@@ -46,7 +46,11 @@ mv -f /tmp/ad/agent-desktop /tmp/ad/agent-desktop-linux-clipboard-owner /usr/loc
 
 echo "== voxl $VOXL_VERSION (builds from source, a few minutes)"
 if ! voxl --version 2>/dev/null | grep -q "$VOXL_VERSION"; then
-  command -v cargo >/dev/null || { curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null; . "$HOME/.cargo/env"; }
+  if ! command -v cargo >/dev/null; then
+    curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null
+    # shellcheck source=/dev/null
+    . "$HOME/.cargo/env"
+  fi
   cargo install -q --locked --version "$VOXL_VERSION" voxl-server --no-default-features --root /usr/local
 fi
 
