@@ -1,0 +1,118 @@
+# SuperBot client
+
+Cross-platform app for a self-hosted [SuperBot](https://github.com/CG-Labs/superbot) server (`botd`).
+
+## Stack (why Expo)
+
+- **One codebase** for iOS, Android, web, and a thin **Electron** shell for Windows/Linux desktop.
+- **EAS Build** compiles iOS on Expo’s macOS workers — no Mac required for the developer machine.
+- **HTTP Basic auth + SSE** match the existing `botd` API; native apps use `react-native-sse` with `Authorization` headers; web/Electron use a fetch-based SSE reader (browser `EventSource` cannot send auth headers).
+- **Rust stays on the server**; the client is a thin TypeScript UI, consistent with the repo’s “thin web client” approach.
+
+## Prerequisites
+
+- Node.js 20+
+- A running `botd` with `AUTH_PASSWORD` set when the server is reachable beyond localhost.
+- For mobile: [Expo EAS CLI](https://docs.expo.dev/build/setup/) (`npm i -g eas-cli`) and a free Expo account.
+
+### Server setup for remote clients
+
+```bash
+# from repo root
+export AUTH_PASSWORD='your-secret'
+export HOST=0.0.0.0
+export PORT=3000
+# Optional: allow your web/Electron origin (defaults include Expo dev ports)
+# export CORS_ORIGINS='https://your-site.example'
+cargo run -p botd
+```
+
+The client **always** asks for a password (it never connects without credentials).
+
+## Development
+
+```bash
+cd apps/client
+npm install
+npm run web          # http://localhost:8081 (add CORS origin if needed)
+```
+
+Point the login screen at `http://127.0.0.1:3000` (or your server) and enter `AUTH_PASSWORD`.
+
+## Web static export
+
+```bash
+npm run build:web    # output in dist/
+npx serve dist
+```
+
+## Desktop (Windows / Linux / macOS)
+
+Electron loads the static web export (no Mac-only tooling):
+
+```bash
+npm run build:web
+npm run desktop      # opens Electron window
+```
+
+Pack installers (on the OS you run the command):
+
+```bash
+npm run desktop:pack # electron-builder → release/
+```
+
+## Android (no Mac)
+
+1. `eas login`
+2. Edit `app.json` → run `eas init` once to get a real `extra.eas.projectId` (replace the placeholder).
+3. Build:
+
+```bash
+eas build -p android --profile preview
+```
+
+Install the APK from the Expo dashboard (internal distribution). For Play Store builds, use `--profile production`.
+
+Local debug (device/emulator + Expo Go or dev client):
+
+```bash
+npm run android
+```
+
+## iOS (no Mac — cloud only)
+
+Apple requires signing assets; Expo stores them for you:
+
+```bash
+eas login
+eas init                    # link project, set projectId in app.json
+eas credentials -p ios      # let EAS create/list certificates (first time)
+eas build -p ios --profile production
+```
+
+When the build finishes, install via:
+
+- **TestFlight** — `eas submit -p ios`, or
+- **Ad hoc / internal** — download the `.ipa` from the Expo build page and install with Apple Configurator / MDM / registered device UDIDs.
+
+You cannot produce a signed `.ipa` on Linux/Windows locally; use **EAS Build** (documented above).
+
+## Scripts
+
+| Command | Purpose |
+|---------|---------|
+| `npm run typecheck` | TypeScript |
+| `npm run lint` | ESLint |
+| `npm run build:web` | Static web bundle (CI) |
+| `npm run desktop` | Electron dev |
+| `eas build -p android` | Cloud APK/AAB |
+| `eas build -p ios` | Cloud IPA |
+
+## Not finished yet
+
+- Live bot **screen** viewer (voxl iframe) and handoff UI
+- Full **routine create/edit** flows (list + toggle only)
+- **Push notifications** for new messages
+- Biometric lock for stored password
+- Custom app icon/branding pass beyond template assets
+- macOS native binary (Electron build on macOS is optional; Linux/Windows documented above)
