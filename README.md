@@ -71,6 +71,8 @@ Then open the web app and say hi to SuperBot. Install and log in to the agent CL
 
 Deploying on a VPS: see [Backend](docs/backend.md).
 
+**Mobile & desktop client:** cross-platform app in [`apps/client`](apps/client/) (Expo: iOS/Android via EAS, web, Electron for Windows/Linux).
+
 ## Harness agnostic
 
 Bots run on the coding agent you choose:

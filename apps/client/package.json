@@ -1,0 +1,61 @@
+{
+  "name": "client",
+  "version": "1.0.0",
+  "main": "expo-router/entry",
+  "dependencies": {
+    "@react-native-picker/picker": "^2.11.4",
+    "@react-navigation/drawer": "^7.14.5",
+    "base-64": "^1.0.0",
+    "expo": "~58.0.26",
+    "expo-constants": "~58.0.16",
+    "expo-font": "~58.0.12",
+    "expo-linking": "~58.0.17",
+    "expo-router": "~58.0.32",
+    "expo-secure-store": "^58.0.3",
+    "expo-splash-screen": "~58.0.14",
+    "expo-status-bar": "~58.0.5",
+    "expo-symbols": "~58.0.5",
+    "expo-web-browser": "~58.1.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "react-native": "0.88.1",
+    "react-native-gesture-handler": "^3.5.0",
+    "react-native-markdown-display": "^7.0.2",
+    "react-native-reanimated": "^4.7.1",
+    "react-native-safe-area-context": "~5.11.1",
+    "react-native-screens": "~4.30.1",
+    "react-native-sse": "^1.2.1",
+    "react-native-svg": "^15.16.1",
+    "react-native-web": "~0.21.4",
+    "react-native-worklets": "0.13.0"
+  },
+  "devDependencies": {
+    "@types/react": "~19.3.0",
+    "@typescript-eslint/eslint-plugin": "^8.73.0",
+    "@typescript-eslint/parser": "^8.73.0",
+    "concurrently": "^10.0.7",
+    "electron": "^45.3.4",
+    "electron-builder": "^26.18.0",
+    "eslint": "^10.15.0",
+    "typescript": "~6.0.3",
+    "wait-on": "^9.5.1"
+  },
+  "scripts": {
+    "start": "expo start",
+    "android": "expo start --android",
+    "ios": "expo start --ios",
+    "web": "expo start --web",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint app components src",
+    "build:web": "expo export --platform web",
+    "desktop": "npm run build:web && electron electron/main.mjs",
+    "desktop:pack": "npm run build:web && electron-builder --linux dir --win dir"
+  },
+  "build": {
+    "appId": "com.cglabs.superbot",
+    "productName": "SuperBot",
+    "directories": { "output": "release" },
+    "files": ["dist/**/*", "electron/**/*"]
+  },
+  "private": true
+}

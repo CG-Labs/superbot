@@ -8,7 +8,7 @@ mod runner;
 mod screen;
 
 use axum::extract::{Path, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -23,6 +23,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 type AppState = Arc<App>;
 
@@ -114,6 +115,7 @@ async fn main() {
         .fallback(get(web))
         .layer(middleware::from_fn_with_state(app.clone(), auth))
         .route("/healthz", get(|| async { Json(json!({ "ok": true })) }))
+        .layer(cors_layer())
         .with_state(app.clone());
 
     app.recover();
@@ -171,6 +173,38 @@ fn not_found(what: &str) -> ApiError {
 }
 
 type Res<T = Json<Value>> = Result<T, ApiError>;
+
+// CORS for the SuperBot client (web/Electron). Native apps are not browser-bound.
+fn cors_layer() -> CorsLayer {
+    let raw = env("CORS_ORIGINS", "");
+    let mut layer = CorsLayer::new()
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+        ]);
+    layer = match raw.as_str() {
+        "*" => layer.allow_origin(AllowOrigin::any()),
+        "" => layer.allow_origin(AllowOrigin::list([
+            HeaderValue::from_static("http://localhost:8081"),
+            HeaderValue::from_static("http://localhost:19006"),
+            HeaderValue::from_static("http://127.0.0.1:8081"),
+            HeaderValue::from_static("http://127.0.0.1:19006"),
+        ])),
+        _ => {
+            let origins: Vec<HeaderValue> = raw.split(',').filter_map(|o| o.trim().parse().ok()).collect();
+            layer.allow_origin(AllowOrigin::list(origins))
+        }
+    };
+    layer
+}
 
 // Auth: browser login with AUTH_PASSWORD (any username), or the Bots' token for `botctl`.
 
