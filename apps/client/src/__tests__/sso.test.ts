@@ -100,6 +100,17 @@ describe("signInWithSso", () => {
     expect(sha256(sent.verifier)).toBe(challenge);
   });
 
+  it("opens the popup in the same tick as the click once providers are loaded", async () => {
+    globalThis.fetch = respond(200, { providers: [{ id: "entra", label: "Microsoft", type: "entra" }] });
+    await fetchSsoProviders(BASE);
+    await new Promise((r) => setTimeout(r, 0));
+    open.mockClear();
+    open.mockResolvedValue({ type: "cancel" });
+    const signingIn = signInWithSso(BASE, "entra");
+    expect(open).toHaveBeenCalledTimes(1);
+    await expect(signingIn).rejects.toThrow(SSO_ERRORS.sso_cancelled);
+  });
+
   it("stops when the person closes the browser", async () => {
     open.mockResolvedValue({ type: "cancel" });
     globalThis.fetch = jest.fn() as unknown as typeof fetch;

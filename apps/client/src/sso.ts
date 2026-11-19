@@ -40,7 +40,9 @@ export async function fetchSsoProviders(baseUrl: string): Promise<SsoProvider[]>
     const res = await fetch(`${normalizeBaseUrl(baseUrl)}/api/auth/sso`);
     if (!res.ok) return [];
     const data = (await res.json()) as { providers?: SsoProvider[] };
-    return Array.isArray(data.providers) ? data.providers : [];
+    const list = Array.isArray(data.providers) ? data.providers : [];
+    if (list.length) prepareSso();
+    return list;
   } catch {
     return [];
   }
@@ -62,6 +64,14 @@ export async function newPkce(): Promise<{ verifier: string; challenge: string }
     encoding: Crypto.CryptoEncoding.BASE64,
   });
   return { verifier, challenge: base64Url(digest) };
+}
+
+// Browsers only allow a popup straight from a click, so the digest is done before it.
+let prepared: { verifier: string; challenge: string } | null = null;
+
+/** Makes the PKCE pair for the next sign-in ahead of time. */
+export function prepareSso(): void {
+  if (!prepared) void newPkce().then((p) => (prepared = prepared ?? p));
 }
 
 export function ssoStartUrl(
@@ -102,7 +112,10 @@ export async function redeemSso(baseUrl: string, code: string, verifier: string,
  */
 export async function signInWithSso(baseUrl: string, providerId: string, label = "SuperBot app"): Promise<ServerConfig> {
   const redirect = Linking.createURL("auth");
-  const { verifier, challenge } = await newPkce();
+  const pkce = prepared ?? (await newPkce());
+  prepared = null;
+  prepareSso();
+  const { verifier, challenge } = pkce;
   const state = randomString();
   const url = ssoStartUrl(baseUrl, providerId, { redirect, challenge, state, label });
   const result = await WebBrowser.openAuthSessionAsync(url, redirect);
