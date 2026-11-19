@@ -2,6 +2,7 @@
 //! audit log. One connection behind a mutex; every call is short.
 
 use crate::policy::{Action, Mode, Override, Policy, Rule};
+use crate::secrets::{redact, sealed};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
 use serde_json::Value;
@@ -178,7 +179,10 @@ fn approval_row(r: &Row) -> rusqlite::Result<Approval> {
         tool: r.get("tool")?,
         kind: r.get("kind")?,
         subject: r.get("subject")?,
-        input: serde_json::from_str(&input).unwrap_or(Value::Null),
+        input: match sealed::open_field(&sealed::approval_context(&r.get::<_, String>("id")?), &input) {
+            Some(input) => serde_json::from_str(&input).unwrap_or(Value::Null),
+            None => serde_json::json!({ "sealed": "unreadable" }),
+        },
         class: r.get("class")?,
         reason: r.get("reason")?,
         status: r.get("status")?,
@@ -213,7 +217,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
         action: r.get("action")?,
         bot_id: r.get("bot_id")?,
         target: r.get("target")?,
-        detail: serde_json::from_str(&detail).unwrap_or(Value::Null),
+        detail: redact::value(serde_json::from_str(&detail).unwrap_or(Value::Null)),
     })
 }
 
@@ -433,10 +437,11 @@ impl Db {
 
     #[allow(clippy::too_many_arguments)]
     pub fn add_message_from(&self, bot_id: &str, role: &str, text: &str, question: Option<&Value>, error: bool, status: Option<&str>, from_bot: Option<&str>) -> Message {
+        let question = question.map(|q| redact::value(q.clone()).to_string());
         let c = self.c();
         c.execute(
             "INSERT INTO messages (bot_id, role, text, question, error, status, from_bot, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            params![bot_id, role, text, question.map(|q| q.to_string()), error, status, from_bot, now()],
+            params![bot_id, role, redact::text(text), question, error, status, from_bot, now()],
         )
         .unwrap();
         let id = c.last_insert_rowid();
@@ -460,7 +465,7 @@ impl Db {
     }
 
     pub fn set_question(&self, id: i64, q: &Value) {
-        self.c().execute("UPDATE messages SET question = ? WHERE id = ?", params![q.to_string(), id]).unwrap();
+        self.c().execute("UPDATE messages SET question = ? WHERE id = ?", params![redact::value(q.clone()).to_string(), id]).unwrap();
     }
 
     pub fn pending(&self) -> Vec<Message> {
@@ -583,15 +588,17 @@ impl Db {
     pub fn add_approval(&self, bot_id: &str, harness: &str, tool: &str, kind: &str, subject: &str, input: &Value, class: &str, reason: &str, expires_at: i64) -> Approval {
         let id = crate::short_id();
         // Keep the row small: a huge file write is summarized by its subject anyway.
-        let mut input = input.to_string();
+        let mut input = redact::value(input.clone()).to_string();
         if input.len() > 20_000 {
             input = serde_json::json!({ "truncated": input.chars().take(20_000).collect::<String>() }).to_string();
         }
+        // Tool input can hold anything a Bot wrote (file contents, commands), so it is sealed at rest.
+        let input = sealed::seal_field(&sealed::approval_context(&id), &input);
         self.c()
             .execute(
                 "INSERT INTO approvals (id, bot_id, harness, tool, kind, subject, input, class, reason, status, created_at, expires_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
-                params![id, bot_id, harness, tool, kind, subject, input, class, reason, now(), expires_at],
+                params![id, bot_id, harness, tool, kind, redact::text(subject), input, class, reason, now(), expires_at],
             )
             .unwrap();
         self.approval(&id).unwrap()
@@ -653,7 +660,7 @@ impl Db {
     pub fn audit(&self, actor: &str, action: &str, bot_id: Option<&str>, target: Option<&str>, detail: Value) {
         let _ = self.c().execute(
             "INSERT INTO audit_events (at, actor, action, bot_id, target, detail) VALUES (?, ?, ?, ?, ?, ?)",
-            params![now(), actor, action, bot_id, target, detail.to_string()],
+            params![now(), actor, action, bot_id, target, redact::value(detail).to_string()],
         );
     }
 

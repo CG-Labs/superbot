@@ -95,7 +95,7 @@ impl App {
     }
 
     pub fn send(&self, v: Value) {
-        let _ = self.tx.send(v.to_string());
+        let _ = self.tx.send(crate::secrets::redact::value(v).to_string());
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, HashMap<String, BotState>> {
@@ -247,7 +247,8 @@ impl App {
                 }
             });
 
-            let mut env = HashMap::from([
+            let mut env: HashMap<String, String> = crate::secrets::global().harness_env().into_iter().map(|(k, v)| (k, v.expose().to_string())).collect();
+            env.extend([
                 ("BOT_ID".to_string(), bot.id.clone()),
                 ("BOT_API".to_string(), self.cfg.api_url.clone()),
                 ("BOT_TOKEN".to_string(), self.cfg.bot_token.clone()),

@@ -9,6 +9,7 @@ mod paths;
 mod policy;
 mod runner;
 mod screen;
+mod secrets;
 mod shell;
 
 use approvals::{DecideError, Remember};
@@ -17,7 +18,7 @@ use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use std::collections::HashMap;
 use db::{BotPatch, Db};
@@ -69,9 +70,10 @@ fn pick<'a>(a: &[&'a str]) -> &'a str {
 async fn main() {
     let port: u16 = env("PORT", "3000").parse().expect("PORT must be a number");
     let host = env("HOST", "127.0.0.1");
-    let password = std::env::var("AUTH_PASSWORD").unwrap_or_default();
+    let password = auth_password();
     let default_harness = env("DEFAULT_HARNESS", "claude");
     let allow_no_auth = auth_startup(&host, &password);
+    secrets::redact::register(&password);
     if adapters::get(&default_harness).is_none() {
         eprintln!("DEFAULT_HARNESS must be one of: {}", adapters::NAMES.join(", "));
         std::process::exit(1);
@@ -82,6 +84,7 @@ async fn main() {
         bot_token: random_hex(24),
         hosts: allowed_hosts(&host, port, &env("ALLOWED_HOSTS", "")),
     });
+    secrets::redact::register(&auth_state.bot_token);
     WEB_DIR.set(std::env::var("WEB_DIR").ok().map(PathBuf::from)).unwrap();
 
     let root = |key: &str, default: &str| {
@@ -92,7 +95,21 @@ async fn main() {
     };
     let data_dir = root("DATA_DIR", "data");
     let workspace = root("WORKSPACE_DIR", "workspace");
-    let db = Db::open(&paths::child(&data_dir, "app.sqlite").unwrap()).expect("open database");
+    let db_path = paths::child(&data_dir, "app.sqlite").unwrap();
+    let db = Db::open(&db_path).expect("open database");
+    match secrets::init(&db_path) {
+        Ok(r) => {
+            println!("Master key: {}{}.", r.key_source, if r.created { " (new)" } else { "" });
+            if r.sealed + r.redacted + r.discarded > 0 {
+                println!("Secrets: sealed {} saved tool inputs, redacted {} saved rows, discarded {} sealed values.", r.sealed, r.redacted, r.discarded);
+            }
+            println!("Stored secrets: {}.", r.stored);
+        }
+        Err(e) => {
+            eprintln!("Secrets: {e}");
+            std::process::exit(1);
+        }
+    }
 
     let screens = paths::child(&data_dir, "screens").and_then(screen::Screens::from_env);
     let app = App::new(db, Config {
@@ -182,6 +199,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/approvals/{id}/approve", post(approve))
         .route("/approvals/{id}/deny", post(deny))
         .route("/audit", get(list_audit))
+        .route("/secrets", get(list_secrets))
+        .route("/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/ask", post(ask))
         .route("/handoff", post(handoff));
     Router::new()
@@ -262,6 +281,18 @@ struct Auth {
 }
 
 /// Refuse to start without AUTH_PASSWORD unless ALLOW_NO_AUTH=1 on loopback only.
+/// AUTH_PASSWORD, or the file named by AUTH_PASSWORD_FILE. Empty when neither is set.
+fn auth_password() -> String {
+    use secrets::SecretStore;
+    match secrets::env::EnvStore::process().get("AUTH_PASSWORD") {
+        Ok(p) => p.map(|p| p.expose().to_string()).unwrap_or_default(),
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn auth_startup(host: &str, password: &str) -> bool {
     if !password.is_empty() {
         return false;
@@ -848,6 +879,41 @@ async fn list_audit(State(app): State<AppState>, Extension(who): Extension<Princ
     Ok(Json(json!(app.db.audit_events(limit, before))))
 }
 
+// Secrets: names only. Values go in and reach harnesses; they never come back out.
+
+fn secret_error(e: secrets::Error) -> ApiError {
+    match e {
+        secrets::Error::Invalid(m) => bad(m),
+        secrets::Error::ReadOnly => ApiError(StatusCode::CONFLICT, e.to_string()),
+        secrets::Error::Store(m) => {
+            eprintln!("secrets: {m}");
+            ApiError(StatusCode::INTERNAL_SERVER_ERROR, "The secret store failed; see the server log.".into())
+        }
+    }
+}
+
+async fn list_secrets(Extension(who): Extension<Principal>) -> Res {
+    need_user(who)?;
+    Ok(Json(json!({ "secrets": secrets::global().list().map_err(secret_error)? })))
+}
+
+async fn put_secret(State(app): State<AppState>, Extension(who): Extension<Principal>, Path(name): Path<String>, Json(v): Json<Value>) -> Res {
+    need_user(who)?;
+    let value = v["value"].as_str().ok_or_else(|| bad("Send {\"value\": \"...\"}."))?;
+    let listed = secrets::global().put(&name, value).map_err(secret_error)?;
+    app.db.audit("user", "secret.set", None, Some(&name), json!({ "store": listed.store }));
+    Ok(Json(json!({ "secret": listed })))
+}
+
+async fn delete_secret(State(app): State<AppState>, Extension(who): Extension<Principal>, Path(name): Path<String>) -> Res {
+    need_user(who)?;
+    if !secrets::global().delete(&name).map_err(secret_error)? {
+        return Err(not_found("Secret"));
+    }
+    app.db.audit("user", "secret.deleted", None, Some(&name), json!({}));
+    Ok(Json(json!({ "ok": true })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1072,6 +1138,42 @@ mod tests {
         }
         let (_, list) = call(port, "GET", "/api/approvals?status=pending", &user, "").await;
         assert_eq!(list.trim(), "[]", "refused without asking");
+    }
+
+    #[tokio::test]
+    async fn secrets_api_takes_values_and_never_returns_them() {
+        let (port, app, user, bot_auth) = serve_app().await;
+        let name = format!("TEST_{}_API_KEY", random_hex(4).to_uppercase());
+        let value = format!("sk-test-{}", random_hex(16));
+        let path = format!("/api/secrets/{name}");
+        let body = json!({ "value": value }).to_string();
+        assert_eq!(call(port, "GET", "/api/secrets", "", "").await.0, 401);
+        assert_eq!(call(port, "GET", "/api/secrets", &bot_auth, "").await.0, 403);
+        assert_eq!(call(port, "PUT", &path, &bot_auth, &body).await.0, 403);
+        assert_eq!(call(port, "PUT", "/api/secrets/PATH", &user, &body).await.0, 400);
+        assert_eq!(call(port, "PUT", &path, &user, "{}").await.0, 400);
+
+        let (code, res) = call(port, "PUT", &path, &user, &body).await;
+        assert_eq!(code, 200, "{res}");
+        assert!(!res.contains(&value));
+        let (code, list) = call(port, "GET", "/api/secrets", &user, "").await;
+        assert_eq!(code, 200);
+        assert!(list.contains(&name) && !list.contains(&value), "{list}");
+        assert_eq!(secrets::global().get(&name).unwrap().unwrap().expose(), value);
+        assert!(secrets::global().harness_env().iter().any(|(k, v)| *k == name && v.expose() == value));
+
+        // A Bot echoing the value: the saved chat and the audit log hold the mark instead.
+        let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
+        let m = app.db.add_message(&bot.id, "bot", &format!("key={value}"), None, false, None);
+        assert_eq!(m.text, "key=[redacted]");
+        app.db.audit("bot", "test.echo", Some(&bot.id), None, json!({ "said": value }));
+        let (_, audit) = call(port, "GET", "/api/audit", &user, "").await;
+        assert!(!audit.contains(&value) && audit.contains("secret.set") && audit.contains(&name), "{audit}");
+
+        assert_eq!(call(port, "DELETE", &path, &bot_auth, "").await.0, 403);
+        assert_eq!(call(port, "DELETE", &path, &user, "").await.0, 200);
+        assert_eq!(call(port, "DELETE", &path, &user, "").await.0, 404);
+        assert!(secrets::global().get(&name).unwrap().is_none());
     }
 
     #[test]
