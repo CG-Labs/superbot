@@ -57,7 +57,13 @@
           headers: { "content-type": "application/json" },
           body: JSON.stringify(body),
         });
-        if (r.ok) return location.replace("/");
+        if (r.ok) {
+          // Browsers drop Secure cookies on plain http, except on localhost.
+          const me = await fetch("/api/auth/me");
+          if (me.ok) return location.replace("/");
+          error.textContent = "Signed in, but this browser didn't keep the session. Open SuperBot over HTTPS.";
+          return;
+        }
         const data = await r.json().catch(() => ({}));
         error.textContent = data.error || "Sign in failed.";
       } catch {

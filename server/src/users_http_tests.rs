@@ -406,6 +406,16 @@ async fn break_glass_off_ignores_the_password() {
     assert_eq!((parse(&me)["role"].as_str(), parse(&me)["breakGlass"].as_bool()), (Some("admin"), Some(false)));
     let (_, body) = call(port, "GET", "/api/audit?action=auth.login_failed", &t, "").await;
     assert!(audit_list(&body).iter().any(|e| e["details"]["reason"] == "break_glass_off"));
+
+    // A browser still sending a cached password reaches the sign-in page, then its cookie wins.
+    let (code, head, _) = call_with(port, "GET", "/", &admin, "", "").await;
+    assert_eq!((code, header(&head, "location").as_deref()), (303, Some("/login")));
+    let code = users::new_secret(users::CODE_PREFIX);
+    app.db.add_login_code(&users::hash(&code), users::OPERATOR, users::OPERATOR, db::now() + 60_000);
+    let (_, head, _) = login(port, &origin(port), json!({ "code": code, "session": "cookie" })).await;
+    let ctoken = header(&head, "set-cookie").unwrap().split(';').next().unwrap().trim_start_matches("superbot_session=").to_string();
+    assert_eq!(call_with(port, "GET", "/api/state", &admin, &cookie(&ctoken), "").await.0, 200);
+    assert_eq!(call_with(port, "GET", "/api/state", &basic("guess"), &cookie(&ctoken), "").await.0, 200, "the password is ignored, right or wrong");
 }
 
 #[tokio::test]

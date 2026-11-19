@@ -54,7 +54,7 @@ Failed sign-ins are rate-limited per client IP (10 per 10 minutes, then 429 with
 
 ### Break-glass: `AUTH_BREAK_GLASS`
 
-On by default (unset, `1`, `true`, `on`, `yes`), so an upgraded server keeps working with no config change. Set `AUTH_BREAK_GLASS=0` once admins sign in another way: `AUTH_PASSWORD` is then ignored everywhere (Basic and the login endpoint), botd starts without one, and no Basic challenge is sent. Getting back in: set it to `1` and restart, which needs shell access to the server. That is the point of break-glass: whoever can edit `.env` already owns the box.
+On by default (unset, `1`, `true`, `on`, `yes`), so an upgraded server keeps working with no config change. Set `AUTH_BREAK_GLASS=0` once admins sign in another way: `AUTH_PASSWORD` is then ignored everywhere (Basic and the login endpoint), botd starts without one, and no Basic challenge is sent. A Basic header the browser still has cached is skipped so the session cookie decides, and pages redirect to `/login`. Getting back in: set it to `1` and restart, which needs shell access to the server. That is the point of break-glass: whoever can edit `.env` already owns the box.
 
 `ALLOW_NO_AUTH=1` (loopback dev) is unchanged: requests without credentials act as the owner.
 

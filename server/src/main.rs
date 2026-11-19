@@ -570,13 +570,20 @@ fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<
         };
     }
     if let Some(b) = h.strip_prefix("Basic ") {
+        if !a.break_glass {
+            // Browsers keep sending a password they cached before break-glass was turned off.
+            if let Some(found) = users::cookie_token(req.headers()).and_then(|t| a.session(&t)) {
+                return Ok(from_session(found));
+            }
+            return fail("password", Some("break_glass_off"), false);
+        }
         let ok = base64_decode(b).is_some_and(|creds| {
             let pass = creds.splitn(2, |c| *c == b':').nth(1).unwrap_or_default();
-            a.break_glass && !a.password.is_empty() && same(pass, a.password.as_bytes())
+            !a.password.is_empty() && same(pass, a.password.as_bytes())
         });
         return match ok || a.allow_no_auth {
             true => Ok(operator(if ok { "password" } else { "none" })),
-            false => fail("password", (!a.break_glass).then_some("break_glass_off"), false),
+            false => fail("password", None, false),
         };
     }
     if !h.is_empty() {
@@ -603,7 +610,8 @@ fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<
 fn unauthorized(a: &Auth, req: &Request, clear_cookie: bool) -> Response {
     let h = req.headers();
     let page = !req.uri().path().starts_with("/api/") && matches!(*req.method(), Method::GET | Method::HEAD);
-    let mut res = if page && !h.contains_key(header::AUTHORIZATION) {
+    // With break-glass on, a page sent with a wrong password gets the browser's password box again.
+    let mut res = if page && (!a.break_glass || !h.contains_key(header::AUTHORIZATION)) {
         (StatusCode::SEE_OTHER, [(header::LOCATION, "/login")]).into_response()
     } else {
         ApiError(StatusCode::UNAUTHORIZED, "Login required".into()).into_response()
