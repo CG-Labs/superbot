@@ -12,7 +12,7 @@ jest.mock("../auth", () => ({
 jest.mock("../sse", () => ({ connectSse: jest.fn(() => ({ close: jest.fn() })) }));
 
 const BASE = "https://bots.example.com";
-const bot = (id: string, primary = false, unread = false) => ({
+const bot = (id: string, primary = false, unread = false, handoffId: number | null = null) => ({
   id,
   name: id === "b1" ? "Ada" : "Bob",
   color: "#f5f5f5",
@@ -21,6 +21,7 @@ const bot = (id: string, primary = false, unread = false) => ({
   primary,
   hidden: false,
   unread,
+  handoff: handoffId,
   working: false,
 });
 const handoff: Message = {
@@ -38,6 +39,10 @@ type Call = { url: string; method: string; body?: unknown; headers: Record<strin
 let calls: Call[] = [];
 let failAnswer = false;
 let bobUnread = false;
+let bobHandoff: number | null = null;
+/** When set, Bob's history request waits until the test calls it. */
+let releaseHistory: (() => void) | null = null;
+let holdHistory = false;
 
 function respond(status: number, body: unknown) {
   return Promise.resolve({ ok: status < 400, status, json: async () => body });
@@ -47,6 +52,9 @@ beforeEach(() => {
   calls = [];
   failAnswer = false;
   bobUnread = false;
+  bobHandoff = null;
+  holdHistory = false;
+  releaseHistory = null;
   (connectSse as jest.Mock).mockClear();
   globalThis.fetch = jest.fn((url: string, init: RequestInit = {}) => {
     const method = init.method ?? "GET";
@@ -54,9 +62,14 @@ beforeEach(() => {
     calls.push({ url, method, body, headers: (init.headers ?? {}) as Record<string, string> });
     const path = url.slice(BASE.length);
     if (path === "/api/state") {
-      return respond(200, { me: { name: "Me" }, harnesses: ["claude"], defaultHarness: "claude", bots: [bot("b1", true), bot("b2", false, bobUnread)] });
+      return respond(200, { me: { name: "Me" }, harnesses: ["claude"], defaultHarness: "claude", bots: [bot("b1", true), bot("b2", false, bobUnread, bobHandoff)] });
     }
-    if (path === "/api/bots/b2/messages" && method === "GET") return respond(200, history);
+    if (path === "/api/bots/b2/messages" && method === "GET") {
+      if (!holdHistory) return respond(200, history);
+      return new Promise((resolve) => {
+        releaseHistory = () => resolve(respond(200, history));
+      });
+    }
     if (path === "/api/bots/b2/messages" && method === "POST") {
       return failAnswer ? respond(500, { error: "boom" }) : respond(202, { id: 13, botId: "b2", role: "user", text: body.text, at: 3 });
     }
@@ -100,6 +113,27 @@ describe("SuperBotProvider", () => {
     await act(() => result.current.loadMessages("b2"));
     expect(calls.filter((c) => c.url.endsWith("/api/bots/b2/messages") && c.method === "GET")).toHaveLength(1);
     expect(calls.some((c) => c.url.endsWith("/api/bots/b2/read"))).toBe(true);
+  });
+
+  it("finds a handoff the user read but never answered", async () => {
+    bobHandoff = 12;
+    const { result } = await connected();
+    await waitFor(() => expect(result.current.handoffs.b2?.id).toBe(12));
+    expect(calls.some((c) => c.url.endsWith("/api/bots/b2/read"))).toBe(false);
+  });
+
+  it("keeps live messages that arrive while a history is loading", async () => {
+    bobUnread = true;
+    holdHistory = true;
+    const { result, emit } = await connected();
+    await waitFor(() => expect(releaseHistory).not.toBeNull());
+
+    const reply: Message = { id: 13, botId: "b2", role: "user", text: "Done already", at: 3 };
+    await emit({ type: "message", message: reply });
+    await act(async () => releaseHistory?.());
+
+    await waitFor(() => expect(result.current.messages.b2?.map((m) => m.id)).toEqual([11, 12, 13]));
+    expect(result.current.handoffs.b2).toBeUndefined();
   });
 
   it("answers a handoff on its own Bot and clears it", async () => {

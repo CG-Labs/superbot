@@ -86,6 +86,12 @@ function upsertBot(list: BotView[], b: BotView): BotView[] {
   return [...list, b];
 }
 
+function mergeMessages(base: Message[], extra: Message[]): Message[] {
+  const seen = new Set(base.map((m) => m.id));
+  const added = extra.filter((m) => !seen.has(m.id));
+  return added.length ? [...base, ...added].sort((a, b) => a.id - b.id) : base;
+}
+
 export function SuperBotProvider({ children }: { children: React.ReactNode }) {
   const [ready, setReady] = useState(false);
   const [connected, setConnected] = useState(false);
@@ -106,6 +112,8 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
   const openedRef = useRef(false);
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
+  /** Live messages that arrived while a Bot's history was loading; the server's snapshot may predate them. */
+  const liveRef = useRef<Record<string, { waiting: number; list: Message[] }>>({});
 
   const applyState = useCallback((state: Awaited<ReturnType<SuperBotApi["verify"]>>) => {
     setMe(state.me);
@@ -123,6 +131,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
         return;
       }
       if (evt.type === "message") {
+        liveRef.current[evt.message.botId]?.list.push(evt.message);
         // Only extend histories already loaded; an unloaded Bot loads its full history on open.
         setMessages((prev) => {
           const list = prev[evt.message.botId];
@@ -171,12 +180,22 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
   const handleSseRef = useRef(handleSse);
   handleSseRef.current = handleSse;
 
-  /** Loads unread Bots' chats in the background so their open handoffs show without opening each one. */
+  const fetchHistory = async (client: SuperBotApi, botId: string) => {
+    const entry = (liveRef.current[botId] ??= { waiting: 0, list: [] });
+    entry.waiting++;
+    try {
+      return mergeMessages(await client.messages(botId), entry.list);
+    } finally {
+      if (--entry.waiting === 0 && liveRef.current[botId] === entry) delete liveRef.current[botId];
+    }
+  };
+
+  /** Loads unread or waiting Bots' chats in the background so their open handoffs show without opening each one. */
   const prefetchUnread = async (client: SuperBotApi, list: BotView[]) => {
-    const ids = list.filter((b) => b.unread && !messagesRef.current[b.id]).map((b) => b.id);
+    const ids = list.filter((b) => (b.unread || b.handoff != null) && !messagesRef.current[b.id]).map((b) => b.id);
     await Promise.all(
       ids.map(async (id) => {
-        const history = await client.messages(id).catch(() => null);
+        const history = await fetchHistory(client, id).catch(() => null);
         if (!history) return;
         setMessages((prev) => (prev[id] ? prev : { ...prev, [id]: history }));
         setHandoffs((h) => applyHandoffHistory(h, id, history));
@@ -189,13 +208,11 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
     applyState(state);
     void prefetchUnread(client, state.bots);
     if (reloadMessages) {
-      const ids = Object.keys(messagesRef.current);
-      const loaded: Record<string, Message[]> = {};
-      for (const id of ids) {
-        loaded[id] = await client.messages(id);
+      for (const id of Object.keys(messagesRef.current)) {
+        const list = await fetchHistory(client, id);
+        setMessages((prev) => ({ ...prev, [id]: list }));
+        setHandoffs((h) => applyHandoffHistory(h, id, list));
       }
-      setMessages((prev) => ({ ...prev, ...loaded }));
-      setHandoffs((h) => ids.reduce((acc, id) => applyHandoffHistory(acc, id, loaded[id]), h));
     }
   };
 
@@ -278,7 +295,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
   const loadMessages = async (botId: string) => {
     if (!api) return;
     if (!messagesRef.current[botId]) {
-      const list = await api.messages(botId);
+      const list = await fetchHistory(api, botId);
       setMessages((m) => ({ ...m, [botId]: list }));
       setHandoffs((h) => applyHandoffHistory(h, botId, list));
       void api.markRead(botId).catch(() => {});

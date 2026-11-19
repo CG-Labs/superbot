@@ -7,6 +7,8 @@ import { ScreenFrame } from "./ScreenFrame";
 
 /** The server stops idle screens; re-asking for the link while watching keeps this one up. */
 export const SCREEN_REFRESH_MS = 60_000;
+/** A screen that is starting or busy usually works again within seconds. */
+export const SCREEN_RETRY_MS = 3_000;
 
 interface Props {
   botId: string;
@@ -19,6 +21,7 @@ interface Props {
   handoff?: Message;
   onHandoffDone?: () => Promise<void>;
   refreshMs?: number;
+  retryMs?: number;
 }
 
 export function ScreenViewer({
@@ -30,6 +33,7 @@ export function ScreenViewer({
   handoff,
   onHandoffDone,
   refreshMs = SCREEN_REFRESH_MS,
+  retryMs = SCREEN_RETRY_MS,
 }: Props) {
   const [url, setUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -40,32 +44,35 @@ export function ScreenViewer({
 
   useEffect(() => {
     let alive = true;
-    let current: string | null = null;
+    // The last link that worked, kept across failed refreshes so a restarted screen is still noticed.
+    let last: string | null = null;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     setUrl(null);
     setError(null);
     const load = async () => {
+      let wait = refreshMs;
       try {
         const next = await fetchRef.current(botId);
         if (!alive) return;
         // A new link means the screen restarted: back to view-only, like the web app.
-        if (current !== null && next !== current) setControl(false);
-        current = next;
+        if (last !== null && next !== last) setControl(false);
+        last = next;
         setUrl(next);
         setError(null);
       } catch (err) {
         if (!alive) return;
-        current = null;
         setUrl(null);
         setError(err instanceof Error ? err.message : "Can't open the screen");
+        wait = Math.min(retryMs, refreshMs);
       }
+      timer = setTimeout(() => void load(), wait);
     };
     void load();
-    const timer = setInterval(() => void load(), refreshMs);
     return () => {
       alive = false;
-      clearInterval(timer);
+      clearTimeout(timer);
     };
-  }, [botId, refreshMs]);
+  }, [botId, refreshMs, retryMs]);
 
   const title = `${botName}'s screen`;
 
