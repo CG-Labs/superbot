@@ -61,9 +61,9 @@ pub fn text(s: &str) -> Cow<'_, str> {
     Cow::Owned(strip_issued(&out))
 }
 
-/// Session tokens, sign-in codes, and SSO handoff codes botd issues. Only their hashes are kept, so they
+/// Session tokens, sign-in codes, SSO handoff codes, and SCIM tokens botd issues. Only their hashes are kept, so they
 /// can't be registered; they're recognized by shape: a prefix and 64 hex digits.
-const ISSUED: [&str; 3] = [crate::users::SESSION_PREFIX, crate::users::CODE_PREFIX, crate::sso::HANDOFF_PREFIX];
+const ISSUED: [&str; 4] = [crate::users::SESSION_PREFIX, crate::users::CODE_PREFIX, crate::sso::HANDOFF_PREFIX, crate::scim::TOKEN_PREFIX];
 const ISSUED_HEX: usize = 64;
 
 /// Where the first issued token in `s` starts, and its length.
@@ -175,7 +175,9 @@ mod tests {
     fn issued_tokens_are_redacted_by_shape() {
         let session = crate::users::new_secret(crate::users::SESSION_PREFIX);
         let code = crate::users::new_secret(crate::users::CODE_PREFIX);
+        let scim = crate::users::new_secret(crate::scim::TOKEN_PREFIX);
         assert_eq!(text(&format!("my code is {code}, token {session}.")), "my code is [redacted], token [redacted].");
+        assert_eq!(text(&format!("SCIM secret: {scim}")), "SCIM secret: [redacted]");
         assert_eq!(value(json!({ "t": format!("Bearer {session}") }))["t"], "Bearer [redacted]");
         for s in ["sbs_", "sbc_abc", "sbs_x", "the sbc_ prefix"] {
             assert!(matches!(text(s), Cow::Borrowed(_)), "{s}");
