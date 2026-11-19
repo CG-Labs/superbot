@@ -186,7 +186,12 @@ fn seal_plaintext(c: &Connection, cipher: &Cipher) -> rusqlite::Result<usize> {
         s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
     };
     for (id, input) in &rows {
-        let sealed = cipher.seal(&approval_context(id), redact::text(input).as_bytes());
+        // Parsed when it's JSON, so a secret with quotes or backslashes matches unescaped.
+        let clean = match serde_json::from_str::<serde_json::Value>(input) {
+            Ok(v) => redact::value(v).to_string(),
+            Err(_) => redact::text(input).to_string(),
+        };
+        let sealed = cipher.seal(&approval_context(id), clean.as_bytes());
         tx.execute("UPDATE approvals SET input = ? WHERE id = ?", params![sealed, id])?;
     }
     tx.commit()?;
@@ -376,7 +381,8 @@ mod tests {
         let (path, db, c) = fresh();
         let bot = db.create_bot("A", "#fff", "waddle", "claude", None, true);
         let secret = format!("ghp_{}", crate::random_hex(16));
-        let input = json!({ "file_path": "/w/.env", "content": format!("TOKEN={secret}\n") }).to_string();
+        let quoted = format!("pw\"{}\\", crate::random_hex(8));
+        let input = json!({ "file_path": "/w/.env", "content": format!("TOKEN={secret}\n"), "password": quoted }).to_string();
         // Rows as an older botd wrote them: plaintext input.
         let raw = Connection::open(&path).unwrap();
         for id in ["old1", "old2"] {
@@ -388,6 +394,7 @@ mod tests {
             .unwrap();
         }
         redact::register(&secret);
+        redact::register(&quoted);
         let on_disk = || {
             let mut bytes = std::fs::read(&path).unwrap();
             bytes.extend(std::fs::read(path.with_extension("sqlite-wal")).unwrap_or_default());
@@ -406,6 +413,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(opened.expose()).unwrap();
         assert_eq!(v["file_path"], "/w/.env", "no data lost");
         assert_eq!(v["content"], "TOKEN=[redacted]\n", "known secrets redacted before sealing");
+        assert_eq!(v["password"], redact::MARK, "escaped in JSON, still found");
         assert!(cipher.open(&approval_context("old2"), &stored).is_err(), "bound to its row");
 
         // Upgrading again (or restarting) changes nothing.
@@ -415,6 +423,7 @@ mod tests {
         let after: String = raw.query_row("SELECT input FROM approvals WHERE id = 'old1'", [], |r| r.get(0)).unwrap();
         assert_eq!(after, stored);
         redact::forget(&secret);
+        redact::forget(&quoted);
     }
 
     #[test]
