@@ -48,8 +48,9 @@ Indexes on `at`, `(action, id)`, and `(actor_kind, actor_id, id)` keep filters f
 | Routines | `routine.created`, `routine.updated`, `routine.enabled`, `routine.disabled`, `routine.deleted`, `routine.fired` |
 | Policy and approvals | `policy.initialized`, `policy.updated`, `policy.reset`, `rule.added`, `rule.removed`, `approval.requested`, `approval.approved`, `approval.denied`, `approval.expired`, `policy.allowed`, `policy.denied` |
 | Handoffs | `handoff.requested`, `handoff.answered`, `handoff.timed_out` |
+| Runs ([ADR 0019](0019-audit-actors.md)) | `harness.invoked` (each harness start: harness, model, policy mode, attempt, trigger), `bot.run_finished` (result, duration, replies), attributed to whoever queued the task |
 | Bot token | Admin calls a Bot makes with `BOT_TOKEN` through `botctl` (routines, Bot to Bot, handoffs, approval checks) are the events above with the Bot as actor; `access.denied` when it calls a person-only endpoint (403) |
-| Server and audit | `server.started` (version and the settings that matter: harness, policy mode, auth kind, retention), `audit.exported` (with its filter), `audit.retention_changed`, `audit.pruned` |
+| Server and audit | `server.started` (version and the settings that matter: harness, policy mode, auth kind, retention), `audit.exported` (with its filter), `audit.retention_changed`, `audit.pruned`, `audit.schema_upgraded` (an upgrade added columns; rows before it leave them empty) |
 
 **Never logged**: passwords, tokens, API keys, `Authorization` headers, message bodies, routine instructions, handoff and ask text. Approval and policy events do carry the call's subject (the command, path, or URL a person decided on), scrubbed and clipped; the full tool input stays in the approvals table. Each event lists the fields it records; `details` are scrubbed before they are written anyway: keys that look secret (`password`, `token`, `secret`, `api_key`, `authorization`, `cookie`, `credential`, ...) become `[redacted]`, and free text has bearer and basic credentials, `--password` style flags, `key=value` secrets, URL user info and secret query parameters, `curl -u user:pass`, and known token prefixes (`sk-`, `ghp_`, ...) masked. Strings are clipped to 500 characters.
 
@@ -84,6 +85,8 @@ Users and SSO fill columns that already exist; no migration of old rows is neede
 - `actor_name` gets the display name, `actor_subject` the IdP identity as `<issuer>|<sub>` (Entra or Google).
 - Filters by person already work (`actor=user:<id>`). RBAC decides who may read the log; today any person can.
 - Per-Bot tokens turn the self-reported Bot id into a verified one.
+
+Done in [ADR 0019](0019-audit-actors.md), which also adds the email, role, sign-in method, IdP, session, and on-behalf-of columns, and audits Bot runs and harness invocations.
 
 ## Later (M5)
 

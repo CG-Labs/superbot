@@ -177,9 +177,12 @@ pub struct Caller {
     pub method: &'static str,
 }
 
-/// The audit actor. Its subject is the SSO identity this session signed in with, else
-/// the user's own (first linked) identity.
-pub fn actor(u: &User, s: Option<&Session>) -> Actor {
+/// The audit actor: the person, their email and role now, and how this request was
+/// signed in. `method` is the caller's ("password", "none", ...); a session's own
+/// method ("password", "code", "sso") wins. The subject is the SSO identity this
+/// session signed in with, else the user's own (first linked) identity.
+pub fn actor(a: &Auth, u: &User, s: Option<&Session>, method: &str) -> Actor {
+    let provider = s.and_then(|s| s.idp_provider.clone());
     Actor {
         kind: ActorKind::User,
         id: Some(u.id.clone()),
@@ -189,6 +192,13 @@ pub fn actor(u: &User, s: Option<&Session>) -> Actor {
             (None, Some(i), Some(s)) => Some(format!("{i}|{s}")),
             _ => None,
         },
+        email: u.email.clone(),
+        role: Some(u.role.as_str().into()),
+        method: Some(s.map_or(method, |s| s.method.as_str()).into()),
+        idp: provider.as_deref().and_then(|p| crate::sso::idp_type(a, p)).map(String::from),
+        idp_provider: provider,
+        session: s.map(|s| s.id.clone()),
+        on_behalf_of: None,
     }
 }
 
@@ -240,7 +250,7 @@ pub fn user_view(u: &User) -> Value {
 fn session_view(s: &Session, cfg: &SessionConfig) -> Value {
     let ends = s.expires_at.min(s.created_at + cfg.max_ms).min(s.last_seen_at + cfg.idle_ms);
     json!({
-        "id": s.id, "userId": s.user_id, "kind": s.kind, "method": s.method, "idpSubject": s.idp_subject, "label": s.label,
+        "id": s.id, "userId": s.user_id, "kind": s.kind, "method": s.method, "idpSubject": s.idp_subject, "idpProvider": s.idp_provider, "label": s.label,
         "ip": s.ip, "userAgent": s.user_agent, "createdAt": s.created_at, "lastSeenAt": s.last_seen_at,
         "expiresAt": s.expires_at, "endsAt": ends,
     })
@@ -248,9 +258,9 @@ fn session_view(s: &Session, cfg: &SessionConfig) -> Value {
 
 // Sign in and out.
 
-/// The new session's token and how it's handed over. `idp_subject` is `issuer|subject`
-/// for SSO sign-ins.
-pub fn start_session(a: &Auth, user: &User, method: &str, idp_subject: Option<&str>, cookie: bool, label: Option<&str>, source: &Source) -> (Session, String) {
+/// The new session's token and how it's handed over. `idp` is the SSO provider id and
+/// `issuer|subject` for SSO sign-ins.
+pub fn start_session(a: &Auth, user: &User, method: &str, idp: Option<(&str, &str)>, cookie: bool, label: Option<&str>, source: &Source) -> (Session, String) {
     let token = new_secret(SESSION_PREFIX);
     let app = a.app.as_ref().expect("sessions need the database");
     let s = app.db.create_session(&NewSession {
@@ -258,7 +268,8 @@ pub fn start_session(a: &Auth, user: &User, method: &str, idp_subject: Option<&s
         token_hash: &hash(&token),
         kind: if cookie { "cookie" } else { "token" },
         method,
-        idp_subject,
+        idp_subject: idp.map(|i| i.1),
+        idp_provider: idp.map(|i| i.0),
         label,
         ip: source.ip.as_deref(),
         user_agent: source.user_agent.as_deref(),
@@ -347,7 +358,7 @@ pub async fn login(Extension(a): Extension<Arc<Auth>>, Extension(source): Extens
         return ApiError(StatusCode::UNAUTHORIZED, msg.into()).into_response();
     };
     let (s, token) = start_session(&a, &user, method, None, cookie, label.as_deref(), &source);
-    let who = Who { actor: actor(&user, None), source };
+    let who = Who { actor: actor(&a, &user, Some(&s), method), source };
     app.db.record(&who.event("auth.login").target("session", &s.id).details(json!({ "method": method, "kind": s.kind, "label": s.label })));
     session_response(&a, &user, &s, &token)
 }
@@ -611,7 +622,7 @@ mod tests {
         let cfg = SessionConfig { idle_ms: 10 * MINUTE, max_ms: 60 * MINUTE };
         let token = new_secret(SESSION_PREFIX);
         fn new(token_hash: &str, max_ms: i64) -> NewSession<'_> {
-            NewSession { user_id: OPERATOR, token_hash, kind: "token", method: "password", idp_subject: None, label: None, ip: None, user_agent: None, expires_at: db::now() + max_ms }
+            NewSession { user_id: OPERATOR, token_hash, kind: "token", method: "password", idp_subject: None, idp_provider: None, label: None, ip: None, user_agent: None, expires_at: db::now() + max_ms }
         }
         let s = db.create_session(&new(&hash(&token), cfg.max_ms));
         let t0 = s.created_at;
