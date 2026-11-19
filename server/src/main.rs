@@ -168,6 +168,7 @@ async fn main() {
 
 // Errors
 
+#[derive(Debug)]
 struct ApiError(StatusCode, String);
 
 impl IntoResponse for ApiError {
@@ -573,23 +574,57 @@ async fn list_routines(State(app): State<AppState>, Path(id): Path<String>) -> R
     Ok(Json(json!(app.db.routines(Some(&id)))))
 }
 
+/// Routine fields from a create or edit body. Absent fields are None; present ones
+/// must be non-empty strings (trimmed), a valid cron, and a boolean `enabled`.
+#[derive(Debug, Default, PartialEq)]
+struct RoutineFields {
+    name: Option<String>,
+    cron: Option<String>,
+    instruction: Option<String>,
+    enabled: Option<bool>,
+}
+
+fn routine_fields(v: &Value) -> Res<RoutineFields> {
+    let text = |key: &str, max: usize| -> Res<Option<String>> {
+        match v.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) if !s.trim().is_empty() => Ok(Some(s.trim().chars().take(max).collect())),
+            Some(_) => Err(bad(format!("{key} can't be empty"))),
+        }
+    };
+    let f = RoutineFields {
+        name: text("name", 100)?,
+        cron: text("cron", 100)?,
+        instruction: text("instruction", 100_000)?,
+        enabled: match v.get("enabled") {
+            None | Some(Value::Null) => None,
+            Some(Value::Bool(b)) => Some(*b),
+            Some(_) => return Err(bad("enabled must be true or false")),
+        },
+    };
+    if let Some(c) = &f.cron {
+        cron::parse(c).map_err(bad)?;
+    }
+    Ok(f)
+}
+
 async fn create_routine(State(app): State<AppState>, Path(id): Path<String>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
     need_bot(&app, &id)?;
-    let field = |k: &str| v[k].as_str().map(str::trim).filter(|s| !s.is_empty());
-    let (Some(name), Some(cron_expr), Some(instruction)) = (field("name"), field("cron"), field("instruction")) else {
+    let f = routine_fields(&v)?;
+    let (Some(name), Some(cron_expr), Some(instruction)) = (f.name, f.cron, f.instruction) else {
         return Err(bad("name, cron, and instruction are required"));
     };
-    cron::parse(cron_expr).map_err(bad)?;
-    Ok((StatusCode::CREATED, Json(json!(app.db.add_routine(&id, name, cron_expr, instruction)))))
+    let r = app.db.add_routine(&id, &name, &cron_expr, &instruction);
+    if f.enabled == Some(false) {
+        app.db.update_routine(&r.id, None, None, None, Some(false));
+    }
+    Ok((StatusCode::CREATED, Json(json!(app.db.routine(&r.id)))))
 }
 
 async fn update_routine(State(app): State<AppState>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
     app.db.routine(&id).ok_or_else(|| not_found("Routine"))?;
-    let cron_expr = v["cron"].as_str();
-    if let Some(c) = cron_expr {
-        cron::parse(c).map_err(bad)?;
-    }
-    app.db.update_routine(&id, v["name"].as_str(), cron_expr, v["instruction"].as_str(), v["enabled"].as_bool());
+    let f = routine_fields(&v)?;
+    app.db.update_routine(&id, f.name.as_deref(), f.cron.as_deref(), f.instruction.as_deref(), f.enabled);
     Ok(Json(json!(app.db.routine(&id))))
 }
 
@@ -689,6 +724,119 @@ mod tests {
         let port = serve("", true, "").await;
         let host = format!("127.0.0.1:{port}");
         assert_eq!(status(port, &host, "").await, 200);
+    }
+
+    #[test]
+    fn routine_fields_validate_and_trim() {
+        let f = routine_fields(&json!({ "name": "  Digest ", "cron": "0 9 * * 1-5", "instruction": " Sum up email ", "enabled": false })).unwrap();
+        assert_eq!(
+            f,
+            RoutineFields { name: Some("Digest".into()), cron: Some("0 9 * * 1-5".into()), instruction: Some("Sum up email".into()), enabled: Some(false) }
+        );
+        assert_eq!(routine_fields(&json!({})).unwrap(), RoutineFields::default());
+        assert_eq!(routine_fields(&json!({ "name": null })).unwrap(), RoutineFields::default());
+        assert!(routine_fields(&json!({ "name": "   " })).is_err());
+        assert!(routine_fields(&json!({ "instruction": "" })).is_err());
+        assert!(routine_fields(&json!({ "name": 5 })).is_err());
+        assert!(routine_fields(&json!({ "cron": "61 * * * *" })).is_err());
+        assert!(routine_fields(&json!({ "cron": "* * *" })).is_err());
+        assert!(routine_fields(&json!({ "enabled": "no" })).is_err());
+        let long = routine_fields(&json!({ "name": "x".repeat(500) })).unwrap();
+        assert_eq!(long.name.unwrap().len(), 100);
+    }
+
+    async fn serve_routines() -> (u16, Arc<App>, String, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("botd-test-{}", random_hex(6)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("app.sqlite")).unwrap();
+        let app = App::new(db, Config {
+            data_dir: dir.clone(),
+            workspace: dir.clone(),
+            user_name: "the user".into(),
+            bin_dir: dir.clone(),
+            api_url: "http://127.0.0.1:0".into(),
+            bot_token: "bot-token".into(),
+            run_timeout: Duration::from_secs(60),
+            default_harness: "claude".into(),
+        }, None);
+        let bot = app.db.create_bot("Tester", "#f5f5f5", "waddle", "claude", None, true);
+        let router = Router::new()
+            .route("/api/bots/{id}/routines", get(list_routines).post(create_routine))
+            .route("/api/routines/{id}", patch(update_routine).delete(delete_routine))
+            .with_state(app.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (port, app, bot.id, dir)
+    }
+
+    async fn call(port: u16, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let body = body.map(|b| b.to_string()).unwrap_or_default();
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut res = String::new();
+        s.read_to_string(&mut res).await.unwrap();
+        let code = res.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let json = res.split_once("\r\n\r\n").and_then(|(_, b)| serde_json::from_str(b).ok()).unwrap_or(Value::Null);
+        (code, json)
+    }
+
+    #[tokio::test]
+    async fn routine_create_edit_delete() {
+        let (port, app, bot, dir) = serve_routines().await;
+        let base = format!("/api/bots/{bot}/routines");
+
+        let (code, _) = call(port, "POST", &base, Some(json!({ "name": "", "cron": "0 9 * * *", "instruction": "x" }))).await;
+        assert_eq!(code, 400);
+        let (code, _) = call(port, "POST", &base, Some(json!({ "name": "A", "cron": "nope", "instruction": "x" }))).await;
+        assert_eq!(code, 400);
+        let (code, _) = call(port, "POST", "/api/bots/missing/routines", Some(json!({ "name": "A", "cron": "0 9 * * *", "instruction": "x" }))).await;
+        assert_eq!(code, 404);
+
+        let (code, r) = call(port, "POST", &base, Some(json!({ "name": " Digest ", "cron": "0 9 * * *", "instruction": "Sum up" }))).await;
+        assert_eq!(code, 201);
+        assert_eq!(r["name"], "Digest");
+        assert_eq!(r["enabled"], true);
+        let id = r["id"].as_str().unwrap().to_string();
+        let path = format!("/api/routines/{id}");
+
+        let (code, paused) = call(port, "POST", &base, Some(json!({ "name": "B", "cron": "0 9 * * *", "instruction": "y", "enabled": false }))).await;
+        assert_eq!(code, 201);
+        assert_eq!(paused["enabled"], false);
+
+        let (code, _) = call(port, "PATCH", &path, Some(json!({ "name": "   " }))).await;
+        assert_eq!(code, 400);
+        let (code, _) = call(port, "PATCH", &path, Some(json!({ "cron": "99 * * * *" }))).await;
+        assert_eq!(code, 400);
+        assert_eq!(app.db.routine(&id).unwrap().name, "Digest");
+        assert_eq!(app.db.routine(&id).unwrap().cron, "0 9 * * *");
+
+        let edit = json!({ "name": " Weekday digest ", "cron": "30 8 * * 1-5", "instruction": "Sum up email", "enabled": false });
+        let (code, r) = call(port, "PATCH", &path, Some(edit)).await;
+        assert_eq!(code, 200);
+        assert_eq!(r["name"], "Weekday digest");
+        assert_eq!(r["cron"], "30 8 * * 1-5");
+        assert_eq!(r["instruction"], "Sum up email");
+        assert_eq!(r["enabled"], false);
+
+        let (code, list) = call(port, "GET", &base, None).await;
+        assert_eq!(code, 200);
+        assert_eq!(list.as_array().unwrap().len(), 2);
+
+        let (code, _) = call(port, "DELETE", &path, None).await;
+        assert_eq!(code, 200);
+        assert!(app.db.routine(&id).is_none());
+        let (code, _) = call(port, "PATCH", &path, Some(json!({ "enabled": true }))).await;
+        assert_eq!(code, 404);
+        let (code, _) = call(port, "DELETE", &path, None).await;
+        assert_eq!(code, 404);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
