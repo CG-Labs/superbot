@@ -73,12 +73,17 @@ pub fn value(v: Value) -> Value {
     }
 }
 
-/// Environment variable names whose values are treated as secrets.
+/// Names that mention a secret (`AWS_ACCESS_KEY_ID`, `OPENAI_API_KEY`, ...).
+pub fn names_secret(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "PRIVATE"].iter().any(|w| n.contains(w))
+}
+
+/// Environment variable names whose values are treated as secrets: they mention one
+/// and don't look like they hold a path or an id instead.
 pub fn looks_secret(name: &str) -> bool {
     let n = name.to_ascii_uppercase();
-    let words = ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "PRIVATE"];
-    let not_values = ["_FILE", "_PATH", "_DIR", "_SOCK", "_ID"];
-    words.iter().any(|w| n.contains(w)) && !not_values.iter().any(|s| n.ends_with(s))
+    names_secret(&n) && !["_FILE", "_PATH", "_DIR", "_SOCK", "_ID"].iter().any(|s| n.ends_with(s))
 }
 
 /// Redacts known secrets already saved in chat text, choice cards, and approval

@@ -60,14 +60,18 @@ impl SecretStore for EnvStore {
         self.var(name).is_some()
     }
 
-    /// Set variables whose names look like secrets (`*_API_KEY`, `*_TOKEN`, ...), with or without `_FILE`.
+    /// Set variables whose names look like secrets (`*_API_KEY`, `*_TOKEN`, ...), and
+    /// `NAME_FILE` for any name that mentions one: a file is set up on purpose to hold a
+    /// value, so `AWS_ACCESS_KEY_ID_FILE` counts even though `*_ID` alone is a guess too far.
     fn names(&self) -> Result<Vec<String>, Error> {
         let mut names: Vec<String> = self
             .keys()
             .into_iter()
             .filter(|k| self.var(k).is_some())
-            .map(|k| k.strip_suffix("_FILE").map(String::from).unwrap_or(k))
-            .filter(|k| redact::looks_secret(k))
+            .filter_map(|k| match k.strip_suffix("_FILE") {
+                Some(stem) => redact::names_secret(stem).then(|| stem.to_string()),
+                None => redact::looks_secret(&k).then_some(k),
+            })
             .collect();
         names.sort();
         names.dedup();
@@ -92,6 +96,9 @@ mod tests {
             ("D_TOKEN", ""),
             ("E_TOKEN_FILE", "/nonexistent/superbot-secret"),
             ("TZ", "UTC"),
+            ("AWS_ACCESS_KEY_ID_FILE", f),
+            ("AWS_REGION_ID", "x"),
+            ("LOG_FILE", f),
         ]);
         assert_eq!(env.get("A_TOKEN").unwrap().unwrap().expose(), "value-1");
         assert_eq!(env.get("B_TOKEN").unwrap().unwrap().expose(), "from-file");
@@ -99,6 +106,7 @@ mod tests {
         assert!(env.get("D_TOKEN").unwrap().is_none());
         assert!(matches!(env.get("E_TOKEN"), Err(Error::Store(_))));
         assert!(env.get("NOPE").unwrap().is_none());
-        assert_eq!(env.names().unwrap(), ["A_TOKEN", "B_TOKEN", "C_TOKEN", "E_TOKEN"]);
+        assert_eq!(env.names().unwrap(), ["AWS_ACCESS_KEY_ID", "A_TOKEN", "B_TOKEN", "C_TOKEN", "E_TOKEN"], "files of any secret-named variable, not LOG_FILE");
+        assert_eq!(env.get("AWS_ACCESS_KEY_ID").unwrap().unwrap().expose(), "from-file");
     }
 }
