@@ -43,7 +43,7 @@ The server is still the computer, so treat it that way. Details and trade-offs: 
 [Hermes Agent](https://github.com/NousResearch/hermes-agent) (Nous Research, MIT), tested on v0.23.2. Design: [ADR 0011](adr/0011-hermes-agent-backend.md) option (a), details in [ADR 0013](adr/0013-hermes-adapter.md).
 
 - **Install**: `deploy/install.sh --with-hermes`, or `hermes` in `SUPERBOT_HARNESSES` for Docker ([deploy/README.md](../deploy/README.md)). Both pin a commit. Then pick Hermes Agent for a Bot in its settings, or set `DEFAULT_HARNESS=hermes`.
-- **Provider and key**: save the key encrypted, e.g. `botctl secret set OPENROUTER_API_KEY < key.txt`. Saved secrets reach Hermes as env vars; Hermes hides its provider keys from the agent's shell. `SUPERBOT_HERMES_PROVIDER` and `SUPERBOT_HERMES_BASE_URL` in `.env` become `--provider` and `--base-url`; empty means Hermes's own config. The model is free text (Hermes can't list models without a prompt). Effort maps to `--reasoning` (`none` to `max`).
+- **Provider and key**: save the key encrypted, e.g. `botctl secret set OPENROUTER_API_KEY < key.txt`. Saved secrets reach Hermes as env vars; Hermes hides its provider keys from the agent's shell. `SUPERBOT_HERMES_PROVIDER` and `SUPERBOT_HERMES_BASE_URL` in `.env` become `--provider` and `--base-url`; empty means Hermes's own config. The model is free text (Hermes can't list models without a prompt): the apps show a text field, and the web UI an "Other model…" choice. Effort maps to `--reasoning` (`none` to `ultra`).
 - **Per Bot**: each Bot has its own Hermes data root, `DATA_DIR/bots/<id>/hermes`. The first run of a new Bot prepares Hermes's dependencies there: about 20 seconds and 0.5 GB, once.
 - **Settings botd enforces** go in `DATA_DIR/bots/<id>/hermes-managed/config.yaml` (Hermes's managed scope, 0600, rewritten every run): the approval hook, tool env passthrough (variable names only, never values), Hermes's own memory off, and its cron tools off. botd owns memory and routines.
 - **Daemon**: `hermes chat` hands the turn to a Hermes gateway daemon that outlives it. botd runs `hermes gateway stop --yes` for the Bot before and after every run, so stopping a Bot ends the turn and each run gets fresh env.
@@ -172,7 +172,7 @@ All JSON. Auth: a session cookie (web app) or `Authorization: Bearer <session to
 - `GET /api/events`: SSE stream (`message`, `draft`, `status`, `bot`, `botDeleted`, `approval`, `policy`, `resync`)
 - `POST /api/bots` `{name, harness?, model?, color?, shape?}`
 - `PATCH /api/bots/:id` `{name?, hidden?, harness?, model?, effort?}`, `DELETE /api/bots/:id`
-- `GET /api/harnesses/:name/models`: models and reasoning efforts the harness offers (Claude Code: aliases; Codex: `codex debug models`; Pi: `pi --list-models`; Hermes Agent: none, the model is free text)
+- `GET /api/harnesses/:name/models`: models and reasoning efforts the harness offers (Claude Code: aliases; Codex: `codex debug models`; Pi: `pi --list-models`; Hermes Agent: one entry with an empty `id`, meaning any model name, with its efforts)
 - `GET|POST /api/bots/:id/messages` `{text, answer?: {messageId, option}}`
 - `POST /api/bots/:id/read`, `POST /api/bots/:id/stop`
 - `GET|POST /api/bots/:id/routines` `{name, cron, instruction}`

@@ -91,6 +91,7 @@ pub trait Adapter: Send {
 
 #[derive(Clone, serde::Serialize)]
 pub struct ModelOption {
+    /// Empty: the harness takes any model name, typed by the user, with these efforts.
     pub id: String,
     pub label: String,
     /// Efforts this model accepts. Empty = no effort setting.

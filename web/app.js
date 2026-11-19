@@ -299,6 +299,7 @@ function render(keepScroll) {
 const modelLists = {}; // harness -> Promise<[{id, label, efforts}]>
 let modelBarKey = "";
 const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+const OTHER_MODEL = "__other_model__";
 
 async function renderModelBar() {
   const first = bot(activeId);
@@ -312,13 +313,16 @@ async function renderModelBar() {
   modelBarKey = key;
 
   const all = [...new Set(list.flatMap((m) => m.efforts))];
-  const models = [{ id: "", label: "Default model", efforts: all }, ...list];
+  // An entry without an id: the harness takes any model name (typed in "Other model…").
+  const freeText = list.some((m) => !m.id);
+  const models = [{ id: "", label: "Default model", efforts: all }, ...list.filter((m) => m.id)];
   // A Bot saved with an alias (e.g. "opus") shows as its exact model.
   const isCurrent = (m) => m.id === (b.model || "") || (b.model && m.aliases?.includes(b.model));
   if (b.model && !list.some(isCurrent)) models.push({ id: b.model, label: b.model, efforts: all });
   const current = models.find(isCurrent);
   $("model-select").innerHTML = models.map((m) =>
-    `<option value="${esc(m.id)}" ${m === current ? "selected" : ""}>${esc(m.label)}</option>`).join("");
+    `<option value="${esc(m.id)}" ${m === current ? "selected" : ""}>${esc(m.label)}</option>`).join("") +
+    (freeText ? `<option value="${OTHER_MODEL}">Other model…</option>` : "");
   $("effort-select").innerHTML = ["", ...current.efforts].map((e) =>
     `<option value="${esc(e)}" ${e === (b.effort || "") ? "selected" : ""}>${e ? cap(e) : "Default effort"}</option>`).join("");
   $("effort-select").hidden = !current.efforts.length;
@@ -335,7 +339,13 @@ async function saveModel(patch) {
 $("model-select").addEventListener("change", async (e) => {
   const b = bot(activeId);
   const list = await modelLists[b.harness];
-  const m = list.find((x) => x.id === e.target.value);
+  if (e.target.value === OTHER_MODEL) {
+    const typed = prompt("Model name, as the harness expects it:", b.model || "")?.trim();
+    if (typed) saveModel({ model: typed });
+    else { modelBarKey = ""; renderModelBar(); }
+    return;
+  }
+  const m = list.find((x) => x.id === e.target.value && x.id);
   // Keep the effort only if the new model supports it.
   const effort = m && b.effort && !m.efforts.includes(b.effort) ? null : b.effort;
   saveModel({ model: e.target.value || null, effort });
