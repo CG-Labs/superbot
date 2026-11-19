@@ -329,6 +329,14 @@ async fn the_app_trades_a_one_time_code_and_its_verifier_for_a_token() {
     let res: Value = serde_json::from_str(&res).unwrap();
     assert!(res["token"].as_str().unwrap().starts_with("sbs_"));
     assert_eq!((res["user"]["role"].as_str(), res["user"]["email"].as_str(), res["session"]["label"].as_str()), (Some("member"), Some("ada@example.com"), Some("Phone")));
+    let token = format!("Bearer {}", res["token"].as_str().unwrap());
+    assert_eq!(call(port, "POST", "/api/bots", &token, r#"{"name":"From the app"}"#).await.0, 201);
+    let made = &audit_list(&call(port, "GET", "/api/audit?action=bot.created", &admin, "").await.1)[0];
+    assert_eq!(
+        (made["authMethod"].as_str(), made["idpProvider"].as_str(), made["idp"].as_str(), made["sessionId"].as_str()),
+        (Some("sso"), Some(id.as_str()), Some("entra"), res["session"]["id"].as_str()),
+        "an app token from SSO acts with its IdP"
+    );
     assert_eq!(redeem(&q["code"], &verifier).await.0, 401, "used once");
     let created = audit_list(&call(port, "GET", "/api/audit?action=user.created", &admin, "").await.1);
     assert!(created.iter().any(|e| e["details"]["reason"] == "just-in-time sign-up" && e["details"]["subject"] == OID && e["actorKind"] == "system"));
@@ -584,4 +592,65 @@ async fn entra_google_and_oidc_side_by_side_sign_in_to_one_linked_user() {
     let (_, head, _) = call_with(port, "GET", &swapped, "", &binder, "").await;
     assert_eq!(header(&head, "location").as_deref(), Some("/login?error=sso_failed"));
     assert_eq!(failures(port, &admin).await[0]["details"]["reason"].as_str(), Some("wrong_provider"));
+}
+
+#[tokio::test]
+async fn each_providers_sessions_put_its_idp_on_every_audit_event() {
+    let (entra, google, okta) = (mock_idp().await, mock_oidc("", false, google_claims()).await, mock_oidc("/oauth2/default", false, json!({ "sub": "00u1", "email": "ada@example.com", "email_verified": true })).await);
+    let ids = [format!("e{}", random_hex(4)), format!("g{}", random_hex(4)), format!("o{}", random_hex(4))];
+    let mut vars: HashMap<String, String> = HashMap::from([("SSO_PROVIDERS".into(), ids.join(","))]);
+    vars.extend(provider_vars(&ids[0], "entra", &entra.authority, &entra.secret, &[("TENANT", T1)]));
+    vars.extend(provider_vars(&ids[1], "google", &google.issuer, &google.secret, &[]));
+    vars.extend(provider_vars(&ids[2], "oidc", &okta.issuer, &okta.secret, &[]));
+    let (port, app, admin) = serve_vars(vars).await;
+    let u = app.db.create_user(None, Some("ada@corp.example"), "Ada", Role::Member).unwrap();
+    let mut keys = Vec::new();
+    for (id, subject) in ids.iter().zip([OID, "1077", "00u1"]) {
+        let (code, i) = call(port, "POST", &format!("/api/users/{}/identities", u.id), &admin, &json!({ "provider": id, "subject": subject }).to_string()).await;
+        assert_eq!(code, 201, "{i}");
+        keys.push(format!("{}|{subject}", serde_json::from_str::<Value>(&i).unwrap()["issuer"].as_str().unwrap()));
+    }
+
+    for (n, ty) in ["entra", "google", "oidc"].into_iter().enumerate() {
+        let (code, head) = web_sign_in(port, &ids[n]).await;
+        assert_eq!(code, 200, "{head}");
+        let cookie = set_cookies(&head).into_iter().find(|c| c.starts_with("superbot_session=sbs_")).unwrap();
+        let web = format!("Cookie: {}\r\nOrigin: http://127.0.0.1:{port}\r\n", cookie.split(';').next().unwrap());
+        let (_, _, me) = call_with(port, "GET", "/api/auth/me", "", &web, "").await;
+        let session = serde_json::from_str::<Value>(&me).unwrap()["session"].clone();
+        assert_eq!(session["idpProvider"].as_str(), Some(ids[n].as_str()));
+        let session = session["id"].as_str().unwrap().to_string();
+        assert_eq!(call_with(port, "POST", "/api/bots", "", &web, &json!({ "name": ty }).to_string()).await.0, 201);
+
+        let all = audit_list(&call(port, "GET", &format!("/api/audit?session={session}"), &admin, "").await.1);
+        let actions: Vec<&str> = all.iter().map(|e| e["action"].as_str().unwrap()).collect();
+        assert_eq!(actions, ["bot.created", "auth.login"], "{ty}");
+        for e in &all {
+            assert_eq!(
+                (e["actorId"].as_str(), e["actorEmail"].as_str(), e["actorRole"].as_str(), e["authMethod"].as_str()),
+                (Some(u.id.as_str()), Some("ada@corp.example"), Some("member"), Some("sso")),
+                "{ty}"
+            );
+            assert_eq!((e["idpProvider"].as_str(), e["idp"].as_str(), e["actorSubject"].as_str()), (Some(ids[n].as_str()), Some(ty), Some(keys[n].as_str())), "{ty}");
+        }
+    }
+
+    // Filter by provider, provider type, or the exact IdP subject.
+    let q = |query: String| {
+        let admin = admin.clone();
+        async move { audit_list(&call(port, "GET", &format!("/api/audit?action=bot.created&{query}"), &admin, "").await.1) }
+    };
+    let names = |ev: Vec<Value>| ev.iter().map(|e| e["details"]["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert_eq!(names(q("idp=google".into()).await), ["google"]);
+    assert_eq!(names(q(format!("idpProvider={}", ids[2])).await), ["oidc"]);
+    assert_eq!(names(q("method=sso".into()).await), ["oidc", "google", "entra"]);
+    let subject: String = url::form_urlencoded::byte_serialize(keys[0].as_bytes()).collect();
+    assert_eq!(names(q(format!("subject={subject}")).await), ["entra"]);
+
+    // A failed SSO sign-in names the provider it was tried at.
+    let (path, binder) = to_callback(port, &format!("/api/auth/sso/{}/start", ids[1])).await;
+    let swapped = path.replace(&format!("/sso/{}/", ids[1]), &format!("/sso/{}/", ids[2]));
+    call_with(port, "GET", &swapped, "", &binder, "").await;
+    let failed = &failures(port, &admin).await[0];
+    assert_eq!((failed["authMethod"].as_str(), failed["idpProvider"].as_str(), failed["idp"].as_str(), failed["actorId"].as_str()), (Some("sso"), Some(ids[2].as_str()), Some("oidc"), None));
 }

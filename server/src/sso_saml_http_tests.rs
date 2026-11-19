@@ -1,4 +1,4 @@
-//! The SAML bridge end to end (ADR 0019): the real router against a mock OIDC broker
+//! The SAML bridge end to end (ADR 0020): the real router against a mock OIDC broker
 //! (Keycloak) whose ID tokens say which SAML IdP it used and that IdP's NameID. The SAML
 //! hop is the broker's; botd checks the broker's signed answer and who vouched in it.
 
@@ -53,8 +53,13 @@ async fn saml_bridge_signs_in_only_people_the_saml_idp_vouched_for() {
     // Vouched for by the SAML IdP, but nobody linked them: the audit event names the NameID and the IdP.
     let (code, head) = web_sign_in(port, &id).await;
     assert_eq!((code, header(&head, "location").as_deref()), (303, Some("/login?error=sso_not_linked")));
-    let f = &failures(port, &admin).await[0]["details"];
+    let failed = &failures(port, &admin).await[0];
+    let f = &failed["details"];
     assert_eq!((f["reason"].as_str(), f["subject"].as_str(), f["issuer"].as_str(), f["idp"].as_str()), (Some("not_linked"), Some(STORED), Some(ADFS), Some("saml")));
+    assert_eq!(
+        (failed["actorSubject"].as_str(), failed["authMethod"].as_str(), failed["idp"].as_str(), failed["idpProvider"].as_str()),
+        (Some(format!("{ADFS}|{STORED}").as_str()), Some("sso"), Some("saml"), Some(id.as_str()))
+    );
 
     let u = app.db.create_user(None, Some("ada@corp.example"), "Ada", Role::Member).unwrap();
     let (code, i) = call(port, "POST", &format!("/api/users/{}/identities", u.id), &admin, &json!({ "provider": id, "subject": NAME_ID }).to_string()).await;
@@ -67,6 +72,13 @@ async fn saml_bridge_signs_in_only_people_the_saml_idp_vouched_for() {
     assert_eq!((code, signed_in_as(port, &head).await), (200, Some(u.id.clone())));
     let login = &audit_list(&call(port, "GET", "/api/audit?action=auth.login", &admin, "").await.1)[0];
     assert_eq!((login["actorSubject"].as_str(), login["details"]["idp"].as_str(), login["details"]["provider"].as_str()), (Some(format!("{ADFS}|{STORED}").as_str()), Some("saml"), Some(id.as_str())));
+    assert_eq!(
+        (login["actorId"].as_str(), login["actorEmail"].as_str(), login["actorRole"].as_str(), login["authMethod"].as_str()),
+        (Some(u.id.as_str()), Some("ada@corp.example"), Some("member"), Some("sso"))
+    );
+    assert_eq!((login["idp"].as_str(), login["idpProvider"].as_str(), login["sessionId"].as_str()), (Some("saml"), Some(id.as_str()), login["targetId"].as_str()));
+    let by_idp = audit_list(&call(port, "GET", "/api/audit?idp=saml&action=auth.login", &admin, "").await.1);
+    assert_eq!(by_idp.len(), 1, "filtered by IdP type");
 
     // Replayed: the same callback again finds no pending sign-in.
     let (_, head, _) = call_with(port, "GET", &path, "", &binder, "").await;

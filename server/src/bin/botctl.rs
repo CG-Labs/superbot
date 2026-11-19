@@ -72,7 +72,9 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl audit [<limit>] [filters]                 Recent audit events, newest first
   botctl audit export [filters] > audit.csv        All matching events as CSV, oldest first
     filters: --from <time> --to <time> --action <a,b.*> --actor <user|bot|system[:id]>
-             --outcome <success|failure|denied> --bot <id>
+             --actor user:<email> --method <password,code,sso,none,bot_token>
+             --idp <entra|google|oidc|github|apple|saml> --idp-provider <id> --subject <issuer|sub>
+             --session <id> --on-behalf-of <user id|email> --outcome <success|failure|denied> --bot <id>
     times: YYYY-MM-DD (UTC), RFC 3339, or unix milliseconds
   botctl secrets                                   List secret names (never values)
   botctl secret set <NAME> < value-file            Save a secret, encrypted; Bots get it as $NAME
@@ -284,9 +286,15 @@ fn audit_query(rest: &[&str]) -> Result<String, String> {
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match *a {
-            "--from" | "--to" | "--action" | "--actor" | "--outcome" | "--bot" | "--limit" => {
+            "--from" | "--to" | "--action" | "--actor" | "--method" | "--idp" | "--idp-provider" | "--subject" | "--session" | "--on-behalf-of" | "--outcome"
+            | "--bot" | "--limit" => {
                 let v = it.next().ok_or(format!("{a} needs a value"))?;
-                pairs.push(format!("{}={}", &a[2..], encode(v)));
+                let key = match *a {
+                    "--idp-provider" => "idpProvider",
+                    "--on-behalf-of" => "onBehalfOf",
+                    k => &k[2..],
+                };
+                pairs.push(format!("{key}={}", encode(v)));
             }
             n if n.parse::<u32>().is_ok() => pairs.push(format!("limit={n}")),
             other => return Err(format!("Unknown audit option \"{other}\". See botctl admin.")),
@@ -510,6 +518,14 @@ mod tests {
             "?from=2026-11-19T13:00:00%2B01:00&action=bot.*,auth.login&actor=bot:ab12"
         );
         assert_eq!(audit_query(&["--to", "a b&c"]).unwrap(), "?to=a%20b%26c");
+        assert_eq!(
+            audit_query(&["--actor", "user:ada@example.com", "--method", "sso,password", "--idp", "entra", "--idp-provider", "work"]).unwrap(),
+            "?actor=user:ada%40example.com&method=sso,password&idp=entra&idpProvider=work"
+        );
+        assert_eq!(
+            audit_query(&["--subject", "https://idp.example/t1|oid-1", "--session", "s0a1b", "--on-behalf-of", "u42"]).unwrap(),
+            "?subject=https:%2F%2Fidp.example%2Ft1%7Coid-1&session=s0a1b&onBehalfOf=u42"
+        );
         assert!(audit_query(&["--from"]).is_err());
         assert!(audit_query(&["--nope", "x"]).is_err());
     }

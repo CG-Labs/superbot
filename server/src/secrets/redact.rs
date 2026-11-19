@@ -123,17 +123,19 @@ pub fn scrub_rows(c: &Connection) -> rusqlite::Result<usize> {
             n += tx.execute(&format!("UPDATE {table} SET {col} = replace({col}, ?1, ?2) WHERE instr({col}, ?1) > 0"), params![s, MARK])?;
         }
     }
-    // Choice cards are JSON, where a secret with quotes or backslashes is escaped, so
-    // they're parsed and redacted value by value.
-    let cards: Vec<(i64, String)> = {
-        let mut s = tx.prepare("SELECT id, question FROM messages WHERE question IS NOT NULL")?;
-        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
-    };
-    for (id, raw) in cards {
-        let Ok(card) = serde_json::from_str::<Value>(&raw) else { continue };
-        let clean = value(card.clone());
-        if clean != card {
-            n += tx.execute("UPDATE messages SET question = ? WHERE id = ?", params![clean.to_string(), id])?;
+    // Choice cards and saved requesters are JSON, where a secret with quotes or
+    // backslashes is escaped, so they're parsed and redacted value by value.
+    for col in ["question", "requested_by"] {
+        let rows: Vec<(i64, String)> = {
+            let mut s = tx.prepare(&format!("SELECT id, {col} FROM messages WHERE {col} IS NOT NULL"))?;
+            s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+        };
+        for (id, raw) in rows {
+            let Ok(json) = serde_json::from_str::<Value>(&raw) else { continue };
+            let clean = value(json.clone());
+            if clean != json {
+                n += tx.execute(&format!("UPDATE messages SET {col} = ? WHERE id = ?"), params![clean.to_string(), id])?;
+            }
         }
     }
     tx.commit()?;
@@ -212,12 +214,16 @@ mod tests {
         let secret = unique("hunter2\"hunter2\\");
         // Saved before botd knew the value, e.g. by an older version.
         let m = db.add_message(&bot.id, "bot", &format!("the key is {secret}"), Some(&json!({ "title": secret, "options": ["a"] })), false, None);
+        let ua = format!("curl/8 {secret}");
+        let who = crate::audit::Who { actor: crate::audit::Actor::operator(), source: crate::audit::Source { ip: None, user_agent: Some(ua) } };
+        db.set_requested_by(m.id, &who);
         register(&secret);
         let c = Connection::open(&path).unwrap();
-        assert_eq!(scrub_rows(&c).unwrap(), 2);
+        assert_eq!(scrub_rows(&c).unwrap(), 3);
         let m = db.message(m.id).unwrap();
         assert_eq!(m.text, "the key is [redacted]");
         assert_eq!(m.question.unwrap()["title"], MARK);
+        assert_eq!(m.requested_by.unwrap().source.user_agent.as_deref(), Some("curl/8 [redacted]"));
         assert_eq!(scrub_rows(&c).unwrap(), 0, "idempotent");
         forget(&secret);
     }

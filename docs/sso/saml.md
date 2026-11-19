@@ -1,6 +1,6 @@
 # Sign in with a SAML identity provider (ADFS, Okta, OneLogin, PingFederate, …)
 
-Lets people sign in with an identity provider that only speaks SAML 2.0, through [Keycloak](https://www.keycloak.org) as a bridge. Keycloak receives and checks the SAML response, then signs people in to SuperBot with OpenID Connect. SuperBot accepts only people that SAML IdP vouched for and links them by the IdP's own id for them, so they are the same users as with any other provider. Why a bridge and not SAML in botd: [ADR 0019](../adr/0019-saml-bridge.md). If your IdP also speaks OpenID Connect, use [the OIDC guide](oidc.md) instead: it's one service fewer.
+Lets people sign in with an identity provider that only speaks SAML 2.0, through [Keycloak](https://www.keycloak.org) as a bridge. Keycloak receives and checks the SAML response, then signs people in to SuperBot with OpenID Connect. SuperBot accepts only people that SAML IdP vouched for and links them by the IdP's own id for them, so they are the same users as with any other provider. Why a bridge and not SAML in botd: [ADR 0019](../adr/0020-saml-bridge.md). If your IdP also speaks OpenID Connect, use [the OIDC guide](oidc.md) instead: it's one service fewer.
 
 ```
 browser ──► SuperBot ──OIDC──► Keycloak ──SAML──► ADFS / Okta / …

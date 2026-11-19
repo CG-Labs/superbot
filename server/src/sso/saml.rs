@@ -1,4 +1,4 @@
-//! The SAML bridge (ADR 0019). botd never parses SAML: an OIDC broker (Keycloak) is the
+//! The SAML bridge (ADR 0020). botd never parses SAML: an OIDC broker (Keycloak) is the
 //! SAML service provider, checks the IdP's signed assertion, and signs people in to
 //! botd over OpenID Connect like any other provider. What botd adds on its side:
 //!

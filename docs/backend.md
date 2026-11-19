@@ -131,7 +131,9 @@ Values never come back out: the API lists names only. Known values (saved and en
 
 ## Audit log
 
-Admin actions are recorded in `audit_events` in `app.sqlite`: who (person, Bot, or system part), what (`bot.created`, `routine.disabled`, `approval.denied`, ...), the target, the outcome, the source IP and user agent, and a few scrubbed details. Logins and failed logins, Bot and routine changes, policy, rules, approvals, handoffs, and Bot-token calls are all covered; the full list is in [ADR 0009](adr/0009-audit-events.md).
+Admin actions are recorded in `audit_events` in `app.sqlite`: who (person, Bot, or system part), what (`bot.created`, `routine.disabled`, `approval.denied`, ...), the target, the outcome, the source IP and user agent, and a few scrubbed details. Logins and failed logins, Bot and routine changes, policy, rules, approvals, handoffs, Bot-token calls, Bot runs (`bot.run_finished`), and harness starts (`harness.invoked`) are all covered; the full list is in [ADR 0009](adr/0009-audit-events.md).
+
+- **Who, exactly**: a person's id, name, email, and role when they acted; how they signed in (`password` = break-glass `AUTH_PASSWORD`, `code`, `sso`, `none`, `bot_token`); for SSO, the IdP type (`entra`, `google`, `oidc`, `github`, `apple`, `saml`), its configured provider id, and their IdP subject; and the session id. A Bot (or a routine) records whose authority it used: its owner, as `onBehalfOf`. A Bot run is attributed to whoever queued it: the person who sent the chat, the Bot that asked, or the scheduler. Rows from before this was added leave these empty. Design: [ADR 0019](adr/0019-audit-actors.md).
 
 - **Append-only**: no API edits or deletes rows, and SQLite triggers refuse `UPDATE` and any `DELETE` inside the retention window.
 - **No secrets**: passwords, tokens, message bodies, and routine instructions are never recorded. Details are scrubbed and clipped anyway.
@@ -143,16 +145,19 @@ Admin actions are recorded in `audit_events` in `app.sqlite`: who (person, Bot, 
 export SUPERBOT_PASSWORD=<your AUTH_PASSWORD>
 botctl audit --action 'bot.*' --from 2026-11-01            # newest first
 botctl audit export --actor user --to 2026-11-30 > audit.csv
+botctl audit --actor user:ada@example.com --method sso      # one person's SSO actions
+botctl audit --on-behalf-of ada@example.com --action 'harness.*'   # what her Bots ran
+botctl audit export --session <session id> > session.csv   # everything one sign-in did
 ```
 
-CSV export is RFC 4180 with CRLF line endings, oldest first. Cells that start with `=`, `+`, `-`, `@`, tab, or CR get a leading `'` so spreadsheets don't treat them as formulas.
+CSV export is RFC 4180 with CRLF line endings, oldest first. Columns: `id,time,actor_kind,actor_id,actor_name,actor_subject,action,target_type,target_id,bot_id,outcome,ip,user_agent,details,actor_email,actor_role,auth_method,idp,idp_provider,session_id,on_behalf_of` (the last seven were added after the first fourteen, which keep their positions). Cells that start with `=`, `+`, `-`, `@`, tab, or CR get a leading `'` so spreadsheets don't treat them as formulas.
 
 ## Users, sessions, and roles
 
 People are users with a role: **admin** (everything), **member** (use and manage Bots and routines, decide approvals), or **read-only** (see everything, change nothing). Admins also manage policy, the audit log, users, sessions, and saved secrets. One check per API route enforces it; unknown routes are admin-only. Design: [ADR 0012](adr/0012-users-sessions-rbac.md).
 
 - **Owner**: made on first start as admin `operator` (name `USER_NAME`, email `OWNER_EMAIL`). `AUTH_PASSWORD` signs in as the owner (break-glass) while `AUTH_BREAK_GLASS` is on, the default. Set `AUTH_BREAK_GLASS=0` to ignore the password once admins sign in another way.
-- **Everyone else**: signs in with Microsoft Entra ID, Google, GitHub, Apple, any OpenID Connect IdP (Okta, Keycloak, Auth0, …), or a SAML IdP (ADFS, Okta, …) through a Keycloak bridge when set up, several at once if you like ([Entra](sso/entra.md), [Google](sso/google.md), [GitHub](sso/github.md), [Apple](sso/apple.md), [OIDC](sso/oidc.md), [SAML](sso/saml.md), [ADR 0014](adr/0014-oidc-sso-entra.md), [ADR 0016](adr/0016-sso-multi-provider.md), [ADR 0018](adr/0018-sso-github-apple.md), [ADR 0019](adr/0019-saml-bridge.md)): an admin links their account at each IdP to a user (`botctl user link`), or just-in-time sign-up makes one. Email never links accounts. Or an admin gives them a one-time sign-in code, which they enter in the web app or client. Codes are single use and expire (default 1 hour).
+- **Everyone else**: signs in with Microsoft Entra ID, Google, GitHub, Apple, any OpenID Connect IdP (Okta, Keycloak, Auth0, …), or a SAML IdP (ADFS, Okta, …) through a Keycloak bridge when set up, several at once if you like ([Entra](sso/entra.md), [Google](sso/google.md), [GitHub](sso/github.md), [Apple](sso/apple.md), [OIDC](sso/oidc.md), [SAML](sso/saml.md), [ADR 0014](adr/0014-oidc-sso-entra.md), [ADR 0016](adr/0016-sso-multi-provider.md), [ADR 0018](adr/0018-sso-github-apple.md), [ADR 0020](adr/0020-saml-bridge.md)): an admin links their account at each IdP to a user (`botctl user link`), or just-in-time sign-up makes one. Email never links accounts. Or an admin gives them a one-time sign-in code, which they enter in the web app or client. Codes are single use and expire (default 1 hour).
 - **Sessions**: the web app gets an HttpOnly cookie, the client and `botctl` a bearer token. They end after `SESSION_IDLE_TIMEOUT` without use (default `7d`) or `SESSION_MAX_AGE` after sign-in (default `30d`), on logout, or when an admin revokes them or disables the user. Only hashes are stored.
 
 ```sh
@@ -198,7 +203,7 @@ All JSON. Auth: a session cookie (web app) or `Authorization: Bearer <session to
 Sign-in, users, and sessions ([ADR 0012](adr/0012-users-sessions-rbac.md)). Users and sessions are admin only:
 
 - `POST /api/auth/login` `{password | code | sso + verifier, session?: "cookie" | "token", label?}` → `{user, session, token}`. No credentials needed. 429 after 10 failures from one IP in 10 minutes
-- Single sign-on ([ADR 0014](adr/0014-oidc-sso-entra.md), [ADR 0016](adr/0016-sso-multi-provider.md), [ADR 0018](adr/0018-sso-github-apple.md), [ADR 0019](adr/0019-saml-bridge.md)), no credentials needed: `GET /api/auth/sso` → `{providers: [{id, label, type: "entra" | "google" | "oidc" | "github" | "apple" | "saml"}]}` in `SSO_PROVIDERS` order; `GET /api/auth/sso/:id/start?session=cookie|token&redirect=&challenge=&state=&label=` redirects to the IdP; `GET /api/auth/sso/:id/callback` is where it comes back
+- Single sign-on ([ADR 0014](adr/0014-oidc-sso-entra.md), [ADR 0016](adr/0016-sso-multi-provider.md), [ADR 0018](adr/0018-sso-github-apple.md), [ADR 0020](adr/0020-saml-bridge.md)), no credentials needed: `GET /api/auth/sso` → `{providers: [{id, label, type: "entra" | "google" | "oidc" | "github" | "apple" | "saml"}]}` in `SSO_PROVIDERS` order; `GET /api/auth/sso/:id/start?session=cookie|token&redirect=&challenge=&state=&label=` redirects to the IdP; `GET /api/auth/sso/:id/callback` is where it comes back
 - `GET|POST /api/users/:id/identities` `{provider, subject, tenant?}`, `DELETE /api/users/:id/identities/:identity`: SSO identities linked to a user
 - `POST /api/auth/logout`, `GET /api/auth/me`: the caller's user, role, permissions, and session
 - `GET|POST /api/users` `{email, name?, role?}`, `GET|PATCH /api/users/:id-or-email` `{name?, email?, role?, status?: active|disabled}`. The owner can't be demoted or disabled (409)
@@ -213,7 +218,7 @@ Approvals, policy, and audit. Writes, decisions, the approvals list, and the aud
 - `GET /api/approvals?status=pending|approved|denied|expired|cancelled|all&bot=<id>&limit=`
 - `POST /api/approvals/:id/approve`, `POST /api/approvals/:id/deny` `{remember?: "bot"|"global", note?}`. Remember needs an admin. 409 if already decided
 - `POST /api/approvals/check` `{from, harness, event}`: the hook's call. Waits for a decision. Replies `allow` or `deny`, then the reason, as plain text
-- `GET /api/audit?from=&to=&action=&actor=&outcome=&bot=&limit=&before=<id>`: audit events, newest first, `{events, nextBefore}`. `from`/`to`: unix ms, RFC 3339, or `YYYY-MM-DD`. `action`: exact or `prefix.*`, comma-separated. `actor`: `user`, `bot`, or `system`, optionally `:<id>`. `limit` 1 to 1000, default 100
+- `GET /api/audit?from=&to=&action=&actor=&outcome=&bot=&limit=&before=<id>`: audit events, newest first, `{events, nextBefore}`. `from`/`to`: unix ms, RFC 3339, or `YYYY-MM-DD`. `action`: exact or `prefix.*`, comma-separated. `actor`: `user`, `bot`, or `system`, optionally `:<id>` (or `user:<email>`). Also `method` (comma-separated `password`, `code`, `sso`, `none`, `bot_token`), `idp` (type), `idpProvider` (id), `subject` (`<issuer>|<sub>`), `session`, `onBehalfOf` (user id or email). Each event has `actorEmail`, `actorRole`, `authMethod`, `idp`, `idpProvider`, `sessionId`, `onBehalfOf`. `limit` 1 to 1000, default 100
 - `GET /api/audit/export.csv` (same filters): CSV download, oldest first
 - `GET /api/secrets`: `{secrets: [{name, store, writable, shadowedBy, forBots}]}`, names only; `forBots` is false for botd's own SSO client secrets. `PUT /api/secrets/:name` `{value}`, `DELETE /api/secrets/:name`. Admin only
 

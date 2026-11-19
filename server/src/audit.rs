@@ -2,19 +2,22 @@
 //! triggers refuse UPDATE, and DELETE of anything younger than the retention
 //! window (`AUDIT_RETENTION_DAYS`). Never put secrets or message bodies in an
 //! event; `details` is scrubbed on write as a second line of defense.
-//! Design: docs/adr/0009-audit-events.md.
+//! Design: docs/adr/0009-audit-events.md; per-user actors and IdP: 0019-audit-actors.md.
 
-use crate::db::{now, AuditEvent};
+use crate::db::{now, AuditEvent, Bot};
 use crate::runner::App;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ActorKind {
     User,
     Bot,
+    #[default]
     System,
 }
 
@@ -28,30 +31,68 @@ impl ActorKind {
     }
 }
 
-/// Who acted. Today a person is the single `AUTH_PASSWORD` operator (id `operator`).
-/// With multi-user sign-in, `id` becomes the user's id and `subject` their IdP
-/// subject (`<issuer>|<sub>`). A Bot's id comes from `botctl` and is self-reported
-/// until Bots get their own tokens.
-#[derive(Clone, Debug, PartialEq)]
+/// Who acted. A person is a user (`operator` is the owner and break-glass account),
+/// with their email and role at the time, and how they signed in: the method, the SSO
+/// provider and its type, their IdP subject (`<issuer>|<sub>`), and the session the
+/// request came with. A Bot's id comes from `botctl` and is self-reported until Bots
+/// get their own tokens; `on_behalf_of` names the person a Bot or the scheduler acted
+/// for (the Bot's owner).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Actor {
     pub kind: ActorKind,
     pub id: Option<String>,
     pub name: Option<String>,
     pub subject: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    /// `admin`, `member`, or `readonly`, as it was when they acted.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// `password` (the break-glass AUTH_PASSWORD), `code`, `sso`, `none`
+    /// (ALLOW_NO_AUTH), or `bot_token`. None for the system.
+    #[serde(default)]
+    pub method: Option<String>,
+    /// The SSO provider's type (`entra`, `google`, `oidc`, `github`, `apple`, `saml`) and its
+    /// configured id (from SSO_PROVIDERS), as `idp` and `provider` are in sign-in details.
+    #[serde(default)]
+    pub idp: Option<String>,
+    #[serde(default)]
+    pub idp_provider: Option<String>,
+    /// The session id (never its token).
+    #[serde(default)]
+    pub session: Option<String>,
+    #[serde(default)]
+    pub on_behalf_of: Option<String>,
 }
 
 impl Actor {
     pub fn operator() -> Actor {
-        Actor { kind: ActorKind::User, id: Some("operator".into()), name: None, subject: None }
+        Actor { kind: ActorKind::User, id: Some("operator".into()), ..Default::default() }
     }
 
     pub fn bot(id: Option<&str>, name: Option<&str>) -> Actor {
-        Actor { kind: ActorKind::Bot, id: id.map(String::from), name: name.map(String::from), subject: None }
+        Actor { kind: ActorKind::Bot, id: id.map(String::from), name: name.map(String::from), ..Default::default() }
+    }
+
+    /// A Bot, acting for its owner (ADR 0017: Bots act with their owner's access).
+    pub fn for_bot(b: &Bot) -> Actor {
+        Actor { on_behalf_of: Some(b.owner_id.clone()), ..Actor::bot(Some(&b.id), Some(&b.name)) }
     }
 
     /// `part` names the component: `server`, `scheduler`, `approvals`, `retention`, ...
     pub fn system(part: &str) -> Actor {
-        Actor { kind: ActorKind::System, id: Some(part.into()), name: None, subject: None }
+        Actor { kind: ActorKind::System, id: Some(part.into()), ..Default::default() }
+    }
+
+    pub fn method(mut self, m: &str) -> Actor {
+        self.method = Some(m.into());
+        self
+    }
+
+    pub fn on_behalf_of(mut self, user: &str) -> Actor {
+        self.on_behalf_of = Some(user.into());
+        self
     }
 }
 
@@ -75,14 +116,16 @@ impl Outcome {
 }
 
 /// Where a request came from, when there was one.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Source {
     pub ip: Option<String>,
     pub user_agent: Option<String>,
 }
 
-/// An actor plus the request they acted through.
-#[derive(Clone, Debug)]
+/// An actor plus the request they acted through. Saved with a queued message, so
+/// the run it starts is attributed to whoever asked for it, even after a restart.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Who {
     pub actor: Actor,
     pub source: Source,
@@ -458,6 +501,18 @@ pub struct Filter {
     pub actions: Vec<String>,
     pub actor_kind: Option<String>,
     pub actor_id: Option<String>,
+    /// `actor=user:<email>` for an email no current user has (an older address).
+    pub actor_email: Option<String>,
+    /// Sign-in methods: `password`, `code`, `sso`, `none`, `bot_token`.
+    pub methods: Vec<String>,
+    /// SSO provider type, and configured provider id.
+    pub idp: Option<String>,
+    pub idp_provider: Option<String>,
+    /// IdP subject, `<issuer>|<sub>`, exactly.
+    pub subject: Option<String>,
+    pub session_id: Option<String>,
+    /// A user id: events by Bots (or routines) acting for that person.
+    pub on_behalf_of: Option<String>,
     pub outcome: Option<String>,
     pub bot_id: Option<String>,
     /// Paging cursors: event ids.
@@ -467,6 +522,10 @@ pub struct Filter {
 
 fn plain_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= 128 && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:@|".contains(c))
+}
+
+fn word(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 32 && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
 /// Unix ms, RFC 3339 (`2026-11-19T13:00:00Z`), or a UTC date (`2026-11-19`).
@@ -487,7 +546,9 @@ pub fn parse_time(s: &str, end: bool) -> Result<i64, String> {
 }
 
 impl Filter {
-    /// `?from=&to=&action=a,b.*&actor=user|bot|system[:id]&outcome=&bot=&before=&after=`
+    /// `?from=&to=&action=a,b.*&actor=user|bot|system[:id]&outcome=&bot=&before=&after=`,
+    /// and for people: `actor=user:<email>`, `method=sso,password`, `idp=entra` (the type),
+    /// `idpProvider=<id>`, `subject=<issuer|sub>`, `session=<id>`, `onBehalfOf=<user id or email>`.
     pub fn from_query(q: &HashMap<String, String>) -> Result<Filter, String> {
         let get = |k: &str| q.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
         let mut f = Filter {
@@ -512,11 +573,41 @@ impl Filter {
             if !["user", "bot", "system"].contains(&kind) {
                 return Err("actor must be user, bot, or system, optionally with :<id>".into());
             }
-            if id.is_some_and(|i| !plain_id(i)) {
-                return Err("Invalid actor id".into());
-            }
             f.actor_kind = Some(kind.into());
-            f.actor_id = id.map(String::from);
+            match id {
+                Some(email) if kind == "user" && email.contains('@') => {
+                    if !crate::users::valid_email(email) {
+                        return Err("Invalid actor email".into());
+                    }
+                    f.actor_email = Some(email.into());
+                }
+                Some(i) if !plain_id(i) => return Err("Invalid actor id".into()),
+                _ => f.actor_id = id.map(String::from),
+            }
+        }
+        for m in get("method").unwrap_or_default().split(',').map(str::trim).filter(|m| !m.is_empty()) {
+            if !word(m) {
+                return Err(format!("Invalid method filter \"{m}\""));
+            }
+            f.methods.push(m.into());
+        }
+        if f.methods.len() > 10 {
+            return Err("At most 10 methods".into());
+        }
+        let id = |k: &str| get(k).map(|v| if plain_id(v) { Ok(v.to_string()) } else { Err(format!("Invalid {k}")) }).transpose();
+        f.idp_provider = id("idpProvider")?;
+        f.session_id = id("session")?;
+        f.on_behalf_of = match get("onBehalfOf") {
+            Some(e) if e.contains('@') && !crate::users::valid_email(e) => return Err("Invalid onBehalfOf".into()),
+            Some(e) if e.contains('@') => Some(e.into()),
+            _ => id("onBehalfOf")?,
+        };
+        f.idp = get("idp").map(|v| if word(v) { Ok(v.to_string()) } else { Err("Invalid idp".to_string()) }).transpose()?;
+        if let Some(s) = get("subject") {
+            if s.len() > 256 || s.chars().any(char::is_control) {
+                return Err("Invalid subject".into());
+            }
+            f.subject = Some(s.into());
         }
         if let Some(o) = get("outcome") {
             if !["success", "failure", "denied"].contains(&o) {
@@ -536,20 +627,36 @@ impl Filter {
         Ok(f)
     }
 
+    /// Emails become user ids where a user has that email now, so a person's events
+    /// match whatever address they had then. `find` looks a user up by id or email.
+    pub fn resolve_users(&mut self, find: impl Fn(&str) -> Option<String>) {
+        if let Some(id) = self.actor_email.as_deref().and_then(&find) {
+            self.actor_id = Some(id);
+            self.actor_email = None;
+        }
+        if let Some(id) = self.on_behalf_of.as_deref().filter(|k| k.contains('@')).and_then(&find) {
+            self.on_behalf_of = Some(id);
+        }
+    }
+
     /// The filter as recorded on `audit.exported`.
     pub fn describe(&self) -> Value {
         json!({
             "from": self.from, "to": self.to, "actions": self.actions, "actorKind": self.actor_kind,
-            "actorId": self.actor_id, "outcome": self.outcome, "botId": self.bot_id,
+            "actorId": self.actor_id, "actorEmail": self.actor_email, "methods": self.methods, "idp": self.idp,
+            "idpProvider": self.idp_provider, "subject": self.subject, "sessionId": self.session_id, "onBehalfOf": self.on_behalf_of,
+            "outcome": self.outcome, "botId": self.bot_id,
         })
     }
 }
 
 // CSV export (RFC 4180): CRLF line ends, quotes doubled, and cells that a
-// spreadsheet would run as a formula start with an apostrophe.
+// spreadsheet would run as a formula start with an apostrophe. The actor columns
+// added with per-user actors (ADR 0019) come last, so scripts that read the first
+// fourteen by position keep working.
 
-pub const CSV_HEADER: &str =
-    "id,time,actor_kind,actor_id,actor_name,actor_subject,action,target_type,target_id,bot_id,outcome,ip,user_agent,details\r\n";
+pub const CSV_HEADER: &str = "id,time,actor_kind,actor_id,actor_name,actor_subject,action,target_type,target_id,bot_id,outcome,ip,user_agent,details,\
+actor_email,actor_role,auth_method,idp,idp_provider,session_id,on_behalf_of\r\n";
 
 pub fn csv_cell(s: &str) -> String {
     let s = if s.starts_with(['=', '+', '-', '@', '\t', '\r']) { format!("'{s}") } else { s.to_string() };
@@ -577,6 +684,13 @@ pub fn csv_row(e: &AuditEvent) -> String {
         o(&e.ip),
         o(&e.user_agent),
         csv_cell(&e.details.to_string()),
+        o(&e.actor_email),
+        o(&e.actor_role),
+        o(&e.auth_method),
+        o(&e.idp),
+        o(&e.idp_provider),
+        o(&e.session_id),
+        o(&e.on_behalf_of),
     ];
     format!("{}\r\n", cells.join(","))
 }
@@ -718,11 +832,69 @@ mod tests {
             ip: Some("192.0.2.1".into()),
             user_agent: Some("botctl".into()),
             details: json!({ "name": "a,b" }),
+            actor_email: None,
+            actor_role: None,
+            auth_method: Some("bot_token".into()),
+            idp: None,
+            idp_provider: None,
+            session_id: None,
+            on_behalf_of: Some("u1".into()),
         };
         let row = csv_row(&e);
         assert!(row.ends_with("\r\n"));
-        assert_eq!(row, "7,1970-01-01T00:00:00.000Z,bot,b1,'=cmd|' /C calc'!A0,,routine.created,routine,r1,b1,success,192.0.2.1,botctl,\"{\"\"name\"\":\"\"a,b\"\"}\"\r\n");
-        assert_eq!(CSV_HEADER.trim_end().split(',').count(), 14);
+        assert_eq!(
+            row,
+            "7,1970-01-01T00:00:00.000Z,bot,b1,'=cmd|' /C calc'!A0,,routine.created,routine,r1,b1,success,192.0.2.1,botctl,\"{\"\"name\"\":\"\"a,b\"\"}\",,,bot_token,,,,u1\r\n"
+        );
+        let header: Vec<&str> = CSV_HEADER.trim_end().split(',').collect();
+        assert_eq!(header.len(), 21);
+        assert_eq!(header[..14].join(","), "id,time,actor_kind,actor_id,actor_name,actor_subject,action,target_type,target_id,bot_id,outcome,ip,user_agent,details", "old columns stay put");
+        let sso = AuditEvent {
+            actor_kind: "user".into(),
+            actor_id: Some("u1".into()),
+            actor_name: Some("Ada".into()),
+            actor_subject: Some("https://login.example/t1/v2.0|oid-1".into()),
+            actor_email: Some("ada@example.com".into()),
+            actor_role: Some("admin".into()),
+            auth_method: Some("sso".into()),
+            idp: Some("entra".into()),
+            idp_provider: Some("work".into()),
+            session_id: Some("s1".into()),
+            on_behalf_of: None,
+            ..e
+        };
+        let row = csv_row(&sso);
+        let cells: Vec<&str> = row.trim_end().rsplitn(8, ',').collect();
+        assert_eq!(cells[..7], ["", "s1", "work", "entra", "sso", "admin", "ada@example.com"]);
+    }
+
+    #[test]
+    fn actors_round_trip_for_queued_runs() {
+        let owner = Bot {
+            id: "b1".into(),
+            name: "Scout".into(),
+            color: String::new(),
+            shape: String::new(),
+            harness: "claude".into(),
+            model: None,
+            effort: None,
+            session_id: None,
+            primary: false,
+            hidden: false,
+            unread: false,
+            created_at: 0,
+            owner_id: "u1".into(),
+            visibility: crate::acl::Visibility::Private,
+        };
+        let a = Actor::for_bot(&owner).method("bot_token");
+        assert_eq!((a.kind, a.id.as_deref(), a.name.as_deref()), (ActorKind::Bot, Some("b1"), Some("Scout")));
+        assert_eq!((a.on_behalf_of.as_deref(), a.method.as_deref()), (Some("u1"), Some("bot_token")));
+        let who = Who { actor: a.clone(), source: Source { ip: Some("192.0.2.1".into()), user_agent: None } };
+        let back: Who = serde_json::from_str(&serde_json::to_string(&who).unwrap()).unwrap();
+        assert_eq!((back.actor, back.source), (a, who.source));
+        let old: Who = serde_json::from_str(r#"{"actor":{"kind":"user","id":"operator","name":null,"subject":null},"source":{"ip":null,"userAgent":null}}"#).unwrap();
+        assert_eq!(old.actor, Actor::operator(), "fields added later default to empty");
+        assert_eq!(Actor::system("scheduler").on_behalf_of("u1").kind, ActorKind::System);
     }
 
     #[test]
@@ -810,6 +982,61 @@ mod tests {
         for bad in [("from", "yesterday"), ("action", "x'; DROP"), ("actor", "admin"), ("actor", "bot:a b"), ("outcome", "ok"), ("before", "x")] {
             assert!(q(&[bad]).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn person_filters_parse_and_reject() {
+        let q = |pairs: &[(&str, &str)]| Filter::from_query(&pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect());
+        let f = q(&[
+            ("actor", "user:ada@example.com"),
+            ("method", "sso, password"),
+            ("idpProvider", "work-entra"),
+            ("idp", "entra"),
+            ("subject", "https://login.microsoftonline.com/t1/v2.0|oid 1"),
+            ("session", "s0123abcd"),
+            ("onBehalfOf", "u42"),
+        ])
+        .unwrap();
+        assert_eq!((f.actor_kind.as_deref(), f.actor_id.as_deref(), f.actor_email.as_deref()), (Some("user"), None, Some("ada@example.com")));
+        assert_eq!(f.methods, ["sso", "password"]);
+        assert_eq!((f.idp_provider.as_deref(), f.idp.as_deref(), f.session_id.as_deref()), (Some("work-entra"), Some("entra"), Some("s0123abcd")));
+        assert_eq!((f.subject.as_deref(), f.on_behalf_of.as_deref()), (Some("https://login.microsoftonline.com/t1/v2.0|oid 1"), Some("u42")));
+        let d = f.describe();
+        assert_eq!((d["actorEmail"].as_str(), d["methods"][1].as_str(), d["onBehalfOf"].as_str()), (Some("ada@example.com"), Some("password"), Some("u42")));
+        // A Bot's id never becomes an email lookup.
+        let bot = q(&[("actor", "bot:a@b")]).unwrap();
+        assert_eq!((bot.actor_id.as_deref(), bot.actor_email), (Some("a@b"), None));
+        // An email resolves to whoever has it now; an unknown one stays an email.
+        let mut f = q(&[("actor", "user:ada@example.com"), ("onBehalfOf", "ada@example.com")]).unwrap();
+        f.resolve_users(|k| (k == "ada@example.com").then(|| "u1".to_string()));
+        assert_eq!((f.actor_id.as_deref(), f.actor_email, f.on_behalf_of.as_deref()), (Some("u1"), None, Some("u1")));
+        let mut f = q(&[("actor", "user:old@example.com")]).unwrap();
+        f.resolve_users(|_| None);
+        assert_eq!((f.actor_id, f.actor_email.as_deref()), (None, Some("old@example.com")));
+        // Any address a user can have can be searched, not only id-shaped ones.
+        let long = format!("{}@example.com", "a".repeat(140));
+        for email in ["ada+work@example.com", "zoë@example.com", long.as_str()] {
+            let f = q(&[("actor", &format!("user:{email}")), ("onBehalfOf", email)]).unwrap();
+            assert_eq!((f.actor_email.as_deref(), f.on_behalf_of.as_deref()), (Some(email), Some(email)));
+        }
+        let many = ["sso"; 11].join(",");
+        for bad in [
+            ("method", "SSO"),
+            ("method", "sso;drop"),
+            ("method", many.as_str()),
+            ("idpProvider", "a b"),
+            ("idp", "Entra"),
+            ("session", "s1'--"),
+            ("onBehalfOf", "u 1"),
+            ("onBehalfOf", "a b@example.com"),
+            ("actor", "user:a b@example.com"),
+            ("actor", "user:@example.com"),
+            ("actor", "bot:a+b"),
+            ("subject", "a\nb"),
+        ] {
+            assert!(q(&[bad]).is_err(), "{bad:?}");
+        }
+        assert!(q(&[("subject", &"x".repeat(257))]).is_err());
     }
 
     #[test]

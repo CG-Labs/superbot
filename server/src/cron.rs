@@ -2,7 +2,7 @@
 //! Supports *, numbers, lists (1,2), ranges (1-5), and steps (*/15, 1-10/2).
 //! Uses the server's local time (set TZ).
 
-use crate::audit::{Actor, Event};
+use crate::audit::{Actor, Who};
 use crate::runner::App;
 use chrono::{Datelike, Local, Timelike};
 use serde_json::json;
@@ -67,10 +67,14 @@ pub fn start(app: Arc<App>) {
                     continue;
                 }
                 app.db.routine_ran(&r.id, now.timestamp_millis());
-                let fired = Event::new(Actor::system("scheduler"), "routine.fired").target("routine", &r.id).bot(&r.bot_id);
-                app.db.record(&fired.details(json!({ "name": r.name, "cron": r.cron })));
+                let mut scheduler = Actor::system("scheduler");
+                scheduler.on_behalf_of = app.db.bot(&r.bot_id).map(|b| b.owner_id);
+                let by = Who { actor: scheduler, source: Default::default() };
+                app.db.record(&by.event("routine.fired").target("routine", &r.id).bot(&r.bot_id).details(json!({ "name": r.name, "cron": r.cron })));
                 let text = format!("{}: {}", r.name, r.instruction);
-                let msg = app.db.add_message(&r.bot_id, "routine", &text, None, false, Some("queued"));
+                let mut msg = app.db.add_message(&r.bot_id, "routine", &text, None, false, Some("queued"));
+                app.db.set_requested_by(msg.id, &by);
+                msg.requested_by = Some(by);
                 app.push_message(&msg);
                 app.enqueue(msg);
             }
