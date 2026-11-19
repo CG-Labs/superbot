@@ -1,0 +1,46 @@
+# Auth review, November 2026: SCIM addendum (M2)
+
+A pen-test style review of the SCIM 2.0 provisioning stub ([ADR 0023](../adr/0023-scim.md), PR [#75](https://github.com/CG-Labs/superbot/pull/75), [setup guide](../sso/scim.md)). It landed after the [November auth review](auth-review-2026-11.md) ([#25](https://github.com/CG-Labs/superbot/issues/25)), which left SCIM out of scope. Same method and severity scale. Design changes are in [ADR 0026](../adr/0026-scim-review-hardening.md).
+
+**Result:** no Critical or High findings. No SCIM token reached anything outside `/scim/v2`, no other credential reached `/scim/v2`, and no request could set a role, link an identity by email, or touch another tenant's users. One Medium and three Low findings are fixed, each with a regression test; two Low and six informational items are accepted.
+
+## Findings
+
+| ID | Severity | Where | Finding | Status |
+|----|----------|-------|---------|--------|
+| SCIM-01 | Medium | `scim.rs` `guard` | **Bad tokens from an address blocked valid ones.** After 20 bad tokens from an IP in 10 minutes, the guard answered 429 to every request from it, valid tokens included. Entra ID and Okta provision from addresses they share with all their customers, so anyone can point their own Entra or Okta app at a server's `/scim/v2` with a junk token and keep its IdP's addresses blocked. Deprovisioning then stalls (Entra quarantines a job that keeps failing) and leavers keep access. | **Fixed.** A valid token is looked up first and always gets through (the per-tenant limit still applies). The IP block only answers bad tokens. Tokens are 256 random bits, so the block spares the database and the audit log; it never stopped guessing. Sessions were already treated this way (AUTH-02). Test: `bad_tokens_from_an_address_never_block_a_valid_token_from_it`. |
+| SCIM-02 | Low | `scim.rs` `update`, `db.rs` `write_scim_user` | **A stale update could undo an admin's disable.** Every SCIM write saved the `active` it read. An admin disabling a SCIM user between a PATCH's read and its write (say, a name change) was re-enabled, with no `user.enabled` event. Sessions stayed revoked. | **Fixed.** The status is written, and acted on, only when the request changes `active`; otherwise the row keeps whatever it holds when the write runs. Test: `an_update_that_leaves_active_alone_cannot_undo_an_admins_disable`. |
+| SCIM-03 | Low | `main.rs` `authenticate` | **A SCIM token on `/api` was logged as a bad Bot token.** It was refused, but `auth.login_failed` said `method: bot_token`, hiding a provisioning token that may have leaked. | **Fixed.** Logged as `method: scim_token`, `reason: not_for_api`, actor `system` `scim`. Test: `a_scim_token_on_the_api_is_logged_as_a_scim_token`. |
+| SCIM-04 | Low | `scim.rs` `guard` | **A revoked token in use looked like a guess.** `scim.auth_failed` said `unknown_or_revoked`, so an admin couldn't tell an IdP still sending a revoked (maybe leaked) token from noise. | **Fixed.** `reason` is `missing`, `unknown`, or `revoked`; a revoked one has the token as the event's target and its tenant. Only `sbp_` plus 64 hex digits is looked up at all. Test: `a_revoked_token_in_use_is_named_in_the_audit_log`. |
+| SCIM-05 | Low | `cron.rs`, ADR 0012 / 0017 | A deprovisioned user's Bots keep their routines: the scheduler doesn't check the owner is active. A leaver's scheduled instructions keep running, attributed to them. Same for any disabled user, not only SCIM. | Accepted for M2. Shared Bots owned by a leaver often serve a team, so pausing them is a product decision. Admins can disable routines or give the Bot to someone else. Follow-up: pause or hand over a disabled owner's routines. |
+| SCIM-06 | Low | `scim.rs` `create_user`, ADR 0023 | A tenant that links an SSO provider can take on any user no tenant manages whose identity at that provider is already linked, admins included (never the owner). It can then disable, rename, or change that user's email; never the role, and it can't sign in as them. | Accepted. By design: that IdP already decides whether the person can sign in. Use one tenant per provider, and treat a SCIM token like admin access to that IdP's people. |
+| SCIM-07 | Info | `scim.rs` `guard` | With `SCIM=off`, `/scim/v2` answers anyone with a 404 saying SCIM is off. | Accepted. It helps setup and shows no data. |
+| SCIM-08 | Info | `scim.rs` `conflict` | A 409 tells a token holder that an email belongs to some SuperBot user, or that a person is managed by another tenant. | Accepted. The IdP admin needs it to fix the mapping; no ids or attributes outside the tenant are returned. |
+| SCIM-09 | Info | `scim.rs` `apply_patch` | SCIM sets emails as the IdP sends them, unverified. An IdP can claim an address nobody uses yet, so a later sign-up or JIT sign-in with it is refused. | Accepted. The IdP is the authority for its people; emails stay unique and never match identities. |
+| SCIM-10 | Info | ADR 0023 | Tokens don't expire. | Accepted. A tenant can hold several tokens for rotation; `botctl scim tokens` shows last use. Expiry and scopes are M5. |
+| SCIM-11 | Info | `main.rs` `cors_layer` | `OPTIONS` on any route, `/scim/v2` included, is answered by the CORS layer before auth: 200, empty. | Accepted. No data; the walk test pins it. |
+| SCIM-12 | Info | `scim.rs` `parse_filter` | An unsupported filter's error repeats up to 100 characters of it. | Accepted. JSON, `no-store`, to the token holder only. |
+
+## Method
+
+Code review of `scim.rs`, the SCIM queries in `db.rs`, the `/scim/v2` mount in `router()`, and the `/api` auth path, then attacks against the real router in tests (`scim_http_tests`, `auth_review_http_tests`).
+
+Checked and holding:
+
+- **Tokens:** `sbp_` plus 256 random bits, returned once with `Cache-Control: no-store`; only the SHA-256 is stored (unique), looked up by hash, so timing shows nothing about the token; never listed or logged, and redacted by shape. Revoking takes effect on the next request (no cache). Making and revoking tokens is admin-only under `/api`, behind the AUTH-01 same-origin check. A tenant's SSO link is fixed by its first token, in one transaction.
+- **Separation:** `/scim/v2` has its own guard. The router walk now calls every SCIM route with no credentials, forged session token and cookie, the break-glass password, a member session, the Bot token, a forged SCIM token, and a revoked one: all 401. A valid SCIM token gets past auth on every SCIM route, and 401 on every other route. Odd paths (case changes, `//`, `..`, `%2e%2e`, `/api/scim/v2`) and the web pages don't take it either.
+- **`SCIM=off`:** the guard stops before reading the token. Every SCIM route is a 404 SCIM error for any caller, the token is never looked up, and nothing is audited (walked).
+- **Tenants:** every query names the tenant. Another tenant's user is a 404 for GET, PUT, PATCH, and DELETE. Ownership is rechecked in the write's transaction, and a user belongs to at most one tenant (primary key).
+- **Filters and paging:** only `userName eq` and `externalId eq`, with a JSON string value that must end the filter, so `and`/`or` can't be smuggled in; 1 to 512 characters; bound SQL parameters, no `LIKE`. `count` is clamped to 0–200, `startIndex` to at least 1; non-numbers are 400.
+- **PATCH and PUT:** there is no role in SCIM's model; `roles`, `groups`, and passwords are dropped, and the role column is never written. `externalId` can't change or be removed once set. Identities are made only at `POST`, from the tenant's linked provider and the `externalId`, never from an email. An email someone else has is a 409. The owner account is out of reach.
+- **Deprovisioning:** `active: false` and `DELETE` disable the user in the same write; session lookups need an active user, so sessions stop at once. Then unredeemed SSO app codes are dropped, sessions revoked, and screen links rotated. `DELETE` is soft; only the same tenant brings a user back, by `POST`.
+- **Limits:** 600 requests a minute per tenant; 20 bad tokens per IP per 10 minutes; 64 KiB bodies; JSON nesting is capped by the parser.
+- **Errors:** SCIM error bodies with fixed messages; database errors are logged, not returned. Missing, unknown, and revoked tokens get the same 401.
+- **Audit:** every write carries the token as a `system` actor with method `scim_token` and the tenant. Failures are throttled per IP, never with the token.
+- **CSRF and cookies:** the guard ignores cookies and Basic auth and sets no cookies, so a browser can't ride it. CORS never allows credentials. The Host is checked against `ALLOWED_HOSTS` before `meta.location` is built from it.
+
+## Out of scope
+
+- The IdPs' own provisioning services and their configuration.
+- Groups, group-to-role mapping, and Bulk: not built (M5).
+- Denial of service beyond the rate limits above.

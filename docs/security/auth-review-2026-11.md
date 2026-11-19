@@ -39,6 +39,6 @@ Checked and holding:
 - The computer daemon, voxl screen streaming internals, and harness sandboxes (ADR 0003, ADR 0008).
 - Network and host hardening: TLS, proxy, firewall, Docker, the installer's systemd units.
 - Third-party IdP configuration mistakes, and the IdPs themselves.
-- SCIM (design stub, PR [#75](https://github.com/CG-Labs/superbot/pull/75)).
+- SCIM (design stub, PR [#75](https://github.com/CG-Labs/superbot/pull/75)): reviewed after it merged, in the [SCIM addendum](auth-review-2026-11-scim.md).
 - Denial of service beyond the sign-in limiter.
 - An external pen test, still planned before M3 GA.

@@ -4,7 +4,7 @@
 
 Accepted (19 Nov 2026). Decided by the product owner, David Kennedy, on 19 Nov 2026. Closes [#28](https://github.com/CG-Labs/superbot/issues/28). Accepts [ADR 0011](0011-hermes-agent-backend.md). Updates [ADR 0013](0013-serve-web-client.md) and [ADR 0022](0022-landing-and-signups.md) on where people land.
 
-ADR 0025 (Linode control plane, [PR #77](https://github.com/CG-Labs/superbot/pull/77)) and ADR 0026 (SCIM review, [PR #78](https://github.com/CG-Labs/superbot/pull/78)) are taken by open PRs, so this is 0027.
+ADR 0025 (Linode control plane, open [PR #77](https://github.com/CG-Labs/superbot/pull/77)) and ADR 0026 (SCIM review, merged in [PR #78](https://github.com/CG-Labs/superbot/pull/78)) are taken, so this is 0027.
 
 ## Context
 
