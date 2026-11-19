@@ -80,6 +80,19 @@ async fn saml_bridge_signs_in_only_people_the_saml_idp_vouched_for() {
     let by_idp = audit_list(&call(port, "GET", "/api/audit?idp=saml&action=auth.login", &admin, "").await.1);
     assert_eq!(by_idp.len(), 1, "filtered by IdP type");
 
+    // The admin portal (ADR 0021) shows the SAML link and the last sign-in through it.
+    let one: Value = serde_json::from_str(&call(port, "GET", &format!("/api/users/{}", u.id), &admin, "").await.1).unwrap();
+    let link = &one["identities"][0];
+    assert_eq!((link["provider"].as_str(), link["idp"].as_str(), link["subject"].as_str()), (Some(id.as_str()), Some("saml"), Some(STORED)));
+    assert!(link["lastLoginAt"].as_i64().is_some(), "{link}");
+    assert_eq!(
+        (one["lastLogin"]["authMethod"].as_str(), one["lastLogin"]["idpProvider"].as_str(), one["lastLogin"]["idp"].as_str()),
+        (Some("sso"), Some(id.as_str()), Some("saml"))
+    );
+    let list: Value = serde_json::from_str(&call(port, "GET", "/api/users", &admin, "").await.1).unwrap();
+    let row = list.as_array().unwrap().iter().find(|r| r["id"] == u.id.as_str()).unwrap();
+    assert_eq!((&row["identities"], &row["lastLogin"]), (&one["identities"], &one["lastLogin"]));
+
     // Replayed: the same callback again finds no pending sign-in.
     let (_, head, _) = call_with(port, "GET", &path, "", &binder, "").await;
     assert_eq!(header(&head, "location").as_deref(), Some("/login?error=sso_expired"));

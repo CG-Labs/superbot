@@ -1,15 +1,23 @@
 import { authHeader, basicAuthHeader, normalizeBaseUrl } from "./auth";
 import type {
+  AdminUser,
   AppState,
   Approval,
   BotAccessView,
   BotView,
+  LoginCode,
   Message,
   ModelOption,
   Policy,
   PolicyMode,
+  Role,
   Routine,
   ServerConfig,
+  SessionView,
+  SignupApproval,
+  SignupRequest,
+  UserBots,
+  UserIdentity,
   Visibility,
 } from "./types";
 
@@ -191,6 +199,62 @@ export class SuperBotApi {
   async setBotPolicy(botId: string, mode: PolicyMode | null): Promise<void> {
     if (mode) await this.request("PUT", `/api/bots/${botId}/policy`, { mode });
     else await this.request("DELETE", `/api/bots/${botId}/policy`);
+  }
+
+  // Users, codes, sessions, and sign-ins: admins only, enforced by the server (ADR 0012, 0021).
+
+  async users(): Promise<AdminUser[]> {
+    return this.request<AdminUser[]>("GET", "/api/users");
+  }
+
+  async createUser(body: { email: string; name?: string; role: Role }): Promise<AdminUser> {
+    return this.request<AdminUser>("POST", "/api/users", body);
+  }
+
+  async patchUser(id: string, body: { name?: string; role?: Role; status?: "active" | "disabled" }): Promise<AdminUser> {
+    return this.request<AdminUser>("PATCH", `/api/users/${encodeURIComponent(id)}`, body);
+  }
+
+  /** `replace` drops the user's unused codes first, so only the new one works. */
+  async createLoginCode(id: string, ttlMinutes: number, replace = false): Promise<LoginCode> {
+    return this.request<LoginCode>("POST", `/api/users/${encodeURIComponent(id)}/login-codes`, { ttlMinutes, replace });
+  }
+
+  async userSessions(id: string): Promise<SessionView[]> {
+    return this.request<SessionView[]>("GET", `/api/sessions?user=${encodeURIComponent(id)}`);
+  }
+
+  /** Ends all of a user's sessions and drops their unused codes. */
+  async revokeUserSessions(id: string): Promise<{ revoked: number }> {
+    return this.request<{ revoked: number }>("DELETE", `/api/users/${encodeURIComponent(id)}/sessions`);
+  }
+
+  async linkIdentity(id: string, body: { provider: string; subject: string; tenant?: string }): Promise<UserIdentity> {
+    return this.request<UserIdentity>("POST", `/api/users/${encodeURIComponent(id)}/identities`, body);
+  }
+
+  async unlinkIdentity(id: string, identityId: string): Promise<void> {
+    await this.request("DELETE", `/api/users/${encodeURIComponent(id)}/identities/${encodeURIComponent(identityId)}`);
+  }
+
+  async userBots(id: string): Promise<UserBots> {
+    return this.request<UserBots>("GET", `/api/users/${encodeURIComponent(id)}/bots`);
+  }
+
+  // Requests for access from the landing page: admins only (ADR 0022).
+
+  async signups(status: SignupRequest["status"] | "all" = "pending"): Promise<SignupRequest[]> {
+    return this.request<SignupRequest[]>("GET", `/api/signups?status=${status}`);
+  }
+
+  /** Makes the user and a one-time code, returned once. */
+  async approveSignup(id: string, body: { role: Role; ttlMinutes: number }): Promise<SignupApproval> {
+    return this.request<SignupApproval>("POST", `/api/signups/${encodeURIComponent(id)}/approve`, body);
+  }
+
+  /** The reason is for admins; nobody is told. */
+  async rejectSignup(id: string, reason?: string): Promise<SignupRequest> {
+    return this.request<SignupRequest>("POST", `/api/signups/${encodeURIComponent(id)}/reject`, { reason: reason || null });
   }
 
   eventsUrl(): string {

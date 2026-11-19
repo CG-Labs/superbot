@@ -296,6 +296,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}", get(users::get_user).patch(users::update_user))
         .route("/users/{key}/login-codes", post(users::create_login_code))
         .route("/users/{key}/sessions", delete(users::revoke_user_sessions))
+        .route("/users/{key}/bots", get(users::user_bots))
         .route("/users/{key}/identities", get(sso::list_identities).post(sso::link_identity))
         .route("/users/{key}/identities/{id}", delete(sso::unlink_identity))
         .route("/sessions", get(users::list_sessions))

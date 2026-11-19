@@ -9,6 +9,7 @@ use crate::secrets::{redact, sealed};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 #[derive(Clone, Serialize)]
@@ -243,6 +244,11 @@ pub struct User {
     pub idp_subject: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// When a session last started for this user, how ("password", "code", "sso"),
+    /// and through which SSO provider id (ADR 0021).
+    pub last_login_at: Option<i64>,
+    pub last_login_method: Option<String>,
+    pub last_login_idp_provider: Option<String>,
 }
 
 impl User {
@@ -440,6 +446,9 @@ fn user_row(r: &Row) -> rusqlite::Result<User> {
         idp_subject: r.get("idp_subject")?,
         created_at: r.get("created_at")?,
         updated_at: r.get("updated_at")?,
+        last_login_at: r.get("last_login_at")?,
+        last_login_method: r.get("last_login_method")?,
+        last_login_idp_provider: r.get("last_login_idp_provider")?,
     })
 }
 
@@ -539,8 +548,16 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 7] =
-    [migrate_approvals, migrate_audit_events, migrate_users, migrate_identities, migrate_bot_acls, migrate_audit_actors, migrate_signups];
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 8] = [
+    migrate_approvals,
+    migrate_audit_events,
+    migrate_users,
+    migrate_identities,
+    migrate_bot_acls,
+    migrate_audit_actors,
+    migrate_signups,
+    migrate_last_login,
+];
 
 /// Requests for access from the public sign-up form (ADR 0022). Consent is a column,
 /// not a flag in a blob: no row exists without it. `user_id` has no foreign key, like
@@ -598,6 +615,19 @@ fn migrate_audit_actors(c: &Connection, fresh: bool) -> rusqlite::Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// The admin portal (ADR 0021): when and how each user last signed in. Sessions are
+/// pruned 30 days after they end, so this lives on the user; it starts from the
+/// newest session still kept.
+fn migrate_last_login(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "ALTER TABLE users ADD COLUMN last_login_at INTEGER;
+        ALTER TABLE users ADD COLUMN last_login_method TEXT;
+        ALTER TABLE users ADD COLUMN last_login_idp_provider TEXT;
+        UPDATE users SET (last_login_at, last_login_method, last_login_idp_provider) =
+          (SELECT created_at, method, idp_provider FROM sessions WHERE sessions.user_id = users.id ORDER BY created_at DESC, id LIMIT 1);",
+    )
 }
 
 /// Bot ACLs (ADR 0017): an owner and a visibility per Bot, and per-user grants.
@@ -1352,6 +1382,17 @@ impl Db {
         s.query_map([user_id], identity_row).unwrap().filter_map(Result::ok).collect()
     }
 
+    /// Every user's identities, keyed by user id, for the admin list.
+    pub fn all_identities(&self) -> HashMap<String, Vec<Identity>> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM user_identities ORDER BY created_at, id").unwrap();
+        let mut out: HashMap<String, Vec<Identity>> = HashMap::new();
+        for i in s.query_map([], identity_row).unwrap().filter_map(Result::ok) {
+            out.entry(i.user_id.clone()).or_default().push(i);
+        }
+        out
+    }
+
     fn insert_identity(tx: &Connection, user_id: &str, i: &NewIdentity) -> rusqlite::Result<String> {
         let id = format!("i{}", crate::short_id());
         tx.execute(
@@ -1429,13 +1470,19 @@ impl Db {
     pub fn create_session(&self, s: &NewSession) -> Session {
         let id = format!("s{}", crate::random_hex(8));
         let at = now();
-        self.c()
-            .execute(
+        {
+            let c = self.c();
+            c.execute(
                 "INSERT INTO sessions (id, token_hash, user_id, kind, method, idp_subject, idp_provider, label, ip, user_agent, created_at, last_seen_at, expires_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![id, s.token_hash, s.user_id, s.kind, s.method, s.idp_subject, s.idp_provider, s.label, s.ip, s.user_agent, at, at, s.expires_at],
             )
             .unwrap();
+            let _ = c.execute(
+                "UPDATE users SET last_login_at = ?, last_login_method = ?, last_login_idp_provider = ? WHERE id = ?",
+                params![at, s.method, s.idp_provider, s.user_id],
+            );
+        }
         self.session(&id).unwrap()
     }
 
@@ -1518,6 +1565,30 @@ impl Db {
                 params![code_hash, user_id, created_by, now(), expires_at],
             )
             .unwrap();
+    }
+
+    /// Adds a sign-in code in place of the user's unused ones, in one transaction so two
+    /// admins replacing at once leave one working code. Returns how many it replaced.
+    pub fn replace_login_codes(&self, code_hash: &str, user_id: &str, created_by: &str, expires_at: i64) -> usize {
+        let mut c = self.c();
+        let tx = c.transaction().unwrap();
+        let n = tx.execute("DELETE FROM login_codes WHERE user_id = ? AND used_at IS NULL", [user_id]).unwrap();
+        tx.execute(
+            "INSERT INTO login_codes (code_hash, user_id, created_by, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+            params![code_hash, user_id, created_by, now(), expires_at],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        n
+    }
+
+    /// Unused, unexpired codes per user: how many, and when the last of them expires.
+    pub fn pending_codes(&self, at: i64) -> HashMap<String, (i64, i64)> {
+        let c = self.c();
+        let mut s = c
+            .prepare("SELECT user_id, count(*), max(expires_at) FROM login_codes WHERE used_at IS NULL AND ? < expires_at GROUP BY user_id")
+            .unwrap();
+        s.query_map([at], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?)))).unwrap().filter_map(Result::ok).collect()
     }
 
     // Sign-ups (ADR 0022)
@@ -1847,12 +1918,22 @@ mod tests {
         };
     }
 
+    macro_rules! undo_last_login {
+        () => {
+            "ALTER TABLE users DROP COLUMN last_login_at; ALTER TABLE users DROP COLUMN last_login_method;
+            ALTER TABLE users DROP COLUMN last_login_idp_provider; "
+        };
+    }
+
+    /// Rewinds a database to before last sign-ins (user_version 7).
+    const UNDO_LAST_LOGIN: &str = undo_last_login!();
+
     /// Rewinds a database to before per-user audit actors (user_version 5).
-    const UNDO_AUDIT_ACTORS: &str = undo_audit_actors!();
+    const UNDO_AUDIT_ACTORS: &str = concat!(undo_last_login!(), undo_audit_actors!());
 
     /// Rewinds a database to before bot ACLs, so a test can set `user_version` lower.
     const UNDO_BOT_ACLS: &str =
-        concat!(undo_audit_actors!(), " DROP TABLE bot_grants; DROP INDEX bots_owner; ALTER TABLE bots DROP COLUMN visibility; ALTER TABLE bots DROP COLUMN owner_id;");
+        concat!(undo_last_login!(), undo_audit_actors!(), " DROP TABLE bot_grants; DROP INDEX bots_owner; ALTER TABLE bots DROP COLUMN visibility; ALTER TABLE bots DROP COLUMN owner_id;");
 
     #[test]
     fn upgrade_keeps_old_audit_rows_and_records_new_actors() {
@@ -1914,6 +1995,22 @@ mod tests {
         assert_eq!(e.actor_name.as_deref(), Some("Ada password=[redacted]"));
         assert!(!e.user_agent.as_deref().unwrap().contains("sbs_0123"), "{:?}", e.user_agent);
         assert_eq!(e.actor_email.as_deref().unwrap().chars().count(), 255, "254 and an ellipsis");
+    }
+
+    #[test]
+    fn upgrade_takes_last_sign_ins_from_kept_sessions() {
+        let path = temp_path("last-login-upgrade").join("app.sqlite");
+        let db = Db::open(&path).unwrap();
+        let seen = db.create_user(None, None, "Seen", Role::Member).unwrap();
+        let never = db.create_user(None, None, "Never", Role::Member).unwrap();
+        let s = db.create_session(&NewSession { user_id: &seen.id, token_hash: "h", kind: "token", method: "sso", idp_subject: None, idp_provider: Some("work"), label: None, ip: None, user_agent: None, expires_at: now() + 1000 });
+        assert_eq!(db.user(&seen.id).unwrap().last_login_at, Some(s.created_at), "a new session stamps it");
+        db.c().execute_batch(&format!("{UNDO_LAST_LOGIN} PRAGMA user_version = 7;")).unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        let u = db.user(&seen.id).unwrap();
+        assert_eq!((u.last_login_at, u.last_login_method.as_deref(), u.last_login_idp_provider.as_deref()), (Some(s.created_at), Some("sso"), Some("work")));
+        assert_eq!(db.user(&never.id).unwrap().last_login_at, None);
     }
 
     #[test]

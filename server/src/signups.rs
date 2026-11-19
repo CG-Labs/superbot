@@ -355,7 +355,7 @@ pub async fn approve(
     let ttl = users::code_ttl(&v["ttlMinutes"], APPROVAL_CODE_MINUTES)?;
     let (su, user) = app.db.approve_signup(&id, role, by.actor.id.as_deref().unwrap_or("")).map_err(decide_error)?;
     users::record_created(&app, &by, &user, Some(&format!("sign-up {}", su.id)));
-    let (code, expires) = users::issue_code(&app, &by, &user, ttl);
+    let (code, expires) = users::issue_code(&app, &by, &user, ttl, false);
     app.db.record(&by.event("signup.approved").target("signup", &su.id).details(json!({ "userId": user.id, "email": su.email, "role": role })));
     let emailed = notify(Notice::Approved { signup: &su, user: &user, code: &code, expires_at: expires });
     let sso = sso_hint(a.sso.providers.iter().filter(|p| p.ready()).map(|p| p.as_ref()), &su.email, &su.sign_in);

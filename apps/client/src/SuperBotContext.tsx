@@ -23,6 +23,7 @@ import {
   withPicked,
   type HandoffMap,
 } from "./handoff";
+import { takeInviteCode } from "./invite";
 import { createBody, patchBody, type RoutineDraft } from "./routines";
 import { signInWithSso } from "./sso";
 import { resolveScreenUrl } from "./screen";
@@ -67,6 +68,10 @@ interface SuperBotContextValue {
   setShowHidden: (v: boolean) => void;
   filter: string;
   setFilter: (v: string) => void;
+  /** A sign-in code from an invite link this page was opened with, to fill in (ADR 0021). */
+  inviteCode: string | null;
+  /** Keeps a code taken from the address bar, so it outlives the page that found it. */
+  offerInviteCode: (code: string) => void;
   /** `secret` is a one-time sign-in code, or the server password (break-glass). */
   login: (baseUrl: string, secret: string) => Promise<void>;
   /** Signs in through one of the server's SSO providers, in the system browser. */
@@ -133,6 +138,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [api, setApi] = useState<SuperBotApi | null>(null);
+  const [inviteCode, offerInviteCode] = useState(() => takeInviteCode());
   const [me, setMe] = useState<Me>({ name: "" });
   // Servers from before roles send no permissions; everyone could write there.
   const can = (perm: string) => !me.permissions || me.permissions.includes(perm);
@@ -313,6 +319,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
     sseRef.current?.close();
     clientRef.current = null;
     setApi(null);
+    offerInviteCode(null);
     setBots([]);
     setMessages({});
     setDrafts({});
@@ -336,6 +343,8 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
       applyState(state);
       clientRef.current = client;
       setApi(client);
+      // Signed in: an invite code from the link is spent, or wasn't needed.
+      offerInviteCode(null);
       startSse(client);
       void prefetchUnread(client, state.bots);
     },
@@ -549,6 +558,8 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
       setShowHidden,
       filter,
       setFilter,
+      inviteCode,
+      offerInviteCode,
       login,
       loginWithSso,
       logout,
@@ -592,6 +603,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
       filter,
       approvals,
       policy,
+      inviteCode,
     ],
   );
 

@@ -96,6 +96,103 @@ export interface ModelOption {
 
 export type Role = "admin" | "member" | "readonly";
 
+/** A user as `/api/users` lists them (ADR 0012, 0021). Admins only. */
+export interface AdminUser {
+  id: string;
+  email: string | null;
+  name: string;
+  role: Role;
+  status: "active" | "disabled";
+  /** The owner account: break-glass signs in as it. Can't be demoted or disabled. */
+  breakGlass: boolean;
+  createdAt: number;
+  updatedAt: number;
+  lastLoginAt?: number | null;
+  /** How they last signed in, in the audit log's terms (ADR 0019). */
+  lastLogin?: LastLogin | null;
+  identities?: UserIdentity[];
+  /** Codes made for this user and not used yet. Never the codes themselves. */
+  pendingCodes?: { count: number; expiresAt: number } | null;
+}
+
+export interface LastLogin {
+  at: number;
+  /** "password", "code", or "sso". */
+  authMethod?: string | null;
+  /** The SSO provider id it came through, and that provider's type ("entra", "google", …). */
+  idpProvider?: string | null;
+  idp?: string | null;
+}
+
+/** An SSO sign-in linked to a user (ADR 0014). */
+export interface UserIdentity {
+  id: string;
+  provider: string;
+  idp?: string | null;
+  email?: string | null;
+  subject?: string;
+  createdAt: number;
+  lastLoginAt?: number | null;
+}
+
+/** `POST /api/users/:id/login-codes`. The code is shown once; the server keeps only its hash. */
+export interface LoginCode {
+  code: string;
+  expiresAt: number;
+}
+
+/** A request for access from the landing page (ADR 0022), as `/api/signups` lists it. Admins only. */
+export interface SignupRequest {
+  id: string;
+  name: string;
+  email: string;
+  company: string;
+  teamSize: string;
+  useCase: string;
+  /** The sign-in they'd like: "microsoft", "google", "github", "apple", or "other". */
+  signIn: string;
+  status: "pending" | "approved" | "rejected";
+  createdAt: number;
+  decidedAt?: number | null;
+  reason?: string | null;
+  userId?: string | null;
+  /** A user has this email already, so approving would fail. */
+  existingUser: boolean;
+}
+
+/** `POST /api/signups/:id/approve`: the new user and their code, shown once. */
+export interface SignupApproval extends LoginCode {
+  signup: SignupRequest;
+  user: AdminUser;
+  /** Configured SSO providers that fit the request; link one so they can skip codes. */
+  sso: { id: string; label: string; type: string }[];
+  emailed: boolean;
+}
+
+/** `GET /api/sessions?user=` */
+export interface SessionView {
+  id: string;
+  kind: "cookie" | "token";
+  method: string;
+  idpProvider?: string | null;
+  label?: string | null;
+  createdAt: number;
+  lastSeenAt: number;
+  endsAt: number;
+}
+
+/** `GET /api/users/:id/bots`: what one user can reach, per ADR 0017. */
+export interface UserBots {
+  active: boolean;
+  bots: {
+    bot: { id: string; name: string; color: string; shape: string };
+    owner: { id: string; name: string | null };
+    visibility: Visibility;
+    access: BotAccess;
+    grant: "viewer" | "operator" | null;
+  }[];
+}
+
 /** `/api/state` `me`. Servers from before ADR 0012 send only the name. */
 export interface Me {
   name: string;

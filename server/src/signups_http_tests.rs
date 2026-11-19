@@ -189,6 +189,31 @@ async fn approval_makes_the_user_and_a_one_time_code() {
     assert_eq!(created["details"]["reason"].as_str(), Some(format!("sign-up {id}").as_str()));
 }
 
+/// The admin portal (ADR 0021) sees an approved request's user like any other, and its
+/// "new code" replaces the approval's code.
+#[tokio::test]
+async fn approved_users_show_in_the_portal_and_their_code_can_be_replaced() {
+    let (port, _, admin, _) = serve_app().await;
+    assert_eq!(submit(port, "192.0.2.1", &form("ada@example.com").to_string()).await.0, 202);
+    let id = signups(port, &admin, "pending").await[0]["id"].as_str().unwrap().to_string();
+    let (_, body) = call(port, "POST", &format!("/api/signups/{id}/approve"), &admin, "").await;
+    let res = parse(&body);
+    let (first, user_id) = (res["code"].as_str().unwrap().to_string(), res["user"]["id"].as_str().unwrap().to_string());
+
+    let (_, body) = call(port, "GET", "/api/users", &admin, "").await;
+    let listed = parse(&body).as_array().unwrap().iter().find(|u| u["id"] == user_id.as_str()).cloned().unwrap();
+    assert_eq!((listed["role"].as_str(), listed["pendingCodes"]["count"].as_i64(), listed["lastLogin"].is_null()), (Some("member"), Some(1), true), "{listed}");
+
+    let (code, body) = call(port, "POST", &format!("/api/users/{user_id}/login-codes"), &admin, r#"{"ttlMinutes":60,"replace":true}"#).await;
+    assert_eq!(code, 200, "{body}");
+    let second = parse(&body)["code"].as_str().unwrap().to_string();
+    assert_eq!(call(port, "POST", "/api/auth/login", "", &json!({ "code": first }).to_string()).await.0, 401, "the approval's code stopped working");
+    assert_eq!(call(port, "POST", "/api/auth/login", "", &json!({ "code": second }).to_string()).await.0, 200);
+    let (_, body) = call(port, "GET", "/api/audit?action=user.login_code_created", &admin, "").await;
+    let details: Vec<Value> = audit_list(&body).iter().map(|e| e["details"].clone()).collect();
+    assert_eq!(details, [json!({ "ttlMinutes": 60, "replaced": 1 }), json!({ "ttlMinutes": 3 * 24 * 60 })]);
+}
+
 #[tokio::test]
 async fn rejection_and_existing_users() {
     let (port, app, admin, _) = serve_app().await;
