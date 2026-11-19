@@ -6,7 +6,7 @@
 //! settings go in a Hermes managed-scope dir, which Hermes merges over the Bot's own
 //! `config.yaml` and the agent can't change with `hermes config set`.
 
-use super::{describe, str_of, Adapter, AgentEvent, ModelOption, RunInput, SECRET_ENV};
+use super::{describe, str_of, Adapter, AgentEvent, ModelOption, RunInput};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -129,9 +129,7 @@ impl Adapter for Hermes {
         }
         let failed = |why: String| Err(format!("Couldn't stop this Bot's Hermes daemon ({why}), so its last turn may still be running. Try again; if this keeps happening, run `hermes gateway stop --yes` with HERMES_HOME={}.", home.display()));
         let mut cmd = std::process::Command::new(self.bin());
-        for k in SECRET_ENV {
-            cmd.env_remove(k);
-        }
+        super::strip_secret_env(&mut cmd);
         if let Some(path) = input.env.get("PATH") {
             cmd.env("PATH", path);
         }
@@ -310,7 +308,7 @@ mod tests {
         assert!(!text.contains("t0k3n") && !text.contains("ghp_x"), "names only, never values");
 
         // Secrets inherited from botd's env are listed too; botd's own never are.
-        let names = ["NPM_TOKEN", "GITHUB_TOKEN", "SUPERBOT_MASTER_KEY", "AUTH_PASSWORD"].map(String::from);
+        let names = ["NPM_TOKEN", "GITHUB_TOKEN", "SUPERBOT_MASTER_KEY", "AUTH_PASSWORD", "SSO_ENTRA_CLIENT_SECRET"].map(String::from);
         let c = managed_config(&i, &names);
         assert_eq!(c["terminal"]["env_passthrough"], json!(["BOT_TOKEN", "GITHUB_TOKEN", "NPM_TOKEN"]));
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);

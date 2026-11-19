@@ -17,6 +17,7 @@ const STUB: &str = r#"#!/bin/sh
 stub=$(dirname "$0")
 printf '%s|%s\n' "$*" "$HERMES_HOME" >>"$stub/calls.log"
 if [ "$1" = gateway ]; then
+  env >"$stub/gateway-env.txt"
   rm -f "$HERMES_HOME/gateway.pid"
   exit 0
 fi
@@ -85,6 +86,7 @@ fn start() -> Botd {
         .env("DEFAULT_HARNESS", "hermes")
         .env("SCREENS", "off")
         .env("E2E_INHERITED_TOKEN", "inherited-e2e-value")
+        .env("SSO_ENTRA_CLIENT_SECRET", "sso-e2e-secret-value")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -204,8 +206,10 @@ fn hermes_runs_behind_the_approval_gate() {
         assert!(env.lines().any(|l| l.starts_with(want)), "missing {want}");
     }
     assert!(env.lines().any(|l| l.starts_with("HERMES_EPHEMERAL_SYSTEM_PROMPT=") && l.len() > 40), "system prompt");
-    for banned in ["AUTH_PASSWORD=", "SUPERBOT_MASTER_KEY="] {
+    let gateway_env = read(&b.stub.join("gateway-env.txt"));
+    for banned in ["AUTH_PASSWORD=", "SUPERBOT_MASTER_KEY=", "SSO_ENTRA_CLIENT_SECRET="] {
         assert!(!env.lines().any(|l| l.starts_with(banned)), "{banned} leaked to the harness");
+        assert!(!gateway_env.lines().any(|l| l.starts_with(banned)), "{banned} leaked to `hermes gateway stop`");
     }
     let managed_dir = env.lines().find_map(|l| l.strip_prefix("HERMES_MANAGED_DIR=")).unwrap().to_string();
     let config: Value = serde_json::from_str(&read(&Path::new(&managed_dir).join("config.yaml"))).unwrap();
@@ -217,7 +221,7 @@ fn hermes_runs_behind_the_approval_gate() {
     for name in ["BOT_TOKEN", "E2E_GITHUB_TOKEN", "E2E_INHERITED_TOKEN"] {
         assert!(passthrough.contains(&json!(name)), "{name} missing from {passthrough:?}");
     }
-    for name in ["AUTH_PASSWORD", "SUPERBOT_MASTER_KEY"] {
+    for name in ["AUTH_PASSWORD", "SUPERBOT_MASTER_KEY", "SSO_ENTRA_CLIENT_SECRET"] {
         assert!(!passthrough.contains(&json!(name)), "{name} listed in {passthrough:?}");
     }
     assert!(!read(&Path::new(&managed_dir).join("config.yaml")).contains("ghp-e2e-secret-value"), "names only, never values");

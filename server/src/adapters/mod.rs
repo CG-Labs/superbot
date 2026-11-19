@@ -63,7 +63,7 @@ pub(crate) const SECRET_ENV: [&str; 6] =
     ["AUTH_PASSWORD", "AUTH_PASSWORD_FILE", "SUPERBOT_PASSWORD", "SUPERBOT_TOKEN", "SUPERBOT_MASTER_KEY", "SUPERBOT_MASTER_KEY_FILE"];
 
 /// `SECRET_ENV`, and every `SSO_*` setting: sign-in config, including client secrets (ADR 0014).
-pub(crate) fn strip_secret_env(cmd: &mut Command) {
+pub(crate) fn strip_secret_env(cmd: &mut std::process::Command) {
     for k in SECRET_ENV {
         cmd.env_remove(k);
     }
@@ -208,7 +208,7 @@ async fn run_child(adapter: &mut dyn Adapter, input: &RunInput, abort: &mut watc
     let stdin = adapter.stdin(input);
 
     let mut cmd = Command::new(adapter.bin());
-    strip_secret_env(&mut cmd);
+    strip_secret_env(cmd.as_std_mut());
     let mut child = match cmd
         .args(&args)
         .current_dir(&input.cwd)
