@@ -1063,12 +1063,14 @@ fn access_view(app: &App, b: &db::Bot, access: Access) -> Value {
 /// cached access, so the Bot's update reaches exactly who can now see it.
 /// When someone may have lost access, its screen also gets a new token: the
 /// proxy sends screen traffic straight to voxl, so an old link would keep working.
+/// That waits on the screen, so it comes after the resync: streams must not run on
+/// stale access meanwhile.
 async fn acl_changed(app: &App, id: &str, narrowed: bool) {
+    app.send(json!({ "type": "resync" }));
+    app.push_bot(id);
     if narrowed && let Some(screens) = &app.screens {
         screens.rotate_token(id).await;
     }
-    app.send(json!({ "type": "resync" }));
-    app.push_bot(id);
 }
 
 async fn get_access(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
