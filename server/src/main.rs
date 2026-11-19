@@ -11,6 +11,8 @@ mod audit;
 mod audit_http_tests;
 #[cfg(test)]
 mod auth_review_http_tests;
+#[cfg(test)]
+mod interface_http_tests;
 mod cron;
 mod db;
 mod machines;
@@ -889,15 +891,34 @@ fn site(file: &'static str) -> Response {
         .into_response()
 }
 
-async fn web(uri: axum::http::Uri) -> Response {
+/// Where a signed-in person lands on the web. The Expo client at /app/ is the interface
+/// for everyone; the console is an admin fallback (ADR 0027).
+pub fn landing(p: Principal) -> &'static str {
+    match p {
+        Principal::User(Role::Admin) => "/console/",
+        _ => "/app/",
+    }
+}
+
+/// botd only sees /app/ when Caddy has no web client to serve there.
+const NO_CLIENT: &str = r#"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>SuperBot</title><p style="font:16px system-ui;margin:2rem">The SuperBot web app isn't installed on this server. Use the desktop or mobile app, or ask an admin to install the web client.</p>"#;
+
+async fn web(uri: axum::http::Uri, principal: Option<Extension<Principal>>) -> Response {
     let path = uri.path();
     if let Some(file) = site_file(path) {
         return site(file);
     }
+    let see = |to: &'static str| (StatusCode::SEE_OTHER, [(header::LOCATION, to)]).into_response();
+    let admin = principal.is_some_and(|Extension(p)| p == Principal::User(Role::Admin));
     let file = match path {
         "/console" => return (StatusCode::PERMANENT_REDIRECT, [(header::LOCATION, "/console/")]).into_response(),
-        // The web client is served by Caddy; without it, /app/ (the landing page's "Sign in") opens the console.
-        p if p == "/app" || p.starts_with("/app/") => return (StatusCode::SEE_OTHER, [(header::LOCATION, "/console/")]).into_response(),
+        p if p == "/app" || p.starts_with("/app/") => {
+            return match admin {
+                true => see("/console/"),
+                false => (StatusCode::NOT_FOUND, [(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], NO_CLIENT).into_response(),
+            };
+        }
+        p if p.starts_with("/console/") && !admin => return see("/app/"),
         "/console/" | "/console/index.html" => "index.html",
         "/console/app.js" => "app.js",
         "/console/styles.css" => "styles.css",
@@ -1170,7 +1191,10 @@ async fn update_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
     let (bot, access) = need_bot_access(&app, &c, &by, &id, Access::Manage)?;
     let mut p = bot_patch(&v)?;
     if p.harness.as_ref().is_some_and(|h| *h != bot.harness) {
-        p.session_id = Some(None); // sessions don't carry across harnesses
+        // Sessions don't carry across harnesses, nor do model names and efforts unless given anew.
+        p.session_id = Some(None);
+        p.model.get_or_insert(None);
+        p.effort.get_or_insert(None);
     }
     app.db.update_bot(&id, p);
     app.push_bot(&id);

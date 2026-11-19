@@ -5,9 +5,9 @@ One Rust binary, `botd`. It serves the landing page (`/`), the admin console (`/
 ## Pages
 
 - `/` and `/get-started`: the public landing page and the request-access form, from `site/`. Same page for everyone, no trackers or external assets ([ADR 0022](adr/0022-landing-and-signups.md)).
-- `/console/`: the built-in admin page (`web/`). Signed-out visitors go to `/login`. `/console` redirects here.
-- `/login`: the sign-in page. Sign-in lands on `/console/`.
-- `/app/`: the client, when Caddy serves it. Without it, botd sends `/app` to `/console/`.
+- `/console/`: the built-in admin page (`web/`), for admins only. Members and read-only users go to `/app/`; signed-out visitors go to `/login`. `/console` redirects here ([ADR 0027](adr/0027-expo-primary-hermes-default.md)).
+- `/login`: the sign-in page, also for break-glass. Sign-in lands admins on `/console/` and everyone else on `/app/` (`landing` in `GET /api/auth/me`). Web SSO sign-ins land the same way.
+- `/app/`: the client, the interface for everyone, when Caddy serves it. It picks up a session the sign-in page left in the browser. Without Caddy's client, botd sends admins to `/console/` and shows everyone else a "web app isn't installed" page.
 
 botd embeds `site/` and `web/`. Set `SITE_DIR` or `WEB_DIR` to serve them from disk while editing.
 

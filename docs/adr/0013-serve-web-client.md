@@ -24,4 +24,8 @@ Both installs built only `botd`, which serves the small built-in page in `web/`.
 
 ## Not yet
 
-`/` redirect and `/admin` (pending the interface decision); published images; serving the client without Caddy (installs without `--domain`).
+Published images; serving the client without Caddy (installs without `--domain`).
+
+## Update (19 Nov 2026)
+
+The owner confirmed the client as the single primary interface ([ADR 0027](0027-expo-primary-hermes-default.md)). `/` became the public landing page and the built-in page moved to `/console/` ([ADR 0022](0022-landing-and-signups.md)), so no `/` redirect is needed. Members and read-only users who open `/console/` are sent to `/app/`, sign-in lands them there, and botd no longer sends them from `/app/` to the console when no client is installed.

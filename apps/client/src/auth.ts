@@ -60,9 +60,10 @@ export function basicAuthHeader(password: string, username = "superbot"): string
   return `Basic ${b64encode(`${username}:${password}`)}`;
 }
 
-/** Bearer for a session token; Basic for the legacy shared password. */
-export function authHeader(cfg: ServerConfig): string {
-  return cfg.token ? `Bearer ${cfg.token}` : basicAuthHeader(cfg.password ?? "");
+/** Bearer for a session token; Basic for the legacy shared password; none for a cookie session. */
+export function authHeader(cfg: ServerConfig): string | null {
+  if (cfg.token) return `Bearer ${cfg.token}`;
+  return cfg.cookie ? null : basicAuthHeader(cfg.password ?? "");
 }
 
 export async function loadSavedCredentials(): Promise<ServerConfig | null> {
@@ -89,6 +90,22 @@ export async function saveCredentials(cfg: ServerConfig): Promise<void> {
     await storeDelete(PASSWORD_KEY);
     if (Platform.OS !== "web") await SecureStore.setItemAsync(PASSWORD_KEY, cfg.password ?? "");
   }
+}
+
+/**
+ * Set on sign-out from a cookie session and cleared once the server confirms it, or by
+ * the next sign-in (here, on `/login`, or a web SSO sign-in). While set, a cookie the
+ * server never got to clear is ended instead of being taken up again (ADR 0027).
+ */
+export const SIGNED_OUT_KEY = "superbot.signedOut";
+
+export async function setCookieSignedOut(on: boolean): Promise<void> {
+  if (on) await storeSet(SIGNED_OUT_KEY, "1");
+  else await storeDelete(SIGNED_OUT_KEY);
+}
+
+export async function cookieSignedOut(): Promise<boolean> {
+  return (await storeGet(SIGNED_OUT_KEY)) === "1";
 }
 
 export async function clearCredentials(): Promise<void> {

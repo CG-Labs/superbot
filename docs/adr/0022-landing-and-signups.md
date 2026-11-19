@@ -21,6 +21,7 @@ There is no tenancy, billing or mail service yet. So "sign up" has to mean "ask,
 - The legacy admin UI (`web/`) moves to `/console/`. `/console` redirects there with a 308.
 - `/app/` is still the client. When it isn't installed, botd sends `/app` to `/console/`.
 - SSO and the sign-in page now land on `/console/`.
+- *Update, 19 Nov 2026 ([ADR 0027](0027-expo-primary-hermes-default.md)):* only admins land on `/console/`. Everyone else lands on `/app/`, and botd sends only admins from a missing `/app/` to the console.
 - The old `/app.js` and `/styles.css` paths are gone.
 
 We considered showing the landing page only to signed-out visitors, keeping the admin page at `/` for signed-in ones. We rejected it:

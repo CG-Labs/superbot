@@ -7,14 +7,18 @@ import React, {
   useRef,
   useState,
 } from "react";
-import { AppState as RNAppState } from "react-native";
+import { Platform, AppState as RNAppState } from "react-native";
 import {
   clearCredentials,
+  cookieSignedOut,
+  defaultServerUrl,
   loadSavedCredentials,
+  LOCAL_SERVER_URL,
   saveCredentials,
+  setCookieSignedOut,
 } from "./auth";
 import { hasAccess } from "./access";
-import { ApiError, signIn, SuperBotApi } from "./api";
+import { ApiError, cookieSession, signIn, SuperBotApi } from "./api";
 import {
   applyHandoffHistory,
   applyHandoffMessage,
@@ -110,6 +114,16 @@ export function useSuperBot(): SuperBotContextValue {
   const ctx = useContext(SuperBotContext);
   if (!ctx) throw new Error("useSuperBot outside provider");
   return ctx;
+}
+
+/** Ends the browser's cookie session; the signed-out mark stays until the server confirms. */
+async function endCookieSession(client: SuperBotApi): Promise<void> {
+  try {
+    await client.logout();
+    await setCookieSignedOut(false);
+  } catch {
+    // Kept signed out; the next start tries again.
+  }
 }
 
 function upsertBot(list: BotView[], b: BotView): BotView[] {
@@ -307,7 +321,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
         () => {
           setConnected(false);
           // A revoked session closes the stream; a quick request tells that apart from a network drop.
-          if (client.config.token) void client.verify().catch(() => {});
+          if (client.hasSession) void client.verify().catch(() => {});
         },
       );
       setConnected(true);
@@ -362,11 +376,19 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
           await saveCredentials(upgraded);
         }
       }
-      if (saved?.token || saved?.password) {
+      // Nothing saved: the server's own sign-in page may have signed this browser in.
+      if (!saved?.token && saved?.password == null) {
+        const origin = defaultServerUrl();
+        if (Platform.OS === "web" && origin !== LOCAL_SERVER_URL) {
+          if (await cookieSignedOut()) await endCookieSession(new SuperBotApi({ baseUrl: origin, cookie: true }));
+          else saved = await cookieSession(origin);
+        }
+      }
+      if (saved?.token || saved?.password || saved?.cookie) {
         try {
           await bootstrap(new SuperBotApi(saved));
         } catch (err) {
-          if (err instanceof ApiError && err.status === 401 && saved.token) {
+          if (err instanceof ApiError && err.status === 401 && (saved.token || saved.cookie)) {
             await clearCredentials();
             setError("Your session ended. Sign in again.");
           } else {
@@ -392,12 +414,14 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
     const client = new SuperBotApi(cfg);
     await bootstrap(client);
     await saveCredentials(cfg);
+    await setCookieSignedOut(false);
   };
 
   const loginWithSso = async (baseUrl: string, providerId: string) => {
     const cfg = await signInWithSso(baseUrl, providerId);
     await bootstrap(new SuperBotApi(cfg));
     await saveCredentials(cfg);
+    await setCookieSignedOut(false);
   };
 
   // Signs out on the device first, so a slow server can't keep anyone signed in.
@@ -405,7 +429,12 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
     const client = api;
     reset();
     await clearCredentials();
-    void client?.logout().catch(() => {});
+    if (client?.config.cookie) {
+      await setCookieSignedOut(true);
+      void endCookieSession(client);
+    } else {
+      void client?.logout().catch(() => {});
+    }
   };
 
   const refresh = async (reloadMessages?: boolean) => {

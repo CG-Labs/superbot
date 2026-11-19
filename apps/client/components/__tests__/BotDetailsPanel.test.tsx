@@ -2,6 +2,7 @@ import React from "react";
 import { act, fireEvent, render, screen } from "@testing-library/react-native";
 import { BotDetailsPanel } from "../BotDetailsPanel";
 import { hasAccess } from "../../src/access";
+import * as dialogs from "../../src/dialogs";
 import type { BotAccess, BotView, Routine } from "../../src/types";
 
 const mockCtx: Record<string, unknown> = {
@@ -115,6 +116,39 @@ describe("BotDetailsPanel", () => {
     expect(screen.getByText("Private · owned by Grace")).toBeOnTheScreen();
     expect(screen.getByLabelText("Share with everyone").props.disabled).toBe(true);
     expect(screen.queryByText("Delete bot")).not.toBeOnTheScreen();
+  });
+
+  it("moves a Bot to another harness, for those who manage it", async () => {
+    const patchBot = jest.fn(async () => {});
+    Object.assign(mockCtx, { bots: [bot("b", "Bob")], activeId: "b", fetchRoutines: jest.fn(async () => []), patchBot, harnesses: ["claude", "hermes"] });
+    const ui = await render(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} />);
+
+    await act(async () => fireEvent.press(screen.getByText("Hermes Agent")));
+    expect(patchBot).toHaveBeenCalledWith("b", { harness: "hermes" });
+    patchBot.mockClear();
+    await act(async () => fireEvent.press(screen.getByRole("radio", { name: "Claude Code" })));
+    expect(patchBot).not.toHaveBeenCalled();
+
+    Object.assign(mockCtx, { bots: [shared("operate")] });
+    await ui.rerender(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} />);
+    expect(screen.queryByText("Hermes Agent")).not.toBeOnTheScreen();
+    Object.assign(mockCtx, { harnesses: undefined });
+  });
+
+  it("asks before deleting a Bot", async () => {
+    const confirm = jest.spyOn(dialogs, "confirmAsync").mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    const deleteBot = jest.fn(async () => {});
+    const onClose = jest.fn();
+    Object.assign(mockCtx, { bots: [bot("b", "Bob")], activeId: "b", fetchRoutines: jest.fn(async () => []), deleteBot });
+    await render(<BotDetailsPanel visible onClose={onClose} onOpenScreen={jest.fn()} />);
+
+    await act(async () => fireEvent.press(screen.getByText("Delete bot")));
+    expect(confirm).toHaveBeenCalledWith("Delete Bob?", expect.stringContaining("erases its chat"));
+    expect(deleteBot).not.toHaveBeenCalled();
+    await act(async () => fireEvent.press(screen.getByText("Delete bot")));
+    expect(deleteBot).toHaveBeenCalledWith("b");
+    expect(onClose).toHaveBeenCalled();
+    confirm.mockRestore();
   });
 
   it("lets a viewer look but not run the Bot", async () => {

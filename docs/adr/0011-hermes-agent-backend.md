@@ -2,7 +2,9 @@
 
 ## Status
 
-Proposed (19 Nov 2026). Assessment for the owner. Nothing changes in code until this is accepted.
+Accepted (19 Nov 2026). The product owner, David Kennedy, accepted it on 19 Nov 2026: Hermes Agent is the default harness for managed tiers and the harness that carries the Enterprise SLA; Claude Code and other harnesses stay available as best-effort. The gate below becomes the release checklist for managed tiers. Details: [ADR 0027](0027-expo-primary-hermes-default.md). Option (a), the adapter, is built ([ADR 0015](0015-hermes-adapter.md)).
+
+Was: Proposed (19 Nov 2026), as an assessment for the owner.
 
 ADR 0010 is taken by the secrets store (PR #9, in review), so this is 0011.
 

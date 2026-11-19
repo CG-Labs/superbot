@@ -233,9 +233,14 @@ export type SseEvent =
   | { type: "policy"; policy: Policy }
   | { type: "resync" };
 
-/** A session token (servers with sign-in, ADR 0012), or the legacy shared password. */
+/**
+ * A session token (servers with sign-in, ADR 0012), the legacy shared password, or, on
+ * the web build the server hosts, the browser's own session cookie from its sign-in
+ * page (ADR 0027). The cookie is never readable here, so it is never saved.
+ */
 export interface ServerConfig {
   baseUrl: string;
   token?: string;
   password?: string;
+  cookie?: boolean;
 }
