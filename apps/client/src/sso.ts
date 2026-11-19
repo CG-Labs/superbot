@@ -36,8 +36,8 @@ export function ssoSupported(): boolean {
 }
 
 /**
- * One button per provider, in the server's order (Entra, Google, and any OIDC IdP can be
- * on at once). Entries that aren't a provider the server could have, or repeat one, are
+ * One button per provider, in the server's order (Entra, Google, GitHub, Apple, and any
+ * OIDC IdP can be on at once; the server lists only those it has secrets for). Entries that aren't a provider the server could have, or repeat one, are
  * dropped, so a bad response can't make a button that goes somewhere odd.
  */
 export function ssoProviderList(raw: unknown): SsoProvider[] {
@@ -52,6 +52,19 @@ export function ssoProviderList(raw: unknown): SsoProvider[] {
     list.push({ id, label: name, type: typeof type === "string" ? type : "oidc" });
   }
   return list;
+}
+
+/**
+ * The button's text. Apple's guidelines want exactly "Sign in with Apple", so a custom
+ * label doesn't change it; the others use the label the server sends.
+ */
+export function ssoButtonText(p: SsoProvider): string {
+  return p.type === "apple" ? "Sign in with Apple" : `Sign in with ${p.label}`;
+}
+
+/** Apple's button is white on a dark screen (its guidelines); the rest share one style. */
+export function ssoButtonTone(p: SsoProvider): "apple" | "plain" {
+  return p.type === "apple" ? "apple" : "plain";
 }
 
 /** The providers on this server; none when it's older or unreachable. */

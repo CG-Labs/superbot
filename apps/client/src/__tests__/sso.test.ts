@@ -1,5 +1,17 @@
 import * as WebBrowser from "expo-web-browser";
-import { fetchSsoProviders, newPkce, parseSsoReturn, redeemSso, signInWithSso, ssoProviderList, ssoRedirect, ssoStartUrl, SSO_ERRORS } from "../sso";
+import {
+  fetchSsoProviders,
+  newPkce,
+  parseSsoReturn,
+  redeemSso,
+  signInWithSso,
+  ssoButtonText,
+  ssoButtonTone,
+  ssoProviderList,
+  ssoRedirect,
+  ssoStartUrl,
+  SSO_ERRORS,
+} from "../sso";
 
 type NodeCrypto = {
   createHash(alg: string): { update(data: string): { digest(enc: string): string } };
@@ -105,6 +117,31 @@ describe("the provider list", () => {
   it("explains a refused account", () => {
     expect(parseSsoReturn("superbot://auth?error=sso_wrong_account&state=s1", "s1")).toEqual({ error: SSO_ERRORS.sso_wrong_account });
   });
+
+  it("keeps GitHub and Apple beside the OIDC providers", () => {
+    const five = [
+      { id: "entra", label: "Microsoft", type: "entra" },
+      { id: "google", label: "Google", type: "google" },
+      { id: "github", label: "GitHub", type: "github" },
+      { id: "apple", label: "Apple", type: "apple" },
+      { id: "okta", label: "Okta", type: "oidc" },
+    ];
+    expect(ssoProviderList(five)).toEqual(five);
+  });
+});
+
+describe("the buttons", () => {
+  it("say Sign in with Apple exactly, in Apple's style, whatever the label", () => {
+    expect(ssoButtonText({ id: "apple", label: "Apple", type: "apple" })).toBe("Sign in with Apple");
+    expect(ssoButtonText({ id: "work", label: "Work Apple ID", type: "apple" })).toBe("Sign in with Apple");
+    expect(ssoButtonTone({ id: "work", label: "Work Apple ID", type: "apple" })).toBe("apple");
+  });
+
+  it("use the server's label for the others", () => {
+    expect(ssoButtonText({ id: "github", label: "GitHub Enterprise", type: "github" })).toBe("Sign in with GitHub Enterprise");
+    expect(ssoButtonText({ id: "entra", label: "Microsoft", type: "entra" })).toBe("Sign in with Microsoft");
+    expect(ssoButtonTone({ id: "github", label: "GitHub", type: "github" })).toBe("plain");
+  });
 });
 
 describe("talking to the server", () => {
@@ -156,6 +193,26 @@ describe("signInWithSso", () => {
     const sent = JSON.parse(init.body);
     const challenge = new URL(open.mock.calls[0][0]).searchParams.get("challenge");
     expect(sha256(sent.verifier)).toBe(challenge);
+  });
+
+  it("signs in with GitHub and Apple the same way, the server doing the IdP's part", async () => {
+    for (const id of ["github", "apple"]) {
+      open.mockImplementation(async (url: string) => {
+        const u = new URL(url);
+        expect(u.pathname).toBe(`/api/auth/sso/${id}/start`);
+        return { type: "success", url: `superbot://auth?code=sbh_${id}&state=${u.searchParams.get("state")}` };
+      });
+      globalThis.fetch = respond(200, { token: `sbs_${id}` });
+      expect(await signInWithSso(BASE, id)).toEqual({ baseUrl: BASE, token: `sbs_${id}` });
+      expect(JSON.parse((globalThis.fetch as jest.Mock).mock.calls[0][1].body).sso).toBe(`sbh_${id}`);
+    }
+  });
+
+  it("shows why GitHub or Apple refused, from the server's code only", async () => {
+    open.mockImplementation(async (url: string) => ({ type: "success", url: `superbot://auth?error=sso_wrong_account&state=${new URL(url).searchParams.get("state")}` }));
+    globalThis.fetch = jest.fn() as unknown as typeof fetch;
+    await expect(signInWithSso(BASE, "github")).rejects.toThrow(SSO_ERRORS.sso_wrong_account);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
   it("opens the popup in the same tick as the click once providers are loaded", async () => {
