@@ -32,6 +32,7 @@
   },
   "devDependencies": {
     "@react-native/jest-preset": "^0.88.1",
+    "@resvg/resvg-js": "2.6.2",
     "@testing-library/react-native": "^14.1.0",
     "@types/jest": "^30.0.0",
     "@types/react": "~19.3.0",
@@ -57,13 +58,21 @@
     "build:web": "expo export --platform web",
     "desktop": "npm run build:web && electron electron/main.mjs",
     "desktop:pack": "npm run build:web && electron-builder --linux dir --win dir",
-    "test": "jest"
+    "test": "jest",
+    "brand": "node scripts/brand.mjs",
+    "brand:check": "node scripts/brand.mjs --check"
   },
   "build": {
     "appId": "com.cglabs.superbot",
     "productName": "SuperBot",
-    "directories": { "output": "release" },
-    "files": ["dist/**/*", "electron/**/*"]
+    "icon": "assets/images/icon.png",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*"
+    ]
   },
   "private": true,
   "jest": {
