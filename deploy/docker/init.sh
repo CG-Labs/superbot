@@ -20,7 +20,7 @@ Usage: init.sh [options]
   --localhost        Plain HTTP on 127.0.0.1 only (clears a previous --domain)
   --tz ZONE          TZ for routines (e.g. Europe/Jersey)
   --user-name NAME   USER_NAME shown in the app
-  --harnesses LIST   Harness CLIs baked into the image, e.g. "claude codex pi"
+  --harnesses LIST   Harness CLIs baked into the image, e.g. "claude codex pi" (add hermes for Hermes Agent)
   -h, --help         Show this help
 EOF
 }
