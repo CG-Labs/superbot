@@ -63,6 +63,6 @@ A real account the server doesn't take (`wrong_domain`, `email_unverified`) come
 
 ## Not in this slice
 
-- SAML bridge (rest of #19). (Apple and GitHub sign-in came next, in [ADR 0018](0018-sso-github-apple.md).)
+- SAML bridge (rest of #19). (Apple and GitHub sign-in came next, in [ADR 0018](0018-sso-github-apple.md); the SAML bridge in [ADR 0019](0019-saml-bridge.md).)
 - Group or role claims to SuperBot roles; mapping `hd` or email domain to a role.
 - Desktop (Electron) SSO, IdP logout, and a linking UI (as in ADR 0014).

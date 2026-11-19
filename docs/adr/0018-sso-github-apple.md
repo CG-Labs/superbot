@@ -70,4 +70,4 @@ An iOS app that signs people in with a third-party or social login must also off
 
 - Native Sign in with Apple on iOS (AuthenticationServices) and Apple's server-to-server notifications (account deleted, consent revoked, email relay changes).
 - GitHub team restrictions, and enterprise-managed users' SAML/OIDC (use the org check or the generic OIDC type).
-- SAML bridge (rest of [#19](https://github.com/CG-Labs/superbot/issues/19)), SCIM stub, bot ACLs, and a linking UI.
+- SAML bridge (rest of [#19](https://github.com/CG-Labs/superbot/issues/19), next in [ADR 0019](0019-saml-bridge.md)), SCIM stub, bot ACLs, and a linking UI.
