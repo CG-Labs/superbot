@@ -290,16 +290,20 @@ fn migrate_audit_events(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
         CREATE INDEX audit_events_action ON audit_events(action, id);
         CREATE INDEX audit_events_actor ON audit_events(actor_kind, actor_id, id);
         CREATE TRIGGER audit_events_no_update BEFORE UPDATE ON audit_events
-          BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;
-        CREATE TRIGGER audit_events_no_delete BEFORE DELETE ON audit_events
-          WHEN NOT EXISTS (
-            SELECT 1 FROM settings
-            WHERE key = 'audit_retention_days' AND CAST(value AS INTEGER) > 0
-              AND OLD.at < (CAST(strftime('%s', 'now') AS INTEGER) - CAST(value AS INTEGER) * 86400) * 1000
-          )
           BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;",
-    )
+    )?;
+    c.execute_batch(&format!(
+        "CREATE TRIGGER audit_events_no_delete BEFORE DELETE ON audit_events
+          WHEN coalesce(OLD.at >= {AUDIT_CUTOFF}, 1)
+          BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;"
+    ))
 }
+
+/// Unix ms before which audit events may be deleted, or NULL while retention is off.
+/// Pruning and the delete trigger share it: SQLite's 'now' is fixed for one statement,
+/// so both see the same cutoff.
+const AUDIT_CUTOFF: &str = "(SELECT (CAST(strftime('%s', 'now') AS INTEGER) - CAST(value AS INTEGER) * 86400) * 1000
+  FROM settings WHERE key = 'audit_retention_days' AND CAST(value AS INTEGER) > 0)";
 
 /// Approvals and harness policy. Fresh installs ask before risky tools; existing
 /// installs keep running in bypass, as before, until the operator opts in.
@@ -813,8 +817,9 @@ impl Db {
 
     /// Deletes events older than `cutoff` (unix ms). The trigger refuses any row
     /// still inside the saved retention window.
-    pub fn prune_audit(&self, cutoff: i64) -> rusqlite::Result<usize> {
-        self.c().execute("DELETE FROM audit_events WHERE at < ?", [cutoff])
+    /// Deletes events older than the saved retention window.
+    pub fn prune_audit(&self) -> rusqlite::Result<usize> {
+        self.c().execute(&format!("DELETE FROM audit_events WHERE at < {AUDIT_CUTOFF}"), [])
     }
 }
 
@@ -874,8 +879,9 @@ mod tests {
         assert!(db.c().execute("UPDATE audit_events SET details = '{}' WHERE action = 'policy.updated'", []).is_err());
         assert!(db.c().execute("DELETE FROM audit_events", []).is_err());
         assert!(db.c().execute("DELETE FROM audit_events WHERE action = 'policy.updated'", []).is_err());
-        // No retention set: even pruning old rows is refused.
-        assert!(db.prune_audit(now() + 60_000).is_err());
+        // No retention set: nothing can be deleted, however old.
+        assert!(db.c().execute("DELETE FROM audit_events WHERE at < ?", [now() + 60_000]).is_err());
+        assert_eq!(db.prune_audit().unwrap(), 0);
         assert_eq!(all_events(&db).len(), 2);
         let e = &all_events(&db)[0];
         assert_eq!((e.actor_kind.as_str(), e.actor_id.as_deref(), e.target_id.as_deref()), ("user", Some("operator"), Some("global")));
@@ -888,14 +894,25 @@ mod tests {
         db.c()
             .execute("INSERT INTO audit_events (at, actor_kind, action, outcome) VALUES (?, 'system', 'old.event', 'success')", [now() - 40 * day])
             .unwrap();
-        assert!(db.prune_audit(now() - 30 * day).is_err(), "no retention saved yet");
+        assert_eq!(db.prune_audit().unwrap(), 0, "no retention saved yet");
+        assert!(db.c().execute("DELETE FROM audit_events", []).is_err());
         db.set_audit_retention(Some(30));
         assert_eq!(db.audit_retention(), Some(30));
         // A cutoff inside the window would delete young rows, so the whole statement fails.
-        assert!(db.prune_audit(now()).is_err());
+        assert!(db.c().execute("DELETE FROM audit_events WHERE at < ?", [now()]).is_err());
         assert!(db.c().execute("DELETE FROM audit_events", []).is_err());
-        assert_eq!(db.prune_audit(now() - 30 * day).unwrap(), 1);
-        assert_eq!(all_events(&db).len(), 1);
+        // Rows on both sides of the cutoff, to the millisecond: pruning never trips the trigger.
+        let edge = now() - 30 * day;
+        for ms in (-2_000..=2_000).step_by(50) {
+            db.c()
+                .execute("INSERT INTO audit_events (at, actor_kind, action, outcome) VALUES (?, 'system', 'edge.event', 'success')", [edge + ms])
+                .unwrap();
+        }
+        assert!(db.prune_audit().unwrap() >= 21, "the 40-day-old row and the edge rows older than a second");
+        let left: Vec<i64> = all_events(&db).iter().filter(|e| e.action == "edge.event").map(|e| e.at).collect();
+        assert!(left.iter().all(|&at| at > edge - 1_000), "rows past the window are gone");
+        assert_eq!(left.iter().filter(|&&at| at >= edge + 1_000).count(), 21, "rows inside the window stay");
+        assert!(all_events(&db).iter().all(|e| e.action != "old.event"));
         db.set_audit_retention(None);
         assert_eq!(db.audit_retention(), None);
     }
