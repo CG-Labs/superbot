@@ -550,6 +550,10 @@ async fn screen_info(State(app): State<AppState>, Path(id): Path<String>) -> Res
     let screens = app.screens.as_ref().filter(|_| screen::on_path("voxl")).ok_or_else(off)?;
     let info = screens.ensure(&id, |b| app.is_running(b)).await;
     let info = info.ok_or_else(|| ApiError(StatusCode::SERVICE_UNAVAILABLE, "All screens are in use. Try again when a Bot finishes.".into()))?;
+    // A frame loaded before voxl listens gets the proxy's 502 and stays blank, so only hand out a link that works.
+    if !screen::wait_for_port(info.port, 50).await {
+        return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "The screen is still starting. Try again in a moment.".into()));
+    }
     // The proxy in front serves /screen/<port>/ from that local voxl port.
     Ok(Json(json!({ "url": format!("/screen/{}/?token={}", info.port, info.token) })))
 }
@@ -836,6 +840,30 @@ mod tests {
         assert_eq!(code, 404);
         let (code, _) = call(port, "DELETE", &path, None).await;
         assert_eq!(code, 404);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn bot_view_reports_the_open_handoff() {
+        let (_, app, bot, dir) = serve_routines().await;
+        let card = |title: &str| json!({ "title": title, "options": ["Done", "I can't right now"], "handoff": true });
+        let view = |app: &App| app.bot_view(&app.db.bot(&bot).unwrap())["handoff"].clone();
+        assert_eq!(view(&app), Value::Null);
+
+        app.db.add_message(&bot, "bot", "", Some(&json!({ "title": "Pick", "options": ["A", "B"] })), false, None);
+        assert_eq!(view(&app), Value::Null);
+
+        let first = app.db.add_message(&bot, "bot", "", Some(&card("Log in")), false, None);
+        assert_eq!(view(&app), json!(first.id));
+        app.db.add_message(&bot, "user", "later", None, false, None);
+        assert_eq!(view(&app), Value::Null);
+
+        let second = app.db.add_message(&bot, "bot", "", Some(&card("2FA")), false, None);
+        assert_eq!(view(&app), json!(second.id));
+        let mut q = card("2FA");
+        q["picked"] = json!(0);
+        app.db.set_question(second.id, &q);
+        assert_eq!(view(&app), Value::Null);
         let _ = std::fs::remove_dir_all(dir);
     }
 

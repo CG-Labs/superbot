@@ -59,7 +59,7 @@ Settings are in [.env.example](../.env.example). Keep `botctl` next to `botd`: t
 
 All JSON. Browser auth: HTTP Basic with `AUTH_PASSWORD`. Empty password requires `ALLOW_NO_AUTH=1` on loopback only.
 
-- `GET /api/state`: user name, installed harnesses, all Bots
+- `GET /api/state`: user name, installed harnesses, all Bots. Each Bot's `handoff` is the id of its unanswered handoff card, or null.
 - `GET /api/events`: SSE stream (`message`, `draft`, `status`, `bot`, `botDeleted`, `resync`)
 - `POST /api/bots` `{name, harness?, model?, color?, shape?}`
 - `PATCH /api/bots/:id` `{name?, hidden?, harness?, model?, effort?}`, `DELETE /api/bots/:id`
@@ -68,7 +68,7 @@ All JSON. Browser auth: HTTP Basic with `AUTH_PASSWORD`. Empty password requires
 - `POST /api/bots/:id/read`, `POST /api/bots/:id/stop`
 - `GET|POST /api/bots/:id/routines` `{name, cron, instruction}`
 - `PATCH|DELETE /api/routines/:id` `{enabled?, name?, cron?, instruction?}`. Text fields are trimmed and can't be empty; cron must parse.
-- `GET /api/bots/:id/screen`: starts the Bot's screen and returns its live view URL, once voxl is listening
+- `GET /api/bots/:id/screen`: starts the Bot's screen and returns its live view URL. 503 while voxl isn't listening yet, or when all screens are in use
 - `POST /api/handoff` `{from, text}`: `botctl handoff`; waits for the user's answer
 
 ## Not built yet

@@ -140,10 +140,6 @@ impl Screens {
                     .env("DISPLAY", &display)
                     .env("VOXL_PASSWORD", &s.token),
             )?);
-            // The live view link is handed out right after this; a frame loaded before voxl listens gets a 502.
-            if !wait_for_port(port, 50).await {
-                eprintln!("voxl on port {port} isn't listening yet");
-            }
         }
         Ok(s)
     }
@@ -168,7 +164,7 @@ impl Screens {
 }
 
 /// Polls a local port every 100 ms until it accepts a connection. False after `tries`.
-async fn wait_for_port(port: u16, tries: u32) -> bool {
+pub async fn wait_for_port(port: u16, tries: u32) -> bool {
     for _ in 0..tries {
         if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
             return true;
