@@ -73,6 +73,15 @@ expect_code 200 "${AUTH[@]}" "$BASE/"
 state=$(curl -fsS "${AUTH[@]}" "$BASE/api/state")
 grep -q '"name":"Smoke"' <<<"$state" || fail "USER_NAME from .env not applied: $state"
 
+log "Sessions: the password signs in as the owner; the token works until logout"
+expect_code 303 "$BASE/"
+login=$(curl -fsS -H 'Content-Type: application/json' -d "{\"password\":\"$PASSWORD\"}" "$BASE/api/auth/login")
+TOKEN=$(sed -n 's/.*"token":"\(sbs_[0-9a-f]*\)".*/\1/p' <<<"$login")
+[[ -n "$TOKEN" ]] || fail "no session token from /api/auth/login"
+grep -q '"role":"admin"' <<<"$(curl -fsS -H "Authorization: Bearer $TOKEN" "$BASE/api/auth/me")" || fail "the owner is not an admin"
+expect_code 200 -X POST -H "Authorization: Bearer $TOKEN" "$BASE/api/auth/logout"
+expect_code 401 -H "Authorization: Bearer $TOKEN" "$BASE/api/state"
+
 log "botd is not published on the host and runs as non-root"
 if curl -fsS --max-time 2 http://127.0.0.1:3000/healthz >/dev/null 2>&1; then
   fail "botd port 3000 is reachable from the host"

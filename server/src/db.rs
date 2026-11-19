@@ -1325,6 +1325,25 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_adds_users_and_keeps_data() {
+        let path = temp_path("users-upgrade").join("app.sqlite");
+        let db = Db::open(&path).unwrap();
+        let bot = db.create_bot("Kept", "#fff", "waddle", "claude", None, true);
+        // As a database from before users: no user tables, user_version 2.
+        db.c().execute_batch("DROP TABLE login_codes; DROP TABLE sessions; DROP TABLE users; PRAGMA user_version = 2;").unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.bot(&bot.id).map(|b| b.name), Some("Kept".into()));
+        assert!(db.users().is_empty(), "the owner is made by botd at start, not by the migration");
+        let v: i64 = db.c().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 3);
+        // The schema refuses what the code never writes.
+        let c = db.c();
+        assert!(c.execute("INSERT INTO users (id, display_name, role, created_at, updated_at) VALUES ('x', 'X', 'root', 0, 0)", []).is_err());
+        assert!(c.execute("INSERT INTO users (id, display_name, role, idp_issuer, created_at, updated_at) VALUES ('x', 'X', 'member', 'iss', 0, 0)", []).is_err());
+    }
+
+    #[test]
     fn audit_filters() {
         let db = Db::open(&temp_path("filters").join("app.sqlite")).unwrap();
         let ev = |actor: audit::Actor, action: &str| audit::Event::new(actor, action);
