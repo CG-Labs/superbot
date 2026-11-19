@@ -9,6 +9,7 @@ import {
   TextInput,
   View,
 } from "react-native";
+import { sharingLabel } from "../src/access";
 import { confirmAsync, showError } from "../src/dialogs";
 import { cronLabel } from "../src/routines";
 import { useSuperBot } from "../src/SuperBotContext";
@@ -39,10 +40,14 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
     deleteRoutine,
     policy,
     setBotPolicy,
-    canWrite,
+    setBotVisibility,
     can,
+    canOnBot,
+    me,
   } = useSuperBot();
   const bot = bots.find((b) => b.id === activeId);
+  const canOperate = canOnBot(bot, "operate");
+  const canManage = canOnBot(bot, "manage");
   const botId = bot?.id;
   const [name, setName] = useState(bot?.name || "");
   const [routines, setRoutines] = useState<Routine[]>([]);
@@ -121,7 +126,7 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
           <TextInput
             style={styles.name}
             value={name}
-            editable={canWrite}
+            editable={canManage}
             onChangeText={setName}
             onBlur={() => {
               const n = name.trim();
@@ -130,7 +135,7 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
           />
           <View style={styles.sectionRow}>
             <Text style={styles.sectionLabel}>Routines</Text>
-            {canWrite ? (
+            {canOperate ? (
               <Pressable role="button" aria-label="New routine" onPress={() => setEditing("new")}>
                 <Text style={styles.link}>+ New routine</Text>
               </Pressable>
@@ -143,7 +148,7 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
                   style={{ flex: 1 }}
                   role="button"
                   aria-label={`Edit routine ${r.name}`}
-                  disabled={!canWrite}
+                  disabled={!canOperate}
                   onPress={() => setEditing(r)}
                 >
                   <Text style={styles.rName}>{r.name}</Text>
@@ -152,7 +157,7 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
                 <Switch
                   aria-label={r.enabled ? `Pause ${r.name}` : `Resume ${r.name}`}
                   value={r.enabled}
-                  disabled={!canWrite}
+                  disabled={!canOperate}
                   onValueChange={() => void toggleRoutine(r).then(reload).catch(showError)}
                 />
               </View>
@@ -163,7 +168,7 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
           <Text style={styles.section}>Computer</Text>
           <View style={styles.row}>
             <Text style={styles.dim}>{bot.working ? bot.status || "Working" : "Asleep"}</Text>
-            {canWrite ? (
+            {canOperate ? (
               <Pressable
                 role="button"
                 aria-label="Open screen"
@@ -182,7 +187,7 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
           </View>
           <View style={styles.row}>
             <Text style={styles.dim}>Hide from sidebar</Text>
-            <Switch value={bot.hidden} disabled={!canWrite} onValueChange={(v) => void patchBot(bot.id, { hidden: v })} />
+            <Switch value={bot.hidden} disabled={!canManage} onValueChange={(v) => void patchBot(bot.id, { hidden: v })} />
           </View>
           <View style={styles.row}>
             <Text style={styles.dim}>Ask before risky actions</Text>
@@ -197,7 +202,24 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
               <Text style={styles.policyLink}>Use the default for all Bots ({policy?.mode ?? "ask"})</Text>
             </Pressable>
           ) : null}
-          {!bot.primary && canWrite ? (
+          {bot.visibility ? (
+            <>
+              <Text style={styles.section}>Sharing</Text>
+              <View style={styles.row}>
+                <Text style={styles.dim}>{sharingLabel(bot, me.id)}</Text>
+              </View>
+              <View style={styles.row}>
+                <Text style={styles.dim}>Shared with everyone</Text>
+                <Switch
+                  aria-label={bot.visibility === "shared" ? "Make private" : "Share with everyone"}
+                  value={bot.visibility === "shared"}
+                  disabled={!canManage}
+                  onValueChange={(v) => void setBotVisibility(bot.id, v ? "shared" : "private").catch(showError)}
+                />
+              </View>
+            </>
+          ) : null}
+          {!bot.primary && canManage ? (
             <Pressable
               style={styles.delete}
               onPress={() => {

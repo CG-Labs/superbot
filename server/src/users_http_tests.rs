@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 static PW: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| random_hex(16));
 
-fn parse(s: &str) -> Value {
+pub(super) fn parse(s: &str) -> Value {
     serde_json::from_str(s).unwrap_or(Value::Null)
 }
 
@@ -40,7 +40,7 @@ async fn token_for(port: u16, body: Value) -> String {
 }
 
 /// A new user with `role`, signed in with a one-time code. Returns its id and Authorization.
-async fn user_with(port: u16, admin: &str, email: &str, role: &str) -> (String, String) {
+pub(super) async fn user_with(port: u16, admin: &str, email: &str, role: &str) -> (String, String) {
     let (code, u) = call(port, "POST", "/api/users", admin, &json!({ "email": email, "role": role }).to_string()).await;
     assert_eq!(code, 201, "{u}");
     let id = parse(&u)["id"].as_str().unwrap().to_string();
@@ -154,7 +154,8 @@ async fn each_role_gets_exactly_its_permissions() {
     let (port, app, admin, bot) = serve(|_| {}).await;
     let (member_id, member) = user_with(port, &admin, "member@example.com", "member").await;
     let (_, readonly) = user_with(port, &admin, "viewer@example.com", "read-only").await;
-    let b = app.db.create_bot("Shared", "#fff", "waddle", "claude", None, false);
+    // The member owns it, so only roles decide here. Bot ACLs: acl_http_tests.rs.
+    let b = app.db.create_bot_owned("Shared", "#fff", "waddle", "claude", None, false, &member_id, Visibility::Shared);
     let bid = b.id.as_str();
 
     let routes: Vec<(&str, String, &str)> = vec![

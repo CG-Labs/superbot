@@ -13,6 +13,7 @@ import {
   loadSavedCredentials,
   saveCredentials,
 } from "./auth";
+import { hasAccess } from "./access";
 import { ApiError, signIn, SuperBotApi } from "./api";
 import {
   applyHandoffHistory,
@@ -26,7 +27,19 @@ import { createBody, patchBody, type RoutineDraft } from "./routines";
 import { signInWithSso } from "./sso";
 import { resolveScreenUrl } from "./screen";
 import { connectSse } from "./sse";
-import type { Approval, BotView, Me, Message, ModelOption, Policy, PolicyMode, Routine, SseEvent } from "./types";
+import type {
+  Approval,
+  BotAccess,
+  BotView,
+  Me,
+  Message,
+  ModelOption,
+  Policy,
+  PolicyMode,
+  Routine,
+  SseEvent,
+  Visibility,
+} from "./types";
 
 interface SuperBotContextValue {
   ready: boolean;
@@ -38,6 +51,8 @@ interface SuperBotContextValue {
   canWrite: boolean;
   /** Whether the server lets this person do `perm` (see ADR 0012). */
   can: (perm: string) => boolean;
+  /** Whether this person may do what takes `need` on the Bot (ADR 0017): view, operate (run it), or manage. */
+  canOnBot: (bot: BotView | null | undefined, need: BotAccess) => boolean;
   harnesses: string[];
   defaultHarness: string;
   bots: BotView[];
@@ -64,6 +79,8 @@ interface SuperBotContextValue {
   answerQuestion: (message: Message, option: number) => Promise<void>;
   createBot: (body: { name: string; color: string; shape: string; harness: string }) => Promise<BotView>;
   patchBot: (id: string, body: Record<string, unknown>) => Promise<void>;
+  /** Shares the Bot with everyone, or makes it private to its owner and grants. */
+  setBotVisibility: (id: string, visibility: Visibility) => Promise<void>;
   deleteBot: (id: string) => Promise<void>;
   stopBot: (id: string) => Promise<void>;
   fetchModels: (harness: string) => Promise<ModelOption[]>;
@@ -120,14 +137,19 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
   // Servers from before roles send no permissions; everyone could write there.
   const can = (perm: string) => !me.permissions || me.permissions.includes(perm);
   const canWrite = can("write");
+  const canOnBot = (bot: BotView | null | undefined, need: BotAccess) => hasAccess(bot, need, canWrite);
   const canWriteRef = useRef(canWrite);
   canWriteRef.current = canWrite;
-  const markRead = (client: SuperBotApi, botId: string) => {
-    if (canWriteRef.current) void client.markRead(botId).catch(() => {});
-  };
   const [harnesses, setHarnesses] = useState<string[]>([]);
   const [defaultHarness, setDefaultHarness] = useState("claude");
   const [bots, setBots] = useState<BotView[]>([]);
+  const botsRef = useRef(bots);
+  botsRef.current = bots;
+  // Marking read changes the Bot for everyone, so it takes operator access to it.
+  const markRead = (client: SuperBotApi, botId: string) => {
+    const bot = botsRef.current.find((b) => b.id === botId);
+    if (hasAccess(bot, "operate", canWriteRef.current)) void client.markRead(botId).catch(() => {});
+  };
   const [activeId, setActiveId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Record<string, Message[]>>({});
   const [drafts, setDrafts] = useState<Record<string, string>>({});
@@ -242,10 +264,22 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
   const refreshInternal = async (client: SuperBotApi, reloadMessages?: boolean) => {
     const state = await client.verify();
     applyState(state);
+    // Drop what's cached for Bots this person can no longer see (access was revoked).
+    const visible = new Set(state.bots.map((b) => b.id));
+    const drop = <T,>(map: Record<string, T>) => {
+      if (!Object.keys(map).some((id) => !visible.has(id))) return map;
+      return Object.fromEntries(Object.entries(map).filter(([id]) => visible.has(id)));
+    };
+    setMessages(drop);
+    setDrafts(drop);
+    setHandoffs(drop);
     void prefetchUnread(client, state.bots);
     if (reloadMessages) {
       for (const id of Object.keys(messagesRef.current)) {
-        const list = await fetchHistory(client, id);
+        if (!visible.has(id)) continue;
+        // One chat failing to load mustn't stop the rest from catching up.
+        const list = await fetchHistory(client, id).catch(() => null);
+        if (!list) continue;
         setMessages((prev) => ({ ...prev, [id]: list }));
         setHandoffs((h) => applyHandoffHistory(h, id, list));
       }
@@ -419,6 +453,12 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
     setBots((bs) => upsertBot(bs, b));
   };
 
+  const setBotVisibility = async (id: string, visibility: Visibility) => {
+    if (!api) return;
+    const res = await api.patchBotAccess(id, { visibility });
+    setBots((bs) => bs.map((b) => (b.id === id ? { ...b, visibility: res.visibility, access: res.access } : b)));
+  };
+
   const deleteBot = async (id: string) => {
     if (!api) return;
     await api.deleteBot(id);
@@ -495,6 +535,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
       me,
       canWrite,
       can,
+      canOnBot,
       harnesses,
       defaultHarness,
       bots,
@@ -517,6 +558,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
       answerQuestion,
       createBot,
       patchBot,
+      setBotVisibility,
       deleteBot,
       stopBot,
       fetchModels,
