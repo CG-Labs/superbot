@@ -739,18 +739,22 @@ async fn list_approvals(State(app): State<AppState>, Extension(who): Extension<P
     Ok(Json(json!(app.db.approvals(status, q.get("bot").map(String::as_str), limit))))
 }
 
-async fn approve(state: State<AppState>, who: Extension<Principal>, id: Path<String>, body: Option<Json<Value>>) -> Res {
+async fn approve(state: State<AppState>, who: Extension<Principal>, id: Path<String>, body: axum::body::Bytes) -> Res {
     decide(state, who, id, body, true).await
 }
 
-async fn deny(state: State<AppState>, who: Extension<Principal>, id: Path<String>, body: Option<Json<Value>>) -> Res {
+async fn deny(state: State<AppState>, who: Extension<Principal>, id: Path<String>, body: axum::body::Bytes) -> Res {
     decide(state, who, id, body, false).await
 }
 
 /// Body: `{remember?: "bot" | "global" | true, note?}`. Remember saves a rule for this exact call.
-async fn decide(State(app): State<AppState>, Extension(who): Extension<Principal>, Path(id): Path<String>, body: Option<Json<Value>>, approve: bool) -> Res {
+async fn decide(State(app): State<AppState>, Extension(who): Extension<Principal>, Path(id): Path<String>, body: axum::body::Bytes, approve: bool) -> Res {
     need_user(who)?;
-    let v = body.map(|Json(v)| v).unwrap_or_default();
+    let v: Value = if body.iter().all(u8::is_ascii_whitespace) {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body).map_err(|e| bad(format!("Invalid JSON: {e}")))?
+    };
     let remember = match &v["remember"] {
         Value::Bool(true) => Some(Remember::Bot),
         Value::String(s) if s == "bot" => Some(Remember::Bot),
@@ -885,6 +889,123 @@ mod tests {
         let port = serve("", true, "").await;
         let host = format!("127.0.0.1:{port}");
         assert_eq!(status(port, &host, "").await, 200);
+    }
+
+    /// The real router on a fresh install (policy: ask), password "hunter2".
+    async fn serve_app() -> (u16, AppState) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let auth = Arc::new(Auth {
+            password: "hunter2".into(),
+            allow_no_auth: false,
+            bot_token: "bot-token".into(),
+            hosts: allowed_hosts("127.0.0.1", port, ""),
+        });
+        let app = runner::test_app();
+        let r = router(app.clone(), auth);
+        tokio::spawn(async move {
+            axum::serve(listener, r).await.unwrap();
+        });
+        (port, app)
+    }
+
+    async fn call(port: u16, method: &str, path: &str, authorization: &str, body: &str) -> (u16, String) {
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let auth = if authorization.is_empty() { String::new() } else { format!("Authorization: {authorization}\r\n") };
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut res = String::new();
+        s.read_to_string(&mut res).await.unwrap();
+        let code = res.split_whitespace().nth(1).unwrap().parse().unwrap();
+        (code, res.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default())
+    }
+
+    const BOT: &str = "Bearer bot-token";
+
+    #[tokio::test]
+    async fn healthz_is_open_and_new_endpoints_need_login() {
+        let (port, _) = serve_app().await;
+        assert_eq!(call(port, "GET", "/healthz", "", "").await.0, 200);
+        for (m, p) in [
+            ("GET", "/api/policy"),
+            ("PUT", "/api/policy"),
+            ("GET", "/api/approvals"),
+            ("POST", "/api/approvals/x/approve"),
+            ("POST", "/api/approvals/check"),
+            ("GET", "/api/audit"),
+            ("GET", "/api/policy/rules"),
+        ] {
+            assert_eq!(call(port, m, p, "", "{}").await.0, 401, "{m} {p}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bots_cannot_approve_or_change_policy() {
+        let (port, app) = serve_app().await;
+        let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
+        let user = basic("hunter2");
+        for (m, p, b) in [
+            ("PUT", "/api/policy".to_string(), r#"{"mode":"bypass"}"#),
+            ("PUT", format!("/api/bots/{}/policy", bot.id), r#"{"mode":"bypass"}"#),
+            ("DELETE", format!("/api/bots/{}/policy", bot.id), ""),
+            ("POST", "/api/policy/rules".to_string(), r#"{"action":"allow","pattern":"*"}"#),
+            ("GET", "/api/approvals".to_string(), ""),
+            ("POST", "/api/approvals/x/approve".to_string(), "{}"),
+            ("POST", "/api/approvals/x/deny".to_string(), "{}"),
+            ("GET", "/api/audit".to_string(), ""),
+        ] {
+            assert_eq!(call(port, m, &p, BOT, b).await.0, 403, "{m} {p}");
+        }
+        assert_eq!(app.db.global_policy().mode, policy::Mode::Ask);
+        assert_eq!(call(port, "GET", "/api/policy", BOT, "").await.0, 200);
+
+        let (code, body) = call(port, "PUT", "/api/policy", &user, r#"{"timeoutMinutes":3}"#).await;
+        assert_eq!((code, serde_json::from_str::<Value>(&body).unwrap()["policy"]["timeoutMinutes"].as_u64()), (200, Some(3)));
+        assert_eq!(call(port, "PUT", "/api/policy", &user, r#"{"mode":"yolo"}"#).await.0, 400);
+        let (_, audit) = call(port, "GET", "/api/audit", &user, "").await;
+        assert_eq!(serde_json::from_str::<Value>(&audit).unwrap()[0]["action"], "policy.updated");
+    }
+
+    #[tokio::test]
+    async fn hook_waits_for_a_person_then_runs() {
+        let (port, app) = serve_app().await;
+        let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
+        let user = basic("hunter2");
+        let check = |cmd: &str| {
+            json!({ "from": bot.id, "harness": "claude", "event": { "tool_name": "Bash", "tool_input": { "command": cmd }, "cwd": "/tmp" } }).to_string()
+        };
+
+        let (code, body) = call(port, "POST", "/api/approvals/check", BOT, &check("ls -la")).await;
+        assert_eq!((code, body.lines().next()), (200, Some("allow")));
+
+        let hook = tokio::spawn({
+            let body = check("git push origin main");
+            async move { call(port, "POST", "/api/approvals/check", BOT, &body).await }
+        });
+        let pending = loop {
+            let (_, list) = call(port, "GET", "/api/approvals?status=pending", &user, "").await;
+            let list: Vec<Value> = serde_json::from_str(&list).unwrap();
+            if let Some(a) = list.into_iter().next() {
+                break a;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(pending["class"], "git_push");
+        let id = pending["id"].as_str().unwrap();
+        assert_eq!(call(port, "POST", &format!("/api/approvals/{id}/approve"), BOT, "{}").await.0, 403);
+        let (code, done) = call(port, "POST", &format!("/api/approvals/{id}/approve"), &user, r#"{"remember":"bot"}"#).await;
+        assert_eq!((code, serde_json::from_str::<Value>(&done).unwrap()["status"].as_str()), (200, Some("approved")));
+        assert_eq!(hook.await.unwrap().1.lines().next(), Some("allow"));
+        assert_eq!(call(port, "POST", &format!("/api/approvals/{id}/deny"), &user, "").await.0, 409);
+
+        let (_, again) = call(port, "POST", "/api/approvals/check", BOT, &check("git push origin main")).await;
+        assert_eq!(again.lines().next(), Some("allow"), "remembered");
+
+        let (_, unknown) = call(port, "POST", "/api/approvals/check", BOT, r#"{"from":"nobody","event":{"tool_name":"Bash"}}"#).await;
+        assert_eq!(unknown.lines().next(), Some("deny"));
     }
 
     #[test]
