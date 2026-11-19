@@ -379,6 +379,8 @@ pub(super) struct Oidc {
     claims: Value,
     /// Claims to change in the next ID token; null removes one.
     pub(super) next: Mutex<Value>,
+    /// Sign the next ID tokens with a key the IdP doesn't publish, under the name of one it does.
+    pub(super) forge: Mutex<bool>,
     /// code -> (PKCE challenge, nonce, redirect_uri)
     codes: Mutex<HashMap<String, (String, String, String)>>,
 }
@@ -387,7 +389,7 @@ pub(super) struct Oidc {
 pub(super) async fn mock_oidc(path: &str, basic: bool, claims: Value) -> Arc<Oidc> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let issuer = format!("http://127.0.0.1:{}{path}", listener.local_addr().unwrap().port());
-    let idp = Arc::new(Oidc { issuer: issuer.clone(), secret: random_hex(16), claims, next: Mutex::new(json!({})), codes: Mutex::default() });
+    let idp = Arc::new(Oidc { issuer: issuer.clone(), secret: random_hex(16), claims, next: Mutex::new(json!({})), forge: Mutex::new(false), codes: Mutex::default() });
     let (a, b) = (idp.clone(), idp.clone());
     let methods = if basic { json!(["client_secret_basic"]) } else { json!(["client_secret_post", "client_secret_basic"]) };
     let meta = json!({
@@ -430,7 +432,8 @@ pub(super) async fn mock_oidc(path: &str, basic: bool, claims: Value) -> Arc<Oid
                 c.extend(b.claims.as_object().unwrap().clone());
                 c.extend(b.next.lock().unwrap().as_object().unwrap().clone());
                 c.retain(|_, v| !v.is_null());
-                Json(json!({ "token_type": "Bearer", "id_token": keys()[0].sign(&claims) })).into_response()
+                let id_token = if *b.forge.lock().unwrap() { keys()[1].sign_with(&json!({ "alg": "RS256", "kid": keys()[0].kid }), &claims) } else { keys()[0].sign(&claims) };
+                Json(json!({ "token_type": "Bearer", "id_token": id_token })).into_response()
             }),
         );
     tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });

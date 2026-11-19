@@ -23,6 +23,8 @@ mod users_http_tests;
 #[cfg(test)]
 mod sso_http_tests;
 #[cfg(test)]
+mod sso_saml_http_tests;
+#[cfg(test)]
 mod sso_social_http_tests;
 
 use acl::{Access, Viewer, Visibility};

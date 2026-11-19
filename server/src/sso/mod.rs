@@ -10,11 +10,14 @@
 //!
 //! GitHub is OAuth 2 without an ID token, and Apple posts its answer (ADR 0018); both
 //! end in the same callback, checks, and sessions as the rest.
+//!
+//! SAML IdPs sign in through an OIDC broker (ADR 0019): botd never parses SAML itself.
 
 pub mod apple;
 mod github;
 pub mod jwt;
 mod provider;
+mod saml;
 
 use crate::audit::{Actor, ActorKind, Event, Outcome, Source, Who};
 use crate::db::{self, Identity, JitError, NewIdentity, User};
@@ -266,24 +269,26 @@ impl Sso {
 type Var<'a> = dyn Fn(&str) -> Option<String> + 'a;
 type List<'a> = dyn Fn(&str) -> Vec<String> + 'a;
 
-const TYPES: [&str; 5] = ["entra", "google", "oidc", "apple", "github"];
+const TYPES: [&str; 6] = ["entra", "google", "oidc", "apple", "github", "saml"];
 
 /// Settings that only mean something for some types. Set on another, they would look like
 /// a restriction that isn't there, so they are refused.
-const ONLY_FOR: [(&str, &[&str]); 13] = [
+const ONLY_FOR: [(&str, &[&str]); 15] = [
     ("TENANT", &["entra"]),
     ("ALLOWED_TENANTS", &["entra"]),
     ("AUTHORITY", &["entra"]),
     ("HOSTED_DOMAINS", &["google"]),
-    ("ALLOWED_DOMAINS", &["oidc", "apple"]),
-    ("SUBJECT_CLAIM", &["oidc"]),
-    ("EMAIL_CLAIM", &["oidc"]),
-    ("NAME_CLAIM", &["oidc"]),
+    ("ALLOWED_DOMAINS", &["oidc", "apple", "saml"]),
+    ("SUBJECT_CLAIM", &["oidc", "saml"]),
+    ("EMAIL_CLAIM", &["oidc", "saml"]),
+    ("NAME_CLAIM", &["oidc", "saml"]),
     ("TEAM_ID", &["apple"]),
     ("KEY_ID", &["apple"]),
     ("ALLOWED_ORGS", &["github"]),
     ("URL", &["github"]),
     ("API_URL", &["github"]),
+    ("IDP_ALIAS", &["saml"]),
+    ("IDP_ENTITY_ID", &["saml"]),
 ];
 
 /// Claims people or their admins can change, so they can't be the subject.
@@ -310,10 +315,24 @@ fn parse_provider(id: &str, var: &Var, list: &List) -> Result<Provider, String> 
     let set_scopes = var(&key("SCOPES"));
     let has = |scopes: &str, any: &[&str]| scopes.split_whitespace().any(|s| any.contains(&s));
     let scopes = set_scopes.clone().unwrap_or_else(|| "openid profile email".into());
-    if matches!(ty.as_str(), "entra" | "google" | "oidc") && !has(&scopes, &["openid"]) {
+    if matches!(ty.as_str(), "entra" | "google" | "oidc" | "saml") && !has(&scopes, &["openid"]) {
         return Err(format!("{} must include openid", key("SCOPES")));
     }
     let mut scopes = scopes;
+    let claim_map = |subject: &str| -> Result<ClaimMap, String> {
+        let claim = |k: &str, default: &str| -> Result<String, String> {
+            let c = var(&key(k)).unwrap_or_else(|| default.into());
+            if c.len() > 128 || !c.bytes().all(|b| b.is_ascii_graphic()) {
+                return Err(format!("{} must be a claim name", key(k)));
+            }
+            Ok(c)
+        };
+        let map = ClaimMap { subject: claim("SUBJECT_CLAIM", subject)?, email: claim("EMAIL_CLAIM", "email")?, name: claim("NAME_CLAIM", "name")? };
+        if MUTABLE_CLAIMS.contains(&map.subject.to_ascii_lowercase().as_str()) {
+            return Err(format!("{}={}: people can change that claim, so it can't say who they are. Use sub or another id that never changes", key("SUBJECT_CLAIM"), map.subject));
+        }
+        Ok(map)
+    };
     let (kind, label) = match ty.as_str() {
         "entra" => {
             let authority = var(&key("AUTHORITY")).unwrap_or_else(|| ENTRA_AUTHORITY.into()).trim_end_matches('/').to_string();
@@ -358,18 +377,22 @@ fn parse_provider(id: &str, var: &Var, list: &List) -> Result<Provider, String> 
             if !secure_url(&issuer) {
                 return Err(format!("{} must be an https URL", key("ISSUER")));
             }
-            let claim = |k: &str, default: &str| -> Result<String, String> {
-                let c = var(&key(k)).unwrap_or_else(|| default.into());
-                if c.len() > 128 || !c.bytes().all(|b| b.is_ascii_graphic()) {
-                    return Err(format!("{} must be a claim name", key(k)));
-                }
-                Ok(c)
-            };
-            let map = ClaimMap { subject: claim("SUBJECT_CLAIM", "sub")?, email: claim("EMAIL_CLAIM", "email")?, name: claim("NAME_CLAIM", "name")? };
-            if MUTABLE_CLAIMS.contains(&map.subject.to_ascii_lowercase().as_str()) {
-                return Err(format!("{}={}: people can change that claim, so it can't say who they are. Use sub or another id that never changes", key("SUBJECT_CLAIM"), map.subject));
+            (Kind::Oidc { issuer, map: claim_map("sub")?, allowed_domains: domains("ALLOWED_DOMAINS")? }, id)
+        }
+        "saml" => {
+            let issuer = var(&key("ISSUER")).ok_or_else(|| format!("{} is required: the OIDC issuer of the broker that speaks SAML to your IdP, like https://sso.example.com/realms/superbot", key("ISSUER")))?;
+            if !secure_url(&issuer) {
+                return Err(format!("{} must be an https URL", key("ISSUER")));
             }
-            (Kind::Oidc { issuer, map, allowed_domains: domains("ALLOWED_DOMAINS")? }, id)
+            let alias = var(&key("IDP_ALIAS")).ok_or_else(|| format!("{} is required: the SAML IdP's alias in the broker, like adfs", key("IDP_ALIAS")))?;
+            let alias = saml::alias(&alias).ok_or_else(|| format!("{}: {alias} is not an alias (letters, digits, . _ -)", key("IDP_ALIAS")))?;
+            let entity_id = var(&key("IDP_ENTITY_ID")).ok_or_else(|| format!("{} is required: the SAML IdP's entity ID, as in its metadata", key("IDP_ENTITY_ID")))?;
+            let entity_id = saml::entity_id(&entity_id).ok_or_else(|| format!("{}: {entity_id} is not an entity ID (a URI, like http://adfs.example.com/adfs/services/trust)", key("IDP_ENTITY_ID")))?;
+            let map = claim_map(saml::SUBJECT_CLAIM)?;
+            if map.subject == saml::IDP_CLAIM {
+                return Err(format!("{}={}: that claim names the IdP, not the person", key("SUBJECT_CLAIM"), map.subject));
+            }
+            (Kind::Saml { issuer, entity_id, alias, map, allowed_domains: domains("ALLOWED_DOMAINS")? }, saml::LABEL)
         }
         "apple" => {
             let issuer = var(&key("ISSUER")).unwrap_or_else(|| apple::ISSUER.into()).trim_end_matches('/').to_string();
@@ -439,7 +462,7 @@ fn claim_details(d: &mut Value, c: &Claims) {
     }
 }
 
-/// The IdP's type (entra, google, oidc, apple, github), beside the configured id.
+/// The IdP's type (entra, google, oidc, apple, github, saml), beside the configured id.
 fn idp_type(a: &Auth, provider: &str) -> Option<&'static str> {
     a.sso.provider(provider).map(|p| p.type_name())
 }
@@ -626,7 +649,7 @@ async fn finish(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, q: &Ha
             a.limiter.fail(&ip, at);
             failed(a, source, id, e.0, None, json!({}));
             // A real account the server doesn't take: say so, so people try another one.
-            return ret.fail(if matches!(e.0, "wrong_domain" | "email_unverified" | "wrong_org") { "sso_wrong_account" } else { "sso_failed" });
+            return ret.fail(if matches!(e.0, "wrong_domain" | "email_unverified" | "wrong_org" | "not_brokered") { "sso_wrong_account" } else { "sso_failed" });
         }
     };
     if claims.name.is_none() {
@@ -736,7 +759,7 @@ pub async fn list_identities(State(app): State<AppState>, Path(key): Path<String
 /// `POST /api/users/{key}/identities {provider, subject, tenant?}`. For Entra the
 /// subject is the user's object id and the tenant defaults to the provider's own; for
 /// GitHub the numeric user id; for Google, Apple, and generic OIDC the subject claim
-/// (`sub` unless mapped).
+/// (`sub` unless mapped); for SAML the IdP's NameID for the person, stored under its entity ID.
 pub async fn link_identity(
     State(app): State<AppState>,
     Extension(a): Extension<Arc<Auth>>,
@@ -1043,10 +1066,74 @@ mod tests {
         assert!(parse(&[("SSO_PROVIDERS", "acme"), ("SSO_PUBLIC_URL", "https://bot.example.com"), ("SSO_ACME_TYPE", "google"), ("SSO_ACME_CLIENT_ID", "c"), ("SSO_ACME_KEY_ID", "KEY1234567")]).is_err(), "an Apple setting on Google");
     }
 
+    const ADFS: &str = "http://adfs.example.com/adfs/services/trust";
+
+    fn saml(extra: &[(&'static str, &'static str)]) -> Result<Sso, String> {
+        let base = [
+            ("SSO_PROVIDERS", "adfs"),
+            ("SSO_PUBLIC_URL", "https://bot.example.com"),
+            ("SSO_ADFS_TYPE", "saml"),
+            ("SSO_ADFS_ISSUER", "https://sso.example.com/realms/superbot"),
+            ("SSO_ADFS_CLIENT_ID", "superbot"),
+            ("SSO_ADFS_IDP_ALIAS", "adfs"),
+            ("SSO_ADFS_IDP_ENTITY_ID", ADFS),
+        ];
+        with_base(&base, extra)
+    }
+
     #[test]
-    fn all_five_types_side_by_side() {
+    fn reads_a_saml_bridge_provider_with_safe_defaults() {
+        let s = saml(&[]).unwrap();
+        let p = s.provider("adfs").unwrap();
+        assert_eq!((p.label.as_str(), p.type_name(), p.jit_role, p.scopes.as_str(), p.oidc(), p.response_mode()), ("Company SSO", "saml", None, "openid profile email", true, "query"));
+        assert!(matches!(&p.kind, Kind::Saml { issuer, entity_id, alias, map, allowed_domains }
+            if issuer == "https://sso.example.com/realms/superbot" && entity_id == ADFS && alias == "adfs"
+            && map.subject == "identity_provider_identity" && map.email == "email" && allowed_domains.is_empty()));
+        assert_eq!(p.auth_params(), [("kc_idp_hint", "adfs".to_string())]);
+        assert_eq!((p.env_var(), p.audience()), ("SSO_ADFS_CLIENT_SECRET".to_string(), format!("anyone SAML IdP {ADFS} signs in (broker alias adfs)")));
+        assert_eq!(p.issuer_for(None).unwrap(), (ADFS.to_string(), None), "identities live under the SAML IdP, not the broker");
+        assert!(p.issuer_for(Some(T1)).is_err());
+        assert_eq!(p.subject(" _a1b2c3 ").unwrap(), "_a1b2c3");
+        assert_eq!(s.redirect_uri("adfs"), "https://bot.example.com/api/auth/sso/adfs/callback");
+
+        let s = saml(&[("SSO_ADFS_ALLOWED_DOMAINS", "example.com"), ("SSO_ADFS_JIT_ROLE", "member"), ("SSO_ADFS_LABEL", "Contoso"), ("SSO_ADFS_SUBJECT_CLAIM", "saml_nameid")]).unwrap();
+        let p = &s.providers[0];
+        assert_eq!((p.label.as_str(), p.jit_role), ("Contoso", Some(Role::Member)));
+        assert!(matches!(&p.kind, Kind::Saml { map, allowed_domains, .. } if map.subject == "saml_nameid" && allowed_domains == &["example.com"]));
+        assert!(p.audience().starts_with("verified emails at example.com from SAML IdP"));
+        assert!(saml(&[("SSO_ADFS_JIT_ROLE", "member")]).is_ok(), "your own IdP: just in time needs no domain list, like oidc");
+    }
+
+    #[test]
+    fn refuses_saml_bridge_settings_that_are_missing_or_unclear() {
+        for (vars, why) in [
+            (vec![("SSO_ADFS_ISSUER", "")], "no broker"),
+            (vec![("SSO_ADFS_ISSUER", "http://sso.example.com/realms/superbot")], "plain http broker"),
+            (vec![("SSO_ADFS_IDP_ALIAS", "")], "no alias"),
+            (vec![("SSO_ADFS_IDP_ALIAS", "ad fs")], "not an alias"),
+            (vec![("SSO_ADFS_IDP_ENTITY_ID", "")], "no entity id"),
+            (vec![("SSO_ADFS_IDP_ENTITY_ID", "adfs")], "not a URI"),
+            (vec![("SSO_ADFS_SUBJECT_CLAIM", "email")], "email as the subject"),
+            (vec![("SSO_ADFS_SUBJECT_CLAIM", "preferred_username")], "broker username as the subject"),
+            (vec![("SSO_ADFS_SUBJECT_CLAIM", "identity_provider")], "the IdP's alias as the subject"),
+            (vec![("SSO_ADFS_SCOPES", "profile email")], "no openid scope"),
+            (vec![("SSO_ADFS_CLIENT_ID", "")], "no client id"),
+            (vec![("SSO_ADFS_TENANT", T1)], "an Entra setting"),
+            (vec![("SSO_ADFS_HOSTED_DOMAINS", "example.com")], "a Google setting"),
+            (vec![("SSO_ADFS_ALLOWED_ORGS", "acme")], "a GitHub setting"),
+            (vec![("SSO_ADFS_ALLOWED_DOMAINS", "example")], "not a domain"),
+        ] {
+            assert!(saml(&vars).is_err(), "{why}");
+        }
+        let okta = [("SSO_PROVIDERS", "okta"), ("SSO_PUBLIC_URL", "https://bot.example.com"), ("SSO_OKTA_TYPE", "oidc"), ("SSO_OKTA_ISSUER", "https://acme.okta.example"), ("SSO_OKTA_CLIENT_ID", "c1")];
+        assert!(with_base(&okta, &[("SSO_OKTA_IDP_ALIAS", "adfs")]).is_err(), "a SAML setting on oidc would look like a check that isn't made");
+        assert!(with_base(&okta, &[("SSO_OKTA_IDP_ENTITY_ID", ADFS)]).is_err());
+    }
+
+    #[test]
+    fn all_six_types_side_by_side() {
         let s = parse(&[
-            ("SSO_PROVIDERS", "entra,google,okta,github,apple"),
+            ("SSO_PROVIDERS", "entra,google,okta,github,apple,adfs"),
             ("SSO_PUBLIC_URL", "https://bot.example.com"),
             ("SSO_ENTRA_CLIENT_ID", "c1"),
             ("SSO_ENTRA_TENANT", T1),
@@ -1058,10 +1145,15 @@ mod tests {
             ("SSO_APPLE_CLIENT_ID", "c5"),
             ("SSO_APPLE_TEAM_ID", "TEAM123456"),
             ("SSO_APPLE_KEY_ID", "KEY1234567"),
+            ("SSO_ADFS_TYPE", "saml"),
+            ("SSO_ADFS_ISSUER", "https://sso.example.com/realms/superbot"),
+            ("SSO_ADFS_CLIENT_ID", "c6"),
+            ("SSO_ADFS_IDP_ALIAS", "adfs"),
+            ("SSO_ADFS_IDP_ENTITY_ID", ADFS),
         ])
         .unwrap();
         let types: Vec<&str> = s.providers.iter().map(|p| p.type_name()).collect();
-        assert_eq!(types, ["entra", "google", "oidc", "github", "apple"]);
+        assert_eq!(types, ["entra", "google", "oidc", "github", "apple", "saml"]);
         assert_eq!(s.redirect_uri("apple"), "https://bot.example.com/api/auth/sso/apple/callback");
     }
 
