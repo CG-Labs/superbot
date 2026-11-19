@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Get started · SuperBot</title>
+  <meta name="description" content="Request access to SuperBot for you and your team." />
+  <meta name="color-scheme" content="dark light" />
+  <meta name="theme-color" content="#171717" media="(prefers-color-scheme: dark)" />
+  <meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)" />
+  <link rel="icon" type="image/svg+xml" href="/site/mark.svg" />
+  <link rel="stylesheet" href="/site/site.css" />
+  <script src="/site/get-started.js" defer></script>
+</head>
+<body class="page-form">
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="top">
+    <div class="wrap top-row">
+      <a class="brand" href="/" aria-label="SuperBot home">
+        <span class="tile"><img src="/site/mark.svg" alt="" width="28" height="28" /></span>
+        <span>SuperBot</span>
+      </a>
+      <nav aria-label="Main">
+        <ul class="nav">
+          <li><a href="/app/">Sign in</a></li>
+        </ul>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main" class="wrap narrow">
+    <section id="request" aria-labelledby="request-title">
+      <h1 id="request-title">Request access</h1>
+      <p class="lede">Tell us a little about you and your team. We review every request and get back to you to set up your account.</p>
+
+      <p id="closed" class="notice" hidden>This server isn't taking new requests. If your organization already uses SuperBot, ask your admin for access.</p>
+
+      <form id="form" novalidate>
+        <div class="error-summary" id="summary" role="alert" tabindex="-1" hidden></div>
+
+        <div class="field">
+          <label for="name">Full name</label>
+          <input id="name" name="name" type="text" autocomplete="name" maxlength="100" required aria-describedby="name-err" />
+          <p class="field-err" id="name-err"></p>
+        </div>
+
+        <div class="field">
+          <label for="email">Work email</label>
+          <input id="email" name="email" type="email" autocomplete="email" inputmode="email" maxlength="254" required aria-describedby="email-hint email-err" />
+          <p class="hint" id="email-hint">We use it for your account and to contact you about this request.</p>
+          <p class="field-err" id="email-err"></p>
+        </div>
+
+        <div class="row">
+          <div class="field">
+            <label for="company">Company</label>
+            <input id="company" name="company" type="text" autocomplete="organization" maxlength="120" required aria-describedby="company-err" />
+            <p class="field-err" id="company-err"></p>
+          </div>
+          <div class="field">
+            <label for="teamSize">Team size</label>
+            <select id="teamSize" name="teamSize" required aria-describedby="teamSize-err">
+              <option value="">Choose…</option>
+              <option value="1">Just me</option>
+              <option value="2-10">2 to 10</option>
+              <option value="11-50">11 to 50</option>
+              <option value="51-200">51 to 200</option>
+              <option value="201-1000">201 to 1,000</option>
+              <option value="1000+">More than 1,000</option>
+            </select>
+            <p class="field-err" id="teamSize-err"></p>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="useCase">What would you like SuperBot to do?</label>
+          <textarea id="useCase" name="useCase" rows="4" maxlength="2000" required aria-describedby="useCase-hint useCase-err"></textarea>
+          <p class="hint" id="useCase-hint">For example: daily research briefs, inbox triage, weekly reports, monitoring vendor portals.</p>
+          <p class="field-err" id="useCase-err"></p>
+        </div>
+
+        <fieldset class="field" aria-describedby="signIn-err">
+          <legend>How would you like to sign in?</legend>
+          <div class="choices">
+            <label class="choice"><input type="radio" name="signIn" value="microsoft" required /> <span>Microsoft</span></label>
+            <label class="choice"><input type="radio" name="signIn" value="google" /> <span>Google</span></label>
+            <label class="choice"><input type="radio" name="signIn" value="github" /> <span>GitHub</span></label>
+            <label class="choice"><input type="radio" name="signIn" value="apple" /> <span>Apple</span></label>
+            <label class="choice"><input type="radio" name="signIn" value="other" /> <span>Other</span></label>
+          </div>
+          <p class="field-err" id="signIn-err"></p>
+        </fieldset>
+
+        <div class="hp" aria-hidden="true">
+          <label for="website">Leave this empty</label>
+          <input id="website" name="website" type="text" tabindex="-1" autocomplete="off" />
+        </div>
+
+        <div class="field">
+          <label class="consent">
+            <input id="consent" name="consent" type="checkbox" required aria-describedby="consent-err" />
+            <span>I agree that SuperBot may store the details in this form and contact me about my request.</span>
+          </label>
+          <p class="field-err" id="consent-err"></p>
+        </div>
+
+        <div id="turnstile" class="field"></div>
+        <p class="field-err" id="turnstileToken-err"></p>
+
+        <button class="btn btn-primary btn-wide" id="submit" type="submit">Request access</button>
+        <noscript><p class="notice">This form needs JavaScript. You can also ask your SuperBot contact for access.</p></noscript>
+      </form>
+    </section>
+
+    <section id="done" aria-labelledby="done-title" hidden>
+      <div class="done-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" /><path d="M7.5 12.5l3 3 6-6.5" /></svg>
+      </div>
+      <h1 id="done-title" tabindex="-1">Thanks, we've got your request</h1>
+      <p class="lede">Here's what happens next.</p>
+      <ol class="next">
+        <li>
+          <h2>We review your request</h2>
+          <p>Someone from the SuperBot team looks at every request and may reach out at <strong id="done-email"></strong> to learn more about what you need.</p>
+        </li>
+        <li>
+          <h2>We set up your account</h2>
+          <p>Once you're approved, we create your account and give you a one-time sign-in code. Keep it private: it works once.</p>
+        </li>
+        <li>
+          <h2>You sign in</h2>
+          <p id="done-signin">Open SuperBot and sign in with your code. After that, your agents are ready to work.</p>
+          <p id="done-sso" hidden></p>
+        </li>
+      </ol>
+      <div class="cta">
+        <a class="btn btn-primary" href="/app/">Go to sign in</a>
+        <a class="btn btn-ghost" href="/">Back to home</a>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <div class="wrap foot-row">
+      <span>&copy; SuperBot</span>
+      <nav aria-label="Footer">
+        <ul class="nav">
+          <li><a href="/">Home</a></li>
+          <li><a href="/app/">Sign in</a></li>
+        </ul>
+      </nav>
+    </div>
+  </footer>
+</body>
+</html>
