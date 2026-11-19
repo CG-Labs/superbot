@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. First slice of M2 ([roadmap](../ROADMAP.md#m2--multi-user--sso)). OIDC providers come next and sign people in to the users and sessions described here.
+Accepted. First slice of M2 ([roadmap](../ROADMAP.md#m2--multi-user--sso)). OIDC providers sign people in to the users and sessions described here: Entra ID first, in [ADR 0013](0013-oidc-sso-entra.md), which also adds `user_identities`.
 
 ## Context
 

@@ -39,6 +39,8 @@ npm run web          # http://localhost:8081 (add CORS origin if needed)
 
 Point the login screen at `http://127.0.0.1:3000` (or your server) and enter `AUTH_PASSWORD`.
 
+**Single sign-on:** when the server offers it (e.g. Microsoft Entra ID, [setup](../../docs/sso/entra.md)), the login screen shows **Sign in with Microsoft**. It opens the system browser (a popup on web) and comes back on `superbot://auth` (web: `<origin>/auth`), which must be in the server's `SSO_APP_REDIRECTS`. Expo Go uses an `exp://…/--/auth` address instead; add that while developing. The desktop app loads from `file://`, so it keeps sign-in codes and the password for now.
+
 ## Features
 
 - **Chat** over SSE, choice cards, per-Bot model and effort.
