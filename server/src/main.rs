@@ -3,6 +3,7 @@
 
 mod adapters;
 mod approvals;
+mod audit;
 mod cron;
 mod db;
 mod paths;
@@ -12,10 +13,11 @@ mod screen;
 mod shell;
 
 use approvals::{DecideError, Remember};
-use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
+use audit::{Actor, Event, Outcome, Source, Who};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, Request, State};
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
@@ -24,10 +26,11 @@ use db::{BotPatch, Db};
 use runner::{App, Config};
 use serde_json::{json, Value};
 use std::convert::Infallible;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tokio_stream::StreamExt;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
@@ -76,12 +79,11 @@ async fn main() {
         eprintln!("DEFAULT_HARNESS must be one of: {}", adapters::NAMES.join(", "));
         std::process::exit(1);
     }
-    let auth_state = Arc::new(Auth {
-        password: password.clone(),
-        allow_no_auth,
-        bot_token: random_hex(24),
-        hosts: allowed_hosts(&host, port, &env("ALLOWED_HOSTS", "")),
+    let retention = audit::retention_days(&env("AUDIT_RETENTION_DAYS", "")).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
     });
+    let bot_token = random_hex(24);
     WEB_DIR.set(std::env::var("WEB_DIR").ok().map(PathBuf::from)).unwrap();
 
     let root = |key: &str, default: &str| {
@@ -102,7 +104,7 @@ async fn main() {
         // `botctl` ships next to `botd`.
         bin_dir: std::env::current_exe().unwrap().parent().unwrap().to_path_buf(),
         api_url: format!("http://127.0.0.1:{port}"),
-        bot_token: auth_state.bot_token.clone(),
+        bot_token: bot_token.clone(),
         run_timeout: Duration::from_secs(60 * env("RUN_TIMEOUT_MINUTES", "60").parse::<u64>().unwrap_or(60)),
         default_harness,
     }, screens);
@@ -114,8 +116,26 @@ async fn main() {
         app.init_bot_files(&bot);
     }
 
+    let auth_state = Arc::new(Auth {
+        password: password.clone(),
+        allow_no_auth,
+        bot_token,
+        hosts: allowed_hosts(&host, port, &env("ALLOWED_HOSTS", "")),
+        trust_forwarded: env("TRUST_FORWARDED_FOR", "") == "1",
+        logins: audit::Logins::default(),
+        app: Some(app.clone()),
+    });
     let router = router(app.clone(), auth_state);
     let policy = app.db.global_policy();
+    app.db.record(&Event::new(Actor::system("server"), "server.started").details(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "defaultHarness": app.cfg.default_harness,
+        "policyMode": policy.mode,
+        "auth": if password.is_empty() { "none" } else { "password" },
+        "auditRetentionDays": retention,
+        "screens": app.screens.is_some(),
+    })));
+    audit::start_retention(app.clone(), retention);
     if policy.mode == policy::Mode::Bypass {
         eprintln!(
             "WARNING: harness policy is bypass: Bots run every tool without asking. \
@@ -156,7 +176,7 @@ async fn main() {
         std::process::exit(0);
     });
 
-    axum::serve(listener, router).await.unwrap();
+    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
 }
 
 fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
@@ -182,6 +202,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/approvals/{id}/approve", post(approve))
         .route("/approvals/{id}/deny", post(deny))
         .route("/audit", get(list_audit))
+        .route("/audit/export.csv", get(export_audit))
         .route("/ask", post(ask))
         .route("/handoff", post(handoff));
     Router::new()
@@ -258,6 +279,70 @@ struct Auth {
     bot_token: String,
     /// Host headers we answer to, lowercase.
     hosts: Vec<String>,
+    /// TRUST_FORWARDED_FOR=1: take the client IP from X-Forwarded-For from any peer,
+    /// not only a proxy on loopback. Set when botd is reachable only through a proxy.
+    trust_forwarded: bool,
+    logins: audit::Logins,
+    /// Where login events go. None in tests of auth alone.
+    app: Option<AppState>,
+}
+
+impl Auth {
+    fn record(&self, e: Event) {
+        if let Some(app) = &self.app {
+            app.db.record(&e);
+        }
+    }
+
+    /// Logs the first good request of a session (see `audit::Logins`).
+    fn login_ok(&self, source: &Source, method: &str) {
+        let client = format!("{}|{}", source.ip.as_deref().unwrap_or(""), source.user_agent.as_deref().unwrap_or(""));
+        if self.logins.success(&client, db::now()) {
+            let who = Who { actor: Actor::operator(), source: source.clone() };
+            self.record(who.event("auth.login").details(json!({ "method": method })));
+        }
+    }
+
+    /// Logs a bad password or token, throttled per IP. Never logs what was sent.
+    fn login_failed(&self, source: &Source, method: &str) {
+        let client = format!("{}|{method}", source.ip.as_deref().unwrap_or(""));
+        let Some(missed) = self.logins.failure(&client, db::now()) else { return };
+        let actor = if method == "bot_token" { Actor::bot(None, None) } else { Actor { id: None, ..Actor::operator() } };
+        let who = Who { actor, source: source.clone() };
+        self.record(who.event("auth.login_failed").outcome(Outcome::Failure).details(json!({ "method": method, "unloggedSinceLast": missed })));
+    }
+
+    /// A Bot request names its Bot (`X-SuperBot-Bot`, from botctl's BOT_ID). All Bots
+    /// share one token, so this is self-reported.
+    fn bot_actor(&self, headers: &axum::http::HeaderMap) -> Actor {
+        let id = headers.get("x-superbot-bot").and_then(|v| v.to_str().ok()).filter(|id| id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric()));
+        match id.and_then(|id| self.app.as_ref()?.db.bot(id)) {
+            Some(b) => Actor::bot(Some(&b.id), Some(&b.name)),
+            None => Actor::bot(None, None),
+        }
+    }
+}
+
+/// The client's IP and user agent. Behind a proxy on loopback (Caddy on the same
+/// host), the IP is the last X-Forwarded-For entry: the one the proxy added.
+fn request_source(req: &Request, trust_forwarded: bool) -> Source {
+    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip().to_canonical());
+    let forwarded = req
+        .headers()
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .last()
+        .and_then(|v| v.parse::<IpAddr>().ok());
+    let ip = match forwarded {
+        Some(f) if trust_forwarded || peer.is_some_and(|p| p.is_loopback()) => Some(f.to_canonical()),
+        _ => peer,
+    };
+    let user_agent = req.headers().get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(|u| audit::clip(u.trim(), 256)).filter(|u| !u.is_empty());
+    Source { ip: ip.map(|i| i.to_string()), user_agent }
 }
 
 /// Refuse to start without AUTH_PASSWORD unless ALLOW_NO_AUTH=1 on loopback only.
@@ -327,6 +412,7 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
         return (StatusCode::FORBIDDEN, "Unknown Host. Add it to ALLOWED_HOSTS.").into_response();
     }
     let h = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let source = request_source(&req, a.trust_forwarded);
     let bot = h.strip_prefix("Bearer ").is_some_and(|t| same(t.as_bytes(), a.bot_token.as_bytes()));
     let user = h.strip_prefix("Basic ").and_then(base64_decode).is_some_and(|creds| {
         let pass = creds.splitn(2, |b| *b == b':').nth(1).unwrap_or_default();
@@ -337,11 +423,29 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
     } else if user || (a.allow_no_auth && a.password.is_empty()) {
         Principal::User
     } else {
+        // No credentials at all is the browser's first request, before it asks for the password.
+        if !h.is_empty() {
+            a.login_failed(&source, if h.starts_with("Bearer ") { "bot_token" } else { "password" });
+        }
         return (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Basic realm=\"Bots\"")], "Login required").into_response();
     };
+    let actor = match who {
+        Principal::User => {
+            a.login_ok(&source, if user { "password" } else { "none" });
+            Actor::operator()
+        }
+        Principal::Bot => a.bot_actor(req.headers()),
+    };
+    let by = Who { actor, source };
+    let (method, path) = (req.method().to_string(), req.uri().path().to_string());
     let mut req = req;
     req.extensions_mut().insert(who);
-    next.run(req).await
+    req.extensions_mut().insert(by.clone());
+    let res = next.run(req).await;
+    if who == Principal::Bot && res.status() == StatusCode::FORBIDDEN {
+        a.record(by.event("access.denied").outcome(Outcome::Denied).details(json!({ "method": method, "path": path })));
+    }
+    res
 }
 
 /// Who is calling: a person (the browser or client, with AUTH_PASSWORD) or a Bot
@@ -412,7 +516,7 @@ async fn web(uri: axum::http::Uri) -> Response {
 async fn events(State(app): State<AppState>) -> impl IntoResponse {
     let stream = BroadcastStream::new(app.tx.subscribe()).map(|r| {
         // A slow client that missed events is told to reload its state.
-        Ok::<_, Infallible>(Event::default().data(r.unwrap_or_else(|_| r#"{"type":"resync"}"#.into())))
+        Ok::<_, Infallible>(SseEvent::default().data(r.unwrap_or_else(|_| r#"{"type":"resync"}"#.into())))
     });
     ([("x-accel-buffering", "no")], Sse::new(stream).keep_alive(KeepAlive::default()))
 }
@@ -486,7 +590,7 @@ fn bot_patch(v: &Value) -> Res<BotPatch> {
     Ok(p)
 }
 
-async fn create_bot(State(app): State<AppState>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
+async fn create_bot(State(app): State<AppState>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
     let p = bot_patch(&v)?;
     let name = p.name.ok_or_else(|| bad("Name is required"))?;
     let harness = p.harness.unwrap_or_else(|| app.cfg.default_harness.clone());
@@ -500,10 +604,30 @@ async fn create_bot(State(app): State<AppState>, Json(v): Json<Value>) -> Res<(S
     );
     app.init_bot_files(&bot);
     app.push_bot(&bot.id);
+    let details = json!({ "name": bot.name, "harness": bot.harness, "model": bot.model });
+    app.db.record(&by.event("bot.created").target("bot", &bot.id).bot(&bot.id).details(details));
     Ok((StatusCode::CREATED, Json(app.bot_view(&bot))))
 }
 
-async fn update_bot(State(app): State<AppState>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
+/// Settings that changed, as `{field: {from, to}}`.
+fn bot_changes(before: &db::Bot, after: &db::Bot) -> serde_json::Map<String, Value> {
+    let mut m = serde_json::Map::new();
+    let mut diff = |k: &str, a: Value, b: Value| {
+        if a != b {
+            m.insert(k.into(), json!({ "from": a, "to": b }));
+        }
+    };
+    diff("name", json!(before.name), json!(after.name));
+    diff("color", json!(before.color), json!(after.color));
+    diff("shape", json!(before.shape), json!(after.shape));
+    diff("harness", json!(before.harness), json!(after.harness));
+    diff("model", json!(before.model), json!(after.model));
+    diff("effort", json!(before.effort), json!(after.effort));
+    diff("hidden", json!(before.hidden), json!(after.hidden));
+    m
+}
+
+async fn update_bot(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
     let bot = need_bot(&app, &id)?;
     let mut p = bot_patch(&v)?;
     if p.harness.as_ref().is_some_and(|h| *h != bot.harness) {
@@ -511,11 +635,17 @@ async fn update_bot(State(app): State<AppState>, Path(id): Path<String>, Json(v)
     }
     app.db.update_bot(&id, p);
     app.push_bot(&id);
-    Ok(Json(app.bot_view(&need_bot(&app, &id)?)))
+    let after = need_bot(&app, &id)?;
+    let changes = bot_changes(&bot, &after);
+    if !changes.is_empty() {
+        app.db.record(&by.event("bot.updated").target("bot", &id).bot(&id).details(json!({ "changes": changes })));
+    }
+    Ok(Json(app.bot_view(&after)))
 }
 
-async fn delete_bot(State(app): State<AppState>, Path(id): Path<String>) -> Res {
-    if need_bot(&app, &id)?.primary {
+async fn delete_bot(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
+    let bot = need_bot(&app, &id)?;
+    if bot.primary {
         return Err(bad("The primary Bot can't be deleted"));
     }
     app.stop(&id);
@@ -523,6 +653,7 @@ async fn delete_bot(State(app): State<AppState>, Path(id): Path<String>) -> Res 
         screens.remove(&id).await;
     }
     app.db.delete_bot(&id);
+    app.db.record(&by.event("bot.deleted").target("bot", &id).bot(&id).details(json!({ "name": bot.name, "harness": bot.harness })));
     app.send(json!({ "type": "botDeleted", "botId": id }));
     Ok(Json(json!({ "ok": true })))
 }
@@ -534,9 +665,10 @@ async fn mark_read(State(app): State<AppState>, Path(id): Path<String>) -> Res {
     Ok(Json(json!({ "ok": true })))
 }
 
-async fn stop_bot(State(app): State<AppState>, Path(id): Path<String>) -> Res {
+async fn stop_bot(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     need_bot(&app, &id)?;
     app.stop(&id);
+    app.db.record(&by.event("bot.stopped").target("bot", &id).bot(&id));
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -547,19 +679,28 @@ async fn list_messages(State(app): State<AppState>, Path(id): Path<String>) -> R
     Ok(Json(json!(app.db.messages(&id, 200))))
 }
 
-async fn send_message(State(app): State<AppState>, Path(id): Path<String>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
+async fn send_message(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
     need_bot(&app, &id)?;
     let text = v["text"].as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| bad("Text is required"))?;
     let text: String = text.chars().take(100_000).collect();
     // Answering a choice card: remember which option was picked.
+    let mut handoff = None;
     if let (Some(mid), Some(opt)) = (v["answer"]["messageId"].as_i64(), v["answer"]["option"].as_u64()) {
         if let Some(mut q) = app.db.message(mid).filter(|m| m.bot_id == id).and_then(|m| m.question) {
+            if q["handoff"] == json!(true) && q["picked"].is_null() {
+                handoff = Some((mid, q["options"][opt as usize].as_str().map(String::from)));
+            }
             q["picked"] = json!(opt);
             app.db.set_question(mid, &q);
         }
     }
+    let waiter = v["answer"]["messageId"].as_i64().and_then(|mid| app.take_handoff(mid));
+    if let Some((mid, option)) = handoff {
+        let details = json!({ "option": option, "botWasWaiting": waiter.is_some() });
+        app.db.record(&by.event("handoff.answered").target("handoff", &mid.to_string()).bot(&id).details(details));
+    }
     // Answering a handoff card the Bot is still waiting on: hand the answer to it directly.
-    if let Some(tx) = v["answer"]["messageId"].as_i64().and_then(|mid| app.take_handoff(mid)) {
+    if let Some(tx) = waiter {
         let msg = app.db.add_message(&id, "user", &text, None, false, Some("done"));
         app.push_message(&msg);
         let _ = tx.send(text);
@@ -573,7 +714,7 @@ async fn send_message(State(app): State<AppState>, Path(id): Path<String>, Json(
 
 // Bot to Bot: `botctl ask`. Waits for the reply and returns it as plain text.
 
-async fn ask(State(app): State<AppState>, Json(v): Json<Value>) -> Result<String, ApiError> {
+async fn ask(State(app): State<AppState>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Result<String, ApiError> {
     let from = v["from"].as_str().and_then(|id| app.db.bot(id)).ok_or_else(|| bad("Unknown asking Bot (BOT_ID)"))?;
     let to_key = v["to"].as_str().map(str::trim).unwrap_or("");
     let bots = app.db.bots();
@@ -586,6 +727,8 @@ async fn ask(State(app): State<AppState>, Json(v): Json<Value>) -> Result<String
         return Err(bad("You can't ask yourself"));
     }
     let text = v["text"].as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| bad("Message is required"))?;
+    let asked = Event { source: by.source.clone(), ..Event::new(Actor::bot(Some(&from.id), Some(&from.name)), "bot.asked") };
+    app.db.record(&asked.target("bot", &to.id).bot(&from.id).details(json!({ "to": to.name })));
     let wait = Duration::from_secs(9 * 60); // under the 10 minute max most harnesses allow a command
     Ok(match app.ask(&from, to, text, wait).await {
         Some(reply) => reply,
@@ -625,29 +768,61 @@ async fn list_routines(State(app): State<AppState>, Path(id): Path<String>) -> R
     Ok(Json(json!(app.db.routines(Some(&id)))))
 }
 
-async fn create_routine(State(app): State<AppState>, Path(id): Path<String>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
+async fn create_routine(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
     need_bot(&app, &id)?;
     let field = |k: &str| v[k].as_str().map(str::trim).filter(|s| !s.is_empty());
     let (Some(name), Some(cron_expr), Some(instruction)) = (field("name"), field("cron"), field("instruction")) else {
         return Err(bad("name, cron, and instruction are required"));
     };
     cron::parse(cron_expr).map_err(bad)?;
-    Ok((StatusCode::CREATED, Json(json!(app.db.add_routine(&id, name, cron_expr, instruction)))))
+    let r = app.db.add_routine(&id, name, cron_expr, instruction);
+    app.db.record(&by.event("routine.created").target("routine", &r.id).bot(&id).details(json!({ "name": r.name, "cron": r.cron })));
+    Ok((StatusCode::CREATED, Json(json!(r))))
 }
 
-async fn update_routine(State(app): State<AppState>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
-    app.db.routine(&id).ok_or_else(|| not_found("Routine"))?;
+/// Logs `routine.enabled`/`routine.disabled`, and `routine.updated` for other changes.
+/// The instruction is a message to the Bot, so only the fact that it changed is kept.
+fn routine_events(by: &Who, before: &db::Routine, after: &db::Routine) -> Vec<Event> {
+    let mut out = Vec::new();
+    let ev = |action: &str| by.event(action).target("routine", &after.id).bot(&after.bot_id);
+    if before.enabled != after.enabled {
+        let action = if after.enabled { "routine.enabled" } else { "routine.disabled" };
+        out.push(ev(action).details(json!({ "name": after.name })));
+    }
+    let mut changes = serde_json::Map::new();
+    if before.name != after.name {
+        changes.insert("name".into(), json!({ "from": before.name, "to": after.name }));
+    }
+    if before.cron != after.cron {
+        changes.insert("cron".into(), json!({ "from": before.cron, "to": after.cron }));
+    }
+    if before.instruction != after.instruction {
+        changes.insert("instruction".into(), json!("changed"));
+    }
+    if !changes.is_empty() {
+        out.push(ev("routine.updated").details(json!({ "name": after.name, "changes": changes })));
+    }
+    out
+}
+
+async fn update_routine(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
+    let before = app.db.routine(&id).ok_or_else(|| not_found("Routine"))?;
     let cron_expr = v["cron"].as_str();
     if let Some(c) = cron_expr {
         cron::parse(c).map_err(bad)?;
     }
     app.db.update_routine(&id, v["name"].as_str(), cron_expr, v["instruction"].as_str(), v["enabled"].as_bool());
-    Ok(Json(json!(app.db.routine(&id))))
+    let after = app.db.routine(&id).ok_or_else(|| not_found("Routine"))?;
+    for e in routine_events(&by, &before, &after) {
+        app.db.record(&e);
+    }
+    Ok(Json(json!(after)))
 }
 
-async fn delete_routine(State(app): State<AppState>, Path(id): Path<String>) -> Res {
-    app.db.routine(&id).ok_or_else(|| not_found("Routine"))?;
+async fn delete_routine(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
+    let r = app.db.routine(&id).ok_or_else(|| not_found("Routine"))?;
     app.db.delete_routine(&id);
+    app.db.record(&by.event("routine.deleted").target("routine", &id).bot(&r.bot_id).details(json!({ "name": r.name, "cron": r.cron })));
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -662,12 +837,12 @@ async fn get_policy(State(app): State<AppState>) -> Json<Value> {
     Json(json!({ "policy": app.db.global_policy(), "classes": classes_view(), "rules": app.db.rules(None) }))
 }
 
-async fn put_policy(State(app): State<AppState>, Extension(who): Extension<Principal>, Json(v): Json<Value>) -> Res {
+async fn put_policy(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res {
     need_user(who)?;
     let before = app.db.global_policy();
     let after = policy::parse_patch(&v).map_err(bad)?.apply(&before);
     app.db.set_global_policy(&after);
-    app.db.audit("user", "policy.updated", None, Some("global"), json!({ "before": before, "after": after }));
+    app.db.record(&by.event("policy.updated").target("policy", "global").details(json!({ "before": before, "after": after })));
     app.send(json!({ "type": "policy", "policy": after }));
     app.stop_unguarded_runs();
     for b in app.db.bots() {
@@ -685,25 +860,25 @@ async fn get_bot_policy(State(app): State<AppState>, Path(id): Path<String>) -> 
     Ok(Json(bot_policy_view(&app, &id)))
 }
 
-async fn put_bot_policy(State(app): State<AppState>, Extension(who): Extension<Principal>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
+async fn put_bot_policy(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
     need_user(who)?;
     need_bot(&app, &id)?;
     let before = app.db.bot_override(&id);
     let mut o = before.clone().unwrap_or_default();
     o.merge(policy::parse_patch(&v).map_err(bad)?);
     app.db.set_bot_override(&id, Some(&o));
-    app.db.audit("user", "policy.updated", Some(&id), Some(&id), json!({ "before": before, "after": o }));
+    app.db.record(&by.event("policy.updated").target("policy", &id).bot(&id).details(json!({ "before": before, "after": o })));
     app.stop_unguarded_runs();
     app.push_bot(&id);
     Ok(Json(bot_policy_view(&app, &id)))
 }
 
-async fn delete_bot_policy(State(app): State<AppState>, Extension(who): Extension<Principal>, Path(id): Path<String>) -> Res {
+async fn delete_bot_policy(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     need_user(who)?;
     need_bot(&app, &id)?;
     let before = app.db.bot_override(&id);
     app.db.set_bot_override(&id, None);
-    app.db.audit("user", "policy.reset", Some(&id), Some(&id), json!({ "before": before }));
+    app.db.record(&by.event("policy.reset").target("policy", &id).bot(&id).details(json!({ "before": before })));
     app.stop_unguarded_runs();
     app.push_bot(&id);
     Ok(Json(bot_policy_view(&app, &id)))
@@ -713,7 +888,7 @@ async fn list_rules(State(app): State<AppState>, Query(q): Query<HashMap<String,
     Json(json!(app.db.rules(q.get("bot").map(String::as_str))))
 }
 
-async fn add_rule(State(app): State<AppState>, Extension(who): Extension<Principal>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
+async fn add_rule(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
     need_user(who)?;
     let bot = v["botId"].as_str().filter(|b| !b.is_empty());
     if let Some(b) = bot {
@@ -727,15 +902,23 @@ async fn add_rule(State(app): State<AppState>, Extension(who): Extension<Princip
     let pattern = v["pattern"].as_str().map(str::trim).filter(|p| !p.is_empty()).ok_or_else(|| bad("pattern is required"))?;
     let tool = v["tool"].as_str().map(str::trim).filter(|t| !t.is_empty()).unwrap_or("*");
     let r = app.db.add_rule(bot, action, tool, pattern, v["note"].as_str());
-    app.db.audit("user", "rule.added", bot, Some(&r.id), json!({ "rule": r }));
+    let added = by.event("rule.added").target("rule", &r.id).details(json!({ "rule": r }));
+    app.db.record(&match bot {
+        Some(b) => added.bot(b),
+        None => added,
+    });
     Ok((StatusCode::CREATED, Json(json!(r))))
 }
 
-async fn delete_rule(State(app): State<AppState>, Extension(who): Extension<Principal>, Path(id): Path<String>) -> Res {
+async fn delete_rule(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     need_user(who)?;
     let r = app.db.rule(&id).ok_or_else(|| not_found("Rule"))?;
     app.db.delete_rule(&id);
-    app.db.audit("user", "rule.removed", r.bot_id.as_deref(), Some(&id), json!({ "rule": r }));
+    let removed = by.event("rule.removed").target("rule", &id).details(json!({ "rule": r }));
+    app.db.record(&match r.bot_id.as_deref() {
+        Some(b) => removed.bot(b),
+        None => removed,
+    });
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -748,16 +931,16 @@ async fn list_approvals(State(app): State<AppState>, Extension(who): Extension<P
     Ok(Json(json!(app.db.approvals(status, q.get("bot").map(String::as_str), limit))))
 }
 
-async fn approve(state: State<AppState>, who: Extension<Principal>, id: Path<String>, body: axum::body::Bytes) -> Res {
-    decide(state, who, id, body, true).await
+async fn approve(state: State<AppState>, who: Extension<Principal>, by: Extension<Who>, id: Path<String>, body: axum::body::Bytes) -> Res {
+    decide(state, who, by, id, body, true).await
 }
 
-async fn deny(state: State<AppState>, who: Extension<Principal>, id: Path<String>, body: axum::body::Bytes) -> Res {
-    decide(state, who, id, body, false).await
+async fn deny(state: State<AppState>, who: Extension<Principal>, by: Extension<Who>, id: Path<String>, body: axum::body::Bytes) -> Res {
+    decide(state, who, by, id, body, false).await
 }
 
 /// Body: `{remember?: "bot" | "global" | true, note?}`. Remember saves a rule for this exact call.
-async fn decide(State(app): State<AppState>, Extension(who): Extension<Principal>, Path(id): Path<String>, body: axum::body::Bytes, approve: bool) -> Res {
+async fn decide(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Path(id): Path<String>, body: axum::body::Bytes, approve: bool) -> Res {
     need_user(who)?;
     let v: Value = if body.iter().all(u8::is_ascii_whitespace) {
         Value::Null
@@ -772,7 +955,7 @@ async fn decide(State(app): State<AppState>, Extension(who): Extension<Principal
         _ => return Err(bad("remember must be \"bot\", \"global\", or true")),
     };
     let note: Option<String> = v["note"].as_str().map(|n| n.trim().chars().take(500).collect()).filter(|n: &String| !n.is_empty());
-    match app.decide(&id, approve, remember, note.as_deref()) {
+    match app.decide(&id, approve, remember, note.as_deref(), &by) {
         Ok(a) => Ok(Json(json!(a))),
         Err(DecideError::NotFound) => Err(not_found("Approval")),
         Err(DecideError::Closed(s)) => Err(ApiError(StatusCode::CONFLICT, format!("This approval is already {s}"))),
@@ -801,12 +984,43 @@ async fn check_approval(State(app): State<AppState>, Json(v): Json<Value>) -> Re
     reply(verdict.action == policy::Action::Allow, &verdict.reason)
 }
 
-/// The append-only audit log, newest first. `?before=<id>` pages back.
+/// The append-only audit log, newest first, filtered (see `audit::Filter`).
+/// `nextBefore` pages back: pass it as `?before=`.
 async fn list_audit(State(app): State<AppState>, Extension(who): Extension<Principal>, Query(q): Query<HashMap<String, String>>) -> Res {
     need_user(who)?;
     let limit = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(100).clamp(1, 1000);
-    let before = q.get("before").and_then(|b| b.parse().ok());
-    Ok(Json(json!(app.db.audit_events(limit, before))))
+    let f = audit::Filter::from_query(&q).map_err(bad)?;
+    let events = app.db.audit_events(&f, limit, false);
+    let next = (events.len() as i64 == limit).then(|| events.last().map(|e| e.id)).flatten();
+    Ok(Json(json!({ "events": events, "nextBefore": next })))
+}
+
+/// The filtered log as RFC 4180 CSV, oldest first, streamed in batches.
+async fn export_audit(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Query(q): Query<HashMap<String, String>>) -> Result<Response, ApiError> {
+    need_user(who)?;
+    let mut f = audit::Filter::from_query(&q).map_err(bad)?;
+    app.db.record(&by.event("audit.exported").target("audit", "csv").details(f.describe()));
+    // A snapshot: events written while the export streams are left out.
+    let newest = app.db.audit_events(&audit::Filter::default(), 1, false).first().map_or(0, |e| e.id);
+    f.before = Some(f.before.map_or(newest + 1, |b| b.min(newest + 1)));
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, Infallible>>(4);
+    tokio::task::spawn_blocking(move || {
+        const BATCH: i64 = 500;
+        if tx.blocking_send(Ok(audit::CSV_HEADER.into())).is_err() {
+            return;
+        }
+        loop {
+            let rows = app.db.audit_events(&f, BATCH, true);
+            let Some(last) = rows.last() else { break };
+            f.after = Some(last.id);
+            if tx.blocking_send(Ok(rows.iter().map(audit::csv_row).collect())).is_err() || (rows.len() as i64) < BATCH {
+                break;
+            }
+        }
+    });
+    let name = format!("attachment; filename=\"superbot-audit-{}.csv\"", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+    let headers = [(header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()), (header::CONTENT_DISPOSITION, name), (header::CACHE_CONTROL, "no-store".into())];
+    Ok((headers, axum::body::Body::from_stream(ReceiverStream::new(rx))).into_response())
 }
 
 #[cfg(test)]
@@ -824,6 +1038,9 @@ mod tests {
             allow_no_auth,
             bot_token: bot_token.clone(),
             hosts: allowed_hosts("127.0.0.1", port, extra_hosts),
+            trust_forwarded: false,
+            logins: audit::Logins::default(),
+            app: None,
         });
         let router = Router::new()
             .route("/api/state", get(|| async { "ok" }))
@@ -911,33 +1128,47 @@ mod tests {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let password = random_hex(16);
+        let app = runner::test_app();
         let auth = Arc::new(Auth {
             password: password.clone(),
             allow_no_auth: false,
             bot_token: random_hex(16),
             hosts: allowed_hosts("127.0.0.1", port, ""),
+            trust_forwarded: false,
+            logins: audit::Logins::default(),
+            app: Some(app.clone()),
         });
         let bot = format!("Bearer {}", auth.bot_token);
-        let app = runner::test_app();
         let r = router(app.clone(), auth);
         tokio::spawn(async move {
-            axum::serve(listener, r).await.unwrap();
+            axum::serve(listener, r.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
         });
         (port, app, basic(&password), bot)
     }
 
     async fn call(port: u16, method: &str, path: &str, authorization: &str, body: &str) -> (u16, String) {
+        let (code, _, body) = call_with(port, method, path, authorization, "", body).await;
+        (code, body)
+    }
+
+    /// `extra` is more header lines, each ending in \r\n. HTTP/1.0, so bodies are never chunked.
+    async fn call_with(port: u16, method: &str, path: &str, authorization: &str, extra: &str, body: &str) -> (u16, String, String) {
         let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let auth = if authorization.is_empty() { String::new() } else { format!("Authorization: {authorization}\r\n") };
         let req = format!(
-            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "{method} {path} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n{auth}{extra}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
         s.write_all(req.as_bytes()).await.unwrap();
         let mut res = String::new();
         s.read_to_string(&mut res).await.unwrap();
         let code = res.split_whitespace().nth(1).unwrap().parse().unwrap();
-        (code, res.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default())
+        let (head, body) = res.split_once("\r\n\r\n").unwrap_or((&res, ""));
+        (code, head.to_string(), body.to_string())
+    }
+
+    fn audit_list(body: &str) -> Vec<Value> {
+        serde_json::from_str::<Value>(body).unwrap()["events"].as_array().cloned().unwrap_or_default()
     }
 
     #[tokio::test]
@@ -951,6 +1182,8 @@ mod tests {
             ("POST", "/api/approvals/x/approve"),
             ("POST", "/api/approvals/check"),
             ("GET", "/api/audit"),
+            ("GET", "/api/audit/export.csv"),
+            ("GET", "/api/audit?action=bot.*"),
             ("GET", "/api/policy/rules"),
         ] {
             assert_eq!(call(port, m, p, "", "{}").await.0, 401, "{m} {p}");
@@ -970,6 +1203,7 @@ mod tests {
             ("POST", "/api/approvals/x/approve".to_string(), "{}"),
             ("POST", "/api/approvals/x/deny".to_string(), "{}"),
             ("GET", "/api/audit".to_string(), ""),
+            ("GET", "/api/audit/export.csv".to_string(), ""),
         ] {
             assert_eq!(call(port, m, &p, &bot_auth, b).await.0, 403, "{m} {p}");
         }
@@ -979,8 +1213,171 @@ mod tests {
         let (code, body) = call(port, "PUT", "/api/policy", &user, r#"{"timeoutMinutes":3}"#).await;
         assert_eq!((code, serde_json::from_str::<Value>(&body).unwrap()["policy"]["timeoutMinutes"].as_u64()), (200, Some(3)));
         assert_eq!(call(port, "PUT", "/api/policy", &user, r#"{"mode":"yolo"}"#).await.0, 400);
-        let (_, audit) = call(port, "GET", "/api/audit", &user, "").await;
-        assert_eq!(serde_json::from_str::<Value>(&audit).unwrap()[0]["action"], "policy.updated");
+        let (_, audit) = call(port, "GET", "/api/audit?action=policy.*", &user, "").await;
+        assert_eq!(audit_list(&audit)[0]["action"], "policy.updated");
+        // Each refused Bot call is on the record.
+        let (_, denied) = call(port, "GET", "/api/audit?action=access.denied&actor=bot", &user, "").await;
+        let denied = audit_list(&denied);
+        assert_eq!(denied.len(), 9);
+        assert_eq!((denied[0]["outcome"].as_str(), denied[0]["details"]["path"].as_str()), (Some("denied"), Some("/api/audit/export.csv")));
+    }
+
+    #[tokio::test]
+    async fn admin_actions_are_audited() {
+        let (port, app, user, bot_auth) = serve_app().await;
+        let browser = "User-Agent: TestBrowser/1.0\r\n";
+        let (code, _, body) = call_with(port, "POST", "/api/bots", &user, browser, r#"{"name":"Helper","harness":"claude"}"#).await;
+        assert_eq!(code, 201);
+        let id = serde_json::from_str::<Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
+        call_with(port, "PATCH", &format!("/api/bots/{id}"), &user, browser, r#"{"name":"Helper 2","hidden":true}"#).await;
+        call_with(port, "PATCH", &format!("/api/bots/{id}"), &user, browser, r#"{"name":"Helper 2"}"#).await; // no change, no event
+
+        // botctl names its Bot; routine calls are logged with that Bot as the actor.
+        let botctl = format!("User-Agent: botctl\r\nX-SuperBot-Bot: {id}\r\n");
+        let body = r#"{"name":"Standup","cron":"0 9 * * 1-5","instruction":"secret plan: email the team"}"#;
+        let (code, _, r) = call_with(port, "POST", &format!("/api/bots/{id}/routines"), &bot_auth, &botctl, body).await;
+        assert_eq!(code, 201);
+        let rid = serde_json::from_str::<Value>(&r).unwrap()["id"].as_str().unwrap().to_string();
+        call_with(port, "PATCH", &format!("/api/routines/{rid}"), &bot_auth, &botctl, r#"{"enabled":false,"cron":"0 10 * * *"}"#).await;
+        call_with(port, "PATCH", &format!("/api/routines/{rid}"), &user, browser, r#"{"enabled":true}"#).await;
+        call_with(port, "DELETE", &format!("/api/routines/{rid}"), &bot_auth, &botctl, "").await;
+        call_with(port, "POST", &format!("/api/bots/{id}/stop"), &user, browser, "").await;
+        call_with(port, "DELETE", &format!("/api/bots/{id}"), &user, browser, "").await;
+        let wrong = basic("hunter2-wrong");
+        assert_eq!(call_with(port, "GET", "/api/state", &wrong, browser, "").await.0, 401);
+        assert_eq!(call_with(port, "GET", "/api/state", &wrong, browser, "").await.0, 401);
+        assert_eq!(call_with(port, "GET", "/api/state", "Bearer nope", "", "").await.0, 401);
+
+        let (code, body) = call(port, "GET", "/api/audit?limit=1000", &user, "").await;
+        assert_eq!(code, 200);
+        let events = audit_list(&body);
+        let mut seen: Vec<(String, String, Option<String>, String)> = events
+            .iter()
+            .filter(|e| !["policy.initialized", "audit.exported"].contains(&e["action"].as_str().unwrap()))
+            .map(|e| {
+                let s = |k: &str| e[k].as_str().map(String::from);
+                (s("action").unwrap(), s("actorKind").unwrap(), s("actorId"), s("outcome").unwrap())
+            })
+            .collect();
+        seen.reverse();
+        let op = Some("operator".to_string());
+        let me = Some(id.clone());
+        assert_eq!(
+            seen,
+            [
+                ("auth.login".into(), "user".into(), op.clone(), "success".into()),
+                ("bot.created".into(), "user".into(), op.clone(), "success".into()),
+                ("bot.updated".into(), "user".into(), op.clone(), "success".into()),
+                ("routine.created".into(), "bot".into(), me.clone(), "success".into()),
+                ("routine.disabled".into(), "bot".into(), me.clone(), "success".into()),
+                ("routine.updated".into(), "bot".into(), me.clone(), "success".into()),
+                ("routine.enabled".into(), "user".into(), op.clone(), "success".into()),
+                ("routine.deleted".into(), "bot".into(), me.clone(), "success".into()),
+                ("bot.stopped".into(), "user".into(), op.clone(), "success".into()),
+                ("bot.deleted".into(), "user".into(), op.clone(), "success".into()),
+                ("auth.login_failed".into(), "user".into(), None, "failure".into()),
+                ("auth.login_failed".into(), "bot".into(), None, "failure".into()),
+                ("auth.login".into(), "user".into(), op.clone(), "success".into()),
+            ],
+            "the second wrong password from the same IP is throttled; the audit read is a new client (no user agent)"
+        );
+        let find = |a: &str| events.iter().find(|e| e["action"] == a).unwrap().clone();
+        let created = find("bot.created");
+        assert_eq!((created["ip"].as_str(), created["userAgent"].as_str()), (Some("127.0.0.1"), Some("TestBrowser/1.0")));
+        assert_eq!((created["targetType"].as_str(), created["targetId"].as_str()), (Some("bot"), Some(id.as_str())));
+        assert_eq!(find("bot.updated")["details"]["changes"]["name"], json!({ "from": "Helper", "to": "Helper 2" }));
+        let routine = find("routine.created");
+        assert_eq!((routine["actorName"].as_str(), routine["userAgent"].as_str()), (Some("Helper 2"), Some("botctl")));
+        assert_eq!(find("routine.updated")["details"]["changes"]["cron"]["to"], "0 10 * * *");
+        assert!(!body.contains("secret plan"), "routine instructions are messages, not audit data");
+        assert!(!body.contains("hunter2"), "passwords are never logged");
+        assert_eq!(find("bot.deleted")["details"]["name"], "Helper 2");
+        // The log outlives the Bot.
+        assert!(app.db.bot(&id).is_none());
+
+        let (_, page) = call(port, "GET", "/api/audit?limit=2", &user, "").await;
+        let page: Value = serde_json::from_str(&page).unwrap();
+        let next = page["nextBefore"].as_i64().unwrap();
+        let (_, older) = call(port, "GET", &format!("/api/audit?limit=2&before={next}"), &user, "").await;
+        assert!(audit_list(&older).iter().all(|e| e["id"].as_i64().unwrap() < next));
+        let (_, mine) = call(port, "GET", &format!("/api/audit?actor=bot:{id}&action=routine.*"), &user, "").await;
+        assert_eq!(audit_list(&mine).len(), 4);
+        assert_eq!(call(port, "GET", "/api/audit?from=last-week", &user, "").await.0, 400);
+        assert_eq!(call(port, "GET", "/api/audit/export.csv?actor=root", &user, "").await.0, 400);
+    }
+
+    #[tokio::test]
+    async fn approvals_and_handoffs_are_audited() {
+        let (port, app, user, bot_auth) = serve_app().await;
+        let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
+        let check = json!({ "from": bot.id, "harness": "claude", "event": { "tool_name": "Bash", "tool_input": { "command": "git push https://x:tok3n@example.com" }, "cwd": "/tmp" } }).to_string();
+        let hook = tokio::spawn({
+            let bot_auth = bot_auth.clone();
+            async move { call(port, "POST", "/api/approvals/check", &bot_auth, &check).await }
+        });
+        let pending = loop {
+            if let Some(a) = app.db.approvals(Some("pending"), None, 1).pop() {
+                break a;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let (code, _, _) = call_with(port, "POST", &format!("/api/approvals/{}/deny", pending.id), &user, "X-Forwarded-For: 198.51.100.7\r\n", "{}").await;
+        assert_eq!(code, 200);
+        hook.await.unwrap();
+
+        let handoff = tokio::spawn({
+            let (app, bot) = (app.clone(), bot.clone());
+            async move { app.handoff(&bot, "Log in to the bank", Duration::from_secs(30)).await }
+        });
+        let card = loop {
+            if let Some(m) = app.db.messages(&bot.id, 10).into_iter().find(|m| m.question.is_some()) {
+                break m;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let answer = json!({ "text": "Done", "answer": { "messageId": card.id, "option": 0 } }).to_string();
+        assert_eq!(call(port, "POST", &format!("/api/bots/{}/messages", bot.id), &user, &answer).await.0, 202);
+        assert_eq!(handoff.await.unwrap().as_deref(), Some("Done"));
+
+        let (_, body) = call(port, "GET", "/api/audit?action=approval.*,handoff.*", &user, "").await;
+        let ev = audit_list(&body);
+        let actions: Vec<&str> = ev.iter().map(|e| e["action"].as_str().unwrap()).collect();
+        assert_eq!(actions, ["handoff.answered", "handoff.requested", "approval.denied", "approval.requested"]);
+        // Behind a proxy on loopback, the client IP is the forwarded one.
+        assert_eq!((ev[2]["actorId"].as_str(), ev[2]["ip"].as_str()), (Some("operator"), Some("198.51.100.7")));
+        assert_eq!(ev[0]["details"], json!({ "option": "Done", "botWasWaiting": true }));
+        assert!(!body.contains("tok3n") && !body.contains("bank"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn csv_export_is_rfc4180_and_formula_safe() {
+        let (port, app, user, _) = serve_app().await;
+        let evil = r#"{"name":"=HYPERLINK(\"http://evil.example\",\"x\"), ok"}"#;
+        let (code, created) = call(port, "POST", "/api/bots", &user, evil).await;
+        assert_eq!(code, 201, "{created}");
+        let (code, head, body) = call_with(port, "GET", "/api/audit/export.csv?action=bot.created", &user, "", "").await;
+        assert_eq!(code, 200);
+        let head = head.to_ascii_lowercase();
+        assert!(head.contains("content-type: text/csv; charset=utf-8"), "{head}");
+        assert!(head.contains("content-disposition: attachment; filename=\"superbot-audit-"), "{head}");
+        let lines: Vec<&str> = body.split("\r\n").collect();
+        assert_eq!(format!("{}\r\n", lines[0]), audit::CSV_HEADER);
+        assert_eq!(lines.len(), 3, "header, one row, and the final CRLF: {body:?}");
+        assert!(lines[1].contains(r#""{""harness"":""claude"",""model"":null,""name"":""=HYPERLINK"#), "{}", lines[1]);
+        assert!(lines[1].split(',').nth(6) == Some("bot.created"));
+        // The export itself is audited, and a cell that starts a formula is defused.
+        let exported = &app.db.audit_events(&audit::Filter { actions: vec!["audit.exported".into()], ..Default::default() }, 10, false)[0];
+        assert_eq!(exported.details["actions"], json!(["bot.created"]));
+        let row = audit::csv_row(&db::AuditEvent { actor_name: Some("=1+2".into()), ..exported.clone() });
+        assert!(row.contains(",'=1+2,"), "{row}");
+        // Many rows stream in batches, oldest first.
+        for i in 0..1200 {
+            app.db.record(&Event::new(Actor::system("test"), "test.bulk").details(json!({ "i": i })));
+        }
+        let (_, _, body) = call_with(port, "GET", "/api/audit/export.csv?action=test.bulk", &user, "", "").await;
+        let rows: Vec<&str> = body.trim_end().split("\r\n").skip(1).collect();
+        assert_eq!(rows.len(), 1200);
+        assert!(rows[0].ends_with(r#""{""i"":0}""#) && rows[1199].ends_with(r#""{""i"":1199}""#));
     }
 
     #[tokio::test]

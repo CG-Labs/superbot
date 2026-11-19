@@ -3,6 +3,7 @@
 //! and is denied. Every outcome is written to the audit log and pushed over SSE.
 
 use crate::adapters::short;
+use crate::audit::{Actor, Event, Outcome, Who};
 use crate::db::{now, Approval, Bot, NewRule};
 use crate::policy::{self, glob_escape, Action, Call, Ctx, Verdict, TRUNCATED};
 use crate::runner::App;
@@ -37,7 +38,7 @@ struct OnDrop {
 
 impl Drop for OnDrop {
     fn drop(&mut self) {
-        self.app.settle(&self.id, "cancelled", "system", Some("The Bot stopped waiting"), None);
+        self.app.settle(&self.id, "cancelled", &Who::system("approvals"), Some("The Bot stopped waiting"), None);
     }
 }
 
@@ -56,15 +57,22 @@ impl App {
         let v = policy::decide(&p, &self.db.rules(Some(&bot.id)), &call, &self.policy_ctx());
         let shown = call.shown();
         let detail = || json!({ "tool": call.tool, "subject": shown, "class": v.class, "reason": v.reason, "rule": v.rule, "harness": harness });
+        let verdict = |action: &str, outcome: Outcome| {
+            let e = Event::new(Actor::system("policy"), action).bot(&bot.id).outcome(outcome).details(detail());
+            match v.rule.as_deref() {
+                Some(r) => e.target("rule", r),
+                None => e,
+            }
+        };
         match v.action {
             Action::Allow => {
                 if v.rule.is_some() {
-                    self.db.audit("system", "policy.allowed", Some(&bot.id), v.rule.as_deref(), detail());
+                    self.db.record(&verdict("policy.allowed", Outcome::Success));
                 }
                 v
             }
             Action::Deny => {
-                self.db.audit("system", "policy.denied", Some(&bot.id), v.rule.as_deref(), detail());
+                self.db.record(&verdict("policy.denied", Outcome::Denied));
                 Verdict { reason: format!("SuperBot policy blocks this: {}. Don't try another way; tell the user what you wanted to do.", v.reason), ..v }
             }
             Action::Ask => {
@@ -74,7 +82,8 @@ impl App {
                 }
                 let class = v.class.unwrap_or("");
                 let a = self.db.add_approval(&bot.id, harness, &call.tool, call.kind.name(), &shown, &call.input, class, &v.reason, now() + wait.as_millis() as i64);
-                self.db.audit("bot", "approval.requested", Some(&bot.id), Some(&a.id), detail());
+                let requested = Event::new(Actor::bot(Some(&bot.id), Some(&bot.name)), "approval.requested").target("approval", &a.id).bot(&bot.id);
+                self.db.record(&requested.details(detail()));
                 let (tx, rx) = oneshot::channel();
                 self.approval_waiters.lock().unwrap().insert(a.id.clone(), tx);
                 self.push_approval(&a);
@@ -83,7 +92,7 @@ impl App {
                 let answer = tokio::time::timeout(wait, rx).await;
                 if answer.is_err() {
                     let mins = wait.as_secs().div_ceil(60);
-                    self.settle(&a.id, "expired", "system", Some(&format!("No answer in {mins} minute{}", if mins == 1 { "" } else { "s" })), None);
+                    self.settle(&a.id, "expired", &Who::system("approvals"), Some(&format!("No answer in {mins} minute{}", if mins == 1 { "" } else { "s" })), None);
                 }
                 drop(guard);
                 self.set_run_status(&bot.id, "Working");
@@ -101,7 +110,7 @@ impl App {
     }
 
     /// The user's answer. `remember` saves an allow (or deny) rule for this exact call.
-    pub fn decide(&self, id: &str, approve: bool, remember: Option<Remember>, note: Option<&str>) -> Result<Approval, DecideError> {
+    pub fn decide(&self, id: &str, approve: bool, remember: Option<Remember>, note: Option<&str>, by: &Who) -> Result<Approval, DecideError> {
         let a = self.db.approval(id).ok_or(DecideError::NotFound)?;
         if a.status != "pending" {
             return Err(DecideError::Closed(a.status));
@@ -109,7 +118,7 @@ impl App {
         let status = if approve { "approved" } else { "denied" };
         let closed = || DecideError::Closed(self.db.approval(id).map(|a| a.status).unwrap_or_default());
         let Some(scope) = remember else {
-            return self.settle(id, status, "user", note, None).ok_or_else(closed);
+            return self.settle(id, status, by, note, None).ok_or_else(closed);
         };
         if a.subject.ends_with(TRUNCATED) {
             return Err(DecideError::TooLong);
@@ -118,25 +127,30 @@ impl App {
         let rule_note = format!("Remembered from approval {}", a.id);
         let pattern = glob_escape(&a.subject);
         let new = NewRule { bot_id: bot, action: if approve { Action::Allow } else { Action::Deny }, tool: &a.tool, pattern: &pattern, note: &rule_note };
-        let r = self.db.finish_approval_with_rule(id, status, "user", note, &new).ok_or_else(closed)?;
-        self.db.audit("user", "rule.added", bot, Some(&r.id), json!({ "rule": r, "from": a.id }));
-        self.after_settle(id, status, "user", note, Some(&r.id)).ok_or_else(closed)
+        let r = self.db.finish_approval_with_rule(id, status, by.actor.kind.as_str(), note, &new).ok_or_else(closed)?;
+        let added = by.event("rule.added").target("rule", &r.id).details(json!({ "rule": r, "from": a.id }));
+        self.db.record(&match bot {
+            Some(b) => added.bot(b),
+            None => added,
+        });
+        self.after_settle(id, status, by, note, Some(&r.id)).ok_or_else(closed)
     }
 
     /// Closes a pending approval once, wakes its waiting hook, logs it, and tells the clients.
-    pub fn settle(&self, id: &str, status: &str, by: &str, note: Option<&str>, rule_id: Option<&str>) -> Option<Approval> {
-        if !self.db.finish_approval(id, status, by, note, rule_id) {
+    pub fn settle(&self, id: &str, status: &str, by: &Who, note: Option<&str>, rule_id: Option<&str>) -> Option<Approval> {
+        if !self.db.finish_approval(id, status, by.actor.kind.as_str(), note, rule_id) {
             return None;
         }
         self.after_settle(id, status, by, note, rule_id)
     }
 
-    fn after_settle(&self, id: &str, status: &str, by: &str, note: Option<&str>, rule_id: Option<&str>) -> Option<Approval> {
+    fn after_settle(&self, id: &str, status: &str, by: &Who, note: Option<&str>, rule_id: Option<&str>) -> Option<Approval> {
         if let Some(tx) = self.approval_waiters.lock().unwrap().remove(id) {
             let _ = tx.send(status == "approved");
         }
         let a = self.db.approval(id)?;
-        self.db.audit(by, &format!("approval.{status}"), Some(&a.bot_id), Some(id), json!({ "subject": a.subject, "class": a.class, "note": note, "rule": rule_id }));
+        let details = json!({ "subject": a.subject, "class": a.class, "tool": a.tool, "note": note, "rule": rule_id });
+        self.db.record(&by.event(&format!("approval.{status}")).target("approval", id).bot(&a.bot_id).details(details));
         self.push_approval(&a);
         Some(a)
     }
@@ -144,14 +158,14 @@ impl App {
     /// Cancels a Bot's pending approvals, e.g. when it is stopped or its run ends.
     pub fn cancel_approvals(&self, bot_id: &str, why: &str) {
         for a in self.db.approvals(Some("pending"), Some(bot_id), 1000) {
-            self.settle(&a.id, "cancelled", "system", Some(why), None);
+            self.settle(&a.id, "cancelled", &Who::system("approvals"), Some(why), None);
         }
     }
 
     /// After a restart nobody is waiting on old approvals: close them.
     pub fn expire_stale_approvals(&self) {
         for a in self.db.approvals(Some("pending"), None, 10_000) {
-            self.settle(&a.id, "expired", "system", Some("Server restarted"), None);
+            self.settle(&a.id, "expired", &Who::system("approvals"), Some("Server restarted"), None);
         }
     }
 
@@ -167,6 +181,14 @@ mod tests {
 
     fn app() -> Arc<App> {
         crate::runner::test_app()
+    }
+
+    fn user() -> Who {
+        Who { actor: Actor::operator(), source: crate::audit::Source { ip: Some("192.0.2.9".into()), user_agent: None } }
+    }
+
+    fn audit_log(app: &App) -> Vec<crate::db::AuditEvent> {
+        app.db.audit_events(&crate::audit::Filter::default(), 100, false)
     }
 
     async fn pending(app: &App) -> Approval {
@@ -206,13 +228,17 @@ mod tests {
         let ev: Value = serde_json::from_str(&events.recv().await.unwrap()).unwrap();
         assert_eq!((ev["type"].as_str(), ev["approval"]["status"].as_str()), (Some("approval"), Some("pending")));
 
-        let done = app.decide(&a.id, true, None, None).unwrap();
+        let done = app.decide(&a.id, true, None, None, &user()).unwrap();
         assert_eq!(done.status, "approved");
         assert_eq!(task.await.unwrap().action, Action::Allow);
-        assert!(matches!(app.decide(&a.id, false, None, None), Err(DecideError::Closed(s)) if s == "approved"));
-        assert!(matches!(app.decide("nope", false, None, None), Err(DecideError::NotFound)));
-        let actions: Vec<String> = app.db.audit_events(10, None).into_iter().map(|e| e.action).collect();
-        assert_eq!(actions[..2], ["approval.approved", "approval.requested"]);
+        assert!(matches!(app.decide(&a.id, false, None, None, &user()), Err(DecideError::Closed(s)) if s == "approved"));
+        assert!(matches!(app.decide("nope", false, None, None, &user()), Err(DecideError::NotFound)));
+        let ev = audit_log(&app);
+        let (approved, requested) = (&ev[0], &ev[1]);
+        assert_eq!((approved.action.as_str(), approved.actor_kind.as_str(), approved.actor_id.as_deref()), ("approval.approved", "user", Some("operator")));
+        assert_eq!((approved.target_id.as_deref(), approved.ip.as_deref()), (Some(a.id.as_str()), Some("192.0.2.9")));
+        assert_eq!(approved.details["subject"], "git push origin main");
+        assert_eq!((requested.action.as_str(), requested.actor_kind.as_str(), requested.actor_id.as_deref()), ("approval.requested", "bot", Some(bot.id.as_str())));
     }
 
     #[tokio::test]
@@ -225,7 +251,7 @@ mod tests {
         };
         let task = ask("npm install left-pad");
         let a = pending(&app).await;
-        app.decide(&a.id, false, Some(Remember::Bot), Some("not today")).unwrap();
+        app.decide(&a.id, false, Some(Remember::Bot), Some("not today"), &user()).unwrap();
         let v = task.await.unwrap();
         assert_eq!(v.action, Action::Deny);
         assert!(v.reason.contains("not today"));
@@ -236,7 +262,7 @@ mod tests {
         // A remembered allow, scoped to every Bot, skips the ask for the same call.
         let task = ask("git push");
         let a = pending(&app).await;
-        app.decide(&a.id, true, Some(Remember::Global), None).unwrap();
+        app.decide(&a.id, true, Some(Remember::Global), None, &user()).unwrap();
         assert_eq!(task.await.unwrap().action, Action::Allow);
         let other = app.db.create_bot("B", "#fff", "waddle", "codex", None, false);
         assert_eq!(app.check(&other, "codex", "Bash", push("git push"), None).await.action, Action::Allow);
@@ -247,7 +273,7 @@ mod tests {
         });
         let a = pending(&app).await;
         assert_eq!(a.subject, "git push --force");
-        app.decide(&a.id, false, None, None).unwrap();
+        app.decide(&a.id, false, None, None, &user()).unwrap();
         assert_eq!(task.await.unwrap().action, Action::Deny);
     }
 
@@ -263,7 +289,8 @@ mod tests {
         assert!(v.reason.contains("in time"), "{}", v.reason);
         let a = app.db.approvals(None, None, 1).pop().unwrap();
         assert_eq!((a.status.as_str(), a.decided_by.as_deref()), ("expired", Some("system")));
-        assert_eq!(app.db.audit_events(1, None)[0].action, "approval.expired");
+        let expired = &audit_log(&app)[0];
+        assert_eq!((expired.action.as_str(), expired.actor_kind.as_str(), expired.actor_id.as_deref()), ("approval.expired", "system", Some("approvals")));
     }
 
     #[tokio::test]
@@ -320,7 +347,7 @@ mod tests {
         app.db.add_rule(None, Action::Deny, "*", "*example.invalid*", None);
         assert_eq!(app.check(&bot, "claude", "WebFetch", json!({ "url": "https://example.invalid" }), None).await.action, Action::Deny);
         assert!(app.db.approvals(None, None, 10).is_empty());
-        assert_eq!(app.db.audit_events(1, None)[0].action, "policy.denied");
+        assert_eq!(audit_log(&app)[0].action, "policy.denied");
     }
 
     #[tokio::test]
@@ -331,12 +358,12 @@ mod tests {
         // A timeout closes it between the user's read and their decision.
         assert!(app.db.finish_approval(&a.id, "expired", "system", None, None));
         assert!(app.db.finish_approval_with_rule(&a.id, "approved", "user", None, &NewRule { bot_id: Some(&bot.id), action: Action::Allow, tool: "Bash", pattern: "git push", note: "x" }).is_none());
-        assert!(matches!(app.decide(&a.id, true, Some(Remember::Bot), None), Err(DecideError::Closed(s)) if s == "expired"));
+        assert!(matches!(app.decide(&a.id, true, Some(Remember::Bot), None, &user()), Err(DecideError::Closed(s)) if s == "expired"));
         assert!(app.db.rules(Some(&bot.id)).is_empty());
 
         let cut = format!("git push{TRUNCATED}");
         let long = app.db.add_approval(&bot.id, "claude", "Bash", "shell", &cut, &json!({}), "git_push", "Pushes", now() + 60_000);
-        assert!(matches!(app.decide(&long.id, true, Some(Remember::Bot), None), Err(DecideError::TooLong)));
+        assert!(matches!(app.decide(&long.id, true, Some(Remember::Bot), None, &user()), Err(DecideError::TooLong)));
         assert_eq!(app.db.approval(&long.id).unwrap().status, "pending");
         assert!(app.db.rules(Some(&bot.id)).is_empty());
     }

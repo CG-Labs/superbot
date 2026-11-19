@@ -1,6 +1,7 @@
 //! SQLite storage: Bots, messages, routines, harness policy, approvals, and the
-//! audit log. One connection behind a mutex; every call is short.
+//! append-only audit log. One connection behind a mutex; every call is short.
 
+use crate::audit;
 use crate::policy::{Action, Mode, Override, Policy, Rule};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
@@ -156,17 +157,30 @@ pub struct Approval {
     pub rule_id: Option<String>,
 }
 
-#[derive(Clone, Serialize)]
+/// One row of the audit log. See `audit.rs` and ADR 0008.
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditEvent {
     pub id: i64,
+    /// Unix ms, UTC.
     pub at: i64,
+    /// `at` as RFC 3339 UTC, e.g. `2026-11-19T13:46:00.123Z`.
+    pub time: String,
     /// "user", "bot", or "system"
-    pub actor: String,
+    pub actor_kind: String,
+    pub actor_id: Option<String>,
+    pub actor_name: Option<String>,
+    /// The IdP subject, once people sign in with SSO.
+    pub actor_subject: Option<String>,
     pub action: String,
+    pub target_type: Option<String>,
+    pub target_id: Option<String>,
     pub bot_id: Option<String>,
-    pub target: Option<String>,
-    pub detail: Value,
+    /// "success", "failure", or "denied"
+    pub outcome: String,
+    pub ip: Option<String>,
+    pub user_agent: Option<String>,
+    pub details: Value,
 }
 
 fn approval_row(r: &Row) -> rusqlite::Result<Approval> {
@@ -205,21 +219,87 @@ fn rule_row(r: &Row) -> rusqlite::Result<Rule> {
 }
 
 fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
-    let detail: String = r.get("detail")?;
+    let details: String = r.get("details")?;
+    let at: i64 = r.get("at")?;
     Ok(AuditEvent {
         id: r.get("id")?,
-        at: r.get("at")?,
-        actor: r.get("actor")?,
+        at,
+        time: chrono::DateTime::from_timestamp_millis(at)
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+            .unwrap_or_default(),
+        actor_kind: r.get("actor_kind")?,
+        actor_id: r.get("actor_id")?,
+        actor_name: r.get("actor_name")?,
+        actor_subject: r.get("actor_subject")?,
         action: r.get("action")?,
+        target_type: r.get("target_type")?,
+        target_id: r.get("target_id")?,
         bot_id: r.get("bot_id")?,
-        target: r.get("target")?,
-        detail: serde_json::from_str(&detail).unwrap_or(Value::Null),
+        outcome: r.get("outcome")?,
+        ip: r.get("ip")?,
+        user_agent: r.get("user_agent")?,
+        details: serde_json::from_str(&details).unwrap_or(Value::Null),
     })
 }
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 1] = [migrate_approvals];
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 2] = [migrate_approvals, migrate_audit_events];
+
+/// Structured audit events (ADR 0008): actor kind and id, target type and id,
+/// outcome, and request source. Copies the rows from the first audit table.
+/// DELETE is refused except for rows older than `audit_retention_days`.
+fn migrate_audit_events(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "DROP TRIGGER audit_events_no_update;
+        DROP TRIGGER audit_events_no_delete;
+        ALTER TABLE audit_events RENAME TO audit_events_v1;
+        CREATE TABLE audit_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          at INTEGER NOT NULL,
+          actor_kind TEXT NOT NULL CHECK (actor_kind IN ('user', 'bot', 'system')),
+          actor_id TEXT,
+          actor_name TEXT,
+          actor_subject TEXT,
+          action TEXT NOT NULL,
+          target_type TEXT,
+          target_id TEXT,
+          bot_id TEXT,
+          outcome TEXT NOT NULL CHECK (outcome IN ('success', 'failure', 'denied')),
+          ip TEXT,
+          user_agent TEXT,
+          details TEXT NOT NULL DEFAULT '{}'
+        );
+        INSERT INTO audit_events (id, at, actor_kind, actor_id, action, target_type, target_id, bot_id, outcome, details)
+        SELECT id, at,
+          CASE actor WHEN 'user' THEN 'user' WHEN 'bot' THEN 'bot' ELSE 'system' END,
+          CASE actor WHEN 'user' THEN 'operator' WHEN 'bot' THEN bot_id ELSE NULL END,
+          action,
+          CASE
+            WHEN target IS NULL THEN NULL
+            WHEN action LIKE 'approval.%' THEN 'approval'
+            WHEN action LIKE 'rule.%' OR action IN ('policy.allowed', 'policy.denied') THEN 'rule'
+            ELSE 'policy'
+          END,
+          target, bot_id,
+          CASE WHEN action = 'policy.denied' THEN 'denied' ELSE 'success' END,
+          detail
+        FROM audit_events_v1 ORDER BY id;
+        DROP TABLE audit_events_v1;
+        CREATE INDEX audit_events_at ON audit_events(at);
+        CREATE INDEX audit_events_action ON audit_events(action, id);
+        CREATE INDEX audit_events_actor ON audit_events(actor_kind, actor_id, id);
+        CREATE TRIGGER audit_events_no_update BEFORE UPDATE ON audit_events
+          BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;
+        CREATE TRIGGER audit_events_no_delete BEFORE DELETE ON audit_events
+          WHEN NOT EXISTS (
+            SELECT 1 FROM settings
+            WHERE key = 'audit_retention_days' AND CAST(value AS INTEGER) > 0
+              AND OLD.at < (CAST(strftime('%s', 'now') AS INTEGER) - CAST(value AS INTEGER) * 86400) * 1000
+          )
+          BEGIN SELECT RAISE(ABORT, 'audit_events is append-only'); END;",
+    )
+}
 
 /// Approvals and harness policy. Fresh installs ask before risky tools; existing
 /// installs keep running in bypass, as before, until the operator opts in.
@@ -632,20 +712,109 @@ impl Db {
         self.rule(&rule_id)
     }
 
-    // Audit: append-only (triggers refuse UPDATE and DELETE).
+    // Audit: append-only. There is no update or delete here; triggers refuse both,
+    // except retention pruning of rows older than `audit_retention_days`.
 
-    pub fn audit(&self, actor: &str, action: &str, bot_id: Option<&str>, target: Option<&str>, detail: Value) {
-        let _ = self.c().execute(
-            "INSERT INTO audit_events (at, actor, action, bot_id, target, detail) VALUES (?, ?, ?, ?, ?, ?)",
-            params![now(), actor, action, bot_id, target, detail.to_string()],
+    /// Writes one event. `details` is scrubbed of secrets; free text is clipped.
+    pub fn record(&self, e: &audit::Event) {
+        let o = |v: &Option<String>, max: usize| v.as_deref().map(|s| audit::clip(s, max));
+        let res = self.c().execute(
+            "INSERT INTO audit_events (at, actor_kind, actor_id, actor_name, actor_subject, action, target_type, target_id, bot_id, outcome, ip, user_agent, details)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                now(),
+                e.actor.kind.as_str(),
+                o(&e.actor.id, 128),
+                o(&e.actor.name, 128),
+                o(&e.actor.subject, 256),
+                audit::clip(&e.action, 64),
+                o(&e.target_type, 32),
+                o(&e.target_id, 128),
+                o(&e.bot_id, 128),
+                e.outcome.as_str(),
+                o(&e.source.ip, 64),
+                o(&e.source.user_agent, 256),
+                audit::scrub(e.details.clone()).to_string(),
+            ],
         );
+        if let Err(err) = res {
+            eprintln!("audit: could not record {}: {err}", e.action);
+        }
     }
 
-    /// Newest first, older than `before` (an event id) when given.
-    pub fn audit_events(&self, limit: i64, before: Option<i64>) -> Vec<AuditEvent> {
+    /// Newest first (or oldest first with `oldest_first`), filtered, at most `limit`.
+    pub fn audit_events(&self, f: &audit::Filter, limit: i64, oldest_first: bool) -> Vec<AuditEvent> {
+        use rusqlite::types::Value as V;
+        let mut sql = String::from("SELECT * FROM audit_events WHERE 1 = 1");
+        let mut args: Vec<V> = Vec::new();
+        let mut and = |clause: &str, v: Vec<V>| {
+            sql.push_str(" AND ");
+            sql.push_str(clause);
+            args.extend(v);
+        };
+        if let Some(t) = f.from {
+            and("at >= ?", vec![V::Integer(t)]);
+        }
+        if let Some(t) = f.to {
+            and("at < ?", vec![V::Integer(t)]);
+        }
+        if !f.actions.is_empty() {
+            let mut parts = Vec::new();
+            let mut vals = Vec::new();
+            for a in &f.actions {
+                match a.strip_suffix('*') {
+                    Some(prefix) => {
+                        parts.push("substr(action, 1, ?) = ?");
+                        vals.extend([V::Integer(prefix.len() as i64), V::Text(prefix.into())]);
+                    }
+                    None => {
+                        parts.push("action = ?");
+                        vals.push(V::Text(a.clone()));
+                    }
+                }
+            }
+            and(&format!("({})", parts.join(" OR ")), vals);
+        }
+        for (col, v) in [("actor_kind", &f.actor_kind), ("actor_id", &f.actor_id), ("outcome", &f.outcome), ("bot_id", &f.bot_id)] {
+            if let Some(v) = v {
+                and(&format!("{col} = ?"), vec![V::Text(v.clone())]);
+            }
+        }
+        if let Some(id) = f.before {
+            and("id < ?", vec![V::Integer(id)]);
+        }
+        if let Some(id) = f.after {
+            and("id > ?", vec![V::Integer(id)]);
+        }
+        sql.push_str(if oldest_first { " ORDER BY id ASC LIMIT ?" } else { " ORDER BY id DESC LIMIT ?" });
+        args.push(V::Integer(limit));
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM audit_events WHERE ?1 IS NULL OR id < ?1 ORDER BY id DESC LIMIT ?2").unwrap();
-        s.query_map(params![before, limit], audit_row).unwrap().filter_map(Result::ok).collect()
+        let mut s = c.prepare(&sql).unwrap();
+        s.query_map(rusqlite::params_from_iter(args), audit_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Days of audit history to keep. None = forever.
+    pub fn audit_retention(&self) -> Option<u32> {
+        let v: Option<String> = self.c().query_row("SELECT value FROM settings WHERE key = 'audit_retention_days'", [], |r| r.get(0)).optional().ok().flatten();
+        v.and_then(|s| s.parse().ok()).filter(|d| *d > 0)
+    }
+
+    pub fn set_audit_retention(&self, days: Option<u32>) {
+        let c = self.c();
+        match days {
+            Some(d) => c.execute(
+                "INSERT INTO settings (key, value) VALUES ('audit_retention_days', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1",
+                [d.to_string()],
+            ),
+            None => c.execute("DELETE FROM settings WHERE key = 'audit_retention_days'", []),
+        }
+        .unwrap();
+    }
+
+    /// Deletes events older than `cutoff` (unix ms). The trigger refuses any row
+    /// still inside the saved retention window.
+    pub fn prune_audit(&self, cutoff: i64) -> rusqlite::Result<usize> {
+        self.c().execute("DELETE FROM audit_events WHERE at < ?", [cutoff])
     }
 }
 
@@ -660,13 +829,19 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn all_events(db: &Db) -> Vec<AuditEvent> {
+        db.audit_events(&audit::Filter::default(), 1000, false)
+    }
+
     #[test]
     fn fresh_install_asks() {
         let db = Db::open(&temp_path("fresh").join("app.sqlite")).unwrap();
         assert_eq!(db.global_policy().mode, Mode::Ask);
         let v: i64 = db.c().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, MIGRATIONS.len() as i64);
-        assert_eq!(db.audit_events(10, None)[0].action, "policy.initialized");
+        let e = &all_events(&db)[0];
+        assert_eq!((e.action.as_str(), e.actor_kind.as_str(), e.target_type.as_deref(), e.outcome.as_str()), ("policy.initialized", "system", Some("policy"), "success"));
+        assert!(e.time.ends_with('Z'), "{}", e.time);
     }
 
     #[test]
@@ -688,18 +863,119 @@ mod tests {
         // Reopening doesn't re-run the migration.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.audit_events(10, None).len(), 1);
+        assert_eq!(all_events(&db).len(), 1);
     }
 
     #[test]
     fn audit_is_append_only() {
         let db = Db::open(&temp_path("audit").join("app.sqlite")).unwrap();
-        db.audit("user", "policy.updated", None, Some("global"), json!({ "mode": "ask" }));
-        assert!(db.c().execute("UPDATE audit_events SET actor = 'x'", []).is_err());
+        db.record(&audit::Event::new(audit::Actor::operator(), "policy.updated").target("policy", "global").details(json!({ "mode": "ask" })));
+        assert!(db.c().execute("UPDATE audit_events SET actor_id = 'x'", []).is_err());
+        assert!(db.c().execute("UPDATE audit_events SET details = '{}' WHERE action = 'policy.updated'", []).is_err());
         assert!(db.c().execute("DELETE FROM audit_events", []).is_err());
-        assert_eq!(db.audit_events(10, None).len(), 2);
-        let first = db.audit_events(10, None)[1].id;
-        assert_eq!(db.audit_events(10, Some(first + 1)).len(), 1);
+        assert!(db.c().execute("DELETE FROM audit_events WHERE action = 'policy.updated'", []).is_err());
+        // No retention set: even pruning old rows is refused.
+        assert!(db.prune_audit(now() + 60_000).is_err());
+        assert_eq!(all_events(&db).len(), 2);
+        let e = &all_events(&db)[0];
+        assert_eq!((e.actor_kind.as_str(), e.actor_id.as_deref(), e.target_id.as_deref()), ("user", Some("operator"), Some("global")));
+    }
+
+    #[test]
+    fn retention_deletes_only_rows_past_the_window() {
+        let db = Db::open(&temp_path("retention").join("app.sqlite")).unwrap();
+        let day = 86_400_000;
+        db.c()
+            .execute("INSERT INTO audit_events (at, actor_kind, action, outcome) VALUES (?, 'system', 'old.event', 'success')", [now() - 40 * day])
+            .unwrap();
+        assert!(db.prune_audit(now() - 30 * day).is_err(), "no retention saved yet");
+        db.set_audit_retention(Some(30));
+        assert_eq!(db.audit_retention(), Some(30));
+        // A cutoff inside the window would delete young rows, so the whole statement fails.
+        assert!(db.prune_audit(now()).is_err());
+        assert!(db.c().execute("DELETE FROM audit_events", []).is_err());
+        assert_eq!(db.prune_audit(now() - 30 * day).unwrap(), 1);
+        assert_eq!(all_events(&db).len(), 1);
+        db.set_audit_retention(None);
+        assert_eq!(db.audit_retention(), None);
+    }
+
+    #[test]
+    fn secrets_never_reach_the_audit_table() {
+        let db = Db::open(&temp_path("scrub").join("app.sqlite")).unwrap();
+        let e = audit::Event::new(audit::Actor::operator(), "x.y").details(json!({ "token": "abc", "cmd": "curl -u admin:hunter2 https://x" }));
+        db.record(&e);
+        let raw: String = db.c().query_row("SELECT details FROM audit_events WHERE action = 'x.y'", [], |r| r.get(0)).unwrap();
+        assert!(!raw.contains("abc") && !raw.contains("hunter2"), "{raw}");
+    }
+
+    #[test]
+    fn upgrades_first_audit_table() {
+        let path = temp_path("upgrade").join("app.sqlite");
+        // A database at schema version 1 (approvals), with audit rows in the first format.
+        let c = Connection::open(&path).unwrap();
+        c.execute_batch(
+            "CREATE TABLE bots (id TEXT PRIMARY KEY, name TEXT NOT NULL, color TEXT NOT NULL, shape TEXT NOT NULL,
+               harness TEXT NOT NULL, model TEXT, session_id TEXT, primary_bot INTEGER NOT NULL DEFAULT 0,
+               hidden INTEGER NOT NULL DEFAULT 0, unread INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);",
+        )
+        .unwrap();
+        migrate_approvals(&c, true).unwrap();
+        c.execute_batch(
+            "INSERT INTO audit_events (at, actor, action, bot_id, target, detail) VALUES
+               (1, 'user', 'policy.updated', NULL, 'global', '{\"after\":1}'),
+               (2, 'bot', 'approval.requested', 'b1', 'a1', '{}'),
+               (3, 'system', 'policy.denied', 'b1', NULL, '{}'),
+               (4, 'user', 'rule.added', 'b1', 'r1', '{}');
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        drop(c);
+        let db = Db::open(&path).unwrap();
+        let rows = db.audit_events(&audit::Filter::default(), 10, true);
+        let view: Vec<_> = rows
+            .iter()
+            .map(|e| (e.action.as_str(), e.actor_kind.as_str(), e.actor_id.as_deref(), e.target_type.as_deref(), e.target_id.as_deref(), e.outcome.as_str()))
+            .collect();
+        assert_eq!(
+            view,
+            [
+                ("policy.initialized", "system", None, Some("policy"), Some("global"), "success"),
+                ("policy.updated", "user", Some("operator"), Some("policy"), Some("global"), "success"),
+                ("approval.requested", "bot", Some("b1"), Some("approval"), Some("a1"), "success"),
+                ("policy.denied", "system", None, None, None, "denied"),
+                ("rule.added", "user", Some("operator"), Some("rule"), Some("r1"), "success"),
+            ]
+        );
+        assert_eq!(rows[1].details, json!({ "after": 1 }));
+        // Still append-only, and ids keep counting up.
+        assert!(db.c().execute("DELETE FROM audit_events", []).is_err());
+        db.record(&audit::Event::new(audit::Actor::system("server"), "server.started"));
+        assert!(all_events(&db)[0].id > rows.last().unwrap().id);
+    }
+
+    #[test]
+    fn audit_filters() {
+        let db = Db::open(&temp_path("filters").join("app.sqlite")).unwrap();
+        let ev = |actor: audit::Actor, action: &str| audit::Event::new(actor, action);
+        db.record(&ev(audit::Actor::operator(), "bot.created").bot("b1"));
+        db.record(&ev(audit::Actor::bot(Some("b1"), Some("A")), "routine.created").bot("b1"));
+        db.record(&ev(audit::Actor::bot(Some("b2"), None), "routine.deleted").bot("b2"));
+        db.record(&ev(audit::Actor::operator(), "auth.login_failed").outcome(audit::Outcome::Failure));
+        let q = |f: audit::Filter| db.audit_events(&f, 100, false).into_iter().map(|e| e.action).collect::<Vec<_>>();
+        let f = |k: &str, v: &str| audit::Filter::from_query(&[(k.to_string(), v.to_string())].into()).unwrap();
+        assert_eq!(q(f("action", "routine.*")), ["routine.deleted", "routine.created"]);
+        assert_eq!(q(f("action", "bot.created,auth.login_failed")), ["auth.login_failed", "bot.created"]);
+        assert_eq!(q(f("actor", "bot:b1")), ["routine.created"]);
+        assert_eq!(q(f("actor", "bot")).len(), 2);
+        assert_eq!(q(f("outcome", "failure")), ["auth.login_failed"]);
+        assert_eq!(q(f("bot", "b1")), ["routine.created", "bot.created"]);
+        assert_eq!(q(f("to", "2000-01-01")).len(), 0);
+        assert_eq!(q(f("from", "2000-01-01")).len(), 5);
+        let newest = all_events(&db)[0].id;
+        assert_eq!(q(audit::Filter { before: Some(newest), ..Default::default() }).len(), 4);
+        let oldest_first = db.audit_events(&audit::Filter { after: Some(newest - 2), ..Default::default() }, 100, true);
+        assert_eq!(oldest_first.iter().map(|e| e.action.as_str()).collect::<Vec<_>>(), ["routine.deleted", "auth.login_failed"]);
     }
 
     #[test]
