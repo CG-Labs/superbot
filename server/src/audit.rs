@@ -202,10 +202,24 @@ pub fn redact_text(s: &str) -> String {
             out.push_str(gap);
             continue;
         }
+        if let Mask::Quoted(q) = next {
+            // Still inside a quoted secret: drop words up to the closing quote.
+            if let Some(i) = word.find(q) {
+                next = Mask::None;
+                let rest = &word[i + 1..];
+                if !rest.is_empty() {
+                    let (masked, after) = redact_word(rest);
+                    next = after;
+                    out.push_str(&masked);
+                    out.push_str(gap);
+                }
+            }
+            continue;
+        }
         let (masked, after) = match next {
-            Mask::Word if !is_auth_scheme(word) => (REDACTED.to_string(), Mask::None),
+            Mask::Word if !is_auth_scheme(word) => (REDACTED.to_string(), quoted(word)),
             Mask::Password => match word.split_once(':') {
-                Some((user, _)) => (format!("{user}:{REDACTED}"), Mask::None),
+                Some((user, _)) => (format!("{user}:{REDACTED}"), quoted(word)),
                 None => redact_word(word),
             },
             _ => redact_word(word),
@@ -217,6 +231,15 @@ pub fn redact_text(s: &str) -> String {
     out
 }
 
+/// After masking a secret in `word`: if it opens a quote it doesn't close, the
+/// secret runs on into the next words.
+fn quoted(word: &str) -> Mask {
+    let open = |q: char| word.matches(q).count() % 2 == 1;
+    let first = word.chars().find(|c| matches!(c, '\'' | '"'));
+    let other = if first == Some('"') { '\'' } else { '"' };
+    first.into_iter().chain([other]).find(|&q| open(q)).map_or(Mask::None, Mask::Quoted)
+}
+
 /// What to mask in the next word.
 #[derive(Clone, Copy, PartialEq)]
 enum Mask {
@@ -224,6 +247,8 @@ enum Mask {
     Word,
     /// `user:password` after `-u` (curl and friends): only the password.
     Password,
+    /// The rest of a quoted secret, up to this closing quote.
+    Quoted(char),
 }
 
 fn is_auth_scheme(word: &str) -> bool {
@@ -250,15 +275,15 @@ fn redact_word(word: &str) -> (String, Mask) {
     if let Some(i) = bare.find(['=', ':']) {
         let (key, value) = (&bare[..i], &bare[i + 1..]);
         if secret_name(key) {
-            if value.is_empty() || value == "'" || value == "\"" {
+            if value.is_empty() {
                 return (word.into(), Mask::Word); // password: <x>
             }
-            return (format!("{key}{}{REDACTED}", &bare[i..=i]), Mask::None);
+            return (format!("{key}{}{REDACTED}", &bare[i..=i]), quoted(word));
         }
         if (key == "--user" || key == "-u")
             && let Some((user, _)) = value.split_once(':')
         {
-            return (format!("{key}={user}:{REDACTED}"), Mask::None);
+            return (format!("{key}={user}:{REDACTED}"), quoted(word));
         }
     }
     let mut s = bare.to_string();
@@ -513,7 +538,7 @@ pub fn start_retention(app: Arc<App>, days: Option<u32>) {
 
 pub fn prune(app: &App, days: u32) {
     let cutoff = now() - days as i64 * 86_400_000;
-    match app.db.prune_audit(cutoff) {
+    match app.db.prune_audit() {
         Ok(0) => {}
         Ok(n) => app.db.record(&Event::new(Actor::system("retention"), "audit.pruned").details(json!({ "deleted": n, "olderThan": cutoff, "retentionDays": days }))),
         Err(e) => eprintln!("audit retention: {e}"),
@@ -586,6 +611,16 @@ mod tests {
         assert_eq!(redact_text("curl -u admin:hunter2 https://x"), "curl -u admin:[redacted] https://x");
         assert_eq!(redact_text("curl --user=admin:hunter2 x"), "curl --user=admin:[redacted] x");
         assert_eq!(redact_text("git push -u origin main"), "git push -u origin main");
+        // Quoted secrets with spaces are masked to the closing quote.
+        assert_eq!(redact_text("tool --password 'my secret pass' --verbose"), "tool --password [redacted] --verbose");
+        assert_eq!(redact_text("tool --password=\"my secret pass\" x"), "tool --password=[redacted] x");
+        assert_eq!(redact_text("export DB_PASSWORD='a b c'; run"), "export DB_PASSWORD=[redacted] ; run");
+        assert_eq!(redact_text("curl -u 'admin:my pass word' https://x"), "curl -u 'admin:[redacted] https://x");
+        assert_eq!(redact_text("curl --user=\"admin:my pass\" https://x"), "curl --user=\"admin:[redacted] https://x");
+        assert_eq!(redact_text("run \"password=my secret\" next"), "run password=[redacted] next");
+        assert_eq!(redact_text("login --token \"it's a secret\" ok"), "login --token [redacted] ok");
+        assert_eq!(redact_text("tool --password 'never closed and more"), "tool --password [redacted] ");
+        assert_eq!(redact_text("echo 'hello world' --password 'x y'"), "echo 'hello world' --password [redacted] ");
         let long = scrub(json!("x".repeat(2000)));
         assert_eq!(long.as_str().unwrap().chars().count(), MAX_STRING + 1);
     }
