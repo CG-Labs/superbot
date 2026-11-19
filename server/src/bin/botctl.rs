@@ -16,7 +16,7 @@ const HELP: &str = r#"botctl: manage your routines (scheduled tasks).
   botctl routine add "<name>" "<cron>" "<what to do>"
   botctl routine rm <id>                           Delete a routine
   botctl routine pause <id> | resume <id>
-  botctl bots                                      List all Bots
+  botctl bots                                      List the Bots you can see (your owner's)
   botctl ask "<Bot name or id>" "<message>"        Ask another Bot; prints its reply
   botctl handoff "<what you need>"                 Ask the user to take over your screen; waits for "Done"
 
@@ -50,6 +50,12 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl sessions [<user>]                         Live sessions
   botctl session revoke <id>
   botctl session revoke-all <user>
+
+  botctl bot access <bot>                          Who owns a Bot, who can see it, and their grants
+  botctl bot share <bot> | private <bot>           Shared with everyone, or only its owner and grants
+  botctl bot owner <bot> <user>                    Give a Bot to another user (admins only)
+  botctl bot grant <bot> <user> <viewer|operator>  viewer: read its chat; operator: also run it
+  botctl bot revoke <bot> <user>
 
   botctl policy [<bot>]                            Show the global or a Bot's policy
   botctl policy set <global|bot> [mode=ask|bypass] [timeout=<minutes>] [<class>=allow|ask|deny]...
@@ -290,6 +296,24 @@ fn flag<'a>(rest: &[&'a str], name: &str) -> Option<&'a str> {
     rest.windows(2).find(|w| w[0] == name).map(|w| w[1])
 }
 
+/// `botctl bot ...`: who owns and can see a Bot (ADR 0016). The request to send.
+fn bot_access(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
+    let access = |bot: &str| format!("/api/bots/{}/access", encode(bot));
+    let grant = |bot: &str, user: &str| format!("/api/bots/{}/grants/{}", encode(bot), encode(user));
+    Ok(match args {
+        ["access", bot] => ("GET", access(bot), None),
+        [v @ ("share" | "private"), bot] => {
+            let visibility = if *v == "share" { "shared" } else { "private" };
+            ("PATCH", access(bot), Some(json!({ "visibility": visibility }).to_string()))
+        }
+        ["owner", bot, user] => ("PATCH", access(bot), Some(json!({ "owner": user }).to_string())),
+        ["grant", bot, user, level @ ("viewer" | "operator")] => ("PUT", grant(bot, user), Some(json!({ "level": level }).to_string())),
+        ["grant", ..] => return Err("Usage: botctl bot grant <bot> <user> <viewer|operator>".into()),
+        ["revoke", bot, user] => ("DELETE", grant(bot, user), None),
+        _ => return Err("Unknown bot command. See botctl admin.".into()),
+    })
+}
+
 fn decide(verb: &str, id: &str, rest: &[&str]) -> Result<String, String> {
     let remember = if rest.contains(&"--remember-global") {
         json!("global")
@@ -364,6 +388,10 @@ fn run(args: &[String]) -> Result<String, String> {
             op("POST", "/api/policy/rules", Some(body.to_string()))
         }
         ["rule", "rm" | "delete", id] => op("DELETE", &format!("/api/policy/rules/{id}"), None).map(|_| "Deleted.".into()),
+        ["bot", rest @ ..] => {
+            let (method, path, body) = bot_access(rest)?;
+            op(method, &path, body)
+        }
         ["approvals"] => op("GET", "/api/approvals?status=pending", None),
         ["approvals", status] => op("GET", &format!("/api/approvals?status={status}"), None),
         [verb @ ("approve" | "deny"), id, rest @ ..] => decide(verb, id, rest),
@@ -490,6 +518,20 @@ mod tests {
         assert_eq!(role("read-only"), Ok("read-only"));
         assert!(role("root").is_err());
         assert_eq!(encode("a.b+c@example.com"), "a.b%2Bc%40example.com");
+    }
+
+    #[test]
+    fn bot_access_commands() {
+        let req = |a: &[&str]| bot_access(a).map(|(m, p, b)| (m, p, b.map(|b| serde_json::from_str::<Value>(&b).unwrap())));
+        assert_eq!(req(&["access", "b1"]), Ok(("GET", "/api/bots/b1/access".into(), None)));
+        assert_eq!(req(&["share", "b1"]), Ok(("PATCH", "/api/bots/b1/access".into(), Some(json!({ "visibility": "shared" })))));
+        assert_eq!(req(&["private", "b1"]), Ok(("PATCH", "/api/bots/b1/access".into(), Some(json!({ "visibility": "private" })))));
+        assert_eq!(req(&["owner", "b1", "a@example.com"]), Ok(("PATCH", "/api/bots/b1/access".into(), Some(json!({ "owner": "a@example.com" })))));
+        assert_eq!(req(&["grant", "b1", "a+b@example.com", "operator"]), Ok(("PUT", "/api/bots/b1/grants/a%2Bb%40example.com".into(), Some(json!({ "level": "operator" })))));
+        assert_eq!(req(&["revoke", "b1", "u1"]), Ok(("DELETE", "/api/bots/b1/grants/u1".into(), None)));
+        assert!(req(&["grant", "b1", "u1", "owner"]).is_err());
+        assert!(req(&["share"]).is_err());
+        assert!(req(&[]).is_err());
     }
 
     #[test]
