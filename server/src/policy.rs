@@ -388,6 +388,11 @@ pub fn classify(call: &Call, ctx: &Ctx) -> Vec<(&'static str, String)> {
                         UNREADABLE => ("shell_destructive", UNREAD_INPUT.to_string()),
                         c => (c, format!("Types into a running program: {why}")),
                     }));
+                    // Earlier writes may hold the start of this command ("git " then "push\n"),
+                    // so input that looks harmless on its own still asks.
+                    if out.is_empty() {
+                        out.push(("shell_destructive", "Types into a running program, which may finish a command typed earlier".into()));
+                    }
                 }
                 Some(None) => out.push(("shell_destructive", UNREAD_INPUT.to_string())),
                 None => {}
@@ -1051,7 +1056,11 @@ mod tests {
         let typed = |action: &str, data: Value| classes(&hermes("process_manage", json!({ "action": action, "session_id": "proc_1", "data": data })));
         assert_eq!(typed("write", json!("git push origin main\n")), ["git_push"]);
         assert_eq!(typed("submit", json!("rm -rf build")), ["file_delete"]);
-        assert!(typed("submit", json!("y")).is_empty());
+        // Harmless-looking input still asks: it may finish a command split across writes.
+        assert_eq!(typed("write", json!("git ")), ["shell_destructive"]);
+        assert_eq!(typed("write", json!("push origin main\n")), ["shell_destructive"]);
+        assert_eq!(typed("submit", json!("")), ["shell_destructive"]);
+        assert_eq!(typed("submit", json!(null)), ["shell_destructive"]);
         assert_eq!(typed("write", json!("print(')'")), ["shell_destructive"]);
         assert_eq!(typed("write", json!(["git", "push"])), ["shell_destructive"]);
         assert!(typed("poll", json!("git push")).is_empty());
