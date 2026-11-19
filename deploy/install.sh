@@ -363,6 +363,68 @@ configure_env() {
   chmod 0600 "$env_file"
 }
 
+master_key_default() { printf '%s/.config/superbot/master.key\n' "$1"; }
+
+# True if botd already sealed values in this database (so only the old key opens them).
+db_has_sealed_values() {
+  local db=$1
+  [[ -f "$db" ]] || return 1
+  [[ -n $(sudo -u "$SUPERBOT_USER" sqlite3 -readonly "$db" "SELECT 1 FROM settings WHERE key = 'secrets_key_check'" 2>/dev/null) ]]
+}
+
+# The key that encrypts secrets in SQLite (docs/adr/0009-secrets.md). Made once,
+# before botd (re)starts, as the service user: 0600 in a 0700 folder, outside
+# DATA_DIR so database backups don't carry it. Never replaced.
+# shellcheck disable=SC2016
+ensure_master_key() {
+  local home repo_path env_file key_file owner mode
+  home=$(user_home)
+  repo_path="$home/superbot"
+  env_file="$repo_path/.env"
+  key_file=$(master_key_default "$home")
+  if [[ "$DRY_RUN" == true ]]; then
+    log "[dry-run] would keep or create master key $key_file (0600, $SUPERBOT_USER) and set SUPERBOT_MASTER_KEY_FILE"
+    return
+  fi
+  if grep -q '^SUPERBOT_MASTER_KEY=.' "$env_file"; then
+    log "Master key: set in $env_file as SUPERBOT_MASTER_KEY"
+    return
+  fi
+  if grep -q '^SUPERBOT_MASTER_KEY_FILE=.' "$env_file"; then
+    key_file=$(sed -n 's/^SUPERBOT_MASTER_KEY_FILE=//p' "$env_file" | tail -n 1)
+  fi
+  [[ "$key_file" == /* ]] || die "SUPERBOT_MASTER_KEY_FILE must be an absolute path, not $key_file"
+  [[ ! -L "$key_file" ]] || die "Refusing symlinked $key_file"
+  if [[ -e "$key_file" ]]; then
+    [[ -s "$key_file" ]] || die "$key_file is empty. Restore the master key from your backup (deploy/README.md)."
+    owner=$(stat -c %U "$key_file")
+    [[ "$owner" == "$SUPERBOT_USER" ]] || die "$key_file must be owned by $SUPERBOT_USER, not $owner"
+    mode=$(stat -c %a "$key_file")
+    if [[ "${mode: -2}" != 00 ]]; then
+      warn "$key_file was mode $mode; tightening to 0600"
+      chmod 0600 "$key_file"
+    fi
+    log "Master key: keeping $key_file"
+  else
+    if db_has_sealed_values "$repo_path/data/app.sqlite"; then
+      die "No master key at $key_file, but the database holds values sealed with one. Restore the key (deploy/README.md) and re-run."
+    fi
+    log "Creating master key $key_file"
+    sudo -u "$SUPERBOT_USER" -H env KEY_FILE="$key_file" sh -c '
+      set -eu
+      umask 077
+      dir=$(dirname "$KEY_FILE")
+      [ -d "$dir" ] || mkdir -p -m 700 "$dir"
+      tmp=$(mktemp "$KEY_FILE.XXXXXX")
+      head -c 32 /dev/urandom | base64 >"$tmp"
+      mv -n "$tmp" "$KEY_FILE"
+      rm -f "$tmp"'
+    [[ -s "$key_file" ]] || die "Could not create $key_file"
+    export NEW_MASTER_KEY_FILE=$key_file
+  fi
+  set_env_var "$env_file" SUPERBOT_MASTER_KEY_FILE "$key_file"
+}
+
 service_unit_fixed() {
   local home=$1
   printf '%s\n' "User=$SUPERBOT_USER" "Group=$SUPERBOT_USER" \
@@ -471,6 +533,8 @@ SuperBot is installed.
 
   URL:      $url
   Password: stored in $pass_file (also in $repo_path/.env as AUTH_PASSWORD)
+  Key:      $(master_key_default "$home") encrypts saved secrets. Back it up apart from
+            the database: without it they can't be read (deploy/README.md).
   Logs:     journalctl -u superbot -f
   Upgrade:  sudo bash -s -- --upgrade < <(curl -fsSL https://raw.githubusercontent.com/CG-Labs/superbot/main/deploy/install.sh)
 
@@ -484,6 +548,9 @@ Next steps (as the service user):
 EOF
   if [[ -f "$pass_file" ]] && [[ "${NEW_PASSWORD_FILE:-}" == "$pass_file" ]]; then
     warn "New login password (saved to $pass_file): $(cat "$pass_file")"
+  fi
+  if [[ -n "${NEW_MASTER_KEY_FILE:-}" ]]; then
+    warn "New master key at $NEW_MASTER_KEY_FILE. Copy it somewhere safe, away from your database backups."
   fi
 }
 
@@ -506,6 +573,7 @@ main() {
   stage_trusted_deploy
   build_botd
   configure_env
+  ensure_master_key
   install_systemd
   install_backup
   install_caddy
