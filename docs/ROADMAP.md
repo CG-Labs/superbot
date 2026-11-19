@@ -17,7 +17,7 @@ SuperBot is a **team of AI coworkers**—each with memory, routines, and a Linux
 
 | Segment | Need | Fit today | Gaps |
 |--------|------|-----------|------|
-| **Technical solopreneur / founder** | Personal VPS, one password, one harness | Strong (install + client + approvals) | Client branding, secrets (in review) |
+| **Technical solopreneur / founder** | Personal VPS, one password, one harness | Strong (install + client + approvals) | Client branding |
 | **Small team (5–30)** | Shared instance, several humans, least privilege | Weak | SSO, multi-user, RBAC, per-user computers |
 | **Growth company (30–500)** | Managed hosting, billing, SSO, support | None | Control plane, per-user tiers |
 | **Enterprise (500+)** | Entra/Google/Okta SSO, SCIM, SOC 2, UK/EU residency, procurement | None | Full enterprise pillar |
@@ -55,7 +55,7 @@ What exists in **CG-Labs/superbot** today:
 |------|---------|
 | **Auth** | Users in SQLite with roles (admin, member, read-only) enforced per API route; server-side sessions (HttpOnly cookie for `web/`, bearer token for the client and `botctl`) with idle and absolute TTLs, logout, and admin revoke; one-time sign-in codes from an admin; `AUTH_PASSWORD` kept as break-glass owner login (`AUTH_BREAK_GLASS`, on by default) ([ADR 0012](adr/0012-users-sessions-rbac.md)). `ALLOW_NO_AUTH` on loopback only; `ALLOWED_HOSTS`; per-start `BOT_TOKEN` for `botctl`. No SSO yet. Sign-ins, revokes, and user changes are audited. |
 | **Client** | Login, SSE chat, bots CRUD, models/effort, routine create/edit/delete, live screen viewer (iframe / WebView) with take over, handoff cards and alerts; no audit log viewer, push, or biometric lock; placeholder EAS `projectId`; template branding. |
-| **Server** | SQLite single-tenant schema; harnesses run with their own prompts off, gated by the SuperBot **policy engine and approval queue** (default **ask** on fresh installs; [ADR 0007](adr/0007-approvals.md)); append-only **audit events** for admin actions with CSV export (`/api/audit`, `botctl audit export`, web Audit log; [ADR 0009](adr/0009-audit-events.md)). **Secrets store** (env/sealed `SecretStore`, master key, redaction) is in review as [PR #9](https://github.com/CG-Labs/superbot/pull/9) (ADR 0010); external vaults not built. |
+| **Server** | SQLite single-tenant schema; harnesses run with their own prompts off, gated by the SuperBot **policy engine and approval queue** (default **ask** on fresh installs; [ADR 0007](adr/0007-approvals.md)); append-only **audit events** for admin actions with CSV export (`/api/audit`, `botctl audit export`, web Audit log; [ADR 0009](adr/0009-audit-events.md)). **Secrets** from env/`_FILE` or saved encrypted in SQLite (XChaCha20-Poly1305, master key outside `DATA_DIR`), redacted from chats, events, and audit ([ADR 0010](adr/0010-secrets.md)); external vaults not built (trait seam only). |
 | **Harnesses** | Claude Code, Codex, Pi adapters. Hermes Agent adapter proposed ([ADR 0011](adr/0011-hermes-agent-backend.md)). |
 | **Deploy** | Ubuntu bash installer (piped-install fix merged, [#3](https://github.com/CG-Labs/superbot/pull/3)), systemd, Caddy, daily SQLite backup timer; Docker Compose (`Dockerfile` + `deploy/docker/`: `botd`, Caddy, backup sidecar), smoke-tested in CI ([ADR 0006](adr/0006-docker-compose.md)). |
 | **Multi-tenancy** | One deployment = one org in practice (`DATA_DIR`, shared `WORKSPACE_DIR`). All Bots share one computer. |
@@ -102,10 +102,10 @@ Basic auth may remain for **break-glass** and **self-host hobby** tiers only, be
 
 | | |
 |--|--|
-| **Status** | **Merged:** installer fix ([#3](https://github.com/CG-Labs/superbot/pull/3)), Docker Compose ([#6](https://github.com/CG-Labs/superbot/pull/6), [ADR 0006](adr/0006-docker-compose.md)), approvals + harness policy ([#5](https://github.com/CG-Labs/superbot/pull/5), [ADR 0007](adr/0007-approvals.md)), client routine editor / screen viewer / handoff ([#7](https://github.com/CG-Labs/superbot/pull/7), [ADR 0008](adr/0008-client-screen-auth.md)), audit events + CSV ([#8](https://github.com/CG-Labs/superbot/pull/8), [ADR 0009](adr/0009-audit-events.md)). **In review:** secrets store ([PR #9](https://github.com/CG-Labs/superbot/pull/9)). **Remaining:** real EAS `projectId`, brand assets. |
+| **Status** | **Merged:** installer fix ([#3](https://github.com/CG-Labs/superbot/pull/3)), Docker Compose ([#6](https://github.com/CG-Labs/superbot/pull/6), [ADR 0006](adr/0006-docker-compose.md)), approvals + harness policy ([#5](https://github.com/CG-Labs/superbot/pull/5), [ADR 0007](adr/0007-approvals.md)), client routine editor / screen viewer / handoff ([#7](https://github.com/CG-Labs/superbot/pull/7), [ADR 0008](adr/0008-client-screen-auth.md)), audit events + CSV ([#8](https://github.com/CG-Labs/superbot/pull/8), [ADR 0009](adr/0009-audit-events.md)), secrets store ([#9](https://github.com/CG-Labs/superbot/pull/9), [ADR 0010](adr/0010-secrets.md)). **Remaining:** real EAS `projectId`, brand assets. |
 | **Goal** | Reduce blast radius and improve deploy surface before selling to strangers. |
-| **Scope** | Approvals MVP (**done**); secrets via env/sealed store, not plaintext in SQLite (**in review**); structured audit events (**done**); Docker Compose one-click (**done**); harness policy flags (**done**); client routine editor, screen viewer, handoff UI (**done**); real EAS `projectId` + brand assets. |
-| **Exit criteria** | Compose documented as supported path (**done**); approvals cover send-email/shell/file-delete class tools (**done**); audit export CSV (**done**); client routine CRUD + screen iframe (**done**); secrets not in plaintext at rest; client builds under the real EAS project with SuperBot branding. |
+| **Scope** | Approvals MVP (**done**); secrets via env/sealed store, not plaintext in SQLite (**done**); structured audit events (**done**); Docker Compose one-click (**done**); harness policy flags (**done**); client routine editor, screen viewer, handoff UI (**done**); real EAS `projectId` + brand assets. |
+| **Exit criteria** | Compose documented as supported path (**done**); approvals cover send-email/shell/file-delete class tools (**done**); audit export CSV (**done**); client routine CRUD + screen iframe (**done**); secrets not in plaintext at rest (**done**); client builds under the real EAS project with SuperBot branding. |
 | **Size** | **L** |
 | **Dependencies** | M0 |
 
@@ -174,7 +174,7 @@ Basic auth may remain for **break-glass** and **self-host hobby** tiers only, be
 |-------|--------|-------------------|
 | Harness permissions | Policy engine: default **ask** for risky tools; bypass only by opt-in (**done**: [ADR 0007](adr/0007-approvals.md)) | Hermes tool names in the policy (M2); per-Bot tokens and approvals follow-ups ([list](approvals-followups.md)) |
 | Compute isolation | One OS user, one shared workspace for all Bots | **One computer per user** (M3); harness as separate OS user, cgroup and egress limits (M5) |
-| Secrets | Harness logins on service user disk; env/sealed store in review ([PR #9](https://github.com/CG-Labs/superbot/pull/9)) | External vaults + short-lived tokens (M5) |
+| Secrets | Env/`_FILE` or sealed in SQLite, master key outside backups, values redacted (**done**: [ADR 0010](adr/0010-secrets.md)); harness logins still on service user disk | Master-key rotation; external vaults + short-lived tokens (M5) |
 | Audit | Append-only SQLite table, CSV export, retention setting (**done**: [ADR 0009](adr/0009-audit-events.md)) | Per-user actors and IdP subjects (M2); SIEM export and tamper evidence (M5) |
 | Network | Caddy TLS, loopback `botd` | Same + mTLS between control plane and per-user machines (M3) |
 | Client | Session token in SecureStore (password only for servers from before ADR 0012) | OAuth tokens, certificate pinning (managed) |
@@ -272,7 +272,7 @@ No certification claims until audits complete.
 
 | Horizon | Focus |
 |---------|--------|
-| **Now** | Finish M1: land secrets ([PR #9](https://github.com/CG-Labs/superbot/pull/9)), EAS `projectId`, brand assets; approvals follow-ups ([list](approvals-followups.md)); owner to accept ADR 0011 and confirm the interface proposal |
+| **Now** | Finish M1: EAS `projectId`, brand assets; approvals follow-ups ([list](approvals-followups.md)); owner to accept ADR 0011 and confirm the interface proposal |
 | **Next** | Multi-user data model; SSO with Apple, GitHub, Entra, Google, generic OIDC; RBAC v1; Hermes adapter |
 | **Later** | Linode control plane with one machine per user; per-user tiers and hidden model routing; public launch + stores; SCIM; SOC 2 |
 
