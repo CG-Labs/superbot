@@ -60,9 +60,10 @@ export function basicAuthHeader(password: string, username = "superbot"): string
   return `Basic ${b64encode(`${username}:${password}`)}`;
 }
 
-/** Bearer for a session token; Basic for the legacy shared password. */
-export function authHeader(cfg: ServerConfig): string {
-  return cfg.token ? `Bearer ${cfg.token}` : basicAuthHeader(cfg.password ?? "");
+/** Bearer for a session token; Basic for the legacy shared password; none for a cookie session. */
+export function authHeader(cfg: ServerConfig): string | null {
+  if (cfg.token) return `Bearer ${cfg.token}`;
+  return cfg.cookie ? null : basicAuthHeader(cfg.password ?? "");
 }
 
 export async function loadSavedCredentials(): Promise<ServerConfig | null> {

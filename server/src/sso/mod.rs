@@ -589,7 +589,11 @@ pub async fn start(
     no_store(res)
 }
 
-const SIGNED_IN: &str = r#"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="0;url=/console/"><title>SuperBot</title><p style="font:16px system-ui;margin:2rem">Signed in. <a href="/console/">Continue to SuperBot</a></p>"#;
+/// The page after a web sign-in, sending admins to the console and everyone else to the app.
+fn signed_in_page(role: Role) -> String {
+    let to = crate::landing(crate::rbac::Principal::User(role));
+    format!(r#"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="0;url={to}"><title>SuperBot</title><p style="font:16px system-ui;margin:2rem">Signed in. <a href="{to}">Continue to SuperBot</a></p>"#)
+}
 
 /// `GET /api/auth/sso/{id}/callback?code&state`: the IdP sends the browser back here.
 pub async fn callback(
@@ -677,7 +681,7 @@ async fn finish(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, q: &Ha
             let label = pending.label.as_deref().or(Some("Web"));
             let (s, token) = users::start_session(a, &user, "sso", Some((id, &claims.key())), true, label, source);
             signed_in(a, &user, &s, id, &claims, source);
-            let mut res = Html(SIGNED_IN).into_response();
+            let mut res = Html(signed_in_page(user.role)).into_response();
             res.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&users::session_cookie(&token, a.sessions.max_ms)).unwrap());
             res
         }

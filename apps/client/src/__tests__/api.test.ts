@@ -1,4 +1,4 @@
-import { SuperBotApi } from "../api";
+import { cookieSession, SuperBotApi } from "../api";
 
 const BASE = "https://bots.example.com";
 
@@ -23,5 +23,48 @@ describe("SuperBotApi.logout", () => {
     globalThis.fetch = jest.fn() as unknown as typeof fetch;
     await new SuperBotApi({ baseUrl: BASE, password: "pw" }).logout();
     expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it("ends a cookie session with no Authorization header", async () => {
+    const fetchMock = jest.fn(async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    await new SuperBotApi({ baseUrl: BASE, cookie: true }).logout();
+    expect(fetchMock).toHaveBeenCalledWith(`${BASE}/api/auth/logout`, expect.objectContaining({ method: "POST", headers: {} }));
+  });
+});
+
+describe("cookie sessions (ADR 0027)", () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+  const answer = (status: number, body: unknown) =>
+    (globalThis.fetch = jest.fn(async () => ({ ok: status < 400, status, json: async () => body })) as unknown as typeof fetch);
+
+  it("adopts the session the server's sign-in page left in this browser", async () => {
+    answer(200, { user: { id: "u1" }, session: { id: "s1" }, landing: "/app/" });
+    expect(await cookieSession(BASE)).toEqual({ baseUrl: BASE, cookie: true });
+    expect(globalThis.fetch).toHaveBeenCalledWith(`${BASE}/api/auth/me`, { credentials: "same-origin" });
+  });
+
+  it("takes nothing without a session", async () => {
+    answer(401, { error: "Login required" });
+    expect(await cookieSession(BASE)).toBeNull();
+    // ALLOW_NO_AUTH answers without a session: that is not a sign-in to keep.
+    answer(200, { user: null, session: null });
+    expect(await cookieSession(BASE)).toBeNull();
+    globalThis.fetch = jest.fn(async () => Promise.reject(new Error("offline"))) as unknown as typeof fetch;
+    expect(await cookieSession(BASE)).toBeNull();
+  });
+
+  it("sends no credentials of its own and treats a 401 as the session ending", async () => {
+    answer(401, { error: "Login required" });
+    const api = new SuperBotApi({ baseUrl: BASE, cookie: true });
+    const ended = jest.fn();
+    api.onSessionEnded = ended;
+    await expect(api.verify()).rejects.toThrow("Login required");
+    expect((globalThis.fetch as jest.Mock).mock.calls[0][1].headers).toEqual({});
+    expect(ended).toHaveBeenCalled();
+    expect(api.authHeaders()).toEqual({});
   });
 });

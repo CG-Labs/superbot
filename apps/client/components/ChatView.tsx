@@ -10,6 +10,7 @@ import {
   View,
 } from "react-native";
 import Markdown from "react-native-markdown-display";
+import { copyText, COPY_LABEL } from "../src/clipboard";
 import { showError } from "../src/dialogs";
 import { isOpenHandoff } from "../src/handoff";
 import { useSuperBot } from "../src/SuperBotContext";
@@ -26,6 +27,12 @@ interface Props {
   /** Opens the Bot's live screen; `takeOver` starts with control (from a handoff). */
   onToggleScreen: (takeOver?: boolean) => void;
   screenOpen?: boolean;
+}
+
+/** Who a Bot-to-Bot message came from. */
+export function peerLabel(m: Message, bots: { id: string; name: string }[]): string {
+  const who = bots.find((b) => b.id === m.fromBot)?.name ?? "another Bot";
+  return m.role === "peer" ? `From ${who}` : `Reply from ${who}`;
 }
 
 function formatTime(ts: number): string {
@@ -94,11 +101,24 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen }: 
         ) : (
           <View style={[styles.row, isUser && styles.rowUser]}>
             <View style={[styles.bubble, isUser && styles.bubbleUser, item.error && styles.bubbleError]}>
+              {item.role === "peer" || item.role === "reply" ? (
+                <Text style={styles.from}>{peerLabel(item, bots)}</Text>
+              ) : null}
               {isUser ? (
                 <Text style={styles.userText}>{item.text}</Text>
               ) : (
                 <Markdown style={mdStyles}>{item.text}</Markdown>
               )}
+              {!isUser && item.text ? (
+                <Pressable
+                  role="button"
+                  aria-label={`${COPY_LABEL} message`}
+                  style={styles.copy}
+                  onPress={() => void copyText(item.text)}
+                >
+                  <Text style={styles.copyText}>{COPY_LABEL}</Text>
+                </Pressable>
+              ) : null}
               {item.question ? (
                 <View style={styles.question}>
                   <Text style={styles.qTitle}>{item.question.title}</Text>
@@ -269,6 +289,9 @@ const styles = StyleSheet.create({
   bubbleUser: { backgroundColor: "#2a3344" },
   bubbleError: { borderColor: colors.danger, borderWidth: 1 },
   userText: { color: colors.text },
+  from: { color: colors.textFaint, fontSize: 13, marginBottom: 2 },
+  copy: { alignSelf: "flex-start", marginTop: 4 },
+  copyText: { color: colors.textFaint, fontSize: 12 },
   question: { marginTop: 8, gap: 6 },
   qTitle: { color: colors.text, fontWeight: "600", marginBottom: 4 },
   opt: {

@@ -7,14 +7,16 @@ import React, {
   useRef,
   useState,
 } from "react";
-import { AppState as RNAppState } from "react-native";
+import { Platform, AppState as RNAppState } from "react-native";
 import {
   clearCredentials,
+  defaultServerUrl,
   loadSavedCredentials,
+  LOCAL_SERVER_URL,
   saveCredentials,
 } from "./auth";
 import { hasAccess } from "./access";
-import { ApiError, signIn, SuperBotApi } from "./api";
+import { ApiError, cookieSession, signIn, SuperBotApi } from "./api";
 import {
   applyHandoffHistory,
   applyHandoffMessage,
@@ -307,7 +309,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
         () => {
           setConnected(false);
           // A revoked session closes the stream; a quick request tells that apart from a network drop.
-          if (client.config.token) void client.verify().catch(() => {});
+          if (client.hasSession) void client.verify().catch(() => {});
         },
       );
       setConnected(true);
@@ -362,11 +364,16 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
           await saveCredentials(upgraded);
         }
       }
-      if (saved?.token || saved?.password) {
+      // Nothing saved: the server's own sign-in page may have signed this browser in.
+      if (!saved?.token && saved?.password == null) {
+        const origin = defaultServerUrl();
+        if (Platform.OS === "web" && origin !== LOCAL_SERVER_URL) saved = await cookieSession(origin);
+      }
+      if (saved?.token || saved?.password || saved?.cookie) {
         try {
           await bootstrap(new SuperBotApi(saved));
         } catch (err) {
-          if (err instanceof ApiError && err.status === 401 && saved.token) {
+          if (err instanceof ApiError && err.status === 401 && (saved.token || saved.cookie)) {
             await clearCredentials();
             setError("Your session ended. Sign in again.");
           } else {

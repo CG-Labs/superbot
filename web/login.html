@@ -53,7 +53,9 @@
     const go = document.getElementById("go");
     const error = document.getElementById("error");
 
-    fetch("/api/auth/me").then((r) => { if (r.ok) location.replace("/console/"); }).catch(() => {});
+    // Admins land on the console, everyone else on the app (docs/adr/0027-expo-primary-hermes-default.md).
+    const landing = (me) => (me?.landing === "/console/" ? "/console/" : "/app/");
+    fetch("/api/auth/me").then(async (r) => { if (r.ok) location.replace(landing(await r.json())); }).catch(() => {});
 
     // Single sign-on: one button per provider the server offers.
     const SSO_ERRORS = {
@@ -101,7 +103,7 @@
         if (r.ok) {
           // Browsers drop Secure cookies on plain http, except on localhost.
           const me = await fetch("/api/auth/me");
-          if (me.ok) return location.replace("/console/");
+          if (me.ok) return location.replace(landing(await me.json().catch(() => null)));
           error.textContent = "Signed in, but this browser didn't keep the session. Open SuperBot over HTTPS.";
           return;
         }

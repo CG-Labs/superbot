@@ -1,5 +1,6 @@
 import { act, renderHook, waitFor } from "@testing-library/react-native";
-import { clearCredentials, loadSavedCredentials, saveCredentials } from "../auth";
+import { Platform } from "react-native";
+import { clearCredentials, defaultServerUrl, loadSavedCredentials, saveCredentials } from "../auth";
 import { connectSse } from "../sse";
 import { SuperBotProvider, useSuperBot } from "../SuperBotContext";
 import type { Message, Routine, SseEvent } from "../types";
@@ -9,6 +10,7 @@ jest.mock("../auth", () => ({
   loadSavedCredentials: jest.fn(async () => ({ baseUrl: "https://bots.example.com", password: "hunter2" })),
   saveCredentials: jest.fn(),
   clearCredentials: jest.fn(),
+  defaultServerUrl: jest.fn(() => "http://127.0.0.1:3000"),
 }));
 jest.mock("../sse", () => ({ connectSse: jest.fn(() => ({ close: jest.fn() })) }));
 
@@ -56,6 +58,8 @@ let bobHidden = false;
 /** Bob's history request fails with a 500. */
 let bobHistoryFails = false;
 let adaHistory: Message[] = [];
+/** The browser holds a session cookie from the server's sign-in page. */
+let cookieMe = false;
 const TOKEN = "sbs_" + "a".repeat(64);
 
 function respond(status: number, body: unknown) {
@@ -76,6 +80,7 @@ beforeEach(() => {
   bobHidden = false;
   bobHistoryFails = false;
   adaHistory = [];
+  cookieMe = false;
   (connectSse as jest.Mock).mockClear();
   (saveCredentials as jest.Mock).mockClear();
   (clearCredentials as jest.Mock).mockClear();
@@ -91,6 +96,7 @@ beforeEach(() => {
       const ok = body.password === "hunter2" || body.code === "sbc_good";
       return ok ? respond(200, { token: loginToken, user: { id: "u1" } }) : respond(401, { error: "Wrong password." });
     }
+    if (path === "/api/auth/me") return cookieMe ? respond(200, { session: { id: "s1" }, landing: "/app/" }) : respond(401, {});
     if (path === "/api/auth/logout") return stallLogout ? new Promise(() => {}) : respond(200, { ok: true });
     if (loginToken && auth !== `Bearer ${loginToken}`) return respond(401, { error: "Login required" });
     if (path === "/api/state") {
@@ -127,6 +133,47 @@ async function connected() {
   const onEvent = (connectSse as jest.Mock).mock.calls[0][2] as (e: SseEvent) => void;
   return { ...hook, emit: (e: SseEvent) => act(() => onEvent(e)) };
 }
+
+describe("signing in on the server's own pages (ADR 0027)", () => {
+  const os = Platform.OS;
+  beforeEach(() => {
+    Platform.OS = "web";
+    (loadSavedCredentials as jest.Mock).mockImplementation(async () => null);
+    (defaultServerUrl as jest.Mock).mockReturnValue(BASE);
+  });
+  afterEach(() => {
+    Platform.OS = os;
+    (defaultServerUrl as jest.Mock).mockReturnValue("http://127.0.0.1:3000");
+  });
+
+  it("opens the app with the browser's session cookie, never saving it", async () => {
+    cookieMe = true;
+    const { result } = await renderHook(() => useSuperBot(), { wrapper: SuperBotProvider });
+    await waitFor(() => expect(result.current.api).not.toBeNull());
+    expect(result.current.api?.config).toEqual({ baseUrl: BASE, cookie: true });
+    const state = calls.find((c) => c.url === `${BASE}/api/state`);
+    expect(state?.headers.Authorization).toBeUndefined();
+    expect(saveCredentials).not.toHaveBeenCalled();
+
+    await act(() => result.current.logout());
+    expect(result.current.api).toBeNull();
+    expect(calls.some((c) => c.url === `${BASE}/api/auth/logout` && c.method === "POST")).toBe(true);
+  });
+
+  it("shows sign-in when there is no cookie, and doesn't look for one in dev or the desktop app", async () => {
+    const { result } = await renderHook(() => useSuperBot(), { wrapper: SuperBotProvider });
+    await waitFor(() => expect(result.current.ready).toBe(true));
+    expect(result.current.api).toBeNull();
+
+    calls = [];
+    cookieMe = true;
+    (defaultServerUrl as jest.Mock).mockReturnValue("http://127.0.0.1:3000");
+    const dev = await renderHook(() => useSuperBot(), { wrapper: SuperBotProvider });
+    await waitFor(() => expect(dev.result.current.ready).toBe(true));
+    expect(dev.result.current.api).toBeNull();
+    expect(calls).toEqual([]);
+  });
+});
 
 describe("SuperBotProvider", () => {
   it("tracks a live handoff for a Bot whose chat isn't loaded, then loads its full history", async () => {

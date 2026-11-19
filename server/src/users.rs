@@ -442,6 +442,7 @@ pub async fn me(Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Call
         "method": c.method,
         "session": c.session.as_ref().map(|s| session_view(s, &a.sessions)),
         "breakGlass": a.break_glass,
+        "landing": crate::landing(c.principal),
     }))
 }
 

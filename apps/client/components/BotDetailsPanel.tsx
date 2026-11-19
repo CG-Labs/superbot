@@ -16,6 +16,7 @@ import { useSuperBot } from "../src/SuperBotContext";
 import { colors, HARNESS_NAMES } from "../src/theme";
 import type { Routine } from "../src/types";
 import { BotAvatar } from "./BotAvatar";
+import { Chips } from "./Chips";
 import { RoutineEditor } from "./RoutineEditor";
 
 interface Props {
@@ -44,8 +45,11 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
     can,
     canOnBot,
     me,
+    harnesses,
   } = useSuperBot();
   const bot = bots.find((b) => b.id === activeId);
+  // The Bot's own harness stays listed even if it is no longer installed.
+  const harnessChoices = bot ? [...new Set([...(harnesses ?? []), bot.harness])] : [];
   const canOperate = canOnBot(bot, "operate");
   const canManage = canOnBot(bot, "manage");
   const botId = bot?.id;
@@ -185,6 +189,17 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
           <View style={styles.row}>
             <Text style={styles.dim}>Runs on {HARNESS_NAMES[bot.harness] || bot.harness}</Text>
           </View>
+          {canManage && harnessChoices.length > 1 ? (
+            <View style={styles.harnessPick}>
+              <Chips
+                options={harnessChoices.map((h) => ({ value: h, label: HARNESS_NAMES[h] || h }))}
+                value={bot.harness}
+                onChange={(h) => {
+                  if (h !== bot.harness) void patchBot(bot.id, { harness: h }).catch(showError);
+                }}
+              />
+            </View>
+          ) : null}
           <View style={styles.row}>
             <Text style={styles.dim}>Hide from sidebar</Text>
             <Switch value={bot.hidden} disabled={!canManage} onValueChange={(v) => void patchBot(bot.id, { hidden: v })} />
@@ -223,8 +238,14 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
             <Pressable
               style={styles.delete}
               onPress={() => {
-                void deleteBot(bot.id);
-                onClose();
+                void confirmAsync(
+                  `Delete ${bot.name}?`,
+                  "This erases its chat, memory, and routines. Files on the computer stay.",
+                ).then((ok) => {
+                  if (!ok) return;
+                  void deleteBot(bot.id);
+                  onClose();
+                });
               }}
             >
               <Text style={styles.deleteText}>Delete bot</Text>
@@ -277,6 +298,7 @@ const styles = StyleSheet.create({
   rCron: { color: colors.textFaint, fontSize: 13 },
   dim: { color: colors.textDim, flex: 1 },
   policyLink: { color: colors.blueDot, flex: 1 },
+  harnessPick: { width: "100%", paddingVertical: 8 },
   delete: { marginTop: 16, padding: 12 },
   deleteText: { color: colors.danger },
 });

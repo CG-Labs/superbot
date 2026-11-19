@@ -61,6 +61,21 @@ export async function signIn(baseUrl: string, secret: string, label = "SuperBot 
   throw new ApiError(data?.error ?? `HTTP ${res.status}`, res.status);
 }
 
+/**
+ * The session the server's sign-in page (or a web SSO sign-in) left in this browser, when
+ * this web build is served by that server: those pages send people here (ADR 0027).
+ */
+export async function cookieSession(baseUrl: string): Promise<ServerConfig | null> {
+  try {
+    const res = await fetch(`${normalizeBaseUrl(baseUrl)}/api/auth/me`, { credentials: "same-origin" });
+    if (!res.ok) return null;
+    const me = (await res.json()) as { session?: unknown } | null;
+    return me?.session ? { baseUrl, cookie: true } : null;
+  } catch {
+    return null;
+  }
+}
+
 export class SuperBotApi {
   /** Called when the server refuses this session token, e.g. after a revoke. */
   onSessionEnded?: () => void;
@@ -76,11 +91,16 @@ export class SuperBotApi {
   }
 
   private headers(json = false): Record<string, string> {
-    const h: Record<string, string> = {
-      Authorization: authHeader(this.cfg),
-    };
+    const h: Record<string, string> = {};
+    const auth = authHeader(this.cfg);
+    if (auth) h.Authorization = auth;
     if (json) h["Content-Type"] = "application/json";
     return h;
+  }
+
+  /** A session the server can end: a token, or the browser's cookie. */
+  get hasSession(): boolean {
+    return !!(this.cfg.token || this.cfg.cookie);
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -91,7 +111,7 @@ export class SuperBotApi {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      if (res.status === 401 && this.cfg.token) this.onSessionEnded?.();
+      if (res.status === 401 && this.hasSession) this.onSessionEnded?.();
       const msg = (data as { error?: string }).error ?? `HTTP ${res.status}`;
       throw new ApiError(msg, res.status);
     }
@@ -102,10 +122,9 @@ export class SuperBotApi {
     return this.request<AppState>("GET", "/api/state");
   }
 
-  /** Ends this session on the server. Nothing to end for a password config. */
-  /** Ends the session on the server, giving up after `timeoutMs`. */
+  /** Ends the session on the server, giving up after `timeoutMs`. Nothing to end for a password config. */
   async logout(timeoutMs = 5000): Promise<void> {
-    if (!this.cfg.token) return;
+    if (!this.hasSession) return;
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), timeoutMs);
     try {
