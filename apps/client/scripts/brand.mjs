@@ -169,7 +169,8 @@ function check() {
     const before = errors.length;
     if (png.w !== a.w || png.h !== a.h) errors.push(`${a.file}: ${png.w}x${png.h}, want ${a.w}x${a.h}`);
     if (png.type !== (a.alpha ? 6 : 2)) errors.push(`${a.file}: PNG color type ${png.type}, want ${a.alpha ? "RGBA (6)" : "RGB (2), no alpha"}`);
-    if (!png.rgba || errors.length > before) continue;
+    if (!png.rgba) errors.push(`${a.file}: unsupported PNG encoding (need 8-bit, non-interlaced); run npm run brand`);
+    if (errors.length > before) continue;
     const want = render(a);
     let bad = 0;
     for (let i = 0; i < want.length; i++) {
