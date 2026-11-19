@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { ActivityIndicator, Pressable, StyleSheet, Switch, Text, TextInput, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
 import { CODE_TTLS, ROLES } from "../src/invite";
@@ -11,9 +11,11 @@ interface Props {
   api: SuperBotApi;
   onCreated: (u: AdminUser) => void;
   onClose: () => void;
+  /** While the user and code are being made: the sheet must stay open, or the code is lost. */
+  onBusy?: (busy: boolean) => void;
 }
 
-export function InviteUserForm({ api, onCreated, onClose }: Props) {
+export function InviteUserForm({ api, onCreated, onClose, onBusy }: Props) {
   const [email, setEmail] = useState("");
   const [name, setName] = useState("");
   const [role, setRole] = useState<Role>("member");
@@ -22,6 +24,7 @@ export function InviteUserForm({ api, onCreated, onClose }: Props) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [made, setMade] = useState<{ user: AdminUser; code: LoginCode } | null>(null);
+  useEffect(() => onBusy?.(busy), [busy, onBusy]);
 
   const submit = async () => {
     setBusy(true);
@@ -85,7 +88,7 @@ export function InviteUserForm({ api, onCreated, onClose }: Props) {
       )}
       {error ? <Text style={styles.error}>{error}</Text> : null}
       <View style={styles.actions}>
-        <Pressable style={styles.btn} onPress={onClose}>
+        <Pressable style={[styles.btn, busy && styles.disabled]} disabled={busy} onPress={onClose}>
           <Text style={styles.btnText}>Cancel</Text>
         </Pressable>
         <Pressable style={[styles.btn, styles.primary, (busy || !email.trim()) && styles.disabled]} disabled={busy || !email.trim()} onPress={() => void submit()}>

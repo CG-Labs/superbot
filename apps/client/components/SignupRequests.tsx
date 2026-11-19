@@ -14,13 +14,27 @@ interface Props {
   onApproved: (userId: string) => void;
 }
 
-function Review({ api, request, onApproved, onClose }: { api: SuperBotApi; request: SignupRequest; onApproved: (a: SignupApproval) => void; onClose: () => void }) {
+function Review({
+  api,
+  request,
+  onApproved,
+  onClose,
+  onBusy,
+}: {
+  api: SuperBotApi;
+  request: SignupRequest;
+  onApproved: (a: SignupApproval) => void;
+  onClose: () => void;
+  /** While approving or rejecting: the sheet must stay open, or the new code is lost. */
+  onBusy: (busy: boolean) => void;
+}) {
   const [role, setRole] = useState<Role>("member");
   const [ttl, setTtl] = useState<number>(APPROVAL_TTLS[1].minutes);
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [made, setMade] = useState<SignupApproval | null>(null);
+  useEffect(() => onBusy(busy), [busy, onBusy]);
 
   const run = async (f: () => Promise<void>) => {
     setBusy(true);
@@ -100,7 +114,7 @@ function Review({ api, request, onApproved, onClose }: { api: SuperBotApi; reque
       />
       {error ? <Text style={styles.error}>{error}</Text> : null}
       <View style={styles.actions}>
-        <Pressable style={styles.btn} onPress={onClose} accessibilityRole="button">
+        <Pressable style={[styles.btn, busy && styles.disabled]} disabled={busy} onPress={onClose} accessibilityRole="button">
           <Text style={styles.btnText}>Cancel</Text>
         </Pressable>
         <Pressable style={[styles.btn, busy && styles.disabled]} disabled={busy} onPress={() => void reject()} accessibilityRole="button">
@@ -127,6 +141,10 @@ export function SignupRequests({ api, onApproved }: Props) {
   const [open, setOpen] = useState<SignupRequest | null>(null);
   // Opened once the code closes, so the user's panel never covers it.
   const approved = useRef<string | null>(null);
+  const busy = useRef(false);
+  const setBusy = useCallback((b: boolean) => {
+    busy.current = b;
+  }, []);
 
   const load = useCallback(async () => {
     try {
@@ -173,7 +191,15 @@ export function SignupRequests({ api, onApproved }: Props) {
           ))}
         </View>
       ) : null}
-      <Modal visible={!!open} animationType="slide" transparent onRequestClose={close} testID="signup-modal">
+      <Modal
+        visible={!!open}
+        animationType="slide"
+        transparent
+        onRequestClose={() => {
+          if (!busy.current) close();
+        }}
+        testID="signup-modal"
+      >
         <View style={styles.backdrop}>
           <ScrollView style={styles.sheet} contentContainerStyle={{ padding: 20, gap: 8 }}>
             <Text style={styles.title}>Request for access</Text>
@@ -186,6 +212,7 @@ export function SignupRequests({ api, onApproved }: Props) {
                   void load();
                 }}
                 onClose={close}
+                onBusy={setBusy}
               />
             ) : null}
           </ScrollView>

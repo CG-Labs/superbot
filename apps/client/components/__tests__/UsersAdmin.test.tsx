@@ -280,6 +280,35 @@ describe("UsersAdmin", () => {
     expect(await screen.findByText(/^Scout/)).toBeOnTheScreen();
   });
 
+  it("keeps the code when Back or Cancel is tried while a request is still being made", async () => {
+    const { api, user } = await open([owner, alex], [ada]);
+    const slow = <T,>(real: () => Promise<T>) => {
+      let go: () => void = () => {};
+      const gate = new Promise<void>((r) => (go = r));
+      return { run: () => gate.then(real), go: () => go() };
+    };
+
+    const approve = slow(() => api.approveSignup.getMockImplementation()!("su1", { role: "member", ttlMinutes: 3 * 24 * 60 }));
+    api.approveSignup.mockImplementationOnce(approve.run);
+    await user.press(await screen.findByLabelText("Request from Ada Lovelace"));
+    await user.press(screen.getByText("Approve"));
+    await act(async () => screen.getByTestId("signup-modal").props.onRequestClose());
+    await user.press(screen.getByText("Cancel"));
+    await act(async () => approve.go());
+    expect(within(await screen.findByTestId("code-reveal")).getByTestId("code-value")).toHaveTextContent(CODE);
+    await user.press(screen.getByText("Done"));
+
+    const code = slow(async () => ({ code: CODE, expiresAt: Date.now() + 3600_000 }));
+    api.createLoginCode.mockImplementationOnce(code.run);
+    await user.press(screen.getByText("Add user"));
+    await user.type(screen.getByLabelText("Email"), "sam@example.com");
+    await user.press(screen.getAllByText("Add user").at(-1)!);
+    await act(async () => screen.getByTestId("invite-modal").props.onRequestClose());
+    await user.press(screen.getByText("Cancel"));
+    await act(async () => code.go());
+    expect(within(await screen.findByTestId("code-reveal")).getByTestId("code-value")).toHaveTextContent(CODE);
+  });
+
   it("rejects a request with a reason, after asking", async () => {
     const { api, user } = await open([owner, alex], [ada]);
     await user.press(await screen.findByLabelText("Request from Ada Lovelace"));

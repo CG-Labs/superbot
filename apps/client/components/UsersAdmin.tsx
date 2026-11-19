@@ -76,6 +76,10 @@ export function UsersAdmin({ api, meId, onBack }: Props) {
   const [inviting, setInviting] = useState(false);
   // Selected once the invite closes, so the user's panel never covers the one-time code.
   const created = useRef<string | null>(null);
+  const inviteBusy = useRef(false);
+  const setInviteBusy = useCallback((b: boolean) => {
+    inviteBusy.current = b;
+  }, []);
   const [providers, setProviders] = useState<SsoProvider[]>([]);
 
   const load = useCallback(async () => {
@@ -158,7 +162,15 @@ export function UsersAdmin({ api, meId, onBack }: Props) {
           </View>
         </Modal>
       ) : null}
-      <Modal visible={inviting} animationType="slide" transparent onRequestClose={closeInvite} testID="invite-modal">
+      <Modal
+        visible={inviting}
+        animationType="slide"
+        transparent
+        onRequestClose={() => {
+          if (!inviteBusy.current) closeInvite();
+        }}
+        testID="invite-modal"
+      >
         <View style={styles.backdrop}>
           <ScrollView style={styles.sheet} contentContainerStyle={{ padding: 20, gap: 8 }}>
             <Text style={styles.title}>Add user</Text>
@@ -170,6 +182,7 @@ export function UsersAdmin({ api, meId, onBack }: Props) {
                   void load();
                 }}
                 onClose={closeInvite}
+                onBusy={setInviteBusy}
               />
             ) : null}
           </ScrollView>
