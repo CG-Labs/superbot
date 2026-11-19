@@ -210,6 +210,17 @@ botctl bot revoke <bot-id> alex@example.com
 botctl bot owner <bot-id> alex@example.com          # admins only
 ```
 
+### Per-user machines (managed hosting)
+
+For CG-Labs managed hosting: botd can rent one Linode per user and track it. **Off by default**: without `LINODE_TOKEN` the machine endpoints answer 503 "control plane not configured", and nothing else changes. Self-hosted servers don't need it. Design: [ADR 0025](adr/0025-control-plane-linode.md).
+
+- **Turn on**: `LINODE_TOKEN` (or `LINODE_TOKEN_FILE`; a Linode personal access token with Linodes read/write) and `MACHINE_REGIONS` (e.g. `gb-lon,de-fra-2`; the first is the default). botd refuses to start with a token and no regions.
+- **Tiers**: `MACHINE_TIERS=starter=g6-standard-1,pro=g6-standard-2,max=g6-standard-4` (the default) maps tier names to Linode plans; the first is the default tier.
+- **Other settings**: `MACHINE_IMAGE` (`linode/ubuntu24.04`), `MACHINE_BACKUPS` (`on`), `MACHINE_LABEL_PREFIX` (`superbot`; every label starts with it and every machine is tagged with it), `MACHINE_AUTHORIZED_KEYS` (comma-separated SSH public keys for operators), `MACHINE_RECONCILE_SECONDS` (`60`).
+- **What it does**: an admin requests a machine for a user; botd creates it (label `<prefix>-<machine id>`, so a retry never makes a second), then a reconciler marks it running, turns on backups, and finishes deletes. States: `pending`, `provisioning`, `running`, `suspended`, `destroying`, `destroyed`, `error`. Suspend powers it off; Linode still bills a powered-off machine.
+- **Audit**: `machine.requested`, `machine.created`, `machine.running`, `machine.backups_enabled`, `machine.suspended`, `machine.resumed`, `machine.resized`, `machine.destroy_requested`, `machine.destroyed`, `machine.retried`, and failures (`machine.create_failed`, `machine.lost`, `machine.destroy_failed`, `machine.backups_failed`, or the action with outcome `failure`). The admin is the actor; the reconciler acts as `system:control_plane` on behalf of the user.
+- **Not yet**: botd doesn't talk to the machines themselves (enrollment and mTLS), move a user's Bots onto theirs, or tie tiers to billing.
+
 ## API
 
 All JSON. Auth: a session cookie (web app) or `Authorization: Bearer <session token>` (client, `botctl`), or HTTP Basic with `AUTH_PASSWORD` while break-glass is on. Empty password requires `ALLOW_NO_AUTH=1` on loopback only. Each route needs a role permission (above); 401 without valid credentials, 403 when the role doesn't allow it. Bot routes also need access to that Bot: 404 for a Bot you can't see, 403 when you can see it but not do this.
@@ -247,6 +258,16 @@ Sign-ups ([ADR 0022](adr/0022-landing-and-signups.md)). Submitting and the confi
 - `POST /api/signups/:id/approve` `{role?, ttlMinutes?}` → `{signup, user, code, expiresAt, emailed: false, sso}`. 409 when decided already or the email is a user's
 - `POST /api/signups/:id/reject` `{reason?}`. 409 when decided already
 
+Per-user machines ([ADR 0025](adr/0025-control-plane-linode.md)). 503 when the control plane is off. Admin only, except `GET /api/machine`:
+
+- `GET /api/machine`: the caller's own machine `{id, tier, region, state, providerStatus, ipv4, backups, createdAt, updatedAt}`; 404 if none. Never anyone else's
+- `GET /api/machines?state=`: every machine, destroyed ones too, newest first
+- `GET /api/users/:id-or-email/machine`: the user's live machine `{id, userId, userEmail, provider, providerId, label, tier, plan, region, state, providerStatus, ipv4, backups, lastError, createdAt, createdBy, updatedAt, destroyedAt}`; 404 if none
+- `POST /api/users/:id-or-email/machine` `{tier?, region?}`: 202 on its way. Asking again returns the same machine (200); another tier or region is a 409 (resize instead). After an error, asking again retries. 502 `{error, machine}` if Linode refused; 409 for a disabled user
+- `POST /api/users/:id-or-email/machine/suspend`, `/resume`, `/resize` `{tier}`: 200 with the machine (a repeat changes nothing), 409 from the wrong state, 502 `{error, machine}` if Linode refused
+- `DELETE /api/users/:id-or-email/machine`: 200 once deleted at Linode, 202 while it retries
+- `POST /api/machines/reconcile` → `{checked, changed}`: one reconciler pass now
+
 Approvals, policy, and audit. Writes, decisions, the approvals list, and the audit log need a person (403 for the Bot token):
 
 - `GET /api/policy`: global policy, class names, global rules. `PUT /api/policy` `{mode?, timeoutMinutes?, classes?: {<class>: allow|ask|deny}}`
@@ -261,6 +282,6 @@ Approvals, policy, and audit. Writes, decisions, the approvals list, and the aud
 
 ## Not built yet
 
-Sign-up emails, self-serve SSO linking, and sign-up retention ([ADR 0022](adr/0022-landing-and-signups.md)). Vault/Key Vault/Secret Manager stores and master-key rotation (the `SecretStore` trait is ready for them), per-Bot resource limits, Slack. Approvals follow-ups are in [approvals-followups.md](approvals-followups.md).
+Sign-up emails, self-serve SSO linking, and sign-up retention ([ADR 0022](adr/0022-landing-and-signups.md)). Enrollment and mTLS with per-user machines, moving a user's Bots onto theirs, and `botctl machine` commands ([ADR 0025](adr/0025-control-plane-linode.md)). Vault/Key Vault/Secret Manager stores and master-key rotation (the `SecretStore` trait is ready for them), per-Bot resource limits, Slack. Approvals follow-ups are in [approvals-followups.md](approvals-followups.md).
 
 Computer use (each Bot's screen, browser, and live view) is in [computer.md](computer.md).
