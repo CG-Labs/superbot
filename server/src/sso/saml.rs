@@ -22,7 +22,7 @@ pub const LABEL: &str = "Company SSO";
 
 /// A SAML subject as identities store it: lowercase. Keycloak lowercases the IdP's name for
 /// the person before passing it on, so a link typed from the IdP's own records must match
-/// that. Keycloak itself can't tell apart two ids that differ only in case, so neither can we.
+/// that. Persistent NameIDs are random or directory ids; case never tells two people apart.
 pub fn subject(s: &str) -> String {
     s.to_lowercase()
 }
