@@ -213,6 +213,10 @@ mod tests {
             ("GET", "/api/signups/su1", Perm::Admin),
             ("POST", "/api/signups/su1/approve", Perm::Admin),
             ("POST", "/api/signups/su1/reject", Perm::Admin),
+            // SCIM tokens are admin-only; /scim/v2 has its own guard and never reaches classify.
+            ("GET", "/api/scim/tokens", Perm::Admin),
+            ("POST", "/api/scim/tokens", Perm::Admin),
+            ("DELETE", "/api/scim/tokens/st1", Perm::Admin),
             ("GET", "/api/auth/me", Perm::Account),
             ("POST", "/api/auth/logout", Perm::Account),
             ("GET", "/", Perm::Read),

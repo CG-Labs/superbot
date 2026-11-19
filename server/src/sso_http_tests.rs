@@ -100,6 +100,11 @@ pub(super) async fn mock_idp() -> Arc<Idp> {
 
 /// botd with one Entra provider (a fresh id per test, so their secrets don't mix) on `idp`.
 async fn serve(idp: &Idp, extra: &[(&str, &str)]) -> (u16, AppState, String, String) {
+    serve_with(idp, extra, |_| {}).await
+}
+
+/// `serve`, with Auth changed first.
+pub(super) async fn serve_with(idp: &Idp, extra: &[(&str, &str)], tweak: impl FnOnce(&mut Auth)) -> (u16, AppState, String, String) {
     let id = format!("e{}", random_hex(4));
     let up = id.to_ascii_uppercase();
     crate::secrets::global().put(&format!("SSO_{up}_CLIENT_SECRET"), &idp.secret).unwrap();
@@ -113,13 +118,18 @@ async fn serve(idp: &Idp, extra: &[(&str, &str)]) -> (u16, AppState, String, Str
     for (k, v) in extra {
         vars.insert(k.replace("{ID}", &up), v.to_string());
     }
-    let (port, app, admin) = serve_vars(vars).await;
+    let (port, app, admin) = serve_vars_with(vars, tweak).await;
     (port, app, admin, id)
 }
 
 /// botd with the SSO settings in `vars` (SSO_PUBLIC_URL defaults to botd's own address).
-pub(super) async fn serve_vars(mut vars: HashMap<String, String>) -> (u16, AppState, String) {
+pub(super) async fn serve_vars(vars: HashMap<String, String>) -> (u16, AppState, String) {
+    serve_vars_with(vars, |_| {}).await
+}
+
+async fn serve_vars_with(mut vars: HashMap<String, String>, tweak: impl FnOnce(&mut Auth)) -> (u16, AppState, String) {
     let (port, app, admin, _) = serve_app_with(|a| {
+        tweak(a);
         // The port is only known now, and the public URL must name it.
         let port = a.hosts[0].rsplit(':').next().unwrap().to_string();
         let public = vars.get("SSO_PUBLIC_URL").cloned().unwrap_or(format!("http://127.0.0.1:{port}")).replace("{PORT}", &port);

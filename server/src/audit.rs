@@ -200,8 +200,8 @@ const MAX_ARRAY: usize = 100;
 const SECRET_WORDS: [&str; 11] =
     ["password", "passwd", "secret", "token", "authorization", "cookie", "apikey", "api_key", "api-key", "private_key", "credential"];
 /// Prefixes of well-known API keys and tokens (OpenAI/Anthropic, GitHub, GitLab, Slack, AWS, Google, JWTs).
-const TOKEN_PREFIXES: [&str; 18] =
-    ["sk-", "sk_live_", "sk_test_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "glpat-", "xoxb-", "xoxp-", "AKIA", "AIza", "eyJ", "sbs_", "sbc_", "sbh_"];
+const TOKEN_PREFIXES: [&str; 19] =
+    ["sk-", "sk_live_", "sk_test_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "glpat-", "xoxb-", "xoxp-", "AKIA", "AIza", "eyJ", "sbs_", "sbc_", "sbh_", "sbp_"];
 
 fn secret_name(k: &str) -> bool {
     let k = k.to_ascii_lowercase();

@@ -415,6 +415,112 @@ fn identity_row(r: &Row) -> rusqlite::Result<Identity> {
     })
 }
 
+/// A SCIM bearer token (ADR 0023). Only its SHA-256 is stored. Every token belongs to
+/// a tenant: one IdP connection, whose users only its tokens can see.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScimToken {
+    pub id: String,
+    pub tenant: String,
+    pub label: Option<String>,
+    /// The SSO provider whose subjects this tenant's `externalId`s are (from SSO_PROVIDERS).
+    pub sso_provider: Option<String>,
+    pub created_at: i64,
+    pub created_by: Option<String>,
+    pub last_used_at: Option<i64>,
+    pub revoked_at: Option<i64>,
+    pub revoked_by: Option<String>,
+}
+
+fn scim_token_row(r: &Row) -> rusqlite::Result<ScimToken> {
+    Ok(ScimToken {
+        id: r.get("id")?,
+        tenant: r.get("tenant")?,
+        label: r.get("label")?,
+        sso_provider: r.get("sso_provider")?,
+        created_at: r.get("created_at")?,
+        created_by: r.get("created_by")?,
+        last_used_at: r.get("last_used_at")?,
+        revoked_at: r.get("revoked_at")?,
+        revoked_by: r.get("revoked_by")?,
+    })
+}
+
+/// A user as a SCIM tenant provisioned it: the SCIM attributes botd has no column for
+/// on `users`, and whether the IdP deleted it (users themselves are never deleted).
+#[derive(Clone, Debug)]
+pub struct ScimUser {
+    pub user: User,
+    pub tenant: String,
+    pub external_id: Option<String>,
+    pub user_name: String,
+    pub given_name: Option<String>,
+    pub family_name: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub deleted_at: Option<i64>,
+}
+
+/// The columns of a `users` row joined with its `scim_users` row, the SCIM ones prefixed.
+const SCIM_USER_SELECT: &str = "SELECT u.*, l.tenant AS scim_tenant, l.external_id AS scim_external_id, l.user_name AS scim_user_name,
+  l.given_name AS scim_given_name, l.family_name AS scim_family_name, l.created_at AS scim_created_at,
+  l.updated_at AS scim_updated_at, l.deleted_at AS scim_deleted_at
+  FROM scim_users l JOIN users u ON u.id = l.user_id";
+
+fn scim_user_row(r: &Row) -> rusqlite::Result<ScimUser> {
+    Ok(ScimUser {
+        user: user_row(r)?,
+        tenant: r.get("scim_tenant")?,
+        external_id: r.get("scim_external_id")?,
+        user_name: r.get("scim_user_name")?,
+        given_name: r.get("scim_given_name")?,
+        family_name: r.get("scim_family_name")?,
+        created_at: r.get("scim_created_at")?,
+        updated_at: r.get("scim_updated_at")?,
+        deleted_at: r.get("scim_deleted_at")?,
+    })
+}
+
+/// How a SCIM tenant looks users up: `userName` (any case) or `externalId` (exactly).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScimKey {
+    UserName(String),
+    ExternalId(String),
+}
+
+/// What SCIM sets on a user. Never the role.
+pub struct ScimFields<'a> {
+    pub user_name: &'a str,
+    pub external_id: Option<&'a str>,
+    pub given_name: Option<&'a str>,
+    pub family_name: Option<&'a str>,
+    pub display_name: &'a str,
+    pub email: Option<&'a str>,
+    pub active: bool,
+}
+
+/// Why a SCIM write was refused: something unique is someone else's already.
+#[derive(Debug, PartialEq)]
+pub enum ScimConflict {
+    Email,
+    UserName,
+    ExternalId,
+    Identity,
+    Db(String),
+}
+
+fn scim_conflict(e: rusqlite::Error) -> ScimConflict {
+    let msg = e.to_string();
+    match () {
+        _ if !constraint(&e) => ScimConflict::Db(msg),
+        _ if msg.contains("users.email") => ScimConflict::Email,
+        _ if msg.contains("external_id") => ScimConflict::ExternalId,
+        _ if msg.contains("user_name") => ScimConflict::UserName,
+        _ if msg.contains("user_identities") => ScimConflict::Identity,
+        _ => ScimConflict::Db(msg),
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum JitError {
     /// Another user has this email. Never merged by email: ask an admin to link instead.
@@ -539,8 +645,44 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 7] =
-    [migrate_approvals, migrate_audit_events, migrate_users, migrate_identities, migrate_bot_acls, migrate_audit_actors, migrate_signups];
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 8] =
+    [migrate_approvals, migrate_audit_events, migrate_users, migrate_identities, migrate_bot_acls, migrate_audit_actors, migrate_signups, migrate_scim];
+
+/// SCIM provisioning (ADR 0023): bearer tokens (hashes only), each in a tenant, and the
+/// users a tenant provisioned. One row per user: a user belongs to at most one tenant.
+/// `deleted_at` is a SCIM DELETE: the tenant can't see the user any more, but the user,
+/// disabled, and its audit history stay. Its `externalId` stays reserved, so the same
+/// person provisioned again gets the same user back. No ON DELETE: users are never deleted.
+fn migrate_scim(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS scim_tokens (
+          id TEXT PRIMARY KEY,
+          tenant TEXT NOT NULL,
+          label TEXT,
+          sso_provider TEXT,
+          token_hash TEXT NOT NULL UNIQUE,
+          created_at INTEGER NOT NULL,
+          created_by TEXT,
+          last_used_at INTEGER,
+          revoked_at INTEGER,
+          revoked_by TEXT
+        );
+        CREATE INDEX IF NOT EXISTS scim_tokens_tenant ON scim_tokens(tenant, created_at);
+        CREATE TABLE IF NOT EXISTS scim_users (
+          user_id TEXT PRIMARY KEY REFERENCES users(id),
+          tenant TEXT NOT NULL,
+          external_id TEXT,
+          user_name TEXT NOT NULL COLLATE NOCASE,
+          given_name TEXT,
+          family_name TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          deleted_at INTEGER
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS scim_users_external_id ON scim_users(tenant, external_id) WHERE external_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS scim_users_user_name ON scim_users(tenant, user_name) WHERE deleted_at IS NULL;",
+    )
+}
 
 /// Requests for access from the public sign-up form (ADR 0022). Consent is a column,
 /// not a flag in a blob: no row exists without it. `user_id` has no foreign key, like
@@ -1594,6 +1736,138 @@ impl Db {
             return Err(SignupError::Closed(s.status));
         }
         self.signup(id).ok_or(SignupError::NotFound)
+    }
+
+    // SCIM (ADR 0023). Callers hash tokens; nothing here sees one.
+
+    pub fn create_scim_token(&self, tenant: &str, label: Option<&str>, sso_provider: Option<&str>, token_hash: &str, by: Option<&str>) -> ScimToken {
+        let id = format!("st{}", crate::random_hex(4));
+        self.c()
+            .execute(
+                "INSERT INTO scim_tokens (id, tenant, label, sso_provider, token_hash, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![id, tenant, label, sso_provider, token_hash, now(), by],
+            )
+            .unwrap();
+        self.scim_token(&id).unwrap()
+    }
+
+    pub fn scim_token(&self, id: &str) -> Option<ScimToken> {
+        self.c().query_row("SELECT * FROM scim_tokens WHERE id = ?", [id], scim_token_row).optional().ok().flatten()
+    }
+
+    /// Newest first, revoked ones too.
+    pub fn scim_tokens(&self) -> Vec<ScimToken> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM scim_tokens ORDER BY created_at DESC, id").unwrap();
+        s.query_map([], scim_token_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// The SSO provider a tenant's first token named: every later token must name the same.
+    pub fn scim_tenant_sso(&self, tenant: &str) -> Option<Option<String>> {
+        self.c()
+            .query_row("SELECT sso_provider FROM scim_tokens WHERE tenant = ? ORDER BY created_at, id LIMIT 1", [tenant], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// The unrevoked token with this hash. Records use, at most once a minute.
+    pub fn live_scim_token(&self, token_hash: &str, at: i64) -> Option<ScimToken> {
+        let t = self.c().query_row("SELECT * FROM scim_tokens WHERE token_hash = ? AND revoked_at IS NULL", [token_hash], scim_token_row).optional().ok().flatten()?;
+        let _ = self.c().execute("UPDATE scim_tokens SET last_used_at = ?1 WHERE id = ?2 AND coalesce(last_used_at, 0) <= ?1 - 60000", params![at, t.id]);
+        Some(t)
+    }
+
+    /// False if it was already revoked or doesn't exist.
+    pub fn revoke_scim_token(&self, id: &str, by: &str) -> bool {
+        self.c().execute("UPDATE scim_tokens SET revoked_at = ?, revoked_by = ? WHERE id = ? AND revoked_at IS NULL", params![now(), by, id]).unwrap_or(0) == 1
+    }
+
+    /// Which tenant manages a user, if any, deleted or not.
+    pub fn scim_user_of(&self, user_id: &str) -> Option<ScimUser> {
+        self.c().query_row(&format!("{SCIM_USER_SELECT} WHERE l.user_id = ?"), [user_id], scim_user_row).optional().ok().flatten()
+    }
+
+    /// A user the tenant manages and hasn't deleted.
+    pub fn scim_user(&self, tenant: &str, user_id: &str) -> Option<ScimUser> {
+        self.c()
+            .query_row(&format!("{SCIM_USER_SELECT} WHERE l.tenant = ? AND l.user_id = ? AND l.deleted_at IS NULL"), [tenant, user_id], scim_user_row)
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// By `externalId`, deleted users included (re-provisioning finds them); by `userName`, live ones only.
+    pub fn scim_find(&self, tenant: &str, key: &ScimKey) -> Option<ScimUser> {
+        let (clause, v) = match key {
+            ScimKey::ExternalId(v) => ("l.external_id = ?2", v),
+            ScimKey::UserName(v) => ("l.user_name = ?2 AND l.deleted_at IS NULL", v),
+        };
+        self.c().query_row(&format!("{SCIM_USER_SELECT} WHERE l.tenant = ?1 AND {clause}"), params![tenant, v], scim_user_row).optional().ok().flatten()
+    }
+
+    /// A page of the tenant's live users, oldest first, and how many match in all.
+    pub fn scim_list(&self, tenant: &str, key: Option<&ScimKey>, offset: i64, limit: i64) -> (i64, Vec<ScimUser>) {
+        let (col, v) = match key {
+            None => ("l.user_name", None),
+            Some(ScimKey::UserName(v)) => ("l.user_name", Some(v)),
+            Some(ScimKey::ExternalId(v)) => ("l.external_id", Some(v)),
+        };
+        let c = self.c();
+        let filter = format!("WHERE l.tenant = ?1 AND l.deleted_at IS NULL AND (?2 IS NULL OR {col} = ?2)");
+        let total: i64 = c.query_row(&format!("SELECT count(*) FROM scim_users l {filter}"), params![tenant, v], |r| r.get(0)).unwrap_or(0);
+        let mut s = c.prepare(&format!("{SCIM_USER_SELECT} {filter} ORDER BY l.created_at, l.user_id LIMIT ?3 OFFSET ?4")).unwrap();
+        let list = s.query_map(params![tenant, v, limit, offset], scim_user_row).unwrap().filter_map(Result::ok).collect();
+        (total, list)
+    }
+
+    fn write_scim_user(tx: &Connection, tenant: &str, user_id: &str, f: &ScimFields, at: i64) -> rusqlite::Result<()> {
+        tx.execute(
+            "UPDATE users SET email = ?, display_name = ?, status = ?, updated_at = ? WHERE id = ?",
+            params![f.email, f.display_name, if f.active { "active" } else { "disabled" }, at, user_id],
+        )?;
+        tx.execute(
+            "INSERT INTO scim_users (user_id, tenant, external_id, user_name, given_name, family_name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+             ON CONFLICT (user_id) DO UPDATE SET tenant = ?2, external_id = ?3, user_name = ?4, given_name = ?5, family_name = ?6, updated_at = ?7, deleted_at = NULL",
+            params![user_id, tenant, f.external_id, f.user_name, f.given_name, f.family_name, at],
+        )?;
+        Ok(())
+    }
+
+    /// A new user made by a SCIM tenant, with its SSO identity when the tenant links one.
+    /// All of it or none.
+    pub fn create_scim_user(&self, tenant: &str, f: &ScimFields, role: Role, identity: Option<&NewIdentity>) -> Result<User, ScimConflict> {
+        let id = format!("u{}", crate::short_id());
+        {
+            let c = self.c();
+            let tx = c.unchecked_transaction().map_err(scim_conflict)?;
+            Self::insert_user(&tx, &id, f.email, f.display_name, role).map_err(scim_conflict)?;
+            Self::write_scim_user(&tx, tenant, &id, f, now()).map_err(scim_conflict)?;
+            if let Some(i) = identity {
+                Self::insert_identity(&tx, &id, i).map_err(scim_conflict)?;
+            }
+            tx.commit().map_err(scim_conflict)?;
+        }
+        self.user(&id).ok_or_else(|| ScimConflict::Db("user not saved".into()))
+    }
+
+    /// Sets what SCIM manages on an existing user: an update, a user provisioned again
+    /// after a DELETE, or one the tenant takes on through its linked SSO identity.
+    pub fn save_scim_user(&self, tenant: &str, user_id: &str, f: &ScimFields) -> Result<(), ScimConflict> {
+        let c = self.c();
+        let tx = c.unchecked_transaction().map_err(scim_conflict)?;
+        Self::write_scim_user(&tx, tenant, user_id, f, now()).map_err(scim_conflict)?;
+        tx.commit().map_err(scim_conflict)
+    }
+
+    /// A SCIM DELETE: the user is disabled and hidden from the tenant, never removed.
+    pub fn delete_scim_user(&self, tenant: &str, user_id: &str) -> bool {
+        let c = self.c();
+        let Ok(tx) = c.unchecked_transaction() else { return false };
+        let at = now();
+        let n = tx.execute("UPDATE scim_users SET deleted_at = ?, updated_at = ? WHERE tenant = ? AND user_id = ? AND deleted_at IS NULL", params![at, at, tenant, user_id]).unwrap_or(0);
+        let ok = n == 1 && tx.execute("UPDATE users SET status = 'disabled', updated_at = ? WHERE id = ?", params![at, user_id]).is_ok();
+        ok && tx.commit().is_ok()
     }
 
     /// Spends a sign-in code: once, before it expires, for an active user. Returns the user.
