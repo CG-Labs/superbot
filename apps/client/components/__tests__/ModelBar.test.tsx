@@ -23,3 +23,18 @@ it("lets the user type a model when the harness takes any model name", async () 
     expect.objectContaining({ model: "anthropic/claude-sonnet-4" }),
   );
 });
+
+it("doesn't carry typed text to another Bot", async () => {
+  const user = userEvent.setup();
+  mockCtx.fetchModels.mockResolvedValue([
+    { id: "", label: "Default model", efforts: [] },
+  ]);
+  const view = await render(<ModelBar botId="b1" harness="hermes" />);
+  await user.type(await screen.findByLabelText("Model"), "half-typed");
+
+  await view.rerender(<ModelBar botId="b2" harness="hermes" />);
+  const field = screen.getByLabelText("Model");
+  expect(field.props.value).toBe("");
+  await user.type(field, "{Enter}", { submitEditing: true });
+  expect(mockCtx.patchBot).not.toHaveBeenCalledWith("b2", expect.anything());
+});

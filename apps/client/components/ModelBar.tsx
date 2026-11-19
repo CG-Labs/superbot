@@ -20,8 +20,9 @@ export function ModelBar({ botId, harness, model, effort }: Props) {
     void fetchModels(harness).then(setModels);
   }, [harness, fetchModels]);
 
-  const [typed, setTyped] = useState(model || "");
-  useEffect(() => setTyped(model || ""), [model]);
+  // Typed text belongs to one Bot, so switching Bots never shows or saves another's.
+  const [draft, setDraft] = useState({ botId, model, text: model || "" });
+  const typed = draft.botId === botId && draft.model === model ? draft.text : model || "";
 
   const allEfforts = [...new Set(models.flatMap((m) => m.efforts))];
   // An entry without an id: the harness takes any model name, so it is typed, not picked.
@@ -48,11 +49,12 @@ export function ModelBar({ botId, harness, model, effort }: Props) {
   const saveTyped = () => {
     if (typed.trim() !== (model || "")) void onModel(typed.trim());
   };
+  const onType = (text: string) => setDraft({ botId, model, text });
   const modelField = (
     <TextInput
       style={[styles.picker, styles.input]}
       value={typed}
-      onChangeText={setTyped}
+      onChangeText={onType}
       onSubmitEditing={saveTyped}
       onBlur={saveTyped}
       placeholder="Default model"
