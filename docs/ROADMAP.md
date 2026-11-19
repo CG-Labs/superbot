@@ -41,7 +41,7 @@ What exists in **CG-Labs/superbot** today:
 | **Auth** | Single `AUTH_PASSWORD` (Basic); optional `ALLOW_NO_AUTH` on loopback only; `ALLOWED_HOSTS`; per-start `BOT_TOKEN` for `botctl`. No user table, no SSO, no RBAC. |
 | **Client** | Login, SSE chat, bots CRUD, models/effort, routines **enable/disable only**; no screen viewer, handoff UI, routine editor, push, or biometric lock; placeholder EAS `projectId`; template branding. |
 | **Server** | SQLite single-tenant schema; harnesses run with **permission bypass** (`--dangerously-skip-permissions` / Codex equivalents); approvals and Vault **not built** (`docs/backend.md`). |
-| **Deploy** | Ubuntu bash installer, systemd, Caddy, daily SQLite backup timer; **no** Dockerfile / Compose in repo (Docker referenced in architecture drafts only). |
+| **Deploy** | Ubuntu bash installer, systemd, Caddy, daily SQLite backup timer; Docker Compose (`Dockerfile` + `deploy/docker/`: `botd`, Caddy, backup sidecar), smoke-tested in CI ([ADR 0006](adr/0006-docker-compose.md)). |
 | **Multi-tenancy** | One deployment = one org in practice (`DATA_DIR`, shared `WORKSPACE_DIR`). |
 | **Observability** | `journalctl`, healthz; no metrics/tracing product. |
 | **Compliance** | None; MIT license at repo root (see [Licensing & upstream](#licensing--upstream)). |
@@ -182,7 +182,7 @@ Basic auth may remain for **break-glass** and **self-host hobby** tiers only, be
 | Mode | Today | Target |
 |------|--------|--------|
 | **Bash VPS installer** | Ubuntu 22/04 | Maintain, Hardened CIS-aligned option |
-| **Docker Compose** | Not in repo | M1 — official compose (addresses upstream **#7** class ask) |
+| **Docker Compose** | **Supported** (M1 ✓): [`deploy/docker/`](../deploy/docker/), [docs](../deploy/README.md#docker-compose-supported) | Published registry image; screens/computer use in the image |
 | **Managed cloud** | None | M3 control plane, M4 SLA |
 | **Air-gapped** | Possible manual | M5 docs + license |
 
