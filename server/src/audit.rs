@@ -2,7 +2,7 @@
 //! triggers refuse UPDATE, and DELETE of anything younger than the retention
 //! window (`AUDIT_RETENTION_DAYS`). Never put secrets or message bodies in an
 //! event; `details` is scrubbed on write as a second line of defense.
-//! Design: docs/adr/0008-audit-events.md.
+//! Design: docs/adr/0009-audit-events.md.
 
 use crate::db::{now, AuditEvent};
 use crate::runner::App;

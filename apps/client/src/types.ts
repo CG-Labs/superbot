@@ -29,6 +29,8 @@ export interface BotView {
   primary: boolean;
   hidden: boolean;
   unread: boolean;
+  /** Id of the Bot's handoff card the user hasn't answered yet. */
+  handoff?: number | null;
   preview?: string;
   working: boolean;
   status?: string;
@@ -90,6 +92,8 @@ export interface Routine {
   cron: string;
   instruction: string;
   enabled: boolean;
+  last_run_at?: number | null;
+  created_at?: number;
 }
 
 export type SseEvent =

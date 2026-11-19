@@ -10,16 +10,22 @@ import {
   View,
 } from "react-native";
 import Markdown from "react-native-markdown-display";
+import { showError } from "../src/dialogs";
+import { isOpenHandoff } from "../src/handoff";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
 import type { Message } from "../src/types";
 import { ApprovalCard } from "./ApprovalsInbox";
 import { BotAvatar } from "./BotAvatar";
+import { HandoffBanner } from "./HandoffBanner";
 import { ModelBar } from "./ModelBar";
 
 interface Props {
   onOpenDetails: () => void;
   onBack?: () => void;
+  /** Opens the Bot's live screen; `takeOver` starts with control (from a handoff). */
+  onToggleScreen: (takeOver?: boolean) => void;
+  screenOpen?: boolean;
 }
 
 function formatTime(ts: number): string {
@@ -27,14 +33,16 @@ function formatTime(ts: number): string {
   return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 }
 
-export function ChatView({ onOpenDetails, onBack }: Props) {
+export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen }: Props) {
   const {
     bots,
     activeId,
     messages,
     drafts,
+    handoffs,
     loadMessages,
     sendText,
+    answerQuestion,
     stopBot,
     approvals,
   } = useSuperBot();
@@ -60,6 +68,9 @@ export function ChatView({ onOpenDetails, onBack }: Props) {
 
   const list = messages[bot.id] || [];
   const draft = drafts[bot.id];
+  const handoff = handoffs[bot.id];
+
+  const answer = (m: Message, option: number) => void answerQuestion(m, option).catch(showError);
 
   const onSend = () => {
     const t = text.trim();
@@ -88,12 +99,24 @@ export function ChatView({ onOpenDetails, onBack }: Props) {
               {item.question ? (
                 <View style={styles.question}>
                   <Text style={styles.qTitle}>{item.question.title}</Text>
+                  {isOpenHandoff(item) ? (
+                    <Pressable
+                      role="button"
+                      aria-label="Open screen"
+                      style={styles.openScreen}
+                      onPress={() => onToggleScreen(true)}
+                    >
+                      <Text style={styles.openScreenText}>Open screen</Text>
+                    </Pressable>
+                  ) : null}
                   {item.question.options.map((opt, k) => (
                     <Pressable
                       key={k}
+                      role="button"
+                      aria-label={opt}
                       style={[styles.opt, item.question?.picked === k && styles.optOn]}
                       disabled={item.question?.picked != null}
-                      onPress={() => void sendText(opt, { messageId: item.id, option: k })}
+                      onPress={() => answer(item, k)}
                     >
                       <Text style={styles.optText}>{opt}</Text>
                     </Pressable>
@@ -148,7 +171,19 @@ export function ChatView({ onOpenDetails, onBack }: Props) {
           <Text style={styles.pillName}>{bot.name}</Text>
           <Text style={styles.harness}>{bot.harness}</Text>
         </Pressable>
+        <Pressable
+          role="button"
+          aria-label={screenOpen ? "Hide screen" : "Show screen"}
+          aria-pressed={!!screenOpen}
+          style={[styles.screenBtn, screenOpen && styles.screenBtnOn]}
+          onPress={() => onToggleScreen()}
+        >
+          <Text style={styles.screenBtnText}>Screen</Text>
+        </Pressable>
       </View>
+      {handoff ? (
+        <HandoffBanner botName={bot.name} handoff={handoff} onOpenScreen={() => onToggleScreen(true)} />
+      ) : null}
       {loading ? (
         <ActivityIndicator style={{ marginTop: 24 }} color={colors.textDim} />
       ) : (
@@ -205,6 +240,9 @@ const styles = StyleSheet.create({
   pill: { flexDirection: "row", alignItems: "center", gap: 8, flex: 1 },
   pillName: { color: colors.text, fontSize: 16, fontWeight: "600" },
   harness: { color: colors.textFaint, fontSize: 13 },
+  screenBtn: { backgroundColor: colors.bgBubble, borderRadius: 999, paddingHorizontal: 14, paddingVertical: 6 },
+  screenBtnOn: { backgroundColor: colors.bgActive, borderWidth: 1, borderColor: colors.blue },
+  screenBtnText: { color: colors.text, fontSize: 14 },
   messages: { padding: 12, paddingBottom: 24 },
   ts: { color: colors.textFaint, textAlign: "center", marginVertical: 10, fontSize: 13 },
   routine: { color: colors.textFaint, textAlign: "center", marginVertical: 6, fontSize: 13 },
@@ -229,6 +267,15 @@ const styles = StyleSheet.create({
     padding: 10,
   },
   optOn: { borderColor: colors.blue },
+  openScreen: {
+    alignSelf: "flex-start",
+    backgroundColor: colors.blue,
+    borderRadius: 999,
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+    marginBottom: 2,
+  },
+  openScreenText: { color: "#fff", fontWeight: "600" },
   optText: { color: colors.text },
   working: {
     flexDirection: "row",

@@ -643,7 +643,7 @@ document.addEventListener("change", (e) => {
   const card = e.target.closest(".ap-remember") && e.target.closest(".approval");
   if (card) e.target.checked ? remembered.add(card.dataset.approval) : remembered.delete(card.dataset.approval);
 });
-// Audit log: append-only record of sign-ins and admin actions (docs/adr/0008-audit-events.md).
+// Audit log: append-only record of sign-ins and admin actions (docs/adr/0009-audit-events.md).
 // `query` is the filter the shown rows came from; Load more pages with it, not the form.
 const audit = { events: [], next: null, query: "", error: "", seq: 0 };
 

@@ -219,6 +219,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
 
 // Errors
 
+#[derive(Debug)]
 struct ApiError(StatusCode, String);
 
 impl IntoResponse for ApiError {
@@ -743,6 +744,10 @@ async fn screen_info(State(app): State<AppState>, Path(id): Path<String>) -> Res
     let screens = app.screens.as_ref().filter(|_| screen::on_path("voxl")).ok_or_else(off)?;
     let info = screens.ensure(&id, |b| app.is_running(b)).await;
     let info = info.ok_or_else(|| ApiError(StatusCode::SERVICE_UNAVAILABLE, "All screens are in use. Try again when a Bot finishes.".into()))?;
+    // A frame loaded before voxl listens gets the proxy's 502 and stays blank, so only hand out a link that works.
+    if !screen::wait_for_port(info.port, 50).await {
+        return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "The screen is still starting. Try again in a moment.".into()));
+    }
     // The proxy in front serves /screen/<port>/ from that local voxl port.
     Ok(Json(json!({ "url": format!("/screen/{}/?token={}", info.port, info.token) })))
 }
@@ -767,15 +772,52 @@ async fn list_routines(State(app): State<AppState>, Path(id): Path<String>) -> R
     Ok(Json(json!(app.db.routines(Some(&id)))))
 }
 
+/// Routine fields from a create or edit body. Absent fields are None; present ones
+/// must be non-empty strings (trimmed), a valid cron, and a boolean `enabled`.
+#[derive(Debug, Default, PartialEq)]
+struct RoutineFields {
+    name: Option<String>,
+    cron: Option<String>,
+    instruction: Option<String>,
+    enabled: Option<bool>,
+}
+
+fn routine_fields(v: &Value) -> Res<RoutineFields> {
+    let text = |key: &str, max: usize| -> Res<Option<String>> {
+        match v.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) if !s.trim().is_empty() => Ok(Some(s.trim().chars().take(max).collect())),
+            Some(_) => Err(bad(format!("{key} can't be empty"))),
+        }
+    };
+    let f = RoutineFields {
+        name: text("name", 100)?,
+        cron: text("cron", 100)?,
+        instruction: text("instruction", 100_000)?,
+        enabled: match v.get("enabled") {
+            None | Some(Value::Null) => None,
+            Some(Value::Bool(b)) => Some(*b),
+            Some(_) => return Err(bad("enabled must be true or false")),
+        },
+    };
+    if let Some(c) = &f.cron {
+        cron::parse(c).map_err(bad)?;
+    }
+    Ok(f)
+}
+
 async fn create_routine(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
     need_bot(&app, &id)?;
-    let field = |k: &str| v[k].as_str().map(str::trim).filter(|s| !s.is_empty());
-    let (Some(name), Some(cron_expr), Some(instruction)) = (field("name"), field("cron"), field("instruction")) else {
+    let f = routine_fields(&v)?;
+    let (Some(name), Some(cron_expr), Some(instruction)) = (f.name, f.cron, f.instruction) else {
         return Err(bad("name, cron, and instruction are required"));
     };
-    cron::parse(cron_expr).map_err(bad)?;
-    let r = app.db.add_routine(&id, name, cron_expr, instruction);
-    app.db.record(&by.event("routine.created").target("routine", &r.id).bot(&id).details(json!({ "name": r.name, "cron": r.cron })));
+    let r = app.db.add_routine(&id, &name, &cron_expr, &instruction);
+    if f.enabled == Some(false) {
+        app.db.update_routine(&r.id, None, None, None, Some(false));
+    }
+    let r = app.db.routine(&r.id).ok_or_else(|| not_found("Routine"))?;
+    app.db.record(&by.event("routine.created").target("routine", &r.id).bot(&id).details(json!({ "name": r.name, "cron": r.cron, "enabled": r.enabled })));
     Ok((StatusCode::CREATED, Json(json!(r))))
 }
 
@@ -806,11 +848,8 @@ fn routine_events(by: &Who, before: &db::Routine, after: &db::Routine) -> Vec<Ev
 
 async fn update_routine(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
     let before = app.db.routine(&id).ok_or_else(|| not_found("Routine"))?;
-    let cron_expr = v["cron"].as_str();
-    if let Some(c) = cron_expr {
-        cron::parse(c).map_err(bad)?;
-    }
-    app.db.update_routine(&id, v["name"].as_str(), cron_expr, v["instruction"].as_str(), v["enabled"].as_bool());
+    let f = routine_fields(&v)?;
+    app.db.update_routine(&id, f.name.as_deref(), f.cron.as_deref(), f.instruction.as_deref(), f.enabled);
     let after = app.db.routine(&id).ok_or_else(|| not_found("Routine"))?;
     for e in routine_events(&by, &before, &after) {
         app.db.record(&e);
@@ -1430,6 +1469,152 @@ mod tests {
         }
         let (_, list) = call(port, "GET", "/api/approvals?status=pending", &user, "").await;
         assert_eq!(list.trim(), "[]", "refused without asking");
+    }
+
+    #[test]
+    fn routine_fields_validate_and_trim() {
+        let f = routine_fields(&json!({ "name": "  Digest ", "cron": "0 9 * * 1-5", "instruction": " Sum up email ", "enabled": false })).unwrap();
+        assert_eq!(
+            f,
+            RoutineFields { name: Some("Digest".into()), cron: Some("0 9 * * 1-5".into()), instruction: Some("Sum up email".into()), enabled: Some(false) }
+        );
+        assert_eq!(routine_fields(&json!({})).unwrap(), RoutineFields::default());
+        assert_eq!(routine_fields(&json!({ "name": null })).unwrap(), RoutineFields::default());
+        assert!(routine_fields(&json!({ "name": "   " })).is_err());
+        assert!(routine_fields(&json!({ "instruction": "" })).is_err());
+        assert!(routine_fields(&json!({ "name": 5 })).is_err());
+        assert!(routine_fields(&json!({ "cron": "61 * * * *" })).is_err());
+        assert!(routine_fields(&json!({ "cron": "* * *" })).is_err());
+        assert!(routine_fields(&json!({ "enabled": "no" })).is_err());
+        let long = routine_fields(&json!({ "name": "x".repeat(500) })).unwrap();
+        assert_eq!(long.name.unwrap().len(), 100);
+    }
+
+    async fn serve_routines() -> (u16, Arc<App>, String, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("botd-test-{}", random_hex(6)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("app.sqlite")).unwrap();
+        let app = App::new(db, Config {
+            data_dir: dir.clone(),
+            workspace: dir.clone(),
+            user_name: "the user".into(),
+            bin_dir: dir.clone(),
+            api_url: "http://127.0.0.1:0".into(),
+            bot_token: "bot-token".into(),
+            run_timeout: Duration::from_secs(60),
+            default_harness: "claude".into(),
+        }, None);
+        let bot = app.db.create_bot("Tester", "#f5f5f5", "waddle", "claude", None, true);
+        let router = Router::new()
+            .route("/api/bots/{id}/routines", get(list_routines).post(create_routine))
+            .route("/api/routines/{id}", patch(update_routine).delete(delete_routine))
+            .layer(Extension(Who { actor: Actor::operator(), source: Source::default() }))
+            .with_state(app.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (port, app, bot.id, dir)
+    }
+
+    async fn call_json(port: u16, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+        let (code, res) = call(port, method, path, "", &body.map(|b| b.to_string()).unwrap_or_default()).await;
+        (code, serde_json::from_str(&res).unwrap_or(Value::Null))
+    }
+
+    #[tokio::test]
+    async fn routine_create_edit_delete() {
+        let (port, app, bot, dir) = serve_routines().await;
+        let base = format!("/api/bots/{bot}/routines");
+
+        let (code, _) = call_json(port, "POST", &base, Some(json!({ "name": "", "cron": "0 9 * * *", "instruction": "x" }))).await;
+        assert_eq!(code, 400);
+        let (code, _) = call_json(port, "POST", &base, Some(json!({ "name": "A", "cron": "nope", "instruction": "x" }))).await;
+        assert_eq!(code, 400);
+        let (code, _) = call_json(port, "POST", "/api/bots/missing/routines", Some(json!({ "name": "A", "cron": "0 9 * * *", "instruction": "x" }))).await;
+        assert_eq!(code, 404);
+
+        let (code, r) = call_json(port, "POST", &base, Some(json!({ "name": " Digest ", "cron": "0 9 * * *", "instruction": "Sum up" }))).await;
+        assert_eq!(code, 201);
+        assert_eq!(r["name"], "Digest");
+        assert_eq!(r["enabled"], true);
+        let id = r["id"].as_str().unwrap().to_string();
+        let path = format!("/api/routines/{id}");
+
+        let (code, paused) = call_json(port, "POST", &base, Some(json!({ "name": "B", "cron": "0 9 * * *", "instruction": "y", "enabled": false }))).await;
+        assert_eq!(code, 201);
+        assert_eq!(paused["enabled"], false);
+
+        let (code, _) = call_json(port, "PATCH", &path, Some(json!({ "name": "   " }))).await;
+        assert_eq!(code, 400);
+        let (code, _) = call_json(port, "PATCH", &path, Some(json!({ "cron": "99 * * * *" }))).await;
+        assert_eq!(code, 400);
+        assert_eq!(app.db.routine(&id).unwrap().name, "Digest");
+        assert_eq!(app.db.routine(&id).unwrap().cron, "0 9 * * *");
+
+        let edit = json!({ "name": " Weekday digest ", "cron": "30 8 * * 1-5", "instruction": "Sum up email", "enabled": false });
+        let (code, r) = call_json(port, "PATCH", &path, Some(edit)).await;
+        assert_eq!(code, 200);
+        assert_eq!(r["name"], "Weekday digest");
+        assert_eq!(r["cron"], "30 8 * * 1-5");
+        assert_eq!(r["instruction"], "Sum up email");
+        assert_eq!(r["enabled"], false);
+
+        let (code, list) = call_json(port, "GET", &base, None).await;
+        assert_eq!(code, 200);
+        assert_eq!(list.as_array().unwrap().len(), 2);
+
+        let (code, _) = call_json(port, "DELETE", &path, None).await;
+        assert_eq!(code, 200);
+        assert!(app.db.routine(&id).is_none());
+        let (code, _) = call_json(port, "PATCH", &path, Some(json!({ "enabled": true }))).await;
+        assert_eq!(code, 404);
+        let (code, _) = call_json(port, "DELETE", &path, None).await;
+        assert_eq!(code, 404);
+
+        let events = app.db.audit_events(&audit::Filter { actions: vec!["routine.*".into()], ..Default::default() }, 100, true);
+        let seen: Vec<(&str, Option<&str>)> = events.iter().map(|e| (e.action.as_str(), e.target_id.as_deref())).collect();
+        let paused_id = paused["id"].as_str();
+        assert_eq!(
+            seen,
+            [
+                ("routine.created", Some(id.as_str())),
+                ("routine.created", paused_id),
+                ("routine.disabled", Some(id.as_str())),
+                ("routine.updated", Some(id.as_str())),
+                ("routine.deleted", Some(id.as_str())),
+            ],
+            "rejected and missing-routine requests are not logged"
+        );
+        assert!(events.iter().all(|e| e.actor_id.as_deref() == Some("operator") && e.bot_id.as_deref() == Some(bot.as_str())));
+        assert_eq!(events[1].details["enabled"], false);
+        assert_eq!(events[3].details["changes"]["instruction"], "changed", "the instruction text is not logged");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn bot_view_reports_the_open_handoff() {
+        let (_, app, bot, dir) = serve_routines().await;
+        let card = |title: &str| json!({ "title": title, "options": ["Done", "I can't right now"], "handoff": true });
+        let view = |app: &App| app.bot_view(&app.db.bot(&bot).unwrap())["handoff"].clone();
+        assert_eq!(view(&app), Value::Null);
+
+        app.db.add_message(&bot, "bot", "", Some(&json!({ "title": "Pick", "options": ["A", "B"] })), false, None);
+        assert_eq!(view(&app), Value::Null);
+
+        let first = app.db.add_message(&bot, "bot", "", Some(&card("Log in")), false, None);
+        assert_eq!(view(&app), json!(first.id));
+        app.db.add_message(&bot, "user", "later", None, false, None);
+        assert_eq!(view(&app), Value::Null);
+
+        let second = app.db.add_message(&bot, "bot", "", Some(&card("2FA")), false, None);
+        assert_eq!(view(&app), json!(second.id));
+        let mut q = card("2FA");
+        q["picked"] = json!(0);
+        app.db.set_question(second.id, &q);
+        assert_eq!(view(&app), Value::Null);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
