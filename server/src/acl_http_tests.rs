@@ -1,4 +1,4 @@
-//! HTTP tests for Bot ACLs (ADR 0016), on the real router: who can see, run, and
+//! HTTP tests for Bot ACLs (ADR 0017), on the real router: who can see, run, and
 //! manage which Bot, what they get in lists and the live stream, and the audit trail.
 
 use crate::tests::{audit_list, call, call_with, serve_app};
@@ -192,7 +192,7 @@ async fn approvals_follow_bot_access() {
 
     assert!(ids(&call(port, "GET", "/api/approvals", &c, "").await.1).is_empty());
     assert!(parse(&call(port, "GET", "/api/state", &c, "").await.1)["approvals"].as_array().unwrap().is_empty());
-    assert_eq!(ids(&call(port, "GET", "/api/approvals", &b, "").await.1), [ap.id.clone()]);
+    assert_eq!(ids(&call(port, "GET", "/api/approvals", &b, "").await.1), [ap.id.as_str()]);
     let approve = format!("/api/approvals/{}/approve", ap.id);
     assert_eq!(got(port, "POST", &approve, &c, "{}").await, Got::Hidden);
     assert_eq!(got(port, "POST", &approve, &b, "{}").await, Got::Forbidden, "viewers can't answer");
