@@ -96,11 +96,18 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 dc exec -T backup sh -c 'ls /backups/superbot-*.tar.gz' >/dev/null || fail "no archive in /backups"
+
+log "Manual backups from botd share the volume and do not collide with the backup service"
 before=$(dc exec -T backup sh -c 'ls /backups/superbot-*.tar.gz | wc -l')
-sleep 1
-dc exec -T botd superbot-backup
+dc exec -T botd superbot-backup &
+manual_pid=$!
+dc exec -T backup superbot-backup
+wait "$manual_pid" || fail "manual backup in botd failed"
 after=$(dc exec -T backup sh -c 'ls /backups/superbot-*.tar.gz | wc -l')
-[[ "$after" -gt "$before" ]] || fail "manual 'exec botd superbot-backup' did not land in the backups volume"
+[[ "$after" -eq $((before + 2)) ]] || fail "expected 2 new archives in the backups volume, got $((after - before))"
+# shellcheck disable=SC2016
+dc exec -T backup sh -c 'for f in /backups/superbot-*.tar.gz; do tar -tzf "$f" | grep -qx app.sqlite || exit 1; done' \
+  || fail "a backup archive is damaged"
 
 log "SSE events stream through Caddy without buffering"
 curl -sN --max-time 5 "${AUTH[@]}" "$BASE/api/events" >"$WORK/events.txt" &

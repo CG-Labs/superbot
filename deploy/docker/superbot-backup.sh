@@ -33,17 +33,27 @@ archive() {
   return "$status"
 }
 
-# Explicit returns: callers use `||`, which turns off set -e inside.
+# The backup sidecar and `docker compose exec botd superbot-backup` share BACKUP_DIR, so runs
+# take a lock on it and never reuse a file name. Explicit exits: callers use `||`, which turns off set -e.
 backup_to_dir() {
-  local stamp dest partial
-  stamp=$(date -u +%Y%m%d-%H%M%S)
-  dest="$BACKUP_DIR/superbot-$stamp.tar.gz"
-  partial="$BACKUP_DIR/.partial-$stamp.tar.gz"
   mkdir -p "$BACKUP_DIR" || return
-  archive "$partial" || { rm -f "$partial"; return 1; }
-  mv "$partial" "$dest" || return
-  find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -name 'superbot-*.tar.gz' -mtime "+$RETENTION_DAYS" -delete || return
-  log "wrote $dest"
+  (
+    flock -w 600 9 || { log "timed out waiting for $BACKUP_DIR/.lock"; exit 1; }
+    stamp=$(date -u +%Y%m%d-%H%M%S)
+    dest="$BACKUP_DIR/superbot-$stamp.tar.gz"
+    n=1
+    while [[ -e "$dest" ]]; do
+      dest="$BACKUP_DIR/superbot-$stamp-$n.tar.gz"
+      n=$((n + 1))
+    done
+    partial=$(mktemp "$BACKUP_DIR/.partial-XXXXXXXX") || exit 1
+    archive "$partial" || { rm -f "$partial"; exit 1; }
+    mv "$partial" "$dest" || exit 1
+    find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 \
+      \( \( -name 'superbot-*.tar.gz' -mtime "+$RETENTION_DAYS" \) -o \( -name '.partial-*' -mmin +1440 \) \) \
+      -delete || exit 1
+    log "wrote $dest"
+  ) 9>"$BACKUP_DIR/.lock"
 }
 
 case "${1:-}" in
