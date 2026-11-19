@@ -55,6 +55,12 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    Make the user (member by default) and print a
                                                    one-time sign-in code, once (default 3 days)
   botctl signup reject <id> [--reason "<text>"]    No email is sent either way
+  botctl scim tokens                               SCIM tokens (never their values), and whether SCIM is on
+  botctl scim token create <tenant> [--sso <provider>] [--label "<text>"]
+                                                   A bearer token for an IdP's SCIM app, shown once.
+                                                   <tenant> names the IdP connection (e.g. entra);
+                                                   --sso: externalId is the person's subject there
+  botctl scim token revoke <id>                    The IdP's users stay as they are
   botctl sessions [<user>]                         Live sessions
   botctl session revoke <id>
   botctl session revoke-all <user>
@@ -77,7 +83,7 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl audit [<limit>] [filters]                 Recent audit events, newest first
   botctl audit export [filters] > audit.csv        All matching events as CSV, oldest first
     filters: --from <time> --to <time> --action <a,b.*> --actor <user|bot|system[:id]>
-             --actor user:<email> --method <password,code,sso,none,bot_token>
+             --actor user:<email> --method <password,code,sso,none,bot_token,scim_token>
              --idp <entra|google|oidc|github|apple|saml> --idp-provider <id> --subject <issuer|sub>
              --session <id> --on-behalf-of <user id|email> --outcome <success|failure|denied> --bot <id>
     times: YYYY-MM-DD (UTC), RFC 3339, or unix milliseconds
@@ -347,6 +353,37 @@ fn signup_request(args: &[&str]) -> Result<(&'static str, String, Option<String>
     })
 }
 
+/// `botctl scim ...`: SCIM provisioning tokens (ADR 0023).
+fn scim_request(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
+    Ok(match args {
+        [] | ["tokens"] | ["token", "list"] => ("GET", "/api/scim/tokens".into(), None),
+        ["token", "create", tenant, rest @ ..] if !tenant.starts_with("--") => {
+            let body = json!({ "tenant": tenant, "sso": flag(rest, "--sso"), "label": flag(rest, "--label") });
+            ("POST", "/api/scim/tokens".into(), Some(body.to_string()))
+        }
+        ["token", "revoke", id] => ("DELETE", format!("/api/scim/tokens/{}", encode(id)), None),
+        _ => return Err("Usage: botctl scim tokens | token create <tenant> [--sso <provider>] [--label TEXT] | token revoke <id>".into()),
+    })
+}
+
+/// What `botctl scim token create` prints: the token once, and where the IdP sends it.
+fn scim_created(res: &Value) -> String {
+    let t = &res["scimToken"];
+    let mut out = format!(
+        "Created SCIM token {} for tenant {}.\n\n{}\n\nIt is shown only once; paste it into the IdP's provisioning settings as the secret (bearer) token.\nTenant URL: https://<your-host>/scim/v2",
+        t["id"].as_str().unwrap_or_default(),
+        t["tenant"].as_str().unwrap_or_default(),
+        res["token"].as_str().unwrap_or_default(),
+    );
+    if let Some(p) = t["ssoProvider"].as_str() {
+        out.push_str(&format!("\nexternalId must be each person's subject in the SSO provider {p} (Entra: map objectId to externalId)."));
+    }
+    if res["enabled"] == false {
+        out.push_str("\n\nSCIM is off on this server: set SCIM=on and restart botd before the IdP connects.");
+    }
+    out
+}
+
 /// What `botctl signup approve` prints: the code once, and how to let SSO sign them in.
 fn approved(res: &Value) -> String {
     let mins = (res["expiresAt"].as_i64().unwrap_or_default() - now_ms()) / 60_000;
@@ -448,6 +485,15 @@ fn run(args: &[String]) -> Result<String, String> {
             match a.get(1) {
                 Some(&"approve") => Ok(approved(&serde_json::from_str(&res).map_err(|e| e.to_string())?)),
                 Some(&"reject") => Ok("Rejected. No email was sent.".into()),
+                _ => Ok(pretty(res)),
+            }
+        }
+        ["scim", rest @ ..] => {
+            let (method, path, body) = scim_request(rest)?;
+            let res = api(Cred::Operator, method, &path, body)?;
+            match rest {
+                ["token", "create", ..] => Ok(scim_created(&serde_json::from_str(&res).map_err(|e| e.to_string())?)),
+                ["token", "revoke", ..] => Ok("Revoked. The IdP can't provision with it any more; its users stay as they are.".into()),
                 _ => Ok(pretty(res)),
             }
         }
@@ -625,6 +671,27 @@ mod tests {
         let out = approved(&res);
         assert!(out.contains("sbc_x") && out.contains("about 72 hours") && out.contains("botctl user link ada@example.com work <subject>"), "{out}");
         assert!(!approved(&json!({ "sso": [] })).contains("user link"));
+    }
+
+    #[test]
+    fn scim_commands() {
+        let req = |a: &[&str]| scim_request(a).map(|(m, p, b)| (m, p, b.map(|b| serde_json::from_str::<Value>(&b).unwrap())));
+        assert_eq!(req(&["tokens"]), Ok(("GET", "/api/scim/tokens".into(), None)));
+        assert_eq!(req(&["token", "create", "okta"]), Ok(("POST", "/api/scim/tokens".into(), Some(json!({ "tenant": "okta", "sso": null, "label": null })))));
+        assert_eq!(
+            req(&["token", "create", "entra", "--sso", "work", "--label", "Entra prod"]),
+            Ok(("POST", "/api/scim/tokens".into(), Some(json!({ "tenant": "entra", "sso": "work", "label": "Entra prod" }))))
+        );
+        assert_eq!(req(&["token", "revoke", "st1"]), Ok(("DELETE", "/api/scim/tokens/st1".into(), None)));
+        assert!(req(&["token", "create"]).is_err());
+        assert!(req(&["token", "create", "--sso", "work"]).is_err());
+        assert!(req(&["token", "revoke"]).is_err());
+
+        let res = json!({ "token": "sbp_x", "enabled": false, "scimToken": { "id": "st1", "tenant": "entra", "ssoProvider": "work" } });
+        let out = scim_created(&res);
+        assert!(out.contains("sbp_x") && out.contains("shown only once") && out.contains("/scim/v2") && out.contains("objectId") && out.contains("SCIM=on"), "{out}");
+        let on = scim_created(&json!({ "token": "sbp_y", "enabled": true, "scimToken": { "id": "st2", "tenant": "okta" } }));
+        assert!(!on.contains("SCIM=on") && !on.contains("objectId"), "{on}");
     }
 
     #[test]
