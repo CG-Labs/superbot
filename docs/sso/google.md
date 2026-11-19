@@ -1,6 +1,6 @@
 # Sign in with Google
 
-Lets people sign in to SuperBot with a Google account: Google Workspace (a company or school domain) or a personal account. Design: [ADR 0014](../adr/0014-oidc-sso-entra.md) and [ADR 0015](../adr/0015-sso-multi-provider.md).
+Lets people sign in to SuperBot with a Google account: Google Workspace (a company or school domain) or a personal account. Design: [ADR 0014](../adr/0014-oidc-sso-entra.md) and [ADR 0016](../adr/0016-sso-multi-provider.md).
 
 You need: a Google Cloud project you can edit, and SuperBot on HTTPS at a fixed address, like `https://superbot.example.com`. Below, replace `superbot.example.com` with yours. Google can run next to Microsoft and other providers; each gets its own button.
 
