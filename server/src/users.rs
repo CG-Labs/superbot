@@ -484,7 +484,7 @@ mod tests {
     #[test]
     fn secrets_are_prefixed_random_and_hashed() {
         let a = new_secret(SESSION_PREFIX);
-        assert!(a.starts_with("sbs_") && a.len() == 4 + 64, "{a}");
+        assert!(a.starts_with("sbs_") && a.len() == 4 + 64);
         assert_ne!(a, new_secret(SESSION_PREFIX));
         assert_eq!(hash("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
         assert_eq!(hash(&a).len(), 64);

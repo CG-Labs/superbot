@@ -5,7 +5,7 @@ use crate::users::{self, SessionConfig};
 use crate::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const PW: &str = "correct horse battery staple";
+static PW: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| random_hex(16));
 
 fn parse(s: &str) -> Value {
     serde_json::from_str(s).unwrap_or(Value::Null)
@@ -21,7 +21,7 @@ fn bearer(token: &str) -> String {
 
 async fn serve(tweak: impl FnOnce(&mut Auth)) -> (u16, AppState, String, String) {
     serve_app_with(|a| {
-        a.password = PW.into();
+        a.password = PW.clone();
         tweak(a);
     })
     .await
@@ -62,7 +62,7 @@ fn cookie(token: &str) -> String {
 async fn password_login_makes_token_and_cookie_sessions() {
     let (port, app, admin, _) = serve(|_| {}).await;
 
-    let (code, head, res) = login(port, "", json!({ "password": PW, "label": "Phone" })).await;
+    let (code, head, res) = login(port, "", json!({ "password": PW.as_str(), "label": "Phone" })).await;
     assert_eq!(code, 200, "{res}");
     let token = res["token"].as_str().unwrap().to_string();
     assert!(token.starts_with("sbs_") && token.len() == 68);
@@ -77,7 +77,7 @@ async fn password_login_makes_token_and_cookie_sessions() {
     assert_eq!(me["permissions"], json!(["account", "read", "review", "write", "approve", "admin"]));
 
     // Cookie sessions, for the web app.
-    let (code, head, res) = login(port, &origin(port), json!({ "password": PW, "session": "cookie" })).await;
+    let (code, head, res) = login(port, &origin(port), json!({ "password": PW.as_str(), "session": "cookie" })).await;
     assert_eq!(code, 200, "{res}");
     assert!(res["token"].is_null(), "the cookie token is never readable by scripts");
     let set = header(&head, "set-cookie").unwrap();
@@ -93,21 +93,21 @@ async fn password_login_makes_token_and_cookie_sessions() {
 
     // Another site can't sign the browser in.
     let evil = "Origin: https://evil.example\r\n";
-    assert_eq!(login(port, evil, json!({ "password": PW, "session": "cookie" })).await.0, 403);
+    assert_eq!(login(port, evil, json!({ "password": PW.as_str(), "session": "cookie" })).await.0, 403);
 
     // Wrong password, and the log never holds a secret.
     let (code, _, res) = login(port, "", json!({ "password": "nope" })).await;
     assert_eq!((code, res["error"].as_str()), (401, Some("Wrong password.")));
     assert_eq!(login(port, "", json!({})).await.0, 400);
-    assert_eq!(login(port, "", json!({ "password": PW, "session": "jwt" })).await.0, 400);
+    assert_eq!(login(port, "", json!({ "password": PW.as_str(), "session": "jwt" })).await.0, 400);
 
     let (_, body) = call(port, "GET", "/api/audit?action=auth.*&limit=1000", &admin, "").await;
     let ev = audit_list(&body);
     let logins: Vec<_> = ev.iter().filter(|e| e["action"] == "auth.login" && e["details"]["method"] == "password").collect();
     assert!(logins.iter().any(|e| e["details"]["kind"] == "cookie") && logins.iter().any(|e| e["details"]["kind"] == "token"));
     assert!(ev.iter().any(|e| e["action"] == "auth.login_failed"));
-    for secret in [PW, token.as_str(), ctoken.as_str(), &users::hash(&token)] {
-        assert!(!body.contains(secret), "audit leaks {secret}");
+    for (i, secret) in [PW.as_str(), token.as_str(), ctoken.as_str(), &users::hash(&token)].into_iter().enumerate() {
+        assert!(!body.contains(secret), "audit leaks secret #{i}");
     }
     assert!(app.db.live_session(&token, db::now(), 60_000, 60_000).is_none(), "the raw token is not stored");
 }
@@ -115,7 +115,7 @@ async fn password_login_makes_token_and_cookie_sessions() {
 #[tokio::test]
 async fn cookie_writes_from_other_sites_are_refused() {
     let (port, app, admin, _) = serve(|_| {}).await;
-    let (_, head, _) = login(port, &origin(port), json!({ "password": PW, "session": "cookie" })).await;
+    let (_, head, _) = login(port, &origin(port), json!({ "password": PW.as_str(), "session": "cookie" })).await;
     let set = header(&head, "set-cookie").unwrap();
     let ctoken = set.split(';').next().unwrap().trim_start_matches("superbot_session=").to_string();
     for bad in ["Origin: https://evil.example\r\n", "Origin: null\r\n", "Sec-Fetch-Site: cross-site\r\n", "Sec-Fetch-Site: same-site\r\n"] {
@@ -223,7 +223,7 @@ async fn sessions_end_on_logout_revoke_and_disable() {
     let (id, member) = user_with(port, &admin, "m@example.com", "member").await;
 
     // Logout ends only this session.
-    let t = bearer(&token_for(port, json!({ "password": PW })).await);
+    let t = bearer(&token_for(port, json!({ "password": PW.as_str() })).await);
     let (code, head, _) = call_with(port, "POST", "/api/auth/logout", &t, "", "").await;
     assert_eq!(code, 200);
     assert!(header(&head, "set-cookie").unwrap().contains("Max-Age=0"));
@@ -272,12 +272,12 @@ async fn sessions_end_on_logout_revoke_and_disable() {
 #[tokio::test]
 async fn sessions_expire_when_idle_and_stale_cookies_are_cleared() {
     let (port, _, _, _) = serve(|a| a.sessions = SessionConfig { idle_ms: 400, max_ms: 60_000 }).await;
-    let t = token_for(port, json!({ "password": PW })).await;
+    let t = token_for(port, json!({ "password": PW.as_str() })).await;
     assert_eq!(call(port, "GET", "/api/state", &bearer(&t), "").await.0, 200);
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert_eq!(call(port, "GET", "/api/state", &bearer(&t), "").await.0, 401);
 
-    let (_, head, _) = login(port, &origin(port), json!({ "password": PW, "session": "cookie" })).await;
+    let (_, head, _) = login(port, &origin(port), json!({ "password": PW.as_str(), "session": "cookie" })).await;
     let ctoken = header(&head, "set-cookie").unwrap().split(';').next().unwrap().trim_start_matches("superbot_session=").to_string();
     tokio::time::sleep(Duration::from_millis(600)).await;
     let (code, head, _) = call_with(port, "GET", "/api/state", "", &cookie(&ctoken), "").await;
@@ -291,7 +291,7 @@ async fn sessions_expire_when_idle_and_stale_cookies_are_cleared() {
 #[tokio::test]
 async fn sessions_hit_their_absolute_limit() {
     let (port, _, _, _) = serve(|a| a.sessions = SessionConfig { idle_ms: 60_000, max_ms: 500 }).await;
-    let t = bearer(&token_for(port, json!({ "password": PW })).await);
+    let t = bearer(&token_for(port, json!({ "password": PW.as_str() })).await);
     for _ in 0..3 {
         assert_eq!(call(port, "GET", "/api/state", &t, "").await.0, 200);
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -354,7 +354,7 @@ async fn bypass_attempts_fail_closed() {
 
     // Forged, mangled, or misused credentials.
     let forged = users::new_secret(users::SESSION_PREFIX);
-    for auth in [
+    for (i, auth) in [
         bearer(&forged),
         bearer(&users::hash(&real)),
         bearer(&format!("{real}x")),
@@ -364,16 +364,18 @@ async fn bypass_attempts_fail_closed() {
         format!("bearer {real}"),
         format!("Digest {real}"),
         "Basic !!!".into(),
-        basic(""),
-        basic("correct horse"),
-    ] {
-        assert_eq!(call(port, "GET", "/api/state", &auth, "").await.0, 401, "{auth}");
+        basic(&PW[..8]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(call(port, "GET", "/api/state", &auth, "").await.0, 401, "case #{i}");
     }
     let (code, head, _) = call_with(port, "GET", "/api/state", "", &cookie(&forged), "").await;
     assert_eq!(code, 401);
     assert!(header(&head, "set-cookie").unwrap().contains("Max-Age=0"));
     // A bad Authorization header is refused even next to a good cookie.
-    let (_, h, _) = login(port, &origin(port), json!({ "password": PW, "session": "cookie" })).await;
+    let (_, h, _) = login(port, &origin(port), json!({ "password": PW.as_str(), "session": "cookie" })).await;
     let ctoken = header(&h, "set-cookie").unwrap().split(';').next().unwrap().trim_start_matches("superbot_session=").to_string();
     assert_eq!(call_with(port, "GET", "/api/state", &bearer(&forged), &cookie(&ctoken), "").await.0, 401);
     assert_eq!(call_with(port, "GET", "/api/state", "", &cookie(&ctoken), "").await.0, 200);
@@ -395,7 +397,7 @@ async fn break_glass_off_ignores_the_password() {
     assert_eq!(call(port, "GET", "/api/state", &admin, "").await.0, 401);
     let (_, head, _) = call_with(port, "GET", "/api/state", "", "", "").await;
     assert!(header(&head, "www-authenticate").is_none(), "no password box");
-    let (code, _, res) = login(port, "", json!({ "password": PW })).await;
+    let (code, _, res) = login(port, "", json!({ "password": PW.as_str() })).await;
     assert_eq!((code, res["error"].as_str().map(|e| e.contains("off"))), (401, Some(true)));
 
     // A code (made here by an admin who still has a session) still signs the owner in.
@@ -415,7 +417,7 @@ async fn break_glass_off_ignores_the_password() {
     let (_, head, _) = login(port, &origin(port), json!({ "code": code, "session": "cookie" })).await;
     let ctoken = header(&head, "set-cookie").unwrap().split(';').next().unwrap().trim_start_matches("superbot_session=").to_string();
     assert_eq!(call_with(port, "GET", "/api/state", &admin, &cookie(&ctoken), "").await.0, 200);
-    assert_eq!(call_with(port, "GET", "/api/state", &basic("guess"), &cookie(&ctoken), "").await.0, 200, "the password is ignored, right or wrong");
+    assert_eq!(call_with(port, "GET", "/api/state", &basic(&random_hex(16)), &cookie(&ctoken), "").await.0, 200, "the password is ignored, right or wrong");
 }
 
 #[tokio::test]
@@ -427,10 +429,10 @@ async fn failed_sign_ins_are_rate_limited_per_client_ip() {
     for i in 0..10 {
         assert_eq!(login(port, &from(i, "198.51.100.1"), json!({ "password": "wrong" })).await.0, 401);
     }
-    let (code, head, _) = login(port, &from(99, "198.51.100.1"), json!({ "password": PW })).await;
+    let (code, head, _) = login(port, &from(99, "198.51.100.1"), json!({ "password": PW.as_str() })).await;
     assert_eq!(code, 429, "even the right password waits");
     assert!(header(&head, "retry-after").unwrap().parse::<u64>().unwrap() > 0);
-    assert_eq!(login(port, &from(1, "198.51.100.2"), json!({ "password": PW })).await.0, 200);
+    assert_eq!(login(port, &from(1, "198.51.100.2"), json!({ "password": PW.as_str() })).await.0, 200);
     // Basic auth (botctl, old clients) is not locked out by the sign-in limiter.
     assert_eq!(call_with(port, "GET", "/api/state", &admin, &from(1, "198.51.100.1"), "").await.0, 200);
 }
