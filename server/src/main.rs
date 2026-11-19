@@ -22,6 +22,8 @@ mod users;
 mod users_http_tests;
 #[cfg(test)]
 mod sso_http_tests;
+#[cfg(test)]
+mod sso_social_http_tests;
 
 use acl::{Access, Viewer, Visibility};
 use approvals::{DecideError, Remember};
@@ -168,7 +170,7 @@ async fn main() {
         ..Auth::new(Some(app.clone()))
     });
     for p in &auth_state.sso.providers {
-        let ready = if p.ready() { "ready".to_string() } else { format!("not offered until {} is set (env, _FILE, or `botctl secret set`)", p.env_var()) };
+        let ready = p.not_ready().unwrap_or_else(|| "ready".into());
         println!("SSO: {} ({}, {}), {ready}; {}; just-in-time sign-up {}.", p.id, p.label, p.type_name(), p.audience(), p.jit_role.map_or("off", |r| r.as_str()));
     }
     let sso_ids: Vec<String> = auth_state.sso.providers.iter().map(|p| p.id.clone()).collect();
@@ -269,7 +271,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/auth/me", get(users::me))
         .route("/auth/sso", get(sso::list))
         .route("/auth/sso/{id}/start", get(sso::start))
-        .route("/auth/sso/{id}/callback", get(sso::callback))
+        .route("/auth/sso/{id}/callback", get(sso::callback).post(sso::callback_post))
         .route("/users", get(users::list_users).post(users::create_user))
         .route("/users/{key}", get(users::get_user).patch(users::update_user))
         .route("/users/{key}/login-codes", post(users::create_login_code))
@@ -558,7 +560,13 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
     let mut req = req;
     req.extensions_mut().insert(source.clone());
     // Signing in, and the page to do it on, need no credentials.
-    if (method == Method::POST && path == "/api/auth/login") || (method == Method::GET && (path == "/login" || sso_path(&path))) {
+    let open = match method {
+        Method::GET => path == "/login" || sso_path(&path).is_some(),
+        // Apple posts its answer to the callback (response_mode=form_post).
+        Method::POST => path == "/api/auth/login" || sso_path(&path) == Some("callback"),
+        _ => false,
+    };
+    if open {
         return next.run(req).await;
     }
     let caller = match authenticate(&a, &req, &source) {
@@ -603,12 +611,11 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
     res
 }
 
-/// `/api/auth/sso`, `/api/auth/sso/{id}/start`, and `/api/auth/sso/{id}/callback`.
-fn sso_path(path: &str) -> bool {
-    match path.strip_prefix("/api/auth/sso") {
-        Some("") => true,
-        Some(rest) => rest.strip_prefix('/').and_then(|r| r.split_once('/')).is_some_and(|(id, step)| !id.is_empty() && !id.contains('/') && matches!(step, "start" | "callback")),
-        None => false,
+/// `/api/auth/sso` (the list), `/api/auth/sso/{id}/start`, and `/api/auth/sso/{id}/callback`: which one.
+fn sso_path(path: &str) -> Option<&str> {
+    match path.strip_prefix("/api/auth/sso")? {
+        "" => Some("list"),
+        rest => rest.strip_prefix('/').and_then(|r| r.split_once('/')).filter(|(id, step)| !id.is_empty() && !id.contains('/') && matches!(*step, "start" | "callback")).map(|(_, step)| step),
     }
 }
 
@@ -1715,6 +1722,8 @@ mod tests {
     }
 
     #[tokio::test]
+    // An empty String, not "": code scanning reads a literal as a hard-coded password.
+    #[allow(clippy::unnecessary_owned_empty_strings)]
     async fn empty_password_requires_opt_in_even_on_loopback() {
         let (port, _) = serve(&String::new(), false, "").await;
         let host = format!("127.0.0.1:{port}");
@@ -1723,6 +1732,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::unnecessary_owned_empty_strings)]
     async fn allow_no_auth_permits_anonymous_on_loopback() {
         let (port, _) = serve(&String::new(), true, "").await;
         let host = format!("127.0.0.1:{port}");

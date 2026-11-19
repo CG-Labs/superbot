@@ -1,7 +1,9 @@
 //! One configured IdP: where it lives, its cached discovery document and keys, the code
 //! exchange, and whose tokens it accepts.
 
+use super::github::{self, GitHub};
 use super::jwt::{self, Invalid, Jwks, Token};
+use super::apple;
 use crate::rbac::Role;
 use serde_json::Value;
 use std::sync::Arc;
@@ -25,6 +27,14 @@ pub enum Kind {
     /// Any OpenID Connect provider with one issuer. With `allowed_domains`, only people
     /// whose verified email is in one of them get in.
     Oidc { issuer: String, map: ClaimMap, allowed_domains: Vec<String> },
+    /// Sign in with Apple: `sub` is the subject (stable per Apple developer team), the
+    /// client secret is an ES256 JWT signed with the team's key, and with
+    /// `allowed_domains` only verified, non-relay emails there get in.
+    Apple { issuer: String, team_id: String, key_id: String, allowed_domains: Vec<String> },
+    /// GitHub or GitHub Enterprise Server: OAuth 2 without an ID token. `web` has the
+    /// authorize and token endpoints, `api` the REST API that says who signed in. With
+    /// `allowed_orgs`, only active members of one of them get in.
+    GitHub { web: String, api: String, allowed_orgs: Vec<String> },
 }
 
 #[cfg(test)]
@@ -86,6 +96,9 @@ pub struct Claims {
     pub tenant: Option<String>,
     pub email: Option<String>,
     pub name: Option<String>,
+    /// A handle people know the account by (GitHub's login), for admins reading the audit
+    /// log. Never the subject: it can change hands.
+    pub username: Option<String>,
 }
 
 impl Claims {
@@ -144,7 +157,7 @@ pub fn secure_url(u: &str) -> bool {
     }
 }
 
-async fn read_json(res: reqwest::Response) -> Result<(u16, Value), Invalid> {
+pub(super) async fn read_json(res: reqwest::Response) -> Result<(u16, Value), Invalid> {
     let status = res.status().as_u16();
     let mut res = res;
     let mut body = Vec::new();
@@ -175,7 +188,23 @@ impl Provider {
             Kind::Entra { .. } => "entra",
             Kind::Google { .. } => "google",
             Kind::Oidc { .. } => "oidc",
+            Kind::Apple { .. } => "apple",
+            Kind::GitHub { .. } => "github",
         }
+    }
+
+    /// OpenID Connect, with an ID token and a nonce. GitHub is plain OAuth 2.
+    pub fn oidc(&self) -> bool {
+        !matches!(self.kind, Kind::GitHub { .. })
+    }
+
+    /// How the IdP returns the code: Apple must POST it when scopes are asked for.
+    pub fn response_mode(&self) -> &'static str {
+        if self.form_post() { "form_post" } else { "query" }
+    }
+
+    pub fn form_post(&self) -> bool {
+        matches!(self.kind, Kind::Apple { .. })
     }
 
     /// Who may sign in, for the startup log.
@@ -187,6 +216,10 @@ impl Provider {
             Kind::Google { hosted_domains, .. } => format!("Workspace domains {}", hosted_domains.join(", ")),
             Kind::Oidc { allowed_domains, .. } if allowed_domains.is_empty() => "anyone the IdP signs in".into(),
             Kind::Oidc { allowed_domains, .. } => format!("verified emails at {}", allowed_domains.join(", ")),
+            Kind::Apple { allowed_domains, .. } if allowed_domains.is_empty() => "any Apple Account".into(),
+            Kind::Apple { allowed_domains, .. } => format!("verified emails at {}", allowed_domains.join(", ")),
+            Kind::GitHub { web, allowed_orgs, .. } if allowed_orgs.is_empty() => format!("any account on {web}"),
+            Kind::GitHub { web, allowed_orgs, .. } => format!("members of {} on {web}", allowed_orgs.join(", ")),
         }
     }
 
@@ -205,31 +238,67 @@ impl Provider {
                 }
                 p
             }
-            Kind::Oidc { .. } => vec![],
+            Kind::Oidc { .. } | Kind::Apple { .. } => vec![],
+            // Nobody makes a GitHub account halfway through signing in to SuperBot.
+            Kind::GitHub { .. } => vec![("prompt", "select_account".into()), ("allow_signup", "false".into())],
         }
     }
 
-    /// Where the client secret is set: env, `_FILE`, or the secrets store.
+    /// Where the provider's secret is set: env, `_FILE`, or the secrets store. Apple's is
+    /// the private key that signs each client secret; the others', the client secret.
     pub fn env_var(&self) -> String {
-        format!("SSO_{}_CLIENT_SECRET", self.id.to_ascii_uppercase())
+        let what = if matches!(self.kind, Kind::Apple { .. }) { "PRIVATE_KEY" } else { "CLIENT_SECRET" };
+        format!("SSO_{}_{what}", self.id.to_ascii_uppercase())
     }
 
     /// Read when used, so `botctl secret set` takes effect without a restart.
-    fn client_secret(&self) -> Option<crate::secrets::Secret> {
+    fn stored_secret(&self) -> Option<crate::secrets::Secret> {
         let s = crate::secrets::global().get(&self.env_var()).ok().flatten()?;
         crate::secrets::redact::register(s.expose());
         Some(s)
     }
 
-    /// Offered on the sign-in page: it has its client secret.
-    pub fn ready(&self) -> bool {
-        self.client_secret().is_some()
+    /// The client secret for one code exchange.
+    fn client_secret(&self) -> Result<crate::secrets::Secret, Invalid> {
+        let stored = self.stored_secret().ok_or(Invalid("not_configured"))?;
+        match &self.kind {
+            Kind::Apple { issuer, team_id, key_id, .. } => {
+                let key = apple::signing_key(stored.expose())?;
+                Ok(crate::secrets::Secret::new(apple::client_secret(&key, team_id, key_id, &self.client_id, issuer, crate::db::now() / 1000)?))
+            }
+            _ => Ok(stored),
+        }
     }
 
-    fn discovery_url(&self) -> String {
+    /// Offered on the sign-in page: it has its client secret (Apple: a key that parses).
+    pub fn ready(&self) -> bool {
+        self.not_ready().is_none()
+    }
+
+    /// Why the provider isn't offered, for the startup log.
+    pub fn not_ready(&self) -> Option<String> {
+        let var = self.env_var();
+        match (&self.kind, self.stored_secret()) {
+            (_, None) => Some(format!("not offered until {var} is set (env, _FILE, or `botctl secret set`)")),
+            (Kind::Apple { .. }, Some(key)) if apple::signing_key(key.expose()).is_err() => Some(format!("not offered: {var} isn't a Sign in with Apple key (the .p8 file)")),
+            _ => None,
+        }
+    }
+
+    /// None for GitHub, which has no discovery document.
+    fn discovery_url(&self) -> Option<String> {
         match &self.kind {
-            Kind::Entra { authority, tenant, .. } => format!("{authority}/{tenant}/v2.0/.well-known/openid-configuration"),
-            Kind::Google { issuer, .. } | Kind::Oidc { issuer, .. } => format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/')),
+            Kind::Entra { authority, tenant, .. } => Some(format!("{authority}/{tenant}/v2.0/.well-known/openid-configuration")),
+            Kind::Google { issuer, .. } | Kind::Oidc { issuer, .. } | Kind::Apple { issuer, .. } => Some(format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'))),
+            Kind::GitHub { .. } => None,
+        }
+    }
+
+    /// Where `start` sends the browser. GitHub's is fixed; OIDC providers' comes from discovery.
+    pub async fn authorization_endpoint(&self, http: &reqwest::Client, gap: Duration) -> Result<String, Invalid> {
+        match &self.kind {
+            Kind::GitHub { web, .. } => Ok(format!("{web}/login/oauth/authorize")),
+            _ => Ok(self.metadata(http, gap).await?.authorization_endpoint.clone()),
         }
     }
 
@@ -246,18 +315,19 @@ impl Provider {
                 }
                 Ok((format!("{authority}/{tid}/v2.0"), Some(tid)))
             }
-            Kind::Google { issuer, .. } | Kind::Oidc { issuer, .. } if tenant.is_none() => Ok((issuer.clone(), None)),
-            Kind::Google { .. } | Kind::Oidc { .. } => Err("tenant is only for Entra providers".into()),
+            Kind::Google { issuer, .. } | Kind::Oidc { issuer, .. } | Kind::Apple { issuer, .. } | Kind::GitHub { web: issuer, .. } if tenant.is_none() => Ok((issuer.clone(), None)),
+            _ => Err("tenant is only for Entra providers".into()),
         }
     }
 
-    /// The subject as tokens carry it: Entra object ids are lowercase GUIDs.
+    /// The subject as tokens carry it: Entra object ids are lowercase GUIDs, GitHub's are numbers.
     pub fn subject(&self, s: &str) -> Result<String, String> {
         let s = s.trim();
         match self.kind {
             Kind::Entra { .. } => guid(s).ok_or_else(|| "subject must be the user's Entra object id (a GUID)".into()),
-            Kind::Google { .. } | Kind::Oidc { .. } if !s.is_empty() && s.len() <= 255 => Ok(s.into()),
-            Kind::Google { .. } | Kind::Oidc { .. } => Err("subject must be 1 to 255 characters".into()),
+            Kind::GitHub { .. } => github::user_id(s).ok_or_else(|| "subject must be the GitHub user's numeric id (gh api users/<login> --jq .id), not the login".into()),
+            _ if !s.is_empty() && s.len() <= 255 => Ok(s.into()),
+            _ => Err("subject must be 1 to 255 characters".into()),
         }
     }
 
@@ -291,7 +361,7 @@ impl Provider {
     }
 
     async fn fetch_metadata(&self, http: &reqwest::Client) -> Result<Metadata, Invalid> {
-        let v = get_json(http, &self.discovery_url()).await?;
+        let v = get_json(http, &self.discovery_url().ok_or(Invalid("not_configured"))?).await?;
         let url = |k: &str| v[k].as_str().filter(|u| secure_url(u)).map(String::from).ok_or(Invalid("idp_bad_response"));
         let methods: Vec<&str> = v["token_endpoint_auth_methods_supported"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
         Ok(Metadata {
@@ -334,9 +404,15 @@ impl Provider {
     }
 
     /// Trades the authorization code for an ID token (with our PKCE verifier) and checks it.
+    /// GitHub has no ID token: its API says who the access token belongs to.
     pub async fn sign_in(&self, http: &reqwest::Client, code: &str, redirect_uri: &str, verifier: &str, nonce: &str, gap: Duration) -> Result<Claims, Invalid> {
+        if let Kind::GitHub { web, api, allowed_orgs } = &self.kind {
+            let secret = self.client_secret()?;
+            let gh = GitHub { web, api, client_id: &self.client_id, allowed_orgs };
+            return gh.sign_in(http, code, redirect_uri, verifier, secret.expose()).await;
+        }
         let meta = self.metadata(http, gap).await?;
-        let secret = self.client_secret().ok_or(Invalid("not_configured"))?;
+        let secret = self.client_secret()?;
         let mut form = vec![("grant_type", "authorization_code"), ("code", code), ("redirect_uri", redirect_uri), ("code_verifier", verifier), ("client_id", &self.client_id)];
         let mut req = http.post(&meta.token_endpoint).header("accept", "application/json");
         if meta.basic_auth {
@@ -375,7 +451,7 @@ impl Provider {
                 }
                 let oid = t.str("oid").and_then(guid).ok_or(Invalid("missing_subject"))?;
                 // Entra's `email` is informational only (it isn't verified), so we never look anyone up by it.
-                Ok(Claims { issuer: iss.into(), subject: oid, tenant: Some(tid), email: t.str("email").map(String::from), name })
+                Ok(Claims { issuer: iss.into(), subject: oid, tenant: Some(tid), email: t.str("email").map(String::from), name, username: None })
             }
             // Identities are stored under the configured issuer, so a link made with
             // `botctl user link` and a sign-in name the same one.
@@ -395,7 +471,7 @@ impl Provider {
                 if !hosted_domains.is_empty() && !t.str("hd").and_then(domain).is_some_and(|d| hosted_domains.contains(&d)) {
                     return Err(Invalid("wrong_domain"));
                 }
-                Ok(Claims { issuer: issuer.clone(), subject, tenant: None, email: Some(email), name })
+                Ok(Claims { issuer: issuer.clone(), subject, tenant: None, email: Some(email), name, username: None })
             }
             Kind::Oidc { issuer, map, allowed_domains } => {
                 if !same_issuer(issuer, &meta.issuer) || iss != meta.issuer {
@@ -409,8 +485,25 @@ impl Provider {
                         return Err(Invalid("wrong_domain"));
                     }
                 }
-                Ok(Claims { issuer: issuer.clone(), subject, tenant: None, email, name: name_in(&map.name) })
+                Ok(Claims { issuer: issuer.clone(), subject, tenant: None, email, name: name_in(&map.name), username: None })
             }
+            // Apple's token never has the name: it is posted once, beside it (`apple::posted_name`).
+            Kind::Apple { issuer, allowed_domains, .. } => {
+                if !same_issuer(issuer, &meta.issuer) || !same_issuer(issuer, iss) {
+                    return Err(Invalid("wrong_issuer"));
+                }
+                let subject = subject_of(t, "sub")?;
+                let email = verified_email(t, "email");
+                if !allowed_domains.is_empty() {
+                    let e = email.as_deref().ok_or(Invalid("email_unverified"))?;
+                    // A Hide My Email address never matches: its domain is Apple's (startup refuses listing it).
+                    if !email_in(e, allowed_domains) {
+                        return Err(Invalid("wrong_domain"));
+                    }
+                }
+                Ok(Claims { issuer: issuer.clone(), subject, tenant: None, email, name: None, username: None })
+            }
+            Kind::GitHub { .. } => Err(Invalid("not_configured")),
         }
     }
 }
@@ -576,6 +669,49 @@ mod tests {
         let typo = meta("https://tenant.auth0.example");
         assert_eq!(p.claims(&t(json!({ "iss": "https://tenant.auth0.example" })), &typo).unwrap().issuer, "https://tenant.auth0.example/", "a trailing slash in config is not a different IdP");
         assert!(p.auth_params().is_empty());
+    }
+
+    fn apple(domains: &[&str]) -> Provider {
+        let kind = Kind::Apple { issuer: apple::ISSUER.into(), team_id: "TEAM123456".into(), key_id: "KEY1234567".into(), allowed_domains: domains.iter().map(|s| s.to_string()).collect() };
+        Provider::new("apple", "Apple", kind, "com.example.superbot", "name email", None)
+    }
+
+    fn a(extra: Value) -> Token {
+        let mut c = json!({ "iss": apple::ISSUER, "sub": "001234.abc", "email": "ada@example.com", "email_verified": "true", "is_private_email": "false" });
+        c.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        c.as_object_mut().unwrap().retain(|_, v| !v.is_null());
+        signed(c)
+    }
+
+    #[test]
+    fn apple_takes_sub_and_a_verified_email_and_has_no_name_in_the_token() {
+        let (p, m) = (apple(&[]), meta(apple::ISSUER));
+        let c = p.claims(&a(json!({ "name": "Not From Apple" })), &m).unwrap();
+        assert_eq!((c.issuer.as_str(), c.subject.as_str(), c.email.as_deref(), c.name), (apple::ISSUER, "001234.abc", Some("ada@example.com"), None));
+        let relay = p.claims(&a(json!({ "email": "x7@privaterelay.appleid.com", "is_private_email": true, "email_verified": true })), &m).unwrap();
+        assert_eq!(relay.email.as_deref(), Some("x7@privaterelay.appleid.com"), "Hide My Email is fine once linked");
+        assert_eq!(p.claims(&a(json!({ "email_verified": "false" })), &m).unwrap().email, None);
+        assert!(p.claims(&a(json!({ "email": null })), &m).is_ok(), "a linked identity needs no email");
+        assert_eq!(p.claims(&a(json!({ "sub": null })), &m).err(), Some(Invalid("missing_subject")));
+        for iss in ["https://appleid.apple.com.evil.example", "appleid.apple.com", "https://accounts.google.com"] {
+            assert_eq!(p.claims(&a(json!({ "iss": iss })), &m).err(), Some(Invalid("wrong_issuer")), "{iss}");
+        }
+        assert_eq!(p.claims(&a(json!({})), &meta("https://evil.example")).err(), Some(Invalid("wrong_issuer")), "discovery from elsewhere");
+    }
+
+    #[test]
+    fn apple_email_domains_refuse_hide_my_email_and_unverified_addresses() {
+        let (p, m) = (apple(&["example.com"]), meta(apple::ISSUER));
+        assert!(p.claims(&a(json!({})), &m).is_ok());
+        for (extra, why) in [
+            (json!({ "email": "x7@privaterelay.appleid.com", "is_private_email": "true" }), "Hide My Email"),
+            (json!({ "email": "ada@evil.example" }), "another domain"),
+            (json!({ "email": "ada@sub.example.com" }), "a subdomain"),
+        ] {
+            assert_eq!(p.claims(&a(extra), &m).err(), Some(Invalid("wrong_domain")), "{why}");
+        }
+        assert_eq!(p.claims(&a(json!({ "email_verified": false })), &m).err(), Some(Invalid("email_unverified")));
+        assert_eq!(p.claims(&a(json!({ "email": null })), &m).err(), Some(Invalid("email_unverified")));
     }
 
     #[tokio::test]

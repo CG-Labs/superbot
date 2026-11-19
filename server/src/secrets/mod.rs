@@ -114,9 +114,11 @@ pub fn check_name(name: &str) -> Result<(), Error> {
 }
 
 /// botd's own secrets: saved and listed like the others, but never given to a Bot.
-/// Today these are SSO client secrets (`SSO_<PROVIDER>_CLIENT_SECRET`, ADR 0014).
+/// Today these are SSO client secrets (`SSO_<PROVIDER>_CLIENT_SECRET`, ADR 0014) and
+/// Apple's signing keys (`SSO_<PROVIDER>_PRIVATE_KEY`, ADR 0018).
 pub fn server_secret(name: &str) -> bool {
-    env_shaped(name) && name.len() > "SSO__CLIENT_SECRET".len() && name.starts_with("SSO_") && name.ends_with("_CLIENT_SECRET")
+    let provider = |suffix: &str| name.strip_prefix("SSO_").and_then(|n| n.strip_suffix(suffix)).is_some_and(|id| !id.is_empty());
+    env_shaped(name) && (provider("_CLIENT_SECRET") || provider("_PRIVATE_KEY"))
 }
 
 fn check_saveable(name: &str) -> Result<(), Error> {
@@ -389,11 +391,19 @@ mod tests {
         assert!(s.harness_env().is_empty(), "neither the sealed nor the env client secret goes to a Bot");
         let names: Vec<_> = s.list().unwrap().into_iter().map(|l| (l.name, l.for_bots)).collect();
         assert_eq!(names, [("SSO_GOOGLE_CLIENT_SECRET".to_string(), false), ("SSO_ENTRA_CLIENT_SECRET".to_string(), false)]);
-        for bad in ["SSO_ENTRA_TENANT", "SSO__CLIENT_SECRET", "SSO_ENTRA_client_SECRET"] {
+        for bad in ["SSO_ENTRA_TENANT", "SSO__CLIENT_SECRET", "SSO_ENTRA_client_SECRET", "SSO__PRIVATE_KEY", "SSO_APPLE_TEAM_ID", "SSO_PRIVATE_KEY"] {
             assert!(s.put(bad, "v").is_err(), "{bad}");
         }
         assert!(s.delete("SSO_ENTRA_CLIENT_SECRET").unwrap());
         redact::forget(&value);
+
+        let key = format!("-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----", crate::random_hex(32));
+        assert!(check_name("SSO_APPLE_PRIVATE_KEY").is_err());
+        let l = s.put("SSO_APPLE_PRIVATE_KEY", &key).unwrap();
+        assert_eq!((l.store, l.for_bots), ("sealed", false), "Apple's signing key is botd's own");
+        assert!(s.harness_env().is_empty());
+        assert!(s.delete("SSO_APPLE_PRIVATE_KEY").unwrap());
+        redact::forget(&key);
     }
 
     #[test]

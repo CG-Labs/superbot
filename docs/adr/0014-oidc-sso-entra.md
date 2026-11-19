@@ -83,4 +83,4 @@ The client secret is `SSO_<ID>_CLIENT_SECRET`: from env, `_FILE`, or sealed in S
 - Desktop (Electron) SSO: the app loads from `file://`, which no IdP can return to. It keeps codes and the password; a loopback redirect is the likely fix.
 - Group or app-role to SuperBot role mapping, IdP logout, `prompt=login` re-authentication for sensitive actions, and certificate (`private_key_jwt`) client auth instead of a secret.
 - A web or client UI for linking identities (API and `botctl` only).
-- Apple, GitHub, SAML, SCIM. (Google and generic OIDC rules came next, in [ADR 0016](0016-sso-multi-provider.md).)
+- Apple, GitHub, SAML, SCIM. (Google and generic OIDC rules came next, in [ADR 0016](0016-sso-multi-provider.md); Apple and GitHub in [ADR 0018](0018-sso-github-apple.md).)

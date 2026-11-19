@@ -10,7 +10,7 @@ import {
   View,
 } from "react-native";
 import { defaultServerUrl } from "../src/auth";
-import { fetchSsoProviders, ssoSupported, type SsoProvider } from "../src/sso";
+import { fetchSsoProviders, ssoButtonText, ssoButtonTone, ssoSupported, type SsoProvider } from "../src/sso";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
 
@@ -69,16 +69,19 @@ export function LoginScreen() {
         />
         {providers.length ? (
           <View style={styles.sso}>
-            {providers.map((p) => (
-              <Pressable
-                key={p.id}
-                style={[styles.ssoBtn, busy && styles.btnDisabled]}
-                onPress={() => run(() => loginWithSso(baseUrl, p.id))}
-                disabled={busy}
-              >
-                <Text style={styles.ssoText}>Sign in with {p.label}</Text>
-              </Pressable>
-            ))}
+            {providers.map((p) => {
+              const apple = ssoButtonTone(p) === "apple";
+              return (
+                <Pressable
+                  key={p.id}
+                  style={[styles.ssoBtn, apple && styles.appleBtn, busy && styles.btnDisabled]}
+                  onPress={() => run(() => loginWithSso(baseUrl, p.id))}
+                  disabled={busy}
+                >
+                  <Text style={[styles.ssoText, apple && styles.appleText]}>{ssoButtonText(p)}</Text>
+                </Pressable>
+              );
+            })}
             <Text style={styles.or}>or</Text>
           </View>
         ) : null}
@@ -153,6 +156,8 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   ssoText: { color: colors.text, fontWeight: "600", fontSize: 16 },
+  appleBtn: { backgroundColor: "#fff", borderColor: "#fff" },
+  appleText: { color: "#000" },
   or: { color: colors.textFaint, textAlign: "center", marginTop: 4 },
   btnText: { color: "#fff", fontWeight: "600", fontSize: 16 },
 });
