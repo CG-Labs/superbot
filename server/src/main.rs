@@ -1242,7 +1242,8 @@ mod tests {
         call_with(port, "DELETE", &format!("/api/routines/{rid}"), &bot_auth, &botctl, "").await;
         call_with(port, "POST", &format!("/api/bots/{id}/stop"), &user, browser, "").await;
         call_with(port, "DELETE", &format!("/api/bots/{id}"), &user, browser, "").await;
-        let wrong = basic("hunter2-wrong");
+        let wrong_password = random_hex(16);
+        let wrong = basic(&wrong_password);
         assert_eq!(call_with(port, "GET", "/api/state", &wrong, browser, "").await.0, 401);
         assert_eq!(call_with(port, "GET", "/api/state", &wrong, browser, "").await.0, 401);
         assert_eq!(call_with(port, "GET", "/api/state", "Bearer nope", "", "").await.0, 401);
@@ -1289,7 +1290,7 @@ mod tests {
         assert_eq!((routine["actorName"].as_str(), routine["userAgent"].as_str()), (Some("Helper 2"), Some("botctl")));
         assert_eq!(find("routine.updated")["details"]["changes"]["cron"]["to"], "0 10 * * *");
         assert!(!body.contains("secret plan"), "routine instructions are messages, not audit data");
-        assert!(!body.contains("hunter2"), "passwords are never logged");
+        assert!(!body.contains(&wrong_password), "passwords are never logged");
         assert_eq!(find("bot.deleted")["details"]["name"], "Helper 2");
         // The log outlives the Bot.
         assert!(app.db.bot(&id).is_none());
