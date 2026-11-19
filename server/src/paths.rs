@@ -26,6 +26,12 @@ pub fn root(dir: &str) -> io::Result<PathBuf> {
     std::fs::canonicalize(s)
 }
 
+/// The canonical form of an existing folder. Resolve a root with this before
+/// handing it to [`child`], so the prefix check there compares real paths.
+pub fn canonical(dir: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(dir).ok()
+}
+
 /// `root/name` when `name` is one plain file or folder name. None for empty names,
 /// `.`, anything with `..`, path separators, or NUL.
 pub fn child(root: &Path, name: &str) -> Option<PathBuf> {
@@ -52,10 +58,12 @@ mod tests {
 
     #[test]
     fn root_resolves_dots_and_is_canonical() {
-        let base = crate::db::temp_path("paths");
-        let r = root(&format!("{}/a/../b/./c", base.display())).unwrap();
-        assert_eq!(r, std::fs::canonicalize(base.join("b/c")).unwrap());
-        assert!(r.is_dir());
+        let id = crate::short_id();
+        let r = root(&format!("../target/test-paths-{id}/a/../b/./c")).unwrap();
+        assert!(r.is_absolute() && r.is_dir());
+        assert!(r.ends_with(format!("target/test-paths-{id}/b/c")));
+        let base = r.parent().and_then(Path::parent).unwrap();
         assert!(!base.join("a").exists());
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

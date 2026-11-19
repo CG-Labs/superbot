@@ -68,7 +68,7 @@ fn pick<'a>(a: &[&'a str]) -> &'a str {
 async fn main() {
     let port: u16 = env("PORT", "3000").parse().expect("PORT must be a number");
     let host = env("HOST", "127.0.0.1");
-    let password = env("AUTH_PASSWORD", "");
+    let password = std::env::var("AUTH_PASSWORD").unwrap_or_default();
     let default_harness = env("DEFAULT_HARNESS", "claude");
     let allow_no_auth = auth_startup(&host, &password);
     if adapters::get(&default_harness).is_none() {
@@ -884,22 +884,22 @@ mod tests {
         let (port, bot_token) = serve(&pw, false, "bots.example.com").await;
         let host = format!("127.0.0.1:{port}");
         assert_eq!(status(port, &host, &basic(&pw)).await, 200);
-        assert_eq!(status(port, &host, &basic("wrong")).await, 401);
+        assert_eq!(status(port, &host, &basic(&random_hex(16))).await, 401);
         assert_eq!(status(port, &host, &format!("Bearer {bot_token}")).await, 200);
         assert_eq!(status(port, "bots.example.com", &basic(&pw)).await, 200);
     }
 
     #[tokio::test]
     async fn empty_password_requires_opt_in_even_on_loopback() {
-        let (port, _) = serve("", false, "").await;
+        let (port, _) = serve(&String::new(), false, "").await;
         let host = format!("127.0.0.1:{port}");
         assert_eq!(status(port, &host, "").await, 401);
-        assert_eq!(status(port, &host, &basic("")).await, 401);
+        assert_eq!(status(port, &host, &basic(&String::new())).await, 401);
     }
 
     #[tokio::test]
     async fn allow_no_auth_permits_anonymous_on_loopback() {
-        let (port, _) = serve("", true, "").await;
+        let (port, _) = serve(&String::new(), true, "").await;
         let host = format!("127.0.0.1:{port}");
         assert_eq!(status(port, &host, "").await, 200);
     }

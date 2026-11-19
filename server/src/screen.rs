@@ -83,15 +83,15 @@ impl Screens {
         })
     }
 
-    fn bus_path(&self, n: u16) -> PathBuf {
-        crate::paths::child(&self.run_dir, &format!("bus-{n}")).expect("bus-<n> is a plain name")
+    fn bus_path(&self, n: u16) -> Option<PathBuf> {
+        crate::paths::child(&crate::paths::canonical(&self.run_dir)?, &format!("bus-{n}"))
     }
 
     fn info(&self, s: &Screen) -> Info {
         let n = self.base + s.slot;
         Info {
             display: format!(":{n}"),
-            bus: format!("unix:path={}", self.bus_path(n).display()),
+            bus: format!("unix:path={}", self.bus_path(n).unwrap_or_default().display()),
             port: 6800 + n,
             token: s.token.clone(),
         }
@@ -149,7 +149,8 @@ impl Screens {
             return Err(std::io::Error::other("Xvfb didn't open its display"));
         }
 
-        let _ = std::fs::remove_file(self.bus_path(n));
+        let bus_path = self.bus_path(n).ok_or_else(|| std::io::Error::other("no screens folder"))?;
+        let _ = std::fs::remove_file(&bus_path);
         s.procs.push(spawn(Command::new("dbus-daemon").args(["--session", "--nofork", &format!("--address={bus}")]))?);
         s.procs.push(spawn(Command::new("openbox").env("DISPLAY", &display).env("DBUS_SESSION_BUS_ADDRESS", &bus))?);
         if on_path("voxl") {

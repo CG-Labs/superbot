@@ -652,8 +652,7 @@ impl Db {
 #[cfg(test)]
 pub fn temp_path(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("superbot-test-{tag}-{}", crate::short_id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    crate::paths::root(&dir.to_string_lossy()).unwrap()
 }
 
 #[cfg(test)]

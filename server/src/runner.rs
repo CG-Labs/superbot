@@ -135,13 +135,13 @@ impl App {
 
     /// `DATA_DIR/bots/<id>`. None when the id isn't one plain folder name.
     pub fn bot_dir(&self, id: &str) -> Option<PathBuf> {
-        paths::child(&paths::child(&self.cfg.data_dir, "bots")?, id)
+        paths::child(&paths::child(&paths::canonical(&self.cfg.data_dir)?, "bots")?, id)
     }
     fn memory_file(&self, id: &str) -> Option<PathBuf> {
         paths::child(&self.bot_dir(id)?, "MEMORY.md")
     }
     fn user_file(&self) -> Option<PathBuf> {
-        paths::child(&self.cfg.data_dir, "USER.md")
+        paths::child(&paths::canonical(&self.cfg.data_dir)?, "USER.md")
     }
 
     pub fn init_bot_files(&self, bot: &Bot) {
