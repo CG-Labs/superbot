@@ -1,6 +1,20 @@
 # SUPERBOT_SITE is SUPERBOT_DOMAIN (automatic HTTPS) or ":80" (plain HTTP, localhost only by default).
 {$SUPERBOT_SITE} {
 	encode gzip
+	# The landing page and get-started form (site/), baked in like the client. botd has a
+	# copy built in too. Keep the headers in step with SITE_CSP in server/src/main.rs.
+	@site path / /index.html /get-started /get-started/ /site/*
+	handle @site {
+		root * /srv/superbot-site
+		header Content-Security-Policy "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+		header X-Content-Type-Options nosniff
+		header Referrer-Policy strict-origin-when-cross-origin
+		header Cache-Control no-cache
+		rewrite /get-started /get-started.html
+		rewrite /get-started/ /get-started.html
+		uri /site/* replace /site/ /assets/ 1
+		file_server
+	}
 	# The web client, baked into this Caddy image at build time (Dockerfile `caddy` target).
 	redir /app /app/
 	handle_path /app/* {
@@ -19,7 +33,7 @@
 		try_files {path} /index.html
 		file_server
 	}
-	# Everything else: botd's built-in page at /, /login, /api, /healthz.
+	# Everything else: botd's console at /console/, /login, /api, /healthz.
 	handle {
 		reverse_proxy botd:3000 {
 			# /api/events is an SSE stream: never buffer.
