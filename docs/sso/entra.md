@@ -77,7 +77,7 @@ Restart botd. The log says `SSO: entra (Microsoft, entra), ready`. The web sign-
 | `SSO_ENTRA_LABEL` | `Microsoft` | Button text: "Sign in with …". |
 | `SSO_ENTRA_SCOPES` | `openid profile email` | Must include `openid`; keep `profile` (Entra sends `oid` with it). |
 | `SSO_ENTRA_AUTHORITY` | `https://login.microsoftonline.com` | Change for national clouds, e.g. `https://login.microsoftonline.us`. |
-| `SSO_APP_REDIRECTS` | `superbot://auth` | Where the SuperBot app may receive its one-time code. Add your web client's `https://…/auth` if you host it separately. |
+| `SSO_APP_REDIRECTS` | `superbot://auth` and `{SSO_PUBLIC_URL}/app/auth` | Where the SuperBot app may receive its one-time code. The default covers the native app and the web client the installer and Compose serve at `/app/`. Setting it replaces the default; add your web client's `https://…/auth` if you host it elsewhere. |
 
 botd refuses to start on a setting that is missing or unsafe, and says which.
 
@@ -112,7 +112,7 @@ Every other tenant is refused, even though Microsoft would sign its people in. L
 ## Apps
 
 - **iOS and Android**: the app opens Microsoft's page in the system browser and comes back on `superbot://auth`. Nothing to register in Entra: Entra only talks to botd. Expo Go uses an `exp://…` address instead; add the one the app shows to `SSO_APP_REDIRECTS` while developing.
-- **Web client** (Expo web): sign-in opens in a popup and returns to `{web client}/auth`; add that address to `SSO_APP_REDIRECTS`.
+- **Web client** (Expo web): sign-in opens in a popup and returns to `{web client}/auth`. The one botd's installer or Compose serves returns to `{SSO_PUBLIC_URL}/app/auth`, which is allowed by default; add any other web client's address to `SSO_APP_REDIRECTS`.
 - **Desktop (Electron)**: not yet; it loads from `file://`, which Microsoft can't return to. Use a sign-in code (`botctl user code <user>`).
 
 ## Troubleshooting

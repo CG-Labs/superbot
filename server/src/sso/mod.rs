@@ -191,11 +191,12 @@ impl Sso {
             Some(p) => format!("{}:{p}", u.host_str().unwrap_or("")),
             None => u.host_str().unwrap_or("").to_string(),
         };
-        sso.public_url = public;
+        // The default also covers the web client the installer and Compose serve at /app/.
         sso.app_redirects = match list("SSO_APP_REDIRECTS") {
-            l if l.is_empty() => vec!["superbot://auth".into()],
+            l if l.is_empty() => vec!["superbot://auth".into(), format!("{public}/app/auth")],
             l => l,
         };
+        sso.public_url = public;
         if let Some(r) = sso.app_redirects.iter().find(|r| !app_redirect_ok(r)) {
             return Err(format!("SSO_APP_REDIRECTS: {r} is not an app redirect (a custom scheme like superbot://auth, or https; no query)"));
         }
@@ -640,7 +641,7 @@ mod tests {
         let p = s.provider("entra").unwrap();
         assert_eq!((p.label.as_str(), p.type_name(), p.jit_role, p.scopes.as_str()), ("Microsoft", "entra", None, "openid profile email"));
         assert_eq!((s.public_url.as_str(), s.public_host.as_str()), ("https://bot.example.com", "bot.example.com"));
-        assert_eq!(s.app_redirects, ["superbot://auth"]);
+        assert_eq!(s.app_redirects, ["superbot://auth", "https://bot.example.com/app/auth"]);
         assert_eq!(s.redirect_uri("entra"), "https://bot.example.com/api/auth/sso/entra/callback");
         assert_eq!(entra(&[("SSO_ENTRA_JIT_ROLE", "member")]).unwrap().providers[0].jit_role, Some(Role::Member));
         let multi = entra(&[("SSO_ENTRA_TENANT", "organizations"), ("SSO_ENTRA_ALLOWED_TENANTS", "22222222-2222-2222-2222-222222222222")]).unwrap();

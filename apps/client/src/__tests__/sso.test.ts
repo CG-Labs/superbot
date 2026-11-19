@@ -1,5 +1,5 @@
 import * as WebBrowser from "expo-web-browser";
-import { fetchSsoProviders, newPkce, parseSsoReturn, redeemSso, signInWithSso, ssoStartUrl, SSO_ERRORS } from "../sso";
+import { fetchSsoProviders, newPkce, parseSsoReturn, redeemSso, signInWithSso, ssoRedirect, ssoStartUrl, SSO_ERRORS } from "../sso";
 
 type NodeCrypto = {
   createHash(alg: string): { update(data: string): { digest(enc: string): string } };
@@ -16,7 +16,10 @@ jest.mock("expo-crypto", () => {
     digestStringAsync: async (_alg: string, data: string) => c.createHash("sha256").update(data).digest("base64"),
   };
 });
-jest.mock("expo-linking", () => ({ createURL: (path: string) => `superbot://${path}` }));
+// Absolute paths resolve against the page origin, as expo-linking does on the web.
+jest.mock("expo-linking", () => ({
+  createURL: (path: string) => (path.startsWith("/") ? `https://bots.example.com${path}` : `superbot://${path}`),
+}));
 jest.mock("expo-web-browser", () => ({ openAuthSessionAsync: jest.fn(), maybeCompleteAuthSession: jest.fn() }));
 
 const BASE = "https://bots.example.com/";
@@ -49,6 +52,12 @@ describe("the start URL", () => {
 });
 
 describe("the redirect back to the app", () => {
+  it("comes back to the web build's base path, or the app scheme", () => {
+    expect(ssoRedirect("web", "/app")).toBe("https://bots.example.com/app/auth");
+    expect(ssoRedirect("ios", "/app")).toBe("superbot://auth");
+    expect(ssoRedirect("android", undefined)).toBe("superbot://auth");
+  });
+
   it("gives the code only when the state is ours", () => {
     expect(parseSsoReturn("superbot://auth?code=sbh_1&state=s1", "s1")).toEqual({ code: "sbh_1" });
     expect(parseSsoReturn("superbot://auth?code=sbh_1&state=other", "s1")).toEqual({ error: SSO_ERRORS.sso_expired });

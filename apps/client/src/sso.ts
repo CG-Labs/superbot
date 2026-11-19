@@ -74,6 +74,15 @@ export function prepareSso(): void {
   if (!prepared) void newPkce().then((p) => (prepared = prepared ?? p));
 }
 
+/**
+ * Where the server sends the one-time code: `superbot://auth` in the native app, the
+ * `auth` route on the web, under the build's base path (`/app/auth` when botd's
+ * installer or Compose serves it).
+ */
+export function ssoRedirect(os: string = Platform.OS, base: string | undefined = process.env.EXPO_BASE_URL): string {
+  return Linking.createURL(os === "web" && base ? `${base}/auth` : "auth");
+}
+
 export function ssoStartUrl(
   baseUrl: string,
   providerId: string,
@@ -111,7 +120,7 @@ export async function redeemSso(baseUrl: string, code: string, verifier: string,
  * session on iOS and Android, a popup on the web), returning to the `auth` route.
  */
 export async function signInWithSso(baseUrl: string, providerId: string, label = "SuperBot app"): Promise<ServerConfig> {
-  const redirect = Linking.createURL("auth");
+  const redirect = ssoRedirect();
   const pkce = prepared ?? (await newPkce());
   prepared = null;
   prepareSso();
