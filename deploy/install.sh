@@ -372,7 +372,7 @@ db_has_sealed_values() {
   [[ -n $(sudo -u "$SUPERBOT_USER" sqlite3 -readonly "$db" "SELECT 1 FROM settings WHERE key = 'secrets_key_check'" 2>/dev/null) ]]
 }
 
-# The key that encrypts secrets in SQLite (docs/adr/0009-secrets.md). Made once,
+# The key that encrypts secrets in SQLite (docs/adr/0010-secrets.md). Made once,
 # before botd (re)starts, as the service user: 0600 in a 0700 folder, outside
 # DATA_DIR so database backups don't carry it. Never replaced.
 # shellcheck disable=SC2016
@@ -406,7 +406,7 @@ ensure_master_key() {
     fi
     log "Master key: keeping $key_file"
   else
-    if db_has_sealed_values "$repo_path/data/app.sqlite"; then
+    if db_has_sealed_values "$repo_path/data/app.sqlite" && ! grep -q '^SUPERBOT_FORGET_SEALED=1$' "$env_file"; then
       die "No master key at $key_file, but the database holds values sealed with one. Restore the key (deploy/README.md) and re-run."
     fi
     log "Creating master key $key_file"

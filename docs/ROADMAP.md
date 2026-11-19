@@ -87,7 +87,7 @@ Basic auth may remain for **break-glass** and **self-host hobby** tiers only, be
 | | |
 |--|--|
 | **Goal** | Reduce blast radius and improve deploy surface before selling to strangers. |
-| **Scope** | Approvals MVP (pause before destructive harness tools); secrets via env/Vault interface (not plaintext in SQLite); structured audit **events** (append-only file or table) for admin actions; optional Docker **Compose** one-click (image + `botd` + Caddy + volume mounts) per [architecture](architecture.md) and community expectation (e.g. upstream issue **#7** — Compose packaging; not yet in CG-Labs tree); harness **policy** flags (when to allow bypass vs require approval); client: routine editor ✓, screen viewer parity with `web/` ✓, handoff UI ✓ ([ADR 0008](adr/0008-client-screen-auth.md)), real EAS `projectId` + brand assets. |
+| **Scope** | Approvals MVP (pause before destructive harness tools); secrets via env/Vault interface (not plaintext in SQLite) ✓ ([ADR 0010](adr/0010-secrets.md)); structured audit **events** (append-only file or table) for admin actions; optional Docker **Compose** one-click (image + `botd` + Caddy + volume mounts) per [architecture](architecture.md) and community expectation (e.g. upstream issue **#7** — Compose packaging; not yet in CG-Labs tree); harness **policy** flags (when to allow bypass vs require approval); client: routine editor ✓, screen viewer parity with `web/` ✓, handoff UI ✓ ([ADR 0008](adr/0008-client-screen-auth.md)), real EAS `projectId` + brand assets. |
 | **Exit criteria** | Compose documented as supported path; approvals cover send-email/shell/file-delete class tools; audit export CSV; client routine CRUD + screen iframe ✓. |
 | **Size** | **L** |
 | **Dependencies** | M0 |
@@ -156,7 +156,7 @@ Basic auth may remain for **break-glass** and **self-host hobby** tiers only, be
 |-------|--------|-------------------|
 | Harness permissions | Bypass flags on all adapters | Policy engine: default **ask** for risky tools; bypass only in dev profiles (**done**: [ADR 0007](adr/0007-approvals.md)) |
 | Compute isolation | One OS user, shared workspace | Tenant workspaces (M3); optional per-bot containers (M5) |
-| Secrets | Harness logins on service user disk | Vault + short-lived tokens (M1→M5) |
+| Secrets | Env/`_FILE` or sealed in SQLite, master key outside backups, values redacted (**done**: [ADR 0010](adr/0010-secrets.md)); harness logins still on service user disk | Key rotation; Vault / Key Vault / Secret Manager stores and short-lived tokens (M5) |
 | Network | Caddy TLS, loopback `botd` | Same + mTLS internal where multi-service |
 | Client | Password in SecureStore | OAuth tokens, certificate pinning (managed) |
 
