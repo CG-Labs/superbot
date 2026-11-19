@@ -50,7 +50,8 @@ RUN groupadd --system --gid "$SUPERBOT_UID" superbot \
         --home-dir /home/superbot --create-home --shell /bin/bash superbot \
     && install -d -o superbot -g superbot -m 0700 /data /workspace /backups
 
-COPY --from=build /out/botd /out/botctl /usr/local/bin/
+# botd prepends its own folder to each Bot's PATH, so it lives apart from the npm CLIs in /usr/local/bin.
+COPY --from=build /out/botd /out/botctl /opt/superbot/bin/
 COPY --chmod=0755 deploy/docker/superbot-backup.sh /usr/local/bin/superbot-backup
 COPY --chmod=0755 deploy/docker/superbot-restore.sh /usr/local/bin/superbot-restore
 
@@ -63,7 +64,7 @@ ENV HOME=/home/superbot \
     WORKSPACE_DIR=/workspace \
     BACKUP_DIR=/backups \
     NPM_CONFIG_PREFIX=/home/superbot/.local \
-    PATH=/home/superbot/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PATH=/opt/superbot/bin:/home/superbot/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     DISABLE_AUTOUPDATER=1
 
 USER superbot

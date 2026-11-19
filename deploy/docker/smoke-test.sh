@@ -85,12 +85,22 @@ for h in ${SMOKE_HARNESSES-claude codex pi}; do
 done
 log "Harness CLIs runnable: ${SMOKE_HARNESSES-claude codex pi}"
 
+log "botd's folder (prepended to Bots' PATH) holds no harness CLI, so runtime npm upgrades win"
+# shellcheck disable=SC2016
+dc exec -T botd sh -c 'd=$(dirname "$(command -v botd)"); for h in claude codex pi; do [ ! -e "$d/$h" ] || exit 1; done' \
+  || fail "a harness CLI sits next to botd and would shadow ~/.local/bin for Bots"
+
 log "Backup service wrote an archive"
 for _ in $(seq 1 30); do
   dc exec -T backup sh -c 'ls /backups/superbot-*.tar.gz' >/dev/null 2>&1 && break
   sleep 1
 done
 dc exec -T backup sh -c 'ls /backups/superbot-*.tar.gz' >/dev/null || fail "no archive in /backups"
+before=$(dc exec -T backup sh -c 'ls /backups/superbot-*.tar.gz | wc -l')
+sleep 1
+dc exec -T botd superbot-backup
+after=$(dc exec -T backup sh -c 'ls /backups/superbot-*.tar.gz | wc -l')
+[[ "$after" -gt "$before" ]] || fail "manual 'exec botd superbot-backup' did not land in the backups volume"
 
 log "SSE events stream through Caddy without buffering"
 curl -sN --max-time 5 "${AUTH[@]}" "$BASE/api/events" >"$WORK/events.txt" &

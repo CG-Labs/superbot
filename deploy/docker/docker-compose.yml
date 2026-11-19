@@ -37,6 +37,8 @@ services:
       - data:/data
       - workspace:/workspace
       - home:/home/superbot
+      # So `docker compose exec botd superbot-backup` archives outlive the container.
+      - backups:/backups
     # Not published: reachable only through Caddy on the compose network.
     expose: ["3000"]
     stop_grace_period: 30s
