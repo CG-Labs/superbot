@@ -940,3 +940,77 @@ async fn machines_are_found_by_their_own_tag() {
     assert_eq!(code, 200, "{v}");
     assert!(fake.machines().is_empty(), "not left running and billed");
 }
+
+#[tokio::test]
+async fn retries_keep_a_machine_that_exists() {
+    let (port, app, admin, _, fake) = serve().await;
+    let (uid, _) = user_with(port, &admin, "ada@example.com", "member").await;
+    let base = format!("/api/users/{uid}/machine");
+
+    // A create that went through with its answer lost, then a refusal (say, a revoked
+    // token): an error row with a machine at the provider.
+    fake.fail_next("create", ProviderError::Transport("timed out".into()));
+    let (_, m) = json_call(port, "POST", &base, &admin, "").await;
+    let orphan = fake.insert(
+        m["label"].as_str().unwrap(),
+        "g6-standard-2",
+        "gb-lon",
+        &["superbot"],
+    );
+    fake.fail_next(
+        "create",
+        ProviderError::Api {
+            status: 401,
+            message: "Invalid Token".into(),
+        },
+    );
+    reconcile(port, &admin).await;
+    assert_eq!(app.db.user_machine(&uid).unwrap().state, State::Error);
+
+    // Can't tell yet: nothing changes.
+    fake.fail_next(
+        "list",
+        ProviderError::Api {
+            status: 401,
+            message: "Invalid Token".into(),
+        },
+    );
+    let (code, v) = json_call(port, "POST", &base, &admin, r#"{"region":"de-fra-2"}"#).await;
+    assert_eq!(
+        (code, v["machine"]["state"].as_str()),
+        (502, Some("error")),
+        "{v}"
+    );
+    // It's there: a new region or tier is refused rather than reported falsely.
+    let (code, v) = json_call(port, "POST", &base, &admin, r#"{"region":"de-fra-2"}"#).await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("gb-lon"), "{v}");
+    assert_eq!(
+        app.db.user_machine(&uid).unwrap().region,
+        "gb-lon",
+        "unchanged"
+    );
+
+    // A plain retry adopts it, recorded as it really is.
+    let (code, m) = json_call(port, "POST", &base, &admin, "").await;
+    assert_eq!(
+        (
+            code,
+            m["state"].as_str(),
+            m["providerId"].as_str(),
+            m["tier"].as_str(),
+            m["plan"].as_str(),
+            m["region"].as_str()
+        ),
+        (
+            202,
+            Some("provisioning"),
+            Some(orphan.as_str()),
+            Some("pro"),
+            Some("g6-standard-2"),
+            Some("gb-lon")
+        ),
+        "{m}"
+    );
+    assert_eq!(fake.machines().len(), 1);
+}

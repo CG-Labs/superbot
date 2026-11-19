@@ -133,7 +133,7 @@ Limits: the parser sees commands, not what scripts or programs do inside, so thi
 API keys and tokens for Bots come from two places, first match wins:
 
 1. **Environment**: `NAME=value` in `.env`, or `NAME_FILE=/path` (Docker/systemd secrets). Same for `AUTH_PASSWORD` (`AUTH_PASSWORD_FILE`).
-2. **Saved secrets**, encrypted in SQLite: `botctl secret set OPENAI_API_KEY < key.txt` (value on stdin), `botctl secrets`, `botctl secret rm NAME`. Bots get them as environment variables from their next run. The exception is SSO client secrets (`SSO_<ID>_CLIENT_SECRET`): saved the same way, but only botd uses them, and every `SSO_*` variable is kept out of Bots' environments.
+2. **Saved secrets**, encrypted in SQLite: `botctl secret set OPENAI_API_KEY < key.txt` (value on stdin), `botctl secrets`, `botctl secret rm NAME`. Bots get them as environment variables from their next run. The exceptions are SSO client secrets (`SSO_<ID>_CLIENT_SECRET`), `TURNSTILE_SECRET` and `LINODE_TOKEN`: only botd uses them, and they (with their `_FILE` forms and every `SSO_*` variable) are kept out of Bots' environments.
 
 Saved secrets and every approval's tool input are sealed with XChaCha20-Poly1305 under a master key: `SUPERBOT_MASTER_KEY` (64 hex chars), or the 0600 file in `SUPERBOT_MASTER_KEY_FILE` (default `~/.config/superbot/master.key`, created on first start). The key never lives in `DATA_DIR`, so backups don't carry it. botd won't start with a wrong key, or without the key once something is sealed.
 
@@ -278,7 +278,7 @@ Approvals, policy, and audit. Writes, decisions, the approvals list, and the aud
 - `POST /api/approvals/check` `{from, harness, event}`: the hook's call. Waits for a decision. Replies `allow` or `deny`, then the reason, as plain text
 - `GET /api/audit?from=&to=&action=&actor=&outcome=&bot=&limit=&before=<id>`: audit events, newest first, `{events, nextBefore}`. `from`/`to`: unix ms, RFC 3339, or `YYYY-MM-DD`. `action`: exact or `prefix.*`, comma-separated. `actor`: `user`, `bot`, or `system`, optionally `:<id>` (or `user:<email>`). Also `method` (comma-separated `password`, `code`, `sso`, `none`, `bot_token`), `idp` (type), `idpProvider` (id), `subject` (`<issuer>|<sub>`), `session`, `onBehalfOf` (user id or email). Each event has `actorEmail`, `actorRole`, `authMethod`, `idp`, `idpProvider`, `sessionId`, `onBehalfOf`. `limit` 1 to 1000, default 100
 - `GET /api/audit/export.csv` (same filters): CSV download, oldest first
-- `GET /api/secrets`: `{secrets: [{name, store, writable, shadowedBy, forBots}]}`, names only; `forBots` is false for botd's own SSO client secrets. `PUT /api/secrets/:name` `{value}`, `DELETE /api/secrets/:name`. Admin only
+- `GET /api/secrets`: `{secrets: [{name, store, writable, shadowedBy, forBots}]}`, names only; `forBots` is false for botd's own secrets (SSO client secrets, `TURNSTILE_SECRET`, `LINODE_TOKEN`). `PUT /api/secrets/:name` `{value}`, `DELETE /api/secrets/:name`. Admin only
 
 ## Not built yet
 

@@ -62,10 +62,15 @@ pub struct Guard {
 pub(crate) const SECRET_ENV: [&str; 6] =
     ["AUTH_PASSWORD", "AUTH_PASSWORD_FILE", "SUPERBOT_PASSWORD", "SUPERBOT_TOKEN", "SUPERBOT_MASTER_KEY", "SUPERBOT_MASTER_KEY_FILE"];
 
-/// `SECRET_ENV`, and every `SSO_*` setting: sign-in config, including client secrets (ADR 0014).
+/// `SECRET_ENV`, `secrets::SERVER_SECRETS` (and their `_FILE`), and every `SSO_*`
+/// setting: sign-in config, including client secrets (ADR 0014).
 pub(crate) fn strip_secret_env(cmd: &mut std::process::Command) {
     for k in SECRET_ENV {
         cmd.env_remove(k);
+    }
+    for k in crate::secrets::SERVER_SECRETS {
+        cmd.env_remove(k);
+        cmd.env_remove(format!("{k}_FILE"));
     }
     for (k, _) in std::env::vars_os() {
         if k.to_str().is_some_and(|k| k.starts_with("SSO_")) {
@@ -318,4 +323,17 @@ pub fn new_uuid() -> String {
     b[8] = (b[8] & 0x3f) | 0x80;
     let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
     format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn server_secrets_are_stripped_from_harnesses() {
+        let mut cmd = std::process::Command::new("true");
+        super::strip_secret_env(&mut cmd);
+        let removed: Vec<_> = cmd.get_envs().filter(|(_, v)| v.is_none()).map(|(k, _)| k.to_string_lossy().into_owned()).collect();
+        for k in ["AUTH_PASSWORD", "SUPERBOT_MASTER_KEY_FILE", "LINODE_TOKEN", "LINODE_TOKEN_FILE", "TURNSTILE_SECRET", "TURNSTILE_SECRET_FILE"] {
+            assert!(removed.iter().any(|r| r == k), "{k}");
+        }
+    }
 }

@@ -411,6 +411,18 @@ async fn provision(
     match found {
         Ok((pm, adopted)) => {
             observe(&mut m, &pm);
+            if adopted {
+                // Record the machine as it is, should it differ from what the row asked for.
+                if pm.plan != m.plan {
+                    m.tier = cp
+                        .tiers
+                        .iter()
+                        .find(|(_, plan)| *plan == pm.plan)
+                        .map_or(m.tier.clone(), |(t, _)| t.clone());
+                    m.plan = pm.plan.clone();
+                }
+                m.region = pm.region.clone();
+            }
             m.state = next(from, Step::Created).unwrap_or(from);
             m.last_error = None;
             if app.db.save_machine(&m, from) {
@@ -773,6 +785,20 @@ pub async fn request(
     let _g = cp.ops.lock().await;
     let m = match app.db.user_machine(&u.id) {
         Some(mut m) if m.state == State::Error => {
+            // The label stays, so a machine made by an earlier create would be adopted
+            // as it is. Only change what's asked for when there's none.
+            if (&tier, &region) != (&m.tier, &m.region) {
+                match by_label(p, &m).await {
+                    Err(e) => return Ok(failed(&app, &e.to_string(), &m)),
+                    Ok(Some(pm)) => {
+                        return Err(conflict(format!(
+                            "This user's machine still exists at the provider ({} in {}). Ask again without a tier or region and resize it once it's back, or destroy it first.",
+                            pm.plan, pm.region
+                        )));
+                    }
+                    Ok(None) => {}
+                }
+            }
             m.state = next(m.state, Step::Retry).unwrap_or(m.state);
             (m.tier, m.plan, m.region) = (tier, plan, region);
             (

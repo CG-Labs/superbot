@@ -95,6 +95,7 @@ All are checked at startup: a bad value stops botd, like other settings.
 
 - **Same request twice.** `POST /api/users/:user/machine` returns the user's live machine with 200 instead of making another. The unique index makes that true even if two requests race past the check. Asking for a *different* tier or region is a 409: that is a resize, not a retry.
 - **Lost answers.** Each machine's Linode label is fixed when the row is saved, before Linode is called. If a create reached Linode but its answer was lost (timeout, crash), the next attempt gets "label must be unique". The control plane then lists machines with the row's tag, finds the one with its label, and adopts it. It never makes a second.
+- **Retries after an error.** The label stays the same, so an earlier create's machine would be adopted as it is. A retry that changes tier or region first looks for it by label: if it's there, the retry is refused (409); if Linode can't be asked, nothing changes (502). When a machine is adopted, its real plan and region are recorded.
 - **Late creates.** A create that went unanswered may still make a machine. If such a row is destroyed before the machine shows up, it stays `destroying` for 15 minutes after the create was sent, looking for the label on each pass and deleting what it finds. Only then is it `destroyed`.
 - **Serialised changes.** Handlers and the reconciler take one async lock per change. Every save is also a compare-and-set on the old state (`UPDATE … WHERE state = ?`), so a stale change loses instead of overwriting.
 - **Actions check Linode first.** Suspend, resume and resize read the machine at Linode before acting. If it is already off, on, or on the plan, no call is made and only our state is updated. So a call whose answer was lost is neither repeated nor wrongly taken as done.
@@ -114,6 +115,8 @@ The reconciler never boots or shuts down a machine to undo a change made in the 
 ### Secrets
 
 `LINODE_TOKEN` comes through the secret store's env layer (`LINODE_TOKEN` or `LINODE_TOKEN_FILE`, [ADR 0010](0010-secrets.md)). It is registered with the redactor at startup, so it can't leak into chats, events, or the audit log.
+
+It is botd's alone. Bots never get it: `LINODE_TOKEN` and `LINODE_TOKEN_FILE` are stripped from harness and screen processes, and the secrets layer never adds it (from a file or the store) to a Bot's environment. Otherwise a Bot could call Linode directly and skip the admin-only routes. `TURNSTILE_SECRET` gets the same treatment.
 
 The client keeps the token in a zeroizing string, sends it only as the `Authorization` header, and leaves it out of `Debug`. Errors carry Linode's error reasons or the transport error without the URL. A test checks that no error or debug string contains the token.
 
