@@ -32,5 +32,6 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test
+      - run: npm run brand:test
       - run: npm run brand:check
       - run: npm run build:web

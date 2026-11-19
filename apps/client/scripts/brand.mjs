@@ -64,7 +64,7 @@ const crc32 = (buf) => {
   for (const b of buf) c = crcTable[(c ^ b) & 0xff] ^ (c >>> 8);
   return (c ^ 0xffffffff) >>> 0;
 };
-const chunk = (type, data) => {
+export const chunk = (type, data) => {
   const out = Buffer.alloc(12 + data.length);
   out.writeUInt32BE(data.length, 0);
   out.write(type, 4, "ascii");
@@ -72,7 +72,7 @@ const chunk = (type, data) => {
   out.writeUInt32BE(crc32(out.subarray(4, 8 + data.length)), 8 + data.length);
   return out;
 };
-const PNG_SIG = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+export const PNG_SIG = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 
 function encodePng(w, h, rgba, alpha) {
   const ch = alpha ? 4 : 3;
@@ -98,7 +98,7 @@ function encodePng(w, h, rgba, alpha) {
 
 export function decodePng(buf) {
   if (!buf.subarray(0, 8).equals(PNG_SIG)) throw new Error("not a PNG");
-  let off = 8, w = 0, h = 0, type = -1, depth = 0, interlace = 0;
+  let off = 8, w = 0, h = 0, type = -1, depth = 0, interlace = 0, trns = null;
   const idat = [];
   while (off < buf.length) {
     const len = buf.readUInt32BE(off);
@@ -106,10 +106,12 @@ export function decodePng(buf) {
     const data = buf.subarray(off + 8, off + 8 + len);
     if (kind === "IHDR") [w, h, depth, type, interlace] = [data.readUInt32BE(0), data.readUInt32BE(4), data[8], data[9], data[12]];
     if (kind === "IDAT") idat.push(data);
+    // tRNS makes RGB, greyscale or palette pixels transparent without changing the color type.
+    if (kind === "tRNS") trns = Buffer.from(data);
     off += 12 + len;
   }
   const ch = { 2: 3, 6: 4 }[type];
-  if (depth !== 8 || !ch || interlace) return { w, h, type, rgba: null };
+  if (depth !== 8 || !ch || interlace) return { w, h, type, trns, rgba: null };
   const raw = zlib.inflateSync(Buffer.concat(idat));
   const stride = w * ch;
   const px = Buffer.alloc(stride * h);
@@ -127,7 +129,13 @@ export function decodePng(buf) {
   }
   const rgba = Buffer.alloc(w * h * 4, 255);
   for (let i = 0; i < w * h; i++) for (let c = 0; c < ch; c++) rgba[i * 4 + c] = px[i * ch + c];
-  return { w, h, type, rgba };
+  if (type === 2 && trns?.length === 6) {
+    const key = [trns.readUInt16BE(0), trns.readUInt16BE(2), trns.readUInt16BE(4)];
+    for (let i = 0; i < w * h; i++) {
+      if (key.every((k, c) => k === rgba[i * 4 + c])) rgba[i * 4 + 3] = 0;
+    }
+  }
+  return { w, h, type, trns, rgba };
 }
 
 const render = (a) => {
@@ -157,6 +165,24 @@ function generate() {
 // Rasterizers can differ by a rounding step across CPUs, so compare pixels with a small tolerance.
 const TOLERANCE = 3;
 
+// Returns the problems with one committed asset's PNG bytes; empty when it matches its SVG source.
+export function checkPng(a, buf) {
+  const png = decodePng(buf);
+  const errors = [];
+  if (png.w !== a.w || png.h !== a.h) errors.push(`${a.file}: ${png.w}x${png.h}, want ${a.w}x${a.h}`);
+  if (png.type !== (a.alpha ? 6 : 2)) errors.push(`${a.file}: PNG color type ${png.type}, want ${a.alpha ? "RGBA (6)" : "RGB (2), no alpha"}`);
+  if (png.trns) errors.push(`${a.file}: has a tRNS transparency chunk; run npm run brand`);
+  if (!png.rgba) errors.push(`${a.file}: unsupported PNG encoding (need 8-bit, non-interlaced); run npm run brand`);
+  if (errors.length) return errors;
+  const want = render(a);
+  let bad = 0;
+  for (let i = 0; i < want.length; i++) {
+    if ((a.alpha || i % 4 !== 3) && Math.abs(want[i] - png.rgba[i]) > TOLERANCE) bad++;
+  }
+  if (bad) errors.push(`${a.file}: ${bad} channel values differ from the SVG source; run npm run brand`);
+  return errors;
+}
+
 function check() {
   const errors = [];
   for (const a of assets) {
@@ -165,18 +191,7 @@ function check() {
       errors.push(`${a.file}: missing`);
       continue;
     }
-    const png = decodePng(fs.readFileSync(file));
-    const before = errors.length;
-    if (png.w !== a.w || png.h !== a.h) errors.push(`${a.file}: ${png.w}x${png.h}, want ${a.w}x${a.h}`);
-    if (png.type !== (a.alpha ? 6 : 2)) errors.push(`${a.file}: PNG color type ${png.type}, want ${a.alpha ? "RGBA (6)" : "RGB (2), no alpha"}`);
-    if (!png.rgba) errors.push(`${a.file}: unsupported PNG encoding (need 8-bit, non-interlaced); run npm run brand`);
-    if (errors.length > before) continue;
-    const want = render(a);
-    let bad = 0;
-    for (let i = 0; i < want.length; i++) {
-      if ((a.alpha || i % 4 !== 3) && Math.abs(want[i] - png.rgba[i]) > TOLERANCE) bad++;
-    }
-    if (bad) errors.push(`${a.file}: ${bad} channel values differ from the SVG source; run npm run brand`);
+    errors.push(...checkPng(a, fs.readFileSync(file)));
   }
 
   const app = JSON.parse(fs.readFileSync(path.join(root, "app.json"), "utf8")).expo;

@@ -60,7 +60,8 @@
     "desktop:pack": "npm run build:web && electron-builder --linux dir --win dir",
     "test": "jest",
     "brand": "node scripts/brand.mjs",
-    "brand:check": "node scripts/brand.mjs --check"
+    "brand:check": "node scripts/brand.mjs --check",
+    "brand:test": "node --test scripts/brand.test.mjs"
   },
   "build": {
     "appId": "com.cglabs.superbot",
@@ -76,6 +77,7 @@
   },
   "private": true,
   "jest": {
-    "preset": "jest-expo"
+    "preset": "jest-expo",
+    "testPathIgnorePatterns": ["/node_modules/", "<rootDir>/scripts/"]
   }
 }
