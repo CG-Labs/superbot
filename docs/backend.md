@@ -15,12 +15,12 @@ botd embeds `site/` and `web/`. Set `SITE_DIR` or `WEB_DIR` to serve them from d
 
 - **Bots** live in SQLite. Each Bot has a harness (`claude`, `codex`, `pi`, or `hermes`), an optional model, and a harness session id.
 - **A message** is queued. Each Bot runs one task at a time, in order. Different Bots run in parallel.
-- **A run** spawns the harness CLI in the shared workspace, streams its JSON events, and saves each text block as a chat bubble.
+- **A run** spawns the harness CLI in its owner's folder, streams its JSON events, and saves each text block as a chat bubble.
 - **Live updates** go to the browser over one Server-Sent Events stream: new messages, streaming text, and what the Bot is doing ("Running: ls").
 - **Memory** is plain files, re-sent in the system prompt every run. The Bot edits them itself:
   - `DATA_DIR/bots/<id>/MEMORY.md`: one Bot's job, rules, and work log.
-  - `DATA_DIR/USER.md`: facts about the user, shared by all Bots.
-- **The computer** is `WORKSPACE_DIR`, shared by all Bots, like Grok Bot's shared VM.
+  - `DATA_DIR/users/<owner>/USER.md`: facts about the Bot's owner, shared by that user's Bots.
+- **The computer** is one per user: `WORKSPACE_DIR/users/<owner>/`, shared by that user's Bots. Each Bot gets its own API token and its owner's saved secrets. See [ADR 0028](adr/0028-per-user-isolation.md).
 - **Routines** are cron schedules. Bots create them with the `botctl` CLI, which works from any harness's shell.
 - **Bot to Bot**: a Bot runs `botctl ask "<Bot>" "<message>"`. The other Bot answers in its own chat and the reply prints back. If it takes over 9 minutes, the reply arrives later as a new message.
 - **Model and effort** are saved per Bot. The web app shows a faint picker above the input. Unset means the harness default.
@@ -83,7 +83,7 @@ Settings are in [.env.example](../.env.example). Keep `botctl` next to `botd`: t
 - Set `ALLOWED_HOSTS` to the domain your proxy forwards (blocks DNS rebinding). See the one-command installer in [deploy/README.md](../deploy/README.md).
 - Proxies must not buffer `/api/events` (it's an SSE stream).
 - Set `TZ` to the user's time zone. Routines use it.
-- Back up `DATA_DIR`. `WORKSPACE_DIR` is the Bots' scratch and files.
+- Back up `DATA_DIR`. `WORKSPACE_DIR/users/<id>/` is each user's scratch and files.
 - Sign-ups are on by default: anyone can ask for access at `/get-started`, and nothing happens until an admin approves. See [Sign-ups](#sign-ups).
 - `GET /healthz` returns `{"ok":true}` without auth.
 
