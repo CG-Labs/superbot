@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Create or update deploy/docker/.env for the Compose setup. Safe to re-run: never replaces AUTH_PASSWORD.
+# Create or update deploy/docker/.env for the Compose setup. Safe to re-run: never replaces
+# AUTH_PASSWORD or SUPERBOT_MASTER_KEY.
 #   ./init.sh                                   # http://localhost, random password
 #   ./init.sh --domain bots.example.com --tz Europe/Jersey --user-name Alex
 set -euo pipefail
@@ -72,6 +73,12 @@ if ! grep -Eq "^AUTH_PASSWORD=('[^']+'|[^'[:space:]]+)" "$ENV_FILE"; then
   set_env AUTH_PASSWORD "$new_password"
 fi
 
+new_key=false
+if ! grep -Eq "^SUPERBOT_MASTER_KEY=('[^']+'|[^'[:space:]]+)" "$ENV_FILE"; then
+  set_env SUPERBOT_MASTER_KEY "$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
+  new_key=true
+fi
+
 if [[ "$DOMAIN_SET" == true ]]; then
   set_env SUPERBOT_DOMAIN "$DOMAIN"
   if [[ -n "$DOMAIN" ]]; then
@@ -88,5 +95,8 @@ fi
 
 if [[ -n "$new_password" ]]; then
   printf 'New login password (also AUTH_PASSWORD in %s): %s\n' "$ENV_FILE" "$new_password"
+fi
+if [[ "$new_key" == true ]]; then
+  printf 'New master key: SUPERBOT_MASTER_KEY in %s. Back it up apart from the data volume.\n' "$ENV_FILE"
 fi
 printf 'Next: cd %s && docker compose up -d --build\n' "$DIR"
