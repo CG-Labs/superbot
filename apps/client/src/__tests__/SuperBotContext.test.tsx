@@ -47,6 +47,8 @@ let holdHistory = false;
 /** The server's /api/auth/login: absent (an old server), or the token it hands out. */
 let loginToken: string | null = null;
 let permissions: string[] | undefined;
+/** When set, the server never answers a logout. */
+let stallLogout = false;
 const TOKEN = "sbs_" + "a".repeat(64);
 
 function respond(status: number, body: unknown) {
@@ -62,6 +64,7 @@ beforeEach(() => {
   releaseHistory = null;
   loginToken = null;
   permissions = undefined;
+  stallLogout = false;
   (connectSse as jest.Mock).mockClear();
   (saveCredentials as jest.Mock).mockClear();
   (clearCredentials as jest.Mock).mockClear();
@@ -77,7 +80,7 @@ beforeEach(() => {
       const ok = body.password === "hunter2" || body.code === "sbc_good";
       return ok ? respond(200, { token: loginToken, user: { id: "u1" } }) : respond(401, { error: "Wrong password." });
     }
-    if (path === "/api/auth/logout") return respond(200, { ok: true });
+    if (path === "/api/auth/logout") return stallLogout ? new Promise(() => {}) : respond(200, { ok: true });
     if (loginToken && auth !== `Bearer ${loginToken}`) return respond(401, { error: "Login required" });
     if (path === "/api/state") {
       return respond(200, { me: { name: "Me", permissions }, harnesses: ["claude"], defaultHarness: "claude", bots: [bot("b1", true), bot("b2", false, bobUnread, bobHandoff)] });
@@ -270,6 +273,16 @@ describe("SuperBotProvider", () => {
     await waitFor(() => expect(hook.result.current.ready).toBe(true));
     expect(hook.result.current.api).toBeNull();
     expect(hook.result.current.error).toBe("Your session ended. Sign in again.");
+    expect(clearCredentials).toHaveBeenCalled();
+  });
+
+  it("signs out on the device even when the server doesn't answer", async () => {
+    loginToken = TOKEN;
+    stallLogout = true;
+    (loadSavedCredentials as jest.Mock).mockImplementation(async () => ({ baseUrl: BASE, token: TOKEN }));
+    const { result } = await connected();
+    await act(() => result.current.logout());
+    expect(result.current.api).toBeNull();
     expect(clearCredentials).toHaveBeenCalled();
   });
 

@@ -348,12 +348,12 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
     await saveCredentials(cfg);
   };
 
+  // Signs out on the device first, so a slow server can't keep anyone signed in.
   const logout = async () => {
-    sseRef.current?.close();
-    clientRef.current = null;
-    await api?.logout().catch(() => {});
+    const client = api;
     reset();
     await clearCredentials();
+    void client?.logout().catch(() => {});
   };
 
   const refresh = async (reloadMessages?: boolean) => {

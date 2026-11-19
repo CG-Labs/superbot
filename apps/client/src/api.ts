@@ -83,8 +83,16 @@ export class SuperBotApi {
   }
 
   /** Ends this session on the server. Nothing to end for a password config. */
-  async logout(): Promise<void> {
-    if (this.cfg.token) await this.request("POST", "/api/auth/logout");
+  /** Ends the session on the server, giving up after `timeoutMs`. */
+  async logout(timeoutMs = 5000): Promise<void> {
+    if (!this.cfg.token) return;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeoutMs);
+    try {
+      await fetch(`${this.baseUrl}/api/auth/logout`, { method: "POST", headers: this.headers(false), signal: ctl.signal });
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async createBot(body: {
