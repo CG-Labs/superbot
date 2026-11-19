@@ -327,3 +327,22 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .ap-modal { width: 820px; }
 .ap-body { align-items: stretch; gap: 12px; }
 .ap-body .approval { width: auto; }
+
+/* Audit log */
+#audit-btn { margin-top: 2px; }
+.au-modal { width: 1180px; display: flex; flex-direction: column; overflow: hidden; }
+.au-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 14px 32px; border-bottom: 1px solid #2c2c2c; font-size: 14px; color: var(--text-dim); }
+.au-filters input, .au-filters select { background: #232323; color: var(--text); border: 1px solid #333; border-radius: 999px; padding: 6px 12px; font: inherit; outline: none; color-scheme: dark; }
+.au-filters #au-action { flex: 1; min-width: 220px; }
+.au-filters label { display: flex; align-items: center; gap: 6px; }
+.au-body { align-items: stretch; padding: 0 0 16px; overflow: auto; min-height: 200px; }
+.au-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+.au-table th { position: sticky; top: 0; background: #1f1f1f; text-align: left; font-weight: 500; color: var(--text-dim); padding: 10px 12px; border-bottom: 1px solid #2c2c2c; white-space: nowrap; }
+.au-table td { padding: 8px 12px; border-bottom: 1px solid #262626; vertical-align: top; white-space: nowrap; }
+.au-table td code { font-size: 13px; }
+.au-table .au-detail { max-width: 360px; overflow: hidden; text-overflow: ellipsis; color: var(--text-dim); font-family: ui-monospace, monospace; font-size: 12.5px; }
+.au-table tr.au-bad td:nth-child(5) { color: #e5484d; }
+.au-body .empty { text-align: center; }
+.au-more { align-self: center; margin-top: 12px; padding: 6px 18px; font-size: 15px; }
+.au-note { margin-right: auto; font-size: 13.5px; color: var(--text-faint); }
+a.nb-btn { text-decoration: none; display: inline-block; }
