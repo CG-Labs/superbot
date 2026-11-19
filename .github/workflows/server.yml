@@ -16,6 +16,9 @@ on:
       - 'deploy/**'
       - '.github/workflows/server.yml'
 
+permissions:
+  contents: read
+
 jobs:
   rust:
     runs-on: ubuntu-latest
@@ -38,15 +41,53 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Piped install uses deploy/ from cloned repo (not bash stdin path)
+      - name: Piped dry run on a fresh host (no user, no clone)
         run: |
           set -euo pipefail
-          sudo useradd -m -s /bin/bash superbot 2>/dev/null || true
-          sudo install -d -o superbot -g superbot /home/superbot/superbot/deploy
-          sudo cp deploy/superbot.service deploy/superbot-backup.service \
-            deploy/superbot-backup.timer deploy/superbot-backup.sh \
-            /home/superbot/superbot/deploy/
+          if id superbot 2>/dev/null || [[ -e /home/superbot ]]; then exit 1; fi
           cat deploy/install.sh | sudo bash -s -- --dry-run --non-interactive \
-            --domain ci.example.com --tz UTC | tee /tmp/piped-install.log
-          grep -Fq 'Using deploy assets from /home/superbot/superbot/deploy' /tmp/piped-install.log
-          grep -Fq '/home/superbot/superbot/deploy/superbot.service' /tmp/piped-install.log
+            --domain ci.example.com --tz UTC | tee /tmp/fresh.log
+          grep -Fq 'would fetch https://github.com/CG-Labs/superbot.git (main) into root-owned /usr/local/share/superbot/src.git' /tmp/fresh.log
+          grep -Fq 'would render /etc/systemd/system/superbot.service from /usr/local/share/superbot/deploy/superbot.service (User=superbot, ExecStart=/usr/local/bin/botd)' /tmp/fresh.log
+          grep -Fq 'SuperBot is installed.' /tmp/fresh.log
+      - name: Piped dry run ignores templates in the service user's checkout
+        run: |
+          set -euo pipefail
+          sudo useradd -m -s /bin/bash superbot
+          sudo -u superbot mkdir -p /home/superbot/superbot/deploy
+          printf '[Service]\nUser=root\nExecStart=/bin/sh -c id\n' | sudo -u superbot tee /home/superbot/superbot/deploy/superbot.service >/dev/null
+          cat deploy/install.sh | sudo bash -s -- --dry-run --non-interactive \
+            --domain ci.example.com --tz UTC | tee /tmp/poisoned.log
+          if grep -Fq '/home/superbot/superbot/deploy' /tmp/poisoned.log; then exit 1; fi
+          grep -Fq 'from /usr/local/share/superbot/deploy/superbot.service' /tmp/poisoned.log
+      - name: Root stages templates from its own fetch and renders fixed units
+        run: |
+          set -euo pipefail
+          sudo cp -a "$GITHUB_WORKSPACE" /tmp/src
+          sudo chown -R root:root /tmp/src
+          sudo env SUPERBOT_INSTALL_NO_MAIN=1 SHARE_DIR=/tmp/share SYSTEMD_DIR=/tmp/units \
+            REPO_URL=file:///tmp/src REPO_BRANCH=HEAD bash -c '
+            set -euo pipefail
+            source deploy/install.sh
+            stage_trusted_deploy
+            for f in "${DEPLOY_FILES[@]}"; do
+              cmp "$SHARE_DIR/deploy/$f" "deploy/$f"
+              [[ $(stat -c %U "$SHARE_DIR/deploy/$f") == root ]]
+            done
+            mkdir -p "$SYSTEMD_DIR"
+            render_unit "$SHARE_DIR/deploy/superbot.service" "$SYSTEMD_DIR/superbot.service" "$(service_unit_fixed /home/superbot)"
+            render_unit "$SHARE_DIR/deploy/superbot-backup.service" "$SYSTEMD_DIR/superbot-backup.service" "$(backup_unit_fixed /home/superbot)"
+            render_unit "$SHARE_DIR/deploy/superbot-backup.timer" "$SYSTEMD_DIR/superbot-backup.timer" ""
+            [[ $(grep -c "^User=" "$SYSTEMD_DIR/superbot.service") == 1 ]]
+            grep -qx "User=superbot" "$SYSTEMD_DIR/superbot.service"
+            grep -qx "ExecStart=/usr/local/bin/botd" "$SYSTEMD_DIR/superbot.service"
+            grep -qx "ExecStart=/usr/local/bin/superbot-backup /home/superbot" "$SYSTEMD_DIR/superbot-backup.service"
+            grep -qx "OnCalendar=\*-\*-\* 03:15:00" "$SYSTEMD_DIR/superbot-backup.timer"
+            printf "[Service]\nUser=root\nExecStart=/bin/sh\n" >/tmp/evil-identity.service
+            render_unit /tmp/evil-identity.service /tmp/out.service "$(service_unit_fixed /home/superbot)"
+            if grep -q root /tmp/out.service; then exit 1; fi
+            printf "[Service]\nExecStartPre=/bin/sh -c id\n" >/tmp/evil-pre.service
+            if (render_unit /tmp/evil-pre.service /tmp/out2.service "$(service_unit_fixed /home/superbot)"); then exit 1; fi
+            if (INSTALL_DIR=/home/superbot/superbot; stage_trusted_deploy); then exit 1; fi
+            echo ok
+          '
