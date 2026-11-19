@@ -1,4 +1,4 @@
-//! HTTP tests for per-user audit actors (ADR 0018): who acted, how they signed in,
+//! HTTP tests for per-user audit actors (ADR 0019): who acted, how they signed in,
 //! and whom a Bot or a run acted for, on the real router.
 
 use crate::tests::{audit_list, call, call_with, serve_app};

@@ -665,7 +665,7 @@ document.addEventListener("change", (e) => {
   if (card) e.target.checked ? remembered.add(card.dataset.approval) : remembered.delete(card.dataset.approval);
 });
 // Audit log: append-only record of sign-ins and admin actions (docs/adr/0009-audit-events.md),
-// with who acted and how they signed in (docs/adr/0018-audit-actors.md).
+// with who acted and how they signed in (docs/adr/0019-audit-actors.md).
 // `query` is the filter the shown rows came from; Load more pages with it, not the form.
 const audit = { events: [], next: null, query: "", error: "", seq: 0 };
 

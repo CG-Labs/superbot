@@ -61,7 +61,7 @@ pub struct Message {
     pub from_bot: Option<String>,
     #[serde(rename = "at")]
     pub created_at: i64,
-    /// Who asked for the run this message starts, for the audit log (ADR 0018).
+    /// Who asked for the run this message starts, for the audit log (ADR 0019).
     #[serde(skip)]
     pub requested_by: Option<audit::Who>,
 }
@@ -215,7 +215,7 @@ pub struct AuditEvent {
     pub ip: Option<String>,
     pub user_agent: Option<String>,
     pub details: Value,
-    // Per-user actors (ADR 0018). Null on rows written before it.
+    // Per-user actors (ADR 0019). Null on rows written before it.
     pub actor_email: Option<String>,
     pub actor_role: Option<String>,
     /// "password" (break-glass), "code", "sso", "none" (ALLOW_NO_AUTH), or "bot_token".
@@ -468,10 +468,10 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 6] =
     [migrate_approvals, migrate_audit_events, migrate_users, migrate_identities, migrate_bot_acls, migrate_audit_actors];
 
-/// The actor columns the audit log gained with per-user actors (ADR 0018).
+/// The actor columns the audit log gained with per-user actors (ADR 0019).
 pub const AUDIT_ACTOR_COLUMNS: [&str; 7] = ["actor_email", "actor_role", "auth_method", "idp", "idp_provider", "session_id", "on_behalf_of"];
 
-/// Per-user audit actors (ADR 0018): each event says who acted as of then (email,
+/// Per-user audit actors (ADR 0019): each event says who acted as of then (email,
 /// role), how they signed in (method, SSO provider and type, session), and whom a Bot
 /// acted for. Only adds nullable columns, so old rows stay as written: the log is
 /// append-only, and guessing at who did something before it was recorded would be

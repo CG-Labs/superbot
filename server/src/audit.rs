@@ -2,7 +2,7 @@
 //! triggers refuse UPDATE, and DELETE of anything younger than the retention
 //! window (`AUDIT_RETENTION_DAYS`). Never put secrets or message bodies in an
 //! event; `details` is scrubbed on write as a second line of defense.
-//! Design: docs/adr/0009-audit-events.md; per-user actors and IdP: 0018-audit-actors.md.
+//! Design: docs/adr/0009-audit-events.md; per-user actors and IdP: 0019-audit-actors.md.
 
 use crate::db::{now, AuditEvent, Bot};
 use crate::runner::App;
@@ -645,7 +645,7 @@ impl Filter {
 
 // CSV export (RFC 4180): CRLF line ends, quotes doubled, and cells that a
 // spreadsheet would run as a formula start with an apostrophe. The actor columns
-// added with per-user actors (ADR 0018) come last, so scripts that read the first
+// added with per-user actors (ADR 0019) come last, so scripts that read the first
 // fourteen by position keep working.
 
 pub const CSV_HEADER: &str = "id,time,actor_kind,actor_id,actor_name,actor_subject,action,target_type,target_id,bot_id,outcome,ip,user_agent,details,\
@@ -1006,7 +1006,7 @@ mod tests {
         let mut f = q(&[("actor", "user:old@example.com")]).unwrap();
         f.resolve_users(|_| None);
         assert_eq!((f.actor_id, f.actor_email.as_deref()), (None, Some("old@example.com")));
-        let many = vec!["sso"; 11].join(",");
+        let many = ["sso"; 11].join(",");
         for bad in [
             ("method", "SSO"),
             ("method", "sso;drop"),

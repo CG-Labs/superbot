@@ -396,7 +396,7 @@ impl App {
 
     /// Who a run is for: whoever queued its message. Routines run as the scheduler,
     /// and replies as the Bot that answered, both for their Bot's owner; messages
-    /// queued before per-user actors (ADR 0018) as the runner.
+    /// queued before per-user actors (ADR 0019) as the runner.
     fn requester(&self, bot: &Bot, msg: &Message) -> Who {
         if let Some(by) = &msg.requested_by {
             return by.clone();
