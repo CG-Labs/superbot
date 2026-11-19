@@ -74,8 +74,10 @@ export function takeInviteCode(
   hist: Hist | undefined = typeof window === "undefined" ? undefined : window.history,
 ): string | null {
   if (!loc?.hash || !loc.hash.includes("code=")) return null;
+  // `loc` is the live location in browsers: read the code before the URL loses it.
+  const code = codeFromHash(loc.hash);
   hist?.replaceState(null, "", `${loc.pathname}${loc.search}`);
-  return codeFromHash(loc.hash);
+  return code;
 }
 
 const METHOD_LABEL: Record<string, string> = { password: "password", code: "code", sso: "SSO" };

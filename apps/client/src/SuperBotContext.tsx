@@ -319,6 +319,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
     sseRef.current?.close();
     clientRef.current = null;
     setApi(null);
+    offerInviteCode(null);
     setBots([]);
     setMessages({});
     setDrafts({});
@@ -342,6 +343,8 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
       applyState(state);
       clientRef.current = client;
       setApi(client);
+      // Signed in: an invite code from the link is spent, or wasn't needed.
+      offerInviteCode(null);
       startSse(client);
       void prefetchUnread(client, state.bots);
     },

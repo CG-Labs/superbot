@@ -1452,9 +1452,19 @@ impl Db {
             .unwrap();
     }
 
-    /// Drops a user's unused sign-in codes. Returns how many.
-    pub fn drop_login_codes(&self, user_id: &str) -> usize {
-        self.c().execute("DELETE FROM login_codes WHERE user_id = ? AND used_at IS NULL", [user_id]).unwrap_or(0)
+    /// Adds a sign-in code in place of the user's unused ones, in one transaction so two
+    /// admins replacing at once leave one working code. Returns how many it replaced.
+    pub fn replace_login_codes(&self, code_hash: &str, user_id: &str, created_by: &str, expires_at: i64) -> usize {
+        let mut c = self.c();
+        let tx = c.transaction().unwrap();
+        let n = tx.execute("DELETE FROM login_codes WHERE user_id = ? AND used_at IS NULL", [user_id]).unwrap();
+        tx.execute(
+            "INSERT INTO login_codes (code_hash, user_id, created_by, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+            params![code_hash, user_id, created_by, now(), expires_at],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        n
     }
 
     /// Unused, unexpired codes per user: how many, and when the last of them expires.

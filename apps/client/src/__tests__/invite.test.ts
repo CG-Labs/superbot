@@ -33,9 +33,13 @@ describe("invites", () => {
   });
 
   it("takes a code from the link and clears it from the address bar", () => {
-    const replaceState = jest.fn();
     const loc = { hash: `#code=${CODE}`, pathname: "/app/", search: "?x=1" };
+    // Like a browser: replacing the URL changes the live location at once.
+    const replaceState = jest.fn(() => {
+      loc.hash = "";
+    });
     expect(takeInviteCode(loc, { replaceState })).toBe(CODE);
+    expect(loc.hash).toBe("");
     expect(replaceState).toHaveBeenCalledWith(null, "", "/app/?x=1");
   });
 

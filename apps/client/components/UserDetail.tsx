@@ -38,6 +38,15 @@ function Button({ label, onPress, danger, disabled }: { label: string; onPress: 
   );
 }
 
+function LoadFailed({ message, onRetry }: { message: string; onRetry: () => void }) {
+  return (
+    <View style={styles.row}>
+      <Text style={[styles.error, { flex: 1 }]}>{message}</Text>
+      <Button label="Retry" onPress={onRetry} />
+    </View>
+  );
+}
+
 export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -45,7 +54,11 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
   const [code, setCode] = useState<LoginCode | null>(null);
   const [sessions, setSessions] = useState<SessionView[] | null>(null);
   const [bots, setBots] = useState<UserBots | null>(null);
-  const [linkProvider, setLinkProvider] = useState(providers[0]?.id ?? "");
+  const [sessionsError, setSessionsError] = useState<string | null>(null);
+  const [botsError, setBotsError] = useState<string | null>(null);
+  const [pickedProvider, setLinkProvider] = useState("");
+  // Providers can arrive after this opens; until someone picks, link with the first.
+  const linkProvider = providers.some((p) => p.id === pickedProvider) ? pickedProvider : (providers[0]?.id ?? "");
   const [subject, setSubject] = useState("");
   const [tenant, setTenant] = useState("");
   const self = user.id === meId;
@@ -53,9 +66,13 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
   const active = user.status === "active";
 
   const loadExtras = useCallback(async () => {
-    const [s, b] = await Promise.all([api.userSessions(user.id).catch(() => null), api.userBots(user.id).catch(() => null)]);
-    setSessions(s);
-    setBots(b);
+    const failed = (err: unknown) => (err instanceof Error ? err.message : "Couldn't load");
+    setSessionsError(null);
+    setBotsError(null);
+    await Promise.all([
+      api.userSessions(user.id).then(setSessions, (err) => setSessionsError(failed(err))),
+      api.userBots(user.id).then(setBots, (err) => setBotsError(failed(err))),
+    ]);
   }, [api, user.id]);
 
   useEffect(() => {
@@ -82,7 +99,10 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
 
   const toggleStatus = async () => {
     if (active && !(await confirmAsync(`Disable ${user.name}?`, "They are signed out everywhere and can't sign in until you enable them again.", "Disable"))) return;
-    void run(() => api.patchUser(user.id, { status: active ? "disabled" : "active" }));
+    void run(async () => {
+      await api.patchUser(user.id, { status: active ? "disabled" : "active" });
+      if (active) setCode(null);
+    });
   };
 
   const newCode = async () => {
@@ -92,7 +112,10 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
 
   const signOutEverywhere = async () => {
     if (!(await confirmAsync(`Sign ${user.name} out everywhere?`, "Ends every session and drops any unused sign-in code.", "Sign out"))) return;
-    void run(() => api.revokeUserSessions(user.id));
+    void run(async () => {
+      await api.revokeUserSessions(user.id);
+      setCode(null);
+    });
   };
 
   const unlink = async (id: string, what: string) => {
@@ -156,7 +179,14 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
       </Section>
 
       <Section title="Sessions">
-        {sessions == null ? (
+        {sessionsError ? (
+          <>
+            <LoadFailed message={sessionsError} onRetry={() => void loadExtras()} />
+            <View style={styles.row}>
+              <Button label="Sign out everywhere" danger disabled={busy} onPress={() => void signOutEverywhere()} />
+            </View>
+          </>
+        ) : sessions == null ? (
           <ActivityIndicator color={colors.textDim} />
         ) : (
           <>
@@ -226,7 +256,9 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
       </Section>
 
       <Section title="Bot access">
-        {bots == null ? (
+        {botsError ? (
+          <LoadFailed message={botsError} onRetry={() => void loadExtras()} />
+        ) : bots == null ? (
           <ActivityIndicator color={colors.textDim} />
         ) : bots.bots.length ? (
           bots.bots.map((b) => (

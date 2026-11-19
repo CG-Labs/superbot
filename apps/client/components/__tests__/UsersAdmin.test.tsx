@@ -2,6 +2,7 @@ import React from "react";
 import { act, render, screen, userEvent, within } from "@testing-library/react-native";
 import { UsersAdmin, matchesUser } from "../UsersAdmin";
 import type { SuperBotApi } from "../../src/api";
+import { fetchSsoProviders } from "../../src/sso";
 import type { AdminUser } from "../../src/types";
 
 jest.mock("../BotAvatar", () => ({ BotAvatar: () => null }));
@@ -130,6 +131,7 @@ describe("UsersAdmin", () => {
 
     await user.press(screen.getByText("Sign out everywhere"));
     expect(api.revokeUserSessions).toHaveBeenCalledWith("u1");
+    expect(screen.queryByTestId("code-reveal")).toBeNull();
 
     await user.press(screen.getByText("Disable"));
     expect(api.patchUser).toHaveBeenCalledWith("u1", { status: "disabled" });
@@ -138,12 +140,36 @@ describe("UsersAdmin", () => {
     expect(api.unlinkIdentity).toHaveBeenCalledWith("u1", "i1");
   });
 
+  it("shows a failed load with a retry, and still offers sign out", async () => {
+    const { api, user } = await open([owner, alex]);
+    api.userSessions.mockRejectedValueOnce(new Error("Server unreachable"));
+    api.userBots.mockRejectedValueOnce(new Error("Server unreachable"));
+    await user.press(screen.getByLabelText("User Alex"));
+    expect(await screen.findAllByText("Server unreachable")).toHaveLength(2);
+    expect(screen.getByText("Sign out everywhere")).toBeOnTheScreen();
+    await user.press(screen.getAllByText("Retry")[0]);
+    expect(await screen.findByText(/^Scout/)).toBeOnTheScreen();
+    expect(screen.queryByText("Server unreachable")).toBeNull();
+  });
+
   it("links an SSO account by its id at the provider", async () => {
     const { api, user } = await open([owner, alex]);
     await user.press(screen.getByLabelText("User Alex"));
     await user.type(await screen.findByLabelText("Subject"), "4242");
     await user.press(screen.getByText("Link"));
     expect(api.linkIdentity).toHaveBeenCalledWith("u1", { provider: "github", subject: "4242", tenant: undefined });
+  });
+
+  it("links with the first provider when providers arrive after the user opens", async () => {
+    let arrive: (p: unknown) => void = () => {};
+    jest.mocked(fetchSsoProviders).mockImplementationOnce(() => new Promise((r) => (arrive = r as typeof arrive)));
+    const { api, user } = await open([owner, alex]);
+    await user.press(screen.getByLabelText("User Alex"));
+    await act(async () => arrive([{ id: "work", label: "Work", type: "entra" }]));
+    await user.type(await screen.findByLabelText("Subject"), "oid-1");
+    expect(screen.getByLabelText("Tenant")).toBeOnTheScreen();
+    await user.press(screen.getByText("Link"));
+    expect(api.linkIdentity).toHaveBeenCalledWith("u1", { provider: "work", subject: "oid-1", tenant: undefined });
   });
 
   it("won't let you change your own or the owner's role or status", async () => {

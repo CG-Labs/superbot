@@ -537,10 +537,15 @@ pub async fn create_login_code(State(app): State<AppState>, Extension(by): Exten
         Value::Bool(b) => *b,
         _ => return Err(bad("replace must be true or false")),
     };
-    let replaced = if replace { app.db.drop_login_codes(&u.id) } else { 0 };
     let code = new_secret(CODE_PREFIX);
     let expires = db::now() + ttl * MINUTE;
-    app.db.add_login_code(&hash(&code), &u.id, by.actor.id.as_deref().unwrap_or(""), expires);
+    let created_by = by.actor.id.as_deref().unwrap_or("");
+    let replaced = if replace {
+        app.db.replace_login_codes(&hash(&code), &u.id, created_by, expires)
+    } else {
+        app.db.add_login_code(&hash(&code), &u.id, created_by, expires);
+        0
+    };
     let mut details = json!({ "ttlMinutes": ttl });
     if replace {
         details["replaced"] = json!(replaced);
@@ -720,6 +725,28 @@ mod tests {
         db.update_user(OPERATOR, UserPatch { status: Some("active"), ..Default::default() }).unwrap();
         assert_eq!(db.revoke_user_sessions(OPERATOR, "x", "test"), 1);
         assert_eq!(db.prune_sessions(db::now() + 1, cfg.idle_ms, cfg.max_ms), 2);
+    }
+
+    #[test]
+    fn replacing_codes_at_once_leaves_one() {
+        let db = std::sync::Arc::new(db::Db::open(&db::temp_path("replace").join("app.sqlite")).unwrap());
+        let u = db.create_user(None, Some("r@example.com"), "R", Role::Member).unwrap();
+        let at = db::now();
+        let codes: Vec<String> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..8)
+                .map(|_| {
+                    let (db, id) = (&db, &u.id);
+                    s.spawn(move || {
+                        let code = new_secret(CODE_PREFIX);
+                        db.replace_login_codes(&hash(&code), id, OPERATOR, at + MINUTE);
+                        code
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(db.pending_codes(at)[&u.id].0, 1);
+        assert_eq!(codes.iter().filter(|c| db.use_login_code(&hash(c), at).is_some()).count(), 1);
     }
 
     #[test]
