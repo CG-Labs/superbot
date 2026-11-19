@@ -9,6 +9,8 @@ mod approvals;
 mod audit;
 #[cfg(test)]
 mod audit_http_tests;
+#[cfg(test)]
+mod auth_review_http_tests;
 mod cron;
 mod db;
 mod paths;
@@ -625,10 +627,12 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
         };
         return denied("role", msg);
     }
-    // A cookie rides along on any request the browser makes, so writes must come from our own pages.
-    // Some GETs act too (opening a screen starts it), so only plain reads are exempt.
+    // A cookie, a password the browser cached, or ALLOW_NO_AUTH rides along on any request the
+    // browser makes, so writes on them must come from our own pages. Only a Bearer token is sent on
+    // purpose. Some GETs act too (opening a screen starts it), so only plain reads are exempt.
     let safe = matches!(method, Method::GET | Method::HEAD | Method::OPTIONS) && matches!(need, rbac::Perm::Account | rbac::Perm::Read | rbac::Perm::Review);
-    if caller.session.as_ref().is_some_and(|s| s.kind == "cookie") && !safe && !users::same_origin(req.headers()) {
+    let ambient = !req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).is_some_and(|h| h.starts_with("Bearer "));
+    if ambient && !safe && !users::same_origin(req.headers()) {
         return denied("cross_site", "Cross-site request refused.".into());
     }
     let principal = caller.principal;
@@ -684,10 +688,19 @@ fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<
             let pass = creds.splitn(2, |c| *c == b':').nth(1).unwrap_or_default();
             !a.password.is_empty() && same(pass, a.password.as_bytes())
         });
-        return match ok || a.allow_no_auth {
-            true => Ok(operator(if ok { "password" } else { "none" })),
-            false => fail("password", None, false),
-        };
+        if a.allow_no_auth {
+            return Ok(operator(if ok { "password" } else { "none" }));
+        }
+        // Every API route takes the password, so guesses here count against the sign-in limiter too.
+        let (ip, at) = (source.ip.clone().unwrap_or_default(), db::now());
+        if let Some(retry) = a.limiter.blocked(&ip, at) {
+            return Err(Box::new(users::too_many(retry)));
+        }
+        if !ok {
+            a.limiter.fail(&ip, at);
+            return fail("password", None, false);
+        }
+        return Ok(operator("password"));
     }
     if !h.is_empty() {
         return fail("unknown_scheme", None, false);
@@ -739,9 +752,11 @@ fn need_user(p: Principal) -> Res<()> {
     }
 }
 
-/// Constant-time comparison.
+/// Constant-time comparison. Both sides are hashed first, so the time taken doesn't show a secret's length either.
 fn same(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
+    use sha2::{Digest, Sha256};
+    let (a, b) = (Sha256::digest(a), Sha256::digest(b));
+    std::hint::black_box(a.iter().zip(b.iter()).fold(0, |acc, (x, y)| acc | (x ^ y))) == 0
 }
 
 fn base64_decode(s: &str) -> Option<Vec<u8>> {

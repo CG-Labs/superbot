@@ -554,6 +554,8 @@ async fn failed_sign_ins_are_rate_limited_per_client_ip() {
     assert_eq!(code, 429, "even the right password waits");
     assert!(header(&head, "retry-after").unwrap().parse::<u64>().unwrap() > 0);
     assert_eq!(login(port, &from(1, "198.51.100.2"), json!({ "password": PW.as_str() })).await.0, 200);
-    // Basic auth (botctl, old clients) is not locked out by the sign-in limiter.
-    assert_eq!(call_with(port, "GET", "/api/state", &admin, &from(1, "198.51.100.1"), "").await.0, 200);
+    // Break-glass Basic takes the same password, so it waits too (ADR 0024); sessions don't.
+    assert_eq!(call_with(port, "GET", "/api/state", &admin, &from(1, "198.51.100.1"), "").await.0, 429);
+    let t = bearer(&token_for(port, json!({ "password": PW.as_str() })).await);
+    assert_eq!(call_with(port, "GET", "/api/state", &t, &from(1, "198.51.100.1"), "").await.0, 200);
 }
