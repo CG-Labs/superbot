@@ -13,6 +13,9 @@ mod audit_http_tests;
 mod auth_review_http_tests;
 mod cron;
 mod db;
+mod machines;
+#[cfg(test)]
+mod machines_http_tests;
 mod paths;
 mod policy;
 mod rbac;
@@ -109,6 +112,8 @@ async fn main() {
     let sso = sso::Sso::from_env().unwrap_or_else(|e| exit(format!("SSO: {e}")));
     let signups = signups::Signups::from_env(&secrets::env::EnvStore::process(), &env("SIGNUPS", ""), &env("TURNSTILE_SITE_KEY", ""))
         .unwrap_or_else(|e| exit(format!("Sign-ups: {e}")));
+    let control_plane = machines::ControlPlane::from_env(&secrets::env::EnvStore::process(), |k| env(k, ""))
+        .unwrap_or_else(|e| exit(format!("Control plane: {e}")));
     let allow_no_auth = auth_startup(&host, &password, break_glass);
     secrets::redact::register(&password);
     if adapters::get(&default_harness).is_none() {
@@ -181,8 +186,10 @@ async fn main() {
         sessions,
         sso,
         signups,
+        machines: Arc::new(control_plane),
         ..Auth::new(Some(app.clone()))
     });
+    println!("Control plane: {}.", auth_state.machines.describe());
     println!(
         "Sign-ups: {}.",
         match (auth_state.signups.enabled, auth_state.signups.turnstile.is_some()) {
@@ -196,6 +203,7 @@ async fn main() {
         println!("SSO: {} ({}, {}), {ready}; {}; just-in-time sign-up {}.", p.id, p.label, p.type_name(), p.audience(), p.jit_role.map_or("off", |r| r.as_str()));
     }
     let sso_ids: Vec<String> = auth_state.sso.providers.iter().map(|p| p.id.clone()).collect();
+    let control_plane = auth_state.machines.clone();
     let router = router(app.clone(), auth_state);
     let policy = app.db.global_policy();
     app.db.record(&Event::new(Actor::system("server"), "server.started").details(json!({
@@ -212,9 +220,11 @@ async fn main() {
         "auditRetentionDays": retention,
         "screens": app.screens.is_some(),
         "sso": sso_ids,
+        "controlPlane": control_plane.enabled(),
     })));
     audit::start_retention(app.clone(), retention);
     users::start_pruning(app.clone(), sessions);
+    machines::start(app.clone(), control_plane);
     if policy.mode == policy::Mode::Bypass {
         eprintln!(
             "WARNING: harness policy is bypass: Bots run every tool without asking. \
@@ -301,6 +311,13 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/bots", get(users::user_bots))
         .route("/users/{key}/identities", get(sso::list_identities).post(sso::link_identity))
         .route("/users/{key}/identities/{id}", delete(sso::unlink_identity))
+        .route("/users/{key}/machine", get(machines::get).post(machines::request).delete(machines::destroy))
+        .route("/users/{key}/machine/suspend", post(machines::suspend))
+        .route("/users/{key}/machine/resume", post(machines::resume))
+        .route("/users/{key}/machine/resize", post(machines::resize))
+        .route("/machines", get(machines::list_all))
+        .route("/machines/reconcile", post(machines::reconcile_now))
+        .route("/machine", get(machines::mine))
         .route("/sessions", get(users::list_sessions))
         .route("/sessions/{id}", delete(users::revoke_session))
         .route("/signups", get(signups::list).post(signups::submit).layer(DefaultBodyLimit::max(signups::MAX_BODY)))
@@ -399,6 +416,8 @@ struct Auth {
     sso: sso::Sso,
     /// The public "Get started" form (ADR 0022).
     signups: signups::Signups,
+    /// Per-user machines (ADR 0025). Off unless LINODE_TOKEN is set.
+    machines: Arc<machines::ControlPlane>,
     /// The database: sessions and audit events. None in tests of auth alone.
     app: Option<AppState>,
 }
@@ -417,6 +436,7 @@ impl Auth {
             limiter: users::Limiter::default(),
             sso: sso::Sso::default(),
             signups: signups::Signups::default(),
+            machines: Arc::default(),
             app,
         }
     }

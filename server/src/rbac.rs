@@ -108,6 +108,9 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         (_, ["users", ..] | ["sessions", ..]) => Admin,
 
         ("GET", ["auth", "me"]) | ("POST", ["auth", "logout"]) => Account,
+        // Your own machine (ADR 0025). Everyone else's, and every change, is under
+        // `users` above or `machines`, which fall through to Admin.
+        ("GET", ["machine"]) => Account,
 
         ("GET", ["state" | "events" | "bots" | "policy"]) => Read,
         ("GET", ["harnesses", _, "models"]) => Read,
@@ -220,6 +223,15 @@ mod tests {
             ("POST", "/api/signups/su1/approve", Perm::Admin),
             ("POST", "/api/signups/su1/reject", Perm::Admin),
             ("GET", "/api/auth/me", Perm::Account),
+            ("GET", "/api/machine", Perm::Account),
+            ("GET", "/api/machines", Perm::Admin),
+            ("POST", "/api/machines/reconcile", Perm::Admin),
+            ("GET", "/api/users/u1/machine", Perm::Admin),
+            ("POST", "/api/users/u1/machine", Perm::Admin),
+            ("DELETE", "/api/users/u1/machine", Perm::Admin),
+            ("POST", "/api/users/u1/machine/suspend", Perm::Admin),
+            ("POST", "/api/users/u1/machine/resume", Perm::Admin),
+            ("POST", "/api/users/u1/machine/resize", Perm::Admin),
             ("POST", "/api/auth/logout", Perm::Account),
             ("GET", "/", Perm::Read),
             ("GET", "/app.js", Perm::Read),
@@ -252,6 +264,8 @@ mod tests {
         assert_eq!(classify(&Method::GET, "/api/bots/b1/grants/u1"), Perm::Admin);
         assert_eq!(classify(&Method::PUT, "/api/bots/b1/grants"), Perm::Admin);
         assert_eq!(classify(&Method::POST, "/"), Perm::Admin);
+        assert_eq!(classify(&Method::POST, "/api/machine"), Perm::Admin);
+        assert_eq!(classify(&Method::GET, "/api/machine/m1"), Perm::Admin);
         assert_eq!(classify(&Method::OPTIONS, "/api/state"), Perm::Admin);
     }
 
