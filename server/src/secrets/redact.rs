@@ -1,8 +1,9 @@
 //! Redaction of known secret values. Every secret botd knows (its stores' values, the
 //! login password, the Bots' token, screen tokens, the master key, and secret-looking
 //! environment variables) becomes `[redacted]` before text is saved to SQLite, pushed
-//! to clients, or written to the audit log. Exact values only: a secret botd was never
-//! told about can't be recognized here.
+//! to clients, or written to the audit log. Exact values only, plus the session tokens
+//! and sign-in codes botd issues (by shape): a secret botd was never told about can't
+//! be recognized here.
 
 use rusqlite::{params, Connection};
 use serde_json::Value;
@@ -48,7 +49,7 @@ pub fn known() -> Vec<String> {
 
 pub fn text(s: &str) -> Cow<'_, str> {
     let known = KNOWN.read().unwrap_or_else(|e| e.into_inner());
-    if !known.iter().any(|k| s.contains(k.as_str())) {
+    if !known.iter().any(|k| s.contains(k.as_str())) && next_issued(s).is_none() {
         return Cow::Borrowed(s);
     }
     let mut out = s.to_string();
@@ -57,7 +58,32 @@ pub fn text(s: &str) -> Cow<'_, str> {
             out = out.replace(k.as_str(), MARK);
         }
     }
-    Cow::Owned(out)
+    Cow::Owned(strip_issued(&out))
+}
+
+/// Session tokens and sign-in codes botd issues. Only their hashes are kept, so they
+/// can't be registered; they're recognized by shape: a prefix and 64 hex digits.
+const ISSUED: [&str; 2] = [crate::users::SESSION_PREFIX, crate::users::CODE_PREFIX];
+const ISSUED_HEX: usize = 64;
+
+/// Where the first issued token in `s` starts, and its length.
+fn next_issued(s: &str) -> Option<(usize, usize)> {
+    ISSUED
+        .iter()
+        .flat_map(|p| s.match_indices(p).map(move |(i, _)| (i, p.len() + ISSUED_HEX)))
+        .filter(|&(i, len)| s.as_bytes().get(i + len - ISSUED_HEX..i + len).is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit)))
+        .min()
+}
+
+fn strip_issued(s: &str) -> String {
+    let (mut out, mut rest) = (String::with_capacity(s.len()), s);
+    while let Some((i, len)) = next_issued(rest) {
+        out.push_str(&rest[..i]);
+        out.push_str(MARK);
+        rest = &rest[i + len..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Every string in a JSON value, at any depth. Keys are left alone.
@@ -141,6 +167,19 @@ mod tests {
         forget(&key);
         assert!(text(&key).contains(&key));
         forget(&longer);
+    }
+
+    #[test]
+    fn issued_tokens_are_redacted_by_shape() {
+        let session = crate::users::new_secret(crate::users::SESSION_PREFIX);
+        let code = crate::users::new_secret(crate::users::CODE_PREFIX);
+        assert_eq!(text(&format!("my code is {code}, token {session}.")), "my code is [redacted], token [redacted].");
+        assert_eq!(value(json!({ "t": format!("Bearer {session}") }))["t"], "Bearer [redacted]");
+        for s in ["sbs_", "sbc_abc", "sbs_x", "the sbc_ prefix"] {
+            assert!(matches!(text(s), Cow::Borrowed(_)), "{s}");
+        }
+        let short = format!("sbs_{}", "a".repeat(ISSUED_HEX - 1));
+        assert_eq!(text(&short), short.as_str(), "too short to be a token");
     }
 
     #[test]

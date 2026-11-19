@@ -34,7 +34,7 @@ Users are never deleted, only disabled, so audit rows keep pointing at someone. 
 
 - **Why not JWTs**: botd is one process with one database, so a lookup per request is cheap, and every request already needs the database. A server-side row can be revoked at once (logout, admin revoke, user disabled, role changed); a JWT stays valid until it expires unless we add a deny list, which is a session table again. Roles are read from the user row on every request, so a demotion applies to the next request, not the next token. JWTs would also add key management and algorithm pitfalls for no gain. When there are several servers (M3), they can share the session store or call the control plane.
 - **Why SHA-256 and not bcrypt/argon2**: the tokens are 256-bit random, so there is nothing to guess; a slow hash only protects low-entropy secrets like passwords. A plain hash means a leaked database (or backup) holds no usable tokens, and lookup is by an index on the hash, so there is no timing leak from string comparison.
-- **Prefixes** (`sbs_` sessions, `sbc_` sign-in codes) make leaked tokens easy to spot; the audit scrubber redacts both.
+- **Prefixes** (`sbs_` sessions, `sbc_` sign-in codes) make leaked tokens easy to spot. The audit scrubber redacts both, and so does the redaction of saved chats, approvals, and live events ([ADR 0010](0010-secrets.md)), by shape, since only their hashes are kept.
 
 **Two ways to carry the token**:
 
@@ -69,7 +69,7 @@ Three roles. One function, `rbac::classify(method, path)`, maps each API route t
 | `review` | approvals list | ✓ | ✓ | ✓ | |
 | `write` | create/edit/delete Bots and routines, send messages, mark read, stop, screen, ask, handoff, approval check | ✓ | ✓ | | ✓ |
 | `approve` | approve or deny a pending approval once (remembering it as a rule is a policy change: admin) | ✓ | ✓ | | |
-| `admin` | policy and rules changes, audit log and export, users, sign-in codes, sessions | ✓ | | | |
+| `admin` | policy and rules changes, audit log and export, secrets, users, sign-in codes, sessions | ✓ | | | |
 
 - **Default deny**: a route the table doesn't name needs `admin`. So does any path with an empty segment, a trailing slash, or unexpected case, so a path that dodges the table can't land on a weaker permission. New routes are admin-only until someone classifies them, and `rbac.rs`'s tests list every route with the permission it should need.
 - **Readonly** can see everything a member sees but change nothing, including read markers and starting a Bot's screen.
