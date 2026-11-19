@@ -78,7 +78,7 @@ async fn every_route_but_the_public_ones_needs_credentials_and_the_right_role() 
     let bot_id = app.db.create_bot("Walker", "#fff", "waddle", "claude", None, false).id;
     let bot = key.auth(&bot_id);
     // A Bot token from another key (another start, or made up) or for a Bot that's gone.
-    let forged_bot = crate::tests::BotKey(crate::random_hex(16)).auth(&bot_id);
+    let forged_bot = crate::tests::BotKey(crate::random_hex(16), None).auth(&bot_id);
     let gone = app.db.create_bot("Gone", "#fff", "waddle", "claude", None, false);
     let gone_bot = key.auth(&gone.id);
     app.db.delete_bot(&gone.id);

@@ -177,7 +177,7 @@ async fn main() {
 
     // Each user's Bots work in that user's folders (ADR 0028). Files from before were
     // the owner account's.
-    match isolation::migrate_workspace(&app.cfg.workspace, users::OPERATOR) {
+    match isolation::migrate_workspace(&app.cfg.workspace, users::OPERATOR, &app.cfg.data_dir) {
         Ok(0) => {}
         Ok(n) => println!("Workspace: moved {n} shared files and folders into users/{}.", users::OPERATOR),
         Err(e) => exit(format!("WORKSPACE_DIR: couldn't move the shared files into users/{}: {e}", users::OPERATOR)),
@@ -760,13 +760,16 @@ fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<
     if let Some(t) = h.strip_prefix("Bearer ") {
         let t = t.trim();
         // Each Bot's runs carry their own token (ADR 0028). A forged one, one from an
-        // earlier start, or one for a Bot since deleted is refused.
+        // earlier start, one for a Bot since deleted, or one from before the Bot changed
+        // hands is refused.
         if t.starts_with(isolation::BOT_TOKEN_PREFIX) {
+            let now = |id: &str| a.app.as_ref().map(|app| app.db.bot(id).map(|b| b.owner_id));
             return match isolation::token_bot(&a.bot_key, t) {
-                Some(id) if a.app.as_ref().is_none_or(|app| app.db.bot(id).is_some()) => {
-                    Ok(Caller { principal: Principal::Bot, user: None, session: None, method: "bot_token", bot: Some(id.to_string()) })
-                }
-                Some(_) => fail("bot_token", Some("bot_gone"), false),
+                Some((id, owner)) => match now(id) {
+                    Some(None) => fail("bot_token", Some("bot_gone"), false),
+                    Some(Some(o)) if o != owner => fail("bot_token", Some("bot_moved"), false),
+                    _ => Ok(Caller { principal: Principal::Bot, user: None, session: None, method: "bot_token", bot: Some(id.to_string()) }),
+                },
                 None => fail("bot_token", Some("bad_token"), false),
             };
         }
@@ -984,9 +987,12 @@ async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>,
     let mut filter = acl::StreamFilter::new(viewer(&app, &c, &by));
     let session = c.session.map(|s| s.id);
     let user = c.user.filter(|_| session.is_some()).map(|u| u.id);
+    let bot = c.bot.filter(|_| c.principal == Principal::Bot);
+    let bot_owner = bot.as_deref().and_then(|id| app.db.bot_owner(id));
     // The stream outlives the request that opened it, so it closes within seconds of
     // its session being revoked, expiring, or its user being disabled, and follows
-    // role changes.
+    // role changes. A Bot's closes when the Bot is deleted, changes hands, or its
+    // owner is disabled, and follows its owner's role.
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, Infallible>>(64);
     let mut sub = app.tx.subscribe();
     let cfg = a.sessions;
@@ -1007,14 +1013,24 @@ async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>,
                         break;
                     }
                 }
-                _ = check.tick(), if session.is_some() => {
-                    if !session.as_deref().is_some_and(|s| app.db.session_is_live(s, db::now(), cfg.idle_ms, cfg.max_ms)) {
-                        break;
-                    }
-                    let now = match user.as_deref().and_then(|id| app.db.user(id)) {
-                        Some(u) if u.role == Role::Admin => Viewer::All,
-                        Some(u) => Viewer::User { id: u.id, role: u.role },
-                        None => Viewer::Nobody,
+                _ = check.tick(), if session.is_some() || bot.is_some() => {
+                    let now = if let Some(id) = bot.as_deref() {
+                        match app.db.bot(id) {
+                            Some(b) if Some(&b.owner_id) == bot_owner.as_ref() => match Viewer::owner_of(&app.db, &b) {
+                                Viewer::Nobody => break,
+                                v => v,
+                            },
+                            _ => break,
+                        }
+                    } else {
+                        if !session.as_deref().is_some_and(|s| app.db.session_is_live(s, db::now(), cfg.idle_ms, cfg.max_ms)) {
+                            break;
+                        }
+                        match user.as_deref().and_then(|id| app.db.user(id)) {
+                            Some(u) if u.role == Role::Admin => Viewer::All,
+                            Some(u) => Viewer::User { id: u.id, role: u.role },
+                            None => Viewer::Nobody,
+                        }
                     };
                     if now != filter.viewer {
                         filter.reset(now);
@@ -1361,6 +1377,9 @@ async fn update_access(State(app): State<AppState>, Extension(c): Extension<Call
         narrowed |= to == Visibility::Private;
     }
     if let Some(u) = owner.filter(|u| u.id != bot.owner_id) {
+        // Work started for the old owner runs in their folder with their keys; it
+        // ends here, and its token stops working (it names the old owner).
+        app.stop(&id);
         app.db.set_bot_owner(&id, &u.id);
         // The new owner manages it anyway; a leftover grant would only confuse.
         app.db.remove_grant(&id, &u.id);
@@ -1941,7 +1960,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let bot_key = random_hex(16);
-        let bot_token = isolation::bot_token(&bot_key, "b1");
+        let bot_token = isolation::bot_token(&bot_key, "b1", users::OPERATOR);
         let state = Arc::new(Auth {
             password: password.into(),
             allow_no_auth,
@@ -2032,13 +2051,19 @@ mod tests {
         assert_eq!(status(port, &host, "").await, 200);
     }
 
-    /// Mints the `Authorization` header a Bot's runs get (ADR 0028).
+    /// Mints the `Authorization` header a Bot's runs get (ADR 0028), for the Bot's
+    /// owner now (the owner account when there's no app or no such Bot).
     #[derive(Clone)]
-    pub(super) struct BotKey(pub String);
+    pub(super) struct BotKey(pub String, pub Option<AppState>);
 
     impl BotKey {
         pub(super) fn auth(&self, bot_id: &str) -> String {
-            format!("Bearer {}", isolation::bot_token(&self.0, bot_id))
+            let owner = self.1.as_ref().and_then(|app| app.db.bot_owner(bot_id)).unwrap_or_else(|| users::OPERATOR.into());
+            self.auth_as(bot_id, &owner)
+        }
+
+        pub(super) fn auth_as(&self, bot_id: &str, owner: &str) -> String {
+            format!("Bearer {}", isolation::bot_token(&self.0, bot_id, owner))
         }
     }
 
@@ -2065,7 +2090,7 @@ mod tests {
         let password = auth.password.clone();
         let _ = app.control_plane.set(auth.machines.clone());
         let auth = Arc::new(auth);
-        let bot = BotKey(auth.bot_key.clone());
+        let bot = BotKey(auth.bot_key.clone(), Some(app.clone()));
         let r = router(app.clone(), auth);
         tokio::spawn(async move {
             axum::serve(listener, r.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();

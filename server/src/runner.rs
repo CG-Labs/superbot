@@ -104,7 +104,9 @@ impl App {
     }
 
     pub fn send(&self, v: Value) {
-        let _ = self.tx.send(crate::secrets::redact::value(v).to_string());
+        let bot = ["/botId", "/bot/id", "/message/botId", "/approval/botId"].iter().find_map(|p| v.pointer(p).and_then(Value::as_str));
+        let owner = bot.and_then(|b| self.db.bot_owner(b));
+        let _ = self.tx.send(crate::secrets::redact::value_for(owner.as_deref().as_slice(), v).to_string());
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, HashMap<String, BotState>> {
@@ -128,8 +130,9 @@ impl App {
         });
         if let Some(run) = self.state().get(&b.id).and_then(|s| s.run.as_ref()) {
             v["working"] = json!(true);
-            v["status"] = json!(crate::secrets::redact::text(&run.status));
-            v["draft"] = json!(crate::secrets::redact::text(&run.draft));
+            let owner = [b.owner_id.as_str()];
+            v["status"] = json!(crate::secrets::redact::text_for(&owner, &run.status));
+            v["draft"] = json!(crate::secrets::redact::text_for(&owner, &run.draft));
         }
         v
     }
@@ -193,7 +196,7 @@ impl App {
         let cwd = self.workspace_for(&bot.owner_id)?;
         let mut env: HashMap<String, String> =
             crate::secrets::global().harness_env_for(&bot.owner_id).into_iter().map(|(k, v)| (k, v.expose().to_string())).collect();
-        let token = isolation::bot_token(&self.cfg.bot_key, &bot.id);
+        let token = isolation::bot_token(&self.cfg.bot_key, &bot.id, &bot.owner_id);
         crate::secrets::redact::register(&token);
         env.extend([
             ("BOT_ID".to_string(), bot.id.clone()),
@@ -837,8 +840,8 @@ mod tests {
         assert_eq!(env_a2.get(&key), Some(&ada_key));
         assert_eq!(env_b.get(&key), None, "Ada's key never reaches Bea's Bot");
         let token = |e: &HashMap<String, String>| e["BOT_TOKEN"].clone();
-        assert_eq!(isolation::token_bot(&app.cfg.bot_key, &token(&env_a)), Some(a.id.as_str()));
-        assert_eq!(isolation::token_bot(&app.cfg.bot_key, &token(&env_b)), Some(b.id.as_str()));
+        assert_eq!(isolation::token_bot(&app.cfg.bot_key, &token(&env_a)), Some((a.id.as_str(), ada.id.as_str())));
+        assert_eq!(isolation::token_bot(&app.cfg.bot_key, &token(&env_b)), Some((b.id.as_str(), bea.id.as_str())));
         assert_ne!(token(&env_a), token(&env_a2), "each Bot has its own token, even with one owner");
         assert_eq!(crate::secrets::redact::text(&token(&env_a)), crate::secrets::redact::MARK);
 
@@ -847,15 +850,15 @@ mod tests {
         std::fs::write(app.user_file(&ada.id).unwrap(), "# About the user\n- Name: Ada\n- Bank: ada-only-fact\n").unwrap();
         let pa = app.system_prompt(&a);
         let pb = app.system_prompt(&b);
-        assert!(pa.contains("AI teammate of Ada") && pa.contains(&cwd_a.display().to_string()) && pa.contains("ada-only-fact"), "{pa}");
-        assert!(pb.contains("AI teammate of Bea") && pb.contains(&cwd_b.display().to_string()), "{pb}");
-        assert!(!pb.contains("ada-only-fact") && !pb.contains(&cwd_a.display().to_string()) && !pb.contains("A1"), "{pb}");
-        assert!(!pa.contains(&cwd_b.display().to_string()) && !pa.contains("B1"), "{pa}");
+        assert!(pa.contains("AI teammate of Ada") && pa.contains(&cwd_a.display().to_string()) && pa.contains("ada-only-fact"));
+        assert!(pb.contains("AI teammate of Bea") && pb.contains(&cwd_b.display().to_string()));
+        assert!(!pb.contains("ada-only-fact") && !pb.contains(&cwd_a.display().to_string()) && !pb.contains("A1"));
+        assert!(!pa.contains(&cwd_b.display().to_string()) && !pa.contains("B1"));
         assert!(pb.contains("A2"), "Ada's shared Bot is one Bea can ask");
         let op = app.db.create_bot("Op", "#fff", "waddle", "claude", None, false);
         assert!(app.system_prompt(&op).contains("AI teammate of Tester"), "the owner account uses USER_NAME");
         crate::secrets::global().user_forget(&ada.id).unwrap();
-        crate::secrets::redact::forget(&ada_key);
+        crate::secrets::redact::forget_for(&ada.id, &ada_key);
     }
 
     fn fake_run(app: &App, bot_id: &str, guarded: bool) -> watch::Receiver<AbortReason> {

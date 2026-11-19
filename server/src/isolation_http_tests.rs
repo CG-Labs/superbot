@@ -214,8 +214,8 @@ async fn a_bot_can_only_act_as_itself() {
     // Tokens that aren't this start's, are made up, or belong to a Bot that's gone.
     let mac = b_bot.rsplit_once('.').unwrap().1;
     let shared_style = format!("Bearer {}", crate::random_hex(24));
-    let forged = format!("Bearer sbb_{}.{mac}", a1.id);
-    let other_start = BotKey(crate::random_hex(32)).auth(&b1.id);
+    let forged = format!("Bearer sbb_{}.{}.{mac}", a1.id, w.b_id);
+    let other_start = BotKey(crate::random_hex(32), None).auth_as(&b1.id, &w.b_id);
     app.db.delete_bot(&b2.id);
     let gone = w.key.auth(&b2.id);
     for (who, auth) in [("a deleted Bot", &gone), ("one shared token", &shared_style), ("B's MAC on A's id", &forged), ("another start's key", &other_start)] {
@@ -248,6 +248,49 @@ async fn a_bot_can_do_no_more_than_its_owner() {
     let (code, list) = call(port, "GET", "/api/bots", &a_bot, "").await;
     assert_eq!(code, 403, "{list}");
     assert_eq!(call(port, "GET", &format!("/api/bots/{}/messages", ab.id), &a_bot, "").await.0, 403);
+}
+
+/// Opens the live stream as `auth` and waits for its headers.
+async fn open_stream(port: u16, auth: &str) -> tokio::net::TcpStream {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let req = format!("GET /api/events HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nAuthorization: {auth}\r\n\r\n");
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut first = [0u8; 12];
+    s.read_exact(&mut first).await.unwrap();
+    assert_eq!(&first, b"HTTP/1.0 200");
+    s
+}
+
+async fn closes(mut s: tokio::net::TcpStream) -> bool {
+    use tokio::io::AsyncReadExt;
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), s.read_to_end(&mut rest)).await.is_ok()
+}
+
+#[tokio::test]
+async fn a_bots_token_and_stream_end_when_its_owner_loses_it() {
+    let w = world().await;
+    let (port, app) = (w.port, &w.app);
+    let ab = app.db.create_bot_owned("Ada's", "#fff", "waddle", "claude", None, false, &w.a_id, Visibility::Private);
+    let old = w.key.auth(&ab.id);
+
+    // Handed to Bea: Ada's run's token and stream stop; they'd otherwise act with Bea's access.
+    let stream = open_stream(port, &old).await;
+    let to_bea = json!({ "owner": w.b_id }).to_string();
+    assert_eq!(call(port, "PATCH", &format!("/api/bots/{}/access", ab.id), &w.admin, &to_bea).await.0, 200);
+    assert!(closes(stream).await, "the old owner's stream is still open");
+    assert_eq!(call(port, "GET", "/api/bots", &old, "").await.0, 401);
+    let failed = events(port, &w.admin, "action=auth.login_failed").await;
+    assert!(failed.iter().any(|e| e["details"]["reason"] == "bot_moved"), "{failed:?}");
+    let new = w.key.auth(&ab.id);
+    assert_ne!(new, old);
+    assert_eq!(call(port, "GET", "/api/bots", &new, "").await.0, 200, "runs for Bea get a token that works");
+
+    // Its owner disabled: the stream closes.
+    let stream = open_stream(port, &new).await;
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{}", w.b_id), &w.admin, r#"{"status":"disabled"}"#).await.0, 200);
+    assert!(closes(stream).await, "a disabled owner's Bot keeps its stream");
 }
 
 #[tokio::test]
@@ -293,6 +336,13 @@ async fn each_users_secrets_reach_only_their_bots() {
         assert_eq!(call(port, "DELETE", &admin_path, auth, "").await.0, 403);
     }
 
+    // Ada's value is hidden where her Bots write, and nowhere else: saving a value
+    // can't erase words from other people's chats.
+    let ada_msg = app.db.add_message(&ab.id, "user", &format!("deploy with {value}"), None, false, None);
+    let bea_msg = app.db.add_message(&bb.id, "user", &format!("deploy with {value}"), None, false, None);
+    assert_eq!(ada_msg.text, "deploy with [redacted]");
+    assert_eq!(bea_msg.text, format!("deploy with {value}"), "Bea's own words stay hers");
+
     // Ada's Bot gets it; Bea's doesn't. The reply that echoes it is redacted.
     let ada = run(&w, &w.a, &ab.id, "go").await;
     assert!(ada.contains("key=[redacted]") && !ada.contains(&value), "{ada}");
@@ -305,7 +355,7 @@ async fn each_users_secrets_reach_only_their_bots() {
     let (code, gone) = call(port, "DELETE", &admin_path, &w.admin, "").await;
     assert_eq!((code, parse(&gone)["deleted"].as_u64()), (200, Some(1)));
     assert!(crate::secrets::global().user_list(&w.a_id).unwrap().is_empty());
-    crate::secrets::redact::forget(&value);
+    crate::secrets::redact::forget_for(&w.a_id, &value);
 }
 
 #[tokio::test]
@@ -377,7 +427,7 @@ async fn shared_bots_work_for_others_but_stay_their_owners() {
     assert_eq!(call(port, "DELETE", &format!("/api/bots/{}/grants/{}", granted.id, w.b_id), &w.a, "").await.0, 200);
     assert_eq!(call(port, "GET", &format!("/api/bots/{}/messages", granted.id), &w.b, "").await.0, 404);
     crate::secrets::global().user_forget(&w.a_id).unwrap();
-    crate::secrets::redact::forget(&value);
+    crate::secrets::redact::forget_for(&w.a_id, &value);
 }
 
 #[tokio::test]

@@ -18,8 +18,8 @@ const LAYOUT: &str = ".superbot-layout";
 /// Where an old shared workspace's files wait on their way to the owner's folder.
 const STAGING: &str = ".superbot-owner-files";
 
-fn mac(key: &str, bot_id: &str) -> hmac::Tag {
-    hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key.as_bytes()), format!("superbot-bot-token/{bot_id}").as_bytes())
+fn signed(bot_id: &str, owner_id: &str) -> String {
+    format!("superbot-bot-token/{bot_id}/{owner_id}")
 }
 
 fn hex(b: &[u8]) -> String {
@@ -37,21 +37,25 @@ fn plain_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
-/// The token one Bot's runs carry: `sbb_<bot id>.<HMAC-SHA256>`. `key` is botd's,
-/// made fresh at each start, so every token dies with the process that issued it.
-pub fn bot_token(key: &str, bot_id: &str) -> String {
-    format!("{BOT_TOKEN_PREFIX}{bot_id}.{}", hex(mac(key, bot_id).as_ref()))
+/// The token one Bot's runs carry: `sbb_<bot id>.<owner id>.<HMAC-SHA256>`. `key` is
+/// botd's, made fresh at each start, so every token dies with the process that issued
+/// it. The owner is signed in, so a token stops working when the Bot changes hands.
+pub fn bot_token(key: &str, bot_id: &str, owner_id: &str) -> String {
+    let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key.as_bytes()), signed(bot_id, owner_id).as_bytes());
+    format!("{BOT_TOKEN_PREFIX}{bot_id}.{owner_id}.{}", hex(tag.as_ref()))
 }
 
-/// The Bot a token was issued to, if botd issued it with this key. Constant time in the MAC.
-pub fn token_bot<'a>(key: &str, token: &'a str) -> Option<&'a str> {
-    let (id, tag) = token.strip_prefix(BOT_TOKEN_PREFIX)?.split_once('.')?;
-    if key.is_empty() || !plain_id(id) || tag.len() != 64 {
+/// The Bot a token was issued to and its owner then, if botd issued it with this key.
+/// Constant time in the MAC. The caller checks the Bot still exists and has that owner.
+pub fn token_bot<'a>(key: &str, token: &'a str) -> Option<(&'a str, &'a str)> {
+    let mut parts = token.strip_prefix(BOT_TOKEN_PREFIX)?.split('.');
+    let (id, owner, tag) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || key.is_empty() || !plain_id(id) || !plain_id(owner) || tag.len() != 64 {
         return None;
     }
     let tag = unhex(tag)?;
     let k = hmac::Key::new(hmac::HMAC_SHA256, key.as_bytes());
-    hmac::verify(&k, format!("superbot-bot-token/{id}").as_bytes(), &tag).ok().map(|_| id)
+    hmac::verify(&k, signed(id, owner).as_bytes(), &tag).ok().map(|_| (id, owner))
 }
 
 /// `root/users/<user>`, created. None when the id isn't one plain folder name.
@@ -65,15 +69,21 @@ pub fn user_dir(root: &Path, user_id: &str) -> Option<PathBuf> {
 /// (`users/<owner>`), once. Every Bot then belonged to the owner account (ADR 0017), so
 /// its files go there; an admin can hand files to others. Renames only, inside the root,
 /// so nothing is copied or lost, and a start interrupted halfway finishes on the next.
-/// Returns how many top-level entries moved.
-pub fn migrate_workspace(root: &Path, owner: &str) -> io::Result<usize> {
+/// `data` (botd's `DATA_DIR`, with the open database) never moves, even when it's
+/// inside `root`; when it is `root`, nothing moves. Returns how many top-level entries moved.
+pub fn migrate_workspace(root: &Path, owner: &str, data: &Path) -> io::Result<usize> {
     let root = std::fs::canonicalize(root)?;
+    let data = std::fs::canonicalize(data).unwrap_or_else(|_| data.to_path_buf());
+    if data == root {
+        return Ok(0);
+    }
     let marker = root.join(LAYOUT);
     let staging = root.join(STAGING);
     let state = std::fs::read_to_string(&marker).ok();
     let mut moved = 0;
     if state.is_none() {
         let entries: Vec<_> = std::fs::read_dir(&root)?.collect::<io::Result<_>>()?;
+        let entries: Vec<_> = entries.into_iter().filter(|e| !data.starts_with(e.path())).collect();
         let old = entries.iter().filter(|e| e.file_name() != STAGING).count();
         if old == 0 && !staging.exists() {
             std::fs::write(&marker, "per-user 1\n")?;
@@ -125,20 +135,24 @@ mod tests {
     #[test]
     fn bot_tokens_name_their_bot_and_nothing_else() {
         let key = crate::random_hex(24);
-        let t = bot_token(&key, "b1");
-        assert!(t.starts_with("sbb_b1.") && t.len() == "sbb_b1.".len() + 64, "{t}");
-        assert_eq!(token_bot(&key, &t), Some("b1"));
-        assert_eq!(bot_token(&key, "b1"), t, "the same for every run of a Bot until botd restarts");
+        let t = bot_token(&key, "b1", "u1");
+        assert!(t.starts_with("sbb_b1.u1.") && t.len() == "sbb_b1.u1.".len() + 64, "{t}");
+        assert_eq!(token_bot(&key, &t), Some(("b1", "u1")));
+        assert_eq!(bot_token(&key, "b1", "u1"), t, "the same for every run of a Bot until botd restarts");
+        assert_ne!(bot_token(&key, "b1", "u2"), t, "or until it changes hands");
         assert_eq!(token_bot(&crate::random_hex(24), &t), None, "another start's key");
         assert_eq!(token_bot("", &t), None);
-        let mac = t.split_once('.').unwrap().1;
+        let mac = t.rsplit_once('.').unwrap().1;
         for forged in [
-            format!("sbb_b2.{mac}"),
-            format!("sbb_b1.{}", "0".repeat(64)),
-            format!("sbb_b1.{}", &mac[..62]),
-            format!("sbb_b1.{}x", &mac[..63]),
-            format!("sbb_b1/x.{mac}"),
-            format!("sbb_.{mac}"),
+            format!("sbb_b2.u1.{mac}"),
+            format!("sbb_b1.u2.{mac}"),
+            format!("sbb_b1.{mac}"),
+            format!("sbb_b1.u1.{}", "0".repeat(64)),
+            format!("sbb_b1.u1.{}", &mac[..62]),
+            format!("sbb_b1.u1.{}x", &mac[..63]),
+            format!("sbb_b1/x.u1.{mac}"),
+            format!("sbb_b1.u1.x.{mac}"),
+            format!("sbb_.u1.{mac}"),
             t.replace("sbb_", "sbx_"),
             t.replace('.', ""),
         ] {
@@ -159,38 +173,57 @@ mod tests {
     #[test]
     fn a_shared_workspace_moves_to_the_owner_once() {
         let root = crate::db::temp_path("ws-migrate");
+        let elsewhere = crate::db::temp_path("ws-migrate-data");
         std::fs::create_dir_all(root.join("project/src")).unwrap();
         std::fs::write(root.join("project/src/main.rs"), "fn main() {}").unwrap();
         std::fs::write(root.join("notes.md"), "hi").unwrap();
         // A user folder from before is just a file of the owner's.
         std::fs::create_dir_all(root.join("users")).unwrap();
-        assert_eq!(migrate_workspace(&root, "operator").unwrap(), 3);
+        assert_eq!(migrate_workspace(&root, "operator", &elsewhere).unwrap(), 3);
         let owner = root.join("users/operator");
         assert_eq!(std::fs::read_to_string(owner.join("project/src/main.rs")).unwrap(), "fn main() {}");
         assert!(owner.join("notes.md").is_file() && owner.join("users").is_dir());
         assert!(!root.join("notes.md").exists() && !root.join(STAGING).exists());
-        assert_eq!(migrate_workspace(&root, "operator").unwrap(), 0, "once");
+        assert_eq!(migrate_workspace(&root, "operator", &elsewhere).unwrap(), 0, "once");
         std::fs::write(root.join("later.md"), "x").unwrap();
-        assert_eq!(migrate_workspace(&root, "operator").unwrap(), 0);
+        assert_eq!(migrate_workspace(&root, "operator", &elsewhere).unwrap(), 0);
         assert!(root.join("later.md").is_file(), "files made after the move stay put");
     }
 
     #[test]
     fn an_interrupted_move_finishes() {
         let root = crate::db::temp_path("ws-resume");
+        let elsewhere = crate::db::temp_path("ws-resume-data");
         std::fs::create_dir_all(root.join(STAGING)).unwrap();
         std::fs::write(root.join(STAGING).join("a.txt"), "a").unwrap();
         std::fs::write(root.join(LAYOUT), "moving\n").unwrap();
         std::fs::create_dir_all(root.join("users/operator")).unwrap();
         std::fs::write(root.join("users/operator/b.txt"), "b").unwrap();
-        migrate_workspace(&root, "operator").unwrap();
+        migrate_workspace(&root, "operator", &elsewhere).unwrap();
         assert!(root.join("users/operator/a.txt").is_file() && root.join("users/operator/b.txt").is_file());
         assert!(!root.join(STAGING).exists());
         assert_eq!(std::fs::read_to_string(root.join(LAYOUT)).unwrap().trim(), "per-user 1");
 
         let fresh = crate::db::temp_path("ws-fresh");
-        assert_eq!(migrate_workspace(&fresh, "operator").unwrap(), 0);
+        assert_eq!(migrate_workspace(&fresh, "operator", &elsewhere).unwrap(), 0);
         assert!(fresh.join(LAYOUT).is_file() && !fresh.join("users/operator").exists(), "nothing to move");
+    }
+
+    #[test]
+    fn the_data_folder_never_moves() {
+        let root = crate::db::temp_path("ws-data-inside");
+        let data = root.join("state/data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("app.sqlite"), "db").unwrap();
+        std::fs::write(root.join("notes.md"), "hi").unwrap();
+        assert_eq!(migrate_workspace(&root, "operator", &data).unwrap(), 1);
+        assert!(data.join("app.sqlite").is_file(), "the folder holding DATA_DIR stays put");
+        assert!(root.join("users/operator/notes.md").is_file());
+
+        let same = crate::db::temp_path("ws-data-same");
+        std::fs::write(same.join("app.sqlite"), "db").unwrap();
+        assert_eq!(migrate_workspace(&same, "operator", &same).unwrap(), 0);
+        assert!(same.join("app.sqlite").is_file() && !same.join(LAYOUT).exists(), "DATA_DIR as the workspace: nothing moves");
     }
 
     #[test]
