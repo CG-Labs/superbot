@@ -7,7 +7,12 @@
 //! app's redirect URL, which the app trades for a token at `POST /api/auth/login`
 //! `{sso, verifier}`. Nobody is found by email: an identity is linked by an admin, or
 //! made just in time when the provider allows it.
+//!
+//! GitHub is OAuth 2 without an ID token, and Apple posts its answer (ADR 0017); both
+//! end in the same callback, checks, and sessions as the rest.
 
+pub mod apple;
+mod github;
 pub mod jwt;
 mod provider;
 
@@ -17,7 +22,7 @@ use crate::rbac::Role;
 use crate::users::{self, hash};
 use crate::{ApiError, AppState, Auth, Res, bad, not_found};
 use axum::Json;
-use axum::extract::{Extension, OriginalUri, Path, Query, State};
+use axum::extract::{Extension, Form, OriginalUri, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use base64::Engine;
@@ -68,6 +73,8 @@ struct Pending {
     label: Option<String>,
     expires: i64,
     ret: Return,
+    /// The name Apple posted beside the code (first sign-in only).
+    name: Option<String>,
 }
 
 struct Handoff {
@@ -247,22 +254,36 @@ impl Sso {
     fn take(&self, state: &str, at: i64) -> Option<Pending> {
         self.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&hash(state)).filter(|p| p.expires > at)
     }
+
+    /// Keeps a posted name with the sign-in it belongs to, for the callback that follows.
+    fn note_name(&self, provider: &str, state: &str, name: Option<String>) {
+        if let Some(p) = self.pending.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&hash(state)).filter(|p| p.provider == provider) {
+            p.name = name.or(p.name.take());
+        }
+    }
 }
 
 type Var<'a> = dyn Fn(&str) -> Option<String> + 'a;
 type List<'a> = dyn Fn(&str) -> Vec<String> + 'a;
 
-/// Settings that only mean something for one type. Set on another, they would look like a
-/// restriction that isn't there, so they are refused.
-const ONLY_FOR: [(&str, &str); 8] = [
-    ("TENANT", "entra"),
-    ("ALLOWED_TENANTS", "entra"),
-    ("AUTHORITY", "entra"),
-    ("HOSTED_DOMAINS", "google"),
-    ("ALLOWED_DOMAINS", "oidc"),
-    ("SUBJECT_CLAIM", "oidc"),
-    ("EMAIL_CLAIM", "oidc"),
-    ("NAME_CLAIM", "oidc"),
+const TYPES: [&str; 5] = ["entra", "google", "oidc", "apple", "github"];
+
+/// Settings that only mean something for some types. Set on another, they would look like
+/// a restriction that isn't there, so they are refused.
+const ONLY_FOR: [(&str, &[&str]); 13] = [
+    ("TENANT", &["entra"]),
+    ("ALLOWED_TENANTS", &["entra"]),
+    ("AUTHORITY", &["entra"]),
+    ("HOSTED_DOMAINS", &["google"]),
+    ("ALLOWED_DOMAINS", &["oidc", "apple"]),
+    ("SUBJECT_CLAIM", &["oidc"]),
+    ("EMAIL_CLAIM", &["oidc"]),
+    ("NAME_CLAIM", &["oidc"]),
+    ("TEAM_ID", &["apple"]),
+    ("KEY_ID", &["apple"]),
+    ("ALLOWED_ORGS", &["github"]),
+    ("URL", &["github"]),
+    ("API_URL", &["github"]),
 ];
 
 /// Claims people or their admins can change, so they can't be the subject.
@@ -271,14 +292,14 @@ const MUTABLE_CLAIMS: [&str; 9] = ["email", "preferred_username", "upn", "unique
 fn parse_provider(id: &str, var: &Var, list: &List) -> Result<Provider, String> {
     let key = |k: &str| format!("SSO_{}_{k}", id.to_ascii_uppercase());
     let preset = match id {
-        "entra" | "google" => id,
+        "entra" | "google" | "apple" | "github" => id,
         _ => "",
     };
     let ty = var(&key("TYPE")).map(|t| t.to_ascii_lowercase()).unwrap_or_else(|| preset.into());
-    if matches!(ty.as_str(), "entra" | "google" | "oidc")
-        && let Some((k, only)) = ONLY_FOR.iter().find(|(k, only)| *only != ty && var(&key(k)).is_some())
+    if TYPES.contains(&ty.as_str())
+        && let Some((k, only)) = ONLY_FOR.iter().find(|(k, only)| !only.contains(&ty.as_str()) && var(&key(k)).is_some())
     {
-        return Err(format!("{} is only for {}={only}", key(k), key("TYPE")));
+        return Err(format!("{} is only for {}={}", key(k), key("TYPE"), only.join(" or ")));
     }
     let domains = |k: &str| -> Result<Vec<String>, String> { list(&key(k)).iter().map(|d| domain(d).ok_or_else(|| format!("{}: {d} is not a domain like example.com", key(k)))).collect() };
     let client_id = var(&key("CLIENT_ID")).ok_or_else(|| format!("{} is required", key("CLIENT_ID")))?;
@@ -286,10 +307,13 @@ fn parse_provider(id: &str, var: &Var, list: &List) -> Result<Provider, String> 
         None | Some("off") => None,
         Some(r) => Some(Role::parse(r).ok_or_else(|| format!("{} must be off, readonly, member, or admin", key("JIT_ROLE")))?),
     };
-    let scopes = var(&key("SCOPES")).unwrap_or_else(|| "openid profile email".into());
-    if !scopes.split_whitespace().any(|s| s == "openid") {
+    let set_scopes = var(&key("SCOPES"));
+    let has = |scopes: &str, any: &[&str]| scopes.split_whitespace().any(|s| any.contains(&s));
+    let scopes = set_scopes.clone().unwrap_or_else(|| "openid profile email".into());
+    if matches!(ty.as_str(), "entra" | "google" | "oidc") && !has(&scopes, &["openid"]) {
         return Err(format!("{} must include openid", key("SCOPES")));
     }
+    let mut scopes = scopes;
     let (kind, label) = match ty.as_str() {
         "entra" => {
             let authority = var(&key("AUTHORITY")).unwrap_or_else(|| ENTRA_AUTHORITY.into()).trim_end_matches('/').to_string();
@@ -347,8 +371,58 @@ fn parse_provider(id: &str, var: &Var, list: &List) -> Result<Provider, String> 
             }
             (Kind::Oidc { issuer, map, allowed_domains: domains("ALLOWED_DOMAINS")? }, id)
         }
-        "" => return Err(format!("{} is required: entra, google, or oidc", key("TYPE"))),
-        t => return Err(format!("{}: unknown type {t} (entra, google, or oidc)", key("TYPE"))),
+        "apple" => {
+            let issuer = var(&key("ISSUER")).unwrap_or_else(|| apple::ISSUER.into()).trim_end_matches('/').to_string();
+            if !secure_url(&issuer) {
+                return Err(format!("{} must be an https URL", key("ISSUER")));
+            }
+            let apple_id = |k: &str, what: &str| var(&key(k)).as_deref().and_then(apple::apple_id).ok_or_else(|| format!("{} is required: your {what} (ten letters and digits)", key(k)));
+            let (team_id, key_id) = (apple_id("TEAM_ID", "Apple Developer Team ID")?, apple_id("KEY_ID", "Sign in with Apple key's Key ID")?);
+            let allowed_domains = domains("ALLOWED_DOMAINS")?;
+            if allowed_domains.iter().any(|d| d == apple::RELAY_DOMAIN) {
+                return Err(format!("{}: {} is Apple's Hide My Email domain, which anyone can have", key("ALLOWED_DOMAINS"), apple::RELAY_DOMAIN));
+            }
+            if jit_role.is_some() && allowed_domains.is_empty() {
+                return Err(format!("{} without {} would let any Apple Account in: list your email domains, or link people instead", key("JIT_ROLE"), key("ALLOWED_DOMAINS")));
+            }
+            scopes = set_scopes.unwrap_or_else(|| "name email".into());
+            if scopes.split_whitespace().any(|s| !["openid", "name", "email"].contains(&s)) {
+                return Err(format!("{} may only have name and email", key("SCOPES")));
+            }
+            if !allowed_domains.is_empty() && !has(&scopes, &["email"]) {
+                return Err(format!("{} must include email to check {}", key("SCOPES"), key("ALLOWED_DOMAINS")));
+            }
+            (Kind::Apple { issuer, team_id, key_id, allowed_domains }, "Apple")
+        }
+        "github" => {
+            let url = |k: &str, default: String| -> Result<String, String> {
+                let u = var(&key(k)).unwrap_or(default).trim_end_matches('/').to_string();
+                let clean = Url::parse(&u).is_ok_and(|p| p.query().is_none() && p.fragment().is_none());
+                if secure_url(&u) && clean { Ok(u) } else { Err(format!("{} must be an https URL", key(k))) }
+            };
+            let web = url("URL", github::URL.into())?;
+            let api = url("API_URL", github::api_for(&web))?;
+            let mut allowed_orgs = Vec::new();
+            for o in list(&key("ALLOWED_ORGS")) {
+                allowed_orgs.push(github::org(&o).ok_or_else(|| format!("{}: {o} is not a GitHub organization name", key("ALLOWED_ORGS")))?);
+            }
+            if jit_role.is_some() && allowed_orgs.is_empty() {
+                return Err(format!("{} without {} would let any GitHub account in: list your organizations, or link people instead", key("JIT_ROLE"), key("ALLOWED_ORGS")));
+            }
+            let orgs = !allowed_orgs.is_empty();
+            let default = [Some("read:user"), Some(github::SCOPE_EMAIL), orgs.then_some(github::SCOPE_ORGS)];
+            scopes = set_scopes.unwrap_or_else(|| default.into_iter().flatten().collect::<Vec<_>>().join(" "));
+            if !has(&scopes, &[github::SCOPE_EMAIL, "user"]) {
+                return Err(format!("{} must include {}: GitHub sign-in needs the verified primary email", key("SCOPES"), github::SCOPE_EMAIL));
+            }
+            if orgs && !has(&scopes, &[github::SCOPE_ORGS, "write:org", "admin:org"]) {
+                return Err(format!("{} must include {} to check {}", key("SCOPES"), github::SCOPE_ORGS, key("ALLOWED_ORGS")));
+            }
+            let label = if web == github::URL { "GitHub" } else { "GitHub Enterprise" };
+            (Kind::GitHub { web, api, allowed_orgs }, label)
+        }
+        "" => return Err(format!("{} is required: {}", key("TYPE"), TYPES.join(", "))),
+        t => return Err(format!("{}: unknown type {t} ({})", key("TYPE"), TYPES.join(", "))),
     };
     let label = var(&key("LABEL")).map(|l| crate::audit::clip(&l, 40)).unwrap_or_else(|| label.to_string());
     Ok(Provider::new(id, &label, kind, &client_id, &scopes, jit_role))
@@ -360,6 +434,14 @@ fn claim_details(d: &mut Value, c: &Claims) {
     d["issuer"] = json!(c.issuer);
     d["subject"] = json!(c.subject);
     d["tenant"] = json!(c.tenant);
+    if let Some(u) = &c.username {
+        d["username"] = json!(u);
+    }
+}
+
+/// The IdP's type (entra, google, oidc, apple, github), beside the configured id.
+fn idp_type(a: &Auth, provider: &str) -> Option<&'static str> {
+    a.sso.provider(provider).map(|p| p.type_name())
 }
 
 /// Failures anyone can cause without the IdP's help, by opening a callback URL.
@@ -367,7 +449,7 @@ const UNVOUCHED: [&str; 5] = ["unknown_state", "wrong_provider", "binder_mismatc
 
 /// A failed SSO sign-in. The ones in UNVOUCHED are throttled like other failed sign-ins.
 fn failed(a: &Auth, source: &Source, provider: &str, reason: &str, c: Option<&Claims>, extra: Value) {
-    let mut d = json!({ "method": "sso", "provider": provider, "reason": reason });
+    let mut d = json!({ "method": "sso", "provider": provider, "idp": idp_type(a, provider), "reason": reason });
     if let Some(c) = c {
         claim_details(&mut d, c);
     }
@@ -384,7 +466,7 @@ fn failed(a: &Auth, source: &Source, provider: &str, reason: &str, c: Option<&Cl
 }
 
 fn signed_in(a: &Auth, user: &User, s: &db::Session, provider: &str, c: &Claims, source: &Source) {
-    let mut d = json!({ "method": "sso", "provider": provider, "kind": s.kind, "label": s.label });
+    let mut d = json!({ "method": "sso", "provider": provider, "idp": idp_type(a, provider), "kind": s.kind, "label": s.label });
     claim_details(&mut d, c);
     let who = Who { actor: users::actor(user, Some(s)), source: source.clone() };
     a.record(who.event("auth.login").target("session", &s.id).details(d));
@@ -434,8 +516,8 @@ pub async fn start(
     if a.limiter.blocked(&ip, at).is_some() {
         return no_store(ret.fail("sso_too_many"));
     }
-    let meta = match p.metadata(sso.http(), sso.refresh_gap).await {
-        Ok(m) => m,
+    let endpoint = match p.authorization_endpoint(sso.http(), sso.refresh_gap).await {
+        Ok(e) => e,
         Err(e) => {
             eprintln!("SSO {id}: discovery failed: {e}");
             return no_store(ret.fail("sso_failed"));
@@ -447,22 +529,23 @@ pub async fn start(
         r => r,
     };
     let label = users::clean_label(&json!(q.get("label")));
-    let pending = Pending { provider: id.clone(), nonce: nonce.clone(), verifier: verifier.clone(), ip, label, expires: at + PENDING_TTL_MS, ret: ret.clone() };
+    let pending = Pending { provider: id.clone(), nonce: nonce.clone(), verifier: verifier.clone(), ip, label, expires: at + PENDING_TTL_MS, ret: ret.clone(), name: None };
     if !sso.hold(&state, pending, at) {
         return no_store(ret.fail("sso_too_many"));
     }
-    let mut url = Url::parse(&meta.authorization_endpoint).expect("checked by secure_url");
+    let mut url = Url::parse(&endpoint).expect("checked by secure_url");
     url.query_pairs_mut().extend_pairs([
         ("client_id", p.client_id.as_str()),
         ("response_type", "code"),
-        ("response_mode", "query"),
         ("redirect_uri", &sso.redirect_uri(&id)),
         ("scope", &p.scopes),
         ("state", &state),
-        ("nonce", &nonce),
         ("code_challenge", &s256(&verifier)),
         ("code_challenge_method", "S256"),
     ]);
+    if p.oidc() {
+        url.query_pairs_mut().extend_pairs([("response_mode", p.response_mode()), ("nonce", &nonce)]);
+    }
     for (k, v) in p.auth_params() {
         url.query_pairs_mut().append_pair(k, &v);
     }
@@ -488,6 +571,22 @@ pub async fn callback(
     no_store(res)
 }
 
+/// `POST /api/auth/sso/{id}/callback`: Apple's `form_post`. A cross-site POST carries no
+/// `SameSite=Lax` cookie, so the binder can't be checked here. Instead the answer moves to
+/// the GET callback with a 303: a top-level GET, which carries it. The posted name is kept
+/// with the pending sign-in; nothing else is trusted or done here.
+pub async fn callback_post(Extension(a): Extension<Arc<Auth>>, Path(id): Path<String>, Form(f): Form<HashMap<String, String>>) -> Response {
+    if !a.sso.provider(&id).is_some_and(|p| p.form_post()) {
+        return no_store(see("/login?error=sso_failed"));
+    }
+    if let Some(state) = f.get("state") {
+        a.sso.note_name(&id, state, f.get("user").and_then(|u| apple::posted_name(u)));
+    }
+    let pairs = ["code", "state", "error"].into_iter().filter_map(|k| f.get(k).map(|v| (k, v.as_str())));
+    let query = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(pairs).finish();
+    no_store(see(&format!("/api/auth/sso/{id}/callback?{query}")))
+}
+
 async fn finish(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, q: &HashMap<String, String>) -> Response {
     let (sso, (ip, at)) = (&a.sso, (source.ip.clone().unwrap_or_default(), db::now()));
     let Some(app) = a.app.as_ref() else { return StatusCode::SERVICE_UNAVAILABLE.into_response() };
@@ -511,7 +610,8 @@ async fn finish(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, q: &Ha
     }
     if let Some(err) = q.get("error") {
         failed(a, source, id, "idp_error", None, json!({ "idpError": crate::audit::clip(err, 64) }));
-        return ret.fail(if err == "access_denied" { "sso_cancelled" } else { "sso_failed" });
+        // Apple says user_cancelled_authorize.
+        return ret.fail(if matches!(err.as_str(), "access_denied" | "user_cancelled_authorize") { "sso_cancelled" } else { "sso_failed" });
     }
     let (Some(code), Some(p)) = (q.get("code").filter(|c| !c.is_empty() && c.len() <= 4096), sso.provider(id)) else {
         failed(a, source, id, "missing_code", None, json!({}));
@@ -520,15 +620,18 @@ async fn finish(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, q: &Ha
     if a.limiter.blocked(&ip, at).is_some() {
         return ret.fail("sso_too_many");
     }
-    let claims = match p.sign_in(sso.http(), code, &sso.redirect_uri(id), &pending.verifier, &pending.nonce, sso.refresh_gap).await {
+    let mut claims = match p.sign_in(sso.http(), code, &sso.redirect_uri(id), &pending.verifier, &pending.nonce, sso.refresh_gap).await {
         Ok(c) => c,
         Err(e) => {
             a.limiter.fail(&ip, at);
             failed(a, source, id, e.0, None, json!({}));
             // A real account the server doesn't take: say so, so people try another one.
-            return ret.fail(if matches!(e.0, "wrong_domain" | "email_unverified") { "sso_wrong_account" } else { "sso_failed" });
+            return ret.fail(if matches!(e.0, "wrong_domain" | "email_unverified" | "wrong_org") { "sso_wrong_account" } else { "sso_failed" });
         }
     };
+    if claims.name.is_none() {
+        claims.name = pending.name.clone();
+    }
     let user = match resolve(app, p, &claims) {
         Ok(u) => u,
         Err((reason, code)) => {
@@ -632,7 +735,8 @@ pub async fn list_identities(State(app): State<AppState>, Path(key): Path<String
 
 /// `POST /api/users/{key}/identities {provider, subject, tenant?}`. For Entra the
 /// subject is the user's object id and the tenant defaults to the provider's own; for
-/// Google and generic OIDC it is the subject claim (`sub` unless mapped).
+/// GitHub the numeric user id; for Google, Apple, and generic OIDC the subject claim
+/// (`sub` unless mapped).
 pub async fn link_identity(
     State(app): State<AppState>,
     Extension(a): Extension<Arc<Auth>>,
@@ -836,6 +940,120 @@ mod tests {
         assert_eq!(who, [format!("tenant {T1}"), "any Google account".into(), "anyone the IdP signs in".into()]);
     }
 
+    fn with_base(base: &[(&'static str, &'static str)], extra: &[(&'static str, &'static str)]) -> Result<Sso, String> {
+        let mut v = base.to_vec();
+        for (k, val) in extra {
+            v.retain(|(old, _)| old != k);
+            v.push((k, val));
+        }
+        parse(&v)
+    }
+
+    fn github(extra: &[(&'static str, &'static str)]) -> Result<Sso, String> {
+        with_base(&[("SSO_PROVIDERS", "github"), ("SSO_PUBLIC_URL", "https://bot.example.com"), ("SSO_GITHUB_CLIENT_ID", "Iv1.abc")], extra)
+    }
+
+    #[test]
+    fn reads_a_github_provider_with_safe_defaults() {
+        let s = github(&[]).unwrap();
+        let p = s.provider("github").unwrap();
+        assert_eq!((p.label.as_str(), p.type_name(), p.jit_role, p.scopes.as_str(), p.oidc()), ("GitHub", "github", None, "read:user user:email", false));
+        assert!(matches!(&p.kind, Kind::GitHub { web, api, allowed_orgs } if web == "https://github.com" && api == "https://api.github.com" && allowed_orgs.is_empty()));
+        assert_eq!((p.env_var(), p.audience()), ("SSO_GITHUB_CLIENT_SECRET".to_string(), "any account on https://github.com".to_string()));
+        assert_eq!(p.auth_params(), [("prompt", "select_account".to_string()), ("allow_signup", "false".to_string())]);
+        assert_eq!(p.issuer_for(None).unwrap(), ("https://github.com".to_string(), None));
+        assert_eq!(p.subject(" 583231 ").unwrap(), "583231");
+        assert!(p.subject("octocat").is_err(), "the login is not the subject");
+
+        let orgs = github(&[("SSO_GITHUB_ALLOWED_ORGS", "CG-Labs, acme"), ("SSO_GITHUB_JIT_ROLE", "member")]).unwrap();
+        let p = &orgs.providers[0];
+        assert!(matches!(&p.kind, Kind::GitHub { allowed_orgs, .. } if allowed_orgs == &["cg-labs", "acme"]));
+        assert_eq!((p.scopes.as_str(), p.jit_role), ("read:user user:email read:org", Some(Role::Member)));
+        assert_eq!(p.audience(), "members of cg-labs, acme on https://github.com");
+
+        let ghes = github(&[("SSO_GITHUB_URL", "https://github.example.com/")]).unwrap();
+        assert!(matches!(&ghes.providers[0].kind, Kind::GitHub { web, api, .. } if web == "https://github.example.com" && api == "https://github.example.com/api/v3"));
+        assert_eq!(ghes.providers[0].label, "GitHub Enterprise");
+    }
+
+    #[test]
+    fn refuses_github_settings_that_would_let_strangers_in() {
+        for (vars, why) in [
+            (vec![("SSO_GITHUB_JIT_ROLE", "member")], "just in time for every GitHub account"),
+            (vec![("SSO_GITHUB_ALLOWED_ORGS", "acme/team")], "not an org"),
+            (vec![("SSO_GITHUB_ALLOWED_ORGS", "-acme")], "not an org"),
+            (vec![("SSO_GITHUB_SCOPES", "read:user")], "no email scope"),
+            (vec![("SSO_GITHUB_ALLOWED_ORGS", "acme"), ("SSO_GITHUB_SCOPES", "read:user user:email")], "orgs without read:org"),
+            (vec![("SSO_GITHUB_URL", "http://github.example.com")], "plain http"),
+            (vec![("SSO_GITHUB_API_URL", "https://api.github.com?x=1")], "API URL with a query"),
+            (vec![("SSO_GITHUB_ALLOWED_DOMAINS", "example.com")], "email domains are not org membership"),
+            (vec![("SSO_GITHUB_HOSTED_DOMAINS", "example.com")], "a Google setting"),
+            (vec![("SSO_GITHUB_TEAM_ID", "TEAM123456")], "an Apple setting"),
+            (vec![("SSO_GITHUB_CLIENT_ID", "")], "no client id"),
+        ] {
+            assert!(github(&vars).is_err(), "{why}");
+        }
+        assert!(github(&[("SSO_GITHUB_SCOPES", "user")]).is_ok(), "user covers user:email");
+    }
+
+    fn apple(extra: &[(&'static str, &'static str)]) -> Result<Sso, String> {
+        let base = [("SSO_PROVIDERS", "apple"), ("SSO_PUBLIC_URL", "https://bot.example.com"), ("SSO_APPLE_CLIENT_ID", "com.example.superbot.web"), ("SSO_APPLE_TEAM_ID", "TEAM123456"), ("SSO_APPLE_KEY_ID", "key1234567")];
+        with_base(&base, extra)
+    }
+
+    #[test]
+    fn reads_an_apple_provider_with_safe_defaults() {
+        let s = apple(&[]).unwrap();
+        let p = s.provider("apple").unwrap();
+        assert_eq!((p.label.as_str(), p.type_name(), p.jit_role, p.scopes.as_str(), p.response_mode()), ("Apple", "apple", None, "name email", "form_post"));
+        assert!(matches!(&p.kind, Kind::Apple { issuer, team_id, key_id, allowed_domains } if issuer == apple::ISSUER && team_id == "TEAM123456" && key_id == "KEY1234567" && allowed_domains.is_empty()));
+        assert_eq!((p.env_var(), p.audience()), ("SSO_APPLE_PRIVATE_KEY".to_string(), "any Apple Account".to_string()));
+        assert!(p.auth_params().is_empty() && p.oidc());
+        assert_eq!(p.issuer_for(None).unwrap(), (apple::ISSUER.to_string(), None));
+        let jit = apple(&[("SSO_APPLE_ALLOWED_DOMAINS", "example.com"), ("SSO_APPLE_JIT_ROLE", "readonly")]).unwrap();
+        assert_eq!((jit.providers[0].jit_role, jit.providers[0].audience()), (Some(Role::Readonly), "verified emails at example.com".to_string()));
+    }
+
+    #[test]
+    fn refuses_apple_settings_that_are_missing_or_would_let_strangers_in() {
+        for (vars, why) in [
+            (vec![("SSO_APPLE_TEAM_ID", "")], "no team id"),
+            (vec![("SSO_APPLE_KEY_ID", "KEY-123")], "not a key id"),
+            (vec![("SSO_APPLE_JIT_ROLE", "member")], "just in time for every Apple Account"),
+            (vec![("SSO_APPLE_ALLOWED_DOMAINS", "privaterelay.appleid.com"), ("SSO_APPLE_JIT_ROLE", "member")], "Hide My Email is everyone's"),
+            (vec![("SSO_APPLE_SCOPES", "openid profile")], "a scope Apple doesn't have"),
+            (vec![("SSO_APPLE_ALLOWED_DOMAINS", "example.com"), ("SSO_APPLE_SCOPES", "name")], "domains without the email"),
+            (vec![("SSO_APPLE_ISSUER", "http://appleid.apple.com")], "plain http"),
+            (vec![("SSO_APPLE_HOSTED_DOMAINS", "example.com")], "a Google setting"),
+            (vec![("SSO_APPLE_ALLOWED_ORGS", "acme")], "a GitHub setting"),
+        ] {
+            assert!(apple(&vars).is_err(), "{why}");
+        }
+        assert!(parse(&[("SSO_PROVIDERS", "acme"), ("SSO_PUBLIC_URL", "https://bot.example.com"), ("SSO_ACME_TYPE", "google"), ("SSO_ACME_CLIENT_ID", "c"), ("SSO_ACME_KEY_ID", "KEY1234567")]).is_err(), "an Apple setting on Google");
+    }
+
+    #[test]
+    fn all_five_types_side_by_side() {
+        let s = parse(&[
+            ("SSO_PROVIDERS", "entra,google,okta,github,apple"),
+            ("SSO_PUBLIC_URL", "https://bot.example.com"),
+            ("SSO_ENTRA_CLIENT_ID", "c1"),
+            ("SSO_ENTRA_TENANT", T1),
+            ("SSO_GOOGLE_CLIENT_ID", "c2"),
+            ("SSO_OKTA_TYPE", "oidc"),
+            ("SSO_OKTA_ISSUER", "https://acme.okta.example"),
+            ("SSO_OKTA_CLIENT_ID", "c3"),
+            ("SSO_GITHUB_CLIENT_ID", "c4"),
+            ("SSO_APPLE_CLIENT_ID", "c5"),
+            ("SSO_APPLE_TEAM_ID", "TEAM123456"),
+            ("SSO_APPLE_KEY_ID", "KEY1234567"),
+        ])
+        .unwrap();
+        let types: Vec<&str> = s.providers.iter().map(|p| p.type_name()).collect();
+        assert_eq!(types, ["entra", "google", "oidc", "github", "apple"]);
+        assert_eq!(s.redirect_uri("apple"), "https://bot.example.com/api/auth/sso/apple/callback");
+    }
+
     /// The installer and Compose copy these files; with nothing filled in, SSO is off.
     #[test]
     fn the_example_env_files_leave_sso_off() {
@@ -849,7 +1067,7 @@ mod tests {
     #[test]
     fn pending_sign_ins_are_single_use_expire_and_are_capped_per_ip() {
         let s = Sso::default();
-        let p = |ip: &str, expires| Pending { provider: "entra".into(), nonce: "n".into(), verifier: "v".into(), ip: ip.into(), label: None, expires, ret: Return::Cookie { binder: String::new() } };
+        let p = |ip: &str, expires| Pending { provider: "entra".into(), nonce: "n".into(), verifier: "v".into(), ip: ip.into(), label: None, expires, ret: Return::Cookie { binder: String::new() }, name: None };
         assert!(s.hold("s1", p("1.1.1.1", 100), 0));
         assert!(s.take("s1", 50).is_some());
         assert!(s.take("s1", 50).is_none(), "replayed");

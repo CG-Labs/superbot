@@ -11,16 +11,16 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-const T1: &str = "11111111-1111-1111-1111-111111111111";
+pub(super) const T1: &str = "11111111-1111-1111-1111-111111111111";
 const T2: &str = "22222222-2222-2222-2222-222222222222";
-const OID: &str = "aaaaaaaa-0000-0000-0000-000000000001";
+pub(super) const OID: &str = "aaaaaaaa-0000-0000-0000-000000000001";
 const OID2: &str = "aaaaaaaa-0000-0000-0000-000000000002";
-const CLIENT: &str = "client-1";
+pub(super) const CLIENT: &str = "client-1";
 
 #[derive(Default)]
-struct Idp {
-    authority: String,
-    secret: String,
+pub(super) struct Idp {
+    pub(super) authority: String,
+    pub(super) secret: String,
     /// Claims to change in the next ID token (and the key to sign it with).
     next: Mutex<(Value, usize)>,
     /// The next authorize answers with this error instead of a code.
@@ -29,11 +29,11 @@ struct Idp {
     codes: Mutex<HashMap<String, (String, String, String)>>,
 }
 
-fn s256(v: &str) -> String {
+pub(super) fn s256(v: &str) -> String {
     B64.encode(Sha256::digest(v.as_bytes()))
 }
 
-async fn mock_idp() -> Arc<Idp> {
+pub(super) async fn mock_idp() -> Arc<Idp> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let authority = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let idp = Arc::new(Idp { authority: authority.clone(), secret: random_hex(16), next: Mutex::new((json!({}), 0)), ..Default::default() });
@@ -118,7 +118,7 @@ async fn serve(idp: &Idp, extra: &[(&str, &str)]) -> (u16, AppState, String, Str
 }
 
 /// botd with the SSO settings in `vars` (SSO_PUBLIC_URL defaults to botd's own address).
-async fn serve_vars(mut vars: HashMap<String, String>) -> (u16, AppState, String) {
+pub(super) async fn serve_vars(mut vars: HashMap<String, String>) -> (u16, AppState, String) {
     let (port, app, admin, _) = serve_app_with(|a| {
         // The port is only known now, and the public URL must name it.
         let port = a.hosts[0].rsplit(':').next().unwrap().to_string();
@@ -131,21 +131,21 @@ async fn serve_vars(mut vars: HashMap<String, String>) -> (u16, AppState, String
     (port, app, admin)
 }
 
-fn header(head: &str, name: &str) -> Option<String> {
+pub(super) fn header(head: &str, name: &str) -> Option<String> {
     head.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.trim().to_string()))
 }
 
-fn set_cookies(head: &str) -> Vec<String> {
+pub(super) fn set_cookies(head: &str) -> Vec<String> {
     head.lines().filter_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("set-cookie")).map(|(_, v)| v.trim().to_string())).collect()
 }
 
-fn http() -> reqwest::Client {
+pub(super) fn http() -> reqwest::Client {
     reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap()
 }
 
 /// Starts at botd, signs in at the IdP, and returns the callback path and the binder
 /// cookie botd set (if any), ready to be sent back.
-async fn to_callback(port: u16, start: &str) -> (String, String) {
+pub(super) async fn to_callback(port: u16, start: &str) -> (String, String) {
     let (code, head, body) = call_with(port, "GET", start, "", "", "").await;
     assert_eq!(code, 303, "{head}\n{body}");
     let to_idp = header(&head, "location").unwrap();
@@ -158,13 +158,13 @@ async fn to_callback(port: u16, start: &str) -> (String, String) {
 }
 
 /// The whole web sign-in. Returns the callback's status and response head.
-async fn web_sign_in(port: u16, id: &str) -> (u16, String) {
+pub(super) async fn web_sign_in(port: u16, id: &str) -> (u16, String) {
     let (path, binder) = to_callback(port, &format!("/api/auth/sso/{id}/start")).await;
     let (code, head, _) = call_with(port, "GET", &path, "", &binder, "").await;
     (code, head)
 }
 
-async fn failures(port: u16, admin: &str) -> Vec<Value> {
+pub(super) async fn failures(port: u16, admin: &str) -> Vec<Value> {
     audit_list(&call(port, "GET", "/api/audit?action=auth.login_failed", admin, "").await.1)
 }
 
@@ -372,19 +372,19 @@ async fn the_client_secret_stays_with_botd() {
 }
 
 /// A mock IdP with one issuer (Google, Okta, Keycloak, …) at `{origin}{path}`.
-struct Oidc {
-    issuer: String,
-    secret: String,
+pub(super) struct Oidc {
+    pub(super) issuer: String,
+    pub(super) secret: String,
     /// Claims every ID token carries, besides the protocol ones.
     claims: Value,
     /// Claims to change in the next ID token; null removes one.
-    next: Mutex<Value>,
+    pub(super) next: Mutex<Value>,
     /// code -> (PKCE challenge, nonce, redirect_uri)
     codes: Mutex<HashMap<String, (String, String, String)>>,
 }
 
 /// `basic`: the token endpoint takes the client secret only as HTTP Basic.
-async fn mock_oidc(path: &str, basic: bool, claims: Value) -> Arc<Oidc> {
+pub(super) async fn mock_oidc(path: &str, basic: bool, claims: Value) -> Arc<Oidc> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let issuer = format!("http://127.0.0.1:{}{path}", listener.local_addr().unwrap().port());
     let idp = Arc::new(Oidc { issuer: issuer.clone(), secret: random_hex(16), claims, next: Mutex::new(json!({})), codes: Mutex::default() });
@@ -438,7 +438,7 @@ async fn mock_oidc(path: &str, basic: bool, claims: Value) -> Arc<Oidc> {
 }
 
 /// Settings for a provider `id` of `ty` on `idp`, with its client secret saved.
-fn provider_vars(id: &str, ty: &str, issuer: &str, secret: &str, extra: &[(&str, &str)]) -> Vec<(String, String)> {
+pub(super) fn provider_vars(id: &str, ty: &str, issuer: &str, secret: &str, extra: &[(&str, &str)]) -> Vec<(String, String)> {
     let up = id.to_ascii_uppercase();
     crate::secrets::global().put(&format!("SSO_{up}_CLIENT_SECRET"), secret).unwrap();
     let mut v = vec![(format!("SSO_{up}_TYPE"), ty.to_string()), (format!("SSO_{up}_CLIENT_ID"), CLIENT.to_string())];
@@ -448,13 +448,13 @@ fn provider_vars(id: &str, ty: &str, issuer: &str, secret: &str, extra: &[(&str,
 }
 
 /// The user a successful web callback signed in, by its session cookie.
-async fn signed_in_as(port: u16, head: &str) -> Option<String> {
+pub(super) async fn signed_in_as(port: u16, head: &str) -> Option<String> {
     let session = set_cookies(head).into_iter().find(|c| c.starts_with("superbot_session=sbs_"))?;
     let (_, _, me) = call_with(port, "GET", "/api/auth/me", "", &format!("Cookie: {}\r\n", session.split(';').next().unwrap()), "").await;
     serde_json::from_str::<Value>(&me).ok()?["user"]["id"].as_str().map(String::from)
 }
 
-fn google_claims() -> Value {
+pub(super) fn google_claims() -> Value {
     json!({ "sub": "1077", "email": "ada@example.com", "email_verified": true, "hd": "example.com", "name": "Ada Lovelace" })
 }
 
