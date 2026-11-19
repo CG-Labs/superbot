@@ -17,6 +17,9 @@ ENABLE_BACKUP=true
 UPGRADE=false
 DRY_RUN=false
 INTERACTIVE=true
+WITH_HERMES=false
+# Hermes Agent release --with-hermes installs: the commit of tag v0.23.2 (NousResearch/hermes-agent).
+HERMES_COMMIT=${HERMES_COMMIT:-ae2a81ccc00e9b7c06301523e5bb09608397149c}
 SHARE_DIR=${SHARE_DIR:-/usr/local/share/superbot}
 SYSTEMD_DIR=${SYSTEMD_DIR:-/etc/systemd/system}
 DEPLOY_FILES=(superbot.service superbot-backup.sh superbot-backup.service superbot-backup.timer)
@@ -39,6 +42,7 @@ Usage: install.sh [options]
   --upgrade           git pull + rebuild + restart
   --ufw               Enable UFW (allow 22, 80, 443)
   --no-backup         Skip daily DATA_DIR backup timer
+  --with-hermes       Also install the Hermes Agent CLI (about 2 GB; HERMES_COMMIT pins it)
   --dry-run           Print actions without changing the system
   --non-interactive   Fail instead of prompting for missing flags
   -h, --help          Show this help
@@ -60,6 +64,7 @@ parse_args() {
       --upgrade) UPGRADE=true; shift ;;
       --ufw) ENABLE_UFW=true; shift ;;
       --no-backup) ENABLE_BACKUP=false; shift ;;
+      --with-hermes) WITH_HERMES=true; shift ;;
       --dry-run) DRY_RUN=true; shift ;;
       --non-interactive) INTERACTIVE=false; shift ;;
       -h|--help) usage; exit 0 ;;
@@ -430,6 +435,37 @@ ensure_master_key() {
   set_env_var "$env_file" SUPERBOT_MASTER_KEY_FILE "$key_file"
 }
 
+# Hermes's own installer, as the service user (Hermes refuses a checkout another user
+# owns). Its launcher lands in ~/.local/bin, which botd gets on PATH through .env.
+# shellcheck disable=SC2016
+install_hermes() {
+  [[ "$WITH_HERMES" == true ]] || return 0
+  [[ "$HERMES_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "HERMES_COMMIT must be a full commit SHA"
+  local home env_file bin_path url
+  home=$(user_home)
+  env_file="$home/superbot/.env"
+  bin_path="$home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  url="https://raw.githubusercontent.com/NousResearch/hermes-agent/$HERMES_COMMIT/scripts/install.sh"
+  if [[ "$DRY_RUN" == true ]]; then
+    log "[dry-run] would install Hermes Agent $HERMES_COMMIT for $SUPERBOT_USER from $url"
+    log "[dry-run] would set PATH=$bin_path in $env_file"
+    return
+  fi
+  log "Installing Hermes Agent ${HERMES_COMMIT:0:12} for $SUPERBOT_USER"
+  apt-get install -y -qq libatomic1 xz-utils
+  sudo -u "$SUPERBOT_USER" -H bash -c 'set -euo pipefail
+    tmp=$(mktemp)
+    trap '\''rm -f "$tmp"'\'' EXIT
+    curl -fsSL "$1" -o "$tmp"
+    bash "$tmp" --non-interactive --skip-browser --skip-computer-use --commit "$2"' _ "$url" "$HERMES_COMMIT"
+  sudo -u "$SUPERBOT_USER" -H "$home/.local/bin/hermes" --version >/dev/null || die "Hermes Agent did not install"
+  if ! grep -q '^PATH=' "$env_file"; then
+    set_env_var "$env_file" PATH "$bin_path"
+  elif ! grep -q "^PATH=.*$home/.local/bin" "$env_file"; then
+    warn "PATH in $env_file lacks $home/.local/bin, so botd won't find hermes"
+  fi
+}
+
 service_unit_fixed() {
   local home=$1
   printf '%s\n' "User=$SUPERBOT_USER" "Group=$SUPERBOT_USER" \
@@ -549,6 +585,7 @@ Next steps (as the service user):
   npm install -g @anthropic-ai/claude-code  # if you use Claude Code
   claude login
   # or: codex login
+  # Hermes Agent (--with-hermes): save its provider key with botctl secret set (docs/backend.md)
 
 EOF
   if [[ -f "$pass_file" ]] && [[ "${NEW_PASSWORD_FILE:-}" == "$pass_file" ]]; then
@@ -579,6 +616,7 @@ main() {
   build_botd
   configure_env
   ensure_master_key
+  install_hermes
   install_systemd
   install_backup
   install_caddy
