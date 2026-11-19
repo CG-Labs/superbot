@@ -393,7 +393,12 @@ fn run(args: &[String]) -> Result<String, String> {
         ["secret", "set", name] => {
             let name = env_name(name)?;
             let body = json!({ "value": stdin_value(std::io::stdin())? }).to_string();
-            op("PUT", &format!("/api/secrets/{name}"), Some(body)).map(|_| format!("Saved {name}. Bots get it as ${name} from their next run."))
+            let res: Value = serde_json::from_str(&op("PUT", &format!("/api/secrets/{name}"), Some(body))?).unwrap_or_default();
+            Ok(if res["secret"]["forBots"] == false {
+                format!("Saved {name}. It is botd's own (single sign-on); Bots never get it.")
+            } else {
+                format!("Saved {name}. Bots get it as ${name} from their next run.")
+            })
         }
         ["secret", "rm" | "delete", name] => op("DELETE", &format!("/api/secrets/{}", env_name(name)?), None).map(|_| "Deleted.".into()),
         ["help", "admin"] | ["admin"] => Ok(ADMIN_HELP.into()),
