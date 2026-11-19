@@ -157,8 +157,8 @@ const MAX_ARRAY: usize = 100;
 const SECRET_WORDS: [&str; 11] =
     ["password", "passwd", "secret", "token", "authorization", "cookie", "apikey", "api_key", "api-key", "private_key", "credential"];
 /// Prefixes of well-known API keys and tokens (OpenAI/Anthropic, GitHub, GitLab, Slack, AWS, Google, JWTs).
-const TOKEN_PREFIXES: [&str; 15] =
-    ["sk-", "sk_live_", "sk_test_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "glpat-", "xoxb-", "xoxp-", "AKIA", "AIza", "eyJ"];
+const TOKEN_PREFIXES: [&str; 17] =
+    ["sk-", "sk_live_", "sk_test_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "glpat-", "xoxb-", "xoxp-", "AKIA", "AIza", "eyJ", "sbs_", "sbc_"];
 
 fn secret_name(k: &str) -> bool {
     let k = k.to_ascii_lowercase();
@@ -743,6 +743,8 @@ mod tests {
         assert!(s.starts_with("curl -H 'Authorization: Bearer [redacted]"), "{s}");
         assert_eq!(redact_text("export OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwx"), "export OPENAI_API_KEY=[redacted]");
         assert_eq!(redact_text("git push origin ghp_abcdefghijklmnopqrstuvwxyz0123"), "git push origin [redacted]");
+        assert_eq!(redact_text("botctl login sbc_0123456789abcdef0123456789"), "botctl login [redacted]");
+        assert_eq!(redact_text("SUPERBOT_TOKEN=sbs_0123456789abcdef0123456789 botctl"), "SUPERBOT_TOKEN=[redacted] botctl");
         assert_eq!(redact_text("ls -la  /tmp\nrm x"), "ls -la  /tmp\nrm x");
         assert_eq!(redact_text("password: hunter2"), "password: [redacted]");
         assert_eq!(redact_text("curl -u admin:hunter2 https://x"), "curl -u admin:[redacted] https://x");

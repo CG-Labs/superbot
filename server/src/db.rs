@@ -3,6 +3,7 @@
 
 use crate::audit;
 use crate::policy::{Action, Mode, Override, Policy, Rule};
+use crate::rbac::Role;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
 use serde_json::Value;
@@ -183,6 +184,107 @@ pub struct AuditEvent {
     pub details: Value,
 }
 
+/// A person who can sign in. `operator` is the owner and break-glass account.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct User {
+    pub id: String,
+    pub email: Option<String>,
+    pub name: String,
+    pub role: Role,
+    /// "active" or "disabled"
+    pub status: String,
+    /// The IdP that vouches for this user, once OIDC lands (ADR 0011).
+    pub idp_issuer: Option<String>,
+    pub idp_subject: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl User {
+    pub fn active(&self) -> bool {
+        self.status == "active"
+    }
+}
+
+#[derive(Default)]
+pub struct UserPatch {
+    pub email: Option<Option<String>>,
+    pub name: Option<String>,
+    pub role: Option<Role>,
+    pub status: Option<&'static str>,
+}
+
+/// A sign-in. The token itself is never stored, only its SHA-256.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Session {
+    pub id: String,
+    pub user_id: String,
+    /// "cookie" (web app) or "token" (bearer: the client, botctl)
+    pub kind: String,
+    /// How the person proved who they are: "password" (break-glass) or "code".
+    pub method: String,
+    pub label: Option<String>,
+    pub ip: Option<String>,
+    pub user_agent: Option<String>,
+    pub created_at: i64,
+    pub last_seen_at: i64,
+    pub expires_at: i64,
+    pub revoked_at: Option<i64>,
+    pub revoked_by: Option<String>,
+    pub revoke_reason: Option<String>,
+}
+
+pub struct NewSession<'a> {
+    pub user_id: &'a str,
+    pub token_hash: &'a str,
+    pub kind: &'a str,
+    pub method: &'a str,
+    pub label: Option<&'a str>,
+    pub ip: Option<&'a str>,
+    pub user_agent: Option<&'a str>,
+    pub expires_at: i64,
+}
+
+fn user_row(r: &Row) -> rusqlite::Result<User> {
+    let role: String = r.get("role")?;
+    Ok(User {
+        id: r.get("id")?,
+        email: r.get("email")?,
+        name: r.get("display_name")?,
+        role: Role::parse(&role).unwrap_or(Role::Readonly),
+        status: r.get("status")?,
+        idp_issuer: r.get("idp_issuer")?,
+        idp_subject: r.get("idp_subject")?,
+        created_at: r.get("created_at")?,
+        updated_at: r.get("updated_at")?,
+    })
+}
+
+fn session_row(r: &Row) -> rusqlite::Result<Session> {
+    Ok(Session {
+        id: r.get("id")?,
+        user_id: r.get("user_id")?,
+        kind: r.get("kind")?,
+        method: r.get("method")?,
+        label: r.get("label")?,
+        ip: r.get("ip")?,
+        user_agent: r.get("user_agent")?,
+        created_at: r.get("created_at")?,
+        last_seen_at: r.get("last_seen_at")?,
+        expires_at: r.get("expires_at")?,
+        revoked_at: r.get("revoked_at")?,
+        revoked_by: r.get("revoked_by")?,
+        revoke_reason: r.get("revoke_reason")?,
+    })
+}
+
+/// SQL for "this session still works": not revoked, before its absolute expiry
+/// (the stored one and `created_at + max`, so lowering the setting applies to
+/// existing sessions), and used within the idle window. Binds `?1` now, `?2` idle ms, `?3` max ms.
+const SESSION_LIVE: &str = "s.revoked_at IS NULL AND ?1 < s.expires_at AND ?1 < s.created_at + ?3 AND ?1 < s.last_seen_at + ?2";
+
 fn approval_row(r: &Row) -> rusqlite::Result<Approval> {
     let input: String = r.get("input")?;
     Ok(Approval {
@@ -244,7 +346,53 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 2] = [migrate_approvals, migrate_audit_events];
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 3] = [migrate_approvals, migrate_audit_events, migrate_users];
+
+/// Users, sessions, and one-time sign-in codes (ADR 0011). Tables start empty; botd
+/// creates the owner (`operator`, the break-glass account) on start, so an upgrade
+/// keeps the shared password working.
+fn migrate_users(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE users (
+          id TEXT PRIMARY KEY,
+          email TEXT COLLATE NOCASE UNIQUE,
+          display_name TEXT NOT NULL,
+          role TEXT NOT NULL CHECK (role IN ('admin', 'member', 'readonly')),
+          status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'disabled')),
+          idp_issuer TEXT,
+          idp_subject TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          CHECK ((idp_issuer IS NULL) = (idp_subject IS NULL))
+        );
+        CREATE UNIQUE INDEX users_idp ON users(idp_issuer, idp_subject) WHERE idp_issuer IS NOT NULL;
+        CREATE TABLE sessions (
+          id TEXT PRIMARY KEY,
+          token_hash TEXT NOT NULL UNIQUE,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          kind TEXT NOT NULL CHECK (kind IN ('cookie', 'token')),
+          method TEXT NOT NULL,
+          label TEXT,
+          ip TEXT,
+          user_agent TEXT,
+          created_at INTEGER NOT NULL,
+          last_seen_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          revoked_at INTEGER,
+          revoked_by TEXT,
+          revoke_reason TEXT
+        );
+        CREATE INDEX sessions_user ON sessions(user_id, created_at);
+        CREATE TABLE login_codes (
+          code_hash TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          created_by TEXT,
+          created_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          used_at INTEGER
+        );",
+    )
+}
 
 /// Structured audit events (ADR 0009): actor kind and id, target type and id,
 /// outcome, and request source. Copies the rows from the first audit table.
@@ -730,6 +878,192 @@ impl Db {
         tx.commit().ok()?;
         drop(c);
         self.rule(&rule_id)
+    }
+
+    // Users
+
+    pub fn users(&self) -> Vec<User> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM users ORDER BY created_at, id").unwrap();
+        s.query_map([], user_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    pub fn user(&self, id: &str) -> Option<User> {
+        self.c().query_row("SELECT * FROM users WHERE id = ?", [id], user_row).optional().ok().flatten()
+    }
+
+    /// By id, or by email (case-insensitive) when `key` has an `@`.
+    pub fn find_user(&self, key: &str) -> Option<User> {
+        if key.contains('@') {
+            self.c().query_row("SELECT * FROM users WHERE email = ?", [key], user_row).optional().ok().flatten()
+        } else {
+            self.user(key)
+        }
+    }
+
+    /// Err when the email or id is taken.
+    pub fn create_user(&self, id: Option<&str>, email: Option<&str>, name: &str, role: Role) -> Result<User, String> {
+        let id = id.map(String::from).unwrap_or_else(|| format!("u{}", crate::short_id()));
+        let at = now();
+        let res = self.c().execute(
+            "INSERT INTO users (id, email, display_name, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            params![id, email, name, role.as_str(), at, at],
+        );
+        match res {
+            Ok(_) => Ok(self.user(&id).unwrap()),
+            Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ConstraintViolation => {
+                Err("A user with that email already exists".into())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    pub fn update_user(&self, id: &str, p: UserPatch) -> Result<(), String> {
+        let c = self.c();
+        let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
+        let set = |col: &str, v: &dyn rusqlite::ToSql| {
+            tx.execute(&format!("UPDATE users SET {col} = ?, updated_at = ? WHERE id = ?"), params![v, now(), id]).map(|_| ())
+        };
+        let res = (|| {
+            if let Some(v) = &p.email { set("email", v)? }
+            if let Some(v) = &p.name { set("display_name", v)? }
+            if let Some(v) = p.role { set("role", &v.as_str())? }
+            if let Some(v) = p.status { set("status", &v)? }
+            Ok::<_, rusqlite::Error>(())
+        })();
+        match res {
+            Ok(()) => tx.commit().map_err(|e| e.to_string()),
+            Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ConstraintViolation => {
+                Err("A user with that email already exists".into())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    // Sessions and sign-in codes. Callers hash tokens; nothing here sees one.
+
+    pub fn create_session(&self, s: &NewSession) -> Session {
+        let id = format!("s{}", crate::random_hex(8));
+        let at = now();
+        self.c()
+            .execute(
+                "INSERT INTO sessions (id, token_hash, user_id, kind, method, label, ip, user_agent, created_at, last_seen_at, expires_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![id, s.token_hash, s.user_id, s.kind, s.method, s.label, s.ip, s.user_agent, at, at, s.expires_at],
+            )
+            .unwrap();
+        self.session(&id).unwrap()
+    }
+
+    pub fn session(&self, id: &str) -> Option<Session> {
+        self.c().query_row("SELECT * FROM sessions WHERE id = ?", [id], session_row).optional().ok().flatten()
+    }
+
+    /// The live session with this token hash and its active user. None when it is
+    /// unknown, revoked, expired (absolute or idle), or the user is disabled.
+    pub fn live_session(&self, token_hash: &str, at: i64, idle_ms: i64, max_ms: i64) -> Option<(Session, User)> {
+        let c = self.c();
+        let s = c
+            .query_row(
+                &format!("SELECT s.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?4 AND u.status = 'active' AND {SESSION_LIVE}"),
+                params![at, idle_ms, max_ms, token_hash],
+                session_row,
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+        let u = c.query_row("SELECT * FROM users WHERE id = ?", [&s.user_id], user_row).optional().ok().flatten()?;
+        Some((s, u))
+    }
+
+    pub fn session_is_live(&self, id: &str, at: i64, idle_ms: i64, max_ms: i64) -> bool {
+        self.c()
+            .query_row(
+                &format!("SELECT 1 FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id = ?4 AND u.status = 'active' AND {SESSION_LIVE}"),
+                params![at, idle_ms, max_ms, id],
+                |_| Ok(()),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    /// Records use, at most once a minute per session to keep writes down. The idle
+    /// window is therefore up to a minute shorter than configured.
+    pub fn touch_session(&self, id: &str, at: i64) {
+        let _ = self.c().execute("UPDATE sessions SET last_seen_at = ?1 WHERE id = ?2 AND last_seen_at <= ?1 - 60000", params![at, id]);
+    }
+
+    /// Live sessions, newest first, optionally for one user.
+    pub fn live_sessions(&self, user_id: Option<&str>, at: i64, idle_ms: i64, max_ms: i64) -> Vec<Session> {
+        let c = self.c();
+        let sql = format!("SELECT s.* FROM sessions s WHERE (?4 IS NULL OR s.user_id = ?4) AND {SESSION_LIVE} ORDER BY s.created_at DESC, s.id LIMIT 1000");
+        let mut s = c.prepare(&sql).unwrap();
+        s.query_map(params![at, idle_ms, max_ms, user_id], session_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// False if it was already revoked or doesn't exist.
+    pub fn revoke_session(&self, id: &str, by: &str, reason: &str) -> bool {
+        self.c()
+            .execute(
+                "UPDATE sessions SET revoked_at = ?, revoked_by = ?, revoke_reason = ? WHERE id = ? AND revoked_at IS NULL",
+                params![now(), by, reason, id],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Revokes every session of a user and drops their unused sign-in codes. Returns how many sessions.
+    pub fn revoke_user_sessions(&self, user_id: &str, by: &str, reason: &str) -> usize {
+        let c = self.c();
+        let n = c
+            .execute(
+                "UPDATE sessions SET revoked_at = ?, revoked_by = ?, revoke_reason = ? WHERE user_id = ? AND revoked_at IS NULL",
+                params![now(), by, reason, user_id],
+            )
+            .unwrap_or(0);
+        let _ = c.execute("DELETE FROM login_codes WHERE user_id = ? AND used_at IS NULL", [user_id]);
+        n
+    }
+
+    pub fn add_login_code(&self, code_hash: &str, user_id: &str, created_by: &str, expires_at: i64) {
+        self.c()
+            .execute(
+                "INSERT INTO login_codes (code_hash, user_id, created_by, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+                params![code_hash, user_id, created_by, now(), expires_at],
+            )
+            .unwrap();
+    }
+
+    /// Spends a sign-in code: once, before it expires, for an active user. Returns the user.
+    pub fn use_login_code(&self, code_hash: &str, at: i64) -> Option<User> {
+        let c = self.c();
+        let user_id: String = c
+            .query_row(
+                "UPDATE login_codes SET used_at = ?1 WHERE code_hash = ?2 AND used_at IS NULL AND ?1 < expires_at
+                   AND user_id IN (SELECT id FROM users WHERE status = 'active')
+                 RETURNING user_id",
+                params![at, code_hash],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+        c.query_row("SELECT * FROM users WHERE id = ?", [user_id], user_row).optional().ok().flatten()
+    }
+
+    /// Deletes sessions and codes that stopped working before `before` (unix ms).
+    pub fn prune_sessions(&self, before: i64, idle_ms: i64, max_ms: i64) -> usize {
+        let c = self.c();
+        let n = c
+            .execute(
+                "DELETE FROM sessions WHERE coalesce(revoked_at, min(expires_at, created_at + ?2, last_seen_at + ?3)) < ?1",
+                params![before, max_ms, idle_ms],
+            )
+            .unwrap_or(0);
+        let _ = c.execute("DELETE FROM login_codes WHERE coalesce(used_at, expires_at) < ?", [before]);
+        n
     }
 
     // Audit: append-only. There is no update or delete here; triggers refuse both,

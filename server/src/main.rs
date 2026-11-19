@@ -8,9 +8,13 @@ mod cron;
 mod db;
 mod paths;
 mod policy;
+mod rbac;
 mod runner;
 mod screen;
 mod shell;
+mod users;
+#[cfg(test)]
+mod users_http_tests;
 
 use approvals::{DecideError, Remember};
 use audit::{Actor, Event, Outcome, Source, Who};
@@ -23,7 +27,9 @@ use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use std::collections::HashMap;
 use db::{BotPatch, Db};
+use rbac::{Perm, Principal, Role};
 use runner::{App, Config};
+use users::{Caller, SessionConfig};
 use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
@@ -35,6 +41,7 @@ use tokio_stream::StreamExt;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 type AppState = Arc<App>;
+type EventStream = std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<SseEvent, Infallible>> + Send>>;
 
 static WEB_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
 
@@ -74,7 +81,13 @@ async fn main() {
     let host = env("HOST", "127.0.0.1");
     let password = std::env::var("AUTH_PASSWORD").unwrap_or_default();
     let default_harness = env("DEFAULT_HARNESS", "claude");
-    let allow_no_auth = auth_startup(&host, &password);
+    let exit = |e: String| -> ! {
+        eprintln!("{e}");
+        std::process::exit(1);
+    };
+    let break_glass = users::break_glass_flag(&env("AUTH_BREAK_GLASS", "")).unwrap_or_else(|e| exit(e));
+    let sessions = SessionConfig::from_env(&env("SESSION_IDLE_TIMEOUT", ""), &env("SESSION_MAX_AGE", "")).unwrap_or_else(|e| exit(e));
+    let allow_no_auth = auth_startup(&host, &password, break_glass);
     if adapters::get(&default_harness).is_none() {
         eprintln!("DEFAULT_HARNESS must be one of: {}", adapters::NAMES.join(", "));
         std::process::exit(1);
@@ -115,15 +128,19 @@ async fn main() {
         let bot = app.db.create_bot(&name, "#f5f5f5", "waddle", &app.cfg.default_harness, None, true);
         app.init_bot_files(&bot);
     }
+    // First start, or the first after upgrading to users: the owner becomes the admin
+    // that break-glass signs in as.
+    users::ensure_operator(&app.db, &env("USER_NAME", "Owner"), std::env::var("OWNER_EMAIL").ok().as_deref());
 
     let auth_state = Arc::new(Auth {
         password: password.clone(),
+        break_glass,
         allow_no_auth,
         bot_token,
         hosts: allowed_hosts(&host, port, &env("ALLOWED_HOSTS", "")),
         trust_forwarded: env("TRUST_FORWARDED_FOR", "") == "1",
-        logins: audit::Logins::default(),
-        app: Some(app.clone()),
+        sessions,
+        ..Auth::new(Some(app.clone()))
     });
     let router = router(app.clone(), auth_state);
     let policy = app.db.global_policy();
@@ -131,11 +148,18 @@ async fn main() {
         "version": env!("CARGO_PKG_VERSION"),
         "defaultHarness": app.cfg.default_harness,
         "policyMode": policy.mode,
-        "auth": if password.is_empty() { "none" } else { "password" },
+        "auth": match (break_glass, password.is_empty()) {
+            (true, false) => "sessions+password",
+            (true, true) => "none",
+            (false, _) => "sessions",
+        },
+        "sessionIdleMinutes": sessions.idle_ms / 60_000,
+        "sessionMaxMinutes": sessions.max_ms / 60_000,
         "auditRetentionDays": retention,
         "screens": app.screens.is_some(),
     })));
     audit::start_retention(app.clone(), retention);
+    users::start_pruning(app.clone(), sessions);
     if policy.mode == policy::Mode::Bypass {
         eprintln!(
             "WARNING: harness policy is bypass: Bots run every tool without asking. \
@@ -204,14 +228,25 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/audit", get(list_audit))
         .route("/audit/export.csv", get(export_audit))
         .route("/ask", post(ask))
-        .route("/handoff", post(handoff));
+        .route("/handoff", post(handoff))
+        .route("/auth/login", post(users::login))
+        .route("/auth/logout", post(users::logout))
+        .route("/auth/me", get(users::me))
+        .route("/users", get(users::list_users).post(users::create_user))
+        .route("/users/{key}", get(users::get_user).patch(users::update_user))
+        .route("/users/{key}/login-codes", post(users::create_login_code))
+        .route("/users/{key}/sessions", delete(users::revoke_user_sessions))
+        .route("/sessions", get(users::list_sessions))
+        .route("/sessions/{id}", delete(users::revoke_session));
     Router::new()
         .route("/healthz", get(|| async { Json(json!({ "ok": true })) }))
         .merge(
             Router::new()
                 .nest("/api", api)
+                .route("/login", get(login_page))
                 .fallback(get(web))
-                .layer(middleware::from_fn_with_state(auth_state, auth)),
+                .layer(middleware::from_fn_with_state(auth_state.clone(), auth))
+                .layer(Extension(auth_state)),
         )
         .layer(cors_layer())
         .with_state(app)
@@ -271,10 +306,14 @@ fn cors_layer() -> CorsLayer {
     layer
 }
 
-// Auth: browser login with AUTH_PASSWORD (any username), or the Bots' token for `botctl`.
+// Auth: sessions (a cookie for the web app, a bearer token for the client and
+// botctl), break-glass AUTH_PASSWORD (HTTP Basic, any username), or the Bots' token
+// for `botctl`. Then one permission check per request (rbac::classify). ADR 0011.
 
 struct Auth {
     password: String,
+    /// AUTH_BREAK_GLASS: AUTH_PASSWORD signs in as the owner. Off: the password is ignored.
+    break_glass: bool,
     /// Only when ALLOW_NO_AUTH=1 and loopback: empty password does not skip login on its own.
     allow_no_auth: bool,
     bot_token: String,
@@ -283,34 +322,73 @@ struct Auth {
     /// TRUST_FORWARDED_FOR=1: take the client IP from X-Forwarded-For from any peer,
     /// not only a proxy on loopback. Set when botd is reachable only through a proxy.
     trust_forwarded: bool,
+    sessions: SessionConfig,
     logins: audit::Logins,
-    /// Where login events go. None in tests of auth alone.
+    limiter: users::Limiter,
+    /// The database: sessions and audit events. None in tests of auth alone.
     app: Option<AppState>,
 }
 
 impl Auth {
+    fn new(app: Option<AppState>) -> Auth {
+        Auth {
+            password: String::new(),
+            break_glass: true,
+            allow_no_auth: false,
+            bot_token: String::new(),
+            hosts: Vec::new(),
+            trust_forwarded: false,
+            sessions: SessionConfig::default(),
+            logins: audit::Logins::default(),
+            limiter: users::Limiter::default(),
+            app,
+        }
+    }
+
     fn record(&self, e: Event) {
         if let Some(app) = &self.app {
             app.db.record(&e);
         }
     }
 
-    /// Logs the first good request of a session (see `audit::Logins`).
-    fn login_ok(&self, source: &Source, method: &str) {
+    /// The owner account, which break-glass and ALLOW_NO_AUTH act as.
+    fn operator(&self) -> Option<db::User> {
+        self.app.as_ref()?.db.user(users::OPERATOR)
+    }
+
+    /// Logs the first good Basic-auth request of a client (see `audit::Logins`).
+    /// Session sign-ins are logged once, by `users::login`.
+    fn login_ok(&self, source: &Source, actor: &Actor, method: &str) {
         let client = format!("{}|{}", source.ip.as_deref().unwrap_or(""), source.user_agent.as_deref().unwrap_or(""));
         if self.logins.success(&client, db::now()) {
-            let who = Who { actor: Actor::operator(), source: source.clone() };
+            let who = Who { actor: actor.clone(), source: source.clone() };
             self.record(who.event("auth.login").details(json!({ "method": method })));
         }
     }
 
-    /// Logs a bad password or token, throttled per IP. Never logs what was sent.
-    fn login_failed(&self, source: &Source, method: &str) {
+    /// Logs a bad password, code, or token, throttled per IP. Never logs what was sent.
+    fn login_failed(&self, source: &Source, method: &str, reason: Option<&str>) {
         let client = format!("{}|{method}", source.ip.as_deref().unwrap_or(""));
         let Some(missed) = self.logins.failure(&client, db::now()) else { return };
         let actor = if method == "bot_token" { Actor::bot(None, None) } else { Actor { id: None, ..Actor::operator() } };
         let who = Who { actor, source: source.clone() };
-        self.record(who.event("auth.login_failed").outcome(Outcome::Failure).details(json!({ "method": method, "unloggedSinceLast": missed })));
+        let mut details = json!({ "method": method, "unloggedSinceLast": missed });
+        if let Some(r) = reason {
+            details["reason"] = json!(r);
+        }
+        self.record(who.event("auth.login_failed").outcome(Outcome::Failure).details(details));
+    }
+
+    /// The live session for a token, or why there isn't one.
+    fn session(&self, token: &str) -> Option<(db::Session, db::User)> {
+        let app = self.app.as_ref()?;
+        if !token.starts_with(users::SESSION_PREFIX) {
+            return None;
+        }
+        let at = db::now();
+        let found = app.db.live_session(&users::hash(token), at, self.sessions.idle_ms, self.sessions.max_ms)?;
+        app.db.touch_session(&found.0.id, at);
+        Some(found)
     }
 
     /// A Bot request names its Bot (`X-SuperBot-Bot`, from botctl's BOT_ID). All Bots
@@ -345,8 +423,17 @@ fn request_source(req: &Request, trust_forwarded: bool) -> Source {
     Source { ip: ip.map(|i| i.to_string()), user_agent }
 }
 
-/// Refuse to start without AUTH_PASSWORD unless ALLOW_NO_AUTH=1 on loopback only.
-fn auth_startup(host: &str, password: &str) -> bool {
+/// With break-glass on (the default), refuse to start without AUTH_PASSWORD unless
+/// ALLOW_NO_AUTH=1 on loopback only. With it off, people sign in with sessions only.
+fn auth_startup(host: &str, password: &str, break_glass: bool) -> bool {
+    if !break_glass {
+        println!(
+            "Break-glass password sign-in is off (AUTH_BREAK_GLASS=0){}. People sign in with sessions; \
+             set AUTH_BREAK_GLASS=1 and restart to get back in with AUTH_PASSWORD.",
+            if password.is_empty() { "" } else { "; AUTH_PASSWORD is ignored" }
+        );
+        return false;
+    }
     if !password.is_empty() {
         return false;
     }
@@ -411,56 +498,132 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
     if !a.hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
         return (StatusCode::FORBIDDEN, "Unknown Host. Add it to ALLOWED_HOSTS.").into_response();
     }
-    let h = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
     let source = request_source(&req, a.trust_forwarded);
-    let bot = h.strip_prefix("Bearer ").is_some_and(|t| same(t.as_bytes(), a.bot_token.as_bytes()));
-    let user = h.strip_prefix("Basic ").and_then(base64_decode).is_some_and(|creds| {
-        let pass = creds.splitn(2, |b| *b == b':').nth(1).unwrap_or_default();
-        !a.password.is_empty() && same(pass, a.password.as_bytes())
-    });
-    let who = if bot {
-        Principal::Bot
-    } else if user || (a.allow_no_auth && a.password.is_empty()) {
-        Principal::User
-    } else {
-        // No credentials at all is the browser's first request, before it asks for the password.
-        if !h.is_empty() {
-            a.login_failed(&source, if h.starts_with("Bearer ") { "bot_token" } else { "password" });
-        }
-        return (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Basic realm=\"Bots\"")], "Login required").into_response();
-    };
-    let actor = match who {
-        Principal::User => {
-            a.login_ok(&source, if user { "password" } else { "none" });
-            Actor::operator()
-        }
-        Principal::Bot => a.bot_actor(req.headers()),
-    };
-    let by = Who { actor, source };
-    let (method, path) = (req.method().to_string(), req.uri().path().to_string());
+    let (method, path) = (req.method().clone(), req.uri().path().to_string());
     let mut req = req;
-    req.extensions_mut().insert(who);
+    req.extensions_mut().insert(source.clone());
+    // Signing in, and the page to do it on, need no credentials.
+    if (method == Method::POST && path == "/api/auth/login") || (method == Method::GET && path == "/login") {
+        return next.run(req).await;
+    }
+    let caller = match authenticate(&a, &req, &source) {
+        Ok(c) => c,
+        Err(res) => return *res,
+    };
+    let actor = match (&caller.principal, &caller.user) {
+        (Principal::Bot, _) => a.bot_actor(req.headers()),
+        (_, Some(u)) => users::actor(u),
+        (_, None) => Actor::operator(),
+    };
+    if caller.method != "session" && caller.principal != Principal::Bot {
+        a.login_ok(&source, &actor, caller.method);
+    }
+    let by = Who { actor, source };
+    let need = rbac::classify(&method, &path);
+    let denied = |reason: &str, msg: String| {
+        a.record(by.event("access.denied").outcome(Outcome::Denied).details(json!({ "method": method.as_str(), "path": path, "need": need.as_str(), "reason": reason })));
+        ApiError(StatusCode::FORBIDDEN, msg).into_response()
+    };
+    if !rbac::allows(caller.principal, need) {
+        let msg = match caller.principal {
+            Principal::Bot => "Only a signed-in person can do this, not a Bot.".to_string(),
+            Principal::User(r) => format!("Your role ({}) can't do this.", r.as_str()),
+        };
+        return denied("role", msg);
+    }
+    // A cookie rides along on any request the browser makes, so writes must come from our own pages.
+    let safe = matches!(method, Method::GET | Method::HEAD | Method::OPTIONS);
+    if caller.session.as_ref().is_some_and(|s| s.kind == "cookie") && !safe && !users::same_origin(req.headers()) {
+        return denied("cross_site", "Cross-site request refused.".into());
+    }
+    let principal = caller.principal;
+    req.extensions_mut().insert(principal);
+    req.extensions_mut().insert(caller);
     req.extensions_mut().insert(by.clone());
     let res = next.run(req).await;
-    if who == Principal::Bot && res.status() == StatusCode::FORBIDDEN {
-        a.record(by.event("access.denied").outcome(Outcome::Denied).details(json!({ "method": method, "path": path })));
+    if principal == Principal::Bot && res.status() == StatusCode::FORBIDDEN {
+        a.record(by.event("access.denied").outcome(Outcome::Denied).details(json!({ "method": method.as_str(), "path": path })));
     }
     res
 }
 
-/// Who is calling: a person (the browser or client, with AUTH_PASSWORD) or a Bot
-/// (`botctl`, with the per-start BOT_TOKEN that every Bot run can read).
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Principal {
-    User,
-    Bot,
+/// Who sent this request, from (in order) the Authorization header, the session
+/// cookie, or ALLOW_NO_AUTH. A request that sends bad credentials is refused even if
+/// it also has good ones elsewhere.
+fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<Response>> {
+    let h = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let operator = |method: &'static str| Caller { principal: Principal::User(Role::Admin), user: a.operator(), session: None, method };
+    let from_session = |(s, u): (db::Session, db::User)| Caller { principal: Principal::User(u.role), user: Some(u), session: Some(s), method: "session" };
+    let fail = |method: &str, reason: Option<&str>, clear: bool| {
+        a.login_failed(source, method, reason);
+        Err(Box::new(unauthorized(a, req, clear)))
+    };
+    if let Some(t) = h.strip_prefix("Bearer ") {
+        let t = t.trim();
+        if !a.bot_token.is_empty() && same(t.as_bytes(), a.bot_token.as_bytes()) {
+            return Ok(Caller { principal: Principal::Bot, user: None, session: None, method: "bot_token" });
+        }
+        return match a.session(t) {
+            Some(found) => Ok(from_session(found)),
+            None if t.starts_with(users::SESSION_PREFIX) => fail("session", Some("unknown_or_expired"), false),
+            None => fail("bot_token", None, false),
+        };
+    }
+    if let Some(b) = h.strip_prefix("Basic ") {
+        let ok = base64_decode(b).is_some_and(|creds| {
+            let pass = creds.splitn(2, |c| *c == b':').nth(1).unwrap_or_default();
+            a.break_glass && !a.password.is_empty() && same(pass, a.password.as_bytes())
+        });
+        return match ok || a.allow_no_auth {
+            true => Ok(operator(if ok { "password" } else { "none" })),
+            false => fail("password", (!a.break_glass).then_some("break_glass_off"), false),
+        };
+    }
+    if !h.is_empty() {
+        return fail("unknown_scheme", None, false);
+    }
+    if let Some(t) = users::cookie_token(req.headers()) {
+        return match a.session(&t) {
+            Some(found) => Ok(from_session(found)),
+            None if a.allow_no_auth => Ok(operator("none")),
+            None => fail("session", Some("unknown_or_expired"), true),
+        };
+    }
+    if a.allow_no_auth {
+        return Ok(operator("none"));
+    }
+    // No credentials at all: a browser's first visit, or a client that hasn't signed in.
+    Err(Box::new(unauthorized(a, req, false)))
+}
+
+/// Not signed in. A browser opening a page without credentials goes to the
+/// sign-in page instead of a 401. The Basic challenge (break-glass) is only offered
+/// when the browser itself would show it to a person: not to the web app's own
+/// fetches, or a cookie session that ended would pop up a password box.
+fn unauthorized(a: &Auth, req: &Request, clear_cookie: bool) -> Response {
+    let h = req.headers();
+    let page = !req.uri().path().starts_with("/api/") && matches!(*req.method(), Method::GET | Method::HEAD);
+    let mut res = if page && !h.contains_key(header::AUTHORIZATION) {
+        (StatusCode::SEE_OTHER, [(header::LOCATION, "/login")]).into_response()
+    } else {
+        ApiError(StatusCode::UNAUTHORIZED, "Login required".into()).into_response()
+    };
+    let fetch = h.get("sec-fetch-mode").and_then(|v| v.to_str().ok()).is_some_and(|m| m != "navigate");
+    if res.status() == StatusCode::UNAUTHORIZED && a.break_glass && !fetch && users::cookie_token(h).is_none() {
+        res.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Basic realm=\"Bots\""));
+    }
+    if clear_cookie {
+        res.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_static(users::clear_cookie()));
+    }
+    res
 }
 
 /// Approvals and policy changes are for people. Bots hold a token too, so without
-/// this a Bot could approve its own request.
+/// this a Bot could approve its own request. The auth middleware already refuses
+/// these by role; this is the second lock.
 fn need_user(p: Principal) -> Res<()> {
     match p {
-        Principal::User => Ok(()),
+        Principal::User(_) => Ok(()),
         Principal::Bot => Err(ApiError(StatusCode::FORBIDDEN, "Only a signed-in person can do this, not a Bot.".into())),
     }
 }
@@ -513,21 +676,74 @@ async fn web(uri: axum::http::Uri) -> Response {
 
 // Live updates: one Server-Sent Events stream with everything.
 
-async fn events(State(app): State<AppState>) -> impl IntoResponse {
-    let stream = BroadcastStream::new(app.tx.subscribe()).map(|r| {
-        // A slow client that missed events is told to reload its state.
-        Ok::<_, Infallible>(SseEvent::default().data(r.unwrap_or_else(|_| r#"{"type":"resync"}"#.into())))
+async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>) -> impl IntoResponse {
+    let Some(session) = c.session.map(|s| s.id) else {
+        let stream = BroadcastStream::new(app.tx.subscribe()).map(|r| {
+            // A slow client that missed events is told to reload its state.
+            Ok::<_, Infallible>(SseEvent::default().data(r.unwrap_or_else(|_| r#"{"type":"resync"}"#.into())))
+        });
+        return ([("x-accel-buffering", "no")], Sse::new(Box::pin(stream) as EventStream).keep_alive(KeepAlive::default()));
+    };
+    // The stream outlives the request that opened it, so it closes within seconds of
+    // its session being revoked, expiring, or its user being disabled.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, Infallible>>(64);
+    let mut sub = app.tx.subscribe();
+    let cfg = a.sessions;
+    tokio::spawn(async move {
+        let mut check = tokio::time::interval(SESSION_RECHECK);
+        loop {
+            tokio::select! {
+                r = sub.recv() => {
+                    let data = match r {
+                        Ok(d) => d,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => r#"{"type":"resync"}"#.into(),
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    };
+                    if tx.send(Ok(SseEvent::default().data(data))).await.is_err() {
+                        break;
+                    }
+                }
+                _ = check.tick() => {
+                    if !app.db.session_is_live(&session, db::now(), cfg.idle_ms, cfg.max_ms) {
+                        break;
+                    }
+                }
+                _ = tx.closed() => break,
+            }
+        }
     });
-    ([("x-accel-buffering", "no")], Sse::new(stream).keep_alive(KeepAlive::default()))
+    ([("x-accel-buffering", "no")], Sse::new(Box::pin(ReceiverStream::new(rx)) as EventStream).keep_alive(KeepAlive::default()))
+}
+
+#[cfg(not(test))]
+const SESSION_RECHECK: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const SESSION_RECHECK: Duration = Duration::from_millis(100);
+
+async fn login_page() -> Response {
+    let body = match WEB_DIR.get().and_then(|d| d.as_ref()) {
+        Some(dir) => std::fs::read_to_string(dir.join("login.html")).unwrap_or_default(),
+        None => include_str!("../../web/login.html").to_string(),
+    };
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], body).into_response()
 }
 
 // Bots
 
-async fn state(State(app): State<AppState>, Extension(who): Extension<Principal>) -> Json<Value> {
+async fn state(State(app): State<AppState>, Extension(c): Extension<Caller>) -> Json<Value> {
     let bots: Vec<Value> = app.db.bots().iter().map(|b| app.bot_view(b)).collect();
-    let approvals = if who == Principal::User { app.db.approvals(Some("pending"), None, 200) } else { vec![] };
+    let approvals = if rbac::allows(c.principal, Perm::Review) { app.db.approvals(Some("pending"), None, 200) } else { vec![] };
+    // The owner keeps USER_NAME, as before users existed.
+    let name = match &c.user {
+        Some(u) if u.id != users::OPERATOR => u.name.clone(),
+        _ => env("USER_NAME", "You"),
+    };
+    let role = match c.principal {
+        Principal::User(r) => json!(r),
+        Principal::Bot => json!("bot"),
+    };
     Json(json!({
-        "me": { "name": env("USER_NAME", "You") },
+        "me": { "name": name, "id": c.user.as_ref().map(|u| &u.id), "email": c.user.as_ref().and_then(|u| u.email.as_ref()), "role": role, "permissions": rbac::granted(c.principal) },
         "harnesses": adapters::installed(),
         "defaultHarness": app.cfg.default_harness,
         "bots": bots,
@@ -1076,9 +1292,7 @@ mod tests {
             allow_no_auth,
             bot_token: bot_token.clone(),
             hosts: allowed_hosts("127.0.0.1", port, extra_hosts),
-            trust_forwarded: false,
-            logins: audit::Logins::default(),
-            app: None,
+            ..Auth::new(None)
         });
         let router = Router::new()
             .route("/api/state", get(|| async { "ok" }))
@@ -1103,7 +1317,7 @@ mod tests {
         res.split_whitespace().nth(1).unwrap().parse().unwrap()
     }
 
-    fn basic(password: &str) -> String {
+    pub(super) fn basic(password: &str) -> String {
         const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = String::new();
         for c in format!("anyone:{password}").as_bytes().chunks(3) {
@@ -1162,20 +1376,26 @@ mod tests {
 
     /// The real router on a fresh install (policy: ask), with a random password.
     /// Returns the port, the app, and the Authorization headers of the person and of Bots.
-    async fn serve_app() -> (u16, AppState, String, String) {
+    pub(super) async fn serve_app() -> (u16, AppState, String, String) {
+        serve_app_with(|_| {}).await
+    }
+
+    /// `serve_app`, with Auth changed first (break-glass, session lifetimes).
+    pub(super) async fn serve_app_with(tweak: impl FnOnce(&mut Auth)) -> (u16, AppState, String, String) {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let password = random_hex(16);
         let app = runner::test_app();
-        let auth = Arc::new(Auth {
+        users::ensure_operator(&app.db, "Owner", None);
+        let mut auth = Auth {
             password: password.clone(),
-            allow_no_auth: false,
             bot_token: random_hex(16),
             hosts: allowed_hosts("127.0.0.1", port, ""),
-            trust_forwarded: false,
-            logins: audit::Logins::default(),
-            app: Some(app.clone()),
-        });
+            ..Auth::new(Some(app.clone()))
+        };
+        tweak(&mut auth);
+        let password = auth.password.clone();
+        let auth = Arc::new(auth);
         let bot = format!("Bearer {}", auth.bot_token);
         let r = router(app.clone(), auth);
         tokio::spawn(async move {
@@ -1184,13 +1404,13 @@ mod tests {
         (port, app, basic(&password), bot)
     }
 
-    async fn call(port: u16, method: &str, path: &str, authorization: &str, body: &str) -> (u16, String) {
+    pub(super) async fn call(port: u16, method: &str, path: &str, authorization: &str, body: &str) -> (u16, String) {
         let (code, _, body) = call_with(port, method, path, authorization, "", body).await;
         (code, body)
     }
 
     /// `extra` is more header lines, each ending in \r\n. HTTP/1.0, so bodies are never chunked.
-    async fn call_with(port: u16, method: &str, path: &str, authorization: &str, extra: &str, body: &str) -> (u16, String, String) {
+    pub(super) async fn call_with(port: u16, method: &str, path: &str, authorization: &str, extra: &str, body: &str) -> (u16, String, String) {
         let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let auth = if authorization.is_empty() { String::new() } else { format!("Authorization: {authorization}\r\n") };
         let req = format!(
@@ -1205,7 +1425,7 @@ mod tests {
         (code, head.to_string(), body.to_string())
     }
 
-    fn audit_list(body: &str) -> Vec<Value> {
+    pub(super) fn audit_list(body: &str) -> Vec<Value> {
         serde_json::from_str::<Value>(body).unwrap()["events"].as_array().cloned().unwrap_or_default()
     }
 
@@ -1304,6 +1524,7 @@ mod tests {
         assert_eq!(
             seen,
             [
+                ("user.created".into(), "system".into(), Some("bootstrap".into()), "success".into()),
                 ("auth.login".into(), "user".into(), op.clone(), "success".into()),
                 ("bot.created".into(), "user".into(), op.clone(), "success".into()),
                 ("bot.updated".into(), "user".into(), op.clone(), "success".into()),
