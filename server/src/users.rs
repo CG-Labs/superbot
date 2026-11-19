@@ -630,9 +630,14 @@ pub async fn revoke_session(State(app): State<AppState>, Extension(by): Extensio
     Ok(Json(json!({ "ok": true })))
 }
 
-pub async fn revoke_user_sessions(State(app): State<AppState>, Extension(by): Extension<Who>, Path(key): Path<String>) -> Res {
+pub async fn revoke_user_sessions(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path(key): Path<String>) -> Res {
     let u = need_user_key(&app, &key)?;
     let n = app.db.revoke_user_sessions(&u.id, by.actor.id.as_deref().unwrap_or(""), "revoked by admin");
+    // Everything that could still become a session, or still shows a screen, goes too.
+    a.sso.forget_user(&u.id);
+    if let Some(screens) = &app.screens {
+        screens.rotate_all().await;
+    }
     app.db.record(&by.event("session.revoked_all").target("user", &u.id).details(json!({ "count": n })));
     Ok(Json(json!({ "revoked": n })))
 }

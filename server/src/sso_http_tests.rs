@@ -87,7 +87,7 @@ pub(super) async fn mock_idp() -> Arc<Idp> {
                 let now = db::now() / 1000;
                 let mut claims = json!({
                     "iss": format!("{}/{T1}/v2.0", b.authority), "aud": CLIENT, "tid": T1, "oid": OID, "sub": "pairwise-sub",
-                    "name": "Ada Lovelace", "email": "ada@example.com", "nonce": nonce, "iat": now, "nbf": now, "exp": now + 3600,
+                    "name": "Ada Lovelace", "email": "ada@example.com", "xms_edov": true, "nonce": nonce, "iat": now, "nbf": now, "exp": now + 3600,
                 });
                 let (over, key) = b.next.lock().unwrap().clone();
                 claims.as_object_mut().unwrap().extend(over.as_object().unwrap().clone());
@@ -354,6 +354,49 @@ async fn the_app_trades_a_one_time_code_and_its_verifier_for_a_token() {
     let (_, q) = back(path).await;
     assert_eq!((q.get("error").map(String::as_str), q.get("code")), (Some("sso_email_taken"), None));
     assert!(app.db.identity(&format!("{}/{T1}/v2.0", idp.authority), OID2).is_none());
+}
+
+#[tokio::test]
+async fn an_entra_email_its_tenant_did_not_verify_is_not_taken() {
+    let idp = mock_idp().await;
+    let (port, app, admin, id) = serve(&idp, &[("SSO_{ID}_JIT_ROLE", "member"), ("SSO_APP_REDIRECTS", "superbot://auth")]).await;
+    let (code, _) = call(port, "POST", "/api/users", &admin, &json!({ "email": "ceo@example.com", "name": "CEO" }).to_string()).await;
+    assert_eq!(code, 201);
+    // Any tenant admin can give an account any email; without xms_edov it is not the person's.
+    *idp.next.lock().unwrap() = (json!({ "email": "CEO@example.com", "xms_edov": false, "name": null }), 0);
+    let (code, head) = web_sign_in(port, &id).await;
+    assert_eq!(code, 200, "{head}");
+    let (_, user) = app.db.identity(&format!("{}/{T1}/v2.0", idp.authority), OID).unwrap();
+    assert_eq!((user.email.as_deref(), user.name.as_str()), (None, "Microsoft user"), "a new user, not ceo@example.com and not named after it");
+    assert_ne!(Some(user.id.clone()), app.db.find_user("ceo@example.com").map(|u| u.id));
+    let made = audit_list(&call(port, "GET", "/api/audit?action=user.created", &admin, "").await.1);
+    assert!(made.iter().any(|e| e["details"]["subject"] == OID && e["details"]["email"].is_null()));
+}
+
+#[tokio::test]
+async fn signing_out_everywhere_spends_app_codes_not_yet_redeemed() {
+    let idp = mock_idp().await;
+    let (port, app, admin, id) = serve(&idp, &[("SSO_{ID}_JIT_ROLE", "member"), ("SSO_APP_REDIRECTS", "superbot://auth")]).await;
+    let verifier = B64.encode(random_bytes(32));
+    let start = format!("/api/auth/sso/{id}/start?session=token&redirect=superbot%3A%2F%2Fauth&challenge={}&state=st-1", s256(&verifier));
+    let code_for = || async {
+        let (path, _) = to_callback(port, &start).await;
+        let (_, head, _) = call_with(port, "GET", &path, "", "", "").await;
+        let to = url::Url::parse(&header(&head, "location").unwrap()).unwrap();
+        to.query_pairs().find(|(k, _)| k == "code").unwrap().1.to_string()
+    };
+    let redeem = |code: String| {
+        let body = json!({ "sso": code, "verifier": verifier }).to_string();
+        async move { call(port, "POST", "/api/auth/login", "", &body).await.0 }
+    };
+    assert_eq!(redeem(code_for().await).await, 200);
+    let uid = app.db.identity(&format!("{}/{T1}/v2.0", idp.authority), OID).unwrap().1.id;
+
+    // A code someone else caught (say, from a shared device's URL bar) dies with the sessions.
+    let caught = code_for().await;
+    assert_eq!(call(port, "DELETE", &format!("/api/users/{uid}/sessions"), &admin, "").await.0, 200);
+    assert_eq!(redeem(caught).await, 401);
+    assert_eq!(redeem(code_for().await).await, 200, "new sign-ins still work");
 }
 
 #[tokio::test]

@@ -120,6 +120,13 @@ impl Default for Sso {
     }
 }
 
+impl Sso {
+    /// Drops `user_id`'s one-time app codes not yet redeemed, when their sessions are revoked.
+    pub fn forget_user(&self, user_id: &str) {
+        self.handoffs.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, h| h.user_id != user_id);
+    }
+}
+
 fn random() -> String {
     B64.encode(crate::random_bytes(32))
 }
