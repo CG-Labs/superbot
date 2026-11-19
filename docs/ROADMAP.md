@@ -53,7 +53,7 @@ What exists in **CG-Labs/superbot** today:
 
 | Area | Reality |
 |------|---------|
-| **Auth** | Single `AUTH_PASSWORD` (Basic); optional `ALLOW_NO_AUTH` on loopback only; `ALLOWED_HOSTS`; per-start `BOT_TOKEN` for `botctl`. No user table, no SSO, no RBAC. Logins and failed logins are audited. |
+| **Auth** | Users in SQLite with roles (admin, member, read-only) enforced per API route; server-side sessions (HttpOnly cookie for `web/`, bearer token for the client and `botctl`) with idle and absolute TTLs, logout, and admin revoke; one-time sign-in codes from an admin; `AUTH_PASSWORD` kept as break-glass owner login (`AUTH_BREAK_GLASS`, on by default) ([ADR 0012](adr/0012-users-sessions-rbac.md)). `ALLOW_NO_AUTH` on loopback only; `ALLOWED_HOSTS`; per-start `BOT_TOKEN` for `botctl`. No SSO yet. Sign-ins, revokes, and user changes are audited. |
 | **Client** | Login, SSE chat, bots CRUD, models/effort, routine create/edit/delete, live screen viewer (iframe / WebView) with take over, handoff cards and alerts; no audit log viewer, push, or biometric lock; placeholder EAS `projectId`; template branding. |
 | **Server** | SQLite single-tenant schema; harnesses run with their own prompts off, gated by the SuperBot **policy engine and approval queue** (default **ask** on fresh installs; [ADR 0007](adr/0007-approvals.md)); append-only **audit events** for admin actions with CSV export (`/api/audit`, `botctl audit export`, web Audit log; [ADR 0009](adr/0009-audit-events.md)). **Secrets store** (env/sealed `SecretStore`, master key, redaction) is in review as [PR #9](https://github.com/CG-Labs/superbot/pull/9) (ADR 0010); external vaults not built. |
 | **Harnesses** | Claude Code, Codex, Pi adapters. Hermes Agent adapter proposed ([ADR 0011](adr/0011-hermes-agent-backend.md)). |
@@ -118,6 +118,7 @@ Basic auth may remain for **break-glass** and **self-host hobby** tiers only, be
 | | |
 |--|--|
 | **Goal** | First **sellable team** product: real users and familiar sign-in. |
+| **Status** | **In progress.** Slice 1 (**done**, [ADR 0012](adr/0012-users-sessions-rbac.md)): user store, server-side sessions with TTLs and revoke, RBAC v1 on the API, break-glass, `botctl` user/session commands, auth audit events, client token flow. Next: OIDC providers on this user model; then SAML bridge, SCIM stub, bot ACLs. |
 | **Scope** | User store; JWT/session cookies for client; **Sign in with Apple**, **GitHub**, **Microsoft Entra ID**, **Google** (OIDC/OAuth); **generic OIDC** connector (Okta and others) and a SAML bridge where an IdP needs it; account linking (several IdPs per user); RBAC v1 (org admin, member, read-only); bot ACLs; migrate from `AUTH_PASSWORD` to SSO-primary with break-glass; session TTL and admin revoke; audit log with per-user actors and IdP; SCIM **design + stub** (full SCIM in M5). Parallel tracks: Hermes Agent harness adapter ([ADR 0011](adr/0011-hermes-agent-backend.md), option a); confirm the interface proposal (Expo client primary, `web/` as admin fallback). |
 | **Exit criteria** | Columbia org signs in with SSO only; each of Apple, GitHub, Entra, Google, and one generic OIDC IdP (e.g. Okta) works end to end; two roles enforced on API; shared vs private bots; pen-test style review of auth bypass; client uses token flow (no password in SecureStore for SSO tenants). |
 | **Size** | **XL** |
@@ -176,7 +177,7 @@ Basic auth may remain for **break-glass** and **self-host hobby** tiers only, be
 | Secrets | Harness logins on service user disk; env/sealed store in review ([PR #9](https://github.com/CG-Labs/superbot/pull/9)) | External vaults + short-lived tokens (M5) |
 | Audit | Append-only SQLite table, CSV export, retention setting (**done**: [ADR 0009](adr/0009-audit-events.md)) | Per-user actors and IdP subjects (M2); SIEM export and tamper evidence (M5) |
 | Network | Caddy TLS, loopback `botd` | Same + mTLS between control plane and per-user machines (M3) |
-| Client | Password in SecureStore | OAuth tokens, certificate pinning (managed) |
+| Client | Session token in SecureStore (password only for servers from before ADR 0012) | OAuth tokens, certificate pinning (managed) |
 
 ---
 

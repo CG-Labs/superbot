@@ -84,7 +84,7 @@ The policy decides what each tool call does: run, ask a person, or be blocked.
 - **Turning approvals on** stops any task that started in `bypass` (it has no hook), with a note to send it again.
 - **Remember** saves an exact rule. Calls too long to store whole (over 4,000 characters) can be approved or denied, but not remembered.
 - **Audit**: every request, decision, timeout, and policy or rule change is in the [audit log](#audit-log).
-- **Who decides**: only a person logged in with `AUTH_PASSWORD`. Bots' token gets 403 on decisions and policy changes.
+- **Who decides**: a signed-in admin or member (see [users and roles](#users-sessions-and-roles)). Bots' token and read-only users get 403 on decisions; only admins change policy and rules.
 
 Fresh installs start in `ask`. Installs from before approvals keep `bypass` until you opt in:
 
@@ -122,9 +122,26 @@ botctl audit export --actor user --to 2026-11-30 > audit.csv
 
 CSV export is RFC 4180 with CRLF line endings, oldest first. Cells that start with `=`, `+`, `-`, `@`, tab, or CR get a leading `'` so spreadsheets don't treat them as formulas.
 
+## Users, sessions, and roles
+
+People are users with a role: **admin** (everything), **member** (use and manage Bots and routines, decide approvals), or **read-only** (see everything, change nothing). Admins also manage policy, the audit log, users, and sessions. One check per API route enforces it; unknown routes are admin-only. Design: [ADR 0012](adr/0012-users-sessions-rbac.md).
+
+- **Owner**: made on first start as admin `operator` (name `USER_NAME`, email `OWNER_EMAIL`). `AUTH_PASSWORD` signs in as the owner (break-glass) while `AUTH_BREAK_GLASS` is on, the default. Set `AUTH_BREAK_GLASS=0` to ignore the password once admins sign in another way.
+- **Everyone else**: an admin adds them and gives them a one-time sign-in code, which they enter in the web app or client. Codes are single use and expire (default 1 hour). SSO (OIDC) is next.
+- **Sessions**: the web app gets an HttpOnly cookie, the client and `botctl` a bearer token. They end after `SESSION_IDLE_TIMEOUT` without use (default `7d`) or `SESSION_MAX_AGE` after sign-in (default `30d`), on logout, or when an admin revokes them or disables the user. Only hashes are stored.
+
+```sh
+export SUPERBOT_PASSWORD=<your AUTH_PASSWORD>      # or: botctl login <code>, then export SUPERBOT_TOKEN=...
+botctl user add alex@example.com "Alex" --role member
+botctl user code alex@example.com                   # one-time code for Alex
+botctl users | botctl sessions alex@example.com
+botctl user role alex@example.com readonly | botctl user disable alex@example.com
+botctl session revoke <id> | botctl session revoke-all alex@example.com
+```
+
 ## API
 
-All JSON. Browser auth: HTTP Basic with `AUTH_PASSWORD`. Empty password requires `ALLOW_NO_AUTH=1` on loopback only.
+All JSON. Auth: a session cookie (web app) or `Authorization: Bearer <session token>` (client, `botctl`), or HTTP Basic with `AUTH_PASSWORD` while break-glass is on. Empty password requires `ALLOW_NO_AUTH=1` on loopback only. Each route needs a role permission (above); 401 without valid credentials, 403 when the role doesn't allow it.
 
 - `GET /api/state`: user name, installed harnesses, all Bots, global policy, pending approvals. Each Bot's `handoff` is the id of its unanswered handoff card, or null.
 - `GET /api/events`: SSE stream (`message`, `draft`, `status`, `bot`, `botDeleted`, `approval`, `policy`, `resync`)
@@ -137,6 +154,14 @@ All JSON. Browser auth: HTTP Basic with `AUTH_PASSWORD`. Empty password requires
 - `PATCH|DELETE /api/routines/:id` `{enabled?, name?, cron?, instruction?}`. Text fields are trimmed and can't be empty; cron must parse.
 - `GET /api/bots/:id/screen`: starts the Bot's screen and returns its live view URL. 503 while voxl isn't listening yet, or when all screens are in use
 - `POST /api/handoff` `{from, text}`: `botctl handoff`; waits for the user's answer
+
+Sign-in, users, and sessions ([ADR 0012](adr/0012-users-sessions-rbac.md)). Users and sessions are admin only:
+
+- `POST /api/auth/login` `{password | code, session?: "cookie" | "token", label?}` → `{user, session, token}`. No credentials needed. 429 after 10 failures from one IP in 10 minutes
+- `POST /api/auth/logout`, `GET /api/auth/me`: the caller's user, role, permissions, and session
+- `GET|POST /api/users` `{email, name?, role?}`, `GET|PATCH /api/users/:id-or-email` `{name?, email?, role?, status?: active|disabled}`. The owner can't be demoted or disabled (409)
+- `POST /api/users/:id/login-codes` `{ttlMinutes?}` → `{code, expiresAt}`
+- `GET /api/sessions?user=`, `DELETE /api/sessions/:id`, `DELETE /api/users/:id/sessions`
 
 Approvals, policy, and audit. Writes, decisions, the approvals list, and the audit log need a person (403 for the Bot token):
 
