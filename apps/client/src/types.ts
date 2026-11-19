@@ -33,6 +33,38 @@ export interface BotView {
   working: boolean;
   status?: string;
   draft?: string;
+  /** Effective harness policy: "ask" pauses risky tool calls for approval. */
+  policy?: PolicyMode;
+  /** True when this Bot overrides the global policy. */
+  policyOverride?: boolean;
+}
+
+export type PolicyMode = "ask" | "bypass";
+export type PolicyAction = "allow" | "ask" | "deny";
+
+export interface Policy {
+  mode: PolicyMode;
+  classes: Record<string, PolicyAction>;
+  timeoutMinutes: number;
+}
+
+export type ApprovalStatus = "pending" | "approved" | "denied" | "expired" | "cancelled";
+
+export interface Approval {
+  id: string;
+  botId: string;
+  harness: string;
+  tool: string;
+  kind: string;
+  subject: string;
+  class: string;
+  reason: string;
+  status: ApprovalStatus;
+  createdAt: number;
+  expiresAt: number;
+  decidedAt?: number | null;
+  decidedBy?: string | null;
+  note?: string | null;
 }
 
 export interface ModelOption {
@@ -47,6 +79,8 @@ export interface AppState {
   harnesses: string[];
   defaultHarness: string;
   bots: BotView[];
+  policy?: Policy;
+  approvals?: Approval[];
 }
 
 export interface Routine {
@@ -64,6 +98,8 @@ export type SseEvent =
   | { type: "botDeleted"; botId: string }
   | { type: "draft"; botId: string; text: string }
   | { type: "status"; botId: string; working: boolean; status?: string }
+  | { type: "approval"; approval: Approval }
+  | { type: "policy"; policy: Policy }
   | { type: "resync" };
 
 export interface ServerConfig {
