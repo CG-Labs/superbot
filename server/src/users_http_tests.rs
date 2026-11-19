@@ -188,11 +188,13 @@ async fn each_role_gets_exactly_its_permissions() {
         ("GET", "/api/secrets".into(), ""),
         ("PUT", "/api/secrets/RBAC_CHECK_KEY".into(), r#"{"value":"v"}"#),
         ("DELETE", "/api/secrets/RBAC_CHECK_KEY".into(), ""),
+        ("GET", format!("/api/users/{member_id}/bots"), ""),
+        ("GET", format!("/api/users/{member_id}/identities"), ""),
     ];
     // Allowed or not, per role, in route order.
-    let r = [true, true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false];
-    let m = [true, true, true, true, true, true, true, true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false];
-    let k = [true, true, true, false, true, true, true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false];
+    let r = [true, true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false];
+    let m = [true, true, true, true, true, true, true, true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false];
+    let k = [true, true, true, false, true, true, true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false];
     for (who, auth, allowed) in [("readonly", &readonly, r), ("member", &member, m), ("bot", &bot, k)] {
         for ((method, path, body), ok) in routes.iter().zip(allowed) {
             let (code, res) = call(port, method, path, auth, body).await;
@@ -293,6 +295,83 @@ async fn sessions_end_on_logout_revoke_and_disable() {
     let (_, body) = call(port, "GET", "/api/audit?action=auth.logout,session.*,user.disabled,user.enabled&limit=100", &admin, "").await;
     let actions: Vec<String> = audit_list(&body).iter().rev().map(|e| e["action"].as_str().unwrap().to_string()).collect();
     assert_eq!(actions, ["auth.logout", "session.revoked", "session.revoked_all", "user.disabled", "user.enabled"]);
+}
+
+/// What the admin portal (ADR 0019) reads and does: last sign-in, linked identities,
+/// waiting codes (never the codes), regenerating a code, and a user's Bot access.
+#[tokio::test]
+async fn the_admin_portal_sees_sign_ins_codes_and_bot_access() {
+    let (port, app, admin, _) = serve(|_| {}).await;
+    let (code, u) = call(port, "POST", "/api/users", &admin, r#"{"email":"new@example.com","name":"New","role":"member"}"#).await;
+    assert_eq!(code, 201, "{u}");
+    let id = parse(&u)["id"].as_str().unwrap().to_string();
+    let row = |list: &str| parse(list).as_array().unwrap().iter().find(|u| u["id"] == id.as_str()).cloned().unwrap();
+    let (_, list) = call(port, "GET", "/api/users", &admin, "").await;
+    let me = row(&list);
+    assert_eq!((me["lastLoginAt"].clone(), me["pendingCodes"].clone(), me["identities"].clone()), (Value::Null, Value::Null, json!([])));
+
+    // A 24 hour invite code: shown once, never cached, and only counted afterwards.
+    let (code, head, c) = call_with(port, "POST", &format!("/api/users/{id}/login-codes"), &admin, "", r#"{"ttlMinutes":1440}"#).await;
+    assert_eq!(code, 200, "{c}");
+    assert_eq!(header(&head, "cache-control").as_deref(), Some("no-store"));
+    let first = parse(&c)["code"].as_str().unwrap().to_string();
+    let (_, list) = call(port, "GET", "/api/users", &admin, "").await;
+    assert!(!list.contains(&first));
+    let me = row(&list);
+    assert_eq!(me["pendingCodes"]["count"], 1);
+    assert_eq!(me["pendingCodes"]["expiresAt"], parse(&c)["expiresAt"]);
+
+    // Regenerating replaces it: the old code stops working.
+    assert_eq!(call(port, "POST", &format!("/api/users/{id}/login-codes"), &admin, r#"{"replace":"yes"}"#).await.0, 400);
+    let (_, c) = call(port, "POST", &format!("/api/users/{id}/login-codes"), &admin, r#"{"ttlMinutes":60,"replace":true}"#).await;
+    let second = parse(&c)["code"].as_str().unwrap().to_string();
+    let (_, list) = call(port, "GET", "/api/users", &admin, "").await;
+    assert_eq!(row(&list)["pendingCodes"]["count"], 1);
+    assert_eq!(login(port, "", json!({ "code": first })).await.0, 401);
+    let t = token_for(port, json!({ "code": second })).await;
+    let (_, list) = call(port, "GET", "/api/users", &admin, "").await;
+    let me = row(&list);
+    assert!(me["lastLoginAt"].as_i64().is_some_and(|t| t > 0), "{me}");
+    assert_eq!(me["pendingCodes"], Value::Null);
+    let (_, me_body) = call(port, "GET", "/api/auth/me", &bearer(&t), "").await;
+    assert_eq!(parse(&me_body)["user"]["lastLoginAt"], me["lastLoginAt"]);
+
+    // Linked identities show in the list and on the user.
+    let ident = db::NewIdentity { provider: "github", issuer: "https://github.com", subject: "42", tenant: None, email: Some("new@example.com"), created_by: Some("operator") };
+    app.db.link_identity(&id, &ident).unwrap();
+    let (_, one) = call(port, "GET", &format!("/api/users/{id}"), &admin, "").await;
+    let one = parse(&one);
+    assert_eq!((one["identities"][0]["provider"].as_str(), one["identities"][0]["email"].as_str()), (Some("github"), Some("new@example.com")));
+    let (_, list) = call(port, "GET", "/api/users", &admin, "").await;
+    assert_eq!(row(&list)["identities"], one["identities"]);
+
+    // Bot access, as ADR 0017 decides it for the user's role now.
+    let mine = app.db.create_bot_owned("Mine", "#fff", "waddle", "claude", None, false, &id, acl::Visibility::Private);
+    let granted = app.db.create_bot_owned("Granted", "#fff", "waddle", "claude", None, false, "operator", acl::Visibility::Private);
+    let hidden = app.db.create_bot_owned("Hidden", "#fff", "waddle", "claude", None, false, "operator", acl::Visibility::Private);
+    app.db.set_grant(&granted.id, &id, acl::Grant::Viewer, "operator");
+    let access = |body: &str| -> Vec<(String, String, Value)> {
+        let v = parse(body);
+        v["bots"].as_array().unwrap().iter().map(|b| (b["bot"]["name"].as_str().unwrap().to_string(), b["access"].as_str().unwrap().to_string(), b["grant"].clone())).collect()
+    };
+    let (code, bots) = call(port, "GET", "/api/users/new@example.com/bots", &admin, "").await;
+    assert_eq!(code, 200, "{bots}");
+    let got = access(&bots);
+    assert!(got.contains(&("Mine".into(), "manage".into(), Value::Null)), "{got:?}");
+    assert!(got.contains(&("Granted".into(), "view".into(), json!("viewer"))), "{got:?}");
+    assert!(!got.iter().any(|(n, ..)| n == "Hidden"), "{got:?}");
+    assert_eq!(parse(&bots)["bots"].as_array().unwrap().iter().find(|b| b["bot"]["id"] == mine.id.as_str()).unwrap()["owner"]["name"], "New");
+    let (_, bots) = call(port, "GET", "/api/users/operator/bots", &admin, "").await;
+    assert!(access(&bots).iter().all(|(_, a, _)| a == "manage") && bots.contains(&hidden.id), "admins see every Bot");
+    assert_eq!(call(port, "GET", "/api/users/nobody/bots", &admin, "").await.0, 404);
+    assert_eq!(call(port, "GET", &format!("/api/users/{id}/bots"), &bearer(&t), "").await.0, 403, "members can't look");
+
+    // Audited as before, with no code in any detail.
+    let (_, body) = call(port, "GET", "/api/audit?action=user.login_code_created&limit=10", &admin, "").await;
+    assert!(!body.contains(&first) && !body.contains(&second));
+    let events = audit_list(&body);
+    assert_eq!(events[0]["details"], json!({ "ttlMinutes": 60, "replaced": 1 }));
+    assert_eq!(events[1]["details"], json!({ "ttlMinutes": 1440 }));
 }
 
 #[tokio::test]

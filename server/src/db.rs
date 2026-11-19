@@ -9,6 +9,7 @@ use crate::secrets::{redact, sealed};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 #[derive(Clone, Serialize)]
@@ -228,6 +229,8 @@ pub struct User {
     pub idp_subject: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// When a session last started for this user, by any sign-in method (ADR 0019).
+    pub last_login_at: Option<i64>,
 }
 
 impl User {
@@ -348,6 +351,7 @@ fn user_row(r: &Row) -> rusqlite::Result<User> {
         idp_subject: r.get("idp_subject")?,
         created_at: r.get("created_at")?,
         updated_at: r.get("updated_at")?,
+        last_login_at: r.get("last_login_at")?,
     })
 }
 
@@ -439,7 +443,17 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 5] = [migrate_approvals, migrate_audit_events, migrate_users, migrate_identities, migrate_bot_acls];
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 6] =
+    [migrate_approvals, migrate_audit_events, migrate_users, migrate_identities, migrate_bot_acls, migrate_last_login];
+
+/// The admin portal (ADR 0019): when each user last signed in. Sessions are pruned 30
+/// days after they end, so this lives on the user; it starts from the sessions still kept.
+fn migrate_last_login(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "ALTER TABLE users ADD COLUMN last_login_at INTEGER;
+        UPDATE users SET last_login_at = (SELECT max(created_at) FROM sessions WHERE sessions.user_id = users.id);",
+    )
+}
 
 /// Bot ACLs (ADR 0017): an owner and a visibility per Bot, and per-user grants.
 /// Bots from before belong to the owner account (`operator`, break-glass) and stay
@@ -1179,6 +1193,17 @@ impl Db {
         s.query_map([user_id], identity_row).unwrap().filter_map(Result::ok).collect()
     }
 
+    /// Every user's identities, keyed by user id, for the admin list.
+    pub fn all_identities(&self) -> HashMap<String, Vec<Identity>> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM user_identities ORDER BY created_at, id").unwrap();
+        let mut out: HashMap<String, Vec<Identity>> = HashMap::new();
+        for i in s.query_map([], identity_row).unwrap().filter_map(Result::ok) {
+            out.entry(i.user_id.clone()).or_default().push(i);
+        }
+        out
+    }
+
     fn insert_identity(tx: &Connection, user_id: &str, i: &NewIdentity) -> rusqlite::Result<String> {
         let id = format!("i{}", crate::short_id());
         tx.execute(
@@ -1256,13 +1281,16 @@ impl Db {
     pub fn create_session(&self, s: &NewSession) -> Session {
         let id = format!("s{}", crate::random_hex(8));
         let at = now();
-        self.c()
-            .execute(
+        {
+            let c = self.c();
+            c.execute(
                 "INSERT INTO sessions (id, token_hash, user_id, kind, method, idp_subject, label, ip, user_agent, created_at, last_seen_at, expires_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![id, s.token_hash, s.user_id, s.kind, s.method, s.idp_subject, s.label, s.ip, s.user_agent, at, at, s.expires_at],
             )
             .unwrap();
+            let _ = c.execute("UPDATE users SET last_login_at = ? WHERE id = ?", params![at, s.user_id]);
+        }
         self.session(&id).unwrap()
     }
 
@@ -1345,6 +1373,20 @@ impl Db {
                 params![code_hash, user_id, created_by, now(), expires_at],
             )
             .unwrap();
+    }
+
+    /// Drops a user's unused sign-in codes. Returns how many.
+    pub fn drop_login_codes(&self, user_id: &str) -> usize {
+        self.c().execute("DELETE FROM login_codes WHERE user_id = ? AND used_at IS NULL", [user_id]).unwrap_or(0)
+    }
+
+    /// Unused, unexpired codes per user: how many, and when the last of them expires.
+    pub fn pending_codes(&self, at: i64) -> HashMap<String, (i64, i64)> {
+        let c = self.c();
+        let mut s = c
+            .prepare("SELECT user_id, count(*), max(expires_at) FROM login_codes WHERE used_at IS NULL AND ? < expires_at GROUP BY user_id")
+            .unwrap();
+        s.query_map([at], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?)))).unwrap().filter_map(Result::ok).collect()
     }
 
     /// Spends a sign-in code: once, before it expires, for an active user. Returns the user.
@@ -1534,8 +1576,26 @@ mod tests {
         assert_eq!(actions, ["bot.acl_initialized", "policy.initialized"]);
     }
 
-    /// Rewinds a database to before bot ACLs, so a test can set `user_version` lower.
-    const UNDO_BOT_ACLS: &str = "DROP TABLE bot_grants; DROP INDEX bots_owner; ALTER TABLE bots DROP COLUMN visibility; ALTER TABLE bots DROP COLUMN owner_id;";
+    /// Rewinds a database to before last sign-in times, so a test can set `user_version` to 5.
+    const UNDO_LAST_LOGIN: &str = "ALTER TABLE users DROP COLUMN last_login_at;";
+
+    /// Rewinds a database to before bot ACLs (and what came after), so a test can set `user_version` lower.
+    const UNDO_BOT_ACLS: &str = "ALTER TABLE users DROP COLUMN last_login_at; DROP TABLE bot_grants; DROP INDEX bots_owner; ALTER TABLE bots DROP COLUMN visibility; ALTER TABLE bots DROP COLUMN owner_id;";
+
+    #[test]
+    fn upgrade_takes_last_sign_ins_from_kept_sessions() {
+        let path = temp_path("last-login-upgrade").join("app.sqlite");
+        let db = Db::open(&path).unwrap();
+        let seen = db.create_user(None, None, "Seen", Role::Member).unwrap();
+        let never = db.create_user(None, None, "Never", Role::Member).unwrap();
+        let s = db.create_session(&NewSession { user_id: &seen.id, token_hash: "h", kind: "token", method: "code", idp_subject: None, label: None, ip: None, user_agent: None, expires_at: now() + 1000 });
+        assert_eq!(db.user(&seen.id).unwrap().last_login_at, Some(s.created_at), "a new session stamps it");
+        db.c().execute_batch(&format!("{UNDO_LAST_LOGIN} PRAGMA user_version = 5;")).unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.user(&seen.id).unwrap().last_login_at, Some(s.created_at));
+        assert_eq!(db.user(&never.id).unwrap().last_login_at, None);
+    }
 
     #[test]
     fn upgrade_gives_existing_bots_to_the_owner_shared() {

@@ -233,8 +233,20 @@ pub fn user_view(u: &User) -> Value {
     json!({
         "id": u.id, "email": u.email, "name": u.name, "role": u.role, "status": u.status,
         "breakGlass": u.id == OPERATOR, "idpIssuer": u.idp_issuer, "idpSubject": u.idp_subject,
-        "createdAt": u.created_at, "updatedAt": u.updated_at,
+        "createdAt": u.created_at, "updatedAt": u.updated_at, "lastLoginAt": u.last_login_at,
     })
+}
+
+/// A user as the admin portal lists them: also their linked sign-ins and any code
+/// still waiting to be used (never the code itself, only its count and expiry).
+fn admin_view(u: &User, identities: &[db::Identity], pending: Option<&(i64, i64)>) -> Value {
+    let mut v = user_view(u);
+    v["identities"] = json!(identities
+        .iter()
+        .map(|i| json!({ "id": i.id, "provider": i.provider, "email": i.email, "createdAt": i.created_at, "lastLoginAt": i.last_login_at }))
+        .collect::<Vec<_>>());
+    v["pendingCodes"] = pending.map_or(Value::Null, |(n, exp)| json!({ "count": n, "expiresAt": exp }));
+    v
 }
 
 fn session_view(s: &Session, cfg: &SessionConfig) -> Value {
@@ -380,11 +392,36 @@ pub fn need_user_key(app: &AppState, key: &str) -> Res<User> {
 }
 
 pub async fn list_users(State(app): State<AppState>) -> Json<Value> {
-    Json(json!(app.db.users().iter().map(user_view).collect::<Vec<_>>()))
+    let ids = app.db.all_identities();
+    let codes = app.db.pending_codes(db::now());
+    let list: Vec<Value> = app.db.users().iter().map(|u| admin_view(u, ids.get(&u.id).map_or(&[], Vec::as_slice), codes.get(&u.id))).collect();
+    Json(json!(list))
 }
 
 pub async fn get_user(State(app): State<AppState>, Path(key): Path<String>) -> Res {
-    Ok(Json(user_view(&need_user_key(&app, &key)?)))
+    let u = need_user_key(&app, &key)?;
+    Ok(Json(admin_view(&u, &app.db.identities(&u.id), app.db.pending_codes(db::now()).get(&u.id))))
+}
+
+/// `GET /api/users/{key}/bots`: the Bots this user can see, with their access and any
+/// grant, as ADR 0017 decides it for their role now. Read-only; grants are changed per Bot.
+pub async fn user_bots(State(app): State<AppState>, Path(key): Path<String>) -> Res {
+    let u = need_user_key(&app, &key)?;
+    let viewer = if u.role == Role::Admin { crate::acl::Viewer::All } else { crate::acl::Viewer::User { id: u.id.clone(), role: u.role } };
+    let grants = app.db.user_grants(&u.id);
+    let owners: HashMap<String, String> = app.db.users().into_iter().map(|o| (o.id, o.name)).collect();
+    let list: Vec<Value> = viewer
+        .bots(&app.db)
+        .into_iter()
+        .map(|(b, access)| {
+            json!({
+                "bot": { "id": b.id, "name": b.name, "color": b.color, "shape": b.shape },
+                "owner": { "id": b.owner_id, "name": owners.get(&b.owner_id) },
+                "visibility": b.visibility, "access": access, "grant": grants.get(&b.id),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "user": user_view(&u), "active": u.active(), "bots": list })))
 }
 
 /// `{email, name?, role?}`. Role defaults to member.
@@ -456,8 +493,10 @@ pub async fn update_user(State(app): State<AppState>, Extension(by): Extension<W
     Ok(Json(user_view(&after)))
 }
 
-/// `{ttlMinutes?}` (default 60, up to 7 days). Returns the code once; only its hash is kept.
-pub async fn create_login_code(State(app): State<AppState>, Extension(by): Extension<Who>, Path(key): Path<String>, body: axum::body::Bytes) -> Res {
+/// `{ttlMinutes?, replace?}` (default 60, up to 7 days). Returns the code once; only its
+/// hash is kept. `replace: true` first drops the user's unused codes, so a regenerated
+/// invite is the only one that works.
+pub async fn create_login_code(State(app): State<AppState>, Extension(by): Extension<Who>, Path(key): Path<String>, body: axum::body::Bytes) -> Res<Response> {
     let u = need_user_key(&app, &key)?;
     if !u.active() {
         return Err(ApiError(StatusCode::CONFLICT, "This user is disabled. Enable them first.".into()));
@@ -467,11 +506,23 @@ pub async fn create_login_code(State(app): State<AppState>, Extension(by): Exten
         Value::Null => 60,
         t => t.as_i64().filter(|t| (1..=7 * 24 * 60).contains(t)).ok_or_else(|| bad("ttlMinutes must be 1 to 10080"))?,
     };
+    let replace = match &v["replace"] {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        _ => return Err(bad("replace must be true or false")),
+    };
+    let replaced = if replace { app.db.drop_login_codes(&u.id) } else { 0 };
     let code = new_secret(CODE_PREFIX);
     let expires = db::now() + ttl * MINUTE;
     app.db.add_login_code(&hash(&code), &u.id, by.actor.id.as_deref().unwrap_or(""), expires);
-    app.db.record(&by.event("user.login_code_created").target("user", &u.id).details(json!({ "ttlMinutes": ttl })));
-    Ok(Json(json!({ "code": code, "expiresAt": expires, "user": user_view(&u) })))
+    let mut details = json!({ "ttlMinutes": ttl });
+    if replace {
+        details["replaced"] = json!(replaced);
+    }
+    app.db.record(&by.event("user.login_code_created").target("user", &u.id).details(details));
+    let mut res = Json(json!({ "code": code, "expiresAt": expires, "user": user_view(&u) })).into_response();
+    res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(res)
 }
 
 // Sessions (admin).
