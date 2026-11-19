@@ -20,7 +20,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM ${NODE_IMAGE} AS runtime
 
 # Space-separated subset of: claude codex pi hermes. Empty = none (install later into the home volume).
-# hermes (Hermes Agent) is opt-in: it adds about 2 GB, plus about 0.5 GB per Bot in /data.
+# hermes (Hermes Agent) is opt-in: it adds about 2.5 GB, plus about 0.5 GB per Bot in /data.
 ARG HARNESSES="claude codex pi"
 ARG CLAUDE_CODE_VERSION=latest
 ARG CODEX_VERSION=latest
@@ -55,16 +55,19 @@ RUN groupadd --system --gid "$SUPERBOT_UID" superbot \
     && install -d -o superbot -g superbot -m 0700 /data /workspace /backups
 
 # Hermes's own installer, outside the home volume. It runs as superbot because Hermes
-# refuses to use a checkout another user owns. Each Bot gets its own Hermes data root.
+# refuses to use a checkout another user owns. Each Bot gets its own Hermes data root,
+# which shares the installed tools only while the checkout sits in the installer's
+# data root (.hermes/hermes-agent, the default layout).
 RUN set -eu; case " $HARNESSES " in *" hermes "*) ;; *) exit 0 ;; esac; \
     apt-get update; apt-get install -y --no-install-recommends libatomic1 xz-utils; rm -rf /var/lib/apt/lists/*; \
     install -d -o superbot -g superbot /opt/hermes; \
     curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_COMMIT}/scripts/install.sh" -o /tmp/hermes-install.sh; \
     runuser -u superbot -- env HOME=/opt/hermes bash /tmp/hermes-install.sh --non-interactive --skip-browser \
-        --skip-computer-use --commit "$HERMES_COMMIT" --dir /opt/hermes/hermes-agent --hermes-home /opt/hermes/home; \
+        --skip-computer-use --commit "$HERMES_COMMIT"; \
     rm -f /tmp/hermes-install.sh; \
-    ln -s /opt/hermes/hermes-agent/.hermes/bin/hermes /usr/local/bin/hermes; \
-    hermes --version
+    ln -s /opt/hermes/.hermes/hermes-agent/.hermes/bin/hermes /usr/local/bin/hermes; \
+    runuser -u superbot -- env HOME=/opt/hermes hermes --version; \
+    if find /opt/hermes \! -user superbot | grep -q .; then echo "root-owned files in /opt/hermes" >&2; exit 1; fi
 
 # botd prepends its own folder to each Bot's PATH, so it lives apart from the npm CLIs in /usr/local/bin.
 COPY --from=build /out/botd /out/botctl /opt/superbot/bin/

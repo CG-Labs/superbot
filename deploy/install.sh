@@ -42,7 +42,7 @@ Usage: install.sh [options]
   --upgrade           git pull + rebuild + restart
   --ufw               Enable UFW (allow 22, 80, 443)
   --no-backup         Skip daily DATA_DIR backup timer
-  --with-hermes       Also install the Hermes Agent CLI (about 2 GB; HERMES_COMMIT pins it)
+  --with-hermes       Also install the Hermes Agent CLI (about 2.5 GB; HERMES_COMMIT pins it)
   --dry-run           Print actions without changing the system
   --non-interactive   Fail instead of prompting for missing flags
   -h, --help          Show this help
