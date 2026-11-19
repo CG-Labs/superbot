@@ -144,7 +144,7 @@ async fn break_glass_password_guesses_on_any_route_are_rate_limited() {
     let (port, _, admin, _) = serve_app_with(|_| {}).await;
     let (_, member) = user_with(port, &admin, "m@example.com", "member").await;
     let from = |ip: &str| format!("X-Forwarded-For: {ip}\r\n");
-    let wrong = basic("not-the-password");
+    let wrong = basic(&random_hex(16));
     for i in 0..10 {
         assert_eq!(call_with(port, "GET", "/api/state", &wrong, &from("198.51.100.7"), "").await.0, 401, "guess #{i}");
     }
@@ -163,7 +163,8 @@ async fn break_glass_password_guesses_on_any_route_are_rate_limited() {
 fn secrets_compare_without_showing_their_length() {
     assert!(crate::same(b"sbs_abc", b"sbs_abc"));
     assert!(crate::same(b"", b""));
-    for (a, b) in [(&b"sbs_abc"[..], &b"sbs_abd"[..]), (b"sbs_abc", b"sbs_ab"), (b"sbs_abc", b"sbs_abcd"), (b"", b"x")] {
+    let cases = [(&b"sbs_abc"[..], &b"sbs_abd"[..]), (b"sbs_abc", b"sbs_ab"), (b"sbs_ab", b"sbs_abc"), (b"sbs_abcsbs_abc", b"sbs_abc"), (b"", b"x"), (b"x", b"")];
+    for (a, b) in cases {
         assert!(!crate::same(a, b), "{a:?} {b:?}");
     }
 }

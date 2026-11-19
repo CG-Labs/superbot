@@ -509,7 +509,7 @@ pub fn record_created(app: &AppState, by: &Who, u: &User, reason: Option<&str>) 
 /// `{name?, email?, role?, status?: "active" | "disabled"}`. Disabling ends the
 /// user's sessions. The owner account can't be demoted or disabled: it is the way
 /// back in (turn off AUTH_BREAK_GLASS instead).
-pub async fn update_user(State(app): State<AppState>, Extension(by): Extension<Who>, Path(key): Path<String>, Json(v): Json<Value>) -> Res {
+pub async fn update_user(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path(key): Path<String>, Json(v): Json<Value>) -> Res {
     let before = need_user_key(&app, &key)?;
     let mut p = UserPatch { name: clean_name(&v["name"])?, ..Default::default() };
     match &v["email"] {
@@ -553,6 +553,7 @@ pub async fn update_user(State(app): State<AppState>, Extension(by): Extension<W
         if after.active() {
             app.db.record(&ev("user.enabled"));
         } else {
+            a.sso.forget_user(&after.id);
             let n = app.db.revoke_user_sessions(&after.id, by.actor.id.as_deref().unwrap_or(""), "user disabled");
             app.db.record(&ev("user.disabled").details(json!({ "sessionsRevoked": n })));
         }
@@ -632,9 +633,11 @@ pub async fn revoke_session(State(app): State<AppState>, Extension(by): Extensio
 
 pub async fn revoke_user_sessions(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path(key): Path<String>) -> Res {
     let u = need_user_key(&app, &key)?;
-    let n = app.db.revoke_user_sessions(&u.id, by.actor.id.as_deref().unwrap_or(""), "revoked by admin");
-    // Everything that could still become a session, or still shows a screen, goes too.
+    // Codes go first: a redemption holds them until its session exists, so either that
+    // session is made in time to be revoked below or the code is already gone.
     a.sso.forget_user(&u.id);
+    let n = app.db.revoke_user_sessions(&u.id, by.actor.id.as_deref().unwrap_or(""), "revoked by admin");
+    // A screen link doesn't know who opened it, so they all change.
     if let Some(screens) = &app.screens {
         screens.rotate_all().await;
     }

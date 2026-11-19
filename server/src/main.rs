@@ -752,11 +752,14 @@ fn need_user(p: Principal) -> Res<()> {
     }
 }
 
-/// Constant-time comparison. Both sides are hashed first, so the time taken doesn't show a secret's length either.
-fn same(a: &[u8], b: &[u8]) -> bool {
-    use sha2::{Digest, Sha256};
-    let (a, b) = (Sha256::digest(a), Sha256::digest(b));
-    std::hint::black_box(a.iter().zip(b.iter()).fold(0, |acc, (x, y)| acc | (x ^ y))) == 0
+/// Constant-time comparison of what a caller sent with a secret. The time depends only on
+/// `presented`'s length, so it shows neither where they differ nor how long the secret is.
+fn same(presented: &[u8], secret: &[u8]) -> bool {
+    if secret.is_empty() {
+        return presented.is_empty();
+    }
+    let diff = presented.iter().enumerate().fold((presented.len() != secret.len()) as u8, |acc, (i, x)| acc | (x ^ secret[i % secret.len()]));
+    std::hint::black_box(diff) == 0
 }
 
 fn base64_decode(s: &str) -> Option<Vec<u8>> {

@@ -397,6 +397,17 @@ async fn signing_out_everywhere_spends_app_codes_not_yet_redeemed() {
     assert_eq!(call(port, "DELETE", &format!("/api/users/{uid}/sessions"), &admin, "").await.0, 200);
     assert_eq!(redeem(caught).await, 401);
     assert_eq!(redeem(code_for().await).await, 200, "new sign-ins still work");
+
+    // Redeemed while being signed out: either the code is gone or its session is revoked.
+    for _ in 0..20 {
+        let code = code_for().await;
+        let body = json!({ "sso": code, "verifier": verifier }).to_string();
+        let revoke = format!("/api/users/{uid}/sessions");
+        let ((_, res), _) = tokio::join!(call(port, "POST", "/api/auth/login", "", &body), call(port, "DELETE", &revoke, &admin, ""));
+        if let Some(t) = serde_json::from_str::<Value>(&res).ok().and_then(|v| v["token"].as_str().map(String::from)) {
+            assert_eq!(call(port, "GET", "/api/auth/me", &format!("Bearer {t}"), "").await.0, 401, "a session outlived sign-out everywhere");
+        }
+    }
 }
 
 #[tokio::test]

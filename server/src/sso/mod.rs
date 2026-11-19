@@ -735,8 +735,11 @@ pub fn redeem(a: &Auth, source: Source, code: &str, verifier: &str, cookie: bool
     if let Some(retry) = a.limiter.blocked(&ip, at) {
         return users::too_many(retry);
     }
+    // Held until the session exists: revoking a user's sessions drops their codes first, so
+    // it can't fall between taking the code and making its session.
+    let mut handoffs = a.sso.handoffs.lock().unwrap_or_else(|e| e.into_inner());
     // Taken out first, so a wrong verifier spends the code too.
-    let h = a.sso.handoffs.lock().unwrap_or_else(|e| e.into_inner()).remove(&hash(code));
+    let h = handoffs.remove(&hash(code));
     let h = h.filter(|h| h.expires > at && crate::same(s256(verifier).as_bytes(), h.challenge.as_bytes()));
     // Looked up again: an admin may have unlinked the identity or disabled the user since.
     let found = h.and_then(|h| {
@@ -744,12 +747,14 @@ pub fn redeem(a: &Auth, source: Source, code: &str, verifier: &str, cookie: bool
         (user.id == h.user_id && user.active()).then_some((user, h))
     });
     let Some((user, h)) = found else {
+        drop(handoffs);
         a.limiter.fail(&ip, at);
         a.login_failed(&source, "sso", Some("bad_handoff"));
         return ApiError(StatusCode::UNAUTHORIZED, "That sign-in expired or was already used. Try again.".into()).into_response();
     };
     let label = label.or(h.label.as_deref());
     let (s, token) = users::start_session(a, &user, "sso", Some((&h.provider, &h.claims.key())), cookie, label, &source);
+    drop(handoffs);
     signed_in(a, &user, &s, &h.provider, &h.claims, &source);
     users::session_response(a, &user, &s, &token)
 }

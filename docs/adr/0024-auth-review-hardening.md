@@ -19,7 +19,7 @@ The review found no way to skip authentication or a role check on any route. It 
 - **Basic shares the sign-in limiter.** A wrong Basic password counts as a failed sign-in for that client IP. After 10 in 10 minutes, Basic from that IP gets 429 with `Retry-After`, even with the right password. Sessions are not affected, so people already signed in from that NAT keep working; `botctl` should use `SUPERBOT_TOKEN`. `ALLOW_NO_AUTH` skips the limiter (there is no password to guess).
 - **`__Host-` cookies.** The session cookie is `__Host-superbot_session`; the SSO binder is `__Host-superbot_sso` with `Path=/` (the prefix requires it; still `SameSite=Lax`, 10 minutes). Browsers refuse `__Host-` cookies from any other host. Web sessions made before the upgrade sign in once more; the old cookie is ignored.
 - **Entra email needs `xms_edov`.** The email counts only when the optional claim `xms_edov` is true (Microsoft: the user's tenant verified the email's domain). Otherwise the JIT user has no email until an admin adds one. The setup guide asks for the claim.
-- **Small ones.** Revoking a user's sessions also drops their unredeemed SSO app codes and rotates screen links. Secret comparisons hash both sides first, so timing doesn't show a secret's length.
+- **Small ones.** Revoking a user's sessions, or disabling them, first drops their unredeemed SSO app codes (a redemption holds the codes until its session exists, so none slips between), then rotates screen links. Secret comparisons run over the caller's input only, so timing doesn't show a secret's length.
 
 ## Consequences
 
