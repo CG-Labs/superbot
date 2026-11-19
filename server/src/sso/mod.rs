@@ -23,7 +23,7 @@ use axum::response::{Html, IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use provider::Claims;
-pub use provider::{ENTRA_AUTHORITY, Kind, Provider, guid, secure_url};
+pub use provider::{ClaimMap, ENTRA_AUTHORITY, GOOGLE_ISSUER, Kind, Provider, domain, guid, secure_url};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -174,7 +174,7 @@ impl Sso {
         Sso::from_vars(&|k| std::env::var(k).ok())
     }
 
-    /// Reads SSO_* settings (see docs/sso/entra.md). No SSO_PROVIDERS: SSO is off.
+    /// Reads SSO_* settings (see docs/sso/). No SSO_PROVIDERS: SSO is off.
     pub fn from_vars(get: &dyn Fn(&str) -> Option<String>) -> Result<Sso, String> {
         let var = |k: &str| get(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         let list = |k: &str| var(k).map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>()).unwrap_or_default();
@@ -252,9 +252,35 @@ impl Sso {
 type Var<'a> = dyn Fn(&str) -> Option<String> + 'a;
 type List<'a> = dyn Fn(&str) -> Vec<String> + 'a;
 
+/// Settings that only mean something for one type. Set on another, they would look like a
+/// restriction that isn't there, so they are refused.
+const ONLY_FOR: [(&str, &str); 8] = [
+    ("TENANT", "entra"),
+    ("ALLOWED_TENANTS", "entra"),
+    ("AUTHORITY", "entra"),
+    ("HOSTED_DOMAINS", "google"),
+    ("ALLOWED_DOMAINS", "oidc"),
+    ("SUBJECT_CLAIM", "oidc"),
+    ("EMAIL_CLAIM", "oidc"),
+    ("NAME_CLAIM", "oidc"),
+];
+
+/// Claims people or their admins can change, so they can't be the subject.
+const MUTABLE_CLAIMS: [&str; 9] = ["email", "preferred_username", "upn", "unique_name", "name", "nickname", "given_name", "family_name", "phone_number"];
+
 fn parse_provider(id: &str, var: &Var, list: &List) -> Result<Provider, String> {
     let key = |k: &str| format!("SSO_{}_{k}", id.to_ascii_uppercase());
-    let ty = var(&key("TYPE")).map(|t| t.to_ascii_lowercase()).unwrap_or_else(|| if id == "entra" { "entra".into() } else { String::new() });
+    let preset = match id {
+        "entra" | "google" => id,
+        _ => "",
+    };
+    let ty = var(&key("TYPE")).map(|t| t.to_ascii_lowercase()).unwrap_or_else(|| preset.into());
+    if matches!(ty.as_str(), "entra" | "google" | "oidc")
+        && let Some((k, only)) = ONLY_FOR.iter().find(|(k, only)| *only != ty && var(&key(k)).is_some())
+    {
+        return Err(format!("{} is only for {}={only}", key(k), key("TYPE")));
+    }
+    let domains = |k: &str| -> Result<Vec<String>, String> { list(&key(k)).iter().map(|d| domain(d).ok_or_else(|| format!("{}: {d} is not a domain like example.com", key(k)))).collect() };
     let client_id = var(&key("CLIENT_ID")).ok_or_else(|| format!("{} is required", key("CLIENT_ID")))?;
     let jit_role = match var(&key("JIT_ROLE")).map(|r| r.to_ascii_lowercase()).as_deref() {
         None | Some("off") => None,
@@ -289,15 +315,40 @@ fn parse_provider(id: &str, var: &Var, list: &List) -> Result<Provider, String> 
             };
             (Kind::Entra { authority, tenant, allowed }, "Microsoft")
         }
+        "google" => {
+            let issuer = var(&key("ISSUER")).unwrap_or_else(|| GOOGLE_ISSUER.into());
+            if !secure_url(&issuer) {
+                return Err(format!("{} must be an https URL", key("ISSUER")));
+            }
+            let hosted_domains = domains("HOSTED_DOMAINS")?;
+            if jit_role.is_some() && hosted_domains.is_empty() {
+                return Err(format!("{} without {} would let any Google account in: list your Workspace domains, or link people instead", key("JIT_ROLE"), key("HOSTED_DOMAINS")));
+            }
+            if !scopes.split_whitespace().any(|s| s == "email") {
+                return Err(format!("{} must include email: Google sign-in needs a verified email", key("SCOPES")));
+            }
+            (Kind::Google { issuer, hosted_domains }, "Google")
+        }
         "oidc" => {
             let issuer = var(&key("ISSUER")).ok_or_else(|| format!("{} is required", key("ISSUER")))?;
             if !secure_url(&issuer) {
                 return Err(format!("{} must be an https URL", key("ISSUER")));
             }
-            (Kind::Oidc { issuer }, id)
+            let claim = |k: &str, default: &str| -> Result<String, String> {
+                let c = var(&key(k)).unwrap_or_else(|| default.into());
+                if c.len() > 128 || !c.bytes().all(|b| b.is_ascii_graphic()) {
+                    return Err(format!("{} must be a claim name", key(k)));
+                }
+                Ok(c)
+            };
+            let map = ClaimMap { subject: claim("SUBJECT_CLAIM", "sub")?, email: claim("EMAIL_CLAIM", "email")?, name: claim("NAME_CLAIM", "name")? };
+            if MUTABLE_CLAIMS.contains(&map.subject.to_ascii_lowercase().as_str()) {
+                return Err(format!("{}={}: people can change that claim, so it can't say who they are. Use sub or another id that never changes", key("SUBJECT_CLAIM"), map.subject));
+            }
+            (Kind::Oidc { issuer, map, allowed_domains: domains("ALLOWED_DOMAINS")? }, id)
         }
-        "" => return Err(format!("{} is required: entra or oidc", key("TYPE"))),
-        t => return Err(format!("{}: unknown type {t} (entra or oidc)", key("TYPE"))),
+        "" => return Err(format!("{} is required: entra, google, or oidc", key("TYPE"))),
+        t => return Err(format!("{}: unknown type {t} (entra, google, or oidc)", key("TYPE"))),
     };
     let label = var(&key("LABEL")).map(|l| crate::audit::clip(&l, 40)).unwrap_or_else(|| label.to_string());
     Ok(Provider::new(id, &label, kind, &client_id, &scopes, jit_role))
@@ -412,8 +463,8 @@ pub async fn start(
         ("code_challenge", &s256(&verifier)),
         ("code_challenge_method", "S256"),
     ]);
-    if matches!(p.kind, Kind::Entra { .. }) {
-        url.query_pairs_mut().append_pair("prompt", "select_account");
+    for (k, v) in p.auth_params() {
+        url.query_pairs_mut().append_pair(k, &v);
     }
     let mut res = see(url.as_str());
     if matches!(ret, Return::Cookie { .. }) {
@@ -474,7 +525,8 @@ async fn finish(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, q: &Ha
         Err(e) => {
             a.limiter.fail(&ip, at);
             failed(a, source, id, e.0, None, json!({}));
-            return ret.fail("sso_failed");
+            // A real account the server doesn't take: say so, so people try another one.
+            return ret.fail(if matches!(e.0, "wrong_domain" | "email_unverified") { "sso_wrong_account" } else { "sso_failed" });
         }
     };
     let user = match resolve(app, p, &claims) {
@@ -579,7 +631,8 @@ pub async fn list_identities(State(app): State<AppState>, Path(key): Path<String
 }
 
 /// `POST /api/users/{key}/identities {provider, subject, tenant?}`. For Entra the
-/// subject is the user's object id; the tenant defaults to the provider's own.
+/// subject is the user's object id and the tenant defaults to the provider's own; for
+/// Google and generic OIDC it is the subject claim (`sub` unless mapped).
 pub async fn link_identity(
     State(app): State<AppState>,
     Extension(a): Extension<Arc<Auth>>,
@@ -689,6 +742,108 @@ mod tests {
         assert_eq!((s.providers[0].label.as_str(), s.providers[0].type_name(), s.public_host.as_str()), ("acme", "oidc", "127.0.0.1:3000"));
         assert_eq!(s.app_redirects.len(), 2);
         assert_eq!(s.providers[0].env_var(), "SSO_ACME_CLIENT_SECRET");
+    }
+
+    fn google(extra: &[(&'static str, &'static str)]) -> Result<Sso, String> {
+        let mut v = vec![("SSO_PROVIDERS", "google"), ("SSO_PUBLIC_URL", "https://bot.example.com"), ("SSO_GOOGLE_CLIENT_ID", "c1.apps.googleusercontent.com")];
+        for (k, val) in extra {
+            v.retain(|(old, _)| old != k);
+            v.push((k, val));
+        }
+        parse(&v)
+    }
+
+    #[test]
+    fn reads_a_google_provider_with_safe_defaults() {
+        let s = google(&[]).unwrap();
+        let p = s.provider("google").unwrap();
+        assert_eq!((p.label.as_str(), p.type_name(), p.jit_role, p.scopes.as_str()), ("Google", "google", None, "openid profile email"));
+        assert!(matches!(&p.kind, Kind::Google { issuer, hosted_domains } if issuer == GOOGLE_ISSUER && hosted_domains.is_empty()));
+        assert_eq!(p.issuer_for(None).unwrap(), (GOOGLE_ISSUER.to_string(), None));
+        assert!(p.issuer_for(Some(T1)).is_err(), "tenant is Entra's");
+        let ws = google(&[("SSO_GOOGLE_HOSTED_DOMAINS", "Example.com, example.org"), ("SSO_GOOGLE_JIT_ROLE", "readonly")]).unwrap();
+        assert!(matches!(&ws.providers[0].kind, Kind::Google { hosted_domains, .. } if hosted_domains == &["example.com", "example.org"]));
+        assert_eq!(ws.providers[0].jit_role, Some(Role::Readonly));
+        let named = parse(&[("SSO_PROVIDERS", "work"), ("SSO_PUBLIC_URL", "https://bot.example.com"), ("SSO_WORK_TYPE", "google"), ("SSO_WORK_CLIENT_ID", "c")]).unwrap();
+        assert_eq!(named.providers[0].type_name(), "google");
+    }
+
+    #[test]
+    fn refuses_google_settings_that_would_let_strangers_in() {
+        for (vars, why) in [
+            (vec![("SSO_GOOGLE_JIT_ROLE", "member")], "just in time for every Google account"),
+            (vec![("SSO_GOOGLE_SCOPES", "openid profile")], "no email scope"),
+            (vec![("SSO_GOOGLE_HOSTED_DOMAINS", "*")], "wildcard domain"),
+            (vec![("SSO_GOOGLE_HOSTED_DOMAINS", "ada@example.com")], "an email, not a domain"),
+            (vec![("SSO_GOOGLE_ALLOWED_DOMAINS", "example.com")], "email domains are not Workspace membership"),
+            (vec![("SSO_GOOGLE_TENANT", T1)], "an Entra setting"),
+            (vec![("SSO_GOOGLE_ISSUER", "http://accounts.google.com")], "plain http issuer"),
+            (vec![("SSO_GOOGLE_CLIENT_ID", "")], "no client id"),
+        ] {
+            assert!(google(&vars).is_err(), "{why}");
+        }
+    }
+
+    #[test]
+    fn reads_generic_oidc_claim_mapping_and_domains() {
+        let base = [("SSO_PROVIDERS", "okta"), ("SSO_PUBLIC_URL", "https://bot.example.com"), ("SSO_OKTA_TYPE", "oidc"), ("SSO_OKTA_ISSUER", "https://acme.okta.example"), ("SSO_OKTA_CLIENT_ID", "c1")];
+        let with = |extra: &[(&'static str, &'static str)]| parse(&[&base[..], extra].concat());
+        let p = &with(&[]).unwrap().providers[0];
+        assert!(matches!(&p.kind, Kind::Oidc { map, allowed_domains, .. } if *map == ClaimMap::default() && allowed_domains.is_empty()));
+        assert!(p.auth_params().is_empty());
+        let s = with(&[("SSO_OKTA_SUBJECT_CLAIM", "uid"), ("SSO_OKTA_EMAIL_CLAIM", "mail"), ("SSO_OKTA_NAME_CLAIM", "display_name"), ("SSO_OKTA_ALLOWED_DOMAINS", "example.com"), ("SSO_OKTA_LABEL", "Okta")]).unwrap();
+        let p = &s.providers[0];
+        assert_eq!(p.label, "Okta");
+        assert!(matches!(&p.kind, Kind::Oidc { map, allowed_domains, .. } if map.subject == "uid" && map.email == "mail" && map.name == "display_name" && allowed_domains == &["example.com"]));
+        for (vars, why) in [
+            (vec![("SSO_OKTA_SUBJECT_CLAIM", "email")], "email as the subject"),
+            (vec![("SSO_OKTA_SUBJECT_CLAIM", "preferred_username")], "username as the subject"),
+            (vec![("SSO_OKTA_SUBJECT_CLAIM", "has space")], "not a claim name"),
+            (vec![("SSO_OKTA_ALLOWED_DOMAINS", "example")], "not a domain"),
+            (vec![("SSO_OKTA_HOSTED_DOMAINS", "example.com")], "a Google setting"),
+            (vec![("SSO_OKTA_TENANT", T1)], "an Entra setting"),
+            (vec![("SSO_OKTA_ISSUER", "http://acme.okta.example")], "plain http issuer"),
+        ] {
+            assert!(with(&vars).is_err(), "{why}");
+        }
+    }
+
+    #[test]
+    fn several_providers_at_once_keep_their_order() {
+        let s = parse(&[
+            ("SSO_PROVIDERS", "entra, google,keycloak"),
+            ("SSO_PUBLIC_URL", "https://bot.example.com"),
+            ("SSO_ENTRA_CLIENT_ID", "c1"),
+            ("SSO_ENTRA_TENANT", T1),
+            ("SSO_GOOGLE_CLIENT_ID", "c2"),
+            ("SSO_KEYCLOAK_TYPE", "oidc"),
+            ("SSO_KEYCLOAK_ISSUER", "https://sso.example.com/realms/acme"),
+            ("SSO_KEYCLOAK_CLIENT_ID", "c3"),
+            ("SSO_KEYCLOAK_LABEL", "Acme SSO"),
+        ])
+        .unwrap();
+        let got: Vec<_> = s.providers.iter().map(|p| (p.id.as_str(), p.label.as_str(), p.type_name(), p.env_var())).collect();
+        assert_eq!(
+            got,
+            [
+                ("entra", "Microsoft", "entra", "SSO_ENTRA_CLIENT_SECRET".to_string()),
+                ("google", "Google", "google", "SSO_GOOGLE_CLIENT_SECRET".to_string()),
+                ("keycloak", "Acme SSO", "oidc", "SSO_KEYCLOAK_CLIENT_SECRET".to_string()),
+            ]
+        );
+        assert!(s.providers.iter().all(|p| s.redirect_uri(&p.id) == format!("https://bot.example.com/api/auth/sso/{}/callback", p.id)));
+        let who: Vec<String> = s.providers.iter().map(|p| p.audience()).collect();
+        assert_eq!(who, [format!("tenant {T1}"), "any Google account".into(), "anyone the IdP signs in".into()]);
+    }
+
+    /// The installer and Compose copy these files; with nothing filled in, SSO is off.
+    #[test]
+    fn the_example_env_files_leave_sso_off() {
+        for (name, text) in [(".env.example", include_str!("../../../.env.example")), ("deploy/docker/.env.example", include_str!("../../../deploy/docker/.env.example"))] {
+            let vars: HashMap<String, String> = text.lines().filter(|l| !l.trim_start().starts_with('#')).filter_map(|l| l.split_once('=')).map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).collect();
+            let s = Sso::from_vars(&|k| vars.get(k).cloned()).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(s.providers.is_empty(), "{name}");
+        }
     }
 
     #[test]

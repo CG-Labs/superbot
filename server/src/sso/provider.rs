@@ -13,13 +13,39 @@ const JWKS_TTL: Duration = Duration::from_secs(3600);
 const MAX_BODY: usize = 1024 * 1024;
 
 pub const ENTRA_AUTHORITY: &str = "https://login.microsoftonline.com";
+pub const GOOGLE_ISSUER: &str = "https://accounts.google.com";
 
 pub enum Kind {
     /// Microsoft Entra ID. Tokens come from one tenant's issuer, `{authority}/{tid}/v2.0`.
     /// `tenant` is a tenant id, or `organizations`/`common` with an `allowed` list.
     Entra { authority: String, tenant: String, allowed: Vec<String> },
-    /// Any OpenID Connect provider with one issuer.
-    Oidc { issuer: String },
+    /// Google accounts, consumer and Workspace. `sub` is the subject, the email must be
+    /// verified, and with `hosted_domains` only those Workspace domains (`hd`) get in.
+    Google { issuer: String, hosted_domains: Vec<String> },
+    /// Any OpenID Connect provider with one issuer. With `allowed_domains`, only people
+    /// whose verified email is in one of them get in.
+    Oidc { issuer: String, map: ClaimMap, allowed_domains: Vec<String> },
+}
+
+#[cfg(test)]
+impl Kind {
+    pub fn oidc(issuer: &str) -> Kind {
+        Kind::Oidc { issuer: issuer.into(), map: ClaimMap::default(), allowed_domains: Vec::new() }
+    }
+}
+
+/// Which ID token claims hold the subject, email, and name (generic OIDC).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClaimMap {
+    pub subject: String,
+    pub email: String,
+    pub name: String,
+}
+
+impl Default for ClaimMap {
+    fn default() -> ClaimMap {
+        ClaimMap { subject: "sub".into(), email: "email".into(), name: "name".into() }
+    }
 }
 
 pub struct Provider {
@@ -77,6 +103,38 @@ pub fn guid(s: &str) -> Option<String> {
     (shape && groups.iter().all(|g| g.bytes().all(|b| b.is_ascii_hexdigit()))).then_some(s)
 }
 
+/// A DNS domain as people write it after the `@`, lowercase.
+pub fn domain(s: &str) -> Option<String> {
+    let s = s.trim().trim_end_matches('.').to_ascii_lowercase();
+    let label_ok = |l: &str| (1..=63).contains(&l.len()) && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    (s.len() <= 253 && s.contains('.') && s.split('.').all(label_ok)).then_some(s)
+}
+
+/// The email's domain is one of `allowed`, exactly (subdomains are listed on their own).
+fn email_in(email: &str, allowed: &[String]) -> bool {
+    email.rsplit_once('@').and_then(|(local, d)| (!local.is_empty()).then(|| domain(d)).flatten()).is_some_and(|d| allowed.contains(&d))
+}
+
+/// The configured issuer and the discovery document's name the same IdP. A trailing slash
+/// is a common typo (Auth0's issuer has one), not a different IdP.
+fn same_issuer(configured: &str, discovered: &str) -> bool {
+    configured.trim_end_matches('/') == discovered.trim_end_matches('/')
+}
+
+/// The email in `claim`, only when the IdP says it checked it. Some IdPs send the flag as a string.
+fn verified_email(t: &Token, claim: &str) -> Option<String> {
+    let verified = match t.claims.get("email_verified") {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => s == "true",
+        _ => false,
+    };
+    t.str(claim).filter(|_| verified).map(|e| e.trim().to_string()).filter(|e| !e.is_empty() && e.len() <= 254)
+}
+
+fn subject_of(t: &Token, claim: &str) -> Result<String, Invalid> {
+    t.str(claim).filter(|s| s.len() <= 255).map(String::from).ok_or(Invalid("missing_subject"))
+}
+
 /// https, or http to this machine (a local IdP in development and tests).
 pub fn secure_url(u: &str) -> bool {
     match reqwest::Url::parse(u) {
@@ -115,7 +173,39 @@ impl Provider {
     pub fn type_name(&self) -> &'static str {
         match self.kind {
             Kind::Entra { .. } => "entra",
+            Kind::Google { .. } => "google",
             Kind::Oidc { .. } => "oidc",
+        }
+    }
+
+    /// Who may sign in, for the startup log.
+    pub fn audience(&self) -> String {
+        match &self.kind {
+            Kind::Entra { tenant, allowed, .. } if allowed.is_empty() => format!("tenant {tenant}"),
+            Kind::Entra { allowed, .. } => format!("tenants {}", allowed.join(", ")),
+            Kind::Google { hosted_domains, .. } if hosted_domains.is_empty() => "any Google account".into(),
+            Kind::Google { hosted_domains, .. } => format!("Workspace domains {}", hosted_domains.join(", ")),
+            Kind::Oidc { allowed_domains, .. } if allowed_domains.is_empty() => "anyone the IdP signs in".into(),
+            Kind::Oidc { allowed_domains, .. } => format!("verified emails at {}", allowed_domains.join(", ")),
+        }
+    }
+
+    /// Extra authorization request parameters: always show the account picker for the
+    /// big consumer IdPs, and give Google its Workspace domain hint. The hint only
+    /// narrows the picker; `claims` checks `hd` itself.
+    pub fn auth_params(&self) -> Vec<(&'static str, String)> {
+        match &self.kind {
+            Kind::Entra { .. } => vec![("prompt", "select_account".into())],
+            Kind::Google { hosted_domains, .. } => {
+                let mut p = vec![("prompt", "select_account".into())];
+                match hosted_domains.as_slice() {
+                    [] => {}
+                    [one] => p.push(("hd", one.clone())),
+                    _ => p.push(("hd", "*".into())),
+                }
+                p
+            }
+            Kind::Oidc { .. } => vec![],
         }
     }
 
@@ -139,7 +229,7 @@ impl Provider {
     fn discovery_url(&self) -> String {
         match &self.kind {
             Kind::Entra { authority, tenant, .. } => format!("{authority}/{tenant}/v2.0/.well-known/openid-configuration"),
-            Kind::Oidc { issuer } => format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/')),
+            Kind::Google { issuer, .. } | Kind::Oidc { issuer, .. } => format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/')),
         }
     }
 
@@ -156,8 +246,8 @@ impl Provider {
                 }
                 Ok((format!("{authority}/{tid}/v2.0"), Some(tid)))
             }
-            Kind::Oidc { issuer } if tenant.is_none() => Ok((issuer.clone(), None)),
-            Kind::Oidc { .. } => Err("tenant is only for Entra providers".into()),
+            Kind::Google { issuer, .. } | Kind::Oidc { issuer, .. } if tenant.is_none() => Ok((issuer.clone(), None)),
+            Kind::Google { .. } | Kind::Oidc { .. } => Err("tenant is only for Entra providers".into()),
         }
     }
 
@@ -166,8 +256,8 @@ impl Provider {
         let s = s.trim();
         match self.kind {
             Kind::Entra { .. } => guid(s).ok_or_else(|| "subject must be the user's Entra object id (a GUID)".into()),
-            Kind::Oidc { .. } if !s.is_empty() && s.len() <= 255 => Ok(s.into()),
-            Kind::Oidc { .. } => Err("subject must be 1 to 255 characters".into()),
+            Kind::Google { .. } | Kind::Oidc { .. } if !s.is_empty() && s.len() <= 255 => Ok(s.into()),
+            Kind::Google { .. } | Kind::Oidc { .. } => Err("subject must be 1 to 255 characters".into()),
         }
     }
 
@@ -271,7 +361,8 @@ impl Provider {
     /// Whose token this is, if it's from an issuer we accept.
     pub fn claims(&self, t: &Token, meta: &Metadata) -> Result<Claims, Invalid> {
         let iss = t.str("iss").ok_or(Invalid("wrong_issuer"))?;
-        let name = t.str("name").map(|n| crate::audit::clip(n.trim(), 100)).filter(|n| !n.is_empty());
+        let name_in = |claim: &str| t.str(claim).map(|n| crate::audit::clip(n.trim(), 100)).filter(|n| !n.is_empty());
+        let name = name_in("name");
         match &self.kind {
             Kind::Entra { authority, tenant, allowed } => {
                 let tid = t.str("tid").and_then(guid).ok_or(Invalid("wrong_tenant"))?;
@@ -286,13 +377,36 @@ impl Provider {
                 // Entra's `email` is informational only (it isn't verified), so we never look anyone up by it.
                 Ok(Claims { issuer: iss.into(), subject: oid, tenant: Some(tid), email: t.str("email").map(String::from), name })
             }
-            Kind::Oidc { issuer } => {
-                if iss != issuer || iss != meta.issuer {
+            // Identities are stored under the configured issuer, so a link made with
+            // `botctl user link` and a sign-in name the same one.
+            Kind::Google { issuer, hosted_domains } => {
+                // Google's ID tokens may carry the issuer without its scheme.
+                let bare = meta.issuer.strip_prefix("https://");
+                if !same_issuer(issuer, &meta.issuer) || (iss != meta.issuer && Some(iss) != bare) {
                     return Err(Invalid("wrong_issuer"));
                 }
-                let sub = t.str("sub").filter(|s| s.len() <= 255).ok_or(Invalid("missing_subject"))?;
-                let verified = t.claims.get("email_verified").and_then(Value::as_bool) == Some(true);
-                Ok(Claims { issuer: iss.into(), subject: sub.into(), tenant: None, email: t.str("email").filter(|_| verified).map(String::from), name })
+                let subject = subject_of(t, "sub")?;
+                let email = verified_email(t, "email").ok_or(Invalid("email_unverified"))?;
+                // `hd` is set by Google for Workspace accounts only; an email's domain is not
+                // proof of membership (anyone can make a Google account for any address).
+                if !hosted_domains.is_empty() && !t.str("hd").and_then(domain).is_some_and(|d| hosted_domains.contains(&d)) {
+                    return Err(Invalid("wrong_domain"));
+                }
+                Ok(Claims { issuer: issuer.clone(), subject, tenant: None, email: Some(email), name })
+            }
+            Kind::Oidc { issuer, map, allowed_domains } => {
+                if !same_issuer(issuer, &meta.issuer) || iss != meta.issuer {
+                    return Err(Invalid("wrong_issuer"));
+                }
+                let subject = subject_of(t, &map.subject)?;
+                let email = verified_email(t, &map.email);
+                if !allowed_domains.is_empty() {
+                    let e = email.as_deref().ok_or(Invalid("email_unverified"))?;
+                    if !email_in(e, allowed_domains) {
+                        return Err(Invalid("wrong_domain"));
+                    }
+                }
+                Ok(Claims { issuer: issuer.clone(), subject, tenant: None, email, name: name_in(&map.name) })
             }
         }
     }
@@ -355,7 +469,7 @@ mod tests {
 
     #[test]
     fn oidc_takes_one_issuer_and_only_verified_email() {
-        let p = Provider::new("acme", "Acme", Kind::Oidc { issuer: "https://idp.example".into() }, "client-1", "openid", None);
+        let p = Provider::new("acme", "Acme", Kind::oidc("https://idp.example"), "client-1", "openid", None);
         let m = meta("https://idp.example");
         let t = |c: Value| jwt::decode(&keys()[0].sign(&c)).unwrap();
         let c = p.claims(&t(json!({ "iss": "https://idp.example", "sub": "s1", "email": "a@example.com" })), &m).unwrap();
@@ -364,6 +478,99 @@ mod tests {
         assert_eq!(c.email.as_deref(), Some("a@example.com"));
         assert_eq!(p.claims(&t(json!({ "iss": "https://other.example", "sub": "s1" })), &m).err(), Some(Invalid("wrong_issuer")));
         assert_eq!(p.claims(&t(json!({ "iss": "https://idp.example" })), &m).err(), Some(Invalid("missing_subject")));
+    }
+
+    fn signed(c: Value) -> Token {
+        jwt::decode(&keys()[0].sign(&c)).unwrap()
+    }
+
+    fn google(domains: &[&str]) -> Provider {
+        let kind = Kind::Google { issuer: GOOGLE_ISSUER.into(), hosted_domains: domains.iter().map(|s| s.to_string()).collect() };
+        Provider::new("google", "Google", kind, "client-1", "openid email profile", None)
+    }
+
+    fn g(extra: Value) -> Value {
+        let mut c = json!({ "iss": GOOGLE_ISSUER, "sub": "1077", "email": "ada@example.com", "email_verified": true, "hd": "example.com", "name": "Ada" });
+        c.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        c
+    }
+
+    #[test]
+    fn google_takes_sub_and_a_verified_email_under_either_issuer_form() {
+        let (p, m) = (google(&[]), meta(GOOGLE_ISSUER));
+        let c = p.claims(&signed(g(json!({}))), &m).unwrap();
+        assert_eq!((c.issuer.as_str(), c.subject.as_str(), c.email.as_deref(), c.tenant.as_deref()), (GOOGLE_ISSUER, "1077", Some("ada@example.com"), None));
+        let bare = p.claims(&signed(g(json!({ "iss": "accounts.google.com" }))), &m).unwrap();
+        assert_eq!(bare.key(), c.key(), "stored under one issuer, so links match both forms");
+        assert!(p.claims(&signed(g(json!({ "hd": null }))), &m).is_ok(), "consumer accounts are fine without a domain list");
+        for (claims, why) in [(json!({ "email_verified": false }), "unverified"), (json!({ "email_verified": null }), "no flag"), (json!({ "email": null }), "no email")] {
+            assert_eq!(p.claims(&signed(g(claims)), &m).err(), Some(Invalid("email_unverified")), "{why}");
+        }
+        for iss in ["https://accounts.google.com.evil.example", "http://accounts.google.com", "https://idp.example"] {
+            assert_eq!(p.claims(&signed(g(json!({ "iss": iss }))), &m).err(), Some(Invalid("wrong_issuer")), "{iss}");
+        }
+        assert_eq!(p.claims(&signed(g(json!({}))), &meta("https://evil.example")).err(), Some(Invalid("wrong_issuer")), "discovery from elsewhere");
+        assert_eq!(p.claims(&signed(g(json!({ "sub": null }))), &m).err(), Some(Invalid("missing_subject")));
+    }
+
+    #[test]
+    fn google_workspace_domains_are_checked_on_hd_not_the_email() {
+        let (p, m) = (google(&["example.com", "example.org"]), meta(GOOGLE_ISSUER));
+        assert!(p.claims(&signed(g(json!({}))), &m).is_ok());
+        assert!(p.claims(&signed(g(json!({ "hd": "EXAMPLE.org" }))), &m).is_ok());
+        assert_eq!(p.claims(&signed(g(json!({ "hd": null }))), &m).err(), Some(Invalid("wrong_domain")), "a consumer account with a company email");
+        assert_eq!(p.claims(&signed(g(json!({ "hd": "evil.example" }))), &m).err(), Some(Invalid("wrong_domain")));
+        assert_eq!(p.claims(&signed(g(json!({ "hd": "sub.example.com" }))), &m).err(), Some(Invalid("wrong_domain")), "subdomains are listed on their own");
+        assert_eq!(p.claims(&signed(g(json!({ "hd": "evil.example", "email": "ada@example.com" }))), &m).err(), Some(Invalid("wrong_domain")));
+        assert_eq!(p.auth_params(), [("prompt", "select_account".to_string()), ("hd", "*".to_string())]);
+        assert_eq!(google(&["example.com"]).auth_params()[1], ("hd", "example.com".to_string()));
+        assert_eq!(google(&[]).auth_params().len(), 1);
+    }
+
+    #[test]
+    fn google_tokens_pass_the_shared_checks_too() {
+        let p = google(&["example.com"]);
+        let now = 1_800_000_000;
+        let base = |extra: Value| {
+            let mut c = g(json!({ "aud": "client-1", "nonce": "n1", "iat": now, "exp": now + 3600 }));
+            c.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            c
+        };
+        let run = |c: Value| {
+            let t = signed(c);
+            t.check("client-1", "n1", now)?;
+            p.claims(&t, &meta(GOOGLE_ISSUER))
+        };
+        assert!(run(base(json!({}))).is_ok());
+        assert_eq!(run(base(json!({ "aud": "someone-else" }))).err(), Some(Invalid("wrong_audience")));
+        assert_eq!(run(base(json!({ "exp": now - 3600 }))).err(), Some(Invalid("expired")));
+        assert_eq!(run(base(json!({ "nonce": "n2" }))).err(), Some(Invalid("nonce_mismatch")));
+        assert_eq!(run(base(json!({ "hd": "evil.example" }))).err(), Some(Invalid("wrong_domain")));
+    }
+
+    #[test]
+    fn oidc_maps_claims_and_restricts_to_verified_email_domains() {
+        let map = ClaimMap { subject: "uid".into(), email: "mail".into(), name: "display".into() };
+        let kind = Kind::Oidc { issuer: "https://tenant.auth0.example/".into(), map, allowed_domains: vec!["example.com".into()] };
+        let p = Provider::new("acme", "Acme", kind, "client-1", "openid", None);
+        let m = meta("https://tenant.auth0.example/");
+        let t = |extra: Value| {
+            let mut c = json!({ "iss": "https://tenant.auth0.example/", "sub": "pairwise", "uid": "u-1", "mail": "ada@Example.com", "email_verified": "true", "display": "Ada" });
+            c.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            signed(c)
+        };
+        let c = p.claims(&t(json!({})), &m).unwrap();
+        assert_eq!((c.subject.as_str(), c.email.as_deref(), c.name.as_deref(), c.issuer.as_str()), ("u-1", Some("ada@Example.com"), Some("Ada"), "https://tenant.auth0.example/"));
+        assert_eq!(p.claims(&t(json!({ "uid": null })), &m).err(), Some(Invalid("missing_subject")), "sub is not the subject here");
+        assert_eq!(p.claims(&t(json!({ "email_verified": false })), &m).err(), Some(Invalid("email_unverified")));
+        assert_eq!(p.claims(&t(json!({ "mail": null })), &m).err(), Some(Invalid("email_unverified")));
+        for mail in ["ada@evil.example", "ada@example.com.evil.example", "ada@sub.example.com", "example.com", "@example.com", "ada@example.com@evil.example"] {
+            assert_eq!(p.claims(&t(json!({ "mail": mail })), &m).err(), Some(Invalid("wrong_domain")), "{mail}");
+        }
+        assert_eq!(p.claims(&t(json!({ "iss": "https://tenant.auth0.example" })), &m).err(), Some(Invalid("wrong_issuer")), "the token must match discovery exactly");
+        let typo = meta("https://tenant.auth0.example");
+        assert_eq!(p.claims(&t(json!({ "iss": "https://tenant.auth0.example" })), &typo).unwrap().issuer, "https://tenant.auth0.example/", "a trailing slash in config is not a different IdP");
+        assert!(p.auth_params().is_empty());
     }
 
     #[tokio::test]
@@ -379,7 +586,7 @@ mod tests {
         let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let p = Provider::new("acme", "Acme", Kind::Oidc { issuer: base.clone() }, "client-1", "openid", None);
+        let p = Provider::new("acme", "Acme", Kind::oidc(&base), "client-1", "openid", None);
         let http = reqwest::Client::new();
         let gap = Duration::from_secs(60);
         for _ in 0..3 {
@@ -401,5 +608,9 @@ mod tests {
         assert!(!secure_url("http://idp.example/x") && !secure_url("file:///etc/passwd") && !secure_url("nope"));
         assert_eq!(guid(&T1.to_uppercase()).as_deref(), Some(T1));
         assert!(guid("contoso.onmicrosoft.com").is_none() && guid("1111111-1111-1111-1111-1111111111111").is_none());
+        assert_eq!(domain(" Example.COM. ").as_deref(), Some("example.com"));
+        for bad in ["localhost", "a@example.com", "-x.example", "exa mple.com", "*.example.com", "", "example..com"] {
+            assert!(domain(bad).is_none(), "{bad}");
+        }
     }
 }
