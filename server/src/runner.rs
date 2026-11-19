@@ -117,8 +117,8 @@ impl App {
         });
         if let Some(run) = self.state().get(&b.id).and_then(|s| s.run.as_ref()) {
             v["working"] = json!(true);
-            v["status"] = json!(run.status);
-            v["draft"] = json!(run.draft);
+            v["status"] = json!(crate::secrets::redact::text(&run.status));
+            v["draft"] = json!(crate::secrets::redact::text(&run.draft));
         }
         v
     }
