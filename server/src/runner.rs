@@ -115,6 +115,8 @@ impl App {
             "primary": b.primary, "hidden": b.hidden, "unread": b.unread, "preview": preview.unwrap_or_default(), "working": false,
             "handoff": self.db.open_handoff(&b.id),
             "policy": self.db.effective_policy(&b.id).mode, "policyOverride": self.db.bot_override(&b.id).is_some(),
+            "owner": self.db.user(&b.owner_id).map(|u| json!({ "id": u.id, "name": u.name })),
+            "visibility": b.visibility,
         });
         if let Some(run) = self.state().get(&b.id).and_then(|s| s.run.as_ref()) {
             v["working"] = json!(true);
@@ -502,11 +504,16 @@ impl App {
         }
     }
 
-    fn system_prompt(&self, bot: &Bot) -> String {
+    pub(crate) fn system_prompt(&self, bot: &Bot) -> String {
         let read = |p: &Option<PathBuf>| p.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default().trim().to_string();
         let (mem_file, user_file) = (self.memory_file(&bot.id), self.user_file());
-        let others: Vec<String> =
-            self.db.bots().iter().filter(|b| b.id != bot.id).map(|b| format!("- {} (id {})", b.name, b.id)).collect();
+        // Only the Bots its owner can see: a Bot acts for its owner (ADR 0016).
+        let others: Vec<String> = crate::acl::Viewer::owner_of(&self.db, bot)
+            .bots(&self.db)
+            .into_iter()
+            .filter(|(b, _)| b.id != bot.id)
+            .map(|(b, _)| format!("- {} (id {})", b.name, b.id))
+            .collect();
         let primary = if bot.primary {
             " You are their primary Bot: their main point of contact. You help them decide which Bot should own which job."
         } else {

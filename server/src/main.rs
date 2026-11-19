@@ -1,6 +1,9 @@
 //! botd: the server. Owns Bots, chats, memory files, and routines; runs each Bot
 //! on its harness (Claude Code, Codex, Pi, or Hermes Agent); serves the web app and its API.
 
+mod acl;
+#[cfg(test)]
+mod acl_http_tests;
 mod adapters;
 mod approvals;
 mod audit;
@@ -20,6 +23,7 @@ mod users_http_tests;
 #[cfg(test)]
 mod sso_http_tests;
 
+use acl::{Access, Viewer, Visibility};
 use approvals::{DecideError, Remember};
 use audit::{Actor, Event, Outcome, Source, Who};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, Request, State};
@@ -40,8 +44,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
-use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 type AppState = Arc<App>;
@@ -238,6 +241,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/harnesses/{name}/models", get(list_models))
         .route("/bots", get(list_bots).post(create_bot))
         .route("/bots/{id}", patch(update_bot).delete(delete_bot))
+        .route("/bots/{id}/access", get(get_access).patch(update_access))
+        .route("/bots/{id}/grants/{user}", put(put_grant).delete(delete_grant))
         .route("/bots/{id}/messages", get(list_messages).post(send_message))
         .route("/bots/{id}/read", post(mark_read))
         .route("/bots/{id}/stop", post(stop_bot))
@@ -744,19 +749,18 @@ async fn web(uri: axum::http::Uri) -> Response {
 
 // Live updates: one Server-Sent Events stream with everything.
 
-async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>) -> impl IntoResponse {
-    let Some(session) = c.session.map(|s| s.id) else {
-        let stream = BroadcastStream::new(app.tx.subscribe()).map(|r| {
-            // A slow client that missed events is told to reload its state.
-            Ok::<_, Infallible>(SseEvent::default().data(r.unwrap_or_else(|_| r#"{"type":"resync"}"#.into())))
-        });
-        return ([("x-accel-buffering", "no")], Sse::new(Box::pin(stream) as EventStream).keep_alive(KeepAlive::default()));
-    };
+async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>) -> impl IntoResponse {
+    // Each stream carries only the Bots its caller can see (ADR 0016).
+    let mut filter = acl::StreamFilter::new(viewer(&app, &c, &by));
+    let session = c.session.map(|s| s.id);
+    let user = c.user.filter(|_| session.is_some()).map(|u| u.id);
     // The stream outlives the request that opened it, so it closes within seconds of
-    // its session being revoked, expiring, or its user being disabled.
+    // its session being revoked, expiring, or its user being disabled, and follows
+    // role changes.
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, Infallible>>(64);
     let mut sub = app.tx.subscribe();
     let cfg = a.sessions;
+    const RESYNC: &str = r#"{"type":"resync"}"#;
     tokio::spawn(async move {
         let mut check = tokio::time::interval(SESSION_RECHECK);
         loop {
@@ -764,16 +768,29 @@ async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>,
                 r = sub.recv() => {
                     let data = match r {
                         Ok(d) => d,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => r#"{"type":"resync"}"#.into(),
+                        // A slow client that missed events is told to reload its state.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => RESYNC.into(),
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     };
+                    let Some(data) = filter.apply(&app.db, &data) else { continue };
                     if tx.send(Ok(SseEvent::default().data(data))).await.is_err() {
                         break;
                     }
                 }
-                _ = check.tick() => {
-                    if !app.db.session_is_live(&session, db::now(), cfg.idle_ms, cfg.max_ms) {
+                _ = check.tick(), if session.is_some() => {
+                    if !session.as_deref().is_some_and(|s| app.db.session_is_live(s, db::now(), cfg.idle_ms, cfg.max_ms)) {
                         break;
+                    }
+                    let now = match user.as_deref().and_then(|id| app.db.user(id)) {
+                        Some(u) if u.role == Role::Admin => Viewer::All,
+                        Some(u) => Viewer::User { id: u.id, role: u.role },
+                        None => Viewer::Nobody,
+                    };
+                    if now != filter.viewer {
+                        filter.reset(now);
+                        if tx.send(Ok(SseEvent::default().data(RESYNC))).await.is_err() {
+                            break;
+                        }
                     }
                 }
                 _ = tx.closed() => break,
@@ -798,9 +815,14 @@ async fn login_page() -> Response {
 
 // Bots
 
-async fn state(State(app): State<AppState>, Extension(c): Extension<Caller>) -> Json<Value> {
-    let bots: Vec<Value> = app.db.bots().iter().map(|b| app.bot_view(b)).collect();
-    let approvals = if rbac::allows(c.principal, Perm::Review) { app.db.approvals(Some("pending"), None, 200) } else { vec![] };
+/// Every Bot the caller can see, each with their `access` to it.
+fn visible_bots(app: &App, c: &Caller, by: &Who) -> Vec<Value> {
+    viewer(app, c, by).bots(&app.db).iter().map(|(b, a)| bot_view_for(app, b, *a)).collect()
+}
+
+async fn state(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>) -> Json<Value> {
+    let bots = visible_bots(&app, &c, &by);
+    let approvals = if rbac::allows(c.principal, Perm::Review) { visible_approvals(&app, &c, &by, app.db.approvals(Some("pending"), None, 200)) } else { vec![] };
     // The owner keeps USER_NAME, as before users existed.
     let name = match &c.user {
         Some(u) if u.id != users::OPERATOR => u.name.clone(),
@@ -829,12 +851,59 @@ async fn list_models(Path(name): Path<String>) -> Res {
     Ok(Json(json!(list)))
 }
 
-async fn list_bots(State(app): State<AppState>) -> Json<Value> {
-    Json(app.db.bots().iter().map(|b| app.bot_view(b)).collect())
+async fn list_bots(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>) -> Json<Value> {
+    Json(json!(visible_bots(&app, &c, &by)))
 }
 
 fn need_bot(app: &App, id: &str) -> Res<db::Bot> {
     app.db.bot(id).ok_or_else(|| not_found("Bot"))
+}
+
+/// Whose Bot access a request has. A Bot that says who it is acts with its owner's.
+/// Bots share one token, so that's a guardrail, not a boundary (ADR 0016).
+fn viewer(app: &App, c: &Caller, by: &Who) -> Viewer {
+    match (c.principal, by.actor.kind, by.actor.id.as_deref().and_then(|id| app.db.bot(id))) {
+        (Principal::Bot, audit::ActorKind::Bot, Some(b)) => Viewer::owner_of(&app.db, &b),
+        _ => Viewer::of(c),
+    }
+}
+
+/// The Bot, when the caller has at least `need` on it (ADR 0016). A Bot they can't see
+/// is a 404, the same as one that doesn't exist; one they can see but not use is a 403.
+fn need_bot_access(app: &App, c: &Caller, by: &Who, id: &str, need: Access) -> Res<(db::Bot, Access)> {
+    let bot = need_bot(app, id)?;
+    let has = viewer(app, c, by).access(&app.db, &bot);
+    if has >= need {
+        return Ok((bot, has));
+    }
+    // The auth middleware already records every 403 a Bot gets.
+    if c.principal != Principal::Bot || has == Access::None {
+        let details = json!({ "reason": "bot_acl", "need": need, "has": has });
+        app.db.record(&by.event("access.denied").target("bot", id).bot(id).outcome(Outcome::Denied).details(details));
+    }
+    Err(match (has, c.principal) {
+        (Access::None, _) => not_found("Bot"),
+        (_, Principal::User(Role::Readonly)) => ApiError(StatusCode::FORBIDDEN, "Your role (readonly) can only view Bots.".into()),
+        (_, _) if need == Access::Manage => ApiError(StatusCode::FORBIDDEN, "Only this Bot's owner or an admin can do this.".into()),
+        _ => ApiError(StatusCode::FORBIDDEN, "You can view this Bot but not use it. Ask its owner for operator access.".into()),
+    })
+}
+
+/// Only the approvals for Bots the caller can see.
+fn visible_approvals(app: &App, c: &Caller, by: &Who, list: Vec<db::Approval>) -> Vec<db::Approval> {
+    let viewer = viewer(app, c, by);
+    if viewer == Viewer::All {
+        return list;
+    }
+    let ids: std::collections::HashSet<String> = viewer.bots(&app.db).into_iter().map(|(b, _)| b.id).collect();
+    list.into_iter().filter(|a| ids.contains(&a.bot_id)).collect()
+}
+
+/// A Bot view as this caller sees it.
+fn bot_view_for(app: &App, b: &db::Bot, access: Access) -> Value {
+    let mut v = app.bot_view(b);
+    v["access"] = json!(access);
+    v
 }
 
 fn bot_patch(v: &Value) -> Res<BotPatch> {
@@ -874,23 +943,41 @@ fn bot_patch(v: &Value) -> Res<BotPatch> {
     Ok(p)
 }
 
-async fn create_bot(State(app): State<AppState>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
+fn visibility_field(v: &Value) -> Res<Option<Visibility>> {
+    match v.get("visibility") {
+        None | Some(Value::Null) => Ok(None),
+        Some(x) => x.as_str().and_then(Visibility::parse).map(Some).ok_or_else(|| bad("Visibility must be private or shared")),
+    }
+}
+
+async fn create_bot(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
     let p = bot_patch(&v)?;
     let name = p.name.ok_or_else(|| bad("Name is required"))?;
     let harness = p.harness.unwrap_or_else(|| app.cfg.default_harness.clone());
-    let bot = app.db.create_bot(
+    // Shared unless asked otherwise, as every Bot was before ACLs.
+    let visibility = visibility_field(&v)?.unwrap_or(Visibility::Shared);
+    // A person owns what they make. A Bot's new Bot belongs to that Bot's owner.
+    let owner = match (&c.user, by.actor.kind) {
+        (Some(u), _) => u.id.clone(),
+        (None, audit::ActorKind::Bot) => by.actor.id.as_deref().and_then(|id| app.db.bot(id)).map_or(users::OPERATOR.into(), |b| b.owner_id),
+        (None, _) => users::OPERATOR.into(),
+    };
+    let bot = app.db.create_bot_owned(
         &name,
         p.color.as_deref().unwrap_or(pick(&COLORS)),
         p.shape.as_deref().unwrap_or(pick(&SHAPES)),
         &harness,
         p.model.flatten().as_deref(),
         false,
+        &owner,
+        visibility,
     );
     app.init_bot_files(&bot);
     app.push_bot(&bot.id);
-    let details = json!({ "name": bot.name, "harness": bot.harness, "model": bot.model });
+    let details = json!({ "name": bot.name, "harness": bot.harness, "model": bot.model, "owner": bot.owner_id, "visibility": bot.visibility });
     app.db.record(&by.event("bot.created").target("bot", &bot.id).bot(&bot.id).details(details));
-    Ok((StatusCode::CREATED, Json(app.bot_view(&bot))))
+    let access = viewer(&app, &c, &by).access(&app.db, &bot);
+    Ok((StatusCode::CREATED, Json(bot_view_for(&app, &bot, access))))
 }
 
 /// Settings that changed, as `{field: {from, to}}`.
@@ -911,8 +998,8 @@ fn bot_changes(before: &db::Bot, after: &db::Bot) -> serde_json::Map<String, Val
     m
 }
 
-async fn update_bot(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
-    let bot = need_bot(&app, &id)?;
+async fn update_bot(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
+    let (bot, access) = need_bot_access(&app, &c, &by, &id, Access::Manage)?;
     let mut p = bot_patch(&v)?;
     if p.harness.as_ref().is_some_and(|h| *h != bot.harness) {
         p.session_id = Some(None); // sessions don't carry across harnesses
@@ -924,11 +1011,11 @@ async fn update_bot(State(app): State<AppState>, Extension(by): Extension<Who>, 
     if !changes.is_empty() {
         app.db.record(&by.event("bot.updated").target("bot", &id).bot(&id).details(json!({ "changes": changes })));
     }
-    Ok(Json(app.bot_view(&after)))
+    Ok(Json(bot_view_for(&app, &after, access)))
 }
 
-async fn delete_bot(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
-    let bot = need_bot(&app, &id)?;
+async fn delete_bot(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
+    let (bot, _) = need_bot_access(&app, &c, &by, &id, Access::Manage)?;
     if bot.primary {
         return Err(bad("The primary Bot can't be deleted"));
     }
@@ -942,15 +1029,124 @@ async fn delete_bot(State(app): State<AppState>, Extension(by): Extension<Who>, 
     Ok(Json(json!({ "ok": true })))
 }
 
-async fn mark_read(State(app): State<AppState>, Path(id): Path<String>) -> Res {
-    need_bot(&app, &id)?;
+// Bot ACLs (ADR 0016): owner, visibility, and grants.
+
+fn person(u: Option<db::User>, id: &str) -> Value {
+    match u {
+        Some(u) => json!({ "id": u.id, "name": u.name, "email": u.email }),
+        None => json!({ "id": id, "name": null, "email": null }),
+    }
+}
+
+/// Who can see a Bot. Grants are only shown to those who can change them.
+fn access_view(app: &App, b: &db::Bot, access: Access) -> Value {
+    let mut v = json!({
+        "botId": b.id,
+        "owner": person(app.db.user(&b.owner_id), &b.owner_id),
+        "visibility": b.visibility,
+        "access": access,
+    });
+    if access == Access::Manage {
+        let grants: Vec<Value> = app
+            .db
+            .grants(&b.id)
+            .into_iter()
+            .map(|g| json!({ "user": person(app.db.user(&g.user_id), &g.user_id), "level": g.level, "createdAt": g.created_at, "createdBy": g.created_by }))
+            .collect();
+        v["grants"] = json!(grants);
+    }
+    v
+}
+
+/// After an ACL change: everyone's lists and live streams start over, since who
+/// sees the Bot may have changed. The resync goes first: it clears each stream's
+/// cached access, so the Bot's update reaches exactly who can now see it.
+fn acl_changed(app: &App, id: &str) {
+    app.send(json!({ "type": "resync" }));
+    app.push_bot(id);
+}
+
+async fn get_access(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
+    let (bot, access) = need_bot_access(&app, &c, &by, &id, Access::View)?;
+    Ok(Json(access_view(&app, &bot, access)))
+}
+
+/// Body: `{visibility?: "private" | "shared", owner?: <user id or email>}`. The owner
+/// or an admin can change visibility; only an admin can give a Bot to someone else.
+async fn update_access(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
+    need_user(c.principal)?;
+    let (bot, _) = need_bot_access(&app, &c, &by, &id, Access::Manage)?;
+    let visibility = visibility_field(&v)?;
+    let owner = match v.get("owner") {
+        None | Some(Value::Null) => None,
+        Some(o) => {
+            if c.principal != Principal::User(Role::Admin) {
+                return Err(ApiError(StatusCode::FORBIDDEN, "Only an admin can change who owns a Bot.".into()));
+            }
+            let key = o.as_str().map(str::trim).filter(|k| !k.is_empty()).ok_or_else(|| bad("owner must be a user id or email"))?;
+            let u = app.db.find_user(key).ok_or_else(|| not_found("User"))?;
+            if !u.active() {
+                return Err(bad("That user is disabled"));
+            }
+            Some(u)
+        }
+    };
+    if visibility.is_none() && owner.is_none() {
+        return Err(bad("Send visibility or owner"));
+    }
+    if let Some(to) = visibility.filter(|to| *to != bot.visibility) {
+        app.db.set_bot_visibility(&id, to);
+        app.db.record(&by.event("bot.visibility_changed").target("bot", &id).bot(&id).details(json!({ "from": bot.visibility, "to": to })));
+    }
+    if let Some(u) = owner.filter(|u| u.id != bot.owner_id) {
+        app.db.set_bot_owner(&id, &u.id);
+        // The new owner manages it anyway; a leftover grant would only confuse.
+        app.db.remove_grant(&id, &u.id);
+        app.db.record(&by.event("bot.owner_changed").target("bot", &id).bot(&id).details(json!({ "from": bot.owner_id, "to": u.id })));
+    }
+    acl_changed(&app, &id);
+    let after = need_bot(&app, &id)?;
+    let access = viewer(&app, &c, &by).access(&app.db, &after);
+    Ok(Json(access_view(&app, &after, access)))
+}
+
+/// Body: `{level: "viewer" | "operator"}`. Adds or changes one user's grant.
+async fn put_grant(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path((id, key)): Path<(String, String)>, Json(v): Json<Value>) -> Res {
+    need_user(c.principal)?;
+    let (bot, access) = need_bot_access(&app, &c, &by, &id, Access::Manage)?;
+    let level = v["level"].as_str().and_then(acl::Grant::parse).ok_or_else(|| bad("level must be viewer or operator"))?;
+    let u = app.db.find_user(&key).ok_or_else(|| not_found("User"))?;
+    if u.id == bot.owner_id {
+        return Err(ApiError(StatusCode::CONFLICT, "That user owns this Bot already.".into()));
+    }
+    let by_id = c.user.as_ref().map_or(users::OPERATOR, |u| u.id.as_str());
+    let before = app.db.set_grant(&id, &u.id, level, by_id);
+    if before != Some(level) {
+        app.db.record(&by.event("bot.access_granted").target("bot", &id).bot(&id).details(json!({ "user": u.id, "level": level, "from": before })));
+        acl_changed(&app, &id);
+    }
+    Ok(Json(access_view(&app, &bot, access)))
+}
+
+async fn delete_grant(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path((id, key)): Path<(String, String)>) -> Res {
+    need_user(c.principal)?;
+    let (bot, access) = need_bot_access(&app, &c, &by, &id, Access::Manage)?;
+    let u = app.db.find_user(&key).ok_or_else(|| not_found("User"))?;
+    let level = app.db.remove_grant(&id, &u.id).ok_or_else(|| not_found("Grant"))?;
+    app.db.record(&by.event("bot.access_revoked").target("bot", &id).bot(&id).details(json!({ "user": u.id, "level": level })));
+    acl_changed(&app, &id);
+    Ok(Json(access_view(&app, &bot, access)))
+}
+
+async fn mark_read(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
+    need_bot_access(&app, &c, &by, &id, Access::Operate)?;
     app.db.update_bot(&id, BotPatch { unread: Some(false), ..Default::default() });
     app.push_bot(&id);
     Ok(Json(json!({ "ok": true })))
 }
 
-async fn stop_bot(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
-    need_bot(&app, &id)?;
+async fn stop_bot(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
+    need_bot_access(&app, &c, &by, &id, Access::Operate)?;
     app.stop(&id);
     app.db.record(&by.event("bot.stopped").target("bot", &id).bot(&id));
     Ok(Json(json!({ "ok": true })))
@@ -958,13 +1154,13 @@ async fn stop_bot(State(app): State<AppState>, Extension(by): Extension<Who>, Pa
 
 // Messages
 
-async fn list_messages(State(app): State<AppState>, Path(id): Path<String>) -> Res {
-    need_bot(&app, &id)?;
+async fn list_messages(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
+    need_bot_access(&app, &c, &by, &id, Access::View)?;
     Ok(Json(json!(app.db.messages(&id, 200))))
 }
 
-async fn send_message(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
-    need_bot(&app, &id)?;
+async fn send_message(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
+    need_bot_access(&app, &c, &by, &id, Access::Operate)?;
     let text = v["text"].as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| bad("Text is required"))?;
     let text: String = text.chars().take(100_000).collect();
     // Answering a choice card: remember which option was picked.
@@ -998,10 +1194,19 @@ async fn send_message(State(app): State<AppState>, Extension(by): Extension<Who>
 
 // Bot to Bot: `botctl ask`. Waits for the reply and returns it as plain text.
 
-async fn ask(State(app): State<AppState>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Result<String, ApiError> {
-    let from = v["from"].as_str().and_then(|id| app.db.bot(id)).ok_or_else(|| bad("Unknown asking Bot (BOT_ID)"))?;
+async fn ask(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Result<String, ApiError> {
+    let from_id = v["from"].as_str().unwrap_or("");
+    let from = app.db.bot(from_id).ok_or_else(|| bad("Unknown asking Bot (BOT_ID)"))?;
+    // A Bot asks with its owner's access. A person needs to be able to run both Bots.
+    let viewer = match c.principal {
+        Principal::Bot => Viewer::owner_of(&app.db, &from),
+        Principal::User(_) => {
+            need_bot_access(&app, &c, &by, from_id, Access::Operate)?;
+            viewer(&app, &c, &by)
+        }
+    };
     let to_key = v["to"].as_str().map(str::trim).unwrap_or("");
-    let bots = app.db.bots();
+    let bots: Vec<db::Bot> = viewer.bots(&app.db).into_iter().filter(|(_, a)| *a >= Access::Operate).map(|(b, _)| b).collect();
     let to = bots
         .iter()
         .find(|b| b.id == to_key)
@@ -1022,8 +1227,9 @@ async fn ask(State(app): State<AppState>, Extension(by): Extension<Who>, Json(v)
 
 // Screens: the live view of a Bot's screen. Opening it starts the screen.
 
-async fn screen_info(State(app): State<AppState>, Path(id): Path<String>) -> Res {
-    need_bot(&app, &id)?;
+async fn screen_info(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
+    // The link gives control of the screen.
+    need_bot_access(&app, &c, &by, &id, Access::Operate)?;
     let off = || ApiError(StatusCode::NOT_FOUND, "Screens are off on this server. Install Xvfb, openbox, and voxl.".into());
     let screens = app.screens.as_ref().filter(|_| screen::on_path("voxl")).ok_or_else(off)?;
     let info = screens.ensure(&id, |b| app.is_running(b)).await;
@@ -1038,8 +1244,12 @@ async fn screen_info(State(app): State<AppState>, Path(id): Path<String>) -> Res
 
 // A Bot hands its screen to the user: `botctl handoff`. Waits for "Done".
 
-async fn handoff(State(app): State<AppState>, Json(v): Json<Value>) -> Result<String, ApiError> {
-    let bot = v["from"].as_str().and_then(|id| app.db.bot(id)).ok_or_else(|| bad("Unknown Bot (BOT_ID)"))?;
+async fn handoff(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Result<String, ApiError> {
+    let from_id = v["from"].as_str().unwrap_or("");
+    let bot = app.db.bot(from_id).ok_or_else(|| bad("Unknown Bot (BOT_ID)"))?;
+    if let Principal::User(_) = c.principal {
+        need_bot_access(&app, &c, &by, from_id, Access::Operate)?;
+    }
     let text = v["text"].as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| bad("Say what you need"))?;
     let text: String = text.chars().take(300).collect();
     let wait = Duration::from_secs(9 * 60); // under the 10 minute max most harnesses allow a command
@@ -1051,8 +1261,8 @@ async fn handoff(State(app): State<AppState>, Json(v): Json<Value>) -> Result<St
 
 // Routines
 
-async fn list_routines(State(app): State<AppState>, Path(id): Path<String>) -> Res {
-    need_bot(&app, &id)?;
+async fn list_routines(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
+    need_bot_access(&app, &c, &by, &id, Access::View)?;
     Ok(Json(json!(app.db.routines(Some(&id)))))
 }
 
@@ -1090,8 +1300,8 @@ fn routine_fields(v: &Value) -> Res<RoutineFields> {
     Ok(f)
 }
 
-async fn create_routine(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
-    need_bot(&app, &id)?;
+async fn create_routine(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
+    need_bot_access(&app, &c, &by, &id, Access::Operate)?;
     let f = routine_fields(&v)?;
     let (Some(name), Some(cron_expr), Some(instruction)) = (f.name, f.cron, f.instruction) else {
         return Err(bad("name, cron, and instruction are required"));
@@ -1130,8 +1340,15 @@ fn routine_events(by: &Who, before: &db::Routine, after: &db::Routine) -> Vec<Ev
     out
 }
 
-async fn update_routine(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
-    let before = app.db.routine(&id).ok_or_else(|| not_found("Routine"))?;
+/// The routine, when the caller can run its Bot. A routine on a hidden Bot is a 404.
+fn need_routine(app: &App, c: &Caller, by: &Who, id: &str) -> Res<db::Routine> {
+    let r = app.db.routine(id).ok_or_else(|| not_found("Routine"))?;
+    need_bot_access(app, c, by, &r.bot_id, Access::Operate).map_err(|e| if e.0 == StatusCode::NOT_FOUND { not_found("Routine") } else { e })?;
+    Ok(r)
+}
+
+async fn update_routine(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
+    let before = need_routine(&app, &c, &by, &id)?;
     let f = routine_fields(&v)?;
     app.db.update_routine(&id, f.name.as_deref(), f.cron.as_deref(), f.instruction.as_deref(), f.enabled);
     let after = app.db.routine(&id).ok_or_else(|| not_found("Routine"))?;
@@ -1141,8 +1358,8 @@ async fn update_routine(State(app): State<AppState>, Extension(by): Extension<Wh
     Ok(Json(json!(after)))
 }
 
-async fn delete_routine(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
-    let r = app.db.routine(&id).ok_or_else(|| not_found("Routine"))?;
+async fn delete_routine(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
+    let r = need_routine(&app, &c, &by, &id)?;
     app.db.delete_routine(&id);
     app.db.record(&by.event("routine.deleted").target("routine", &id).bot(&r.bot_id).details(json!({ "name": r.name, "cron": r.cron })));
     Ok(Json(json!({ "ok": true })))
@@ -1177,8 +1394,8 @@ fn bot_policy_view(app: &App, id: &str) -> Value {
     json!({ "policy": app.db.effective_policy(id), "override": app.db.bot_override(id), "classes": classes_view(), "rules": app.db.rules(Some(id)) })
 }
 
-async fn get_bot_policy(State(app): State<AppState>, Path(id): Path<String>) -> Res {
-    need_bot(&app, &id)?;
+async fn get_bot_policy(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
+    need_bot_access(&app, &c, &by, &id, Access::View)?;
     Ok(Json(bot_policy_view(&app, &id)))
 }
 
@@ -1206,8 +1423,12 @@ async fn delete_bot_policy(State(app): State<AppState>, Extension(who): Extensio
     Ok(Json(bot_policy_view(&app, &id)))
 }
 
-async fn list_rules(State(app): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Json<Value> {
-    Json(json!(app.db.rules(q.get("bot").map(String::as_str))))
+async fn list_rules(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Query(q): Query<HashMap<String, String>>) -> Res {
+    let bot = q.get("bot").map(String::as_str).filter(|b| !b.is_empty());
+    if let Some(b) = bot {
+        need_bot_access(&app, &c, &by, b, Access::View)?;
+    }
+    Ok(Json(json!(app.db.rules(bot))))
 }
 
 async fn add_rule(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
@@ -1246,25 +1467,38 @@ async fn delete_rule(State(app): State<AppState>, Extension(who): Extension<Prin
 
 // Approvals
 
-async fn list_approvals(State(app): State<AppState>, Extension(who): Extension<Principal>, Query(q): Query<HashMap<String, String>>) -> Res {
-    need_user(who)?;
+async fn list_approvals(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Query(q): Query<HashMap<String, String>>) -> Res {
+    need_user(c.principal)?;
     let limit = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(100).clamp(1, 1000);
     let status = q.get("status").map(String::as_str).filter(|s| *s != "all");
-    Ok(Json(json!(app.db.approvals(status, q.get("bot").map(String::as_str), limit))))
+    let bot = q.get("bot").map(String::as_str).filter(|b| !b.is_empty());
+    if let Some(b) = bot {
+        need_bot_access(&app, &c, &by, b, Access::View)?;
+    }
+    // Hidden Bots' rows are dropped after the query, so look further back to still fill `limit`.
+    let scan = if viewer(&app, &c, &by) == Viewer::All { limit } else { 1000 };
+    let mut list = visible_approvals(&app, &c, &by, app.db.approvals(status, bot, scan));
+    list.truncate(limit as usize);
+    Ok(Json(json!(list)))
 }
 
-async fn approve(state: State<AppState>, who: Extension<Principal>, by: Extension<Who>, id: Path<String>, body: axum::body::Bytes) -> Res {
-    decide(state, who, by, id, body, true).await
+async fn approve(state: State<AppState>, c: Extension<Caller>, by: Extension<Who>, id: Path<String>, body: axum::body::Bytes) -> Res {
+    decide(state, c, by, id, body, true).await
 }
 
-async fn deny(state: State<AppState>, who: Extension<Principal>, by: Extension<Who>, id: Path<String>, body: axum::body::Bytes) -> Res {
-    decide(state, who, by, id, body, false).await
+async fn deny(state: State<AppState>, c: Extension<Caller>, by: Extension<Who>, id: Path<String>, body: axum::body::Bytes) -> Res {
+    decide(state, c, by, id, body, false).await
 }
 
 /// Body: `{remember?: "bot" | "global" | true, note?}`. Remember saves a rule for this
 /// exact call, which is a policy change, so it needs an admin.
-async fn decide(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Path(id): Path<String>, body: axum::body::Bytes, approve: bool) -> Res {
+async fn decide(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>, body: axum::body::Bytes, approve: bool) -> Res {
+    let who = c.principal;
     need_user(who)?;
+    // Answering lets the Bot act, so it takes operator access to that Bot.
+    if let Some(a) = app.db.approval(&id) {
+        need_bot_access(&app, &c, &by, &a.bot_id, Access::Operate).map_err(|e| if e.0 == StatusCode::NOT_FOUND { not_found("Approval") } else { e })?;
+    }
     let v: Value = if body.iter().all(u8::is_ascii_whitespace) {
         Value::Null
     } else {
@@ -1293,7 +1527,7 @@ async fn decide(State(app): State<AppState>, Extension(who): Extension<Principal
 /// The harness hook (`botctl hook <harness>`) asks here before each tool call.
 /// Body: `{from, harness, event}` with the harness's PreToolUse payload. Waits while
 /// the user decides. Replies in plain text: "allow" or "deny", then the reason.
-async fn check_approval(State(app): State<AppState>, Json(v): Json<Value>) -> Response {
+async fn check_approval(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Response {
     let reply = |allow: bool, reason: &str| {
         let body = format!("{}\n{reason}", if allow { "allow" } else { "deny" });
         ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response()
@@ -1301,6 +1535,11 @@ async fn check_approval(State(app): State<AppState>, Json(v): Json<Value>) -> Re
     let Some(bot) = v["from"].as_str().and_then(|id| app.db.bot(id)) else {
         return reply(false, "Unknown Bot (BOT_ID)");
     };
+    if let Principal::User(_) = c.principal
+        && let Err(e) = need_bot_access(&app, &c, &by, &bot.id, Access::Operate)
+    {
+        return e.into_response();
+    }
     let e = &v["event"];
     let Some(tool) = e["tool_name"].as_str().filter(|t| !t.is_empty()) else {
         return reply(false, "The hook sent no tool name");
@@ -1874,6 +2113,7 @@ mod tests {
             .route("/api/bots/{id}/routines", get(list_routines).post(create_routine))
             .route("/api/routines/{id}", patch(update_routine).delete(delete_routine))
             .layer(Extension(Who { actor: Actor::operator(), source: Source::default() }))
+            .layer(Extension(Caller { principal: Principal::User(Role::Admin), user: None, session: None, method: "none" }))
             .with_state(app.clone());
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();

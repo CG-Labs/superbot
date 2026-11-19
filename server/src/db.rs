@@ -1,6 +1,7 @@
 //! SQLite storage: Bots, messages, routines, harness policy, approvals, and the
 //! append-only audit log. One connection behind a mutex; every call is short.
 
+use crate::acl::{Grant, Visibility};
 use crate::audit;
 use crate::policy::{Action, Mode, Override, Policy, Rule};
 use crate::rbac::Role;
@@ -25,6 +26,20 @@ pub struct Bot {
     pub hidden: bool,
     pub unread: bool,
     pub created_at: i64,
+    /// The user who owns it (ADR 0016). Bots from before ACLs belong to `operator`.
+    pub owner_id: String,
+    pub visibility: Visibility,
+}
+
+/// One user's grant on one Bot (ADR 0016).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BotGrant {
+    pub bot_id: String,
+    pub user_id: String,
+    pub level: Grant,
+    pub created_at: i64,
+    pub created_by: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -93,6 +108,19 @@ fn bot_row(r: &Row) -> rusqlite::Result<Bot> {
         hidden: r.get("hidden")?,
         unread: r.get("unread")?,
         created_at: r.get("created_at")?,
+        owner_id: r.get("owner_id")?,
+        // The column's CHECK allows only the two; anything else would fail closed.
+        visibility: Visibility::parse(&r.get::<_, String>("visibility")?).unwrap_or(Visibility::Private),
+    })
+}
+
+fn grant_row(r: &Row) -> rusqlite::Result<BotGrant> {
+    Ok(BotGrant {
+        bot_id: r.get("bot_id")?,
+        user_id: r.get("user_id")?,
+        level: Grant::parse(&r.get::<_, String>("level")?).unwrap_or(Grant::Viewer),
+        created_at: r.get("created_at")?,
+        created_by: r.get("created_by")?,
     })
 }
 
@@ -411,7 +439,37 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 4] = [migrate_approvals, migrate_audit_events, migrate_users, migrate_identities];
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 5] = [migrate_approvals, migrate_audit_events, migrate_users, migrate_identities, migrate_bot_acls];
+
+/// Bot ACLs (ADR 0016): an owner and a visibility per Bot, and per-user grants.
+/// Bots from before belong to the owner account (`operator`, break-glass) and stay
+/// shared, so everyone keeps the Bots they had. No foreign key on `owner_id`: the
+/// owner account is made after migrations run, and users are never deleted.
+fn migrate_bot_acls(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "ALTER TABLE bots ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'operator';
+        ALTER TABLE bots ADD COLUMN visibility TEXT NOT NULL DEFAULT 'shared' CHECK (visibility IN ('private', 'shared'));
+        CREATE INDEX bots_owner ON bots(owner_id);
+        CREATE TABLE bot_grants (
+          bot_id TEXT NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          level TEXT NOT NULL CHECK (level IN ('viewer', 'operator')),
+          created_at INTEGER NOT NULL,
+          created_by TEXT,
+          PRIMARY KEY (bot_id, user_id)
+        );
+        CREATE INDEX bot_grants_user ON bot_grants(user_id);",
+    )?;
+    let n: i64 = c.query_row("SELECT count(*) FROM bots", [], |r| r.get(0))?;
+    if n > 0 {
+        let details = serde_json::json!({ "bots": n, "owner": "operator", "visibility": "shared", "reason": "Bots from before ACLs" });
+        c.execute(
+            "INSERT INTO audit_events (at, actor_kind, actor_id, action, target_type, outcome, details) VALUES (?, 'system', 'migration', 'bot.acl_initialized', 'bot', 'success', ?)",
+            params![now(), details.to_string()],
+        )?;
+    }
+    Ok(())
+}
 
 /// SSO identities (ADR 0014): any number per user, each `(issuer, subject)` at most
 /// once. `users.idp_issuer`/`idp_subject` become the user's first identity and are
@@ -676,15 +734,73 @@ impl Db {
         self.c().query_row("SELECT * FROM bots WHERE id = ?", [id], bot_row).optional().ok().flatten()
     }
 
+    /// Owned by the owner account and shared, like every Bot from before ACLs.
     pub fn create_bot(&self, name: &str, color: &str, shape: &str, harness: &str, model: Option<&str>, primary: bool) -> Bot {
+        self.create_bot_owned(name, color, shape, harness, model, primary, crate::users::OPERATOR, Visibility::Shared)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_bot_owned(&self, name: &str, color: &str, shape: &str, harness: &str, model: Option<&str>, primary: bool, owner: &str, visibility: Visibility) -> Bot {
         let id = crate::short_id();
         self.c()
             .execute(
-                "INSERT INTO bots (id, name, color, shape, harness, model, primary_bot, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                params![id, name, color, shape, harness, model, primary, now()],
+                "INSERT INTO bots (id, name, color, shape, harness, model, primary_bot, created_at, owner_id, visibility) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![id, name, color, shape, harness, model, primary, now(), owner, visibility.as_str()],
             )
             .unwrap();
         self.bot(&id).unwrap()
+    }
+
+    // Bot ACLs (ADR 0016)
+
+    pub fn set_bot_owner(&self, id: &str, owner: &str) {
+        self.c().execute("UPDATE bots SET owner_id = ? WHERE id = ?", params![owner, id]).unwrap();
+    }
+
+    pub fn set_bot_visibility(&self, id: &str, v: Visibility) {
+        self.c().execute("UPDATE bots SET visibility = ? WHERE id = ?", params![v.as_str(), id]).unwrap();
+    }
+
+    pub fn grant(&self, bot_id: &str, user_id: &str) -> Option<Grant> {
+        self.c()
+            .query_row("SELECT * FROM bot_grants WHERE bot_id = ? AND user_id = ?", [bot_id, user_id], grant_row)
+            .optional()
+            .ok()
+            .flatten()
+            .map(|g| g.level)
+    }
+
+    /// A user's grants, by Bot id.
+    pub fn user_grants(&self, user_id: &str) -> std::collections::HashMap<String, Grant> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM bot_grants WHERE user_id = ?").unwrap();
+        s.query_map([user_id], grant_row).unwrap().filter_map(Result::ok).map(|g| (g.bot_id, g.level)).collect()
+    }
+
+    pub fn grants(&self, bot_id: &str) -> Vec<BotGrant> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM bot_grants WHERE bot_id = ? ORDER BY created_at, user_id").unwrap();
+        s.query_map([bot_id], grant_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Adds or changes a grant. Returns the level it had before.
+    pub fn set_grant(&self, bot_id: &str, user_id: &str, level: Grant, by: &str) -> Option<Grant> {
+        let before = self.grant(bot_id, user_id);
+        self.c()
+            .execute(
+                "INSERT INTO bot_grants (bot_id, user_id, level, created_at, created_by) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(bot_id, user_id) DO UPDATE SET level = ?3, created_at = ?4, created_by = ?5",
+                params![bot_id, user_id, level.as_str(), now(), by],
+            )
+            .unwrap();
+        before
+    }
+
+    /// Removes a grant. Returns its level, or None if there was none.
+    pub fn remove_grant(&self, bot_id: &str, user_id: &str) -> Option<Grant> {
+        let before = self.grant(bot_id, user_id)?;
+        self.c().execute("DELETE FROM bot_grants WHERE bot_id = ? AND user_id = ?", [bot_id, user_id]).unwrap();
+        Some(before)
     }
 
     pub fn update_bot(&self, id: &str, p: BotPatch) {
@@ -1401,10 +1517,51 @@ mod tests {
         let db = Db::open(&path).unwrap();
         assert_eq!(db.global_policy().mode, Mode::Bypass);
         assert_eq!(db.bots().len(), 1);
-        // Reopening doesn't re-run the migration.
+        // Reopening doesn't re-run the migrations.
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(all_events(&db).len(), 1);
+        let actions: Vec<String> = all_events(&db).into_iter().map(|e| e.action).collect();
+        assert_eq!(actions, ["bot.acl_initialized", "policy.initialized"]);
+    }
+
+    /// Rewinds a database to before bot ACLs, so a test can set `user_version` lower.
+    const UNDO_BOT_ACLS: &str = "DROP TABLE bot_grants; DROP INDEX bots_owner; ALTER TABLE bots DROP COLUMN visibility; ALTER TABLE bots DROP COLUMN owner_id;";
+
+    #[test]
+    fn upgrade_gives_existing_bots_to_the_owner_shared() {
+        let path = temp_path("acl-upgrade").join("app.sqlite");
+        let db = Db::open(&path).unwrap();
+        let old = db.create_bot("Old", "#fff", "waddle", "claude", None, true);
+        db.c().execute_batch(&format!("{UNDO_BOT_ACLS} PRAGMA user_version = 4;")).unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        let b = db.bot(&old.id).unwrap();
+        assert_eq!((b.owner_id.as_str(), b.visibility), ("operator", Visibility::Shared));
+        let e = &all_events(&db)[0];
+        assert_eq!((e.action.as_str(), e.actor_id.as_deref(), e.details["bots"].as_i64()), ("bot.acl_initialized", Some("migration"), Some(1)));
+
+        // Grants: one per user and Bot, gone with the Bot, and the schema refuses unknown words.
+        let u = db.create_user(None, Some("g@example.com"), "G", Role::Member).unwrap();
+        let mine = db.create_bot_owned("Mine", "#fff", "waddle", "claude", None, false, &u.id, Visibility::Private);
+        assert_eq!((mine.owner_id.as_str(), mine.visibility), (u.id.as_str(), Visibility::Private));
+        assert_eq!(db.set_grant(&old.id, &u.id, Grant::Viewer, "operator"), None);
+        assert_eq!(db.set_grant(&old.id, &u.id, Grant::Operator, "operator"), Some(Grant::Viewer));
+        assert_eq!(db.grants(&old.id).len(), 1);
+        assert_eq!(db.user_grants(&u.id).get(&old.id), Some(&Grant::Operator));
+        let c = db.c();
+        assert!(c.execute("UPDATE bots SET visibility = 'public' WHERE id = ?", [&old.id]).is_err());
+        assert!(c.execute("UPDATE bot_grants SET level = 'owner'", []).is_err());
+        drop(c);
+        db.set_bot_visibility(&old.id, Visibility::Private);
+        db.set_bot_owner(&old.id, &u.id);
+        assert_eq!(db.bot(&old.id).map(|b| (b.owner_id, b.visibility)), Some((u.id.clone(), Visibility::Private)));
+        assert_eq!(db.remove_grant(&old.id, &u.id), Some(Grant::Operator));
+        assert_eq!(db.remove_grant(&old.id, &u.id), None);
+        let other = db.create_user(None, Some("o@example.com"), "O", Role::Member).unwrap();
+        db.set_grant(&mine.id, &other.id, Grant::Viewer, &u.id);
+        assert_eq!(db.grants(&mine.id).len(), 1);
+        db.delete_bot(&mine.id);
+        assert!(db.grants(&mine.id).is_empty() && db.grant(&mine.id, &other.id).is_none());
     }
 
     #[test]
@@ -1519,7 +1676,9 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let bot = db.create_bot("Kept", "#fff", "waddle", "claude", None, true);
         // As a database from before users: no user tables, user_version 2.
-        db.c().execute_batch("DROP TABLE user_identities; DROP TABLE login_codes; DROP TABLE sessions; DROP TABLE users; PRAGMA user_version = 2;").unwrap();
+        db.c()
+            .execute_batch(&format!("{UNDO_BOT_ACLS} DROP TABLE user_identities; DROP TABLE login_codes; DROP TABLE sessions; DROP TABLE users; PRAGMA user_version = 2;"))
+            .unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();
         assert_eq!(db.bot(&bot.id).map(|b| b.name), Some("Kept".into()));
@@ -1539,7 +1698,7 @@ mod tests {
         let u = db.create_user(None, None, "Linked", Role::Member).unwrap();
         db.c()
             .execute_batch(&format!(
-                "DROP TABLE user_identities; ALTER TABLE sessions DROP COLUMN idp_subject;
+                "{UNDO_BOT_ACLS} DROP TABLE user_identities; ALTER TABLE sessions DROP COLUMN idp_subject;
                  UPDATE users SET idp_issuer = 'https://idp.example', idp_subject = 's1' WHERE id = '{}'; PRAGMA user_version = 3;",
                 u.id
             ))
