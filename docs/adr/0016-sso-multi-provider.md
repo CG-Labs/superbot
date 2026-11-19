@@ -1,4 +1,4 @@
-# 0015: Several SSO providers: Google, generic OIDC, and account linking
+# 0016: Several SSO providers: Google, generic OIDC, and account linking
 
 ## Status
 
