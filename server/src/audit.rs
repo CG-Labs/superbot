@@ -253,14 +253,19 @@ fn redact_pairs(s: &str) -> String {
             i = key_end;
             continue;
         }
+        // `"token": 1` is JSON: a bare value ends at `,`, `}`, or `]`. Otherwise it's a
+        // shell or form argument, which ends only where the shell word (or field) does.
+        let json = b[key_end..j].contains(&b'"');
+        let outer = (!json).then(|| ['\'', '"'].into_iter().find(|&q| s[..i].matches(q).count() % 2 == 1)).flatten();
         j += 1;
         j += b[j..].iter().take_while(|&&c| c == b' ').count();
         let open = b[j..].iter().take_while(|&&c| matches!(c, b'"' | b'\'' | b'\\')).count();
         let mut start = j + open;
-        let word = |at: usize| at + b[at..].iter().take_while(|&&c| !c.is_ascii_whitespace() && !b",;&}])\"'".contains(&c)).count();
-        if open == 0 && is_auth_scheme(&s[start..word(start)]) {
+        let word = |at: usize| if json { json_word(b, at) } else { shell_word(s, at, outer) };
+        let scheme = b[start..].iter().take_while(|&&c| c.is_ascii_alphabetic()).count();
+        if open == 0 && is_auth_scheme(&s[start..start + scheme]) && b.get(start + scheme) == Some(&b' ') {
             // Authorization: Bearer <x>: keep the scheme, mask the credential.
-            start = word(start);
+            start += scheme;
             start += b[start..].iter().take_while(|&&c| c == b' ').count();
         }
         let end = match &s[j..j + open] {
@@ -278,6 +283,30 @@ fn redact_pairs(s: &str) -> String {
     }
     out.push_str(&s[copied..]);
     out
+}
+
+/// End of a bare JSON value (number, `true`, ...).
+fn json_word(b: &[u8], at: usize) -> usize {
+    at + b[at..].iter().take_while(|&&c| !c.is_ascii_whitespace() && !b",}]\"".contains(&c)).count()
+}
+
+/// End of an unquoted shell or form value. Inside a quoted argument (`outer`) it runs
+/// to the closing quote or the next `&` field; outside, to whitespace, `&`, or `;`,
+/// taking any quoted part along (`pa"ss word"`).
+fn shell_word(s: &str, at: usize, outer: Option<char>) -> usize {
+    let b = s.as_bytes();
+    let mut e = at;
+    while e < b.len() {
+        let c = b[e];
+        match outer {
+            Some(q) if c == q as u8 || c == b'&' => break,
+            Some(_) => e += 1,
+            None if c.is_ascii_whitespace() || c == b'&' || c == b';' => break,
+            None if c == b'"' || c == b'\'' => e = s[e + 1..].find(c as char).map_or(b.len(), |n| e + n + 2),
+            None => e += 1,
+        }
+    }
+    e
 }
 
 fn key_char(c: u8) -> bool {
@@ -366,8 +395,11 @@ fn redact_word(word: &str) -> (String, Mask) {
             if value.is_empty() {
                 return (word.into(), Mask::Word); // password: <x>
             }
-            if value.trim_start_matches(['"', '\'', '\\']).starts_with(REDACTED) {
-                return (word.into(), quoted(word)); // already masked by redact_pairs
+            // Already masked by redact_pairs, up to a quote or the next field.
+            if let Some(rest) = value.trim_start_matches(['"', '\'', '\\']).strip_prefix(REDACTED)
+                && (rest.is_empty() || rest.starts_with(['"', '\'', '\\', '&', ';']))
+            {
+                return (word.into(), quoted(word));
             }
             return (format!("{key}{}{REDACTED}", &bare[i..=i]), quoted(word));
         }
@@ -708,7 +740,7 @@ mod tests {
         assert_eq!(redact_text("export DB_PASSWORD='a b c'; run"), "export DB_PASSWORD='[redacted]'; run");
         assert_eq!(redact_text("curl -u 'admin:my pass word' https://x"), "curl -u 'admin:[redacted] https://x");
         assert_eq!(redact_text("curl --user=\"admin:my pass\" https://x"), "curl --user=\"admin:[redacted] https://x");
-        assert_eq!(redact_text("run \"password=my secret\" next"), "run \"password=[redacted] next");
+        assert_eq!(redact_text("run \"password=my secret\" next"), "run \"password=[redacted]\" next");
         assert_eq!(redact_text("login --token \"it's a secret\" ok"), "login --token [redacted] ok");
         assert_eq!(redact_text("tool --password 'never closed and more"), "tool --password [redacted] ");
         assert_eq!(redact_text("echo 'hello world' --password 'x y'"), "echo 'hello world' --password [redacted] ");
@@ -725,6 +757,10 @@ mod tests {
         );
         assert_eq!(redact_text("user[password][]=hunter2"), "user[password][]=[redacted]");
         assert_eq!(redact_text("user%5Bpassword%5D=hunter2&x=1"), "user%5Bpassword%5D=[redacted]&x=1");
+        assert_eq!(redact_text("curl --password=abc,def}x] https://x"), "curl --password=[redacted] https://x");
+        assert_eq!(redact_text("tool --token=ab\"c d\"e next"), "tool --token=[redacted] next");
+        assert_eq!(redact_text("curl -d 'password=a b,c&x=1' u"), "curl -d 'password=[redacted]&x=1' u");
+        assert_eq!(redact_text("PASSWORD=abc;echo ok"), "PASSWORD=[redacted];echo ok");
         assert_eq!(redact_text(r#"{"message":"my token is mine","n":2}"#), r#"{"message":"my token is mine","n":2}"#);
         assert_eq!(redact_text("token=é€x y"), "token=[redacted] y");
         assert_eq!(redact_text("pässword=ü token:'é"), "pässword=ü token:'[redacted]");
