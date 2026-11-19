@@ -290,7 +290,10 @@ pub async fn login(Extension(a): Extension<Arc<Auth>>, Extension(source): Extens
     if let Some(retry) = a.limiter.blocked(&ip, at) {
         return too_many(retry);
     }
-    let label: Option<String> = v["label"].as_str().map(|l| crate::audit::clip(l.trim(), 60)).filter(|l| !l.is_empty());
+    let label: Option<String> = v["label"]
+        .as_str()
+        .map(|l| crate::audit::clip(&crate::secrets::redact::text(&crate::audit::redact_text(l.trim())), 60))
+        .filter(|l| !l.is_empty());
     let code = v["code"].as_str().map(str::trim).filter(|c| !c.is_empty());
     let password = v["password"].as_str().filter(|p| !p.is_empty());
     let (user, method) = match (code, password) {

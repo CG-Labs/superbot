@@ -348,13 +348,6 @@ fn run(args: &[String]) -> Result<String, String> {
         [verb @ ("approve" | "deny"), id, rest @ ..] => decide(verb, id, rest),
         ["audit", "export", rest @ ..] => api(Cred::Operator, "GET", &format!("/api/audit/export.csv{}", audit_query(rest)?), None),
         ["audit", rest @ ..] => op("GET", &format!("/api/audit{}", audit_query(rest)?), None),
-        ["secrets"] => op("GET", "/api/secrets", None),
-        ["secret", "set", name] => {
-            let name = env_name(name)?;
-            let body = json!({ "value": stdin_value(std::io::stdin())? }).to_string();
-            op("PUT", &format!("/api/secrets/{name}"), Some(body)).map(|_| format!("Saved {name}. Bots get it as ${name} from their next run."))
-        }
-        ["secret", "rm" | "delete", name] => op("DELETE", &format!("/api/secrets/{}", env_name(name)?), None).map(|_| "Deleted.".into()),
 
         ["login", rest @ ..] if rest.len() <= 1 => {
             let res: Value = serde_json::from_str(&api(Cred::Anonymous, "POST", "/api/auth/login", Some(login_body(rest.first().copied())?.to_string()))?).map_err(|e| e.to_string())?;
@@ -385,6 +378,13 @@ fn run(args: &[String]) -> Result<String, String> {
         ["sessions", key] => op("GET", &format!("/api/sessions?user={}", encode(key)), None),
         ["session", "revoke", id] => op("DELETE", &format!("/api/sessions/{}", encode(id)), None).map(|_| "Revoked.".into()),
         ["session", "revoke-all", key] => op("DELETE", &format!("/api/users/{}/sessions", encode(key)), None),
+        ["secrets"] => op("GET", "/api/secrets", None),
+        ["secret", "set", name] => {
+            let name = env_name(name)?;
+            let body = json!({ "value": stdin_value(std::io::stdin())? }).to_string();
+            op("PUT", &format!("/api/secrets/{name}"), Some(body)).map(|_| format!("Saved {name}. Bots get it as ${name} from their next run."))
+        }
+        ["secret", "rm" | "delete", name] => op("DELETE", &format!("/api/secrets/{}", env_name(name)?), None).map(|_| "Deleted.".into()),
         ["help", "admin"] | ["admin"] => Ok(ADMIN_HELP.into()),
         _ => Ok(HELP.into()),
     }
