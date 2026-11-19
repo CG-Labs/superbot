@@ -70,6 +70,16 @@ Open `https://your-domain` and log in with any username and the saved password.
 
 Release binaries are installed system-wide in `/usr/local/bin` so `botctl` stays next to `botd` on the Bots' PATH. To use user-local installs instead, set `BIN_DIR` before running the script (advanced).
 
+## Approvals after an upgrade
+
+Fresh installs ask before risky actions. An install from before approvals keeps running without them (`bypass`) after `--upgrade`, and botd logs a warning at start. To opt in, on the server:
+
+```sh
+sudo -u superbot env SUPERBOT_PASSWORD="$(sudo grep -oP '^AUTH_PASSWORD=\K.*' ~superbot/superbot/.env)" botctl policy set global mode=ask
+```
+
+Or use the switch at the bottom of the web app's Approvals window. Don't put `SUPERBOT_PASSWORD` in `.env`: it's for your shell. See [docs/backend.md](../docs/backend.md#approvals).
+
 ## Computer / screens
 
 For Xvfb, browser automation, and live screens, run [`install-computer.sh`](install-computer.sh) after the base install.
