@@ -1,6 +1,6 @@
 import * as SecureStore from "expo-secure-store";
 import { Platform } from "react-native";
-import { loadSavedCredentials, saveCredentials } from "../auth";
+import { defaultServerUrl, LOCAL_SERVER_URL, loadSavedCredentials, saveCredentials } from "../auth";
 
 jest.mock("expo-secure-store", () => ({
   setItemAsync: jest.fn(),
@@ -49,5 +49,21 @@ describe("saved credentials", () => {
     const password = crypto.randomUUID();
     await saveCredentials({ baseUrl: BASE, password });
     expect(SecureStore.setItemAsync).toHaveBeenCalledWith("superbot.password", password);
+  });
+});
+
+describe("default server URL", () => {
+  const served = { protocol: "https:", origin: BASE };
+
+  it("is the page's origin for a web build the server hosts", () => {
+    expect(defaultServerUrl("web", served, false)).toBe(BASE);
+    expect(defaultServerUrl("web", { protocol: "http:", origin: "http://localhost" }, false)).toBe("http://localhost");
+  });
+
+  it("stays local for the dev server, Electron, and native", () => {
+    expect(defaultServerUrl("web", served, true)).toBe(LOCAL_SERVER_URL);
+    expect(defaultServerUrl("web", { protocol: "file:", origin: "null" }, false)).toBe(LOCAL_SERVER_URL);
+    expect(defaultServerUrl("web", undefined, false)).toBe(LOCAL_SERVER_URL);
+    expect(defaultServerUrl("ios", served, false)).toBe(LOCAL_SERVER_URL);
   });
 });

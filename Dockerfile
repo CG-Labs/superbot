@@ -5,6 +5,21 @@
 ARG DEBIAN_RELEASE=trixie
 ARG RUST_IMAGE=rust:1-${DEBIAN_RELEASE}
 ARG NODE_IMAGE=node:22-${DEBIAN_RELEASE}-slim
+ARG CADDY_IMAGE=caddy:2
+
+# The web client (apps/client), exported for the /app/ path.
+FROM ${NODE_IMAGE} AS client
+WORKDIR /src/apps/client
+ENV CI=1 EXPO_NO_TELEMETRY=1 ELECTRON_SKIP_BINARY_DOWNLOAD=1
+COPY apps/client/package.json apps/client/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
+COPY apps/client ./
+RUN SUPERBOT_WEB_BASE_URL=/app npx expo export --platform web --output-dir /out/app
+
+# Compose's Caddy (`target: caddy`): stock Caddy plus the client, so each rebuild ships the
+# client from this checkout. The Caddyfile is mounted from deploy/docker/.
+FROM ${CADDY_IMAGE} AS caddy
+COPY --from=client /out/app /srv/superbot-app
 
 FROM ${RUST_IMAGE} AS build
 WORKDIR /src
