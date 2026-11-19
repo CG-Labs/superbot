@@ -155,11 +155,12 @@ impl Secrets {
         self.writable()?.delete(name)
     }
 
-    /// Every name, store by store, marking names an earlier store overrides.
+    /// Names Bots can get, store by store, marking names an earlier store overrides.
+    /// botd's own (AUTH_PASSWORD, SUPERBOT_*) are left out: Bots never receive them.
     pub fn list(&self) -> Result<Vec<Listed>, Error> {
         let mut out: Vec<Listed> = Vec::new();
         for s in &self.stores {
-            for name in s.names()? {
+            for name in s.names()?.into_iter().filter(|n| check_name(n).is_ok()) {
                 let shadowed_by = out.iter().find(|l| l.name == name).map(|l| l.store);
                 out.push(Listed { name, store: s.kind(), writable: s.writable(), shadowed_by });
             }
@@ -293,7 +294,7 @@ mod tests {
 
     #[test]
     fn environment_wins_and_stored_values_reach_harnesses() {
-        let s = secrets(&[("GITHUB_TOKEN", "from-env-value-1")]);
+        let s = secrets(&[("GITHUB_TOKEN", "from-env-value-1"), ("AUTH_PASSWORD", "pw"), ("SUPERBOT_MASTER_KEY_FILE", "/k")]);
         let stored = format!("stored-{}", crate::random_hex(8));
         s.put("GITHUB_TOKEN", "from-db-value-1").unwrap();
         let l = s.put("OPENAI_API_KEY", &stored).unwrap();
@@ -302,6 +303,7 @@ mod tests {
         assert_eq!(s.get("OPENAI_API_KEY").unwrap().unwrap().expose(), stored);
 
         let list = s.list().unwrap();
+        assert!(!list.iter().any(|l| l.name == "AUTH_PASSWORD" || l.name.starts_with("SUPERBOT_")), "{list:?}");
         let gh: Vec<_> = list.iter().filter(|l| l.name == "GITHUB_TOKEN").collect();
         assert_eq!(gh.len(), 2);
         assert_eq!((gh[0].store, gh[0].shadowed_by), ("env", None));
