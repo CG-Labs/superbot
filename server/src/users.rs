@@ -21,7 +21,9 @@ use std::sync::{Arc, Mutex};
 pub const OPERATOR: &str = "operator";
 pub const SESSION_PREFIX: &str = "sbs_";
 pub const CODE_PREFIX: &str = "sbc_";
-pub const COOKIE: &str = "superbot_session";
+/// `__Host-` makes browsers refuse this cookie unless it is Secure, Path=/, and set by
+/// this exact host, so a sibling subdomain can't plant or overwrite it.
+pub const COOKIE: &str = "__Host-superbot_session";
 
 /// A new random secret: `prefix` plus 256 bits as hex.
 pub fn new_secret(prefix: &str) -> String {
@@ -159,7 +161,7 @@ impl Limiter {
 
 // Cookies and CSRF.
 
-/// The session token from `Cookie: superbot_session=...`, if any.
+/// The session token from `Cookie: __Host-superbot_session=...`, if any.
 pub fn cookie_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get_all(header::COOKIE)
@@ -178,13 +180,14 @@ pub fn session_cookie(token: &str, max_age_ms: i64) -> String {
 }
 
 pub fn clear_cookie() -> &'static str {
-    "superbot_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0"
+    "__Host-superbot_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0"
 }
 
-/// For cookie-authenticated writes: the browser says the request comes from this
-/// site. `Origin` must name the Host we were reached on; without it, `Sec-Fetch-Site`
-/// must not be cross-site. A request with neither isn't from a browser page, and
-/// SameSite=Strict already kept the cookie off cross-site requests.
+/// For writes on credentials the browser sends by itself (the session cookie, a cached
+/// break-glass password, or none at all with ALLOW_NO_AUTH): the browser says the request
+/// comes from this site. `Origin` must name the Host we were reached on; without it,
+/// `Sec-Fetch-Site` must not be cross-site. Browsers send one of them on every cross-site
+/// write, so a request with neither isn't from a browser page.
 pub fn same_origin(headers: &HeaderMap) -> bool {
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
     if let Some(origin) = headers.get(header::ORIGIN) {
@@ -506,7 +509,7 @@ pub fn record_created(app: &AppState, by: &Who, u: &User, reason: Option<&str>) 
 /// `{name?, email?, role?, status?: "active" | "disabled"}`. Disabling ends the
 /// user's sessions. The owner account can't be demoted or disabled: it is the way
 /// back in (turn off AUTH_BREAK_GLASS instead).
-pub async fn update_user(State(app): State<AppState>, Extension(by): Extension<Who>, Path(key): Path<String>, Json(v): Json<Value>) -> Res {
+pub async fn update_user(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path(key): Path<String>, Json(v): Json<Value>) -> Res {
     let before = need_user_key(&app, &key)?;
     let mut p = UserPatch { name: clean_name(&v["name"])?, ..Default::default() };
     match &v["email"] {
@@ -550,6 +553,7 @@ pub async fn update_user(State(app): State<AppState>, Extension(by): Extension<W
         if after.active() {
             app.db.record(&ev("user.enabled"));
         } else {
+            a.sso.forget_user(&after.id);
             let n = app.db.revoke_user_sessions(&after.id, by.actor.id.as_deref().unwrap_or(""), "user disabled");
             app.db.record(&ev("user.disabled").details(json!({ "sessionsRevoked": n })));
         }
@@ -627,9 +631,16 @@ pub async fn revoke_session(State(app): State<AppState>, Extension(by): Extensio
     Ok(Json(json!({ "ok": true })))
 }
 
-pub async fn revoke_user_sessions(State(app): State<AppState>, Extension(by): Extension<Who>, Path(key): Path<String>) -> Res {
+pub async fn revoke_user_sessions(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path(key): Path<String>) -> Res {
     let u = need_user_key(&app, &key)?;
+    // Codes go first: a redemption holds them until its session exists, so either that
+    // session is made in time to be revoked below or the code is already gone.
+    a.sso.forget_user(&u.id);
     let n = app.db.revoke_user_sessions(&u.id, by.actor.id.as_deref().unwrap_or(""), "revoked by admin");
+    // A screen link doesn't know who opened it, so they all change.
+    if let Some(screens) = &app.screens {
+        screens.rotate_all().await;
+    }
     app.db.record(&by.event("session.revoked_all").target("user", &u.id).details(json!({ "count": n })));
     Ok(Json(json!({ "revoked": n })))
 }
@@ -714,11 +725,15 @@ mod tests {
     #[test]
     fn cookies_and_origins() {
         let mut h = HeaderMap::new();
-        h.insert(header::COOKIE, "a=1; superbot_session=sbs_x ; b=2".parse().unwrap());
+        h.insert(header::COOKIE, "a=1; __Host-superbot_session=sbs_x ; b=2".parse().unwrap());
         assert_eq!(cookie_token(&h).as_deref(), Some("sbs_x"));
         let mut h2 = HeaderMap::new();
-        h2.insert(header::COOKIE, "xsuperbot_session=sbs_y".parse().unwrap());
+        h2.insert(header::COOKIE, "x__Host-superbot_session=sbs_y".parse().unwrap());
         assert_eq!(cookie_token(&h2), None);
+        // The old name, which a sibling subdomain could plant, is not read.
+        let mut h3 = HeaderMap::new();
+        h3.insert(header::COOKIE, "superbot_session=sbs_z".parse().unwrap());
+        assert_eq!(cookie_token(&h3), None);
         let c = session_cookie("sbs_x", 3_600_000);
         for attr in ["HttpOnly", "Secure", "SameSite=Strict", "Path=/", "Max-Age=3600"] {
             assert!(c.contains(attr), "{c}");

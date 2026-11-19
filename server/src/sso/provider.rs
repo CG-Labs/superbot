@@ -485,8 +485,16 @@ impl Provider {
                     return Err(Invalid("wrong_issuer"));
                 }
                 let oid = t.str("oid").and_then(guid).ok_or(Invalid("missing_subject"))?;
-                // Entra's `email` is informational only (it isn't verified), so we never look anyone up by it.
-                Ok(Claims { issuer: iss.into(), subject: oid, tenant: Some(tid), email: t.str("email").map(String::from), name, username: None })
+                // Entra's `email` is whatever the account's tenant typed in (nOAuth), so it is kept only
+                // when the optional `xms_edov` claim says that tenant owns the email's domain.
+                let edov = match t.claims.get("xms_edov") {
+                    Some(Value::Bool(b)) => *b,
+                    Some(Value::String(s)) => s == "true" || s == "1",
+                    Some(Value::Number(n)) => n.as_u64() == Some(1),
+                    _ => false,
+                };
+                let email = t.str("email").filter(|_| edov).map(|e| e.trim().to_string()).filter(|e| !e.is_empty() && e.len() <= 254);
+                Ok(Claims { issuer: iss.into(), subject: oid, tenant: Some(tid), email, name, username: None })
             }
             // Identities are stored under the configured issuer, so a link made with
             // `botctl user link` and a sign-in name the same one.
@@ -592,6 +600,25 @@ mod tests {
         assert_eq!(p.claims(&token(T1, &iss(T2), Some(OID)), &m).err(), Some(Invalid("wrong_issuer")), "iss must match tid");
         assert_eq!(p.claims(&token(T1, "https://evil.example/t/v2.0", Some(OID)), &m).err(), Some(Invalid("wrong_issuer")));
         assert_eq!(p.claims(&token(T1, &iss(T1), None), &m).err(), Some(Invalid("missing_subject")), "sub alone is not enough");
+    }
+
+    #[test]
+    fn entra_email_counts_only_when_its_domain_is_verified() {
+        let p = entra(T1, &[]);
+        let m = meta(&iss(T1));
+        let with = |edov: Value| {
+            let mut c = json!({ "iss": iss(T1), "tid": T1, "oid": OID, "email": "ceo@example.com" });
+            if !edov.is_null() {
+                c["xms_edov"] = edov;
+            }
+            p.claims(&jwt::decode(&keys()[0].sign(&c)).unwrap(), &m).unwrap().email
+        };
+        for ok in [json!(true), json!("true"), json!("1"), json!(1)] {
+            assert_eq!(with(ok.clone()).as_deref(), Some("ceo@example.com"), "{ok}");
+        }
+        for no in [Value::Null, json!(false), json!("false"), json!(0), json!("yes")] {
+            assert_eq!(with(no.clone()), None, "{no}: any tenant can type in any email");
+        }
     }
 
     #[test]

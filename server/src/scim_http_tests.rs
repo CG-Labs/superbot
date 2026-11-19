@@ -428,7 +428,7 @@ async fn an_sso_linked_tenant_provisions_people_who_then_sign_in() {
     let (path, binder) = to_callback(port, &format!("/api/auth/sso/{sso}/start")).await;
     let (code, head, _) = call_with(port, "GET", &path, "", &binder, "").await;
     assert_eq!(code, 200, "{head}");
-    let cookie = set_cookies(&head).into_iter().find(|c| c.starts_with("superbot_session=sbs_")).unwrap();
+    let cookie = set_cookies(&head).into_iter().find(|c| c.starts_with("__Host-superbot_session=sbs_")).unwrap();
     let cookie = format!("Cookie: {}\r\n", cookie.split(';').next().unwrap());
     let (_, _, who) = call_with(port, "GET", "/api/auth/me", "", &cookie, "").await;
     assert_eq!(parse(&who)["user"]["id"].as_str(), Some(id.as_str()));
