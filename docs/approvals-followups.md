@@ -8,7 +8,7 @@ Work left after the approvals MVP ([ADR 0007](adr/0007-approvals.md)). Each item
 4. **Policy editor in the apps.** The web app and client switch ask/bypass globally and per Bot. Add class actions, the timeout, and the rule list (view, add, delete), which today need `botctl` or the API.
 5. **Audit export.** `GET /api/audit` is JSON only. Add CSV export and a viewer, as the M1 exit criteria ask.
 6. **Notifications.** Approvals wait silently unless an app is open. Push notifications (client), email, or Slack, with a deep link to the approval.
-7. **Smarter command analysis.** The shell classifier is lexical. Consider a real shell parser, resolving script files the Bot runs (`./cleanup.sh`), and flagging `eval`/`base64 -d | sh` patterns as risky.
+7. **Smarter command analysis.** Commands are parsed (`server/src/shell.rs`), but script files the Bot runs (`./cleanup.sh`, `python x.py`) aren't read, and decoded payloads (`base64 -d | sh`) aren't flagged.
 8. **Approve once per run.** Let a person approve "this kind of call for the rest of this task" without saving a permanent rule.
 9. **Sandbox defaults.** Turn on Codex's sandbox (`workspace-write`) and similar options as defense in depth, separate from approvals.
 10. **Pi canary coverage.** The unguarded-run canary keys off shell tool names (`bash`, `shell`). Extend it to every tool once each harness reports hook calls reliably.
