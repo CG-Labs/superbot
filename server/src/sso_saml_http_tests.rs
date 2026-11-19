@@ -10,7 +10,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use std::collections::HashMap;
 
 const ADFS: &str = "http://adfs.example.com/adfs/services/trust";
-const NAME_ID: &str = "_a1b2c3-persistent";
+const NAME_ID: &str = "G-94f06852-D353-persistent";
+/// How botd stores it: Keycloak lowercases the NameID it passes on, so botd compares without case.
+const STORED: &str = "g-94f06852-d353-persistent";
 
 /// What Keycloak puts in its ID token after a login brokered through its IdP `adfs`, with
 /// User Session Note mappers for `identity_provider` and `identity_provider_identity`.
@@ -52,18 +54,19 @@ async fn saml_bridge_signs_in_only_people_the_saml_idp_vouched_for() {
     let (code, head) = web_sign_in(port, &id).await;
     assert_eq!((code, header(&head, "location").as_deref()), (303, Some("/login?error=sso_not_linked")));
     let f = &failures(port, &admin).await[0]["details"];
-    assert_eq!((f["reason"].as_str(), f["subject"].as_str(), f["issuer"].as_str(), f["idp"].as_str()), (Some("not_linked"), Some(NAME_ID), Some(ADFS), Some("saml")));
+    assert_eq!((f["reason"].as_str(), f["subject"].as_str(), f["issuer"].as_str(), f["idp"].as_str()), (Some("not_linked"), Some(STORED), Some(ADFS), Some("saml")));
 
     let u = app.db.create_user(None, Some("ada@corp.example"), "Ada", Role::Member).unwrap();
     let (code, i) = call(port, "POST", &format!("/api/users/{}/identities", u.id), &admin, &json!({ "provider": id, "subject": NAME_ID }).to_string()).await;
     assert_eq!(code, 201, "{i}");
-    assert_eq!(serde_json::from_str::<Value>(&i).unwrap()["issuer"].as_str(), Some(ADFS), "linked under the SAML IdP, not the broker");
+    let i: Value = serde_json::from_str(&i).unwrap();
+    assert_eq!((i["issuer"].as_str(), i["subject"].as_str()), (Some(ADFS), Some(STORED)), "linked under the SAML IdP, not the broker, as typed from the IdP");
 
     let (path, binder) = to_callback(port, &format!("/api/auth/sso/{id}/start")).await;
     let (code, head, _) = call_with(port, "GET", &path, "", &binder, "").await;
     assert_eq!((code, signed_in_as(port, &head).await), (200, Some(u.id.clone())));
     let login = &audit_list(&call(port, "GET", "/api/audit?action=auth.login", &admin, "").await.1)[0];
-    assert_eq!((login["actorSubject"].as_str(), login["details"]["idp"].as_str(), login["details"]["provider"].as_str()), (Some(format!("{ADFS}|{NAME_ID}").as_str()), Some("saml"), Some(id.as_str())));
+    assert_eq!((login["actorSubject"].as_str(), login["details"]["idp"].as_str(), login["details"]["provider"].as_str()), (Some(format!("{ADFS}|{STORED}").as_str()), Some("saml"), Some(id.as_str())));
 
     // Replayed: the same callback again finds no pending sign-in.
     let (_, head, _) = call_with(port, "GET", &path, "", &binder, "").await;
@@ -141,10 +144,10 @@ async fn the_app_signs_in_through_the_bridge_and_just_in_time_gets_the_role_set(
     assert_eq!(code, 200, "{res}");
     let res: Value = serde_json::from_str(&res).unwrap();
     assert_eq!((res["user"]["role"].as_str(), res["user"]["email"].as_str(), res["user"]["name"].as_str()), (Some("readonly"), Some("ada@example.com"), Some("Ada Lovelace")));
-    let (identity, user) = app.db.identity(ADFS, NAME_ID).expect("stored under the IdP's entity ID and NameID");
+    let (identity, user) = app.db.identity(ADFS, STORED).expect("stored under the IdP's entity ID and NameID");
     assert_eq!((identity.provider.as_str(), user.email.as_deref()), (id.as_str(), Some("ada@example.com")));
     let created = audit_list(&call(port, "GET", "/api/audit?action=user.created", &admin, "").await.1);
-    assert!(created.iter().any(|e| e["details"]["subject"] == NAME_ID && e["details"]["issuer"] == ADFS));
+    assert!(created.iter().any(|e| e["details"]["subject"] == STORED && e["details"]["issuer"] == ADFS));
 
     // The same RBAC as everyone else: a read-only user can't make Bots.
     let auth = format!("Bearer {}", res["token"].as_str().unwrap());

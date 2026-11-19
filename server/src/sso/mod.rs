@@ -1093,7 +1093,8 @@ mod tests {
         assert_eq!((p.env_var(), p.audience()), ("SSO_ADFS_CLIENT_SECRET".to_string(), format!("anyone SAML IdP {ADFS} signs in (broker alias adfs)")));
         assert_eq!(p.issuer_for(None).unwrap(), (ADFS.to_string(), None), "identities live under the SAML IdP, not the broker");
         assert!(p.issuer_for(Some(T1)).is_err());
-        assert_eq!(p.subject(" _a1b2c3 ").unwrap(), "_a1b2c3");
+        assert_eq!(p.subject(" G-A1b2C3 ").unwrap(), "g-a1b2c3");
+        assert!(p.subject("").is_err() && p.subject(&"x".repeat(256)).is_err());
         assert_eq!(s.redirect_uri("adfs"), "https://bot.example.com/api/auth/sso/adfs/callback");
 
         let s = saml(&[("SSO_ADFS_ALLOWED_DOMAINS", "example.com"), ("SSO_ADFS_JIT_ROLE", "member"), ("SSO_ADFS_LABEL", "Contoso"), ("SSO_ADFS_SUBJECT_CLAIM", "saml_nameid")]).unwrap();

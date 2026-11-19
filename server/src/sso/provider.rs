@@ -348,6 +348,7 @@ impl Provider {
         match self.kind {
             Kind::Entra { .. } => guid(s).ok_or_else(|| "subject must be the user's Entra object id (a GUID)".into()),
             Kind::GitHub { .. } => github::user_id(s).ok_or_else(|| "subject must be the GitHub user's numeric id (gh api users/<login> --jq .id), not the login".into()),
+            Kind::Saml { .. } if !s.is_empty() && s.len() <= 255 => Ok(saml::subject(s)),
             _ if !s.is_empty() && s.len() <= 255 => Ok(s.into()),
             _ => Err("subject must be 1 to 255 characters".into()),
         }
@@ -511,7 +512,7 @@ impl Provider {
                 if t.str(saml::IDP_CLAIM) != Some(alias.as_str()) {
                     return Err(Invalid("not_brokered"));
                 }
-                let subject = subject_of(t, &map.subject)?;
+                let subject = saml::subject(&subject_of(t, &map.subject)?);
                 let email = email_within(t, &map.email, allowed_domains)?;
                 Ok(Claims { issuer: entity_id.clone(), subject, tenant: None, email, name: name_in(&map.name), username: None })
             }
@@ -771,6 +772,8 @@ mod tests {
         let c = p.claims(&signed(brokered(json!({}))), &m).unwrap();
         assert_eq!((c.issuer.as_str(), c.subject.as_str(), c.email.as_deref(), c.name.as_deref()), (ADFS, "_a1b2c3-persistent", Some("ada@example.com"), Some("Ada Lovelace")));
         assert_eq!(c.key(), format!("{ADFS}|_a1b2c3-persistent"), "not the broker's issuer or its own user id");
+        let upper = p.claims(&signed(brokered(json!({ "identity_provider_identity": "G-94F0-AbC" }))), &m).unwrap();
+        assert_eq!((upper.subject.as_str(), p.subject(" G-94F0-AbC ").unwrap()), ("g-94f0-abc", "g-94f0-abc".to_string()), "compared without case, at sign-in and when linking");
         for (extra, why) in [
             (json!({ "identity_provider": null, "identity_provider_identity": null }), "a password login at the broker"),
             (json!({ "identity_provider": null }), "no claim naming the IdP"),

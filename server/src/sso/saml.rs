@@ -20,6 +20,13 @@ pub const SUBJECT_CLAIM: &str = "identity_provider_identity";
 pub const HINT_PARAM: &str = "kc_idp_hint";
 pub const LABEL: &str = "Company SSO";
 
+/// A SAML subject as identities store it: lowercase. Keycloak lowercases the IdP's name for
+/// the person before passing it on, so a link typed from the IdP's own records must match
+/// that. Keycloak itself can't tell apart two ids that differ only in case, so neither can we.
+pub fn subject(s: &str) -> String {
+    s.to_lowercase()
+}
+
 /// An IdP alias as Keycloak allows it in URLs: letters, digits, `.`, `_`, `-`.
 pub fn alias(s: &str) -> Option<String> {
     let s = s.trim();
