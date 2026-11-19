@@ -8,6 +8,7 @@ on:
       - 'deploy/docker/**'
       - 'server/**'
       - 'web/**'
+      - 'apps/client/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/docker.yml'
@@ -18,6 +19,7 @@ on:
       - 'deploy/docker/**'
       - 'server/**'
       - 'web/**'
+      - 'apps/client/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/docker.yml'
@@ -40,6 +42,15 @@ jobs:
           tags: superbot:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Build Caddy image with the web client
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: caddy
+          load: true
+          tags: superbot-caddy:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
       - name: Compose file is valid
         working-directory: deploy/docker
         run: |
@@ -48,8 +59,9 @@ jobs:
           sed -i "s/^SUPERBOT_MASTER_KEY=.*/SUPERBOT_MASTER_KEY=$(openssl rand -hex 32)/" .env
           docker compose config --quiet
           rm .env
-      - name: Smoke test (compose up, healthz, auth, backup/restore, compose down)
+      - name: Smoke test (compose up, healthz, auth, web client at /app/, backup/restore, compose down)
         env:
           SUPERBOT_IMAGE: superbot:ci
+          SUPERBOT_CADDY_IMAGE: superbot-caddy:ci
           SMOKE_NO_BUILD: '1'
         run: deploy/docker/smoke-test.sh
