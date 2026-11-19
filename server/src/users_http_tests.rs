@@ -55,7 +55,7 @@ fn origin(port: u16) -> String {
 }
 
 fn cookie(token: &str) -> String {
-    format!("Cookie: superbot_session={token}\r\n")
+    format!("Cookie: __Host-superbot_session={token}\r\n")
 }
 
 #[tokio::test]
@@ -81,10 +81,10 @@ async fn password_login_makes_token_and_cookie_sessions() {
     assert_eq!(code, 200, "{res}");
     assert!(res["token"].is_null(), "the cookie token is never readable by scripts");
     let set = header(&head, "set-cookie").unwrap();
-    for attr in ["superbot_session=sbs_", "HttpOnly", "Secure", "SameSite=Strict", "Path=/"] {
+    for attr in ["__Host-superbot_session=sbs_", "HttpOnly", "Secure", "SameSite=Strict", "Path=/"] {
         assert!(set.contains(attr), "{set}");
     }
-    let ctoken = set.split(';').next().unwrap().trim_start_matches("superbot_session=").to_string();
+    let ctoken = set.split(';').next().unwrap().trim_start_matches("__Host-superbot_session=").to_string();
     let (code, _, state) = call_with(port, "GET", "/api/state", "", &cookie(&ctoken), "").await;
     assert_eq!((code, parse(&state)["me"]["role"].as_str()), (200, Some("admin")));
     // The web app's writes carry its Origin.
@@ -132,7 +132,7 @@ async fn cookie_writes_from_other_sites_are_refused() {
     let (port, app, admin, _) = serve(|_| {}).await;
     let (_, head, _) = login(port, &origin(port), json!({ "password": PW.as_str(), "session": "cookie" })).await;
     let set = header(&head, "set-cookie").unwrap();
-    let ctoken = set.split(';').next().unwrap().trim_start_matches("superbot_session=").to_string();
+    let ctoken = set.split(';').next().unwrap().trim_start_matches("__Host-superbot_session=").to_string();
     let screen = format!("/api/bots/{}/screen", app.db.create_bot("Shared", "#fff", "waddle", "claude", None, false).id);
     for bad in ["Origin: https://evil.example\r\n", "Origin: null\r\n", "Sec-Fetch-Site: cross-site\r\n", "Sec-Fetch-Site: same-site\r\n"] {
         let extra = format!("{}{bad}", cookie(&ctoken));
@@ -389,7 +389,7 @@ async fn sessions_expire_when_idle_and_stale_cookies_are_cleared() {
     assert_eq!(call(port, "GET", "/api/state", &bearer(&t), "").await.0, 401);
 
     let (_, head, _) = login(port, &origin(port), json!({ "password": PW.as_str(), "session": "cookie" })).await;
-    let ctoken = header(&head, "set-cookie").unwrap().split(';').next().unwrap().trim_start_matches("superbot_session=").to_string();
+    let ctoken = header(&head, "set-cookie").unwrap().split(';').next().unwrap().trim_start_matches("__Host-superbot_session=").to_string();
     tokio::time::sleep(Duration::from_millis(600)).await;
     let (code, head, _) = call_with(port, "GET", "/api/state", "", &cookie(&ctoken), "").await;
     assert_eq!(code, 401);
@@ -487,7 +487,7 @@ async fn bypass_attempts_fail_closed() {
     assert!(header(&head, "set-cookie").unwrap().contains("Max-Age=0"));
     // A bad Authorization header is refused even next to a good cookie.
     let (_, h, _) = login(port, &origin(port), json!({ "password": PW.as_str(), "session": "cookie" })).await;
-    let ctoken = header(&h, "set-cookie").unwrap().split(';').next().unwrap().trim_start_matches("superbot_session=").to_string();
+    let ctoken = header(&h, "set-cookie").unwrap().split(';').next().unwrap().trim_start_matches("__Host-superbot_session=").to_string();
     assert_eq!(call_with(port, "GET", "/api/state", &bearer(&forged), &cookie(&ctoken), "").await.0, 401);
     assert_eq!(call_with(port, "GET", "/api/state", "", &cookie(&ctoken), "").await.0, 200);
 
@@ -536,7 +536,7 @@ async fn break_glass_off_ignores_the_password() {
     let code = users::new_secret(users::CODE_PREFIX);
     app.db.add_login_code(&users::hash(&code), users::OPERATOR, users::OPERATOR, db::now() + 60_000);
     let (_, head, _) = login(port, &origin(port), json!({ "code": code, "session": "cookie" })).await;
-    let ctoken = header(&head, "set-cookie").unwrap().split(';').next().unwrap().trim_start_matches("superbot_session=").to_string();
+    let ctoken = header(&head, "set-cookie").unwrap().split(';').next().unwrap().trim_start_matches("__Host-superbot_session=").to_string();
     assert_eq!(call_with(port, "GET", "/api/state", &admin, &cookie(&ctoken), "").await.0, 200);
     assert_eq!(call_with(port, "GET", "/api/state", &basic(&random_hex(16)), &cookie(&ctoken), "").await.0, 200, "the password is ignored, right or wrong");
 }
@@ -554,6 +554,8 @@ async fn failed_sign_ins_are_rate_limited_per_client_ip() {
     assert_eq!(code, 429, "even the right password waits");
     assert!(header(&head, "retry-after").unwrap().parse::<u64>().unwrap() > 0);
     assert_eq!(login(port, &from(1, "198.51.100.2"), json!({ "password": PW.as_str() })).await.0, 200);
-    // Basic auth (botctl, old clients) is not locked out by the sign-in limiter.
-    assert_eq!(call_with(port, "GET", "/api/state", &admin, &from(1, "198.51.100.1"), "").await.0, 200);
+    // Break-glass Basic takes the same password, so it waits too (ADR 0024); sessions don't.
+    assert_eq!(call_with(port, "GET", "/api/state", &admin, &from(1, "198.51.100.1"), "").await.0, 429);
+    let t = bearer(&token_for(port, json!({ "password": PW.as_str() })).await);
+    assert_eq!(call_with(port, "GET", "/api/state", &t, &from(1, "198.51.100.1"), "").await.0, 200);
 }

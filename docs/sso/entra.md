@@ -24,7 +24,7 @@ Then, in the new app:
 2. **Certificates & secrets → Client secrets → New client secret**. Copy the **Value** (not the Secret ID) now; Entra shows it once. Note when it expires and put a reminder in your calendar.
 3. **Authentication**: leave **Access tokens** and **ID tokens** (implicit grant) unchecked. SuperBot uses the authorization code flow with PKCE.
 4. **API permissions**: the default **Microsoft Graph → User.Read** is enough; SuperBot asks for `openid profile email`, which need no extra permission. To skip the consent prompt for everyone, click **Grant admin consent**.
-5. Optional, **Token configuration → Add optional claim → ID → email**: SuperBot then shows and saves people's email. It is never used to decide who someone is.
+5. Optional, **Token configuration → Add optional claim → ID → email** and **xms_edov**: SuperBot then saves people's email. It is never used to decide who someone is. Entra's `email` is whatever the account's tenant typed in, so SuperBot keeps it only when `xms_edov` is true (the tenant verified the email's domain); without `xms_edov`, people signing up just in time get no email and an admin adds it.
 
 ### Claims SuperBot reads
 
@@ -36,6 +36,7 @@ Then, in the new app:
 | `aud`, `azp` | Must be your client id. |
 | `exp`, `iat`, `nbf`, `nonce` | Freshness and replay protection. |
 | `name`, `email` | Display only (and the new user's name and email with just-in-time sign-up). |
+| `xms_edov` | The `email` counts only when this is true. |
 
 ## 2. Configure SuperBot
 
