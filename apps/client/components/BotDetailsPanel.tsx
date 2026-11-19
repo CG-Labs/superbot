@@ -39,6 +39,8 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
     deleteRoutine,
     policy,
     setBotPolicy,
+    canWrite,
+    can,
   } = useSuperBot();
   const bot = bots.find((b) => b.id === activeId);
   const botId = bot?.id;
@@ -119,6 +121,7 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
           <TextInput
             style={styles.name}
             value={name}
+            editable={canWrite}
             onChangeText={setName}
             onBlur={() => {
               const n = name.trim();
@@ -127,9 +130,11 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
           />
           <View style={styles.sectionRow}>
             <Text style={styles.sectionLabel}>Routines</Text>
-            <Pressable role="button" aria-label="New routine" onPress={() => setEditing("new")}>
-              <Text style={styles.link}>+ New routine</Text>
-            </Pressable>
+            {canWrite ? (
+              <Pressable role="button" aria-label="New routine" onPress={() => setEditing("new")}>
+                <Text style={styles.link}>+ New routine</Text>
+              </Pressable>
+            ) : null}
           </View>
           {routines.length ? (
             routines.map((r) => (
@@ -138,6 +143,7 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
                   style={{ flex: 1 }}
                   role="button"
                   aria-label={`Edit routine ${r.name}`}
+                  disabled={!canWrite}
                   onPress={() => setEditing(r)}
                 >
                   <Text style={styles.rName}>{r.name}</Text>
@@ -146,6 +152,7 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
                 <Switch
                   aria-label={r.enabled ? `Pause ${r.name}` : `Resume ${r.name}`}
                   value={r.enabled}
+                  disabled={!canWrite}
                   onValueChange={() => void toggleRoutine(r).then(reload).catch(showError)}
                 />
               </View>
@@ -156,16 +163,18 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
           <Text style={styles.section}>Computer</Text>
           <View style={styles.row}>
             <Text style={styles.dim}>{bot.working ? bot.status || "Working" : "Asleep"}</Text>
-            <Pressable
-              role="button"
-              aria-label="Open screen"
-              onPress={() => {
-                close();
-                onOpenScreen();
-              }}
-            >
-              <Text style={styles.link}>Open screen</Text>
-            </Pressable>
+            {canWrite ? (
+              <Pressable
+                role="button"
+                aria-label="Open screen"
+                onPress={() => {
+                  close();
+                  onOpenScreen();
+                }}
+              >
+                <Text style={styles.link}>Open screen</Text>
+              </Pressable>
+            ) : null}
           </View>
           <Text style={styles.section}>Settings</Text>
           <View style={styles.row}>
@@ -173,21 +182,22 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
           </View>
           <View style={styles.row}>
             <Text style={styles.dim}>Hide from sidebar</Text>
-            <Switch value={bot.hidden} onValueChange={(v) => void patchBot(bot.id, { hidden: v })} />
+            <Switch value={bot.hidden} disabled={!canWrite} onValueChange={(v) => void patchBot(bot.id, { hidden: v })} />
           </View>
           <View style={styles.row}>
             <Text style={styles.dim}>Ask before risky actions</Text>
             <Switch
               value={bot.policy !== "bypass"}
+              disabled={!can("admin")}
               onValueChange={(v) => void setBotPolicy(bot.id, v ? "ask" : "bypass")}
             />
           </View>
-          {bot.policyOverride ? (
+          {bot.policyOverride && can("admin") ? (
             <Pressable style={styles.row} onPress={() => void setBotPolicy(bot.id, null)}>
               <Text style={styles.policyLink}>Use the default for all Bots ({policy?.mode ?? "ask"})</Text>
             </Pressable>
           ) : null}
-          {!bot.primary ? (
+          {!bot.primary && canWrite ? (
             <Pressable
               style={styles.delete}
               onPress={() => {

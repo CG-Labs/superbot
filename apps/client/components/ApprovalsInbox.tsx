@@ -16,7 +16,7 @@ function minutesLeft(a: Approval): string {
 }
 
 export function ApprovalCard({ approval: a }: { approval: Approval }) {
-  const { bots, decideApproval } = useSuperBot();
+  const { bots, decideApproval, can } = useSuperBot();
   const bot = bots.find((b) => b.id === a.botId);
   const [remember, setRemember] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -45,11 +45,18 @@ export function ApprovalCard({ approval: a }: { approval: Approval }) {
         {a.subject}
       </Text>
       <View style={styles.row}>
-        <Switch value={remember} onValueChange={setRemember} />
-        <Text style={[styles.dim, { flex: 1 }]}>Remember for {bot?.name ?? "this Bot"}</Text>
+        {can("admin") ? (
+          <>
+            <Switch value={remember} onValueChange={setRemember} />
+            <Text style={[styles.dim, { flex: 1 }]}>Remember for {bot?.name ?? "this Bot"}</Text>
+          </>
+        ) : (
+          <View style={{ flex: 1 }} />
+        )}
         <Text style={styles.faint}>Denied in {minutesLeft(a)}</Text>
       </View>
       {error ? <Text style={styles.error}>{error}</Text> : null}
+      {can("approve") ? (
       <View style={styles.actions}>
         <Pressable style={styles.btn} disabled={busy} onPress={() => void decide(false)}>
           <Text style={styles.btnText}>Deny</Text>
@@ -58,12 +65,13 @@ export function ApprovalCard({ approval: a }: { approval: Approval }) {
           <Text style={[styles.btnText, styles.primaryText]}>Approve</Text>
         </Pressable>
       </View>
+      ) : null}
     </View>
   );
 }
 
 export function ApprovalsInbox({ visible, onClose }: Props) {
-  const { approvals, policy, setGlobalPolicy } = useSuperBot();
+  const { approvals, policy, setGlobalPolicy, can } = useSuperBot();
   const ask = policy?.mode !== "bypass";
 
   return (
@@ -85,7 +93,11 @@ export function ApprovalsInbox({ visible, onClose }: Props) {
           </ScrollView>
           <View style={styles.row}>
             <Text style={[styles.dim, { flex: 1 }]}>Ask before risky actions (all Bots)</Text>
-            <Switch value={ask} onValueChange={(v) => void setGlobalPolicy(v ? "ask" : "bypass")} />
+            <Switch
+              value={ask}
+              disabled={!can("admin")}
+              onValueChange={(v) => void setGlobalPolicy(v ? "ask" : "bypass")}
+            />
           </View>
           {!ask ? <Text style={styles.faint}>Bypass: Bots run everything without asking. Dev only.</Text> : null}
         </View>

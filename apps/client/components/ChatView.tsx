@@ -100,7 +100,7 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen }: 
               {item.question ? (
                 <View style={styles.question}>
                   <Text style={styles.qTitle}>{item.question.title}</Text>
-                  {isOpenHandoff(item) ? (
+                  {canWrite && isOpenHandoff(item) ? (
                     <Pressable
                       role="button"
                       aria-label="Open screen"
@@ -116,7 +116,7 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen }: 
                       role="button"
                       aria-label={opt}
                       style={[styles.opt, item.question?.picked === k && styles.optOn]}
-                      disabled={item.question?.picked != null}
+                      disabled={!canWrite || item.question?.picked != null}
                       onPress={() => answer(item, k)}
                     >
                       <Text style={styles.optText}>{opt}</Text>
@@ -151,9 +151,11 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen }: 
         <View style={styles.working}>
           <ActivityIndicator color={colors.blueDot} />
           <Text style={styles.workingText}>{bot.status || "Working"}…</Text>
-          <Pressable onPress={() => void stopBot(bot.id)}>
-            <Text style={styles.stop}>Stop</Text>
-          </Pressable>
+          {canWrite ? (
+            <Pressable onPress={() => void stopBot(bot.id)}>
+              <Text style={styles.stop}>Stop</Text>
+            </Pressable>
+          ) : null}
         </View>
       ) : null}
     </View>
@@ -172,6 +174,7 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen }: 
           <Text style={styles.pillName}>{bot.name}</Text>
           <Text style={styles.harness}>{bot.harness}</Text>
         </Pressable>
+        {canWrite ? (
         <Pressable
           role="button"
           aria-label={screenOpen ? "Hide screen" : "Show screen"}
@@ -181,6 +184,7 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen }: 
         >
           <Text style={styles.screenBtnText}>Screen</Text>
         </Pressable>
+        ) : null}
       </View>
       {handoff ? (
         <HandoffBanner botName={bot.name} handoff={handoff} onOpenScreen={() => onToggleScreen(true)} />
@@ -198,7 +202,7 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen }: 
           onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
         />
       )}
-      <ModelBar botId={bot.id} harness={bot.harness} model={bot.model} effort={bot.effort} />
+      {canWrite ? <ModelBar botId={bot.id} harness={bot.harness} model={bot.model} effort={bot.effort} /> : null}
       {canWrite ? (
       <View style={styles.composer}>
         <TextInput

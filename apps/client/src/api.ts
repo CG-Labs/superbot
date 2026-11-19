@@ -42,6 +42,9 @@ export async function signIn(baseUrl: string, secret: string, label = "SuperBot 
 }
 
 export class SuperBotApi {
+  /** Called when the server refuses this session token, e.g. after a revoke. */
+  onSessionEnded?: () => void;
+
   constructor(private cfg: ServerConfig) {}
 
   get config(): ServerConfig {
@@ -68,6 +71,7 @@ export class SuperBotApi {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
+      if (res.status === 401 && this.cfg.token) this.onSessionEnded?.();
       const msg = (data as { error?: string }).error ?? `HTTP ${res.status}`;
       throw new ApiError(msg, res.status);
     }

@@ -273,6 +273,18 @@ describe("SuperBotProvider", () => {
     expect(clearCredentials).toHaveBeenCalled();
   });
 
+  it("returns to sign-in when the session is revoked while the app is open", async () => {
+    loginToken = TOKEN;
+    (loadSavedCredentials as jest.Mock).mockImplementation(async () => ({ baseUrl: BASE, token: TOKEN }));
+    const { result } = await connected();
+    loginToken = "sbs_" + "b".repeat(64);
+    const onError = (connectSse as jest.Mock).mock.calls[0][4] as () => void;
+    await act(async () => onError());
+    await waitFor(() => expect(result.current.api).toBeNull());
+    expect(result.current.error).toBe("Your session ended. Sign in again.");
+    expect(clearCredentials).toHaveBeenCalled();
+  });
+
   it("doesn't mark chats read for read-only users", async () => {
     permissions = ["account", "read", "review"];
     bobUnread = true;
