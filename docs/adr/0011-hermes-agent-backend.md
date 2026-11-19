@@ -39,11 +39,14 @@ Read from the repo and its docs at release v0.23.2 (16 Nov 2026).
 
 - **Fit**
   - **Adapters**: good. The stream-json events map one-to-one onto `AgentEvent` (session, text delta, text, tool, error), and `--resume` gives harness sessions. Each Bot gets its own `HERMES_HOME` under its `state_dir`, which is exactly what Hermes asks for.
-  - **Approvals and policy**: good, with work. The adapter writes a `pre_tool_call` hook running `botctl hook hermes` with `fail_closed: true`, and sets `HERMES_ACCEPT_HOOKS=1`. `botctl hook` already exits 2 to block. Two gaps: the policy must learn Hermes tool names (`terminal` is not in `SHELL_TOOLS`; `write_file` and `patch` are file tools), and the 300-second hook cap is shorter than botd's 10-minute approval wait, so Hermes Bots need a shorter wait or the hook fails closed early. The unguarded-run canary covers versions that skip hooks.
+  - **Approvals and policy**: good, with work. The adapter writes a `pre_tool_call` hook running `botctl hook hermes` with `fail_closed: true`, and sets `HERMES_ACCEPT_HOOKS=1`. `botctl hook` already exits 2 to block. Three gaps:
+    - The policy must learn Hermes tool names: `terminal` is not in `SHELL_TOOLS`, and `write_file` and `patch` are file tools.
+    - The 300-second hook cap is shorter than botd's 10-minute approval wait, so Hermes Bots need a shorter wait or the hook fails closed early.
+    - The unguarded-run canary in `runner.rs` only starts on tool events named `bash` or `shell`, so it would miss a Hermes version that skips hooks. It must also watch `terminal`, and the adapter needs a test that a run with a skipped hook is stopped.
   - **Audit**: unchanged. Every gated call already goes through `/api/approvals/check`.
   - **Routines and Bot-to-Bot**: unchanged. Bots keep using `botctl`. Hermes's own cron stays off.
   - **Memory**: overlap. botd sends memory in the system prompt; Hermes also loads its own `MEMORY.md` and `USER.md` and learns skills. Either turn Hermes memory off for SuperBot Bots, or let it run and treat it as harness-private (like Claude Code's own files). Decide in the adapter PR.
-- **Effort**: **M**. One adapter file (similar to the existing 90 to 100 lines), Hermes tool names in `policy.rs`, `botctl hook hermes`, the model list, Python 3.14 and Hermes in the installer and Docker image, and the end-to-end hook test from the [approvals follow-ups](../approvals-followups.md).
+- **Effort**: **M**. One adapter file (similar to the existing 90 to 100 lines), Hermes tool names in `policy.rs` and the unguarded-run canary, `botctl hook hermes`, the model list, Python 3.14 and Hermes in the installer and Docker image, and the end-to-end hook test from the [approvals follow-ups](../approvals-followups.md).
 - **Risks**: upstream churn breaks the stream format or hook contract (pin a stable release, test on upgrade); memory and CPU of a Python agent per Bot on a 4 GB machine (measure); Hermes may start a gateway runtime per profile; a second, overlapping memory system.
 - **Licence**: MIT, run as a separate program. No obligations beyond keeping its notice if we ship it in our image.
 
@@ -79,7 +82,7 @@ Hermes's gateway, cron, memory, Bot Mode, and approvals become the back end. bot
 
 1. Build the Hermes adapter (a) in M2, alongside multi-user work. It is a contained change that keeps botd's approvals, audit, routines, and memory in charge.
 2. Make Hermes the default engine (b) in M3, for managed tiers first, only when it passes this gate:
-   - the end-to-end approval test passes on the pinned stable version, including fail-closed on hook timeout;
+   - the end-to-end approval test passes on the pinned stable version, including fail-closed on hook timeout and the canary stopping a run whose hook was skipped;
    - per-Bot memory and CPU on the smallest managed machine are measured and acceptable;
    - one upstream upgrade has been taken through the test suite without adapter changes, or with small ones;
    - tier-to-model routing works with at least two providers.
@@ -87,7 +90,7 @@ Hermes's gateway, cron, memory, Bot Mode, and approvals become the back end. bot
 
 ## Consequences
 
-- If accepted: a new adapter, `policy.rs` learns Hermes tool names, the installer and Docker image gain Python 3.14 and a pinned Hermes, and the roadmap tracks (a) in M2 and the (b) gate in M3.
+- If accepted: a new adapter, `policy.rs` and the unguarded-run canary learn Hermes tool names, the installer and Docker image gain Python 3.14 and a pinned Hermes, and the roadmap tracks (a) in M2 and the (b) gate in M3.
 - Hermes's own approval gate, cron, messaging gateway, and Bot Mode stay unused in SuperBot. botd remains the single place for policy, audit, routines, and Bot-to-Bot.
 - Open: whether Hermes's memory and skill learning run for SuperBot Bots; the shorter approval wait for Hermes Bots; Hermes's footprint per Bot on small machines.
 
