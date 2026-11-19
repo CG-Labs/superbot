@@ -86,6 +86,14 @@ export function UsersAdmin({ api, meId, onBack }: Props) {
     }
   }, [api]);
 
+  // Every way out (Done, Cancel, Android Back) takes the new user, so it isn't opened later.
+  const closeInvite = () => {
+    setInviting(false);
+    if (created.current) setSelectedId(created.current);
+    created.current = null;
+    void load();
+  };
+
   useEffect(() => {
     void load();
     void fetchSsoProviders(api.baseUrl).then(setProviders);
@@ -142,7 +150,7 @@ export function UsersAdmin({ api, meId, onBack }: Props) {
           </View>
         </Modal>
       ) : null}
-      <Modal visible={inviting} animationType="slide" transparent onRequestClose={() => setInviting(false)}>
+      <Modal visible={inviting} animationType="slide" transparent onRequestClose={closeInvite} testID="invite-modal">
         <View style={styles.backdrop}>
           <ScrollView style={styles.sheet} contentContainerStyle={{ padding: 20, gap: 8 }}>
             <Text style={styles.title}>Add user</Text>
@@ -153,12 +161,7 @@ export function UsersAdmin({ api, meId, onBack }: Props) {
                   created.current = u.id;
                   void load();
                 }}
-                onClose={() => {
-                  setInviting(false);
-                  if (created.current) setSelectedId(created.current);
-                  created.current = null;
-                  void load();
-                }}
+                onClose={closeInvite}
               />
             ) : null}
           </ScrollView>

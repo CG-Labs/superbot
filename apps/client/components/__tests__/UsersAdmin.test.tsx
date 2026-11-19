@@ -114,6 +114,20 @@ describe("UsersAdmin", () => {
     expect(await screen.findByText(/^Scout/)).toBeOnTheScreen();
   });
 
+  it("closing the invite with Back opens the new user once, not on a later Cancel", async () => {
+    const { user } = await open([owner, alex]);
+    await user.press(screen.getByText("Add user"));
+    await user.type(screen.getByLabelText("Email"), "sam@example.com");
+    await user.press(screen.getAllByText("Add user").at(-1)!);
+    await screen.findByTestId("code-reveal");
+    await act(async () => screen.getByTestId("invite-modal").props.onRequestClose());
+    expect(await screen.findByText(/^Scout/)).toBeOnTheScreen();
+    await user.press(screen.getByLabelText("User Owner"));
+    await user.press(screen.getByText("Add user"));
+    await user.press(screen.getByText("Cancel"));
+    expect(screen.getByText("Owner (break-glass) · ", { exact: false })).toBeOnTheScreen();
+  });
+
   it("changes a role, regenerates a code, signs out, and shows Bot access", async () => {
     const { api, user } = await open([owner, alex]);
     await user.press(screen.getByLabelText("User Alex"));
