@@ -207,7 +207,7 @@ async fn approvals_follow_bot_access() {
         app.db.add_approval(&p.id, "claude", "Bash", "shell", "ls", &json!({}), "shell", "ask", far);
     }
     app.db.remove_grant(&p.id, &b_id);
-    assert_eq!(ids(&call(port, "GET", "/api/approvals?status=pending&limit=1", &b, "").await.1), [ap_b.id.clone()]);
+    assert_eq!(ids(&call(port, "GET", "/api/approvals?status=pending&limit=1", &b, "").await.1), std::slice::from_ref(&ap_b.id));
     let state = parse(&call(port, "GET", "/api/state", &b, "").await.1);
     assert_eq!(state["approvals"].as_array().map(|l| l.iter().map(|a| a["id"].clone()).collect::<Vec<_>>()), Some(vec![json!(ap_b.id)]));
 }
