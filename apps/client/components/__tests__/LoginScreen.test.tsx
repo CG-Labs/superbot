@@ -44,12 +44,31 @@ describe("LoginScreen", () => {
     await render(<LoginScreen />);
 
     await screen.findByText("Sign in with Okta", {}, { timeout: 2000 });
-    const labels = screen.getAllByText(/^Sign in with /).map((n) => n.props.children.join(""));
+    const labels = screen.getAllByText(/^Sign in with /).map((n) => n.props.children);
     expect(labels).toEqual(["Sign in with Microsoft", "Sign in with Google", "Sign in with Okta"]);
     expect(globalThis.fetch).toHaveBeenCalledWith(`${LOCAL_SERVER_URL}/api/auth/sso`);
 
     await user.press(screen.getByText("Sign in with Google"));
     expect(mockCtx.loginWithSso).toHaveBeenCalledWith(LOCAL_SERVER_URL, "google");
+  });
+
+  it("shows GitHub and Apple, with Apple's button in Apple's wording and colors", async () => {
+    serverWith([
+      { id: "github", label: "GitHub", type: "github" },
+      { id: "apple", label: "Work Apple ID", type: "apple" },
+    ]);
+    const user = userEvent.setup();
+    await render(<LoginScreen />);
+
+    const apple = await screen.findByText("Sign in with Apple", {}, { timeout: 2000 });
+    expect(screen.getAllByText(/^Sign in with /).map((n) => n.props.children)).toEqual(["Sign in with GitHub", "Sign in with Apple"]);
+    expect(apple).toHaveStyle({ color: "#000" });
+    expect(screen.getByText("Sign in with GitHub")).not.toHaveStyle({ color: "#000" });
+
+    await user.press(apple);
+    expect(mockCtx.loginWithSso).toHaveBeenCalledWith(LOCAL_SERVER_URL, "apple");
+    await user.press(screen.getByText("Sign in with GitHub"));
+    expect(mockCtx.loginWithSso).toHaveBeenCalledWith(LOCAL_SERVER_URL, "github");
   });
 
   it("shows no SSO buttons when the server has none", async () => {
