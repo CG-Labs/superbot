@@ -245,7 +245,8 @@ fn redact_pairs(s: &str) -> String {
             continue;
         }
         let key_end = i + b[i..].iter().take_while(|&&c| key_char(c)).count();
-        let mut j = key_end + b[key_end..].iter().take_while(|&&c| matches!(c, b'"' | b'\'' | b'\\')).count();
+        // Closing quotes and brackets may sit between key and separator: `"token":`, `user[password]=`.
+        let mut j = key_end + b[key_end..].iter().take_while(|&&c| matches!(c, b'"' | b'\'' | b'\\' | b'[' | b']')).count();
         j += b[j..].iter().take_while(|&&c| c == b' ').count();
         let is_pair = j < b.len() && matches!(b[j], b':' | b'=') && !b[j..].starts_with(b"://");
         if !is_pair || !secret_name(&s[i..key_end]) {
@@ -280,7 +281,7 @@ fn redact_pairs(s: &str) -> String {
 }
 
 fn key_char(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.')
+    c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b'%')
 }
 
 /// Length of a JSON string body up to (not including) its closing quote.
@@ -364,6 +365,9 @@ fn redact_word(word: &str) -> (String, Mask) {
         if key.bytes().all(key_char) && secret_name(key) {
             if value.is_empty() {
                 return (word.into(), Mask::Word); // password: <x>
+            }
+            if value.trim_start_matches(['"', '\'', '\\']).starts_with(REDACTED) {
+                return (word.into(), quoted(word)); // already masked by redact_pairs
             }
             return (format!("{key}{}{REDACTED}", &bare[i..=i]), quoted(word));
         }
@@ -700,11 +704,11 @@ mod tests {
         assert_eq!(redact_text("git push -u origin main"), "git push -u origin main");
         // Quoted secrets with spaces are masked to the closing quote.
         assert_eq!(redact_text("tool --password 'my secret pass' --verbose"), "tool --password [redacted] --verbose");
-        assert_eq!(redact_text("tool --password=\"my secret pass\" x"), "tool --password=[redacted] x");
-        assert_eq!(redact_text("export DB_PASSWORD='a b c'; run"), "export DB_PASSWORD=[redacted] run");
+        assert_eq!(redact_text("tool --password=\"my secret pass\" x"), "tool --password=\"[redacted]\" x");
+        assert_eq!(redact_text("export DB_PASSWORD='a b c'; run"), "export DB_PASSWORD='[redacted]'; run");
         assert_eq!(redact_text("curl -u 'admin:my pass word' https://x"), "curl -u 'admin:[redacted] https://x");
         assert_eq!(redact_text("curl --user=\"admin:my pass\" https://x"), "curl --user=\"admin:[redacted] https://x");
-        assert_eq!(redact_text("run \"password=my secret\" next"), "run password=[redacted] next");
+        assert_eq!(redact_text("run \"password=my secret\" next"), "run \"password=[redacted] next");
         assert_eq!(redact_text("login --token \"it's a secret\" ok"), "login --token [redacted] ok");
         assert_eq!(redact_text("tool --password 'never closed and more"), "tool --password [redacted] ");
         assert_eq!(redact_text("echo 'hello world' --password 'x y'"), "echo 'hello world' --password [redacted] ");
@@ -715,9 +719,15 @@ mod tests {
         assert_eq!(redact_text(r#"x {"credentials":{"user":"a","pass":"hunter2"},"ok":true}"#), r#"x {"credentials":[redacted],"ok":true}"#);
         assert_eq!(redact_text(r#"x {"a":1,"secret":"hunter2 and more"#), r#"x {"a":1,"secret":"[redacted]"#);
         assert_eq!(redact_text("a=1&password=hunter2&b=2"), "a=1&password=[redacted]&b=2");
+        assert_eq!(
+            redact_text("curl --data 'user[password]=hunter2&user[name]=a' https://x"),
+            "curl --data 'user[password]=[redacted]&user[name]=a' https://x"
+        );
+        assert_eq!(redact_text("user[password][]=hunter2"), "user[password][]=[redacted]");
+        assert_eq!(redact_text("user%5Bpassword%5D=hunter2&x=1"), "user%5Bpassword%5D=[redacted]&x=1");
         assert_eq!(redact_text(r#"{"message":"my token is mine","n":2}"#), r#"{"message":"my token is mine","n":2}"#);
         assert_eq!(redact_text("token=é€x y"), "token=[redacted] y");
-        assert_eq!(redact_text("pässword=ü token:'é"), "pässword=ü token:[redacted]");
+        assert_eq!(redact_text("pässword=ü token:'é"), "pässword=ü token:'[redacted]");
         // Cut-short or odd input never panics.
         for odd in ["token=", "password:\"", "token={", "secret=\"\\", "key: [1, {", "token\\\":\\\"x"] {
             redact_text(odd);
