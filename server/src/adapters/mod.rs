@@ -61,6 +61,18 @@ pub struct Guard {
 pub(crate) const SECRET_ENV: [&str; 6] =
     ["AUTH_PASSWORD", "AUTH_PASSWORD_FILE", "SUPERBOT_PASSWORD", "SUPERBOT_TOKEN", "SUPERBOT_MASTER_KEY", "SUPERBOT_MASTER_KEY_FILE"];
 
+/// `SECRET_ENV`, and every `SSO_*` setting: sign-in config, including client secrets (ADR 0013).
+pub(crate) fn strip_secret_env(cmd: &mut Command) {
+    for k in SECRET_ENV {
+        cmd.env_remove(k);
+    }
+    for (k, _) in std::env::vars_os() {
+        if k.to_str().is_some_and(|k| k.starts_with("SSO_")) {
+            cmd.env_remove(k);
+        }
+    }
+}
+
 pub trait Adapter: Send {
     fn bin(&self) -> &'static str;
     /// Command-line arguments. May emit events up front (e.g. a session id it chose).
@@ -152,9 +164,7 @@ pub async fn run(
     out.drain(..).for_each(&mut emit);
 
     let mut cmd = Command::new(adapter.bin());
-    for k in SECRET_ENV {
-        cmd.env_remove(k);
-    }
+    strip_secret_env(&mut cmd);
     let mut child = match cmd
         .args(&args)
         .current_dir(&input.cwd)
