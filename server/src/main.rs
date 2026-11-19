@@ -7,6 +7,8 @@ mod acl_http_tests;
 mod adapters;
 mod approvals;
 mod audit;
+#[cfg(test)]
+mod audit_http_tests;
 mod cron;
 mod db;
 mod paths;
