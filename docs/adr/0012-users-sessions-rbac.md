@@ -68,7 +68,7 @@ Three roles. One function, `rbac::classify(method, path)`, maps each API route t
 | `read` | state, events, Bots, messages, routines, models, policy (view) | ✓ | ✓ | ✓ | ✓ |
 | `review` | approvals list | ✓ | ✓ | ✓ | |
 | `write` | create/edit/delete Bots and routines, send messages, mark read, stop, screen, ask, handoff, approval check | ✓ | ✓ | | ✓ |
-| `approve` | approve or deny a pending approval | ✓ | ✓ | | |
+| `approve` | approve or deny a pending approval once (remembering it as a rule is a policy change: admin) | ✓ | ✓ | | |
 | `admin` | policy and rules changes, audit log and export, users, sign-in codes, sessions | ✓ | | | |
 
 - **Default deny**: a route the table doesn't name needs `admin`. So does any path with an empty segment, a trailing slash, or unexpected case, so a path that dodges the table can't land on a weaker permission. New routes are admin-only until someone classifies them, and `rbac.rs`'s tests list every route with the permission it should need.
