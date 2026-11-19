@@ -297,7 +297,14 @@ pub async fn login(Extension(a): Extension<Arc<Auth>>, Extension(source): Extens
     let code = v["code"].as_str().map(str::trim).filter(|c| !c.is_empty());
     let password = v["password"].as_str().filter(|p| !p.is_empty());
     let (user, method) = match (code, password) {
-        (Some(code), _) => (app.db.use_login_code(&hash(code), at), "code"),
+        (Some(code), _) => match app.db.use_login_code(&hash(code), at) {
+            Some(u) => (Some(u), "code"),
+            // Clients send anything shaped like a code as one, but an older password may look like that too.
+            None if a.break_glass && !a.password.is_empty() && v["code"].as_str().is_some_and(|c| crate::same(c.as_bytes(), a.password.as_bytes())) => {
+                (app.db.user(OPERATOR), "password")
+            }
+            None => (None, "code"),
+        },
         (None, Some(p)) if a.break_glass && !a.password.is_empty() => {
             (crate::same(p.as_bytes(), a.password.as_bytes()).then(|| app.db.user(OPERATOR)).flatten(), "password")
         }

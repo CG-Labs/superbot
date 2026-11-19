@@ -133,16 +133,20 @@ async fn cookie_writes_from_other_sites_are_refused() {
     let (_, head, _) = login(port, &origin(port), json!({ "password": PW.as_str(), "session": "cookie" })).await;
     let set = header(&head, "set-cookie").unwrap();
     let ctoken = set.split(';').next().unwrap().trim_start_matches("superbot_session=").to_string();
+    let screen = format!("/api/bots/{}/screen", app.db.create_bot("Shared", "#fff", "waddle", "claude", None, false).id);
     for bad in ["Origin: https://evil.example\r\n", "Origin: null\r\n", "Sec-Fetch-Site: cross-site\r\n", "Sec-Fetch-Site: same-site\r\n"] {
         let extra = format!("{}{bad}", cookie(&ctoken));
         let (code, _, body) = call_with(port, "POST", "/api/bots", "", &extra, r#"{"name":"CSRF"}"#).await;
         assert_eq!(code, 403, "{bad}: {body}");
+        // Opening a screen starts it, so that GET counts as a write.
+        assert_eq!(call_with(port, "GET", &screen, "", &extra, "").await.0, 403, "{bad}");
         // Reads stay fine: they change nothing, and the response can't be read cross-site.
         assert_eq!(call_with(port, "GET", "/api/state", "", &extra, "").await.0, 200);
     }
+    assert_ne!(call_with(port, "GET", &screen, "", &format!("{}Sec-Fetch-Site: same-origin\r\n", cookie(&ctoken)), "").await.0, 403);
     assert!(app.db.bots().iter().all(|b| b.name != "CSRF"));
     let (_, body) = call(port, "GET", "/api/audit?action=access.denied", &admin, "").await;
-    assert_eq!(audit_list(&body).iter().filter(|e| e["details"]["reason"] == "cross_site").count(), 4);
+    assert_eq!(audit_list(&body).iter().filter(|e| e["details"]["reason"] == "cross_site").count(), 8);
 }
 
 #[tokio::test]
@@ -413,6 +417,15 @@ async fn bypass_attempts_fail_closed() {
 }
 
 #[tokio::test]
+async fn a_password_shaped_like_a_code_still_signs_in() {
+    let pw = format!("{}{}", users::CODE_PREFIX, random_hex(8));
+    let (port, _, _, _) = serve(|a| a.password = pw.clone()).await;
+    let (code, _, res) = login(port, "", json!({ "code": pw })).await;
+    assert_eq!((code, res["user"]["id"].as_str()), (200, Some(users::OPERATOR)));
+    assert_eq!(login(port, "", json!({ "code": format!("{pw}x") })).await.0, 401);
+}
+
+#[tokio::test]
 async fn break_glass_off_ignores_the_password() {
     let (port, app, admin, _) = serve(|a| a.break_glass = false).await;
     assert_eq!(call(port, "GET", "/api/state", &admin, "").await.0, 401);
@@ -420,6 +433,7 @@ async fn break_glass_off_ignores_the_password() {
     assert!(header(&head, "www-authenticate").is_none(), "no password box");
     let (code, _, res) = login(port, "", json!({ "password": PW.as_str() })).await;
     assert_eq!((code, res["error"].as_str().map(|e| e.contains("off"))), (401, Some(true)));
+    assert_eq!(login(port, "", json!({ "code": PW.as_str() })).await.0, 401, "nor as a code");
 
     // A code (made here by an admin who still has a session) still signs the owner in.
     let code = users::new_secret(users::CODE_PREFIX);

@@ -563,7 +563,8 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
         return denied("role", msg);
     }
     // A cookie rides along on any request the browser makes, so writes must come from our own pages.
-    let safe = matches!(method, Method::GET | Method::HEAD | Method::OPTIONS);
+    // Some GETs act too (opening a screen starts it), so only plain reads are exempt.
+    let safe = matches!(method, Method::GET | Method::HEAD | Method::OPTIONS) && matches!(need, rbac::Perm::Account | rbac::Perm::Read | rbac::Perm::Review);
     if caller.session.as_ref().is_some_and(|s| s.kind == "cookie") && !safe && !users::same_origin(req.headers()) {
         return denied("cross_site", "Cross-site request refused.".into());
     }
