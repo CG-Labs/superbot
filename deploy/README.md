@@ -11,7 +11,11 @@ curl -fsSL https://raw.githubusercontent.com/CG-Labs/superbot/main/deploy/instal
   --user-name "Alex"
 ```
 
-Re-run with `--upgrade` to pull latest `main`, rebuild, and restart.
+Re-run with `--upgrade` to pull latest `main`, rebuild, and restart (systemd/Caddy units are read from the cloned repo’s `deploy/` after pull):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/CG-Labs/superbot/main/deploy/install.sh | sudo bash -s -- --upgrade
+```
 
 ## From a local checkout
 

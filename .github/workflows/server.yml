@@ -33,3 +33,20 @@ jobs:
       - name: Install ShellCheck
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
       - run: shellcheck -S warning deploy/install.sh deploy/superbot-backup.sh deploy/install-computer.sh
+
+  install-pipe-dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Piped install uses deploy/ from cloned repo (not bash stdin path)
+        run: |
+          set -euo pipefail
+          sudo useradd -m -s /bin/bash superbot 2>/dev/null || true
+          sudo install -d -o superbot -g superbot /home/superbot/superbot/deploy
+          sudo cp deploy/superbot.service deploy/superbot-backup.service \
+            deploy/superbot-backup.timer deploy/superbot-backup.sh \
+            /home/superbot/superbot/deploy/
+          cat deploy/install.sh | sudo bash -s -- --dry-run --non-interactive \
+            --domain ci.example.com --tz UTC | tee /tmp/piped-install.log
+          grep -Fq 'Using deploy assets from /home/superbot/superbot/deploy' /tmp/piped-install.log
+          grep -Fq '/home/superbot/superbot/deploy/superbot.service' /tmp/piped-install.log

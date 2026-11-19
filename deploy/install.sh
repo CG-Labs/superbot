@@ -17,6 +17,7 @@ ENABLE_BACKUP=true
 UPGRADE=false
 DRY_RUN=false
 INTERACTIVE=true
+DEPLOY_DIR=""
 
 log() { printf '==> %s\n' "$*"; }
 warn() { printf '!! %s\n' "$*" >&2; }
@@ -100,12 +101,51 @@ detect_source_dir() {
   if [[ -n "$INSTALL_DIR" ]]; then
     return
   fi
-  local script_dir
-  script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  local script_path script_dir
+  script_path=${BASH_SOURCE[0]:-}
+  if [[ -z "$script_path" ]] || [[ ! -f "$script_path" ]]; then
+    return
+  fi
+  script_dir=$(cd "$(dirname "$script_path")" && pwd)
   if [[ -f "$script_dir/../Cargo.toml" ]] && [[ -f "$script_dir/../server/src/main.rs" ]]; then
     INSTALL_DIR=$(cd "$script_dir/.." && pwd)
     log "Using local checkout: $INSTALL_DIR"
   fi
+}
+
+# deploy/ next to this script (checkout) or under the cloned repo (curl | bash).
+resolve_deploy_dir() {
+  if [[ -n "$DEPLOY_DIR" ]]; then
+    printf '%s\n' "$DEPLOY_DIR"
+    return
+  fi
+  local script_path script_dir home repo_deploy
+  script_path=${BASH_SOURCE[0]:-}
+  if [[ -n "$script_path" ]] && [[ -f "$script_path" ]]; then
+    script_dir=$(cd "$(dirname "$script_path")" && pwd)
+    if [[ -f "$script_dir/superbot.service" ]]; then
+      DEPLOY_DIR=$script_dir
+      printf '%s\n' "$DEPLOY_DIR"
+      return
+    fi
+  fi
+  home=$(user_home)
+  repo_deploy="$home/superbot/deploy"
+  if [[ -f "$repo_deploy/superbot.service" ]]; then
+    DEPLOY_DIR=$repo_deploy
+    printf '%s\n' "$DEPLOY_DIR"
+    return
+  fi
+  die "Missing deploy/ templates at $repo_deploy (clone may have failed; re-run from a checkout or curl | bash after sync_repo)."
+}
+
+verify_deploy_templates() {
+  local deploy f
+  deploy=$(resolve_deploy_dir)
+  log "Using deploy assets from $deploy"
+  for f in superbot.service superbot-backup.sh superbot-backup.service superbot-backup.timer; do
+    [[ -f "$deploy/$f" ]] || die "Missing deploy template: $deploy/$f"
+  done
 }
 
 user_home() {
@@ -269,37 +309,39 @@ configure_env() {
 }
 
 install_systemd() {
-  local home script_dir
+  local home deploy unit
   home=$(user_home)
-  script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-  local unit=/etc/systemd/system/superbot.service
-  log "Installing systemd unit"
+  deploy=$(resolve_deploy_dir)
+  unit=/etc/systemd/system/superbot.service
+  log "Installing systemd unit from $deploy"
   if [[ "$DRY_RUN" == true ]]; then
+    log "[dry-run] would write $unit from $deploy/superbot.service"
     return
   fi
   sed -e "s|/home/superbot|$home|g" -e "s|User=superbot|User=$SUPERBOT_USER|g" \
     -e "s|Group=superbot|Group=$SUPERBOT_USER|g" \
-    "$script_dir/superbot.service" >"$unit"
+    "$deploy/superbot.service" >"$unit"
   systemctl daemon-reload
   systemctl enable superbot.service
   systemctl restart superbot.service
 }
 
 install_backup() {
-  local home script_dir
+  local home deploy
   home=$(user_home)
-  script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-  run install -m 0755 "$script_dir/superbot-backup.sh" "$BIN_DIR/superbot-backup"
+  deploy=$(resolve_deploy_dir)
+  run install -m 0755 "$deploy/superbot-backup.sh" "$BIN_DIR/superbot-backup"
   if [[ "$ENABLE_BACKUP" != true ]]; then
     return
   fi
-  log "Enabling daily backup timer"
+  log "Enabling daily backup timer from $deploy"
   if [[ "$DRY_RUN" == true ]]; then
+    log "[dry-run] would install backup timer units from $deploy"
     return
   fi
   sed -e "s|/home/superbot|$home|g" -e "s|User=superbot|User=$SUPERBOT_USER|g" \
-    "$script_dir/superbot-backup.service" >/etc/systemd/system/superbot-backup.service
-  cp "$script_dir/superbot-backup.timer" /etc/systemd/system/superbot-backup.timer
+    "$deploy/superbot-backup.service" >/etc/systemd/system/superbot-backup.service
+  cp "$deploy/superbot-backup.timer" /etc/systemd/system/superbot-backup.timer
   systemctl daemon-reload
   systemctl enable --now superbot-backup.timer
 }
@@ -364,7 +406,7 @@ SuperBot is installed.
   URL:      $url
   Password: stored in $pass_file (also in $repo_path/.env as AUTH_PASSWORD)
   Logs:     journalctl -u superbot -f
-  Upgrade:  re-run this script with --upgrade (or curl | sudo bash -s -- --upgrade)
+  Upgrade:  sudo bash -s -- --upgrade < <(curl -fsSL https://raw.githubusercontent.com/CG-Labs/superbot/main/deploy/install.sh)
 
 Next steps (as the service user):
   sudo -iu $SUPERBOT_USER
@@ -395,6 +437,7 @@ main() {
     log "Upgrade mode: updating source and rebuilding"
   fi
   sync_repo
+  verify_deploy_templates
   build_botd
   configure_env
   install_systemd
