@@ -440,6 +440,11 @@ impl Attrs {
         }
     }
 
+    /// What the shown name is built from.
+    fn names(&self) -> [Option<&str>; 5] {
+        [Some(self.user_name.as_str()), self.display_name.as_deref(), self.formatted.as_deref(), self.given_name.as_deref(), self.family_name.as_deref()]
+    }
+
     /// The name SuperBot shows: what the IdP called them, or their userName up to the `@`.
     fn shown_name(&self) -> String {
         let parts = [self.given_name.as_deref(), self.family_name.as_deref()].into_iter().flatten().collect::<Vec<_>>().join(" ");
@@ -571,7 +576,11 @@ pub fn apply_patch(a: &mut Attrs, v: &Value) -> ScimRes<()> {
             None if kind == "remove" => return Err(ScimError::new(StatusCode::BAD_REQUEST, Some("noTarget"), "remove needs a path")),
             None => {
                 let obj = value.as_object().ok_or_else(|| syntax("Without a path, value must be an object of attributes"))?;
+                let mut seen = std::collections::HashSet::new();
                 for (k, val) in obj {
+                    if !seen.insert(normal_path(k)) {
+                        return Err(invalid(format!("{k} is sent more than once")));
+                    }
                     apply_path(a, &kind, k, val)?;
                 }
             }
@@ -580,9 +589,14 @@ pub fn apply_patch(a: &mut Attrs, v: &Value) -> ScimRes<()> {
     Ok(())
 }
 
-fn apply_path(a: &mut Attrs, op: &str, path: &str, v: &Value) -> ScimRes<()> {
+/// A PATCH path without the core schema prefix, spaces collapsed, lowercase.
+fn normal_path(path: &str) -> String {
     let path = path.get(..USER_SCHEMA.len() + 1).filter(|p| p.eq_ignore_ascii_case(&format!("{USER_SCHEMA}:"))).map_or(path, |p| &path[p.len()..]);
-    let p = path.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase();
+    path.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
+}
+
+fn apply_path(a: &mut Attrs, op: &str, path: &str, v: &Value) -> ScimRes<()> {
+    let p = normal_path(path);
     let remove = op == "remove";
     let cant_remove = |f: &str| Err(invalid(format!("{f} can't be removed")));
     match p.as_str() {
@@ -687,14 +701,18 @@ async fn changed(app: &AppState, c: &Caller, before_user: &User, before: Option<
 /// Saves `d` over an existing user. `taken` is a re-provisioning after DELETE or a user the
 /// tenant takes on: the audit event for it, recorded once the save succeeded. Without
 /// it, the user must still be the tenant's and live when the write runs. `externalId`
-/// can be set once, never changed.
+/// can be set once, never changed. The shown name is rebuilt only when a name attribute
+/// changed, so an admin's rename lasts until the IdP sends a new name.
 async fn update(app: &AppState, c: &Caller, user: &User, before: Option<&ScimUser>, d: &Attrs, taken: Option<(&str, Value)>) -> ScimRes<ScimUser> {
     if let Some(old) = before.and_then(|b| b.external_id.as_deref())
         && d.external_id.as_deref() != Some(old)
     {
         return Err(ScimError::new(StatusCode::BAD_REQUEST, Some("mutability"), "externalId can't change once set. Delete the user and provision the person again."));
     }
-    let shown = d.shown_name();
+    let shown = match before {
+        Some(b) if Attrs::of(b).names() == d.names() => user.name.clone(),
+        _ => d.shown_name(),
+    };
     app.db.save_scim_user(&c.token.tenant, &user.id, &fields(d, &shown), taken.is_some()).map_err(conflict)?;
     let after = app.db.scim_user(&c.token.tenant, &user.id).ok_or_else(|| server_error("user not saved"))?;
     if let Some((action, details)) = taken {
@@ -707,7 +725,28 @@ async fn update(app: &AppState, c: &Caller, user: &User, before: Option<&ScimUse
 /// The JSON body. A body over MAX_BODY, or one that can't be read, is a SCIM error too.
 fn parse_body(body: Result<Bytes, BytesRejection>) -> ScimRes<Value> {
     let body = body.map_err(|e| ScimError::new(e.status(), None, e.body_text()))?;
-    serde_json::from_slice(&body).map_err(|e| ScimError::new(StatusCode::BAD_REQUEST, Some("invalidSyntax"), format!("Invalid JSON: {e}")))
+    let v = serde_json::from_slice(&body).map_err(|e| ScimError::new(StatusCode::BAD_REQUEST, Some("invalidSyntax"), format!("Invalid JSON: {e}")))?;
+    no_twice(&v)?;
+    Ok(v)
+}
+
+/// Attribute names are case-insensitive, so `active` and `Active` in one object would
+/// be the same attribute twice. Refused rather than guessed at, at any depth.
+fn no_twice(v: &Value) -> ScimRes<()> {
+    match v {
+        Value::Object(o) => {
+            let mut seen = std::collections::HashSet::new();
+            for (k, x) in o {
+                if !seen.insert(k.to_ascii_lowercase()) {
+                    return Err(invalid(format!("{k} is sent more than once")));
+                }
+                no_twice(x)?;
+            }
+            Ok(())
+        }
+        Value::Array(l) => l.iter().try_for_each(no_twice),
+        _ => Ok(()),
+    }
 }
 
 fn need(app: &AppState, c: &Caller, id: &str) -> ScimRes<ScimUser> {
@@ -1029,6 +1068,22 @@ mod tests {
         ] {
             assert!(apply_patch(&mut ada(), &bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_same_attribute_twice_is_refused() {
+        let body = |v: Value| parse_body(Ok(Bytes::from(v.to_string())));
+        assert!(body(json!({ "userName": "x", "Active": false })).is_ok());
+        for twice in [
+            json!({ "userName": "x", "active": false, "Active": true }),
+            json!({ "userName": "x", "name": { "givenName": "a", "GivenName": "b" } }),
+            json!({ "userName": "x", "emails": [{ "value": "a@example.com", "Value": "b@example.com" }] }),
+            json!({ "Operations": [{ "op": "replace", "value": { "active": false, "ACTIVE": true } }] }),
+        ] {
+            assert!(body(twice.clone()).is_err(), "{twice}");
+        }
+        let prefixed = json!({ "Operations": [{ "op": "replace", "value": { "active": false, "urn:ietf:params:scim:schemas:core:2.0:User:active": true } }] });
+        assert!(apply_patch(&mut ada(), &prefixed).is_err());
     }
 
     #[test]

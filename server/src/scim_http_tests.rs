@@ -467,3 +467,44 @@ async fn an_sso_linked_tenant_provisions_people_who_then_sign_in() {
     assert_eq!(code, 409, "{body}");
     assert!(app.db.scim_user_of(users::OPERATOR).is_none());
 }
+
+#[tokio::test]
+async fn mixed_case_attributes_still_disable() {
+    let (port, app, admin) = serve(|_| {}).await;
+    let (t, _) = token(port, &admin, json!({ "tenant": "okta" })).await;
+    let mut ada = okta_user("ada@example.com", "00u1");
+    ada.as_object_mut().unwrap().remove("active");
+    ada["Active"] = json!(false);
+    let (code, _, u) = scim(port, &t, "POST", USERS, ada.clone()).await;
+    assert_eq!((code, u["active"].clone()), (201, json!(false)), "{u}");
+    assert!(!app.db.user(u["id"].as_str().unwrap()).unwrap().active());
+    let (code, head, body) = call_with(port, "POST", USERS, &format!("Bearer {t}"), "", r#"{"userName":"bo@example.com","active":false,"Active":true}"#).await;
+    assert_eq!(code, 400, "{body}");
+    is_scim_error(&head, &parse(&body), 400);
+}
+
+#[tokio::test]
+async fn admin_renames_last_until_the_idp_sends_a_name() {
+    let (port, app, admin) = serve(|_| {}).await;
+    let (t, _) = token(port, &admin, json!({ "tenant": "okta" })).await;
+    let mut ada = okta_user("ada@example.com", "00u1");
+    ada.as_object_mut().unwrap().remove("displayName");
+    let (_, _, u) = scim(port, &t, "POST", USERS, ada).await;
+    let id = u["id"].as_str().unwrap().to_string();
+    let path = format!("{USERS}/{id}");
+    let set = |p: &str, v: Value| json!({ "Operations": [{ "op": "replace", "path": p, "value": v }] });
+    let (_, _, u) = scim(port, &t, "PATCH", &path, set("name.familyName", json!("King"))).await;
+    assert_eq!(u["displayName"], "Ada King", "a name built from its parts follows them");
+
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{id}"), &admin, r#"{"name":"Ada (Eng)"}"#).await.0, 200);
+    let (_, _, u) = scim(port, &t, "PATCH", &path, set("active", json!(false))).await;
+    assert_eq!(u["displayName"], "Ada (Eng)", "an unrelated update keeps an admin's rename");
+    let mut same = okta_user("ada@example.com", "00u1");
+    same.as_object_mut().unwrap().remove("displayName");
+    same["name"]["familyName"] = json!("King");
+    let (_, _, u) = scim(port, &t, "PUT", &path, same).await;
+    assert_eq!(u["displayName"], "Ada (Eng)", "a PUT with the same names too");
+    let (_, _, u) = scim(port, &t, "PATCH", &path, set("displayName", json!("A. King"))).await;
+    assert_eq!(u["displayName"], "A. King");
+    assert_eq!(app.db.user(&id).unwrap().name, "A. King");
+}
