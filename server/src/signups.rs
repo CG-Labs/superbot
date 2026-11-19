@@ -4,7 +4,7 @@
 //! Design: docs/adr/0022-landing-and-signups.md.
 
 use crate::audit::{Actor, ActorKind, Outcome, Source, Who};
-use crate::db::{NewSignup, Signup, SignupError, User};
+use crate::db::{AddSignup, NewSignup, Signup, SignupError, User};
 use crate::rbac::Role;
 use crate::secrets::SecretStore;
 use crate::sso::Provider;
@@ -266,11 +266,8 @@ pub async fn submit(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
         return field_error("turnstileToken", "We couldn't verify you're a person. Try the check again.");
     }
     let hint = sso_hint(a.sso.providers.iter().filter(|p| p.ready()).map(|p| p.as_ref()), &form.email, &form.sign_in);
-    if app.db.pending_signups() >= MAX_PENDING {
-        refused("full", Some(&form));
-        return ApiError(StatusCode::SERVICE_UNAVAILABLE, "We can't take new requests right now. Please try again later.".into()).into_response();
-    }
-    let saved = app.db.add_signup(&NewSignup {
+    let saved = app.db.add_signup(
+        &NewSignup {
         name: &form.name,
         email: &form.email,
         company: &form.company,
@@ -279,11 +276,20 @@ pub async fn submit(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
         sign_in: &form.sign_in,
         ip: source.ip.as_deref(),
         user_agent: source.user_agent.as_deref(),
-    });
-    if let Some(su) = saved {
-        let who = Who { actor: visitor(Some(&su.name), Some(&su.email)), source: source.clone() };
-        app.db.record(&who.event("signup.submitted").target("signup", &su.id).details(json!({ "company": su.company, "teamSize": su.team_size, "signIn": su.sign_in })));
-        notify(Notice::Received(&su));
+        },
+        MAX_PENDING,
+    );
+    match saved {
+        Ok(su) => {
+            let who = Who { actor: visitor(Some(&su.name), Some(&su.email)), source: source.clone() };
+            app.db.record(&who.event("signup.submitted").target("signup", &su.id).details(json!({ "company": su.company, "teamSize": su.team_size, "signIn": su.sign_in })));
+            notify(Notice::Received(&su));
+        }
+        Err(AddSignup::Duplicate) => {}
+        Err(AddSignup::Full) => {
+            refused("full", Some(&form));
+            return ApiError(StatusCode::SERVICE_UNAVAILABLE, "We can't take new requests right now. Please try again later.".into()).into_response();
+        }
     }
     accepted(hint)
 }

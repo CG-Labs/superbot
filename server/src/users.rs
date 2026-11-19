@@ -115,14 +115,24 @@ impl Limiter {
         Limiter { hits: Mutex::default(), limit, window_ms }
     }
 
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (i64, u32)>> {
+        self.hits.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Seconds to wait, when this IP has hit the limit.
     pub fn blocked(&self, ip: &str, at: i64) -> Option<i64> {
-        let m = self.hits.lock().unwrap_or_else(|e| e.into_inner());
+        self.wait(&self.lock(), ip, at)
+    }
+
+    fn wait(&self, m: &HashMap<String, (i64, u32)>, ip: &str, at: i64) -> Option<i64> {
         m.get(ip).filter(|(start, n)| *n >= self.limit && at - start < self.window_ms).map(|(start, _)| (start + self.window_ms - at + 999) / 1000)
     }
 
     pub fn fail(&self, ip: &str, at: i64) {
-        let mut m = self.hits.lock().unwrap_or_else(|e| e.into_inner());
+        self.count(&mut self.lock(), ip, at);
+    }
+
+    fn count(&self, m: &mut HashMap<String, (i64, u32)>, ip: &str, at: i64) {
         if !m.contains_key(ip) && m.len() >= MAX_TRACKED {
             m.retain(|_, (start, _)| at - *start < self.window_ms);
             if m.len() >= MAX_TRACKED {
@@ -137,9 +147,11 @@ impl Limiter {
     }
 
     /// Counts one request, unless the IP is over the limit: then the seconds to wait.
+    /// One lock for both, so concurrent requests can't share the last slot.
     pub fn hit(&self, ip: &str, at: i64) -> Option<i64> {
-        self.blocked(ip, at).or_else(|| {
-            self.fail(ip, at);
+        let mut m = self.lock();
+        self.wait(&m, ip, at).or_else(|| {
+            self.count(&mut m, ip, at);
             None
         })
     }
@@ -568,6 +580,23 @@ pub fn start_pruning(app: AppState, cfg: SessionConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_hits_never_pass_the_limit() {
+        let limiter = std::sync::Arc::new(Limiter::new(5, MINUTE));
+        let passed: usize = (0..32)
+            .map(|_| {
+                let l = limiter.clone();
+                std::thread::spawn(move || l.hit("203.0.113.9", 1_000).is_none())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| usize::from(t.join().unwrap()))
+            .sum();
+        assert_eq!(passed, 5);
+        assert_eq!(limiter.hit("203.0.113.9", 1_000), Some(60));
+        assert_eq!(limiter.hit("203.0.113.9", 1_000 + MINUTE), None, "a new window");
+    }
 
     #[test]
     fn secrets_are_prefixed_random_and_hashed() {

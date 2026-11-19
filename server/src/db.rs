@@ -277,6 +277,14 @@ pub struct Signup {
 }
 
 #[derive(Debug, PartialEq)]
+pub enum AddSignup {
+    /// This email has a pending request already.
+    Duplicate,
+    /// The pending cap is reached.
+    Full,
+}
+
+#[derive(Debug, PartialEq)]
 pub enum SignupError {
     NotFound,
     /// Approved or rejected already: the status it has.
@@ -1514,18 +1522,21 @@ impl Db {
 
     // Sign-ups (ADR 0022)
 
-    /// Saves a request for access. None when this email already has one pending.
-    pub fn add_signup(&self, s: &NewSignup) -> Option<Signup> {
+    /// Saves a request for access, unless `max_pending` are pending already (one
+    /// statement, so concurrent requests can't pass the cap together).
+    pub fn add_signup(&self, s: &NewSignup, max_pending: i64) -> Result<Signup, AddSignup> {
         let id = format!("su{}", crate::short_id());
         let at = now();
         let res = self.c().execute(
             "INSERT INTO signups (id, name, email, company, team_size, use_case, sign_in, consent_at, ip, user_agent, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            params![id, s.name, s.email, s.company, s.team_size, s.use_case, s.sign_in, at, s.ip, s.user_agent, at],
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?8
+             WHERE (SELECT count(*) FROM signups WHERE status = 'pending') < ?11",
+            params![id, s.name, s.email, s.company, s.team_size, s.use_case, s.sign_in, at, s.ip, s.user_agent, max_pending],
         );
         match res {
-            Ok(_) => self.signup(&id),
-            Err(e) if constraint(&e) => None,
+            Ok(0) => Err(AddSignup::Full),
+            Ok(_) => self.signup(&id).ok_or(AddSignup::Full),
+            Err(e) if constraint(&e) => Err(AddSignup::Duplicate),
             Err(e) => panic!("save signup: {e}"),
         }
     }
@@ -1541,6 +1552,7 @@ impl Db {
         s.query_map(params![status, limit], signup_row).unwrap().filter_map(Result::ok).collect()
     }
 
+    #[cfg(test)]
     pub fn pending_signups(&self) -> i64 {
         self.c().query_row("SELECT count(*) FROM signups WHERE status = 'pending'", [], |r| r.get(0)).unwrap_or(0)
     }
@@ -1764,6 +1776,30 @@ mod tests {
 
     fn all_events(db: &Db) -> Vec<AuditEvent> {
         db.audit_events(&audit::Filter::default(), 1000, false)
+    }
+
+    #[test]
+    fn the_pending_cap_holds_under_concurrent_requests() {
+        let db = std::sync::Arc::new(Db::open(&temp_path("signup-cap").join("app.sqlite")).unwrap());
+        let results: Vec<_> = (0..16)
+            .map(|i| {
+                let db = db.clone();
+                std::thread::spawn(move || {
+                    let email = format!("p{i}@example.com");
+                    let s = NewSignup { name: "P", email: &email, company: "C", team_size: "1", use_case: "U", sign_in: "other", ip: None, user_agent: None };
+                    db.add_signup(&s, 3).map(|_| ())
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 3);
+        assert!(results.iter().all(|r| r.is_ok() || *r == Err(AddSignup::Full)));
+        assert_eq!(db.pending_signups(), 3);
+        let taken = db.signups(Some("pending"), 1)[0].email.to_uppercase();
+        let s = NewSignup { name: "P", email: &taken, company: "C", team_size: "1", use_case: "U", sign_in: "other", ip: None, user_agent: None };
+        assert_eq!(db.add_signup(&s, 10).map(|_| ()), Err(AddSignup::Duplicate), "emails match without case");
     }
 
     #[test]

@@ -101,7 +101,7 @@ state=$(curl -fsS "${AUTH[@]}" "$BASE/api/state")
 grep -q '"name":"Smoke"' <<<"$state" || fail "USER_NAME from .env not applied: $state"
 
 log "Sessions: the password signs in as the owner; the token works until logout"
-expect_code 303 "$BASE/"
+expect_code 303 "$BASE/console/"
 login=$(curl -fsS -H 'Content-Type: application/json' -d "{\"password\":\"$PASSWORD\"}" "$BASE/api/auth/login")
 TOKEN=$(sed -n 's/.*"token":"\(sbs_[0-9a-f]*\)".*/\1/p' <<<"$login")
 [[ -n "$TOKEN" ]] || fail "no session token from /api/auth/login"
