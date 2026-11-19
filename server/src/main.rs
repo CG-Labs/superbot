@@ -2,18 +2,22 @@
 //! on its harness (Claude Code, Codex, or Pi); serves the web app and its API.
 
 mod adapters;
+mod approvals;
 mod cron;
 mod db;
+mod policy;
 mod runner;
 mod screen;
 
-use axum::extract::{Path, Request, State};
+use approvals::{DecideError, Remember};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
+use std::collections::HashMap;
 use db::{BotPatch, Db};
 use runner::{App, Config};
 use serde_json::{json, Value};
@@ -105,30 +109,14 @@ async fn main() {
         app.init_bot_files(&bot);
     }
 
-    let api = Router::new()
-        .route("/state", get(state))
-        .route("/events", get(events))
-        .route("/harnesses/{name}/models", get(list_models))
-        .route("/bots", get(list_bots).post(create_bot))
-        .route("/bots/{id}", patch(update_bot).delete(delete_bot))
-        .route("/bots/{id}/messages", get(list_messages).post(send_message))
-        .route("/bots/{id}/read", post(mark_read))
-        .route("/bots/{id}/stop", post(stop_bot))
-        .route("/bots/{id}/routines", get(list_routines).post(create_routine))
-        .route("/routines/{id}", patch(update_routine).delete(delete_routine))
-        .route("/bots/{id}/screen", get(screen_info))
-        .route("/ask", post(ask))
-        .route("/handoff", post(handoff));
-    let router = Router::new()
-        .route("/healthz", get(|| async { Json(json!({ "ok": true })) }))
-        .merge(
-            Router::new()
-                .nest("/api", api)
-                .fallback(get(web))
-                .layer(middleware::from_fn_with_state(auth_state, auth)),
-        )
-        .layer(cors_layer())
-        .with_state(app.clone());
+    let router = router(app.clone(), auth_state);
+    let policy = app.db.global_policy();
+    if policy.mode == policy::Mode::Bypass {
+        eprintln!(
+            "WARNING: harness policy is bypass: Bots run every tool without asking. \
+             Opt in to approvals with `botctl policy set global mode=ask` (see docs/backend.md)."
+        );
+    }
 
     app.recover();
     cron::start(app.clone());
@@ -166,6 +154,43 @@ async fn main() {
     axum::serve(listener, router).await.unwrap();
 }
 
+fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
+    let api = Router::new()
+        .route("/state", get(state))
+        .route("/events", get(events))
+        .route("/harnesses/{name}/models", get(list_models))
+        .route("/bots", get(list_bots).post(create_bot))
+        .route("/bots/{id}", patch(update_bot).delete(delete_bot))
+        .route("/bots/{id}/messages", get(list_messages).post(send_message))
+        .route("/bots/{id}/read", post(mark_read))
+        .route("/bots/{id}/stop", post(stop_bot))
+        .route("/bots/{id}/routines", get(list_routines).post(create_routine))
+        .route("/routines/{id}", patch(update_routine).delete(delete_routine))
+        .route("/bots/{id}/screen", get(screen_info))
+        .route("/bots/{id}/policy", get(get_bot_policy).put(put_bot_policy).delete(delete_bot_policy))
+        .route("/policy", get(get_policy).put(put_policy))
+        .route("/policy/rules", get(list_rules).post(add_rule))
+        .route("/policy/rules/{id}", delete(delete_rule))
+        .route("/approvals", get(list_approvals))
+        // A file write's full content passes through here, so allow big bodies.
+        .route("/approvals/check", post(check_approval).layer(DefaultBodyLimit::max(32 * 1024 * 1024)))
+        .route("/approvals/{id}/approve", post(approve))
+        .route("/approvals/{id}/deny", post(deny))
+        .route("/audit", get(list_audit))
+        .route("/ask", post(ask))
+        .route("/handoff", post(handoff));
+    Router::new()
+        .route("/healthz", get(|| async { Json(json!({ "ok": true })) }))
+        .merge(
+            Router::new()
+                .nest("/api", api)
+                .fallback(get(web))
+                .layer(middleware::from_fn_with_state(auth_state, auth)),
+        )
+        .layer(cors_layer())
+        .with_state(app)
+}
+
 // Errors
 
 struct ApiError(StatusCode, String);
@@ -193,6 +218,7 @@ fn cors_layer() -> CorsLayer {
         .allow_methods([
             Method::GET,
             Method::POST,
+            Method::PUT,
             Method::PATCH,
             Method::DELETE,
             Method::OPTIONS,
@@ -296,19 +322,37 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
         return (StatusCode::FORBIDDEN, "Unknown Host. Add it to ALLOWED_HOSTS.").into_response();
     }
     let h = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
-    let ok = (a.allow_no_auth && a.password.is_empty())
-        || h.strip_prefix("Bearer ")
-            .is_some_and(|t| same(t.as_bytes(), a.bot_token.as_bytes()))
-        || h.strip_prefix("Basic ")
-            .and_then(base64_decode)
-            .is_some_and(|creds| {
-                let pass = creds.splitn(2, |b| *b == b':').nth(1).unwrap_or_default();
-                !a.password.is_empty() && same(pass, a.password.as_bytes())
-            });
-    if ok {
-        next.run(req).await
+    let bot = h.strip_prefix("Bearer ").is_some_and(|t| same(t.as_bytes(), a.bot_token.as_bytes()));
+    let user = h.strip_prefix("Basic ").and_then(base64_decode).is_some_and(|creds| {
+        let pass = creds.splitn(2, |b| *b == b':').nth(1).unwrap_or_default();
+        !a.password.is_empty() && same(pass, a.password.as_bytes())
+    });
+    let who = if bot {
+        Principal::Bot
+    } else if user || (a.allow_no_auth && a.password.is_empty()) {
+        Principal::User
     } else {
-        (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Basic realm=\"Bots\"")], "Login required").into_response()
+        return (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Basic realm=\"Bots\"")], "Login required").into_response();
+    };
+    let mut req = req;
+    req.extensions_mut().insert(who);
+    next.run(req).await
+}
+
+/// Who is calling: a person (the browser or client, with AUTH_PASSWORD) or a Bot
+/// (`botctl`, with the per-start BOT_TOKEN that every Bot run can read).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Principal {
+    User,
+    Bot,
+}
+
+/// Approvals and policy changes are for people. Bots hold a token too, so without
+/// this a Bot could approve its own request.
+fn need_user(p: Principal) -> Res<()> {
+    match p {
+        Principal::User => Ok(()),
+        Principal::Bot => Err(ApiError(StatusCode::FORBIDDEN, "Only a signed-in person can do this, not a Bot.".into())),
     }
 }
 
@@ -370,13 +414,16 @@ async fn events(State(app): State<AppState>) -> impl IntoResponse {
 
 // Bots
 
-async fn state(State(app): State<AppState>) -> Json<Value> {
+async fn state(State(app): State<AppState>, Extension(who): Extension<Principal>) -> Json<Value> {
     let bots: Vec<Value> = app.db.bots().iter().map(|b| app.bot_view(b)).collect();
+    let approvals = if who == Principal::User { app.db.approvals(Some("pending"), None, 200) } else { vec![] };
     Json(json!({
         "me": { "name": env("USER_NAME", "You") },
         "harnesses": adapters::installed(),
         "defaultHarness": app.cfg.default_harness,
         "bots": bots,
+        "policy": app.db.global_policy(),
+        "approvals": approvals,
     }))
 }
 
@@ -597,6 +644,155 @@ async fn delete_routine(State(app): State<AppState>, Path(id): Path<String>) -> 
     app.db.routine(&id).ok_or_else(|| not_found("Routine"))?;
     app.db.delete_routine(&id);
     Ok(Json(json!({ "ok": true })))
+}
+
+// Harness policy: global default, per-Bot overrides, and allow/deny rules.
+// Anyone signed in can read it; only a person can change it.
+
+fn classes_view() -> Value {
+    json!(policy::CLASSES.iter().map(|(id, label)| json!({ "id": id, "label": label })).collect::<Vec<_>>())
+}
+
+async fn get_policy(State(app): State<AppState>) -> Json<Value> {
+    Json(json!({ "policy": app.db.global_policy(), "classes": classes_view(), "rules": app.db.rules(None) }))
+}
+
+async fn put_policy(State(app): State<AppState>, Extension(who): Extension<Principal>, Json(v): Json<Value>) -> Res {
+    need_user(who)?;
+    let before = app.db.global_policy();
+    let after = policy::parse_patch(&v).map_err(bad)?.apply(&before);
+    app.db.set_global_policy(&after);
+    app.db.audit("user", "policy.updated", None, Some("global"), json!({ "before": before, "after": after }));
+    for b in app.db.bots() {
+        app.push_bot(&b.id);
+    }
+    Ok(Json(json!({ "policy": after })))
+}
+
+fn bot_policy_view(app: &App, id: &str) -> Value {
+    json!({ "policy": app.db.effective_policy(id), "override": app.db.bot_override(id), "classes": classes_view(), "rules": app.db.rules(Some(id)) })
+}
+
+async fn get_bot_policy(State(app): State<AppState>, Path(id): Path<String>) -> Res {
+    need_bot(&app, &id)?;
+    Ok(Json(bot_policy_view(&app, &id)))
+}
+
+async fn put_bot_policy(State(app): State<AppState>, Extension(who): Extension<Principal>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
+    need_user(who)?;
+    need_bot(&app, &id)?;
+    let before = app.db.bot_override(&id);
+    let mut o = before.clone().unwrap_or_default();
+    o.merge(policy::parse_patch(&v).map_err(bad)?);
+    app.db.set_bot_override(&id, Some(&o));
+    app.db.audit("user", "policy.updated", Some(&id), Some(&id), json!({ "before": before, "after": o }));
+    app.push_bot(&id);
+    Ok(Json(bot_policy_view(&app, &id)))
+}
+
+async fn delete_bot_policy(State(app): State<AppState>, Extension(who): Extension<Principal>, Path(id): Path<String>) -> Res {
+    need_user(who)?;
+    need_bot(&app, &id)?;
+    let before = app.db.bot_override(&id);
+    app.db.set_bot_override(&id, None);
+    app.db.audit("user", "policy.reset", Some(&id), Some(&id), json!({ "before": before }));
+    app.push_bot(&id);
+    Ok(Json(bot_policy_view(&app, &id)))
+}
+
+async fn list_rules(State(app): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Json<Value> {
+    Json(json!(app.db.rules(q.get("bot").map(String::as_str))))
+}
+
+async fn add_rule(State(app): State<AppState>, Extension(who): Extension<Principal>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
+    need_user(who)?;
+    let bot = v["botId"].as_str().filter(|b| !b.is_empty());
+    if let Some(b) = bot {
+        need_bot(&app, b)?;
+    }
+    let action = match v["action"].as_str() {
+        Some("allow") => policy::Action::Allow,
+        Some("deny") => policy::Action::Deny,
+        _ => return Err(bad("action must be \"allow\" or \"deny\"")),
+    };
+    let pattern = v["pattern"].as_str().map(str::trim).filter(|p| !p.is_empty()).ok_or_else(|| bad("pattern is required"))?;
+    let tool = v["tool"].as_str().map(str::trim).filter(|t| !t.is_empty()).unwrap_or("*");
+    let r = app.db.add_rule(bot, action, tool, pattern, v["note"].as_str());
+    app.db.audit("user", "rule.added", bot, Some(&r.id), json!({ "rule": r }));
+    Ok((StatusCode::CREATED, Json(json!(r))))
+}
+
+async fn delete_rule(State(app): State<AppState>, Extension(who): Extension<Principal>, Path(id): Path<String>) -> Res {
+    need_user(who)?;
+    let r = app.db.rule(&id).ok_or_else(|| not_found("Rule"))?;
+    app.db.delete_rule(&id);
+    app.db.audit("user", "rule.removed", r.bot_id.as_deref(), Some(&id), json!({ "rule": r }));
+    Ok(Json(json!({ "ok": true })))
+}
+
+// Approvals
+
+async fn list_approvals(State(app): State<AppState>, Extension(who): Extension<Principal>, Query(q): Query<HashMap<String, String>>) -> Res {
+    need_user(who)?;
+    let limit = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(100).clamp(1, 1000);
+    let status = q.get("status").map(String::as_str).filter(|s| *s != "all");
+    Ok(Json(json!(app.db.approvals(status, q.get("bot").map(String::as_str), limit))))
+}
+
+async fn approve(state: State<AppState>, who: Extension<Principal>, id: Path<String>, body: Option<Json<Value>>) -> Res {
+    decide(state, who, id, body, true).await
+}
+
+async fn deny(state: State<AppState>, who: Extension<Principal>, id: Path<String>, body: Option<Json<Value>>) -> Res {
+    decide(state, who, id, body, false).await
+}
+
+/// Body: `{remember?: "bot" | "global" | true, note?}`. Remember saves a rule for this exact call.
+async fn decide(State(app): State<AppState>, Extension(who): Extension<Principal>, Path(id): Path<String>, body: Option<Json<Value>>, approve: bool) -> Res {
+    need_user(who)?;
+    let v = body.map(|Json(v)| v).unwrap_or_default();
+    let remember = match &v["remember"] {
+        Value::Bool(true) => Some(Remember::Bot),
+        Value::String(s) if s == "bot" => Some(Remember::Bot),
+        Value::String(s) if s == "global" => Some(Remember::Global),
+        Value::Null | Value::Bool(false) => None,
+        _ => return Err(bad("remember must be \"bot\", \"global\", or true")),
+    };
+    let note: Option<String> = v["note"].as_str().map(|n| n.trim().chars().take(500).collect()).filter(|n: &String| !n.is_empty());
+    match app.decide(&id, approve, remember, note.as_deref()) {
+        Ok(a) => Ok(Json(json!(a))),
+        Err(DecideError::NotFound) => Err(not_found("Approval")),
+        Err(DecideError::Closed(s)) => Err(ApiError(StatusCode::CONFLICT, format!("This approval is already {s}"))),
+    }
+}
+
+/// The harness hook (`botctl hook <harness>`) asks here before each tool call.
+/// Body: `{from, harness, event}` with the harness's PreToolUse payload. Waits while
+/// the user decides. Replies in plain text: "allow" or "deny", then the reason.
+async fn check_approval(State(app): State<AppState>, Json(v): Json<Value>) -> Response {
+    let reply = |allow: bool, reason: &str| {
+        let body = format!("{}\n{reason}", if allow { "allow" } else { "deny" });
+        ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response()
+    };
+    let Some(bot) = v["from"].as_str().and_then(|id| app.db.bot(id)) else {
+        return reply(false, "Unknown Bot (BOT_ID)");
+    };
+    let e = &v["event"];
+    let Some(tool) = e["tool_name"].as_str().filter(|t| !t.is_empty()) else {
+        return reply(false, "The hook sent no tool name");
+    };
+    let harness = v["harness"].as_str().unwrap_or(&bot.harness).to_string();
+    let cwd = e["cwd"].as_str().filter(|c| c.starts_with('/')).map(PathBuf::from);
+    let verdict = app.check(&bot, &harness, tool, e["tool_input"].clone(), cwd).await;
+    reply(verdict.action == policy::Action::Allow, &verdict.reason)
+}
+
+/// The append-only audit log, newest first. `?before=<id>` pages back.
+async fn list_audit(State(app): State<AppState>, Extension(who): Extension<Principal>, Query(q): Query<HashMap<String, String>>) -> Res {
+    need_user(who)?;
+    let limit = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(100).clamp(1, 1000);
+    let before = q.get("before").and_then(|b| b.parse().ok());
+    Ok(Json(json!(app.db.audit_events(limit, before))))
 }
 
 #[cfg(test)]

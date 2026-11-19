@@ -1,16 +1,21 @@
 //! Runs Bots: one task at a time per Bot, in order. Builds the system prompt
 //! (identity, rules, memory), streams harness events to the web app, and saves replies.
 
-use crate::adapters::{self, AbortReason, AgentEvent, RunInput};
+use crate::adapters::{self, AbortReason, AgentEvent, Guard, RunInput};
 use crate::db::{Bot, BotPatch, Db, Message};
+use crate::policy::Mode;
 use crate::screen::{self, Screens};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, oneshot, watch};
+
+/// How long after a guarded run's first shell tool the approval hook must have
+/// called in. If it hasn't, the harness ignored the hook and the run is stopped.
+const HOOK_GRACE: Duration = Duration::from_secs(5);
 
 pub struct Config {
     pub data_dir: PathBuf,
@@ -28,6 +33,10 @@ struct Run {
     abort: watch::Sender<AbortReason>,
     status: String,
     draft: String,
+    /// Approval hook calls during this run.
+    hooks: Arc<AtomicU32>,
+    /// Longest an approval may wait: just under the harness's hook timeout.
+    hook_wait: Option<Duration>,
 }
 
 #[derive(Default)]
@@ -47,12 +56,37 @@ pub struct App {
     bots: Mutex<HashMap<String, BotState>>,
     /// Bots waiting on `botctl ask` or `botctl handoff`, by the message's id.
     waiters: Mutex<HashMap<i64, oneshot::Sender<String>>>,
+    /// Tool calls waiting on the user, by approval id. true = approved.
+    pub approval_waiters: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     closing: AtomicBool,
 }
 
 impl App {
     pub fn new(db: Db, cfg: Config, screens: Option<Screens>) -> Arc<App> {
-        Arc::new(App { db, cfg, tx: broadcast::channel(1024).0, screens, bots: Mutex::default(), waiters: Mutex::default(), closing: AtomicBool::new(false) })
+        Arc::new(App {
+            db,
+            cfg,
+            tx: broadcast::channel(1024).0,
+            screens,
+            bots: Mutex::default(),
+            waiters: Mutex::default(),
+            approval_waiters: Mutex::default(),
+            closing: AtomicBool::new(false),
+        })
+    }
+
+    /// Counts an approval hook call for the Bot's run. Returns how long an approval may wait.
+    pub fn note_hook(&self, bot_id: &str) -> Option<Duration> {
+        self.with_run(bot_id, |r| {
+            r.hooks.fetch_add(1, Ordering::SeqCst);
+            r.hook_wait
+        })
+    }
+
+    pub fn set_run_status(&self, bot_id: &str, status: &str) {
+        if self.with_run(bot_id, |r| { r.status = status.into(); true }) {
+            self.send(json!({ "type": "status", "botId": bot_id, "working": true, "status": status }));
+        }
     }
 
     pub fn is_running(&self, bot_id: &str) -> bool {
@@ -77,6 +111,7 @@ impl App {
         let mut v = json!({
             "id": b.id, "name": b.name, "color": b.color, "shape": b.shape, "harness": b.harness, "model": b.model, "effort": b.effort,
             "primary": b.primary, "hidden": b.hidden, "unread": b.unread, "preview": preview.unwrap_or_default(), "working": false,
+            "policy": self.db.effective_policy(&b.id).mode, "policyOverride": self.db.bot_override(&b.id).is_some(),
         });
         if let Some(run) = self.state().get(&b.id).and_then(|s| s.run.as_ref()) {
             v["working"] = json!(true);
@@ -176,19 +211,37 @@ impl App {
 
         for attempt in 0..2 {
             let (abort_tx, abort_rx) = watch::channel(None);
-            self.state().entry(bot.id.clone()).or_default().run =
-                Some(Run { abort: abort_tx.clone(), status: "Thinking".into(), draft: String::new() });
+            // Ask mode: the harness calls `botctl hook` before every tool. Its hook timeout
+            // stays above our wait, so the hook is never killed into failing open.
+            let policy = self.db.effective_policy(&bot.id);
+            let guard = (policy.mode == Mode::Ask).then(|| {
+                let wait = Duration::from_secs(policy.timeout_minutes as u64 * 60 + 60);
+                let botctl = self.cfg.bin_dir.join("botctl").display().to_string();
+                Guard { command: format!("{} hook {}", shell_quote(&botctl), bot.harness), timeout_secs: wait.as_secs() + 60, wait }
+            });
+            let hooks = Arc::new(AtomicU32::new(0));
+            self.state().entry(bot.id.clone()).or_default().run = Some(Run {
+                abort: abort_tx.clone(),
+                status: "Thinking".into(),
+                draft: String::new(),
+                hooks: hooks.clone(),
+                hook_wait: guard.as_ref().map(|g| g.wait),
+            });
             self.send(json!({ "type": "status", "botId": bot.id, "working": true, "status": "Thinking" }));
             let timeout = self.cfg.run_timeout;
-            let timer = tokio::spawn(async move {
-                tokio::time::sleep(timeout).await;
-                abort_tx.send_if_modified(|r| r.get_or_insert("timeout") == &"timeout");
+            let timer = tokio::spawn({
+                let abort_tx = abort_tx.clone();
+                async move {
+                    tokio::time::sleep(timeout).await;
+                    abort_tx.send_if_modified(|r| r.get_or_insert("timeout") == &"timeout");
+                }
             });
 
             let mut env = HashMap::from([
                 ("BOT_ID".to_string(), bot.id.clone()),
                 ("BOT_API".to_string(), self.cfg.api_url.clone()),
                 ("BOT_TOKEN".to_string(), self.cfg.bot_token.clone()),
+                ("SUPERBOT_BOTCTL".to_string(), self.cfg.bin_dir.join("botctl").display().to_string()),
             ]);
             let path = std::env::var("PATH").unwrap_or_default();
             env.insert("PATH".into(), format!("{}:{path}", self.cfg.bin_dir.display()));
@@ -206,11 +259,13 @@ impl App {
                 effort: bot.effort.clone(),
                 env,
                 state_dir: self.bot_dir(&bot.id),
+                guard: guard.clone(),
             };
 
             let mut errors: Vec<String> = Vec::new();
             let mut replies = 0;
             let id = bot.id.clone();
+            let mut canary: Option<tokio::task::JoinHandle<()>> = None;
             adapters::run(adapters::get(&bot.harness).unwrap(), input, abort_rx.clone(), |e| match e {
                 AgentEvent::Session(s) => {
                     if self.db.bot(&id).and_then(|b| b.session_id).as_deref() != Some(&s) {
@@ -227,6 +282,17 @@ impl App {
                     self.say(&id, &t, false);
                 }
                 AgentEvent::Tool { name, detail } => {
+                    // Fail closed: a guarded harness that runs a shell tool without ever
+                    // calling the hook isn't enforcing approvals, so stop it.
+                    if guard.is_some() && canary.is_none() && ["bash", "shell"].contains(&name.to_lowercase().as_str()) {
+                        let (hooks, abort) = (hooks.clone(), abort_tx.clone());
+                        canary = Some(tokio::spawn(async move {
+                            tokio::time::sleep(HOOK_GRACE).await;
+                            if hooks.load(Ordering::SeqCst) == 0 {
+                                abort.send_if_modified(|r| r.get_or_insert("unguarded") == &"unguarded");
+                            }
+                        }));
+                    }
                     let status = tool_label(&name, &detail);
                     self.with_run(&id, |r| r.status = status.clone());
                     self.send(json!({ "type": "status", "botId": id, "working": true, "status": status }));
@@ -235,6 +301,10 @@ impl App {
             })
             .await;
             timer.abort();
+            if let Some(c) = canary {
+                c.abort();
+            }
+            self.cancel_approvals(&id, "The task ended");
             // Done running. The stream may have ended without a final block: keep what was streamed.
             let draft = self.state().get_mut(&id).and_then(|s| s.run.take()).map(|r| r.draft).unwrap_or_default();
             if !draft.trim().is_empty() {
@@ -258,6 +328,15 @@ impl App {
             match *abort_rx.borrow() {
                 Some("shutdown") => {}
                 Some("stopped") => self.say(&id, "Stopped.", true),
+                Some("unguarded") => self.say(
+                    &id,
+                    &format!(
+                        "I stopped: {} ran a command without checking SuperBot's approval gate, so approvals aren't enforced for me. \
+                         Update the {} CLI, or set my approvals to bypass (dev only).",
+                        bot.harness, bot.harness
+                    ),
+                    true,
+                ),
                 Some("timeout") => {
                     let mins = self.cfg.run_timeout.as_secs() / 60;
                     self.say(&id, &format!("I hit the {mins} minute limit for one task and stopped."), true)
@@ -340,15 +419,18 @@ impl App {
 
     /// Stops the current task and drops queued ones.
     pub fn stop(&self, bot_id: &str) {
-        let mut st = self.state();
-        if let Some(s) = st.get_mut(bot_id) {
-            for m in s.queue.drain(..) {
-                self.db.set_status(m.id, "done");
-            }
-            if let Some(r) = &s.run {
-                r.abort.send_if_modified(|v| v.get_or_insert("stopped") == &"stopped");
+        {
+            let mut st = self.state();
+            if let Some(s) = st.get_mut(bot_id) {
+                for m in s.queue.drain(..) {
+                    self.db.set_status(m.id, "done");
+                }
+                if let Some(r) = &s.run {
+                    r.abort.send_if_modified(|v| v.get_or_insert("stopped") == &"stopped");
+                }
             }
         }
+        self.cancel_approvals(bot_id, "The Bot was stopped");
     }
 
     /// Kills running agents. Queued messages run after the restart.
@@ -368,6 +450,7 @@ impl App {
     /// After a restart: queued messages run. Interrupted ones are reported, not
     /// re-run, because re-running could repeat actions like sending an email.
     pub fn recover(self: &Arc<Self>) {
+        self.expire_stale_approvals();
         for m in self.db.pending() {
             if self.db.bot(&m.bot_id).is_none() {
                 continue;
@@ -416,7 +499,7 @@ They talk to you in a chat app, like messaging a coworker. Finish work end to en
 ## Style
 - Reply like a teammate in chat: short, plain English. Markdown is fine.
 - Each separate text block you write is shown as its own chat bubble. Before long work, send a one-line heads-up.
-- Ask before anything you can't undo: sending messages, publishing, deleting, paying.
+- Ask before anything you can't undo: sending messages, publishing, deleting, paying.{approvals}
 - To ask a multiple-choice question, end your reply with this block, and nothing after it:
 ```question
 {{"title": "Your question?", "options": ["First", "Second", "Third"]}}
@@ -433,6 +516,12 @@ Current time: {now}."#,
             botctl = self.cfg.bin_dir.join("botctl").display(),
             screen = if self.screens.is_some() { screen_prompt(&self.cfg.bin_dir.join("botctl").display().to_string()) } else { String::new() },
             user = self.cfg.user_name,
+            approvals = if self.db.effective_policy(&bot.id).mode == Mode::Ask {
+                "\n- Risky actions (destructive commands, deleting outside your folder, sending messages, installing software, git push) \
+                 pause until the user approves them in the app. If one is denied, don't try another way to do it; tell the user what you wanted to do."
+            } else {
+                ""
+            },
             ws = self.cfg.workspace.display(),
             mem_path = self.memory_file(&bot.id).display(),
             user_path = self.user_file().display(),
@@ -442,6 +531,32 @@ Current time: {now}."#,
             now = chrono::Local::now().format("%A, %B %-d, %Y, %H:%M (UTC%:z)"),
         )
     }
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+pub fn test_app() -> Arc<App> {
+    let dir = crate::db::temp_path("app");
+    let db = Db::open(&dir.join("app.sqlite")).unwrap();
+    let workspace = dir.join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    App::new(
+        db,
+        Config {
+            data_dir: dir.clone(),
+            workspace,
+            user_name: "Tester".into(),
+            bin_dir: dir,
+            api_url: "http://127.0.0.1:1".into(),
+            bot_token: "bot-token".into(),
+            run_timeout: Duration::from_secs(60),
+            default_harness: "claude".into(),
+        },
+        None,
+    )
 }
 
 /// Splits off a trailing ```question {json}``` block.

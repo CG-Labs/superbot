@@ -2,7 +2,7 @@
 //! Resumes with `--resume <session id>`. The system prompt is applied fresh every run.
 
 use super::{describe, new_uuid, str_of, Adapter, AgentEvent, ModelOption, RunInput};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 #[derive(Default)]
 pub struct Claude {
@@ -24,6 +24,13 @@ impl Adapter for Claude {
         .map(String::from)
         .into();
         a.extend([if input.session_id.is_some() { "--resume" } else { "--session-id" }.into(), self.id.clone()]);
+        // A PreToolUse deny holds even with --dangerously-skip-permissions. Flag settings
+        // outrank project files, so a workspace `disableAllHooks` can't switch it off.
+        if let Some(g) = &input.guard {
+            let hook = json!({ "type": "command", "command": g.command, "timeout": g.timeout_secs });
+            let settings = json!({ "disableAllHooks": false, "hooks": { "PreToolUse": [{ "matcher": "*", "hooks": [hook] }] } });
+            a.extend(["--settings".into(), settings.to_string()]);
+        }
         if let Some(m) = &input.model {
             a.extend(["--model".into(), m.clone()]);
         }
