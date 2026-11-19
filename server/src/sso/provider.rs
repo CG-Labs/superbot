@@ -535,20 +535,21 @@ mod tests {
     fn google_tokens_pass_the_shared_checks_too() {
         let p = google(&["example.com"]);
         let now = 1_800_000_000;
+        let (nonce, other) = (crate::random_hex(16), crate::random_hex(16));
         let base = |extra: Value| {
-            let mut c = g(json!({ "aud": "client-1", "nonce": "n1", "iat": now, "exp": now + 3600 }));
+            let mut c = g(json!({ "aud": "client-1", "nonce": nonce, "iat": now, "exp": now + 3600 }));
             c.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
             c
         };
         let run = |c: Value| {
             let t = signed(c);
-            t.check("client-1", "n1", now)?;
+            t.check("client-1", &nonce, now)?;
             p.claims(&t, &meta(GOOGLE_ISSUER))
         };
         assert!(run(base(json!({}))).is_ok());
         assert_eq!(run(base(json!({ "aud": "someone-else" }))).err(), Some(Invalid("wrong_audience")));
         assert_eq!(run(base(json!({ "exp": now - 3600 }))).err(), Some(Invalid("expired")));
-        assert_eq!(run(base(json!({ "nonce": "n2" }))).err(), Some(Invalid("nonce_mismatch")));
+        assert_eq!(run(base(json!({ "nonce": other }))).err(), Some(Invalid("nonce_mismatch")));
         assert_eq!(run(base(json!({ "hd": "evil.example" }))).err(), Some(Invalid("wrong_domain")));
     }
 
