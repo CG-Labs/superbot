@@ -99,6 +99,7 @@ Details: [VM specs](docs/background/grok-bot-computer-specs.md) and [running man
 
 ## Docs
 
+- [Product roadmap](docs/ROADMAP.md): commercial product plan (self-hosted and managed).
 - [Grok Bot reference](docs/grok-bot-reference.md): what we are rebuilding.
 - [Architecture](docs/architecture.md): the plan and open decisions.
 - [Backend](docs/backend.md): how the server works, and how to run and deploy it.
