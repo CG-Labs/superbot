@@ -3,10 +3,11 @@
 //! hook to `botctl hook`, and the call lands here as a tool name plus its input.
 //!
 //! The classifier is a guardrail against mistakes and prompt injection, not a
-//! sandbox: it reads commands lexically and cannot see what a script does inside.
+//! sandbox: it parses commands (`crate::shell`) but cannot see what a script does inside.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use crate::shell::{self, Word};
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
@@ -301,6 +302,9 @@ pub fn decide(p: &Policy, rules: &[Rule], call: &Call, ctx: &Ctx) -> Verdict {
         return Verdict { action: Action::Deny, class: None, reason: format!("Matches deny rule \"{}\"", r.pattern), rule: Some(r.id.clone()) };
     }
     let found = classify(call, ctx);
+    if let Some((_, why)) = found.iter().find(|(c, _)| *c == UNREADABLE) {
+        return Verdict { action: Action::Deny, class: Some(UNREADABLE), reason: why.clone(), rule: None };
+    }
     let Some((class, why, action)) = found.iter().map(|(c, why)| (*c, why, p.action(c))).max_by_key(|x| x.2) else {
         return Verdict::allow("Not a risky action");
     };
@@ -359,22 +363,36 @@ const MESSAGING_HOSTS: [&str; 22] = [
     "webhook.office.com", "chat.googleapis.com", "api.agentmail.to", "api.pushover.net", "smtp://", "smtps://",
 ];
 
+/// Not a configurable class: a shell command the parser can't read is refused.
+pub const UNREADABLE: &str = "shell_unreadable";
+
 const SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ksh", "fish"];
 
-fn classify_shell(cmd: &str, cwd: &Path, ctx: &Ctx, depth: u8, out: &mut Vec<(&'static str, String)>) {
-    if depth > 3 {
-        return;
-    }
+fn classify_shell(cmd: &str, cwd: &Path, ctx: &Ctx, depth: usize, out: &mut Vec<(&'static str, String)>) {
+    let cmds = match shell::parse(cmd, depth) {
+        Ok(cmds) => cmds,
+        Err(e) => return out.push((UNREADABLE, format!("Can't check this command safely: {e}"))),
+    };
     let mut cwd = cwd.to_path_buf();
-    let mut prev: Option<String> = None;
-    for seg in split_commands(cmd) {
-        let argv = strip_wrappers(&seg.argv, out);
-        let Some(first) = argv.first() else { continue };
-        let prog = program(first);
-        let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
-        let piped_download = seg.piped && prev.as_deref().is_some_and(|p| p == "curl" || p == "wget");
-        prev = Some(prog.clone());
+    for c in &cmds {
+        let words = strip_wrappers(&c.argv, out);
+        let Some(first) = words.first() else { continue };
+        if first.dynamic {
+            out.push(("shell_destructive", format!("Runs a command only known when it runs ({})", first.text)));
+            continue;
+        }
+        let prog = program(&first.text);
+        let args: Vec<&str> = words[1..].iter().map(|w| w.text.as_str()).collect();
+        let piped_download = c.pipe_from.and_then(|j| cmds[j].argv.first()).is_some_and(|w| ["curl", "wget"].contains(&program(&w.text).as_str()));
 
+        if prog == "eval" {
+            if words[1..].iter().any(|w| w.dynamic) {
+                out.push(("shell_destructive", "Runs code only known when it runs (eval)".into()));
+            } else {
+                classify_shell(&args.join(" "), &cwd, ctx, depth + 1, out);
+            }
+            continue;
+        }
         if SHELLS.contains(&prog.as_str()) || prog.starts_with("python") || prog == "perl" || prog == "node" || prog == "ruby" {
             if piped_download && !args.iter().any(|a| a.starts_with("-c") || a.starts_with("-e")) {
                 out.push(("network_install", "Runs a downloaded script".into()));
@@ -382,8 +400,10 @@ fn classify_shell(cmd: &str, cwd: &Path, ctx: &Ctx, depth: u8, out: &mut Vec<(&'
             if SHELLS.contains(&prog.as_str()) {
                 // `bash -lc '<script>'`: classify the script too.
                 let flag = args.iter().position(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c'));
-                if let Some(script) = flag.and_then(|i| args.get(i + 1)) {
-                    classify_shell(script, &cwd, ctx, depth + 1, out);
+                match flag.and_then(|i| words.get(i + 2)) {
+                    Some(script) if script.dynamic => out.push(("shell_destructive", format!("Runs a script only known when it runs ({prog} -c)"))),
+                    Some(script) => classify_shell(&script.text, &cwd, ctx, depth + 1, out),
+                    None => {}
                 }
                 continue;
             }
@@ -557,13 +577,13 @@ fn publish(prog: &str, args: &[&str]) -> Option<String> {
 }
 
 /// Drops `sudo`, `env`, `nohup`, `timeout`, ... and env assignments. `sudo` is itself destructive.
-fn strip_wrappers(argv: &[String], out: &mut Vec<(&'static str, String)>) -> Vec<String> {
+fn strip_wrappers(argv: &[Word], out: &mut Vec<(&'static str, String)>) -> Vec<Word> {
     let mut i = 0;
     loop {
-        while argv.get(i).is_some_and(|a| is_assignment(a)) {
+        while argv.get(i).is_some_and(|a| is_assignment(&a.text)) {
             i += 1;
         }
-        let Some(p) = argv.get(i).map(|a| program(a)) else { return vec![] };
+        let Some(p) = argv.get(i).filter(|a| !a.dynamic).map(|a| program(&a.text)) else { return argv.get(i..).unwrap_or_default().to_vec() };
         let skip_flags_with_values: &[&str] = match p.as_str() {
             "sudo" | "doas" => {
                 out.push(("shell_destructive", "Runs as root".into()));
@@ -580,8 +600,8 @@ fn strip_wrappers(argv: &[String], out: &mut Vec<(&'static str, String)>) -> Vec
             _ => return argv[i..].to_vec(),
         };
         i += 1;
-        while let Some(a) = argv.get(i) {
-            if skip_flags_with_values.contains(&a.as_str()) {
+        while let Some(a) = argv.get(i).map(|a| a.text.as_str()) {
+            if skip_flags_with_values.contains(&a) {
                 i += 2;
             } else if a.starts_with('-') || is_assignment(a) || (p == "timeout" && a.chars().next().is_some_and(|c| c.is_ascii_digit())) {
                 i += 1;
@@ -599,152 +619,6 @@ fn is_assignment(a: &str) -> bool {
 /// `/usr/bin/rm` and `\rm` -> `rm`.
 fn program(a: &str) -> String {
     a.trim_start_matches('\\').rsplit('/').next().unwrap_or(a).to_string()
-}
-
-struct Segment {
-    argv: Vec<String>,
-    /// Its input is piped from the previous command.
-    piped: bool,
-}
-
-/// Splits a shell command line on `; && || | & ( ) $( backticks` and newlines,
-/// respecting quotes. Redirections are dropped. Good enough to classify, not to run.
-fn split_commands(cmd: &str) -> Vec<Segment> {
-    let mut segs = Vec::new();
-    let mut argv: Vec<String> = Vec::new();
-    let mut word = String::new();
-    let mut in_word = false;
-    let mut piped = false;
-    let mut skip_next_word = false;
-    let mut nested: Vec<String> = Vec::new();
-    let mut chars = cmd.chars().peekable();
-    let finish_word = |word: &mut String, in_word: &mut bool, argv: &mut Vec<String>, skip: &mut bool| {
-        if *in_word {
-            let w = std::mem::take(word);
-            if *skip {
-                *skip = false;
-            } else if let Some(rest) = redirect(&w) {
-                // `>file` carries its target; a bare `>` takes the next word.
-                *skip = rest.is_empty();
-            } else {
-                argv.push(w);
-            }
-            *in_word = false;
-        }
-    };
-    let mut finish_seg = |argv: &mut Vec<String>, piped_next: bool, piped: &mut bool| {
-        if !argv.is_empty() {
-            segs.push(Segment { argv: std::mem::take(argv), piped: *piped });
-        }
-        *piped = piped_next;
-    };
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' => {
-                in_word = true;
-                for c in chars.by_ref() {
-                    if c == '\'' {
-                        break;
-                    }
-                    word.push(c);
-                }
-            }
-            '"' => {
-                in_word = true;
-                while let Some(c) = chars.next() {
-                    match c {
-                        '"' => break,
-                        '\\' => {
-                            if let Some(n) = chars.next() {
-                                word.push(n);
-                            }
-                        }
-                        // The shell runs these even inside double quotes.
-                        '$' if chars.peek() == Some(&'(') => {
-                            chars.next();
-                            let mut depth = 1;
-                            let mut inner = String::new();
-                            for c in chars.by_ref() {
-                                depth += match c {
-                                    '(' => 1,
-                                    ')' => -1,
-                                    _ => 0,
-                                };
-                                if depth == 0 {
-                                    break;
-                                }
-                                inner.push(c);
-                            }
-                            word.push_str(&inner);
-                            nested.push(inner);
-                        }
-                        '`' => {
-                            let inner: String = chars.by_ref().take_while(|c| *c != '`').collect();
-                            word.push_str(&inner);
-                            nested.push(inner);
-                        }
-                        c => word.push(c),
-                    }
-                }
-            }
-            '\\' => {
-                in_word = true;
-                match chars.next() {
-                    Some('\n') | None => {}
-                    Some(n) => word.push(n),
-                }
-            }
-            '#' if !in_word => {
-                for c in chars.by_ref() {
-                    if c == '\n' {
-                        break;
-                    }
-                }
-                finish_seg(&mut argv, false, &mut piped);
-            }
-            c if c.is_whitespace() && c != '\n' => finish_word(&mut word, &mut in_word, &mut argv, &mut skip_next_word),
-            ';' | '\n' | '(' | ')' | '`' | '{' | '}' if !(matches!(c, '{' | '}') && in_word) => {
-                finish_word(&mut word, &mut in_word, &mut argv, &mut skip_next_word);
-                finish_seg(&mut argv, false, &mut piped);
-            }
-            '$' if chars.peek() == Some(&'(') => {
-                chars.next();
-                finish_word(&mut word, &mut in_word, &mut argv, &mut skip_next_word);
-                finish_seg(&mut argv, false, &mut piped);
-            }
-            '|' | '&' => {
-                let double = chars.peek() == Some(&c);
-                if double {
-                    chars.next();
-                }
-                // `>&2` and `&>file` are redirections, not separators.
-                if c == '&' && !double && (word.ends_with('>') || chars.peek() == Some(&'>')) {
-                    in_word = true;
-                    word.push(c);
-                    continue;
-                }
-                finish_word(&mut word, &mut in_word, &mut argv, &mut skip_next_word);
-                finish_seg(&mut argv, c == '|' && !double, &mut piped);
-            }
-            c => {
-                in_word = true;
-                word.push(c);
-            }
-        }
-    }
-    finish_word(&mut word, &mut in_word, &mut argv, &mut skip_next_word);
-    finish_seg(&mut argv, false, &mut piped);
-    for n in nested {
-        segs.extend(split_commands(&n));
-    }
-    segs
-}
-
-/// For a redirection word (`>`, `2>>log`, `&>x`, `<in`), the target that follows it.
-fn redirect(w: &str) -> Option<&str> {
-    let t = w.trim_start_matches(|c: char| c.is_ascii_digit()).trim_start_matches('&');
-    let rest = t.strip_prefix(">>").or_else(|| t.strip_prefix(">|")).or_else(|| t.strip_prefix('>')).or_else(|| t.strip_prefix("<<<")).or_else(|| t.strip_prefix('<'))?;
-    Some(rest.trim_start_matches('&'))
 }
 
 fn inside(ctx: &Ctx, cwd: &Path, p: &str) -> bool {
@@ -984,7 +858,8 @@ mod tests {
         assert_eq!(cls("env FOO=1 nohup git push"), ["git_push"]);
         assert_eq!(cls("timeout 30 git push"), ["git_push"]);
         assert_eq!(cls("echo $(git push)"), ["git_push"]);
-        assert_eq!(cls("true && `git push`"), ["git_push"]);
+        // Its output becomes the command name, so that is unknown too.
+        assert_eq!(cls("true && `git push`"), ["git_push", "shell_destructive"]);
         // The shell runs substitutions inside double quotes too.
         assert_eq!(cls("echo \"$(git push origin main)\""), ["git_push"]);
         assert_eq!(cls("echo \"today: `git push`\""), ["git_push"]);
@@ -992,6 +867,17 @@ mod tests {
         assert!(cls("echo '$(git push)'").is_empty(), "single quotes don't run it");
         let argv = Call::new("Bash", json!({ "command": ["bash", "-lc", "git push"] }), "/srv/ws".into());
         assert_eq!(classes(&argv), ["git_push"]);
+        assert_eq!(cls("echo \"$(echo \"$(git push)\")\""), ["git_push"]);
+        assert_eq!(cls("cat <<EOF\n$(git push)\nEOF"), ["git_push"]);
+        assert!(cls("cat <<'EOF'\n$(git push)\nEOF").is_empty(), "a quoted here-document doesn't expand");
+        assert_eq!(cls("diff <(git push) x"), ["git_push"]);
+        assert_eq!(cls("echo ${X:-$(git push)}"), ["git_push"]);
+        assert_eq!(cls("if true; then git push; fi"), ["git_push"]);
+        assert_eq!(cls("for b in main dev; do git push origin $b; done"), ["git_push"]);
+        assert_eq!(cls("eval 'git push'"), ["git_push"]);
+        assert_eq!(cls("eval \"$CMD\""), ["shell_destructive"]);
+        assert_eq!(cls("$CMD --force"), ["shell_destructive"]);
+        assert_eq!(cls("bash -c \"$SCRIPT\""), ["shell_destructive"]);
         let comment = cls("ls # git push later");
         assert!(comment.is_empty(), "{comment:?}");
     }
@@ -1050,6 +936,25 @@ mod tests {
         assert_eq!(decide(&p, &[], &shell("npm i x && git push"), &c).action, Action::Deny);
         assert_eq!(decide(&p, &[], &shell("npm i x"), &c).action, Action::Allow);
         assert_eq!(decide(&p, std::slice::from_ref(&allow), &shell("git push origin main"), &c).action, Action::Deny);
+    }
+
+    #[test]
+    fn unreadable_or_hostile_commands_are_denied() {
+        let ask = Policy::new(Mode::Ask);
+        let allow_all = [rule(Action::Allow, "*", "*")];
+        let deep = format!("echo \"{}{}\"", "$(".repeat(5000), ")".repeat(5000));
+        let chain = "eval ".repeat(crate::shell::MAX_DEPTH + 1) + "git push";
+        for cmd in ["echo 'unclosed", "echo $(git push", "a )", deep.as_str(), chain.as_str()] {
+            let v = decide(&ask, &allow_all, &shell(cmd), &ctx());
+            assert_eq!((v.action, v.class), (Action::Deny, Some(UNREADABLE)), "{cmd:.60}");
+        }
+        let long = Call::new("Bash", json!({ "command": "a".repeat(crate::shell::MAX_LEN + 1) }), "/srv/ws".into());
+        assert_eq!(decide(&ask, &[], &long, &ctx()).action, Action::Deny);
+        assert_eq!(decide(&Policy::new(Mode::Bypass), &[], &shell("echo 'x"), &ctx()).action, Action::Allow);
+        assert_eq!(decide(&ask, &[], &shell("echo fine"), &ctx()).action, Action::Allow);
+        // Deeper than the old silent cutoff, still well inside the limit: classified, not skipped.
+        let five = (0..5).fold("git push".to_string(), |s, _| format!("bash -c {}", quote(&s)));
+        assert_eq!(classes(&shell(&five)), ["git_push"]);
     }
 
     #[test]

@@ -9,6 +9,7 @@ mod paths;
 mod policy;
 mod runner;
 mod screen;
+mod shell;
 
 use approvals::{DecideError, Remember};
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
@@ -1019,6 +1020,14 @@ mod tests {
 
         let (_, unknown) = call(port, "POST", "/api/approvals/check", &bot_auth, r#"{"from":"nobody","event":{"tool_name":"Bash"}}"#).await;
         assert_eq!(unknown.lines().next(), Some("deny"));
+
+        let deep = format!("echo \"{}{}\"", "$(".repeat(100_000), ")".repeat(100_000));
+        for cmd in ["echo \"$(git push", deep.as_str()] {
+            let (code, bad) = call(port, "POST", "/api/approvals/check", &bot_auth, &check(cmd)).await;
+            assert_eq!((code, bad.lines().next()), (200, Some("deny")), "{cmd:.40}");
+        }
+        let (_, list) = call(port, "GET", "/api/approvals?status=pending", &user, "").await;
+        assert_eq!(list.trim(), "[]", "refused without asking");
     }
 
     #[test]

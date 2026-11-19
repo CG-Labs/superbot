@@ -12,7 +12,7 @@ Every adapter ran its harness with permission prompts off (`--dangerously-skip-p
 
 **One policy engine in `botd`, one gate binary, one hook per harness.**
 
-- **Policy** (`server/src/policy.rs`): a mode (`ask` or `bypass`), an action (`allow`, `ask`, `deny`) per risky class, and a timeout. Classes: destructive shell (`rm -rf /`, `git reset --hard`, `dd`, `DROP TABLE`, ...), file deletion outside the workspace, outbound email or messages (mail CLIs, `gh pr create`, Slack webhooks, messaging MCP tools), network installs (`apt`, `npm i`, `curl | sh`), and `git push`. Classification is lexical and errs towards asking. Rules on top: `deny` rules (the deny list) beat everything; `allow` rules (usually "remember this") skip asking but never override a class set to `deny`.
+- **Policy** (`server/src/policy.rs`): a mode (`ask` or `bypass`), an action (`allow`, `ask`, `deny`) per risky class, and a timeout. Classes: destructive shell (`rm -rf /`, `git reset --hard`, `dd`, `DROP TABLE`, ...), file deletion outside the workspace, outbound email or messages (mail CLIs, `gh pr create`, Slack webhooks, messaging MCP tools), network installs (`apt`, `npm i`, `curl | sh`), and `git push`. Shell commands go through a real shell parser (`server/src/shell.rs`) that finds every command, including those inside quotes, substitutions, and here-documents. Classification errs towards asking, and a command the parser can't read for certain is denied outright (fail closed). Input size, nesting, and command count are bounded. Rules on top: `deny` rules (the deny list) beat everything; `allow` rules (usually "remember this") skip asking but never override a class set to `deny`.
 - **Scope**: one global policy plus optional per-Bot overrides, in SQLite. A versioned migration (`PRAGMA user_version`) adds the tables. Fresh installs start in `ask`. Existing installs start in `bypass`, so an upgrade changes nothing until the owner opts in.
 - **Gate**: `botctl hook <harness>` reads the harness's PreToolUse event on stdin and posts it to `POST /api/approvals/check`. botd answers at once (allow or deny), or creates a pending approval and holds the request open until a person decides, the timeout passes, or the run stops. botctl exits 0 to allow and 2 (reason on stderr) to block.
 - **Harness hooks** (adapter code only):
@@ -34,7 +34,7 @@ Every adapter ran its harness with permission prompts off (`--dangerously-skip-p
 ## Consequences
 
 - Risky calls block the run until answered (default 10 minutes, then denied). The Bot sees a plain reason and is told to ask the user, not to work around it.
-- Shell classification is heuristic. Obfuscated commands (`eval "$(echo ...)"`, scripts that delete things internally) can slip through. This is a guard rail for honest mistakes and prompt injection, not a sandbox.
+- Shell classification sees commands, not what they do inside. Commands built at run time (`$CMD`, `eval "$X"`) ask; scripts and programs that delete or send things internally can slip through. This is a guard rail for honest mistakes and prompt injection, not a sandbox.
 - Bots run as the same OS user as `botd`, so a determined Bot could read `.env` or the database. Separating them needs a different OS user per harness (follow-up).
 - `ALLOW_NO_AUTH=1` (loopback dev) treats unauthenticated callers as a person, so any local process can approve. Dev only.
 - Codex hooks rely on a newer Codex; the canary stops guarded runs on versions that skip them.
