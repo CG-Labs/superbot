@@ -17,6 +17,7 @@ One Rust binary, `botd`. It serves the web app, stores everything in SQLite, and
 - **Model and effort** are saved per Bot. The web app shows a faint picker above the input. Unset means the harness default.
 - **Choice cards**: a reply ending in a ` ```question ` JSON block becomes a multiple-choice card.
 - **Approvals**: in `ask` mode, risky tool calls wait for a person. See [Approvals](#approvals).
+- **Audit log**: admin actions go into an append-only table. See [Audit log](#audit-log).
 - **Restarts**: queued messages run after a restart. A task that was running is reported as interrupted, not re-run, so it can't repeat an action like sending an email.
 
 ## Harness adapters
@@ -82,7 +83,7 @@ The policy decides what each tool call does: run, ask a person, or be blocked.
 - **Timeout**: an unanswered approval is denied after `timeoutMinutes` (default 10). Stopping the Bot, the run ending, or a server restart also closes it.
 - **Turning approvals on** stops any task that started in `bypass` (it has no hook), with a note to send it again.
 - **Remember** saves an exact rule. Calls too long to store whole (over 4,000 characters) can be approved or denied, but not remembered.
-- **Audit**: every request, decision, timeout, and policy or rule change is in an append-only log (`GET /api/audit`).
+- **Audit**: every request, decision, timeout, and policy or rule change is in the [audit log](#audit-log).
 - **Who decides**: only a person logged in with `AUTH_PASSWORD`. Bots' token gets 403 on decisions and policy changes.
 
 Fresh installs start in `ask`. Installs from before approvals keep `bypass` until you opt in:
@@ -114,6 +115,24 @@ Saved secrets and every approval's tool input are sealed with XChaCha20-Poly1305
 
 Values never come back out: the API lists names only. Known values (saved and env secrets, `AUTH_PASSWORD`, the Bots' token, screen tokens, the key) are replaced by `[redacted]` in saved chats, approvals, the audit log, and live events. Upgrading seals old approval inputs and scrubs known values from saved chats on first start. Bots run as the same OS user, so this protects copies of the database, not the running server. See [ADR 0010](adr/0010-secrets.md).
 
+## Audit log
+
+Admin actions are recorded in `audit_events` in `app.sqlite`: who (person, Bot, or system part), what (`bot.created`, `routine.disabled`, `approval.denied`, ...), the target, the outcome, the source IP and user agent, and a few scrubbed details. Logins and failed logins, Bot and routine changes, policy, rules, approvals, handoffs, and Bot-token calls are all covered; the full list is in [ADR 0009](adr/0009-audit-events.md).
+
+- **Append-only**: no API edits or deletes rows, and SQLite triggers refuse `UPDATE` and any `DELETE` inside the retention window.
+- **No secrets**: passwords, tokens, message bodies, and routine instructions are never recorded. Details are scrubbed and clipped anyway.
+- **Retention**: `AUDIT_RETENTION_DAYS` (unset or `0` = keep forever, the default). Pruning runs every 6 hours and is itself logged. Backups copy the table with the rest of `app.sqlite`.
+- **Source IP**: the peer, or the last `X-Forwarded-For` entry when the proxy is on loopback. Set `TRUST_FORWARDED_FOR=1` only when `botd` is reachable solely through your proxy (Compose sets it).
+- **Read it**: the web app's Audit log (filters and Export CSV), or:
+
+```sh
+export SUPERBOT_PASSWORD=<your AUTH_PASSWORD>
+botctl audit --action 'bot.*' --from 2026-11-01            # newest first
+botctl audit export --actor user --to 2026-11-30 > audit.csv
+```
+
+CSV export is RFC 4180 with CRLF line endings, oldest first. Cells that start with `=`, `+`, `-`, `@`, tab, or CR get a leading `'` so spreadsheets don't treat them as formulas.
+
 ## API
 
 All JSON. Browser auth: HTTP Basic with `AUTH_PASSWORD`. Empty password requires `ALLOW_NO_AUTH=1` on loopback only.
@@ -130,7 +149,7 @@ All JSON. Browser auth: HTTP Basic with `AUTH_PASSWORD`. Empty password requires
 - `GET /api/bots/:id/screen`: starts the Bot's screen and returns its live view URL. 503 while voxl isn't listening yet, or when all screens are in use
 - `POST /api/handoff` `{from, text}`: `botctl handoff`; waits for the user's answer
 
-Approvals and policy. Writes, decisions, the approvals list, and the audit log need a person (403 for the Bot token):
+Approvals, policy, and audit. Writes, decisions, the approvals list, and the audit log need a person (403 for the Bot token):
 
 - `GET /api/policy`: global policy, class names, global rules. `PUT /api/policy` `{mode?, timeoutMinutes?, classes?: {<class>: allow|ask|deny}}`
 - `GET /api/bots/:id/policy`: effective policy, override, rules. `PUT` (same body, merged into the override), `DELETE` (drop the override)
@@ -138,7 +157,8 @@ Approvals and policy. Writes, decisions, the approvals list, and the audit log n
 - `GET /api/approvals?status=pending|approved|denied|expired|cancelled|all&bot=<id>&limit=`
 - `POST /api/approvals/:id/approve`, `POST /api/approvals/:id/deny` `{remember?: "bot"|"global", note?}`. 409 if already decided
 - `POST /api/approvals/check` `{from, harness, event}`: the hook's call. Waits for a decision. Replies `allow` or `deny`, then the reason, as plain text
-- `GET /api/audit?limit=&before=<id>`: audit events, newest first
+- `GET /api/audit?from=&to=&action=&actor=&outcome=&bot=&limit=&before=<id>`: audit events, newest first, `{events, nextBefore}`. `from`/`to`: unix ms, RFC 3339, or `YYYY-MM-DD`. `action`: exact or `prefix.*`, comma-separated. `actor`: `user`, `bot`, or `system`, optionally `:<id>`. `limit` 1 to 1000, default 100
+- `GET /api/audit/export.csv` (same filters): CSV download, oldest first
 - `GET /api/secrets`: `{secrets: [{name, store, writable, shadowedBy}]}`, names only. `PUT /api/secrets/:name` `{value}`, `DELETE /api/secrets/:name`. Person only
 
 ## Not built yet

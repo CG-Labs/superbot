@@ -2,6 +2,7 @@
 //! (identity, rules, memory), streams harness events to the web app, and saves replies.
 
 use crate::adapters::{self, AbortReason, AgentEvent, Guard, RunInput};
+use crate::audit::{Actor, Event};
 use crate::db::{Bot, BotPatch, Db, Message};
 use crate::paths;
 use crate::policy::Mode;
@@ -400,9 +401,12 @@ impl App {
         let (tx, rx) = oneshot::channel();
         self.waiters.lock().unwrap().insert(m.id, tx);
         self.push_message(&m);
+        let card = m.id.to_string();
+        self.db.record(&Event::new(Actor::bot(Some(&bot.id), Some(&bot.name)), "handoff.requested").target("handoff", &card).bot(&bot.id));
         let answer = tokio::time::timeout(wait, rx).await.ok().and_then(Result::ok);
-        if answer.is_none() {
-            self.waiters.lock().unwrap().remove(&m.id);
+        if answer.is_none() && self.waiters.lock().unwrap().remove(&m.id).is_some() {
+            let e = Event::new(Actor::system("handoff"), "handoff.timed_out").target("handoff", &card).bot(&bot.id);
+            self.db.record(&e.details(json!({ "waitedSeconds": wait.as_secs() })));
         }
         answer
     }

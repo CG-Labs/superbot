@@ -643,6 +643,88 @@ document.addEventListener("change", (e) => {
   const card = e.target.closest(".ap-remember") && e.target.closest(".approval");
   if (card) e.target.checked ? remembered.add(card.dataset.approval) : remembered.delete(card.dataset.approval);
 });
+// Audit log: append-only record of sign-ins and admin actions (docs/adr/0009-audit-events.md).
+// `query` is the filter the shown rows came from; Load more pages with it, not the form.
+const audit = { events: [], next: null, query: "", error: "", seq: 0 };
+
+function auditQuery() {
+  const p = new URLSearchParams();
+  const action = $("au-action").value.trim();
+  if (action) p.set("action", action);
+  if ($("au-actor").value) p.set("actor", $("au-actor").value);
+  // Whole days in the browser's time zone, sent as unix ms.
+  const day = (id, add) => {
+    const v = $(id).value;
+    if (!v) return null;
+    const [y, m, d] = v.split("-").map(Number);
+    return new Date(y, m - 1, d + add).getTime();
+  };
+  const from = day("au-from", 0), to = day("au-to", 1);
+  if (from != null) p.set("from", from);
+  if (to != null) p.set("to", to);
+  return p;
+}
+
+async function loadAudit(more) {
+  if (more && !audit.next) return;
+  const seq = ++audit.seq;
+  const p = more ? new URLSearchParams(audit.query) : auditQuery();
+  if (more) {
+    p.set("before", audit.next);
+  } else {
+    audit.query = p.toString();
+    audit.next = null;
+    $("au-more").hidden = true;
+    $("au-export").href = `/api/audit/export.csv?${p}`;
+  }
+  p.set("limit", 100);
+  try {
+    const page = await api("GET", `/api/audit?${p}`);
+    if (seq !== audit.seq) return;
+    audit.events = more ? audit.events.concat(page.events) : page.events;
+    audit.next = page.nextBefore;
+    audit.error = "";
+  } catch (err) {
+    if (seq !== audit.seq) return;
+    audit.error = err.message;
+    if (!more) { audit.events = []; audit.next = null; }
+  }
+  renderAudit();
+}
+
+function renderAudit() {
+  const who = (e) => {
+    if (e.actorKind === "bot") return e.actorName || bot(e.actorId)?.name || e.actorId || "A Bot";
+    if (e.actorKind === "user") return e.actorName || e.actorId || "Unknown person";
+    return `System${e.actorId ? ` · ${e.actorId}` : ""}`;
+  };
+  const target = (e) => [e.targetType, e.targetId].filter(Boolean).join(" ");
+  const details = (e) => { const s = JSON.stringify(e.details ?? {}); return s === "{}" ? "" : s; };
+  $("au-rows").innerHTML = audit.events.map((e) => `<tr class="${e.outcome === "success" ? "" : "au-bad"}">
+      <td title="${esc(e.time)}">${esc(new Date(e.at).toLocaleString())}</td>
+      <td>${esc(who(e))}</td>
+      <td><code>${esc(e.action)}</code></td>
+      <td>${esc(target(e))}</td>
+      <td>${esc(e.outcome)}</td>
+      <td title="${esc(e.userAgent || "")}">${esc(e.ip || "")}</td>
+      <td class="au-detail" title="${esc(details(e))}">${esc(details(e))}</td>
+    </tr>`).join("");
+  $("au-empty").textContent = audit.error || "No events match.";
+  $("au-empty").hidden = !audit.error && audit.events.length > 0;
+  $("au-more").hidden = !audit.next || !!audit.error;
+}
+
+let auditTimer = null;
+const closeAudit = () => { $("au").hidden = true; };
+$("audit-btn").addEventListener("click", () => { $("au").hidden = false; loadAudit(); });
+$("au-close").addEventListener("click", closeAudit);
+$("au").addEventListener("mousedown", (e) => { if (e.target === $("au")) closeAudit(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("au").hidden) closeAudit(); });
+$("au-more").addEventListener("click", () => loadAudit(true));
+$("au-filters").addEventListener("submit", (e) => { e.preventDefault(); loadAudit(); });
+$("au-filters").addEventListener("change", () => loadAudit());
+$("au-action").addEventListener("input", () => { clearTimeout(auditTimer); auditTimer = setTimeout(() => loadAudit(), 300); });
+
 // Keep the "Denied in N minutes" countdowns fresh.
 setInterval(() => { if (approvals.length) render(true); }, 30000);
 $("details").addEventListener("keydown", (e) => { if (e.target.id === "d-name" && e.key === "Enter") e.target.blur(); });

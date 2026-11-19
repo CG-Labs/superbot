@@ -155,4 +155,14 @@ grep -q '"name":"KeepMe"' <<<"$bots" || fail "restored data is missing KeepMe"
 if grep -q '"name":"DropMe"' <<<"$bots"; then fail "restore did not roll back DropMe"; fi
 grep -q '"name":"SMOKE_API_KEY"' <<<"$(curl -fsS "${AUTH[@]}" "$BASE/api/secrets")" || fail "restored data lost the saved secret"
 
+log "Audit log is restored with the data and exports CSV"
+expect_code 401 "$BASE/api/audit/export.csv"
+audit=$(curl -fsS "${AUTH[@]}" "$BASE/api/audit?action=bot.created")
+grep -q '"name":"KeepMe"' <<<"$audit" || fail "audit log is missing bot.created for KeepMe: $audit"
+if grep -q '"name":"DropMe"' <<<"$audit"; then fail "restore did not roll back the audit log"; fi
+curl -fsS "${AUTH[@]}" "$BASE/api/audit/export.csv" >"$WORK/audit.csv"
+IFS= read -r header <"$WORK/audit.csv" || true
+[[ "${header%$'\r'}" == id,time,actor_kind,* ]] || fail "audit CSV has no header: $header"
+grep -q ',bot.created,' "$WORK/audit.csv" || fail "audit CSV has no bot.created row"
+
 log "Smoke test passed"

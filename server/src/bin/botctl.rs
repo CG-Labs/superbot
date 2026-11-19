@@ -41,7 +41,11 @@ and BOT_API if botd isn't on http://127.0.0.1:3000; the password is only sent to
   botctl approvals [pending|all]                   List approvals
   botctl approve <id> [--remember | --remember-global]
   botctl deny <id> [--remember | --remember-global]
-  botctl audit [<limit>]                           Recent audit events
+  botctl audit [<limit>] [filters]                 Recent audit events, newest first
+  botctl audit export [filters] > audit.csv        All matching events as CSV, oldest first
+    filters: --from <time> --to <time> --action <a,b.*> --actor <user|bot|system[:id]>
+             --outcome <success|failure|denied> --bot <id>
+    times: YYYY-MM-DD (UTC), RFC 3339, or unix milliseconds
   botctl secrets                                   List secret names (never values)
   botctl secret set <NAME> < value-file            Save a secret, encrypted; Bots get it as $NAME
   botctl secret rm <NAME>                          Delete a saved secret
@@ -80,8 +84,15 @@ fn api(cred: Cred, method: &str, path: &str, body: Option<String>) -> Result<Str
         return Err(format!("{addr} isn't on this machine, so botctl won't send SUPERBOT_PASSWORD there."));
     }
     let body = body.unwrap_or_default();
+    // Names the calling Bot for the audit log. All Bots share BOT_TOKEN, so botd treats it as self-reported.
+    let bot = match cred {
+        Cred::Bot => std::env::var("BOT_ID").ok().filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric())),
+        Cred::Operator => None,
+    };
+    let bot = bot.map(|id| format!("X-SuperBot-Bot: {id}\r\n")).unwrap_or_default();
     let req = format!(
-        "{method} {path} HTTP/1.0\r\nHost: {addr}\r\nAuthorization: {auth}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        "{method} {path} HTTP/1.0\r\nHost: {addr}\r\nAuthorization: {auth}\r\nUser-Agent: botctl/{}\r\n{bot}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        env!("CARGO_PKG_VERSION"),
         body.len()
     );
     s.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
@@ -176,6 +187,33 @@ fn policy_patch(args: &[&str]) -> Result<Value, String> {
     Ok(Value::Object(patch))
 }
 
+/// Percent-encodes a query string value.
+fn encode(v: &str) -> String {
+    v.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'*' | b',' | b':' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// `botctl audit` options as a query string: `[<limit>] [--from <t>] [--action <a>] ...`.
+fn audit_query(rest: &[&str]) -> Result<String, String> {
+    let mut pairs = Vec::new();
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match *a {
+            "--from" | "--to" | "--action" | "--actor" | "--outcome" | "--bot" | "--limit" => {
+                let v = it.next().ok_or(format!("{a} needs a value"))?;
+                pairs.push(format!("{}={}", &a[2..], encode(v)));
+            }
+            n if n.parse::<u32>().is_ok() => pairs.push(format!("limit={n}")),
+            other => return Err(format!("Unknown audit option \"{other}\". See botctl admin.")),
+        }
+    }
+    Ok(if pairs.is_empty() { String::new() } else { format!("?{}", pairs.join("&")) })
+}
+
 fn flag<'a>(rest: &[&'a str], name: &str) -> Option<&'a str> {
     rest.windows(2).find(|w| w[0] == name).map(|w| w[1])
 }
@@ -251,8 +289,8 @@ fn run(args: &[String]) -> Result<String, String> {
         ["approvals"] => op("GET", "/api/approvals?status=pending", None),
         ["approvals", status] => op("GET", &format!("/api/approvals?status={status}"), None),
         [verb @ ("approve" | "deny"), id, rest @ ..] => decide(verb, id, rest),
-        ["audit"] => op("GET", "/api/audit", None),
-        ["audit", n] => op("GET", &format!("/api/audit?limit={n}"), None),
+        ["audit", "export", rest @ ..] => api(Cred::Operator, "GET", &format!("/api/audit/export.csv{}", audit_query(rest)?), None),
+        ["audit", rest @ ..] => op("GET", &format!("/api/audit{}", audit_query(rest)?), None),
         ["secrets"] => op("GET", "/api/secrets", None),
         ["secret", "set", name] => {
             let name = env_name(name)?;
@@ -268,6 +306,7 @@ fn run(args: &[String]) -> Result<String, String> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {
+        Ok(out) if out.ends_with('\n') => print!("{out}"),
         Ok(out) => println!("{out}"),
         Err(e) => {
             eprintln!("Error: {e}");
@@ -306,6 +345,19 @@ mod tests {
         }
         let err = api(Cred::Operator, "GET", "/api/approvals", None).unwrap_err();
         assert!(err.contains("only to a server on this machine"), "{err}");
+    }
+
+    #[test]
+    fn audit_options_become_a_query() {
+        assert_eq!(audit_query(&[]).unwrap(), "");
+        assert_eq!(audit_query(&["50"]).unwrap(), "?limit=50");
+        assert_eq!(
+            audit_query(&["--from", "2026-11-19T13:00:00+01:00", "--action", "bot.*,auth.login", "--actor", "bot:ab12"]).unwrap(),
+            "?from=2026-11-19T13:00:00%2B01:00&action=bot.*,auth.login&actor=bot:ab12"
+        );
+        assert_eq!(audit_query(&["--to", "a b&c"]).unwrap(), "?to=a%20b%26c");
+        assert!(audit_query(&["--from"]).is_err());
+        assert!(audit_query(&["--nope", "x"]).is_err());
     }
 
     #[test]
