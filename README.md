@@ -73,7 +73,7 @@ Then open the web app and say hi to SuperBot. Install and log in to the agent CL
 
 **Docker Compose:** `botd` + Caddy HTTPS + daily backups on any Docker host — [Docker Compose (supported)](deploy/README.md#docker-compose-supported).
 
-**Mobile & desktop client:** cross-platform app in [`apps/client`](apps/client/) (Expo: iOS/Android via EAS, web, Electron for Windows/Linux).
+**Mobile & desktop client:** cross-platform app in [`apps/client`](apps/client/) (Expo: iOS/Android via EAS, web at `/app/`, Electron for Windows/Linux). It is the single primary interface; the server's own pages are an admin fallback ([ADR 0027](docs/adr/0027-expo-primary-hermes-default.md)).
 
 ## Harness agnostic
 
@@ -83,7 +83,7 @@ Bots run on the coding agent you choose:
 - Codex CLI
 - Pi Agent
 - Grok Build *(planned)*
-- Hermes Agent (opt-in install)
+- Hermes Agent (opt-in install; the default on managed tiers, [ADR 0027](docs/adr/0027-expo-primary-hermes-default.md))
 
 Each harness plugs in through one small adapter. Everything else stays the same.
 
