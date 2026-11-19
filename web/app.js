@@ -161,10 +161,10 @@ function approvalCard(a, withBot) {
     <div class="ap-reason">${esc(a.reason)}</div>
     <pre class="ap-subject">${esc(a.subject)}</pre>
     <div class="ap-foot">
-      <label class="ap-remember"><input type="checkbox" ${remembered.has(a.id) ? "checked" : ""} /> Remember for ${esc(b?.name || "this Bot")}</label>
+      ${can("admin") ? `<label class="ap-remember"><input type="checkbox" ${remembered.has(a.id) ? "checked" : ""} /> Remember for ${esc(b?.name || "this Bot")}</label>` : ""}
       <span class="ap-left">Denied in ${minutesLeft(a)}</span>
-      <button class="nb-btn" data-decide="deny">Deny</button>
-      <button class="nb-btn primary" data-decide="approve">Approve</button>
+      ${can("approve") ? `<button class="nb-btn" data-decide="deny">Deny</button>
+      <button class="nb-btn primary" data-decide="approve">Approve</button>` : ""}
     </div>
   </div>`;
 }

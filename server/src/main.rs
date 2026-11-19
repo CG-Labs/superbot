@@ -1201,7 +1201,8 @@ async fn deny(state: State<AppState>, who: Extension<Principal>, by: Extension<W
     decide(state, who, by, id, body, false).await
 }
 
-/// Body: `{remember?: "bot" | "global" | true, note?}`. Remember saves a rule for this exact call.
+/// Body: `{remember?: "bot" | "global" | true, note?}`. Remember saves a rule for this
+/// exact call, which is a policy change, so it needs an admin.
 async fn decide(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Path(id): Path<String>, body: axum::body::Bytes, approve: bool) -> Res {
     need_user(who)?;
     let v: Value = if body.iter().all(u8::is_ascii_whitespace) {
@@ -1216,6 +1217,10 @@ async fn decide(State(app): State<AppState>, Extension(who): Extension<Principal
         Value::Null | Value::Bool(false) => None,
         _ => return Err(bad("remember must be \"bot\", \"global\", or true")),
     };
+    if remember.is_some() && !rbac::allows(who, rbac::Perm::Admin) {
+        app.db.record(&by.event("access.denied").outcome(Outcome::Denied).details(json!({ "path": format!("/api/approvals/{id}"), "need": "admin", "reason": "remember" })));
+        return Err(ApiError(StatusCode::FORBIDDEN, "Only an admin can save a lasting rule. Approve or deny just this call.".into()));
+    }
     let note: Option<String> = v["note"].as_str().map(|n| n.trim().chars().take(500).collect()).filter(|n: &String| !n.is_empty());
     match app.decide(&id, approve, remember, note.as_deref(), &by) {
         Ok(a) => Ok(Json(json!(a))),

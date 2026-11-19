@@ -151,6 +151,8 @@ async fn each_role_gets_exactly_its_permissions() {
         ("GET", format!("/api/bots/{bid}/screen"), ""),
         ("POST", format!("/api/bots/{bid}/routines"), r#"{"name":"R","cron":"0 9 * * *","instruction":"x"}"#),
         ("POST", "/api/approvals/missing/approve".into(), "{}"),
+        ("POST", "/api/approvals/missing/approve".into(), r#"{"remember":"bot"}"#),
+        ("POST", "/api/approvals/missing/deny".into(), r#"{"remember":"global"}"#),
         ("PUT", "/api/policy".into(), r#"{"mode":"ask"}"#),
         ("PUT", format!("/api/bots/{bid}/policy"), r#"{"mode":"ask"}"#),
         ("POST", "/api/policy/rules".into(), "{}"),
@@ -165,9 +167,9 @@ async fn each_role_gets_exactly_its_permissions() {
         ("DELETE", format!("/api/users/{member_id}/sessions"), ""),
     ];
     // Allowed or not, per role, in route order.
-    let r = [true, true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false];
-    let m = [true, true, true, true, true, true, true, true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false, false];
-    let k = [true, true, true, false, true, true, true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false];
+    let r = [true, true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false];
+    let m = [true, true, true, true, true, true, true, true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false];
+    let k = [true, true, true, false, true, true, true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false];
     for (who, auth, allowed) in [("readonly", &readonly, r), ("member", &member, m), ("bot", &bot, k)] {
         for ((method, path, body), ok) in routes.iter().zip(allowed) {
             let (code, res) = call(port, method, path, auth, body).await;
@@ -187,6 +189,7 @@ async fn each_role_gets_exactly_its_permissions() {
     let denied = audit_list(&body);
     assert!(denied.iter().any(|e| e["actorName"] == "viewer" && e["details"]["need"] == "write" && e["details"]["path"] == "/api/bots"));
     assert!(denied.iter().any(|e| e["actorKind"] == "bot" && e["details"]["need"] == "admin"));
+    assert!(denied.iter().any(|e| e["actorName"] == "member" && e["details"]["reason"] == "remember"));
 }
 
 #[tokio::test]
