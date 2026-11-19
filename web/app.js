@@ -644,7 +644,8 @@ document.addEventListener("change", (e) => {
   if (card) e.target.checked ? remembered.add(card.dataset.approval) : remembered.delete(card.dataset.approval);
 });
 // Audit log: append-only record of sign-ins and admin actions (docs/adr/0008-audit-events.md).
-const audit = { events: [], next: null, error: "", seq: 0 };
+// `query` is the filter the shown rows came from; Load more pages with it, not the form.
+const audit = { events: [], next: null, query: "", error: "", seq: 0 };
 
 function auditQuery() {
   const p = new URLSearchParams();
@@ -665,11 +666,18 @@ function auditQuery() {
 }
 
 async function loadAudit(more) {
+  if (more && !audit.next) return;
   const seq = ++audit.seq;
-  const p = auditQuery();
-  $("au-export").href = `/api/audit/export.csv?${p}`;
+  const p = more ? new URLSearchParams(audit.query) : auditQuery();
+  if (more) {
+    p.set("before", audit.next);
+  } else {
+    audit.query = p.toString();
+    audit.next = null;
+    $("au-more").hidden = true;
+    $("au-export").href = `/api/audit/export.csv?${p}`;
+  }
   p.set("limit", 100);
-  if (more && audit.next) p.set("before", audit.next);
   try {
     const page = await api("GET", `/api/audit?${p}`);
     if (seq !== audit.seq) return;
@@ -715,7 +723,7 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("au")
 $("au-more").addEventListener("click", () => loadAudit(true));
 $("au-filters").addEventListener("submit", (e) => { e.preventDefault(); loadAudit(); });
 $("au-filters").addEventListener("change", () => loadAudit());
-$("au-action").addEventListener("input", () => { clearTimeout(auditTimer); auditTimer = setTimeout(loadAudit, 300); });
+$("au-action").addEventListener("input", () => { clearTimeout(auditTimer); auditTimer = setTimeout(() => loadAudit(), 300); });
 
 // Keep the "Denied in N minutes" countdowns fresh.
 setInterval(() => { if (approvals.length) render(true); }, 30000);
