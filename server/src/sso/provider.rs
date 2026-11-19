@@ -161,7 +161,9 @@ fn email_within(t: &Token, claim: &str, allowed: &[String]) -> Result<Option<Str
 }
 
 fn subject_of(t: &Token, claim: &str) -> Result<String, Invalid> {
-    t.str(claim).filter(|s| s.len() <= 255).map(String::from).ok_or(Invalid("missing_subject"))
+    // Refused rather than trimmed: linking trims what admins type, so a padded or empty
+    // subject could never be linked, and empty ones would all be one person.
+    t.str(claim).filter(|s| !s.is_empty() && s.len() <= 255 && s.trim() == *s).map(String::from).ok_or(Invalid("missing_subject"))
 }
 
 /// https, or http to this machine (a local IdP in development and tests).
@@ -605,6 +607,9 @@ mod tests {
         assert_eq!(c.email.as_deref(), Some("a@example.com"));
         assert_eq!(p.claims(&t(json!({ "iss": "https://other.example", "sub": "s1" })), &m).err(), Some(Invalid("wrong_issuer")));
         assert_eq!(p.claims(&t(json!({ "iss": "https://idp.example" })), &m).err(), Some(Invalid("missing_subject")));
+        for padded in ["", " s1", "s1 "] {
+            assert_eq!(p.claims(&t(json!({ "iss": "https://idp.example", "sub": padded })), &m).err(), Some(Invalid("missing_subject")), "{padded:?}: empty ones would all be one person");
+        }
     }
 
     fn signed(c: Value) -> Token {
@@ -786,6 +791,9 @@ mod tests {
         }
         assert_eq!(p.claims(&signed(brokered(json!({ "identity_provider_identity": null }))), &m).err(), Some(Invalid("missing_subject")), "the broker's sub is not the person at the IdP");
         assert_eq!(p.claims(&signed(brokered(json!({ "identity_provider_identity": "x".repeat(256) }))), &m).err(), Some(Invalid("missing_subject")));
+        for padded in ["", " ", " g-1", "g-1 ", "\tg-1"] {
+            assert_eq!(p.claims(&signed(brokered(json!({ "identity_provider_identity": padded }))), &m).err(), Some(Invalid("missing_subject")), "{padded:?} could never be linked");
+        }
         for iss in ["https://sso.example.com/realms/other", "https://sso.example.com/realms/superbot/", ADFS] {
             assert_eq!(p.claims(&signed(brokered(json!({ "iss": iss }))), &m).err(), Some(Invalid("wrong_issuer")), "{iss}");
         }
