@@ -212,7 +212,7 @@ impl Call {
             Kind::Other
         };
         let subject = match kind {
-            Kind::Shell => shell_text(&input["command"]),
+            Kind::Shell => shell_command(&input).unwrap_or_default(),
             Kind::File if lower == "apply_patch" => patch_paths(&patch_text(&input)).into_iter().map(|(_, p)| p).collect::<Vec<_>>().join(" "),
             Kind::File => ["file_path", "path", "notebook_path"].iter().find_map(|k| input[*k].as_str()).unwrap_or_default().to_string(),
             Kind::Web => ["url", "query"].iter().find_map(|k| input[*k].as_str()).unwrap_or_default().to_string(),
@@ -221,7 +221,6 @@ impl Call {
                 format!("{tool} {args}")
             }
         };
-        let subject = subject.split_whitespace().collect::<Vec<_>>().join(" ");
         Call { tool: tool.to_string(), kind, subject, input, cwd }
     }
 
@@ -237,6 +236,25 @@ impl Call {
 
 const SHOWN_MAX: usize = 4000;
 pub const TRUNCATED: &str = " …[cut]";
+
+/// The command a shell tool runs: `command` or `cmd` (harnesses differ), as text or
+/// argv. An error when there is none, it isn't text, or the two fields disagree.
+fn shell_command(input: &Value) -> Result<String, &'static str> {
+    let mut found: Option<String> = None;
+    for key in ["command", "cmd"] {
+        let Some(v) = input.get(key) else { continue };
+        let text = match v {
+            Value::String(s) => s.clone(),
+            Value::Array(a) => a.iter().map(|x| x.as_str().map(quote)).collect::<Option<Vec<_>>>().ok_or("part of its command isn't text")?.join(" "),
+            _ => return Err("its command isn't text"),
+        };
+        if found.as_ref().is_some_and(|f| *f != text) {
+            return Err("it names two different commands");
+        }
+        found = Some(text);
+    }
+    found.ok_or("it has no command")
+}
 
 fn shell_text(v: &Value) -> String {
     match v {
@@ -320,10 +338,10 @@ pub fn decide(p: &Policy, rules: &[Rule], call: &Call, ctx: &Ctx) -> Verdict {
 pub fn classify(call: &Call, ctx: &Ctx) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     match call.kind {
-        Kind::Shell => {
-            let cmd = shell_text(&call.input["command"]);
-            classify_shell(&cmd, &call.cwd, ctx, 0, &mut out);
-        }
+        Kind::Shell => match shell_command(&call.input) {
+            Ok(cmd) => classify_shell(&cmd, &Cwds::new(&call.cwd), ctx, 0, &mut { shell::MAX_TOTAL }, &mut out),
+            Err(why) => out.push((UNREADABLE, format!("Can't check this shell call: {why}"))),
+        },
         Kind::File => {
             for (op, path) in patch_paths(&patch_text(&call.input)) {
                 if op == "delete" && !inside(ctx, &call.cwd, &path) {
@@ -368,13 +386,159 @@ pub const UNREADABLE: &str = "shell_unreadable";
 
 const SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ksh", "fish"];
 
-fn classify_shell(cmd: &str, cwd: &Path, ctx: &Ctx, depth: usize, out: &mut Vec<(&'static str, String)>) {
-    let cmds = match shell::parse(cmd, depth) {
-        Ok(cmds) => cmds,
-        Err(e) => return out.push((UNREADABLE, format!("Can't check this command safely: {e}"))),
-    };
-    let mut cwd = cwd.to_path_buf();
-    for c in &cmds {
+/// Every folder a shell command might be working in. A `cd` can fail, run in a
+/// subshell or pipeline, or sit in a loop, so each `cd` target adds a folder and
+/// none is removed. A relative path is inside the workspace only if it is inside
+/// from every one of them.
+#[derive(Clone)]
+struct Cwds {
+    dirs: Vec<PathBuf>,
+    /// A `cd` went somewhere we can't know (`cd -`, `cd "$DIR"`, too many folders).
+    unknown: bool,
+}
+
+const MAX_CWDS: usize = 32;
+/// Path lookups one command may cost before its folders count as unknown.
+const MAX_CD_WORK: usize = 100_000;
+
+impl Cwds {
+    fn new(cwd: &Path) -> Cwds {
+        Cwds { dirs: vec![cwd.to_path_buf()], unknown: false }
+    }
+
+    /// Adds every folder these `cd` targets reach from any folder already known, in
+    /// order. With `repeats` (a loop or function may run them again) it goes on until
+    /// nothing new is added. None is a target that can't be known.
+    fn add(&mut self, ctx: &Ctx, targets: &[Option<String>], repeats: bool) {
+        let mut work = 0;
+        loop {
+            let before = self.dirs.len();
+            for t in targets {
+                let Some(t) = t else {
+                    self.unknown = true;
+                    continue;
+                };
+                work += self.dirs.len();
+                if work > MAX_CD_WORK {
+                    self.unknown = true;
+                    return;
+                }
+                for d in self.dirs.clone() {
+                    match resolve(ctx, &d, t) {
+                        Some(p) if !self.dirs.contains(&p) => self.dirs.push(p),
+                        Some(_) => {}
+                        None => self.unknown = true,
+                    }
+                }
+                if self.dirs.len() > MAX_CWDS {
+                    self.unknown = true;
+                    return;
+                }
+            }
+            if !repeats || self.dirs.len() == before {
+                return;
+            }
+        }
+    }
+
+    /// Every place `p` could name. None when that can't be known.
+    fn resolve(&self, ctx: &Ctx, p: &str) -> Option<Vec<PathBuf>> {
+        let anchored = p.starts_with('/') || p.starts_with('~') || p.starts_with("$HOME") || p.starts_with("${HOME}");
+        if self.unknown && !anchored {
+            return None;
+        }
+        self.dirs.iter().map(|d| resolve(ctx, d, p)).collect()
+    }
+
+    fn inside(&self, ctx: &Ctx, p: &str) -> bool {
+        self.resolve(ctx, p).is_some_and(|ps| ps.iter().all(|p| p.starts_with(&ctx.workspace)))
+    }
+}
+
+/// Whether a loop or function in `cmd` may run its commands more than once.
+fn repeats(cmd: &str) -> bool {
+    let words = cmd.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
+    words.into_iter().any(|w| ["for", "while", "until", "select", "function"].contains(&w)) || cmd.replace([' ', '\t'], "").contains("()")
+}
+
+/// A parsed command line. Each `eval` with known words is parsed once too: it runs
+/// in this shell, so its `cd`s move the commands after it.
+struct Script {
+    cmds: Vec<shell::Command>,
+    /// Per command: its eval'd code, when it is an `eval` of known words.
+    evals: Vec<Option<Result<Script, shell::Error>>>,
+    repeats: bool,
+}
+
+/// `budget` is what's left of shell::MAX_TOTAL for this call.
+fn script(src: &str, depth: usize, budget: &mut usize) -> Result<Script, shell::Error> {
+    *budget = budget.checked_sub(src.len()).ok_or(shell::Error::TooMuch)?;
+    let cmds = shell::parse(src, depth)?;
+    let evals = cmds
+        .iter()
+        .map(|c| {
+            let words = strip_wrappers(&c.argv, &mut Vec::new());
+            let eval = words.first().is_some_and(|w| !w.dynamic && program(&w.text) == "eval") && !words[1..].iter().any(|w| w.dynamic);
+            eval.then(|| script(&words[1..].iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "), depth + 1, budget))
+        })
+        .collect();
+    Ok(Script { cmds, evals, repeats: repeats(src) })
+}
+
+/// Where each `cd`, `pushd`, or `popd` in `s` goes, in order, including those in
+/// `eval`. None when that can't be known: `source` may change folder too.
+fn cd_targets(s: &Script, out: &mut Vec<Option<String>>) {
+    for (c, eval) in s.cmds.iter().zip(&s.evals) {
+        match eval {
+            Some(Ok(inner)) => cd_targets(inner, out),
+            Some(Err(_)) => out.push(None),
+            None => {}
+        }
+        let words = strip_wrappers(&c.argv, &mut Vec::new());
+        let Some(prog) = words.first().filter(|w| !w.dynamic).map(|w| program(&w.text)) else { continue };
+        match prog.as_str() {
+            "cd" | "pushd" | "popd" => {}
+            "source" | "." => {
+                out.push(None);
+                continue;
+            }
+            _ => continue,
+        }
+        let arg = words[1..].iter().find(|a| a.dynamic || !a.text.starts_with('-') || a.text == "-");
+        let home_only = |a: &Word| (a.text.starts_with("$HOME") || a.text.starts_with("${HOME}")) && a.text.matches('$').count() == 1;
+        out.push(match (prog.as_str(), arg) {
+            ("cd", None) => Some("~".to_string()),
+            ("popd", _) | (_, None) => None,
+            (_, Some(a)) if (a.dynamic && !home_only(a)) || a.text == "-" || a.text.starts_with('+') || a.text.contains(['*', '?', '[']) => None,
+            (_, Some(a)) => Some(a.text.clone()),
+        });
+    }
+}
+
+fn classify_shell(cmd: &str, cwds: &Cwds, ctx: &Ctx, depth: usize, budget: &mut usize, out: &mut Vec<(&'static str, String)>) {
+    match script(cmd, depth, budget) {
+        Ok(s) => {
+            let mut cwds = cwds.clone();
+            let mut targets = Vec::new();
+            cd_targets(&s, &mut targets);
+            if cmd.contains("CDPATH") {
+                targets.push(None);
+            }
+            cwds.add(ctx, &targets, s.repeats);
+            classify_script(&s, &cwds, ctx, depth, budget, out)
+        }
+        Err(e) => unreadable(&e, out),
+    }
+}
+
+fn unreadable(e: &shell::Error, out: &mut Vec<(&'static str, String)>) {
+    out.push((UNREADABLE, format!("Can't check this command safely: {e}")))
+}
+
+/// Classifies every command in `s`. `cwds` already holds every folder it may visit.
+fn classify_script(s: &Script, cwds: &Cwds, ctx: &Ctx, depth: usize, budget: &mut usize, out: &mut Vec<(&'static str, String)>) {
+    let cmds = &s.cmds;
+    for (c, eval) in cmds.iter().zip(&s.evals) {
         let words = strip_wrappers(&c.argv, out);
         let Some(first) = words.first() else { continue };
         if first.dynamic {
@@ -386,10 +550,10 @@ fn classify_shell(cmd: &str, cwd: &Path, ctx: &Ctx, depth: usize, out: &mut Vec<
         let piped_download = c.pipe_from.and_then(|j| cmds[j].argv.first()).is_some_and(|w| ["curl", "wget"].contains(&program(&w.text).as_str()));
 
         if prog == "eval" {
-            if words[1..].iter().any(|w| w.dynamic) {
-                out.push(("shell_destructive", "Runs code only known when it runs (eval)".into()));
-            } else {
-                classify_shell(&args.join(" "), &cwd, ctx, depth + 1, out);
+            match eval {
+                Some(Ok(inner)) => classify_script(inner, cwds, ctx, depth + 1, budget, out),
+                Some(Err(e)) => unreadable(e, out),
+                None => out.push(("shell_destructive", "Runs code only known when it runs (eval)".into())),
             }
             continue;
         }
@@ -402,7 +566,7 @@ fn classify_shell(cmd: &str, cwd: &Path, ctx: &Ctx, depth: usize, out: &mut Vec<
                 let flag = args.iter().position(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c'));
                 match flag.and_then(|i| words.get(i + 2)) {
                     Some(script) if script.dynamic => out.push(("shell_destructive", format!("Runs a script only known when it runs ({prog} -c)"))),
-                    Some(script) => classify_shell(&script.text, &cwd, ctx, depth + 1, out),
+                    Some(script) => classify_shell(&script.text, cwds, ctx, depth + 1, budget, out),
                     None => {}
                 }
                 continue;
@@ -411,11 +575,6 @@ fn classify_shell(cmd: &str, cwd: &Path, ctx: &Ctx, depth: usize, out: &mut Vec<
         let mut found = Vec::new();
         let mut push = |class: &'static str, why: String| found.push((class, why));
         match prog.as_str() {
-            "cd" => {
-                if let Some(dir) = args.first().and_then(|d| resolve(ctx, &cwd, d)) {
-                    cwd = dir;
-                }
-            }
             "rm" | "rmdir" | "unlink" | "shred" | "srm" | "trash" | "trash-put" | "gio" => {
                 let targets: Vec<&str> = if prog == "gio" {
                     if args.first() == Some(&"trash") || args.first() == Some(&"remove") { args[1..].to_vec() } else { vec![] }
@@ -423,7 +582,7 @@ fn classify_shell(cmd: &str, cwd: &Path, ctx: &Ctx, depth: usize, out: &mut Vec<
                     args.clone()
                 };
                 for t in operands(&targets) {
-                    deletion(ctx, &cwd, t, &mut push);
+                    deletion(ctx, cwds, t, &mut push);
                 }
                 if prog == "shred" {
                     push("shell_destructive", "Shreds files".into());
@@ -434,7 +593,7 @@ fn classify_shell(cmd: &str, cwd: &Path, ctx: &Ctx, depth: usize, out: &mut Vec<
                     || args.windows(2).any(|w| (w[0] == "-exec" || w[0] == "-execdir") && ["rm", "shred", "unlink"].contains(&program(w[1]).as_str())) =>
             {
                 for t in args.iter().take_while(|a| !a.starts_with('-') && !a.starts_with('(') && !a.starts_with('!')) {
-                    if !inside(ctx, &cwd, t) {
+                    if !cwds.inside(ctx, t) {
                         push("file_delete", format!("Deletes files under {t} outside the workspace"));
                     }
                 }
@@ -449,7 +608,7 @@ fn classify_shell(cmd: &str, cwd: &Path, ctx: &Ctx, depth: usize, out: &mut Vec<
             "crontab" if args.contains(&"-r") => push("shell_destructive", "Removes the crontab".into()),
             "chmod" | "chown" | "chgrp" if args.iter().any(|a| *a == "-R" || *a == "--recursive" || (a.starts_with('-') && !a.starts_with("--") && a.contains('R'))) => {
                 for t in operands(&args).into_iter().skip(1) {
-                    if !inside(ctx, &cwd, t) {
+                    if !cwds.inside(ctx, t) {
                         push("shell_destructive", format!("Recursively changes permissions on {t}"));
                     }
                 }
@@ -486,10 +645,10 @@ fn classify_shell(cmd: &str, cwd: &Path, ctx: &Ctx, depth: usize, out: &mut Vec<
     }
 }
 
-fn deletion(ctx: &Ctx, cwd: &Path, target: &str, push: &mut impl FnMut(&'static str, String)) {
-    match resolve(ctx, cwd, target) {
-        Some(p) if p == ctx.workspace => push("shell_destructive", "Deletes the whole workspace".into()),
-        Some(p) if p.starts_with(&ctx.workspace) => {}
+fn deletion(ctx: &Ctx, cwds: &Cwds, target: &str, push: &mut impl FnMut(&'static str, String)) {
+    match cwds.resolve(ctx, target) {
+        Some(ps) if ps.contains(&ctx.workspace) => push("shell_destructive", "Deletes the whole workspace".into()),
+        Some(ps) if ps.iter().all(|p| p.starts_with(&ctx.workspace)) => {}
         _ => push("file_delete", format!("Deletes {target} outside the workspace")),
     }
 }
@@ -778,7 +937,8 @@ mod tests {
         assert_eq!(cls("rm -rf /srv/ws"), ["shell_destructive"]);
         assert_eq!(cls("rm -rf *"), ["shell_destructive"]);
         assert_eq!(cls("rm -rf ."), ["shell_destructive"]);
-        assert!(cls("cd sub; rm -rf *").is_empty());
+        // If `cd` fails, `rm` runs in the workspace itself.
+        assert_eq!(cls("cd sub; rm -rf *"), ["shell_destructive"]);
     }
 
     #[test]
@@ -953,8 +1113,83 @@ mod tests {
         assert_eq!(decide(&Policy::new(Mode::Bypass), &[], &shell("echo 'x"), &ctx()).action, Action::Allow);
         assert_eq!(decide(&ask, &[], &shell("echo fine"), &ctx()).action, Action::Allow);
         // Deeper than the old silent cutoff, still well inside the limit: classified, not skipped.
+        // Many `cd`s, many `eval`s: bounded work, and still a decision.
+        let started = std::time::Instant::now();
+        let cds = format!("while x; do {} done; rm victim", (0..4_000).map(|i| format!("cd /srv/ws/{}; cd d{i}; ", i % 7)).collect::<String>());
+        let evals = "eval ".repeat(200_000) + "cd /tmp; rm victim";
+        let v = decide(&ask, &[], &shell(&cds), &ctx());
+        assert_eq!((v.action, v.class), (Action::Ask, Some("file_delete")));
+        let v = decide(&ask, &[], &shell(&evals), &ctx());
+        assert_eq!((v.action, v.class), (Action::Deny, Some(UNREADABLE)));
+        assert!(v.reason.contains("nested code"), "{}", v.reason);
+        assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());
         let five = (0..5).fold("git push".to_string(), |s, _| format!("bash -c {}", quote(&s)));
         assert_eq!(classes(&shell(&five)), ["git_push"]);
+    }
+
+    #[test]
+    fn escaped_and_globbed_command_names() {
+        for cmd in [r"$'g\x69t' push", r"$'\147it' push", r"$'\u0067it' push", r"$'\U00000067it' push", r"$'git\0junk' push", r"g$'\151't push"] {
+            assert_eq!(cls(cmd), ["git_push"], "{cmd}");
+        }
+        for cmd in ["/usr/bin/gi? push", "/usr/bin/g[i]t push", "{git,push}", "/usr/bin/gi* push", r"$'\xff' x", "$\"git\" push"] {
+            assert_eq!(cls(cmd), ["shell_destructive"], "{cmd}");
+        }
+        for cmd in ["[ -f x ] && echo y", "[[ -n $x ]]", "find . -name '*.o' -exec echo {} \\;", "echo $'a\\tb'"] {
+            assert!(cls(cmd).is_empty(), "{cmd} -> {:?}", cls(cmd));
+        }
+    }
+
+    #[test]
+    fn remembered_commands_keep_their_spaces() {
+        let ask = Policy::new(Mode::Ask);
+        let one = shell("rm '/tmp/a b'");
+        assert_eq!(one.subject, "rm '/tmp/a b'");
+        let remembered = rule(Action::Allow, "shell", &glob_escape(&one.shown()));
+        assert_eq!(decide(&ask, std::slice::from_ref(&remembered), &one, &ctx()).action, Action::Allow);
+        assert_eq!(decide(&ask, &[remembered], &shell("rm '/tmp/a  b'"), &ctx()).action, Action::Ask);
+    }
+
+    #[test]
+    fn shell_tools_send_command_or_cmd() {
+        let ask = Policy::new(Mode::Ask);
+        let call = |input: Value| Call::new("exec_command", input, "/srv/ws".into());
+        for input in [json!({ "cmd": "git push" }), json!({ "cmd": ["git", "push"] }), json!({ "command": "git push", "cmd": "git push" })] {
+            let c = call(input.clone());
+            assert_eq!((classes(&c), c.subject.as_str()), (vec!["git_push"], "git push"), "{input}");
+        }
+        for input in [json!({}), json!({ "cmd": 5 }), json!({ "cmd": ["git", 5] }), json!({ "command": "ls", "cmd": "git push" }), Value::Null] {
+            let v = decide(&ask, &[rule(Action::Allow, "*", "*")], &call(input.clone()), &ctx());
+            assert_eq!((v.action, v.class), (Action::Deny, Some(UNREADABLE)), "{input}");
+        }
+    }
+
+    #[test]
+    fn every_folder_a_cd_could_leave_counts() {
+        // The subshell's `cd` doesn't move the outer shell, so `victim` is in /tmp.
+        for cmd in [
+            "cd /tmp; (cd /srv/ws); rm victim",
+            "cd /tmp; (cd /srv/ws) && rm victim",
+            "cd /tmp && { cd /srv/ws || true; } && rm victim",
+            "cd /tmp; cd /srv/ws | cat; rm victim",
+            "cd /srv/ws/sub && rm ../../x",
+            "cd /srv/ws/a; rm x; cd ../b; rm y",
+            "cd /tmp || cd /srv/ws; rm victim",
+            "cd -; rm victim",
+            "cd \"$D\" && rm victim",
+            "pushd /tmp; popd; rm victim",
+            "source env.sh; rm victim",
+            "eval 'cd /tmp'; rm victim",
+            "CDPATH=/tmp cd sub; rm victim",
+            "for d in a b c; do cd ..; done; rm victim",
+            "bash -c 'cd / && rm -rf etc'",
+            "cd /tmp; bash -c 'rm victim'",
+        ] {
+            assert!(cls(cmd).contains(&"file_delete"), "{cmd} -> {:?}", cls(cmd));
+        }
+        for cmd in ["cd sub && rm -rf out", "cd /srv/ws/a; rm x; cd /srv/ws/b; rm y", "cd src && cd lib && rm old.rs", "(cd sub && rm x)", "cd; cd /srv/ws && rm /srv/ws/x"] {
+            assert!(cls(cmd).is_empty(), "{cmd} -> {:?}", cls(cmd));
+        }
     }
 
     #[test]

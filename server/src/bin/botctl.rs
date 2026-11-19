@@ -30,7 +30,7 @@ Confirm the schedule with the user in plain words.
 If the other Bot takes longer, its reply arrives later as a new message."#;
 
 const ADMIN_HELP: &str = r#"Operator commands (run on the server; need SUPERBOT_PASSWORD set to AUTH_PASSWORD,
-and BOT_API if botd isn't on http://127.0.0.1:3000):
+and BOT_API if botd isn't on http://127.0.0.1:3000; the password is only sent to this machine):
 
   botctl policy [<bot>]                            Show the global or a Bot's policy
   botctl policy set <global|bot> [mode=ask|bypass] [timeout=<minutes>] [<class>=allow|ask|deny]...
@@ -67,8 +67,15 @@ fn api(cred: Cred, method: &str, path: &str, body: Option<String>) -> Result<Str
         },
     };
     let base = base();
-    let addr = base.trim_start_matches("http://").trim_end_matches('/');
+    let addr = addr(&base)?;
+    let operator = matches!(cred, Cred::Operator);
+    if operator && !loopback(addr) {
+        return Err(format!("botctl sends SUPERBOT_PASSWORD only to a server on this machine, not {addr}. Run it on the server, or set BOT_API to an SSH tunnel on 127.0.0.1."));
+    }
     let mut s = TcpStream::connect(addr).map_err(|e| format!("Can't reach the server: {e}"))?;
+    if operator && !s.peer_addr().is_ok_and(|a| a.ip().is_loopback()) {
+        return Err(format!("{addr} isn't on this machine, so botctl won't send SUPERBOT_PASSWORD there."));
+    }
     let body = body.unwrap_or_default();
     let req = format!(
         "{method} {path} HTTP/1.0\r\nHost: {addr}\r\nAuthorization: {auth}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
@@ -85,6 +92,25 @@ fn api(cred: Cred, method: &str, path: &str, body: Option<String>) -> Result<Str
         let msg = serde_json::from_str::<Value>(body).ok().and_then(|v| v["error"].as_str().map(String::from)).unwrap_or(body.into());
         Err(format!("{msg} (HTTP {code})"))
     }
+}
+
+/// The `host:port` in BOT_API. botctl speaks plain http only.
+fn addr(base: &str) -> Result<&str, String> {
+    let a = base.strip_prefix("http://").unwrap_or("").trim_end_matches('/');
+    if a.is_empty() || a.contains(['/', '@', '?', '#']) {
+        return Err(format!("BOT_API should look like http://127.0.0.1:3000, not {base}"));
+    }
+    Ok(a)
+}
+
+/// Whether `addr` names this machine. Plain http crosses any network in the clear,
+/// so the operator password only goes to loopback.
+fn loopback(addr: &str) -> bool {
+    let host = match addr.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or_default(),
+        None => addr.rsplit_once(':').map_or(addr, |(h, _)| h),
+    };
+    host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 fn base64(b: &[u8]) -> String {
@@ -231,6 +257,27 @@ mod tests {
         assert_eq!(base64(b"superbot:pw"), "c3VwZXJib3Q6cHc=");
         assert_eq!(base64(b"ab"), "YWI=");
         assert_eq!(base64(b"abc"), "YWJj");
+    }
+
+    #[test]
+    fn the_operator_password_only_goes_to_this_machine() {
+        for a in ["127.0.0.1:3000", "127.1.2.3:80", "localhost:3000", "LOCALHOST:3000", "[::1]:3000"] {
+            assert!(loopback(a), "{a}");
+        }
+        for a in ["192.0.2.7:3000", "example.com:3000", "localhost.example.com:3000", "[2001:db8::1]:3000", "0.0.0.0:3000", "127.0.0.1.example.com:3000"] {
+            assert!(!loopback(a), "{a}");
+        }
+        assert_eq!(addr("http://127.0.0.1:3000/"), Ok("127.0.0.1:3000"));
+        for b in ["https://127.0.0.1:3000", "127.0.0.1:3000", "http://user@192.0.2.7:3000", "http://192.0.2.7:3000/x", "http://"] {
+            assert!(addr(b).is_err(), "{b}");
+        }
+        // SAFETY: tests in this binary don't read these variables concurrently.
+        unsafe {
+            std::env::set_var("BOT_API", "http://192.0.2.7:3000");
+            std::env::set_var("SUPERBOT_PASSWORD", std::process::id().to_string());
+        }
+        let err = api(Cred::Operator, "GET", "/api/approvals", None).unwrap_err();
+        assert!(err.contains("only to a server on this machine"), "{err}");
     }
 
     #[test]

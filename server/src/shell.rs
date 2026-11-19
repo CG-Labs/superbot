@@ -16,6 +16,8 @@ pub const MAX_LEN: usize = 1 << 20;
 pub const MAX_DEPTH: usize = 16;
 /// Most simple commands in one call.
 pub const MAX_COMMANDS: usize = 10_000;
+/// Most code parsed for one call, counting each nested `eval` or `sh -c` again.
+pub const MAX_TOTAL: usize = 4 * MAX_LEN;
 
 /// One shell word after quote removal. Expansions stay in the text as written
 /// (`$HOME/x`) or as a marker (`$(…)`), and make the word `dynamic`.
@@ -39,6 +41,8 @@ pub enum Error {
     TooLong,
     TooDeep,
     TooMany,
+    /// Nested code (`eval`, `sh -c`) parsed for one call went over MAX_TOTAL.
+    TooMuch,
     Unterminated(&'static str),
     Unexpected(char),
 }
@@ -49,6 +53,7 @@ impl fmt::Display for Error {
             Error::TooLong => write!(f, "it is over {MAX_LEN} characters"),
             Error::TooDeep => write!(f, "it nests more than {MAX_DEPTH} levels deep"),
             Error::TooMany => write!(f, "it runs more than {MAX_COMMANDS} commands"),
+            Error::TooMuch => write!(f, "its nested code is over {MAX_TOTAL} characters in all"),
             Error::Unterminated(what) => write!(f, "it has an unclosed {what}"),
             Error::Unexpected(c) => write!(f, "it has an unexpected {c:?}"),
         }
@@ -429,9 +434,11 @@ impl Parser {
         Ok(())
     }
 
-    /// One word, up to a blank or an operator.
+    /// One word, up to a blank or an operator. Unquoted globs (`gi?`, `[g]it`) and
+    /// brace lists (`{a,b}`, `{1..3}`) make it dynamic: the shell picks the words.
     fn word(&mut self) -> Result<Word, Error> {
         let mut w = Word::default();
+        let (mut bracket, mut brace, mut list) = (false, false, false);
         while let Some(c) = self.peek() {
             match c {
                 ' ' | '\t' | '\n' | ';' | '&' | '|' | '<' | '>' | ')' => break,
@@ -469,6 +476,16 @@ impl Parser {
                 }
                 c => {
                     self.i += 1;
+                    match c {
+                        '*' | '?' => w.dynamic = true,
+                        '[' => bracket = true,
+                        ']' if bracket => w.dynamic = true,
+                        '{' => (brace, list) = (true, false),
+                        ',' if brace => list = true,
+                        '.' if brace && w.text.ends_with('.') => list = true,
+                        '}' if brace && list => w.dynamic = true,
+                        _ => {}
+                    }
                     w.text.push(c);
                 }
             }
@@ -504,19 +521,82 @@ impl Parser {
         }
     }
 
-    /// `$'…'`: backslash escapes, no expansion.
+    /// `$'…'`: decodes backslash escapes the way bash does. Escapes give bytes, so
+    /// `\xc3\xa9` is one character; text that isn't UTF-8 makes the word dynamic, and
+    /// a NUL ends the string, as in bash.
     fn ansi(&mut self, w: &mut Word) -> Result<(), Error> {
+        let mut bytes = Vec::new();
+        let push = |bytes: &mut Vec<u8>, c: char| bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
         loop {
             match self.bump() {
                 None => return Err(Error::Unterminated("$'")),
-                Some('\'') => return Ok(()),
+                Some('\'') => break,
                 Some('\\') => match self.bump() {
                     None => return Err(Error::Unterminated("$'")),
-                    Some(c) => w.text.push(c),
+                    Some(c @ ('\\' | '\'' | '"' | '?')) => push(&mut bytes, c),
+                    Some('a') => bytes.push(0x07),
+                    Some('b') => bytes.push(0x08),
+                    Some('e' | 'E') => bytes.push(0x1b),
+                    Some('f') => bytes.push(0x0c),
+                    Some('n') => bytes.push(b'\n'),
+                    Some('r') => bytes.push(b'\r'),
+                    Some('t') => bytes.push(b'\t'),
+                    Some('v') => bytes.push(0x0b),
+                    Some(c @ '0'..='7') => {
+                        let n = self.digits(8, 2, c.to_digit(8).unwrap_or(0));
+                        bytes.push((n & 0xff) as u8);
+                    }
+                    Some(c @ ('x' | 'u' | 'U')) => {
+                        let max = match c {
+                            'x' => 2,
+                            'u' => 4,
+                            _ => 8,
+                        };
+                        let start = self.i;
+                        let n = self.digits(16, max, 0);
+                        match (c, self.i > start) {
+                            (_, false) => bytes.extend_from_slice(&[b'\\', c as u8]),
+                            ('x', true) => bytes.push(n as u8),
+                            (_, true) => match char::from_u32(n) {
+                                Some(ch) => push(&mut bytes, ch),
+                                None => w.dynamic = true,
+                            },
+                        }
+                    }
+                    Some('c') => match self.bump() {
+                        None => return Err(Error::Unterminated("$'")),
+                        Some(c) if c.is_ascii() => bytes.push(c.to_ascii_uppercase() as u8 ^ 0x40),
+                        Some(_) => w.dynamic = true,
+                    },
+                    Some(c) => {
+                        bytes.push(b'\\');
+                        push(&mut bytes, c);
+                    }
                 },
-                Some(c) => w.text.push(c),
+                Some(c) => push(&mut bytes, c),
             }
         }
+        if let Some(nul) = bytes.iter().position(|b| *b == 0) {
+            bytes.truncate(nul);
+        }
+        match String::from_utf8(bytes) {
+            Ok(s) => w.text.push_str(&s),
+            Err(e) => {
+                w.text.push_str(&String::from_utf8_lossy(e.as_bytes()));
+                w.dynamic = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// Up to `max` more digits in `radix`, after `n`.
+    fn digits(&mut self, radix: u32, max: usize, mut n: u32) -> u32 {
+        for _ in 0..max {
+            let Some(d) = self.peek().and_then(|c| c.to_digit(radix)) else { break };
+            n = n * radix + d;
+            self.i += 1;
+        }
+        n
     }
 
     /// Double-quoted text up to `close`, or (None) an expanding here-document body.
@@ -571,7 +651,9 @@ impl Parser {
                 self.ansi(w)
             }
             Some('"') if !quoted => {
+                // `$"…"` may be swapped for a translation, so its text isn't known.
                 self.i += 1;
+                w.dynamic = true;
                 self.text(Some('"'), w)
             }
             Some(c) if c.is_ascii_alphabetic() || c == '_' => {
@@ -685,6 +767,44 @@ mod tests {
         assert_eq!(cmds(r#"echo 'a b' "c $HOME" d\ e $'f\'g'"#), [["echo", "a b", "c $HOME", "d e", "f'g"]]);
         assert_eq!(cmds("echo a\\\nb"), [["echo", "ab"]]);
         assert_eq!(cmds("echo {a,b} x#y # comment"), [["echo", "{a,b}", "x#y"]]);
+    }
+
+    fn word(src: &str) -> Word {
+        parse(&format!("echo {src}"), 0).unwrap().remove(0).argv.remove(1)
+    }
+
+    #[test]
+    fn ansi_quotes_decode_like_bash() {
+        for (src, text) in [
+            (r"$'g\x69t'", "git"),
+            (r"$'\147\151\164'", "git"),
+            (r"$'\u0067it'", "git"),
+            (r"$'\U0001F600'", "😀"),
+            (r"$'\xc3\xa9'", "é"),
+            (r#"$'a\tb\nc\\d\'e\"f\?g'"#, "a\tb\nc\\d'e\"f?g"),
+            (r"$'\a\b\e\E\f\r\v'", "\x07\x08\x1b\x1b\x0c\r\x0b"),
+            (r"$'\cA\c['", "\x01\x1b"),
+            (r"$'\q\x'", "\\q\\x"),
+            (r"$'git\0push'", "git"),
+            (r"$'\1010'", "A0"),
+        ] {
+            let w = word(src);
+            assert_eq!((w.text.as_str(), w.dynamic), (text, false), "{src}");
+        }
+        for src in [r"$'\xff'", r"$'\U110000'", r"$'\uD800'"] {
+            assert!(word(src).dynamic, "{src}");
+        }
+        assert_eq!(parse(r"echo $'\'", 0).unwrap_err(), Error::Unterminated("$'"));
+    }
+
+    #[test]
+    fn globs_and_brace_lists_are_dynamic() {
+        for src in ["gi?", "g*", "[g]it", "{git,x}", "{1..3}", "a{b,c}d", "$\"x\""] {
+            assert!(word(src).dynamic, "{src}");
+        }
+        for src in ["[", "a[[", "]", "{", "}", "{}", "{x}", "a,b", "'g*'", "\"gi?\"", r"g\*", "a.b", "{a.b}"] {
+            assert!(!word(src).dynamic, "{src}");
+        }
     }
 
     #[test]

@@ -73,7 +73,9 @@ The policy decides what each tool call does: run, ask a person, or be blocked.
   - `outbound_message`: mail CLIs, `gh pr create`/comments, chat webhooks, messaging MCP tools.
   - `network_install`: `apt`, `brew`, `npm i`, `pip install`, `cargo install`, `curl ... | sh`.
   - `git_push`: any `git push`.
-- **Shell commands** are parsed like `sh`/`bash` reads them (`server/src/shell.rs`): every command in pipes, lists, groups, `$(…)`, backticks, `<(…)`, `${…}`, and expanding here-documents is checked. A command whose name is only known at run time (`$CMD`, `eval "$X"`, `bash -c "$S"`) counts as `shell_destructive`.
+- **Shell commands** are parsed like `sh`/`bash` reads them (`server/src/shell.rs`): every command in pipes, lists, groups, `$(…)`, backticks, `<(…)`, `${…}`, and expanding here-documents is checked. `$'…'` escapes are decoded as bash does. A command whose name is only known at run time (`$CMD`, `gi?`, `{git,x}`, `eval "$X"`, `bash -c "$S"`) counts as `shell_destructive`.
+- **Folders**: a `cd` may fail or run in a subshell, so a relative path must be inside the workspace from every folder the command could be in. When a folder can't be known (`cd -`, `cd "$D"`, `popd`, `source`), relative deletes count as outside.
+- **Shell tools** may send `command` or `cmd`, as text or argv. A shell call with neither, or two that differ, is denied.
 - **Unreadable commands are denied**, whatever the classes or rules say: unclosed quotes or substitutions, syntax the parser doesn't know, over 1 MiB, nesting over 16 levels, or over 10,000 commands. The Bot is told why, so it can simplify the command.
 - **Rules**: `deny` rules (the deny list) always block. `allow` rules skip asking, unless the class is `deny`. Patterns are globs (`*`, `?`) over the command, path, URL, or tool arguments. "Remember" on an approval saves an exact-match rule for that Bot.
 - **Scope**: one global policy, plus optional per-Bot overrides.
@@ -89,7 +91,7 @@ Fresh installs start in `ask`. Installs from before approvals keep `bypass` unti
 SUPERBOT_PASSWORD=<your AUTH_PASSWORD> botctl policy set global mode=ask
 ```
 
-Or use the switch at the bottom of the web app's Approvals window. More operator commands: `botctl admin`.
+Or use the switch at the bottom of the web app's Approvals window. More operator commands: `botctl admin`. botctl only sends the password to a server on the same machine (loopback), since it speaks plain http; from elsewhere, use an SSH tunnel.
 
 ```sh
 botctl policy set global timeout=15 git_push=deny   # never push, ask longer

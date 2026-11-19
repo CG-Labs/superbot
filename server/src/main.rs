@@ -1026,6 +1026,11 @@ mod tests {
             let (code, bad) = call(port, "POST", "/api/approvals/check", &bot_auth, &check(cmd)).await;
             assert_eq!((code, bad.lines().next()), (200, Some("deny")), "{cmd:.40}");
         }
+        for input in [json!({}), json!({ "command": "ls", "cmd": "git push" })] {
+            let body = json!({ "from": bot.id, "harness": "codex", "event": { "tool_name": "exec_command", "tool_input": input } }).to_string();
+            let (_, bad) = call(port, "POST", "/api/approvals/check", &bot_auth, &body).await;
+            assert_eq!(bad.lines().next(), Some("deny"), "{input}");
+        }
         let (_, list) = call(port, "GET", "/api/approvals?status=pending", &user, "").await;
         assert_eq!(list.trim(), "[]", "refused without asking");
     }
