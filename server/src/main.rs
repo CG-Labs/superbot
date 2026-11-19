@@ -416,6 +416,7 @@ impl Auth {
         let client = format!("{}|{method}", source.ip.as_deref().unwrap_or(""));
         let Some(missed) = self.logins.failure(&client, db::now()) else { return };
         let actor = if method == "bot_token" { Actor::bot(None, None) } else { Actor { id: None, ..Actor::operator() } };
+        let actor = actor.method(method);
         let who = Who { actor, source: source.clone() };
         let mut details = json!({ "method": method, "unloggedSinceLast": missed });
         if let Some(r) = reason {
@@ -437,13 +438,19 @@ impl Auth {
     }
 
     /// A Bot request names its Bot (`X-SuperBot-Bot`, from botctl's BOT_ID). All Bots
-    /// share one token, so this is self-reported.
+    /// share one token, so this is self-reported. A known Bot acts for its owner.
     fn bot_actor(&self, headers: &axum::http::HeaderMap) -> Actor {
         let id = headers.get("x-superbot-bot").and_then(|v| v.to_str().ok()).filter(|id| id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric()));
         match id.and_then(|id| self.app.as_ref()?.db.bot(id)) {
-            Some(b) => Actor::bot(Some(&b.id), Some(&b.name)),
+            Some(b) => Actor::for_bot(&b),
             None => Actor::bot(None, None),
         }
+        .method("bot_token")
+    }
+
+    /// The type of an SSO provider ("entra", "google", "oidc", ...), for audit actors.
+    pub fn idp_type(&self, provider: &str) -> Option<String> {
+        self.sso.provider(provider).map(|p| p.type_name().to_string())
     }
 }
 
@@ -575,8 +582,8 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
     };
     let actor = match (&caller.principal, &caller.user) {
         (Principal::Bot, _) => a.bot_actor(req.headers()),
-        (_, Some(u)) => users::actor(u, caller.session.as_ref()),
-        (_, None) => Actor::operator(),
+        (_, Some(u)) => users::actor(&a, u, caller.session.as_ref(), caller.method),
+        (_, None) => Actor::operator().method(caller.method),
     };
     if caller.method != "session" && caller.principal != Principal::Bot {
         a.login_ok(&source, &actor, caller.method);
@@ -1205,7 +1212,9 @@ async fn send_message(State(app): State<AppState>, Extension(c): Extension<Calle
         let _ = tx.send(text);
         return Ok((StatusCode::ACCEPTED, Json(json!(msg))));
     }
-    let msg = app.db.add_message(&id, "user", &text, None, false, Some("queued"));
+    let mut msg = app.db.add_message(&id, "user", &text, None, false, Some("queued"));
+    app.db.set_requested_by(msg.id, &by);
+    msg.requested_by = Some(by.clone());
     app.push_message(&msg);
     app.enqueue(msg.clone());
     Ok((StatusCode::ACCEPTED, Json(json!(msg))))
@@ -1235,10 +1244,14 @@ async fn ask(State(app): State<AppState>, Extension(c): Extension<Caller>, Exten
         return Err(bad("You can't ask yourself"));
     }
     let text = v["text"].as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| bad("Message is required"))?;
-    let asked = Event { source: by.source.clone(), ..Event::new(Actor::bot(Some(&from.id), Some(&from.name)), "bot.asked") };
-    app.db.record(&asked.target("bot", &to.id).bot(&from.id).details(json!({ "to": to.name })));
+    // A Bot asks as itself (whatever Bot botctl named), for its owner; a person as themselves.
+    let by = match c.principal {
+        Principal::Bot => Who { actor: Actor::for_bot(&from).method("bot_token"), source: by.source.clone() },
+        Principal::User(_) => by,
+    };
+    app.db.record(&by.event("bot.asked").target("bot", &to.id).bot(&from.id).details(json!({ "to": to.name })));
     let wait = Duration::from_secs(9 * 60); // under the 10 minute max most harnesses allow a command
-    Ok(match app.ask(&from, to, text, wait).await {
+    Ok(match app.ask(&from, to, text, wait, &by).await {
         Some(reply) => reply,
         None => format!("{} is still working on it. Their reply will arrive later as a new message.", to.name),
     })
@@ -1570,16 +1583,23 @@ async fn check_approval(State(app): State<AppState>, Extension(c): Extension<Cal
 async fn list_audit(State(app): State<AppState>, Extension(who): Extension<Principal>, Query(q): Query<HashMap<String, String>>) -> Res {
     need_user(who)?;
     let limit = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(100).clamp(1, 1000);
-    let f = audit::Filter::from_query(&q).map_err(bad)?;
+    let f = audit_filter(&app, &q)?;
     let events = app.db.audit_events(&f, limit, false);
     let next = (events.len() as i64 == limit).then(|| events.last().map(|e| e.id)).flatten();
     Ok(Json(json!({ "events": events, "nextBefore": next })))
 }
 
+/// `?actor=user:<email>` and `?onBehalfOf=<email>` find the person by their email now.
+fn audit_filter(app: &App, q: &HashMap<String, String>) -> Result<audit::Filter, ApiError> {
+    let mut f = audit::Filter::from_query(q).map_err(bad)?;
+    f.resolve_users(|key| app.db.find_user(key).map(|u| u.id));
+    Ok(f)
+}
+
 /// The filtered log as RFC 4180 CSV, oldest first, streamed in batches.
 async fn export_audit(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Query(q): Query<HashMap<String, String>>) -> Result<Response, ApiError> {
     need_user(who)?;
-    let mut f = audit::Filter::from_query(&q).map_err(bad)?;
+    let mut f = audit_filter(&app, &q)?;
     app.db.record(&by.event("audit.exported").target("audit", "csv").details(f.describe()));
     // A snapshot: events written while the export streams are left out.
     let newest = app.db.audit_events(&audit::Filter::default(), 1, false).first().map_or(0, |e| e.id);
@@ -2002,7 +2022,8 @@ mod tests {
         let (_, _, body) = call_with(port, "GET", "/api/audit/export.csv?action=test.bulk", &user, "", "").await;
         let rows: Vec<&str> = body.trim_end().split("\r\n").skip(1).collect();
         assert_eq!(rows.len(), 1200);
-        assert!(rows[0].ends_with(r#""{""i"":0}""#) && rows[1199].ends_with(r#""{""i"":1199}""#));
+        assert!(rows[0].ends_with(r#""{""i"":0}",,,,,,,"#), "{}", rows[0]);
+        assert!(rows[1199].ends_with(r#""{""i"":1199}",,,,,,,"#), "{}", rows[1199]);
     }
 
     #[tokio::test]

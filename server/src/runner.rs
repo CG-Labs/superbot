@@ -2,7 +2,7 @@
 //! (identity, rules, memory), streams harness events to the web app, and saves replies.
 
 use crate::adapters::{self, AbortReason, AgentEvent, Guard, RunInput};
-use crate::audit::{Actor, Event};
+use crate::audit::{Actor, Event, Outcome, Who};
 use crate::db::{Bot, BotPatch, Db, Message};
 use crate::paths;
 use crate::policy::Mode;
@@ -12,7 +12,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, oneshot, watch};
 
 /// How long after a guarded run's first shell tool the approval hook must have
@@ -214,6 +214,8 @@ impl App {
         };
         self.init_bot_files(&bot);
         self.db.set_status(msg.id, "running");
+        let by = self.requester(&bot, msg);
+        let started = Instant::now();
         let from = || msg.from_bot.as_deref().and_then(|id| self.db.bot(id)).map(|b| format!("{} (id {})", b.name, b.id)).unwrap_or("another Bot".into());
         let prompt = match msg.role.as_str() {
             "routine" => format!("(Scheduled routine) {}", msg.text),
@@ -261,6 +263,12 @@ impl App {
             {
                 env.extend(screen::bot_env(&info, &bot.id, &bot_dir));
             }
+            let invoked = json!({
+                "harness": bot.harness, "model": bot.model, "effort": bot.effort, "policy": policy.mode,
+                "guarded": guard.is_some(), "resumed": bot.session_id.is_some(), "attempt": attempt + 1,
+                "trigger": msg.role, "messageId": msg.id,
+            });
+            self.db.record(&by.event("harness.invoked").target("message", &msg.id.to_string()).bot(&bot.id).details(invoked));
             let input = RunInput {
                 prompt: prompt.clone(),
                 system: self.system_prompt(&bot),
@@ -343,7 +351,21 @@ impl App {
                 continue;
             }
 
-            match *abort_rx.borrow() {
+            let reason = *abort_rx.borrow();
+            let (result, outcome) = match reason {
+                Some("shutdown") => ("interrupted", Outcome::Failure),
+                Some("stopped") => ("stopped", Outcome::Failure),
+                Some(r @ ("unguarded" | "policy")) => (r, Outcome::Denied),
+                Some("timeout") => ("timeout", Outcome::Failure),
+                _ if !errors.is_empty() => ("error", Outcome::Failure),
+                _ => ("done", Outcome::Success),
+            };
+            let finished = json!({
+                "result": result, "durationMs": started.elapsed().as_millis() as u64, "replies": replies,
+                "attempts": attempt + 1, "trigger": msg.role, "messageId": msg.id,
+            });
+            self.db.record(&by.event("bot.run_finished").target("message", &msg.id.to_string()).bot(&bot.id).outcome(outcome).details(finished));
+            match reason {
                 Some("shutdown") => {}
                 Some("stopped") => self.say(&id, "Stopped.", true),
                 Some("unguarded") => self.say(
@@ -372,14 +394,34 @@ impl App {
         }
     }
 
+    /// Who a run is for: whoever queued its message. Routines run as the scheduler,
+    /// and replies as the Bot that answered, both for their Bot's owner; messages
+    /// queued before per-user actors (ADR 0018) as the runner.
+    fn requester(&self, bot: &Bot, msg: &Message) -> Who {
+        if let Some(by) = &msg.requested_by {
+            return by.clone();
+        }
+        let actor = match msg.role.as_str() {
+            "routine" => Actor::system("scheduler").on_behalf_of(&bot.owner_id),
+            "reply" => match msg.from_bot.as_deref().and_then(|id| self.db.bot(id)) {
+                Some(b) => Actor::for_bot(&b),
+                None => Actor::bot(msg.from_bot.as_deref(), None),
+            },
+            _ => Actor::system("runner").on_behalf_of(&bot.owner_id),
+        };
+        Who { actor, source: Default::default() }
+    }
+
     fn with_run<T: Default>(&self, bot_id: &str, f: impl FnOnce(&mut Run) -> T) -> T {
         self.state().get_mut(bot_id).and_then(|s| s.run.as_mut()).map(f).unwrap_or_default()
     }
 
     /// Another Bot asks this one something. Resolves with the reply, or None if it
     /// takes longer than `wait`; then the reply is delivered to the asker later.
-    pub async fn ask(self: &Arc<Self>, from: &Bot, to: &Bot, text: &str, wait: Duration) -> Option<String> {
-        let msg = self.db.add_message_from(&to.id, "peer", text, None, false, Some("queued"), Some(&from.id));
+    pub async fn ask(self: &Arc<Self>, from: &Bot, to: &Bot, text: &str, wait: Duration, by: &Who) -> Option<String> {
+        let mut msg = self.db.add_message_from(&to.id, "peer", text, None, false, Some("queued"), Some(&from.id));
+        self.db.set_requested_by(msg.id, by);
+        msg.requested_by = Some(by.clone());
         let (tx, rx) = oneshot::channel();
         self.waiters.lock().unwrap().insert(msg.id, tx);
         self.push_message(&msg);
@@ -402,7 +444,7 @@ impl App {
         self.waiters.lock().unwrap().insert(m.id, tx);
         self.push_message(&m);
         let card = m.id.to_string();
-        self.db.record(&Event::new(Actor::bot(Some(&bot.id), Some(&bot.name)), "handoff.requested").target("handoff", &card).bot(&bot.id));
+        self.db.record(&Event::new(Actor::for_bot(bot), "handoff.requested").target("handoff", &card).bot(&bot.id));
         let answer = tokio::time::timeout(wait, rx).await.ok().and_then(Result::ok);
         if answer.is_none() && self.waiters.lock().unwrap().remove(&m.id).is_some() {
             let e = Event::new(Actor::system("handoff"), "handoff.timed_out").target("handoff", &card).bot(&bot.id);

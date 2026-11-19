@@ -82,7 +82,7 @@ impl App {
                 }
                 let class = v.class.unwrap_or("");
                 let a = self.db.add_approval(&bot.id, harness, &call.tool, call.kind.name(), &shown, &call.input, class, &v.reason, now() + wait.as_millis() as i64);
-                let requested = Event::new(Actor::bot(Some(&bot.id), Some(&bot.name)), "approval.requested").target("approval", &a.id).bot(&bot.id);
+                let requested = Event::new(Actor::for_bot(bot), "approval.requested").target("approval", &a.id).bot(&bot.id);
                 self.db.record(&requested.details(detail()));
                 let (tx, rx) = oneshot::channel();
                 self.approval_waiters.lock().unwrap().insert(a.id.clone(), tx);
