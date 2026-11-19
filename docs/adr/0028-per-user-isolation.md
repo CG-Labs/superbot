@@ -45,11 +45,12 @@ The runner asks before every run. A routed run hands a `Job { bot, owner, messag
 ### The trust boundary
 
 - **People** are checked by role (RBAC) and then by Bot ACL, as before.
-- **Bots** get their own token per run: `sbb_<bot id>.<HMAC-SHA256>` over the id, with a key made fresh at each start. botd checks it in constant time. A made-up token, another Bot's id with this Bot's MAC, a token from an earlier start, or a deleted Bot's token is a 401.
+- **Bots** get their own token per run: `sbb_<bot id>.<owner id>.<HMAC-SHA256>` over both, with a key made fresh at each start. botd checks it in constant time. A made-up token, another Bot's id with this Bot's MAC, a token from an earlier start, a deleted Bot's token, or one from before the Bot changed hands is a 401.
+- **Handing a Bot over** stops its current and queued work: that work started in the old owner's folder with their keys. A Bot's live stream closes when the Bot is deleted, changes hands, or its owner is disabled, and follows its owner's role.
 - **A Bot is who its token says.** An `X-SuperBot-Bot` header naming a different Bot is a 403 (`bot_mismatch`). `from` in `ask`, `handoff` and `approvals/check` must be the Bot itself (left out, it means itself). A Bot asking for another Bot's approval check gets `deny`.
 - **A Bot can do no more than its owner.** Its role is capped by its owner's: a read-only user's Bot can't write (403, `owner_role`). A disabled owner's Bot can do nothing.
 - **A Bot sees what its owner sees.** It reaches Bots through its owner's ACL: its own, its owner's other Bots, and Bots shared with its owner.
-- **Secrets.** Each user can keep secrets of their own (`/api/me/secrets`). They reach only Bots that user owns, laid over the server-wide secrets. People can't save names botd itself uses (`PATH`, `BOT_TOKEN`, `LINODE_TOKEN`, `SSO_*`, ...). Values are never returned, only names. Admins can list a user's names and delete them all (`/api/users/{id}/secrets`). Each value is sealed with its user and name, so a row copied to another user doesn't open.
+- **Secrets.** Each user can keep secrets of their own (`/api/me/secrets`). They reach only Bots that user owns, laid over the server-wide secrets. People can't save names botd itself uses (`PATH`, `BOT_TOKEN`, `LINODE_TOKEN`, `SSO_*`, ...). Values are never returned, only names. Admins can list a user's names and delete them all (`/api/users/{id}/secrets`). Each value is sealed with its user and name, so a row copied to another user doesn't open. A user's values are redacted only where their own Bots write (their chats, approvals, audit events, and messages their Bots send others), not from everyone's text: any member can save any value, and must not be able to erase words from other people's chats.
 
 ### Self-hosting on one server
 
@@ -64,7 +65,7 @@ One server plays both parts. It keeps one service account; isolation is by owner
 
 The approval policy counts the owner's folder as the workspace, so a delete in another user's folder counts as outside it. No API route serves files, so there is no HTTP path to another user's folder.
 
-**Upgrading.** On first start, botd moves the old shared workspace and `USER.md` into the operator's folders (`users/operator/`), because every Bot was the operator's before ADR 0017. It writes a marker (`.superbot-layout`) and finishes a move a crash cut short. Claude Code keys sessions by folder, so a Bot starts a fresh session after the move; memory files keep its context.
+**Upgrading.** On first start, botd moves the old shared workspace and `USER.md` into the operator's folders (`users/operator/`), because every Bot was the operator's before ADR 0017. It writes a marker (`.superbot-layout`) and finishes a move a crash cut short. `DATA_DIR` never moves: a folder holding it stays put, and when `DATA_DIR` is the workspace itself nothing moves. Claude Code keys sessions by folder, so a Bot starts a fresh session after the move; memory files keep its context.
 
 **Docker and the bash install** need no change. The backup script also copies `DATA_DIR/users`; the Docker archive already has all of `DATA_DIR`.
 
@@ -80,7 +81,7 @@ The approval policy counts the owner's folder as the workspace, so a delete in a
 - A user's Bots can't see another user's files, facts, keys, chat, screens or approvals through any route. A test walks every Bot, routine and approval route as another user, a read-only user and another user's Bot.
 - botctl stops sending `X-SuperBot-Bot`; its token says who it is.
 - Bot tokens die on restart. Runs don't outlive a restart anyway (they're reported as interrupted).
-- New audit events: `bot.run_routed`, `bot.run_refused`; `secret.set` and `secret.deleted` carry `scope: "user"`; `access.denied` adds `bot_mismatch` and `owner_role`; `auth.login_failed` adds `bot_gone`.
+- New audit events: `bot.run_routed`, `bot.run_refused`; `secret.set` and `secret.deleted` carry `scope: "user"`; `access.denied` adds `bot_mismatch` and `owner_role`; `auth.login_failed` adds `bot_gone` and `bot_moved`.
 
 ## Deferred
 
