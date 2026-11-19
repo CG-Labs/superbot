@@ -264,10 +264,22 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
   const refreshInternal = async (client: SuperBotApi, reloadMessages?: boolean) => {
     const state = await client.verify();
     applyState(state);
+    // Drop what's cached for Bots this person can no longer see (access was revoked).
+    const visible = new Set(state.bots.map((b) => b.id));
+    const drop = <T,>(map: Record<string, T>) => {
+      if (!Object.keys(map).some((id) => !visible.has(id))) return map;
+      return Object.fromEntries(Object.entries(map).filter(([id]) => visible.has(id)));
+    };
+    setMessages(drop);
+    setDrafts(drop);
+    setHandoffs(drop);
     void prefetchUnread(client, state.bots);
     if (reloadMessages) {
       for (const id of Object.keys(messagesRef.current)) {
-        const list = await fetchHistory(client, id);
+        if (!visible.has(id)) continue;
+        // One chat failing to load mustn't stop the rest from catching up.
+        const list = await fetchHistory(client, id).catch(() => null);
+        if (!list) continue;
         setMessages((prev) => ({ ...prev, [id]: list }));
         setHandoffs((h) => applyHandoffHistory(h, id, list));
       }
