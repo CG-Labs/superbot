@@ -226,6 +226,9 @@ async fn role_changes_apply_to_live_sessions_and_the_owner_stays_admin() {
     assert_eq!(call(port, "POST", "/api/bots", &member, r#"{"name":"B"}"#).await.0, 403, "demotion is immediate");
     assert_eq!(call(port, "PATCH", "/api/users/M@Example.com", &admin, r#"{"role":"admin"}"#).await.0, 200, "by email, any case");
     assert_eq!(call(port, "GET", "/api/users", &member, "").await.0, 200, "promotion too");
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{id}"), &member, r#"{"role":"member"}"#).await.0, 409, "no demoting yourself");
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{id}"), &member, r#"{"status":"disabled"}"#).await.0, 409, "or disabling yourself");
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{id}"), &member, r#"{"name":"Me"}"#).await.0, 200, "renaming is fine");
 
     assert_eq!(call(port, "PATCH", "/api/users/operator", &admin, r#"{"role":"member"}"#).await.0, 409);
     assert_eq!(call(port, "PATCH", "/api/users/operator", &admin, r#"{"status":"disabled"}"#).await.0, 409);
@@ -240,8 +243,8 @@ async fn role_changes_apply_to_live_sessions_and_the_owner_stays_admin() {
     let actions: Vec<String> = audit_list(&body).iter().rev().map(|e| e["action"].as_str().unwrap().to_string()).collect();
     assert_eq!(
         actions,
-        ["user.created", "user.created", "user.login_code_created", "user.role_changed", "user.role_changed", "user.updated"],
-        "owner, the member and its code, two role changes, and the owner's rename"
+        ["user.created", "user.created", "user.login_code_created", "user.role_changed", "user.role_changed", "user.updated", "user.updated"],
+        "owner, the member and its code, two role changes, its own rename, and the owner's"
     );
 }
 

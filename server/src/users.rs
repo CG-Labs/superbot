@@ -243,7 +243,7 @@ fn admin_view(u: &User, identities: &[db::Identity], pending: Option<&(i64, i64)
     let mut v = user_view(u);
     v["identities"] = json!(identities
         .iter()
-        .map(|i| json!({ "id": i.id, "provider": i.provider, "email": i.email, "createdAt": i.created_at, "lastLoginAt": i.last_login_at }))
+        .map(|i| json!({ "id": i.id, "provider": i.provider, "subject": i.subject, "email": i.email, "createdAt": i.created_at, "lastLoginAt": i.last_login_at }))
         .collect::<Vec<_>>());
     v["pendingCodes"] = pending.map_or(Value::Null, |(n, exp)| json!({ "count": n, "expiresAt": exp }));
     v
@@ -460,6 +460,9 @@ pub async fn update_user(State(app): State<AppState>, Extension(by): Extension<W
     let demotes = p.role.is_some_and(|r| r != Role::Admin) || p.status == Some("disabled");
     if before.id == OPERATOR && demotes {
         return Err(ApiError(StatusCode::CONFLICT, "The owner (break-glass) account stays an active admin. Set AUTH_BREAK_GLASS=0 to turn password sign-in off.".into()));
+    }
+    if demotes && by.actor.id.as_deref() == Some(before.id.as_str()) {
+        return Err(ApiError(StatusCode::CONFLICT, "You can't demote or disable yourself. Ask another admin.".into()));
     }
     app.db.update_user(&before.id, p).map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
     let after = need_user_key(&app, &before.id)?;
