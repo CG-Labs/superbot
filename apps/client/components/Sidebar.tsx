@@ -20,6 +20,7 @@ export function Sidebar({ onSelectBot, onNewBot, onLogout, compact }: Props) {
     showHidden,
     setShowHidden,
     me,
+    handoffs,
   } = useSuperBot();
 
   const primary = bots.find((b) => b.primary);
@@ -52,6 +53,7 @@ export function Sidebar({ onSelectBot, onNewBot, onLogout, compact }: Props) {
         >
           <BotAvatar color={primary.color} shape={primary.shape} size={72} />
           <Text style={styles.primaryName}>{primary.name}</Text>
+          {handoffs[primary.id] ? <Text style={styles.needsYou}>Needs you</Text> : null}
           {primary.unread && activeId !== primary.id ? <View style={styles.dot} /> : null}
         </Pressable>
       ) : null}
@@ -67,9 +69,15 @@ export function Sidebar({ onSelectBot, onNewBot, onLogout, compact }: Props) {
               <Text style={styles.name} numberOfLines={1}>
                 {b.name}
               </Text>
-              <Text style={styles.preview} numberOfLines={1}>
-                {b.working ? `${b.status || "Working"}…` : b.preview || ""}
-              </Text>
+              {handoffs[b.id] ? (
+                <Text style={styles.needsYou} numberOfLines={1}>
+                  Needs you on its screen
+                </Text>
+              ) : (
+                <Text style={styles.preview} numberOfLines={1}>
+                  {b.working ? `${b.status || "Working"}…` : b.preview || ""}
+                </Text>
+              )}
             </View>
             {b.unread && activeId !== b.id ? <View style={styles.dot} /> : null}
           </Pressable>
@@ -141,6 +149,7 @@ const styles = StyleSheet.create({
   meta: { flex: 1, minWidth: 0 },
   name: { color: "#f0f0f0", fontSize: 16 },
   preview: { color: colors.textDim, fontSize: 14 },
+  needsYou: { color: colors.blueDot, fontSize: 14, fontWeight: "600" },
   dot: {
     width: 9,
     height: 9,

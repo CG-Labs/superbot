@@ -89,8 +89,24 @@ export class SuperBotApi {
     return this.request<Routine[]>("GET", `/api/bots/${botId}/routines`);
   }
 
+  async createRoutine(
+    botId: string,
+    body: { name: string; cron: string; instruction: string; enabled?: boolean },
+  ): Promise<Routine> {
+    return this.request<Routine>("POST", `/api/bots/${botId}/routines`, body);
+  }
+
   async patchRoutine(id: string, body: Record<string, unknown>): Promise<Routine> {
     return this.request<Routine>("PATCH", `/api/routines/${id}`, body);
+  }
+
+  async deleteRoutine(id: string): Promise<void> {
+    await this.request("DELETE", `/api/routines/${id}`);
+  }
+
+  /** Starts the Bot's screen and returns its live view link (see `resolveScreenUrl`). */
+  async screen(botId: string): Promise<{ url: string }> {
+    return this.request<{ url: string }>("GET", `/api/bots/${botId}/screen`);
   }
 
   eventsUrl(): string {

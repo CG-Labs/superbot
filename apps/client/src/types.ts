@@ -56,6 +56,8 @@ export interface Routine {
   cron: string;
   instruction: string;
   enabled: boolean;
+  last_run_at?: number | null;
+  created_at?: number;
 }
 
 export type SseEvent =

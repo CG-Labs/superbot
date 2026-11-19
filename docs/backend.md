@@ -67,8 +67,8 @@ All JSON. Browser auth: HTTP Basic with `AUTH_PASSWORD`. Empty password requires
 - `GET|POST /api/bots/:id/messages` `{text, answer?: {messageId, option}}`
 - `POST /api/bots/:id/read`, `POST /api/bots/:id/stop`
 - `GET|POST /api/bots/:id/routines` `{name, cron, instruction}`
-- `PATCH|DELETE /api/routines/:id` `{enabled?, name?, cron?, instruction?}`
-- `GET /api/bots/:id/screen`: starts the Bot's screen and returns its live view URL
+- `PATCH|DELETE /api/routines/:id` `{enabled?, name?, cron?, instruction?}`. Text fields are trimmed and can't be empty; cron must parse.
+- `GET /api/bots/:id/screen`: starts the Bot's screen and returns its live view URL, once voxl is listening
 - `POST /api/handoff` `{from, text}`: `botctl handoff`; waits for the user's answer
 
 ## Not built yet

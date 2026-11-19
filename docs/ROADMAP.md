@@ -39,7 +39,7 @@ What exists in **CG-Labs/superbot** today:
 | Area | Reality |
 |------|---------|
 | **Auth** | Single `AUTH_PASSWORD` (Basic); optional `ALLOW_NO_AUTH` on loopback only; `ALLOWED_HOSTS`; per-start `BOT_TOKEN` for `botctl`. No user table, no SSO, no RBAC. |
-| **Client** | Login, SSE chat, bots CRUD, models/effort, routines **enable/disable only**; no screen viewer, handoff UI, routine editor, push, or biometric lock; placeholder EAS `projectId`; template branding. |
+| **Client** | Login, SSE chat, bots CRUD, models/effort, routine create/edit/delete, live screen viewer (iframe / WebView) with take over, handoff cards and alerts; no push or biometric lock; placeholder EAS `projectId`; template branding. |
 | **Server** | SQLite single-tenant schema; harnesses run with **permission bypass** (`--dangerously-skip-permissions` / Codex equivalents); approvals and Vault **not built** (`docs/backend.md`). |
 | **Deploy** | Ubuntu bash installer, systemd, Caddy, daily SQLite backup timer; Docker Compose (`Dockerfile` + `deploy/docker/`: `botd`, Caddy, backup sidecar), smoke-tested in CI ([ADR 0006](adr/0006-docker-compose.md)). |
 | **Multi-tenancy** | One deployment = one org in practice (`DATA_DIR`, shared `WORKSPACE_DIR`). |
@@ -87,8 +87,8 @@ Basic auth may remain for **break-glass** and **self-host hobby** tiers only, be
 | | |
 |--|--|
 | **Goal** | Reduce blast radius and improve deploy surface before selling to strangers. |
-| **Scope** | Approvals MVP (pause before destructive harness tools); secrets via env/Vault interface (not plaintext in SQLite); structured audit **events** (append-only file or table) for admin actions; optional Docker **Compose** one-click (image + `botd` + Caddy + volume mounts) per [architecture](architecture.md) and community expectation (e.g. upstream issue **#7** — Compose packaging; not yet in CG-Labs tree); harness **policy** flags (when to allow bypass vs require approval); client: routine editor, screen viewer parity with `web/`, real EAS `projectId` + brand assets. |
-| **Exit criteria** | Compose documented as supported path; approvals cover send-email/shell/file-delete class tools; audit export CSV; client routine CRUD + screen iframe. |
+| **Scope** | Approvals MVP (pause before destructive harness tools); secrets via env/Vault interface (not plaintext in SQLite); structured audit **events** (append-only file or table) for admin actions; optional Docker **Compose** one-click (image + `botd` + Caddy + volume mounts) per [architecture](architecture.md) and community expectation (e.g. upstream issue **#7** — Compose packaging; not yet in CG-Labs tree); harness **policy** flags (when to allow bypass vs require approval); client: routine editor ✓, screen viewer parity with `web/` ✓, handoff UI ✓ ([ADR 0005](adr/0005-client-screen-auth.md)), real EAS `projectId` + brand assets. |
+| **Exit criteria** | Compose documented as supported path; approvals cover send-email/shell/file-delete class tools; audit export CSV; client routine CRUD + screen iframe ✓. |
 | **Size** | **L** |
 | **Dependencies** | M0 |
 
@@ -166,9 +166,9 @@ Basic auth may remain for **break-glass** and **self-host hobby** tiers only, be
 
 | Item | Priority | Milestone |
 |------|----------|-----------|
-| Screen viewer (voxl / `/api/bots/:id/screen`) | High | M1 |
-| Handoff UI | High | M1 |
-| Routine create/edit | High | M1 |
+| Screen viewer (voxl / `/api/bots/:id/screen`) | High | M1 ✓ |
+| Handoff UI | High | M1 ✓ |
+| Routine create/edit | High | M1 ✓ |
 | Push notifications | Medium | M3 |
 | Biometric app lock | Medium | M3 |
 | Custom icons / brand | Medium | M1 |
@@ -248,7 +248,7 @@ No certification claims until audits complete.
 
 | Horizon | Focus |
 |---------|--------|
-| **Now** | Dogfood on Linode; client parity for routines + screen; Compose image; approvals design ADR |
+| **Now** | Dogfood on Linode; client parity for routines + screen ✓; Compose image; approvals design ADR |
 | **Next** | Multi-user data model; Entra + Google OIDC; RBAC v1; private beta billing |
 | **Later** | Public launch + stores; managed multi-tenant; SCIM; SOC 2; per-bot sandboxes |
 
