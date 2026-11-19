@@ -55,7 +55,7 @@ pub enum Perm {
     Write,
     /// Approve or deny a Bot's risky tool call. People only, or a Bot could approve itself.
     Approve,
-    /// Policy and rules, the audit log, users, and sessions.
+    /// Policy and rules, the audit log, secrets, users, and sessions.
     Admin,
 }
 
@@ -187,6 +187,9 @@ mod tests {
             ("DELETE", "/api/policy/rules/r1", Perm::Admin),
             ("GET", "/api/audit", Perm::Admin),
             ("GET", "/api/audit/export.csv", Perm::Admin),
+            ("GET", "/api/secrets", Perm::Admin),
+            ("PUT", "/api/secrets/OPENAI_API_KEY", Perm::Admin),
+            ("DELETE", "/api/secrets/OPENAI_API_KEY", Perm::Admin),
             ("GET", "/api/users", Perm::Admin),
             ("POST", "/api/users", Perm::Admin),
             ("GET", "/api/users/u1", Perm::Admin),
