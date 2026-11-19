@@ -5,6 +5,7 @@ mod adapters;
 mod approvals;
 mod cron;
 mod db;
+mod paths;
 mod policy;
 mod runner;
 mod screen;
@@ -82,14 +83,17 @@ async fn main() {
     });
     WEB_DIR.set(std::env::var("WEB_DIR").ok().map(PathBuf::from)).unwrap();
 
-    let abs = |p: String| std::path::absolute(p).expect("bad path");
-    let data_dir = abs(env("DATA_DIR", "data"));
-    let workspace = abs(env("WORKSPACE_DIR", "workspace"));
-    std::fs::create_dir_all(&data_dir).expect("create DATA_DIR");
-    std::fs::create_dir_all(&workspace).expect("create WORKSPACE_DIR");
-    let db = Db::open(&data_dir.join("app.sqlite")).expect("open database");
+    let root = |key: &str, default: &str| {
+        paths::root(&env(key, default)).unwrap_or_else(|e| {
+            eprintln!("{key}: {e}");
+            std::process::exit(1);
+        })
+    };
+    let data_dir = root("DATA_DIR", "data");
+    let workspace = root("WORKSPACE_DIR", "workspace");
+    let db = Db::open(&paths::child(&data_dir, "app.sqlite").unwrap()).expect("open database");
 
-    let screens = screen::Screens::from_env(data_dir.join("screens"));
+    let screens = paths::child(&data_dir, "screens").and_then(screen::Screens::from_env);
     let app = App::new(db, Config {
         data_dir,
         workspace,
@@ -809,13 +813,15 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    async fn serve(password: &str, allow_no_auth: bool, extra_hosts: &str) -> u16 {
+    /// Auth in front of a stub route. Returns the port and the Bots' bearer token.
+    async fn serve(password: &str, allow_no_auth: bool, extra_hosts: &str) -> (u16, String) {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let bot_token = random_hex(16);
         let state = Arc::new(Auth {
             password: password.into(),
             allow_no_auth,
-            bot_token: "bot-token".into(),
+            bot_token: bot_token.clone(),
             hosts: allowed_hosts("127.0.0.1", port, extra_hosts),
         });
         let router = Router::new()
@@ -824,7 +830,7 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
-        port
+        (port, bot_token)
     }
 
     async fn status(port: u16, host: &str, authorization: &str) -> u16 {
@@ -865,25 +871,27 @@ mod tests {
 
     #[tokio::test]
     async fn spoofed_host_is_refused() {
-        let port = serve("hunter2", false, "bots.example.com").await;
-        assert_eq!(status(port, "attacker.example", &basic("hunter2")).await, 403);
-        assert_eq!(status(port, &format!("attacker.example:{port}"), &basic("hunter2")).await, 403);
-        assert_eq!(status(port, "127.0.0.1:1", &basic("hunter2")).await, 403);
+        let pw = random_hex(16);
+        let (port, _) = serve(&pw, false, "bots.example.com").await;
+        assert_eq!(status(port, "attacker.example", &basic(&pw)).await, 403);
+        assert_eq!(status(port, &format!("attacker.example:{port}"), &basic(&pw)).await, 403);
+        assert_eq!(status(port, "127.0.0.1:1", &basic(&pw)).await, 403);
     }
 
     #[tokio::test]
     async fn own_hosts_and_login() {
-        let port = serve("hunter2", false, "bots.example.com").await;
+        let pw = random_hex(16);
+        let (port, bot_token) = serve(&pw, false, "bots.example.com").await;
         let host = format!("127.0.0.1:{port}");
-        assert_eq!(status(port, &host, &basic("hunter2")).await, 200);
+        assert_eq!(status(port, &host, &basic(&pw)).await, 200);
         assert_eq!(status(port, &host, &basic("wrong")).await, 401);
-        assert_eq!(status(port, &host, "Bearer bot-token").await, 200);
-        assert_eq!(status(port, "bots.example.com", &basic("hunter2")).await, 200);
+        assert_eq!(status(port, &host, &format!("Bearer {bot_token}")).await, 200);
+        assert_eq!(status(port, "bots.example.com", &basic(&pw)).await, 200);
     }
 
     #[tokio::test]
     async fn empty_password_requires_opt_in_even_on_loopback() {
-        let port = serve("", false, "").await;
+        let (port, _) = serve("", false, "").await;
         let host = format!("127.0.0.1:{port}");
         assert_eq!(status(port, &host, "").await, 401);
         assert_eq!(status(port, &host, &basic("")).await, 401);
@@ -891,29 +899,30 @@ mod tests {
 
     #[tokio::test]
     async fn allow_no_auth_permits_anonymous_on_loopback() {
-        let port = serve("", true, "").await;
+        let (port, _) = serve("", true, "").await;
         let host = format!("127.0.0.1:{port}");
         assert_eq!(status(port, &host, "").await, 200);
     }
 
     /// The real router on a fresh install (policy: ask), with a random password.
-    /// Returns the port, the app, and the person's Authorization header.
-    async fn serve_app() -> (u16, AppState, String) {
+    /// Returns the port, the app, and the Authorization headers of the person and of Bots.
+    async fn serve_app() -> (u16, AppState, String, String) {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let password = random_hex(16);
         let auth = Arc::new(Auth {
             password: password.clone(),
             allow_no_auth: false,
-            bot_token: "bot-token".into(),
+            bot_token: random_hex(16),
             hosts: allowed_hosts("127.0.0.1", port, ""),
         });
+        let bot = format!("Bearer {}", auth.bot_token);
         let app = runner::test_app();
         let r = router(app.clone(), auth);
         tokio::spawn(async move {
             axum::serve(listener, r).await.unwrap();
         });
-        (port, app, basic(&password))
+        (port, app, basic(&password), bot)
     }
 
     async fn call(port: u16, method: &str, path: &str, authorization: &str, body: &str) -> (u16, String) {
@@ -930,11 +939,9 @@ mod tests {
         (code, res.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default())
     }
 
-    const BOT: &str = "Bearer bot-token";
-
     #[tokio::test]
     async fn healthz_is_open_and_new_endpoints_need_login() {
-        let (port, _, _) = serve_app().await;
+        let (port, _, _, _) = serve_app().await;
         assert_eq!(call(port, "GET", "/healthz", "", "").await.0, 200);
         for (m, p) in [
             ("GET", "/api/policy"),
@@ -951,7 +958,7 @@ mod tests {
 
     #[tokio::test]
     async fn bots_cannot_approve_or_change_policy() {
-        let (port, app, user) = serve_app().await;
+        let (port, app, user, bot_auth) = serve_app().await;
         let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
         for (m, p, b) in [
             ("PUT", "/api/policy".to_string(), r#"{"mode":"bypass"}"#),
@@ -963,10 +970,10 @@ mod tests {
             ("POST", "/api/approvals/x/deny".to_string(), "{}"),
             ("GET", "/api/audit".to_string(), ""),
         ] {
-            assert_eq!(call(port, m, &p, BOT, b).await.0, 403, "{m} {p}");
+            assert_eq!(call(port, m, &p, &bot_auth, b).await.0, 403, "{m} {p}");
         }
         assert_eq!(app.db.global_policy().mode, policy::Mode::Ask);
-        assert_eq!(call(port, "GET", "/api/policy", BOT, "").await.0, 200);
+        assert_eq!(call(port, "GET", "/api/policy", &bot_auth, "").await.0, 200);
 
         let (code, body) = call(port, "PUT", "/api/policy", &user, r#"{"timeoutMinutes":3}"#).await;
         assert_eq!((code, serde_json::from_str::<Value>(&body).unwrap()["policy"]["timeoutMinutes"].as_u64()), (200, Some(3)));
@@ -977,18 +984,19 @@ mod tests {
 
     #[tokio::test]
     async fn hook_waits_for_a_person_then_runs() {
-        let (port, app, user) = serve_app().await;
+        let (port, app, user, bot_auth) = serve_app().await;
         let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
         let check = |cmd: &str| {
             json!({ "from": bot.id, "harness": "claude", "event": { "tool_name": "Bash", "tool_input": { "command": cmd }, "cwd": "/tmp" } }).to_string()
         };
 
-        let (code, body) = call(port, "POST", "/api/approvals/check", BOT, &check("ls -la")).await;
+        let (code, body) = call(port, "POST", "/api/approvals/check", &bot_auth, &check("ls -la")).await;
         assert_eq!((code, body.lines().next()), (200, Some("allow")));
 
         let hook = tokio::spawn({
             let body = check("git push origin main");
-            async move { call(port, "POST", "/api/approvals/check", BOT, &body).await }
+            let bot_auth = bot_auth.clone();
+            async move { call(port, "POST", "/api/approvals/check", &bot_auth, &body).await }
         });
         let pending = loop {
             let (_, list) = call(port, "GET", "/api/approvals?status=pending", &user, "").await;
@@ -1000,16 +1008,16 @@ mod tests {
         };
         assert_eq!(pending["class"], "git_push");
         let id = pending["id"].as_str().unwrap();
-        assert_eq!(call(port, "POST", &format!("/api/approvals/{id}/approve"), BOT, "{}").await.0, 403);
+        assert_eq!(call(port, "POST", &format!("/api/approvals/{id}/approve"), &bot_auth, "{}").await.0, 403);
         let (code, done) = call(port, "POST", &format!("/api/approvals/{id}/approve"), &user, r#"{"remember":"bot"}"#).await;
         assert_eq!((code, serde_json::from_str::<Value>(&done).unwrap()["status"].as_str()), (200, Some("approved")));
         assert_eq!(hook.await.unwrap().1.lines().next(), Some("allow"));
         assert_eq!(call(port, "POST", &format!("/api/approvals/{id}/deny"), &user, "").await.0, 409);
 
-        let (_, again) = call(port, "POST", "/api/approvals/check", BOT, &check("git push origin main")).await;
+        let (_, again) = call(port, "POST", "/api/approvals/check", &bot_auth, &check("git push origin main")).await;
         assert_eq!(again.lines().next(), Some("allow"), "remembered");
 
-        let (_, unknown) = call(port, "POST", "/api/approvals/check", BOT, r#"{"from":"nobody","event":{"tool_name":"Bash"}}"#).await;
+        let (_, unknown) = call(port, "POST", "/api/approvals/check", &bot_auth, r#"{"from":"nobody","event":{"tool_name":"Bash"}}"#).await;
         assert_eq!(unknown.lines().next(), Some("deny"));
     }
 

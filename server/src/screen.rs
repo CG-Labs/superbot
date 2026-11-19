@@ -15,7 +15,8 @@ pub struct Screens {
     idle: Duration,
     /// Display numbers are base+slot; voxl ports are 6800+base+slot (6901, 6902, ...).
     base: u16,
-    size: String,
+    /// Width and height from SCREEN_SIZE.
+    size: (u32, u32),
     run_dir: PathBuf,
     live: Mutex<HashMap<String, Screen>>,
 }
@@ -43,6 +44,23 @@ fn spawn(cmd: &mut Command) -> std::io::Result<Child> {
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn()
 }
 
+/// `WIDTHxHEIGHT` within sane bounds, else the default 1280x800. Only these
+/// numbers reach Xvfb's command line.
+fn parse_size(s: &str) -> (u32, u32) {
+    s.trim()
+        .split_once('x')
+        .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
+        .filter(|(w, h)| (320..=7680).contains(w) && (240..=4320).contains(h))
+        .unwrap_or((1280, 800))
+}
+
+/// Leftovers of display `n` that would stop Xvfb from starting.
+fn x11_paths(n: u16) -> Option<(PathBuf, PathBuf)> {
+    let sock = crate::paths::child(Path::new("/tmp/.X11-unix"), &format!("X{n}"))?;
+    let lock = crate::paths::child(Path::new("/tmp"), &format!(".X{n}-lock"))?;
+    Some((sock, lock))
+}
+
 /// The agent-browser session that belongs to a Bot.
 pub fn browser_session(bot_id: &str) -> String {
     format!("bot-{bot_id}")
@@ -59,17 +77,21 @@ impl Screens {
             max: num("MAX_SCREENS", 3).clamp(1, 50) as u16,
             idle: Duration::from_secs(60 * num("SCREEN_IDLE_MINUTES", 10)),
             base: num("SCREEN_BASE", 100).clamp(1, 1000) as u16,
-            size: crate::env("SCREEN_SIZE", "1280x800"),
+            size: parse_size(&crate::env("SCREEN_SIZE", "1280x800")),
             run_dir,
             live: Mutex::default(),
         })
+    }
+
+    fn bus_path(&self, n: u16) -> PathBuf {
+        crate::paths::child(&self.run_dir, &format!("bus-{n}")).expect("bus-<n> is a plain name")
     }
 
     fn info(&self, s: &Screen) -> Info {
         let n = self.base + s.slot;
         Info {
             display: format!(":{n}"),
-            bus: format!("unix:path={}", self.run_dir.join(format!("bus-{n}")).display()),
+            bus: format!("unix:path={}", self.bus_path(n).display()),
             port: 6800 + n,
             token: s.token.clone(),
         }
@@ -112,11 +134,11 @@ impl Screens {
         let Info { display, bus, port, .. } = self.info(&s);
         let n = self.base + slot;
 
-        // Leftovers from a crash would stop Xvfb from starting.
-        let sock = PathBuf::from(format!("/tmp/.X11-unix/X{n}"));
-        let _ = std::fs::remove_file(format!("/tmp/.X{n}-lock"));
+        let (sock, lock) = x11_paths(n).ok_or_else(|| std::io::Error::other("bad display number"))?;
+        let _ = std::fs::remove_file(&lock);
         let _ = std::fs::remove_file(&sock);
-        s.procs.push(spawn(Command::new("Xvfb").args([&display, "-screen", "0", &format!("{}x24", self.size), "-nolisten", "tcp"]))?);
+        let (w, h) = self.size;
+        s.procs.push(spawn(Command::new("Xvfb").args([&display, "-screen", "0", &format!("{w}x{h}x24"), "-nolisten", "tcp"]))?);
         for _ in 0..50 {
             if sock.exists() {
                 break;
@@ -127,8 +149,7 @@ impl Screens {
             return Err(std::io::Error::other("Xvfb didn't open its display"));
         }
 
-        let bus_path = self.run_dir.join(format!("bus-{n}"));
-        let _ = std::fs::remove_file(&bus_path);
+        let _ = std::fs::remove_file(self.bus_path(n));
         s.procs.push(spawn(Command::new("dbus-daemon").args(["--session", "--nofork", &format!("--address={bus}")]))?);
         s.procs.push(spawn(Command::new("openbox").env("DISPLAY", &display).env("DBUS_SESSION_BUS_ADDRESS", &bus))?);
         if on_path("voxl") {
@@ -188,4 +209,25 @@ pub fn bot_env(info: &Info, bot_id: &str, bot_dir: &Path) -> HashMap<String, Str
         ("QT_ACCESSIBILITY".into(), "1".into()),
         ("ACCESSIBILITY_ENABLED".into(), "1".into()),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screen_size_is_two_numbers_or_the_default() {
+        assert_eq!(parse_size("1920x1080"), (1920, 1080));
+        assert_eq!(parse_size(" 800x600 "), (800, 600));
+        for bad in ["", "1280", "x800", "1280x800 -ac", "1280x800x24", "-nolisten", "99999x99999", "1x1", "1280x800;rm -rf /"] {
+            assert_eq!(parse_size(bad), (1280, 800), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn display_leftovers_stay_in_their_folders() {
+        let (sock, lock) = x11_paths(101).unwrap();
+        assert_eq!(sock, PathBuf::from("/tmp/.X11-unix/X101"));
+        assert_eq!(lock, PathBuf::from("/tmp/.X101-lock"));
+    }
 }

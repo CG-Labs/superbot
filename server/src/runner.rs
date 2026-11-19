@@ -3,6 +3,7 @@
 
 use crate::adapters::{self, AbortReason, AgentEvent, Guard, RunInput};
 use crate::db::{Bot, BotPatch, Db, Message};
+use crate::paths;
 use crate::policy::Mode;
 use crate::screen::{self, Screens};
 use serde_json::{json, Value};
@@ -132,24 +133,29 @@ impl App {
         self.send(json!({ "type": "message", "message": m, "bot": bot }));
     }
 
-    pub fn bot_dir(&self, id: &str) -> PathBuf {
-        self.cfg.data_dir.join("bots").join(id)
+    /// `DATA_DIR/bots/<id>`. None when the id isn't one plain folder name.
+    pub fn bot_dir(&self, id: &str) -> Option<PathBuf> {
+        paths::child(&paths::child(&self.cfg.data_dir, "bots")?, id)
     }
-    fn memory_file(&self, id: &str) -> PathBuf {
-        self.bot_dir(id).join("MEMORY.md")
+    fn memory_file(&self, id: &str) -> Option<PathBuf> {
+        paths::child(&self.bot_dir(id)?, "MEMORY.md")
     }
-    fn user_file(&self) -> PathBuf {
-        self.cfg.data_dir.join("USER.md")
+    fn user_file(&self) -> Option<PathBuf> {
+        paths::child(&self.cfg.data_dir, "USER.md")
     }
 
     pub fn init_bot_files(&self, bot: &Bot) {
-        let _ = std::fs::create_dir_all(self.bot_dir(&bot.id));
-        let mem = self.memory_file(&bot.id);
-        if !mem.exists() {
+        if let Some(dir) = self.bot_dir(&bot.id) {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Some(mem) = self.memory_file(&bot.id)
+            && !mem.exists()
+        {
             let _ = std::fs::write(&mem, format!("# {}\n\n## Job\n\nNot set yet. Ask the user.\n\n## Rules\n\n## Work log\n", bot.name));
         }
-        let user = self.user_file();
-        if !user.exists() {
+        if let Some(user) = self.user_file()
+            && !user.exists()
+        {
             let _ = std::fs::write(&user, format!("# About the user\n\n- Name: {}\n", self.cfg.user_name));
         }
     }
@@ -199,6 +205,9 @@ impl App {
         if adapters::get(&bot.harness).is_none() {
             return self.say(&bot.id, &format!("Unknown harness \"{}\".", bot.harness), true);
         }
+        let Some(bot_dir) = self.bot_dir(&bot.id) else {
+            return self.say(&bot.id, "This Bot's id isn't a safe folder name, so it can't run.", true);
+        };
         self.init_bot_files(&bot);
         self.db.set_status(msg.id, "running");
         let from = || msg.from_bot.as_deref().and_then(|id| self.db.bot(id)).map(|b| format!("{} (id {})", b.name, b.id)).unwrap_or("another Bot".into());
@@ -248,7 +257,7 @@ impl App {
             if let Some(screens) = &self.screens
                 && let Some(info) = screens.ensure(&bot.id, |id| self.is_running(id)).await
             {
-                env.extend(screen::bot_env(&info, &bot.id, &self.bot_dir(&bot.id)));
+                env.extend(screen::bot_env(&info, &bot.id, &bot_dir));
             }
             let input = RunInput {
                 prompt: prompt.clone(),
@@ -258,7 +267,7 @@ impl App {
                 model: bot.model.clone(),
                 effort: bot.effort.clone(),
                 env,
-                state_dir: self.bot_dir(&bot.id),
+                state_dir: bot_dir.clone(),
                 guard: guard.clone(),
             };
 
@@ -490,7 +499,8 @@ impl App {
     }
 
     fn system_prompt(&self, bot: &Bot) -> String {
-        let read = |p: PathBuf| std::fs::read_to_string(p).unwrap_or_default().trim().to_string();
+        let read = |p: &Option<PathBuf>| p.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default().trim().to_string();
+        let (mem_file, user_file) = (self.memory_file(&bot.id), self.user_file());
         let others: Vec<String> =
             self.db.bots().iter().filter(|b| b.id != bot.id).map(|b| format!("- {} (id {})", b.name, b.id)).collect();
         let primary = if bot.primary {
@@ -548,10 +558,10 @@ Current time: {now}."#,
                 ""
             },
             ws = self.cfg.workspace.display(),
-            mem_path = self.memory_file(&bot.id).display(),
-            user_path = self.user_file().display(),
-            mem = read(self.memory_file(&bot.id)),
-            user_facts = read(self.user_file()),
+            mem_path = mem_file.clone().unwrap_or_default().display(),
+            user_path = user_file.clone().unwrap_or_default().display(),
+            mem = read(&mem_file),
+            user_facts = read(&user_file),
             others = if others.is_empty() { "None yet.".into() } else { others.join("\n") },
             now = chrono::Local::now().format("%A, %B %-d, %Y, %H:%M (UTC%:z)"),
         )
@@ -576,7 +586,7 @@ pub fn test_app() -> Arc<App> {
             user_name: "Tester".into(),
             bin_dir: dir,
             api_url: "http://127.0.0.1:1".into(),
-            bot_token: "bot-token".into(),
+            bot_token: crate::random_hex(16),
             run_timeout: Duration::from_secs(60),
             default_harness: "claude".into(),
         },
@@ -631,6 +641,21 @@ fn screen_prompt(botctl: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bot_files_stay_in_the_data_folder() {
+        let app = test_app();
+        let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
+        app.init_bot_files(&bot);
+        let dir = app.bot_dir(&bot.id).unwrap();
+        assert_eq!(dir, app.cfg.data_dir.join("bots").join(&bot.id));
+        assert!(app.memory_file(&bot.id).unwrap().is_file());
+        assert!(app.user_file().unwrap().is_file());
+        for bad in ["", "..", "../../etc", "a/b", "/etc"] {
+            assert_eq!(app.bot_dir(bad), None, "{bad:?}");
+            assert_eq!(app.memory_file(bad), None, "{bad:?}");
+        }
+    }
 
     fn fake_run(app: &App, bot_id: &str, guarded: bool) -> watch::Receiver<AbortReason> {
         let (tx, rx) = watch::channel(None);

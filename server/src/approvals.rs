@@ -330,7 +330,7 @@ mod tests {
         let a = app.db.add_approval(&bot.id, "claude", "Bash", "shell", "git push", &json!({}), "git_push", "Pushes", now() + 60_000);
         // A timeout closes it between the user's read and their decision.
         assert!(app.db.finish_approval(&a.id, "expired", "system", None, None));
-        assert!(matches!(app.db.finish_approval_with_rule(&a.id, "approved", "user", None, &NewRule { bot_id: Some(&bot.id), action: Action::Allow, tool: "Bash", pattern: "git push", note: "x" }), None));
+        assert!(app.db.finish_approval_with_rule(&a.id, "approved", "user", None, &NewRule { bot_id: Some(&bot.id), action: Action::Allow, tool: "Bash", pattern: "git push", note: "x" }).is_none());
         assert!(matches!(app.decide(&a.id, true, Some(Remember::Bot), None), Err(DecideError::Closed(s)) if s == "expired"));
         assert!(app.db.rules(Some(&bot.id)).is_empty());
 
