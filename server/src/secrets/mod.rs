@@ -185,8 +185,14 @@ impl Secrets {
                 }
                 seen.push(name.clone());
                 match self.find(&name) {
-                    Ok(Some((v, from))) if !from.inherited(&name) => out.push((name, v)),
-                    Ok(_) => {}
+                    Ok(Some((v, from))) => {
+                        // Files can change after startup, so learn the value as it is now.
+                        self.learn(from, &v);
+                        if !from.inherited(&name) {
+                            out.push((name, v));
+                        }
+                    }
+                    Ok(None) => {}
                     Err(e) => eprintln!("secret {name}: {e}"),
                 }
             }
@@ -194,14 +200,23 @@ impl Secrets {
         out
     }
 
+    /// Teaches the redactor a value. Environment names are a guess from the name, so
+    /// only random-looking values from the first store count.
+    fn learn(&self, from: &dyn SecretStore, v: &Secret) {
+        if self.stores.first().is_some_and(|first| std::ptr::addr_eq(first.as_ref(), from)) {
+            redact::register_if_random(v.expose());
+        } else {
+            redact::register(v.expose());
+        }
+    }
+
     /// Teaches the redactor every value this can read.
     fn register_all(&self) -> usize {
         let mut n = 0;
-        for (i, s) in self.stores.iter().enumerate() {
+        for s in &self.stores {
             for name in s.names().unwrap_or_default() {
                 if let Ok(Some(v)) = s.get(&name) {
-                    // Environment names are a guess from the name, so only random-looking values count.
-                    if i > 0 { redact::register(v.expose()) } else { redact::register_if_random(v.expose()) }
+                    self.learn(s.as_ref(), &v);
                     n += 1;
                 }
             }
@@ -336,6 +351,11 @@ mod tests {
             "files arrive under their base name; inherited and shadowed values aren't repeated"
         );
         assert_eq!(redact::text(&stored), redact::MARK, "a saved value is redacted from then on");
+        let rotated = format!("npm_{}", crate::random_hex(12));
+        std::fs::write(&npm, &rotated).unwrap();
+        assert!(s.harness_env().iter().any(|(k, v)| k == "NPM_TOKEN" && v.expose() == rotated));
+        assert_eq!(redact::text(&rotated), redact::MARK, "a file changed after startup is redacted before a Bot gets it");
+        redact::forget(&rotated);
 
         assert!(s.delete("OPENAI_API_KEY").unwrap());
         assert!(!s.delete("OPENAI_API_KEY").unwrap());
