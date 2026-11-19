@@ -92,6 +92,9 @@ const drafts = {}; // botId -> streaming text
 let activeId = localStorage.getItem("activeBot");
 let filter = "";
 let showHidden = false;
+let approvals = []; // pending, oldest first
+let globalPolicy = { mode: "ask" };
+const remembered = new Set(); // approval ids with "Always allow" ticked; survives re-renders
 
 const bot = (id) => bots.find((b) => b.id === id);
 const primary = () => bots.find((b) => b.primary);
@@ -125,6 +128,53 @@ function renderSidebar() {
   $("hidden-count").textContent = showHidden ? "" : hidden;
   $("me-name").textContent = me.name;
   $("me-avatar").textContent = (me.name || "?")[0].toUpperCase();
+  $("approvals-count").textContent = approvals.length || "";
+  $("approvals-btn").classList.toggle("waiting", approvals.length > 0);
+}
+
+// Approvals: risky tool calls wait here for a person (see docs/adr/0005-approvals.md).
+function upsertApproval(a) {
+  approvals = approvals.filter((x) => x.id !== a.id);
+  if (a.status === "pending") approvals.push(a);
+  approvals.sort((x, y) => x.createdAt - y.createdAt);
+}
+
+function minutesLeft(a) {
+  const m = Math.max(0, Math.ceil((a.expiresAt - Date.now()) / 60000));
+  return m <= 1 ? "under a minute" : `${m} minutes`;
+}
+
+function approvalCard(a, withBot) {
+  const b = bot(a.botId);
+  return `<div class="approval" data-approval="${esc(a.id)}">
+    <div class="ap-head">${withBot && b ? `${avatar(b.color, b.shape, 22)}<b>${esc(b.name)}</b>` : ""}
+      <span class="ap-what">wants to run <code>${esc(a.tool)}</code></span></div>
+    <div class="ap-reason">${esc(a.reason)}</div>
+    <pre class="ap-subject">${esc(a.subject)}</pre>
+    <div class="ap-foot">
+      <label class="ap-remember"><input type="checkbox" ${remembered.has(a.id) ? "checked" : ""} /> Remember for ${esc(b?.name || "this Bot")}</label>
+      <span class="ap-left">Denied in ${minutesLeft(a)}</span>
+      <button class="nb-btn" data-decide="deny">Deny</button>
+      <button class="nb-btn primary" data-decide="approve">Approve</button>
+    </div>
+  </div>`;
+}
+
+async function decideApproval(card, verb) {
+  const remember = card.querySelector(".ap-remember input")?.checked ? "bot" : null;
+  card.querySelectorAll("button").forEach((x) => (x.disabled = true));
+  try {
+    upsertApproval(await api("POST", `/api/approvals/${card.dataset.approval}/${verb}`, { remember }));
+  } catch (err) {
+    alert(err.message);
+  }
+  render(true);
+}
+
+function renderApprovals() {
+  if ($("ap").hidden) return;
+  $("ap-list").innerHTML = approvals.map((a) => approvalCard(a, true)).join("") || '<div class="empty">Nothing is waiting for you.</div>';
+  $("ap-mode").value = globalPolicy.mode;
 }
 
 // Chat
@@ -176,6 +226,7 @@ function renderChat(keepScroll) {
   $("input").placeholder = `Message ${b.name}`;
   const list = messages[b.id] || [];
   let html = list.map((m, i) => renderMessage(m, list[i - 1])).join("");
+  html += approvals.filter((a) => a.botId === b.id).map((a) => `<div class="msg-row bot">${approvalCard(a, false)}</div>`).join("");
   if (b.working) {
     const draft = drafts[b.id];
     if (draft) html += `<div class="msg-row bot"><div class="bubble">${md(draft)}</div></div>`;
@@ -230,6 +281,7 @@ async function sendText(text, answer) {
 function render(keepScroll) {
   renderSidebar();
   renderChat(keepScroll);
+  renderApprovals();
   renderModelBar();
   if (details.open && document.activeElement?.id !== "d-name") renderDetails();
 }
@@ -347,6 +399,10 @@ function connect() {
       const b = bot(e.botId);
       if (b) { b.working = e.working; b.status = e.status; }
       if (!e.working) delete drafts[e.botId];
+    } else if (e.type === "approval") {
+      upsertApproval(e.approval);
+    } else if (e.type === "policy") {
+      globalPolicy = e.policy;
     }
     render(true);
   };
@@ -361,6 +417,9 @@ async function load(refresh) {
   harnesses = state.harnesses;
   defaultHarness = state.defaultHarness;
   bots = state.bots;
+  approvals = [];
+  (state.approvals || []).forEach(upsertApproval);
+  if (state.policy) globalPolicy = state.policy;
   if (refresh) for (const id of Object.keys(messages)) messages[id] = await api("GET", `/api/bots/${id}/messages`);
   await open(activeId);
 }
@@ -381,6 +440,8 @@ $("messages").addEventListener("click", (e) => {
     return;
   }
   if (e.target.closest(".open-screen")) return void openScreen();
+  const decide = e.target.closest("[data-decide]");
+  if (decide) return void decideApproval(decide.closest(".approval"), decide.dataset.decide);
   const opt = e.target.closest(".option");
   if (!opt) return;
   const card = opt.closest(".question");
@@ -507,6 +568,12 @@ function renderDetails() {
       <label class="d-item"><span class="d-text">Runs on</span>
         <select id="d-harness">${list.map((h) => `<option value="${h}" ${h === b.harness ? "selected" : ""}>${HARNESS_NAMES[h] || h}</option>`).join("")}</select></label>
       <div class="d-item"><span class="d-text">Hide from sidebar</span>${toggle(b.hidden, 'id="d-hide"')}</div>
+      <label class="d-item"><span class="d-text">Risky actions</span>
+        <select id="d-policy">
+          <option value="" ${b.policyOverride ? "" : "selected"}>Like all Bots (${globalPolicy.mode === "ask" ? "ask" : "bypass"})</option>
+          <option value="ask" ${b.policyOverride && b.policy === "ask" ? "selected" : ""}>Ask me first</option>
+          <option value="bypass" ${b.policyOverride && b.policy === "bypass" ? "selected" : ""}>Bypass (dev only)</option>
+        </select></label>
     </div>
     ${b.primary ? "" : `<div class="d-card"><button class="d-item d-link d-danger" id="d-delete">${ICONS.trash}<span>Delete Bot</span></button></div>`}`;
   el.innerHTML = `
@@ -545,7 +612,39 @@ $("details").addEventListener("click", async (e) => {
     }
   }
 });
-$("details").addEventListener("change", (e) => { if (e.target.id === "d-harness") patchBot({ harness: e.target.value }); });
+$("details").addEventListener("change", async (e) => {
+  if (e.target.id === "d-harness") return patchBot({ harness: e.target.value });
+  if (e.target.id !== "d-policy") return;
+  const mode = e.target.value;
+  try {
+    await (mode ? api("PUT", `/api/bots/${activeId}/policy`, { mode }) : api("DELETE", `/api/bots/${activeId}/policy`));
+  } catch (err) { alert(err.message); }
+});
+
+const closeApprovals = () => { $("ap").hidden = true; };
+$("approvals-btn").addEventListener("click", () => { $("ap").hidden = false; renderApprovals(); });
+$("ap-close").addEventListener("click", closeApprovals);
+$("ap").addEventListener("mousedown", (e) => { if (e.target === $("ap")) closeApprovals(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("ap").hidden) closeApprovals(); });
+$("ap-list").addEventListener("click", (e) => {
+  const t = e.target.closest("[data-decide]");
+  if (t) decideApproval(t.closest(".approval"), t.dataset.decide);
+});
+$("ap-mode").addEventListener("change", async (e) => {
+  const mode = e.target.value;
+  if (mode === "bypass" && !confirm("Let every Bot run risky actions without asking? Use this only on a dev machine.")) {
+    e.target.value = globalPolicy.mode;
+    return;
+  }
+  try { globalPolicy = (await api("PUT", "/api/policy", { mode })).policy; } catch (err) { alert(err.message); }
+  render(true);
+});
+document.addEventListener("change", (e) => {
+  const card = e.target.closest(".ap-remember") && e.target.closest(".approval");
+  if (card) e.target.checked ? remembered.add(card.dataset.approval) : remembered.delete(card.dataset.approval);
+});
+// Keep the "Denied in N minutes" countdowns fresh.
+setInterval(() => { if (approvals.length) render(true); }, 30000);
 $("details").addEventListener("keydown", (e) => { if (e.target.id === "d-name" && e.key === "Enter") e.target.blur(); });
 $("details").addEventListener("focusout", (e) => {
   if (e.target.id !== "d-name") return;

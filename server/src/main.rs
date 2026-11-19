@@ -663,6 +663,7 @@ async fn put_policy(State(app): State<AppState>, Extension(who): Extension<Princ
     let after = policy::parse_patch(&v).map_err(bad)?.apply(&before);
     app.db.set_global_policy(&after);
     app.db.audit("user", "policy.updated", None, Some("global"), json!({ "before": before, "after": after }));
+    app.send(json!({ "type": "policy", "policy": after }));
     for b in app.db.bots() {
         app.push_bot(&b.id);
     }
