@@ -23,6 +23,7 @@ export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, comp
     me,
     handoffs,
     approvals,
+    canWrite,
   } = useSuperBot();
 
   const primary = bots.find((b) => b.primary);
@@ -34,9 +35,11 @@ export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, comp
   return (
     <View style={[styles.sidebar, compact && styles.sidebarCompact]}>
       <View style={styles.topRow}>
-        <Pressable style={styles.iconBtn} onPress={onNewBot}>
-          <Text style={styles.iconText}>+</Text>
-        </Pressable>
+        {canWrite ? (
+          <Pressable style={styles.iconBtn} onPress={onNewBot}>
+            <Text style={styles.iconText}>+</Text>
+          </Pressable>
+        ) : null}
         <Pressable style={styles.iconBtn} onPress={onLogout}>
           <Text style={styles.iconText}>⎋</Text>
         </Pressable>

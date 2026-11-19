@@ -2,8 +2,9 @@
 //! because every harness can run a shell command. Talks to botd over local HTTP.
 //! A tiny HTTP/1.0 client over a TCP socket; no HTTP library.
 //!
-//! It is also the approval gate (`botctl hook <harness>`), and lets the operator manage
-//! approvals and policy from a shell on the server (`SUPERBOT_PASSWORD`).
+//! It is also the approval gate (`botctl hook <harness>`), and lets an admin manage
+//! approvals, policy, users, and sessions from a shell on the server (`SUPERBOT_TOKEN`
+//! from `botctl login`, or the break-glass `SUPERBOT_PASSWORD`).
 
 use serde_json::{json, Map, Value};
 use std::io::{Read, Write};
@@ -29,8 +30,21 @@ Confirm the schedule with the user in plain words.
 `ask` and `handoff` can take minutes: run them with a long command timeout (10 minutes).
 If the other Bot takes longer, its reply arrives later as a new message."#;
 
-const ADMIN_HELP: &str = r#"Operator commands (run on the server; need SUPERBOT_PASSWORD set to AUTH_PASSWORD,
-and BOT_API if botd isn't on http://127.0.0.1:3000; the password is only sent to this machine):
+const ADMIN_HELP: &str = r#"Operator commands (run on the server; need SUPERBOT_TOKEN, or SUPERBOT_PASSWORD set to
+AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only sent to this machine):
+
+  botctl login [<code> | -]                        Sign in with a sign-in code (- reads it from stdin), or
+                                                   with SUPERBOT_PASSWORD; prints a SUPERBOT_TOKEN
+  botctl logout                                    End the SUPERBOT_TOKEN session
+  botctl whoami                                    Who the token or password signs in as, and its role
+  botctl users                                     List users
+  botctl user add <email> ["<name>"] [--role admin|member|readonly]
+  botctl user role <user> <admin|member|readonly>  <user> is an id or email
+  botctl user disable <user> | enable <user>       Disabling ends the user's sessions
+  botctl user code <user> [--ttl <minutes>]        A one-time sign-in code (default 60 minutes)
+  botctl sessions [<user>]                         Live sessions
+  botctl session revoke <id>
+  botctl session revoke-all <user>
 
   botctl policy [<bot>]                            Show the global or a Bot's policy
   botctl policy set <global|bot> [mode=ask|bypass] [timeout=<minutes>] [<class>=allow|ask|deny]...
@@ -56,6 +70,8 @@ Patterns are globs (* and ?) over the command, path, URL, or tool arguments."#;
 enum Cred {
     Bot,
     Operator,
+    /// Signing in: sends no Authorization, but the body holds a secret, so loopback only.
+    Anonymous,
 }
 
 fn base() -> String {
@@ -68,30 +84,29 @@ fn api(cred: Cred, method: &str, path: &str, body: Option<String>) -> Result<Str
             (Ok(_), Ok(token)) => format!("Bearer {token}"),
             _ => return Err("botctl only works inside a Bot run (BOT_API and BOT_TOKEN are missing).".into()),
         },
-        Cred::Operator => match std::env::var("SUPERBOT_PASSWORD") {
-            Ok(p) if !p.is_empty() => format!("Basic {}", base64(format!("superbot:{p}").as_bytes())),
-            _ => return Err("Set SUPERBOT_PASSWORD to the server's AUTH_PASSWORD to manage approvals and policy.".into()),
-        },
+        Cred::Operator => operator_auth()?,
+        Cred::Anonymous => String::new(),
     };
     let base = base();
     let addr = addr(&base)?;
-    let operator = matches!(cred, Cred::Operator);
+    let operator = !matches!(cred, Cred::Bot);
     if operator && !loopback(addr) {
-        return Err(format!("botctl sends SUPERBOT_PASSWORD only to a server on this machine, not {addr}. Run it on the server, or set BOT_API to an SSH tunnel on 127.0.0.1."));
+        return Err(format!("botctl sends SUPERBOT_TOKEN, SUPERBOT_PASSWORD, and sign-in codes only to a server on this machine, not {addr}. Run it on the server, or set BOT_API to an SSH tunnel on 127.0.0.1."));
     }
     let mut s = TcpStream::connect(addr).map_err(|e| format!("Can't reach the server: {e}"))?;
     if operator && !s.peer_addr().is_ok_and(|a| a.ip().is_loopback()) {
-        return Err(format!("{addr} isn't on this machine, so botctl won't send SUPERBOT_PASSWORD there."));
+        return Err(format!("{addr} isn't on this machine, so botctl won't send credentials there."));
     }
+    let auth = if auth.is_empty() { String::new() } else { format!("Authorization: {auth}\r\n") };
     let body = body.unwrap_or_default();
     // Names the calling Bot for the audit log. All Bots share BOT_TOKEN, so botd treats it as self-reported.
     let bot = match cred {
         Cred::Bot => std::env::var("BOT_ID").ok().filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric())),
-        Cred::Operator => None,
+        Cred::Operator | Cred::Anonymous => None,
     };
     let bot = bot.map(|id| format!("X-SuperBot-Bot: {id}\r\n")).unwrap_or_default();
     let req = format!(
-        "{method} {path} HTTP/1.0\r\nHost: {addr}\r\nAuthorization: {auth}\r\nUser-Agent: botctl/{}\r\n{bot}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        "{method} {path} HTTP/1.0\r\nHost: {addr}\r\n{auth}User-Agent: botctl/{}\r\n{bot}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         env!("CARGO_PKG_VERSION"),
         body.len()
     );
@@ -105,6 +120,48 @@ fn api(cred: Cred, method: &str, path: &str, body: Option<String>) -> Result<Str
     } else {
         let msg = serde_json::from_str::<Value>(body).ok().and_then(|v| v["error"].as_str().map(String::from)).unwrap_or(body.into());
         Err(format!("{msg} (HTTP {code})"))
+    }
+}
+
+/// A session token from `botctl login` wins over the break-glass password.
+fn operator_auth() -> Result<String, String> {
+    let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    match (var("SUPERBOT_TOKEN"), var("SUPERBOT_PASSWORD")) {
+        (Some(t), _) => Ok(format!("Bearer {t}")),
+        (None, Some(p)) => Ok(format!("Basic {}", base64(format!("superbot:{p}").as_bytes()))),
+        _ => Err("Set SUPERBOT_TOKEN (from botctl login <code>), or SUPERBOT_PASSWORD to the server's AUTH_PASSWORD.".into()),
+    }
+}
+
+/// `botctl login`: the body for POST /api/auth/login.
+fn login_body(arg: Option<&str>) -> Result<Value, String> {
+    let code = match arg {
+        Some("-") => {
+            let mut c = String::new();
+            std::io::stdin().read_to_string(&mut c).map_err(|e| e.to_string())?;
+            Some(c.trim().to_string())
+        }
+        Some(c) => Some(c.trim().to_string()),
+        None => None,
+    };
+    let body = match code {
+        Some(c) if c.is_empty() => return Err("The sign-in code is empty.".into()),
+        Some(c) => json!({ "code": c }),
+        None => match std::env::var("SUPERBOT_PASSWORD") {
+            Ok(p) if !p.is_empty() => json!({ "password": p }),
+            _ => return Err("Give a sign-in code (botctl login <code>), or set SUPERBOT_PASSWORD.".into()),
+        },
+    };
+    let mut body = body;
+    body["session"] = json!("token");
+    body["label"] = json!("botctl");
+    Ok(body)
+}
+
+fn role(r: &str) -> Result<&str, String> {
+    match r {
+        "admin" | "member" | "readonly" | "read-only" => Ok(r),
+        _ => Err(format!("Role must be admin, member, or readonly, not \"{r}\".")),
     }
 }
 
@@ -291,6 +348,36 @@ fn run(args: &[String]) -> Result<String, String> {
         [verb @ ("approve" | "deny"), id, rest @ ..] => decide(verb, id, rest),
         ["audit", "export", rest @ ..] => api(Cred::Operator, "GET", &format!("/api/audit/export.csv{}", audit_query(rest)?), None),
         ["audit", rest @ ..] => op("GET", &format!("/api/audit{}", audit_query(rest)?), None),
+
+        ["login", rest @ ..] if rest.len() <= 1 => {
+            let res: Value = serde_json::from_str(&api(Cred::Anonymous, "POST", "/api/auth/login", Some(login_body(rest.first().copied())?.to_string()))?).map_err(|e| e.to_string())?;
+            let (token, who) = (res["token"].as_str().unwrap_or_default(), res["user"]["name"].as_str().unwrap_or_default());
+            Ok(format!("Signed in as {who} ({}). Run:\n\n  export SUPERBOT_TOKEN={token}", res["user"]["role"].as_str().unwrap_or_default()))
+        }
+        ["logout"] => op("POST", "/api/auth/logout", None).map(|_| "Signed out. Unset SUPERBOT_TOKEN.".into()),
+        ["whoami"] => op("GET", "/api/auth/me", None),
+        ["users"] | ["user", "list"] => op("GET", "/api/users", None),
+        ["user", "add", email, rest @ ..] => {
+            let name = rest.first().filter(|n| !n.starts_with("--"));
+            let body = json!({ "email": email, "name": name, "role": flag(rest, "--role").map(role).transpose()? });
+            op("POST", "/api/users", Some(body.to_string()))
+        }
+        ["user", "role", key, r] => op("PATCH", &format!("/api/users/{}", encode(key)), Some(json!({ "role": role(r)? }).to_string())),
+        ["user", cmd @ ("disable" | "enable"), key] => {
+            let status = if *cmd == "disable" { "disabled" } else { "active" };
+            op("PATCH", &format!("/api/users/{}", encode(key)), Some(json!({ "status": status }).to_string()))
+        }
+        ["user", "code", key, rest @ ..] => {
+            let ttl = flag(rest, "--ttl").map(|t| t.parse::<u32>().map_err(|_| "--ttl must be minutes")).transpose()?;
+            let body = json!({ "ttlMinutes": ttl }).to_string();
+            let res: Value = serde_json::from_str(&api(Cred::Operator, "POST", &format!("/api/users/{}/login-codes", encode(key)), Some(body))?).map_err(|e| e.to_string())?;
+            let mins = (res["expiresAt"].as_i64().unwrap_or_default() - now_ms()) / 60_000;
+            Ok(format!("{}\n\nA one-time sign-in code for {}, good for about {} minutes. Share it privately.", res["code"].as_str().unwrap_or_default(), res["user"]["email"].as_str().unwrap_or(key), mins.max(1)))
+        }
+        ["sessions"] => op("GET", "/api/sessions", None),
+        ["sessions", key] => op("GET", &format!("/api/sessions?user={}", encode(key)), None),
+        ["session", "revoke", id] => op("DELETE", &format!("/api/sessions/{}", encode(id)), None).map(|_| "Revoked.".into()),
+        ["session", "revoke-all", key] => op("DELETE", &format!("/api/users/{}/sessions", encode(key)), None),
         ["secrets"] => op("GET", "/api/secrets", None),
         ["secret", "set", name] => {
             let name = env_name(name)?;
@@ -301,6 +388,10 @@ fn run(args: &[String]) -> Result<String, String> {
         ["help", "admin"] | ["admin"] => Ok(ADMIN_HELP.into()),
         _ => Ok(HELP.into()),
     }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
 fn main() {
@@ -358,6 +449,15 @@ mod tests {
         assert_eq!(audit_query(&["--to", "a b&c"]).unwrap(), "?to=a%20b%26c");
         assert!(audit_query(&["--from"]).is_err());
         assert!(audit_query(&["--nope", "x"]).is_err());
+    }
+
+    #[test]
+    fn login_and_user_commands() {
+        assert_eq!(login_body(Some(" sbc_abc ")).unwrap(), json!({ "code": "sbc_abc", "session": "token", "label": "botctl" }));
+        assert!(login_body(Some("  ")).is_err());
+        assert_eq!(role("read-only"), Ok("read-only"));
+        assert!(role("root").is_err());
+        assert_eq!(encode("a.b+c@example.com"), "a.b%2Bc%40example.com");
     }
 
     #[test]

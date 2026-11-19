@@ -3,7 +3,7 @@ import { act, render, screen } from "@testing-library/react-native";
 import { BotDetailsPanel } from "../BotDetailsPanel";
 import type { BotView, Routine } from "../../src/types";
 
-const mockCtx: Record<string, unknown> = {};
+const mockCtx: Record<string, unknown> = { canWrite: true, can: () => true };
 jest.mock("../../src/SuperBotContext", () => ({ useSuperBot: () => mockCtx }));
 jest.mock("../BotAvatar", () => ({ BotAvatar: () => null }));
 
@@ -56,5 +56,23 @@ describe("BotDetailsPanel", () => {
 
     expect(await screen.findByText("Mine")).toBeOnTheScreen();
     expect(screen.queryByText("Not mine")).not.toBeOnTheScreen();
+  });
+
+  it("offers read-only users nothing the server would refuse", async () => {
+    Object.assign(mockCtx, {
+      bots: [bot("b", "Bob")],
+      activeId: "b",
+      fetchRoutines: jest.fn(async () => [routine("rb", "b", "Mine")]),
+      canWrite: false,
+      can: (p: string) => ["account", "read", "review"].includes(p),
+    });
+    await render(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} />);
+
+    expect(await screen.findByText("Mine")).toBeOnTheScreen();
+    expect(screen.queryByText("+ New routine")).not.toBeOnTheScreen();
+    expect(screen.queryByText("Open screen")).not.toBeOnTheScreen();
+    expect(screen.queryByText("Delete bot")).not.toBeOnTheScreen();
+    expect(screen.getByLabelText("Pause Mine").props.disabled).toBe(true);
+    Object.assign(mockCtx, { canWrite: true, can: () => true });
   });
 });

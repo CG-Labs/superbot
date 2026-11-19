@@ -1,4 +1,5 @@
 import { act, renderHook, waitFor } from "@testing-library/react-native";
+import { clearCredentials, loadSavedCredentials, saveCredentials } from "../auth";
 import { connectSse } from "../sse";
 import { SuperBotProvider, useSuperBot } from "../SuperBotContext";
 import type { Message, Routine, SseEvent } from "../types";
@@ -43,6 +44,12 @@ let bobHandoff: number | null = null;
 /** When set, Bob's history request waits until the test calls it. */
 let releaseHistory: (() => void) | null = null;
 let holdHistory = false;
+/** The server's /api/auth/login: absent (an old server), or the token it hands out. */
+let loginToken: string | null = null;
+let permissions: string[] | undefined;
+/** When set, the server never answers a logout. */
+let stallLogout = false;
+const TOKEN = "sbs_" + "a".repeat(64);
 
 function respond(status: number, body: unknown) {
   return Promise.resolve({ ok: status < 400, status, json: async () => body });
@@ -55,14 +62,28 @@ beforeEach(() => {
   bobHandoff = null;
   holdHistory = false;
   releaseHistory = null;
+  loginToken = null;
+  permissions = undefined;
+  stallLogout = false;
   (connectSse as jest.Mock).mockClear();
+  (saveCredentials as jest.Mock).mockClear();
+  (clearCredentials as jest.Mock).mockClear();
+  (loadSavedCredentials as jest.Mock).mockImplementation(async () => ({ baseUrl: BASE, password: "hunter2" }));
   globalThis.fetch = jest.fn((url: string, init: RequestInit = {}) => {
     const method = init.method ?? "GET";
     const body = init.body ? JSON.parse(String(init.body)) : undefined;
     calls.push({ url, method, body, headers: (init.headers ?? {}) as Record<string, string> });
     const path = url.slice(BASE.length);
+    const auth = ((init.headers ?? {}) as Record<string, string>).Authorization ?? "";
+    if (path === "/api/auth/login" && method === "POST") {
+      if (!loginToken) return respond(405, {});
+      const ok = body.password === "hunter2" || body.code === "sbc_good";
+      return ok ? respond(200, { token: loginToken, user: { id: "u1" } }) : respond(401, { error: "Wrong password." });
+    }
+    if (path === "/api/auth/logout") return stallLogout ? new Promise(() => {}) : respond(200, { ok: true });
+    if (loginToken && auth !== `Bearer ${loginToken}`) return respond(401, { error: "Login required" });
     if (path === "/api/state") {
-      return respond(200, { me: { name: "Me" }, harnesses: ["claude"], defaultHarness: "claude", bots: [bot("b1", true), bot("b2", false, bobUnread, bobHandoff)] });
+      return respond(200, { me: { name: "Me", permissions }, harnesses: ["claude"], defaultHarness: "claude", bots: [bot("b1", true), bot("b2", false, bobUnread, bobHandoff)] });
     }
     if (path === "/api/bots/b2/messages" && method === "GET") {
       if (!holdHistory) return respond(200, history);
@@ -199,5 +220,90 @@ describe("SuperBotProvider", () => {
       ["PATCH", "/api/routines/r1", { cron: "0 8 * * 1-5", enabled: false }],
       ["DELETE", "/api/routines/r1", undefined],
     ]);
+  });
+
+  it("swaps a saved password for a session token and stops storing the password", async () => {
+    loginToken = TOKEN;
+    const { result } = await connected();
+    const login = calls.find((c) => c.url.endsWith("/api/auth/login"));
+    expect(login?.body).toEqual({ password: "hunter2", session: "token", label: "SuperBot app" });
+    expect(saveCredentials).toHaveBeenCalledWith({ baseUrl: BASE, token: TOKEN });
+    const state = calls.find((c) => c.url.endsWith("/api/state"));
+    expect(state?.headers.Authorization).toBe(`Bearer ${TOKEN}`);
+    expect((connectSse as jest.Mock).mock.calls[0][1]).toEqual({ Authorization: `Bearer ${TOKEN}` });
+
+    await act(() => result.current.logout());
+    expect(calls.some((c) => c.method === "POST" && c.url.endsWith("/api/auth/logout") && c.headers.Authorization === `Bearer ${TOKEN}`)).toBe(true);
+    expect(clearCredentials).toHaveBeenCalled();
+  });
+
+  it("signs in with a one-time code", async () => {
+    loginToken = TOKEN;
+    (loadSavedCredentials as jest.Mock).mockImplementation(async () => null);
+    const hook = await renderHook(() => useSuperBot(), { wrapper: SuperBotProvider });
+    await waitFor(() => expect(hook.result.current.ready).toBe(true));
+    let error: unknown;
+    await act(async () => {
+      await hook.result.current.login(BASE, "sbc_bad").catch((e) => (error = e));
+    });
+    expect((error as Error).message).toBe("Wrong password.");
+    await act(() => hook.result.current.login(BASE, " sbc_good "));
+    const login = calls.filter((c) => c.url.endsWith("/api/auth/login")).pop();
+    expect(login?.body).toEqual({ code: "sbc_good", session: "token", label: "SuperBot app" });
+    expect(login?.headers.Authorization).toBeUndefined();
+    expect(saveCredentials).toHaveBeenCalledWith({ baseUrl: BASE, token: TOKEN });
+    expect(hook.result.current.api).not.toBeNull();
+  });
+
+  it("keeps using the password on servers from before sign-in", async () => {
+    const { result } = await connected();
+    expect(saveCredentials).not.toHaveBeenCalled();
+    expect(calls.find((c) => c.url.endsWith("/api/state"))?.headers.Authorization).toMatch(/^Basic /);
+    let error: unknown;
+    await act(async () => {
+      await result.current.login(BASE, "sbc_code").catch((e) => (error = e));
+    });
+    expect((error as Error).message).toMatch("doesn't support sign-in codes");
+  });
+
+  it("forgets a session the server ended", async () => {
+    loginToken = TOKEN;
+    (loadSavedCredentials as jest.Mock).mockImplementation(async () => ({ baseUrl: BASE, token: "sbs_revoked" }));
+    const hook = await renderHook(() => useSuperBot(), { wrapper: SuperBotProvider });
+    await waitFor(() => expect(hook.result.current.ready).toBe(true));
+    expect(hook.result.current.api).toBeNull();
+    expect(hook.result.current.error).toBe("Your session ended. Sign in again.");
+    expect(clearCredentials).toHaveBeenCalled();
+  });
+
+  it("signs out on the device even when the server doesn't answer", async () => {
+    loginToken = TOKEN;
+    stallLogout = true;
+    (loadSavedCredentials as jest.Mock).mockImplementation(async () => ({ baseUrl: BASE, token: TOKEN }));
+    const { result } = await connected();
+    await act(() => result.current.logout());
+    expect(result.current.api).toBeNull();
+    expect(clearCredentials).toHaveBeenCalled();
+  });
+
+  it("returns to sign-in when the session is revoked while the app is open", async () => {
+    loginToken = TOKEN;
+    (loadSavedCredentials as jest.Mock).mockImplementation(async () => ({ baseUrl: BASE, token: TOKEN }));
+    const { result } = await connected();
+    loginToken = "sbs_" + "b".repeat(64);
+    const onError = (connectSse as jest.Mock).mock.calls[0][4] as () => void;
+    await act(async () => onError());
+    await waitFor(() => expect(result.current.api).toBeNull());
+    expect(result.current.error).toBe("Your session ended. Sign in again.");
+    expect(clearCredentials).toHaveBeenCalled();
+  });
+
+  it("doesn't mark chats read for read-only users", async () => {
+    permissions = ["account", "read", "review"];
+    bobUnread = true;
+    const { result } = await connected();
+    await waitFor(() => expect(result.current.canWrite).toBe(false));
+    await act(() => result.current.loadMessages("b2"));
+    expect(calls.some((c) => c.url.endsWith("/read"))).toBe(false);
   });
 });

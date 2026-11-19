@@ -13,7 +13,7 @@ import {
   loadSavedCredentials,
   saveCredentials,
 } from "./auth";
-import { SuperBotApi } from "./api";
+import { ApiError, signIn, SuperBotApi } from "./api";
 import {
   applyHandoffHistory,
   applyHandoffMessage,
@@ -25,14 +25,18 @@ import {
 import { createBody, patchBody, type RoutineDraft } from "./routines";
 import { resolveScreenUrl } from "./screen";
 import { connectSse } from "./sse";
-import type { Approval, BotView, Message, ModelOption, Policy, PolicyMode, Routine, SseEvent } from "./types";
+import type { Approval, BotView, Me, Message, ModelOption, Policy, PolicyMode, Routine, SseEvent } from "./types";
 
 interface SuperBotContextValue {
   ready: boolean;
   connected: boolean;
   error: string | null;
   api: SuperBotApi | null;
-  me: { name: string };
+  me: Me;
+  /** Whether this person's role may change things. The server enforces it; this hides what would fail. */
+  canWrite: boolean;
+  /** Whether the server lets this person do `perm` (see ADR 0012). */
+  can: (perm: string) => boolean;
   harnesses: string[];
   defaultHarness: string;
   bots: BotView[];
@@ -47,7 +51,8 @@ interface SuperBotContextValue {
   setShowHidden: (v: boolean) => void;
   filter: string;
   setFilter: (v: string) => void;
-  login: (baseUrl: string, password: string) => Promise<void>;
+  /** `secret` is a one-time sign-in code, or the server password (break-glass). */
+  login: (baseUrl: string, secret: string) => Promise<void>;
   logout: () => Promise<void>;
   refresh: (reloadMessages?: boolean) => Promise<void>;
   loadMessages: (botId: string) => Promise<void>;
@@ -108,7 +113,15 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [api, setApi] = useState<SuperBotApi | null>(null);
-  const [me, setMe] = useState({ name: "" });
+  const [me, setMe] = useState<Me>({ name: "" });
+  // Servers from before roles send no permissions; everyone could write there.
+  const can = (perm: string) => !me.permissions || me.permissions.includes(perm);
+  const canWrite = can("write");
+  const canWriteRef = useRef(canWrite);
+  canWriteRef.current = canWrite;
+  const markRead = (client: SuperBotApi, botId: string) => {
+    if (canWriteRef.current) void client.markRead(botId).catch(() => {});
+  };
   const [harnesses, setHarnesses] = useState<string[]>([]);
   const [defaultHarness, setDefaultHarness] = useState("claude");
   const [bots, setBots] = useState<BotView[]>([]);
@@ -122,6 +135,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [policy, setPolicy] = useState<Policy | null>(null);
   const sseRef = useRef<ReturnType<typeof connectSse> | null>(null);
+  const clientRef = useRef<SuperBotApi | null>(null);
   const openedRef = useRef(false);
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
@@ -162,7 +176,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
           });
         }
         if (evt.bot) setBots((bs) => upsertBot(bs, evt.bot as BotView));
-        if (evt.message.botId === activeId && api) void api.markRead(evt.message.botId).catch(() => {});
+        if (evt.message.botId === activeId && api) markRead(api, evt.message.botId);
       } else if (evt.type === "bot") {
         setBots((bs) => upsertBot(bs, evt.bot));
       } else if (evt.type === "botDeleted") {
@@ -247,18 +261,43 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
           if (openedRef.current) void refreshInternal(client, true);
           openedRef.current = true;
         },
-        () => setConnected(false),
+        () => {
+          setConnected(false);
+          // A revoked session closes the stream; a quick request tells that apart from a network drop.
+          if (client.config.token) void client.verify().catch(() => {});
+        },
       );
       setConnected(true);
     },
     [],
   );
 
+  const reset = () => {
+    sseRef.current?.close();
+    clientRef.current = null;
+    setApi(null);
+    setBots([]);
+    setMessages({});
+    setDrafts({});
+    setHandoffs({});
+    setApprovals([]);
+    setConnected(false);
+  };
+  const resetRef = useRef(reset);
+  resetRef.current = reset;
+
   const bootstrap = useCallback(
     async (client: SuperBotApi) => {
       setError(null);
+      client.onSessionEnded = () => {
+        if (clientRef.current !== client) return;
+        resetRef.current();
+        void clearCredentials();
+        setError("Your session ended. Sign in again.");
+      };
       const state = await client.verify();
       applyState(state);
+      clientRef.current = client;
       setApi(client);
       startSse(client);
       void prefetchUnread(client, state.bots);
@@ -268,12 +307,25 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     void (async () => {
-      const saved = await loadSavedCredentials();
-      if (saved?.password) {
+      let saved = await loadSavedCredentials();
+      // A password saved before sign-in existed is swapped for a session token, once.
+      if (saved?.password && !saved.token) {
+        const upgraded = await signIn(saved.baseUrl, saved.password).catch(() => null);
+        if (upgraded?.token) {
+          saved = upgraded;
+          await saveCredentials(upgraded);
+        }
+      }
+      if (saved?.token || saved?.password) {
         try {
           await bootstrap(new SuperBotApi(saved));
         } catch (err) {
-          setError(err instanceof Error ? err.message : "Connection failed");
+          if (err instanceof ApiError && err.status === 401 && saved.token) {
+            await clearCredentials();
+            setError("Your session ended. Sign in again.");
+          } else {
+            setError(err instanceof Error ? err.message : "Connection failed");
+          }
         }
       }
       setReady(true);
@@ -283,28 +335,25 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     const sub = RNAppState.addEventListener("change", (s) => {
-      if (s === "active" && activeId && api) void api.markRead(activeId).catch(() => {});
+      if (s === "active" && activeId && api) markRead(api, activeId);
     });
     return () => sub.remove();
   }, [activeId, api]);
 
-  const login = async (baseUrl: string, password: string) => {
-    if (!password.trim()) throw new Error("Password is required");
-    const client = new SuperBotApi({ baseUrl, password });
+  const login = async (baseUrl: string, secret: string) => {
+    if (!secret.trim()) throw new Error("A sign-in code or password is required");
+    const cfg = await signIn(baseUrl, secret.trim());
+    const client = new SuperBotApi(cfg);
     await bootstrap(client);
-    await saveCredentials(baseUrl, password);
+    await saveCredentials(cfg);
   };
 
+  // Signs out on the device first, so a slow server can't keep anyone signed in.
   const logout = async () => {
-    sseRef.current?.close();
-    setApi(null);
-    setBots([]);
-    setMessages({});
-    setDrafts({});
-    setHandoffs({});
-    setApprovals([]);
-    setConnected(false);
+    const client = api;
+    reset();
     await clearCredentials();
+    void client?.logout().catch(() => {});
   };
 
   const refresh = async (reloadMessages?: boolean) => {
@@ -318,10 +367,10 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
       const list = await fetchHistory(api, botId);
       setMessages((m) => ({ ...m, [botId]: list }));
       setHandoffs((h) => applyHandoffHistory(h, botId, list));
-      void api.markRead(botId).catch(() => {});
+      markRead(api, botId);
     } else if (bots.find((b) => b.id === botId)?.unread) {
       // Prefetched in the background: opening it still marks it read.
-      void api.markRead(botId).catch(() => {});
+      markRead(api, botId);
     }
   };
 
@@ -435,6 +484,8 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
       error,
       api,
       me,
+      canWrite,
+      can,
       harnesses,
       defaultHarness,
       bots,

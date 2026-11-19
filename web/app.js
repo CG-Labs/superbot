@@ -78,12 +78,15 @@ async function api(method, path, body) {
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401) location.href = "/login";
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data;
 }
 
 // State
-let me = { name: "" };
+let me = { name: "", permissions: [] };
+// What this person's role allows (see docs/adr/0012-users-sessions-rbac.md). The server enforces it; this only hides what would fail.
+const can = (perm) => (me.permissions || []).includes(perm);
 let harnesses = [];
 let defaultHarness = "claude";
 let bots = [];
@@ -130,6 +133,12 @@ function renderSidebar() {
   $("me-avatar").textContent = (me.name || "?")[0].toUpperCase();
   $("approvals-count").textContent = approvals.length || "";
   $("approvals-btn").classList.toggle("waiting", approvals.length > 0);
+  $("new-btn").hidden = !can("write");
+  $("audit-btn").hidden = !can("admin");
+  $("signout-btn").hidden = !me.session;
+  $("ap-mode").disabled = !can("admin");
+  $("input").disabled = !can("write");
+  $("input").placeholder = can("write") ? "" : "Read-only access";
 }
 
 // Approvals: risky tool calls wait here for a person (see docs/adr/0007-approvals.md).
@@ -152,10 +161,10 @@ function approvalCard(a, withBot) {
     <div class="ap-reason">${esc(a.reason)}</div>
     <pre class="ap-subject">${esc(a.subject)}</pre>
     <div class="ap-foot">
-      <label class="ap-remember"><input type="checkbox" ${remembered.has(a.id) ? "checked" : ""} /> Remember for ${esc(b?.name || "this Bot")}</label>
+      ${can("admin") ? `<label class="ap-remember"><input type="checkbox" ${remembered.has(a.id) ? "checked" : ""} /> Remember for ${esc(b?.name || "this Bot")}</label>` : ""}
       <span class="ap-left">Denied in ${minutesLeft(a)}</span>
-      <button class="nb-btn" data-decide="deny">Deny</button>
-      <button class="nb-btn primary" data-decide="approve">Approve</button>
+      ${can("approve") ? `<button class="nb-btn" data-decide="deny">Deny</button>
+      <button class="nb-btn primary" data-decide="approve">Approve</button>` : ""}
     </div>
   </div>`;
 }
@@ -262,7 +271,7 @@ async function open(id) {
 
 function markRead() {
   const b = bot(activeId);
-  if (b?.unread && document.hasFocus()) {
+  if (b?.unread && document.hasFocus() && can("write")) {
     b.unread = false;
     api("POST", `/api/bots/${b.id}/read`).catch(() => {});
   }
@@ -409,6 +418,8 @@ function connect() {
   // Resync after a reconnect, in case events were missed.
   let opened = false;
   es.onopen = () => { if (opened) load(true); opened = true; };
+  // The stream ends when the session does; the browser then gives up after a 401.
+  es.onerror = () => { if (es.readyState === EventSource.CLOSED) api("GET", "/api/auth/me").catch(() => {}); };
 }
 
 async function load(refresh) {
@@ -716,6 +727,10 @@ function renderAudit() {
 
 let auditTimer = null;
 const closeAudit = () => { $("au").hidden = true; };
+$("signout-btn").addEventListener("click", async () => {
+  await api("POST", "/api/auth/logout").catch(() => {});
+  location.href = "/login";
+});
 $("audit-btn").addEventListener("click", () => { $("au").hidden = false; loadAudit(); });
 $("au-close").addEventListener("click", closeAudit);
 $("au").addEventListener("mousedown", (e) => { if (e.target === $("au")) closeAudit(); });
