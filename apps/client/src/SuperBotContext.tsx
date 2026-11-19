@@ -23,6 +23,7 @@ import {
   type HandoffMap,
 } from "./handoff";
 import { createBody, patchBody, type RoutineDraft } from "./routines";
+import { signInWithSso } from "./sso";
 import { resolveScreenUrl } from "./screen";
 import { connectSse } from "./sse";
 import type { Approval, BotView, Me, Message, ModelOption, Policy, PolicyMode, Routine, SseEvent } from "./types";
@@ -53,6 +54,8 @@ interface SuperBotContextValue {
   setFilter: (v: string) => void;
   /** `secret` is a one-time sign-in code, or the server password (break-glass). */
   login: (baseUrl: string, secret: string) => Promise<void>;
+  /** Signs in through one of the server's SSO providers, in the system browser. */
+  loginWithSso: (baseUrl: string, providerId: string) => Promise<void>;
   logout: () => Promise<void>;
   refresh: (reloadMessages?: boolean) => Promise<void>;
   loadMessages: (botId: string) => Promise<void>;
@@ -348,6 +351,12 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
     await saveCredentials(cfg);
   };
 
+  const loginWithSso = async (baseUrl: string, providerId: string) => {
+    const cfg = await signInWithSso(baseUrl, providerId);
+    await bootstrap(new SuperBotApi(cfg));
+    await saveCredentials(cfg);
+  };
+
   // Signs out on the device first, so a slow server can't keep anyone signed in.
   const logout = async () => {
     const client = api;
@@ -500,6 +509,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
       filter,
       setFilter,
       login,
+      loginWithSso,
       logout,
       refresh,
       loadMessages,

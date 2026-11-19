@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -10,27 +10,43 @@ import {
   View,
 } from "react-native";
 import { defaultServerUrl } from "../src/auth";
+import { fetchSsoProviders, ssoSupported, type SsoProvider } from "../src/sso";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
 
 export function LoginScreen() {
-  const { login, error: bootError } = useSuperBot();
+  const { login, loginWithSso, error: bootError } = useSuperBot();
   const [baseUrl, setBaseUrl] = useState(() => defaultServerUrl());
   const [secret, setSecret] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [providers, setProviders] = useState<SsoProvider[]>([]);
 
-  const onSubmit = async () => {
+  // Ask the server which SSO providers it offers, once typing pauses.
+  useEffect(() => {
+    if (!ssoSupported()) return;
+    let live = true;
+    const t = setTimeout(() => {
+      void fetchSsoProviders(baseUrl).then((list) => live && setProviders(list));
+    }, 400);
+    return () => {
+      live = false;
+      clearTimeout(t);
+    };
+  }, [baseUrl]);
+
+  const run = async (signIn: () => Promise<void>) => {
     setBusy(true);
     setError(null);
     try {
-      await login(baseUrl, secret);
+      await signIn();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Login failed");
     } finally {
       setBusy(false);
     }
   };
+  const onSubmit = () => run(() => login(baseUrl, secret));
 
   return (
     <KeyboardAvoidingView
@@ -51,6 +67,21 @@ export function LoginScreen() {
           value={baseUrl}
           onChangeText={setBaseUrl}
         />
+        {providers.length ? (
+          <View style={styles.sso}>
+            {providers.map((p) => (
+              <Pressable
+                key={p.id}
+                style={[styles.ssoBtn, busy && styles.btnDisabled]}
+                onPress={() => run(() => loginWithSso(baseUrl, p.id))}
+                disabled={busy}
+              >
+                <Text style={styles.ssoText}>Sign in with {p.label}</Text>
+              </Pressable>
+            ))}
+            <Text style={styles.or}>or</Text>
+          </View>
+        ) : null}
         <Text style={styles.label}>Sign-in code or password</Text>
         <TextInput
           style={styles.input}
@@ -112,5 +143,16 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   btnDisabled: { opacity: 0.6 },
+  sso: { marginTop: 16, gap: 10 },
+  ssoBtn: {
+    backgroundColor: colors.bgBubble,
+    borderColor: colors.border,
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingVertical: 14,
+    alignItems: "center",
+  },
+  ssoText: { color: colors.text, fontWeight: "600", fontSize: 16 },
+  or: { color: colors.textFaint, textAlign: "center", marginTop: 4 },
   btnText: { color: "#fff", fontWeight: "600", fontSize: 16 },
 });

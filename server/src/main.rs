@@ -13,9 +13,12 @@ mod runner;
 mod screen;
 mod secrets;
 mod shell;
+mod sso;
 mod users;
 #[cfg(test)]
 mod users_http_tests;
+#[cfg(test)]
+mod sso_http_tests;
 
 use approvals::{DecideError, Remember};
 use audit::{Actor, Event, Outcome, Source, Who};
@@ -88,6 +91,7 @@ async fn main() {
     };
     let break_glass = users::break_glass_flag(&env("AUTH_BREAK_GLASS", "")).unwrap_or_else(|e| exit(e));
     let sessions = SessionConfig::from_env(&env("SESSION_IDLE_TIMEOUT", ""), &env("SESSION_MAX_AGE", "")).unwrap_or_else(|e| exit(e));
+    let sso = sso::Sso::from_env().unwrap_or_else(|e| exit(format!("SSO: {e}")));
     let allow_no_auth = auth_startup(&host, &password, break_glass);
     secrets::redact::register(&password);
     if adapters::get(&default_harness).is_none() {
@@ -157,8 +161,14 @@ async fn main() {
         hosts: allowed_hosts(&host, port, &env("ALLOWED_HOSTS", "")),
         trust_forwarded: env("TRUST_FORWARDED_FOR", "") == "1",
         sessions,
+        sso,
         ..Auth::new(Some(app.clone()))
     });
+    for p in &auth_state.sso.providers {
+        let ready = if p.ready() { "ready".to_string() } else { format!("not offered until {} is set (env, _FILE, or `botctl secret set`)", p.env_var()) };
+        println!("SSO: {} ({}, {}), {ready}; just-in-time sign-up {}.", p.id, p.label, p.type_name(), p.jit_role.map_or("off", |r| r.as_str()));
+    }
+    let sso_ids: Vec<String> = auth_state.sso.providers.iter().map(|p| p.id.clone()).collect();
     let router = router(app.clone(), auth_state);
     let policy = app.db.global_policy();
     app.db.record(&Event::new(Actor::system("server"), "server.started").details(json!({
@@ -174,6 +184,7 @@ async fn main() {
         "sessionMaxMinutes": sessions.max_ms / 60_000,
         "auditRetentionDays": retention,
         "screens": app.screens.is_some(),
+        "sso": sso_ids,
     })));
     audit::start_retention(app.clone(), retention);
     users::start_pruning(app.clone(), sessions);
@@ -251,10 +262,15 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/auth/login", post(users::login))
         .route("/auth/logout", post(users::logout))
         .route("/auth/me", get(users::me))
+        .route("/auth/sso", get(sso::list))
+        .route("/auth/sso/{id}/start", get(sso::start))
+        .route("/auth/sso/{id}/callback", get(sso::callback))
         .route("/users", get(users::list_users).post(users::create_user))
         .route("/users/{key}", get(users::get_user).patch(users::update_user))
         .route("/users/{key}/login-codes", post(users::create_login_code))
         .route("/users/{key}/sessions", delete(users::revoke_user_sessions))
+        .route("/users/{key}/identities", get(sso::list_identities).post(sso::link_identity))
+        .route("/users/{key}/identities/{id}", delete(sso::unlink_identity))
         .route("/sessions", get(users::list_sessions))
         .route("/sessions/{id}", delete(users::revoke_session));
     Router::new()
@@ -344,6 +360,8 @@ struct Auth {
     sessions: SessionConfig,
     logins: audit::Logins,
     limiter: users::Limiter,
+    /// Single sign-on providers and sign-ins in progress (ADR 0014).
+    sso: sso::Sso,
     /// The database: sessions and audit events. None in tests of auth alone.
     app: Option<AppState>,
 }
@@ -360,6 +378,7 @@ impl Auth {
             sessions: SessionConfig::default(),
             logins: audit::Logins::default(),
             limiter: users::Limiter::default(),
+            sso: sso::Sso::default(),
             app,
         }
     }
@@ -534,7 +553,7 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
     let mut req = req;
     req.extensions_mut().insert(source.clone());
     // Signing in, and the page to do it on, need no credentials.
-    if (method == Method::POST && path == "/api/auth/login") || (method == Method::GET && path == "/login") {
+    if (method == Method::POST && path == "/api/auth/login") || (method == Method::GET && (path == "/login" || sso_path(&path))) {
         return next.run(req).await;
     }
     let caller = match authenticate(&a, &req, &source) {
@@ -543,7 +562,7 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
     };
     let actor = match (&caller.principal, &caller.user) {
         (Principal::Bot, _) => a.bot_actor(req.headers()),
-        (_, Some(u)) => users::actor(u),
+        (_, Some(u)) => users::actor(u, caller.session.as_ref()),
         (_, None) => Actor::operator(),
     };
     if caller.method != "session" && caller.principal != Principal::Bot {
@@ -577,6 +596,15 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
         a.record(by.event("access.denied").outcome(Outcome::Denied).details(json!({ "method": method.as_str(), "path": path })));
     }
     res
+}
+
+/// `/api/auth/sso`, `/api/auth/sso/{id}/start`, and `/api/auth/sso/{id}/callback`.
+fn sso_path(path: &str) -> bool {
+    match path.strip_prefix("/api/auth/sso") {
+        Some("") => true,
+        Some(rest) => rest.strip_prefix('/').and_then(|r| r.split_once('/')).is_some_and(|(id, step)| !id.is_empty() && !id.contains('/') && matches!(step, "start" | "callback")),
+        None => false,
+    }
 }
 
 /// Who sent this request, from (in order) the Authorization header, the session

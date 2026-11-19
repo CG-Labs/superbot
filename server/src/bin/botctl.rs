@@ -42,6 +42,11 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl user role <user> <admin|member|readonly>  <user> is an id or email
   botctl user disable <user> | enable <user>       Disabling ends the user's sessions
   botctl user code <user> [--ttl <minutes>]        A one-time sign-in code (default 60 minutes)
+  botctl user identities <user>                    The user's SSO identities
+  botctl user link <user> <provider> <subject> [--tenant <tenant-id>]
+                                                   Let an SSO identity sign in as the user. Entra:
+                                                   <subject> is the user's object id
+  botctl user unlink <user> <identity-id>
   botctl sessions [<user>]                         Live sessions
   botctl session revoke <id>
   botctl session revoke-all <user>
@@ -390,6 +395,12 @@ fn run(args: &[String]) -> Result<String, String> {
             let mins = (res["expiresAt"].as_i64().unwrap_or_default() - now_ms()) / 60_000;
             Ok(format!("{}\n\nA one-time sign-in code for {}, good for about {} minutes. Share it privately.", res["code"].as_str().unwrap_or_default(), res["user"]["email"].as_str().unwrap_or(key), mins.max(1)))
         }
+        ["user", "identities", key] => op("GET", &format!("/api/users/{}/identities", encode(key)), None),
+        ["user", "link", key, provider, subject, rest @ ..] => {
+            let body = json!({ "provider": provider, "subject": subject, "tenant": flag(rest, "--tenant") });
+            op("POST", &format!("/api/users/{}/identities", encode(key)), Some(body.to_string()))
+        }
+        ["user", "unlink", key, id] => op("DELETE", &format!("/api/users/{}/identities/{}", encode(key), encode(id)), None),
         ["sessions"] => op("GET", "/api/sessions", None),
         ["sessions", key] => op("GET", &format!("/api/sessions?user={}", encode(key)), None),
         ["session", "revoke", id] => op("DELETE", &format!("/api/sessions/{}", encode(id)), None).map(|_| "Revoked.".into()),
@@ -398,7 +409,12 @@ fn run(args: &[String]) -> Result<String, String> {
         ["secret", "set", name] => {
             let name = env_name(name)?;
             let body = json!({ "value": stdin_value(std::io::stdin())? }).to_string();
-            op("PUT", &format!("/api/secrets/{name}"), Some(body)).map(|_| format!("Saved {name}. Bots get it as ${name} from their next run."))
+            let res: Value = serde_json::from_str(&op("PUT", &format!("/api/secrets/{name}"), Some(body))?).unwrap_or_default();
+            Ok(if res["secret"]["forBots"] == false {
+                format!("Saved {name}. It is botd's own (single sign-on); Bots never get it.")
+            } else {
+                format!("Saved {name}. Bots get it as ${name} from their next run.")
+            })
         }
         ["secret", "rm" | "delete", name] => op("DELETE", &format!("/api/secrets/{}", env_name(name)?), None).map(|_| "Deleted.".into()),
         ["help", "admin"] | ["admin"] => Ok(ADMIN_HELP.into()),

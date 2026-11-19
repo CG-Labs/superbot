@@ -90,24 +90,37 @@ pub struct Listed {
     pub writable: bool,
     /// An earlier store with the same name, whose value wins.
     pub shadowed_by: Option<&'static str>,
+    /// False for botd's own secrets (`server_secret`), which no Bot receives.
+    pub for_bots: bool,
 }
 
 /// Names botd or the harnesses rely on; a stored secret must not replace them in a Bot's environment.
 const RESERVED: [&str; 11] = ["AUTH_PASSWORD", "PATH", "HOME", "USER", "LOGNAME", "SHELL", "ENV", "BASH_ENV", "NODE_OPTIONS", "DISPLAY", "DBUS_SESSION_BUS_ADDRESS"];
-const RESERVED_PREFIXES: [&str; 6] = ["SUPERBOT_", "BOT_", "LD_", "DYLD_", "AGENT_BROWSER_", "VOXL_"];
+const RESERVED_PREFIXES: [&str; 7] = ["SUPERBOT_", "BOT_", "SSO_", "LD_", "DYLD_", "AGENT_BROWSER_", "VOXL_"];
 pub const MAX_VALUE: usize = 64 * 1024;
 
+fn env_shaped(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 128 && name.bytes().enumerate().all(|(i, b)| b == b'_' || b.is_ascii_uppercase() || (i > 0 && b.is_ascii_digit()))
+}
+
 pub fn check_name(name: &str) -> Result<(), Error> {
-    let shape = !name.is_empty()
-        && name.len() <= 128
-        && name.bytes().enumerate().all(|(i, b)| b == b'_' || b.is_ascii_uppercase() || (i > 0 && b.is_ascii_digit()));
-    if !shape {
+    if !env_shaped(name) {
         return Err(Error::Invalid("Use an environment variable name: A-Z, 0-9, and _, not starting with a digit.".into()));
     }
     if RESERVED.contains(&name) || RESERVED_PREFIXES.iter().any(|p| name.starts_with(p)) {
         return Err(Error::Invalid(format!("{name} is reserved by SuperBot.")));
     }
     Ok(())
+}
+
+/// botd's own secrets: saved and listed like the others, but never given to a Bot.
+/// Today these are SSO client secrets (`SSO_<PROVIDER>_CLIENT_SECRET`, ADR 0014).
+pub fn server_secret(name: &str) -> bool {
+    env_shaped(name) && name.len() > "SSO__CLIENT_SECRET".len() && name.starts_with("SSO_") && name.ends_with("_CLIENT_SECRET")
+}
+
+fn check_saveable(name: &str) -> Result<(), Error> {
+    if server_secret(name) { Ok(()) } else { check_name(name) }
 }
 
 fn check_value(v: &str) -> Result<(), Error> {
@@ -137,7 +150,6 @@ impl Secrets {
     }
 
     /// For code inside botd that needs a value; harnesses get theirs through `harness_env`.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn get(&self, name: &str) -> Result<Option<Secret>, Error> {
         Ok(self.find(name)?.map(|(v, _)| v))
     }
@@ -147,7 +159,7 @@ impl Secrets {
     }
 
     pub fn put(&self, name: &str, value: &str) -> Result<Listed, Error> {
-        check_name(name)?;
+        check_saveable(name)?;
         check_value(value)?;
         redact::register(value);
         self.writable()?.put(name, value)?;
@@ -155,18 +167,20 @@ impl Secrets {
     }
 
     pub fn delete(&self, name: &str) -> Result<bool, Error> {
-        check_name(name)?;
+        check_saveable(name)?;
         self.writable()?.delete(name)
     }
 
-    /// Names Bots can get, store by store, marking names an earlier store overrides.
-    /// botd's own (AUTH_PASSWORD, SUPERBOT_*) are left out: Bots never receive them.
+    /// Names Bots can get, then botd's own SSO client secrets (`for_bots: false`), store
+    /// by store, marking names an earlier store overrides. Other names botd keeps for
+    /// itself (AUTH_PASSWORD, SUPERBOT_*) are left out.
     pub fn list(&self) -> Result<Vec<Listed>, Error> {
         let mut out: Vec<Listed> = Vec::new();
         for s in &self.stores {
-            for name in s.names()?.into_iter().filter(|n| check_name(n).is_ok()) {
+            for name in s.names()?.into_iter().filter(|n| check_saveable(n).is_ok()) {
                 let shadowed_by = out.iter().find(|l| l.name == name).map(|l| l.store);
-                out.push(Listed { name, store: s.kind(), writable: s.writable(), shadowed_by });
+                let for_bots = !server_secret(&name);
+                out.push(Listed { name, store: s.kind(), writable: s.writable(), shadowed_by, for_bots });
             }
         }
         Ok(out)
@@ -333,7 +347,7 @@ mod tests {
         let stored = format!("stored-{}", crate::random_hex(8));
         s.put("GITHUB_TOKEN", "from-db-value-1").unwrap();
         let l = s.put("OPENAI_API_KEY", &stored).unwrap();
-        assert_eq!(l, Listed { name: "OPENAI_API_KEY".into(), store: "sealed", writable: true, shadowed_by: None });
+        assert_eq!(l, Listed { name: "OPENAI_API_KEY".into(), store: "sealed", writable: true, shadowed_by: None, for_bots: true });
         assert_eq!(s.get("GITHUB_TOKEN").unwrap().unwrap().expose(), "from-env-value-1");
         assert_eq!(s.get("OPENAI_API_KEY").unwrap().unwrap().expose(), stored);
 
@@ -362,6 +376,24 @@ mod tests {
         assert!(matches!(s.put("PATH", "x"), Err(Error::Invalid(_))));
         assert_eq!(format!("{:?}", s.get("GITHUB_TOKEN").unwrap().unwrap()), "[redacted]");
         redact::forget(&stored);
+    }
+
+    #[test]
+    fn sso_client_secrets_are_saved_but_never_reach_bots() {
+        let s = secrets(&[("SSO_GOOGLE_CLIENT_SECRET", "from-env-value-2"), ("SSO_ENTRA_TENANT", "x")]);
+        let value = format!("entra-{}", crate::random_hex(12));
+        assert!(check_name("SSO_ENTRA_CLIENT_SECRET").is_err(), "Bots can't be given an SSO_ name");
+        let l = s.put("SSO_ENTRA_CLIENT_SECRET", &value).unwrap();
+        assert_eq!((l.store, l.for_bots), ("sealed", false));
+        assert_eq!(s.get("SSO_ENTRA_CLIENT_SECRET").unwrap().unwrap().expose(), value);
+        assert!(s.harness_env().is_empty(), "neither the sealed nor the env client secret goes to a Bot");
+        let names: Vec<_> = s.list().unwrap().into_iter().map(|l| (l.name, l.for_bots)).collect();
+        assert_eq!(names, [("SSO_GOOGLE_CLIENT_SECRET".to_string(), false), ("SSO_ENTRA_CLIENT_SECRET".to_string(), false)]);
+        for bad in ["SSO_ENTRA_TENANT", "SSO__CLIENT_SECRET", "SSO_ENTRA_client_SECRET"] {
+            assert!(s.put(bad, "v").is_err(), "{bad}");
+        }
+        assert!(s.delete("SSO_ENTRA_CLIENT_SECRET").unwrap());
+        redact::forget(&value);
     }
 
     #[test]
