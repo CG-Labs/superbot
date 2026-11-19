@@ -167,9 +167,17 @@ fn seal_plaintext(c: &Connection, cipher: &Cipher) -> rusqlite::Result<usize> {
     Ok(rows.len())
 }
 
-/// Startup checks, in order: optionally forget sealed values; find or make the key
-/// (refusing to make one when sealed values exist); prove the key opens what's
-/// sealed; seal leftover plaintext.
+/// Whether `cipher` opens what this database has sealed. True when nothing is sealed yet.
+fn opens(c: &Connection, cipher: &Cipher) -> rusqlite::Result<bool> {
+    if let Some(v) = key_check(c)? {
+        return Ok(cipher.open("key-check", &v).is_ok_and(|p| p.as_slice() == KEY_CHECK_PLAIN));
+    }
+    Ok(any_sealed(c)?.is_none_or(|(context, v)| cipher.open(&context, &v).is_ok()))
+}
+
+/// Startup checks: find or make the key (never making one when sealed values exist),
+/// prove it opens what's sealed, then seal leftover plaintext. `forget` drops sealed
+/// values only when the key is missing or wrong, so leaving it set does no harm.
 pub fn bootstrap(
     c: &Connection,
     found: Option<MasterKey>,
@@ -178,34 +186,30 @@ pub fn bootstrap(
 ) -> Result<(Cipher, Bootstrap), String> {
     let db = |e: rusqlite::Error| format!("database: {e}");
     let mut b = Bootstrap::default();
-    if forget {
-        b.discarded = discard(c).map_err(db)?;
-    }
-    let check = key_check(c).map_err(db)?;
-    let sealed = any_sealed(c).map_err(db)?;
-    let key = match found {
-        Some(k) => k,
-        None if check.is_some() || sealed.is_some() => return Err(MISSING_KEY.into()),
+    let cipher = match found {
+        Some(k) => {
+            let cipher = Cipher::new(&k);
+            if !opens(c, &cipher).map_err(db)? {
+                if !forget {
+                    return Err(WRONG_KEY.into());
+                }
+                b.discarded = discard(c).map_err(db)?;
+            }
+            cipher
+        }
         None => {
+            if key_check(c).map_err(db)?.is_some() || any_sealed(c).map_err(db)?.is_some() {
+                if !forget {
+                    return Err(MISSING_KEY.into());
+                }
+                b.discarded = discard(c).map_err(db)?;
+            }
             b.created = true;
-            create()?
+            Cipher::new(&create()?)
         }
     };
-    let cipher = Cipher::new(&key);
-    match (check, sealed) {
-        (Some(v), _) => {
-            if cipher.open("key-check", &v).ok().is_none_or(|p| p.as_slice() != KEY_CHECK_PLAIN) {
-                return Err(WRONG_KEY.into());
-            }
-        }
-        (None, sealed) => {
-            if let Some((context, v)) = sealed
-                && cipher.open(&context, &v).is_err()
-            {
-                return Err(WRONG_KEY.into());
-            }
-            c.execute("INSERT INTO settings (key, value) VALUES (?, ?)", params![KEY_CHECK, cipher.seal("key-check", KEY_CHECK_PLAIN)]).map_err(db)?;
-        }
+    if key_check(c).map_err(db)?.is_none() {
+        c.execute("INSERT INTO settings (key, value) VALUES (?, ?)", params![KEY_CHECK, cipher.seal("key-check", KEY_CHECK_PLAIN)]).map_err(db)?;
     }
     b.sealed = seal_plaintext(c, &cipher).map_err(db)?;
     Ok((cipher, b))
@@ -407,9 +411,13 @@ mod tests {
     fn forgetting_drops_sealed_values_and_starts_over() {
         let (_, db, c) = fresh();
         let bot = db.create_bot("A", "#fff", "waddle", "claude", None, true);
-        let (cipher, _) = bootstrap(&c, Some(MasterKey::generate()), no_key, false).unwrap();
+        let key = MasterKey::generate();
+        let same_key = MasterKey::parse(&key.base64()).unwrap();
+        let (cipher, _) = bootstrap(&c, Some(key), no_key, false).unwrap();
         let cipher = Arc::new(cipher);
         SealedStore::new(connect_again(&c), cipher.clone()).put("X_TOKEN", "v").unwrap();
+        let (_, b) = bootstrap(&c, Some(same_key), no_key, true).unwrap();
+        assert_eq!(b.discarded, 0, "a key that works keeps everything, even with the flag left on");
         let sealed = cipher.seal(&approval_context("a1"), b"{}");
         c.execute(
             "INSERT INTO approvals (id, bot_id, harness, tool, kind, subject, input, class, reason, status, created_at, expires_at)
@@ -424,5 +432,13 @@ mod tests {
         assert_eq!(fresh_cipher.open_text(&approval_context("a1"), &input).unwrap().expose(), r#"{"sealed":"discarded"}"#);
         let n: i64 = c.query_row("SELECT COUNT(*) FROM secrets", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 0);
+
+        // A wrong key with the flag: drop what it can't open, then adopt that key.
+        SealedStore::new(connect_again(&c), Arc::new(fresh_cipher)).put("Y_TOKEN", "v").unwrap();
+        let other = MasterKey::generate();
+        let other_copy = MasterKey::parse(&other.base64()).unwrap();
+        let (_, b) = bootstrap(&c, Some(other), no_key, true).unwrap();
+        assert_eq!((b.discarded, b.created), (2, false));
+        assert!(bootstrap(&c, Some(other_copy), no_key, false).is_ok());
     }
 }

@@ -257,6 +257,9 @@ pub fn init(db_path: &Path) -> Result<Report, String> {
         },
         forget,
     )?;
+    if forget && boot.discarded == 0 {
+        eprintln!("SUPERBOT_FORGET_SEALED=1 is set, but the master key works, so nothing was dropped. Remove the setting.");
+    }
     let cipher = sealed::install(cipher)?;
     let store = sealed::SealedStore::new(sealed::connect(db_path)?, Arc::clone(&cipher));
     let secrets = Secrets::new(vec![Box::new(env), Box::new(store)]);
