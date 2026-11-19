@@ -51,6 +51,7 @@ Related, from the same day ([#29](https://github.com/CG-Labs/superbot/issues/29)
 
 - On the web build that the server hosts (same origin, not dev), with nothing saved, the client asks `GET /api/auth/me`. If the answer has a session, it uses the cookie: requests carry no `Authorization` header, and the browser sends the cookie.
 - The cookie stays unreadable to scripts and is never written to storage. Signing out calls `/api/auth/logout`, which ends the session and clears the cookie.
+- If that sign-out doesn't reach the server, a "signed out" mark in `localStorage` (`superbot.signedOut`) stops the client from taking the live cookie up again. Each start tries the sign-out again until the server confirms it. A fresh sign-in (in the client, on `/login`, or through web SSO) clears the mark. The startup cookie check gives up after 5 seconds, so a stalled server still gets the sign-in form.
 - Writes on a cookie still need a same-origin request ([ADR 0024](0024-auth-review-hardening.md)). The client is same-origin, so this changes nothing on the server.
 - A saved token still wins. Native, desktop and dev builds never look for a cookie.
 
