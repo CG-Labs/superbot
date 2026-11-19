@@ -45,7 +45,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl user identities <user>                    The user's SSO identities
   botctl user link <user> <provider> <subject> [--tenant <tenant-id>]
                                                    Let an SSO identity sign in as the user. Entra:
-                                                   <subject> is the user's object id
+                                                   <subject> is the user's object id; Google and
+                                                   OIDC: the sub claim (or the mapped subject)
   botctl user unlink <user> <identity-id>
   botctl sessions [<user>]                         Live sessions
   botctl session revoke <id>

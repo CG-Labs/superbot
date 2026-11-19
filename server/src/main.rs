@@ -166,7 +166,7 @@ async fn main() {
     });
     for p in &auth_state.sso.providers {
         let ready = if p.ready() { "ready".to_string() } else { format!("not offered until {} is set (env, _FILE, or `botctl secret set`)", p.env_var()) };
-        println!("SSO: {} ({}, {}), {ready}; just-in-time sign-up {}.", p.id, p.label, p.type_name(), p.jit_role.map_or("off", |r| r.as_str()));
+        println!("SSO: {} ({}, {}), {ready}; {}; just-in-time sign-up {}.", p.id, p.label, p.type_name(), p.audience(), p.jit_role.map_or("off", |r| r.as_str()));
     }
     let sso_ids: Vec<String> = auth_state.sso.providers.iter().map(|p| p.id.clone()).collect();
     let router = router(app.clone(), auth_state);
