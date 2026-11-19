@@ -17,7 +17,9 @@ ENABLE_BACKUP=true
 UPGRADE=false
 DRY_RUN=false
 INTERACTIVE=true
-DEPLOY_DIR=""
+SHARE_DIR=${SHARE_DIR:-/usr/local/share/superbot}
+SYSTEMD_DIR=${SYSTEMD_DIR:-/etc/systemd/system}
+DEPLOY_FILES=(superbot.service superbot-backup.sh superbot-backup.service superbot-backup.timer)
 
 log() { printf '==> %s\n' "$*"; }
 warn() { printf '!! %s\n' "$*" >&2; }
@@ -113,39 +115,90 @@ detect_source_dir() {
   fi
 }
 
-# deploy/ next to this script (checkout) or under the cloned repo (curl | bash).
-resolve_deploy_dir() {
-  if [[ -n "$DEPLOY_DIR" ]]; then
-    printf '%s\n' "$DEPLOY_DIR"
-    return
-  fi
-  local script_path script_dir home repo_deploy
-  script_path=${BASH_SOURCE[0]:-}
-  if [[ -n "$script_path" ]] && [[ -f "$script_path" ]]; then
-    script_dir=$(cd "$(dirname "$script_path")" && pwd)
-    if [[ -f "$script_dir/superbot.service" ]]; then
-      DEPLOY_DIR=$script_dir
-      printf '%s\n' "$DEPLOY_DIR"
-      return
-    fi
-  fi
+# Root installs units only from this root-owned copy, never from the service
+# user's checkout (that user could edit templates to gain root).
+trusted_deploy_dir() { printf '%s/deploy\n' "$SHARE_DIR"; }
+
+assert_not_service_owned() {
+  local path=$1 home owner
   home=$(user_home)
-  repo_deploy="$home/superbot/deploy"
-  if [[ -f "$repo_deploy/superbot.service" ]]; then
-    DEPLOY_DIR=$repo_deploy
-    printf '%s\n' "$DEPLOY_DIR"
-    return
-  fi
-  die "Missing deploy/ templates at $repo_deploy (clone may have failed; re-run from a checkout or curl | bash after sync_repo)."
+  case "$path/" in
+    "$home"/*) die "Refusing $path: it is under $home, writable by $SUPERBOT_USER. Use a root-owned checkout or curl | bash." ;;
+  esac
+  [[ -e "$path" ]] || return 0
+  owner=$(stat -c %U "$path")
+  [[ "$owner" != "$SUPERBOT_USER" ]] || die "Refusing $path: owned by $SUPERBOT_USER"
 }
 
-verify_deploy_templates() {
-  local deploy f
-  deploy=$(resolve_deploy_dir)
-  log "Using deploy assets from $deploy"
-  for f in superbot.service superbot-backup.sh superbot-backup.service superbot-backup.timer; do
-    [[ -f "$deploy/$f" ]] || die "Missing deploy template: $deploy/$f"
+install_trusted_files() {
+  local src=$1 dest=$2 f
+  install -d -m 0755 -o root -g root "$SHARE_DIR" "$dest"
+  for f in "${DEPLOY_FILES[@]}"; do
+    [[ -f "$src/$f" ]] || die "Missing deploy template: $src/$f"
+    install -m 0644 -o root -g root "$src/$f" "$dest/$f"
   done
+}
+
+# Local checkout: copy its deploy/ (same trust as this script).
+# curl | bash: root fetches REPO_URL into a root-owned bare repo and reads
+# deploy/ from the fetched commit with git show.
+stage_trusted_deploy() {
+  local dest git_dir rev tmp f src
+  dest=$(trusted_deploy_dir)
+  if [[ -n "$INSTALL_DIR" ]]; then
+    src=$(realpath -m "$INSTALL_DIR")
+    assert_not_service_owned "$src"
+    assert_not_service_owned "$src/deploy"
+    for f in "${DEPLOY_FILES[@]}"; do
+      assert_not_service_owned "$src/deploy/$f"
+    done
+    if [[ "$DRY_RUN" == true ]]; then
+      log "[dry-run] would copy deploy templates from $src/deploy to $dest"
+      return
+    fi
+    install_trusted_files "$src/deploy" "$dest"
+    log "Staged deploy templates from $src/deploy to $dest"
+    return
+  fi
+  git_dir="$SHARE_DIR/src.git"
+  if [[ "$DRY_RUN" == true ]]; then
+    log "[dry-run] would fetch $REPO_URL ($REPO_BRANCH) into root-owned $git_dir and stage deploy templates in $dest"
+    return
+  fi
+  install -d -m 0755 -o root -g root "$SHARE_DIR"
+  [[ -d "$git_dir" ]] || git init -q --bare "$git_dir"
+  git --git-dir="$git_dir" fetch -q --depth 1 "$REPO_URL" "$REPO_BRANCH"
+  rev=$(git --git-dir="$git_dir" rev-parse FETCH_HEAD)
+  tmp=$(mktemp -d)
+  for f in "${DEPLOY_FILES[@]}"; do
+    git --git-dir="$git_dir" show "$rev:deploy/$f" >"$tmp/$f" || die "Missing deploy/$f at $REPO_URL@$rev"
+  done
+  install_trusted_files "$tmp" "$dest"
+  rm -rf "$tmp"
+  log "Staged deploy templates from $REPO_URL@$rev to $dest"
+}
+
+# Drop identity/exec lines from a template and inject fixed ones after
+# [Service]. Fail closed on any other directive that could change what runs
+# or as whom.
+render_unit() {
+  local template=$1 out=$2 fixed=$3 tmp
+  if grep -Ev '^[[:space:]]*ExecStart[[:space:]]*=' "$template" |
+    grep -Eq '^[[:space:]]*(Exec[A-Za-z]*|DynamicUser|SupplementaryGroups|AmbientCapabilities|PermissionsStartOnly|RootDirectory|RootImage|Alias)[[:space:]]*='; then
+    die "Refusing $template: unexpected privileged directive"
+  fi
+  tmp=$(mktemp)
+  awk -v fixed="$fixed" '
+    /^[[:space:]]*(User|Group|ExecStart|WorkingDirectory|EnvironmentFile|Unit)[[:space:]]*=/ { next }
+    { print }
+    /^[[:space:]]*\[Service\][[:space:]]*$/ && fixed != "" { print fixed }
+  ' "$template" >"$tmp"
+  if [[ -n "$fixed" ]] && ! grep -qxF "$(printf '%s\n' "$fixed" | grep '^ExecStart=')" "$tmp"; then
+    rm -f "$tmp"
+    die "Refusing $template: no [Service] section"
+  fi
+  install -m 0644 -o root -g root "$tmp" "$out"
+  rm -f "$tmp"
 }
 
 user_home() {
@@ -276,6 +329,8 @@ configure_env() {
     return
   fi
 
+  [[ ! -L "$env_file" ]] || die "Refusing symlinked $env_file"
+  [[ ! -L "$pass_file" ]] || die "Refusing symlinked $pass_file"
   if [[ ! -f "$env_file" ]]; then
     cp "$repo_path/.env.example" "$env_file"
     chown "$SUPERBOT_USER:$SUPERBOT_USER" "$env_file"
@@ -308,19 +363,31 @@ configure_env() {
   chmod 0600 "$env_file"
 }
 
+service_unit_fixed() {
+  local home=$1
+  printf '%s\n' "User=$SUPERBOT_USER" "Group=$SUPERBOT_USER" \
+    "WorkingDirectory=$home/superbot" "EnvironmentFile=-$home/superbot/.env" \
+    "ExecStart=$BIN_DIR/botd"
+}
+
+backup_unit_fixed() {
+  local home=$1
+  printf '%s\n' "User=$SUPERBOT_USER" "Group=$SUPERBOT_USER" \
+    "EnvironmentFile=-$home/superbot/.env" \
+    "ExecStart=$BIN_DIR/superbot-backup $home"
+}
+
 install_systemd() {
   local home deploy unit
   home=$(user_home)
-  deploy=$(resolve_deploy_dir)
-  unit=/etc/systemd/system/superbot.service
-  log "Installing systemd unit from $deploy"
+  deploy=$(trusted_deploy_dir)
+  unit="$SYSTEMD_DIR/superbot.service"
   if [[ "$DRY_RUN" == true ]]; then
-    log "[dry-run] would write $unit from $deploy/superbot.service"
+    log "[dry-run] would render $unit from $deploy/superbot.service (User=$SUPERBOT_USER, ExecStart=$BIN_DIR/botd)"
     return
   fi
-  sed -e "s|/home/superbot|$home|g" -e "s|User=superbot|User=$SUPERBOT_USER|g" \
-    -e "s|Group=superbot|Group=$SUPERBOT_USER|g" \
-    "$deploy/superbot.service" >"$unit"
+  log "Installing $unit from $deploy"
+  render_unit "$deploy/superbot.service" "$unit" "$(service_unit_fixed "$home")"
   systemctl daemon-reload
   systemctl enable superbot.service
   systemctl restart superbot.service
@@ -329,19 +396,18 @@ install_systemd() {
 install_backup() {
   local home deploy
   home=$(user_home)
-  deploy=$(resolve_deploy_dir)
-  run install -m 0755 "$deploy/superbot-backup.sh" "$BIN_DIR/superbot-backup"
+  deploy=$(trusted_deploy_dir)
+  run install -m 0755 -o root -g root "$deploy/superbot-backup.sh" "$BIN_DIR/superbot-backup"
   if [[ "$ENABLE_BACKUP" != true ]]; then
     return
   fi
-  log "Enabling daily backup timer from $deploy"
   if [[ "$DRY_RUN" == true ]]; then
-    log "[dry-run] would install backup timer units from $deploy"
+    log "[dry-run] would render $SYSTEMD_DIR/superbot-backup.{service,timer} from $deploy (User=$SUPERBOT_USER, ExecStart=$BIN_DIR/superbot-backup $home)"
     return
   fi
-  sed -e "s|/home/superbot|$home|g" -e "s|User=superbot|User=$SUPERBOT_USER|g" \
-    "$deploy/superbot-backup.service" >/etc/systemd/system/superbot-backup.service
-  cp "$deploy/superbot-backup.timer" /etc/systemd/system/superbot-backup.timer
+  log "Enabling daily backup timer from $deploy"
+  render_unit "$deploy/superbot-backup.service" "$SYSTEMD_DIR/superbot-backup.service" "$(backup_unit_fixed "$home")"
+  render_unit "$deploy/superbot-backup.timer" "$SYSTEMD_DIR/superbot-backup.timer" ""
   systemctl daemon-reload
   systemctl enable --now superbot-backup.timer
 }
@@ -437,7 +503,7 @@ main() {
     log "Upgrade mode: updating source and rebuilding"
   fi
   sync_repo
-  verify_deploy_templates
+  stage_trusted_deploy
   build_botd
   configure_env
   install_systemd
@@ -447,4 +513,7 @@ main() {
   summary
 }
 
-main "$@"
+# CI sources the functions without running the install.
+if [[ "${SUPERBOT_INSTALL_NO_MAIN:-}" != 1 ]]; then
+  main "$@"
+fi

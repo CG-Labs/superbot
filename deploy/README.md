@@ -11,7 +11,7 @@ curl -fsSL https://raw.githubusercontent.com/CG-Labs/superbot/main/deploy/instal
   --user-name "Alex"
 ```
 
-Re-run with `--upgrade` to pull latest `main`, rebuild, and restart (systemd/Caddy units are read from the cloned repo’s `deploy/` after pull):
+Re-run with `--upgrade` to pull latest `main`, rebuild, and restart. Root never installs units from the service user's checkout: it fetches the repo into a root-owned `/usr/local/share/superbot/src.git`, stages `deploy/` in `/usr/local/share/superbot/deploy`, and renders units with a fixed `User=`, paths, and `ExecStart=`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/CG-Labs/superbot/main/deploy/install.sh | sudo bash -s -- --upgrade
@@ -23,7 +23,7 @@ curl -fsSL https://raw.githubusercontent.com/CG-Labs/superbot/main/deploy/instal
 sudo deploy/install.sh --domain bots.example.com --tz UTC
 ```
 
-If flags are omitted, the script prompts on a TTY.
+If flags are omitted, the script prompts on a TTY. The checkout must not be owned by (or live under the home of) the service user; the installer refuses it otherwise.
 
 ## What it does
 
