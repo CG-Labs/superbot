@@ -53,11 +53,12 @@ pub struct Actor {
     /// (ALLOW_NO_AUTH), or `bot_token`. None for the system.
     #[serde(default)]
     pub method: Option<String>,
-    /// The SSO provider id (from SSO_PROVIDERS) and its type (`entra`, `google`, `oidc`, ...).
+    /// The SSO provider's type (`entra`, `google`, `oidc`, `github`, `apple`) and its
+    /// configured id (from SSO_PROVIDERS), as `idp` and `provider` are in sign-in details.
     #[serde(default)]
     pub idp: Option<String>,
     #[serde(default)]
-    pub idp_type: Option<String>,
+    pub idp_provider: Option<String>,
     /// The session id (never its token).
     #[serde(default)]
     pub session: Option<String>,
@@ -504,9 +505,9 @@ pub struct Filter {
     pub actor_email: Option<String>,
     /// Sign-in methods: `password`, `code`, `sso`, `none`, `bot_token`.
     pub methods: Vec<String>,
-    /// SSO provider id, and provider type.
+    /// SSO provider type, and configured provider id.
     pub idp: Option<String>,
-    pub idp_type: Option<String>,
+    pub idp_provider: Option<String>,
     /// IdP subject, `<issuer>|<sub>`, exactly.
     pub subject: Option<String>,
     pub session_id: Option<String>,
@@ -546,8 +547,8 @@ pub fn parse_time(s: &str, end: bool) -> Result<i64, String> {
 
 impl Filter {
     /// `?from=&to=&action=a,b.*&actor=user|bot|system[:id]&outcome=&bot=&before=&after=`,
-    /// and for people: `actor=user:<email>`, `method=sso,password`, `idp=<provider id>`,
-    /// `idpType=entra`, `subject=<issuer|sub>`, `session=<id>`, `onBehalfOf=<user id or email>`.
+    /// and for people: `actor=user:<email>`, `method=sso,password`, `idp=entra` (the type),
+    /// `idpProvider=<id>`, `subject=<issuer|sub>`, `session=<id>`, `onBehalfOf=<user id or email>`.
     pub fn from_query(q: &HashMap<String, String>) -> Result<Filter, String> {
         let get = |k: &str| q.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
         let mut f = Filter {
@@ -591,10 +592,10 @@ impl Filter {
             return Err("At most 10 methods".into());
         }
         let id = |k: &str| get(k).map(|v| if plain_id(v) { Ok(v.to_string()) } else { Err(format!("Invalid {k}")) }).transpose();
-        f.idp = id("idp")?;
+        f.idp_provider = id("idpProvider")?;
         f.session_id = id("session")?;
         f.on_behalf_of = id("onBehalfOf")?;
-        f.idp_type = get("idpType").map(|v| if word(v) { Ok(v.to_string()) } else { Err("Invalid idpType".to_string()) }).transpose()?;
+        f.idp = get("idp").map(|v| if word(v) { Ok(v.to_string()) } else { Err("Invalid idp".to_string()) }).transpose()?;
         if let Some(s) = get("subject") {
             if s.len() > 256 || s.chars().any(char::is_control) {
                 return Err("Invalid subject".into());
@@ -636,7 +637,7 @@ impl Filter {
         json!({
             "from": self.from, "to": self.to, "actions": self.actions, "actorKind": self.actor_kind,
             "actorId": self.actor_id, "actorEmail": self.actor_email, "methods": self.methods, "idp": self.idp,
-            "idpType": self.idp_type, "subject": self.subject, "sessionId": self.session_id, "onBehalfOf": self.on_behalf_of,
+            "idpProvider": self.idp_provider, "subject": self.subject, "sessionId": self.session_id, "onBehalfOf": self.on_behalf_of,
             "outcome": self.outcome, "botId": self.bot_id,
         })
     }
@@ -648,7 +649,7 @@ impl Filter {
 // fourteen by position keep working.
 
 pub const CSV_HEADER: &str = "id,time,actor_kind,actor_id,actor_name,actor_subject,action,target_type,target_id,bot_id,outcome,ip,user_agent,details,\
-actor_email,actor_role,auth_method,idp,idp_type,session_id,on_behalf_of\r\n";
+actor_email,actor_role,auth_method,idp,idp_provider,session_id,on_behalf_of\r\n";
 
 pub fn csv_cell(s: &str) -> String {
     let s = if s.starts_with(['=', '+', '-', '@', '\t', '\r']) { format!("'{s}") } else { s.to_string() };
@@ -680,7 +681,7 @@ pub fn csv_row(e: &AuditEvent) -> String {
         o(&e.actor_role),
         o(&e.auth_method),
         o(&e.idp),
-        o(&e.idp_type),
+        o(&e.idp_provider),
         o(&e.session_id),
         o(&e.on_behalf_of),
     ];
@@ -828,7 +829,7 @@ mod tests {
             actor_role: None,
             auth_method: Some("bot_token".into()),
             idp: None,
-            idp_type: None,
+            idp_provider: None,
             session_id: None,
             on_behalf_of: Some("u1".into()),
         };
@@ -850,14 +851,14 @@ mod tests {
             actor_role: Some("admin".into()),
             auth_method: Some("sso".into()),
             idp: Some("entra".into()),
-            idp_type: Some("entra".into()),
+            idp_provider: Some("work".into()),
             session_id: Some("s1".into()),
             on_behalf_of: None,
             ..e
         };
         let row = csv_row(&sso);
         let cells: Vec<&str> = row.trim_end().rsplitn(8, ',').collect();
-        assert_eq!(cells[..7], ["", "s1", "entra", "entra", "sso", "admin", "ada@example.com"]);
+        assert_eq!(cells[..7], ["", "s1", "work", "entra", "sso", "admin", "ada@example.com"]);
     }
 
     #[test]
@@ -982,8 +983,8 @@ mod tests {
         let f = q(&[
             ("actor", "user:ada@example.com"),
             ("method", "sso, password"),
-            ("idp", "work-entra"),
-            ("idpType", "entra"),
+            ("idpProvider", "work-entra"),
+            ("idp", "entra"),
             ("subject", "https://login.microsoftonline.com/t1/v2.0|oid 1"),
             ("session", "s0123abcd"),
             ("onBehalfOf", "u42"),
@@ -991,7 +992,7 @@ mod tests {
         .unwrap();
         assert_eq!((f.actor_kind.as_deref(), f.actor_id.as_deref(), f.actor_email.as_deref()), (Some("user"), None, Some("ada@example.com")));
         assert_eq!(f.methods, ["sso", "password"]);
-        assert_eq!((f.idp.as_deref(), f.idp_type.as_deref(), f.session_id.as_deref()), (Some("work-entra"), Some("entra"), Some("s0123abcd")));
+        assert_eq!((f.idp_provider.as_deref(), f.idp.as_deref(), f.session_id.as_deref()), (Some("work-entra"), Some("entra"), Some("s0123abcd")));
         assert_eq!((f.subject.as_deref(), f.on_behalf_of.as_deref()), (Some("https://login.microsoftonline.com/t1/v2.0|oid 1"), Some("u42")));
         let d = f.describe();
         assert_eq!((d["actorEmail"].as_str(), d["methods"][1].as_str(), d["onBehalfOf"].as_str()), (Some("ada@example.com"), Some("password"), Some("u42")));
@@ -1010,8 +1011,8 @@ mod tests {
             ("method", "SSO"),
             ("method", "sso;drop"),
             ("method", many.as_str()),
-            ("idp", "a b"),
-            ("idpType", "Entra"),
+            ("idpProvider", "a b"),
+            ("idp", "Entra"),
             ("session", "s1'--"),
             ("onBehalfOf", "u 1"),
             ("subject", "a\nb"),

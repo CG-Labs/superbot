@@ -440,7 +440,7 @@ fn claim_details(d: &mut Value, c: &Claims) {
 }
 
 /// The IdP's type (entra, google, oidc, apple, github), beside the configured id.
-fn idp_type(a: &Auth, provider: &str) -> Option<&'static str> {
+pub(crate) fn idp_type(a: &Auth, provider: &str) -> Option<&'static str> {
     a.sso.provider(provider).map(|p| p.type_name())
 }
 
@@ -461,9 +461,9 @@ fn failed(a: &Auth, source: &Source, provider: &str, reason: &str, c: Option<&Cl
     if let (Value::Object(d), Value::Object(e)) = (&mut d, extra) {
         d.extend(e);
     }
-    let idp = a.sso.provider(provider).map(|p| (p.id.clone(), p.type_name().to_string()));
-    let (idp, idp_type) = idp.unzip();
-    let actor = Actor { kind: ActorKind::User, subject: c.map(Claims::key), method: Some("sso".into()), idp, idp_type, ..Default::default() };
+    let idp = idp_type(a, provider).map(String::from);
+    let idp_provider = idp.is_some().then(|| provider.to_string());
+    let actor = Actor { kind: ActorKind::User, subject: c.map(Claims::key), method: Some("sso".into()), idp, idp_provider, ..Default::default() };
     a.record(Who { actor, source: source.clone() }.event("auth.login_failed").outcome(Outcome::Failure).details(d));
 }
 

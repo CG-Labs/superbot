@@ -220,9 +220,9 @@ pub struct AuditEvent {
     pub actor_role: Option<String>,
     /// "password" (break-glass), "code", "sso", "none" (ALLOW_NO_AUTH), or "bot_token".
     pub auth_method: Option<String>,
-    /// The SSO provider id, and its type ("entra", "google", "oidc", ...).
+    /// The SSO provider's type ("entra", "google", "oidc", "github", "apple"), and its configured id.
     pub idp: Option<String>,
-    pub idp_type: Option<String>,
+    pub idp_provider: Option<String>,
     pub session_id: Option<String>,
     /// The user a Bot or the scheduler acted for.
     pub on_behalf_of: Option<String>,
@@ -457,7 +457,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
         actor_role: r.get("actor_role")?,
         auth_method: r.get("auth_method")?,
         idp: r.get("idp")?,
-        idp_type: r.get("idp_type")?,
+        idp_provider: r.get("idp_provider")?,
         session_id: r.get("session_id")?,
         on_behalf_of: r.get("on_behalf_of")?,
     })
@@ -469,7 +469,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 6] =
     [migrate_approvals, migrate_audit_events, migrate_users, migrate_identities, migrate_bot_acls, migrate_audit_actors];
 
 /// The actor columns the audit log gained with per-user actors (ADR 0018).
-pub const AUDIT_ACTOR_COLUMNS: [&str; 7] = ["actor_email", "actor_role", "auth_method", "idp", "idp_type", "session_id", "on_behalf_of"];
+pub const AUDIT_ACTOR_COLUMNS: [&str; 7] = ["actor_email", "actor_role", "auth_method", "idp", "idp_provider", "session_id", "on_behalf_of"];
 
 /// Per-user audit actors (ADR 0018): each event says who acted as of then (email,
 /// role), how they signed in (method, SSO provider and type, session), and whom a Bot
@@ -1450,7 +1450,7 @@ impl Db {
         let a = &e.actor;
         let res = self.c().execute(
             "INSERT INTO audit_events (at, actor_kind, actor_id, actor_name, actor_subject, action, target_type, target_id, bot_id, outcome, ip, user_agent, details,
-               actor_email, actor_role, auth_method, idp, idp_type, session_id, on_behalf_of)
+               actor_email, actor_role, auth_method, idp, idp_provider, session_id, on_behalf_of)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 now(),
@@ -1469,8 +1469,8 @@ impl Db {
                 text(&a.email, 254),
                 o(&a.role, 16),
                 o(&a.method, 32),
-                o(&a.idp, 64),
-                o(&a.idp_type, 32),
+                o(&a.idp, 32),
+                o(&a.idp_provider, 64),
                 o(&a.session, 64),
                 o(&a.on_behalf_of, 128),
             ],
@@ -1517,7 +1517,7 @@ impl Db {
             ("actor_kind", &f.actor_kind),
             ("actor_id", &f.actor_id),
             ("idp", &f.idp),
-            ("idp_type", &f.idp_type),
+            ("idp_provider", &f.idp_provider),
             ("actor_subject", &f.subject),
             ("session_id", &f.session_id),
             ("on_behalf_of", &f.on_behalf_of),
@@ -1629,7 +1629,7 @@ mod tests {
             "DROP INDEX audit_events_on_behalf_of; DROP INDEX audit_events_session;
             ALTER TABLE audit_events DROP COLUMN actor_email; ALTER TABLE audit_events DROP COLUMN actor_role;
             ALTER TABLE audit_events DROP COLUMN auth_method; ALTER TABLE audit_events DROP COLUMN idp;
-            ALTER TABLE audit_events DROP COLUMN idp_type; ALTER TABLE audit_events DROP COLUMN session_id;
+            ALTER TABLE audit_events DROP COLUMN idp_provider; ALTER TABLE audit_events DROP COLUMN session_id;
             ALTER TABLE audit_events DROP COLUMN on_behalf_of; ALTER TABLE sessions DROP COLUMN idp_provider;
             ALTER TABLE messages DROP COLUMN requested_by;"
         };
@@ -1675,7 +1675,7 @@ mod tests {
                 role: Some("admin".into()),
                 method: Some("sso".into()),
                 idp: Some("entra".into()),
-                idp_type: Some("entra".into()),
+                idp_provider: Some("work".into()),
                 session: Some("s1".into()),
                 ..audit::Actor::operator()
             },
@@ -1686,8 +1686,8 @@ mod tests {
         db.record(&who.event("bot.updated"));
         let e = &all_events(&db)[0];
         assert_eq!(
-            (e.actor_email.as_deref(), e.actor_role.as_deref(), e.auth_method.as_deref(), e.idp.as_deref(), e.idp_type.as_deref(), e.session_id.as_deref()),
-            (Some("ada@example.com"), Some("admin"), Some("sso"), Some("entra"), Some("entra"), Some("s1"))
+            (e.actor_email.as_deref(), e.actor_role.as_deref(), e.auth_method.as_deref(), e.idp.as_deref(), e.idp_provider.as_deref(), e.session_id.as_deref()),
+            (Some("ada@example.com"), Some("admin"), Some("sso"), Some("entra"), Some("work"), Some("s1"))
         );
         assert!(db.c().execute("UPDATE audit_events SET actor_email = 'x'", []).is_err(), "still append-only");
     }
@@ -1953,8 +1953,8 @@ mod tests {
             id: Some(ada.id.clone()),
             email: Some("Ada@Example.com".into()),
             method: Some(method.into()),
-            idp: idp.map(String::from),
-            idp_type: idp.map(|_| "entra".into()),
+            idp: idp.map(|_| "entra".into()),
+            idp_provider: idp.map(String::from),
             subject: idp.map(|_| "https://login.example/t1/v2.0|oid-1".into()),
             session: Some(session.into()),
             ..audit::Actor::operator()
@@ -1981,8 +1981,8 @@ mod tests {
         assert_eq!(q(old_email), ["auth.login", "policy.updated", "bot.created"], "no such user now: matches the recorded email");
         assert_eq!(q(f("method", "sso")), ["bot.created"]);
         assert_eq!(q(f("method", "password,bot_token")), ["approval.requested", "policy.updated"]);
-        assert_eq!(q(f("idp", "work")), ["bot.created"]);
-        assert_eq!(q(f("idpType", "entra")), ["bot.created"]);
+        assert_eq!(q(f("idpProvider", "work")), ["bot.created"]);
+        assert_eq!(q(f("idp", "entra")), ["bot.created"]);
         assert_eq!(q(f("subject", "https://login.example/t1/v2.0|oid-1")), ["bot.created"]);
         assert_eq!(q(f("session", "s2")), ["policy.updated"]);
         assert_eq!(q(f("onBehalfOf", &ada.id)), ["routine.fired", "approval.requested"]);

@@ -182,7 +182,7 @@ pub struct Caller {
 /// method ("password", "code", "sso") wins. The subject is the SSO identity this
 /// session signed in with, else the user's own (first linked) identity.
 pub fn actor(a: &Auth, u: &User, s: Option<&Session>, method: &str) -> Actor {
-    let idp = s.and_then(|s| s.idp_provider.clone());
+    let provider = s.and_then(|s| s.idp_provider.clone());
     Actor {
         kind: ActorKind::User,
         id: Some(u.id.clone()),
@@ -195,8 +195,8 @@ pub fn actor(a: &Auth, u: &User, s: Option<&Session>, method: &str) -> Actor {
         email: u.email.clone(),
         role: Some(u.role.as_str().into()),
         method: Some(s.map_or(method, |s| s.method.as_str()).into()),
-        idp_type: idp.as_deref().and_then(|p| a.idp_type(p)),
-        idp,
+        idp: provider.as_deref().and_then(|p| crate::sso::idp_type(a, p)).map(String::from),
+        idp_provider: provider,
         session: s.map(|s| s.id.clone()),
         on_behalf_of: None,
     }

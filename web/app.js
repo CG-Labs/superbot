@@ -728,7 +728,8 @@ function renderAudit() {
   // A user's name from any loaded event, for "on behalf of".
   const nameOf = (id) => audit.events.find((x) => x.actorKind === "user" && x.actorId === id && x.actorName)?.actorName || id;
   const how = (e) => {
-    const sso = e.authMethod === "sso" && (e.idpType || e.idp) ? `SSO · ${e.idpType || e.idp}${e.idp && e.idp !== e.idpType ? ` (${e.idp})` : ""}` : null;
+    const ids = e.idp || e.idpProvider;
+    const sso = e.authMethod === "sso" && ids ? `SSO · ${ids}${e.idpProvider && e.idpProvider !== e.idp ? ` (${e.idpProvider})` : ""}` : null;
     return [e.actorRole, sso || SIGN_IN[e.authMethod] || e.authMethod, e.onBehalfOf && `for ${nameOf(e.onBehalfOf)}`].filter(Boolean).join(" · ");
   };
   const tip = (e) => [

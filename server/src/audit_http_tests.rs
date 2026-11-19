@@ -67,7 +67,7 @@ async fn people_are_recorded_with_how_they_signed_in() {
     assert_eq!(code, 200);
     let lines: Vec<&str> = csv.trim_end().split("\r\n").collect();
     assert_eq!(lines.len(), 2, "{csv}");
-    assert!(lines[0].ends_with(",details,actor_email,actor_role,auth_method,idp,idp_type,session_id,on_behalf_of"));
+    assert!(lines[0].ends_with(",details,actor_email,actor_role,auth_method,idp,idp_provider,session_id,on_behalf_of"));
     assert!(lines[1].ends_with(&format!(",ada@example.com,member,code,,,{ada_session},")), "{}", lines[1]);
     let exported = &events(port, &admin, "action=audit.exported").await[0];
     assert_eq!((exported["details"]["actorId"].as_str(), exported["details"]["actorEmail"].as_str()), (Some(ada.as_str()), None), "the email became her id");

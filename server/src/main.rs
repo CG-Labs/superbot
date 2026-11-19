@@ -449,11 +449,6 @@ impl Auth {
         }
         .method("bot_token")
     }
-
-    /// The type of an SSO provider ("entra", "google", "oidc", ...), for audit actors.
-    pub fn idp_type(&self, provider: &str) -> Option<String> {
-        self.sso.provider(provider).map(|p| p.type_name().to_string())
-    }
 }
 
 /// The client's IP and user agent. Behind a proxy on loopback (Caddy on the same

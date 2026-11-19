@@ -73,7 +73,7 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl audit export [filters] > audit.csv        All matching events as CSV, oldest first
     filters: --from <time> --to <time> --action <a,b.*> --actor <user|bot|system[:id]>
              --actor user:<email> --method <password,code,sso,none,bot_token>
-             --idp <provider id> --idp-type <entra|google|oidc|...> --subject <issuer|sub>
+             --idp <entra|google|oidc|github|apple> --idp-provider <id> --subject <issuer|sub>
              --session <id> --on-behalf-of <user id|email> --outcome <success|failure|denied> --bot <id>
     times: YYYY-MM-DD (UTC), RFC 3339, or unix milliseconds
   botctl secrets                                   List secret names (never values)
@@ -286,11 +286,11 @@ fn audit_query(rest: &[&str]) -> Result<String, String> {
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match *a {
-            "--from" | "--to" | "--action" | "--actor" | "--method" | "--idp" | "--idp-type" | "--subject" | "--session" | "--on-behalf-of" | "--outcome"
+            "--from" | "--to" | "--action" | "--actor" | "--method" | "--idp" | "--idp-provider" | "--subject" | "--session" | "--on-behalf-of" | "--outcome"
             | "--bot" | "--limit" => {
                 let v = it.next().ok_or(format!("{a} needs a value"))?;
                 let key = match *a {
-                    "--idp-type" => "idpType",
+                    "--idp-provider" => "idpProvider",
                     "--on-behalf-of" => "onBehalfOf",
                     k => &k[2..],
                 };
@@ -519,8 +519,8 @@ mod tests {
         );
         assert_eq!(audit_query(&["--to", "a b&c"]).unwrap(), "?to=a%20b%26c");
         assert_eq!(
-            audit_query(&["--actor", "user:ada@example.com", "--method", "sso,password", "--idp", "work", "--idp-type", "entra"]).unwrap(),
-            "?actor=user:ada%40example.com&method=sso,password&idp=work&idpType=entra"
+            audit_query(&["--actor", "user:ada@example.com", "--method", "sso,password", "--idp", "entra", "--idp-provider", "work"]).unwrap(),
+            "?actor=user:ada%40example.com&method=sso,password&idp=entra&idpProvider=work"
         );
         assert_eq!(
             audit_query(&["--subject", "https://idp.example/t1|oid-1", "--session", "s0a1b", "--on-behalf-of", "u42"]).unwrap(),
