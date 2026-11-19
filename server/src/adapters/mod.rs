@@ -39,7 +39,26 @@ pub struct RunInput {
     pub env: HashMap<String, String>,
     /// A private folder for this Bot's harness files.
     pub state_dir: PathBuf,
+    /// Set in ask mode: the harness must run `command` before every tool call.
+    pub guard: Option<Guard>,
 }
+
+/// The approval gate, as each adapter installs it in its harness's own hook format.
+/// The hook command exits 0 to allow, or 2 with a reason on stderr (and a
+/// PreToolUse deny on stdout) to block.
+#[derive(Clone)]
+pub struct Guard {
+    /// Shell command, e.g. `'/usr/local/bin/botctl' hook claude`.
+    pub command: String,
+    /// Hook timeout for the harness. Longer than `wait`, so a slow answer never fails open.
+    pub timeout_secs: u64,
+    /// Longest the server lets one approval wait.
+    pub wait: std::time::Duration,
+}
+
+/// Server secrets the harness (and everything it runs) must not inherit, or a Bot
+/// could approve its own actions.
+const SECRET_ENV: [&str; 2] = ["AUTH_PASSWORD", "SUPERBOT_PASSWORD"];
 
 pub trait Adapter: Send {
     fn bin(&self) -> &'static str;
@@ -131,7 +150,11 @@ pub async fn run(
     let args = adapter.args(&input, &mut out);
     out.drain(..).for_each(&mut emit);
 
-    let mut child = match Command::new(adapter.bin())
+    let mut cmd = Command::new(adapter.bin());
+    for k in SECRET_ENV {
+        cmd.env_remove(k);
+    }
+    let mut child = match cmd
         .args(&args)
         .current_dir(&input.cwd)
         .envs(&input.env)

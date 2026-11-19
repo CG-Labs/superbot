@@ -1,16 +1,22 @@
 //! Runs Bots: one task at a time per Bot, in order. Builds the system prompt
 //! (identity, rules, memory), streams harness events to the web app, and saves replies.
 
-use crate::adapters::{self, AbortReason, AgentEvent, RunInput};
+use crate::adapters::{self, AbortReason, AgentEvent, Guard, RunInput};
 use crate::db::{Bot, BotPatch, Db, Message};
+use crate::paths;
+use crate::policy::Mode;
 use crate::screen::{self, Screens};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, oneshot, watch};
+
+/// How long after a guarded run's first shell tool the approval hook must have
+/// called in. If it hasn't, the harness ignored the hook and the run is stopped.
+const HOOK_GRACE: Duration = Duration::from_secs(5);
 
 pub struct Config {
     pub data_dir: PathBuf,
@@ -28,6 +34,10 @@ struct Run {
     abort: watch::Sender<AbortReason>,
     status: String,
     draft: String,
+    /// Approval hook calls during this run.
+    hooks: Arc<AtomicU32>,
+    /// Longest an approval may wait: just under the harness's hook timeout.
+    hook_wait: Option<Duration>,
 }
 
 #[derive(Default)]
@@ -47,12 +57,37 @@ pub struct App {
     bots: Mutex<HashMap<String, BotState>>,
     /// Bots waiting on `botctl ask` or `botctl handoff`, by the message's id.
     waiters: Mutex<HashMap<i64, oneshot::Sender<String>>>,
+    /// Tool calls waiting on the user, by approval id. true = approved.
+    pub approval_waiters: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     closing: AtomicBool,
 }
 
 impl App {
     pub fn new(db: Db, cfg: Config, screens: Option<Screens>) -> Arc<App> {
-        Arc::new(App { db, cfg, tx: broadcast::channel(1024).0, screens, bots: Mutex::default(), waiters: Mutex::default(), closing: AtomicBool::new(false) })
+        Arc::new(App {
+            db,
+            cfg,
+            tx: broadcast::channel(1024).0,
+            screens,
+            bots: Mutex::default(),
+            waiters: Mutex::default(),
+            approval_waiters: Mutex::default(),
+            closing: AtomicBool::new(false),
+        })
+    }
+
+    /// Counts an approval hook call for the Bot's run. Returns how long an approval may wait.
+    pub fn note_hook(&self, bot_id: &str) -> Option<Duration> {
+        self.with_run(bot_id, |r| {
+            r.hooks.fetch_add(1, Ordering::SeqCst);
+            r.hook_wait
+        })
+    }
+
+    pub fn set_run_status(&self, bot_id: &str, status: &str) {
+        if self.with_run(bot_id, |r| { r.status = status.into(); true }) {
+            self.send(json!({ "type": "status", "botId": bot_id, "working": true, "status": status }));
+        }
     }
 
     pub fn is_running(&self, bot_id: &str) -> bool {
@@ -77,6 +112,7 @@ impl App {
         let mut v = json!({
             "id": b.id, "name": b.name, "color": b.color, "shape": b.shape, "harness": b.harness, "model": b.model, "effort": b.effort,
             "primary": b.primary, "hidden": b.hidden, "unread": b.unread, "preview": preview.unwrap_or_default(), "working": false,
+            "policy": self.db.effective_policy(&b.id).mode, "policyOverride": self.db.bot_override(&b.id).is_some(),
         });
         if let Some(run) = self.state().get(&b.id).and_then(|s| s.run.as_ref()) {
             v["working"] = json!(true);
@@ -97,24 +133,29 @@ impl App {
         self.send(json!({ "type": "message", "message": m, "bot": bot }));
     }
 
-    pub fn bot_dir(&self, id: &str) -> PathBuf {
-        self.cfg.data_dir.join("bots").join(id)
+    /// `DATA_DIR/bots/<id>`. None when the id isn't one plain folder name.
+    pub fn bot_dir(&self, id: &str) -> Option<PathBuf> {
+        paths::child(&paths::child(&paths::canonical(&self.cfg.data_dir)?, "bots")?, id)
     }
-    fn memory_file(&self, id: &str) -> PathBuf {
-        self.bot_dir(id).join("MEMORY.md")
+    fn memory_file(&self, id: &str) -> Option<PathBuf> {
+        paths::child(&self.bot_dir(id)?, "MEMORY.md")
     }
-    fn user_file(&self) -> PathBuf {
-        self.cfg.data_dir.join("USER.md")
+    fn user_file(&self) -> Option<PathBuf> {
+        paths::child(&paths::canonical(&self.cfg.data_dir)?, "USER.md")
     }
 
     pub fn init_bot_files(&self, bot: &Bot) {
-        let _ = std::fs::create_dir_all(self.bot_dir(&bot.id));
-        let mem = self.memory_file(&bot.id);
-        if !mem.exists() {
+        if let Some(dir) = self.bot_dir(&bot.id) {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Some(mem) = self.memory_file(&bot.id)
+            && !mem.exists()
+        {
             let _ = std::fs::write(&mem, format!("# {}\n\n## Job\n\nNot set yet. Ask the user.\n\n## Rules\n\n## Work log\n", bot.name));
         }
-        let user = self.user_file();
-        if !user.exists() {
+        if let Some(user) = self.user_file()
+            && !user.exists()
+        {
             let _ = std::fs::write(&user, format!("# About the user\n\n- Name: {}\n", self.cfg.user_name));
         }
     }
@@ -164,6 +205,9 @@ impl App {
         if adapters::get(&bot.harness).is_none() {
             return self.say(&bot.id, &format!("Unknown harness \"{}\".", bot.harness), true);
         }
+        let Some(bot_dir) = self.bot_dir(&bot.id) else {
+            return self.say(&bot.id, "This Bot's id isn't a safe folder name, so it can't run.", true);
+        };
         self.init_bot_files(&bot);
         self.db.set_status(msg.id, "running");
         let from = || msg.from_bot.as_deref().and_then(|id| self.db.bot(id)).map(|b| format!("{} (id {})", b.name, b.id)).unwrap_or("another Bot".into());
@@ -176,26 +220,44 @@ impl App {
 
         for attempt in 0..2 {
             let (abort_tx, abort_rx) = watch::channel(None);
-            self.state().entry(bot.id.clone()).or_default().run =
-                Some(Run { abort: abort_tx.clone(), status: "Thinking".into(), draft: String::new() });
+            // Ask mode: the harness calls `botctl hook` before every tool. Its hook timeout
+            // stays above our wait, so the hook is never killed into failing open.
+            let policy = self.db.effective_policy(&bot.id);
+            let guard = (policy.mode == Mode::Ask).then(|| {
+                let wait = Duration::from_secs(policy.timeout_minutes as u64 * 60 + 60);
+                let botctl = self.cfg.bin_dir.join("botctl").display().to_string();
+                Guard { command: format!("{} hook {}", shell_quote(&botctl), bot.harness), timeout_secs: wait.as_secs() + 60, wait }
+            });
+            let hooks = Arc::new(AtomicU32::new(0));
+            self.state().entry(bot.id.clone()).or_default().run = Some(Run {
+                abort: abort_tx.clone(),
+                status: "Thinking".into(),
+                draft: String::new(),
+                hooks: hooks.clone(),
+                hook_wait: guard.as_ref().map(|g| g.wait),
+            });
             self.send(json!({ "type": "status", "botId": bot.id, "working": true, "status": "Thinking" }));
             let timeout = self.cfg.run_timeout;
-            let timer = tokio::spawn(async move {
-                tokio::time::sleep(timeout).await;
-                abort_tx.send_if_modified(|r| r.get_or_insert("timeout") == &"timeout");
+            let timer = tokio::spawn({
+                let abort_tx = abort_tx.clone();
+                async move {
+                    tokio::time::sleep(timeout).await;
+                    abort_tx.send_if_modified(|r| r.get_or_insert("timeout") == &"timeout");
+                }
             });
 
             let mut env = HashMap::from([
                 ("BOT_ID".to_string(), bot.id.clone()),
                 ("BOT_API".to_string(), self.cfg.api_url.clone()),
                 ("BOT_TOKEN".to_string(), self.cfg.bot_token.clone()),
+                ("SUPERBOT_BOTCTL".to_string(), self.cfg.bin_dir.join("botctl").display().to_string()),
             ]);
             let path = std::env::var("PATH").unwrap_or_default();
             env.insert("PATH".into(), format!("{}:{path}", self.cfg.bin_dir.display()));
             if let Some(screens) = &self.screens
                 && let Some(info) = screens.ensure(&bot.id, |id| self.is_running(id)).await
             {
-                env.extend(screen::bot_env(&info, &bot.id, &self.bot_dir(&bot.id)));
+                env.extend(screen::bot_env(&info, &bot.id, &bot_dir));
             }
             let input = RunInput {
                 prompt: prompt.clone(),
@@ -205,12 +267,15 @@ impl App {
                 model: bot.model.clone(),
                 effort: bot.effort.clone(),
                 env,
-                state_dir: self.bot_dir(&bot.id),
+                state_dir: bot_dir.clone(),
+                guard: guard.clone(),
             };
 
             let mut errors: Vec<String> = Vec::new();
             let mut replies = 0;
             let id = bot.id.clone();
+            let mut canary: Option<tokio::task::JoinHandle<()>> = None;
+            let mut saw_shell = false;
             adapters::run(adapters::get(&bot.harness).unwrap(), input, abort_rx.clone(), |e| match e {
                 AgentEvent::Session(s) => {
                     if self.db.bot(&id).and_then(|b| b.session_id).as_deref() != Some(&s) {
@@ -227,6 +292,18 @@ impl App {
                     self.say(&id, &t, false);
                 }
                 AgentEvent::Tool { name, detail } => {
+                    // Fail closed: a guarded harness that runs a shell tool without ever
+                    // calling the hook isn't enforcing approvals, so stop it.
+                    if guard.is_some() && canary.is_none() && ["bash", "shell"].contains(&name.to_lowercase().as_str()) {
+                        saw_shell = true;
+                        let (hooks, abort) = (hooks.clone(), abort_tx.clone());
+                        canary = Some(tokio::spawn(async move {
+                            tokio::time::sleep(HOOK_GRACE).await;
+                            if hooks.load(Ordering::SeqCst) == 0 {
+                                abort.send_if_modified(|r| r.get_or_insert("unguarded") == &"unguarded");
+                            }
+                        }));
+                    }
                     let status = tool_label(&name, &detail);
                     self.with_run(&id, |r| r.status = status.clone());
                     self.send(json!({ "type": "status", "botId": id, "working": true, "status": status }));
@@ -235,6 +312,14 @@ impl App {
             })
             .await;
             timer.abort();
+            if let Some(c) = canary {
+                c.abort();
+            }
+            // A run that ends before the canary fires still has to report a missing hook.
+            if saw_shell && hooks.load(Ordering::SeqCst) == 0 {
+                abort_tx.send_if_modified(|r| r.get_or_insert("unguarded") == &"unguarded");
+            }
+            self.cancel_approvals(&id, "The task ended");
             // Done running. The stream may have ended without a final block: keep what was streamed.
             let draft = self.state().get_mut(&id).and_then(|s| s.run.take()).map(|r| r.draft).unwrap_or_default();
             if !draft.trim().is_empty() {
@@ -258,6 +343,20 @@ impl App {
             match *abort_rx.borrow() {
                 Some("shutdown") => {}
                 Some("stopped") => self.say(&id, "Stopped.", true),
+                Some("unguarded") => self.say(
+                    &id,
+                    &format!(
+                        "I stopped: {} ran a command without checking SuperBot's approval gate, so approvals aren't enforced for me. \
+                         Update the {} CLI, or set my approvals to bypass (dev only).",
+                        bot.harness, bot.harness
+                    ),
+                    true,
+                ),
+                Some("policy") => self.say(
+                    &id,
+                    "I stopped: approvals were turned on while I was working without them. Send the task again and I'll ask before risky steps.",
+                    true,
+                ),
                 Some("timeout") => {
                     let mins = self.cfg.run_timeout.as_secs() / 60;
                     self.say(&id, &format!("I hit the {mins} minute limit for one task and stopped."), true)
@@ -340,13 +439,30 @@ impl App {
 
     /// Stops the current task and drops queued ones.
     pub fn stop(&self, bot_id: &str) {
-        let mut st = self.state();
-        if let Some(s) = st.get_mut(bot_id) {
-            for m in s.queue.drain(..) {
-                self.db.set_status(m.id, "done");
+        {
+            let mut st = self.state();
+            if let Some(s) = st.get_mut(bot_id) {
+                for m in s.queue.drain(..) {
+                    self.db.set_status(m.id, "done");
+                }
+                if let Some(r) = &s.run {
+                    r.abort.send_if_modified(|v| v.get_or_insert("stopped") == &"stopped");
+                }
             }
-            if let Some(r) = &s.run {
-                r.abort.send_if_modified(|v| v.get_or_insert("stopped") == &"stopped");
+        }
+        self.cancel_approvals(bot_id, "The Bot was stopped");
+    }
+
+    /// After a policy change: a run that started in bypass has no approval hook, so
+    /// once its Bot is in ask mode it must stop rather than keep acting unchecked.
+    pub fn stop_unguarded_runs(&self) {
+        let unguarded: Vec<String> = self.state().iter().filter(|(_, s)| s.run.as_ref().is_some_and(|r| r.hook_wait.is_none())).map(|(id, _)| id.clone()).collect();
+        for id in unguarded {
+            if self.db.effective_policy(&id).mode != Mode::Ask {
+                continue;
+            }
+            if let Some(r) = self.state().get(&id).and_then(|s| s.run.as_ref()).filter(|r| r.hook_wait.is_none()) {
+                r.abort.send_if_modified(|v| v.get_or_insert("policy") == &"policy");
             }
         }
     }
@@ -368,6 +484,7 @@ impl App {
     /// After a restart: queued messages run. Interrupted ones are reported, not
     /// re-run, because re-running could repeat actions like sending an email.
     pub fn recover(self: &Arc<Self>) {
+        self.expire_stale_approvals();
         for m in self.db.pending() {
             if self.db.bot(&m.bot_id).is_none() {
                 continue;
@@ -382,7 +499,8 @@ impl App {
     }
 
     fn system_prompt(&self, bot: &Bot) -> String {
-        let read = |p: PathBuf| std::fs::read_to_string(p).unwrap_or_default().trim().to_string();
+        let read = |p: &Option<PathBuf>| p.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default().trim().to_string();
+        let (mem_file, user_file) = (self.memory_file(&bot.id), self.user_file());
         let others: Vec<String> =
             self.db.bots().iter().filter(|b| b.id != bot.id).map(|b| format!("- {} (id {})", b.name, b.id)).collect();
         let primary = if bot.primary {
@@ -416,7 +534,7 @@ They talk to you in a chat app, like messaging a coworker. Finish work end to en
 ## Style
 - Reply like a teammate in chat: short, plain English. Markdown is fine.
 - Each separate text block you write is shown as its own chat bubble. Before long work, send a one-line heads-up.
-- Ask before anything you can't undo: sending messages, publishing, deleting, paying.
+- Ask before anything you can't undo: sending messages, publishing, deleting, paying.{approvals}
 - To ask a multiple-choice question, end your reply with this block, and nothing after it:
 ```question
 {{"title": "Your question?", "options": ["First", "Second", "Third"]}}
@@ -433,15 +551,47 @@ Current time: {now}."#,
             botctl = self.cfg.bin_dir.join("botctl").display(),
             screen = if self.screens.is_some() { screen_prompt(&self.cfg.bin_dir.join("botctl").display().to_string()) } else { String::new() },
             user = self.cfg.user_name,
+            approvals = if self.db.effective_policy(&bot.id).mode == Mode::Ask {
+                "\n- Risky actions (destructive commands, deleting outside your folder, sending messages, installing software, git push) \
+                 pause until the user approves them in the app. If one is denied, don't try another way to do it; tell the user what you wanted to do."
+            } else {
+                ""
+            },
             ws = self.cfg.workspace.display(),
-            mem_path = self.memory_file(&bot.id).display(),
-            user_path = self.user_file().display(),
-            mem = read(self.memory_file(&bot.id)),
-            user_facts = read(self.user_file()),
+            mem_path = mem_file.clone().unwrap_or_default().display(),
+            user_path = user_file.clone().unwrap_or_default().display(),
+            mem = read(&mem_file),
+            user_facts = read(&user_file),
             others = if others.is_empty() { "None yet.".into() } else { others.join("\n") },
             now = chrono::Local::now().format("%A, %B %-d, %Y, %H:%M (UTC%:z)"),
         )
     }
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+pub fn test_app() -> Arc<App> {
+    let dir = crate::db::temp_path("app");
+    let db = Db::open(&dir.join("app.sqlite")).unwrap();
+    let workspace = dir.join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    App::new(
+        db,
+        Config {
+            data_dir: dir.clone(),
+            workspace,
+            user_name: "Tester".into(),
+            bin_dir: dir,
+            api_url: "http://127.0.0.1:1".into(),
+            bot_token: crate::random_hex(16),
+            run_timeout: Duration::from_secs(60),
+            default_harness: "claude".into(),
+        },
+        None,
+    )
 }
 
 /// Splits off a trailing ```question {json}``` block.
@@ -486,4 +636,52 @@ fn screen_prompt(botctl: &str) -> String {
 - When you need the user on your screen (a login, 2FA code, CAPTCHA, or payment check), run: {botctl} handoff "<what you need, in one line>". It waits until they finish, so give the command a 10 minute timeout. Never ask for passwords in chat.
 "#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bot_files_stay_in_the_data_folder() {
+        let app = test_app();
+        let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
+        app.init_bot_files(&bot);
+        let dir = app.bot_dir(&bot.id).unwrap();
+        assert_eq!(dir, app.cfg.data_dir.join("bots").join(&bot.id));
+        assert!(app.memory_file(&bot.id).unwrap().is_file());
+        assert!(app.user_file().unwrap().is_file());
+        for bad in ["", "..", "../../etc", "a/b", "/etc"] {
+            assert_eq!(app.bot_dir(bad), None, "{bad:?}");
+            assert_eq!(app.memory_file(bad), None, "{bad:?}");
+        }
+    }
+
+    fn fake_run(app: &App, bot_id: &str, guarded: bool) -> watch::Receiver<AbortReason> {
+        let (tx, rx) = watch::channel(None);
+        let hook_wait = guarded.then_some(Duration::from_secs(60));
+        app.state().entry(bot_id.into()).or_default().run =
+            Some(Run { abort: tx, status: String::new(), draft: String::new(), hooks: Default::default(), hook_wait });
+        rx
+    }
+
+    #[test]
+    fn turning_on_approvals_stops_runs_without_the_hook() {
+        let app = test_app();
+        let a = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
+        let b = app.db.create_bot("B", "#fff", "waddle", "claude", None, false);
+        let mut p = app.db.global_policy();
+        p.mode = Mode::Bypass;
+        app.db.set_global_policy(&p);
+        let (unguarded, guarded) = (fake_run(&app, &a.id, false), fake_run(&app, &b.id, true));
+
+        app.stop_unguarded_runs();
+        assert_eq!(*unguarded.borrow(), None, "still bypass");
+
+        p.mode = Mode::Ask;
+        app.db.set_global_policy(&p);
+        app.stop_unguarded_runs();
+        assert_eq!(*unguarded.borrow(), Some("policy"));
+        assert_eq!(*guarded.borrow(), None);
+    }
 }

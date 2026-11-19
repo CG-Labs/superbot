@@ -307,3 +307,23 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .switch span { position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: #fff; transition: transform .15s; }
 .switch.on { background: var(--blue); }
 .switch.on span { transform: translateX(16px); }
+
+/* Approvals */
+.approvals-btn { margin-top: 2px; }
+.approvals-btn .count { min-width: 22px; text-align: center; }
+.approvals-btn.waiting { color: var(--text); }
+.approvals-btn.waiting .count { background: #e5484d; color: #fff; border-radius: 999px; padding: 0 7px; font-size: 13px; line-height: 22px; }
+.approval { width: 760px; max-width: 100%; background: var(--bg-bubble); border: 1px solid #3a2f1d; border-radius: 20px; padding: 14px 18px 12px; }
+.ap-head { display: flex; align-items: center; gap: 8px; font-size: 15px; color: var(--text-dim); }
+.ap-head b { color: var(--text); font-weight: 500; }
+.ap-what code { font-size: 13.5px; color: var(--text); }
+.ap-reason { margin: 6px 0 8px; font-size: 16px; color: #e9a23b; }
+.ap-subject { margin: 0 0 10px; padding: 10px 12px; background: #151515; border-radius: 10px; font-size: 13.5px; white-space: pre-wrap; word-break: break-all; max-height: 180px; overflow-y: auto; }
+.ap-foot { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.ap-foot .nb-btn { padding: 6px 18px; font-size: 15px; }
+.ap-foot .nb-btn:disabled { opacity: .5; cursor: default; }
+.ap-remember { margin-right: auto; font-size: 14px; color: var(--text-dim); display: flex; align-items: center; gap: 6px; }
+.ap-left { font-size: 13px; color: var(--text-faint); }
+.ap-modal { width: 820px; }
+.ap-body { align-items: stretch; gap: 12px; }
+.ap-body .approval { width: auto; }

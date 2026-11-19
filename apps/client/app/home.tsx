@@ -2,6 +2,7 @@ import React, { useState } from "react";
 import { StyleSheet, useWindowDimensions, View } from "react-native";
 import { Redirect } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { ApprovalsInbox } from "../components/ApprovalsInbox";
 import { BotDetailsPanel } from "../components/BotDetailsPanel";
 import { ChatView } from "../components/ChatView";
 import { CreateBotModal } from "../components/CreateBotModal";
@@ -16,6 +17,7 @@ export default function HomeScreen() {
   const [mobilePane, setMobilePane] = useState<"list" | "chat">("list");
   const [createOpen, setCreateOpen] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const [approvalsOpen, setApprovalsOpen] = useState(false);
 
   if (!api) {
     return <Redirect href="/" />;
@@ -39,6 +41,7 @@ export default function HomeScreen() {
             onSelectBot={onSelectBot}
             onNewBot={() => setCreateOpen(true)}
             onLogout={onLogout}
+            onOpenApprovals={() => setApprovalsOpen(true)}
           />
         ) : null}
         {wide || mobilePane === "chat" ? (
@@ -56,6 +59,7 @@ export default function HomeScreen() {
         }}
       />
       <BotDetailsPanel visible={detailsOpen} onClose={() => setDetailsOpen(false)} />
+      <ApprovalsInbox visible={approvalsOpen} onClose={() => setApprovalsOpen(false)} />
     </SafeAreaView>
   );
 }

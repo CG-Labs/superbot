@@ -40,7 +40,7 @@ What exists in **CG-Labs/superbot** today:
 |------|---------|
 | **Auth** | Single `AUTH_PASSWORD` (Basic); optional `ALLOW_NO_AUTH` on loopback only; `ALLOWED_HOSTS`; per-start `BOT_TOKEN` for `botctl`. No user table, no SSO, no RBAC. |
 | **Client** | Login, SSE chat, bots CRUD, models/effort, routines **enable/disable only**; no screen viewer, handoff UI, routine editor, push, or biometric lock; placeholder EAS `projectId`; template branding. |
-| **Server** | SQLite single-tenant schema; harnesses run with **permission bypass** (`--dangerously-skip-permissions` / Codex equivalents); approvals and Vault **not built** (`docs/backend.md`). |
+| **Server** | SQLite single-tenant schema; harnesses run with their own prompts off, gated by the SuperBot **policy engine and approval queue** (default **ask** on fresh installs; [ADR 0007](adr/0007-approvals.md)); Vault **not built** (`docs/backend.md`). |
 | **Deploy** | Ubuntu bash installer, systemd, Caddy, daily SQLite backup timer; Docker Compose (`Dockerfile` + `deploy/docker/`: `botd`, Caddy, backup sidecar), smoke-tested in CI ([ADR 0006](adr/0006-docker-compose.md)). |
 | **Multi-tenancy** | One deployment = one org in practice (`DATA_DIR`, shared `WORKSPACE_DIR`). |
 | **Observability** | `journalctl`, healthz; no metrics/tracing product. |
@@ -154,7 +154,7 @@ Basic auth may remain for **break-glass** and **self-host hobby** tiers only, be
 
 | Topic | Today | Roadmap direction |
 |-------|--------|-------------------|
-| Harness permissions | Bypass flags on all adapters | Policy engine: default **ask** for risky tools; bypass only in dev profiles |
+| Harness permissions | Bypass flags on all adapters | Policy engine: default **ask** for risky tools; bypass only in dev profiles (**done**: [ADR 0007](adr/0007-approvals.md)) |
 | Compute isolation | One OS user, shared workspace | Tenant workspaces (M3); optional per-bot containers (M5) |
 | Secrets | Harness logins on service user disk | Vault + short-lived tokens (M1→M5) |
 | Network | Caddy TLS, loopback `botd` | Same + mTLS internal where multi-service |
@@ -248,7 +248,7 @@ No certification claims until audits complete.
 
 | Horizon | Focus |
 |---------|--------|
-| **Now** | Dogfood on Linode; client parity for routines + screen; Compose image; approvals design ADR |
+| **Now** | Dogfood on Linode; client parity for routines + screen; Compose image; approvals follow-ups ([list](approvals-followups.md)) |
 | **Next** | Multi-user data model; Entra + Google OIDC; RBAC v1; private beta billing |
 | **Later** | Public launch + stores; managed multi-tenant; SCIM; SOC 2; per-bot sandboxes |
 

@@ -1,0 +1,139 @@
+import React, { useState } from "react";
+import { Modal, Pressable, ScrollView, StyleSheet, Switch, Text, View } from "react-native";
+import { useSuperBot } from "../src/SuperBotContext";
+import { colors } from "../src/theme";
+import type { Approval } from "../src/types";
+import { BotAvatar } from "./BotAvatar";
+
+interface Props {
+  visible: boolean;
+  onClose: () => void;
+}
+
+function minutesLeft(a: Approval): string {
+  const m = Math.max(0, Math.ceil((a.expiresAt - Date.now()) / 60000));
+  return m <= 1 ? "under a minute" : `${m} minutes`;
+}
+
+export function ApprovalCard({ approval: a }: { approval: Approval }) {
+  const { bots, decideApproval } = useSuperBot();
+  const bot = bots.find((b) => b.id === a.botId);
+  const [remember, setRemember] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const decide = async (approve: boolean) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await decideApproval(a.id, approve, remember);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed");
+      setBusy(false);
+    }
+  };
+
+  return (
+    <View style={styles.card}>
+      <View style={styles.head}>
+        {bot ? <BotAvatar color={bot.color} shape={bot.shape} size={22} /> : null}
+        <Text style={styles.who}>{bot?.name ?? "A Bot"}</Text>
+        <Text style={styles.dim}>wants to run {a.tool}</Text>
+      </View>
+      <Text style={styles.reason}>{a.reason}</Text>
+      <Text style={styles.subject} selectable>
+        {a.subject}
+      </Text>
+      <View style={styles.row}>
+        <Switch value={remember} onValueChange={setRemember} />
+        <Text style={[styles.dim, { flex: 1 }]}>Remember for {bot?.name ?? "this Bot"}</Text>
+        <Text style={styles.faint}>Denied in {minutesLeft(a)}</Text>
+      </View>
+      {error ? <Text style={styles.error}>{error}</Text> : null}
+      <View style={styles.actions}>
+        <Pressable style={styles.btn} disabled={busy} onPress={() => void decide(false)}>
+          <Text style={styles.btnText}>Deny</Text>
+        </Pressable>
+        <Pressable style={[styles.btn, styles.primary]} disabled={busy} onPress={() => void decide(true)}>
+          <Text style={[styles.btnText, styles.primaryText]}>Approve</Text>
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
+export function ApprovalsInbox({ visible, onClose }: Props) {
+  const { approvals, policy, setGlobalPolicy } = useSuperBot();
+  const ask = policy?.mode !== "bypass";
+
+  return (
+    <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
+      <View style={styles.backdrop}>
+        <View style={styles.panel}>
+          <View style={styles.titleRow}>
+            <Text style={styles.title}>Approvals</Text>
+            <Pressable onPress={onClose}>
+              <Text style={styles.close}>✕</Text>
+            </Pressable>
+          </View>
+          <ScrollView contentContainerStyle={{ gap: 12 }}>
+            {approvals.length ? (
+              approvals.map((a) => <ApprovalCard key={a.id} approval={a} />)
+            ) : (
+              <Text style={styles.empty}>Nothing is waiting for you.</Text>
+            )}
+          </ScrollView>
+          <View style={styles.row}>
+            <Text style={[styles.dim, { flex: 1 }]}>Ask before risky actions (all Bots)</Text>
+            <Switch value={ask} onValueChange={(v) => void setGlobalPolicy(v ? "ask" : "bypass")} />
+          </View>
+          {!ask ? <Text style={styles.faint}>Bypass: Bots run everything without asking. Dev only.</Text> : null}
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+const styles = StyleSheet.create({
+  backdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.5)", justifyContent: "flex-end" },
+  panel: {
+    backgroundColor: colors.bgSidebar,
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    padding: 20,
+    maxHeight: "85%",
+    gap: 12,
+  },
+  titleRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  title: { color: colors.text, fontSize: 20, fontWeight: "600" },
+  close: { color: colors.textDim, fontSize: 22 },
+  card: {
+    backgroundColor: colors.bgBubble,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "#3a2f1d",
+    padding: 14,
+    gap: 8,
+  },
+  head: { flexDirection: "row", alignItems: "center", gap: 8 },
+  who: { color: colors.text, fontWeight: "500" },
+  reason: { color: colors.warning, fontSize: 16 },
+  subject: {
+    color: colors.text,
+    backgroundColor: "#151515",
+    borderRadius: 10,
+    padding: 10,
+    fontFamily: "monospace",
+    fontSize: 13,
+  },
+  row: { flexDirection: "row", alignItems: "center", gap: 10 },
+  actions: { flexDirection: "row", justifyContent: "flex-end", gap: 10 },
+  btn: { paddingVertical: 8, paddingHorizontal: 18, borderRadius: 999, borderWidth: 1, borderColor: "#3a3a3a" },
+  btnText: { color: colors.text, fontSize: 15 },
+  primary: { backgroundColor: "#f2f2f2", borderColor: "#f2f2f2" },
+  primaryText: { color: "#111" },
+  dim: { color: colors.textDim },
+  faint: { color: colors.textFaint, fontSize: 13 },
+  error: { color: colors.danger },
+  empty: { color: colors.textFaint, padding: 12, textAlign: "center" },
+});
