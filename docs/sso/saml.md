@@ -172,6 +172,8 @@ botctl audit 5 --action auth.login_failed          # details.subject on the not_
 botctl user link ada@example.com adfs <subject>
 ```
 
+Admins can also link it in the app: **Users**, pick the person, then **Single sign-on** ([ADR 0021](../adr/0021-admin-portal.md)).
+
 SAML subjects are compared without case: Keycloak lowercases the NameID before passing it on, and SuperBot lowercases what you link.
 
 **Or just in time.** With `SSO_ADFS_JIT_ROLE=member`, anyone your IdP lets into the SuperBot app becomes a member. Limit who that is at the IdP (ADFS: the relying party's access control policy; Okta: app assignments), and to be sure, with `SSO_ADFS_ALLOWED_DOMAINS`. If someone's email already belongs to another SuperBot user, sign-in is refused until an admin links them.

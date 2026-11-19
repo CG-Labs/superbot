@@ -277,8 +277,32 @@ pub fn user_view(u: &User) -> Value {
     json!({
         "id": u.id, "email": u.email, "name": u.name, "role": u.role, "status": u.status,
         "breakGlass": u.id == OPERATOR, "idpIssuer": u.idp_issuer, "idpSubject": u.idp_subject,
-        "createdAt": u.created_at, "updatedAt": u.updated_at,
+        "createdAt": u.created_at, "updatedAt": u.updated_at, "lastLoginAt": u.last_login_at,
     })
+}
+
+/// A user as the admin portal lists them: how they last signed in, in the audit log's
+/// terms (`authMethod`, `idp`, `idpProvider`, ADR 0019), their linked sign-ins, and any
+/// code still waiting to be used (never the code itself, only its count and expiry).
+fn admin_view(a: &Auth, u: &User, identities: &[db::Identity], pending: Option<&(i64, i64)>) -> Value {
+    let idp = |provider: &str| crate::sso::idp_type(a, provider);
+    let mut v = user_view(u);
+    v["lastLogin"] = match u.last_login_at {
+        None => Value::Null,
+        Some(at) => json!({
+            "at": at, "authMethod": u.last_login_method, "idpProvider": u.last_login_idp_provider,
+            "idp": u.last_login_idp_provider.as_deref().and_then(idp),
+        }),
+    };
+    v["identities"] = json!(identities
+        .iter()
+        .map(|i| json!({
+            "id": i.id, "provider": i.provider, "idp": idp(&i.provider), "subject": i.subject, "email": i.email,
+            "createdAt": i.created_at, "lastLoginAt": i.last_login_at,
+        }))
+        .collect::<Vec<_>>());
+    v["pendingCodes"] = pending.map_or(Value::Null, |(n, exp)| json!({ "count": n, "expiresAt": exp }));
+    v
 }
 
 fn session_view(s: &Session, cfg: &SessionConfig) -> Value {
@@ -424,12 +448,37 @@ pub fn need_user_key(app: &AppState, key: &str) -> Res<User> {
     app.db.find_user(key).ok_or_else(|| not_found("User"))
 }
 
-pub async fn list_users(State(app): State<AppState>) -> Json<Value> {
-    Json(json!(app.db.users().iter().map(user_view).collect::<Vec<_>>()))
+pub async fn list_users(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>) -> Json<Value> {
+    let ids = app.db.all_identities();
+    let codes = app.db.pending_codes(db::now());
+    let list: Vec<Value> = app.db.users().iter().map(|u| admin_view(&a, u, ids.get(&u.id).map_or(&[], Vec::as_slice), codes.get(&u.id))).collect();
+    Json(json!(list))
 }
 
-pub async fn get_user(State(app): State<AppState>, Path(key): Path<String>) -> Res {
-    Ok(Json(user_view(&need_user_key(&app, &key)?)))
+pub async fn get_user(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Path(key): Path<String>) -> Res {
+    let u = need_user_key(&app, &key)?;
+    Ok(Json(admin_view(&a, &u, &app.db.identities(&u.id), app.db.pending_codes(db::now()).get(&u.id))))
+}
+
+/// `GET /api/users/{key}/bots`: the Bots this user can see, with their access and any
+/// grant, as ADR 0017 decides it for their role now. Read-only; grants are changed per Bot.
+pub async fn user_bots(State(app): State<AppState>, Path(key): Path<String>) -> Res {
+    let u = need_user_key(&app, &key)?;
+    let viewer = if u.role == Role::Admin { crate::acl::Viewer::All } else { crate::acl::Viewer::User { id: u.id.clone(), role: u.role } };
+    let grants = app.db.user_grants(&u.id);
+    let owners: HashMap<String, String> = app.db.users().into_iter().map(|o| (o.id, o.name)).collect();
+    let list: Vec<Value> = viewer
+        .bots(&app.db)
+        .into_iter()
+        .map(|(b, access)| {
+            json!({
+                "bot": { "id": b.id, "name": b.name, "color": b.color, "shape": b.shape },
+                "owner": { "id": b.owner_id, "name": owners.get(&b.owner_id) },
+                "visibility": b.visibility, "access": access, "grant": grants.get(&b.id),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "user": user_view(&u), "active": u.active(), "bots": list })))
 }
 
 /// `{email, name?, role?}`. Role defaults to member.
@@ -478,6 +527,9 @@ pub async fn update_user(State(app): State<AppState>, Extension(by): Extension<W
     if before.id == OPERATOR && demotes {
         return Err(ApiError(StatusCode::CONFLICT, "The owner (break-glass) account stays an active admin. Set AUTH_BREAK_GLASS=0 to turn password sign-in off.".into()));
     }
+    if demotes && by.actor.id.as_deref() == Some(before.id.as_str()) {
+        return Err(ApiError(StatusCode::CONFLICT, "You can't demote or disable yourself. Ask another admin.".into()));
+    }
     app.db.update_user(&before.id, p).map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
     let after = need_user_key(&app, &before.id)?;
     let ev = |action: &str| by.event(action).target("user", &after.id);
@@ -510,16 +562,25 @@ pub async fn update_user(State(app): State<AppState>, Extension(by): Extension<W
     Ok(Json(user_view(&after)))
 }
 
-/// `{ttlMinutes?}` (default 60, up to 7 days). Returns the code once; only its hash is kept.
-pub async fn create_login_code(State(app): State<AppState>, Extension(by): Extension<Who>, Path(key): Path<String>, body: axum::body::Bytes) -> Res {
+/// `{ttlMinutes?, replace?}` (default 60, up to 7 days). Returns the code once; only its
+/// hash is kept. `replace: true` first drops the user's unused codes, so a regenerated
+/// invite is the only one that works.
+pub async fn create_login_code(State(app): State<AppState>, Extension(by): Extension<Who>, Path(key): Path<String>, body: axum::body::Bytes) -> Res<Response> {
     let u = need_user_key(&app, &key)?;
     if !u.active() {
         return Err(ApiError(StatusCode::CONFLICT, "This user is disabled. Enable them first.".into()));
     }
     let v: Value = if body.iter().all(u8::is_ascii_whitespace) { Value::Null } else { serde_json::from_slice(&body).map_err(|e| bad(format!("Invalid JSON: {e}")))? };
     let ttl = code_ttl(&v["ttlMinutes"], 60)?;
-    let (code, expires) = issue_code(&app, &by, &u, ttl);
-    Ok(Json(json!({ "code": code, "expiresAt": expires, "user": user_view(&u) })))
+    let replace = match &v["replace"] {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        _ => return Err(bad("replace must be true or false")),
+    };
+    let (code, expires) = issue_code(&app, &by, &u, ttl, replace);
+    let mut res = Json(json!({ "code": code, "expiresAt": expires, "user": user_view(&u) })).into_response();
+    res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(res)
 }
 
 /// `ttlMinutes` for a sign-in code: 1 minute to 7 days.
@@ -531,12 +592,18 @@ pub fn code_ttl(v: &Value, default: i64) -> Res<i64> {
 }
 
 /// A new one-time sign-in code for `u`, good for `ttl` minutes. Returns the code (only
-/// its hash is kept) and when it expires.
-pub fn issue_code(app: &AppState, by: &Who, u: &User, ttl: i64) -> (String, i64) {
+/// its hash is kept) and when it expires. `replace` drops the user's unused codes first.
+pub fn issue_code(app: &AppState, by: &Who, u: &User, ttl: i64, replace: bool) -> (String, i64) {
     let code = new_secret(CODE_PREFIX);
     let expires = db::now() + ttl * MINUTE;
-    app.db.add_login_code(&hash(&code), &u.id, by.actor.id.as_deref().unwrap_or(""), expires);
-    app.db.record(&by.event("user.login_code_created").target("user", &u.id).details(json!({ "ttlMinutes": ttl })));
+    let created_by = by.actor.id.as_deref().unwrap_or("");
+    let mut details = json!({ "ttlMinutes": ttl });
+    if replace {
+        details["replaced"] = json!(app.db.replace_login_codes(&hash(&code), &u.id, created_by, expires));
+    } else {
+        app.db.add_login_code(&hash(&code), &u.id, created_by, expires);
+    }
+    app.db.record(&by.event("user.login_code_created").target("user", &u.id).details(details));
     (code, expires)
 }
 
@@ -726,6 +793,28 @@ mod tests {
         db.update_user(OPERATOR, UserPatch { status: Some("active"), ..Default::default() }).unwrap();
         assert_eq!(db.revoke_user_sessions(OPERATOR, "x", "test"), 1);
         assert_eq!(db.prune_sessions(db::now() + 1, cfg.idle_ms, cfg.max_ms), 2);
+    }
+
+    #[test]
+    fn replacing_codes_at_once_leaves_one() {
+        let db = std::sync::Arc::new(db::Db::open(&db::temp_path("replace").join("app.sqlite")).unwrap());
+        let u = db.create_user(None, Some("r@example.com"), "R", Role::Member).unwrap();
+        let at = db::now();
+        let codes: Vec<String> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..8)
+                .map(|_| {
+                    let (db, id) = (&db, &u.id);
+                    s.spawn(move || {
+                        let code = new_secret(CODE_PREFIX);
+                        db.replace_login_codes(&hash(&code), id, OPERATOR, at + MINUTE);
+                        code
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(db.pending_codes(at)[&u.id].0, 1);
+        assert_eq!(codes.iter().filter(|c| db.use_login_code(&hash(c), at).is_some()).count(), 1);
     }
 
     #[test]
