@@ -750,7 +750,7 @@ async fn web(uri: axum::http::Uri) -> Response {
 // Live updates: one Server-Sent Events stream with everything.
 
 async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>) -> impl IntoResponse {
-    // Each stream carries only the Bots its caller can see (ADR 0016).
+    // Each stream carries only the Bots its caller can see (ADR 0017).
     let mut filter = acl::StreamFilter::new(viewer(&app, &c, &by));
     let session = c.session.map(|s| s.id);
     let user = c.user.filter(|_| session.is_some()).map(|u| u.id);
@@ -860,7 +860,7 @@ fn need_bot(app: &App, id: &str) -> Res<db::Bot> {
 }
 
 /// Whose Bot access a request has. A Bot that says who it is acts with its owner's.
-/// Bots share one token, so that's a guardrail, not a boundary (ADR 0016).
+/// Bots share one token, so that's a guardrail, not a boundary (ADR 0017).
 fn viewer(app: &App, c: &Caller, by: &Who) -> Viewer {
     match (c.principal, by.actor.kind, by.actor.id.as_deref().and_then(|id| app.db.bot(id))) {
         (Principal::Bot, audit::ActorKind::Bot, Some(b)) => Viewer::owner_of(&app.db, &b),
@@ -868,7 +868,7 @@ fn viewer(app: &App, c: &Caller, by: &Who) -> Viewer {
     }
 }
 
-/// The Bot, when the caller has at least `need` on it (ADR 0016). A Bot they can't see
+/// The Bot, when the caller has at least `need` on it (ADR 0017). A Bot they can't see
 /// is a 404, the same as one that doesn't exist; one they can see but not use is a 403.
 fn need_bot_access(app: &App, c: &Caller, by: &Who, id: &str, need: Access) -> Res<(db::Bot, Access)> {
     let bot = need_bot(app, id)?;
@@ -1029,7 +1029,7 @@ async fn delete_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
     Ok(Json(json!({ "ok": true })))
 }
 
-// Bot ACLs (ADR 0016): owner, visibility, and grants.
+// Bot ACLs (ADR 0017): owner, visibility, and grants.
 
 fn person(u: Option<db::User>, id: &str) -> Value {
     match u {

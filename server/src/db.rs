@@ -26,12 +26,12 @@ pub struct Bot {
     pub hidden: bool,
     pub unread: bool,
     pub created_at: i64,
-    /// The user who owns it (ADR 0016). Bots from before ACLs belong to `operator`.
+    /// The user who owns it (ADR 0017). Bots from before ACLs belong to `operator`.
     pub owner_id: String,
     pub visibility: Visibility,
 }
 
-/// One user's grant on one Bot (ADR 0016).
+/// One user's grant on one Bot (ADR 0017).
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BotGrant {
@@ -441,7 +441,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 /// Each gets `fresh`: true when this database was just created.
 const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 5] = [migrate_approvals, migrate_audit_events, migrate_users, migrate_identities, migrate_bot_acls];
 
-/// Bot ACLs (ADR 0016): an owner and a visibility per Bot, and per-user grants.
+/// Bot ACLs (ADR 0017): an owner and a visibility per Bot, and per-user grants.
 /// Bots from before belong to the owner account (`operator`, break-glass) and stay
 /// shared, so everyone keeps the Bots they had. No foreign key on `owner_id`: the
 /// owner account is made after migrations run, and users are never deleted.
@@ -751,7 +751,7 @@ impl Db {
         self.bot(&id).unwrap()
     }
 
-    // Bot ACLs (ADR 0016)
+    // Bot ACLs (ADR 0017)
 
     pub fn set_bot_owner(&self, id: &str, owner: &str) {
         self.c().execute("UPDATE bots SET owner_id = ? WHERE id = ?", params![owner, id]).unwrap();

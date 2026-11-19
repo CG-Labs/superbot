@@ -124,7 +124,7 @@ export class SuperBotApi {
     await this.request("DELETE", `/api/bots/${id}`);
   }
 
-  /** Who can see a Bot (ADR 0016). Owner changes are for admins. */
+  /** Who can see a Bot (ADR 0017). Owner changes are for admins. */
   async patchBotAccess(id: string, body: { visibility?: Visibility; owner?: string }): Promise<BotAccessView> {
     return this.request<BotAccessView>("PATCH", `/api/bots/${id}/access`, body);
   }

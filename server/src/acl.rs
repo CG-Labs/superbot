@@ -2,7 +2,7 @@
 //! (private, or shared with the org), and the owner can grant others `viewer` or
 //! `operator`. `access` is the whole model; handlers ask for the level they need with
 //! `need_bot_access` in `main.rs`, and lists and the live stream keep only what the
-//! caller may see. Roles (`rbac.rs`) still apply first. Design: docs/adr/0016-bot-acls.md.
+//! caller may see. Roles (`rbac.rs`) still apply first. Design: docs/adr/0017-bot-acls.md.
 
 use crate::db::{Bot, Db};
 use crate::rbac::{Principal, Role};

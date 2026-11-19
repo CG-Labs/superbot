@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. Second slice of M2 ([roadmap](../ROADMAP.md#m2--multi-user--sso), [#17](https://github.com/CG-Labs/superbot/issues/17)). Builds on the users and sessions of [ADR 0012](0012-users-sessions-rbac.md). Google ([#18](https://github.com/CG-Labs/superbot/issues/18)) and generic OIDC ([#19](https://github.com/CG-Labs/superbot/issues/19)) reuse this layer: see [ADR 0015](0015-sso-multi-provider.md) for their claim rules, several providers at once, and account linking.
+Accepted. Second slice of M2 ([roadmap](../ROADMAP.md#m2--multi-user--sso), [#17](https://github.com/CG-Labs/superbot/issues/17)). Builds on the users and sessions of [ADR 0012](0012-users-sessions-rbac.md). Google ([#18](https://github.com/CG-Labs/superbot/issues/18)) and generic OIDC ([#19](https://github.com/CG-Labs/superbot/issues/19)) reuse this layer: see [ADR 0016](0016-sso-multi-provider.md) for their claim rules, several providers at once, and account linking.
 
 ## Context
 
@@ -83,4 +83,4 @@ The client secret is `SSO_<ID>_CLIENT_SECRET`: from env, `_FILE`, or sealed in S
 - Desktop (Electron) SSO: the app loads from `file://`, which no IdP can return to. It keeps codes and the password; a loopback redirect is the likely fix.
 - Group or app-role to SuperBot role mapping, IdP logout, `prompt=login` re-authentication for sensitive actions, and certificate (`private_key_jwt`) client auth instead of a secret.
 - A web or client UI for linking identities (API and `botctl` only).
-- Apple, GitHub, SAML, SCIM. (Google and generic OIDC rules came next, in [ADR 0015](0015-sso-multi-provider.md).)
+- Apple, GitHub, SAML, SCIM. (Google and generic OIDC rules came next, in [ADR 0016](0016-sso-multi-provider.md).)

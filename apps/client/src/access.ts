@@ -3,7 +3,7 @@ import type { BotAccess, BotView } from "./types";
 const RANK: Record<BotAccess, number> = { view: 1, operate: 2, manage: 3 };
 
 /**
- * Your access to a Bot (ADR 0016). Servers from before Bot ACLs don't say; there,
+ * Your access to a Bot (ADR 0017). Servers from before Bot ACLs don't say; there,
  * your role alone decided.
  */
 export function botAccess(bot: Pick<BotView, "access"> | null | undefined, canWrite: boolean): BotAccess {
