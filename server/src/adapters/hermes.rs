@@ -39,11 +39,14 @@ fn quote(s: &str) -> String {
 /// The managed `config.yaml` (JSON is YAML). Hermes runs `hooks.pre_tool_call` before
 /// every tool call; `fail_closed` turns a crash, timeout, or bad output into a block.
 /// Tools only see secret-looking variables listed in `env_passthrough`, so every
-/// variable SuperBot sets for the run (BOT_TOKEN, saved secrets) is listed; Hermes
-/// itself refuses its provider keys there. botd owns memory and routines.
-fn managed_config(input: &RunInput) -> Value {
-    let mut passthrough: Vec<&String> = input.env.keys().collect();
+/// variable SuperBot sets for the run (BOT_TOKEN, saved secrets) is listed, plus
+/// `secret_names`: secrets Bots get by inheriting botd's env, which aren't in
+/// `input.env`. Hermes itself refuses its provider keys there. botd owns memory and routines.
+fn managed_config(input: &RunInput, secret_names: &[String]) -> Value {
+    let inherited = secret_names.iter().filter(|n| crate::secrets::check_name(n).is_ok());
+    let mut passthrough: Vec<&String> = input.env.keys().chain(inherited).collect();
     passthrough.sort();
+    passthrough.dedup();
     let mut c = json!({
         "terminal": { "env_passthrough": passthrough },
         "memory": { "memory_enabled": false, "user_profile_enabled": false },
@@ -73,7 +76,14 @@ impl Adapter for Hermes {
     }
 
     fn args(&mut self, input: &RunInput, out: &mut Vec<AgentEvent>) -> Vec<String> {
-        if write_private(&managed_dir(input), "config.yaml", &managed_config(input).to_string()).is_err() {
+        let secret_names: Vec<String> = match crate::secrets::global().list() {
+            Ok(list) => list.into_iter().map(|l| l.name).collect(),
+            Err(e) => {
+                eprintln!("hermes: listing secret names: {e}");
+                Vec::new()
+            }
+        };
+        if write_private(&managed_dir(input), "config.yaml", &managed_config(input, &secret_names).to_string()).is_err() {
             out.push(AgentEvent::Error("Couldn't write SuperBot's settings for Hermes.".into()));
         }
         // SuperBot's approval hook is the gate, so Hermes's own prompts are off (--yolo),
@@ -298,6 +308,11 @@ mod tests {
         assert_eq!(c["agent"]["disabled_toolsets"], json!(["cronjob"]));
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("t0k3n") && !text.contains("ghp_x"), "names only, never values");
+
+        // Secrets inherited from botd's env are listed too; botd's own never are.
+        let names = ["NPM_TOKEN", "GITHUB_TOKEN", "SUPERBOT_MASTER_KEY", "AUTH_PASSWORD"].map(String::from);
+        let c = managed_config(&i, &names);
+        assert_eq!(c["terminal"]["env_passthrough"], json!(["BOT_TOKEN", "GITHUB_TOKEN", "NPM_TOKEN"]));
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
 
         // Bypass: no hook, and a later run drops the old one.

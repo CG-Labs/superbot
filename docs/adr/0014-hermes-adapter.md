@@ -19,7 +19,7 @@ ADR 0011 said to add Hermes as one more adapter and left some details to the ada
 - **Stop the daemon around every run**: `hermes gateway stop --yes` for the Bot's data root before and after each run (only when its `gateway.pid` exists, at most 60 seconds). Stop, timeout, and the unguarded-run canary then really end the turn, and every run starts with fresh env. Without `--yes` Hermes refuses while a session is live.
 - **SuperBot's settings in Hermes's managed scope**: `HERMES_MANAGED_DIR=DATA_DIR/bots/<id>/hermes-managed`, rewritten (0600) every run. Hermes merges it over the Bot's own config, and the agent can't change it with `hermes config set`. It holds:
   - the `pre_tool_call` hook (`fail_closed: true`), accepted with `HERMES_ACCEPT_HOOKS=1`;
-  - `terminal.env_passthrough`: the names of the variables botd sets for the run, so tools see `BOT_TOKEN` and saved secrets (names only, never values);
+  - `terminal.env_passthrough`: the names of the variables botd sets for the run and of the secrets Bots inherit from botd's env (e.g. `GITHUB_TOKEN` in `.env`), so tools see `BOT_TOKEN` and every secret a Bot gets. botd's own secrets are never listed. Names only, never values;
   - Hermes memory and user profile off, and its `cronjob` toolset off. This answers ADR 0011's open question: botd owns memory and routines.
 - **The hook names the Bot's folder**: `botctl hook hermes --cwd <workspace>` overrides the hook's `cwd`, so relative paths are checked from where the command really runs. A `terminal` call's `workdir` counts as a `cd`.
 - **`--yolo`**: Hermes's own approval prompt is off, like `--dangerously-skip-permissions` for Claude Code. SuperBot's hook still gates every tool (tested with the real CLI).

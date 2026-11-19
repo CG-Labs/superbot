@@ -84,6 +84,7 @@ fn start() -> Botd {
         .env("WORKSPACE_DIR", dir.join("workspace"))
         .env("DEFAULT_HARNESS", "hermes")
         .env("SCREENS", "off")
+        .env("E2E_INHERITED_TOKEN", "inherited-e2e-value")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -213,8 +214,14 @@ fn hermes_runs_behind_the_approval_gate() {
     assert!(hook["command"].as_str().unwrap().contains("hook hermes --cwd '"), "{hook}");
     assert_eq!(config["memory"]["memory_enabled"], false);
     let passthrough = config["terminal"]["env_passthrough"].as_array().unwrap();
-    assert!(passthrough.contains(&json!("BOT_TOKEN")) && passthrough.contains(&json!("E2E_GITHUB_TOKEN")));
+    for name in ["BOT_TOKEN", "E2E_GITHUB_TOKEN", "E2E_INHERITED_TOKEN"] {
+        assert!(passthrough.contains(&json!(name)), "{name} missing from {passthrough:?}");
+    }
+    for name in ["AUTH_PASSWORD", "SUPERBOT_MASTER_KEY"] {
+        assert!(!passthrough.contains(&json!(name)), "{name} listed in {passthrough:?}");
+    }
     assert!(!read(&Path::new(&managed_dir).join("config.yaml")).contains("ghp-e2e-secret-value"), "names only, never values");
+    assert!(!read(&Path::new(&managed_dir).join("config.yaml")).contains("inherited-e2e-value"), "names only, never values");
 
     // The hook checks paths from the Bot's workspace, not the folder Hermes runs hooks in.
     std::fs::write(b.stub.join("tool"), "rm -rf build").unwrap();
