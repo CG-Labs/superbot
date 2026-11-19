@@ -40,7 +40,7 @@ If flags are omitted, the script prompts on a TTY. The checkout must not be owne
    - `ALLOWED_HOSTS` and `CORS_ORIGINS` when `--domain` is set
    - `SUPERBOT_MASTER_KEY_FILE`, after creating the [master key](#master-key) if it is missing (never replaced)
 7. **systemd** `superbot.service` (hardened, runs as the service user)
-8. **Caddy** automatic HTTPS when `--domain` is set: the web client at `/app/`, everything else to `botd` (`flush_interval -1` for SSE)
+8. **Caddy** automatic HTTPS when `--domain` is set: the [landing page](#landing-page-and-sign-ups) at `/`, the web client at `/app/`, everything else to `botd` (`flush_interval -1` for SSE)
 9. Optional **UFW** (`--ufw`): allow 22, 80, 443
 10. Daily **backup** timer (on by default; `--no-backup` to skip)
 11. With `--with-hermes`: [Hermes Agent](#hermes-agent) for the service user
@@ -54,11 +54,11 @@ journalctl -u superbot -f
 sudo -iu superbot claude login   # or codex login, etc.
 ```
 
-Open `https://your-domain/app/` for the app (it fills in the server URL), or `https://your-domain` for the built-in admin page. Sign in with the saved password.
+Open `https://your-domain/app/` for the app (it fills in the server URL), or `https://your-domain/console/` for the built-in admin page. Sign in with the saved password. `https://your-domain/` is the public landing page.
 
 ## Web client
 
-The installer builds the Expo client (`apps/client`) from the same commit as `botd` on every install and `--upgrade`, and Caddy serves it at `/app/`. `/` stays the built-in admin page, and `/login`, `/api`, `/api/events`, and `/healthz` still go to `botd`. Design: [ADR 0013](../docs/adr/0013-serve-web-client.md).
+The installer builds the Expo client (`apps/client`) from the same commit as `botd` on every install and `--upgrade`, and Caddy serves it at `/app/`. `/` is the [landing page](#landing-page-and-sign-ups); `/console/` (the built-in admin page), `/login`, `/api`, `/api/events`, and `/healthz` go to `botd`. Design: [ADR 0013](../docs/adr/0013-serve-web-client.md).
 
 - The service user builds it (`npm ci`, `expo export` with `SUPERBOT_WEB_BASE_URL=/app`) in `~/superbot/apps/client/dist-app`. Root copies only plain files and folders into a new root-owned release in `/var/www/superbot-app.releases/`, then switches the `/var/www/superbot-app` symlink in one step. The previous release is kept. Set `CLIENT_DIR` to use another path.
 - Needs Node.js 20+ (the installer sets up 22). Without it, or if the build fails, the installer warns and keeps the previous client. `--no-client` skips it.
@@ -131,6 +131,15 @@ Admin actions (logins, Bot and routine changes, approvals, policy, handoffs) are
 - Both installs back it up: the bash timer and the Compose `backup` service take a SQLite `.backup` of `app.sqlite`, audit table included, and keep archives for `SUPERBOT_BACKUP_RETENTION_DAYS` (default 14). So a pruned event still exists in backups for that long; shorten it too if you must erase events.
 - Source IPs: the installer's Caddy is on loopback, so `botd` trusts its `X-Forwarded-For`. Compose sets `TRUST_FORWARDED_FOR=1`, since `botd` is reachable only through Caddy.
 
+## Landing page and sign-ups
+
+`/` is a public landing page and `/get-started` a form to ask for access ([ADR 0022](../docs/adr/0022-landing-and-signups.md)). The built-in admin page moved from `/` to `/console/`; `/app/` is unchanged.
+
+- The installer copies `site/` (plain files, no build) into a root-owned release in `/var/www/superbot-site.releases/` and switches the `/var/www/superbot-site` symlink, like the client, on every install and `--upgrade`. Caddy serves `/`, `/get-started`, and `/site/*` from it. Set `SITE_DIR` to use another path. botd has the same pages built in, so they work without Caddy too.
+- Requests wait for an admin: `botctl signup list`, then `botctl signup approve <id>` (prints a one-time sign-in code, once) or `botctl signup reject <id>`. **No email is sent**: give the person their code yourself. Details: [docs/backend.md](../docs/backend.md#sign-ups).
+- Optional bot check: `TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET` in `.env` turn on Cloudflare Turnstile. `SIGNUPS=off` closes the form.
+- Upgrading needs no config change. The first start adds the `signups` table. Bookmarks of `/` for the admin page should move to `/console/`.
+
 ## Users and sign-in after an upgrade
 
 botd now has users, roles, and sessions ([ADR 0012](../docs/adr/0012-users-sessions-rbac.md)). Upgrading (`--upgrade`, or a new Compose image) needs no config change:
@@ -157,14 +166,14 @@ docker compose up -d --build
 docker compose logs -f botd
 ```
 
-`init.sh` writes `.env` (mode `0600`) from [`.env.example`](docker/.env.example) with a random `AUTH_PASSWORD`, prints it once, and never replaces it on re-run. Open `https://bots.example.com/app/` for the app, or `https://bots.example.com` for the built-in admin page, and sign in with that password. DNS for the domain must point at the host, with ports 80 and 443 open.
+`init.sh` writes `.env` (mode `0600`) from [`.env.example`](docker/.env.example) with a random `AUTH_PASSWORD`, prints it once, and never replaces it on re-run. Open `https://bots.example.com/app/` for the app, or `https://bots.example.com/console/` for the built-in admin page, and sign in with that password. DNS for the domain must point at the host, with ports 80 and 443 open.
 
 Without a domain, `./init.sh` gives plain HTTP at `http://localhost`, published on `127.0.0.1` only. For another machine, use a domain (HTTPS); over plain HTTP the password crosses the network in clear text.
 
 | Service | Role |
 |---------|------|
 | `botd` | Server, web app, harness CLIs. Runs as uid `10001`, no capabilities, port 3000 not published. |
-| `caddy` | `caddy:2` plus the [web client](#web-client), built from this checkout (`Dockerfile` target `caddy`). Publishes 80/443 on `SUPERBOT_BIND`, serves the client at `/app/`, proxies everything else to `botd` (SSE unbuffered). |
+| `caddy` | `caddy:2` plus the [web client](#web-client) and [landing page](#landing-page-and-sign-ups), built from this checkout (`Dockerfile` target `caddy`). Publishes 80/443 on `SUPERBOT_BIND`, serves the landing page at `/` and the client at `/app/`, proxies everything else to `botd` (SSE unbuffered). |
 | `backup` | Archives `DATA_DIR` at start and every `SUPERBOT_BACKUP_INTERVAL` seconds. No network. |
 
 | Volume | Mounted at | Holds |
@@ -271,4 +280,4 @@ Screens and computer use (Xvfb, browser, voxl): `botd` reports `Screens: off`. U
 
 ### Check the setup
 
-[`deploy/docker/smoke-test.sh`](docker/smoke-test.sh) builds the image and runs the stack in an isolated project (own volumes and ports 18080/18443): health, auth, Host allowlist, the web client at `/app/`, harness CLIs, SSE through Caddy, saved secrets (encrypted, names only, absent from logs and backups), and a backup/restore round trip, then removes everything. CI runs it on every change to the image.
+[`deploy/docker/smoke-test.sh`](docker/smoke-test.sh) builds the image and runs the stack in an isolated project (own volumes and ports 18080/18443): health, auth, Host allowlist, the landing page, the web client at `/app/`, harness CLIs, SSE through Caddy, saved secrets (encrypted, names only, absent from logs and backups), and a backup/restore round trip, then removes everything. CI runs it on every change to the image.
