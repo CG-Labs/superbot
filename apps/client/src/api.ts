@@ -199,7 +199,7 @@ export class SuperBotApi {
     else await this.request("DELETE", `/api/bots/${botId}/policy`);
   }
 
-  // Users, codes, sessions, and sign-ins: admins only, enforced by the server (ADR 0012, 0019).
+  // Users, codes, sessions, and sign-ins: admins only, enforced by the server (ADR 0012, 0021).
 
   async users(): Promise<AdminUser[]> {
     return this.request<AdminUser[]>("GET", "/api/users");

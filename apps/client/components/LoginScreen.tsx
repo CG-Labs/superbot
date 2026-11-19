@@ -14,8 +14,9 @@ import { fetchSsoProviders, ssoButtonText, ssoButtonTone, ssoSupported, type Sso
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
 
-export function LoginScreen() {
-  const { login, loginWithSso, error: bootError, inviteCode } = useSuperBot();
+/** `inviteCode` fills in the code from an invite link; it is only spent on Connect. */
+export function LoginScreen({ inviteCode = null }: { inviteCode?: string | null }) {
+  const { login, loginWithSso, error: bootError } = useSuperBot();
   const [baseUrl, setBaseUrl] = useState(() => defaultServerUrl());
   const [secret, setSecret] = useState(inviteCode ?? "");
   const [busy, setBusy] = useState(false);

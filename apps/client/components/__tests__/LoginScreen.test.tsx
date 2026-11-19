@@ -74,17 +74,12 @@ describe("LoginScreen", () => {
   it("fills in the code from an invite link, and signs in only when asked", async () => {
     serverWith([]);
     const code = "sbc_" + "cd".repeat(32);
-    mockCtx.inviteCode = code;
     const user = userEvent.setup();
-    try {
-      await render(<LoginScreen />);
-      expect(screen.getByText(/invite code is filled in/)).toBeOnTheScreen();
-      expect(mockCtx.login).not.toHaveBeenCalled();
-      await user.press(screen.getByText("Connect"));
-      expect(mockCtx.login).toHaveBeenCalledWith(LOCAL_SERVER_URL, code);
-    } finally {
-      mockCtx.inviteCode = null;
-    }
+    await render(<LoginScreen inviteCode={code} />);
+    expect(screen.getByText(/invite code is filled in/)).toBeOnTheScreen();
+    expect(mockCtx.login).not.toHaveBeenCalled();
+    await user.press(screen.getByText("Connect"));
+    expect(mockCtx.login).toHaveBeenCalledWith(LOCAL_SERVER_URL, code);
   });
 
   it("shows no SSO buttons when the server has none", async () => {

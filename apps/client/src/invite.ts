@@ -22,7 +22,7 @@ export function appUrl(serverUrl: string): string {
 }
 
 /**
- * A link that fills in the code on the sign-in page (ADR 0019). The code rides in the
+ * A link that fills in the code on the sign-in page (ADR 0021). The code rides in the
  * fragment, which browsers never send to a server or put in a Referer, so it stays out
  * of Caddy's and botd's logs. Opening it only fills the form; nothing is spent until
  * the person presses Connect, so link scanners can't use it up.
@@ -54,21 +54,37 @@ export function inviteMessage(o: { name: string; serverUrl: string; code: string
   ].join("\n");
 }
 
+/** The sign-in code in a fragment like `code=sbc_…` (with or without the `#`), if it is one. */
+export function codeFromHash(hash: string | null | undefined): string | null {
+  if (!hash || !hash.includes("code=")) return null;
+  const raw = new URLSearchParams(hash.replace(/^#/, "")).get("code") ?? "";
+  return CODE_SHAPE.test(raw) ? raw : null;
+}
+
 type Loc = { hash: string; pathname: string; search: string };
 type Hist = { replaceState: (data: unknown, unused: string, url?: string) => void };
 
 /**
  * The sign-in code from an invite link (`#code=sbc_…`), if the page was opened with one.
  * Removes it from the address bar and history either way, so it isn't left behind.
+ * Expo Router also keeps the fragment as the `#` param, so the index route drops it there too.
  */
 export function takeInviteCode(
   loc: Loc | undefined = typeof window === "undefined" ? undefined : window.location,
   hist: Hist | undefined = typeof window === "undefined" ? undefined : window.history,
 ): string | null {
   if (!loc?.hash || !loc.hash.includes("code=")) return null;
-  const raw = new URLSearchParams(loc.hash.slice(1)).get("code") ?? "";
   hist?.replaceState(null, "", `${loc.pathname}${loc.search}`);
-  return CODE_SHAPE.test(raw) ? raw : null;
+  return codeFromHash(loc.hash);
+}
+
+const METHOD_LABEL: Record<string, string> = { password: "password", code: "code", sso: "SSO" };
+
+/** "SSO (work)", "code", …: how a sign-in happened, from its method and SSO provider. */
+export function signInMethod(method: string | null | undefined, idpProvider?: string | null): string {
+  if (!method) return "";
+  const m = METHOD_LABEL[method] ?? method;
+  return idpProvider ? `${m} (${idpProvider})` : m;
 }
 
 export function relativeTime(at: number | null | undefined, now = Date.now()): string {

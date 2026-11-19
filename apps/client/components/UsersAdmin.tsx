@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Modal,
@@ -11,7 +11,7 @@ import {
   View,
 } from "react-native";
 import type { SuperBotApi } from "../src/api";
-import { relativeTime, ROLES } from "../src/invite";
+import { relativeTime, ROLES, signInMethod } from "../src/invite";
 import { fetchSsoProviders, type SsoProvider } from "../src/sso";
 import { colors } from "../src/theme";
 import type { AdminUser } from "../src/types";
@@ -57,13 +57,14 @@ function UserRow({ u, providers, selected, onPress }: { u: AdminUser; providers:
       <View style={styles.rowSide}>
         <Text style={styles.faint}>Last sign-in</Text>
         <Text style={styles.dim}>{relativeTime(u.lastLoginAt)}</Text>
+        {u.lastLogin?.authMethod ? <Text style={styles.faint}>with {signInMethod(u.lastLogin.authMethod, u.lastLogin.idpProvider)}</Text> : null}
         <Text style={styles.faint}>Added {new Date(u.createdAt).toLocaleDateString()}</Text>
       </View>
     </Pressable>
   );
 }
 
-/** The admin portal: people, their roles, sign-in codes, sessions, SSO links, and Bot access (ADR 0019). */
+/** The admin portal: people, their roles, sign-in codes, sessions, SSO links, and Bot access (ADR 0021). */
 export function UsersAdmin({ api, meId, onBack }: Props) {
   const { width } = useWindowDimensions();
   const wide = width >= 900;
@@ -72,6 +73,8 @@ export function UsersAdmin({ api, meId, onBack }: Props) {
   const [query, setQuery] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [inviting, setInviting] = useState(false);
+  // Selected once the invite closes, so the user's panel never covers the one-time code.
+  const created = useRef<string | null>(null);
   const [providers, setProviders] = useState<SsoProvider[]>([]);
 
   const load = useCallback(async () => {
@@ -106,7 +109,7 @@ export function UsersAdmin({ api, meId, onBack }: Props) {
         </Pressable>
       </View>
       <View style={styles.body}>
-        <View style={[styles.listPane, wide && styles.listPaneWide]}>
+        <View style={wide ? styles.listPaneWide : styles.listPane}>
           <TextInput
             style={styles.search}
             placeholder="Search people"
@@ -132,10 +135,10 @@ export function UsersAdmin({ api, meId, onBack }: Props) {
       {!wide ? (
         <Modal visible={!!selected} animationType="slide" onRequestClose={() => setSelectedId(null)}>
           <View style={styles.modalRoot}>
-            <Pressable onPress={() => setSelectedId(null)} accessibilityRole="button">
+            <Pressable style={styles.modalHeader} onPress={() => setSelectedId(null)} accessibilityRole="button">
               <Text style={styles.back}>‹ Users</Text>
             </Pressable>
-            <ScrollView contentContainerStyle={{ paddingVertical: 16 }}>{detail}</ScrollView>
+            <ScrollView contentContainerStyle={{ padding: 16, paddingRight: 20 }}>{detail}</ScrollView>
           </View>
         </Modal>
       ) : null}
@@ -147,11 +150,13 @@ export function UsersAdmin({ api, meId, onBack }: Props) {
               <InviteUserForm
                 api={api}
                 onCreated={(u) => {
-                  setSelectedId(u.id);
+                  created.current = u.id;
                   void load();
                 }}
                 onClose={() => {
                   setInviting(false);
+                  if (created.current) setSelectedId(created.current);
+                  created.current = null;
                   void load();
                 }}
               />
@@ -172,7 +177,7 @@ const styles = StyleSheet.create({
   primaryText: { color: "#111", fontSize: 15 },
   body: { flex: 1, flexDirection: "row" },
   listPane: { flex: 1, padding: 12 },
-  listPaneWide: { flex: 0, width: 460, borderRightWidth: 1, borderRightColor: colors.border },
+  listPaneWide: { width: 460, padding: 12, borderRightWidth: 1, borderRightColor: colors.border },
   detailPane: { flex: 1 },
   search: {
     backgroundColor: colors.bgHover,
@@ -198,7 +203,8 @@ const styles = StyleSheet.create({
   codeTag: { color: colors.warning, borderColor: "#5a4520" },
   empty: { color: colors.textFaint, padding: 12, textAlign: "center" },
   error: { color: colors.danger, padding: 8 },
-  modalRoot: { flex: 1, backgroundColor: colors.bgMain, padding: 16, paddingTop: 48 },
+  modalRoot: { flex: 1, backgroundColor: colors.bgMain, paddingTop: 32 },
+  modalHeader: { padding: 16, borderBottomWidth: 1, borderBottomColor: colors.border, backgroundColor: colors.bgMain },
   backdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.5)", justifyContent: "center", padding: 16 },
   sheet: { flexGrow: 0, maxHeight: "90%", width: "100%", maxWidth: 560, alignSelf: "center", backgroundColor: colors.bgSidebar, borderRadius: 16 },
 });

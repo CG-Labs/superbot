@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import { ActivityIndicator, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
 import { confirmAsync } from "../src/dialogs";
-import { CODE_TTLS, formatExpiry, relativeTime, ROLES } from "../src/invite";
+import { CODE_TTLS, formatExpiry, relativeTime, ROLES, signInMethod } from "../src/invite";
 import type { SsoProvider } from "../src/sso";
 import { colors } from "../src/theme";
 import type { AdminUser, LoginCode, Role, SessionView, UserBots } from "../src/types";
@@ -118,6 +118,7 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
         <Text style={styles.faint}>
           {user.breakGlass ? "Owner (break-glass) · " : ""}
           {self ? "You · " : ""}Added {new Date(user.createdAt).toLocaleDateString()} · Last sign-in {relativeTime(user.lastLoginAt).toLowerCase()}
+          {user.lastLogin?.authMethod ? ` with ${signInMethod(user.lastLogin.authMethod, user.lastLogin.idpProvider)}` : ""}
         </Text>
       </View>
       {error ? <Text style={styles.error}>{error}</Text> : null}
@@ -162,7 +163,7 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
             {sessions.length ? (
               sessions.map((s) => (
                 <Text key={s.id} style={styles.dim}>
-                  {s.label || (s.kind === "cookie" ? "Browser" : "App")} · {s.method} · last used {relativeTime(s.lastSeenAt).toLowerCase()}
+                  {s.label || (s.kind === "cookie" ? "Browser" : "App")} · {signInMethod(s.method, s.idpProvider)} · last used {relativeTime(s.lastSeenAt).toLowerCase()}
                 </Text>
               ))
             ) : (

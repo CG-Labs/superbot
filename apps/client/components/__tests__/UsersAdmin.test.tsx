@@ -24,6 +24,7 @@ const owner: AdminUser = {
   createdAt: 1,
   updatedAt: 1,
   lastLoginAt: Date.now() - 5 * 60_000,
+  lastLogin: { at: Date.now() - 5 * 60_000, authMethod: "sso", idpProvider: "work", idp: "entra" },
   identities: [],
   pendingCodes: null,
 };
@@ -86,6 +87,7 @@ describe("UsersAdmin", () => {
     expect(row.getByText("Code waiting")).toBeOnTheScreen();
     expect(row.getByText("Never")).toBeOnTheScreen();
     expect(within(screen.getByLabelText("User Owner")).getByText("5 min ago")).toBeOnTheScreen();
+    expect(within(screen.getByLabelText("User Owner")).getByText("with SSO (work)")).toBeOnTheScreen();
   });
 
   it("adds a user with a code and shows the code and invite once", async () => {
@@ -104,9 +106,11 @@ describe("UsersAdmin", () => {
     expect(reveal.getByText(/shown once/)).toBeOnTheScreen();
     expect(reveal.getByText(new RegExp(`${BASE}/app/#code=${CODE}`))).toBeOnTheScreen();
 
+    expect(screen.queryByText(/^Scout/)).not.toBeOnTheScreen();
     await user.press(reveal.getByText("Done"));
     expect(screen.queryByTestId("code-reveal")).not.toBeOnTheScreen();
     expect(screen.queryByText(CODE)).not.toBeOnTheScreen();
+    expect(await screen.findByText(/^Scout/)).toBeOnTheScreen();
   });
 
   it("changes a role, regenerates a code, signs out, and shows Bot access", async () => {

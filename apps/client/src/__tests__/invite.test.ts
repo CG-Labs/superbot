@@ -1,4 +1,4 @@
-import { appUrl, CODE_TTLS, formatExpiry, inviteLink, inviteMessage, relativeTime, takeInviteCode } from "../invite";
+import { appUrl, CODE_TTLS, codeFromHash, formatExpiry, inviteLink, inviteMessage, relativeTime, signInMethod, takeInviteCode } from "../invite";
 
 const CODE = "sbc_" + "ab".repeat(32);
 
@@ -39,6 +39,13 @@ describe("invites", () => {
     expect(replaceState).toHaveBeenCalledWith(null, "", "/app/?x=1");
   });
 
+  it("reads a code from the router's `#` param too", () => {
+    expect(codeFromHash(`code=${CODE}`)).toBe(CODE);
+    expect(codeFromHash(`#code=${CODE}&x=1`)).toBe(CODE);
+    expect(codeFromHash("code=sbs_" + "a".repeat(64))).toBeNull();
+    expect(codeFromHash(undefined)).toBeNull();
+  });
+
   it("ignores anything that isn't a sign-in code, but still clears it", () => {
     const replaceState = jest.fn();
     expect(takeInviteCode({ hash: "#code=hunter2", pathname: "/app/", search: "" }, { replaceState })).toBeNull();
@@ -47,5 +54,13 @@ describe("invites", () => {
     expect(takeInviteCode({ hash: "#section", pathname: "/", search: "" }, { replaceState })).toBeNull();
     expect(replaceState).toHaveBeenCalledTimes(1);
     expect(takeInviteCode(undefined, undefined)).toBeNull();
+  });
+});
+
+describe("signInMethod", () => {
+  it("names the method and any SSO provider", () => {
+    expect(signInMethod("sso", "work")).toBe("SSO (work)");
+    expect(signInMethod("code")).toBe("code");
+    expect(signInMethod(null)).toBe("");
   });
 });

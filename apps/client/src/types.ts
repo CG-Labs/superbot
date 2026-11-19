@@ -96,7 +96,7 @@ export interface ModelOption {
 
 export type Role = "admin" | "member" | "readonly";
 
-/** A user as `/api/users` lists them (ADR 0012, 0019). Admins only. */
+/** A user as `/api/users` lists them (ADR 0012, 0021). Admins only. */
 export interface AdminUser {
   id: string;
   email: string | null;
@@ -108,15 +108,27 @@ export interface AdminUser {
   createdAt: number;
   updatedAt: number;
   lastLoginAt?: number | null;
+  /** How they last signed in, in the audit log's terms (ADR 0019). */
+  lastLogin?: LastLogin | null;
   identities?: UserIdentity[];
   /** Codes made for this user and not used yet. Never the codes themselves. */
   pendingCodes?: { count: number; expiresAt: number } | null;
+}
+
+export interface LastLogin {
+  at: number;
+  /** "password", "code", or "sso". */
+  authMethod?: string | null;
+  /** The SSO provider id it came through, and that provider's type ("entra", "google", …). */
+  idpProvider?: string | null;
+  idp?: string | null;
 }
 
 /** An SSO sign-in linked to a user (ADR 0014). */
 export interface UserIdentity {
   id: string;
   provider: string;
+  idp?: string | null;
   email?: string | null;
   subject?: string;
   createdAt: number;
@@ -134,6 +146,7 @@ export interface SessionView {
   id: string;
   kind: "cookie" | "token";
   method: string;
+  idpProvider?: string | null;
   label?: string | null;
   createdAt: number;
   lastSeenAt: number;
