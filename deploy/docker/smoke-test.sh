@@ -79,7 +79,13 @@ log "Health, auth, and Host checks through Caddy"
 expect_code 401 "$BASE/api/state"
 expect_code 401 -u "smoke:wrong-password" "$BASE/api/state"
 expect_code 403 "${AUTH[@]}" -H "Host: evil.example" "$BASE/api/state"
-expect_code 200 "${AUTH[@]}" "$BASE/"
+expect_code 200 "${AUTH[@]}" "$BASE/console/"
+log "The landing page and get-started form are public"
+expect_code 200 "$BASE/"
+expect_code 200 "$BASE/get-started"
+expect_code 200 "$BASE/site/get-started.js"
+curl -fsSI "$BASE/" | grep -qi "^content-security-policy: default-src 'self'" || fail "the landing page has no CSP"
+grep -q '"enabled":true' <<<"$(curl -fsS "$BASE/api/signups/config")" || fail "sign-ups are not open"
 log "Caddy serves the web client at /app/ and leaves everything else to botd"
 expect_code 200 "$BASE/app/"
 expect_code 302 "$BASE/app"
@@ -95,7 +101,7 @@ state=$(curl -fsS "${AUTH[@]}" "$BASE/api/state")
 grep -q '"name":"Smoke"' <<<"$state" || fail "USER_NAME from .env not applied: $state"
 
 log "Sessions: the password signs in as the owner; the token works until logout"
-expect_code 303 "$BASE/"
+expect_code 303 "$BASE/console/"
 login=$(curl -fsS -H 'Content-Type: application/json' -d "{\"password\":\"$PASSWORD\"}" "$BASE/api/auth/login")
 TOKEN=$(sed -n 's/.*"token":"\(sbs_[0-9a-f]*\)".*/\1/p' <<<"$login")
 [[ -n "$TOKEN" ]] || fail "no session token from /api/auth/login"

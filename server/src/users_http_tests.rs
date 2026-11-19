@@ -395,7 +395,7 @@ async fn sessions_expire_when_idle_and_stale_cookies_are_cleared() {
     assert_eq!(code, 401);
     assert!(header(&head, "set-cookie").unwrap().contains("Max-Age=0"));
     assert!(header(&head, "www-authenticate").is_none(), "no password box when a cookie session ends");
-    let (code, head, _) = call_with(port, "GET", "/", "", &cookie(&ctoken), "").await;
+    let (code, head, _) = call_with(port, "GET", "/console/", "", &cookie(&ctoken), "").await;
     assert_eq!((code, header(&head, "location").as_deref()), (303, Some("/login")));
 }
 
@@ -457,7 +457,7 @@ async fn bypass_attempts_fail_closed() {
     assert!(header(&head, "www-authenticate").is_some(), "break-glass Basic is offered to browsers");
     let (_, head, _) = call_with(port, "GET", "/api/state", "", "Sec-Fetch-Mode: cors\r\n", "").await;
     assert!(header(&head, "www-authenticate").is_none(), "but not to the web app's own fetches");
-    let (code, head, _) = call_with(port, "GET", "/", "", "", "").await;
+    let (code, head, _) = call_with(port, "GET", "/console/", "", "", "").await;
     assert_eq!((code, header(&head, "location").as_deref()), (303, Some("/login")));
     let (code, head, page) = call_with(port, "GET", "/login", "", "", "").await;
     assert!(code == 200 && header(&head, "content-type").unwrap().starts_with("text/html") && page.contains("/api/auth/login"));
@@ -531,7 +531,7 @@ async fn break_glass_off_ignores_the_password() {
     assert!(audit_list(&body).iter().any(|e| e["details"]["reason"] == "break_glass_off"));
 
     // A browser still sending a cached password reaches the sign-in page, then its cookie wins.
-    let (code, head, _) = call_with(port, "GET", "/", &admin, "", "").await;
+    let (code, head, _) = call_with(port, "GET", "/console/", &admin, "", "").await;
     assert_eq!((code, header(&head, "location").as_deref()), (303, Some("/login")));
     let code = users::new_secret(users::CODE_PREFIX);
     app.db.add_login_code(&users::hash(&code), users::OPERATOR, users::OPERATOR, db::now() + 60_000);

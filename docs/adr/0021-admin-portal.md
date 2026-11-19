@@ -29,7 +29,7 @@ Existing routes stay; additions are small and backward compatible:
 
 | Change | Why |
 |--------|-----|
-| `users.last_login_at`, `last_login_method`, `last_login_idp_provider` (migration 7), set when any session starts, backfilled from the newest kept session | Last sign-in survives session pruning. Method and provider use ADR 0019's terms. |
+| `users.last_login_at`, `last_login_method`, `last_login_idp_provider` (migration 8, after ADR 0022's `signups`), set when any session starts, backfilled from the newest kept session | Last sign-in survives session pruning. Method and provider use ADR 0019's terms. |
 | Users carry `lastLoginAt` and, in the admin list and `GET /api/users/:id`, `lastLogin: {at, authMethod, idpProvider, idp}`, `identities: [{id, provider, idp, subject, email, createdAt, lastLoginAt}]`, and `pendingCodes: {count, expiresAt} \| null` | One call fills the list. Never a code or its hash. |
 | `GET /api/users/:id-or-email/bots` → `{user, active, bots: [{bot, owner, visibility, access, grant}]}` | What ADR 0017 grants this user now, computed with the same rules as their own requests (admins see every Bot). |
 | `POST /api/users/:id/login-codes` takes `replace: true` to drop the user's unused codes first; the response is `Cache-Control: no-store` | "Regenerate" really revokes the old code, and no cache keeps the new one. |

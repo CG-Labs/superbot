@@ -1,6 +1,15 @@
 # Backend
 
-One Rust binary, `botd`. It serves the web app, stores everything in SQLite, and runs each Bot on a coding-agent CLI.
+One Rust binary, `botd`. It serves the landing page (`/`), the admin console (`/console/`), and the API, stores everything in SQLite, and runs each Bot on a coding-agent CLI. The client is served at `/app/` by Caddy ([deploy/README.md](../deploy/README.md)).
+
+## Pages
+
+- `/` and `/get-started`: the public landing page and the request-access form, from `site/`. Same page for everyone, no trackers or external assets ([ADR 0022](adr/0022-landing-and-signups.md)).
+- `/console/`: the built-in admin page (`web/`). Signed-out visitors go to `/login`. `/console` redirects here.
+- `/login`: the sign-in page. Sign-in lands on `/console/`.
+- `/app/`: the client, when Caddy serves it. Without it, botd sends `/app` to `/console/`.
+
+botd embeds `site/` and `web/`. Set `SITE_DIR` or `WEB_DIR` to serve them from disk while editing.
 
 ## How it works
 
@@ -75,6 +84,7 @@ Settings are in [.env.example](../.env.example). Keep `botctl` next to `botd`: t
 - Proxies must not buffer `/api/events` (it's an SSE stream).
 - Set `TZ` to the user's time zone. Routines use it.
 - Back up `DATA_DIR`. `WORKSPACE_DIR` is the Bots' scratch and files.
+- Sign-ups are on by default: anyone can ask for access at `/get-started`, and nothing happens until an admin approves. See [Sign-ups](#sign-ups).
 - `GET /healthz` returns `{"ok":true}` without auth.
 
 ## Approvals
@@ -171,6 +181,23 @@ botctl session revoke <id> | botctl session revoke-all alex@example.com
 botctl user link alex@example.com entra <object-id> | botctl user identities alex@example.com
 ```
 
+### Sign-ups
+
+People ask for access on the get-started page. An admin approves or rejects each request; approving makes the user and a one-time sign-in code (3 days by default), shown once. **No email is sent**: hand the code over yourself. Design: [ADR 0022](adr/0022-landing-and-signups.md).
+
+```sh
+botctl signup list                                  # pending; or approved, rejected, all
+botctl signup approve <id> --role member            # prints the code once, and SSO providers to link
+botctl signup reject <id> --reason "Not a customer"
+```
+
+- **Limits**: 5 requests per IP per hour, 16 KiB bodies, one pending request per email, at most 1000 pending. A hidden honeypot field and a duplicate both get the normal "received" answer, and nothing is saved.
+- **Bot check**: set `TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET` (or `TURNSTILE_SECRET_FILE`) to require [Cloudflare Turnstile](https://developers.cloudflare.com/turnstile/). Both or neither. If Cloudflare can't be reached, requests are refused.
+- **Off**: `SIGNUPS=off` closes the form (the API answers 404).
+- **SSO**: approving doesn't link an IdP account (email never links). The confirmation page and the approve response name the providers that fit; link with `botctl user link`.
+- **Email hook**: `signups::notify` is called with each notice (received, approved with the code, rejected). It sends nothing today.
+- **Audit**: `signup.submitted`, `signup.refused` (honeypot, throttled), `signup.approved` (with `user.created` and `user.login_code_created`), `signup.rejected`.
+
 ### Shared and private Bots
 
 Each Bot has an owner and is **shared** (everyone can use it) or **private** (only its owner, admins, and people it's granted to). Grants are **viewer** (read its chat) or **operator** (also run it). Only the owner or an admin changes a Bot's settings, deletes it, or changes who sees it; only an admin gives it to someone else. Read-only users can view, never run. A Bot acts with its owner's access, so it only sees and asks Bots its owner can. Bots from before this stay shared and belong to the owner account. Design: [ADR 0017](adr/0017-bot-acls.md).
@@ -212,6 +239,14 @@ Sign-in, users, and sessions ([ADR 0012](adr/0012-users-sessions-rbac.md)). User
 - `GET /api/users/:id-or-email/bots` → `{user, active, bots: [{bot, owner, visibility, access, grant}]}`: the Bots that user can reach now and how ([ADR 0017](adr/0017-bot-acls.md))
 - `GET /api/sessions?user=`, `DELETE /api/sessions/:id`, `DELETE /api/users/:id/sessions`
 
+Sign-ups ([ADR 0022](adr/0022-landing-and-signups.md)). Submitting and the config are public; the rest is admin only:
+
+- `GET /api/signups/config` → `{enabled, turnstileSiteKey, providers, teamSizes, signIns}`
+- `POST /api/signups` `{name, email, company, teamSize, useCase, signIn: microsoft|google|github|apple|other, consent: true, website?, turnstileToken?}` → 202 `{ok, sso: [{id, label, type}]}`. 400 `{error, field}` for a bad field, 413 over 16 KiB, 429 with `Retry-After`, 503 when 1000 are pending, 404 when `SIGNUPS=off`
+- `GET /api/signups?status=pending|approved|rejected|all&limit=` (newest first), `GET /api/signups/:id`. Each has `existingUser` when a user has that email
+- `POST /api/signups/:id/approve` `{role?, ttlMinutes?}` → `{signup, user, code, expiresAt, emailed: false, sso}`. 409 when decided already or the email is a user's
+- `POST /api/signups/:id/reject` `{reason?}`. 409 when decided already
+
 Approvals, policy, and audit. Writes, decisions, the approvals list, and the audit log need a person (403 for the Bot token):
 
 - `GET /api/policy`: global policy, class names, global rules. `PUT /api/policy` `{mode?, timeoutMinutes?, classes?: {<class>: allow|ask|deny}}`
@@ -226,6 +261,6 @@ Approvals, policy, and audit. Writes, decisions, the approvals list, and the aud
 
 ## Not built yet
 
-Vault/Key Vault/Secret Manager stores and master-key rotation (the `SecretStore` trait is ready for them), per-Bot resource limits, Slack. Approvals follow-ups are in [approvals-followups.md](approvals-followups.md).
+Sign-up emails, self-serve SSO linking, and sign-up retention ([ADR 0022](adr/0022-landing-and-signups.md)). Vault/Key Vault/Secret Manager stores and master-key rotation (the `SecretStore` trait is ready for them), per-Bot resource limits, Slack. Approvals follow-ups are in [approvals-followups.md](approvals-followups.md).
 
 Computer use (each Bot's screen, browser, and live view) is in [computer.md](computer.md).

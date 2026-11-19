@@ -97,29 +97,63 @@ const FAIL_LIMIT: u32 = 10;
 const FAIL_WINDOW_MS: i64 = 10 * MINUTE;
 const MAX_TRACKED: usize = 10_000;
 
-#[derive(Default)]
-pub struct Limiter(Mutex<HashMap<String, (i64, u32)>>);
+/// Counts per client IP in fixed windows: `limit` per `window_ms`.
+pub struct Limiter {
+    hits: Mutex<HashMap<String, (i64, u32)>>,
+    limit: u32,
+    window_ms: i64,
+}
+
+impl Default for Limiter {
+    fn default() -> Self {
+        Limiter::new(FAIL_LIMIT, FAIL_WINDOW_MS)
+    }
+}
 
 impl Limiter {
-    /// Seconds to wait, when this IP has failed too often.
+    pub fn new(limit: u32, window_ms: i64) -> Limiter {
+        Limiter { hits: Mutex::default(), limit, window_ms }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (i64, u32)>> {
+        self.hits.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Seconds to wait, when this IP has hit the limit.
     pub fn blocked(&self, ip: &str, at: i64) -> Option<i64> {
-        let m = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        m.get(ip).filter(|(start, n)| *n >= FAIL_LIMIT && at - start < FAIL_WINDOW_MS).map(|(start, _)| (start + FAIL_WINDOW_MS - at + 999) / 1000)
+        self.wait(&self.lock(), ip, at)
+    }
+
+    fn wait(&self, m: &HashMap<String, (i64, u32)>, ip: &str, at: i64) -> Option<i64> {
+        m.get(ip).filter(|(start, n)| *n >= self.limit && at - start < self.window_ms).map(|(start, _)| (start + self.window_ms - at + 999) / 1000)
     }
 
     pub fn fail(&self, ip: &str, at: i64) {
-        let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        self.count(&mut self.lock(), ip, at);
+    }
+
+    fn count(&self, m: &mut HashMap<String, (i64, u32)>, ip: &str, at: i64) {
         if !m.contains_key(ip) && m.len() >= MAX_TRACKED {
-            m.retain(|_, (start, _)| at - *start < FAIL_WINDOW_MS);
+            m.retain(|_, (start, _)| at - *start < self.window_ms);
             if m.len() >= MAX_TRACKED {
                 m.clear();
             }
         }
         let e = m.entry(ip.to_string()).or_insert((at, 0));
-        if at - e.0 >= FAIL_WINDOW_MS {
+        if at - e.0 >= self.window_ms {
             *e = (at, 0);
         }
         e.1 += 1;
+    }
+
+    /// Counts one request, unless the IP is over the limit: then the seconds to wait.
+    /// One lock for both, so concurrent requests can't share the last slot.
+    pub fn hit(&self, ip: &str, at: i64) -> Option<i64> {
+        let mut m = self.lock();
+        self.wait(&m, ip, at).or_else(|| {
+            self.count(&mut m, ip, at);
+            None
+        })
     }
 }
 
@@ -456,8 +490,17 @@ pub async fn create_user(State(app): State<AppState>, Extension(by): Extension<W
         r => r.as_str().and_then(Role::parse).ok_or_else(|| bad("role must be admin, member, or readonly"))?,
     };
     let u = app.db.create_user(None, Some(email), &name, role).map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
-    app.db.record(&by.event("user.created").target("user", &u.id).details(json!({ "email": u.email, "name": u.name, "role": u.role })));
+    record_created(&app, &by, &u, None);
     Ok((StatusCode::CREATED, Json(user_view(&u))))
+}
+
+/// `user.created`, as every way of adding a user logs it. `reason` says why, when it isn't an admin's form.
+pub fn record_created(app: &AppState, by: &Who, u: &User, reason: Option<&str>) {
+    let mut details = json!({ "email": u.email, "name": u.name, "role": u.role });
+    if let Some(r) = reason {
+        details["reason"] = json!(r);
+    }
+    app.db.record(&by.event("user.created").target("user", &u.id).details(details));
 }
 
 /// `{name?, email?, role?, status?: "active" | "disabled"}`. Disabling ends the
@@ -528,32 +571,40 @@ pub async fn create_login_code(State(app): State<AppState>, Extension(by): Exten
         return Err(ApiError(StatusCode::CONFLICT, "This user is disabled. Enable them first.".into()));
     }
     let v: Value = if body.iter().all(u8::is_ascii_whitespace) { Value::Null } else { serde_json::from_slice(&body).map_err(|e| bad(format!("Invalid JSON: {e}")))? };
-    let ttl = match &v["ttlMinutes"] {
-        Value::Null => 60,
-        t => t.as_i64().filter(|t| (1..=7 * 24 * 60).contains(t)).ok_or_else(|| bad("ttlMinutes must be 1 to 10080"))?,
-    };
+    let ttl = code_ttl(&v["ttlMinutes"], 60)?;
     let replace = match &v["replace"] {
         Value::Null => false,
         Value::Bool(b) => *b,
         _ => return Err(bad("replace must be true or false")),
     };
-    let code = new_secret(CODE_PREFIX);
-    let expires = db::now() + ttl * MINUTE;
-    let created_by = by.actor.id.as_deref().unwrap_or("");
-    let replaced = if replace {
-        app.db.replace_login_codes(&hash(&code), &u.id, created_by, expires)
-    } else {
-        app.db.add_login_code(&hash(&code), &u.id, created_by, expires);
-        0
-    };
-    let mut details = json!({ "ttlMinutes": ttl });
-    if replace {
-        details["replaced"] = json!(replaced);
-    }
-    app.db.record(&by.event("user.login_code_created").target("user", &u.id).details(details));
+    let (code, expires) = issue_code(&app, &by, &u, ttl, replace);
     let mut res = Json(json!({ "code": code, "expiresAt": expires, "user": user_view(&u) })).into_response();
     res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(res)
+}
+
+/// `ttlMinutes` for a sign-in code: 1 minute to 7 days.
+pub fn code_ttl(v: &Value, default: i64) -> Res<i64> {
+    match v {
+        Value::Null => Ok(default),
+        t => t.as_i64().filter(|t| (1..=7 * 24 * 60).contains(t)).ok_or_else(|| bad("ttlMinutes must be 1 to 10080")),
+    }
+}
+
+/// A new one-time sign-in code for `u`, good for `ttl` minutes. Returns the code (only
+/// its hash is kept) and when it expires. `replace` drops the user's unused codes first.
+pub fn issue_code(app: &AppState, by: &Who, u: &User, ttl: i64, replace: bool) -> (String, i64) {
+    let code = new_secret(CODE_PREFIX);
+    let expires = db::now() + ttl * MINUTE;
+    let created_by = by.actor.id.as_deref().unwrap_or("");
+    let mut details = json!({ "ttlMinutes": ttl });
+    if replace {
+        details["replaced"] = json!(app.db.replace_login_codes(&hash(&code), &u.id, created_by, expires));
+    } else {
+        app.db.add_login_code(&hash(&code), &u.id, created_by, expires);
+    }
+    app.db.record(&by.event("user.login_code_created").target("user", &u.id).details(details));
+    (code, expires)
 }
 
 // Sessions (admin).
@@ -596,6 +647,23 @@ pub fn start_pruning(app: AppState, cfg: SessionConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_hits_never_pass_the_limit() {
+        let limiter = std::sync::Arc::new(Limiter::new(5, MINUTE));
+        let passed: usize = (0..32)
+            .map(|_| {
+                let l = limiter.clone();
+                std::thread::spawn(move || l.hit("203.0.113.9", 1_000).is_none())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| usize::from(t.join().unwrap()))
+            .sum();
+        assert_eq!(passed, 5);
+        assert_eq!(limiter.hit("203.0.113.9", 1_000), Some(60));
+        assert_eq!(limiter.hit("203.0.113.9", 1_000 + MINUTE), None, "a new window");
+    }
 
     #[test]
     fn secrets_are_prefixed_random_and_hashed() {

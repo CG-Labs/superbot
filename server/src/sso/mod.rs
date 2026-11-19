@@ -581,7 +581,7 @@ pub async fn start(
     no_store(res)
 }
 
-const SIGNED_IN: &str = r#"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="0;url=/"><title>SuperBot</title><p style="font:16px system-ui;margin:2rem">Signed in. <a href="/">Continue to SuperBot</a></p>"#;
+const SIGNED_IN: &str = r#"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="0;url=/console/"><title>SuperBot</title><p style="font:16px system-ui;margin:2rem">Signed in. <a href="/console/">Continue to SuperBot</a></p>"#;
 
 /// `GET /api/auth/sso/{id}/callback?code&state`: the IdP sends the browser back here.
 pub async fn callback(

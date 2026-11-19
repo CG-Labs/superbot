@@ -50,6 +50,11 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    subject); GitHub: the numeric user id
                                                    (gh api users/<login> --jq .id)
   botctl user unlink <user> <identity-id>
+  botctl signup list [pending|approved|rejected|all]  Access requests from the get-started page
+  botctl signup approve <id> [--role admin|member|readonly] [--ttl <minutes>]
+                                                   Make the user (member by default) and print a
+                                                   one-time sign-in code, once (default 3 days)
+  botctl signup reject <id> [--reason "<text>"]    No email is sent either way
   botctl sessions [<user>]                         Live sessions
   botctl session revoke <id>
   botctl session revoke-all <user>
@@ -325,6 +330,40 @@ fn bot_access(args: &[&str]) -> Result<(&'static str, String, Option<String>), S
     })
 }
 
+/// `botctl signup ...`: people who asked for access on the get-started page (ADR 0022).
+fn signup_request(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
+    let at = |id: &str, verb: &str| format!("/api/signups/{}/{verb}", encode(id));
+    Ok(match args {
+        [] | ["list"] => ("GET", "/api/signups?status=pending".into(), None),
+        ["list", "all"] => ("GET", "/api/signups".into(), None),
+        ["list", s @ ("pending" | "approved" | "rejected")] => ("GET", format!("/api/signups?status={s}"), None),
+        ["approve", id, rest @ ..] => {
+            let ttl = flag(rest, "--ttl").map(|t| t.parse::<u32>().map_err(|_| "--ttl must be minutes")).transpose()?;
+            let body = json!({ "role": flag(rest, "--role").map(role).transpose()?, "ttlMinutes": ttl });
+            ("POST", at(id, "approve"), Some(body.to_string()))
+        }
+        ["reject", id, rest @ ..] => ("POST", at(id, "reject"), Some(json!({ "reason": flag(rest, "--reason") }).to_string())),
+        _ => return Err("Usage: botctl signup list [pending|approved|rejected|all] | approve <id> [--role R] [--ttl M] | reject <id> [--reason TEXT]".into()),
+    })
+}
+
+/// What `botctl signup approve` prints: the code once, and how to let SSO sign them in.
+fn approved(res: &Value) -> String {
+    let mins = (res["expiresAt"].as_i64().unwrap_or_default() - now_ms()) / 60_000;
+    let (email, user) = (res["user"]["email"].as_str().unwrap_or_default(), res["user"]["id"].as_str().unwrap_or_default());
+    let mut out = format!(
+        "Approved. {email} is now a {} user ({user}).\n\n{}\n\nA one-time sign-in code, good for about {} hours. It is shown only once; share it privately.",
+        res["user"]["role"].as_str().unwrap_or_default(),
+        res["code"].as_str().unwrap_or_default(),
+        ((mins + 30) / 60).max(1),
+    );
+    let sso: Vec<String> = res["sso"].as_array().into_iter().flatten().filter_map(|p| p["id"].as_str()).map(|id| format!("  botctl user link {email} {id} <subject>")).collect();
+    if !sso.is_empty() {
+        out.push_str(&format!("\n\nTo let them sign in with single sign-on instead, link their identity:\n{}", sso.join("\n")));
+    }
+    out
+}
+
 fn decide(verb: &str, id: &str, rest: &[&str]) -> Result<String, String> {
     let remember = if rest.contains(&"--remember-global") {
         json!("global")
@@ -402,6 +441,15 @@ fn run(args: &[String]) -> Result<String, String> {
         ["bot", rest @ ..] => {
             let (method, path, body) = bot_access(rest)?;
             op(method, &path, body)
+        }
+        ["signups"] | ["signup", ..] => {
+            let (method, path, body) = signup_request(a.get(1..).unwrap_or_default())?;
+            let res = api(Cred::Operator, method, &path, body)?;
+            match a.get(1) {
+                Some(&"approve") => Ok(approved(&serde_json::from_str(&res).map_err(|e| e.to_string())?)),
+                Some(&"reject") => Ok("Rejected. No email was sent.".into()),
+                _ => Ok(pretty(res)),
+            }
         }
         ["approvals"] => op("GET", "/api/approvals?status=pending", None),
         ["approvals", status] => op("GET", &format!("/api/approvals?status={status}"), None),
@@ -551,6 +599,32 @@ mod tests {
         assert!(req(&["grant", "b1", "u1", "owner"]).is_err());
         assert!(req(&["share"]).is_err());
         assert!(req(&[]).is_err());
+    }
+
+    #[test]
+    fn signup_commands() {
+        let req = |a: &[&str]| signup_request(a).map(|(m, p, b)| (m, p, b.map(|b| serde_json::from_str::<Value>(&b).unwrap())));
+        assert_eq!(req(&[]), Ok(("GET", "/api/signups?status=pending".into(), None)));
+        assert_eq!(req(&["list", "all"]), Ok(("GET", "/api/signups".into(), None)));
+        assert_eq!(req(&["list", "rejected"]), Ok(("GET", "/api/signups?status=rejected".into(), None)));
+        assert_eq!(req(&["approve", "su1"]), Ok(("POST", "/api/signups/su1/approve".into(), Some(json!({ "role": null, "ttlMinutes": null })))));
+        assert_eq!(
+            req(&["approve", "su1", "--role", "readonly", "--ttl", "90"]),
+            Ok(("POST", "/api/signups/su1/approve".into(), Some(json!({ "role": "readonly", "ttlMinutes": 90 }))))
+        );
+        assert_eq!(req(&["reject", "su1", "--reason", "spam"]), Ok(("POST", "/api/signups/su1/reject".into(), Some(json!({ "reason": "spam" })))));
+        assert!(req(&["approve", "su1", "--role", "root"]).is_err());
+        assert!(req(&["approve", "su1", "--ttl", "soon"]).is_err());
+        assert!(req(&["list", "maybe"]).is_err());
+
+        let res = json!({
+            "user": { "id": "u1", "email": "ada@example.com", "role": "member" },
+            "code": "sbc_x", "expiresAt": now_ms() + 3 * 24 * 3_600_000,
+            "sso": [{ "id": "work", "label": "Work", "type": "entra" }],
+        });
+        let out = approved(&res);
+        assert!(out.contains("sbc_x") && out.contains("about 72 hours") && out.contains("botctl user link ada@example.com work <subject>"), "{out}");
+        assert!(!approved(&json!({ "sso": [] })).contains("user link"));
     }
 
     #[test]
