@@ -129,13 +129,11 @@ export function AuditLog({ api, onBack, botName }: Props) {
   const load = useCallback(
     async (q: string, before?: number) => {
       const n = ++seq.current;
-      if (before == null) {
-        shown.current = q;
-        setLoading(true);
-      }
+      if (before == null) setLoading(true);
       try {
         const page = await api.audit(q, before);
         if (n !== seq.current) return;
+        shown.current = q;
         setEvents((prev) => (before != null && prev ? [...prev, ...page.events] : page.events));
         setNext(page.nextBefore);
         setError(null);
@@ -143,6 +141,7 @@ export function AuditLog({ api, onBack, botName }: Props) {
         if (n !== seq.current) return;
         setError(err instanceof Error ? err.message : "Couldn't load the audit log");
         if (before == null) {
+          shown.current = q;
           setEvents([]);
           setNext(null);
         }

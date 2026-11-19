@@ -145,6 +145,23 @@ describe("AuditLog", () => {
     expect(saveCsv).toHaveBeenCalledWith(expect.stringMatching(/^superbot-audit-\d{8}-\d{6}\.csv$/), "id,time\r\n");
   });
 
+  it("exports the rows on screen while a new filter is still loading", async () => {
+    const { api, user } = await open([{ events: [ev(1)], nextBefore: null }]);
+    await screen.findByLabelText("Audit event 1: bot.created");
+    let finish: (p: AuditPage) => void = () => {};
+    api.audit.mockImplementationOnce(() => new Promise<AuditPage>((r) => (finish = r)));
+    await user.press(screen.getByText("Filters"));
+    await user.press(screen.getByRole("radio", { name: "Failure" }));
+    await act(() => new Promise((r) => setTimeout(r, 350)));
+    expect(lastQuery(api)).toBe("outcome=failure");
+    await user.press(screen.getByText("Export CSV"));
+    expect(api.auditCsv).toHaveBeenLastCalledWith("");
+    await act(async () => finish({ events: [ev(2, { outcome: "failure" })], nextBefore: null }));
+    await screen.findByLabelText("Audit event 2: bot.created");
+    await user.press(screen.getByText("Export CSV"));
+    expect(api.auditCsv).toHaveBeenLastCalledWith("outcome=failure");
+  });
+
   it("shows why an export or a load failed", async () => {
     const api = fakeApi([]);
     api.audit.mockRejectedValueOnce(new ApiError("Admins only", 403));
