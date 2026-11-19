@@ -176,8 +176,9 @@ pub fn scrub(v: Value) -> Value {
                 .collect(),
         ),
         Value::Array(a) => Value::Array(a.into_iter().take(MAX_ARRAY).map(scrub).collect()),
-        // Only the first MAX_STRING characters are kept, so only those (and a margin) are scanned.
-        Value::String(s) => Value::String(clip(&redact_text(&s.chars().take(MAX_STRING * 2).collect::<String>()), MAX_STRING)),
+        // Masks the whole string before clipping: cutting first could hide the context
+        // that marks a secret (a URL's `@`, a closing quote). Masking is linear.
+        Value::String(s) => Value::String(clip(&redact_text(&s), MAX_STRING)),
         v => v,
     }
 }
@@ -782,6 +783,9 @@ mod tests {
         let t = std::time::Instant::now();
         assert!(!redact_text(&big).contains("=x"));
         assert!(t.elapsed() < std::time::Duration::from_secs(2), "{:?}", t.elapsed());
+        let url = format!("https://user:{}@example.com/x", "p".repeat(1_100));
+        let v = scrub(json!({ "subject": format!("git clone {url}") }));
+        assert!(!v["subject"].as_str().unwrap().contains("ppp"), "{v}");
         // Cut-short or odd input never panics.
         for odd in ["token=", "password:\"", "token={", "secret=\"\\", "key: [1, {", "token\\\":\\\"x"] {
             redact_text(odd);
