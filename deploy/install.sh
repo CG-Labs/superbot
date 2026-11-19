@@ -378,22 +378,41 @@ install_client() {
     return 1
   fi
   rev=$(sudo -u "$SUPERBOT_USER" git -C "$src" rev-parse --short=12 HEAD 2>/dev/null | tr -cd '0-9a-f' || true)
-  install -d -m 0755 -o root -g root "$(dirname "$CLIENT_DIR")" "$releases"
-  release=$(mktemp -d "$releases/$(date -u +%Y%m%dT%H%M%SZ)-${rev:-local}-XXXX")
-  tar -xf "$tmp/client.tar" -C "$release" --no-same-owner --no-same-permissions
+  # Callers use `||`, which turns off set -e here, so every step is checked by hand.
+  if ! install -d -m 0755 -o root -g root "$(dirname "$CLIENT_DIR")" "$releases" ||
+    ! release=$(mktemp -d "$releases/$(date -u +%Y%m%dT%H%M%SZ)-${rev:-local}-XXXX"); then
+    rm -rf "$tmp"
+    warn "Could not create a release folder in $releases"
+    return 1
+  fi
+  if ! { tar -xf "$tmp/client.tar" -C "$release" --no-same-owner --no-same-permissions &&
+    chown -R root:root "$release" &&
+    find "$release" -type d -exec chmod 0755 {} + &&
+    find "$release" -type f -exec chmod 0644 {} + &&
+    [[ -f "$release/index.html" ]] &&
+    touch "$release"; }; then
+    rm -rf "$tmp" "$release"
+    warn "Could not unpack the web client into $release"
+    return 1
+  fi
   rm -rf "$tmp"
-  chown -R root:root "$release"
-  find "$release" -type d -exec chmod 0755 {} +
-  find "$release" -type f -exec chmod 0644 {} +
-  touch "$release"
+  old=""
   if [[ -d "$CLIENT_DIR" && ! -L "$CLIENT_DIR" ]]; then
     # A folder from before releases (e.g. a manual build) is kept as the previous release.
-    old=$(mktemp -d "$releases/previous-XXXX")
-    rmdir "$old"
-    mv -T "$CLIENT_DIR" "$old"
+    old="$releases/previous-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    if ! mv -T "$CLIENT_DIR" "$old"; then
+      rm -rf "$release"
+      warn "Could not move $CLIENT_DIR aside"
+      return 1
+    fi
   fi
-  ln -sfn "$release" "$CLIENT_DIR.new"
-  mv -Tf "$CLIENT_DIR.new" "$CLIENT_DIR"
+  if ! { ln -sfn "$release" "$CLIENT_DIR.new" && mv -Tf "$CLIENT_DIR.new" "$CLIENT_DIR"; }; then
+    rm -f "$CLIENT_DIR.new"
+    [[ -z "$old" ]] || mv -T "$old" "$CLIENT_DIR" || true
+    rm -rf "$release"
+    warn "Could not switch $CLIENT_DIR to the new release"
+    return 1
+  fi
   find "$releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | tail -n +3 | cut -d' ' -f2- |
     while IFS= read -r old; do
       [[ "$old" == "$release" ]] || rm -rf -- "$old"

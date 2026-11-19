@@ -176,8 +176,12 @@ jobs:
             install_client "$dist"
             [[ $(readlink -f "$CLIENT_DIR") != "$live" ]]
             [[ $(find "$(client_releases_dir)" -mindepth 1 -maxdepth 1 | wc -l) == 2 ]]
-            # A build holding a link, or without index.html, is refused; the live client stays.
+            # A failure while unpacking leaves the live client and no half-made release.
             live=$(readlink -f "$CLIENT_DIR")
+            if (chown() { return 1; }; install_client "$dist"); then exit 1; fi
+            [[ $(readlink -f "$CLIENT_DIR") == "$live" ]]
+            [[ $(find "$(client_releases_dir)" -mindepth 1 -maxdepth 1 | wc -l) == 2 ]]
+            # A build holding a link, or without index.html, is refused; the live client stays.
             sudo -u superbot ln -s /etc/shadow "$dist/leak"
             if (install_client "$dist"); then exit 1; fi
             sudo -u superbot rm "$dist/leak" "$dist/index.html"
