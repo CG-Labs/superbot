@@ -382,7 +382,7 @@ pub async fn start(
     if a.limiter.blocked(&ip, at).is_some() {
         return no_store(ret.fail("sso_too_many"));
     }
-    let meta = match p.metadata(sso.http()).await {
+    let meta = match p.metadata(sso.http(), sso.refresh_gap).await {
         Ok(m) => m,
         Err(e) => {
             eprintln!("SSO {id}: discovery failed: {e}");
@@ -549,7 +549,11 @@ pub fn redeem(a: &Auth, source: Source, code: &str, verifier: &str, cookie: bool
     // Taken out first, so a wrong verifier spends the code too.
     let h = a.sso.handoffs.lock().unwrap_or_else(|e| e.into_inner()).remove(&hash(code));
     let h = h.filter(|h| h.expires > at && crate::same(s256(verifier).as_bytes(), h.challenge.as_bytes()));
-    let found = h.and_then(|h| Some((app.db.user(&h.user_id).filter(User::active)?, h)));
+    // Looked up again: an admin may have unlinked the identity or disabled the user since.
+    let found = h.and_then(|h| {
+        let (_, user) = app.db.identity(&h.claims.issuer, &h.claims.subject)?;
+        (user.id == h.user_id && user.active()).then_some((user, h))
+    });
     let Some((user, h)) = found else {
         a.limiter.fail(&ip, at);
         a.login_failed(&source, "sso", Some("bad_handoff"));
@@ -683,7 +687,7 @@ mod tests {
         .unwrap();
         assert_eq!((s.providers[0].label.as_str(), s.providers[0].type_name(), s.public_host.as_str()), ("acme", "oidc", "127.0.0.1:3000"));
         assert_eq!(s.app_redirects.len(), 2);
-        assert_eq!(s.providers[0].secret_name(), "SSO_ACME_CLIENT_SECRET");
+        assert_eq!(s.providers[0].env_var(), "SSO_ACME_CLIENT_SECRET");
     }
 
     #[test]

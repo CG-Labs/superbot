@@ -327,6 +327,13 @@ async fn the_app_trades_a_one_time_code_and_its_verifier_for_a_token() {
     let created = audit_list(&call(port, "GET", "/api/audit?action=user.created", &admin, "").await.1);
     assert!(created.iter().any(|e| e["details"]["reason"] == "just-in-time sign-up" && e["details"]["subject"] == OID && e["actorKind"] == "system"));
 
+    // A code issued before an admin unlinks the identity is no longer good.
+    let (path, _) = to_callback(port, &start("superbot://auth", &s256(&verifier))).await;
+    let (_, q) = back(path).await;
+    let (identity, user) = app.db.identity(&format!("{}/{T1}/v2.0", idp.authority), OID).unwrap();
+    assert_eq!(call(port, "DELETE", &format!("/api/users/{}/identities/{}", user.id, identity.id), &admin, "").await.0, 200);
+    assert_eq!(redeem(&q["code"], &verifier).await.0, 401, "unlinked since the code was issued");
+
     // Just in time never takes over an existing account with the same email.
     *idp.next.lock().unwrap() = (json!({ "oid": OID2, "email": "ADA@example.com" }), 0);
     let (path, _) = to_callback(port, &start("superbot://auth", &s256(&verifier))).await;
