@@ -104,7 +104,7 @@ describe("UsersAdmin", () => {
     const reveal = within(await screen.findByTestId("code-reveal"));
     expect(reveal.getByTestId("code-value")).toHaveTextContent(CODE);
     expect(reveal.getByText(/shown once/)).toBeOnTheScreen();
-    expect(reveal.getByText(new RegExp(`${BASE}/app/#code=${CODE}`))).toBeOnTheScreen();
+    expect(reveal.getByText(`${BASE}/app/#code=${CODE}`, { exact: false })).toBeOnTheScreen();
 
     expect(screen.queryByText(/^Scout/)).not.toBeOnTheScreen();
     await user.press(reveal.getByText("Done"));
