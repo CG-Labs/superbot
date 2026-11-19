@@ -33,7 +33,7 @@ All three run with the harness's own permission prompts off (`--dangerously-skip
 - **Codex**: the same hook via `-c hooks.PreToolUse=...` and `features.hooks=true`.
 - **Pi**: a small generated extension (`--extension`) that runs the same command on `tool_call`.
 
-The server is still the computer, so treat it that way. Details and trade-offs: [ADR 0005](adr/0005-approvals.md).
+The server is still the computer, so treat it that way. Details and trade-offs: [ADR 0007](adr/0007-approvals.md).
 
 Add a harness: write one adapter file and add it to `get()` and `NAMES` in `adapters/mod.rs`.
 
@@ -97,7 +97,7 @@ botctl rule add allow "npm install*" --bot <bot-id> # this Bot may install npm p
 botctl approvals | botctl approve <id> [--remember] | botctl deny <id>
 ```
 
-Limits: shell classification is heuristic, so this catches mistakes and prompt injection, not a determined attacker. Bots run as the same OS user as `botd`. See [ADR 0005](adr/0005-approvals.md).
+Limits: shell classification is heuristic, so this catches mistakes and prompt injection, not a determined attacker. Bots run as the same OS user as `botd`. See [ADR 0007](adr/0007-approvals.md).
 
 ## API
 

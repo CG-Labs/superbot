@@ -1,6 +1,6 @@
 # Approvals follow-ups
 
-Work left after the approvals MVP ([ADR 0005](adr/0005-approvals.md)). Each item is meant to become one GitHub issue.
+Work left after the approvals MVP ([ADR 0007](adr/0007-approvals.md)). Each item is meant to become one GitHub issue.
 
 1. **End-to-end hook tests against real CLIs.** CI tests the policy, queue, and API, not the harnesses. Add a job (or a manual script) that runs Claude Code, Codex, and Pi with a fake model or a cheap key, triggers a `git push`, and checks it waits for approval. Pin the minimum Codex version that runs hooks in `codex exec`.
 2. **Run harnesses as a separate OS user.** Bots share `botd`'s user, so a Bot could read `.env`, the database, or `botd`'s memory. Run each harness as a dedicated user (or in a container) with no read access to `DATA_DIR` secrets.

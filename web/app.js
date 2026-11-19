@@ -132,7 +132,7 @@ function renderSidebar() {
   $("approvals-btn").classList.toggle("waiting", approvals.length > 0);
 }
 
-// Approvals: risky tool calls wait here for a person (see docs/adr/0005-approvals.md).
+// Approvals: risky tool calls wait here for a person (see docs/adr/0007-approvals.md).
 function upsertApproval(a) {
   approvals = approvals.filter((x) => x.id !== a.id);
   if (a.status === "pending") approvals.push(a);

@@ -1,4 +1,4 @@
-# ADR 0005: Approvals and harness permission policy
+# 0007: Approvals and harness permission policy
 
 ## Status
 
