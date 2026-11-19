@@ -152,7 +152,7 @@ CSV export is RFC 4180 with CRLF line endings, oldest first. Cells that start wi
 People are users with a role: **admin** (everything), **member** (use and manage Bots and routines, decide approvals), or **read-only** (see everything, change nothing). Admins also manage policy, the audit log, users, sessions, and saved secrets. One check per API route enforces it; unknown routes are admin-only. Design: [ADR 0012](adr/0012-users-sessions-rbac.md).
 
 - **Owner**: made on first start as admin `operator` (name `USER_NAME`, email `OWNER_EMAIL`). `AUTH_PASSWORD` signs in as the owner (break-glass) while `AUTH_BREAK_GLASS` is on, the default. Set `AUTH_BREAK_GLASS=0` to ignore the password once admins sign in another way.
-- **Everyone else**: signs in with Microsoft Entra ID when it's set up ([guide](sso/entra.md), [ADR 0014](adr/0014-oidc-sso-entra.md)): an admin links their Microsoft account to a user (`botctl user link`), or just-in-time sign-up makes one. Or an admin gives them a one-time sign-in code, which they enter in the web app or client. Codes are single use and expire (default 1 hour).
+- **Everyone else**: signs in with Microsoft Entra ID, Google, or any OpenID Connect IdP (Okta, Keycloak, Auth0, …) when set up, several at once if you like ([Entra](sso/entra.md), [Google](sso/google.md), [OIDC](sso/oidc.md), [ADR 0014](adr/0014-oidc-sso-entra.md), [ADR 0015](adr/0015-sso-multi-provider.md)): an admin links their account at each IdP to a user (`botctl user link`), or just-in-time sign-up makes one. Email never links accounts. Or an admin gives them a one-time sign-in code, which they enter in the web app or client. Codes are single use and expire (default 1 hour).
 - **Sessions**: the web app gets an HttpOnly cookie, the client and `botctl` a bearer token. They end after `SESSION_IDLE_TIMEOUT` without use (default `7d`) or `SESSION_MAX_AGE` after sign-in (default `30d`), on logout, or when an admin revokes them or disables the user. Only hashes are stored.
 
 ```sh
@@ -184,7 +184,7 @@ All JSON. Auth: a session cookie (web app) or `Authorization: Bearer <session to
 Sign-in, users, and sessions ([ADR 0012](adr/0012-users-sessions-rbac.md)). Users and sessions are admin only:
 
 - `POST /api/auth/login` `{password | code | sso + verifier, session?: "cookie" | "token", label?}` → `{user, session, token}`. No credentials needed. 429 after 10 failures from one IP in 10 minutes
-- Single sign-on ([ADR 0014](adr/0014-oidc-sso-entra.md)), no credentials needed: `GET /api/auth/sso` → `{providers: [{id, label, type}]}`; `GET /api/auth/sso/:id/start?session=cookie|token&redirect=&challenge=&state=&label=` redirects to the IdP; `GET /api/auth/sso/:id/callback` is where it comes back
+- Single sign-on ([ADR 0014](adr/0014-oidc-sso-entra.md), [ADR 0015](adr/0015-sso-multi-provider.md)), no credentials needed: `GET /api/auth/sso` → `{providers: [{id, label, type: "entra" | "google" | "oidc"}]}` in `SSO_PROVIDERS` order; `GET /api/auth/sso/:id/start?session=cookie|token&redirect=&challenge=&state=&label=` redirects to the IdP; `GET /api/auth/sso/:id/callback` is where it comes back
 - `GET|POST /api/users/:id/identities` `{provider, subject, tenant?}`, `DELETE /api/users/:id/identities/:identity`: SSO identities linked to a user
 - `POST /api/auth/logout`, `GET /api/auth/me`: the caller's user, role, permissions, and session
 - `GET|POST /api/users` `{email, name?, role?}`, `GET|PATCH /api/users/:id-or-email` `{name?, email?, role?, status?: active|disabled}`. The owner can't be demoted or disabled (409)

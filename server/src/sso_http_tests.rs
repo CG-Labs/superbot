@@ -113,6 +113,12 @@ async fn serve(idp: &Idp, extra: &[(&str, &str)]) -> (u16, AppState, String, Str
     for (k, v) in extra {
         vars.insert(k.replace("{ID}", &up), v.to_string());
     }
+    let (port, app, admin) = serve_vars(vars).await;
+    (port, app, admin, id)
+}
+
+/// botd with the SSO settings in `vars` (SSO_PUBLIC_URL defaults to botd's own address).
+async fn serve_vars(mut vars: HashMap<String, String>) -> (u16, AppState, String) {
     let (port, app, admin, _) = serve_app_with(|a| {
         // The port is only known now, and the public URL must name it.
         let port = a.hosts[0].rsplit(':').next().unwrap().to_string();
@@ -122,7 +128,7 @@ async fn serve(idp: &Idp, extra: &[(&str, &str)]) -> (u16, AppState, String, Str
         a.sso.refresh_gap = Duration::ZERO;
     })
     .await;
-    (port, app, admin, id)
+    (port, app, admin)
 }
 
 fn header(head: &str, name: &str) -> Option<String> {
@@ -363,4 +369,216 @@ async fn the_client_secret_stays_with_botd() {
     let entry = listed["secrets"].as_array().unwrap().iter().find(|s| s["name"] == name.as_str()).cloned();
     assert_eq!(entry.map(|s| s["forBots"].clone()), Some(json!(false)), "{listed}");
     assert_eq!(crate::secrets::redact::text(&format!("x {} y", idp.secret)), "x [redacted] y");
+}
+
+/// A mock IdP with one issuer (Google, Okta, Keycloak, …) at `{origin}{path}`.
+struct Oidc {
+    issuer: String,
+    secret: String,
+    /// Claims every ID token carries, besides the protocol ones.
+    claims: Value,
+    /// Claims to change in the next ID token; null removes one.
+    next: Mutex<Value>,
+    /// code -> (PKCE challenge, nonce, redirect_uri)
+    codes: Mutex<HashMap<String, (String, String, String)>>,
+}
+
+/// `basic`: the token endpoint takes the client secret only as HTTP Basic.
+async fn mock_oidc(path: &str, basic: bool, claims: Value) -> Arc<Oidc> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let issuer = format!("http://127.0.0.1:{}{path}", listener.local_addr().unwrap().port());
+    let idp = Arc::new(Oidc { issuer: issuer.clone(), secret: random_hex(16), claims, next: Mutex::new(json!({})), codes: Mutex::default() });
+    let (a, b) = (idp.clone(), idp.clone());
+    let methods = if basic { json!(["client_secret_basic"]) } else { json!(["client_secret_post", "client_secret_basic"]) };
+    let meta = json!({
+        "issuer": issuer,
+        "authorization_endpoint": format!("{issuer}/authorize"),
+        "token_endpoint": format!("{issuer}/token"),
+        "jwks_uri": format!("{issuer}/keys"),
+        "token_endpoint_auth_methods_supported": methods,
+    });
+    let r = Router::new()
+        .route(&format!("{path}/.well-known/openid-configuration"), get(move || async move { Json(meta) }))
+        .route(&format!("{path}/keys"), get(|| async { Json(jwks(&[&keys()[0]])) }))
+        .route(
+            &format!("{path}/authorize"),
+            get(move |Query(q): Query<HashMap<String, String>>| async move {
+                assert_eq!((q["client_id"].as_str(), q["code_challenge_method"].as_str(), q["response_type"].as_str()), (CLIENT, "S256", "code"));
+                let code = random_hex(8);
+                a.codes.lock().unwrap().insert(code.clone(), (q["code_challenge"].clone(), q["nonce"].clone(), q["redirect_uri"].clone()));
+                let mut u = url::Url::parse(&q["redirect_uri"]).unwrap();
+                u.query_pairs_mut().extend_pairs([("code", &code), ("state", &q["state"])]);
+                (StatusCode::SEE_OTHER, [(header::LOCATION, u.to_string())]).into_response()
+            }),
+        )
+        .route(
+            &format!("{path}/token"),
+            post(move |headers: axum::http::HeaderMap, Form(f): Form<HashMap<String, String>>| async move {
+                let found = b.codes.lock().unwrap().remove(&f["code"]);
+                let basic_ok = headers.get(header::AUTHORIZATION).and_then(|h| h.to_str().ok())
+                    == Some(format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{CLIENT}:{}", b.secret)))).as_deref();
+                let secret_ok = if basic { basic_ok && !f.contains_key("client_secret") } else { f.get("client_secret") == Some(&b.secret) };
+                let ok = |(challenge, _, redirect): &(String, String, String)| {
+                    secret_ok && f["grant_type"] == "authorization_code" && &f["redirect_uri"] == redirect && &s256(&f["code_verifier"]) == challenge
+                };
+                let Some((_, nonce, _)) = found.filter(ok) else {
+                    return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid_grant" }))).into_response();
+                };
+                let now = db::now() / 1000;
+                let mut claims = json!({ "iss": b.issuer, "aud": CLIENT, "nonce": nonce, "iat": now, "exp": now + 3600 });
+                let c = claims.as_object_mut().unwrap();
+                c.extend(b.claims.as_object().unwrap().clone());
+                c.extend(b.next.lock().unwrap().as_object().unwrap().clone());
+                c.retain(|_, v| !v.is_null());
+                Json(json!({ "token_type": "Bearer", "id_token": keys()[0].sign(&claims) })).into_response()
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
+    idp
+}
+
+/// Settings for a provider `id` of `ty` on `idp`, with its client secret saved.
+fn provider_vars(id: &str, ty: &str, issuer: &str, secret: &str, extra: &[(&str, &str)]) -> Vec<(String, String)> {
+    let up = id.to_ascii_uppercase();
+    crate::secrets::global().put(&format!("SSO_{up}_CLIENT_SECRET"), secret).unwrap();
+    let mut v = vec![(format!("SSO_{up}_TYPE"), ty.to_string()), (format!("SSO_{up}_CLIENT_ID"), CLIENT.to_string())];
+    v.push((format!("SSO_{up}_{}", if ty == "entra" { "AUTHORITY" } else { "ISSUER" }), issuer.to_string()));
+    v.extend(extra.iter().map(|(k, val)| (format!("SSO_{up}_{k}"), val.to_string())));
+    v
+}
+
+/// The user a successful web callback signed in, by its session cookie.
+async fn signed_in_as(port: u16, head: &str) -> Option<String> {
+    let session = set_cookies(head).into_iter().find(|c| c.starts_with("superbot_session=sbs_"))?;
+    let (_, _, me) = call_with(port, "GET", "/api/auth/me", "", &format!("Cookie: {}\r\n", session.split(';').next().unwrap()), "").await;
+    serde_json::from_str::<Value>(&me).ok()?["user"]["id"].as_str().map(String::from)
+}
+
+fn google_claims() -> Value {
+    json!({ "sub": "1077", "email": "ada@example.com", "email_verified": true, "hd": "example.com", "name": "Ada Lovelace" })
+}
+
+#[tokio::test]
+async fn google_checks_the_workspace_domain_and_a_verified_email_before_sign_up() {
+    let idp = mock_oidc("", false, google_claims()).await;
+    let id = format!("g{}", random_hex(4));
+    let vars = provider_vars(&id, "google", &idp.issuer, &idp.secret, &[("HOSTED_DOMAINS", "example.com"), ("JIT_ROLE", "member")]);
+    let (port, app, admin) = serve_vars(vars.into_iter().chain([("SSO_PROVIDERS".into(), id.clone())]).collect()).await;
+
+    let (_, body) = call(port, "GET", "/api/auth/sso", "", "").await;
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["providers"], json!([{ "id": id, "label": "Google", "type": "google" }]));
+    let (code, head, _) = call_with(port, "GET", &format!("/api/auth/sso/{id}/start"), "", "", "").await;
+    assert_eq!(code, 303);
+    let to_idp = url::Url::parse(&header(&head, "location").unwrap()).unwrap();
+    let q: HashMap<_, _> = to_idp.query_pairs().into_owned().collect();
+    assert!(to_idp.as_str().starts_with(&format!("{}/authorize?", idp.issuer)));
+    assert_eq!((q["hd"].as_str(), q["prompt"].as_str(), q["scope"].as_str(), q["code_challenge_method"].as_str()), ("example.com", "select_account", "openid profile email", "S256"));
+
+    // Each is a real Google account, but not one this server takes. Nobody is created.
+    for (claims, reason) in [
+        (json!({ "hd": null }), "wrong_domain"),
+        (json!({ "hd": "evil.example", "email": "ada@example.com" }), "wrong_domain"),
+        (json!({ "email_verified": false }), "email_unverified"),
+        (json!({ "iss": "https://accounts.google.com" }), "wrong_issuer"),
+    ] {
+        *idp.next.lock().unwrap() = claims;
+        let (code, head) = web_sign_in(port, &id).await;
+        let page = if reason == "wrong_issuer" { "sso_failed" } else { "sso_wrong_account" };
+        assert_eq!((code, header(&head, "location")), (303, Some(format!("/login?error={page}"))), "{reason}");
+        assert_eq!(failures(port, &admin).await[0]["details"]["reason"].as_str(), Some(reason));
+        assert!(app.db.find_user("ada@example.com").is_none(), "{reason}");
+    }
+    *idp.next.lock().unwrap() = json!({});
+
+    // A verified account in the Workspace domain: made just in time, then signed in.
+    let (code, head) = web_sign_in(port, &id).await;
+    assert_eq!(code, 200, "{head}");
+    let user = app.db.find_user("ada@example.com").expect("made just in time");
+    assert_eq!((user.role, signed_in_as(port, &head).await), (Role::Member, Some(user.id.clone())));
+    let (identity, _) = app.db.identity(&idp.issuer, "1077").expect("stored under the issuer and sub");
+    assert_eq!((identity.provider.as_str(), identity.tenant), (id.as_str(), None));
+
+    // Leaving the Workspace (or a token for another domain) locks a known identity out too.
+    *idp.next.lock().unwrap() = json!({ "hd": "other.example" });
+    assert_eq!(header(&web_sign_in(port, &id).await.1, "location").as_deref(), Some("/login?error=sso_wrong_account"));
+}
+
+#[tokio::test]
+async fn generic_oidc_maps_claims_sends_basic_auth_and_restricts_email_domains() {
+    let claims = json!({ "sub": "pairwise-1", "uid": "u-1", "mail": "ada@example.com", "email_verified": "true", "display": "Ada L." });
+    let idp = mock_oidc("/realms/acme", true, claims).await;
+    let id = format!("o{}", random_hex(4));
+    let extra = [("SUBJECT_CLAIM", "uid"), ("EMAIL_CLAIM", "mail"), ("NAME_CLAIM", "display"), ("ALLOWED_DOMAINS", "example.com"), ("LABEL", "Acme SSO")];
+    let vars = provider_vars(&id, "oidc", &idp.issuer, &idp.secret, &extra);
+    let (port, app, admin) = serve_vars(vars.into_iter().chain([("SSO_PROVIDERS".into(), id.clone())]).collect()).await;
+
+    let (_, body) = call(port, "GET", "/api/auth/sso", "", "").await;
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["providers"], json!([{ "id": id, "label": "Acme SSO", "type": "oidc" }]));
+    let (_, head, _) = call_with(port, "GET", &format!("/api/auth/sso/{id}/start"), "", "", "").await;
+    let q: HashMap<_, _> = url::Url::parse(&header(&head, "location").unwrap()).unwrap().query_pairs().into_owned().collect();
+    assert!(!q.contains_key("prompt") && !q.contains_key("hd"), "{q:?}");
+
+    // Valid, but nobody linked the mapped subject: the audit event names it for the admin.
+    let (code, head) = web_sign_in(port, &id).await;
+    assert_eq!((code, header(&head, "location").as_deref()), (303, Some("/login?error=sso_not_linked")), "the code exchange used Basic auth");
+    assert_eq!(failures(port, &admin).await[0]["details"]["subject"].as_str(), Some("u-1"));
+
+    let u = app.db.create_user(None, Some("ada@corp.example"), "Ada", Role::Member).unwrap();
+    let (code, i) = call(port, "POST", &format!("/api/users/{}/identities", u.id), &admin, &json!({ "provider": id, "subject": "u-1" }).to_string()).await;
+    assert_eq!(code, 201, "{i}");
+    assert_eq!(serde_json::from_str::<Value>(&i).unwrap()["issuer"].as_str(), Some(idp.issuer.as_str()));
+    let (code, head) = web_sign_in(port, &id).await;
+    assert_eq!((code, signed_in_as(port, &head).await), (200, Some(u.id.clone())));
+    let logins = audit_list(&call(port, "GET", "/api/audit?action=auth.login", &admin, "").await.1);
+    assert_eq!(logins[0]["actorSubject"].as_str(), Some(format!("{}|u-1", idp.issuer).as_str()));
+
+    for (claims, reason) in [
+        (json!({ "mail": "ada@evil.example" }), "wrong_domain"),
+        (json!({ "email_verified": "false" }), "email_unverified"),
+        (json!({ "uid": null }), "missing_subject"),
+    ] {
+        *idp.next.lock().unwrap() = claims;
+        let (_, head) = web_sign_in(port, &id).await;
+        let page = if reason == "missing_subject" { "sso_failed" } else { "sso_wrong_account" };
+        assert_eq!(header(&head, "location"), Some(format!("/login?error={page}")), "{reason}");
+        assert_eq!(failures(port, &admin).await[0]["details"]["reason"].as_str(), Some(reason));
+    }
+}
+
+#[tokio::test]
+async fn entra_google_and_oidc_side_by_side_sign_in_to_one_linked_user() {
+    let (entra, google, okta) = (mock_idp().await, mock_oidc("", false, google_claims()).await, mock_oidc("/oauth2/default", false, json!({ "sub": "00u1", "email": "ada@example.com", "email_verified": true })).await);
+    let ids = [format!("e{}", random_hex(4)), format!("g{}", random_hex(4)), format!("o{}", random_hex(4))];
+    let mut vars: HashMap<String, String> = HashMap::from([("SSO_PROVIDERS".into(), ids.join(","))]);
+    vars.extend(provider_vars(&ids[0], "entra", &entra.authority, &entra.secret, &[("TENANT", T1)]));
+    vars.extend(provider_vars(&ids[1], "google", &google.issuer, &google.secret, &[]));
+    vars.extend(provider_vars(&ids[2], "oidc", &okta.issuer, &okta.secret, &[("LABEL", "Okta")]));
+    let (port, app, admin) = serve_vars(vars).await;
+
+    let (_, body) = call(port, "GET", "/api/auth/sso", "", "").await;
+    let listed: Vec<(String, String)> = serde_json::from_str::<Value>(&body).unwrap()["providers"].as_array().unwrap().iter().map(|p| (p["id"].as_str().unwrap().into(), p["label"].as_str().unwrap().into())).collect();
+    assert_eq!(listed, [(ids[0].clone(), "Microsoft".into()), (ids[1].clone(), "Google".into()), (ids[2].clone(), "Okta".into())], "in SSO_PROVIDERS order");
+
+    // One person, three identities, linked by an admin to the same user. Email never links them.
+    let u = app.db.create_user(None, Some("ada@corp.example"), "Ada", Role::Member).unwrap();
+    for (id, subject) in [(&ids[0], OID), (&ids[1], "1077"), (&ids[2], "00u1")] {
+        let (code, i) = call(port, "POST", &format!("/api/users/{}/identities", u.id), &admin, &json!({ "provider": id, "subject": subject }).to_string()).await;
+        assert_eq!(code, 201, "{i}");
+    }
+    for id in &ids {
+        let (code, head) = web_sign_in(port, id).await;
+        assert_eq!((code, signed_in_as(port, &head).await), (200, Some(u.id.clone())), "{id}");
+    }
+    let logins = audit_list(&call(port, "GET", "/api/audit?action=auth.login", &admin, "").await.1);
+    let providers: Vec<&str> = logins.iter().take(3).filter_map(|e| e["details"]["provider"].as_str()).collect();
+    assert_eq!(providers, [ids[2].as_str(), ids[1].as_str(), ids[0].as_str()]);
+    let (_, list) = call(port, "GET", &format!("/api/users/{}/identities", u.id), &admin, "").await;
+    assert_eq!(serde_json::from_str::<Value>(&list).unwrap().as_array().unwrap().len(), 3);
+
+    // A sign-in started with one provider can't be finished at another's callback.
+    let (path, binder) = to_callback(port, &format!("/api/auth/sso/{}/start", ids[1])).await;
+    let swapped = path.replace(&format!("/sso/{}/", ids[1]), &format!("/sso/{}/", ids[2]));
+    let (_, head, _) = call_with(port, "GET", &swapped, "", &binder, "").await;
+    assert_eq!(header(&head, "location").as_deref(), Some("/login?error=sso_failed"));
+    assert_eq!(failures(port, &admin).await[0]["details"]["reason"].as_str(), Some("wrong_provider"));
 }
