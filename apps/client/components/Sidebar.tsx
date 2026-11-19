@@ -9,10 +9,12 @@ interface Props {
   onNewBot: () => void;
   onLogout: () => void;
   onOpenApprovals: () => void;
+  /** Shown to admins only; the server refuses the users API to everyone else. */
+  onOpenUsers?: () => void;
   compact?: boolean;
 }
 
-export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, compact }: Props) {
+export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOpenUsers, compact }: Props) {
   const {
     bots,
     activeId,
@@ -102,6 +104,11 @@ export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, comp
           </View>
         ) : null}
       </Pressable>
+      {onOpenUsers && me.permissions?.includes("admin") ? (
+        <Pressable style={styles.approvalsBtn} onPress={onOpenUsers} accessibilityRole="button">
+          <Text style={styles.hiddenText}>Users</Text>
+        </Pressable>
+      ) : null}
       <View style={styles.meRow}>
         <View style={styles.meAvatar}>
           <Text style={styles.meInitial}>{(me.name || "?")[0]?.toUpperCase()}</Text>

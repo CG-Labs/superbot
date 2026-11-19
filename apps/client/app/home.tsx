@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import { Modal, StyleSheet, useWindowDimensions, View } from "react-native";
-import { Redirect } from "expo-router";
+import { Redirect, router } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { ApprovalsInbox } from "../components/ApprovalsInbox";
 import { BotDetailsPanel } from "../components/BotDetailsPanel";
@@ -76,6 +76,7 @@ export default function HomeScreen() {
             onNewBot={() => setCreateOpen(true)}
             onLogout={onLogout}
             onOpenApprovals={() => setApprovalsOpen(true)}
+            onOpenUsers={() => router.push("/users")}
           />
         ) : null}
         {wide || mobilePane === "chat" ? (
