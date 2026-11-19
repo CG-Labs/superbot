@@ -48,7 +48,15 @@ services:
     stop_grace_period: 30s
 
   caddy:
-    image: ${CADDY_IMAGE:-caddy:2}
+    # Stock Caddy plus the web client served at /app/, built from this checkout.
+    image: ${SUPERBOT_CADDY_IMAGE:-superbot-caddy:local}
+    pull_policy: never
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: caddy
+      args:
+        CADDY_IMAGE: ${CADDY_IMAGE:-caddy:2}
     restart: unless-stopped
     depends_on:
       botd:
