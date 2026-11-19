@@ -513,7 +513,9 @@ pub struct ScimFields<'a> {
     /// The name SuperBot shows.
     pub display_name: &'a str,
     pub email: Option<&'a str>,
-    pub active: bool,
+    /// None leaves the status as it is now, so an update that doesn't change `active`
+    /// can't undo an admin's disable that landed after it read the user.
+    pub active: Option<bool>,
 }
 
 /// Why a SCIM write was refused: something unique is someone else's already.
@@ -1870,6 +1872,11 @@ impl Db {
         Some(t)
     }
 
+    /// The token with this hash, revoked or not: a revoked token still in use is worth an alert.
+    pub fn scim_token_by_hash(&self, token_hash: &str) -> Option<ScimToken> {
+        self.c().query_row("SELECT * FROM scim_tokens WHERE token_hash = ?", [token_hash], scim_token_row).optional().ok().flatten()
+    }
+
     /// False if it was already revoked or doesn't exist.
     pub fn revoke_scim_token(&self, id: &str, by: &str) -> bool {
         self.c().execute("UPDATE scim_tokens SET revoked_at = ?, revoked_by = ? WHERE id = ? AND revoked_at IS NULL", params![now(), by, id]).unwrap_or(0) == 1
@@ -1915,8 +1922,8 @@ impl Db {
 
     fn write_scim_user(tx: &Connection, tenant: &str, user_id: &str, f: &ScimFields, at: i64) -> rusqlite::Result<()> {
         tx.execute(
-            "UPDATE users SET email = ?, display_name = ?, status = ?, updated_at = ? WHERE id = ?",
-            params![f.email, f.display_name, if f.active { "active" } else { "disabled" }, at, user_id],
+            "UPDATE users SET email = ?, display_name = ?, status = coalesce(?, status), updated_at = ? WHERE id = ?",
+            params![f.email, f.display_name, f.active.map(|on| if on { "active" } else { "disabled" }), at, user_id],
         )?;
         tx.execute(
             "INSERT INTO scim_users (user_id, tenant, external_id, user_name, given_name, family_name, display_name, formatted, created_at, updated_at)

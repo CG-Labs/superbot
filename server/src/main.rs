@@ -479,7 +479,11 @@ impl Auth {
     fn login_failed(&self, source: &Source, method: &str, reason: Option<&str>) {
         let client = format!("{}|{method}", source.ip.as_deref().unwrap_or(""));
         let Some(missed) = self.logins.failure(&client, db::now()) else { return };
-        let actor = if method == "bot_token" { Actor::bot(None, None) } else { Actor { id: None, ..Actor::operator() } };
+        let actor = match method {
+            "bot_token" => Actor::bot(None, None),
+            "scim_token" => Actor::system("scim"),
+            _ => Actor { id: None, ..Actor::operator() },
+        };
         let actor = actor.method(method);
         let who = Who { actor, source: source.clone() };
         let mut details = json!({ "method": method, "unloggedSinceLast": missed });
@@ -706,6 +710,8 @@ fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<
         return match a.session(t) {
             Some(found) => Ok(from_session(found)),
             None if t.starts_with(users::SESSION_PREFIX) => fail("session", Some("unknown_or_expired"), false),
+            // A provisioning token works only under /scim/v2 (ADR 0023); one sent here may have leaked.
+            None if t.starts_with(scim::TOKEN_PREFIX) => fail("scim_token", Some("not_for_api"), false),
             None => fail("bot_token", None, false),
         };
     }

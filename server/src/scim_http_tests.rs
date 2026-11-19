@@ -151,7 +151,82 @@ async fn only_a_scim_token_works_and_bad_ones_are_throttled() {
     }
     let (_, retry) = limited.expect("bad tokens are rate limited per IP");
     assert!(retry.is_some_and(|r| r.parse::<i64>().unwrap() > 0));
-    assert_eq!(scim(port, &t, "GET", USERS, Value::Null).await.0, 429, "even good tokens wait out the block from this IP");
+}
+
+/// SCIM-01 (docs/security/auth-review-2026-11-scim.md): Entra and Okta send from addresses
+/// they share with every customer. Junk tokens from those addresses (anyone's own IdP
+/// app pointed here) must not hold off a real tenant's deprovisioning.
+#[tokio::test]
+async fn bad_tokens_from_an_address_never_block_a_valid_token_from_it() {
+    let (port, app, admin) = serve(|a| a.scim.failures = users::Limiter::new(3, 60_000)).await;
+    let (t, _) = token(port, &admin, json!({ "tenant": "entra" })).await;
+    let (_, _, u) = scim(port, &t, "POST", USERS, okta_user("ada@example.com", "e1")).await;
+    let id = u["id"].as_str().unwrap().to_string();
+    let shared = "X-Forwarded-For: 20.36.0.1\r\n";
+    let junk = format!("Bearer {}", users::new_secret(scim::TOKEN_PREFIX));
+    let mut codes = Vec::new();
+    for _ in 0..4 {
+        codes.push(call_with(port, "GET", USERS, &junk, shared, "").await.0);
+    }
+    assert_eq!(codes, [401, 401, 401, 429]);
+    assert_eq!(call_with(port, "GET", USERS, &junk, shared, "").await.0, 429, "bad tokens stay blocked");
+    // The real tenant, from the same address, still deprovisions.
+    let off = json!({ "Operations": [{ "op": "replace", "path": "active", "value": false }] }).to_string();
+    let (code, _, body) = call_with(port, "PATCH", &format!("{USERS}/{id}"), &format!("Bearer {t}"), shared, &off).await;
+    assert_eq!(code, 200, "{body}");
+    assert!(!app.db.user(&id).unwrap().active());
+}
+
+#[tokio::test]
+async fn a_revoked_token_in_use_is_named_in_the_audit_log() {
+    let (port, _, admin) = serve(|_| {}).await;
+    let (t, id) = token(port, &admin, json!({ "tenant": "okta" })).await;
+    assert_eq!(call(port, "DELETE", &format!("/api/scim/tokens/{id}"), &admin, "").await.0, 200);
+    assert_eq!(scim(port, &t, "GET", USERS, Value::Null).await.0, 401);
+    let failed = events(port, &admin, "action=scim.auth_failed").await;
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    let e = &failed[0];
+    assert_eq!((e["details"]["reason"].as_str(), e["details"]["tenant"].as_str(), e["targetType"].as_str(), e["targetId"].as_str()), (Some("revoked"), Some("okta"), Some("scim_token"), Some(id.as_str())));
+    let (_, all) = call(port, "GET", "/api/audit", &admin, "").await;
+    assert!(!all.contains(&t) && !all.contains(&users::hash(&t)), "never the token or its hash");
+}
+
+/// SCIM-03: a SCIM token sent to the API is refused and logged as one, not as a bad Bot token.
+#[tokio::test]
+async fn a_scim_token_on_the_api_is_logged_as_a_scim_token() {
+    let (port, _, admin) = serve(|_| {}).await;
+    let (t, _) = token(port, &admin, json!({ "tenant": "okta" })).await;
+    assert_eq!(call(port, "GET", "/api/users", &format!("Bearer {t}"), "").await.0, 401);
+    let failed = events(port, &admin, "action=auth.login_failed").await;
+    let e = failed.iter().find(|e| e["details"]["method"] == "scim_token").unwrap_or_else(|| panic!("{failed:?}"));
+    assert_eq!((e["details"]["reason"].as_str(), e["actorKind"].as_str(), e["actorId"].as_str()), (Some("not_for_api"), Some("system"), Some("scim")));
+}
+
+/// SCIM-02: an update that doesn't change `active` leaves the status as it is when it
+/// writes, so an admin's disable that landed after the update read the user stands.
+#[tokio::test]
+async fn an_update_that_leaves_active_alone_cannot_undo_an_admins_disable() {
+    let (port, app, admin) = serve(|_| {}).await;
+    let (t, _) = token(port, &admin, json!({ "tenant": "okta" })).await;
+    let (_, _, u) = scim(port, &t, "POST", USERS, okta_user("ada@example.com", "00u1")).await;
+    let id = u["id"].as_str().unwrap().to_string();
+    // What a PATCH of the family name read before the admin acted.
+    let stale = app.db.scim_user("okta", &id).unwrap();
+    assert!(stale.user.active());
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{id}"), &admin, r#"{"status":"disabled"}"#).await.0, 200);
+    assert!(!app.db.user(&id).unwrap().active());
+    let rename = db::ScimFields { user_name: &stale.user_name, external_id: stale.external_id.as_deref(), given_name: Some("Ada"), family_name: Some("King"), scim_display_name: None, formatted: None, display_name: "Ada King", email: stale.user.email.as_deref(), active: None };
+    app.db.save_scim_user("okta", &id, &rename, false).unwrap();
+    assert!(!app.db.user(&id).unwrap().active(), "the disable stands");
+    assert_eq!(app.db.user(&id).unwrap().name, "Ada King");
+    // Through the API: an unrelated update records no enable and leaves them disabled.
+    let (code, _, u) = scim(port, &t, "PATCH", &format!("{USERS}/{id}"), json!({ "Operations": [{ "op": "replace", "path": "displayName", "value": "A. King" }] })).await;
+    assert_eq!((code, u["active"].clone()), (200, json!(false)));
+    assert!(events(port, &admin, "action=user.enabled").await.is_empty());
+    // The IdP still owns `active`: saying so enables them again.
+    let (_, _, u) = scim(port, &t, "PATCH", &format!("{USERS}/{id}"), json!({ "Operations": [{ "op": "replace", "path": "active", "value": true }] })).await;
+    assert_eq!(u["active"], true);
+    assert_eq!(events(port, &admin, "action=user.enabled").await.len(), 1);
 }
 
 #[tokio::test]
@@ -345,7 +420,7 @@ async fn entra_patches_deletes_softly_and_provisions_again() {
     let kept = app.db.user(&id).expect("never destroyed");
     assert!(!kept.active());
     // An update that read the user before the DELETE can't bring them back.
-    let stale = db::ScimFields { user_name: "grace@contoso.example", external_id: Some("grace"), given_name: None, family_name: None, scim_display_name: None, formatted: None, display_name: "Grace", email: None, active: true };
+    let stale = db::ScimFields { user_name: "grace@contoso.example", external_id: Some("grace"), given_name: None, family_name: None, scim_display_name: None, formatted: None, display_name: "Grace", email: None, active: Some(true) };
     assert_eq!(app.db.save_scim_user("entra", &id, &stale, false), Err(db::ScimConflict::Gone));
     assert!(!app.db.user(&id).unwrap().active());
     let deleted = &events(port, &admin, "action=scim.user_deleted").await[0];
