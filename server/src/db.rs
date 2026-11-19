@@ -1829,15 +1829,27 @@ impl Db {
 
     // SCIM (ADR 0023). Callers hash tokens; nothing here sees one.
 
-    pub fn create_scim_token(&self, tenant: &str, label: Option<&str>, sso_provider: Option<&str>, token_hash: &str, by: Option<&str>) -> ScimToken {
+    /// A tenant's first token sets its SSO provider for good: a token naming another gets
+    /// `Err` with the tenant's provider. Checked and written in one transaction.
+    pub fn create_scim_token(&self, tenant: &str, label: Option<&str>, sso_provider: Option<&str>, token_hash: &str, by: Option<&str>) -> Result<ScimToken, Option<String>> {
         let id = format!("st{}", crate::random_hex(4));
-        self.c()
-            .execute(
-                "INSERT INTO scim_tokens (id, tenant, label, sso_provider, token_hash, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                params![id, tenant, label, sso_provider, token_hash, now(), by],
-            )
-            .unwrap();
-        self.scim_token(&id).unwrap()
+        let c = self.c();
+        let tx = c.unchecked_transaction().unwrap();
+        let first: Option<Option<String>> =
+            tx.query_row("SELECT sso_provider FROM scim_tokens WHERE tenant = ? ORDER BY created_at, id LIMIT 1", [tenant], |r| r.get(0)).optional().unwrap();
+        if let Some(first) = first
+            && first.as_deref() != sso_provider
+        {
+            return Err(first);
+        }
+        tx.execute(
+            "INSERT INTO scim_tokens (id, tenant, label, sso_provider, token_hash, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            params![id, tenant, label, sso_provider, token_hash, now(), by],
+        )
+        .unwrap();
+        let t = tx.query_row("SELECT * FROM scim_tokens WHERE id = ?", [&id], scim_token_row).unwrap();
+        tx.commit().unwrap();
+        Ok(t)
     }
 
     pub fn scim_token(&self, id: &str) -> Option<ScimToken> {
@@ -1849,15 +1861,6 @@ impl Db {
         let c = self.c();
         let mut s = c.prepare("SELECT * FROM scim_tokens ORDER BY created_at DESC, id").unwrap();
         s.query_map([], scim_token_row).unwrap().filter_map(Result::ok).collect()
-    }
-
-    /// The SSO provider a tenant's first token named: every later token must name the same.
-    pub fn scim_tenant_sso(&self, tenant: &str) -> Option<Option<String>> {
-        self.c()
-            .query_row("SELECT sso_provider FROM scim_tokens WHERE tenant = ? ORDER BY created_at, id LIMIT 1", [tenant], |r| r.get(0))
-            .optional()
-            .ok()
-            .flatten()
     }
 
     /// The unrevoked token with this hash. Records use, at most once a minute.

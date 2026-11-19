@@ -210,6 +210,7 @@ async fn okta_provisions_finds_updates_and_deactivates() {
     assert_eq!((u["userName"].as_str(), u["externalId"].as_str(), u["active"].clone(), u["displayName"].as_str()), (Some("ada@example.com"), Some("00u1"), json!(true), Some("Ada Lovelace")));
     assert_eq!(u["emails"], json!([{ "value": "ada@example.com", "type": "work", "primary": true }]));
     assert_eq!(u["meta"]["location"], format!("http://127.0.0.1:{port}/scim/v2/Users/{id}"));
+    assert_eq!(header(&head, "location"), Some(format!("http://127.0.0.1:{port}/scim/v2/Users/{id}")));
     assert!(u.get("password").is_none() && u.get("groups").is_none());
     let user = app.db.user(&id).unwrap();
     assert_eq!((user.email.as_deref(), user.role, user.active()), (Some("ada@example.com"), rbac::Role::Member, true));
@@ -327,6 +328,9 @@ async fn entra_patches_deletes_softly_and_provisions_again() {
     // name.formatted is kept as sent; the shown name stays the displayName.
     let (_, _, u) = scim(port, &t, "PATCH", &format!("{USERS}/{id}"), json!({ "Operations": [{ "op": "Replace", "path": "name.formatted", "value": "G. Hopper" }] })).await;
     assert_eq!((u["name"]["formatted"].as_str(), u["displayName"].as_str()), (Some("G. Hopper"), Some("Amazing Grace")));
+    let audited = events(port, &admin, "action=user.updated").await;
+    let last = audited.iter().find(|e| e["targetId"] == id.as_str()).unwrap();
+    assert_eq!(last["details"]["changes"]["formatted"]["to"], "G. Hopper", "{last}");
 
     // Turn it back on, sign in, then DELETE: disabled, sessions gone, history kept.
     assert_eq!(scim(port, &t, "PATCH", &format!("{USERS}/{id}"), json!({ "Operations": [{ "op": "Replace", "path": "active", "value": true }] })).await.0, 200);

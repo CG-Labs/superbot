@@ -681,6 +681,8 @@ async fn changed(app: &AppState, c: &Caller, before_user: &User, before: Option<
         diff("externalId", json!(b.external_id), json!(after.external_id));
         diff("givenName", json!(b.given_name), json!(after.given_name));
         diff("familyName", json!(b.family_name), json!(after.family_name));
+        diff("displayName", json!(b.display_name), json!(after.display_name));
+        diff("formatted", json!(b.formatted), json!(after.formatted));
     }
     if !changes.is_empty() {
         app.db.record(&ev("user.updated").details(json!({ "changes": changes, "tenant": c.token.tenant })));
@@ -776,7 +778,14 @@ pub async fn create_user(State(app): State<AppState>, Extension(a): Extension<Ar
     let d = from_resource(&parse_body(body)?, None)?;
     let tenant = c.token.tenant.as_str();
     let base = base_url(&headers);
-    let created = |s: &ScimUser| Ok(scim_json(StatusCode::CREATED, resource(&base, s)));
+    let created = |s: &ScimUser| {
+        let body = resource(&base, s);
+        let mut r = scim_json(StatusCode::CREATED, body.clone());
+        if let Some(Ok(at)) = body["meta"]["location"].as_str().map(HeaderValue::from_str) {
+            r.headers_mut().insert(header::LOCATION, at);
+        }
+        Ok(r)
+    };
     if let Some(ext) = &d.external_id
         && let Some(found) = app.db.scim_find(tenant, &ScimKey::ExternalId(ext.clone()))
     {
@@ -900,14 +909,11 @@ pub async fn create_token(State(app): State<AppState>, Extension(a): Extension<A
         })?;
         p.issuer_for(None).map_err(|e| bad(format!("SCIM can't link {pid}: {e}")))?;
     }
-    if let Some(first) = app.db.scim_tenant_sso(&tenant)
-        && first != sso
-    {
-        let had = first.map_or("no SSO provider".to_string(), |p| format!("the SSO provider {p}"));
-        return Err(ApiError(StatusCode::CONFLICT, format!("Tenant {tenant} links {had}; its tokens all must. Use a new tenant name for another link.")));
-    }
     let token = users::new_secret(TOKEN_PREFIX);
-    let t = app.db.create_scim_token(&tenant, label.as_deref(), sso.as_deref(), &users::hash(&token), by.actor.id.as_deref());
+    let t = app.db.create_scim_token(&tenant, label.as_deref(), sso.as_deref(), &users::hash(&token), by.actor.id.as_deref()).map_err(|first| {
+        let had = first.map_or("no SSO provider".to_string(), |p| format!("the SSO provider {p}"));
+        ApiError(StatusCode::CONFLICT, format!("Tenant {tenant} links {had}; its tokens all must. Use a new tenant name for another link."))
+    })?;
     app.db.record(&by.event("scim.token_created").target("scim_token", &t.id).details(json!({ "tenant": t.tenant, "label": t.label, "sso": t.sso_provider })));
     let mut res = (StatusCode::CREATED, Json(json!({ "token": token, "scimToken": t, "enabled": a.scim.enabled }))).into_response();
     res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
