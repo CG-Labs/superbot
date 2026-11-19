@@ -57,6 +57,14 @@ npm run build:web    # output in dist/
 npx serve dist
 ```
 
+Servers serve the client at `/app/` ([deploy/README.md](../../deploy/README.md#web-client)). That build sets the base path from `SUPERBOT_WEB_BASE_URL` (read in `app.config.js`, so other builds are unchanged):
+
+```bash
+npm run build:web:server   # SUPERBOT_WEB_BASE_URL=/app, output in dist-app/
+```
+
+Served from the server's own origin, the login fills in that origin as the Server URL.
+
 ## Desktop (Windows / Linux / macOS)
 
 Electron loads the static web export (no Mac-only tooling):
@@ -116,6 +124,7 @@ You cannot produce a signed `.ipa` on Linux/Windows locally; use **EAS Build** (
 | `npm run lint` | ESLint |
 | `npm test` | Jest (`jest-expo`) unit and component tests |
 | `npm run build:web` | Static web bundle (CI) |
+| `npm run build:web:server` | Web bundle for the server's `/app/` path |
 | `npm run desktop` | Electron dev |
 | `eas build -p android` | Cloud APK/AAB |
 | `eas build -p ios` | Cloud IPA |

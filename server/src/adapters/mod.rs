@@ -61,7 +61,7 @@ pub struct Guard {
 pub(crate) const SECRET_ENV: [&str; 6] =
     ["AUTH_PASSWORD", "AUTH_PASSWORD_FILE", "SUPERBOT_PASSWORD", "SUPERBOT_TOKEN", "SUPERBOT_MASTER_KEY", "SUPERBOT_MASTER_KEY_FILE"];
 
-/// `SECRET_ENV`, and every `SSO_*` setting: sign-in config, including client secrets (ADR 0013).
+/// `SECRET_ENV`, and every `SSO_*` setting: sign-in config, including client secrets (ADR 0014).
 pub(crate) fn strip_secret_env(cmd: &mut Command) {
     for k in SECRET_ENV {
         cmd.env_remove(k);

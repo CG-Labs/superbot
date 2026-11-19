@@ -1,7 +1,14 @@
-# Allowlist: the image needs only the Rust workspace, the embedded web app, and the container scripts.
+# Allowlist: the image needs only the Rust workspace, the embedded web app, the container scripts,
+# and the web client source (for the caddy target).
 *
 !Cargo.toml
 !Cargo.lock
 !server/
 !web/
 !deploy/docker/*.sh
+!apps/client/
+apps/client/node_modules
+apps/client/dist
+apps/client/dist-app
+apps/client/release
+apps/client/.expo

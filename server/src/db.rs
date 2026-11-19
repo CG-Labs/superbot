@@ -251,7 +251,7 @@ pub struct NewSession<'a> {
     pub expires_at: i64,
 }
 
-/// An SSO identity linked to a user (ADR 0013). `(issuer, subject)` is the key; the
+/// An SSO identity linked to a user (ADR 0014). `(issuer, subject)` is the key; the
 /// email is only what the IdP last said, never used to find anyone.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -413,7 +413,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 /// Each gets `fresh`: true when this database was just created.
 const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 4] = [migrate_approvals, migrate_audit_events, migrate_users, migrate_identities];
 
-/// SSO identities (ADR 0013): any number per user, each `(issuer, subject)` at most
+/// SSO identities (ADR 0014): any number per user, each `(issuer, subject)` at most
 /// once. `users.idp_issuer`/`idp_subject` become the user's first identity and are
 /// kept in step with this table. Sessions remember which identity signed them in.
 fn migrate_identities(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
@@ -1033,7 +1033,7 @@ impl Db {
         }
     }
 
-    // SSO identities (ADR 0013)
+    // SSO identities (ADR 0014)
 
     /// The identity with this key and its user, whatever the user's status.
     pub fn identity(&self, issuer: &str, subject: &str) -> Option<(Identity, User)> {

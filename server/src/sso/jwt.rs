@@ -1,4 +1,4 @@
-//! ID token checks (ADR 0013): an RS256 signature by a key in the IdP's JWKS, then the
+//! ID token checks (ADR 0014): an RS256 signature by a key in the IdP's JWKS, then the
 //! standard claims. Only RS256: it's what Entra and most IdPs sign ID tokens with, and
 //! accepting one algorithm leaves no `alg` to confuse.
 

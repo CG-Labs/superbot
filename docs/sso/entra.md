@@ -1,6 +1,6 @@
 # Sign in with Microsoft Entra ID
 
-Lets people sign in to SuperBot with their work Microsoft account. Design: [ADR 0013](../adr/0013-oidc-sso-entra.md).
+Lets people sign in to SuperBot with their work Microsoft account. Design: [ADR 0014](../adr/0014-oidc-sso-entra.md).
 
 You need: admin rights in your Entra tenant (to register an app), and SuperBot on HTTPS at a fixed address, like `https://superbot.example.com`. Below, replace `superbot.example.com` with yours.
 

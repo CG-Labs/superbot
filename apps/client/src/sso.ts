@@ -7,7 +7,7 @@ import { ApiError } from "./api";
 import { normalizeBaseUrl } from "./auth";
 import type { ServerConfig } from "./types";
 
-/** A single sign-on provider the server offers (ADR 0013). */
+/** A single sign-on provider the server offers (ADR 0014). */
 export interface SsoProvider {
   id: string;
   label: string;

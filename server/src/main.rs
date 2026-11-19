@@ -360,7 +360,7 @@ struct Auth {
     sessions: SessionConfig,
     logins: audit::Logins,
     limiter: users::Limiter,
-    /// Single sign-on providers and sign-ins in progress (ADR 0013).
+    /// Single sign-on providers and sign-ins in progress (ADR 0014).
     sso: sso::Sso,
     /// The database: sessions and audit events. None in tests of auth alone.
     app: Option<AppState>,

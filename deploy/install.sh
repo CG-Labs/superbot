@@ -19,6 +19,9 @@ DRY_RUN=false
 INTERACTIVE=true
 SHARE_DIR=${SHARE_DIR:-/usr/local/share/superbot}
 SYSTEMD_DIR=${SYSTEMD_DIR:-/etc/systemd/system}
+CLIENT_DIR=${CLIENT_DIR:-/var/www/superbot-app}
+CLIENT_BASE_URL=/app
+BUILD_CLIENT=true
 DEPLOY_FILES=(superbot.service superbot-backup.sh superbot-backup.service superbot-backup.timer)
 
 log() { printf '==> %s\n' "$*"; }
@@ -39,6 +42,7 @@ Usage: install.sh [options]
   --upgrade           git pull + rebuild + restart
   --ufw               Enable UFW (allow 22, 80, 443)
   --no-backup         Skip daily DATA_DIR backup timer
+  --no-client         Skip building the web client (served at /app/)
   --dry-run           Print actions without changing the system
   --non-interactive   Fail instead of prompting for missing flags
   -h, --help          Show this help
@@ -60,6 +64,7 @@ parse_args() {
       --upgrade) UPGRADE=true; shift ;;
       --ufw) ENABLE_UFW=true; shift ;;
       --no-backup) ENABLE_BACKUP=false; shift ;;
+      --no-client) BUILD_CLIENT=false; shift ;;
       --dry-run) DRY_RUN=true; shift ;;
       --non-interactive) INTERACTIVE=false; shift ;;
       -h|--help) usage; exit 0 ;;
@@ -270,9 +275,9 @@ sync_repo() {
     fi
     mkdir -p "$(dirname "$repo_path")"
     if [[ -d "$repo_path/.git" ]]; then
-      rsync -a --delete --exclude target --exclude .git "$INSTALL_DIR/" "$repo_path/"
+      rsync -a --delete --exclude target --exclude node_modules --exclude dist-app --exclude .git "$INSTALL_DIR/" "$repo_path/"
     else
-      rsync -a --exclude target "$INSTALL_DIR/" "$repo_path/"
+      rsync -a --exclude target --exclude node_modules --exclude dist-app "$INSTALL_DIR/" "$repo_path/"
     fi
     return
   fi
@@ -304,6 +309,115 @@ build_botd() {
   sudo -u "$SUPERBOT_USER" -H bash -lc "cd '$repo_path' && . \"\$HOME/.cargo/env\" && cargo build --release"
   run install -m 0755 "$repo_path/target/release/botd" "$BIN_DIR/botd"
   run install -m 0755 "$repo_path/target/release/botctl" "$BIN_DIR/botctl"
+}
+
+client_releases_dir() { printf '%s.releases\n' "$CLIENT_DIR"; }
+
+client_node_ok() {
+  sudo -u "$SUPERBOT_USER" -H bash -lc 'command -v npm >/dev/null && node -e "process.exit(+process.versions.node.split(\".\")[0] < 20 ? 1 : 0)"' 2>/dev/null
+}
+
+# The web client (apps/client) is built by the service user from its checkout. Root then
+# unpacks only plain files and folders into a root-owned folder that Caddy serves, so a
+# tampered checkout can change what browsers load but never what root runs or reads.
+build_client() {
+  local home client
+  home=$(user_home)
+  client="$home/superbot/apps/client"
+  if [[ "$BUILD_CLIENT" != true ]]; then
+    log "Skipping the web client (--no-client)"
+    return
+  fi
+  if [[ "$DRY_RUN" == true ]]; then
+    log "[dry-run] would build the web client in $client as $SUPERBOT_USER (base URL $CLIENT_BASE_URL) and install it into root-owned $CLIENT_DIR"
+    return
+  fi
+  if ! client_node_ok; then
+    warn "Node.js 20+ and npm not found for $SUPERBOT_USER: skipping the web client. botd still serves its built-in page."
+    return
+  fi
+  log "Building the web client"
+  if ! sudo -u "$SUPERBOT_USER" -H env CI=1 EXPO_NO_TELEMETRY=1 ELECTRON_SKIP_BINARY_DOWNLOAD=1 SUPERBOT_WEB_BASE_URL="$CLIENT_BASE_URL" \
+    bash -lc "cd '$client' && npm ci --no-audit --no-fund && npx expo export --platform web --output-dir dist-app"; then
+    warn "Web client build failed: keeping the previous one, if any"
+    return
+  fi
+  install_client "$client/dist-app" || warn "Web client not installed: keeping the previous one, if any"
+}
+
+# Plain files and folders only (no links, devices, or ".."), with an index.html.
+client_archive_ok() {
+  local archive=$1
+  tar -tvf "$archive" | awk '{ t = substr($0, 1, 1) } t != "-" && t != "d" { bad = 1 } END { exit bad }' || return 1
+  if tar -tf "$archive" | grep -Eq '^/|(^|/)\.\.(/|$)'; then
+    return 1
+  fi
+  tar -tf "$archive" | grep -qx './index.html'
+}
+
+# Unpacks a fresh release beside the live one, then swaps the CLIENT_DIR symlink with one
+# rename, so Caddy never serves a half-copied client. Keeps the previous release.
+install_client() {
+  local src=$1 releases tmp release rev old
+  [[ "$CLIENT_DIR" == /* && "$CLIENT_DIR/" != */../* ]] || { warn "CLIENT_DIR must be an absolute path: $CLIENT_DIR"; return 1; }
+  releases=$(client_releases_dir)
+  assert_not_service_owned "$(dirname "$CLIENT_DIR")"
+  assert_not_service_owned "$CLIENT_DIR"
+  assert_not_service_owned "$releases"
+  tmp=$(mktemp -d)
+  # The service user reads its own build; root only ever opens the resulting archive.
+  # shellcheck disable=SC2024
+  if ! sudo -u "$SUPERBOT_USER" tar -C "$src" -cf - . >"$tmp/client.tar"; then
+    rm -rf "$tmp"
+    warn "Could not read the web client build in $src"
+    return 1
+  fi
+  if ! client_archive_ok "$tmp/client.tar"; then
+    rm -rf "$tmp"
+    warn "Refusing the web client build in $src: it must hold only plain files and folders, with index.html"
+    return 1
+  fi
+  rev=$(sudo -u "$SUPERBOT_USER" git -C "$src" rev-parse --short=12 HEAD 2>/dev/null | tr -cd '0-9a-f' || true)
+  # Callers use `||`, which turns off set -e here, so every step is checked by hand.
+  if ! install -d -m 0755 -o root -g root "$(dirname "$CLIENT_DIR")" "$releases" ||
+    ! release=$(mktemp -d "$releases/$(date -u +%Y%m%dT%H%M%SZ)-${rev:-local}-XXXX"); then
+    rm -rf "$tmp"
+    warn "Could not create a release folder in $releases"
+    return 1
+  fi
+  if ! { tar -xf "$tmp/client.tar" -C "$release" --no-same-owner --no-same-permissions &&
+    chown -R root:root "$release" &&
+    find "$release" -type d -exec chmod 0755 {} + &&
+    find "$release" -type f -exec chmod 0644 {} + &&
+    [[ -f "$release/index.html" ]] &&
+    touch "$release"; }; then
+    rm -rf "$tmp" "$release"
+    warn "Could not unpack the web client into $release"
+    return 1
+  fi
+  rm -rf "$tmp"
+  old=""
+  if [[ -d "$CLIENT_DIR" && ! -L "$CLIENT_DIR" ]]; then
+    # A folder from before releases (e.g. a manual build) is kept as the previous release.
+    old="$releases/previous-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    if ! mv -T "$CLIENT_DIR" "$old"; then
+      rm -rf "$release"
+      warn "Could not move $CLIENT_DIR aside"
+      return 1
+    fi
+  fi
+  if ! { ln -sfn "$release" "$CLIENT_DIR.new" && mv -Tf "$CLIENT_DIR.new" "$CLIENT_DIR"; }; then
+    rm -f "$CLIENT_DIR.new"
+    [[ -z "$old" ]] || mv -T "$old" "$CLIENT_DIR" || true
+    rm -rf "$release"
+    warn "Could not switch $CLIENT_DIR to the new release"
+    return 1
+  fi
+  find "$releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | tail -n +3 | cut -d' ' -f2- |
+    while IFS= read -r old; do
+      [[ "$old" == "$release" ]] || rm -rf -- "$old"
+    done
+  log "Installed the web client into $CLIENT_DIR -> $release"
 }
 
 set_env_var() {
@@ -479,13 +593,58 @@ install_backup() {
   systemctl enable --now superbot-backup.timer
 }
 
+# Caddyfile for SITE: the web client at /app/ when CLIENT_ROOT is set; everything else (the
+# built-in page at /, /login, /api, the /api/events SSE stream, /healthz) goes to botd.
+render_caddyfile() {
+  local site=$1 upstream=$2 client_root=${3:-}
+  printf '%s {\n\tencode gzip\n' "$site"
+  if [[ -n "$client_root" ]]; then
+    cat <<CADDY
+	redir /app /app/
+	handle_path /app/* {
+		root * ${client_root}
+		# Hashed bundles never change; everything else is re-checked so upgrades show at once.
+		@immutable {
+			path /_expo/static/*
+			file
+		}
+		@mutable not {
+			path /_expo/static/*
+			file
+		}
+		header @immutable Cache-Control "public, max-age=31536000, immutable"
+		header @mutable Cache-Control "no-cache"
+		try_files {path} /index.html
+		file_server
+	}
+CADDY
+  fi
+  cat <<CADDY
+	handle {
+		reverse_proxy ${upstream} {
+			flush_interval -1
+		}
+	}
+}
+CADDY
+}
+
+client_installed() {
+  [[ -f "$CLIENT_DIR/index.html" ]] || [[ "$DRY_RUN" == true && "$BUILD_CLIENT" == true ]]
+}
+
 install_caddy() {
+  local client_root=""
   if [[ -z "$DOMAIN" ]]; then
-    warn "No --domain: skipping Caddy (botd listens on 127.0.0.1:3000 only)"
+    warn "No --domain: skipping Caddy (botd listens on 127.0.0.1:3000 only; the web client is not served)"
     return
+  fi
+  if client_installed; then
+    client_root=$CLIENT_DIR
   fi
   log "Installing Caddy"
   if [[ "$DRY_RUN" == true ]]; then
+    log "[dry-run] would write /etc/caddy/Caddyfile for $DOMAIN: ${client_root:+web client at /app/ from $client_root, }everything else to botd on 127.0.0.1:3000"
     return
   fi
   if ! command -v caddy >/dev/null 2>&1; then
@@ -494,15 +653,7 @@ install_caddy() {
     apt-get update -qq
     apt-get install -y -qq caddy
   fi
-  local caddyfile=/etc/caddy/Caddyfile
-  cat >"$caddyfile" <<EOF
-${DOMAIN} {
-	encode gzip
-	reverse_proxy 127.0.0.1:3000 {
-		flush_interval -1
-	}
-}
-EOF
+  render_caddyfile "$DOMAIN" 127.0.0.1:3000 "$client_root" >/etc/caddy/Caddyfile
   systemctl enable caddy
   systemctl reload caddy || systemctl restart caddy
 }
@@ -523,7 +674,7 @@ configure_ufw() {
 }
 
 summary() {
-  local home repo_path pass_file url
+  local home repo_path pass_file url app
   home=$(user_home)
   repo_path="$home/superbot"
   pass_file="$home/.superbot-admin-password"
@@ -532,11 +683,16 @@ summary() {
   else
     url="http://127.0.0.1:3000 (on this host)"
   fi
+  app="not served (needs --domain and the web client)"
+  if [[ -n "$DOMAIN" ]] && client_installed; then
+    app="https://${DOMAIN}/app/"
+  fi
   cat <<EOF
 
 SuperBot is installed.
 
-  URL:      $url
+  URL:      $url (built-in admin page)
+  App:      $app
   Password: stored in $pass_file (also in $repo_path/.env as AUTH_PASSWORD)
   Key:      $(master_key_default "$home") encrypts saved secrets. Back it up apart from
             the database: without it they can't be read (deploy/README.md).
@@ -577,6 +733,7 @@ main() {
   sync_repo
   stage_trusted_deploy
   build_botd
+  build_client
   configure_env
   ensure_master_key
   install_systemd

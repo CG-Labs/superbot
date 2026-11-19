@@ -1,4 +1,4 @@
-//! SSO end to end (ADR 0013): the real router against a mock Entra tenant that serves
+//! SSO end to end (ADR 0014): the real router against a mock Entra tenant that serves
 //! discovery, keys, an authorize endpoint, and a token endpoint checking PKCE.
 
 use crate::sso::jwt::test_keys::{jwks, keys};

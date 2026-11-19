@@ -114,7 +114,7 @@ pub fn check_name(name: &str) -> Result<(), Error> {
 }
 
 /// botd's own secrets: saved and listed like the others, but never given to a Bot.
-/// Today these are SSO client secrets (`SSO_<PROVIDER>_CLIENT_SECRET`, ADR 0013).
+/// Today these are SSO client secrets (`SSO_<PROVIDER>_CLIENT_SECRET`, ADR 0014).
 pub fn server_secret(name: &str) -> bool {
     env_shaped(name) && name.len() > "SSO__CLIENT_SECRET".len() && name.starts_with("SSO_") && name.ends_with("_CLIENT_SECRET")
 }

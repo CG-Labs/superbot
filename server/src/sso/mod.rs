@@ -1,4 +1,4 @@
-//! Single sign-on with OpenID Connect (ADR 0013): the authorization code flow with
+//! Single sign-on with OpenID Connect (ADR 0014): the authorization code flow with
 //! PKCE, state, and nonce, ending in the same sessions as every other sign-in.
 //!
 //! Web app: `/start` sets a short-lived binder cookie and sends the browser to the IdP;

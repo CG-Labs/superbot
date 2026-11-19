@@ -9,13 +9,14 @@ import {
   TextInput,
   View,
 } from "react-native";
+import { defaultServerUrl } from "../src/auth";
 import { fetchSsoProviders, ssoSupported, type SsoProvider } from "../src/sso";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
 
 export function LoginScreen() {
   const { login, loginWithSso, error: bootError } = useSuperBot();
-  const [baseUrl, setBaseUrl] = useState("http://127.0.0.1:3000");
+  const [baseUrl, setBaseUrl] = useState(() => defaultServerUrl());
   const [secret, setSecret] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
