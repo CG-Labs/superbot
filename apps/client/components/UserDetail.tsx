@@ -5,7 +5,7 @@ import { confirmAsync } from "../src/dialogs";
 import { CODE_TTLS, formatExpiry, relativeTime, ROLES, signInMethod } from "../src/invite";
 import type { SsoProvider } from "../src/sso";
 import { colors } from "../src/theme";
-import type { AdminUser, LoginCode, Role, SessionView, UserBots } from "../src/types";
+import type { AdminUser, LoginCode, Role, SessionView, UserBots, UserIdentity } from "../src/types";
 import { BotAvatar } from "./BotAvatar";
 import { Chips } from "./Chips";
 import { CodeReveal } from "./CodeReveal";
@@ -44,6 +44,13 @@ const SUBJECT_HINT: Record<string, string> = {
   github: "GitHub user id (number)",
   saml: "NameID at the SAML IdP",
 };
+
+/** SAML links are by NameID, so it's shown even once a sign-in has filled in an email. */
+function identityName(i: UserIdentity, providers: SsoProvider[]): string {
+  const saml = (i.idp ?? providers.find((p) => p.id === i.provider)?.type) === "saml";
+  if (saml && i.subject) return i.email ? `${i.subject} (${i.email})` : i.subject;
+  return i.email ?? i.subject ?? i.id;
+}
 
 function LoadFailed({ message, onRetry }: { message: string; onRetry: () => void }) {
   return (
@@ -132,7 +139,7 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
 
   const link = () =>
     void run(async () => {
-      await api.linkIdentity(user.id, { provider: linkProvider, subject: subject.trim(), tenant: tenant.trim() || undefined });
+      await api.linkIdentity(user.id, { provider: linkProvider, subject: subject.trim(), tenant: (linkType === "entra" && tenant.trim()) || undefined });
       setSubject("");
       setTenant("");
     });
@@ -218,7 +225,7 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
           user.identities.map((i) => (
             <View key={i.id} style={styles.row}>
               <Text style={[styles.text, { flex: 1 }]} numberOfLines={1}>
-                {providerLabel(i.provider)} · {i.email ?? i.subject ?? i.id}
+                {providerLabel(i.provider)} · {identityName(i, providers)}
                 <Text style={styles.faint}> · used {relativeTime(i.lastLoginAt).toLowerCase()}</Text>
               </Text>
               <Button label="Unlink" disabled={busy} onPress={() => void unlink(i.id, providerLabel(i.provider))} />

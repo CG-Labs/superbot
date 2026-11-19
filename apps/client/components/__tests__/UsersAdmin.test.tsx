@@ -172,11 +172,25 @@ describe("UsersAdmin", () => {
     expect(api.linkIdentity).toHaveBeenCalledWith("u1", { provider: "work", subject: "oid-1", tenant: undefined });
   });
 
+  it("sends a tenant only to Entra, even after switching away from it", async () => {
+    jest.mocked(fetchSsoProviders).mockResolvedValueOnce([
+      { id: "work", label: "Work", type: "entra" },
+      { id: "github", label: "GitHub", type: "github" },
+    ]);
+    const { api, user } = await open([owner, alex]);
+    await user.press(screen.getByLabelText("User Alex"));
+    await user.type(await screen.findByLabelText("Tenant"), "tid-1");
+    await user.press(screen.getByRole("radio", { name: "GitHub" }));
+    await user.type(screen.getByLabelText("Subject"), "4242");
+    await user.press(screen.getByText("Link"));
+    expect(api.linkIdentity).toHaveBeenCalledWith("u1", { provider: "github", subject: "4242", tenant: undefined });
+  });
+
   it("shows SAML links by their provider and links one by its NameID", async () => {
     jest.mocked(fetchSsoProviders).mockResolvedValueOnce([{ id: "adfs", label: "Contoso", type: "saml" }]);
     const ada: AdminUser = {
       ...alex,
-      identities: [{ id: "i9", provider: "adfs", idp: "saml", subject: "g-94f0-persistent", createdAt: 1, lastLoginAt: Date.now() }],
+      identities: [{ id: "i9", provider: "adfs", idp: "saml", subject: "g-94f0-persistent", email: "alex@example.com", createdAt: 1, lastLoginAt: Date.now() }],
       lastLogin: { at: Date.now(), authMethod: "sso", idpProvider: "adfs", idp: "saml" },
     };
     const { api, user } = await open([owner, ada]);
@@ -184,7 +198,7 @@ describe("UsersAdmin", () => {
     expect(await row.findByText("Contoso")).toBeOnTheScreen();
     expect(row.getByText("with SSO (Contoso)")).toBeOnTheScreen();
     await user.press(screen.getByLabelText("User Alex"));
-    expect(await screen.findByText(/^Contoso · g-94f0-persistent/)).toBeOnTheScreen();
+    expect(await screen.findByText(/^Contoso · g-94f0-persistent \(alex@example\.com\)/)).toBeOnTheScreen();
     expect(screen.queryByLabelText("Tenant")).toBeNull();
     await user.type(screen.getByPlaceholderText("NameID at the SAML IdP"), "G-1234-persistent");
     await user.press(screen.getByText("Link"));
