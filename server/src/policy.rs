@@ -646,10 +646,12 @@ fn classify_script(s: &Script, cwds: &Cwds, ctx: &Ctx, depth: usize, budget: &mu
 }
 
 fn deletion(ctx: &Ctx, cwds: &Cwds, target: &str, push: &mut impl FnMut(&'static str, String)) {
-    match cwds.resolve(ctx, target) {
-        Some(ps) if ps.contains(&ctx.workspace) => push("shell_destructive", "Deletes the whole workspace".into()),
-        Some(ps) if ps.iter().all(|p| p.starts_with(&ctx.workspace)) => {}
-        _ => push("file_delete", format!("Deletes {target} outside the workspace")),
+    let places = cwds.resolve(ctx, target);
+    if places.as_ref().is_some_and(|ps| ps.contains(&ctx.workspace)) {
+        push("shell_destructive", "Deletes the whole workspace".into());
+    }
+    if !places.is_some_and(|ps| ps.iter().all(|p| p.starts_with(&ctx.workspace))) {
+        push("file_delete", format!("Deletes {target} outside the workspace"));
     }
 }
 
@@ -939,6 +941,12 @@ mod tests {
         assert_eq!(cls("rm -rf ."), ["shell_destructive"]);
         // If `cd` fails, `rm` runs in the workspace itself.
         assert_eq!(cls("cd sub; rm -rf *"), ["shell_destructive"]);
+        // Both classes count, so neither class's setting can be skipped.
+        assert_eq!(cls("cd /tmp && rm -rf *"), ["shell_destructive", "file_delete"]);
+        let mut p = Policy::new(Mode::Ask);
+        p.classes.insert("file_delete".into(), Action::Deny);
+        p.classes.insert("shell_destructive".into(), Action::Allow);
+        assert_eq!(decide(&p, &[], &shell("cd /tmp && rm -rf *"), &ctx()).action, Action::Deny);
     }
 
     #[test]
