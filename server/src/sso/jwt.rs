@@ -205,14 +205,19 @@ mod tests {
 
     const NOW: i64 = 1_800_000_000;
 
+    fn nonce() -> &'static str {
+        static N: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        N.get_or_init(|| crate::random_bytes(16).iter().map(|b| format!("{b:02x}")).collect())
+    }
+
     fn claims() -> Value {
-        json!({ "iss": "https://idp.example/t/v2.0", "aud": "client-1", "sub": "s", "nonce": "n-1", "iat": NOW - 10, "nbf": NOW - 10, "exp": NOW + 3600 })
+        json!({ "iss": "https://idp.example/t/v2.0", "aud": "client-1", "sub": "s", "nonce": nonce(), "iat": NOW - 10, "nbf": NOW - 10, "exp": NOW + 3600 })
     }
 
     fn check(token: &str, set: &Jwks) -> Result<Token, Invalid> {
         let t = decode(token)?;
         t.verify(set)?;
-        t.check("client-1", "n-1", NOW)?;
+        t.check("client-1", nonce(), NOW)?;
         Ok(t)
     }
 
