@@ -46,7 +46,8 @@ const HANDOFF_TTL_MS: i64 = 2 * 60_000;
 const MAX_PENDING: usize = 10_000;
 const MAX_PENDING_PER_IP: usize = 20;
 pub const HANDOFF_PREFIX: &str = "sbh_";
-const BINDER: &str = "superbot_sso";
+/// `__Host-` (so Path=/, no Domain): a sibling subdomain can't plant its own binder.
+const BINDER: &str = "__Host-superbot_sso";
 
 #[derive(Clone)]
 enum Return {
@@ -153,7 +154,7 @@ fn no_store(mut r: Response) -> Response {
 }
 
 fn binder_cookie(value: &str, max_age_s: i64) -> HeaderValue {
-    HeaderValue::from_str(&format!("{BINDER}={value}; Path=/api/auth/sso; HttpOnly; Secure; SameSite=Lax; Max-Age={max_age_s}")).unwrap()
+    HeaderValue::from_str(&format!("{BINDER}={value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={max_age_s}")).unwrap()
 }
 
 fn read_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {

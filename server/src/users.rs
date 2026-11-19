@@ -21,7 +21,9 @@ use std::sync::{Arc, Mutex};
 pub const OPERATOR: &str = "operator";
 pub const SESSION_PREFIX: &str = "sbs_";
 pub const CODE_PREFIX: &str = "sbc_";
-pub const COOKIE: &str = "superbot_session";
+/// `__Host-` makes browsers refuse this cookie unless it is Secure, Path=/, and set by
+/// this exact host, so a sibling subdomain can't plant or overwrite it.
+pub const COOKIE: &str = "__Host-superbot_session";
 
 /// A new random secret: `prefix` plus 256 bits as hex.
 pub fn new_secret(prefix: &str) -> String {
@@ -159,7 +161,7 @@ impl Limiter {
 
 // Cookies and CSRF.
 
-/// The session token from `Cookie: superbot_session=...`, if any.
+/// The session token from `Cookie: __Host-superbot_session=...`, if any.
 pub fn cookie_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get_all(header::COOKIE)
@@ -178,13 +180,14 @@ pub fn session_cookie(token: &str, max_age_ms: i64) -> String {
 }
 
 pub fn clear_cookie() -> &'static str {
-    "superbot_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0"
+    "__Host-superbot_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0"
 }
 
-/// For cookie-authenticated writes: the browser says the request comes from this
-/// site. `Origin` must name the Host we were reached on; without it, `Sec-Fetch-Site`
-/// must not be cross-site. A request with neither isn't from a browser page, and
-/// SameSite=Strict already kept the cookie off cross-site requests.
+/// For writes on credentials the browser sends by itself (the session cookie, a cached
+/// break-glass password, or none at all with ALLOW_NO_AUTH): the browser says the request
+/// comes from this site. `Origin` must name the Host we were reached on; without it,
+/// `Sec-Fetch-Site` must not be cross-site. Browsers send one of them on every cross-site
+/// write, so a request with neither isn't from a browser page.
 pub fn same_origin(headers: &HeaderMap) -> bool {
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
     if let Some(origin) = headers.get(header::ORIGIN) {
@@ -714,11 +717,15 @@ mod tests {
     #[test]
     fn cookies_and_origins() {
         let mut h = HeaderMap::new();
-        h.insert(header::COOKIE, "a=1; superbot_session=sbs_x ; b=2".parse().unwrap());
+        h.insert(header::COOKIE, "a=1; __Host-superbot_session=sbs_x ; b=2".parse().unwrap());
         assert_eq!(cookie_token(&h).as_deref(), Some("sbs_x"));
         let mut h2 = HeaderMap::new();
-        h2.insert(header::COOKIE, "xsuperbot_session=sbs_y".parse().unwrap());
+        h2.insert(header::COOKIE, "x__Host-superbot_session=sbs_y".parse().unwrap());
         assert_eq!(cookie_token(&h2), None);
+        // The old name, which a sibling subdomain could plant, is not read.
+        let mut h3 = HeaderMap::new();
+        h3.insert(header::COOKIE, "superbot_session=sbs_z".parse().unwrap());
+        assert_eq!(cookie_token(&h3), None);
         let c = session_cookie("sbs_x", 3_600_000);
         for attr in ["HttpOnly", "Secure", "SameSite=Strict", "Path=/", "Max-Age=3600"] {
             assert!(c.contains(attr), "{c}");

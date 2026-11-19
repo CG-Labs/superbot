@@ -180,7 +180,7 @@ async fn github_signs_in_by_numeric_id_with_the_verified_primary_email_then_revo
     let (to, q) = start_query(&head);
     assert!(to.as_str().starts_with(&format!("{}/login/oauth/authorize?", gh.url)));
     assert_eq!((q["scope"].as_str(), q["prompt"].as_str(), q["allow_signup"].as_str()), ("read:user user:email", "select_account", "false"));
-    assert!(set_cookies(&head).iter().any(|c| c.starts_with("superbot_sso=")), "the same binder cookie as OIDC");
+    assert!(set_cookies(&head).iter().any(|c| c.starts_with("__Host-superbot_sso=")), "the same binder cookie as OIDC");
 
     // A real GitHub account nobody linked: refused, and the audit log says who it was.
     let (code, head) = web_sign_in(port, &id).await;
@@ -383,7 +383,7 @@ async fn apple_posts(form: &[(&str, &str)], to: &str) -> String {
 async fn apple_to_callback(port: u16, start: &str, user: Option<&str>) -> (String, String) {
     let (code, head, body) = call_with(port, "GET", start, "", "", "").await;
     assert_eq!(code, 303, "{head}\n{body}");
-    let binder = set_cookies(&head).into_iter().find(|c| c.starts_with("superbot_sso=")).map(|c| format!("Cookie: {}\r\n", c.split(';').next().unwrap())).unwrap_or_default();
+    let binder = set_cookies(&head).into_iter().find(|c| c.starts_with("__Host-superbot_sso=")).map(|c| format!("Cookie: {}\r\n", c.split(';').next().unwrap())).unwrap_or_default();
     let answer: Value = http().get(header(&head, "location").unwrap()).send().await.unwrap().json().await.unwrap();
     let (code, state) = (answer["code"].as_str().unwrap(), answer["state"].as_str().unwrap());
     let mut form = vec![("code", code), ("state", state)];
@@ -461,7 +461,7 @@ async fn apple_posts_back_and_signs_in_with_a_fresh_es256_client_secret() {
     // Cancelled at Apple: posted as an error, shown as cancelled.
     let (_, head, _) = call_with(port, "GET", &format!("/api/auth/sso/{id}/start"), "", "", "").await;
     let state = start_query(&head).1["state"].clone();
-    let binder = format!("Cookie: {}\r\n", set_cookies(&head).into_iter().find(|c| c.starts_with("superbot_sso=")).unwrap().split(';').next().unwrap());
+    let binder = format!("Cookie: {}\r\n", set_cookies(&head).into_iter().find(|c| c.starts_with("__Host-superbot_sso=")).unwrap().split(';').next().unwrap());
     let path = apple_posts(&[("error", "user_cancelled_authorize"), ("state", &state)], &format!("http://127.0.0.1:{port}/api/auth/sso/{id}/callback")).await;
     let (_, head, _) = call_with(port, "GET", &path, "", &binder, "").await;
     assert_eq!(header(&head, "location").as_deref(), Some("/login?error=sso_cancelled"));

@@ -149,7 +149,7 @@ pub(super) async fn to_callback(port: u16, start: &str) -> (String, String) {
     let (code, head, body) = call_with(port, "GET", start, "", "", "").await;
     assert_eq!(code, 303, "{head}\n{body}");
     let to_idp = header(&head, "location").unwrap();
-    let binder = set_cookies(&head).into_iter().find(|c| c.starts_with("superbot_sso=")).map(|c| format!("Cookie: {}\r\n", c.split(';').next().unwrap())).unwrap_or_default();
+    let binder = set_cookies(&head).into_iter().find(|c| c.starts_with("__Host-superbot_sso=")).map(|c| format!("Cookie: {}\r\n", c.split(';').next().unwrap())).unwrap_or_default();
     let res = http().get(&to_idp).send().await.unwrap();
     assert_eq!(res.status(), 303);
     let back = res.headers()["location"].to_str().unwrap().to_string();
@@ -184,8 +184,8 @@ async fn web_sign_in_needs_a_linked_identity_then_sets_a_session_cookie() {
     assert_eq!(q["redirect_uri"], format!("http://127.0.0.1:{port}/api/auth/sso/{id}/callback"));
     assert_eq!((q["code_challenge_method"].as_str(), q["prompt"].as_str(), q["scope"].as_str()), ("S256", "select_account", "openid profile email"));
     assert!(q["state"].len() >= 43 && q["nonce"].len() >= 43 && q["code_challenge"].len() == 43);
-    let binder = set_cookies(&head).into_iter().find(|c| c.starts_with("superbot_sso=")).unwrap();
-    for attr in ["HttpOnly", "Secure", "SameSite=Lax", "Path=/api/auth/sso", "Max-Age=600"] {
+    let binder = set_cookies(&head).into_iter().find(|c| c.starts_with("__Host-superbot_sso=")).unwrap();
+    for attr in ["HttpOnly", "Secure", "SameSite=Lax", "Path=/;", "Max-Age=600"] {
         assert!(binder.contains(attr), "{binder}");
     }
 
@@ -219,11 +219,11 @@ async fn web_sign_in_needs_a_linked_identity_then_sets_a_session_cookie() {
     assert!(body.contains("url=/"), "{body}");
     assert_eq!(header(&head, "cache-control").as_deref(), Some("no-store"));
     let cookies = set_cookies(&head);
-    let session = cookies.iter().find(|c| c.starts_with("superbot_session=sbs_")).expect("a session cookie");
+    let session = cookies.iter().find(|c| c.starts_with("__Host-superbot_session=sbs_")).expect("a session cookie");
     assert!(session.contains("SameSite=Strict") && session.contains("HttpOnly"));
-    assert!(cookies.iter().any(|c| c.starts_with("superbot_sso=;") && c.contains("Max-Age=0")), "binder cleared");
-    let token = session.split(';').next().unwrap().trim_start_matches("superbot_session=");
-    let (code, _, me) = call_with(port, "GET", "/api/auth/me", "", &format!("Cookie: superbot_session={token}\r\n"), "").await;
+    assert!(cookies.iter().any(|c| c.starts_with("__Host-superbot_sso=;") && c.contains("Max-Age=0")), "binder cleared");
+    let token = session.split(';').next().unwrap().trim_start_matches("__Host-superbot_session=");
+    let (code, _, me) = call_with(port, "GET", "/api/auth/me", "", &format!("Cookie: __Host-superbot_session={token}\r\n"), "").await;
     let me: Value = serde_json::from_str(&me).unwrap();
     assert_eq!((code, me["user"]["id"].as_str(), me["session"]["method"].as_str()), (200, Some(uid.as_str()), Some("sso")));
     let logins = audit_list(&call(port, "GET", "/api/audit?action=auth.login", &admin, "").await.1);
@@ -460,7 +460,7 @@ pub(super) fn provider_vars(id: &str, ty: &str, issuer: &str, secret: &str, extr
 
 /// The user a successful web callback signed in, by its session cookie.
 pub(super) async fn signed_in_as(port: u16, head: &str) -> Option<String> {
-    let session = set_cookies(head).into_iter().find(|c| c.starts_with("superbot_session=sbs_"))?;
+    let session = set_cookies(head).into_iter().find(|c| c.starts_with("__Host-superbot_session=sbs_"))?;
     let (_, _, me) = call_with(port, "GET", "/api/auth/me", "", &format!("Cookie: {}\r\n", session.split(';').next().unwrap()), "").await;
     serde_json::from_str::<Value>(&me).ok()?["user"]["id"].as_str().map(String::from)
 }
@@ -614,7 +614,7 @@ async fn each_providers_sessions_put_its_idp_on_every_audit_event() {
     for (n, ty) in ["entra", "google", "oidc"].into_iter().enumerate() {
         let (code, head) = web_sign_in(port, &ids[n]).await;
         assert_eq!(code, 200, "{head}");
-        let cookie = set_cookies(&head).into_iter().find(|c| c.starts_with("superbot_session=sbs_")).unwrap();
+        let cookie = set_cookies(&head).into_iter().find(|c| c.starts_with("__Host-superbot_session=sbs_")).unwrap();
         let web = format!("Cookie: {}\r\nOrigin: http://127.0.0.1:{port}\r\n", cookie.split(';').next().unwrap());
         let (_, _, me) = call_with(port, "GET", "/api/auth/me", "", &web, "").await;
         let session = serde_json::from_str::<Value>(&me).unwrap()["session"].clone();
