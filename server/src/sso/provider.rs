@@ -37,6 +37,9 @@ pub struct Provider {
 struct Cache {
     meta: Option<(Arc<Metadata>, Instant)>,
     jwks: Option<(Arc<Jwks>, Instant)>,
+    /// The last failed fetch, so a down IdP costs one timeout per gap, not one per sign-in.
+    meta_failed: Option<(Instant, Invalid)>,
+    jwks_failed: Option<(Instant, Invalid)>,
 }
 
 pub struct Metadata {
@@ -116,13 +119,14 @@ impl Provider {
         }
     }
 
-    pub fn secret_name(&self) -> String {
+    /// Where the client secret is set: env, `_FILE`, or the secrets store.
+    pub fn env_var(&self) -> String {
         format!("SSO_{}_CLIENT_SECRET", self.id.to_ascii_uppercase())
     }
 
     /// Read when used, so `botctl secret set` takes effect without a restart.
     fn client_secret(&self) -> Option<crate::secrets::Secret> {
-        let s = crate::secrets::global().get(&self.secret_name()).ok().flatten()?;
+        let s = crate::secrets::global().get(&self.env_var()).ok().flatten()?;
         crate::secrets::redact::register(s.expose());
         Some(s)
     }
@@ -167,21 +171,32 @@ impl Provider {
         }
     }
 
-    pub async fn metadata(&self, http: &reqwest::Client) -> Result<Arc<Metadata>, Invalid> {
+    /// The discovery document, retried at most once per `gap` after a failure.
+    pub async fn metadata(&self, http: &reqwest::Client, gap: Duration) -> Result<Arc<Metadata>, Invalid> {
         let mut c = self.cache.lock().await;
+        let stale = c.meta.as_ref().map(|(m, _)| m.clone());
         if let Some((m, at)) = &c.meta
             && at.elapsed() < META_TTL
         {
             return Ok(m.clone());
         }
+        if let Some((at, e)) = c.meta_failed
+            && at.elapsed() < gap
+        {
+            return stale.ok_or(e);
+        }
         match self.fetch_metadata(http).await {
             Ok(m) => {
                 let m = Arc::new(m);
                 c.meta = Some((m.clone(), Instant::now()));
+                c.meta_failed = None;
                 Ok(m)
             }
             // An IdP outage shouldn't sign everyone out of SSO: keep using what we had.
-            Err(e) => c.meta.as_ref().map(|(m, _)| m.clone()).ok_or(e),
+            Err(e) => {
+                c.meta_failed = Some((Instant::now(), e));
+                stale.ok_or(e)
+            }
         }
     }
 
@@ -199,28 +214,38 @@ impl Provider {
     }
 
     /// The signing keys, fetched again when a token names a key we don't have (the IdP
-    /// rotated), at most once per `gap`.
+    /// rotated), at most once per `gap`, and retried at most once per `gap` after a failure.
     async fn keys(&self, http: &reqwest::Client, meta: &Metadata, kid: Option<&str>, gap: Duration) -> Result<Arc<Jwks>, Invalid> {
         let mut c = self.cache.lock().await;
+        let stale = c.jwks.as_ref().map(|(k, _)| k.clone());
         if let Some((k, at)) = &c.jwks {
             let fresh = at.elapsed() < JWKS_TTL && k.has(kid);
             if fresh || at.elapsed() < gap {
                 return Ok(k.clone());
             }
         }
+        if let Some((at, e)) = c.jwks_failed
+            && at.elapsed() < gap
+        {
+            return stale.ok_or(e);
+        }
         match get_json(http, &meta.jwks_uri).await.and_then(|v| Jwks::parse(&v)) {
             Ok(k) => {
                 let k = Arc::new(k);
                 c.jwks = Some((k.clone(), Instant::now()));
+                c.jwks_failed = None;
                 Ok(k)
             }
-            Err(e) => c.jwks.as_ref().map(|(k, _)| k.clone()).ok_or(e),
+            Err(e) => {
+                c.jwks_failed = Some((Instant::now(), e));
+                stale.ok_or(e)
+            }
         }
     }
 
     /// Trades the authorization code for an ID token (with our PKCE verifier) and checks it.
     pub async fn sign_in(&self, http: &reqwest::Client, code: &str, redirect_uri: &str, verifier: &str, nonce: &str, gap: Duration) -> Result<Claims, Invalid> {
-        let meta = self.metadata(http).await?;
+        let meta = self.metadata(http, gap).await?;
         let secret = self.client_secret().ok_or(Invalid("not_configured"))?;
         let mut form = vec![("grant_type", "authorization_code"), ("code", code), ("redirect_uri", redirect_uri), ("code_verifier", verifier), ("client_id", &self.client_id)];
         let mut req = http.post(&meta.token_endpoint).header("accept", "application/json");
@@ -339,6 +364,35 @@ mod tests {
         assert_eq!(c.email.as_deref(), Some("a@example.com"));
         assert_eq!(p.claims(&t(json!({ "iss": "https://other.example", "sub": "s1" })), &m).err(), Some(Invalid("wrong_issuer")));
         assert_eq!(p.claims(&t(json!({ "iss": "https://idp.example" })), &m).err(), Some(Invalid("missing_subject")));
+    }
+
+    #[tokio::test]
+    async fn a_down_idp_is_retried_once_per_gap_not_once_per_sign_in() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let app = axum::Router::new().fallback(move || {
+            h.fetch_add(1, Ordering::SeqCst);
+            async { axum::http::StatusCode::SERVICE_UNAVAILABLE }
+        });
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let p = Provider::new("acme", "Acme", Kind::Oidc { issuer: base.clone() }, "client-1", "openid", None);
+        let http = reqwest::Client::new();
+        let gap = Duration::from_secs(60);
+        for _ in 0..3 {
+            assert_eq!(p.metadata(&http, gap).await.err(), Some(Invalid("idp_bad_response")));
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let m = Metadata { jwks_uri: format!("{base}/keys"), ..meta(&base) };
+        for _ in 0..3 {
+            assert_eq!(p.keys(&http, &m, Some("k1"), gap).await.err(), Some(Invalid("idp_bad_response")));
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(p.metadata(&http, Duration::ZERO).await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "retried once the gap has passed");
     }
 
     #[test]
