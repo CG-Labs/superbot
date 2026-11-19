@@ -1,7 +1,7 @@
 //! SCIM provisioning end to end (ADR 0023): the real router, with the request shapes
 //! Okta and Entra ID send.
 
-use crate::sso_http_tests::{header, mock_idp, serve_with, set_cookies, to_callback, web_sign_in, OID};
+use crate::sso_http_tests::{header, mock_idp, s256, serve_with, set_cookies, to_callback, web_sign_in, OID};
 use crate::tests::{audit_list, call, call_with, serve_app_with};
 use crate::users_http_tests::{parse, user_with};
 use crate::*;
@@ -511,4 +511,41 @@ async fn admin_renames_last_until_the_idp_sends_a_name() {
     let (_, _, u) = scim(port, &t, "PATCH", &path, set("displayName", json!("A. King"))).await;
     assert_eq!(u["displayName"], "A. King");
     assert_eq!(app.db.user(&id).unwrap().name, "A. King");
+}
+
+#[tokio::test]
+async fn deprovisioning_spends_app_codes_not_yet_redeemed() {
+    let idp = mock_idp().await;
+    let (port, _, admin, sso) = serve_with(&idp, &[("SSO_APP_REDIRECTS", "superbot://auth")], |a| a.scim.enabled = true).await;
+    let (t, _) = token(port, &admin, json!({ "tenant": "entra", "sso": sso })).await;
+    let (code, _, u) = scim(port, &t, "POST", USERS, okta_user("ada@corp.example", OID)).await;
+    assert_eq!(code, 201, "{u}");
+    let id = u["id"].as_str().unwrap().to_string();
+    let verifier = "v".repeat(64);
+    let start = format!("/api/auth/sso/{sso}/start?session=token&redirect=superbot%3A%2F%2Fauth&challenge={}&state=st-1", s256(&verifier));
+    let code_for = || async {
+        let (path, _) = to_callback(port, &start).await;
+        let (_, head, _) = call_with(port, "GET", &path, "", "", "").await;
+        let to = url::Url::parse(&header(&head, "location").unwrap()).unwrap();
+        to.query_pairs().find(|(k, _)| k == "code").unwrap().1.to_string()
+    };
+    let redeem = |code: String| {
+        let body = json!({ "sso": code, "verifier": verifier }).to_string();
+        async move { call(port, "POST", "/api/auth/login", "", &body).await.0 }
+    };
+    assert_eq!(redeem(code_for().await).await, 200);
+    let set_active = |on: bool| json!({ "Operations": [{ "op": "replace", "path": "active", "value": on }] });
+
+    // Disabled, then enabled again before the code expires: the code still doesn't work.
+    let caught = code_for().await;
+    assert_eq!(scim(port, &t, "PATCH", &format!("{USERS}/{id}"), set_active(false)).await.0, 200);
+    assert_eq!(scim(port, &t, "PATCH", &format!("{USERS}/{id}"), set_active(true)).await.0, 200);
+    assert_eq!(redeem(caught).await, 401);
+
+    // Deleted, then provisioned again: the same.
+    let caught = code_for().await;
+    assert_eq!(scim(port, &t, "DELETE", &format!("{USERS}/{id}"), Value::Null).await.0, 204);
+    assert_eq!(scim(port, &t, "POST", USERS, okta_user("ada@corp.example", OID)).await.0, 201);
+    assert_eq!(redeem(caught).await, 401);
+    assert_eq!(redeem(code_for().await).await, 200, "new sign-ins still work");
 }

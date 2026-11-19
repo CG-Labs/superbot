@@ -663,9 +663,10 @@ fn fields<'a>(d: &'a Attrs, shown: &'a str) -> ScimFields<'a> {
     }
 }
 
-/// Audits what changed on a user and acts on it: deactivating ends every session and
-/// closes open screens (their links don't know who opened them).
-async fn changed(app: &AppState, c: &Caller, before_user: &User, before: Option<&ScimUser>, after: &ScimUser) {
+/// Audits what changed on a user and acts on it: deactivating drops their unredeemed SSO
+/// app codes, ends every session, and closes open screens (their links don't know who
+/// opened them).
+async fn changed(app: &AppState, a: &Auth, c: &Caller, before_user: &User, before: Option<&ScimUser>, after: &ScimUser) {
     let by = &c.who;
     let ev = |action: &str| by.event(action).target("user", &after.user.id);
     let mut changes = Map::new();
@@ -690,6 +691,7 @@ async fn changed(app: &AppState, c: &Caller, before_user: &User, before: Option<
     match (before_user.active(), after.user.active()) {
         (false, true) => app.db.record(&ev("user.enabled").details(json!({ "tenant": c.token.tenant }))),
         (true, false) => {
+            a.sso.forget_user(&after.user.id);
             let n = app.db.revoke_user_sessions(&after.user.id, by.actor.id.as_deref().unwrap_or("scim"), "deprovisioned by SCIM");
             app.db.record(&ev("user.disabled").details(json!({ "sessionsRevoked": n, "tenant": c.token.tenant })));
             if let Some(screens) = &app.screens {
@@ -705,7 +707,7 @@ async fn changed(app: &AppState, c: &Caller, before_user: &User, before: Option<
 /// it, the user must still be the tenant's and live when the write runs. `externalId`
 /// can be set once, never changed. The shown name is rebuilt only when a name attribute
 /// changed, so an admin's rename lasts until the IdP sends a new name.
-async fn update(app: &AppState, c: &Caller, user: &User, before: Option<&ScimUser>, d: &Attrs, taken: Option<(&str, Value)>) -> ScimRes<ScimUser> {
+async fn update(app: &AppState, a: &Auth, c: &Caller, user: &User, before: Option<&ScimUser>, d: &Attrs, taken: Option<(&str, Value)>) -> ScimRes<ScimUser> {
     if let Some(old) = before.and_then(|b| b.external_id.as_deref())
         && d.external_id.as_deref() != Some(old)
     {
@@ -720,7 +722,7 @@ async fn update(app: &AppState, c: &Caller, user: &User, before: Option<&ScimUse
     if let Some((action, details)) = taken {
         app.db.record(&c.who.event(action).target("user", &user.id).details(details));
     }
-    changed(app, c, user, before, &after).await;
+    changed(app, a, c, user, before, &after).await;
     Ok(after)
 }
 
@@ -793,7 +795,7 @@ pub async fn create_user(State(app): State<AppState>, Extension(a): Extension<Ar
             return Err(uniqueness(format!("A user with this externalId exists already: {}", found.user.id)));
         }
         let restored = json!({ "tenant": tenant, "externalId": ext, "userName": d.user_name });
-        let after = update(&app, &c, &found.user.clone(), Some(&found), &d, Some(("scim.user_restored", restored))).await?;
+        let after = update(&app, &a, &c, &found.user.clone(), Some(&found), &d, Some(("scim.user_restored", restored))).await?;
         return created(&after);
     }
     if app.db.scim_find(tenant, &ScimKey::UserName(d.user_name.clone())).is_some() {
@@ -814,7 +816,7 @@ pub async fn create_user(State(app): State<AppState>, Extension(a): Extension<Ar
         };
         let linked = json!({ "tenant": tenant, "externalId": d.external_id, "userName": d.user_name, "provider": l.provider, "subject": l.subject });
         let action = if mine.is_some() { "scim.user_restored" } else { "scim.user_linked" };
-        let after = update(&app, &c, &user, None, &d, Some((action, linked))).await?;
+        let after = update(&app, &a, &c, &user, None, &d, Some((action, linked))).await?;
         return created(&after);
     }
     let shown = d.shown_name();
@@ -841,29 +843,30 @@ pub async fn create_user(State(app): State<AppState>, Extension(a): Extension<Ar
 }
 
 /// `PUT /scim/v2/Users/{id}`: the whole user. An `externalId` or `active` left out is kept.
-pub async fn replace_user(State(app): State<AppState>, Extension(c): Extension<Caller>, headers: HeaderMap, Path(id): Path<String>, body: Result<Bytes, BytesRejection>) -> ScimRes {
+pub async fn replace_user(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, headers: HeaderMap, Path(id): Path<String>, body: Result<Bytes, BytesRejection>) -> ScimRes {
     let before = need(&app, &c, &id)?;
     let d = from_resource(&parse_body(body)?, Some(&Attrs::of(&before)))?;
-    let after = update(&app, &c, &before.user, Some(&before), &d, None).await?;
+    let after = update(&app, &a, &c, &before.user, Some(&before), &d, None).await?;
     Ok(scim_json(StatusCode::OK, resource(&base_url(&headers), &after)))
 }
 
 /// `PATCH /scim/v2/Users/{id}`. `active: false` disables the user and ends their sessions.
-pub async fn patch_user(State(app): State<AppState>, Extension(c): Extension<Caller>, headers: HeaderMap, Path(id): Path<String>, body: Result<Bytes, BytesRejection>) -> ScimRes {
+pub async fn patch_user(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, headers: HeaderMap, Path(id): Path<String>, body: Result<Bytes, BytesRejection>) -> ScimRes {
     let before = need(&app, &c, &id)?;
     let mut d = Attrs::of(&before);
     apply_patch(&mut d, &parse_body(body)?)?;
-    let after = update(&app, &c, &before.user, Some(&before), &d, None).await?;
+    let after = update(&app, &a, &c, &before.user, Some(&before), &d, None).await?;
     Ok(scim_json(StatusCode::OK, resource(&base_url(&headers), &after)))
 }
 
 /// `DELETE /scim/v2/Users/{id}`: the user is disabled, their sessions end, and the tenant
 /// can't see them any more. Nothing is destroyed: the user and its audit history stay.
-pub async fn delete_user(State(app): State<AppState>, Extension(c): Extension<Caller>, Path(id): Path<String>) -> ScimRes {
+pub async fn delete_user(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, Path(id): Path<String>) -> ScimRes {
     let before = need(&app, &c, &id)?;
     if !app.db.delete_scim_user(&c.token.tenant, &id) {
         return Err(missing("User"));
     }
+    a.sso.forget_user(&id);
     let n = app.db.revoke_user_sessions(&id, c.who.actor.id.as_deref().unwrap_or("scim"), "deleted by SCIM");
     app.db.record(&c.who.event("scim.user_deleted").target("user", &id).details(json!({
         "tenant": c.token.tenant, "externalId": before.external_id, "userName": before.user_name, "sessionsRevoked": n,
