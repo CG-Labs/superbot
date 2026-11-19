@@ -8,6 +8,10 @@
   var submit = document.getElementById("submit");
   var turnstileToken = "";
   var turnstileWidget = null;
+  // The server's settings; null until loaded. A failed load is retried on submit, so a
+  // dropped connection can't leave the form without the bot check the server requires.
+  var config = null;
+  var needsTurnstile = false;
 
   var LIMITS = { name: 100, email: 254, company: 120, useCase: 2000 };
   var LABELS = {
@@ -70,7 +74,11 @@
     if (!value("teamSize")) errors.teamSize = "Pick a team size.";
     if (!value("signIn")) errors.signIn = "Pick how you'd like to sign in.";
     if (!value("consent")) errors.consent = "Please agree so we can store your request and contact you about it.";
-    if (turnstileWidget !== null && !turnstileToken) errors.turnstileToken = "Please complete the check above.";
+    if (needsTurnstile && !turnstileToken) {
+      errors.turnstileToken = turnstileWidget === null
+        ? "The check above is still loading, or was blocked. Wait a moment, or allow challenges.cloudflare.com, then try again."
+        : "Please complete the check above.";
+    }
     return errors;
   }
 
@@ -126,18 +134,31 @@
     document.head.appendChild(s);
   }
 
-  fetch("/api/signups/config", { credentials: "omit" })
-    .then(function (r) { return r.ok ? r.json() : null; })
-    .then(function (cfg) {
-      if (!cfg) return;
-      if (!cfg.enabled) {
-        form.hidden = true;
-        el("closed").hidden = false;
-        return;
-      }
-      if (cfg.turnstileSiteKey) loadTurnstile(cfg.turnstileSiteKey);
-    })
-    .catch(function () {});
+  function loadConfig() {
+    return fetch("/api/signups/config", { credentials: "omit" })
+      .then(function (r) {
+        if (!r.ok) throw new Error("config " + r.status);
+        return r.json();
+      })
+      .then(function (cfg) {
+        config = cfg;
+        if (!cfg.enabled) {
+          form.hidden = true;
+          el("closed").hidden = false;
+          return;
+        }
+        if (cfg.turnstileSiteKey) {
+          needsTurnstile = true;
+          loadTurnstile(cfg.turnstileSiteKey);
+        }
+      });
+  }
+
+  function ready() {
+    return config ? Promise.resolve() : loadConfig();
+  }
+
+  loadConfig().catch(function () {});
 
   form.addEventListener("input", function (e) {
     var name = e.target && e.target.name;
@@ -147,6 +168,13 @@
   form.addEventListener("submit", function (e) {
     e.preventDefault();
     clearErrors();
+    ready().then(send, function () {
+      showSummary("We couldn't reach SuperBot. Check your connection and try again.");
+    });
+  });
+
+  function send() {
+    if (!config.enabled) return;
     var errors = check();
     if (Object.keys(errors).length) return report(errors);
 
@@ -192,5 +220,5 @@
         submit.disabled = false;
         submit.textContent = "Request access";
       });
-  });
+  }
 })();
