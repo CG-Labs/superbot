@@ -38,13 +38,13 @@ What exists in **CG-Labs/superbot** today:
 
 | Area | Reality |
 |------|---------|
-| **Auth** | Single `AUTH_PASSWORD` (Basic); optional `ALLOW_NO_AUTH` on loopback only; `ALLOWED_HOSTS`; per-start `BOT_TOKEN` for `botctl`. No user table, no SSO, no RBAC. |
+| **Auth** | Single `AUTH_PASSWORD` (Basic); optional `ALLOW_NO_AUTH` on loopback only; `ALLOWED_HOSTS`; per-start `BOT_TOKEN` for `botctl`. No user table, no SSO, no RBAC. Logins and failed logins are audited. |
 | **Client** | Login, SSE chat, bots CRUD, models/effort, routines **enable/disable only**; no screen viewer, handoff UI, routine editor, push, or biometric lock; placeholder EAS `projectId`; template branding. |
-| **Server** | SQLite single-tenant schema; harnesses run with their own prompts off, gated by the SuperBot **policy engine and approval queue** (default **ask** on fresh installs; [ADR 0007](adr/0007-approvals.md)); Vault **not built** (`docs/backend.md`). |
+| **Server** | SQLite single-tenant schema; harnesses run with their own prompts off, gated by the SuperBot **policy engine and approval queue** (default **ask** on fresh installs; [ADR 0007](adr/0007-approvals.md)); append-only **audit events** for admin actions with CSV export (`/api/audit`, `botctl audit export`, web Audit log; [ADR 0008](adr/0008-audit-events.md)); Vault **not built** (`docs/backend.md`). |
 | **Deploy** | Ubuntu bash installer, systemd, Caddy, daily SQLite backup timer; Docker Compose (`Dockerfile` + `deploy/docker/`: `botd`, Caddy, backup sidecar), smoke-tested in CI ([ADR 0006](adr/0006-docker-compose.md)). |
 | **Multi-tenancy** | One deployment = one org in practice (`DATA_DIR`, shared `WORKSPACE_DIR`). |
 | **Observability** | `journalctl`, healthz; no metrics/tracing product. |
-| **Compliance** | None; MIT license at repo root (see [Licensing & upstream](#licensing--upstream)). |
+| **Compliance** | No certifications. Audit log with CSV export and configurable retention (`AUDIT_RETENTION_DAYS`, default keep forever). MIT license at repo root (see [Licensing & upstream](#licensing--upstream)). |
 
 ---
 
@@ -87,8 +87,8 @@ Basic auth may remain for **break-glass** and **self-host hobby** tiers only, be
 | | |
 |--|--|
 | **Goal** | Reduce blast radius and improve deploy surface before selling to strangers. |
-| **Scope** | Approvals MVP (pause before destructive harness tools); secrets via env/Vault interface (not plaintext in SQLite); structured audit **events** (append-only file or table) for admin actions; optional Docker **Compose** one-click (image + `botd` + Caddy + volume mounts) per [architecture](architecture.md) and community expectation (e.g. upstream issue **#7** — Compose packaging; not yet in CG-Labs tree); harness **policy** flags (when to allow bypass vs require approval); client: routine editor, screen viewer parity with `web/`, real EAS `projectId` + brand assets. |
-| **Exit criteria** | Compose documented as supported path; approvals cover send-email/shell/file-delete class tools; audit export CSV; client routine CRUD + screen iframe. |
+| **Scope** | Approvals MVP (pause before destructive harness tools) (**done**: [ADR 0007](adr/0007-approvals.md)); secrets via env/Vault interface (not plaintext in SQLite); structured audit **events** (append-only table) for admin actions (**done**: [ADR 0008](adr/0008-audit-events.md)); optional Docker **Compose** one-click (image + `botd` + Caddy + volume mounts) per [architecture](architecture.md) and community expectation (e.g. upstream issue **#7** — Compose packaging) (**done**: [ADR 0006](adr/0006-docker-compose.md)); harness **policy** flags (when to allow bypass vs require approval) (**done**: ADR 0007); client: routine editor, screen viewer parity with `web/`, real EAS `projectId` + brand assets. |
+| **Exit criteria** | Compose documented as supported path (**done**); approvals cover send-email/shell/file-delete class tools (**done**); audit export CSV (**done**); client routine CRUD + screen iframe. |
 | **Size** | **L** |
 | **Dependencies** | M0 |
 
@@ -157,6 +157,7 @@ Basic auth may remain for **break-glass** and **self-host hobby** tiers only, be
 | Harness permissions | Bypass flags on all adapters | Policy engine: default **ask** for risky tools; bypass only in dev profiles (**done**: [ADR 0007](adr/0007-approvals.md)) |
 | Compute isolation | One OS user, shared workspace | Tenant workspaces (M3); optional per-bot containers (M5) |
 | Secrets | Harness logins on service user disk | Vault + short-lived tokens (M1→M5) |
+| Audit | Append-only SQLite table, CSV export, retention setting (**done**: [ADR 0008](adr/0008-audit-events.md)) | Per-user actors and IdP subjects (M2); SIEM export and tamper evidence (M5) |
 | Network | Caddy TLS, loopback `botd` | Same + mTLS internal where multi-service |
 | Client | Password in SecureStore | OAuth tokens, certificate pinning (managed) |
 
