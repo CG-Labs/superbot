@@ -892,12 +892,14 @@ mod tests {
         assert_eq!(status(port, &host, "").await, 200);
     }
 
-    /// The real router on a fresh install (policy: ask), password "hunter2".
-    async fn serve_app() -> (u16, AppState) {
+    /// The real router on a fresh install (policy: ask), with a random password.
+    /// Returns the port, the app, and the person's Authorization header.
+    async fn serve_app() -> (u16, AppState, String) {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let password = random_hex(16);
         let auth = Arc::new(Auth {
-            password: "hunter2".into(),
+            password: password.clone(),
             allow_no_auth: false,
             bot_token: "bot-token".into(),
             hosts: allowed_hosts("127.0.0.1", port, ""),
@@ -907,7 +909,7 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, r).await.unwrap();
         });
-        (port, app)
+        (port, app, basic(&password))
     }
 
     async fn call(port: u16, method: &str, path: &str, authorization: &str, body: &str) -> (u16, String) {
@@ -928,7 +930,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_is_open_and_new_endpoints_need_login() {
-        let (port, _) = serve_app().await;
+        let (port, _, _) = serve_app().await;
         assert_eq!(call(port, "GET", "/healthz", "", "").await.0, 200);
         for (m, p) in [
             ("GET", "/api/policy"),
@@ -945,9 +947,8 @@ mod tests {
 
     #[tokio::test]
     async fn bots_cannot_approve_or_change_policy() {
-        let (port, app) = serve_app().await;
+        let (port, app, user) = serve_app().await;
         let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
-        let user = basic("hunter2");
         for (m, p, b) in [
             ("PUT", "/api/policy".to_string(), r#"{"mode":"bypass"}"#),
             ("PUT", format!("/api/bots/{}/policy", bot.id), r#"{"mode":"bypass"}"#),
@@ -972,9 +973,8 @@ mod tests {
 
     #[tokio::test]
     async fn hook_waits_for_a_person_then_runs() {
-        let (port, app) = serve_app().await;
+        let (port, app, user) = serve_app().await;
         let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
-        let user = basic("hunter2");
         let check = |cmd: &str| {
             json!({ "from": bot.id, "harness": "claude", "event": { "tool_name": "Bash", "tool_input": { "command": cmd }, "cwd": "/tmp" } }).to_string()
         };
