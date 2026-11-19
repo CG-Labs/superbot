@@ -48,4 +48,5 @@ export const HARNESS_NAMES: Record<string, string> = {
   claude: "Claude Code",
   codex: "Codex",
   pi: "Pi",
+  hermes: "Hermes Agent",
 };

@@ -43,6 +43,7 @@ If flags are omitted, the script prompts on a TTY. The checkout must not be owne
 8. **Caddy** automatic HTTPS when `--domain` is set: the web client at `/app/`, everything else to `botd` (`flush_interval -1` for SSE)
 9. Optional **UFW** (`--ufw`): allow 22, 80, 443
 10. Daily **backup** timer (on by default; `--no-backup` to skip)
+11. With `--with-hermes`: [Hermes Agent](#hermes-agent) for the service user
 
 Admin password file: `~superbot/.superbot-admin-password` (mode `0600`).
 
@@ -75,9 +76,20 @@ The installer builds the Expo client (`apps/client`) from the same commit as `bo
 | `--upgrade` | Pull, rebuild, restart |
 | `--ufw` | Enable firewall rules |
 | `--no-backup` | Skip backup timer |
+| `--with-hermes` | Also install Hermes Agent ([below](#hermes-agent)) |
 | `--no-client` | Skip building the web client |
 | `--dry-run` | Print steps only |
 | `--source-dir` | Copy a local tree instead of cloning |
+
+## Hermes Agent
+
+Opt-in, because it is large (about 2.5 GB for the install, plus about 0.5 GB per Bot that uses it). `--with-hermes` runs Hermes's own installer as the service user, pinned to the commit of release v0.23.2 (override with `HERMES_COMMIT=<sha>`), and puts `~/.local/bin` on botd's `PATH` in `.env`. Hermes has no login: save a provider key, encrypted ([master key](#master-key)):
+
+```sh
+sudo -u superbot env SUPERBOT_PASSWORD="$(sudo grep -oP '^AUTH_PASSWORD=\K.*' ~superbot/superbot/.env)" botctl secret set OPENROUTER_API_KEY < /path/to/key.txt
+```
+
+To pick a provider or endpoint, set `SUPERBOT_HERMES_PROVIDER` (Hermes's `--provider`, e.g. `openrouter`) and `SUPERBOT_HERMES_BASE_URL` in `~superbot/superbot/.env`, then `sudo systemctl restart superbot`. Pick Hermes Agent for a Bot in its settings, or set `DEFAULT_HARNESS=hermes`. How it runs and its limits: [backend docs](../docs/backend.md#hermes-agent).
 
 ## Binaries
 
@@ -159,7 +171,7 @@ Without a domain, `./init.sh` gives plain HTTP at `http://localhost`, published 
 |--------|------------|-------|
 | `data` | `/data` (`DATA_DIR`) | SQLite database, Bot memory, user file. Back this up. |
 | `workspace` | `/workspace` (`WORKSPACE_DIR`) | The Bots' shared files. |
-| `home` | `/home/superbot` | Harness logins and sessions (`~/.claude`, `~/.claude.json`, `~/.codex`, `~/.pi`), runtime `npm i -g` installs. |
+| `home` | `/home/superbot` | Harness logins and sessions (`~/.claude`, `~/.claude.json`, `~/.codex`, `~/.pi`), runtime `npm i -g` installs. Hermes Agent keeps its per-Bot data in `data` instead. |
 | `backups` | `/backups` | Backup archives. |
 | `caddy-data`, `caddy-config` | Caddy | Certificates and ACME account. |
 
@@ -173,6 +185,8 @@ Every other `botd` setting (`TZ`, `USER_NAME`, `DEFAULT_HARNESS`, `CORS_ORIGINS`
 
 The image bakes in Claude Code, Codex, and Pi (`npm i -g` at build time). Pick a subset with `SUPERBOT_HARNESSES` in `.env` (e.g. `claude`, or empty for none), then `docker compose build botd && docker compose up -d`. Pin versions with build args, e.g. `docker compose build --build-arg CLAUDE_CODE_VERSION=2.1.328 botd` (`CODEX_VERSION` and `PI_VERSION` too).
 
+Hermes Agent is opt-in: add it with `SUPERBOT_HARNESSES=claude codex pi hermes` (about 2.5 GB more in the image, plus about 0.5 GB per Bot in the `data` volume). The image installs it in `/opt/hermes`, pinned with `HERMES_COMMIT`. It has no login: save a provider key with `botctl secret set` (above) and, if needed, set `SUPERBOT_HERMES_PROVIDER` and `SUPERBOT_HERMES_BASE_URL` in `.env`. See [backend docs](../docs/backend.md#hermes-agent).
+
 Log in once inside the container, as the `superbot` user that runs the Bots. Logins are stored in the `home` volume and survive upgrades and container recreation:
 
 | Harness | Interactive login | Or put in `.env` |
@@ -180,6 +194,7 @@ Log in once inside the container, as the `superbot` user that runs the Bots. Log
 | Claude Code | `docker compose exec -it botd claude auth login` (open the URL, paste the code back) | `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) or `ANTHROPIC_API_KEY` |
 | Codex | `docker compose exec -it botd codex login --device-auth` | `OPENAI_API_KEY`, or store it: `docker compose exec -T botd codex login --with-api-key < key.txt` |
 | Pi | `docker compose exec -it botd pi auth login <provider> --no-browser` | A provider key, e.g. `OPENROUTER_API_KEY` |
+| Hermes Agent | None | A provider key, e.g. `OPENROUTER_API_KEY`, best saved with `botctl secret set` |
 
 Check with `claude auth status`, `codex login status`, or `pi auth check` (same `docker compose exec` prefix).
 

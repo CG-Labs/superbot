@@ -4,7 +4,7 @@ One Rust binary, `botd`. It serves the web app, stores everything in SQLite, and
 
 ## How it works
 
-- **Bots** live in SQLite. Each Bot has a harness (`claude`, `codex`, or `pi`), an optional model, and a harness session id.
+- **Bots** live in SQLite. Each Bot has a harness (`claude`, `codex`, `pi`, or `hermes`), an optional model, and a harness session id.
 - **A message** is queued. Each Bot runs one task at a time, in order. Different Bots run in parallel.
 - **A run** spawns the harness CLI in the shared workspace, streams its JSON events, and saves each text block as a chat bubble.
 - **Live updates** go to the browser over one Server-Sent Events stream: new messages, streaming text, and what the Bot is doing ("Running: ls").
@@ -27,14 +27,28 @@ Each adapter is one file in `server/src/adapters/`. It builds the command line a
 - **Claude Code**: `claude -p --output-format stream-json --resume <id>`. System prompt via `--append-system-prompt`, fresh every run.
 - **Codex**: `codex exec --json`, then `codex exec resume <id>`. Instructions via `-c developer_instructions=...`. Codex only reads them when a session starts, so later memory edits reach it through the memory file.
 - **Pi**: `pi --mode json --session-dir <bot dir> --session-id <id>`. System prompt via `--append-system-prompt`.
+- **Hermes Agent**: `hermes chat --oneshot --query-file - --format stream-json --source tool`, prompt on stdin, then `--resume <id>`. System prompt via `HERMES_EPHEMERAL_SYSTEM_PROMPT`. See [Hermes Agent](#hermes-agent).
 
-All three run with the harness's own permission prompts off (`--dangerously-skip-permissions` and equivalents): nobody is at a terminal to answer them. In `ask` mode, each adapter adds a hook that runs `botctl hook <harness>` before every tool call instead:
+All four run with the harness's own permission prompts off (`--dangerously-skip-permissions` and equivalents): nobody is at a terminal to answer them. In `ask` mode, each adapter adds a hook that runs `botctl hook <harness>` before every tool call instead:
 
 - **Claude Code**: a `PreToolUse` command hook via `--settings`.
 - **Codex**: the same hook via `-c hooks.PreToolUse=...` and `features.hooks=true`.
 - **Pi**: a small generated extension (`--extension`) that runs the same command on `tool_call`.
+- **Hermes Agent**: a `pre_tool_call` shell hook with `fail_closed: true`, in a Hermes managed config. Hermes runs hooks in its own folder, so the hook names the Bot's: `botctl hook hermes --cwd <workspace>`.
 
 The server is still the computer, so treat it that way. Details and trade-offs: [ADR 0007](adr/0007-approvals.md).
+
+### Hermes Agent
+
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) (Nous Research, MIT), tested on v0.23.2. Design: [ADR 0011](adr/0011-hermes-agent-backend.md) option (a), details in [ADR 0015](adr/0015-hermes-adapter.md).
+
+- **Install**: `deploy/install.sh --with-hermes`, or `hermes` in `SUPERBOT_HARNESSES` for Docker ([deploy/README.md](../deploy/README.md)). Both pin a commit. Then pick Hermes Agent for a Bot in its settings, or set `DEFAULT_HARNESS=hermes`.
+- **Provider and key**: save the key encrypted, e.g. `botctl secret set OPENROUTER_API_KEY < key.txt`. Saved secrets reach Hermes as env vars; Hermes hides its provider keys from the agent's shell. `SUPERBOT_HERMES_PROVIDER` and `SUPERBOT_HERMES_BASE_URL` in `.env` become `--provider` and `--base-url`; empty means Hermes's own config. The model is free text (Hermes can't list models without a prompt): the apps show a text field, and the web UI an "Other model…" choice. Effort maps to `--reasoning` (`none` to `ultra`).
+- **Per Bot**: each Bot has its own Hermes data root, `DATA_DIR/bots/<id>/hermes`. The first run of a new Bot prepares Hermes's dependencies there: about 20 seconds and 0.5 GB, once.
+- **Settings botd enforces** go in `DATA_DIR/bots/<id>/hermes-managed/config.yaml` (Hermes's managed scope, 0600, rewritten every run): the approval hook, tool env passthrough (variable names only, never values), Hermes's own memory off, and its cron tools off. botd owns memory and routines.
+- **Daemon**: `hermes chat` hands the turn to a Hermes gateway daemon that outlives it. botd runs `hermes gateway stop --yes` for the Bot before and after every run, so stopping a Bot ends the turn and each run gets fresh env.
+- **Approvals**: Hermes stops hooks after 300 seconds, so a Hermes Bot's approval waits at most 4 minutes, then counts as denied. Hermes's own dangerous-command prompt is off (`--yolo`): SuperBot's hook is the gate, like the other harnesses. Tools: `terminal` is a shell tool (its `workdir` counts as a folder the command runs in), `write_file` and `patch` are file tools, and text typed into a running program with `process_manage` is checked as a command.
+- **Limits**: `execute_code` runs Python like `python3 script.py` does for other harnesses; the hook sees the tools a script calls, not the script's own system calls. If the hook can't run (crash, bad output, timeout), Hermes blocks the tool.
 
 Add a harness: write one adapter file and add it to `get()` and `NAMES` in `adapters/mod.rs`.
 
@@ -53,7 +67,7 @@ Settings are in [.env.example](../.env.example). Keep `botctl` next to `botd`: t
 
 - Keep your server IP, domain, and secrets out of this repo. They go in `.env` on the server.
 
-- Install the harness CLIs you want and log them in **as the user that runs `botd`**: `claude` (then `claude login` or `ANTHROPIC_API_KEY`), `codex` (`codex login` or `OPENAI_API_KEY`), `pi` (provider API key, e.g. `OPENROUTER_API_KEY`). Their env vars pass through to the Bots.
+- Install the harness CLIs you want and log them in **as the user that runs `botd`**: `claude` (then `claude login` or `ANTHROPIC_API_KEY`), `codex` (`codex login` or `OPENAI_API_KEY`), `pi` (provider API key, e.g. `OPENROUTER_API_KEY`), `hermes` (provider API key, see [Hermes Agent](#hermes-agent)). Their env vars pass through to the Bots.
 - Run `botd` as a normal user, not root. Claude Code refuses to skip permissions as root.
 - Run it under systemd with `Restart=always`. It shuts down cleanly on SIGTERM.
 - Put HTTPS in front (e.g. Caddy) and set `AUTH_PASSWORD` and `HOST=127.0.0.1` behind the proxy (recommended). The browser logs in with any username and that password.
@@ -80,7 +94,7 @@ The policy decides what each tool call does: run, ask a person, or be blocked.
 - **Unreadable commands are denied**, whatever the classes or rules say: unclosed quotes or substitutions, syntax the parser doesn't know, over 1 MiB, nesting over 16 levels, or over 10,000 commands. The Bot is told why, so it can simplify the command.
 - **Rules**: `deny` rules (the deny list) always block. `allow` rules skip asking, unless the class is `deny`. Patterns are globs (`*`, `?`) over the command, path, URL, or tool arguments. "Remember" on an approval saves an exact-match rule for that Bot.
 - **Scope**: one global policy, plus optional per-Bot overrides.
-- **Timeout**: an unanswered approval is denied after `timeoutMinutes` (default 10). Stopping the Bot, the run ending, or a server restart also closes it.
+- **Timeout**: an unanswered approval is denied after `timeoutMinutes` (default 10; at most 4 for Hermes Agent Bots). Stopping the Bot, the run ending, or a server restart also closes it.
 - **Turning approvals on** stops any task that started in `bypass` (it has no hook), with a note to send it again.
 - **Remember** saves an exact rule. Calls too long to store whole (over 4,000 characters) can be approved or denied, but not remembered.
 - **Audit**: every request, decision, timeout, and policy or rule change is in the [audit log](#audit-log).
@@ -159,7 +173,7 @@ All JSON. Auth: a session cookie (web app) or `Authorization: Bearer <session to
 - `GET /api/events`: SSE stream (`message`, `draft`, `status`, `bot`, `botDeleted`, `approval`, `policy`, `resync`)
 - `POST /api/bots` `{name, harness?, model?, color?, shape?}`
 - `PATCH /api/bots/:id` `{name?, hidden?, harness?, model?, effort?}`, `DELETE /api/bots/:id`
-- `GET /api/harnesses/:name/models`: models and reasoning efforts the harness offers (Claude Code: aliases; Codex: `codex debug models`; Pi: `pi --list-models`)
+- `GET /api/harnesses/:name/models`: models and reasoning efforts the harness offers (Claude Code: aliases; Codex: `codex debug models`; Pi: `pi --list-models`; Hermes Agent: one entry with an empty `id`, meaning any model name, with its efforts)
 - `GET|POST /api/bots/:id/messages` `{text, answer?: {messageId, option}}`
 - `POST /api/bots/:id/read`, `POST /api/bots/:id/stop`
 - `GET|POST /api/bots/:id/routines` `{name, cron, instruction}`

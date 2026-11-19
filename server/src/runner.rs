@@ -9,7 +9,7 @@ use crate::policy::Mode;
 use crate::screen::{self, Screens};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -204,9 +204,9 @@ impl App {
     }
 
     async fn run_one(self: &Arc<Self>, mut bot: Bot, msg: &Message) {
-        if adapters::get(&bot.harness).is_none() {
+        let Some(shell_tool) = adapters::get(&bot.harness).map(|a| a.shell_tool()) else {
             return self.say(&bot.id, &format!("Unknown harness \"{}\".", bot.harness), true);
-        }
+        };
         let Some(bot_dir) = self.bot_dir(&bot.id) else {
             return self.say(&bot.id, "This Bot's id isn't a safe folder name, so it can't run.", true);
         };
@@ -223,13 +223,10 @@ impl App {
         for attempt in 0..2 {
             let (abort_tx, abort_rx) = watch::channel(None);
             // Ask mode: the harness calls `botctl hook` before every tool. Its hook timeout
-            // stays above our wait, so the hook is never killed into failing open.
+            // stays above our wait, so the hook is never killed into failing open. A harness
+            // that caps hook timeouts gets a shorter wait instead.
             let policy = self.db.effective_policy(&bot.id);
-            let guard = (policy.mode == Mode::Ask).then(|| {
-                let wait = Duration::from_secs(policy.timeout_minutes as u64 * 60 + 60);
-                let botctl = self.cfg.bin_dir.join("botctl").display().to_string();
-                Guard { command: format!("{} hook {}", shell_quote(&botctl), bot.harness), timeout_secs: wait.as_secs() + 60, wait }
-            });
+            let guard = (policy.mode == Mode::Ask).then(|| guard(&self.cfg.bin_dir, &bot.harness, policy.timeout_minutes));
             let hooks = Arc::new(AtomicU32::new(0));
             self.state().entry(bot.id.clone()).or_default().run = Some(Run {
                 abort: abort_tx.clone(),
@@ -297,7 +294,7 @@ impl App {
                 AgentEvent::Tool { name, detail } => {
                     // Fail closed: a guarded harness that runs a shell tool without ever
                     // calling the hook isn't enforcing approvals, so stop it.
-                    if guard.is_some() && canary.is_none() && ["bash", "shell"].contains(&name.to_lowercase().as_str()) {
+                    if guard.is_some() && canary.is_none() && name.eq_ignore_ascii_case(shell_tool) {
                         saw_shell = true;
                         let (hooks, abort) = (hooks.clone(), abort_tx.clone());
                         canary = Some(tokio::spawn(async move {
@@ -334,6 +331,7 @@ impl App {
             let lost = errors.iter().any(|m| {
                 let m = m.to_lowercase();
                 m.contains("no conversation found")
+                    || m.contains("no session found")
                     || ((m.contains("session") || m.contains("conversation"))
                         && (m.contains("not found") || m.contains("no such") || m.contains("does not exist")))
             });
@@ -578,6 +576,16 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// The approval gate for one run. The hook timeout stays a minute above the wait.
+fn guard(bin_dir: &Path, harness: &str, timeout_minutes: u32) -> Guard {
+    let mut wait = Duration::from_secs(timeout_minutes as u64 * 60 + 60);
+    if let Some(cap) = adapters::get(harness).and_then(|a| a.max_hook_secs()) {
+        wait = wait.min(Duration::from_secs(cap.saturating_sub(60).max(1)));
+    }
+    let botctl = bin_dir.join("botctl").display().to_string();
+    Guard { command: format!("{} hook {harness}", shell_quote(&botctl)), timeout_secs: wait.as_secs() + 60, wait }
+}
+
 #[cfg(test)]
 pub fn test_app() -> Arc<App> {
     let dir = crate::db::temp_path("app");
@@ -614,7 +622,7 @@ fn split_question(text: &str) -> (&str, Option<Value>) {
 fn tool_label(name: &str, detail: &str) -> String {
     let n = name.to_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| n.contains(w));
-    let verb = if has(&["bash", "shell", "command"]) {
+    let verb = if has(&["bash", "shell", "command", "terminal"]) {
         "Running".to_string()
     } else if has(&["read", "view"]) {
         "Reading".into()
@@ -647,6 +655,19 @@ fn screen_prompt(botctl: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_approval_wait_fits_the_harness_hook_limit() {
+        let g = guard(Path::new("/opt/it's"), "claude", 10);
+        assert_eq!(g.command, r"'/opt/it'\''s/botctl' hook claude");
+        assert_eq!((g.wait, g.timeout_secs), (Duration::from_secs(660), 720));
+        // Hermes kills hooks after 300 seconds, so its wait stays under that.
+        let g = guard(Path::new("/opt"), "hermes", 10);
+        assert_eq!((g.wait, g.timeout_secs), (Duration::from_secs(240), 300));
+        let g = guard(Path::new("/opt"), "hermes", 1);
+        assert_eq!((g.wait, g.timeout_secs), (Duration::from_secs(120), 180));
+        assert_eq!(tool_label("terminal", "ls"), "Running: ls");
+    }
 
     #[test]
     fn bot_files_stay_in_the_data_folder() {

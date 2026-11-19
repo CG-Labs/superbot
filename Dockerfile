@@ -34,11 +34,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Harness CLIs are Node packages, so the runtime is Node's slim Debian image.
 FROM ${NODE_IMAGE} AS runtime
 
-# Space-separated subset of: claude codex pi. Empty = none (install later into the home volume).
+# Space-separated subset of: claude codex pi hermes. Empty = none (install later into the home volume).
+# hermes (Hermes Agent) is opt-in: it adds about 2.5 GB, plus about 0.5 GB per Bot in /data.
 ARG HARNESSES="claude codex pi"
 ARG CLAUDE_CODE_VERSION=latest
 ARG CODEX_VERSION=latest
 ARG PI_VERSION=latest
+# Hermes Agent release the image installs: the commit of tag v0.23.2 (NousResearch/hermes-agent).
+ARG HERMES_COMMIT=ae2a81ccc00e9b7c06301523e5bb09608397149c
 ARG SUPERBOT_UID=10001
 
 RUN apt-get update \
@@ -52,7 +55,8 @@ RUN set -eu; pkgs=""; \
             claude) pkgs="$pkgs @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" ;; \
             codex) pkgs="$pkgs @openai/codex@${CODEX_VERSION}" ;; \
             pi) pkgs="$pkgs @earendil-works/pi-coding-agent@${PI_VERSION}" ;; \
-            *) echo "Unknown harness in HARNESSES: $h (use claude, codex, pi)" >&2; exit 1 ;; \
+            hermes) ;; \
+            *) echo "Unknown harness in HARNESSES: $h (use claude, codex, pi, hermes)" >&2; exit 1 ;; \
         esac; \
     done; \
     if [ -n "$pkgs" ]; then \
@@ -64,6 +68,21 @@ RUN groupadd --system --gid "$SUPERBOT_UID" superbot \
     && useradd --system --uid "$SUPERBOT_UID" --gid superbot \
         --home-dir /home/superbot --create-home --shell /bin/bash superbot \
     && install -d -o superbot -g superbot -m 0700 /data /workspace /backups
+
+# Hermes's own installer, outside the home volume. It runs as superbot because Hermes
+# refuses to use a checkout another user owns. Each Bot gets its own Hermes data root,
+# which shares the installed tools only while the checkout sits in the installer's
+# data root (.hermes/hermes-agent, the default layout).
+RUN set -eu; case " $HARNESSES " in *" hermes "*) ;; *) exit 0 ;; esac; \
+    apt-get update; apt-get install -y --no-install-recommends libatomic1 xz-utils; rm -rf /var/lib/apt/lists/*; \
+    install -d -o superbot -g superbot /opt/hermes; \
+    curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_COMMIT}/scripts/install.sh" -o /tmp/hermes-install.sh; \
+    runuser -u superbot -- env HOME=/opt/hermes bash /tmp/hermes-install.sh --non-interactive --skip-browser \
+        --skip-computer-use --commit "$HERMES_COMMIT"; \
+    rm -f /tmp/hermes-install.sh; \
+    ln -s /opt/hermes/.hermes/hermes-agent/.hermes/bin/hermes /usr/local/bin/hermes; \
+    runuser -u superbot -- env HOME=/opt/hermes hermes --version; \
+    if find /opt/hermes \! -user superbot | grep -q .; then echo "root-owned files in /opt/hermes" >&2; exit 1; fi
 
 # botd prepends its own folder to each Bot's PATH, so it lives apart from the npm CLIs in /usr/local/bin.
 COPY --from=build /out/botd /out/botctl /opt/superbot/bin/

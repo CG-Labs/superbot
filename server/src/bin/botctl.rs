@@ -208,16 +208,14 @@ fn pretty(body: String) -> String {
 /// The approval gate. The harness pipes its PreToolUse event on stdin; botd decides,
 /// waiting for the user if needed. Exit 0 allows. Anything else must block, so every
 /// failure (no server, bad reply) exits 2 with the reason on stderr.
-fn hook(harness: &str) -> ! {
+/// `--cwd` names the folder the tool runs in, for harnesses whose hook runs elsewhere.
+fn hook(harness: &str, cwd: Option<&str>) -> ! {
     let mut event = String::new();
     let verdict = std::io::stdin()
         .read_to_string(&mut event)
         .map_err(|e| e.to_string())
-        .and_then(|_| serde_json::from_str::<Value>(&event).map_err(|e| format!("bad hook input: {e}")))
-        .and_then(|event| {
-            let body = json!({ "from": std::env::var("BOT_ID").unwrap_or_default(), "harness": harness, "event": event });
-            api(Cred::Bot, "POST", "/api/approvals/check", Some(body.to_string()))
-        });
+        .and_then(|_| hook_body(harness, &std::env::var("BOT_ID").unwrap_or_default(), &event, cwd))
+        .and_then(|body| api(Cred::Bot, "POST", "/api/approvals/check", Some(body)));
     match verdict {
         Ok(r) if r.lines().next() == Some("allow") => std::process::exit(0),
         Ok(r) => {
@@ -227,6 +225,18 @@ fn hook(harness: &str) -> ! {
         Err(e) => eprintln!("SuperBot's approval gate failed, so this action was blocked: {e}"),
     }
     std::process::exit(2)
+}
+
+fn hook_body(harness: &str, bot: &str, event: &str, cwd: Option<&str>) -> Result<String, String> {
+    let mut event = serde_json::from_str::<Value>(event).map_err(|e| format!("bad hook input: {e}"))?;
+    if let Some(cwd) = cwd {
+        if !cwd.starts_with('/') {
+            return Err(format!("--cwd must be an absolute path, not {cwd}"));
+        }
+        let obj = event.as_object_mut().ok_or("bad hook input: not a JSON object")?;
+        obj.insert("cwd".into(), json!(cwd));
+    }
+    Ok(json!({ "from": bot, "harness": harness, "event": event }).to_string())
 }
 
 fn policy_patch(args: &[&str]) -> Result<Value, String> {
@@ -334,7 +344,13 @@ fn run(args: &[String]) -> Result<String, String> {
             let body = json!({ "from": bot, "text": text }).to_string();
             api(Cred::Bot, "POST", "/api/handoff", Some(body))
         }
-        ["hook", harness] => hook(harness),
+        ["hook", harness] => hook(harness, None),
+        ["hook", harness, "--cwd", cwd] => hook(harness, Some(cwd)),
+        ["hook", ..] => {
+            // Exit 0 would allow the tool call, so a malformed gate blocks.
+            eprintln!("SuperBot's approval gate is misconfigured, so this action was blocked. Usage: botctl hook <harness> [--cwd <dir>]");
+            std::process::exit(2)
+        }
 
         ["policy"] | ["policy", "global"] => op("GET", "/api/policy", None),
         ["policy", "set", "global", rest @ ..] => op("PUT", "/api/policy", Some(policy_patch(rest)?.to_string())),
@@ -474,6 +490,20 @@ mod tests {
         assert_eq!(role("read-only"), Ok("read-only"));
         assert!(role("root").is_err());
         assert_eq!(encode("a.b+c@example.com"), "a.b%2Bc%40example.com");
+    }
+
+    #[test]
+    fn hook_cwd_overrides_where_the_harness_says_it_runs() {
+        let event = r#"{"tool_name":"terminal","tool_input":{"command":"ls"},"cwd":"/opt/hermes"}"#;
+        let body: Value = serde_json::from_str(&hook_body("hermes", "b1", event, Some("/workspace")).unwrap()).unwrap();
+        assert_eq!(body["event"]["cwd"], "/workspace");
+        assert_eq!(body["event"]["tool_name"], "terminal");
+        assert_eq!(body["from"], "b1");
+        let body: Value = serde_json::from_str(&hook_body("claude", "b1", event, None).unwrap()).unwrap();
+        assert_eq!(body["event"]["cwd"], "/opt/hermes");
+        assert!(hook_body("hermes", "b1", event, Some("workspace")).is_err());
+        assert!(hook_body("hermes", "b1", "[1]", Some("/workspace")).is_err());
+        assert!(hook_body("hermes", "b1", "not json", None).is_err());
     }
 
     #[test]

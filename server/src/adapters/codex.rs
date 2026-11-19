@@ -71,6 +71,10 @@ impl Adapter for Codex {
     }
 
     /// From `codex debug models`: the models this login can use, and their efforts.
+    fn shell_tool(&self) -> &'static str {
+        "shell"
+    }
+
     fn models(&self) -> Vec<ModelOption> {
         let v: Value = serde_json::from_str(&output("codex", &["debug", "models"])).unwrap_or_default();
         v["models"]

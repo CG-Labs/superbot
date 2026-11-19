@@ -1438,16 +1438,20 @@ mod tests {
         assert!(db.c().execute("DELETE FROM audit_events WHERE at < ?", [now()]).is_err());
         assert!(db.c().execute("DELETE FROM audit_events", []).is_err());
         // Rows on both sides of the cutoff, to the millisecond: pruning never trips the trigger.
-        let edge = now() - 30 * day;
+        let start = now();
+        let edge = start - 30 * day;
         for ms in (-2_000..=2_000).step_by(50) {
             db.c()
                 .execute("INSERT INTO audit_events (at, actor_kind, action, outcome) VALUES (?, 'system', 'edge.event', 'success')", [edge + ms])
                 .unwrap();
         }
         assert!(db.prune_audit().unwrap() >= 21, "the 40-day-old row and the edge rows older than a second");
+        // The cutoff moves with the clock, so a slow runner ages more edge rows out.
+        let late = (now() - start).max(1_000);
         let left: Vec<i64> = all_events(&db).iter().filter(|e| e.action == "edge.event").map(|e| e.at).collect();
         assert!(left.iter().all(|&at| at > edge - 1_000), "rows past the window are gone");
-        assert_eq!(left.iter().filter(|&&at| at >= edge + 1_000).count(), 21, "rows inside the window stay");
+        let young = (-2_000..=2_000).step_by(50).filter(|&ms| ms >= late).count();
+        assert_eq!(left.iter().filter(|&&at| at >= edge + late).count(), young, "rows inside the window stay");
         assert!(all_events(&db).iter().all(|e| e.action != "old.event"));
         db.set_audit_retention(None);
         assert_eq!(db.audit_retention(), None);

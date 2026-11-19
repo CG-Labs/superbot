@@ -117,7 +117,7 @@ log "Harness CLIs runnable: ${SMOKE_HARNESSES-claude codex pi}"
 
 log "botd's folder (prepended to Bots' PATH) holds no harness CLI, so runtime npm upgrades win"
 # shellcheck disable=SC2016
-dc exec -T botd sh -c 'd=$(dirname "$(command -v botd)"); for h in claude codex pi; do [ ! -e "$d/$h" ] || exit 1; done' \
+dc exec -T botd sh -c 'd=$(dirname "$(command -v botd)"); for h in claude codex pi hermes; do [ ! -e "$d/$h" ] || exit 1; done' \
   || fail "a harness CLI sits next to botd and would shadow ~/.local/bin for Bots"
 
 log "Backup service wrote an archive"

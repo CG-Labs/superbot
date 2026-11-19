@@ -56,6 +56,16 @@ jobs:
           grep -Fq 'would build the web client in /home/superbot/superbot/apps/client as superbot (base URL /app) and install it into root-owned /var/www/superbot-app' /tmp/fresh.log
           grep -Fq 'web client at /app/ from /var/www/superbot-app, everything else to botd on 127.0.0.1:3000' /tmp/fresh.log
           grep -Fq 'App:      https://ci.example.com/app/' /tmp/fresh.log
+      - name: Hermes Agent is opt-in and pinned to a commit
+        run: |
+          set -euo pipefail
+          if grep -Eq 'would (install Hermes|set PATH)' /tmp/fresh.log; then exit 1; fi
+          cat deploy/install.sh | sudo bash -s -- --dry-run --non-interactive --with-hermes \
+            --domain ci.example.com --tz UTC | tee /tmp/hermes.log
+          grep -Eq 'would install Hermes Agent [0-9a-f]{40} for superbot from https://raw\.githubusercontent\.com/NousResearch/hermes-agent/[0-9a-f]{40}/scripts/install\.sh$' /tmp/hermes.log
+          grep -Fq 'would set PATH=/home/superbot/.local/bin:/usr/local/sbin:/usr/local/bin:' /tmp/hermes.log
+          if cat deploy/install.sh | sudo HERMES_COMMIT=main bash -s -- --dry-run --non-interactive --with-hermes \
+            --domain ci.example.com --tz UTC; then exit 1; fi
       - name: Piped dry run of an upgrade without the client
         run: |
           set -euo pipefail

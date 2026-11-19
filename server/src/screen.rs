@@ -41,7 +41,7 @@ pub fn on_path(bin: &str) -> bool {
 }
 
 fn spawn(cmd: &mut Command) -> std::io::Result<Child> {
-    crate::adapters::strip_secret_env(cmd);
+    crate::adapters::strip_secret_env(cmd.as_std_mut());
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn()
 }
 
