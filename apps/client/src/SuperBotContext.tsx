@@ -51,7 +51,7 @@ interface SuperBotContextValue {
   canWrite: boolean;
   /** Whether the server lets this person do `perm` (see ADR 0012). */
   can: (perm: string) => boolean;
-  /** Whether this person may do what takes `need` on the Bot (ADR 0016): view, operate (run it), or manage. */
+  /** Whether this person may do what takes `need` on the Bot (ADR 0017): view, operate (run it), or manage. */
   canOnBot: (bot: BotView | null | undefined, need: BotAccess) => boolean;
   harnesses: string[];
   defaultHarness: string;

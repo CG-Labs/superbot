@@ -1,6 +1,6 @@
 # Sign in with any OpenID Connect provider (Okta, Keycloak, Auth0, …)
 
-Lets people sign in with your company's identity provider, set up purely in `.env`. Works with any IdP that does the OpenID Connect authorization code flow with PKCE and signs ID tokens with RS256: Okta, Keycloak, Auth0, Authentik, Zitadel, OneLogin, JumpCloud, and others. Design: [ADR 0014](../adr/0014-oidc-sso-entra.md) and [ADR 0015](../adr/0015-sso-multi-provider.md). For Microsoft and Google use their own guides ([Entra](entra.md), [Google](google.md)): they need checks a generic provider doesn't do.
+Lets people sign in with your company's identity provider, set up purely in `.env`. Works with any IdP that does the OpenID Connect authorization code flow with PKCE and signs ID tokens with RS256: Okta, Keycloak, Auth0, Authentik, Zitadel, OneLogin, JumpCloud, and others. Design: [ADR 0014](../adr/0014-oidc-sso-entra.md) and [ADR 0016](../adr/0016-sso-multi-provider.md). For Microsoft and Google use their own guides ([Entra](entra.md), [Google](google.md)): they need checks a generic provider doesn't do.
 
 You need: admin rights in the IdP, and SuperBot on HTTPS at a fixed address, like `https://superbot.example.com`. Each provider has an id you choose (lowercase letters and digits), like `okta`; it names its settings (`SSO_OKTA_*`) and its redirect URI.
 

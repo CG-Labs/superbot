@@ -47,7 +47,7 @@ let holdHistory = false;
 /** The server's /api/auth/login: absent (an old server), or the token it hands out. */
 let loginToken: string | null = null;
 let permissions: string[] | undefined;
-/** Bob's Bot ACL fields, as a server with ADR 0016 sends them. */
+/** Bob's Bot ACL fields, as a server with ADR 0017 sends them. */
 let bobAcl: Record<string, unknown> = {};
 /** When set, the server never answers a logout. */
 let stallLogout = false;

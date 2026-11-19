@@ -39,7 +39,7 @@ export interface BotView {
   policy?: PolicyMode;
   /** True when this Bot overrides the global policy. */
   policyOverride?: boolean;
-  /** Bot ACLs (ADR 0016). Servers from before send none of these. */
+  /** Bot ACLs (ADR 0017). Servers from before send none of these. */
   owner?: { id: string; name: string } | null;
   visibility?: Visibility;
   /** What you may do with it. */

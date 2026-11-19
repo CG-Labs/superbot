@@ -297,7 +297,7 @@ fn flag<'a>(rest: &[&'a str], name: &str) -> Option<&'a str> {
     rest.windows(2).find(|w| w[0] == name).map(|w| w[1])
 }
 
-/// `botctl bot ...`: who owns and can see a Bot (ADR 0016). The request to send.
+/// `botctl bot ...`: who owns and can see a Bot (ADR 0017). The request to send.
 fn bot_access(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
     let access = |bot: &str| format!("/api/bots/{}/access", encode(bot));
     let grant = |bot: &str, user: &str| format!("/api/bots/{}/grants/{}", encode(bot), encode(user));

@@ -507,7 +507,7 @@ impl App {
     pub(crate) fn system_prompt(&self, bot: &Bot) -> String {
         let read = |p: &Option<PathBuf>| p.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default().trim().to_string();
         let (mem_file, user_file) = (self.memory_file(&bot.id), self.user_file());
-        // Only the Bots its owner can see: a Bot acts for its owner (ADR 0016).
+        // Only the Bots its owner can see: a Bot acts for its owner (ADR 0017).
         let others: Vec<String> = crate::acl::Viewer::owner_of(&self.db, bot)
             .bots(&self.db)
             .into_iter()

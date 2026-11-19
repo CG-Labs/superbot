@@ -18,7 +18,7 @@ function minutesLeft(a: Approval): string {
 export function ApprovalCard({ approval: a }: { approval: Approval }) {
   const { bots, decideApproval, can, canOnBot } = useSuperBot();
   const bot = bots.find((b) => b.id === a.botId);
-  // Answering lets the Bot act, so it takes operator access to that Bot (ADR 0016).
+  // Answering lets the Bot act, so it takes operator access to that Bot (ADR 0017).
   const canDecide = can("approve") && canOnBot(bot, "operate");
   const [remember, setRemember] = useState(false);
   const [busy, setBusy] = useState(false);

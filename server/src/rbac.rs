@@ -116,7 +116,7 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         ("PATCH" | "DELETE", ["bots", _]) => Write,
         ("POST", ["bots", _, "messages" | "read" | "stop" | "routines"]) => Write,
         ("PATCH" | "DELETE", ["routines", _]) => Write,
-        // Bot ACLs. Handlers also require the Bot's owner or an admin (ADR 0016).
+        // Bot ACLs. Handlers also require the Bot's owner or an admin (ADR 0017).
         ("PATCH", ["bots", _, "access"]) => Write,
         ("PUT" | "DELETE", ["bots", _, "grants", _]) => Write,
         ("POST", ["ask" | "handoff"]) => Write,
