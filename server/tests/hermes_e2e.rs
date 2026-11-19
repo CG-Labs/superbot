@@ -137,19 +137,21 @@ fn wait_for<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
     }
 }
 
-/// Sends `text` and waits for the Bot's next reply.
-fn ask(b: &Botd, bot: &str, text: &str, mut on_pending: impl FnMut(&Value)) -> Value {
+/// Sends `text` and waits for the Bot's replies, the last containing `last`. The Bot shows
+/// as idle a moment before its closing message, so idle alone doesn't mean it's done.
+fn ask(b: &Botd, bot: &str, text: &str, last: &str, mut on_pending: impl FnMut(&Value)) -> Value {
     let before = get(b, &format!("/api/bots/{bot}/messages")).as_array().unwrap().len();
     let (code, body) = http(b, "POST", &format!("/api/bots/{bot}/messages"), &json!({ "text": text }).to_string());
     assert_eq!(code, 202, "{body}");
-    wait_for("a reply", || {
+    wait_for(&format!("a reply with {last:?}"), || {
         for a in get(b, "/api/approvals?status=pending").as_array().unwrap() {
             on_pending(a);
         }
         let msgs = get(b, &format!("/api/bots/{bot}/messages"));
         let fresh: Vec<Value> = msgs.as_array().unwrap()[before..].iter().filter(|m| m["role"] == "bot").cloned().collect();
         let done = !get(b, "/api/state")["bots"].as_array().unwrap().iter().any(|x| x["id"] == bot && x["working"] == true);
-        (done && !fresh.is_empty()).then(|| json!(fresh))
+        let ended = fresh.last().is_some_and(|m| m["text"].as_str().unwrap_or_default().contains(last));
+        (done && ended).then(|| json!(fresh))
     })
 }
 
@@ -174,7 +176,7 @@ fn hermes_runs_behind_the_approval_gate() {
     // A risky command waits for a person; approving lets it run.
     std::fs::write(b.stub.join("tool"), "git push origin main").unwrap();
     let mut seen = None;
-    let replies = ask(&b, &id, "push it", |a| {
+    let replies = ask(&b, &id, "push it", "Ran it.", |a| {
         if seen.is_none() {
             seen = Some(a.clone());
             let (code, body) = http(&b, "POST", &format!("/api/approvals/{}/approve", a["id"].as_str().unwrap()), "{}");
@@ -216,13 +218,13 @@ fn hermes_runs_behind_the_approval_gate() {
 
     // The hook checks paths from the Bot's workspace, not the folder Hermes runs hooks in.
     std::fs::write(b.stub.join("tool"), "rm -rf build").unwrap();
-    let replies = ask(&b, &id, "clean up", |a| panic!("asked for a workspace-local delete: {a}"));
+    let replies = ask(&b, &id, "clean up", "Ran it.", |a| panic!("asked for a workspace-local delete: {a}"));
     assert_eq!(texts(&replies), "On it.\nRan it.");
     assert!(read(&b.stub.join("calls.log")).contains("--resume local-stub1"), "the session resumes");
 
     // Denied: the tool doesn't run and the agent is told why.
     std::fs::write(b.stub.join("tool"), "git push --force").unwrap();
-    let replies = ask(&b, &id, "force push", |a| {
+    let replies = ask(&b, &id, "force push", "Blocked: ", |a| {
         let _ = http(&b, "POST", &format!("/api/approvals/{}/deny", a["id"].as_str().unwrap()), "{}");
     });
     let t = texts(&replies);
@@ -232,7 +234,7 @@ fn hermes_runs_behind_the_approval_gate() {
     std::fs::write(b.stub.join("skip-hook"), "").unwrap();
     std::fs::write(b.stub.join("tool"), "ls").unwrap();
     let start = Instant::now();
-    let replies = ask(&b, &id, "list files", |a| panic!("no hook should have run: {a}"));
+    let replies = ask(&b, &id, "list files", "approval gate", |a| panic!("no hook should have run: {a}"));
     assert!(texts(&replies).contains("without checking SuperBot's approval gate"), "{}", texts(&replies));
     assert!(start.elapsed() < Duration::from_secs(20), "stopped by the canary, not the stub's sleep");
     assert!(read(&b.stub.join("calls.log")).trim_end().lines().last().unwrap().starts_with("gateway stop --yes|"));
