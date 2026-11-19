@@ -1476,15 +1476,15 @@ mod tests {
 
     #[tokio::test]
     async fn empty_password_requires_opt_in_even_on_loopback() {
-        let (port, _) = serve(&String::new(), false, "").await;
+        let (port, _) = serve("", false, "").await;
         let host = format!("127.0.0.1:{port}");
         assert_eq!(status(port, &host, "").await, 401);
-        assert_eq!(status(port, &host, &basic(&String::new())).await, 401);
+        assert_eq!(status(port, &host, &basic("")).await, 401);
     }
 
     #[tokio::test]
     async fn allow_no_auth_permits_anonymous_on_loopback() {
-        let (port, _) = serve(&String::new(), true, "").await;
+        let (port, _) = serve("", true, "").await;
         let host = format!("127.0.0.1:{port}");
         assert_eq!(status(port, &host, "").await, 200);
     }

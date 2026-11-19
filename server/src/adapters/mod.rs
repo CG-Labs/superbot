@@ -120,11 +120,13 @@ pub struct ModelOption {
 pub fn models(name: &str) -> Vec<ModelOption> {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
-    static CACHE: Mutex<Option<HashMap<String, (Instant, Vec<ModelOption>)>>> = Mutex::new(None);
-    if let Some((at, list)) = CACHE.lock().unwrap().get_or_insert_default().get(name) {
-        if at.elapsed() < Duration::from_secs(600) && !list.is_empty() {
-            return list.clone();
-        }
+    type Cache = HashMap<String, (Instant, Vec<ModelOption>)>;
+    static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
+    if let Some((at, list)) = CACHE.lock().unwrap().get_or_insert_default().get(name)
+        && at.elapsed() < Duration::from_secs(600)
+        && !list.is_empty()
+    {
+        return list.clone();
     }
     let list = get(name).map(|a| a.models()).unwrap_or_default();
     CACHE.lock().unwrap().get_or_insert_default().insert(name.into(), (Instant::now(), list.clone()));
