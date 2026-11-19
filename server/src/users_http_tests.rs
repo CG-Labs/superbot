@@ -113,6 +113,21 @@ async fn password_login_makes_token_and_cookie_sessions() {
 }
 
 #[tokio::test]
+async fn session_labels_never_hold_a_secret() {
+    let (port, app, admin, _) = serve(|_| {}).await;
+    crate::secrets::redact::register(PW.as_str());
+    let label = format!("laptop {} password=hunter2", PW.as_str());
+    let token = token_for(port, json!({ "password": PW.as_str(), "label": label })).await;
+    let (_, me) = call(port, "GET", "/api/auth/me", &bearer(&token), "").await;
+    let (_, sessions) = call(port, "GET", "/api/sessions", &admin, "").await;
+    let (s, _) = app.db.live_session(&users::hash(&token), db::now(), 60_000, 60_000).unwrap();
+    let stored = s.label.unwrap_or_default();
+    for (what, s) in [("me", me.as_str()), ("sessions", sessions.as_str()), ("sqlite", stored.as_str())] {
+        assert!(s.contains("laptop") && !s.contains(PW.as_str()) && !s.contains("hunter2"), "{what}: {s}");
+    }
+}
+
+#[tokio::test]
 async fn cookie_writes_from_other_sites_are_refused() {
     let (port, app, admin, _) = serve(|_| {}).await;
     let (_, head, _) = login(port, &origin(port), json!({ "password": PW.as_str(), "session": "cookie" })).await;
@@ -165,11 +180,14 @@ async fn each_role_gets_exactly_its_permissions() {
         ("GET", "/api/sessions".into(), ""),
         ("DELETE", "/api/sessions/missing".into(), ""),
         ("DELETE", format!("/api/users/{member_id}/sessions"), ""),
+        ("GET", "/api/secrets".into(), ""),
+        ("PUT", "/api/secrets/RBAC_CHECK_KEY".into(), r#"{"value":"v"}"#),
+        ("DELETE", "/api/secrets/RBAC_CHECK_KEY".into(), ""),
     ];
     // Allowed or not, per role, in route order.
-    let r = [true, true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false];
-    let m = [true, true, true, true, true, true, true, true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false];
-    let k = [true, true, true, false, true, true, true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false];
+    let r = [true, true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false];
+    let m = [true, true, true, true, true, true, true, true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false];
+    let k = [true, true, true, false, true, true, true, true, true, true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false];
     for (who, auth, allowed) in [("readonly", &readonly, r), ("member", &member, m), ("bot", &bot, k)] {
         for ((method, path, body), ok) in routes.iter().zip(allowed) {
             let (code, res) = call(port, method, path, auth, body).await;
