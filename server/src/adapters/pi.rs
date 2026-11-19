@@ -70,6 +70,10 @@ impl Adapter for Pi {
 
     /// From `pi --list-models`: models with credentials set up. Columns:
     /// provider, model, context, max-out, thinking (yes/no), images.
+    fn shell_tool(&self) -> &'static str {
+        "bash"
+    }
+
     fn models(&self) -> Vec<ModelOption> {
         let efforts: Vec<String> = ["off", "minimal", "low", "medium", "high", "xhigh", "max"].map(String::from).into();
         output("pi", &["--list-models"])

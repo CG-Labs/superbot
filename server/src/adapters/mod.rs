@@ -83,6 +83,9 @@ pub trait Adapter: Send {
     fn stop_leftovers(&self, _input: &RunInput) -> Result<(), String> {
         Ok(())
     }
+    /// The tool name its events use for shell commands. Ask mode stops a run that uses it
+    /// without calling the hook, since that harness isn't enforcing approvals.
+    fn shell_tool(&self) -> &'static str;
     /// The longest hook timeout the harness accepts, if it caps it.
     fn max_hook_secs(&self) -> Option<u64> {
         None

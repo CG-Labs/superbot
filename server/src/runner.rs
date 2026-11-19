@@ -204,9 +204,9 @@ impl App {
     }
 
     async fn run_one(self: &Arc<Self>, mut bot: Bot, msg: &Message) {
-        if adapters::get(&bot.harness).is_none() {
+        let Some(shell_tool) = adapters::get(&bot.harness).map(|a| a.shell_tool()) else {
             return self.say(&bot.id, &format!("Unknown harness \"{}\".", bot.harness), true);
-        }
+        };
         let Some(bot_dir) = self.bot_dir(&bot.id) else {
             return self.say(&bot.id, "This Bot's id isn't a safe folder name, so it can't run.", true);
         };
@@ -294,7 +294,7 @@ impl App {
                 AgentEvent::Tool { name, detail } => {
                     // Fail closed: a guarded harness that runs a shell tool without ever
                     // calling the hook isn't enforcing approvals, so stop it.
-                    if guard.is_some() && canary.is_none() && CANARY_TOOLS.contains(&name.to_lowercase().as_str()) {
+                    if guard.is_some() && canary.is_none() && name.eq_ignore_ascii_case(shell_tool) {
                         saw_shell = true;
                         let (hooks, abort) = (hooks.clone(), abort_tx.clone());
                         canary = Some(tokio::spawn(async move {
@@ -575,9 +575,6 @@ Current time: {now}."#,
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
-
-/// Shell tools whose use proves the hook works: Claude Code and Pi (`bash`), Codex (`shell`), Hermes (`terminal`).
-const CANARY_TOOLS: [&str; 3] = ["bash", "shell", "terminal"];
 
 /// The approval gate for one run. The hook timeout stays a minute above the wait.
 fn guard(bin_dir: &Path, harness: &str, timeout_minutes: u32) -> Guard {

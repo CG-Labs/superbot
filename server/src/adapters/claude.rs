@@ -73,6 +73,10 @@ impl Adapter for Claude {
 
     /// Claude Code has no command to list models, so this is the current lineup.
     /// Update it when Anthropic ships new models.
+    fn shell_tool(&self) -> &'static str {
+        "Bash"
+    }
+
     fn models(&self) -> Vec<ModelOption> {
         let efforts: Vec<String> = ["low", "medium", "high", "xhigh", "max"].map(String::from).into();
         [

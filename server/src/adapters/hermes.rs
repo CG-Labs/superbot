@@ -202,6 +202,10 @@ impl Adapter for Hermes {
     }
 
     /// Hermes has no command that lists models without a prompt, so the model is free text.
+    fn shell_tool(&self) -> &'static str {
+        "terminal"
+    }
+
     fn models(&self) -> Vec<ModelOption> {
         let efforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
         vec![ModelOption { id: String::new(), label: "Default model".into(), efforts: efforts.map(String::from).into(), aliases: Vec::new() }]
