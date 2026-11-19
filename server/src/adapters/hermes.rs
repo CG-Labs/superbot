@@ -112,11 +112,12 @@ impl Adapter for Hermes {
 
     /// A stopped or finished `hermes chat` only detaches: the turn keeps running in the
     /// daemon. Stopping the daemon ends it, and the next run starts one with fresh env.
-    fn stop_leftovers(&self, input: &RunInput) {
+    fn stop_leftovers(&self, input: &RunInput) -> Result<(), String> {
         let home = home(input);
         if !home.join("gateway.pid").exists() {
-            return;
+            return Ok(());
         }
+        let failed = |why: String| Err(format!("Couldn't stop this Bot's Hermes daemon ({why}), so its last turn may still be running. Try again; if this keeps happening, run `hermes gateway stop --yes` with HERMES_HOME={}.", home.display()));
         let mut cmd = std::process::Command::new(self.bin());
         for k in SECRET_ENV {
             cmd.env_remove(k);
@@ -132,15 +133,23 @@ impl Adapter for Hermes {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn();
-        let Ok(mut child) = child else { return };
+        let mut child = match child {
+            Ok(c) => c,
+            Err(e) => return failed(format!("`hermes gateway stop` didn't start: {e}")),
+        };
         let start = Instant::now();
-        while matches!(child.try_wait(), Ok(None)) {
-            if start.elapsed() > STOP_TIMEOUT {
-                let _ = child.kill();
-                let _ = child.wait();
-                return;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => return Ok(()),
+                Ok(Some(status)) => return failed(format!("`hermes gateway stop` failed: {status}")),
+                Ok(None) if start.elapsed() > STOP_TIMEOUT => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return failed(format!("`hermes gateway stop` took over {} seconds", STOP_TIMEOUT.as_secs()));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                Err(e) => return failed(e.to_string()),
             }
-            std::thread::sleep(Duration::from_millis(100));
         }
     }
 
@@ -350,10 +359,28 @@ mod tests {
 
     #[test]
     fn leftovers_are_stopped_only_when_a_daemon_ran() {
-        let i = input(false);
-        let started = Instant::now();
-        Hermes::default().stop_leftovers(&i);
-        assert!(started.elapsed() < Duration::from_secs(1), "no gateway.pid, no `hermes gateway stop`");
+        use std::os::unix::fs::PermissionsExt;
+        let mut i = input(false);
+        assert_eq!(Hermes::default().stop_leftovers(&i), Ok(()), "no gateway.pid, no `hermes gateway stop`");
         assert_eq!(Hermes::default().max_hook_secs(), Some(300));
+
+        // A stop that fails is reported, so the runner won't start a turn beside the old one.
+        let bin = i.state_dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(home(&i)).unwrap();
+        std::fs::write(home(&i).join("gateway.pid"), "{}").unwrap();
+        i.env.insert("PATH".into(), bin.display().to_string());
+        let stub = |body: &str| {
+            std::fs::write(bin.join("hermes"), format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(bin.join("hermes"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        stub("exit 0");
+        assert_eq!(Hermes::default().stop_leftovers(&i), Ok(()));
+        stub("exit 1");
+        let err = Hermes::default().stop_leftovers(&i).unwrap_err();
+        assert!(err.contains("Couldn't stop this Bot's Hermes daemon") && err.contains("failed"), "{err}");
+        std::fs::remove_file(bin.join("hermes")).unwrap();
+        assert!(Hermes::default().stop_leftovers(&i).unwrap_err().contains("didn't start"));
+        let _ = std::fs::remove_dir_all(&i.state_dir);
     }
 }

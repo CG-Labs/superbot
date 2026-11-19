@@ -80,7 +80,9 @@ pub trait Adapter: Send {
     }
     /// Stops harness processes that outlive the CLI (e.g. a daemon it started), so a
     /// stopped run really stops. Runs before and after every run. Blocking.
-    fn stop_leftovers(&self, _input: &RunInput) {}
+    fn stop_leftovers(&self, _input: &RunInput) -> Result<(), String> {
+        Ok(())
+    }
     /// The longest hook timeout the harness accepts, if it caps it.
     fn max_hook_secs(&self) -> Option<u64> {
         None
@@ -159,15 +161,21 @@ pub type AbortReason = Option<&'static str>;
 
 /// Runs the harness, calling `emit` for every event, until it exits or `abort` fires.
 pub async fn run(adapter: Box<dyn Adapter>, input: RunInput, mut abort: watch::Receiver<AbortReason>, mut emit: impl FnMut(AgentEvent)) {
-    let (mut adapter, input) = stop_leftovers(adapter, input).await;
+    // A turn left running from before would keep going beside this one.
+    let (mut adapter, input, before) = stop_leftovers(adapter, input).await;
+    if let Err(e) = before {
+        return emit(AgentEvent::Error(e));
+    }
     run_child(adapter.as_mut(), &input, &mut abort, &mut emit).await;
-    stop_leftovers(adapter, input).await;
+    if let (_, _, Err(e)) = stop_leftovers(adapter, input).await {
+        emit(AgentEvent::Error(e));
+    }
 }
 
-async fn stop_leftovers(adapter: Box<dyn Adapter>, input: RunInput) -> (Box<dyn Adapter>, RunInput) {
+async fn stop_leftovers(adapter: Box<dyn Adapter>, input: RunInput) -> (Box<dyn Adapter>, RunInput, Result<(), String>) {
     let task = tokio::task::spawn_blocking(move || {
-        adapter.stop_leftovers(&input);
-        (adapter, input)
+        let done = adapter.stop_leftovers(&input);
+        (adapter, input, done)
     });
     task.await.expect("stop_leftovers panicked")
 }
