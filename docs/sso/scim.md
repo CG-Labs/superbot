@@ -82,6 +82,8 @@ Google has no generic SCIM client for custom apps. Put Entra ID or Okta in front
 | Deletes (`DELETE`) | Disables the user and ends sessions; the tenant no longer sees it. Nothing is destroyed. Provisioning the same `externalId` again brings back the same user |
 | Sends groups, roles, a password | Ignored |
 
+**The IdP is in charge.** For users it provisioned, the IdP decides name, email, and `active`: an admin can disable one in SuperBot, but the IdP's next update can enable them again. Remove people in the IdP.
+
 **One person, one user.** Email never matches people. If a SuperBot user already has the email, the IdP gets a 409: link that user's SSO identity (`botctl user link <user> <provider> <subject>`) and retry, or change one of the emails. The owner account is never managed by SCIM.
 
 **Audit.** Every change is logged with the token as the actor: `botctl audit --method scim_token`, or `--actor system:scim:<token id>`. Bad tokens are logged as `scim.auth_failed` (throttled); tokens never are.
