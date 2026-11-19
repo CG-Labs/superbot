@@ -29,6 +29,7 @@
       <button class="hidden-bots approvals-btn" id="approvals-btn">
         <span>Approvals</span><span class="count" id="approvals-count"></span>
       </button>
+      <button class="hidden-bots" id="audit-btn"><span>Audit log</span></button>
 
       <div class="sidebar-bottom">
         <div class="me">
@@ -127,6 +128,39 @@
           <option value="ask">Ask before risky actions</option>
           <option value="bypass">Bypass (dev only)</option>
         </select></label>
+      </div>
+    </div>
+  </div>
+  <div class="modal-backdrop" id="au" hidden>
+    <div class="modal au-modal">
+      <div class="modal-head">
+        <h3>Audit log</h3>
+        <button type="button" class="modal-close" id="au-close" title="Close">
+          <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </div>
+      <form class="au-filters" id="au-filters" autocomplete="off">
+        <input id="au-action" placeholder="Action, e.g. bot.* or auth.login_failed" spellcheck="false" />
+        <select id="au-actor" title="Who">
+          <option value="">Everyone</option>
+          <option value="user">People</option>
+          <option value="bot">Bots</option>
+          <option value="system">System</option>
+        </select>
+        <label>From <input type="date" id="au-from" /></label>
+        <label>To <input type="date" id="au-to" /></label>
+      </form>
+      <div class="modal-body au-body">
+        <table class="au-table">
+          <thead><tr><th>Time</th><th>Who</th><th>Action</th><th>Target</th><th>Outcome</th><th>IP</th><th>Details</th></tr></thead>
+          <tbody id="au-rows"></tbody>
+        </table>
+        <div class="empty" id="au-empty" hidden></div>
+        <button type="button" class="nb-btn au-more" id="au-more" hidden>Load more</button>
+      </div>
+      <div class="modal-foot">
+        <span class="au-note">Append-only. Export uses these filters.</span>
+        <a class="nb-btn primary" id="au-export" href="/api/audit/export.csv" download>Export CSV</a>
       </div>
     </div>
   </div>

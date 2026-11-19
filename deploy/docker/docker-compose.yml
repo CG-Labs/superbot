@@ -33,6 +33,8 @@ services:
       AUTH_PASSWORD: ${AUTH_PASSWORD:?Set AUTH_PASSWORD in deploy/docker/.env (run ./init.sh)}
       # Caddy forwards the browser's Host header; botd answers only to these names.
       ALLOWED_HOSTS: ${SUPERBOT_DOMAIN:-localhost},${ALLOWED_HOSTS:-}
+      # botd is reachable only through Caddy, so the audit log takes the client IP from X-Forwarded-For.
+      TRUST_FORWARDED_FOR: "1"
     volumes:
       - data:/data
       - workspace:/workspace

@@ -2,8 +2,10 @@
 //! Supports *, numbers, lists (1,2), ranges (1-5), and steps (*/15, 1-10/2).
 //! Uses the server's local time (set TZ).
 
+use crate::audit::{Actor, Event};
 use crate::runner::App;
 use chrono::{Datelike, Local, Timelike};
+use serde_json::json;
 use std::sync::Arc;
 
 const RANGES: [(u32, u32); 5] = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)];
@@ -65,6 +67,8 @@ pub fn start(app: Arc<App>) {
                     continue;
                 }
                 app.db.routine_ran(&r.id, now.timestamp_millis());
+                let fired = Event::new(Actor::system("scheduler"), "routine.fired").target("routine", &r.id).bot(&r.bot_id);
+                app.db.record(&fired.details(json!({ "name": r.name, "cron": r.cron })));
                 let text = format!("{}: {}", r.name, r.instruction);
                 let msg = app.db.add_message(&r.bot_id, "routine", &text, None, false, Some("queued"));
                 app.push_message(&msg);
