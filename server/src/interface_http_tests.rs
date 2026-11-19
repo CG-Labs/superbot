@@ -73,6 +73,31 @@ async fn a_members_cookie_session_from_the_sign_in_page_opens_the_app() {
 }
 
 #[tokio::test]
+async fn a_new_harness_drops_the_old_model_and_effort() {
+    let (port, _, admin, _) = serve_app().await;
+    let (code, b) = call(port, "POST", "/api/bots", &admin, &json!({ "name": "Ada", "harness": "claude" }).to_string()).await;
+    assert_eq!(code, 201, "{b}");
+    let id = parse(&b)["id"].as_str().unwrap().to_string();
+    let patch = |body: Value| {
+        let (admin, id) = (admin.clone(), id.clone());
+        async move {
+            let (code, b) = call(port, "PATCH", &format!("/api/bots/{id}"), &admin, &body.to_string()).await;
+            assert_eq!(code, 200, "{b}");
+            parse(&b)
+        }
+    };
+    let b = patch(json!({ "model": "opus", "effort": "high" })).await;
+    assert_eq!((b["model"].as_str(), b["effort"].as_str()), (Some("opus"), Some("high")));
+    let b = patch(json!({ "harness": "codex" })).await;
+    assert_eq!((b["harness"].as_str(), b["model"].as_str(), b["effort"].as_str()), (Some("codex"), None, None));
+    // A model sent with the new harness is kept.
+    let b = patch(json!({ "harness": "claude", "model": "sonnet" })).await;
+    assert_eq!((b["harness"].as_str(), b["model"].as_str()), (Some("claude"), Some("sonnet")));
+    // The same harness again changes nothing.
+    assert_eq!(patch(json!({ "harness": "claude" })).await["model"].as_str(), Some("sonnet"));
+}
+
+#[tokio::test]
 async fn sso_web_sign_ins_land_by_role() {
     let idp = mock_idp().await;
     let (port, app, admin, id) = serve_with(&idp, &[], |_| {}).await;

@@ -1,17 +1,24 @@
 import { act, renderHook, waitFor } from "@testing-library/react-native";
 import { Platform } from "react-native";
-import { clearCredentials, defaultServerUrl, loadSavedCredentials, saveCredentials } from "../auth";
+import { clearCredentials, cookieSignedOut, defaultServerUrl, loadSavedCredentials, saveCredentials, setCookieSignedOut } from "../auth";
 import { connectSse } from "../sse";
 import { SuperBotProvider, useSuperBot } from "../SuperBotContext";
 import type { Message, Routine, SseEvent } from "../types";
 
-jest.mock("../auth", () => ({
-  ...jest.requireActual("../auth"),
-  loadSavedCredentials: jest.fn(async () => ({ baseUrl: "https://bots.example.com", password: "hunter2" })),
-  saveCredentials: jest.fn(),
-  clearCredentials: jest.fn(),
-  defaultServerUrl: jest.fn(() => "http://127.0.0.1:3000"),
-}));
+jest.mock("../auth", () => {
+  let signedOut = false;
+  return {
+    ...jest.requireActual("../auth"),
+    loadSavedCredentials: jest.fn(async () => ({ baseUrl: "https://bots.example.com", password: "hunter2" })),
+    saveCredentials: jest.fn(),
+    clearCredentials: jest.fn(),
+    defaultServerUrl: jest.fn(() => "http://127.0.0.1:3000"),
+    setCookieSignedOut: jest.fn(async (on: boolean) => {
+      signedOut = on;
+    }),
+    cookieSignedOut: jest.fn(async () => signedOut),
+  };
+});
 jest.mock("../sse", () => ({ connectSse: jest.fn(() => ({ close: jest.fn() })) }));
 
 const BASE = "https://bots.example.com";
@@ -60,6 +67,8 @@ let bobHistoryFails = false;
 let adaHistory: Message[] = [];
 /** The browser holds a session cookie from the server's sign-in page. */
 let cookieMe = false;
+/** The server's logout fails with a 502. */
+let failLogout = false;
 const TOKEN = "sbs_" + "a".repeat(64);
 
 function respond(status: number, body: unknown) {
@@ -81,6 +90,9 @@ beforeEach(() => {
   bobHistoryFails = false;
   adaHistory = [];
   cookieMe = false;
+  failLogout = false;
+  void setCookieSignedOut(false);
+  (setCookieSignedOut as jest.Mock).mockClear();
   (connectSse as jest.Mock).mockClear();
   (saveCredentials as jest.Mock).mockClear();
   (clearCredentials as jest.Mock).mockClear();
@@ -97,7 +109,12 @@ beforeEach(() => {
       return ok ? respond(200, { token: loginToken, user: { id: "u1" } }) : respond(401, { error: "Wrong password." });
     }
     if (path === "/api/auth/me") return cookieMe ? respond(200, { session: { id: "s1" }, landing: "/app/" }) : respond(401, {});
-    if (path === "/api/auth/logout") return stallLogout ? new Promise(() => {}) : respond(200, { ok: true });
+    if (path === "/api/auth/logout") {
+      if (stallLogout) return new Promise(() => {});
+      if (failLogout) return respond(502, {});
+      cookieMe = false;
+      return respond(200, { ok: true });
+    }
     if (loginToken && auth !== `Bearer ${loginToken}`) return respond(401, { error: "Login required" });
     if (path === "/api/state") {
       const bob = { ...bot("b2", false, bobUnread, bobHandoff), ...bobAcl };
@@ -158,6 +175,35 @@ describe("signing in on the server's own pages (ADR 0027)", () => {
     await act(() => result.current.logout());
     expect(result.current.api).toBeNull();
     expect(calls.some((c) => c.url === `${BASE}/api/auth/logout` && c.method === "POST")).toBe(true);
+    await waitFor(() => expect(setCookieSignedOut).toHaveBeenLastCalledWith(false));
+  });
+
+  it("stays signed out after a sign-out the server never saw", async () => {
+    cookieMe = true;
+    failLogout = true;
+    const first = await renderHook(() => useSuperBot(), { wrapper: SuperBotProvider });
+    await waitFor(() => expect(first.result.current.api).not.toBeNull());
+    await act(() => first.result.current.logout());
+    await waitFor(() => expect(calls.some((c) => c.url === `${BASE}/api/auth/logout`)).toBe(true));
+    expect(await cookieSignedOut()).toBe(true);
+    await first.unmount();
+
+    // A reload with the cookie still live ends it again instead of taking it up.
+    calls = [];
+    const reload = await renderHook(() => useSuperBot(), { wrapper: SuperBotProvider });
+    await waitFor(() => expect(reload.result.current.ready).toBe(true));
+    expect(reload.result.current.api).toBeNull();
+    expect(calls.map((c) => `${c.method} ${c.url.slice(BASE.length)}`)).toEqual(["POST /api/auth/logout"]);
+    expect(await cookieSignedOut()).toBe(true);
+  });
+
+  it("clears the signed-out mark once the server ends the cookie", async () => {
+    await setCookieSignedOut(true);
+    cookieMe = true;
+    const { result } = await renderHook(() => useSuperBot(), { wrapper: SuperBotProvider });
+    await waitFor(() => expect(setCookieSignedOut).toHaveBeenLastCalledWith(false));
+    expect(result.current.api).toBeNull();
+    expect(cookieMe).toBe(false);
   });
 
   it("shows sign-in when there is no cookie, and doesn't look for one in dev or the desktop app", async () => {

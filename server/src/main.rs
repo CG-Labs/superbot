@@ -1171,7 +1171,10 @@ async fn update_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
     let (bot, access) = need_bot_access(&app, &c, &by, &id, Access::Manage)?;
     let mut p = bot_patch(&v)?;
     if p.harness.as_ref().is_some_and(|h| *h != bot.harness) {
-        p.session_id = Some(None); // sessions don't carry across harnesses
+        // Sessions don't carry across harnesses, nor do model names and efforts unless given anew.
+        p.session_id = Some(None);
+        p.model.get_or_insert(None);
+        p.effort.get_or_insert(None);
     }
     app.db.update_bot(&id, p);
     app.push_bot(&id);

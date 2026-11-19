@@ -55,7 +55,10 @@
 
     // Admins land on the console, everyone else on the app (docs/adr/0027-expo-primary-hermes-default.md).
     const landing = (me) => (me?.landing === "/console/" ? "/console/" : "/app/");
-    fetch("/api/auth/me").then(async (r) => { if (r.ok) location.replace(landing(await r.json())); }).catch(() => {});
+    // Set by the web app on a sign-out the server may not have seen (apps/client/src/auth.ts).
+    const SIGNED_OUT = "superbot.signedOut";
+    const signedOut = () => { try { return localStorage.getItem(SIGNED_OUT) === "1"; } catch { return false; } };
+    if (!signedOut()) fetch("/api/auth/me").then(async (r) => { if (r.ok) location.replace(landing(await r.json())); }).catch(() => {});
 
     // Single sign-on: one button per provider the server offers.
     const SSO_ERRORS = {
@@ -101,6 +104,7 @@
           body: JSON.stringify(body),
         });
         if (r.ok) {
+          try { localStorage.removeItem(SIGNED_OUT); } catch {}
           // Browsers drop Secure cookies on plain http, except on localhost.
           const me = await fetch("/api/auth/me");
           if (me.ok) return location.replace(landing(await me.json().catch(() => null)));

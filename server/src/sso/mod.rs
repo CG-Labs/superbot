@@ -592,7 +592,10 @@ pub async fn start(
 /// The page after a web sign-in, sending admins to the console and everyone else to the app.
 fn signed_in_page(role: Role) -> String {
     let to = crate::landing(crate::rbac::Principal::User(role));
-    format!(r#"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="0;url={to}"><title>SuperBot</title><p style="font:16px system-ui;margin:2rem">Signed in. <a href="{to}">Continue to SuperBot</a></p>"#)
+    // Clears the web app's signed-out mark (apps/client/src/auth.ts) so it takes up this new session.
+    format!(
+        r#"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><script>try{{localStorage.removeItem("superbot.signedOut")}}catch(e){{}}</script><meta http-equiv="refresh" content="0;url={to}"><title>SuperBot</title><p style="font:16px system-ui;margin:2rem">Signed in. <a href="{to}">Continue to SuperBot</a></p>"#
+    )
 }
 
 /// `GET /api/auth/sso/{id}/callback?code&state`: the IdP sends the browser back here.

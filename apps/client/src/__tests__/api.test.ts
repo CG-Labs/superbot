@@ -31,6 +31,16 @@ describe("SuperBotApi.logout", () => {
     await new SuperBotApi({ baseUrl: BASE, cookie: true }).logout();
     expect(fetchMock).toHaveBeenCalledWith(`${BASE}/api/auth/logout`, expect.objectContaining({ method: "POST", headers: {} }));
   });
+
+  it("fails when the server couldn't end the session, but not when it was already gone", async () => {
+    const answer = (status: number) =>
+      (globalThis.fetch = jest.fn(async () => ({ ok: status < 400, status, json: async () => ({}) })) as unknown as typeof fetch);
+    const api = new SuperBotApi({ baseUrl: BASE, cookie: true });
+    answer(502);
+    await expect(api.logout()).rejects.toThrow("Sign-out failed (502)");
+    answer(401);
+    await expect(api.logout()).resolves.toBeUndefined();
+  });
 });
 
 describe("cookie sessions (ADR 0027)", () => {
@@ -44,7 +54,17 @@ describe("cookie sessions (ADR 0027)", () => {
   it("adopts the session the server's sign-in page left in this browser", async () => {
     answer(200, { user: { id: "u1" }, session: { id: "s1" }, landing: "/app/" });
     expect(await cookieSession(BASE)).toEqual({ baseUrl: BASE, cookie: true });
-    expect(globalThis.fetch).toHaveBeenCalledWith(`${BASE}/api/auth/me`, { credentials: "same-origin" });
+    expect(globalThis.fetch).toHaveBeenCalledWith(`${BASE}/api/auth/me`, expect.objectContaining({ credentials: "same-origin" }));
+  });
+
+  it("gives up on a server that doesn't answer, so sign-in still shows", async () => {
+    let signal: AbortSignal | undefined;
+    globalThis.fetch = jest.fn((_url: string, init: RequestInit = {}) => {
+      signal = init.signal ?? undefined;
+      return new Promise((_, reject) => signal?.addEventListener("abort", () => reject(new Error("aborted"))));
+    }) as unknown as typeof fetch;
+    expect(await cookieSession(BASE, 10)).toBeNull();
+    expect(signal?.aborted).toBe(true);
   });
 
   it("takes nothing without a session", async () => {

@@ -10,10 +10,12 @@ import React, {
 import { Platform, AppState as RNAppState } from "react-native";
 import {
   clearCredentials,
+  cookieSignedOut,
   defaultServerUrl,
   loadSavedCredentials,
   LOCAL_SERVER_URL,
   saveCredentials,
+  setCookieSignedOut,
 } from "./auth";
 import { hasAccess } from "./access";
 import { ApiError, cookieSession, signIn, SuperBotApi } from "./api";
@@ -112,6 +114,16 @@ export function useSuperBot(): SuperBotContextValue {
   const ctx = useContext(SuperBotContext);
   if (!ctx) throw new Error("useSuperBot outside provider");
   return ctx;
+}
+
+/** Ends the browser's cookie session; the signed-out mark stays until the server confirms. */
+async function endCookieSession(client: SuperBotApi): Promise<void> {
+  try {
+    await client.logout();
+    await setCookieSignedOut(false);
+  } catch {
+    // Kept signed out; the next start tries again.
+  }
 }
 
 function upsertBot(list: BotView[], b: BotView): BotView[] {
@@ -367,7 +379,10 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
       // Nothing saved: the server's own sign-in page may have signed this browser in.
       if (!saved?.token && saved?.password == null) {
         const origin = defaultServerUrl();
-        if (Platform.OS === "web" && origin !== LOCAL_SERVER_URL) saved = await cookieSession(origin);
+        if (Platform.OS === "web" && origin !== LOCAL_SERVER_URL) {
+          if (await cookieSignedOut()) await endCookieSession(new SuperBotApi({ baseUrl: origin, cookie: true }));
+          else saved = await cookieSession(origin);
+        }
       }
       if (saved?.token || saved?.password || saved?.cookie) {
         try {
@@ -399,12 +414,14 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
     const client = new SuperBotApi(cfg);
     await bootstrap(client);
     await saveCredentials(cfg);
+    await setCookieSignedOut(false);
   };
 
   const loginWithSso = async (baseUrl: string, providerId: string) => {
     const cfg = await signInWithSso(baseUrl, providerId);
     await bootstrap(new SuperBotApi(cfg));
     await saveCredentials(cfg);
+    await setCookieSignedOut(false);
   };
 
   // Signs out on the device first, so a slow server can't keep anyone signed in.
@@ -412,7 +429,12 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
     const client = api;
     reset();
     await clearCredentials();
-    void client?.logout().catch(() => {});
+    if (client?.config.cookie) {
+      await setCookieSignedOut(true);
+      void endCookieSession(client);
+    } else {
+      void client?.logout().catch(() => {});
+    }
   };
 
   const refresh = async (reloadMessages?: boolean) => {

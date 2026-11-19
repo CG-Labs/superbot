@@ -65,14 +65,19 @@ export async function signIn(baseUrl: string, secret: string, label = "SuperBot 
  * The session the server's sign-in page (or a web SSO sign-in) left in this browser, when
  * this web build is served by that server: those pages send people here (ADR 0027).
  */
-export async function cookieSession(baseUrl: string): Promise<ServerConfig | null> {
+export async function cookieSession(baseUrl: string, timeoutMs = 5000): Promise<ServerConfig | null> {
+  // Startup waits on this, so a server that never answers must not hide the sign-in form.
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
   try {
-    const res = await fetch(`${normalizeBaseUrl(baseUrl)}/api/auth/me`, { credentials: "same-origin" });
+    const res = await fetch(`${normalizeBaseUrl(baseUrl)}/api/auth/me`, { credentials: "same-origin", signal: ctl.signal });
     if (!res.ok) return null;
     const me = (await res.json()) as { session?: unknown } | null;
     return me?.session ? { baseUrl, cookie: true } : null;
   } catch {
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -128,7 +133,9 @@ export class SuperBotApi {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), timeoutMs);
     try {
-      await fetch(`${this.baseUrl}/api/auth/logout`, { method: "POST", headers: this.headers(false), signal: ctl.signal });
+      const res = await fetch(`${this.baseUrl}/api/auth/logout`, { method: "POST", headers: this.headers(false), signal: ctl.signal });
+      // 401: the session was already gone.
+      if (!res.ok && res.status !== 401) throw new ApiError(`Sign-out failed (${res.status})`, res.status);
     } finally {
       clearTimeout(timer);
     }
