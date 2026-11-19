@@ -212,6 +212,16 @@ impl Provider {
         }
     }
 
+    /// Whether a person with this email could sign in here, as far as the email shows:
+    /// Some(true) when the provider only takes listed domains and this is one,
+    /// Some(false) when it isn't, None when the provider doesn't go by email domain.
+    pub fn takes_email(&self, email: &str) -> Option<bool> {
+        match &self.kind {
+            Kind::Google { hosted_domains: d, .. } | Kind::Oidc { allowed_domains: d, .. } | Kind::Apple { allowed_domains: d, .. } if !d.is_empty() => Some(email_in(email, d)),
+            _ => None,
+        }
+    }
+
     /// OpenID Connect, with an ID token and a nonce. GitHub is plain OAuth 2.
     pub fn oidc(&self) -> bool {
         !matches!(self.kind, Kind::GitHub { .. })

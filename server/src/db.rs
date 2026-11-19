@@ -251,6 +251,72 @@ impl User {
     }
 }
 
+/// A request for access from the public sign-up form (ADR 0022).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Signup {
+    pub id: String,
+    pub name: String,
+    pub email: String,
+    pub company: String,
+    pub team_size: String,
+    pub use_case: String,
+    /// `microsoft`, `google`, `github`, `apple`, or `other`.
+    pub sign_in: String,
+    /// "pending", "approved", or "rejected"
+    pub status: String,
+    pub ip: Option<String>,
+    pub user_agent: Option<String>,
+    pub created_at: i64,
+    pub decided_at: Option<i64>,
+    pub decided_by: Option<String>,
+    pub reason: Option<String>,
+    /// The user an approval made, and their role.
+    pub user_id: Option<String>,
+    pub role: Option<String>,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum SignupError {
+    NotFound,
+    /// Approved or rejected already: the status it has.
+    Closed(String),
+    EmailTaken,
+    Db(String),
+}
+
+pub struct NewSignup<'a> {
+    pub name: &'a str,
+    pub email: &'a str,
+    pub company: &'a str,
+    pub team_size: &'a str,
+    pub use_case: &'a str,
+    pub sign_in: &'a str,
+    pub ip: Option<&'a str>,
+    pub user_agent: Option<&'a str>,
+}
+
+fn signup_row(r: &Row) -> rusqlite::Result<Signup> {
+    Ok(Signup {
+        id: r.get("id")?,
+        name: r.get("name")?,
+        email: r.get("email")?,
+        company: r.get("company")?,
+        team_size: r.get("team_size")?,
+        use_case: r.get("use_case")?,
+        sign_in: r.get("sign_in")?,
+        status: r.get("status")?,
+        ip: r.get("ip")?,
+        user_agent: r.get("user_agent")?,
+        created_at: r.get("created_at")?,
+        decided_at: r.get("decided_at")?,
+        decided_by: r.get("decided_by")?,
+        reason: r.get("reason")?,
+        user_id: r.get("user_id")?,
+        role: r.get("role")?,
+    })
+}
+
 #[derive(Default)]
 pub struct UserPatch {
     pub email: Option<Option<String>>,
@@ -465,8 +531,37 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 6] =
-    [migrate_approvals, migrate_audit_events, migrate_users, migrate_identities, migrate_bot_acls, migrate_audit_actors];
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 7] =
+    [migrate_approvals, migrate_audit_events, migrate_users, migrate_identities, migrate_bot_acls, migrate_audit_actors, migrate_signups];
+
+/// Requests for access from the public sign-up form (ADR 0022). Consent is a column,
+/// not a flag in a blob: no row exists without it. `user_id` has no foreign key, like
+/// `bots.owner_id`: users are never deleted.
+fn migrate_signups(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS signups (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          email TEXT NOT NULL COLLATE NOCASE,
+          company TEXT NOT NULL,
+          team_size TEXT NOT NULL,
+          use_case TEXT NOT NULL,
+          sign_in TEXT NOT NULL CHECK (sign_in IN ('microsoft', 'google', 'github', 'apple', 'other')),
+          consent_at INTEGER NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+          ip TEXT,
+          user_agent TEXT,
+          created_at INTEGER NOT NULL,
+          decided_at INTEGER,
+          decided_by TEXT,
+          reason TEXT,
+          user_id TEXT,
+          role TEXT
+        );
+        CREATE INDEX IF NOT EXISTS signups_status ON signups(status, created_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS signups_one_pending ON signups(email) WHERE status = 'pending';",
+    )
+}
 
 /// The actor columns the audit log gained with per-user actors (ADR 0019).
 pub const AUDIT_ACTOR_COLUMNS: [&str; 7] = ["actor_email", "actor_role", "auth_method", "idp", "idp_provider", "session_id", "on_behalf_of"];
@@ -1189,11 +1284,7 @@ impl Db {
     /// Err when the email or id is taken.
     pub fn create_user(&self, id: Option<&str>, email: Option<&str>, name: &str, role: Role) -> Result<User, String> {
         let id = id.map(String::from).unwrap_or_else(|| format!("u{}", crate::short_id()));
-        let at = now();
-        let res = self.c().execute(
-            "INSERT INTO users (id, email, display_name, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-            params![id, email, name, role.as_str(), at, at],
-        );
+        let res = Self::insert_user(&self.c(), &id, email, name, role);
         match res {
             Ok(_) => Ok(self.user(&id).unwrap()),
             Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ConstraintViolation => {
@@ -1201,6 +1292,14 @@ impl Db {
             }
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    fn insert_user(c: &Connection, id: &str, email: Option<&str>, name: &str, role: Role) -> rusqlite::Result<usize> {
+        let at = now();
+        c.execute(
+            "INSERT INTO users (id, email, display_name, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            params![id, email, name, role.as_str(), at, at],
+        )
     }
 
     pub fn update_user(&self, id: &str, p: UserPatch) -> Result<(), String> {
@@ -1411,6 +1510,78 @@ impl Db {
                 params![code_hash, user_id, created_by, now(), expires_at],
             )
             .unwrap();
+    }
+
+    // Sign-ups (ADR 0022)
+
+    /// Saves a request for access. None when this email already has one pending.
+    pub fn add_signup(&self, s: &NewSignup) -> Option<Signup> {
+        let id = format!("su{}", crate::short_id());
+        let at = now();
+        let res = self.c().execute(
+            "INSERT INTO signups (id, name, email, company, team_size, use_case, sign_in, consent_at, ip, user_agent, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![id, s.name, s.email, s.company, s.team_size, s.use_case, s.sign_in, at, s.ip, s.user_agent, at],
+        );
+        match res {
+            Ok(_) => self.signup(&id),
+            Err(e) if constraint(&e) => None,
+            Err(e) => panic!("save signup: {e}"),
+        }
+    }
+
+    pub fn signup(&self, id: &str) -> Option<Signup> {
+        self.c().query_row("SELECT * FROM signups WHERE id = ?", [id], signup_row).optional().ok().flatten()
+    }
+
+    /// Newest first. `status` None: all of them.
+    pub fn signups(&self, status: Option<&str>, limit: u32) -> Vec<Signup> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM signups WHERE ?1 IS NULL OR status = ?1 ORDER BY created_at DESC, id LIMIT ?2").unwrap();
+        s.query_map(params![status, limit], signup_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    pub fn pending_signups(&self) -> i64 {
+        self.c().query_row("SELECT count(*) FROM signups WHERE status = 'pending'", [], |r| r.get(0)).unwrap_or(0)
+    }
+
+    /// Approves a pending request: its user is made in the same transaction, so a
+    /// request is never approved without one, nor a user made for a closed request.
+    pub fn approve_signup(&self, id: &str, role: Role, by: &str) -> Result<(Signup, User), SignupError> {
+        let user_id = {
+            let c = self.c();
+            let tx = c.unchecked_transaction().map_err(|e| SignupError::Db(e.to_string()))?;
+            let s = tx.query_row("SELECT * FROM signups WHERE id = ?", [id], signup_row).optional().map_err(|e| SignupError::Db(e.to_string()))?;
+            let s = s.ok_or(SignupError::NotFound)?;
+            if s.status != "pending" {
+                return Err(SignupError::Closed(s.status));
+            }
+            let user_id = format!("u{}", crate::short_id());
+            Self::insert_user(&tx, &user_id, Some(&s.email), &s.name, role).map_err(|e| if constraint(&e) { SignupError::EmailTaken } else { SignupError::Db(e.to_string()) })?;
+            tx.execute(
+                "UPDATE signups SET status = 'approved', decided_at = ?, decided_by = ?, user_id = ?, role = ? WHERE id = ? AND status = 'pending'",
+                params![now(), by, user_id, role.as_str(), id],
+            )
+            .map_err(|e| SignupError::Db(e.to_string()))?;
+            tx.commit().map_err(|e| SignupError::Db(e.to_string()))?;
+            user_id
+        };
+        Ok((self.signup(id).ok_or(SignupError::NotFound)?, self.user(&user_id).ok_or(SignupError::NotFound)?))
+    }
+
+    pub fn reject_signup(&self, id: &str, by: &str, reason: Option<&str>) -> Result<Signup, SignupError> {
+        let s = self.signup(id).ok_or(SignupError::NotFound)?;
+        let n = self
+            .c()
+            .execute(
+                "UPDATE signups SET status = 'rejected', decided_at = ?, decided_by = ?, reason = ? WHERE id = ? AND status = 'pending'",
+                params![now(), by, reason, id],
+            )
+            .map_err(|e| SignupError::Db(e.to_string()))?;
+        if n != 1 {
+            return Err(SignupError::Closed(s.status));
+        }
+        self.signup(id).ok_or(SignupError::NotFound)
     }
 
     /// Spends a sign-in code: once, before it expires, for an active user. Returns the user.

@@ -208,6 +208,11 @@ mod tests {
             ("GET", "/api/secrets", Perm::Admin),
             ("PUT", "/api/secrets/OPENAI_API_KEY", Perm::Admin),
             ("DELETE", "/api/secrets/OPENAI_API_KEY", Perm::Admin),
+            // POST /api/signups and GET /api/signups/config are public; the auth middleware lets them through first.
+            ("GET", "/api/signups", Perm::Admin),
+            ("GET", "/api/signups/su1", Perm::Admin),
+            ("POST", "/api/signups/su1/approve", Perm::Admin),
+            ("POST", "/api/signups/su1/reject", Perm::Admin),
             ("GET", "/api/auth/me", Perm::Account),
             ("POST", "/api/auth/logout", Perm::Account),
             ("GET", "/", Perm::Read),

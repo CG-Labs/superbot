@@ -53,7 +53,7 @@
     const go = document.getElementById("go");
     const error = document.getElementById("error");
 
-    fetch("/api/auth/me").then((r) => { if (r.ok) location.replace("/"); }).catch(() => {});
+    fetch("/api/auth/me").then((r) => { if (r.ok) location.replace("/console/"); }).catch(() => {});
 
     // Single sign-on: one button per provider the server offers.
     const SSO_ERRORS = {
@@ -101,7 +101,7 @@
         if (r.ok) {
           // Browsers drop Secure cookies on plain http, except on localhost.
           const me = await fetch("/api/auth/me");
-          if (me.ok) return location.replace("/");
+          if (me.ok) return location.replace("/console/");
           error.textContent = "Signed in, but this browser didn't keep the session. Open SuperBot over HTTPS.";
           return;
         }

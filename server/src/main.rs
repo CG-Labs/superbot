@@ -18,6 +18,9 @@ mod runner;
 mod screen;
 mod secrets;
 mod shell;
+mod signups;
+#[cfg(test)]
+mod signups_http_tests;
 mod sso;
 mod users;
 #[cfg(test)]
@@ -57,6 +60,7 @@ type AppState = Arc<App>;
 type EventStream = std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<SseEvent, Infallible>> + Send>>;
 
 static WEB_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+static SITE_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 const COLORS: [&str; 11] = ["#f5f5f5", "#9a6b3f", "#e5484d", "#e8702e", "#e9a23b", "#4cc06a", "#4fb5a5", "#3b82f6", "#8b5cf6", "#e64a9c", "#7a7a7a"];
 const SHAPES: [&str; 12] = ["waddle", "drop", "cloud", "bean", "onigiri", "peanut", "pebble", "square", "jelly", "gem", "gear", "heart"];
@@ -101,6 +105,8 @@ async fn main() {
     let break_glass = users::break_glass_flag(&env("AUTH_BREAK_GLASS", "")).unwrap_or_else(|e| exit(e));
     let sessions = SessionConfig::from_env(&env("SESSION_IDLE_TIMEOUT", ""), &env("SESSION_MAX_AGE", "")).unwrap_or_else(|e| exit(e));
     let sso = sso::Sso::from_env().unwrap_or_else(|e| exit(format!("SSO: {e}")));
+    let signups = signups::Signups::from_env(&secrets::env::EnvStore::process(), &env("SIGNUPS", ""), &env("TURNSTILE_SITE_KEY", ""))
+        .unwrap_or_else(|e| exit(format!("Sign-ups: {e}")));
     let allow_no_auth = auth_startup(&host, &password, break_glass);
     secrets::redact::register(&password);
     if adapters::get(&default_harness).is_none() {
@@ -114,6 +120,7 @@ async fn main() {
     let bot_token = random_hex(24);
     secrets::redact::register(&bot_token);
     WEB_DIR.set(std::env::var("WEB_DIR").ok().map(PathBuf::from)).unwrap();
+    SITE_DIR.set(std::env::var("SITE_DIR").ok().map(PathBuf::from)).unwrap();
 
     let root = |key: &str, default: &str| {
         paths::root(&env(key, default)).unwrap_or_else(|e| {
@@ -171,8 +178,17 @@ async fn main() {
         trust_forwarded: env("TRUST_FORWARDED_FOR", "") == "1",
         sessions,
         sso,
+        signups,
         ..Auth::new(Some(app.clone()))
     });
+    println!(
+        "Sign-ups: {}.",
+        match (auth_state.signups.enabled, auth_state.signups.turnstile.is_some()) {
+            (false, _) => "off (SIGNUPS=off)",
+            (true, true) => "on, with Turnstile",
+            (true, false) => "on (set TURNSTILE_SECRET and TURNSTILE_SITE_KEY to add a bot check)",
+        }
+    );
     for p in &auth_state.sso.providers {
         let ready = p.not_ready().unwrap_or_else(|| "ready".into());
         println!("SSO: {} ({}, {}), {ready}; {}; just-in-time sign-up {}.", p.id, p.label, p.type_name(), p.audience(), p.jit_role.map_or("off", |r| r.as_str()));
@@ -283,7 +299,12 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/identities", get(sso::list_identities).post(sso::link_identity))
         .route("/users/{key}/identities/{id}", delete(sso::unlink_identity))
         .route("/sessions", get(users::list_sessions))
-        .route("/sessions/{id}", delete(users::revoke_session));
+        .route("/sessions/{id}", delete(users::revoke_session))
+        .route("/signups", get(signups::list).post(signups::submit).layer(DefaultBodyLimit::max(signups::MAX_BODY)))
+        .route("/signups/config", get(signups::config))
+        .route("/signups/{id}", get(signups::get))
+        .route("/signups/{id}/approve", post(signups::approve))
+        .route("/signups/{id}/reject", post(signups::reject));
     Router::new()
         .route("/healthz", get(|| async { Json(json!({ "ok": true })) }))
         .merge(
@@ -373,6 +394,8 @@ struct Auth {
     limiter: users::Limiter,
     /// Single sign-on providers and sign-ins in progress (ADR 0014).
     sso: sso::Sso,
+    /// The public "Get started" form (ADR 0022).
+    signups: signups::Signups,
     /// The database: sessions and audit events. None in tests of auth alone.
     app: Option<AppState>,
 }
@@ -390,6 +413,7 @@ impl Auth {
             logins: audit::Logins::default(),
             limiter: users::Limiter::default(),
             sso: sso::Sso::default(),
+            signups: signups::Signups::default(),
             app,
         }
     }
@@ -565,11 +589,11 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
     let (method, path) = (req.method().clone(), req.uri().path().to_string());
     let mut req = req;
     req.extensions_mut().insert(source.clone());
-    // Signing in, and the page to do it on, need no credentials.
+    // Signing in, the page to do it on, the public site, and asking for access need no credentials.
     let open = match method {
-        Method::GET => path == "/login" || sso_path(&path).is_some(),
+        Method::GET | Method::HEAD => path == "/login" || sso_path(&path).is_some() || site_file(&path).is_some() || path == "/api/signups/config",
         // Apple posts its answer to the callback (response_mode=form_post).
-        Method::POST => path == "/api/auth/login" || sso_path(&path) == Some("callback"),
+        Method::POST => path == "/api/auth/login" || sso_path(&path) == Some("callback") || path == "/api/signups",
         _ => false,
     };
     if open {
@@ -733,22 +757,75 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-// Web app: embedded in the binary. Set WEB_DIR to serve from disk while editing it.
+// The public site (`site/`: the landing page and the "Get started" form) and the
+// built-in console (`web/`, at /console/). Both are embedded in the binary; set
+// SITE_DIR or WEB_DIR to serve from disk while editing them. ADR 0022.
+
+/// The `site/` file a public path serves.
+fn site_file(path: &str) -> Option<&'static str> {
+    Some(match path {
+        "/" | "/index.html" => "index.html",
+        "/get-started" | "/get-started/" => "get-started.html",
+        "/site/site.css" => "assets/site.css",
+        "/site/get-started.js" => "assets/get-started.js",
+        "/site/mark.svg" => "assets/mark.svg",
+        _ => return None,
+    })
+}
+
+/// The public pages run only their own scripts, plus Cloudflare's when Turnstile is on.
+pub const SITE_CSP: &str = "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; \
+     style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
+fn content_type(file: &str) -> &'static str {
+    match file.rsplit('.').next() {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        _ => "text/css; charset=utf-8",
+    }
+}
+
+fn site(file: &'static str) -> Response {
+    let body = match SITE_DIR.get().and_then(|d| d.as_ref()) {
+        Some(dir) => std::fs::read_to_string(dir.join(file)).unwrap_or_default(),
+        None => match file {
+            "index.html" => include_str!("../../site/index.html"),
+            "get-started.html" => include_str!("../../site/get-started.html"),
+            "assets/site.css" => include_str!("../../site/assets/site.css"),
+            "assets/get-started.js" => include_str!("../../site/assets/get-started.js"),
+            _ => include_str!("../../site/assets/mark.svg"),
+        }
+        .to_string(),
+    };
+    (
+        [
+            (header::CONTENT_TYPE, content_type(file)),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::CONTENT_SECURITY_POLICY, SITE_CSP),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::REFERRER_POLICY, "strict-origin-when-cross-origin"),
+        ],
+        body,
+    )
+        .into_response()
+}
 
 async fn web(uri: axum::http::Uri) -> Response {
     let path = uri.path();
+    if let Some(file) = site_file(path) {
+        return site(file);
+    }
     let file = match path {
-        "/" | "/index.html" => "index.html",
-        "/app.js" => "app.js",
-        "/styles.css" => "styles.css",
+        "/console" => return (StatusCode::PERMANENT_REDIRECT, [(header::LOCATION, "/console/")]).into_response(),
+        // The web client is served by Caddy; without it, /app/ (the landing page's "Sign in") opens the console.
+        p if p == "/app" || p.starts_with("/app/") => return (StatusCode::SEE_OTHER, [(header::LOCATION, "/console/")]).into_response(),
+        "/console/" | "/console/index.html" => "index.html",
+        "/console/app.js" => "app.js",
+        "/console/styles.css" => "styles.css",
         _ => return (StatusCode::NOT_FOUND, "Not found").into_response(),
     };
-    let kind = match file.rsplit('.').next() {
-        Some("html") => "text/html; charset=utf-8",
-        Some("js") => "text/javascript; charset=utf-8",
-        _ => "text/css; charset=utf-8",
-    };
-    let body = match WEB_DIR.get().unwrap() {
+    let body = match WEB_DIR.get().and_then(|d| d.as_ref()) {
         Some(dir) => std::fs::read_to_string(dir.join(file)).unwrap_or_default(),
         None => match file {
             "index.html" => include_str!("../../web/index.html"),
@@ -757,7 +834,7 @@ async fn web(uri: axum::http::Uri) -> Response {
         }
         .to_string(),
     };
-    ([(header::CONTENT_TYPE, kind), (header::CACHE_CONTROL, "no-cache")], body).into_response()
+    ([(header::CONTENT_TYPE, content_type(file)), (header::CACHE_CONTROL, "no-cache")], body).into_response()
 }
 
 // Live updates: one Server-Sent Events stream with everything.
