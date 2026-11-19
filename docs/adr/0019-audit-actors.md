@@ -25,7 +25,7 @@ Every event's actor gains seven fields, set where the request is authenticated (
 | Email | `actor_email` | `actorEmail` | The user's email when they acted. |
 | Role | `actor_role` | `actorRole` | `admin`, `member`, or `readonly`, when they acted. |
 | Method | `auth_method` | `authMethod` | `password` (break-glass `AUTH_PASSWORD`, Basic or login), `code` (one-time sign-in code), `sso`, `none` (`ALLOW_NO_AUTH` on loopback), or `bot_token` (`botctl` with the per-start `BOT_TOKEN`). |
-| IdP | `idp` | `idp` | The SSO provider's type: `entra`, `google`, `oidc`, `github`, `apple`. |
+| IdP | `idp` | `idp` | The SSO provider's type: `entra`, `google`, `oidc`, `github`, `apple`, `saml` (the SAML bridge, [ADR 0020](0020-saml-bridge.md)). |
 | Provider | `idp_provider` | `idpProvider` | Its configured id from `SSO_PROVIDERS` (two Entra tenants are two providers). |
 | Session | `session_id` | `sessionId` | The session's id. Never its token. |
 | On behalf of | `on_behalf_of` | `onBehalfOf` | For a Bot or a scheduled run: the user whose authority it used (the Bot's owner). |

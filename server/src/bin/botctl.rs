@@ -73,7 +73,7 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl audit export [filters] > audit.csv        All matching events as CSV, oldest first
     filters: --from <time> --to <time> --action <a,b.*> --actor <user|bot|system[:id]>
              --actor user:<email> --method <password,code,sso,none,bot_token>
-             --idp <entra|google|oidc|github|apple> --idp-provider <id> --subject <issuer|sub>
+             --idp <entra|google|oidc|github|apple|saml> --idp-provider <id> --subject <issuer|sub>
              --session <id> --on-behalf-of <user id|email> --outcome <success|failure|denied> --bot <id>
     times: YYYY-MM-DD (UTC), RFC 3339, or unix milliseconds
   botctl secrets                                   List secret names (never values)

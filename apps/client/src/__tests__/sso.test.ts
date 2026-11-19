@@ -118,15 +118,16 @@ describe("the provider list", () => {
     expect(parseSsoReturn("superbot://auth?error=sso_wrong_account&state=s1", "s1")).toEqual({ error: SSO_ERRORS.sso_wrong_account });
   });
 
-  it("keeps GitHub and Apple beside the OIDC providers", () => {
-    const five = [
+  it("keeps GitHub, Apple, and SAML beside the OIDC providers", () => {
+    const six = [
       { id: "entra", label: "Microsoft", type: "entra" },
       { id: "google", label: "Google", type: "google" },
       { id: "github", label: "GitHub", type: "github" },
       { id: "apple", label: "Apple", type: "apple" },
       { id: "okta", label: "Okta", type: "oidc" },
+      { id: "adfs", label: "Company SSO", type: "saml" },
     ];
-    expect(ssoProviderList(five)).toEqual(five);
+    expect(ssoProviderList(six)).toEqual(six);
   });
 });
 
@@ -141,6 +142,11 @@ describe("the buttons", () => {
     expect(ssoButtonText({ id: "github", label: "GitHub Enterprise", type: "github" })).toBe("Sign in with GitHub Enterprise");
     expect(ssoButtonText({ id: "entra", label: "Microsoft", type: "entra" })).toBe("Sign in with Microsoft");
     expect(ssoButtonTone({ id: "github", label: "GitHub", type: "github" })).toBe("plain");
+  });
+
+  it("show a SAML IdP behind the bridge like any other", () => {
+    expect(ssoButtonText({ id: "adfs", label: "Company SSO", type: "saml" })).toBe("Sign in with Company SSO");
+    expect(ssoButtonTone({ id: "adfs", label: "Acme", type: "saml" })).toBe("plain");
   });
 });
 
@@ -195,8 +201,8 @@ describe("signInWithSso", () => {
     expect(sha256(sent.verifier)).toBe(challenge);
   });
 
-  it("signs in with GitHub and Apple the same way, the server doing the IdP's part", async () => {
-    for (const id of ["github", "apple"]) {
+  it("signs in with GitHub, Apple, and a SAML bridge the same way, the server doing the IdP's part", async () => {
+    for (const id of ["github", "apple", "adfs"]) {
       open.mockImplementation(async (url: string) => {
         const u = new URL(url);
         expect(u.pathname).toBe(`/api/auth/sso/${id}/start`);

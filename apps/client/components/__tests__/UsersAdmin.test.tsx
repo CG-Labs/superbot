@@ -172,6 +172,25 @@ describe("UsersAdmin", () => {
     expect(api.linkIdentity).toHaveBeenCalledWith("u1", { provider: "work", subject: "oid-1", tenant: undefined });
   });
 
+  it("shows SAML links by their provider and links one by its NameID", async () => {
+    jest.mocked(fetchSsoProviders).mockResolvedValueOnce([{ id: "adfs", label: "Contoso", type: "saml" }]);
+    const ada: AdminUser = {
+      ...alex,
+      identities: [{ id: "i9", provider: "adfs", idp: "saml", subject: "g-94f0-persistent", createdAt: 1, lastLoginAt: Date.now() }],
+      lastLogin: { at: Date.now(), authMethod: "sso", idpProvider: "adfs", idp: "saml" },
+    };
+    const { api, user } = await open([owner, ada]);
+    const row = within(screen.getByLabelText("User Alex"));
+    expect(await row.findByText("Contoso")).toBeOnTheScreen();
+    expect(row.getByText("with SSO (Contoso)")).toBeOnTheScreen();
+    await user.press(screen.getByLabelText("User Alex"));
+    expect(await screen.findByText(/^Contoso · g-94f0-persistent/)).toBeOnTheScreen();
+    expect(screen.queryByLabelText("Tenant")).toBeNull();
+    await user.type(screen.getByPlaceholderText("NameID at the SAML IdP"), "G-1234-persistent");
+    await user.press(screen.getByText("Link"));
+    expect(api.linkIdentity).toHaveBeenCalledWith("u1", { provider: "adfs", subject: "G-1234-persistent", tenant: undefined });
+  });
+
   it("won't let you change your own or the owner's role or status", async () => {
     const { api, user } = await open([owner, alex]);
     await user.press(screen.getByLabelText("User Owner"));

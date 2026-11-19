@@ -38,6 +38,13 @@ function Button({ label, onPress, danger, disabled }: { label: string; onPress: 
   );
 }
 
+/** What to type to link an account, per provider type: its id there, never an email. */
+const SUBJECT_HINT: Record<string, string> = {
+  entra: "Object id",
+  github: "GitHub user id (number)",
+  saml: "NameID at the SAML IdP",
+};
+
 function LoadFailed({ message, onRetry }: { message: string; onRetry: () => void }) {
   return (
     <View style={styles.row}>
@@ -141,7 +148,7 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
         <Text style={styles.faint}>
           {user.breakGlass ? "Owner (break-glass) · " : ""}
           {self ? "You · " : ""}Added {new Date(user.createdAt).toLocaleDateString()} · Last sign-in {relativeTime(user.lastLoginAt).toLowerCase()}
-          {user.lastLogin?.authMethod ? ` with ${signInMethod(user.lastLogin.authMethod, user.lastLogin.idpProvider)}` : ""}
+          {user.lastLogin?.authMethod ? ` with ${signInMethod(user.lastLogin.authMethod, user.lastLogin.idpProvider && providerLabel(user.lastLogin.idpProvider))}` : ""}
         </Text>
       </View>
       {error ? <Text style={styles.error}>{error}</Text> : null}
@@ -193,7 +200,7 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
             {sessions.length ? (
               sessions.map((s) => (
                 <Text key={s.id} style={styles.dim}>
-                  {s.label || (s.kind === "cookie" ? "Browser" : "App")} · {signInMethod(s.method, s.idpProvider)} · last used {relativeTime(s.lastSeenAt).toLowerCase()}
+                  {s.label || (s.kind === "cookie" ? "Browser" : "App")} · {signInMethod(s.method, s.idpProvider && providerLabel(s.idpProvider))} · last used {relativeTime(s.lastSeenAt).toLowerCase()}
                 </Text>
               ))
             ) : (
@@ -228,7 +235,7 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
               style={styles.input}
               autoCapitalize="none"
               autoCorrect={false}
-              placeholder={linkType === "entra" ? "Object id" : linkType === "github" ? "GitHub user id (number)" : "Subject (sub)"}
+              placeholder={SUBJECT_HINT[linkType ?? ""] ?? "Subject (sub)"}
               placeholderTextColor={colors.textFaint}
               value={subject}
               onChangeText={setSubject}

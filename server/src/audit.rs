@@ -53,7 +53,7 @@ pub struct Actor {
     /// (ALLOW_NO_AUTH), or `bot_token`. None for the system.
     #[serde(default)]
     pub method: Option<String>,
-    /// The SSO provider's type (`entra`, `google`, `oidc`, `github`, `apple`) and its
+    /// The SSO provider's type (`entra`, `google`, `oidc`, `github`, `apple`, `saml`) and its
     /// configured id (from SSO_PROVIDERS), as `idp` and `provider` are in sign-in details.
     #[serde(default)]
     pub idp: Option<String>,

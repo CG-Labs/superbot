@@ -57,7 +57,7 @@ function UserRow({ u, providers, selected, onPress }: { u: AdminUser; providers:
       <View style={styles.rowSide}>
         <Text style={styles.faint}>Last sign-in</Text>
         <Text style={styles.dim}>{relativeTime(u.lastLoginAt)}</Text>
-        {u.lastLogin?.authMethod ? <Text style={styles.faint}>with {signInMethod(u.lastLogin.authMethod, u.lastLogin.idpProvider)}</Text> : null}
+        {u.lastLogin?.authMethod ? <Text style={styles.faint}>with {signInMethod(u.lastLogin.authMethod, u.lastLogin.idpProvider && label(u.lastLogin.idpProvider))}</Text> : null}
         <Text style={styles.faint}>Added {new Date(u.createdAt).toLocaleDateString()}</Text>
       </View>
     </Pressable>
