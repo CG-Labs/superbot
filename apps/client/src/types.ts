@@ -39,6 +39,24 @@ export interface BotView {
   policy?: PolicyMode;
   /** True when this Bot overrides the global policy. */
   policyOverride?: boolean;
+  /** Bot ACLs (ADR 0016). Servers from before send none of these. */
+  owner?: { id: string; name: string } | null;
+  visibility?: Visibility;
+  /** What you may do with it. */
+  access?: BotAccess;
+}
+
+export type Visibility = "private" | "shared";
+/** Each level includes the ones before it. */
+export type BotAccess = "view" | "operate" | "manage";
+
+/** `/api/bots/{id}/access`. Grants come only with "manage". */
+export interface BotAccessView {
+  botId: string;
+  owner: { id: string; name: string | null; email: string | null };
+  visibility: Visibility;
+  access: BotAccess;
+  grants?: { user: { id: string; name: string | null; email: string | null }; level: "viewer" | "operator" }[];
 }
 
 export type PolicyMode = "ask" | "bypass";

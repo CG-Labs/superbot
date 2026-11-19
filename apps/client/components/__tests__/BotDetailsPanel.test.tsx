@@ -1,9 +1,15 @@
 import React from "react";
-import { act, render, screen } from "@testing-library/react-native";
+import { act, fireEvent, render, screen } from "@testing-library/react-native";
 import { BotDetailsPanel } from "../BotDetailsPanel";
-import type { BotView, Routine } from "../../src/types";
+import { hasAccess } from "../../src/access";
+import type { BotAccess, BotView, Routine } from "../../src/types";
 
-const mockCtx: Record<string, unknown> = { canWrite: true, can: () => true };
+const mockCtx: Record<string, unknown> = {
+  canWrite: true,
+  can: () => true,
+  canOnBot: (b: BotView | undefined, need: BotAccess) => hasAccess(b, need, mockCtx.canWrite as boolean),
+  me: { name: "Ada", id: "u1" },
+};
 jest.mock("../../src/SuperBotContext", () => ({ useSuperBot: () => mockCtx }));
 jest.mock("../BotAvatar", () => ({ BotAvatar: () => null }));
 
@@ -74,5 +80,51 @@ describe("BotDetailsPanel", () => {
     expect(screen.queryByText("Delete bot")).not.toBeOnTheScreen();
     expect(screen.getByLabelText("Pause Mine").props.disabled).toBe(true);
     Object.assign(mockCtx, { canWrite: true, can: () => true });
+  });
+
+  const shared = (access: BotAccess): BotView => ({
+    ...bot("b", "Bob"),
+    owner: { id: "u1", name: "Ada" },
+    visibility: "shared",
+    access,
+  });
+
+  it("lets the owner make a shared Bot private", async () => {
+    const setBotVisibility = jest.fn(async () => {});
+    Object.assign(mockCtx, { bots: [shared("manage")], activeId: "b", fetchRoutines: jest.fn(async () => []), setBotVisibility });
+    await render(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} />);
+
+    expect(screen.getByText("Shared with everyone · owned by you")).toBeOnTheScreen();
+    const toggle = screen.getByLabelText("Make private");
+    expect(toggle.props.disabled).toBeFalsy();
+    await act(async () => fireEvent(toggle, "valueChange", false));
+    expect(setBotVisibility).toHaveBeenCalledWith("b", "private");
+    expect(screen.getByText("Delete bot")).toBeOnTheScreen();
+  });
+
+  it("lets an operator run a Bot but not change who sees it", async () => {
+    Object.assign(mockCtx, {
+      bots: [{ ...shared("operate"), owner: { id: "u2", name: "Grace" }, visibility: "private" }],
+      activeId: "b",
+      fetchRoutines: jest.fn(async () => [routine("rb", "b", "Mine")]),
+    });
+    await render(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} />);
+
+    expect(await screen.findByText("+ New routine")).toBeOnTheScreen();
+    expect(screen.getByText("Open screen")).toBeOnTheScreen();
+    expect(screen.getByText("Private · owned by Grace")).toBeOnTheScreen();
+    expect(screen.getByLabelText("Share with everyone").props.disabled).toBe(true);
+    expect(screen.queryByText("Delete bot")).not.toBeOnTheScreen();
+  });
+
+  it("lets a viewer look but not run the Bot", async () => {
+    Object.assign(mockCtx, { bots: [shared("view")], activeId: "b", fetchRoutines: jest.fn(async () => [routine("rb", "b", "Mine")]) });
+    await render(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} />);
+
+    expect(await screen.findByText("Mine")).toBeOnTheScreen();
+    expect(screen.queryByText("+ New routine")).not.toBeOnTheScreen();
+    expect(screen.queryByText("Open screen")).not.toBeOnTheScreen();
+    expect(screen.getByLabelText("Pause Mine").props.disabled).toBe(true);
+    expect(screen.getByLabelText("Make private").props.disabled).toBe(true);
   });
 });

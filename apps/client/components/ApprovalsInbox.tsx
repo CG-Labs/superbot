@@ -16,8 +16,10 @@ function minutesLeft(a: Approval): string {
 }
 
 export function ApprovalCard({ approval: a }: { approval: Approval }) {
-  const { bots, decideApproval, can } = useSuperBot();
+  const { bots, decideApproval, can, canOnBot } = useSuperBot();
   const bot = bots.find((b) => b.id === a.botId);
+  // Answering lets the Bot act, so it takes operator access to that Bot (ADR 0016).
+  const canDecide = can("approve") && canOnBot(bot, "operate");
   const [remember, setRemember] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -56,7 +58,7 @@ export function ApprovalCard({ approval: a }: { approval: Approval }) {
         <Text style={styles.faint}>Denied in {minutesLeft(a)}</Text>
       </View>
       {error ? <Text style={styles.error}>{error}</Text> : null}
-      {can("approve") ? (
+      {canDecide ? (
       <View style={styles.actions}>
         <Pressable style={styles.btn} disabled={busy} onPress={() => void decide(false)}>
           <Text style={styles.btnText}>Deny</Text>
