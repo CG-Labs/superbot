@@ -3,7 +3,7 @@
 
 use super::github::{self, GitHub};
 use super::jwt::{self, Invalid, Jwks, Token};
-use super::apple;
+use super::{apple, saml};
 use crate::rbac::Role;
 use serde_json::Value;
 use std::sync::Arc;
@@ -35,6 +35,10 @@ pub enum Kind {
     /// authorize and token endpoints, `api` the REST API that says who signed in. With
     /// `allowed_orgs`, only active members of one of them get in.
     GitHub { web: String, api: String, allowed_orgs: Vec<String> },
+    /// A SAML 2.0 IdP behind an OIDC broker (`issuer`, a Keycloak realm), see `saml`. The
+    /// token must say the broker used the IdP `alias`; identities are stored under the
+    /// IdP's `entity_id`, with its name for the person as the subject.
+    Saml { issuer: String, entity_id: String, alias: String, map: ClaimMap, allowed_domains: Vec<String> },
 }
 
 #[cfg(test)]
@@ -144,8 +148,22 @@ fn verified_email(t: &Token, claim: &str) -> Option<String> {
     t.str(claim).filter(|_| verified).map(|e| e.trim().to_string()).filter(|e| !e.is_empty() && e.len() <= 254)
 }
 
+/// The verified email in `claim`. With `allowed` domains it is required, and must be in one.
+fn email_within(t: &Token, claim: &str, allowed: &[String]) -> Result<Option<String>, Invalid> {
+    let email = verified_email(t, claim);
+    if !allowed.is_empty() {
+        let e = email.as_deref().ok_or(Invalid("email_unverified"))?;
+        if !email_in(e, allowed) {
+            return Err(Invalid("wrong_domain"));
+        }
+    }
+    Ok(email)
+}
+
 fn subject_of(t: &Token, claim: &str) -> Result<String, Invalid> {
-    t.str(claim).filter(|s| s.len() <= 255).map(String::from).ok_or(Invalid("missing_subject"))
+    // Refused rather than trimmed: linking trims what admins type, so a padded or empty
+    // subject could never be linked, and empty ones would all be one person.
+    t.str(claim).filter(|s| !s.is_empty() && s.len() <= 255 && s.trim() == *s).map(String::from).ok_or(Invalid("missing_subject"))
 }
 
 /// https, or http to this machine (a local IdP in development and tests).
@@ -190,6 +208,7 @@ impl Provider {
             Kind::Oidc { .. } => "oidc",
             Kind::Apple { .. } => "apple",
             Kind::GitHub { .. } => "github",
+            Kind::Saml { .. } => "saml",
         }
     }
 
@@ -220,6 +239,8 @@ impl Provider {
             Kind::Apple { allowed_domains, .. } => format!("verified emails at {}", allowed_domains.join(", ")),
             Kind::GitHub { web, allowed_orgs, .. } if allowed_orgs.is_empty() => format!("any account on {web}"),
             Kind::GitHub { web, allowed_orgs, .. } => format!("members of {} on {web}", allowed_orgs.join(", ")),
+            Kind::Saml { entity_id, alias, allowed_domains, .. } if allowed_domains.is_empty() => format!("anyone SAML IdP {entity_id} signs in (broker alias {alias})"),
+            Kind::Saml { entity_id, alias, allowed_domains, .. } => format!("verified emails at {} from SAML IdP {entity_id} (broker alias {alias})", allowed_domains.join(", ")),
         }
     }
 
@@ -241,6 +262,9 @@ impl Provider {
             Kind::Oidc { .. } | Kind::Apple { .. } => vec![],
             // Nobody makes a GitHub account halfway through signing in to SuperBot.
             Kind::GitHub { .. } => vec![("prompt", "select_account".into()), ("allow_signup", "false".into())],
+            // Straight to the SAML IdP, past the broker's own login page. Only a shortcut:
+            // `claims` checks the IdP the broker actually used.
+            Kind::Saml { alias, .. } => vec![(saml::HINT_PARAM, alias.clone())],
         }
     }
 
@@ -289,7 +313,7 @@ impl Provider {
     fn discovery_url(&self) -> Option<String> {
         match &self.kind {
             Kind::Entra { authority, tenant, .. } => Some(format!("{authority}/{tenant}/v2.0/.well-known/openid-configuration")),
-            Kind::Google { issuer, .. } | Kind::Oidc { issuer, .. } | Kind::Apple { issuer, .. } => Some(format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'))),
+            Kind::Google { issuer, .. } | Kind::Oidc { issuer, .. } | Kind::Apple { issuer, .. } | Kind::Saml { issuer, .. } => Some(format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'))),
             Kind::GitHub { .. } => None,
         }
     }
@@ -315,7 +339,7 @@ impl Provider {
                 }
                 Ok((format!("{authority}/{tid}/v2.0"), Some(tid)))
             }
-            Kind::Google { issuer, .. } | Kind::Oidc { issuer, .. } | Kind::Apple { issuer, .. } | Kind::GitHub { web: issuer, .. } if tenant.is_none() => Ok((issuer.clone(), None)),
+            Kind::Google { issuer, .. } | Kind::Oidc { issuer, .. } | Kind::Apple { issuer, .. } | Kind::GitHub { web: issuer, .. } | Kind::Saml { entity_id: issuer, .. } if tenant.is_none() => Ok((issuer.clone(), None)),
             _ => Err("tenant is only for Entra providers".into()),
         }
     }
@@ -326,6 +350,7 @@ impl Provider {
         match self.kind {
             Kind::Entra { .. } => guid(s).ok_or_else(|| "subject must be the user's Entra object id (a GUID)".into()),
             Kind::GitHub { .. } => github::user_id(s).ok_or_else(|| "subject must be the GitHub user's numeric id (gh api users/<login> --jq .id), not the login".into()),
+            Kind::Saml { .. } if !s.is_empty() && s.len() <= 255 => Ok(saml::subject(s)),
             _ if !s.is_empty() && s.len() <= 255 => Ok(s.into()),
             _ => Err("subject must be 1 to 255 characters".into()),
         }
@@ -478,14 +503,20 @@ impl Provider {
                     return Err(Invalid("wrong_issuer"));
                 }
                 let subject = subject_of(t, &map.subject)?;
-                let email = verified_email(t, &map.email);
-                if !allowed_domains.is_empty() {
-                    let e = email.as_deref().ok_or(Invalid("email_unverified"))?;
-                    if !email_in(e, allowed_domains) {
-                        return Err(Invalid("wrong_domain"));
-                    }
-                }
+                let email = email_within(t, &map.email, allowed_domains)?;
                 Ok(Claims { issuer: issuer.clone(), subject, tenant: None, email, name: name_in(&map.name), username: None })
+            }
+            // The broker checked the SAML assertion; its signed token says which IdP it used.
+            Kind::Saml { issuer, entity_id, alias, map, allowed_domains } => {
+                if !same_issuer(issuer, &meta.issuer) || iss != meta.issuer {
+                    return Err(Invalid("wrong_issuer"));
+                }
+                if t.str(saml::IDP_CLAIM) != Some(alias.as_str()) {
+                    return Err(Invalid("not_brokered"));
+                }
+                let subject = saml::subject(&subject_of(t, &map.subject)?);
+                let email = email_within(t, &map.email, allowed_domains)?;
+                Ok(Claims { issuer: entity_id.clone(), subject, tenant: None, email, name: name_in(&map.name), username: None })
             }
             // Apple's token never has the name: it is posted once, beside it (`apple::posted_name`).
             Kind::Apple { issuer, allowed_domains, .. } => {
@@ -512,6 +543,8 @@ impl Provider {
 mod tests {
     use super::*;
     use crate::sso::jwt::test_keys::keys;
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
     use serde_json::json;
 
     const T1: &str = "11111111-1111-1111-1111-111111111111";
@@ -574,6 +607,9 @@ mod tests {
         assert_eq!(c.email.as_deref(), Some("a@example.com"));
         assert_eq!(p.claims(&t(json!({ "iss": "https://other.example", "sub": "s1" })), &m).err(), Some(Invalid("wrong_issuer")));
         assert_eq!(p.claims(&t(json!({ "iss": "https://idp.example" })), &m).err(), Some(Invalid("missing_subject")));
+        for padded in ["", " s1", "s1 "] {
+            assert_eq!(p.claims(&t(json!({ "iss": "https://idp.example", "sub": padded })), &m).err(), Some(Invalid("missing_subject")), "{padded:?}: empty ones would all be one person");
+        }
     }
 
     fn signed(c: Value) -> Token {
@@ -712,6 +748,107 @@ mod tests {
         }
         assert_eq!(p.claims(&a(json!({ "email_verified": false })), &m).err(), Some(Invalid("email_unverified")));
         assert_eq!(p.claims(&a(json!({ "email": null })), &m).err(), Some(Invalid("email_unverified")));
+    }
+
+    const BROKER: &str = "https://sso.example.com/realms/superbot";
+    const ADFS: &str = "http://adfs.example.com/adfs/services/trust";
+
+    fn saml_bridge(domains: &[&str]) -> Provider {
+        let map = ClaimMap { subject: saml::SUBJECT_CLAIM.into(), ..ClaimMap::default() };
+        let kind = Kind::Saml { issuer: BROKER.into(), entity_id: ADFS.into(), alias: "adfs".into(), map, allowed_domains: domains.iter().map(|s| s.to_string()).collect() };
+        Provider::new("adfs", "Contoso", kind, "client-1", "openid profile email", None)
+    }
+
+    /// What Keycloak's ID token says after a login brokered through the SAML IdP `adfs`.
+    fn brokered(extra: Value) -> Value {
+        let mut c = json!({
+            "iss": BROKER, "sub": "kc-user-uuid", "preferred_username": "ada",
+            "identity_provider": "adfs", "identity_provider_identity": "_a1b2c3-persistent",
+            "email": "ada@example.com", "email_verified": true, "name": "Ada Lovelace",
+        });
+        c.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        c.as_object_mut().unwrap().retain(|_, v| !v.is_null());
+        c
+    }
+
+    #[test]
+    fn saml_bridge_takes_the_idps_name_id_under_its_entity_id_only_when_that_idp_signed_in() {
+        let (p, m) = (saml_bridge(&[]), meta(BROKER));
+        let c = p.claims(&signed(brokered(json!({}))), &m).unwrap();
+        assert_eq!((c.issuer.as_str(), c.subject.as_str(), c.email.as_deref(), c.name.as_deref()), (ADFS, "_a1b2c3-persistent", Some("ada@example.com"), Some("Ada Lovelace")));
+        assert_eq!(c.key(), format!("{ADFS}|_a1b2c3-persistent"), "not the broker's issuer or its own user id");
+        let upper = p.claims(&signed(brokered(json!({ "identity_provider_identity": "G-94F0-AbC" }))), &m).unwrap();
+        assert_eq!((upper.subject.as_str(), p.subject(" G-94F0-AbC ").unwrap()), ("g-94f0-abc", "g-94f0-abc".to_string()), "compared without case, at sign-in and when linking");
+        for (extra, why) in [
+            (json!({ "identity_provider": null, "identity_provider_identity": null }), "a password login at the broker"),
+            (json!({ "identity_provider": null }), "no claim naming the IdP"),
+            (json!({ "identity_provider": "github" }), "another IdP the broker knows"),
+            (json!({ "identity_provider": "ADFS" }), "aliases are compared exactly"),
+            (json!({ "identity_provider": ["adfs"] }), "not a string"),
+            (json!({ "identity_provider": "" }), "empty"),
+        ] {
+            assert_eq!(p.claims(&signed(brokered(extra)), &m).err(), Some(Invalid("not_brokered")), "{why}");
+        }
+        assert_eq!(p.claims(&signed(brokered(json!({ "identity_provider_identity": null }))), &m).err(), Some(Invalid("missing_subject")), "the broker's sub is not the person at the IdP");
+        assert_eq!(p.claims(&signed(brokered(json!({ "identity_provider_identity": "x".repeat(256) }))), &m).err(), Some(Invalid("missing_subject")));
+        for padded in ["", " ", " g-1", "g-1 ", "\tg-1"] {
+            assert_eq!(p.claims(&signed(brokered(json!({ "identity_provider_identity": padded }))), &m).err(), Some(Invalid("missing_subject")), "{padded:?} could never be linked");
+        }
+        for iss in ["https://sso.example.com/realms/other", "https://sso.example.com/realms/superbot/", ADFS] {
+            assert_eq!(p.claims(&signed(brokered(json!({ "iss": iss }))), &m).err(), Some(Invalid("wrong_issuer")), "{iss}");
+        }
+        assert_eq!(p.claims(&signed(brokered(json!({}))), &meta("https://evil.example")).err(), Some(Invalid("wrong_issuer")), "discovery from elsewhere");
+        assert_eq!(p.claims(&signed(brokered(json!({ "email_verified": false }))), &m).unwrap().email, None, "an unverified email is dropped");
+    }
+
+    #[test]
+    fn saml_bridge_email_domains_need_a_verified_email() {
+        let (p, m) = (saml_bridge(&["example.com"]), meta(BROKER));
+        assert!(p.claims(&signed(brokered(json!({}))), &m).is_ok());
+        assert_eq!(p.claims(&signed(brokered(json!({ "email": "ada@evil.example" }))), &m).err(), Some(Invalid("wrong_domain")));
+        assert_eq!(p.claims(&signed(brokered(json!({ "email_verified": false }))), &m).err(), Some(Invalid("email_unverified")));
+        assert_eq!(p.claims(&signed(brokered(json!({ "identity_provider": "github" }))), &m).err(), Some(Invalid("not_brokered")), "checked before the email");
+    }
+
+    /// The whole check of the broker's answer, as `sign_in` runs it. The SAML assertion's
+    /// own checks (XML signature, audience, recipient, NotOnOrAfter, InResponseTo, replay)
+    /// are the broker's; these are the same properties on the hop botd verifies.
+    #[test]
+    fn saml_bridge_tokens_pass_the_shared_checks_too() {
+        use crate::sso::jwt::Jwks;
+        let p = saml_bridge(&[]);
+        let [k1, k2] = keys();
+        let set = Jwks::parse(&crate::sso::jwt::test_keys::jwks(&[k1])).unwrap();
+        let now = 1_800_000_000;
+        let (nonce, other) = (crate::random_hex(16), crate::random_hex(16));
+        let claims = |extra: Value| {
+            let mut c = json!({ "aud": "client-1", "azp": "client-1", "nonce": nonce, "iat": now, "exp": now + 300 });
+            c.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            brokered(c)
+        };
+        let run = |token: String| {
+            let t = jwt::decode(&token)?;
+            t.verify(&set)?;
+            t.check("client-1", &nonce, now)?;
+            p.claims(&t, &meta(BROKER))
+        };
+        assert!(run(k1.sign(&claims(json!({})))).is_ok());
+
+        let forged = k2.sign_with(&json!({ "alg": "RS256", "kid": "k1" }), &claims(json!({})));
+        assert_eq!(run(forged).err(), Some(Invalid("bad_signature")), "signed by someone else");
+        let good = k1.sign(&claims(json!({})));
+        let (head, rest) = good.split_once('.').unwrap();
+        let sig = rest.split_once('.').unwrap().1;
+        let swapped = format!("{head}.{}.{sig}", B64.encode(claims(json!({ "identity_provider_identity": "_someone-else" })).to_string()));
+        assert_eq!(run(swapped).err(), Some(Invalid("bad_signature")), "the person swapped under a good signature");
+        assert_eq!(run(k2.sign(&claims(json!({})))).err(), Some(Invalid("unknown_key")));
+        assert_eq!(run(k1.sign(&claims(json!({ "aud": "another-app", "azp": "another-app" })))).err(), Some(Invalid("wrong_audience")));
+        assert_eq!(run(k1.sign(&claims(json!({ "aud": ["client-1", "another-app"], "azp": "another-app" })))).err(), Some(Invalid("wrong_audience")));
+        assert_eq!(run(k1.sign(&claims(json!({ "iat": now - 3600, "exp": now - 600 })))).err(), Some(Invalid("expired")));
+        assert_eq!(run(k1.sign(&claims(json!({ "iat": now + 3600, "exp": now + 7200 })))).err(), Some(Invalid("not_yet_valid")));
+        assert_eq!(run(k1.sign(&claims(json!({ "nonce": other })))).err(), Some(Invalid("nonce_mismatch")), "an answer to another sign-in (SAML's InResponseTo)");
+        assert_eq!(run(k1.sign(&claims(json!({ "nonce": null })))).err(), Some(Invalid("nonce_mismatch")), "unsolicited (IdP-initiated)");
+        assert_eq!(run(k1.sign_with(&json!({ "alg": "none" }), &claims(json!({})))).err(), Some(Invalid("bad_algorithm")));
     }
 
     #[tokio::test]

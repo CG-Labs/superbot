@@ -220,7 +220,7 @@ pub struct AuditEvent {
     pub actor_role: Option<String>,
     /// "password" (break-glass), "code", "sso", "none" (ALLOW_NO_AUTH), or "bot_token".
     pub auth_method: Option<String>,
-    /// The SSO provider's type ("entra", "google", "oidc", "github", "apple"), and its configured id.
+    /// The SSO provider's type ("entra", "google", "oidc", "github", "apple", "saml"), and its configured id.
     pub idp: Option<String>,
     pub idp_provider: Option<String>,
     pub session_id: Option<String>,

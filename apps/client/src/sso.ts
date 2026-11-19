@@ -36,8 +36,8 @@ export function ssoSupported(): boolean {
 }
 
 /**
- * One button per provider, in the server's order (Entra, Google, GitHub, Apple, and any
- * OIDC IdP can be on at once; the server lists only those it has secrets for). Entries that aren't a provider the server could have, or repeat one, are
+ * One button per provider, in the server's order (Entra, Google, GitHub, Apple, any OIDC
+ * IdP, and SAML IdPs through a bridge can be on at once; the server lists only those it has secrets for). Entries that aren't a provider the server could have, or repeat one, are
  * dropped, so a bad response can't make a button that goes somewhere odd.
  */
 export function ssoProviderList(raw: unknown): SsoProvider[] {
