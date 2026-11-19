@@ -16,16 +16,18 @@ RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
 COPY apps/client ./
 RUN SUPERBOT_WEB_BASE_URL=/app npx expo export --platform web --output-dir /out/app
 
-# Compose's Caddy (`target: caddy`): stock Caddy plus the client, so each rebuild ships the
-# client from this checkout. The Caddyfile is mounted from deploy/docker/.
+# Compose's Caddy (`target: caddy`): stock Caddy plus the client and the landing page, so
+# each rebuild ships them from this checkout. The Caddyfile is mounted from deploy/docker/.
 FROM ${CADDY_IMAGE} AS caddy
 COPY --from=client /out/app /srv/superbot-app
+COPY site /srv/superbot-site
 
 FROM ${RUST_IMAGE} AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY server server
 COPY web web
+COPY site site
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked \

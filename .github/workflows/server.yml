@@ -7,6 +7,8 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'deploy/**'
+      - 'site/**'
+      - 'web/**'
       - 'apps/client/**'
       - '.github/workflows/server.yml'
   pull_request:
@@ -15,6 +17,8 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'deploy/**'
+      - 'site/**'
+      - 'web/**'
       - 'apps/client/**'
       - '.github/workflows/server.yml'
 
@@ -56,6 +60,9 @@ jobs:
           grep -Fq 'would build the web client in /home/superbot/superbot/apps/client as superbot (base URL /app) and install it into root-owned /var/www/superbot-app' /tmp/fresh.log
           grep -Fq 'web client at /app/ from /var/www/superbot-app, everything else to botd on 127.0.0.1:3000' /tmp/fresh.log
           grep -Fq 'App:      https://ci.example.com/app/' /tmp/fresh.log
+          grep -Fq 'would install the landing page from /home/superbot/superbot/site into root-owned /var/www/superbot-site' /tmp/fresh.log
+          grep -Fq 'landing page at / from /var/www/superbot-site, web client at /app/' /tmp/fresh.log
+          grep -Fq 'Console:  https://ci.example.com/console/' /tmp/fresh.log
       - name: Hermes Agent is opt-in and pinned to a commit
         run: |
           set -euo pipefail
@@ -74,6 +81,7 @@ jobs:
           grep -Fq 'Skipping the web client (--no-client)' /tmp/upgrade.log
           if grep -Fq 'would build the web client' /tmp/upgrade.log; then exit 1; fi
           if grep -Fq 'web client at /app/' /tmp/upgrade.log; then exit 1; fi
+          grep -Fq 'would install the landing page' /tmp/upgrade.log
       - name: Piped dry run ignores templates in the service user's checkout
         run: |
           set -euo pipefail
@@ -159,7 +167,7 @@ jobs:
             if (INSTALL_DIR=/home/superbot/superbot; stage_trusted_deploy); then exit 1; fi
             echo ok
           '
-      - name: Web client is built as the service user, installed root-owned, and served at /app/
+      - name: Web client and landing page are installed root-owned and served by Caddy
         run: |
           set -euo pipefail
           id superbot >/dev/null 2>&1 || sudo useradd -m -s /bin/bash superbot
@@ -200,7 +208,15 @@ jobs:
             # No Node for the service user: a warning, not a failed install.
             client_node_ok() { return 1; }
             build_client 2>&1 | grep -q "skipping the web client"
-            render_caddyfile :18090 127.0.0.1:3999 "$CLIENT_DIR" >/tmp/Caddyfile
+            # The landing page: plain files, installed like the client; a link is refused.
+            install_site
+            site=$(readlink -f "$SITE_DIR")
+            [[ $(stat -c "%U %a" "$site/get-started.html") == "root 644" ]]
+            sudo -u superbot ln -s /etc/shadow /home/superbot/superbot/site/leak
+            install_site 2>&1 | grep -q "Landing page not installed"
+            [[ $(readlink -f "$SITE_DIR") == "$site" ]]
+            sudo -u superbot rm /home/superbot/superbot/site/leak
+            render_caddyfile :18090 127.0.0.1:3999 "$CLIENT_DIR" "$SITE_DIR" >/tmp/Caddyfile
             echo ok
           '
           docker run -d --name caddy --network host \
@@ -215,7 +231,14 @@ jobs:
           curl -fsSI "$B/app/" | grep -qi '^cache-control: no-cache'
           js=$(curl -fsS "$B/app/" | grep -o '/app/_expo/static/js/web/entry-[0-9a-f]*\.js' | head -1)
           curl -fsSI "$B$js" | grep -qi '^cache-control: public, max-age=31536000, immutable'
-          # Everything outside /app/ goes to botd (not running here, so 502), never to the client.
-          [[ $(code "$B/") == 502 ]]
+          # The landing page and its assets come from SITE_DIR, with botd's headers.
+          [[ $(code "$B/") == 200 && $(code "$B/get-started") == 200 && $(code "$B/site/site.css") == 200 ]]
+          curl -fsS "$B/get-started" | grep -q '/site/get-started.js'
+          curl -fsSI "$B/" | grep -qi "^content-security-policy: default-src 'self'"
+          curl -fsSI "$B/site/get-started.js" | grep -qi '^x-content-type-options: nosniff'
+          [[ $(code "$B/site/nope.js") == 404 ]]
+          # Everything else goes to botd (not running here, so 502), never to the client.
+          [[ $(code "$B/console/") == 502 ]]
+          [[ $(code "$B/api/signups") == 502 ]]
           [[ $(code "$B/app.js") == 502 ]]
           [[ $(code "$B/api/events") == 502 ]]

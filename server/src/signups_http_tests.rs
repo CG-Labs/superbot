@@ -267,3 +267,12 @@ async fn signups_can_be_closed() {
     assert_eq!(app.db.pending_signups(), 0);
     assert_eq!(call(port, "GET", "/", "", "").await.0, 200, "the landing page stays up");
 }
+
+#[test]
+fn caddy_serves_the_site_with_botds_headers() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    for file in ["deploy/install.sh", "deploy/docker/Caddyfile"] {
+        let text = std::fs::read_to_string(root.join(file)).unwrap();
+        assert!(text.contains(&format!("header Content-Security-Policy \"{}\"", crate::SITE_CSP)), "{file} has a different CSP than SITE_CSP");
+    }
+}
