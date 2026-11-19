@@ -157,7 +157,7 @@ pub struct Approval {
     pub rule_id: Option<String>,
 }
 
-/// One row of the audit log. See `audit.rs` and ADR 0008.
+/// One row of the audit log. See `audit.rs` and ADR 0009.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditEvent {
@@ -246,7 +246,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 /// Each gets `fresh`: true when this database was just created.
 const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 2] = [migrate_approvals, migrate_audit_events];
 
-/// Structured audit events (ADR 0008): actor kind and id, target type and id,
+/// Structured audit events (ADR 0009): actor kind and id, target type and id,
 /// outcome, and request source. Copies the rows from the first audit table.
 /// DELETE is refused except for rows older than `audit_retention_days`.
 fn migrate_audit_events(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
@@ -481,6 +481,22 @@ impl Db {
                 "SELECT * FROM messages WHERE bot_id = ? AND role != 'routine' ORDER BY id DESC LIMIT 1",
                 [bot_id],
                 message_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// The Bot's latest unanswered handoff card, unless the user wrote after it.
+    pub fn open_handoff(&self, bot_id: &str) -> Option<i64> {
+        self.c()
+            .query_row(
+                "SELECT id FROM messages WHERE bot_id = ?1 AND role = 'bot'
+                   AND json_extract(question, '$.handoff') = 1 AND json_extract(question, '$.picked') IS NULL
+                   AND id > COALESCE((SELECT MAX(id) FROM messages WHERE bot_id = ?1 AND role = 'user'), 0)
+                 ORDER BY id DESC LIMIT 1",
+                [bot_id],
+                |r| r.get(0),
             )
             .optional()
             .ok()

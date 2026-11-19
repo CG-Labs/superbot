@@ -14,6 +14,16 @@ import {
   saveCredentials,
 } from "./auth";
 import { SuperBotApi } from "./api";
+import {
+  applyHandoffHistory,
+  applyHandoffMessage,
+  isHandoff,
+  withoutHandoff,
+  withPicked,
+  type HandoffMap,
+} from "./handoff";
+import { createBody, patchBody, type RoutineDraft } from "./routines";
+import { resolveScreenUrl } from "./screen";
 import { connectSse } from "./sse";
 import type { Approval, BotView, Message, ModelOption, Policy, PolicyMode, Routine, SseEvent } from "./types";
 
@@ -30,6 +40,8 @@ interface SuperBotContextValue {
   setActiveId: (id: string | null) => void;
   messages: Record<string, Message[]>;
   drafts: Record<string, string>;
+  /** botId -> the latest handoff card the user still has to act on. */
+  handoffs: HandoffMap;
   modelCache: Record<string, ModelOption[]>;
   showHidden: boolean;
   setShowHidden: (v: boolean) => void;
@@ -40,6 +52,8 @@ interface SuperBotContextValue {
   refresh: (reloadMessages?: boolean) => Promise<void>;
   loadMessages: (botId: string) => Promise<void>;
   sendText: (text: string, answer?: { messageId: number; option: number }) => Promise<void>;
+  /** Answers a choice or handoff card on the card's own Bot. Rejects (and undoes) on failure. */
+  answerQuestion: (message: Message, option: number) => Promise<void>;
   createBot: (body: { name: string; color: string; shape: string; harness: string }) => Promise<BotView>;
   patchBot: (id: string, body: Record<string, unknown>) => Promise<void>;
   deleteBot: (id: string) => Promise<void>;
@@ -47,6 +61,11 @@ interface SuperBotContextValue {
   fetchModels: (harness: string) => Promise<ModelOption[]>;
   fetchRoutines: (botId: string) => Promise<Routine[]>;
   toggleRoutine: (r: Routine) => Promise<void>;
+  createRoutine: (botId: string, draft: RoutineDraft) => Promise<Routine>;
+  updateRoutine: (r: Routine, draft: RoutineDraft) => Promise<Routine>;
+  deleteRoutine: (id: string) => Promise<void>;
+  /** Starts the Bot's screen; resolves to an absolute live-view link on this server. */
+  fetchScreenUrl: (botId: string) => Promise<string>;
   /** Pending approvals, oldest first. */
   approvals: Approval[];
   policy: Policy | null;
@@ -73,6 +92,12 @@ function upsertBot(list: BotView[], b: BotView): BotView[] {
   return [...list, b];
 }
 
+function mergeMessages(base: Message[], extra: Message[]): Message[] {
+  const seen = new Set(base.map((m) => m.id));
+  const added = extra.filter((m) => !seen.has(m.id));
+  return added.length ? [...base, ...added].sort((a, b) => a.id - b.id) : base;
+}
+
 function upsertApproval(list: Approval[], a: Approval): Approval[] {
   const rest = list.filter((x) => x.id !== a.id);
   return a.status === "pending" ? [...rest, a].sort((x, y) => x.createdAt - y.createdAt) : rest;
@@ -90,6 +115,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Record<string, Message[]>>({});
   const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [handoffs, setHandoffs] = useState<HandoffMap>({});
   const [modelCache, setModelCache] = useState<Record<string, ModelOption[]>>({});
   const [showHidden, setShowHidden] = useState(false);
   const [filter, setFilter] = useState("");
@@ -97,6 +123,10 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
   const [policy, setPolicy] = useState<Policy | null>(null);
   const sseRef = useRef<ReturnType<typeof connectSse> | null>(null);
   const openedRef = useRef(false);
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+  /** Live messages that arrived while a Bot's history was loading; the server's snapshot may predate them. */
+  const liveRef = useRef<Record<string, { waiting: number; list: Message[] }>>({});
 
   const applyState = useCallback((state: Awaited<ReturnType<SuperBotApi["verify"]>>) => {
     setMe(state.me);
@@ -116,11 +146,14 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
         return;
       }
       if (evt.type === "message") {
+        liveRef.current[evt.message.botId]?.list.push(evt.message);
+        // Only extend histories already loaded; an unloaded Bot loads its full history on open.
         setMessages((prev) => {
-          const list = prev[evt.message.botId] ?? [];
-          if (list.some((m) => m.id === evt.message.id)) return prev;
+          const list = prev[evt.message.botId];
+          if (!list || list.some((m) => m.id === evt.message.id)) return prev;
           return { ...prev, [evt.message.botId]: [...list, evt.message] };
         });
+        setHandoffs((h) => applyHandoffMessage(h, evt.message));
         if (evt.message.role === "bot") {
           setDrafts((d) => {
             const next = { ...d };
@@ -134,6 +167,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
         setBots((bs) => upsertBot(bs, evt.bot));
       } else if (evt.type === "botDeleted") {
         setBots((bs) => bs.filter((b) => b.id !== evt.botId));
+        setHandoffs((h) => withoutHandoff(h, evt.botId));
         setActiveId((id) => {
           if (id !== evt.botId) return id;
           const primary = bots.find((b) => b.primary);
@@ -162,17 +196,42 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
     },
     [activeId, api, bots],
   );
+  const handleSseRef = useRef(handleSse);
+  handleSseRef.current = handleSse;
+
+  const fetchHistory = async (client: SuperBotApi, botId: string) => {
+    const entry = (liveRef.current[botId] ??= { waiting: 0, list: [] });
+    entry.waiting++;
+    try {
+      return mergeMessages(await client.messages(botId), entry.list);
+    } finally {
+      if (--entry.waiting === 0 && liveRef.current[botId] === entry) delete liveRef.current[botId];
+    }
+  };
+
+  /** Loads unread or waiting Bots' chats in the background so their open handoffs show without opening each one. */
+  const prefetchUnread = async (client: SuperBotApi, list: BotView[]) => {
+    const ids = list.filter((b) => (b.unread || b.handoff != null) && !messagesRef.current[b.id]).map((b) => b.id);
+    await Promise.all(
+      ids.map(async (id) => {
+        const history = await fetchHistory(client, id).catch(() => null);
+        if (!history) return;
+        setMessages((prev) => (prev[id] ? prev : { ...prev, [id]: history }));
+        setHandoffs((h) => applyHandoffHistory(h, id, history));
+      }),
+    );
+  };
 
   const refreshInternal = async (client: SuperBotApi, reloadMessages?: boolean) => {
     const state = await client.verify();
     applyState(state);
+    void prefetchUnread(client, state.bots);
     if (reloadMessages) {
-      const ids = Object.keys(messages);
-      const loaded: Record<string, Message[]> = { ...messages };
-      for (const id of ids) {
-        loaded[id] = await client.messages(id);
+      for (const id of Object.keys(messagesRef.current)) {
+        const list = await fetchHistory(client, id);
+        setMessages((prev) => ({ ...prev, [id]: list }));
+        setHandoffs((h) => applyHandoffHistory(h, id, list));
       }
-      setMessages(loaded);
     }
   };
 
@@ -183,7 +242,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
       sseRef.current = connectSse(
         client.eventsUrl(),
         client.authHeaders(),
-        (ev) => void handleSse(ev),
+        (ev) => void handleSseRef.current(ev),
         () => {
           if (openedRef.current) void refreshInternal(client, true);
           openedRef.current = true;
@@ -192,7 +251,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
       );
       setConnected(true);
     },
-    [handleSse],
+    [],
   );
 
   const bootstrap = useCallback(
@@ -202,6 +261,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
       applyState(state);
       setApi(client);
       startSse(client);
+      void prefetchUnread(client, state.bots);
     },
     [applyState, startSse],
   );
@@ -241,6 +301,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
     setBots([]);
     setMessages({});
     setDrafts({});
+    setHandoffs({});
     setApprovals([]);
     setConnected(false);
     await clearCredentials();
@@ -252,15 +313,39 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
   };
 
   const loadMessages = async (botId: string) => {
-    if (!api || messages[botId]) return;
-    const list = await api.messages(botId);
-    setMessages((m) => ({ ...m, [botId]: list }));
-    void api.markRead(botId).catch(() => {});
+    if (!api) return;
+    if (!messagesRef.current[botId]) {
+      const list = await fetchHistory(api, botId);
+      setMessages((m) => ({ ...m, [botId]: list }));
+      setHandoffs((h) => applyHandoffHistory(h, botId, list));
+      void api.markRead(botId).catch(() => {});
+    } else if (bots.find((b) => b.id === botId)?.unread) {
+      // Prefetched in the background: opening it still marks it read.
+      void api.markRead(botId).catch(() => {});
+    }
   };
 
   const sendText = async (text: string, answer?: { messageId: number; option: number }) => {
     if (!api || !activeId || !text.trim()) return;
     await api.sendMessage(activeId, text.trim(), answer);
+  };
+
+  const answerQuestion = async (message: Message, option: number) => {
+    const q = message.question;
+    if (!api || !q || q.picked != null || option < 0 || option >= q.options.length) return;
+    const setPicked = (picked: number | null) =>
+      setMessages((prev) =>
+        prev[message.botId] ? { ...prev, [message.botId]: withPicked(prev[message.botId], message.id, picked) } : prev,
+      );
+    setPicked(option);
+    setHandoffs((h) => withoutHandoff(h, message.botId, message.id));
+    try {
+      await api.sendMessage(message.botId, q.options[option], { messageId: message.id, option });
+    } catch (err) {
+      setPicked(null);
+      if (isHandoff(message)) setHandoffs((h) => (h[message.botId] ? h : { ...h, [message.botId]: message }));
+      throw err;
+    }
   };
 
   const createBot = async (body: { name: string; color: string; shape: string; harness: string }) => {
@@ -304,6 +389,29 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
     await api.patchRoutine(r.id, { enabled: !r.enabled });
   };
 
+  const createRoutine = async (botId: string, draft: RoutineDraft) => {
+    if (!api) throw new Error("Not connected");
+    return api.createRoutine(botId, createBody(draft));
+  };
+
+  const updateRoutine = async (r: Routine, draft: RoutineDraft) => {
+    if (!api) throw new Error("Not connected");
+    const patch = patchBody(r, draft);
+    if (!Object.keys(patch).length) return r;
+    return api.patchRoutine(r.id, patch);
+  };
+
+  const deleteRoutine = async (id: string) => {
+    if (!api) throw new Error("Not connected");
+    await api.deleteRoutine(id);
+  };
+
+  const fetchScreenUrl = async (botId: string) => {
+    if (!api) throw new Error("Not connected");
+    const { url } = await api.screen(botId);
+    return resolveScreenUrl(api.baseUrl, url);
+  };
+
   const decideApproval = async (id: string, approve: boolean, remember: boolean) => {
     if (!api) return;
     const a = await api.decideApproval(id, approve, remember);
@@ -334,6 +442,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
       setActiveId,
       messages,
       drafts,
+      handoffs,
       modelCache,
       showHidden,
       setShowHidden,
@@ -344,6 +453,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
       refresh,
       loadMessages,
       sendText,
+      answerQuestion,
       createBot,
       patchBot,
       deleteBot,
@@ -351,6 +461,10 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
       fetchModels,
       fetchRoutines,
       toggleRoutine,
+      createRoutine,
+      updateRoutine,
+      deleteRoutine,
+      fetchScreenUrl,
       approvals,
       policy,
       decideApproval,
@@ -369,6 +483,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
       activeId,
       messages,
       drafts,
+      handoffs,
       modelCache,
       showHidden,
       filter,

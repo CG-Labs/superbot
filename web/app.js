@@ -643,7 +643,7 @@ document.addEventListener("change", (e) => {
   const card = e.target.closest(".ap-remember") && e.target.closest(".approval");
   if (card) e.target.checked ? remembered.add(card.dataset.approval) : remembered.delete(card.dataset.approval);
 });
-// Audit log: append-only record of sign-ins and admin actions (docs/adr/0008-audit-events.md).
+// Audit log: append-only record of sign-ins and admin actions (docs/adr/0009-audit-events.md).
 const audit = { events: [], next: null, error: "", seq: 0 };
 
 function auditQuery() {

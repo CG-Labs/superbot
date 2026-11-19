@@ -185,6 +185,17 @@ impl Screens {
     }
 }
 
+/// Polls a local port every 100 ms until it accepts a connection. False after `tries`.
+pub async fn wait_for_port(port: u16, tries: u32) -> bool {
+    for _ in 0..tries {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
 /// Closes the Bot's browser cleanly (so its profile saves), then kills the screen.
 async fn stop(bot_id: &str, s: Screen) {
     if on_path("agent-browser") {
@@ -215,6 +226,29 @@ pub fn bot_env(info: &Info, bot_id: &str, bot_dir: &Path) -> HashMap<String, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn waits_for_a_listener() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(wait_for_port(port, 1).await);
+        drop(listener);
+        assert!(!wait_for_port(port, 2).await);
+    }
+
+    #[tokio::test]
+    async fn sees_a_late_listener() {
+        let probe = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let l = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            drop(l);
+        });
+        assert!(wait_for_port(port, 20).await);
+    }
 
     #[test]
     fn screen_size_is_two_numbers_or_the_default() {
