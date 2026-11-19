@@ -39,7 +39,7 @@ Users are never deleted, only disabled, so audit rows keep pointing at someone. 
 **Two ways to carry the token**:
 
 - **Web app (`web/`)**: `Set-Cookie: superbot_session=...; HttpOnly; Secure; SameSite=Strict; Path=/`. Scripts can't read it, it never goes over plain http (browsers allow `Secure` on `http://localhost`), and other sites can't make the browser send it. On top of SameSite, every cookie-authenticated write must come from our own origin (`Origin` equal to the Host, or `Sec-Fetch-Site: same-origin`), else 403, and the cookie sign-in itself checks the same. Requests with neither header aren't from a browser page.
-- **Expo client and `botctl`**: `Authorization: Bearer sbs_...`. Not sent automatically, so no CSRF. The client keeps the token in SecureStore instead of the password.
+- **Expo client and `botctl`**: `Authorization: Bearer sbs_...`. Not sent automatically, so no CSRF. The client keeps the token in SecureStore (browser storage on web) instead of the password. A password for a server from before sign-in stays in SecureStore on phones and is never written to browser storage.
 
 **Lifetimes** (`.env`): `SESSION_IDLE_TIMEOUT` (default `7d`) since the last request, and `SESSION_MAX_AGE` (default `30d`) since sign-in, however active. Values like `30m`, `12h`, `7d`, from 5 minutes to 365 days. Both are checked on every request against the current settings, so shortening them applies to existing sessions. Last-seen is written at most once a minute. The SSE stream rechecks its session every few seconds and closes when it ends. Ended sessions and codes are deleted 30 days later.
 

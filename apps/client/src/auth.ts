@@ -57,15 +57,20 @@ export async function loadSavedCredentials(): Promise<ServerConfig | null> {
   return password == null ? null : { baseUrl, password };
 }
 
-/** Saves a token in place of the password, so the password stops living on the device. */
+/**
+ * Saves a token in place of the password, so the password stops living on the device.
+ * Servers from before sign-in only take the password: it goes in the keychain on
+ * phones and is never written to browser storage, so the web app asks again on reload.
+ */
 export async function saveCredentials(cfg: ServerConfig): Promise<void> {
   await storeSet(SERVER_KEY, normalizeBaseUrl(cfg.baseUrl));
   if (cfg.token) {
     await storeSet(TOKEN_KEY, cfg.token);
     await storeDelete(PASSWORD_KEY);
   } else {
-    await storeSet(PASSWORD_KEY, cfg.password ?? "");
     await storeDelete(TOKEN_KEY);
+    await storeDelete(PASSWORD_KEY);
+    if (Platform.OS !== "web") await SecureStore.setItemAsync(PASSWORD_KEY, cfg.password ?? "");
   }
 }
 
