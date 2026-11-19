@@ -75,7 +75,7 @@ Three roles. One function, `rbac::classify(method, path)`, maps each API route t
 - **Readonly** can see everything a member sees but change nothing, including read markers and starting a Bot's screen.
 - **Bots** keep exactly what they had: everything except approvals and admin. Handlers still call `need_user` for decisions as a second lock.
 - **Members** decide approvals but can't change the policy or rules that decide which calls ask.
-- Bot ACLs (private vs shared Bots) are not in this slice: every signed-in person sees every Bot.
+- Bot ACLs (private vs shared Bots) are not in this slice: every signed-in person sees every Bot. Added in [ADR 0016](0016-bot-acls.md).
 
 ### Audit events
 
