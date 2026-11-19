@@ -380,9 +380,12 @@ impl Provider {
             // Identities are stored under the configured issuer, so a link made with
             // `botctl user link` and a sign-in name the same one.
             Kind::Google { issuer, hosted_domains } => {
-                // Google's ID tokens may carry the issuer without its scheme.
-                let bare = meta.issuer.strip_prefix("https://");
-                if !same_issuer(issuer, &meta.issuer) || (iss != meta.issuer && Some(iss) != bare) {
+                // Google's tokens and discovery may name the issuer without its scheme (legacy).
+                let ours = |x: &str| {
+                    let (x, c) = (x.trim_end_matches('/'), issuer.trim_end_matches('/'));
+                    x == c || Some(x) == c.strip_prefix("https://")
+                };
+                if !ours(&meta.issuer) || !ours(iss) {
                     return Err(Invalid("wrong_issuer"));
                 }
                 let subject = subject_of(t, "sub")?;
@@ -510,6 +513,7 @@ mod tests {
             assert_eq!(p.claims(&signed(g(json!({ "iss": iss }))), &m).err(), Some(Invalid("wrong_issuer")), "{iss}");
         }
         assert_eq!(p.claims(&signed(g(json!({}))), &meta("https://evil.example")).err(), Some(Invalid("wrong_issuer")), "discovery from elsewhere");
+        assert!(p.claims(&signed(g(json!({}))), &meta("accounts.google.com")).is_ok(), "legacy discovery issuer");
         assert_eq!(p.claims(&signed(g(json!({ "sub": null }))), &m).err(), Some(Invalid("missing_subject")));
     }
 
