@@ -743,7 +743,7 @@ async fn state(State(app): State<AppState>, Extension(c): Extension<Caller>) -> 
         Principal::Bot => json!("bot"),
     };
     Json(json!({
-        "me": { "name": name, "id": c.user.as_ref().map(|u| &u.id), "email": c.user.as_ref().and_then(|u| u.email.as_ref()), "role": role, "permissions": rbac::granted(c.principal) },
+        "me": { "name": name, "id": c.user.as_ref().map(|u| &u.id), "email": c.user.as_ref().and_then(|u| u.email.as_ref()), "role": role, "permissions": rbac::granted(c.principal), "session": c.session.is_some() },
         "harnesses": adapters::installed(),
         "defaultHarness": app.cfg.default_harness,
         "bots": bots,

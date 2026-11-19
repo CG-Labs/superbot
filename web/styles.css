@@ -80,6 +80,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
   margin-top: 14px; padding: 8px 10px; font-size: 15px; color: var(--text-dim);
 }
 .hidden-bots:hover { color: var(--text); }
+.hidden-bots[hidden], .icon-btn[hidden] { display: none; }
 
 .sidebar-bottom { margin-top: auto; display: flex; align-items: center; justify-content: space-between; padding: 0 2px; }
 .me { display: flex; align-items: center; gap: 10px; font-size: 16px; }
