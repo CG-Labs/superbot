@@ -102,8 +102,8 @@
       hint.hidden = false;
     }
     document.title = "Request received · SuperBot";
-    window.scrollTo(0, 0);
-    el("done-title").focus();
+    window.scrollTo({ top: 0, behavior: "instant" });
+    el("done-title").focus({ preventScroll: true });
   }
 
   function resetTurnstile() {

@@ -46,6 +46,8 @@
 
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; }
+/* Clear the sticky header when focus or an anchor scrolls something into view. */
+:target, [tabindex="-1"], input, select, textarea { scroll-margin-top: 88px; }
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
   *, *::before, *::after { transition: none !important; animation: none !important; }
