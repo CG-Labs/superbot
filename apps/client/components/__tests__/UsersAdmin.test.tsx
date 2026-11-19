@@ -1,9 +1,9 @@
 import React from "react";
 import { act, render, screen, userEvent, within } from "@testing-library/react-native";
 import { UsersAdmin, matchesUser } from "../UsersAdmin";
-import type { SuperBotApi } from "../../src/api";
+import { ApiError, type SuperBotApi } from "../../src/api";
 import { fetchSsoProviders } from "../../src/sso";
-import type { AdminUser } from "../../src/types";
+import type { AdminUser, SignupRequest } from "../../src/types";
 
 jest.mock("../BotAvatar", () => ({ BotAvatar: () => null }));
 jest.mock("../../src/sso", () => ({
@@ -41,10 +41,37 @@ const alex: AdminUser = {
   pendingCodes: { count: 1, expiresAt: Date.now() + 3600_000 },
 };
 
-function fakeApi(list: AdminUser[]) {
+const ada: SignupRequest = {
+  id: "su1",
+  name: "Ada Lovelace",
+  email: "ada@example.com",
+  company: "Analytical Engines",
+  teamSize: "2-10",
+  useCase: "Nightly test triage",
+  signIn: "github",
+  status: "pending",
+  createdAt: Date.now() - 2 * 3600_000,
+  existingUser: false,
+};
+
+function fakeApi(list: AdminUser[], requests: SignupRequest[] = []) {
   const users = list.map((u) => ({ ...u }));
+  let pending = requests.map((r) => ({ ...r }));
   return {
     baseUrl: BASE,
+    signups: jest.fn(async () => pending.map((r) => ({ ...r }))),
+    approveSignup: jest.fn(async (id: string, b: { role: AdminUser["role"]; ttlMinutes: number }) => {
+      const r = pending.find((x) => x.id === id)!;
+      pending = pending.filter((x) => x.id !== id);
+      const u: AdminUser = { ...alex, id: "u3", email: r.email, name: r.name, role: b.role, identities: [], pendingCodes: { count: 1, expiresAt: Date.now() + 3600_000 } };
+      users.push(u);
+      return { signup: { ...r, status: "approved" }, user: u, code: CODE, expiresAt: Date.now() + b.ttlMinutes * 60_000, emailed: false, sso: [{ id: "github", label: "GitHub", type: "github" }] };
+    }),
+    rejectSignup: jest.fn(async (id: string) => {
+      const r = pending.find((x) => x.id === id)!;
+      pending = pending.filter((x) => x.id !== id);
+      return { ...r, status: "rejected" };
+    }),
     users: jest.fn(async () => users.map((u) => ({ ...u }))),
     createUser: jest.fn(async (b: { email: string; name?: string; role: AdminUser["role"] }) => {
       const u: AdminUser = { ...alex, id: "u2", email: b.email, name: b.name ?? "x", role: b.role, identities: [], pendingCodes: null };
@@ -68,8 +95,8 @@ function fakeApi(list: AdminUser[]) {
   };
 }
 
-async function open(list: AdminUser[]) {
-  const api = fakeApi(list);
+async function open(list: AdminUser[], requests: SignupRequest[] = []) {
+  const api = fakeApi(list, requests);
   const user = userEvent.setup();
   await render(<UsersAdmin api={api as unknown as SuperBotApi} meId="operator" onBack={jest.fn()} />);
   await screen.findByLabelText("User Alex");
@@ -227,6 +254,59 @@ describe("UsersAdmin", () => {
     await user.press(screen.getByText("Disable"));
     expect(api.patchUser).not.toHaveBeenCalled();
     expect(screen.getByText(/way back in/)).toBeOnTheScreen();
+  });
+
+  it("approves a request into a user and shows their code once", async () => {
+    const { api, user } = await open([owner, alex], [ada]);
+    const row = within(await screen.findByLabelText("Request from Ada Lovelace"));
+    expect(row.getByText("ada@example.com")).toBeOnTheScreen();
+    expect(screen.getByText("Requests · 1")).toBeOnTheScreen();
+    await user.press(screen.getByLabelText("Request from Ada Lovelace"));
+    expect(screen.getByText(/prefers GitHub/)).toBeOnTheScreen();
+    expect(screen.getByRole("radio", { name: "3 days", checked: true })).toBeOnTheScreen();
+    await user.press(screen.getByRole("radio", { name: "Read-only" }));
+    await user.press(screen.getByText("Approve"));
+
+    expect(api.approveSignup).toHaveBeenCalledWith("su1", { role: "readonly", ttlMinutes: 3 * 24 * 60 });
+    const reveal = within(await screen.findByTestId("code-reveal"));
+    expect(reveal.getByTestId("code-value")).toHaveTextContent(CODE);
+    expect(screen.getByText(/link their GitHub account/)).toBeOnTheScreen();
+    expect(screen.queryByText(/^Scout/)).not.toBeOnTheScreen();
+
+    await user.press(reveal.getByText("Done"));
+    expect(screen.queryByText(CODE)).not.toBeOnTheScreen();
+    expect(screen.queryByTestId("signup-requests")).not.toBeOnTheScreen();
+    expect(await screen.findByLabelText("User Ada Lovelace")).toBeOnTheScreen();
+    expect(await screen.findByText(/^Scout/)).toBeOnTheScreen();
+  });
+
+  it("rejects a request with a reason, after asking", async () => {
+    const { api, user } = await open([owner, alex], [ada]);
+    await user.press(await screen.findByLabelText("Request from Ada Lovelace"));
+    await user.type(screen.getByLabelText("Reason"), "Not a customer");
+    await user.press(screen.getByText("Reject"));
+    expect(mockConfirm).toHaveBeenCalled();
+    expect(api.rejectSignup).toHaveBeenCalledWith("su1", "Not a customer");
+    expect(api.approveSignup).not.toHaveBeenCalled();
+    await act(async () => {});
+    expect(screen.queryByTestId("signup-requests")).not.toBeOnTheScreen();
+  });
+
+  it("won't approve a request whose email is a user's already", async () => {
+    const { user } = await open([owner, alex], [{ ...ada, existingUser: true }]);
+    expect(await screen.findByText("Has an account")).toBeOnTheScreen();
+    await user.press(screen.getByLabelText("Request from Ada Lovelace"));
+    expect(screen.getByText(/exists already/)).toBeOnTheScreen();
+    expect(screen.queryByText("Approve")).toBeNull();
+  });
+
+  it("shows no requests on a server from before sign-ups", async () => {
+    const api = fakeApi([owner, alex], [ada]);
+    api.signups.mockRejectedValueOnce(new ApiError("Not found", 404));
+    await render(<UsersAdmin api={api as unknown as SuperBotApi} meId="operator" onBack={jest.fn()} />);
+    await screen.findByLabelText("User Alex");
+    expect(screen.queryByTestId("signup-requests")).toBeNull();
+    expect(screen.queryByText("Not found")).toBeNull();
   });
 
   it("searches by name, email, role, and provider", () => {

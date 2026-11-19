@@ -90,5 +90,5 @@ There is no mail service, so nothing is sent. Every point where an email would g
 - Sending email (plug into `notify`).
 - Letting people link their own SSO identity at first sign-in, instead of an admin linking it.
 - Retention and purging of sign-up requests.
-- A Signups screen in the client's admin area (the admin portal is being built separately). Until then, use `botctl signup` or the API.
+- A Signups screen in the client's admin area. Since built: **Requests** in the admin portal ([ADR 0021](0021-admin-portal.md)).
 - Self-serve tenants and billing (M3/M4).

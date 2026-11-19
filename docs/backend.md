@@ -168,7 +168,7 @@ People are users with a role: **admin** (everything), **member** (use and manage
 
 - **Owner**: made on first start as admin `operator` (name `USER_NAME`, email `OWNER_EMAIL`). `AUTH_PASSWORD` signs in as the owner (break-glass) while `AUTH_BREAK_GLASS` is on, the default. Set `AUTH_BREAK_GLASS=0` to ignore the password once admins sign in another way.
 - **Everyone else**: signs in with Microsoft Entra ID, Google, GitHub, Apple, any OpenID Connect IdP (Okta, Keycloak, Auth0, …), or a SAML IdP (ADFS, Okta, …) through a Keycloak bridge when set up, several at once if you like ([Entra](sso/entra.md), [Google](sso/google.md), [GitHub](sso/github.md), [Apple](sso/apple.md), [OIDC](sso/oidc.md), [SAML](sso/saml.md), [ADR 0014](adr/0014-oidc-sso-entra.md), [ADR 0016](adr/0016-sso-multi-provider.md), [ADR 0018](adr/0018-sso-github-apple.md), [ADR 0020](adr/0020-saml-bridge.md)): an admin links their account at each IdP to a user (`botctl user link`), or just-in-time sign-up makes one. Email never links accounts. Or an admin gives them a one-time sign-in code, which they enter in the web app or client. Codes are single use and expire (default 1 hour).
-- **Admin portal**: admins manage all of this in the app too (`/app/`, **Users** in the sidebar): add people, give them a one-time code (1 hour, 24 hours, or 7 days) with a ready-to-send invite and link, change roles, disable, sign out everywhere, link SSO accounts, and see each person's last sign-in and Bot access. Design: [ADR 0021](adr/0021-admin-portal.md).
+- **Admin portal**: admins manage all of this in the app too (`/app/`, **Users** in the sidebar): approve or reject [requests for access](#sign-ups), add people, give them a one-time code (1 hour, 24 hours, or 7 days) with a ready-to-send invite and link, change roles, disable, sign out everywhere, link SSO accounts, and see each person's last sign-in and Bot access. Design: [ADR 0021](adr/0021-admin-portal.md).
 - **Sessions**: the web app gets an HttpOnly cookie, the client and `botctl` a bearer token. They end after `SESSION_IDLE_TIMEOUT` without use (default `7d`) or `SESSION_MAX_AGE` after sign-in (default `30d`), on logout, or when an admin revokes them or disables the user. Only hashes are stored.
 
 ```sh
@@ -183,7 +183,7 @@ botctl user link alex@example.com entra <object-id> | botctl user identities ale
 
 ### Sign-ups
 
-People ask for access on the get-started page. An admin approves or rejects each request; approving makes the user and a one-time sign-in code (3 days by default), shown once. **No email is sent**: hand the code over yourself. Design: [ADR 0022](adr/0022-landing-and-signups.md).
+People ask for access on the get-started page. An admin approves or rejects each request; approving makes the user and a one-time sign-in code (3 days by default), shown once. **No email is sent**: hand the code over yourself. Design: [ADR 0022](adr/0022-landing-and-signups.md). In the app, pending requests are under **Requests** at the top of **Users** ([ADR 0021](adr/0021-admin-portal.md)); from a shell:
 
 ```sh
 botctl signup list                                  # pending; or approved, rejected, all

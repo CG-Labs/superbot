@@ -37,6 +37,18 @@ Existing routes stay; additions are small and backward compatible:
 
 Every change is audited with the existing `user.*` actions (`user.created`, `user.updated`, `user.role_changed`, `user.disabled`, `user.enabled`, `user.login_code_created` with `{ttlMinutes, replaced?}`, `user.identity_linked`, `user.identity_unlinked`, `session.revoked`, `session.revoked_all`), and ADR 0019 puts the admin's role, sign-in method, IdP, and session on each.
 
+### Requests for access (ADR 0022)
+
+Approved sign-ups ([ADR 0022](0022-landing-and-signups.md)) are how most people will arrive, so pending requests sit at the top of the Users list as **Requests**. The portal adds no server API for them; it uses `/api/signups` as `botctl signup` does, and follows that model rather than adding a second one:
+
+- **Approve** picks a role (member by default) and how long the code lasts (24 hours, 3 days, or 7 days; 3 days by default, like `botctl`). The server makes the user and the code in one step, and the portal shows the code with the same once-only panel, link, and invite as **Add user**. The new user opens once the panel closes. When the approval names SSO providers that fit, the panel says to link one from the user's page; email still never links accounts.
+- **Reject** asks first and takes an optional reason that only admins see.
+- A request whose email is already a user's says so and offers only Reject, matching the server's 409; give that person a code from their page instead.
+- Approving and rejecting are audited by the server (`signup.approved` with `user.created` and `user.login_code_created`, `signup.rejected`). **Add user** stays for people who didn't ask.
+- Servers from before sign-ups answer 404, and the section stays hidden.
+
+`issue_code` is shared: the portal's `replace: true` and a sign-up's approval make codes through the same function, so both are hashed, audited, and replaced the same way.
+
 ### Sign-in codes
 
 The admin picks 1 hour, 24 hours, or 7 days when adding someone or later. The code is shown once, with **Copy code**, **Copy link**, and **Copy invite**: a short message with the app URL, the server URL, the code, and when it expires. On native, copy opens the share sheet (no new native dependency). Closing the panel forgets the code; the server only has its hash, so it can't be shown again. The list shows "Code waiting" until it's used or expires.
@@ -54,7 +66,7 @@ Why this is safe enough to ship:
 
 ## Consequences
 
-- Admins can onboard a person from the app in one step and see whether they have signed in, how, and what they can reach.
+- Admins can onboard a person from the app in one step, or approve their request for access, and see whether they have signed in, how, and what they can reach.
 - One extra list query per page load for identities and waiting codes; fine at team sizes.
 - Old databases get last sign-ins from sessions still kept; users whose sessions were pruned show "Never" until they sign in again.
 - Deferred: the portal in legacy `web/`, an audit view in the Expo client (each user's recent sign-ins from `/api/audit`), bulk invites, and email delivery of invites.

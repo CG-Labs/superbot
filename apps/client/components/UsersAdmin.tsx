@@ -16,6 +16,7 @@ import { fetchSsoProviders, type SsoProvider } from "../src/sso";
 import { colors } from "../src/theme";
 import type { AdminUser } from "../src/types";
 import { InviteUserForm } from "./InviteUserForm";
+import { SignupRequests } from "./SignupRequests";
 import { UserDetail } from "./UserDetail";
 
 interface Props {
@@ -64,7 +65,7 @@ function UserRow({ u, providers, selected, onPress }: { u: AdminUser; providers:
   );
 }
 
-/** The admin portal: people, their roles, sign-in codes, sessions, SSO links, and Bot access (ADR 0021). */
+/** The admin portal: requests for access, people, their roles, sign-in codes, sessions, SSO links, and Bot access (ADR 0021, 0022). */
 export function UsersAdmin({ api, meId, onBack }: Props) {
   const { width } = useWindowDimensions();
   const wide = width >= 900;
@@ -128,6 +129,13 @@ export function UsersAdmin({ api, meId, onBack }: Props) {
           {error ? <Text style={styles.error}>{error}</Text> : null}
           {users == null && !error ? <ActivityIndicator color={colors.textDim} style={{ marginTop: 20 }} /> : null}
           <ScrollView contentContainerStyle={{ gap: 4, paddingBottom: 24 }}>
+            <SignupRequests
+              api={api}
+              onApproved={(id) => {
+                setSelectedId(id);
+                void load();
+              }}
+            />
             {list.map((u) => (
               <UserRow key={u.id} u={u} providers={providers} selected={u.id === selectedId} onPress={() => setSelectedId(u.id)} />
             ))}

@@ -141,6 +141,34 @@ export interface LoginCode {
   expiresAt: number;
 }
 
+/** A request for access from the landing page (ADR 0022), as `/api/signups` lists it. Admins only. */
+export interface SignupRequest {
+  id: string;
+  name: string;
+  email: string;
+  company: string;
+  teamSize: string;
+  useCase: string;
+  /** The sign-in they'd like: "microsoft", "google", "github", "apple", or "other". */
+  signIn: string;
+  status: "pending" | "approved" | "rejected";
+  createdAt: number;
+  decidedAt?: number | null;
+  reason?: string | null;
+  userId?: string | null;
+  /** A user has this email already, so approving would fail. */
+  existingUser: boolean;
+}
+
+/** `POST /api/signups/:id/approve`: the new user and their code, shown once. */
+export interface SignupApproval extends LoginCode {
+  signup: SignupRequest;
+  user: AdminUser;
+  /** Configured SSO providers that fit the request; link one so they can skip codes. */
+  sso: { id: string; label: string; type: string }[];
+  emailed: boolean;
+}
+
 /** `GET /api/sessions?user=` */
 export interface SessionView {
   id: string;

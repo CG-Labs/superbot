@@ -8,6 +8,22 @@ export const CODE_TTLS = [
   { label: "7 days", minutes: 7 * 24 * 60 },
 ] as const;
 
+/** Approving a sign-up defaults to 3 days, like `botctl signup approve`: the code is handed over by hand. */
+export const APPROVAL_TTLS = [
+  { label: "24 hours", minutes: 24 * 60 },
+  { label: "3 days", minutes: 3 * 24 * 60 },
+  { label: "7 days", minutes: 7 * 24 * 60 },
+] as const;
+
+/** What the get-started form calls each sign-in choice. */
+export const SIGN_IN_CHOICES: Record<string, string> = {
+  microsoft: "Microsoft",
+  google: "Google",
+  github: "GitHub",
+  apple: "Apple",
+  other: "Other (OIDC or SAML)",
+};
+
 export const ROLES: { role: Role; label: string; hint: string }[] = [
   { role: "admin", label: "Admin", hint: "Everything, including users, policy, and the audit log" },
   { role: "member", label: "Member", hint: "Use and manage Bots and routines, decide approvals" },

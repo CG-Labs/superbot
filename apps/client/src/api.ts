@@ -14,6 +14,8 @@ import type {
   Routine,
   ServerConfig,
   SessionView,
+  SignupApproval,
+  SignupRequest,
   UserBots,
   UserIdentity,
   Visibility,
@@ -237,6 +239,22 @@ export class SuperBotApi {
 
   async userBots(id: string): Promise<UserBots> {
     return this.request<UserBots>("GET", `/api/users/${encodeURIComponent(id)}/bots`);
+  }
+
+  // Requests for access from the landing page: admins only (ADR 0022).
+
+  async signups(status: SignupRequest["status"] | "all" = "pending"): Promise<SignupRequest[]> {
+    return this.request<SignupRequest[]>("GET", `/api/signups?status=${status}`);
+  }
+
+  /** Makes the user and a one-time code, returned once. */
+  async approveSignup(id: string, body: { role: Role; ttlMinutes: number }): Promise<SignupApproval> {
+    return this.request<SignupApproval>("POST", `/api/signups/${encodeURIComponent(id)}/approve`, body);
+  }
+
+  /** The reason is for admins; nobody is told. */
+  async rejectSignup(id: string, reason?: string): Promise<SignupRequest> {
+    return this.request<SignupRequest>("POST", `/api/signups/${encodeURIComponent(id)}/reject`, { reason: reason || null });
   }
 
   eventsUrl(): string {
