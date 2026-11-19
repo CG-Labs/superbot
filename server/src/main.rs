@@ -27,7 +27,6 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 type AppState = Arc<App>;
 
-static PASSWORD: OnceLock<String> = OnceLock::new();
 static WEB_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 const COLORS: [&str; 11] = ["#f5f5f5", "#9a6b3f", "#e5484d", "#e8702e", "#e9a23b", "#4cc06a", "#4fb5a5", "#3b82f6", "#8b5cf6", "#e64a9c", "#7a7a7a"];
@@ -44,8 +43,16 @@ pub fn random_bytes(n: usize) -> Vec<u8> {
     b
 }
 
+fn random_hex(n: usize) -> String {
+    random_bytes(n).iter().map(|x| format!("{x:02x}")).collect()
+}
+
 pub fn short_id() -> String {
-    random_bytes(4).iter().map(|x| format!("{x:02x}")).collect()
+    random_hex(4)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    ["127.0.0.1", "localhost", "::1"].contains(&host)
 }
 
 fn pick<'a>(a: &[&'a str]) -> &'a str {
@@ -58,15 +65,17 @@ async fn main() {
     let host = env("HOST", "127.0.0.1");
     let password = env("AUTH_PASSWORD", "");
     let default_harness = env("DEFAULT_HARNESS", "claude");
-    if password.is_empty() && !["127.0.0.1", "localhost", "::1"].contains(&host.as_str()) {
-        eprintln!("Refusing to listen on a public address without AUTH_PASSWORD.");
-        std::process::exit(1);
-    }
+    let allow_no_auth = auth_startup(&host, &password);
     if adapters::get(&default_harness).is_none() {
         eprintln!("DEFAULT_HARNESS must be one of: {}", adapters::NAMES.join(", "));
         std::process::exit(1);
     }
-    PASSWORD.set(password).unwrap();
+    let auth_state = Arc::new(Auth {
+        password: password.clone(),
+        allow_no_auth,
+        bot_token: random_hex(24),
+        hosts: allowed_hosts(&host, port, &env("ALLOWED_HOSTS", "")),
+    });
     WEB_DIR.set(std::env::var("WEB_DIR").ok().map(PathBuf::from)).unwrap();
 
     let abs = |p: String| std::path::absolute(p).expect("bad path");
@@ -84,7 +93,7 @@ async fn main() {
         // `botctl` ships next to `botd`.
         bin_dir: std::env::current_exe().unwrap().parent().unwrap().to_path_buf(),
         api_url: format!("http://127.0.0.1:{port}"),
-        bot_token: random_bytes(24).iter().map(|x| format!("{x:02x}")).collect(),
+        bot_token: auth_state.bot_token.clone(),
         run_timeout: Duration::from_secs(60 * env("RUN_TIMEOUT_MINUTES", "60").parse::<u64>().unwrap_or(60)),
         default_harness,
     }, screens);
@@ -111,10 +120,13 @@ async fn main() {
         .route("/ask", post(ask))
         .route("/handoff", post(handoff));
     let router = Router::new()
-        .nest("/api", api)
-        .fallback(get(web))
-        .layer(middleware::from_fn_with_state(app.clone(), auth))
         .route("/healthz", get(|| async { Json(json!({ "ok": true })) }))
+        .merge(
+            Router::new()
+                .nest("/api", api)
+                .fallback(get(web))
+                .layer(middleware::from_fn_with_state(auth_state, auth)),
+        )
         .layer(cors_layer())
         .with_state(app.clone());
 
@@ -208,15 +220,91 @@ fn cors_layer() -> CorsLayer {
 
 // Auth: browser login with AUTH_PASSWORD (any username), or the Bots' token for `botctl`.
 
-async fn auth(State(app): State<AppState>, req: Request, next: Next) -> Response {
+struct Auth {
+    password: String,
+    /// Only when ALLOW_NO_AUTH=1 and loopback: empty password does not skip login on its own.
+    allow_no_auth: bool,
+    bot_token: String,
+    /// Host headers we answer to, lowercase.
+    hosts: Vec<String>,
+}
+
+/// Refuse to start without AUTH_PASSWORD unless ALLOW_NO_AUTH=1 on loopback only.
+fn auth_startup(host: &str, password: &str) -> bool {
+    if !password.is_empty() {
+        return false;
+    }
+    if !is_loopback_host(host) {
+        eprintln!("Refusing to listen on a public address without AUTH_PASSWORD.");
+        std::process::exit(1);
+    }
+    if env("ALLOW_NO_AUTH", "") == "1" {
+        eprintln!(
+            "WARNING: ALLOW_NO_AUTH=1 with empty AUTH_PASSWORD on {host}. \
+             Any local process that passes the Host allowlist can use the API without login. \
+             Set AUTH_PASSWORD for real use."
+        );
+        return true;
+    }
+    eprintln!(
+        "Refusing to start: set AUTH_PASSWORD (recommended), or set ALLOW_NO_AUTH=1 only for \
+         loopback development (HOST=127.0.0.1, localhost, or ::1)."
+    );
+    std::process::exit(1);
+}
+
+/// `host:port`, with brackets for IPv6.
+fn host_port(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// The server's own address and loopback names on its port, plus ALLOWED_HOSTS (comma separated).
+pub fn allowed_hosts(host: &str, port: u16, extra: &str) -> Vec<String> {
+    let names = [host, "localhost", "127.0.0.1", "::1"];
+    let mut own: Vec<String> = names.map(|h| host_port(h, port)).into();
+    if port == 80 {
+        own.extend(names.map(|h| {
+            if h.contains(':') {
+                format!("[{h}]")
+            } else {
+                h.to_owned()
+            }
+        }));
+    }
+    let extra = extra
+        .split(',')
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(String::from);
+    own.into_iter()
+        .chain(extra)
+        .map(|h| h.to_ascii_lowercase())
+        .collect()
+}
+
+async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !a.hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+        return (StatusCode::FORBIDDEN, "Unknown Host. Add it to ALLOWED_HOSTS.").into_response();
+    }
     let h = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
-    let password = PASSWORD.get().unwrap();
-    let ok = password.is_empty()
-        || h.strip_prefix("Bearer ").is_some_and(|t| same(t.as_bytes(), app.cfg.bot_token.as_bytes()))
-        || h.strip_prefix("Basic ").and_then(base64_decode).is_some_and(|creds| {
-            let pass = creds.splitn(2, |b| *b == b':').nth(1).unwrap_or_default();
-            same(pass, password.as_bytes())
-        });
+    let ok = (a.allow_no_auth && a.password.is_empty())
+        || h.strip_prefix("Bearer ")
+            .is_some_and(|t| same(t.as_bytes(), a.bot_token.as_bytes()))
+        || h.strip_prefix("Basic ")
+            .and_then(base64_decode)
+            .is_some_and(|creds| {
+                let pass = creds.splitn(2, |b| *b == b':').nth(1).unwrap_or_default();
+                !a.password.is_empty() && same(pass, a.password.as_bytes())
+            });
     if ok {
         next.run(req).await
     } else {
@@ -509,4 +597,107 @@ async fn delete_routine(State(app): State<AppState>, Path(id): Path<String>) -> 
     app.db.routine(&id).ok_or_else(|| not_found("Routine"))?;
     app.db.delete_routine(&id);
     Ok(Json(json!({ "ok": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn serve(password: &str, allow_no_auth: bool, extra_hosts: &str) -> u16 {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = Arc::new(Auth {
+            password: password.into(),
+            allow_no_auth,
+            bot_token: "bot-token".into(),
+            hosts: allowed_hosts("127.0.0.1", port, extra_hosts),
+        });
+        let router = Router::new()
+            .route("/api/state", get(|| async { "ok" }))
+            .layer(middleware::from_fn_with_state(state, super::auth));
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        port
+    }
+
+    async fn status(port: u16, host: &str, authorization: &str) -> u16 {
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let auth = if authorization.is_empty() {
+            String::new()
+        } else {
+            format!("Authorization: {authorization}\r\n")
+        };
+        let req = format!("GET /api/state HTTP/1.1\r\nHost: {host}\r\n{auth}Connection: close\r\n\r\n");
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut res = String::new();
+        s.read_to_string(&mut res).await.unwrap();
+        res.split_whitespace().nth(1).unwrap().parse().unwrap()
+    }
+
+    fn basic(password: &str) -> String {
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for c in format!("anyone:{password}").as_bytes().chunks(3) {
+            let n = c.iter().enumerate().fold(0u32, |n, (i, b)| n | ((*b as u32) << (16 - 8 * i)));
+            for i in 0..4 {
+                out.push(if i <= c.len() {
+                    T[((n >> (18 - 6 * i)) & 63) as usize] as char
+                } else {
+                    '='
+                });
+            }
+        }
+        format!("Basic {out}")
+    }
+
+    #[test]
+    fn startup_requires_password_or_opt_out() {
+        assert!(!is_loopback_host("0.0.0.0"));
+        assert!(is_loopback_host("127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn spoofed_host_is_refused() {
+        let port = serve("hunter2", false, "bots.example.com").await;
+        assert_eq!(status(port, "attacker.example", &basic("hunter2")).await, 403);
+        assert_eq!(status(port, &format!("attacker.example:{port}"), &basic("hunter2")).await, 403);
+        assert_eq!(status(port, "127.0.0.1:1", &basic("hunter2")).await, 403);
+    }
+
+    #[tokio::test]
+    async fn own_hosts_and_login() {
+        let port = serve("hunter2", false, "bots.example.com").await;
+        let host = format!("127.0.0.1:{port}");
+        assert_eq!(status(port, &host, &basic("hunter2")).await, 200);
+        assert_eq!(status(port, &host, &basic("wrong")).await, 401);
+        assert_eq!(status(port, &host, "Bearer bot-token").await, 200);
+        assert_eq!(status(port, "bots.example.com", &basic("hunter2")).await, 200);
+    }
+
+    #[tokio::test]
+    async fn empty_password_requires_opt_in_even_on_loopback() {
+        let port = serve("", false, "").await;
+        let host = format!("127.0.0.1:{port}");
+        assert_eq!(status(port, &host, "").await, 401);
+        assert_eq!(status(port, &host, &basic("")).await, 401);
+    }
+
+    #[tokio::test]
+    async fn allow_no_auth_permits_anonymous_on_loopback() {
+        let port = serve("", true, "").await;
+        let host = format!("127.0.0.1:{port}");
+        assert_eq!(status(port, &host, "").await, 200);
+    }
+
+    #[test]
+    fn allowed_host_names() {
+        assert_eq!(
+            allowed_hosts("::1", 3000, "")[0..4],
+            ["[::1]:3000", "localhost:3000", "127.0.0.1:3000", "[::1]:3000"]
+        );
+        let list = allowed_hosts("127.0.0.1", 3000, " Bots.Example.com ,");
+        assert!(list.iter().any(|h| h == "bots.example.com"));
+    }
 }

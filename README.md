@@ -69,7 +69,7 @@ set -a; . ./.env; set +a
 
 Then open the web app and say hi to SuperBot. Install and log in to the agent CLIs you want (`claude`, `codex`, `pi`) as the same user that runs `botd`.
 
-Deploying on a VPS: see [Backend](docs/backend.md).
+**VPS (Ubuntu 22.04/24.04):** one-command install with HTTPS — [deploy/README.md](deploy/README.md). Manual steps: [Backend](docs/backend.md).
 
 **Mobile & desktop client:** cross-platform app in [`apps/client`](apps/client/) (Expo: iOS/Android via EAS, web, Electron for Windows/Linux).
 

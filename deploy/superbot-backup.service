@@ -1,0 +1,8 @@
+[Unit]
+Description=SuperBot SQLite backup
+
+[Service]
+Type=oneshot
+User=superbot
+EnvironmentFile=-/home/superbot/superbot/.env
+ExecStart=/usr/local/bin/superbot-backup /home/superbot
