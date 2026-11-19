@@ -8,7 +8,7 @@
 //! A store for Vault, Azure Key Vault, or GCP Secret Manager is another `SecretStore`
 //! added to that list. Values never leave botd except into a harness's environment;
 //! the API lists names only. Every known value is redacted from saved text, events,
-//! and the audit log (`redact`). See docs/adr/0009-secrets.md.
+//! and the audit log (`redact`). See docs/adr/0010-secrets.md.
 
 pub mod env;
 pub mod key;

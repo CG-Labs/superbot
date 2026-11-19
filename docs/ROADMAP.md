@@ -40,7 +40,7 @@ What exists in **CG-Labs/superbot** today:
 |------|---------|
 | **Auth** | Single `AUTH_PASSWORD` (Basic); optional `ALLOW_NO_AUTH` on loopback only; `ALLOWED_HOSTS`; per-start `BOT_TOKEN` for `botctl`. No user table, no SSO, no RBAC. |
 | **Client** | Login, SSE chat, bots CRUD, models/effort, routine create/edit/delete, live screen viewer (iframe / WebView) with take over, handoff cards and alerts; no push or biometric lock; placeholder EAS `projectId`; template branding. |
-| **Server** | SQLite single-tenant schema; harnesses run with their own prompts off, gated by the SuperBot **policy engine and approval queue** (default **ask** on fresh installs; [ADR 0007](adr/0007-approvals.md)); Vault **not built** (`docs/backend.md`). |
+| **Server** | SQLite single-tenant schema; harnesses run with their own prompts off, gated by the SuperBot **policy engine and approval queue** (default **ask** on fresh installs; [ADR 0007](adr/0007-approvals.md)); secrets from env/`_FILE` or saved encrypted in SQLite (XChaCha20-Poly1305, master key outside `DATA_DIR`), redacted from chats, events, and audit ([ADR 0010](adr/0010-secrets.md)); Vault/KMS stores **not built** (trait seam only). |
 | **Deploy** | Ubuntu bash installer, systemd, Caddy, daily SQLite backup timer; Docker Compose (`Dockerfile` + `deploy/docker/`: `botd`, Caddy, backup sidecar), smoke-tested in CI ([ADR 0006](adr/0006-docker-compose.md)). |
 | **Multi-tenancy** | One deployment = one org in practice (`DATA_DIR`, shared `WORKSPACE_DIR`). |
 | **Observability** | `journalctl`, healthz; no metrics/tracing product. |
