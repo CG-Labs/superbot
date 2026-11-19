@@ -118,7 +118,7 @@ Basic auth may remain for **break-glass** and **self-host hobby** tiers only, be
 | | |
 |--|--|
 | **Goal** | First **sellable team** product: real users and familiar sign-in. |
-| **Status** | **In progress.** Slice 1 (**done**, [ADR 0012](adr/0012-users-sessions-rbac.md)): user store, server-side sessions with TTLs and revoke, RBAC v1 on the API, break-glass, `botctl` user/session commands, auth audit events, client token flow. Next: OIDC providers on this user model; then SAML bridge, SCIM stub, bot ACLs. |
+| **Status** | **In progress.** Slice 1 in review ([#61](https://github.com/CG-Labs/superbot/pull/61), [ADR 0012](adr/0012-users-sessions-rbac.md)): user store, server-side sessions with TTLs and revoke, RBAC v1 on the API, break-glass, `botctl` user/session commands, auth audit events, client token flow. Next: OIDC providers on this user model; then SAML bridge, SCIM stub, bot ACLs. |
 | **Scope** | User store; JWT/session cookies for client; **Sign in with Apple**, **GitHub**, **Microsoft Entra ID**, **Google** (OIDC/OAuth); **generic OIDC** connector (Okta and others) and a SAML bridge where an IdP needs it; account linking (several IdPs per user); RBAC v1 (org admin, member, read-only); bot ACLs; migrate from `AUTH_PASSWORD` to SSO-primary with break-glass; session TTL and admin revoke; audit log with per-user actors and IdP; SCIM **design + stub** (full SCIM in M5). Parallel tracks: Hermes Agent harness adapter ([ADR 0011](adr/0011-hermes-agent-backend.md), option a); confirm the interface proposal (Expo client primary, `web/` as admin fallback). |
 | **Exit criteria** | Columbia org signs in with SSO only; each of Apple, GitHub, Entra, Google, and one generic OIDC IdP (e.g. Okta) works end to end; two roles enforced on API; shared vs private bots; pen-test style review of auth bypass; client uses token flow (no password in SecureStore for SSO tenants). |
 | **Size** | **XL** |
@@ -272,8 +272,8 @@ No certification claims until audits complete.
 
 | Horizon | Focus |
 |---------|--------|
-| **Now** | Finish M1: EAS `projectId`, brand assets; approvals follow-ups ([list](approvals-followups.md)); owner to accept ADR 0011 and confirm the interface proposal |
-| **Next** | Multi-user data model; SSO with Apple, GitHub, Entra, Google, generic OIDC; RBAC v1; Hermes adapter |
+| **Now** | Finish M1: EAS `projectId`, brand assets; approvals follow-ups ([list](approvals-followups.md)); owner to accept ADR 0011 and confirm the interface proposal; M2 slice 1: user store, sessions, RBAC v1 ([#61](https://github.com/CG-Labs/superbot/pull/61)) |
+| **Next** | SSO with Apple, GitHub, Entra, Google, generic OIDC on the new user model; bot ACLs; Hermes adapter |
 | **Later** | Linode control plane with one machine per user; per-user tiers and hidden model routing; public launch + stores; SCIM; SOC 2 |
 
 ---
