@@ -1,0 +1,87 @@
+# SuperBot on Docker Compose: botd + Caddy (HTTPS) + daily SQLite backups.
+# Quick start (from this folder):
+#   ./init.sh                      # writes .env with a random AUTH_PASSWORD
+#   docker compose up -d --build
+# Docs: deploy/README.md ("Docker Compose (supported)").
+
+name: superbot
+
+x-superbot-image: &superbot-image
+  image: ${SUPERBOT_IMAGE:-superbot:local}
+  # Built locally from this checkout; never pulled from a registry under this name.
+  pull_policy: never
+  restart: unless-stopped
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
+services:
+  botd:
+    <<: *superbot-image
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        HARNESSES: ${SUPERBOT_HARNESSES-claude codex pi}
+    env_file: ${SUPERBOT_ENV_FILE:-.env}
+    environment:
+      # Fixed by the image layout; .env cannot override these.
+      HOST: 0.0.0.0
+      PORT: "3000"
+      DATA_DIR: /data
+      WORKSPACE_DIR: /workspace
+      ALLOW_NO_AUTH: ""
+      AUTH_PASSWORD: ${AUTH_PASSWORD:?Set AUTH_PASSWORD in deploy/docker/.env (run ./init.sh)}
+      # Caddy forwards the browser's Host header; botd answers only to these names.
+      ALLOWED_HOSTS: ${SUPERBOT_DOMAIN:-localhost},${ALLOWED_HOSTS:-}
+    volumes:
+      - data:/data
+      - workspace:/workspace
+      - home:/home/superbot
+    # Not published: reachable only through Caddy on the compose network.
+    expose: ["3000"]
+    stop_grace_period: 30s
+
+  caddy:
+    image: ${CADDY_IMAGE:-caddy:2}
+    restart: unless-stopped
+    depends_on:
+      botd:
+        condition: service_healthy
+    environment:
+      # A hostname gets automatic HTTPS (Let's Encrypt); ":80" serves plain HTTP for localhost.
+      SUPERBOT_SITE: ${SUPERBOT_DOMAIN:-:80}
+    ports:
+      - "${SUPERBOT_BIND:-127.0.0.1}:${SUPERBOT_HTTP_PORT:-80}:80"
+      - "${SUPERBOT_BIND:-127.0.0.1}:${SUPERBOT_HTTPS_PORT:-443}:443"
+      - "${SUPERBOT_BIND:-127.0.0.1}:${SUPERBOT_HTTPS_PORT:-443}:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+
+  backup:
+    <<: *superbot-image
+    command: ["superbot-backup", "--loop"]
+    depends_on:
+      botd:
+        condition: service_healthy
+    environment:
+      SUPERBOT_BACKUP_INTERVAL: ${SUPERBOT_BACKUP_INTERVAL:-86400}
+      SUPERBOT_BACKUP_RETENTION_DAYS: ${SUPERBOT_BACKUP_RETENTION_DAYS:-14}
+    volumes:
+      - data:/data
+      - backups:/backups
+    network_mode: none
+    healthcheck:
+      disable: true
+
+volumes:
+  data:
+  workspace:
+  home:
+  backups:
+  caddy-data:
+  caddy-config:

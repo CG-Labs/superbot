@@ -1,0 +1,8 @@
+# SUPERBOT_SITE is SUPERBOT_DOMAIN (automatic HTTPS) or ":80" (plain HTTP, localhost only by default).
+{$SUPERBOT_SITE} {
+	encode gzip
+	reverse_proxy botd:3000 {
+		# /api/events is an SSE stream: never buffer.
+		flush_interval -1
+	}
+}
