@@ -176,13 +176,11 @@ fn honeypot(v: &Value) -> bool {
     }
 }
 
-const fn sso_type(sign_in: &str) -> &'static str {
-    match sign_in.as_bytes() {
-        b"microsoft" => "entra",
-        b"google" => "google",
-        b"github" => "github",
-        b"apple" => "apple",
-        _ => "oidc",
+fn picked(sign_in: &str, provider_type: &str) -> bool {
+    match sign_in {
+        "microsoft" => provider_type == "entra",
+        "other" => matches!(provider_type, "oidc" | "saml"),
+        s => provider_type == s,
     }
 }
 
@@ -190,12 +188,11 @@ const fn sso_type(sign_in: &str) -> &'static str {
 /// take their email's domain, and the ones of the kind they picked that don't go by
 /// domain or take theirs.
 pub fn sso_hint<'a>(providers: impl IntoIterator<Item = &'a Provider>, email: &str, sign_in: &str) -> Vec<Value> {
-    let want = sso_type(sign_in);
     providers
         .into_iter()
         .filter(|p| match p.takes_email(email) {
             Some(takes) => takes,
-            None => p.type_name() == want,
+            None => picked(sign_in, p.type_name()),
         })
         .map(|p| json!({ "id": p.id, "label": p.label, "type": p.type_name() }))
         .collect()
@@ -426,12 +423,14 @@ mod tests {
         let entra = p("work", Kind::Entra { authority: "https://login.microsoftonline.com".into(), tenant: "organizations".into(), allowed: vec![] });
         let google = p("g", Kind::Google { issuer: "https://accounts.google.com".into(), hosted_domains: vec!["example.com".into()] });
         let okta = p("okta", Kind::Oidc { issuer: "https://idp.example".into(), map: ClaimMap::default(), allowed_domains: vec![] });
-        let all = [&entra, &google, &okta];
+        let adfs = p("adfs", Kind::Saml { issuer: "https://broker.example".into(), entity_id: "https://adfs.example".into(), alias: "adfs".into(), map: ClaimMap::default(), allowed_domains: vec!["corp.example".into()] });
+        let all = [&entra, &google, &okta, &adfs];
         let ids = |email: &str, pick: &str| sso_hint(all, email, pick).iter().map(|v| v["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
         assert_eq!(ids("ada@example.com", "microsoft"), ["work", "g"], "their Workspace domain counts whatever they picked");
         assert_eq!(ids("ada@other.example", "google"), Vec::<String>::new(), "a Google provider for another domain doesn't");
         assert_eq!(ids("ada@other.example", "other"), ["okta"]);
         assert_eq!(ids("ada@other.example", "github"), Vec::<String>::new());
+        assert_eq!(ids("ada@corp.example", "microsoft"), ["work", "adfs"], "a SAML IdP for their domain counts too");
     }
 
     #[test]

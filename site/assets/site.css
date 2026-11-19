@@ -149,8 +149,6 @@ section { padding: 72px 0; }
 .security p { color: var(--text-dim); max-width: 60ch; }
 .badges { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 10px; }
 .badges li { padding: 8px 14px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface); font-size: 14px; font-weight: 600; }
-.badges .soon { color: var(--text-dim); }
-.badges .soon span { font-weight: 500; font-size: 12px; margin-left: 4px; }
 
 .closing { text-align: center; }
 .closing p { color: var(--text-dim); }

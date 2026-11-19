@@ -217,7 +217,7 @@ impl Provider {
     /// Some(false) when it isn't, None when the provider doesn't go by email domain.
     pub fn takes_email(&self, email: &str) -> Option<bool> {
         match &self.kind {
-            Kind::Google { hosted_domains: d, .. } | Kind::Oidc { allowed_domains: d, .. } | Kind::Apple { allowed_domains: d, .. } if !d.is_empty() => Some(email_in(email, d)),
+            Kind::Google { hosted_domains: d, .. } | Kind::Oidc { allowed_domains: d, .. } | Kind::Apple { allowed_domains: d, .. } | Kind::Saml { allowed_domains: d, .. } if !d.is_empty() => Some(email_in(email, d)),
             _ => None,
         }
     }
