@@ -22,8 +22,9 @@ impl std::fmt::Debug for MasterKey {
 
 impl MasterKey {
     pub fn generate() -> MasterKey {
+        use chacha20poly1305::aead::rand_core::RngCore;
         let mut k = Zeroizing::new([0u8; 32]);
-        k.copy_from_slice(&crate::random_bytes(32));
+        chacha20poly1305::aead::OsRng.fill_bytes(&mut k[..]);
         MasterKey(k)
     }
 
@@ -100,16 +101,49 @@ pub fn default_path() -> Option<PathBuf> {
     Some(base.join("superbot").join("master.key"))
 }
 
-/// Where the key file is, or would be created.
-fn file_path() -> Result<PathBuf, String> {
-    match var("SUPERBOT_MASTER_KEY_FILE") {
-        Some(p) => Ok(PathBuf::from(p)),
-        None => default_path().ok_or_else(|| "set SUPERBOT_MASTER_KEY_FILE (HOME is not set)".into()),
+/// `path` with symlinks resolved as far as it exists.
+fn resolve(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut at = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(at) {
+            return rest.iter().rev().fold(real, |p, part| p.join(part));
+        }
+        match (at.file_name(), at.parent()) {
+            (Some(name), Some(parent)) => {
+                rest.push(name);
+                at = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
     }
 }
 
+/// Refuses a key path inside `data_dir`: backups copy that folder, and must not carry the key.
+fn check_outside(path: &Path, data_dir: &Path) -> Result<(), String> {
+    let shown = path.display();
+    if path.components().any(|c| c == std::path::Component::ParentDir) {
+        return Err(format!("{shown}: use a key path without '..'"));
+    }
+    let abs = |p: &Path| if p.is_absolute() { p.to_path_buf() } else { std::env::current_dir().unwrap_or_default().join(p) };
+    if resolve(&abs(path)).starts_with(resolve(&abs(data_dir))) {
+        return Err(format!("{shown} is inside DATA_DIR ({}), which backups copy. Keep the master key elsewhere.", data_dir.display()));
+    }
+    Ok(())
+}
+
+/// Where the key file is, or would be created.
+fn file_path(data_dir: &Path) -> Result<PathBuf, String> {
+    let path = match var("SUPERBOT_MASTER_KEY_FILE") {
+        Some(p) => PathBuf::from(p),
+        None => default_path().ok_or("set SUPERBOT_MASTER_KEY_FILE (HOME is not set)")?,
+    };
+    check_outside(&path, data_dir)?;
+    Ok(path)
+}
+
 /// The configured key and where it came from, or None if there is none yet.
-pub fn locate() -> Result<Option<(MasterKey, String)>, String> {
+pub fn locate(data_dir: &Path) -> Result<Option<(MasterKey, String)>, String> {
     if let Some(text) = var("SUPERBOT_MASTER_KEY") {
         if var("SUPERBOT_MASTER_KEY_FILE").is_some() {
             return Err("set SUPERBOT_MASTER_KEY or SUPERBOT_MASTER_KEY_FILE, not both".into());
@@ -117,7 +151,7 @@ pub fn locate() -> Result<Option<(MasterKey, String)>, String> {
         let text = Zeroizing::new(text);
         return MasterKey::parse(&text).map(|k| Some((k, "SUPERBOT_MASTER_KEY".into()))).map_err(|e| format!("SUPERBOT_MASTER_KEY: {e}"));
     }
-    let path = file_path()?;
+    let path = file_path(data_dir)?;
     // symlink_metadata: a dangling symlink still counts as "there", so it is never replaced.
     if std::fs::symlink_metadata(&path).is_err() {
         return Ok(None);
@@ -126,8 +160,8 @@ pub fn locate() -> Result<Option<(MasterKey, String)>, String> {
 }
 
 /// A new key at SUPERBOT_MASTER_KEY_FILE, or the default path.
-pub fn create() -> Result<(MasterKey, String), String> {
-    let path = file_path()?;
+pub fn create(data_dir: &Path) -> Result<(MasterKey, String), String> {
+    let path = file_path(data_dir)?;
     write_new(&path).map(|k| (k, path.display().to_string()))
 }
 
@@ -165,6 +199,20 @@ mod tests {
         std::os::unix::fs::symlink(path.with_file_name("nowhere"), &link).unwrap();
         assert!(write_new(&link).is_err(), "a symlink is never followed when creating");
         assert!(!path.with_file_name("nowhere").exists());
+    }
+
+    #[test]
+    fn keys_stay_out_of_the_data_dir() {
+        let root = dir();
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::os::unix::fs::symlink(&data, root.join("alias")).unwrap();
+        for inside in [data.join("master.key"), data.join("new/master.key"), root.join("alias/master.key"), data.clone()] {
+            assert!(check_outside(&inside, &data).is_err(), "{}", inside.display());
+        }
+        assert!(check_outside(&root.join("other/../data/master.key"), &data).is_err(), "'..' is refused");
+        assert!(check_outside(&root.join("config/master.key"), &data).is_ok());
+        assert!(check_outside(&root.join("data2/master.key"), &data).is_ok(), "a sibling with the same prefix is fine");
     }
 
     #[test]

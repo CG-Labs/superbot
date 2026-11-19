@@ -76,6 +76,10 @@ pub trait SecretStore: Send + Sync {
     fn delete(&self, _name: &str) -> Result<bool, Error> {
         Err(Error::ReadOnly)
     }
+    /// True if harnesses already inherit this value from botd's own environment.
+    fn inherited(&self, _name: &str) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -122,11 +126,11 @@ impl Secrets {
         Secrets { stores }
     }
 
-    /// The value and the kind of store it came from.
-    fn find(&self, name: &str) -> Result<Option<(Secret, &'static str)>, Error> {
+    /// The value and the store it came from.
+    fn find(&self, name: &str) -> Result<Option<(Secret, &dyn SecretStore)>, Error> {
         for s in &self.stores {
             if let Some(v) = s.get(name)? {
-                return Ok(Some((v, s.kind())));
+                return Ok(Some((v, s.as_ref())));
             }
         }
         Ok(None)
@@ -168,15 +172,20 @@ impl Secrets {
         Ok(out)
     }
 
-    /// Stored secrets to add to a Bot's environment. The environment's own variables
-    /// already pass through, so only values from later stores are added, and only
-    /// where the environment doesn't set the name.
+    /// Values to add to a Bot's environment: the winning value of every name, except
+    /// those the harness already inherits (plain environment variables). So `NAME_FILE`
+    /// arrives as `NAME`, and saved secrets arrive unless the environment sets the name.
     pub fn harness_env(&self) -> Vec<(String, Secret)> {
+        let mut seen: Vec<String> = Vec::new();
         let mut out = Vec::new();
-        for s in self.stores.iter().skip(1) {
+        for s in &self.stores {
             for name in s.names().unwrap_or_default() {
+                if seen.contains(&name) || check_name(&name).is_err() {
+                    continue;
+                }
+                seen.push(name.clone());
                 match self.find(&name) {
-                    Ok(Some((v, kind))) if kind == s.kind() && check_name(&name).is_ok() => out.push((name, v)),
+                    Ok(Some((v, from))) if !from.inherited(&name) => out.push((name, v)),
                     Ok(_) => {}
                     Err(e) => eprintln!("secret {name}: {e}"),
                 }
@@ -240,7 +249,8 @@ pub fn init(db_path: &Path) -> Result<Report, String> {
             redact::register_if_random(v.expose());
         }
     }
-    let (found, mut key_source) = match key::locate()? {
+    let data_dir = db_path.parent().unwrap_or(Path::new("."));
+    let (found, mut key_source) = match key::locate(data_dir)? {
         Some((k, source)) => (Some(k), source),
         None => (None, String::new()),
     };
@@ -251,7 +261,7 @@ pub fn init(db_path: &Path) -> Result<Report, String> {
         &c,
         found,
         || {
-            let (k, source) = key::create()?;
+            let (k, source) = key::create(data_dir)?;
             k.register_redactions();
             key_source = source;
             Ok(k)
@@ -267,6 +277,9 @@ pub fn init(db_path: &Path) -> Result<Report, String> {
     let stored = secrets.stores[1].names().map_err(|e| e.to_string())?.len();
     secrets.register_all();
     let redacted = redact::scrub_rows(&c).map_err(|e| format!("database: {e}"))?;
+    if boot.sealed + redacted + boot.discarded > 0 {
+        sealed::purge_old_pages(&c).map_err(|e| format!("database: {e}"))?;
+    }
     GLOBAL.set(secrets).map_err(|_| "secrets::init ran twice".to_string())?;
     Ok(Report { key_source, created: boot.created, sealed: boot.sealed, redacted, discarded: boot.discarded, stored })
 }
@@ -294,7 +307,14 @@ mod tests {
 
     #[test]
     fn environment_wins_and_stored_values_reach_harnesses() {
-        let s = secrets(&[("GITHUB_TOKEN", "from-env-value-1"), ("AUTH_PASSWORD", "pw"), ("SUPERBOT_MASTER_KEY_FILE", "/k")]);
+        let npm = crate::db::temp_path("npm").join("token");
+        std::fs::write(&npm, "npm-from-file\n").unwrap();
+        let s = secrets(&[
+            ("GITHUB_TOKEN", "from-env-value-1"),
+            ("NPM_TOKEN_FILE", npm.to_str().unwrap()),
+            ("AUTH_PASSWORD", "pw"),
+            ("SUPERBOT_MASTER_KEY_FILE", "/k"),
+        ]);
         let stored = format!("stored-{}", crate::random_hex(8));
         s.put("GITHUB_TOKEN", "from-db-value-1").unwrap();
         let l = s.put("OPENAI_API_KEY", &stored).unwrap();
@@ -310,7 +330,11 @@ mod tests {
         assert_eq!((gh[1].store, gh[1].shadowed_by), ("sealed", Some("env")));
 
         let env: Vec<(String, String)> = s.harness_env().into_iter().map(|(k, v)| (k, v.expose().to_string())).collect();
-        assert_eq!(env, [("OPENAI_API_KEY".to_string(), stored.clone())], "env values aren't duplicated; shadowed ones aren't injected");
+        assert_eq!(
+            env,
+            [("NPM_TOKEN".to_string(), "npm-from-file".to_string()), ("OPENAI_API_KEY".to_string(), stored.clone())],
+            "files arrive under their base name; inherited and shadowed values aren't repeated"
+        );
         assert_eq!(redact::text(&stored), redact::MARK, "a saved value is redacted from then on");
 
         assert!(s.delete("OPENAI_API_KEY").unwrap());

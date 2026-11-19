@@ -88,8 +88,21 @@ pub fn scrub_rows(c: &Connection) -> rusqlite::Result<usize> {
     let tx = c.unchecked_transaction()?;
     let mut n = 0;
     for s in known() {
-        for (table, col) in [("messages", "text"), ("messages", "question"), ("approvals", "subject")] {
+        for (table, col) in [("messages", "text"), ("approvals", "subject")] {
             n += tx.execute(&format!("UPDATE {table} SET {col} = replace({col}, ?1, ?2) WHERE instr({col}, ?1) > 0"), params![s, MARK])?;
+        }
+    }
+    // Choice cards are JSON, where a secret with quotes or backslashes is escaped, so
+    // they're parsed and redacted value by value.
+    let cards: Vec<(i64, String)> = {
+        let mut s = tx.prepare("SELECT id, question FROM messages WHERE question IS NOT NULL")?;
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, raw) in cards {
+        let Ok(card) = serde_json::from_str::<Value>(&raw) else { continue };
+        let clean = value(card.clone());
+        if clean != card {
+            n += tx.execute("UPDATE messages SET question = ? WHERE id = ?", params![clean.to_string(), id])?;
         }
     }
     tx.commit()?;
@@ -152,7 +165,7 @@ mod tests {
         let path = crate::db::temp_path("scrub").join("app.sqlite");
         let db = crate::db::Db::open(&path).unwrap();
         let bot = db.create_bot("A", "#fff", "waddle", "claude", None, true);
-        let secret = unique("hunter2hunter2");
+        let secret = unique("hunter2\"hunter2\\");
         // Saved before botd knew the value, e.g. by an older version.
         let m = db.add_message(&bot.id, "bot", &format!("the key is {secret}"), Some(&json!({ "title": secret, "options": ["a"] })), false, None);
         register(&secret);

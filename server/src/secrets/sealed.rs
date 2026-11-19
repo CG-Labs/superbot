@@ -10,7 +10,7 @@ use super::key::MasterKey;
 use super::{redact, Error, Secret, SecretStore};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -36,9 +36,10 @@ impl Cipher {
     }
 
     pub fn seal(&self, context: &str, plain: &[u8]) -> String {
-        let mut out = crate::random_bytes(NONCE);
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
         let aad = aad(context);
-        let ct = self.0.encrypt(XNonce::from_slice(&out), Payload { msg: plain, aad: aad.as_bytes() }).expect("XChaCha20-Poly1305 seals any input");
+        let ct = self.0.encrypt(&nonce, Payload { msg: plain, aad: aad.as_bytes() }).expect("XChaCha20-Poly1305 seals any input");
+        let mut out = nonce.to_vec();
         out.extend(ct);
         format!("{PREFIX}{}", B64.encode(out))
     }
@@ -106,7 +107,8 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS secrets (
 /// A connection of its own to the database (WAL allows several), with the `secrets` table.
 pub fn connect(path: &Path) -> Result<Connection, String> {
     let c = Connection::open(path).map_err(|e| e.to_string())?;
-    c.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
+    // Overwrite freed space with zeros, so replaced values don't linger in free pages.
+    c.execute_batch(&format!("PRAGMA secure_delete = ON; {SCHEMA}")).map_err(|e| e.to_string())?;
     Ok(c)
 }
 
@@ -140,14 +142,38 @@ fn any_sealed(c: &Connection) -> rusqlite::Result<Option<(String, String)>> {
         .optional()
 }
 
-/// Drops every sealed value. Approval inputs keep a marker; everything else about them stays.
-fn discard(c: &Connection) -> rusqlite::Result<usize> {
+/// Drops the sealed values `keep` can't open (all of them without a key) and the key
+/// check. Approval inputs keep a marker; everything else about them stays.
+fn discard(c: &Connection, keep: Option<&Cipher>) -> rusqlite::Result<usize> {
+    let opens = |context: &str, v: &str| keep.is_some_and(|k| k.open(context, v).is_ok());
     let tx = c.unchecked_transaction()?;
-    let mut n = tx.execute("DELETE FROM secrets", [])?;
-    n += tx.execute("UPDATE approvals SET input = '{\"sealed\":\"discarded\"}' WHERE input LIKE 'sb1:%'", [])?;
+    let pairs = |sql: &str| -> rusqlite::Result<Vec<(String, String)>> {
+        let mut s = tx.prepare(sql)?;
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
+    };
+    let secrets = pairs("SELECT name, value FROM secrets")?;
+    let approvals = pairs("SELECT id, input FROM approvals WHERE input LIKE 'sb1:%'")?;
+    let mut n = 0;
+    for (name, v) in secrets.iter().filter(|(name, v)| !opens(&context(name), v)) {
+        n += tx.execute("DELETE FROM secrets WHERE name = ? AND value = ?", params![name, v])?;
+    }
+    for (id, _) in approvals.iter().filter(|(id, v)| !opens(&approval_context(id), v)) {
+        n += tx.execute("UPDATE approvals SET input = '{\"sealed\":\"discarded\"}' WHERE id = ?", [id])?;
+    }
     tx.execute("DELETE FROM settings WHERE key = ?", [KEY_CHECK])?;
     tx.commit()?;
     Ok(n)
+}
+
+/// Rewrites the database file and empties the WAL, so plaintext that sealing or
+/// redaction replaced doesn't linger in old pages. Run after a start that changed rows.
+pub fn purge_old_pages(c: &Connection) -> rusqlite::Result<()> {
+    c.execute_batch("VACUUM")?;
+    let busy: i64 = c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+    if busy != 0 {
+        eprintln!("Secrets: the database was busy, so old pages may stay in the WAL until the next checkpoint.");
+    }
+    Ok(())
 }
 
 /// Seals approval inputs saved in plaintext by versions before this one. Each row is
@@ -193,7 +219,7 @@ pub fn bootstrap(
                 if !forget {
                     return Err(WRONG_KEY.into());
                 }
-                b.discarded = discard(c).map_err(db)?;
+                b.discarded = discard(c, Some(&cipher)).map_err(db)?;
             }
             cipher
         }
@@ -202,7 +228,7 @@ pub fn bootstrap(
                 if !forget {
                     return Err(MISSING_KEY.into());
                 }
-                b.discarded = discard(c).map_err(db)?;
+                b.discarded = discard(c, None).map_err(db)?;
             }
             b.created = true;
             Cipher::new(&create()?)
@@ -362,10 +388,18 @@ mod tests {
             .unwrap();
         }
         redact::register(&secret);
+        let on_disk = || {
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes.extend(std::fs::read(path.with_extension("sqlite-wal")).unwrap_or_default());
+            bytes.windows(secret.len()).any(|w| w == secret.as_bytes())
+        };
+        assert!(on_disk());
         let key = MasterKey::generate();
         let key_bytes = *key.bytes();
         let (cipher, b) = bootstrap(&c, Some(key), no_key, false).unwrap();
         assert_eq!(b.sealed, 2);
+        purge_old_pages(&c).unwrap();
+        assert!(!on_disk(), "old pages holding the plaintext are gone from the file and the WAL");
         let stored: String = raw.query_row("SELECT input FROM approvals WHERE id = 'old1'", [], |r| r.get(0)).unwrap();
         assert!(is_sealed(&stored));
         let opened = cipher.open_text(&approval_context("old1"), &stored).unwrap();
@@ -440,5 +474,24 @@ mod tests {
         let (_, b) = bootstrap(&c, Some(other), no_key, true).unwrap();
         assert_eq!((b.discarded, b.created), (2, false));
         assert!(bootstrap(&c, Some(other_copy), no_key, false).is_ok());
+    }
+
+    #[test]
+    fn forgetting_keeps_what_the_key_still_opens() {
+        let (_, _db, c) = fresh();
+        let key = MasterKey::generate();
+        let same_key = MasterKey::parse(&key.base64()).unwrap();
+        let (cipher, _) = bootstrap(&c, Some(key), no_key, false).unwrap();
+        SealedStore::new(connect_again(&c), Arc::new(cipher)).put("KEEP_TOKEN", "kept").unwrap();
+        // A value and a key check sealed with another key, e.g. after the key file was swapped.
+        let other = Cipher::new(&MasterKey::generate());
+        c.execute("INSERT INTO secrets (name, value, created_at, updated_at) VALUES ('LOST_TOKEN', ?, 0, 0)", [other.seal(&context("LOST_TOKEN"), b"lost")]).unwrap();
+        c.execute("UPDATE settings SET value = ? WHERE key = ?", params![other.seal("key-check", KEY_CHECK_PLAIN), KEY_CHECK]).unwrap();
+
+        let (cipher, b) = bootstrap(&c, Some(same_key), no_key, true).unwrap();
+        assert_eq!(b.discarded, 1, "only the value this key can't open is dropped");
+        let store = SealedStore::new(connect_again(&c), Arc::new(cipher));
+        assert_eq!(store.get("KEEP_TOKEN").unwrap().unwrap().expose(), "kept");
+        assert_eq!(store.names().unwrap(), ["KEEP_TOKEN"]);
     }
 }

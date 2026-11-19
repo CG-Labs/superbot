@@ -55,6 +55,11 @@ impl SecretStore for EnvStore {
         }
     }
 
+    /// `NAME` itself is set, so child processes inherit it; `NAME_FILE` alone isn't.
+    fn inherited(&self, name: &str) -> bool {
+        self.var(name).is_some()
+    }
+
     /// Set variables whose names look like secrets (`*_API_KEY`, `*_TOKEN`, ...), with or without `_FILE`.
     fn names(&self) -> Result<Vec<String>, Error> {
         let mut names: Vec<String> = self
