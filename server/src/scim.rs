@@ -176,17 +176,35 @@ fn actor(a: &Auth, t: &ScimToken) -> Actor {
     }
 }
 
-/// A missing, unknown, or revoked token, throttled per IP. Never what was sent.
-fn auth_failed(a: &Auth, app: &AppState, source: &Source, reason: &str) {
+/// A missing, unknown, or revoked token, throttled per IP. Never what was sent; for a
+/// revoked one, which token it was, since a revoked token still in use may have leaked.
+fn auth_failed(a: &Auth, app: &AppState, source: &Source, reason: &str, revoked: Option<&ScimToken>) {
     let Some(missed) = a.logins.failure(&format!("{}|scim", source.ip.as_deref().unwrap_or("")), db::now()) else { return };
     let actor = Actor { kind: ActorKind::System, id: Some("scim".into()), method: Some("scim_token".into()), ..Default::default() };
     let who = Who { actor, source: source.clone() };
-    app.db.record(&who.event("scim.auth_failed").outcome(Outcome::Failure).details(json!({ "reason": reason, "unloggedSinceLast": missed })));
+    let mut details = json!({ "reason": reason, "unloggedSinceLast": missed });
+    let mut e = who.event("scim.auth_failed").outcome(Outcome::Failure);
+    if let Some(t) = revoked {
+        details["tenant"] = json!(t.tenant);
+        e = e.target("scim_token", &t.id);
+    }
+    app.db.record(&e.details(details));
 }
 
-/// Checks the Host, that SCIM is on, the client IP's failures, the token, and the
-/// tenant's rate, before any SCIM handler runs. Session cookies and tokens, the
-/// break-glass password, and the Bots' token never work here.
+/// `sbp_` and 64 hex digits, as `users::new_secret` makes them. Anything else is not
+/// looked up.
+fn token_shaped(t: &str) -> bool {
+    t.strip_prefix(TOKEN_PREFIX).is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Checks the Host, that SCIM is on, the token, the tenant's rate, and the client IP's
+/// failures, before any SCIM handler runs. Session cookies and tokens, the break-glass
+/// password, and the Bots' token never work here.
+///
+/// A valid token is never refused for its IP's failures: Entra and Okta send from
+/// addresses they share with every customer, so anyone pointing their own IdP here with
+/// a junk token could otherwise hold off deprovisioning. Tokens are 256 random bits, so
+/// the IP limit only spares the database and the audit log, as sessions are spared.
 pub async fn guard(State(a): State<Arc<Auth>>, mut req: Request, next: Next) -> Response {
     let host = req.headers().get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
     if !a.hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
@@ -200,14 +218,21 @@ pub async fn guard(State(a): State<Arc<Auth>>, mut req: Request, next: Next) -> 
     };
     let source = crate::request_source(&req, a.trust_forwarded);
     let (ip, at) = (source.ip.clone().unwrap_or_default(), db::now());
-    if let Some(retry) = a.scim.failures.blocked(&ip, at) {
-        return too_many(retry);
-    }
     let token = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|h| h.strip_prefix("Bearer ")).map(str::trim).unwrap_or("");
-    let found = if token.starts_with(TOKEN_PREFIX) { app.db.live_scim_token(&users::hash(token), at) } else { None };
+    let hash = token_shaped(token).then(|| users::hash(token));
+    let found = hash.as_deref().and_then(|h| app.db.live_scim_token(h, at));
     let Some(t) = found else {
+        if let Some(retry) = a.scim.failures.blocked(&ip, at) {
+            return too_many(retry);
+        }
         a.scim.failures.fail(&ip, at);
-        auth_failed(&a, &app, &source, if token.is_empty() { "missing" } else { "unknown_or_revoked" });
+        let revoked = hash.as_deref().and_then(|h| app.db.scim_token_by_hash(h));
+        let reason = match (&revoked, token.is_empty()) {
+            (Some(_), _) => "revoked",
+            (None, true) => "missing",
+            (None, false) => "unknown",
+        };
+        auth_failed(&a, &app, &source, reason, revoked.as_ref());
         let mut r = ScimError::new(StatusCode::UNAUTHORIZED, None, "A valid SCIM bearer token is required.").into_response();
         r.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer realm=\"SuperBot SCIM\""));
         return r;
@@ -649,7 +674,7 @@ fn sso_link(a: &Auth, t: &ScimToken, external_id: Option<&str>) -> ScimRes<Optio
     Ok(Some(Link { provider: pid.clone(), issuer, subject, tenant }))
 }
 
-fn fields<'a>(d: &'a Attrs, shown: &'a str) -> ScimFields<'a> {
+fn fields<'a>(d: &'a Attrs, shown: &'a str, active: Option<bool>) -> ScimFields<'a> {
     ScimFields {
         user_name: &d.user_name,
         external_id: d.external_id.as_deref(),
@@ -659,14 +684,14 @@ fn fields<'a>(d: &'a Attrs, shown: &'a str) -> ScimFields<'a> {
         formatted: d.formatted.as_deref(),
         display_name: shown,
         email: d.email.as_deref(),
-        active: d.active,
+        active,
     }
 }
 
 /// Audits what changed on a user and acts on it: deactivating drops their unredeemed SSO
 /// app codes, ends every session, and closes open screens (their links don't know who
-/// opened them).
-async fn changed(app: &AppState, a: &Auth, c: &Caller, before_user: &User, before: Option<&ScimUser>, after: &ScimUser) {
+/// opened them). `active` is what this request set, if it changed it.
+async fn changed(app: &AppState, a: &Auth, c: &Caller, before_user: &User, before: Option<&ScimUser>, after: &ScimUser, active: Option<bool>) {
     let by = &c.who;
     let ev = |action: &str| by.event(action).target("user", &after.user.id);
     let mut changes = Map::new();
@@ -688,9 +713,9 @@ async fn changed(app: &AppState, a: &Auth, c: &Caller, before_user: &User, befor
     if !changes.is_empty() {
         app.db.record(&ev("user.updated").details(json!({ "changes": changes, "tenant": c.token.tenant })));
     }
-    match (before_user.active(), after.user.active()) {
-        (false, true) => app.db.record(&ev("user.enabled").details(json!({ "tenant": c.token.tenant }))),
-        (true, false) => {
+    match active {
+        Some(true) => app.db.record(&ev("user.enabled").details(json!({ "tenant": c.token.tenant }))),
+        Some(false) => {
             a.sso.forget_user(&after.user.id);
             let n = app.db.revoke_user_sessions(&after.user.id, by.actor.id.as_deref().unwrap_or("scim"), "deprovisioned by SCIM");
             app.db.record(&ev("user.disabled").details(json!({ "sessionsRevoked": n, "tenant": c.token.tenant })));
@@ -698,7 +723,7 @@ async fn changed(app: &AppState, a: &Auth, c: &Caller, before_user: &User, befor
                 screens.rotate_all().await;
             }
         }
-        _ => {}
+        None => {}
     }
 }
 
@@ -717,12 +742,13 @@ async fn update(app: &AppState, a: &Auth, c: &Caller, user: &User, before: Optio
         Some(b) if Attrs::of(b).names() == d.names() => user.name.clone(),
         _ => d.shown_name(),
     };
-    app.db.save_scim_user(&c.token.tenant, &user.id, &fields(d, &shown), taken.is_some()).map_err(conflict)?;
+    let active = (d.active != user.active()).then_some(d.active);
+    app.db.save_scim_user(&c.token.tenant, &user.id, &fields(d, &shown, active), taken.is_some()).map_err(conflict)?;
     let after = app.db.scim_user(&c.token.tenant, &user.id).ok_or_else(|| server_error("user not saved"))?;
     if let Some((action, details)) = taken {
         app.db.record(&c.who.event(action).target("user", &user.id).details(details));
     }
-    changed(app, a, c, user, before, &after).await;
+    changed(app, a, c, user, before, &after, active).await;
     Ok(after)
 }
 
@@ -829,7 +855,7 @@ pub async fn create_user(State(app): State<AppState>, Extension(a): Extension<Ar
         email: None,
         created_by: created_by.as_deref(),
     });
-    let user = app.db.create_scim_user(tenant, &fields(&d, &shown), a.scim.default_role, identity.as_ref()).map_err(conflict)?;
+    let user = app.db.create_scim_user(tenant, &fields(&d, &shown, Some(d.active)), a.scim.default_role, identity.as_ref()).map_err(conflict)?;
     app.db.record(&c.who.event("user.created").target("user", &user.id).details(json!({
         "email": user.email, "name": user.name, "role": user.role, "reason": "scim",
         "tenant": tenant, "externalId": d.external_id, "userName": d.user_name, "active": d.active,

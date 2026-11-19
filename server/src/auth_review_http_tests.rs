@@ -1,10 +1,12 @@
-//! Regression tests from the auth review (docs/security/auth-review-2026-11.md, ADR 0024),
-//! on the real router: every route that isn't public refuses callers without the right
-//! credentials or role, and credentials a browser sends by itself can't be ridden cross-site.
+//! Regression tests from the auth review (docs/security/auth-review-2026-11.md, ADR 0024,
+//! and its SCIM addendum, ADR 0026), on the real router: every route that isn't public
+//! refuses callers without the right credentials or role, SCIM tokens and other credentials
+//! never cross between /scim/v2 and the rest, and credentials a browser sends by itself
+//! can't be ridden cross-site.
 
 use crate::rbac::{self, Principal, Role};
 use crate::tests::{basic, call, call_with, serve_app_with};
-use crate::users_http_tests::user_with;
+use crate::users_http_tests::{parse, user_with};
 use crate::*;
 
 /// Routes anyone may call: signing in, the page to do it on, and asking for access.
@@ -77,6 +79,10 @@ async fn every_route_but_the_public_ones_needs_credentials_and_the_right_role() 
     let (_, readonly) = user_with(port, &admin, "r@example.com", "readonly").await;
     let forged = format!("Bearer {}", users::new_secret(users::SESSION_PREFIX));
     let cookie = format!("Cookie: {}={}\r\n", users::COOKIE, users::new_secret(users::SESSION_PREFIX));
+    let (scim_auth, _) = scim_token(port, &admin, "walk").await;
+    let (revoked, revoked_id) = scim_token(port, &admin, "walk").await;
+    assert_eq!(call(port, "DELETE", &format!("/api/scim/tokens/{revoked_id}"), &admin, "").await.0, 200);
+    let forged_scim = format!("Bearer {}", users::new_secret(scim::TOKEN_PREFIX));
     let mut checked = 0;
     for (m, p) in routes() {
         if PUBLIC.contains(&(m.as_str(), p.as_str())) {
@@ -87,14 +93,18 @@ async fn every_route_but_the_public_ones_needs_credentials_and_the_right_role() 
             let (code, _, body) = call_with(port, &m, &path, auth, extra, "{}").await;
             assert_eq!(code, 401, "{who}: {m} {path}: {body}");
         }
-        // SCIM (ADR 0023) takes only a SCIM tenant's token: no session, password, or Bot token.
+        // SCIM (ADR 0023) takes only a live SCIM tenant's token: no session, password, or Bot token.
         if p.starts_with("/scim/") {
-            for (who, auth) in [("admin", &admin), ("member", &member), ("bot", &bot)] {
+            for (who, auth) in [("admin password", &admin), ("member session", &member), ("bot", &bot), ("forged SCIM token", &forged_scim), ("revoked SCIM token", &revoked)] {
                 assert_eq!(call(port, &m, &path, auth, "{}").await.0, 401, "{who}: {m} {path}");
             }
+            let (code, body) = call(port, &m, &path, &scim_auth, "{}").await;
+            assert!(![401, 403, 429].contains(&code), "SCIM token: {m} {path}: {code} {body}");
             checked += 1;
             continue;
         }
+        // A provisioning token reaches nothing outside /scim/v2.
+        assert_eq!(call(port, &m, &path, &scim_auth, "{}").await.0, 401, "SCIM token: {m} {path}");
         let method = axum::http::Method::from_bytes(m.as_bytes()).unwrap();
         let need = rbac::classify(&method, &path);
         for (who, principal, auth) in [("member", Principal::User(Role::Member), &member), ("readonly", Principal::User(Role::Readonly), &readonly), ("bot", Principal::Bot, &bot)] {
@@ -116,6 +126,57 @@ async fn every_route_but_the_public_ones_needs_credentials_and_the_right_role() 
     // Web pages go to the sign-in page.
     let (code, head, _) = call_with(port, "GET", "/console/", "", "", "").await;
     assert_eq!((code, head.to_ascii_lowercase().contains("location: /login")), (303, true), "{head}");
+}
+
+/// A new SCIM token for `tenant`: as an Authorization header, and its id.
+async fn scim_token(port: u16, admin: &str, tenant: &str) -> (String, String) {
+    let (code, body) = call(port, "POST", "/api/scim/tokens", admin, &json!({ "tenant": tenant }).to_string()).await;
+    assert_eq!(code, 201, "{body}");
+    let v = parse(&body);
+    (format!("Bearer {}", v["token"].as_str().unwrap()), v["scimToken"]["id"].as_str().unwrap().to_string())
+}
+
+fn scim_routes() -> Vec<(String, String)> {
+    routes().into_iter().filter(|(_, p)| p.starts_with("/scim/")).collect()
+}
+
+#[tokio::test]
+async fn with_scim_off_every_scim_route_is_a_404_that_never_reads_a_token() {
+    let (port, app, admin, _) = serve_app_with(|_| {}).await;
+    let (token, _) = scim_token(port, &admin, "okta").await;
+    let routes = scim_routes();
+    assert!(routes.len() >= 15, "{routes:?}");
+    for (m, p) in routes {
+        let path = concrete(&p);
+        for (who, auth) in [("nobody", ""), ("SCIM token", token.as_str()), ("admin password", admin.as_str())] {
+            let (code, head, body) = call_with(port, &m, &path, auth, "", "{}").await;
+            assert_eq!(code, 404, "{who}: {m} {path}: {body}");
+            assert!(head.to_ascii_lowercase().contains("content-type: application/scim+json"), "{who}: {m} {path}: {head}");
+        }
+    }
+    assert!(app.db.scim_tokens().iter().all(|t| t.last_used_at.is_none()), "the token was never looked up");
+    let (_, audit) = call(port, "GET", "/api/audit?action=scim.*", &admin, "").await;
+    let audit = crate::tests::audit_list(&audit);
+    assert!(audit.iter().all(|e| e["action"] != "scim.auth_failed"), "{audit:?}");
+}
+
+#[tokio::test]
+async fn scim_tokens_get_nowhere_by_odd_paths_or_methods() {
+    let (port, _, admin, _) = serve_app_with(|a| a.scim.enabled = true).await;
+    let (token, _) = scim_token(port, &admin, "okta").await;
+    // Methods no SCIM route has still need a token first.
+    for (m, p) in [("TRACE", "/scim/v2/Users"), ("HEAD", "/scim/v2/Users"), ("PATCH", "/scim/v2/Users"), ("POST", "/scim/v2/Users/x1"), ("PUT", "/scim/v2/ServiceProviderConfig")] {
+        let (code, head, body) = call_with(port, m, p, "", "", "").await;
+        assert_eq!(code, 401, "{m} {p}: {head} {body}");
+    }
+    // OPTIONS is answered by the CORS layer on every route, before any auth: empty, with no data.
+    let (code, _, body) = call_with(port, "OPTIONS", "/scim/v2/Users", "", "", "").await;
+    assert_eq!((code, body.as_str()), (200, ""));
+    // Paths that look like SCIM but aren't, or that try to climb out of it.
+    for p in ["/SCIM/v2/Users", "/scim/V2/Users", "/scim//v2/Users", "/scim/Users", "/api/../scim/v2/Users", "/scim/v2/../../api/state", "/scim/v2/%2e%2e/%2e%2e/api/users", "/api/scim/v2/Users", "/api/users", "/api/scim/tokens", "/console/"] {
+        let (code, body) = call(port, "GET", p, &token, "").await;
+        assert!(!(200..300).contains(&code), "{p}: {code} {body}");
+    }
 }
 
 #[tokio::test]
