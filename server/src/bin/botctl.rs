@@ -46,6 +46,9 @@ and BOT_API if botd isn't on http://127.0.0.1:3000; the password is only sent to
     filters: --from <time> --to <time> --action <a,b.*> --actor <user|bot|system[:id]>
              --outcome <success|failure|denied> --bot <id>
     times: YYYY-MM-DD (UTC), RFC 3339, or unix milliseconds
+  botctl secrets                                   List secret names (never values)
+  botctl secret set <NAME> < value-file            Save a secret, encrypted; Bots get it as $NAME
+  botctl secret rm <NAME>                          Delete a saved secret
 
 Classes: shell_destructive, file_delete, outbound_message, network_install, git_push.
 Patterns are globs (* and ?) over the command, path, URL, or tool arguments."#;
@@ -227,6 +230,24 @@ fn decide(verb: &str, id: &str, rest: &[&str]) -> Result<String, String> {
     api(Cred::Operator, "POST", &format!("/api/approvals/{id}/{verb}"), Some(body)).map(|_| if verb == "approve" { "Approved." } else { "Denied." }.into())
 }
 
+fn env_name(name: &str) -> Result<&str, String> {
+    if name.is_empty() || !name.bytes().all(|b| b == b'_' || b.is_ascii_uppercase() || b.is_ascii_digit()) {
+        return Err(format!("\"{name}\" isn't a valid name. Use an environment variable name like OPENAI_API_KEY."));
+    }
+    Ok(name)
+}
+
+/// The value comes on stdin, so it stays out of shell history and the process list.
+fn stdin_value(mut input: impl Read) -> Result<String, String> {
+    let mut v = String::new();
+    input.read_to_string(&mut v).map_err(|e| format!("Couldn't read the value from stdin: {e}"))?;
+    let v = v.strip_suffix('\n').map(|t| t.strip_suffix('\r').unwrap_or(t)).unwrap_or(&v).to_string();
+    if v.is_empty() {
+        return Err("No value on stdin. Example: botctl secret set OPENAI_API_KEY < key.txt".into());
+    }
+    Ok(v)
+}
+
 fn run(args: &[String]) -> Result<String, String> {
     let bot = std::env::var("BOT_ID").unwrap_or_default();
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -270,6 +291,13 @@ fn run(args: &[String]) -> Result<String, String> {
         [verb @ ("approve" | "deny"), id, rest @ ..] => decide(verb, id, rest),
         ["audit", "export", rest @ ..] => api(Cred::Operator, "GET", &format!("/api/audit/export.csv{}", audit_query(rest)?), None),
         ["audit", rest @ ..] => op("GET", &format!("/api/audit{}", audit_query(rest)?), None),
+        ["secrets"] => op("GET", "/api/secrets", None),
+        ["secret", "set", name] => {
+            let name = env_name(name)?;
+            let body = json!({ "value": stdin_value(std::io::stdin())? }).to_string();
+            op("PUT", &format!("/api/secrets/{name}"), Some(body)).map(|_| format!("Saved {name}. Bots get it as ${name} from their next run."))
+        }
+        ["secret", "rm" | "delete", name] => op("DELETE", &format!("/api/secrets/{}", env_name(name)?), None).map(|_| "Deleted.".into()),
         ["help", "admin"] | ["admin"] => Ok(ADMIN_HELP.into()),
         _ => Ok(HELP.into()),
     }
@@ -338,5 +366,17 @@ mod tests {
         assert_eq!(p, json!({ "mode": "ask", "timeoutMinutes": 15, "classes": { "git_push": "deny" } }));
         assert!(policy_patch(&[]).is_err());
         assert!(policy_patch(&["timeout=soon"]).is_err());
+    }
+
+    #[test]
+    fn values_come_from_stdin_without_the_newline() {
+        assert_eq!(stdin_value("sk-1\n".as_bytes()).unwrap(), "sk-1");
+        assert_eq!(stdin_value("sk-1\r\n".as_bytes()).unwrap(), "sk-1");
+        assert_eq!(stdin_value("a b\n\n".as_bytes()).unwrap(), "a b\n");
+        assert!(stdin_value("\n".as_bytes()).is_err());
+        assert!(env_name("OPENAI_API_KEY").is_ok());
+        for bad in ["", "lower", "A/B", "../X", "A B"] {
+            assert!(env_name(bad).is_err(), "{bad}");
+        }
     }
 }

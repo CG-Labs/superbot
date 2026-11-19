@@ -31,6 +31,8 @@ services:
       WORKSPACE_DIR: /workspace
       ALLOW_NO_AUTH: ""
       AUTH_PASSWORD: ${AUTH_PASSWORD:?Set AUTH_PASSWORD in deploy/docker/.env (run ./init.sh)}
+      # Encrypts saved secrets. Lives in .env on the host, never in a volume, so backups don't carry it.
+      SUPERBOT_MASTER_KEY: ${SUPERBOT_MASTER_KEY:?Set SUPERBOT_MASTER_KEY in deploy/docker/.env (run ./init.sh)}
       # Caddy forwards the browser's Host header; botd answers only to these names.
       ALLOWED_HOSTS: ${SUPERBOT_DOMAIN:-localhost},${ALLOWED_HOSTS:-}
       # botd is reachable only through Caddy, so the audit log takes the client IP from X-Forwarded-For.

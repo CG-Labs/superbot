@@ -41,6 +41,9 @@ pub fn on_path(bin: &str) -> bool {
 }
 
 fn spawn(cmd: &mut Command) -> std::io::Result<Child> {
+    for k in crate::adapters::SECRET_ENV {
+        cmd.env_remove(k);
+    }
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn()
 }
 
@@ -130,6 +133,7 @@ impl Screens {
 
     async fn start(&self, slot: u16) -> std::io::Result<Screen> {
         let token: String = crate::random_bytes(16).iter().map(|x| format!("{x:02x}")).collect();
+        crate::secrets::redact::register(&token);
         let mut s = Screen { slot, token, used: Instant::now(), procs: Vec::new() };
         let Info { display, bus, port, .. } = self.info(&s);
         let n = self.base + slot;
@@ -202,6 +206,7 @@ async fn stop(bot_id: &str, s: Screen) {
         let close = Command::new("agent-browser").args(["--session", &browser_session(bot_id), "close"]).stdin(Stdio::null()).output();
         let _ = tokio::time::timeout(Duration::from_secs(10), close).await;
     }
+    crate::secrets::redact::forget(&s.token);
     drop(s); // kill_on_drop stops Xvfb, D-Bus, Openbox, and voxl
 }
 
