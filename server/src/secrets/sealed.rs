@@ -385,13 +385,14 @@ impl UserSecrets {
     }
 
     /// Every value, for the redactor at startup.
-    pub fn all_values(&self) -> Vec<Secret> {
+    /// Every value, with the user it belongs to.
+    pub fn all_values(&self) -> Vec<(String, Secret)> {
         let rows: Vec<(String, String, String)> = {
             let c = self.c();
             let Ok(mut s) = c.prepare("SELECT user_id, name, value FROM user_secrets") else { return Vec::new() };
             s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map(|m| m.filter_map(Result::ok).collect()).unwrap_or_default()
         };
-        rows.iter().filter_map(|(u, n, v)| self.cipher.open_text(&user_context(u, n), v).ok()).collect()
+        rows.into_iter().filter_map(|(u, n, v)| self.cipher.open_text(&user_context(&u, &n), &v).ok().map(|v| (u, v))).collect()
     }
 }
 

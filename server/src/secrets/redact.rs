@@ -8,6 +8,7 @@
 use rusqlite::{params, Connection};
 use serde_json::Value;
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::RwLock;
 
 pub const MARK: &str = "[redacted]";
@@ -45,6 +46,65 @@ pub fn forget(value: &str) {
 
 pub fn known() -> Vec<String> {
     KNOWN.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Each user's own secrets (ADR 0028), by user. Any member can save any value, so
+/// theirs are redacted only where their own Bots write (`text_for`): one user can't
+/// erase words from everyone else's chats.
+static OWNED: RwLock<BTreeMap<String, Vec<String>>> = RwLock::new(BTreeMap::new());
+
+pub fn register_for(owner: &str, value: &str) {
+    let v = value.trim();
+    if v.chars().count() < MIN_LEN || v.contains(MARK) {
+        return;
+    }
+    let mut owned = OWNED.write().unwrap_or_else(|e| e.into_inner());
+    let list = owned.entry(owner.to_string()).or_default();
+    if !list.iter().any(|k| k == v) {
+        list.push(v.to_string());
+        list.sort_by_key(|k| std::cmp::Reverse(k.len()));
+    }
+}
+
+#[cfg(test)]
+pub fn forget_for(owner: &str, value: &str) {
+    if let Some(list) = OWNED.write().unwrap_or_else(|e| e.into_inner()).get_mut(owner) {
+        list.retain(|k| k != value.trim());
+    }
+}
+
+pub fn owned() -> Vec<(String, Vec<String>)> {
+    OWNED.read().unwrap_or_else(|e| e.into_inner()).iter().map(|(o, l)| (o.clone(), l.clone())).collect()
+}
+
+/// `text`, plus the own secrets of `owners` (the users whose Bots wrote or carry `s`).
+pub fn text_for<'a>(owners: &[&str], s: &'a str) -> Cow<'a, str> {
+    let mut out = Cow::Borrowed(s);
+    {
+        let owned = OWNED.read().unwrap_or_else(|e| e.into_inner());
+        for k in owners.iter().filter_map(|o| owned.get(*o)).flatten() {
+            if out.contains(k.as_str()) {
+                out = Cow::Owned(out.replace(k.as_str(), MARK));
+            }
+        }
+    }
+    match out {
+        Cow::Borrowed(s) => text(s),
+        Cow::Owned(o) => Cow::Owned(text(&o).into_owned()),
+    }
+}
+
+/// `value`, plus the own secrets of `owners`.
+pub fn value_for(owners: &[&str], v: Value) -> Value {
+    match v {
+        Value::String(s) => match text_for(owners, &s) {
+            Cow::Borrowed(_) => Value::String(s),
+            Cow::Owned(r) => Value::String(r),
+        },
+        Value::Array(a) => Value::Array(a.into_iter().map(|v| value_for(owners, v)).collect()),
+        Value::Object(o) => Value::Object(o.into_iter().map(|(k, v)| (k, value_for(owners, v))).collect()),
+        other => other,
+    }
 }
 
 pub fn text(s: &str) -> Cow<'_, str> {
@@ -123,16 +183,25 @@ pub fn scrub_rows(c: &Connection) -> rusqlite::Result<usize> {
             n += tx.execute(&format!("UPDATE {table} SET {col} = replace({col}, ?1, ?2) WHERE instr({col}, ?1) > 0"), params![s, MARK])?;
         }
     }
+    // A user's own secrets, only in their own Bots' rows.
+    for (owner, values) in owned() {
+        for s in values {
+            for (table, col) in [("messages", "text"), ("approvals", "subject")] {
+                let sql = format!("UPDATE {table} SET {col} = replace({col}, ?1, ?2) WHERE instr({col}, ?1) > 0 AND bot_id IN (SELECT id FROM bots WHERE owner_id = ?3)");
+                n += tx.execute(&sql, params![s, MARK, owner])?;
+            }
+        }
+    }
     // Choice cards and saved requesters are JSON, where a secret with quotes or
     // backslashes is escaped, so they're parsed and redacted value by value.
     for col in ["question", "requested_by"] {
-        let rows: Vec<(i64, String)> = {
-            let mut s = tx.prepare(&format!("SELECT id, {col} FROM messages WHERE {col} IS NOT NULL"))?;
-            s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+        let rows: Vec<(i64, String, Option<String>)> = {
+            let mut s = tx.prepare(&format!("SELECT m.id, m.{col}, b.owner_id FROM messages m LEFT JOIN bots b ON b.id = m.bot_id WHERE m.{col} IS NOT NULL"))?;
+            s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?
         };
-        for (id, raw) in rows {
+        for (id, raw, owner) in rows {
             let Ok(json) = serde_json::from_str::<Value>(&raw) else { continue };
-            let clean = value(json.clone());
+            let clean = value_for(owner.as_deref().as_slice(), json.clone());
             if clean != json {
                 n += tx.execute(&format!("UPDATE messages SET {col} = ? WHERE id = ?"), params![clean.to_string(), id])?;
             }

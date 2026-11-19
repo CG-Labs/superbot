@@ -182,7 +182,7 @@ impl Secrets {
     pub fn user_put(&self, user_id: &str, name: &str, value: &str) -> Result<UserListed, Error> {
         check_user_name(name)?;
         check_value(value)?;
-        redact::register(value);
+        redact::register_for(user_id, value);
         let users = self.users()?;
         users.put(user_id, name, value)?;
         self.user_list(user_id)?.into_iter().find(|l| l.name == name).ok_or_else(|| Error::Store(format!("{name} was not saved")))
@@ -320,8 +320,8 @@ impl Secrets {
                 }
             }
         }
-        for v in self.users.as_ref().map(|u| u.all_values()).unwrap_or_default() {
-            redact::register(v.expose());
+        for (user, v) in self.users.as_ref().map(|u| u.all_values()).unwrap_or_default() {
+            redact::register_for(&user, v.expose());
             n += 1;
         }
         n
@@ -432,7 +432,10 @@ mod tests {
         assert_eq!(env("ua"), [pair("ANTHROPIC_API_KEY", &a), pair("OPENAI_API_KEY", "a-openai-value")], "A's own beat the team's");
         assert_eq!(env("ub"), [pair("GH_TOKEN", "b-gh-value"), pair("OPENAI_API_KEY", "team-openai-value")], "none of A's");
         assert_eq!(env("uc"), [pair("OPENAI_API_KEY", "team-openai-value")]);
-        assert_eq!(redact::text(&a), redact::MARK);
+        assert_eq!(redact::text_for(&["ua"], &a), redact::MARK, "redacted from A's Bots");
+        assert_eq!(redact::text_for(&["ub"], "deploy to b-gh-value"), "deploy to [redacted]");
+        assert_eq!(redact::text(&a), a.as_str(), "not from everyone's: any member can save any value");
+        assert_eq!(redact::text_for(&["ub"], &a), a.as_str());
         for bad in ["PATH", "BOT_TOKEN", "SSO_X_CLIENT_SECRET", "LINODE_TOKEN", "TURNSTILE_SECRET", "lower"] {
             assert!(matches!(s.user_put("ua", bad, "v"), Err(Error::Invalid(_))), "{bad}");
         }
@@ -442,10 +445,10 @@ mod tests {
         assert_eq!(s.user_forget("ua").unwrap(), 2);
         assert!(s.user_list("ua").unwrap().is_empty());
         assert!(matches!(Secrets::new(vec![]).user_put("ua", "X_TOKEN", "v"), Err(Error::ReadOnly)));
-        redact::forget(&a);
-        for v in ["a-openai-value", "b-gh-value", "team-openai-value"] {
-            redact::forget(v);
-        }
+        redact::forget_for("ua", &a);
+        redact::forget_for("ua", "a-openai-value");
+        redact::forget_for("ub", "b-gh-value");
+        redact::forget("team-openai-value");
     }
 
     #[test]
