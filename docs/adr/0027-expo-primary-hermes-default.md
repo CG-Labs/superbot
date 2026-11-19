@@ -65,10 +65,10 @@ The console had a few things for end users that the client lacked. These are now
 
 Larger gaps are follow-ups, not blockers. They are admin features that stay in the console until then:
 
-- **Audit log viewer in the client**, with filters and CSV export ([ADR 0009](0009-audit-events.md), [ADR 0019](0019-audit-actors.md)). M3.
-- **Link from the client to the admin console** for admins on the web, and a client-side check of `landing`. M2.
-- **Retire console end-user features** (chat, Bots, screens) once the client covers admins too, leaving a minimal admin page. M3.
-- **"Suggested" prompts** in Bot details (create a routine, give it a job). Small; M3 polish.
+- **Audit log viewer in the client**, with filters and CSV export ([ADR 0009](0009-audit-events.md), [ADR 0019](0019-audit-actors.md)). M3, [#81](https://github.com/CG-Labs/superbot/issues/81).
+- **Link from the client to the admin console** for admins on the web, and a client-side check of `landing`. M2, [#80](https://github.com/CG-Labs/superbot/issues/80).
+- **Retire console end-user features** (chat, Bots, screens) once the client covers admins too, leaving a minimal admin page. M3, [#82](https://github.com/CG-Labs/superbot/issues/82).
+- **"Suggested" prompts** in Bot details (create a routine, give it a job). Small; M3 polish, [#83](https://github.com/CG-Labs/superbot/issues/83).
 
 ## How decision 2 applies
 

@@ -192,10 +192,10 @@ Basic auth may remain for **break-glass** and **self-host hobby** tiers only, be
 | `eas init` / real `projectId` | High | M1 |
 | Custom icons / brand | Medium | M1 ✓ |
 | Single primary interface (Expo client; `web/` as admin fallback), [ADR 0027](adr/0027-expo-primary-hermes-default.md) | High | M2 ✓ |
-| Link to the admin console for admins on the web client | Low | M2 |
-| Audit log viewer in the client (filters, CSV export) | Medium | M3 |
-| Retire the console's end-user features (chat, Bots, screens), leaving a minimal admin page | Medium | M3 |
-| Suggested prompts in Bot details | Low | M3 |
+| Link to the admin console for admins on the web client ([#80](https://github.com/CG-Labs/superbot/issues/80)) | Low | M2 |
+| Audit log viewer in the client (filters, CSV export) ([#81](https://github.com/CG-Labs/superbot/issues/81)) | Medium | M3 |
+| Retire the console's end-user features (chat, Bots, screens), leaving a minimal admin page ([#82](https://github.com/CG-Labs/superbot/issues/82)) | Medium | M3 |
+| Suggested prompts in Bot details ([#83](https://github.com/CG-Labs/superbot/issues/83)) | Low | M3 |
 | SSO sign-in (Apple, GitHub, Microsoft, Google, OIDC, SAML via bridge) | High | M2 |
 | Tier picker instead of model picker on managed plans | Medium | M3 |
 | Push notifications | Medium | M3 |
@@ -320,8 +320,8 @@ Each remaining roadmap item is one GitHub issue, labelled with its milestone and
 | Milestone | Issues |
 |-----------|--------|
 | [M1 — Foundation hardening](https://github.com/CG-Labs/superbot/issues?q=is%3Aissue%20milestone%3AM1) | EAS `projectId`; approvals follow-ups (tracking). Brand assets done |
-| [M2 — Multi-user + SSO](https://github.com/CG-Labs/superbot/issues?q=is%3Aissue%20milestone%3AM2) | User store and sessions; Sign in with Apple; GitHub sign-in; Microsoft Entra ID; Google sign-in; generic OIDC/SAML connector; RBAC v1 and bot ACLs; break-glass and session revoke; client token flow; per-user audit actors; SCIM design stub; auth pen-test review; IdP setup docs; Hermes Agent adapter; Expo client as the single interface (decided); admin console link in the web client |
-| [M3 — Private beta](https://github.com/CG-Labs/superbot/issues?q=is%3Aissue%20milestone%3AM3) | Linode control plane (one machine per user); per-user isolation; per-user tiers billing v0; model routing hidden behind tiers; Hermes default harness for managed tiers (ADR 0011 checklist); client audit log viewer; retire console end-user features; suggested prompts; self-host license key; onboarding wizard; push notifications; biometric unlock; TestFlight / Play internal; registry image with computer use; backup restore drill; sales/security pack |
+| [M2 — Multi-user + SSO](https://github.com/CG-Labs/superbot/issues?q=is%3Aissue%20milestone%3AM2) | User store and sessions; Sign in with Apple; GitHub sign-in; Microsoft Entra ID; Google sign-in; generic OIDC/SAML connector; RBAC v1 and bot ACLs; break-glass and session revoke; client token flow; per-user audit actors; SCIM design stub; auth pen-test review; IdP setup docs; Hermes Agent adapter; Expo client as the single interface (decided); admin console link in the web client ([#80](https://github.com/CG-Labs/superbot/issues/80)) |
+| [M3 — Private beta](https://github.com/CG-Labs/superbot/issues?q=is%3Aissue%20milestone%3AM3) | Linode control plane (one machine per user); per-user isolation; per-user tiers billing v0; model routing hidden behind tiers; Hermes default harness for managed tiers (ADR 0011 checklist); client audit log viewer ([#81](https://github.com/CG-Labs/superbot/issues/81)); retire console end-user features ([#82](https://github.com/CG-Labs/superbot/issues/82)); suggested prompts ([#83](https://github.com/CG-Labs/superbot/issues/83)); self-host license key; onboarding wizard; push notifications; biometric unlock; TestFlight / Play internal; registry image with computer use; backup restore drill; sales/security pack |
 | [M4 — Public launch](https://github.com/CG-Labs/superbot/issues?q=is%3Aissue%20milestone%3AM4) | Published per-user plans; revisit managed substrate; marketing site and docs portal; store production release; observability; status page and SLO; GDPR docs and DPA; UK/EU region; SOC 2 readiness |
 | [M5 — Enterprise](https://github.com/CG-Labs/superbot/issues?q=is%3Aissue%20milestone%3AM5) | SCIM; full SAML; advanced RBAC; per-user computer hardening; vault integrations; SIEM export; SOC 2 Type II; data residency; air-gapped self-host; enterprise support playbooks |
 
