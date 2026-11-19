@@ -25,15 +25,18 @@ fn routes() -> Vec<(String, String)> {
     let src = include_str!("main.rs");
     let body = &src[src.find("\nfn router(").expect("fn router")..];
     let body = &body[..body.find("\n}\n").expect("end of fn router")];
-    // Routes before the outer Router are the API, nested under /api.
+    // Routes in `let api` are the API, nested under /api; the rest (SCIM, the outer
+    // Router) are mounted where they say.
     let outer = body.find(".route(\"/healthz\"").expect("the outer router");
+    let api = body.find("let api = Router::new()").expect("the API router");
+    let api_end = body[api + 1..].find("\n    let ").map_or(outer, |j| (api + 1 + j).min(outer));
     let mut out = Vec::new();
     let mut at = 0;
     while let Some(i) = body[at..].find(".route(\"") {
         let start = at + i + ".route(\"".len();
         let path = &body[start..start + body[start..].find('"').unwrap()];
         let end = body[start..].find(".route(\"").map_or(body.len(), |j| start + j);
-        let full = if start < outer { format!("/api{path}") } else { path.to_string() };
+        let full = if (api..api_end).contains(&start) { format!("/api{path}") } else { path.to_string() };
         let chunk = &body[start..end];
         for m in ["get", "post", "put", "patch", "delete"] {
             let pat = format!("{m}(");
@@ -55,7 +58,7 @@ fn concrete(path: &str) -> String {
 fn the_route_list_is_read_whole() {
     let r = routes();
     assert!(r.len() >= 60, "{} routes: the parser no longer understands fn router", r.len());
-    for (m, p) in [("GET", "/api/state"), ("DELETE", "/api/users/{key}/sessions"), ("POST", "/api/signups/{id}/reject"), ("POST", "/api/auth/sso/{id}/callback"), ("GET", "/healthz")] {
+    for (m, p) in [("GET", "/api/state"), ("DELETE", "/api/users/{key}/sessions"), ("POST", "/api/signups/{id}/reject"), ("POST", "/api/auth/sso/{id}/callback"), ("GET", "/healthz"), ("POST", "/api/scim/tokens"), ("PATCH", "/scim/v2/Users/{id}")] {
         assert!(r.contains(&(m.into(), p.into())), "{m} {p} missing from {r:?}");
     }
     for (m, p) in PUBLIC {
@@ -65,7 +68,11 @@ fn the_route_list_is_read_whole() {
 
 #[tokio::test]
 async fn every_route_but_the_public_ones_needs_credentials_and_the_right_role() {
-    let (port, _, admin, bot) = serve_app_with(|_| {}).await;
+    let (port, _, admin, bot) = serve_app_with(|a| {
+        a.scim.enabled = true;
+        a.scim.failures = users::Limiter::new(10_000, 60_000);
+    })
+    .await;
     let (_, member) = user_with(port, &admin, "m@example.com", "member").await;
     let (_, readonly) = user_with(port, &admin, "r@example.com", "readonly").await;
     let forged = format!("Bearer {}", users::new_secret(users::SESSION_PREFIX));
@@ -79,6 +86,14 @@ async fn every_route_but_the_public_ones_needs_credentials_and_the_right_role() 
         for (who, auth, extra) in [("nobody", "", ""), ("forged token", forged.as_str(), ""), ("forged cookie", "", cookie.as_str())] {
             let (code, _, body) = call_with(port, &m, &path, auth, extra, "{}").await;
             assert_eq!(code, 401, "{who}: {m} {path}: {body}");
+        }
+        // SCIM (ADR 0023) takes only a SCIM tenant's token: no session, password, or Bot token.
+        if p.starts_with("/scim/") {
+            for (who, auth) in [("admin", &admin), ("member", &member), ("bot", &bot)] {
+                assert_eq!(call(port, &m, &path, auth, "{}").await.0, 401, "{who}: {m} {path}");
+            }
+            checked += 1;
+            continue;
         }
         let method = axum::http::Method::from_bytes(m.as_bytes()).unwrap();
         let need = rbac::classify(&method, &path);

@@ -20,6 +20,9 @@ mod paths;
 mod policy;
 mod rbac;
 mod runner;
+mod scim;
+#[cfg(test)]
+mod scim_http_tests;
 mod screen;
 mod secrets;
 mod shell;
@@ -45,7 +48,7 @@ use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post, put};
+use axum::routing::{any, delete, get, patch, post, put};
 use axum::{Json, Router};
 use std::collections::HashMap;
 use db::{BotPatch, Db};
@@ -114,6 +117,7 @@ async fn main() {
         .unwrap_or_else(|e| exit(format!("Sign-ups: {e}")));
     let control_plane = machines::ControlPlane::from_env(&secrets::env::EnvStore::process(), |k| env(k, ""))
         .unwrap_or_else(|e| exit(format!("Control plane: {e}")));
+    let scim = scim::Scim::from_env(&env("SCIM", ""), &env("SCIM_DEFAULT_ROLE", "")).unwrap_or_else(|e| exit(format!("SCIM: {e}")));
     let allow_no_auth = auth_startup(&host, &password, break_glass);
     secrets::redact::register(&password);
     if adapters::get(&default_harness).is_none() {
@@ -187,9 +191,14 @@ async fn main() {
         sso,
         signups,
         machines: Arc::new(control_plane),
+        scim,
         ..Auth::new(Some(app.clone()))
     });
     println!("Control plane: {}.", auth_state.machines.describe());
+    match auth_state.scim.enabled {
+        true => println!("SCIM: on at /scim/v2; new users get the {} role.", auth_state.scim.default_role.as_str()),
+        false => println!("SCIM: off (SCIM=off)."),
+    }
     println!(
         "Sign-ups: {}.",
         match (auth_state.signups.enabled, auth_state.signups.turnstile.is_some()) {
@@ -204,6 +213,7 @@ async fn main() {
     }
     let sso_ids: Vec<String> = auth_state.sso.providers.iter().map(|p| p.id.clone()).collect();
     let control_plane = auth_state.machines.clone();
+    let auth_state_scim = auth_state.scim.enabled;
     let router = router(app.clone(), auth_state);
     let policy = app.db.global_policy();
     app.db.record(&Event::new(Actor::system("server"), "server.started").details(json!({
@@ -221,6 +231,7 @@ async fn main() {
         "screens": app.screens.is_some(),
         "sso": sso_ids,
         "controlPlane": control_plane.enabled(),
+        "scim": auth_state_scim,
     })));
     audit::start_retention(app.clone(), retention);
     users::start_pruning(app.clone(), sessions);
@@ -324,9 +335,28 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/signups/config", get(signups::config))
         .route("/signups/{id}", get(signups::get))
         .route("/signups/{id}/approve", post(signups::approve))
-        .route("/signups/{id}/reject", post(signups::reject));
+        .route("/signups/{id}/reject", post(signups::reject))
+        .route("/scim/tokens", get(scim::list_tokens).post(scim::create_token))
+        .route("/scim/tokens/{id}", delete(scim::revoke_token));
+    // SCIM has its own bearer tokens and error format, so its own guard, not `auth` (ADR 0023).
+    let scim_routes = Router::new()
+        .route("/scim/v2/ServiceProviderConfig", get(scim::service_provider_config))
+        .route("/scim/v2/ResourceTypes", get(scim::resource_types))
+        .route("/scim/v2/ResourceTypes/{id}", get(scim::resource_type))
+        .route("/scim/v2/Schemas", get(scim::schemas))
+        .route("/scim/v2/Schemas/{id}", get(scim::schema))
+        .route("/scim/v2/Users", get(scim::list_users).post(scim::create_user))
+        .route("/scim/v2/Users/{id}", get(scim::get_user).put(scim::replace_user).patch(scim::patch_user).delete(scim::delete_user))
+        .route("/scim/v2/Groups", get(scim::list_groups).post(scim::groups_unsupported))
+        .route("/scim/v2/Groups/{id}", get(scim::get_group).put(scim::groups_unsupported).patch(scim::groups_unsupported).delete(scim::groups_unsupported))
+        .route("/scim/v2", any(scim::unknown))
+        .route("/scim/v2/{*rest}", any(scim::unknown))
+        .layer(DefaultBodyLimit::max(scim::MAX_BODY))
+        .layer(middleware::from_fn_with_state(auth_state.clone(), scim::guard))
+        .layer(Extension(auth_state.clone()));
     Router::new()
         .route("/healthz", get(|| async { Json(json!({ "ok": true })) }))
+        .merge(scim_routes)
         .merge(
             Router::new()
                 .nest("/api", api)
@@ -418,6 +448,8 @@ struct Auth {
     signups: signups::Signups,
     /// Per-user machines (ADR 0025). Off unless LINODE_TOKEN is set.
     machines: Arc<machines::ControlPlane>,
+    /// SCIM provisioning (ADR 0023).
+    scim: scim::Scim,
     /// The database: sessions and audit events. None in tests of auth alone.
     app: Option<AppState>,
 }
@@ -437,6 +469,7 @@ impl Auth {
             sso: sso::Sso::default(),
             signups: signups::Signups::default(),
             machines: Arc::default(),
+            scim: scim::Scim::default(),
             app,
         }
     }

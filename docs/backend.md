@@ -137,13 +137,13 @@ API keys and tokens for Bots come from two places, first match wins:
 
 Saved secrets and every approval's tool input are sealed with XChaCha20-Poly1305 under a master key: `SUPERBOT_MASTER_KEY` (64 hex chars), or the 0600 file in `SUPERBOT_MASTER_KEY_FILE` (default `~/.config/superbot/master.key`, created on first start). The key never lives in `DATA_DIR`, so backups don't carry it. botd won't start with a wrong key, or without the key once something is sealed.
 
-Values never come back out: the API lists names only. Known values (saved and env secrets, `AUTH_PASSWORD`, the Bots' token, screen tokens, the key) and any session token, sign-in code, or SSO handoff code botd issued (`sbs_…`, `sbc_…`, `sbh_…`) are replaced by `[redacted]` in saved chats, approvals, the audit log, and live events. Upgrading seals old approval inputs and scrubs known values from saved chats on first start. Bots run as the same OS user, so this protects copies of the database, not the running server. See [ADR 0010](adr/0010-secrets.md).
+Values never come back out: the API lists names only. Known values (saved and env secrets, `AUTH_PASSWORD`, the Bots' token, screen tokens, the key) and any session token, sign-in code, SSO handoff code, or SCIM token botd issued (`sbs_…`, `sbc_…`, `sbh_…`, `sbp_…`) are replaced by `[redacted]` in saved chats, approvals, the audit log, and live events. Upgrading seals old approval inputs and scrubs known values from saved chats on first start. Bots run as the same OS user, so this protects copies of the database, not the running server. See [ADR 0010](adr/0010-secrets.md).
 
 ## Audit log
 
 Admin actions are recorded in `audit_events` in `app.sqlite`: who (person, Bot, or system part), what (`bot.created`, `routine.disabled`, `approval.denied`, ...), the target, the outcome, the source IP and user agent, and a few scrubbed details. Logins and failed logins, Bot and routine changes, policy, rules, approvals, handoffs, Bot-token calls, Bot runs (`bot.run_finished`), and harness starts (`harness.invoked`) are all covered; the full list is in [ADR 0009](adr/0009-audit-events.md).
 
-- **Who, exactly**: a person's id, name, email, and role when they acted; how they signed in (`password` = break-glass `AUTH_PASSWORD`, `code`, `sso`, `none`, `bot_token`); for SSO, the IdP type (`entra`, `google`, `oidc`, `github`, `apple`, `saml`), its configured provider id, and their IdP subject; and the session id. A Bot (or a routine) records whose authority it used: its owner, as `onBehalfOf`. A Bot run is attributed to whoever queued it: the person who sent the chat, the Bot that asked, or the scheduler. Rows from before this was added leave these empty. Design: [ADR 0019](adr/0019-audit-actors.md).
+- **Who, exactly**: a person's id, name, email, and role when they acted; how they signed in (`password` = break-glass `AUTH_PASSWORD`, `code`, `sso`, `none`, `bot_token`, `scim_token`); for SSO, the IdP type (`entra`, `google`, `oidc`, `github`, `apple`, `saml`), its configured provider id, and their IdP subject; and the session id. A Bot (or a routine) records whose authority it used: its owner, as `onBehalfOf`. A Bot run is attributed to whoever queued it: the person who sent the chat, the Bot that asked, or the scheduler. Rows from before this was added leave these empty. Design: [ADR 0019](adr/0019-audit-actors.md).
 
 - **Append-only**: no API edits or deletes rows, and SQLite triggers refuse `UPDATE` and any `DELETE` inside the retention window.
 - **No secrets**: passwords, tokens, message bodies, and routine instructions are never recorded. Details are scrubbed and clipped anyway.
@@ -197,6 +197,22 @@ botctl signup reject <id> --reason "Not a customer"
 - **SSO**: approving doesn't link an IdP account (email never links). The confirmation page and the approve response name the providers that fit; link with `botctl user link`.
 - **Email hook**: `signups::notify` is called with each notice (received, approved with the code, rejected). It sends nothing today.
 - **Audit**: `signup.submitted`, `signup.refused` (honeypot, throttled), `signup.approved` (with `user.created` and `user.login_code_created`), `signup.rejected`.
+
+### SCIM provisioning
+
+Entra ID, Okta, or another SCIM 2.0 client creates, updates, disables, and deletes users at `/scim/v2`. Users only; groups come later. Setup: [sso/scim.md](sso/scim.md). Design: [ADR 0023](adr/0023-scim.md).
+
+```sh
+botctl scim token create entra --sso entra          # the sbp_ token, once; --sso: externalId is the SSO subject
+botctl scim tokens | botctl scim token revoke <id>
+```
+
+- **Off by default**: `SCIM=on` turns it on; off, `/scim/v2` answers 404. New users get `SCIM_DEFAULT_ROLE` (`member` or `readonly`; `admin` is refused at start). SCIM never changes roles.
+- **Tenants**: each token belongs to a tenant (one IdP connection), which sees only the users it provisioned. Only token hashes are stored. Session tokens and the password don't work on `/scim/v2`, and SCIM tokens don't work on `/api`.
+- **One user per person**: with `--sso`, provisioning links the person's SSO identity, or takes on the user an admin already linked it to. Email never matches: a user with the same email is a 409. Never the owner account.
+- **Deprovisioning**: `active: false` disables the user and ends their sessions. `DELETE` does the same and hides the user from the tenant; nothing is destroyed, and the same `externalId` brings the same user back.
+- **Limits**: 600 requests a minute per tenant, 20 bad tokens per IP in 10 minutes, 64 KiB bodies, 200 users per page.
+- **Audit**: actor `system` `scim:<token id>`, method `scim_token`. `user.created` (`reason: scim`), `user.updated`, `user.disabled`, `user.enabled`, `user.identity_linked`, `scim.user_linked`, `scim.user_deleted`, `scim.user_restored`, `scim.token_created`, `scim.token_revoked`, `scim.auth_failed` (throttled).
 
 ### Shared and private Bots
 
@@ -258,6 +274,13 @@ Sign-ups ([ADR 0022](adr/0022-landing-and-signups.md)). Submitting and the confi
 - `POST /api/signups/:id/approve` `{role?, ttlMinutes?}` → `{signup, user, code, expiresAt, emailed: false, sso}`. 409 when decided already or the email is a user's
 - `POST /api/signups/:id/reject` `{reason?}`. 409 when decided already
 
+SCIM ([ADR 0023](adr/0023-scim.md)). Tokens are admin only:
+
+- `GET /api/scim/tokens` → `{enabled, defaultRole, tokens: [{id, tenant, label, ssoProvider, createdAt, createdBy, lastUsedAt, revokedAt, revokedBy}]}`
+- `POST /api/scim/tokens` `{tenant, label?, sso?}` → 201 `{token, scimToken, enabled}`, the token once. 400 for a bad tenant name or SSO provider, 409 when the tenant links another provider
+- `DELETE /api/scim/tokens/:id`
+- `/scim/v2` (`Authorization: Bearer sbp_…`, `application/scim+json`): `GET /ServiceProviderConfig`, `/ResourceTypes`, `/Schemas`; `GET /Users?filter=userName eq "…"|externalId eq "…"&startIndex=&count=`, `POST /Users`, `GET|PUT|PATCH|DELETE /Users/:id`; `GET /Groups` is always empty, other group requests are 501. Errors use the SCIM error schema
+
 Per-user machines ([ADR 0025](adr/0025-control-plane-linode.md)). 503 when the control plane is off. Admin only, except `GET /api/machine`:
 
 - `GET /api/machine`: the caller's own machine `{id, tier, region, state, providerStatus, ipv4, backups, createdAt, updatedAt}`; 404 if none. Never anyone else's
@@ -276,12 +299,12 @@ Approvals, policy, and audit. Writes, decisions, the approvals list, and the aud
 - `GET /api/approvals?status=pending|approved|denied|expired|cancelled|all&bot=<id>&limit=`
 - `POST /api/approvals/:id/approve`, `POST /api/approvals/:id/deny` `{remember?: "bot"|"global", note?}`. Remember needs an admin. 409 if already decided
 - `POST /api/approvals/check` `{from, harness, event}`: the hook's call. Waits for a decision. Replies `allow` or `deny`, then the reason, as plain text
-- `GET /api/audit?from=&to=&action=&actor=&outcome=&bot=&limit=&before=<id>`: audit events, newest first, `{events, nextBefore}`. `from`/`to`: unix ms, RFC 3339, or `YYYY-MM-DD`. `action`: exact or `prefix.*`, comma-separated. `actor`: `user`, `bot`, or `system`, optionally `:<id>` (or `user:<email>`). Also `method` (comma-separated `password`, `code`, `sso`, `none`, `bot_token`), `idp` (type), `idpProvider` (id), `subject` (`<issuer>|<sub>`), `session`, `onBehalfOf` (user id or email). Each event has `actorEmail`, `actorRole`, `authMethod`, `idp`, `idpProvider`, `sessionId`, `onBehalfOf`. `limit` 1 to 1000, default 100
+- `GET /api/audit?from=&to=&action=&actor=&outcome=&bot=&limit=&before=<id>`: audit events, newest first, `{events, nextBefore}`. `from`/`to`: unix ms, RFC 3339, or `YYYY-MM-DD`. `action`: exact or `prefix.*`, comma-separated. `actor`: `user`, `bot`, or `system`, optionally `:<id>` (or `user:<email>`). Also `method` (comma-separated `password`, `code`, `sso`, `none`, `bot_token`, `scim_token`), `idp` (type), `idpProvider` (id), `subject` (`<issuer>|<sub>`), `session`, `onBehalfOf` (user id or email). Each event has `actorEmail`, `actorRole`, `authMethod`, `idp`, `idpProvider`, `sessionId`, `onBehalfOf`. `limit` 1 to 1000, default 100
 - `GET /api/audit/export.csv` (same filters): CSV download, oldest first
 - `GET /api/secrets`: `{secrets: [{name, store, writable, shadowedBy, forBots}]}`, names only; `forBots` is false for botd's own SSO client secrets. `PUT /api/secrets/:name` `{value}`, `DELETE /api/secrets/:name`. Admin only
 
 ## Not built yet
 
-Sign-up emails, self-serve SSO linking, and sign-up retention ([ADR 0022](adr/0022-landing-and-signups.md)). Enrollment and mTLS with per-user machines, moving a user's Bots onto theirs, and `botctl machine` commands ([ADR 0025](adr/0025-control-plane-linode.md)). Vault/Key Vault/Secret Manager stores and master-key rotation (the `SecretStore` trait is ready for them), per-Bot resource limits, Slack. Approvals follow-ups are in [approvals-followups.md](approvals-followups.md).
+Sign-up emails, self-serve SSO linking, and sign-up retention ([ADR 0022](adr/0022-landing-and-signups.md)). SCIM groups, group-to-role mapping, and bulk ([ADR 0023](adr/0023-scim.md)). Enrollment and mTLS with per-user machines, moving a user's Bots onto theirs, and `botctl machine` commands ([ADR 0025](adr/0025-control-plane-linode.md)). Vault/Key Vault/Secret Manager stores and master-key rotation (the `SecretStore` trait is ready for them), per-Bot resource limits, Slack. Approvals follow-ups are in [approvals-followups.md](approvals-followups.md).
 
 Computer use (each Bot's screen, browser, and live view) is in [computer.md](computer.md).
