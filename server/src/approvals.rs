@@ -43,9 +43,13 @@ impl Drop for OnDrop {
 }
 
 impl App {
-    pub fn policy_ctx(&self) -> Ctx {
+    /// The Bot's workspace is its owner's folder, so deleting in another user's folder
+    /// counts as outside it (ADR 0028).
+    pub fn policy_ctx(&self, bot: &Bot) -> Ctx {
         let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| "/".into());
-        Ctx { workspace: self.cfg.workspace.clone(), home }
+        // No folder of its own (an odd owner id): nothing is inside, so every delete asks.
+        let workspace = self.workspace_for(&bot.owner_id).unwrap_or_else(|| self.cfg.workspace.join(crate::isolation::USERS).join(".none"));
+        Ctx { workspace, home }
     }
 
     /// Decides one tool call. Risky calls wait for the user. Never fails open:
@@ -53,8 +57,9 @@ impl App {
     pub async fn check(self: &Arc<Self>, bot: &Bot, harness: &str, tool: &str, input: Value, cwd: Option<PathBuf>) -> Verdict {
         let cap = self.note_hook(&bot.id);
         let p = self.db.effective_policy(&bot.id);
-        let call = Call::new(tool, input, cwd.unwrap_or_else(|| self.cfg.workspace.clone()));
-        let v = policy::decide(&p, &self.db.rules(Some(&bot.id)), &call, &self.policy_ctx());
+        let ctx = self.policy_ctx(bot);
+        let call = Call::new(tool, input, cwd.unwrap_or_else(|| ctx.workspace.clone()));
+        let v = policy::decide(&p, &self.db.rules(Some(&bot.id)), &call, &ctx);
         let shown = call.shown();
         let detail = || json!({ "tool": call.tool, "subject": shown, "class": v.class, "reason": v.reason, "rule": v.rule, "harness": harness });
         let verdict = |action: &str, outcome: Outcome| {

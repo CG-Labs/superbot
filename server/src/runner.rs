@@ -4,14 +4,16 @@
 use crate::adapters::{self, AbortReason, AgentEvent, Guard, RunInput};
 use crate::audit::{Actor, Event, Outcome, Who};
 use crate::db::{Bot, BotPatch, Db, Message};
-use crate::paths;
+use crate::machines::ControlPlane;
+use crate::machines::route::{Job, Refusal, Target};
+use crate::{isolation, paths};
 use crate::policy::Mode;
 use crate::screen::{self, Screens};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, oneshot, watch};
 
@@ -21,12 +23,15 @@ const HOOK_GRACE: Duration = Duration::from_secs(5);
 
 pub struct Config {
     pub data_dir: PathBuf,
+    /// Holds one working folder per user (`users/<id>`, ADR 0028).
     pub workspace: PathBuf,
+    /// The owner account's name, for Bots the operator owns.
     pub user_name: String,
     /// Added to PATH so Bots can run `botctl`.
     pub bin_dir: PathBuf,
     pub api_url: String,
-    pub bot_token: String,
+    /// Signs each Bot's own `BOT_TOKEN` (`isolation::bot_token`). Made fresh at each start.
+    pub bot_key: String,
     pub run_timeout: Duration,
     pub default_harness: String,
 }
@@ -60,6 +65,8 @@ pub struct App {
     waiters: Mutex<HashMap<i64, oneshot::Sender<String>>>,
     /// Tool calls waiting on the user, by approval id. true = approved.
     pub approval_waiters: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+    /// Picks where each Bot runs: its owner's machine, or here (ADR 0028). Unset: here.
+    pub control_plane: OnceLock<Arc<ControlPlane>>,
     closing: AtomicBool,
 }
 
@@ -73,6 +80,7 @@ impl App {
             bots: Mutex::default(),
             waiters: Mutex::default(),
             approval_waiters: Mutex::default(),
+            control_plane: OnceLock::new(),
             closing: AtomicBool::new(false),
         })
     }
@@ -144,8 +152,22 @@ impl App {
     fn memory_file(&self, id: &str) -> Option<PathBuf> {
         paths::child(&self.bot_dir(id)?, "MEMORY.md")
     }
-    fn user_file(&self) -> Option<PathBuf> {
-        paths::child(&paths::canonical(&self.cfg.data_dir)?, "USER.md")
+    /// `DATA_DIR/users/<owner>/USER.md`: facts about one user, for that user's Bots only.
+    pub fn user_file(&self, owner_id: &str) -> Option<PathBuf> {
+        paths::child(&isolation::user_dir(&self.cfg.data_dir, owner_id)?, "USER.md")
+    }
+
+    /// `WORKSPACE_DIR/users/<owner>`, created: the folder every Bot of that user works in.
+    pub fn workspace_for(&self, owner_id: &str) -> Option<PathBuf> {
+        isolation::user_dir(&self.cfg.workspace, owner_id)
+    }
+
+    /// Who a Bot works for, by name.
+    pub fn owner_name(&self, bot: &Bot) -> String {
+        match self.db.user(&bot.owner_id) {
+            Some(u) if u.id != crate::users::OPERATOR && !u.name.trim().is_empty() => u.name,
+            _ => self.cfg.user_name.clone(),
+        }
     }
 
     pub fn init_bot_files(&self, bot: &Bot) {
@@ -157,11 +179,31 @@ impl App {
         {
             let _ = std::fs::write(&mem, format!("# {}\n\n## Job\n\nNot set yet. Ask the user.\n\n## Rules\n\n## Work log\n", bot.name));
         }
-        if let Some(user) = self.user_file()
+        if let Some(user) = self.user_file(&bot.owner_id)
             && !user.exists()
         {
-            let _ = std::fs::write(&user, format!("# About the user\n\n- Name: {}\n", self.cfg.user_name));
+            let _ = std::fs::write(&user, format!("# About the user\n\n- Name: {}\n", self.owner_name(bot)));
         }
+    }
+
+    /// Where a Bot's run happens and what it gets: its owner's working folder, and
+    /// the server-wide secrets plus its owner's, never another user's. `BOT_TOKEN`
+    /// proves to botd which Bot is calling, so it can only act as itself.
+    pub(crate) fn run_space(&self, bot: &Bot) -> Option<(PathBuf, HashMap<String, String>)> {
+        let cwd = self.workspace_for(&bot.owner_id)?;
+        let mut env: HashMap<String, String> =
+            crate::secrets::global().harness_env_for(&bot.owner_id).into_iter().map(|(k, v)| (k, v.expose().to_string())).collect();
+        let token = isolation::bot_token(&self.cfg.bot_key, &bot.id);
+        crate::secrets::redact::register(&token);
+        env.extend([
+            ("BOT_ID".to_string(), bot.id.clone()),
+            ("BOT_API".to_string(), self.cfg.api_url.clone()),
+            ("BOT_TOKEN".to_string(), token),
+            ("SUPERBOT_BOTCTL".to_string(), self.cfg.bin_dir.join("botctl").display().to_string()),
+        ]);
+        let path = std::env::var("PATH").unwrap_or_default();
+        env.insert("PATH".into(), format!("{}:{path}", self.cfg.bin_dir.display()));
+        Some((cwd, env))
     }
 
     pub fn enqueue(self: &Arc<Self>, msg: Message) {
@@ -212,9 +254,15 @@ impl App {
         let Some(bot_dir) = self.bot_dir(&bot.id) else {
             return self.say(&bot.id, "This Bot's id isn't a safe folder name, so it can't run.", true);
         };
+        let Some(space) = self.run_space(&bot) else {
+            return self.say(&bot.id, "This Bot's owner id isn't a safe folder name, so it can't run.", true);
+        };
+        let by = self.requester(&bot, msg);
+        if !self.route_here(&bot, msg, &by).await {
+            return;
+        }
         self.init_bot_files(&bot);
         self.db.set_status(msg.id, "running");
-        let by = self.requester(&bot, msg);
         let started = Instant::now();
         let from = || msg.from_bot.as_deref().and_then(|id| self.db.bot(id)).map(|b| format!("{} (id {})", b.name, b.id)).unwrap_or("another Bot".into());
         let prompt = match msg.role.as_str() {
@@ -249,15 +297,7 @@ impl App {
                 }
             });
 
-            let mut env: HashMap<String, String> = crate::secrets::global().harness_env().into_iter().map(|(k, v)| (k, v.expose().to_string())).collect();
-            env.extend([
-                ("BOT_ID".to_string(), bot.id.clone()),
-                ("BOT_API".to_string(), self.cfg.api_url.clone()),
-                ("BOT_TOKEN".to_string(), self.cfg.bot_token.clone()),
-                ("SUPERBOT_BOTCTL".to_string(), self.cfg.bin_dir.join("botctl").display().to_string()),
-            ]);
-            let path = std::env::var("PATH").unwrap_or_default();
-            env.insert("PATH".into(), format!("{}:{path}", self.cfg.bin_dir.display()));
+            let (cwd, mut env) = space.clone();
             if let Some(screens) = &self.screens
                 && let Some(info) = screens.ensure(&bot.id, |id| self.is_running(id)).await
             {
@@ -273,7 +313,7 @@ impl App {
                 prompt: prompt.clone(),
                 system: self.system_prompt(&bot),
                 session_id: bot.session_id.clone(),
-                cwd: self.cfg.workspace.clone(),
+                cwd,
                 model: bot.model.clone(),
                 effort: bot.effort.clone(),
                 env,
@@ -391,6 +431,34 @@ impl App {
                 _ => {}
             }
             return;
+        }
+    }
+
+    /// True when the Bot runs on this server. Otherwise the message went to its owner's
+    /// own machine, or the run was refused and the Bot said why. Never another user's
+    /// machine, and never here instead when routing is on.
+    async fn route_here(&self, bot: &Bot, msg: &Message, by: &Who) -> bool {
+        let Some(cp) = self.control_plane.get() else { return true };
+        let refused = |r: Refusal, machine: Option<&str>| {
+            let e = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied);
+            self.db.record(&e.details(json!({ "reason": r.reason(), "owner": bot.owner_id, "machine": machine, "messageId": msg.id })));
+            self.say(&bot.id, &r.message(), true);
+            false
+        };
+        match cp.route(&self.db, &bot.owner_id) {
+            Ok(Target::Local) => true,
+            Err(r) => refused(r, None),
+            Ok(Target::Machine(to)) => {
+                let job = Job { bot_id: bot.id.clone(), owner_id: bot.owner_id.clone(), message_id: msg.id };
+                match cp.link.dispatch(&to, job).await {
+                    Ok(()) => {
+                        let e = by.event("bot.run_routed").target("message", &msg.id.to_string()).bot(&bot.id);
+                        self.db.record(&e.details(json!({ "owner": bot.owner_id, "machine": to.machine_id, "link": cp.link.name(), "messageId": msg.id })));
+                        false
+                    }
+                    Err(e) => refused(Refusal::Unreachable(e), Some(&to.machine_id)),
+                }
+            }
         }
     }
 
@@ -548,7 +616,7 @@ impl App {
 
     pub(crate) fn system_prompt(&self, bot: &Bot) -> String {
         let read = |p: &Option<PathBuf>| p.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default().trim().to_string();
-        let (mem_file, user_file) = (self.memory_file(&bot.id), self.user_file());
+        let (mem_file, user_file) = (self.memory_file(&bot.id), self.user_file(&bot.owner_id));
         // Only the Bots its owner can see: a Bot acts for its owner (ADR 0017).
         let others: Vec<String> = crate::acl::Viewer::owner_of(&self.db, bot)
             .bots(&self.db)
@@ -566,12 +634,12 @@ impl App {
 They talk to you in a chat app, like messaging a coworker. Finish work end to end.
 
 ## Your computer
-- You run on a Linux computer shared with the user's other Bots. Your working folder is {ws}.
-- Files, browser sign-ins, and credentials on it are shared by all Bots. Keep durable work in clear project folders.
+- You run on a Linux computer you share with {user}'s other Bots. Your working folder is {ws}; it belongs to {user}.
+- Keep {user}'s work inside it, in clear project folders. Other people's folders on this computer aren't yours to open.
 
 ## Memory
 - Your memory file: {mem_path}. It holds your job, the user's rules and preferences for you, and a short dated log of important work.
-- Shared facts about the user, used by every Bot: {user_path}. Name, time zone, and similar.
+- Facts about {user}, shared by all of their Bots: {user_path}. Name, time zone, and similar.
 - Update these files yourself when you learn something lasting, without asking. Keep them short. Never store passwords, keys, or card numbers.
 - Current contents:
 <memory>
@@ -603,14 +671,14 @@ Current time: {now}."#,
             // Full path: some harnesses run commands in a login shell that resets PATH.
             botctl = self.cfg.bin_dir.join("botctl").display(),
             screen = if self.screens.is_some() { screen_prompt(&self.cfg.bin_dir.join("botctl").display().to_string()) } else { String::new() },
-            user = self.cfg.user_name,
+            user = self.owner_name(bot),
             approvals = if self.db.effective_policy(&bot.id).mode == Mode::Ask {
                 "\n- Risky actions (destructive commands, deleting outside your folder, sending messages, installing software, git push) \
                  pause until the user approves them in the app. If one is denied, don't try another way to do it; tell the user what you wanted to do."
             } else {
                 ""
             },
-            ws = self.cfg.workspace.display(),
+            ws = self.workspace_for(&bot.owner_id).unwrap_or_default().display(),
             mem_path = mem_file.clone().unwrap_or_default().display(),
             user_path = user_file.clone().unwrap_or_default().display(),
             mem = read(&mem_file),
@@ -649,7 +717,7 @@ pub fn test_app() -> Arc<App> {
             user_name: "Tester".into(),
             bin_dir: dir,
             api_url: "http://127.0.0.1:1".into(),
-            bot_token: crate::random_hex(16),
+            bot_key: crate::random_hex(16),
             run_timeout: Duration::from_secs(60),
             default_harness: "claude".into(),
         },
@@ -726,11 +794,68 @@ mod tests {
         let dir = app.bot_dir(&bot.id).unwrap();
         assert_eq!(dir, app.cfg.data_dir.join("bots").join(&bot.id));
         assert!(app.memory_file(&bot.id).unwrap().is_file());
-        assert!(app.user_file().unwrap().is_file());
+        assert_eq!(app.user_file(&bot.owner_id).unwrap(), app.cfg.data_dir.join("users").join(&bot.owner_id).join("USER.md"));
+        assert!(app.user_file(&bot.owner_id).unwrap().is_file());
         for bad in ["", "..", "../../etc", "a/b", "/etc"] {
             assert_eq!(app.bot_dir(bad), None, "{bad:?}");
             assert_eq!(app.memory_file(bad), None, "{bad:?}");
+            assert_eq!(app.user_file(bad), None, "{bad:?}");
+            assert_eq!(app.workspace_for(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn each_users_bots_get_their_own_folder_facts_secrets_and_token() {
+        use crate::acl::Visibility;
+        use crate::rbac::Role;
+        let app = test_app();
+        crate::users::ensure_operator(&app.db, "Owner", None);
+        let ada = app.db.create_user(None, Some("ada@example.com"), "Ada", Role::Member).unwrap();
+        let bea = app.db.create_user(None, Some("bea@example.com"), "Bea", Role::Member).unwrap();
+        let a = app.db.create_bot_owned("A1", "#fff", "waddle", "claude", None, false, &ada.id, Visibility::Private);
+        let a2 = app.db.create_bot_owned("A2", "#fff", "waddle", "claude", None, false, &ada.id, Visibility::Shared);
+        let b = app.db.create_bot_owned("B1", "#fff", "waddle", "claude", None, false, &bea.id, Visibility::Private);
+        for bot in [&a, &a2, &b] {
+            app.init_bot_files(bot);
+        }
+        let key = format!("ANTHROPIC_API_KEY_{}", crate::random_hex(3).to_uppercase());
+        let ada_key = format!("sk-ant-{}", crate::random_hex(12));
+        crate::secrets::global().user_put(&ada.id, &key, &ada_key).unwrap();
+
+        let (cwd_a, env_a) = app.run_space(&a).unwrap();
+        let (cwd_a2, env_a2) = app.run_space(&a2).unwrap();
+        let (cwd_b, env_b) = app.run_space(&b).unwrap();
+        let ws = paths::canonical(&app.cfg.workspace).unwrap();
+        assert_eq!(cwd_a, ws.join("users").join(&ada.id));
+        assert_eq!(cwd_a2, cwd_a, "a user's Bots share that user's folder");
+        assert_eq!(cwd_b, ws.join("users").join(&bea.id));
+        assert!(!cwd_a.starts_with(&cwd_b) && !cwd_b.starts_with(&cwd_a));
+        assert!(cwd_a.is_dir() && cwd_b.is_dir());
+        assert_eq!(app.policy_ctx(&a).workspace, cwd_a, "deleting in Bea's folder is outside Ada's Bot's workspace");
+
+        assert_eq!(env_a.get(&key), Some(&ada_key));
+        assert_eq!(env_a2.get(&key), Some(&ada_key));
+        assert_eq!(env_b.get(&key), None, "Ada's key never reaches Bea's Bot");
+        let token = |e: &HashMap<String, String>| e["BOT_TOKEN"].clone();
+        assert_eq!(isolation::token_bot(&app.cfg.bot_key, &token(&env_a)), Some(a.id.as_str()));
+        assert_eq!(isolation::token_bot(&app.cfg.bot_key, &token(&env_b)), Some(b.id.as_str()));
+        assert_ne!(token(&env_a), token(&env_a2), "each Bot has its own token, even with one owner");
+        assert_eq!(crate::secrets::redact::text(&token(&env_a)), crate::secrets::redact::MARK);
+
+        let facts = |u: &str| std::fs::read_to_string(app.user_file(u).unwrap()).unwrap();
+        assert!(facts(&ada.id).contains("Ada") && facts(&bea.id).contains("Bea"));
+        std::fs::write(app.user_file(&ada.id).unwrap(), "# About the user\n- Name: Ada\n- Bank: ada-only-fact\n").unwrap();
+        let pa = app.system_prompt(&a);
+        let pb = app.system_prompt(&b);
+        assert!(pa.contains("AI teammate of Ada") && pa.contains(&cwd_a.display().to_string()) && pa.contains("ada-only-fact"), "{pa}");
+        assert!(pb.contains("AI teammate of Bea") && pb.contains(&cwd_b.display().to_string()), "{pb}");
+        assert!(!pb.contains("ada-only-fact") && !pb.contains(&cwd_a.display().to_string()) && !pb.contains("A1"), "{pb}");
+        assert!(!pa.contains(&cwd_b.display().to_string()) && !pa.contains("B1"), "{pa}");
+        assert!(pb.contains("A2"), "Ada's shared Bot is one Bea can ask");
+        let op = app.db.create_bot("Op", "#fff", "waddle", "claude", None, false);
+        assert!(app.system_prompt(&op).contains("AI teammate of Tester"), "the owner account uses USER_NAME");
+        crate::secrets::global().user_forget(&ada.id).unwrap();
+        crate::secrets::redact::forget(&ada_key);
     }
 
     fn fake_run(app: &App, bot_id: &str, guarded: bool) -> watch::Receiver<AbortReason> {

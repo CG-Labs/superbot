@@ -23,7 +23,7 @@ const PUBLIC: &[(&str, &str)] = &[
 ];
 
 /// Every `(method, path)` in `router()`, read from its source so a new route can't be missed.
-fn routes() -> Vec<(String, String)> {
+pub(crate) fn routes() -> Vec<(String, String)> {
     let src = include_str!("main.rs");
     let body = &src[src.find("\nfn router(").expect("fn router")..];
     let body = &body[..body.find("\n}\n").expect("end of fn router")];
@@ -70,11 +70,18 @@ fn the_route_list_is_read_whole() {
 
 #[tokio::test]
 async fn every_route_but_the_public_ones_needs_credentials_and_the_right_role() {
-    let (port, _, admin, bot) = serve_app_with(|a| {
+    let (port, app, admin, key) = serve_app_with(|a| {
         a.scim.enabled = true;
         a.scim.failures = users::Limiter::new(10_000, 60_000);
     })
     .await;
+    let bot_id = app.db.create_bot("Walker", "#fff", "waddle", "claude", None, false).id;
+    let bot = key.auth(&bot_id);
+    // A Bot token from another key (another start, or made up) or for a Bot that's gone.
+    let forged_bot = crate::tests::BotKey(crate::random_hex(16)).auth(&bot_id);
+    let gone = app.db.create_bot("Gone", "#fff", "waddle", "claude", None, false);
+    let gone_bot = key.auth(&gone.id);
+    app.db.delete_bot(&gone.id);
     let (_, member) = user_with(port, &admin, "m@example.com", "member").await;
     let (_, readonly) = user_with(port, &admin, "r@example.com", "readonly").await;
     let forged = format!("Bearer {}", users::new_secret(users::SESSION_PREFIX));
@@ -89,7 +96,13 @@ async fn every_route_but_the_public_ones_needs_credentials_and_the_right_role() 
             continue;
         }
         let path = concrete(&p);
-        for (who, auth, extra) in [("nobody", "", ""), ("forged token", forged.as_str(), ""), ("forged cookie", "", cookie.as_str())] {
+        for (who, auth, extra) in [
+            ("nobody", "", ""),
+            ("forged token", forged.as_str(), ""),
+            ("forged cookie", "", cookie.as_str()),
+            ("forged Bot token", forged_bot.as_str(), ""),
+            ("deleted Bot's token", gone_bot.as_str(), ""),
+        ] {
             let (code, _, body) = call_with(port, &m, &path, auth, extra, "{}").await;
             assert_eq!(code, 401, "{who}: {m} {path}: {body}");
         }

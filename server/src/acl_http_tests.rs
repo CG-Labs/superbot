@@ -291,24 +291,25 @@ async fn the_live_stream_carries_only_visible_bots() {
 
 #[tokio::test]
 async fn bots_act_with_their_owners_access() {
-    let (port, app, admin, bot) = serve_app().await;
+    let (port, app, admin, key) = serve_app().await;
     let (a_id, _) = user_with(port, &admin, "a@example.com", "member").await;
     let (b_id, _) = user_with(port, &admin, "b@example.com", "member").await;
     let p = app.db.create_bot_owned("Secret", "#fff", "waddle", "claude", None, false, &a_id, Visibility::Private);
     let helper = app.db.create_bot_owned("Helper", "#fff", "waddle", "claude", None, false, &b_id, Visibility::Private);
-    let as_helper = format!("X-SuperBot-Bot: {}\r\n", helper.id);
+    let bot = key.auth(&helper.id);
+    let as_helper = "";
 
-    let (_, _, list) = call_with(port, "GET", "/api/bots", &bot, &as_helper, "").await;
+    let (_, _, list) = call_with(port, "GET", "/api/bots", &bot, as_helper, "").await;
     let list = ids(&list);
     assert!(list.contains(&helper.id) && !list.contains(&p.id), "{list:?}");
     let ask = json!({ "from": helper.id, "to": "Secret", "text": "hi" }).to_string();
-    let (code, _, res) = call_with(port, "POST", "/api/ask", &bot, &as_helper, &ask).await;
+    let (code, _, res) = call_with(port, "POST", "/api/ask", &bot, as_helper, &ask).await;
     assert_eq!(code, 400, "{res}");
     assert!(res.contains("No Bot named"), "{res}");
-    assert_eq!(call_with(port, "GET", &format!("/api/bots/{}/messages", p.id), &bot, &as_helper, "").await.0, 404);
+    assert_eq!(call_with(port, "GET", &format!("/api/bots/{}/messages", p.id), &bot, as_helper, "").await.0, 404);
 
     // A new Bot made by a Bot belongs to that Bot's owner.
-    let (code, _, made) = call_with(port, "POST", "/api/bots", &bot, &as_helper, r#"{"name":"Child"}"#).await;
+    let (code, _, made) = call_with(port, "POST", "/api/bots", &bot, as_helper, r#"{"name":"Child"}"#).await;
     assert_eq!(code, 201, "{made}");
     assert_eq!(parse(&made)["owner"]["id"], b_id.as_str());
     // Its prompt lists only the Bots its owner can see.

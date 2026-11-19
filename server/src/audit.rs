@@ -34,9 +34,8 @@ impl ActorKind {
 /// Who acted. A person is a user (`operator` is the owner and break-glass account),
 /// with their email and role at the time, and how they signed in: the method, the SSO
 /// provider and its type, their IdP subject (`<issuer>|<sub>`), and the session the
-/// request came with. A Bot's id comes from `botctl` and is self-reported until Bots
-/// get their own tokens; `on_behalf_of` names the person a Bot or the scheduler acted
-/// for (the Bot's owner).
+/// request came with. A Bot's id is the one its own token names (ADR 0028);
+/// `on_behalf_of` names the person a Bot or the scheduler acted for (the Bot's owner).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Actor {

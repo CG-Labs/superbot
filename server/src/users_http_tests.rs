@@ -19,7 +19,7 @@ fn bearer(token: &str) -> String {
     format!("Bearer {token}")
 }
 
-async fn serve(tweak: impl FnOnce(&mut Auth)) -> (u16, AppState, String, String) {
+async fn serve(tweak: impl FnOnce(&mut Auth)) -> (u16, AppState, String, crate::tests::BotKey) {
     serve_app_with(|a| {
         a.password = PW.clone();
         tweak(a);
@@ -151,7 +151,9 @@ async fn cookie_writes_from_other_sites_are_refused() {
 
 #[tokio::test]
 async fn each_role_gets_exactly_its_permissions() {
-    let (port, app, admin, bot) = serve(|_| {}).await;
+    let (port, app, admin, key) = serve(|_| {}).await;
+    // A Bot of the owner account, an admin, so only the Bot role limits it.
+    let bot = key.auth(&app.db.create_bot("Ops", "#fff", "waddle", "claude", None, false).id);
     let (member_id, member) = user_with(port, &admin, "member@example.com", "member").await;
     let (_, readonly) = user_with(port, &admin, "viewer@example.com", "read-only").await;
     // The member owns it, so only roles decide here. Bot ACLs: acl_http_tests.rs.
@@ -447,7 +449,8 @@ async fn sign_in_codes_work_once() {
 
 #[tokio::test]
 async fn bypass_attempts_fail_closed() {
-    let (port, _, admin, bot) = serve(|_| {}).await;
+    let (port, app, admin, key) = serve(|_| {}).await;
+    let bot = key.auth(&app.db.create_bot("Ops", "#fff", "waddle", "claude", None, false).id);
     let (_, readonly) = user_with(port, &admin, "r@example.com", "readonly").await;
     let real = readonly.trim_start_matches("Bearer ").to_string();
 

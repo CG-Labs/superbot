@@ -212,6 +212,8 @@ pub struct Caller {
     pub session: Option<Session>,
     /// "session", "password" (break-glass Basic), "none" (ALLOW_NO_AUTH), or "bot_token".
     pub method: &'static str,
+    /// The Bot a Bot's token was issued to (ADR 0028). Only ever set for `Principal::Bot`.
+    pub bot: Option<String>,
 }
 
 /// The audit actor: the person, their email and role now, and how this request was

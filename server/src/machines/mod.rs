@@ -8,6 +8,7 @@
 pub mod fake;
 pub mod linode;
 pub mod provider;
+pub mod route;
 
 use crate::audit::{Actor, Event, Outcome, Source, Who};
 use crate::db::{AddMachine, Machine, NewMachine, now};
@@ -135,6 +136,11 @@ pub struct ControlPlane {
     pub label_prefix: String,
     pub authorized_keys: Vec<String>,
     pub reconcile_every: Duration,
+    /// MACHINE_ROUTING=on: each user's Bots run only on that user's machine (ADR 0028).
+    /// Off: on this server, in the owner's folders.
+    pub routing: bool,
+    /// How work reaches a user's machine. `Unenrolled` until machines run an agent.
+    pub link: Arc<dyn route::MachineLink>,
     /// One change at a time, from handlers and the reconciler alike, so two can't
     /// race on one machine. Changes are rare and admin-driven; this is cheap.
     ops: tokio::sync::Mutex<()>,
@@ -151,6 +157,8 @@ impl Default for ControlPlane {
             label_prefix: "superbot".into(),
             authorized_keys: Vec::new(),
             reconcile_every: Duration::from_secs(DEFAULT_RECONCILE_SECONDS),
+            routing: false,
+            link: Arc::new(route::Unenrolled),
             ops: tokio::sync::Mutex::new(()),
         }
     }
@@ -164,6 +172,15 @@ fn slug(s: &str, max: usize) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         && !s.starts_with('-')
         && !s.ends_with('-')
+}
+
+/// MACHINE_ROUTING: off (the default) or on.
+fn routing(raw: &str) -> Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" | "false" | "no" => Ok(false),
+        "1" | "on" | "true" | "yes" => Ok(true),
+        v => Err(format!("MACHINE_ROUTING must be on or off, not \"{v}\"")),
+    }
 }
 
 fn list(raw: &str) -> Vec<String> {
@@ -207,6 +224,9 @@ impl ControlPlane {
         var: impl Fn(&str) -> String,
     ) -> Result<ControlPlane, String> {
         let Some(token) = store.get("LINODE_TOKEN").map_err(|e| e.to_string())? else {
+            if routing(&var("MACHINE_ROUTING"))? {
+                return Err("MACHINE_ROUTING=on needs the control plane: set LINODE_TOKEN and MACHINE_REGIONS".into());
+            }
             return Ok(ControlPlane::default());
         };
         let token = token.expose().trim().to_string();
@@ -274,6 +294,7 @@ impl ControlPlane {
             .ok_or("MACHINE_RECONCILE_SECONDS must be 10 to 3600")?;
         Ok(ControlPlane {
             provider: Some(provider),
+            routing: routing(&var("MACHINE_ROUTING"))?,
             tiers: parse_tiers(&or("MACHINE_TIERS", DEFAULT_TIERS))?,
             image,
             backups,
@@ -282,6 +303,11 @@ impl ControlPlane {
             reconcile_every: Duration::from_secs(secs),
             ..ControlPlane::default()
         })
+    }
+
+    /// Where `user_id`'s Bots run (`route::target`).
+    pub fn route(&self, db: &crate::db::Db, user_id: &str) -> Result<route::Target, route::Refusal> {
+        route::target(db, self, user_id)
     }
 
     #[cfg(test)]
@@ -301,7 +327,7 @@ impl ControlPlane {
         match &self.provider {
             None => "off (set LINODE_TOKEN and MACHINE_REGIONS for one machine per user)".into(),
             Some(p) => format!(
-                "{}, regions {}, tiers {}, backups {}",
+                "{}, regions {}, tiers {}, backups {}, routing {}",
                 p.name(),
                 self.regions.join(", "),
                 self.tiers
@@ -309,7 +335,8 @@ impl ControlPlane {
                     .map(|(t, p)| format!("{t}={p}"))
                     .collect::<Vec<_>>()
                     .join(", "),
-                if self.backups { "on" } else { "off" }
+                if self.backups { "on" } else { "off" },
+                if self.routing { format!("on via {}", self.link.name()) } else { "off (Bots run on this server)".into() }
             ),
         }
     }
@@ -1261,5 +1288,25 @@ mod tests {
                 .into())
             .is_err()
         );
+    }
+
+    #[test]
+    fn routing_is_off_unless_asked_and_needs_the_control_plane() {
+        let token = EnvStore::fixed(&[("LINODE_TOKEN", "routing-test-token-9e2a")]);
+        let vars = |routing: &'static str| {
+            move |k: &str| match k {
+                "MACHINE_REGIONS" => "gb-lon".to_string(),
+                "MACHINE_ROUTING" => routing.to_string(),
+                _ => String::new(),
+            }
+        };
+        let off = ControlPlane::from_env(&token, vars("")).unwrap();
+        assert!(!off.routing && off.describe().contains("routing off"), "{}", off.describe());
+        let on = ControlPlane::from_env(&token, vars("on")).unwrap();
+        assert!(on.routing && on.describe().contains("routing on via unenrolled"), "{}", on.describe());
+        assert!(ControlPlane::from_env(&token, vars("sometimes")).is_err());
+        let err = ControlPlane::from_env(&EnvStore::fixed(&[]), vars("on")).err().unwrap();
+        assert!(err.contains("LINODE_TOKEN"), "routing on without machines would strand every Bot: {err}");
+        assert!(!ControlPlane::from_env(&EnvStore::fixed(&[]), vars("off")).unwrap().routing);
     }
 }

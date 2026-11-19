@@ -14,8 +14,9 @@ use crate::*;
 async fn serve() -> (u16, AppState, String, String, Arc<Fake>) {
     let fake = Arc::new(Fake::default());
     let p: Arc<dyn MachineProvider> = fake.clone();
-    let (port, app, owner, bot) =
+    let (port, app, owner, key) =
         serve_app_with(|a| a.machines = Arc::new(ControlPlane::for_tests(p))).await;
+    let bot = key.auth(&app.db.create_bot("Ops", "#fff", "waddle", "claude", None, false).id);
     let (_, admin) = user_with(port, &owner, "ops@example.com", "admin").await;
     (port, app, admin, bot, fake)
 }

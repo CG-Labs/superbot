@@ -102,6 +102,14 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS secrets (
   value TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS user_secrets (
+  user_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  value TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, name)
 );";
 
 /// A connection of its own to the database (WAL allows several), with the `secrets` table.
@@ -138,6 +146,12 @@ fn any_sealed(c: &Connection) -> rusqlite::Result<Option<(String, String)>> {
     if secret.is_some() {
         return Ok(secret);
     }
+    let mine = c
+        .query_row("SELECT user_id, name, value FROM user_secrets LIMIT 1", [], |r| Ok((user_context(&r.get::<_, String>(0)?, &r.get::<_, String>(1)?), r.get(2)?)))
+        .optional()?;
+    if mine.is_some() {
+        return Ok(mine);
+    }
     c.query_row("SELECT id, input FROM approvals WHERE input LIKE 'sb1:%' LIMIT 1", [], |r| Ok((approval_context(&r.get::<_, String>(0)?), r.get(1)?)))
         .optional()
 }
@@ -156,6 +170,13 @@ fn discard(c: &Connection, keep: Option<&Cipher>) -> rusqlite::Result<usize> {
     let mut n = 0;
     for (name, v) in secrets.iter().filter(|(name, v)| !opens(&context(name), v)) {
         n += tx.execute("DELETE FROM secrets WHERE name = ? AND value = ?", params![name, v])?;
+    }
+    let mine: Vec<(String, String, String)> = {
+        let mut s = tx.prepare("SELECT user_id, name, value FROM user_secrets")?;
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?
+    };
+    for (user, name, v) in mine.iter().filter(|(u, name, v)| !opens(&user_context(u, name), v)) {
+        n += tx.execute("DELETE FROM user_secrets WHERE user_id = ? AND name = ? AND value = ?", params![user, name, v])?;
     }
     for (id, _) in approvals.iter().filter(|(id, v)| !opens(&approval_context(id), v)) {
         n += tx.execute("UPDATE approvals SET input = '{\"sealed\":\"discarded\"}' WHERE id = ?", [id])?;
@@ -308,6 +329,72 @@ impl SecretStore for SealedStore {
     }
 }
 
+/// The associated data names the user too, so a value copied to another user's row
+/// doesn't open as theirs.
+fn user_context(user_id: &str, name: &str) -> String {
+    format!("user-secrets/{user_id}/{name}")
+}
+
+/// Each user's own secrets (ADR 0028): API keys and tokens that reach only that user's
+/// Bots. Every query names the user.
+pub struct UserSecrets {
+    c: Mutex<Connection>,
+    cipher: Arc<Cipher>,
+}
+
+impl UserSecrets {
+    pub fn new(c: Connection, cipher: Arc<Cipher>) -> UserSecrets {
+        UserSecrets { c: Mutex::new(c), cipher }
+    }
+
+    fn c(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.c.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn get(&self, user_id: &str, name: &str) -> Result<Option<Secret>, Error> {
+        let v: Option<String> = self
+            .c()
+            .query_row("SELECT value FROM user_secrets WHERE user_id = ? AND name = ?", [user_id, name], |r| r.get(0))
+            .optional()
+            .map_err(store_err)?;
+        v.map(|v| self.cipher.open_text(&user_context(user_id, name), &v)).transpose()
+    }
+
+    /// The user's secret names and when each was last set. Never values.
+    pub fn names(&self, user_id: &str) -> Result<Vec<(String, i64)>, Error> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT name, updated_at FROM user_secrets WHERE user_id = ? ORDER BY name").map_err(store_err)?;
+        s.query_map([user_id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(store_err)?.collect::<rusqlite::Result<_>>().map_err(store_err)
+    }
+
+    pub fn put(&self, user_id: &str, name: &str, value: &str) -> Result<(), Error> {
+        let sealed = self.cipher.seal(&user_context(user_id, name), value.as_bytes());
+        self.c()
+            .execute(
+                "INSERT INTO user_secrets (user_id, name, value, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)
+                 ON CONFLICT(user_id, name) DO UPDATE SET value = ?3, updated_at = ?4",
+                params![user_id, name, sealed, crate::db::now()],
+            )
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// True if the user had it.
+    pub fn delete(&self, user_id: &str, name: &str) -> Result<bool, Error> {
+        Ok(self.c().execute("DELETE FROM user_secrets WHERE user_id = ? AND name = ?", [user_id, name]).map_err(store_err)? == 1)
+    }
+
+    /// Every value, for the redactor at startup.
+    pub fn all_values(&self) -> Vec<Secret> {
+        let rows: Vec<(String, String, String)> = {
+            let c = self.c();
+            let Ok(mut s) = c.prepare("SELECT user_id, name, value FROM user_secrets") else { return Vec::new() };
+            s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map(|m| m.filter_map(Result::ok).collect()).unwrap_or_default()
+        };
+        rows.iter().filter_map(|(u, n, v)| self.cipher.open_text(&user_context(u, n), v).ok()).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,6 +450,37 @@ mod tests {
         let raw = std::fs::read(&path).unwrap();
         let wal = std::fs::read(path.with_extension("sqlite-wal")).unwrap_or_default();
         let has = |hay: &[u8]| hay.windows(value.len()).any(|w| w == value.as_bytes());
+        assert!(!has(&raw) && !has(&wal), "plaintext never reaches the database file");
+    }
+
+    #[test]
+    fn user_secrets_are_per_user_and_bound_to_their_row() {
+        let (path, _db, c) = fresh();
+        let (cipher, _) = bootstrap(&c, None, || Ok(MasterKey::generate()), false).unwrap();
+        let s = UserSecrets::new(c, Arc::new(cipher));
+        let a = format!("sk-ant-{}", crate::random_hex(16));
+        s.put("ua", "ANTHROPIC_API_KEY", &a).unwrap();
+        s.put("ub", "ANTHROPIC_API_KEY", "b-key").unwrap();
+        s.put("ub", "OPENAI_API_KEY", "b-openai").unwrap();
+        assert_eq!(s.get("ua", "ANTHROPIC_API_KEY").unwrap().unwrap().expose(), a);
+        assert_eq!(s.get("ub", "ANTHROPIC_API_KEY").unwrap().unwrap().expose(), "b-key");
+        assert!(s.get("ua", "OPENAI_API_KEY").unwrap().is_none(), "B's key isn't A's");
+        assert_eq!(s.names("ua").unwrap().into_iter().map(|(n, _)| n).collect::<Vec<_>>(), ["ANTHROPIC_API_KEY"]);
+        assert!(!s.delete("ua", "OPENAI_API_KEY").unwrap(), "A can't delete B's");
+        assert!(s.get("ub", "OPENAI_API_KEY").unwrap().is_some());
+        // A ciphertext moved to another user's row doesn't open there.
+        {
+            let c = s.c();
+            let av: String = c.query_row("SELECT value FROM user_secrets WHERE user_id = 'ua'", [], |r| r.get(0)).unwrap();
+            assert!(!av.contains(&a));
+            c.execute("UPDATE user_secrets SET value = ? WHERE user_id = 'ub' AND name = 'ANTHROPIC_API_KEY'", [av]).unwrap();
+        }
+        assert!(s.get("ub", "ANTHROPIC_API_KEY").is_err());
+        assert_eq!(s.all_values().len(), 2, "the moved value is skipped, not read as B's");
+        drop(s);
+        let raw = std::fs::read(&path).unwrap();
+        let wal = std::fs::read(path.with_extension("sqlite-wal")).unwrap_or_default();
+        let has = |hay: &[u8]| hay.windows(a.len()).any(|w| w == a.as_bytes());
         assert!(!has(&raw) && !has(&wal), "plaintext never reaches the database file");
     }
 

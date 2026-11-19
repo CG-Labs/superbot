@@ -14,6 +14,9 @@ mod auth_review_http_tests;
 #[cfg(test)]
 mod interface_http_tests;
 mod cron;
+mod isolation;
+#[cfg(test)]
+mod isolation_http_tests;
 mod db;
 mod machines;
 #[cfg(test)]
@@ -130,8 +133,8 @@ async fn main() {
         eprintln!("{e}");
         std::process::exit(1);
     });
-    let bot_token = random_hex(24);
-    secrets::redact::register(&bot_token);
+    let bot_key = random_hex(32);
+    secrets::redact::register(&bot_key);
     WEB_DIR.set(std::env::var("WEB_DIR").ok().map(PathBuf::from)).unwrap();
     SITE_DIR.set(std::env::var("SITE_DIR").ok().map(PathBuf::from)).unwrap();
 
@@ -167,10 +170,23 @@ async fn main() {
         // `botctl` ships next to `botd`.
         bin_dir: std::env::current_exe().unwrap().parent().unwrap().to_path_buf(),
         api_url: format!("http://127.0.0.1:{port}"),
-        bot_token: bot_token.clone(),
+        bot_key: bot_key.clone(),
         run_timeout: Duration::from_secs(60 * env("RUN_TIMEOUT_MINUTES", "60").parse::<u64>().unwrap_or(60)),
         default_harness,
     }, screens);
+
+    // Each user's Bots work in that user's folders (ADR 0028). Files from before were
+    // the owner account's.
+    match isolation::migrate_workspace(&app.cfg.workspace, users::OPERATOR) {
+        Ok(0) => {}
+        Ok(n) => println!("Workspace: moved {n} shared files and folders into users/{}.", users::OPERATOR),
+        Err(e) => exit(format!("WORKSPACE_DIR: couldn't move the shared files into users/{}: {e}", users::OPERATOR)),
+    }
+    match isolation::migrate_user_file(&app.cfg.data_dir, users::OPERATOR) {
+        Ok(true) => println!("USER.md: moved to users/{}/USER.md.", users::OPERATOR),
+        Ok(false) => {}
+        Err(e) => exit(format!("DATA_DIR: couldn't move USER.md: {e}")),
+    }
 
     // First start: create the primary Bot.
     if app.db.bots().is_empty() {
@@ -186,7 +202,7 @@ async fn main() {
         password: password.clone(),
         break_glass,
         allow_no_auth,
-        bot_token,
+        bot_key,
         hosts: allowed_hosts(&host, port, &env("ALLOWED_HOSTS", "")),
         trust_forwarded: env("TRUST_FORWARDED_FOR", "") == "1",
         sessions,
@@ -215,6 +231,7 @@ async fn main() {
     }
     let sso_ids: Vec<String> = auth_state.sso.providers.iter().map(|p| p.id.clone()).collect();
     let control_plane = auth_state.machines.clone();
+    let _ = app.control_plane.set(control_plane.clone());
     let auth_state_scim = auth_state.scim.enabled;
     let router = router(app.clone(), auth_state);
     let policy = app.db.global_policy();
@@ -309,6 +326,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/audit/export.csv", get(export_audit))
         .route("/secrets", get(list_secrets))
         .route("/secrets/{name}", put(put_secret).delete(delete_secret))
+        .route("/me/secrets", get(list_my_secrets))
+        .route("/me/secrets/{name}", put(put_my_secret).delete(delete_my_secret))
         .route("/ask", post(ask))
         .route("/handoff", post(handoff))
         .route("/auth/login", post(users::login))
@@ -322,6 +341,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/login-codes", post(users::create_login_code))
         .route("/users/{key}/sessions", delete(users::revoke_user_sessions))
         .route("/users/{key}/bots", get(users::user_bots))
+        .route("/users/{key}/secrets", get(list_user_secrets).delete(delete_user_secrets))
         .route("/users/{key}/identities", get(sso::list_identities).post(sso::link_identity))
         .route("/users/{key}/identities/{id}", delete(sso::unlink_identity))
         .route("/users/{key}/machine", get(machines::get).post(machines::request).delete(machines::destroy))
@@ -435,7 +455,8 @@ struct Auth {
     break_glass: bool,
     /// Only when ALLOW_NO_AUTH=1 and loopback: empty password does not skip login on its own.
     allow_no_auth: bool,
-    bot_token: String,
+    /// Signs and checks each Bot's token (`isolation::bot_token`). The same as `Config::bot_key`.
+    bot_key: String,
     /// Host headers we answer to, lowercase.
     hosts: Vec<String>,
     /// TRUST_FORWARDED_FOR=1: take the client IP from X-Forwarded-For from any peer,
@@ -462,7 +483,7 @@ impl Auth {
             password: String::new(),
             break_glass: true,
             allow_no_auth: false,
-            bot_token: String::new(),
+            bot_key: String::new(),
             hosts: Vec::new(),
             trust_forwarded: false,
             sessions: SessionConfig::default(),
@@ -527,13 +548,11 @@ impl Auth {
         Some(found)
     }
 
-    /// A Bot request names its Bot (`X-SuperBot-Bot`, from botctl's BOT_ID). All Bots
-    /// share one token, so this is self-reported. A known Bot acts for its owner.
-    fn bot_actor(&self, headers: &axum::http::HeaderMap) -> Actor {
-        let id = headers.get("x-superbot-bot").and_then(|v| v.to_str().ok()).filter(|id| id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric()));
-        match id.and_then(|id| self.app.as_ref()?.db.bot(id)) {
+    /// The Bot a token was issued to, acting for its owner.
+    fn bot_actor(&self, bot_id: Option<&str>) -> Actor {
+        match bot_id.and_then(|id| self.app.as_ref()?.db.bot(id)) {
             Some(b) => Actor::for_bot(&b),
-            None => Actor::bot(None, None),
+            None => Actor::bot(bot_id, None),
         }
         .method("bot_token")
     }
@@ -666,7 +685,7 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
         Err(res) => return *res,
     };
     let actor = match (&caller.principal, &caller.user) {
-        (Principal::Bot, _) => a.bot_actor(req.headers()),
+        (Principal::Bot, _) => a.bot_actor(caller.bot.as_deref()),
         (_, Some(u)) => users::actor(&a, u, caller.session.as_ref(), caller.method),
         (_, None) => Actor::operator().method(caller.method),
     };
@@ -679,12 +698,26 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
         a.record(by.event("access.denied").outcome(Outcome::Denied).details(json!({ "method": method.as_str(), "path": path, "need": need.as_str(), "reason": reason })));
         ApiError(StatusCode::FORBIDDEN, msg).into_response()
     };
+    // Older botctl names its Bot in a header. It must be the Bot the token names.
+    let claimed = req.headers().get("x-superbot-bot").map(|v| v.to_str().unwrap_or("").to_string());
+    if caller.principal == Principal::Bot && claimed.as_deref().is_some_and(|id| Some(id) != caller.bot.as_deref()) {
+        return denied("bot_mismatch", "This token belongs to another Bot.".into());
+    }
     if !rbac::allows(caller.principal, need) {
         let msg = match caller.principal {
             Principal::Bot => "Only a signed-in person can do this, not a Bot.".to_string(),
             Principal::User(r) => format!("Your role ({}) can't do this.", r.as_str()),
         };
         return denied("role", msg);
+    }
+    // A Bot acts for its owner, so it can't do what the owner's role can't (ADR 0028).
+    if caller.principal == Principal::Bot
+        && let Some(app) = &a.app
+    {
+        let owner = caller.bot.as_deref().and_then(|id| app.db.bot(id)).and_then(|b| app.db.user(&b.owner_id)).filter(|u| u.active());
+        if !owner.is_some_and(|u| rbac::allows(Principal::User(u.role), need)) {
+            return denied("owner_role", "This Bot's owner can't do this.".into());
+        }
     }
     // A cookie, a password the browser cached, or ALLOW_NO_AUTH rides along on any request the
     // browser makes, so writes on them must come from our own pages. Only a Bearer token is sent on
@@ -718,16 +751,24 @@ fn sso_path(path: &str) -> Option<&str> {
 /// it also has good ones elsewhere.
 fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<Response>> {
     let h = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
-    let operator = |method: &'static str| Caller { principal: Principal::User(Role::Admin), user: a.operator(), session: None, method };
-    let from_session = |(s, u): (db::Session, db::User)| Caller { principal: Principal::User(u.role), user: Some(u), session: Some(s), method: "session" };
+    let operator = |method: &'static str| Caller { principal: Principal::User(Role::Admin), user: a.operator(), session: None, method, bot: None };
+    let from_session = |(s, u): (db::Session, db::User)| Caller { principal: Principal::User(u.role), user: Some(u), session: Some(s), method: "session", bot: None };
     let fail = |method: &str, reason: Option<&str>, clear: bool| {
         a.login_failed(source, method, reason);
         Err(Box::new(unauthorized(a, req, clear)))
     };
     if let Some(t) = h.strip_prefix("Bearer ") {
         let t = t.trim();
-        if !a.bot_token.is_empty() && same(t.as_bytes(), a.bot_token.as_bytes()) {
-            return Ok(Caller { principal: Principal::Bot, user: None, session: None, method: "bot_token" });
+        // Each Bot's runs carry their own token (ADR 0028). A forged one, one from an
+        // earlier start, or one for a Bot since deleted is refused.
+        if t.starts_with(isolation::BOT_TOKEN_PREFIX) {
+            return match isolation::token_bot(&a.bot_key, t) {
+                Some(id) if a.app.as_ref().is_none_or(|app| app.db.bot(id).is_some()) => {
+                    Ok(Caller { principal: Principal::Bot, user: None, session: None, method: "bot_token", bot: Some(id.to_string()) })
+                }
+                Some(_) => fail("bot_token", Some("bot_gone"), false),
+                None => fail("bot_token", Some("bad_token"), false),
+            };
         }
         return match a.session(t) {
             Some(found) => Ok(from_session(found)),
@@ -1048,12 +1089,32 @@ fn need_bot(app: &App, id: &str) -> Res<db::Bot> {
     app.db.bot(id).ok_or_else(|| not_found("Bot"))
 }
 
-/// Whose Bot access a request has. A Bot that says who it is acts with its owner's.
-/// Bots share one token, so that's a guardrail, not a boundary (ADR 0017).
-fn viewer(app: &App, c: &Caller, by: &Who) -> Viewer {
-    match (c.principal, by.actor.kind, by.actor.id.as_deref().and_then(|id| app.db.bot(id))) {
-        (Principal::Bot, audit::ActorKind::Bot, Some(b)) => Viewer::owner_of(&app.db, &b),
+/// Whose Bot access a request has. A Bot acts with its owner's: its token names it,
+/// so it can't borrow another user's (ADR 0028).
+fn viewer(app: &App, c: &Caller, _by: &Who) -> Viewer {
+    match (c.principal, c.bot.as_deref().and_then(|id| app.db.bot(id))) {
+        (Principal::Bot, Some(b)) => Viewer::owner_of(&app.db, &b),
+        (Principal::Bot, None) => Viewer::Nobody,
         _ => Viewer::of(c),
+    }
+}
+
+/// The Bot a request acts as (`from`). A Bot is the one its token names and can't
+/// name another (ADR 0028); a person names one they can operate.
+fn acting_bot(app: &App, c: &Caller, by: &Who, named: Option<&str>) -> Res<db::Bot> {
+    let named = named.map(str::trim).filter(|n| !n.is_empty());
+    match c.principal {
+        Principal::Bot => {
+            let own = c.bot.as_deref().unwrap_or("");
+            if named.is_some_and(|n| n != own) {
+                return Err(ApiError(StatusCode::FORBIDDEN, "A Bot can only act as itself.".into()));
+            }
+            app.db.bot(own).ok_or_else(|| bad("Unknown Bot (BOT_ID)"))
+        }
+        Principal::User(_) => {
+            let id = named.ok_or_else(|| bad("Say which Bot (from)"))?;
+            need_bot_access(app, c, by, id, Access::Operate).map(|(b, _)| b)
+        }
     }
 }
 
@@ -1146,9 +1207,9 @@ async fn create_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
     // Shared unless asked otherwise, as every Bot was before ACLs.
     let visibility = visibility_field(&v)?.unwrap_or(Visibility::Shared);
     // A person owns what they make. A Bot's new Bot belongs to that Bot's owner.
-    let owner = match (&c.user, by.actor.kind) {
+    let owner = match (&c.user, c.principal) {
         (Some(u), _) => u.id.clone(),
-        (None, audit::ActorKind::Bot) => by.actor.id.as_deref().and_then(|id| app.db.bot(id)).map_or(users::OPERATOR.into(), |b| b.owner_id),
+        (None, Principal::Bot) => acting_bot(&app, &c, &by, None)?.owner_id,
         (None, _) => users::OPERATOR.into(),
     };
     let bot = app.db.create_bot_owned(
@@ -1401,16 +1462,9 @@ async fn send_message(State(app): State<AppState>, Extension(c): Extension<Calle
 // Bot to Bot: `botctl ask`. Waits for the reply and returns it as plain text.
 
 async fn ask(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Result<String, ApiError> {
-    let from_id = v["from"].as_str().unwrap_or("");
-    let from = app.db.bot(from_id).ok_or_else(|| bad("Unknown asking Bot (BOT_ID)"))?;
+    let from = acting_bot(&app, &c, &by, v["from"].as_str())?;
     // A Bot asks with its owner's access. A person needs to be able to run both Bots.
-    let viewer = match c.principal {
-        Principal::Bot => Viewer::owner_of(&app.db, &from),
-        Principal::User(_) => {
-            need_bot_access(&app, &c, &by, from_id, Access::Operate)?;
-            viewer(&app, &c, &by)
-        }
-    };
+    let viewer = viewer(&app, &c, &by);
     let to_key = v["to"].as_str().map(str::trim).unwrap_or("");
     let bots: Vec<db::Bot> = viewer.bots(&app.db).into_iter().filter(|(_, a)| *a >= Access::Operate).map(|(b, _)| b).collect();
     let to = bots
@@ -1422,7 +1476,7 @@ async fn ask(State(app): State<AppState>, Extension(c): Extension<Caller>, Exten
         return Err(bad("You can't ask yourself"));
     }
     let text = v["text"].as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| bad("Message is required"))?;
-    // A Bot asks as itself (whatever Bot botctl named), for its owner; a person as themselves.
+    // A Bot asks as itself, for its owner; a person as themselves.
     let by = match c.principal {
         Principal::Bot => Who { actor: Actor::for_bot(&from).method("bot_token"), source: by.source.clone() },
         Principal::User(_) => by,
@@ -1455,11 +1509,7 @@ async fn screen_info(State(app): State<AppState>, Extension(c): Extension<Caller
 // A Bot hands its screen to the user: `botctl handoff`. Waits for "Done".
 
 async fn handoff(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Result<String, ApiError> {
-    let from_id = v["from"].as_str().unwrap_or("");
-    let bot = app.db.bot(from_id).ok_or_else(|| bad("Unknown Bot (BOT_ID)"))?;
-    if let Principal::User(_) = c.principal {
-        need_bot_access(&app, &c, &by, from_id, Access::Operate)?;
-    }
+    let bot = acting_bot(&app, &c, &by, v["from"].as_str())?;
     let text = v["text"].as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| bad("Say what you need"))?;
     let text: String = text.chars().take(300).collect();
     let wait = Duration::from_secs(9 * 60); // under the 10 minute max most harnesses allow a command
@@ -1738,14 +1788,12 @@ async fn check_approval(State(app): State<AppState>, Extension(c): Extension<Cal
         let body = format!("{}\n{reason}", if allow { "allow" } else { "deny" });
         ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response()
     };
-    let Some(bot) = v["from"].as_str().and_then(|id| app.db.bot(id)) else {
-        return reply(false, "Unknown Bot (BOT_ID)");
+    // A hook gets a plain "deny" it can show; a person gets the usual error.
+    let bot = match acting_bot(&app, &c, &by, v["from"].as_str()) {
+        Ok(b) => b,
+        Err(ApiError(_, msg)) if c.principal == Principal::Bot => return reply(false, &msg),
+        Err(e) => return e.into_response(),
     };
-    if let Principal::User(_) = c.principal
-        && let Err(e) = need_bot_access(&app, &c, &by, &bot.id, Access::Operate)
-    {
-        return e.into_response();
-    }
     let e = &v["event"];
     let Some(tool) = e["tool_name"].as_str().filter(|t| !t.is_empty()) else {
         return reply(false, "The hook sent no tool name");
@@ -1837,20 +1885,67 @@ async fn delete_secret(State(app): State<AppState>, Extension(who): Extension<Pr
     Ok(Json(json!({ "ok": true })))
 }
 
+// Your own secrets (ADR 0028): harness logins and API keys that reach only your Bots,
+// over a server-wide one of the same name. A person's, never a Bot's: a Bot that could
+// read or change them could take its owner's keys elsewhere.
+
+/// The signed-in person whose secrets these are.
+fn secrets_owner(c: &Caller) -> Res<String> {
+    need_user(c.principal)?;
+    c.user.as_ref().map(|u| u.id.clone()).ok_or_else(|| ApiError(StatusCode::FORBIDDEN, "Sign in as a user to keep your own secrets.".into()))
+}
+
+async fn list_my_secrets(Extension(c): Extension<Caller>) -> Res {
+    let me = secrets_owner(&c)?;
+    Ok(Json(json!({ "secrets": secrets::global().user_list(&me).map_err(secret_error)? })))
+}
+
+async fn put_my_secret(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(name): Path<String>, Json(v): Json<Value>) -> Res {
+    let me = secrets_owner(&c)?;
+    let value = v["value"].as_str().ok_or_else(|| bad("Send {\"value\": \"...\"}."))?;
+    let listed = secrets::global().user_put(&me, &name, value).map_err(secret_error)?;
+    app.db.record(&by.event("secret.set").target("secret", &name).details(json!({ "scope": "user", "userId": me })));
+    Ok(Json(json!({ "secret": listed })))
+}
+
+async fn delete_my_secret(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(name): Path<String>) -> Res {
+    let me = secrets_owner(&c)?;
+    if !secrets::global().user_delete(&me, &name).map_err(secret_error)? {
+        return Err(not_found("Secret"));
+    }
+    app.db.record(&by.event("secret.deleted").target("secret", &name).details(json!({ "scope": "user", "userId": me })));
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// Admin: a user's secret names, never values.
+async fn list_user_secrets(State(app): State<AppState>, Path(key): Path<String>) -> Res {
+    let u = users::need_user_key(&app, &key)?;
+    Ok(Json(json!({ "user": u.id, "secrets": secrets::global().user_list(&u.id).map_err(secret_error)? })))
+}
+
+/// Admin: drops every secret a user saved, e.g. when they leave.
+async fn delete_user_secrets(State(app): State<AppState>, Extension(by): Extension<Who>, Path(key): Path<String>) -> Res {
+    let u = users::need_user_key(&app, &key)?;
+    let n = secrets::global().user_forget(&u.id).map_err(secret_error)?;
+    app.db.record(&by.event("secret.deleted").target("user", &u.id).details(json!({ "scope": "user", "userId": u.id, "count": n })));
+    Ok(Json(json!({ "deleted": n })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// Auth in front of a stub route. Returns the port and the Bots' bearer token.
+    /// Auth in front of a stub route. Returns the port and a Bot's bearer token.
     async fn serve(password: &str, allow_no_auth: bool, extra_hosts: &str) -> (u16, String) {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let bot_token = random_hex(16);
+        let bot_key = random_hex(16);
+        let bot_token = isolation::bot_token(&bot_key, "b1");
         let state = Arc::new(Auth {
             password: password.into(),
             allow_no_auth,
-            bot_token: bot_token.clone(),
+            bot_key,
             hosts: allowed_hosts("127.0.0.1", port, extra_hosts),
             ..Auth::new(None)
         });
@@ -1937,14 +2032,24 @@ mod tests {
         assert_eq!(status(port, &host, "").await, 200);
     }
 
+    /// Mints the `Authorization` header a Bot's runs get (ADR 0028).
+    #[derive(Clone)]
+    pub(super) struct BotKey(pub String);
+
+    impl BotKey {
+        pub(super) fn auth(&self, bot_id: &str) -> String {
+            format!("Bearer {}", isolation::bot_token(&self.0, bot_id))
+        }
+    }
+
     /// The real router on a fresh install (policy: ask), with a random password.
-    /// Returns the port, the app, and the Authorization headers of the person and of Bots.
-    pub(super) async fn serve_app() -> (u16, AppState, String, String) {
+    /// Returns the port, the app, the person's Authorization header, and the key Bots' tokens come from.
+    pub(super) async fn serve_app() -> (u16, AppState, String, BotKey) {
         serve_app_with(|_| {}).await
     }
 
     /// `serve_app`, with Auth changed first (break-glass, session lifetimes).
-    pub(super) async fn serve_app_with(tweak: impl FnOnce(&mut Auth)) -> (u16, AppState, String, String) {
+    pub(super) async fn serve_app_with(tweak: impl FnOnce(&mut Auth)) -> (u16, AppState, String, BotKey) {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let password = random_hex(16);
@@ -1952,14 +2057,15 @@ mod tests {
         users::ensure_operator(&app.db, "Owner", None);
         let mut auth = Auth {
             password: password.clone(),
-            bot_token: random_hex(16),
+            bot_key: app.cfg.bot_key.clone(),
             hosts: allowed_hosts("127.0.0.1", port, ""),
             ..Auth::new(Some(app.clone()))
         };
         tweak(&mut auth);
         let password = auth.password.clone();
+        let _ = app.control_plane.set(auth.machines.clone());
         let auth = Arc::new(auth);
-        let bot = format!("Bearer {}", auth.bot_token);
+        let bot = BotKey(auth.bot_key.clone());
         let r = router(app.clone(), auth);
         tokio::spawn(async move {
             axum::serve(listener, r.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
@@ -2013,8 +2119,9 @@ mod tests {
 
     #[tokio::test]
     async fn bots_cannot_approve_or_change_policy() {
-        let (port, app, user, bot_auth) = serve_app().await;
+        let (port, app, user, key) = serve_app().await;
         let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
+        let bot_auth = key.auth(&bot.id);
         for (m, p, b) in [
             ("PUT", "/api/policy".to_string(), r#"{"mode":"bypass"}"#),
             ("PUT", format!("/api/bots/{}/policy", bot.id), r#"{"mode":"bypass"}"#),
@@ -2045,7 +2152,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_actions_are_audited() {
-        let (port, app, user, bot_auth) = serve_app().await;
+        let (port, app, user, key) = serve_app().await;
         let browser = "User-Agent: TestBrowser/1.0\r\n";
         let (code, _, body) = call_with(port, "POST", "/api/bots", &user, browser, r#"{"name":"Helper","harness":"claude"}"#).await;
         assert_eq!(code, 201);
@@ -2053,15 +2160,16 @@ mod tests {
         call_with(port, "PATCH", &format!("/api/bots/{id}"), &user, browser, r#"{"name":"Helper 2","hidden":true}"#).await;
         call_with(port, "PATCH", &format!("/api/bots/{id}"), &user, browser, r#"{"name":"Helper 2"}"#).await; // no change, no event
 
-        // botctl names its Bot; routine calls are logged with that Bot as the actor.
-        let botctl = format!("User-Agent: botctl\r\nX-SuperBot-Bot: {id}\r\n");
+        // A Bot's token names it; routine calls are logged with that Bot as the actor.
+        let bot_auth = key.auth(&id);
+        let botctl = "User-Agent: botctl\r\n";
         let body = r#"{"name":"Standup","cron":"0 9 * * 1-5","instruction":"secret plan: email the team"}"#;
-        let (code, _, r) = call_with(port, "POST", &format!("/api/bots/{id}/routines"), &bot_auth, &botctl, body).await;
+        let (code, _, r) = call_with(port, "POST", &format!("/api/bots/{id}/routines"), &bot_auth, botctl, body).await;
         assert_eq!(code, 201);
         let rid = serde_json::from_str::<Value>(&r).unwrap()["id"].as_str().unwrap().to_string();
-        call_with(port, "PATCH", &format!("/api/routines/{rid}"), &bot_auth, &botctl, r#"{"enabled":false,"cron":"0 10 * * *"}"#).await;
+        call_with(port, "PATCH", &format!("/api/routines/{rid}"), &bot_auth, botctl, r#"{"enabled":false,"cron":"0 10 * * *"}"#).await;
         call_with(port, "PATCH", &format!("/api/routines/{rid}"), &user, browser, r#"{"enabled":true}"#).await;
-        call_with(port, "DELETE", &format!("/api/routines/{rid}"), &bot_auth, &botctl, "").await;
+        call_with(port, "DELETE", &format!("/api/routines/{rid}"), &bot_auth, botctl, "").await;
         call_with(port, "POST", &format!("/api/bots/{id}/stop"), &user, browser, "").await;
         call_with(port, "DELETE", &format!("/api/bots/{id}"), &user, browser, "").await;
         let wrong_password = random_hex(16);
@@ -2131,8 +2239,9 @@ mod tests {
 
     #[tokio::test]
     async fn approvals_and_handoffs_are_audited() {
-        let (port, app, user, bot_auth) = serve_app().await;
+        let (port, app, user, key) = serve_app().await;
         let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
+        let bot_auth = key.auth(&bot.id);
         let check = json!({ "from": bot.id, "harness": "claude", "event": { "tool_name": "Bash", "tool_input": { "command": "git push https://x:tok3n@example.com" }, "cwd": "/tmp" } }).to_string();
         let hook = tokio::spawn({
             let bot_auth = bot_auth.clone();
@@ -2206,8 +2315,9 @@ mod tests {
 
     #[tokio::test]
     async fn hook_waits_for_a_person_then_runs() {
-        let (port, app, user, bot_auth) = serve_app().await;
+        let (port, app, user, key) = serve_app().await;
         let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
+        let bot_auth = key.auth(&bot.id);
         let check = |cmd: &str| {
             json!({ "from": bot.id, "harness": "claude", "event": { "tool_name": "Bash", "tool_input": { "command": cmd }, "cwd": "/tmp" } }).to_string()
         };
@@ -2258,7 +2368,8 @@ mod tests {
 
     #[tokio::test]
     async fn secrets_api_takes_values_and_never_returns_them() {
-        let (port, app, user, bot_auth) = serve_app().await;
+        let (port, app, user, key) = serve_app().await;
+        let bot_auth = key.auth(&app.db.create_bot("Z", "#fff", "waddle", "claude", None, false).id);
         let name = format!("TEST_{}_API_KEY", random_hex(4).to_uppercase());
         let value = format!("sk-test-{}", random_hex(16));
         let path = format!("/api/secrets/{name}");
@@ -2321,7 +2432,7 @@ mod tests {
             user_name: "the user".into(),
             bin_dir: dir.clone(),
             api_url: "http://127.0.0.1:0".into(),
-            bot_token: "bot-token".into(),
+            bot_key: "bot-key".into(),
             run_timeout: Duration::from_secs(60),
             default_harness: "claude".into(),
         }, None);
@@ -2330,7 +2441,7 @@ mod tests {
             .route("/api/bots/{id}/routines", get(list_routines).post(create_routine))
             .route("/api/routines/{id}", patch(update_routine).delete(delete_routine))
             .layer(Extension(Who { actor: Actor::operator(), source: Source::default() }))
-            .layer(Extension(Caller { principal: Principal::User(Role::Admin), user: None, session: None, method: "none" }))
+            .layer(Extension(Caller { principal: Principal::User(Role::Admin), user: None, session: None, method: "none", bot: None }))
             .with_state(app.clone());
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
