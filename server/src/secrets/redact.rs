@@ -78,20 +78,25 @@ pub fn owned() -> Vec<(String, Vec<String>)> {
 }
 
 /// `text`, plus the own secrets of `owners` (the users whose Bots wrote or carry `s`).
+/// Both lists are matched together, longest first: a short value someone saved (a known
+/// key prefix) must not split a longer secret and leave the rest of it showing.
 pub fn text_for<'a>(owners: &[&str], s: &'a str) -> Cow<'a, str> {
-    let mut out = Cow::Borrowed(s);
-    {
+    let theirs: Vec<String> = {
         let owned = OWNED.read().unwrap_or_else(|e| e.into_inner());
-        for k in owners.iter().filter_map(|o| owned.get(*o)).flatten() {
-            if out.contains(k.as_str()) {
-                out = Cow::Owned(out.replace(k.as_str(), MARK));
-            }
+        owners.iter().filter_map(|o| owned.get(*o)).flatten().filter(|k| s.contains(k.as_str())).cloned().collect()
+    };
+    if theirs.is_empty() {
+        return text(s);
+    }
+    let mut all: Vec<String> = known().into_iter().filter(|k| s.contains(k.as_str())).chain(theirs).collect();
+    all.sort_by_key(|k| std::cmp::Reverse(k.len()));
+    let mut out = s.to_string();
+    for k in &all {
+        if out.contains(k.as_str()) {
+            out = out.replace(k.as_str(), MARK);
         }
     }
-    match out {
-        Cow::Borrowed(s) => text(s),
-        Cow::Owned(o) => Cow::Owned(text(&o).into_owned()),
-    }
+    Cow::Owned(strip_issued(&out))
 }
 
 /// `value`, plus the own secrets of `owners`.
@@ -178,18 +183,21 @@ pub fn looks_secret(name: &str) -> bool {
 pub fn scrub_rows(c: &Connection) -> rusqlite::Result<usize> {
     let tx = c.unchecked_transaction()?;
     let mut n = 0;
-    for s in known() {
-        for (table, col) in [("messages", "text"), ("approvals", "subject")] {
-            n += tx.execute(&format!("UPDATE {table} SET {col} = replace({col}, ?1, ?2) WHERE instr({col}, ?1) > 0"), params![s, MARK])?;
-        }
-    }
-    // A user's own secrets, only in their own Bots' rows.
+    // A user's own Bots' rows first, with their secrets and botd's together, longest
+    // first (as `text_for`), so a short value of theirs can't split a longer secret.
     for (owner, values) in owned() {
-        for s in values {
+        let mut all: Vec<String> = known().into_iter().chain(values).collect();
+        all.sort_by_key(|k| std::cmp::Reverse(k.len()));
+        for s in all {
             for (table, col) in [("messages", "text"), ("approvals", "subject")] {
                 let sql = format!("UPDATE {table} SET {col} = replace({col}, ?1, ?2) WHERE instr({col}, ?1) > 0 AND bot_id IN (SELECT id FROM bots WHERE owner_id = ?3)");
                 n += tx.execute(&sql, params![s, MARK, owner])?;
             }
+        }
+    }
+    for s in known() {
+        for (table, col) in [("messages", "text"), ("approvals", "subject")] {
+            n += tx.execute(&format!("UPDATE {table} SET {col} = replace({col}, ?1, ?2) WHERE instr({col}, ?1) > 0"), params![s, MARK])?;
         }
     }
     // Choice cards and saved requesters are JSON, where a secret with quotes or
@@ -238,6 +246,22 @@ mod tests {
         forget(&key);
         assert!(text(&key).contains(&key));
         forget(&longer);
+    }
+
+    #[test]
+    fn own_secrets_stay_with_their_owner_and_never_split_a_longer_one() {
+        let owner = unique("u");
+        let key = unique("sk-ant-api03-server");
+        let prefix = key[..key.len() - 6].to_string();
+        register(&key);
+        register_for(&owner, &prefix);
+        assert_eq!(text_for(&[owner.as_str()], &format!("key {key}!")), "key [redacted]!", "the whole server key, no suffix left");
+        assert_eq!(text_for(&[owner.as_str()], &format!("{prefix}..")), "[redacted]..");
+        assert_eq!(text(&format!("{prefix}..")), format!("{prefix}.."), "only in the owner's Bots");
+        assert_eq!(text_for(&["someone-else"], &prefix), prefix.as_str());
+        assert_eq!(value_for(&[owner.as_str()], json!({ "a": [format!("x {key}")] })), json!({ "a": ["x [redacted]"] }));
+        forget(&key);
+        forget_for(&owner, &prefix);
     }
 
     #[test]
