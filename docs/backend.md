@@ -109,11 +109,11 @@ Limits: the parser sees commands, not what scripts or programs do inside, so thi
 API keys and tokens for Bots come from two places, first match wins:
 
 1. **Environment**: `NAME=value` in `.env`, or `NAME_FILE=/path` (Docker/systemd secrets). Same for `AUTH_PASSWORD` (`AUTH_PASSWORD_FILE`).
-2. **Saved secrets**, encrypted in SQLite: `botctl secret set OPENAI_API_KEY < key.txt` (value on stdin), `botctl secrets`, `botctl secret rm NAME`. Bots get them as environment variables from their next run.
+2. **Saved secrets**, encrypted in SQLite: `botctl secret set OPENAI_API_KEY < key.txt` (value on stdin), `botctl secrets`, `botctl secret rm NAME`. Bots get them as environment variables from their next run. The exception is SSO client secrets (`SSO_<ID>_CLIENT_SECRET`): saved the same way, but only botd uses them, and every `SSO_*` variable is kept out of Bots' environments.
 
 Saved secrets and every approval's tool input are sealed with XChaCha20-Poly1305 under a master key: `SUPERBOT_MASTER_KEY` (64 hex chars), or the 0600 file in `SUPERBOT_MASTER_KEY_FILE` (default `~/.config/superbot/master.key`, created on first start). The key never lives in `DATA_DIR`, so backups don't carry it. botd won't start with a wrong key, or without the key once something is sealed.
 
-Values never come back out: the API lists names only. Known values (saved and env secrets, `AUTH_PASSWORD`, the Bots' token, screen tokens, the key) and any session token or sign-in code botd issued (`sbs_…`, `sbc_…`) are replaced by `[redacted]` in saved chats, approvals, the audit log, and live events. Upgrading seals old approval inputs and scrubs known values from saved chats on first start. Bots run as the same OS user, so this protects copies of the database, not the running server. See [ADR 0010](adr/0010-secrets.md).
+Values never come back out: the API lists names only. Known values (saved and env secrets, `AUTH_PASSWORD`, the Bots' token, screen tokens, the key) and any session token, sign-in code, or SSO handoff code botd issued (`sbs_…`, `sbc_…`, `sbh_…`) are replaced by `[redacted]` in saved chats, approvals, the audit log, and live events. Upgrading seals old approval inputs and scrubs known values from saved chats on first start. Bots run as the same OS user, so this protects copies of the database, not the running server. See [ADR 0010](adr/0010-secrets.md).
 
 ## Audit log
 
@@ -138,7 +138,7 @@ CSV export is RFC 4180 with CRLF line endings, oldest first. Cells that start wi
 People are users with a role: **admin** (everything), **member** (use and manage Bots and routines, decide approvals), or **read-only** (see everything, change nothing). Admins also manage policy, the audit log, users, sessions, and saved secrets. One check per API route enforces it; unknown routes are admin-only. Design: [ADR 0012](adr/0012-users-sessions-rbac.md).
 
 - **Owner**: made on first start as admin `operator` (name `USER_NAME`, email `OWNER_EMAIL`). `AUTH_PASSWORD` signs in as the owner (break-glass) while `AUTH_BREAK_GLASS` is on, the default. Set `AUTH_BREAK_GLASS=0` to ignore the password once admins sign in another way.
-- **Everyone else**: an admin adds them and gives them a one-time sign-in code, which they enter in the web app or client. Codes are single use and expire (default 1 hour). SSO (OIDC) is next.
+- **Everyone else**: signs in with Microsoft Entra ID when it's set up ([guide](sso/entra.md), [ADR 0014](adr/0014-oidc-sso-entra.md)): an admin links their Microsoft account to a user (`botctl user link`), or just-in-time sign-up makes one. Or an admin gives them a one-time sign-in code, which they enter in the web app or client. Codes are single use and expire (default 1 hour).
 - **Sessions**: the web app gets an HttpOnly cookie, the client and `botctl` a bearer token. They end after `SESSION_IDLE_TIMEOUT` without use (default `7d`) or `SESSION_MAX_AGE` after sign-in (default `30d`), on logout, or when an admin revokes them or disables the user. Only hashes are stored.
 
 ```sh
@@ -148,6 +148,7 @@ botctl user code alex@example.com                   # one-time code for Alex
 botctl users | botctl sessions alex@example.com
 botctl user role alex@example.com readonly | botctl user disable alex@example.com
 botctl session revoke <id> | botctl session revoke-all alex@example.com
+botctl user link alex@example.com entra <object-id> | botctl user identities alex@example.com
 ```
 
 ## API
@@ -168,7 +169,9 @@ All JSON. Auth: a session cookie (web app) or `Authorization: Bearer <session to
 
 Sign-in, users, and sessions ([ADR 0012](adr/0012-users-sessions-rbac.md)). Users and sessions are admin only:
 
-- `POST /api/auth/login` `{password | code, session?: "cookie" | "token", label?}` → `{user, session, token}`. No credentials needed. 429 after 10 failures from one IP in 10 minutes
+- `POST /api/auth/login` `{password | code | sso + verifier, session?: "cookie" | "token", label?}` → `{user, session, token}`. No credentials needed. 429 after 10 failures from one IP in 10 minutes
+- Single sign-on ([ADR 0014](adr/0014-oidc-sso-entra.md)), no credentials needed: `GET /api/auth/sso` → `{providers: [{id, label, type}]}`; `GET /api/auth/sso/:id/start?session=cookie|token&redirect=&challenge=&state=&label=` redirects to the IdP; `GET /api/auth/sso/:id/callback` is where it comes back
+- `GET|POST /api/users/:id/identities` `{provider, subject, tenant?}`, `DELETE /api/users/:id/identities/:identity`: SSO identities linked to a user
 - `POST /api/auth/logout`, `GET /api/auth/me`: the caller's user, role, permissions, and session
 - `GET|POST /api/users` `{email, name?, role?}`, `GET|PATCH /api/users/:id-or-email` `{name?, email?, role?, status?: active|disabled}`. The owner can't be demoted or disabled (409)
 - `POST /api/users/:id/login-codes` `{ttlMinutes?}` → `{code, expiresAt}`
@@ -184,7 +187,7 @@ Approvals, policy, and audit. Writes, decisions, the approvals list, and the aud
 - `POST /api/approvals/check` `{from, harness, event}`: the hook's call. Waits for a decision. Replies `allow` or `deny`, then the reason, as plain text
 - `GET /api/audit?from=&to=&action=&actor=&outcome=&bot=&limit=&before=<id>`: audit events, newest first, `{events, nextBefore}`. `from`/`to`: unix ms, RFC 3339, or `YYYY-MM-DD`. `action`: exact or `prefix.*`, comma-separated. `actor`: `user`, `bot`, or `system`, optionally `:<id>`. `limit` 1 to 1000, default 100
 - `GET /api/audit/export.csv` (same filters): CSV download, oldest first
-- `GET /api/secrets`: `{secrets: [{name, store, writable, shadowedBy}]}`, names only. `PUT /api/secrets/:name` `{value}`, `DELETE /api/secrets/:name`. Admin only
+- `GET /api/secrets`: `{secrets: [{name, store, writable, shadowedBy, forBots}]}`, names only; `forBots` is false for botd's own SSO client secrets. `PUT /api/secrets/:name` `{value}`, `DELETE /api/secrets/:name`. Admin only
 
 ## Not built yet
 

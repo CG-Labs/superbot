@@ -224,8 +224,10 @@ pub struct Session {
     pub user_id: String,
     /// "cookie" (web app) or "token" (bearer: the client, botctl)
     pub kind: String,
-    /// How the person proved who they are: "password" (break-glass) or "code".
+    /// How the person proved who they are: "password" (break-glass), "code", or "sso".
     pub method: String,
+    /// `issuer|subject` of the SSO identity that signed in, for the audit log.
+    pub idp_subject: Option<String>,
     pub label: Option<String>,
     pub ip: Option<String>,
     pub user_agent: Option<String>,
@@ -242,10 +244,68 @@ pub struct NewSession<'a> {
     pub token_hash: &'a str,
     pub kind: &'a str,
     pub method: &'a str,
+    pub idp_subject: Option<&'a str>,
     pub label: Option<&'a str>,
     pub ip: Option<&'a str>,
     pub user_agent: Option<&'a str>,
     pub expires_at: i64,
+}
+
+/// An SSO identity linked to a user (ADR 0014). `(issuer, subject)` is the key; the
+/// email is only what the IdP last said, never used to find anyone.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Identity {
+    pub id: String,
+    pub user_id: String,
+    /// The provider id from SSO_PROVIDERS, e.g. "entra".
+    pub provider: String,
+    pub issuer: String,
+    /// Entra: the object id (`oid`); others: `sub`.
+    pub subject: String,
+    /// Entra: the tenant id (`tid`), which `issuer` also names.
+    pub tenant: Option<String>,
+    pub email: Option<String>,
+    pub created_at: i64,
+    pub created_by: Option<String>,
+    pub last_login_at: Option<i64>,
+}
+
+pub struct NewIdentity<'a> {
+    pub provider: &'a str,
+    pub issuer: &'a str,
+    pub subject: &'a str,
+    pub tenant: Option<&'a str>,
+    pub email: Option<&'a str>,
+    pub created_by: Option<&'a str>,
+}
+
+fn identity_row(r: &Row) -> rusqlite::Result<Identity> {
+    Ok(Identity {
+        id: r.get("id")?,
+        user_id: r.get("user_id")?,
+        provider: r.get("provider")?,
+        issuer: r.get("issuer")?,
+        subject: r.get("subject")?,
+        tenant: r.get("tenant")?,
+        email: r.get("email")?,
+        created_at: r.get("created_at")?,
+        created_by: r.get("created_by")?,
+        last_login_at: r.get("last_login_at")?,
+    })
+}
+
+#[derive(Debug, PartialEq)]
+pub enum JitError {
+    /// Another user has this email. Never merged by email: ask an admin to link instead.
+    EmailTaken,
+    /// Another sign-in linked this identity first.
+    IdentityTaken,
+    Database,
+}
+
+fn constraint(e: &rusqlite::Error) -> bool {
+    matches!(e, rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::ConstraintViolation)
 }
 
 fn user_row(r: &Row) -> rusqlite::Result<User> {
@@ -269,6 +329,7 @@ fn session_row(r: &Row) -> rusqlite::Result<Session> {
         user_id: r.get("user_id")?,
         kind: r.get("kind")?,
         method: r.get("method")?,
+        idp_subject: r.get("idp_subject")?,
         label: r.get("label")?,
         ip: r.get("ip")?,
         user_agent: r.get("user_agent")?,
@@ -350,7 +411,32 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 3] = [migrate_approvals, migrate_audit_events, migrate_users];
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 4] = [migrate_approvals, migrate_audit_events, migrate_users, migrate_identities];
+
+/// SSO identities (ADR 0014): any number per user, each `(issuer, subject)` at most
+/// once. `users.idp_issuer`/`idp_subject` become the user's first identity and are
+/// kept in step with this table. Sessions remember which identity signed them in.
+fn migrate_identities(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE user_identities (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          provider TEXT NOT NULL,
+          issuer TEXT NOT NULL,
+          subject TEXT NOT NULL,
+          tenant TEXT,
+          email TEXT,
+          created_at INTEGER NOT NULL,
+          created_by TEXT,
+          last_login_at INTEGER,
+          UNIQUE (issuer, subject)
+        );
+        CREATE INDEX user_identities_user ON user_identities(user_id, created_at);
+        INSERT INTO user_identities (id, user_id, provider, issuer, subject, created_at)
+          SELECT 'i' || lower(hex(randomblob(4))), id, 'oidc', idp_issuer, idp_subject, created_at FROM users WHERE idp_issuer IS NOT NULL;
+        ALTER TABLE sessions ADD COLUMN idp_subject TEXT;",
+    )
+}
 
 /// Users, sessions, and one-time sign-in codes (ADR 0012). Tables start empty; botd
 /// creates the owner (`operator`, the break-glass account) on start, so an upgrade
@@ -947,6 +1033,98 @@ impl Db {
         }
     }
 
+    // SSO identities (ADR 0014)
+
+    /// The identity with this key and its user, whatever the user's status.
+    pub fn identity(&self, issuer: &str, subject: &str) -> Option<(Identity, User)> {
+        let c = self.c();
+        let i = c
+            .query_row("SELECT * FROM user_identities WHERE issuer = ? AND subject = ?", [issuer, subject], identity_row)
+            .optional()
+            .ok()
+            .flatten()?;
+        let u = c.query_row("SELECT * FROM users WHERE id = ?", [&i.user_id], user_row).optional().ok().flatten()?;
+        Some((i, u))
+    }
+
+    pub fn identities(&self, user_id: &str) -> Vec<Identity> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM user_identities WHERE user_id = ? ORDER BY created_at, id").unwrap();
+        s.query_map([user_id], identity_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    fn insert_identity(tx: &Connection, user_id: &str, i: &NewIdentity) -> rusqlite::Result<String> {
+        let id = format!("i{}", crate::short_id());
+        tx.execute(
+            "INSERT INTO user_identities (id, user_id, provider, issuer, subject, tenant, email, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![id, user_id, i.provider, i.issuer, i.subject, i.tenant, i.email, now(), i.created_by],
+        )?;
+        // The first identity is also the user's own (users.idp_*).
+        tx.execute(
+            "UPDATE users SET idp_issuer = ?, idp_subject = ?, updated_at = ? WHERE id = ? AND idp_issuer IS NULL",
+            params![i.issuer, i.subject, now(), user_id],
+        )?;
+        Ok(id)
+    }
+
+    fn identity_by_id(&self, id: &str) -> Option<Identity> {
+        self.c().query_row("SELECT * FROM user_identities WHERE id = ?", [id], identity_row).optional().ok().flatten()
+    }
+
+    /// Err when the identity is linked already, to this user or another.
+    pub fn link_identity(&self, user_id: &str, i: &NewIdentity) -> Result<Identity, String> {
+        let id = {
+            let c = self.c();
+            let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
+            let id = Self::insert_identity(&tx, user_id, i).map_err(|e| if constraint(&e) { "This identity is already linked to a user".to_string() } else { e.to_string() })?;
+            tx.commit().map_err(|e| e.to_string())?;
+            id
+        };
+        self.identity_by_id(&id).ok_or_else(|| "identity not saved".into())
+    }
+
+    /// Just-in-time sign-up: a new user and their first identity, together or not at all.
+    pub fn create_sso_user(&self, email: Option<&str>, name: &str, role: Role, i: &NewIdentity) -> Result<User, JitError> {
+        let id = format!("u{}", crate::short_id());
+        {
+            let c = self.c();
+            let tx = c.unchecked_transaction().map_err(|_| JitError::Database)?;
+            let at = now();
+            tx.execute(
+                "INSERT INTO users (id, email, display_name, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                params![id, email, name, role.as_str(), at, at],
+            )
+            .map_err(|e| if constraint(&e) { JitError::EmailTaken } else { JitError::Database })?;
+            Self::insert_identity(&tx, &id, i).map_err(|e| if constraint(&e) { JitError::IdentityTaken } else { JitError::Database })?;
+            tx.commit().map_err(|_| JitError::Database)?;
+        }
+        self.user(&id).ok_or(JitError::Database)
+    }
+
+    /// Removes one of a user's identities. If it was the user's own, their next oldest takes its place.
+    pub fn unlink_identity(&self, user_id: &str, id: &str) -> Option<Identity> {
+        let gone = self.identity_by_id(id).filter(|i| i.user_id == user_id)?;
+        let c = self.c();
+        let tx = c.unchecked_transaction().ok()?;
+        tx.execute("DELETE FROM user_identities WHERE id = ?", [id]).ok()?;
+        tx.execute(
+            "UPDATE users SET
+               idp_issuer = (SELECT issuer FROM user_identities WHERE user_id = ?1 ORDER BY created_at, id LIMIT 1),
+               idp_subject = (SELECT subject FROM user_identities WHERE user_id = ?1 ORDER BY created_at, id LIMIT 1),
+               updated_at = ?4
+             WHERE id = ?1 AND idp_issuer = ?2 AND idp_subject = ?3",
+            params![user_id, gone.issuer, gone.subject, now()],
+        )
+        .ok()?;
+        tx.commit().ok()?;
+        Some(gone)
+    }
+
+    /// A sign-in with this identity: when, and the email the IdP sent this time.
+    pub fn touch_identity(&self, id: &str, email: Option<&str>, at: i64) {
+        let _ = self.c().execute("UPDATE user_identities SET last_login_at = ?, email = coalesce(?, email) WHERE id = ?", params![at, email, id]);
+    }
+
     // Sessions and sign-in codes. Callers hash tokens; nothing here sees one.
 
     pub fn create_session(&self, s: &NewSession) -> Session {
@@ -954,9 +1132,9 @@ impl Db {
         let at = now();
         self.c()
             .execute(
-                "INSERT INTO sessions (id, token_hash, user_id, kind, method, label, ip, user_agent, created_at, last_seen_at, expires_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                params![id, s.token_hash, s.user_id, s.kind, s.method, s.label, s.ip, s.user_agent, at, at, s.expires_at],
+                "INSERT INTO sessions (id, token_hash, user_id, kind, method, idp_subject, label, ip, user_agent, created_at, last_seen_at, expires_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![id, s.token_hash, s.user_id, s.kind, s.method, s.idp_subject, s.label, s.ip, s.user_agent, at, at, s.expires_at],
             )
             .unwrap();
         self.session(&id).unwrap()
@@ -1337,17 +1515,69 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let bot = db.create_bot("Kept", "#fff", "waddle", "claude", None, true);
         // As a database from before users: no user tables, user_version 2.
-        db.c().execute_batch("DROP TABLE login_codes; DROP TABLE sessions; DROP TABLE users; PRAGMA user_version = 2;").unwrap();
+        db.c().execute_batch("DROP TABLE user_identities; DROP TABLE login_codes; DROP TABLE sessions; DROP TABLE users; PRAGMA user_version = 2;").unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();
         assert_eq!(db.bot(&bot.id).map(|b| b.name), Some("Kept".into()));
         assert!(db.users().is_empty(), "the owner is made by botd at start, not by the migration");
         let v: i64 = db.c().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, MIGRATIONS.len() as i64);
         // The schema refuses what the code never writes.
         let c = db.c();
         assert!(c.execute("INSERT INTO users (id, display_name, role, created_at, updated_at) VALUES ('x', 'X', 'root', 0, 0)", []).is_err());
         assert!(c.execute("INSERT INTO users (id, display_name, role, idp_issuer, created_at, updated_at) VALUES ('x', 'X', 'member', 'iss', 0, 0)", []).is_err());
+    }
+
+    #[test]
+    fn upgrade_moves_a_users_idp_columns_into_identities() {
+        let path = temp_path("identities-upgrade").join("app.sqlite");
+        let db = Db::open(&path).unwrap();
+        let u = db.create_user(None, None, "Linked", Role::Member).unwrap();
+        db.c()
+            .execute_batch(&format!(
+                "DROP TABLE user_identities; ALTER TABLE sessions DROP COLUMN idp_subject;
+                 UPDATE users SET idp_issuer = 'https://idp.example', idp_subject = 's1' WHERE id = '{}'; PRAGMA user_version = 3;",
+                u.id
+            ))
+            .unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        let (i, found) = db.identity("https://idp.example", "s1").unwrap();
+        assert_eq!((found.id.as_str(), i.provider.as_str()), (u.id.as_str(), "oidc"));
+    }
+
+    #[test]
+    fn identities_link_once_and_keep_the_users_own_in_step() {
+        let db = Db::open(&temp_path("identities").join("app.sqlite")).unwrap();
+        let a = db.create_user(None, Some("a@example.com"), "A", Role::Member).unwrap();
+        let b = db.create_user(None, None, "B", Role::Member).unwrap();
+        let new = |subject: &'static str| NewIdentity { provider: "entra", issuer: "https://login.example/t1/v2.0", subject, tenant: Some("t1"), email: None, created_by: Some("operator") };
+        let first = db.link_identity(&a.id, &new("oid-1")).unwrap();
+        let second = db.link_identity(&a.id, &new("oid-2")).unwrap();
+        assert!(db.link_identity(&b.id, &new("oid-1")).is_err(), "one user per identity");
+        assert!(db.link_identity(&a.id, &new("oid-1")).is_err(), "and once");
+        assert_eq!(db.user(&a.id).unwrap().idp_subject.as_deref(), Some("oid-1"), "the first is the user's own");
+        assert_eq!(db.identity("https://login.example/t1/v2.0", "oid-2").map(|(i, u)| (i.id, u.id)), Some((second.id.clone(), a.id.clone())));
+        assert!(db.identity("https://login.example/t2/v2.0", "oid-2").is_none(), "the issuer is part of the key");
+        db.touch_identity(&first.id, Some("new@example.com"), 42);
+        db.touch_identity(&first.id, None, 43);
+        let touched = db.identities(&a.id).into_iter().find(|i| i.id == first.id).unwrap();
+        assert_eq!((touched.email.as_deref(), touched.last_login_at), (Some("new@example.com"), Some(43)));
+
+        assert!(db.unlink_identity(&b.id, &first.id).is_none(), "only the owner's");
+        assert_eq!(db.unlink_identity(&a.id, &first.id).map(|i| i.subject), Some("oid-1".into()));
+        assert_eq!(db.user(&a.id).unwrap().idp_subject.as_deref(), Some("oid-2"), "the next one takes over");
+        db.unlink_identity(&a.id, &second.id).unwrap();
+        let u = db.user(&a.id).unwrap();
+        assert_eq!((u.idp_issuer, u.idp_subject), (None, None));
+
+        // Just in time: a user and their identity together, never merged by email.
+        let jit = |email: Option<&'static str>, subject: &'static str| db.create_sso_user(email, "J", Role::Readonly, &new(subject));
+        assert_eq!(jit(Some("A@example.com"), "oid-3").unwrap_err(), JitError::EmailTaken);
+        assert!(db.identity("https://login.example/t1/v2.0", "oid-3").is_none(), "nothing half made");
+        let j = jit(Some("j@example.com"), "oid-3").unwrap();
+        assert_eq!((j.role, j.idp_subject.as_deref()), (Role::Readonly, Some("oid-3")));
+        assert_eq!(jit(None, "oid-3").unwrap_err(), JitError::IdentityTaken);
     }
 
     #[test]

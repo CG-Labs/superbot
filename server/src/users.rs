@@ -177,13 +177,16 @@ pub struct Caller {
     pub method: &'static str,
 }
 
-pub fn actor(u: &User) -> Actor {
+/// The audit actor. Its subject is the SSO identity this session signed in with, else
+/// the user's own (first linked) identity.
+pub fn actor(u: &User, s: Option<&Session>) -> Actor {
     Actor {
         kind: ActorKind::User,
         id: Some(u.id.clone()),
         name: Some(u.name.clone()),
-        subject: match (&u.idp_issuer, &u.idp_subject) {
-            (Some(i), Some(s)) => Some(format!("{i}|{s}")),
+        subject: match (s.and_then(|s| s.idp_subject.as_ref()), &u.idp_issuer, &u.idp_subject) {
+            (Some(sub), _, _) => Some(sub.clone()),
+            (None, Some(i), Some(s)) => Some(format!("{i}|{s}")),
             _ => None,
         },
     }
@@ -226,7 +229,7 @@ fn clean_name(v: &Value) -> Res<Option<String>> {
     }
 }
 
-fn user_view(u: &User) -> Value {
+pub fn user_view(u: &User) -> Value {
     json!({
         "id": u.id, "email": u.email, "name": u.name, "role": u.role, "status": u.status,
         "breakGlass": u.id == OPERATOR, "idpIssuer": u.idp_issuer, "idpSubject": u.idp_subject,
@@ -237,7 +240,7 @@ fn user_view(u: &User) -> Value {
 fn session_view(s: &Session, cfg: &SessionConfig) -> Value {
     let ends = s.expires_at.min(s.created_at + cfg.max_ms).min(s.last_seen_at + cfg.idle_ms);
     json!({
-        "id": s.id, "userId": s.user_id, "kind": s.kind, "method": s.method, "label": s.label,
+        "id": s.id, "userId": s.user_id, "kind": s.kind, "method": s.method, "idpSubject": s.idp_subject, "label": s.label,
         "ip": s.ip, "userAgent": s.user_agent, "createdAt": s.created_at, "lastSeenAt": s.last_seen_at,
         "expiresAt": s.expires_at, "endsAt": ends,
     })
@@ -245,8 +248,9 @@ fn session_view(s: &Session, cfg: &SessionConfig) -> Value {
 
 // Sign in and out.
 
-/// The new session's token and how it's handed over.
-pub fn start_session(a: &Auth, user: &User, method: &str, cookie: bool, label: Option<&str>, source: &Source) -> (Session, String) {
+/// The new session's token and how it's handed over. `idp_subject` is `issuer|subject`
+/// for SSO sign-ins.
+pub fn start_session(a: &Auth, user: &User, method: &str, idp_subject: Option<&str>, cookie: bool, label: Option<&str>, source: &Source) -> (Session, String) {
     let token = new_secret(SESSION_PREFIX);
     let app = a.app.as_ref().expect("sessions need the database");
     let s = app.db.create_session(&NewSession {
@@ -254,6 +258,7 @@ pub fn start_session(a: &Auth, user: &User, method: &str, cookie: bool, label: O
         token_hash: &hash(&token),
         kind: if cookie { "cookie" } else { "token" },
         method,
+        idp_subject,
         label,
         ip: source.ip.as_deref(),
         user_agent: source.user_agent.as_deref(),
@@ -262,7 +267,27 @@ pub fn start_session(a: &Auth, user: &User, method: &str, cookie: bool, label: O
     (s, token)
 }
 
-fn too_many(retry: i64) -> Response {
+/// The sign-in reply: `{user, session, token}`, with the cookie set instead of the
+/// token returned for the web app. Never cached.
+pub fn session_response(a: &Auth, user: &User, s: &Session, token: &str) -> Response {
+    let cookie = s.kind == "cookie";
+    let body = json!({ "user": user_view(user), "session": session_view(s, &a.sessions), "token": if cookie { Value::Null } else { json!(token) } });
+    let mut res = Json(body).into_response();
+    if cookie {
+        res.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&session_cookie(token, a.sessions.max_ms)).unwrap());
+    }
+    res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    res
+}
+
+/// A sign-in label from a request: secrets masked, at most 60 characters.
+pub fn clean_label(v: &Value) -> Option<String> {
+    v.as_str()
+        .map(|l| crate::audit::clip(&crate::secrets::redact::text(&crate::audit::redact_text(l.trim())), 60))
+        .filter(|l| !l.is_empty())
+}
+
+pub fn too_many(retry: i64) -> Response {
     let mut r = (StatusCode::TOO_MANY_REQUESTS, Json(json!({ "error": "Too many failed sign-ins. Try again later." }))).into_response();
     r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(retry.max(1)));
     r
@@ -290,10 +315,10 @@ pub async fn login(Extension(a): Extension<Arc<Auth>>, Extension(source): Extens
     if let Some(retry) = a.limiter.blocked(&ip, at) {
         return too_many(retry);
     }
-    let label: Option<String> = v["label"]
-        .as_str()
-        .map(|l| crate::audit::clip(&crate::secrets::redact::text(&crate::audit::redact_text(l.trim())), 60))
-        .filter(|l| !l.is_empty());
+    let label = clean_label(&v["label"]);
+    if let Some(handoff) = v["sso"].as_str() {
+        return crate::sso::redeem(&a, source, handoff, v["verifier"].as_str().unwrap_or(""), cookie, label.as_deref());
+    }
     let code = v["code"].as_str().map(str::trim).filter(|c| !c.is_empty());
     let password = v["password"].as_str().filter(|p| !p.is_empty());
     let (user, method) = match (code, password) {
@@ -321,16 +346,10 @@ pub async fn login(Extension(a): Extension<Arc<Auth>>, Extension(source): Extens
         let msg = if method == "code" { "That sign-in code is wrong, used, or expired." } else { "Wrong password." };
         return ApiError(StatusCode::UNAUTHORIZED, msg.into()).into_response();
     };
-    let (s, token) = start_session(&a, &user, method, cookie, label.as_deref(), &source);
-    let who = Who { actor: actor(&user), source };
+    let (s, token) = start_session(&a, &user, method, None, cookie, label.as_deref(), &source);
+    let who = Who { actor: actor(&user, None), source };
     app.db.record(&who.event("auth.login").target("session", &s.id).details(json!({ "method": method, "kind": s.kind, "label": s.label })));
-    let body = json!({ "user": user_view(&user), "session": session_view(&s, &a.sessions), "token": if cookie { Value::Null } else { json!(token) } });
-    let mut res = Json(body).into_response();
-    if cookie {
-        res.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&session_cookie(&token, a.sessions.max_ms)).unwrap());
-    }
-    res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    res
+    session_response(&a, &user, &s, &token)
 }
 
 /// Ends the current session. Always clears the cookie.
@@ -356,7 +375,7 @@ pub async fn me(Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Call
 
 // Users (admin).
 
-fn need_user_key(app: &AppState, key: &str) -> Res<User> {
+pub fn need_user_key(app: &AppState, key: &str) -> Res<User> {
     app.db.find_user(key).ok_or_else(|| not_found("User"))
 }
 
@@ -587,7 +606,7 @@ mod tests {
         let cfg = SessionConfig { idle_ms: 10 * MINUTE, max_ms: 60 * MINUTE };
         let token = new_secret(SESSION_PREFIX);
         fn new(token_hash: &str, max_ms: i64) -> NewSession<'_> {
-            NewSession { user_id: OPERATOR, token_hash, kind: "token", method: "password", label: None, ip: None, user_agent: None, expires_at: db::now() + max_ms }
+            NewSession { user_id: OPERATOR, token_hash, kind: "token", method: "password", idp_subject: None, label: None, ip: None, user_agent: None, expires_at: db::now() + max_ms }
         }
         let s = db.create_session(&new(&hash(&token), cfg.max_ms));
         let t0 = s.created_at;
