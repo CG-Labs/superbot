@@ -45,6 +45,7 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen }: 
     answerQuestion,
     stopBot,
     approvals,
+    canWrite,
   } = useSuperBot();
   const [text, setText] = useState("");
   const [loading, setLoading] = useState(false);
@@ -198,6 +199,7 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen }: 
         />
       )}
       <ModelBar botId={bot.id} harness={bot.harness} model={bot.model} effort={bot.effort} />
+      {canWrite ? (
       <View style={styles.composer}>
         <TextInput
           style={styles.input}
@@ -212,6 +214,9 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen }: 
           <Text style={styles.sendText}>Send</Text>
         </Pressable>
       </View>
+      ) : (
+        <Text style={styles.readOnly}>Read-only access</Text>
+      )}
     </View>
   );
 }
@@ -312,4 +317,5 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
   },
   sendText: { color: "#fff", fontWeight: "600" },
+  readOnly: { color: colors.textFaint, textAlign: "center", padding: 16 },
 });

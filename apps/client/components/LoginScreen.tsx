@@ -15,7 +15,7 @@ import { colors } from "../src/theme";
 export function LoginScreen() {
   const { login, error: bootError } = useSuperBot();
   const [baseUrl, setBaseUrl] = useState("http://127.0.0.1:3000");
-  const [password, setPassword] = useState("");
+  const [secret, setSecret] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -23,7 +23,7 @@ export function LoginScreen() {
     setBusy(true);
     setError(null);
     try {
-      await login(baseUrl, password);
+      await login(baseUrl, secret);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Login failed");
     } finally {
@@ -50,17 +50,19 @@ export function LoginScreen() {
           value={baseUrl}
           onChangeText={setBaseUrl}
         />
-        <Text style={styles.label}>Password (AUTH_PASSWORD)</Text>
+        <Text style={styles.label}>Sign-in code or password</Text>
         <TextInput
           style={styles.input}
           secureTextEntry
-          placeholder="Required"
+          autoCapitalize="none"
+          autoCorrect={false}
+          placeholder="sbc_… or AUTH_PASSWORD"
           placeholderTextColor={colors.textFaint}
-          value={password}
-          onChangeText={setPassword}
+          value={secret}
+          onChangeText={setSecret}
         />
         <Text style={styles.hint}>
-          The client always sends HTTP Basic auth. Set AUTH_PASSWORD on botd for remote access.
+          Ask an admin for a one-time sign-in code. The owner can use the server password. The app keeps a session token, not the password.
         </Text>
         {(error || bootError) ? (
           <Text style={styles.error}>{error || bootError}</Text>

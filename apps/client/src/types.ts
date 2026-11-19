@@ -76,8 +76,20 @@ export interface ModelOption {
   aliases?: string[];
 }
 
+export type Role = "admin" | "member" | "readonly";
+
+/** `/api/state` `me`. Servers from before ADR 0011 send only the name. */
+export interface Me {
+  name: string;
+  id?: string | null;
+  email?: string | null;
+  role?: Role | "bot";
+  permissions?: string[];
+  session?: boolean;
+}
+
 export interface AppState {
-  me: { name: string };
+  me: Me;
   harnesses: string[];
   defaultHarness: string;
   bots: BotView[];
@@ -106,7 +118,9 @@ export type SseEvent =
   | { type: "policy"; policy: Policy }
   | { type: "resync" };
 
+/** A session token (servers with sign-in, ADR 0011), or the legacy shared password. */
 export interface ServerConfig {
   baseUrl: string;
-  password: string;
+  token?: string;
+  password?: string;
 }
