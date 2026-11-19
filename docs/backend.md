@@ -131,7 +131,9 @@ Values never come back out: the API lists names only. Known values (saved and en
 
 ## Audit log
 
-Admin actions are recorded in `audit_events` in `app.sqlite`: who (person, Bot, or system part), what (`bot.created`, `routine.disabled`, `approval.denied`, ...), the target, the outcome, the source IP and user agent, and a few scrubbed details. Logins and failed logins, Bot and routine changes, policy, rules, approvals, handoffs, and Bot-token calls are all covered; the full list is in [ADR 0009](adr/0009-audit-events.md).
+Admin actions are recorded in `audit_events` in `app.sqlite`: who (person, Bot, or system part), what (`bot.created`, `routine.disabled`, `approval.denied`, ...), the target, the outcome, the source IP and user agent, and a few scrubbed details. Logins and failed logins, Bot and routine changes, policy, rules, approvals, handoffs, Bot-token calls, Bot runs (`bot.run_finished`), and harness starts (`harness.invoked`) are all covered; the full list is in [ADR 0009](adr/0009-audit-events.md).
+
+- **Who, exactly**: a person's id, name, email, and role when they acted; how they signed in (`password` = break-glass `AUTH_PASSWORD`, `code`, `sso`, `none`, `bot_token`); for SSO, the IdP type (`entra`, `google`, `oidc`, `github`, `apple`), its configured provider id, and their IdP subject; and the session id. A Bot (or a routine) records whose authority it used: its owner, as `onBehalfOf`. A Bot run is attributed to whoever queued it: the person who sent the chat, the Bot that asked, or the scheduler. Rows from before this was added leave these empty. Design: [ADR 0019](adr/0019-audit-actors.md).
 
 - **Append-only**: no API edits or deletes rows, and SQLite triggers refuse `UPDATE` and any `DELETE` inside the retention window.
 - **No secrets**: passwords, tokens, message bodies, and routine instructions are never recorded. Details are scrubbed and clipped anyway.
@@ -143,9 +145,12 @@ Admin actions are recorded in `audit_events` in `app.sqlite`: who (person, Bot, 
 export SUPERBOT_PASSWORD=<your AUTH_PASSWORD>
 botctl audit --action 'bot.*' --from 2026-11-01            # newest first
 botctl audit export --actor user --to 2026-11-30 > audit.csv
+botctl audit --actor user:ada@example.com --method sso      # one person's SSO actions
+botctl audit --on-behalf-of ada@example.com --action 'harness.*'   # what her Bots ran
+botctl audit export --session <session id> > session.csv   # everything one sign-in did
 ```
 
-CSV export is RFC 4180 with CRLF line endings, oldest first. Cells that start with `=`, `+`, `-`, `@`, tab, or CR get a leading `'` so spreadsheets don't treat them as formulas.
+CSV export is RFC 4180 with CRLF line endings, oldest first. Columns: `id,time,actor_kind,actor_id,actor_name,actor_subject,action,target_type,target_id,bot_id,outcome,ip,user_agent,details,actor_email,actor_role,auth_method,idp,idp_provider,session_id,on_behalf_of` (the last seven were added after the first fourteen, which keep their positions). Cells that start with `=`, `+`, `-`, `@`, tab, or CR get a leading `'` so spreadsheets don't treat them as formulas.
 
 ## Users, sessions, and roles
 
@@ -213,7 +218,7 @@ Approvals, policy, and audit. Writes, decisions, the approvals list, and the aud
 - `GET /api/approvals?status=pending|approved|denied|expired|cancelled|all&bot=<id>&limit=`
 - `POST /api/approvals/:id/approve`, `POST /api/approvals/:id/deny` `{remember?: "bot"|"global", note?}`. Remember needs an admin. 409 if already decided
 - `POST /api/approvals/check` `{from, harness, event}`: the hook's call. Waits for a decision. Replies `allow` or `deny`, then the reason, as plain text
-- `GET /api/audit?from=&to=&action=&actor=&outcome=&bot=&limit=&before=<id>`: audit events, newest first, `{events, nextBefore}`. `from`/`to`: unix ms, RFC 3339, or `YYYY-MM-DD`. `action`: exact or `prefix.*`, comma-separated. `actor`: `user`, `bot`, or `system`, optionally `:<id>`. `limit` 1 to 1000, default 100
+- `GET /api/audit?from=&to=&action=&actor=&outcome=&bot=&limit=&before=<id>`: audit events, newest first, `{events, nextBefore}`. `from`/`to`: unix ms, RFC 3339, or `YYYY-MM-DD`. `action`: exact or `prefix.*`, comma-separated. `actor`: `user`, `bot`, or `system`, optionally `:<id>` (or `user:<email>`). Also `method` (comma-separated `password`, `code`, `sso`, `none`, `bot_token`), `idp` (type), `idpProvider` (id), `subject` (`<issuer>|<sub>`), `session`, `onBehalfOf` (user id or email). Each event has `actorEmail`, `actorRole`, `authMethod`, `idp`, `idpProvider`, `sessionId`, `onBehalfOf`. `limit` 1 to 1000, default 100
 - `GET /api/audit/export.csv` (same filters): CSV download, oldest first
 - `GET /api/secrets`: `{secrets: [{name, store, writable, shadowedBy, forBots}]}`, names only; `forBots` is false for botd's own SSO client secrets. `PUT /api/secrets/:name` `{value}`, `DELETE /api/secrets/:name`. Admin only
 

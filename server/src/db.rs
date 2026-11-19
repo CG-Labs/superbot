@@ -62,6 +62,9 @@ pub struct Message {
     pub from_bot: Option<String>,
     #[serde(rename = "at")]
     pub created_at: i64,
+    /// Who asked for the run this message starts, for the audit log (ADR 0019).
+    #[serde(skip)]
+    pub requested_by: Option<audit::Who>,
 }
 
 #[derive(Clone, Serialize)]
@@ -137,6 +140,7 @@ fn message_row(r: &Row) -> rusqlite::Result<Message> {
         status: r.get("status")?,
         from_bot: r.get("from_bot")?,
         created_at: r.get("created_at")?,
+        requested_by: r.get::<_, Option<String>>("requested_by")?.and_then(|s| serde_json::from_str(&s).ok()),
     })
 }
 
@@ -201,7 +205,7 @@ pub struct AuditEvent {
     pub actor_kind: String,
     pub actor_id: Option<String>,
     pub actor_name: Option<String>,
-    /// The IdP subject, once people sign in with SSO.
+    /// The IdP subject (`issuer|subject`) when the person signed in with SSO.
     pub actor_subject: Option<String>,
     pub action: String,
     pub target_type: Option<String>,
@@ -212,6 +216,17 @@ pub struct AuditEvent {
     pub ip: Option<String>,
     pub user_agent: Option<String>,
     pub details: Value,
+    // Per-user actors (ADR 0019). Null on rows written before it.
+    pub actor_email: Option<String>,
+    pub actor_role: Option<String>,
+    /// "password" (break-glass), "code", "sso", "none" (ALLOW_NO_AUTH), or "bot_token".
+    pub auth_method: Option<String>,
+    /// The SSO provider's type ("entra", "google", "oidc", "github", "apple"), and its configured id.
+    pub idp: Option<String>,
+    pub idp_provider: Option<String>,
+    pub session_id: Option<String>,
+    /// The user a Bot or the scheduler acted for.
+    pub on_behalf_of: Option<String>,
 }
 
 /// A person who can sign in. `operator` is the owner and break-glass account.
@@ -229,8 +244,11 @@ pub struct User {
     pub idp_subject: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
-    /// When a session last started for this user, by any sign-in method (ADR 0019).
+    /// When a session last started for this user, how ("password", "code", "sso"),
+    /// and through which SSO provider id (ADR 0021).
     pub last_login_at: Option<i64>,
+    pub last_login_method: Option<String>,
+    pub last_login_idp_provider: Option<String>,
 }
 
 impl User {
@@ -259,6 +277,8 @@ pub struct Session {
     pub method: String,
     /// `issuer|subject` of the SSO identity that signed in, for the audit log.
     pub idp_subject: Option<String>,
+    /// The SSO provider id it signed in with (from SSO_PROVIDERS).
+    pub idp_provider: Option<String>,
     pub label: Option<String>,
     pub ip: Option<String>,
     pub user_agent: Option<String>,
@@ -276,6 +296,7 @@ pub struct NewSession<'a> {
     pub kind: &'a str,
     pub method: &'a str,
     pub idp_subject: Option<&'a str>,
+    pub idp_provider: Option<&'a str>,
     pub label: Option<&'a str>,
     pub ip: Option<&'a str>,
     pub user_agent: Option<&'a str>,
@@ -352,6 +373,8 @@ fn user_row(r: &Row) -> rusqlite::Result<User> {
         created_at: r.get("created_at")?,
         updated_at: r.get("updated_at")?,
         last_login_at: r.get("last_login_at")?,
+        last_login_method: r.get("last_login_method")?,
+        last_login_idp_provider: r.get("last_login_idp_provider")?,
     })
 }
 
@@ -362,6 +385,7 @@ fn session_row(r: &Row) -> rusqlite::Result<Session> {
         kind: r.get("kind")?,
         method: r.get("method")?,
         idp_subject: r.get("idp_subject")?,
+        idp_provider: r.get("idp_provider")?,
         label: r.get("label")?,
         ip: r.get("ip")?,
         user_agent: r.get("user_agent")?,
@@ -438,20 +462,60 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
         ip: r.get("ip")?,
         user_agent: r.get("user_agent")?,
         details: redact::value(serde_json::from_str(&details).unwrap_or(Value::Null)),
+        actor_email: r.get("actor_email")?,
+        actor_role: r.get("actor_role")?,
+        auth_method: r.get("auth_method")?,
+        idp: r.get("idp")?,
+        idp_provider: r.get("idp_provider")?,
+        session_id: r.get("session_id")?,
+        on_behalf_of: r.get("on_behalf_of")?,
     })
 }
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 6] =
-    [migrate_approvals, migrate_audit_events, migrate_users, migrate_identities, migrate_bot_acls, migrate_last_login];
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 7] =
+    [migrate_approvals, migrate_audit_events, migrate_users, migrate_identities, migrate_bot_acls, migrate_audit_actors, migrate_last_login];
 
-/// The admin portal (ADR 0019): when each user last signed in. Sessions are pruned 30
-/// days after they end, so this lives on the user; it starts from the sessions still kept.
+/// The actor columns the audit log gained with per-user actors (ADR 0019).
+pub const AUDIT_ACTOR_COLUMNS: [&str; 7] = ["actor_email", "actor_role", "auth_method", "idp", "idp_provider", "session_id", "on_behalf_of"];
+
+/// Per-user audit actors (ADR 0019): each event says who acted as of then (email,
+/// role), how they signed in (method, SSO provider and type, session), and whom a Bot
+/// acted for. Only adds nullable columns, so old rows stay as written: the log is
+/// append-only, and guessing at who did something before it was recorded would be
+/// rewriting history. Sessions remember their SSO provider, and queued messages who
+/// asked for them, so the runs they start can be attributed.
+fn migrate_audit_actors(c: &Connection, fresh: bool) -> rusqlite::Result<()> {
+    for col in AUDIT_ACTOR_COLUMNS {
+        c.execute_batch(&format!("ALTER TABLE audit_events ADD COLUMN {col} TEXT;"))?;
+    }
+    c.execute_batch(
+        "CREATE INDEX audit_events_on_behalf_of ON audit_events(on_behalf_of, id) WHERE on_behalf_of IS NOT NULL;
+        CREATE INDEX audit_events_session ON audit_events(session_id, id) WHERE session_id IS NOT NULL;
+        ALTER TABLE sessions ADD COLUMN idp_provider TEXT;
+        ALTER TABLE messages ADD COLUMN requested_by TEXT;",
+    )?;
+    if !fresh {
+        let details = serde_json::json!({ "added": AUDIT_ACTOR_COLUMNS, "reason": "per-user actors and IdP; earlier events leave these empty" });
+        c.execute(
+            "INSERT INTO audit_events (at, actor_kind, actor_id, action, target_type, target_id, outcome, details) VALUES (?, 'system', 'migration', 'audit.schema_upgraded', 'audit', 'actors', 'success', ?)",
+            params![now(), details.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
+/// The admin portal (ADR 0021): when and how each user last signed in. Sessions are
+/// pruned 30 days after they end, so this lives on the user; it starts from the
+/// newest session still kept.
 fn migrate_last_login(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
     c.execute_batch(
         "ALTER TABLE users ADD COLUMN last_login_at INTEGER;
-        UPDATE users SET last_login_at = (SELECT max(created_at) FROM sessions WHERE sessions.user_id = users.id);",
+        ALTER TABLE users ADD COLUMN last_login_method TEXT;
+        ALTER TABLE users ADD COLUMN last_login_idp_provider TEXT;
+        UPDATE users SET (last_login_at, last_login_method, last_login_idp_provider) =
+          (SELECT created_at, method, idp_provider FROM sessions WHERE sessions.user_id = users.id ORDER BY created_at DESC, id LIMIT 1);",
     )
 }
 
@@ -912,6 +976,16 @@ impl Db {
         self.c().execute("UPDATE messages SET status = ? WHERE id = ?", params![status, id]).unwrap();
     }
 
+    /// Free text (name, email, user agent) is masked as `record` masks it.
+    pub fn set_requested_by(&self, id: i64, who: &audit::Who) {
+        let mut who = who.clone();
+        for v in [&mut who.actor.name, &mut who.actor.email, &mut who.source.user_agent].into_iter().flatten() {
+            *v = audit::redact_text(v);
+        }
+        let who = serde_json::to_value(&who).map(|v| redact::value(v).to_string()).unwrap_or_default();
+        self.c().execute("UPDATE messages SET requested_by = ? WHERE id = ?", params![who, id]).unwrap();
+    }
+
     pub fn set_question(&self, id: i64, q: &Value) {
         self.c().execute("UPDATE messages SET question = ? WHERE id = ?", params![redact::value(q.clone()).to_string(), id]).unwrap();
     }
@@ -1284,12 +1358,15 @@ impl Db {
         {
             let c = self.c();
             c.execute(
-                "INSERT INTO sessions (id, token_hash, user_id, kind, method, idp_subject, label, ip, user_agent, created_at, last_seen_at, expires_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                params![id, s.token_hash, s.user_id, s.kind, s.method, s.idp_subject, s.label, s.ip, s.user_agent, at, at, s.expires_at],
+                "INSERT INTO sessions (id, token_hash, user_id, kind, method, idp_subject, idp_provider, label, ip, user_agent, created_at, last_seen_at, expires_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![id, s.token_hash, s.user_id, s.kind, s.method, s.idp_subject, s.idp_provider, s.label, s.ip, s.user_agent, at, at, s.expires_at],
             )
             .unwrap();
-            let _ = c.execute("UPDATE users SET last_login_at = ? WHERE id = ?", params![at, s.user_id]);
+            let _ = c.execute(
+                "UPDATE users SET last_login_at = ?, last_login_method = ?, last_login_idp_provider = ? WHERE id = ?",
+                params![at, s.method, s.idp_provider, s.user_id],
+            );
         }
         self.session(&id).unwrap()
     }
@@ -1422,27 +1499,38 @@ impl Db {
     // Audit: append-only. There is no update or delete here; triggers refuse both,
     // except retention pruning of rows older than `audit_retention_days`.
 
-    /// Writes one event. `details` is scrubbed of secrets; free text is clipped.
+    /// Writes one event. `details` is scrubbed of secrets; free text (names, the user
+    /// agent) is masked the same way; everything is clipped.
     pub fn record(&self, e: &audit::Event) {
         let o = |v: &Option<String>, max: usize| v.as_deref().map(|s| audit::clip(s, max));
+        let text = |v: &Option<String>, max: usize| v.as_deref().map(|s| audit::clip(&redact::text(&audit::redact_text(s)), max));
         let details = redact::value(audit::scrub(e.details.clone())).to_string();
+        let a = &e.actor;
         let res = self.c().execute(
-            "INSERT INTO audit_events (at, actor_kind, actor_id, actor_name, actor_subject, action, target_type, target_id, bot_id, outcome, ip, user_agent, details)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO audit_events (at, actor_kind, actor_id, actor_name, actor_subject, action, target_type, target_id, bot_id, outcome, ip, user_agent, details,
+               actor_email, actor_role, auth_method, idp, idp_provider, session_id, on_behalf_of)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 now(),
-                e.actor.kind.as_str(),
-                o(&e.actor.id, 128),
-                o(&e.actor.name, 128),
-                o(&e.actor.subject, 256),
+                a.kind.as_str(),
+                o(&a.id, 128),
+                text(&a.name, 128),
+                o(&a.subject, 256),
                 audit::clip(&e.action, 64),
                 o(&e.target_type, 32),
                 o(&e.target_id, 128),
                 o(&e.bot_id, 128),
                 e.outcome.as_str(),
                 o(&e.source.ip, 64),
-                o(&e.source.user_agent, 256),
+                text(&e.source.user_agent, 256),
                 details,
+                text(&a.email, 254),
+                o(&a.role, 16),
+                o(&a.method, 32),
+                o(&a.idp, 32),
+                o(&a.idp_provider, 64),
+                o(&a.session, 64),
+                o(&a.on_behalf_of, 128),
             ],
         );
         if let Err(err) = res {
@@ -1483,10 +1571,28 @@ impl Db {
             }
             and(&format!("({})", parts.join(" OR ")), vals);
         }
-        for (col, v) in [("actor_kind", &f.actor_kind), ("actor_id", &f.actor_id), ("outcome", &f.outcome), ("bot_id", &f.bot_id)] {
+        let exact = [
+            ("actor_kind", &f.actor_kind),
+            ("actor_id", &f.actor_id),
+            ("idp", &f.idp),
+            ("idp_provider", &f.idp_provider),
+            ("actor_subject", &f.subject),
+            ("session_id", &f.session_id),
+            ("on_behalf_of", &f.on_behalf_of),
+            ("outcome", &f.outcome),
+            ("bot_id", &f.bot_id),
+        ];
+        for (col, v) in exact {
             if let Some(v) = v {
                 and(&format!("{col} = ?"), vec![V::Text(v.clone())]);
             }
+        }
+        if let Some(e) = &f.actor_email {
+            and("actor_email = ? COLLATE NOCASE", vec![V::Text(e.clone())]);
+        }
+        if !f.methods.is_empty() {
+            let marks = vec!["?"; f.methods.len()].join(", ");
+            and(&format!("auth_method IN ({marks})"), f.methods.iter().map(|m| V::Text(m.clone())).collect());
         }
         if let Some(id) = f.before {
             and("id < ?", vec![V::Integer(id)]);
@@ -1573,14 +1679,98 @@ mod tests {
         drop(db);
         let db = Db::open(&path).unwrap();
         let actions: Vec<String> = all_events(&db).into_iter().map(|e| e.action).collect();
-        assert_eq!(actions, ["bot.acl_initialized", "policy.initialized"]);
+        assert_eq!(actions, ["audit.schema_upgraded", "bot.acl_initialized", "policy.initialized"]);
     }
 
-    /// Rewinds a database to before last sign-in times, so a test can set `user_version` to 5.
-    const UNDO_LAST_LOGIN: &str = "ALTER TABLE users DROP COLUMN last_login_at;";
+    macro_rules! undo_audit_actors {
+        () => {
+            "DROP INDEX audit_events_on_behalf_of; DROP INDEX audit_events_session;
+            ALTER TABLE audit_events DROP COLUMN actor_email; ALTER TABLE audit_events DROP COLUMN actor_role;
+            ALTER TABLE audit_events DROP COLUMN auth_method; ALTER TABLE audit_events DROP COLUMN idp;
+            ALTER TABLE audit_events DROP COLUMN idp_provider; ALTER TABLE audit_events DROP COLUMN session_id;
+            ALTER TABLE audit_events DROP COLUMN on_behalf_of; ALTER TABLE sessions DROP COLUMN idp_provider;
+            ALTER TABLE messages DROP COLUMN requested_by;"
+        };
+    }
 
-    /// Rewinds a database to before bot ACLs (and what came after), so a test can set `user_version` lower.
-    const UNDO_BOT_ACLS: &str = "ALTER TABLE users DROP COLUMN last_login_at; DROP TABLE bot_grants; DROP INDEX bots_owner; ALTER TABLE bots DROP COLUMN visibility; ALTER TABLE bots DROP COLUMN owner_id;";
+    macro_rules! undo_last_login {
+        () => {
+            "ALTER TABLE users DROP COLUMN last_login_at; ALTER TABLE users DROP COLUMN last_login_method;
+            ALTER TABLE users DROP COLUMN last_login_idp_provider; "
+        };
+    }
+
+    /// Rewinds a database to before last sign-ins (user_version 6).
+    const UNDO_LAST_LOGIN: &str = undo_last_login!();
+
+    /// Rewinds a database to before per-user audit actors (user_version 5).
+    const UNDO_AUDIT_ACTORS: &str = concat!(undo_last_login!(), undo_audit_actors!());
+
+    /// Rewinds a database to before bot ACLs, so a test can set `user_version` lower.
+    const UNDO_BOT_ACLS: &str =
+        concat!(undo_last_login!(), undo_audit_actors!(), " DROP TABLE bot_grants; DROP INDEX bots_owner; ALTER TABLE bots DROP COLUMN visibility; ALTER TABLE bots DROP COLUMN owner_id;");
+
+    #[test]
+    fn upgrade_keeps_old_audit_rows_and_records_new_actors() {
+        let path = temp_path("actors-upgrade").join("app.sqlite");
+        let db = Db::open(&path).unwrap();
+        let bot = db.create_bot("Kept", "#fff", "waddle", "claude", None, true);
+        let queued = db.add_message(&bot.id, "user", "hi", None, false, Some("queued"));
+        db.c().execute_batch(&format!("{UNDO_AUDIT_ACTORS} PRAGMA user_version = 5;")).unwrap();
+        // A row as version 5 wrote it.
+        db.c()
+            .execute(
+                "INSERT INTO audit_events (at, actor_kind, actor_id, actor_name, action, outcome, details) VALUES (1, 'user', 'operator', 'Owner', 'bot.created', 'success', '{}')",
+                [],
+            )
+            .unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        let v: i64 = db.c().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, MIGRATIONS.len() as i64);
+        let rows = all_events(&db);
+        let (upgraded, old) = (&rows[0], rows.iter().find(|e| e.action == "bot.created").unwrap());
+        assert_eq!((upgraded.action.as_str(), upgraded.actor_id.as_deref()), ("audit.schema_upgraded", Some("migration")));
+        assert_eq!(upgraded.details["added"].as_array().map(Vec::len), Some(AUDIT_ACTOR_COLUMNS.len()));
+        assert_eq!((old.actor_id.as_deref(), old.actor_name.as_deref()), (Some("operator"), Some("Owner")), "old rows stay as written");
+        assert_eq!((&old.actor_email, &old.auth_method, &old.idp, &old.session_id, &old.on_behalf_of), (&None, &None, &None, &None, &None));
+        let m = db.message(queued.id).unwrap();
+        assert!(m.requested_by.is_none(), "messages queued before the upgrade have no requester");
+
+        let who = audit::Who {
+            actor: audit::Actor {
+                email: Some("ada@example.com".into()),
+                role: Some("admin".into()),
+                method: Some("sso".into()),
+                idp: Some("entra".into()),
+                idp_provider: Some("work".into()),
+                session: Some("s1".into()),
+                ..audit::Actor::operator()
+            },
+            source: audit::Source::default(),
+        };
+        db.set_requested_by(m.id, &who);
+        assert_eq!(db.message(m.id).unwrap().requested_by.map(|w| w.actor), Some(who.actor.clone()));
+        db.record(&who.event("bot.updated"));
+        let e = &all_events(&db)[0];
+        assert_eq!(
+            (e.actor_email.as_deref(), e.actor_role.as_deref(), e.auth_method.as_deref(), e.idp.as_deref(), e.idp_provider.as_deref(), e.session_id.as_deref()),
+            (Some("ada@example.com"), Some("admin"), Some("sso"), Some("entra"), Some("work"), Some("s1"))
+        );
+        assert!(db.c().execute("UPDATE audit_events SET actor_email = 'x'", []).is_err(), "still append-only");
+    }
+
+    #[test]
+    fn actor_text_is_scrubbed_and_clipped() {
+        let db = Db::open(&temp_path("actor-scrub").join("app.sqlite")).unwrap();
+        let actor = audit::Actor { name: Some("Ada password=hunter2".into()), email: Some(format!("{}@example.com", "a".repeat(300))), ..audit::Actor::operator() };
+        let source = audit::Source { ip: None, user_agent: Some("curl --token sbs_0123456789abcdef0123456789".into()) };
+        db.record(&audit::Who { actor, source }.event("x.y"));
+        let e = &all_events(&db)[0];
+        assert_eq!(e.actor_name.as_deref(), Some("Ada password=[redacted]"));
+        assert!(!e.user_agent.as_deref().unwrap().contains("sbs_0123"), "{:?}", e.user_agent);
+        assert_eq!(e.actor_email.as_deref().unwrap().chars().count(), 255, "254 and an ellipsis");
+    }
 
     #[test]
     fn upgrade_takes_last_sign_ins_from_kept_sessions() {
@@ -1588,12 +1778,13 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let seen = db.create_user(None, None, "Seen", Role::Member).unwrap();
         let never = db.create_user(None, None, "Never", Role::Member).unwrap();
-        let s = db.create_session(&NewSession { user_id: &seen.id, token_hash: "h", kind: "token", method: "code", idp_subject: None, label: None, ip: None, user_agent: None, expires_at: now() + 1000 });
+        let s = db.create_session(&NewSession { user_id: &seen.id, token_hash: "h", kind: "token", method: "sso", idp_subject: None, idp_provider: Some("work"), label: None, ip: None, user_agent: None, expires_at: now() + 1000 });
         assert_eq!(db.user(&seen.id).unwrap().last_login_at, Some(s.created_at), "a new session stamps it");
-        db.c().execute_batch(&format!("{UNDO_LAST_LOGIN} PRAGMA user_version = 5;")).unwrap();
+        db.c().execute_batch(&format!("{UNDO_LAST_LOGIN} PRAGMA user_version = 6;")).unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.user(&seen.id).unwrap().last_login_at, Some(s.created_at));
+        let u = db.user(&seen.id).unwrap();
+        assert_eq!((u.last_login_at, u.last_login_method.as_deref(), u.last_login_idp_provider.as_deref()), (Some(s.created_at), Some("sso"), Some("work")));
         assert_eq!(db.user(&never.id).unwrap().last_login_at, None);
     }
 
@@ -1607,7 +1798,7 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let b = db.bot(&old.id).unwrap();
         assert_eq!((b.owner_id.as_str(), b.visibility), ("operator", Visibility::Shared));
-        let e = &all_events(&db)[0];
+        let e = &all_events(&db)[1];
         assert_eq!((e.action.as_str(), e.actor_id.as_deref(), e.details["bots"].as_i64()), ("bot.acl_initialized", Some("migration"), Some(1)));
 
         // Grants: one per user and Bot, gone with the Bot, and the schema refuses unknown words.
@@ -1731,6 +1922,7 @@ mod tests {
                 ("approval.requested", "bot", Some("b1"), Some("approval"), Some("a1"), "success"),
                 ("policy.denied", "system", None, None, None, "denied"),
                 ("rule.added", "user", Some("operator"), Some("rule"), Some("r1"), "success"),
+                ("audit.schema_upgraded", "system", Some("migration"), Some("audit"), Some("actors"), "success"),
             ]
         );
         assert_eq!(rows[1].details, json!({ "after": 1 }));
@@ -1835,6 +2027,50 @@ mod tests {
         assert_eq!(q(audit::Filter { before: Some(newest), ..Default::default() }).len(), 4);
         let oldest_first = db.audit_events(&audit::Filter { after: Some(newest - 2), ..Default::default() }, 100, true);
         assert_eq!(oldest_first.iter().map(|e| e.action.as_str()).collect::<Vec<_>>(), ["routine.deleted", "auth.login_failed"]);
+    }
+
+    #[test]
+    fn audit_filters_by_person_and_sign_in() {
+        let db = Db::open(&temp_path("actor-filters").join("app.sqlite")).unwrap();
+        let ada = db.create_user(None, Some("ada@example.com"), "Ada", Role::Member).unwrap();
+        let person = |method: &str, idp: Option<&str>, session: &str| audit::Actor {
+            id: Some(ada.id.clone()),
+            email: Some("Ada@Example.com".into()),
+            method: Some(method.into()),
+            idp: idp.map(|_| "entra".into()),
+            idp_provider: idp.map(String::from),
+            subject: idp.map(|_| "https://login.example/t1/v2.0|oid-1".into()),
+            session: Some(session.into()),
+            ..audit::Actor::operator()
+        };
+        let mut gone = person("code", None, "s3");
+        gone.id = Some("u-deleted".into());
+        let ev = |actor: audit::Actor, action: &str| audit::Event::new(actor, action);
+        db.record(&ev(person("sso", Some("work"), "s1"), "bot.created"));
+        db.record(&ev(person("password", None, "s2"), "policy.updated"));
+        db.record(&ev(audit::Actor::bot(Some("b1"), Some("A")).method("bot_token").on_behalf_of(&ada.id), "approval.requested"));
+        db.record(&ev(audit::Actor::system("scheduler").on_behalf_of(&ada.id), "routine.fired"));
+        db.record(&ev(gone, "auth.login"));
+        let q = |f: audit::Filter| db.audit_events(&f, 100, false).into_iter().map(|e| e.action).collect::<Vec<_>>();
+        let f = |k: &str, v: &str| {
+            let mut f = audit::Filter::from_query(&[(k.to_string(), v.to_string())].into()).unwrap();
+            f.resolve_users(|key| db.find_user(key).map(|u| u.id));
+            f
+        };
+        assert_eq!(q(f("actor", &format!("user:{}", ada.id))), ["policy.updated", "bot.created"]);
+        assert_eq!(q(f("actor", "user:ada@example.com")), ["policy.updated", "bot.created"], "an email finds the user");
+        assert_eq!(q(f("actor", "user:ADA@example.com")), ["policy.updated", "bot.created"], "any case");
+        let mut old_email = audit::Filter::from_query(&[("actor".into(), "user:ada@example.com".into())].into()).unwrap();
+        old_email.resolve_users(|_| None);
+        assert_eq!(q(old_email), ["auth.login", "policy.updated", "bot.created"], "no such user now: matches the recorded email");
+        assert_eq!(q(f("method", "sso")), ["bot.created"]);
+        assert_eq!(q(f("method", "password,bot_token")), ["approval.requested", "policy.updated"]);
+        assert_eq!(q(f("idpProvider", "work")), ["bot.created"]);
+        assert_eq!(q(f("idp", "entra")), ["bot.created"]);
+        assert_eq!(q(f("subject", "https://login.example/t1/v2.0|oid-1")), ["bot.created"]);
+        assert_eq!(q(f("session", "s2")), ["policy.updated"]);
+        assert_eq!(q(f("onBehalfOf", &ada.id)), ["routine.fired", "approval.requested"]);
+        assert_eq!(q(f("onBehalfOf", "ada@example.com")), ["routine.fired", "approval.requested"]);
     }
 
     #[test]

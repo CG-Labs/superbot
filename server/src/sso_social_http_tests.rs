@@ -543,6 +543,11 @@ async fn google_github_and_apple_side_by_side_sign_in_to_one_linked_user() {
     let logins = audit_list(&call(port, "GET", "/api/audit?action=auth.login", &admin, "").await.1);
     let idps: Vec<&str> = logins.iter().take(3).filter_map(|e| e["details"]["idp"].as_str()).collect();
     assert_eq!(idps, ["apple", "github", "google"]);
+    // The audit actor carries the IdP too, so any later action is attributed to it.
+    let actors: Vec<(&str, &str, &str)> = logins.iter().take(3).map(|e| (e["authMethod"].as_str().unwrap(), e["idp"].as_str().unwrap(), e["idpProvider"].as_str().unwrap())).collect();
+    assert_eq!(actors, [("sso", "apple", ids[2].as_str()), ("sso", "github", ids[1].as_str()), ("sso", "google", ids[0].as_str())]);
+    let github = audit_list(&call(port, "GET", "/api/audit?idp=github", &admin, "").await.1);
+    assert!(!github.is_empty() && github.iter().all(|e| e["actorId"] == u.id.as_str() && e["sessionId"].is_string()));
 
     // A GitHub sign-in can't be finished at Apple's callback, POST or GET.
     let (path, binder) = to_callback(port, &format!("/api/auth/sso/{}/start", ids[1])).await;

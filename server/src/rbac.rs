@@ -103,7 +103,7 @@ pub fn classify(method: &Method, path: &str) -> Perm {
     }
     let m = if method == Method::HEAD { "GET" } else { method.as_str() };
     match (m, s.as_slice()) {
-        // The admin portal (ADR 0019): users, sign-in codes, identities, sessions, and a
+        // The admin portal (ADR 0021): users, sign-in codes, identities, sessions, and a
         // user's Bot access. First, so no broader arm added below can ever open them.
         (_, ["users", ..] | ["sessions", ..]) => Admin,
 

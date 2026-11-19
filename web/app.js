@@ -664,7 +664,8 @@ document.addEventListener("change", (e) => {
   const card = e.target.closest(".ap-remember") && e.target.closest(".approval");
   if (card) e.target.checked ? remembered.add(card.dataset.approval) : remembered.delete(card.dataset.approval);
 });
-// Audit log: append-only record of sign-ins and admin actions (docs/adr/0009-audit-events.md).
+// Audit log: append-only record of sign-ins and admin actions (docs/adr/0009-audit-events.md),
+// with who acted and how they signed in (docs/adr/0019-audit-actors.md).
 // `query` is the filter the shown rows came from; Load more pages with it, not the form.
 const audit = { events: [], next: null, query: "", error: "", seq: 0 };
 
@@ -672,7 +673,10 @@ function auditQuery() {
   const p = new URLSearchParams();
   const action = $("au-action").value.trim();
   if (action) p.set("action", action);
-  if ($("au-actor").value) p.set("actor", $("au-actor").value);
+  const person = $("au-person").value.trim();
+  if (person) p.set("actor", `user:${person}`);
+  else if ($("au-actor").value) p.set("actor", $("au-actor").value);
+  if ($("au-method").value) p.set("method", $("au-method").value);
   // Whole days in the browser's time zone, sent as unix ms.
   const day = (id, add) => {
     const v = $(id).value;
@@ -713,17 +717,30 @@ async function loadAudit(more) {
   renderAudit();
 }
 
+const SIGN_IN = { password: "Password (break-glass)", code: "Sign-in code", sso: "SSO", none: "No auth (dev)", bot_token: "Bot token" };
+
 function renderAudit() {
   const who = (e) => {
     if (e.actorKind === "bot") return e.actorName || bot(e.actorId)?.name || e.actorId || "A Bot";
-    if (e.actorKind === "user") return e.actorName || e.actorId || "Unknown person";
+    if (e.actorKind === "user") return e.actorName || e.actorEmail || e.actorId || "Unknown person";
     return `System${e.actorId ? ` · ${e.actorId}` : ""}`;
   };
+  // A user's name from any loaded event, for "on behalf of".
+  const nameOf = (id) => audit.events.find((x) => x.actorKind === "user" && x.actorId === id && x.actorName)?.actorName || id;
+  const how = (e) => {
+    const ids = e.idp || e.idpProvider;
+    const sso = e.authMethod === "sso" && ids ? `SSO · ${ids}${e.idpProvider && e.idpProvider !== e.idp ? ` (${e.idpProvider})` : ""}` : null;
+    return [e.actorRole, sso || SIGN_IN[e.authMethod] || e.authMethod, e.onBehalfOf && `for ${nameOf(e.onBehalfOf)}`].filter(Boolean).join(" · ");
+  };
+  const tip = (e) => [
+    e.actorEmail, e.actorId && `id ${e.actorId}`, e.actorSubject && `IdP subject ${e.actorSubject}`,
+    e.sessionId && `session ${e.sessionId}`, e.onBehalfOf && `on behalf of ${e.onBehalfOf}`,
+  ].filter(Boolean).join("\n");
   const target = (e) => [e.targetType, e.targetId].filter(Boolean).join(" ");
   const details = (e) => { const s = JSON.stringify(e.details ?? {}); return s === "{}" ? "" : s; };
   $("au-rows").innerHTML = audit.events.map((e) => `<tr class="${e.outcome === "success" ? "" : "au-bad"}">
       <td title="${esc(e.time)}">${esc(new Date(e.at).toLocaleString())}</td>
-      <td>${esc(who(e))}</td>
+      <td class="au-who" title="${esc(tip(e))}">${esc(who(e))}${how(e) ? `<span class="au-how">${esc(how(e))}</span>` : ""}</td>
       <td><code>${esc(e.action)}</code></td>
       <td>${esc(target(e))}</td>
       <td>${esc(e.outcome)}</td>
@@ -748,7 +765,9 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("au")
 $("au-more").addEventListener("click", () => loadAudit(true));
 $("au-filters").addEventListener("submit", (e) => { e.preventDefault(); loadAudit(); });
 $("au-filters").addEventListener("change", () => loadAudit());
-$("au-action").addEventListener("input", () => { clearTimeout(auditTimer); auditTimer = setTimeout(() => loadAudit(), 300); });
+for (const id of ["au-action", "au-person"]) {
+  $(id).addEventListener("input", () => { clearTimeout(auditTimer); auditTimer = setTimeout(() => loadAudit(), 300); });
+}
 
 // Keep the "Denied in N minutes" countdowns fresh.
 setInterval(() => { if (approvals.length) render(true); }, 30000);

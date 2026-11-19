@@ -440,7 +440,7 @@ fn claim_details(d: &mut Value, c: &Claims) {
 }
 
 /// The IdP's type (entra, google, oidc, apple, github), beside the configured id.
-fn idp_type(a: &Auth, provider: &str) -> Option<&'static str> {
+pub(crate) fn idp_type(a: &Auth, provider: &str) -> Option<&'static str> {
     a.sso.provider(provider).map(|p| p.type_name())
 }
 
@@ -461,14 +461,16 @@ fn failed(a: &Auth, source: &Source, provider: &str, reason: &str, c: Option<&Cl
     if let (Value::Object(d), Value::Object(e)) = (&mut d, extra) {
         d.extend(e);
     }
-    let actor = Actor { kind: ActorKind::User, id: None, name: None, subject: c.map(Claims::key) };
+    let idp = idp_type(a, provider).map(String::from);
+    let idp_provider = idp.is_some().then(|| provider.to_string());
+    let actor = Actor { kind: ActorKind::User, subject: c.map(Claims::key), method: Some("sso".into()), idp, idp_provider, ..Default::default() };
     a.record(Who { actor, source: source.clone() }.event("auth.login_failed").outcome(Outcome::Failure).details(d));
 }
 
 fn signed_in(a: &Auth, user: &User, s: &db::Session, provider: &str, c: &Claims, source: &Source) {
     let mut d = json!({ "method": "sso", "provider": provider, "idp": idp_type(a, provider), "kind": s.kind, "label": s.label });
     claim_details(&mut d, c);
-    let who = Who { actor: users::actor(user, Some(s)), source: source.clone() };
+    let who = Who { actor: users::actor(a, user, Some(s), "sso"), source: source.clone() };
     a.record(who.event("auth.login").target("session", &s.id).details(d));
 }
 
@@ -642,7 +644,7 @@ async fn finish(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, q: &Ha
     match ret {
         Return::Cookie { .. } => {
             let label = pending.label.as_deref().or(Some("Web"));
-            let (s, token) = users::start_session(a, &user, "sso", Some(&claims.key()), true, label, source);
+            let (s, token) = users::start_session(a, &user, "sso", Some((id, &claims.key())), true, label, source);
             signed_in(a, &user, &s, id, &claims, source);
             let mut res = Html(SIGNED_IN).into_response();
             res.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&users::session_cookie(&token, a.sessions.max_ms)).unwrap());
@@ -716,7 +718,7 @@ pub fn redeem(a: &Auth, source: Source, code: &str, verifier: &str, cookie: bool
         return ApiError(StatusCode::UNAUTHORIZED, "That sign-in expired or was already used. Try again.".into()).into_response();
     };
     let label = label.or(h.label.as_deref());
-    let (s, token) = users::start_session(a, &user, "sso", Some(&h.claims.key()), cookie, label, &source);
+    let (s, token) = users::start_session(a, &user, "sso", Some((&h.provider, &h.claims.key())), cookie, label, &source);
     signed_in(a, &user, &s, &h.provider, &h.claims, &source);
     users::session_response(a, &user, &s, &token)
 }

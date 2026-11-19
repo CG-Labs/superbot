@@ -300,7 +300,7 @@ async fn sessions_end_on_logout_revoke_and_disable() {
     assert_eq!(actions, ["auth.logout", "session.revoked", "session.revoked_all", "user.disabled", "user.enabled"]);
 }
 
-/// What the admin portal (ADR 0019) reads and does: last sign-in, linked identities,
+/// What the admin portal (ADR 0021) reads and does: last sign-in, linked identities,
 /// waiting codes (never the codes), regenerating a code, and a user's Bot access.
 #[tokio::test]
 async fn the_admin_portal_sees_sign_ins_codes_and_bot_access() {
@@ -311,7 +311,7 @@ async fn the_admin_portal_sees_sign_ins_codes_and_bot_access() {
     let row = |list: &str| parse(list).as_array().unwrap().iter().find(|u| u["id"] == id.as_str()).cloned().unwrap();
     let (_, list) = call(port, "GET", "/api/users", &admin, "").await;
     let me = row(&list);
-    assert_eq!((me["lastLoginAt"].clone(), me["pendingCodes"].clone(), me["identities"].clone()), (Value::Null, Value::Null, json!([])));
+    assert_eq!((me["lastLogin"].clone(), me["pendingCodes"].clone(), me["identities"].clone()), (Value::Null, Value::Null, json!([])));
 
     // A 24 hour invite code: shown once, never cached, and only counted afterwards.
     let (code, head, c) = call_with(port, "POST", &format!("/api/users/{id}/login-codes"), &admin, "", r#"{"ttlMinutes":1440}"#).await;
@@ -335,6 +335,7 @@ async fn the_admin_portal_sees_sign_ins_codes_and_bot_access() {
     let (_, list) = call(port, "GET", "/api/users", &admin, "").await;
     let me = row(&list);
     assert!(me["lastLoginAt"].as_i64().is_some_and(|t| t > 0), "{me}");
+    assert_eq!(me["lastLogin"], json!({ "at": me["lastLoginAt"], "authMethod": "code", "idpProvider": null, "idp": null }));
     assert_eq!(me["pendingCodes"], Value::Null);
     let (_, me_body) = call(port, "GET", "/api/auth/me", &bearer(&t), "").await;
     assert_eq!(parse(&me_body)["user"]["lastLoginAt"], me["lastLoginAt"]);
@@ -375,6 +376,8 @@ async fn the_admin_portal_sees_sign_ins_codes_and_bot_access() {
     let events = audit_list(&body);
     assert_eq!(events[0]["details"], json!({ "ttlMinutes": 60, "replaced": 1 }));
     assert_eq!(events[1]["details"], json!({ "ttlMinutes": 1440 }));
+    assert_eq!((events[0]["actorRole"].as_str(), events[0]["targetId"].as_str()), (Some("admin"), Some(id.as_str())));
+    assert!(events[0]["authMethod"].is_string(), "{}", events[0]);
 }
 
 #[tokio::test]

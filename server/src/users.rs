@@ -177,9 +177,12 @@ pub struct Caller {
     pub method: &'static str,
 }
 
-/// The audit actor. Its subject is the SSO identity this session signed in with, else
-/// the user's own (first linked) identity.
-pub fn actor(u: &User, s: Option<&Session>) -> Actor {
+/// The audit actor: the person, their email and role now, and how this request was
+/// signed in. `method` is the caller's ("password", "none", ...); a session's own
+/// method ("password", "code", "sso") wins. The subject is the SSO identity this
+/// session signed in with, else the user's own (first linked) identity.
+pub fn actor(a: &Auth, u: &User, s: Option<&Session>, method: &str) -> Actor {
+    let provider = s.and_then(|s| s.idp_provider.clone());
     Actor {
         kind: ActorKind::User,
         id: Some(u.id.clone()),
@@ -189,6 +192,13 @@ pub fn actor(u: &User, s: Option<&Session>) -> Actor {
             (None, Some(i), Some(s)) => Some(format!("{i}|{s}")),
             _ => None,
         },
+        email: u.email.clone(),
+        role: Some(u.role.as_str().into()),
+        method: Some(s.map_or(method, |s| s.method.as_str()).into()),
+        idp: provider.as_deref().and_then(|p| crate::sso::idp_type(a, p)).map(String::from),
+        idp_provider: provider,
+        session: s.map(|s| s.id.clone()),
+        on_behalf_of: None,
     }
 }
 
@@ -237,13 +247,25 @@ pub fn user_view(u: &User) -> Value {
     })
 }
 
-/// A user as the admin portal lists them: also their linked sign-ins and any code
-/// still waiting to be used (never the code itself, only its count and expiry).
-fn admin_view(u: &User, identities: &[db::Identity], pending: Option<&(i64, i64)>) -> Value {
+/// A user as the admin portal lists them: how they last signed in, in the audit log's
+/// terms (`authMethod`, `idp`, `idpProvider`, ADR 0019), their linked sign-ins, and any
+/// code still waiting to be used (never the code itself, only its count and expiry).
+fn admin_view(a: &Auth, u: &User, identities: &[db::Identity], pending: Option<&(i64, i64)>) -> Value {
+    let idp = |provider: &str| crate::sso::idp_type(a, provider);
     let mut v = user_view(u);
+    v["lastLogin"] = match u.last_login_at {
+        None => Value::Null,
+        Some(at) => json!({
+            "at": at, "authMethod": u.last_login_method, "idpProvider": u.last_login_idp_provider,
+            "idp": u.last_login_idp_provider.as_deref().and_then(idp),
+        }),
+    };
     v["identities"] = json!(identities
         .iter()
-        .map(|i| json!({ "id": i.id, "provider": i.provider, "subject": i.subject, "email": i.email, "createdAt": i.created_at, "lastLoginAt": i.last_login_at }))
+        .map(|i| json!({
+            "id": i.id, "provider": i.provider, "idp": idp(&i.provider), "subject": i.subject, "email": i.email,
+            "createdAt": i.created_at, "lastLoginAt": i.last_login_at,
+        }))
         .collect::<Vec<_>>());
     v["pendingCodes"] = pending.map_or(Value::Null, |(n, exp)| json!({ "count": n, "expiresAt": exp }));
     v
@@ -252,7 +274,7 @@ fn admin_view(u: &User, identities: &[db::Identity], pending: Option<&(i64, i64)
 fn session_view(s: &Session, cfg: &SessionConfig) -> Value {
     let ends = s.expires_at.min(s.created_at + cfg.max_ms).min(s.last_seen_at + cfg.idle_ms);
     json!({
-        "id": s.id, "userId": s.user_id, "kind": s.kind, "method": s.method, "idpSubject": s.idp_subject, "label": s.label,
+        "id": s.id, "userId": s.user_id, "kind": s.kind, "method": s.method, "idpSubject": s.idp_subject, "idpProvider": s.idp_provider, "label": s.label,
         "ip": s.ip, "userAgent": s.user_agent, "createdAt": s.created_at, "lastSeenAt": s.last_seen_at,
         "expiresAt": s.expires_at, "endsAt": ends,
     })
@@ -260,9 +282,9 @@ fn session_view(s: &Session, cfg: &SessionConfig) -> Value {
 
 // Sign in and out.
 
-/// The new session's token and how it's handed over. `idp_subject` is `issuer|subject`
-/// for SSO sign-ins.
-pub fn start_session(a: &Auth, user: &User, method: &str, idp_subject: Option<&str>, cookie: bool, label: Option<&str>, source: &Source) -> (Session, String) {
+/// The new session's token and how it's handed over. `idp` is the SSO provider id and
+/// `issuer|subject` for SSO sign-ins.
+pub fn start_session(a: &Auth, user: &User, method: &str, idp: Option<(&str, &str)>, cookie: bool, label: Option<&str>, source: &Source) -> (Session, String) {
     let token = new_secret(SESSION_PREFIX);
     let app = a.app.as_ref().expect("sessions need the database");
     let s = app.db.create_session(&NewSession {
@@ -270,7 +292,8 @@ pub fn start_session(a: &Auth, user: &User, method: &str, idp_subject: Option<&s
         token_hash: &hash(&token),
         kind: if cookie { "cookie" } else { "token" },
         method,
-        idp_subject,
+        idp_subject: idp.map(|i| i.1),
+        idp_provider: idp.map(|i| i.0),
         label,
         ip: source.ip.as_deref(),
         user_agent: source.user_agent.as_deref(),
@@ -359,7 +382,7 @@ pub async fn login(Extension(a): Extension<Arc<Auth>>, Extension(source): Extens
         return ApiError(StatusCode::UNAUTHORIZED, msg.into()).into_response();
     };
     let (s, token) = start_session(&a, &user, method, None, cookie, label.as_deref(), &source);
-    let who = Who { actor: actor(&user, None), source };
+    let who = Who { actor: actor(&a, &user, Some(&s), method), source };
     app.db.record(&who.event("auth.login").target("session", &s.id).details(json!({ "method": method, "kind": s.kind, "label": s.label })));
     session_response(&a, &user, &s, &token)
 }
@@ -391,16 +414,16 @@ pub fn need_user_key(app: &AppState, key: &str) -> Res<User> {
     app.db.find_user(key).ok_or_else(|| not_found("User"))
 }
 
-pub async fn list_users(State(app): State<AppState>) -> Json<Value> {
+pub async fn list_users(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>) -> Json<Value> {
     let ids = app.db.all_identities();
     let codes = app.db.pending_codes(db::now());
-    let list: Vec<Value> = app.db.users().iter().map(|u| admin_view(u, ids.get(&u.id).map_or(&[], Vec::as_slice), codes.get(&u.id))).collect();
+    let list: Vec<Value> = app.db.users().iter().map(|u| admin_view(&a, u, ids.get(&u.id).map_or(&[], Vec::as_slice), codes.get(&u.id))).collect();
     Json(json!(list))
 }
 
-pub async fn get_user(State(app): State<AppState>, Path(key): Path<String>) -> Res {
+pub async fn get_user(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Path(key): Path<String>) -> Res {
     let u = need_user_key(&app, &key)?;
-    Ok(Json(admin_view(&u, &app.db.identities(&u.id), app.db.pending_codes(db::now()).get(&u.id))))
+    Ok(Json(admin_view(&a, &u, &app.db.identities(&u.id), app.db.pending_codes(db::now()).get(&u.id))))
 }
 
 /// `GET /api/users/{key}/bots`: the Bots this user can see, with their access and any
@@ -665,7 +688,7 @@ mod tests {
         let cfg = SessionConfig { idle_ms: 10 * MINUTE, max_ms: 60 * MINUTE };
         let token = new_secret(SESSION_PREFIX);
         fn new(token_hash: &str, max_ms: i64) -> NewSession<'_> {
-            NewSession { user_id: OPERATOR, token_hash, kind: "token", method: "password", idp_subject: None, label: None, ip: None, user_agent: None, expires_at: db::now() + max_ms }
+            NewSession { user_id: OPERATOR, token_hash, kind: "token", method: "password", idp_subject: None, idp_provider: None, label: None, ip: None, user_agent: None, expires_at: db::now() + max_ms }
         }
         let s = db.create_session(&new(&hash(&token), cfg.max_ms));
         let t0 = s.created_at;
