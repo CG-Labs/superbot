@@ -1,9 +1,10 @@
-//! The only contract between the server and a harness (Claude Code, Codex, Pi).
+//! The only contract between the server and a harness (Claude Code, Codex, Pi, Hermes).
 //! Each adapter builds a command line and maps the harness's JSON lines to `AgentEvent`s.
 //! Spawning, streaming, stopping, and exit handling are shared here.
 
 mod claude;
 mod codex;
+mod hermes;
 mod pi;
 
 use serde_json::Value;
@@ -69,6 +70,21 @@ pub trait Adapter: Send {
     fn on_event(&mut self, e: &Value, out: &mut Vec<AgentEvent>);
     /// Models this harness can run here, with their reasoning efforts. Blocking.
     fn models(&self) -> Vec<ModelOption>;
+    /// Environment the harness needs on top of `input.env`.
+    fn env(&self, _input: &RunInput) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    /// Text for the harness's stdin. None = no stdin.
+    fn stdin(&self, _input: &RunInput) -> Option<String> {
+        None
+    }
+    /// Stops harness processes that outlive the CLI (e.g. a daemon it started), so a
+    /// stopped run really stops. Runs before and after every run. Blocking.
+    fn stop_leftovers(&self, _input: &RunInput) {}
+    /// The longest hook timeout the harness accepts, if it caps it.
+    fn max_hook_secs(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -111,13 +127,14 @@ pub fn output(bin: &str, args: &[&str]) -> String {
 }
 
 /// To add a harness: write one adapter file and list it here.
-pub const NAMES: [&str; 3] = ["claude", "codex", "pi"];
+pub const NAMES: [&str; 4] = ["claude", "codex", "pi", "hermes"];
 
 pub fn get(name: &str) -> Option<Box<dyn Adapter>> {
     match name {
         "claude" => Some(Box::new(claude::Claude::default())),
         "codex" => Some(Box::new(codex::Codex)),
         "pi" => Some(Box::new(pi::Pi)),
+        "hermes" => Some(Box::new(hermes::Hermes::default())),
         _ => None,
     }
 }
@@ -141,15 +158,30 @@ pub fn installed() -> Vec<&'static str> {
 pub type AbortReason = Option<&'static str>;
 
 /// Runs the harness, calling `emit` for every event, until it exits or `abort` fires.
-pub async fn run(
-    mut adapter: Box<dyn Adapter>,
-    input: RunInput,
-    mut abort: watch::Receiver<AbortReason>,
-    mut emit: impl FnMut(AgentEvent),
-) {
+pub async fn run(adapter: Box<dyn Adapter>, input: RunInput, mut abort: watch::Receiver<AbortReason>, mut emit: impl FnMut(AgentEvent)) {
+    let (mut adapter, input) = stop_leftovers(adapter, input).await;
+    run_child(adapter.as_mut(), &input, &mut abort, &mut emit).await;
+    stop_leftovers(adapter, input).await;
+}
+
+async fn stop_leftovers(adapter: Box<dyn Adapter>, input: RunInput) -> (Box<dyn Adapter>, RunInput) {
+    let task = tokio::task::spawn_blocking(move || {
+        adapter.stop_leftovers(&input);
+        (adapter, input)
+    });
+    task.await.expect("stop_leftovers panicked")
+}
+
+async fn run_child(adapter: &mut dyn Adapter, input: &RunInput, abort: &mut watch::Receiver<AbortReason>, mut emit: impl FnMut(AgentEvent)) {
     let mut out = Vec::new();
-    let args = adapter.args(&input, &mut out);
+    let args = adapter.args(input, &mut out);
+    // An adapter that couldn't set up (e.g. write its approval gate) must not run.
+    let failed = out.iter().any(|e| matches!(e, AgentEvent::Error(_)));
     out.drain(..).for_each(&mut emit);
+    if failed {
+        return;
+    }
+    let stdin = adapter.stdin(input);
 
     let mut cmd = Command::new(adapter.bin());
     for k in SECRET_ENV {
@@ -159,7 +191,8 @@ pub async fn run(
         .args(&args)
         .current_dir(&input.cwd)
         .envs(&input.env)
-        .stdin(Stdio::null())
+        .envs(adapter.env(input))
+        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0) // own group, so stop kills the whole tree
@@ -170,6 +203,12 @@ pub async fn run(
         Err(e) => return emit(AgentEvent::Error(format!("Couldn't start {}: {e}", adapter.bin()))),
     };
     let pid = child.id();
+    if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = pipe.write_all(text.as_bytes()).await;
+        });
+    }
 
     let mut stderr = child.stderr.take().unwrap();
     let stderr_task = tokio::spawn(async move {
