@@ -26,6 +26,35 @@ struct Screen {
     token: String,
     used: Instant,
     procs: Vec<Child>,
+    /// voxl, kept apart so a new token restarts only the viewer, not the display.
+    viewer: Option<Child>,
+}
+
+impl Screen {
+    fn alive(&mut self) -> bool {
+        self.procs.iter_mut().chain(self.viewer.as_mut()).all(|c| matches!(c.try_wait(), Ok(None)))
+    }
+}
+
+fn new_token() -> String {
+    let token: String = crate::random_bytes(16).iter().map(|x| format!("{x:02x}")).collect();
+    crate::secrets::redact::register(&token);
+    token
+}
+
+/// voxl streams the display. Its own token login guards the stream; the proxy in front adds HTTPS.
+fn spawn_viewer(display: &str, port: u16, token: &str) -> std::io::Result<Option<Child>> {
+    if !on_path("voxl") {
+        return Ok(None);
+    }
+    spawn(
+        Command::new("voxl")
+            .args(["--addr", "127.0.0.1", "--port", &port.to_string(), "--allowed-hosts", "*"])
+            .args(["--audio-enabled", "false", "--file-transfers", "none", "--enable-clipboard", "true"])
+            .env("DISPLAY", display)
+            .env("VOXL_PASSWORD", token),
+    )
+    .map(Some)
 }
 
 /// What a Bot run and the web app need to reach a screen.
@@ -103,7 +132,7 @@ impl Screens {
     pub async fn ensure(&self, bot_id: &str, busy: impl Fn(&str) -> bool) -> Option<Info> {
         let mut live = self.live.lock().await;
         if let Some(s) = live.get_mut(bot_id) {
-            if s.procs.iter_mut().all(|c| matches!(c.try_wait(), Ok(None))) {
+            if s.alive() {
                 s.used = Instant::now();
                 return Some(self.info(s));
             }
@@ -130,9 +159,7 @@ impl Screens {
     }
 
     async fn start(&self, slot: u16) -> std::io::Result<Screen> {
-        let token: String = crate::random_bytes(16).iter().map(|x| format!("{x:02x}")).collect();
-        crate::secrets::redact::register(&token);
-        let mut s = Screen { slot, token, used: Instant::now(), procs: Vec::new() };
+        let mut s = Screen { slot, token: new_token(), used: Instant::now(), procs: Vec::new(), viewer: None };
         let Info { display, bus, port, .. } = self.info(&s);
         let n = self.base + slot;
 
@@ -155,17 +182,38 @@ impl Screens {
         let _ = std::fs::remove_file(&bus_path);
         s.procs.push(spawn(Command::new("dbus-daemon").args(["--session", "--nofork", &format!("--address={bus}")]))?);
         s.procs.push(spawn(Command::new("openbox").env("DISPLAY", &display).env("DBUS_SESSION_BUS_ADDRESS", &bus))?);
-        if on_path("voxl") {
-            // voxl's own token login guards the stream; the proxy in front adds HTTPS.
-            s.procs.push(spawn(
-                Command::new("voxl")
-                    .args(["--addr", "127.0.0.1", "--port", &port.to_string(), "--allowed-hosts", "*"])
-                    .args(["--audio-enabled", "false", "--file-transfers", "none", "--enable-clipboard", "true"])
-                    .env("DISPLAY", &display)
-                    .env("VOXL_PASSWORD", &s.token),
-            )?);
-        }
+        s.viewer = spawn_viewer(&display, port, &s.token)?;
         Ok(s)
+    }
+
+    /// Gives a running screen a new token and restarts its viewer, so earlier links
+    /// and open views stop working while the display and the Bot's apps keep going.
+    /// For when someone loses access to the Bot: the proxy doesn't ask `botd`.
+    pub async fn rotate_token(&self, bot_id: &str) {
+        let mut live = self.live.lock().await;
+        let Some(s) = live.get_mut(bot_id) else { return };
+        if let Some(mut v) = s.viewer.take() {
+            let _ = v.kill().await;
+        }
+        let old = std::mem::replace(&mut s.token, new_token());
+        crate::secrets::redact::forget(&old);
+        let Info { display, port, .. } = self.info(s);
+        match spawn_viewer(&display, port, &s.token) {
+            Ok(v) => s.viewer = v,
+            Err(e) => {
+                eprintln!("Screen viewer for {bot_id} failed to restart: {e}");
+                let s = live.remove(bot_id).unwrap();
+                stop(bot_id, s).await;
+            }
+        }
+    }
+
+    /// `rotate_token` for every running screen.
+    pub async fn rotate_all(&self) {
+        let ids: Vec<String> = self.live.lock().await.keys().cloned().collect();
+        for id in ids {
+            self.rotate_token(&id).await;
+        }
     }
 
     /// Stops screens that nobody used for a while.
@@ -260,6 +308,24 @@ mod tests {
         for bad in ["", "1280", "x800", "1280x800 -ac", "1280x800x24", "-nolisten", "99999x99999", "1x1", "1280x800;rm -rf /"] {
             assert_eq!(parse_size(bad), (1280, 800), "{bad:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_new_token_keeps_the_display_running() {
+        let dir = std::env::temp_dir().join(format!("superbot-screens-{}", crate::short_id()));
+        let screens = Screens { max: 1, idle: Duration::from_secs(60), base: 100, size: (1280, 800), run_dir: dir, live: Mutex::default() };
+        let display = spawn(Command::new("sleep").arg("30")).unwrap();
+        let s = Screen { slot: 1, token: new_token(), used: Instant::now(), procs: vec![display], viewer: None };
+        screens.live.lock().await.insert("b1".into(), s);
+        let before = screens.ensure("b1", |_| true).await.unwrap().token;
+
+        screens.rotate_token("b1").await;
+        let after = screens.ensure("b1", |_| true).await.unwrap().token;
+        assert_ne!(before, after);
+        assert_eq!(after.len(), 32);
+        assert!(screens.live.lock().await.get_mut("b1").unwrap().alive(), "same display, not restarted");
+        screens.rotate_token("nobody").await;
+        screens.remove("b1").await;
     }
 
     #[test]

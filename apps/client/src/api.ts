@@ -1,5 +1,17 @@
 import { authHeader, basicAuthHeader, normalizeBaseUrl } from "./auth";
-import type { AppState, Approval, BotView, Message, ModelOption, Policy, PolicyMode, Routine, ServerConfig } from "./types";
+import type {
+  AppState,
+  Approval,
+  BotAccessView,
+  BotView,
+  Message,
+  ModelOption,
+  Policy,
+  PolicyMode,
+  Routine,
+  ServerConfig,
+  Visibility,
+} from "./types";
 
 export class ApiError extends Error {
   constructor(
@@ -110,6 +122,11 @@ export class SuperBotApi {
 
   async deleteBot(id: string): Promise<void> {
     await this.request("DELETE", `/api/bots/${id}`);
+  }
+
+  /** Who can see a Bot (ADR 0017). Owner changes are for admins. */
+  async patchBotAccess(id: string, body: { visibility?: Visibility; owner?: string }): Promise<BotAccessView> {
+    return this.request<BotAccessView>("PATCH", `/api/bots/${id}/access`, body);
   }
 
   async messages(id: string): Promise<Message[]> {

@@ -1,4 +1,4 @@
-//! Sign in with Apple (ADR 0017). Apple is OpenID Connect with three differences: the
+//! Sign in with Apple (ADR 0018). Apple is OpenID Connect with three differences: the
 //! client secret is a short-lived ES256 JWT we sign with the team's key, the result
 //! comes back as a form POST, and the person's name arrives once, outside the token.
 

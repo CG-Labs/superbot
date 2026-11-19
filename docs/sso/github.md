@@ -1,6 +1,6 @@
 # Sign in with GitHub
 
-Lets people sign in to SuperBot with a GitHub account, on github.com or GitHub Enterprise Server. Optionally, only members of your GitHub organizations get in. Design: [ADR 0017](../adr/0017-sso-github-apple.md), on the layer from [ADR 0014](../adr/0014-oidc-sso-entra.md) and [ADR 0016](../adr/0016-sso-multi-provider.md).
+Lets people sign in to SuperBot with a GitHub account, on github.com or GitHub Enterprise Server. Optionally, only members of your GitHub organizations get in. Design: [ADR 0018](../adr/0018-sso-github-apple.md), on the layer from [ADR 0014](../adr/0014-oidc-sso-entra.md) and [ADR 0016](../adr/0016-sso-multi-provider.md).
 
 You need: a GitHub account that can create an OAuth app (for an org, an org owner), and SuperBot on HTTPS at a fixed address, like `https://superbot.example.com`. Below, replace `superbot.example.com` with yours. GitHub can run next to Microsoft, Google, Apple, and other providers; each gets its own button.
 

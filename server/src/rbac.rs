@@ -107,7 +107,7 @@ pub fn classify(method: &Method, path: &str) -> Perm {
 
         ("GET", ["state" | "events" | "bots" | "policy"]) => Read,
         ("GET", ["harnesses", _, "models"]) => Read,
-        ("GET", ["bots", _, "messages" | "routines" | "policy"]) => Read,
+        ("GET", ["bots", _, "messages" | "routines" | "policy" | "access"]) => Read,
         ("GET", ["policy", "rules"]) => Read,
         ("GET", ["approvals"]) => Review,
 
@@ -116,6 +116,9 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         ("PATCH" | "DELETE", ["bots", _]) => Write,
         ("POST", ["bots", _, "messages" | "read" | "stop" | "routines"]) => Write,
         ("PATCH" | "DELETE", ["routines", _]) => Write,
+        // Bot ACLs. Handlers also require the Bot's owner or an admin (ADR 0017).
+        ("PATCH", ["bots", _, "access"]) => Write,
+        ("PUT" | "DELETE", ["bots", _, "grants", _]) => Write,
         ("POST", ["ask" | "handoff"]) => Write,
         ("POST", ["approvals", "check"]) => Write,
 
@@ -162,6 +165,10 @@ mod tests {
             ("GET", "/api/bots/b1/messages", Perm::Read),
             ("GET", "/api/bots/b1/routines", Perm::Read),
             ("GET", "/api/bots/b1/policy", Perm::Read),
+            ("GET", "/api/bots/b1/access", Perm::Read),
+            ("PATCH", "/api/bots/b1/access", Perm::Write),
+            ("PUT", "/api/bots/b1/grants/u1", Perm::Write),
+            ("DELETE", "/api/bots/b1/grants/a%40example.com", Perm::Write),
             ("GET", "/api/policy", Perm::Read),
             ("GET", "/api/policy/rules", Perm::Read),
             ("GET", "/api/approvals", Perm::Review),
@@ -230,6 +237,9 @@ mod tests {
         }
         assert_eq!(classify(&Method::POST, "/api/approvals"), Perm::Admin);
         assert_eq!(classify(&Method::PUT, "/api/bots/b1"), Perm::Admin);
+        assert_eq!(classify(&Method::PUT, "/api/bots/b1/access"), Perm::Admin);
+        assert_eq!(classify(&Method::GET, "/api/bots/b1/grants/u1"), Perm::Admin);
+        assert_eq!(classify(&Method::PUT, "/api/bots/b1/grants"), Perm::Admin);
         assert_eq!(classify(&Method::POST, "/"), Perm::Admin);
         assert_eq!(classify(&Method::OPTIONS, "/api/state"), Perm::Admin);
     }

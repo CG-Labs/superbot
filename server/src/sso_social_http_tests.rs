@@ -1,4 +1,4 @@
-//! GitHub and Apple sign-in end to end (ADR 0017): the real router against a mock GitHub
+//! GitHub and Apple sign-in end to end (ADR 0018): the real router against a mock GitHub
 //! (OAuth endpoints and the REST API) and a mock Apple (discovery, keys, an authorize
 //! step that posts its answer back, and a token endpoint that checks our ES256 secret).
 

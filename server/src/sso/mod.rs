@@ -8,7 +8,7 @@
 //! `{sso, verifier}`. Nobody is found by email: an identity is linked by an admin, or
 //! made just in time when the provider allows it.
 //!
-//! GitHub is OAuth 2 without an ID token, and Apple posts its answer (ADR 0017); both
+//! GitHub is OAuth 2 without an ID token, and Apple posts its answer (ADR 0018); both
 //! end in the same callback, checks, and sessions as the rest.
 
 pub mod apple;

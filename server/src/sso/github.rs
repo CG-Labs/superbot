@@ -1,4 +1,4 @@
-//! GitHub sign-in (ADR 0017). GitHub is OAuth 2, not OpenID Connect: there is no ID
+//! GitHub sign-in (ADR 0018). GitHub is OAuth 2, not OpenID Connect: there is no ID
 //! token to verify. botd trades the code (with its PKCE verifier and client secret) for
 //! an access token, asks GitHub's API who that is over TLS, then revokes the token.
 

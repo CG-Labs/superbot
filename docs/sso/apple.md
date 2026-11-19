@@ -1,6 +1,6 @@
 # Sign in with Apple
 
-Lets people sign in to SuperBot with their Apple Account, including with Hide My Email. Design: [ADR 0017](../adr/0017-sso-github-apple.md), on the layer from [ADR 0014](../adr/0014-oidc-sso-entra.md) and [ADR 0016](../adr/0016-sso-multi-provider.md).
+Lets people sign in to SuperBot with their Apple Account, including with Hide My Email. Design: [ADR 0018](../adr/0018-sso-github-apple.md), on the layer from [ADR 0014](../adr/0014-oidc-sso-entra.md) and [ADR 0016](../adr/0016-sso-multi-provider.md).
 
 You need: a paid Apple Developer Program membership (Account Holder or Admin), and SuperBot on HTTPS at a public domain, like `https://superbot.example.com`. Apple refuses `localhost`, IP addresses, and plain HTTP. Below, replace `superbot.example.com` with yours. Apple can run next to Microsoft, Google, GitHub, and other providers; each gets its own button.
 

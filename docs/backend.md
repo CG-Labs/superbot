@@ -152,7 +152,7 @@ CSV export is RFC 4180 with CRLF line endings, oldest first. Cells that start wi
 People are users with a role: **admin** (everything), **member** (use and manage Bots and routines, decide approvals), or **read-only** (see everything, change nothing). Admins also manage policy, the audit log, users, sessions, and saved secrets. One check per API route enforces it; unknown routes are admin-only. Design: [ADR 0012](adr/0012-users-sessions-rbac.md).
 
 - **Owner**: made on first start as admin `operator` (name `USER_NAME`, email `OWNER_EMAIL`). `AUTH_PASSWORD` signs in as the owner (break-glass) while `AUTH_BREAK_GLASS` is on, the default. Set `AUTH_BREAK_GLASS=0` to ignore the password once admins sign in another way.
-- **Everyone else**: signs in with Microsoft Entra ID, Google, GitHub, Apple, or any OpenID Connect IdP (Okta, Keycloak, Auth0, …) when set up, several at once if you like ([Entra](sso/entra.md), [Google](sso/google.md), [GitHub](sso/github.md), [Apple](sso/apple.md), [OIDC](sso/oidc.md), [ADR 0014](adr/0014-oidc-sso-entra.md), [ADR 0016](adr/0016-sso-multi-provider.md), [ADR 0017](adr/0017-sso-github-apple.md)): an admin links their account at each IdP to a user (`botctl user link`), or just-in-time sign-up makes one. Email never links accounts. Or an admin gives them a one-time sign-in code, which they enter in the web app or client. Codes are single use and expire (default 1 hour).
+- **Everyone else**: signs in with Microsoft Entra ID, Google, GitHub, Apple, or any OpenID Connect IdP (Okta, Keycloak, Auth0, …) when set up, several at once if you like ([Entra](sso/entra.md), [Google](sso/google.md), [GitHub](sso/github.md), [Apple](sso/apple.md), [OIDC](sso/oidc.md), [ADR 0014](adr/0014-oidc-sso-entra.md), [ADR 0016](adr/0016-sso-multi-provider.md), [ADR 0018](adr/0018-sso-github-apple.md)): an admin links their account at each IdP to a user (`botctl user link`), or just-in-time sign-up makes one. Email never links accounts. Or an admin gives them a one-time sign-in code, which they enter in the web app or client. Codes are single use and expire (default 1 hour).
 - **Sessions**: the web app gets an HttpOnly cookie, the client and `botctl` a bearer token. They end after `SESSION_IDLE_TIMEOUT` without use (default `7d`) or `SESSION_MAX_AGE` after sign-in (default `30d`), on logout, or when an admin revokes them or disables the user. Only hashes are stored.
 
 ```sh
@@ -165,14 +165,28 @@ botctl session revoke <id> | botctl session revoke-all alex@example.com
 botctl user link alex@example.com entra <object-id> | botctl user identities alex@example.com
 ```
 
+### Shared and private Bots
+
+Each Bot has an owner and is **shared** (everyone can use it) or **private** (only its owner, admins, and people it's granted to). Grants are **viewer** (read its chat) or **operator** (also run it). Only the owner or an admin changes a Bot's settings, deletes it, or changes who sees it; only an admin gives it to someone else. Read-only users can view, never run. A Bot acts with its owner's access, so it only sees and asks Bots its owner can. Bots from before this stay shared and belong to the owner account. Design: [ADR 0017](adr/0017-bot-acls.md).
+
+```sh
+botctl bot access <bot-id>                          # owner, visibility, grants
+botctl bot private <bot-id> | botctl bot share <bot-id>
+botctl bot grant <bot-id> alex@example.com operator # or viewer
+botctl bot revoke <bot-id> alex@example.com
+botctl bot owner <bot-id> alex@example.com          # admins only
+```
+
 ## API
 
-All JSON. Auth: a session cookie (web app) or `Authorization: Bearer <session token>` (client, `botctl`), or HTTP Basic with `AUTH_PASSWORD` while break-glass is on. Empty password requires `ALLOW_NO_AUTH=1` on loopback only. Each route needs a role permission (above); 401 without valid credentials, 403 when the role doesn't allow it.
+All JSON. Auth: a session cookie (web app) or `Authorization: Bearer <session token>` (client, `botctl`), or HTTP Basic with `AUTH_PASSWORD` while break-glass is on. Empty password requires `ALLOW_NO_AUTH=1` on loopback only. Each route needs a role permission (above); 401 without valid credentials, 403 when the role doesn't allow it. Bot routes also need access to that Bot: 404 for a Bot you can't see, 403 when you can see it but not do this.
 
-- `GET /api/state`: user name, installed harnesses, all Bots, global policy, pending approvals. Each Bot's `handoff` is the id of its unanswered handoff card, or null.
-- `GET /api/events`: SSE stream (`message`, `draft`, `status`, `bot`, `botDeleted`, `approval`, `policy`, `resync`)
-- `POST /api/bots` `{name, harness?, model?, color?, shape?}`
-- `PATCH /api/bots/:id` `{name?, hidden?, harness?, model?, effort?}`, `DELETE /api/bots/:id`
+- `GET /api/state`: user name, installed harnesses, the Bots you can see, global policy, pending approvals on those Bots. Each Bot's `handoff` is the id of its unanswered handoff card, or null; `owner` is `{id, name}`, `visibility` is `private` or `shared`, and `access` is yours: `view`, `operate`, or `manage`.
+- `GET /api/events`: SSE stream (`message`, `draft`, `status`, `bot`, `botDeleted`, `approval`, `policy`, `resync`), only about Bots you can see
+- `POST /api/bots` `{name, harness?, model?, color?, shape?, visibility?}`: you own it; shared unless `visibility` is `private`
+- `PATCH /api/bots/:id` `{name?, hidden?, harness?, model?, effort?}`, `DELETE /api/bots/:id`: owner or admin
+- `GET /api/bots/:id/access` → `{botId, owner, visibility, access, grants?}` (grants for the owner and admins). `PATCH` `{visibility?, owner?}` (owner: admins only)
+- `PUT /api/bots/:id/grants/:user` `{level: viewer|operator}`, `DELETE /api/bots/:id/grants/:user`: owner or admin; `:user` is an id or email
 - `GET /api/harnesses/:name/models`: models and reasoning efforts the harness offers (Claude Code: aliases; Codex: `codex debug models`; Pi: `pi --list-models`; Hermes Agent: one entry with an empty `id`, meaning any model name, with its efforts)
 - `GET|POST /api/bots/:id/messages` `{text, answer?: {messageId, option}}`
 - `POST /api/bots/:id/read`, `POST /api/bots/:id/stop`

@@ -115,7 +115,7 @@ pub fn check_name(name: &str) -> Result<(), Error> {
 
 /// botd's own secrets: saved and listed like the others, but never given to a Bot.
 /// Today these are SSO client secrets (`SSO_<PROVIDER>_CLIENT_SECRET`, ADR 0014) and
-/// Apple's signing keys (`SSO_<PROVIDER>_PRIVATE_KEY`, ADR 0017).
+/// Apple's signing keys (`SSO_<PROVIDER>_PRIVATE_KEY`, ADR 0018).
 pub fn server_secret(name: &str) -> bool {
     let provider = |suffix: &str| name.strip_prefix("SSO_").and_then(|n| n.strip_suffix(suffix)).is_some_and(|id| !id.is_empty());
     env_shaped(name) && (provider("_CLIENT_SECRET") || provider("_PRIVATE_KEY"))
