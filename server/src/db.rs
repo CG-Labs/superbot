@@ -3,6 +3,7 @@
 
 use crate::acl::{Grant, Visibility};
 use crate::audit;
+use crate::machines::State as MachineState;
 use crate::policy::{Action, Mode, Override, Policy, Rule};
 use crate::rbac::Role;
 use crate::secrets::{redact, sealed};
@@ -328,6 +329,80 @@ fn signup_row(r: &Row) -> rusqlite::Result<Signup> {
         reason: r.get("reason")?,
         user_id: r.get("user_id")?,
         role: r.get("role")?,
+    })
+}
+
+/// One user's machine (ADR 0025). Destroyed rows stay, as history; a user has at
+/// most one that isn't.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Machine {
+    pub id: String,
+    pub user_id: String,
+    pub provider: String,
+    /// The provider's id for it, once created.
+    pub provider_id: Option<String>,
+    /// Unique at the provider: `<prefix>-<id>`. Creating twice can't make two.
+    pub label: String,
+    /// The provider tag it is created with and found by: the label prefix when it was
+    /// saved, so changing MACHINE_LABEL_PREFIX later can't lose it.
+    pub tag: String,
+    pub tier: String,
+    pub plan: String,
+    pub region: String,
+    pub state: MachineState,
+    /// The provider's last word on it (`running`, `offline`, ...), from reconciliation.
+    pub provider_status: Option<String>,
+    pub ipv4: Option<String>,
+    pub backups: bool,
+    pub last_error: Option<String>,
+    /// When a create was last sent. One that went unanswered may still make a machine.
+    pub create_sent_at: Option<i64>,
+    pub created_at: i64,
+    pub created_by: Option<String>,
+    pub updated_at: i64,
+    pub destroyed_at: Option<i64>,
+}
+
+pub struct NewMachine<'a> {
+    pub user_id: &'a str,
+    pub provider: &'a str,
+    pub label_prefix: &'a str,
+    pub tier: &'a str,
+    pub plan: &'a str,
+    pub region: &'a str,
+    pub created_by: Option<&'a str>,
+}
+
+#[derive(Debug)]
+pub enum AddMachine {
+    /// The user's live machine.
+    Exists(Box<Machine>),
+    Db(String),
+}
+
+fn machine_row(r: &Row) -> rusqlite::Result<Machine> {
+    Ok(Machine {
+        id: r.get("id")?,
+        user_id: r.get("user_id")?,
+        provider: r.get("provider")?,
+        provider_id: r.get("provider_id")?,
+        label: r.get("label")?,
+        tag: r.get("tag")?,
+        tier: r.get("tier")?,
+        plan: r.get("plan")?,
+        region: r.get("region")?,
+        // The column's CHECK allows only known states.
+        state: MachineState::parse(&r.get::<_, String>("state")?).unwrap_or(MachineState::Error),
+        provider_status: r.get("provider_status")?,
+        ipv4: r.get("ipv4")?,
+        backups: r.get("backups")?,
+        last_error: r.get("last_error")?,
+        create_sent_at: r.get("create_sent_at")?,
+        created_at: r.get("created_at")?,
+        created_by: r.get("created_by")?,
+        updated_at: r.get("updated_at")?,
+        destroyed_at: r.get("destroyed_at")?,
     })
 }
 
@@ -671,7 +746,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 9] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 10] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -681,6 +756,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 9] = [
     migrate_signups,
     migrate_last_login,
     migrate_scim,
+    migrate_machines,
 ];
 
 /// SCIM provisioning (ADR 0023): bearer tokens (hashes only), each in a tenant, and the
@@ -718,6 +794,37 @@ fn migrate_scim(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
         );
         CREATE UNIQUE INDEX IF NOT EXISTS scim_users_external_id ON scim_users(tenant, external_id) WHERE external_id IS NOT NULL;
         CREATE UNIQUE INDEX IF NOT EXISTS scim_users_user_name ON scim_users(tenant, user_name) WHERE deleted_at IS NULL;",
+    )
+}
+
+/// Per-user machines from the control plane (ADR 0025). Every query names the user or
+/// the machine. The partial unique index is "one machine per user": a second request
+/// can't insert another while one is live. Destroyed rows are kept as history.
+fn migrate_machines(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS machines (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id),
+          provider TEXT NOT NULL,
+          provider_id TEXT,
+          label TEXT NOT NULL UNIQUE,
+          tag TEXT NOT NULL,
+          tier TEXT NOT NULL,
+          plan TEXT NOT NULL,
+          region TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('pending', 'provisioning', 'running', 'suspended', 'destroying', 'destroyed', 'error')),
+          provider_status TEXT,
+          ipv4 TEXT,
+          backups INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          create_sent_at INTEGER,
+          created_at INTEGER NOT NULL,
+          created_by TEXT,
+          updated_at INTEGER NOT NULL,
+          destroyed_at INTEGER
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS machines_one_per_user ON machines(user_id) WHERE state <> 'destroyed';
+        CREATE INDEX IF NOT EXISTS machines_state ON machines(state, created_at);",
     )
 }
 
@@ -2145,6 +2252,68 @@ impl Db {
     pub fn prune_audit(&self) -> rusqlite::Result<usize> {
         self.c().execute(&format!("DELETE FROM audit_events WHERE at < {AUDIT_CUTOFF}"), [])
     }
+
+    // Machines (ADR 0025)
+
+    /// A new `pending` machine for the user, unless they have a live one already.
+    pub fn add_machine(&self, n: &NewMachine) -> Result<Machine, AddMachine> {
+        let id = format!("m{}", crate::short_id());
+        let at = now();
+        let res = self.c().execute(
+            "INSERT INTO machines (id, user_id, provider, label, tag, tier, plan, region, state, created_at, created_by, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, ?10, ?9)",
+            params![id, n.user_id, n.provider, format!("{}-{id}", n.label_prefix), n.label_prefix, n.tier, n.plan, n.region, at, n.created_by],
+        );
+        match res {
+            Ok(_) => self.machine(&id).ok_or_else(|| AddMachine::Db("the new machine wasn't saved".into())),
+            Err(e) if constraint(&e) => self.user_machine(n.user_id).map_or_else(|| Err(AddMachine::Db(e.to_string())), |m| Err(AddMachine::Exists(Box::new(m)))),
+            Err(e) => Err(AddMachine::Db(e.to_string())),
+        }
+    }
+
+    pub fn machine(&self, id: &str) -> Option<Machine> {
+        self.c().query_row("SELECT * FROM machines WHERE id = ?", [id], machine_row).optional().ok().flatten()
+    }
+
+    /// The user's machine that isn't destroyed, if any.
+    pub fn user_machine(&self, user_id: &str) -> Option<Machine> {
+        self.c().query_row("SELECT * FROM machines WHERE user_id = ? AND state <> 'destroyed'", [user_id], machine_row).optional().ok().flatten()
+    }
+
+    /// Newest first. `state` None: every one, destroyed too.
+    pub fn machines(&self, state: Option<MachineState>) -> Vec<Machine> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM machines WHERE ?1 IS NULL OR state = ?1 ORDER BY created_at DESC, id").unwrap();
+        s.query_map([state.map(MachineState::as_str)], machine_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Writes `m` back if the stored machine is still in state `from`, so two changes
+    /// can't both win. The user and label never change. Returns whether it was saved.
+    pub fn save_machine(&self, m: &Machine, from: MachineState) -> bool {
+        self.c()
+            .execute(
+                "UPDATE machines SET provider_id = ?, tier = ?, plan = ?, region = ?, state = ?, provider_status = ?, ipv4 = ?, backups = ?,
+                 last_error = ?, create_sent_at = ?, updated_at = ?, destroyed_at = ? WHERE id = ? AND state = ?",
+                params![
+                    m.provider_id,
+                    m.tier,
+                    m.plan,
+                    m.region,
+                    m.state.as_str(),
+                    m.provider_status,
+                    m.ipv4,
+                    m.backups,
+                    m.last_error,
+                    m.create_sent_at,
+                    now(),
+                    m.destroyed_at,
+                    m.id,
+                    from.as_str()
+                ],
+            )
+            .unwrap()
+            == 1
+    }
 }
 
 #[cfg(test)]
@@ -2195,6 +2364,43 @@ mod tests {
         let e = &all_events(&db)[0];
         assert_eq!((e.action.as_str(), e.actor_kind.as_str(), e.target_type.as_deref(), e.outcome.as_str()), ("policy.initialized", "system", Some("policy"), "success"));
         assert!(e.time.ends_with('Z'), "{}", e.time);
+    }
+
+    #[test]
+    fn one_live_machine_per_user() {
+        let path = temp_path("machines").join("app.sqlite");
+        let db = Db::open(&path).unwrap();
+        let u = db.create_user(None, Some("ada@example.com"), "Ada", Role::Member).unwrap();
+        let new = NewMachine { user_id: &u.id, provider: "fake", label_prefix: "superbot", tier: "starter", plan: "g6-standard-1", region: "gb-lon", created_by: Some("operator") };
+        let m = db.add_machine(&new).unwrap();
+        assert_eq!((m.state, m.label.clone(), m.provider_id.as_deref()), (MachineState::Pending, format!("superbot-{}", m.id), None));
+        match db.add_machine(&new) {
+            Err(AddMachine::Exists(e)) => assert_eq!(e.id, m.id),
+            other => panic!("{other:?}"),
+        }
+        let missing = NewMachine { user_id: "u-nobody", ..new };
+        assert!(matches!(db.add_machine(&missing), Err(AddMachine::Db(_))), "only for real users");
+
+        let mut next = m.clone();
+        next.state = MachineState::Provisioning;
+        next.provider_id = Some("42".into());
+        assert!(db.save_machine(&next, MachineState::Pending));
+        assert!(!db.save_machine(&next, MachineState::Pending), "a stale change loses");
+        next.state = MachineState::Destroyed;
+        assert!(db.save_machine(&next, MachineState::Provisioning));
+        assert!(db.user_machine(&u.id).is_none());
+        let again = db.add_machine(&new).unwrap();
+        assert_ne!(again.id, m.id);
+        assert_eq!(db.machines(None).len(), 2);
+        assert_eq!(db.machines(Some(MachineState::Destroyed))[0].provider_id.as_deref(), Some("42"));
+        assert!(db.c().execute("UPDATE machines SET state = 'lost'", []).is_err(), "only known states");
+
+        // An install from before machines (user_version 9) gets the table on upgrade.
+        db.c().execute_batch("DROP TABLE machines; PRAGMA user_version = 9;").unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert!(db.machines(None).is_empty());
+        assert!(db.add_machine(&new).is_ok());
     }
 
     #[test]

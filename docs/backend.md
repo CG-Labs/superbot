@@ -133,7 +133,7 @@ Limits: the parser sees commands, not what scripts or programs do inside, so thi
 API keys and tokens for Bots come from two places, first match wins:
 
 1. **Environment**: `NAME=value` in `.env`, or `NAME_FILE=/path` (Docker/systemd secrets). Same for `AUTH_PASSWORD` (`AUTH_PASSWORD_FILE`).
-2. **Saved secrets**, encrypted in SQLite: `botctl secret set OPENAI_API_KEY < key.txt` (value on stdin), `botctl secrets`, `botctl secret rm NAME`. Bots get them as environment variables from their next run. The exception is SSO client secrets (`SSO_<ID>_CLIENT_SECRET`): saved the same way, but only botd uses them, and every `SSO_*` variable is kept out of Bots' environments.
+2. **Saved secrets**, encrypted in SQLite: `botctl secret set OPENAI_API_KEY < key.txt` (value on stdin), `botctl secrets`, `botctl secret rm NAME`. Bots get them as environment variables from their next run. The exceptions are SSO client secrets (`SSO_<ID>_CLIENT_SECRET`), `TURNSTILE_SECRET` and `LINODE_TOKEN`: only botd uses them, and they (with their `_FILE` forms and every `SSO_*` variable) are kept out of Bots' environments.
 
 Saved secrets and every approval's tool input are sealed with XChaCha20-Poly1305 under a master key: `SUPERBOT_MASTER_KEY` (64 hex chars), or the 0600 file in `SUPERBOT_MASTER_KEY_FILE` (default `~/.config/superbot/master.key`, created on first start). The key never lives in `DATA_DIR`, so backups don't carry it. botd won't start with a wrong key, or without the key once something is sealed.
 
@@ -226,6 +226,17 @@ botctl bot revoke <bot-id> alex@example.com
 botctl bot owner <bot-id> alex@example.com          # admins only
 ```
 
+### Per-user machines (managed hosting)
+
+For CG-Labs managed hosting: botd can rent one Linode per user and track it. **Off by default**: without `LINODE_TOKEN` the machine endpoints answer 503 "control plane not configured", and nothing else changes. Self-hosted servers don't need it. Design: [ADR 0025](adr/0025-control-plane-linode.md).
+
+- **Turn on**: `LINODE_TOKEN` (or `LINODE_TOKEN_FILE`; a Linode personal access token with Linodes read/write) and `MACHINE_REGIONS` (e.g. `gb-lon,de-fra-2`; the first is the default). botd refuses to start with a token and no regions.
+- **Tiers**: `MACHINE_TIERS=starter=g6-standard-1,pro=g6-standard-2,max=g6-standard-4` (the default) maps tier names to Linode plans; the first is the default tier.
+- **Other settings**: `MACHINE_IMAGE` (`linode/ubuntu24.04`), `MACHINE_BACKUPS` (`on`), `MACHINE_LABEL_PREFIX` (`superbot`; every label starts with it and every machine is tagged with it; each machine keeps the prefix it was made with), `MACHINE_AUTHORIZED_KEYS` (comma-separated SSH public keys for operators), `MACHINE_RECONCILE_SECONDS` (`60`).
+- **What it does**: an admin requests a machine for a user; botd creates it (label `<prefix>-<machine id>`, so a retry never makes a second), then a reconciler marks it running, turns on backups, and finishes deletes. States: `pending`, `provisioning`, `running`, `suspended`, `destroying`, `destroyed`, `error`. Suspend powers it off; Linode still bills a powered-off machine.
+- **Audit**: `machine.requested`, `machine.created`, `machine.running`, `machine.backups_enabled`, `machine.suspended`, `machine.resumed`, `machine.resized`, `machine.destroy_requested`, `machine.destroyed`, `machine.retried`, and failures (`machine.create_failed`, `machine.lost`, `machine.destroy_failed`, `machine.backups_failed`, or the action with outcome `failure`). The admin is the actor; the reconciler acts as `system:control_plane` on behalf of the user.
+- **Not yet**: botd doesn't talk to the machines themselves (enrollment and mTLS), move a user's Bots onto theirs, or tie tiers to billing.
+
 ## API
 
 All JSON. Auth: a session cookie (web app) or `Authorization: Bearer <session token>` (client, `botctl`), or HTTP Basic with `AUTH_PASSWORD` while break-glass is on. Empty password requires `ALLOW_NO_AUTH=1` on loopback only. Each route needs a role permission (above); 401 without valid credentials, 403 when the role doesn't allow it. Bot routes also need access to that Bot: 404 for a Bot you can't see, 403 when you can see it but not do this.
@@ -270,6 +281,16 @@ SCIM ([ADR 0023](adr/0023-scim.md)). Tokens are admin only:
 - `DELETE /api/scim/tokens/:id`
 - `/scim/v2` (`Authorization: Bearer sbp_…`, `application/scim+json`): `GET /ServiceProviderConfig`, `/ResourceTypes`, `/Schemas`; `GET /Users?filter=userName eq "…"|externalId eq "…"&startIndex=&count=`, `POST /Users`, `GET|PUT|PATCH|DELETE /Users/:id`; `GET /Groups` is always empty, other group requests are 501. Errors use the SCIM error schema
 
+Per-user machines ([ADR 0025](adr/0025-control-plane-linode.md)). 503 when the control plane is off. Admin only, except `GET /api/machine`:
+
+- `GET /api/machine`: the caller's own machine `{id, tier, region, state, providerStatus, ipv4, backups, createdAt, updatedAt}`; 404 if none. Never anyone else's
+- `GET /api/machines?state=`: every machine, destroyed ones too, newest first
+- `GET /api/users/:id-or-email/machine`: the user's live machine `{id, userId, userEmail, provider, providerId, label, tag, tier, plan, region, state, providerStatus, ipv4, backups, lastError, createSentAt, createdAt, createdBy, updatedAt, destroyedAt}`; 404 if none
+- `POST /api/users/:id-or-email/machine` `{tier?, region?}`: 202 on its way. Asking again returns the same machine (200); another tier or region is a 409 (resize instead). After an error, asking again retries, with the saved tier and region unless others are given. 502 `{error, machine}` if Linode refused; 409 for a disabled user
+- `POST /api/users/:id-or-email/machine/suspend`, `/resume`, `/resize` `{tier}`: 200 with the machine (Linode is checked first, so a repeat, or a change already made there, calls nothing; resizing to the same tier applies a changed plan), 409 from the wrong state, 502 `{error, machine}` if Linode refused
+- `DELETE /api/users/:id-or-email/machine`: 200 once deleted at Linode, 202 while it retries
+- `POST /api/machines/reconcile` → `{checked, changed}`: one reconciler pass now
+
 Approvals, policy, and audit. Writes, decisions, the approvals list, and the audit log need a person (403 for the Bot token):
 
 - `GET /api/policy`: global policy, class names, global rules. `PUT /api/policy` `{mode?, timeoutMinutes?, classes?: {<class>: allow|ask|deny}}`
@@ -280,10 +301,10 @@ Approvals, policy, and audit. Writes, decisions, the approvals list, and the aud
 - `POST /api/approvals/check` `{from, harness, event}`: the hook's call. Waits for a decision. Replies `allow` or `deny`, then the reason, as plain text
 - `GET /api/audit?from=&to=&action=&actor=&outcome=&bot=&limit=&before=<id>`: audit events, newest first, `{events, nextBefore}`. `from`/`to`: unix ms, RFC 3339, or `YYYY-MM-DD`. `action`: exact or `prefix.*`, comma-separated. `actor`: `user`, `bot`, or `system`, optionally `:<id>` (or `user:<email>`). Also `method` (comma-separated `password`, `code`, `sso`, `none`, `bot_token`, `scim_token`), `idp` (type), `idpProvider` (id), `subject` (`<issuer>|<sub>`), `session`, `onBehalfOf` (user id or email). Each event has `actorEmail`, `actorRole`, `authMethod`, `idp`, `idpProvider`, `sessionId`, `onBehalfOf`. `limit` 1 to 1000, default 100
 - `GET /api/audit/export.csv` (same filters): CSV download, oldest first
-- `GET /api/secrets`: `{secrets: [{name, store, writable, shadowedBy, forBots}]}`, names only; `forBots` is false for botd's own SSO client secrets. `PUT /api/secrets/:name` `{value}`, `DELETE /api/secrets/:name`. Admin only
+- `GET /api/secrets`: `{secrets: [{name, store, writable, shadowedBy, forBots}]}`, names only; `forBots` is false for botd's own secrets (SSO client secrets, `TURNSTILE_SECRET`, `LINODE_TOKEN`). `PUT /api/secrets/:name` `{value}`, `DELETE /api/secrets/:name`. Admin only
 
 ## Not built yet
 
-Sign-up emails, self-serve SSO linking, and sign-up retention ([ADR 0022](adr/0022-landing-and-signups.md)). SCIM groups, group-to-role mapping, and bulk ([ADR 0023](adr/0023-scim.md)). Vault/Key Vault/Secret Manager stores and master-key rotation (the `SecretStore` trait is ready for them), per-Bot resource limits, Slack. Approvals follow-ups are in [approvals-followups.md](approvals-followups.md).
+Sign-up emails, self-serve SSO linking, and sign-up retention ([ADR 0022](adr/0022-landing-and-signups.md)). SCIM groups, group-to-role mapping, and bulk ([ADR 0023](adr/0023-scim.md)). Enrollment and mTLS with per-user machines, moving a user's Bots onto theirs, and `botctl machine` commands ([ADR 0025](adr/0025-control-plane-linode.md)). Vault/Key Vault/Secret Manager stores and master-key rotation (the `SecretStore` trait is ready for them), per-Bot resource limits, Slack. Approvals follow-ups are in [approvals-followups.md](approvals-followups.md).
 
 Computer use (each Bot's screen, browser, and live view) is in [computer.md](computer.md).

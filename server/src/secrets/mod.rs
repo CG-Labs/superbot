@@ -114,12 +114,16 @@ pub fn check_name(name: &str) -> Result<(), Error> {
 }
 
 /// botd's own secrets: saved and listed like the others, but never given to a Bot.
-/// Today these are SSO client secrets (`SSO_<PROVIDER>_CLIENT_SECRET`, ADR 0014) and
-/// Apple's signing keys (`SSO_<PROVIDER>_PRIVATE_KEY`, ADR 0018).
+/// Today these are SSO client secrets (`SSO_<PROVIDER>_CLIENT_SECRET`, ADR 0014),
+/// Apple's signing keys (`SSO_<PROVIDER>_PRIVATE_KEY`, ADR 0018), and `SERVER_SECRETS`.
 pub fn server_secret(name: &str) -> bool {
     let provider = |suffix: &str| name.strip_prefix("SSO_").and_then(|n| n.strip_suffix(suffix)).is_some_and(|id| !id.is_empty());
-    env_shaped(name) && (provider("_CLIENT_SECRET") || provider("_PRIVATE_KEY"))
+    env_shaped(name) && (provider("_CLIENT_SECRET") || provider("_PRIVATE_KEY") || SERVER_SECRETS.contains(&name))
 }
+
+/// The Turnstile secret (ADR 0022), and the Linode token, which can rent and delete
+/// every user's machine (ADR 0025).
+pub const SERVER_SECRETS: [&str; 2] = ["TURNSTILE_SECRET", "LINODE_TOKEN"];
 
 fn check_saveable(name: &str) -> Result<(), Error> {
     if server_secret(name) { Ok(()) } else { check_name(name) }
@@ -196,7 +200,7 @@ impl Secrets {
         let mut out = Vec::new();
         for s in &self.stores {
             for name in s.names().unwrap_or_default() {
-                if seen.contains(&name) || check_name(&name).is_err() {
+                if seen.contains(&name) || check_name(&name).is_err() || server_secret(&name) {
                     continue;
                 }
                 seen.push(name.clone());
@@ -404,6 +408,19 @@ mod tests {
         assert!(s.harness_env().is_empty());
         assert!(s.delete("SSO_APPLE_PRIVATE_KEY").unwrap());
         redact::forget(&key);
+    }
+
+    #[test]
+    fn hosting_and_turnstile_secrets_never_reach_bots() {
+        let linode = crate::db::temp_path("linode").join("token");
+        std::fs::write(&linode, "linode-from-file-7c1e\n").unwrap();
+        let s = secrets(&[("LINODE_TOKEN_FILE", linode.to_str().unwrap()), ("TURNSTILE_SECRET", "0x4AAA-env")]);
+        assert_eq!(s.get("LINODE_TOKEN").unwrap().unwrap().expose(), "linode-from-file-7c1e", "botd still reads it");
+        s.put("TURNSTILE_SECRET", "0x4AAA-sealed").unwrap();
+        assert!(s.harness_env().is_empty(), "not from a file, the environment, or the store");
+        assert!(s.list().unwrap().iter().all(|l| !l.for_bots), "listed as botd's own");
+        redact::forget("linode-from-file-7c1e");
+        redact::forget("0x4AAA-sealed");
     }
 
     #[test]

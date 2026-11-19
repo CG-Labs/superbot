@@ -133,6 +133,7 @@ Basic auth may remain for **break-glass** and **self-host hobby** tiers only, be
 | | |
 |--|--|
 | **Goal** | Paid early adopters on **managed hosting** and polished **self-host** SKU. |
+| **Status** | **Started.** Control-plane foundation in review ([#29](https://github.com/CG-Labs/superbot/issues/29), [ADR 0025](adr/0025-control-plane-linode.md)): a `machines` table (one live machine per user), a Linode API v4 client behind a provider trait, tier → plan mapping in config, admin endpoints to request, suspend, resume, resize and destroy a user's machine, a reconciler, and audit events for each change. Off unless `LINODE_TOKEN` is set, so self-host is unchanged. Next on #29: enrollment and mTLS between the control plane and each machine, then moving a user's Bots onto their machine. |
 | **Scope** | Control plane that provisions **one machine per user via the Linode API** (create, size by tier, suspend, destroy, backups); **per-user isolation**: each user's Bots, workspace, harness logins, and screens live on that user's computer, with the org's shared data (users, roles, billing, audit) in the control plane; billing v0 (Stripe, **per-user subscription tiers**); **model routing hidden behind tiers** (server picks provider and model per tier; users never pick a model on managed plans); Hermes Agent as default engine for managed tiers once the [ADR 0011 gate](adr/0011-hermes-agent-backend.md#recommendation) passes; license key for self-host; onboarding wizard (domain, IdP, tier), growing the approval-based sign-ups ([ADR 0022](adr/0022-landing-and-signups.md)) into self-serve with email, self-linked SSO, and sign-up data retention; client push notifications (routine completions, approvals), biometric optional unlock; **TestFlight / Play internal** tracks; published registry image with screens/computer use; DR: backup restore runbook + tested RPO target on managed tier. |
 | **Exit criteria** | ≥3 paying design partners; user A's computer and Bots cannot reach user B's; tier limits enforced (models, Bots, machine size); restore drill documented; mobile beta installable from stores (internal). |
 | **Size** | **L** |
@@ -176,7 +177,7 @@ Basic auth may remain for **break-glass** and **self-host hobby** tiers only, be
 | Compute isolation | One OS user, one shared workspace for all Bots | **One computer per user** (M3); harness as separate OS user, cgroup and egress limits (M5) |
 | Secrets | Env/`_FILE` or sealed in SQLite, master key outside backups, values redacted (**done**: [ADR 0010](adr/0010-secrets.md)); harness logins still on service user disk | Master-key rotation; external vaults + short-lived tokens (M5) |
 | Audit | Append-only SQLite table, CSV export, retention setting (**done**: [ADR 0009](adr/0009-audit-events.md)) | Per-user actors and IdP subjects (M2, in review: [PR #70](https://github.com/CG-Labs/superbot/pull/70), [ADR 0019](adr/0019-audit-actors.md)); SIEM export and tamper evidence (M5) |
-| Network | Caddy TLS, loopback `botd` | Same + mTLS between control plane and per-user machines (M3) |
+| Network | Caddy TLS, loopback `botd` | Same + mTLS between control plane and per-user machines (M3; enrollment design in [ADR 0025](adr/0025-control-plane-linode.md)) |
 | Client | Session token in SecureStore (password only for servers from before ADR 0012) | OAuth tokens, certificate pinning (managed) |
 
 ---
@@ -205,7 +206,7 @@ Basic auth may remain for **break-glass** and **self-host hobby** tiers only, be
 |------|--------|--------|
 | **Bash VPS installer** | Ubuntu 22.04 / 24.04 | Maintain; hardened CIS-aligned option |
 | **Docker Compose** | **Supported** (M1 ✓): [`deploy/docker/`](../deploy/docker/), [docs](../deploy/README.md#docker-compose-supported) | Published registry image; screens/computer use in the image (M3) |
-| **Managed cloud** | None | **Linode API**, one machine per user (M3); revisit the substrate before M4 |
+| **Managed cloud** | Control-plane foundation in review: Linode client, machine records, admin API, reconciler; off by default ([ADR 0025](adr/0025-control-plane-linode.md)) | **Linode API**, one machine per user (M3); revisit the substrate before M4 |
 | **Air-gapped** | Possible manual | M5 docs + license |
 
 ---
@@ -272,9 +273,9 @@ No certification claims until audits complete.
 
 | Horizon | Focus |
 |---------|--------|
-| **Now** | SCIM auth review ([PR #78](https://github.com/CG-Labs/superbot/pull/78)); finish M1: EAS `projectId`; approvals follow-ups ([list](approvals-followups.md)); owner to accept ADR 0011 and confirm the interface proposal; Hermes Agent adapter ([#27](https://github.com/CG-Labs/superbot/issues/27)) |
+| **Now** | Linode control plane review ([PR #77](https://github.com/CG-Labs/superbot/pull/77)); finish M1: EAS `projectId`; approvals follow-ups ([list](approvals-followups.md)); owner to accept ADR 0011 and confirm the interface proposal; Hermes Agent adapter ([#27](https://github.com/CG-Labs/superbot/issues/27)) |
 | **Next** | Pause or hand over a disabled user's Bot routines (SCIM-05 in the [SCIM review](security/auth-review-2026-11-scim.md)); measure Hermes per-Bot footprint (ADR 0011 gate) |
-| **Later** | Linode control plane with one machine per user; per-user tiers and hidden model routing; public launch + stores; full SCIM (groups, role mapping); SOC 2 |
+| **Later** | Linode control plane with one machine per user (foundation started: [ADR 0025](adr/0025-control-plane-linode.md); enrollment/mTLS and moving Bots next); per-user tiers and hidden model routing; public launch + stores; full SCIM (groups, role mapping); SOC 2 |
 
 ---
 
