@@ -1,5 +1,5 @@
 //! botd: the server. Owns Bots, chats, memory files, and routines; runs each Bot
-//! on its harness (Claude Code, Codex, or Pi); serves the web app and its API.
+//! on its harness (Claude Code, Codex, Pi, or Hermes Agent); serves the web app and its API.
 
 mod adapters;
 mod approvals;
