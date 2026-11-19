@@ -89,11 +89,15 @@ async fn mock_github() -> Arc<Gh> {
         )
         .route(
             "/api/user/emails",
-            get(move |h: HeaderMap| async move {
+            get(move |h: HeaderMap, Query(q): Query<HashMap<String, String>>| async move {
                 if !signed_in(&d, &h) {
                     return StatusCode::UNAUTHORIZED.into_response();
                 }
-                Json(d.emails.lock().unwrap().clone()).into_response()
+                // Paged like GitHub's: 30 by default, per_page up to 100.
+                let n = |k: &str, default: usize| q.get(k).and_then(|v| v.parse().ok()).unwrap_or(default);
+                let (per, page) = (n("per_page", 30).min(100), n("page", 1).max(1));
+                let all = d.emails.lock().unwrap().as_array().cloned().unwrap_or_default();
+                Json(all.into_iter().skip((page - 1) * per).take(per).collect::<Vec<_>>()).into_response()
             }),
         )
         .route(
@@ -221,6 +225,12 @@ async fn github_signs_in_by_numeric_id_with_the_verified_primary_email_then_revo
         assert_eq!(header(&web_sign_in(port, &id).await.1, "location").as_deref(), Some("/login?error=sso_wrong_account"), "{why}");
         assert_eq!(reason(&failures(port, &admin).await), Some("email_unverified"), "{why}");
     }
+    // Past the first page: the primary is still found.
+    let mut many: Vec<Value> = (0..150).map(|i| json!({ "email": format!("ada+{i}@example.org"), "primary": false, "verified": true })).collect();
+    many.push(json!({ "email": "ada@example.com", "primary": true, "verified": true }));
+    *gh.emails.lock().unwrap() = json!(many);
+    let (code, head) = web_sign_in(port, &id).await;
+    assert_eq!((code, signed_in_as(port, &head).await), (200, Some(u.id.clone())), "primary on the second page");
     *gh.emails.lock().unwrap() = ada_emails();
 
     // GitHub refuses the code (here: botd has the wrong client secret).

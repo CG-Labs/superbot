@@ -11,6 +11,9 @@ pub const API: &str = "https://api.github.com";
 /// The scopes the checks below need: the profile, the email list, and org membership.
 pub const SCOPE_EMAIL: &str = "user:email";
 pub const SCOPE_ORGS: &str = "read:org";
+const EMAILS_PER_PAGE: usize = 100;
+/// GitHub caps an account's addresses well below this.
+const EMAIL_PAGES: usize = 10;
 
 /// The API next to a GitHub address: github.com's own, or GitHub Enterprise Server's `/api/v3`.
 pub fn api_for(web: &str) -> String {
@@ -72,24 +75,33 @@ impl GitHub<'_> {
         };
         let subject = user["id"].as_u64().filter(|id| *id > 0).ok_or(Invalid("missing_subject"))?.to_string();
         let login = user["login"].as_str().map(|l| crate::audit::clip(l, 39));
-        // Only the verified primary address: GitHub lets people add any address unverified.
-        let email = match self.get(http, token, "/user/emails").await? {
-            (200, Value::Array(list)) => list
-                .iter()
-                .find(|e| e["primary"] == json!(true) && e["verified"] == json!(true))
-                .and_then(|e| e["email"].as_str())
-                .map(|e| e.trim().to_string())
-                .filter(|e| crate::users::valid_email(e)),
-            // No user:email scope (or a GitHub App without the email permission).
-            (403 | 404, _) => None,
-            _ => return Err(Invalid("idp_bad_response")),
-        };
-        let email = email.ok_or(Invalid("email_unverified"))?;
+        let email = self.primary_email(http, token).await?.ok_or(Invalid("email_unverified"))?;
         if !self.allowed_orgs.is_empty() && !self.in_allowed_org(http, token).await? {
             return Err(Invalid("wrong_org"));
         }
         let name = user["name"].as_str().map(|n| crate::audit::clip(n.trim(), 100)).filter(|n| !n.is_empty()).or_else(|| login.clone());
         Ok(Claims { issuer: self.web.to_string(), subject, tenant: None, email: Some(email), name, username: login })
+    }
+
+    /// The primary address, only if verified: GitHub lets people add any address
+    /// unverified. The list is paged, and the primary needn't be on the first page.
+    async fn primary_email(&self, http: &reqwest::Client, token: &str) -> Result<Option<String>, Invalid> {
+        for page in 1..=EMAIL_PAGES {
+            let list = match self.get(http, token, &format!("/user/emails?per_page={EMAILS_PER_PAGE}&page={page}")).await? {
+                (200, Value::Array(list)) => list,
+                // No user:email scope (or a GitHub App without the email permission).
+                (403 | 404, _) => return Ok(None),
+                _ => return Err(Invalid("idp_bad_response")),
+            };
+            if let Some(e) = list.iter().find(|e| e["primary"] == json!(true)) {
+                let verified = e["verified"] == json!(true);
+                return Ok(e["email"].as_str().map(|e| e.trim().to_string()).filter(|e| verified && crate::users::valid_email(e)));
+            }
+            if list.len() < EMAILS_PER_PAGE {
+                break;
+            }
+        }
+        Ok(None)
     }
 
     /// An active member of one of the allowed organizations. Pending invitations don't
