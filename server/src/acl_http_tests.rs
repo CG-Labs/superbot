@@ -313,5 +313,6 @@ async fn bots_act_with_their_owners_access() {
     assert_eq!(parse(&made)["owner"]["id"], b_id.as_str());
     // Its prompt lists only the Bots its owner can see.
     let prompt = app.system_prompt(&helper);
-    assert!(prompt.contains("- Child (id") && !prompt.contains("Secret"), "{prompt}");
+    assert!(prompt.contains("- Child (id"));
+    assert!(!prompt.contains("Secret"));
 }
