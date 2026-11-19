@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sign in · SuperBot</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      background: #171717; color: #ececec; display: grid; place-items: center;
+      font: 16px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    form { width: min(360px, 92vw); display: flex; flex-direction: column; gap: 14px; }
+    h1 { font-size: 22px; font-weight: 600; margin: 0 0 6px; text-align: center; }
+    p { margin: 0; color: #9a9a9a; font-size: 14px; text-align: center; }
+    input {
+      padding: 12px 14px; border-radius: 12px; border: 1px solid #2a2a2a;
+      background: #1c1c1c; color: #ececec; font: inherit; outline: none;
+    }
+    input:focus { border-color: #4b8df8; }
+    button {
+      padding: 12px; border-radius: 12px; border: 0; background: #ececec; color: #171717;
+      font: inherit; font-weight: 600; cursor: pointer;
+    }
+    button:disabled { opacity: .6; cursor: default; }
+    .error { color: #e5484d; font-size: 14px; text-align: center; min-height: 21px; }
+  </style>
+</head>
+<body>
+  <form id="form" autocomplete="on">
+    <h1>SuperBot</h1>
+    <p>Enter your sign-in code, or the server password.</p>
+    <input id="secret" type="password" autocomplete="current-password" placeholder="Sign-in code or password" autofocus required />
+    <button id="go" type="submit">Sign in</button>
+    <div class="error" id="error" role="alert"></div>
+  </form>
+  <script>
+    const form = document.getElementById("form");
+    const secret = document.getElementById("secret");
+    const go = document.getElementById("go");
+    const error = document.getElementById("error");
+
+    fetch("/api/auth/me").then((r) => { if (r.ok) location.replace("/"); }).catch(() => {});
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const value = secret.value.trim();
+      const body = { session: "cookie", label: "Web" };
+      if (value.startsWith("sbc_")) body.code = value; else body.password = value;
+      go.disabled = true;
+      error.textContent = "";
+      try {
+        const r = await fetch("/api/auth/login", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (r.ok) {
+          // Browsers drop Secure cookies on plain http, except on localhost.
+          const me = await fetch("/api/auth/me");
+          if (me.ok) return location.replace("/");
+          error.textContent = "Signed in, but this browser didn't keep the session. Open SuperBot over HTTPS.";
+          return;
+        }
+        const data = await r.json().catch(() => ({}));
+        error.textContent = data.error || "Sign in failed.";
+      } catch {
+        error.textContent = "Can't reach the server.";
+      } finally {
+        go.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

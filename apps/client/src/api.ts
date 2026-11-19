@@ -1,4 +1,4 @@
-import { basicAuthHeader, normalizeBaseUrl } from "./auth";
+import { authHeader, basicAuthHeader, normalizeBaseUrl } from "./auth";
 import type { AppState, Approval, BotView, Message, ModelOption, Policy, PolicyMode, Routine, ServerConfig } from "./types";
 
 export class ApiError extends Error {
@@ -11,8 +11,45 @@ export class ApiError extends Error {
   }
 }
 
+/** One-time sign-in codes an admin makes start with this (see ADR 0012). */
+export const CODE_PREFIX = "sbc_";
+
+/**
+ * Signs in with a password or sign-in code and returns a session-token config.
+ * Servers from before sign-in (ADR 0012) don't have the endpoint: with a password,
+ * fall back to sending it on every request, as before.
+ */
+export async function signIn(baseUrl: string, secret: string, label = "SuperBot app"): Promise<ServerConfig> {
+  const isCode = secret.startsWith(CODE_PREFIX);
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  // Lets an old server, which checks auth before routing, answer 404 instead of 401.
+  if (!isCode) headers.Authorization = basicAuthHeader(secret);
+  const res = await fetch(`${normalizeBaseUrl(baseUrl)}/api/auth/login`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ...(isCode ? { code: secret } : { password: secret }), session: "token", label }),
+  });
+  const data = (await res.json().catch(() => null)) as { token?: string; error?: string } | null;
+  if (res.ok && data?.token) return { baseUrl, token: data.token };
+  if (res.status === 404 || res.status === 405) {
+    if (isCode) throw new ApiError("This server doesn't support sign-in codes. Use the password.", res.status);
+    return { baseUrl, password: secret };
+  }
+  if (res.status === 401 && !data?.error) {
+    throw new ApiError(isCode ? "This server doesn't support sign-in codes. Use the password." : "Wrong password.", 401);
+  }
+  throw new ApiError(data?.error ?? `HTTP ${res.status}`, res.status);
+}
+
 export class SuperBotApi {
+  /** Called when the server refuses this session token, e.g. after a revoke. */
+  onSessionEnded?: () => void;
+
   constructor(private cfg: ServerConfig) {}
+
+  get config(): ServerConfig {
+    return this.cfg;
+  }
 
   get baseUrl(): string {
     return normalizeBaseUrl(this.cfg.baseUrl);
@@ -20,7 +57,7 @@ export class SuperBotApi {
 
   private headers(json = false): Record<string, string> {
     const h: Record<string, string> = {
-      Authorization: basicAuthHeader(this.cfg.password),
+      Authorization: authHeader(this.cfg),
     };
     if (json) h["Content-Type"] = "application/json";
     return h;
@@ -34,6 +71,7 @@ export class SuperBotApi {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
+      if (res.status === 401 && this.cfg.token) this.onSessionEnded?.();
       const msg = (data as { error?: string }).error ?? `HTTP ${res.status}`;
       throw new ApiError(msg, res.status);
     }
@@ -42,6 +80,19 @@ export class SuperBotApi {
 
   async verify(): Promise<AppState> {
     return this.request<AppState>("GET", "/api/state");
+  }
+
+  /** Ends this session on the server. Nothing to end for a password config. */
+  /** Ends the session on the server, giving up after `timeoutMs`. */
+  async logout(timeoutMs = 5000): Promise<void> {
+    if (!this.cfg.token) return;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeoutMs);
+    try {
+      await fetch(`${this.baseUrl}/api/auth/logout`, { method: "POST", headers: this.headers(false), signal: ctl.signal });
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async createBot(body: {
