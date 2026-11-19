@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   Modal,
   Pressable,
@@ -45,6 +45,12 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
   const [name, setName] = useState(bot?.name || "");
   const [routines, setRoutines] = useState<Routine[]>([]);
   const [editing, setEditing] = useState<Editing>(null);
+  /** The Bot whose routines are on screen; a load for any other (or a closed panel) is stale. */
+  const shownRef = useRef<string | null>(null);
+
+  const showRoutines = (id: string, list: Routine[]) => {
+    if (shownRef.current === id) setRoutines(list.filter((r) => r.bot_id === id));
+  };
 
   useEffect(() => {
     setName(bot?.name || "");
@@ -53,15 +59,21 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
   useEffect(() => {
     setEditing(null);
     setRoutines([]);
+    shownRef.current = botId && visible ? botId : null;
     if (botId && visible) {
-      void fetchRoutines(botId).then(setRoutines).catch(() => setRoutines([]));
+      void fetchRoutines(botId)
+        .then((list) => showRoutines(botId, list))
+        .catch(() => showRoutines(botId, []));
     }
     // fetchRoutines changes identity on every provider render; reload only when the Bot or visibility changes.
   }, [botId, visible]);
 
   if (!bot) return null;
 
-  const reload = () => fetchRoutines(bot.id).then(setRoutines);
+  const reload = () => {
+    const id = bot.id;
+    return fetchRoutines(id).then((list) => showRoutines(id, list));
+  };
 
   const close = () => {
     setEditing(null);

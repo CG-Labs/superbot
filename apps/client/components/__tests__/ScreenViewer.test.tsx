@@ -36,6 +36,26 @@ describe("ScreenViewer", () => {
     expect(screen.getByTestId("screen-shield")).toBeOnTheScreen();
   });
 
+  it("reports control changes so a remounted viewer can keep them", async () => {
+    const user = userEvent.setup();
+    const onControlChange = jest.fn();
+    await render(
+      <ScreenViewer
+        botId="b1"
+        botName="Ada"
+        fetchUrl={jest.fn().mockResolvedValue("https://h/screen/6901/?token=a")}
+        onClose={jest.fn()}
+        initialControl
+        onControlChange={onControlChange}
+      />,
+    );
+    await screen.findByTestId("screen-frame");
+    await user.press(screen.getByRole("button", { name: "Give back" }));
+    expect(onControlChange).toHaveBeenLastCalledWith(false);
+    await user.press(screen.getByRole("button", { name: "Take over" }));
+    expect(onControlChange).toHaveBeenLastCalledWith(true);
+  });
+
   it("shows the server's error when screens are off", async () => {
     const fetchUrl = jest.fn().mockRejectedValue(new Error("Screens are off on this server."));
     await render(<ScreenViewer botId="b1" botName="Ada" fetchUrl={fetchUrl} onClose={jest.fn()} />);

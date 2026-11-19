@@ -20,6 +20,8 @@ interface Props {
   /** The open handoff for this Bot, if any: shows "Done" to hand the screen back. */
   handoff?: Message;
   onHandoffDone?: () => Promise<void>;
+  /** Reports take over / give back, so a remounted viewer (e.g. after a layout change) keeps the same state. */
+  onControlChange?: (control: boolean) => void;
   refreshMs?: number;
   retryMs?: number;
 }
@@ -32,6 +34,7 @@ export function ScreenViewer({
   initialControl = false,
   handoff,
   onHandoffDone,
+  onControlChange,
   refreshMs = SCREEN_REFRESH_MS,
   retryMs = SCREEN_RETRY_MS,
 }: Props) {
@@ -41,6 +44,12 @@ export function ScreenViewer({
   const [finishing, setFinishing] = useState(false);
   const fetchRef = useRef(fetchUrl);
   fetchRef.current = fetchUrl;
+  const controlChangeRef = useRef(onControlChange);
+  controlChangeRef.current = onControlChange;
+
+  useEffect(() => {
+    controlChangeRef.current?.(control);
+  }, [control]);
 
   useEffect(() => {
     let alive = true;

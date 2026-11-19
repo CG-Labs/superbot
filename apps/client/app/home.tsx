@@ -11,7 +11,7 @@ import { Sidebar } from "../components/Sidebar";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
 
-/** Open screen viewer. `n` remounts it, e.g. to take over when a handoff card is opened. */
+/** Open screen viewer. `takeOver` tracks whether the user has control; `n` remounts it, e.g. to take over from a handoff card. */
 type ScreenState = { takeOver: boolean; n: number } | null;
 
 export default function HomeScreen() {
@@ -61,6 +61,7 @@ export default function HomeScreen() {
             ? () => answerQuestion(handoff, Math.max(0, handoff.question?.options.indexOf("Done") ?? 0))
             : undefined
         }
+        onControlChange={(c) => setScreen((s) => (s && s.takeOver !== c ? { ...s, takeOver: c } : s))}
         onClose={() => setScreen(null)}
       />
     ) : null;
