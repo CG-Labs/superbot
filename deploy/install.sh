@@ -349,7 +349,7 @@ configure_env() {
     set_env_var "$env_file" CORS_ORIGINS "https://${DOMAIN}"
   fi
 
-  if ! grep -q '^AUTH_PASSWORD=.' "$env_file"; then
+  if ! grep -q '^AUTH_PASSWORD=.' "$env_file" && ! grep -q '^AUTH_PASSWORD_FILE=.' "$env_file"; then
     local pass
     pass=$(openssl rand -base64 32 | tr -d '/+=' | head -c 32)
     set_env_var "$env_file" AUTH_PASSWORD "$pass"
@@ -392,8 +392,13 @@ ensure_master_key() {
   fi
   if grep -q '^SUPERBOT_MASTER_KEY_FILE=.' "$env_file"; then
     key_file=$(sed -n 's/^SUPERBOT_MASTER_KEY_FILE=//p' "$env_file" | tail -n 1)
+    case $key_file in
+      \"*\" | \'*\') key_file=${key_file:1:-1} ;;
+    esac
   fi
   [[ "$key_file" == /* ]] || die "SUPERBOT_MASTER_KEY_FILE must be an absolute path, not $key_file"
+  [[ "$key_file/" != */../* ]] || die "SUPERBOT_MASTER_KEY_FILE must not contain '..': $key_file"
+  [[ "$key_file/" != "$repo_path/data/"* ]] || die "$key_file is inside DATA_DIR, which backups copy. Keep the master key elsewhere."
   [[ ! -L "$key_file" ]] || die "Refusing symlinked $key_file"
   if [[ -e "$key_file" ]]; then
     [[ -s "$key_file" ]] || die "$key_file is empty. Restore the master key from your backup (deploy/README.md)."

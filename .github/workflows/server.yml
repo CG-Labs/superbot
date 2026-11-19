@@ -82,6 +82,21 @@ jobs:
           ensure_master_key
           [[ $(sha256sum "$key") == "$before" ]]
           [[ $(grep -c '^SUPERBOT_MASTER_KEY_FILE=' "$env_file") == 1 ]]
+          # A quoted custom path is read without its quotes.
+          custom=/home/superbot/.config/superbot/custom.key
+          sed -i "s|^SUPERBOT_MASTER_KEY_FILE=.*|SUPERBOT_MASTER_KEY_FILE=\"$custom\"|" "$env_file"
+          ensure_master_key
+          [[ $(stat -c '%U %a' "$custom") == 'superbot 600' ]]
+          grep -qx "SUPERBOT_MASTER_KEY_FILE=$custom" "$env_file"
+          # Never inside DATA_DIR, which backups copy.
+          sed -i "s|^SUPERBOT_MASTER_KEY_FILE=.*|SUPERBOT_MASTER_KEY_FILE=/home/superbot/superbot/data/master.key|" "$env_file"
+          if (ensure_master_key); then exit 1; fi
+          [[ ! -e /home/superbot/superbot/data/master.key ]]
+          sed -i "s|^SUPERBOT_MASTER_KEY_FILE=.*|SUPERBOT_MASTER_KEY_FILE=$key|" "$env_file"
+          # A password file is kept: no AUTH_PASSWORD is generated beside it.
+          sed -i 's|^AUTH_PASSWORD=x$|AUTH_PASSWORD_FILE=/run/superbot-password|' "$env_file"
+          configure_env
+          if grep -q '^AUTH_PASSWORD=' "$env_file"; then exit 1; fi
           # A lost key with sealed data: stop rather than make a key that can't open it.
           mv "$key" /tmp/old.key
           sudo -u superbot sqlite3 /home/superbot/superbot/data/app.sqlite \
