@@ -3,8 +3,8 @@
 //! and is denied. Every outcome is written to the audit log and pushed over SSE.
 
 use crate::adapters::short;
-use crate::db::{now, Approval, Bot};
-use crate::policy::{self, glob_escape, Action, Call, Ctx, Verdict};
+use crate::db::{now, Approval, Bot, NewRule};
+use crate::policy::{self, glob_escape, Action, Call, Ctx, Verdict, TRUNCATED};
 use crate::runner::App;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -24,6 +24,8 @@ pub enum DecideError {
     NotFound,
     /// Already approved, denied, expired, or cancelled.
     Closed(String),
+    /// The call was too long to store whole, so it can't become an exact rule.
+    TooLong,
 }
 
 /// Closes the approval if the waiting request goes away without an answer
@@ -52,7 +54,8 @@ impl App {
         let p = self.db.effective_policy(&bot.id);
         let call = Call::new(tool, input, cwd.unwrap_or_else(|| self.cfg.workspace.clone()));
         let v = policy::decide(&p, &self.db.rules(Some(&bot.id)), &call, &self.policy_ctx());
-        let detail = || json!({ "tool": call.tool, "subject": call.subject, "class": v.class, "reason": v.reason, "rule": v.rule, "harness": harness });
+        let shown = call.shown();
+        let detail = || json!({ "tool": call.tool, "subject": shown, "class": v.class, "reason": v.reason, "rule": v.rule, "harness": harness });
         match v.action {
             Action::Allow => {
                 if v.rule.is_some() {
@@ -70,7 +73,7 @@ impl App {
                     wait = wait.min(cap);
                 }
                 let class = v.class.unwrap_or("");
-                let a = self.db.add_approval(&bot.id, harness, &call.tool, call.kind.name(), &call.subject, &call.input, class, &v.reason, now() + wait.as_millis() as i64);
+                let a = self.db.add_approval(&bot.id, harness, &call.tool, call.kind.name(), &shown, &call.input, class, &v.reason, now() + wait.as_millis() as i64);
                 self.db.audit("bot", "approval.requested", Some(&bot.id), Some(&a.id), detail());
                 let (tx, rx) = oneshot::channel();
                 self.approval_waiters.lock().unwrap().insert(a.id.clone(), tx);
@@ -103,15 +106,21 @@ impl App {
         if a.status != "pending" {
             return Err(DecideError::Closed(a.status));
         }
-        let rule = remember.map(|scope| {
-            let bot = (scope == Remember::Bot).then_some(a.bot_id.as_str());
-            let action = if approve { Action::Allow } else { Action::Deny };
-            let r = self.db.add_rule(bot, action, &a.tool, &glob_escape(&a.subject), Some(&format!("Remembered from approval {}", a.id)));
-            self.db.audit("user", "rule.added", bot, Some(&r.id), json!({ "rule": r, "from": a.id }));
-            r
-        });
         let status = if approve { "approved" } else { "denied" };
-        self.settle(id, status, "user", note, rule.as_ref().map(|r| r.id.as_str())).ok_or(DecideError::Closed("decided".into()))
+        let closed = || DecideError::Closed(self.db.approval(id).map(|a| a.status).unwrap_or_default());
+        let Some(scope) = remember else {
+            return self.settle(id, status, "user", note, None).ok_or_else(closed);
+        };
+        if a.subject.ends_with(TRUNCATED) {
+            return Err(DecideError::TooLong);
+        }
+        let bot = (scope == Remember::Bot).then_some(a.bot_id.as_str());
+        let rule_note = format!("Remembered from approval {}", a.id);
+        let pattern = glob_escape(&a.subject);
+        let new = NewRule { bot_id: bot, action: if approve { Action::Allow } else { Action::Deny }, tool: &a.tool, pattern: &pattern, note: &rule_note };
+        let r = self.db.finish_approval_with_rule(id, status, "user", note, &new).ok_or_else(closed)?;
+        self.db.audit("user", "rule.added", bot, Some(&r.id), json!({ "rule": r, "from": a.id }));
+        self.after_settle(id, status, "user", note, Some(&r.id)).ok_or_else(closed)
     }
 
     /// Closes a pending approval once, wakes its waiting hook, logs it, and tells the clients.
@@ -119,6 +128,10 @@ impl App {
         if !self.db.finish_approval(id, status, by, note, rule_id) {
             return None;
         }
+        self.after_settle(id, status, by, note, rule_id)
+    }
+
+    fn after_settle(&self, id: &str, status: &str, by: &str, note: Option<&str>, rule_id: Option<&str>) -> Option<Approval> {
         if let Some(tx) = self.approval_waiters.lock().unwrap().remove(id) {
             let _ = tx.send(status == "approved");
         }
@@ -308,5 +321,23 @@ mod tests {
         assert_eq!(app.check(&bot, "claude", "WebFetch", json!({ "url": "https://example.invalid" }), None).await.action, Action::Deny);
         assert!(app.db.approvals(None, None, 10).is_empty());
         assert_eq!(app.db.audit_events(1, None)[0].action, "policy.denied");
+    }
+
+    #[tokio::test]
+    async fn a_decision_that_loses_saves_no_rule() {
+        let app = app();
+        let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
+        let a = app.db.add_approval(&bot.id, "claude", "Bash", "shell", "git push", &json!({}), "git_push", "Pushes", now() + 60_000);
+        // A timeout closes it between the user's read and their decision.
+        assert!(app.db.finish_approval(&a.id, "expired", "system", None, None));
+        assert!(matches!(app.db.finish_approval_with_rule(&a.id, "approved", "user", None, &NewRule { bot_id: Some(&bot.id), action: Action::Allow, tool: "Bash", pattern: "git push", note: "x" }), None));
+        assert!(matches!(app.decide(&a.id, true, Some(Remember::Bot), None), Err(DecideError::Closed(s)) if s == "expired"));
+        assert!(app.db.rules(Some(&bot.id)).is_empty());
+
+        let cut = format!("git push{TRUNCATED}");
+        let long = app.db.add_approval(&bot.id, "claude", "Bash", "shell", &cut, &json!({}), "git_push", "Pushes", now() + 60_000);
+        assert!(matches!(app.decide(&long.id, true, Some(Remember::Bot), None), Err(DecideError::TooLong)));
+        assert_eq!(app.db.approval(&long.id).unwrap().status, "pending");
+        assert!(app.db.rules(Some(&bot.id)).is_empty());
     }
 }

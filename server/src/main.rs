@@ -664,6 +664,7 @@ async fn put_policy(State(app): State<AppState>, Extension(who): Extension<Princ
     app.db.set_global_policy(&after);
     app.db.audit("user", "policy.updated", None, Some("global"), json!({ "before": before, "after": after }));
     app.send(json!({ "type": "policy", "policy": after }));
+    app.stop_unguarded_runs();
     for b in app.db.bots() {
         app.push_bot(&b.id);
     }
@@ -687,6 +688,7 @@ async fn put_bot_policy(State(app): State<AppState>, Extension(who): Extension<P
     o.merge(policy::parse_patch(&v).map_err(bad)?);
     app.db.set_bot_override(&id, Some(&o));
     app.db.audit("user", "policy.updated", Some(&id), Some(&id), json!({ "before": before, "after": o }));
+    app.stop_unguarded_runs();
     app.push_bot(&id);
     Ok(Json(bot_policy_view(&app, &id)))
 }
@@ -697,6 +699,7 @@ async fn delete_bot_policy(State(app): State<AppState>, Extension(who): Extensio
     let before = app.db.bot_override(&id);
     app.db.set_bot_override(&id, None);
     app.db.audit("user", "policy.reset", Some(&id), Some(&id), json!({ "before": before }));
+    app.stop_unguarded_runs();
     app.push_bot(&id);
     Ok(Json(bot_policy_view(&app, &id)))
 }
@@ -768,6 +771,7 @@ async fn decide(State(app): State<AppState>, Extension(who): Extension<Principal
         Ok(a) => Ok(Json(json!(a))),
         Err(DecideError::NotFound) => Err(not_found("Approval")),
         Err(DecideError::Closed(s)) => Err(ApiError(StatusCode::CONFLICT, format!("This approval is already {s}"))),
+        Err(DecideError::TooLong) => Err(bad("This call is too long to remember. Approve or deny it without remembering.")),
     }
 }
 

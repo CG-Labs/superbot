@@ -76,6 +76,8 @@ The policy decides what each tool call does: run, ask a person, or be blocked.
 - **Rules**: `deny` rules (the deny list) always block. `allow` rules skip asking, unless the class is `deny`. Patterns are globs (`*`, `?`) over the command, path, URL, or tool arguments. "Remember" on an approval saves an exact-match rule for that Bot.
 - **Scope**: one global policy, plus optional per-Bot overrides.
 - **Timeout**: an unanswered approval is denied after `timeoutMinutes` (default 10). Stopping the Bot, the run ending, or a server restart also closes it.
+- **Turning approvals on** stops any task that started in `bypass` (it has no hook), with a note to send it again.
+- **Remember** saves an exact rule. Calls too long to store whole (over 4,000 characters) can be approved or denied, but not remembered.
 - **Audit**: every request, decision, timeout, and policy or rule change is in an append-only log (`GET /api/audit`).
 - **Who decides**: only a person logged in with `AUTH_PASSWORD`. Bots' token gets 403 on decisions and policy changes.
 

@@ -121,6 +121,15 @@ fn routine_row(r: &Row) -> rusqlite::Result<Routine> {
     })
 }
 
+/// A rule to save together with a decision.
+pub struct NewRule<'a> {
+    pub bot_id: Option<&'a str>,
+    pub action: Action,
+    pub tool: &'a str,
+    pub pattern: &'a str,
+    pub note: &'a str,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Approval {
@@ -594,6 +603,33 @@ impl Db {
             )
             .unwrap()
             == 1
+    }
+
+    /// Closes a pending approval and saves its remembered rule in one transaction,
+    /// so a decision that loses the race (to a timeout, a stop, or someone else) saves
+    /// no rule. None if the approval was no longer pending.
+    pub fn finish_approval_with_rule(&self, id: &str, status: &str, by: &str, note: Option<&str>, rule: &NewRule) -> Option<Rule> {
+        let rule_id = crate::short_id();
+        let c = self.c();
+        let tx = c.unchecked_transaction().ok()?;
+        let closed = tx
+            .execute(
+                "UPDATE approvals SET status = ?, decided_by = ?, note = ?, rule_id = ?, decided_at = ? WHERE id = ? AND status = 'pending'",
+                params![status, by, note, rule_id, now(), id],
+            )
+            .ok()?;
+        if closed != 1 {
+            return None;
+        }
+        let action = if rule.action == Action::Allow { "allow" } else { "deny" };
+        tx.execute(
+            "INSERT INTO policy_rules (id, bot_id, action, tool, pattern, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            params![rule_id, rule.bot_id, action, rule.tool, rule.pattern, rule.note, now()],
+        )
+        .ok()?;
+        tx.commit().ok()?;
+        drop(c);
+        self.rule(&rule_id)
     }
 
     // Audit: append-only (triggers refuse UPDATE and DELETE).

@@ -185,7 +185,8 @@ impl Kind {
 pub struct Call {
     pub tool: String,
     pub kind: Kind,
-    /// What rules match and the user reads: the command, path, URL, or tool arguments.
+    /// What rules match: the whole command, path, URL, or tool arguments.
+    /// Never shortened, so a remembered rule can't match a longer, different call.
     pub subject: String,
     pub input: Value,
     pub cwd: PathBuf,
@@ -219,10 +220,22 @@ impl Call {
                 format!("{tool} {args}")
             }
         };
-        let subject: String = subject.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(4000).collect();
+        let subject = subject.split_whitespace().collect::<Vec<_>>().join(" ");
         Call { tool: tool.to_string(), kind, subject, input, cwd }
     }
+
+    /// The subject as stored and shown to the user: cut to SHOWN_MAX characters, with
+    /// TRUNCATED at the end when cut. A cut subject can't be remembered as a rule.
+    pub fn shown(&self) -> String {
+        if self.subject.chars().count() <= SHOWN_MAX {
+            return self.subject.clone();
+        }
+        self.subject.chars().take(SHOWN_MAX).collect::<String>() + TRUNCATED
+    }
 }
+
+const SHOWN_MAX: usize = 4000;
+pub const TRUNCATED: &str = " …[cut]";
 
 fn shell_text(v: &Value) -> String {
     match v {
@@ -603,6 +616,7 @@ fn split_commands(cmd: &str) -> Vec<Segment> {
     let mut in_word = false;
     let mut piped = false;
     let mut skip_next_word = false;
+    let mut nested: Vec<String> = Vec::new();
     let mut chars = cmd.chars().peekable();
     let finish_word = |word: &mut String, in_word: &mut bool, argv: &mut Vec<String>, skip: &mut bool| {
         if *in_word {
@@ -644,6 +658,30 @@ fn split_commands(cmd: &str) -> Vec<Segment> {
                             if let Some(n) = chars.next() {
                                 word.push(n);
                             }
+                        }
+                        // The shell runs these even inside double quotes.
+                        '$' if chars.peek() == Some(&'(') => {
+                            chars.next();
+                            let mut depth = 1;
+                            let mut inner = String::new();
+                            for c in chars.by_ref() {
+                                depth += match c {
+                                    '(' => 1,
+                                    ')' => -1,
+                                    _ => 0,
+                                };
+                                if depth == 0 {
+                                    break;
+                                }
+                                inner.push(c);
+                            }
+                            word.push_str(&inner);
+                            nested.push(inner);
+                        }
+                        '`' => {
+                            let inner: String = chars.by_ref().take_while(|c| *c != '`').collect();
+                            word.push_str(&inner);
+                            nested.push(inner);
                         }
                         c => word.push(c),
                     }
@@ -696,6 +734,9 @@ fn split_commands(cmd: &str) -> Vec<Segment> {
     }
     finish_word(&mut word, &mut in_word, &mut argv, &mut skip_next_word);
     finish_seg(&mut argv, false, &mut piped);
+    for n in nested {
+        segs.extend(split_commands(&n));
+    }
     segs
 }
 
@@ -944,6 +985,11 @@ mod tests {
         assert_eq!(cls("timeout 30 git push"), ["git_push"]);
         assert_eq!(cls("echo $(git push)"), ["git_push"]);
         assert_eq!(cls("true && `git push`"), ["git_push"]);
+        // The shell runs substitutions inside double quotes too.
+        assert_eq!(cls("echo \"$(git push origin main)\""), ["git_push"]);
+        assert_eq!(cls("echo \"today: `git push`\""), ["git_push"]);
+        assert_eq!(cls("bash -lc 'echo \"$(git push)\"'"), ["git_push"]);
+        assert!(cls("echo '$(git push)'").is_empty(), "single quotes don't run it");
         let argv = Call::new("Bash", json!({ "command": ["bash", "-lc", "git push"] }), "/srv/ws".into());
         assert_eq!(classes(&argv), ["git_push"]);
         let comment = cls("ls # git push later");
@@ -1004,6 +1050,18 @@ mod tests {
         assert_eq!(decide(&p, &[], &shell("npm i x && git push"), &c).action, Action::Deny);
         assert_eq!(decide(&p, &[], &shell("npm i x"), &c).action, Action::Allow);
         assert_eq!(decide(&p, std::slice::from_ref(&allow), &shell("git push origin main"), &c).action, Action::Deny);
+    }
+
+    #[test]
+    fn rules_match_the_whole_call_not_the_shown_part() {
+        let long = format!("git push origin main # {}", "x".repeat(5000));
+        let call = shell(&long);
+        assert!(call.shown().ends_with(TRUNCATED) && call.shown().chars().count() < 4100);
+        // A rule made from the shown text must not cover a longer, different call.
+        let remembered = rule(Action::Allow, "shell", &glob_escape(&call.shown()));
+        let worse = shell(&format!("{}\nrm -rf ~/x", &long[..4500]));
+        assert_eq!(decide(&Policy::new(Mode::Ask), &[remembered], &worse, &ctx()).action, Action::Ask);
+        assert_eq!(shell("ls").shown(), "ls");
     }
 
     #[test]

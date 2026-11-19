@@ -266,6 +266,7 @@ impl App {
             let mut replies = 0;
             let id = bot.id.clone();
             let mut canary: Option<tokio::task::JoinHandle<()>> = None;
+            let mut saw_shell = false;
             adapters::run(adapters::get(&bot.harness).unwrap(), input, abort_rx.clone(), |e| match e {
                 AgentEvent::Session(s) => {
                     if self.db.bot(&id).and_then(|b| b.session_id).as_deref() != Some(&s) {
@@ -285,6 +286,7 @@ impl App {
                     // Fail closed: a guarded harness that runs a shell tool without ever
                     // calling the hook isn't enforcing approvals, so stop it.
                     if guard.is_some() && canary.is_none() && ["bash", "shell"].contains(&name.to_lowercase().as_str()) {
+                        saw_shell = true;
                         let (hooks, abort) = (hooks.clone(), abort_tx.clone());
                         canary = Some(tokio::spawn(async move {
                             tokio::time::sleep(HOOK_GRACE).await;
@@ -303,6 +305,10 @@ impl App {
             timer.abort();
             if let Some(c) = canary {
                 c.abort();
+            }
+            // A run that ends before the canary fires still has to report a missing hook.
+            if saw_shell && hooks.load(Ordering::SeqCst) == 0 {
+                abort_tx.send_if_modified(|r| r.get_or_insert("unguarded") == &"unguarded");
             }
             self.cancel_approvals(&id, "The task ended");
             // Done running. The stream may have ended without a final block: keep what was streamed.
@@ -335,6 +341,11 @@ impl App {
                          Update the {} CLI, or set my approvals to bypass (dev only).",
                         bot.harness, bot.harness
                     ),
+                    true,
+                ),
+                Some("policy") => self.say(
+                    &id,
+                    "I stopped: approvals were turned on while I was working without them. Send the task again and I'll ask before risky steps.",
                     true,
                 ),
                 Some("timeout") => {
@@ -431,6 +442,20 @@ impl App {
             }
         }
         self.cancel_approvals(bot_id, "The Bot was stopped");
+    }
+
+    /// After a policy change: a run that started in bypass has no approval hook, so
+    /// once its Bot is in ask mode it must stop rather than keep acting unchecked.
+    pub fn stop_unguarded_runs(&self) {
+        let unguarded: Vec<String> = self.state().iter().filter(|(_, s)| s.run.as_ref().is_some_and(|r| r.hook_wait.is_none())).map(|(id, _)| id.clone()).collect();
+        for id in unguarded {
+            if self.db.effective_policy(&id).mode != Mode::Ask {
+                continue;
+            }
+            if let Some(r) = self.state().get(&id).and_then(|s| s.run.as_ref()).filter(|r| r.hook_wait.is_none()) {
+                r.abort.send_if_modified(|v| v.get_or_insert("policy") == &"policy");
+            }
+        }
     }
 
     /// Kills running agents. Queued messages run after the restart.
@@ -601,4 +626,37 @@ fn screen_prompt(botctl: &str) -> String {
 - When you need the user on your screen (a login, 2FA code, CAPTCHA, or payment check), run: {botctl} handoff "<what you need, in one line>". It waits until they finish, so give the command a 10 minute timeout. Never ask for passwords in chat.
 "#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_run(app: &App, bot_id: &str, guarded: bool) -> watch::Receiver<AbortReason> {
+        let (tx, rx) = watch::channel(None);
+        let hook_wait = guarded.then_some(Duration::from_secs(60));
+        app.state().entry(bot_id.into()).or_default().run =
+            Some(Run { abort: tx, status: String::new(), draft: String::new(), hooks: Default::default(), hook_wait });
+        rx
+    }
+
+    #[test]
+    fn turning_on_approvals_stops_runs_without_the_hook() {
+        let app = test_app();
+        let a = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
+        let b = app.db.create_bot("B", "#fff", "waddle", "claude", None, false);
+        let mut p = app.db.global_policy();
+        p.mode = Mode::Bypass;
+        app.db.set_global_policy(&p);
+        let (unguarded, guarded) = (fake_run(&app, &a.id, false), fake_run(&app, &b.id, true));
+
+        app.stop_unguarded_runs();
+        assert_eq!(*unguarded.borrow(), None, "still bypass");
+
+        p.mode = Mode::Ask;
+        app.db.set_global_policy(&p);
+        app.stop_unguarded_runs();
+        assert_eq!(*unguarded.borrow(), Some("policy"));
+        assert_eq!(*guarded.borrow(), None);
+    }
 }
