@@ -456,6 +456,10 @@ pub struct ScimUser {
     pub user_name: String,
     pub given_name: Option<String>,
     pub family_name: Option<String>,
+    /// `displayName` and `name.formatted` as the IdP sent them; `users.display_name` is
+    /// what SuperBot shows, built from these.
+    pub display_name: Option<String>,
+    pub formatted: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub deleted_at: Option<i64>,
@@ -463,7 +467,8 @@ pub struct ScimUser {
 
 /// The columns of a `users` row joined with its `scim_users` row, the SCIM ones prefixed.
 const SCIM_USER_SELECT: &str = "SELECT u.*, l.tenant AS scim_tenant, l.external_id AS scim_external_id, l.user_name AS scim_user_name,
-  l.given_name AS scim_given_name, l.family_name AS scim_family_name, l.created_at AS scim_created_at,
+  l.given_name AS scim_given_name, l.family_name AS scim_family_name, l.display_name AS scim_display_name,
+  l.formatted AS scim_formatted, l.created_at AS scim_created_at,
   l.updated_at AS scim_updated_at, l.deleted_at AS scim_deleted_at
   FROM scim_users l JOIN users u ON u.id = l.user_id";
 
@@ -475,6 +480,8 @@ fn scim_user_row(r: &Row) -> rusqlite::Result<ScimUser> {
         user_name: r.get("scim_user_name")?,
         given_name: r.get("scim_given_name")?,
         family_name: r.get("scim_family_name")?,
+        display_name: r.get("scim_display_name")?,
+        formatted: r.get("scim_formatted")?,
         created_at: r.get("scim_created_at")?,
         updated_at: r.get("scim_updated_at")?,
         deleted_at: r.get("scim_deleted_at")?,
@@ -494,6 +501,10 @@ pub struct ScimFields<'a> {
     pub external_id: Option<&'a str>,
     pub given_name: Option<&'a str>,
     pub family_name: Option<&'a str>,
+    /// What the IdP sent, if anything.
+    pub scim_display_name: Option<&'a str>,
+    pub formatted: Option<&'a str>,
+    /// The name SuperBot shows.
     pub display_name: &'a str,
     pub email: Option<&'a str>,
     pub active: bool,
@@ -506,6 +517,10 @@ pub enum ScimConflict {
     UserName,
     ExternalId,
     Identity,
+    /// The user belongs to another SCIM tenant, deleted there or not.
+    OtherTenant,
+    /// Deleted (or never this tenant's) by the time the write ran.
+    Gone,
     Db(String),
 }
 
@@ -675,6 +690,8 @@ fn migrate_scim(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
           user_name TEXT NOT NULL COLLATE NOCASE,
           given_name TEXT,
           family_name TEXT,
+          display_name TEXT,
+          formatted TEXT,
           created_at INTEGER NOT NULL,
           updated_at INTEGER NOT NULL,
           deleted_at INTEGER
@@ -1827,9 +1844,11 @@ impl Db {
             params![f.email, f.display_name, if f.active { "active" } else { "disabled" }, at, user_id],
         )?;
         tx.execute(
-            "INSERT INTO scim_users (user_id, tenant, external_id, user_name, given_name, family_name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
-             ON CONFLICT (user_id) DO UPDATE SET tenant = ?2, external_id = ?3, user_name = ?4, given_name = ?5, family_name = ?6, updated_at = ?7, deleted_at = NULL",
-            params![user_id, tenant, f.external_id, f.user_name, f.given_name, f.family_name, at],
+            "INSERT INTO scim_users (user_id, tenant, external_id, user_name, given_name, family_name, display_name, formatted, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+             ON CONFLICT (user_id) DO UPDATE SET external_id = ?3, user_name = ?4, given_name = ?5, family_name = ?6, display_name = ?7, formatted = ?8,
+               updated_at = ?9, deleted_at = NULL",
+            params![user_id, tenant, f.external_id, f.user_name, f.given_name, f.family_name, f.scim_display_name, f.formatted, at],
         )?;
         Ok(())
     }
@@ -1851,11 +1870,20 @@ impl Db {
         self.user(&id).ok_or_else(|| ScimConflict::Db("user not saved".into()))
     }
 
-    /// Sets what SCIM manages on an existing user: an update, a user provisioned again
-    /// after a DELETE, or one the tenant takes on through its linked SSO identity.
-    pub fn save_scim_user(&self, tenant: &str, user_id: &str, f: &ScimFields) -> Result<(), ScimConflict> {
+    /// Sets what SCIM manages on an existing user. An update (`restore` false) needs the
+    /// tenant's live user; `restore` also takes a user the tenant deleted, or one no tenant
+    /// manages. Never another tenant's: checked in the same transaction as the write.
+    pub fn save_scim_user(&self, tenant: &str, user_id: &str, f: &ScimFields, restore: bool) -> Result<(), ScimConflict> {
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(scim_conflict)?;
+        let row: Option<(String, Option<i64>)> =
+            tx.query_row("SELECT tenant, deleted_at FROM scim_users WHERE user_id = ?", [user_id], |r| Ok((r.get(0)?, r.get(1)?))).optional().map_err(scim_conflict)?;
+        match row {
+            Some((t, _)) if t != tenant => return Err(ScimConflict::OtherTenant),
+            Some((_, None)) => {}
+            _ if !restore => return Err(ScimConflict::Gone),
+            _ => {}
+        }
         Self::write_scim_user(&tx, tenant, user_id, f, now()).map_err(scim_conflict)?;
         tx.commit().map_err(scim_conflict)
     }

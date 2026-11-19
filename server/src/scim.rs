@@ -11,6 +11,7 @@ use crate::rbac::Role;
 use crate::users::{self, Limiter};
 use crate::{bad, not_found, ApiError, AppState, Auth, Res};
 use axum::body::Bytes;
+use axum::extract::rejection::BytesRejection;
 use axum::extract::{Extension, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
@@ -139,6 +140,8 @@ fn conflict(e: ScimConflict) -> ScimError {
         ScimConflict::UserName => uniqueness("Another user in this tenant has this userName."),
         ScimConflict::ExternalId => uniqueness("Another user in this tenant has this externalId."),
         ScimConflict::Identity => uniqueness("This person's SSO identity is linked to another SuperBot user."),
+        ScimConflict::OtherTenant => uniqueness("This person is managed by another SCIM tenant."),
+        ScimConflict::Gone => missing("User"),
         ScimConflict::Db(e) => {
             eprintln!("scim: database error: {e}");
             server_error("Database error")
@@ -384,7 +387,7 @@ fn rfc3339(ms: i64) -> String {
 pub fn resource(base: &str, s: &ScimUser) -> Value {
     let u = &s.user;
     let mut name = Map::new();
-    name.insert("formatted".into(), json!(u.name));
+    name.insert("formatted".into(), json!(s.formatted.as_deref().unwrap_or(&u.name)));
     if let Some(g) = &s.given_name {
         name.insert("givenName".into(), json!(g));
     }
@@ -416,7 +419,7 @@ pub struct Attrs {
     pub external_id: Option<String>,
     pub given_name: Option<String>,
     pub family_name: Option<String>,
-    /// `displayName`, else `name.formatted`, else built from the name parts.
+    /// As the IdP sent it. The name SuperBot shows is this, else `formatted`, else the parts.
     pub display_name: Option<String>,
     pub formatted: Option<String>,
     pub email: Option<String>,
@@ -430,8 +433,8 @@ impl Attrs {
             external_id: s.external_id.clone(),
             given_name: s.given_name.clone(),
             family_name: s.family_name.clone(),
-            display_name: Some(s.user.name.clone()),
-            formatted: None,
+            display_name: s.display_name.clone(),
+            formatted: s.formatted.clone(),
             email: s.user.email.clone(),
             active: s.user.active(),
         }
@@ -449,11 +452,18 @@ impl Attrs {
             .take(100)
             .collect()
     }
+}
 
-    /// The email to keep: the one sent, else the userName when it is an address (Okta's default).
-    fn kept_email(&self) -> Option<&str> {
-        self.email.as_deref().or(Some(self.user_name.as_str()).filter(|n| users::valid_email(n)))
-    }
+static NULL: Value = Value::Null;
+
+/// An attribute of an object, by name in any case: SCIM attribute names are case-insensitive.
+fn key<'a>(v: &'a Value, name: &str) -> Option<&'a Value> {
+    v.as_object()?.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v)
+}
+
+/// `key`, with missing as null.
+fn attr<'a>(v: &'a Value, name: &str) -> &'a Value {
+    key(v, name).unwrap_or(&NULL)
 }
 
 /// A string attribute: trimmed, without control characters, at most `max` characters.
@@ -496,19 +506,19 @@ fn pick_email(v: &Value) -> ScimRes<Option<String>> {
     };
     let chosen = list
         .iter()
-        .find(|e| e["primary"] == true || e["primary"] == "true")
-        .or_else(|| list.iter().find(|e| e["type"].as_str().is_some_and(|t| t.eq_ignore_ascii_case("work"))))
+        .find(|e| matches!(attr(e, "primary"), Value::Bool(true)) || attr(e, "primary").as_str().is_some_and(|p| p.eq_ignore_ascii_case("true")))
+        .or_else(|| list.iter().find(|e| attr(e, "type").as_str().is_some_and(|t| t.eq_ignore_ascii_case("work"))))
         .or_else(|| list.first());
-    chosen.map_or(Ok(None), |e| email(&e["value"], "emails.value"))
+    chosen.map_or(Ok(None), |e| email(attr(e, "value"), "emails.value"))
 }
 
 fn set_name(a: &mut Attrs, v: &Value) -> ScimRes<()> {
     if !v.is_object() && !v.is_null() {
         return Err(invalid("name must be an object"));
     }
-    a.given_name = text(&v["givenName"], "name.givenName", 100)?;
-    a.family_name = text(&v["familyName"], "name.familyName", 100)?;
-    a.formatted = text(&v["formatted"], "name.formatted", 100)?;
+    a.given_name = text(attr(v, "givenName"), "name.givenName", 100)?;
+    a.family_name = text(attr(v, "familyName"), "name.familyName", 100)?;
+    a.formatted = text(attr(v, "formatted"), "name.formatted", 100)?;
     Ok(())
 }
 
@@ -517,23 +527,25 @@ fn required_user_name(v: &Value) -> ScimRes<String> {
 }
 
 /// The attributes of a POST or PUT body. `current` is the user a PUT replaces: an
-/// `externalId` or `active` the body leaves out is kept from it.
+/// `externalId` or `active` the body leaves out is kept from it. Without `emails`, the
+/// email is the userName when that is an address (Okta's default profile).
 pub fn from_resource(v: &Value, current: Option<&Attrs>) -> ScimRes<Attrs> {
     if !v.is_object() {
         return Err(ScimError::new(StatusCode::BAD_REQUEST, Some("invalidSyntax"), "Send the user as a JSON object"));
     }
+    let user_name = required_user_name(attr(v, "userName"))?;
     let mut a = Attrs {
-        user_name: required_user_name(&v["userName"])?,
-        external_id: text(&v["externalId"], "externalId", 256)?.or_else(|| current.and_then(|c| c.external_id.clone())),
-        display_name: text(&v["displayName"], "displayName", 100)?,
-        email: pick_email(&v["emails"])?,
-        active: match v.get("active") {
+        external_id: text(attr(v, "externalId"), "externalId", 256)?.or_else(|| current.and_then(|c| c.external_id.clone())),
+        display_name: text(attr(v, "displayName"), "displayName", 100)?,
+        email: pick_email(attr(v, "emails"))?.or_else(|| Some(user_name.clone()).filter(|n| users::valid_email(n))),
+        user_name,
+        active: match key(v, "active") {
             None | Some(Value::Null) => current.is_none_or(|c| c.active),
             Some(b) => boolean(b, "active")?,
         },
         ..Attrs::default()
     };
-    set_name(&mut a, &v["name"])?;
+    set_name(&mut a, attr(v, "name"))?;
     Ok(a)
 }
 
@@ -548,16 +560,17 @@ pub fn apply_patch(a: &mut Attrs, v: &Value) -> ScimRes<()> {
     let ops = v.as_object().and_then(|o| o.iter().find(|(k, _)| k.eq_ignore_ascii_case("Operations"))).map(|(_, ops)| ops);
     let ops = ops.and_then(Value::as_array).filter(|o| !o.is_empty()).ok_or_else(|| syntax("Operations must be a list of operations"))?;
     for op in ops {
-        let kind = op["op"].as_str().map(str::to_ascii_lowercase);
+        let kind = attr(op, "op").as_str().map(str::to_ascii_lowercase);
         let kind = match kind.as_deref() {
             Some(k @ ("add" | "replace" | "remove")) => k.to_string(),
             _ => return Err(syntax("op must be add, replace, or remove")),
         };
-        match op.get("path").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty()) {
-            Some(path) => apply_path(a, &kind, path, &op["value"])?,
+        let value = attr(op, "value");
+        match attr(op, "path").as_str().map(str::trim).filter(|p| !p.is_empty()) {
+            Some(path) => apply_path(a, &kind, path, value)?,
             None if kind == "remove" => return Err(ScimError::new(StatusCode::BAD_REQUEST, Some("noTarget"), "remove needs a path")),
             None => {
-                let obj = op["value"].as_object().ok_or_else(|| syntax("Without a path, value must be an object of attributes"))?;
+                let obj = value.as_object().ok_or_else(|| syntax("Without a path, value must be an object of attributes"))?;
                 for (k, val) in obj {
                     apply_path(a, &kind, k, val)?;
                 }
@@ -584,15 +597,12 @@ fn apply_path(a: &mut Attrs, op: &str, path: &str, v: &Value) -> ScimRes<()> {
         "name" if remove => (a.given_name, a.family_name, a.formatted) = (None, None, None),
         "name" => {
             // Replacing a complex attribute changes the parts sent and keeps the rest.
-            let mut n = a.clone();
-            set_name(&mut n, v)?;
+            if !v.is_object() {
+                return Err(invalid("name must be an object"));
+            }
             for (k, keep) in [("givenName", &mut a.given_name), ("familyName", &mut a.family_name), ("formatted", &mut a.formatted)] {
-                if v.get(k).is_some() {
-                    *keep = match k {
-                        "givenName" => n.given_name.clone(),
-                        "familyName" => n.family_name.clone(),
-                        _ => n.formatted.clone(),
-                    };
+                if let Some(x) = key(v, k) {
+                    *keep = text(x, &format!("name.{k}"), 100)?;
                 }
             }
         }
@@ -631,8 +641,10 @@ fn fields<'a>(d: &'a Attrs, shown: &'a str) -> ScimFields<'a> {
         external_id: d.external_id.as_deref(),
         given_name: d.given_name.as_deref(),
         family_name: d.family_name.as_deref(),
+        scim_display_name: d.display_name.as_deref(),
+        formatted: d.formatted.as_deref(),
         display_name: shown,
-        email: d.kept_email(),
+        email: d.email.as_deref(),
         active: d.active,
     }
 }
@@ -672,23 +684,30 @@ async fn changed(app: &AppState, c: &Caller, before_user: &User, before: Option<
     }
 }
 
-/// Saves `d` over an existing user: an update, a re-provisioning after DELETE, or a
-/// user the tenant takes on. `externalId` can be set once, never changed.
-async fn update(app: &AppState, c: &Caller, user: &User, before: Option<&ScimUser>, d: &Attrs) -> ScimRes<ScimUser> {
+/// Saves `d` over an existing user. `taken` is a re-provisioning after DELETE or a user the
+/// tenant takes on: the audit event for it, recorded once the save succeeded. Without
+/// it, the user must still be the tenant's and live when the write runs. `externalId`
+/// can be set once, never changed.
+async fn update(app: &AppState, c: &Caller, user: &User, before: Option<&ScimUser>, d: &Attrs, taken: Option<(&str, Value)>) -> ScimRes<ScimUser> {
     if let Some(old) = before.and_then(|b| b.external_id.as_deref())
         && d.external_id.as_deref() != Some(old)
     {
         return Err(ScimError::new(StatusCode::BAD_REQUEST, Some("mutability"), "externalId can't change once set. Delete the user and provision the person again."));
     }
     let shown = d.shown_name();
-    app.db.save_scim_user(&c.token.tenant, &user.id, &fields(d, &shown)).map_err(conflict)?;
+    app.db.save_scim_user(&c.token.tenant, &user.id, &fields(d, &shown), taken.is_some()).map_err(conflict)?;
     let after = app.db.scim_user(&c.token.tenant, &user.id).ok_or_else(|| server_error("user not saved"))?;
+    if let Some((action, details)) = taken {
+        app.db.record(&c.who.event(action).target("user", &user.id).details(details));
+    }
     changed(app, c, user, before, &after).await;
     Ok(after)
 }
 
-fn parse_body(body: &Bytes) -> ScimRes<Value> {
-    serde_json::from_slice(body).map_err(|e| ScimError::new(StatusCode::BAD_REQUEST, Some("invalidSyntax"), format!("Invalid JSON: {e}")))
+/// The JSON body. A body over MAX_BODY, or one that can't be read, is a SCIM error too.
+fn parse_body(body: Result<Bytes, BytesRejection>) -> ScimRes<Value> {
+    let body = body.map_err(|e| ScimError::new(e.status(), None, e.body_text()))?;
+    serde_json::from_slice(&body).map_err(|e| ScimError::new(StatusCode::BAD_REQUEST, Some("invalidSyntax"), format!("Invalid JSON: {e}")))
 }
 
 fn need(app: &AppState, c: &Caller, id: &str) -> ScimRes<ScimUser> {
@@ -714,8 +733,8 @@ pub async fn get_user(State(app): State<AppState>, Extension(c): Extension<Calle
 /// it deleted comes back, the same user. With a linked SSO provider, a person whose
 /// identity an admin (or just-in-time sign-in) already linked to a user is that user.
 /// Otherwise a new user, with the default role.
-pub async fn create_user(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, headers: HeaderMap, body: Bytes) -> ScimRes {
-    let d = from_resource(&parse_body(&body)?, None)?;
+pub async fn create_user(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, headers: HeaderMap, body: Result<Bytes, BytesRejection>) -> ScimRes {
+    let d = from_resource(&parse_body(body)?, None)?;
     let tenant = c.token.tenant.as_str();
     let base = base_url(&headers);
     let created = |s: &ScimUser| Ok(scim_json(StatusCode::CREATED, resource(&base, s)));
@@ -725,8 +744,8 @@ pub async fn create_user(State(app): State<AppState>, Extension(a): Extension<Ar
         if found.deleted_at.is_none() {
             return Err(uniqueness(format!("A user with this externalId exists already: {}", found.user.id)));
         }
-        app.db.record(&c.who.event("scim.user_restored").target("user", &found.user.id).details(json!({ "tenant": tenant, "externalId": ext, "userName": d.user_name })));
-        let after = update(&app, &c, &found.user.clone(), Some(&found), &d).await?;
+        let restored = json!({ "tenant": tenant, "externalId": ext, "userName": d.user_name });
+        let after = update(&app, &c, &found.user.clone(), Some(&found), &d, Some(("scim.user_restored", restored))).await?;
         return created(&after);
     }
     if app.db.scim_find(tenant, &ScimKey::UserName(d.user_name.clone())).is_some() {
@@ -739,13 +758,15 @@ pub async fn create_user(State(app): State<AppState>, Extension(a): Extension<Ar
         if user.id == users::OPERATOR {
             return Err(uniqueness("This identity belongs to the owner (break-glass) account, which SCIM never manages."));
         }
-        if let Some(other) = app.db.scim_user_of(&user.id).filter(|o| o.deleted_at.is_none()) {
-            return Err(uniqueness(if other.tenant == tenant { "This person is provisioned already, under another externalId." } else { "This person is managed by another SCIM tenant." }));
-        }
-        app.db.record(&c.who.event("scim.user_linked").target("user", &user.id).details(json!({
-            "tenant": tenant, "externalId": d.external_id, "userName": d.user_name, "provider": l.provider, "subject": l.subject,
-        })));
-        let after = update(&app, &c, &user, None, &d).await?;
+        // A user another tenant manages stays its own, even deleted there: only it may restore them.
+        let mine = match app.db.scim_user_of(&user.id) {
+            Some(o) if o.tenant != tenant => return Err(uniqueness("This person is managed by another SCIM tenant.")),
+            Some(o) if o.deleted_at.is_none() => return Err(uniqueness("This person is provisioned already, under another externalId.")),
+            o => o,
+        };
+        let linked = json!({ "tenant": tenant, "externalId": d.external_id, "userName": d.user_name, "provider": l.provider, "subject": l.subject });
+        let action = if mine.is_some() { "scim.user_restored" } else { "scim.user_linked" };
+        let after = update(&app, &c, &user, None, &d, Some((action, linked))).await?;
         return created(&after);
     }
     let shown = d.shown_name();
@@ -772,19 +793,19 @@ pub async fn create_user(State(app): State<AppState>, Extension(a): Extension<Ar
 }
 
 /// `PUT /scim/v2/Users/{id}`: the whole user. An `externalId` or `active` left out is kept.
-pub async fn replace_user(State(app): State<AppState>, Extension(c): Extension<Caller>, headers: HeaderMap, Path(id): Path<String>, body: Bytes) -> ScimRes {
+pub async fn replace_user(State(app): State<AppState>, Extension(c): Extension<Caller>, headers: HeaderMap, Path(id): Path<String>, body: Result<Bytes, BytesRejection>) -> ScimRes {
     let before = need(&app, &c, &id)?;
-    let d = from_resource(&parse_body(&body)?, Some(&Attrs::of(&before)))?;
-    let after = update(&app, &c, &before.user, Some(&before), &d).await?;
+    let d = from_resource(&parse_body(body)?, Some(&Attrs::of(&before)))?;
+    let after = update(&app, &c, &before.user, Some(&before), &d, None).await?;
     Ok(scim_json(StatusCode::OK, resource(&base_url(&headers), &after)))
 }
 
 /// `PATCH /scim/v2/Users/{id}`. `active: false` disables the user and ends their sessions.
-pub async fn patch_user(State(app): State<AppState>, Extension(c): Extension<Caller>, headers: HeaderMap, Path(id): Path<String>, body: Bytes) -> ScimRes {
+pub async fn patch_user(State(app): State<AppState>, Extension(c): Extension<Caller>, headers: HeaderMap, Path(id): Path<String>, body: Result<Bytes, BytesRejection>) -> ScimRes {
     let before = need(&app, &c, &id)?;
     let mut d = Attrs::of(&before);
-    apply_patch(&mut d, &parse_body(&body)?)?;
-    let after = update(&app, &c, &before.user, Some(&before), &d).await?;
+    apply_patch(&mut d, &parse_body(body)?)?;
+    let after = update(&app, &c, &before.user, Some(&before), &d, None).await?;
     Ok(scim_json(StatusCode::OK, resource(&base_url(&headers), &after)))
 }
 
@@ -933,9 +954,9 @@ mod tests {
         assert_eq!((a.user_name.as_str(), a.external_id.as_deref(), a.email.as_deref(), a.active), ("ada@example.com", Some("e1"), Some("ada@work.example"), true));
         assert_eq!(a.shown_name(), "Ada Lovelace");
         let only = from_resource(&json!({ "userName": "grace@example.com" }), None).unwrap();
-        assert_eq!((only.shown_name().as_str(), only.kept_email()), ("grace", Some("grace@example.com")));
+        assert_eq!((only.shown_name().as_str(), only.email.as_deref()), ("grace", Some("grace@example.com")));
         let upn = from_resource(&json!({ "userName": "grace" }), None).unwrap();
-        assert_eq!(upn.kept_email(), None, "a userName that isn't an address isn't an email");
+        assert_eq!(upn.email, None, "a userName that isn't an address isn't an email");
         let primary = from_resource(&json!({ "userName": "x", "emails": [{ "value": "a@example.com" }, { "value": "b@example.com", "primary": true }] }), None).unwrap();
         assert_eq!(primary.email.as_deref(), Some("b@example.com"));
         for bad in [
@@ -956,7 +977,10 @@ mod tests {
         let mut off = ada();
         off.active = false;
         let put = from_resource(&json!({ "userName": "ada@example.com" }), Some(&off)).unwrap();
-        assert_eq!((put.external_id.as_deref(), put.active, put.email), (Some("e1"), false, None));
+        assert_eq!((put.external_id.as_deref(), put.active, put.email.as_deref()), (Some("e1"), false, Some("ada@example.com")));
+        // Attribute names are case-insensitive, nested ones too.
+        let odd = from_resource(&json!({ "USERNAME": "x@example.com", "Active": false, "Name": { "GivenName": "Ada" }, "Emails": [{ "Value": "a@example.com", "Primary": true }] }), None).unwrap();
+        assert_eq!((odd.user_name.as_str(), odd.active, odd.given_name.as_deref(), odd.email.as_deref()), ("x@example.com", false, Some("Ada"), Some("a@example.com")));
     }
 
     #[test]
@@ -981,6 +1005,15 @@ mod tests {
         assert_eq!((a.display_name.as_deref(), a.given_name.as_deref()), (Some("A. King"), Some("Ada")));
         apply_patch(&mut a, &json!({ "Operations": [{ "op": "remove", "path": "name.familyName" }, { "op": "remove", "path": "emails" }] })).unwrap();
         assert_eq!((a.family_name.as_deref(), a.email.as_deref()), (None, None));
+        apply_patch(&mut a, &json!({ "Operations": [{ "Op": "Replace", "Value": { "Name": { "FamilyName": "Byron" }, "ACTIVE": false } }] })).unwrap();
+        assert_eq!((a.family_name.as_deref(), a.active), (Some("Byron"), false));
+        // Without a displayName, the shown name follows name.formatted, then the parts.
+        let mut n = Attrs { user_name: "u@example.com".into(), given_name: Some("Ada".into()), ..Attrs::default() };
+        assert_eq!(n.shown_name(), "Ada");
+        apply_patch(&mut n, &json!({ "Operations": [{ "op": "replace", "path": "name.formatted", "value": "Ada L." }] })).unwrap();
+        assert_eq!(n.shown_name(), "Ada L.");
+        apply_patch(&mut n, &json!({ "Operations": [{ "op": "replace", "path": "displayName", "value": "Countess" }] })).unwrap();
+        assert_eq!(n.shown_name(), "Countess");
         apply_patch(&mut a, &json!({ "Operations": [{ "op": "replace", "path": "urn:ietf:params:scim:schemas:core:2.0:User:userName", "value": "ada2@example.com" }] })).unwrap();
         assert_eq!(a.user_name, "ada2@example.com");
         for bad in [

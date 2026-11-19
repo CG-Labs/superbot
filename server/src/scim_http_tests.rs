@@ -121,9 +121,9 @@ async fn only_a_scim_token_works_and_bad_ones_are_throttled() {
     let (_, member) = user_with(port, &admin, "member@example.com", "member").await;
     let (t, _) = token(port, &admin, json!({ "tenant": "okta" })).await;
     let fake = users::new_secret(scim::TOKEN_PREFIX);
-    for auth in ["".to_string(), format!("Bearer {fake}"), "Bearer sbp_short".into(), admin.clone(), member.clone(), format!("Basic {t}")] {
-        let (code, head, body) = call_with(port, "GET", USERS, &auth, "", "").await;
-        assert_eq!(code, 401, "{auth}");
+    for (n, auth) in ["".to_string(), format!("Bearer {fake}"), "Bearer sbp_short".into(), admin.clone(), member.clone(), format!("Basic {t}")].iter().enumerate() {
+        let (code, head, body) = call_with(port, "GET", USERS, auth, "", "").await;
+        assert_eq!(code, 401, "credential {n}");
         is_scim_error(&head, &parse(&body), 401);
         assert_eq!(header(&head, "www-authenticate").as_deref(), Some("Bearer realm=\"SuperBot SCIM\""));
     }
@@ -316,6 +316,17 @@ async fn entra_patches_deletes_softly_and_provisions_again() {
     assert_eq!(scim(port, &t, "PATCH", &format!("{USERS}/{id}"), json!({ "Operations": [{ "op": "Replace", "path": "externalId", "value": "other" }] })).await.2["scimType"], "mutability");
     let (code, _, body) = call_with(port, "POST", USERS, &format!("Bearer {t}"), "", "{not json").await;
     assert_eq!((code, parse(&body)["scimType"].as_str()), (400, Some("invalidSyntax")));
+    let (code, head, body) = call_with(port, "POST", USERS, &format!("Bearer {t}"), "", &format!("{{\"userName\":\"{}\"}}", "x".repeat(scim::MAX_BODY))).await;
+    assert_eq!(code, 413);
+    is_scim_error(&head, &parse(&body), 413);
+
+    // Removing the email removes it, even when the userName is an address.
+    let (code, _, u) = scim(port, &t, "PATCH", &format!("{USERS}/{id}"), json!({ "Operations": [{ "op": "Remove", "path": "emails" }] })).await;
+    assert_eq!((code, u.get("emails")), (200, None), "{u}");
+    assert_eq!(app.db.user(&id).unwrap().email, None);
+    // name.formatted is kept as sent; the shown name stays the displayName.
+    let (_, _, u) = scim(port, &t, "PATCH", &format!("{USERS}/{id}"), json!({ "Operations": [{ "op": "Replace", "path": "name.formatted", "value": "G. Hopper" }] })).await;
+    assert_eq!((u["name"]["formatted"].as_str(), u["displayName"].as_str()), (Some("G. Hopper"), Some("Amazing Grace")));
 
     // Turn it back on, sign in, then DELETE: disabled, sessions gone, history kept.
     assert_eq!(scim(port, &t, "PATCH", &format!("{USERS}/{id}"), json!({ "Operations": [{ "op": "Replace", "path": "active", "value": true }] })).await.0, 200);
@@ -329,6 +340,10 @@ async fn entra_patches_deletes_softly_and_provisions_again() {
     assert_eq!(scim(port, &t, "GET", "/scim/v2/Users?filter=externalId+eq+%22grace%22", Value::Null).await.2["totalResults"], 0);
     let kept = app.db.user(&id).expect("never destroyed");
     assert!(!kept.active());
+    // An update that read the user before the DELETE can't bring them back.
+    let stale = db::ScimFields { user_name: "grace@contoso.example", external_id: Some("grace"), given_name: None, family_name: None, scim_display_name: None, formatted: None, display_name: "Grace", email: None, active: true };
+    assert_eq!(app.db.save_scim_user("entra", &id, &stale, false), Err(db::ScimConflict::Gone));
+    assert!(!app.db.user(&id).unwrap().active());
     let deleted = &events(port, &admin, "action=scim.user_deleted").await[0];
     assert_eq!((deleted["targetId"].as_str(), deleted["details"]["sessionsRevoked"].clone(), deleted["details"]["externalId"].as_str()), (Some(id.as_str()), json!(1), Some("grace")));
 
@@ -362,6 +377,15 @@ async fn tenants_are_isolated_and_never_take_over_users() {
     assert_eq!(code, 409);
     assert!(body["detail"].as_str().unwrap().contains("botctl user link"), "{body}");
     assert_eq!(app.db.user(&boss).unwrap().role, rbac::Role::Admin);
+
+    // A restore that fails (the email is someone else's now) leaves no restore event.
+    let (_, _, u) = scim(port, &a, "POST", USERS, okta_user("dee@example.com", "x3")).await;
+    let dee = u["id"].as_str().unwrap().to_string();
+    assert_eq!(scim(port, &a, "DELETE", &format!("{USERS}/{dee}"), Value::Null).await.0, 204);
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{dee}"), &admin, r#"{"email":"dee.old@example.com"}"#).await.0, 200);
+    assert_eq!(call(port, "POST", "/api/users", &admin, r#"{"email":"dee@example.com"}"#).await.0, 201);
+    assert_eq!(scim(port, &a, "POST", USERS, okta_user("dee@example.com", "x3")).await.0, 409);
+    assert!(events(port, &admin, "action=scim.user_restored").await.is_empty());
 
     // Admins still own roles: a promotion survives SCIM updates.
     assert_eq!(call(port, "PATCH", &format!("/api/users/{id}"), &admin, r#"{"role":"admin"}"#).await.0, 200);
@@ -422,6 +446,19 @@ async fn an_sso_linked_tenant_provisions_people_who_then_sign_in() {
     assert_eq!(events(port, &admin, "action=scim.user_linked").await[0]["targetId"].as_str(), Some(bob.as_str()));
     let (code, _, _) = scim(port, &t, "POST", USERS, okta_user("bob2@corp.example", other)).await;
     assert_eq!(code, 409, "provisioned once");
+
+    // Two tenants on the same IdP: a user one of them deleted stays its own.
+    let (t2, _) = token(port, &admin, json!({ "tenant": "entra-2", "sso": sso })).await;
+    let carol = "aaaaaaaa-0000-0000-0000-0000000000c4";
+    let (_, _, u) = scim(port, &t, "POST", USERS, okta_user("carol@corp.example", carol)).await;
+    let carol_id = u["id"].as_str().unwrap().to_string();
+    assert_eq!(scim(port, &t, "DELETE", &format!("{USERS}/{carol_id}"), Value::Null).await.0, 204);
+    let (code, _, body) = scim(port, &t2, "POST", USERS, okta_user("carol@corp.example", carol)).await;
+    assert_eq!((code, body["scimType"].as_str()), (409, Some("uniqueness")), "{body}");
+    assert!(!app.db.user(&carol_id).unwrap().active());
+    assert_eq!(app.db.scim_user_of(&carol_id).unwrap().tenant, "entra");
+    let (code, _, u) = scim(port, &t, "POST", USERS, okta_user("carol@corp.example", carol)).await;
+    assert_eq!((code, u["id"].as_str()), (201, Some(carol_id.as_str())), "only its own tenant restores");
 
     // Never the owner: the break-glass account stays out of SCIM's reach.
     let boss = "aaaaaaaa-0000-0000-0000-0000000000b3";
