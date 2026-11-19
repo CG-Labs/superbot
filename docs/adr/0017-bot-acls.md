@@ -84,6 +84,7 @@ The Expo client shows each Bot's owner and whether it is shared or private in it
 - A member can no longer rename, re-model, or delete a shared Bot they don't own; they ask its owner or an admin. Running it is unchanged.
 - Each Bot check is one indexed lookup (the grant); lists read the caller's grants once. The live stream adds one lookup per Bot per subscriber until the next resync.
 - Approvals lists filter in the query (by the caller's visible Bot ids), so others' private Bots never crowd a member's page.
+- Screen links carry voxl's token and don't know who opened them. When someone may lose access (a Bot made private, a new owner, an operator grant lowered or revoked, a user demoted or disabled), the affected screens get a new token and a restarted viewer, so open views close and old links stop working. The display and the Bot's apps keep running; people who still have access reopen the screen.
 - `botDeleted` events still go to every subscriber; they carry only the id of a Bot that no longer exists.
 
 ## Not in this slice

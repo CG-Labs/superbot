@@ -1061,9 +1061,13 @@ fn access_view(app: &App, b: &db::Bot, access: Access) -> Value {
 /// After an ACL change: everyone's lists and live streams start over, since who
 /// sees the Bot may have changed. The resync goes first: it clears each stream's
 /// cached access, so the Bot's update reaches exactly who can now see it.
-fn acl_changed(app: &App, id: &str) {
+/// When someone may have lost access, open screen links stop working too.
+async fn acl_changed(app: &App, id: &str, narrowed: bool) {
     app.send(json!({ "type": "resync" }));
     app.push_bot(id);
+    if narrowed && let Some(screens) = &app.screens {
+        screens.rekey(id).await;
+    }
 }
 
 async fn get_access(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
@@ -1094,17 +1098,20 @@ async fn update_access(State(app): State<AppState>, Extension(c): Extension<Call
     if visibility.is_none() && owner.is_none() {
         return Err(bad("Send visibility or owner"));
     }
+    let mut narrowed = false;
     if let Some(to) = visibility.filter(|to| *to != bot.visibility) {
         app.db.set_bot_visibility(&id, to);
         app.db.record(&by.event("bot.visibility_changed").target("bot", &id).bot(&id).details(json!({ "from": bot.visibility, "to": to })));
+        narrowed |= to == Visibility::Private;
     }
     if let Some(u) = owner.filter(|u| u.id != bot.owner_id) {
         app.db.set_bot_owner(&id, &u.id);
         // The new owner manages it anyway; a leftover grant would only confuse.
         app.db.remove_grant(&id, &u.id);
         app.db.record(&by.event("bot.owner_changed").target("bot", &id).bot(&id).details(json!({ "from": bot.owner_id, "to": u.id })));
+        narrowed = true;
     }
-    acl_changed(&app, &id);
+    acl_changed(&app, &id, narrowed).await;
     let after = need_bot(&app, &id)?;
     let access = viewer(&app, &c, &by).access(&app.db, &after);
     Ok(Json(access_view(&app, &after, access)))
@@ -1123,7 +1130,7 @@ async fn put_grant(State(app): State<AppState>, Extension(c): Extension<Caller>,
     let before = app.db.set_grant(&id, &u.id, level, by_id);
     if before != Some(level) {
         app.db.record(&by.event("bot.access_granted").target("bot", &id).bot(&id).details(json!({ "user": u.id, "level": level, "from": before })));
-        acl_changed(&app, &id);
+        acl_changed(&app, &id, before == Some(acl::Grant::Operator)).await;
     }
     Ok(Json(access_view(&app, &bot, access)))
 }
@@ -1134,7 +1141,7 @@ async fn delete_grant(State(app): State<AppState>, Extension(c): Extension<Calle
     let u = app.db.find_user(&key).ok_or_else(|| not_found("User"))?;
     let level = app.db.remove_grant(&id, &u.id).ok_or_else(|| not_found("Grant"))?;
     app.db.record(&by.event("bot.access_revoked").target("bot", &id).bot(&id).details(json!({ "user": u.id, "level": level })));
-    acl_changed(&app, &id);
+    acl_changed(&app, &id, true).await;
     Ok(Json(access_view(&app, &bot, access)))
 }
 
