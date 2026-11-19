@@ -34,7 +34,7 @@ You message Bots like teammates. They finish work end to end and only ask you wh
 - **Memory that grows**: Bots save your rules and preferences as plain files. Ask "What do you remember about me?"
 - **Routines**: run a Bot on a schedule. Bots create their own cron jobs.
 - **Bot to Bot**: Bots ask each other for help and pass work along.
-- **Any agent**: Claude Code, Codex, or Pi, through one small adapter each.
+- **Any agent**: Claude Code, Codex, Pi, or Hermes Agent, through one small adapter each.
 - **Approvals**: Bots pause and ask before risky actions (deleting outside the workspace, `git push`, sending messages, installing software). Safe work stays autonomous. See [Approvals](docs/backend.md#approvals).
 
 Also planned: computer use (Bots drive the browser and GUI apps), skills, and Slack.
@@ -67,7 +67,7 @@ set -a; . ./.env; set +a
 ./target/release/botd
 ```
 
-Then open the web app and say hi to SuperBot. Install and log in to the agent CLIs you want (`claude`, `codex`, `pi`) as the same user that runs `botd`.
+Then open the web app and say hi to SuperBot. Install and log in to the agent CLIs you want (`claude`, `codex`, `pi`, `hermes`) as the same user that runs `botd`.
 
 **VPS (Ubuntu 22.04/24.04):** one-command install with HTTPS — [deploy/README.md](deploy/README.md). Manual steps: [Backend](docs/backend.md).
 
@@ -83,7 +83,7 @@ Bots run on the coding agent you choose:
 - Codex CLI
 - Pi Agent
 - Grok Build *(planned)*
-- Hermes Agent *(planned)*
+- Hermes Agent (opt-in install)
 
 Each harness plugs in through one small adapter. Everything else stays the same.
 
