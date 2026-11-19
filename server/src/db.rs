@@ -738,6 +738,7 @@ impl Db {
     /// Writes one event. `details` is scrubbed of secrets; free text is clipped.
     pub fn record(&self, e: &audit::Event) {
         let o = |v: &Option<String>, max: usize| v.as_deref().map(|s| audit::clip(s, max));
+        let details = audit::scrub(e.details.clone()).to_string();
         let res = self.c().execute(
             "INSERT INTO audit_events (at, actor_kind, actor_id, actor_name, actor_subject, action, target_type, target_id, bot_id, outcome, ip, user_agent, details)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -754,7 +755,7 @@ impl Db {
                 e.outcome.as_str(),
                 o(&e.source.ip, 64),
                 o(&e.source.user_agent, 256),
-                audit::scrub(e.details.clone()).to_string(),
+                details,
             ],
         );
         if let Err(err) = res {

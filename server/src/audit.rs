@@ -176,7 +176,8 @@ pub fn scrub(v: Value) -> Value {
                 .collect(),
         ),
         Value::Array(a) => Value::Array(a.into_iter().take(MAX_ARRAY).map(scrub).collect()),
-        Value::String(s) => Value::String(clip(&redact_text(&s), MAX_STRING)),
+        // Only the first MAX_STRING characters are kept, so only those (and a margin) are scanned.
+        Value::String(s) => Value::String(clip(&redact_text(&s.chars().take(MAX_STRING * 2).collect::<String>()), MAX_STRING)),
         v => v,
     }
 }
@@ -239,6 +240,8 @@ fn redact_pairs(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let (mut copied, mut i) = (0, 0);
+    // Quotes seen before `counted`, single and double: whether a pair sits inside a quoted argument.
+    let (mut counted, mut quotes) = (0, [0usize; 2]);
     while i < b.len() {
         if !key_char(b[i]) || (i > 0 && key_char(b[i - 1])) {
             i += 1;
@@ -256,7 +259,17 @@ fn redact_pairs(s: &str) -> String {
         // `"token": 1` is JSON: a bare value ends at `,`, `}`, or `]`. Otherwise it's a
         // shell or form argument, which ends only where the shell word (or field) does.
         let json = b[key_end..j].contains(&b'"');
-        let outer = (!json).then(|| ['\'', '"'].into_iter().find(|&q| s[..i].matches(q).count() % 2 == 1)).flatten();
+        for &c in &b[counted..i] {
+            quotes[0] += (c == b'\'') as usize;
+            quotes[1] += (c == b'"') as usize;
+        }
+        counted = i;
+        let outer = match quotes {
+            _ if json => None,
+            [singles, _] if singles % 2 == 1 => Some('\''),
+            [_, doubles] if doubles % 2 == 1 => Some('"'),
+            _ => None,
+        };
         j += 1;
         j += b[j..].iter().take_while(|&&c| c == b' ').count();
         let open = b[j..].iter().take_while(|&&c| matches!(c, b'"' | b'\'' | b'\\')).count();
@@ -764,6 +777,11 @@ mod tests {
         assert_eq!(redact_text(r#"{"message":"my token is mine","n":2}"#), r#"{"message":"my token is mine","n":2}"#);
         assert_eq!(redact_text("token=é€x y"), "token=[redacted] y");
         assert_eq!(redact_text("pässword=ü token:'é"), "pässword=ü token:'[redacted]");
+        // Linear in the input: many secret pairs after many quotes.
+        let big = "'a' ".repeat(50_000) + &"token=x ".repeat(50_000);
+        let t = std::time::Instant::now();
+        assert!(!redact_text(&big).contains("=x"));
+        assert!(t.elapsed() < std::time::Duration::from_secs(2), "{:?}", t.elapsed());
         // Cut-short or odd input never panics.
         for odd in ["token=", "password:\"", "token={", "secret=\"\\", "key: [1, {", "token\\\":\\\"x"] {
             redact_text(odd);
