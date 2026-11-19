@@ -149,6 +149,15 @@
           <option value="bot">Bots</option>
           <option value="system">System</option>
         </select>
+        <input id="au-person" placeholder="Person: email or id" spellcheck="false" title="Events by this person" />
+        <select id="au-method" title="How they signed in">
+          <option value="">Any sign-in</option>
+          <option value="sso">SSO</option>
+          <option value="code">Sign-in code</option>
+          <option value="password">Password (break-glass)</option>
+          <option value="bot_token">Bot token</option>
+          <option value="none">No auth (dev)</option>
+        </select>
         <label>From <input type="date" id="au-from" /></label>
         <label>To <input type="date" id="au-to" /></label>
       </form>
