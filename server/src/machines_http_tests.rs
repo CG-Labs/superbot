@@ -1014,3 +1014,44 @@ async fn retries_keep_a_machine_that_exists() {
     );
     assert_eq!(fake.machines().len(), 1);
 }
+
+#[tokio::test]
+async fn a_plain_retry_keeps_the_saved_settings() {
+    let (port, _, admin, _, fake) = serve().await;
+    let (uid, _) = user_with(port, &admin, "ada@example.com", "member").await;
+    let base = format!("/api/users/{uid}/machine");
+    fake.fail_next(
+        "create",
+        ProviderError::Api {
+            status: 400,
+            message: "region: try later".into(),
+        },
+    );
+    let (code, _) = json_call(
+        port,
+        "POST",
+        &base,
+        &admin,
+        r#"{"tier":"pro","region":"de-fra-2"}"#,
+    )
+    .await;
+    assert_eq!(code, 502);
+    let (code, m) = json_call(port, "POST", &base, &admin, "{}").await;
+    assert_eq!(
+        (
+            code,
+            m["tier"].as_str(),
+            m["plan"].as_str(),
+            m["region"].as_str()
+        ),
+        (202, Some("pro"), Some("g6-standard-2"), Some("de-fra-2")),
+        "not the defaults: {m}"
+    );
+    assert_eq!(
+        (
+            fake.machines()[0].plan.as_str(),
+            fake.machines()[0].region.as_str()
+        ),
+        ("g6-standard-2", "de-fra-2")
+    );
+}

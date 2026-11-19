@@ -286,7 +286,7 @@ Per-user machines ([ADR 0025](adr/0025-control-plane-linode.md)). 503 when the c
 - `GET /api/machine`: the caller's own machine `{id, tier, region, state, providerStatus, ipv4, backups, createdAt, updatedAt}`; 404 if none. Never anyone else's
 - `GET /api/machines?state=`: every machine, destroyed ones too, newest first
 - `GET /api/users/:id-or-email/machine`: the user's live machine `{id, userId, userEmail, provider, providerId, label, tag, tier, plan, region, state, providerStatus, ipv4, backups, lastError, createSentAt, createdAt, createdBy, updatedAt, destroyedAt}`; 404 if none
-- `POST /api/users/:id-or-email/machine` `{tier?, region?}`: 202 on its way. Asking again returns the same machine (200); another tier or region is a 409 (resize instead). After an error, asking again retries. 502 `{error, machine}` if Linode refused; 409 for a disabled user
+- `POST /api/users/:id-or-email/machine` `{tier?, region?}`: 202 on its way. Asking again returns the same machine (200); another tier or region is a 409 (resize instead). After an error, asking again retries, with the saved tier and region unless others are given. 502 `{error, machine}` if Linode refused; 409 for a disabled user
 - `POST /api/users/:id-or-email/machine/suspend`, `/resume`, `/resize` `{tier}`: 200 with the machine (Linode is checked first, so a repeat, or a change already made there, calls nothing; resizing to the same tier applies a changed plan), 409 from the wrong state, 502 `{error, machine}` if Linode refused
 - `DELETE /api/users/:id-or-email/machine`: 200 once deleted at Linode, 202 while it retries
 - `POST /api/machines/reconcile` → `{checked, changed}`: one reconciler pass now

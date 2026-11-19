@@ -755,36 +755,40 @@ pub async fn request(
             "This user is disabled. Enable them before giving them a machine.".into(),
         ));
     }
-    let tier = f
-        .get("tier")
-        .cloned()
-        .unwrap_or_else(|| cp.tiers[0].0.clone());
-    let plan = cp
-        .plan(&tier)
-        .ok_or_else(|| {
-            bad(format!(
-                "tier must be one of {}",
-                cp.tiers
-                    .iter()
-                    .map(|(t, _)| t.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ))
-        })?
-        .to_string();
-    let region = f
-        .get("region")
-        .cloned()
-        .unwrap_or_else(|| cp.regions[0].clone());
-    if !cp.regions.contains(&region) {
+    let asked_tier = f.get("tier").cloned();
+    if let Some(t) = &asked_tier
+        && cp.plan(t).is_none()
+    {
+        return Err(bad(format!(
+            "tier must be one of {}",
+            cp.tiers
+                .iter()
+                .map(|(t, _)| t.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    let asked_region = f.get("region").cloned();
+    if let Some(r) = &asked_region
+        && !cp.regions.contains(r)
+    {
         return Err(bad(format!(
             "region must be one of {}",
             cp.regions.join(", ")
         )));
     }
+    // What's asked for, else `(tier, plan, region)` as given: a new machine's defaults,
+    // or what a retried machine was saved with.
+    let settings = |tier: &str, plan: &str, region: &str| {
+        let tier = asked_tier.clone().unwrap_or_else(|| tier.into());
+        let plan = cp.plan(&tier).map_or_else(|| plan.into(), String::from);
+        let region = asked_region.clone().unwrap_or_else(|| region.into());
+        (tier, plan, region)
+    };
     let _g = cp.ops.lock().await;
     let m = match app.db.user_machine(&u.id) {
         Some(mut m) if m.state == State::Error => {
+            let (tier, plan, region) = settings(&m.tier, &m.plan, &m.region);
             // The label stays, so a machine made by an earlier create would be adopted
             // as it is. Only change what's asked for when there's none.
             if (&tier, &region) != (&m.tier, &m.region) {
@@ -835,6 +839,8 @@ pub async fn request(
         }
         Some(m) => return Ok(reply(&app, StatusCode::OK, &m)),
         None => {
+            let (default_tier, default_plan) = &cp.tiers[0];
+            let (tier, plan, region) = settings(default_tier, default_plan, &cp.regions[0]);
             let new = NewMachine {
                 user_id: &u.id,
                 provider: p.name(),
