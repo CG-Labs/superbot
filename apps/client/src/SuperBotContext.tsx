@@ -266,8 +266,16 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
     applyState(state);
     void prefetchUnread(client, state.bots);
     if (reloadMessages) {
-      for (const id of Object.keys(messagesRef.current)) {
-        const list = await fetchHistory(client, id);
+      // A Bot the user can no longer see (deleted, made private) loses its cached chat.
+      const visible = new Set(state.bots.map((b) => b.id));
+      const gone = Object.keys(messagesRef.current).filter((id) => !visible.has(id));
+      if (gone.length) {
+        setMessages((prev) => Object.fromEntries(Object.entries(prev).filter(([id]) => visible.has(id))));
+        setHandoffs((h) => gone.reduce((m, id) => withoutHandoff(m, id), h));
+      }
+      for (const id of Object.keys(messagesRef.current).filter((id) => visible.has(id))) {
+        const list = await fetchHistory(client, id).catch(() => null);
+        if (!list) continue;
         setMessages((prev) => ({ ...prev, [id]: list }));
         setHandoffs((h) => applyHandoffHistory(h, id, list));
       }
