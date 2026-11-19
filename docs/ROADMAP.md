@@ -38,7 +38,7 @@ Product decisions by the product owner, David Kennedy, on 19 Nov 2026. They repl
 
 | # | Topic | Decision | Status |
 |---|-------|----------|--------|
-| 1 | **Isolation** | One computer (VM or container) per **user**, not per Bot. A user's Bots share that user's computer. Managed hosting: one computer per user, or **one container per user** when running on a virtualised server ([#29](https://github.com/CG-Labs/superbot/issues/29); ADR 0025 in [PR #77](https://github.com/CG-Labs/superbot/pull/77)). | Decided |
+| 1 | **Isolation** | One computer (VM or container) per **user**, not per Bot. A user's Bots share that user's computer. Managed hosting: one computer per user, or **one container per user** when running on a virtualised server ([#29](https://github.com/CG-Labs/superbot/issues/29); [ADR 0025](adr/0025-control-plane-linode.md), [PR #77](https://github.com/CG-Labs/superbot/pull/77)). | Decided |
 | 2 | **Managed platform** | Provision per-user machines with the **Linode API** until a production-ready system exists. | Decided for now; revisit before M4 |
 | 3 | **Pricing** | **Per user**, with several tiers. Tiers differ by language model access and other limits. Models can stay hidden in the back end: users pick a tier, not a model. | Decided |
 | 4 | **SSO** | Support all the major identity providers: **Sign in with Apple, GitHub, Microsoft Entra ID, Google**, plus a generic **OIDC/SAML** path for others (e.g. Okta). A SCIM stub (users only) ships in M2 ([ADR 0023](adr/0023-scim.md)); full SCIM stays in M5. | Decided |
@@ -134,7 +134,8 @@ Basic auth may remain for **break-glass** and **self-host hobby** tiers only, be
 | | |
 |--|--|
 | **Goal** | Paid early adopters on **managed hosting** and polished **self-host** SKU. |
-| **Scope** | Control plane that provisions **one machine per user via the Linode API**, or **one container per user** on a virtualised server (create, size by tier, suspend, destroy, backups; [#29](https://github.com/CG-Labs/superbot/issues/29), ADR 0025 in [PR #77](https://github.com/CG-Labs/superbot/pull/77)); **per-user isolation**: each user's Bots, workspace, harness logins, and screens live on that user's computer, with the org's shared data (users, roles, billing, audit) in the control plane; billing v0 (Stripe, **per-user subscription tiers**); **model routing hidden behind tiers** (server picks provider and model per tier; users never pick a model on managed plans); **Hermes Agent as the default harness for managed tiers** (decided, [ADR 0027](adr/0027-expo-primary-hermes-default.md)), shipped once the [ADR 0011 checklist](adr/0011-hermes-agent-backend.md#recommendation) passes, and the harness behind the Enterprise SLA (others best-effort); client audit log viewer, then retire the console's end-user features; license key for self-host; onboarding wizard (domain, IdP, tier), growing the approval-based sign-ups ([ADR 0022](adr/0022-landing-and-signups.md)) into self-serve with email, self-linked SSO, and sign-up data retention; client push notifications (routine completions, approvals), biometric optional unlock; **TestFlight / Play internal** tracks; published registry image with screens/computer use; DR: backup restore runbook + tested RPO target on managed tier. |
+| **Status** | **Started.** Control-plane foundation merged ([#29](https://github.com/CG-Labs/superbot/issues/29), [ADR 0025](adr/0025-control-plane-linode.md), [PR #77](https://github.com/CG-Labs/superbot/pull/77)): a `machines` table (one live machine per user), a Linode API v4 client behind a provider trait, tier → plan mapping in config, admin endpoints to request, suspend, resume, resize and destroy a user's machine, a reconciler, and audit events for each change. Off unless `LINODE_TOKEN` is set, so self-host is unchanged. Next on #29: enrollment and mTLS between the control plane and each machine, then moving a user's Bots onto their machine. |
+| **Scope** | Control plane that provisions **one machine per user via the Linode API**, or **one container per user** on a virtualised server (create, size by tier, suspend, destroy, backups; [#29](https://github.com/CG-Labs/superbot/issues/29), [ADR 0025](adr/0025-control-plane-linode.md), [PR #77](https://github.com/CG-Labs/superbot/pull/77)); **per-user isolation**: each user's Bots, workspace, harness logins, and screens live on that user's computer, with the org's shared data (users, roles, billing, audit) in the control plane; billing v0 (Stripe, **per-user subscription tiers**); **model routing hidden behind tiers** (server picks provider and model per tier; users never pick a model on managed plans); **Hermes Agent as the default harness for managed tiers** (decided, [ADR 0027](adr/0027-expo-primary-hermes-default.md)), shipped once the [ADR 0011 checklist](adr/0011-hermes-agent-backend.md#recommendation) passes, and the harness behind the Enterprise SLA (others best-effort); client audit log viewer, then retire the console's end-user features; license key for self-host; onboarding wizard (domain, IdP, tier), growing the approval-based sign-ups ([ADR 0022](adr/0022-landing-and-signups.md)) into self-serve with email, self-linked SSO, and sign-up data retention; client push notifications (routine completions, approvals), biometric optional unlock; **TestFlight / Play internal** tracks; published registry image with screens/computer use; DR: backup restore runbook + tested RPO target on managed tier. |
 | **Exit criteria** | ≥3 paying design partners; user A's computer and Bots cannot reach user B's; tier limits enforced (models, Bots, machine size); restore drill documented; mobile beta installable from stores (internal). |
 | **Size** | **L** |
 | **Dependencies** | M2 |
@@ -177,7 +178,7 @@ Basic auth may remain for **break-glass** and **self-host hobby** tiers only, be
 | Compute isolation | One OS user, one shared workspace for all Bots | **One computer per user** (M3); harness as separate OS user, cgroup and egress limits (M5) |
 | Secrets | Env/`_FILE` or sealed in SQLite, master key outside backups, values redacted (**done**: [ADR 0010](adr/0010-secrets.md)); harness logins still on service user disk | Master-key rotation; external vaults + short-lived tokens (M5) |
 | Audit | Append-only SQLite table, CSV export, retention setting (**done**: [ADR 0009](adr/0009-audit-events.md)) | Per-user actors and IdP subjects (M2, in review: [PR #70](https://github.com/CG-Labs/superbot/pull/70), [ADR 0019](adr/0019-audit-actors.md)); SIEM export and tamper evidence (M5) |
-| Network | Caddy TLS, loopback `botd` | Same + mTLS between control plane and per-user machines (M3) |
+| Network | Caddy TLS, loopback `botd` | Same + mTLS between control plane and per-user machines (M3; enrollment design in [ADR 0025](adr/0025-control-plane-linode.md)) |
 | Client | Session token in SecureStore (password only for servers from before ADR 0012) | OAuth tokens, certificate pinning (managed) |
 
 ---
@@ -210,7 +211,7 @@ Basic auth may remain for **break-glass** and **self-host hobby** tiers only, be
 |------|--------|--------|
 | **Bash VPS installer** | Ubuntu 22.04 / 24.04 | Maintain; hardened CIS-aligned option |
 | **Docker Compose** | **Supported** (M1 ✓): [`deploy/docker/`](../deploy/docker/), [docs](../deploy/README.md#docker-compose-supported) | Published registry image; screens/computer use in the image (M3) |
-| **Managed cloud** | None | **Linode API**, one machine per user, or one container per user on a virtualised server (M3, [#29](https://github.com/CG-Labs/superbot/issues/29)); revisit the substrate before M4 |
+| **Managed cloud** | Control-plane foundation merged: Linode client, machine records, admin API, reconciler; off by default ([ADR 0025](adr/0025-control-plane-linode.md), [PR #77](https://github.com/CG-Labs/superbot/pull/77)) | **Linode API**, one machine per user, or one container per user on a virtualised server (M3, [#29](https://github.com/CG-Labs/superbot/issues/29)); revisit the substrate before M4 |
 | **Air-gapped** | Possible manual | M5 docs + license |
 
 ---
@@ -277,9 +278,9 @@ No certification claims until audits complete.
 
 | Horizon | Focus |
 |---------|--------|
-| **Now** | Finish M1: EAS `projectId`; approvals follow-ups ([list](approvals-followups.md)); Expo client as the single interface ([#28](https://github.com/CG-Labs/superbot/issues/28), [ADR 0027](adr/0027-expo-primary-hermes-default.md)) |
+| **Now** | Linode control plane next steps on [#29](https://github.com/CG-Labs/superbot/issues/29) (enrollment and mTLS, then moving Bots); finish M1: EAS `projectId`; approvals follow-ups ([list](approvals-followups.md)); Expo client as the single interface ([#28](https://github.com/CG-Labs/superbot/issues/28), [ADR 0027](adr/0027-expo-primary-hermes-default.md)) |
 | **Next** | Pause or hand over a disabled user's Bot routines (SCIM-05 in the [SCIM review](security/auth-review-2026-11-scim.md)); measure Hermes per-Bot footprint (ADR 0011 checklist for the managed default); client audit log viewer ([#81](https://github.com/CG-Labs/superbot/issues/81)) |
-| **Later** | Linode control plane with one machine per user; per-user tiers and hidden model routing; public launch + stores; full SCIM (groups, role mapping); SOC 2 |
+| **Later** | Linode control plane with one machine per user (foundation merged: [ADR 0025](adr/0025-control-plane-linode.md); enrollment/mTLS and moving Bots next); per-user tiers and hidden model routing; public launch + stores; full SCIM (groups, role mapping); SOC 2 |
 
 ---
 

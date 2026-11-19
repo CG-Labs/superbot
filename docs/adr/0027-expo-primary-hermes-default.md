@@ -4,7 +4,7 @@
 
 Accepted (19 Nov 2026). Decided by the product owner, David Kennedy, on 19 Nov 2026. Closes [#28](https://github.com/CG-Labs/superbot/issues/28). Accepts [ADR 0011](0011-hermes-agent-backend.md). Updates [ADR 0013](0013-serve-web-client.md) and [ADR 0022](0022-landing-and-signups.md) on where people land.
 
-ADR 0025 (Linode control plane, open [PR #77](https://github.com/CG-Labs/superbot/pull/77)) and ADR 0026 (SCIM review, merged in [PR #78](https://github.com/CG-Labs/superbot/pull/78)) are taken, so this is 0027.
+ADR 0025 (Linode control plane, merged in [PR #77](https://github.com/CG-Labs/superbot/pull/77)) and ADR 0026 (SCIM review, merged in [PR #78](https://github.com/CG-Labs/superbot/pull/78)) are taken, so this is 0027.
 
 ## Context
 
@@ -20,7 +20,7 @@ Both had chat, Bots, approvals and screens, so each feature was built twice or o
 1. **The Expo client is the single primary interface for end users.** That is the web build at `/app/` and the native and desktop builds. The server-rendered pages stay only as an **admin fallback**: the console (admin portal, sign-up approvals, audit log), break-glass sign-in at `/login`, and `/healthz`.
 2. **Hermes Agent is the default harness for managed tiers, and the harness that carries the Enterprise SLA.** ADR 0011 moves from proposed to accepted. Claude Code, Codex, Pi and other harnesses stay available as **best-effort**: supported in code and tests, not covered by the SLA.
 
-Related, from the same day ([#29](https://github.com/CG-Labs/superbot/issues/29), ADR 0025 in [PR #77](https://github.com/CG-Labs/superbot/pull/77)): managed hosting is **one computer per user**, or **one container per user** on a virtualised server. Hermes's single-tenant design fits that ([ADR 0011](0011-hermes-agent-backend.md#b-hermes-as-the-primary-harness-and-default-engine)).
+Related, from the same day ([#29](https://github.com/CG-Labs/superbot/issues/29), [ADR 0025](0025-control-plane-linode.md), [PR #77](https://github.com/CG-Labs/superbot/pull/77)): managed hosting is **one computer per user**, or **one container per user** on a virtualised server. Hermes's single-tenant design fits that ([ADR 0011](0011-hermes-agent-backend.md#b-hermes-as-the-primary-harness-and-default-engine)).
 
 ## How decision 1 is built
 
