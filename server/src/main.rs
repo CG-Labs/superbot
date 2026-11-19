@@ -822,7 +822,7 @@ fn visible_bots(app: &App, c: &Caller, by: &Who) -> Vec<Value> {
 
 async fn state(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>) -> Json<Value> {
     let bots = visible_bots(&app, &c, &by);
-    let approvals = if rbac::allows(c.principal, Perm::Review) { visible_approvals(&app, &c, &by, app.db.approvals(Some("pending"), None, 200)) } else { vec![] };
+    let approvals = if rbac::allows(c.principal, Perm::Review) { visible_approvals(&app, &c, &by, Some("pending"), None, 200) } else { vec![] };
     // The owner keeps USER_NAME, as before users existed.
     let name = match &c.user {
         Some(u) if u.id != users::OPERATOR => u.name.clone(),
@@ -889,14 +889,14 @@ fn need_bot_access(app: &App, c: &Caller, by: &Who, id: &str, need: Access) -> R
     })
 }
 
-/// Only the approvals for Bots the caller can see.
-fn visible_approvals(app: &App, c: &Caller, by: &Who, list: Vec<db::Approval>) -> Vec<db::Approval> {
+/// Newest approvals for Bots the caller can see; `bot` narrows to one they can see.
+fn visible_approvals(app: &App, c: &Caller, by: &Who, status: Option<&str>, bot: Option<&str>, limit: i64) -> Vec<db::Approval> {
     let viewer = viewer(app, c, by);
-    if viewer == Viewer::All {
-        return list;
+    if viewer == Viewer::All || bot.is_some() {
+        return app.db.approvals(status, bot, limit);
     }
-    let ids: std::collections::HashSet<String> = viewer.bots(&app.db).into_iter().map(|(b, _)| b.id).collect();
-    list.into_iter().filter(|a| ids.contains(&a.bot_id)).collect()
+    let ids: Vec<String> = viewer.bots(&app.db).into_iter().map(|(b, _)| b.id).collect();
+    app.db.approvals_among(status, &ids, limit)
 }
 
 /// A Bot view as this caller sees it.
@@ -1165,8 +1165,10 @@ async fn send_message(State(app): State<AppState>, Extension(c): Extension<Calle
     let text: String = text.chars().take(100_000).collect();
     // Answering a choice card: remember which option was picked.
     let mut handoff = None;
-    if let (Some(mid), Some(opt)) = (v["answer"]["messageId"].as_i64(), v["answer"]["option"].as_u64())
-        && let Some(mut q) = app.db.message(mid).filter(|m| m.bot_id == id).and_then(|m| m.question)
+    let answered = v["answer"]["messageId"].as_i64().and_then(|mid| app.db.message(mid)).filter(|m| m.bot_id == id);
+    let answered_id = answered.as_ref().map(|m| m.id);
+    if let (Some(mid), Some(opt)) = (answered_id, v["answer"]["option"].as_u64())
+        && let Some(mut q) = answered.and_then(|m| m.question)
     {
         if q["handoff"] == json!(true) && q["picked"].is_null() {
             handoff = Some((mid, q["options"][opt as usize].as_str().map(String::from)));
@@ -1174,7 +1176,7 @@ async fn send_message(State(app): State<AppState>, Extension(c): Extension<Calle
         q["picked"] = json!(opt);
         app.db.set_question(mid, &q);
     }
-    let waiter = v["answer"]["messageId"].as_i64().and_then(|mid| app.take_handoff(mid));
+    let waiter = answered_id.and_then(|mid| app.take_handoff(mid));
     if let Some((mid, option)) = handoff {
         let details = json!({ "option": option, "botWasWaiting": waiter.is_some() });
         app.db.record(&by.event("handoff.answered").target("handoff", &mid.to_string()).bot(&id).details(details));
@@ -1475,11 +1477,7 @@ async fn list_approvals(State(app): State<AppState>, Extension(c): Extension<Cal
     if let Some(b) = bot {
         need_bot_access(&app, &c, &by, b, Access::View)?;
     }
-    // Hidden Bots' rows are dropped after the query, so look further back to still fill `limit`.
-    let scan = if viewer(&app, &c, &by) == Viewer::All { limit } else { 1000 };
-    let mut list = visible_approvals(&app, &c, &by, app.db.approvals(status, bot, scan));
-    list.truncate(limit as usize);
-    Ok(Json(json!(list)))
+    Ok(Json(json!(visible_approvals(&app, &c, &by, status, bot, limit))))
 }
 
 async fn approve(state: State<AppState>, c: Extension<Caller>, by: Extension<Who>, id: Path<String>, body: axum::body::Bytes) -> Res {

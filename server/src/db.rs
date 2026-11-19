@@ -1051,6 +1051,16 @@ impl Db {
         s.query_map(params![status, bot_id, limit], approval_row).unwrap().filter_map(Result::ok).collect()
     }
 
+    /// Like `approvals`, but only for these Bots, so `limit` counts only their rows.
+    pub fn approvals_among(&self, status: Option<&str>, bot_ids: &[String], limit: i64) -> Vec<Approval> {
+        let c = self.c();
+        let mut s = c
+            .prepare("SELECT * FROM approvals WHERE (?1 IS NULL OR status = ?1) AND bot_id IN (SELECT value FROM json_each(?2)) ORDER BY created_at DESC, rowid DESC LIMIT ?3")
+            .unwrap();
+        let ids = serde_json::to_string(bot_ids).unwrap();
+        s.query_map(params![status, ids, limit], approval_row).unwrap().filter_map(Result::ok).collect()
+    }
+
     /// Closes a pending approval. False if it was already closed (first decision wins).
     pub fn finish_approval(&self, id: &str, status: &str, by: &str, note: Option<&str>, rule_id: Option<&str>) -> bool {
         self.c()

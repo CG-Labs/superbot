@@ -199,6 +199,46 @@ async fn approvals_follow_bot_access() {
     app.db.set_grant(&p.id, &b_id, acl::Grant::Operator, &a_id);
     let (code, res) = call(port, "POST", &approve, &b, "{}").await;
     assert_eq!((code, parse(&res)["status"].as_str()), (200, Some("approved")), "{res}");
+
+    // Others' hidden approvals don't crowd yours out of a page.
+    let mine = app.db.create_bot_owned("Mine", "#fff", "waddle", "claude", None, false, &b_id, Visibility::Private);
+    let ap_b = app.db.add_approval(&mine.id, "claude", "Bash", "shell", "ls", &json!({}), "shell", "ask", far);
+    for _ in 0..200 {
+        app.db.add_approval(&p.id, "claude", "Bash", "shell", "ls", &json!({}), "shell", "ask", far);
+    }
+    app.db.remove_grant(&p.id, &b_id);
+    assert_eq!(ids(&call(port, "GET", "/api/approvals?status=pending&limit=1", &b, "").await.1), [ap_b.id.clone()]);
+    let state = parse(&call(port, "GET", "/api/state", &b, "").await.1);
+    assert_eq!(state["approvals"].as_array().map(|l| l.iter().map(|a| a["id"].clone()).collect::<Vec<_>>()), Some(vec![json!(ap_b.id)]));
+}
+
+/// Answering a handoff card goes only to a Bot the caller can operate.
+#[tokio::test]
+async fn handoff_answers_stay_with_their_bot() {
+    let (port, app, admin, _) = serve_app().await;
+    let (a_id, _) = user_with(port, &admin, "a@example.com", "member").await;
+    let (b_id, b) = user_with(port, &admin, "b@example.com", "member").await;
+    let p = app.db.create_bot_owned("Private", "#fff", "waddle", "claude", None, false, &a_id, Visibility::Private);
+    let s = app.db.create_bot_owned("Shared", "#fff", "waddle", "claude", None, false, &a_id, Visibility::Shared);
+    app.db.set_grant(&p.id, &b_id, acl::Grant::Viewer, &a_id);
+    let waiting = {
+        let (app, p) = (app.clone(), p.clone());
+        tokio::spawn(async move { app.handoff(&p, "Sign in", Duration::from_secs(5)).await })
+    };
+    let card = loop {
+        if let Some(m) = app.db.messages(&p.id, 10).into_iter().find(|m| m.question.is_some()) {
+            break m.id;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    let sneaky = json!({ "text": "Done", "answer": { "messageId": card, "option": 0 } }).to_string();
+    assert_eq!(call(port, "POST", &format!("/api/bots/{}/messages", s.id), &b, &sneaky).await.0, 202);
+    assert_eq!(got(port, "POST", &format!("/api/bots/{}/messages", p.id), &b, &sneaky).await, Got::Forbidden);
+    assert!(app.db.message(card).and_then(|m| m.question).is_some_and(|q| q["picked"].is_null()));
+    let tx = app.take_handoff(card).expect("still waiting");
+    tx.send("from the owner".into()).unwrap();
+    assert_eq!(waiting.await.unwrap().as_deref(), Some("from the owner"));
 }
 
 /// Reads the stream until `until` shows up. Returns all it read.
