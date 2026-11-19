@@ -881,6 +881,15 @@ mod tests {
     }
 
     #[test]
+    fn the_example_env_files_leave_scim_off() {
+        for (name, text) in [(".env.example", include_str!("../../.env.example")), ("deploy/docker/.env.example", include_str!("../../deploy/docker/.env.example"))] {
+            let vars: HashMap<&str, &str> = text.lines().filter(|l| !l.trim_start().starts_with('#')).filter_map(|l| l.split_once('=')).map(|(k, v)| (k.trim(), v.trim())).collect();
+            let s = Scim::from_env(vars.get("SCIM").copied().unwrap_or(""), vars.get("SCIM_DEFAULT_ROLE").copied().unwrap_or("")).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(!s.enabled && vars.contains_key("SCIM"), "{name}");
+        }
+    }
+
+    #[test]
     fn filters() {
         assert_eq!(parse_filter(r#"userName eq "ada@example.com""#), Ok(ScimKey::UserName("ada@example.com".into())));
         assert_eq!(parse_filter(r#"  USERNAME  EQ  "Ada"  "#), Ok(ScimKey::UserName("Ada".into())));
