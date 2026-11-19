@@ -78,7 +78,7 @@ export interface ModelOption {
 
 export type Role = "admin" | "member" | "readonly";
 
-/** `/api/state` `me`. Servers from before ADR 0011 send only the name. */
+/** `/api/state` `me`. Servers from before ADR 0012 send only the name. */
 export interface Me {
   name: string;
   id?: string | null;
@@ -118,7 +118,7 @@ export type SseEvent =
   | { type: "policy"; policy: Policy }
   | { type: "resync" };
 
-/** A session token (servers with sign-in, ADR 0011), or the legacy shared password. */
+/** A session token (servers with sign-in, ADR 0012), or the legacy shared password. */
 export interface ServerConfig {
   baseUrl: string;
   token?: string;

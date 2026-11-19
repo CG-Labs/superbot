@@ -1,7 +1,7 @@
 //! Roles and permissions (RBAC v1). Every API request is mapped to one permission
 //! by `classify`, in the auth middleware, before any handler runs. Anything not in
 //! the table needs `Admin`, so a new route is closed until someone classifies it.
-//! Design: docs/adr/0011-users-sessions-rbac.md.
+//! Design: docs/adr/0012-users-sessions-rbac.md.
 
 use axum::http::Method;
 use serde::{Deserialize, Serialize};

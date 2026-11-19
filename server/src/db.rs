@@ -194,7 +194,7 @@ pub struct User {
     pub role: Role,
     /// "active" or "disabled"
     pub status: String,
-    /// The IdP that vouches for this user, once OIDC lands (ADR 0011).
+    /// The IdP that vouches for this user, once OIDC lands (ADR 0012).
     pub idp_issuer: Option<String>,
     pub idp_subject: Option<String>,
     pub created_at: i64,
@@ -348,7 +348,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 /// Each gets `fresh`: true when this database was just created.
 const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 3] = [migrate_approvals, migrate_audit_events, migrate_users];
 
-/// Users, sessions, and one-time sign-in codes (ADR 0011). Tables start empty; botd
+/// Users, sessions, and one-time sign-in codes (ADR 0012). Tables start empty; botd
 /// creates the owner (`operator`, the break-glass account) on start, so an upgrade
 /// keeps the shared password working.
 fn migrate_users(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {

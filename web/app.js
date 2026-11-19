@@ -85,7 +85,7 @@ async function api(method, path, body) {
 
 // State
 let me = { name: "", permissions: [] };
-// What this person's role allows (see docs/adr/0011-users-sessions-rbac.md). The server enforces it; this only hides what would fail.
+// What this person's role allows (see docs/adr/0012-users-sessions-rbac.md). The server enforces it; this only hides what would fail.
 const can = (perm) => (me.permissions || []).includes(perm);
 let harnesses = [];
 let defaultHarness = "claude";

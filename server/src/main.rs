@@ -308,7 +308,7 @@ fn cors_layer() -> CorsLayer {
 
 // Auth: sessions (a cookie for the web app, a bearer token for the client and
 // botctl), break-glass AUTH_PASSWORD (HTTP Basic, any username), or the Bots' token
-// for `botctl`. Then one permission check per request (rbac::classify). ADR 0011.
+// for `botctl`. Then one permission check per request (rbac::classify). ADR 0012.
 
 struct Auth {
     password: String,

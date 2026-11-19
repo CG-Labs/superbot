@@ -11,12 +11,12 @@ export class ApiError extends Error {
   }
 }
 
-/** One-time sign-in codes an admin makes start with this (see ADR 0011). */
+/** One-time sign-in codes an admin makes start with this (see ADR 0012). */
 export const CODE_PREFIX = "sbc_";
 
 /**
  * Signs in with a password or sign-in code and returns a session-token config.
- * Servers from before sign-in (ADR 0011) don't have the endpoint: with a password,
+ * Servers from before sign-in (ADR 0012) don't have the endpoint: with a password,
  * fall back to sending it on every request, as before.
  */
 export async function signIn(baseUrl: string, secret: string, label = "SuperBot app"): Promise<ServerConfig> {

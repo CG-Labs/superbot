@@ -1,7 +1,7 @@
 //! People and their sign-ins: the user store, server-side sessions, one-time
 //! sign-in codes, and the break-glass owner account. Permission checks live in
 //! `rbac.rs`; the auth middleware in `main.rs` ties both to each request.
-//! Design: docs/adr/0011-users-sessions-rbac.md.
+//! Design: docs/adr/0012-users-sessions-rbac.md.
 
 use crate::audit::{Actor, ActorKind, Event, Source, Who};
 use crate::db::{self, NewSession, Session, User, UserPatch};

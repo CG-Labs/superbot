@@ -1,4 +1,4 @@
-//! HTTP tests for sign-in, sessions, and roles (ADR 0011), on the real router.
+//! HTTP tests for sign-in, sessions, and roles (ADR 0012), on the real router.
 
 use crate::tests::{audit_list, basic, call, call_with, serve_app_with};
 use crate::users::{self, SessionConfig};
