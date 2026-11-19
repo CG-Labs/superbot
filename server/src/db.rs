@@ -954,8 +954,13 @@ impl Db {
         self.c().execute("UPDATE messages SET status = ? WHERE id = ?", params![status, id]).unwrap();
     }
 
+    /// Free text (name, email, user agent) is masked as `record` masks it.
     pub fn set_requested_by(&self, id: i64, who: &audit::Who) {
-        let who = serde_json::to_string(who).unwrap_or_default();
+        let mut who = who.clone();
+        for v in [&mut who.actor.name, &mut who.actor.email, &mut who.source.user_agent].into_iter().flatten() {
+            *v = audit::redact_text(v);
+        }
+        let who = serde_json::to_value(&who).map(|v| redact::value(v).to_string()).unwrap_or_default();
         self.c().execute("UPDATE messages SET requested_by = ? WHERE id = ?", params![who, id]).unwrap();
     }
 

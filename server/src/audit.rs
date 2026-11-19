@@ -573,12 +573,15 @@ impl Filter {
             if !["user", "bot", "system"].contains(&kind) {
                 return Err("actor must be user, bot, or system, optionally with :<id>".into());
             }
-            if id.is_some_and(|i| !plain_id(i)) {
-                return Err("Invalid actor id".into());
-            }
             f.actor_kind = Some(kind.into());
             match id {
-                Some(email) if kind == "user" && email.contains('@') => f.actor_email = Some(email.into()),
+                Some(email) if kind == "user" && email.contains('@') => {
+                    if !crate::users::valid_email(email) {
+                        return Err("Invalid actor email".into());
+                    }
+                    f.actor_email = Some(email.into());
+                }
+                Some(i) if !plain_id(i) => return Err("Invalid actor id".into()),
                 _ => f.actor_id = id.map(String::from),
             }
         }
@@ -594,7 +597,11 @@ impl Filter {
         let id = |k: &str| get(k).map(|v| if plain_id(v) { Ok(v.to_string()) } else { Err(format!("Invalid {k}")) }).transpose();
         f.idp_provider = id("idpProvider")?;
         f.session_id = id("session")?;
-        f.on_behalf_of = id("onBehalfOf")?;
+        f.on_behalf_of = match get("onBehalfOf") {
+            Some(e) if e.contains('@') && !crate::users::valid_email(e) => return Err("Invalid onBehalfOf".into()),
+            Some(e) if e.contains('@') => Some(e.into()),
+            _ => id("onBehalfOf")?,
+        };
         f.idp = get("idp").map(|v| if word(v) { Ok(v.to_string()) } else { Err("Invalid idp".to_string()) }).transpose()?;
         if let Some(s) = get("subject") {
             if s.len() > 256 || s.chars().any(char::is_control) {
@@ -1006,6 +1013,12 @@ mod tests {
         let mut f = q(&[("actor", "user:old@example.com")]).unwrap();
         f.resolve_users(|_| None);
         assert_eq!((f.actor_id, f.actor_email.as_deref()), (None, Some("old@example.com")));
+        // Any address a user can have can be searched, not only id-shaped ones.
+        let long = format!("{}@example.com", "a".repeat(140));
+        for email in ["ada+work@example.com", "zoë@example.com", long.as_str()] {
+            let f = q(&[("actor", &format!("user:{email}")), ("onBehalfOf", email)]).unwrap();
+            assert_eq!((f.actor_email.as_deref(), f.on_behalf_of.as_deref()), (Some(email), Some(email)));
+        }
         let many = ["sso"; 11].join(",");
         for bad in [
             ("method", "SSO"),
@@ -1015,6 +1028,10 @@ mod tests {
             ("idp", "Entra"),
             ("session", "s1'--"),
             ("onBehalfOf", "u 1"),
+            ("onBehalfOf", "a b@example.com"),
+            ("actor", "user:a b@example.com"),
+            ("actor", "user:@example.com"),
+            ("actor", "bot:a+b"),
             ("subject", "a\nb"),
         ] {
             assert!(q(&[bad]).is_err(), "{bad:?}");
