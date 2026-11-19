@@ -407,6 +407,22 @@ impl Db {
             .flatten()
     }
 
+    /// The Bot's latest unanswered handoff card, unless the user wrote after it.
+    pub fn open_handoff(&self, bot_id: &str) -> Option<i64> {
+        self.c()
+            .query_row(
+                "SELECT id FROM messages WHERE bot_id = ?1 AND role = 'bot'
+                   AND json_extract(question, '$.handoff') = 1 AND json_extract(question, '$.picked') IS NULL
+                   AND id > COALESCE((SELECT MAX(id) FROM messages WHERE bot_id = ?1 AND role = 'user'), 0)
+                 ORDER BY id DESC LIMIT 1",
+                [bot_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
     pub fn message(&self, id: i64) -> Option<Message> {
         self.c().query_row("SELECT * FROM messages WHERE id = ?", [id], message_row).optional().ok().flatten()
     }

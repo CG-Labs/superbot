@@ -1,36 +1,70 @@
 import React, { useState } from "react";
-import { StyleSheet, useWindowDimensions, View } from "react-native";
+import { Modal, StyleSheet, useWindowDimensions, View } from "react-native";
 import { Redirect } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { ApprovalsInbox } from "../components/ApprovalsInbox";
 import { BotDetailsPanel } from "../components/BotDetailsPanel";
 import { ChatView } from "../components/ChatView";
 import { CreateBotModal } from "../components/CreateBotModal";
+import { ScreenViewer } from "../components/ScreenViewer";
 import { Sidebar } from "../components/Sidebar";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
 
+/** Open screen viewer. `takeOver` tracks whether the user has control; `n` remounts it, e.g. to take over from a handoff card. */
+type ScreenState = { takeOver: boolean; n: number } | null;
+
 export default function HomeScreen() {
-  const { api, setActiveId, logout } = useSuperBot();
+  const { api, bots, activeId, setActiveId, logout, handoffs, fetchScreenUrl, answerQuestion } = useSuperBot();
   const { width } = useWindowDimensions();
   const wide = width >= 800;
   const [mobilePane, setMobilePane] = useState<"list" | "chat">("list");
   const [createOpen, setCreateOpen] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const [screen, setScreen] = useState<ScreenState>(null);
   const [approvalsOpen, setApprovalsOpen] = useState(false);
 
   if (!api) {
     return <Redirect href="/" />;
   }
 
+  const bot = bots.find((b) => b.id === activeId);
+  const handoff = bot ? handoffs[bot.id] : undefined;
+
   const onSelectBot = (id: string) => {
     setActiveId(id);
+    setScreen((s) => (s && id !== activeId ? { takeOver: false, n: s.n + 1 } : s));
     if (!wide) setMobilePane("chat");
   };
 
   const onLogout = () => {
+    setScreen(null);
     void logout();
   };
+
+  const toggleScreen = (takeOver?: boolean) => {
+    if (takeOver) setScreen((s) => ({ takeOver: true, n: (s?.n ?? 0) + 1 }));
+    else setScreen((s) => (s ? null : { takeOver: false, n: 0 }));
+  };
+
+  const viewer =
+    screen && bot ? (
+      <ScreenViewer
+        key={`${bot.id}:${screen.n}`}
+        botId={bot.id}
+        botName={bot.name}
+        fetchUrl={fetchScreenUrl}
+        initialControl={screen.takeOver}
+        handoff={handoff}
+        onHandoffDone={
+          handoff?.question
+            ? () => answerQuestion(handoff, Math.max(0, handoff.question?.options.indexOf("Done") ?? 0))
+            : undefined
+        }
+        onControlChange={(c) => setScreen((s) => (s && s.takeOver !== c ? { ...s, takeOver: c } : s))}
+        onClose={() => setScreen(null)}
+      />
+    ) : null;
 
   return (
     <SafeAreaView style={styles.root} edges={["top", "left", "right"]}>
@@ -48,9 +82,17 @@ export default function HomeScreen() {
           <ChatView
             onOpenDetails={() => setDetailsOpen(true)}
             onBack={wide ? undefined : () => setMobilePane("list")}
+            onToggleScreen={toggleScreen}
+            screenOpen={!!screen}
           />
         ) : null}
+        {wide && viewer ? <View style={styles.screenPanel}>{viewer}</View> : null}
       </View>
+      {!wide ? (
+        <Modal visible={!!viewer} animationType="slide" onRequestClose={() => setScreen(null)}>
+          <SafeAreaView style={styles.screenModal}>{viewer}</SafeAreaView>
+        </Modal>
+      ) : null}
       <CreateBotModal
         visible={createOpen}
         onClose={() => setCreateOpen(false)}
@@ -58,7 +100,11 @@ export default function HomeScreen() {
           onSelectBot(id);
         }}
       />
-      <BotDetailsPanel visible={detailsOpen} onClose={() => setDetailsOpen(false)} />
+      <BotDetailsPanel
+        visible={detailsOpen}
+        onClose={() => setDetailsOpen(false)}
+        onOpenScreen={() => setScreen((s) => s ?? { takeOver: false, n: 0 })}
+      />
       <ApprovalsInbox visible={approvalsOpen} onClose={() => setApprovalsOpen(false)} />
     </SafeAreaView>
   );
@@ -67,4 +113,6 @@ export default function HomeScreen() {
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: colors.bgMain },
   row: { flex: 1, flexDirection: "row" },
+  screenPanel: { width: "46%", minWidth: 420, borderLeftWidth: 1, borderLeftColor: colors.border },
+  screenModal: { flex: 1, backgroundColor: "#111" },
 });

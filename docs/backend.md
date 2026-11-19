@@ -107,7 +107,7 @@ Limits: the parser sees commands, not what scripts or programs do inside, so thi
 
 All JSON. Browser auth: HTTP Basic with `AUTH_PASSWORD`. Empty password requires `ALLOW_NO_AUTH=1` on loopback only.
 
-- `GET /api/state`: user name, installed harnesses, all Bots, global policy, pending approvals
+- `GET /api/state`: user name, installed harnesses, all Bots, global policy, pending approvals. Each Bot's `handoff` is the id of its unanswered handoff card, or null.
 - `GET /api/events`: SSE stream (`message`, `draft`, `status`, `bot`, `botDeleted`, `approval`, `policy`, `resync`)
 - `POST /api/bots` `{name, harness?, model?, color?, shape?}`
 - `PATCH /api/bots/:id` `{name?, hidden?, harness?, model?, effort?}`, `DELETE /api/bots/:id`
@@ -115,8 +115,8 @@ All JSON. Browser auth: HTTP Basic with `AUTH_PASSWORD`. Empty password requires
 - `GET|POST /api/bots/:id/messages` `{text, answer?: {messageId, option}}`
 - `POST /api/bots/:id/read`, `POST /api/bots/:id/stop`
 - `GET|POST /api/bots/:id/routines` `{name, cron, instruction}`
-- `PATCH|DELETE /api/routines/:id` `{enabled?, name?, cron?, instruction?}`
-- `GET /api/bots/:id/screen`: starts the Bot's screen and returns its live view URL
+- `PATCH|DELETE /api/routines/:id` `{enabled?, name?, cron?, instruction?}`. Text fields are trimmed and can't be empty; cron must parse.
+- `GET /api/bots/:id/screen`: starts the Bot's screen and returns its live view URL. 503 while voxl isn't listening yet, or when all screens are in use
 - `POST /api/handoff` `{from, text}`: `botctl handoff`; waits for the user's answer
 
 Approvals and policy. Writes, decisions, the approvals list, and the audit log need a person (403 for the Bot token):

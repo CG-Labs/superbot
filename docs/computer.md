@@ -7,8 +7,8 @@ Each Bot gets its own screen on the server, with a real browser. You can watch i
 - **Screen:** a virtual display (Xvfb) with a window manager (Openbox) and its own D-Bus session. `botd` starts it on a Bot's first task and stops it after `SCREEN_IDLE_MINUTES` without use. Code: `server/src/screen.rs`.
 - **Browser:** [agent-browser](https://github.com/vercel-labs/agent-browser). Each Bot has its own session and Chrome profile in `DATA_DIR/bots/<id>/browser`, so sign-ins persist. Chrome runs headed on the Bot's screen.
 - **Desktop apps:** [agent-desktop](https://github.com/vercel-labs/agent-desktop) reads apps through the screen's accessibility bus.
-- **Live view:** [voxl](https://github.com/tembo/voxl) streams each screen. `GET /api/bots/<id>/screen` returns `/screen/<port>/?token=...`. The page is view-only until you click **Take over**.
-- **Handoff:** for logins, 2FA, or CAPTCHAs, a Bot runs `botctl handoff "<what it needs>"`. You get a card with **Open screen** and **Done**. The Bot's command waits for your answer.
+- **Live view:** [voxl](https://github.com/tembo/voxl) streams each screen. `GET /api/bots/<id>/screen` returns `/screen/<port>/?token=...`. The page is view-only until you click **Take over**. The web app and the Expo client (iframe, or a WebView on phones) both show it; see [ADR 0008](adr/0008-client-screen-auth.md) for how the client keeps the password out of the link.
+- **Handoff:** for logins, 2FA, or CAPTCHAs, a Bot runs `botctl handoff "<what it needs>"`. You get a card with **Open screen** and **Done**. The Bot's command waits for your answer. The client also flags the Bot in the sidebar ("Needs you"), pins a banner over its chat, and puts **Done** in the screen panel.
 
 All tools are plain CLIs, so this works the same on every harness. The Bot's system prompt explains them.
 

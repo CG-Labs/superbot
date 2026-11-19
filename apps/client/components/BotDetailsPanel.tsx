@@ -1,45 +1,120 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   Modal,
   Pressable,
+  ScrollView,
   StyleSheet,
   Switch,
   Text,
   TextInput,
   View,
 } from "react-native";
+import { confirmAsync, showError } from "../src/dialogs";
+import { cronLabel } from "../src/routines";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors, HARNESS_NAMES } from "../src/theme";
 import type { Routine } from "../src/types";
 import { BotAvatar } from "./BotAvatar";
+import { RoutineEditor } from "./RoutineEditor";
 
 interface Props {
   visible: boolean;
   onClose: () => void;
+  onOpenScreen: () => void;
 }
 
-export function BotDetailsPanel({ visible, onClose }: Props) {
-  const { bots, activeId, patchBot, deleteBot, fetchRoutines, toggleRoutine, policy, setBotPolicy } = useSuperBot();
+/** "new" or the routine being edited; null shows the details. */
+type Editing = "new" | Routine | null;
+
+export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
+  const {
+    bots,
+    activeId,
+    patchBot,
+    deleteBot,
+    fetchRoutines,
+    toggleRoutine,
+    createRoutine,
+    updateRoutine,
+    deleteRoutine,
+    policy,
+    setBotPolicy,
+  } = useSuperBot();
   const bot = bots.find((b) => b.id === activeId);
+  const botId = bot?.id;
   const [name, setName] = useState(bot?.name || "");
   const [routines, setRoutines] = useState<Routine[]>([]);
+  const [editing, setEditing] = useState<Editing>(null);
+  /** The Bot whose routines are on screen; a load for any other (or a closed panel) is stale. */
+  const shownRef = useRef<string | null>(null);
+
+  const showRoutines = (id: string, list: Routine[]) => {
+    if (shownRef.current === id) setRoutines(list.filter((r) => r.bot_id === id));
+  };
 
   useEffect(() => {
     setName(bot?.name || "");
-    if (bot && visible) {
-      void fetchRoutines(bot.id).then(setRoutines);
+  }, [bot?.name]);
+
+  useEffect(() => {
+    setEditing(null);
+    setRoutines([]);
+    shownRef.current = botId && visible ? botId : null;
+    if (botId && visible) {
+      void fetchRoutines(botId)
+        .then((list) => showRoutines(botId, list))
+        .catch(() => showRoutines(botId, []));
     }
-  }, [bot, visible, fetchRoutines]);
+    // fetchRoutines changes identity on every provider render; reload only when the Bot or visibility changes.
+  }, [botId, visible]);
 
   if (!bot) return null;
 
+  const reload = () => {
+    const id = bot.id;
+    return fetchRoutines(id).then((list) => showRoutines(id, list));
+  };
+
+  const close = () => {
+    setEditing(null);
+    onClose();
+  };
+
+  const editor =
+    editing === null ? null : (
+      <RoutineEditor
+        key={editing === "new" ? "new" : editing.id}
+        routine={editing === "new" ? undefined : editing}
+        onCancel={() => setEditing(null)}
+        onSave={async (draft) => {
+          if (editing === "new") await createRoutine(bot.id, draft);
+          else await updateRoutine(editing, draft);
+          await reload();
+          setEditing(null);
+        }}
+        onDelete={
+          editing === "new"
+            ? undefined
+            : async () => {
+                const ok = await confirmAsync(`Delete "${editing.name}"?`, "The Bot stops running it.");
+                if (!ok) return;
+                await deleteRoutine(editing.id);
+                await reload();
+                setEditing(null);
+              }
+        }
+      />
+    );
+
   return (
-    <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
+    <Modal visible={visible} animationType="slide" transparent onRequestClose={close}>
       <View style={styles.backdrop}>
-        <View style={styles.panel}>
-          <Pressable style={styles.close} onPress={onClose}>
+        <ScrollView style={styles.panel} contentContainerStyle={styles.panelContent}>
+          <Pressable style={styles.close} role="button" aria-label="Close details" onPress={close}>
             <Text style={styles.closeText}>✕</Text>
           </Pressable>
+          {editor ?? (
+          <>
           <BotAvatar color={bot.color} shape={bot.shape} size={90} />
           <TextInput
             style={styles.name}
@@ -50,23 +125,48 @@ export function BotDetailsPanel({ visible, onClose }: Props) {
               if (n && n !== bot.name) void patchBot(bot.id, { name: n });
             }}
           />
-          <Text style={styles.section}>Routines</Text>
+          <View style={styles.sectionRow}>
+            <Text style={styles.sectionLabel}>Routines</Text>
+            <Pressable role="button" aria-label="New routine" onPress={() => setEditing("new")}>
+              <Text style={styles.link}>+ New routine</Text>
+            </Pressable>
+          </View>
           {routines.length ? (
             routines.map((r) => (
               <View key={r.id} style={styles.row}>
-                <View style={{ flex: 1 }}>
+                <Pressable
+                  style={{ flex: 1 }}
+                  role="button"
+                  aria-label={`Edit routine ${r.name}`}
+                  onPress={() => setEditing(r)}
+                >
                   <Text style={styles.rName}>{r.name}</Text>
-                  <Text style={styles.rCron}>{r.cron}</Text>
-                </View>
+                  <Text style={styles.rCron}>{cronLabel(r.cron)}</Text>
+                </Pressable>
                 <Switch
+                  aria-label={r.enabled ? `Pause ${r.name}` : `Resume ${r.name}`}
                   value={r.enabled}
-                  onValueChange={() => void toggleRoutine(r).then(() => fetchRoutines(bot.id).then(setRoutines))}
+                  onValueChange={() => void toggleRoutine(r).then(reload).catch(showError)}
                 />
               </View>
             ))
           ) : (
             <Text style={styles.dim}>No routines yet</Text>
           )}
+          <Text style={styles.section}>Computer</Text>
+          <View style={styles.row}>
+            <Text style={styles.dim}>{bot.working ? bot.status || "Working" : "Asleep"}</Text>
+            <Pressable
+              role="button"
+              aria-label="Open screen"
+              onPress={() => {
+                close();
+                onOpenScreen();
+              }}
+            >
+              <Text style={styles.link}>Open screen</Text>
+            </Pressable>
+          </View>
           <Text style={styles.section}>Settings</Text>
           <View style={styles.row}>
             <Text style={styles.dim}>Runs on {HARNESS_NAMES[bot.harness] || bot.harness}</Text>
@@ -84,7 +184,7 @@ export function BotDetailsPanel({ visible, onClose }: Props) {
           </View>
           {bot.policyOverride ? (
             <Pressable style={styles.row} onPress={() => void setBotPolicy(bot.id, null)}>
-              <Text style={styles.link}>Use the default for all Bots ({policy?.mode ?? "ask"})</Text>
+              <Text style={styles.policyLink}>Use the default for all Bots ({policy?.mode ?? "ask"})</Text>
             </Pressable>
           ) : null}
           {!bot.primary ? (
@@ -98,7 +198,9 @@ export function BotDetailsPanel({ visible, onClose }: Props) {
               <Text style={styles.deleteText}>Delete bot</Text>
             </Pressable>
           ) : null}
-        </View>
+          </>
+          )}
+        </ScrollView>
       </View>
     </Modal>
   );
@@ -110,11 +212,10 @@ const styles = StyleSheet.create({
     backgroundColor: colors.bgSidebar,
     borderTopLeftRadius: 16,
     borderTopRightRadius: 16,
-    padding: 20,
     maxHeight: "85%",
-    gap: 10,
-    alignItems: "center",
+    flexGrow: 0,
   },
+  panelContent: { padding: 20, gap: 10, alignItems: "center" },
   close: { alignSelf: "flex-end" },
   closeText: { color: colors.textDim, fontSize: 22 },
   name: {
@@ -128,6 +229,9 @@ const styles = StyleSheet.create({
     width: "100%",
   },
   section: { alignSelf: "flex-start", color: colors.textFaint, marginTop: 8 },
+  sectionRow: { flexDirection: "row", alignItems: "center", width: "100%", marginTop: 8 },
+  sectionLabel: { color: colors.textFaint, flex: 1 },
+  link: { color: colors.blueDot },
   row: {
     flexDirection: "row",
     alignItems: "center",
@@ -140,7 +244,7 @@ const styles = StyleSheet.create({
   rName: { color: colors.text },
   rCron: { color: colors.textFaint, fontSize: 13 },
   dim: { color: colors.textDim, flex: 1 },
-  link: { color: colors.blueDot, flex: 1 },
+  policyLink: { color: colors.blueDot, flex: 1 },
   delete: { marginTop: 16, padding: 12 },
   deleteText: { color: colors.danger },
 });
