@@ -6,6 +6,8 @@ use serde_json::Value;
 
 pub struct Pi;
 
+const GUARD_EXTENSION: &str = include_str!("pi_guard.ts");
+
 impl Adapter for Pi {
     fn bin(&self) -> &'static str {
         "pi"
@@ -25,6 +27,14 @@ impl Adapter for Pi {
         }
         if let Some(e) = &input.effort {
             a.extend(["--thinking".into(), e.clone()]);
+        }
+        // Pi has no hook config, only TypeScript extensions: load a thin one that runs the gate.
+        if input.guard.is_some() {
+            let path = input.state_dir.join("superbot-guard.ts");
+            if std::fs::create_dir_all(&input.state_dir).and_then(|_| std::fs::write(&path, GUARD_EXTENSION)).is_err() {
+                out.push(AgentEvent::Error("Couldn't write the approval gate for Pi.".into()));
+            }
+            a.extend(["--extension".into(), path.display().to_string()]);
         }
         // A leading "@" would make pi read a file, so pad it.
         let p = &input.prompt;

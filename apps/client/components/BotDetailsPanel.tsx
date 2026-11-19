@@ -37,6 +37,8 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
     createRoutine,
     updateRoutine,
     deleteRoutine,
+    policy,
+    setBotPolicy,
   } = useSuperBot();
   const bot = bots.find((b) => b.id === activeId);
   const botId = bot?.id;
@@ -161,6 +163,18 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
             <Text style={styles.dim}>Hide from sidebar</Text>
             <Switch value={bot.hidden} onValueChange={(v) => void patchBot(bot.id, { hidden: v })} />
           </View>
+          <View style={styles.row}>
+            <Text style={styles.dim}>Ask before risky actions</Text>
+            <Switch
+              value={bot.policy !== "bypass"}
+              onValueChange={(v) => void setBotPolicy(bot.id, v ? "ask" : "bypass")}
+            />
+          </View>
+          {bot.policyOverride ? (
+            <Pressable style={styles.row} onPress={() => void setBotPolicy(bot.id, null)}>
+              <Text style={styles.policyLink}>Use the default for all Bots ({policy?.mode ?? "ask"})</Text>
+            </Pressable>
+          ) : null}
           {!bot.primary ? (
             <Pressable
               style={styles.delete}
@@ -218,6 +232,7 @@ const styles = StyleSheet.create({
   rName: { color: colors.text },
   rCron: { color: colors.textFaint, fontSize: 13 },
   dim: { color: colors.textDim, flex: 1 },
+  policyLink: { color: colors.blueDot, flex: 1 },
   delete: { marginTop: 16, padding: 12 },
   deleteText: { color: colors.danger },
 });

@@ -1,4 +1,4 @@
-# 0005: How the client shows a Bot's screen without leaking the password
+# 0008: How the client shows a Bot's screen without leaking the password
 
 Date: 2026-11-19. Status: accepted.
 

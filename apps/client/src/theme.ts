@@ -11,6 +11,7 @@ export const colors = {
   blue: "#2f72e4",
   blueDot: "#4b8df8",
   danger: "#e5484d",
+  warning: "#e9a23b",
   accent: "#4cc06a",
 };
 

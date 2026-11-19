@@ -1,6 +1,7 @@
 //! Codex CLI: `codex exec --json`. Resumes with `codex exec resume <thread id>`.
 //! Limitation: Codex fixes its instructions when a session starts, so later memory
 //! changes reach it only through its memory file, not the system prompt.
+//! Approvals: an inline PreToolUse hook. Hosted tools such as web search skip hooks.
 
 use super::{output, short, str_of, Adapter, AgentEvent, ModelOption, RunInput};
 use serde_json::Value;
@@ -24,6 +25,16 @@ impl Adapter for Codex {
         }
         if let Some(e) = &input.effort {
             a.extend(["-c".into(), format!("model_reasoning_effort={}", Value::String(e.clone()))]);
+        }
+        // Codex reads Claude-style PreToolUse hooks. Inline hooks need trust, which
+        // `exec` can't prompt for; we generate this one, so we vouch for it.
+        if let Some(g) = &input.guard {
+            let hooks = format!(
+                "hooks.PreToolUse=[{{matcher=\"*\",hooks=[{{type=\"command\",command={},timeout={}}}]}}]",
+                Value::String(g.command.clone()),
+                g.timeout_secs
+            );
+            a.extend(["-c".into(), "features.hooks=true".into(), "-c".into(), hooks, "--dangerously-bypass-hook-trust".into()]);
         }
         a.push("--".into());
         if let Some(id) = &input.session_id {

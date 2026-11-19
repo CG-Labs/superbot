@@ -25,7 +25,7 @@ import {
 import { createBody, patchBody, type RoutineDraft } from "./routines";
 import { resolveScreenUrl } from "./screen";
 import { connectSse } from "./sse";
-import type { BotView, Message, ModelOption, Routine, SseEvent } from "./types";
+import type { Approval, BotView, Message, ModelOption, Policy, PolicyMode, Routine, SseEvent } from "./types";
 
 interface SuperBotContextValue {
   ready: boolean;
@@ -66,6 +66,12 @@ interface SuperBotContextValue {
   deleteRoutine: (id: string) => Promise<void>;
   /** Starts the Bot's screen; resolves to an absolute live-view link on this server. */
   fetchScreenUrl: (botId: string) => Promise<string>;
+  /** Pending approvals, oldest first. */
+  approvals: Approval[];
+  policy: Policy | null;
+  decideApproval: (id: string, approve: boolean, remember: boolean) => Promise<void>;
+  setGlobalPolicy: (mode: PolicyMode) => Promise<void>;
+  setBotPolicy: (botId: string, mode: PolicyMode | null) => Promise<void>;
 }
 
 const SuperBotContext = createContext<SuperBotContextValue | null>(null);
@@ -92,6 +98,11 @@ function mergeMessages(base: Message[], extra: Message[]): Message[] {
   return added.length ? [...base, ...added].sort((a, b) => a.id - b.id) : base;
 }
 
+function upsertApproval(list: Approval[], a: Approval): Approval[] {
+  const rest = list.filter((x) => x.id !== a.id);
+  return a.status === "pending" ? [...rest, a].sort((x, y) => x.createdAt - y.createdAt) : rest;
+}
+
 export function SuperBotProvider({ children }: { children: React.ReactNode }) {
   const [ready, setReady] = useState(false);
   const [connected, setConnected] = useState(false);
@@ -108,6 +119,8 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
   const [modelCache, setModelCache] = useState<Record<string, ModelOption[]>>({});
   const [showHidden, setShowHidden] = useState(false);
   const [filter, setFilter] = useState("");
+  const [approvals, setApprovals] = useState<Approval[]>([]);
+  const [policy, setPolicy] = useState<Policy | null>(null);
   const sseRef = useRef<ReturnType<typeof connectSse> | null>(null);
   const openedRef = useRef(false);
   const messagesRef = useRef(messages);
@@ -120,6 +133,8 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
     setHarnesses(state.harnesses);
     setDefaultHarness(state.defaultHarness);
     setBots(state.bots);
+    setApprovals((state.approvals ?? []).reduce(upsertApproval, []));
+    setPolicy(state.policy ?? null);
     const primary = state.bots.find((b) => b.primary);
     setActiveId((cur) => (cur && state.bots.some((b) => b.id === cur) ? cur : primary?.id ?? null));
   }, []);
@@ -160,6 +175,10 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
         });
       } else if (evt.type === "draft") {
         setDrafts((d) => ({ ...d, [evt.botId]: evt.text }));
+      } else if (evt.type === "approval") {
+        setApprovals((list) => upsertApproval(list, evt.approval));
+      } else if (evt.type === "policy") {
+        setPolicy(evt.policy);
       } else if (evt.type === "status") {
         setBots((bs) =>
           bs.map((b) =>
@@ -283,6 +302,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
     setMessages({});
     setDrafts({});
     setHandoffs({});
+    setApprovals([]);
     setConnected(false);
     await clearCredentials();
   };
@@ -392,6 +412,22 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
     return resolveScreenUrl(api.baseUrl, url);
   };
 
+  const decideApproval = async (id: string, approve: boolean, remember: boolean) => {
+    if (!api) return;
+    const a = await api.decideApproval(id, approve, remember);
+    setApprovals((list) => upsertApproval(list, a));
+  };
+
+  const setGlobalPolicy = async (mode: PolicyMode) => {
+    if (!api) return;
+    setPolicy(await api.setGlobalPolicy(mode));
+  };
+
+  const setBotPolicy = async (botId: string, mode: PolicyMode | null) => {
+    if (!api) return;
+    await api.setBotPolicy(botId, mode);
+  };
+
   const value = useMemo(
     () => ({
       ready,
@@ -429,6 +465,11 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
       updateRoutine,
       deleteRoutine,
       fetchScreenUrl,
+      approvals,
+      policy,
+      decideApproval,
+      setGlobalPolicy,
+      setBotPolicy,
     }),
     [
       ready,
@@ -446,6 +487,8 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
       modelCache,
       showHidden,
       filter,
+      approvals,
+      policy,
     ],
   );
 

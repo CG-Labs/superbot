@@ -8,10 +8,11 @@ interface Props {
   onSelectBot: (id: string) => void;
   onNewBot: () => void;
   onLogout: () => void;
+  onOpenApprovals: () => void;
   compact?: boolean;
 }
 
-export function Sidebar({ onSelectBot, onNewBot, onLogout, compact }: Props) {
+export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, compact }: Props) {
   const {
     bots,
     activeId,
@@ -21,6 +22,7 @@ export function Sidebar({ onSelectBot, onNewBot, onLogout, compact }: Props) {
     setShowHidden,
     me,
     handoffs,
+    approvals,
   } = useSuperBot();
 
   const primary = bots.find((b) => b.primary);
@@ -88,6 +90,14 @@ export function Sidebar({ onSelectBot, onNewBot, onLogout, compact }: Props) {
       </ScrollView>
       <Pressable style={styles.hiddenBtn} onPress={() => setShowHidden(!showHidden)}>
         <Text style={styles.hiddenText}>{showHidden ? "Back to bots" : "Hidden bots"}</Text>
+      </Pressable>
+      <Pressable style={styles.approvalsBtn} onPress={onOpenApprovals}>
+        <Text style={approvals.length ? styles.approvalsWaiting : styles.hiddenText}>Approvals</Text>
+        {approvals.length ? (
+          <View style={styles.badge}>
+            <Text style={styles.badgeText}>{approvals.length}</Text>
+          </View>
+        ) : null}
       </Pressable>
       <View style={styles.meRow}>
         <View style={styles.meAvatar}>
@@ -159,6 +169,10 @@ const styles = StyleSheet.create({
   empty: { color: colors.textFaint, padding: 12, textAlign: "center" },
   hiddenBtn: { paddingVertical: 10 },
   hiddenText: { color: colors.textDim },
+  approvalsBtn: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingVertical: 10 },
+  approvalsWaiting: { color: colors.text },
+  badge: { backgroundColor: colors.danger, borderRadius: 999, minWidth: 22, paddingHorizontal: 7, alignItems: "center" },
+  badgeText: { color: "#fff", fontSize: 13, lineHeight: 22 },
   meRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingTop: 8 },
   meAvatar: {
     width: 36,

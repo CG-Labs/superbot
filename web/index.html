@@ -26,6 +26,9 @@
       <button class="hidden-bots" id="hidden-btn">
         <span id="hidden-label">Hidden Bots</span><span id="hidden-count"></span>
       </button>
+      <button class="hidden-bots approvals-btn" id="approvals-btn">
+        <span>Approvals</span><span class="count" id="approvals-count"></span>
+      </button>
 
       <div class="sidebar-bottom">
         <div class="me">
@@ -109,6 +112,23 @@
         <button type="submit" class="nb-btn primary" id="nb-create">Create</button>
       </div>
     </form>
+  </div>
+  <div class="modal-backdrop" id="ap" hidden>
+    <div class="modal ap-modal">
+      <div class="modal-head">
+        <h3>Approvals</h3>
+        <button type="button" class="modal-close" id="ap-close" title="Close">
+          <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </div>
+      <div class="modal-body ap-body" id="ap-list"></div>
+      <div class="modal-foot">
+        <label class="nb-runs">All Bots <select id="ap-mode">
+          <option value="ask">Ask before risky actions</option>
+          <option value="bypass">Bypass (dev only)</option>
+        </select></label>
+      </div>
+    </div>
   </div>
   <script src="app.js"></script>
 </body>

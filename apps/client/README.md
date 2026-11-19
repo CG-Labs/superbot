@@ -43,7 +43,7 @@ Point the login screen at `http://127.0.0.1:3000` (or your server) and enter `AU
 
 - **Chat** over SSE, choice cards, per-Bot model and effort.
 - **Routines:** open a Bot's details (tap its name) to create, edit, pause, or delete routines. Presets cover common schedules; any 5-field cron works (server time zone). The server validates cron and shows its error inline.
-- **Screen:** the **Screen** button in the chat header opens the Bot's live screen (voxl). It's a side panel on wide windows and full screen on phones. It is view-only until you press **Take over**; **Give back** returns it. Web and Electron use an iframe, native apps use a WebView. The password never goes in the link (see [ADR 0005](../../docs/adr/0005-client-screen-auth.md)).
+- **Screen:** the **Screen** button in the chat header opens the Bot's live screen (voxl). It's a side panel on wide windows and full screen on phones. It is view-only until you press **Take over**; **Give back** returns it. Web and Electron use an iframe, native apps use a WebView. The password never goes in the link (see [ADR 0008](../../docs/adr/0008-client-screen-auth.md)).
 - **Handoffs:** when a Bot runs `botctl handoff`, its sidebar row says "Needs you", a banner sits on top of its chat, and **Open screen** opens the screen with control. **Done** (in the card or the screen panel) hands it back to the Bot.
 
 The screen needs the server's proxy to route `/screen/<port>/` to voxl ([docs/computer.md](../../docs/computer.md)) and HTTPS (or localhost), since voxl decodes with WebCodecs.

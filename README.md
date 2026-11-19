@@ -35,7 +35,7 @@ You message Bots like teammates. They finish work end to end and only ask you wh
 - **Routines**: run a Bot on a schedule. Bots create their own cron jobs.
 - **Bot to Bot**: Bots ask each other for help and pass work along.
 - **Any agent**: Claude Code, Codex, or Pi, through one small adapter each.
-- **Approvals** *(soon)*: Bots pause and ask before risky actions.
+- **Approvals**: Bots pause and ask before risky actions (deleting outside the workspace, `git push`, sending messages, installing software). Safe work stays autonomous. See [Approvals](docs/backend.md#approvals).
 
 Also planned: computer use (Bots drive the browser and GUI apps), skills, and Slack.
 
@@ -108,7 +108,9 @@ Details: [VM specs](docs/background/grok-bot-computer-specs.md) and [running man
 
 ## Status
 
-Early. Chat with Bots on Claude Code, Codex, or Pi works, with memory, routines, and Bot to Bot. Approvals and computer use are next.
+Early. Chat with Bots on Claude Code, Codex, or Pi works, with memory, routines, Bot to Bot, and approvals. Computer use is next.
+
+Upgrading from before approvals? Your install keeps running without them until you opt in: `SUPERBOT_PASSWORD=<AUTH_PASSWORD> botctl policy set global mode=ask`, or the switch in the app's Approvals window.
 
 ## License
 

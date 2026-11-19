@@ -16,6 +16,7 @@ One Rust binary, `botd`. It serves the web app, stores everything in SQLite, and
 - **Bot to Bot**: a Bot runs `botctl ask "<Bot>" "<message>"`. The other Bot answers in its own chat and the reply prints back. If it takes over 9 minutes, the reply arrives later as a new message.
 - **Model and effort** are saved per Bot. The web app shows a faint picker above the input. Unset means the harness default.
 - **Choice cards**: a reply ending in a ` ```question ` JSON block becomes a multiple-choice card.
+- **Approvals**: in `ask` mode, risky tool calls wait for a person. See [Approvals](#approvals).
 - **Restarts**: queued messages run after a restart. A task that was running is reported as interrupted, not re-run, so it can't repeat an action like sending an email.
 
 ## Harness adapters
@@ -26,7 +27,13 @@ Each adapter is one file in `server/src/adapters/`. It builds the command line a
 - **Codex**: `codex exec --json`, then `codex exec resume <id>`. Instructions via `-c developer_instructions=...`. Codex only reads them when a session starts, so later memory edits reach it through the memory file.
 - **Pi**: `pi --mode json --session-dir <bot dir> --session-id <id>`. System prompt via `--append-system-prompt`.
 
-All three run with permission prompts off (`--dangerously-skip-permissions` and equivalents). The server is the computer, so treat it that way. Approvals are not built yet.
+All three run with the harness's own permission prompts off (`--dangerously-skip-permissions` and equivalents): nobody is at a terminal to answer them. In `ask` mode, each adapter adds a hook that runs `botctl hook <harness>` before every tool call instead:
+
+- **Claude Code**: a `PreToolUse` command hook via `--settings`.
+- **Codex**: the same hook via `-c hooks.PreToolUse=...` and `features.hooks=true`.
+- **Pi**: a small generated extension (`--extension`) that runs the same command on `tool_call`.
+
+The server is still the computer, so treat it that way. Details and trade-offs: [ADR 0007](adr/0007-approvals.md).
 
 Add a harness: write one adapter file and add it to `get()` and `NAMES` in `adapters/mod.rs`.
 
@@ -55,12 +62,53 @@ Settings are in [.env.example](../.env.example). Keep `botctl` next to `botd`: t
 - Back up `DATA_DIR`. `WORKSPACE_DIR` is the Bots' scratch and files.
 - `GET /healthz` returns `{"ok":true}` without auth.
 
+## Approvals
+
+The policy decides what each tool call does: run, ask a person, or be blocked.
+
+- **Modes**: `ask` pauses risky calls. `bypass` runs everything, as before (dev only).
+- **Risky classes**, each set to `allow`, `ask` (default), or `deny`:
+  - `shell_destructive`: `rm -rf` on the workspace or system paths, `git reset --hard`, `dd`, `mkfs`, `DROP TABLE`, `sudo`, ...
+  - `file_delete`: deleting files outside the workspace.
+  - `outbound_message`: mail CLIs, `gh pr create`/comments, chat webhooks, messaging MCP tools.
+  - `network_install`: `apt`, `brew`, `npm i`, `pip install`, `cargo install`, `curl ... | sh`.
+  - `git_push`: any `git push`.
+- **Shell commands** are parsed like `sh`/`bash` reads them (`server/src/shell.rs`): every command in pipes, lists, groups, `$(…)`, backticks, `<(…)`, `${…}`, and expanding here-documents is checked. `$'…'` escapes are decoded as bash does. A command whose name is only known at run time (`$CMD`, `gi?`, `{git,x}`, `eval "$X"`, `bash -c "$S"`) counts as `shell_destructive`.
+- **Folders**: a `cd` may fail or run in a subshell, so a relative path must be inside the workspace from every folder the command could be in. When a folder can't be known (`cd -`, `cd "$D"`, `popd`, `source`), relative deletes count as outside.
+- **Shell tools** may send `command` or `cmd`, as text or argv. A shell call with neither, or two that differ, is denied.
+- **Unreadable commands are denied**, whatever the classes or rules say: unclosed quotes or substitutions, syntax the parser doesn't know, over 1 MiB, nesting over 16 levels, or over 10,000 commands. The Bot is told why, so it can simplify the command.
+- **Rules**: `deny` rules (the deny list) always block. `allow` rules skip asking, unless the class is `deny`. Patterns are globs (`*`, `?`) over the command, path, URL, or tool arguments. "Remember" on an approval saves an exact-match rule for that Bot.
+- **Scope**: one global policy, plus optional per-Bot overrides.
+- **Timeout**: an unanswered approval is denied after `timeoutMinutes` (default 10). Stopping the Bot, the run ending, or a server restart also closes it.
+- **Turning approvals on** stops any task that started in `bypass` (it has no hook), with a note to send it again.
+- **Remember** saves an exact rule. Calls too long to store whole (over 4,000 characters) can be approved or denied, but not remembered.
+- **Audit**: every request, decision, timeout, and policy or rule change is in an append-only log (`GET /api/audit`).
+- **Who decides**: only a person logged in with `AUTH_PASSWORD`. Bots' token gets 403 on decisions and policy changes.
+
+Fresh installs start in `ask`. Installs from before approvals keep `bypass` until you opt in:
+
+```sh
+SUPERBOT_PASSWORD=<your AUTH_PASSWORD> botctl policy set global mode=ask
+```
+
+Or use the switch at the bottom of the web app's Approvals window. More operator commands: `botctl admin`. botctl only sends the password to a server on the same machine (loopback), since it speaks plain http; from elsewhere, use an SSH tunnel.
+
+```sh
+botctl policy set global timeout=15 git_push=deny   # never push, ask longer
+botctl policy set <bot-id> mode=bypass              # one dev Bot runs freely
+botctl rule add deny "rm -rf /srv/*"                # deny list
+botctl rule add allow "npm install*" --bot <bot-id> # this Bot may install npm packages
+botctl approvals | botctl approve <id> [--remember] | botctl deny <id>
+```
+
+Limits: the parser sees commands, not what scripts or programs do inside, so this catches mistakes and prompt injection, not a determined attacker. Bots run as the same OS user as `botd`. See [ADR 0007](adr/0007-approvals.md).
+
 ## API
 
 All JSON. Browser auth: HTTP Basic with `AUTH_PASSWORD`. Empty password requires `ALLOW_NO_AUTH=1` on loopback only.
 
-- `GET /api/state`: user name, installed harnesses, all Bots. Each Bot's `handoff` is the id of its unanswered handoff card, or null.
-- `GET /api/events`: SSE stream (`message`, `draft`, `status`, `bot`, `botDeleted`, `resync`)
+- `GET /api/state`: user name, installed harnesses, all Bots, global policy, pending approvals. Each Bot's `handoff` is the id of its unanswered handoff card, or null.
+- `GET /api/events`: SSE stream (`message`, `draft`, `status`, `bot`, `botDeleted`, `approval`, `policy`, `resync`)
 - `POST /api/bots` `{name, harness?, model?, color?, shape?}`
 - `PATCH /api/bots/:id` `{name?, hidden?, harness?, model?, effort?}`, `DELETE /api/bots/:id`
 - `GET /api/harnesses/:name/models`: models and reasoning efforts the harness offers (Claude Code: aliases; Codex: `codex debug models`; Pi: `pi --list-models`)
@@ -71,8 +119,18 @@ All JSON. Browser auth: HTTP Basic with `AUTH_PASSWORD`. Empty password requires
 - `GET /api/bots/:id/screen`: starts the Bot's screen and returns its live view URL. 503 while voxl isn't listening yet, or when all screens are in use
 - `POST /api/handoff` `{from, text}`: `botctl handoff`; waits for the user's answer
 
+Approvals and policy. Writes, decisions, the approvals list, and the audit log need a person (403 for the Bot token):
+
+- `GET /api/policy`: global policy, class names, global rules. `PUT /api/policy` `{mode?, timeoutMinutes?, classes?: {<class>: allow|ask|deny}}`
+- `GET /api/bots/:id/policy`: effective policy, override, rules. `PUT` (same body, merged into the override), `DELETE` (drop the override)
+- `GET /api/policy/rules?bot=<id>`, `POST /api/policy/rules` `{action: allow|deny, pattern, tool?, botId?, note?}`, `DELETE /api/policy/rules/:id`
+- `GET /api/approvals?status=pending|approved|denied|expired|cancelled|all&bot=<id>&limit=`
+- `POST /api/approvals/:id/approve`, `POST /api/approvals/:id/deny` `{remember?: "bot"|"global", note?}`. 409 if already decided
+- `POST /api/approvals/check` `{from, harness, event}`: the hook's call. Waits for a decision. Replies `allow` or `deny`, then the reason, as plain text
+- `GET /api/audit?limit=&before=<id>`: audit events, newest first
+
 ## Not built yet
 
-Approvals before risky actions, Vault for secrets, per-Bot resource limits, Slack.
+Vault for secrets, per-Bot resource limits, Slack. Approvals follow-ups are in [approvals-followups.md](approvals-followups.md).
 
 Computer use (each Bot's screen, browser, and live view) is in [computer.md](computer.md).

@@ -1,5 +1,5 @@
 import { basicAuthHeader, normalizeBaseUrl } from "./auth";
-import type { AppState, BotView, Message, ModelOption, Routine, ServerConfig } from "./types";
+import type { AppState, Approval, BotView, Message, ModelOption, Policy, PolicyMode, Routine, ServerConfig } from "./types";
 
 export class ApiError extends Error {
   constructor(
@@ -107,6 +107,22 @@ export class SuperBotApi {
   /** Starts the Bot's screen and returns its live view link (see `resolveScreenUrl`). */
   async screen(botId: string): Promise<{ url: string }> {
     return this.request<{ url: string }>("GET", `/api/bots/${botId}/screen`);
+  }
+
+  async decideApproval(id: string, approve: boolean, remember: boolean): Promise<Approval> {
+    return this.request<Approval>("POST", `/api/approvals/${id}/${approve ? "approve" : "deny"}`, {
+      remember: remember ? "bot" : null,
+    });
+  }
+
+  async setGlobalPolicy(mode: PolicyMode): Promise<Policy> {
+    return (await this.request<{ policy: Policy }>("PUT", "/api/policy", { mode })).policy;
+  }
+
+  /** mode null drops the Bot's override, so it follows the global policy again. */
+  async setBotPolicy(botId: string, mode: PolicyMode | null): Promise<void> {
+    if (mode) await this.request("PUT", `/api/bots/${botId}/policy`, { mode });
+    else await this.request("DELETE", `/api/bots/${botId}/policy`);
   }
 
   eventsUrl(): string {

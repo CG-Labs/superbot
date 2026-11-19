@@ -15,6 +15,7 @@ import { isOpenHandoff } from "../src/handoff";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
 import type { Message } from "../src/types";
+import { ApprovalCard } from "./ApprovalsInbox";
 import { BotAvatar } from "./BotAvatar";
 import { HandoffBanner } from "./HandoffBanner";
 import { ModelBar } from "./ModelBar";
@@ -43,6 +44,7 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen }: 
     sendText,
     answerQuestion,
     stopBot,
+    approvals,
   } = useSuperBot();
   const [text, setText] = useState("");
   const [loading, setLoading] = useState(false);
@@ -130,6 +132,13 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen }: 
 
   const footer = (
     <View>
+      {approvals
+        .filter((a) => a.botId === bot.id)
+        .map((a) => (
+          <View key={a.id} style={styles.row}>
+            <ApprovalCard approval={a} />
+          </View>
+        ))}
       {draft ? (
         <View style={styles.row}>
           <View style={styles.bubble}>
