@@ -35,7 +35,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install ShellCheck
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-      - run: shellcheck -S warning deploy/install.sh deploy/superbot-backup.sh deploy/install-computer.sh
+      - run: shellcheck -S warning deploy/install.sh deploy/superbot-backup.sh deploy/install-computer.sh deploy/docker/*.sh
 
   install-pipe-dry-run:
     runs-on: ubuntu-latest
