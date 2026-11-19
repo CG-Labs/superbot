@@ -192,7 +192,7 @@ fn decide(verb: &str, id: &str, rest: &[&str]) -> Result<String, String> {
     api(Cred::Operator, "POST", &format!("/api/approvals/{id}/{verb}"), Some(body)).map(|_| if verb == "approve" { "Approved." } else { "Denied." }.into())
 }
 
-fn secret_name(name: &str) -> Result<&str, String> {
+fn env_name(name: &str) -> Result<&str, String> {
     if name.is_empty() || !name.bytes().all(|b| b == b'_' || b.is_ascii_uppercase() || b.is_ascii_digit()) {
         return Err(format!("\"{name}\" isn't a valid name. Use an environment variable name like OPENAI_API_KEY."));
     }
@@ -200,7 +200,7 @@ fn secret_name(name: &str) -> Result<&str, String> {
 }
 
 /// The value comes on stdin, so it stays out of shell history and the process list.
-fn secret_value(mut input: impl Read) -> Result<String, String> {
+fn stdin_value(mut input: impl Read) -> Result<String, String> {
     let mut v = String::new();
     input.read_to_string(&mut v).map_err(|e| format!("Couldn't read the value from stdin: {e}"))?;
     let v = v.strip_suffix('\n').map(|t| t.strip_suffix('\r').unwrap_or(t)).unwrap_or(&v).to_string();
@@ -255,11 +255,11 @@ fn run(args: &[String]) -> Result<String, String> {
         ["audit", n] => op("GET", &format!("/api/audit?limit={n}"), None),
         ["secrets"] => op("GET", "/api/secrets", None),
         ["secret", "set", name] => {
-            let name = secret_name(name)?;
-            let body = json!({ "value": secret_value(std::io::stdin())? }).to_string();
+            let name = env_name(name)?;
+            let body = json!({ "value": stdin_value(std::io::stdin())? }).to_string();
             op("PUT", &format!("/api/secrets/{name}"), Some(body)).map(|_| format!("Saved {name}. Bots get it as ${name} from their next run."))
         }
-        ["secret", "rm" | "delete", name] => op("DELETE", &format!("/api/secrets/{}", secret_name(name)?), None).map(|_| "Deleted.".into()),
+        ["secret", "rm" | "delete", name] => op("DELETE", &format!("/api/secrets/{}", env_name(name)?), None).map(|_| "Deleted.".into()),
         ["help", "admin"] | ["admin"] => Ok(ADMIN_HELP.into()),
         _ => Ok(HELP.into()),
     }
@@ -317,14 +317,14 @@ mod tests {
     }
 
     #[test]
-    fn secret_values_come_from_stdin_without_the_newline() {
-        assert_eq!(secret_value("sk-1\n".as_bytes()).unwrap(), "sk-1");
-        assert_eq!(secret_value("sk-1\r\n".as_bytes()).unwrap(), "sk-1");
-        assert_eq!(secret_value("a b\n\n".as_bytes()).unwrap(), "a b\n");
-        assert!(secret_value("\n".as_bytes()).is_err());
-        assert!(secret_name("OPENAI_API_KEY").is_ok());
+    fn values_come_from_stdin_without_the_newline() {
+        assert_eq!(stdin_value("sk-1\n".as_bytes()).unwrap(), "sk-1");
+        assert_eq!(stdin_value("sk-1\r\n".as_bytes()).unwrap(), "sk-1");
+        assert_eq!(stdin_value("a b\n\n".as_bytes()).unwrap(), "a b\n");
+        assert!(stdin_value("\n".as_bytes()).is_err());
+        assert!(env_name("OPENAI_API_KEY").is_ok());
         for bad in ["", "lower", "A/B", "../X", "A B"] {
-            assert!(secret_name(bad).is_err(), "{bad}");
+            assert!(env_name(bad).is_err(), "{bad}");
         }
     }
 }
