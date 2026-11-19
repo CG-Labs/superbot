@@ -32,6 +32,9 @@ pub const NOT_CONFIGURED: &str = "The control plane is not configured on this se
 pub const DEFAULT_TIERS: &str = "starter=g6-standard-1,pro=g6-standard-2,max=g6-standard-4";
 pub const DEFAULT_IMAGE: &str = "linode/ubuntu24.04";
 const DEFAULT_RECONCILE_SECONDS: u64 = 60;
+/// How long after a create that went unanswered a machine may still turn up at the
+/// provider. Linode creates synchronously, so this is generous.
+pub const CREATE_SETTLE_MS: i64 = 15 * 60 * 1000;
 /// The audit actor for what the reconciler does on its own.
 const SYSTEM: &str = "control_plane";
 
@@ -330,10 +333,7 @@ impl ControlPlane {
             plan: m.plan.clone(),
             region: m.region.clone(),
             image: self.image.clone(),
-            tags: vec![
-                self.label_prefix.clone(),
-                format!("{}-user-{}", self.label_prefix, m.user_id),
-            ],
+            tags: vec![m.tag.clone(), format!("{}-user-{}", m.tag, m.user_id)],
             authorized_keys: self.authorized_keys.clone(),
         }
     }
@@ -364,22 +364,26 @@ fn observe(m: &mut Machine, pm: &ProviderMachine) {
     m.backups = pm.backups;
 }
 
-/// Worth trying again by itself, unlike a refusal.
+/// Worth trying again by itself, unlike a refusal: rate limits, the network, timeouts,
+/// and the provider's own outages (5xx).
 fn transient(e: &ProviderError) -> bool {
-    matches!(e, ProviderError::RateLimited | ProviderError::Transport(_))
+    match e {
+        ProviderError::RateLimited | ProviderError::Transport(_) => true,
+        ProviderError::Api { status, .. } => *status == 408 || *status >= 500,
+        ProviderError::NotFound | ProviderError::LabelTaken => false,
+    }
 }
 
-/// The provider's machine with our label, if there is one: what a create whose answer
-/// was lost left behind.
+/// The provider's machine with this one's label, if there is one: what a create whose
+/// answer was lost left behind. Found by the tag saved with the row, not today's prefix.
 async fn by_label(
-    cp: &ControlPlane,
     p: &dyn MachineProvider,
-    label: &str,
+    m: &Machine,
 ) -> Result<Option<ProviderMachine>, ProviderError> {
-    Ok(p.list(&cp.label_prefix)
+    Ok(p.list(&m.tag)
         .await?
         .into_iter()
-        .find(|x| x.label == label))
+        .find(|x| x.label == m.label))
 }
 
 /// Sends a pending machine to the provider. The label makes it idempotent: if the
@@ -392,9 +396,11 @@ async fn provision(
     mut m: Machine,
     by: &Who,
 ) -> Machine {
+    m.create_sent_at = Some(now());
+    app.db.save_machine(&m, m.state);
     let found = match p.create(&cp.spec(&m)).await {
         Ok(pm) => Ok((pm, false)),
-        Err(ProviderError::LabelTaken) => match by_label(cp, p, &m.label).await {
+        Err(ProviderError::LabelTaken) => match by_label(p, &m).await {
             Ok(Some(pm)) => Ok((pm, true)),
             Ok(None) => Err(ProviderError::LabelTaken),
             Err(e) => Err(e),
@@ -420,6 +426,10 @@ async fn provision(
             let retrying = transient(&e);
             if !retrying {
                 m.state = next(from, Step::Fail).unwrap_or(from);
+                if matches!(e, ProviderError::Api { .. }) {
+                    // A refusal made nothing, so a delete needn't wait for it.
+                    m.create_sent_at = None;
+                }
             }
             m.last_error = Some(e.to_string());
             app.db.save_machine(&m, from);
@@ -438,26 +448,30 @@ async fn provision(
 }
 
 /// Deletes a destroying machine at the provider. Until that works it stays
-/// destroying, with the error, and the reconciler tries again.
-async fn finish_destroy(
-    app: &App,
-    cp: &ControlPlane,
-    p: &dyn MachineProvider,
-    mut m: Machine,
-    by: &Who,
-) -> Machine {
+/// destroying, with the error, and the reconciler tries again. One with no provider id
+/// whose create went unanswered stays too, until `CREATE_SETTLE` has passed with
+/// nothing by its label, so a create that lands late is still deleted.
+async fn finish_destroy(app: &App, p: &dyn MachineProvider, mut m: Machine, by: &Who) -> Machine {
     let id = match &m.provider_id {
         Some(id) => Ok(Some(id.clone())),
-        None => by_label(cp, p, &m.label).await.map(|f| f.map(|pm| pm.id)),
+        None => by_label(p, &m).await.map(|f| f.map(|pm| pm.id)),
     };
     let res = match id {
-        Ok(Some(id)) => p.delete(&id).await,
-        Ok(None) => Ok(()),
+        Ok(Some(id)) => p.delete(&id).await.map(|()| true),
+        Ok(None) => Ok(!m
+            .create_sent_at
+            .is_some_and(|t| now() - t < CREATE_SETTLE_MS)),
         Err(e) => Err(e),
     };
     let from = m.state;
     match res {
-        Ok(()) => {
+        Ok(false) => {
+            m.last_error = Some(
+                "Waiting to be sure a create the provider didn't answer made no machine.".into(),
+            );
+            app.db.save_machine(&m, from);
+        }
+        Ok(true) => {
             m.state = next(from, Step::Gone).unwrap_or(from);
             m.destroyed_at = Some(now());
             (m.last_error, m.provider_status, m.ipv4) = (None, None, None);
@@ -498,7 +512,7 @@ async fn reconcile_one(app: &App, cp: &ControlPlane, p: &dyn MachineProvider, id
     let (by, from) = (system(&m), m.state);
     match from {
         State::Pending => provision(app, cp, p, m, &by).await.state != from,
-        State::Destroying => finish_destroy(app, cp, p, m, &by).await.state != from,
+        State::Destroying => finish_destroy(app, p, m, &by).await.state != from,
         State::Provisioning | State::Running | State::Suspended => {
             let Some(pid) = m.provider_id.clone() else {
                 return false;
@@ -828,8 +842,9 @@ pub async fn request(
     })
 }
 
-/// Suspend, resume, or resize: one provider call, then the new state. Repeating one
-/// that is done already changes nothing.
+/// Suspend, resume, or resize. The provider is asked how the machine is first, so a
+/// call whose answer was lost, or a change made at the provider, is neither repeated
+/// nor taken as done when it isn't. Repeating one that is done changes nothing.
 async fn act(
     app: &AppState,
     cp: &ControlPlane,
@@ -847,19 +862,16 @@ async fn act(
             t.clone(),
             cp.plan(t).ok_or_else(|| bad("Unknown tier"))?.to_string(),
         )),
+        (Step::Resize, None) => return Err(bad("Unknown tier")),
         _ => None,
     };
-    let done = match (step, &target) {
-        (Step::Suspend, _) => m.state == State::Suspended,
-        (Step::Resume, _) => m.state == State::Running,
-        (_, Some((t, _))) => *t == m.tier && m.state != State::Error,
-        _ => false,
-    };
-    if done {
-        return Ok(reply(app, StatusCode::OK, &m));
-    }
     let from = m.state;
-    let Some(to) = next(from, step) else {
+    let to = match step {
+        Step::Suspend => State::Suspended,
+        Step::Resume => State::Running,
+        _ => from,
+    };
+    if next(from, step).is_none() && !(to == from && matches!(step, Step::Suspend | Step::Resume)) {
         let verb = match step {
             Step::Suspend => "suspend",
             Step::Resume => "resume",
@@ -869,35 +881,57 @@ async fn act(
             "Can't {verb} a machine that is {}.",
             from.as_str()
         )));
-    };
+    }
     let pid = provider_id(&m)?.to_string();
-    let (action, res, extra) = match (step, &target) {
-        (Step::Suspend, _) => ("machine.suspended", p.shutdown(&pid).await, json!({})),
-        (Step::Resume, _) => ("machine.resumed", p.boot(&pid).await, json!({})),
-        (_, Some((t, plan))) => {
-            let extra =
-                json!({ "fromTier": m.tier, "toTier": t, "fromPlan": m.plan, "toPlan": plan });
-            // Two tiers may share a plan; then only the name changes.
-            let res = if *plan == m.plan {
-                Ok(())
-            } else {
-                p.resize(&pid, plan).await
-            };
-            ("machine.resized", res, extra)
-        }
-        _ => return Err(bad("Unknown action")),
+    let action = match step {
+        Step::Suspend => "machine.suspended",
+        Step::Resume => "machine.resumed",
+        _ => "machine.resized",
     };
-    if let Err(e) = res {
+    let refused = |m: &Machine, e: ProviderError| {
         app.db.record(
             &event(
                 by,
                 action,
-                &m,
+                m,
                 json!({ "error": e.to_string(), "providerId": pid }),
             )
             .outcome(Outcome::Failure),
         );
-        return Ok(failed(app, &e.to_string(), &m));
+        failed(app, &e.to_string(), m)
+    };
+    let pm = match p.get(&pid).await {
+        Ok(pm) => pm,
+        Err(e) => return Ok(refused(&m, e)),
+    };
+    // Already so at the provider; also when two tiers share a plan.
+    let there = match (step, &target) {
+        (Step::Suspend, _) => matches!(pm.status.as_str(), "offline" | "stopped" | "shutting_down"),
+        (Step::Resume, _) => matches!(pm.status.as_str(), "running" | "booting"),
+        (_, Some((_, plan))) => pm.plan == *plan,
+        _ => false,
+    };
+    let recorded = to == from
+        && target
+            .as_ref()
+            .is_none_or(|(t, plan)| *t == m.tier && *plan == m.plan);
+    if there && recorded {
+        return Ok(reply(app, StatusCode::OK, &m));
+    }
+    if !there {
+        let res = match (step, &target) {
+            (Step::Suspend, _) => p.shutdown(&pid).await,
+            (Step::Resume, _) => p.boot(&pid).await,
+            (_, Some((_, plan))) => p.resize(&pid, plan).await,
+            _ => Ok(()),
+        };
+        if let Err(e) = res {
+            return Ok(refused(&m, e));
+        }
+    }
+    let mut extra = json!({ "providerCall": !there });
+    if let Some((t, plan)) = &target {
+        extra = json!({ "fromTier": m.tier, "toTier": t, "fromPlan": m.plan, "toPlan": plan, "providerCall": !there });
     }
     m.state = to;
     if let Some((t, plan)) = target {
@@ -989,7 +1023,7 @@ pub async fn destroy(
             json!({ "was": from, "userEmail": u.email }),
         ));
     }
-    let m = finish_destroy(&app, cp, p, m, &by).await;
+    let m = finish_destroy(&app, p, m, &by).await;
     Ok(reply(
         &app,
         if m.state == State::Destroyed {

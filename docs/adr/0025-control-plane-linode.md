@@ -38,10 +38,12 @@ A new `machines` table (migration 9). One row per machine, keyed by an opaque id
 | `user_id` | The user it belongs to (`users.id`). Every query names the user or the machine. |
 | `provider`, `provider_id` | `linode` and the Linode id, once created. |
 | `label` | `<prefix>-<id>`, unique per Linode account. The idempotency key (below). |
+| `tag` | The label prefix when the row was saved. The machine is tagged with it and looked up by it, so changing `MACHINE_LABEL_PREFIX` later can't lose a machine. |
 | `tier`, `plan`, `region` | The tier asked for, the Linode plan it maps to now, and the region. |
 | `state` | Our lifecycle state (below). |
 | `provider_status`, `ipv4`, `backups` | What Linode last said: its own status word, the public IPv4, whether backups are on. |
 | `last_error` | The last provider error, if the last attempt failed. |
+| `create_sent_at` | When a create was last sent. Cleared when Linode refuses it. |
 | `created_at`, `created_by`, `updated_at`, `destroyed_at` | Bookkeeping. |
 
 A partial unique index on `user_id WHERE state <> 'destroyed'` is the rule "one machine per user". Destroyed rows stay as history.
@@ -76,7 +78,7 @@ The provider's status is stored beside our state, not mixed into it. A machine i
 
 ### Tiers, regions and the image are config
 
-Tiers map to Linode plans in `MACHINE_TIERS=starter=g6-standard-1,pro=g6-standard-2,max=g6-standard-4` (the default; the first is the default tier). Changing the mapping changes what new machines and resizes get. It never resizes existing machines by itself.
+Tiers map to Linode plans in `MACHINE_TIERS=starter=g6-standard-1,pro=g6-standard-2,max=g6-standard-4` (the default; the first is the default tier). Changing the mapping changes what new machines and resizes get. It never resizes existing machines by itself; resizing a machine to its own tier moves it to the tier's new plan.
 
 Other settings:
 
@@ -92,18 +94,20 @@ All are checked at startup: a bad value stops botd, like other settings.
 ### Idempotency
 
 - **Same request twice.** `POST /api/users/:user/machine` returns the user's live machine with 200 instead of making another. The unique index makes that true even if two requests race past the check. Asking for a *different* tier or region is a 409: that is a resize, not a retry.
-- **Lost answers.** Each machine's Linode label is fixed when the row is saved, before Linode is called. If a create reached Linode but its answer was lost (timeout, crash), the next attempt gets "label must be unique". The control plane then lists machines with its tag, finds the one with its label, and adopts it. It never makes a second.
+- **Lost answers.** Each machine's Linode label is fixed when the row is saved, before Linode is called. If a create reached Linode but its answer was lost (timeout, crash), the next attempt gets "label must be unique". The control plane then lists machines with the row's tag, finds the one with its label, and adopts it. It never makes a second.
+- **Late creates.** A create that went unanswered may still make a machine. If such a row is destroyed before the machine shows up, it stays `destroying` for 15 minutes after the create was sent, looking for the label on each pass and deleting what it finds. Only then is it `destroyed`.
 - **Serialised changes.** Handlers and the reconciler take one async lock per change. Every save is also a compare-and-set on the old state (`UPDATE … WHERE state = ?`), so a stale change loses instead of overwriting.
-- **Repeats are no-ops.** Suspending a suspended machine, resuming a running one, or resizing to the current tier returns 200 and records nothing.
+- **Actions check Linode first.** Suspend, resume and resize read the machine at Linode before acting. If it is already off, on, or on the plan, no call is made and only our state is updated. So a call whose answer was lost is neither repeated nor wrongly taken as done.
+- **Repeats are no-ops.** Suspending a suspended machine, resuming a running one, or resizing to the current tier and plan returns 200 and records nothing, when Linode agrees.
 
 ### Reconciliation
 
 A background loop (every `MACHINE_RECONCILE_SECONDS`, and on `POST /api/machines/reconcile`) visits each machine that isn't `destroyed` or `error`:
 
-- **pending:** try the create again. Rate limits and network errors leave a machine pending with `last_error`. Linode refusals put it in `error`.
+- **pending:** try the create again. Rate limits, network errors, timeouts and Linode outages (5xx) leave a machine pending with `last_error`. Linode refusals (other 4xx) put it in `error`.
 - **provisioning:** mark it running once Linode says so.
 - **running and suspended:** record Linode's status, address and backups. Turn backups on if they should be. If Linode doesn't have it any more, it goes to `error` (`machine.lost`).
-- **destroying:** retry the delete until it works.
+- **destroying:** retry the delete until it works, and wait out late creates (above).
 
 The reconciler never boots or shuts down a machine to undo a change made in the Linode console. It records what it sees and leaves the decision to an admin. Machines in `error` wait for an admin.
 

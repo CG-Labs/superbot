@@ -344,6 +344,9 @@ pub struct Machine {
     pub provider_id: Option<String>,
     /// Unique at the provider: `<prefix>-<id>`. Creating twice can't make two.
     pub label: String,
+    /// The provider tag it is created with and found by: the label prefix when it was
+    /// saved, so changing MACHINE_LABEL_PREFIX later can't lose it.
+    pub tag: String,
     pub tier: String,
     pub plan: String,
     pub region: String,
@@ -353,6 +356,8 @@ pub struct Machine {
     pub ipv4: Option<String>,
     pub backups: bool,
     pub last_error: Option<String>,
+    /// When a create was last sent. One that went unanswered may still make a machine.
+    pub create_sent_at: Option<i64>,
     pub created_at: i64,
     pub created_by: Option<String>,
     pub updated_at: i64,
@@ -383,6 +388,7 @@ fn machine_row(r: &Row) -> rusqlite::Result<Machine> {
         provider: r.get("provider")?,
         provider_id: r.get("provider_id")?,
         label: r.get("label")?,
+        tag: r.get("tag")?,
         tier: r.get("tier")?,
         plan: r.get("plan")?,
         region: r.get("region")?,
@@ -392,6 +398,7 @@ fn machine_row(r: &Row) -> rusqlite::Result<Machine> {
         ipv4: r.get("ipv4")?,
         backups: r.get("backups")?,
         last_error: r.get("last_error")?,
+        create_sent_at: r.get("create_sent_at")?,
         created_at: r.get("created_at")?,
         created_by: r.get("created_by")?,
         updated_at: r.get("updated_at")?,
@@ -639,6 +646,7 @@ fn migrate_machines(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
           provider TEXT NOT NULL,
           provider_id TEXT,
           label TEXT NOT NULL UNIQUE,
+          tag TEXT NOT NULL,
           tier TEXT NOT NULL,
           plan TEXT NOT NULL,
           region TEXT NOT NULL,
@@ -647,6 +655,7 @@ fn migrate_machines(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
           ipv4 TEXT,
           backups INTEGER NOT NULL DEFAULT 0,
           last_error TEXT,
+          create_sent_at INTEGER,
           created_at INTEGER NOT NULL,
           created_by TEXT,
           updated_at INTEGER NOT NULL,
@@ -1938,9 +1947,9 @@ impl Db {
         let id = format!("m{}", crate::short_id());
         let at = now();
         let res = self.c().execute(
-            "INSERT INTO machines (id, user_id, provider, label, tier, plan, region, state, created_at, created_by, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?8)",
-            params![id, n.user_id, n.provider, format!("{}-{id}", n.label_prefix), n.tier, n.plan, n.region, at, n.created_by],
+            "INSERT INTO machines (id, user_id, provider, label, tag, tier, plan, region, state, created_at, created_by, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, ?10, ?9)",
+            params![id, n.user_id, n.provider, format!("{}-{id}", n.label_prefix), n.label_prefix, n.tier, n.plan, n.region, at, n.created_by],
         );
         match res {
             Ok(_) => self.machine(&id).ok_or_else(|| AddMachine::Db("the new machine wasn't saved".into())),
@@ -1971,7 +1980,7 @@ impl Db {
         self.c()
             .execute(
                 "UPDATE machines SET provider_id = ?, tier = ?, plan = ?, region = ?, state = ?, provider_status = ?, ipv4 = ?, backups = ?,
-                 last_error = ?, updated_at = ?, destroyed_at = ? WHERE id = ? AND state = ?",
+                 last_error = ?, create_sent_at = ?, updated_at = ?, destroyed_at = ? WHERE id = ? AND state = ?",
                 params![
                     m.provider_id,
                     m.tier,
@@ -1982,6 +1991,7 @@ impl Db {
                     m.ipv4,
                     m.backups,
                     m.last_error,
+                    m.create_sent_at,
                     now(),
                     m.destroyed_at,
                     m.id,

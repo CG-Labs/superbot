@@ -69,6 +69,11 @@ impl Fake {
         id
     }
 
+    /// Changed behind the control plane's back, e.g. by a call whose answer was lost.
+    pub fn set(&self, id: &str, f: impl FnOnce(&mut ProviderMachine)) {
+        f(self.state.lock().unwrap().machines.get_mut(id).unwrap());
+    }
+
     /// Deleted behind the control plane's back.
     pub fn remove(&self, id: &str) {
         self.state.lock().unwrap().machines.remove(id);

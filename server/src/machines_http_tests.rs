@@ -749,3 +749,194 @@ async fn disabled_users_get_no_machine() {
     assert_eq!(code, 409, "{v}");
     assert_eq!((fake.calls("create"), app.db.machines(None).len()), (0, 0));
 }
+
+#[tokio::test]
+async fn power_and_size_follow_the_provider() {
+    let (port, app, admin, _, fake) = serve().await;
+    let (uid, _) = user_with(port, &admin, "ada@example.com", "member").await;
+    let base = format!("/api/users/{uid}/machine");
+    let act = |a: &str| format!("{base}/{a}");
+    assert_eq!(json_call(port, "POST", &base, &admin, "").await.0, 202);
+    reconcile(port, &admin).await;
+    let pid = app.db.user_machine(&uid).unwrap().provider_id.unwrap();
+
+    // A shutdown the provider took but whose answer was lost: still "running" here.
+    fake.set(&pid, |m| m.status = "offline".into());
+    let (code, m) = json_call(port, "POST", &act("resume"), &admin, "").await;
+    assert_eq!((code, m["state"].as_str()), (200, Some("running")), "{m}");
+    assert_eq!(fake.calls("boot"), 1, "booted, not taken as done");
+
+    // And the reverse: off at the provider already, so suspending only records it.
+    fake.set(&pid, |m| m.status = "offline".into());
+    let (code, m) = json_call(port, "POST", &act("suspend"), &admin, "").await;
+    assert_eq!((code, m["state"].as_str()), (200, Some("suspended")));
+    assert_eq!(fake.calls("shutdown"), 0);
+    let ev = events(port, &admin, "machine.suspended").await;
+    assert_eq!(ev[0]["details"]["providerCall"].as_bool(), Some(false));
+
+    // Booted at the provider while suspended here: suspending again powers it off.
+    fake.set(&pid, |m| m.status = "running".into());
+    let (code, m) = json_call(port, "POST", &act("suspend"), &admin, "").await;
+    assert_eq!((code, m["state"].as_str()), (200, Some("suspended")));
+    assert_eq!(fake.calls("shutdown"), 1);
+
+    // A tier whose plan changed in MACHINE_TIERS is resized to the new plan.
+    let mut saved = app.db.user_machine(&uid).unwrap();
+    saved.plan = "g6-standard-old".into();
+    assert!(app.db.save_machine(&saved, State::Suspended));
+    let (code, m) = json_call(
+        port,
+        "POST",
+        &act("resize"),
+        &admin,
+        r#"{"tier":"starter"}"#,
+    )
+    .await;
+    assert_eq!(
+        (code, m["plan"].as_str()),
+        (200, Some("g6-standard-1")),
+        "{m}"
+    );
+    assert_eq!(
+        fake.calls("resize"),
+        0,
+        "the provider had that plan already"
+    );
+    fake.set(&pid, |m| m.plan = "g6-standard-old".into());
+    let mut saved = app.db.user_machine(&uid).unwrap();
+    saved.plan = "g6-standard-old".into();
+    assert!(app.db.save_machine(&saved, State::Suspended));
+    json_call(
+        port,
+        "POST",
+        &act("resize"),
+        &admin,
+        r#"{"tier":"starter"}"#,
+    )
+    .await;
+    assert_eq!(fake.calls("resize"), 1);
+    assert_eq!(
+        fake.machines()[0].plan,
+        "g6-standard-1",
+        "moved to the new plan"
+    );
+}
+
+#[tokio::test]
+async fn outages_retry_and_late_creates_are_deleted() {
+    let (port, app, admin, _, fake) = serve().await;
+    let (uid, _) = user_with(port, &admin, "ada@example.com", "member").await;
+    let base = format!("/api/users/{uid}/machine");
+
+    // A 503 from the provider is an outage, not a refusal: it stays pending.
+    fake.fail_next(
+        "create",
+        ProviderError::Api {
+            status: 503,
+            message: "Service unavailable".into(),
+        },
+    );
+    let (code, m) = json_call(port, "POST", &base, &admin, "").await;
+    assert_eq!((code, m["state"].as_str()), (202, Some("pending")), "{m}");
+    // So does an outage while looking for the machine a lost create made.
+    let label = m["label"].as_str().unwrap().to_string();
+    let orphan = fake.insert(&label, "g6-standard-1", "gb-lon", &["superbot"]);
+    fake.fail_next(
+        "list",
+        ProviderError::Api {
+            status: 502,
+            message: "Bad gateway".into(),
+        },
+    );
+    reconcile(port, &admin).await;
+    assert_eq!(app.db.user_machine(&uid).unwrap().state, State::Pending);
+    reconcile(port, &admin).await;
+    let saved = app.db.user_machine(&uid).unwrap();
+    assert_eq!(
+        (saved.state, saved.provider_id.as_deref()),
+        (State::Provisioning, Some(orphan.as_str()))
+    );
+    assert_eq!(json_call(port, "DELETE", &base, &admin, "").await.0, 200);
+
+    // A create left unanswered, then deleted before the machine shows up: it stays
+    // destroying, and the late machine is deleted when it does.
+    fake.fail_next("create", ProviderError::Transport("timed out".into()));
+    let (_, m) = json_call(port, "POST", &base, &admin, "").await;
+    let label = m["label"].as_str().unwrap().to_string();
+    let (code, m) = json_call(port, "DELETE", &base, &admin, "").await;
+    assert_eq!(
+        (code, m["state"].as_str()),
+        (202, Some("destroying")),
+        "{m}"
+    );
+    assert!(m["lastError"].as_str().unwrap().contains("didn't answer"));
+    let late = fake.insert(&label, "g6-standard-1", "gb-lon", &["superbot"]);
+    reconcile(port, &admin).await;
+    assert!(fake.machines().iter().all(|x| x.id != late), "deleted");
+    assert!(app.db.user_machine(&uid).is_none());
+
+    // Once it has had time to show up and hasn't, the row is done.
+    fake.fail_next("create", ProviderError::Transport("timed out".into()));
+    json_call(port, "POST", &base, &admin, "").await;
+    assert_eq!(json_call(port, "DELETE", &base, &admin, "").await.0, 202);
+    let mut saved = app.db.user_machine(&uid).unwrap();
+    saved.create_sent_at = Some(crate::db::now() - crate::machines::CREATE_SETTLE_MS - 1);
+    assert!(app.db.save_machine(&saved, State::Destroying));
+    reconcile(port, &admin).await;
+    assert!(app.db.user_machine(&uid).is_none());
+
+    // A refusal made nothing, so its row needn't wait.
+    fake.fail_next(
+        "create",
+        ProviderError::Api {
+            status: 400,
+            message: "region: not here".into(),
+        },
+    );
+    assert_eq!(json_call(port, "POST", &base, &admin, "").await.0, 502);
+    assert_eq!(json_call(port, "DELETE", &base, &admin, "").await.0, 200);
+}
+
+#[tokio::test]
+async fn machines_are_found_by_their_own_tag() {
+    let (port, app, admin, _, fake) = serve().await;
+    let (uid, _) = user_with(port, &admin, "ada@example.com", "member").await;
+    // Saved under an older MACHINE_LABEL_PREFIX, before a create whose answer was lost.
+    let m = app
+        .db
+        .add_machine(&crate::db::NewMachine {
+            user_id: &uid,
+            provider: "fake",
+            label_prefix: "oldbot",
+            tier: "starter",
+            plan: "g6-standard-1",
+            region: "gb-lon",
+            created_by: None,
+        })
+        .unwrap();
+    assert_eq!(m.tag, "oldbot");
+    let orphan = fake.insert(&m.label, "g6-standard-1", "gb-lon", &["oldbot"]);
+    reconcile(port, &admin).await;
+    let saved = app.db.user_machine(&uid).unwrap();
+    assert_eq!(
+        saved.provider_id.as_deref(),
+        Some(orphan.as_str()),
+        "adopted"
+    );
+    assert_eq!(fake.machines().len(), 1);
+
+    // And deleted by it too, when the provider id was never saved.
+    let mut saved = saved;
+    saved.provider_id = None;
+    assert!(app.db.save_machine(&saved, State::Provisioning));
+    let (code, v) = json_call(
+        port,
+        "DELETE",
+        &format!("/api/users/{uid}/machine"),
+        &admin,
+        "",
+    )
+    .await;
+    assert_eq!(code, 200, "{v}");
+    assert!(fake.machines().is_empty(), "not left running and billed");
+}

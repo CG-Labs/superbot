@@ -216,7 +216,7 @@ For CG-Labs managed hosting: botd can rent one Linode per user and track it. **O
 
 - **Turn on**: `LINODE_TOKEN` (or `LINODE_TOKEN_FILE`; a Linode personal access token with Linodes read/write) and `MACHINE_REGIONS` (e.g. `gb-lon,de-fra-2`; the first is the default). botd refuses to start with a token and no regions.
 - **Tiers**: `MACHINE_TIERS=starter=g6-standard-1,pro=g6-standard-2,max=g6-standard-4` (the default) maps tier names to Linode plans; the first is the default tier.
-- **Other settings**: `MACHINE_IMAGE` (`linode/ubuntu24.04`), `MACHINE_BACKUPS` (`on`), `MACHINE_LABEL_PREFIX` (`superbot`; every label starts with it and every machine is tagged with it), `MACHINE_AUTHORIZED_KEYS` (comma-separated SSH public keys for operators), `MACHINE_RECONCILE_SECONDS` (`60`).
+- **Other settings**: `MACHINE_IMAGE` (`linode/ubuntu24.04`), `MACHINE_BACKUPS` (`on`), `MACHINE_LABEL_PREFIX` (`superbot`; every label starts with it and every machine is tagged with it; each machine keeps the prefix it was made with), `MACHINE_AUTHORIZED_KEYS` (comma-separated SSH public keys for operators), `MACHINE_RECONCILE_SECONDS` (`60`).
 - **What it does**: an admin requests a machine for a user; botd creates it (label `<prefix>-<machine id>`, so a retry never makes a second), then a reconciler marks it running, turns on backups, and finishes deletes. States: `pending`, `provisioning`, `running`, `suspended`, `destroying`, `destroyed`, `error`. Suspend powers it off; Linode still bills a powered-off machine.
 - **Audit**: `machine.requested`, `machine.created`, `machine.running`, `machine.backups_enabled`, `machine.suspended`, `machine.resumed`, `machine.resized`, `machine.destroy_requested`, `machine.destroyed`, `machine.retried`, and failures (`machine.create_failed`, `machine.lost`, `machine.destroy_failed`, `machine.backups_failed`, or the action with outcome `failure`). The admin is the actor; the reconciler acts as `system:control_plane` on behalf of the user.
 - **Not yet**: botd doesn't talk to the machines themselves (enrollment and mTLS), move a user's Bots onto theirs, or tie tiers to billing.
@@ -262,9 +262,9 @@ Per-user machines ([ADR 0025](adr/0025-control-plane-linode.md)). 503 when the c
 
 - `GET /api/machine`: the caller's own machine `{id, tier, region, state, providerStatus, ipv4, backups, createdAt, updatedAt}`; 404 if none. Never anyone else's
 - `GET /api/machines?state=`: every machine, destroyed ones too, newest first
-- `GET /api/users/:id-or-email/machine`: the user's live machine `{id, userId, userEmail, provider, providerId, label, tier, plan, region, state, providerStatus, ipv4, backups, lastError, createdAt, createdBy, updatedAt, destroyedAt}`; 404 if none
+- `GET /api/users/:id-or-email/machine`: the user's live machine `{id, userId, userEmail, provider, providerId, label, tag, tier, plan, region, state, providerStatus, ipv4, backups, lastError, createSentAt, createdAt, createdBy, updatedAt, destroyedAt}`; 404 if none
 - `POST /api/users/:id-or-email/machine` `{tier?, region?}`: 202 on its way. Asking again returns the same machine (200); another tier or region is a 409 (resize instead). After an error, asking again retries. 502 `{error, machine}` if Linode refused; 409 for a disabled user
-- `POST /api/users/:id-or-email/machine/suspend`, `/resume`, `/resize` `{tier}`: 200 with the machine (a repeat changes nothing), 409 from the wrong state, 502 `{error, machine}` if Linode refused
+- `POST /api/users/:id-or-email/machine/suspend`, `/resume`, `/resize` `{tier}`: 200 with the machine (Linode is checked first, so a repeat, or a change already made there, calls nothing; resizing to the same tier applies a changed plan), 409 from the wrong state, 502 `{error, machine}` if Linode refused
 - `DELETE /api/users/:id-or-email/machine`: 200 once deleted at Linode, 202 while it retries
 - `POST /api/machines/reconcile` → `{checked, changed}`: one reconciler pass now
 
