@@ -1015,6 +1015,17 @@ mod tests {
     }
 
     #[test]
+    fn apple_says_why_it_isnt_offered() {
+        let s = with_base(&[("SSO_PROVIDERS", "applekey"), ("SSO_PUBLIC_URL", "https://bot.example.com"), ("SSO_APPLEKEY_TYPE", "apple"), ("SSO_APPLEKEY_CLIENT_ID", "com.example.superbot.web"), ("SSO_APPLEKEY_TEAM_ID", "TEAM123456"), ("SSO_APPLEKEY_KEY_ID", "KEY1234567")], &[]).unwrap();
+        let p = s.provider("applekey").unwrap();
+        assert!(p.not_ready().unwrap().contains("until SSO_APPLEKEY_PRIVATE_KEY is set"));
+        crate::secrets::global().put("SSO_APPLEKEY_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----\nnope\n-----END PRIVATE KEY-----").unwrap();
+        assert!(p.not_ready().unwrap().contains("isn't a Sign in with Apple key"));
+        crate::secrets::global().put("SSO_APPLEKEY_PRIVATE_KEY", &apple::test_key::p8().0).unwrap();
+        assert!(p.not_ready().is_none() && p.ready());
+    }
+
+    #[test]
     fn refuses_apple_settings_that_are_missing_or_would_let_strangers_in() {
         for (vars, why) in [
             (vec![("SSO_APPLE_TEAM_ID", "")], "no team id"),

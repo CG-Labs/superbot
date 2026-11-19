@@ -272,9 +272,16 @@ impl Provider {
 
     /// Offered on the sign-in page: it has its client secret (Apple: a key that parses).
     pub fn ready(&self) -> bool {
+        self.not_ready().is_none()
+    }
+
+    /// Why the provider isn't offered, for the startup log.
+    pub fn not_ready(&self) -> Option<String> {
+        let var = self.env_var();
         match (&self.kind, self.stored_secret()) {
-            (Kind::Apple { .. }, Some(key)) => apple::signing_key(key.expose()).is_ok(),
-            (_, s) => s.is_some(),
+            (_, None) => Some(format!("not offered until {var} is set (env, _FILE, or `botctl secret set`)")),
+            (Kind::Apple { .. }, Some(key)) if apple::signing_key(key.expose()).is_err() => Some(format!("not offered: {var} isn't a Sign in with Apple key (the .p8 file)")),
+            _ => None,
         }
     }
 
