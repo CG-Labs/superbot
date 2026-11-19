@@ -135,7 +135,7 @@ CSV export is RFC 4180 with CRLF line endings, oldest first. Cells that start wi
 
 ## Users, sessions, and roles
 
-People are users with a role: **admin** (everything), **member** (use and manage Bots and routines, decide approvals), or **read-only** (see everything, change nothing). Admins also manage policy, the audit log, users, and sessions. One check per API route enforces it; unknown routes are admin-only. Design: [ADR 0012](adr/0012-users-sessions-rbac.md).
+People are users with a role: **admin** (everything), **member** (use and manage Bots and routines, decide approvals), or **read-only** (see everything, change nothing). Admins also manage policy, the audit log, users, sessions, and saved secrets. One check per API route enforces it; unknown routes are admin-only. Design: [ADR 0012](adr/0012-users-sessions-rbac.md).
 
 - **Owner**: made on first start as admin `operator` (name `USER_NAME`, email `OWNER_EMAIL`). `AUTH_PASSWORD` signs in as the owner (break-glass) while `AUTH_BREAK_GLASS` is on, the default. Set `AUTH_BREAK_GLASS=0` to ignore the password once admins sign in another way.
 - **Everyone else**: an admin adds them and gives them a one-time sign-in code, which they enter in the web app or client. Codes are single use and expire (default 1 hour). SSO (OIDC) is next.
@@ -184,7 +184,7 @@ Approvals, policy, and audit. Writes, decisions, the approvals list, and the aud
 - `POST /api/approvals/check` `{from, harness, event}`: the hook's call. Waits for a decision. Replies `allow` or `deny`, then the reason, as plain text
 - `GET /api/audit?from=&to=&action=&actor=&outcome=&bot=&limit=&before=<id>`: audit events, newest first, `{events, nextBefore}`. `from`/`to`: unix ms, RFC 3339, or `YYYY-MM-DD`. `action`: exact or `prefix.*`, comma-separated. `actor`: `user`, `bot`, or `system`, optionally `:<id>`. `limit` 1 to 1000, default 100
 - `GET /api/audit/export.csv` (same filters): CSV download, oldest first
-- `GET /api/secrets`: `{secrets: [{name, store, writable, shadowedBy}]}`, names only. `PUT /api/secrets/:name` `{value}`, `DELETE /api/secrets/:name`. Person only
+- `GET /api/secrets`: `{secrets: [{name, store, writable, shadowedBy}]}`, names only. `PUT /api/secrets/:name` `{value}`, `DELETE /api/secrets/:name`. Admin only
 
 ## Not built yet
 

@@ -18,7 +18,7 @@ SuperBot is a **team of AI coworkers**—each with memory, routines, and a Linux
 | Segment | Need | Fit today | Gaps |
 |--------|------|-----------|------|
 | **Technical solopreneur / founder** | Personal VPS, one password, one harness | Strong (install + client + approvals) | Client branding |
-| **Small team (5–30)** | Shared instance, several humans, least privilege | Weak | SSO, multi-user, RBAC, per-user computers |
+| **Small team (5–30)** | Shared instance, several humans, least privilege | Basic (users, roles, sessions) | SSO, bot ACLs, per-user computers |
 | **Growth company (30–500)** | Managed hosting, billing, SSO, support | None | Control plane, per-user tiers |
 | **Enterprise (500+)** | Entra/Google/Okta SSO, SCIM, SOC 2, UK/EU residency, procurement | None | Full enterprise pillar |
 
@@ -273,7 +273,7 @@ No certification claims until audits complete.
 | Horizon | Focus |
 |---------|--------|
 | **Now** | Finish M1: EAS `projectId`, brand assets; approvals follow-ups ([list](approvals-followups.md)); owner to accept ADR 0011 and confirm the interface proposal |
-| **Next** | Multi-user data model; SSO with Apple, GitHub, Entra, Google, generic OIDC; RBAC v1; Hermes adapter |
+| **Next** | M2: SSO with Apple, GitHub, Entra, Google, generic OIDC on the new user model (slice 1, [ADR 0012](adr/0012-users-sessions-rbac.md)); bot ACLs; Hermes adapter |
 | **Later** | Linode control plane with one machine per user; per-user tiers and hidden model routing; public launch + stores; SCIM; SOC 2 |
 
 ---
