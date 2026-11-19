@@ -3,6 +3,7 @@ import type {
   AdminUser,
   AppState,
   Approval,
+  AuditPage,
   BotAccessView,
   BotView,
   LoginCode,
@@ -108,19 +109,24 @@ export class SuperBotApi {
     return !!(this.cfg.token || this.cfg.cookie);
   }
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async send(method: string, path: string, body?: unknown): Promise<Response> {
     const res = await fetch(`${this.baseUrl}${path}`, {
       method,
       headers: this.headers(body !== undefined),
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
-    const data = await res.json().catch(() => ({}));
     if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
       if (res.status === 401 && this.hasSession) this.onSessionEnded?.();
       const msg = (data as { error?: string }).error ?? `HTTP ${res.status}`;
       throw new ApiError(msg, res.status);
     }
-    return data as T;
+    return res;
+  }
+
+  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const res = await this.send(method, path, body);
+    return (await res.json().catch(() => ({}))) as T;
   }
 
   async verify(): Promise<AppState> {
@@ -281,6 +287,22 @@ export class SuperBotApi {
   /** The reason is for admins; nobody is told. */
   async rejectSignup(id: string, reason?: string): Promise<SignupRequest> {
     return this.request<SignupRequest>("POST", `/api/signups/${encodeURIComponent(id)}/reject`, { reason: reason || null });
+  }
+
+  // The audit log: admins only (ADR 0009, 0019). `query` comes from `auditQuery`.
+
+  async audit(query: string, before?: number | null, limit = 100): Promise<AuditPage> {
+    const page = [query, before != null && `before=${before}`, `limit=${limit}`].filter(Boolean).join("&");
+    return this.request<AuditPage>("GET", `/api/audit?${page}`);
+  }
+
+  /**
+   * The filtered log as CSV, oldest first. Fetched with this session's credentials
+   * rather than linked, since a bearer token can't ride on a plain link.
+   */
+  async auditCsv(query: string): Promise<string> {
+    const res = await this.send("GET", `/api/audit/export.csv${query ? `?${query}` : ""}`);
+    return res.text();
   }
 
   eventsUrl(): string {
