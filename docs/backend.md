@@ -211,8 +211,8 @@ botctl scim tokens | botctl scim token revoke <id>
 - **Tenants**: each token belongs to a tenant (one IdP connection), which sees only the users it provisioned. Only token hashes are stored. Session tokens and the password don't work on `/scim/v2`, and SCIM tokens don't work on `/api`.
 - **One user per person**: with `--sso`, provisioning links the person's SSO identity, or takes on the user an admin already linked it to. Email never matches: a user with the same email is a 409. Never the owner account.
 - **Deprovisioning**: `active: false` disables the user and ends their sessions. `DELETE` does the same and hides the user from the tenant; nothing is destroyed, and the same `externalId` brings the same user back.
-- **Limits**: 600 requests a minute per tenant, 20 bad tokens per IP in 10 minutes, 64 KiB bodies, 200 users per page.
-- **Audit**: actor `system` `scim:<token id>`, method `scim_token`. `user.created` (`reason: scim`), `user.updated`, `user.disabled`, `user.enabled`, `user.identity_linked`, `scim.user_linked`, `scim.user_deleted`, `scim.user_restored`, `scim.token_created`, `scim.token_revoked`, `scim.auth_failed` (throttled).
+- **Limits**: 600 requests a minute per tenant, 20 bad tokens per IP in 10 minutes (then that IP's bad tokens get 429; a valid token from it still works, [ADR 0026](adr/0026-scim-review-hardening.md)), 64 KiB bodies, 200 users per page.
+- **Audit**: actor `system` `scim:<token id>`, method `scim_token`. `user.created` (`reason: scim`), `user.updated`, `user.disabled`, `user.enabled`, `user.identity_linked`, `scim.user_linked`, `scim.user_deleted`, `scim.user_restored`, `scim.token_created`, `scim.token_revoked`, `scim.auth_failed` (throttled; `reason` is `missing`, `unknown`, or `revoked`, with the revoked token as target). A SCIM token sent to `/api` is logged as `auth.login_failed` with method `scim_token`.
 
 ### Shared and private Bots
 
