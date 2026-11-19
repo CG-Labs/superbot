@@ -4,10 +4,12 @@ on:
   push:
     paths:
       - "apps/client/**"
+      - "web/index.html"
       - ".github/workflows/client.yml"
   pull_request:
     paths:
       - "apps/client/**"
+      - "web/index.html"
       - ".github/workflows/client.yml"
 
 permissions:
@@ -30,4 +32,6 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test
+      - run: npm run brand:test
+      - run: npm run brand:check
       - run: npm run build:web

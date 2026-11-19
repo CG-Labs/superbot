@@ -17,7 +17,7 @@ SuperBot is a **team of AI coworkers**—each with memory, routines, and a Linux
 
 | Segment | Need | Fit today | Gaps |
 |--------|------|-----------|------|
-| **Technical solopreneur / founder** | Personal VPS, one password, one harness | Strong (install + client + approvals) | Client branding |
+| **Technical solopreneur / founder** | Personal VPS, one password, one harness | Strong (install + client + approvals) | Client branding (in review) |
 | **Small team (5–30)** | Shared instance, several humans, least privilege | Basic (users, roles, sessions) | SSO, bot ACLs, per-user computers |
 | **Growth company (30–500)** | Managed hosting, billing, SSO, support | None | Control plane, per-user tiers |
 | **Enterprise (500+)** | Entra/Google/Okta SSO, SCIM, SOC 2, UK/EU residency, procurement | None | Full enterprise pillar |
@@ -54,7 +54,7 @@ What exists in **CG-Labs/superbot** today:
 | Area | Reality |
 |------|---------|
 | **Auth** | Users in SQLite with roles (admin, member, read-only) enforced per API route; server-side sessions (HttpOnly cookie for `web/`, bearer token for the client and `botctl`) with idle and absolute TTLs, logout, and admin revoke; one-time sign-in codes from an admin; `AUTH_PASSWORD` kept as break-glass owner login (`AUTH_BREAK_GLASS`, on by default) ([ADR 0012](adr/0012-users-sessions-rbac.md)). `ALLOW_NO_AUTH` on loopback only; `ALLOWED_HOSTS`; per-start `BOT_TOKEN` for `botctl`. No SSO yet. Sign-ins, revokes, and user changes are audited. |
-| **Client** | Login, SSE chat, bots CRUD, models/effort, routine create/edit/delete, live screen viewer (iframe / WebView) with take over, handoff cards and alerts; no audit log viewer, push, or biometric lock; placeholder EAS `projectId`; template branding. |
+| **Client** | Login, SSE chat, bots CRUD, models/effort, routine create/edit/delete, live screen viewer (iframe / WebView) with take over, handoff cards and alerts; no audit log viewer, push, or biometric lock; placeholder EAS `projectId`; SuperBot icons, splash and store art in review ([PR #62](https://github.com/CG-Labs/superbot/pull/62)). |
 | **Server** | SQLite single-tenant schema; harnesses run with their own prompts off, gated by the SuperBot **policy engine and approval queue** (default **ask** on fresh installs; [ADR 0007](adr/0007-approvals.md)); append-only **audit events** for admin actions with CSV export (`/api/audit`, `botctl audit export`, web Audit log; [ADR 0009](adr/0009-audit-events.md)). **Secrets** from env/`_FILE` or saved encrypted in SQLite (XChaCha20-Poly1305, master key outside `DATA_DIR`), redacted from chats, events, and audit ([ADR 0010](adr/0010-secrets.md)); external vaults not built (trait seam only). |
 | **Harnesses** | Claude Code, Codex, Pi adapters. Hermes Agent adapter proposed ([ADR 0011](adr/0011-hermes-agent-backend.md)). |
 | **Deploy** | Ubuntu bash installer (piped-install fix merged, [#3](https://github.com/CG-Labs/superbot/pull/3)), systemd, Caddy, daily SQLite backup timer; Docker Compose (`Dockerfile` + `deploy/docker/`: `botd`, Caddy, backup sidecar), smoke-tested in CI ([ADR 0006](adr/0006-docker-compose.md)). |
@@ -102,9 +102,9 @@ Basic auth may remain for **break-glass** and **self-host hobby** tiers only, be
 
 | | |
 |--|--|
-| **Status** | **Merged:** installer fix ([#3](https://github.com/CG-Labs/superbot/pull/3)), Docker Compose ([#6](https://github.com/CG-Labs/superbot/pull/6), [ADR 0006](adr/0006-docker-compose.md)), approvals + harness policy ([#5](https://github.com/CG-Labs/superbot/pull/5), [ADR 0007](adr/0007-approvals.md)), client routine editor / screen viewer / handoff ([#7](https://github.com/CG-Labs/superbot/pull/7), [ADR 0008](adr/0008-client-screen-auth.md)), audit events + CSV ([#8](https://github.com/CG-Labs/superbot/pull/8), [ADR 0009](adr/0009-audit-events.md)), secrets store ([#9](https://github.com/CG-Labs/superbot/pull/9), [ADR 0010](adr/0010-secrets.md)). **Remaining:** real EAS `projectId`, brand assets. |
+| **Status** | **Merged:** installer fix ([#3](https://github.com/CG-Labs/superbot/pull/3)), Docker Compose ([#6](https://github.com/CG-Labs/superbot/pull/6), [ADR 0006](adr/0006-docker-compose.md)), approvals + harness policy ([#5](https://github.com/CG-Labs/superbot/pull/5), [ADR 0007](adr/0007-approvals.md)), client routine editor / screen viewer / handoff ([#7](https://github.com/CG-Labs/superbot/pull/7), [ADR 0008](adr/0008-client-screen-auth.md)), audit events + CSV ([#8](https://github.com/CG-Labs/superbot/pull/8), [ADR 0009](adr/0009-audit-events.md)), secrets store ([#9](https://github.com/CG-Labs/superbot/pull/9), [ADR 0010](adr/0010-secrets.md)). **In review:** brand assets ([PR #62](https://github.com/CG-Labs/superbot/pull/62), [#12](https://github.com/CG-Labs/superbot/issues/12), [brand guide](brand.md)). **Remaining:** real EAS `projectId`. |
 | **Goal** | Reduce blast radius and improve deploy surface before selling to strangers. |
-| **Scope** | Approvals MVP (**done**); secrets via env/sealed store, not plaintext in SQLite (**done**); structured audit events (**done**); Docker Compose one-click (**done**); harness policy flags (**done**); client routine editor, screen viewer, handoff UI (**done**); real EAS `projectId` + brand assets. |
+| **Scope** | Approvals MVP (**done**); secrets via env/sealed store, not plaintext in SQLite (**done**); structured audit events (**done**); Docker Compose one-click (**done**); harness policy flags (**done**); client routine editor, screen viewer, handoff UI (**done**); brand assets (**in review**); real EAS `projectId`. |
 | **Exit criteria** | Compose documented as supported path (**done**); approvals cover send-email/shell/file-delete class tools (**done**); audit export CSV (**done**); client routine CRUD + screen iframe (**done**); secrets not in plaintext at rest (**done**); client builds under the real EAS project with SuperBot branding. |
 | **Size** | **L** |
 | **Dependencies** | M0 |
@@ -118,7 +118,7 @@ Basic auth may remain for **break-glass** and **self-host hobby** tiers only, be
 | | |
 |--|--|
 | **Goal** | First **sellable team** product: real users and familiar sign-in. |
-| **Status** | **In progress.** Slice 1 in review ([#61](https://github.com/CG-Labs/superbot/pull/61), [ADR 0012](adr/0012-users-sessions-rbac.md)): user store, server-side sessions with TTLs and revoke, RBAC v1 on the API, break-glass, `botctl` user/session commands, auth audit events, client token flow. Next: OIDC providers on this user model; then SAML bridge, SCIM stub, bot ACLs. |
+| **Status** | **In progress.** Slice 1 merged ([#61](https://github.com/CG-Labs/superbot/pull/61), [ADR 0012](adr/0012-users-sessions-rbac.md)): user store, server-side sessions with TTLs and revoke, RBAC v1 on the API, break-glass, `botctl` user/session commands, auth audit events, client token flow. Next: OIDC providers on this user model; then SAML bridge, SCIM stub, bot ACLs. |
 | **Scope** | User store; JWT/session cookies for client; **Sign in with Apple**, **GitHub**, **Microsoft Entra ID**, **Google** (OIDC/OAuth); **generic OIDC** connector (Okta and others) and a SAML bridge where an IdP needs it; account linking (several IdPs per user); RBAC v1 (org admin, member, read-only); bot ACLs; migrate from `AUTH_PASSWORD` to SSO-primary with break-glass; session TTL and admin revoke; audit log with per-user actors and IdP; SCIM **design + stub** (full SCIM in M5). Parallel tracks: Hermes Agent harness adapter ([ADR 0011](adr/0011-hermes-agent-backend.md), option a); confirm the interface proposal (Expo client primary, `web/` as admin fallback). |
 | **Exit criteria** | Columbia org signs in with SSO only; each of Apple, GitHub, Entra, Google, and one generic OIDC IdP (e.g. Okta) works end to end; two roles enforced on API; shared vs private bots; pen-test style review of auth bypass; client uses token flow (no password in SecureStore for SSO tenants). |
 | **Size** | **XL** |
@@ -189,7 +189,7 @@ Basic auth may remain for **break-glass** and **self-host hobby** tiers only, be
 | Handoff UI | High | M1 ✓ |
 | Routine create/edit | High | M1 ✓ |
 | `eas init` / real `projectId` | High | M1 |
-| Custom icons / brand | Medium | M1 |
+| Custom icons / brand | Medium | M1 (in review) |
 | Single primary interface (Expo client; `web/` as admin fallback) — proposal | High | M2 (confirm) |
 | SSO sign-in (Apple, GitHub, Microsoft, Google, OIDC) | High | M2 |
 | Tier picker instead of model picker on managed plans | Medium | M3 |
@@ -272,7 +272,7 @@ No certification claims until audits complete.
 
 | Horizon | Focus |
 |---------|--------|
-| **Now** | Finish M1: EAS `projectId`, brand assets; approvals follow-ups ([list](approvals-followups.md)); owner to accept ADR 0011 and confirm the interface proposal; M2 slice 1: user store, sessions, RBAC v1 ([#61](https://github.com/CG-Labs/superbot/pull/61)) |
+| **Now** | Finish M1: EAS `projectId`, brand assets ([PR #62](https://github.com/CG-Labs/superbot/pull/62)); approvals follow-ups ([list](approvals-followups.md)); owner to accept ADR 0011 and confirm the interface proposal |
 | **Next** | SSO with Apple, GitHub, Entra, Google, generic OIDC on the new user model; bot ACLs; Hermes adapter |
 | **Later** | Linode control plane with one machine per user; per-user tiers and hidden model routing; public launch + stores; SCIM; SOC 2 |
 
