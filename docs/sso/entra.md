@@ -2,6 +2,8 @@
 
 Lets people sign in to SuperBot with their work Microsoft account. Design: [ADR 0014](../adr/0014-oidc-sso-entra.md).
 
+Google and other OpenID Connect IdPs can be offered next to it: [Google](google.md), [Okta, Keycloak, Auth0, …](oidc.md).
+
 You need: admin rights in your Entra tenant (to register an app), and SuperBot on HTTPS at a fixed address, like `https://superbot.example.com`. Below, replace `superbot.example.com` with yours.
 
 ## 1. Register the app in Entra
