@@ -54,9 +54,19 @@ PASSWORD=$(sed -n "s/^AUTH_PASSWORD='\(.*\)'$/\1/p" "$SUPERBOT_ENV_FILE")
 [[ -z "${GITHUB_ACTIONS:-}" ]] || echo "::add-mask::$PASSWORD"
 AUTH=(-u "smoke:$PASSWORD")
 
-log "Compose refuses to start without AUTH_PASSWORD"
+MASTER_KEY=$(sed -n "s/^SUPERBOT_MASTER_KEY='\(.*\)'$/\1/p" "$SUPERBOT_ENV_FILE")
+[[ ${#MASTER_KEY} == 64 ]] || fail "init.sh did not set a 64-hex SUPERBOT_MASTER_KEY"
+[[ -z "${GITHUB_ACTIONS:-}" ]] || echo "::add-mask::$MASTER_KEY"
+ENV_FILE="$SUPERBOT_ENV_FILE" "$DIR/init.sh" --localhost >/dev/null
+grep -qx "SUPERBOT_MASTER_KEY='$MASTER_KEY'" "$SUPERBOT_ENV_FILE" || fail "re-running init.sh replaced the master key"
+
+log "Compose refuses to start without AUTH_PASSWORD or SUPERBOT_MASTER_KEY"
 if SUPERBOT_ENV_FILE=/dev/null docker compose -f "$DIR/docker-compose.yml" -p "$PROJECT" --env-file /dev/null config -q 2>/dev/null; then
   fail "compose config succeeded without AUTH_PASSWORD"
+fi
+grep -v '^SUPERBOT_MASTER_KEY=' "$SUPERBOT_ENV_FILE" >"$WORK/nokey.env"
+if SUPERBOT_ENV_FILE="$WORK/nokey.env" docker compose -f "$DIR/docker-compose.yml" -p "$PROJECT" --env-file "$WORK/nokey.env" config -q 2>/dev/null; then
+  fail "compose config succeeded without SUPERBOT_MASTER_KEY"
 fi
 
 log "Starting the stack"
@@ -117,9 +127,22 @@ curl -fsS "${AUTH[@]}" -H 'Content-Type: application/json' -d '{"name":"KeepMe"}
 wait "$events_pid" || true
 grep -q '"name":"KeepMe"' "$WORK/events.txt" || fail "no bot event on /api/events within 5s"
 
+log "Secrets: saved encrypted, listed by name only, never in the database or a backup in plaintext"
+SECRET_VALUE="smoke-$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
+[[ -z "${GITHUB_ACTIONS:-}" ]] || echo "::add-mask::$SECRET_VALUE"
+printf '%s\n' "$SECRET_VALUE" | SUPERBOT_PASSWORD="$PASSWORD" dc exec -T -e SUPERBOT_PASSWORD botd botctl secret set SMOKE_API_KEY >/dev/null \
+  || fail "botctl secret set failed"
+secrets=$(curl -fsS "${AUTH[@]}" "$BASE/api/secrets")
+grep -q '"name":"SMOKE_API_KEY"' <<<"$secrets" || fail "saved secret not listed: $secrets"
+if grep -qF "$SECRET_VALUE" <<<"$secrets"; then fail "the API returned a secret value"; fi
+if dc logs --no-color botd | grep -qF -e "$SECRET_VALUE" -e "$MASTER_KEY"; then fail "a secret reached botd's logs"; fi
+
 log "Backup and restore round trip"
 dc exec -T botd superbot-backup - >"$WORK/backup.tar.gz"
 tar -tzf "$WORK/backup.tar.gz" | grep -qx 'app.sqlite' || fail "archive has no app.sqlite"
+mkdir "$WORK/unpacked"
+tar -xzf "$WORK/backup.tar.gz" -C "$WORK/unpacked"
+if grep -rqF -e "$SECRET_VALUE" -e "$MASTER_KEY" "$WORK/unpacked"; then fail "a backup holds a secret or the master key"; fi
 curl -fsS "${AUTH[@]}" -H 'Content-Type: application/json' -d '{"name":"DropMe"}' "$BASE/api/bots" >/dev/null
 if dc run --rm --no-deps -T botd superbot-restore - <"$WORK/backup.tar.gz" 2>/dev/null; then
   fail "restore ran while botd was up"
@@ -130,6 +153,7 @@ dc up -d --no-build --wait --wait-timeout 120
 bots=$(curl -fsS "${AUTH[@]}" "$BASE/api/bots")
 grep -q '"name":"KeepMe"' <<<"$bots" || fail "restored data is missing KeepMe"
 if grep -q '"name":"DropMe"' <<<"$bots"; then fail "restore did not roll back DropMe"; fi
+grep -q '"name":"SMOKE_API_KEY"' <<<"$(curl -fsS "${AUTH[@]}" "$BASE/api/secrets")" || fail "restored data lost the saved secret"
 
 log "Audit log is restored with the data and exports CSV"
 expect_code 401 "$BASE/api/audit/export.csv"

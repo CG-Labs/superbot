@@ -57,8 +57,8 @@ pub struct Guard {
 }
 
 /// Server secrets the harness (and everything it runs) must not inherit, or a Bot
-/// could approve its own actions.
-const SECRET_ENV: [&str; 2] = ["AUTH_PASSWORD", "SUPERBOT_PASSWORD"];
+/// could approve its own actions or read what botd seals.
+pub(crate) const SECRET_ENV: [&str; 5] = ["AUTH_PASSWORD", "AUTH_PASSWORD_FILE", "SUPERBOT_PASSWORD", "SUPERBOT_MASTER_KEY", "SUPERBOT_MASTER_KEY_FILE"];
 
 pub trait Adapter: Send {
     fn bin(&self) -> &'static str;
