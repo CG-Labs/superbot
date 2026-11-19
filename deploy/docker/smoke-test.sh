@@ -80,6 +80,17 @@ expect_code 401 "$BASE/api/state"
 expect_code 401 -u "smoke:wrong-password" "$BASE/api/state"
 expect_code 403 "${AUTH[@]}" -H "Host: evil.example" "$BASE/api/state"
 expect_code 200 "${AUTH[@]}" "$BASE/"
+log "Caddy serves the web client at /app/ and leaves everything else to botd"
+expect_code 200 "$BASE/app/"
+expect_code 302 "$BASE/app"
+expect_code 200 "$BASE/app/some/deep/link"
+curl -fsS "$BASE/app/" >"$WORK/app.html"
+entry=$(grep -o '/app/_expo/static/js/web/entry-[0-9a-f]*\.js' "$WORK/app.html" | head -1)
+[[ -n "$entry" ]] || fail "/app/ is not the client's index.html (built without SUPERBOT_WEB_BASE_URL=/app?)"
+expect_code 200 "$BASE$entry"
+curl -fsSI "$BASE$entry" | grep -qi '^cache-control: public, max-age=31536000, immutable' || fail "client bundle is not cached as immutable"
+curl -fsSI "$BASE/app/" | grep -qi '^cache-control: no-cache' || fail "client index.html is cacheable, so upgrades would not show"
+expect_code 303 "$BASE/app.js"
 state=$(curl -fsS "${AUTH[@]}" "$BASE/api/state")
 grep -q '"name":"Smoke"' <<<"$state" || fail "USER_NAME from .env not applied: $state"
 

@@ -1,8 +1,8 @@
-# 0013: Hermes Agent adapter details
+# 0014: Hermes Agent adapter details
 
 ## Status
 
-Accepted (19 Nov 2026). Implements [ADR 0011](0011-hermes-agent-backend.md) option (a) for Hermes Agent v0.23.2. ADR 0012 is users and sessions, so this is 0013.
+Accepted (19 Nov 2026). Implements [ADR 0011](0011-hermes-agent-backend.md) option (a) for Hermes Agent v0.23.2. ADR 0012 is users and sessions and ADR 0013 is serving the web client, so this is 0014.
 
 ## Context
 

@@ -1,8 +1,29 @@
 # SUPERBOT_SITE is SUPERBOT_DOMAIN (automatic HTTPS) or ":80" (plain HTTP, localhost only by default).
 {$SUPERBOT_SITE} {
 	encode gzip
-	reverse_proxy botd:3000 {
-		# /api/events is an SSE stream: never buffer.
-		flush_interval -1
+	# The web client, baked into this Caddy image at build time (Dockerfile `caddy` target).
+	redir /app /app/
+	handle_path /app/* {
+		root * /srv/superbot-app
+		# Hashed bundles never change; everything else is re-checked so upgrades show at once.
+		@immutable {
+			path /_expo/static/*
+			file
+		}
+		@mutable not {
+			path /_expo/static/*
+			file
+		}
+		header @immutable Cache-Control "public, max-age=31536000, immutable"
+		header @mutable Cache-Control "no-cache"
+		try_files {path} /index.html
+		file_server
+	}
+	# Everything else: botd's built-in page at /, /login, /api, /healthz.
+	handle {
+		reverse_proxy botd:3000 {
+			# /api/events is an SSE stream: never buffer.
+			flush_interval -1
+		}
 	}
 }

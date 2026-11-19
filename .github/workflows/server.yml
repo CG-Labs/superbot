@@ -7,6 +7,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'deploy/**'
+      - 'apps/client/**'
       - '.github/workflows/server.yml'
   pull_request:
     paths:
@@ -14,6 +15,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'deploy/**'
+      - 'apps/client/**'
       - '.github/workflows/server.yml'
 
 permissions:
@@ -51,6 +53,9 @@ jobs:
           grep -Fq 'would render /etc/systemd/system/superbot.service from /usr/local/share/superbot/deploy/superbot.service (User=superbot, ExecStart=/usr/local/bin/botd)' /tmp/fresh.log
           grep -Fq 'SuperBot is installed.' /tmp/fresh.log
           grep -Fq 'would keep or create master key /home/superbot/.config/superbot/master.key' /tmp/fresh.log
+          grep -Fq 'would build the web client in /home/superbot/superbot/apps/client as superbot (base URL /app) and install it into root-owned /var/www/superbot-app' /tmp/fresh.log
+          grep -Fq 'web client at /app/ from /var/www/superbot-app, everything else to botd on 127.0.0.1:3000' /tmp/fresh.log
+          grep -Fq 'App:      https://ci.example.com/app/' /tmp/fresh.log
       - name: Hermes Agent is opt-in and pinned to a commit
         run: |
           set -euo pipefail
@@ -61,6 +66,14 @@ jobs:
           grep -Fq 'would set PATH=/home/superbot/.local/bin:/usr/local/sbin:/usr/local/bin:' /tmp/hermes.log
           if cat deploy/install.sh | sudo HERMES_COMMIT=main bash -s -- --dry-run --non-interactive --with-hermes \
             --domain ci.example.com --tz UTC; then exit 1; fi
+      - name: Piped dry run of an upgrade without the client
+        run: |
+          set -euo pipefail
+          cat deploy/install.sh | sudo bash -s -- --dry-run --non-interactive --upgrade --no-client \
+            --domain ci.example.com --tz UTC | tee /tmp/upgrade.log
+          grep -Fq 'Skipping the web client (--no-client)' /tmp/upgrade.log
+          if grep -Fq 'would build the web client' /tmp/upgrade.log; then exit 1; fi
+          if grep -Fq 'web client at /app/' /tmp/upgrade.log; then exit 1; fi
       - name: Piped dry run ignores templates in the service user's checkout
         run: |
           set -euo pipefail
@@ -146,3 +159,63 @@ jobs:
             if (INSTALL_DIR=/home/superbot/superbot; stage_trusted_deploy); then exit 1; fi
             echo ok
           '
+      - name: Web client is built as the service user, installed root-owned, and served at /app/
+        run: |
+          set -euo pipefail
+          id superbot >/dev/null 2>&1 || sudo useradd -m -s /bin/bash superbot
+          sudo -u superbot -H bash -lc 'node -v && npm -v'
+          sudo rm -rf /home/superbot/superbot
+          sudo cp -a "$GITHUB_WORKSPACE" /home/superbot/superbot
+          sudo chown -R superbot:superbot /home/superbot/superbot
+          # A manual build from before releases, as on servers set up by hand.
+          sudo mkdir -p /var/www/superbot-app
+          echo manual | sudo tee /var/www/superbot-app/index.html >/dev/null
+          sudo env SUPERBOT_INSTALL_NO_MAIN=1 bash -c '
+            set -euo pipefail
+            source deploy/install.sh
+            dist=/home/superbot/superbot/apps/client/dist-app
+            build_client
+            [[ -L "$CLIENT_DIR" ]]
+            live=$(readlink -f "$CLIENT_DIR")
+            [[ $(stat -c "%U %a" "$live") == "root 755" ]]
+            [[ $(stat -c "%U %a" "$live/index.html") == "root 644" ]]
+            if find "$live" ! -user root | grep -q .; then exit 1; fi
+            grep -q "/app/_expo/static/js/web/entry-" "$live/index.html"
+            grep -qx manual "$(client_releases_dir)"/previous-*/index.html
+            # An upgrade swaps in a new release and keeps only the previous one.
+            install_client "$dist"
+            [[ $(readlink -f "$CLIENT_DIR") != "$live" ]]
+            [[ $(find "$(client_releases_dir)" -mindepth 1 -maxdepth 1 | wc -l) == 2 ]]
+            # A failure while unpacking leaves the live client and no half-made release.
+            live=$(readlink -f "$CLIENT_DIR")
+            if (chown() { return 1; }; install_client "$dist"); then exit 1; fi
+            [[ $(readlink -f "$CLIENT_DIR") == "$live" ]]
+            [[ $(find "$(client_releases_dir)" -mindepth 1 -maxdepth 1 | wc -l) == 2 ]]
+            # A build holding a link, or without index.html, is refused; the live client stays.
+            sudo -u superbot ln -s /etc/shadow "$dist/leak"
+            if (install_client "$dist"); then exit 1; fi
+            sudo -u superbot rm "$dist/leak" "$dist/index.html"
+            if (install_client "$dist"); then exit 1; fi
+            [[ $(readlink -f "$CLIENT_DIR") == "$live" ]]
+            # No Node for the service user: a warning, not a failed install.
+            client_node_ok() { return 1; }
+            build_client 2>&1 | grep -q "skipping the web client"
+            render_caddyfile :18090 127.0.0.1:3999 "$CLIENT_DIR" >/tmp/Caddyfile
+            echo ok
+          '
+          docker run -d --name caddy --network host \
+            -v /tmp/Caddyfile:/etc/caddy/Caddyfile:ro -v /var/www:/var/www:ro caddy:2
+          trap 'docker logs caddy 2>&1 | tail -20; docker rm -f caddy >/dev/null' EXIT
+          B=http://127.0.0.1:18090
+          for _ in $(seq 1 30); do curl -fsS -o /dev/null "$B/app/" && break; sleep 1; done
+          code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+          [[ $(code "$B/app/") == 200 ]]
+          [[ $(code "$B/app") == 302 ]]
+          [[ $(code "$B/app/some/deep/link") == 200 ]]
+          curl -fsSI "$B/app/" | grep -qi '^cache-control: no-cache'
+          js=$(curl -fsS "$B/app/" | grep -o '/app/_expo/static/js/web/entry-[0-9a-f]*\.js' | head -1)
+          curl -fsSI "$B$js" | grep -qi '^cache-control: public, max-age=31536000, immutable'
+          # Everything outside /app/ goes to botd (not running here, so 502), never to the client.
+          [[ $(code "$B/") == 502 ]]
+          [[ $(code "$B/app.js") == 502 ]]
+          [[ $(code "$B/api/events") == 502 ]]

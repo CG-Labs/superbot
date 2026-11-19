@@ -1,6 +1,6 @@
 # SuperBot VPS install
 
-Idempotent installer for Ubuntu 22.04 or 24.04: `botd`, `botctl`, systemd, optional Caddy HTTPS, and daily SQLite backups.
+Idempotent installer for Ubuntu 22.04 or 24.04: `botd`, `botctl`, the web client, systemd, optional Caddy HTTPS, and daily SQLite backups.
 
 Prefer containers? See [Docker Compose (supported)](#docker-compose-supported): same auth, HTTPS, and backups, on any Linux host with Docker.
 
@@ -33,16 +33,17 @@ If flags are omitted, the script prompts on a TTY. The checkout must not be owne
 2. Installs build deps, Node.js 22 LTS, rustup for the service user
 3. Clones or updates [CG-Labs/superbot](https://github.com/CG-Labs/superbot) under `~/superbot`
 4. Builds release `botd` / `botctl` → `/usr/local/bin`
-5. Writes `~/superbot/.env` from `.env.example` with:
+5. Builds the [web client](#web-client) (`apps/client`) → `/var/www/superbot-app` (skip with `--no-client`)
+6. Writes `~/superbot/.env` from `.env.example` with:
    - `HOST=127.0.0.1`, `PORT=3000`, `TZ`, `USER_NAME`, data paths
    - Random `AUTH_PASSWORD` on first install (never overwritten on re-run)
    - `ALLOWED_HOSTS` and `CORS_ORIGINS` when `--domain` is set
    - `SUPERBOT_MASTER_KEY_FILE`, after creating the [master key](#master-key) if it is missing (never replaced)
-6. **systemd** `superbot.service` (hardened, runs as the service user)
-7. **Caddy** automatic HTTPS when `--domain` is set (`flush_interval -1` for SSE)
-8. Optional **UFW** (`--ufw`): allow 22, 80, 443
-9. Daily **backup** timer (on by default; `--no-backup` to skip)
-10. With `--with-hermes`: [Hermes Agent](#hermes-agent) for the service user
+7. **systemd** `superbot.service` (hardened, runs as the service user)
+8. **Caddy** automatic HTTPS when `--domain` is set: the web client at `/app/`, everything else to `botd` (`flush_interval -1` for SSE)
+9. Optional **UFW** (`--ufw`): allow 22, 80, 443
+10. Daily **backup** timer (on by default; `--no-backup` to skip)
+11. With `--with-hermes`: [Hermes Agent](#hermes-agent) for the service user
 
 Admin password file: `~superbot/.superbot-admin-password` (mode `0600`).
 
@@ -53,7 +54,17 @@ journalctl -u superbot -f
 sudo -iu superbot claude login   # or codex login, etc.
 ```
 
-Open `https://your-domain` and log in with any username and the saved password.
+Open `https://your-domain/app/` for the app (it fills in the server URL), or `https://your-domain` for the built-in admin page. Sign in with the saved password.
+
+## Web client
+
+The installer builds the Expo client (`apps/client`) from the same commit as `botd` on every install and `--upgrade`, and Caddy serves it at `/app/`. `/` stays the built-in admin page, and `/login`, `/api`, `/api/events`, and `/healthz` still go to `botd`. Design: [ADR 0013](../docs/adr/0013-serve-web-client.md).
+
+- The service user builds it (`npm ci`, `expo export` with `SUPERBOT_WEB_BASE_URL=/app`) in `~/superbot/apps/client/dist-app`. Root copies only plain files and folders into a new root-owned release in `/var/www/superbot-app.releases/`, then switches the `/var/www/superbot-app` symlink in one step. The previous release is kept. Set `CLIENT_DIR` to use another path.
+- Needs Node.js 20+ (the installer sets up 22). Without it, or if the build fails, the installer warns and keeps the previous client. `--no-client` skips it.
+- Served only through Caddy, so it needs `--domain`.
+- A hand-made `/var/www/superbot-app` folder is kept as the previous release on the first run.
+- Build it yourself: `cd apps/client && npm ci && npm run build:web:server`. Plain `npm run build:web` (Electron, local) is unchanged.
 
 ## Options
 
@@ -66,6 +77,7 @@ Open `https://your-domain` and log in with any username and the saved password.
 | `--ufw` | Enable firewall rules |
 | `--no-backup` | Skip backup timer |
 | `--with-hermes` | Also install Hermes Agent ([below](#hermes-agent)) |
+| `--no-client` | Skip building the web client |
 | `--dry-run` | Print steps only |
 | `--source-dir` | Copy a local tree instead of cloning |
 
@@ -144,14 +156,14 @@ docker compose up -d --build
 docker compose logs -f botd
 ```
 
-`init.sh` writes `.env` (mode `0600`) from [`.env.example`](docker/.env.example) with a random `AUTH_PASSWORD`, prints it once, and never replaces it on re-run. Open `https://bots.example.com` and log in with any username and that password. DNS for the domain must point at the host, with ports 80 and 443 open.
+`init.sh` writes `.env` (mode `0600`) from [`.env.example`](docker/.env.example) with a random `AUTH_PASSWORD`, prints it once, and never replaces it on re-run. Open `https://bots.example.com/app/` for the app, or `https://bots.example.com` for the built-in admin page, and sign in with that password. DNS for the domain must point at the host, with ports 80 and 443 open.
 
 Without a domain, `./init.sh` gives plain HTTP at `http://localhost`, published on `127.0.0.1` only. For another machine, use a domain (HTTPS); over plain HTTP the password crosses the network in clear text.
 
 | Service | Role |
 |---------|------|
 | `botd` | Server, web app, harness CLIs. Runs as uid `10001`, no capabilities, port 3000 not published. |
-| `caddy` | Publishes 80/443 on `SUPERBOT_BIND`, proxies to `botd` (SSE unbuffered). |
+| `caddy` | `caddy:2` plus the [web client](#web-client), built from this checkout (`Dockerfile` target `caddy`). Publishes 80/443 on `SUPERBOT_BIND`, serves the client at `/app/`, proxies everything else to `botd` (SSE unbuffered). |
 | `backup` | Archives `DATA_DIR` at start and every `SUPERBOT_BACKUP_INTERVAL` seconds. No network. |
 
 | Volume | Mounted at | Holds |
@@ -196,7 +208,7 @@ docker compose exec botd superbot-backup        # optional: archive first
 docker compose build --pull && docker compose up -d
 ```
 
-Volumes are kept. The schema migrates on start, as with the bash install. To pin a release, `git checkout <tag>` before building.
+Volumes are kept. The schema migrates on start, as with the bash install. The build also rebuilds the `caddy` image with the checkout's web client. To pin a release, `git checkout <tag>` before building.
 
 Upgrading from a release before secrets: run `./init.sh` once first. It adds a random `SUPERBOT_MASTER_KEY` to `.env` (Compose refuses to start without one) and leaves everything else alone. The key encrypts saved secrets and approvals' tool input ([master key](#master-key)); it stays in `.env` on the host, never in a volume.
 
@@ -258,4 +270,4 @@ Screens and computer use (Xvfb, browser, voxl): `botd` reports `Screens: off`. U
 
 ### Check the setup
 
-[`deploy/docker/smoke-test.sh`](docker/smoke-test.sh) builds the image and runs the stack in an isolated project (own volumes and ports 18080/18443): health, auth, Host allowlist, harness CLIs, SSE through Caddy, saved secrets (encrypted, names only, absent from logs and backups), and a backup/restore round trip, then removes everything. CI runs it on every change to the image.
+[`deploy/docker/smoke-test.sh`](docker/smoke-test.sh) builds the image and runs the stack in an isolated project (own volumes and ports 18080/18443): health, auth, Host allowlist, the web client at `/app/`, harness CLIs, SSE through Caddy, saved secrets (encrypted, names only, absent from logs and backups), and a backup/restore round trip, then removes everything. CI runs it on every change to the image.

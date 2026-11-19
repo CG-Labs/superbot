@@ -39,6 +39,23 @@ export function normalizeBaseUrl(input: string): string {
   return trimmed;
 }
 
+export const LOCAL_SERVER_URL = "http://127.0.0.1:3000";
+
+/**
+ * A web build served over http(s) is hosted by the SuperBot server itself (Caddy serves it
+ * beside botd), so that origin is the server. Dev servers and Electron (file://) are not.
+ */
+export function defaultServerUrl(
+  os: string = Platform.OS,
+  location: { protocol?: string; origin?: string } | undefined = typeof window === "undefined" ? undefined : window.location,
+  dev: boolean = __DEV__,
+): string {
+  if (os === "web" && !dev && location?.origin && /^https?:$/.test(location.protocol ?? "")) {
+    return location.origin;
+  }
+  return LOCAL_SERVER_URL;
+}
+
 export function basicAuthHeader(password: string, username = "superbot"): string {
   return `Basic ${b64encode(`${username}:${password}`)}`;
 }
