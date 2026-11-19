@@ -18,6 +18,7 @@ export interface SsoProvider {
 export const SSO_ERRORS: Record<string, string> = {
   sso_not_linked: "Your account isn't set up on this server yet. Ask an admin to add you.",
   sso_not_allowed: "Your SuperBot account is disabled.",
+  sso_wrong_account: "That account can't sign in here. Use your organization's account, with a verified email.",
   sso_email_taken: "A user with your email already exists. Ask an admin to link your sign-in to it.",
   sso_cancelled: "Sign-in was cancelled.",
   sso_expired: "That sign-in expired. Try again.",
@@ -34,13 +35,32 @@ export function ssoSupported(): boolean {
   return Platform.OS !== "web" || (typeof location !== "undefined" && location.protocol.startsWith("http"));
 }
 
+/**
+ * One button per provider, in the server's order (Entra, Google, and any OIDC IdP can be
+ * on at once). Entries that aren't a provider the server could have, or repeat one, are
+ * dropped, so a bad response can't make a button that goes somewhere odd.
+ */
+export function ssoProviderList(raw: unknown): SsoProvider[] {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>();
+  const list: SsoProvider[] = [];
+  for (const p of raw as Partial<Record<keyof SsoProvider, unknown>>[]) {
+    const { id, label, type } = p ?? {};
+    if (typeof id !== "string" || !/^[a-z0-9]{1,32}$/.test(id) || seen.has(id)) continue;
+    const name = typeof label === "string" && label.trim() ? label.trim().slice(0, 40) : id;
+    seen.add(id);
+    list.push({ id, label: name, type: typeof type === "string" ? type : "oidc" });
+  }
+  return list;
+}
+
 /** The providers on this server; none when it's older or unreachable. */
 export async function fetchSsoProviders(baseUrl: string): Promise<SsoProvider[]> {
   try {
     const res = await fetch(`${normalizeBaseUrl(baseUrl)}/api/auth/sso`);
     if (!res.ok) return [];
-    const data = (await res.json()) as { providers?: SsoProvider[] };
-    const list = Array.isArray(data.providers) ? data.providers : [];
+    const data = (await res.json()) as { providers?: unknown };
+    const list = ssoProviderList(data?.providers);
     if (list.length) prepareSso();
     return list;
   } catch {

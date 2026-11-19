@@ -58,6 +58,7 @@
     const SSO_ERRORS = {
       sso_not_linked: "Your account isn't set up on this server yet. Ask an admin to add you.",
       sso_not_allowed: "Your SuperBot account is disabled.",
+      sso_wrong_account: "That account can't sign in here. Use your organization's account, with a verified email.",
       sso_email_taken: "A user with your email already exists. Ask an admin to link your sign-in to it.",
       sso_cancelled: "Sign-in was cancelled.",
       sso_expired: "That sign-in expired. Try again.",
@@ -69,10 +70,14 @@
     if (code) error.textContent = SSO_ERRORS[code] || SSO_ERRORS.sso_failed;
     fetch("/api/auth/sso").then((r) => (r.ok ? r.json() : { providers: [] })).then(({ providers }) => {
       const box = document.getElementById("sso");
-      for (const p of providers || []) {
+      const seen = new Set();
+      for (const p of Array.isArray(providers) ? providers : []) {
+        if (typeof p?.id !== "string" || !/^[a-z0-9]{1,32}$/.test(p.id) || seen.has(p.id)) continue;
+        seen.add(p.id);
         const a = document.createElement("a");
+        a.dataset.type = p.type || "oidc";
         a.href = `/api/auth/sso/${encodeURIComponent(p.id)}/start?label=Web`;
-        a.textContent = `Sign in with ${p.label}`;
+        a.textContent = `Sign in with ${p.label || p.id}`;
         box.appendChild(a);
       }
       if (box.children.length) document.getElementById("or").style.display = "flex";

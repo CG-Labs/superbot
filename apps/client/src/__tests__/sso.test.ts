@@ -1,5 +1,5 @@
 import * as WebBrowser from "expo-web-browser";
-import { fetchSsoProviders, newPkce, parseSsoReturn, redeemSso, signInWithSso, ssoRedirect, ssoStartUrl, SSO_ERRORS } from "../sso";
+import { fetchSsoProviders, newPkce, parseSsoReturn, redeemSso, signInWithSso, ssoProviderList, ssoRedirect, ssoStartUrl, SSO_ERRORS } from "../sso";
 
 type NodeCrypto = {
   createHash(alg: string): { update(data: string): { digest(enc: string): string } };
@@ -70,7 +70,56 @@ describe("the redirect back to the app", () => {
   });
 });
 
+describe("the provider list", () => {
+  it("keeps every provider the server offers, in its order", () => {
+    const three = [
+      { id: "entra", label: "Microsoft", type: "entra" },
+      { id: "google", label: "Google", type: "google" },
+      { id: "okta", label: "Okta", type: "oidc" },
+    ];
+    expect(ssoProviderList(three)).toEqual(three);
+  });
+
+  it("drops entries that can't be a provider, and repeats", () => {
+    expect(
+      ssoProviderList([
+        { id: "google", label: "Google", type: "google" },
+        { id: "google", label: "Google again", type: "google" },
+        { id: "../admin", label: "Sneaky", type: "oidc" },
+        { id: "Okta", label: "Okta", type: "oidc" },
+        { id: 7, label: "Number" },
+        null,
+        "entra",
+        { id: "acme", label: "  ", type: 3 },
+        { id: "long", label: "x".repeat(60), type: "oidc" },
+      ]),
+    ).toEqual([
+      { id: "google", label: "Google", type: "google" },
+      { id: "acme", label: "acme", type: "oidc" },
+      { id: "long", label: "x".repeat(40), type: "oidc" },
+    ]);
+    expect(ssoProviderList(undefined)).toEqual([]);
+    expect(ssoProviderList({ id: "entra" })).toEqual([]);
+  });
+
+  it("explains a refused account", () => {
+    expect(parseSsoReturn("superbot://auth?error=sso_wrong_account&state=s1", "s1")).toEqual({ error: SSO_ERRORS.sso_wrong_account });
+  });
+});
+
 describe("talking to the server", () => {
+  it("lists several providers from one server", async () => {
+    const providers = [
+      { id: "entra", label: "Microsoft", type: "entra" },
+      { id: "google", label: "Google", type: "google" },
+      { id: "keycloak", label: "Acme SSO", type: "oidc" },
+    ];
+    globalThis.fetch = respond(200, { providers: [...providers, { id: "bad id" }] });
+    expect(await fetchSsoProviders(BASE)).toEqual(providers);
+    globalThis.fetch = respond(200, { providers: "nope" });
+    expect(await fetchSsoProviders(BASE)).toEqual([]);
+  });
+
   it("lists providers, and none from a server without SSO", async () => {
     globalThis.fetch = respond(200, { providers: [{ id: "entra", label: "Microsoft", type: "entra" }] });
     expect(await fetchSsoProviders(BASE)).toEqual([{ id: "entra", label: "Microsoft", type: "entra" }]);
