@@ -14,10 +14,11 @@ import { fetchSsoProviders, ssoButtonText, ssoButtonTone, ssoSupported, type Sso
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
 
-export function LoginScreen() {
+/** `inviteCode` fills in the code from an invite link; it is only spent on Connect. */
+export function LoginScreen({ inviteCode = null }: { inviteCode?: string | null }) {
   const { login, loginWithSso, error: bootError } = useSuperBot();
   const [baseUrl, setBaseUrl] = useState(() => defaultServerUrl());
-  const [secret, setSecret] = useState("");
+  const [secret, setSecret] = useState(inviteCode ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [providers, setProviders] = useState<SsoProvider[]>([]);
@@ -96,6 +97,9 @@ export function LoginScreen() {
           value={secret}
           onChangeText={setSecret}
         />
+        {inviteCode && secret === inviteCode ? (
+          <Text style={styles.invited}>Your invite code is filled in. Check the server URL, then press Connect.</Text>
+        ) : null}
         <Text style={styles.hint}>
           Ask an admin for a one-time sign-in code. The owner can use the server password. The app keeps a session token, not the password.
         </Text>
@@ -137,6 +141,7 @@ const styles = StyleSheet.create({
     fontSize: 16,
   },
   hint: { color: colors.textFaint, fontSize: 13, lineHeight: 18 },
+  invited: { color: colors.accent, fontSize: 14 },
   error: { color: colors.danger, marginTop: 4 },
   btn: {
     marginTop: 16,
