@@ -193,8 +193,9 @@ pub struct Call {
     pub cwd: PathBuf,
 }
 
-const SHELL_TOOLS: [&str; 5] = ["bash", "shell", "exec_command", "local_shell", "command_execution"];
-const FILE_TOOLS: [&str; 8] = ["write", "edit", "multiedit", "notebookedit", "apply_patch", "str_replace_based_edit_tool", "create_file", "delete_file"];
+const SHELL_TOOLS: [&str; 6] = ["bash", "shell", "exec_command", "local_shell", "command_execution", "terminal"];
+const FILE_TOOLS: [&str; 10] =
+    ["write", "edit", "multiedit", "notebookedit", "apply_patch", "str_replace_based_edit_tool", "create_file", "delete_file", "write_file", "patch"];
 const WEB_TOOLS: [&str; 4] = ["webfetch", "websearch", "web_fetch", "web_search"];
 
 impl Call {
@@ -212,8 +213,14 @@ impl Call {
             Kind::Other
         };
         let subject = match kind {
-            Kind::Shell => shell_command(&input).unwrap_or_default(),
-            Kind::File if lower == "apply_patch" => patch_paths(&patch_text(&input)).into_iter().map(|(_, p)| p).collect::<Vec<_>>().join(" "),
+            // A rule remembered for a command must not match it in another folder.
+            Kind::Shell => match (shell_command(&input).unwrap_or_default(), workdir(&input)) {
+                (cmd, Ok(Some(dir))) => format!("cd {} && {cmd}", quote(&dir)),
+                (cmd, _) => cmd,
+            },
+            Kind::File if lower == "apply_patch" || input["patch"].is_string() => {
+                patch_paths(&patch_text(&input)).into_iter().map(|(_, p)| p).collect::<Vec<_>>().join(" ")
+            }
             Kind::File => ["file_path", "path", "notebook_path"].iter().find_map(|k| input[*k].as_str()).unwrap_or_default().to_string(),
             Kind::Web => ["url", "query"].iter().find_map(|k| input[*k].as_str()).unwrap_or_default().to_string(),
             Kind::Mcp | Kind::Other => {
@@ -254,6 +261,17 @@ fn shell_command(input: &Value) -> Result<String, &'static str> {
         found = Some(text);
     }
     found.ok_or("it has no command")
+}
+
+/// The folder a shell tool runs its command in, if it names one (`workdir` in Codex and
+/// Hermes). Its relative paths may then mean either folder.
+fn workdir(input: &Value) -> Result<Option<String>, &'static str> {
+    match input.get("workdir") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.trim().is_empty() => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err("its working folder isn't text"),
+    }
 }
 
 fn shell_text(v: &Value) -> String {
@@ -338,8 +356,14 @@ pub fn decide(p: &Policy, rules: &[Rule], call: &Call, ctx: &Ctx) -> Verdict {
 pub fn classify(call: &Call, ctx: &Ctx) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     match call.kind {
-        Kind::Shell => match shell_command(&call.input) {
-            Ok(cmd) => classify_shell(&cmd, &Cwds::new(&call.cwd), ctx, 0, &mut { shell::MAX_TOTAL }, &mut out),
+        Kind::Shell => match shell_command(&call.input).and_then(|cmd| Ok((cmd, workdir(&call.input)?))) {
+            Ok((cmd, dir)) => {
+                let mut cwds = Cwds::new(&call.cwd);
+                if let Some(dir) = dir {
+                    cwds.add(ctx, &[Some(dir)], false);
+                }
+                classify_shell(&cmd, &cwds, ctx, 0, &mut { shell::MAX_TOTAL }, &mut out)
+            }
             Err(why) => out.push((UNREADABLE, format!("Can't check this shell call: {why}"))),
         },
         Kind::File => {
@@ -353,6 +377,21 @@ pub fn classify(call: &Call, ctx: &Ctx) -> Vec<(&'static str, String)> {
             }
         }
         Kind::Mcp | Kind::Other => {
+            const UNREAD_INPUT: &str = "Types input SuperBot can't read into a running program";
+            match typed_input(call) {
+                Some(Some(text)) => {
+                    // The program may be a shell started earlier, in any folder.
+                    let cwds = Cwds { dirs: vec![call.cwd.clone()], unknown: true };
+                    let mut found = Vec::new();
+                    classify_shell(text, &cwds, ctx, 0, &mut { shell::MAX_TOTAL }, &mut found);
+                    out.extend(found.into_iter().map(|(c, why)| match c {
+                        UNREADABLE => ("shell_destructive", UNREAD_INPUT.to_string()),
+                        c => (c, format!("Types into a running program: {why}")),
+                    }));
+                }
+                Some(None) => out.push(("shell_destructive", UNREAD_INPUT.to_string())),
+                None => {}
+            }
             let name: String = call.tool.to_ascii_lowercase().chars().filter(char::is_ascii_alphanumeric).collect();
             if OUTBOUND_TOOL_WORDS.iter().any(|w| name.contains(w)) {
                 out.push(("outbound_message", format!("Sends a message with {}", call.tool)));
@@ -367,6 +406,18 @@ pub fn classify(call: &Call, ctx: &Ctx) -> Vec<(&'static str, String)> {
         Kind::Web => {}
     }
     out
+}
+
+/// Text a tool types into a running program (Hermes `process_manage` write/submit), which
+/// may be a shell, so it is checked like a command. Some(None) when it isn't text.
+fn typed_input(call: &Call) -> Option<Option<&str>> {
+    let action = call.input["action"].as_str().unwrap_or_default().trim().to_ascii_lowercase();
+    let writes = call.tool.eq_ignore_ascii_case("process_manage") && (action == "write" || action == "submit");
+    writes.then(|| match &call.input["data"] {
+        Value::Null => Some(""),
+        Value::String(s) => Some(s.as_str()),
+        _ => None,
+    })
 }
 
 const OUTBOUND_TOOL_WORDS: [&str; 14] = [
@@ -947,6 +998,64 @@ mod tests {
         p.classes.insert("file_delete".into(), Action::Deny);
         p.classes.insert("shell_destructive".into(), Action::Allow);
         assert_eq!(decide(&p, &[], &shell("cd /tmp && rm -rf *"), &ctx()).action, Action::Deny);
+    }
+
+    fn hermes(tool: &str, input: Value) -> Call {
+        Call::new(tool, input, "/srv/ws".into())
+    }
+
+    #[test]
+    fn hermes_tools_are_checked_like_the_others() {
+        let t = hermes("terminal", json!({ "command": "git push origin main" }));
+        assert_eq!((t.kind, t.subject.as_str()), (Kind::Shell, "git push origin main"));
+        assert_eq!(classes(&t), ["git_push"]);
+        assert_eq!(decide(&Policy::new(Mode::Ask), &[], &t, &ctx()).action, Action::Ask);
+        assert!(classes(&hermes("terminal", json!({ "command": "ls -la", "background": true }))).is_empty());
+        assert_eq!(classes(&hermes("terminal", json!({ "command": 7 }))), [UNREADABLE]);
+
+        let w = hermes("write_file", json!({ "path": "src/main.rs", "content": "x" }));
+        assert_eq!((w.kind, w.subject.as_str()), (Kind::File, "src/main.rs"));
+        assert!(classes(&w).is_empty());
+        let p = hermes("patch", json!({ "path": "a.rs", "old_string": "a", "new_string": "b" }));
+        assert_eq!((p.kind, p.subject.as_str()), (Kind::File, "a.rs"));
+        // V4A patches, like Codex apply_patch: a delete outside the workspace asks.
+        let v4a = "*** Begin Patch\n*** Update File: a.rs\n@@\n-a\n+b\n*** Delete File: /etc/hosts\n*** End Patch";
+        let p = hermes("patch", json!({ "mode": "patch", "patch": v4a }));
+        assert_eq!(p.subject, "a.rs /etc/hosts");
+        assert_eq!(classes(&p), ["file_delete"]);
+        assert!(classes(&hermes("patch", json!({ "mode": "patch", "patch": "*** Delete File: old.rs" }))).is_empty());
+        assert_eq!(hermes("web_search", json!({ "query": "rust" })).kind, Kind::Web);
+    }
+
+    #[test]
+    fn a_shell_workdir_counts_as_a_folder_the_command_runs_in() {
+        let at = |cmd: &str, dir: Value| classes(&hermes("terminal", json!({ "command": cmd, "workdir": dir })));
+        assert!(at("rm -rf build", json!("/srv/ws/app")).is_empty());
+        assert_eq!(at("rm -rf build", json!("/etc")), ["file_delete"]);
+        assert_eq!(at("rm -rf build", json!("..")), ["file_delete"]);
+        assert_eq!(at("rm -rf build", json!("$HOME")), ["file_delete"]);
+        assert_eq!(at("rm -rf *", json!("/srv/ws")), ["shell_destructive"]);
+        assert!(at("rm -rf build", json!(null)).is_empty());
+        assert_eq!(at("ls", json!(["/etc"])), [UNREADABLE]);
+        assert_eq!(classes(&Call::new("exec_command", json!({ "cmd": "rm -rf x", "workdir": "/tmp" }), "/srv/ws".into())), ["file_delete"]);
+        // A rule remembered for a command in one folder doesn't match it in another.
+        let c = hermes("terminal", json!({ "command": "rm -rf build", "workdir": "/etc" }));
+        assert_eq!(c.subject, "cd /etc && rm -rf build");
+        let allow = Rule { id: "r1".into(), bot_id: None, action: Action::Allow, tool: "terminal".into(), pattern: "rm -rf build".into(), note: None, created_at: 0 };
+        assert!(!allow.matches(&c));
+        assert!(allow.matches(&hermes("terminal", json!({ "command": "rm -rf build" }))));
+    }
+
+    #[test]
+    fn typing_into_a_running_program_is_checked_like_a_command() {
+        let typed = |action: &str, data: Value| classes(&hermes("process_manage", json!({ "action": action, "session_id": "proc_1", "data": data })));
+        assert_eq!(typed("write", json!("git push origin main\n")), ["git_push"]);
+        assert_eq!(typed("submit", json!("rm -rf build")), ["file_delete"]);
+        assert!(typed("submit", json!("y")).is_empty());
+        assert_eq!(typed("write", json!("print(')'")), ["shell_destructive"]);
+        assert_eq!(typed("write", json!(["git", "push"])), ["shell_destructive"]);
+        assert!(typed("poll", json!("git push")).is_empty());
+        assert!(classes(&hermes("process_manage", json!({ "action": "kill", "session_id": "proc_1" }))).is_empty());
     }
 
     #[test]
