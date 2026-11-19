@@ -193,6 +193,7 @@ pub fn clip(s: &str, max: usize) -> String {
 /// Masks credentials in free text such as a shell command: `Bearer <x>`,
 /// `--password <x>`, `token=<x>`, `user:pass@` in URLs, and known key formats.
 pub fn redact_text(s: &str) -> String {
+    let s = &redact_pairs(s);
     let mut out = String::with_capacity(s.len());
     let mut next = Mask::None;
     for piece in s.split_inclusive(char::is_whitespace) {
@@ -229,6 +230,92 @@ pub fn redact_text(s: &str) -> String {
         out.push_str(gap);
     }
     out
+}
+
+/// Masks the value of every secret-named `key: value` or `key=value` anywhere in the
+/// text, so a secret isn't missed for following a harmless key in the same word, as in
+/// tool arguments shown as JSON (`{"message":"hi","token":"x"}`, also escaped or cut short).
+fn redact_pairs(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let (mut copied, mut i) = (0, 0);
+    while i < b.len() {
+        if !key_char(b[i]) || (i > 0 && key_char(b[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let key_end = i + b[i..].iter().take_while(|&&c| key_char(c)).count();
+        let mut j = key_end + b[key_end..].iter().take_while(|&&c| matches!(c, b'"' | b'\'' | b'\\')).count();
+        j += b[j..].iter().take_while(|&&c| c == b' ').count();
+        let is_pair = j < b.len() && matches!(b[j], b':' | b'=') && !b[j..].starts_with(b"://");
+        if !is_pair || !secret_name(&s[i..key_end]) {
+            i = key_end;
+            continue;
+        }
+        j += 1;
+        j += b[j..].iter().take_while(|&&c| c == b' ').count();
+        let open = b[j..].iter().take_while(|&&c| matches!(c, b'"' | b'\'' | b'\\')).count();
+        let mut start = j + open;
+        let word = |at: usize| at + b[at..].iter().take_while(|&&c| !c.is_ascii_whitespace() && !b",;&}])\"'".contains(&c)).count();
+        if open == 0 && is_auth_scheme(&s[start..word(start)]) {
+            // Authorization: Bearer <x>: keep the scheme, mask the credential.
+            start = word(start);
+            start += b[start..].iter().take_while(|&&c| c == b' ').count();
+        }
+        let end = match &s[j..j + open] {
+            "" if start < b.len() && matches!(b[start], b'{' | b'[') => closing_bracket(&b[start..]).map_or(b.len(), |n| start + n),
+            "" => word(start),
+            "\"" => start + string_end(&b[start..]).unwrap_or(b.len() - start),
+            q => s[start..].find(q).map_or(b.len(), |n| start + n),
+        };
+        if end > start {
+            out.push_str(&s[copied..start]);
+            out.push_str(REDACTED);
+            copied = end;
+        }
+        i = end.max(key_end);
+    }
+    out.push_str(&s[copied..]);
+    out
+}
+
+fn key_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.')
+}
+
+/// Length of a JSON string body up to (not including) its closing quote.
+fn string_end(b: &[u8]) -> Option<usize> {
+    let mut escaped = false;
+    for (n, &c) in b.iter().enumerate() {
+        match c {
+            _ if escaped => escaped = false,
+            b'\\' => escaped = true,
+            b'"' => return Some(n),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Length of a `{...}` or `[...]` value, brackets included.
+fn closing_bracket(b: &[u8]) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut n = 0;
+    while n < b.len() {
+        match b[n] {
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(n + 1);
+                }
+            }
+            b'"' => n += string_end(&b[n + 1..])? + 1,
+            _ => {}
+        }
+        n += 1;
+    }
+    None
 }
 
 /// After masking a secret in `word`: if it opens a quote it doesn't close, the
@@ -274,7 +361,7 @@ fn redact_word(word: &str) -> (String, Mask) {
     let bare = word.trim_matches(|c| c == '"' || c == '\'');
     if let Some(i) = bare.find(['=', ':']) {
         let (key, value) = (&bare[..i], &bare[i + 1..]);
-        if secret_name(key) {
+        if key.bytes().all(key_char) && secret_name(key) {
             if value.is_empty() {
                 return (word.into(), Mask::Word); // password: <x>
             }
@@ -614,13 +701,27 @@ mod tests {
         // Quoted secrets with spaces are masked to the closing quote.
         assert_eq!(redact_text("tool --password 'my secret pass' --verbose"), "tool --password [redacted] --verbose");
         assert_eq!(redact_text("tool --password=\"my secret pass\" x"), "tool --password=[redacted] x");
-        assert_eq!(redact_text("export DB_PASSWORD='a b c'; run"), "export DB_PASSWORD=[redacted] ; run");
+        assert_eq!(redact_text("export DB_PASSWORD='a b c'; run"), "export DB_PASSWORD=[redacted] run");
         assert_eq!(redact_text("curl -u 'admin:my pass word' https://x"), "curl -u 'admin:[redacted] https://x");
         assert_eq!(redact_text("curl --user=\"admin:my pass\" https://x"), "curl --user=\"admin:[redacted] https://x");
         assert_eq!(redact_text("run \"password=my secret\" next"), "run password=[redacted] next");
         assert_eq!(redact_text("login --token \"it's a secret\" ok"), "login --token [redacted] ok");
         assert_eq!(redact_text("tool --password 'never closed and more"), "tool --password [redacted] ");
         assert_eq!(redact_text("echo 'hello world' --password 'x y'"), "echo 'hello world' --password [redacted] ");
+        // Secrets after a harmless key, as in MCP tool arguments, plain, escaped, nested, or cut short.
+        assert_eq!(redact_text(r#"mcp__send {"message":"hello","token":"hunter2"}"#), r#"mcp__send {"message":"hello","token":"[redacted]"}"#);
+        assert_eq!(redact_text(r#"mcp__send {"text":"a b","api_key":"x \"y\" z","n":1}"#), r#"mcp__send {"text":"a b","api_key":"[redacted]","n":1}"#);
+        assert_eq!(redact_text(r#"x {"body":"{\"password\":\"hunter2\"}"}"#), r#"x {"body":"{\"password\":\"[redacted]\"}"}"#);
+        assert_eq!(redact_text(r#"x {"credentials":{"user":"a","pass":"hunter2"},"ok":true}"#), r#"x {"credentials":[redacted],"ok":true}"#);
+        assert_eq!(redact_text(r#"x {"a":1,"secret":"hunter2 and more"#), r#"x {"a":1,"secret":"[redacted]"#);
+        assert_eq!(redact_text("a=1&password=hunter2&b=2"), "a=1&password=[redacted]&b=2");
+        assert_eq!(redact_text(r#"{"message":"my token is mine","n":2}"#), r#"{"message":"my token is mine","n":2}"#);
+        assert_eq!(redact_text("token=é€x y"), "token=[redacted] y");
+        assert_eq!(redact_text("pässword=ü token:'é"), "pässword=ü token:[redacted]");
+        // Cut-short or odd input never panics.
+        for odd in ["token=", "password:\"", "token={", "secret=\"\\", "key: [1, {", "token\\\":\\\"x"] {
+            redact_text(odd);
+        }
         let long = scrub(json!("x".repeat(2000)));
         assert_eq!(long.as_str().unwrap().chars().count(), MAX_STRING + 1);
     }

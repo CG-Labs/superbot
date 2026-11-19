@@ -936,10 +936,12 @@ mod tests {
     #[test]
     fn secrets_never_reach_the_audit_table() {
         let db = Db::open(&temp_path("scrub").join("app.sqlite")).unwrap();
-        let e = audit::Event::new(audit::Actor::operator(), "x.y").details(json!({ "token": "abc", "cmd": "curl -u admin:hunter2 https://x" }));
+        let subject = r#"mcp__chat__send {"message":"hi there","token":"hunter3"}"#;
+        let e = audit::Event::new(audit::Actor::operator(), "x.y").details(json!({ "token": "abc", "cmd": "curl -u admin:hunter2 https://x", "subject": subject }));
         db.record(&e);
         let raw: String = db.c().query_row("SELECT details FROM audit_events WHERE action = 'x.y'", [], |r| r.get(0)).unwrap();
-        assert!(!raw.contains("abc") && !raw.contains("hunter2"), "{raw}");
+        assert!(!raw.contains("abc") && !raw.contains("hunter2") && !raw.contains("hunter3"), "{raw}");
+        assert!(raw.contains("hi there"), "{raw}");
     }
 
     #[test]
