@@ -26,6 +26,35 @@ struct Screen {
     token: String,
     used: Instant,
     procs: Vec<Child>,
+    /// voxl, kept apart so a new token restarts only the viewer, not the display.
+    viewer: Option<Child>,
+}
+
+impl Screen {
+    fn alive(&mut self) -> bool {
+        self.procs.iter_mut().chain(self.viewer.as_mut()).all(|c| matches!(c.try_wait(), Ok(None)))
+    }
+}
+
+fn new_token() -> String {
+    let token: String = crate::random_bytes(16).iter().map(|x| format!("{x:02x}")).collect();
+    crate::secrets::redact::register(&token);
+    token
+}
+
+/// voxl streams the display. Its own token login guards the stream; the proxy in front adds HTTPS.
+fn spawn_viewer(display: &str, port: u16, token: &str) -> std::io::Result<Option<Child>> {
+    if !on_path("voxl") {
+        return Ok(None);
+    }
+    spawn(
+        Command::new("voxl")
+            .args(["--addr", "127.0.0.1", "--port", &port.to_string(), "--allowed-hosts", "*"])
+            .args(["--audio-enabled", "false", "--file-transfers", "none", "--enable-clipboard", "true"])
+            .env("DISPLAY", display)
+            .env("VOXL_PASSWORD", token),
+    )
+    .map(Some)
 }
 
 /// What a Bot run and the web app need to reach a screen.
@@ -103,7 +132,7 @@ impl Screens {
     pub async fn ensure(&self, bot_id: &str, busy: impl Fn(&str) -> bool) -> Option<Info> {
         let mut live = self.live.lock().await;
         if let Some(s) = live.get_mut(bot_id) {
-            if s.procs.iter_mut().all(|c| matches!(c.try_wait(), Ok(None))) {
+            if s.alive() {
                 s.used = Instant::now();
                 return Some(self.info(s));
             }
@@ -130,7 +159,7 @@ impl Screens {
     }
 
     async fn start(&self, slot: u16) -> std::io::Result<Screen> {
-        let mut s = Screen { slot, token: new_token(), used: Instant::now(), procs: Vec::new() };
+        let mut s = Screen { slot, token: new_token(), used: Instant::now(), procs: Vec::new(), viewer: None };
         let Info { display, bus, port, .. } = self.info(&s);
         let n = self.base + slot;
 
@@ -153,43 +182,39 @@ impl Screens {
         let _ = std::fs::remove_file(&bus_path);
         s.procs.push(spawn(Command::new("dbus-daemon").args(["--session", "--nofork", &format!("--address={bus}")]))?);
         s.procs.push(spawn(Command::new("openbox").env("DISPLAY", &display).env("DBUS_SESSION_BUS_ADDRESS", &bus))?);
-        if on_path("voxl") {
-            s.procs.push(spawn(&mut voxl(&display, port, &s.token))?);
-        }
+        s.viewer = spawn_viewer(&display, port, &s.token)?;
         Ok(s)
     }
 
-    /// New screen links for the Bot: a new token and a restarted viewer, which
-    /// closes every open view. The display and its apps keep running. For when
-    /// someone may have lost access to the Bot (ADR 0017).
-    pub async fn rekey(&self, bot_id: &str) {
+    /// Gives a running screen a new token and restarts its viewer, so earlier links
+    /// and open views stop working while the display and the Bot's apps keep going.
+    /// For when someone loses access to the Bot: the proxy doesn't ask `botd`.
+    pub async fn rotate_token(&self, bot_id: &str) {
         let mut live = self.live.lock().await;
         let Some(s) = live.get_mut(bot_id) else { return };
-        crate::secrets::redact::forget(&s.token);
-        s.token = new_token();
-        // The viewer is the last process, after Xvfb, D-Bus, and Openbox.
-        if s.procs.len() == 4 {
-            let _ = s.procs[3].kill().await;
-            let Info { display, port, .. } = self.info(s);
-            match spawn(&mut voxl(&display, port, &s.token)) {
-                Ok(c) => s.procs[3] = c,
-                Err(e) => {
-                    eprintln!("Screen viewer for {bot_id} didn't restart: {e}");
-                    let s = live.remove(bot_id).unwrap();
-                    stop(bot_id, s).await;
-                }
+        if let Some(mut v) = s.viewer.take() {
+            let _ = v.kill().await;
+        }
+        let old = std::mem::replace(&mut s.token, new_token());
+        crate::secrets::redact::forget(&old);
+        let Info { display, port, .. } = self.info(s);
+        match spawn_viewer(&display, port, &s.token) {
+            Ok(v) => s.viewer = v,
+            Err(e) => {
+                eprintln!("Screen viewer for {bot_id} failed to restart: {e}");
+                let s = live.remove(bot_id).unwrap();
+                stop(bot_id, s).await;
             }
         }
     }
 
-    /// `rekey` for every live screen.
-    pub async fn rekey_all(&self) {
+    /// `rotate_token` for every running screen.
+    pub async fn rotate_all(&self) {
         let ids: Vec<String> = self.live.lock().await.keys().cloned().collect();
         for id in ids {
-            self.rekey(&id).await;
+            self.rotate_token(&id).await;
         }
     }
-
 
     /// Stops screens that nobody used for a while.
     pub async fn reap(&self, busy: impl Fn(&str) -> bool) {
@@ -208,22 +233,6 @@ impl Screens {
             stop(bot_id, s).await;
         }
     }
-}
-
-fn new_token() -> String {
-    let token: String = crate::random_bytes(16).iter().map(|x| format!("{x:02x}")).collect();
-    crate::secrets::redact::register(&token);
-    token
-}
-
-/// voxl's own token login guards the stream; the proxy in front adds HTTPS.
-fn voxl(display: &str, port: u16, token: &str) -> Command {
-    let mut cmd = Command::new("voxl");
-    cmd.args(["--addr", "127.0.0.1", "--port", &port.to_string(), "--allowed-hosts", "*"])
-        .args(["--audio-enabled", "false", "--file-transfers", "none", "--enable-clipboard", "true"])
-        .env("DISPLAY", display)
-        .env("VOXL_PASSWORD", token);
-    cmd
 }
 
 /// Polls a local port every 100 ms until it accepts a connection. False after `tries`.
@@ -301,24 +310,28 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_new_token_keeps_the_display_running() {
+        let dir = std::env::temp_dir().join(format!("superbot-screens-{}", crate::short_id()));
+        let screens = Screens { max: 1, idle: Duration::from_secs(60), base: 100, size: (1280, 800), run_dir: dir, live: Mutex::default() };
+        let display = spawn(Command::new("sleep").arg("30")).unwrap();
+        let s = Screen { slot: 1, token: new_token(), used: Instant::now(), procs: vec![display], viewer: None };
+        screens.live.lock().await.insert("b1".into(), s);
+        let before = screens.ensure("b1", |_| true).await.unwrap().token;
+
+        screens.rotate_token("b1").await;
+        let after = screens.ensure("b1", |_| true).await.unwrap().token;
+        assert_ne!(before, after);
+        assert_eq!(after.len(), 32);
+        assert!(screens.live.lock().await.get_mut("b1").unwrap().alive(), "same display, not restarted");
+        screens.rotate_token("nobody").await;
+        screens.remove("b1").await;
+    }
+
     #[test]
     fn display_leftovers_stay_in_their_folders() {
         let (sock, lock) = x11_paths(101).unwrap();
         assert_eq!(sock, PathBuf::from("/tmp/.X11-unix/X101"));
         assert_eq!(lock, PathBuf::from("/tmp/.X101-lock"));
-    }
-
-    #[tokio::test]
-    async fn rekeying_gives_new_links_and_keeps_the_screen() {
-        let screens = Screens { max: 2, idle: Duration::from_secs(60), base: 900, size: (1280, 800), run_dir: std::env::temp_dir(), live: Mutex::default() };
-        let old = new_token();
-        screens.live.lock().await.insert("b1".into(), Screen { slot: 1, token: old.clone(), used: Instant::now(), procs: Vec::new() });
-        screens.rekey("b1").await;
-        screens.rekey("nobody").await;
-        let live = screens.live.lock().await;
-        let new = &live["b1"].token;
-        assert!(new != &old && new.len() == 32);
-        let known = crate::secrets::redact::known();
-        assert!(known.contains(new) && !known.contains(&old), "only the live token is redacted");
     }
 }

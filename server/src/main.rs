@@ -1061,13 +1061,14 @@ fn access_view(app: &App, b: &db::Bot, access: Access) -> Value {
 /// After an ACL change: everyone's lists and live streams start over, since who
 /// sees the Bot may have changed. The resync goes first: it clears each stream's
 /// cached access, so the Bot's update reaches exactly who can now see it.
-/// When someone may have lost access, open screen links stop working too.
+/// When someone may have lost access, its screen also gets a new token: the
+/// proxy sends screen traffic straight to voxl, so an old link would keep working.
 async fn acl_changed(app: &App, id: &str, narrowed: bool) {
+    if narrowed && let Some(screens) = &app.screens {
+        screens.rotate_token(id).await;
+    }
     app.send(json!({ "type": "resync" }));
     app.push_bot(id);
-    if narrowed && let Some(screens) = &app.screens {
-        screens.rekey(id).await;
-    }
 }
 
 async fn get_access(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
@@ -1130,7 +1131,7 @@ async fn put_grant(State(app): State<AppState>, Extension(c): Extension<Caller>,
     let before = app.db.set_grant(&id, &u.id, level, by_id);
     if before != Some(level) {
         app.db.record(&by.event("bot.access_granted").target("bot", &id).bot(&id).details(json!({ "user": u.id, "level": level, "from": before })));
-        acl_changed(&app, &id, before == Some(acl::Grant::Operator)).await;
+        acl_changed(&app, &id, before == Some(acl::Grant::Operator) && level == acl::Grant::Viewer).await;
     }
     Ok(Json(access_view(&app, &bot, access)))
 }

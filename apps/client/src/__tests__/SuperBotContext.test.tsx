@@ -49,10 +49,13 @@ let loginToken: string | null = null;
 let permissions: string[] | undefined;
 /** Bob's Bot ACL fields, as a server with ADR 0017 sends them. */
 let bobAcl: Record<string, unknown> = {};
-/** When set, Bob is gone for this user, as after a Bot is made private. */
-let bobHidden = false;
 /** When set, the server never answers a logout. */
 let stallLogout = false;
+/** Bob's access was revoked: gone from the state, and his history is a 404. */
+let bobHidden = false;
+/** Bob's history request fails with a 500. */
+let bobHistoryFails = false;
+let adaHistory: Message[] = [];
 const TOKEN = "sbs_" + "a".repeat(64);
 
 function respond(status: number, body: unknown) {
@@ -69,8 +72,10 @@ beforeEach(() => {
   loginToken = null;
   permissions = undefined;
   bobAcl = {};
-  bobHidden = false;
   stallLogout = false;
+  bobHidden = false;
+  bobHistoryFails = false;
+  adaHistory = [];
   (connectSse as jest.Mock).mockClear();
   (saveCredentials as jest.Mock).mockClear();
   (clearCredentials as jest.Mock).mockClear();
@@ -92,9 +97,10 @@ beforeEach(() => {
       const bob = { ...bot("b2", false, bobUnread, bobHandoff), ...bobAcl };
       return respond(200, { me: { name: "Me", permissions }, harnesses: ["claude"], defaultHarness: "claude", bots: bobHidden ? [bot("b1", true)] : [bot("b1", true), bob] });
     }
-    if (path.startsWith("/api/bots/b2/") && bobHidden) return respond(404, { error: "Bot not found" });
-    if (path === "/api/bots/b1/messages" && method === "GET") return respond(200, []);
+    if (path === "/api/bots/b1/messages" && method === "GET") return respond(200, adaHistory);
     if (path === "/api/bots/b2/messages" && method === "GET") {
+      if (bobHidden) return respond(404, { error: "Bot not found" });
+      if (bobHistoryFails) return respond(500, { error: "boom" });
       if (!holdHistory) return respond(200, history);
       return new Promise((resolve) => {
         releaseHistory = () => resolve(respond(200, history));
@@ -337,20 +343,29 @@ describe("SuperBotProvider", () => {
     expect(result.current.bots.find((b) => b.id === "b2")?.visibility).toBe("private");
   });
 
-  it("drops a Bot's chat when it is no longer visible and still reloads the rest", async () => {
+  it("forgets a Bot's chat once access to it is revoked", async () => {
+    const { result, emit } = await connected();
+    await act(() => result.current.loadMessages("b2"));
+    expect(result.current.handoffs.b2?.id).toBe(12);
+
+    bobHidden = true;
+    const before = calls.length;
+    await emit({ type: "resync" });
+    await waitFor(() => expect(result.current.bots.map((b) => b.id)).toEqual(["b1"]));
+    expect(result.current.messages.b2).toBeUndefined();
+    expect(result.current.handoffs.b2).toBeUndefined();
+    expect(calls.slice(before).some((c) => c.url.endsWith("/api/bots/b2/messages"))).toBe(false);
+  });
+
+  it("keeps reloading other chats when one fails", async () => {
     const { result, emit } = await connected();
     await act(() => result.current.loadMessages("b2"));
     await act(() => result.current.loadMessages("b1"));
-    expect(result.current.handoffs.b2?.id).toBe(12);
-    const loads = (id: string) => calls.filter((c) => c.url.endsWith(`/api/bots/${id}/messages`) && c.method === "GET").length;
-    expect([loads("b1"), loads("b2")]).toEqual([1, 1]);
 
-    bobHidden = true;
+    bobHistoryFails = true;
+    adaHistory = [{ id: 20, botId: "b1", role: "bot", text: "While you were away", at: 5 }];
     await emit({ type: "resync" });
-    await waitFor(() => expect(loads("b1")).toBe(2));
-    expect(loads("b2")).toBe(1);
-    expect(result.current.messages.b2).toBeUndefined();
-    expect(result.current.handoffs.b2).toBeUndefined();
-    expect(result.current.bots.map((b) => b.id)).toEqual(["b1"]);
+    await waitFor(() => expect(result.current.messages.b1?.map((m) => m.id)).toEqual([20]));
+    expect(result.current.messages.b2.map((m) => m.id)).toEqual([11, 12]);
   });
 });

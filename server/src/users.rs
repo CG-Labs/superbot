@@ -451,7 +451,7 @@ pub async fn update_user(State(app): State<AppState>, Extension(by): Extension<W
     // Screen links don't know who opened them, so anyone losing access closes them all.
     let lost = (before.role != after.role && after.role != Role::Admin) || (before.active() && !after.active());
     if lost && let Some(screens) = &app.screens {
-        screens.rekey_all().await;
+        screens.rotate_all().await;
     }
     Ok(Json(user_view(&after)))
 }
