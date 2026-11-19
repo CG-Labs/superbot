@@ -140,6 +140,10 @@ impl Screens {
                     .env("DISPLAY", &display)
                     .env("VOXL_PASSWORD", &s.token),
             )?);
+            // The live view link is handed out right after this; a frame loaded before voxl listens gets a 502.
+            if !wait_for_port(port, 50).await {
+                eprintln!("voxl on port {port} isn't listening yet");
+            }
         }
         Ok(s)
     }
@@ -161,6 +165,17 @@ impl Screens {
             stop(bot_id, s).await;
         }
     }
+}
+
+/// Polls a local port every 100 ms until it accepts a connection. False after `tries`.
+async fn wait_for_port(port: u16, tries: u32) -> bool {
+    for _ in 0..tries {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
 }
 
 /// Closes the Bot's browser cleanly (so its profile saves), then kills the screen.
@@ -188,4 +203,32 @@ pub fn bot_env(info: &Info, bot_id: &str, bot_dir: &Path) -> HashMap<String, Str
         ("QT_ACCESSIBILITY".into(), "1".into()),
         ("ACCESSIBILITY_ENABLED".into(), "1".into()),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn waits_for_a_listener() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(wait_for_port(port, 1).await);
+        drop(listener);
+        assert!(!wait_for_port(port, 2).await);
+    }
+
+    #[tokio::test]
+    async fn sees_a_late_listener() {
+        let probe = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let l = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            drop(l);
+        });
+        assert!(wait_for_port(port, 20).await);
+    }
 }
