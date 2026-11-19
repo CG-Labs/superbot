@@ -255,10 +255,10 @@ fn redact_word(word: &str) -> (String, Mask) {
             }
             return (format!("{key}{}{REDACTED}", &bare[i..=i]), Mask::None);
         }
-        if key == "--user" || key == "-u" {
-            if let Some((user, _)) = value.split_once(':') {
-                return (format!("{key}={user}:{REDACTED}"), Mask::None);
-            }
+        if (key == "--user" || key == "-u")
+            && let Some((user, _)) = value.split_once(':')
+        {
+            return (format!("{key}={user}:{REDACTED}"), Mask::None);
         }
     }
     let mut s = bare.to_string();

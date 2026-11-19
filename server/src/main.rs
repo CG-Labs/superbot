@@ -334,8 +334,7 @@ fn request_source(req: &Request, trust_forwarded: bool) -> Source {
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(','))
         .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .last()
+        .rfind(|v| !v.is_empty())
         .and_then(|v| v.parse::<IpAddr>().ok());
     let ip = match forwarded {
         Some(f) if trust_forwarded || peer.is_some_and(|p| p.is_loopback()) => Some(f.to_canonical()),
@@ -685,14 +684,14 @@ async fn send_message(State(app): State<AppState>, Extension(by): Extension<Who>
     let text: String = text.chars().take(100_000).collect();
     // Answering a choice card: remember which option was picked.
     let mut handoff = None;
-    if let (Some(mid), Some(opt)) = (v["answer"]["messageId"].as_i64(), v["answer"]["option"].as_u64()) {
-        if let Some(mut q) = app.db.message(mid).filter(|m| m.bot_id == id).and_then(|m| m.question) {
-            if q["handoff"] == json!(true) && q["picked"].is_null() {
-                handoff = Some((mid, q["options"][opt as usize].as_str().map(String::from)));
-            }
-            q["picked"] = json!(opt);
-            app.db.set_question(mid, &q);
+    if let (Some(mid), Some(opt)) = (v["answer"]["messageId"].as_i64(), v["answer"]["option"].as_u64())
+        && let Some(mut q) = app.db.message(mid).filter(|m| m.bot_id == id).and_then(|m| m.question)
+    {
+        if q["handoff"] == json!(true) && q["picked"].is_null() {
+            handoff = Some((mid, q["options"][opt as usize].as_str().map(String::from)));
         }
+        q["picked"] = json!(opt);
+        app.db.set_question(mid, &q);
     }
     let waiter = v["answer"]["messageId"].as_i64().and_then(|mid| app.take_handoff(mid));
     if let Some((mid, option)) = handoff {
