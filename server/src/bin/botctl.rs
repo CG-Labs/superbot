@@ -94,8 +94,9 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl bot revoke <bot> <user>
 
   botctl policy [<bot>]                            Show the global or a Bot's policy
-  botctl policy set <global|bot> [mode=ask|bypass] [timeout=<minutes>] [<class>=allow|ask|deny]...
+  botctl policy set <global|bot> [mode=ask|bypass] [sandbox=on|off] [timeout=<minutes>] [<class>=allow|ask|deny]...
                                                    On a Bot, =inherit follows the global value again
+                                                   sandbox: the harness's own sandbox (Codex, Claude Code)
   botctl policy reset <bot>                        Drop a Bot's override; it follows global again
   botctl rules [<bot>]                             List allow/deny rules
   botctl rule add <allow|deny> "<pattern>" [--tool <tool>] [--bot <bot>]
@@ -163,7 +164,17 @@ fn send(cred: Cred, method: &str, path: &str, body: Option<String>) -> Result<Tc
     if operator && !loopback(addr) {
         return Err(format!("botctl sends SUPERBOT_TOKEN, SUPERBOT_PASSWORD, and sign-in codes only to a server on this machine, not {addr}. Run it on the server, or set BOT_API to an SSH tunnel on 127.0.0.1."));
     }
-    let mut s = TcpStream::connect(addr).map_err(|e| format!("Can't reach the server: {e}"))?;
+    let (mut s, target, via) = match TcpStream::connect(addr) {
+        Ok(s) => (s, path.to_string(), String::new()),
+        Err(e) => match proxy().filter(|_| !operator) {
+            Some(p) => {
+                let s = TcpStream::connect(p.addr.as_str()).map_err(|_| format!("Can't reach the server: {e}"))?;
+                let via = p.auth.map(|a| format!("Proxy-Authorization: Basic {}\r\n", base64(a.as_bytes()))).unwrap_or_default();
+                (s, format!("http://{addr}{path}"), via)
+            }
+            None => return Err(format!("Can't reach the server: {e}")),
+        },
+    };
     if operator && !s.peer_addr().is_ok_and(|a| a.ip().is_loopback()) {
         return Err(format!("{addr} isn't on this machine, so botctl won't send credentials there."));
     }
@@ -171,7 +182,7 @@ fn send(cred: Cred, method: &str, path: &str, body: Option<String>) -> Result<Tc
     let body = body.unwrap_or_default();
     // BOT_TOKEN is this Bot's own, so it says which Bot is calling (ADR 0029).
     let req = format!(
-        "{method} {path} HTTP/1.0\r\nHost: {addr}\r\n{auth}User-Agent: botctl/{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        "{method} {target} HTTP/1.0\r\nHost: {addr}\r\n{via}{auth}User-Agent: botctl/{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         env!("CARGO_PKG_VERSION"),
         body.len()
     );
@@ -344,6 +355,51 @@ fn addr(base: &str) -> Result<&str, String> {
     Ok(a)
 }
 
+/// An HTTP proxy on this machine, from `HTTP_PROXY`.
+struct Proxy {
+    addr: String,
+    /// `user:password`, decoded.
+    auth: Option<String>,
+}
+
+/// A sandboxed run (ADR 0055) may reach botd only through its harness's proxy: Claude
+/// Code's runs commands in their own network, with `HTTP_PROXY` pointing at a proxy that
+/// lets through the hosts it's told about. Only a proxy on this machine gets BOT_TOKEN;
+/// plain http to one elsewhere would show it to the network.
+fn proxy() -> Option<Proxy> {
+    let url = std::env::var("HTTP_PROXY").or_else(|_| std::env::var("http_proxy")).ok()?;
+    parse_proxy(&url)
+}
+
+fn parse_proxy(url: &str) -> Option<Proxy> {
+    let rest = url.strip_prefix("http://")?.trim_end_matches('/');
+    let (auth, addr) = match rest.rsplit_once('@') {
+        Some((a, h)) => (Some(a), h),
+        None => (None, rest),
+    };
+    (!addr.is_empty() && !addr.contains(['/', '?', '#']) && loopback(addr)).then(|| Proxy { addr: addr.to_string(), auth: auth.map(unescape) })
+}
+
+/// Percent-decodes `s`; a malformed escape stays as written.
+fn unescape(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match (b[i], b.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok())) {
+            (b'%', Some(x)) => {
+                out.push(x);
+                i += 3;
+            }
+            (c, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Whether `addr` names this machine. Plain http crosses any network in the clear,
 /// so the operator password only goes to loopback.
 fn loopback(addr: &str) -> bool {
@@ -415,6 +471,15 @@ fn policy_patch(args: &[&str]) -> Result<Value, String> {
         let inherit = v == "inherit";
         match k {
             "mode" => _ = patch.insert("mode".into(), if inherit { Value::Null } else { json!(v) }),
+            "sandbox" => {
+                let on = match v {
+                    "inherit" => Value::Null,
+                    "on" => json!(true),
+                    "off" => json!(false),
+                    _ => return Err("sandbox must be on, off, or inherit".into()),
+                };
+                patch.insert("sandbox".into(), on);
+            }
             "timeout" if inherit => _ = patch.insert("timeoutMinutes".into(), Value::Null),
             "timeout" => _ = patch.insert("timeoutMinutes".into(), json!(v.parse::<u64>().map_err(|_| "timeout must be minutes")?)),
             class => _ = classes.insert(class.into(), if inherit { Value::Null } else { json!(v) }),
@@ -966,6 +1031,9 @@ fn main() {
 mod tests {
     use super::*;
 
+    /// Held by tests that set botctl's environment variables.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn handover_names_the_disabled_user_and_who_takes_over() {
         let (path, body) = handover_request("ada@example.com", &["bea@example.com"]).unwrap();
@@ -1037,7 +1105,8 @@ mod tests {
         for b in ["https://127.0.0.1:3000", "127.0.0.1:3000", "http://user@192.0.2.7:3000", "http://192.0.2.7:3000/x", "http://"] {
             assert!(addr(b).is_err(), "{b}");
         }
-        // SAFETY: tests in this binary don't read these variables concurrently.
+        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: tests that set these variables hold ENV.
         unsafe {
             std::env::set_var("BOT_API", "http://192.0.2.7:3000");
             std::env::set_var("SUPERBOT_PASSWORD", std::process::id().to_string());
@@ -1253,6 +1322,59 @@ mod tests {
         assert!(policy_patch(&["timeout=soon"]).is_err());
         let p = policy_patch(&["mode=inherit", "timeout=inherit", "git_push=inherit"]).unwrap();
         assert_eq!(p, json!({ "mode": null, "timeoutMinutes": null, "classes": { "git_push": null } }));
+        assert_eq!(policy_patch(&["sandbox=on"]).unwrap(), json!({ "sandbox": true }));
+        assert_eq!(policy_patch(&["sandbox=off", "mode=bypass"]).unwrap(), json!({ "sandbox": false, "mode": "bypass" }));
+        assert_eq!(policy_patch(&["sandbox=inherit"]).unwrap(), json!({ "sandbox": null }));
+        assert!(policy_patch(&["sandbox=yes"]).is_err());
+    }
+
+    #[test]
+    fn only_a_proxy_on_this_machine_gets_the_bot_token() {
+        let p = parse_proxy("http://user:p%40ss%3Aw@localhost:3128").unwrap();
+        assert_eq!((p.addr.as_str(), p.auth.as_deref()), ("localhost:3128", Some("user:p@ss:w")));
+        let p = parse_proxy("http://127.0.0.1:41000/").unwrap();
+        assert_eq!((p.addr.as_str(), p.auth), ("127.0.0.1:41000", None));
+        for bad in ["http://proxy.example:3128", "https://localhost:3128", "http://localhost:3128/x", "socks5://localhost:1080", "http://", "http://u:p@10.0.0.1:3128"] {
+            assert!(parse_proxy(bad).is_none(), "{bad}");
+        }
+        assert_eq!(unescape("a%2"), "a%2");
+    }
+
+    #[test]
+    fn a_bot_run_reaches_botd_through_its_sandboxs_proxy() {
+        use std::net::TcpListener;
+        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = proxy.local_addr().unwrap();
+        let seen = std::thread::spawn(move || {
+            let (mut c, _) = proxy.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = c.read(&mut buf).unwrap();
+            c.write_all(b"HTTP/1.0 200 OK\r\n\r\n{\"ok\":true}").unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+        // Nothing listens on BOT_API itself, as in a sandbox's own network.
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: tests that set these variables hold ENV.
+        unsafe {
+            std::env::set_var("BOT_API", format!("http://{closed}"));
+            std::env::set_var("BOT_TOKEN", "tok");
+            std::env::set_var("HTTP_PROXY", format!("http://sb:s%3Acret@{at}"));
+        }
+        let body = api(Cred::Bot, "GET", "/api/bot/routines", None).unwrap();
+        assert_eq!(body, r#"{"ok":true}"#);
+        let req = seen.join().unwrap();
+        assert!(req.starts_with(&format!("GET http://{closed}/api/bot/routines HTTP/1.0\r\n")), "{req}");
+        assert!(req.contains(&format!("Proxy-Authorization: Basic {}\r\n", base64(b"sb:s:cret"))), "{req}");
+        assert!(req.contains("Authorization: Bearer tok\r\n"));
+        // An operator's credentials never take a proxy.
+        unsafe { std::env::set_var("SUPERBOT_TOKEN", "op") };
+        assert!(api(Cred::Operator, "GET", "/api/policy", None).is_err());
+        unsafe {
+            for k in ["BOT_API", "BOT_TOKEN", "HTTP_PROXY", "SUPERBOT_TOKEN"] {
+                std::env::remove_var(k);
+            }
+        }
     }
 
     #[test]

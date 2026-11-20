@@ -144,3 +144,94 @@ async fn rules_are_listed_added_and_deleted_with_bounds_and_audit() {
     assert_eq!(events.iter().map(|e| e["action"].as_str().unwrap()).collect::<Vec<_>>(), ["rule.removed", "rule.added", "rule.added", "rule.added"]);
     assert_eq!((events[0]["botId"].as_str(), events[0]["details"]["rule"]["pattern"].as_str()), (Some(bot.id.as_str()), Some("git push origin *")));
 }
+
+/// A Claude Code that keeps its arguments next to itself and says one thing.
+fn arg_keeping_claude(app: &App) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = app.cfg.bin_dir.join("claude");
+    let reply = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"On it."}]}}"#;
+    std::fs::write(&path, format!("#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.args\"\necho '{reply}'\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    app.cfg.bin_dir.join("claude.args")
+}
+
+async fn invoked_after(port: u16, admin: &str, bot: &str, n: usize) -> Value {
+    for _ in 0..500 {
+        let (_, body) = call(port, "GET", &format!("/api/audit?action=harness.invoked&bot={bot}"), admin, "").await;
+        let found = audit_list(&body);
+        if found.len() >= n {
+            return found[0].clone();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("no run {n} of {bot}");
+}
+
+#[tokio::test]
+async fn the_sandbox_is_on_for_new_installs_set_per_bot_and_audited() {
+    let (port, app, admin, _) = serve_app().await;
+    let (_, member) = user_with(port, &admin, "m@example.com", "member").await;
+    let args = arg_keeping_claude(&app);
+    let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
+    let path = format!("/api/bots/{}/policy", bot.id);
+
+    let (_, body) = call(port, "GET", "/api/policy", &member, "").await;
+    let v = parse(&body);
+    assert_eq!(v["policy"]["sandbox"], true, "on for a new install");
+    assert_eq!(v["sandbox"], json!({ "harnesses": ["claude", "codex"], "available": true }));
+    assert_eq!(call(port, "PUT", "/api/policy", &member, r#"{"sandbox":false}"#).await.0, 403);
+    for bad in [r#"{"sandbox":"yes"}"#, r#"{"sandbox":1}"#] {
+        assert_eq!(call(port, "PUT", "/api/policy", &admin, bad).await.0, 400, "{bad}");
+        assert_eq!(call(port, "PUT", &path, &admin, bad).await.0, 400, "{bad}");
+    }
+    let (_, body) = call(port, "PUT", "/api/policy", &admin, r#"{"sandbox":null}"#).await;
+    assert_eq!(parse(&body)["policy"]["sandbox"], true, "null leaves the global setting as it is");
+
+    // A run gets Claude Code's sandbox, with the hook, and says so in the audit log.
+    let send = |n: usize| {
+        let (admin, bot, app) = (admin.clone(), bot.id.clone(), app.clone());
+        async move {
+            assert_eq!(call(port, "POST", &format!("/api/bots/{bot}/messages"), &admin, r#"{"text":"build it"}"#).await.0, 202);
+            let e = invoked_after(port, &admin, &bot, n).await;
+            for _ in 0..500 {
+                if !app.is_running(&bot) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            e
+        }
+    };
+    let e = send(1).await;
+    assert_eq!(e["details"]["sandbox"], "on", "{e}");
+    let a = std::fs::read_to_string(&args).unwrap();
+    let settings: Value = serde_json::from_str(a.lines().skip_while(|l| *l != "--settings").nth(1).unwrap()).unwrap();
+    assert_eq!(settings["sandbox"]["enabled"], true);
+    assert!(settings["hooks"]["PreToolUse"].is_array());
+    assert_eq!(settings["sandbox"]["network"]["allowedDomains"], json!(["127.0.0.1:1"]), "botd's API, for botctl");
+
+    // A Bot turns it off for itself; the rest keep the global setting.
+    let (code, body) = call(port, "PUT", &path, &admin, r#"{"sandbox":false}"#).await;
+    assert_eq!(code, 200, "{body}");
+    let v = parse(&body);
+    assert_eq!((v["override"].clone(), v["policy"]["sandbox"].clone()), (json!({ "sandbox": false }), json!(false)));
+    assert_eq!(send(2).await["details"]["sandbox"], "off");
+    assert!(!std::fs::read_to_string(&args).unwrap().contains("\"sandbox\""));
+
+    // Back to inheriting.
+    let (_, body) = call(port, "PUT", &path, &admin, r#"{"sandbox":null}"#).await;
+    assert!(parse(&body)["override"].is_null());
+    assert_eq!(app.db.effective_policy(&bot.id).sandbox, true);
+
+    let (_, audit) = call(port, "GET", &format!("/api/audit?action=policy.updated&bot={}", bot.id), &admin, "").await;
+    let events = audit_list(&audit);
+    assert_eq!((events[1]["details"]["before"].clone(), events[1]["details"]["after"].clone()), (Value::Null, json!({ "sandbox": false })));
+    assert_eq!(events[0]["details"]["after"], json!({}));
+
+    let (code, body) = call(port, "PUT", "/api/policy", &admin, r#"{"sandbox":false}"#).await;
+    assert_eq!((code, parse(&body)["policy"]["sandbox"].clone()), (200, json!(false)), "{body}");
+    let (_, audit) = call(port, "GET", "/api/audit?action=policy.updated", &admin, "").await;
+    let e = &audit_list(&audit)[0];
+    assert_eq!(e["targetId"], "global");
+    assert_eq!((e["details"]["before"]["sandbox"].clone(), e["details"]["after"]["sandbox"].clone()), (json!(true), json!(false)));
+}

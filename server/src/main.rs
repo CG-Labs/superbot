@@ -360,6 +360,8 @@ async fn main() {
         "version": env!("CARGO_PKG_VERSION"),
         "defaultHarness": app.cfg.default_harness,
         "policyMode": policy.mode,
+        "sandbox": policy.sandbox,
+        "sandboxAvailable": app.cfg.sandbox_available,
         "auth": match (break_glass, password.is_empty()) {
             (true, false) => "sessions+password",
             (true, true) => "none",
@@ -388,6 +390,14 @@ async fn main() {
         eprintln!(
             "WARNING: harness policy is bypass: Bots run every tool without asking. \
              Opt in to approvals with `botctl policy set global mode=ask` (see docs/backend.md)."
+        );
+    }
+    if !policy.sandbox {
+        eprintln!("Harness sandboxes: off. Turn them on with `botctl policy set global sandbox=on` (ADR 0055).");
+    } else if !app.cfg.sandbox_available {
+        eprintln!(
+            "WARNING: harness sandboxes are on but can't start here (no unprivileged user namespaces, or no bubblewrap), \
+             so runs on this server go without them. Install bubblewrap and socat, or allow user namespaces (ADR 0055)."
         );
     }
 
@@ -2213,8 +2223,15 @@ fn classes_view() -> Value {
     json!(policy::CLASSES.iter().map(|(id, label)| json!({ "id": id, "label": label })).collect::<Vec<_>>())
 }
 
+/// What the policy's `sandbox` can do here (ADR 0055): which harnesses have one, and
+/// whether it can start on this server. A machine reports its own at each run.
+fn sandbox_view(app: &App) -> Value {
+    let harnesses: Vec<&str> = adapters::NAMES.iter().copied().filter(|n| adapters::get(n).is_some_and(|a| a.has_sandbox())).collect();
+    json!({ "harnesses": harnesses, "available": app.cfg.sandbox_available })
+}
+
 async fn get_policy(State(app): State<AppState>) -> Json<Value> {
-    Json(json!({ "policy": app.db.global_policy(), "classes": classes_view(), "rules": app.db.rules(None) }))
+    Json(json!({ "policy": app.db.global_policy(), "classes": classes_view(), "rules": app.db.rules(None), "sandbox": sandbox_view(&app) }))
 }
 
 async fn put_policy(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res {
@@ -2232,7 +2249,7 @@ async fn put_policy(State(app): State<AppState>, Extension(who): Extension<Princ
 }
 
 fn bot_policy_view(app: &App, id: &str) -> Value {
-    json!({ "policy": app.db.effective_policy(id), "override": app.db.bot_override(id), "classes": classes_view(), "rules": app.db.rules(Some(id)) })
+    json!({ "policy": app.db.effective_policy(id), "override": app.db.bot_override(id), "classes": classes_view(), "rules": app.db.rules(Some(id)), "sandbox": sandbox_view(app) })
 }
 
 async fn get_bot_policy(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
