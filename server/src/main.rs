@@ -1837,17 +1837,40 @@ async fn ask(State(app): State<AppState>, Extension(c): Extension<Caller>, Exten
 
 // Screens: the live view of a Bot's screen. Opening it starts the screen.
 
-async fn screen_info(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
+/// The caller as they are now, role read again: None once their session is revoked or
+/// expired, or they're disabled.
+fn caller_now(app: &App, a: &Auth, c: &Caller) -> Option<Caller> {
+    let Some(s) = &c.session else { return Some(c.clone()) };
+    if !app.db.session_is_live(&s.id, db::now(), a.sessions.idle_ms, a.sessions.max_ms) {
+        return None;
+    }
+    let u = app.db.user(&s.user_id)?;
+    Some(Caller { principal: Principal::User(u.role), user: Some(u), ..c.clone() })
+}
+
+async fn screen_info(
+    State(app): State<AppState>,
+    Extension(a): Extension<Arc<Auth>>,
+    Extension(c): Extension<Caller>,
+    Extension(by): Extension<Who>,
+    Path(id): Path<String>,
+) -> Res {
     // The link gives control of the screen.
     let (bot, _) = need_bot_access(&app, &c, &by, &id, Access::Operate)?;
-    // A Bot on its owner's machine is shown from there or not at all (ADR 0045).
-    if let Some(url) = machines::screens::open(&app, &by, &bot).await? {
+    // A Bot on its owner's machine is shown from there or not at all (ADR 0045). Its
+    // screen may change hands while this waits on it, so access is checked again then.
+    let still = || match caller_now(&app, &a, &c) {
+        Some(now) => need_bot_access(&app, &now, &by, &id, Access::Operate).map(drop),
+        None => Err(ApiError(StatusCode::UNAUTHORIZED, "Your session has ended. Sign in again.".into())),
+    };
+    if let Some(url) = machines::screens::open(&app, &by, &bot, still).await? {
         return Ok(Json(json!({ "url": url })));
     }
     let off = || ApiError(StatusCode::NOT_FOUND, "Screens are off on this server. Install Xvfb, openbox, and voxl.".into());
     let screens = app.screens.as_ref().filter(|_| screen::on_path("voxl")).ok_or_else(off)?;
     let info = screens.ensure(&id, |b| app.is_running(b)).await;
     let info = info.ok_or_else(|| ApiError(StatusCode::SERVICE_UNAVAILABLE, "All screens are in use. Try again when a Bot finishes.".into()))?;
+    still()?;
     // A frame loaded before voxl listens gets the proxy's 502 and stays blank, so only hand out a link that works.
     if !screen::wait_for_port(info.port, 50).await {
         return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "The screen is still starting. Try again in a moment.".into()));

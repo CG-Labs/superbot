@@ -347,3 +347,19 @@ async fn revoking_someones_sessions_or_disabling_them_changes_every_machine_scre
     assert_eq!(events(&env, "machine.screen_rotated").await.len(), 2);
     assert!(!matches!(view(port, &fresh).await, Ok((200, _))));
 }
+
+#[tokio::test]
+async fn a_viewer_who_lost_access_while_waiting_gets_no_link() {
+    let mut env = serve_with(|e| e.with_screens(ports())).await;
+    let (uid, m) = ready_machine(&mut env, "ada@example.com", fake_stack()).await;
+    let bot = owned_bot(&env, &uid);
+    until_ready(&env, &m.agent).await;
+    let b = env.app.db.bot(&bot).unwrap();
+    let by = crate::audit::Who::system("test");
+    let gone = || Err(ApiError(StatusCode::NOT_FOUND, "Bot not found".into()));
+    let r = crate::machines::screens::open(&env.app, &by, &b, gone).await;
+    assert_eq!(r.err().map(|e| e.0), Some(StatusCode::NOT_FOUND));
+    assert!(events(&env, "machine.screen_opened").await.is_empty(), "no link handed out");
+    let r = crate::machines::screens::open(&env.app, &by, &b, || Ok(())).await.unwrap();
+    assert!(r.unwrap().starts_with("/screen/"));
+}

@@ -289,8 +289,10 @@ pub async fn target(app: &App, bot: &Bot) -> Result<Option<(Arc<Enrollment>, Set
 
 /// `GET /api/bots/:id/screen` for a Bot on its owner's machine: its screen there,
 /// started if need be, as a `/screen/<port>/?token=` link. `Ok(None)`: the Bot runs on
-/// this server, which shows it as before. The caller has checked access to the Bot.
-pub async fn open(app: &AppState, by: &Who, bot: &Bot) -> Res<Option<String>> {
+/// this server, which shows it as before. The caller has checked access to the Bot;
+/// `still` checks it again once the screen is this request's to hand out, since a new
+/// token made meanwhile must not reach someone who just lost access.
+pub async fn open(app: &AppState, by: &Who, bot: &Bot, still: impl Fn() -> Res<()>) -> Res<Option<String>> {
     let refused = |machine: Option<&str>, w: Why| {
         let d = json!({ "reason": w.reason(), "owner": bot.owner_id, "machine": machine });
         let e = by.event("machine.screen_refused").bot(&bot.id).outcome(Outcome::Denied).details(d);
@@ -309,6 +311,7 @@ pub async fn open(app: &AppState, by: &Who, bot: &Bot) -> Res<Option<String>> {
     let hb = super::enroll::check(app, &e, &to).await.map_err(|m| refused(Some(&to.machine_id), Why::Route(Refusal::Offline(m))))?;
     fit(&e, &hb).map_err(|w| refused(Some(&to.machine_id), w))?;
     let (reply, token) = ensure(app, &e, &s, by, bot, &to, "viewer").await.map_err(|w| refused(Some(&to.machine_id), w))?;
+    still()?;
     let viewer = by.actor.id.clone().unwrap_or_default();
     let (port, first) = listen(app, &e, &s, &bot.id, &viewer).map_err(|w| refused(Some(&to.machine_id), w))?;
     if first {
