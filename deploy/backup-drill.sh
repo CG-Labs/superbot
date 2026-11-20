@@ -138,7 +138,7 @@ step "reinstall on the 'new' host (default paths: it knows nothing of the old on
 install_superbot
 NEW_KEY=$(setting SUPERBOT_MASTER_KEY_FILE)
 [[ $(password) != "$OLD_PASSWORD" ]] || fail "reinstall reused the old password"
-if api "$BASE/api/bots" | grep -q DrillKeep; then fail "fresh install already has DrillKeep"; fi
+if grep -q DrillKeep <<<"$(api "$BASE/api/bots")"; then fail "fresh install already has DrillKeep"; fi
 
 step "restore in the documented order: old .env first, then its key path and DATA_DIR (timed)"
 t0=$(date +%s)
@@ -157,7 +157,7 @@ install -m 0600 -o "$SUPERBOT_USER" -g "$SUPERBOT_USER" "$NEW_KEY" "$OLD_KEY"
 systemctl start superbot.service
 sleep 5
 if curl -fsS --max-time 2 "$BASE/healthz" >/dev/null 2>&1; then fail "botd started with the wrong master key"; fi
-journalctl -u superbot --no-pager --since "-1min" | grep -q "wrong key" || fail "botd did not log the wrong master key"
+grep -q "wrong key" <<<"$(journalctl -u superbot --no-pager --since "-1min")" || fail "botd did not log the wrong master key"
 systemctl stop superbot.service
 
 t2=$(date +%s)
@@ -172,9 +172,9 @@ step "check the restored data"
 bots=$(api "$BASE/api/bots")
 grep -q '"name":"DrillKeep"' <<<"$bots" || fail "DrillKeep is missing after restore"
 if grep -q '"name":"DrillDrop"' <<<"$bots"; then fail "DrillDrop (after the backup) should be gone"; fi
-api "$BASE/api/secrets" | grep -q '"name":"DRILL_API_KEY","shadowedBy":null,"store":"sealed"' || fail "the sealed secret is missing"
-botctl_as_owner users | grep -q drill@example.com || fail "the drill user is missing"
-api "$BASE/api/audit?action=bot.created" | grep -q '"name":"DrillKeep"' || fail "the audit log lost bot.created for DrillKeep"
+grep -q '"name":"DRILL_API_KEY","shadowedBy":null,"store":"sealed"' <<<"$(api "$BASE/api/secrets")" || fail "the sealed secret is missing"
+grep -q drill@example.com <<<"$(botctl_as_owner users)" || fail "the drill user is missing"
+grep -q '"name":"DrillKeep"' <<<"$(api "$BASE/api/audit?action=bot.created")" || fail "the audit log lost bot.created for DrillKeep"
 systemctl start superbot-backup.service
 [[ $(systemctl show -p Result --value superbot-backup.service) == success ]] || fail "backup after restore failed"
 ((RTO <= RTO_BUDGET)) || fail "restore took ${RTO}s (budget ${RTO_BUDGET}s)"

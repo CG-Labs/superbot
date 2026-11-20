@@ -84,18 +84,18 @@ log "The landing page and get-started form are public"
 expect_code 200 "$BASE/"
 expect_code 200 "$BASE/get-started"
 expect_code 200 "$BASE/site/get-started.js"
-curl -fsSI "$BASE/" | grep -qi "^content-security-policy: default-src 'self'" || fail "the landing page has no CSP"
+grep -qi "^content-security-policy: default-src 'self'" <<<"$(curl -fsSI "$BASE/")" || fail "the landing page has no CSP"
 grep -q '"enabled":true' <<<"$(curl -fsS "$BASE/api/signups/config")" || fail "sign-ups are not open"
 log "Caddy serves the web client at /app/ and leaves everything else to botd"
 expect_code 200 "$BASE/app/"
 expect_code 302 "$BASE/app"
 expect_code 200 "$BASE/app/some/deep/link"
 curl -fsS "$BASE/app/" >"$WORK/app.html"
-entry=$(grep -o '/app/_expo/static/js/web/entry-[0-9a-f]*\.js' "$WORK/app.html" | head -1)
+entry=$(grep -o '/app/_expo/static/js/web/entry-[0-9a-f]*\.js' "$WORK/app.html" | sed -n 1p)
 [[ -n "$entry" ]] || fail "/app/ is not the client's index.html (built without SUPERBOT_WEB_BASE_URL=/app?)"
 expect_code 200 "$BASE$entry"
-curl -fsSI "$BASE$entry" | grep -qi '^cache-control: public, max-age=31536000, immutable' || fail "client bundle is not cached as immutable"
-curl -fsSI "$BASE/app/" | grep -qi '^cache-control: no-cache' || fail "client index.html is cacheable, so upgrades would not show"
+grep -qi '^cache-control: public, max-age=31536000, immutable' <<<"$(curl -fsSI "$BASE$entry")" || fail "client bundle is not cached as immutable"
+grep -qi '^cache-control: no-cache' <<<"$(curl -fsSI "$BASE/app/")" || fail "client index.html is cacheable, so upgrades would not show"
 expect_code 303 "$BASE/app.js"
 state=$(curl -fsS "${AUTH[@]}" "$BASE/api/state")
 grep -q '"name":"Smoke"' <<<"$state" || fail "USER_NAME from .env not applied: $state"
@@ -142,7 +142,7 @@ wait "$manual_pid" || fail "manual backup in botd failed"
 after=$(dc exec -T backup sh -c 'ls /backups/superbot-*.tar.gz | wc -l')
 [[ "$after" -eq $((before + 2)) ]] || fail "expected 2 new archives in the backups volume, got $((after - before))"
 # shellcheck disable=SC2016
-dc exec -T backup sh -c 'for f in /backups/superbot-*.tar.gz; do tar -tzf "$f" | grep -qx app.sqlite || exit 1; done' \
+dc exec -T backup sh -c 'for f in /backups/superbot-*.tar.gz; do [ "$(tar -tzf "$f" | grep -cx app.sqlite)" -ge 1 ] || exit 1; done' \
   || fail "a backup archive is damaged"
 
 log "SSE events stream through Caddy without buffering"
@@ -161,11 +161,11 @@ printf '%s\n' "$SECRET_VALUE" | SUPERBOT_PASSWORD="$PASSWORD" dc exec -T -e SUPE
 secrets=$(curl -fsS "${AUTH[@]}" "$BASE/api/secrets")
 grep -q '"name":"SMOKE_API_KEY"' <<<"$secrets" || fail "saved secret not listed: $secrets"
 if grep -qF "$SECRET_VALUE" <<<"$secrets"; then fail "the API returned a secret value"; fi
-if dc logs --no-color botd | grep -qF -e "$SECRET_VALUE" -e "$MASTER_KEY"; then fail "a secret reached botd's logs"; fi
+if grep -qF -e "$SECRET_VALUE" -e "$MASTER_KEY" <<<"$(dc logs --no-color botd)"; then fail "a secret reached botd's logs"; fi
 
 log "Backup and restore round trip"
 dc exec -T botd superbot-backup - >"$WORK/backup.tar.gz"
-tar -tzf "$WORK/backup.tar.gz" | grep -qx 'app.sqlite' || fail "archive has no app.sqlite"
+grep -qx 'app.sqlite' <<<"$(tar -tzf "$WORK/backup.tar.gz")" || fail "archive has no app.sqlite"
 mkdir "$WORK/unpacked"
 tar -xzf "$WORK/backup.tar.gz" -C "$WORK/unpacked"
 if grep -rqF -e "$SECRET_VALUE" -e "$MASTER_KEY" "$WORK/unpacked"; then fail "a backup holds a secret or the master key"; fi
