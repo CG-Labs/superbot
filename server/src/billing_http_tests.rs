@@ -137,6 +137,32 @@ async fn routine_runs_hold_per_user_per_day() {
 }
 
 #[tokio::test]
+async fn stopping_a_bot_gives_back_its_queued_routine_runs() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = world(false).await;
+    let app = &w.app;
+    let slow = app.cfg.bin_dir.join("claude");
+    std::fs::write(&slow, "#!/bin/sh\nexec sleep 10\n").unwrap();
+    std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let bot = app.db.create_bot_owned("Slow", "#fff", "waddle", "claude", None, false, &w.a_id, Visibility::Private);
+    let r = app.db.add_routine(&bot.id, "Digest", "0 9 * * *", "x");
+    let now = db::now();
+    // One runs, the second waits behind it; both count.
+    cron::fire(app, &r, now);
+    for _ in 0..300 {
+        if app.is_running(&bot.id) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cron::fire(app, &r, now);
+    assert_eq!(app.db.routine_runs_used(&w.a_id, &tiers::day(now)), 2);
+    // Stop drops the waiting one, so it doesn't count; the one that ran does.
+    assert_eq!(call(w.port, "POST", &format!("/api/bots/{}/stop", bot.id), &w.a, "").await.0, 200);
+    assert_eq!(app.db.routine_runs_used(&w.a_id, &tiers::day(now)), 1);
+}
+
+#[tokio::test]
 async fn without_a_tiers_file_routines_bots_and_machines_are_unlimited() {
     let (port, app, admin, _) = serve_app().await;
     fake_claude(&app);
@@ -220,6 +246,17 @@ async fn machines_get_their_owners_plan_size() {
     let (code, res) = call(port2, "POST", &format!("{}/resize", machine(users::OPERATOR)), &owner2, r#"{"tier":"nope"}"#).await;
     assert_eq!(code, 400);
     assert!(res.contains("starter, pro, max, solo"), "{res}");
+    // A plan named like a MACHINE_TIERS entry of another size: asking for it by name gets the plan's size.
+    let clash = r#"{"tiers":[{"name":"starter","label":"Starter","routes":"any","limits":{"machineType":"g6-dedicated-2"}}]}"#;
+    let (port3, app3, owner3, _) = {
+        let p: Arc<dyn MachineProvider> = Arc::new(Fake::default());
+        serve_app_with(|a| a.machines = Arc::new(ControlPlane::for_tests(p))).await
+    };
+    app3.tiers.set(Arc::new(Tiers::parse(clash, None).unwrap())).unwrap();
+    let (code, res) = call(port3, "POST", &machine(users::OPERATOR), &owner3, r#"{"tier":"starter"}"#).await;
+    assert_eq!(code, 202, "{res}");
+    let m = app3.db.user_machine(users::OPERATOR).unwrap();
+    assert_eq!((m.tier.as_str(), m.plan.as_str()), ("starter", "g6-dedicated-2"));
 }
 
 #[tokio::test]
@@ -370,6 +407,11 @@ async fn signed_subscription_events_set_the_users_tier() {
     let old_gone = event(DELETED, &w.b_id, "evt_8", 1_795_300_200, |v| v["data"]["object"]["id"] = json!("sub_test_bea_1"));
     assert_eq!(deliver(port, &old_gone, None).await.1["outcome"], "superseded");
     assert_eq!(tier(&w.b_id).as_deref(), Some("starter"));
+    // A late update to the old one, from before the move, doesn't bring back its plan.
+    let late = event(UPDATED, &w.b_id, "evt_8b", 1_795_300_050, |v| v["data"]["object"]["id"] = json!("sub_test_bea_1"));
+    assert_eq!(deliver(port, &late, None).await.1["outcome"], "superseded");
+    assert_eq!(tier(&w.b_id).as_deref(), Some("starter"));
+    assert_eq!(app.db.subscription(&w.b_id).unwrap().subscription_id, "sub_test_bea_2");
     let incomplete = event(UPDATED, &w.b_id, "evt_9", 1_795_300_300, |v| {
         v["data"]["object"]["id"] = json!("sub_test_bea_2");
         v["data"]["object"]["status"] = json!("incomplete");
