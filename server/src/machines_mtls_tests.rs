@@ -1374,3 +1374,39 @@ async fn stopping_a_bot_ends_its_run_on_the_machine() {
     let finished = &events(&env, "bot.run_finished").await[0];
     assert_eq!(finished["details"]["result"], "stopped", "{finished}");
 }
+
+#[tokio::test]
+async fn botd_stops_listening_to_a_machine_that_floods_it() {
+    let mut env = serve().await;
+    let (uid, mid, token) = machine_for(&env, "ada@example.com").await;
+    let flood = "#!/bin/sh\nhead -c 17000000 /dev/zero | tr '\\0' a\necho\nsleep 60\n";
+    let m = agent_with(&mut env, &mid, &token, flood).await;
+    let bot = env.app.db.create_bot_owned(
+        "Ada's",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &uid,
+        crate::acl::Visibility::Shared,
+    );
+    let before = send(&env, &bot.id, "say a lot").await;
+    let said = reply_after(&env, &bot.id, before).await;
+    assert!(
+        said.contains("more than 16 MiB"),
+        "{}",
+        &said[..said.len().min(200)]
+    );
+    for _ in 0..200 {
+        if m.agent.running() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        m.agent.running(),
+        0,
+        "dropping the stream ends the job there"
+    );
+}

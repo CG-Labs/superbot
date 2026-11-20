@@ -960,7 +960,7 @@ async fn probe(
         let address = to.address.as_deref().ok_or("it has no address yet")?;
         let (client, seen) = e.pinned(to.pins.clone())?;
         let query: Vec<String> = bins.iter().map(|b| format!("bin={b}")).collect();
-        let r = client
+        let mut r = client
             .get(e.agent_url(address, &format!("/v1/heartbeat?{}", query.join("&"))))
             .send()
             .await
@@ -968,10 +968,10 @@ async fn probe(
         if !r.status().is_success() {
             return Err(format!("its agent answered {}", r.status().as_u16()));
         }
-        let hb: wire::Heartbeat = r
-            .json()
+        let hb: wire::Heartbeat = read_capped(&mut r, MAX_REPLY)
             .await
-            .map_err(|_| "its agent's answer wasn't a heartbeat".to_string())?;
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .ok_or("its agent's answer wasn't a heartbeat")?;
         let fp = seen.seen.lock().unwrap().clone().unwrap_or_default();
         if hb.machine_id != to.machine_id || hb.user_id != to.user_id {
             return Err("its agent answered for another machine".into());
@@ -1004,6 +1004,25 @@ fn without_url(e: reqwest::Error) -> String {
     s
 }
 
+/// The most botd keeps of an agent's heartbeat or refusal.
+const MAX_REPLY: usize = 1 << 20;
+/// The largest event a machine may send: one line of harness output, or the end of a
+/// run with the files it sends back.
+pub const MAX_EVENT: usize = 16 << 20;
+
+/// The body, unless it is longer than `max` or breaks off. A machine's certificate
+/// says who answered, not that the answer is sane.
+async fn read_capped(r: &mut reqwest::Response, max: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        match r.chunk().await {
+            Ok(Some(c)) if out.len() + c.len() <= max => out.extend_from_slice(&c),
+            Ok(None) => return Some(out),
+            _ => return None,
+        }
+    }
+}
+
 /// Hands jobs to a user's machine over mutual TLS, to that machine's own pinned
 /// certificate only, and streams back what happens (ADR 0034).
 pub struct Mtls(pub Arc<Enrollment>);
@@ -1030,13 +1049,32 @@ impl Mtls {
             .map_err(|e| format!("Your computer didn't take the job: {}.", without_url(e)))?;
         if !r.status().is_success() {
             let code = r.status().as_u16();
-            let why = r
-                .json::<wire::ErrorReply>()
+            let why = read_capped(&mut r, MAX_REPLY)
                 .await
+                .and_then(|b| serde_json::from_slice::<wire::ErrorReply>(&b).ok())
                 .map(|e| e.error)
                 .unwrap_or_default();
             return Err(format!("Your computer turned the job down ({code}): {why}"));
         }
+        // Whenever botd stops listening early, the machine is told to stop too.
+        let stop_there = |reason: String| {
+            let (e, pins, address, id) = (
+                self.0.clone(),
+                to.pins.clone(),
+                address.to_string(),
+                job_id.clone(),
+            );
+            tokio::spawn(async move {
+                if let Ok((c, _)) = e.pinned(pins) {
+                    let url = e.agent_url(&address, &format!("/v1/jobs/{id}/abort"));
+                    let _ = c
+                        .post(url)
+                        .json(&wire::AbortRequest { reason })
+                        .send()
+                        .await;
+                }
+            });
+        };
         let mut buf: Vec<u8> = Vec::new();
         let mut deadline: Option<tokio::time::Instant> = None;
         loop {
@@ -1054,22 +1092,27 @@ impl Mtls {
                             let line: Vec<u8> = buf.drain(..=i).collect();
                             let Ok(ev) = serde_json::from_slice::<JobEvent>(&line) else { continue };
                             if !matches!(ev, JobEvent::Ping) && tx.send(ev).await.is_err() {
+                                stop_there("botd stopped listening".into());
                                 return Ok(());
                             }
                         }
+                        if buf.len() > MAX_EVENT {
+                            stop_there("too much output".into());
+                            return Err(format!(
+                                "Your computer sent more than {} MiB in one go, so I stopped listening.",
+                                MAX_EVENT >> 20
+                            ));
+                        }
                     }
                     Ok(None) => return Ok(()),
-                    Err(e) => return Err(format!("Lost your computer during the run: {}.", without_url(e))),
+                    Err(e) => {
+                        stop_there("lost the stream".into());
+                        return Err(format!("Lost your computer during the run: {}.", without_url(e)));
+                    }
                 },
                 reason = async { abort.wait_for(|r| r.is_some()).await.ok().and_then(|r| *r) }, if deadline.is_none() => {
                     deadline = Some(tokio::time::Instant::now() + ABORT_GRACE);
-                    let reason = reason.unwrap_or("stopped").to_string();
-                    let (e, pins, address, id) = (self.0.clone(), to.pins.clone(), address.to_string(), job_id.clone());
-                    tokio::spawn(async move {
-                        if let Ok((c, _)) = e.pinned(pins) {
-                            let _ = c.post(e.agent_url(&address, &format!("/v1/jobs/{id}/abort"))).json(&wire::AbortRequest { reason }).send().await;
-                        }
-                    });
+                    stop_there(reason.unwrap_or("stopped").to_string());
                 }
                 _ = give_up => return Err("Your computer didn't end the run when asked; I let go of it.".into()),
             }
