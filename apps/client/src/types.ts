@@ -235,6 +235,21 @@ export interface Approval {
   decidedAt?: number | null;
   decidedBy?: string | null;
   note?: string | null;
+  /** The run the call came from, while it was the Bot's live run (ADR 0051). */
+  runId?: string | null;
+  /** What "Approve for this run" would cover. Null: this call can only be approved once. */
+  runScope?: ApprovalRunScope | null;
+  /** How it was approved: just this call, or for the rest of its run. */
+  scope?: ApprovalScope | null;
+}
+
+export type ApprovalScope = "once" | "run";
+
+export interface ApprovalRunScope {
+  /** The kinds of call it lets through, e.g. "Pushes to a git remote". */
+  covers: string[];
+  /** True when it covers only this exact call again (deletes outside the workspace). */
+  exact: boolean;
 }
 
 export interface ModelOption {
