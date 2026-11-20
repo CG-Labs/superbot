@@ -77,9 +77,9 @@ refused as_svc sudo -n /usr/bin/id
 for bad in ../etc 'u1 u2' U1 "$(printf 'a%.0s' {1..28})" ''; do
   refused as_svc sudo -n /usr/local/sbin/superbot-userctl ensure "$bad"
 done
-getent passwd | grep -q '^sb-u-' && die "a refused call made an account"
+grep -q '^sb-u-' <<<"$(getent passwd)" && die "a refused call made an account"
 as_svc sudo -n /usr/local/sbin/superbot-userctl ensure t1 >/dev/null
-id -nG sb-u-t1 | tr ' ' '\n' | grep -qx "$SVC" && die "sb-u-t1 is in $SVC's group"
+grep -qx "$SVC" <<<"$(id -nG sb-u-t1 | tr ' ' '\n')" && die "sb-u-t1 is in $SVC's group"
 [[ "$(getent passwd sb-u-t1 | cut -d: -f7)" == /usr/sbin/nologin ]] || die "sb-u-t1 can log in"
 (cd "$TEST_DIR/users/t1/workspace" && as_svc sudo -n -E -u sb-u-t1 -- "$LIB/bin/superbot-run" /usr/bin/true)
 # superbot-run refuses to start outside the account's folders, and as any other account.
