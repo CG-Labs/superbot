@@ -81,7 +81,7 @@ botctl user harness-login <user> codex       # codex login
 botctl user harness-login <user> claude -- setup-token
 ```
 
-botd makes the account if needed and returns the command; botctl runs it at the admin's terminal with a clean env. API: `POST /api/users/{key}/harness-login` `{harness, args?}`. `GET` and `POST /api/users/{key}/isolation` show and make the account (`botctl user isolation | isolate`). All are admin-only. Per-user API keys as secrets ([ADR 0029](0029-per-user-isolation.md)) still work and need no login.
+botd makes the account if needed and returns the command; botctl runs it at the admin's terminal with a clean env. API: `POST /api/users/{key}/harness-login` `{harness, args?}`. `GET` and `POST /api/users/{key}/isolation` show and make the account (`botctl user isolation | isolate`). All are admin-only, and refused for a disabled user, who holds no seat ([ADR 0038](0038-self-host-license-key.md)). Per-user API keys as secrets ([ADR 0029](0029-per-user-isolation.md)) still work and need no login.
 
 ### Audit
 

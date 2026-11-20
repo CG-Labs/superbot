@@ -157,6 +157,34 @@ async fn the_seat_limit_blocks_new_and_re_enabled_people_with_a_clear_error() {
 }
 
 #[tokio::test]
+async fn per_user_accounts_take_no_seat_and_disabled_people_get_none() {
+    let (port, app, admin, _) = serve_app().await;
+    let root = app.cfg.data_dir.parent().unwrap().join(format!("iso-{}", short_id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let _ = app.isolation.set(Arc::new(accounts::for_tests(&root, "/bin/false")));
+    assert_eq!(install(port, &admin, &mint(&claims(Some(12), 100))).await.0, 200);
+    fill(&app, 11);
+    let (id, _) = user_with(port, &admin, "a@example.com", "member").await;
+    assert_eq!(app.db.active_seats(), 12);
+
+    // An active user's account is tried (the fake helper fails), and seats don't move.
+    let (code, res) = call(port, "POST", &format!("/api/users/{id}/isolation"), &admin, "").await;
+    assert_eq!(code, 502, "{res}");
+    assert_eq!(app.db.active_seats(), 12);
+
+    // Disabled: no seat, so no account and no harness login, and nothing tried.
+    let off = call(port, "PATCH", &format!("/api/users/{id}"), &admin, r#"{"status":"disabled"}"#).await;
+    assert_eq!(off.0, 200, "{}", off.1);
+    assert_eq!(app.db.active_seats(), 11);
+    for (path, body) in [("isolation", ""), ("harness-login", r#"{"harness":"claude"}"#)] {
+        let (code, res) = call(port, "POST", &format!("/api/users/{id}/{path}"), &admin, body).await;
+        assert_eq!(code, 400, "{path}: {res}");
+        assert!(parse(&res)["error"].as_str().unwrap().contains("disabled"), "{res}");
+    }
+    assert_eq!(events(port, &admin, "isolation.account_failed").await.len(), 1);
+}
+
+#[tokio::test]
 async fn without_a_license_the_community_edition_allows_ten_and_locks_nobody_out() {
     let (port, app, admin, _) = serve_app().await;
     fill(&app, COMMUNITY_SEATS);
