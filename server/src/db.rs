@@ -2252,7 +2252,12 @@ impl Db {
         let by_id = tx.query_row("SELECT * FROM subscriptions WHERE subscription_id = ?", [&sub.subscription_id], subscription_row).optional().map_err(|e| e.to_string())?;
         let outcome = if by_id.as_ref().is_some_and(|s| s.user_id != sub.user_id) {
             Applied::OtherUser
-        } else if by_id.as_ref().is_some_and(|s| sub.event_created < s.event_created) {
+        } else if by_id.as_ref().is_some_and(|s| {
+            // Stripe's `created` is in seconds, so two events can tie; an ended state wins
+            // the tie, or a cancellation that arrived first could be undone.
+            let ended = |status: &str| crate::billing::ENDED.contains(&status);
+            sub.event_created < s.event_created || (sub.event_created == s.event_created && ended(&s.status) && !ended(&sub.status))
+        }) {
             Applied::Stale
         } else {
             let paying_id = |s: &Option<Subscription>| s.as_ref().map(|s| s.subscription_id.clone());
@@ -3451,8 +3456,9 @@ mod tests {
         let db = Db::open(&temp_path("sub-order").join("app.sqlite")).unwrap();
         // Plan A (pro) started at 10, was updated at 25 and cancelled at 30. Plan B
         // (starter) started at 20, replacing it, and was cancelled at 40.
-        let events = [("a", "active", Some("pro"), 10, 10), ("b", "active", Some("starter"), 20, 20), ("a", "active", Some("pro"), 10, 25), ("a", "canceled", None, 10, 30), ("b", "canceled", None, 20, 40)];
-        for (picked, want) in [(&[0, 1, 2, 3][..], Some("starter")), (&[0, 1, 2, 3, 4][..], None), (&[0, 1, 2, 4][..], Some("pro"))] {
+        // The last is an update to A in the same second as its cancellation.
+        let events = [("a", "active", Some("pro"), 10, 10), ("b", "active", Some("starter"), 20, 20), ("a", "active", Some("pro"), 10, 25), ("a", "canceled", None, 10, 30), ("b", "canceled", None, 20, 40), ("a", "active", Some("pro"), 10, 30)];
+        for (picked, want) in [(&[0, 1, 2, 3][..], Some("starter")), (&[0, 1, 2, 3, 4][..], None), (&[0, 1, 2, 4][..], Some("pro")), (&[0, 3, 5][..], None)] {
             for order in orders(picked.len()) {
                 let u = db.create_user(None, None, "Payer", Role::Member).unwrap();
                 for (n, &i) in order.iter().enumerate() {
