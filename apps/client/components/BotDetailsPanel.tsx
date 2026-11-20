@@ -48,8 +48,9 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
     harnesses,
   } = useSuperBot();
   const bot = bots.find((b) => b.id === activeId);
-  // The Bot's own harness stays listed even if it is no longer installed.
-  const harnessChoices = bot ? [...new Set([...(harnesses ?? []), bot.harness])] : [];
+  // The Bot's own harness stays listed even if it is no longer installed. Admins get
+  // the owner's plan's harnesses on the Bot itself.
+  const harnessChoices = bot ? [...new Set([...(bot.harnesses ?? harnesses ?? []), bot.harness])] : [];
   const canOperate = canOnBot(bot, "operate");
   const canManage = canOnBot(bot, "manage");
   const botId = bot?.id;

@@ -189,8 +189,9 @@ export class SuperBotApi {
     await this.request("POST", `/api/bots/${id}/stop`);
   }
 
-  async models(harness: string): Promise<ModelOption[]> {
-    return this.request<ModelOption[]>("GET", `/api/harnesses/${harness}/models`);
+  /** `tier` (admins): only that plan's models. */
+  async models(harness: string, tier?: string): Promise<ModelOption[]> {
+    return this.request<ModelOption[]>("GET", `/api/harnesses/${harness}/models${tier ? `?tier=${encodeURIComponent(tier)}` : ""}`);
   }
 
   async routines(botId: string): Promise<Routine[]> {

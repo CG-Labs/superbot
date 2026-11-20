@@ -92,7 +92,8 @@ interface SuperBotContextValue {
   setBotVisibility: (id: string, visibility: Visibility) => Promise<void>;
   deleteBot: (id: string) => Promise<void>;
   stopBot: (id: string) => Promise<void>;
-  fetchModels: (harness: string) => Promise<ModelOption[]>;
+  /** `tier`: only that plan's models (admins, for a Bot on a managed plan). */
+  fetchModels: (harness: string, tier?: string) => Promise<ModelOption[]>;
   fetchRoutines: (botId: string) => Promise<Routine[]>;
   toggleRoutine: (r: Routine) => Promise<void>;
   createRoutine: (botId: string, draft: RoutineDraft) => Promise<Routine>;
@@ -507,11 +508,12 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
     await api.stopBot(id);
   };
 
-  const fetchModels = async (harness: string) => {
-    if (modelCache[harness]) return modelCache[harness];
+  const fetchModels = async (harness: string, tier?: string) => {
+    const key = tier ? `${harness}?tier=${tier}` : harness;
+    if (modelCache[key]) return modelCache[key];
     if (!api) return [];
-    const list = await api.models(harness);
-    setModelCache((c) => ({ ...c, [harness]: list }));
+    const list = await api.models(harness, tier);
+    setModelCache((c) => ({ ...c, [key]: list }));
     return list;
   };
 
