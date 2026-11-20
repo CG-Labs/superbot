@@ -60,16 +60,17 @@ impl Billing {
     pub fn enabled(&self) -> bool {
         self.secret.is_some()
     }
+}
 
-    pub fn describe(&self, tiers: &crate::tiers::Tiers) -> String {
-        if !self.enabled() {
-            return "off (set STRIPE_WEBHOOK_SECRET to take Stripe subscriptions)".into();
-        }
-        let priced: Vec<String> = tiers.all().iter().filter(|t| !t.stripe_prices.is_empty()).map(|t| format!("{} ({})", t.name, t.stripe_prices.len())).collect();
-        match priced.is_empty() {
-            true => format!("Stripe webhook at {PATH}, but no tier lists stripePrices, so no subscription sets a tier"),
-            false => format!("Stripe webhook at {PATH}; prices for {}", priced.join(", ")),
-        }
+/// What startup prints. Takes only whether billing is on, so nothing secret can reach the log.
+pub fn describe(enabled: bool, tiers: &crate::tiers::Tiers) -> String {
+    if !enabled {
+        return "off (set STRIPE_WEBHOOK_SECRET to take Stripe subscriptions)".into();
+    }
+    let priced: Vec<String> = tiers.all().iter().filter(|t| !t.stripe_prices.is_empty()).map(|t| format!("{} ({})", t.name, t.stripe_prices.len())).collect();
+    match priced.is_empty() {
+        true => format!("Stripe webhook at {PATH}, but no tier lists stripePrices, so no subscription sets a tier"),
+        false => format!("Stripe webhook at {PATH}; prices for {}", priced.join(", ")),
     }
 }
 

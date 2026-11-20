@@ -274,7 +274,7 @@ async fn main() {
         ..Auth::new(Some(app.clone()))
     });
     println!("Control plane: {}.", auth_state.machines.describe());
-    println!("Billing: {}.", auth_state.billing.describe(app.tiers()));
+    println!("Billing: {}.", billing::describe(auth_state.billing.enabled(), app.tiers()));
     match auth_state.scim.enabled {
         true => println!("SCIM: on at /scim/v2; new users get the {} role.", auth_state.scim.default_role.as_str()),
         false => println!("SCIM: off (SCIM=off)."),
