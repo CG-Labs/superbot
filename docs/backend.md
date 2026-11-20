@@ -97,7 +97,7 @@ The policy decides what each tool call does: run, ask a person, or be blocked.
   - `file_delete`: deleting files outside the workspace.
   - `outbound_message`: mail CLIs, `gh pr create`/comments, chat webhooks, messaging MCP tools.
   - `network_install`: `apt`, `brew`, `npm i`, `pip install`, `cargo install`, `curl ... | sh`.
-  - `git_push`: any `git push`.
+  - `git_push`: any `git push`, and `git config` that changes what a push does (a remote's push refspecs or mirroring, `push.*`, aliases).
 - **Shell commands** are parsed like `sh`/`bash` reads them (`server/src/shell.rs`): every command in pipes, lists, groups, `$(…)`, backticks, `<(…)`, `${…}`, and expanding here-documents is checked. `$'…'` escapes are decoded as bash does. A command whose name is only known at run time (`$CMD`, `gi?`, `{git,x}`, `eval "$X"`, `bash -c "$S"`) counts as `shell_destructive`.
 - **Folders**: a `cd` may fail or run in a subshell, so a relative path must be inside the workspace from every folder the command could be in. When a folder can't be known (`cd -`, `cd "$D"`, `popd`, `source`), relative deletes count as outside.
 - **Shell tools** may send `command` or `cmd`, as text or argv. A shell call with neither, or two that differ, is denied.

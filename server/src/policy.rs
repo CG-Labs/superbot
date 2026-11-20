@@ -804,6 +804,13 @@ fn deletion(ctx: &Ctx, cwds: &Cwds, target: &str, push: &mut impl FnMut(&'static
     }
 }
 
+/// Whether `git config` sets push config: such a key with a value after it, in the old
+/// form (`git config [--add] k v`) or the new one (`git config set k v`). Reads and unsets
+/// have no value after the key.
+fn sets_push_config(rest: &[&str]) -> bool {
+    operands(rest).windows(2).any(|w| push_config(w[0]))
+}
+
 /// Arguments that are not flags. Everything after `--` is an operand.
 fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
     let mut out = Vec::new();
@@ -820,11 +827,37 @@ fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
     out
 }
 
+/// Options of `git push` that can overwrite or delete what is on the remote.
+const PUSH_REWRITES: [&str; 6] = ["force", "force-with-lease", "force-if-includes", "mirror", "delete", "prune"];
+
+/// Whether `git push` takes this as a rewriting option. Git accepts any unique prefix of
+/// a long option (`--mir` is `--mirror`); an ambiguous one (`--p`) counts too.
+fn push_rewrites(arg: &str) -> bool {
+    let Some(name) = arg.strip_prefix("--") else { return false };
+    let name = name.split('=').next().unwrap_or("");
+    !name.is_empty() && (name.starts_with("force") || PUSH_REWRITES.iter().any(|o| o.starts_with(name)))
+}
+
+/// Config that changes what a plain `git push` does: a remote's push refspecs (`+…` forces)
+/// or mirroring, the push defaults, and aliases.
+fn push_config(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    (key.starts_with("remote.") && (key.ends_with(".push") || key.ends_with(".mirror"))) || key.starts_with("push.") || key.starts_with("alias.")
+}
+
 fn git(args: &[&str], push: &mut impl FnMut(&'static str, String)) {
-    // Skip global options such as `-C dir` and `-c key=value`.
+    // Skip global options such as `-C dir` and `-c key=value`, noting config that changes pushes.
     let mut i = 0;
+    let mut configured = false;
     while i < args.len() && args[i].starts_with('-') {
-        i += if ["-C", "-c", "--git-dir", "--work-tree", "--namespace"].contains(&args[i]) { 2 } else { 1 };
+        let (opt, value) = match args[i].split_once('=') {
+            Some((o, v)) if o == "--config-env" => (o, Some(v)),
+            _ => (args[i], args.get(i + 1).copied()),
+        };
+        if opt == "-c" || opt == "--config-env" {
+            configured |= value.is_some_and(|v| push_config(v.split('=').next().unwrap_or("")));
+        }
+        i += if ["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"].contains(&args[i]) { 2 } else { 1 };
     }
     let Some(sub) = args.get(i) else { return };
     let rest = &args[(i + 1).min(args.len())..];
@@ -833,11 +866,11 @@ fn git(args: &[&str], push: &mut impl FnMut(&'static str, String)) {
     match *sub {
         "push" => {
             // Its own reason, so a push approved for a run (ADR 0051) never covers one that rewrites or deletes.
-            let rewrites = short('f')
-                || short('d')
-                || rest.iter().any(|a| a.starts_with("--force") || ["--mirror", "--delete", "--prune"].contains(a) || a.starts_with(['+', ':']));
+            let rewrites = configured || short('f') || short('d') || rest.iter().any(|a| push_rewrites(a) || a.starts_with(['+', ':']));
             push("git_push", if rewrites { "Force-pushes or deletes on a git remote" } else { "Pushes to a git remote" }.into())
         }
+        // A plain push approved for a run must not turn into a forced or mirroring one later.
+        "config" if sets_push_config(rest) => push("git_push", "Changes how git pushes (git config)".into()),
         "reset" if has("--hard") => push("shell_destructive", "Discards local changes (git reset --hard)".into()),
         "clean" if short('f') || has("--force") => push("shell_destructive", "Deletes untracked files (git clean)".into()),
         "branch" if has("-D") || (short('d') && (short('f') || has("--force"))) => push("shell_destructive", "Force-deletes a branch".into()),
@@ -1192,6 +1225,13 @@ mod tests {
         for cmd in ["git push", "git push --force origin main", "git -C repo -c user.name=x push", "cd repo && git push -u origin HEAD"] {
             assert_eq!(cls(cmd), ["git_push"], "{cmd}");
         }
+        // Config that makes a later plain push force or mirror asks too.
+        for cmd in ["git config remote.origin.push +refs/heads/*:refs/heads/*", "git config set remote.origin.mirror true", "git config --file x.cfg --add Remote.Origin.Push +main", "git config alias.p 'push --force'", "git config push.default matching"] {
+            assert_eq!(cls(cmd), ["git_push"], "{cmd}");
+        }
+        for cmd in ["git config remote.origin.push", "git config get remote.origin.mirror", "git config --unset remote.origin.push", "git config user.name Ada", "git config remote.origin.url https://example.invalid/r.git"] {
+            assert!(cls(cmd).is_empty(), "{cmd}");
+        }
     }
 
     #[test]
@@ -1457,11 +1497,29 @@ mod tests {
         let s = scope(&ask, &push).unwrap();
         assert_eq!((s.tool.as_str(), s.covers_text(), s.exact.is_some()), ("Bash", vec!["Pushes to a git remote".to_string()], false));
         // Any ordinary push, in any form, with harmless commands around it.
-        for later in ["git push", "git push origin feature", "cd repo && git push -u origin HEAD", "git add . && git commit -m x && git push"] {
+        for later in ["git push", "git push origin feature", "cd repo && git push -u origin HEAD", "git add . && git commit -m x && git push", "git push --dry-run --porcelain origin main", "git -c user.name=x push --no-force"] {
             assert!(covers(&push, &shell(later)), "{later}");
         }
         // Never a force push or a remote delete, another class, or another tool.
-        for later in ["git push --force", "git push -f origin main", "git push origin +main", "git push origin :old", "git push --delete origin x"] {
+        for later in [
+            "git push --force",
+            "git push -f origin main",
+            "git push origin +main",
+            "git push origin :old",
+            "git push --delete origin x",
+            // Git takes any unique prefix of a long option.
+            "git push --mir origin",
+            "git push --forc origin main",
+            "git push --force-with-lease=main origin main",
+            "git push --del origin x",
+            "git push --pru origin",
+            "git push --p origin",
+            // Or config, given just for this push, that makes it force or mirror.
+            "git -c remote.origin.mirror=true push origin",
+            "git -c remote.origin.push=+refs/heads/*:refs/heads/* push",
+            "git --config-env=remote.origin.push=REFS push",
+            "git config remote.origin.push +main",
+        ] {
             assert!(!covers(&push, &shell(later)), "{later}");
         }
         assert!(!covers(&push, &shell("git push && npm install left-pad")));

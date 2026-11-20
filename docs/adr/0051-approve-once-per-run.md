@@ -38,7 +38,8 @@ A later call is covered when it uses the same tool and every (class, reason) it 
 - It never reaches another class, or another reason in the same class: a grant for `npm install` doesn't cover `pip install` or `curl … | sh`, and one for `gh pr comment` doesn't cover `mail`.
 - Harmless commands around it don't matter: `git add . && git commit -m x && git push` is covered by a `git push` grant.
 - A call that is riskier than the approved one asks again: `git push && npm install x` needs both in the grant.
-- Force pushes and remote deletes (`--force`, `-f`, `+ref`, `:ref`, `--delete`, `--mirror`, `--prune`) now have their own reason, "Force-pushes or deletes on a git remote", so a plain push never covers them. They are still `git_push`.
+- Force pushes and remote deletes (`--force*`, `-f`, `-d`, `+ref`, `:ref`, `--delete`, `--mirror`, `--prune`, and any prefix git accepts for those, like `--mir`) now have their own reason, "Force-pushes or deletes on a git remote", so a plain push never covers them. So does a push given config for just that call that changes what it pushes (`git -c remote.origin.mirror=true push`). They are still `git_push`.
+- Setting config that changes what a later plain push does (`git config remote.<name>.push|mirror`, `push.*`, `alias.*`) is now `git_push` too, with its own reason ("Changes how git pushes (git config)"), so it asks and no push grant covers it.
 
 Some calls are only ever approved one at a time, so their `runScope` is null and the client shows no run action:
 
@@ -89,6 +90,7 @@ The admin console gets nothing: it has no approvals of Bot actions (ADR 0032), a
 
 - A task that pushes, installs, or posts several times asks once, if the person wants, without an admin and without a rule that outlives it.
 - The grant is only as narrow as the classifier's reasons. A grant for "Posts to GitHub (gh pr comment)" covers comments on any PR for the rest of the task. The person sees that wording before choosing.
+- The classifier reads commands, not files (ADR 0007): a Bot that edits `.git/config` directly can still make a covered `git push` force. That is the same limit approvals already have, now with one more thing a run grant could let through.
 - Run ids now reach the harness's environment. They aren't secret: knowing one lets nothing happen without the Bot's token, and only the live run's id counts.
 - A server restart drops grants along with the pending approvals, as before.
 
