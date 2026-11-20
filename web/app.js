@@ -459,12 +459,7 @@ for (const id of ["au-action", "au-person"]) {
 let policyMode = "ask";
 
 async function loadSettings() {
-  try {
-    policyMode = (await api("GET", "/api/policy")).policy.mode;
-    $("policy-mode").value = policyMode;
-  } catch (err) {
-    fail(err);
-  }
+  await loadPolicy();
   loadLicense();
   loadSignIn();
   loadSecrets();
@@ -533,6 +528,91 @@ $("license-box").addEventListener("click", async (e) => {
   if (!e.target.closest("button[data-act=license-remove]")) return;
   await removeLicense();
   loadLicense();
+});
+
+// The global approval policy (ADR 0007, 0048): mode, an action per risky class, the timeout,
+// and rules for all Bots. Each Bot's own settings and rules are edited in the app.
+
+const ACTIONS = { allow: "Allow", ask: "Ask", deny: "Deny" };
+const TOOLS = { "*": "Any tool", shell: "Shell", file: "Files", web: "Web", mcp: "MCP", other: "Other tools" };
+
+function showPolicy(policy) {
+  policyMode = policy.mode;
+  $("policy-mode").value = policyMode;
+  $("policy-timeout").value = policy.timeoutMinutes;
+  for (const sel of document.querySelectorAll("#policy-classes select")) sel.value = policy.classes[sel.dataset.class] || "ask";
+}
+
+async function loadPolicy() {
+  let v;
+  try {
+    v = await api("GET", "/api/policy");
+  } catch (err) {
+    fail(err);
+    return;
+  }
+  $("policy-classes").innerHTML = v.classes.map((c) => `<tr>
+      <td>${esc(c.label)}</td>
+      <td><select data-class="${esc(c.id)}" aria-label="${esc(c.label)}">${Object.entries(ACTIONS).map(([a, l]) => `<option value="${a}">${l}</option>`).join("")}</select></td>
+    </tr>`).join("");
+  showPolicy(v.policy);
+  const rules = v.rules || [];
+  $("rules-empty").textContent = "No rules for all Bots.";
+  $("rules-empty").hidden = rules.length > 0;
+  $("rules-rows").innerHTML = rules.map((r) => `<tr data-rule="${esc(r.id)}">
+      <td>${esc(ACTIONS[r.action] || r.action)}</td><td>${esc(TOOLS[r.tool] || r.tool)}</td>
+      <td><code>${esc(r.pattern)}</code></td><td><span class="sub">${esc(r.note || "")}</span></td><td>${esc(fmt(r.at))}</td>
+      <td class="actions"><button type="button" class="btn" data-act="delete">Delete</button></td>
+    </tr>`).join("");
+}
+
+async function patchPolicy(patch, done) {
+  try {
+    showPolicy((await api("PUT", "/api/policy", patch)).policy);
+    notice(done, false);
+  } catch (err) {
+    fail(err);
+    loadPolicy();
+  }
+}
+
+$("policy-classes").addEventListener("change", (e) => {
+  const sel = e.target.closest("select[data-class]");
+  if (!sel) return;
+  patchPolicy({ classes: { [sel.dataset.class]: sel.value } }, `${sel.getAttribute("aria-label")}: ${ACTIONS[sel.value]}.`);
+});
+
+$("policy-timeout-save").addEventListener("click", () => {
+  const m = Number($("policy-timeout").value);
+  if (!Number.isInteger(m) || m < 1 || m > 1440) {
+    notice("Use whole minutes from 1 to 1440 (24 hours).");
+    return;
+  }
+  patchPolicy({ timeoutMinutes: m }, `Approvals now wait ${m} minute${m === 1 ? "" : "s"}.`);
+});
+
+$("rule-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const body = { action: $("rule-action").value, tool: $("rule-tool").value.trim() || "*", pattern: $("rule-pattern").value.trim() };
+  const note = $("rule-note").value.trim();
+  if (note) body.note = note;
+  try {
+    await api("POST", "/api/policy/rules", body);
+    for (const id of ["rule-tool", "rule-pattern", "rule-note"]) $(id).value = "";
+    notice(`${ACTIONS[body.action]} rule added for all Bots.`, false);
+  } catch (err) {
+    fail(err);
+  }
+  loadPolicy();
+});
+
+$("rules-rows").addEventListener("click", async (e) => {
+  const t = e.target.closest("button[data-act=delete]");
+  if (!t) return;
+  const row = t.closest("tr");
+  if (!confirm(`Delete this rule for all Bots?\n\n${row.querySelector("code").textContent}`)) return;
+  try { await api("DELETE", `/api/policy/rules/${key(row.dataset.rule)}`); } catch (err) { fail(err); }
+  loadPolicy();
 });
 
 $("policy-mode").addEventListener("change", async (e) => {
