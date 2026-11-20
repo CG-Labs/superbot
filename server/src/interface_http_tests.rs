@@ -1,13 +1,183 @@
-//! The Expo client is the interface for everyone; the console is an admin fallback (ADR 0027).
+//! The Expo client is the interface for everyone (ADR 0027); the console is a minimal
+//! admin page with no chat, Bots, or screens (ADR 0032).
 
 use crate::sso_http_tests::{header, mock_idp, serve_with, set_cookies, to_callback, OID};
 use crate::tests::{call, call_with, serve_app};
 use crate::users_http_tests::{parse, user_with};
 use crate::*;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+const CONSOLE_JS: &str = include_str!("../../web/app.js");
+const CONSOLE_HTML: &str = include_str!("../../web/index.html");
+const CLIENT_API: &str = include_str!("../../apps/client/src/api.ts");
 
 async fn location(port: u16, path: &str, auth: &str, extra: &str) -> (u16, Option<String>, String) {
     let (code, head, body) = call_with(port, "GET", path, auth, extra, "").await;
     (code, header(&head, "location"), body)
+}
+
+/// The values a `${...}` hole can take: its quoted strings (`${ok ? "approve" : "deny"}`),
+/// else a placeholder id.
+fn hole(expr: &str) -> Vec<String> {
+    let quoted: Vec<String> = expr.split('"').skip(1).step_by(2).map(String::from).collect();
+    if quoted.is_empty() { vec!["x".into()] } else { quoted }
+}
+
+/// Every string a JS/TS literal starting at `s[0]` (a `"` or a backtick) can be, and the
+/// rest of the line after it.
+fn literal(s: &str) -> (Vec<String>, &str) {
+    let quote = s.as_bytes()[0];
+    let mut out = vec![String::new()];
+    let mut i = 1;
+    while i < s.len() {
+        let c = s.as_bytes()[i];
+        if c == quote {
+            return (out, &s[i + 1..]);
+        }
+        if quote == b'`' && s[i..].starts_with("${") {
+            let (mut depth, mut j) = (0, i + 1);
+            for (k, ch) in s[i + 1..].char_indices() {
+                depth += match ch { '{' => 1, '}' => -1, _ => 0 };
+                if depth == 0 {
+                    j = i + 1 + k;
+                    break;
+                }
+            }
+            let options = hole(&s[i + 2..j]);
+            out = out.iter().flat_map(|o| options.iter().map(move |v| format!("{o}{v}"))).collect();
+            i = j + 1;
+            continue;
+        }
+        let ch = s[i..].chars().next().unwrap();
+        out.iter_mut().for_each(|o| o.push(ch));
+        i += ch.len_utf8();
+    }
+    (out, "")
+}
+
+/// Each `/api/...` call in a script, with its method: the `"METHOD", ` just before the
+/// path, else a `method: "X"` later in the same statement, else GET. Query strings are dropped.
+fn api_calls(src: &str) -> Vec<(String, String)> {
+    const METHODS: [&str; 5] = ["GET", "POST", "PUT", "PATCH", "DELETE"];
+    let lines: Vec<&str> = src.lines().collect();
+    let mut out = vec![];
+    for (n, line) in lines.iter().enumerate() {
+        let mut rest = *line;
+        while let Some(at) = rest.find(['"', '`']) {
+            let before = line[..line.len() - rest.len() + at].trim_end();
+            let (values, after) = literal(&rest[at..]);
+            let ahead = format!("{after}\n{}", lines[(n + 1).min(lines.len())..lines.len().min(n + 3)].join("\n"));
+            let ahead = ahead.split(';').next().unwrap_or_default();
+            for v in values {
+                let Some(p) = v.find("/api/") else { continue };
+                let path = v[p..].split('?').next().unwrap().to_string();
+                let method = METHODS
+                    .iter()
+                    .find(|m| before.ends_with(&format!("\"{m}\",")))
+                    .or_else(|| METHODS.iter().find(|m| ahead.contains(&format!("method: \"{m}\""))))
+                    .unwrap_or(&"GET");
+                out.push((method.to_string(), path));
+            }
+            rest = after;
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Just the status line, for responses that stream and never end (`/api/events`).
+async fn status_only(port: u16, path: &str, auth: &str) -> u16 {
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let req = format!("GET {path} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nAuthorization: {auth}\r\n\r\n");
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut line = String::new();
+    tokio::io::BufReader::new(s).read_line(&mut line).await.unwrap();
+    line.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+/// Asserts each call reaches a route for its method: not a 405, and not what a path
+/// nothing serves gets.
+async fn assert_routed(port: u16, auth: &str, calls: &[(String, String)]) {
+    let nothing = call(port, "GET", "/api/no/such/route", auth, "").await;
+    assert_eq!(nothing.0, 404);
+    for (m, p) in calls {
+        let got = if p == "/api/events" { (status_only(port, p, auth).await, String::new()) } else { call(port, m, p, auth, "{}").await };
+        assert!(got.0 != 405 && got != nothing, "{m} {p} isn't served: {got:?}");
+    }
+}
+
+#[test]
+fn the_call_finder_reads_templates_and_methods() {
+    let src = r#"
+        api("POST", `/api/approvals/${id}/${approve ? "approve" : "deny"}`, {});
+        this.request("GET", `/api/audit/export.csv${query ? `?${query}` : ""}`);
+        const res = await fetch(`${normalizeBaseUrl(baseUrl)}/api/auth/login`, {
+          method: "POST",
+        return `${this.baseUrl}/api/events`;
+    "#;
+    let want = [("GET", "/api/audit/export.csv"), ("GET", "/api/events"), ("POST", "/api/approvals/x/approve"), ("POST", "/api/approvals/x/deny"), ("POST", "/api/auth/login")];
+    assert_eq!(api_calls(src), want.map(|(m, p)| (m.to_string(), p.to_string())));
+}
+
+#[tokio::test]
+async fn the_console_is_an_admin_page_without_chat_bots_or_screens() {
+    let (port, _, admin, _) = serve_app().await;
+    let (code, head, html) = call_with(port, "GET", "/console/", &admin, "", "").await;
+    assert_eq!(code, 200);
+    assert_eq!(html, CONSOLE_HTML);
+    let csp = header(&head, "content-security-policy").unwrap();
+    for part in ["script-src 'self'", "style-src 'self'", "frame-ancestors 'none'", "connect-src 'self'"] {
+        assert!(csp.contains(part), "{csp}");
+    }
+    for tab in ["Users", "Requests", "Machines", "Audit log", "Settings", "Sign out", r#"href="/app/""#] {
+        assert!(html.contains(tab), "{tab}");
+    }
+    // Nothing the CSP would block: one script, from a file, and no inline styles.
+    assert_eq!(html.matches("<script").count(), 1);
+    assert!(html.contains(r#"<script src="app.js"></script>"#));
+    assert!(!html.contains("style=") && !html.contains("<style"));
+    for (file, csp_too) in [("/console/app.js", true), ("/console/styles.css", true)] {
+        let (code, head, _) = call_with(port, "GET", file, &admin, "", "").await;
+        assert_eq!((code, header(&head, "content-security-policy").is_some()), (200, csp_too), "{file}");
+    }
+
+    // Chat, Bots, Bot approvals, live events, and screens are the app's.
+    for gone in ["/api/state", "/api/events", "EventSource", "/api/bots", "/messages", "/screen", "/api/approvals", "/routines", "/api/harnesses"] {
+        assert!(!CONSOLE_JS.contains(gone) && !html.contains(gone), "{gone} is still in the console");
+    }
+    let calls = api_calls(CONSOLE_JS);
+    for want in ["/api/users", "/api/signups/x/approve", "/api/machines", "/api/users/x/machine/suspend", "/api/audit", "/api/audit/export.csv", "/api/policy", "/api/secrets/x", "/api/scim/tokens"] {
+        assert!(calls.iter().any(|(_, p)| p == want) || html.contains(want), "the console lost {want}: {calls:?}");
+    }
+}
+
+#[tokio::test]
+async fn every_call_the_console_makes_is_served_and_admin_only() {
+    let (port, _, admin, _) = serve_app().await;
+    let (_, member) = user_with(port, &admin, "mia@example.com", "member").await;
+    let calls = api_calls(CONSOLE_JS);
+    assert!(calls.len() >= 20, "{calls:?}");
+    for (m, p) in &calls {
+        // Your own session is yours, and anyone may read the approval mode; everything
+        // else on the page is for admins.
+        if p.starts_with("/api/auth/") || (m.as_str(), p.as_str()) == ("GET", "/api/policy") {
+            continue;
+        }
+        let (code, body) = call(port, m, p, &member, "{}").await;
+        assert_eq!(code, 403, "{m} {p}: {body}");
+    }
+    assert_routed(port, &admin, &calls).await;
+}
+
+#[tokio::test]
+async fn every_route_the_client_uses_is_still_served() {
+    let (port, _, admin, _) = serve_app().await;
+    let calls = api_calls(CLIENT_API);
+    for want in [("GET", "/api/state"), ("GET", "/api/events"), ("POST", "/api/bots/x/messages"), ("GET", "/api/bots/x/screen"), ("POST", "/api/approvals/x/deny"), ("POST", "/api/auth/login"), ("GET", "/api/audit/export.csv")] {
+        assert!(calls.contains(&(want.0.to_string(), want.1.to_string())), "{want:?} not found in api.ts: {calls:?}");
+    }
+    assert_routed(port, &admin, &calls).await;
 }
 
 #[tokio::test]
