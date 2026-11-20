@@ -52,8 +52,11 @@ mod signups;
 mod signups_http_tests;
 mod sso;
 mod tiers;
+mod billing;
 #[cfg(test)]
 mod tiers_http_tests;
+#[cfg(test)]
+mod billing_http_tests;
 mod users;
 #[cfg(test)]
 mod users_http_tests;
@@ -143,6 +146,7 @@ async fn main() {
         .unwrap_or_else(|e| exit(format!("Control plane: {e}")));
     let scim = scim::Scim::from_env(&env("SCIM", ""), &env("SCIM_DEFAULT_ROLE", "")).unwrap_or_else(|e| exit(format!("SCIM: {e}")));
     let tiers = tiers::Tiers::from_env(|k| env(k, "")).unwrap_or_else(|e| exit(format!("Tiers: {e}")));
+    let billing = billing::Billing::from_env(&secrets::env::EnvStore::process()).unwrap_or_else(|e| exit(format!("Billing: {e}")));
     let allow_no_auth = auth_startup(&host, &password, break_glass);
     secrets::redact::register(&password);
     if adapters::get(&default_harness).is_none() {
@@ -266,9 +270,11 @@ async fn main() {
         signups,
         machines: Arc::new(control_plane),
         scim,
+        billing,
         ..Auth::new(Some(app.clone()))
     });
     println!("Control plane: {}.", auth_state.machines.describe());
+    println!("Billing: {}.", auth_state.billing.describe(app.tiers()));
     match auth_state.scim.enabled {
         true => println!("SCIM: on at /scim/v2; new users get the {} role.", auth_state.scim.default_role.as_str()),
         false => println!("SCIM: off (SCIM=off)."),
@@ -289,6 +295,7 @@ async fn main() {
     let control_plane = auth_state.machines.clone();
     let _ = app.control_plane.set(control_plane.clone());
     let auth_state_scim = auth_state.scim.enabled;
+    let auth_state_billing = auth_state.billing.enabled();
     let router = router(app.clone(), auth_state);
     let policy = app.db.global_policy();
     app.db.record(&Event::new(Actor::system("server"), "server.started").details(json!({
@@ -308,6 +315,7 @@ async fn main() {
         "sso": sso_ids,
         "controlPlane": control_plane.enabled(),
         "scim": auth_state_scim,
+        "billing": auth_state_billing,
         "tiers": app.tiers().all().iter().map(|t| &t.name).collect::<Vec<_>>(),
         "defaultTier": app.tiers().default_tier().name,
         "license": license.summary(),
@@ -403,6 +411,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/me/tier", get(my_tier))
         .route("/tiers", get(list_tiers))
+        .route("/usage", get(admin_usage))
         .route("/setup", get(setup::status).patch(setup::update))
         .route("/license", get(license::get).put(license::put).delete(license::delete))
         .route("/me/secrets", get(list_my_secrets))
@@ -461,9 +470,15 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .layer(DefaultBodyLimit::max(scim::MAX_BODY))
         .layer(middleware::from_fn_with_state(auth_state.clone(), scim::guard))
         .layer(Extension(auth_state.clone()));
+    // Stripe signs its webhook; there are no credentials to check (ADR 0040).
+    let billing_routes = Router::new()
+        .route("/billing/stripe/webhook", post(billing::webhook))
+        .layer(DefaultBodyLimit::max(billing::MAX_BODY))
+        .layer(Extension(auth_state.clone()));
     Router::new()
         .route("/healthz", get(|| async { Json(json!({ "ok": true })) }))
         .merge(scim_routes)
+        .merge(billing_routes)
         .merge(
             Router::new()
                 .nest("/api", api)
@@ -558,6 +573,8 @@ struct Auth {
     machines: Arc<machines::ControlPlane>,
     /// SCIM provisioning (ADR 0023).
     scim: scim::Scim,
+    /// Stripe subscriptions set users' tiers (ADR 0040). Off unless STRIPE_WEBHOOK_SECRET is set.
+    billing: billing::Billing,
     /// The database: sessions and audit events. None in tests of auth alone.
     app: Option<AppState>,
 }
@@ -578,6 +595,7 @@ impl Auth {
             signups: signups::Signups::default(),
             machines: Arc::default(),
             scim: scim::Scim::default(),
+            billing: billing::Billing::default(),
             app,
         }
     }
@@ -1260,12 +1278,56 @@ async fn my_tier(State(app): State<AppState>, Extension(c): Extension<Caller>) -
     Ok(Json(tier_usage(&app, id)))
 }
 
-/// A user's tier and their use of it this month.
+/// A user's tier and their use of it: runs this month, routine runs today (UTC), Bots.
 pub(crate) fn tier_usage(app: &App, user_id: &str) -> Value {
-    let period = tiers::period(db::now());
+    let at = db::now();
+    let (period, day) = (tiers::period(at), tiers::day(at));
     let mut v = app.tier_of(user_id).view();
-    v["usage"] = json!({ "period": period, "runs": app.db.runs_used(user_id, &period), "bots": app.db.owned_bot_count(user_id) });
+    v["usage"] = json!({
+        "period": period, "runs": app.db.runs_used(user_id, &period), "bots": app.db.owned_bot_count(user_id),
+        "day": day, "routineRuns": app.db.routine_runs_used(user_id, &day),
+    });
     v
+}
+
+/// `GET /api/usage` (admins): every user's plan, limits, and use, their machine against
+/// the plan's size, and their subscription (ADR 0040). `over` names limits a user is
+/// past, which happens after a downgrade: nothing is deleted, new use is refused.
+async fn admin_usage(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>) -> Json<Value> {
+    let users: Vec<Value> = app
+        .db
+        .users()
+        .iter()
+        .map(|u| {
+            let plan = tier_usage(&app, &u.id);
+            let limits = &app.tier_of(&u.id).limits;
+            let machine = app.db.user_machine(&u.id);
+            let fits = |m: &db::Machine| limits.machine_type.as_ref().is_none_or(|t| *t == m.plan);
+            let used = |k: &str| plan["usage"][k].as_u64().unwrap_or(0);
+            let mut over = Vec::new();
+            for (name, limit, n) in [
+                ("bots", limits.max_bots, used("bots")),
+                ("monthlyRuns", limits.monthly_runs, used("runs")),
+                ("dailyRoutineRuns", limits.daily_routine_runs, used("routineRuns")),
+            ] {
+                if limit.is_some_and(|l| n > u64::from(l)) {
+                    over.push(name);
+                }
+            }
+            if machine.as_ref().is_some_and(|m| !fits(m)) {
+                over.push("machineType");
+            }
+            json!({
+                "user": { "id": u.id, "email": u.email, "name": u.name, "role": u.role, "status": u.status },
+                "tier": u.tier,
+                "plan": plan,
+                "machine": machine.as_ref().map(|m| json!({ "tier": m.tier, "plan": m.plan, "state": m.state, "fits": fits(m) })),
+                "subscription": app.db.subscription(&u.id),
+                "over": over,
+            })
+        })
+        .collect();
+    Json(json!({ "users": users, "billing": a.billing.enabled() }))
 }
 
 /// `GET /api/tiers` (admins): every tier with its routes, and the default.
@@ -1431,7 +1493,11 @@ async fn create_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
             visibility,
             max,
         )
-        .ok_or_else(|| ApiError(StatusCode::FORBIDDEN, format!("The {} plan allows {} Bots, and they're all in use. Delete one first.", tier.label, max.unwrap_or(0))))?;
+        .ok_or_else(|| {
+            let details = json!({ "reason": "tier_bot_limit", "name": name, "owner": owner, "tier": tier.name, "limit": max });
+            app.db.record(&by.event("bot.create_refused").target("user", &owner).outcome(Outcome::Denied).details(details));
+            ApiError(StatusCode::FORBIDDEN, format!("The {} plan allows {} Bots, and they're all in use. Delete one first.", tier.label, max.unwrap_or(0)))
+        })?;
     app.init_bot_files(&bot);
     app.push_bot(&bot.id);
     let details = json!({ "name": bot.name, "harness": bot.harness, "model": bot.model, "owner": bot.owner_id, "visibility": bot.visibility });
@@ -1584,6 +1650,8 @@ async fn update_access(State(app): State<AppState>, Extension(c): Extension<Call
         // ends here, and its token stops working (it names the old owner). A refused
         // transfer (another request took the last slot) leaves that work running.
         if !app.stop_if(&id, || app.db.set_bot_owner_capped(&id, &u.id, max)) {
+            let details = json!({ "reason": "tier_bot_limit", "from": bot.owner_id, "to": u.id, "tier": tier.name, "limit": max });
+            app.db.record(&by.event("bot.transfer_refused").target("bot", &id).bot(&id).outcome(Outcome::Denied).details(details));
             return Err(ApiError(StatusCode::FORBIDDEN, format!("{}'s plan ({}) allows {} Bots, and they're all in use.", u.name, tier.label, max.unwrap_or(0))));
         }
         // The new owner manages it anyway; a leftover grant would only confuse.

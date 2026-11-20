@@ -898,6 +898,47 @@ pub async fn list_all(
     )))
 }
 
+/// The machine size a user's plan gives them (ADR 0040), as `(machine tier, provider
+/// plan)`: the plan's `machineType`, named by its `MACHINE_TIERS` entry if it has one,
+/// else by the user's tier. None: their plan sets no size, so any `MACHINE_TIERS` entry.
+pub fn size_for(app: &App, cp: &ControlPlane, user_id: &str) -> Option<(String, String)> {
+    let tier = app.tier_of(user_id);
+    let plan = tier.limits.machine_type.clone()?;
+    let name = cp.tiers.iter().find(|(_, p)| *p == plan).map_or_else(|| tier.name.clone(), |(t, _)| t.clone());
+    Some((name, plan))
+}
+
+/// The provider plan a machine tier means: a `MACHINE_TIERS` entry, or the name of the
+/// size the user's plan gives them.
+fn plan_of(cp: &ControlPlane, size: &Option<(String, String)>, tier: &str) -> Option<String> {
+    cp.plan(tier).map(String::from).or_else(|| size.as_ref().filter(|(n, _)| n == tier).map(|(_, p)| p.clone()))
+}
+
+fn tier_choices(cp: &ControlPlane, size: &Option<(String, String)>) -> String {
+    let mut names: Vec<&str> = cp.tiers.iter().map(|(t, _)| t.as_str()).collect();
+    if let Some((n, _)) = size.as_ref().filter(|(n, _)| !names.contains(&n.as_str())) {
+        names.push(n);
+    }
+    format!("tier must be one of {}", names.join(", "))
+}
+
+/// A machine size the user's plan doesn't give them: refused, and audited.
+fn refuse_size(app: &App, by: &Who, u: &crate::db::User, allowed: &(String, String), tier: &str, plan: &str, action: &str) -> ApiError {
+    let user_tier = app.tier_of(&u.id);
+    let details = json!({
+        "reason": "tier_machine_size", "action": action, "userEmail": u.email, "userTier": user_tier.name,
+        "askedTier": tier, "askedPlan": plan, "allowedTier": allowed.0, "allowedPlan": allowed.1,
+    });
+    app.db.record(&by.event("machine.refused").target("user", &u.id).outcome(Outcome::Denied).details(details));
+    ApiError(
+        StatusCode::FORBIDDEN,
+        format!(
+            "{}'s plan ({}) comes with {} machines, not {plan}. Ask for \"{}\" or leave the tier out, or move them to another plan first.",
+            u.name, user_tier.label, allowed.1, allowed.0
+        ),
+    )
+}
+
 /// `GET /api/users/{key}/machine`: the user's live machine.
 pub async fn get(
     AppS(app): AppS<AppState>,
@@ -929,18 +970,13 @@ pub async fn request(
             "This user is disabled. Enable them before giving them a machine.".into(),
         ));
     }
+    let size = size_for(&app, cp, &u.id);
     let asked_tier = f.get("tier").cloned();
-    if let Some(t) = &asked_tier
-        && cp.plan(t).is_none()
-    {
-        return Err(bad(format!(
-            "tier must be one of {}",
-            cp.tiers
-                .iter()
-                .map(|(t, _)| t.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
+    if let Some(t) = &asked_tier {
+        let plan = plan_of(cp, &size, t).ok_or_else(|| bad(tier_choices(cp, &size)))?;
+        if let Some(allowed) = size.as_ref().filter(|(_, p)| *p != plan) {
+            return Err(refuse_size(&app, &by, &u, allowed, t, &plan, "request"));
+        }
     }
     let asked_region = f.get("region").cloned();
     if let Some(r) = &asked_region
@@ -953,9 +989,14 @@ pub async fn request(
     }
     // What's asked for, else `(tier, plan, region)` as given: a new machine's defaults,
     // or what a retried machine was saved with.
+    // A plan that sets a machine size (ADR 0040) gets that size unless asked otherwise,
+    // and asking otherwise was refused above.
     let settings = |tier: &str, plan: &str, region: &str| {
-        let tier = asked_tier.clone().unwrap_or_else(|| tier.into());
-        let plan = cp.plan(&tier).map_or_else(|| plan.into(), String::from);
+        let (tier, plan) = match (&asked_tier, &size) {
+            (Some(t), _) => (t.clone(), plan_of(cp, &size, t).unwrap_or_else(|| plan.into())),
+            (None, Some(s)) => s.clone(),
+            (None, None) => (tier.to_string(), cp.plan(tier).map_or_else(|| plan.into(), String::from)),
+        };
         let region = asked_region.clone().unwrap_or_else(|| region.into());
         (tier, plan, region)
     };
@@ -1057,20 +1098,15 @@ async fn act(
     by: &Who,
     key: &str,
     step: Step,
-    tier: Option<String>,
+    target: Option<(String, String)>,
 ) -> Res<Response> {
     let p = cp.need()?;
     let u = need_user_key(app, key)?;
     let _g = cp.ops.lock().await;
     let mut m = need_machine(app, &u.id)?;
-    let target = match (step, &tier) {
-        (Step::Resize, Some(t)) => Some((
-            t.clone(),
-            cp.plan(t).ok_or_else(|| bad("Unknown tier"))?.to_string(),
-        )),
-        (Step::Resize, None) => return Err(bad("Unknown tier")),
-        _ => None,
-    };
+    if step == Step::Resize && target.is_none() {
+        return Err(bad("Unknown tier"));
+    }
     let from = m.state;
     let to = match step {
         Step::Suspend => State::Suspended,
@@ -1185,22 +1221,18 @@ pub async fn resize(
     Path(key): Path<String>,
     body: Bytes,
 ) -> Res<Response> {
-    a.machines.need()?;
+    let cp = &a.machines;
+    cp.need()?;
     let tier = fields(&body, &["tier"])?
         .remove("tier")
         .ok_or_else(|| bad("Send {\"tier\": \"...\"}."))?;
-    if a.machines.plan(&tier).is_none() {
-        return Err(bad(format!(
-            "tier must be one of {}",
-            a.machines
-                .tiers
-                .iter()
-                .map(|(t, _)| t.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
+    let u = need_user_key(&app, &key)?;
+    let size = size_for(&app, cp, &u.id);
+    let plan = plan_of(cp, &size, &tier).ok_or_else(|| bad(tier_choices(cp, &size)))?;
+    if let Some(allowed) = size.as_ref().filter(|(_, p)| *p != plan) {
+        return Err(refuse_size(&app, &by, &u, allowed, &tier, &plan, "resize"));
     }
-    act(&app, &a.machines, &by, &key, Step::Resize, Some(tier)).await
+    act(&app, cp, &by, &key, Step::Resize, Some((tier, plan))).await
 }
 
 /// `DELETE /api/users/{key}/machine`: deletes it and its disks at the provider. 200

@@ -688,7 +688,7 @@ impl App {
     async fn place(&self, bot: &Bot, msg: &Message, by: &Who, period: &str, bin: &str) -> Option<Place> {
         let Some(cp) = self.control_plane.get() else { return Some(Place::Here) };
         let refused = |r: Refusal, machine: Option<&str>| {
-            self.db.give_back_run(&bot.owner_id, period);
+            self.give_back(bot, msg, period);
             let e = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied);
             self.db.record(&e.details(json!({ "reason": r.reason(), "owner": bot.owner_id, "machine": machine, "messageId": msg.id })));
             self.say(&bot.id, &r.message(), true);
@@ -835,7 +835,7 @@ impl App {
             return Ok(None);
         }
         let refused = |reason: &str, text: &str| {
-            self.db.give_back_run(&bot.owner_id, period);
+            self.give_back(bot, msg, period);
             let e = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied);
             let account = accounts::account(&bot.owner_id);
             self.db.record(&e.details(json!({ "reason": reason, "owner": bot.owner_id, "account": account, "harness": bot.harness, "messageId": msg.id })));
@@ -861,6 +861,7 @@ impl App {
     fn tier_route(&self, bot: &Bot, msg: &Message, by: &Who, period: &str) -> Option<(String, Route)> {
         let tier = self.tier_of(&bot.owner_id);
         let refused = |reason: &str, text: String, limit: Option<u32>| {
+            self.give_back_routine(bot, msg);
             let details = json!({ "reason": reason, "owner": bot.owner_id, "tier": tier.name, "limit": limit, "period": period, "messageId": msg.id });
             self.db.record(&by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied).details(details));
             self.say(&bot.id, &text, true);
@@ -875,6 +876,19 @@ impl App {
             return refused("tier_limit", text, Some(limit));
         }
         Some((tier.name.clone(), route))
+    }
+
+    /// Gives back what a refused run took: its monthly run, and for a routine, the
+    /// routine run counted for the day it fired (ADR 0040).
+    fn give_back(&self, bot: &Bot, msg: &Message, period: &str) {
+        self.db.give_back_run(&bot.owner_id, period);
+        self.give_back_routine(bot, msg);
+    }
+
+    fn give_back_routine(&self, bot: &Bot, msg: &Message) {
+        if msg.role == "routine" {
+            self.db.give_back_routine_run(&bot.owner_id, &tiers::day(msg.created_at));
+        }
     }
 
     /// Who a run is for: whoever queued its message. Routines run as the scheduler,
