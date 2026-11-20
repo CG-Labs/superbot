@@ -256,8 +256,8 @@ impl Upgrader {
         Fut: std::future::Future<Output = Result<Vec<u8>, String>>,
     {
         let res = self.stage_inner(req, fetch).await;
-        let report = self.current.lock().unwrap().take();
         if let Err(e) = &res {
+            let report = self.current.lock().unwrap().take();
             for p in [&self.exe, &self.botctl] {
                 let _ = std::fs::remove_file(suffixed(p, ".new"));
             }

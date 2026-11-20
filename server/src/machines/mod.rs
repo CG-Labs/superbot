@@ -17,7 +17,6 @@ pub mod linode;
 pub mod pki;
 pub mod provider;
 pub mod route;
-#[cfg(test)]
 #[allow(dead_code)]
 pub mod tools;
 #[cfg(test)]
@@ -772,15 +771,19 @@ pub async fn reconcile(app: &App, cp: &ControlPlane) -> Value {
     out
 }
 
-/// Asks every enrolled running machine's agent how it is, a few at a time, and
-/// returns how many answered. None when enrollment is off. Heartbeats change only the
+/// Asks every enrolled running machine's agent how it is, a few at a time, sends
+/// what's due to those that answered (`upkeep`), and returns how many did. None when enrollment is off. Heartbeats change only the
 /// agent columns, so they don't take the lock.
 pub async fn heartbeats(app: &App, cp: &ControlPlane) -> Option<usize> {
     use futures_util::StreamExt;
     let e = cp.enrollment.as_ref()?;
     let enrolled = app.db.machines(Some(State::Running)).into_iter().filter(|m| m.enrollment == "enrolled");
     let answered = futures_util::stream::iter(enrolled)
-        .map(|m| async move { enroll::heartbeat(app, e, &m).await.is_ok() })
+        .map(|m| async move {
+            let Ok(hb) = enroll::heartbeat(app, e, &m).await else { return false };
+            upkeep::follow_up(app, cp, e, &m.id, &hb).await;
+            true
+        })
         .buffer_unordered(HEARTBEATS_AT_ONCE)
         .filter(|ok| std::future::ready(*ok))
         .count()

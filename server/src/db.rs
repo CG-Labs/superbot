@@ -382,6 +382,22 @@ pub struct Machine {
     /// When an admin assigned it to its user, so their Bots run on it (ADR 0036).
     pub assigned_at: Option<i64>,
     pub assigned_by: Option<String>,
+    /// What its agent last said of its build, harness CLIs and upgrades (ADR 0038).
+    pub agent_upkeep: Option<Value>,
+    /// When botd last sent it the harness plan, and the plan's id.
+    pub harnesses_sent_at: Option<i64>,
+    pub harnesses_sent_plan: Option<String>,
+    /// An admin holding its agent at its build: nothing upgrades it.
+    pub upgrade_hold_at: Option<i64>,
+    pub upgrade_hold_by: Option<String>,
+    /// The upgrade on its way: its id, the build, when it was sent, and `auto` or the
+    /// admin who asked.
+    pub upgrade_id: Option<String>,
+    pub upgrade_build: Option<String>,
+    pub upgrade_sent_at: Option<i64>,
+    pub upgrade_by: Option<String>,
+    /// A build that failed to upgrade it, so it isn't tried again by itself.
+    pub upgrade_failed_build: Option<String>,
 }
 
 /// A certificate the control plane issued a machine (ADR 0031). Looked up by
@@ -517,6 +533,16 @@ fn machine_row(r: &Row) -> rusqlite::Result<Machine> {
         enroll_overdue_at: r.get("enroll_overdue_at")?,
         assigned_at: r.get("assigned_at")?,
         assigned_by: r.get("assigned_by")?,
+        agent_upkeep: r.get::<_, Option<String>>("agent_upkeep")?.and_then(|j| serde_json::from_str(&j).ok()),
+        harnesses_sent_at: r.get("harnesses_sent_at")?,
+        harnesses_sent_plan: r.get("harnesses_sent_plan")?,
+        upgrade_hold_at: r.get("upgrade_hold_at")?,
+        upgrade_hold_by: r.get("upgrade_hold_by")?,
+        upgrade_id: r.get("upgrade_id")?,
+        upgrade_build: r.get("upgrade_build")?,
+        upgrade_sent_at: r.get("upgrade_sent_at")?,
+        upgrade_by: r.get("upgrade_by")?,
+        upgrade_failed_build: r.get("upgrade_failed_build")?,
     })
 }
 
@@ -863,7 +889,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 14] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 15] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -878,7 +904,28 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 14] = [
     migrate_machine_enrollment,
     migrate_machine_lockdown,
     migrate_machine_placement,
+    migrate_machine_upkeep,
 ];
+/// Harness CLIs and agent upgrades on machines (ADR 0038): what each agent last said,
+/// the plan sent to it, and an upgrade on its way, held, or failed.
+fn migrate_machine_upkeep(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'agent_upkeep'", [], |r| r.get(0))?;
+    if has {
+        return Ok(());
+    }
+    c.execute_batch(
+        "ALTER TABLE machines ADD COLUMN agent_upkeep TEXT;
+        ALTER TABLE machines ADD COLUMN harnesses_sent_at INTEGER;
+        ALTER TABLE machines ADD COLUMN harnesses_sent_plan TEXT;
+        ALTER TABLE machines ADD COLUMN upgrade_hold_at INTEGER;
+        ALTER TABLE machines ADD COLUMN upgrade_hold_by TEXT;
+        ALTER TABLE machines ADD COLUMN upgrade_id TEXT;
+        ALTER TABLE machines ADD COLUMN upgrade_build TEXT;
+        ALTER TABLE machines ADD COLUMN upgrade_sent_at INTEGER;
+        ALTER TABLE machines ADD COLUMN upgrade_by TEXT;
+        ALTER TABLE machines ADD COLUMN upgrade_failed_build TEXT;",
+    )
+}
 /// Machines come up firewalled and enrolled (ADR 0035): the provider firewall each is
 /// behind, and when it must have enrolled by (and when it was found it hadn't).
 fn migrate_machine_lockdown(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
@@ -2934,6 +2981,72 @@ impl Db {
             ),
             Err(why) => self.c().execute("UPDATE machines SET agent_error = ? WHERE id = ?", params![why, machine_id]),
         };
+    }
+
+    /// What the agent said of its build, harnesses and upgrades (ADR 0038), if it was
+    /// still `old`. Returns whether it was, so each change is seen once.
+    pub fn machine_upkeep_swap(&self, machine_id: &str, old: Option<&Value>, new: &Value) -> bool {
+        self.c()
+            .execute(
+                "UPDATE machines SET agent_upkeep = ? WHERE id = ? AND agent_upkeep IS ?",
+                params![new.to_string(), machine_id, old.map(Value::to_string)],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    pub fn machine_harnesses_sent(&self, machine_id: &str, plan: &str) {
+        let _ = self.c().execute(
+            "UPDATE machines SET harnesses_sent_at = ?, harnesses_sent_plan = ? WHERE id = ?",
+            params![now(), plan, machine_id],
+        );
+    }
+
+    /// Records an upgrade as on its way, unless another is (one sent before
+    /// `stale_before` no longer counts). Returns whether this one is.
+    pub fn machine_upgrade_claim(&self, machine_id: &str, id: &str, build: &str, by: &str, stale_before: i64) -> bool {
+        self.c()
+            .execute(
+                "UPDATE machines SET upgrade_id = ?, upgrade_build = ?, upgrade_sent_at = ?, upgrade_by = ?
+                 WHERE id = ? AND (upgrade_id IS NULL OR upgrade_sent_at < ?)",
+                params![id, build, now(), by, machine_id, stale_before],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Ends upgrade `id`. `failed`: the build that failed, kept so it isn't tried again
+    /// by itself; None clears it. Returns whether `id` was the one on its way.
+    pub fn machine_upgrade_end(&self, machine_id: &str, id: &str, failed: Option<&str>) -> bool {
+        self.c()
+            .execute(
+                "UPDATE machines SET upgrade_id = NULL, upgrade_build = NULL, upgrade_sent_at = NULL, upgrade_by = NULL,
+                 upgrade_failed_build = ? WHERE id = ? AND upgrade_id = ?",
+                params![failed, machine_id, id],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Lets a build that failed be tried again.
+    pub fn machine_upgrade_forget_failure(&self, machine_id: &str) {
+        let _ = self.c().execute("UPDATE machines SET upgrade_failed_build = NULL WHERE id = ?", [machine_id]);
+    }
+
+    /// Holds the agent at its build (`by`: Some), or lets it go (None). Returns whether
+    /// it changed.
+    pub fn machine_upgrade_hold(&self, machine_id: &str, by: Option<Option<&str>>) -> bool {
+        let n = match by {
+            Some(by) => self.c().execute(
+                "UPDATE machines SET upgrade_hold_at = ?, upgrade_hold_by = ? WHERE id = ? AND upgrade_hold_at IS NULL",
+                params![now(), by, machine_id],
+            ),
+            None => self.c().execute(
+                "UPDATE machines SET upgrade_hold_at = NULL, upgrade_hold_by = NULL WHERE id = ? AND upgrade_hold_at IS NOT NULL",
+                [machine_id],
+            ),
+        };
+        n.unwrap_or(0) == 1
     }
 }
 
