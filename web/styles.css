@@ -128,6 +128,44 @@ span.sub { display: inline; }
 }
 .modal-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 
+#tab-setup { max-width: 980px; }
+#tab-setup .setup-title, .setup-state { margin: 0; }
+.steps { display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0 18px; }
+.step {
+  display: flex; align-items: center; gap: 8px; padding: 6px 12px 6px 6px; border-radius: 10px;
+  border: 1px solid var(--border); background: var(--bg-field); color: var(--text-dim); font: inherit; cursor: pointer;
+}
+.step.on { color: var(--text); border-color: var(--blue-dot); }
+.step .n {
+  display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 11px;
+  background: #262626; font-size: 12px; font-weight: 600;
+}
+.verdict { padding: 10px 14px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg-card); }
+.verdict.good { border-color: #24502f; color: #b6f0c4; }
+.verdict.todo { border-color: #5a4318; color: #f3d39c; }
+.warn-text { color: var(--amber); }
+.howto { margin: 0 0 14px; }
+.howto h3 { font-size: 13.5px; font-weight: 600; margin: 0 0 2px; }
+.howto .hint { margin-bottom: 6px; }
+.cmd { display: flex; gap: 8px; align-items: flex-start; margin: 0 0 12px; }
+.cmd pre {
+  flex: 1; min-width: 0; margin: 0; padding: 8px 10px; border-radius: 10px; background: var(--bg-top); border: 1px solid var(--border);
+  font: 12.5px ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-all;
+}
+.grid .cmd { margin: 0; }
+.secret-inline { display: flex; gap: 6px; }
+.secret-inline textarea { min-width: 10em; flex: 1; }
+.checklist { list-style: none; padding: 0; margin: 0 0 16px; }
+.checklist li {
+  display: flex; gap: 12px; align-items: center; justify-content: space-between;
+  padding: 10px 0; border-bottom: 1px solid #222;
+}
+.checklist .sub { display: block; }
+.checklist li.good b { color: var(--green); }
+.checklist li.todo b { color: var(--amber); }
+.setup-nav { margin-top: 18px; }
+.setup-nav #setup-next { margin-left: auto; }
+
 @media (max-width: 760px) {
   .top { padding: 10px 14px; gap: 10px; }
   main { padding: 12px 14px 40px; }

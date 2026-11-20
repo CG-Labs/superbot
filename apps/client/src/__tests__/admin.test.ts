@@ -1,5 +1,16 @@
-import { Linking } from "react-native";
-import { consoleUrl, isAdmin, openConsole } from "../admin";
+import { AppState, Linking } from "react-native";
+import { waitFor } from "@testing-library/react-native";
+import { ApiError } from "../api";
+import { consoleUrl, isAdmin, openConsole, openSetup, setupPending, setupUrl, watchSetup } from "../admin";
+import type { Me, SetupStatus } from "../types";
+
+const ADMIN: Me = { name: "Owner", role: "admin", permissions: ["account", "read", "admin"] };
+const status = (show: boolean): SetupStatus => ({
+  progress: { step: "domain", show, dismissed: !show, completedAt: null },
+  checklist: [],
+  done: 2,
+  total: 5,
+});
 
 describe("admin console link (ADR 0027)", () => {
   it("is for admins only, by the permissions the server grants", () => {
@@ -20,5 +31,59 @@ describe("admin console link (ADR 0027)", () => {
     await openConsole("https://bots.example.com");
     expect(open).toHaveBeenCalledWith("https://bots.example.com/console/");
     open.mockRestore();
+  });
+});
+
+describe("setup wizard link (ADR 0034)", () => {
+  it("opens the console's Setup tab", async () => {
+    expect(setupUrl("https://bots.example.com/")).toBe("https://bots.example.com/console/#setup");
+    const open = jest.spyOn(Linking, "openURL").mockResolvedValue(undefined);
+    await openSetup("https://bots.example.com");
+    expect(open).toHaveBeenCalledWith("https://bots.example.com/console/#setup");
+    open.mockRestore();
+  });
+
+  it("is pending for admins until the wizard is finished or hidden", async () => {
+    expect(await setupPending({ setupStatus: async () => status(true) }, ADMIN)).toBe(true);
+    expect(await setupPending({ setupStatus: async () => status(false) }, ADMIN)).toBe(false);
+  });
+
+  it("never asks the server for anyone but admins", async () => {
+    const setupStatus = jest.fn(async () => status(true));
+    expect(await setupPending({ setupStatus }, { name: "Alex", role: "member", permissions: ["account", "read", "write"] })).toBe(false);
+    expect(await setupPending({ setupStatus }, { name: "You" })).toBe(false);
+    expect(setupStatus).not.toHaveBeenCalled();
+  });
+
+  it("checks again when the app comes back from the console", async () => {
+    let onState: (s: string) => void = () => {};
+    const remove = jest.fn();
+    const listen = jest.spyOn(AppState, "addEventListener").mockImplementation((_, fn) => {
+      onState = fn as (s: string) => void;
+      return { remove } as unknown as ReturnType<typeof AppState.addEventListener>;
+    });
+    let show = true;
+    const setupStatus = jest.fn(async () => status(show));
+    const seen: boolean[] = [];
+    const stop = watchSetup({ setupStatus }, ADMIN, (v) => seen.push(v));
+    await waitFor(() => expect(seen).toEqual([true]));
+    show = false;
+    onState("background");
+    onState("active");
+    await waitFor(() => expect(seen).toEqual([true, false]));
+    expect(setupStatus).toHaveBeenCalledTimes(2);
+    stop();
+    expect(remove).toHaveBeenCalled();
+    onState("active");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(seen).toEqual([true, false]);
+    listen.mockRestore();
+  });
+
+  it("stays quiet on servers without the wizard", async () => {
+    const missing = async (): Promise<SetupStatus> => {
+      throw new ApiError("Not found", 404);
+    };
+    expect(await setupPending({ setupStatus: missing }, ADMIN)).toBe(false);
   });
 });

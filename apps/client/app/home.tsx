@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { Modal, StyleSheet, useWindowDimensions, View } from "react-native";
 import { Redirect, router } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
@@ -8,7 +8,7 @@ import { ChatView } from "../components/ChatView";
 import { CreateBotModal } from "../components/CreateBotModal";
 import { ScreenViewer } from "../components/ScreenViewer";
 import { Sidebar } from "../components/Sidebar";
-import { openConsole } from "../src/admin";
+import { openConsole, openSetup, watchSetup } from "../src/admin";
 import { showError } from "../src/dialogs";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
@@ -17,7 +17,7 @@ import { colors } from "../src/theme";
 type ScreenState = { takeOver: boolean; n: number } | null;
 
 export default function HomeScreen() {
-  const { api, bots, activeId, setActiveId, logout, handoffs, fetchScreenUrl, answerQuestion } = useSuperBot();
+  const { api, me, bots, activeId, setActiveId, logout, handoffs, fetchScreenUrl, answerQuestion } = useSuperBot();
   const { width } = useWindowDimensions();
   const wide = width >= 800;
   const [mobilePane, setMobilePane] = useState<"list" | "chat">("list");
@@ -25,6 +25,9 @@ export default function HomeScreen() {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [screen, setScreen] = useState<ScreenState>(null);
   const [approvalsOpen, setApprovalsOpen] = useState(false);
+  const [setupWaiting, setSetupWaiting] = useState(false);
+
+  useEffect(() => (api ? watchSetup(api, me, setSetupWaiting) : undefined), [api, me]);
 
   if (!api) {
     return <Redirect href="/" />;
@@ -81,6 +84,9 @@ export default function HomeScreen() {
             onOpenUsers={() => router.push("/users")}
             onOpenAudit={() => router.push("/audit")}
             onOpenConsole={() => void openConsole(api.baseUrl).catch((err) => showError(err, "Couldn't open the admin console"))}
+            onOpenSetup={
+              setupWaiting ? () => void openSetup(api.baseUrl).catch((err) => showError(err, "Couldn't open the setup wizard")) : undefined
+            }
           />
         ) : null}
         {wide || mobilePane === "chat" ? (
