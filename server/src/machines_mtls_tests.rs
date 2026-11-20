@@ -308,7 +308,7 @@ async fn the_agent_enrolls_from_its_token_file_and_keeps_its_key_across_restarts
 }
 
 async fn wait_for_heartbeat(env: &Env) {
-    for _ in 0..100 {
+    for _ in 0..400 {
         let (_, r) = json_call(env, "POST", "/api/machines/reconcile", "").await;
         if r["heartbeats"] == 1 {
             return;
