@@ -73,7 +73,7 @@ impl App {
         let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| "/".into());
         // No folder of its own (an odd owner id): nothing is inside, so every delete asks.
         let workspace = self.workspace_for(&bot.owner_id).unwrap_or_else(|| self.cfg.workspace.join(crate::isolation::USERS).join(".none"));
-        Ctx { workspace, home }
+        Ctx { workspace, home, readable: true }
     }
 
     /// Decides one tool call. Risky calls wait for the user. Never fails open:
