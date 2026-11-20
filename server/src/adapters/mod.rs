@@ -44,6 +44,8 @@ pub struct RunInput {
     pub state_dir: PathBuf,
     /// Set in ask mode: the harness must run `command` before every tool call.
     pub guard: Option<Guard>,
+    /// With per-user accounts (ADR 0037): the account the harness runs as. None: botd's.
+    pub run_as: Option<crate::accounts::RunAs>,
 }
 
 /// The approval gate, as each adapter installs it in its harness's own hook format.
@@ -232,10 +234,20 @@ async fn run_child(adapter: &mut dyn Adapter, input: &RunInput, abort: &mut watc
     }
     let stdin = adapter.stdin(input);
 
-    let mut cmd = Command::new(adapter.bin());
+    let argv: Vec<std::ffi::OsString> = match &input.run_as {
+        Some(r) => r.argv(adapter.bin(), args),
+        None => std::iter::once(adapter.bin().into()).chain(args.into_iter().map(Into::into)).collect(),
+    };
+    let mut cmd = Command::new(&argv[0]);
     strip_secret_env(cmd.as_std_mut());
+    // sudo resets PATH; superbot-run puts this one back.
+    if input.run_as.is_some()
+        && let Some(path) = input.env.get("PATH")
+    {
+        cmd.env("SUPERBOT_PATH", path);
+    }
     let mut child = match cmd
-        .args(&args)
+        .args(&argv[1..])
         .current_dir(&input.cwd)
         .envs(&input.env)
         .envs(adapter.env(input))

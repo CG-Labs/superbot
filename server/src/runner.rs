@@ -1,6 +1,7 @@
 //! Runs Bots: one task at a time per Bot, in order. Builds the system prompt
 //! (identity, rules, memory), streams harness events to the web app, and saves replies.
 
+use crate::accounts::{self, Isolation, RunAs};
 use crate::adapters::{self, AbortReason, AgentEvent, Guard, RunInput};
 use crate::audit::{Actor, Event, Outcome, Who};
 use crate::db::{Bot, BotPatch, Db, Message};
@@ -70,6 +71,8 @@ pub struct App {
     pub control_plane: OnceLock<Arc<ControlPlane>>,
     /// Each user's plan and the models it routes to (ADR 0033). Unset: self-host only.
     pub tiers: OnceLock<Arc<Tiers>>,
+    /// Each user's Bots run as that user's own account (ADR 0037). Unset: all as botd's.
+    pub isolation: OnceLock<Arc<Isolation>>,
     closing: AtomicBool,
 }
 
@@ -85,6 +88,7 @@ impl App {
             approval_waiters: Mutex::default(),
             control_plane: OnceLock::new(),
             tiers: OnceLock::new(),
+            isolation: OnceLock::new(),
             closing: AtomicBool::new(false),
         })
     }
@@ -187,17 +191,51 @@ impl App {
     pub fn bot_dir(&self, id: &str) -> Option<PathBuf> {
         paths::child(&paths::child(&paths::canonical(&self.cfg.data_dir)?, "bots")?, id)
     }
-    fn memory_file(&self, id: &str) -> Option<PathBuf> {
+    pub fn isolation(&self) -> Option<&Isolation> {
+        self.isolation.get().map(|i| i.as_ref())
+    }
+
+    /// A Bot's memory file: `DATA_DIR/bots/<id>/MEMORY.md`, or with per-user accounts
+    /// `memory/<id>.md` in its owner's folder, where the run can edit it.
+    pub(crate) fn memory_file(&self, bot: &Bot) -> Option<PathBuf> {
+        match self.isolation() {
+            Some(iso) => iso.memory_file(&bot.owner_id, &bot.id),
+            None => self.data_memory_file(&bot.id),
+        }
+    }
+    /// `DATA_DIR/bots/<id>/MEMORY.md`. With per-user accounts, botd's copy of the memory file.
+    fn data_memory_file(&self, id: &str) -> Option<PathBuf> {
         paths::child(&self.bot_dir(id)?, "MEMORY.md")
     }
-    /// `DATA_DIR/users/<owner>/USER.md`: facts about one user, for that user's Bots only.
+
+    /// Facts about one user, for that user's Bots only: `DATA_DIR/users/<owner>/USER.md`,
+    /// or with per-user accounts `memory/USER.md` in their folder.
     pub fn user_file(&self, owner_id: &str) -> Option<PathBuf> {
+        match self.isolation() {
+            Some(iso) => iso.user_file(owner_id),
+            None => self.data_user_file(owner_id),
+        }
+    }
+    /// `DATA_DIR/users/<owner>/USER.md`. With per-user accounts, botd's copy.
+    fn data_user_file(&self, owner_id: &str) -> Option<PathBuf> {
         paths::child(&isolation::user_dir(&self.cfg.data_dir, owner_id)?, "USER.md")
     }
 
-    /// `WORKSPACE_DIR/users/<owner>`, created: the folder every Bot of that user works in.
+    /// The folder every Bot of that user works in: `WORKSPACE_DIR/users/<owner>`, created,
+    /// or with per-user accounts `workspace` in their folder (made with the account).
     pub fn workspace_for(&self, owner_id: &str) -> Option<PathBuf> {
-        isolation::user_dir(&self.cfg.workspace, owner_id)
+        match self.isolation() {
+            Some(iso) => iso.workspace(owner_id),
+            None => isolation::user_dir(&self.cfg.workspace, owner_id),
+        }
+    }
+
+    fn read_memory(&self, p: &Path) -> Option<String> {
+        match self.isolation() {
+            // The run's account can write there, so never follow a link it left.
+            Some(_) => accounts::read_plain(p, accounts::MAX_FILE),
+            None => std::fs::read_to_string(p).ok(),
+        }
     }
 
     /// Who a Bot works for, by name.
@@ -212,15 +250,89 @@ impl App {
         if let Some(dir) = self.bot_dir(&bot.id) {
             let _ = std::fs::create_dir_all(dir);
         }
-        if let Some(mem) = self.memory_file(&bot.id)
+        if let Some(mem) = self.data_memory_file(&bot.id)
             && !mem.exists()
         {
             let _ = std::fs::write(&mem, format!("# {}\n\n## Job\n\nNot set yet. Ask the user.\n\n## Rules\n\n## Work log\n", bot.name));
         }
-        if let Some(user) = self.user_file(&bot.owner_id)
+        if let Some(user) = self.data_user_file(&bot.owner_id)
             && !user.exists()
         {
             let _ = std::fs::write(&user, format!("# About the user\n\n- Name: {}\n", self.owner_name(bot)));
+        }
+        // With per-user accounts the run edits copies in its owner's folder, made from
+        // botd's. Until the account exists there's no folder, and nothing is made.
+        if let Some(iso) = self.isolation() {
+            let kept = |p: Option<PathBuf>| p.and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+            if let Some(mem) = iso.memory_file(&bot.owner_id, &bot.id) {
+                let _ = accounts::seed(&mem, &kept(self.data_memory_file(&bot.id)));
+            }
+            if let Some(user) = iso.user_file(&bot.owner_id) {
+                let _ = accounts::seed(&user, &kept(self.data_user_file(&bot.owner_id)));
+            }
+        }
+    }
+
+    /// With per-user accounts: copies the memory and facts a run left in its owner's
+    /// folder back to `DATA_DIR`, so backups have them and memory follows the Bot.
+    fn keep_memory(&self, bot: &Bot) {
+        let Some(iso) = self.isolation() else { return };
+        let pairs = [
+            (iso.memory_file(&bot.owner_id, &bot.id), self.data_memory_file(&bot.id)),
+            (iso.user_file(&bot.owner_id), self.data_user_file(&bot.owner_id)),
+        ];
+        for (from, to) in pairs {
+            if let (Some(from), Some(to)) = (from, to)
+                && let Some(text) = accounts::read_plain(&from, accounts::MAX_FILE)
+                && !text.trim().is_empty()
+                && std::fs::read_to_string(&to).ok().as_deref() != Some(text.as_str())
+            {
+                let _ = std::fs::write(&to, text);
+            }
+        }
+    }
+
+    /// A Bot changed hands. With per-user accounts its memory leaves the old owner's
+    /// folder (botd keeps it) and is made again in the new owner's on its next run.
+    pub fn hand_over_memory(&self, bot_id: &str, from: &str, to: &str) {
+        let Some(iso) = self.isolation() else { return };
+        if let (Some(old), Some(kept)) = (iso.memory_file(from, bot_id), self.data_memory_file(bot_id))
+            && let Some(text) = accounts::read_plain(&old, accounts::MAX_FILE)
+            && !text.trim().is_empty()
+        {
+            let _ = std::fs::write(kept, text);
+        }
+        for owner in [from, to] {
+            if let Some(p) = iso.memory_file(owner, bot_id) {
+                accounts::remove(&p);
+            }
+        }
+    }
+
+    /// Makes sure the user's account and folders exist (ADR 0037). A new account and a
+    /// failure are audited, as done by `by`.
+    pub async fn ensure_account(&self, user_id: &str, by: &Who) -> Result<RunAs, String> {
+        let iso = self.isolation.get().cloned().ok_or("Per-user accounts are off (ISOLATION=users turns them on).")?;
+        let run_as = iso.run_as(user_id).ok_or_else(|| format!("User id {user_id:?} can't be part of a Unix account name."))?;
+        let id = user_id.to_string();
+        let made = tokio::task::spawn_blocking({
+            let iso = iso.clone();
+            move || iso.ensure(&id)
+        })
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+        let event = |action: &str| by.event(action).target("user", user_id);
+        match made {
+            Ok(false) => Ok(run_as),
+            Ok(true) => {
+                self.db.record(&event("isolation.account_created").details(json!({ "account": run_as.account, "home": iso.home(user_id) })));
+                Ok(run_as)
+            }
+            Err(e) => {
+                eprintln!("Isolation: couldn't set up {}: {e}", run_as.account);
+                self.db.record(&event("isolation.account_failed").outcome(Outcome::Failure).details(json!({ "account": run_as.account, "error": e })));
+                Err(e)
+            }
         }
     }
 
@@ -301,6 +413,7 @@ impl App {
         if !self.route_here(&bot, msg, &by, &period).await {
             return;
         }
+        let Ok(run_as) = self.isolate(&bot, msg, &by, &period).await else { return };
         self.init_bot_files(&bot);
         self.db.set_status(msg.id, "running");
         let started = Instant::now();
@@ -343,11 +456,14 @@ impl App {
             {
                 env.extend(screen::bot_env(&info, &bot.id, &bot_dir));
             }
-            let invoked = json!({
+            let mut invoked = json!({
                 "harness": bot.harness, "model": route.model, "effort": route.effort, "provider": route.provider, "tier": tier, "policy": policy.mode,
                 "guarded": guard.is_some(), "resumed": bot.session_id.is_some(), "attempt": attempt + 1,
                 "trigger": msg.role, "messageId": msg.id,
             });
+            if let Some(r) = &run_as {
+                invoked["runAs"] = json!(r.account);
+            }
             self.db.record(&by.event("harness.invoked").target("message", &msg.id.to_string()).bot(&bot.id).details(invoked));
             let input = RunInput {
                 prompt: prompt.clone(),
@@ -360,6 +476,7 @@ impl App {
                 env,
                 state_dir: bot_dir.clone(),
                 guard: guard.clone(),
+                run_as: run_as.clone(),
             };
 
             let mut errors: Vec<String> = Vec::new();
@@ -403,6 +520,7 @@ impl App {
             })
             .await;
             timer.abort();
+            self.keep_memory(&bot);
             if let Some(c) = canary {
                 c.abort();
             }
@@ -501,6 +619,34 @@ impl App {
                     Err(e) => refused(Refusal::Unreachable(e), Some(&to.machine_id)),
                 }
             }
+        }
+    }
+
+    /// With per-user accounts (ADR 0037): the account this run starts as, always its
+    /// owner's, made now if it's new. Ok(None): isolation is off. Err: refused, and the
+    /// Bot said why; it never falls back to running as botd's account.
+    async fn isolate(&self, bot: &Bot, msg: &Message, by: &Who, period: &str) -> Result<Option<RunAs>, ()> {
+        if self.isolation().is_none() {
+            return Ok(None);
+        }
+        let refused = |reason: &str, text: &str| {
+            self.db.give_back_run(&bot.owner_id, period);
+            let e = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied);
+            let account = accounts::account(&bot.owner_id);
+            self.db.record(&e.details(json!({ "reason": reason, "owner": bot.owner_id, "account": account, "harness": bot.harness, "messageId": msg.id })));
+            self.say(&bot.id, text, true);
+            Err(())
+        };
+        if !accounts::HARNESSES.contains(&bot.harness.as_str()) {
+            let text = format!(
+                "This server runs each person's Bots under their own account, and {} can't run that way yet. Switch me to Claude Code or Codex in my settings.",
+                bot.harness
+            );
+            return refused("isolation_harness", &text);
+        }
+        match self.ensure_account(&bot.owner_id, by).await {
+            Ok(r) => Ok(Some(r)),
+            Err(_) => refused("no_account", "I couldn't set up my owner's account on this server, so I didn't run. An admin can check the server log."),
         }
     }
 
@@ -690,8 +836,8 @@ impl App {
     }
 
     pub(crate) fn system_prompt(&self, bot: &Bot) -> String {
-        let read = |p: &Option<PathBuf>| p.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default().trim().to_string();
-        let (mem_file, user_file) = (self.memory_file(&bot.id), self.user_file(&bot.owner_id));
+        let read = |p: &Option<PathBuf>| p.as_deref().and_then(|p| self.read_memory(p)).unwrap_or_default().trim().to_string();
+        let (mem_file, user_file) = (self.memory_file(bot), self.user_file(&bot.owner_id));
         // Only the Bots its owner can see: a Bot acts for its owner (ADR 0017).
         let others: Vec<String> = crate::acl::Viewer::owner_of(&self.db, bot)
             .bots(&self.db)
@@ -876,6 +1022,116 @@ mod tests {
         assert_eq!(status().as_deref(), Some("done"));
     }
 
+    fn actions(app: &App, prefix: &str) -> Vec<crate::db::AuditEvent> {
+        let f = crate::audit::Filter { actions: vec![format!("{prefix}*")], ..Default::default() };
+        app.db.audit_events(&f, 100, true)
+    }
+
+    /// An app with per-user accounts on, in a scratch folder; the account helper is
+    /// `sudo`, so making an account fails unless the test makes the folders itself.
+    fn isolated_app(sudo: &str) -> (Arc<App>, PathBuf) {
+        let app = test_app();
+        let root = app.cfg.data_dir.parent().unwrap().join(format!("iso-{}", crate::short_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _ = app.isolation.set(Arc::new(accounts::for_tests(&root, sudo)));
+        (app, root)
+    }
+
+    #[tokio::test]
+    async fn isolation_off_runs_as_before() {
+        let app = test_app();
+        let bot = app.db.create_bot("A", "#fff", "waddle", "pi", None, true);
+        let msg = app.db.add_message(&bot.id, "user", "hi", None, false, Some("queued"));
+        assert_eq!(app.isolate(&bot, &msg, &Who::system("test"), "2026-11").await, Ok(None));
+        app.init_bot_files(&bot);
+        assert_eq!(app.memory_file(&bot), app.data_memory_file(&bot.id));
+        assert_eq!(app.user_file(&bot.owner_id), app.data_user_file(&bot.owner_id));
+        assert_eq!(app.workspace_for(&bot.owner_id), isolation::user_dir(&app.cfg.workspace, &bot.owner_id));
+        assert!(actions(&app, "isolation.").is_empty());
+        assert!(actions(&app, "bot.run_refused").is_empty());
+    }
+
+    #[test]
+    fn isolated_bots_keep_memory_in_their_owners_folder() {
+        use crate::acl::Visibility;
+        use crate::rbac::Role;
+        let (app, root) = isolated_app("/bin/false");
+        let ada = app.db.create_user(None, Some("ada@example.com"), "Ada", Role::Member).unwrap();
+        let bea = app.db.create_user(None, Some("bea@example.com"), "Bea", Role::Member).unwrap();
+        let a = app.db.create_bot_owned("A1", "#fff", "waddle", "claude", None, false, &ada.id, Visibility::Private);
+        assert_eq!(app.workspace_for(&ada.id), Some(root.join(&ada.id).join("workspace")));
+        assert_eq!(app.memory_file(&a), Some(root.join(&ada.id).join("memory").join(format!("{}.md", a.id))));
+        assert_eq!(app.user_file(&ada.id), Some(root.join(&ada.id).join("memory/USER.md")));
+        for bad in ["", "..", "a/b", "U1", &"a".repeat(28)] {
+            assert_eq!(app.workspace_for(bad), None, "{bad:?}");
+            assert_eq!(app.user_file(bad), None, "{bad:?}");
+        }
+
+        // No account yet: botd's copies are made, nothing in the user's folder.
+        app.init_bot_files(&a);
+        assert!(app.data_memory_file(&a.id).unwrap().is_file());
+        assert!(!app.memory_file(&a).unwrap().exists());
+
+        // With the folder there, the run gets a copy, and what it writes comes back.
+        for u in [&ada.id, &bea.id] {
+            std::fs::create_dir_all(root.join(u).join("memory")).unwrap();
+        }
+        app.init_bot_files(&a);
+        let mem = app.memory_file(&a).unwrap();
+        assert!(std::fs::read_to_string(&mem).unwrap().contains("# A1"));
+        std::fs::write(&mem, "# A1\n\nLearned a thing.\n").unwrap();
+        app.keep_memory(&a);
+        assert_eq!(std::fs::read_to_string(app.data_memory_file(&a.id).unwrap()).unwrap(), "# A1\n\nLearned a thing.\n");
+
+        // A link left in its place is never followed, nor copied back.
+        let secret = root.join("secret.txt");
+        std::fs::write(&secret, "not yours").unwrap();
+        std::fs::remove_file(&mem).unwrap();
+        std::os::unix::fs::symlink(&secret, &mem).unwrap();
+        app.keep_memory(&a);
+        assert_eq!(std::fs::read_to_string(app.data_memory_file(&a.id).unwrap()).unwrap(), "# A1\n\nLearned a thing.\n");
+        assert!(!app.system_prompt(&a).contains("not yours"));
+        std::fs::remove_file(&mem).unwrap();
+        app.init_bot_files(&a);
+
+        // Handed to Bea: it leaves Ada's folder and starts again in Bea's.
+        app.hand_over_memory(&a.id, &ada.id, &bea.id);
+        assert!(!mem.exists());
+        assert!(app.db.set_bot_owner_capped(&a.id, &bea.id, None));
+        let b = app.db.bot(&a.id).unwrap();
+        app.init_bot_files(&b);
+        assert!(std::fs::read_to_string(app.memory_file(&b).unwrap()).unwrap().contains("Learned a thing."));
+        assert_eq!(app.memory_file(&b).unwrap().parent().unwrap(), root.join(&bea.id).join("memory"));
+    }
+
+    #[tokio::test]
+    async fn isolated_runs_never_fall_back_to_botds_account() {
+        let (app, _) = isolated_app("/bin/false");
+        let who = Who::system("test");
+        for harness in ["pi", "hermes"] {
+            let bot = app.db.create_bot("P", "#fff", "waddle", harness, None, true);
+            let msg = app.db.add_message(&bot.id, "user", "hi", None, false, Some("queued"));
+            assert_eq!(app.isolate(&bot, &msg, &who, "2026-11").await, Err(()), "{harness}");
+            let last = app.db.messages(&bot.id, 1).pop().unwrap();
+            assert!(last.error && last.text.contains("Claude Code or Codex"), "{}", last.text);
+        }
+        let refused = actions(&app, "bot.run_refused");
+        assert!(refused.iter().all(|e| e.details["reason"] == "isolation_harness"), "{refused:?}");
+        assert_eq!(refused.len(), 2);
+
+        // The account can't be made: refused, and the failure is audited.
+        let bot = app.db.create_bot("C", "#fff", "waddle", "claude", None, true);
+        let msg = app.db.add_message(&bot.id, "user", "hi", None, false, Some("queued"));
+        assert_eq!(app.isolate(&bot, &msg, &who, "2026-11").await, Err(()));
+        let refused = actions(&app, "bot.run_refused");
+        assert_eq!(refused.last().unwrap().details["reason"], "no_account");
+        assert_eq!(refused.last().unwrap().details["account"], format!("sb-u-{}", bot.owner_id));
+        let failed = actions(&app, "isolation.account_failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].outcome, "failure");
+        assert!(actions(&app, "harness.invoked").is_empty());
+    }
+
     #[test]
     fn bot_files_stay_in_the_data_folder() {
         let app = test_app();
@@ -883,12 +1139,13 @@ mod tests {
         app.init_bot_files(&bot);
         let dir = app.bot_dir(&bot.id).unwrap();
         assert_eq!(dir, app.cfg.data_dir.join("bots").join(&bot.id));
-        assert!(app.memory_file(&bot.id).unwrap().is_file());
+        assert_eq!(app.memory_file(&bot), app.data_memory_file(&bot.id));
+        assert!(app.memory_file(&bot).unwrap().is_file());
         assert_eq!(app.user_file(&bot.owner_id).unwrap(), app.cfg.data_dir.join("users").join(&bot.owner_id).join("USER.md"));
         assert!(app.user_file(&bot.owner_id).unwrap().is_file());
         for bad in ["", "..", "../../etc", "a/b", "/etc"] {
             assert_eq!(app.bot_dir(bad), None, "{bad:?}");
-            assert_eq!(app.memory_file(bad), None, "{bad:?}");
+            assert_eq!(app.data_memory_file(bad), None, "{bad:?}");
             assert_eq!(app.user_file(bad), None, "{bad:?}");
             assert_eq!(app.workspace_for(bad), None, "{bad:?}");
         }
