@@ -586,8 +586,15 @@ mod tests {
         for vars in [vec![("STRIPE_WEBHOOK_SECRET", "whsec_inline_test")], vec![("STRIPE_WEBHOOK_SECRET_FILE", f.to_str().unwrap())]] {
             let s = secrets(&vars);
             assert!(s.harness_env().is_empty() && s.inherited_harness_env().is_empty(), "{vars:?}");
+            assert!(s.harness_env_for("ua").is_empty(), "a Bot's run space: {vars:?}");
             assert!(s.list().unwrap().is_empty(), "{vars:?}");
         }
+        // Even one already in the sealed store (put there before the name was reserved).
+        let s = secrets(&[]);
+        s.stores[1].put("STRIPE_WEBHOOK_SECRET", "whsec_sealed_test").unwrap();
+        assert!(s.harness_env_for("ua").is_empty() && s.inherited_harness_env().is_empty());
+        let host = crate::adapters::local_host();
+        assert!(["STRIPE_WEBHOOK_SECRET", "STRIPE_WEBHOOK_SECRET_FILE"].iter().all(|k| host.remove.iter().any(|r| r == k)), "removed from local jobs");
         assert!(secrets(&[]).put("STRIPE_WEBHOOK_SECRET", "whsec_x").is_err(), "set in the environment, not as a secret");
         assert!(secrets(&[]).user_put("ua", "STRIPE_WEBHOOK_SECRET", "whsec_x").is_err());
     }
