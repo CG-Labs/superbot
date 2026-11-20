@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use crate::shell::{self, Word};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,26 +367,80 @@ pub struct Ctx {
 
 /// Deny rules first, then risky classes: a remembered allow rule skips the ask,
 /// otherwise the most severe class action wins. Calls in no class run.
+#[cfg(test)]
 pub fn decide(p: &Policy, rules: &[Rule], call: &Call, ctx: &Ctx) -> Verdict {
+    decide_with(p, rules, call, ctx).0
+}
+
+/// Like `decide`, and every risky class the call fell in with its reason (`classify`).
+/// Empty when it was decided before classifying: bypass mode or a deny rule.
+pub fn decide_with(p: &Policy, rules: &[Rule], call: &Call, ctx: &Ctx) -> (Verdict, Vec<(&'static str, String)>) {
     if p.mode == Mode::Bypass {
-        return Verdict::allow("Bypass mode");
+        return (Verdict::allow("Bypass mode"), vec![]);
     }
     if let Some(r) = rules.iter().find(|r| r.action == Action::Deny && r.matches(call)) {
-        return Verdict { action: Action::Deny, class: None, reason: format!("Matches deny rule \"{}\"", r.pattern), rule: Some(r.id.clone()) };
+        let v = Verdict { action: Action::Deny, class: None, reason: format!("Matches deny rule \"{}\"", r.pattern), rule: Some(r.id.clone()) };
+        return (v, vec![]);
     }
     let found = classify(call, ctx);
     if let Some((_, why)) = found.iter().find(|(c, _)| *c == UNREADABLE) {
-        return Verdict { action: Action::Deny, class: Some(UNREADABLE), reason: why.clone(), rule: None };
+        let v = Verdict { action: Action::Deny, class: Some(UNREADABLE), reason: why.clone(), rule: None };
+        return (v, found);
     }
     let Some((class, why, action)) = found.iter().map(|(c, why)| (*c, why, p.action(c))).max_by_key(|x| x.2) else {
-        return Verdict::allow("Not a risky action");
+        return (Verdict::allow("Not a risky action"), found);
     };
-    if action != Action::Deny
-        && let Some(r) = rules.iter().find(|r| r.action == Action::Allow && r.matches(call))
-    {
-        return Verdict { action: Action::Allow, class: Some(class), reason: format!("Matches allow rule \"{}\"", r.pattern), rule: Some(r.id.clone()) };
+    let v = match rules.iter().find(|r| r.action == Action::Allow && r.matches(call)) {
+        Some(r) if action != Action::Deny => {
+            Verdict { action: Action::Allow, class: Some(class), reason: format!("Matches allow rule \"{}\"", r.pattern), rule: Some(r.id.clone()) }
+        }
+        _ => Verdict { action, class: Some(class), reason: why.clone(), rule: None },
+    };
+    (v, found)
+}
+
+/// What "Approve for this run" covers (ADR 0051): later calls in the same run with the
+/// same tool whose every risky part that asks is one the approved call had, in the
+/// classifier's own words ("Pushes to a git remote", "Installs software (npm install)").
+/// It never reaches a class the approved call wasn't in, and it only turns an ask into
+/// an allow: deny rules, deny classes, and unreadable commands are decided first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunScope {
+    pub tool: String,
+    /// (class, reason) for each risky part in a class set to ask.
+    pub asks: BTreeSet<(&'static str, String)>,
+    /// A delete outside the workspace names a path that may be relative to wherever the
+    /// command runs, so it covers only the same call again, in the same folder.
+    pub exact: Option<(String, PathBuf)>,
+}
+
+/// Classes that are only ever approved one call at a time: their reasons ("Runs as
+/// root", "Runs a command only known when it runs") don't say what would run next time.
+const ONE_AT_A_TIME: [&str; 2] = ["shell_destructive", UNREADABLE];
+
+impl RunScope {
+    /// None when the call can't be approved for a run: nothing in it asks, or part of it
+    /// is in a one-at-a-time class, runs a downloaded script, or types into a running
+    /// program (which may finish a command typed earlier).
+    pub fn of(call: &Call, p: &Policy, found: &[(&'static str, String)]) -> Option<RunScope> {
+        let asks: BTreeSet<(&'static str, String)> = found.iter().filter(|(c, _)| p.action(c) == Action::Ask).cloned().collect();
+        let one_at_a_time = asks.iter().any(|(c, why)| ONE_AT_A_TIME.contains(c) || why == DOWNLOADED_SCRIPT);
+        if asks.is_empty() || one_at_a_time || typed_input(call).is_some() {
+            return None;
+        }
+        let exact = asks.iter().any(|(c, _)| *c == "file_delete").then(|| (call.subject.clone(), call.cwd.clone()));
+        Some(RunScope { tool: call.tool.clone(), asks, exact })
     }
-    Verdict { action, class: Some(class), reason: why.clone(), rule: None }
+
+    /// Whether this grant covers a later call's scope.
+    pub fn covers(&self, later: &RunScope) -> bool {
+        self.tool.eq_ignore_ascii_case(&later.tool) && self.exact == later.exact && later.asks.is_subset(&self.asks)
+    }
+
+    /// What it covers, as the person approving reads it.
+    pub fn covers_text(&self) -> Vec<String> {
+        self.asks.iter().map(|(_, why)| why.clone()).collect()
+    }
 }
 
 /// Every risky class this call falls in, with a short reason for the user.
@@ -476,6 +530,8 @@ const MESSAGING_HOSTS: [&str; 22] = [
 
 /// Not a configurable class: a shell command the parser can't read is refused.
 pub const UNREADABLE: &str = "shell_unreadable";
+
+const DOWNLOADED_SCRIPT: &str = "Runs a downloaded script";
 
 const SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ksh", "fish"];
 
@@ -652,7 +708,7 @@ fn classify_script(s: &Script, cwds: &Cwds, ctx: &Ctx, depth: usize, budget: &mu
         }
         if SHELLS.contains(&prog.as_str()) || prog.starts_with("python") || prog == "perl" || prog == "node" || prog == "ruby" {
             if piped_download && !args.iter().any(|a| a.starts_with("-c") || a.starts_with("-e")) {
-                out.push(("network_install", "Runs a downloaded script".into()));
+                out.push(("network_install", DOWNLOADED_SCRIPT.into()));
             }
             if SHELLS.contains(&prog.as_str()) {
                 // `bash -lc '<script>'`: classify the script too.
@@ -748,6 +804,24 @@ fn deletion(ctx: &Ctx, cwds: &Cwds, target: &str, push: &mut impl FnMut(&'static
     }
 }
 
+/// Whether `git config` sets push config: such a key with a value after it, in the old
+/// form (`git config [--add] k v`) or the new one (`git config set k v`). Reads, unsets and
+/// renames don't, even with a value pattern after the key (`--get k '.*'`). Only options
+/// before `--` are actions; a write action with them counts as a write.
+fn sets_push_config(rest: &[&str]) -> bool {
+    const NOT_SETTING: [&str; 12] = ["--get", "--get-all", "--get-regexp", "--get-urlmatch", "--get-color", "--get-colorbool", "--list", "-l", "--unset", "--unset-all", "--rename-section", "--remove-section"];
+    let opts = rest.iter().take_while(|a| **a != "--").filter(|a| a.starts_with('-'));
+    let (mut reads, mut writes) = (false, false);
+    for o in opts {
+        reads |= NOT_SETTING.contains(o);
+        writes |= ["--add", "--replace-all"].contains(o);
+    }
+    // A subcommand comes first; later words may be option values (`--file get`).
+    let sub = rest.first();
+    let reads = reads || sub.is_some_and(|o| ["get", "list", "unset", "rename-section", "remove-section"].contains(o));
+    (writes || !reads) && operands(rest).windows(2).any(|w| push_config(w[0]))
+}
+
 /// Arguments that are not flags. Everything after `--` is an operand.
 fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
     let mut out = Vec::new();
@@ -764,18 +838,50 @@ fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
     out
 }
 
+/// Options of `git push` that can overwrite or delete what is on the remote.
+const PUSH_REWRITES: [&str; 6] = ["force", "force-with-lease", "force-if-includes", "mirror", "delete", "prune"];
+
+/// Whether `git push` takes this as a rewriting option. Git accepts any unique prefix of
+/// a long option (`--mir` is `--mirror`); an ambiguous one (`--p`) counts too.
+fn push_rewrites(arg: &str) -> bool {
+    let Some(name) = arg.strip_prefix("--") else { return false };
+    let name = name.split('=').next().unwrap_or("");
+    !name.is_empty() && (name.starts_with("force") || PUSH_REWRITES.iter().any(|o| o.starts_with(name)))
+}
+
+/// Config that changes what a plain `git push` does: a remote's push refspecs (`+…` forces)
+/// or mirroring, the push defaults, and aliases.
+fn push_config(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    (key.starts_with("remote.") && (key.ends_with(".push") || key.ends_with(".mirror"))) || key.starts_with("push.") || key.starts_with("alias.")
+}
+
 fn git(args: &[&str], push: &mut impl FnMut(&'static str, String)) {
-    // Skip global options such as `-C dir` and `-c key=value`.
+    // Skip global options such as `-C dir` and `-c key=value`, noting config that changes pushes.
     let mut i = 0;
+    let mut configured = false;
     while i < args.len() && args[i].starts_with('-') {
-        i += if ["-C", "-c", "--git-dir", "--work-tree", "--namespace"].contains(&args[i]) { 2 } else { 1 };
+        let (opt, value) = match args[i].split_once('=') {
+            Some((o, v)) if o == "--config-env" => (o, Some(v)),
+            _ => (args[i], args.get(i + 1).copied()),
+        };
+        if opt == "-c" || opt == "--config-env" {
+            configured |= value.is_some_and(|v| push_config(v.split('=').next().unwrap_or("")));
+        }
+        i += if ["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"].contains(&args[i]) { 2 } else { 1 };
     }
     let Some(sub) = args.get(i) else { return };
     let rest = &args[(i + 1).min(args.len())..];
     let has = |f: &str| rest.contains(&f);
     let short = |c: char| rest.iter().any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains(c));
     match *sub {
-        "push" => push("git_push", "Pushes to a git remote".into()),
+        "push" => {
+            // Its own reason, so a push approved for a run (ADR 0051) never covers one that rewrites or deletes.
+            let rewrites = configured || short('f') || short('d') || rest.iter().any(|a| push_rewrites(a) || a.starts_with(['+', ':']));
+            push("git_push", if rewrites { "Force-pushes or deletes on a git remote" } else { "Pushes to a git remote" }.into())
+        }
+        // A plain push approved for a run must not turn into a forced or mirroring one later.
+        "config" if sets_push_config(rest) => push("git_push", "Changes how git pushes (git config)".into()),
         "reset" if has("--hard") => push("shell_destructive", "Discards local changes (git reset --hard)".into()),
         "clean" if short('f') || has("--force") => push("shell_destructive", "Deletes untracked files (git clean)".into()),
         "branch" if has("-D") || (short('d') && (short('f') || has("--force"))) => push("shell_destructive", "Force-deletes a branch".into()),
@@ -1130,6 +1236,13 @@ mod tests {
         for cmd in ["git push", "git push --force origin main", "git -C repo -c user.name=x push", "cd repo && git push -u origin HEAD"] {
             assert_eq!(cls(cmd), ["git_push"], "{cmd}");
         }
+        // Config that makes a later plain push force or mirror asks too.
+        for cmd in ["git config remote.origin.push +refs/heads/*:refs/heads/*", "git config set remote.origin.mirror true", "git config --file x.cfg --add Remote.Origin.Push +main", "git config alias.p 'push --force'", "git config push.default matching", "git config --replace-all -- remote.origin.push +refs/heads/main:refs/heads/main --get", "git config --replace-all remote.origin.push +main --get", "git config --file get remote.origin.push +main"] {
+            assert_eq!(cls(cmd), ["git_push"], "{cmd}");
+        }
+        for cmd in ["git config remote.origin.push", "git config get remote.origin.mirror", "git config --unset remote.origin.push", "git config --get remote.origin.push '.*'", "git config --get-all remote.origin.push +", "git config --unset-all remote.origin.push '^\\+'", "git config get --all --value=x remote.origin.push", "git config --rename-section alias.a alias.b", "git config user.name Ada", "git config remote.origin.url https://example.invalid/r.git"] {
+            assert!(cls(cmd).is_empty(), "{cmd}");
+        }
     }
 
     #[test]
@@ -1378,6 +1491,101 @@ mod tests {
         let exact = glob_escape("rm -rf ~/x/*");
         assert!(glob(&exact, "rm -rf ~/x/*"));
         assert!(!glob(&exact, "rm -rf ~/x/abc"));
+    }
+
+    fn scope(p: &Policy, call: &Call) -> Option<RunScope> {
+        let (v, found) = decide_with(p, &[], call, &ctx());
+        assert_eq!(v, decide(p, &[], call, &ctx()));
+        RunScope::of(call, p, &found)
+    }
+
+    #[test]
+    fn a_run_scope_covers_the_same_kind_of_call_and_nothing_broader() {
+        let ask = Policy::new(Mode::Ask);
+        let covers = |approved: &Call, later: &Call| scope(&ask, approved).unwrap().covers(&scope(&ask, later).unwrap());
+
+        let push = shell("git push origin main");
+        let s = scope(&ask, &push).unwrap();
+        assert_eq!((s.tool.as_str(), s.covers_text(), s.exact.is_some()), ("Bash", vec!["Pushes to a git remote".to_string()], false));
+        // Any ordinary push, in any form, with harmless commands around it.
+        for later in ["git push", "git push origin feature", "cd repo && git push -u origin HEAD", "git add . && git commit -m x && git push", "git push --dry-run --porcelain origin main", "git -c user.name=x push --no-force"] {
+            assert!(covers(&push, &shell(later)), "{later}");
+        }
+        // Never a force push or a remote delete, another class, or another tool.
+        for later in [
+            "git push --force",
+            "git push -f origin main",
+            "git push origin +main",
+            "git push origin :old",
+            "git push --delete origin x",
+            // Git takes any unique prefix of a long option.
+            "git push --mir origin",
+            "git push --forc origin main",
+            "git push --force-with-lease=main origin main",
+            "git push --del origin x",
+            "git push --pru origin",
+            "git push --p origin",
+            // Or config, given just for this push, that makes it force or mirror.
+            "git -c remote.origin.mirror=true push origin",
+            "git -c remote.origin.push=+refs/heads/*:refs/heads/* push",
+            "git --config-env=remote.origin.push=REFS push",
+            "git config remote.origin.push +main",
+        ] {
+            assert!(!covers(&push, &shell(later)), "{later}");
+        }
+        assert!(!covers(&push, &shell("git push && npm install left-pad")));
+        assert!(!covers(&push, &shell("gh pr create --fill")));
+        assert!(!covers(&push, &hermes("terminal", json!({ "command": "git push" }))));
+
+        // Installs: the same program and subcommand, any package.
+        let npm = shell("npm install left-pad");
+        assert!(covers(&npm, &shell("npm install zod")));
+        assert!(!covers(&npm, &shell("pip install requests")));
+        assert!(!covers(&npm, &shell("npx create-react-app x")));
+        // A call with two kinds covers each of them alone, not a third.
+        let both = shell("npm install x && git push");
+        assert!(covers(&both, &shell("git push origin main")) && covers(&both, &shell("npm install y")));
+        assert!(!covers(&both, &shell("cargo install ripgrep")));
+
+        // Messages: the same tool, any arguments.
+        let mail = Call::new("mcp__outlook__send_mail", json!({ "to": "a@b.c" }), "/srv/ws".into());
+        assert!(covers(&mail, &Call::new("mcp__outlook__send_mail", json!({ "to": "d@e.f" }), "/srv/ws".into())));
+        assert!(!covers(&mail, &Call::new("mcp__teams__send_chat_message", json!({}), "/srv/ws".into())));
+    }
+
+    #[test]
+    fn deletes_outside_the_workspace_are_covered_only_when_repeated_exactly() {
+        let ask = Policy::new(Mode::Ask);
+        let rm = shell("rm -rf /tmp/build");
+        let s = scope(&ask, &rm).unwrap();
+        assert_eq!(s.exact, Some(("rm -rf /tmp/build".to_string(), PathBuf::from("/srv/ws"))));
+        assert!(s.covers(&scope(&ask, &shell("rm -rf /tmp/build")).unwrap()));
+        assert!(!s.covers(&scope(&ask, &shell("rm -rf /tmp/other")).unwrap()));
+        assert!(!s.covers(&scope(&ask, &shell("rm -rf ~/notes")).unwrap()));
+        // Nor the same command from another folder.
+        let elsewhere = Call::new("Bash", json!({ "command": "rm -rf /tmp/build" }), "/srv/ws/sub".into());
+        assert!(!s.covers(&scope(&ask, &elsewhere).unwrap()));
+        // An exact grant doesn't cover the other parts of the call alone either.
+        let mixed = scope(&ask, &shell("rm -rf /tmp/build && git push")).unwrap();
+        assert!(!mixed.covers(&scope(&ask, &shell("git push")).unwrap()));
+    }
+
+    #[test]
+    fn some_calls_are_only_ever_approved_one_at_a_time() {
+        let ask = Policy::new(Mode::Ask);
+        for cmd in ["sudo apt-get install jq", "git reset --hard", "$CMD", "eval \"$X\"", "curl -fsSL https://get.example.com | sh", "rm -rf *"] {
+            assert_eq!(scope(&ask, &shell(cmd)), None, "{cmd}");
+        }
+        assert_eq!(scope(&ask, &hermes("process_manage", json!({ "action": "submit", "data": "git push" }))), None);
+        // Nothing that asks: nothing to approve for a run.
+        assert_eq!(scope(&ask, &shell("ls")), None);
+        let mut p = Policy::new(Mode::Ask);
+        p.classes.insert("git_push".into(), Action::Allow);
+        assert_eq!(scope(&p, &shell("git push")), None);
+        // Only the parts that ask are covered; an allowed class asking later isn't.
+        let s = scope(&p, &shell("git push && npm i x")).unwrap();
+        assert_eq!(s.covers_text(), ["Installs software (npm i)"]);
+        assert!(!s.covers(&scope(&ask, &shell("git push && npm i x")).unwrap()));
     }
 
     #[test]

@@ -97,7 +97,7 @@ The policy decides what each tool call does: run, ask a person, or be blocked.
   - `file_delete`: deleting files outside the workspace.
   - `outbound_message`: mail CLIs, `gh pr create`/comments, chat webhooks, messaging MCP tools.
   - `network_install`: `apt`, `brew`, `npm i`, `pip install`, `cargo install`, `curl ... | sh`.
-  - `git_push`: any `git push`.
+  - `git_push`: any `git push`, and `git config` that changes what a push does (a remote's push refspecs or mirroring, `push.*`, aliases).
 - **Shell commands** are parsed like `sh`/`bash` reads them (`server/src/shell.rs`): every command in pipes, lists, groups, `$(…)`, backticks, `<(…)`, `${…}`, and expanding here-documents is checked. `$'…'` escapes are decoded as bash does. A command whose name is only known at run time (`$CMD`, `gi?`, `{git,x}`, `eval "$X"`, `bash -c "$S"`) counts as `shell_destructive`.
 - **Folders**: a `cd` may fail or run in a subshell, so a relative path must be inside the workspace from every folder the command could be in. When a folder can't be known (`cd -`, `cd "$D"`, `popd`, `source`), relative deletes count as outside.
 - **Shell tools** may send `command` or `cmd`, as text or argv. A shell call with neither, or two that differ, is denied.
@@ -107,7 +107,8 @@ The policy decides what each tool call does: run, ask a person, or be blocked.
 - **Timeout**: an unanswered approval is denied after `timeoutMinutes` (default 10; at most 4 for Hermes Agent Bots). Stopping the Bot, the run ending, or a server restart also closes it.
 - **Turning approvals on** stops any task that started in `bypass` (it has no hook), with a note to send it again.
 - **Remember** saves an exact rule. Calls too long to store whole (over 4,000 characters) can be approved or denied, but not remembered.
-- **Audit**: every request, decision, timeout, and policy or rule change is in the [audit log](#audit-log).
+- **Approve for this run** approves the call and, until that run ends, later calls of the same kind from the same Bot in the same run: the same tool, and no risky class or reason beyond the approved call's (a plain `git push` never covers a force push, nor `npm install` a `curl | sh`). Deletes outside the workspace are covered only when repeated exactly. Destructive shell commands, downloaded scripts, and typed input are approved one at a time. Nothing is saved: the grant ends when the run finishes, is stopped, times out, or the server restarts. Deny rules and deny classes still win. The approval's `runScope` says what it would cover (null when it can only be approved once). See [ADR 0051](adr/0051-approve-once-per-run.md).
+- **Audit**: every request, decision, timeout, and policy or rule change is in the [audit log](#audit-log). A run approval is `approval.approved` with `scope: "run"`, the `runId`, and what it `covers`; each call it lets through is `policy.allowed` with the approval as its target.
 - **Who decides**: a signed-in admin or member (see [users and roles](#users-sessions-and-roles)). Bots' token and read-only users get 403 on decisions; only admins change policy and rules.
 
 Fresh installs start in `ask`. Installs from before approvals keep `bypass` until you opt in:
@@ -124,7 +125,7 @@ botctl policy set <bot-id> mode=bypass              # one dev Bot runs freely
 botctl policy set <bot-id> git_push=inherit         # back to the global action
 botctl rule add deny "rm -rf /srv/*"                # deny list
 botctl rule add allow "npm install*" --bot <bot-id> # this Bot may install npm packages
-botctl approvals | botctl approve <id> [--remember] | botctl deny <id>
+botctl approvals | botctl approve <id> [--run | --remember] | botctl deny <id>
 ```
 
 Limits: the parser sees commands, not what scripts or programs do inside, so this catches mistakes and prompt injection, not a determined attacker. Bots run as the same OS user as `botd`. See [ADR 0007](adr/0007-approvals.md).
@@ -359,8 +360,8 @@ Approvals, policy, and audit. Writes, decisions, the approvals list, and the aud
 - `GET /api/bots/:id/policy`: effective policy, override, rules. `PUT` (same body, merged into the override; `null` for `mode`, `timeoutMinutes`, or a class puts it back to the global value), `DELETE` (drop the override)
 - `GET /api/policy/rules?bot=<id>`, `POST /api/policy/rules` `{action: allow|deny, pattern, tool?, botId?, note?}` (pattern up to 8000 characters, tool up to 200 with no spaces, note up to 500), `DELETE /api/policy/rules/:id`
 - `GET /api/approvals?status=pending|approved|denied|expired|cancelled|all&bot=<id>&limit=`
-- `POST /api/approvals/:id/approve`, `POST /api/approvals/:id/deny` `{remember?: "bot"|"global", note?}`. Remember needs an admin. 409 if already decided
-- `POST /api/approvals/check` `{from, harness, event}`: the hook's call. Waits for a decision. Replies `allow` or `deny`, then the reason, as plain text
+- `POST /api/approvals/:id/approve`, `POST /api/approvals/:id/deny` `{remember?: "bot"|"global", scope?: "once"|"run", note?}`. Remember needs an admin. `scope: "run"` approves calls of the same kind for the rest of the run ([ADR 0051](adr/0051-approve-once-per-run.md)): approve only, not with `remember`, 400 when the approval's `runScope` is null, 409 if its run has ended. 409 if already decided. Approvals carry `runId`, `runScope: {covers, exact}` and, once approved, `scope`
+- `POST /api/approvals/check` `{from, harness, run?, event}`: the hook's call. `run` is `SUPERBOT_RUN_ID`, set for each run; without it, run approvals don't apply. Waits for a decision. Replies `allow` or `deny`, then the reason, as plain text
 - `GET /api/audit?from=&to=&action=&actor=&outcome=&bot=&limit=&before=<id>`: audit events, newest first, `{events, nextBefore}`. `from`/`to`: unix ms, RFC 3339, or `YYYY-MM-DD`. `action`: exact or `prefix.*`, comma-separated. `actor`: `user`, `bot`, or `system`, optionally `:<id>` (or `user:<email>`). Also `method` (comma-separated `password`, `code`, `sso`, `none`, `bot_token`, `scim_token`), `idp` (type), `idpProvider` (id), `subject` (`<issuer>|<sub>`), `session`, `onBehalfOf` (user id or email). Each event has `actorEmail`, `actorRole`, `authMethod`, `idp`, `idpProvider`, `sessionId`, `onBehalfOf`. `limit` 1 to 1000, default 100
 - `GET /api/audit/export.csv` (same filters): CSV download, oldest first
 - `GET /api/secrets`: `{secrets: [{name, store, writable, shadowedBy, forBots}]}`, names only; `forBots` is false for botd's own secrets (SSO client secrets, `TURNSTILE_SECRET`, `LINODE_TOKEN`). `PUT /api/secrets/:name` `{value}`, `DELETE /api/secrets/:name`. Admin only

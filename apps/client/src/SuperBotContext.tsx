@@ -34,6 +34,7 @@ import { resolveScreenUrl } from "./screen";
 import { connectSse } from "./sse";
 import type {
   Approval,
+  ApprovalScope,
   BotAccess,
   BotView,
   Me,
@@ -104,7 +105,7 @@ interface SuperBotContextValue {
   /** Pending approvals, oldest first. */
   approvals: Approval[];
   policy: Policy | null;
-  decideApproval: (id: string, approve: boolean, remember: boolean) => Promise<void>;
+  decideApproval: (id: string, approve: boolean, remember: boolean, scope?: ApprovalScope) => Promise<void>;
   setGlobalPolicy: (mode: PolicyMode) => Promise<void>;
   setBotPolicy: (botId: string, mode: PolicyMode | null) => Promise<void>;
 }
@@ -550,9 +551,9 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
     return resolveScreenUrl(api.baseUrl, url);
   };
 
-  const decideApproval = async (id: string, approve: boolean, remember: boolean) => {
+  const decideApproval = async (id: string, approve: boolean, remember: boolean, scope?: ApprovalScope) => {
     if (!api) return;
-    const a = await api.decideApproval(id, approve, remember);
+    const a = await api.decideApproval(id, approve, remember, scope);
     setApprovals((list) => upsertApproval(list, a));
   };
 

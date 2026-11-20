@@ -371,6 +371,14 @@ pub struct Approval {
     pub note: Option<String>,
     /// The rule a "remember" decision created.
     pub rule_id: Option<String>,
+    /// The run the call came from (`runId` in the audit log), when the hook named the
+    /// Bot's live run (ADR 0051).
+    pub run_id: Option<String>,
+    /// What approving it for the rest of that run would cover: `{covers: [what], exact}`.
+    /// None when it can only be approved once.
+    pub run_scope: Option<Value>,
+    /// How it was approved: "once" or "run". None until approved.
+    pub scope: Option<String>,
 }
 
 /// One row of the audit log. See `audit.rs` and ADR 0009.
@@ -1045,6 +1053,9 @@ fn approval_row(r: &Row) -> rusqlite::Result<Approval> {
         decided_by: r.get("decided_by")?,
         note: r.get("note")?,
         rule_id: r.get("rule_id")?,
+        run_id: r.get("run_id")?,
+        run_scope: r.get::<_, Option<String>>("run_scope")?.and_then(|s| serde_json::from_str(&s).ok()),
+        scope: r.get("scope")?,
     })
 }
 
@@ -1094,7 +1105,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 20] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 21] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1115,7 +1126,21 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 20] = [
     migrate_routine_authors,
     migrate_routine_pauses,
     migrate_token_usage,
+    migrate_approval_runs,
 ];
+
+/// Approve once per run (ADR 0051): the run each approval was asked in, what approving
+/// it for that run would cover, and which of the two it got. The grants themselves are
+/// never stored: they live with the run and end with it.
+fn migrate_approval_runs(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    for col in ["run_id", "run_scope", "scope"] {
+        let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('approvals') WHERE name = ?", [col], |r| r.get(0))?;
+        if !has {
+            c.execute_batch(&format!("ALTER TABLE approvals ADD COLUMN {col} TEXT;"))?;
+        }
+    }
+    Ok(())
+}
 
 /// Token metering (ADR 0050): the model tokens each run used, one row per model, or one
 /// row with `reported = 0` when the harness didn't say. Charged to the Bot's owner, like
@@ -2217,8 +2242,28 @@ impl Db {
 
     // Approvals
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn add_approval(&self, bot_id: &str, harness: &str, tool: &str, kind: &str, subject: &str, input: &Value, class: &str, reason: &str, expires_at: i64) -> Approval {
+        self.add_approval_in_run(bot_id, harness, tool, kind, subject, input, class, reason, expires_at, None)
+    }
+
+    /// `add_approval` for a call from a live run: `run` is its id, and what approving the
+    /// call for the rest of that run would cover (None: it can only be approved once).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_approval_in_run(
+        &self,
+        bot_id: &str,
+        harness: &str,
+        tool: &str,
+        kind: &str,
+        subject: &str,
+        input: &Value,
+        class: &str,
+        reason: &str,
+        expires_at: i64,
+        run: Option<(&str, Option<&crate::policy::RunScope>)>,
+    ) -> Approval {
         let id = crate::short_id();
         // Keep the row small: a huge file write is summarized by its subject anyway.
         let owner = self.bot_owner(bot_id);
@@ -2230,11 +2275,16 @@ impl Db {
         }
         // Tool input can hold anything a Bot wrote (file contents, commands), so it is sealed at rest.
         let input = sealed::seal_field(&sealed::approval_context(&id), &input);
+        let run_id = run.map(|(r, _)| r);
+        let run_scope = run.and_then(|(_, s)| s).map(|s| {
+            let covers: Vec<String> = s.covers_text().iter().map(|w| redact::text_for(owners, w).into_owned()).collect();
+            serde_json::json!({ "covers": covers, "exact": s.exact.is_some() }).to_string()
+        });
         self.c()
             .execute(
-                "INSERT INTO approvals (id, bot_id, harness, tool, kind, subject, input, class, reason, status, created_at, expires_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
-                params![id, bot_id, harness, tool, kind, redact::text_for(owners, subject), input, class, reason, now(), expires_at],
+                "INSERT INTO approvals (id, bot_id, harness, tool, kind, subject, input, class, reason, status, created_at, expires_at, run_id, run_scope)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+                params![id, bot_id, harness, tool, kind, redact::text_for(owners, subject), input, class, reason, now(), expires_at, run_id, run_scope],
             )
             .unwrap();
         self.approval(&id).unwrap()
@@ -2265,10 +2315,20 @@ impl Db {
 
     /// Closes a pending approval. False if it was already closed (first decision wins).
     pub fn finish_approval(&self, id: &str, status: &str, by: &str, note: Option<&str>, rule_id: Option<&str>) -> bool {
+        self.finish_approval_scoped(id, status, by, note, rule_id, (status == "approved").then_some("once"))
+    }
+
+    /// Approves a pending approval for the rest of its run (ADR 0051). False if it was
+    /// already closed.
+    pub fn finish_approval_for_run(&self, id: &str, by: &str, note: Option<&str>) -> bool {
+        self.finish_approval_scoped(id, "approved", by, note, None, Some("run"))
+    }
+
+    fn finish_approval_scoped(&self, id: &str, status: &str, by: &str, note: Option<&str>, rule_id: Option<&str>, scope: Option<&str>) -> bool {
         self.c()
             .execute(
-                "UPDATE approvals SET status = ?, decided_by = ?, note = ?, rule_id = ?, decided_at = ? WHERE id = ? AND status = 'pending'",
-                params![status, by, note, rule_id, now(), id],
+                "UPDATE approvals SET status = ?, decided_by = ?, note = ?, rule_id = ?, scope = ?, decided_at = ? WHERE id = ? AND status = 'pending'",
+                params![status, by, note, rule_id, scope, now(), id],
             )
             .unwrap()
             == 1
@@ -2281,10 +2341,11 @@ impl Db {
         let rule_id = crate::short_id();
         let c = self.c();
         let tx = c.unchecked_transaction().ok()?;
+        let scope = (status == "approved").then_some("once");
         let closed = tx
             .execute(
-                "UPDATE approvals SET status = ?, decided_by = ?, note = ?, rule_id = ?, decided_at = ? WHERE id = ? AND status = 'pending'",
-                params![status, by, note, rule_id, now(), id],
+                "UPDATE approvals SET status = ?, decided_by = ?, note = ?, rule_id = ?, scope = ?, decided_at = ? WHERE id = ? AND status = 'pending'",
+                params![status, by, note, rule_id, scope, now(), id],
             )
             .ok()?;
         if closed != 1 {

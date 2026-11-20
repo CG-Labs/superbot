@@ -101,7 +101,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl rule add <allow|deny> "<pattern>" [--tool <tool>] [--bot <bot>]
   botctl rule rm <id>
   botctl approvals [pending|all]                   List approvals
-  botctl approve <id> [--remember | --remember-global]
+  botctl approve <id> [--run | --remember | --remember-global]
+                                                   --run: also calls of the same kind, until the task ends
   botctl deny <id> [--remember | --remember-global]
   botctl audit [<limit>] [filters]                 Recent audit events, newest first
   botctl audit export [filters] > audit.csv        All matching events as CSV, oldest first
@@ -375,7 +376,7 @@ fn hook(harness: &str, cwd: Option<&str>) -> ! {
     let verdict = std::io::stdin()
         .read_to_string(&mut event)
         .map_err(|e| e.to_string())
-        .and_then(|_| hook_body(harness, &std::env::var("BOT_ID").unwrap_or_default(), &event, cwd))
+        .and_then(|_| hook_body(harness, &std::env::var("BOT_ID").unwrap_or_default(), std::env::var("SUPERBOT_RUN_ID").ok().as_deref(), &event, cwd))
         .and_then(|body| api(Cred::Bot, "POST", "/api/approvals/check", Some(body)));
     match verdict {
         Ok(r) if r.lines().next() == Some("allow") => std::process::exit(0),
@@ -388,7 +389,9 @@ fn hook(harness: &str, cwd: Option<&str>) -> ! {
     std::process::exit(2)
 }
 
-fn hook_body(harness: &str, bot: &str, event: &str, cwd: Option<&str>) -> Result<String, String> {
+/// `run`: the run this hook is part of, so what a person approved for that run counts
+/// only there (ADR 0051).
+fn hook_body(harness: &str, bot: &str, run: Option<&str>, event: &str, cwd: Option<&str>) -> Result<String, String> {
     let mut event = serde_json::from_str::<Value>(event).map_err(|e| format!("bad hook input: {e}"))?;
     if let Some(cwd) = cwd {
         if !cwd.starts_with('/') {
@@ -397,7 +400,7 @@ fn hook_body(harness: &str, bot: &str, event: &str, cwd: Option<&str>) -> Result
         let obj = event.as_object_mut().ok_or("bad hook input: not a JSON object")?;
         obj.insert("cwd".into(), json!(cwd));
     }
-    Ok(json!({ "from": bot, "harness": harness, "event": event }).to_string())
+    Ok(json!({ "from": bot, "harness": harness, "run": run.filter(|r| !r.is_empty()), "event": event }).to_string())
 }
 
 fn policy_patch(args: &[&str]) -> Result<Value, String> {
@@ -570,6 +573,16 @@ fn approved(res: &Value) -> String {
 }
 
 fn decide(verb: &str, id: &str, rest: &[&str]) -> Result<String, String> {
+    let body = decide_body(rest)?;
+    let done = match (verb, body["scope"].as_str()) {
+        ("approve", Some("run")) => "Approved for the rest of this task.",
+        ("approve", _) => "Approved.",
+        _ => "Denied.",
+    };
+    api(Cred::Operator, "POST", &format!("/api/approvals/{id}/{verb}"), Some(body.to_string())).map(|_| done.into())
+}
+
+fn decide_body(rest: &[&str]) -> Result<Value, String> {
     let remember = if rest.contains(&"--remember-global") {
         json!("global")
     } else if rest.contains(&"--remember") {
@@ -577,8 +590,11 @@ fn decide(verb: &str, id: &str, rest: &[&str]) -> Result<String, String> {
     } else {
         Value::Null
     };
-    let body = json!({ "remember": remember }).to_string();
-    api(Cred::Operator, "POST", &format!("/api/approvals/{id}/{verb}"), Some(body)).map(|_| if verb == "approve" { "Approved." } else { "Denied." }.into())
+    let run = rest.contains(&"--run");
+    if run && !remember.is_null() {
+        return Err("Pick one: --run (the rest of this task) or --remember (a lasting rule).".into());
+    }
+    Ok(json!({ "remember": remember, "scope": if run { "run" } else { "once" } }))
 }
 
 fn env_name(name: &str) -> Result<&str, String> {
@@ -1190,15 +1206,27 @@ mod tests {
     #[test]
     fn hook_cwd_overrides_where_the_harness_says_it_runs() {
         let event = r#"{"tool_name":"terminal","tool_input":{"command":"ls"},"cwd":"/opt/hermes"}"#;
-        let body: Value = serde_json::from_str(&hook_body("hermes", "b1", event, Some("/workspace")).unwrap()).unwrap();
+        let body: Value = serde_json::from_str(&hook_body("hermes", "b1", None, event, Some("/workspace")).unwrap()).unwrap();
         assert_eq!(body["event"]["cwd"], "/workspace");
         assert_eq!(body["event"]["tool_name"], "terminal");
         assert_eq!(body["from"], "b1");
-        let body: Value = serde_json::from_str(&hook_body("claude", "b1", event, None).unwrap()).unwrap();
+        let body: Value = serde_json::from_str(&hook_body("claude", "b1", None, event, None).unwrap()).unwrap();
         assert_eq!(body["event"]["cwd"], "/opt/hermes");
-        assert!(hook_body("hermes", "b1", event, Some("workspace")).is_err());
-        assert!(hook_body("hermes", "b1", "[1]", Some("/workspace")).is_err());
-        assert!(hook_body("hermes", "b1", "not json", None).is_err());
+        assert!(hook_body("hermes", "b1", None, event, Some("workspace")).is_err());
+        assert!(hook_body("hermes", "b1", None, "[1]", Some("/workspace")).is_err());
+        assert!(hook_body("hermes", "b1", None, "not json", None).is_err());
+        // The run the hook is part of goes with it, so run approvals count only there.
+        let body: Value = serde_json::from_str(&hook_body("claude", "b1", Some("r1"), event, None).unwrap()).unwrap();
+        assert_eq!((body["run"].as_str(), body["from"].as_str()), (Some("r1"), Some("b1")));
+        assert!(serde_json::from_str::<Value>(&hook_body("claude", "b1", Some(""), event, None).unwrap()).unwrap()["run"].is_null());
+    }
+
+    #[test]
+    fn approve_for_the_run_or_remember() {
+        assert_eq!(decide_body(&[]).unwrap(), json!({ "remember": null, "scope": "once" }));
+        assert_eq!(decide_body(&["--run"]).unwrap(), json!({ "remember": null, "scope": "run" }));
+        assert_eq!(decide_body(&["--remember"]).unwrap(), json!({ "remember": "bot", "scope": "once" }));
+        assert!(decide_body(&["--run", "--remember-global"]).is_err());
     }
 
     #[test]

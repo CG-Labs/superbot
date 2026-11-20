@@ -52,6 +52,8 @@ mod policy;
 #[cfg(test)]
 mod policy_http_tests;
 mod rbac;
+#[cfg(test)]
+mod run_grants_http_tests;
 mod runner;
 mod scim;
 #[cfg(test)]
@@ -2288,8 +2290,10 @@ async fn deny(state: State<AppState>, c: Extension<Caller>, by: Extension<Who>, 
     decide(state, c, by, id, body, false).await
 }
 
-/// Body: `{remember?: "bot" | "global" | true, note?}`. Remember saves a rule for this
-/// exact call, which is a policy change, so it needs an admin.
+/// Body: `{scope?: "once" | "run", remember?: "bot" | "global" | true, note?}`. Remember
+/// saves a rule for this exact call, which is a policy change, so it needs an admin.
+/// `scope: "run"` approves calls of the same kind for the rest of the Bot's run without
+/// saving anything (ADR 0051), so it takes only what approving once takes.
 async fn decide(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>, body: axum::body::Bytes, approve: bool) -> Res {
     let who = c.principal;
     need_user(who)?;
@@ -2309,16 +2313,31 @@ async fn decide(State(app): State<AppState>, Extension(c): Extension<Caller>, Ex
         Value::Null | Value::Bool(false) => None,
         _ => return Err(bad("remember must be \"bot\", \"global\", or true")),
     };
+    let for_run = match &v["scope"] {
+        Value::Null => false,
+        Value::String(s) if s == "once" => false,
+        Value::String(s) if s == "run" => true,
+        _ => return Err(bad("scope must be \"once\" or \"run\"")),
+    };
+    if for_run && !approve {
+        return Err(bad("Only an approval can cover the rest of a task. A denial is for this call; to keep denying it, remember it."));
+    }
+    if for_run && remember.is_some() {
+        return Err(bad("Pick one: approve for the rest of this task, or remember a lasting rule."));
+    }
     if remember.is_some() && !rbac::allows(who, rbac::Perm::Admin) {
         app.db.record(&by.event("access.denied").outcome(Outcome::Denied).details(json!({ "path": format!("/api/approvals/{id}"), "need": "admin", "reason": "remember" })));
         return Err(ApiError(StatusCode::FORBIDDEN, "Only an admin can save a lasting rule. Approve or deny just this call.".into()));
     }
     let note: Option<String> = v["note"].as_str().map(|n| n.trim().chars().take(500).collect()).filter(|n: &String| !n.is_empty());
-    match app.decide(&id, approve, remember, note.as_deref(), &by) {
+    let decided = if for_run { app.approve_for_run(&id, note.as_deref(), &by) } else { app.decide(&id, approve, remember, note.as_deref(), &by) };
+    match decided {
         Ok(a) => Ok(Json(json!(a))),
         Err(DecideError::NotFound) => Err(not_found("Approval")),
         Err(DecideError::Closed(s)) => Err(ApiError(StatusCode::CONFLICT, format!("This approval is already {s}"))),
         Err(DecideError::TooLong) => Err(bad("This call is too long to remember. Approve or deny it without remembering.")),
+        Err(DecideError::OnceOnly) => Err(bad("This call can only be approved once. Approve or deny just this call.")),
+        Err(DecideError::RunEnded) => Err(ApiError(StatusCode::CONFLICT, "The task this call came from has ended.".into())),
     }
 }
 
@@ -2342,7 +2361,7 @@ async fn check_approval(State(app): State<AppState>, Extension(c): Extension<Cal
     };
     let harness = v["harness"].as_str().unwrap_or(&bot.harness).to_string();
     let cwd = e["cwd"].as_str().filter(|c| c.starts_with('/')).map(PathBuf::from);
-    let verdict = app.check(&bot, &harness, tool, e["tool_input"].clone(), cwd).await;
+    let verdict = app.check(&bot, &harness, tool, e["tool_input"].clone(), cwd, v["run"].as_str()).await;
     reply(verdict.action == policy::Action::Allow, &verdict.reason)
 }
 

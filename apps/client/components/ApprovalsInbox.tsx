@@ -2,7 +2,7 @@ import React, { useState } from "react";
 import { Modal, Pressable, ScrollView, StyleSheet, Switch, Text, View } from "react-native";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
-import type { Approval } from "../src/types";
+import type { Approval, ApprovalScope } from "../src/types";
 import { BotAvatar } from "./BotAvatar";
 
 interface Props {
@@ -17,6 +17,14 @@ function minutesLeft(a: Approval): string {
   return m <= 1 ? "under a minute" : `${m} minutes`;
 }
 
+/** What "Approve for this run" lets through, in words (ADR 0051). */
+export function runScopeText(a: Approval): string | null {
+  const s = a.runScope;
+  if (!s) return null;
+  const what = s.exact || !s.covers.length ? "this exact call" : `calls like this (${s.covers.join("; ")})`;
+  return `For this run, ${what} won't ask again until the task ends. Nothing is saved as a rule.`;
+}
+
 export function ApprovalCard({ approval: a }: { approval: Approval }) {
   const { bots, decideApproval, can, canOnBot } = useSuperBot();
   const bot = bots.find((b) => b.id === a.botId);
@@ -26,11 +34,15 @@ export function ApprovalCard({ approval: a }: { approval: Approval }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const decide = async (approve: boolean) => {
+  // A run approval saves no rule, so it never goes with "remember".
+  const forRun = runScopeText(a);
+  const canRun = canDecide && !!forRun && !remember;
+
+  const decide = async (approve: boolean, scope: ApprovalScope = "once") => {
     setBusy(true);
     setError(null);
     try {
-      await decideApproval(a.id, approve, remember);
+      await decideApproval(a.id, approve, remember, scope);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed");
       setBusy(false);
@@ -59,13 +71,19 @@ export function ApprovalCard({ approval: a }: { approval: Approval }) {
         )}
         <Text style={styles.faint}>Denied in {minutesLeft(a)}</Text>
       </View>
+      {canRun ? <Text style={styles.faint}>{forRun}</Text> : null}
       {error ? <Text style={styles.error}>{error}</Text> : null}
       {canDecide ? (
       <View style={styles.actions}>
-        <Pressable style={styles.btn} disabled={busy} onPress={() => void decide(false)}>
+        <Pressable style={styles.btn} disabled={busy} onPress={() => void decide(false)} accessibilityRole="button">
           <Text style={styles.btnText}>Deny</Text>
         </Pressable>
-        <Pressable style={[styles.btn, styles.primary]} disabled={busy} onPress={() => void decide(true)}>
+        {canRun ? (
+          <Pressable style={styles.btn} disabled={busy} onPress={() => void decide(true, "run")} accessibilityRole="button" accessibilityHint={forRun ?? undefined}>
+            <Text style={styles.btnText}>Approve for this run</Text>
+          </Pressable>
+        ) : null}
+        <Pressable style={[styles.btn, styles.primary]} disabled={busy} onPress={() => void decide(true)} accessibilityRole="button">
           <Text style={[styles.btnText, styles.primaryText]}>Approve</Text>
         </Pressable>
       </View>
@@ -148,7 +166,7 @@ const styles = StyleSheet.create({
     fontSize: 13,
   },
   row: { flexDirection: "row", alignItems: "center", gap: 10 },
-  actions: { flexDirection: "row", justifyContent: "flex-end", gap: 10 },
+  actions: { flexDirection: "row", flexWrap: "wrap", justifyContent: "flex-end", gap: 10 },
   btn: { paddingVertical: 8, paddingHorizontal: 18, borderRadius: 999, borderWidth: 1, borderColor: "#3a3a3a" },
   btnText: { color: colors.text, fontSize: 15 },
   primary: { backgroundColor: "#f2f2f2", borderColor: "#f2f2f2" },
