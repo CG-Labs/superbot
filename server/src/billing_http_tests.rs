@@ -163,6 +163,33 @@ async fn stopping_a_bot_gives_back_its_queued_routine_runs() {
 }
 
 #[tokio::test]
+async fn a_transfer_gives_back_queued_routine_runs_to_whoever_was_charged() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = world(false).await;
+    let app = &w.app;
+    let slow = app.cfg.bin_dir.join("claude");
+    std::fs::write(&slow, "#!/bin/sh\nexec sleep 10\n").unwrap();
+    std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let bot = app.db.create_bot_owned("Slow", "#fff", "waddle", "claude", None, false, &w.a_id, Visibility::Private);
+    let r = app.db.add_routine(&bot.id, "Digest", "0 9 * * *", "x");
+    let now = db::now();
+    let day = tiers::day(now);
+    cron::fire(app, &r, now);
+    for _ in 0..300 {
+        if app.is_running(&bot.id) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cron::fire(app, &r, now);
+    app.db.take_routine_run(&w.b_id, &day, Some(2)).unwrap();
+    // Handing the Bot to Bea drops Ada's queued routine: Ada gets it back, Bea keeps her own.
+    let (code, res) = call(w.port, "PATCH", &format!("/api/bots/{}/access", bot.id), &w.admin, &json!({ "owner": w.b_id }).to_string()).await;
+    assert_eq!(code, 200, "{res}");
+    assert_eq!((app.db.routine_runs_used(&w.a_id, &day), app.db.routine_runs_used(&w.b_id, &day)), (1, 1));
+}
+
+#[tokio::test]
 async fn a_routine_whose_bot_cant_start_gives_back_its_run() {
     let w = world(false).await;
     let app = &w.app;

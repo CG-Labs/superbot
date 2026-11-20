@@ -889,9 +889,12 @@ impl App {
         self.give_back_routine(bot, msg);
     }
 
+    /// To the owner the routine run was charged to when it fired (its requester's
+    /// `on_behalf_of`), who may no longer own the Bot.
     fn give_back_routine(&self, bot: &Bot, msg: &Message) {
         if msg.role == "routine" {
-            self.db.give_back_routine_run(&bot.owner_id, &tiers::day(msg.created_at));
+            let charged = msg.requested_by.as_ref().and_then(|w| w.actor.on_behalf_of.as_deref()).unwrap_or(&bot.owner_id);
+            self.db.give_back_routine_run(charged, &tiers::day(msg.created_at));
         }
     }
 
@@ -997,11 +1000,11 @@ impl App {
     pub fn stop_if(&self, bot_id: &str, first: impl FnOnce() -> bool) -> bool {
         {
             let mut st = self.state();
+            let bot = self.db.bot(bot_id);
             if !first() {
                 return false;
             }
             if let Some(s) = st.get_mut(bot_id) {
-                let bot = self.db.bot(bot_id);
                 for m in s.queue.drain(..) {
                     self.db.set_status(m.id, "done");
                     if let Some(b) = &bot {
