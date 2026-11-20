@@ -415,16 +415,30 @@ pub type Tls = Arc<dyn Fn() -> Arc<ServerConfig> + Send + Sync>;
 /// Connections served at once; more are closed as they arrive. The ports are open to
 /// the internet, so a flood of slow clients mustn't grow without bound.
 const MAX_CONNECTIONS: usize = 256;
-/// The longest a connection lives, slow downloads of the agent included.
-const CONNECTION_LIFETIME: Duration = Duration::from_secs(600);
+/// The longest a connection without a client certificate lives, slow downloads of
+/// the agent included.
+pub const CONNECTION_LIFETIME: Duration = Duration::from_secs(600);
+/// The longest one with a certificate lives: a Bot's run streams over it, and an
+/// approval it waits on can take a day (`policy::MAX_TIMEOUT_MINUTES`).
+pub const AUTHENTICATED_LIFETIME: Duration = Duration::from_secs(25 * 3600);
+
+/// How long a connection from a peer may live: none if it shows no certificate.
+pub fn lifetime(peer: &Peer) -> Option<Duration> {
+    Some(if peer.cert.is_some() {
+        AUTHENTICATED_LIFETIME
+    } else {
+        CONNECTION_LIFETIME
+    })
+}
 
 /// Serves `router` over TLS on `listener`. Each request carries the connection's
-/// `Peer` as an extension. `admit` can drop a connection right after the handshake.
+/// `Peer` as an extension. `admit` says how long a connection may live, right after
+/// the handshake; None drops it.
 pub async fn serve(
     listener: tokio::net::TcpListener,
     tls: Tls,
     router: axum::Router,
-    admit: fn(&Peer) -> bool,
+    admit: fn(&Peer) -> Option<Duration>,
 ) {
     let open = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
@@ -454,9 +468,9 @@ pub async fn serve(
                 .and_then(|c| c.first())
                 .map(|c| c.clone().into_owned());
             let peer = Peer { cert, addr };
-            if !admit(&peer) {
+            let Some(lifetime) = admit(&peer) else {
                 return;
-            }
+            };
             let svc = tower::ServiceExt::map_request(
                 router,
                 move |mut r: axum::http::Request<hyper::body::Incoming>| {
@@ -471,7 +485,7 @@ pub async fn serve(
                     hyper_util::rt::TokioIo::new(stream),
                     hyper_util::service::TowerToHyperService::new(svc),
                 );
-            let _ = tokio::time::timeout(CONNECTION_LIFETIME, conn).await;
+            let _ = tokio::time::timeout(lifetime, conn).await;
         });
     }
 }

@@ -1,12 +1,13 @@
 //! Enrollment and mutual TLS between botd and a machine agent (ADR 0031), end to end on
 //! loopback: the real router, botd's machine port, and the real agent, with the
-//! in-memory provider. Nothing here talks to Linode.
+//! in-memory provider. Nothing here talks to Linode. Bot runs on a machine (ADR 0034)
+//! go through the real agent too, with a stand-in harness on its PATH.
 
 use crate::machines::agent::{self, Agent, Config, Identity};
 use crate::machines::enroll::{self, Enrollment};
 use crate::machines::fake::Fake;
 use crate::machines::provider::MachineProvider;
-use crate::machines::route::{Job, Refusal, Target};
+use crate::machines::route::{Refusal, Routing, Target};
 use crate::machines::{ControlPlane, State, pki, wire};
 use crate::tests::{audit_list, call};
 use crate::users_http_tests::{parse, user_with};
@@ -38,14 +39,24 @@ async fn serve() -> Env {
     let fake = Arc::new(Fake::default());
     let p: Arc<dyn MachineProvider> = fake.clone();
     let mut cp = ControlPlane::for_tests(p);
-    cp.routing = true;
+    cp.routing = Routing::On;
     let e = cp
         .enroll_with(Enrollment::for_tests(9, mport, aport).with_agent(AGENT.as_bytes()))
         .unwrap();
     let cp = Arc::new(cp);
     let shared = cp.clone();
-    let (port, app, owner, _) = crate::tests::serve_app_with(move |a| a.machines = shared).await;
-    tokio::spawn(enroll::serve(machine_listener, app.clone(), e.clone()));
+    let (port, app, owner, _, router) =
+        crate::tests::serve_app_and_router(move |a| a.machines = shared).await;
+    let api = enroll::Api {
+        router,
+        host: format!("127.0.0.1:{port}"),
+    };
+    tokio::spawn(enroll::serve(
+        machine_listener,
+        app.clone(),
+        e.clone(),
+        Some(api),
+    ));
     let (_, admin) = user_with(port, &owner, "ops@example.com", "admin").await;
     Env {
         port,
@@ -84,8 +95,8 @@ fn token_in(user_data: &str) -> String {
     user_data[at..].split('"').next().unwrap().to_string()
 }
 
-/// A member with a running machine on 127.0.0.1. Returns their id, the machine's id,
-/// and the token its cloud-init user data carries.
+/// A member with a running machine on 127.0.0.1, assigned to them. Returns their id,
+/// the machine's id, and the token its cloud-init user data carries.
 async fn machine_for(env: &Env, email: &str) -> (String, String, String) {
     let (uid, _) = user_with(env.port, &env.admin, email, "member").await;
     let (code, m) = json_call(env, "POST", &format!("/api/users/{uid}/machine"), "").await;
@@ -97,6 +108,7 @@ async fn machine_for(env: &Env, email: &str) -> (String, String, String) {
     let (code, r) = json_call(env, "POST", "/api/machines/reconcile", "").await;
     assert_eq!(code, 200, "{r}");
     assert_eq!(env.app.db.machine(&m.id).unwrap().state, State::Running);
+    assert!(env.app.db.assign_machine(&m.id, None));
     let ud = env
         .fake
         .user_data(&m.label)
@@ -118,6 +130,11 @@ fn config(env: &Env, machine_id: &str, token: Option<&str>) -> Config {
         listen: SocketAddr::from(([127, 0, 0, 1], env.e.agent_port)),
         token: token.map(|t| Zeroizing::new(t.to_string())),
         token_file: None,
+        home: crate::db::temp_path("agent-home"),
+        api_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+        botctl: PathBuf::from("/nonexistent/botctl"),
+        harness_path: "/usr/bin:/bin".into(),
+        max_jobs: 8,
     }
 }
 
@@ -261,22 +278,21 @@ async fn a_machine_enrolls_once_then_answers_over_mutual_tls() {
         (to.machine_id.as_str(), to.pins.as_slice()),
         (mid.as_str(), &[fp][..])
     );
-    let err = env
+    let hb = env
         .cp
         .link
-        .dispatch(
-            &to,
-            Job {
-                bot_id: "b1".into(),
-                owner_id: uid.clone(),
-                message_id: 1,
-            },
-        )
+        .check(&env.app, &to, &["sh", "no-such-harness"])
         .await
-        .unwrap_err();
-    assert!(
-        err.contains("can't run Bots yet"),
-        "the agent got the job over mTLS and turned it down: {err}"
+        .unwrap();
+    assert_eq!(
+        (hb.protocol, hb.missing.as_slice()),
+        (wire::PROTOCOL, &["no-such-harness".to_string()][..]),
+        "the agent says what it can run"
+    );
+    assert_eq!(
+        crate::machines::route::fit(&hb, "sh"),
+        Err(Refusal::NoBotctl),
+        "no botctl there, so no approvals: it can't run Bots"
     );
 }
 
@@ -827,14 +843,7 @@ async fn one_users_machine_cannot_act_for_another() {
     let err = env
         .cp
         .link
-        .dispatch(
-            &to_b,
-            Job {
-                bot_id: "b".into(),
-                owner_id: ub.clone(),
-                message_id: 2,
-            },
-        )
+        .check(&env.app, &to_b, &[])
         .await
         .unwrap_err();
     assert!(
@@ -990,7 +999,7 @@ async fn off_without_a_control_url() {
     let fake = Arc::new(Fake::default());
     let p: Arc<dyn MachineProvider> = fake.clone();
     let mut cp = ControlPlane::for_tests(p);
-    cp.routing = true;
+    cp.routing = Routing::On;
     let cp = Arc::new(cp);
     let shared = cp.clone();
     let (port, app, owner, _) = crate::tests::serve_app_with(move |a| a.machines = shared).await;
@@ -1020,9 +1029,12 @@ async fn off_without_a_control_url() {
         (503, Some(enroll::OFF))
     );
     call(port, "POST", "/api/machines/reconcile", &admin, "").await;
-    assert!(
-        matches!(cp.route(&app.db, &uid), Ok(Target::Machine(_))),
-        "routing is as before"
+    let m = app.db.user_machine(&uid).unwrap();
+    assert!(app.db.assign_machine(&m.id, None));
+    assert_eq!(
+        cp.route(&app.db, &uid),
+        Err(Refusal::NotEnrolled),
+        "nothing can run there without enrollment"
     );
     assert_eq!(cp.link.name(), "unenrolled");
     assert!(

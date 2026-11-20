@@ -372,6 +372,9 @@ pub struct Machine {
     pub agent_seen_at: Option<i64>,
     pub agent_version: Option<String>,
     pub agent_error: Option<String>,
+    /// When an admin assigned it to its user, so their Bots run on it (ADR 0034).
+    pub assigned_at: Option<i64>,
+    pub assigned_by: Option<String>,
 }
 
 /// A certificate the control plane issued a machine (ADR 0031). Looked up by
@@ -502,6 +505,8 @@ fn machine_row(r: &Row) -> rusqlite::Result<Machine> {
         agent_seen_at: r.get("agent_seen_at")?,
         agent_version: r.get("agent_version")?,
         agent_error: r.get("agent_error")?,
+        assigned_at: r.get("assigned_at")?,
+        assigned_by: r.get("assigned_by")?,
     })
 }
 
@@ -848,7 +853,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 12] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 13] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -861,7 +866,18 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 12] = [
     migrate_machines,
     migrate_tiers,
     migrate_machine_enrollment,
+    migrate_machine_placement,
 ];
+/// Placement (ADR 0034): an admin assigns a user's machine to them, and then that
+/// user's Bots run there. Kept on the machine row, so a user can only be placed on
+/// their own machine, and destroying it ends the placement.
+fn migrate_machine_placement(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'assigned_at'", [], |r| r.get(0))?;
+    if !has {
+        c.execute_batch("ALTER TABLE machines ADD COLUMN assigned_at INTEGER; ALTER TABLE machines ADD COLUMN assigned_by TEXT;")?;
+    }
+    Ok(())
+}
 /// Machine enrollment (ADR 0031). Tokens are kept as SHA-256 hashes, bound to one
 /// machine, and used once. Certificates are kept by fingerprint, never with their keys
 /// (botd never sees a machine's key); `id` orders them, so the ones before a rotated
@@ -2774,6 +2790,29 @@ impl Db {
             Ok(fps) if refresh_enrollment(&tx, machine_id).is_ok() && tx.commit().is_ok() => fps,
             _ => Vec::new(),
         }
+    }
+
+    /// Places the machine's user on it: their Bots run there (ADR 0034). Only a live
+    /// machine. Returns whether it changed.
+    pub fn assign_machine(&self, machine_id: &str, by: Option<&str>) -> bool {
+        self.c()
+            .execute(
+                "UPDATE machines SET assigned_at = ?, assigned_by = ? WHERE id = ? AND assigned_at IS NULL AND state NOT IN ('destroying', 'destroyed')",
+                params![now(), by, machine_id],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Their Bots run where routing puts unassigned users again. Returns whether it changed.
+    pub fn unassign_machine(&self, machine_id: &str) -> bool {
+        self.c().execute("UPDATE machines SET assigned_at = NULL, assigned_by = NULL WHERE id = ? AND assigned_at IS NOT NULL", [machine_id]).unwrap_or(0) == 1
+    }
+
+    /// Forgets the harness sessions of the user's Bots: a session lives on the host
+    /// that ran it, so after a move the next run starts a new one. Returns how many.
+    pub fn forget_sessions_of(&self, owner_id: &str) -> usize {
+        self.c().execute("UPDATE bots SET session_id = NULL WHERE owner_id = ? AND session_id IS NOT NULL", [owner_id]).unwrap_or(0)
     }
 
     /// Records a heartbeat: `Ok(version)` when the agent answered, `Err(why)` when not.

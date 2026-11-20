@@ -323,6 +323,7 @@ impl Verdict {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct Ctx {
     pub workspace: PathBuf,
     pub home: PathBuf,

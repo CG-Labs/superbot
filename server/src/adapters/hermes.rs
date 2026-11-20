@@ -7,10 +7,11 @@
 //! `config.yaml` and the agent can't change with `hermes config set`.
 
 use super::{describe, str_of, Adapter, AgentEvent, ModelOption, RunInput};
+use crate::machines::wire::JobCleanup;
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Default)]
 pub struct Hermes {
@@ -61,21 +62,12 @@ fn managed_config(input: &RunInput, secret_names: &[String]) -> Value {
     c
 }
 
-fn write_private(dir: &Path, name: &str, body: &str) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-    let tmp = dir.join(format!(".{name}.tmp"));
-    std::fs::write(&tmp, body)?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::rename(tmp, dir.join(name))
-}
-
 impl Adapter for Hermes {
     fn bin(&self) -> &'static str {
         "hermes"
     }
 
-    fn args(&mut self, input: &RunInput, out: &mut Vec<AgentEvent>) -> Vec<String> {
+    fn files(&self, input: &RunInput) -> Vec<(PathBuf, String)> {
         let secret_names: Vec<String> = match crate::secrets::global().list() {
             Ok(list) => list.into_iter().map(|l| l.name).collect(),
             Err(e) => {
@@ -83,9 +75,10 @@ impl Adapter for Hermes {
                 Vec::new()
             }
         };
-        if write_private(&managed_dir(input), "config.yaml", &managed_config(input, &secret_names).to_string()).is_err() {
-            out.push(AgentEvent::Error("Couldn't write SuperBot's settings for Hermes.".into()));
-        }
+        vec![(managed_dir(input).join("config.yaml"), managed_config(input, &secret_names).to_string())]
+    }
+
+    fn args(&mut self, input: &RunInput, _out: &mut Vec<AgentEvent>) -> Vec<String> {
         // SuperBot's approval hook is the gate, so Hermes's own prompts are off (--yolo),
         // like --dangerously-skip-permissions for Claude Code.
         let mut a: Vec<String> =
@@ -128,43 +121,27 @@ impl Adapter for Hermes {
 
     /// A stopped or finished `hermes chat` only detaches: the turn keeps running in the
     /// daemon. Stopping the daemon ends it, and the next run starts one with fresh env.
-    fn stop_leftovers(&self, input: &RunInput) -> Result<(), String> {
-        let home = home(input);
-        if !home.join("gateway.pid").exists() {
-            return Ok(());
-        }
-        let failed = |why: String| Err(format!("Couldn't stop this Bot's Hermes daemon ({why}), so its last turn may still be running. Try again; if this keeps happening, run `hermes gateway stop --yes` with HERMES_HOME={}.", home.display()));
-        let mut cmd = std::process::Command::new(self.bin());
-        super::strip_secret_env(&mut cmd);
+    fn cleanup(&self, input: &RunInput) -> Option<JobCleanup> {
+        let home = home(input).display().to_string();
+        let mut env = BTreeMap::from([("HERMES_HOME".to_string(), home.clone())]);
         if let Some(path) = input.env.get("PATH") {
-            cmd.env("PATH", path);
+            env.insert("PATH".into(), path.clone());
         }
-        let child = cmd
-            .args(["gateway", "stop", "--yes"])
-            .env("HERMES_HOME", &home)
-            .current_dir(&input.state_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        let mut child = match child {
-            Ok(c) => c,
-            Err(e) => return failed(format!("`hermes gateway stop` didn't start: {e}")),
-        };
-        let start = Instant::now();
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) if status.success() => return Ok(()),
-                Ok(Some(status)) => return failed(format!("`hermes gateway stop` failed: {status}")),
-                Ok(None) if start.elapsed() > STOP_TIMEOUT => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return failed(format!("`hermes gateway stop` took over {} seconds", STOP_TIMEOUT.as_secs()));
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-                Err(e) => return failed(e.to_string()),
-            }
-        }
+        Some(JobCleanup {
+            when_exists: format!("{home}/gateway.pid"),
+            bin: self.bin().into(),
+            args: ["gateway", "stop", "--yes"].map(String::from).into(),
+            env,
+            cwd: input.state_dir.display().to_string(),
+            timeout_secs: STOP_TIMEOUT.as_secs(),
+        })
+    }
+
+    fn cleanup_failed(&self, input: &RunInput, why: &str) -> String {
+        format!(
+            "Couldn't stop this Bot's Hermes daemon ({why}), so its last turn may still be running. Try again; if this keeps happening, run `hermes gateway stop --yes` with HERMES_HOME={}.",
+            home(input).display()
+        )
     }
 
     fn max_hook_secs(&self) -> Option<u64> {
@@ -301,11 +278,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&i.state_dir);
     }
 
+    fn write_files(i: &RunInput) {
+        for (path, body) in Hermes::default().files(i) {
+            crate::machines::job::write_private(&path, &body).unwrap();
+        }
+    }
+
     #[test]
     fn managed_config_installs_the_gate() {
         use std::os::unix::fs::PermissionsExt;
         let i = input(true);
-        Hermes::default().args(&i, &mut Vec::new());
+        write_files(&i);
         let path = i.state_dir.join("hermes-managed/config.yaml");
         let c: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
@@ -328,19 +311,21 @@ mod tests {
         // Bypass: no hook, and a later run drops the old one.
         let mut bypass = input(false);
         bypass.state_dir = i.state_dir.clone();
-        Hermes::default().args(&bypass, &mut Vec::new());
+        write_files(&bypass);
         let c: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(c.get("hooks").is_none(), "{c}");
         let _ = std::fs::remove_dir_all(&i.state_dir);
     }
 
-    #[test]
-    fn a_gate_that_cant_be_written_is_an_error() {
+    #[tokio::test]
+    async fn a_gate_that_cant_be_written_is_an_error() {
         let mut i = input(true);
         i.state_dir = "/proc/superbot-no-such-dir".into();
+        i.cwd = std::env::temp_dir();
         let mut out = Vec::new();
-        Hermes::default().args(&i, &mut out);
-        assert!(matches!(out.as_slice(), [AgentEvent::Error(_)]));
+        let (_abort, rx) = tokio::sync::watch::channel(None);
+        super::super::run(Box::new(Hermes::default()), i, rx, |e| out.push(e)).await;
+        assert!(matches!(out.as_slice(), [AgentEvent::Error(m)] if m.contains("Couldn't write")), "never started");
     }
 
     /// Lines as Hermes v0.23.2 writes them (`timestamp` and `tokens` trimmed).
@@ -387,11 +372,14 @@ mod tests {
         assert_eq!(partial, ["delta Half", "session s", "error Turn lost"]);
     }
 
-    #[test]
-    fn leftovers_are_stopped_only_when_a_daemon_ran() {
+    #[tokio::test]
+    async fn leftovers_are_stopped_only_when_a_daemon_ran() {
         use std::os::unix::fs::PermissionsExt;
+        async fn stop(i: &RunInput) -> Result<(), String> {
+            super::super::stop_leftovers(&Hermes::default(), i).await
+        }
         let mut i = input(false);
-        assert_eq!(Hermes::default().stop_leftovers(&i), Ok(()), "no gateway.pid, no `hermes gateway stop`");
+        assert_eq!(stop(&i).await, Ok(()), "no gateway.pid, no `hermes gateway stop`");
         assert_eq!(Hermes::default().max_hook_secs(), Some(300));
 
         // A stop that fails is reported, so the runner won't start a turn beside the old one.
@@ -405,12 +393,12 @@ mod tests {
             std::fs::set_permissions(bin.join("hermes"), std::fs::Permissions::from_mode(0o755)).unwrap();
         };
         stub("exit 0");
-        assert_eq!(Hermes::default().stop_leftovers(&i), Ok(()));
+        assert_eq!(stop(&i).await, Ok(()));
         stub("exit 1");
-        let err = Hermes::default().stop_leftovers(&i).unwrap_err();
+        let err = stop(&i).await.unwrap_err();
         assert!(err.contains("Couldn't stop this Bot's Hermes daemon") && err.contains("failed"), "{err}");
         std::fs::remove_file(bin.join("hermes")).unwrap();
-        assert!(Hermes::default().stop_leftovers(&i).unwrap_err().contains("didn't start"));
+        assert!(stop(&i).await.unwrap_err().contains("didn't start"));
         let _ = std::fs::remove_dir_all(&i.state_dir);
     }
 }

@@ -11,6 +11,7 @@ pub mod enroll;
 
 #[cfg(test)]
 pub mod fake;
+pub mod job;
 pub mod linode;
 pub mod pki;
 pub mod provider;
@@ -145,9 +146,10 @@ pub struct ControlPlane {
     pub label_prefix: String,
     pub authorized_keys: Vec<String>,
     pub reconcile_every: Duration,
-    /// MACHINE_ROUTING=on: each user's Bots run only on that user's machine (ADR 0029).
-    /// Off: on this server, in the owner's folders.
-    pub routing: bool,
+    /// MACHINE_ROUTING (ADR 0029, ADR 0034): off, the default, runs every Bot on this
+    /// server; `assigned` runs assigned users' Bots on their machine and others' here;
+    /// `on` runs Bots only on their owner's assigned machine.
+    pub routing: route::Routing,
     /// How work reaches a user's machine: `Unenrolled` (refuses) until enrollment is
     /// on, then mutual TLS to the machine's agent (ADR 0031).
     pub link: Arc<dyn route::MachineLink>,
@@ -169,7 +171,7 @@ impl Default for ControlPlane {
             label_prefix: "superbot".into(),
             authorized_keys: Vec::new(),
             reconcile_every: Duration::from_secs(DEFAULT_RECONCILE_SECONDS),
-            routing: false,
+            routing: route::Routing::Off,
             link: Arc::new(route::Unenrolled),
             enrollment: None,
             ops: tokio::sync::Mutex::new(()),
@@ -185,15 +187,6 @@ fn slug(s: &str, max: usize) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         && !s.starts_with('-')
         && !s.ends_with('-')
-}
-
-/// MACHINE_ROUTING: off (the default) or on.
-fn routing(raw: &str) -> Result<bool, String> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "" | "0" | "off" | "false" | "no" => Ok(false),
-        "1" | "on" | "true" | "yes" => Ok(true),
-        v => Err(format!("MACHINE_ROUTING must be on or off, not \"{v}\"")),
-    }
 }
 
 fn list(raw: &str) -> Vec<String> {
@@ -237,8 +230,9 @@ impl ControlPlane {
         var: impl Fn(&str) -> String,
     ) -> Result<ControlPlane, String> {
         let Some(token) = store.get("LINODE_TOKEN").map_err(|e| e.to_string())? else {
-            if routing(&var("MACHINE_ROUTING"))? {
-                return Err("MACHINE_ROUTING=on needs the control plane: set LINODE_TOKEN and MACHINE_REGIONS".into());
+            let routing = route::Routing::parse(&var("MACHINE_ROUTING"))?;
+            if routing != route::Routing::Off {
+                return Err(format!("MACHINE_ROUTING={} needs the control plane: set LINODE_TOKEN and MACHINE_REGIONS", routing.as_str()));
             }
             return Ok(ControlPlane::default());
         };
@@ -307,7 +301,7 @@ impl ControlPlane {
             .ok_or("MACHINE_RECONCILE_SECONDS must be 10 to 3600")?;
         Ok(ControlPlane {
             provider: Some(provider),
-            routing: routing(&var("MACHINE_ROUTING"))?,
+            routing: route::Routing::parse(&var("MACHINE_ROUTING"))?,
             tiers: parse_tiers(&or("MACHINE_TIERS", DEFAULT_TIERS))?,
             image,
             backups,
@@ -361,7 +355,10 @@ impl ControlPlane {
                     .collect::<Vec<_>>()
                     .join(", "),
                 if self.backups { "on" } else { "off" },
-                if self.routing { format!("on via {}", self.link.name()) } else { "off (Bots run on this server)".into() },
+                match self.routing {
+                    route::Routing::Off => "off (Bots run on this server)".into(),
+                    r => format!("{} via {}", r.as_str(), self.link.name()),
+                },
                 self.enrollment.as_ref().map_or("off (set MACHINE_CONTROL_URL)".into(), |e| e.describe())
             ),
         }
@@ -752,7 +749,7 @@ fn own_view(m: &Machine) -> Value {
     json!({
         "id": m.id, "tier": m.tier, "region": m.region, "state": m.state, "providerStatus": m.provider_status,
         "ipv4": m.ipv4, "backups": m.backups, "createdAt": m.created_at, "updatedAt": m.updated_at,
-        "enrollment": m.enrollment, "agentSeenAt": m.agent_seen_at,
+        "enrollment": m.enrollment, "agentSeenAt": m.agent_seen_at, "assigned": m.assigned_at.is_some(),
     })
 }
 
@@ -1162,6 +1159,7 @@ pub async fn destroy(
             json!({ "was": from, "userEmail": u.email }),
         ));
         enroll::revoke_all(&app, &by, &m, "destroyed");
+        unplace(&app, &by, &m, "destroyed");
     }
     let m = finish_destroy(&app, p, m, &by).await;
     Ok(reply(
@@ -1206,6 +1204,106 @@ pub async fn mine(
         )
     })?;
     Ok(Json(own_view(&m)))
+}
+
+// Placement (ADR 0034): which users' Bots run on their machine.
+
+/// Where a user's Bots run now, and why, as admins see it.
+fn placement_view(app: &App, cp: &ControlPlane, user_id: &str) -> Value {
+    let m = app.db.user_machine(user_id);
+    let (runs_on, reason, message) = match cp.route(&app.db, user_id) {
+        Ok(route::Target::Local) => ("server", None, None),
+        Ok(route::Target::Machine(_)) => ("machine", None, None),
+        Err(r) => ("nowhere", Some(r.reason()), Some(r.message())),
+    };
+    json!({
+        "userId": user_id,
+        "userEmail": app.db.user(user_id).and_then(|u| u.email),
+        "routing": cp.routing.as_str(),
+        "assigned": m.as_ref().is_some_and(|m| m.assigned_at.is_some()),
+        "runsOn": runs_on,
+        "reason": reason,
+        "message": message,
+        "machine": m.map(|m| json!({
+            "id": m.id, "state": m.state, "enrollment": m.enrollment, "assignedAt": m.assigned_at, "assignedBy": m.assigned_by,
+            "agentSeenAt": m.agent_seen_at, "agentVersion": m.agent_version, "agentError": m.agent_error,
+        })),
+    })
+}
+
+/// Ends the machine's placement, if it had one, and says so in the audit log.
+fn unplace(app: &App, by: &Who, m: &Machine, reason: &str) -> bool {
+    if !app.db.unassign_machine(&m.id) {
+        return false;
+    }
+    let forgot = app.db.forget_sessions_of(&m.user_id);
+    app.db.record(&event(by, "placement.unassigned", m, json!({ "reason": reason, "sessionsReset": forgot })));
+    true
+}
+
+/// `GET /api/machines/placements`: every live machine and where its user's Bots run.
+pub async fn placements(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>) -> Res {
+    a.machines.need()?;
+    let live = app.db.machines(None).into_iter().filter(|m| m.state != State::Destroyed);
+    let list: Vec<Value> = live.map(|m| placement_view(&app, &a.machines, &m.user_id)).collect();
+    Ok(Json(json!({ "routing": a.machines.routing.as_str(), "placements": list })))
+}
+
+/// `GET /api/users/{key}/placement`: where the user's Bots run now, and why.
+pub async fn placement(
+    AppS(app): AppS<AppState>,
+    Extension(a): Extension<Arc<Auth>>,
+    Path(key): Path<String>,
+) -> Res {
+    a.machines.need()?;
+    let u = need_user_key(&app, &key)?;
+    Ok(Json(placement_view(&app, &a.machines, &u.id)))
+}
+
+/// `PUT /api/users/{key}/placement`: the user's Bots run on their machine from their
+/// next run. The machine must be running and enrolled, so a slip can't strand them.
+pub async fn assign(
+    AppS(app): AppS<AppState>,
+    Extension(a): Extension<Arc<Auth>>,
+    Extension(by): Extension<Who>,
+    Path(key): Path<String>,
+) -> Res {
+    let cp = &a.machines;
+    cp.need()?;
+    let u = need_user_key(&app, &key)?;
+    let _g = cp.ops.lock().await;
+    let m = app.db.user_machine(&u.id).ok_or_else(|| conflict("They don't have a machine. Request one first.".into()))?;
+    if m.assigned_at.is_none() {
+        if m.state != State::Running || m.enrollment != "enrolled" {
+            return Err(conflict(format!(
+                "Their machine is {} and its agent is {}: assign it once it's running and enrolled.",
+                m.state.as_str(),
+                if m.enrollment == "none" { "not enrolled" } else { m.enrollment.as_str() }
+            )));
+        }
+        if app.db.assign_machine(&m.id, by.actor.id.as_deref()) {
+            let forgot = app.db.forget_sessions_of(&u.id);
+            app.db.record(&event(&by, "placement.assigned", &m, json!({ "routing": cp.routing.as_str(), "userEmail": u.email, "sessionsReset": forgot })));
+        }
+    }
+    Ok(Json(placement_view(&app, cp, &u.id)))
+}
+
+/// `DELETE /api/users/{key}/placement`: their Bots run where unassigned users' do.
+pub async fn unassign(
+    AppS(app): AppS<AppState>,
+    Extension(a): Extension<Arc<Auth>>,
+    Extension(by): Extension<Who>,
+    Path(key): Path<String>,
+) -> Res {
+    let cp = &a.machines;
+    cp.need()?;
+    let u = need_user_key(&app, &key)?;
+    let _g = cp.ops.lock().await;
+    if let Some(m) = app.db.user_machine(&u.id) {
+        unplace(&app, &by, &m, "admin");
+    }
+    Ok(Json(placement_view(&app, cp, &u.id)))
 }
 
 #[cfg(test)]
@@ -1385,13 +1483,18 @@ mod tests {
                 _ => String::new(),
             }
         };
+        use route::Routing;
         let off = ControlPlane::from_env(&token, vars("")).unwrap();
-        assert!(!off.routing && off.describe().contains("routing off"), "{}", off.describe());
+        assert!(off.routing == Routing::Off && off.describe().contains("routing off"), "{}", off.describe());
         let on = ControlPlane::from_env(&token, vars("on")).unwrap();
-        assert!(on.routing && on.describe().contains("routing on via unenrolled"), "{}", on.describe());
+        assert!(on.routing == Routing::On && on.describe().contains("routing on via unenrolled"), "{}", on.describe());
+        let assigned = ControlPlane::from_env(&token, vars("Assigned")).unwrap();
+        assert!(assigned.routing == Routing::Assigned && assigned.describe().contains("routing assigned via"), "{}", assigned.describe());
         assert!(ControlPlane::from_env(&token, vars("sometimes")).is_err());
-        let err = ControlPlane::from_env(&EnvStore::fixed(&[]), vars("on")).err().unwrap();
-        assert!(err.contains("LINODE_TOKEN"), "routing on without machines would strand every Bot: {err}");
-        assert!(!ControlPlane::from_env(&EnvStore::fixed(&[]), vars("off")).unwrap().routing);
+        for mode in ["on", "assigned"] {
+            let err = ControlPlane::from_env(&EnvStore::fixed(&[]), vars(mode)).err().unwrap();
+            assert!(err.contains("LINODE_TOKEN"), "routing without machines would strand every Bot: {err}");
+        }
+        assert!(ControlPlane::from_env(&EnvStore::fixed(&[]), vars("off")).unwrap().routing == Routing::Off);
     }
 }

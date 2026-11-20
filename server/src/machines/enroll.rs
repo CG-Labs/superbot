@@ -10,21 +10,22 @@
 //! and recorded, and when it calls a machine, only that machine's own.
 
 use super::pki::{self, Ca, Issued, Peer};
-use super::route::{Assigned, Dispatched, Job, MachineLink};
-use super::wire;
+use super::route::{Assigned, Checked, MachineLink, Ran};
+use super::wire::{self, JobEvent, JobRequest};
 use super::{ControlPlane, State};
 use crate::audit::{Actor, Outcome, Source, Who};
 use crate::db::{Machine, MachineCert, now};
 use crate::runner::App;
 use crate::secrets::sealed::Cipher;
 use crate::users::need_user_key;
+use crate::adapters::AbortReason;
 use crate::{ApiError, AppState, Auth, Res};
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Extension, Path, State as AxState};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Request, State as AxState};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use base64::Engine;
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -34,6 +35,7 @@ use std::net::SocketAddr;
 use std::path::Path as FsPath;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use tokio::sync::{mpsc, watch};
 
 /// How long an enrollment token lasts. Building and booting a Linode takes minutes.
 pub const TOKEN_MINUTES: i64 = 60;
@@ -44,6 +46,13 @@ const CONTROL_CERT_DAYS: i64 = 30;
 pub const DEFAULT_AGENT_PORT: u16 = 7443;
 /// The agent's binary, next to botd's, served to machines at `/v1/agent`.
 pub const AGENT_BIN: &str = "superbot-machine";
+/// Bots on a machine run `botctl` there too, served at `/v1/botctl`.
+pub const BOTCTL_BIN: &str = "botctl";
+/// A job stream with nothing on it this long (the agent pings every 15 seconds)
+/// means the machine is gone.
+const JOB_SILENCE: Duration = Duration::from_secs(60);
+/// After a stop, how long the agent has to end the job before botd lets go of it.
+const ABORT_GRACE: Duration = Duration::from_secs(30);
 const TOKEN_PREFIX: &str = "sbe_";
 /// The derived-key purpose of the CA's key. Changing it makes a new CA.
 const CA_PURPOSE: &str = "machine-ca/v1";
@@ -71,6 +80,8 @@ pub struct Enrollment {
     /// The agent binary and its SHA-256, when it ships next to botd. Read once at
     /// start and shared by every download, so a download costs no new memory.
     agent: Option<(Bytes, String)>,
+    /// botctl, the same way.
+    botctl: Option<(Bytes, String)>,
 }
 
 impl std::fmt::Debug for Enrollment {
@@ -139,20 +150,23 @@ impl Enrollment {
                 .filter(|p| *p > 0)
                 .ok_or("MACHINE_AGENT_PORT must be 1 to 65535")?,
         };
-        let agent = std::fs::read(bin_dir.join(AGENT_BIN)).ok().map(|b| {
-            let sha = sha256_hex(&b);
-            (Bytes::from(b), sha)
-        });
+        let read = |name: &str| {
+            std::fs::read(bin_dir.join(name)).ok().map(|b| {
+                let sha = sha256_hex(&b);
+                (Bytes::from(b), sha)
+            })
+        };
         let ca = Ca::from_seed(&cipher.derive(CA_PURPOSE))?;
-        Enrollment::new(
+        let mut e = Enrollment::new(
             u.as_str().trim_end_matches('/').to_string(),
             host,
             listen,
             agent_port,
             ca,
-            agent,
-        )
-        .map(Some)
+            read(AGENT_BIN),
+        )?;
+        e.botctl = read(BOTCTL_BIN);
+        Ok(Some(e))
     }
 
     fn new(
@@ -172,6 +186,7 @@ impl Enrollment {
             ca,
             current,
             agent,
+            botctl: None,
         })
     }
 
@@ -215,10 +230,10 @@ impl Enrollment {
             self.url,
             self.listen,
             self.agent_port,
-            if self.agent.is_some() {
-                ""
-            } else {
-                "; superbot-machine isn't next to botd, so machines must be given it another way"
+            match (&self.agent, &self.botctl) {
+                (Some(_), Some(_)) => "",
+                (None, _) => "; superbot-machine isn't next to botd, so machines must be given it another way",
+                (_, None) => "; botctl isn't next to botd, so machines can't run Bots until they're given it",
             }
         )
     }
@@ -298,11 +313,21 @@ impl Enrollment {
             port = self.agent_port,
             unit = indent(UNIT),
         );
-        if let Some((_, sha)) = &self.agent {
-            out.push_str(&format!(
-                "runcmd:\n\
-                 \x20 - [sh, -c, \"curl -fsS --retry 5 --cacert /etc/superbot/ca.pem -o /usr/local/bin/superbot-machine.new {url}/v1/agent && echo '{sha}  /usr/local/bin/superbot-machine.new' | sha256sum -c - && chmod 755 /usr/local/bin/superbot-machine.new && mv /usr/local/bin/superbot-machine.new /usr/local/bin/superbot-machine && systemctl daemon-reload && systemctl enable --now superbot-machine\"]\n",
+        let install = |path: &str, name: &str, sha: &str| {
+            format!(
+                "curl -fsS --retry 5 --cacert /etc/superbot/ca.pem -o /usr/local/bin/{name}.new {url}{path} && echo '{sha}  /usr/local/bin/{name}.new' | sha256sum -c - && chmod 755 /usr/local/bin/{name}.new && mv /usr/local/bin/{name}.new /usr/local/bin/{name}",
                 url = self.url,
+            )
+        };
+        if let Some((_, sha)) = &self.agent {
+            out.push_str("runcmd:\n");
+            // botctl first: the agent reports whether it's there when botd checks.
+            if let Some((_, b)) = &self.botctl {
+                out.push_str(&format!("  - [sh, -c, \"{}\"]\n", install("/v1/botctl", BOTCTL_BIN, b)));
+            }
+            out.push_str(&format!(
+                "  - [sh, -c, \"{} && systemctl daemon-reload && systemctl enable --now superbot-machine\"]\n",
+                install("/v1/agent", AGENT_BIN, sha)
             ));
         }
         out
@@ -320,6 +345,19 @@ impl Enrollment {
             .build()
             .map_err(|e| e.to_string())?;
         Ok((client, verifier))
+    }
+
+    /// Like `pinned`, for a job's stream: no overall timeout, since a run can take
+    /// hours, but a stream silent for `JOB_SILENCE` is a lost machine.
+    fn job_client(&self, pins: Vec<String>) -> Result<reqwest::Client, String> {
+        let c = self.control();
+        let (config, _) = pki::pinned_client_config(pins, c.chain.clone(), c.key.clone_key())?;
+        reqwest::Client::builder()
+            .tls_backend_preconfigured(config)
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(JOB_SILENCE)
+            .build()
+            .map_err(|e| e.to_string())
     }
 
     fn agent_url(&self, address: &str, path: &str) -> String {
@@ -463,6 +501,15 @@ pub fn revoke_all(app: &App, by: &Who, m: &Machine, reason: &str) -> usize {
 struct Port {
     app: AppState,
     e: Arc<Enrollment>,
+    api: Option<Api>,
+}
+
+/// botd's own API, for the relay (`/v1/machines/{id}/api/...`): the router, and a
+/// Host it accepts.
+#[derive(Clone)]
+pub struct Api {
+    pub router: axum::Router,
+    pub host: String,
 }
 
 fn reply(code: StatusCode, msg: &str) -> Response {
@@ -757,30 +804,114 @@ async fn rotate(
     .into_response()
 }
 
-/// `GET /v1/agent`: the agent binary. Public code; cloud-init checks its SHA-256.
-async fn agent_binary(AxState(p): AxState<Arc<Port>>) -> Response {
-    let Some((bytes, _)) = p.e.agent.clone() else {
+fn binary(b: &Option<(Bytes, String)>, name: &str) -> Response {
+    let Some((bytes, _)) = b.clone() else {
         return reply(
             StatusCode::NOT_FOUND,
-            "superbot-machine isn't installed next to botd.",
+            &format!("{name} isn't installed next to botd."),
         );
     };
     ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response()
 }
 
-pub fn router(app: AppState, e: Arc<Enrollment>) -> axum::Router {
+/// `GET /v1/agent`: the agent binary. Public code; cloud-init checks its SHA-256.
+async fn agent_binary(AxState(p): AxState<Arc<Port>>) -> Response {
+    binary(&p.e.agent, AGENT_BIN)
+}
+
+/// `GET /v1/botctl`: botctl, for Bots on the machine. Public code, checked the same way.
+async fn botctl_binary(AxState(p): AxState<Arc<Port>>) -> Response {
+    binary(&p.e.botctl, BOTCTL_BIN)
+}
+
+/// Headers a Bot's call carries through the relay; nothing else crosses.
+const RELAYED: [header::HeaderName; 4] = [
+    header::AUTHORIZATION,
+    header::CONTENT_TYPE,
+    header::ACCEPT,
+    header::USER_AGENT,
+];
+
+/// `ANY /v1/machines/{id}/api/{path}`: a call from a Bot on the machine (`botctl`, the
+/// approval hook) to botd's `/api/{path}`, relayed by its agent. The machine shows its
+/// certificate, and the call carries the Bot's own token, which must be for one of
+/// that machine's user's Bots: a machine speaks for its own user only. From there the
+/// API checks the token and the Bot's rights as for any Bot.
+async fn relay(
+    AxState(p): AxState<Arc<Port>>,
+    Extension(peer): Extension<Peer>,
+    Path((id, rest)): Path<(String, String)>,
+    req: Request,
+) -> Response {
+    let (_, m) = match authenticate(&p, &peer, &id) {
+        Err(r) => return r,
+        Ok(x) => x,
+    };
+    let Some(api) = &p.api else {
+        return reply(StatusCode::NOT_FOUND, "This server doesn't relay calls.");
+    };
+    let token = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|t| t.starts_with(crate::isolation::BOT_TOKEN_PREFIX));
+    let bot = token.and_then(|t| crate::isolation::token_bot(&p.app.cfg.bot_key, t));
+    if !bot.is_some_and(|(_, owner)| owner == m.user_id) {
+        record(
+            &p.app,
+            &agent_who(&m.user_id, &peer),
+            "access.denied",
+            &m.id,
+            Outcome::Denied,
+            json!({ "userId": m.user_id, "reason": if bot.is_some() { "another_users_bot" } else { "no_bot_token" }, "path": crate::audit::clip(&rest, 80), "bot": bot.map(|(b, _)| b) }),
+        );
+        return reply(
+            StatusCode::FORBIDDEN,
+            "Only this machine's user's Bots can call botd through it, each with its own token.",
+        );
+    }
+    if rest.split('/').any(|s| s.is_empty() || s == "." || s == "..") {
+        return reply(StatusCode::NOT_FOUND, "No such API path.");
+    }
+    let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+    let mut b = axum::http::Request::builder()
+        .method(req.method().clone())
+        .uri(format!("/api/{rest}{query}"))
+        .header(header::HOST, &api.host);
+    for h in RELAYED {
+        if let Some(v) = req.headers().get(&h) {
+            b = b.header(h, v.clone());
+        }
+    }
+    let Ok(mut inner) = b.body(req.into_body()) else {
+        return reply(StatusCode::BAD_REQUEST, "That request can't be relayed.");
+    };
+    // The machine's own address, so the audit log says where the call came from.
+    inner.extensions_mut().insert(ConnectInfo(peer.addr));
+    match tower::ServiceExt::oneshot(api.router.clone(), inner).await {
+        Ok(r) => r.into_response(),
+        Err(e) => match e {},
+    }
+}
+
+pub fn router(app: AppState, e: Arc<Enrollment>, api: Option<Api>) -> axum::Router {
     axum::Router::new()
         .route("/v1/enroll", post(enroll))
         .route("/v1/machines/{id}", get(status))
         .route("/v1/machines/{id}/certificate", post(rotate))
+        .route("/v1/machines/{id}/api/{*rest}", any(relay))
         .route("/v1/agent", get(agent_binary))
+        .route("/v1/botctl", get(botctl_binary))
         .layer(DefaultBodyLimit::max(64 * 1024))
-        .with_state(Arc::new(Port { app, e }))
+        .with_state(Arc::new(Port { app, e, api }))
 }
 
-/// Serves the machine port on `listener`.
-pub async fn serve(listener: tokio::net::TcpListener, app: AppState, e: Arc<Enrollment>) {
-    pki::serve(listener, e.tls(), router(app, e), |_| true).await
+/// Serves the machine port on `listener`. `api`: botd's API, relayed for Bots on
+/// machines.
+pub async fn serve(listener: tokio::net::TcpListener, app: AppState, e: Arc<Enrollment>, api: Option<Api>) {
+    pki::serve(listener, e.tls(), router(app, e, api), pki::lifetime).await
 }
 
 // Calling machines
@@ -789,15 +920,26 @@ pub async fn serve(listener: tokio::net::TcpListener, app: AppState, e: Arc<Enro
 /// own certificates, and records the answer. A rotated certificate seen here for the
 /// first time retires the ones before it.
 pub async fn heartbeat(app: &App, e: &Enrollment, m: &Machine) -> Result<wire::Heartbeat, String> {
+    let to = Assigned {
+        machine_id: m.id.clone(),
+        user_id: m.user_id.clone(),
+        address: m.ipv4.clone(),
+        pins: app.db.machine_pins(&m.id),
+    };
+    probe(app, e, &to, &[]).await
+}
+
+/// `heartbeat`, also asking whether `bins` are installed there.
+async fn probe(app: &App, e: &Enrollment, to: &Assigned, bins: &[&str]) -> Result<wire::Heartbeat, String> {
     let res = async {
-        let pins = app.db.machine_pins(&m.id);
-        if pins.is_empty() {
+        if to.pins.is_empty() {
             return Err("it has no usable certificate".to_string());
         }
-        let address = m.ipv4.as_deref().ok_or("it has no address yet")?;
-        let (client, seen) = e.pinned(pins)?;
+        let address = to.address.as_deref().ok_or("it has no address yet")?;
+        let (client, seen) = e.pinned(to.pins.clone())?;
+        let query: Vec<String> = bins.iter().map(|b| format!("bin={b}")).collect();
         let r = client
-            .get(e.agent_url(address, "/v1/heartbeat"))
+            .get(e.agent_url(address, &format!("/v1/heartbeat?{}", query.join("&"))))
             .send()
             .await
             .map_err(|e| format!("its agent didn't answer: {}", without_url(e)))?;
@@ -809,16 +951,18 @@ pub async fn heartbeat(app: &App, e: &Enrollment, m: &Machine) -> Result<wire::H
             .await
             .map_err(|_| "its agent's answer wasn't a heartbeat".to_string())?;
         let fp = seen.seen.lock().unwrap().clone().unwrap_or_default();
-        if hb.machine_id != m.id || hb.user_id != m.user_id {
+        if hb.machine_id != to.machine_id || hb.user_id != to.user_id {
             return Err("its agent answered for another machine".into());
         }
         let revoked = app.db.machine_cert_seen(&fp);
-        record_revoked(app, &Who::system("control_plane"), m, "rotated", &revoked);
+        if let Some(m) = app.db.machine(&to.machine_id) {
+            record_revoked(app, &Who::system("control_plane"), &m, "rotated", &revoked);
+        }
         Ok(hb)
     }
     .await;
     app.db.machine_agent_seen(
-        &m.id,
+        &to.machine_id,
         res.as_ref()
             .map(|h| h.version.as_str())
             .map_err(String::as_str),
@@ -839,39 +983,104 @@ fn without_url(e: reqwest::Error) -> String {
 }
 
 /// Hands jobs to a user's machine over mutual TLS, to that machine's own pinned
-/// certificate only. The agent doesn't run Bots yet, so it turns every job down and the
-/// run is refused with that reason; the connection and both certificates are real.
+/// certificate only, and streams back what happens (ADR 0034).
 pub struct Mtls(pub Arc<Enrollment>);
+
+impl Mtls {
+    async fn stream(&self, to: &Assigned, job: JobRequest, mut abort: watch::Receiver<AbortReason>, tx: &mpsc::Sender<JobEvent>) -> Result<(), String> {
+        let address = to.address.as_deref().ok_or("your computer has no address yet")?;
+        let client = self.0.job_client(to.pins.clone())?;
+        let job_id = job.job_id.clone();
+        let mut r = client
+            .post(self.0.agent_url(address, "/v1/jobs"))
+            .json(&job)
+            .send()
+            .await
+            .map_err(|e| format!("Your computer didn't take the job: {}.", without_url(e)))?;
+        if !r.status().is_success() {
+            let code = r.status().as_u16();
+            let why = r.json::<wire::ErrorReply>().await.map(|e| e.error).unwrap_or_default();
+            return Err(format!("Your computer turned the job down ({code}): {why}"));
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        let mut deadline: Option<tokio::time::Instant> = None;
+        loop {
+            let give_up = async {
+                match deadline {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                chunk = r.chunk() => match chunk {
+                    Ok(Some(bytes)) => {
+                        buf.extend_from_slice(&bytes);
+                        while let Some(i) = buf.iter().position(|b| *b == b'\n') {
+                            let line: Vec<u8> = buf.drain(..=i).collect();
+                            let Ok(ev) = serde_json::from_slice::<JobEvent>(&line) else { continue };
+                            if !matches!(ev, JobEvent::Ping) && tx.send(ev).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Ok(None) => return Ok(()),
+                    Err(e) => return Err(format!("Lost your computer during the run: {}.", without_url(e))),
+                },
+                reason = async { abort.wait_for(|r| r.is_some()).await.ok().and_then(|r| *r) }, if deadline.is_none() => {
+                    deadline = Some(tokio::time::Instant::now() + ABORT_GRACE);
+                    let reason = reason.unwrap_or("stopped").to_string();
+                    let (e, pins, address, id) = (self.0.clone(), to.pins.clone(), address.to_string(), job_id.clone());
+                    tokio::spawn(async move {
+                        if let Ok((c, _)) = e.pinned(pins) {
+                            let _ = c.post(e.agent_url(&address, &format!("/v1/jobs/{id}/abort"))).json(&wire::AbortRequest { reason }).send().await;
+                        }
+                    });
+                }
+                _ = give_up => return Err("Your computer didn't end the run when asked; I let go of it.".into()),
+            }
+        }
+    }
+}
 
 impl MachineLink for Mtls {
     fn name(&self) -> &'static str {
         "mtls"
     }
 
-    fn dispatch<'a>(&'a self, to: &'a Assigned, job: Job) -> Dispatched<'a> {
+    fn check<'a>(&'a self, app: &'a App, to: &'a Assigned, bins: &'a [&'a str]) -> Checked<'a> {
+        Box::pin(probe(app, &self.0, to, bins))
+    }
+
+    fn run<'a>(&'a self, to: &'a Assigned, job: JobRequest, abort: watch::Receiver<AbortReason>, tx: mpsc::Sender<JobEvent>) -> Ran<'a> {
         Box::pin(async move {
-            let address = to
-                .address
-                .as_deref()
-                .ok_or("your computer has no address yet")?;
-            let (client, _) = self.0.pinned(to.pins.clone())?;
-            let body = wire::JobRequest {
-                bot_id: job.bot_id,
-                owner_id: job.owner_id,
-                message_id: job.message_id,
-            };
-            let r = client
-                .post(self.0.agent_url(address, "/v1/jobs"))
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| format!("it didn't answer ({})", without_url(e)))?;
-            match r.status() {
-                s if s.is_success() => Ok(()),
-                StatusCode::NOT_IMPLEMENTED => {
-                    Err("it's connected, but it can't run Bots yet.".into())
+            let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (fwd_tx, mut fwd_rx) = mpsc::channel::<JobEvent>(64);
+            let watch_end = {
+                let (ended, tx) = (ended.clone(), tx.clone());
+                async move {
+                    while let Some(ev) = fwd_rx.recv().await {
+                        if matches!(ev, JobEvent::Exit { .. } | JobEvent::Cleanup { .. } | JobEvent::Error { .. }) {
+                            ended.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        if tx.send(ev).await.is_err() {
+                            return;
+                        }
+                    }
                 }
-                s => Err(format!("it answered {}.", s.as_u16())),
+            };
+            let run = async move {
+                let res = self.stream(to, job, abort, &fwd_tx).await;
+                drop(fwd_tx);
+                res
+            };
+            let (res, ()) = tokio::join!(run, watch_end);
+            let message = match res {
+                Err(m) => Some(m),
+                Ok(()) if !ended.load(std::sync::atomic::Ordering::SeqCst) => Some("Your computer stopped answering before the run finished.".into()),
+                Ok(()) => None,
+            };
+            if let Some(message) = message {
+                let _ = tx.send(JobEvent::Error { message }).await;
             }
         })
     }
