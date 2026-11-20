@@ -24,15 +24,31 @@ const TAG: usize = 16;
 const KEY_CHECK: &str = "secrets_key_check";
 const KEY_CHECK_PLAIN: &[u8] = b"superbot master key check";
 
-pub struct Cipher(XChaCha20Poly1305);
+/// The AEAD, and a root for keys derived from the master key.
+pub struct Cipher(XChaCha20Poly1305, Zeroizing<[u8; 32]>);
 
 fn aad(context: &str) -> String {
     format!("superbot/{context}")
 }
 
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> Zeroizing<[u8; 32]> {
+    use aws_lc_rs::hmac;
+    let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), msg);
+    let mut out = Zeroizing::new([0u8; 32]);
+    out.copy_from_slice(tag.as_ref());
+    out
+}
+
 impl Cipher {
     pub fn new(key: &MasterKey) -> Cipher {
-        Cipher(XChaCha20Poly1305::new(Key::from_slice(key.bytes())))
+        Cipher(XChaCha20Poly1305::new(Key::from_slice(key.bytes())), hmac_sha256(key.bytes(), b"superbot/derive"))
+    }
+
+    /// 32 bytes for `purpose` (e.g. the machine CA's key, ADR 0031), derived from the
+    /// master key with HMAC-SHA256. As safe as the master key and kept nowhere else;
+    /// a new master key means new derived keys.
+    pub fn derive(&self, purpose: &str) -> Zeroizing<[u8; 32]> {
+        hmac_sha256(&self.1[..], purpose.as_bytes())
     }
 
     pub fn seal(&self, context: &str, plain: &[u8]) -> String {

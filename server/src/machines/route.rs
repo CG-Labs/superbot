@@ -2,11 +2,12 @@
 //! Bots share it. With routing off (self-hosting, and managed hosting until machines
 //! enroll), every Bot runs on this server in its owner's folders. With MACHINE_ROUTING
 //! on, a Bot runs only on its owner's machine: never here, and never on anyone else's.
-//! `MachineLink` is the seam the machine agent plugs into; until it exists, nothing is
-//! sent and runs are refused rather than falling back to this server.
+//! `MachineLink` is the seam the machine agent plugs into: mutual TLS to the machine's
+//! own pinned certificate once enrollment is on (ADR 0031). Until then nothing is sent,
+//! and runs are refused rather than falling back to this server.
 
 use super::{ControlPlane, State};
-use crate::db::{Db, Machine};
+use crate::db::Db;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -17,6 +18,9 @@ pub struct Assigned {
     pub user_id: String,
     /// Where the machine answers. None until the provider gives it an address.
     pub address: Option<String>,
+    /// Fingerprints of its usable certificates (ADR 0031): the only ones accepted from
+    /// it. Empty until it enrolls.
+    pub pins: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -34,6 +38,8 @@ pub enum Refusal {
     NoMachine,
     /// The owner's machine exists but isn't running (still being built, suspended, ...).
     NotReady(State),
+    /// It is running, but its agent hasn't enrolled (or its certificates were revoked).
+    NotEnrolled,
     /// The machine is running but the work couldn't be handed to it.
     Unreachable(String),
 }
@@ -43,6 +49,7 @@ impl Refusal {
         match self {
             Refusal::NoMachine => "no_machine",
             Refusal::NotReady(_) => "machine_not_ready",
+            Refusal::NotEnrolled => "machine_not_enrolled",
             Refusal::Unreachable(_) => "machine_unreachable",
         }
     }
@@ -52,6 +59,7 @@ impl Refusal {
         match self {
             Refusal::NoMachine => "I can't run yet: you don't have a computer. Ask an admin to set one up for you.".into(),
             Refusal::NotReady(s) => format!("I can't run yet: your computer is {}. Try again when it's running.", s.as_str()),
+            Refusal::NotEnrolled => "I can't run yet: your computer hasn't connected to this server. Ask an admin to check on it.".into(),
             Refusal::Unreachable(e) => format!("I couldn't reach your computer: {e}"),
         }
     }
@@ -68,14 +76,14 @@ pub fn target(db: &Db, cp: &ControlPlane, user_id: &str) -> Result<Target, Refus
     if m.user_id != user_id {
         return Err(Refusal::NoMachine);
     }
-    match m.state {
-        State::Running => Ok(Target::Machine(assigned(&m))),
-        s => Err(Refusal::NotReady(s)),
+    if m.state != State::Running {
+        return Err(Refusal::NotReady(m.state));
     }
-}
-
-fn assigned(m: &Machine) -> Assigned {
-    Assigned { machine_id: m.id.clone(), user_id: m.user_id.clone(), address: m.ipv4.clone() }
+    let to = Assigned { machine_id: m.id.clone(), user_id: m.user_id.clone(), address: m.ipv4.clone(), pins: db.machine_pins(&m.id) };
+    if cp.enrollment.is_some() && to.pins.is_empty() {
+        return Err(Refusal::NotEnrolled);
+    }
+    Ok(Target::Machine(to))
 }
 
 /// One message for a Bot to work on, handed to its owner's machine.
@@ -88,9 +96,9 @@ pub struct Job {
 
 pub type Dispatched<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
-/// Hands work to a user's machine. The machine agent (enrollment, mutual TLS, and
-/// the run protocol) implements this; botd never sends a job to any machine but the
-/// one `target` picked for the Bot's owner.
+/// Hands work to a user's machine. botd never sends a job to any machine but the one
+/// `target` picked for the Bot's owner, and over mutual TLS only to that machine's
+/// own certificates (`enroll::Mtls`).
 pub trait MachineLink: Send + Sync {
     fn name(&self) -> &'static str;
     fn dispatch<'a>(&'a self, to: &'a Assigned, job: Job) -> Dispatched<'a>;
@@ -105,7 +113,7 @@ impl MachineLink for Unenrolled {
     }
 
     fn dispatch<'a>(&'a self, _to: &'a Assigned, _job: Job) -> Dispatched<'a> {
-        Box::pin(async { Err("this server can't send work to machines yet (no machine agent is enrolled)".to_string()) })
+        Box::pin(async { Err("this server can't send work to machines yet (machine enrollment is off)".to_string()) })
     }
 }
 
@@ -135,7 +143,7 @@ pub mod recording {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::NewMachine;
+    use crate::db::{Machine, NewMachine};
 
     fn machine(db: &Db, user: &str, state: State) -> Machine {
         let m = db

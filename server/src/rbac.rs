@@ -244,6 +244,8 @@ mod tests {
             ("POST", "/api/users/u1/machine", Perm::Admin),
             ("DELETE", "/api/users/u1/machine", Perm::Admin),
             ("POST", "/api/users/u1/machine/suspend", Perm::Admin),
+            ("POST", "/api/users/u1/machine/enrollment", Perm::Admin),
+            ("DELETE", "/api/users/u1/machine/certificates", Perm::Admin),
             ("POST", "/api/users/u1/machine/resume", Perm::Admin),
             ("POST", "/api/users/u1/machine/resize", Perm::Admin),
             ("POST", "/api/auth/logout", Perm::Account),

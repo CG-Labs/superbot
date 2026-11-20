@@ -21,6 +21,8 @@ mod db;
 mod machines;
 #[cfg(test)]
 mod machines_http_tests;
+#[cfg(test)]
+mod machines_mtls_tests;
 mod paths;
 mod policy;
 mod rbac;
@@ -120,7 +122,7 @@ async fn main() {
     let sso = sso::Sso::from_env().unwrap_or_else(|e| exit(format!("SSO: {e}")));
     let signups = signups::Signups::from_env(&secrets::env::EnvStore::process(), &env("SIGNUPS", ""), &env("TURNSTILE_SITE_KEY", ""))
         .unwrap_or_else(|e| exit(format!("Sign-ups: {e}")));
-    let control_plane = machines::ControlPlane::from_env(&secrets::env::EnvStore::process(), |k| env(k, ""))
+    let mut control_plane = machines::ControlPlane::from_env(&secrets::env::EnvStore::process(), |k| env(k, ""))
         .unwrap_or_else(|e| exit(format!("Control plane: {e}")));
     let scim = scim::Scim::from_env(&env("SCIM", ""), &env("SCIM_DEFAULT_ROLE", "")).unwrap_or_else(|e| exit(format!("SCIM: {e}")));
     let allow_no_auth = auth_startup(&host, &password, break_glass);
@@ -161,6 +163,11 @@ async fn main() {
             std::process::exit(1);
         }
     }
+    // Machine enrollment's CA key is derived from the master key (ADR 0031).
+    let bin_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+    let enrollment = machines::enroll::Enrollment::from_env(&|k| env(k, ""), &secrets::sealed::cipher(), &bin_dir)
+        .unwrap_or_else(|e| exit(format!("Machine enrollment: {e}")))
+        .map(|e| control_plane.enroll_with(e).unwrap_or_else(|e| exit(format!("Machine enrollment: {e}"))));
 
     let screens = paths::child(&data_dir, "screens").and_then(screen::Screens::from_env);
     let app = App::new(db, Config {
@@ -168,7 +175,7 @@ async fn main() {
         workspace,
         user_name: env("USER_NAME", "the user"),
         // `botctl` ships next to `botd`.
-        bin_dir: std::env::current_exe().unwrap().parent().unwrap().to_path_buf(),
+        bin_dir,
         api_url: format!("http://127.0.0.1:{port}"),
         bot_key: bot_key.clone(),
         run_timeout: Duration::from_secs(60 * env("RUN_TIMEOUT_MINUTES", "60").parse::<u64>().unwrap_or(60)),
@@ -276,6 +283,11 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await.expect("bind");
     println!("Listening on http://{host}:{port}");
+    if let Some(e) = enrollment {
+        let machine_listener = tokio::net::TcpListener::bind(e.listen).await.unwrap_or_else(|err| exit(format!("MACHINE_LISTEN {}: {err}", e.listen)));
+        println!("Machines enroll at {} (listening on {}).", e.url, e.listen);
+        tokio::spawn(machines::enroll::serve(machine_listener, app.clone(), e));
+    }
     println!("Harnesses on PATH: {}. Default: {}.", adapters::installed().join(", "), app.cfg.default_harness);
     println!("Screens: {}.", if app.screens.is_some() { "on" } else { "off (install Xvfb and openbox to turn them on)" });
 
@@ -348,6 +360,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/machine/suspend", post(machines::suspend))
         .route("/users/{key}/machine/resume", post(machines::resume))
         .route("/users/{key}/machine/resize", post(machines::resize))
+        .route("/users/{key}/machine/enrollment", post(machines::enroll::issue_token))
+        .route("/users/{key}/machine/certificates", delete(machines::enroll::revoke))
         .route("/machines", get(machines::list_all))
         .route("/machines/reconcile", post(machines::reconcile_now))
         .route("/machine", get(machines::mine))

@@ -18,6 +18,9 @@ pub struct CreateSpec {
     pub image: String,
     pub tags: Vec<String>,
     pub authorized_keys: Vec<String>,
+    /// cloud-init user data for the first boot: the enrollment token and how to reach
+    /// the control plane (ADR 0031). None when enrollment is off.
+    pub user_data: Option<String>,
 }
 
 /// A machine as the provider sees it. `status` is the provider's own word for it
