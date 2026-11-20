@@ -106,20 +106,37 @@ impl Host {
 /// [`Host`] for this machine, checked once per process. Containers and some
 /// distributions (Ubuntu 24.04's AppArmor) block user namespaces.
 pub fn host() -> Host {
-    static HOST: std::sync::OnceLock<Host> = std::sync::OnceLock::new();
-    HOST.get_or_init(probe).clone()
+    host_as(None)
+}
+
+/// [`Host`] for runs as the user `(uid, gid)`, checked as that user once per process:
+/// root may make namespaces an unprivileged user can't.
+pub fn host_as(ids: Option<(u32, u32)>) -> Host {
+    type Checked = Vec<(Option<(u32, u32)>, Host)>;
+    static HOSTS: std::sync::Mutex<Checked> = std::sync::Mutex::new(Vec::new());
+    let mut hosts = HOSTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, h)) = hosts.iter().find(|(i, _)| *i == ids) {
+        return h.clone();
+    }
+    let h = probe(ids);
+    hosts.push((ids, h.clone()));
+    h
 }
 
 #[cfg(target_os = "macos")]
-fn probe() -> Host {
+fn probe(_ids: Option<(u32, u32)>) -> Host {
     Host { namespaces: Path::new("/usr/bin/sandbox-exec").exists(), programs: PROGRAMS.map(String::from).into() }
 }
 
 #[cfg(target_os = "linux")]
-fn probe() -> Host {
+fn probe(ids: Option<(u32, u32)>) -> Host {
+    use std::os::unix::process::CommandExt;
     let ok = |bin: &str, args: &[&str]| {
-        std::process::Command::new(bin)
-            .args(args)
+        let mut c = std::process::Command::new(bin);
+        if let Some((uid, gid)) = ids {
+            c.uid(uid).gid(gid).current_dir("/");
+        }
+        c.args(args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -134,7 +151,7 @@ fn probe() -> Host {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn probe() -> Host {
+fn probe(_ids: Option<(u32, u32)>) -> Host {
     Host::default()
 }
 
@@ -147,6 +164,14 @@ mod tests {
         let home = std::env::temp_dir().join(format!("sandbox-{name}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
         home
+    }
+
+    #[test]
+    fn a_user_is_checked_as_that_user() {
+        // SAFETY: plain getters.
+        let me = unsafe { (libc::getuid(), libc::getgid()) };
+        assert_eq!(host_as(Some(me)), host(), "this process's own user sees what it sees");
+        assert_eq!(host_as(Some(me)), host_as(Some(me)), "checked once");
     }
 
     #[test]

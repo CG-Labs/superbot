@@ -9,6 +9,8 @@ use serde_json::Value;
 
 #[derive(Default)]
 pub struct Codex {
+    /// This run asked for the sandbox, so a bubblewrap error is likely Codex's own.
+    sandboxed: bool,
     /// Said once per run that the sandbox can't start.
     sandbox_failed: bool,
 }
@@ -40,6 +42,7 @@ impl Adapter for Codex {
             a.push("resume".into());
         }
         a.extend(["--json", "--skip-git-repo-check"].map(String::from));
+        self.sandboxed = input.sandbox.is_some();
         match &input.sandbox {
             Some(s) => a.extend(sandbox_config(s)),
             None => a.push("--dangerously-bypass-approvals-and-sandbox".into()),
@@ -77,10 +80,12 @@ impl Adapter for Codex {
             "item.completed" if kind == "agent_message" && !str_of(item, "text").trim().is_empty() => {
                 out.push(AgentEvent::Text(str_of(item, "text").into()))
             }
-            "item.completed" if kind == "command_execution" && !self.sandbox_failed => {
+            // A note, not an error: a command's output may only quote bubblewrap, and the
+            // Bot may still finish the task.
+            "item.completed" if kind == "command_execution" && self.sandboxed && !self.sandbox_failed => {
                 if let Some(why) = sandbox_failure(str_of(item, "aggregated_output")) {
                     self.sandbox_failed = true;
-                    out.push(AgentEvent::Error(format!(
+                    out.push(AgentEvent::Text(format!(
                         "Codex's sandbox can't start on this computer ({why}), so my commands fail. Install bubblewrap (on Ubuntu 24.04, also its AppArmor profile), \
                          or turn the sandbox off for me in my approval settings."
                     )));
@@ -195,14 +200,17 @@ mod tests {
 
     #[test]
     fn a_sandbox_that_cant_start_is_said_once() {
-        let mut c = Codex::default();
         let mut out = Vec::new();
         let done = |o: &str| json!({ "type": "item.completed", "item": { "type": "command_execution", "aggregated_output": o } });
+        let failed = done("bwrap: No permissions to create new namespace, likely because the kernel does not allow non-privileged user namespaces.\n");
+        Codex::default().on_event(&failed, &mut out);
+        assert!(out.is_empty(), "without the sandbox it's only a command's output");
+        let mut c = Codex { sandboxed: true, ..Default::default() };
         c.on_event(&done("total 0\nbwrap is a fine word\n"), &mut out);
         assert!(out.is_empty());
-        c.on_event(&done("bwrap: No permissions to create new namespace, likely because the kernel does not allow non-privileged user namespaces.\n"), &mut out);
+        c.on_event(&failed, &mut out);
         c.on_event(&done("bwrap: setting up uid map: Permission denied\n"), &mut out);
-        let [AgentEvent::Error(e)] = out.as_slice() else { panic!("one error, got {}", out.len()) };
+        let [AgentEvent::Text(e)] = out.as_slice() else { panic!("one note, not an error that fails the task, got {}", out.len()) };
         assert!(e.contains("bubblewrap") && e.contains("No permissions to create new namespace"), "{e}");
     }
 }
