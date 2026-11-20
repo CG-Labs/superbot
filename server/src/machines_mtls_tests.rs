@@ -364,10 +364,7 @@ async fn new_machines_download_the_agent_botd_hashed() {
         .user_data(&env.app.db.machine(&mid).unwrap().label)
         .unwrap();
     assert!(
-        ud.contains(&format!(
-            "echo '{}  /usr/local/bin/superbot-machine.new'",
-            sha(AGENT)
-        )),
+        ud.contains(&format!("echo \"{}  $bin.new\" | sha256sum -c -", sha(AGENT))),
         "{ud}"
     );
     let config = pki::client_config(&pki::cert_der(env.e.ca_pem()).unwrap(), None).unwrap();
@@ -423,7 +420,7 @@ async fn tokens_are_single_use_bound_to_one_machine_and_short_lived() {
 
     env.app
         .db
-        .add_machine_token(&mb, &sha("sbe_stale"), crate::db::now() - 1, None)
+        .add_machine_token(&mb, &sha("sbe_stale"), crate::db::now() - 1, None, crate::db::now())
         .unwrap();
     let stale = agent::enroll(&config(&env, &mb, Some("sbe_stale")))
         .await

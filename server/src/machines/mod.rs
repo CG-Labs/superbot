@@ -11,6 +11,7 @@ pub mod enroll;
 
 #[cfg(test)]
 pub mod fake;
+pub mod firewall;
 pub mod linode;
 pub mod pki;
 pub mod provider;
@@ -153,6 +154,11 @@ pub struct ControlPlane {
     pub link: Arc<dyn route::MachineLink>,
     /// Machine enrollment and mutual TLS (ADR 0031). None: off (MACHINE_CONTROL_URL).
     pub enrollment: Option<Arc<enroll::Enrollment>>,
+    /// The provider firewall every machine sits behind (ADR 0035). None: off
+    /// (MACHINE_FIREWALL). Made from `firewall_settings` once enrollment says which
+    /// port to open.
+    pub firewall: Option<firewall::Firewall>,
+    firewall_settings: Option<firewall::Settings>,
     /// One change at a time, from handlers and the reconciler alike, so two can't
     /// race on one machine. Changes are rare and admin-driven; this is cheap.
     ops: tokio::sync::Mutex<()>,
@@ -172,6 +178,8 @@ impl Default for ControlPlane {
             routing: false,
             link: Arc::new(route::Unenrolled),
             enrollment: None,
+            firewall: None,
+            firewall_settings: None,
             ops: tokio::sync::Mutex::new(()),
         }
     }
@@ -239,6 +247,9 @@ impl ControlPlane {
         let Some(token) = store.get("LINODE_TOKEN").map_err(|e| e.to_string())? else {
             if routing(&var("MACHINE_ROUTING"))? {
                 return Err("MACHINE_ROUTING=on needs the control plane: set LINODE_TOKEN and MACHINE_REGIONS".into());
+            }
+            if firewall::Settings::from_env(&var)?.is_some() {
+                return Err("MACHINE_FIREWALL=on needs the control plane: set LINODE_TOKEN and MACHINE_REGIONS".into());
             }
             return Ok(ControlPlane::default());
         };
@@ -314,6 +325,7 @@ impl ControlPlane {
             label_prefix,
             authorized_keys,
             reconcile_every: Duration::from_secs(secs),
+            firewall_settings: firewall::Settings::from_env(var)?,
             ..ControlPlane::default()
         })
     }
@@ -324,10 +336,32 @@ impl ControlPlane {
         if !self.enabled() {
             return Err("MACHINE_CONTROL_URL needs the control plane: set LINODE_TOKEN and MACHINE_REGIONS".into());
         }
+        if let Some(s) = &self.firewall_settings {
+            self.firewall = Some(firewall::Firewall::new(
+                s,
+                &self.label_prefix,
+                e.agent_port,
+                e.host(),
+            )?);
+        }
         let e = Arc::new(e);
         self.link = Arc::new(enroll::Mtls(e.clone()));
         self.enrollment = Some(e.clone());
         Ok(e)
+    }
+
+    /// Puts every machine behind a firewall made from `s` (tests; `from_env` reads
+    /// MACHINE_FIREWALL). Needs enrollment, for the agent's port.
+    #[cfg(test)]
+    pub fn firewall_with(&mut self, s: firewall::Settings) -> Result<(), String> {
+        let e = self.enrollment.clone().ok_or("enroll first")?;
+        self.firewall = Some(firewall::Firewall::new(
+            &s,
+            &self.label_prefix,
+            e.agent_port,
+            e.host(),
+        )?);
+        Ok(())
     }
 
     /// Where `user_id`'s Bots run (`route::target`).
@@ -352,7 +386,7 @@ impl ControlPlane {
         match &self.provider {
             None => "off (set LINODE_TOKEN and MACHINE_REGIONS for one machine per user)".into(),
             Some(p) => format!(
-                "{}, regions {}, tiers {}, backups {}, routing {}, enrollment {}",
+                "{}, regions {}, tiers {}, backups {}, routing {}, enrollment {}, firewall {}",
                 p.name(),
                 self.regions.join(", "),
                 self.tiers
@@ -362,7 +396,8 @@ impl ControlPlane {
                     .join(", "),
                 if self.backups { "on" } else { "off" },
                 if self.routing { format!("on via {}", self.link.name()) } else { "off (Bots run on this server)".into() },
-                self.enrollment.as_ref().map_or("off (set MACHINE_CONTROL_URL)".into(), |e| e.describe())
+                self.enrollment.as_ref().map_or("off (set MACHINE_CONTROL_URL)".into(), |e| e.describe()),
+                self.firewall.as_ref().map_or("off (set MACHINE_FIREWALL=on)".into(), |f| f.describe())
             ),
         }
     }
@@ -389,6 +424,7 @@ impl ControlPlane {
             tags: vec![m.tag.clone(), format!("{}-user-{}", m.tag, m.user_id)],
             authorized_keys: self.authorized_keys.clone(),
             user_data,
+            firewall_id: m.firewall_id.clone(),
         }
     }
 }
@@ -450,6 +486,15 @@ async fn provision(
     mut m: Machine,
     by: &Who,
 ) -> Machine {
+    // The firewall first: a machine is never made without one, nor a token minted for
+    // a create that won't be sent.
+    m.firewall_id = match &cp.firewall {
+        None => None,
+        Some(fw) => match firewall::ensure(app, fw, p, by).await {
+            Ok(id) => Some(id),
+            Err(e) => return refused(app, m, by, e, "firewall"),
+        },
+    };
     m.create_sent_at = Some(now());
     app.db.save_machine(&m, m.state);
     // A fresh token each attempt. An earlier one stays good until it expires, in case
@@ -479,6 +524,7 @@ async fn provision(
     };
     let from = m.state;
     match found {
+        Err(e) => return refused(app, m, by, e, "create"),
         Ok((pm, adopted)) => {
             observe(&mut m, &pm);
             if adopted {
@@ -500,32 +546,40 @@ async fn provision(
                     by,
                     "machine.created",
                     &m,
-                    json!({ "providerId": pm.id, "adopted": adopted }),
+                    json!({ "providerId": pm.id, "adopted": adopted, "firewallId": m.firewall_id }),
                 ));
             }
         }
-        Err(e) => {
-            let retrying = transient(&e);
-            if !retrying {
-                m.state = next(from, Step::Fail).unwrap_or(from);
-                if matches!(e, ProviderError::Api { .. }) {
-                    // A refusal made nothing, so a delete needn't wait for it.
-                    m.create_sent_at = None;
-                }
-            }
-            m.last_error = Some(e.to_string());
-            app.db.save_machine(&m, from);
-            app.db.record(
-                &event(
-                    by,
-                    "machine.create_failed",
-                    &m,
-                    json!({ "error": e.to_string(), "retrying": retrying }),
-                )
-                .outcome(Outcome::Failure),
-            );
+    }
+    m
+}
+
+/// A create (or the firewall before it, `step`) didn't go through. A transient failure
+/// leaves the machine pending for the reconciler; a refusal is an error.
+fn refused(app: &App, mut m: Machine, by: &Who, e: ProviderError, step: &str) -> Machine {
+    let from = m.state;
+    let retrying = transient(&e);
+    if !retrying {
+        m.state = next(from, Step::Fail).unwrap_or(from);
+        if step == "create" && matches!(e, ProviderError::Api { .. }) {
+            // A refusal made nothing, so a delete needn't wait for it.
+            m.create_sent_at = None;
         }
     }
+    m.last_error = Some(match step {
+        "firewall" => format!("The machine's firewall couldn't be set up: {e}"),
+        _ => e.to_string(),
+    });
+    app.db.save_machine(&m, from);
+    app.db.record(
+        &event(
+            by,
+            "machine.create_failed",
+            &m,
+            json!({ "error": e.to_string(), "retrying": retrying, "step": step }),
+        )
+        .outcome(Outcome::Failure),
+    );
     m
 }
 
@@ -564,6 +618,7 @@ async fn finish_destroy(app: &App, p: &dyn MachineProvider, mut m: Machine, by: 
                     &m,
                     json!({ "providerId": m.provider_id }),
                 ));
+                firewall::release(app, p, &m, by).await;
             }
         }
         Err(e) => {
@@ -667,6 +722,20 @@ async fn reconcile_one(app: &App, cp: &ControlPlane, p: &dyn MachineProvider, id
                     app.db.record(e);
                 }
             }
+            if let Some(e) = &cp.enrollment
+                && matches!(m.state, State::Provisioning | State::Running)
+                && app.db.mark_enroll_overdue(&m.id)
+            {
+                app.db.record(
+                    &event(
+                        &by,
+                        "machine.enroll_timeout",
+                        &m,
+                        json!({ "providerId": pid, "minutes": e.enroll_timeout_ms / 60_000, "enrollBy": m.enroll_by, "enrollment": m.enrollment }),
+                    )
+                    .outcome(Outcome::Failure),
+                );
+            }
             m.state != from
         }
         State::Error | State::Destroyed => false,
@@ -691,7 +760,12 @@ pub async fn reconcile(app: &App, cp: &ControlPlane) -> Value {
         let _g = cp.ops.lock().await;
         changed += reconcile_one(app, cp, p, id).await as usize;
     }
-    json!({ "checked": ids.len(), "changed": changed })
+    let mut out = json!({ "checked": ids.len(), "changed": changed });
+    if let Some(fw) = &cp.firewall {
+        let _g = cp.ops.lock().await;
+        out["firewallAttached"] = firewall::sync(app, fw, p).await.into();
+    }
+    out
 }
 
 /// Asks every enrolled running machine's agent how it is, a few at a time, and
@@ -752,7 +826,7 @@ fn own_view(m: &Machine) -> Value {
     json!({
         "id": m.id, "tier": m.tier, "region": m.region, "state": m.state, "providerStatus": m.provider_status,
         "ipv4": m.ipv4, "backups": m.backups, "createdAt": m.created_at, "updatedAt": m.updated_at,
-        "enrollment": m.enrollment, "agentSeenAt": m.agent_seen_at,
+        "enrollment": m.enrollment, "agentSeenAt": m.agent_seen_at, "enrollOverdueAt": m.enroll_overdue_at,
     })
 }
 
@@ -1393,5 +1467,32 @@ mod tests {
         let err = ControlPlane::from_env(&EnvStore::fixed(&[]), vars("on")).err().unwrap();
         assert!(err.contains("LINODE_TOKEN"), "routing on without machines would strand every Bot: {err}");
         assert!(!ControlPlane::from_env(&EnvStore::fixed(&[]), vars("off")).unwrap().routing);
+    }
+
+    #[test]
+    fn the_firewall_is_off_unless_asked_and_needs_enrollment() {
+        let token = EnvStore::fixed(&[("LINODE_TOKEN", "firewall-test-token-71c3")]);
+        let vars = |fw: &'static str, url: &'static str| {
+            move |k: &str| match k {
+                "MACHINE_REGIONS" => "gb-lon".to_string(),
+                "MACHINE_FIREWALL" => fw.to_string(),
+                "MACHINE_CONTROL_URL" => url.to_string(),
+                _ => String::new(),
+            }
+        };
+        let off = ControlPlane::from_env(&token, vars("", "")).unwrap();
+        assert!(off.firewall_settings.is_none() && off.firewall.is_none());
+        let err = ControlPlane::from_env(&EnvStore::fixed(&[]), vars("on", "https://192.0.2.1:8443"))
+            .err()
+            .unwrap();
+        assert!(err.contains("LINODE_TOKEN"), "{err}");
+        let err = ControlPlane::from_env(&token, vars("on", "")).err().unwrap();
+        assert!(err.contains("MACHINE_CONTROL_URL"), "it opens the agent's port: {err}");
+        let mut cp = ControlPlane::from_env(&token, vars("on", "https://192.0.2.1:8443")).unwrap();
+        assert!(cp.firewall.is_none(), "made with enrollment");
+        cp.enroll_with(enroll::Enrollment::for_tests(3, 8443, 7443)).unwrap();
+        let fw = cp.firewall.as_ref().unwrap();
+        assert_eq!(fw.rules[0].sources, ["127.0.0.1/32"], "the control URL's address");
+        assert!(cp.describe().contains("firewall"), "{}", cp.describe());
     }
 }

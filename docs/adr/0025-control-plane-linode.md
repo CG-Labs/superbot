@@ -124,7 +124,7 @@ The API base URL is fixed (`https://api.linode.com/v4`); there is no setting to 
 
 Linode requires a root password with an image. Each machine gets a fresh random one that is sent once and stored nowhere. Operators get in with `MACHINE_AUTHORIZED_KEYS`; the control plane uses enrollment ([ADR 0031](0031-machine-enrollment-mtls.md)).
 
-Use a Linode token scoped to Linodes read/write only.
+Use a Linode token scoped to Linodes read/write only. With `MACHINE_FIREWALL=on` it also needs Firewalls read/write ([ADR 0035](0035-machine-firewall-auto-enroll.md)).
 
 ### API and audit
 
