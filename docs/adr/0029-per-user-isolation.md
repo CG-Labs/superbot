@@ -88,7 +88,7 @@ The approval policy counts the owner's folder as the workspace, so a delete in a
 - **OS isolation on one server.** All Bots still run as one Unix account. A Bot's shell can read another user's folder on disk; only the approval policy (in `ask` mode) and the API stand in the way. Next: per-user Unix accounts, or one container per user.
 - **Harness logins on disk.** `claude login`, `codex login` and the like write to the service account's HOME, so they're shared. Per-user API keys (secrets) are the isolated path today.
 - **Per-user screens.** Screens are per Bot and gated by ACL; the X displays share one account.
-- **The machine agent.** Enrollment, mutual TLS and the run protocol behind `MachineLink`, then moving each user's folders, memory and logins onto their machine (#29).
+- **The machine agent.** Enrollment and mutual TLS are done ([ADR 0031](0031-machine-enrollment-mtls.md)); next, the run protocol behind `MachineLink`, then moving each user's folders, memory and logins onto their machine (#29).
 - **Shared team Bots.** They run on their owner's computer. A team-owned computer is a later decision.
 - **SCIM-05.** A disabled user's Bot can't use the API (its token can do nothing), but its routines still run; pausing or handing them over is open.
 - **Client UI** for `/api/me/secrets`; `botctl` and the API only for now.

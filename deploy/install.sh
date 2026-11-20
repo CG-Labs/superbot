@@ -315,6 +315,7 @@ build_botd() {
   sudo -u "$SUPERBOT_USER" -H bash -lc "cd '$repo_path' && . \"\$HOME/.cargo/env\" && cargo build --release"
   run install -m 0755 "$repo_path/target/release/botd" "$BIN_DIR/botd"
   run install -m 0755 "$repo_path/target/release/botctl" "$BIN_DIR/botctl"
+  run install -m 0755 "$repo_path/target/release/superbot-machine" "$BIN_DIR/superbot-machine"
 }
 
 releases_dir() { printf '%s.releases\n' "$1"; }
