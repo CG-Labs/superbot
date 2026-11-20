@@ -303,7 +303,9 @@ async fn main() {
     if let Some(e) = enrollment {
         let machine_listener = tokio::net::TcpListener::bind(e.listen).await.unwrap_or_else(|err| exit(format!("MACHINE_LISTEN {}: {err}", e.listen)));
         println!("Machines enroll at {} (listening on {}).", e.url, e.listen);
-        tokio::spawn(machines::enroll::serve(machine_listener, app.clone(), e));
+        // Bots on machines reach this API through the machine port, as if from loopback.
+        let api = machines::enroll::Api { router: router.clone(), host: format!("127.0.0.1:{port}") };
+        tokio::spawn(machines::enroll::serve(machine_listener, app.clone(), e, Some(api)));
     }
     println!("Harnesses on PATH: {}. Default: {}.", adapters::installed().join(", "), app.cfg.default_harness);
     println!("Screens: {}.", if app.screens.is_some() { "on" } else { "off (install Xvfb and openbox to turn them on)" });
@@ -382,7 +384,9 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/machine/resize", post(machines::resize))
         .route("/users/{key}/machine/enrollment", post(machines::enroll::issue_token))
         .route("/users/{key}/machine/certificates", delete(machines::enroll::revoke))
+        .route("/users/{key}/placement", get(machines::placement).put(machines::assign).delete(machines::unassign))
         .route("/machines", get(machines::list_all))
+        .route("/machines/placements", get(machines::placements))
         .route("/machines/reconcile", post(machines::reconcile_now))
         .route("/machine", get(machines::mine))
         .route("/sessions", get(users::list_sessions))
@@ -2234,6 +2238,12 @@ mod tests {
 
     /// `serve_app`, with Auth changed first (break-glass, session lifetimes).
     pub(super) async fn serve_app_with(tweak: impl FnOnce(&mut Auth)) -> (u16, AppState, String, BotKey) {
+        let (port, app, password, bot, _) = serve_app_and_router(tweak).await;
+        (port, app, password, bot)
+    }
+
+    /// `serve_app_with`, and the router it serves, for botd's machine port.
+    pub(super) async fn serve_app_and_router(tweak: impl FnOnce(&mut Auth)) -> (u16, AppState, String, BotKey, Router) {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let password = random_hex(16);
@@ -2251,10 +2261,11 @@ mod tests {
         let auth = Arc::new(auth);
         let bot = BotKey(auth.bot_key.clone(), Some(app.clone()));
         let r = router(app.clone(), auth);
+        let served = r.clone();
         tokio::spawn(async move {
-            axum::serve(listener, r.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+            axum::serve(listener, served.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
         });
-        (port, app, basic(&password), bot)
+        (port, app, basic(&password), bot, r)
     }
 
     pub(super) async fn call(port: u16, method: &str, path: &str, authorization: &str, body: &str) -> (u16, String) {

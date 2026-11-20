@@ -50,7 +50,7 @@ async fn serve(fw: Option<Settings>, timeout_ms: Option<i64>) -> Env {
     }
     let cp = Arc::new(cp);
     let (port, app, owner, _) = crate::tests::serve_app_with(move |a| a.machines = cp).await;
-    tokio::spawn(enroll::serve(machine_listener, app.clone(), e.clone()));
+    tokio::spawn(enroll::serve(machine_listener, app.clone(), e.clone(), None));
     let (_, admin) = user_with(port, &owner, "ops@example.com", "admin").await;
     Env {
         port,
@@ -406,6 +406,11 @@ async fn machines_that_dont_enroll_in_time_are_reported() {
         listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         token: Some(Zeroizing::new(token)),
         token_file: None,
+        home: crate::db::temp_path("agent-home"),
+        api_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+        botctl: std::path::PathBuf::from("/nonexistent/botctl"),
+        harness_path: "/usr/bin:/bin".into(),
+        max_jobs: 8,
     };
     agent::enroll(&cfg).await.unwrap();
     let row = env.app.db.machine(&mid).unwrap();

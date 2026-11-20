@@ -1,7 +1,10 @@
-//! The machine agent (`superbot-machine`, ADR 0031), a stub for now: it enrolls with
-//! the control plane, keeps its certificate fresh, and answers botd's heartbeat over
-//! mutual TLS. It turns jobs down (501) until machines run Bots. Shared by the binary
-//! and botd's tests, so it uses nothing of botd's but `pki` and `wire`.
+//! The machine agent (`superbot-machine`, ADR 0031, ADR 0036): it enrolls with the
+//! control plane, keeps its certificate fresh, and answers botd over mutual TLS: a
+//! heartbeat, and jobs, each one harness run for one of its user's Bots, streamed
+//! back as it happens. It knows nothing of harnesses: botd builds each command. Bots
+//! on the machine reach botd's API (approvals, `botctl`) through the agent's relay
+//! on loopback, which forwards over mutual TLS. Shared by the binary and botd's
+//! tests, so it uses nothing of botd's but `job`, `pki` and `wire`.
 //!
 //! Settings (cloud-init writes them to /etc/superbot/machine.env):
 //! - `SUPERBOT_CONTROL_URL`: botd's machine port, `https://<host>:<port>`.
@@ -11,25 +14,42 @@
 //! - `SUPERBOT_AGENT_LISTEN`: default 0.0.0.0:7443.
 //! - `STATE_DIRECTORY` (systemd) or `SUPERBOT_STATE_DIR`: where the key and
 //!   certificate live (default /var/lib/superbot-machine).
+//! - `SUPERBOT_HOME`: where Bots work (default `<state dir>/home`).
+//! - `SUPERBOT_AGENT_API`: the relay to botd's API, loopback (default 127.0.0.1:7444).
+//! - `SUPERBOT_HARNESS_PATH`: PATH for harnesses (default `<home>/.local/bin`, then
+//!   the system's). A harness counts as installed only if it resolves to a file
+//!   under the home or `PROGRAM_ROOTS`.
+//! - `SUPERBOT_MAX_JOBS`: jobs at once (default 8).
 
+use super::job;
 use super::pki::{self, Peer};
 use super::wire;
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::body::{Body, Bytes};
+use axum::extract::{DefaultBodyLimit, Path as UrlPath, RawQuery, Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use rustls::ServerConfig;
 use rustls::pki_types::CertificateDer;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+use tokio::sync::{mpsc, watch};
 use zeroize::Zeroizing;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// How often a job stream says it's alive while the harness is quiet.
+pub const PING_EVERY: Duration = Duration::from_secs(15);
+/// The largest request a Bot may send botd through the relay.
+pub const MAX_RELAY_BODY: usize = 32 << 20;
+/// Where the machine image installs botctl.
+pub const BOTCTL: &str = "/usr/local/bin/botctl";
 
 #[derive(Clone)]
 pub struct Config {
@@ -40,6 +60,33 @@ pub struct Config {
     pub listen: SocketAddr,
     pub token: Option<Zeroizing<String>>,
     pub token_file: Option<PathBuf>,
+    /// HOME for harnesses, holding everything Bots keep here.
+    pub home: PathBuf,
+    /// The relay to botd's API. Loopback: it's for Bots on this machine.
+    pub api_listen: SocketAddr,
+    pub botctl: PathBuf,
+    /// PATH for harnesses and what they run.
+    pub harness_path: String,
+    pub max_jobs: usize,
+}
+
+/// Where harnesses and botctl may live, besides the Bots' home: the system's program
+/// directories. A PATH entry elsewhere (say `/tmp`) isn't looked in.
+const PROGRAM_ROOTS: [&str; 6] = ["/usr", "/opt", "/bin", "/sbin", "/snap", "/nix"];
+
+/// Whether `p`, with symlinks resolved, is an executable file under one of `roots`.
+fn runnable(p: &Path, roots: &[PathBuf]) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(p) = p.canonicalize() else {
+        return false;
+    };
+    for root in roots {
+        if p.starts_with(root) {
+            return std::fs::metadata(&p)
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+        }
+    }
+    false
 }
 
 fn now_ms() -> i64 {
@@ -84,6 +131,30 @@ impl Config {
             .unwrap_or_else(|| "0.0.0.0:7443".into())
             .parse()
             .map_err(|_| "SUPERBOT_AGENT_LISTEN must be <ip>:<port>")?;
+        let api_listen: SocketAddr = var("SUPERBOT_AGENT_API")
+            .unwrap_or_else(|| "127.0.0.1:7444".into())
+            .parse()
+            .map_err(|_| "SUPERBOT_AGENT_API must be <ip>:<port>")?;
+        if !api_listen.ip().is_loopback() {
+            return Err("SUPERBOT_AGENT_API must be a loopback address".into());
+        }
+        let home = var("SUPERBOT_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| state_dir.join("home"));
+        if !home.is_absolute() {
+            return Err("SUPERBOT_HOME must be an absolute path".into());
+        }
+        let harness_path = var("SUPERBOT_HARNESS_PATH").unwrap_or_else(|| {
+            format!(
+                "{}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                home.display()
+            )
+        });
+        let max_jobs = var("SUPERBOT_MAX_JOBS")
+            .map(|v| v.parse().map_err(|_| "SUPERBOT_MAX_JOBS must be a number"))
+            .transpose()?
+            .unwrap_or(8)
+            .max(1);
         Ok(Config {
             control_url,
             machine_id,
@@ -92,7 +163,56 @@ impl Config {
             listen,
             token: var("SUPERBOT_ENROLL_TOKEN").map(Zeroizing::new),
             token_file: var("SUPERBOT_ENROLL_TOKEN_FILE").map(PathBuf::from),
+            home,
+            api_listen,
+            botctl: BOTCTL.into(),
+            harness_path,
+            max_jobs,
         })
+    }
+
+    /// Where Bots work here, as botd is told.
+    pub fn layout(&self) -> wire::Layout {
+        let p = |p: PathBuf| p.display().to_string();
+        wire::Layout {
+            home: p(self.home.clone()),
+            workspace: p(self.home.join("work")),
+            bots: p(self.home.join("bots")),
+            user_file: p(self.home.join("USER.md")),
+            api: format!("http://{}", self.api_listen),
+            botctl: runnable(&self.botctl, &self.roots()).then(|| p(self.botctl.clone())),
+        }
+    }
+
+    /// `PROGRAM_ROOTS` and the home, canonicalized; those that don't exist are left out.
+    fn roots(&self) -> Vec<PathBuf> {
+        PROGRAM_ROOTS
+            .iter()
+            .map(Path::new)
+            .chain([self.home.as_path()])
+            .filter_map(|r| r.canonicalize().ok())
+            .collect()
+    }
+
+    /// The environment every job starts from; nothing of the agent's own.
+    fn host(&self) -> job::Host {
+        job::Host {
+            clear_env: true,
+            remove: Vec::new(),
+            env: BTreeMap::from([
+                ("HOME".to_string(), self.home.display().to_string()),
+                ("PATH".to_string(), self.harness_path.clone()),
+                ("LANG".to_string(), "C.UTF-8".to_string()),
+            ]),
+        }
+    }
+
+    /// Whether `bin` is an executable on the harness PATH, under `roots`.
+    fn has(&self, bin: &str) -> bool {
+        let roots = self.roots();
+        self.harness_path
+            .split(':')
+            .any(|dir| runnable(&Path::new(dir).join(bin), &roots))
     }
 
     fn ca(&self) -> CertificateDer<'static> {
@@ -380,19 +500,39 @@ pub async fn status(cfg: &Config, id: &Identity) -> Result<wire::MachineStatus, 
         .map_err(|_| transient("the control plane's answer wasn't a status".into()))
 }
 
-/// The running agent: its identity and the TLS settings made from it.
+/// The running agent: its identity, the TLS settings made from it, and its jobs.
 pub struct Agent {
     pub cfg: Config,
     current: RwLock<(Arc<Identity>, Arc<ServerConfig>)>,
+    /// Running jobs by id; sending true stops one.
+    jobs: Mutex<HashMap<String, watch::Sender<bool>>>,
 }
 
 impl Agent {
     pub fn new(cfg: Config, id: Identity) -> Result<Arc<Agent>, String> {
         let server = Arc::new(server_config(&cfg, &id)?);
+        for dir in [cfg.home.join("work"), cfg.home.join("bots")] {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&dir)
+                .map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
         Ok(Arc::new(Agent {
             cfg,
             current: RwLock::new((Arc::new(id), server)),
+            jobs: Mutex::default(),
         }))
+    }
+
+    fn jobs(&self) -> std::sync::MutexGuard<'_, HashMap<String, watch::Sender<bool>>> {
+        self.jobs.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Jobs running now.
+    pub fn running(&self) -> usize {
+        self.jobs().len()
     }
 
     pub fn identity(&self) -> Arc<Identity> {
@@ -439,14 +579,49 @@ fn server_config(cfg: &Config, id: &Identity) -> Result<ServerConfig, String> {
     pki::server_config(&cfg.ca(), chain, key, true)
 }
 
-pub fn admit(peer: &Peer) -> bool {
-    peer.cert
+pub fn admit(peer: &Peer) -> Option<Duration> {
+    let control_plane = peer
+        .cert
         .as_ref()
         .and_then(|c| pki::facts(c))
-        .is_some_and(|f| f.uris.iter().any(|u| u == pki::CONTROL_PLANE_URI))
+        .is_some_and(|f| f.uris.iter().any(|u| u == pki::CONTROL_PLANE_URI));
+    control_plane.then_some(pki::AUTHENTICATED_LIFETIME)
 }
 
-async fn heartbeat(State(a): State<Arc<Agent>>) -> Json<wire::Heartbeat> {
+fn refuse(code: StatusCode, error: impl Into<String>) -> Response {
+    (
+        code,
+        Json(wire::ErrorReply {
+            error: error.into(),
+        }),
+    )
+        .into_response()
+}
+
+/// A program name for PATH to find, never a path.
+fn plain_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        && s != "."
+        && s != ".."
+}
+
+/// `?bin=claude&bin=hermes`: the harnesses botd is about to run. Names this build
+/// doesn't know are missing without a look, so the query never makes a path.
+fn bins(query: Option<&str>) -> Vec<(String, Option<&'static str>)> {
+    query
+        .unwrap_or("")
+        .split('&')
+        .filter_map(|kv| kv.strip_prefix("bin="))
+        .filter(|b| plain_name(b))
+        .take(8)
+        .map(|b| (b.to_string(), wire::harness_bin(b)))
+        .collect()
+}
+
+async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<wire::Heartbeat> {
     let id = a.identity();
     Json(wire::Heartbeat {
         machine_id: id.machine_id.clone(),
@@ -454,23 +629,179 @@ async fn heartbeat(State(a): State<Arc<Agent>>) -> Json<wire::Heartbeat> {
         version: VERSION.into(),
         certificate: id.fingerprint.clone(),
         time: now_ms(),
+        protocol: wire::PROTOCOL,
+        layout: Some(a.cfg.layout()),
+        missing: bins(q.as_deref())
+            .into_iter()
+            .filter(|(_, known)| !known.is_some_and(|k| a.cfg.has(k)))
+            .map(|(b, _)| b)
+            .collect(),
+        jobs: a.running() as u32,
     })
 }
 
-async fn job(Json(_job): Json<wire::JobRequest>) -> Response {
+/// Whether `p` is an absolute path inside `home`, with no `..` to climb out.
+fn inside(home: &Path, p: &str) -> bool {
+    let p = Path::new(p);
+    p.is_absolute()
+        && p.starts_with(home)
+        && p.components()
+            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+}
+
+/// Why this machine won't run the job, if it won't.
+fn check(cfg: &Config, user_id: &str, j: &wire::JobRequest) -> Result<(), (StatusCode, String)> {
+    let bad = |m: String| Err((StatusCode::BAD_REQUEST, m));
+    if j.protocol != wire::PROTOCOL {
+        return bad(format!(
+            "This agent speaks job protocol {}, not {}. Update it.",
+            wire::PROTOCOL,
+            j.protocol
+        ));
+    }
+    // Its certificate names one user; it runs no one else's Bots, whatever botd says.
+    if j.owner_id != user_id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "This machine runs only its own user's Bots.".into(),
+        ));
+    }
+    if !plain_name(&j.job_id) || !plain_name(&j.bot_id) {
+        return bad("The job or Bot id isn't a plain name.".into());
+    }
+    if !plain_name(&j.bin) || j.cleanup.as_ref().is_some_and(|c| !plain_name(&c.bin)) {
+        return bad("Harnesses are named, not paths: this machine's PATH finds them.".into());
+    }
+    let mut paths: Vec<&str> = vec![&j.cwd];
+    paths.extend(j.files.iter().map(|f| f.path.as_str()));
+    paths.extend(j.collect.iter().map(String::as_str));
+    if let Some(c) = &j.cleanup {
+        paths.extend([c.when_exists.as_str(), c.cwd.as_str()]);
+    }
+    if let Some(p) = paths.into_iter().find(|p| !inside(&cfg.home, p)) {
+        return bad(format!("{p} isn't inside {}.", cfg.home.display()));
+    }
+    let Some(bin) = wire::harness_bin(&j.bin) else {
+        return bad(format!("{} isn't a harness this machine runs.", j.bin));
+    };
+    if let Some(c) = &j.cleanup
+        && wire::harness_bin(&c.bin).is_none()
+    {
+        return bad(format!("{} isn't a harness this machine runs.", c.bin));
+    }
+    if !cfg.has(bin) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{} isn't installed on this machine.", j.bin),
+        ));
+    }
+    Ok(())
+}
+
+/// The agent sets HOME and PATH; a job can't move them.
+fn scrub(env: &mut BTreeMap<String, String>) {
+    env.retain(|k, _| k != "HOME" && k != "PATH");
+}
+
+fn ndjson(e: &wire::JobEvent) -> Bytes {
+    let mut line = serde_json::to_vec(e).unwrap_or_default();
+    line.push(b'\n');
+    Bytes::from(line)
+}
+
+/// Ends a job's registration, and the job, however its stream ends.
+struct Running(Arc<Agent>, String, watch::Sender<bool>);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.2.send(true);
+        self.0.jobs().remove(&self.1);
+    }
+}
+
+/// `POST /v1/jobs`: runs the job and streams its events, one JSON object per line.
+/// A request it refuses gets an error status before anything runs.
+async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobRequest>) -> Response {
+    if let Err((code, msg)) = check(&a.cfg, &a.identity().user_id, &j) {
+        return refuse(code, msg);
+    }
+    scrub(&mut j.env);
+    if let Some(c) = j.cleanup.as_mut() {
+        scrub(&mut c.env);
+    }
+    let (stop_tx, mut stop_rx) = watch::channel(false);
+    {
+        let mut jobs = a.jobs();
+        if jobs.contains_key(&j.job_id) {
+            return refuse(StatusCode::CONFLICT, "That job is already running.");
+        }
+        if jobs.len() >= a.cfg.max_jobs {
+            return refuse(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("This machine is already running {} jobs.", jobs.len()),
+            );
+        }
+        jobs.insert(j.job_id.clone(), stop_tx.clone());
+    }
+    let running = Running(a.clone(), j.job_id.clone(), stop_tx);
+    for dir in [a.cfg.home.join("work"), a.cfg.home.join("bots")] {
+        let _ = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir);
+    }
+    let (ev_tx, mut ev_rx) = mpsc::channel::<wire::JobEvent>(256);
+    let host = a.cfg.host();
+    tokio::spawn(async move {
+        let abort = async move {
+            let _ = stop_rx.wait_for(|s| *s).await;
+        };
+        job::run(&host, &j, abort, &ev_tx).await;
+    });
+    let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    tokio::spawn(async move {
+        // Held until the stream ends: dropping it stops the job.
+        let _running = running;
+        loop {
+            let next = tokio::time::timeout(PING_EVERY, ev_rx.recv()).await;
+            let line = match next {
+                Ok(Some(e)) => ndjson(&e),
+                Ok(None) => break,
+                Err(_) => ndjson(&wire::JobEvent::Ping),
+            };
+            if body_tx.send(Ok(line)).await.is_err() {
+                break;
+            }
+        }
+    });
     (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(wire::ErrorReply {
-            error: "This machine's agent can't run Bots yet.".into(),
-        }),
+        [(header::CONTENT_TYPE, "application/x-ndjson")],
+        Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(body_rx)),
     )
         .into_response()
+}
+
+/// `POST /v1/jobs/{id}/abort`: stops a job; its stream ends with its exit.
+async fn abort_job(
+    State(a): State<Arc<Agent>>,
+    UrlPath(id): UrlPath<String>,
+    Json(_why): Json<wire::AbortRequest>,
+) -> Response {
+    match a.jobs().get(&id) {
+        Some(stop) => {
+            let _ = stop.send(true);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        None => refuse(StatusCode::NOT_FOUND, "No such job is running."),
+    }
 }
 
 pub fn router(a: Arc<Agent>) -> Router {
     Router::new()
         .route("/v1/heartbeat", get(heartbeat))
-        .route("/v1/jobs", post(job))
+        .route("/v1/jobs", post(start_job))
+        .route("/v1/jobs/{id}/abort", post(abort_job))
+        .layer(DefaultBodyLimit::max(MAX_RELAY_BODY))
         .with_state(a)
 }
 
@@ -478,6 +809,90 @@ pub async fn serve(listener: tokio::net::TcpListener, a: Arc<Agent>) {
     let tls_agent = a.clone();
     let tls: pki::Tls = Arc::new(move || tls_agent.current.read().unwrap().1.clone());
     pki::serve(listener, tls, router(a), admit).await
+}
+
+/// For the relay: no overall timeout, since an approval can wait a day.
+fn relay_client(cfg: &Config, id: &Identity) -> Result<reqwest::Client, String> {
+    let config = pki::client_config(&cfg.ca(), Some(id.chain()))?;
+    reqwest::Client::builder()
+        .tls_backend_preconfigured(config)
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// Headers a Bot's call carries to botd; nothing else crosses.
+const RELAYED: [header::HeaderName; 4] = [
+    header::AUTHORIZATION,
+    header::CONTENT_TYPE,
+    header::ACCEPT,
+    header::USER_AGENT,
+];
+
+/// `/api/...` on loopback: sends a Bot's call to botd over mutual TLS, as
+/// `/v1/machines/<id>/api/...`, and its answer back. botd checks the Bot's token.
+async fn relay(State(a): State<Arc<Agent>>, req: Request) -> Response {
+    let Some(rest) = req.uri().path().strip_prefix("/api/") else {
+        return refuse(StatusCode::NOT_FOUND, "Only /api/ is relayed.");
+    };
+    let mut url = format!(
+        "{}/v1/machines/{}/api/{rest}",
+        a.cfg.control_url, a.cfg.machine_id
+    );
+    if let Some(q) = req.uri().query() {
+        url = format!("{url}?{q}");
+    }
+    let method = req.method().clone();
+    let mut headers = HeaderMap::new();
+    for h in RELAYED {
+        if let Some(v) = req.headers().get(&h) {
+            headers.insert(h, v.clone());
+        }
+    }
+    let body = match axum::body::to_bytes(req.into_body(), MAX_RELAY_BODY).await {
+        Ok(b) => b,
+        Err(_) => return refuse(StatusCode::PAYLOAD_TOO_LARGE, "That request is too big."),
+    };
+    let client = match relay_client(&a.cfg, &a.identity()) {
+        Ok(c) => c,
+        Err(e) => return refuse(StatusCode::BAD_GATEWAY, e),
+    };
+    let r = client
+        .request(method, url)
+        .headers(headers)
+        .body(body)
+        .send()
+        .await;
+    match r {
+        Ok(r) => {
+            let mut res = Response::builder().status(r.status());
+            if let Some(t) = r.headers().get(header::CONTENT_TYPE) {
+                res = res.header(header::CONTENT_TYPE, t.clone());
+            }
+            let body = match r.bytes().await {
+                Ok(b) => b,
+                Err(e) => return refuse(StatusCode::BAD_GATEWAY, e.without_url().to_string()),
+            };
+            res.body(Body::from(body))
+                .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+        }
+        Err(e) => refuse(
+            StatusCode::BAD_GATEWAY,
+            format!("Couldn't reach botd: {}", e.without_url()),
+        ),
+    }
+}
+
+pub fn relay_router(a: Arc<Agent>) -> Router {
+    Router::new()
+        .route("/api/{*rest}", any(relay))
+        .layer(DefaultBodyLimit::max(MAX_RELAY_BODY))
+        .with_state(a)
+}
+
+/// Serves the relay on loopback, for Bots on this machine.
+pub async fn serve_relay(listener: tokio::net::TcpListener, a: Arc<Agent>) {
+    let _ = axum::serve(listener, relay_router(a)).await;
 }
 
 /// Enrolls if it must (retrying), then serves and rotates until stopped.
@@ -506,7 +921,12 @@ pub async fn run(cfg: Config) -> Result<(), String> {
         .await
         .map_err(|e| format!("{}: {e}", cfg.listen))?;
     println!("Answering the control plane on {}.", cfg.listen);
+    let relay = tokio::net::TcpListener::bind(cfg.api_listen)
+        .await
+        .map_err(|e| format!("{}: {e}", cfg.api_listen))?;
+    println!("Relaying Bots' calls to botd from {}.", cfg.api_listen);
     let agent = Agent::new(cfg, id)?;
+    tokio::spawn(serve_relay(relay, agent.clone()));
     let rotating = agent.clone();
     tokio::spawn(async move {
         // Checks at once, so a machine restarted near its certificate's end renews it

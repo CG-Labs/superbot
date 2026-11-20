@@ -379,6 +379,9 @@ pub struct Machine {
     /// When the reconciler found it hadn't enrolled by then. Cleared when it enrolls
     /// or gets a new token.
     pub enroll_overdue_at: Option<i64>,
+    /// When an admin assigned it to its user, so their Bots run on it (ADR 0036).
+    pub assigned_at: Option<i64>,
+    pub assigned_by: Option<String>,
 }
 
 /// A certificate the control plane issued a machine (ADR 0031). Looked up by
@@ -512,6 +515,8 @@ fn machine_row(r: &Row) -> rusqlite::Result<Machine> {
         firewall_id: r.get("firewall_id")?,
         enroll_by: r.get("enroll_by")?,
         enroll_overdue_at: r.get("enroll_overdue_at")?,
+        assigned_at: r.get("assigned_at")?,
+        assigned_by: r.get("assigned_by")?,
     })
 }
 
@@ -858,7 +863,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 13] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 14] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -872,6 +877,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 13] = [
     migrate_tiers,
     migrate_machine_enrollment,
     migrate_machine_lockdown,
+    migrate_machine_placement,
 ];
 /// Machines come up firewalled and enrolled (ADR 0035): the provider firewall each is
 /// behind, and when it must have enrolled by (and when it was found it hadn't).
@@ -889,6 +895,16 @@ fn migrate_machine_lockdown(c: &Connection, _fresh: bool) -> rusqlite::Result<()
         ALTER TABLE machines ADD COLUMN enroll_by INTEGER;
         ALTER TABLE machines ADD COLUMN enroll_overdue_at INTEGER;",
     )
+}
+/// Placement (ADR 0036): an admin assigns a user's machine to them, and then that
+/// user's Bots run there. Kept on the machine row, so a user can only be placed on
+/// their own machine, and destroying it ends the placement.
+fn migrate_machine_placement(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'assigned_at'", [], |r| r.get(0))?;
+    if !has {
+        c.execute_batch("ALTER TABLE machines ADD COLUMN assigned_at INTEGER; ALTER TABLE machines ADD COLUMN assigned_by TEXT;")?;
+    }
+    Ok(())
 }
 /// Machine enrollment (ADR 0031). Tokens are kept as SHA-256 hashes, bound to one
 /// machine, and used once. Certificates are kept by fingerprint, never with their keys
@@ -2865,6 +2881,48 @@ impl Db {
             Ok(fps) if refresh_enrollment(&tx, machine_id).is_ok() && tx.commit().is_ok() => fps,
             _ => Vec::new(),
         }
+    }
+
+    /// Places the machine's user on it: their Bots run there (ADR 0036). Only a live
+    /// machine. Returns whether it changed.
+    pub fn assign_machine(&self, machine_id: &str, by: Option<&str>) -> bool {
+        self.c()
+            .execute(
+                "UPDATE machines SET assigned_at = ?, assigned_by = ? WHERE id = ? AND assigned_at IS NULL AND state NOT IN ('destroying', 'destroyed')",
+                params![now(), by, machine_id],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Their Bots run where routing puts unassigned users again. Returns whether it changed.
+    pub fn unassign_machine(&self, machine_id: &str) -> bool {
+        self.c().execute("UPDATE machines SET assigned_at = NULL, assigned_by = NULL WHERE id = ? AND assigned_at IS NOT NULL", [machine_id]).unwrap_or(0) == 1
+    }
+
+    /// Forgets the harness sessions of the user's Bots: a session lives on the host
+    /// that ran it, so after a move the next run starts a new one. Returns how many.
+    pub fn forget_sessions_of(&self, owner_id: &str) -> usize {
+        self.c().execute("UPDATE bots SET session_id = NULL WHERE owner_id = ? AND session_id IS NOT NULL", [owner_id]).unwrap_or(0)
+    }
+
+    /// When the owner's machine was assigned (None: it isn't). A run reads this as it
+    /// starts and passes it to `keep_session`.
+    pub fn placed_at(&self, owner_id: &str) -> Option<i64> {
+        self.user_machine(owner_id).and_then(|m| m.assigned_at)
+    }
+
+    /// Saves a run's session unless the owner was assigned or unassigned since the run
+    /// began (`placed_at` then), so a run on the old host can't undo `forget_sessions_of`.
+    pub fn keep_session(&self, bot_id: &str, session_id: &str, placed_at: Option<i64>) -> bool {
+        self.c()
+            .execute(
+                "UPDATE bots SET session_id = ?1 WHERE id = ?2 AND session_id IS NOT ?1
+                 AND (SELECT assigned_at FROM machines WHERE user_id = bots.owner_id AND state <> 'destroyed') IS ?3",
+                params![session_id, bot_id, placed_at],
+            )
+            .unwrap_or(0)
+            == 1
     }
 
     /// Records a heartbeat: `Ok(version)` when the agent answered, `Err(why)` when not.

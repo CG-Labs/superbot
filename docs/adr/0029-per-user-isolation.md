@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. First slice of [#30](https://github.com/CG-Labs/superbot/issues/30) (M3). It follows the owner's decision of 19 Nov 2026 ([roadmap](../ROADMAP.md#decisions-19-nov-2026), decision 1): one computer per **user**, not per Bot; a user's Bots share it. It builds on [ADR 0017](0017-bot-acls.md) (Bot owners and ACLs), [ADR 0010](0010-secrets.md) (secrets), [ADR 0012](0012-users-sessions-rbac.md) (roles), [ADR 0019](0019-audit-actors.md) (audit actors) and [ADR 0025](0025-control-plane-linode.md) (one machine per user). It fixes AUTH-07 in the [auth review](../security/auth-review-2026-11.md).
+Accepted. First slice of [#30](https://github.com/CG-Labs/superbot/issues/30) (M3). It follows the owner's decision of 19 Nov 2026 ([roadmap](../ROADMAP.md#decisions-19-nov-2026), decision 1): one computer per **user**, not per Bot; a user's Bots share it. It builds on [ADR 0017](0017-bot-acls.md) (Bot owners and ACLs), [ADR 0010](0010-secrets.md) (secrets), [ADR 0012](0012-users-sessions-rbac.md) (roles), [ADR 0019](0019-audit-actors.md) (audit actors) and [ADR 0025](0025-control-plane-linode.md) (one machine per user). It fixes AUTH-07 in the [auth review](../security/auth-review-2026-11.md). Routing modes, machine assignment and running Bots on the machine: [ADR 0036](0036-bots-on-the-users-machine.md).
 
 ## Context
 
