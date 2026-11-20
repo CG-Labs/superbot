@@ -26,7 +26,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::ffi::{CString, OsStr, OsString};
 use std::io::Read;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -162,11 +165,88 @@ fn sha_reader(mut r: impl Read) -> std::io::Result<String> {
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Where a listed file is on this server: a folder, the names below it, and the file's
+/// identity when it was listed. It is opened again only through those names, never
+/// following a link, and only if it is still that file.
+#[derive(Clone, Debug)]
+pub struct Source {
+    base: PathBuf,
+    rel: Vec<OsString>,
+    dev: u64,
+    ino: u64,
+}
+
 /// What a copy sends: each file's entry and where it is on this server.
 #[derive(Debug, Default)]
 pub struct Listing {
-    pub files: Vec<(SyncFile, PathBuf)>,
+    pub files: Vec<(SyncFile, Source)>,
     pub skipped: u64,
+}
+
+const DIR: libc::c_int = libc::O_RDONLY | libc::O_DIRECTORY;
+/// Non-blocking, so a FIFO swapped in can't stall the copy.
+const FILE: libc::c_int = libc::O_RDONLY | libc::O_NONBLOCK;
+
+/// `name` in `dir` (or a path, with no `dir`), never through a link at its last part.
+fn open_at(dir: Option<&OwnedFd>, name: &OsStr, flags: libc::c_int) -> std::io::Result<OwnedFd> {
+    let c = CString::new(name.as_bytes()).map_err(std::io::Error::other)?;
+    let at = dir.map_or(libc::AT_FDCWD, |d| d.as_raw_fd());
+    // SAFETY: a valid C string and descriptor; the result is owned below.
+    let fd = unsafe { libc::openat(at, c.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat just returned this descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// `base`, then each of `rel` inside the last, with no link anywhere below `base`.
+fn open_beneath(base: &Path, rel: &[OsString], last: libc::c_int) -> std::io::Result<OwnedFd> {
+    let mut at = open_at(None, base.as_os_str(), if rel.is_empty() { last } else { DIR })?;
+    for (i, part) in rel.iter().enumerate() {
+        at = open_at(Some(&at), part, if i + 1 == rel.len() { last } else { DIR })?;
+    }
+    Ok(at)
+}
+
+/// The names in a folder.
+fn names(dir: &OwnedFd) -> std::io::Result<Vec<OsString>> {
+    // SAFETY: fdopendir takes the duplicate, closedir releases it.
+    unsafe {
+        let fd = libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let d = libc::fdopendir(fd);
+        if d.is_null() {
+            let e = std::io::Error::last_os_error();
+            libc::close(fd);
+            return Err(e);
+        }
+        let mut out = Vec::new();
+        loop {
+            let e = libc::readdir(d);
+            if e.is_null() {
+                break;
+            }
+            let name = std::ffi::CStr::from_ptr((*e).d_name.as_ptr()).to_bytes();
+            if name != b"." && name != b".." {
+                out.push(OsStr::from_bytes(name).to_os_string());
+            }
+        }
+        libc::closedir(d);
+        Ok(out)
+    }
+}
+
+/// What `name` in `dir` is, without following a link.
+fn kind_at(dir: &OwnedFd, name: &OsStr) -> Option<libc::mode_t> {
+    let c = CString::new(name.as_bytes()).ok()?;
+    // SAFETY: a valid descriptor, C string and stat buffer.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        (libc::fstatat(dir.as_raw_fd(), c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) == 0).then_some(st.st_mode & libc::S_IFMT)
+    }
 }
 
 impl Listing {
@@ -174,13 +254,10 @@ impl Listing {
         self.files.iter().map(|(f, _)| f.size).sum()
     }
 
-    fn add(&mut self, path: String, on_disk: PathBuf, seed: bool, max_bytes: u64) -> Result<(), Failed> {
-        use std::os::unix::fs::PermissionsExt;
-        let opened = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags_nofollow()
-            .open(&on_disk)
-            .and_then(|f| Ok((f.metadata()?, f)));
+    /// Lists `rel` under `base` if it is a regular file, hashing what was opened.
+    fn add(&mut self, path: String, base: &Path, rel: Vec<OsString>, seed: bool, max_bytes: u64) -> Result<(), Failed> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let opened = open_beneath(base, &rel, FILE).map(std::fs::File::from).and_then(|f| Ok((f.metadata()?, f)));
         let Ok((meta, file)) = opened else {
             self.skipped += 1;
             return Ok(());
@@ -207,55 +284,57 @@ impl Listing {
                 exec: meta.permissions().mode() & 0o100 != 0,
                 seed,
             },
-            on_disk,
+            Source {
+                base: base.to_path_buf(),
+                rel,
+                dev: meta.dev(),
+                ino: meta.ino(),
+            },
         ));
         Ok(())
     }
 }
 
-trait NoFollow {
-    fn custom_flags_nofollow(&mut self) -> &mut Self;
-}
-
-impl NoFollow for std::fs::OpenOptions {
-    fn custom_flags_nofollow(&mut self) -> &mut Self {
-        use std::os::unix::fs::OpenOptionsExt;
-        self.custom_flags(libc::O_NOFOLLOW)
-    }
-}
-
-/// Every regular file under `root`, as `work/<path>`. Links are never followed.
+/// Every regular file under `root`, as `work/<path>`. Links are never followed, at
+/// `root` or below it.
 fn walk(root: &Path, out: &mut Listing, max_bytes: u64) -> Result<(), Failed> {
-    let mut dirs = vec![(root.to_path_buf(), String::from("work"))];
-    while let Some((dir, rel)) = dirs.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+    open_beneath(root, &[], DIR).map_err(|e| failed("no_folder", format!("The user's folder can't be opened: {e}")))?;
+    let mut dirs: Vec<(Vec<OsString>, String)> = vec![(Vec::new(), String::from("work"))];
+    while let Some((rel, shown)) = dirs.pop() {
+        let Ok(dir) = open_beneath(root, &rel, DIR) else {
             out.skipped += 1;
             continue;
         };
-        let mut entries: Vec<_> = entries.flatten().collect();
-        entries.sort_by_key(|e| e.file_name());
-        for entry in entries {
-            let Some(name) = entry.file_name().to_str().map(String::from) else {
+        let Ok(mut entries) = names(&dir) else {
+            out.skipped += 1;
+            continue;
+        };
+        entries.sort();
+        for name in entries {
+            let Some(path) = name.to_str().map(|n| format!("{shown}/{n}")) else {
                 out.skipped += 1;
                 continue;
             };
-            let path = format!("{rel}/{name}");
-            let Ok(kind) = entry.file_type() else {
-                out.skipped += 1;
-                continue;
-            };
-            if !wire::home_path(&path) {
-                out.skipped += 1;
-            } else if kind.is_dir() {
-                dirs.push((entry.path(), path));
-            } else if kind.is_file() {
-                out.add(path, entry.path(), false, max_bytes)?;
-            } else {
-                out.skipped += 1;
+            let mut below = rel.clone();
+            below.push(name.clone());
+            match kind_at(&dir, &name) {
+                _ if !wire::home_path(&path) => out.skipped += 1,
+                Some(libc::S_IFDIR) => dirs.push((below, path)),
+                Some(libc::S_IFREG) => out.add(path, root, below, false, max_bytes)?,
+                _ => out.skipped += 1,
             }
         }
     }
     Ok(())
+}
+
+/// A seed from botd's own data folder: `name` in its folder.
+fn seed(out: &mut Listing, path: String, file: Option<PathBuf>, max_bytes: u64) -> Result<(), Failed> {
+    let Some((dir, name)) = file.as_deref().and_then(|f| Some((f.parent()?, f.file_name()?))) else { return Ok(()) };
+    if open_beneath(dir, &[name.to_os_string()], FILE).is_err() {
+        return Ok(());
+    }
+    out.add(path, dir, vec![name.to_os_string()], true, max_bytes)
 }
 
 /// The user's folder, facts and Bots' memory, as a copy sends them.
@@ -263,30 +342,46 @@ pub fn list(app: &App, user_id: &str, max_bytes: u64) -> Result<Listing, Failed>
     let root = app.workspace_for(user_id).ok_or_else(|| failed("no_folder", "The user has no folder on this server."))?;
     let mut out = Listing::default();
     walk(&root, &mut out, max_bytes)?;
-    if let Some(p) = app.data_user_file(user_id).filter(|p| p.is_file()) {
-        out.add("USER.md".into(), p, true, max_bytes)?;
-    }
+    seed(&mut out, "USER.md".into(), app.data_user_file(user_id), max_bytes)?;
     for bot in app.db.bots().into_iter().filter(|b| b.owner_id == user_id) {
         let path = format!("bots/{}/MEMORY.md", bot.id);
-        if let Some(p) = app.data_memory_file(&bot.id).filter(|p| p.is_file() && wire::home_path(&path)) {
-            out.add(path, p, true, max_bytes)?;
+        if wire::home_path(&path) {
+            seed(&mut out, path, app.data_memory_file(&bot.id), max_bytes)?;
         }
     }
     Ok(out)
 }
 
-/// Sends one content from `have` on, chunk by chunk. A chunk the agent refuses for its
-/// offset is sent again from where the agent says it is.
-async fn send(client: &reqwest::Client, url: &str, file: &Path, mut have: u64, size: u64, sent: &mut u64) -> Result<(), Failed> {
+/// Opens a listed file again, if it is still the file that was listed.
+fn reopen(src: &Source) -> Result<std::fs::File, Failed> {
+    use std::os::unix::fs::MetadataExt;
+    let shown = || src.base.join(src.rel.iter().collect::<PathBuf>()).display().to_string();
+    let f = open_beneath(&src.base, &src.rel, FILE)
+        .map(std::fs::File::from)
+        .map_err(|e| failed("source_changed", format!("{}: {e}", shown())))?;
+    let meta = f.metadata().map_err(|e| failed("source_changed", e.to_string()))?;
+    if !meta.is_file() || meta.dev() != src.dev || meta.ino() != src.ino {
+        return Err(failed("source_changed", format!("{} was replaced while it was being copied.", shown())));
+    }
+    Ok(f)
+}
+
+/// Sends one content from `have` on, chunk by chunk, until the agent has it whole (an
+/// empty one, or one it holds all of, takes one empty chunk). A chunk the agent refuses
+/// for its offset is sent again from where the agent says it is.
+async fn send(client: &reqwest::Client, url: &str, src: &Source, mut have: u64, size: u64, sent: &mut u64) -> Result<(), Failed> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    let mut f = tokio::fs::File::open(file).await.map_err(|e| failed("source_changed", format!("{}: {e}", file.display())))?;
+    let mut f = tokio::fs::File::from_std(reopen(src)?);
     let mut tries = 0;
-    while have < size {
+    loop {
+        if have > size {
+            return Err(failed("agent_error", "Its agent holds more of a file than the file has."));
+        }
         f.seek(std::io::SeekFrom::Start(have)).await.map_err(|e| failed("source_changed", e.to_string()))?;
         let mut chunk = vec![0u8; CHUNK.min((size - have) as usize)];
         f.read_exact(&mut chunk)
             .await
-            .map_err(|_| failed("source_changed", format!("{} changed while it was being copied.", file.display())))?;
+            .map_err(|_| failed("source_changed", "A file changed while it was being copied."))?;
         let n = chunk.len() as u64;
         let r = client
             .put(format!("{url}?offset={have}"))
@@ -300,23 +395,25 @@ async fn send(client: &reqwest::Client, url: &str, file: &Path, mut have: u64, s
             200 => {
                 let b: BlobReply = serde_json::from_value(reply).map_err(|_| failed("agent_error", "Its agent's answer wasn't a chunk receipt."))?;
                 *sent += n;
-                have = b.have;
                 if b.done {
                     return Ok(());
                 }
+                if b.have <= have || b.have >= size {
+                    return Err(failed("agent_error", "Its agent didn't take a chunk."));
+                }
+                have = b.have;
             }
             409 if tries < 3 => {
                 tries += 1;
                 have = reply["have"].as_u64().ok_or_else(|| failed("agent_error", "Its agent refused a chunk."))?;
             }
-            422 => return Err(failed("source_changed", format!("{} changed while it was being copied.", file.display()))),
+            422 => return Err(failed("source_changed", "A file changed while it was being copied.")),
             _ => {
                 let why = reply["error"].as_str().unwrap_or("no reason given");
                 return Err(failed("agent_error", format!("Its agent refused a chunk ({code}): {why}")));
             }
         }
     }
-    Ok(())
 }
 
 /// One copy to `m`, start to end.
@@ -348,11 +445,11 @@ async fn copy(app: &AppState, e: &Enrollment, m: &Machine, max_bytes: u64, statu
     let reply = post(&client, e.agent_url(&address, "/v1/sync"), body).await?;
     let plan: SyncPlan = serde_json::from_value(reply).map_err(|_| failed("agent_error", "Its agent's answer wasn't a plan."))?;
     for need in &plan.need {
-        let Some((_, on_disk)) = listing.files.iter().find(|(f, _)| f.sha256 == need.sha256) else {
+        let Some((_, src)) = listing.files.iter().find(|(f, _)| f.sha256 == need.sha256) else {
             return Err(failed("agent_error", "Its agent asked for content that isn't in the folder."));
         };
         let url = e.agent_url(&address, &format!("/v1/sync/{}/blobs/{}", manifest.sync_id, need.sha256));
-        send(&client, &url, on_disk, need.have, need.size, &mut status.sent).await?;
+        send(&client, &url, src, need.have, need.size, &mut status.sent).await?;
     }
     let finishing = e.upload_client(pins, FINISH_SECS).map_err(|why| failed("offline", why))?;
     let reply = post(&finishing, e.agent_url(&address, &format!("/v1/sync/{}/finish", manifest.sync_id)), b"{}".to_vec()).await?;
@@ -546,5 +643,20 @@ mod tests {
         assert_eq!(l.files[0].0.sha256, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
         let mut small = Listing::default();
         assert_eq!(walk(&root, &mut small, 8).unwrap_err().reason, "too_big");
+
+        // Sent only if it is still the file listed, and never through a link.
+        assert!(reopen(&l.files[1].1).is_ok());
+        std::fs::remove_file(root.join("a.txt")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", root.join("a.txt")).unwrap();
+        assert_eq!(reopen(&l.files[0].1).unwrap_err().reason, "source_changed");
+        std::fs::write(root.join("a.new"), "hello").unwrap();
+        std::fs::rename(root.join("a.new"), root.join("a.txt")).unwrap();
+        assert_eq!(reopen(&l.files[0].1).unwrap_err().reason, "source_changed", "another file by the same name");
+        std::fs::rename(root.join("sub"), root.join("moved")).unwrap();
+        std::os::unix::fs::symlink(root.join("moved"), root.join("sub")).unwrap();
+        assert!(reopen(&l.files[1].1).is_err(), "a folder swapped for a link");
+        let linked = root.with_extension("link");
+        std::os::unix::fs::symlink(&root, &linked).unwrap();
+        assert_eq!(walk(&linked, &mut Listing::default(), 1 << 20).unwrap_err().reason, "no_folder");
     }
 }
