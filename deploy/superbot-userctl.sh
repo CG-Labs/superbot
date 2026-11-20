@@ -84,7 +84,7 @@ ensure() {
     uid=$(id -u "$account")
     [[ "$uid" != 0 ]] || die "$account has uid 0"
     [[ "$(getent passwd "$account" | cut -d: -f6)" == "$home" ]] || die "$account exists with another home; fix or remove it by hand"
-    if id -nG "$account" | tr ' ' '\n' | grep -qxF "$SERVICE_GROUP"; then
+    if grep -qxF "$SERVICE_GROUP" <<<"$(id -nG "$account" | tr ' ' '\n')"; then
       die "$account is in $SERVICE_GROUP; it must not be"
     fi
   else
