@@ -29,6 +29,32 @@ pub enum AgentEvent {
     /// The agent started using a tool.
     Tool { name: String, detail: String },
     Error(String),
+    /// Model tokens the harness says it used (ADR 0048). A run may report several, one
+    /// per model or turn; the runner adds them up. A harness that says nothing: unknown.
+    Usage(Usage),
+}
+
+/// Tokens one model used, as Anthropic and Hermes count them: `input` is the prompt
+/// tokens not read from or written to the cache, so all four add up to the total.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    /// As the harness named it. None: it didn't say.
+    pub model: Option<String>,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+impl Usage {
+    pub fn total(&self) -> u64 {
+        self.input.saturating_add(self.output).saturating_add(self.cache_read).saturating_add(self.cache_write)
+    }
+
+    /// A count from harness JSON: a whole number of tokens, else 0.
+    pub fn count(v: &Value) -> u64 {
+        v.as_u64().unwrap_or(0)
+    }
 }
 
 pub struct RunInput {

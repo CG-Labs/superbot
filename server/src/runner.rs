@@ -3,14 +3,14 @@
 
 use crate::accounts::{self, Isolation, RunAs};
 use crate::acl::{Access, SharedBots, Viewer, Visibility};
-use crate::adapters::{self, AbortReason, AgentEvent, Guard, RunInput};
+use crate::adapters::{self, AbortReason, AgentEvent, Guard, RunInput, Usage};
 use crate::audit::{Actor, ActorKind, Event, Outcome, Who};
-use crate::db::{Bot, BotPatch, Db, Message};
+use crate::db::{Bot, BotPatch, Db, Message, TokenRow};
 use crate::machines::ControlPlane;
 use crate::machines::route::{self, Assigned, Refusal, Target};
 use crate::machines::wire::{self, JobEvent};
 use crate::tiers::{self, Route, Tier, Tiers};
-use crate::{isolation, paths};
+use crate::{isolation, paths, usage};
 use crate::policy::{Ctx, Mode};
 use crate::screen::{self, Screens};
 use serde_json::{json, Value};
@@ -115,6 +115,8 @@ pub struct App {
     /// ROUTINES_ON_ENABLE=resume (ADR 0047): re-enabling a user resumes the routines
     /// paused when they were disabled. Unset: they stay paused until an admin resumes them.
     pub resume_routines_on_enable: OnceLock<bool>,
+    /// STRIPE_METER_EVENT (ADR 0048): reports each run's tokens to a Stripe meter. Unset: off.
+    pub meter: OnceLock<Arc<crate::billing::Meter>>,
     closing: AtomicBool,
 }
 
@@ -139,6 +141,7 @@ impl App {
             shared_bots: OnceLock::new(),
             askers: Mutex::default(),
             resume_routines_on_enable: OnceLock::new(),
+            meter: OnceLock::new(),
             closing: AtomicBool::new(false),
         })
     }
@@ -211,6 +214,13 @@ impl App {
     pub fn tiers(&self) -> &Tiers {
         static SELF_HOST: OnceLock<Tiers> = OnceLock::new();
         self.tiers.get().map_or_else(|| SELF_HOST.get_or_init(Tiers::self_host), |t| t.as_ref())
+    }
+
+    /// The billing period `at` (Unix ms) falls in for a user (ADR 0048): their paid
+    /// subscription's month, else the calendar month.
+    pub fn billing_period(&self, user_id: &str, at: i64) -> usage::Period {
+        let sub = self.db.subscription(user_id).filter(|s| s.tier.is_some());
+        usage::period_at(sub.map(|s| (s.period_start, s.period_end)), at)
     }
 
     /// The tier a user is on: theirs, else the default.
@@ -590,13 +600,13 @@ impl App {
         if for_other.is_some() {
             bot.session_id = None;
         }
-        let period = tiers::period(crate::db::now());
+        let period = self.billing_period(&bot.owner_id, crate::db::now());
         let Some((tier, route)) = self.tier_route(&bot, msg, &by, &period) else { return };
         let placed_at = self.db.placed_at(&bot.owner_id);
-        let Some(place) = self.place(&bot, msg, &by, &period, bin, for_other.as_deref()).await else { return };
+        let Some(place) = self.place(&bot, msg, &by, &period.key, bin, for_other.as_deref()).await else { return };
         // The owner's own machine runs only their Bots, so only runs here need their account.
         let run_as = match place {
-            Place::Here => match self.isolate(&bot, msg, &by, &period).await {
+            Place::Here => match self.isolate(&bot, msg, &by, &period.key).await {
                 Ok(r) => r,
                 Err(()) => return,
             },
@@ -621,6 +631,9 @@ impl App {
             _ => msg.text.clone(),
         };
         let host = json!({ "host": if spot.machine.is_some() { "machine" } else { "server" }, "machine": spot.machine.as_ref().map(|m| &m.machine_id) });
+        let run_id = format!("r{}", crate::random_hex(8));
+        // Tokens every attempt reported: a retried attempt spent them too.
+        let mut used: Vec<Usage> = Vec::new();
 
         for attempt in 0..2 {
             let (abort_tx, abort_rx) = watch::channel(None);
@@ -659,7 +672,7 @@ impl App {
             let mut invoked = json!({
                 "harness": bot.harness, "model": route.model, "effort": route.effort, "provider": route.provider, "tier": tier, "policy": policy.mode,
                 "guarded": guard.is_some(), "resumed": bot.session_id.is_some(), "attempt": attempt + 1,
-                "trigger": msg.role, "messageId": msg.id,
+                "trigger": msg.role, "messageId": msg.id, "runId": run_id,
             });
             merge(&mut invoked, &host);
             if let Some(r) = &run_as {
@@ -721,6 +734,7 @@ impl App {
                     self.send(json!({ "type": "status", "botId": id, "working": true, "status": status }));
                 }
                 AgentEvent::Error(m) => errors.push(m),
+                AgentEvent::Usage(u) => used.push(u),
             };
             let adapter = adapters::get(&bot.harness).unwrap();
             match &spot.machine {
@@ -769,9 +783,10 @@ impl App {
                 _ if !errors.is_empty() => ("error", Outcome::Failure),
                 _ => ("done", Outcome::Success),
             };
+            let tokens = self.record_tokens(&bot, msg, &run_id, &route, &period, std::mem::take(&mut used));
             let mut finished = json!({
                 "result": result, "durationMs": started.elapsed().as_millis() as u64, "replies": replies,
-                "attempts": attempt + 1, "trigger": msg.role, "messageId": msg.id,
+                "attempts": attempt + 1, "trigger": msg.role, "messageId": msg.id, "runId": run_id, "usage": tokens,
             });
             merge(&mut finished, &host);
             self.db.record(&by.event("bot.run_finished").target("message", &msg.id.to_string()).bot(&bot.id).outcome(outcome).details(finished));
@@ -1011,25 +1026,106 @@ impl App {
 
     /// The tier this run is on and the route it takes: the Bot owner's tier picks the
     /// model, never the Bot's settings alone (ADR 0033). The run is counted for the
-    /// owner, within the tier's monthly limit. None: refused, and the Bot said why.
-    fn tier_route(&self, bot: &Bot, msg: &Message, by: &Who, period: &str) -> Option<(String, Route)> {
+    /// owner, within the tier's runs and tokens a billing period (ADR 0048). None:
+    /// refused, and the Bot said why.
+    fn tier_route(&self, bot: &Bot, msg: &Message, by: &Who, period: &usage::Period) -> Option<(String, Route)> {
         let tier = self.tier_of(&bot.owner_id);
-        let refused = |reason: &str, text: String, limit: Option<u32>| {
+        let refused = |reason: &str, text: String, limit: Option<u64>, used: Option<u64>| {
             self.give_back_routine(bot, msg);
-            let details = json!({ "reason": reason, "owner": bot.owner_id, "tier": tier.name, "limit": limit, "period": period, "messageId": msg.id });
+            let mut details = json!({ "reason": reason, "owner": bot.owner_id, "tier": tier.name, "limit": limit, "period": period.key, "messageId": msg.id });
+            if let Some(n) = used {
+                details["used"] = json!(n);
+                details["periodEnd"] = json!(period.end);
+            }
             self.db.record(&by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied).details(details));
-            self.say(&bot.id, &text, true);
+            // A routine keeps firing into a used-up period; one bubble says it.
+            if used.is_none() || self.db.last_message(&bot.id).is_none_or(|m| m.text != text) {
+                self.say(&bot.id, &text, true);
+            }
             None
         };
         let route = match tier.route(&bot.harness, bot.model.as_deref(), bot.effort.as_deref()) {
             Ok(r) => r,
-            Err(e) => return refused("tier_harness", format!("{e} Switch me to one of those in my settings."), None),
+            Err(e) => return refused("tier_harness", format!("{e} Switch me to one of those in my settings."), None, None),
         };
-        if let Err(limit) = self.db.take_run(&bot.owner_id, period, tier.limits.monthly_runs) {
-            let text = format!("The {} plan allows {limit} runs a month, and this month's are used up. More start on the 1st (UTC).", tier.label);
-            return refused("tier_limit", text, Some(limit));
+        let (this, more) = match period.source {
+            usage::Source::Calendar => ("month", "the 1st (UTC)".to_string()),
+            usage::Source::Subscription => ("billing period", format!("{} (UTC)", period.end_day())),
+        };
+        if let Some(limit) = tier.limits.monthly_tokens {
+            let used = self.db.tokens_used(&bot.owner_id, period.start, period.end);
+            if used >= limit {
+                let text = format!(
+                    "The {} plan allows {} model tokens a {this}, and this {this}'s are used up. More start on {more}.",
+                    tier.label,
+                    usage::thousands(limit)
+                );
+                return refused("tier_token_limit", text, Some(limit), Some(used));
+            }
+        }
+        if let Err(limit) = self.db.take_run(&bot.owner_id, &period.key, tier.limits.monthly_runs) {
+            let text = format!("The {} plan allows {limit} runs a {this}, and this {this}'s are used up. More start on {more}.", tier.label);
+            return refused("tier_limit", text, Some(u64::from(limit)), None);
         }
         Some((tier.name.clone(), route))
+    }
+
+    /// Records the tokens a run used, one row per model, charged to the Bot's owner
+    /// (ADR 0048). A harness that reported nothing leaves one row saying so. Audits the
+    /// run that uses up the owner's tokens for the period. Returns the run's total, or
+    /// None when unknown.
+    fn record_tokens(&self, bot: &Bot, msg: &Message, run_id: &str, route: &Route, period: &usage::Period, used: Vec<Usage>) -> Option<u64> {
+        let mut models: Vec<Usage> = Vec::new();
+        for u in used {
+            let model = u.model.clone().or_else(|| route.model.clone());
+            match models.iter_mut().find(|m| m.model == model) {
+                Some(m) => {
+                    m.input = m.input.saturating_add(u.input);
+                    m.output = m.output.saturating_add(u.output);
+                    m.cache_read = m.cache_read.saturating_add(u.cache_read);
+                    m.cache_write = m.cache_write.saturating_add(u.cache_write);
+                }
+                None => models.push(Usage { model, ..u }),
+            }
+        }
+        let at = crate::db::now();
+        let total = models.iter().map(Usage::total).fold(0u64, u64::saturating_add);
+        let meter = self.meter.get().is_some() && self.db.customer_of(&bot.owner_id).is_some();
+        let row = |u: Usage, reported: bool| TokenRow {
+            user_id: bot.owner_id.clone(),
+            bot_id: bot.id.clone(),
+            run_id: run_id.into(),
+            message_id: Some(msg.id),
+            harness: bot.harness.clone(),
+            reported,
+            meter: meter && reported && u.total() > 0,
+            model: u.model,
+            input: u.input,
+            output: u.output,
+            cache_read: u.cache_read,
+            cache_write: u.cache_write,
+            at,
+        };
+        let reported = !models.is_empty();
+        let rows: Vec<TokenRow> = if reported {
+            models.into_iter().map(|u| row(u, true)).collect()
+        } else {
+            vec![row(Usage { model: route.model.clone(), ..Default::default() }, false)]
+        };
+        let tier = self.tier_of(&bot.owner_id);
+        let before = tier.limits.monthly_tokens.map(|_| self.db.tokens_used(&bot.owner_id, period.start, period.end));
+        if let Err(e) = self.db.record_tokens(&rows) {
+            eprintln!("botd: couldn't record run {run_id}'s tokens: {e}");
+        }
+        if let (Some(limit), Some(before)) = (tier.limits.monthly_tokens, before)
+            && before < limit
+            && before.saturating_add(total) >= limit
+        {
+            let by = Who { actor: Actor::system("billing").on_behalf_of(&bot.owner_id), source: Default::default() };
+            let details = json!({ "owner": bot.owner_id, "tier": tier.name, "limit": limit, "used": before.saturating_add(total), "period": period.key, "periodEnd": period.end, "runId": run_id });
+            self.db.record(&by.event("usage.token_limit_reached").target("user", &bot.owner_id).bot(&bot.id).details(details));
+        }
+        reported.then_some(total)
     }
 
     /// Gives back what a refused run took: its monthly run, and for a routine, the

@@ -15,30 +15,31 @@ use crate::tiers_http_tests::{fake_claude, run};
 use crate::users_http_tests::{parse, user_with};
 use crate::*;
 
-const SECRET: &str = "whsec_test_not_a_real_secret";
-const UPDATED: &str = include_str!("../tests/fixtures/stripe/customer.subscription.updated.json");
+pub(crate) const SECRET: &str = "whsec_test_not_a_real_secret";
+pub(crate) const UPDATED: &str = include_str!("../tests/fixtures/stripe/customer.subscription.updated.json");
 const DELETED: &str = include_str!("../tests/fixtures/stripe/customer.subscription.deleted.json");
 
-struct World {
-    port: u16,
-    app: AppState,
-    admin: String,
-    a_id: String,
-    a: String,
-    b_id: String,
-    b: String,
-    bots: crate::tests::BotKey,
+pub(crate) struct World {
+    pub port: u16,
+    pub app: AppState,
+    pub admin: String,
+    pub a_id: String,
+    pub a: String,
+    pub b_id: String,
+    pub b: String,
+    pub bots: crate::tests::BotKey,
 }
 
 /// A server on the example tiers (starter: 2 Bots, 3 runs a month, 2 routine runs a
 /// day, g6-standard-1 machines), the fake machine provider, Ada and Bea (members), and
 /// with `stripe`, the webhook on.
-async fn world(stripe: bool) -> World {
+pub(crate) async fn world(stripe: bool) -> World {
     world_with(stripe.then(|| Billing::with_secret(SECRET))).await
 }
 
-async fn world_with(payments: Option<Billing>) -> World {
+pub(crate) async fn world_with(payments: Option<Billing>) -> World {
     let p: Arc<dyn MachineProvider> = Arc::new(Fake::default());
+    let meter = payments.as_ref().and_then(Billing::meter);
     let (port, app, admin, bots) = serve_app_with(|a| {
         a.machines = Arc::new(ControlPlane::for_tests(p));
         if let Some(b) = payments {
@@ -47,25 +48,28 @@ async fn world_with(payments: Option<Billing>) -> World {
     })
     .await;
     app.tiers.set(Arc::new(Tiers::parse(EXAMPLE, None).unwrap())).unwrap();
+    if let Some(m) = meter {
+        let _ = app.meter.set(m);
+    }
     let (a_id, a) = user_with(port, &admin, "ada@example.com", "member").await;
     let (b_id, b) = user_with(port, &admin, "bea@example.com", "member").await;
     fake_claude(&app);
     World { port, app, admin, a_id, a, b_id, b, bots }
 }
 
-async fn audit(port: u16, admin: &str, q: &str) -> Vec<Value> {
+pub(crate) async fn audit(port: u16, admin: &str, q: &str) -> Vec<Value> {
     let (code, body) = call(port, "GET", &format!("/api/audit?{q}&limit=500"), admin, "").await;
     assert_eq!(code, 200, "{body}");
     audit_list(&body)
 }
 
-async fn set_tier(w: &World, user: &str, tier: Value) {
+pub(crate) async fn set_tier(w: &World, user: &str, tier: Value) {
     let (code, body) = call(w.port, "PATCH", &format!("/api/users/{user}"), &w.admin, &json!({ "tier": tier }).to_string()).await;
     assert_eq!(code, 200, "{body}");
 }
 
 /// Waits until `bot` has `n` replies after message `after`.
-async fn replies(app: &App, bot: &str, after: i64, n: usize) -> Vec<String> {
+pub(crate) async fn replies(app: &App, bot: &str, after: i64, n: usize) -> Vec<String> {
     for _ in 0..300 {
         let got = app.db.replies_after(bot, after);
         if got.len() >= n && !app.is_running(bot) {
@@ -338,7 +342,7 @@ async fn admins_see_everyones_use_against_their_limits() {
 }
 
 /// A fixture event with its user, id, creation time, and anything else changed.
-fn event(fixture: &str, user: &str, id: &str, created: i64, f: impl FnOnce(&mut Value)) -> String {
+pub(crate) fn event(fixture: &str, user: &str, id: &str, created: i64, f: impl FnOnce(&mut Value)) -> String {
     let mut v: Value = serde_json::from_str(&fixture.replace("{{USER_ID}}", user)).unwrap();
     v["id"] = json!(id);
     v["created"] = json!(created);
@@ -347,7 +351,7 @@ fn event(fixture: &str, user: &str, id: &str, created: i64, f: impl FnOnce(&mut 
 }
 
 /// Delivers `body` as Stripe does, signed now; `sign` may change the header.
-async fn deliver(port: u16, body: &str, header: Option<String>) -> (u16, Value) {
+pub(crate) async fn deliver(port: u16, body: &str, header: Option<String>) -> (u16, Value) {
     let header = header.unwrap_or_else(|| billing::sign(SECRET, body.as_bytes(), db::now() / 1000));
     let (code, _, res) = call_with(port, "POST", billing::PATH, "", &format!("Stripe-Signature: {header}\r\n"), body).await;
     (code, serde_json::from_str(&res).unwrap_or(Value::Null))
@@ -504,23 +508,23 @@ async fn signed_subscription_events_set_the_users_tier() {
 // Checkout, the customer portal, and customer links (ADR 0042). Stripe is a fake on
 // loopback: nothing here reaches Stripe, and the key is made up.
 
-const KEY: &str = "sk_test_not_a_real_key_for_tests";
-const PUBLIC: &str = "https://bots.example.com";
+pub(crate) const KEY: &str = "sk_test_not_a_real_key_for_tests";
+pub(crate) const PUBLIC: &str = "https://bots.example.com";
 const CHECKOUT_DONE: &str = include_str!("../tests/fixtures/stripe/checkout.session.completed.json");
 const CUSTOMER_DELETED: &str = include_str!("../tests/fixtures/stripe/customer.deleted.json");
 
 /// One request the fake Stripe got.
 #[derive(Clone, Debug)]
-struct Seen {
-    path: String,
-    auth: String,
-    key: String,
-    version: String,
-    form: Vec<(String, String)>,
+pub(crate) struct Seen {
+    pub path: String,
+    pub auth: String,
+    pub key: String,
+    pub version: String,
+    pub form: Vec<(String, String)>,
 }
 
 impl Seen {
-    fn get(&self, k: &str) -> Option<&str> {
+    pub fn get(&self, k: &str) -> Option<&str> {
         self.form.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str())
     }
 }
@@ -528,7 +532,7 @@ impl Seen {
 /// Stripe's API as far as botd uses it: answers from `replies` first, else a new
 /// session; like Stripe, a repeated idempotency key gets the first answer again.
 #[derive(Clone, Default)]
-struct FakeStripe {
+pub(crate) struct FakeStripe {
     seen: Arc<std::sync::Mutex<Vec<Seen>>>,
     replies: Arc<std::sync::Mutex<std::collections::VecDeque<(u16, Value)>>>,
     answered: Arc<std::sync::Mutex<HashMap<String, (u16, Value)>>>,
@@ -537,10 +541,10 @@ struct FakeStripe {
 }
 
 impl FakeStripe {
-    fn seen(&self) -> Vec<Seen> {
+    pub fn seen(&self) -> Vec<Seen> {
         self.seen.lock().unwrap().clone()
     }
-    fn reply(&self, status: u16, body: Value) {
+    pub fn reply(&self, status: u16, body: Value) {
         self.replies.lock().unwrap().push_back((status, body));
     }
     fn pay(&self, session: &str) {
@@ -551,7 +555,7 @@ impl FakeStripe {
     }
 }
 
-async fn fake_stripe() -> (String, FakeStripe) {
+pub(crate) async fn fake_stripe() -> (String, FakeStripe) {
     use axum::extract::{OriginalUri, State as S};
     async fn handle(S(f): S<FakeStripe>, OriginalUri(uri): OriginalUri, headers: axum::http::HeaderMap, body: axum::body::Bytes) -> (StatusCode, Json<Value>) {
         let h = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
@@ -566,6 +570,7 @@ async fn fake_stripe() -> (String, FakeStripe) {
         let session = seen.path.strip_prefix("/v1/checkout/sessions/").map(|r| r.trim_end_matches("/expire").to_string());
         let paid = session.as_ref().is_some_and(|id| f.paid.lock().unwrap().contains(id));
         let (code, v) = f.replies.lock().unwrap().pop_front().unwrap_or_else(|| match (seen.path.as_str(), session) {
+            ("/v1/billing/meter_events", _) => (200, json!({ "object": "billing.meter_event", "identifier": seen.get("identifier"), "event_name": seen.get("event_name") })),
             ("/v1/checkout/sessions", _) => (200, json!({ "id": format!("cs_test_{n}"), "object": "checkout.session", "url": format!("https://checkout.stripe.com/c/pay/cs_test_{n}") })),
             (p, Some(_)) if p.ends_with("/expire") && paid => (400, json!({ "error": { "type": "invalid_request_error", "message": "Only Checkout Sessions with a status of open can be expired." } })),
             (_, Some(id)) => (200, json!({ "id": id, "object": "checkout.session", "status": if paid { "complete" } else { "expired" } })),

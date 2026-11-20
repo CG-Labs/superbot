@@ -1,7 +1,7 @@
 //! Pi coding agent CLI: `pi --mode json`. Sessions are files in the Bot's own
 //! session dir, addressed by a fixed --session-id, so resuming is the same call.
 
-use super::{describe, new_uuid, output, str_of, Adapter, AgentEvent, ModelOption, RunInput};
+use super::{describe, new_uuid, output, str_of, Adapter, AgentEvent, ModelOption, RunInput, Usage};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -62,6 +62,18 @@ impl Adapter for Pi {
                         out.push(AgentEvent::Text(str_of(c, "text").into()));
                     }
                 }
+                // Each assistant message carries its own turn's counts, cache apart from input.
+                let u = &msg["usage"];
+                let usage = Usage {
+                    model: msg["model"].as_str().filter(|m| !m.is_empty()).map(String::from),
+                    input: Usage::count(&u["input"]),
+                    output: Usage::count(&u["output"]),
+                    cache_read: Usage::count(&u["cacheRead"]),
+                    cache_write: Usage::count(&u["cacheWrite"]),
+                };
+                if usage.total() > 0 {
+                    out.push(AgentEvent::Usage(usage));
+                }
                 if str_of(msg, "stopReason") == "error" {
                     out.push(AgentEvent::Error(msg["errorMessage"].as_str().unwrap_or("Pi failed").into()));
                 }
@@ -91,5 +103,23 @@ impl Adapter for Pi {
                 Some(ModelOption { label: id.clone(), id, efforts: if thinks { efforts.clone() } else { vec![] }, aliases: vec![] })
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokens_come_from_each_assistant_message() {
+        let mut out = Vec::new();
+        let line = r#"{"type":"message_end","message":{"role":"assistant","model":"gpt-5","content":[{"type":"text","text":"Hi"}],
+            "usage":{"input":50,"output":12,"cacheRead":800,"cacheWrite":0,"totalTokens":862},"stopReason":"stop"}}"#;
+        Pi.on_event(&serde_json::from_str(line).unwrap(), &mut out);
+        let usage: Vec<&Usage> = out.iter().filter_map(|e| if let AgentEvent::Usage(u) = e { Some(u) } else { None }).collect();
+        assert_eq!(usage, [&Usage { model: Some("gpt-5".into()), input: 50, output: 12, cache_read: 800, cache_write: 0 }]);
+        out.clear();
+        Pi.on_event(&serde_json::from_str(r#"{"type":"message_end","message":{"role":"user","usage":{"input":5}}}"#).unwrap(), &mut out);
+        assert!(out.is_empty(), "only the model's own messages");
     }
 }

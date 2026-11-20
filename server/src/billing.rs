@@ -6,7 +6,9 @@
 //! (`POST /api/billing/portal`) and hands back their links; it creates nothing else at
 //! Stripe. The tiers file maps Stripe price ids to tiers (`stripePrices`); a subscription
 //! names its user in its metadata (`superbot_user_id`, set by the checkout), or through
-//! its customer, linked to the user when their checkout completes.
+//! its customer, linked to the user when their checkout completes. With
+//! `STRIPE_METER_EVENT` too (off by default), botd reports each run's model tokens to
+//! that Stripe meter (ADR 0048); it never does without it.
 
 use crate::audit::{Actor, Outcome, Who};
 use crate::db::{Applied, Linked, Subscription};
@@ -57,7 +59,22 @@ pub struct Billing {
     refusals: crate::users::Limiter,
     /// Checkout and the customer portal (ADR 0042). None without `STRIPE_SECRET_KEY`.
     checkout: Option<Checkout>,
+    /// Token metering (ADR 0048). None without `STRIPE_METER_EVENT`: the default.
+    meter: Option<Arc<Meter>>,
 }
+
+/// Reports each run's tokens to a Stripe meter as meter events (ADR 0048).
+pub struct Meter {
+    stripe: Stripe,
+    /// The meter's event name at Stripe.
+    event: String,
+}
+
+/// Token rows sent to Stripe per pass.
+const METER_BATCH: u32 = 100;
+/// Passes a row may fail to reach Stripe before botd gives up on it.
+const METER_TRIES: i64 = 5;
+const METER_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// What botd needs to send people to Stripe's pages and back.
 pub struct Checkout {
@@ -74,6 +91,10 @@ impl Billing {
     /// checkout, the public address from `var` (see `public_url`).
     pub fn from_env(store: &dyn SecretStore, var: &dyn Fn(&str) -> String) -> Result<Billing, String> {
         let key = store.get("STRIPE_SECRET_KEY").map_err(|e| e.to_string())?.map(|k| k.expose().trim().to_string()).filter(|k| !k.is_empty());
+        let meter = meter_event(&var("STRIPE_METER_EVENT"))?;
+        if meter.is_some() && key.is_none() {
+            return Err("STRIPE_METER_EVENT needs STRIPE_SECRET_KEY, to send Stripe the meter events".into());
+        }
         let Some(s) = store.get("STRIPE_WEBHOOK_SECRET").map_err(|e| e.to_string())? else {
             return match key {
                 Some(_) => Err("STRIPE_SECRET_KEY needs STRIPE_WEBHOOK_SECRET too: without the webhook, a checkout would never change anyone's plan".into()),
@@ -93,12 +114,24 @@ impl Billing {
             crate::secrets::redact::register(&key);
             let public = public_url(var)?;
             b.checkout = Some(Checkout::new(&key, stripe::API, &public));
+            b.meter = meter.map(|event| Arc::new(Meter { stripe: Stripe::new(&key, stripe::API), event }));
         }
         Ok(b)
     }
 
     pub fn with_secret(secret: &str) -> Billing {
-        Billing { secret: Some(secret.into()), refusals: crate::users::Limiter::new(20, 60_000), checkout: None }
+        Billing { secret: Some(secret.into()), refusals: crate::users::Limiter::new(20, 60_000), checkout: None, meter: None }
+    }
+
+    /// `with_checkout`, reporting tokens to the meter `event` through the API at `api`.
+    #[cfg(test)]
+    pub fn with_metering(secret: &str, key: &str, api: &str, public_url: &str, event: &str) -> Billing {
+        Billing { meter: Some(Arc::new(Meter { stripe: Stripe::new(key, api), event: event.into() })), ..Billing::with_checkout(secret, key, api, public_url) }
+    }
+
+    /// The token meter, when `STRIPE_METER_EVENT` turned it on.
+    pub fn meter(&self) -> Option<Arc<Meter>> {
+        self.meter.clone()
     }
 
     /// `with_secret`, with checkout through the Stripe API at `api` (a fake, in tests).
@@ -150,15 +183,31 @@ pub fn public_url(var: &dyn Fn(&str) -> String) -> Result<String, String> {
     Ok(url)
 }
 
+/// `STRIPE_METER_EVENT`: the event name of the Stripe meter to report tokens to. Empty: off.
+pub fn meter_event(raw: &str) -> Result<Option<String>, String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    if name.len() > 100 || !name.chars().all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c)) {
+        return Err("STRIPE_METER_EVENT must be the event name of a Stripe meter (letters, digits, _ - and ., up to 100), like superbot_tokens".into());
+    }
+    Ok(Some(name.into()))
+}
+
 /// What startup prints. Takes only whether each part is on, so nothing secret can reach the log.
-pub fn describe(enabled: bool, checkout: bool, tiers: &crate::tiers::Tiers) -> String {
+pub fn describe(enabled: bool, checkout: bool, metering: bool, tiers: &crate::tiers::Tiers) -> String {
     if !enabled {
         return "off (set STRIPE_WEBHOOK_SECRET to take Stripe subscriptions)".into();
     }
+    let pages = match metering {
+        true => "; reporting run tokens to a Stripe meter",
+        false => "",
+    };
     let priced: Vec<String> = tiers.all().iter().filter(|t| !t.stripe_prices.is_empty()).map(|t| format!("{} ({})", t.name, t.stripe_prices.len())).collect();
     let pages = match checkout {
-        true => "; checkout and the customer portal on",
-        false => "; checkout off (set STRIPE_SECRET_KEY to sell plans in the app)",
+        true => format!("; checkout and the customer portal on{pages}"),
+        false => "; checkout off (set STRIPE_SECRET_KEY to sell plans in the app)".into(),
     };
     match priced.is_empty() {
         true => format!("Stripe webhook at {PATH}, but no tier lists stripePrices, so no subscription sets a tier{pages}"),
@@ -272,6 +321,7 @@ struct Sub<'a> {
     status: &'a str,
     user: Option<&'a str>,
     prices: Vec<&'a str>,
+    period_start: Option<i64>,
     period_end: Option<i64>,
     created: Option<i64>,
 }
@@ -284,6 +334,7 @@ fn read_sub(o: &Value) -> Option<Sub<'_>> {
         status: o["status"].as_str()?,
         user: o["metadata"][USER_KEY].as_str().map(str::trim).filter(|s| !s.is_empty()),
         prices: items.iter().filter_map(|i| i["price"]["id"].as_str()).collect(),
+        period_start: o["current_period_start"].as_i64().or_else(|| items.iter().find_map(|i| i["current_period_start"].as_i64())),
         period_end: o["current_period_end"].as_i64().or_else(|| items.iter().find_map(|i| i["current_period_end"].as_i64())),
         created: o["created"].as_i64(),
     })
@@ -356,6 +407,7 @@ fn subscription_event(app: &App, event_id: &str, kind: &str, event: &Value) -> R
         status: if kind == "customer.subscription.deleted" { "canceled".into() } else { sub.status.into() },
         price_id: priced.map(|(p, _)| p.to_string()).or_else(|| sub.prices.first().map(|p| p.to_string())),
         tier: tier.clone(),
+        period_start: sub.period_start,
         period_end: sub.period_end,
         started: sub.created.or(known.as_ref().map(|s| s.started)).unwrap_or(created),
         event_created: created,
@@ -673,6 +725,63 @@ pub async fn portal(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
             r
         }
     }
+}
+
+/// Sends the token rows waiting for Stripe's meter, oldest first, one meter event each
+/// (ADR 0048). The event's `identifier` and idempotency key are the row's own, so
+/// Stripe counts a resent row once. A row Stripe refuses, or that can't reach it after
+/// `METER_TRIES` passes, is marked failed and audited (`billing.meter_failed`); nothing
+/// is dropped silently. Returns how many went through.
+pub async fn send_meter_events(app: &App, m: &Meter) -> usize {
+    let mut sent = 0;
+    for row in app.db.pending_meter(METER_BATCH) {
+        let failed = |why: String| {
+            app.db.meter_result(row.id, Some("failed"));
+            let details = json!({ "runId": row.run_id, "usage": row.tokens, "attempts": row.attempts + 1, "error": why });
+            app.db.record(&system(Some(&row.user_id)).event("billing.meter_failed").target("user", &row.user_id).outcome(Outcome::Failure).details(details));
+        };
+        let Some(customer) = app.db.customer_of(&row.user_id) else {
+            failed("no Stripe customer".into());
+            continue;
+        };
+        let id = format!("superbot-{}-{}", row.run_id, row.id);
+        let form: Vec<(String, String)> = [
+            ("event_name", m.event.clone()),
+            ("payload[stripe_customer_id]", customer),
+            ("payload[value]", row.tokens.to_string()),
+            ("identifier", id.clone()),
+            ("timestamp", (row.at / 1000).to_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        match m.stripe.post("/v1/billing/meter_events", &form, &format!("{id}-meter")).await {
+            Ok(_) => {
+                app.db.meter_result(row.id, Some("sent"));
+                sent += 1;
+            }
+            Err(e @ stripe::Error::Refused { status, .. }) if status != 429 && status < 500 => failed(e.to_string()),
+            Err(e) if row.attempts + 1 >= METER_TRIES => failed(e.to_string()),
+            Err(e) => {
+                app.db.meter_result(row.id, None);
+                // Stripe is down or busy: try the rest next pass.
+                eprintln!("botd: Stripe meter: {e}; trying again in a minute");
+                break;
+            }
+        }
+    }
+    sent
+}
+
+/// Reports tokens to Stripe every minute, while `STRIPE_METER_EVENT` is set.
+pub fn start_metering(app: Arc<App>) {
+    let Some(m) = app.meter.get().cloned() else { return };
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(METER_EVERY).await;
+            send_meter_events(&app, &m).await;
+        }
+    });
 }
 
 #[cfg(test)]
