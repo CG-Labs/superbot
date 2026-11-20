@@ -584,7 +584,7 @@ fn copy_tree(src: &OwnedFd, dst: &OwnedFd, depth: usize) -> io::Result<()> {
                 let Ok(from) = open_at(src.as_raw_fd(), &name, libc::O_RDONLY | libc::O_NONBLOCK) else {
                     continue;
                 };
-                copy_file(from, dst, &name, mode)?;
+                copy_file(&from, dst, &name, mode)?;
             }
             libc::S_IFLNK => {
                 let mut buf = vec![0u8; libc::PATH_MAX as usize];
@@ -604,9 +604,10 @@ fn copy_tree(src: &OwnedFd, dst: &OwnedFd, depth: usize) -> io::Result<()> {
     Ok(())
 }
 
-/// Copies the open regular file `s` to a new file `to` in `dst` with `mode`.
-fn copy_file(s: OwnedFd, dst: &OwnedFd, to: &CStr, mode: u32) -> io::Result<()> {
-    if fstat(&s)?.st_mode & libc::S_IFMT != libc::S_IFREG {
+/// Copies the open regular file `s` to a new file `to` in `dst` with `mode`. A name
+/// that's taken is `AlreadyExists`, and left alone; a copy that fails partway is deleted.
+fn copy_file(s: &OwnedFd, dst: &OwnedFd, to: &CStr, mode: u32) -> io::Result<()> {
+    if fstat(s)?.st_mode & libc::S_IFMT != libc::S_IFREG {
         return Ok(());
     }
     // SAFETY: an open descriptor and a C string; the descriptor is owned on success.
@@ -619,11 +620,18 @@ fn copy_file(s: OwnedFd, dst: &OwnedFd, to: &CStr, mode: u32) -> io::Result<()> 
         )
     };
     let d = last(fd, ()).map(|()| unsafe { OwnedFd::from_raw_fd(fd) })?;
-    // SAFETY: an open descriptor.
-    last(unsafe { libc::fchmod(d.as_raw_fd(), (mode & !SETID) as libc::mode_t) }, ())?;
-    let (mut r, mut w) = (std::fs::File::from(s), std::fs::File::from(d));
-    io::copy(&mut r, &mut w)?;
-    w.sync_all()
+    let filled = (|| {
+        // SAFETY: an open descriptor.
+        last(unsafe { libc::fchmod(d.as_raw_fd(), (mode & !SETID) as libc::mode_t) }, ())?;
+        let (mut r, mut w) = (std::fs::File::from(s.try_clone()?), std::fs::File::from(d));
+        io::copy(&mut r, &mut w)?;
+        w.sync_all()
+    })();
+    if filled.is_err() {
+        // SAFETY: an open descriptor and a C string; removes only the name made above.
+        unsafe { libc::unlinkat(dst.as_raw_fd(), to.as_ptr(), 0) };
+    }
+    filled
 }
 
 /// Gives each regular file under `root` that's `uid`'s and has another hard link a copy
@@ -650,8 +658,20 @@ pub fn unshare_links(root: &Path, uid: u32) -> io::Result<u64> {
                     if st.st_uid != uid || st.st_nlink < 2 {
                         continue;
                     }
-                    let tmp = CString::new(format!(".superbot-unlinked-{n}")).map_err(io::Error::other)?;
-                    copy_file(from, dir, &tmp, st.st_mode & 0o777)?;
+                    // Their own files may have any name, so the first free one is used.
+                    let mut tmp = None;
+                    for k in 0..1000 {
+                        let t = CString::new(format!(".superbot-unlinked-{k}")).map_err(io::Error::other)?;
+                        match copy_file(&from, dir, &t, st.st_mode & 0o777) {
+                            Ok(()) => {
+                                tmp = Some(t);
+                                break;
+                            }
+                            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    let tmp = tmp.ok_or_else(|| io::Error::other("no free name for a copy"))?;
                     // SAFETY: an open descriptor and two C strings; replaces the link only.
                     last(unsafe { libc::renameat(dir.as_raw_fd(), tmp.as_ptr(), dir.as_raw_fd(), name.as_ptr()) }, ())?;
                     *n += 1;
@@ -827,6 +847,7 @@ mod tests {
         std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o640)).unwrap();
         std::fs::hard_link(&outside, home.join("a/hard")).unwrap();
         std::fs::write(home.join("plain"), "mine").unwrap();
+        std::fs::write(home.join("a/.superbot-unlinked-0"), "a file of theirs").unwrap();
 
         assert_eq!(unshare_links(&home, me().uid + 1).unwrap(), 0, "someone else's: never read");
         assert_eq!(std::fs::metadata(&outside).unwrap().nlink(), 2);
@@ -836,8 +857,10 @@ mod tests {
         assert_eq!(std::fs::read_to_string(home.join("a/hard")).unwrap(), "theirs");
         assert_eq!(std::fs::metadata(&outside).unwrap().nlink(), 1);
         assert_eq!(hand_over(&home, me()).unwrap().skipped, 0);
-        let names: Vec<_> = std::fs::read_dir(home.join("a")).unwrap().flatten().map(|e| e.file_name()).collect();
-        assert_eq!(names, ["hard"], "no copy left behind");
+        let mut names: Vec<_> = std::fs::read_dir(home.join("a")).unwrap().flatten().map(|e| e.file_name()).collect();
+        names.sort();
+        assert_eq!(names, [".superbot-unlinked-0", "hard"], "no copy left behind");
+        assert_eq!(std::fs::read_to_string(home.join("a/.superbot-unlinked-0")).unwrap(), "a file of theirs", "a name that's taken is left alone");
         let _ = std::fs::remove_dir_all(&d);
     }
 
