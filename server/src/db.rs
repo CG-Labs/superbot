@@ -2163,8 +2163,9 @@ impl Db {
     /// records the event id (a redelivery is `Duplicate`), skips events older than the
     /// last one applied to the subscription (`Stale`), keeps the subscription row, and,
     /// when `set_tier`, sets `users.tier` to `sub.tier` (None: the default tier). An
-    /// ending subscription that isn't the user's current one changes nothing
-    /// (`Superseded`), so cancelling an old plan after moving to a new one can't undo it.
+    /// event for a subscription that isn't the user's current one changes nothing when it
+    /// ends that subscription or is older than the current one (`Superseded`), so a late
+    /// event for an old plan after moving to a new one can't undo the move.
     pub fn apply_subscription(&self, event_id: &str, event_type: &str, sub: &Subscription, set_tier: bool, ending: bool) -> Result<Applied, String> {
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
@@ -2180,7 +2181,7 @@ impl Db {
             Applied::OtherUser
         } else if by_id.as_ref().is_some_and(|s| sub.event_created < s.event_created) {
             Applied::Stale
-        } else if ending && mine.as_ref().is_some_and(|s| s.subscription_id != sub.subscription_id) {
+        } else if mine.as_ref().is_some_and(|s| s.subscription_id != sub.subscription_id && (ending || sub.event_created < s.event_created)) {
             Applied::Superseded
         } else {
             tx.execute(
