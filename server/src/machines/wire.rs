@@ -26,6 +26,15 @@ use std::collections::BTreeMap;
 /// The job protocol this build speaks. A job names it, and an agent refuses any other.
 pub const PROTOCOL: u32 = 1;
 
+/// The harness CLIs a heartbeat can ask about: every adapter's `bin()`.
+pub const HARNESS_BINS: [&str; 4] = ["claude", "codex", "pi", "hermes"];
+
+/// `name` as one of `HARNESS_BINS`, so what an agent looks up on disk is never the
+/// request's own text.
+pub fn harness_bin(name: &str) -> Option<&'static str> {
+    HARNESS_BINS.into_iter().find(|k| *k == name)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EnrollRequest {

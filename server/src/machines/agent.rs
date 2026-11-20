@@ -582,15 +582,16 @@ fn plain_name(s: &str) -> bool {
         && s != ".."
 }
 
-/// `?bin=claude&bin=hermes`: the harnesses botd is about to run.
-fn bins(query: Option<&str>) -> Vec<String> {
+/// `?bin=claude&bin=hermes`: the harnesses botd is about to run. Names this build
+/// doesn't know are missing without a look, so the query never makes a path.
+fn bins(query: Option<&str>) -> Vec<(String, Option<&'static str>)> {
     query
         .unwrap_or("")
         .split('&')
         .filter_map(|kv| kv.strip_prefix("bin="))
         .filter(|b| plain_name(b))
         .take(8)
-        .map(String::from)
+        .map(|b| (b.to_string(), wire::harness_bin(b)))
         .collect()
 }
 
@@ -606,7 +607,8 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
         layout: Some(a.cfg.layout()),
         missing: bins(q.as_deref())
             .into_iter()
-            .filter(|b| !a.cfg.has(b))
+            .filter(|(_, known)| !known.is_some_and(|k| a.cfg.has(k)))
+            .map(|(b, _)| b)
             .collect(),
         jobs: a.running() as u32,
     })
@@ -653,7 +655,15 @@ fn check(cfg: &Config, user_id: &str, j: &wire::JobRequest) -> Result<(), (Statu
     if let Some(p) = paths.into_iter().find(|p| !inside(&cfg.home, p)) {
         return bad(format!("{p} isn't inside {}.", cfg.home.display()));
     }
-    if !cfg.has(&j.bin) {
+    let Some(bin) = wire::harness_bin(&j.bin) else {
+        return bad(format!("{} isn't a harness this machine runs.", j.bin));
+    };
+    if let Some(c) = &j.cleanup
+        && wire::harness_bin(&c.bin).is_none()
+    {
+        return bad(format!("{} isn't a harness this machine runs.", c.bin));
+    }
+    if !cfg.has(bin) {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             format!("{} isn't installed on this machine.", j.bin),

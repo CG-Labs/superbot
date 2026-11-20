@@ -343,6 +343,14 @@ pub fn new_uuid() -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn machines_know_every_harness() {
+        for name in super::NAMES {
+            let bin = super::get(name).unwrap().bin();
+            assert_eq!(crate::machines::wire::harness_bin(bin), Some(bin), "{name}");
+        }
+    }
+
+    #[test]
     fn server_secrets_are_stripped_from_harnesses() {
         let mut cmd = std::process::Command::new("true");
         super::strip_secret_env(&mut cmd);

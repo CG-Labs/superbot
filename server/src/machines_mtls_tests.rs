@@ -286,11 +286,14 @@ async fn a_machine_enrolls_once_then_answers_over_mutual_tls() {
         .unwrap();
     assert_eq!(
         (hb.protocol, hb.missing.as_slice()),
-        (wire::PROTOCOL, &["no-such-harness".to_string()][..]),
-        "the agent says what it can run"
+        (
+            wire::PROTOCOL,
+            &["sh".to_string(), "no-such-harness".to_string()][..]
+        ),
+        "the agent runs only harnesses it knows, and says which it can't"
     );
     assert_eq!(
-        crate::machines::route::fit(&hb, "sh"),
+        crate::machines::route::fit(&hb, "claude"),
         Err(Refusal::NoBotctl),
         "no botctl there, so no approvals: it can't run Bots"
     );
