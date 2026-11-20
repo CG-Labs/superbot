@@ -189,6 +189,19 @@ mod tests {
     }
 
     #[test]
+    fn runs_wait_for_the_bots_user_only_when_it_is_on() {
+        let off = Enrollment::for_tests(4, 1, 2);
+        let on = Enrollment::for_tests(4, 1, 2).with_bot_user();
+        let old = Heartbeat { version: "0.1.0".into(), ..Default::default() };
+        assert_eq!(check_run(&off, &old), Ok(()), "off: as before");
+        assert_eq!(check_run(&on, &old), Err(Refusal::Outdated("0.1.0".into())), "an agent too old to do it");
+        assert_eq!(check_run(&on, &hb(true, 0, None)), Err(Refusal::BotUserPending));
+        assert_eq!(check_run(&on, &hb(true, 0, Some((wire::BOT_USER_SETTING_UP, 1)))), Err(Refusal::BotUserPending));
+        assert_eq!(check_run(&on, &hb(true, 0, Some((wire::BOT_USER_FAILED, 1)))), Err(Refusal::BotUserFailed));
+        assert_eq!(check_run(&on, &hb(true, 0, Some((wire::BOT_USER_READY, 1)))), Ok(()));
+    }
+
+    #[test]
     fn off_by_default_and_only_on_or_off() {
         assert!(!from_env(&|_| String::new()).unwrap());
         assert!(from_env(&|_| "on".into()).unwrap());

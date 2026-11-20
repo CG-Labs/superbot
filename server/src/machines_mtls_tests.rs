@@ -1074,8 +1074,19 @@ impl OnMachine {
 }
 
 pub(crate) async fn agent_with(env: &mut Env, mid: &str, token: &str, harness: &str) -> OnMachine {
+    agent_with_config(env, mid, token, harness, |c| c).await
+}
+
+/// `agent_with`, with its settings changed by `f`.
+pub(crate) async fn agent_with_config(
+    env: &mut Env,
+    mid: &str,
+    token: &str,
+    harness: &str,
+    f: impl FnOnce(Config) -> Config,
+) -> OnMachine {
     use std::os::unix::fs::PermissionsExt;
-    let mut cfg = config(env, mid, Some(token));
+    let mut cfg = f(config(env, mid, Some(token)));
     let bin = cfg.home.join(".local/bin");
     std::fs::create_dir_all(&bin).unwrap();
     for (name, body) in [("claude", harness), ("botctl", "#!/bin/sh\nexit 2\n")] {

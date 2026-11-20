@@ -1547,14 +1547,18 @@ mod tests {
         assert!(e.upkeep.plan.is_some() && e.describe().contains("harnesses on machines: pi@1.5.2; agent upgrades: manual"), "{}", e.describe());
         assert!(with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_HARNESSES", "nope")]).is_err());
         let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443")]).unwrap().unwrap();
-        assert!(!e.logins && e.folder.is_none(), "logins and folder copies are off unless asked");
-        for v in ["MACHINE_HARNESS_LOGINS", "MACHINE_FOLDER_SYNC", "MACHINE_FOLDER_SYNC_MAX_MB"] {
+        assert!(!e.logins && e.folder.is_none() && !e.bot_user, "logins, folder copies and the Bots' user are off unless asked");
+        assert!(e.describe().contains("Bots' own user off"), "{}", e.describe());
+        for v in ["MACHINE_HARNESS_LOGINS", "MACHINE_FOLDER_SYNC", "MACHINE_FOLDER_SYNC_MAX_MB", "MACHINE_BOT_USER"] {
             let vars: &'static [(&'static str, &'static str)] = Box::leak(Box::new([(v, "on")]));
             assert!(with(vars).is_err(), "{v} needs enrollment");
         }
         let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_HARNESS_LOGINS", "on"), ("MACHINE_FOLDER_SYNC", "on")]).unwrap().unwrap();
         assert!(e.logins && e.folder.as_ref().is_some_and(|f| f.max_bytes == 2048 << 20), "{}", e.describe());
         assert!(with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_HARNESS_LOGINS", "yes")]).is_err());
+        let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_BOT_USER", "on")]).unwrap().unwrap();
+        assert!(e.bot_user && e.describe().contains("Bots' own user on"), "{}", e.describe());
+        assert!(with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_BOT_USER", "yes")]).is_err());
         for (raw, ok) in [("", Some(15)), ("5", Some(5)), ("60", Some(60)), ("4", None), ("61", None), ("soon", None)] {
             let vars: &'static [(&'static str, &'static str)] = Box::leak(Box::new([
                 ("MACHINE_CONTROL_URL", "https://cp.example:8443"),
@@ -1733,6 +1737,23 @@ mod tests {
             .args(["-n", "-c", &script])
             .output()
             .unwrap();
+        assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stderr));
+        let ud = e.user_data(&m, "sbe_tok");
+        assert!(ud.contains("StateDirectoryMode=0700") && !ud.contains("useradd"), "no Bots' user unless asked");
+
+        // MACHINE_BOT_USER (ADR 0042): the user is made at first boot, and the state
+        // folder lets it through to its home.
+        e.bot_user = true;
+        let ud = e.user_data(&m, "sbe_tok");
+        assert!(ud.contains("StateDirectoryMode=0711") && !ud.contains("StateDirectoryMode=0700"), "{ud}");
+        let script = firstboot_in(&ud);
+        assert!(
+            script.contains("id -u superbot-bots >/dev/null 2>&1 || useradd --system --user-group --no-create-home --shell /usr/sbin/nologin --comment \"SuperBot Bots\" --home-dir /var/lib/superbot-machine/home superbot-bots"),
+            "{script}"
+        );
+        let order = ["useradd", "/v1/agent", "systemctl start"].map(|s| script.find(s).unwrap_or_else(|| panic!("{s}")));
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+        let check = std::process::Command::new("sh").args(["-n", "-c", &script]).output().unwrap();
         assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stderr));
     }
 

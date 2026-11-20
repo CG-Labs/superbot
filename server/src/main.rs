@@ -28,6 +28,8 @@ mod license;
 mod license_http_tests;
 mod machines;
 #[cfg(test)]
+mod machines_bot_user_tests;
+#[cfg(test)]
 mod machines_http_tests;
 #[cfg(test)]
 mod machines_lockdown_tests;

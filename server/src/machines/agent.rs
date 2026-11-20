@@ -725,6 +725,11 @@ impl Agent {
         self.jobs().len() + self.logins.running().len()
     }
 
+    /// Where the Bots' own user stands, as heartbeats say.
+    pub fn bot_user(&self) -> Option<wire::BotUserStatus> {
+        self.bot().status
+    }
+
     fn bot(&self) -> Bot {
         self.bot.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
