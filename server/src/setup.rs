@@ -10,7 +10,7 @@ use crate::rbac::Role;
 use crate::sso::Provider;
 use crate::tiers::Tier;
 use crate::users::{self, Caller};
-use crate::{bad, need_user, AppState, Auth, Res};
+use crate::{bad, need_user, ApiError, AppState, Auth, Res};
 use axum::extract::{ConnectInfo, Extension, State};
 use axum::http::{header, HeaderMap};
 use axum::Json;
@@ -208,6 +208,8 @@ fn sign_in_view(app: &AppState, a: &Auth, public_url: Option<&str>) -> Value {
         .providers
         .iter()
         .map(|p| {
+            // A value from the environment (or _FILE) wins over a saved one, so the wizard can't replace it.
+            let source = crate::secrets::global().source(&p.env_var()).ok().flatten();
             json!({
                 "id": p.id,
                 "label": p.label,
@@ -215,6 +217,8 @@ fn sign_in_view(app: &AppState, a: &Auth, public_url: Option<&str>) -> Value {
                 "ready": p.ready(),
                 "problem": p.not_ready(),
                 "secret": p.env_var(),
+                "secretStore": source.map(|(store, _)| store),
+                "secretSavable": source.is_none_or(|(_, writable)| writable),
                 "callbackUrl": a.sso.callback_url(&p.id),
                 "audience": p.audience(),
                 "jitRole": p.jit_role.map(Role::as_str),
@@ -353,33 +357,34 @@ pub async fn update(
     if let Some(k) = obj.keys().find(|k| !["step", "dismissed", "completed"].contains(&k.as_str())) {
         return Err(bad(format!("Unknown field \"{k}\". Send step, dismissed, or completed.")));
     }
-    let before = app.db.setup_progress();
-    let mut p = before.clone();
-    if let Some(s) = obj.get("step") {
-        let s = s.as_str().filter(|s| STEPS.contains(s)).ok_or_else(|| bad(format!("step must be one of {}.", STEPS.join(", "))))?;
-        p.step = s.into();
-    }
-    if let Some(d) = obj.get("dismissed") {
-        p.dismissed = d.as_bool().ok_or_else(|| bad("dismissed must be true or false."))?;
-    }
-    match obj.get("completed").map(Value::as_bool) {
-        None => {}
-        Some(None) => return Err(bad("completed must be true or false.")),
-        Some(Some(true)) if p.completed_at.is_none() => {
-            p.completed_at = Some(crate::db::now());
-            p.completed_by = c.user.as_ref().map(|u| u.id.clone());
-            p.step = "finish".into();
+    let step = match obj.get("step") {
+        None => None,
+        Some(s) => Some(s.as_str().filter(|s| STEPS.contains(s)).ok_or_else(|| bad(format!("step must be one of {}.", STEPS.join(", "))))?),
+    };
+    let dismissed = obj.get("dismissed").map(|d| d.as_bool().ok_or_else(|| bad("dismissed must be true or false."))).transpose()?;
+    let completed = obj.get("completed").map(|d| d.as_bool().ok_or_else(|| bad("completed must be true or false."))).transpose()?;
+    let (before, p) = app.db.update_setup_progress(|p| {
+        if let Some(s) = step {
+            p.step = s.into();
         }
-        Some(Some(true)) => {}
-        Some(Some(false)) => {
-            p.completed_at = None;
-            p.completed_by = None;
-            p.dismissed = false;
+        if let Some(d) = dismissed {
+            p.dismissed = d;
         }
-    }
-    if p != before {
-        app.db.set_setup_progress(&p);
-    }
+        match completed {
+            Some(true) if p.completed_at.is_none() => {
+                p.completed_at = Some(crate::db::now());
+                p.completed_by = c.user.as_ref().map(|u| u.id.clone());
+                p.step = "finish".into();
+            }
+            Some(false) => {
+                p.completed_at = None;
+                p.completed_by = None;
+                p.dismissed = false;
+            }
+            _ => {}
+        }
+        Ok::<_, ApiError>(())
+    })?;
     let out = report(&app, &a, &headers, peer_ip(peer));
     let event = |action: &str| by.event(action).target("setup", "server");
     if before.completed_at.is_none() && p.completed_at.is_some() {

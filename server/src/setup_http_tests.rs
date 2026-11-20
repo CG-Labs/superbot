@@ -92,6 +92,8 @@ async fn progress_is_saved_and_finishing_is_audited() {
     let at = p["completedAt"].clone();
     let (_, s) = patch(port, &admin, json!({ "completed": true })).await;
     assert_eq!(s["progress"]["completedAt"], at, "finishing again keeps the first time");
+    let (_, s) = patch(port, &admin, json!({ "step": "domain" })).await;
+    assert_eq!((s["progress"]["step"].as_str(), s["progress"]["completedAt"].clone()), (Some("domain"), at.clone()), "moving between steps keeps it finished");
     let (_, s) = patch(port, &admin, json!({ "completed": false })).await;
     assert_eq!((s["progress"]["show"].as_bool(), s["progress"]["completedAt"].clone()), (Some(true), Value::Null));
 
@@ -138,6 +140,7 @@ async fn a_provider_waiting_for_its_secret_is_ready_once_it_is_saved() {
     assert_eq!((p["id"].as_str(), p["ready"].as_bool(), si["ok"].as_bool()), (Some(id.as_str()), Some(false), Some(false)));
     let secret = format!("SSO_{up}_CLIENT_SECRET");
     assert_eq!(p["secret"].as_str(), Some(secret.as_str()));
+    assert_eq!((p["secretStore"].clone(), p["secretSavable"].as_bool()), (Value::Null, Some(true)));
     assert!(p["problem"].as_str().unwrap().contains(&secret));
     assert_eq!(p["callbackUrl"], format!("https://bots.example.com/api/auth/sso/{id}/callback"));
     assert_eq!(si["publicUrl"], "https://bots.example.com");
@@ -150,6 +153,7 @@ async fn a_provider_waiting_for_its_secret_is_ready_once_it_is_saved() {
     assert_eq!(code, 200);
     let s = get(port, &admin, "").await;
     assert_eq!((s["signIn"]["providers"][0]["ready"].as_bool(), check(&s, "signin")["done"].as_bool()), (Some(true), Some(true)));
+    assert_eq!(s["signIn"]["providers"][0]["secretStore"], "sealed");
     assert!(!s.to_string().contains(&value), "the report never holds a secret");
     let _ = secrets::global().delete(&secret);
 }
