@@ -12,7 +12,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use zeroize::Zeroizing;
@@ -383,12 +383,14 @@ impl UserSecrets {
         s.query_map([user_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(store_err)?.collect::<rusqlite::Result<_>>().map_err(store_err)
     }
 
-    /// True if it replaced a value the user already had. Checked and written under one
-    /// lock and transaction, so two first saves can't both say they were first.
+    /// True if it replaced a value the user already had. Checked and written in one
+    /// transaction, so two first saves can't both say they were first. It takes the write
+    /// lock before the read (`IMMEDIATE`): a deferred one that reads first fails with
+    /// `SQLITE_BUSY_SNAPSHOT`, with no wait, if another connection writes in between.
     pub fn put(&self, user_id: &str, name: &str, value: &str) -> Result<bool, Error> {
         let sealed = self.cipher.seal(&user_context(user_id, name), value.as_bytes());
         let mut c = self.c();
-        let tx = c.transaction().map_err(store_err)?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate).map_err(store_err)?;
         let existed = tx.query_row("SELECT 1 FROM user_secrets WHERE user_id = ? AND name = ?", [user_id, name], |_| Ok(())).optional().map_err(store_err)?.is_some();
         tx.execute(
             "INSERT INTO user_secrets (user_id, name, value, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)
@@ -592,6 +594,24 @@ mod tests {
         SealedStore::new(connect_again(&c), Arc::new(cipher)).put("X_TOKEN", "v").unwrap();
         c.execute("DELETE FROM settings WHERE key = ?", [KEY_CHECK]).unwrap();
         assert_eq!(bootstrap(&c, Some(MasterKey::generate()), no_key, false).err().unwrap(), WRONG_KEY);
+    }
+
+    #[test]
+    fn a_save_waits_for_another_connections_write() {
+        let (_path, _db, c) = fresh();
+        let (cipher, _) = bootstrap(&c, None, || Ok(MasterKey::generate()), false).unwrap();
+        let other = connect_again(&c);
+        let s = UserSecrets::new(c, Arc::new(cipher));
+        s.put("ua", "A_TOKEN", "first").unwrap();
+        // Another connection holds the write lock and commits a change while the save waits.
+        other.execute_batch("BEGIN IMMEDIATE; INSERT INTO secrets (name, value, created_at, updated_at) VALUES ('OTHER_TOKEN', 'x', 1, 1);").unwrap();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            other.execute_batch("COMMIT").unwrap();
+        });
+        assert!(s.put("ua", "A_TOKEN", "second").unwrap(), "saved after the other write, not refused as a stale read");
+        writer.join().unwrap();
+        assert_eq!(s.get("ua", "A_TOKEN").unwrap().unwrap().expose(), "second");
     }
 
     fn connect_again(c: &Connection) -> Connection {
