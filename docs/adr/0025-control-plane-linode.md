@@ -122,7 +122,7 @@ The client keeps the token in a zeroizing string, sends it only as the `Authoriz
 
 The API base URL is fixed (`https://api.linode.com/v4`); there is no setting to send the token elsewhere. Tests pass a local URL in code.
 
-Linode requires a root password with an image. Each machine gets a fresh random one that is sent once and stored nowhere. Operators get in with `MACHINE_AUTHORIZED_KEYS`; the control plane will use enrollment (below).
+Linode requires a root password with an image. Each machine gets a fresh random one that is sent once and stored nowhere. Operators get in with `MACHINE_AUTHORIZED_KEYS`; the control plane uses enrollment ([ADR 0031](0031-machine-enrollment-mtls.md)).
 
 Use a Linode token scoped to Linodes read/write only.
 
@@ -153,7 +153,7 @@ Nothing in tests or CI calls Linode:
 
 ## Deliberately out of scope
 
-- **Talking to the machines.** Enrollment and mTLS between the control plane and each machine is the next slice. The plan: the machine boots with a one-time enrollment token (cloud-init user data); it calls the control plane over HTTPS to exchange it for a client certificate from a control-plane CA; after that every call is mTLS, pinned both ways. The certificate is revoked on destroy. Until then a machine is just a VM.
+- **Talking to the machines.** Enrollment and mTLS between the control plane and each machine is the next slice. The plan: the machine boots with a one-time enrollment token (cloud-init user data); it calls the control plane over HTTPS to exchange it for a client certificate from a control-plane CA; after that every call is mTLS, pinned both ways. The certificate is revoked on destroy. Done in [ADR 0031](0031-machine-enrollment-mtls.md).
 - **Moving Bots onto machines.** Running a user's Bots, workspace, harness logins and screens on their machine, and routing their chats there.
 - **Billing and entitlements.** Tiers aren't tied to a subscription yet, and limits aren't enforced. Model routing per tier is separate (M3).
 - **Lifecycle tied to users.** Disabling a user doesn't suspend their machine yet. A disabled user can't be given a new one.

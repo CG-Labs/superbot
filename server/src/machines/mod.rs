@@ -3,12 +3,19 @@
 //! suspend, resume, resize, and destroy a user's machine; a reconciler follows each
 //! one to where it should be. Every change is audited.
 //! Design: docs/adr/0025-control-plane-linode.md.
+// The agent binary's code; botd only runs it in tests, and not all of it.
+#[cfg(test)]
+#[allow(dead_code)]
+pub mod agent;
+pub mod enroll;
 
 #[cfg(test)]
 pub mod fake;
 pub mod linode;
+pub mod pki;
 pub mod provider;
 pub mod route;
+pub mod wire;
 
 use crate::audit::{Actor, Event, Outcome, Source, Who};
 use crate::db::{AddMachine, Machine, NewMachine, now};
@@ -33,6 +40,8 @@ pub const NOT_CONFIGURED: &str = "The control plane is not configured on this se
 pub const DEFAULT_TIERS: &str = "starter=g6-standard-1,pro=g6-standard-2,max=g6-standard-4";
 pub const DEFAULT_IMAGE: &str = "linode/ubuntu24.04";
 const DEFAULT_RECONCILE_SECONDS: u64 = 60;
+/// Heartbeats in flight at once; each gives up after 10 seconds.
+const HEARTBEATS_AT_ONCE: usize = 16;
 /// How long after a create that went unanswered a machine may still turn up at the
 /// provider. Linode creates synchronously, so this is generous.
 pub const CREATE_SETTLE_MS: i64 = 15 * 60 * 1000;
@@ -139,8 +148,11 @@ pub struct ControlPlane {
     /// MACHINE_ROUTING=on: each user's Bots run only on that user's machine (ADR 0029).
     /// Off: on this server, in the owner's folders.
     pub routing: bool,
-    /// How work reaches a user's machine. `Unenrolled` until machines run an agent.
+    /// How work reaches a user's machine: `Unenrolled` (refuses) until enrollment is
+    /// on, then mutual TLS to the machine's agent (ADR 0031).
     pub link: Arc<dyn route::MachineLink>,
+    /// Machine enrollment and mutual TLS (ADR 0031). None: off (MACHINE_CONTROL_URL).
+    pub enrollment: Option<Arc<enroll::Enrollment>>,
     /// One change at a time, from handlers and the reconciler alike, so two can't
     /// race on one machine. Changes are rare and admin-driven; this is cheap.
     ops: tokio::sync::Mutex<()>,
@@ -159,6 +171,7 @@ impl Default for ControlPlane {
             reconcile_every: Duration::from_secs(DEFAULT_RECONCILE_SECONDS),
             routing: false,
             link: Arc::new(route::Unenrolled),
+            enrollment: None,
             ops: tokio::sync::Mutex::new(()),
         }
     }
@@ -305,6 +318,18 @@ impl ControlPlane {
         })
     }
 
+    /// Turns on enrollment: machines get tokens at create, and routed work goes to
+    /// them over mutual TLS. Needs the control plane.
+    pub fn enroll_with(&mut self, e: enroll::Enrollment) -> Result<Arc<enroll::Enrollment>, String> {
+        if !self.enabled() {
+            return Err("MACHINE_CONTROL_URL needs the control plane: set LINODE_TOKEN and MACHINE_REGIONS".into());
+        }
+        let e = Arc::new(e);
+        self.link = Arc::new(enroll::Mtls(e.clone()));
+        self.enrollment = Some(e.clone());
+        Ok(e)
+    }
+
     /// Where `user_id`'s Bots run (`route::target`).
     pub fn route(&self, db: &crate::db::Db, user_id: &str) -> Result<route::Target, route::Refusal> {
         route::target(db, self, user_id)
@@ -327,7 +352,7 @@ impl ControlPlane {
         match &self.provider {
             None => "off (set LINODE_TOKEN and MACHINE_REGIONS for one machine per user)".into(),
             Some(p) => format!(
-                "{}, regions {}, tiers {}, backups {}, routing {}",
+                "{}, regions {}, tiers {}, backups {}, routing {}, enrollment {}",
                 p.name(),
                 self.regions.join(", "),
                 self.tiers
@@ -336,7 +361,8 @@ impl ControlPlane {
                     .collect::<Vec<_>>()
                     .join(", "),
                 if self.backups { "on" } else { "off" },
-                if self.routing { format!("on via {}", self.link.name()) } else { "off (Bots run on this server)".into() }
+                if self.routing { format!("on via {}", self.link.name()) } else { "off (Bots run on this server)".into() },
+                self.enrollment.as_ref().map_or("off (set MACHINE_CONTROL_URL)".into(), |e| e.describe())
             ),
         }
     }
@@ -354,7 +380,7 @@ impl ControlPlane {
             .map(|(_, p)| p.as_str())
     }
 
-    fn spec(&self, m: &Machine) -> CreateSpec {
+    fn spec(&self, m: &Machine, user_data: Option<String>) -> CreateSpec {
         CreateSpec {
             label: m.label.clone(),
             plan: m.plan.clone(),
@@ -362,6 +388,7 @@ impl ControlPlane {
             image: self.image.clone(),
             tags: vec![m.tag.clone(), format!("{}-user-{}", m.tag, m.user_id)],
             authorized_keys: self.authorized_keys.clone(),
+            user_data,
         }
     }
 }
@@ -425,7 +452,23 @@ async fn provision(
 ) -> Machine {
     m.create_sent_at = Some(now());
     app.db.save_machine(&m, m.state);
-    let found = match p.create(&cp.spec(&m)).await {
+    // A fresh token each attempt. An earlier one stays good until it expires, in case
+    // that attempt made the machine and it is adopted below.
+    let user_data = match &cp.enrollment {
+        None => None,
+        Some(e) => match e.mint_token(app, &m.id, by.actor.id.as_deref()) {
+            Ok((token, expires_at)) => {
+                app.db.record(&event(by, "machine.enroll_token_issued", &m, json!({ "expiresAt": expires_at, "via": "create" })));
+                Some(e.user_data(&m, &token))
+            }
+            Err(err) => {
+                m.last_error = Some(format!("couldn't make an enrollment token: {err}"));
+                app.db.save_machine(&m, m.state);
+                return m;
+            }
+        },
+    };
+    let found = match p.create(&cp.spec(&m, user_data)).await {
         Ok(pm) => Ok((pm, false)),
         Err(ProviderError::LabelTaken) => match by_label(p, &m).await {
             Ok(Some(pm)) => Ok((pm, true)),
@@ -571,6 +614,8 @@ async fn reconcile_one(app: &App, cp: &ControlPlane, p: &dyn MachineProvider, id
                             )
                             .outcome(Outcome::Failure),
                         );
+                        // If it turns up again it is not to be trusted as it was.
+                        enroll::revoke_all(app, &by, &m, "lost");
                     }
                     return true;
                 }
@@ -649,17 +694,46 @@ pub async fn reconcile(app: &App, cp: &ControlPlane) -> Value {
     json!({ "checked": ids.len(), "changed": changed })
 }
 
+/// Asks every enrolled running machine's agent how it is, a few at a time, and
+/// returns how many answered. None when enrollment is off. Heartbeats change only the
+/// agent columns, so they don't take the lock.
+pub async fn heartbeats(app: &App, cp: &ControlPlane) -> Option<usize> {
+    use futures_util::StreamExt;
+    let e = cp.enrollment.as_ref()?;
+    let enrolled = app.db.machines(Some(State::Running)).into_iter().filter(|m| m.enrollment == "enrolled");
+    let answered = futures_util::stream::iter(enrolled)
+        .map(|m| async move { enroll::heartbeat(app, e, &m).await.is_ok() })
+        .buffer_unordered(HEARTBEATS_AT_ONCE)
+        .filter(|ok| std::future::ready(*ok))
+        .count()
+        .await;
+    Some(answered)
+}
+
 /// Reconciles every MACHINE_RECONCILE_SECONDS, from startup, when the control plane is on.
 pub fn start(app: AppState, cp: Arc<ControlPlane>) {
     if !cp.enabled() {
         return;
     }
+    let (a, c) = (app.clone(), cp.clone());
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(c.reconcile_every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            reconcile(&a, &c).await;
+        }
+    });
+    if cp.enrollment.is_none() {
+        return;
+    }
+    // Apart from reconciling, so agents that don't answer can't hold up provider checks.
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(cp.reconcile_every);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            reconcile(&app, &cp).await;
+            heartbeats(&app, &cp).await;
         }
     });
 }
@@ -678,6 +752,7 @@ fn own_view(m: &Machine) -> Value {
     json!({
         "id": m.id, "tier": m.tier, "region": m.region, "state": m.state, "providerStatus": m.provider_status,
         "ipv4": m.ipv4, "backups": m.backups, "createdAt": m.created_at, "updatedAt": m.updated_at,
+        "enrollment": m.enrollment, "agentSeenAt": m.agent_seen_at,
     })
 }
 
@@ -1001,6 +1076,11 @@ async fn act(
         return Err(conflict("The machine changed meanwhile; try again.".into()));
     }
     app.db.record(&event(by, action, &m, extra));
+    match m.state {
+        State::Suspended if from != State::Suspended => enroll::hold(app, by, &m),
+        State::Running if from == State::Suspended => enroll::release(app, by, &m),
+        _ => {}
+    }
     Ok(reply(app, StatusCode::OK, &m))
 }
 
@@ -1081,6 +1161,7 @@ pub async fn destroy(
             &m,
             json!({ "was": from, "userEmail": u.email }),
         ));
+        enroll::revoke_all(&app, &by, &m, "destroyed");
     }
     let m = finish_destroy(&app, p, m, &by).await;
     Ok(reply(
@@ -1097,7 +1178,11 @@ pub async fn destroy(
 /// `POST /api/machines/reconcile`: one pass now, instead of waiting for the timer.
 pub async fn reconcile_now(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>) -> Res {
     a.machines.need()?;
-    Ok(Json(reconcile(&app, &a.machines).await))
+    let mut out = reconcile(&app, &a.machines).await;
+    if let Some(n) = heartbeats(&app, &a.machines).await {
+        out["heartbeats"] = n.into();
+    }
+    Ok(Json(out))
 }
 
 /// `GET /api/machine`: the caller's own machine, and only theirs.

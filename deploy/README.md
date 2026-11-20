@@ -106,7 +106,19 @@ To pick a provider or endpoint, set `SUPERBOT_HERMES_PROVIDER` (Hermes's `--prov
 
 ## Binaries
 
-Release binaries are installed system-wide in `/usr/local/bin` so `botctl` stays next to `botd` on the Bots' PATH. To use user-local installs instead, set `BIN_DIR` before running the script (advanced).
+Release binaries are installed system-wide in `/usr/local/bin` so `botctl` stays next to `botd` on the Bots' PATH. To use user-local installs instead, set `BIN_DIR` before running the script (advanced). `superbot-machine` is the agent for managed machines (below); self-hosted servers never run it.
+
+## Managed machines: enrollment
+
+Managed hosting only (one Linode per user, [ADR 0025](../docs/adr/0025-control-plane-linode.md)). Self-hosted servers skip this. With `LINODE_TOKEN` set, add to `.env`:
+
+```sh
+MACHINE_CONTROL_URL=https://<server-ip>:8443   # how machines reach this server; turns enrollment on
+# MACHINE_LISTEN=0.0.0.0:8443                   # default: all addresses, the URL's port
+# MACHINE_AGENT_PORT=7443                       # where each machine's agent answers
+```
+
+botd then listens on that port for machines (TLS from its own CA, not Caddy's), so open it in the firewall (`sudo ufw allow 8443/tcp`; with Docker, publish it too). Each new machine gets a one-time token in its cloud-init data, downloads `superbot-machine` from botd, enrolls for a 30-day certificate, and answers botd over mutual TLS. Suspend holds its certificate; destroy revokes it. The CA key is derived from the [master key](#master-key), so there is nothing new to back up; a new master key means every machine re-enrolls. A new token for a machine (shown once): `POST /api/users/<user>/machine/enrollment`; revoke its certificates: `DELETE /api/users/<user>/machine/certificates`. Design: [ADR 0031](../docs/adr/0031-machine-enrollment-mtls.md).
 
 ## Approvals after an upgrade
 

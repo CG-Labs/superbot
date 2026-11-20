@@ -185,6 +185,11 @@ impl MachineProvider for Linode {
             if !spec.authorized_keys.is_empty() {
                 body["authorized_keys"] = json!(spec.authorized_keys);
             }
+            if let Some(ud) = &spec.user_data {
+                body["metadata"] = json!({
+                    "user_data": base64::engine::general_purpose::STANDARD.encode(ud)
+                });
+            }
             machine(
                 &self
                     .call(Method::POST, "/linode/instances", None, Some(&body))
@@ -423,6 +428,7 @@ mod tests {
             image: "linode/ubuntu24.04".into(),
             tags: vec!["superbot".into(), "superbot-user-u1".into()],
             authorized_keys: vec!["ssh-ed25519 AAAAC3Nza test@example".into()],
+            user_data: None,
         }
     }
 
@@ -442,38 +448,56 @@ mod tests {
         );
         let again = api.create(&spec("superbot-m2")).await.unwrap();
         assert_eq!(again.id, "42");
-        let seen = seen.lock().unwrap();
-        let body = &seen[0].3;
+        {
+            let seen = seen.lock().unwrap();
+            let body = &seen[0].3;
+            assert_eq!(
+                (seen[0].0.as_str(), seen[0].1.as_str()),
+                ("POST", "/linode/instances")
+            );
+            assert_eq!(
+                (
+                    body["type"].as_str(),
+                    body["region"].as_str(),
+                    body["image"].as_str(),
+                    body["booted"].as_bool()
+                ),
+                (
+                    Some("g6-standard-1"),
+                    Some("gb-lon"),
+                    Some("linode/ubuntu24.04"),
+                    Some(true)
+                )
+            );
+            assert_eq!(body["tags"], json!(["superbot", "superbot-user-u1"]));
+            assert_eq!(
+                body["authorized_keys"],
+                json!(["ssh-ed25519 AAAAC3Nza test@example"])
+            );
+            let (p1, p2) = (
+                body["root_pass"].as_str().unwrap(),
+                seen[1].3["root_pass"].as_str().unwrap(),
+            );
+            assert!(
+                p1.len() >= 40 && p1 != p2,
+                "a fresh strong password per machine"
+            );
+            assert!(
+                body.get("metadata").is_none(),
+                "no user data unless enrollment is on"
+            );
+        }
+
+        let with = CreateSpec {
+            user_data: Some("#cloud-config\n".into()),
+            ..spec("superbot-m3")
+        };
+        api.create(&with).await.unwrap();
+        let sent = seen.lock().unwrap().last().unwrap().3.clone();
         assert_eq!(
-            (seen[0].0.as_str(), seen[0].1.as_str()),
-            ("POST", "/linode/instances")
-        );
-        assert_eq!(
-            (
-                body["type"].as_str(),
-                body["region"].as_str(),
-                body["image"].as_str(),
-                body["booted"].as_bool()
-            ),
-            (
-                Some("g6-standard-1"),
-                Some("gb-lon"),
-                Some("linode/ubuntu24.04"),
-                Some(true)
-            )
-        );
-        assert_eq!(body["tags"], json!(["superbot", "superbot-user-u1"]));
-        assert_eq!(
-            body["authorized_keys"],
-            json!(["ssh-ed25519 AAAAC3Nza test@example"])
-        );
-        let (p1, p2) = (
-            body["root_pass"].as_str().unwrap(),
-            seen[1].3["root_pass"].as_str().unwrap(),
-        );
-        assert!(
-            p1.len() >= 40 && p1 != p2,
-            "a fresh strong password per machine"
+            sent["metadata"]["user_data"],
+            json!("I2Nsb3VkLWNvbmZpZwo="),
+            "base64, as Linode wants"
         );
     }
 
