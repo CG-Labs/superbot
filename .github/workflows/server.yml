@@ -89,6 +89,11 @@ jobs:
         run: |
           sudo SUPERBOT_MACHINE_BOT_USER_TEST=1 /tmp/botd-tests --ignored --exact \
             machines_teammates_tests::as_root_a_teammates_run_gets_their_own_os_user_and_cant_read_the_owners_home
+      # ADR 0052: a teammate who leaves loses their user there, and no one else does.
+      - name: Leaving teammates' users are removed from a machine
+        run: |
+          sudo SUPERBOT_MACHINE_BOT_USER_TEST=1 /tmp/botd-tests --ignored --exact \
+            machines_offboard_tests::as_root_a_leaving_teammates_user_processes_and_files_go_and_no_one_elses
 
   shellcheck:
     runs-on: ubuntu-latest

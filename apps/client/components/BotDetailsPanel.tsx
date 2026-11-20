@@ -11,13 +11,16 @@ import {
 } from "react-native";
 import { sharingLabel, whereItRuns, whoseKeys } from "../src/access";
 import { confirmAsync, showError } from "../src/dialogs";
+import { promptsFor } from "../src/prompts";
 import { cronLabel } from "../src/routines";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors, HARNESS_NAMES } from "../src/theme";
 import type { Routine } from "../src/types";
 import { BotAvatar } from "./BotAvatar";
 import { Chips } from "./Chips";
+import { PromptsEditor } from "./PromptsEditor";
 import { RoutineEditor } from "./RoutineEditor";
+import { SuggestedPrompts } from "./SuggestedPrompts";
 
 interface Props {
   visible: boolean;
@@ -25,12 +28,14 @@ interface Props {
   onOpenScreen: () => void;
   /** Opens this Bot's policy editor (ADR 0049). */
   onOpenPolicy?: (botId: string) => void;
+  /** Sends a suggested prompt to this Bot, or puts a starter in its message box (ADR 0054). */
+  onUsePrompt?: (prompt: string) => void;
 }
 
-/** "new" or the routine being edited; null shows the details. */
-type Editing = "new" | Routine | null;
+/** "new" or the routine being edited, or "prompts"; null shows the details. */
+type Editing = "new" | "prompts" | Routine | null;
 
-export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy }: Props) {
+export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, onUsePrompt }: Props) {
   const {
     bots,
     activeId,
@@ -58,7 +63,13 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy }
   const botId = bot?.id;
   const [name, setName] = useState(bot?.name || "");
   const [routines, setRoutines] = useState<Routine[]>([]);
-  const [editing, setEditing] = useState<Editing>(null);
+  const [editing, setEditingState] = useState<Editing>(null);
+  /** Bumped whenever the form changes, so a save that finishes late can't close a newer one. */
+  const sessionRef = useRef(0);
+  const setEditing = (e: Editing) => {
+    sessionRef.current += 1;
+    setEditingState(e);
+  };
   /** The Bot whose routines are on screen; a load for any other (or a closed panel) is stale. */
   const shownRef = useRef<string | null>(null);
 
@@ -94,17 +105,31 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy }
     onClose();
   };
 
+  const prompts = promptsFor(bot);
+
   const editor =
-    editing === null ? null : (
+    editing === null ? null : editing === "prompts" ? (
+      <PromptsEditor
+        prompts={prompts}
+        custom={bot.prompts != null}
+        onCancel={() => setEditing(null)}
+        onSave={async (list) => {
+          const session = sessionRef.current;
+          await patchBot(bot.id, { prompts: list });
+          if (sessionRef.current === session) setEditing(null);
+        }}
+      />
+    ) : (
       <RoutineEditor
         key={editing === "new" ? "new" : editing.id}
         routine={editing === "new" ? undefined : editing}
         onCancel={() => setEditing(null)}
         onSave={async (draft) => {
+          const session = sessionRef.current;
           if (editing === "new") await createRoutine(bot.id, draft);
           else await updateRoutine(editing, draft);
           await reload();
-          setEditing(null);
+          if (sessionRef.current === session) setEditing(null);
         }}
         onDelete={
           editing === "new"
@@ -112,9 +137,10 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy }
             : async () => {
                 const ok = await confirmAsync(`Delete "${editing.name}"?`, "The Bot stops running it.");
                 if (!ok) return;
+                const session = sessionRef.current;
                 await deleteRoutine(editing.id);
                 await reload();
-                setEditing(null);
+                if (sessionRef.current === session) setEditing(null);
               }
         }
       />
@@ -140,6 +166,17 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy }
               if (n && n !== bot.name) void patchBot(bot.id, { name: n });
             }}
           />
+          {canOperate && onUsePrompt ? (
+            <SuggestedPrompts
+              botName={bot.name}
+              prompts={prompts}
+              onUse={(p) => {
+                close();
+                onUsePrompt(p);
+              }}
+              onEdit={canManage ? () => setEditing("prompts") : undefined}
+            />
+          ) : null}
           <View style={styles.sectionRow}>
             <Text style={styles.sectionLabel}>Routines</Text>
             {canOperate ? (

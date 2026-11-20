@@ -355,6 +355,7 @@ pub async fn open(app: &AppState, by: &Who, bot: &Bot, for_user: Option<&str>, s
             let d = json!({ "owner": bot.owner_id, "forUser": u, "user": t.user, "uid": t.uid });
             app.db.record(&by.event("machine.teammate_user_created").target("machine", &to.machine_id).bot(&bot.id).details(d));
         }
+        super::offboard::seen(app, &to.machine_id, u);
     }
     let (reply, token) = ensure(app, &e, &s, by, bot, for_user, &to, "viewer").await.map_err(|w| refused(Some(&to.machine_id), w))?;
     let viewer = by.actor.id.clone().unwrap_or_default();
@@ -553,6 +554,24 @@ async fn close_key(app: &App, by: &Who, bot: &str, key: &str, reason: &str) -> b
     let Some(e) = enrollment(app).cloned() else { return false };
     let _one = e.shown.one_at_a_time(bot).await;
     close_locked(app, &e, by, key, reason).await
+}
+
+/// Closes `user_id`'s own screens on the machine, when they leave it (ADR 0052). How
+/// many it closed.
+pub async fn close_for(app: &App, by: &Who, machine_id: &str, user_id: &str, reason: &str) -> usize {
+    let Some(e) = enrollment(app) else { return 0 };
+    let theirs: Vec<(String, String)> = e
+        .shown
+        .open()
+        .iter()
+        .filter(|(_, o)| o.machine_id == machine_id && o.for_user.as_deref() == Some(user_id))
+        .map(|(k, o)| (o.bot_id.clone(), k.clone()))
+        .collect();
+    let mut closed = 0;
+    for (bot, key) in theirs {
+        closed += close_key(app, by, &bot, &key, reason).await as usize;
+    }
+    closed
 }
 
 /// `rotate` for every open machine screen, when someone loses access: a link doesn't

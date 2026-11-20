@@ -294,6 +294,21 @@ Before a teammate's run, botd asks the owner's agent to make that teammate a use
 
 Audited as `machine.teammate_user_created`, with `teammateUser` on `bot.run_routed` and `harness.invoked`. Design: [ADR 0048](../docs/adr/0048-teammates-own-os-user-on-machines.md).
 
+When a teammate leaves (disabled, deprovisioned by SCIM, or no longer able to run any of the owner's Bots), botd asks the owner's agent to stop their jobs, screens and processes and remove their user and home. A machine that's offline is asked again after each round of heartbeats until it's done. Their work folder goes to the owner's `work/from-teammates/` by default; to delete it instead after a grace period:
+
+```sh
+MACHINE_TEAMMATE_FILES=delete     # archive (default) or delete
+MACHINE_TEAMMATE_FILES_DAYS=7     # with delete: days it's held first, 0 to 365
+```
+
+```sh
+botctl machine removals [open|pending|held|done|cancelled|all]  # removals, open ones by default
+botctl machine teammates <user>                                 # teammates with a user on their machine
+botctl machine teammates <user> remove <teammate>               # remove one now
+```
+
+Audited as `machine.teammate_removal_*`, `machine.teammate_removed` and `machine.teammate_files_*`. Design: [ADR 0052](../docs/adr/0052-teammate-offboarding-on-machines.md).
+
 ## Approvals after an upgrade
 
 Fresh installs ask before risky actions. An install from before approvals keeps running without them (`bypass`) after `--upgrade`, and botd logs a warning at start. To opt in, on the server:
