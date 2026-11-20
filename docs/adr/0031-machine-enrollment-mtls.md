@@ -99,5 +99,5 @@ All on loopback with the fake provider: the real router, botd's machine port and
 
 - **Moving Bots onto machines** (next on #29): the run protocol behind `POST /v1/jobs`, and moving each user's folder, memory and harness logins there.
 - Pushing an agent upgrade to running machines; today a machine gets the agent at first boot.
-- A firewall rule set at the provider (Linode Cloud Firewall) limiting the agent port to the control plane.
+- A firewall rule set at the provider (Linode Cloud Firewall) limiting the agent port to the control plane. Done in [ADR 0035](0035-machine-firewall-auto-enroll.md), with hands-free first-boot enrollment and an enrollment timeout.
 - The control plane's own CA with an offline root, if the master-key-derived CA proves too coupled.

@@ -372,6 +372,13 @@ pub struct Machine {
     pub agent_seen_at: Option<i64>,
     pub agent_version: Option<String>,
     pub agent_error: Option<String>,
+    /// The provider firewall it was created behind or put behind (ADR 0035).
+    pub firewall_id: Option<String>,
+    /// When its current enrollment token was issued, plus the enrollment timeout.
+    pub enroll_by: Option<i64>,
+    /// When the reconciler found it hadn't enrolled by then. Cleared when it enrolls
+    /// or gets a new token.
+    pub enroll_overdue_at: Option<i64>,
     /// When an admin assigned it to its user, so their Bots run on it (ADR 0036).
     pub assigned_at: Option<i64>,
     pub assigned_by: Option<String>,
@@ -505,6 +512,9 @@ fn machine_row(r: &Row) -> rusqlite::Result<Machine> {
         agent_seen_at: r.get("agent_seen_at")?,
         agent_version: r.get("agent_version")?,
         agent_error: r.get("agent_error")?,
+        firewall_id: r.get("firewall_id")?,
+        enroll_by: r.get("enroll_by")?,
+        enroll_overdue_at: r.get("enroll_overdue_at")?,
         assigned_at: r.get("assigned_at")?,
         assigned_by: r.get("assigned_by")?,
     })
@@ -853,7 +863,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 13] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 14] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -866,8 +876,26 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 13] = [
     migrate_machines,
     migrate_tiers,
     migrate_machine_enrollment,
+    migrate_machine_lockdown,
     migrate_machine_placement,
 ];
+/// Machines come up firewalled and enrolled (ADR 0035): the provider firewall each is
+/// behind, and when it must have enrolled by (and when it was found it hadn't).
+fn migrate_machine_lockdown(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'firewall_id'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has {
+        return Ok(());
+    }
+    c.execute_batch(
+        "ALTER TABLE machines ADD COLUMN firewall_id TEXT;
+        ALTER TABLE machines ADD COLUMN enroll_by INTEGER;
+        ALTER TABLE machines ADD COLUMN enroll_overdue_at INTEGER;",
+    )
+}
 /// Placement (ADR 0036): an admin assigns a user's machine to them, and then that
 /// user's Bots run there. Kept on the machine row, so a user can only be placed on
 /// their own machine, and destroying it ends the placement.
@@ -2584,7 +2612,7 @@ impl Db {
         self.c()
             .execute(
                 "UPDATE machines SET provider_id = ?, tier = ?, plan = ?, region = ?, state = ?, provider_status = ?, ipv4 = ?, backups = ?,
-                 last_error = ?, create_sent_at = ?, updated_at = ?, destroyed_at = ? WHERE id = ? AND state = ?",
+                 last_error = ?, create_sent_at = ?, updated_at = ?, destroyed_at = ?, firewall_id = ? WHERE id = ? AND state = ?",
                 params![
                     m.provider_id,
                     m.tier,
@@ -2598,6 +2626,7 @@ impl Db {
                     m.create_sent_at,
                     now(),
                     m.destroyed_at,
+                    m.firewall_id,
                     m.id,
                     from.as_str()
                 ],
@@ -2608,19 +2637,57 @@ impl Db {
 
     // Machine enrollment (ADR 0031)
 
+    /// Saves a token's hash. The machine must enroll by `enroll_by` (ADR 0035); a new
+    /// token starts that clock again and clears an earlier overdue mark.
     pub fn add_machine_token(
         &self,
         machine_id: &str,
         token_hash: &str,
         expires_at: i64,
         created_by: Option<&str>,
+        enroll_by: i64,
     ) -> rusqlite::Result<()> {
+        let c = self.c();
+        let tx = c.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO machine_tokens (machine_id, token_hash, created_at, created_by, expires_at) VALUES (?, ?, ?, ?, ?)",
+            params![machine_id, token_hash, now(), created_by, expires_at],
+        )?;
+        tx.execute(
+            "UPDATE machines SET enroll_by = ?, enroll_overdue_at = NULL WHERE id = ?",
+            params![enroll_by, machine_id],
+        )?;
+        tx.commit()
+    }
+
+    /// Marks the machine overdue if it had to enroll by now and hasn't (ADR 0035).
+    /// Returns whether this call marked it, so it is reported once.
+    pub fn mark_enroll_overdue(&self, machine_id: &str) -> bool {
+        let at = now();
         self.c()
             .execute(
-                "INSERT INTO machine_tokens (machine_id, token_hash, created_at, created_by, expires_at) VALUES (?, ?, ?, ?, ?)",
-                params![machine_id, token_hash, now(), created_by, expires_at],
+                "UPDATE machines SET enroll_overdue_at = ?1 WHERE id = ?2 AND enroll_overdue_at IS NULL
+                 AND enroll_by IS NOT NULL AND enroll_by <= ?1 AND enrollment IN ('none', 'revoked')",
+                params![at, machine_id],
             )
-            .map(|_| ())
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Records that the machine is behind firewall `firewall_id` at the provider.
+    pub fn set_machine_firewall(&self, machine_id: &str, firewall_id: &str) {
+        let _ = self.c().execute("UPDATE machines SET firewall_id = ? WHERE id = ?", params![firewall_id, machine_id]);
+    }
+
+    /// How many machines other than `except` that aren't destroyed use the firewall.
+    pub fn machines_on_firewall(&self, firewall_id: &str, except: &str) -> usize {
+        self.c()
+            .query_row(
+                "SELECT COUNT(*) FROM machines WHERE firewall_id = ? AND id <> ? AND state <> 'destroyed'",
+                params![firewall_id, except],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_or(0, |n| n as usize)
     }
 
     /// A token by its hash, used or not.
@@ -2675,7 +2742,7 @@ impl Db {
         )
         .ok()?;
         tx.execute(
-            "UPDATE machines SET enrolled_at = ? WHERE id = ?",
+            "UPDATE machines SET enrolled_at = ?, enroll_by = NULL, enroll_overdue_at = NULL WHERE id = ?",
             params![at, machine_id],
         )
         .ok()?;
@@ -2988,6 +3055,25 @@ mod tests {
         assert_eq!(v, MIGRATIONS.len() as i64);
         let tables: i64 = db.c().query_row("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('machine_certs', 'machine_tokens', 'usage_monthly')", [], |r| r.get(0)).unwrap();
         assert_eq!(tables, 3);
+
+        // An install at main's enrollment version (12) gets the lockdown columns, and
+        // its machines keep working.
+        let live = db.machines(None).into_iter().find(|m| m.state != MachineState::Destroyed).unwrap();
+        db.c()
+            .execute_batch(
+                "ALTER TABLE machines DROP COLUMN firewall_id; ALTER TABLE machines DROP COLUMN enroll_by;
+                 ALTER TABLE machines DROP COLUMN enroll_overdue_at; PRAGMA user_version = 12;",
+            )
+            .unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        let v: i64 = db.c().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, MIGRATIONS.len() as i64);
+        let m = db.machine(&live.id).unwrap();
+        assert_eq!((m.firewall_id, m.enroll_by, m.enroll_overdue_at), (None, None, None));
+        db.set_machine_firewall(&live.id, "501");
+        assert_eq!(db.machines_on_firewall("501", "nobody"), 1);
+        assert_eq!(db.machines_on_firewall("501", &live.id), 0, "not counting the one asked about");
     }
 
     #[test]

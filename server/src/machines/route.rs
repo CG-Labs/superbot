@@ -213,7 +213,7 @@ pub mod recording {
         let (_, csr) = super::super::pki::new_request(&m.id).unwrap();
         let issued = ca.issue_machine(&csr, &m.user_id, &m.id, 30).unwrap();
         let hash = crate::random_hex(8);
-        db.add_machine_token(&m.id, &hash, crate::db::now() + 60_000, None).unwrap();
+        db.add_machine_token(&m.id, &hash, crate::db::now() + 60_000, None, crate::db::now() + 60_000).unwrap();
         let t = db.machine_token(&hash).unwrap().id;
         db.enroll_machine(t, &m.id, &m.user_id, &issued).unwrap();
     }

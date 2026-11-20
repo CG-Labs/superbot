@@ -118,6 +118,6 @@ Approvals made from the machine are audited exactly as local ones.
 - **Screens on machines.** Runs there get no screen yet.
 - **The agent runs as root**, so a Bot there could read the agent's key. A separate OS user for Bots belongs with #30's OS isolation.
 - **Agent upgrades.** A machine keeps the agent it installed. An outdated one is refused, not upgraded.
-- **Firewall.** The agent port isn't restricted to botd's address at the provider. Mutual TLS and the control-plane-only admit are the defence today.
+- **Firewall.** Restricting the agent port at the provider is [ADR 0035](0035-machine-firewall-auto-enroll.md) (`MACHINE_FIREWALL=on`, off by default). Without it, mutual TLS and the control-plane-only admit are the defence.
 - **Per-peer connection limits** on botd's machine port.
 - **Concurrent facts edits.** The `USER.md` guard is per botd process. Runs of one user's Bots in parallel can still lose an edit made by a run that didn't receive the file.

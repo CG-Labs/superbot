@@ -17,7 +17,8 @@
 //! - `SUPERBOT_HOME`: where Bots work (default `<state dir>/home`).
 //! - `SUPERBOT_AGENT_API`: the relay to botd's API, loopback (default 127.0.0.1:7444).
 //! - `SUPERBOT_HARNESS_PATH`: PATH for harnesses (default `<home>/.local/bin`, then
-//!   the system's).
+//!   the system's). A harness counts as installed only if it resolves to a file
+//!   under the home or `PROGRAM_ROOTS`.
 //! - `SUPERBOT_MAX_JOBS`: jobs at once (default 8).
 
 use super::job;
@@ -69,9 +70,23 @@ pub struct Config {
     pub max_jobs: usize,
 }
 
-fn runnable(p: &Path) -> bool {
+/// Where harnesses and botctl may live, besides the Bots' home: the system's program
+/// directories. A PATH entry elsewhere (say `/tmp`) isn't looked in.
+const PROGRAM_ROOTS: [&str; 6] = ["/usr", "/opt", "/bin", "/sbin", "/snap", "/nix"];
+
+/// Whether `p`, with symlinks resolved, is an executable file under one of `roots`.
+fn runnable(p: &Path, roots: &[PathBuf]) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    let Ok(p) = p.canonicalize() else {
+        return false;
+    };
+    for root in roots {
+        if p.starts_with(root) {
+            return std::fs::metadata(&p)
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+        }
+    }
+    false
 }
 
 fn now_ms() -> i64 {
@@ -165,8 +180,18 @@ impl Config {
             bots: p(self.home.join("bots")),
             user_file: p(self.home.join("USER.md")),
             api: format!("http://{}", self.api_listen),
-            botctl: runnable(&self.botctl).then(|| p(self.botctl.clone())),
+            botctl: runnable(&self.botctl, &self.roots()).then(|| p(self.botctl.clone())),
         }
+    }
+
+    /// `PROGRAM_ROOTS` and the home, canonicalized; those that don't exist are left out.
+    fn roots(&self) -> Vec<PathBuf> {
+        PROGRAM_ROOTS
+            .iter()
+            .map(Path::new)
+            .chain([self.home.as_path()])
+            .filter_map(|r| r.canonicalize().ok())
+            .collect()
     }
 
     /// The environment every job starts from; nothing of the agent's own.
@@ -182,11 +207,12 @@ impl Config {
         }
     }
 
-    /// Whether `bin` is an executable on the harness PATH.
+    /// Whether `bin` is an executable on the harness PATH, under `roots`.
     fn has(&self, bin: &str) -> bool {
+        let roots = self.roots();
         self.harness_path
             .split(':')
-            .any(|dir| runnable(&Path::new(dir).join(bin)))
+            .any(|dir| runnable(&Path::new(dir).join(bin), &roots))
     }
 
     fn ca(&self) -> CertificateDer<'static> {
