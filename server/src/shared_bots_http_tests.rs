@@ -255,15 +255,18 @@ async fn a_disabled_owners_shared_bot_does_not_run_for_anyone() {
 
     let said = run(&w, &w.b, &team.id, "status").await;
     assert!(said.contains("owner's account is turned off"), "{said}");
-    // Its routine keeps firing but doesn't run, and says so once.
+    // Its routine was paused (ADR 0047); one that fires anyway is refused before it queues.
+    assert_eq!(w.app.db.routine(&routine.id).unwrap().paused_reason.as_deref(), Some("owner_disabled"));
     for _ in 0..2 {
         cron::fire(&w.app, &routine, db::now());
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
     let bubbles = w.app.db.messages(&team.id, 50).into_iter().filter(|m| m.text.contains("turned off")).count();
-    assert_eq!(bubbles, 1, "one bubble, not one per firing");
+    assert_eq!(bubbles, 1, "one bubble, for the chat");
     let refused = events(&w, "action=bot.run_refused").await;
-    assert_eq!(refused.iter().filter(|e| e["details"]["reason"] == "owner_disabled").count(), 3);
+    assert_eq!(refused.iter().filter(|e| e["details"]["reason"] == "owner_disabled").count(), 1);
+    let not_fired = events(&w, "action=routine.run_refused").await;
+    assert_eq!(not_fired.iter().filter(|e| e["details"]["reason"] == "owner_disabled").count(), 2);
     assert!(events(&w, &format!("action=harness.invoked&bot={}", team.id)).await.is_empty(), "nothing ran");
 }
 

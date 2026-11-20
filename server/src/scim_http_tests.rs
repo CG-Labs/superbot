@@ -624,3 +624,40 @@ async fn deprovisioning_spends_app_codes_not_yet_redeemed() {
     assert_eq!(redeem(caught).await, 401);
     assert_eq!(redeem(code_for().await).await, 200, "new sign-ins still work");
 }
+
+/// SCIM-05: deprovisioning pauses the user's routines, whether by `active: false` or
+/// DELETE, and re-provisioning leaves them paused.
+#[tokio::test]
+async fn deprovisioning_pauses_the_users_routines() {
+    let (port, app, admin) = serve(|_| {}).await;
+    let (t, _) = token(port, &admin, json!({ "tenant": "okta" })).await;
+    let mut ids = Vec::new();
+    for (email, ext) in [("ada@example.com", "00u1"), ("grace@example.com", "00u2")] {
+        let (code, _, u) = scim(port, &t, "POST", USERS, okta_user(email, ext)).await;
+        assert_eq!(code, 201, "{u}");
+        ids.push(u["id"].as_str().unwrap().to_string());
+    }
+    let routines: Vec<String> = ids
+        .iter()
+        .map(|id| {
+            let b = app.db.create_bot_owned("Daily", "#fff", "waddle", "claude", None, false, id, crate::acl::Visibility::Shared);
+            app.db.add_routine(&b.id, "Daily", "0 9 * * *", "report").id
+        })
+        .collect();
+
+    let off = json!({ "Operations": [{ "op": "replace", "path": "active", "value": false }] });
+    assert_eq!(scim(port, &t, "PATCH", &format!("{USERS}/{}", ids[0]), off).await.0, 200);
+    assert_eq!(scim(port, &t, "DELETE", &format!("{USERS}/{}", ids[1]), Value::Null).await.0, 204);
+    for (id, r) in ids.iter().zip(&routines) {
+        let r = app.db.routine(r).unwrap();
+        assert_eq!((r.enabled, r.paused_reason.as_deref(), r.paused_for.as_deref()), (false, Some("owner_disabled"), Some(id.as_str())));
+    }
+    let paused = events(port, &admin, "action=routine.paused").await;
+    assert!(paused.len() == 2 && paused.iter().all(|e| e["authMethod"] == "scim_token"), "{paused:?}");
+    assert_eq!(events(port, &admin, "action=user.disabled").await[0]["details"]["routinesPaused"], 1);
+    assert_eq!(events(port, &admin, "action=scim.user_deleted").await[0]["details"]["routinesPaused"], 1);
+
+    let on = json!({ "Operations": [{ "op": "replace", "value": { "active": true } }] });
+    assert_eq!(scim(port, &t, "PATCH", &format!("{USERS}/{}", ids[0]), on).await.0, 200);
+    assert!(!app.db.routine(&routines[0]).unwrap().enabled, "an admin resumes them, not the IdP");
+}

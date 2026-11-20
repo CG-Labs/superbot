@@ -19,6 +19,9 @@ mod auth_review_http_tests;
 #[cfg(test)]
 mod interface_http_tests;
 mod cron;
+mod handover;
+#[cfg(test)]
+mod handover_http_tests;
 mod isolation;
 #[cfg(test)]
 mod isolation_http_tests;
@@ -157,6 +160,7 @@ async fn main() {
         .unwrap_or_else(|e| exit(format!("Control plane: {e}")));
     let shared_bots = acl::SharedBots::parse(&env("SHARED_BOTS", ""), control_plane.routing != machines::route::Routing::Off)
         .unwrap_or_else(|e| exit(format!("Shared Bots: {e}")));
+    let resume_routines = handover::resume_on_enable(&env("ROUTINES_ON_ENABLE", "")).unwrap_or_else(|e| exit(e));
     let scim = scim::Scim::from_env(&env("SCIM", ""), &env("SCIM_DEFAULT_ROLE", "")).unwrap_or_else(|e| exit(format!("SCIM: {e}")));
     let tiers = tiers::Tiers::from_env(|k| env(k, "")).unwrap_or_else(|e| exit(format!("Tiers: {e}")));
     let payments = billing::Billing::from_env(&secrets::env::EnvStore::process(), &|k| env(k, "")).unwrap_or_else(|e| exit(format!("Billing: {e}")));
@@ -230,6 +234,7 @@ async fn main() {
     let _ = app.tiers.set(Arc::new(tiers));
     println!("Tiers: {}.", app.tiers().describe());
     let _ = app.shared_bots.set(shared_bots);
+    let _ = app.resume_routines_on_enable.set(resume_routines);
     println!(
         "Shared Bots: {}.",
         match shared_bots {
@@ -465,6 +470,9 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/login-codes", post(users::create_login_code))
         .route("/users/{key}/sessions", delete(users::revoke_user_sessions))
         .route("/users/{key}/bots", get(users::user_bots))
+        .route("/users/{key}/routines", get(handover::list))
+        .route("/users/{key}/routines/resume", post(handover::resume_for))
+        .route("/users/{key}/handover", post(handover::handover))
         .route("/users/{key}/secrets", get(list_user_secrets).delete(delete_user_secrets))
         .route("/users/{key}/isolation", get(accounts::http::get).post(accounts::http::ensure))
         .route("/users/{key}/harness-login", post(accounts::http::harness_login))
@@ -1699,6 +1707,32 @@ async fn acl_changed(app: &App, id: &str, narrowed: bool) {
     }
 }
 
+/// Gives `bot` to `to` (an admin's choice): it takes one of their Bot slots, work
+/// started for the old owner ends, and its memory follows it. Its harness and model
+/// they can change after.
+pub(crate) async fn give_bot(app: &App, by: &Who, bot: &db::Bot, to: &db::User) -> Res<()> {
+    if to.id == bot.owner_id {
+        return Ok(());
+    }
+    let id = &bot.id;
+    let tier = app.tier_of(&to.id);
+    let max = tier.limits.max_bots;
+    // Work started for the old owner runs in their folder with their keys; it
+    // ends here, and its token stops working (it names the old owner). A refused
+    // transfer (another request took the last slot) leaves that work running.
+    if !app.stop_if(id, || app.db.set_bot_owner_capped(id, &to.id, max)) {
+        let details = json!({ "reason": "tier_bot_limit", "from": bot.owner_id, "to": to.id, "tier": tier.name, "limit": max });
+        app.db.record(&by.event("bot.transfer_refused").target("bot", id).bot(id).outcome(Outcome::Denied).details(details));
+        return Err(ApiError(StatusCode::FORBIDDEN, format!("{}'s plan ({}) allows {} Bots, and they're all in use.", to.name, tier.label, max.unwrap_or(0))));
+    }
+    // The new owner manages it anyway; a leftover grant would only confuse.
+    app.db.remove_grant(id, &to.id);
+    app.hand_over_memory(id, &bot.owner_id, &to.id);
+    app.db.record(&by.event("bot.owner_changed").target("bot", id).bot(id).details(json!({ "from": bot.owner_id, "to": to.id })));
+    acl_changed(app, id, true).await;
+    Ok(())
+}
+
 async fn get_access(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     let (bot, access) = need_bot_access(&app, &c, &by, &id, Access::View)?;
     Ok(Json(access_view(&app, &bot, access)))
@@ -1730,21 +1764,7 @@ async fn update_access(State(app): State<AppState>, Extension(c): Extension<Call
     let mut narrowed = false;
     // The owner first: it can be refused for the new owner's Bot limit.
     if let Some(u) = owner.filter(|u| u.id != bot.owner_id) {
-        // It takes one of the new owner's Bot slots; its harness and model they can change after.
-        let tier = app.tier_of(&u.id);
-        let max = tier.limits.max_bots;
-        // Work started for the old owner runs in their folder with their keys; it
-        // ends here, and its token stops working (it names the old owner). A refused
-        // transfer (another request took the last slot) leaves that work running.
-        if !app.stop_if(&id, || app.db.set_bot_owner_capped(&id, &u.id, max)) {
-            let details = json!({ "reason": "tier_bot_limit", "from": bot.owner_id, "to": u.id, "tier": tier.name, "limit": max });
-            app.db.record(&by.event("bot.transfer_refused").target("bot", &id).bot(&id).outcome(Outcome::Denied).details(details));
-            return Err(ApiError(StatusCode::FORBIDDEN, format!("{}'s plan ({}) allows {} Bots, and they're all in use.", u.name, tier.label, max.unwrap_or(0))));
-        }
-        // The new owner manages it anyway; a leftover grant would only confuse.
-        app.db.remove_grant(&id, &u.id);
-        app.hand_over_memory(&id, &bot.owner_id, &u.id);
-        app.db.record(&by.event("bot.owner_changed").target("bot", &id).bot(&id).details(json!({ "from": bot.owner_id, "to": u.id })));
+        give_bot(&app, &by, &bot, &u).await?;
         narrowed = true;
     }
     if let Some(to) = visibility.filter(|to| *to != bot.visibility) {
@@ -1990,6 +2010,9 @@ async fn create_routine(State(app): State<AppState>, Extension(c): Extension<Cal
         return Err(bad("name, cron, and instruction are required"));
     };
     let author = routine_author(&app, &c);
+    if f.enabled != Some(false) {
+        need_unblocked(&app, &id, author.as_deref())?;
+    }
     let r = app.db.add_routine_by(&id, &name, &cron_expr, &instruction, f.enabled != Some(false), author.as_deref());
     let details = json!({ "name": r.name, "cron": r.cron, "enabled": r.enabled, "author": r.author_id });
     app.db.record(&by.event("routine.created").target("routine", &r.id).bot(&id).details(details));
@@ -2003,6 +2026,18 @@ fn routine_author(app: &App, c: &Caller) -> Option<String> {
         (Some(u), _) => Some(u.id.clone()),
         (None, Principal::Bot) => c.bot.as_deref().and_then(|id| app.db.bot(id)).map(|b| app.acting_for(&b)),
         _ => None,
+    }
+}
+
+/// A routine can't be turned on while its Bot's owner or its author is disabled (ADR 0047).
+fn need_unblocked(app: &App, bot_id: &str, author: Option<&str>) -> Res<()> {
+    let Some(owner) = app.db.bot_owner(bot_id) else { return Err(not_found("Bot")) };
+    match handover::blocked(&app.db, &owner, author) {
+        None => Ok(()),
+        Some((reason, _)) => {
+            let whose = if reason == handover::OWNER_DISABLED { "this Bot's owner" } else { "whoever wrote it" };
+            Err(ApiError(StatusCode::CONFLICT, format!("This routine runs for {whose}, whose account is turned off. An admin can hand their Bots and routines to someone else.")))
+        }
     }
 }
 
@@ -2046,6 +2081,11 @@ async fn update_routine(State(app): State<AppState>, Extension(c): Extension<Cal
     let f = routine_fields(&v)?;
     // Whoever writes the instruction is whom it runs for.
     let author = routine_author(&app, &c);
+    if f.enabled == Some(true) {
+        let rewrites = f.instruction.as_deref().is_some_and(|i| i != before.instruction);
+        let author_after = if rewrites && author.is_some() { author.clone() } else { before.author_id.clone() };
+        need_unblocked(&app, &before.bot_id, author_after.as_deref())?;
+    }
     app.db.update_routine(&id, f.name.as_deref(), f.cron.as_deref(), f.instruction.as_deref(), f.enabled, author.as_deref());
     let after = app.db.routine(&id).ok_or_else(|| not_found("Routine"))?;
     for e in routine_events(&by, &before, &after) {
@@ -2885,6 +2925,7 @@ mod tests {
             run_timeout: Duration::from_secs(60),
             default_harness: "claude".into(),
         }, None);
+        users::ensure_operator(&app.db, "Owner", None);
         let bot = app.db.create_bot("Tester", "#f5f5f5", "waddle", "claude", None, true);
         let router = Router::new()
             .route("/api/bots/{id}/routines", get(list_routines).post(create_routine))
