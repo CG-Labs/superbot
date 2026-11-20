@@ -783,7 +783,7 @@ impl App {
                 _ if !errors.is_empty() => ("error", Outcome::Failure),
                 _ => ("done", Outcome::Success),
             };
-            let tokens = self.record_tokens(&bot, msg, &run_id, &route, &period, std::mem::take(&mut used));
+            let tokens = self.record_tokens(&bot, msg, &run_id, &route, std::mem::take(&mut used));
             let mut finished = json!({
                 "result": result, "durationMs": started.elapsed().as_millis() as u64, "replies": replies,
                 "attempts": attempt + 1, "trigger": msg.role, "messageId": msg.id, "runId": run_id, "usage": tokens,
@@ -1072,9 +1072,9 @@ impl App {
 
     /// Records the tokens a run used, one row per model, charged to the Bot's owner
     /// (ADR 0048). A harness that reported nothing leaves one row saying so. Audits the
-    /// run that uses up the owner's tokens for the period. Returns the run's total, or
-    /// None when unknown.
-    fn record_tokens(&self, bot: &Bot, msg: &Message, run_id: &str, route: &Route, period: &usage::Period, used: Vec<Usage>) -> Option<u64> {
+    /// run that uses up the owner's tokens for the period it ends in, which its tokens
+    /// count in. Returns the run's total, or None when unknown.
+    fn record_tokens(&self, bot: &Bot, msg: &Message, run_id: &str, route: &Route, used: Vec<Usage>) -> Option<u64> {
         let mut models: Vec<Usage> = Vec::new();
         for u in used {
             let model = u.model.clone().or_else(|| route.model.clone());
@@ -1113,6 +1113,7 @@ impl App {
             vec![row(Usage { model: route.model.clone(), ..Default::default() }, false)]
         };
         let tier = self.tier_of(&bot.owner_id);
+        let period = self.billing_period(&bot.owner_id, at);
         let before = tier.limits.monthly_tokens.map(|_| self.db.tokens_used(&bot.owner_id, period.start, period.end));
         if let Err(e) = self.db.record_tokens(&rows) {
             eprintln!("botd: couldn't record run {run_id}'s tokens: {e}");

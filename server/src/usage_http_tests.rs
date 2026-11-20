@@ -120,6 +120,17 @@ async fn tokens_are_recorded_per_run_and_shown_only_to_their_owner() {
     assert_eq!((mine["tokens"]["total"].as_u64(), mine["tokens"]["runs"].as_u64(), mine["tokens"]["unreportedRuns"].as_u64()), (Some(1500), Some(2), Some(1)), "{mine}");
     let finished = audit(w.port, &w.admin, &format!("action=bot.run_finished&bot={}", bot.id)).await;
     assert_eq!(finished[0]["details"]["usage"], Value::Null);
+
+    // An admin gives the Bot to Bea, who renames it: Ada keeps its usage, not its new name.
+    let (code, body) = call(w.port, "PATCH", &format!("/api/bots/{}/access", bot.id), &w.admin, &json!({ "owner": w.b_id, "visibility": "private" }).to_string()).await;
+    assert_eq!(code, 200, "{body}");
+    let (code, body) = call(w.port, "PATCH", &format!("/api/bots/{}", bot.id), &w.b, r#"{"name":"Bea's secret project"}"#).await;
+    assert_eq!(code, 200, "{body}");
+    let (_, mine) = get(&w, "/api/me/usage", &w.a).await;
+    assert_eq!((mine["byBot"][0]["bot"].as_str(), mine["byBot"][0]["name"].clone(), mine["tokens"]["total"].as_u64()), (Some(bot.id.as_str()), Value::Null, Some(1500)), "{mine}");
+    assert!(!mine.to_string().contains("secret project"));
+    let (_, hers) = get(&w, &format!("/api/users/{}/usage", w.a_id), &w.admin).await;
+    assert_eq!(hers["byBot"][0]["name"], "Bea's secret project");
 }
 
 #[tokio::test]

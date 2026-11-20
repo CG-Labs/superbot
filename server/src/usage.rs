@@ -55,9 +55,10 @@ impl Period {
 
 /// The billing period `at` (Unix ms) falls in, given a paid subscription's period
 /// (`start`, `end`, Unix seconds, as Stripe sends them). A monthly subscription's own
-/// period, while `at` is in it. Otherwise months counted from its start (or end): a
-/// yearly plan's months, or the months after a period whose renewal hasn't arrived yet.
-/// No subscription: the calendar month.
+/// period, while `at` is in it. Otherwise months counted from its end once `at` is past
+/// it (the months after a period whose renewal hasn't arrived yet, which Stripe starts
+/// at that end), else from its start (a yearly plan's months). No subscription: the
+/// calendar month.
 pub fn period_at(sub: Option<(Option<i64>, Option<i64>)>, at: i64) -> Period {
     let ms = |s: i64| s.saturating_mul(1000);
     let (start, end) = sub.unwrap_or_default();
@@ -68,7 +69,9 @@ pub fn period_at(sub: Option<(Option<i64>, Option<i64>)>, at: i64) -> Period {
     {
         return subscription(ms(s), ms(e));
     }
-    if let Some(anchor) = start.or(end).and_then(|s| DateTime::from_timestamp(s, 0)) {
+    let past_end = end.is_some_and(|e| at >= ms(e));
+    let anchor = if past_end { end } else { start.or(end) };
+    if let Some(anchor) = anchor.and_then(|s| DateTime::from_timestamp(s, 0)) {
         let now = DateTime::from_timestamp_millis(at).unwrap_or_default();
         let shift = |n: i64| -> Option<DateTime<Utc>> {
             let m = Months::new(u32::try_from(n.unsigned_abs()).ok()?);
@@ -121,9 +124,11 @@ fn totals(t: &TokenTotals) -> Value {
     })
 }
 
-/// A user's usage this billing period. `models`: include the per-model breakdown, which
-/// a managed tier hides from its members (ADR 0033).
-pub fn view(app: &App, user_id: &str, models: bool) -> Value {
+/// A user's usage this billing period. `admin`: include the per-model breakdown, which
+/// a managed tier hides from its members (ADR 0033), and the name of every Bot the
+/// usage was on. Otherwise only Bots the user still owns are named: a Bot given to
+/// someone else keeps its usage here, but not its new name.
+pub fn view(app: &App, user_id: &str, models: bool, admin: bool) -> Value {
     let p = app.billing_period(user_id, crate::db::now());
     let tier = app.tier_of(user_id);
     let TokenSummary { all, by_model, by_bot } = app.db.token_summary(user_id, p.start, p.end);
@@ -134,7 +139,7 @@ pub fn view(app: &App, user_id: &str, models: bool) -> Value {
         .map(|(id, t)| {
             let mut v = totals(t);
             v["bot"] = json!(id);
-            v["name"] = json!(app.db.bot(id).map(|b| b.name));
+            v["name"] = json!(app.db.bot(id).filter(|b| admin || b.owner_id == user_id).map(|b| b.name));
             v
         })
         .collect();
@@ -164,14 +169,14 @@ pub fn view(app: &App, user_id: &str, models: bool) -> Value {
 pub async fn mine(State(app): State<AppState>, Extension(c): Extension<Caller>) -> Res {
     need_user(c.principal)?;
     let id = c.user.as_ref().map_or(crate::users::OPERATOR, |u| u.id.as_str());
-    let models = c.principal == Principal::User(Role::Admin) || !app.tier_of(id).managed();
-    Ok(Json(view(&app, id, models)))
+    let admin = c.principal == Principal::User(Role::Admin);
+    Ok(Json(view(&app, id, admin || !app.tier_of(id).managed(), admin)))
 }
 
 /// `GET /api/users/{key}/usage` (admins): one user's usage this billing period.
 pub async fn of_user(State(app): State<AppState>, Path(key): Path<String>) -> Res {
     let u = need_user_key(&app, &key)?;
-    Ok(Json(view(&app, &u.id, true)))
+    Ok(Json(view(&app, &u.id, true, true)))
 }
 
 #[cfg(test)]
@@ -212,6 +217,11 @@ mod tests {
         assert_eq!((next.start, next.end), (e * 1000, ms("2027-01-14T08:00:00Z")));
         let later = period_at(Some((Some(s), Some(e))), ms("2027-02-01T00:00:00Z"));
         assert_eq!((later.key.as_str(), later.end), ("2027-01-14T08:00:00Z", ms("2027-02-14T08:00:00Z")));
+        // A month-end period whose renewal is late: months from its end, where Stripe's
+        // next period starts, not from its start.
+        let (fs, fe) = (secs("2026-02-28T12:00:00Z"), secs("2026-03-31T12:00:00Z"));
+        let late = period_at(Some((Some(fs), Some(fe))), ms("2026-04-01T00:00:00Z"));
+        assert_eq!((late.key.as_str(), late.end), ("2026-03-31T12:00:00Z", ms("2026-04-30T12:00:00Z")));
         // Known only by its end (from before starts were kept): months back from the end.
         let old = period_at(Some((None, Some(e))), ms("2026-11-20T10:00:00Z"));
         assert_eq!((old.start, old.end), (s * 1000, e * 1000));

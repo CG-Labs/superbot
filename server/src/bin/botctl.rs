@@ -678,7 +678,7 @@ fn period_summary(v: &Value) -> String {
     }
     out.push('\n');
     for b in v["byBot"].as_array().into_iter().flatten() {
-        let name = b["name"].as_str().unwrap_or("(deleted)");
+        let name = b["name"].as_str().unwrap_or("(deleted or not yours now)");
         out += &format!("  Bot {name} ({}): {} tokens in {} runs\n", b["bot"].as_str().unwrap_or_default(), n(&b["total"]), n(&b["runs"]));
     }
     for m in v["byModel"].as_array().into_iter().flatten() {
@@ -1112,7 +1112,7 @@ mod tests {
         let out = period_summary(&v);
         assert_eq!(
             out,
-            "Pro plan, 2026-11-18 to 2026-12-18 (subscription period)\nTokens 1500/5000000 (input 1000, output 200, cache read 300, cache write 0)\nRuns 2/unlimited; 1 reported no tokens\n  Bot Ada's (b1): 1500 tokens in 2 runs\n  Bot (deleted) (b2): 0 tokens in 1 runs\n  Model claude-sonnet-4-5: 1500 tokens in 1 runs\n"
+            "Pro plan, 2026-11-18 to 2026-12-18 (subscription period)\nTokens 1500/5000000 (input 1000, output 200, cache read 300, cache write 0)\nRuns 2/unlimited; 1 reported no tokens\n  Bot Ada's (b1): 1500 tokens in 2 runs\n  Bot (deleted or not yours now) (b2): 0 tokens in 1 runs\n  Model claude-sonnet-4-5: 1500 tokens in 1 runs\n"
         );
         // A member on a managed plan gets no models; the calendar month says so.
         let mut member = v.clone();
