@@ -125,10 +125,11 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, 
         routine={editing === "new" ? undefined : editing}
         onCancel={() => setEditing(null)}
         onSave={async (draft) => {
+          const session = sessionRef.current;
           if (editing === "new") await createRoutine(bot.id, draft);
           else await updateRoutine(editing, draft);
           await reload();
-          setEditing(null);
+          if (sessionRef.current === session) setEditing(null);
         }}
         onDelete={
           editing === "new"
@@ -136,9 +137,10 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, 
             : async () => {
                 const ok = await confirmAsync(`Delete "${editing.name}"?`, "The Bot stops running it.");
                 if (!ok) return;
+                const session = sessionRef.current;
                 await deleteRoutine(editing.id);
                 await reload();
-                setEditing(null);
+                if (sessionRef.current === session) setEditing(null);
               }
         }
       />
