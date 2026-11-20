@@ -1,5 +1,5 @@
 import React from "react";
-import { act, render, screen, userEvent } from "@testing-library/react-native";
+import { act, fireEvent, render, screen, userEvent } from "@testing-library/react-native";
 import { PromptsEditor } from "../PromptsEditor";
 import { DEFAULT_PROMPTS } from "../../src/prompts";
 
@@ -51,6 +51,20 @@ describe("PromptsEditor", () => {
     expect(screen.getByLabelText("Prompt 1").props.editable).toBe(false);
     await act(async () => finish());
     expect(screen.getByLabelText("Prompt 1").props.editable).toBe(true);
+  });
+
+  it("counts emoji as one character, like the server, and refuses past 200", async () => {
+    const user = userEvent.setup();
+    const onSave = jest.fn().mockResolvedValue(undefined);
+    await render(<PromptsEditor prompts={["🚀".repeat(200)]} custom onSave={onSave} onCancel={jest.fn()} />);
+
+    await user.press(screen.getByRole("button", { name: "Save prompts" }));
+    expect(onSave).toHaveBeenCalledWith(["🚀".repeat(200)]);
+    onSave.mockClear();
+    await act(async () => fireEvent.changeText(screen.getByLabelText("Prompt 1"), "🚀".repeat(201)));
+    await user.press(screen.getByRole("button", { name: "Save prompts" }));
+    expect(screen.getByRole("alert")).toHaveTextContent(/200 characters/);
+    expect(onSave).not.toHaveBeenCalled();
   });
 
   it("shows the server's refusal and cancels", async () => {

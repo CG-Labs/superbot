@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import { Pressable, StyleSheet, Text, TextInput, View } from "react-native";
-import { cleanPrompts, MAX_PROMPT_CHARS, MAX_PROMPTS, validatePrompts } from "../src/prompts";
+import { cleanPrompts, MAX_PROMPTS, validatePrompts } from "../src/prompts";
 import { colors } from "../src/theme";
 
 interface Props {
@@ -57,7 +57,6 @@ export function PromptsEditor({ prompts, custom, onSave, onCancel }: Props) {
             placeholderTextColor={colors.textFaint}
             value={p}
             editable={!busy}
-            maxLength={MAX_PROMPT_CHARS}
             onChangeText={(t) => setList((l) => l.map((x, k) => (k === i ? t : x)))}
           />
           <Pressable
