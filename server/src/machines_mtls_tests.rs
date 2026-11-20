@@ -35,6 +35,11 @@ async fn serve() -> Env {
 
 /// `serve`, with enrollment changed by `f`.
 pub(crate) async fn serve_with(f: impl FnOnce(Enrollment) -> Enrollment) -> Env {
+    serve_with_auth(f, |_| {}).await
+}
+
+/// `serve_with`, with botd's auth settings changed by `tweak` too.
+pub(crate) async fn serve_with_auth(f: impl FnOnce(Enrollment) -> Enrollment, tweak: impl FnOnce(&mut crate::Auth) + Send + 'static) -> Env {
     let machine_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let agent_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let (mport, aport) = (
@@ -51,7 +56,11 @@ pub(crate) async fn serve_with(f: impl FnOnce(Enrollment) -> Enrollment) -> Env 
     let cp = Arc::new(cp);
     let shared = cp.clone();
     let (port, app, owner, _, router) =
-        crate::tests::serve_app_and_router(move |a| a.machines = shared).await;
+        crate::tests::serve_app_and_router(move |a| {
+            a.machines = shared;
+            tweak(a);
+        })
+        .await;
     let api = enroll::Api {
         router,
         host: format!("127.0.0.1:{port}"),
