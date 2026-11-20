@@ -24,7 +24,7 @@ const HELP: &str = "superbot-license: make and check SuperBot self-host license 
 
 The kid defaults to cg-<year>. Keep old keys in TRUSTED until every license they signed has ended.";
 
-type Res<T = ()> = Result<T, String>;
+type Res<T> = Result<T, String>;
 
 struct Args(Vec<String>);
 
@@ -87,7 +87,7 @@ fn trusted_line(kid: &str, key: &aws_lc_rs::signature::Ed25519KeyPair) -> String
     format!("(\"{kid}\", \"{}\"),", token::public_b64(key))
 }
 
-fn keygen(mut a: Args) -> Res {
+fn keygen(mut a: Args) -> Res<String> {
     let out = a.need("--out")?;
     let kid = a.take("--kid")?.unwrap_or_else(default_kid);
     a.rest(0)?;
@@ -103,19 +103,17 @@ fn keygen(mut a: Args) -> Res {
     f.write_all(pem.as_bytes()).and_then(|_| f.sync_all()).map_err(|e| format!("{out}: {e}"))?;
     eprintln!("Private key saved to {out}. Keep it offline and backed up; never commit it.");
     eprintln!("Add this to TRUSTED in server/src/license/mod.rs:");
-    println!("{}", trusted_line(&kid, &key));
-    Ok(())
+    Ok(trusted_line(&kid, &key))
 }
 
-fn public(mut a: Args) -> Res {
+fn public(mut a: Args) -> Res<String> {
     let key = read_key(&a.need("--key")?)?;
     let kid = a.take("--kid")?.unwrap_or_else(default_kid);
     a.rest(0)?;
-    println!("{}", trusted_line(&kid, &key));
-    Ok(())
+    Ok(trusted_line(&kid, &key))
 }
 
-fn sign(mut a: Args) -> Res {
+fn sign(mut a: Args) -> Res<String> {
     let key = read_key(&a.need("--key")?)?;
     let kid = a.need("--kid")?;
     let licensee = a.need("--licensee")?;
@@ -146,8 +144,7 @@ fn sign(mut a: Args) -> Res {
     // Our own check, as botd will make it.
     token::verify(&t, &[Key::parse(&kid, &token::public_b64(&key))?], at.max(claims.nbf.unwrap_or(at))).map_err(|e| e.text().to_string())?;
     eprintln!("{}", describe(&claims));
-    println!("{t}");
-    Ok(())
+    Ok(t)
 }
 
 fn describe(c: &Claims) -> String {
@@ -164,7 +161,7 @@ fn describe(c: &Claims) -> String {
     )
 }
 
-fn verify(mut a: Args) -> Res {
+fn verify(mut a: Args) -> Res<String> {
     let key = match (a.take("--key")?, a.take("--public")?) {
         (Some(path), None) => {
             let k = read_key(&path)?;
@@ -189,13 +186,13 @@ fn verify(mut a: Args) -> Res {
     // With a private key file, the token's own kid is the one to check.
     let kid = key.0.or_else(|| token::kid_of(&t)).ok_or("the license names no key")?;
     let c = token::verify(&t, &[Key::parse(&kid, &key.1)?], at).map_err(|e| e.text().to_string())?;
-    println!("{}", serde_json::to_string_pretty(&c).map_err(|e| e.to_string())?);
+    let shown = serde_json::to_string_pretty(&c).map_err(|e| e.to_string())?;
     let state = if at < c.exp { "valid" } else { "ended" };
     eprintln!("{} Signature good; {state} on {}.", describe(&c), chrono::DateTime::from_timestamp(at, 0).unwrap_or_default().format("%Y-%m-%d"));
     if at >= c.exp {
         return Err("the license has ended".into());
     }
-    Ok(())
+    Ok(shown)
 }
 
 fn main() {
@@ -207,14 +204,63 @@ fn main() {
         "public" => public(a),
         "sign" => sign(a),
         "verify" => verify(a),
-        "" | "help" | "-h" | "--help" => {
-            println!("{HELP}");
-            Ok(())
-        }
+        "" | "help" | "-h" | "--help" => Ok(HELP.to_string()),
         other => Err(format!("unknown command {other}. Run superbot-license help.")),
     };
-    if let Err(e) = res {
-        eprintln!("superbot-license: {e}");
-        std::process::exit(1);
+    match res {
+        Ok(out) => println!("{out}"),
+        Err(e) => {
+            eprintln!("superbot-license: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(s: &[&str]) -> Args {
+        Args(s.iter().map(|a| a.to_string()).collect())
+    }
+
+    #[test]
+    fn keygen_sign_and_verify_round_trip() {
+        let dir = std::env::temp_dir().join(format!("superbot-license-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("cg.pem");
+        let k = key.to_str().unwrap();
+        let line = keygen(args(&["--out", k, "--kid", "cg-test"])).unwrap();
+        assert!(line.starts_with("(\"cg-test\", \"") && line.ends_with("\"),"), "{line}");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(keygen(args(&["--out", k])).unwrap_err().contains("exists"), "never overwrites a key");
+        assert_eq!(public(args(&["--key", k, "--kid", "cg-test"])).unwrap(), line);
+
+        let t = sign(args(&["--key", k, "--kid", "cg-test", "--licensee", "Acme Ltd", "--days", "365", "--seats", "50", "--feature", "sso", "--feature", "scim", "--id", "lic-acme-1"])).unwrap();
+        let public_key = line.split('"').nth(3).unwrap();
+        let shown = verify(args(&["--public", &format!("cg-test={public_key}"), &t])).unwrap();
+        let c: Claims = serde_json::from_str(&shown).unwrap();
+        assert_eq!((c.sub.as_str(), c.seats, c.jti.as_str(), c.edition.as_str(), c.aud.as_str()), ("Acme Ltd", Some(50), "lic-acme-1", "business", token::AUDIENCE));
+        assert_eq!(c.features, ["sso", "scim"]);
+        assert!(verify(args(&["--key", k, &t])).is_ok());
+        // Checked as it will be on a date after it ends.
+        assert!(verify(args(&["--key", k, "--at", "2999-01-01", &t])).unwrap_err().contains("ended"));
+        // Through a date: valid all of that day, UTC.
+        let dated = sign(args(&["--key", k, "--kid", "cg-test", "--licensee", "Acme", "--expires", "2999-12-31"])).unwrap();
+        let c: Claims = serde_json::from_str(&verify(args(&["--key", k, &dated])).unwrap()).unwrap();
+        assert_eq!((c.exp, c.seats), (day("3000-01-01").unwrap(), None));
+
+        for bad in [
+            vec!["--key", k, "--kid", "cg-test", "--licensee", "Acme"],
+            vec!["--key", k, "--kid", "cg-test", "--licensee", "Acme", "--days", "0"],
+            vec!["--key", k, "--kid", "cg-test", "--licensee", "Acme", "--days", "9", "--seats", "0"],
+            vec!["--key", k, "--kid", "Not OK", "--licensee", "Acme", "--days", "9"],
+            vec!["--key", k, "--kid", "cg-test", "--licensee", "Acme", "--expires", "2001-01-01"],
+            vec!["--key", k, "--kid", "cg-test", "--licensee", "Acme", "--days", "9", "--bogus"],
+        ] {
+            assert!(sign(args(&bad)).is_err(), "{bad:?}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

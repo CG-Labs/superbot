@@ -68,7 +68,7 @@ pub enum Source {
 }
 
 impl Source {
-    fn from_env(self) -> bool {
+    fn is_env(self) -> bool {
         matches!(self, Source::Env | Source::EnvFile)
     }
 }
@@ -250,7 +250,7 @@ impl Status {
             "edition": self.edition(),
             "features": self.honoured().map_or(&[][..], |c| c.features.as_slice()),
             "source": self.source,
-            "savable": !self.source.from_env(),
+            "savable": !self.source.is_env(),
             "license": license,
             "error": self.problem.as_ref().map(|p| p.code),
             "problem": self.problem.as_ref().map(|p| p.text.clone()),
@@ -373,7 +373,7 @@ impl Licensing {
             }
             db.record(&by.event("license.refused").target("license", "server").outcome(Outcome::Failure).details(d));
         };
-        if before.source.from_env() {
+        if before.source.is_env() {
             refuse("set_in_env", json!({}));
             return Err(ChangeError::FromEnv);
         }
@@ -402,7 +402,7 @@ impl Licensing {
     pub fn remove(&self, db: &Db, by: &Who) -> Result<Status, ChangeError> {
         let _one = self.changing.lock().unwrap_or_else(|e| e.into_inner());
         let before = self.status();
-        if before.source.from_env() {
+        if before.source.is_env() {
             return Err(ChangeError::FromEnv);
         }
         match std::fs::remove_file(&self.path) {
