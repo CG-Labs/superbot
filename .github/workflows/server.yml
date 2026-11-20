@@ -167,6 +167,24 @@ jobs:
           [[ ! -e "$key" ]]
           echo ok
           EOF
+      - name: .env values are written as given
+        run: |
+          set -euo pipefail
+          env_file=$(mktemp)
+          printf 'USER_NAME=Owner\nUSER_NAME_OLD=keep\n' >"$env_file"
+          SUPERBOT_INSTALL_NO_MAIN=1 bash -c '
+            set -euo pipefail
+            source deploy/install.sh
+            set_env_var "$1" USER_NAME "Alice & Bob | C:\\x \$(id)"
+            set_env_var "$1" TZ "Europe/Jersey"
+            if (set_env_var "$1" TZ "a
+          b"); then exit 1; fi
+          ' _ "$env_file"
+          diff "$env_file" - <<'EOF'
+          USER_NAME=Alice & Bob | C:\x $(id)
+          USER_NAME_OLD=keep
+          TZ=Europe/Jersey
+          EOF
       - name: Root stages templates from its own fetch and renders fixed units
         run: |
           set -euo pipefail
