@@ -731,7 +731,7 @@ async fn changed(app: &AppState, a: &Auth, c: &Caller, before_user: &User, befor
             if let Some(screens) = &app.screens {
                 screens.rotate_all().await;
             }
-            crate::machines::screens::rotate_all(&app).await;
+            crate::machines::screens::rotate_all(app).await;
         }
         None => {}
     }
