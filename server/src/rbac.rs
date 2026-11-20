@@ -111,7 +111,7 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         // Your own machine (ADR 0025). Everyone else's, and every change, is under
         // `users` above or `machines`, which fall through to Admin.
         ("GET", ["machine"]) => Account,
-        // Your own secrets (ADR 0028). Handlers refuse Bots; anyone else's are under `users`.
+        // Your own secrets (ADR 0029). Handlers refuse Bots; anyone else's are under `users`.
         ("GET", ["me", "secrets"]) => Read,
         ("PUT" | "DELETE", ["me", "secrets", _]) => Write,
 

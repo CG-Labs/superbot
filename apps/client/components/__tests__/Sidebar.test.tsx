@@ -1,0 +1,63 @@
+import React from "react";
+import { render, screen, userEvent } from "@testing-library/react-native";
+import { Sidebar } from "../Sidebar";
+import type { Me } from "../../src/types";
+
+jest.mock("../BotAvatar", () => ({ BotAvatar: () => null }));
+
+const ALL = ["account", "read", "review", "write", "approve", "admin"];
+const mockCtx: Record<string, unknown> = {};
+jest.mock("../../src/SuperBotContext", () => ({ useSuperBot: () => mockCtx }));
+
+function setup(me: Me) {
+  Object.assign(mockCtx, {
+    bots: [],
+    activeId: null,
+    filter: "",
+    setFilter: jest.fn(),
+    showHidden: false,
+    setShowHidden: jest.fn(),
+    me,
+    handoffs: {},
+    approvals: [],
+    canWrite: true,
+  });
+  const props = {
+    onSelectBot: jest.fn(),
+    onNewBot: jest.fn(),
+    onLogout: jest.fn(),
+    onOpenApprovals: jest.fn(),
+    onOpenUsers: jest.fn(),
+    onOpenAudit: jest.fn(),
+    onOpenConsole: jest.fn(),
+  };
+  return props;
+}
+
+describe("Sidebar admin entries", () => {
+  it("shows admins the users, the audit log, and a link to the admin console", async () => {
+    const props = setup({ name: "Owner", role: "admin", permissions: ALL });
+    const user = userEvent.setup();
+    await render(<Sidebar {...props} />);
+    await user.press(screen.getByRole("link", { name: "Admin console" }));
+    expect(props.onOpenConsole).toHaveBeenCalledTimes(1);
+    await user.press(screen.getByText("Audit log"));
+    expect(props.onOpenAudit).toHaveBeenCalledTimes(1);
+    await user.press(screen.getByText("Users"));
+    expect(props.onOpenUsers).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["member", { name: "Alex", role: "member", permissions: ["account", "read", "review", "write", "approve"] }],
+    ["read-only", { name: "Rae", role: "readonly", permissions: ["account", "read", "review"] }],
+    ["a Bot", { name: "Scout", role: "bot", permissions: ["account", "read", "write"] }],
+    ["a server from before roles", { name: "You" }],
+  ] as [string, Me][])("shows %s none of them", async (_, me) => {
+    await render(<Sidebar {...setup(me)} />);
+    expect(screen.queryByRole("link", { name: "Admin console" })).toBeNull();
+    expect(screen.queryByText("Admin console ↗")).toBeNull();
+    expect(screen.queryByText("Audit log")).toBeNull();
+    expect(screen.queryByText("Users")).toBeNull();
+    expect(screen.getByText("Approvals")).toBeOnTheScreen();
+  });
+});

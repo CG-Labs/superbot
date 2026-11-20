@@ -175,7 +175,7 @@ async fn main() {
         default_harness,
     }, screens);
 
-    // Each user's Bots work in that user's folders (ADR 0028). Files from before were
+    // Each user's Bots work in that user's folders (ADR 0029). Files from before were
     // the owner account's.
     match isolation::migrate_workspace(&app.cfg.workspace, users::OPERATOR, &app.cfg.data_dir) {
         Ok(0) => {}
@@ -710,7 +710,7 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
         };
         return denied("role", msg);
     }
-    // A Bot acts for its owner, so it can't do what the owner's role can't (ADR 0028).
+    // A Bot acts for its owner, so it can't do what the owner's role can't (ADR 0029).
     if caller.principal == Principal::Bot
         && let Some(app) = &a.app
     {
@@ -759,7 +759,7 @@ fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<
     };
     if let Some(t) = h.strip_prefix("Bearer ") {
         let t = t.trim();
-        // Each Bot's runs carry their own token (ADR 0028). A forged one, one from an
+        // Each Bot's runs carry their own token (ADR 0029). A forged one, one from an
         // earlier start, one for a Bot since deleted, or one from before the Bot changed
         // hands is refused.
         if t.starts_with(isolation::BOT_TOKEN_PREFIX) {
@@ -1106,7 +1106,7 @@ fn need_bot(app: &App, id: &str) -> Res<db::Bot> {
 }
 
 /// Whose Bot access a request has. A Bot acts with its owner's: its token names it,
-/// so it can't borrow another user's (ADR 0028).
+/// so it can't borrow another user's (ADR 0029).
 fn viewer(app: &App, c: &Caller, _by: &Who) -> Viewer {
     match (c.principal, c.bot.as_deref().and_then(|id| app.db.bot(id))) {
         (Principal::Bot, Some(b)) => Viewer::owner_of(&app.db, &b),
@@ -1116,7 +1116,7 @@ fn viewer(app: &App, c: &Caller, _by: &Who) -> Viewer {
 }
 
 /// The Bot a request acts as (`from`). A Bot is the one its token names and can't
-/// name another (ADR 0028); a person names one they can operate.
+/// name another (ADR 0029); a person names one they can operate.
 fn acting_bot(app: &App, c: &Caller, by: &Who, named: Option<&str>) -> Res<db::Bot> {
     let named = named.map(str::trim).filter(|n| !n.is_empty());
     match c.principal {
@@ -1904,7 +1904,7 @@ async fn delete_secret(State(app): State<AppState>, Extension(who): Extension<Pr
     Ok(Json(json!({ "ok": true })))
 }
 
-// Your own secrets (ADR 0028): harness logins and API keys that reach only your Bots,
+// Your own secrets (ADR 0029): harness logins and API keys that reach only your Bots,
 // over a server-wide one of the same name. A person's, never a Bot's: a Bot that could
 // read or change them could take its owner's keys elsewhere.
 
@@ -2051,7 +2051,7 @@ mod tests {
         assert_eq!(status(port, &host, "").await, 200);
     }
 
-    /// Mints the `Authorization` header a Bot's runs get (ADR 0028), for the Bot's
+    /// Mints the `Authorization` header a Bot's runs get (ADR 0029), for the Bot's
     /// owner now (the owner account when there's no app or no such Bot).
     #[derive(Clone)]
     pub(super) struct BotKey(pub String, pub Option<AppState>);

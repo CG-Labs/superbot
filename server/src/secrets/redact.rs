@@ -48,7 +48,7 @@ pub fn known() -> Vec<String> {
     KNOWN.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// Each user's own secrets (ADR 0028), by user. Any member can save any value, so
+/// Each user's own secrets (ADR 0029), by user. Any member can save any value, so
 /// theirs are redacted only where their own Bots write (`text_for`): one user can't
 /// erase words from everyone else's chats.
 static OWNED: RwLock<BTreeMap<String, Vec<String>>> = RwLock::new(BTreeMap::new());

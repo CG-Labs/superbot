@@ -23,7 +23,7 @@ const HOOK_GRACE: Duration = Duration::from_secs(5);
 
 pub struct Config {
     pub data_dir: PathBuf,
-    /// Holds one working folder per user (`users/<id>`, ADR 0028).
+    /// Holds one working folder per user (`users/<id>`, ADR 0029).
     pub workspace: PathBuf,
     /// The owner account's name, for Bots the operator owns.
     pub user_name: String,
@@ -65,7 +65,7 @@ pub struct App {
     waiters: Mutex<HashMap<i64, oneshot::Sender<String>>>,
     /// Tool calls waiting on the user, by approval id. true = approved.
     pub approval_waiters: Mutex<HashMap<String, oneshot::Sender<bool>>>,
-    /// Picks where each Bot runs: its owner's machine, or here (ADR 0028). Unset: here.
+    /// Picks where each Bot runs: its owner's machine, or here (ADR 0029). Unset: here.
     pub control_plane: OnceLock<Arc<ControlPlane>>,
     closing: AtomicBool,
 }

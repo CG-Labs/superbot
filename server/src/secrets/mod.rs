@@ -155,7 +155,7 @@ pub struct UserListed {
 
 pub struct Secrets {
     stores: Vec<Box<dyn SecretStore>>,
-    /// Each user's own (ADR 0028). None: no store for them here.
+    /// Each user's own (ADR 0029). None: no store for them here.
     users: Option<sealed::UserSecrets>,
 }
 

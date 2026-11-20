@@ -44,7 +44,7 @@ impl Drop for OnDrop {
 
 impl App {
     /// The Bot's workspace is its owner's folder, so deleting in another user's folder
-    /// counts as outside it (ADR 0028).
+    /// counts as outside it (ADR 0029).
     pub fn policy_ctx(&self, bot: &Bot) -> Ctx {
         let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| "/".into());
         // No folder of its own (an odd owner id): nothing is inside, so every delete asks.

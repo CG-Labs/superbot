@@ -21,7 +21,7 @@ mkdir -p "$DEST"
 if [[ -f "$DB" ]]; then
   sqlite3 "$DB" ".backup '$DEST/app.sqlite'"
   cp -a "$DATA_DIR/bots" "$DEST/" 2>/dev/null || true
-  # Each user's facts (users/<id>/USER.md, ADR 0028); USER.md is from before per-user folders.
+  # Each user's facts (users/<id>/USER.md, ADR 0029); USER.md is from before per-user folders.
   cp -a "$DATA_DIR/users" "$DEST/" 2>/dev/null || true
   cp -a "$DATA_DIR/USER.md" "$DEST/" 2>/dev/null || true
 fi

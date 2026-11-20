@@ -20,7 +20,7 @@ botd embeds `site/` and `web/`. Set `SITE_DIR` or `WEB_DIR` to serve them from d
 - **Memory** is plain files, re-sent in the system prompt every run. The Bot edits them itself:
   - `DATA_DIR/bots/<id>/MEMORY.md`: one Bot's job, rules, and work log.
   - `DATA_DIR/users/<owner>/USER.md`: facts about the Bot's owner, shared by that user's Bots.
-- **The computer** is one per user: `WORKSPACE_DIR/users/<owner>/`, shared by that user's Bots. Each Bot gets its own API token and its owner's saved secrets. See [ADR 0028](adr/0028-per-user-isolation.md).
+- **The computer** is one per user: `WORKSPACE_DIR/users/<owner>/`, shared by that user's Bots. Each Bot gets its own API token and its owner's saved secrets. See [ADR 0029](adr/0029-per-user-isolation.md).
 - **Routines** are cron schedules. Bots create them with the `botctl` CLI, which works from any harness's shell.
 - **Bot to Bot**: a Bot runs `botctl ask "<Bot>" "<message>"`. The other Bot answers in its own chat and the reply prints back. If it takes over 9 minutes, the reply arrives later as a new message.
 - **Model and effort** are saved per Bot. The web app shows a faint picker above the input. Unset means the harness default.

@@ -1,4 +1,4 @@
-//! Per-user isolation on one host (ADR 0028). A user's Bots share that user's folders
+//! Per-user isolation on one host (ADR 0029). A user's Bots share that user's folders
 //! and secrets, and nobody else's: `WORKSPACE_DIR/users/<user>` is their working folder,
 //! `DATA_DIR/users/<user>/USER.md` their facts. Each Bot run carries a token only that
 //! Bot has, so a Bot can't claim to be another user's Bot. On managed hosting the same

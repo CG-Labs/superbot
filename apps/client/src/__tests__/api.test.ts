@@ -88,3 +88,36 @@ describe("cookie sessions (ADR 0027)", () => {
     expect(api.authHeaders()).toEqual({});
   });
 });
+
+describe("audit log (ADR 0009, 0019)", () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+  const TOKEN = "sbs_" + "a".repeat(64);
+
+  it("pages with the filter, a cursor, and a limit", async () => {
+    const fetchMock = jest.fn(async () => ({ ok: true, status: 200, json: async () => ({ events: [], nextBefore: null }) }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const api = new SuperBotApi({ baseUrl: BASE, token: TOKEN });
+    await api.audit("action=bot.*");
+    await api.audit("", 41, 50);
+    expect(fetchMock.mock.calls.map((c) => (c as unknown as [string])[0])).toEqual([
+      `${BASE}/api/audit?action=bot.*&limit=100`,
+      `${BASE}/api/audit?before=41&limit=50`,
+    ]);
+  });
+
+  it("fetches the CSV with the session's token, and says why the server refused it", async () => {
+    const fetchMock = jest.fn(async () => ({ ok: true, status: 200, text: async () => "id,time\r\n" }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const api = new SuperBotApi({ baseUrl: BASE, token: TOKEN });
+    expect(await api.auditCsv("actor=bot")).toBe("id,time\r\n");
+    expect(fetchMock).toHaveBeenCalledWith(`${BASE}/api/audit/export.csv?actor=bot`, expect.objectContaining({ method: "GET", headers: { Authorization: `Bearer ${TOKEN}` } }));
+    await api.auditCsv("");
+    expect((fetchMock.mock.calls[1] as unknown as [string])[0]).toBe(`${BASE}/api/audit/export.csv`);
+
+    globalThis.fetch = jest.fn(async () => ({ ok: false, status: 403, json: async () => ({ error: "Admins only" }) })) as unknown as typeof fetch;
+    await expect(api.auditCsv("")).rejects.toMatchObject({ message: "Admins only", status: 403 });
+  });
+});

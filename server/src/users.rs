@@ -212,7 +212,7 @@ pub struct Caller {
     pub session: Option<Session>,
     /// "session", "password" (break-glass Basic), "none" (ALLOW_NO_AUTH), or "bot_token".
     pub method: &'static str,
-    /// The Bot a Bot's token was issued to (ADR 0028). Only ever set for `Principal::Bot`.
+    /// The Bot a Bot's token was issued to (ADR 0029). Only ever set for `Principal::Bot`.
     pub bot: Option<String>,
 }
 

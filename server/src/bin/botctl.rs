@@ -126,7 +126,7 @@ fn api(cred: Cred, method: &str, path: &str, body: Option<String>) -> Result<Str
     }
     let auth = if auth.is_empty() { String::new() } else { format!("Authorization: {auth}\r\n") };
     let body = body.unwrap_or_default();
-    // BOT_TOKEN is this Bot's own, so it says which Bot is calling (ADR 0028).
+    // BOT_TOKEN is this Bot's own, so it says which Bot is calling (ADR 0029).
     let req = format!(
         "{method} {path} HTTP/1.0\r\nHost: {addr}\r\n{auth}User-Agent: botctl/{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         env!("CARGO_PKG_VERSION"),

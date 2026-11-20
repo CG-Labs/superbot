@@ -1,4 +1,4 @@
-//! Per-user isolation (ADR 0028), on the real router: user B can't reach user A's Bots,
+//! Per-user isolation (ADR 0029), on the real router: user B can't reach user A's Bots,
 //! folders, secrets, screens, or sessions through any route, as a person or through a
 //! Bot of theirs; a Bot can only act as itself; shared Bots still work for others and
 //! still run in their owner's space; and with routing on, a Bot runs only on its

@@ -335,7 +335,7 @@ fn user_context(user_id: &str, name: &str) -> String {
     format!("user-secrets/{user_id}/{name}")
 }
 
-/// Each user's own secrets (ADR 0028): API keys and tokens that reach only that user's
+/// Each user's own secrets (ADR 0029): API keys and tokens that reach only that user's
 /// Bots. Every query names the user.
 pub struct UserSecrets {
     c: Mutex<Connection>,

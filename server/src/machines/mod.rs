@@ -136,7 +136,7 @@ pub struct ControlPlane {
     pub label_prefix: String,
     pub authorized_keys: Vec<String>,
     pub reconcile_every: Duration,
-    /// MACHINE_ROUTING=on: each user's Bots run only on that user's machine (ADR 0028).
+    /// MACHINE_ROUTING=on: each user's Bots run only on that user's machine (ADR 0029).
     /// Off: on this server, in the owner's folders.
     pub routing: bool,
     /// How work reaches a user's machine. `Unenrolled` until machines run an agent.

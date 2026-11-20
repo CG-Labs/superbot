@@ -1374,7 +1374,7 @@ impl Db {
         self.c().execute("UPDATE messages SET question = ? WHERE id = ?", params![q, id]).unwrap();
     }
 
-    /// Who owns a Bot: whose own secrets are redacted from what it writes (ADR 0028).
+    /// Who owns a Bot: whose own secrets are redacted from what it writes (ADR 0029).
     pub fn bot_owner(&self, bot_id: &str) -> Option<String> {
         self.c().query_row("SELECT owner_id FROM bots WHERE id = ?", [bot_id], |r| r.get(0)).ok()
     }

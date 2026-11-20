@@ -1,5 +1,6 @@
 import React from "react";
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { isAdmin } from "../src/admin";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
 import { BotAvatar } from "./BotAvatar";
@@ -9,12 +10,15 @@ interface Props {
   onNewBot: () => void;
   onLogout: () => void;
   onOpenApprovals: () => void;
-  /** Shown to admins only; the server refuses the users API to everyone else. */
+  /** These three are shown to admins only; the server refuses the admin API and console to everyone else. */
   onOpenUsers?: () => void;
+  onOpenAudit?: () => void;
+  /** The server's admin console (ADR 0027), in a new tab or the system browser. */
+  onOpenConsole?: () => void;
   compact?: boolean;
 }
 
-export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOpenUsers, compact }: Props) {
+export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOpenUsers, onOpenAudit, onOpenConsole, compact }: Props) {
   const {
     bots,
     activeId,
@@ -104,10 +108,30 @@ export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOp
           </View>
         ) : null}
       </Pressable>
-      {onOpenUsers && me.permissions?.includes("admin") ? (
-        <Pressable style={styles.approvalsBtn} onPress={onOpenUsers} accessibilityRole="button">
-          <Text style={styles.hiddenText}>Users</Text>
-        </Pressable>
+      {isAdmin(me) ? (
+        <>
+          {onOpenUsers ? (
+            <Pressable style={styles.approvalsBtn} onPress={onOpenUsers} accessibilityRole="button">
+              <Text style={styles.hiddenText}>Users</Text>
+            </Pressable>
+          ) : null}
+          {onOpenAudit ? (
+            <Pressable style={styles.approvalsBtn} onPress={onOpenAudit} accessibilityRole="button">
+              <Text style={styles.hiddenText}>Audit log</Text>
+            </Pressable>
+          ) : null}
+          {onOpenConsole ? (
+            <Pressable
+              style={styles.approvalsBtn}
+              onPress={onOpenConsole}
+              accessibilityRole="link"
+              accessibilityLabel="Admin console"
+              accessibilityHint="Opens the server's admin console in the browser"
+            >
+              <Text style={styles.hiddenText}>Admin console ↗</Text>
+            </Pressable>
+          ) : null}
+        </>
       ) : null}
       <View style={styles.meRow}>
         <View style={styles.meAvatar}>
