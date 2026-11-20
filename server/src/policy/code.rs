@@ -32,7 +32,9 @@ enum Code {
     Inline(Word, &'static str),
     File(Word),
     Stdin,
-    /// A module or subcommand, not a file SuperBot reads.
+    /// `python -m name`: a module, read when it is a file in the workspace.
+    Module(Word),
+    /// A subcommand, not a file SuperBot reads.
     Nothing,
 }
 
@@ -107,7 +109,12 @@ impl Level<'_> {
             }
             let args: Vec<&str> = words[1..].iter().map(|w| w.text.as_str()).collect();
             if let Some(lang) = Lang::of(&prog) {
-                match code_arg(lang, &prog, &words[1..]) {
+                let mut preloads = Vec::new();
+                let code = code_arg(lang, &prog, &words[1..], &mut preloads);
+                for p in preloads.iter().filter(|p| p.dynamic || p.text.starts_with(['.', '/', '~']) || script_ext(Path::new(&p.text))) {
+                    self.run_file(p, Some(lang), k, w, out);
+                }
+                match code {
                     Code::Inline(code, flag) if lang == Lang::Shell => match code.dynamic {
                         true => self.unknown_code("a script", &format!("{prog} {flag} {}", code.text), out),
                         false => classify_shell(&code.text, self.cwds, self.ctx, self.depth + 1, w, fed, out),
@@ -120,6 +127,7 @@ impl Level<'_> {
                         self.run_file(&file, Some(lang), k, w, out);
                     }
                     Code::Stdin => self.stdin(k, lang, &prog, w, out),
+                    Code::Module(m) => self.module(&m, k, w, out),
                     Code::Nothing => {}
                 }
                 if lang == Lang::Shell {
@@ -130,6 +138,22 @@ impl Level<'_> {
                 self.find_exec(&args, w, fed, out);
             }
             classify_program(&prog, &args, self.cwds, self.ctx, out);
+        }
+    }
+
+    /// `python -m name`: runs `name.py` or `name/__main__.py` when one is in a folder
+    /// the command may run in; otherwise it is an installed module, as before.
+    fn module(&self, m: &Word, k: usize, w: &mut Walk, out: &mut Out) {
+        if m.dynamic {
+            return self.unknown_code("code", &format!("python -m {}", m.text), out);
+        }
+        let base = m.text.replace('.', "/");
+        for file in [format!("{base}.py"), format!("{base}/__main__.py")] {
+            let here = self.unsourced.resolve(self.ctx, &file).unwrap_or_default();
+            if here.iter().any(|p| p.starts_with(&self.ctx.workspace) && p.exists()) {
+                self.run_file(&Word { text: file, dynamic: false }, Some(Lang::Python), k, w, out);
+                return;
+            }
         }
     }
 
@@ -194,7 +218,8 @@ impl Level<'_> {
         for (c, why) in found {
             out.push(match c {
                 UNREADABLE => ("shell_destructive", format!("Can't fully check {label}: {}", why.trim_start_matches("Can't check this command safely: "))),
-                _ if why.ends_with(&tag) => (c, why),
+                // Kept as is: a downloaded script is approved one call at a time (ADR 0051).
+                _ if why.ends_with(&tag) || why == DOWNLOADED_SCRIPT => (c, why),
                 _ => (c, format!("{why} ({tag}")),
             });
         }
@@ -241,18 +266,25 @@ impl Level<'_> {
                 ask(out, format!("Runs {name} after this same command may change it, so SuperBot can't check what will run"));
                 continue;
             }
+            // The same script run again may get other input, so it is checked again. One
+            // that runs itself, directly or through others, isn't followed round.
             if w.files.contains(&place) {
+                ask(out, format!("Runs {name} from inside itself, which SuperBot doesn't follow"));
                 continue;
             }
-            if w.files.len() >= scripts::MAX_FILES {
+            if w.reads >= scripts::MAX_FILES {
                 ask(out, "Runs more scripts than SuperBot checks in one call".into());
                 continue;
             }
-            w.files.push(place.clone());
+            w.reads += 1;
             let source = scripts::read(&self.ctx.workspace, &place);
             missing |= matches!(source, Source::Missing);
             found |= !matches!(source, Source::Missing);
             match source {
+                // Bytecode (`.pyc`) passes bash's binary test but isn't text an interpreter reads as source.
+                Source::Text(text) if lang.is_some() && text.contains(['\0', '\u{FFFD}']) => {
+                    ask(out, format!("Runs {name}, compiled code SuperBot can't read"))
+                }
                 Source::Text(text) => {
                     let lang = match (lang, scripts::shebang(&text)) {
                         (Some(l), _) => Some(l),
@@ -273,11 +305,13 @@ impl Level<'_> {
                         let fed = self.fed(&self.s.cmds[k]);
                         // Named the same however it was typed, so a run grant covers `./x.sh` and `bash x.sh` alike.
                         let label = place.strip_prefix(&self.ctx.workspace).map_or(name.into(), |p| p.to_string_lossy().into_owned());
+                        w.files.push(place.clone());
                         self.code(l, &text, &label, w, fed, out);
+                        w.files.pop();
                     }
                 }
                 Source::Binary if lang.is_none() => program_name = Some(program(name)),
-                Source::Binary => {}
+                Source::Binary => ask(out, format!("Runs {name}, compiled code SuperBot can't read")),
                 Source::Missing => {}
                 Source::TooBig => ask(out, format!("Runs {name}, which is too big for SuperBot to check (over {} KB)", scripts::MAX_SCRIPT_BYTES / 1024)),
                 Source::Unreadable(why) => ask(out, format!("Runs {name}, which SuperBot can't read ({why})")),
@@ -505,7 +539,9 @@ fn runs_string(prog: &str, args: &[Word]) -> Option<(String, Option<Word>)> {
 }
 
 /// Where an interpreter called with `args` gets its code.
-fn code_arg(lang: Lang, prog: &str, args: &[Word]) -> Code {
+/// Files that options load before the code runs (`node --require x.js`, `ruby -r ./x`)
+/// go in `preloads`.
+fn code_arg(lang: Lang, prog: &str, args: &[Word], preloads: &mut Vec<Word>) -> Code {
     let base = prog.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
     let mut args = args;
     match base {
@@ -561,7 +597,13 @@ fn code_arg(lang: Lang, prog: &str, args: &[Word]) -> Code {
                     add(args.get(i + 1).cloned(), f);
                     i += 1;
                 }
-                (None, None) if o.value_long.contains(&name.as_str()) => i += 1,
+                (None, None) if o.value_long.contains(&name.as_str()) => {
+                    if o.preload_long.contains(&name.as_str()) {
+                        preloads.extend(args.get(i + 1).cloned());
+                    }
+                    i += 1
+                }
+                (None, Some((_, v))) if o.preload_long.contains(&name.as_str()) => preloads.push(Word { text: v.into(), dynamic: a.dynamic }),
                 _ => {}
             }
             i += 1;
@@ -582,13 +624,23 @@ fn code_arg(lang: Lang, prog: &str, args: &[Word]) -> Code {
                     add(if taken { args.get(i + 1).cloned() } else { Some(Word { text: rest, dynamic: false }) }, flag);
                     break;
                 }
+                let value = || if rest.is_empty() { args.get(i + 1).cloned() } else { Some(Word { text: rest.clone(), dynamic: false }) };
                 if *ch == 'm' && lang == Lang::Python {
-                    return Code::Nothing;
+                    return value().map_or(Code::Nothing, Code::Module);
                 }
                 if o.attached.contains(ch) {
                     break;
                 }
                 if o.value_short.contains(ch) {
+                    let v = value();
+                    if o.preload_short.contains(ch) {
+                        preloads.extend(v);
+                    } else if let Some(file) = v.as_ref().filter(|_| lang == Lang::Php && *ch == 'd').and_then(|v| {
+                        let (key, file) = v.text.split_once('=')?;
+                        ["auto_prepend_file", "auto_append_file"].contains(&key.trim()).then(|| Word { text: file.into(), dynamic: v.dynamic })
+                    }) {
+                        preloads.push(file);
+                    }
                     taken = rest.is_empty();
                     break;
                 }
@@ -627,10 +679,13 @@ struct Options {
     attached: &'static [char],
     code_long: &'static [&'static str],
     value_long: &'static [&'static str],
+    /// Options among those that load a file or module before the code.
+    preload_short: &'static [char],
+    preload_long: &'static [&'static str],
 }
 
 fn options(lang: Lang) -> Options {
-    let none: Options = Options { code_short: &[], value_short: &[], attached: &[], code_long: &[], value_long: &[] };
+    let none: Options = Options { code_short: &[], value_short: &[], attached: &[], code_long: &[], value_long: &[], preload_short: &[], preload_long: &[] };
     match lang {
         Lang::Shell => Options { code_short: &['c'], value_short: &['o', 'O'], code_long: &["--command"], value_long: &["--rcfile", "--init-file"], ..none },
         Lang::Python => Options { code_short: &['c'], value_short: &['W', 'X', 'Q'], value_long: &["--check-hash-based-pycs"], ..none },
@@ -639,9 +694,11 @@ fn options(lang: Lang) -> Options {
             value_short: &['r', 'C'],
             code_long: &["--eval", "--print"],
             value_long: &["--require", "--import", "--loader", "--experimental-loader", "--input-type", "--conditions"],
+            preload_short: &['r'],
+            preload_long: &["--require", "--import", "--loader", "--experimental-loader"],
             ..none
         },
-        Lang::Ruby => Options { code_short: &['e'], value_short: &['r', 'I', 'C', 'E', 'F'], ..none },
+        Lang::Ruby => Options { code_short: &['e'], value_short: &['r', 'I', 'C', 'E', 'F'], preload_short: &['r'], ..none },
         Lang::Perl => Options { code_short: &['e', 'E'], attached: &['M', 'm', 'I', 'x', 'd', 'D', 'i', 'C', '0', 'l'], ..none },
         Lang::Php => Options { code_short: &['r'], value_short: &['d', 'c', 'z'], ..none },
     }

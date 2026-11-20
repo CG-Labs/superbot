@@ -430,7 +430,7 @@ impl RunScope {
     /// program (which may finish a command typed earlier).
     pub fn of(call: &Call, p: &Policy, found: &[(&'static str, String)]) -> Option<RunScope> {
         let asks: BTreeSet<(&'static str, String)> = found.iter().filter(|(c, _)| p.action(c) == Action::Ask).cloned().collect();
-        let one_at_a_time = asks.iter().any(|(c, why)| ONE_AT_A_TIME.contains(c) || why == DOWNLOADED_SCRIPT);
+        let one_at_a_time = asks.iter().any(|(c, why)| ONE_AT_A_TIME.contains(c) || why.starts_with(DOWNLOADED_SCRIPT));
         if asks.is_empty() || one_at_a_time || typed_input(call).is_some() {
             return None;
         }
@@ -628,13 +628,15 @@ struct Script {
 struct Walk {
     /// What's left of shell::MAX_TOTAL.
     budget: usize,
-    /// Script files already read (ADR 0053).
+    /// Script files being read, outermost first, so a script running itself stops (ADR 0053).
     files: Vec<PathBuf>,
+    /// Script files read so far, counting the same file read again.
+    reads: usize,
 }
 
 impl Walk {
     fn new() -> Walk {
-        Walk { budget: shell::MAX_TOTAL, files: Vec::new() }
+        Walk { budget: shell::MAX_TOTAL, files: Vec::new(), reads: 0 }
     }
 }
 

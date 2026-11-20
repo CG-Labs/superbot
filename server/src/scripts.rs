@@ -66,18 +66,15 @@ pub fn read(workspace: &Path, path: &Path) -> Source {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Source::Missing,
         Err(_) => return Source::Unreadable("it can't be opened"),
     };
-    if !real.starts_with(&ws) {
-        return Source::LinksOutside(real);
-    }
-    let Ok(meta) = std::fs::metadata(&real) else { return Source::Unreadable("it can't be opened") };
+    let Ok(rel) = real.strip_prefix(&ws) else { return Source::LinksOutside(real) };
+    let Some(file) = open_under(&ws, rel) else { return Source::Unreadable("it changed while SuperBot read it, or can't be opened") };
+    let Ok(meta) = file.metadata() else { return Source::Unreadable("it can't be opened") };
     if !meta.is_file() {
         return Source::Unreadable("it isn't a regular file");
     }
     if meta.len() > MAX_SCRIPT_BYTES as u64 {
         return Source::TooBig;
     }
-    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&real);
-    let Ok(file) = file else { return Source::Unreadable("it can't be opened") };
     let mut bytes = Vec::new();
     if file.take(MAX_SCRIPT_BYTES as u64 + 1).read_to_end(&mut bytes).is_err() {
         return Source::Unreadable("it can't be read");
@@ -89,6 +86,35 @@ pub fn read(workspace: &Path, path: &Path) -> Source {
         return Source::Binary;
     }
     Source::Text(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Opens `rel` under the folder `ws` one name at a time, never through a link, so a
+/// folder swapped for a link after the path was checked can't lead outside.
+fn open_under(ws: &Path, rel: &Path) -> Option<std::fs::File> {
+    use std::os::fd::{FromRawFd, OwnedFd, AsRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let dir_flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    let root = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY).open(ws).ok()?;
+    let mut dir: OwnedFd = root.into();
+    let names: Vec<_> = rel.components().collect();
+    let (last, folders) = names.split_last()?;
+    for name in folders {
+        let std::path::Component::Normal(n) = name else { return None };
+        let c = std::ffi::CString::new(n.as_bytes()).ok()?;
+        // SAFETY: `dir` is an open folder and `c` a NUL-terminated name.
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), dir_flags | libc::O_NOFOLLOW) };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: openat returned a new descriptor that nothing else owns.
+        dir = unsafe { OwnedFd::from_raw_fd(fd) };
+    }
+    let std::path::Component::Normal(n) = last else { return None };
+    let c = std::ffi::CString::new(n.as_bytes()).ok()?;
+    // SAFETY: as above.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+    // SAFETY: as above.
+    (fd >= 0).then(|| unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
 /// A compiled program: an ELF or Mach-O header, or, as bash decides before running a
@@ -319,6 +345,16 @@ pub fn scan(lang: Lang, code: &str, name: &str) -> Found {
             f.asks.push(unknown_cmd(spec.0));
         }
     }
+    // A risky API under another name (`from subprocess import run as r`, `f = os.system`,
+    // `getattr(os, 'system')`) can't be followed to its calls.
+    for spec in apis.spawn.iter().chain(apis.spawn_opaque).chain(apis.delete).filter(|s| gated(s)) {
+        if let Some(how) = renamed(&toks, spec.0, apis.bare_calls) {
+            f.asks.push(("shell_destructive", format!("Uses {} {how}, so SuperBot can't follow what it runs ({} in {name})", spec.0, spec.0)));
+        }
+    }
+    if lang == Lang::Php && toks.windows(2).any(|w| matches!(w, [Tok::Ident(v), Tok::Punct('(')] if v.starts_with('$'))) {
+        f.asks.push(unknown_cmd("a function named by a variable"));
+    }
     // Command literals: backticks in Ruby, Perl, and PHP, and zx's $`…` in JavaScript.
     for (k, t) in toks.iter().enumerate() {
         let Tok::Str { text, dynamic, backtick: true } = t else { continue };
@@ -362,9 +398,17 @@ pub fn scan(lang: Lang, code: &str, name: &str) -> Found {
         let sites = call_sites(&toks, spec.0, apis.bare_calls);
         let mut unknown = false;
         for args in &sites {
-            match args.first() {
-                Some(Arg::Lit(p)) => f.deletes.push(p.clone()),
-                _ => unknown = true,
+            if args.iter().all(|a| matches!(a, Arg::Opt(_))) {
+                unknown = true;
+            }
+            for a in args {
+                match a {
+                    Arg::Lit(p) => f.deletes.push(p.clone()),
+                    Arg::List(ps) => f.deletes.extend(ps.iter().cloned()),
+                    Arg::Opt(keys) if keys.iter().any(|k| k == "dir_fd" || CHANGES_RUN.contains(&k.as_str())) => unknown = true,
+                    Arg::Opt(_) => {}
+                    Arg::Dynamic => unknown = true,
+                }
             }
         }
         if unknown || raw_calls(code, spec.0, apis.bare_calls, false) > sites.len() {
@@ -476,13 +520,52 @@ fn tokens(lang: Lang, code: &str) -> Vec<Tok> {
     out
 }
 
+/// How `name` is used other than by calling it: renamed on import, assigned, passed
+/// along, or named in a string. Importing it under its own name is fine.
+fn renamed(toks: &[Tok], name: &str, bare: bool) -> Option<&'static str> {
+    // Names too common as plain words to count in strings.
+    const COMMON: [&str; 6] = ["run", "call", "remove", "delete", "rm", "spawn"];
+    for (k, t) in toks.iter().enumerate() {
+        match t {
+            Tok::Str { text, .. } if text == name && !COMMON.contains(&name) => return Some("by a name in a string"),
+            Tok::Ident(n) if n == name => {}
+            _ => continue,
+        }
+        let next = toks.get(k + 1);
+        let called = match next {
+            Some(Tok::Punct('(')) => true,
+            Some(Tok::Str { .. } | Tok::Ident(_) | Tok::Punct('[')) if bare => !matches!(next, Some(Tok::Ident(a)) if a == "as"),
+            _ => false,
+        };
+        if called {
+            continue;
+        }
+        if matches!(next, Some(Tok::Ident(a)) if a == "as") || matches!(next, Some(Tok::Punct(':'))) && !matches!(toks.get(k + 2), Some(Tok::Punct(':'))) {
+            return Some("under another name");
+        }
+        // The statement it is in: an import or require naming it as itself is fine.
+        let start = toks[..k].iter().rposition(|t| matches!(t, Tok::Punct('\n' | ';'))).map_or(0, |p| p + 1);
+        let end = toks[k..].iter().position(|t| matches!(t, Tok::Punct('\n' | ';'))).map_or(toks.len(), |p| k + p);
+        let import = toks[start..end].iter().any(|t| matches!(t, Tok::Ident(w) if ["import", "require", "use"].contains(&w.as_str())));
+        if import {
+            continue;
+        }
+        // `def system(…)` / `function exec(…)` define their own, called like the real one.
+        if matches!(toks.get(k.wrapping_sub(1)), Some(Tok::Ident(d)) if ["def", "function", "sub"].contains(&d.as_str())) {
+            continue;
+        }
+        return Some("without calling it directly");
+    }
+    None
+}
+
 /// One argument of a call.
 #[derive(Debug, PartialEq)]
 enum Arg {
     Lit(String),
     List(Vec<String>),
-    /// A keyword argument or options object: not part of the command.
-    Opt,
+    /// A keyword argument or options object, with the option names it sets.
+    Opt(Vec<String>),
     Dynamic,
 }
 
@@ -530,7 +613,16 @@ fn arg(toks: &[Tok]) -> Arg {
     };
     match toks {
         [t] if lit(t).is_some() => Arg::Lit(lit(t).unwrap_or_default()),
-        [Tok::Ident(_), Tok::Punct('=' | ':'), ..] | [Tok::Punct('{'), ..] => Arg::Opt,
+        [Tok::Ident(k), Tok::Punct('=' | ':'), ..] => Arg::Opt(vec![k.clone()]),
+        [Tok::Punct('{'), inner @ ..] => {
+            // Every name or string before a `:`, `=>`, or `=` names an option (or, for a
+            // Ruby env hash, a variable); nested values are named too, which only asks more.
+            let keys = inner.windows(2).filter_map(|w| match w {
+                [Tok::Ident(k) | Tok::Str { text: k, .. }, Tok::Punct(':' | '=')] => Some(k.clone()),
+                _ => None,
+            });
+            Arg::Opt(keys.collect())
+        }
         [Tok::Punct('['), inner @ .., Tok::Punct(']')] => {
             let items: Option<Vec<String>> = inner.iter().filter(|t| **t != Tok::Punct(',')).map(lit).collect();
             items.map(Arg::List).unwrap_or(Arg::Dynamic)
@@ -550,7 +642,9 @@ fn command_of(args: &[Arg]) -> Option<String> {
                 words.push(s.clone());
             }
             Arg::List(l) => words.extend(l.iter().cloned()),
-            Arg::Opt => {}
+            // Options that change where or what it runs make the command unknown here.
+            Arg::Opt(keys) if keys.iter().any(|k| CHANGES_RUN.contains(&k.as_str())) => return None,
+            Arg::Opt(_) => {}
             Arg::Dynamic => return None,
         }
     }
@@ -561,6 +655,9 @@ fn command_of(args: &[Arg]) -> Option<String> {
         _ => Some(words.iter().map(|w| shell_quote(w)).collect::<Vec<_>>().join(" ")),
     }
 }
+
+/// Spawn options that change the folder, the program, or its environment (PATH).
+const CHANGES_RUN: [&str; 7] = ["cwd", "chdir", "executable", "argv0", "env", "PATH", "unsetenv_others"];
 
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -673,7 +770,6 @@ mod tests {
             (Lang::Python, "import os\nos.system(f'git {verb}')"),
             (Lang::Python, "import os\nos.system('\\x67it push')"),
             (Lang::Python, "import os\nos.execvp('git', ['git', 'push'])"),
-            (Lang::Python, "import os\nf = os.system\nf('git push')\n# os.system('ls')"),
             (Lang::Js, "require('child_process').exec(`git ${verb}`)"),
             (Lang::Js, "const cp = require('child_process'); cp.fork('./worker.js')"),
             (Lang::Js, "new Deno.Command('git', { args: ['push'] })"),
@@ -687,6 +783,39 @@ mod tests {
             let a = asks(lang, code);
             assert!(a.iter().any(|w| w.starts_with("Runs commands only known when it runs")), "{code}: {a:?}");
         }
+    }
+
+    #[test]
+    fn renamed_apis_ask() {
+        for (lang, code) in [
+            (Lang::Python, "import os\nf = os.system\nf('git push')"),
+            (Lang::Python, "from subprocess import run as r\nr(['git', 'push'])"),
+            (Lang::Python, "import os\ngetattr(os, 'system')('git push')"),
+            (Lang::Python, "import subprocess\nlist(map(subprocess.check_output, cmds))"),
+            (Lang::Js, "const { execSync: x } = require('child_process'); x('git push')"),
+            (Lang::Js, "import { execSync as x } from 'child_process'; x('git push')"),
+            (Lang::Js, "const cp = require('child_process'); cp['execSync']('git push')"),
+            (Lang::Ruby, "m = method(:system)\nm.call('git push')"),
+            (Lang::Php, "<?php $f = 'sys' . 'tem'; $f('git push');"),
+        ] {
+            let a = asks(lang, code);
+            assert!(!a.is_empty(), "{code}: {a:?}");
+        }
+        // Importing under its own name is not renaming.
+        assert!(asks(Lang::Python, "from subprocess import run, PIPE\nrun(['ls'], stdout=PIPE)").is_empty());
+        assert!(asks(Lang::Js, "const { execSync } = require('child_process'); execSync('ls')").is_empty());
+    }
+
+    #[test]
+    fn options_that_change_the_run_and_every_deleted_path() {
+        assert!(!asks(Lang::Python, "import subprocess\nsubprocess.run(['rm', '-rf', 'build'], cwd='/tmp')").is_empty());
+        assert!(!asks(Lang::Js, "require('child_process').execSync('rm -rf build', { cwd: '/tmp' })").is_empty());
+        assert!(!asks(Lang::Ruby, "system('rm -rf build', chdir: '/tmp')").is_empty());
+        assert_eq!(cmds(Lang::Python, "import subprocess\nsubprocess.run(['ls'], check=True, text=True)"), ["'ls'"]);
+        assert_eq!(scan(Lang::Ruby, "File.delete('local.tmp', '/tmp/important.txt')", "x").deletes, ["local.tmp", "/tmp/important.txt"]);
+        assert_eq!(scan(Lang::Perl, "unlink 'local.tmp', '/tmp/important.txt';", "x").deletes, ["local.tmp", "/tmp/important.txt"]);
+        assert!(!scan(Lang::Perl, "unlink 'a', $b;", "x").asks.is_empty());
+        assert!(!scan(Lang::Python, "from pathlib import Path\nPath(p).unlink()", "x").asks.is_empty());
     }
 
     #[test]
