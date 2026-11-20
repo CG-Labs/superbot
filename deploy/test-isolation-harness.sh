@@ -3,6 +3,7 @@
 # reports, as one Claude Code reply, what that account could reach. The prompt says what to do:
 #   WRITE-CREDS                       write a fake login into $HOME
 #   SLEEP                             keep a heartbeat in the workspace until stopped
+#   LEAVE                             answer and exit, leaving the heartbeat going
 #   PROBE <other account> <name:path>...  try to read (and write next to) each path
 set -u
 for prompt; do :; done
@@ -27,6 +28,12 @@ case "$prompt" in
     (trap '' TERM; while :; do date +%s.%N >"$PWD/heartbeat"; sleep 0.2; done) &
     sleep 300
     out=slept
+    ;;
+  LEAVE)
+    # Left behind holding stdout, so botd would wait for it forever.
+    (trap '' TERM; while :; do date +%s.%N >"$PWD/heartbeat"; sleep 0.2; done) &
+    sleep 1
+    out=left
     ;;
   PROBE*)
     # shellcheck disable=SC2086 # the prompt is words on purpose

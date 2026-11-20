@@ -148,3 +148,23 @@ async fn stopping_a_run_stops_the_accounts_processes_too() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(std::fs::read_to_string(&beat).unwrap(), then, "a process of the run is still going");
 }
+
+#[tokio::test]
+#[ignore = "needs root's setup: deploy/test-isolation.sh"]
+async fn a_finished_run_leaves_no_processes_behind() {
+    let Some((app, iso)) = setup() else { return };
+    let d = user_and_bot(&app, "d@example.com");
+    let msg = app.db.add_message(&d.id, "user", "LEAVE", None, false, Some("queued"));
+    app.enqueue(msg.clone());
+    let start = Instant::now();
+    while app.db.message(msg.id).unwrap().status.as_deref() != Some("done") {
+        assert!(start.elapsed() < Duration::from_secs(30), "a tool the run left behind kept it going");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let beat = iso.workspace(&d.owner_id).unwrap().join("heartbeat");
+    assert!(beat.exists(), "the tool never started");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let then = std::fs::read_to_string(&beat).unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(std::fs::read_to_string(&beat).unwrap(), then, "a process of the run is still going");
+}

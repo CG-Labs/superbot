@@ -107,7 +107,14 @@ async fn main() -> ExitCode {
     let Some(pid) = child.id().map(|p| p as i32) else { return exit_code(child.wait().await) };
     let target = if tty { pid } else { -pid };
     tokio::select! {
-        s = child.wait() => return exit_code(s),
+        s = child.wait() => {
+            // Tools it left behind could hold botd's pipe open, and once this process is
+            // gone nothing botd may signal can reach them, so they end with the run.
+            if !tty {
+                end_group(target).await;
+            }
+            return exit_code(s);
+        }
         _ = term.recv() => {}
         _ = int.recv() => {}
         _ = hup.recv() => {}
@@ -118,17 +125,39 @@ async fn main() -> ExitCode {
     // SAFETY: signals this account's own processes.
     unsafe { libc::kill(target, libc::SIGTERM) };
     let exited = tokio::time::timeout_at(deadline, child.wait()).await.is_ok();
-    // SAFETY: signal 0 only checks that the group still has a process.
-    let group_left = || !tty && unsafe { libc::kill(target, 0) } == 0;
-    while group_left() && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    if !exited || group_left() {
+    if !tty {
+        end_group_by(target, deadline).await;
+    } else if !exited {
         // SAFETY: as above.
         unsafe { libc::kill(target, libc::SIGKILL) };
     }
     let _ = child.wait().await;
     ExitCode::from(143)
+}
+
+/// TERM to what's left of the run's group, then KILL after the grace period.
+async fn end_group(group: i32) {
+    if group_left(group) {
+        // SAFETY: signals this account's own processes.
+        unsafe { libc::kill(group, libc::SIGTERM) };
+        end_group_by(group, tokio::time::Instant::now() + GRACE).await;
+    }
+}
+
+/// Waits for the group to empty until `deadline`, then KILLs what's left.
+async fn end_group_by(group: i32, deadline: tokio::time::Instant) {
+    while group_left(group) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if group_left(group) {
+        // SAFETY: signals this account's own processes.
+        unsafe { libc::kill(group, libc::SIGKILL) };
+    }
+}
+
+fn group_left(group: i32) -> bool {
+    // SAFETY: signal 0 only checks that the group still has a process.
+    (unsafe { libc::kill(group, 0) }) == 0
 }
 
 #[cfg(test)]

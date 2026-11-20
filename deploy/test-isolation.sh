@@ -26,6 +26,7 @@ TEST_DIR=/srv/superbot-test
 cleanup() {
   local u
   for u in $(getent passwd | awk -F: -v d="$TEST_DIR/users/" 'index($6, d) == 1 { print $1 }'); do
+    pkill -KILL -u "$u" 2>/dev/null || true
     userdel "$u" 2>/dev/null || true
     groupdel "$u" 2>/dev/null || true
   done
