@@ -170,8 +170,22 @@ pub fn get(name: &str) -> Option<Box<dyn Adapter>> {
     }
 }
 
-/// Harnesses whose CLI is on PATH.
+/// Harnesses whose CLI is on PATH. Cached briefly: admin views ask once per Bot,
+/// and a harness installed later still shows up without a restart.
 pub fn installed() -> Vec<&'static str> {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<Option<(Instant, Vec<&'static str>)>> = Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, names)) = cache.as_ref().filter(|(at, _)| at.elapsed() < Duration::from_secs(30)) {
+        return names.clone();
+    }
+    let names = probe_installed();
+    *cache = Some((Instant::now(), names.clone()));
+    names
+}
+
+fn probe_installed() -> Vec<&'static str> {
     NAMES
         .into_iter()
         .filter(|n| {
