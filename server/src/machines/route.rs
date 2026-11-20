@@ -122,6 +122,16 @@ impl Refusal {
         }
     }
 
+    /// The machine's own words, for the audit log: its error, version or state.
+    pub fn detail(&self) -> Option<String> {
+        match self {
+            Refusal::Offline(e) | Refusal::Outdated(e) => Some(e.clone()),
+            Refusal::NotReady(s) => Some(s.as_str().into()),
+            Refusal::HarnessMissing(h) | Refusal::HarnessInstalling(h) | Refusal::NotLoggedIn(h) => Some(h.clone()),
+            _ => None,
+        }
+    }
+
     /// What the Bot tells the user.
     pub fn message(&self) -> String {
         self.message_in(true)

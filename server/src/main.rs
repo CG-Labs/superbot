@@ -694,10 +694,12 @@ impl Auth {
         Some(found)
     }
 
-    /// The Bot a token was issued to, acting for its owner.
+    /// The Bot a token was issued to, acting for its owner, and for whomever its run is
+    /// for (ADR 0046), so what it queues runs for them too.
     fn bot_actor(&self, bot_id: Option<&str>) -> Actor {
-        match bot_id.and_then(|id| self.app.as_ref()?.db.bot(id)) {
-            Some(b) => Actor::for_bot(&b),
+        let app = self.app.as_ref();
+        match bot_id.and_then(|id| app?.db.bot(id)) {
+            Some(b) => Actor { asker: app.map(|a| a.acting_for(&b)).filter(|a| *a != b.owner_id), ..Actor::for_bot(&b) },
             None => Actor::bot(bot_id, None),
         }
         .method("bot_token")
@@ -1943,14 +1945,8 @@ async fn create_routine(State(app): State<AppState>, Extension(c): Extension<Cal
     let (Some(name), Some(cron_expr), Some(instruction)) = (f.name, f.cron, f.instruction) else {
         return Err(bad("name, cron, and instruction are required"));
     };
-    let r = app.db.add_routine(&id, &name, &cron_expr, &instruction);
-    if f.enabled == Some(false) {
-        app.db.update_routine(&r.id, None, None, None, Some(false));
-    }
-    if let Some(author) = routine_author(&app, &c) {
-        app.db.set_routine_author(&r.id, &author);
-    }
-    let r = app.db.routine(&r.id).ok_or_else(|| not_found("Routine"))?;
+    let author = routine_author(&app, &c);
+    let r = app.db.add_routine_by(&id, &name, &cron_expr, &instruction, f.enabled != Some(false), author.as_deref());
     let details = json!({ "name": r.name, "cron": r.cron, "enabled": r.enabled, "author": r.author_id });
     app.db.record(&by.event("routine.created").target("routine", &r.id).bot(&id).details(details));
     Ok((StatusCode::CREATED, Json(json!(r))))
@@ -2004,13 +2000,9 @@ fn need_routine(app: &App, c: &Caller, by: &Who, id: &str) -> Res<db::Routine> {
 async fn update_routine(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
     let before = need_routine(&app, &c, &by, &id)?;
     let f = routine_fields(&v)?;
-    app.db.update_routine(&id, f.name.as_deref(), f.cron.as_deref(), f.instruction.as_deref(), f.enabled);
     // Whoever writes the instruction is whom it runs for.
-    if f.instruction.as_ref().is_some_and(|i| *i != before.instruction)
-        && let Some(author) = routine_author(&app, &c)
-    {
-        app.db.set_routine_author(&id, &author);
-    }
+    let author = routine_author(&app, &c);
+    app.db.update_routine(&id, f.name.as_deref(), f.cron.as_deref(), f.instruction.as_deref(), f.enabled, author.as_deref());
     let after = app.db.routine(&id).ok_or_else(|| not_found("Routine"))?;
     for e in routine_events(&by, &before, &after) {
         app.db.record(&e);

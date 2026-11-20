@@ -572,6 +572,11 @@ impl App {
             let asker = for_other.clone().unwrap_or_else(|| bot.owner_id.clone());
             self.askers.lock().unwrap_or_else(|e| e.into_inner()).insert(bot.id.clone(), asker);
         }
+        // The owner's session holds their conversation, and some harnesses keep its first
+        // instructions: a run for someone else starts fresh and keeps nothing.
+        if for_other.is_some() {
+            bot.session_id = None;
+        }
         let period = tiers::period(crate::db::now());
         let Some((tier, route)) = self.tier_route(&bot, msg, &by, &period) else { return };
         let placed_at = self.db.placed_at(&bot.owner_id);
@@ -665,7 +670,9 @@ impl App {
             let mut saw_shell = false;
             let emit = |e| match e {
                 AgentEvent::Session(s) => {
-                    self.db.keep_session(&id, &s, placed_at);
+                    if for_other.is_none() {
+                        self.db.keep_session(&id, &s, placed_at);
+                    }
                 }
                 AgentEvent::TextDelta(t) => {
                     let draft = self.with_run(&id, |r| { r.draft.push_str(&t); r.draft.clone() });
@@ -801,7 +808,9 @@ impl App {
         let refused = |r: Refusal, machine: Option<&str>| {
             self.give_back(bot, msg, period);
             let e = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied);
-            let detail = json!({ "reason": r.reason(), "owner": bot.owner_id, "machine": machine, "forUser": for_other, "messageId": msg.id });
+            let detail = json!({
+                "reason": r.reason(), "detail": r.detail(), "owner": bot.owner_id, "machine": machine, "forUser": for_other, "messageId": msg.id,
+            });
             self.db.record(&e.details(detail));
             let text = if for_other.is_some() { r.message_for(owner_name.as_deref()) } else { r.message_in(!team) };
             self.say(&bot.id, &text, true);

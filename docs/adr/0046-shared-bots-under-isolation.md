@@ -29,7 +29,7 @@ For a team Bot that should not depend on one person, make it with a team account
 
 ### Isolated: a run is for someone, and gets no more than they could reach
 
-Each run is **for** a person: whoever sent the chat message; for a Bot-to-Bot `ask`, whomever the asking Bot's run is for (through any number of Bots); for a reply that comes back later, whomever the question was for; for a routine, whoever last wrote its instruction (`routines.author_id`, new); otherwise the owner. When that person isn't the owner, the run is a **teammate's run**:
+Each run is **for** a person: whoever sent the chat message; for anything a Bot sends or asks with its token (a message, an `ask`), whomever that Bot's run is for (through any number of Bots); for a reply that comes back later, whomever the question was for; for a routine, whoever last wrote its instruction (`routines.author_id`, new); otherwise the owner. When that person isn't the owner, the run is a **teammate's run**:
 
 | | Owner's own run | Teammate's run |
 |---|---|---|
@@ -40,20 +40,21 @@ Each run is **for** a person: whoever sent the chat message; for a Bot-to-Bot `a
 | Harness logins on the owner's machine | Yes | Yes (see Limits) |
 | Owner's facts (`USER.md`) | In the prompt, sent to the machine and back | **Left out**: not in the prompt, not sent, not collected |
 | Prompt | As before | Says whom it's for, and not to open or pass on the owner's private files |
+| Harness session | Resumes the Bot's | **Fresh, and not kept**: the owner's holds their conversation, and some harnesses (Codex) keep a session's first instructions |
 | Can make new Bots | Yes (owner's role allowing) | No (403) |
 
 Admins count as teammates here: an admin's run of Ada's Bot gets no Ada keys, as admins never see personal values (ADR 0044).
 
 **The cap.** botd keeps whom each Bot's latest run is for. A Bot's token then acts with `owner.within(asker)`: on each Bot, the lesser of what the owner and the asker can do. It applies to every route a Bot calls (`/api/bots`, messages, routines, `ask`, approvals, the event stream, the "Other Bots" list in the prompt). Bea's run of Ada's shared Bot can't see Ada's private Bots, nor Bea's private ones (Ada can't see those). It stays after the run, so whatever the run left behind is still capped until the owner's next run.
 
-**Routines.** A routine runs for whoever wrote its instruction. Creating one sets its author; changing its instruction makes the editor its author; renaming or rescheduling doesn't. Routines from before have no author and run for the owner, as they did. A routine made by a Bot is authored by whomever that Bot's run is for.
+**Routines.** A routine runs for whoever wrote its instruction. Creating one sets its author; changing its instruction makes the editor its author; renaming or rescheduling doesn't. The instruction and its author are written together, so the scheduler never reads one without the other. Routines from before have no author and run for the owner, as they did. A routine made by a Bot is authored by whomever that Bot's run is for.
 
 **Before each run** botd refuses it, gives back what it took, and audits why:
 
 - `owner_disabled`: the owner is disabled. Their Bots don't run for anyone, routines included; a firing routine says so once, not on every firing.
 - `asker_lost_access`: the person the run is for can no longer operate the Bot, e.g. a routine of someone whose grant was revoked.
 
-**When the owner's machine is down.** The run is refused as before (ADR 0036), never moved. A shared Bot's chat is read by everyone who can see the Bot, so a teammate's run says whose computer it is and that it isn't ready ("I run on Ada's computer, and it isn't reachable right now"), with no errors, addresses, versions or commands; the owner's own run of a shared Bot keeps "your computer" but drops error text and versions. The detail is in the audit log.
+**When the owner's machine is down.** The run is refused as before (ADR 0036), never moved. A shared Bot's chat is read by everyone who can see the Bot, so a teammate's run says whose computer it is and that it isn't ready ("I run on Ada's computer, and it isn't reachable right now"), with no errors, addresses, versions or commands; the owner's own run of a shared Bot keeps "your computer" but drops error text and versions. The machine's own words stay in the admin-only audit event (`details.detail`).
 
 **New Bots are private** unless made shared, so sharing is a choice.
 
@@ -66,7 +67,7 @@ Bot views add `runsOn` (`server`, `machine` or `nowhere`, when routing isn't off
 | Event | New |
 |---|---|
 | `harness.invoked`, `bot.run_routed`, `bot.run_refused` | `forUser` on teammates' runs |
-| `bot.run_refused` | Reasons `owner_disabled`, `asker_lost_access` |
+| `bot.run_refused` | Reasons `owner_disabled`, `asker_lost_access`; `detail` (the machine's error, version or state) on machine refusals |
 | `access.denied` | Reason `asker_acl` (with `forUser`): the owner could, the asker can't |
 | `routine.created` | `author` |
 | `routine.updated` | `changes.author` when it moves |
@@ -94,6 +95,7 @@ Bot views add `runsOn` (`server`, `machine` or `nowhere`, when routing isn't off
 - **One trust domain on the owner's computer.** A teammate's run is still a shell on the owner's computer, as the owner's Bots' user (ADR 0043). Its tools can still open the owner's folder, other Bots' files and the harness logins there; botd only keeps the owner's keys and facts out of it and tells it not to. A separate OS user and home for teammates' runs on the machine, with their own logins, is the follow-up.
 - **Team accounts and team machines** as first-class things, not a convention.
 - **Per-run tokens**, so a token names the run's person, not only the Bot, and the cap needs no saved state.
+- **A session per person**, so a teammate's chat with a shared Bot carries on between messages; today each teammate's run starts fresh.
 - **Owner approval for risky steps in teammates' runs**, whatever the Bot's approval mode.
 - **Open servers**: a disabled owner's shared Bots still run there (and stay a SCIM-05 follow-up).
 - The event stream re-checks access every few seconds, so a cap takes up to that long to apply to an open stream.

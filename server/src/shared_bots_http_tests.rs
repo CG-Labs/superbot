@@ -113,6 +113,9 @@ async fn a_teammate_reaches_nothing_of_the_owners_through_a_shared_bot() {
     assert_eq!(mine, "key=[redacted] facts=yes ledger=yes asking=no");
     assert!(call(port, "GET", "/api/bots", &team_token, "").await.1.contains(&ledger.id));
 
+    let ada_session = w.app.db.bot(&team.id).unwrap().session_id;
+    assert!(ada_session.is_some());
+
     // Bea's run: none of Ada's key, facts, or private Bots; told it's for Bea.
     let theirs = run(&w, &w.b, &team.id, "status").await;
     assert_eq!(theirs, "key=none facts=no ledger=no asking=yes");
@@ -120,6 +123,10 @@ async fn a_teammate_reaches_nothing_of_the_owners_through_a_shared_bot() {
     let invoked = events(&w, &format!("action=harness.invoked&bot={}", team.id)).await;
     assert!(invoked.iter().any(|e| e["details"]["forUser"] == w.b_id.as_str()), "{invoked:?}");
     assert!(invoked.iter().any(|e| e["details"].get("forUser").is_none()), "Ada's own run is for no one else");
+    // Nor Ada's conversation: a fresh session, which isn't kept.
+    let bea_run = invoked.iter().find(|e| e["details"]["forUser"] == w.b_id.as_str()).unwrap();
+    assert_eq!(bea_run["details"]["resumed"], false, "{bea_run}");
+    assert_eq!(w.app.db.bot(&team.id).unwrap().session_id, ada_session, "Ada's session is untouched");
 
     // An admin's run of Ada's Bot doesn't get her key either (ADR 0044: admins never see values).
     assert!(run(&w, &w.admin, &team.id, "status").await.starts_with("key=none facts=no"));
@@ -150,9 +157,21 @@ async fn a_teammate_reaches_nothing_of_the_owners_through_a_shared_bot() {
     assert!(!denied.iter().any(|e| e["details"]["reason"] == "asker_acl" && e["targetId"] == scout.id.as_str()), "Ada can't see Scout either: plain not found");
     assert!(w.app.db.messages(&ledger.id, 10).is_empty(), "nothing reached Ledger");
 
-    // Ada's next run gives it back her access.
+    // What it queues runs for Bea too: messages to itself or another shared Bot.
+    let helper = bot(&w, "Helper", &w.a_id, Visibility::Shared);
+    for to in [&team.id, &helper.id] {
+        let before = w.app.db.last_id();
+        let (code, res) = call(port, "POST", &format!("/api/bots/{to}/messages"), &team_token, r#"{"text":"carry on"}"#).await;
+        assert_eq!(code, 202, "{res}");
+        assert_eq!(reply_after(&w, to, before).await, "key=none facts=no ledger=no asking=yes", "queued by Bea's run");
+    }
+
+    // Ada's next run gives it back her access, and her own session.
     run(&w, &w.a, &team.id, "again").await;
     assert!(call(port, "GET", "/api/bots", &team_token, "").await.1.contains(&ledger.id));
+    let last = events(&w, &format!("action=harness.invoked&bot={}", team.id)).await;
+    let ada_again = last.iter().find(|e| e["details"].get("forUser").is_none()).unwrap();
+    assert_eq!(ada_again["details"]["resumed"], true, "{ada_again}");
 }
 
 #[tokio::test]
@@ -327,7 +346,9 @@ async fn with_routing_on_a_teammates_run_stays_on_the_owners_machine_without_the
     assert!(said.contains(&format!("I run on {ada_name}'s computer")), "{said}");
     assert!(!said.contains("connection refused") && !said.contains("192.0.2.7"), "{said}");
     let refused = events(&w, "action=bot.run_refused").await;
-    assert!(refused.iter().any(|e| e["details"]["reason"] == "machine_offline" && e["details"]["forUser"] == w.b_id.as_str()), "{refused:?}");
+    let offline = refused.iter().find(|e| e["details"]["reason"] == "machine_offline" && e["details"]["forUser"] == w.b_id.as_str());
+    let offline = offline.unwrap_or_else(|| panic!("{refused:?}"));
+    assert_eq!(offline["details"]["detail"], "connection refused at 192.0.2.7", "admins still see the machine's words");
 
     // SHARED_BOTS=open can't be used with routing on.
     assert!(SharedBots::parse("open", true).is_err());
