@@ -5,13 +5,29 @@
 use crate::adapters::short;
 use crate::audit::{Actor, Event, Outcome, Who};
 use crate::db::{now, Approval, Bot, NewRule};
-use crate::policy::{self, glob_escape, Action, Call, Ctx, Verdict, TRUNCATED};
+use crate::policy::{self, glob_escape, Action, Call, Ctx, RunScope, Verdict, TRUNCATED};
 use crate::runner::App;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
+
+/// A hook waiting on a person, by approval id.
+pub struct Waiter {
+    tx: oneshot::Sender<bool>,
+    /// The live run the call came from, and what approving it for the rest of that run
+    /// would cover (None: once only).
+    run: Option<(String, Option<RunScope>)>,
+}
+
+/// One "Approve for this run" (ADR 0051): the approval it came from and what it covers.
+/// Held by the run alone, so it ends when the run does and never becomes a rule.
+#[derive(Clone, Debug)]
+pub struct RunGrant {
+    pub approval_id: String,
+    pub scope: RunScope,
+}
 
 /// Where a "remember" decision applies.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -27,6 +43,10 @@ pub enum DecideError {
     Closed(String),
     /// The call was too long to store whole, so it can't become an exact rule.
     TooLong,
+    /// The call can only be approved once (ADR 0051).
+    OnceOnly,
+    /// The run it came from has ended, or its hook stopped waiting.
+    RunEnded,
 }
 
 /// Closes the approval if the waiting request goes away without an answer
@@ -57,13 +77,17 @@ impl App {
     }
 
     /// Decides one tool call. Risky calls wait for the user. Never fails open:
-    /// anything other than an explicit allow comes back as a deny.
-    pub async fn check(self: &Arc<Self>, bot: &Bot, harness: &str, tool: &str, input: Value, cwd: Option<PathBuf>) -> Verdict {
+    /// anything other than an explicit allow comes back as a deny. `run` is the run the
+    /// hook says it is from (`SUPERBOT_RUN_ID`); what was approved for a run counts only
+    /// while that run is the Bot's live one.
+    pub async fn check(self: &Arc<Self>, bot: &Bot, harness: &str, tool: &str, input: Value, cwd: Option<PathBuf>, run: Option<&str>) -> Verdict {
         let cap = self.note_hook(&bot.id);
+        let live = self.live_run(&bot.id);
+        let run = run.filter(|r| live.as_deref() == Some(*r));
         let p = self.db.effective_policy(&bot.id);
         let ctx = self.policy_ctx(bot);
         let call = Call::new(tool, input, cwd.unwrap_or_else(|| ctx.workspace.clone()));
-        let v = policy::decide(&p, &self.db.rules(Some(&bot.id)), &call, &ctx);
+        let (v, found) = policy::decide_with(&p, &self.db.rules(Some(&bot.id)), &call, &ctx);
         let shown = call.shown();
         let detail = || json!({ "tool": call.tool, "subject": shown, "class": v.class, "reason": v.reason, "rule": v.rule, "harness": harness });
         let verdict = |action: &str, outcome: Outcome| {
@@ -85,16 +109,37 @@ impl App {
                 Verdict { reason: format!("SuperBot policy blocks this: {}. Don't try another way; tell the user what you wanted to do.", v.reason), ..v }
             }
             Action::Ask => {
+                // Only an ask can be lifted by a run grant: deny rules, deny classes, and
+                // unreadable commands were decided above and still win.
+                let scope = run.and(RunScope::of(&call, &p, &found));
+                if let (Some(run), Some(s)) = (run, &scope)
+                    && let Some(g) = self.run_grant(&bot.id, run, s)
+                {
+                    let mut d = detail();
+                    d["scope"] = json!("run");
+                    d["runId"] = json!(run);
+                    let e = Event::new(Actor::system("policy"), "policy.allowed").target("approval", &g.approval_id).bot(&bot.id);
+                    self.db.record(&e.details(d));
+                    return Verdict { action: Action::Allow, reason: "Approved for the rest of this task".into(), ..v };
+                }
                 let mut wait = Duration::from_secs(p.timeout_minutes as u64 * 60);
                 if let Some(cap) = cap {
                     wait = wait.min(cap);
                 }
                 let class = v.class.unwrap_or("");
-                let a = self.db.add_approval(&bot.id, harness, &call.tool, call.kind.name(), &shown, &call.input, class, &v.reason, now() + wait.as_millis() as i64);
+                let in_run = run.map(|r| (r, scope.as_ref()));
+                let expires = now() + wait.as_millis() as i64;
+                let a = self.db.add_approval_in_run(&bot.id, harness, &call.tool, call.kind.name(), &shown, &call.input, class, &v.reason, expires, in_run);
                 let requested = Event::new(Actor::for_bot(bot), "approval.requested").target("approval", &a.id).bot(&bot.id);
-                self.db.record(&requested.details(detail()));
+                let mut d = detail();
+                if let Some(r) = run {
+                    d["runId"] = json!(r);
+                    d["runScope"] = json!(scope.as_ref().map(RunScope::covers_text));
+                }
+                self.db.record(&requested.details(d));
                 let (tx, rx) = oneshot::channel();
-                self.approval_waiters.lock().unwrap().insert(a.id.clone(), tx);
+                let run = run.map(|r| (r.to_string(), scope));
+                self.approval_waiters.lock().unwrap().insert(a.id.clone(), Waiter { tx, run });
                 self.push_approval(&a);
                 self.set_run_status(&bot.id, &format!("Waiting for approval: {}", short(&a.subject)));
                 let guard = OnDrop { app: self.clone(), id: a.id.clone() };
@@ -145,6 +190,33 @@ impl App {
         self.after_settle(id, status, by, note, Some(&r.id)).ok_or_else(closed)
     }
 
+    /// Approves this call and, for the rest of the run it came from, every call of the
+    /// same kind (ADR 0051). Saves no rule: the grant lives with the run and ends with it.
+    /// Deciding takes the same rights as approving once.
+    pub fn approve_for_run(&self, id: &str, note: Option<&str>, by: &Who) -> Result<Approval, DecideError> {
+        let a = self.db.approval(id).ok_or(DecideError::NotFound)?;
+        if a.status != "pending" {
+            return Err(DecideError::Closed(a.status));
+        }
+        if a.run_scope.is_none() {
+            return Err(DecideError::OnceOnly);
+        }
+        let closed = || DecideError::Closed(self.db.approval(id).map(|a| a.status).unwrap_or_default());
+        let offer = self.approval_waiters.lock().unwrap().get(id).and_then(|w| w.run.clone());
+        let Some((run, Some(scope))) = offer else { return Err(DecideError::RunEnded) };
+        if self.live_run(&a.bot_id).as_deref() != Some(run.as_str()) {
+            return Err(DecideError::RunEnded);
+        }
+        if !self.db.finish_approval_for_run(id, by.actor.kind.as_str(), note) {
+            return Err(closed());
+        }
+        // Granted before the hook wakes, so the Bot's next call already finds it.
+        let covers = scope.covers_text();
+        let granted = self.add_run_grant(&a.bot_id, &run, RunGrant { approval_id: id.to_string(), scope });
+        let extra = json!({ "runId": run, "covers": covers, "granted": granted });
+        self.after_settle_with(id, "approved", by, note, None, extra).ok_or_else(closed)
+    }
+
     /// Closes a pending approval once, wakes its waiting hook, logs it, and tells the clients.
     pub fn settle(&self, id: &str, status: &str, by: &Who, note: Option<&str>, rule_id: Option<&str>) -> Option<Approval> {
         if !self.db.finish_approval(id, status, by.actor.kind.as_str(), note, rule_id) {
@@ -154,11 +226,22 @@ impl App {
     }
 
     fn after_settle(&self, id: &str, status: &str, by: &Who, note: Option<&str>, rule_id: Option<&str>) -> Option<Approval> {
-        if let Some(tx) = self.approval_waiters.lock().unwrap().remove(id) {
-            let _ = tx.send(status == "approved");
+        self.after_settle_with(id, status, by, note, rule_id, json!({}))
+    }
+
+    /// `extra`'s fields go into the audit event's details.
+    fn after_settle_with(&self, id: &str, status: &str, by: &Who, note: Option<&str>, rule_id: Option<&str>, extra: Value) -> Option<Approval> {
+        if let Some(w) = self.approval_waiters.lock().unwrap().remove(id) {
+            let _ = w.tx.send(status == "approved");
         }
         let a = self.db.approval(id)?;
-        let details = json!({ "subject": a.subject, "class": a.class, "tool": a.tool, "note": note, "rule": rule_id });
+        let mut details = json!({ "subject": a.subject, "class": a.class, "tool": a.tool, "note": note, "rule": rule_id });
+        if let Some(s) = &a.scope {
+            details["scope"] = json!(s);
+        }
+        if let (Some(d), Value::Object(x)) = (details.as_object_mut(), extra) {
+            d.extend(x);
+        }
         self.db.record(&by.event(&format!("approval.{status}")).target("approval", id).bot(&a.bot_id).details(details));
         self.push_approval(&a);
         Some(a)
@@ -218,7 +301,7 @@ mod tests {
     async fn safe_calls_run_without_asking() {
         let app = app();
         let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
-        let v = app.check(&bot, "claude", "Bash", push("ls -la"), None).await;
+        let v = app.check(&bot, "claude", "Bash", push("ls -la"), None, None).await;
         assert_eq!(v.action, Action::Allow);
         assert!(app.db.approvals(None, None, 10).is_empty());
     }
@@ -230,7 +313,7 @@ mod tests {
         let mut events = app.tx.subscribe();
         let task = tokio::spawn({
             let (app, bot) = (app.clone(), bot.clone());
-            async move { app.check(&bot, "claude", "Bash", push("git push origin main"), None).await }
+            async move { app.check(&bot, "claude", "Bash", push("git push origin main"), None, None).await }
         });
         let a = pending(&app).await;
         assert_eq!((a.class.as_str(), a.subject.as_str()), ("git_push", "git push origin main"));
@@ -256,7 +339,7 @@ mod tests {
         let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
         let ask = |cmd: &'static str| {
             let (app, bot) = (app.clone(), bot.clone());
-            tokio::spawn(async move { app.check(&bot, "claude", "Bash", push(cmd), None).await })
+            tokio::spawn(async move { app.check(&bot, "claude", "Bash", push(cmd), None, None).await })
         };
         let task = ask("npm install left-pad");
         let a = pending(&app).await;
@@ -274,11 +357,11 @@ mod tests {
         app.decide(&a.id, true, Some(Remember::Global), None, &user()).unwrap();
         assert_eq!(task.await.unwrap().action, Action::Allow);
         let other = app.db.create_bot("B", "#fff", "waddle", "codex", None, false);
-        assert_eq!(app.check(&other, "codex", "Bash", push("git push"), None).await.action, Action::Allow);
+        assert_eq!(app.check(&other, "codex", "Bash", push("git push"), None, None).await.action, Action::Allow);
         // Only the exact call is remembered: a different push still asks.
         let task = tokio::spawn({
             let app = app.clone();
-            async move { app.check(&other, "codex", "Bash", push("git push --force"), None).await }
+            async move { app.check(&other, "codex", "Bash", push("git push --force"), None, None).await }
         });
         let a = pending(&app).await;
         assert_eq!(a.subject, "git push --force");
@@ -293,7 +376,7 @@ mod tests {
         let o = Override { timeout_minutes: Some(1), ..Default::default() };
         app.db.set_bot_override(&bot.id, Some(&o));
         tokio::time::pause();
-        let v = app.check(&bot, "claude", "Bash", push("git push"), None).await;
+        let v = app.check(&bot, "claude", "Bash", push("git push"), None, None).await;
         assert_eq!(v.action, Action::Deny);
         assert!(v.reason.contains("in time"), "{}", v.reason);
         let a = app.db.approvals(None, None, 1).pop().unwrap();
@@ -308,7 +391,7 @@ mod tests {
         let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
         let task = tokio::spawn({
             let (app, bot) = (app.clone(), bot.clone());
-            async move { app.check(&bot, "claude", "Bash", push("git push"), None).await }
+            async move { app.check(&bot, "claude", "Bash", push("git push"), None, None).await }
         });
         let a = pending(&app).await;
         app.stop(&bot.id);
@@ -322,7 +405,7 @@ mod tests {
         let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
         let task = tokio::spawn({
             let (app, bot) = (app.clone(), bot.clone());
-            async move { app.check(&bot, "claude", "Bash", push("git push"), None).await }
+            async move { app.check(&bot, "claude", "Bash", push("git push"), None, None).await }
         });
         let a = pending(&app).await;
         task.abort();
@@ -340,7 +423,7 @@ mod tests {
 
         let o = Override { mode: Some(Mode::Bypass), ..Default::default() };
         app.db.set_bot_override(&bot.id, Some(&o));
-        assert_eq!(app.check(&bot, "claude", "Bash", push("rm -rf /"), None).await.action, Action::Allow);
+        assert_eq!(app.check(&bot, "claude", "Bash", push("rm -rf /"), None, None).await.action, Action::Allow);
     }
 
     #[tokio::test]
@@ -350,11 +433,11 @@ mod tests {
         let mut g = app.db.global_policy();
         g.classes.insert("git_push".into(), Action::Deny);
         app.db.set_global_policy(&g);
-        let v = app.check(&bot, "claude", "Bash", push("git push"), None).await;
+        let v = app.check(&bot, "claude", "Bash", push("git push"), None, None).await;
         assert_eq!(v.action, Action::Deny);
         assert!(v.reason.starts_with("SuperBot policy blocks this"));
         app.db.add_rule(None, Action::Deny, "*", "*example.invalid*", None);
-        assert_eq!(app.check(&bot, "claude", "WebFetch", json!({ "url": "https://example.invalid" }), None).await.action, Action::Deny);
+        assert_eq!(app.check(&bot, "claude", "WebFetch", json!({ "url": "https://example.invalid" }), None, None).await.action, Action::Deny);
         assert!(app.db.approvals(None, None, 10).is_empty());
         assert_eq!(audit_log(&app)[0].action, "policy.denied");
     }
@@ -375,5 +458,174 @@ mod tests {
         assert!(matches!(app.decide(&long.id, true, Some(Remember::Bot), None, &user()), Err(DecideError::TooLong)));
         assert_eq!(app.db.approval(&long.id).unwrap().status, "pending");
         assert!(app.db.rules(Some(&bot.id)).is_empty());
+    }
+
+    fn ask_in(app: &Arc<App>, bot: &Bot, run: Option<&str>, cmd: &'static str) -> tokio::task::JoinHandle<Verdict> {
+        let (app, bot, run) = (app.clone(), bot.clone(), run.map(str::to_string));
+        tokio::spawn(async move { app.check(&bot, "claude", "Bash", push(cmd), None, run.as_deref()).await })
+    }
+
+    /// Approves `cmd` for the rest of `run`, and returns the approval.
+    async fn grant(app: &Arc<App>, bot: &Bot, run: &str, cmd: &'static str) -> Approval {
+        let task = ask_in(app, bot, Some(run), cmd);
+        let a = pending(app).await;
+        let done = app.approve_for_run(&a.id, Some("for today"), &user()).unwrap();
+        assert_eq!((done.status.as_str(), done.scope.as_deref()), ("approved", Some("run")));
+        assert_eq!(task.await.unwrap().action, Action::Allow);
+        done
+    }
+
+    #[tokio::test]
+    async fn approve_for_the_run_covers_the_same_kind_of_call_and_is_audited() {
+        let app = app();
+        let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
+        let run = app.start_test_run(&bot.id);
+        let task = ask_in(&app, &bot, Some(&run), "git push origin main");
+        let a = pending(&app).await;
+        assert_eq!(a.run_id.as_deref(), Some(run.as_str()));
+        assert_eq!(a.run_scope.as_ref().unwrap()["covers"], json!(["Pushes to a git remote"]));
+        let requested = &audit_log(&app)[0];
+        assert_eq!((requested.details["runId"].as_str(), requested.details["runScope"].clone()), (Some(run.as_str()), json!(["Pushes to a git remote"])));
+        app.approve_for_run(&a.id, None, &user()).unwrap();
+        assert_eq!(task.await.unwrap().action, Action::Allow);
+        let approved = &audit_log(&app)[0];
+        assert_eq!((approved.action.as_str(), approved.target_id.as_deref()), ("approval.approved", Some(a.id.as_str())));
+        assert_eq!((approved.details["scope"].as_str(), approved.details["runId"].as_str(), approved.details["granted"].as_bool()), (Some("run"), Some(run.as_str()), Some(true)));
+        assert_eq!(approved.details["covers"], json!(["Pushes to a git remote"]));
+
+        // Another push in the same run goes through without a new approval, and says why.
+        let v = app.check(&bot, "claude", "Bash", push("git push origin feature"), None, Some(&run)).await;
+        assert_eq!((v.action, v.reason.as_str()), (Action::Allow, "Approved for the rest of this task"));
+        assert_eq!(app.db.approvals(None, None, 10).len(), 1);
+        let auto = &audit_log(&app)[0];
+        assert_eq!((auto.action.as_str(), auto.actor_kind.as_str(), auto.target_id.as_deref()), ("policy.allowed", "system", Some(a.id.as_str())));
+        assert_eq!((auto.details["scope"].as_str(), auto.details["runId"].as_str(), auto.details["subject"].as_str()), (Some("run"), Some(run.as_str()), Some("git push origin feature")));
+        assert_eq!(auto.bot_id.as_deref(), Some(bot.id.as_str()));
+        assert!(app.db.rules(Some(&bot.id)).is_empty() && app.db.rules(None).is_empty());
+
+        // Nothing broader: a force push, or a call in another class, still asks.
+        for cmd in ["git push --force origin main", "npm install left-pad", "git push origin main && npm install x"] {
+            let task = ask_in(&app, &bot, Some(&run), cmd);
+            let b = pending(&app).await;
+            assert_eq!(b.subject, cmd);
+            app.decide(&b.id, false, None, None, &user()).unwrap();
+            assert_eq!(task.await.unwrap().action, Action::Deny);
+        }
+        // Without its run id (an older botctl) a call never uses the grant.
+        let task = ask_in(&app, &bot, None, "git push origin feature");
+        let b = pending(&app).await;
+        assert!(b.run_id.is_none() && b.run_scope.is_none());
+        assert!(matches!(app.approve_for_run(&b.id, None, &user()), Err(DecideError::OnceOnly)));
+        app.decide(&b.id, false, None, None, &user()).unwrap();
+        assert_eq!(task.await.unwrap().action, Action::Deny);
+    }
+
+    #[tokio::test]
+    async fn approving_once_grants_nothing_more() {
+        let app = app();
+        let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
+        let run = app.start_test_run(&bot.id);
+        let task = ask_in(&app, &bot, Some(&run), "git push");
+        let a = pending(&app).await;
+        assert_eq!(app.decide(&a.id, true, None, None, &user()).unwrap().scope.as_deref(), Some("once"));
+        assert_eq!(task.await.unwrap().action, Action::Allow);
+        let task = ask_in(&app, &bot, Some(&run), "git push");
+        let b = pending(&app).await;
+        assert_ne!(a.id, b.id);
+        app.decide(&b.id, false, None, None, &user()).unwrap();
+        assert_eq!(task.await.unwrap().action, Action::Deny);
+    }
+
+    #[tokio::test]
+    async fn run_grants_end_with_the_run() {
+        let app = app();
+        let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
+        let first = app.start_test_run(&bot.id);
+        grant(&app, &bot, &first, "git push").await;
+        app.end_test_run(&bot.id);
+
+        // The next run starts with nothing, and the old run's id no longer counts.
+        let second = app.start_test_run(&bot.id);
+        assert_ne!(first, second);
+        for run in [&second, &first] {
+            let task = ask_in(&app, &bot, Some(run), "git push");
+            let a = pending(&app).await;
+            assert_eq!(a.run_id.as_deref(), (run == &second).then_some(second.as_str()));
+            app.decide(&a.id, false, None, None, &user()).unwrap();
+            assert_eq!(task.await.unwrap().action, Action::Deny);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_ending_before_the_answer_grants_nothing() {
+        let app = app();
+        let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
+        let run = app.start_test_run(&bot.id);
+        let task = ask_in(&app, &bot, Some(&run), "git push");
+        let a = pending(&app).await;
+        app.end_test_run(&bot.id);
+        assert_eq!(task.await.unwrap().action, Action::Deny);
+        assert!(matches!(app.approve_for_run(&a.id, None, &user()), Err(DecideError::Closed(s)) if s == "cancelled"));
+
+        // A pending approval whose hook is gone (e.g. after a restart) can't start a grant.
+        let run = app.start_test_run(&bot.id);
+        let scope = RunScope::of(&Call::new("Bash", push("git push"), "/".into()), &app.db.effective_policy(&bot.id), &[("git_push", "Pushes to a git remote".into())]).unwrap();
+        let orphan = app.db.add_approval_in_run(&bot.id, "claude", "Bash", "shell", "git push", &json!({}), "git_push", "Pushes", now() + 60_000, Some((&run, Some(&scope))));
+        assert!(matches!(app.approve_for_run(&orphan.id, None, &user()), Err(DecideError::RunEnded)));
+        assert_eq!(app.db.approval(&orphan.id).unwrap().status, "pending");
+        assert!(matches!(app.approve_for_run("nope", None, &user()), Err(DecideError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn run_grants_stay_with_their_bot() {
+        let app = app();
+        let a = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
+        let b = app.db.create_bot("B", "#fff", "waddle", "claude", None, true);
+        let run_a = app.start_test_run(&a.id);
+        let run_b = app.start_test_run(&b.id);
+        grant(&app, &a, &run_a, "git push").await;
+        // Neither B's own run nor A's run id, sent by B, finds A's grant.
+        for run in [&run_b, &run_a] {
+            let task = ask_in(&app, &b, Some(run), "git push");
+            let p = pending(&app).await;
+            assert_eq!(p.bot_id, b.id);
+            app.decide(&p.id, false, None, None, &user()).unwrap();
+            assert_eq!(task.await.unwrap().action, Action::Deny);
+        }
+        assert_eq!(app.check(&a, "claude", "Bash", push("git push"), None, Some(&run_a)).await.action, Action::Allow);
+    }
+
+    #[tokio::test]
+    async fn deny_rules_and_deny_classes_beat_a_run_grant() {
+        let app = app();
+        let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
+        let run = app.start_test_run(&bot.id);
+        grant(&app, &bot, &run, "git push origin main").await;
+        app.db.add_rule(Some(&bot.id), Action::Deny, "Bash", "git push origin prod*", None);
+        let v = app.check(&bot, "claude", "Bash", push("git push origin prod"), None, Some(&run)).await;
+        assert_eq!(v.action, Action::Deny);
+        assert_eq!(audit_log(&app)[0].action, "policy.denied");
+        assert_eq!(app.check(&bot, "claude", "Bash", push("git push origin dev"), None, Some(&run)).await.action, Action::Allow);
+
+        let o = Override { classes: [("git_push".to_string(), Action::Deny)].into(), ..Default::default() };
+        app.db.set_bot_override(&bot.id, Some(&o));
+        assert_eq!(app.check(&bot, "claude", "Bash", push("git push origin dev"), None, Some(&run)).await.action, Action::Deny);
+        // Unreadable commands are denied whatever was granted.
+        assert_eq!(app.check(&bot, "claude", "Bash", push("git push 'oops"), None, Some(&run)).await.action, Action::Deny);
+    }
+
+    #[tokio::test]
+    async fn risky_shell_commands_are_only_approved_one_at_a_time() {
+        let app = app();
+        let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
+        let run = app.start_test_run(&bot.id);
+        let task = ask_in(&app, &bot, Some(&run), "sudo apt-get install jq");
+        let a = pending(&app).await;
+        assert_eq!(a.run_id.as_deref(), Some(run.as_str()));
+        assert!(a.run_scope.is_none());
+        assert!(matches!(app.approve_for_run(&a.id, None, &user()), Err(DecideError::OnceOnly)));
+        assert_eq!(app.db.approval(&a.id).unwrap().status, "pending");
+        app.decide(&a.id, true, None, None, &user()).unwrap();
+        assert_eq!(task.await.unwrap().action, Action::Allow);
     }
 }

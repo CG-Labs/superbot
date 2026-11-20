@@ -11,7 +11,8 @@ use crate::machines::route::{self, Assigned, Refusal, Target};
 use crate::machines::wire::{self, JobEvent};
 use crate::tiers::{self, Route, Tier, Tiers};
 use crate::{isolation, paths, usage};
-use crate::policy::{Ctx, Mode};
+use crate::approvals::RunGrant;
+use crate::policy::{Ctx, Mode, RunScope};
 use crate::screen::{self, Screens};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -41,6 +42,10 @@ pub struct Config {
 }
 
 struct Run {
+    /// The run's id (`runId` in the audit log). Its hook sends it as `SUPERBOT_RUN_ID`.
+    id: String,
+    /// Calls people approved for the rest of this run (ADR 0051). Never stored: they end with it.
+    grants: Vec<RunGrant>,
     abort: watch::Sender<AbortReason>,
     status: String,
     draft: String,
@@ -98,7 +103,7 @@ pub struct App {
     /// Bots waiting on `botctl ask` or `botctl handoff`, by the message's id.
     waiters: Mutex<HashMap<i64, oneshot::Sender<String>>>,
     /// Tool calls waiting on the user, by approval id. true = approved.
-    pub approval_waiters: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+    pub approval_waiters: Mutex<HashMap<String, crate::approvals::Waiter>>,
     /// Picks where each Bot runs: its owner's machine, or here (ADR 0029). Unset: here.
     pub control_plane: OnceLock<Arc<ControlPlane>>,
     /// Each user's plan and the models it routes to (ADR 0033). Unset: self-host only.
@@ -160,6 +165,27 @@ impl App {
     /// The folders a running Bot's tool calls are judged by, when it runs elsewhere.
     pub fn run_ctx(&self, bot_id: &str) -> Option<Ctx> {
         self.with_run(bot_id, |r| r.ctx.clone())
+    }
+
+    /// The id of the Bot's run now, if it has one.
+    pub fn live_run(&self, bot_id: &str) -> Option<String> {
+        self.with_run(bot_id, |r| Some(r.id.clone()))
+    }
+
+    /// The grant in the Bot's run `run_id` that covers a call, if that run is still live.
+    pub fn run_grant(&self, bot_id: &str, run_id: &str, scope: &RunScope) -> Option<RunGrant> {
+        self.with_run(bot_id, |r| if r.id == run_id { r.grants.iter().find(|g| g.scope.covers(scope)).cloned() } else { None })
+    }
+
+    /// Adds a grant to the Bot's run `run_id`. False if that run has ended.
+    pub fn add_run_grant(&self, bot_id: &str, run_id: &str, grant: RunGrant) -> bool {
+        self.with_run(bot_id, |r| {
+            if r.id != run_id {
+                return false;
+            }
+            r.grants.push(grant);
+            true
+        })
     }
 
     pub fn set_run_status(&self, bot_id: &str, status: &str) {
@@ -638,6 +664,8 @@ impl App {
         let run_id = format!("r{}", crate::random_hex(8));
         // Tokens every attempt reported: a retried attempt spent them too.
         let mut used: Vec<Usage> = Vec::new();
+        // A retried attempt is the same task, so what was approved for it still holds.
+        let mut grants: Vec<RunGrant> = Vec::new();
 
         for attempt in 0..2 {
             let (abort_tx, abort_rx) = watch::channel(None);
@@ -648,6 +676,8 @@ impl App {
             let guard = (policy.mode == Mode::Ask).then(|| guard(&spot.botctl, &bot.harness, policy.timeout_minutes));
             let hooks = Arc::new(AtomicU32::new(0));
             self.state().entry(bot.id.clone()).or_default().run = Some(Run {
+                id: run_id.clone(),
+                grants: std::mem::take(&mut grants),
                 abort: abort_tx.clone(),
                 status: "Thinking".into(),
                 draft: String::new(),
@@ -666,6 +696,7 @@ impl App {
             });
 
             let mut env = spot.env.clone();
+            env.insert("SUPERBOT_RUN_ID".into(), run_id.clone());
             if spot.screens
                 && spot.machine.is_none()
                 && let Some(screens) = &self.screens
@@ -761,7 +792,8 @@ impl App {
             }
             self.cancel_approvals(&id, "The task ended");
             // Done running. The stream may have ended without a final block: keep what was streamed.
-            let draft = self.state().get_mut(&id).and_then(|s| s.run.take()).map(|r| r.draft).unwrap_or_default();
+            let (draft, kept) = self.state().get_mut(&id).and_then(|s| s.run.take()).map(|r| (r.draft, r.grants)).unwrap_or_default();
+            grants = kept;
             if !draft.trim().is_empty() {
                 replies += 1;
                 self.say(&id, &draft, false);
@@ -796,6 +828,9 @@ impl App {
                 "attempts": attempt + 1, "trigger": msg.role, "messageId": msg.id, "runId": run_id, "usage": tokens,
             });
             merge(&mut finished, &host);
+            if !grants.is_empty() {
+                finished["runGrants"] = json!(grants.iter().map(|g| &g.approval_id).collect::<Vec<_>>());
+            }
             self.db.record(&by.event("bot.run_finished").target("message", &msg.id.to_string()).bot(&bot.id).outcome(outcome).details(finished));
             match reason {
                 Some("shutdown") => {}
@@ -1494,6 +1529,32 @@ fn merge(v: &mut Value, extra: &Value) {
 }
 
 #[cfg(test)]
+impl App {
+    /// Marks a Bot as running, as `run_one` does, with no harness. Returns the run's id.
+    pub(crate) fn start_test_run(&self, bot_id: &str) -> String {
+        let id = format!("r{}", crate::random_hex(8));
+        let run = Run {
+            id: id.clone(),
+            grants: Vec::new(),
+            abort: watch::channel(None).0,
+            status: "Working".into(),
+            draft: String::new(),
+            hooks: Arc::default(),
+            hook_wait: None,
+            ctx: None,
+        };
+        self.state().entry(bot_id.into()).or_default().run = Some(run);
+        id
+    }
+
+    /// Ends it, as `run_one` does when its harness exits.
+    pub(crate) fn end_test_run(&self, bot_id: &str) {
+        self.cancel_approvals(bot_id, "The task ended");
+        self.state().remove(bot_id);
+    }
+}
+
+#[cfg(test)]
 pub fn test_app() -> Arc<App> {
     let dir = crate::db::temp_path("app");
     let db = Db::open(&dir.join("app.sqlite")).unwrap();
@@ -1846,7 +1907,7 @@ mod tests {
         let (tx, rx) = watch::channel(None);
         let hook_wait = guarded.then_some(Duration::from_secs(60));
         app.state().entry(bot_id.into()).or_default().run =
-            Some(Run { abort: tx, status: String::new(), draft: String::new(), hooks: Default::default(), hook_wait, ctx: None });
+            Some(Run { id: "r1".into(), grants: Vec::new(), abort: tx, status: String::new(), draft: String::new(), hooks: Default::default(), hook_wait, ctx: None });
         rx
     }
 
