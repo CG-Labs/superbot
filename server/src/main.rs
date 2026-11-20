@@ -44,6 +44,8 @@ mod machines_logins_tests;
 mod machines_upkeep_tests;
 #[cfg(test)]
 mod machines_screens_tests;
+#[cfg(test)]
+mod machines_teammates_tests;
 mod passwd;
 mod paths;
 mod policy;
@@ -924,8 +926,8 @@ fn sso_path(path: &str) -> Option<&str> {
 /// it also has good ones elsewhere.
 fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<Response>> {
     let h = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
-    let operator = |method: &'static str| Caller { principal: Principal::User(Role::Admin), user: a.operator(), session: None, method, bot: None };
-    let from_session = |(s, u): (db::Session, db::User)| Caller { principal: Principal::User(u.role), user: Some(u), session: Some(s), method: "session", bot: None };
+    let operator = |method: &'static str| Caller { principal: Principal::User(Role::Admin), user: a.operator(), session: None, method, bot: None, bot_for: None };
+    let from_session = |(s, u): (db::Session, db::User)| Caller { principal: Principal::User(u.role), user: Some(u), session: Some(s), method: "session", bot: None, bot_for: None };
     let fail = |method: &str, reason: Option<&str>, clear: bool| {
         a.login_failed(source, method, reason);
         Err(Box::new(unauthorized(a, req, clear)))
@@ -934,14 +936,17 @@ fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<
         let t = t.trim();
         // Each Bot's runs carry their own token (ADR 0029). A forged one, one from an
         // earlier start, one for a Bot since deleted, or one from before the Bot changed
-        // hands is refused.
+        // hands is refused. One bound to a teammate (ADR 0048) works only while the
+        // Bot's latest run is still theirs.
         if t.starts_with(isolation::BOT_TOKEN_PREFIX) {
-            let now = |id: &str| a.app.as_ref().map(|app| app.db.bot(id).map(|b| b.owner_id));
+            let now = |id: &str| a.app.as_ref().map(|app| app.db.bot(id));
+            let run_over = |b: &db::Bot, u: &str| a.app.as_ref().is_some_and(|app| app.acting_for(b) != u);
             return match isolation::token_bot(&a.bot_key, t) {
                 Some((id, owner)) => match now(id) {
                     Some(None) => fail("bot_token", Some("bot_gone"), false),
-                    Some(Some(o)) if o != owner => fail("bot_token", Some("bot_moved"), false),
-                    _ => Ok(Caller { principal: Principal::Bot, user: None, session: None, method: "bot_token", bot: Some(id.to_string()) }),
+                    Some(Some(b)) if b.owner_id != owner => fail("bot_token", Some("bot_moved"), false),
+                    Some(Some(b)) if isolation::token_for_user(&a.bot_key, t).is_some_and(|u| run_over(&b, u)) => fail("bot_token", Some("run_over"), false),
+                    _ => Ok(Caller { principal: Principal::Bot, user: None, session: None, method: "bot_token", bot: Some(id.to_string()), bot_for: isolation::token_for_user(&a.bot_key, t).map(str::to_string) }),
                 },
                 None => fail("bot_token", Some("bad_token"), false),
             };
@@ -1177,10 +1182,12 @@ async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>,
     let user = c.user.filter(|_| session.is_some()).map(|u| u.id);
     let bot = c.bot.filter(|_| c.principal == Principal::Bot);
     let bot_owner = bot.as_deref().and_then(|id| app.db.bot_owner(id));
+    let bot_for = c.bot_for.filter(|_| bot.is_some());
     // The stream outlives the request that opened it, so it closes within seconds of
     // its session being revoked, expiring, or its user being disabled, and follows
     // role changes. A Bot's closes when the Bot is deleted, changes hands, or its
-    // owner is disabled, and follows its owner's role.
+    // owner is disabled, and follows its owner's role. One bound to a teammate (ADR
+    // 0048) closes once the Bot's latest run isn't theirs, never taking the owner's access.
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, Infallible>>(64);
     let mut sub = app.tx.subscribe();
     let cfg = a.sessions;
@@ -1212,6 +1219,7 @@ async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>,
                 _ = check.tick(), if session.is_some() || bot.is_some() => {
                     let now = if let Some(id) = bot.as_deref() {
                         match app.db.bot(id) {
+                            Some(b) if bot_for.as_deref().is_some_and(|u| app.acting_for(&b) != u) => break,
                             Some(b) if Some(&b.owner_id) == bot_owner.as_ref() => match app.bot_viewer(&b) {
                                 Viewer::Nobody => break,
                                 v => v,
@@ -1427,6 +1435,7 @@ fn need_bot(app: &App, id: &str) -> Res<db::Bot> {
 /// than that of the person its run is for (ADR 0046).
 fn viewer(app: &App, c: &Caller, _by: &Who) -> Viewer {
     match (c.principal, c.bot.as_deref().and_then(|id| app.db.bot(id))) {
+        (Principal::Bot, Some(b)) if c.bot_for.as_deref().is_some_and(|u| app.acting_for(&b) != u) => Viewer::Nobody,
         (Principal::Bot, Some(b)) => app.bot_viewer(&b),
         (Principal::Bot, None) => Viewer::Nobody,
         _ => Viewer::of(c),
@@ -1922,22 +1931,52 @@ fn caller_now(app: &App, a: &Auth, c: &Caller) -> Option<Caller> {
     Some(Caller { principal: Principal::User(u.role), user: Some(u), ..c.clone() })
 }
 
+/// With teammates' own users on machines (ADR 0048), whose screen of `bot` a caller
+/// gets: a teammate their own, the owner theirs; an admin the owner's, or a teammate's
+/// with `?for=<user>`. A Bot's token gets the screen of the person its run is for.
+/// None: the owner's.
+fn screen_for(app: &App, c: &Caller, bot: &db::Bot, asked: Option<&str>) -> Res<Option<String>> {
+    let on = app.control_plane.get().is_some_and(|cp| cp.teammate_users()) && app.shared_bots() == acl::SharedBots::Isolated;
+    let me = match (&c.user, &c.bot) {
+        (Some(u), _) => Some(u.id.clone()),
+        (None, Some(b)) => app.db.bot(b).map(|b| app.acting_for(&b)),
+        (None, None) => None,
+    };
+    let admin = c.principal == Principal::User(Role::Admin);
+    let who = match asked.map(str::trim).filter(|u| !u.is_empty()) {
+        Some(u) if !on => return Err(bad(format!("Screens are per teammate only with MACHINE_TEAMMATE_USERS=on, so there's no screen for {u}."))),
+        Some(u) if admin || me.as_deref() == Some(u) => Some(u.to_string()),
+        Some(_) => return Err(ApiError(StatusCode::FORBIDDEN, "Only an admin can open someone else's screen of this Bot.".into())),
+        None if on && !admin => me,
+        None => None,
+    };
+    let who = who.filter(|u| *u != bot.owner_id);
+    if let Some(u) = &who
+        && Viewer::person(&app.db, u).access(&app.db, bot) < Access::Operate
+    {
+        return Err(ApiError(StatusCode::NOT_FOUND, "That person can't use this Bot, so it has no screen for them.".into()));
+    }
+    Ok(who)
+}
+
 async fn screen_info(
     State(app): State<AppState>,
     Extension(a): Extension<Arc<Auth>>,
     Extension(c): Extension<Caller>,
     Extension(by): Extension<Who>,
     Path(id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Res {
     // The link gives control of the screen.
     let (bot, _) = need_bot_access(&app, &c, &by, &id, Access::Operate)?;
+    let for_user = screen_for(&app, &c, &bot, q.get("for").map(String::as_str))?;
     // A Bot on its owner's machine is shown from there or not at all (ADR 0045). Its
     // screen may change hands while this waits on it, so access is checked again then.
     let still = || match caller_now(&app, &a, &c) {
         Some(now) => need_bot_access(&app, &now, &by, &id, Access::Operate).map(drop),
         None => Err(ApiError(StatusCode::UNAUTHORIZED, "Your session has ended. Sign in again.".into())),
     };
-    if let Some(url) = machines::screens::open(&app, &by, &bot, still).await? {
+    if let Some(url) = machines::screens::open(&app, &by, &bot, for_user.as_deref(), still).await? {
         return Ok(Json(json!({ "url": url })));
     }
     let off = || ApiError(StatusCode::NOT_FOUND, "Screens are off on this server. Install Xvfb, openbox, and voxl.".into());
@@ -2935,7 +2974,7 @@ mod tests {
             .route("/api/bots/{id}/routines", get(list_routines).post(create_routine))
             .route("/api/routines/{id}", patch(update_routine).delete(delete_routine))
             .layer(Extension(Who { actor: Actor::operator(), source: Source::default() }))
-            .layer(Extension(Caller { principal: Principal::User(Role::Admin), user: None, session: None, method: "none", bot: None }))
+            .layer(Extension(Caller { principal: Principal::User(Role::Admin), user: None, session: None, method: "none", bot: None, bot_for: None }))
             .with_state(app.clone());
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();

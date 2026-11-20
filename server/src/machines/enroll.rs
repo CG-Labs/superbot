@@ -107,6 +107,9 @@ pub struct Enrollment {
     /// voxl for new machines.
     pub screens: Option<super::screens::Settings>,
     pub(super) shown: super::screens::Shown,
+    /// Teammates' runs of shared Bots as their own OS user (MACHINE_TEAMMATE_USERS,
+    /// ADR 0048), with screens of their own.
+    pub teammate_users: bool,
     voxl: Option<(Bytes, String)>,
 }
 
@@ -149,6 +152,7 @@ impl Enrollment {
                 "MACHINE_BOT_USER",
                 "MACHINE_SCREENS",
                 "MACHINE_SCREEN_PORTS",
+                "MACHINE_TEAMMATE_USERS",
             ] {
                 if !var(k).trim().is_empty() {
                     return Err(format!("{k} needs MACHINE_CONTROL_URL"));
@@ -224,6 +228,7 @@ impl Enrollment {
         e.folder = super::folder::Settings::from_env(var)?;
         e.bot_user = super::botuser::from_env(var)?;
         e.screens = super::screens::from_env(var, e.bot_user)?;
+        e.teammate_users = super::teammate::from_env(var, e.bot_user)?;
         if e.screens.is_some() {
             let on_path = std::env::var_os("PATH")
                 .and_then(|p| std::env::split_paths(&p).map(|d| d.join(VOXL_BIN)).find(|p| p.is_file()));
@@ -264,6 +269,7 @@ impl Enrollment {
             asked: Default::default(),
             screens: None,
             shown: Default::default(),
+            teammate_users: false,
             voxl: None,
         })
     }
@@ -316,6 +322,14 @@ impl Enrollment {
         self
     }
 
+    /// With MACHINE_TEAMMATE_USERS=on (and so MACHINE_BOT_USER=on).
+    #[cfg(test)]
+    pub fn with_teammate_users(mut self) -> Enrollment {
+        self.bot_user = true;
+        self.teammate_users = true;
+        self
+    }
+
     /// With MACHINE_SCREENS=on (and so MACHINE_BOT_USER=on), showing screens through
     /// botd's loopback ports `ports`.
     #[cfg(test)]
@@ -362,7 +376,7 @@ impl Enrollment {
 
     pub fn describe(&self) -> String {
         format!(
-            "on at {} (listening on {}, agents on port {}, {} minutes to enroll; {}; harness logins {}; folder copies {}; Bots' own user {}; screens {}){}",
+            "on at {} (listening on {}, agents on port {}, {} minutes to enroll; {}; harness logins {}; folder copies {}; Bots' own user {}; teammates' own users {}; screens {}){}",
             self.url,
             self.listen,
             self.agent_port,
@@ -371,6 +385,7 @@ impl Enrollment {
             if self.logins { "on" } else { "off" },
             self.folder.as_ref().map_or("off".to_string(), |f| format!("on, up to {} MiB", f.max_bytes >> 20)),
             if self.bot_user { "on" } else { "off" },
+            if self.teammate_users { "on" } else { "off" },
             match (&self.screens, &self.voxl) {
                 (None, _) => "off".to_string(),
                 (Some(s), v) => format!(
@@ -1488,6 +1503,10 @@ impl MachineLink for Mtls {
         Box::pin(probe(app, &self.0, to, bins))
     }
 
+    fn teammate<'a>(&'a self, to: &'a Assigned, user_id: &'a str) -> super::route::Teammated<'a> {
+        Box::pin(super::teammate::ask(&self.0, to, user_id))
+    }
+
     fn run<'a>(
         &'a self,
         to: &'a Assigned,
@@ -1645,7 +1664,8 @@ mod tests {
         let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443")]).unwrap().unwrap();
         assert!(!e.logins && e.folder.is_none() && !e.bot_user, "logins, folder copies and the Bots' user are off unless asked");
         assert!(e.describe().contains("Bots' own user off"), "{}", e.describe());
-        for v in ["MACHINE_HARNESS_LOGINS", "MACHINE_FOLDER_SYNC", "MACHINE_FOLDER_SYNC_MAX_MB", "MACHINE_BOT_USER"] {
+        assert!(e.describe().contains("teammates' own users off"), "{}", e.describe());
+        for v in ["MACHINE_HARNESS_LOGINS", "MACHINE_FOLDER_SYNC", "MACHINE_FOLDER_SYNC_MAX_MB", "MACHINE_BOT_USER", "MACHINE_TEAMMATE_USERS"] {
             let vars: &'static [(&'static str, &'static str)] = Box::leak(Box::new([(v, "on")]));
             assert!(with(vars).is_err(), "{v} needs enrollment");
         }
@@ -1655,6 +1675,9 @@ mod tests {
         let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_BOT_USER", "on")]).unwrap().unwrap();
         assert!(e.bot_user && e.describe().contains("Bots' own user on"), "{}", e.describe());
         assert!(with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_BOT_USER", "yes")]).is_err());
+        assert!(with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_TEAMMATE_USERS", "on")]).is_err(), "teammates' users need the Bots' user");
+        let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_BOT_USER", "on"), ("MACHINE_TEAMMATE_USERS", "on")]).unwrap().unwrap();
+        assert!(e.teammate_users && e.describe().contains("teammates' own users on"), "{}", e.describe());
         for (raw, ok) in [("", Some(15)), ("5", Some(5)), ("60", Some(60)), ("4", None), ("61", None), ("soon", None)] {
             let vars: &'static [(&'static str, &'static str)] = Box::leak(Box::new([
                 ("MACHINE_CONTROL_URL", "https://cp.example:8443"),

@@ -70,20 +70,15 @@ pub fn is_root() -> bool {
 /// useradd's arguments for the Bots' user: a system user with its own group, no
 /// login shell, `home` as its home, which the agent made.
 pub fn useradd_args(name: &str, home: &Path) -> Vec<String> {
-    [
-        "--system",
-        "--user-group",
-        "--no-create-home",
-        "--shell",
-        "/usr/sbin/nologin",
-        "--comment",
-        "SuperBot Bots",
-        "--home-dir",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .chain([home.display().to_string(), name.to_string()])
-    .collect()
+    useradd_args_as(name, home, "SuperBot Bots")
+}
+
+fn useradd_args_as(name: &str, home: &Path, comment: &str) -> Vec<String> {
+    ["--system", "--user-group", "--no-create-home", "--shell", "/usr/sbin/nologin", "--comment", comment, "--home-dir"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain([home.display().to_string(), name.to_string()])
+        .collect()
 }
 
 fn run(program: &str, args: &[String]) -> Result<(), String> {
@@ -108,10 +103,32 @@ fn run(program: &str, args: &[String]) -> Result<(), String> {
 /// Makes the user if it isn't there. An agent from before ADR 0043 runs in a unit that
 /// can't write /etc, so when useradd fails there, systemd runs it outside the unit.
 pub fn ensure_user(name: &str, home: &Path) -> Result<Ids, String> {
+    ensure_user_as(name, home, "SuperBot Bots")
+}
+
+/// Removes a user this agent just made (not its home), like `ensure_user_as` going
+/// through systemd when the unit can't write /etc.
+pub fn remove_user(name: &str) -> Result<(), String> {
+    let args = vec![name.to_string()];
+    if let Err(direct) = run("userdel", &args) {
+        let mut outside: Vec<String> = ["--quiet", "--wait", "--collect", "--", "userdel"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        outside.extend(args);
+        if let Err(via) = run("systemd-run", &outside) {
+            return Err(format!("{direct}; through systemd: {via}"));
+        }
+    }
+    Ok(())
+}
+
+/// `ensure_user`, with `comment` as the user's description.
+pub fn ensure_user_as(name: &str, home: &Path, comment: &str) -> Result<Ids, String> {
     if let Some((ids, _)) = lookup(name) {
         return Ok(ids);
     }
-    let args = useradd_args(name, home);
+    let args = useradd_args_as(name, home, comment);
     if let Err(direct) = run("useradd", &args) {
         let mut outside = vec![
             "--quiet".into(),

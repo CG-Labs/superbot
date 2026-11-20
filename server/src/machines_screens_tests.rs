@@ -256,6 +256,8 @@ fn wire_req(owner: &str, token: &str) -> crate::machines::wire::ScreenRequest {
         width: 800,
         height: 600,
         idle_secs: 600,
+        for_user: None,
+        xauth: false,
     }
 }
 
@@ -401,9 +403,86 @@ async fn a_viewer_who_lost_access_while_waiting_gets_no_link() {
     let b = env.app.db.bot(&bot).unwrap();
     let by = crate::audit::Who::system("test");
     let gone = || Err(ApiError(StatusCode::NOT_FOUND, "Bot not found".into()));
-    let r = crate::machines::screens::open(&env.app, &by, &b, gone).await;
+    let r = crate::machines::screens::open(&env.app, &by, &b, None, gone).await;
     assert_eq!(r.err().map(|e| e.0), Some(StatusCode::NOT_FOUND));
     assert!(events(&env, "machine.screen_opened").await.is_empty(), "no link handed out");
-    let r = crate::machines::screens::open(&env.app, &by, &b, || Ok(())).await.unwrap();
+    let r = crate::machines::screens::open(&env.app, &by, &b, None, || Ok(())).await.unwrap();
     assert!(r.unwrap().starts_with("/screen/"));
+}
+
+async fn screen_for(env: &Env, auth: &str, bot: &str, for_user: &str) -> (u16, Value) {
+    let (code, body) = call(env.port, "GET", &format!("/api/bots/{bot}/screen?for={for_user}"), auth, "").await;
+    (code, parse(&body))
+}
+
+#[tokio::test]
+async fn with_teammate_users_a_teammate_has_a_screen_of_their_own_that_only_they_and_admins_see() {
+    let range = ports();
+    let mut env = serve_with(|e| e.with_screens(range).with_teammate_users()).await;
+    let me = crate::machines::runas::current_user().unwrap();
+    let (uid, mid, token) = machine_for(&env, "ada@example.com").await;
+    let m = agent_with_config(&mut env, &mid, &token, SCREEN_CLAUDE, |c| crate::machines::agent::Config { screens: fake_stack(), teammate_stand_in: Some(me), ..c }).await;
+    until_ready(&env, &m.agent).await;
+    let bot = owned_bot(&env, &uid);
+    let (bea_id, bea) = user_with(env.port, &env.admin, "bea@example.com", "member").await;
+    let ada = crate::users_http_tests::signed_in(env.port, &env.admin, &uid).await.unwrap();
+
+    // Ada sees her Bot's screen; Bea, who may operate it, gets one of her own.
+    let (code, v) = screen_of(&env, &ada, &bot).await;
+    assert_eq!(code, 200, "{v}");
+    let (ada_port, ada_token) = link(&v);
+    assert_eq!(view(ada_port, &ada_token).await.unwrap(), (200, "voxl display=:101".into()));
+    let (code, v) = screen_of(&env, &bea, &bot).await;
+    assert_eq!(code, 200, "{v}");
+    let (bea_port, bea_token) = link(&v);
+    assert!(bea_port != ada_port && bea_token != ada_token);
+    assert_eq!(view(bea_port, &bea_token).await.unwrap(), (200, "voxl display=:102".into()), "a display of its own");
+    assert_eq!(view(ada_port, &bea_token).await.unwrap().0, 401, "Bea's link doesn't open Ada's screen");
+    let mut running = m.agent.screens.report().running;
+    running.sort();
+    assert_eq!(running, [bot.clone(), format!("{bot}@{bea_id}")]);
+    let started = events(&env, "machine.screen_started").await;
+    assert!(started.iter().any(|e| e["details"]["forUser"] == bea_id.as_str()), "{started:?}");
+    assert!(started.iter().any(|e| e["details"].get("forUser").is_none()), "{started:?}");
+    assert_eq!(events(&env, "machine.teammate_user_created").await.len(), 1);
+
+    // Neither may ask for the other's; an admin sees Ada's, or Bea's when asking.
+    assert_eq!(screen_for(&env, &bea, &bot, &uid).await.0, 403);
+    assert_eq!(screen_for(&env, &ada, &bot, &bea_id).await.0, 403);
+    let (_, v) = screen_of(&env, &env.admin, &bot).await;
+    assert_eq!(link(&v), (ada_port, ada_token.clone()));
+    let (code, v) = screen_for(&env, &env.admin, &bot, &bea_id).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(link(&v), (bea_port, bea_token.clone()));
+    let (_, v) = json_call(&env, "GET", &format!("/api/users/{uid}/machine/screens"), "").await;
+    let listed: Vec<Option<&str>> = v["screens"].as_array().unwrap().iter().map(|s| s["forUser"].as_str()).collect();
+    assert_eq!(listed, [None, Some(bea_id.as_str())], "{v}");
+
+    // Bea loses the Bot: her screen closes on the machine; Ada's gets a new token.
+    let (code, v) = json_call(&env, "PATCH", &format!("/api/bots/{bot}/access"), r#"{"visibility":"private"}"#).await;
+    assert_eq!(code, 200, "{v}");
+    let closed = events(&env, "machine.screen_closed").await;
+    assert!(closed.iter().any(|e| e["details"]["reason"] == "access_lost" && e["details"]["forUser"] == bea_id.as_str() && e["details"]["machineStopped"] == true), "{closed:?}");
+    assert_eq!(m.agent.screens.report().running, std::slice::from_ref(&bot));
+    assert!(!matches!(view(bea_port, &bea_token).await, Ok((200, _))));
+    let (code, _) = screen_of(&env, &bea, &bot).await;
+    assert!(code == 403 || code == 404, "{code}");
+    assert_eq!(screen_for(&env, &env.admin, &bot, &bea_id).await.0, 404, "she can't use it, so it has no screen for her");
+    let (code, v) = screen_of(&env, &ada, &bot).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(view(link(&v).0, &link(&v).1).await.unwrap(), (200, "voxl display=:101".into()));
+}
+
+#[tokio::test]
+async fn without_teammate_users_everyone_shares_the_owners_screen_as_before() {
+    let mut env = serve_with(|e| e.with_screens(ports())).await;
+    let (uid, m) = ready_machine(&mut env, "ada@example.com", fake_stack()).await;
+    until_ready(&env, &m.agent).await;
+    let bot = owned_bot(&env, &uid);
+    let (bea_id, bea) = user_with(env.port, &env.admin, "bea@example.com", "member").await;
+    let (_, a) = screen_of(&env, &env.admin, &bot).await;
+    let (_, b) = screen_of(&env, &bea, &bot).await;
+    assert_eq!(link(&a), link(&b));
+    assert_eq!(m.agent.screens.report().running, std::slice::from_ref(&bot));
+    assert_eq!(screen_for(&env, &env.admin, &bot, &bea_id).await.0, 400, "no per-teammate screens to ask for");
 }

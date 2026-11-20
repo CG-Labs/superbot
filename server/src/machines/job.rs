@@ -301,6 +301,7 @@ mod tests {
             job_id: "j1".into(),
             bot_id: "b1".into(),
             owner_id: "u1".into(),
+            for_user: None,
             message_id: 1,
             bin: "sh".into(),
             args: vec!["-c".into(), script.into()],
