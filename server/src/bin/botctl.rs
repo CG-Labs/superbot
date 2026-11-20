@@ -102,6 +102,10 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine placement [<user>]                Where each user's Bots run: this server or their machine
   botctl machine assign <user>                     Run the user's Bots on their enrolled machine
   botctl machine unassign <user>                   Stop using it; with MACHINE_ROUTING=assigned they run here again
+  botctl machine agent <user>                      Its agent's build, harness CLIs and upgrades, against botd's
+  botctl machine upgrade <user>                    Upgrade its agent to botd's build now
+  botctl machine upgrade <user> hold|release       Keep its agent at its build, or let it be upgraded again
+  botctl machine harnesses <user>                  Install MACHINE_HARNESSES on it now, retrying failures
   botctl secrets                                   List secret names (never values)
   botctl secret set <NAME> < value-file            Save a secret, encrypted; Bots get it as $NAME
   botctl secret rm <NAME>                          Delete a saved secret
@@ -387,15 +391,24 @@ fn bot_access(args: &[&str]) -> Result<(&'static str, String, Option<String>), S
     })
 }
 
-/// `botctl machine ...`: which computer each user's Bots run on (ADR 0036).
+/// `botctl machine ...`: which computer each user's Bots run on (ADR 0036), and its
+/// agent's harnesses and upgrades (ADR 0039).
 fn machine_request(args: &[&str]) -> Result<(&'static str, String), String> {
     let at = |user: &str| format!("/api/users/{}/placement", encode(user));
+    let machine = |user: &str, rest: &str| format!("/api/users/{}/machine/{rest}", encode(user));
     Ok(match args {
         ["placement"] | ["placements"] => ("GET", "/api/machines/placements".into()),
         ["placement", user] => ("GET", at(user)),
         ["assign", user] => ("PUT", at(user)),
         ["unassign", user] => ("DELETE", at(user)),
-        _ => return Err("Usage: botctl machine placement [<user>] | assign <user> | unassign <user>".into()),
+        ["agent", user] => ("GET", machine(user, "agent")),
+        ["upgrade", user] => ("POST", machine(user, "agent/upgrade")),
+        ["upgrade", user, "hold"] => ("PUT", machine(user, "agent/hold")),
+        ["upgrade", user, "release"] => ("DELETE", machine(user, "agent/hold")),
+        ["harnesses", user] => ("POST", machine(user, "harnesses")),
+        _ => {
+            return Err("Usage: botctl machine placement [<user>] | assign <user> | unassign <user> | agent <user> | upgrade <user> [hold|release] | harnesses <user>".into());
+        }
     })
 }
 
@@ -739,6 +752,12 @@ mod tests {
         assert_eq!(machine_request(&["assign", "u1"]).unwrap(), ("PUT", "/api/users/u1/placement".into()));
         assert_eq!(machine_request(&["unassign", "u1"]).unwrap(), ("DELETE", "/api/users/u1/placement".into()));
         assert!(machine_request(&["assign"]).is_err());
+        assert_eq!(machine_request(&["agent", "a@example.com"]).unwrap(), ("GET", "/api/users/a%40example.com/machine/agent".into()));
+        assert_eq!(machine_request(&["upgrade", "u1"]).unwrap(), ("POST", "/api/users/u1/machine/agent/upgrade".into()));
+        assert_eq!(machine_request(&["upgrade", "u1", "hold"]).unwrap(), ("PUT", "/api/users/u1/machine/agent/hold".into()));
+        assert_eq!(machine_request(&["upgrade", "u1", "release"]).unwrap(), ("DELETE", "/api/users/u1/machine/agent/hold".into()));
+        assert_eq!(machine_request(&["harnesses", "u1"]).unwrap(), ("POST", "/api/users/u1/machine/harnesses".into()));
+        assert!(machine_request(&["upgrade", "u1", "now"]).is_err());
     }
 
     #[test]

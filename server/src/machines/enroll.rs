@@ -11,6 +11,7 @@
 
 use super::pki::{self, Ca, Issued, Peer};
 use super::route::{Assigned, Checked, MachineLink, Ran};
+use super::upkeep::Upkeep;
 use super::wire::{self, JobEvent, JobRequest};
 use super::{ControlPlane, State};
 use crate::adapters::AbortReason;
@@ -87,6 +88,8 @@ pub struct Enrollment {
     agent: Option<(Bytes, String)>,
     /// botctl, the same way.
     botctl: Option<(Bytes, String)>,
+    /// Harness CLIs and agent upgrades on machines (ADR 0039).
+    pub upkeep: Upkeep,
 }
 
 impl std::fmt::Debug for Enrollment {
@@ -116,7 +119,13 @@ impl Enrollment {
     ) -> Result<Option<Enrollment>, String> {
         let raw = var("MACHINE_CONTROL_URL").trim().to_string();
         if raw.is_empty() {
-            for k in ["MACHINE_LISTEN", "MACHINE_AGENT_PORT", "MACHINE_ENROLL_TIMEOUT_MINUTES"] {
+            for k in [
+                "MACHINE_LISTEN",
+                "MACHINE_AGENT_PORT",
+                "MACHINE_ENROLL_TIMEOUT_MINUTES",
+                "MACHINE_HARNESSES",
+                "MACHINE_AGENT_UPGRADES",
+            ] {
                 if !var(k).trim().is_empty() {
                     return Err(format!("{k} needs MACHINE_CONTROL_URL"));
                 }
@@ -182,6 +191,7 @@ impl Enrollment {
         )?;
         e.botctl = read(BOTCTL_BIN);
         e.enroll_timeout_ms = timeout * 60_000;
+        e.upkeep = Upkeep::from_env(var)?;
         Ok(Some(e))
     }
 
@@ -204,6 +214,7 @@ impl Enrollment {
             current,
             agent,
             botctl: None,
+            upkeep: Upkeep::default(),
         })
     }
 
@@ -234,6 +245,22 @@ impl Enrollment {
         self
     }
 
+    /// Serves `binary` as botctl, as if it shipped next to botd.
+    #[cfg(test)]
+    pub fn with_botctl(mut self, binary: &'static [u8]) -> Enrollment {
+        self.botctl = Some((Bytes::from_static(binary), sha256_hex(binary)));
+        self
+    }
+
+    /// SHA-256 of the agent botd ships, the build machines upgrade to.
+    pub fn agent_sha256(&self) -> Option<&str> {
+        self.agent.as_ref().map(|(_, sha)| sha.as_str())
+    }
+
+    pub fn botctl_sha256(&self) -> Option<&str> {
+        self.botctl.as_ref().map(|(_, sha)| sha.as_str())
+    }
+
     /// A certificate from this CA that botd never recorded.
     #[cfg(test)]
     pub fn issue_unrecorded(&self, csr: &str, user_id: &str, machine_id: &str) -> Issued {
@@ -248,11 +275,12 @@ impl Enrollment {
 
     pub fn describe(&self) -> String {
         format!(
-            "on at {} (listening on {}, agents on port {}, {} minutes to enroll){}",
+            "on at {} (listening on {}, agents on port {}, {} minutes to enroll; {}){}",
             self.url,
             self.listen,
             self.agent_port,
             self.enroll_timeout_ms / 60_000,
+            self.upkeep.describe(),
             match (&self.agent, &self.botctl) {
                 (Some(_), Some(_)) => "",
                 (None, _) =>
@@ -334,12 +362,16 @@ impl Enrollment {
              \x20     SUPERBOT_AGENT_LISTEN=0.0.0.0:{port}\n\
              \x20 - path: /etc/systemd/system/superbot-machine.service\n\
              \x20   permissions: \"0644\"\n\
-             \x20   content: |\n{unit}",
+             \x20   content: |\n{unit}\
+             \x20 - path: {GUARD_PATH}\n\
+             \x20   permissions: \"0755\"\n\
+             \x20   content: |\n{guard}",
             ca = indent(self.ca.pem()),
             url = self.url,
             id = m.id,
             port = self.agent_port,
             unit = indent(UNIT),
+            guard = indent(GUARD),
         );
         if let Some((_, sha)) = &self.agent {
             // botctl first: the agent reports whether it's there when botd checks.
@@ -392,6 +424,36 @@ impl Enrollment {
     fn agent_url(&self, address: &str, path: &str) -> String {
         format!("https://{address}:{}{path}", self.agent_port)
     }
+
+    /// Sends `body` to `m`'s agent at `path`, pinned to its certificates. Its status
+    /// and JSON answer (`null` if none).
+    pub(super) async fn call_agent<T: serde::Serialize + ?Sized>(
+        &self,
+        app: &App,
+        m: &Machine,
+        method: reqwest::Method,
+        path: &str,
+        body: &T,
+    ) -> Result<(u16, Value), String> {
+        let pins = app.db.machine_pins(&m.id);
+        if pins.is_empty() {
+            return Err("it has no usable certificate".into());
+        }
+        let address = m.ipv4.as_deref().ok_or("it has no address yet")?;
+        let (client, _) = self.pinned(pins)?;
+        let mut r = client
+            .request(method, self.agent_url(address, path))
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| format!("its agent didn't answer: {}", without_url(e)))?;
+        let code = r.status().as_u16();
+        let reply = read_capped(&mut r, MAX_REPLY)
+            .await
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or(Value::Null);
+        Ok((code, reply))
+    }
 }
 
 fn control_cert(ca: &Ca, host: &str) -> Result<ControlCert, String> {
@@ -413,19 +475,23 @@ fn control_cert(ca: &Ca, host: &str) -> Result<ControlCert, String> {
 }
 
 const FIRSTBOOT_PATH: &str = "/usr/local/lib/superbot/firstboot";
+const GUARD_PATH: &str = "/usr/local/lib/superbot/agent-guard";
 
 /// Run once by cloud-init (ADR 0035): installs the agent botd ships (and botctl, when
 /// botd ships it), each checked against the SHA-256 botd pinned, enrolls, and starts
 /// the agent. Its output goes to the cloud-init log, so nothing in it may print the
-/// token.
+/// token. Both live in /usr/local/lib/superbot, which the unit lets the agent write,
+/// so it can upgrade them (ADR 0039); /usr/local/bin links to them.
 const FIRSTBOOT: &str = r#"#!/bin/sh
 set -eu
+dir=/usr/local/lib/superbot
 {botctl}
-bin=/usr/local/bin/superbot-machine
+bin=$dir/superbot-machine
 curl -fsS --retry 10 --retry-delay 5 --retry-all-errors --cacert /etc/superbot/ca.pem -o "$bin.new" "{url}/v1/agent"
 echo "{sha}  $bin.new" | sha256sum -c -
 chmod 755 "$bin.new"
 mv "$bin.new" "$bin"
+ln -sfn "$bin" /usr/local/bin/superbot-machine
 systemctl daemon-reload
 systemctl enable superbot-machine
 set -a
@@ -442,11 +508,32 @@ systemctl start superbot-machine
 "#;
 
 /// FIRSTBOOT's botctl step (ADR 0036).
-const FIRSTBOOT_BOTCTL: &str = r#"ctl=/usr/local/bin/botctl
+const FIRSTBOOT_BOTCTL: &str = r#"ctl=$dir/botctl
 curl -fsS --retry 10 --retry-delay 5 --retry-all-errors --cacert /etc/superbot/ca.pem -o "$ctl.new" "{url}/v1/botctl"
 echo "{sha}  $ctl.new" | sha256sum -c -
 chmod 755 "$ctl.new"
 mv "$ctl.new" "$ctl"
+ln -sfn "$ctl" /usr/local/bin/botctl
+"#;
+
+/// Run before every start of the agent (ADR 0039). While an upgraded agent is on
+/// trial it counts the starts; past three, the new agent can't be working, so the
+/// files before it go back. The old agent then reports the upgrade rolled back. It
+/// never stops the agent from starting.
+pub const GUARD: &str = r#"#!/bin/sh
+state=${STATE_DIRECTORY:-/var/lib/superbot-machine}
+dir=${SUPERBOT_AGENT_DIR:-/usr/local/lib/superbot}
+[ -f "$state/upgrade-trial.json" ] || exit 0
+n=$(cat "$state/upgrade-trial.starts" 2>/dev/null || true)
+case $n in ''|*[!0-9]*) n=0 ;; esac
+n=$((n + 1))
+echo "$n" > "$state/upgrade-trial.starts"
+[ "$n" -gt 3 ] || exit 0
+for f in botctl superbot-machine; do
+  if [ -f "$dir/$f.prev" ]; then mv -f "$dir/$f.prev" "$dir/$f"; fi
+done
+echo "superbot: the upgraded agent didn't start; put the one before it back" >&2
+exit 0
 "#;
 
 const UNIT: &str = "[Unit]
@@ -457,7 +544,8 @@ Wants=network-online.target
 [Service]
 EnvironmentFile=/etc/superbot/machine.env
 Environment=SUPERBOT_ENROLL_TOKEN_FILE=/etc/superbot/enroll-token
-ExecStart=/usr/local/bin/superbot-machine run
+ExecStartPre=-/usr/local/lib/superbot/agent-guard
+ExecStart=/usr/local/lib/superbot/superbot-machine run
 Restart=always
 RestartSec=5
 StateDirectory=superbot-machine
@@ -466,7 +554,7 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-ReadWritePaths=/etc/superbot
+ReadWritePaths=/etc/superbot /usr/local/lib/superbot
 
 [Install]
 WantedBy=multi-user.target
@@ -1050,6 +1138,9 @@ async fn probe(
             .map(|h| h.version.as_str())
             .map_err(String::as_str),
     );
+    if let Ok(hb) = &res {
+        super::upkeep::observe(app, &to.machine_id, hb);
+    }
     res
 }
 
@@ -1261,7 +1352,7 @@ impl MachineLink for Mtls {
 
 // Admin API, under `/api/users/{key}/machine` (admin only, rbac::classify).
 
-fn need(cp: &ControlPlane) -> Res<&Arc<Enrollment>> {
+pub(super) fn need(cp: &ControlPlane) -> Res<&Arc<Enrollment>> {
     cp.need()?;
     cp.enrollment
         .as_ref()
@@ -1360,6 +1451,11 @@ mod tests {
             "agent settings alone are a mistake"
         );
         assert!(with(&[("MACHINE_ENROLL_TIMEOUT_MINUTES", "20")]).is_err());
+        assert!(with(&[("MACHINE_HARNESSES", "claude")]).is_err(), "harnesses need enrollment");
+        assert!(with(&[("MACHINE_AGENT_UPGRADES", "auto")]).is_err());
+        let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_HARNESSES", "pi")]).unwrap().unwrap();
+        assert!(e.upkeep.plan.is_some() && e.describe().contains("harnesses on machines: pi@1.5.2; agent upgrades: manual"), "{}", e.describe());
+        assert!(with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_HARNESSES", "nope")]).is_err());
         for (raw, ok) in [("", Some(15)), ("5", Some(5)), ("60", Some(60)), ("4", None), ("61", None), ("soon", None)] {
             let vars: &'static [(&'static str, &'static str)] = Box::leak(Box::new([
                 ("MACHINE_CONTROL_URL", "https://cp.example:8443"),
@@ -1473,10 +1569,14 @@ mod tests {
             &format!("SUPERBOT_MACHINE_ID={}", m.id),
             "SUPERBOT_CONTROL_URL=https://127.0.0.1:1",
             "      -----BEGIN CERTIFICATE-----",
-            "ExecStart=/usr/local/bin/superbot-machine run",
+            "ExecStart=/usr/local/lib/superbot/superbot-machine run",
+            "ExecStartPre=-/usr/local/lib/superbot/agent-guard",
+            "ReadWritePaths=/etc/superbot /usr/local/lib/superbot",
+            &format!("path: {GUARD_PATH}"),
         ] {
             assert!(ud.contains(want), "{want}\n{ud}");
         }
+        assert!(ud.contains(&indent_lines(GUARD)), "the guard, as written");
         assert!(
             !ud.contains("runcmd"),
             "no download when botd has no agent to serve"
@@ -1490,6 +1590,8 @@ mod tests {
             "SUPERBOT_ENROLL_TOKEN_FILE=/etc/superbot/enroll-token SUPERBOT_STATE_DIR=/var/lib/superbot-machine \"$bin\" enroll".into(),
             "systemctl enable superbot-machine".into(),
             "rm -f /var/lib/cloud/instance/user-data.txt".into(),
+            "bin=$dir/superbot-machine".into(),
+            "ln -sfn \"$bin\" /usr/local/bin/superbot-machine".into(),
         ] {
             assert!(script.contains(&want), "{want}\n{script}");
         }
@@ -1520,6 +1622,8 @@ mod tests {
             format!("echo \"{}  $ctl.new\" | sha256sum -c -", "cd".repeat(32)),
             "--cacert /etc/superbot/ca.pem -o \"$ctl.new\" \"https://127.0.0.1:1/v1/botctl\"".into(),
             format!("echo \"{}  $bin.new\" | sha256sum -c -", "ab".repeat(32)),
+            "ctl=$dir/botctl".into(),
+            "ln -sfn \"$ctl\" /usr/local/bin/botctl".into(),
         ] {
             assert!(script.contains(&want), "{want}\n{script}");
         }
@@ -1563,6 +1667,41 @@ mod tests {
             take_events(&mut Vec::new(), line(&JobEvent::Line { line: most.clone() }).as_bytes()),
             Some(vec![JobEvent::Line { line: most }])
         );
+    }
+
+    fn indent_lines(s: &str) -> String {
+        s.lines().map(|l| format!("      {l}\n")).collect()
+    }
+
+    /// The unit's guard, run as systemd would before each start, after an upgrade.
+    #[test]
+    fn the_guard_puts_the_old_agent_back_after_three_failed_starts() {
+        let (state, dir) = (crate::db::temp_path("guard-state"), crate::db::temp_path("guard-bin"));
+        let start = || {
+            let out = std::process::Command::new("sh")
+                .args(["-c", GUARD])
+                .env("STATE_DIRECTORY", &state)
+                .env("SUPERBOT_AGENT_DIR", &dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "the guard never stops a start");
+        };
+        let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default();
+        for (f, body) in [("superbot-machine", "new"), ("superbot-machine.prev", "old"), ("botctl", "new ctl"), ("botctl.prev", "old ctl")] {
+            std::fs::write(dir.join(f), body).unwrap();
+        }
+        start();
+        assert_eq!(read("superbot-machine"), "new", "no trial, nothing to do");
+        std::fs::write(state.join("upgrade-trial.json"), "{}").unwrap();
+        for n in 1..=3 {
+            start();
+            assert_eq!(read("superbot-machine"), "new", "start {n} of the new agent");
+        }
+        start();
+        assert_eq!((read("superbot-machine"), read("botctl")), ("old".into(), "old ctl".into()), "the fourth start runs the old one");
+        assert!(!dir.join("superbot-machine.prev").exists());
+        start();
+        assert_eq!(read("superbot-machine"), "old", "nothing left to put back");
     }
 
     /// The first-boot script as cloud-init will write it.

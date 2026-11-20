@@ -8,6 +8,7 @@ mod claude;
 mod codex;
 mod hermes;
 mod pi;
+pub mod install;
 
 use crate::machines::job;
 use crate::machines::wire::{JobCleanup, JobEvent, JobFile, JobRequest};

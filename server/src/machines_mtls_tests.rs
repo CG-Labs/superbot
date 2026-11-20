@@ -16,20 +16,25 @@ use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use zeroize::Zeroizing;
 
-struct Env {
-    port: u16,
-    app: AppState,
-    admin: String,
-    fake: Arc<Fake>,
-    e: Arc<Enrollment>,
-    cp: Arc<ControlPlane>,
-    agent_listener: Option<TcpListener>,
+pub(crate) struct Env {
+    pub port: u16,
+    pub app: AppState,
+    pub admin: String,
+    pub fake: Arc<Fake>,
+    pub e: Arc<Enrollment>,
+    pub cp: Arc<ControlPlane>,
+    pub agent_listener: Option<TcpListener>,
 }
 
 const AGENT: &str = "stand-in for the superbot-machine binary";
 
 /// botd with the fake provider, routing on, and enrollment on a loopback machine port.
 async fn serve() -> Env {
+    serve_with(|e| e).await
+}
+
+/// `serve`, with enrollment changed by `f`.
+pub(crate) async fn serve_with(f: impl FnOnce(Enrollment) -> Enrollment) -> Env {
     let machine_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let agent_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let (mport, aport) = (
@@ -41,7 +46,7 @@ async fn serve() -> Env {
     let mut cp = ControlPlane::for_tests(p);
     cp.routing = Routing::On;
     let e = cp
-        .enroll_with(Enrollment::for_tests(9, mport, aport).with_agent(AGENT.as_bytes()))
+        .enroll_with(f(Enrollment::for_tests(9, mport, aport).with_agent(AGENT.as_bytes())))
         .unwrap();
     let cp = Arc::new(cp);
     let shared = cp.clone();
@@ -69,12 +74,12 @@ async fn serve() -> Env {
     }
 }
 
-async fn json_call(env: &Env, method: &str, path: &str, body: &str) -> (u16, Value) {
+pub(crate) async fn json_call(env: &Env, method: &str, path: &str, body: &str) -> (u16, Value) {
     let (code, body) = call(env.port, method, path, &env.admin, body).await;
     (code, parse(&body))
 }
 
-async fn events(env: &Env, action: &str) -> Vec<Value> {
+pub(crate) async fn events(env: &Env, action: &str) -> Vec<Value> {
     let (code, body) = call(
         env.port,
         "GET",
@@ -97,7 +102,7 @@ fn token_in(user_data: &str) -> String {
 
 /// A member with a running machine on 127.0.0.1, assigned to them. Returns their id,
 /// the machine's id, and the token its cloud-init user data carries.
-async fn machine_for(env: &Env, email: &str) -> (String, String, String) {
+pub(crate) async fn machine_for(env: &Env, email: &str) -> (String, String, String) {
     let (uid, _) = user_with(env.port, &env.admin, email, "member").await;
     let (code, m) = json_call(env, "POST", &format!("/api/users/{uid}/machine"), "").await;
     assert_eq!(code, 202, "{m}");
@@ -121,7 +126,7 @@ async fn machine_for(env: &Env, email: &str) -> (String, String, String) {
     (uid, m.id, token_in(&ud))
 }
 
-fn config(env: &Env, machine_id: &str, token: Option<&str>) -> Config {
+pub(crate) fn config(env: &Env, machine_id: &str, token: Option<&str>) -> Config {
     Config {
         control_url: env.e.url.clone(),
         machine_id: machine_id.into(),
@@ -135,6 +140,8 @@ fn config(env: &Env, machine_id: &str, token: Option<&str>) -> Config {
         botctl: PathBuf::from("/nonexistent/botctl"),
         harness_path: "/usr/bin:/bin".into(),
         max_jobs: 8,
+        tools: crate::db::temp_path("agent-tools"),
+        exe: crate::db::temp_path("agent-exe"),
     }
 }
 
@@ -1092,7 +1099,7 @@ async fn agent_with(env: &mut Env, mid: &str, token: &str, harness: &str) -> OnM
 }
 
 /// The Bot's next reply after message `before`.
-async fn reply_after(env: &Env, bot: &str, before: i64) -> String {
+pub(crate) async fn reply_after(env: &Env, bot: &str, before: i64) -> String {
     for _ in 0..600 {
         if let Some(m) = env.app.db.replies_after(bot, before).into_iter().next() {
             return m.text;
@@ -1102,7 +1109,7 @@ async fn reply_after(env: &Env, bot: &str, before: i64) -> String {
     panic!("no reply from {bot}");
 }
 
-async fn send(env: &Env, bot: &str, text: &str) -> i64 {
+pub(crate) async fn send(env: &Env, bot: &str, text: &str) -> i64 {
     let before = env.app.db.last_id();
     let body = json!({ "text": text }).to_string();
     let (code, m) = call(
@@ -1117,7 +1124,7 @@ async fn send(env: &Env, bot: &str, text: &str) -> i64 {
     before
 }
 
-async fn wait_for_event(env: &Env, action: &str) -> Vec<Value> {
+pub(crate) async fn wait_for_event(env: &Env, action: &str) -> Vec<Value> {
     for _ in 0..600 {
         let evs = events(env, action).await;
         if !evs.is_empty() {
@@ -1440,6 +1447,69 @@ async fn stopping_a_bot_ends_its_run_on_the_machine() {
     assert_eq!(finished["details"]["result"], "stopped", "{finished}");
 }
 
+/// A harness that streams until it's stopped, takes a second to stop, and whose
+/// `cleanup` takes another.
+const CHATTY: &str = r#"#!/bin/sh
+if [ "$1" = cleanup ]; then sleep 1; touch "$HOME/cleaned"; exit 0; fi
+trap 'sleep 1; touch "$HOME/stopped"; exit 0' TERM
+echo $$ > "$HOME/harness.pid"
+touch "$HOME/run.env"
+while :; do echo '{}'; sleep 0.05; done
+"#;
+
+fn alive(pid: &str) -> bool {
+    std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
+        .is_ok_and(|s| s.rsplit(')').next().is_some_and(|r| !r.trim_start().starts_with('Z')))
+}
+
+#[tokio::test]
+async fn an_install_waits_until_a_stopped_job_has_exited_and_cleaned_up() {
+    let mut env = serve().await;
+    let (uid, mid, token) = machine_for(&env, "ada@example.com").await;
+    let m = agent_with(&mut env, &mid, &token, CHATTY).await;
+    let Ok(Target::Machine(to)) = env.cp.route(&env.app.db, &uid) else {
+        panic!("Ada's machine")
+    };
+    // botd goes away mid-run, so its stream to the agent drops; or a Bot is stopped.
+    for dropped in [true, false] {
+        for f in ["harness.pid", "run.env", "stopped", "cleaned"] {
+            let _ = std::fs::remove_file(m.home.join(f));
+        }
+        let job: wire::JobRequest = serde_json::from_value(json!({
+            "protocol": wire::PROTOCOL, "jobId": format!("j-{dropped}"), "botId": "b1", "ownerId": uid,
+            "messageId": 1, "bin": "claude", "args": [], "env": {}, "cwd": m.home.join("work"),
+            "stdin": null, "files": [],
+            "cleanup": { "whenExists": m.home.join("run.env"), "bin": "claude", "args": ["cleanup"],
+                         "env": {}, "cwd": m.home.join("work"), "timeoutSecs": 10 },
+            "collect": []
+        }))
+        .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let (abort_tx, abort) = tokio::sync::watch::channel(None);
+        let (link, to) = (env.cp.link.clone(), to.clone());
+        let stream = tokio::spawn(async move { link.run(&to, job, abort, tx).await });
+        let pid = wait_for_file(&m.home.join("harness.pid")).await;
+        assert_eq!(m.agent.running(), 1);
+        if dropped {
+            stream.abort();
+        } else {
+            abort_tx.send(Some("stopped")).unwrap();
+        }
+        let (tools, home) = (m.agent.tools.clone(), m.home.clone());
+        let install = tokio::spawn(async move {
+            let _r = tools.replacing().await;
+            ["stopped", "cleaned"].map(|f| home.join(f).exists()) == [true, true] && !alive(&pid)
+        });
+        let waited = tokio::time::timeout(Duration::from_secs(20), install)
+            .await
+            .expect("the install got its turn")
+            .unwrap();
+        assert!(waited, "dropped {dropped}: the install waited for the harness to exit and its cleanup");
+        assert_eq!(m.agent.running(), 0);
+    }
+}
+
 #[tokio::test]
 async fn botd_stops_listening_to_a_machine_that_floods_it() {
     let mut env = serve().await;
@@ -1502,6 +1572,8 @@ fn agent_counts_programs_only_under_its_home_or_the_system() {
         botctl: elsewhere.join("botctl"),
         harness_path: "/usr/bin:/bin".into(),
         max_jobs: 1,
+        tools: crate::db::temp_path("agent-tools"),
+        exe: crate::db::temp_path("agent-exe"),
     };
     assert_eq!(cfg.layout().botctl, None, "outside the home and the system's directories");
 

@@ -197,7 +197,27 @@ botctl machine placement [<user>]  # where each user's Bots run, and why
 botctl machine unassign <user>     # back to this server (with MACHINE_ROUTING=assigned)
 ```
 
-An assigned user's Bots run only on their machine. If it is down, suspended, outdated, or missing the Bot's harness, the Bot says so and nothing runs here instead. New machines download `botctl` from botd as well as the agent, so keep `botctl` next to `botd` (the installer and image do). On the machine, Bots reach botd through the agent on `127.0.0.1:7444` (loopback only; no new firewall rule). The harness CLIs themselves aren't installed on machines yet. Design: [ADR 0036](../docs/adr/0036-bots-on-the-users-machine.md).
+An assigned user's Bots run only on their machine. If it is down, suspended, outdated, or missing the Bot's harness, the Bot says so and nothing runs here instead. New machines download `botctl` from botd as well as the agent, so keep `botctl` next to `botd` (the installer and image do). On the machine, Bots reach botd through the agent on `127.0.0.1:7444` (loopback only; no new firewall rule). Design: [ADR 0036](../docs/adr/0036-bots-on-the-users-machine.md).
+
+### Harness CLIs and agent upgrades on machines
+
+To have each machine's agent install harness CLIs by itself once it enrolls, add:
+
+```sh
+MACHINE_HARNESSES=claude,codex,pi   # pinned versions, checked by hash; name@version for another
+MACHINE_AGENT_UPGRADES=manual       # manual (default): only when you ask; auto: every idle agent, once per build
+```
+
+Until a Bot's harness is installed, its runs are refused with "still being installed". Agents upgrade themselves to the `superbot-machine` next to `botd`: they download it from botd over the pinned channel, check its SHA-256, swap it in, and restart. If botd can't reach the new agent, the old one is put back. On the server:
+
+```sh
+botctl machine agent <user>               # its build, harnesses and upgrade, against botd's
+botctl machine upgrade <user>             # upgrade its agent now
+botctl machine upgrade <user> hold        # keep it at its build (release: let it go)
+botctl machine harnesses <user>           # install MACHINE_HARNESSES now, retrying failures
+```
+
+Each step is audited as `machine.harness_*` and `machine.agent_upgrade*`. Machines enrolled before this change can't replace their own agent: reinstall them. Logins for harnesses on machines aren't set up yet, so give Bots there an API key in the user's secrets. Design: [ADR 0039](../docs/adr/0039-machine-harnesses-and-agent-upgrades.md).
 
 ## Approvals after an upgrade
 
