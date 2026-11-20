@@ -277,10 +277,14 @@ impl App {
     /// folder back to `DATA_DIR`, so backups have them and memory follows the Bot.
     fn keep_memory(&self, bot: &Bot) {
         let Some(iso) = self.isolation() else { return };
-        let pairs = [
-            (iso.memory_file(&bot.owner_id, &bot.id), self.data_memory_file(&bot.id)),
-            (iso.user_file(&bot.owner_id), self.data_user_file(&bot.owner_id)),
-        ];
+        let mut pairs = vec![(iso.user_file(&bot.owner_id), self.data_user_file(&bot.owner_id))];
+        // Handed over while it ran: hand_over_memory already kept the memory, and this
+        // run's copy is the old owner's, so it's dropped, not copied over the Bot's.
+        if self.db.bot(&bot.id).is_some_and(|now| now.owner_id == bot.owner_id) {
+            pairs.push((iso.memory_file(&bot.owner_id, &bot.id), self.data_memory_file(&bot.id)));
+        } else if let Some(stale) = iso.memory_file(&bot.owner_id, &bot.id) {
+            accounts::remove(&stale);
+        }
         for (from, to) in pairs {
             if let (Some(from), Some(to)) = (from, to)
                 && let Some(text) = accounts::read_plain(&from, accounts::MAX_FILE)
@@ -1095,9 +1099,14 @@ mod tests {
         app.init_bot_files(&a);
 
         // Handed to Bea: it leaves Ada's folder and starts again in Bea's.
+        assert!(app.db.set_bot_owner_capped(&a.id, &bea.id, None));
         app.hand_over_memory(&a.id, &ada.id, &bea.id);
         assert!(!mem.exists());
-        assert!(app.db.set_bot_owner_capped(&a.id, &bea.id, None));
+        // Ada's run, stopped by the handover, ends after it: what it wrote is dropped.
+        std::fs::write(&mem, "# A1\n\nWritten after the handover.\n").unwrap();
+        app.keep_memory(&a);
+        assert!(!mem.exists());
+        assert!(std::fs::read_to_string(app.data_memory_file(&a.id).unwrap()).unwrap().contains("Learned a thing."));
         let b = app.db.bot(&a.id).unwrap();
         app.init_bot_files(&b);
         assert!(std::fs::read_to_string(app.memory_file(&b).unwrap()).unwrap().contains("Learned a thing."));
