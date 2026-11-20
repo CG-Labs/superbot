@@ -3140,20 +3140,36 @@ impl Db {
         let _ = self.c().execute("UPDATE machines SET upgrade_failed_build = NULL WHERE id = ?", [machine_id]);
     }
 
-    /// Holds the agent at its build (`by`: Some), or lets it go (None). Returns whether
-    /// it changed.
-    pub fn machine_upgrade_hold(&self, machine_id: &str, by: Option<Option<&str>>) -> bool {
-        let n = match by {
-            Some(by) => self.c().execute(
-                "UPDATE machines SET upgrade_hold_at = ?, upgrade_hold_by = ? WHERE id = ? AND upgrade_hold_at IS NULL",
-                params![now(), by, machine_id],
-            ),
-            None => self.c().execute(
+    /// Holds the agent at its build, unless it is held already or an upgrade is on its
+    /// way (one sent before `stale_before` no longer counts): a hold that is taken means
+    /// no upgrade starts until it is released. Returns whether it was taken.
+    pub fn machine_upgrade_hold(&self, machine_id: &str, by: Option<&str>, stale_before: i64) -> bool {
+        self.c()
+            .execute(
+                "UPDATE machines SET upgrade_hold_at = ?, upgrade_hold_by = ?
+                 WHERE id = ? AND upgrade_hold_at IS NULL AND (upgrade_id IS NULL OR upgrade_sent_at < ?)",
+                params![now(), by, machine_id, stale_before],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Lets a held agent go. Returns whether it was held.
+    pub fn machine_upgrade_release(&self, machine_id: &str) -> bool {
+        self.c()
+            .execute(
                 "UPDATE machines SET upgrade_hold_at = NULL, upgrade_hold_by = NULL WHERE id = ? AND upgrade_hold_at IS NOT NULL",
                 [machine_id],
-            ),
-        };
-        n.unwrap_or(0) == 1
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    #[cfg(test)]
+    pub fn machine_upgrade_backdate(&self, machine_id: &str, ms: i64) {
+        self.c()
+            .execute("UPDATE machines SET upgrade_sent_at = upgrade_sent_at - ? WHERE id = ?", params![ms, machine_id])
+            .unwrap();
     }
 }
 
@@ -3237,11 +3253,28 @@ mod tests {
         let u = db.create_user(None, Some("ada@example.com"), "Ada", Role::Member).unwrap();
         let new = NewMachine { user_id: &u.id, provider: "fake", label_prefix: "superbot", tier: "starter", plan: "g6-standard-1", region: "gb-lon", created_by: None };
         let m = db.add_machine(&new).unwrap();
-        assert!(db.machine_upgrade_hold(&m.id, Some(Some("admin"))));
+        assert!(db.machine_upgrade_hold(&m.id, Some("admin"), 0));
+        assert!(!db.machine_upgrade_hold(&m.id, Some("admin"), 0), "held already");
         assert!(!db.machine_upgrade_claim(&m.id, "u1", "b", "admin", 0), "held");
-        assert!(db.machine_upgrade_hold(&m.id, None));
+        assert!(db.machine_upgrade_release(&m.id));
+        assert!(!db.machine_upgrade_release(&m.id), "released already");
         assert!(db.machine_upgrade_claim(&m.id, "u1", "b", "admin", 0));
         assert!(!db.machine_upgrade_claim(&m.id, "u2", "b", "admin", 0), "one on its way");
+    }
+
+    #[test]
+    fn an_upgrade_on_its_way_takes_no_hold() {
+        let db = Db::open(&temp_path("upgrade-claimed").join("app.sqlite")).unwrap();
+        let u = db.create_user(None, Some("ada@example.com"), "Ada", Role::Member).unwrap();
+        let new = NewMachine { user_id: &u.id, provider: "fake", label_prefix: "superbot", tier: "starter", plan: "g6-standard-1", region: "gb-lon", created_by: None };
+        let m = db.add_machine(&new).unwrap();
+        assert!(db.machine_upgrade_claim(&m.id, "u1", "b", "admin", 0));
+        assert!(!db.machine_upgrade_hold(&m.id, Some("admin"), 0), "an upgrade is on its way");
+        assert!(db.machine(&m.id).unwrap().upgrade_hold_at.is_none());
+        db.machine_upgrade_backdate(&m.id, 60_000);
+        assert!(db.machine_upgrade_hold(&m.id, Some("admin"), now() - 1000), "a stale one doesn't count");
+        assert!(db.machine_upgrade_end(&m.id, "u1", None));
+        assert!(!db.machine_upgrade_claim(&m.id, "u2", "b", "admin", 0), "held");
     }
 
     #[test]

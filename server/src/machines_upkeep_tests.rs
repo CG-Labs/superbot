@@ -309,6 +309,11 @@ async fn an_admin_upgrades_an_agent_that_puts_the_old_one_back_if_the_new_one_fa
     let (code, v) = json_call(&env, "POST", &format!("{path}/upgrade"), "").await;
     assert_eq!(code, 202, "{v}");
     assert_eq!(v["upgrade"]["build"].as_str(), Some(hex(new).as_str()), "{v}");
+    // On its way, it can't be called back, so it can't be held either.
+    let (code, v) = json_call(&env, "PUT", &format!("{path}/hold"), "").await;
+    assert_eq!(code, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("on its way"), "{v}");
+    assert_eq!(events(&env, "machine.agent_upgrade_held").await.len(), 1);
     m.wait_for_restart().await;
     assert_eq!((read(&m.cfg.exe).as_bytes(), read(&ctl).as_str()), (new, "new botctl"));
     assert_eq!((read(&prev(&m.cfg.exe)), read(&prev(&ctl))), (old.clone(), "old botctl".to_string()));
@@ -343,6 +348,34 @@ async fn an_admin_upgrades_an_agent_that_puts_the_old_one_back_if_the_new_one_fa
     let (code, v) = json_call(&env, "POST", &format!("{path}/upgrade"), "").await;
     assert_eq!(code, 409, "{v}");
     assert!(v["error"].as_str().unwrap().contains("already"), "{v}");
+}
+
+#[tokio::test]
+async fn an_upgrade_whose_agent_goes_quiet_times_out() {
+    let new = build(VERSION, "quiet");
+    let mut env = serve_with(move |e| e.with_agent(new)).await;
+    let (uid, mid, token) = machine_for(&env, "cy@example.com").await;
+    let old = String::from_utf8(build("0.0.9", "old").to_vec()).unwrap();
+    let mut m = agent_on(&mut env, &mid, &token, &old).await;
+    let path = format!("/api/users/{uid}/machine/agent");
+    beat_until(&env, &uid, "heard from", |v| v["agent"]["build"].is_string()).await;
+    let (code, v) = json_call(&env, "POST", &format!("{path}/upgrade"), "").await;
+    assert_eq!(code, 202, "{v}");
+    m.wait_for_restart().await;
+
+    // The new agent never comes up, so no heartbeat says how it went.
+    m.server.abort();
+    let _ = (&mut m.server).await;
+    heartbeats(&env.app, &env.cp).await;
+    assert!(events(&env, "machine.agent_upgrade_failed").await.is_empty(), "not yet");
+    env.app.db.machine_upgrade_backdate(&mid, 86_400_000 + 11 * 60_000);
+    assert_eq!(heartbeats(&env.app, &env.cp).await, Some(0), "it doesn't answer");
+    let failed = events(&env, "machine.agent_upgrade_failed").await;
+    assert_eq!((failed.len(), failed[0]["details"]["reason"].as_str()), (1, Some("timeout")), "{failed:?}");
+    assert_eq!(failed[0]["outcome"], "failure");
+    let (code, v) = json_call(&env, "GET", &path, "").await;
+    assert_eq!(code, 200);
+    assert_eq!((v["upgrade"].clone(), v["failedBuild"].as_str()), (Value::Null, Some(hex(new).as_str())), "{v}");
 }
 
 #[tokio::test]

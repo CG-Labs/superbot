@@ -44,7 +44,7 @@ Heartbeats now also report `can` (`harnesses`, `upgrade`), the agent's `build` (
 - `manual`: nothing upgrades an agent by itself. An admin asks: `POST /api/users/{user}/machine/agent/upgrade` (`botctl machine upgrade <user>`).
 - `auto`: after each periodic heartbeat, botd also upgrades every idle agent whose build isn't botd's. It does this once per build: a build that failed on a machine isn't tried there again by itself.
 
-Either way, an admin can hold a machine at its build: `PUT|DELETE /api/users/{user}/machine/agent/hold` (`botctl machine upgrade <user> hold|release`). `GET /api/users/{user}/machine/agent` (`botctl machine agent <user>`) shows the agent's build, harnesses and upgrade against botd's. All of these are admin only.
+Either way, an admin can hold a machine at its build: `PUT|DELETE /api/users/{user}/machine/agent/hold` (`botctl machine upgrade <user> hold|release`). The hold and the upgrade claim are each one database update that checks the other, so a hold that succeeds means no upgrade starts until it is released. While an upgrade is on its way, a hold is refused (409), since that upgrade can't be called back. `GET /api/users/{user}/machine/agent` (`botctl machine agent <user>`) shows the agent's build, harnesses and upgrade against botd's. All of these are admin only.
 
 Since botd and the agent share one crate version, the build means the SHA-256 of `superbot-machine` as botd serves it at `/v1/agent`. botd asks only when:
 - it ships an agent;

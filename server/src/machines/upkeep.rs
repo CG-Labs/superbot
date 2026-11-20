@@ -181,6 +181,11 @@ fn trial_secs(cp: &ControlPlane) -> u64 {
     (cp.reconcile_every.as_secs() * 3).clamp(300, 86_400)
 }
 
+/// An upgrade sent before this, and not heard of since, no longer counts as on its way.
+fn stale_before(cp: &ControlPlane) -> i64 {
+    now() - (trial_secs(cp) as i64 * 1000 + UPGRADE_GRACE_MS)
+}
+
 /// Why `m`'s agent can't be upgraded to botd's build now, if it can't.
 fn blocker(e: &Enrollment, m: &Machine, hb: &Heartbeat) -> Option<String> {
     let Some(served) = e.agent_sha256() else {
@@ -213,7 +218,7 @@ async fn upgrade(app: &App, cp: &ControlPlane, e: &Enrollment, m: &Machine, hb: 
     }
     let served = e.agent_sha256().unwrap_or_default().to_string();
     let trial = trial_secs(cp);
-    let stale = now() - (trial as i64 * 1000 + UPGRADE_GRACE_MS);
+    let stale = stale_before(cp);
     let id = crate::short_id().replace('-', "");
     let auto = system(m);
     let (by, who) = match by {
@@ -303,7 +308,7 @@ fn plan_due(plan: &HarnessPlan, m: &Machine, hb: &Heartbeat, at: i64) -> bool {
 /// or not. Its build isn't tried again by itself.
 pub fn expire_upgrade(app: &App, cp: &ControlPlane, m: &Machine) {
     let (Some(id), Some(at)) = (&m.upgrade_id, m.upgrade_sent_at) else { return };
-    if now() - at > trial_secs(cp) as i64 * 1000 + UPGRADE_GRACE_MS
+    if at < stale_before(cp)
         && app.db.machine_upgrade_end(&m.id, id, m.upgrade_build.as_deref())
     {
         let d = json!({ "upgradeId": id, "by": m.upgrade_by, "toBuild": m.upgrade_build, "reason": "timeout", "error": "it never said how the upgrade went" });
@@ -402,17 +407,26 @@ pub async fn upgrade_now(
 }
 
 /// `PUT /api/users/{key}/machine/agent/hold`: nothing upgrades its agent until released.
+/// 409 while an upgrade is on its way, since that one can't be called back.
 pub async fn hold(
     AppS(app): AppS<AppState>,
     Extension(by): Extension<Who>,
     Path(key): Path<String>,
 ) -> Res {
-    let e = enroll::need(control_plane(&app)?)?;
+    let cp = control_plane(&app)?;
+    let e = enroll::need(cp)?;
     let m = need_machine(&app, &key)?;
-    if app.db.machine_upgrade_hold(&m.id, Some(by.actor.id.as_deref())) {
+    if app.db.machine_upgrade_hold(&m.id, by.actor.id.as_deref(), stale_before(cp)) {
         app.db.record(&event(&by, "machine.agent_upgrade_held", &m, json!({ "build": m.agent_upkeep.as_ref().map(|u| u["build"].clone()) })));
     }
-    Ok(Json(view(e, &app.db.machine(&m.id).unwrap_or(m))))
+    let m = app.db.machine(&m.id).unwrap_or(m);
+    if m.upgrade_hold_at.is_none() {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "An upgrade is on its way to it. Hold it once that upgrade is done or has failed.".into(),
+        ));
+    }
+    Ok(Json(view(e, &m)))
 }
 
 /// `DELETE /api/users/{key}/machine/agent/hold`: its agent may be upgraded again, and
@@ -424,7 +438,7 @@ pub async fn release(
 ) -> Res {
     let e = enroll::need(control_plane(&app)?)?;
     let m = need_machine(&app, &key)?;
-    if app.db.machine_upgrade_hold(&m.id, None) {
+    if app.db.machine_upgrade_release(&m.id) {
         app.db.machine_upgrade_forget_failure(&m.id);
         app.db.record(&event(&by, "machine.agent_upgrade_released", &m, json!({})));
     }
