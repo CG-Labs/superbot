@@ -194,8 +194,8 @@ Without a domain, `./init.sh` gives plain HTTP at `http://localhost`, published 
 
 | Volume | Mounted at | Holds |
 |--------|------------|-------|
-| `data` | `/data` (`DATA_DIR`) | SQLite database, Bot memory, user file. Back this up. |
-| `workspace` | `/workspace` (`WORKSPACE_DIR`) | The Bots' shared files. |
+| `data` | `/data` (`DATA_DIR`) | SQLite database, Bot memory, each user's `users/<id>/USER.md`. Back this up. |
+| `workspace` | `/workspace` (`WORKSPACE_DIR`) | Each user's working folder, `users/<id>/`, shared by that user's Bots. |
 | `home` | `/home/superbot` | Harness logins and sessions (`~/.claude`, `~/.claude.json`, `~/.codex`, `~/.pi`), runtime `npm i -g` installs. Hermes Agent keeps its per-Bot data in `data` instead. |
 | `backups` | `/backups` | Backup archives. |
 | `caddy-data`, `caddy-config` | Caddy | Certificates and ACME account. |
@@ -240,7 +240,7 @@ Upgrading from a release before secrets: run `./init.sh` once first. It adds a r
 
 ### Backup and restore
 
-The `backup` service writes `superbot-<UTC stamp>.tar.gz` to the `backups` volume (default every 24 h, keeps 14 days: `SUPERBOT_BACKUP_INTERVAL`, `SUPERBOT_BACKUP_RETENTION_DAYS`). Each archive has an online SQLite `.backup` copy of `app.sqlite` plus the rest of `DATA_DIR` (Bot memory, `USER.md`), so it is safe while Bots are running.
+The `backup` service writes `superbot-<UTC stamp>.tar.gz` to the `backups` volume (default every 24 h, keeps 14 days: `SUPERBOT_BACKUP_INTERVAL`, `SUPERBOT_BACKUP_RETENTION_DAYS`). Each archive has an online SQLite `.backup` copy of `app.sqlite` plus the rest of `DATA_DIR` (Bot memory, each user's `USER.md`), so it is safe while Bots are running.
 
 ```sh
 # On demand, into the backups volume, or streamed to the host (copy it off-site)

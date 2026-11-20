@@ -126,14 +126,9 @@ fn api(cred: Cred, method: &str, path: &str, body: Option<String>) -> Result<Str
     }
     let auth = if auth.is_empty() { String::new() } else { format!("Authorization: {auth}\r\n") };
     let body = body.unwrap_or_default();
-    // Names the calling Bot for the audit log. All Bots share BOT_TOKEN, so botd treats it as self-reported.
-    let bot = match cred {
-        Cred::Bot => std::env::var("BOT_ID").ok().filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric())),
-        Cred::Operator | Cred::Anonymous => None,
-    };
-    let bot = bot.map(|id| format!("X-SuperBot-Bot: {id}\r\n")).unwrap_or_default();
+    // BOT_TOKEN is this Bot's own, so it says which Bot is calling (ADR 0029).
     let req = format!(
-        "{method} {path} HTTP/1.0\r\nHost: {addr}\r\n{auth}User-Agent: botctl/{}\r\n{bot}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        "{method} {path} HTTP/1.0\r\nHost: {addr}\r\n{auth}User-Agent: botctl/{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         env!("CARGO_PKG_VERSION"),
         body.len()
     );

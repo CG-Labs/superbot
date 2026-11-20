@@ -8,6 +8,7 @@
 use rusqlite::{params, Connection};
 use serde_json::Value;
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::RwLock;
 
 pub const MARK: &str = "[redacted]";
@@ -45,6 +46,70 @@ pub fn forget(value: &str) {
 
 pub fn known() -> Vec<String> {
     KNOWN.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Each user's own secrets (ADR 0029), by user. Any member can save any value, so
+/// theirs are redacted only where their own Bots write (`text_for`): one user can't
+/// erase words from everyone else's chats.
+static OWNED: RwLock<BTreeMap<String, Vec<String>>> = RwLock::new(BTreeMap::new());
+
+pub fn register_for(owner: &str, value: &str) {
+    let v = value.trim();
+    if v.chars().count() < MIN_LEN || v.contains(MARK) {
+        return;
+    }
+    let mut owned = OWNED.write().unwrap_or_else(|e| e.into_inner());
+    let list = owned.entry(owner.to_string()).or_default();
+    if !list.iter().any(|k| k == v) {
+        list.push(v.to_string());
+        list.sort_by_key(|k| std::cmp::Reverse(k.len()));
+    }
+}
+
+#[cfg(test)]
+pub fn forget_for(owner: &str, value: &str) {
+    if let Some(list) = OWNED.write().unwrap_or_else(|e| e.into_inner()).get_mut(owner) {
+        list.retain(|k| k != value.trim());
+    }
+}
+
+pub fn owned() -> Vec<(String, Vec<String>)> {
+    OWNED.read().unwrap_or_else(|e| e.into_inner()).iter().map(|(o, l)| (o.clone(), l.clone())).collect()
+}
+
+/// `text`, plus the own secrets of `owners` (the users whose Bots wrote or carry `s`).
+/// Both lists are matched together, longest first: a short value someone saved (a known
+/// key prefix) must not split a longer secret and leave the rest of it showing.
+pub fn text_for<'a>(owners: &[&str], s: &'a str) -> Cow<'a, str> {
+    let theirs: Vec<String> = {
+        let owned = OWNED.read().unwrap_or_else(|e| e.into_inner());
+        owners.iter().filter_map(|o| owned.get(*o)).flatten().filter(|k| s.contains(k.as_str())).cloned().collect()
+    };
+    if theirs.is_empty() {
+        return text(s);
+    }
+    let mut all: Vec<String> = known().into_iter().filter(|k| s.contains(k.as_str())).chain(theirs).collect();
+    all.sort_by_key(|k| std::cmp::Reverse(k.len()));
+    let mut out = s.to_string();
+    for k in &all {
+        if out.contains(k.as_str()) {
+            out = out.replace(k.as_str(), MARK);
+        }
+    }
+    Cow::Owned(strip_issued(&out))
+}
+
+/// `value`, plus the own secrets of `owners`.
+pub fn value_for(owners: &[&str], v: Value) -> Value {
+    match v {
+        Value::String(s) => match text_for(owners, &s) {
+            Cow::Borrowed(_) => Value::String(s),
+            Cow::Owned(r) => Value::String(r),
+        },
+        Value::Array(a) => Value::Array(a.into_iter().map(|v| value_for(owners, v)).collect()),
+        Value::Object(o) => Value::Object(o.into_iter().map(|(k, v)| (k, value_for(owners, v))).collect()),
+        other => other,
+    }
 }
 
 pub fn text(s: &str) -> Cow<'_, str> {
@@ -118,6 +183,18 @@ pub fn looks_secret(name: &str) -> bool {
 pub fn scrub_rows(c: &Connection) -> rusqlite::Result<usize> {
     let tx = c.unchecked_transaction()?;
     let mut n = 0;
+    // A user's own Bots' rows first, with their secrets and botd's together, longest
+    // first (as `text_for`), so a short value of theirs can't split a longer secret.
+    for (owner, values) in owned() {
+        let mut all: Vec<String> = known().into_iter().chain(values).collect();
+        all.sort_by_key(|k| std::cmp::Reverse(k.len()));
+        for s in all {
+            for (table, col) in [("messages", "text"), ("approvals", "subject")] {
+                let sql = format!("UPDATE {table} SET {col} = replace({col}, ?1, ?2) WHERE instr({col}, ?1) > 0 AND bot_id IN (SELECT id FROM bots WHERE owner_id = ?3)");
+                n += tx.execute(&sql, params![s, MARK, owner])?;
+            }
+        }
+    }
     for s in known() {
         for (table, col) in [("messages", "text"), ("approvals", "subject")] {
             n += tx.execute(&format!("UPDATE {table} SET {col} = replace({col}, ?1, ?2) WHERE instr({col}, ?1) > 0"), params![s, MARK])?;
@@ -126,13 +203,13 @@ pub fn scrub_rows(c: &Connection) -> rusqlite::Result<usize> {
     // Choice cards and saved requesters are JSON, where a secret with quotes or
     // backslashes is escaped, so they're parsed and redacted value by value.
     for col in ["question", "requested_by"] {
-        let rows: Vec<(i64, String)> = {
-            let mut s = tx.prepare(&format!("SELECT id, {col} FROM messages WHERE {col} IS NOT NULL"))?;
-            s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+        let rows: Vec<(i64, String, Option<String>)> = {
+            let mut s = tx.prepare(&format!("SELECT m.id, m.{col}, b.owner_id FROM messages m LEFT JOIN bots b ON b.id = m.bot_id WHERE m.{col} IS NOT NULL"))?;
+            s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?
         };
-        for (id, raw) in rows {
+        for (id, raw, owner) in rows {
             let Ok(json) = serde_json::from_str::<Value>(&raw) else { continue };
-            let clean = value(json.clone());
+            let clean = value_for(owner.as_deref().as_slice(), json.clone());
             if clean != json {
                 n += tx.execute(&format!("UPDATE messages SET {col} = ? WHERE id = ?"), params![clean.to_string(), id])?;
             }
@@ -169,6 +246,22 @@ mod tests {
         forget(&key);
         assert!(text(&key).contains(&key));
         forget(&longer);
+    }
+
+    #[test]
+    fn own_secrets_stay_with_their_owner_and_never_split_a_longer_one() {
+        let owner = unique("u");
+        let key = unique("sk-ant-api03-server");
+        let prefix = key[..key.len() - 6].to_string();
+        register(&key);
+        register_for(&owner, &prefix);
+        assert_eq!(text_for(&[owner.as_str()], &format!("key {key}!")), "key [redacted]!", "the whole server key, no suffix left");
+        assert_eq!(text_for(&[owner.as_str()], &format!("{prefix}..")), "[redacted]..");
+        assert_eq!(text(&format!("{prefix}..")), format!("{prefix}.."), "only in the owner's Bots");
+        assert_eq!(text_for(&["someone-else"], &prefix), prefix.as_str());
+        assert_eq!(value_for(&[owner.as_str()], json!({ "a": [format!("x {key}")] })), json!({ "a": ["x [redacted]"] }));
+        forget(&key);
+        forget_for(&owner, &prefix);
     }
 
     #[test]

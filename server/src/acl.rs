@@ -97,7 +97,7 @@ pub fn access(user_id: &str, role: Role, owner_id: &str, visibility: Visibility,
 /// Whose access a request has, for ACL checks.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Viewer {
-    /// Admins, break-glass, and Bots (one shared token, so no narrower identity to check).
+    /// Admins and break-glass.
     All,
     User { id: String, role: Role },
     /// A person without a user record. Only reachable if the owner account is missing.
@@ -107,15 +107,19 @@ pub enum Viewer {
 impl Viewer {
     pub fn of(c: &Caller) -> Viewer {
         match (c.principal, &c.user) {
-            (Principal::Bot, _) | (Principal::User(Role::Admin), _) => Viewer::All,
+            (Principal::User(Role::Admin), _) => Viewer::All,
+            // A Bot acts with its owner's access (`owner_of`), never more.
+            (Principal::Bot, _) => Viewer::Nobody,
             (Principal::User(role), Some(u)) => Viewer::User { id: u.id.clone(), role },
             (Principal::User(_), None) => Viewer::Nobody,
         }
     }
 
     /// The access a Bot acts with toward other Bots: its owner's, as the user's role is now.
+    /// A Bot whose owner is disabled or gone acts with none.
     pub fn owner_of(db: &Db, bot: &Bot) -> Viewer {
         match db.user(&bot.owner_id) {
+            Some(u) if !u.active() => Viewer::Nobody,
             Some(u) if u.role == Role::Admin => Viewer::All,
             Some(u) => Viewer::User { id: u.id, role: u.role },
             None => Viewer::Nobody,

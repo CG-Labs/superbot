@@ -111,6 +111,9 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         // Your own machine (ADR 0025). Everyone else's, and every change, is under
         // `users` above or `machines`, which fall through to Admin.
         ("GET", ["machine"]) => Account,
+        // Your own secrets (ADR 0029). Handlers refuse Bots; anyone else's are under `users`.
+        ("GET", ["me", "secrets"]) => Read,
+        ("PUT" | "DELETE", ["me", "secrets", _]) => Write,
 
         ("GET", ["state" | "events" | "bots" | "policy"]) => Read,
         ("GET", ["harnesses", _, "models"]) => Read,
@@ -228,6 +231,13 @@ mod tests {
             ("DELETE", "/api/scim/tokens/st1", Perm::Admin),
             ("GET", "/api/auth/me", Perm::Account),
             ("GET", "/api/machine", Perm::Account),
+            ("GET", "/api/me/secrets", Perm::Read),
+            ("PUT", "/api/me/secrets/OPENAI_API_KEY", Perm::Write),
+            ("DELETE", "/api/me/secrets/OPENAI_API_KEY", Perm::Write),
+            ("POST", "/api/me/secrets/OPENAI_API_KEY", Perm::Admin),
+            ("GET", "/api/me/secrets/OPENAI_API_KEY", Perm::Admin),
+            ("GET", "/api/users/u1/secrets", Perm::Admin),
+            ("DELETE", "/api/users/u1/secrets", Perm::Admin),
             ("GET", "/api/machines", Perm::Admin),
             ("POST", "/api/machines/reconcile", Perm::Admin),
             ("GET", "/api/users/u1/machine", Perm::Admin),
