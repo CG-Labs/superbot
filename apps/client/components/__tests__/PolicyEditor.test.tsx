@@ -73,6 +73,18 @@ function fakeApi() {
 
 const yes = jest.fn(async () => true);
 
+// The first render loads and transforms most of React Native, which takes seconds on a cold CI runner.
+// Pay for it here, not in whichever test runs first.
+beforeAll(async () => {
+  const { unmount } = await render(<PolicyEditor api={fakeApi()} canEdit onBack={jest.fn()} confirm={yes} />);
+  await screen.findByLabelText("Pushes to a git remote");
+  await unmount();
+}, 60_000);
+// userEvent.press holds each press for a real 130 ms; fake timers skip that wait.
+beforeEach(() => jest.useFakeTimers());
+afterEach(() => jest.useRealTimers());
+jest.setTimeout(15_000);
+
 describe("PolicyEditor (ADR 0049)", () => {
   beforeEach(() => yes.mockClear());
 
