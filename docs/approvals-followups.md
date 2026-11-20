@@ -9,6 +9,6 @@ Work left after the approvals MVP ([ADR 0007](adr/0007-approvals.md)). Each item
 5. **Audit export.** Done: CSV export, filters, and a viewer in the web app ([ADR 0009](adr/0009-audit-events.md)). The Expo client has no viewer yet.
 6. **Notifications.** Approvals wait silently unless an app is open. Push notifications (client), email, or Slack, with a deep link to the approval.
 7. **Smarter command analysis.** Commands are parsed (`server/src/shell.rs`), but script files the Bot runs (`./cleanup.sh`, `python x.py`) aren't read, and decoded payloads (`base64 -d | sh`) aren't flagged.
-8. **Approve once per run.** Let a person approve "this kind of call for the rest of this task" without saving a permanent rule.
+8. **Approve once per run.** Done: "Approve for this run" approves the call and, until that run ends, later calls of the same kind from the same Bot in the same run; it saves no rule, deny rules and deny classes still win, and some calls (destructive shell commands, downloaded scripts, typed input) can only be approved one at a time ([ADR 0051](adr/0051-approve-once-per-run.md)).
 9. **Sandbox defaults.** Turn on Codex's sandbox (`workspace-write`) and similar options as defense in depth, separate from approvals.
 10. **Pi canary coverage.** The unguarded-run canary keys off shell tool names (`bash`, `shell`, and Hermes's `terminal`). Extend it to every tool once each harness reports hook calls reliably.
