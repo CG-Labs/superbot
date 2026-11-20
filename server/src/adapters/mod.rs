@@ -146,6 +146,21 @@ pub trait Adapter: Send {
     fn login_args(&self) -> Option<&'static [&'static str]> {
         None
     }
+    /// How the harness logs in on a user's machine (ADR 0041), if it has a login there.
+    fn machine_login(&self) -> Option<MachineLogin> {
+        None
+    }
+}
+
+/// A harness's login on a user's machine: the agent runs `args` in a terminal there,
+/// with HOME its Bots' HOME, and checks `files` to tell whether it's logged in.
+#[derive(Clone, Copy, Debug)]
+pub struct MachineLogin {
+    pub args: &'static [&'static str],
+    /// Where the login saves its credentials, relative to HOME.
+    pub files: &'static [&'static str],
+    /// Secrets that make a login unneeded: a run with one of them is never refused.
+    pub keys: &'static [&'static str],
 }
 
 #[derive(Clone, serde::Serialize)]

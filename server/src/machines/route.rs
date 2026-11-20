@@ -92,6 +92,10 @@ pub enum Refusal {
     Upgrading,
     /// `botctl` isn't installed on it, so approvals can't be asked for there.
     NoBotctl,
+    /// The Bot's harness isn't logged in there and the owner has no key for it (ADR 0041).
+    NotLoggedIn(String),
+    /// The owner's folder is being copied there for the first time (ADR 0041).
+    FolderCopying,
 }
 
 impl Refusal {
@@ -107,6 +111,8 @@ impl Refusal {
             Refusal::HarnessInstalling(_) => "harness_installing",
             Refusal::Upgrading => "agent_upgrading",
             Refusal::NoBotctl => "agent_incomplete",
+            Refusal::NotLoggedIn(_) => "harness_not_logged_in",
+            Refusal::FolderCopying => "folder_copying",
         }
     }
 
@@ -123,6 +129,8 @@ impl Refusal {
             Refusal::HarnessInstalling(h) => format!("I didn't run: {h} is still being installed on your computer. Try again in a few minutes."),
             Refusal::Upgrading => "I didn't run: your computer's agent is updating itself. Try again in a minute.".into(),
             Refusal::NoBotctl => "I didn't run: botctl isn't installed on your computer, so I couldn't ask you before risky steps. Ask an admin to install it.".into(),
+            Refusal::NotLoggedIn(h) => format!("I didn't run: {h} isn't logged in on your computer. Log it in there with `botctl machine harness-login me {h}` (or ask an admin), or save an API key for it in your secrets."),
+            Refusal::FolderCopying => "I didn't run: your files are still being copied to your computer. Try again in a few minutes.".into(),
         }
     }
 }
@@ -171,6 +179,13 @@ pub fn fit(hb: &Heartbeat, bin: &str) -> Result<wire::Layout, Refusal> {
         return Err(Refusal::NoBotctl);
     }
     Ok(layout)
+}
+
+/// Whether the machine's login for `bin` lets a run start (ADR 0041): it's logged in
+/// there, or the run has a key that makes a login unneeded (`keyed`).
+pub fn logged_in(hb: &Heartbeat, bin: &str, keyed: bool) -> Result<(), Refusal> {
+    let there = hb.logins.get(bin).is_some_and(|l| l.state == wire::LOGGED_IN);
+    if there || keyed { Ok(()) } else { Err(Refusal::NotLoggedIn(bin.into())) }
 }
 
 pub type Checked<'a> = Pin<Box<dyn Future<Output = Result<Heartbeat, String>> + Send + 'a>>;
@@ -402,5 +417,20 @@ mod tests {
         for r in [Refusal::Offline("x".into()), Refusal::NotAssigned, Refusal::NoBotctl, Refusal::Upgrading, Refusal::HarnessInstalling("pi".into())] {
             assert!(!r.message().is_empty() && !r.reason().is_empty());
         }
+    }
+
+    #[test]
+    fn a_run_needs_its_harness_logged_in_there_or_a_key() {
+        let mut hb = Heartbeat::default();
+        let refused: Result<(), Refusal> = Err(Refusal::NotLoggedIn("claude".into()));
+        assert_eq!(logged_in(&hb, "claude", false), refused, "an agent that can't say is no login");
+        assert_eq!(logged_in(&hb, "claude", true), Ok(()));
+        for (state, ok) in [(wire::LOGGED_OUT, false), (wire::LOGGING_IN, false), (wire::LOGGED_IN, true)] {
+            hb.logins.insert("claude".into(), wire::LoginStatus { state: state.into(), since: None });
+            assert_eq!(logged_in(&hb, "claude", false).is_ok(), ok, "{state}");
+        }
+        assert_eq!(Refusal::NotLoggedIn("claude".into()).reason(), "harness_not_logged_in");
+        assert!(Refusal::NotLoggedIn("codex".into()).message().contains("botctl machine harness-login me codex"));
+        assert_eq!(Refusal::FolderCopying.reason(), "folder_copying");
     }
 }

@@ -111,6 +111,10 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         // Your own machine (ADR 0025). Everyone else's, and every change, is under
         // `users` above or `machines`, which fall through to Admin.
         ("GET", ["machine"]) => Account,
+        // Harness logins on your own machine (ADR 0041). Handlers refuse Bots.
+        ("GET", ["machine", "harness-logins"]) => Account,
+        ("POST", ["machine", "harness-login"] | ["machine", "harness-login", _, "input"]) => Write,
+        ("DELETE", ["machine", "harness-login" | "harness-logins", _]) => Write,
         // Your own secrets (ADR 0029). Handlers refuse Bots; anyone else's are under `users`.
         ("GET", ["me", "secrets"]) => Read,
         // Your own plan (ADR 0033). Every tier with its models is `tiers`, for admins.
@@ -268,6 +272,20 @@ mod tests {
             ("PUT", "/api/users/u1/machine/agent/hold", Perm::Admin),
             ("DELETE", "/api/users/u1/machine/agent/hold", Perm::Admin),
             ("POST", "/api/users/u1/machine/harnesses", Perm::Admin),
+            ("POST", "/api/users/u1/machine/harness-login", Perm::Admin),
+            ("POST", "/api/users/u1/machine/harness-login/l1/input", Perm::Admin),
+            ("DELETE", "/api/users/u1/machine/harness-login/l1", Perm::Admin),
+            ("GET", "/api/users/u1/machine/harness-logins", Perm::Admin),
+            ("DELETE", "/api/users/u1/machine/harness-logins/claude", Perm::Admin),
+            ("GET", "/api/users/u1/machine/folder-sync", Perm::Admin),
+            ("POST", "/api/users/u1/machine/folder-sync", Perm::Admin),
+            ("GET", "/api/machine/harness-logins", Perm::Account),
+            ("POST", "/api/machine/harness-login", Perm::Write),
+            ("POST", "/api/machine/harness-login/l1/input", Perm::Write),
+            ("DELETE", "/api/machine/harness-login/l1", Perm::Write),
+            ("DELETE", "/api/machine/harness-logins/claude", Perm::Write),
+            ("PUT", "/api/machine/harness-login", Perm::Admin),
+            ("POST", "/api/machine/folder-sync", Perm::Admin),
             ("POST", "/api/auth/logout", Perm::Account),
             ("GET", "/", Perm::Read),
             ("GET", "/app.js", Perm::Read),
