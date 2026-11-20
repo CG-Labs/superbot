@@ -889,7 +889,7 @@ mod tests {
         assert!(t.remove("ufay", "c4", &Files::Delete, |_| Err("root".into())).is_err());
         fake.users.lock().unwrap().insert(fay.user.clone(), Ids { uid: 4_000_000, gid: 4_000_000 });
         let e = t.remove("ufay", "c4", &Files::Delete, |_| Ok(())).unwrap_err();
-        assert!(e.contains("isn't the user it was"), "{e}");
+        assert!(e.contains("isn't the user it was"));
         assert!(fay.home.is_dir() && t.known().contains(&"ufay".to_string()));
 
         // While a removal runs, no run or screen of theirs gets their user.
