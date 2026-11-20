@@ -1098,6 +1098,15 @@ async fn login_page() -> Response {
 
 // Bots
 
+/// Whose plan applies to the caller: a person's own, a Bot's owner's (ADR 0033).
+fn plan_user(app: &App, c: &Caller) -> String {
+    match (&c.user, c.principal) {
+        (Some(u), _) => u.id.clone(),
+        (None, Principal::Bot) => c.bot.as_deref().and_then(|id| app.db.bot(id)).map_or_else(String::new, |b| b.owner_id),
+        (None, _) => users::OPERATOR.into(),
+    }
+}
+
 /// Every Bot the caller can see, each with their `access` to it.
 fn visible_bots(app: &App, c: &Caller, by: &Who) -> Vec<Value> {
     viewer(app, c, by).bots(&app.db).iter().map(|(b, a)| bot_view_for(app, c, b, *a)).collect()
@@ -1115,8 +1124,9 @@ async fn state(State(app): State<AppState>, Extension(c): Extension<Caller>, Ext
         Principal::User(r) => json!(r),
         Principal::Bot => json!("bot"),
     };
-    // New Bots are the caller's, so the harnesses offered are the ones their tier has.
-    let me_id = c.user.as_ref().map_or(users::OPERATOR, |u| u.id.as_str());
+    // New Bots are the caller's (a Bot's are its owner's), so the harnesses offered are that tier's.
+    let plan_id = plan_user(&app, &c);
+    let me_id = plan_id.as_str();
     let tier = app.tier_of(me_id);
     let harnesses: Vec<&str> = adapters::installed().into_iter().filter(|h| tier.allows_harness(h)).collect();
     Json(json!({
@@ -1137,8 +1147,7 @@ async fn list_models(State(app): State<AppState>, Extension(c): Extension<Caller
         return Err(not_found("Harness"));
     }
     let admin = c.principal == Principal::User(Role::Admin);
-    let me_id = c.user.as_ref().map_or(users::OPERATOR, |u| u.id.as_str());
-    if !admin && (q.contains_key("tier") || app.tier_of(me_id).managed()) {
+    if !admin && (q.contains_key("tier") || app.tier_of(&plan_user(&app, &c)).managed()) {
         return Err(ApiError(StatusCode::FORBIDDEN, "Your plan picks the model.".into()));
     }
     let tier = match q.get("tier") {

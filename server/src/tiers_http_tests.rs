@@ -299,6 +299,15 @@ async fn tier_limits_hold_per_user() {
     assert!(run(port, app, &w.b, &hers.id).await.starts_with("model="));
     // A Bot's plan is its owner's; it has none of its own to ask for.
     assert_eq!(call(port, "GET", "/api/me/tier", &w.key.auth(shared), "").await.0, 403);
+    // Its owner's plan, not the operator's, decides what it may list.
+    assert_eq!(set_tier(&w, users::OPERATOR, json!("self-host")).await.0, 200);
+    assert_eq!(call(port, "GET", "/api/harnesses/claude/models", &w.admin, "").await.0, 200);
+    assert_eq!(call(port, "GET", "/api/harnesses/claude/models", &w.key.auth(shared), "").await.0, 403);
+    let (_, state) = call(port, "GET", "/api/state", &w.key.auth(shared), "").await;
+    assert_eq!(parse(&state)["me"]["tier"]["name"], "starter");
+    assert_eq!(set_tier(&w, users::OPERATOR, Value::Null).await.0, 200);
+    assert_eq!(set_tier(&w, &w.a_id, json!("self-host")).await.0, 200);
+    assert_eq!(call(port, "GET", "/api/harnesses/claude/models", &w.key.auth(shared), "").await.0, 200, "the operator is on starter");
     // Moving Ada up lifts the limit at once.
     assert_eq!(set_tier(&w, &w.a_id, json!("pro")).await.0, 200);
     assert!(run(port, app, &w.a, shared).await.starts_with("model=claude-sonnet-4-5"));
