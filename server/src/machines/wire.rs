@@ -23,6 +23,11 @@
 //! - `PUT /v1/sync/{id}/blobs/{sha256}?offset=<n>` (bytes) -> `BlobReply`.
 //! - `POST /v1/sync/{id}/finish` -> `SyncReport`.
 //! - `PUT /v1/bot-user` `BotUserRequest` (202): run Bots as their own OS user (ADR 0043).
+//! - `PUT /v1/screens/{bot}` `ScreenRequest` -> `ScreenReply`: start the Bot's screen,
+//!   or give a running one a new viewer token (ADR 0045).
+//! - `DELETE /v1/screens/{bot}`: stop it.
+//! - `GET /v1/screens/{bot}/tunnel` with `Upgrade: SCREEN_UPGRADE` (101): a raw byte
+//!   pipe to the screen's viewer on the machine's loopback, one per viewer connection.
 //!
 //! Protocol 1 (`PROTOCOL`) is the first that runs Bots. A heartbeat without `protocol`
 //! is from an agent before it, which can't. Installs, upgrades, logins and folder
@@ -95,6 +100,64 @@ pub const CAN_UPGRADE: &str = "upgrade";
 pub const CAN_LOGINS: &str = "logins";
 pub const CAN_SYNC: &str = "sync";
 pub const CAN_BOT_USER: &str = "bot_user";
+pub const CAN_SCREENS: &str = "screens";
+
+/// The screen protocol this build speaks (ADR 0045). A request names it, an agent
+/// refuses any other, and botd treats an agent that reports another as outdated.
+pub const SCREEN_PROTOCOL: u32 = 1;
+
+/// The `Upgrade` header of a screen tunnel.
+pub const SCREEN_UPGRADE: &str = "superbot-screen/1";
+
+/// What a screen runs, as found on the machine's system PATH: a virtual display, a
+/// window manager, a session bus and the viewer.
+pub const SCREEN_PROGRAMS: [&str; 4] = ["Xvfb", "openbox", "dbus-daemon", "voxl"];
+
+/// Screens on a machine (ADR 0045).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenReport {
+    pub protocol: u32,
+    /// Of `SCREEN_PROGRAMS`, those it can't find.
+    pub missing: Vec<String>,
+    /// The Bots whose screen is up.
+    pub running: Vec<String>,
+    /// How many it shows at once.
+    pub max: u32,
+}
+
+/// `PUT /v1/screens/{bot}`: start the Bot's screen as the Bots' user, or, if it is up,
+/// keep it and let only `token` view it from now on.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScreenRequest {
+    pub protocol: u32,
+    /// Must be the machine's own user, as for jobs.
+    pub owner_id: String,
+    /// The viewer's password: 32 to 128 lowercase hex characters, chosen by botd.
+    pub token: String,
+    pub width: u32,
+    pub height: u32,
+    /// Stop it after this long with no viewer, request or job of the Bot.
+    pub idle_secs: u64,
+}
+
+/// Where a Bot's programs find its screen on the machine.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenReply {
+    /// `DISPLAY`, e.g. `:101`.
+    pub display: String,
+    /// `DBUS_SESSION_BUS_ADDRESS`.
+    pub bus: String,
+    /// It was started (not just kept) by this request.
+    pub started: bool,
+}
+
+/// `token` as a viewer password: plain lowercase hex, long enough to guess at no rate.
+pub fn screen_token(token: &str) -> bool {
+    (32..=128).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
 
 /// The OS user Bots run as on a machine (ADR 0043). An agent may be set to another,
 /// as tests are; botd never names one.
@@ -166,6 +229,9 @@ pub struct Heartbeat {
     /// The Bots' own user, once botd has asked for one (ADR 0043).
     #[serde(default)]
     pub bot_user: Option<BotUserStatus>,
+    /// Its screens, if it can show them (`CAN_SCREENS`).
+    #[serde(default)]
+    pub screens: Option<ScreenReport>,
 }
 
 /// Whether a harness is logged in on the machine: whether one of the credential files
@@ -574,6 +640,16 @@ mod tests {
         .unwrap();
         assert_eq!((old.protocol, old.layout, old.jobs), (0, None, 0));
         assert!(old.logins.is_empty(), "an agent from before logins says nothing of them");
+        assert!(old.screens.is_none(), "an agent from before screens says nothing of them");
+    }
+
+    #[test]
+    fn screen_tokens_are_long_lowercase_hex() {
+        assert!(screen_token(&"a1".repeat(16)));
+        assert!(screen_token(&"f".repeat(128)));
+        for bad in ["", "abc", &"A1".repeat(16), &"g".repeat(32), &"a".repeat(129), &format!("{} ", "a".repeat(32))] {
+            assert!(!screen_token(bad), "{bad:?}");
+        }
     }
 
     #[test]

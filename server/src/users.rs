@@ -595,6 +595,9 @@ pub async fn update_user(State(app): State<AppState>, Extension(a): Extension<Ar
     if lost && let Some(screens) = &app.screens {
         screens.rotate_all().await;
     }
+    if lost {
+        crate::machines::screens::rotate_all(&app).await;
+    }
     Ok(Json(user_view(&after)))
 }
 
@@ -673,6 +676,7 @@ pub async fn revoke_user_sessions(State(app): State<AppState>, Extension(a): Ext
     if let Some(screens) = &app.screens {
         screens.rotate_all().await;
     }
+    crate::machines::screens::rotate_all(&app).await;
     app.db.record(&by.event("session.revoked_all").target("user", &u.id).details(json!({ "count": n })));
     Ok(Json(json!({ "revoked": n })))
 }

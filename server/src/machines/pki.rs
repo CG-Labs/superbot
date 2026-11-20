@@ -440,6 +440,18 @@ pub async fn serve(
     router: axum::Router,
     admit: fn(&Peer) -> Option<Duration>,
 ) {
+    serve_with(listener, tls, router, admit, false).await
+}
+
+/// `serve`, letting a handler take over its connection with an HTTP upgrade. The
+/// connection stops counting toward the limit, and its lifetime, once it's upgraded.
+pub async fn serve_with(
+    listener: tokio::net::TcpListener,
+    tls: Tls,
+    router: axum::Router,
+    admit: fn(&Peer) -> Option<Duration>,
+    upgrades: bool,
+) {
     let open = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (tcp, addr) = match listener.accept().await {
@@ -478,14 +490,18 @@ pub async fn serve(
                     r
                 },
             );
-            let conn = hyper::server::conn::http1::Builder::new()
-                .timer(hyper_util::rt::TokioTimer::new())
-                .header_read_timeout(Duration::from_secs(10))
-                .serve_connection(
-                    hyper_util::rt::TokioIo::new(stream),
-                    hyper_util::service::TowerToHyperService::new(svc),
-                );
-            let _ = tokio::time::timeout(lifetime, conn).await;
+            let mut http = hyper::server::conn::http1::Builder::new();
+            http.timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(Duration::from_secs(10));
+            let conn = http.serve_connection(
+                hyper_util::rt::TokioIo::new(stream),
+                hyper_util::service::TowerToHyperService::new(svc),
+            );
+            if upgrades {
+                let _ = tokio::time::timeout(lifetime, conn.with_upgrades()).await;
+            } else {
+                let _ = tokio::time::timeout(lifetime, conn).await;
+            }
         });
     }
 }
