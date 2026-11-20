@@ -258,6 +258,9 @@ install_packages() {
     debian-keyring debian-archive-keyring apt-transport-https rsync gnupg openssl
   # Optional: encrypts backups when SUPERBOT_BACKUP_AGE_RECIPIENTS is set (Ubuntu universe).
   run apt-get install -y -qq age || warn "Could not install age: encrypted backups are unavailable"
+  # Harness sandboxes (ADR 0055): Codex and Claude Code build theirs with bubblewrap;
+  # Claude Code also needs socat.
+  run apt-get install -y -qq bubblewrap socat || warn "Could not install bubblewrap and socat: harness sandboxes are unavailable"
 }
 
 install_node() {

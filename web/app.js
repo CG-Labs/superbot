@@ -457,6 +457,7 @@ for (const id of ["au-action", "au-person"]) {
 // Settings
 
 let policyMode = "ask";
+let policySandbox = true;
 
 async function loadSettings() {
   await queuePolicy(loadPolicy);
@@ -546,6 +547,8 @@ let shownTimeout = null;
 function showPolicy(policy, { timeout = false } = {}) {
   policyMode = policy.mode;
   $("policy-mode").value = policyMode;
+  policySandbox = policy.sandbox !== false;
+  $("policy-sandbox").value = policySandbox ? "on" : "off";
   const box = $("policy-timeout");
   if (timeout || box.value === "" || box.value === String(shownTimeout)) box.value = policy.timeoutMinutes;
   shownTimeout = policy.timeoutMinutes;
@@ -565,6 +568,9 @@ async function loadPolicy() {
       <td><select data-class="${esc(c.id)}" aria-label="${esc(c.label)}">${Object.entries(ACTIONS).map(([a, l]) => `<option value="${a}">${l}</option>`).join("")}</select></td>
     </tr>`).join("");
   showPolicy(v.policy);
+  const sb = v.sandbox;
+  $("policy-sandbox-hint").textContent = "Codex and Claude Code run commands in their own sandbox: they write only in the workspace, temp folders, the Bot's memory, and package caches. It holds in Bypass too."
+    + (sb && !sb.available ? " Sandboxes can't start on this server, so runs here go without: install bubblewrap and socat." : "");
   const rules = v.rules || [];
   $("rules-empty").textContent = "No rules for all Bots.";
   $("rules-empty").hidden = rules.length > 0;
@@ -647,6 +653,15 @@ $("policy-mode").addEventListener("change", async (e) => {
       e.target.value = policyMode;
     }
   });
+});
+
+$("policy-sandbox").addEventListener("change", (e) => {
+  const on = e.target.value === "on";
+  if (!on && !confirm("Turn the harness sandbox off for every Bot? Their commands could write anywhere the harness can.")) {
+    e.target.value = policySandbox ? "on" : "off";
+    return;
+  }
+  patchPolicy({ sandbox: on }, `Sandbox ${on ? "on" : "off"} for all Bots.`);
 });
 
 async function loadSignIn() {
