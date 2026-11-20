@@ -1044,7 +1044,9 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 17] = [
 ];
 /// Users linked to their payment-provider customer (ADR 0042), at most one each way;
 /// customers the provider deleted, which are never linked again; and each user's open
-/// checkout, closed before another is opened so only one can be paid.
+/// checkout, closed before another is opened so only one can be paid. Subscribers from
+/// before keep their portal: a user whose subscriptions name one customer, which no other
+/// user's do, is linked to it.
 fn migrate_billing_customers(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
     c.execute_batch(
         "CREATE TABLE IF NOT EXISTS billing_customers (
@@ -1063,7 +1065,19 @@ fn migrate_billing_customers(c: &Connection, _fresh: bool) -> rusqlite::Result<(
           session_id TEXT NOT NULL,
           expires_at INTEGER NOT NULL
         );",
-    )
+    )?;
+    c.execute(
+        "INSERT OR IGNORE INTO billing_customers (user_id, provider, customer_id, linked_at, linked_via)
+         SELECT user_id, MIN(provider), MIN(customer_id), ?, 'migration' FROM subscriptions
+         WHERE customer_id IS NOT NULL AND customer_id != ''
+         GROUP BY user_id
+         HAVING COUNT(DISTINCT customer_id) = 1
+           AND MIN(customer_id) NOT IN (
+             SELECT customer_id FROM subscriptions WHERE customer_id IS NOT NULL
+             GROUP BY customer_id HAVING COUNT(DISTINCT user_id) > 1)",
+        [now()],
+    )?;
+    Ok(())
 }
 /// Harness CLIs and agent upgrades on machines (ADR 0039): what each agent last said,
 /// the plan sent to it, and an upgrade on its way, held, or failed.
@@ -3640,6 +3654,30 @@ mod tests {
                 assert_eq!(db.user(&u.id).unwrap().tier.as_deref(), want, "events {picked:?} in order {order:?}");
             }
         }
+    }
+
+    #[test]
+    fn subscribers_from_before_customers_were_linked_keep_their_portal() {
+        let db = Db::open(&temp_path("billing-backfill").join("app.sqlite")).unwrap();
+        let ids: Vec<String> = (0..4).map(|_| db.create_user(None, None, "Payer", Role::Member).unwrap().id).collect();
+        // One customer; two of their own; one shared with another user (ADR 0040 kept the
+        // other user's subscription out, but its id may still be on record).
+        let rows = [(&ids[0], "sub_a", "cus_a"), (&ids[0], "sub_a2", "cus_a"), (&ids[1], "sub_b", "cus_b"), (&ids[1], "sub_b2", "cus_b2"), (&ids[2], "sub_c", "cus_shared"), (&ids[3], "sub_d", "cus_shared")];
+        {
+            let c = db.c();
+            c.execute("DELETE FROM billing_customers", []).unwrap();
+            for (u, sub, cus) in rows {
+                c.execute(
+                    "INSERT INTO subscriptions (subscription_id, user_id, provider, customer_id, status, started, event_created, updated_at) VALUES (?, ?, 'stripe', ?, 'active', 1, 1, 1)",
+                    params![sub, u, cus],
+                )
+                .unwrap();
+            }
+            migrate_billing_customers(&c, false).unwrap();
+            migrate_billing_customers(&c, false).unwrap();
+        }
+        let linked: Vec<Option<String>> = ids.iter().map(|u| db.customer_of(u)).collect();
+        assert_eq!(linked, [Some("cus_a".to_string()), None, None, None]);
     }
 
     #[test]
