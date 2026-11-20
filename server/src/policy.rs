@@ -3,12 +3,15 @@
 //! hook to `botctl hook`, and the call lands here as a tool name plus its input.
 //!
 //! The classifier is a guardrail against mistakes and prompt injection, not a
-//! sandbox: it parses commands (`crate::shell`) but cannot see what a script does inside.
+//! sandbox: it parses commands (`crate::shell`) and reads the scripts they run from
+//! the workspace (`crate::scripts`, ADR 0053), but not what compiled programs do inside.
+
+mod code;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use crate::shell::{self, Word};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,6 +366,9 @@ impl Verdict {
 pub struct Ctx {
     pub workspace: PathBuf,
     pub home: PathBuf,
+    /// The workspace is on this server, so scripts the Bot runs can be read. False for
+    /// a run on its owner's machine (ADR 0036): those scripts ask.
+    pub readable: bool,
 }
 
 /// Deny rules first, then risky classes: a remembered allow rule skips the ask,
@@ -424,7 +430,7 @@ impl RunScope {
     /// program (which may finish a command typed earlier).
     pub fn of(call: &Call, p: &Policy, found: &[(&'static str, String)]) -> Option<RunScope> {
         let asks: BTreeSet<(&'static str, String)> = found.iter().filter(|(c, _)| p.action(c) == Action::Ask).cloned().collect();
-        let one_at_a_time = asks.iter().any(|(c, why)| ONE_AT_A_TIME.contains(c) || why == DOWNLOADED_SCRIPT);
+        let one_at_a_time = asks.iter().any(|(c, why)| ONE_AT_A_TIME.contains(c) || why.starts_with(DOWNLOADED_SCRIPT));
         if asks.is_empty() || one_at_a_time || typed_input(call).is_some() {
             return None;
         }
@@ -453,7 +459,7 @@ pub fn classify(call: &Call, ctx: &Ctx) -> Vec<(&'static str, String)> {
                 if let Some(dir) = dir {
                     cwds.add(ctx, &[Some(dir)], false);
                 }
-                classify_shell(&cmd, &cwds, ctx, 0, &mut { shell::MAX_TOTAL }, &mut out)
+                classify_shell(&cmd, &cwds, ctx, 0, &mut Walk::new(), false, &mut out)
             }
             Err(why) => out.push((UNREADABLE, format!("Can't check this shell call: {why}"))),
         },
@@ -474,7 +480,7 @@ pub fn classify(call: &Call, ctx: &Ctx) -> Vec<(&'static str, String)> {
                     // The program may be a shell started earlier, in any folder.
                     let cwds = Cwds { dirs: vec![call.cwd.clone()], unknown: true };
                     let mut found = Vec::new();
-                    classify_shell(text, &cwds, ctx, 0, &mut { shell::MAX_TOTAL }, &mut found);
+                    classify_shell(text, &cwds, ctx, 0, &mut Walk::new(), true, &mut found);
                     out.extend(found.into_iter().map(|(c, why)| match c {
                         UNREADABLE => ("shell_destructive", UNREAD_INPUT.to_string()),
                         c => (c, format!("Types into a running program: {why}")),
@@ -532,8 +538,6 @@ const MESSAGING_HOSTS: [&str; 22] = [
 pub const UNREADABLE: &str = "shell_unreadable";
 
 const DOWNLOADED_SCRIPT: &str = "Runs a downloaded script";
-
-const SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ksh", "fish"];
 
 /// Every folder a shell command might be working in. A `cd` can fail, run in a
 /// subshell or pipeline, or sit in a loop, so each `cd` target adds a folder and
@@ -613,10 +617,33 @@ fn repeats(cmd: &str) -> bool {
 /// A parsed command line. Each `eval` with known words is parsed once too: it runs
 /// in this shell, so its `cd`s move the commands after it.
 struct Script {
+    src: String,
     cmds: Vec<shell::Command>,
     /// Per command: its eval'd code, when it is an `eval` of known words.
     evals: Vec<Option<Result<Script, shell::Error>>>,
     repeats: bool,
+}
+
+/// What checking one call has used up, across every nested script and file.
+struct Walk {
+    /// What's left of shell::MAX_TOTAL.
+    budget: usize,
+    /// Script files being read, outermost first, so a script running itself stops (ADR 0053).
+    files: Vec<PathBuf>,
+    /// Script files read so far, counting the same file read again.
+    reads: usize,
+    /// Names of the script files read so far.
+    ran: HashSet<String>,
+    /// Names of files something in the call may change, and whether it writes to a path
+    /// only known when it runs. Sets, since one command line can name 100,000 files.
+    changed: HashSet<String>,
+    wild_writes: bool,
+}
+
+impl Walk {
+    fn new() -> Walk {
+        Walk { budget: shell::MAX_TOTAL, files: Vec::new(), reads: 0, ran: HashSet::new(), changed: HashSet::new(), wild_writes: false }
+    }
 }
 
 /// `budget` is what's left of shell::MAX_TOTAL for this call.
@@ -626,29 +653,32 @@ fn script(src: &str, depth: usize, budget: &mut usize) -> Result<Script, shell::
     let evals = cmds
         .iter()
         .map(|c| {
-            let words = strip_wrappers(&c.argv, &mut Vec::new());
+            let words = strip_wrappers(&c.argv, &mut Vec::new()).0;
             let eval = words.first().is_some_and(|w| !w.dynamic && program(&w.text) == "eval") && !words[1..].iter().any(|w| w.dynamic);
             eval.then(|| script(&words[1..].iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "), depth + 1, budget))
         })
         .collect();
-    Ok(Script { cmds, evals, repeats: repeats(src) })
+    Ok(Script { src: src.to_string(), cmds, evals, repeats: repeats(src) })
 }
 
 /// Where each `cd`, `pushd`, or `popd` in `s` goes, in order, including those in
-/// `eval`. None when that can't be known: `source` may change folder too.
-fn cd_targets(s: &Script, out: &mut Vec<Option<String>>) {
+/// `eval`. None when that can't be known: `source` may change folder too, unless
+/// `sources` is false (for commands that run before any `source`).
+fn cd_targets(s: &Script, sources: bool, out: &mut Vec<Option<String>>) {
     for (c, eval) in s.cmds.iter().zip(&s.evals) {
         match eval {
-            Some(Ok(inner)) => cd_targets(inner, out),
+            Some(Ok(inner)) => cd_targets(inner, sources, out),
             Some(Err(_)) => out.push(None),
             None => {}
         }
-        let words = strip_wrappers(&c.argv, &mut Vec::new());
+        let words = strip_wrappers(&c.argv, &mut Vec::new()).0;
         let Some(prog) = words.first().filter(|w| !w.dynamic).map(|w| program(&w.text)) else { continue };
         match prog.as_str() {
             "cd" | "pushd" | "popd" => {}
             "source" | "." => {
-                out.push(None);
+                if sources {
+                    out.push(None);
+                }
                 continue;
             }
             _ => continue,
@@ -664,17 +694,23 @@ fn cd_targets(s: &Script, out: &mut Vec<Option<String>>) {
     }
 }
 
-fn classify_shell(cmd: &str, cwds: &Cwds, ctx: &Ctx, depth: usize, budget: &mut usize, out: &mut Vec<(&'static str, String)>) {
-    match script(cmd, depth, budget) {
+/// Classifies a command line. `input` is whether its standard input may carry code
+/// from outside it (a pipe or redirection into the script or `-c` string it came from).
+fn classify_shell(cmd: &str, cwds: &Cwds, ctx: &Ctx, depth: usize, w: &mut Walk, input: bool, out: &mut Vec<(&'static str, String)>) {
+    match script(cmd, depth, &mut w.budget) {
         Ok(s) => {
-            let mut cwds = cwds.clone();
-            let mut targets = Vec::new();
-            cd_targets(&s, &mut targets);
-            if cmd.contains("CDPATH") {
-                targets.push(None);
-            }
-            cwds.add(ctx, &targets, s.repeats);
-            classify_script(&s, &cwds, ctx, depth, budget, out)
+            let folders = |sources: bool| {
+                let mut c = cwds.clone();
+                let mut targets = Vec::new();
+                cd_targets(&s, sources, &mut targets);
+                if cmd.contains("CDPATH") {
+                    targets.push(None);
+                }
+                c.add(ctx, &targets, s.repeats);
+                c
+            };
+            let (all, unsourced) = (folders(true), folders(false));
+            code::Level { s: &s, cwds: &all, unsourced: &unsourced, ctx, depth, input }.classify(w, out)
         }
         Err(e) => unreadable(&e, out),
     }
@@ -684,114 +720,79 @@ fn unreadable(e: &shell::Error, out: &mut Vec<(&'static str, String)>) {
     out.push((UNREADABLE, format!("Can't check this command safely: {e}")))
 }
 
-/// Classifies every command in `s`. `cwds` already holds every folder it may visit.
-fn classify_script(s: &Script, cwds: &Cwds, ctx: &Ctx, depth: usize, budget: &mut usize, out: &mut Vec<(&'static str, String)>) {
-    let cmds = &s.cmds;
-    for (c, eval) in cmds.iter().zip(&s.evals) {
-        let words = strip_wrappers(&c.argv, out);
-        let Some(first) = words.first() else { continue };
-        if first.dynamic {
-            out.push(("shell_destructive", format!("Runs a command only known when it runs ({})", first.text)));
-            continue;
-        }
-        let prog = program(&first.text);
-        let args: Vec<&str> = words[1..].iter().map(|w| w.text.as_str()).collect();
-        let piped_download = c.pipe_from.and_then(|j| cmds[j].argv.first()).is_some_and(|w| ["curl", "wget"].contains(&program(&w.text).as_str()));
-
-        if prog == "eval" {
-            match eval {
-                Some(Ok(inner)) => classify_script(inner, cwds, ctx, depth + 1, budget, out),
-                Some(Err(e)) => unreadable(e, out),
-                None => out.push(("shell_destructive", "Runs code only known when it runs (eval)".into())),
+/// The risky classes of one program run with these arguments, by what it is known to do.
+fn classify_program(prog: &str, args: &[&str], cwds: &Cwds, ctx: &Ctx, out: &mut Vec<(&'static str, String)>) {
+    let args = args.to_vec();
+    let mut found = Vec::new();
+    let mut push = |class: &'static str, why: String| found.push((class, why));
+    match prog {
+        "rm" | "rmdir" | "unlink" | "shred" | "srm" | "trash" | "trash-put" | "gio" => {
+            let targets: Vec<&str> = if prog == "gio" {
+                if args.first() == Some(&"trash") || args.first() == Some(&"remove") { args[1..].to_vec() } else { vec![] }
+            } else {
+                args.clone()
+            };
+            for t in operands(&targets) {
+                deletion(ctx, cwds, t, &mut push);
             }
-            continue;
-        }
-        if SHELLS.contains(&prog.as_str()) || prog.starts_with("python") || prog == "perl" || prog == "node" || prog == "ruby" {
-            if piped_download && !args.iter().any(|a| a.starts_with("-c") || a.starts_with("-e")) {
-                out.push(("network_install", DOWNLOADED_SCRIPT.into()));
-            }
-            if SHELLS.contains(&prog.as_str()) {
-                // `bash -lc '<script>'`: classify the script too.
-                let flag = args.iter().position(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c'));
-                match flag.and_then(|i| words.get(i + 2)) {
-                    Some(script) if script.dynamic => out.push(("shell_destructive", format!("Runs a script only known when it runs ({prog} -c)"))),
-                    Some(script) => classify_shell(&script.text, cwds, ctx, depth + 1, budget, out),
-                    None => {}
-                }
-                continue;
+            if prog == "shred" {
+                push("shell_destructive", "Shreds files".into());
             }
         }
-        let mut found = Vec::new();
-        let mut push = |class: &'static str, why: String| found.push((class, why));
-        match prog.as_str() {
-            "rm" | "rmdir" | "unlink" | "shred" | "srm" | "trash" | "trash-put" | "gio" => {
-                let targets: Vec<&str> = if prog == "gio" {
-                    if args.first() == Some(&"trash") || args.first() == Some(&"remove") { args[1..].to_vec() } else { vec![] }
-                } else {
-                    args.clone()
-                };
-                for t in operands(&targets) {
-                    deletion(ctx, cwds, t, &mut push);
-                }
-                if prog == "shred" {
-                    push("shell_destructive", "Shreds files".into());
+        "find"
+            if args.contains(&"-delete")
+                || args.windows(2).any(|w| (w[0] == "-exec" || w[0] == "-execdir") && ["rm", "shred", "unlink"].contains(&program(w[1]).as_str())) =>
+        {
+            for t in args.iter().take_while(|a| !a.starts_with('-') && !a.starts_with('(') && !a.starts_with('!')) {
+                if !cwds.inside(ctx, t) {
+                    push("file_delete", format!("Deletes files under {t} outside the workspace"));
                 }
             }
-            "find"
-                if args.contains(&"-delete")
-                    || args.windows(2).any(|w| (w[0] == "-exec" || w[0] == "-execdir") && ["rm", "shred", "unlink"].contains(&program(w[1]).as_str())) =>
-            {
-                for t in args.iter().take_while(|a| !a.starts_with('-') && !a.starts_with('(') && !a.starts_with('!')) {
-                    if !cwds.inside(ctx, t) {
-                        push("file_delete", format!("Deletes files under {t} outside the workspace"));
-                    }
-                }
-            }
-            "dd" if args.iter().any(|a| a.starts_with("of=")) => push("shell_destructive", "Writes raw data with dd".into()),
-            p if p.starts_with("mkfs") || ["wipefs", "fdisk", "sfdisk", "parted", "shutdown", "reboot", "poweroff", "halt"].contains(&p) => {
-                push("shell_destructive", format!("Runs {p}"))
-            }
-            "systemctl" if args.iter().any(|a| ["stop", "disable", "mask", "kill", "poweroff", "reboot", "halt"].contains(a)) => {
-                push("shell_destructive", "Stops or disables a system service".into())
-            }
-            "crontab" if args.contains(&"-r") => push("shell_destructive", "Removes the crontab".into()),
-            "chmod" | "chown" | "chgrp" if args.iter().any(|a| *a == "-R" || *a == "--recursive" || (a.starts_with('-') && !a.starts_with("--") && a.contains('R'))) => {
-                for t in operands(&args).into_iter().skip(1) {
-                    if !cwds.inside(ctx, t) {
-                        push("shell_destructive", format!("Recursively changes permissions on {t}"));
-                    }
-                }
-            }
-            "psql" | "mysql" | "sqlite3" | "mariadb" if args.iter().any(|a| {
-                let u = a.to_ascii_uppercase();
-                u.contains("DROP ") || u.contains("TRUNCATE ")
-            }) => push("shell_destructive", "Drops or truncates database tables".into()),
-            "docker" | "podman" if (args.contains(&"prune")) || (args.contains(&"volume") && (args.contains(&"rm") || args.contains(&"prune"))) => {
-                push("shell_destructive", "Deletes containers or volumes".into())
-            }
-            "git" => git(&args, &mut push),
-            "gh" => gh(&args, &mut push),
-            "sendmail" | "mail" | "mailx" | "mutt" | "neomutt" | "msmtp" | "swaks" | "ssmtp" | "s-nail" => {
-                push("outbound_message", format!("Sends email with {prog}"))
-            }
-            "curl" | "wget" | "http" | "https" | "xh" | "httpie" => {
-                if let Some(host) = args.iter().find_map(|a| {
-                    let a = a.to_ascii_lowercase();
-                    MESSAGING_HOSTS.iter().find(|h| a.contains(*h))
-                }) {
-                    push("outbound_message", format!("Sends a message through {}", host.trim_end_matches("://")));
-                }
-            }
-            _ => {}
         }
-        if let Some(why) = install(&prog, &args) {
-            push("network_install", why);
+        "dd" if args.iter().any(|a| a.starts_with("of=")) => push("shell_destructive", "Writes raw data with dd".into()),
+        p if p.starts_with("mkfs") || ["wipefs", "fdisk", "sfdisk", "parted", "shutdown", "reboot", "poweroff", "halt"].contains(&p) => {
+            push("shell_destructive", format!("Runs {p}"))
         }
-        if let Some(why) = publish(&prog, &args) {
-            push("outbound_message", why);
+        "systemctl" if args.iter().any(|a| ["stop", "disable", "mask", "kill", "poweroff", "reboot", "halt"].contains(a)) => {
+            push("shell_destructive", "Stops or disables a system service".into())
         }
-        out.append(&mut found);
+        "crontab" if args.contains(&"-r") => push("shell_destructive", "Removes the crontab".into()),
+        "chmod" | "chown" | "chgrp" if args.iter().any(|a| *a == "-R" || *a == "--recursive" || (a.starts_with('-') && !a.starts_with("--") && a.contains('R'))) => {
+            for t in operands(&args).into_iter().skip(1) {
+                if !cwds.inside(ctx, t) {
+                    push("shell_destructive", format!("Recursively changes permissions on {t}"));
+                }
+            }
+        }
+        "psql" | "mysql" | "sqlite3" | "mariadb" if args.iter().any(|a| {
+            let u = a.to_ascii_uppercase();
+            u.contains("DROP ") || u.contains("TRUNCATE ")
+        }) => push("shell_destructive", "Drops or truncates database tables".into()),
+        "docker" | "podman" if (args.contains(&"prune")) || (args.contains(&"volume") && (args.contains(&"rm") || args.contains(&"prune"))) => {
+            push("shell_destructive", "Deletes containers or volumes".into())
+        }
+        "git" => git(&args, &mut push),
+        "gh" => gh(&args, &mut push),
+        "sendmail" | "mail" | "mailx" | "mutt" | "neomutt" | "msmtp" | "swaks" | "ssmtp" | "s-nail" => {
+            push("outbound_message", format!("Sends email with {prog}"))
+        }
+        "curl" | "wget" | "http" | "https" | "xh" | "httpie" => {
+            if let Some(host) = args.iter().find_map(|a| {
+                let a = a.to_ascii_lowercase();
+                MESSAGING_HOSTS.iter().find(|h| a.contains(*h))
+            }) {
+                push("outbound_message", format!("Sends a message through {}", host.trim_end_matches("://")));
+            }
+        }
+        _ => {}
     }
+    if let Some(why) = install(prog, &args) {
+        push("network_install", why);
+    }
+    if let Some(why) = publish(prog, &args) {
+        push("outbound_message", why);
+    }
+    out.append(&mut found);
 }
 
 fn deletion(ctx: &Ctx, cwds: &Cwds, target: &str, push: &mut impl FnMut(&'static str, String)) {
@@ -937,13 +938,16 @@ fn publish(prog: &str, args: &[&str]) -> Option<String> {
 }
 
 /// Drops `sudo`, `env`, `nohup`, `timeout`, ... and env assignments. `sudo` is itself destructive.
-fn strip_wrappers(argv: &[Word], out: &mut Vec<(&'static str, String)>) -> Vec<Word> {
+/// Also whether `xargs` was one of them: it adds arguments only known when it runs.
+/// `env -S` is kept: its string is a command line of its own.
+fn strip_wrappers(argv: &[Word], out: &mut Vec<(&'static str, String)>) -> (Vec<Word>, bool) {
     let mut i = 0;
+    let mut xargs = false;
     loop {
         while argv.get(i).is_some_and(|a| is_assignment(&a.text)) {
             i += 1;
         }
-        let Some(p) = argv.get(i).filter(|a| !a.dynamic).map(|a| program(&a.text)) else { return argv.get(i..).unwrap_or_default().to_vec() };
+        let Some(p) = argv.get(i).filter(|a| !a.dynamic).map(|a| program(&a.text)) else { return (argv.get(i..).unwrap_or_default().to_vec(), xargs) };
         let skip_flags_with_values: &[&str] = match p.as_str() {
             "sudo" | "doas" => {
                 out.push(("shell_destructive", "Runs as root".into()));
@@ -951,13 +955,21 @@ fn strip_wrappers(argv: &[Word], out: &mut Vec<(&'static str, String)>) -> Vec<W
             }
             "su" => {
                 out.push(("shell_destructive", "Runs as another user".into()));
-                return vec![];
+                return (vec![], xargs);
             }
-            "env" => &["-u", "-C", "-S"],
+            "env" if argv[i + 1..].iter().take_while(|a| a.text.starts_with('-') || is_assignment(&a.text)).any(|a| a.text.starts_with("-S") || a.text.starts_with("--split-string")) => {
+                return (argv[i..].to_vec(), xargs);
+            }
+            "env" => &["-u", "-C"],
             "nice" => &["-n"],
             "timeout" => &["-s", "-k"],
-            "nohup" | "time" | "command" | "exec" | "builtin" | "stdbuf" | "setsid" | "xargs" | "ionice" => &["-n", "-c", "-I", "-L", "-P", "-d"],
-            _ => return argv[i..].to_vec(),
+            "busybox" | "toybox" => &[],
+            "xargs" => {
+                xargs = true;
+                &["-n", "-I", "-L", "-P", "-d", "-E", "-s", "-a"]
+            }
+            "nohup" | "time" | "command" | "exec" | "builtin" | "stdbuf" | "setsid" | "ionice" => &["-n", "-c", "-I", "-L", "-P", "-d"],
+            _ => return (argv[i..].to_vec(), xargs),
         };
         i += 1;
         while let Some(a) = argv.get(i).map(|a| a.text.as_str()) {
@@ -1073,7 +1085,7 @@ mod tests {
     use serde_json::json;
 
     fn ctx() -> Ctx {
-        Ctx { workspace: "/srv/ws".into(), home: "/home/bot".into() }
+        Ctx { workspace: "/srv/ws".into(), home: "/home/bot".into(), readable: true }
     }
 
     fn shell(cmd: &str) -> Call {
@@ -1106,7 +1118,7 @@ mod tests {
             "botctl ask \"Writer\" \"draft it\"",
             "git push-notes",
             "npm run build",
-            "python3 script.py",
+            "python3 -c 'print(1)'",
             "chmod -R 755 ./dist",
         ] {
             assert!(cls(cmd).is_empty(), "{cmd} -> {:?}", cls(cmd));

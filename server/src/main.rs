@@ -18,6 +18,8 @@ mod audit_http_tests;
 mod auth_review_http_tests;
 #[cfg(test)]
 mod interface_http_tests;
+#[cfg(test)]
+mod command_analysis_http_tests;
 mod cron;
 mod handover;
 #[cfg(test)]
@@ -69,6 +71,7 @@ mod setup;
 mod setup_http_tests;
 #[cfg(test)]
 mod shared_bots_http_tests;
+mod scripts;
 mod shell;
 mod signups;
 #[cfg(test)]

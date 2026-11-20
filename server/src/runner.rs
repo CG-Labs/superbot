@@ -986,7 +986,7 @@ impl App {
                     botctl,
                     env,
                     screens: false,
-                    ctx: Some(Ctx { workspace: PathBuf::from(&layout.workspace), home: PathBuf::from(&layout.home) }),
+                    ctx: Some(Ctx { workspace: PathBuf::from(&layout.workspace), home: PathBuf::from(&layout.home), readable: false }),
                     for_other: None,
                     teammate_user,
                 }
