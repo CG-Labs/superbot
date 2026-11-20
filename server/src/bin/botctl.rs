@@ -87,6 +87,7 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
 
   botctl policy [<bot>]                            Show the global or a Bot's policy
   botctl policy set <global|bot> [mode=ask|bypass] [timeout=<minutes>] [<class>=allow|ask|deny]...
+                                                   On a Bot, =inherit follows the global value again
   botctl policy reset <bot>                        Drop a Bot's override; it follows global again
   botctl rules [<bot>]                             List allow/deny rules
   botctl rule add <allow|deny> "<pattern>" [--tool <tool>] [--bot <bot>]
@@ -396,10 +397,13 @@ fn policy_patch(args: &[&str]) -> Result<Value, String> {
     let mut classes = Map::new();
     for a in args {
         let (k, v) = a.split_once('=').ok_or(format!("Expected key=value, got \"{a}\""))?;
+        // `inherit` puts a Bot's field back to following the global policy.
+        let inherit = v == "inherit";
         match k {
-            "mode" => _ = patch.insert("mode".into(), json!(v)),
+            "mode" => _ = patch.insert("mode".into(), if inherit { Value::Null } else { json!(v) }),
+            "timeout" if inherit => _ = patch.insert("timeoutMinutes".into(), Value::Null),
             "timeout" => _ = patch.insert("timeoutMinutes".into(), json!(v.parse::<u64>().map_err(|_| "timeout must be minutes")?)),
-            class => _ = classes.insert(class.into(), json!(v)),
+            class => _ = classes.insert(class.into(), if inherit { Value::Null } else { json!(v) }),
         }
     }
     if !classes.is_empty() {
@@ -1099,6 +1103,8 @@ mod tests {
         assert_eq!(p, json!({ "mode": "ask", "timeoutMinutes": 15, "classes": { "git_push": "deny" } }));
         assert!(policy_patch(&[]).is_err());
         assert!(policy_patch(&["timeout=soon"]).is_err());
+        let p = policy_patch(&["mode=inherit", "timeout=inherit", "git_push=inherit"]).unwrap();
+        assert_eq!(p, json!({ "mode": null, "timeoutMinutes": null, "classes": { "git_push": null } }));
     }
 
     #[test]
