@@ -256,6 +256,8 @@ fn wire_req(owner: &str, token: &str) -> crate::machines::wire::ScreenRequest {
         width: 800,
         height: 600,
         idle_secs: 600,
+        for_user: None,
+        xauth: false,
     }
 }
 
@@ -401,9 +403,9 @@ async fn a_viewer_who_lost_access_while_waiting_gets_no_link() {
     let b = env.app.db.bot(&bot).unwrap();
     let by = crate::audit::Who::system("test");
     let gone = || Err(ApiError(StatusCode::NOT_FOUND, "Bot not found".into()));
-    let r = crate::machines::screens::open(&env.app, &by, &b, gone).await;
+    let r = crate::machines::screens::open(&env.app, &by, &b, None, gone).await;
     assert_eq!(r.err().map(|e| e.0), Some(StatusCode::NOT_FOUND));
     assert!(events(&env, "machine.screen_opened").await.is_empty(), "no link handed out");
-    let r = crate::machines::screens::open(&env.app, &by, &b, || Ok(())).await.unwrap();
+    let r = crate::machines::screens::open(&env.app, &by, &b, None, || Ok(())).await.unwrap();
     assert!(r.unwrap().starts_with("/screen/"));
 }

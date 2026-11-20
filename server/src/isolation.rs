@@ -47,17 +47,50 @@ pub fn bot_token(key: &str, bot_id: &str, owner_id: &str) -> String {
     format!("{BOT_TOKEN_PREFIX}{bot_id}.{owner_id}.{}", hex(tag.as_ref()))
 }
 
-/// The Bot a token was issued to and its owner then, if botd issued it with this key.
-/// Constant time in the MAC. The caller checks the Bot still exists and has that owner.
-pub fn token_bot<'a>(key: &str, token: &'a str) -> Option<(&'a str, &'a str)> {
-    let mut parts = token.strip_prefix(BOT_TOKEN_PREFIX)?.split('.');
-    let (id, owner, tag) = (parts.next()?, parts.next()?, parts.next()?);
-    if parts.next().is_some() || key.is_empty() || !plain_id(id) || !plain_id(owner) || tag.len() != 64 {
+fn signed_for(bot_id: &str, owner_id: &str, for_user: &str) -> String {
+    format!("superbot-bot-token/{bot_id}/{owner_id}/for/{for_user}")
+}
+
+/// The token a teammate's run of a shared Bot carries when it runs as the teammate's
+/// own OS user (ADR 0047): `sbb_<bot id>.<owner id>.<teammate id>.<HMAC-SHA256>`. It
+/// works only while the Bot's latest run is that teammate's, so what their run keeps
+/// can't act with the owner's access once the owner runs the Bot again.
+pub fn bot_token_for(key: &str, bot_id: &str, owner_id: &str, for_user: &str) -> String {
+    let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key.as_bytes()), signed_for(bot_id, owner_id, for_user).as_bytes());
+    format!("{BOT_TOKEN_PREFIX}{bot_id}.{owner_id}.{for_user}.{}", hex(tag.as_ref()))
+}
+
+/// The Bot a token was issued to, its owner then, and the teammate it's bound to if
+/// any, if botd issued it with this key. Constant time in the MAC.
+fn parse_token<'a>(key: &str, token: &'a str) -> Option<(&'a str, &'a str, Option<&'a str>)> {
+    let parts: Vec<&str> = token.strip_prefix(BOT_TOKEN_PREFIX)?.split('.').collect();
+    let (id, owner, for_user, tag) = match parts[..] {
+        [id, owner, tag] => (id, owner, None, tag),
+        [id, owner, u, tag] if plain_id(u) => (id, owner, Some(u), tag),
+        _ => return None,
+    };
+    if key.is_empty() || !plain_id(id) || !plain_id(owner) || tag.len() != 64 {
         return None;
     }
     let tag = unhex(tag)?;
     let k = hmac::Key::new(hmac::HMAC_SHA256, key.as_bytes());
-    hmac::verify(&k, signed(id, owner).as_bytes(), &tag).ok().map(|_| (id, owner))
+    let msg = match for_user {
+        None => signed(id, owner),
+        Some(u) => signed_for(id, owner, u),
+    };
+    hmac::verify(&k, msg.as_bytes(), &tag).ok().map(|_| (id, owner, for_user))
+}
+
+/// The Bot a token was issued to and its owner then, if botd issued it with this key.
+/// Constant time in the MAC. The caller checks the Bot still exists and has that owner,
+/// and, for a token bound to a teammate (`token_for_user`), that its run is still theirs.
+pub fn token_bot<'a>(key: &str, token: &'a str) -> Option<(&'a str, &'a str)> {
+    parse_token(key, token).map(|(id, owner, _)| (id, owner))
+}
+
+/// The teammate a valid token is bound to (`bot_token_for`), if any.
+pub fn token_for_user<'a>(key: &str, token: &'a str) -> Option<&'a str> {
+    parse_token(key, token).and_then(|(_, _, u)| u)
 }
 
 /// `root/users/<user>`, created. None when the id isn't one plain folder name.
@@ -163,6 +196,14 @@ mod tests {
         let t = bot_token(&key, "b1", "u1");
         assert!(t.starts_with("sbb_b1.u1.") && t.len() == "sbb_b1.u1.".len() + 64, "{t}");
         assert_eq!(token_bot(&key, &t), Some(("b1", "u1")));
+        assert_eq!(token_for_user(&key, &t), None);
+        let bound = bot_token_for(&key, "b1", "u1", "u2");
+        assert_eq!((token_bot(&key, &bound), token_for_user(&key, &bound)), (Some(("b1", "u1")), Some("u2")));
+        assert_ne!(bound, t);
+        let unbound = format!("sbb_b1.u1.{}", bound.rsplit('.').next().unwrap());
+        assert_eq!(token_bot(&key, &unbound), None, "a teammate's binding can't be dropped");
+        let moved = bound.replacen(".u2.", ".u3.", 1);
+        assert_eq!(token_bot(&key, &moved), None, "nor moved to someone else");
         assert_eq!(bot_token(&key, "b1", "u1"), t, "the same for every run of a Bot until botd restarts");
         assert_ne!(bot_token(&key, "b1", "u2"), t, "or until it changes hands");
         assert_eq!(token_bot(&crate::random_hex(24), &t), None, "another start's key");

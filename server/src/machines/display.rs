@@ -51,8 +51,20 @@ impl Default for Settings {
     }
 }
 
+/// Whom a screen runs as, and the home its sockets and cookie live in.
+#[derive(Clone, Debug)]
+pub struct As {
+    pub ids: Ids,
+    pub home: PathBuf,
+    pub user: String,
+}
+
 struct Screen {
     slot: u32,
+    home: PathBuf,
+    user: String,
+    /// The display's cookie file, when it takes only clients that have it.
+    xauth: Option<PathBuf>,
     token: Zeroizing<String>,
     idle: Duration,
     used: Instant,
@@ -160,16 +172,26 @@ impl Screens {
         self.s.port_base + slot as u16
     }
 
-    fn bus_path(&self, slot: u32) -> PathBuf {
-        self.home.join(".screens").join(format!("bus-{}", self.display(slot)))
+    fn bus_path(&self, home: &Path, slot: u32) -> PathBuf {
+        home.join(".screens").join(format!("bus-{}", self.display(slot)))
     }
 
-    fn reply(&self, slot: u32, started: bool) -> wire::ScreenReply {
+    fn xauth_path(&self, home: &Path, slot: u32) -> PathBuf {
+        home.join(".screens").join(format!("xauth-{}", self.display(slot)))
+    }
+
+    fn reply(&self, s: &Screen, started: bool) -> wire::ScreenReply {
         wire::ScreenReply {
-            display: format!(":{}", self.display(slot)),
-            bus: format!("unix:path={}", self.bus_path(slot).display()),
+            display: format!(":{}", self.display(s.slot)),
+            bus: format!("unix:path={}", self.bus_path(&s.home, s.slot).display()),
             started,
+            xauthority: s.xauth.as_ref().map(|p| p.display().to_string()),
         }
+    }
+
+    /// The Bots' user, in the Bots' home: whom the machine's own user's screens run as.
+    fn bots(&self, ids: Ids) -> As {
+        As { ids, home: self.home.clone(), user: self.user.clone() }
     }
 
     /// Keeps `bot`'s screen up while the hold lives.
@@ -192,52 +214,66 @@ impl Screens {
         Ok((port, self.hold(bot), permit))
     }
 
-    /// Starts `bot`'s screen as `ids`, or, if it's up, keeps it and lets only `token`
-    /// view it from now on: only the viewer restarts, so what's on the screen stays.
+    /// Starts `bot`'s screen as the Bots' user (`ids`), or, if it's up, keeps it and lets
+    /// only `token` view it from now on.
     pub async fn ensure(&self, bot: &str, r: &wire::ScreenRequest, ids: Ids) -> Result<wire::ScreenReply, Failure> {
+        self.ensure_as(bot, r, &self.bots(ids)).await
+    }
+
+    /// Starts the screen named `key` as `who`, or, if it's up, keeps it and lets only
+    /// `token` view it from now on: only the viewer restarts, so what's on the screen
+    /// stays. One running as someone else, or without the cookie the request asks for,
+    /// is replaced.
+    pub async fn ensure_as(&self, key: &str, r: &wire::ScreenRequest, who: &As) -> Result<wire::ScreenReply, Failure> {
         let _one = self.changing.lock().await;
         let idle = Duration::from_secs(r.idle_secs.clamp(60, 86_400));
+        let xauth = r.xauth || r.for_user.is_some();
         let old_viewer = {
             let mut live = self.live();
-            let alive = live.get_mut(bot).map(|s| s.alive());
-            match live.get_mut(bot).filter(|_| alive == Some(true)) {
+            let fits = live.get_mut(key).map(|s| s.alive() && s.xauth.is_some() == xauth && s.user == who.user && s.home == who.home);
+            match live.get_mut(key).filter(|_| fits == Some(true)) {
                 Some(s) => {
                     s.used = Instant::now();
                     s.idle = idle;
                     if s.token.as_str() == r.token {
-                        return Ok(self.reply(s.slot, false));
+                        return Ok(self.reply(s, false));
                     }
-                    Some((s.slot, s.viewer.take()))
+                    Some((s.slot, s.viewer.take(), s.xauth.clone()))
                 }
                 None => {
-                    live.remove(bot);
+                    live.remove(key);
                     None
                 }
             }
         };
-        if let Some((slot, viewer)) = old_viewer {
+        if let Some((slot, viewer, cookie)) = old_viewer {
             if let Some(mut v) = viewer {
                 let _ = v.kill().await;
             }
             let voxl = self.find("voxl").ok_or_else(|| fail(422, "This machine has no voxl."))?;
-            return match self.start_viewer(&voxl, slot, &r.token, ids).await {
+            return match self.start_viewer(&voxl, slot, &r.token, who, cookie.as_deref()).await {
                 Ok(v) => {
-                    if let Some(s) = self.live().get_mut(bot) {
-                        s.viewer = Some(v);
-                        s.token = Zeroizing::new(r.token.clone());
+                    let mut live = self.live();
+                    match live.get_mut(key) {
+                        Some(s) => {
+                            s.viewer = Some(v);
+                            s.token = Zeroizing::new(r.token.clone());
+                            Ok(self.reply(s, false))
+                        }
+                        None => Err(fail(503, "The screen stopped meanwhile.")),
                     }
-                    Ok(self.reply(slot, false))
                 }
                 Err(e) => {
-                    self.live().remove(bot);
+                    self.live().remove(key);
                     Err(e)
                 }
             };
         }
         let slot = self.free_slot()?;
-        let s = self.start(slot, r, ids, idle).await?;
-        self.live().insert(bot.to_string(), s);
-        Ok(self.reply(slot, true))
+        let s = self.start(slot, r, who, idle, xauth).await?;
+        let reply = self.reply(&s, true);
+        self.live().insert(key.to_string(), s);
+        Ok(reply)
     }
 
     /// The lowest slot no screen holds whose viewer port nothing else listens on.
@@ -252,18 +288,18 @@ impl Screens {
             .ok_or_else(|| fail(503, "Every screen port on this machine is taken."))
     }
 
-    fn command(&self, program: &Path, ids: Ids, env: &[(&str, String)]) -> Command {
+    fn command(&self, program: &Path, who: &As, env: &[(&str, String)]) -> Command {
         let mut c = Command::new(program);
         c.env_clear()
-            .env("HOME", &self.home)
+            .env("HOME", &who.home)
             .env("PATH", &self.s.path)
-            .env("USER", &self.user)
-            .env("LOGNAME", &self.user)
+            .env("USER", &who.user)
+            .env("LOGNAME", &who.user)
             .env("LANG", "C.UTF-8")
             .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
-            .current_dir(&self.home)
-            .uid(ids.uid)
-            .gid(ids.gid)
+            .current_dir(&who.home)
+            .uid(who.ids.uid)
+            .gid(who.ids.gid)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -287,28 +323,46 @@ impl Screens {
         }
     }
 
-    async fn start(&self, slot: u32, r: &wire::ScreenRequest, ids: Ids, idle: Duration) -> Result<Screen, Failure> {
+    async fn start(&self, slot: u32, r: &wire::ScreenRequest, who: &As, idle: Duration, xauth: bool) -> Result<Screen, Failure> {
         let find = |p: &str| self.find(p).ok_or_else(|| fail(422, format!("This machine has no {p}.")));
         let (xvfb, openbox, dbus, voxl) = (find("Xvfb")?, find("openbox")?, find("dbus-daemon")?, find("voxl")?);
         let n = self.display(slot);
         let x11 = self.x11_dir()?;
         let socket = x11.join(format!("X{n}"));
-        let bus = self.bus_path(slot);
-        let run = self.home.join(".screens");
-        // A screen that died leaves its sockets and lock; they're the Bots' user's.
-        runas::as_user(Some(ids), || -> std::io::Result<()> {
+        let bus = self.bus_path(&who.home, slot);
+        let run = who.home.join(".screens");
+        let cookie = xauth.then(|| self.xauth_path(&who.home, slot));
+        let secret = match cookie {
+            Some(_) => Some(Zeroizing::new(random16().map_err(|e| fail(500, format!("No randomness for the screen's cookie: {e}")))?)),
+            None => None,
+        };
+        // A screen that died leaves its sockets and lock; they're its user's.
+        runas::as_user(Some(who.ids), || -> std::io::Result<()> {
             std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&run)?;
             for p in [&socket, &self.s.tmp.join(format!(".X{n}-lock")), &bus] {
                 let _ = std::fs::remove_file(p);
+            }
+            if let (Some(path), Some(secret)) = (&cookie, &secret) {
+                write_private(path, &xauth_entry(n, secret))?;
             }
             Ok(())
         })
         .and_then(|r| r)
         .map_err(|e| fail(500, format!("{}: {e}", run.display())))?;
+        let with_cookie = |mut env: Vec<(&'static str, String)>| {
+            if let Some(p) = &cookie {
+                env.push(("XAUTHORITY", p.display().to_string()));
+            }
+            env
+        };
 
         let size = format!("{}x{}x24", r.width, r.height);
         let spawn = |c: &mut Command, what: &str| c.spawn().map_err(|e| fail(500, format!("{what} didn't start: {e}")));
-        let mut x = spawn(self.command(&xvfb, ids, &[]).args([format!(":{n}"), "-screen".into(), "0".into(), size, "-nolisten".into(), "tcp".into()]), "Xvfb")?;
+        let mut xargs = vec![format!(":{n}"), "-screen".into(), "0".into(), size, "-nolisten".into(), "tcp".into()];
+        if let Some(p) = &cookie {
+            xargs.extend(["-auth".into(), p.display().to_string()]);
+        }
+        let mut x = spawn(self.command(&xvfb, who, &[]).args(xargs), "Xvfb")?;
         let mut ready = false;
         for _ in 0..100 {
             if std::fs::symlink_metadata(&socket).is_ok() {
@@ -326,13 +380,16 @@ impl Screens {
         let display = ("DISPLAY", format!(":{n}"));
         let address = ("DBUS_SESSION_BUS_ADDRESS", format!("unix:path={}", bus.display()));
         let bus_child = spawn(
-            self.command(&dbus, ids, &[]).args(["--session".to_string(), "--nofork".into(), format!("--address={}", address.1)]),
+            self.command(&dbus, who, &[]).args(["--session".to_string(), "--nofork".into(), format!("--address={}", address.1)]),
             "dbus-daemon",
         )?;
-        let wm = spawn(&mut self.command(&openbox, ids, &[display.clone(), address.clone()]), "openbox")?;
-        let viewer = self.start_viewer(&voxl, slot, &r.token, ids).await?;
+        let wm = spawn(&mut self.command(&openbox, who, &with_cookie(vec![display.clone(), address.clone()])), "openbox")?;
+        let viewer = self.start_viewer(&voxl, slot, &r.token, who, cookie.as_deref()).await?;
         Ok(Screen {
             slot,
+            home: who.home.clone(),
+            user: who.user.clone(),
+            xauth: cookie,
             token: Zeroizing::new(r.token.clone()),
             idle,
             used: Instant::now(),
@@ -345,9 +402,13 @@ impl Screens {
 
     /// voxl on loopback, for display `slot`, with `token` as its password; returns once
     /// it answers.
-    async fn start_viewer(&self, voxl: &Path, slot: u32, token: &str, ids: Ids) -> Result<Child, Failure> {
+    async fn start_viewer(&self, voxl: &Path, slot: u32, token: &str, who: &As, cookie: Option<&Path>) -> Result<Child, Failure> {
         let port = self.port(slot);
-        let mut cmd = self.command(voxl, ids, &[("DISPLAY", format!(":{}", self.display(slot))), ("VOXL_PASSWORD", token.to_string())]);
+        let mut env = vec![("DISPLAY", format!(":{}", self.display(slot))), ("VOXL_PASSWORD", token.to_string())];
+        if let Some(p) = cookie {
+            env.push(("XAUTHORITY", p.display().to_string()));
+        }
+        let mut cmd = self.command(voxl, who, &env);
         cmd.args(["--addr", "127.0.0.1", "--port", &port.to_string(), "--allowed-hosts", "*"])
             .args(["--audio-enabled", "false", "--file-transfers", "none", "--enable-clipboard", "true"]);
         let mut v = cmd.spawn().map_err(|e| fail(500, format!("voxl didn't start: {e}")))?;
@@ -402,6 +463,40 @@ impl Screens {
     }
 }
 
+/// 16 random bytes from the kernel.
+fn random16() -> std::io::Result<[u8; 16]> {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
+    Ok(b)
+}
+
+/// One Xauthority entry: an MIT-MAGIC-COOKIE-1 for display `n` on any host
+/// (FamilyWild), as X's own `xauth` writes it.
+pub fn xauth_entry(n: u32, cookie: &[u8; 16]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut field = |b: &[u8]| {
+        out.extend_from_slice(&(b.len() as u16).to_be_bytes());
+        out.extend_from_slice(b);
+    };
+    field(b"");
+    field(n.to_string().as_bytes());
+    field(b"MIT-MAGIC-COOKIE-1");
+    field(cookie);
+    let mut entry = 0xffffu16.to_be_bytes().to_vec();
+    entry.extend(out);
+    entry
+}
+
+/// Writes `body` to `path`, mode 0600, never through a link left there.
+fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let _ = std::fs::remove_file(path);
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(path)?;
+    f.write_all(body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,7 +521,7 @@ mod tests {
         for d in [&bin, &tmp, &home] {
             std::fs::create_dir_all(d).unwrap();
         }
-        script(&bin, "Xvfb", &format!("#!/bin/sh\nn=${{1#:}}\nmkdir -p {x}\n: > {x}/X$n\nexec sleep 60\n", x = tmp.join(".X11-unix").display()));
+        script(&bin, "Xvfb", &format!("#!/bin/sh\nn=${{1#:}}\necho \"$@\" > {t}/xvfb-$n.args\nmkdir -p {x}\n: > {x}/X$n\nexec sleep 60\n", t = tmp.display(), x = tmp.join(".X11-unix").display()));
         script(&bin, "dbus-daemon", "#!/bin/sh\nexec sleep 60\n");
         script(&bin, "openbox", "#!/bin/sh\nexec sleep 60\n");
         script(
@@ -442,7 +537,7 @@ mod tests {
     }
 
     fn req(token: &str) -> wire::ScreenRequest {
-        wire::ScreenRequest { protocol: wire::SCREEN_PROTOCOL, owner_id: "u1".into(), token: token.into(), width: 800, height: 600, idle_secs: 60 }
+        wire::ScreenRequest { protocol: wire::SCREEN_PROTOCOL, owner_id: "u1".into(), token: token.into(), width: 800, height: 600, idle_secs: 60, for_user: None, xauth: false }
     }
 
     #[tokio::test]
@@ -521,6 +616,53 @@ mod tests {
         screens.live().get_mut("b1").unwrap().used = Instant::now() - Duration::from_secs(120);
         screens.reap();
         assert!(screens.report().running.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_teammates_screen_has_its_own_home_and_a_display_only_its_cookie_opens() {
+        let (screens, root) = fakes();
+        let a = "a".repeat(32);
+        let owner = screens.ensure("b1", &req(&a), me()).await.unwrap();
+        assert_eq!(owner.xauthority, None, "as before unless asked");
+        let args = |n: u32| std::fs::read_to_string(root.join(format!("tmp/xvfb-{n}.args"))).unwrap();
+        assert!(!args(101).contains("-auth"), "{}", args(101));
+
+        let theirs = root.join("teammate");
+        std::fs::create_dir_all(&theirs).unwrap();
+        let bea = As { ids: me(), home: theirs.clone(), user: "superbot-t-bea".into() };
+        let mut r = req(&a);
+        r.for_user = Some("u-bea".into());
+        let t = screens.ensure_as("b1@u-bea", &r, &bea).await.unwrap();
+        assert!(t.started);
+        assert_eq!(t.display, ":102", "a screen of its own, not the owner's");
+        assert!(t.bus.contains(&theirs.display().to_string()), "{}", t.bus);
+        let cookie = PathBuf::from(t.xauthority.clone().expect("a teammate's screen always has a cookie"));
+        assert!(cookie.starts_with(&theirs));
+        assert_eq!(std::fs::metadata(&cookie).unwrap().permissions().mode() & 0o777, 0o600);
+        let entry = std::fs::read(&cookie).unwrap();
+        assert_eq!(&entry[..2], &[0xff, 0xff]);
+        assert_eq!(entry.len(), 2 + 2 + 2 + 3 + 2 + 18 + 2 + 16);
+        assert!(args(102).contains(&format!("-auth {}", cookie.display())), "{}", args(102));
+        let mut running = screens.report().running;
+        running.sort();
+        assert_eq!(running, ["b1", "b1@u-bea"]);
+
+        // Asking for a cookie on the owner's screen replaces it with one that has one.
+        let mut locked = req(&a);
+        locked.xauth = true;
+        let o = screens.ensure("b1", &locked, me()).await.unwrap();
+        assert!(o.started && o.xauthority.is_some(), "{o:?}");
+        assert!(screens.stop("b1").await && screens.stop("b1@u-bea").await);
+    }
+
+    #[test]
+    fn xauthority_entries_are_what_xauth_writes() {
+        let e = xauth_entry(101, &[7; 16]);
+        let mut want = vec![0xff, 0xff, 0, 0, 0, 3, b'1', b'0', b'1', 0, 18];
+        want.extend_from_slice(b"MIT-MAGIC-COOKIE-1");
+        want.extend_from_slice(&[0, 16]);
+        want.extend_from_slice(&[7; 16]);
+        assert_eq!(e, want);
     }
 
     #[test]

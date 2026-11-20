@@ -28,12 +28,15 @@
 //! - `SUPERBOT_BOT_USER`: the OS user Bots run as once botd asks (ADR 0043; default
 //!   `superbot-bots`). Never root, nor the agent's own user.
 //! - `SUPERBOT_MAX_SCREENS`: Bots' screens shown at once (ADR 0045; default 4).
+//! - `SUPERBOT_TEAMMATES`: where teammates' own homes are, for their runs of the
+//!   user's shared Bots (ADR 0047; default `<state dir>/teammates`).
 
 use super::display::{self, Screens};
 use super::job;
 use super::landing::Landing;
 use super::pki::{self, Peer};
 use super::runas::{self, Ids};
+use super::teammates::{Teammate, Teammates};
 use super::terminal::Logins;
 use super::tools::Tools;
 use super::upgrade::{self, Upgrader};
@@ -95,6 +98,10 @@ pub struct Config {
     pub allow_own_user: bool,
     /// Bots' screens (ADR 0045).
     pub screens: display::Settings,
+    /// Holds each teammate's own home (ADR 0047).
+    pub teammates: PathBuf,
+    /// Tests can't make users: every teammate runs as this existing one instead.
+    pub teammate_stand_in: Option<String>,
 }
 
 /// Where harnesses and botctl may live, besides the Bots' home: the system's program
@@ -198,6 +205,12 @@ impl Config {
             .transpose()?
             .unwrap_or(4)
             .clamp(1, 50);
+        let teammates = var("SUPERBOT_TEAMMATES")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| state_dir.join("teammates"));
+        if !teammates.is_absolute() || teammates.starts_with(&home) || home.starts_with(&teammates) {
+            return Err("SUPERBOT_TEAMMATES must be an absolute path apart from SUPERBOT_HOME".into());
+        }
         Ok(Config {
             control_url,
             machine_id,
@@ -219,6 +232,8 @@ impl Config {
                 max: max_screens,
                 ..display::Settings::default()
             },
+            teammates,
+            teammate_stand_in: None,
         })
     }
 
@@ -264,6 +279,18 @@ impl Config {
             env,
             user,
         }
+    }
+
+    /// The environment a teammate's jobs start from: their own home and user (ADR 0047).
+    fn teammate_host(&self, t: &Teammate) -> job::Host {
+        let env = BTreeMap::from([
+            ("HOME".to_string(), t.home.display().to_string()),
+            ("PATH".to_string(), self.harness_path.clone()),
+            ("LANG".to_string(), "C.UTF-8".to_string()),
+            ("USER".to_string(), t.user.clone()),
+            ("LOGNAME".to_string(), t.user.clone()),
+        ]);
+        job::Host { clear_env: true, remove: Vec::new(), env, user: Some(t.ids) }
     }
 
     /// Why `ids` can't be the Bots' user, if it can't.
@@ -597,6 +624,8 @@ pub struct Agent {
     bot: RwLock<Bot>,
     /// Bots' screens (ADR 0045).
     pub screens: Arc<Screens>,
+    /// Teammates' own users and homes (ADR 0047).
+    pub teammates: Arc<Teammates>,
 }
 
 /// Where the Bots' user stands. Once botd has asked, no job runs as root again.
@@ -716,6 +745,7 @@ impl Agent {
             landing.set_user(ids);
         }
         let screens = Arc::new(Screens::new(cfg.screens.clone(), cfg.home.clone(), cfg.bot_user.clone()));
+        let teammates = Arc::new(Teammates::new(cfg.teammates.clone(), cfg.state_dir.clone(), cfg.teammate_stand_in.clone()));
         let a = Arc::new(Agent {
             cfg,
             current: RwLock::new((Arc::new(id), server)),
@@ -727,6 +757,7 @@ impl Agent {
             restart: watch::channel(false).0,
             bot: RwLock::new(bot),
             screens,
+            teammates,
         });
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::spawn(a.tools.clone().work());
@@ -806,6 +837,49 @@ impl Agent {
                     s.error.as_deref().unwrap_or("no reason given")
                 ),
             )),
+        }
+    }
+
+    /// `user_id`'s own user and home here, made on their first run (ADR 0047). Only
+    /// once the Bots' user is ready: the owner's home must be that user's alone. Never
+    /// the machine's own user, root, the agent's user or the Bots' user.
+    #[allow(clippy::result_large_err)]
+    async fn teammate(self: &Arc<Self>, user_id: &str) -> Result<Teammate, Response> {
+        if !plain_name(user_id) {
+            return Err(refuse(StatusCode::BAD_REQUEST, "The teammate's id isn't a plain name."));
+        }
+        if user_id == self.identity().user_id {
+            return Err(refuse(StatusCode::BAD_REQUEST, "That is this machine's own user, not a teammate."));
+        }
+        let bots = match self.job_user()? {
+            Some(ids) => ids,
+            None => {
+                return Err(refuse(
+                    StatusCode::CONFLICT,
+                    "Teammates get their own users only once Bots run as their own user here, and this machine hasn't been asked to set one up.",
+                ));
+            }
+        };
+        let (a, id) = (self.clone(), user_id.to_string());
+        let made = tokio::task::spawn_blocking(move || {
+            let stand_in = a.cfg.teammate_stand_in.is_some();
+            a.teammates.ensure(&id, |ids| {
+                if ids.uid == 0 || ids.gid == 0 {
+                    return Err("a teammate's user can't be root or in root's group".into());
+                }
+                // SAFETY: no arguments.
+                let own = ids.uid == unsafe { libc::geteuid() };
+                if !stand_in && (own || ids.uid == bots.uid || ids.gid == bots.gid) {
+                    return Err("a teammate's user can't be the agent's or the Bots' user".into());
+                }
+                Ok(())
+            })
+        })
+        .await;
+        match made {
+            Ok(Ok(t)) => Ok(t),
+            Ok(Err(e)) => Err(refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't set up the teammate's user: {e}"))),
+            Err(e) => Err(refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
         }
     }
 
@@ -1014,7 +1088,7 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
             .map(|(b, _)| b)
             .collect(),
         jobs: a.running() as u32,
-        can: [wire::CAN_HARNESSES, wire::CAN_LOGINS, wire::CAN_SYNC, wire::CAN_BOT_USER, wire::CAN_SCREENS]
+        can: [wire::CAN_HARNESSES, wire::CAN_LOGINS, wire::CAN_SYNC, wire::CAN_BOT_USER, wire::CAN_SCREENS, wire::CAN_TEAMMATES]
             .into_iter()
             .chain(a.upgrader.build.is_some().then_some(wire::CAN_UPGRADE))
             .map(String::from)
@@ -1039,7 +1113,7 @@ fn inside(home: &Path, p: &str) -> bool {
 }
 
 /// Why this machine won't run the job, if it won't.
-fn check(cfg: &Config, user_id: &str, j: &wire::JobRequest) -> Result<(), (StatusCode, String)> {
+fn check(cfg: &Config, user_id: &str, j: &wire::JobRequest, home: &Path) -> Result<(), (StatusCode, String)> {
     let bad = |m: String| Err((StatusCode::BAD_REQUEST, m));
     if j.protocol != wire::PROTOCOL {
         return bad(format!(
@@ -1067,8 +1141,8 @@ fn check(cfg: &Config, user_id: &str, j: &wire::JobRequest) -> Result<(), (Statu
     if let Some(c) = &j.cleanup {
         paths.extend([c.when_exists.as_str(), c.cwd.as_str()]);
     }
-    if let Some(p) = paths.into_iter().find(|p| !inside(&cfg.home, p)) {
-        return bad(format!("{p} isn't inside {}.", cfg.home.display()));
+    if let Some(p) = paths.into_iter().find(|p| !inside(home, p)) {
+        return bad(format!("{p} isn't inside {}.", home.display()));
     }
     let Some(bin) = wire::harness_bin(&j.bin) else {
         return bad(format!("{} isn't a harness this machine runs.", j.bin));
@@ -1149,9 +1223,18 @@ impl Drop for StopOnDrop {
 /// `POST /v1/jobs`: runs the job and streams its events, one JSON object per line.
 /// A request it refuses gets an error status before anything runs.
 async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobRequest>) -> Response {
-    if let Err((code, msg)) = check(&a.cfg, &a.identity().user_id, &j) {
+    // A teammate's run (ADR 0047): their own user, and nothing outside their home.
+    let home = j.for_user.as_deref().map_or(a.cfg.home.clone(), |u| a.teammates.home_of(u));
+    if let Err((code, msg)) = check(&a.cfg, &a.identity().user_id, &j, &home) {
         return refuse(code, msg);
     }
+    let teammate = match j.for_user.clone() {
+        Some(u) => match a.teammate(&u).await {
+            Ok(t) => Some(t),
+            Err(r) => return r,
+        },
+        None => None,
+    };
     scrub(&mut j.env);
     if let Some(c) = j.cleanup.as_mut() {
         scrub(&mut c.env);
@@ -1189,10 +1272,15 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
     };
     let running = Running(a.clone(), j.job_id.clone(), permit);
     let stop = StopOnDrop(stop_tx);
-    let _ = work_dirs(&a.cfg, user);
+    let host = match &teammate {
+        Some(t) => a.cfg.teammate_host(t),
+        None => {
+            let _ = work_dirs(&a.cfg, user);
+            a.cfg.host(user)
+        }
+    };
     let (ev_tx, ev_rx) = mpsc::channel::<wire::JobEvent>(256);
-    let host = a.cfg.host(user);
-    let screen = a.screens.hold(&j.bot_id);
+    let screen = a.screens.hold(&wire::screen_key(&j.bot_id, j.for_user.as_deref()));
     tokio::spawn(async move {
         let _running = running;
         let _screen = screen;
@@ -1465,6 +1553,15 @@ async fn put_screen(State(a): State<Arc<Agent>>, UrlPath(bot): UrlPath<String>, 
         }
         Err(r) => return r,
     };
+    // A teammate's own screen of the Bot runs as their user, in their home (ADR 0047).
+    let who = match &r.for_user {
+        Some(u) => match a.teammate(u).await {
+            Ok(t) => display::As { ids: t.ids, home: t.home, user: t.user },
+            Err(r) => return r,
+        },
+        None => display::As { ids, home: a.cfg.home.clone(), user: a.cfg.bot_user.clone() },
+    };
+    let key = wire::screen_key(&bot, r.for_user.as_deref());
     if a.upgrader.staging() {
         return refuse(StatusCode::SERVICE_UNAVAILABLE, "This machine is updating its agent. Try again in a minute.");
     }
@@ -1472,10 +1569,10 @@ async fn put_screen(State(a): State<Arc<Agent>>, UrlPath(bot): UrlPath<String>, 
     if !missing.is_empty() {
         return refuse(StatusCode::UNPROCESSABLE_ENTITY, format!("This machine is missing {}.", missing.join(", ")));
     }
-    match a.screens.ensure(&bot, &r, ids).await {
+    match a.screens.ensure_as(&key, &r, &who).await {
         Ok(reply) => {
             if reply.started {
-                println!("Screen {} of Bot {bot} started.", reply.display);
+                println!("Screen {} of {key} started.", reply.display);
             }
             Json(reply).into_response()
         }
@@ -1483,8 +1580,27 @@ async fn put_screen(State(a): State<Arc<Agent>>, UrlPath(bot): UrlPath<String>, 
     }
 }
 
-async fn delete_screen(State(a): State<Arc<Agent>>, UrlPath(bot): UrlPath<String>) -> Response {
-    if a.screens.stop(&bot).await {
+/// `?for=<user>`: a teammate's own screen of the Bot (ADR 0047).
+#[derive(serde::Deserialize)]
+struct ScreenFor {
+    #[serde(rename = "for")]
+    for_user: Option<String>,
+}
+
+impl ScreenFor {
+    fn key(&self, bot: &str) -> Option<String> {
+        match &self.for_user {
+            Some(u) if !plain_name(u) => None,
+            u => Some(wire::screen_key(bot, u.as_deref())),
+        }
+    }
+}
+
+async fn delete_screen(State(a): State<Arc<Agent>>, UrlPath(bot): UrlPath<String>, Query(f): Query<ScreenFor>) -> Response {
+    let Some(key) = f.key(&bot) else {
+        return refuse(StatusCode::BAD_REQUEST, "The teammate's id isn't a plain name.");
+    };
+    if a.screens.stop(&key).await {
         StatusCode::NO_CONTENT.into_response()
     } else {
         refuse(StatusCode::NOT_FOUND, "No screen is up for that Bot here.")
@@ -1496,12 +1612,15 @@ const TUNNEL_LIFETIME: Duration = Duration::from_secs(12 * 3600);
 
 /// `GET /v1/screens/{bot}/tunnel`: one viewer connection, piped as raw bytes to the
 /// Bot's voxl on loopback. The viewer port itself is never reachable from outside.
-async fn screen_tunnel(State(a): State<Arc<Agent>>, UrlPath(bot): UrlPath<String>, mut req: Request) -> Response {
+async fn screen_tunnel(State(a): State<Arc<Agent>>, UrlPath(bot): UrlPath<String>, Query(f): Query<ScreenFor>, mut req: Request) -> Response {
     let wants = req.headers().get(header::UPGRADE).and_then(|v| v.to_str().ok());
     if wants != Some(wire::SCREEN_UPGRADE) {
         return refuse(StatusCode::BAD_REQUEST, format!("Ask with Upgrade: {}.", wire::SCREEN_UPGRADE));
     }
-    let (port, hold, permit) = match a.screens.tunnel(&bot) {
+    let Some(key) = f.key(&bot) else {
+        return refuse(StatusCode::BAD_REQUEST, "The teammate's id isn't a plain name.");
+    };
+    let (port, hold, permit) = match a.screens.tunnel(&key) {
         Ok(t) => t,
         Err((code, msg)) => return refuse(code_or(code, StatusCode::NOT_FOUND), msg),
     };
@@ -1527,6 +1646,26 @@ async fn screen_tunnel(State(a): State<Arc<Agent>>, UrlPath(bot): UrlPath<String
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// `PUT /v1/teammates/{user}`: the OS user and home a teammate's runs of this machine's
+/// user's shared Bots get here, made on first use (ADR 0047).
+async fn put_teammate(State(a): State<Arc<Agent>>, UrlPath(user): UrlPath<String>, Json(r): Json<wire::TeammateRequest>) -> Response {
+    if r.owner_id != a.identity().user_id {
+        return refuse(StatusCode::FORBIDDEN, "This machine runs only its own user's Bots.");
+    }
+    if a.upgrader.staging() {
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, "This machine is updating its agent. Try again in a minute.");
+    }
+    match a.teammate(&user).await {
+        Ok(t) => {
+            if t.created {
+                println!("Teammate user {} made for runs of shared Bots.", t.user);
+            }
+            Json(t.reply()).into_response()
+        }
+        Err(r) => r,
+    }
+}
+
 pub fn router(a: Arc<Agent>) -> Router {
     Router::new()
         .route("/v1/heartbeat", get(heartbeat))
@@ -1544,6 +1683,7 @@ pub fn router(a: Arc<Agent>) -> Router {
         .route("/v1/bot-user", axum::routing::put(set_bot_user))
         .route("/v1/screens/{bot}", axum::routing::put(put_screen).delete(delete_screen))
         .route("/v1/screens/{bot}/tunnel", get(screen_tunnel))
+        .route("/v1/teammates/{user}", axum::routing::put(put_teammate))
         .layer(DefaultBodyLimit::max(MAX_RELAY_BODY))
         .with_state(a)
 }

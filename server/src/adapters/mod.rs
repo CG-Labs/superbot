@@ -272,6 +272,7 @@ pub fn job_for(adapter: &mut dyn Adapter, input: &RunInput, out: &mut Vec<AgentE
         job_id: String::new(),
         bot_id: String::new(),
         owner_id: String::new(),
+        for_user: None,
         message_id: 0,
         bin: adapter.bin().into(),
         args,

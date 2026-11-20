@@ -28,6 +28,9 @@
 //! - `DELETE /v1/screens/{bot}`: stop it.
 //! - `GET /v1/screens/{bot}/tunnel` with `Upgrade: SCREEN_UPGRADE` (101): a raw byte
 //!   pipe to the screen's viewer on the machine's loopback, one per viewer connection.
+//! - `PUT /v1/teammates/{user}` `TeammateRequest` -> `TeammateReply`: the OS user and
+//!   home a teammate's runs of the owner's shared Bots get on this machine (ADR 0047).
+//!   Screen routes take `?for=<user>` for that teammate's own screen of the Bot.
 //!
 //! Protocol 1 (`PROTOCOL`) is the first that runs Bots. A heartbeat without `protocol`
 //! is from an agent before it, which can't. Installs, upgrades, logins and folder
@@ -101,6 +104,7 @@ pub const CAN_LOGINS: &str = "logins";
 pub const CAN_SYNC: &str = "sync";
 pub const CAN_BOT_USER: &str = "bot_user";
 pub const CAN_SCREENS: &str = "screens";
+pub const CAN_TEAMMATES: &str = "teammates";
 
 /// The screen protocol this build speaks (ADR 0045). A request names it, an agent
 /// refuses any other, and botd treats an agent that reports another as outdated.
@@ -140,6 +144,15 @@ pub struct ScreenRequest {
     pub height: u32,
     /// Stop it after this long with no viewer, request or job of the Bot.
     pub idle_secs: u64,
+    /// The teammate whose own screen of the Bot this is, run as their OS user on the
+    /// machine (ADR 0047). None: the owner's, as the Bots' user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_user: Option<String>,
+    /// Only X clients with the screen's cookie may connect to its display. Always so for
+    /// a teammate's screen; botd asks for it on the owner's too once teammates have
+    /// their own users, so neither can reach the other's display.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub xauth: bool,
 }
 
 /// Where a Bot's programs find its screen on the machine.
@@ -152,6 +165,51 @@ pub struct ScreenReply {
     pub bus: String,
     /// It was started (not just kept) by this request.
     pub started: bool,
+    /// `XAUTHORITY`, when the display takes only clients with its cookie.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xauthority: Option<String>,
+}
+
+/// A screen's name on the agent: the Bot, or the Bot and the teammate it's for.
+pub fn screen_key(bot: &str, for_user: Option<&str>) -> String {
+    match for_user {
+        Some(u) => format!("{bot}@{u}"),
+        None => bot.to_string(),
+    }
+}
+
+/// The OS user a teammate's runs get on a machine (ADR 0047): from their user id, so
+/// it never holds the request's own text and fits useradd's 32 bytes.
+pub fn teammate_user(user_id: &str) -> String {
+    use sha2::Digest;
+    let d = sha2::Sha256::digest(user_id.as_bytes());
+    let hex: String = d.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    format!("{TEAMMATE_USER_PREFIX}{hex}")
+}
+
+pub const TEAMMATE_USER_PREFIX: &str = "superbot-t-";
+
+/// `PUT /v1/teammates/{user}`: make or check the OS user and home of a teammate who
+/// runs the machine's user's shared Bots (ADR 0047). Never the machine's own user.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TeammateRequest {
+    /// Must be the machine's own user, as for jobs.
+    pub owner_id: String,
+}
+
+/// Where a teammate's runs happen on the machine. Every path in their jobs must be
+/// inside `home`, which only their OS user can open.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeammateReply {
+    pub user: String,
+    pub uid: u32,
+    pub home: String,
+    pub workspace: String,
+    pub bots: String,
+    /// The user was made by this request.
+    pub created: bool,
 }
 
 /// `token` as a viewer password: plain lowercase hex, long enough to guess at no rate.
@@ -574,6 +632,10 @@ pub struct JobRequest {
     pub cleanup: Option<JobCleanup>,
     /// Files to send back when the job ends (as they are then), e.g. the Bot's memory.
     pub collect: Vec<String>,
+    /// A teammate's run of the owner's shared Bot (ADR 0047): it runs as that teammate's
+    /// own OS user, in their home there, and every path must be inside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_user: Option<String>,
 }
 
 /// What a job stream carries, one per line.

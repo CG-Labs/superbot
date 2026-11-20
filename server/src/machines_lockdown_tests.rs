@@ -416,6 +416,8 @@ async fn machines_that_dont_enroll_in_time_are_reported() {
         bot_user: crate::machines::wire::BOT_USER.into(),
         allow_own_user: false,
         screens: crate::machines_mtls_tests::no_screens(),
+        teammates: crate::db::temp_path("agent-teammates"),
+        teammate_stand_in: None,
     };
     agent::enroll(&cfg).await.unwrap();
     let row = env.app.db.machine(&mid).unwrap();

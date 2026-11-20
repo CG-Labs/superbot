@@ -922,13 +922,16 @@ fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<
         let t = t.trim();
         // Each Bot's runs carry their own token (ADR 0029). A forged one, one from an
         // earlier start, one for a Bot since deleted, or one from before the Bot changed
-        // hands is refused.
+        // hands is refused. One bound to a teammate (ADR 0047) works only while the
+        // Bot's latest run is still theirs.
         if t.starts_with(isolation::BOT_TOKEN_PREFIX) {
-            let now = |id: &str| a.app.as_ref().map(|app| app.db.bot(id).map(|b| b.owner_id));
+            let now = |id: &str| a.app.as_ref().map(|app| app.db.bot(id));
+            let run_over = |b: &db::Bot, u: &str| a.app.as_ref().is_some_and(|app| app.acting_for(b) != u);
             return match isolation::token_bot(&a.bot_key, t) {
                 Some((id, owner)) => match now(id) {
                     Some(None) => fail("bot_token", Some("bot_gone"), false),
-                    Some(Some(o)) if o != owner => fail("bot_token", Some("bot_moved"), false),
+                    Some(Some(b)) if b.owner_id != owner => fail("bot_token", Some("bot_moved"), false),
+                    Some(Some(b)) if isolation::token_for_user(&a.bot_key, t).is_some_and(|u| run_over(&b, u)) => fail("bot_token", Some("run_over"), false),
                     _ => Ok(Caller { principal: Principal::Bot, user: None, session: None, method: "bot_token", bot: Some(id.to_string()) }),
                 },
                 None => fail("bot_token", Some("bad_token"), false),
@@ -1898,22 +1901,52 @@ fn caller_now(app: &App, a: &Auth, c: &Caller) -> Option<Caller> {
     Some(Caller { principal: Principal::User(u.role), user: Some(u), ..c.clone() })
 }
 
+/// With teammates' own users on machines (ADR 0047), whose screen of `bot` a caller
+/// gets: a teammate their own, the owner theirs; an admin the owner's, or a teammate's
+/// with `?for=<user>`. A Bot's token gets the screen of the person its run is for.
+/// None: the owner's.
+fn screen_for(app: &App, c: &Caller, bot: &db::Bot, asked: Option<&str>) -> Res<Option<String>> {
+    let on = app.control_plane.get().is_some_and(|cp| cp.teammate_users()) && app.shared_bots() == acl::SharedBots::Isolated;
+    let me = match (&c.user, &c.bot) {
+        (Some(u), _) => Some(u.id.clone()),
+        (None, Some(b)) => app.db.bot(b).map(|b| app.acting_for(&b)),
+        (None, None) => None,
+    };
+    let admin = c.principal == Principal::User(Role::Admin);
+    let who = match asked.map(str::trim).filter(|u| !u.is_empty()) {
+        Some(u) if !on => return Err(bad(&format!("Screens are per teammate only with MACHINE_TEAMMATE_USERS=on, so there's no screen for {u}."))),
+        Some(u) if admin || me.as_deref() == Some(u) => Some(u.to_string()),
+        Some(_) => return Err(ApiError(StatusCode::FORBIDDEN, "Only an admin can open someone else's screen of this Bot.".into())),
+        None if on && !admin => me,
+        None => None,
+    };
+    let who = who.filter(|u| *u != bot.owner_id);
+    if let Some(u) = &who
+        && Viewer::person(&app.db, u).access(&app.db, bot) < Access::Operate
+    {
+        return Err(ApiError(StatusCode::NOT_FOUND, "That person can't use this Bot, so it has no screen for them.".into()));
+    }
+    Ok(who)
+}
+
 async fn screen_info(
     State(app): State<AppState>,
     Extension(a): Extension<Arc<Auth>>,
     Extension(c): Extension<Caller>,
     Extension(by): Extension<Who>,
     Path(id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Res {
     // The link gives control of the screen.
     let (bot, _) = need_bot_access(&app, &c, &by, &id, Access::Operate)?;
+    let for_user = screen_for(&app, &c, &bot, q.get("for").map(String::as_str))?;
     // A Bot on its owner's machine is shown from there or not at all (ADR 0045). Its
     // screen may change hands while this waits on it, so access is checked again then.
     let still = || match caller_now(&app, &a, &c) {
         Some(now) => need_bot_access(&app, &now, &by, &id, Access::Operate).map(drop),
         None => Err(ApiError(StatusCode::UNAUTHORIZED, "Your session has ended. Sign in again.".into())),
     };
-    if let Some(url) = machines::screens::open(&app, &by, &bot, still).await? {
+    if let Some(url) = machines::screens::open(&app, &by, &bot, for_user.as_deref(), still).await? {
         return Ok(Json(json!({ "url": url })));
     }
     let off = || ApiError(StatusCode::NOT_FOUND, "Screens are off on this server. Install Xvfb, openbox, and voxl.".into());

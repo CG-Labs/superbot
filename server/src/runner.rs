@@ -55,7 +55,8 @@ struct Run {
 /// Where a run happens: here, or on its owner's machine (ADR 0036).
 enum Place {
     Here,
-    There(Box<(Assigned, wire::Layout)>),
+    /// The owner's machine, and the teammate's own user there the run is for (ADR 0047).
+    There(Box<(Assigned, wire::Layout, Option<wire::TeammateReply>)>),
 }
 
 /// What a job on a machine sent back: files by path, and those too big to send.
@@ -75,6 +76,8 @@ struct Spot {
     /// The person the run is for, when that isn't the Bot's owner and shared Bots are
     /// isolated (ADR 0046): the run gets neither the owner's own keys nor their facts.
     for_other: Option<String>,
+    /// The teammate's own OS user the run is for on the machine (ADR 0047).
+    teammate_user: Option<String>,
 }
 
 #[derive(Default)]
@@ -589,10 +592,11 @@ impl App {
             },
             Place::There(_) => None,
         };
-        let mut spot = self.spot(&bot, bot_dir.clone(), space, place);
+        let mut spot = self.spot(&bot, bot_dir.clone(), space, place, for_other.as_deref());
         spot.for_other = for_other.clone();
+        let screen_for = spot.teammate_user.as_ref().and(for_other.as_deref());
         if let Some(to) = spot.machine.clone()
-            && let Some(env) = crate::machines::screens::for_run(self, &bot, &to, &spot.state_dir).await
+            && let Some(env) = crate::machines::screens::for_run(self, &bot, screen_for, &to, &spot.state_dir).await
         {
             spot.env.extend(env);
             spot.screens = true;
@@ -654,6 +658,9 @@ impl App {
             }
             if let Some(u) = &for_other {
                 invoked["forUser"] = json!(u);
+            }
+            if let Some(u) = &spot.teammate_user {
+                invoked["teammateUser"] = json!(u);
             }
             self.db.record(&by.event("harness.invoked").target("message", &msg.id.to_string()).bot(&bot.id).details(invoked));
             let input = RunInput {
@@ -828,28 +835,47 @@ impl App {
             Err(r) => return refused(r, None),
             Ok(Target::Machine(to)) => to,
         };
+        // A teammate's run goes there as their own user (ADR 0047), never the Bots'.
+        let teammate = for_other.filter(|_| cp.teammate_users());
         let checked = cp.link.check(self, &to, &[bin]).await.map_err(Refusal::Offline);
         let ready = checked.and_then(|hb| {
             let layout = route::fit(&hb, bin)?;
             let keys = if for_other.is_some() { None } else { Some(bot.owner_id.as_str()) };
-            cp.ready(self, &hb, keys, &to.machine_id, bin)?;
+            cp.ready(self, &hb, keys, &to.machine_id, bin, teammate.is_some())?;
             Ok((layout, hb.version))
         });
-        match ready {
-            Err(r) => refused(r, Some(&to.machine_id)),
-            Ok((layout, version)) => {
-                let e = by.event("bot.run_routed").target("message", &msg.id.to_string()).bot(&bot.id);
-                let detail = json!({ "owner": bot.owner_id, "machine": to.machine_id, "link": cp.link.name(), "agentVersion": version, "forUser": for_other, "messageId": msg.id });
-                self.db.record(&e.details(detail));
-                Some(Place::There(Box::new((to, layout))))
-            }
-        }
+        let (layout, version) = match ready {
+            Err(r) => return refused(r, Some(&to.machine_id)),
+            Ok(ready) => ready,
+        };
+        let user = match teammate {
+            None => None,
+            Some(u) => match cp.link.teammate(&to, u).await {
+                Err(e) => return refused(Refusal::TeammateUserFailed(e), Some(&to.machine_id)),
+                Ok(t) => {
+                    if t.created {
+                        let e = by.event("machine.teammate_user_created").target("machine", &to.machine_id).bot(&bot.id);
+                        self.db.record(&e.details(json!({ "owner": bot.owner_id, "forUser": u, "user": t.user, "uid": t.uid, "messageId": msg.id })));
+                    }
+                    Some(t)
+                }
+            },
+        };
+        let e = by.event("bot.run_routed").target("message", &msg.id.to_string()).bot(&bot.id);
+        let detail = json!({
+            "owner": bot.owner_id, "machine": to.machine_id, "link": cp.link.name(), "agentVersion": version, "forUser": for_other,
+            "teammateUser": user.as_ref().map(|t| &t.user), "messageId": msg.id,
+        });
+        self.db.record(&e.details(detail));
+        Some(Place::There(Box::new((to, layout, user))))
     }
 
     /// The run's folders and environment where it happens. On a machine: the machine's
     /// folders, botctl there, and botd's API through the agent's relay; its screen
     /// there, if any, comes after (ADR 0045).
-    fn spot(&self, bot: &Bot, bot_dir: PathBuf, (cwd, mut env): (PathBuf, HashMap<String, String>), place: Place) -> Spot {
+    /// A teammate's run as their own user (ADR 0047) works in that user's home, and its
+    /// token is bound to them (`isolation::bot_token_for`).
+    fn spot(&self, bot: &Bot, bot_dir: PathBuf, (cwd, mut env): (PathBuf, HashMap<String, String>), place: Place, for_other: Option<&str>) -> Spot {
         let local = |p: Option<PathBuf>| p.unwrap_or_default();
         match place {
             Place::Here => Spot {
@@ -863,9 +889,10 @@ impl App {
                 screens: self.screens.is_some(),
                 ctx: None,
                 for_other: None,
+                teammate_user: None,
             },
             Place::There(there) => {
-                let (to, layout) = *there;
+                let (to, mut layout, teammate) = *there;
                 let botctl = PathBuf::from(layout.botctl.clone().unwrap_or_default());
                 // HOME and PATH are the machine's own; it inherits nothing of botd's.
                 env.remove("PATH");
@@ -874,6 +901,17 @@ impl App {
                 }
                 env.insert("BOT_API".into(), layout.api.clone());
                 env.insert("SUPERBOT_BOTCTL".into(), botctl.display().to_string());
+                let teammate_user = match (teammate, for_other) {
+                    (Some(t), Some(u)) => {
+                        let token = isolation::bot_token_for(&self.cfg.bot_key, &bot.id, &bot.owner_id, u);
+                        crate::secrets::redact::register(&token);
+                        env.insert("BOT_TOKEN".into(), token);
+                        layout.user_file = format!("{}/USER.md", t.home);
+                        (layout.home, layout.workspace, layout.bots) = (t.home, t.workspace, t.bots);
+                        Some(t.user)
+                    }
+                    _ => None,
+                };
                 let state_dir = PathBuf::from(&layout.bots).join(&bot.id);
                 Spot {
                     machine: Some(to),
@@ -886,6 +924,7 @@ impl App {
                     screens: false,
                     ctx: Some(Ctx { workspace: PathBuf::from(&layout.workspace), home: PathBuf::from(&layout.home) }),
                     for_other: None,
+                    teammate_user,
                 }
             }
         }
@@ -918,6 +957,7 @@ impl App {
             job.job_id = format!("j{}", crate::random_hex(8));
             job.bot_id = bot.id.clone();
             job.owner_id = bot.owner_id.clone();
+            job.for_user = spot.teammate_user.as_ref().and(spot.for_other.clone());
             job.message_id = msg.id;
             let files = [(memory_at.clone(), memory), (user_at.clone(), facts.filter(|_| alone))];
             job.files.extend(files.into_iter().filter_map(|(path, body)| Some(wire::JobFile { path, body: body? })));
@@ -1220,7 +1260,7 @@ impl App {
     #[cfg(test)]
     pub(crate) fn system_prompt(&self, bot: &Bot) -> String {
         let (cwd, env) = (self.workspace_for(&bot.owner_id).unwrap_or_default(), HashMap::new());
-        let spot = self.spot(bot, self.bot_dir(&bot.id).unwrap_or_default(), (cwd, env), Place::Here);
+        let spot = self.spot(bot, self.bot_dir(&bot.id).unwrap_or_default(), (cwd, env), Place::Here, None);
         self.system_prompt_at(bot, &spot)
     }
 

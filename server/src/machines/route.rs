@@ -100,6 +100,11 @@ pub enum Refusal {
     BotUserPending,
     /// Its agent couldn't set up the Bots' own user (ADR 0043).
     BotUserFailed,
+    /// A teammate's run there needs a server-wide key for this harness, since it runs as
+    /// the teammate's own user, outside the machine's logins (ADR 0047).
+    NoTeammateKey(String),
+    /// Its agent couldn't set up the teammate's own user (ADR 0047): its words.
+    TeammateUserFailed(String),
 }
 
 impl Refusal {
@@ -119,15 +124,17 @@ impl Refusal {
             Refusal::FolderCopying => "folder_copying",
             Refusal::BotUserPending => "bot_user_pending",
             Refusal::BotUserFailed => "bot_user_failed",
+            Refusal::NoTeammateKey(_) => "teammate_no_key",
+            Refusal::TeammateUserFailed(_) => "teammate_user_failed",
         }
     }
 
     /// The machine's own words, for the audit log: its error, version or state.
     pub fn detail(&self) -> Option<String> {
         match self {
-            Refusal::Offline(e) | Refusal::Outdated(e) => Some(e.clone()),
+            Refusal::Offline(e) | Refusal::Outdated(e) | Refusal::TeammateUserFailed(e) => Some(e.clone()),
             Refusal::NotReady(s) => Some(s.as_str().into()),
-            Refusal::HarnessMissing(h) | Refusal::HarnessInstalling(h) | Refusal::NotLoggedIn(h) => Some(h.clone()),
+            Refusal::HarnessMissing(h) | Refusal::HarnessInstalling(h) | Refusal::NotLoggedIn(h) | Refusal::NoTeammateKey(h) => Some(h.clone()),
             _ => None,
         }
     }
@@ -159,6 +166,8 @@ impl Refusal {
             Refusal::FolderCopying => "I didn't run: your files are still being copied to your computer. Try again in a few minutes.".into(),
             Refusal::BotUserPending => "I didn't run: your computer is still setting up a separate account for your Bots. Try again in a few minutes.".into(),
             Refusal::BotUserFailed => "I didn't run: your computer couldn't set up a separate account for your Bots. Ask an admin to look at it (`botctl machine agent <your email>`).".into(),
+            Refusal::NoTeammateKey(h) => format!("I didn't run: runs for your teammates use their own account on your computer, and {h} has no server-wide key for that. Ask an admin to save one."),
+            Refusal::TeammateUserFailed(_) => "I didn't run: your computer couldn't set up a separate account for a teammate. Ask an admin to look at it (`botctl machine agent <your email>`).".into(),
         }
     }
 
@@ -175,6 +184,10 @@ impl Refusal {
             Refusal::NotLoggedIn(h) => {
                 return format!("I didn't run: {h} isn't logged in for me on {o}'s computer. An admin can log it in there, or save a server-wide key for it.");
             }
+            Refusal::NoTeammateKey(h) => {
+                return format!("I didn't run: on {o}'s computer I run for you under your own account, and {h} has no server-wide key for that. An admin can save one.");
+            }
+            Refusal::TeammateUserFailed(_) => "it couldn't set up an account for you there",
             Refusal::Outdated(_) | Refusal::Upgrading | Refusal::NoBotctl | Refusal::FolderCopying | Refusal::BotUserPending | Refusal::BotUserFailed => {
                 "it isn't ready to run Bots"
             }
@@ -245,6 +258,7 @@ pub fn logged_in(hb: &Heartbeat, bin: &str, keyed: bool) -> Result<(), Refusal> 
 
 pub type Checked<'a> = Pin<Box<dyn Future<Output = Result<Heartbeat, String>> + Send + 'a>>;
 pub type Ran<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+pub type Teammated<'a> = Pin<Box<dyn Future<Output = Result<wire::TeammateReply, String>> + Send + 'a>>;
 
 /// Hands work to a user's machine. botd never sends a job to any machine but the one
 /// `target` picked for the Bot's owner, and over mutual TLS only to that machine's
@@ -256,6 +270,9 @@ pub trait MachineLink: Send + Sync {
     /// Runs `job` there, sending its events to `tx` until it ends. A job that can't
     /// start, or a machine lost on the way, ends with an `Error`.
     fn run<'a>(&'a self, to: &'a Assigned, job: JobRequest, abort: watch::Receiver<AbortReason>, tx: mpsc::Sender<JobEvent>) -> Ran<'a>;
+    /// Makes sure `user_id`, a teammate of the machine's owner, has their own user
+    /// there (ADR 0047), and says where its folders are.
+    fn teammate<'a>(&'a self, to: &'a Assigned, user_id: &'a str) -> Teammated<'a>;
 }
 
 /// While enrollment is off: nothing can be sent, so routed runs are refused.
@@ -277,6 +294,10 @@ impl MachineLink for Unenrolled {
             let _ = tx.send(JobEvent::Error { message: UNENROLLED.into() }).await;
         })
     }
+
+    fn teammate<'a>(&'a self, _to: &'a Assigned, _user_id: &'a str) -> Teammated<'a> {
+        Box::pin(async { Err(UNENROLLED.to_string()) })
+    }
 }
 
 #[cfg(test)]
@@ -290,6 +311,9 @@ pub mod recording {
         pub sent: Mutex<Vec<(Assigned, JobRequest)>>,
         pub heartbeat: Mutex<Result<Heartbeat, String>>,
         pub script: Mutex<Vec<JobEvent>>,
+        /// Teammates it was asked to make users for, and what it answers.
+        pub teammates: Mutex<Vec<String>>,
+        pub teammate_error: Mutex<Option<String>>,
     }
 
     /// Records `m` as enrolled, with a certificate from a throwaway CA.
@@ -332,6 +356,8 @@ pub mod recording {
                     JobEvent::Started,
                     JobEvent::Exit { success: true, status: "exit status: 0".into(), stderr: String::new(), files: Default::default(), too_big: Vec::new() },
                 ]),
+                teammates: Mutex::default(),
+                teammate_error: Mutex::default(),
             }
         }
     }
@@ -355,6 +381,27 @@ pub mod recording {
                 }
             })
         }
+
+        fn teammate<'a>(&'a self, _to: &'a Assigned, user_id: &'a str) -> Teammated<'a> {
+            let created = {
+                let mut seen = self.teammates.lock().unwrap();
+                let created = !seen.iter().any(|u| u == user_id);
+                seen.push(user_id.to_string());
+                created
+            };
+            let res = match self.teammate_error.lock().unwrap().clone() {
+                Some(e) => Err(e),
+                None => Ok(teammate_reply(user_id, created)),
+            };
+            Box::pin(async move { res })
+        }
+    }
+
+    /// Where a stand-in machine keeps `user_id`'s teammate user.
+    pub fn teammate_reply(user_id: &str, created: bool) -> wire::TeammateReply {
+        let user = wire::teammate_user(user_id);
+        let home = format!("/home/teammates/{user}");
+        wire::TeammateReply { workspace: format!("{home}/work"), bots: format!("{home}/bots"), home, uid: 2001, user, created }
     }
 }
 
@@ -373,6 +420,8 @@ mod tests {
             Refusal::HarnessMissing("claude".into()),
             Refusal::NotLoggedIn("claude".into()),
             Refusal::BotUserFailed,
+            Refusal::NoTeammateKey("claude".into()),
+            Refusal::TeammateUserFailed("useradd failed at 192.0.2.7".into()),
         ];
         for r in &all {
             let m = r.message_for(Some("Ada"));
