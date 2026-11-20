@@ -124,8 +124,8 @@ fn domain_view(a: &Auth, host: &str, scheme: &str, on_this_machine: bool) -> Val
         step("DNS", format!("Point an A (and AAAA) record for {shown} at this server, and open ports 80 and 443."), &[]),
         step(
             "Bash installer",
-            "Re-run the installer with the domain. It sets ALLOWED_HOSTS and CORS_ORIGINS in .env, writes Caddy's config, and restarts botd. Caddy gets the certificate.",
-            &[format!("sudo deploy/install.sh --domain {shown}")],
+            "Re-run the installer with the domain. It pulls the latest main and rebuilds, sets ALLOWED_HOSTS and CORS_ORIGINS in .env, writes Caddy's config, and restarts botd. Caddy gets the certificate.",
+            &[format!("curl -fsSL https://raw.githubusercontent.com/CG-Labs/superbot/main/deploy/install.sh | sudo bash -s -- --upgrade --domain {shown}")],
         ),
         step(
             "Docker Compose",

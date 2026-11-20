@@ -18,7 +18,7 @@ After `install.sh` or `docker compose up`, the first admin signs in with the bre
 
 | Part | What it says |
 |------|--------------|
-| `domain` | The public URL (`SSO_PUBLIC_URL`, else the first public `ALLOWED_HOSTS` name), and whether this request came over HTTPS through the proxy (`X-Forwarded-Proto`, trusted the same way as `X-Forwarded-For`: from loopback, or with `TRUST_FORWARDED_FOR=1`). Requests from loopback without the proxy (botctl, SSH tunnels) count as "can't check", not as plain HTTP. Commands for DNS, `install.sh --domain`, and `init.sh --domain`. |
+| `domain` | The public URL (`SSO_PUBLIC_URL`, else the first public `ALLOWED_HOSTS` name), and whether this request came over HTTPS through the proxy (`X-Forwarded-Proto`, trusted the same way as `X-Forwarded-For`: from loopback, or with `TRUST_FORWARDED_FOR=1`). Requests from loopback without the proxy (botctl, SSH tunnels) count as "can't check", not as plain HTTP. Commands for DNS, the one-command installer with `--upgrade --domain` (it works without a checkout), and `init.sh --domain`. |
 | `signIn` | Each SSO provider, whether it's ready (`Provider::not_ready`), its secret's name, and the redirect URI to register. Admins other than the break-glass owner, SCIM, sign-ups. Copy-ready `.env` lines for each provider type, merged into the current `SSO_PROVIDERS`. |
 | `tiers` | The tiers file or the built-in open self-host tier, the default, each tier's limits (no models), and how to add a file. |
 | `approvals` | The global approval mode. |

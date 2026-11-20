@@ -60,7 +60,7 @@ Open `https://your-domain/app/` for the app (it fills in the server URL), or `ht
 
 On a new server the console opens on **Setup** until an admin finishes or hides it ([ADR 0034](../docs/adr/0034-onboarding-wizard.md)). It walks through:
 
-1. **Domain:** the public address, whether you reached it over HTTPS through Caddy, and the commands to set it (`install.sh --domain`, or `init.sh --domain` for Compose).
+1. **Domain:** the public address, whether you reached it over HTTPS through Caddy, and the commands to set it (the one-command installer with `--upgrade --domain`, or `init.sh --domain` for Compose).
 2. **Sign-in:** each SSO provider, whether it's ready, the redirect URI to register at the IdP, and a box to save its client secret (it takes effect at once). `.env` lines to add a provider of any type.
 3. **Plans:** the tiers file, or the open `self-host` tier, and how to add a [tiers file](#tiers-plans).
 4. **Finish:** a checklist, including a second admin besides the break-glass owner and approvals on.
