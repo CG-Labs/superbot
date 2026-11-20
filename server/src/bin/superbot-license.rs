@@ -92,7 +92,7 @@ fn default_id() -> Res<String> {
     Ok(format!("lic-{}-{tail}", chrono::Utc::now().format("%Y%m%d")))
 }
 
-fn trusted_line(kid: &str, key: &aws_lc_rs::signature::Ed25519KeyPair) -> String {
+fn key_entry(kid: &str, key: &aws_lc_rs::signature::Ed25519KeyPair) -> String {
     format!("(\"{kid}\", \"{}\"),", token::public_b64(key))
 }
 
@@ -112,14 +112,14 @@ fn keygen(mut a: Args) -> Res<String> {
     f.write_all(pem.as_bytes()).and_then(|_| f.sync_all()).map_err(|e| format!("{out}: {e}"))?;
     eprintln!("Private key saved to {out}. Keep it offline and backed up; never commit it.");
     eprintln!("Add this to TRUSTED in server/src/license/mod.rs:");
-    Ok(trusted_line(&kid, &key))
+    Ok(key_entry(&kid, &key))
 }
 
 fn public(mut a: Args) -> Res<String> {
     let key = read_key(&a.need("--key")?)?;
     let kid = a.take("--kid")?.unwrap_or_else(default_kid);
     a.rest(0)?;
-    Ok(trusted_line(&kid, &key))
+    Ok(key_entry(&kid, &key))
 }
 
 fn sign(mut a: Args) -> Res<String> {
