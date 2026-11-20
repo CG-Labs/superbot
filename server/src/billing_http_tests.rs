@@ -532,6 +532,8 @@ struct FakeStripe {
     seen: Arc<std::sync::Mutex<Vec<Seen>>>,
     replies: Arc<std::sync::Mutex<std::collections::VecDeque<(u16, Value)>>>,
     answered: Arc<std::sync::Mutex<HashMap<String, (u16, Value)>>>,
+    /// Checkout sessions someone paid: no longer open, so they can't be expired.
+    paid: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl FakeStripe {
@@ -540,6 +542,12 @@ impl FakeStripe {
     }
     fn reply(&self, status: u16, body: Value) {
         self.replies.lock().unwrap().push_back((status, body));
+    }
+    fn pay(&self, session: &str) {
+        self.paid.lock().unwrap().insert(session.into());
+    }
+    fn created(&self) -> Vec<Seen> {
+        self.seen().into_iter().filter(|s| s.path == "/v1/checkout/sessions").collect()
     }
 }
 
@@ -554,8 +562,12 @@ async fn fake_stripe() -> (String, FakeStripe) {
             return (StatusCode::from_u16(*code).unwrap(), Json(v.clone()));
         }
         let n = f.seen.lock().unwrap().len();
-        let (code, v) = f.replies.lock().unwrap().pop_front().unwrap_or_else(|| match seen.path.as_str() {
-            "/v1/checkout/sessions" => (200, json!({ "id": format!("cs_test_{n}"), "object": "checkout.session", "url": format!("https://checkout.stripe.com/c/pay/cs_test_{n}") })),
+        let session = seen.path.strip_prefix("/v1/checkout/sessions/").map(|r| r.trim_end_matches("/expire").to_string());
+        let paid = session.as_ref().is_some_and(|id| f.paid.lock().unwrap().contains(id));
+        let (code, v) = f.replies.lock().unwrap().pop_front().unwrap_or_else(|| match (seen.path.as_str(), session) {
+            ("/v1/checkout/sessions", _) => (200, json!({ "id": format!("cs_test_{n}"), "object": "checkout.session", "url": format!("https://checkout.stripe.com/c/pay/cs_test_{n}") })),
+            (p, Some(_)) if p.ends_with("/expire") && paid => (400, json!({ "error": { "type": "invalid_request_error", "message": "Only Checkout Sessions with a status of open can be expired." } })),
+            (_, Some(id)) => (200, json!({ "id": id, "object": "checkout.session", "status": if paid { "complete" } else { "expired" } })),
             _ => (200, json!({ "id": format!("bps_test_{n}"), "object": "billing_portal.session", "url": format!("https://billing.stripe.com/p/session/test_{n}") })),
         });
         if code < 500 {
@@ -564,7 +576,7 @@ async fn fake_stripe() -> (String, FakeStripe) {
         (StatusCode::from_u16(code).unwrap(), Json(v))
     }
     let f = FakeStripe::default();
-    let r = axum::Router::new().route("/v1/{*rest}", axum::routing::post(handle)).with_state(f.clone());
+    let r = axum::Router::new().route("/v1/{*rest}", axum::routing::post(handle).get(handle)).with_state(f.clone());
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
@@ -657,12 +669,14 @@ async fn people_buy_plans_with_a_price_through_stripe_checkout() {
         assert_eq!(s.get(k), Some(v), "{k}: {s:?}");
     }
     assert_eq!(s.get("customer"), None);
-    // A double click is the same request: the same key, so Stripe gives the same session.
+    let expires: i64 = s.get("expires_at").unwrap().parse().unwrap();
+    assert!((minute * 60 + 30 * 60 + 1..=(minute + 1) * 60 + 31 * 60).contains(&expires), "{expires}");
+    // Another checkout closes the first page, so only one of them can be paid.
     let (_, again) = buy(&w, &w.a, "pro").await;
-    if db::now() / 60_000 == minute {
-        assert_eq!(stripe.seen()[1].key, s.key);
-        assert_eq!(again["url"].as_str(), Some(url.as_str()));
-    }
+    let seen = stripe.seen();
+    assert_eq!((seen[1].path.as_str(), seen[2].path.as_str()), ("/v1/checkout/sessions/cs_test_1/expire", "/v1/checkout/sessions"));
+    assert!(seen[1].key.starts_with("superbot-expire-") && seen[2].key != s.key, "{seen:?}");
+    assert_eq!(again["url"].as_str(), Some("https://checkout.stripe.com/c/pay/cs_test_3"));
     let created = audit(port, &w.admin, "action=billing.checkout_created").await;
     let c = created.last().unwrap();
     assert_eq!((c["actorId"].as_str(), c["targetId"].as_str(), c["outcome"].as_str()), (Some(w.a_id.as_str()), Some(w.a_id.as_str()), Some("success")), "{c}");
@@ -754,6 +768,43 @@ async fn stripe_failures_are_retried_once_and_said_plainly() {
 }
 
 #[tokio::test]
+async fn only_one_checkout_page_can_be_paid() {
+    let (w, stripe) = shop().await;
+    assert_eq!(buy(&w, &w.a, "pro").await.0, 200);
+    assert_eq!(w.app.db.open_checkout(&w.a_id).as_deref(), Some("cs_test_1"));
+
+    // Ada paid on that page, and the webhook isn't here yet: no second checkout.
+    stripe.pay("cs_test_1");
+    let (code, res) = buy(&w, &w.a, "starter").await;
+    assert_eq!(code, 409, "{res}");
+    assert!(res["error"].as_str().unwrap().contains("went through"), "{res}");
+    let paths: Vec<String> = stripe.seen().iter().skip(1).map(|s| s.path.clone()).collect();
+    assert_eq!(paths, ["/v1/checkout/sessions/cs_test_1/expire", "/v1/checkout/sessions/cs_test_1"]);
+    assert_eq!(stripe.created().len(), 1);
+    let d = &audit(w.port, &w.admin, "action=billing.checkout_created&outcome=denied").await[0];
+    assert_eq!((d["details"]["reason"].as_str(), d["details"]["session"].as_str()), (Some("checkout_completed"), Some("cs_test_1")));
+
+    // Its completion closes it.
+    let done = event(CHECKOUT_DONE, &w.a_id, "evt_c1", 1_794_990_000, |v| v["data"]["object"]["id"] = json!("cs_test_1"));
+    assert_eq!(deliver(w.port, &done, None).await.1["outcome"], "customer_linked");
+    assert_eq!(w.app.db.open_checkout(&w.a_id), None);
+
+    // Bea's open page can't be closed while Stripe is down, so no second one opens.
+    assert_eq!(buy(&w, &w.b, "pro").await.0, 200);
+    let before = stripe.created().len();
+    stripe.reply(503, json!({ "error": { "type": "api_error" } }));
+    stripe.reply(503, json!({ "error": { "type": "api_error" } }));
+    let (code, res) = buy(&w, &w.b, "starter").await;
+    assert_eq!(code, 502, "{res}");
+    assert_eq!(stripe.created().len(), before);
+    let f = &audit(w.port, &w.admin, "action=billing.checkout_created&outcome=failure").await[0];
+    assert_eq!(f["details"]["reason"], "last checkout: HTTP 503 api_error");
+    // Once it answers, the old page is expired and a new one opens.
+    assert_eq!(buy(&w, &w.b, "starter").await.0, 200);
+    assert_eq!(stripe.created().len(), before + 1);
+}
+
+#[tokio::test]
 async fn too_many_sessions_at_once_are_refused() {
     let (w, stripe) = shop().await;
     for n in 0..10 {
@@ -761,7 +812,7 @@ async fn too_many_sessions_at_once_are_refused() {
     }
     let (code, res) = buy(&w, &w.a, "pro").await;
     assert_eq!(code, 429, "{res}");
-    assert_eq!(stripe.seen().len(), 10);
+    assert_eq!(stripe.created().len(), 10);
     // Per person: Bea still can.
     assert_eq!(buy(&w, &w.b, "pro").await.0, 200);
 }
@@ -829,6 +880,17 @@ async fn customers_tie_subscriptions_to_their_user() {
     assert_eq!((u["targetId"].as_str(), u["details"]["customer"].as_str()), (Some(w.a_id.as_str()), Some("cus_test_ada")));
     let unknown = event(CUSTOMER_DELETED, &w.a_id, "evt_d2", 1_795_600_100, |v| v["data"]["object"]["id"] = json!("cus_test_nobody"));
     assert_eq!(deliver(port, &unknown, None).await.1["outcome"], "unchanged");
+    // Events that arrive after the deletion still end the plan, but can't link the customer again.
+    let late = event(DELETED, &w.a_id, "evt_s4", 1_795_600_200, |v| {
+        v["data"]["object"]["metadata"] = json!({});
+        v["data"]["object"]["id"] = json!("sub_test_portal");
+    });
+    assert_eq!(deliver(port, &late, None).await.1["outcome"], "tier_changed");
+    assert_eq!(tier(&w.a_id), None);
+    let late_checkout = done(&w.a_id, "evt_c7", &|_| {});
+    assert_eq!(deliver(port, &late_checkout, None).await.1["outcome"], "ignored");
+    assert_eq!(audit(port, &w.admin, "action=billing.event_ignored").await[0]["details"]["reason"], "customer_deleted");
+    assert_eq!(w.app.db.customer_of(&w.a_id), None);
 
     // Admins see who is linked to which customer.
     let usage = parse(&call(port, "GET", "/api/usage", &w.admin, "").await.1);

@@ -225,9 +225,15 @@ pub enum Linked {
     UserHasAnother(String),
     /// The customer is linked to this other user already.
     OfAnotherUser(String),
+    /// The provider deleted this customer: a late event can't bring it back.
+    Deleted,
 }
 
 fn link_in(c: &Connection, user_id: &str, provider: &str, customer_id: &str, via: &str) -> rusqlite::Result<Linked> {
+    let deleted: bool = c.query_row("SELECT COUNT(*) FROM billing_deleted_customers WHERE customer_id = ?", [customer_id], |r| r.get(0))?;
+    if deleted {
+        return Ok(Linked::Deleted);
+    }
     let by_customer: Option<String> = c.query_row("SELECT user_id FROM billing_customers WHERE customer_id = ?", [customer_id], |r| r.get(0)).optional()?;
     if let Some(u) = by_customer {
         return Ok(if u == user_id { Linked::Already } else { Linked::OfAnotherUser(u) });
@@ -1036,7 +1042,9 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 17] = [
     migrate_billing,
     migrate_billing_customers,
 ];
-/// Users linked to their payment-provider customer (ADR 0041), at most one each way.
+/// Users linked to their payment-provider customer (ADR 0041), at most one each way;
+/// customers the provider deleted, which are never linked again; and each user's open
+/// checkout, closed before another is opened so only one can be paid.
 fn migrate_billing_customers(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
     c.execute_batch(
         "CREATE TABLE IF NOT EXISTS billing_customers (
@@ -1045,6 +1053,15 @@ fn migrate_billing_customers(c: &Connection, _fresh: bool) -> rusqlite::Result<(
           customer_id TEXT NOT NULL UNIQUE,
           linked_at INTEGER NOT NULL,
           linked_via TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS billing_deleted_customers (
+          customer_id TEXT PRIMARY KEY,
+          deleted_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS billing_checkouts (
+          user_id TEXT PRIMARY KEY REFERENCES users(id),
+          session_id TEXT NOT NULL,
+          expires_at INTEGER NOT NULL
         );",
     )
 }
@@ -2391,8 +2408,28 @@ impl Db {
         }
         let user: Option<String> =
             tx.query_row("DELETE FROM billing_customers WHERE customer_id = ? RETURNING user_id", [customer_id], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
+        tx.execute("INSERT OR IGNORE INTO billing_deleted_customers (customer_id, deleted_at) VALUES (?, ?)", params![customer_id, now()]).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(Some(user))
+    }
+
+    /// The user's checkout session that may still be open (`expires_at` in seconds, as Stripe has it).
+    pub fn open_checkout(&self, user_id: &str) -> Option<String> {
+        let at = now() / 1000;
+        self.c().query_row("SELECT session_id FROM billing_checkouts WHERE user_id = ? AND expires_at > ?", params![user_id, at], |r| r.get(0)).optional().ok().flatten()
+    }
+
+    pub fn set_open_checkout(&self, user_id: &str, session_id: &str, expires_at: i64) {
+        let _ = self.c().execute(
+            "INSERT INTO billing_checkouts (user_id, session_id, expires_at) VALUES (?, ?, ?)
+             ON CONFLICT(user_id) DO UPDATE SET session_id = excluded.session_id, expires_at = excluded.expires_at",
+            params![user_id, session_id, expires_at],
+        );
+    }
+
+    /// Forgets the user's open checkout if it is `session_id` (closed, or paid).
+    pub fn close_checkout(&self, user_id: &str, session_id: &str) {
+        let _ = self.c().execute("DELETE FROM billing_checkouts WHERE user_id = ? AND session_id = ?", params![user_id, session_id]);
     }
 
     // SSO identities (ADR 0014)

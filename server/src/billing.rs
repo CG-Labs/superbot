@@ -36,6 +36,9 @@ pub const RETURN_PATH: &str = "/app/plan";
 /// Checkout and portal sessions one person may start a minute.
 const STARTS_PER_MINUTE: u32 = 10;
 const OFF: &str = "Billing isn't set up on this server.";
+/// How long a checkout page stays payable, in minutes past the current one. Stripe's
+/// shortest is 30 minutes from creation; whole minutes keep a retried request identical.
+const CHECKOUT_MINUTES: i64 = 31;
 
 /// Statuses that pay for the subscription's tier. `past_due` keeps it while Stripe
 /// retries the card; Stripe moves it to `canceled` or `unpaid` when it gives up.
@@ -62,6 +65,8 @@ pub struct Checkout {
     /// The https address people open SuperBot at, with no trailing slash.
     public_url: String,
     starts: crate::users::Limiter,
+    /// One checkout at a time per person, so two can't both be opened and paid.
+    busy: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Billing {
@@ -113,7 +118,16 @@ impl Billing {
 
 impl Checkout {
     fn new(key: &str, api: &str, public_url: &str) -> Checkout {
-        Checkout { stripe: Stripe::new(key, api), public_url: public_url.trim_end_matches('/').into(), starts: crate::users::Limiter::new(STARTS_PER_MINUTE, 60_000) }
+        Checkout {
+            stripe: Stripe::new(key, api),
+            public_url: public_url.trim_end_matches('/').into(),
+            starts: crate::users::Limiter::new(STARTS_PER_MINUTE, 60_000),
+            busy: Default::default(),
+        }
+    }
+
+    fn lock(&self, user: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.busy.lock().unwrap_or_else(|e| e.into_inner()).entry(user.to_string()).or_default().clone()
     }
 }
 
@@ -394,6 +408,7 @@ fn checkout_completed(app: &App, event_id: &str, kind: &str, event: &Value) -> R
         Some(u) if app.db.user(&u).is_some() => u,
         other => return ignore("unknown_user", None, json!({ "session": session, "user": other })),
     };
+    app.db.close_checkout(&user, session);
     let Some(cus) = customer_of(o) else {
         return ignore("no_customer", Some(&user), json!({ "session": session }));
     };
@@ -406,6 +421,7 @@ fn checkout_completed(app: &App, event_id: &str, kind: &str, event: &Value) -> R
         Some(Linked::Already) => "unchanged",
         Some(Linked::UserHasAnother(other)) => return ignore("user_has_another_customer", Some(&user), json!({ "session": session, "customer": cus, "linked": other })),
         Some(Linked::OfAnotherUser(_)) => return ignore("customer_of_another_user", Some(&user), json!({ "session": session, "customer": cus })),
+        Some(Linked::Deleted) => return ignore("customer_deleted", Some(&user), json!({ "session": session, "customer": cus })),
     };
     Ok(outcome)
 }
@@ -485,12 +501,44 @@ pub async fn info(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>
 
 /// Counts a start for `user`; false once they've started too many this minute.
 fn may_start(co: &Checkout, user: &str) -> bool {
-    let at = crate::db::now();
-    if co.starts.blocked(user, at).is_some() {
-        return false;
+    co.starts.hit(user, crate::db::now()).is_none()
+}
+
+/// What became of the person's last checkout page.
+enum Last {
+    /// None open, or expired now: a new one may open.
+    Closed,
+    /// Paid: its subscription is on the way.
+    Paid,
+    Unknown(stripe::Error),
+}
+
+/// Expires the person's open checkout page, if any, so it can't be paid as well as the
+/// next. Stripe refuses to expire a page that isn't open; then its status says why.
+async fn close_last(app: &App, co: &Checkout, user: &str) -> Last {
+    let Some(id) = app.db.open_checkout(user) else { return Last::Closed };
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        app.db.close_checkout(user, &id);
+        return Last::Closed;
     }
-    co.starts.fail(user, at);
-    true
+    let key = stripe::idempotency_key("expire", user, &[("session".into(), id.clone())], crate::db::now());
+    let status = match co.stripe.post(&format!("/v1/checkout/sessions/{id}/expire"), &[], &key).await {
+        Ok(v) => v["status"].as_str().map(String::from),
+        Err(stripe::Error::Refused { status, .. }) if status < 500 => match co.stripe.get(&format!("/v1/checkout/sessions/{id}")).await {
+            Ok(v) => v["status"].as_str().map(String::from),
+            Err(stripe::Error::Refused { status: 404, .. }) => Some("expired".into()),
+            Err(e) => return Last::Unknown(e),
+        },
+        Err(e) => return Last::Unknown(e),
+    };
+    match status.as_deref() {
+        Some("expired") => {
+            app.db.close_checkout(user, &id);
+            Last::Closed
+        }
+        Some("complete") => Last::Paid,
+        _ => Last::Unknown(stripe::Error::Unreachable),
+    }
 }
 
 /// Stripe's answer: the session's id and link, or a 502 that says only that Stripe
@@ -539,6 +587,21 @@ pub async fn checkout(State(app): State<AppState>, Extension(a): Extension<Arc<A
     if !may_start(co, &u.id) {
         return bad(StatusCode::TOO_MANY_REQUESTS, "Too many checkouts at once. Try again in a minute.".into());
     }
+    let lock = co.lock(&u.id);
+    let _one_at_a_time = lock.lock().await;
+    let replaces = app.db.open_checkout(&u.id);
+    match close_last(&app, co, &u.id).await {
+        Last::Closed => {}
+        Last::Paid => {
+            app.db.record(&event(Outcome::Denied, json!({ "tier": tier.name, "reason": "checkout_completed", "session": replaces })));
+            return reply(StatusCode::CONFLICT, json!({ "error": "Your last checkout went through. Your plan changes as soon as Stripe confirms the payment." }));
+        }
+        Last::Unknown(e) => {
+            eprintln!("billing: closing {}'s last Stripe checkout: {e}", u.id);
+            app.db.record(&event(Outcome::Failure, json!({ "tier": tier.name, "reason": format!("last checkout: {e}"), "session": replaces })));
+            return bad(StatusCode::BAD_GATEWAY, "Stripe couldn't open the checkout just now. Try again in a minute; if it keeps happening, an admin can see why in the server log.".into());
+        }
+    }
     let customer = app.db.customer_of(&u.id);
     let back = format!("{}{RETURN_PATH}", co.public_url);
     let mut form: Vec<(String, String)> = [
@@ -560,9 +623,16 @@ pub async fn checkout(State(app): State<AppState>, Extension(a): Extension<Arc<A
         (None, Some(email)) => form.push(("customer_email".into(), email.clone())),
         (None, None) => {}
     }
-    let key = stripe::idempotency_key("checkout", &u.id, &form, crate::db::now());
+    let now = crate::db::now();
+    let expires_at = (now / 60_000 + CHECKOUT_MINUTES) * 60;
+    form.push(("expires_at".into(), expires_at.to_string()));
+    // A page that replaces another is a new request, not a retry of the one before.
+    let mut keyed = form.clone();
+    keyed.extend(replaces.map(|r| ("replaces".to_string(), r)));
+    let key = stripe::idempotency_key("checkout", &u.id, &keyed, now);
     match session("checkout", &u.id, co.stripe.post("/v1/checkout/sessions", &form, &key).await) {
         Ok((id, url)) => {
+            app.db.set_open_checkout(&u.id, &id, expires_at);
             app.db.record(&event(Outcome::Success, json!({ "tier": tier.name, "price": price, "session": id, "customer": customer })));
             reply(StatusCode::OK, json!({ "url": url }))
         }

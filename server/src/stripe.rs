@@ -1,7 +1,7 @@
-//! The two Stripe API calls botd makes (ADR 0041): a Checkout Session and a Billing
-//! Portal session, each a form POST with the secret key, an idempotency key, and a
-//! timeout. Nothing else here, and nothing that spends money: Stripe charges only when
-//! the person completes the page it returns.
+//! The Stripe API calls botd makes (ADR 0041): opening, reading, and expiring a Checkout
+//! Session, and opening a Billing Portal session, with the secret key, an idempotency key
+//! on every POST, and a timeout. Nothing here spends money: Stripe charges only when the
+//! person completes the page it returns.
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -55,20 +55,26 @@ impl Stripe {
     /// POSTs `form` to `path` (`/v1/...`). Retried once, with the same idempotency key, when
     /// Stripe doesn't answer or answers 429 or 5xx, as Stripe's own libraries do.
     pub async fn post(&self, path: &str, form: &[(String, String)], idempotency_key: &str) -> Result<Value, Error> {
+        self.send(path, Some((form, idempotency_key))).await
+    }
+
+    /// GETs `path`, retried like `post`.
+    pub async fn get(&self, path: &str) -> Result<Value, Error> {
+        self.send(path, None).await
+    }
+
+    async fn send(&self, path: &str, post: Option<(&[(String, String)], &str)>) -> Result<Value, Error> {
         let mut last = Error::Unreachable;
         for attempt in 0..2 {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
-            let sent = self
-                .http
-                .post(format!("{}{path}", self.base))
-                .bearer_auth(&self.key)
-                .header("Idempotency-Key", idempotency_key)
-                .header("Stripe-Version", VERSION)
-                .form(form)
-                .send()
-                .await;
+            let url = format!("{}{path}", self.base);
+            let req = match post {
+                Some((form, key)) => self.http.post(url).header("Idempotency-Key", key).form(form),
+                None => self.http.get(url),
+            };
+            let sent = req.bearer_auth(&self.key).header("Stripe-Version", VERSION).send().await;
             let Ok(res) = sent else {
                 last = Error::Unreachable;
                 continue;
