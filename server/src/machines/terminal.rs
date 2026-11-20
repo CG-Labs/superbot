@@ -248,15 +248,16 @@ impl Logins {
         drop(slave);
         let pid = child.id();
         let (tx, rx) = mpsc::channel::<LoginEvent>(256);
+        // First, before anything it shows.
+        let _ = tx.try_send(LoginEvent::Started { login_id: r.login_id.clone() });
         let reading = {
             let tx = tx.clone();
             tokio::task::spawn_blocking(move || read_terminal(reader, tx))
         };
-        let (home, files, id) = (home.to_path_buf(), r.files.clone(), r.login_id.clone());
+        let (home, files) = (home.to_path_buf(), r.files.clone());
         let timeout = Duration::from_secs(r.timeout_secs.clamp(MIN_SECS, MAX_SECS));
         tokio::spawn(async move {
             let _registered = registered;
-            let _ = tx.send(LoginEvent::Started { login_id: id }).await;
             let mut status = tokio::select! {
                 s = child.wait() => Some(s),
                 _ = stop_rx.wait_for(|s| *s) => None,

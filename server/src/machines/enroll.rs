@@ -1510,6 +1510,15 @@ mod tests {
         let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_HARNESSES", "pi")]).unwrap().unwrap();
         assert!(e.upkeep.plan.is_some() && e.describe().contains("harnesses on machines: pi@1.5.2; agent upgrades: manual"), "{}", e.describe());
         assert!(with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_HARNESSES", "nope")]).is_err());
+        let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443")]).unwrap().unwrap();
+        assert!(!e.logins && e.folder.is_none(), "logins and folder copies are off unless asked");
+        for v in ["MACHINE_HARNESS_LOGINS", "MACHINE_FOLDER_SYNC", "MACHINE_FOLDER_SYNC_MAX_MB"] {
+            let vars: &'static [(&'static str, &'static str)] = Box::leak(Box::new([(v, "on")]));
+            assert!(with(vars).is_err(), "{v} needs enrollment");
+        }
+        let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_HARNESS_LOGINS", "on"), ("MACHINE_FOLDER_SYNC", "on")]).unwrap().unwrap();
+        assert!(e.logins && e.folder.as_ref().is_some_and(|f| f.max_bytes == 2048 << 20), "{}", e.describe());
+        assert!(with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_HARNESS_LOGINS", "yes")]).is_err());
         for (raw, ok) in [("", Some(15)), ("5", Some(5)), ("60", Some(60)), ("4", None), ("61", None), ("soon", None)] {
             let vars: &'static [(&'static str, &'static str)] = Box::leak(Box::new([
                 ("MACHINE_CONTROL_URL", "https://cp.example:8443"),

@@ -385,7 +385,9 @@ async fn logout(app: AppState, by: Who, u: User, harness: String) -> Res {
     }
     app.db.record(&event(&by, "machine.harness_logged_out", &m, json!({ "harness": harness, "removed": reply["removed"] })));
     let hb = heartbeat(&app, &e, &m).await?;
-    Ok(Json(view(&e, &m, &hb)))
+    let mut v = view(&e, &m, &hb);
+    v["removed"] = reply["removed"].clone();
+    Ok(Json(v))
 }
 
 // Admin API, under `/api/users/{key}/machine` (admin only, rbac::classify).

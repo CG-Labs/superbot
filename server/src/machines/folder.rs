@@ -384,10 +384,9 @@ pub fn start(app: &AppState, e: &Arc<Enrollment>, m: &Machine, by: &Who, trigger
     app.db.record(&event(by, "machine.folder_sync_started", m, json!({ "trigger": trigger })));
     let (app, e, m, by) = (app.clone(), e.clone(), m.clone(), by.clone());
     tokio::spawn(async move {
-        let _claim = claim;
         let res = copy(&app, &e, &m, settings.max_bytes, &mut status).await;
         status.finished_at = Some(now());
-        match res {
+        let ev = match res {
             Ok(r) => {
                 status.state = "done".into();
                 status.done_at = status.finished_at;
@@ -395,20 +394,20 @@ pub fn start(app: &AppState, e: &Arc<Enrollment>, m: &Machine, by: &Who, trigger
                 let d = json!({ "trigger": status.trigger, "files": status.files, "bytes": status.bytes, "sent": status.sent, "skipped": status.skipped,
                     "copied": r.copied, "unchanged": r.unchanged, "seeded": r.seeded, "kept": r.kept, "conflicts": r.conflict_count });
                 status.report = Some(r);
-                app.db.record(&event(&by, "machine.folder_sync_finished", &m, d));
+                event(&by, "machine.folder_sync_finished", &m, d)
             }
             Err(f) => {
                 status.state = "failed".into();
                 status.attempts += 1;
-                app.db.record(
-                    &event(&by, "machine.folder_sync_failed", &m, json!({ "trigger": status.trigger, "reason": f.reason, "error": f.error, "sent": status.sent }))
-                        .outcome(Outcome::Failure),
-                );
+                let d = json!({ "trigger": status.trigger, "reason": f.reason, "error": f.error, "sent": status.sent });
                 status.reason = Some(f.reason.into());
                 status.error = Some(f.error);
+                event(&by, "machine.folder_sync_failed", &m, d).outcome(Outcome::Failure)
             }
-        }
+        };
         save(&app, &m.id, &status);
+        drop(claim);
+        app.db.record(&ev);
     });
     true
 }

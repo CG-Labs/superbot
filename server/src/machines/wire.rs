@@ -528,5 +528,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!((old.protocol, old.layout, old.jobs), (0, None, 0));
+        assert!(old.logins.is_empty(), "an agent from before logins says nothing of them");
+    }
+
+    #[test]
+    fn home_paths_are_plain_and_relative() {
+        for ok in ["USER.md", ".claude/.credentials.json", "work/a b/c.txt", "bots/b1/MEMORY.md"] {
+            assert!(home_path(ok), "{ok}");
+        }
+        let long = "a".repeat(256);
+        for bad in ["", "/etc/passwd", "../x", "a/../b", "a/./b", "a//b", "a/", "a\\b", "a\nb", long.as_str()] {
+            assert!(!home_path(bad), "{bad:?}");
+        }
+        let e = LoginEvent::Exit { success: true, status: "exit status: 0".into(), logged_in: true };
+        assert_eq!(serde_json::to_string(&e).unwrap(), r#"{"type":"exit","success":true,"status":"exit status: 0","loggedIn":true}"#);
     }
 }
