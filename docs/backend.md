@@ -20,7 +20,7 @@ botd embeds `site/` and `web/`. Set `SITE_DIR` or `WEB_DIR` to serve them from d
 - **Memory** is plain files, re-sent in the system prompt every run. The Bot edits them itself:
   - `DATA_DIR/bots/<id>/MEMORY.md`: one Bot's job, rules, and work log.
   - `DATA_DIR/users/<owner>/USER.md`: facts about the Bot's owner, shared by that user's Bots.
-- **The computer** is one per user: `WORKSPACE_DIR/users/<owner>/`, shared by that user's Bots. Each Bot gets its own API token and its owner's saved secrets. See [ADR 0029](adr/0029-per-user-isolation.md).
+- **The computer** is one per user: `WORKSPACE_DIR/users/<owner>/`, shared by that user's Bots. Each Bot gets its own API token and its owner's saved secrets. See [ADR 0029](adr/0029-per-user-isolation.md). With `ISOLATION=users`, each user's Bots also run as their own Unix account; see [One Unix account per user](#one-unix-account-per-user).
 - **Routines** are cron schedules. Bots create them with the `botctl` CLI, which works from any harness's shell.
 - **Bot to Bot**: a Bot runs `botctl ask "<Bot>" "<message>"`. The other Bot answers in its own chat and the reply prints back. If it takes over 9 minutes, the reply arrives later as a new message.
 - **Model and effort** are saved per Bot. The app shows a picker in the chat. Unset means the harness default.
@@ -76,7 +76,7 @@ Settings are in [.env.example](../.env.example). Keep `botctl` next to `botd`: t
 
 - Keep your server IP, domain, and secrets out of this repo. They go in `.env` on the server.
 
-- Install the harness CLIs you want and log them in **as the user that runs `botd`**: `claude` (then `claude login` or `ANTHROPIC_API_KEY`), `codex` (`codex login` or `OPENAI_API_KEY`), `pi` (provider API key, e.g. `OPENROUTER_API_KEY`), `hermes` (provider API key, see [Hermes Agent](#hermes-agent)). Their env vars pass through to the Bots.
+- Install the harness CLIs you want and log them in **as the user that runs `botd`**: `claude` (then `claude login` or `ANTHROPIC_API_KEY`), `codex` (`codex login` or `OPENAI_API_KEY`), `pi` (provider API key, e.g. `OPENROUTER_API_KEY`), `hermes` (provider API key, see [Hermes Agent](#hermes-agent)). Their env vars pass through to the Bots. With [one Unix account per user](#one-unix-account-per-user), install them system-wide and log them in per user with `botctl user harness-login` instead.
 - Run `botd` as a normal user, not root. Claude Code refuses to skip permissions as root.
 - Run it under systemd with `Restart=always`. It shuts down cleanly on SIGTERM.
 - Put HTTPS in front (e.g. Caddy) and set `AUTH_PASSWORD` and `HOST=127.0.0.1` behind the proxy (recommended). The browser logs in with any username and that password.
@@ -236,6 +236,16 @@ Each user is on a **tier** (a plan). A tier lists the harness and model **routes
 - **Assign**: `botctl user tier alex@example.com pro` (or `default`), or `PATCH /api/users/:id {tier}`. Admins only; audited as `user.tier_changed`. `botctl tiers` lists them.
 - **Audit**: `harness.invoked` records the tier and route; refusals are `bot.run_refused` with reason `tier_harness` or `tier_limit`.
 
+### One Unix account per user
+
+With `ISOLATION=users` (`deploy/install.sh --isolation`), each user's Bots run as that user's own Unix account, `sb-u-<user id>`, so one user's Bots can't read or write another's folder or harness logins, or botd's database, `.env`, and master key. **Off by default**: unset or `off` changes nothing. Design: [ADR 0037](adr/0037-per-user-unix-accounts.md).
+
+- **Folders**: `ISOLATION_DIR/<user id>/` (default `/srv/superbot/users`) holds `home/` (the account's HOME, so its own `~/.claude` and `~/.codex`), `workspace/` (where its Bots work), and `memory/` (copies of `USER.md` and each Bot's memory; botd keeps the originals in `DATA_DIR` and copies changes back after each run). Only that account and botd can open it.
+- **How a run starts**: `sudo -n -E -u sb-u-<id> -- superbot-run <harness> ...`. botd may only start `superbot-run` as a per-user account, and `superbot-userctl ensure <id>` as root to make an account; nothing else. A user's account is made at their first run, or with `botctl user isolate <user>`.
+- **Harness logins**: on the server, as botd's account, `botctl user harness-login <user> claude` (runs `claude auth login` as that user) or `codex`. `-- <args>` replaces the login arguments, e.g. `-- setup-token`. Per-user API keys as secrets still work too.
+- **Limits**: only Claude Code and Codex Bots run this way; Pi and Hermes Bots are refused with a message. Screens are off. Harness CLIs must be installed system-wide. Accounts share the network.
+- **Audit**: `isolation.account_created`, `isolation.account_failed`, `harness.login_started`; `harness.invoked` adds `runAs`; refusals are `bot.run_refused` with reason `isolation_harness` or `no_account`.
+
 ### Per-user machines (managed hosting)
 
 For CG-Labs managed hosting: botd can rent one Linode per user and track it. **Off by default**: without `LINODE_TOKEN` the machine endpoints answer 503 "control plane not configured", and nothing else changes. Self-hosted servers don't need it. Design: [ADR 0025](adr/0025-control-plane-linode.md).
@@ -279,6 +289,7 @@ Sign-in, users, and sessions ([ADR 0012](adr/0012-users-sessions-rbac.md)). User
 - `POST /api/users/:id/login-codes` `{ttlMinutes?, replace?}` → `{code, expiresAt}`, `Cache-Control: no-store`. `replace: true` drops the user's unused codes first
 - `GET /api/users/:id-or-email/bots` → `{user, active, bots: [{bot, owner, visibility, access, grant}]}`: the Bots that user can reach now and how ([ADR 0017](adr/0017-bot-acls.md))
 - `GET /api/sessions?user=`, `DELETE /api/sessions/:id`, `DELETE /api/users/:id/sessions`
+- `GET /api/users/:id-or-email/isolation` → `{isolation: "off"}`, or `{isolation: "users", account, root, home, workspace, memory, ready, harnesses}`; `POST` makes the account and its folders now (409 when off, 502 when that fails). `POST /api/users/:id-or-email/harness-login` `{harness: claude|codex, args?: [string]}` → `{account, home, command}`: the command `botctl user harness-login` runs ([ADR 0037](adr/0037-per-user-unix-accounts.md))
 
 Sign-ups ([ADR 0022](adr/0022-landing-and-signups.md)). Submitting and the config are public; the rest is admin only:
 
