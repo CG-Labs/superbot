@@ -6,7 +6,7 @@
 
 use crate::paths;
 use aws_lc_rs::hmac;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 /// Starts every per-Bot token, so a leaked one is easy to spot and redact.
@@ -81,9 +81,23 @@ pub fn migrate_workspace(root: &Path, owner: &str, data: &Path) -> io::Result<us
     }
     let marker = root.join(LAYOUT);
     let staging = root.join(STAGING);
+    let tmp = root.join(LAYOUT_TMP);
+    // Bots could write anything in the old shared workspace. botd never makes these
+    // paths links, so a link there is dropped rather than followed (into DATA_DIR, say).
+    for p in [&marker, &staging, &tmp] {
+        if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+            std::fs::remove_file(p)?;
+        }
+    }
     let mark = |state: &str| -> io::Result<()> {
-        let tmp = root.join(LAYOUT_TMP);
-        std::fs::write(&tmp, format!("{state}\n"))?;
+        match std::fs::remove_file(&tmp) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        f.write_all(format!("{state}\n").as_bytes())?;
+        f.sync_all()?;
+        drop(f);
         std::fs::rename(&tmp, &marker)
     };
     let state = std::fs::read_to_string(&marker).ok();
@@ -250,6 +264,31 @@ mod tests {
         std::fs::write(same.join("app.sqlite"), "db").unwrap();
         assert_eq!(migrate_workspace(&same, "operator", &same).unwrap(), 0);
         assert!(same.join("app.sqlite").is_file() && !same.join(LAYOUT).exists(), "DATA_DIR as the workspace: nothing moves");
+    }
+
+    #[test]
+    fn links_planted_in_the_old_workspace_are_never_followed() {
+        use std::os::unix::fs::symlink;
+        let root = crate::db::temp_path("ws-links");
+        let data = crate::db::temp_path("ws-links-data");
+        std::fs::write(data.join("app.sqlite"), "db").unwrap();
+        std::fs::write(root.join("notes.md"), "hi").unwrap();
+        symlink(data.join("app.sqlite"), root.join(LAYOUT_TMP)).unwrap();
+        symlink(&data, root.join(STAGING)).unwrap();
+        assert_eq!(migrate_workspace(&root, "operator", &data).unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(data.join("app.sqlite")).unwrap(), "db", "the database is untouched");
+        assert!(!data.join("notes.md").exists(), "nothing moved into DATA_DIR");
+        let owner = root.join("users/operator");
+        assert!(!std::fs::symlink_metadata(&owner).unwrap().file_type().is_symlink() && owner.join("notes.md").is_file());
+        assert_eq!(std::fs::read_to_string(root.join(LAYOUT)).unwrap().trim(), DONE);
+        assert!(!root.join(LAYOUT_TMP).exists());
+
+        let root = crate::db::temp_path("ws-link-marker");
+        std::fs::write(data.join("fake"), "per-user 1\n").unwrap();
+        std::fs::write(root.join("notes.md"), "hi").unwrap();
+        symlink(data.join("fake"), root.join(LAYOUT)).unwrap();
+        assert_eq!(migrate_workspace(&root, "operator", &data).unwrap(), 1, "a linked marker doesn't count");
+        assert_eq!(std::fs::read_to_string(data.join("fake")).unwrap(), "per-user 1\n");
     }
 
     #[test]
