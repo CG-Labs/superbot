@@ -15,10 +15,17 @@
 //! - `POST /v1/jobs/{id}/abort` `AbortRequest`.
 //! - `PUT /v1/harnesses` `HarnessPlan` (202): the harness CLIs to install (ADR 0039).
 //! - `POST /v1/upgrade` `UpgradeRequest` (202): replace the agent with botd's build.
+//! - `POST /v1/logins` `LoginRequest` -> a stream of `LoginEvent`s: a harness CLI's
+//!   login, run in a terminal on the machine (ADR 0041).
+//! - `POST /v1/logins/{id}/input` `LoginInput`, `POST /v1/logins/{id}/abort`.
+//! - `POST /v1/logins/forget` `ForgetRequest` -> `ForgetReply`: log a harness out.
+//! - `POST /v1/sync` `SyncManifest` -> `SyncPlan`: copy the user's folder (ADR 0041).
+//! - `PUT /v1/sync/{id}/blobs/{sha256}?offset=<n>` (bytes) -> `BlobReply`.
+//! - `POST /v1/sync/{id}/finish` -> `SyncReport`.
 //!
 //! Protocol 1 (`PROTOCOL`) is the first that runs Bots. A heartbeat without `protocol`
-//! is from an agent before it, which can't. Installs and upgrades are additions to it:
-//! an agent lists them in `can`.
+//! is from an agent before it, which can't. Installs, upgrades, logins and folder
+//! copies are additions to it: an agent lists them in `can`.
 
 // Shared by two binaries, each of which uses only part of it.
 #![allow(dead_code)]
@@ -76,6 +83,8 @@ pub struct MachineStatus {
 /// What an agent can do besides running jobs (`Heartbeat::can`).
 pub const CAN_HARNESSES: &str = "harnesses";
 pub const CAN_UPGRADE: &str = "upgrade";
+pub const CAN_LOGINS: &str = "logins";
+pub const CAN_SYNC: &str = "sync";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -113,6 +122,162 @@ pub struct Heartbeat {
     /// Its current or last self-upgrade.
     #[serde(default)]
     pub upgrade: Option<UpgradeReport>,
+    /// Each harness the heartbeat asked about with `cred=`, plus any logging in now.
+    #[serde(default)]
+    pub logins: BTreeMap<String, LoginStatus>,
+}
+
+/// Whether a harness is logged in on the machine: whether one of the credential files
+/// botd named exists. The agent never reads them.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginStatus {
+    /// `LOGGED_IN`, `LOGGED_OUT` or `LOGGING_IN` (a login is running, none saved yet).
+    pub state: String,
+    /// When the credential file last changed, if there is one.
+    pub since: Option<i64>,
+}
+
+pub const LOGGED_IN: &str = "logged_in";
+pub const LOGGED_OUT: &str = "logged_out";
+pub const LOGGING_IN: &str = "logging_in";
+
+/// Whether `p` can name a file in the agent's HOME: relative, plain parts only.
+pub fn home_path(p: &str) -> bool {
+    p.len() <= 1024
+        && !p.starts_with('/')
+        && p.split('/').all(|s| {
+            !s.is_empty()
+                && s != "."
+                && s != ".."
+                && s.len() <= 255
+                && s.chars().all(|c| !c.is_control() && c != '\\')
+        })
+}
+
+/// A harness CLI's own login, run by the agent in a terminal on the machine (ADR 0041).
+/// botd takes the command from the harness's adapter; the agent knows no harness.
+/// What the login saves stays on the machine.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoginRequest {
+    /// Chosen by botd; names the login for `input` and `abort`.
+    pub login_id: String,
+    /// One of `HARNESS_BINS`.
+    pub harness: String,
+    pub args: Vec<String>,
+    /// Where the login saves its credentials, relative to HOME (`home_path`).
+    pub files: Vec<String>,
+    pub timeout_secs: u64,
+}
+
+/// What a login stream carries, one per line.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum LoginEvent {
+    #[serde(rename_all = "camelCase")]
+    Started { login_id: String },
+    /// What the login wrote to its terminal, as it wrote it.
+    Output { text: String },
+    Ping,
+    Error { message: String },
+    /// It exited. `logged_in`: one of its credential files exists now.
+    #[serde(rename_all = "camelCase")]
+    Exit {
+        success: bool,
+        status: String,
+        logged_in: bool,
+    },
+}
+
+/// A line typed into a login: sent with Enter.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoginInput {
+    pub text: String,
+}
+
+/// Log a harness out: remove its credential files.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ForgetRequest {
+    pub harness: String,
+    pub files: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForgetReply {
+    pub removed: u32,
+}
+
+/// One file of the user's folder (ADR 0041). `path` is relative to the agent's HOME:
+/// `work/...` (their working folder), `USER.md`, or `bots/<id>/MEMORY.md`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SyncFile {
+    pub path: String,
+    pub size: u64,
+    /// Lowercase hex SHA-256 of its bytes.
+    pub sha256: String,
+    #[serde(default)]
+    pub exec: bool,
+    /// Written only if the machine has no file there: the user's facts and Bots'
+    /// memory, which jobs keep up to date (ADR 0036).
+    #[serde(default)]
+    pub seed: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SyncManifest {
+    /// Chosen by botd; names this copy in later calls.
+    pub sync_id: String,
+    pub files: Vec<SyncFile>,
+}
+
+/// The file contents the agent still needs, by SHA-256, and how many bytes of each it
+/// already holds from an earlier, interrupted copy.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncNeed {
+    pub sha256: String,
+    pub size: u64,
+    pub have: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncPlan {
+    pub sync_id: String,
+    pub need: Vec<SyncNeed>,
+}
+
+/// A chunk was taken (or, on 409, refused): the bytes of that blob the agent holds.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlobReply {
+    pub have: u64,
+    /// It is whole and its SHA-256 matched.
+    pub done: bool,
+}
+
+/// What a folder copy did. Nothing on the machine is ever deleted.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncReport {
+    pub sync_id: String,
+    /// Written, each checked against its SHA-256 before it was put in place.
+    pub copied: u64,
+    /// Already the same on the machine.
+    pub unchanged: u64,
+    /// Seeds written, and seeds left alone because the machine has its own.
+    pub seeded: u64,
+    pub kept: u64,
+    /// Changed on the machine since the last copy, so left as they are. Up to 50.
+    pub conflicts: Vec<String>,
+    pub conflict_count: u64,
+    pub bytes: u64,
 }
 
 /// The harness CLIs a machine should have (ADR 0039): pinned versions, each checked
