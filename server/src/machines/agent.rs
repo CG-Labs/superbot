@@ -247,6 +247,8 @@ impl Config {
             user_file: p(self.home.join("USER.md")),
             api: format!("http://{}", self.api_listen),
             botctl: runnable(&self.botctl, &self.roots()).then(|| p(self.botctl.clone())),
+            sandbox: Some(crate::sandbox::available()),
+            caches: crate::sandbox::caches(&self.home).into_iter().map(p).collect(),
         }
     }
 

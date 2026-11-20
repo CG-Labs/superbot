@@ -19,6 +19,8 @@ mod job;
 mod landing;
 #[path = "../machines/pki.rs"]
 mod pki;
+#[path = "../sandbox.rs"]
+mod sandbox;
 #[path = "../machines/runas.rs"]
 mod runas;
 #[path = "../machines/teammates.rs"]

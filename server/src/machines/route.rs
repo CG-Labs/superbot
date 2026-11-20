@@ -335,6 +335,8 @@ pub mod recording {
             user_file: "/home/bots/USER.md".into(),
             api: "http://127.0.0.1:7444".into(),
             botctl: Some("/usr/local/bin/botctl".into()),
+            sandbox: Some(true),
+            caches: vec!["/home/bots/.npm".into()],
         }
     }
 

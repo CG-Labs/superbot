@@ -3,7 +3,7 @@
 
 use crate::accounts::{self, Isolation, RunAs};
 use crate::acl::{Access, SharedBots, Viewer, Visibility};
-use crate::adapters::{self, AbortReason, AgentEvent, Guard, RunInput, Usage};
+use crate::adapters::{self, AbortReason, AgentEvent, Guard, RunInput, Sandbox, Usage};
 use crate::audit::{Actor, ActorKind, Event, Outcome, Who};
 use crate::db::{Bot, BotPatch, Db, Message, TokenRow};
 use crate::machines::ControlPlane;
@@ -39,6 +39,8 @@ pub struct Config {
     pub bot_key: String,
     pub run_timeout: Duration,
     pub default_harness: String,
+    /// Whether harness sandboxes can start on this server (`sandbox::available`).
+    pub sandbox_available: bool,
 }
 
 struct Run {
@@ -83,6 +85,43 @@ struct Spot {
     for_other: Option<String>,
     /// The teammate's own OS user the run is for on the machine (ADR 0048).
     teammate_user: Option<String>,
+    /// Whether harness sandboxes can start there (ADR 0055).
+    sandbox_ok: bool,
+    /// The run's HOME there, which a sandbox keeps read-only, and its package caches,
+    /// which it doesn't.
+    home: Option<PathBuf>,
+    caches: Vec<PathBuf>,
+}
+
+impl Spot {
+    /// The sandbox a run gets, and what the audit log says of it (ADR 0055).
+    fn sandbox(&self, wanted: bool, supported: bool) -> (Option<Sandbox>, &'static str) {
+        if !wanted {
+            return (None, "off");
+        }
+        if !supported {
+            return (None, "unsupported");
+        }
+        if !self.sandbox_ok {
+            return (None, "unavailable");
+        }
+        // Its memory and facts files' folders, never HOME itself (a machine keeps USER.md
+        // there). Someone else's run doesn't get the owner's facts (ADR 0046). Here each
+        // must exist; on a machine the job makes the memory folder.
+        let facts = self.for_other.is_none().then_some(&self.user_file);
+        let mut writable: Vec<PathBuf> = Vec::new();
+        for dir in [Some(&self.memory), facts].into_iter().flatten().filter_map(|p| p.parent()) {
+            let usable = !dir.as_os_str().is_empty()
+                && dir != self.cwd
+                && self.home.as_deref() != Some(dir)
+                && (self.machine.is_some() || dir.is_dir());
+            if usable && !writable.iter().any(|w| w == dir) {
+                writable.push(dir.to_path_buf());
+            }
+        }
+        writable.extend(self.caches.iter().cloned());
+        (Some(Sandbox { writable }), "on")
+    }
 }
 
 #[derive(Default)]
@@ -589,7 +628,7 @@ impl App {
             self.give_back_routine(&bot, msg);
             self.say(&bot.id, text, true);
         };
-        let Some((shell_tool, bin)) = adapters::get(&bot.harness).map(|a| (a.shell_tool(), a.bin())) else {
+        let Some((shell_tool, bin, has_sandbox)) = adapters::get(&bot.harness).map(|a| (a.shell_tool(), a.bin(), a.has_sandbox())) else {
             return cant_run(&format!("Unknown harness \"{}\".", bot.harness));
         };
         let Some(bot_dir) = self.bot_dir(&bot.id) else {
@@ -643,6 +682,13 @@ impl App {
         };
         let mut spot = self.spot(&bot, bot_dir.clone(), space, place, for_other.as_deref());
         spot.for_other = for_other.clone();
+        if spot.machine.is_none() {
+            spot.home = match &run_as {
+                Some(_) => self.isolation().and_then(|i| i.home(&bot.owner_id)),
+                None => std::env::var_os("HOME").map(PathBuf::from),
+            };
+            spot.caches = spot.home.as_deref().map(crate::sandbox::caches).unwrap_or_default();
+        }
         let screen_for = spot.teammate_user.as_ref().and(for_other.as_deref());
         if let Some(to) = spot.machine.clone()
             && let Some(env) = crate::machines::screens::for_run(self, &bot, screen_for, &to, &spot.state_dir).await
@@ -674,6 +720,7 @@ impl App {
             // that caps hook timeouts gets a shorter wait instead.
             let policy = self.db.effective_policy(&bot.id);
             let guard = (policy.mode == Mode::Ask).then(|| guard(&spot.botctl, &bot.harness, policy.timeout_minutes));
+            let (sandbox, sandboxed) = spot.sandbox(policy.sandbox, has_sandbox);
             let hooks = Arc::new(AtomicU32::new(0));
             self.state().entry(bot.id.clone()).or_default().run = Some(Run {
                 id: run_id.clone(),
@@ -706,7 +753,7 @@ impl App {
             }
             let mut invoked = json!({
                 "harness": bot.harness, "model": route.model, "effort": route.effort, "provider": route.provider, "tier": tier, "policy": policy.mode,
-                "guarded": guard.is_some(), "resumed": bot.session_id.is_some(), "attempt": attempt + 1,
+                "guarded": guard.is_some(), "sandbox": sandboxed, "resumed": bot.session_id.is_some(), "attempt": attempt + 1,
                 "trigger": msg.role, "messageId": msg.id, "runId": run_id,
             });
             merge(&mut invoked, &host);
@@ -732,6 +779,7 @@ impl App {
                 state_dir: spot.state_dir.clone(),
                 guard: guard.clone(),
                 run_as: run_as.clone(),
+                sandbox,
             };
 
             let mut errors: Vec<String> = Vec::new();
@@ -954,6 +1002,9 @@ impl App {
                 ctx: None,
                 for_other: None,
                 teammate_user: None,
+                sandbox_ok: self.cfg.sandbox_available,
+                home: None,
+                caches: vec![],
             },
             Place::There(there) => {
                 let (to, mut layout, teammate) = *there;
@@ -977,6 +1028,11 @@ impl App {
                     _ => None,
                 };
                 let state_dir = PathBuf::from(&layout.bots).join(&bot.id);
+                // The agent's caches are its own user's; a teammate's home has its own.
+                let caches = match teammate_user {
+                    Some(_) => vec![],
+                    None => layout.caches.iter().filter(|c| paths::under(&layout.home, c)).map(PathBuf::from).collect(),
+                };
                 Spot {
                     machine: Some(to),
                     cwd: PathBuf::from(&layout.workspace),
@@ -989,6 +1045,9 @@ impl App {
                     ctx: Some(Ctx { workspace: PathBuf::from(&layout.workspace), home: PathBuf::from(&layout.home) }),
                     for_other: None,
                     teammate_user,
+                    sandbox_ok: layout.sandbox.unwrap_or(true),
+                    home: Some(PathBuf::from(&layout.home)),
+                    caches,
                 }
             }
         }
@@ -1571,6 +1630,7 @@ pub fn test_app() -> Arc<App> {
             bot_key: crate::random_hex(16),
             run_timeout: Duration::from_secs(60),
             default_harness: "claude".into(),
+            sandbox_available: true,
         },
         None,
     )
@@ -1648,6 +1708,55 @@ mod tests {
         let g = guard(Path::new("/opt/botctl"), "hermes", 1);
         assert_eq!((g.wait, g.timeout_secs), (Duration::from_secs(120), 180));
         assert_eq!(tool_label("terminal", "ls"), "Running: ls");
+    }
+
+    fn spot_at(dir: &Path) -> Spot {
+        Spot {
+            machine: None,
+            cwd: dir.join("ws"),
+            state_dir: dir.join("bots/b1"),
+            memory: dir.join("bots/b1/MEMORY.md"),
+            user_file: dir.join("users/u1/USER.md"),
+            botctl: dir.join("botctl"),
+            env: HashMap::new(),
+            screens: false,
+            ctx: None,
+            for_other: None,
+            teammate_user: None,
+            sandbox_ok: true,
+            home: Some(dir.join("home")),
+            caches: vec![dir.join("home/.npm")],
+        }
+    }
+
+    #[test]
+    fn a_sandbox_writes_only_where_the_run_keeps_its_files() {
+        let dir = std::env::temp_dir().join(format!("spot-{}", crate::short_id()));
+        std::fs::create_dir_all(dir.join("bots/b1")).unwrap();
+        let mut spot = spot_at(&dir);
+        assert!(matches!(spot.sandbox(false, true), (None, "off")));
+        assert!(matches!(spot.sandbox(true, false), (None, "unsupported")));
+        // Facts folder missing here: Codex won't start with a writable folder that doesn't exist.
+        let (s, said) = spot.sandbox(true, true);
+        assert_eq!((s.unwrap().writable, said), (vec![dir.join("bots/b1"), dir.join("home/.npm")], "on"));
+        std::fs::create_dir_all(dir.join("users/u1")).unwrap();
+        assert_eq!(spot.sandbox(true, true).0.unwrap().writable[1], dir.join("users/u1"));
+        // Someone else's run never gets the owner's facts (ADR 0046).
+        spot.for_other = Some("u2".into());
+        assert!(!spot.sandbox(true, true).0.unwrap().writable.contains(&dir.join("users/u1")));
+        // Per-user accounts keep both files in one folder.
+        spot.for_other = None;
+        std::fs::create_dir_all(dir.join("mem")).unwrap();
+        (spot.memory, spot.user_file) = (dir.join("mem/b1.md"), dir.join("mem/USER.md"));
+        assert_eq!(spot.sandbox(true, true).0.unwrap().writable, [dir.join("mem"), dir.join("home/.npm")]);
+        // A machine keeps USER.md in HOME, which stays read-only.
+        spot.machine = Some(Assigned { machine_id: "m1".into(), user_id: "u1".into(), address: None, pins: vec![] });
+        (spot.memory, spot.user_file) = ("/home/bots/bots/b1/MEMORY.md".into(), "/home/bots/USER.md".into());
+        spot.home = Some("/home/bots".into());
+        assert_eq!(spot.sandbox(true, true).0.unwrap().writable, [PathBuf::from("/home/bots/bots/b1"), dir.join("home/.npm")]);
+        spot.sandbox_ok = false;
+        assert!(matches!(spot.sandbox(true, true), (None, "unavailable")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

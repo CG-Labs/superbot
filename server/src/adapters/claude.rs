@@ -12,6 +12,21 @@ pub struct Claude {
     model: Option<String>,
 }
 
+/// Claude Code's sandbox for Bash (ADR 0055): writes to the working folder, the temp
+/// folders, and `writable`. Its proxy refuses local addresses it isn't told about, so
+/// botd's API is listed for `botctl`; other hosts stay open, as permissions are skipped.
+/// No command may leave the sandbox. File tools and hooks run outside it, as in
+/// Claude Code itself.
+fn sandbox_settings(s: &super::Sandbox, api: Option<String>) -> Value {
+    let writable: Vec<String> = s.writable.iter().map(|p| p.display().to_string()).collect();
+    json!({
+        "enabled": true,
+        "allowUnsandboxedCommands": false,
+        "filesystem": { "allowWrite": writable },
+        "network": { "allowedDomains": api.into_iter().collect::<Vec<_>>() },
+    })
+}
+
 impl Adapter for Claude {
     fn bin(&self) -> &'static str {
         "claude"
@@ -28,10 +43,17 @@ impl Adapter for Claude {
         a.extend([if input.session_id.is_some() { "--resume" } else { "--session-id" }.into(), self.id.clone()]);
         // A PreToolUse deny holds even with --dangerously-skip-permissions. Flag settings
         // outrank project files, so a workspace `disableAllHooks` can't switch it off.
+        let mut settings = serde_json::Map::new();
         if let Some(g) = &input.guard {
             let hook = json!({ "type": "command", "command": g.command, "timeout": g.timeout_secs });
-            let settings = json!({ "disableAllHooks": false, "hooks": { "PreToolUse": [{ "matcher": "*", "hooks": [hook] }] } });
-            a.extend(["--settings".into(), settings.to_string()]);
+            settings.insert("disableAllHooks".into(), json!(false));
+            settings.insert("hooks".into(), json!({ "PreToolUse": [{ "matcher": "*", "hooks": [hook] }] }));
+        }
+        if let Some(s) = &input.sandbox {
+            settings.insert("sandbox".into(), sandbox_settings(s, super::api_host(input)));
+        }
+        if !settings.is_empty() {
+            a.extend(["--settings".into(), Value::Object(settings).to_string()]);
         }
         if let Some(m) = &input.model {
             a.extend(["--model".into(), m.clone()]);
@@ -83,6 +105,10 @@ impl Adapter for Claude {
     /// Update it when Anthropic ships new models.
     fn shell_tool(&self) -> &'static str {
         "Bash"
+    }
+
+    fn has_sandbox(&self) -> bool {
+        true
     }
 
     fn login_args(&self) -> Option<&'static [&'static str]> {

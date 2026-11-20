@@ -42,9 +42,30 @@ pub fn child(root: &Path, name: &str) -> Option<PathBuf> {
     if p.starts_with(root) && p.parent() == Some(root) { Some(p) } else { None }
 }
 
+/// Whether `path`, as another computer reported it, names something strictly under
+/// its absolute folder `root`, with no `.` or `..` parts on the way.
+pub fn under(root: &str, path: &str) -> bool {
+    let root = Path::new(root);
+    root.is_absolute()
+        && Path::new(path).strip_prefix(root).is_ok_and(|rest| {
+            rest.components().next().is_some() && rest.components().all(|c| matches!(c, Component::Normal(_)))
+        })
+        && !path.contains("/./")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn under_stays_strictly_inside() {
+        assert!(under("/home/bots", "/home/bots/.npm"));
+        assert!(under("/home/bots", "/home/bots/.cargo/registry"));
+        for bad in ["/home/bots", "/home/bots/", "/home/bots/../etc", "/home/bots/./x", "/home/botsx/.npm", "relative/.npm", "/etc"] {
+            assert!(!under("/home/bots", bad), "{bad}");
+        }
+        assert!(!under("relative", "relative/x"));
+    }
 
     #[test]
     fn child_keeps_plain_names_inside_the_root() {

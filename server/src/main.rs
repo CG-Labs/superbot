@@ -59,6 +59,7 @@ mod rbac;
 #[cfg(test)]
 mod run_grants_http_tests;
 mod runner;
+mod sandbox;
 mod scim;
 #[cfg(test)]
 mod scim_http_tests;
@@ -243,6 +244,7 @@ async fn main() {
         bot_key: bot_key.clone(),
         run_timeout: Duration::from_secs(60 * env("RUN_TIMEOUT_MINUTES", "60").parse::<u64>().unwrap_or(60)),
         default_harness,
+        sandbox_available: sandbox::available(),
     }, screens);
     let _ = app.tiers.set(Arc::new(tiers));
     println!("Tiers: {}.", app.tiers().describe());
@@ -3053,6 +3055,7 @@ mod tests {
             bot_key: "bot-key".into(),
             run_timeout: Duration::from_secs(60),
             default_harness: "claude".into(),
+            sandbox_available: true,
         }, None);
         users::ensure_operator(&app.db, "Owner", None);
         let bot = app.db.create_bot("Tester", "#f5f5f5", "waddle", "claude", None, true);
