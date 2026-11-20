@@ -1630,6 +1630,30 @@ impl Db {
             .unwrap();
     }
 
+    /// The onboarding wizard's progress (ADR 0034).
+    pub fn setup_progress(&self) -> crate::setup::Progress {
+        Self::read_setup(&self.c())
+    }
+
+    fn read_setup(c: &Connection) -> crate::setup::Progress {
+        let v: Option<String> = c.query_row("SELECT value FROM settings WHERE key = 'setup'", [], |r| r.get(0)).optional().ok().flatten();
+        v.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    }
+
+    /// Changes the progress under one lock, so concurrent saves of different fields don't
+    /// undo each other. Returns it before and after; nothing is written when `f` fails.
+    pub fn update_setup_progress<E>(&self, f: impl FnOnce(&mut crate::setup::Progress) -> Result<(), E>) -> Result<(crate::setup::Progress, crate::setup::Progress), E> {
+        let c = self.c();
+        let before = Self::read_setup(&c);
+        let mut after = before.clone();
+        f(&mut after)?;
+        if after != before {
+            c.execute("INSERT INTO settings (key, value) VALUES ('setup', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1", [serde_json::to_string(&after).unwrap()])
+                .unwrap();
+        }
+        Ok((before, after))
+    }
+
     pub fn bot_override(&self, bot_id: &str) -> Option<Override> {
         let v: Option<String> = self.c().query_row("SELECT policy FROM bot_policies WHERE bot_id = ?", [bot_id], |r| r.get(0)).optional().ok().flatten();
         v.and_then(|s| serde_json::from_str(&s).ok())

@@ -32,6 +32,9 @@ mod scim;
 mod scim_http_tests;
 mod screen;
 mod secrets;
+mod setup;
+#[cfg(test)]
+mod setup_http_tests;
 mod shell;
 mod signups;
 #[cfg(test)]
@@ -352,6 +355,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/me/tier", get(my_tier))
         .route("/tiers", get(list_tiers))
+        .route("/setup", get(setup::status).patch(setup::update))
         .route("/me/secrets", get(list_my_secrets))
         .route("/me/secrets/{name}", put(put_my_secret).delete(delete_my_secret))
         .route("/ask", post(ask))

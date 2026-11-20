@@ -53,12 +53,12 @@ function closeOnce() {
   $("once-value").textContent = "";
   $("once-copy-link").dataset.link = "";
 }
-async function copy(text, done) {
+async function copy(text, done, shown = $("once-value")) {
   try {
     await navigator.clipboard.writeText(text);
     notice(done, false);
   } catch {
-    getSelection().selectAllChildren($("once-value"));
+    getSelection().selectAllChildren(shown);
     notice("Copy isn't available here. The value is selected; copy it yourself.");
   }
 }
@@ -581,9 +581,248 @@ $("scim-rows").addEventListener("click", async (e) => {
   loadScim();
 });
 
+// Setup: the onboarding wizard (ADR 0034). The server reports what's set up. This page saves
+// where you are, SSO secrets (secrets API), and the approval mode (policy API); settings botd
+// reads at startup come back as commands and .env lines to copy.
+
+const SETUP_STEPS = { domain: "Domain", signin: "Sign-in", tiers: "Plans", finish: "Finish" };
+// `seq` numbers requests; only the newest one's reply is used, so a slow reply can't move
+// the page back to an older step.
+const setup = { data: null, step: "domain", template: "", copies: [], seq: 0 };
+
+async function loadSetup() {
+  const seq = ++setup.seq;
+  try {
+    const data = await api("GET", "/api/setup");
+    if (seq !== setup.seq) return;
+    setup.data = data;
+    setup.step = data.progress.step;
+    $("setup-empty").hidden = true;
+  } catch (err) {
+    if (seq !== setup.seq) return;
+    setup.data = null;
+    $("setup-empty").textContent = err.message;
+    $("setup-empty").hidden = false;
+  }
+  renderSetup();
+}
+
+async function saveSetup(body) {
+  const seq = ++setup.seq;
+  try {
+    const data = await api("PATCH", "/api/setup", body);
+    if (seq !== setup.seq) return;
+    setup.data = data;
+    setup.step = data.progress.step;
+  } catch (err) {
+    fail(err);
+  }
+  if (seq === setup.seq) renderSetup();
+}
+
+// Shows the step at once and saves it in the background. The reply redraws the step only
+// if the server's state changed meanwhile and nothing has been typed into it yet.
+async function goSetup(step) {
+  setup.step = step;
+  renderSetup();
+  const seq = ++setup.seq;
+  try {
+    const data = await api("PATCH", "/api/setup", { step });
+    if (seq !== setup.seq) return;
+    const changed = setupState(setup.data) !== setupState(data);
+    setup.data = data;
+    const typed = [...$("setup-body").querySelectorAll("textarea")].some((t) => t.value);
+    if (changed && !typed) renderSetup();
+    else renderSetupHead();
+  } catch (err) {
+    fail(err);
+  }
+}
+
+const setupState = (s) => JSON.stringify(s && { ...s, progress: { ...s.progress, step: null } });
+
+// Open checklist items on the tab while admins are still sent here.
+function setupCount(s) {
+  $("setup-count").textContent = s?.progress?.show ? s.total - s.done || "" : "";
+}
+
+function copyBlock(text) {
+  const i = setup.copies.push(text) - 1;
+  return `<div class="cmd"><pre>${esc(text)}</pre><button type="button" class="btn" data-copy="${i}">Copy</button></div>`;
+}
+const howto = (steps) => steps.map((s) => `<div class="howto"><h3>${esc(s.title)}</h3><p class="hint">${esc(s.text)}</p>${s.commands.length ? copyBlock(s.commands.join("\n")) : ""}</div>`).join("");
+const verdict = (ok, text) => `<p class="verdict ${ok ? "good" : "todo"}">${ok ? "✓" : "!"} ${esc(text)}</p>`;
+
+function setupDomain(d) {
+  return verdict(d.ok, d.detail)
+    + (d.publicUrl ? `<p>Public address: <code>${esc(d.publicUrl)}</code></p>` : "")
+    + `<h2>Set the domain</h2><p class="hint">botd and Caddy read it at startup, so run these on the server. This page can't change them.</p>`
+    + howto(d.instructions);
+}
+
+const providerRow = (p) => `<tr>
+    <td>${esc(p.label)}<div class="sub">${esc(p.id)} · ${esc(p.type)}${p.jitRole ? ` · new people join as ${esc(ROLES[p.jitRole] || p.jitRole)}` : ""}</div></td>
+    <td>${p.ready ? "Ready" : `<span class="warn-text">${esc(p.problem || "Not ready")}</span>`}</td>
+    <td>${copyBlock(p.callbackUrl)}</td>
+    <td>${p.secretSavable === false ? envSecret(p.secret) : secretForm(p)}</td>
+  </tr>`;
+const secretForm = (p) => `<form class="secret-inline" data-secret="${esc(p.secret)}" autocomplete="off">
+    <textarea rows="1" placeholder="${esc(p.secret)}" required spellcheck="false" autocomplete="off"></textarea>
+    <button type="submit" class="btn">${p.ready ? "Replace" : "Save"}</button>
+  </form>`;
+// botd's environment wins over a saved value, so saving here would change nothing.
+const envSecret = (name) => `<span class="sub">Set by <code>${esc(name)}</code> (or <code>${esc(name)}_FILE</code>) in botd's environment. To change it, edit .env and restart botd.</span>`;
+
+function setupSignIn(s) {
+  const providers = s.providers.length
+    ? `<table class="grid"><thead><tr><th>Provider</th><th>State</th><th>Redirect URI to register at the IdP</th><th>Secret</th></tr></thead>
+      <tbody>${s.providers.map(providerRow).join("")}</tbody></table>
+      <p class="hint">Secrets saved here go to the server's secrets store and take effect at once, no restart. They're never shown again.</p>`
+    : "";
+  const admins = s.admins.length
+    ? `<p>Admins besides the owner: ${s.admins.map((a) => esc(a.name || a.email || a.id)).join(", ")}.</p>`
+    : `<p class="warn">Only the break-glass owner is an admin. <a href="#users">Add a second admin in Users</a> so you aren't locked out if the password is lost or turned off.</p>`;
+  const glass = s.breakGlass ? "Break-glass password sign-in at /login is on." : "Break-glass password sign-in is off.";
+  const extra = [glass, s.scim ? "SCIM provisioning is on." : "", s.signups ? "People can request access." : ""].filter(Boolean).join(" ");
+  const pick = s.templates.find((t) => t.id === setup.template) || s.templates.find((t) => !t.configured) || s.templates[0];
+  setup.template = pick.id;
+  const template = `<h2>Add a provider</h2>
+    <div class="bar"><label>Provider <select id="setup-template">${s.templates.map((t) => `<option value="${esc(t.id)}" ${t.id === pick.id ? "selected" : ""}>${esc(t.label)}${t.configured ? " (set up)" : ""}</option>`).join("")}</select></label></div>
+    <p class="hint">1. Register SuperBot at the provider (see ${esc(pick.docs)}) with this redirect URI:</p>${copyBlock(pick.callbackUrl)}
+    <p class="hint">2. Add these lines to .env, filling in the &lt;placeholders&gt;:</p>${copyBlock(pick.env)}
+    <p class="hint">3. Restart botd (below). 4. The provider then shows up on this page: save its secret, <code>${esc(pick.secret)}</code>, there.</p>
+    ${howto(s.restart)}`;
+  return verdict(s.ok, s.detail) + providers + `<h2>Admins</h2>${admins}<p class="hint">${esc(extra)}</p>` + template;
+}
+
+function limitsText(l) {
+  const n = (v) => Number(v).toLocaleString();
+  return [l?.maxBots != null && `${n(l.maxBots)} Bots`, l?.monthlyRuns != null && `${n(l.monthlyRuns)} runs a month`, l?.monthlyTokens != null && `${n(l.monthlyTokens)} tokens a month (not enforced yet)`]
+    .filter(Boolean).join(" · ") || "No limits";
+}
+
+function setupTiers(t) {
+  const rows = t.tiers.map((x) => `<tr>
+      <td>${esc(x.label)}<div class="sub">${esc(x.name)}${x.name === t.default ? " · default" : ""}</div></td>
+      <td>${x.managed ? "Set harnesses and models" : "Any harness and model"}</td>
+      <td>${esc(limitsText(x.limits))}</td>
+    </tr>`).join("");
+  return verdict(true, t.detail)
+    + `<table class="grid"><thead><tr><th>Plan</th><th>Harnesses and models</th><th>Limits</th></tr></thead><tbody>${rows}</tbody></table>`
+    + `<h2>${t.fileLoaded ? "Change the plans" : "Sell plans or set limits"}</h2><p class="hint">botd reads the tiers file at startup. Skip this to keep the open self-host tier.</p>`
+    + howto(t.instructions);
+}
+
+function setupFinish(s) {
+  const fix = (c) => {
+    if (c.done) return "";
+    if (c.id === "admin") return '<a class="btn" href="#users">Open Users</a>';
+    if (c.id === "approvals") return '<button type="button" class="btn" data-act="approvals">Turn approvals on</button>';
+    return c.id in SETUP_STEPS ? `<button type="button" class="btn" data-go="${esc(c.id)}">Go to ${esc(SETUP_STEPS[c.id])}</button>` : "";
+  };
+  const row = (c) => `<li class="${c.done ? "good" : "todo"}">
+      <div><b>${c.done ? "✓" : "○"} ${esc(c.label)}</b><span class="sub">${esc(c.detail)}</span></div>${fix(c)}
+    </li>`;
+  const list = `<ul class="checklist">${s.checklist.map(row).join("")}</ul>`;
+  const p = s.progress;
+  if (p.completedAt) {
+    const by = p.completedBy === me.user?.id ? "you" : s.signIn.admins.find((a) => a.id === p.completedBy)?.name;
+    return list + verdict(true, `Setup was finished ${fmt(p.completedAt)}${by ? ` by ${by}` : ""}.`)
+      + '<div class="bar"><button type="button" class="btn" data-act="reopen">Reopen setup</button></div>';
+  }
+  const open = s.total - s.done;
+  return list + `<p class="hint">${open ? `${open} item${open === 1 ? " is" : "s are"} still open. You can finish anyway and come back to them.` : "Everything is set."} Finishing stops sending admins here; the Setup tab stays.</p>`
+    + '<div class="bar"><button type="button" class="btn primary" data-act="finish">Finish setup</button></div>';
+}
+
+function renderSetup() {
+  const s = setup.data;
+  setup.copies = [];
+  $("setup-body").innerHTML = "";
+  renderSetupHead();
+  if (!s) return;
+  const view = { domain: () => setupDomain(s.domain), signin: () => setupSignIn(s.signIn), tiers: () => setupTiers(s.tiers), finish: () => setupFinish(s) }[setup.step];
+  $("setup-body").innerHTML = view ? view() : "";
+}
+
+// Everything but the step's own content: the count, the step buttons, and the controls.
+function renderSetupHead() {
+  const s = setup.data;
+  setupCount(s);
+  $("setup-steps").innerHTML = "";
+  for (const id of ["setup-hide", "setup-unhide", "setup-back", "setup-next"]) $(id).hidden = true;
+  $("setup-state").textContent = "";
+  if (!s) return;
+  const done = (id) => (id === "finish" ? !!s.progress.completedAt : s.checklist.find((c) => c.id === id)?.done);
+  $("setup-steps").innerHTML = s.steps.map((id, i) => `<button type="button" class="step ${id === setup.step ? "on" : ""}" data-step="${esc(id)}" ${id === setup.step ? 'aria-current="step"' : ""}>
+      <span class="n">${done(id) ? "✓" : i + 1}</span>${esc(SETUP_STEPS[id] || id)}</button>`).join("");
+  const i = s.steps.indexOf(setup.step);
+  $("setup-back").hidden = i <= 0;
+  $("setup-next").hidden = i < 0 || i >= s.steps.length - 1;
+  const p = s.progress;
+  $("setup-state").textContent = p.completedAt ? "Finished." : p.dismissed ? "Hidden: admins aren't sent here." : `${s.done} of ${s.total} done.`;
+  $("setup-hide").hidden = !p.show;
+  $("setup-unhide").hidden = !(p.dismissed && !p.completedAt);
+}
+
+$("setup-steps").addEventListener("click", (e) => {
+  const t = e.target.closest("button[data-step]");
+  if (t) goSetup(t.dataset.step);
+});
+$("setup-back").addEventListener("click", () => goSetup(setup.data.steps[setup.data.steps.indexOf(setup.step) - 1]));
+$("setup-next").addEventListener("click", () => goSetup(setup.data.steps[setup.data.steps.indexOf(setup.step) + 1]));
+$("setup-hide").addEventListener("click", async () => {
+  await saveSetup({ dismissed: true });
+  if (setup.data?.progress.dismissed) {
+    notice("Setup is hidden. It's still under the Setup tab.", false);
+    location.hash = "users";
+  }
+});
+$("setup-unhide").addEventListener("click", () => saveSetup({ dismissed: false }));
+
+$("setup-body").addEventListener("click", async (e) => {
+  const c = e.target.closest("button[data-copy]");
+  if (c) return copy(setup.copies[+c.dataset.copy], "Copied.", c.previousElementSibling);
+  const g = e.target.closest("button[data-go]");
+  if (g) return goSetup(g.dataset.go);
+  const t = e.target.closest("button[data-act]");
+  if (!t) return;
+  t.disabled = true;
+  if (t.dataset.act === "approvals") {
+    try { await api("PUT", "/api/policy", { mode: "ask" }); } catch (err) { fail(err); }
+    return loadSetup();
+  }
+  if (t.dataset.act === "finish") {
+    await saveSetup({ completed: true });
+    if (setup.data?.progress.completedAt) notice("Setup is finished. You can reopen it from the Setup tab.", false);
+  }
+  if (t.dataset.act === "reopen") await saveSetup({ completed: false, step: "domain" });
+});
+
+$("setup-body").addEventListener("change", (e) => {
+  if (e.target.id !== "setup-template") return;
+  setup.template = e.target.value;
+  renderSetup();
+});
+
+$("setup-body").addEventListener("submit", async (e) => {
+  const f = e.target.closest("form[data-secret]");
+  if (!f) return;
+  e.preventDefault();
+  const name = f.dataset.secret;
+  try {
+    const r = await api("PUT", `/api/secrets/${key(name)}`, { value: f.querySelector("textarea").value });
+    if (r.secret?.shadowedBy) notice(`Saved ${name}, but botd's environment sets it too, and that value still wins. Remove ${name} (and ${name}_FILE) from .env and restart botd.`);
+    else notice(`Saved ${name}.`, false);
+  } catch (err) {
+    fail(err);
+  }
+  loadSetup();
+});
+
 // Tabs, from the address bar's #fragment so a reload keeps your place.
 
-const TABS = { users: loadUsers, requests: loadRequests, machines: loadMachines, audit: () => loadAudit(), settings: loadSettings };
+const TABS = { users: loadUsers, requests: loadRequests, machines: loadMachines, audit: () => loadAudit(), settings: loadSettings, setup: loadSetup };
 
 function showTab() {
   const name = location.hash.slice(1);
@@ -604,6 +843,10 @@ async function start() {
   me = await api("GET", "/api/auth/me");
   if (!(me.permissions || []).includes("admin")) return location.replace("/app/");
   $("me-name").textContent = me.user?.name || "";
+  // Admins land on the setup wizard until someone finishes or hides it.
+  const s = await api("GET", "/api/setup").catch(() => null);
+  setupCount(s);
+  if (!location.hash && s?.progress?.show) history.replaceState(null, "", "#setup");
   showTab();
   refreshRequestCount();
 }

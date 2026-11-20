@@ -248,6 +248,14 @@ export interface AuditPage {
   nextBefore: number | null;
 }
 
+/** `GET /api/setup` (admins, ADR 0034): the parts the client uses. The wizard itself is in the console. */
+export interface SetupStatus {
+  progress: { step: string; show: boolean; dismissed: boolean; completedAt: number | null };
+  checklist: { id: string; label: string; done: boolean; detail: string }[];
+  done: number;
+  total: number;
+}
+
 /** `/api/state` `me`. Servers from before ADR 0012 send only the name. */
 export interface Me {
   name: string;
