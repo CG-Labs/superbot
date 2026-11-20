@@ -119,6 +119,9 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         ("GET", ["me", "secrets"]) => Read,
         // Your own plan (ADR 0033). Every tier with its models is `tiers`, for admins.
         ("GET", ["me", "tier"]) => Read,
+        // Your own plan, and buying or managing it (ADR 0042). Handlers refuse Bots.
+        ("GET", ["billing"]) => Read,
+        ("POST", ["billing", "checkout" | "portal"]) => Write,
         ("PUT" | "DELETE", ["me", "secrets", _]) => Write,
 
         ("GET", ["state" | "events" | "bots" | "policy"]) => Read,
@@ -242,6 +245,12 @@ mod tests {
             ("GET", "/api/tiers", Perm::Admin),
             // Everyone's plan and use, against their limits (ADR 0040).
             ("GET", "/api/usage", Perm::Admin),
+            // Your own plan's checkout and billing portal (ADR 0042).
+            ("GET", "/api/billing", Perm::Read),
+            ("POST", "/api/billing/checkout", Perm::Write),
+            ("POST", "/api/billing/portal", Perm::Write),
+            ("POST", "/api/billing", Perm::Admin),
+            ("GET", "/api/billing/checkout", Perm::Admin),
             // The onboarding wizard (ADR 0034): what the server has set up, and its progress.
             ("GET", "/api/setup", Perm::Admin),
             ("PATCH", "/api/setup", Perm::Admin),

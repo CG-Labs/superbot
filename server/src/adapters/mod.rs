@@ -68,8 +68,8 @@ pub struct Guard {
 
 /// Server secrets the harness (and everything it runs) must not inherit, or a Bot
 /// could approve its own actions, read what botd seals, or copy the license key or
-/// forge Stripe's webhook.
-pub(crate) const SECRET_ENV: [&str; 10] = [
+/// forge Stripe's webhook or call Stripe's API.
+pub(crate) const SECRET_ENV: [&str; 12] = [
     "AUTH_PASSWORD",
     "AUTH_PASSWORD_FILE",
     "SUPERBOT_PASSWORD",
@@ -80,6 +80,8 @@ pub(crate) const SECRET_ENV: [&str; 10] = [
     "LICENSE_KEY_FILE",
     "STRIPE_WEBHOOK_SECRET",
     "STRIPE_WEBHOOK_SECRET_FILE",
+    "STRIPE_SECRET_KEY",
+    "STRIPE_SECRET_KEY_FILE",
 ];
 
 /// `SECRET_ENV`, `secrets::SERVER_SECRETS` (and their `_FILE`), and every `SSO_*`
@@ -149,7 +151,7 @@ pub trait Adapter: Send {
     fn login_args(&self) -> Option<&'static [&'static str]> {
         None
     }
-    /// How the harness logs in on a user's machine (ADR 0041), if it has a login there.
+    /// How the harness logs in on a user's machine (ADR 0042), if it has a login there.
     fn machine_login(&self) -> Option<MachineLogin> {
         None
     }
@@ -465,7 +467,7 @@ mod tests {
         let mut cmd = std::process::Command::new("true");
         super::strip_secret_env(&mut cmd);
         let removed: Vec<_> = cmd.get_envs().filter(|(_, v)| v.is_none()).map(|(k, _)| k.to_string_lossy().into_owned()).collect();
-        for k in ["AUTH_PASSWORD", "SUPERBOT_MASTER_KEY_FILE", "LINODE_TOKEN", "LINODE_TOKEN_FILE", "TURNSTILE_SECRET", "TURNSTILE_SECRET_FILE", "LICENSE_KEY", "LICENSE_KEY_FILE", "STRIPE_WEBHOOK_SECRET", "STRIPE_WEBHOOK_SECRET_FILE"] {
+        for k in ["AUTH_PASSWORD", "SUPERBOT_MASTER_KEY_FILE", "LINODE_TOKEN", "LINODE_TOKEN_FILE", "TURNSTILE_SECRET", "TURNSTILE_SECRET_FILE", "LICENSE_KEY", "LICENSE_KEY_FILE", "STRIPE_WEBHOOK_SECRET", "STRIPE_WEBHOOK_SECRET_FILE", "STRIPE_SECRET_KEY", "STRIPE_SECRET_KEY_FILE"] {
             assert!(removed.iter().any(|r| r == k), "{k}");
         }
     }
