@@ -15,7 +15,7 @@ describe("plan usage", () => {
       "Bots: 3 of 2",
       "Runs in 2026-11: 12 of 300",
       "Routine runs today (UTC): 4 of 24",
-      "Machine size: g6-standard-1",
+      "Machine size on this plan: g6-standard-1",
     ]);
     expect(overLimits(starter)).toEqual(["Bots"]);
   });

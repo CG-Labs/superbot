@@ -169,7 +169,7 @@ describe("UsersAdmin", () => {
     expect(screen.getByText("Plan and usage")).toBeOnTheScreen();
     expect(screen.getByText("Starter")).toBeOnTheScreen();
     expect(screen.getByText("Routine runs today (UTC): 4 of 24")).toBeOnTheScreen();
-    expect(screen.getByText("Machine size: g6-standard-1")).toBeOnTheScreen();
+    expect(screen.getByText("Machine size on this plan: g6-standard-1")).toBeOnTheScreen();
     expect(screen.getByText(/Over the plan's limit for Bots/)).toBeOnTheScreen();
   });
 

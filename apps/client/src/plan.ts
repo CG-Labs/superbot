@@ -9,7 +9,7 @@ export function planUsageLines(plan: PlanUsage): string[] {
   const { limits: l, usage: u } = plan;
   const lines = [`Bots: ${of(u.bots, l.maxBots)}`, `Runs in ${u.period}: ${of(u.runs, l.monthlyRuns)}`];
   if (u.day != null) lines.push(`Routine runs today (UTC): ${of(u.routineRuns, l.dailyRoutineRuns)}`);
-  if (l.machineType) lines.push(`Machine size: ${l.machineType}`);
+  if (l.machineType) lines.push(`Machine size on this plan: ${l.machineType}`);
   return lines;
 }
 
