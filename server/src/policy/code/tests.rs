@@ -331,6 +331,11 @@ fn review_findings_ask() {
     // Compiled code given to an interpreter asks.
     std::fs::write(ws.dir.join("payload.pyc"), b"\x6f\x0d\x0d\x0a\0\0\0\0").unwrap();
     assert!(ws.reasons("python3 payload.pyc").contains("compiled code SuperBot can't read"));
+    // A command naming a huge number of files is checked quickly.
+    let names: Vec<String> = (0..100_000).map(|i| format!("f{i:06}")).collect();
+    let started = std::time::Instant::now();
+    ws.found(&format!("sort {}", names.join(" ")));
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "took {:?}", started.elapsed());
 }
 
 #[test]

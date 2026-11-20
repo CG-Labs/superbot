@@ -315,9 +315,7 @@ impl Level<'_> {
                 continue;
             }
             w.reads += 1;
-            if !w.ran.contains(&base) {
-                w.ran.push(base.clone());
-            }
+            w.ran.insert(base.clone());
             let source = scripts::read(&self.ctx.workspace, &place);
             missing |= matches!(source, Source::Missing);
             found |= !matches!(source, Source::Missing);
@@ -518,9 +516,7 @@ fn note_named(named: Vec<String>, w: &mut Walk, out: &mut Out) {
         if w.ran.contains(&n) {
             out.push(("shell_destructive", format!("May change {n}, which this call also runs, so SuperBot can't check what will run")));
         }
-        if !w.changed.contains(&n) {
-            w.changed.push(n);
-        }
+        w.changed.insert(n);
     }
 }
 

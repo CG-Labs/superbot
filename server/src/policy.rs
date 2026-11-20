@@ -11,7 +11,7 @@ mod code;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use crate::shell::{self, Word};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -633,16 +633,16 @@ struct Walk {
     /// Script files read so far, counting the same file read again.
     reads: usize,
     /// Names of the script files read so far.
-    ran: Vec<String>,
+    ran: HashSet<String>,
     /// Names of files something in the call may change, and whether it writes to a path
-    /// only known when it runs.
-    changed: Vec<String>,
+    /// only known when it runs. Sets, since one command line can name 100,000 files.
+    changed: HashSet<String>,
     wild_writes: bool,
 }
 
 impl Walk {
     fn new() -> Walk {
-        Walk { budget: shell::MAX_TOTAL, files: Vec::new(), reads: 0, ran: Vec::new(), changed: Vec::new(), wild_writes: false }
+        Walk { budget: shell::MAX_TOTAL, files: Vec::new(), reads: 0, ran: HashSet::new(), changed: HashSet::new(), wild_writes: false }
     }
 }
 
