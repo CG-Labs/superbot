@@ -97,5 +97,5 @@ Bot views add `runsOn` (`server`, `machine` or `nowhere`, when routing isn't off
 - **Per-run tokens**, so a token names the run's person, not only the Bot, and the cap needs no saved state.
 - **A session per person**, so a teammate's chat with a shared Bot carries on between messages; today each teammate's run starts fresh.
 - **Owner approval for risky steps in teammates' runs**, whatever the Bot's approval mode.
-- **Open servers**: a disabled owner's shared Bots still run there (and stay a SCIM-05 follow-up).
+- **Open servers**: a disabled owner's shared Bots still run there for chat. Their routines are paused on every server since [ADR 0047](0047-disabled-users-routines.md), which also replaces "a firing routine says so once" for disabled owners.
 - The event stream re-checks access every few seconds, so a cap takes up to that long to apply to an open stream.

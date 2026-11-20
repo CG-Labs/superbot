@@ -89,5 +89,5 @@ The approval policy counts the owner's folder as the workspace, so a delete in a
 - **Per-user screens.** Screens are per Bot and gated by ACL; the X displays share one account.
 - **The machine agent.** Enrollment and mutual TLS are done ([ADR 0031](0031-machine-enrollment-mtls.md)); next, the run protocol behind `MachineLink`, then moving each user's folders, memory and logins onto their machine (#29).
 - **Shared team Bots.** They run on their owner's computer. A team-owned computer is a later decision.
-- **SCIM-05.** A disabled user's Bot can't use the API (its token can do nothing), but its routines still run; pausing or handing them over is open.
+- **SCIM-05.** A disabled user's Bot can't use the API (its token can do nothing). Its routines are paused, and can be handed over, since [ADR 0047](0047-disabled-users-routines.md).
 - **Client UI** for `/api/me/secrets`: done, the client's Your secrets screen ([ADR 0044](0044-client-personal-secrets.md)).
