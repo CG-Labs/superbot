@@ -55,6 +55,34 @@ pub struct Tools {
     saved: Mutex<Saved>,
     wake: tokio::sync::Notify,
     http: reqwest::Client,
+    /// Jobs that may be using the tools, and whether an install is replacing some.
+    gate: Mutex<Gate>,
+    gate_open: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct Gate {
+    jobs: usize,
+    replacing: bool,
+}
+
+/// A job's hold on the tools: nothing it may be using is replaced until it is dropped.
+pub struct JobPermit(Arc<Tools>);
+
+impl Drop for JobPermit {
+    fn drop(&mut self) {
+        self.0.gate().jobs -= 1;
+        self.0.gate_open.notify_waiters();
+    }
+}
+
+/// An install's hold on the tools: no job starts until it is dropped.
+struct Replacing<'a>(&'a Tools);
+
+impl Drop for Replacing<'_> {
+    fn drop(&mut self) {
+        self.0.gate().replacing = false;
+    }
 }
 
 /// A plain token: what versions and names may be.
@@ -202,6 +230,8 @@ impl Tools {
             saved: Mutex::new(saved),
             wake: tokio::sync::Notify::new(),
             http: b.build().map_err(|e| e.to_string())?,
+            gate: Mutex::default(),
+            gate_open: tokio::sync::Notify::new(),
         });
         // An install a restart cut short starts again.
         {
@@ -217,6 +247,45 @@ impl Tools {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Saved> {
         self.saved.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn gate(&self) -> std::sync::MutexGuard<'_, Gate> {
+        self.gate.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Lets a job start, unless an install is replacing harness files right now.
+    pub fn job_permit(self: &Arc<Self>) -> Option<JobPermit> {
+        let mut g = self.gate();
+        if g.replacing {
+            return None;
+        }
+        g.jobs += 1;
+        Some(JobPermit(self.clone()))
+    }
+
+    /// Waits until no job is running, then keeps new ones from starting.
+    async fn replacing(&self) -> Replacing<'_> {
+        loop {
+            let open = self.gate_open.notified();
+            tokio::pin!(open);
+            open.as_mut().enable();
+            {
+                let mut g = self.gate();
+                if g.jobs == 0 {
+                    g.replacing = true;
+                    return Replacing(self);
+                }
+            }
+            open.await;
+        }
+    }
+
+    /// Whether installing `h` replaces files a running job may use: an installed
+    /// harness, or the Node.js npm harnesses run on.
+    fn replaces(&self, h: &HarnessInstall, node: Option<&NodeRuntime>) -> bool {
+        let s = self.lock();
+        let npm = matches!(h.source, InstallSource::Npm { .. });
+        s.installed.contains_key(&h.name) || (npm && s.node.is_some() && node.is_some_and(|n| s.node.as_deref() != Some(&n.version)))
     }
 
     fn save(&self, s: &Saved) {
@@ -237,19 +306,22 @@ impl Tools {
     }
 
     /// Takes `plan` as the one to install. A harness already at its version is left
-    /// alone; one that failed is tried again. Harnesses no longer planned stay
-    /// installed, since a Bot may be using one.
+    /// alone; one that failed is tried again, and npm harnesses are installed again
+    /// on a new Node.js. Harnesses no longer planned stay installed, since a Bot may be
+    /// using one.
     pub fn set_plan(&self, plan: HarnessPlan) -> Result<(), String> {
         check(&plan)?;
         let mut s = self.lock();
         let at = now_ms();
+        let new_node = plan.node.as_ref().is_some_and(|n| s.node.as_deref() != Some(&n.version));
         let mut status = BTreeMap::new();
         for h in &plan.harnesses {
             let have = s.installed.get(&h.name).cloned();
             let old = s.status.get(&h.name);
             // Only the very same recipe carries on; a corrected one is installed again.
             let same = s.plan.as_ref().is_some_and(|p| p.harnesses.contains(h));
-            let st = if have.as_deref() == Some(&h.version) && runnable(&self.bin_dir().join(&h.name)) {
+            let npm = matches!(h.source, InstallSource::Npm { .. });
+            let st = if have.as_deref() == Some(&h.version) && !(npm && new_node) && runnable(&self.bin_dir().join(&h.name)) {
                 HarnessStatus { version: have, wanted: Some(h.version.clone()), state: wire::HARNESS_INSTALLED.into(), error: None, at: old.map_or(at, |o| o.at) }
             } else if same && old.is_some_and(|o| o.state == wire::HARNESS_INSTALLING) {
                 old.cloned().unwrap_or_default()
@@ -312,10 +384,12 @@ impl Tools {
         self.save(&s);
     }
 
-    /// Installs what's queued, one at a time, until stopped.
+    /// Installs what's queued, one at a time, until stopped. Replacing what a job may
+    /// be using waits for running jobs to end, and no job starts until it's done.
     pub async fn work(self: Arc<Self>) {
         loop {
             while let Some((h, node)) = self.next() {
+                let _replacing = if self.replaces(&h, node.as_ref()) { Some(self.replacing().await) } else { None };
                 let res = self.install(&h, node.as_ref()).await;
                 if let Err(e) = &res {
                     eprintln!("Installing {} {}: {e}", h.name, h.version);
@@ -608,6 +682,57 @@ mod tests {
         assert_eq!(t.report().1["claude"].state, wire::HARNESS_QUEUED, "the old run's end doesn't count");
         let (new, _) = t.next().unwrap();
         assert_eq!(new, with(sum(2)).harnesses[0]);
+    }
+
+    #[test]
+    fn a_new_node_reinstalls_npm_harnesses() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("superbot-tools-node-{}", now_ms()));
+        let t = Tools::new(dir, None).unwrap();
+        let claude = t.bin_dir().join("claude");
+        std::fs::write(&claude, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        {
+            let mut s = t.lock();
+            s.node = Some("24.22.3".into());
+            s.installed.insert("claude".into(), "2.1.329".into());
+        }
+        let on = |version: &str| HarnessPlan {
+            node: Some(NodeRuntime {
+                version: version.into(),
+                downloads: BTreeMap::from([("x86_64".into(), wire::Download { url: "https://nodejs.org/n.tar.xz".into(), sha256: "a".repeat(64) })]),
+            }),
+            harnesses: vec![npm("claude", "@anthropic-ai/claude-code", "2.1.329")],
+        };
+        t.set_plan(on("24.22.3")).unwrap();
+        assert_eq!(t.report().1["claude"].state, wire::HARNESS_INSTALLED);
+        t.set_plan(on("24.22.4")).unwrap();
+        assert_eq!(t.report().1["claude"].state, wire::HARNESS_QUEUED, "a plan that only moves Node.js is applied");
+        let (h, node) = t.next().unwrap();
+        assert!(t.replaces(&h, node.as_ref()), "running Bots use the old Node.js");
+    }
+
+    #[tokio::test]
+    async fn replacing_waits_for_running_jobs_and_holds_new_ones() {
+        let dir = std::env::temp_dir().join(format!("superbot-tools-gate-{}", now_ms()));
+        let t = Tools::new(dir, None).unwrap();
+        let job = t.job_permit().unwrap();
+        let (got_tx, got_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let t2 = t.clone();
+        let install = tokio::spawn(async move {
+            let _r = t2.replacing().await;
+            let _ = got_tx.send(());
+            let _ = done_rx.await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!install.is_finished() && t.job_permit().is_some(), "it waits, and jobs still start");
+        drop(job);
+        tokio::time::timeout(Duration::from_secs(5), got_rx).await.unwrap().unwrap();
+        assert!(t.job_permit().is_none(), "no job starts while files are replaced");
+        let _ = done_tx.send(());
+        install.await.unwrap();
+        assert!(t.job_permit().is_some());
     }
 
     #[test]

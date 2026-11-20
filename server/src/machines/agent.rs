@@ -788,8 +788,9 @@ fn ndjson(e: &wire::JobEvent) -> Bytes {
     Bytes::from(line)
 }
 
-/// Ends a job's registration, and the job, however its stream ends.
-struct Running(Arc<Agent>, String, watch::Sender<bool>);
+/// Ends a job's registration, and the job, however its stream ends. Holds the tools
+/// it may be using until then.
+struct Running(Arc<Agent>, String, watch::Sender<bool>, #[allow(dead_code)] super::tools::JobPermit);
 
 impl Drop for Running {
     fn drop(&mut self) {
@@ -809,7 +810,7 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
         scrub(&mut c.env);
     }
     let (stop_tx, mut stop_rx) = watch::channel(false);
-    {
+    let permit = {
         let mut jobs = a.jobs();
         if a.upgrader.staging() {
             return refuse(
@@ -826,9 +827,16 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
                 format!("This machine is already running {} jobs.", jobs.len()),
             );
         }
+        let Some(permit) = a.tools.job_permit() else {
+            return refuse(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "This machine is updating its harnesses. Try again in a minute.",
+            );
+        };
         jobs.insert(j.job_id.clone(), stop_tx.clone());
-    }
-    let running = Running(a.clone(), j.job_id.clone(), stop_tx);
+        permit
+    };
+    let running = Running(a.clone(), j.job_id.clone(), stop_tx, permit);
     for dir in [a.cfg.home.join("work"), a.cfg.home.join("bots")] {
         let _ = std::fs::DirBuilder::new()
             .recursive(true)
