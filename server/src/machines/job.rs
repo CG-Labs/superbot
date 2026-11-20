@@ -81,8 +81,13 @@ pub fn write_private(path: &Path, body: &str) -> std::io::Result<()> {
     std::fs::rename(tmp, path)
 }
 
-fn write_files(files: &[JobFile]) -> Result<(), String> {
+/// Skips a `collect` file that's too big to send back: it's newer than any copy the
+/// job brings, which can only be from before it grew.
+fn write_files(files: &[JobFile], collect: &[String]) -> Result<(), String> {
     for f in files {
+        if collect.contains(&f.path) && too_big(&f.path) {
+            continue;
+        }
         write_private(Path::new(&f.path), &f.body)
             .map_err(|e| format!("Couldn't write {}: {e}", f.path))?;
     }
@@ -126,12 +131,19 @@ fn tail(stderr: &str) -> String {
     lines.into_iter().rev().collect::<Vec<_>>().join("\n")
 }
 
-fn collect(paths: &[String]) -> BTreeMap<String, String> {
-    paths
-        .iter()
-        .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() <= MAX_COLLECT))
+fn too_big(path: &str) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() > MAX_COLLECT)
+}
+
+/// The `collect` files to send back, and those too big to.
+fn collect(paths: &[String]) -> (BTreeMap<String, String>, Vec<String>) {
+    let (big, rest): (Vec<&String>, Vec<&String>) = paths.iter().partition(|p| too_big(p));
+    let files = rest
+        .into_iter()
+        .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()))
         .filter_map(|p| Some((p.clone(), std::fs::read_to_string(p).ok()?)))
-        .collect()
+        .collect();
+    (files, big.into_iter().cloned().collect())
 }
 
 /// Runs `job` until it exits or `abort` resolves, sending what happens to `tx`. A
@@ -149,7 +161,7 @@ pub async fn run(
         let _ = tx.send(JobEvent::Cleanup { why }).await;
         return;
     }
-    match write_files(&job.files) {
+    match write_files(&job.files, &job.collect) {
         Ok(()) => run_child(host, job, abort, tx).await,
         Err(message) => {
             let _ = tx.send(JobEvent::Error { message }).await;
@@ -253,6 +265,7 @@ async fn run_child(
         }
     };
     group.0 = None;
+    let (files, too_big) = collect(&job.collect);
     let _ = tx
         .send(JobEvent::Exit {
             success: status.as_ref().is_ok_and(|s| s.success()),
@@ -260,7 +273,8 @@ async fn run_child(
                 .map(|s| s.to_string())
                 .unwrap_or_else(|e| e.to_string()),
             stderr: tail(&stderr),
-            files: collect(&job.collect),
+            files,
+            too_big,
         })
         .await;
 }
@@ -348,6 +362,25 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+
+        // Too big to send back: reported, and the next job's older copy doesn't replace it.
+        let big = dir.join("out.md").display().to_string();
+        let mut grow = job("head -c 1048577 /dev/zero | tr '\\0' a > out.md", &dir);
+        grow.files.push(JobFile {
+            path: big.clone(),
+            body: "old".into(),
+        });
+        for _ in 0..2 {
+            let ev = events(&Host::default(), &grow, false).await;
+            let Some(JobEvent::Exit { files, too_big, .. }) = ev.last() else {
+                panic!("{ev:?}")
+            };
+            assert!(files.is_empty());
+            assert_eq!(too_big, std::slice::from_ref(&big));
+            grow.args[1] = "true".into();
+        }
+        assert_eq!(std::fs::metadata(&big).unwrap().len(), MAX_COLLECT + 1);
+        std::fs::remove_file(&big).unwrap();
 
         // Aborted: the whole group stops, so the run ends long before the sleep would.
         let started = std::time::Instant::now();

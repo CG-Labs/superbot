@@ -246,7 +246,7 @@ pub mod recording {
                 })),
                 script: Mutex::new(vec![
                     JobEvent::Started,
-                    JobEvent::Exit { success: true, status: "exit status: 0".into(), stderr: String::new(), files: Default::default() },
+                    JobEvent::Exit { success: true, status: "exit status: 0".into(), stderr: String::new(), files: Default::default(), too_big: Vec::new() },
                 ]),
             }
         }
