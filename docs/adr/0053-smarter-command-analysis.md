@@ -38,7 +38,7 @@ When a command runs a script file, the server reads it and classifies its conten
 These ask as `shell_destructive`, with a plain reason:
 
 - The script is missing everywhere it could be ("doesn't exist yet"), too big, unreadable, a link out of the workspace, outside the workspace (a script extension, `/tmp`, or run by an interpreter), or names a language SuperBot can't read (`#!/usr/bin/env lua`).
-- The same command line may change it first: the script's name appears elsewhere in it other than in read-only programs (`echo … > x.sh && ./x.sh`, `curl -o x.sh … && ./x.sh`), or something writes to a path only known when it runs. This holds across the whole call: a script that writes or names another script the call runs (`./prepare.sh; ./deploy.sh` where `prepare.sh` rewrites `deploy.sh`), in either order, asks.
+- The same command line may change it first: the script's name appears elsewhere in it other than in read-only programs (`echo … > x.sh && ./x.sh`, `curl -o x.sh … && ./x.sh`), or something writes to a path only known when it runs. This holds across the whole call: a script that writes or names another script the call runs (`./prepare.sh; ./deploy.sh` where `prepare.sh` rewrites `deploy.sh`), in either order, asks. In other languages, any string naming the script counts, except as a word of a command the code runs (`open('deploy.sh', 'w')`).
 - The Bot runs on the owner's machine (ADR 0036): the server can't read that disk, so every script there asks. Inline code is still checked.
 - The script's name or the code is only known when it runs (`bash "$S"`, `python3 -c "$CODE"`).
 

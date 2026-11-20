@@ -163,7 +163,7 @@ impl Level<'_> {
     /// script already read, since one script may rewrite another before it runs.
     fn note_changes(&self, w: &mut Walk, out: &mut Out) {
         const RUNS_OTHERS: [&str; 5] = ["find", "watch", "flock", "script", "make"];
-        let base = |t: &str| t.rsplit('/').next().unwrap_or(t).to_string();
+        let base = file_name;
         let mut named = Vec::new();
         for c in &self.s.cmds {
             for target in &c.writes {
@@ -180,14 +180,7 @@ impl Level<'_> {
             }
             named.extend(words[1..].iter().filter(|a| !a.dynamic && !a.text.starts_with('-')).map(|a| base(&a.text)));
         }
-        for n in named.into_iter().filter(|n| !n.is_empty()) {
-            if w.ran.contains(&n) {
-                out.push(("shell_destructive", format!("May change {n}, which this call also runs, so SuperBot can't check what will run")));
-            }
-            if !w.changed.contains(&n) {
-                w.changed.push(n);
-            }
-        }
+        note_named(named, w, out);
     }
 
     /// Whether this command's standard input may carry code from outside the command line.
@@ -238,6 +231,15 @@ impl Level<'_> {
             let f = scripts::scan(lang, code, label);
             let moved = Cwds { dirs: self.cwds.dirs.clone(), unknown: true };
             let cwds = if f.moves { &moved } else { self.cwds };
+            // Any string naming a file may be a file it writes (`open('deploy.sh', 'w')`),
+            // except as a word of a command it runs.
+            let mut named: Vec<String> = f.strings.iter().map(|s| file_name(s)).collect();
+            for word in f.commands.iter().flat_map(|c| c.split_whitespace()) {
+                if let Some(i) = named.iter().position(|n| *n == file_name(word.trim_matches(['\'', '"']))) {
+                    named.swap_remove(i);
+                }
+            }
+            note_named(named, w, &mut found);
             for cmd in &f.commands {
                 classify_shell(cmd, cwds, self.ctx, self.depth + 1, w, false, &mut found);
             }
@@ -501,6 +503,23 @@ impl Level<'_> {
                 i = end;
             }
             i += 1;
+        }
+    }
+}
+
+fn file_name(t: &str) -> String {
+    t.rsplit('/').next().unwrap_or(t).to_string()
+}
+
+/// Notes files something in the call may change. Naming a script already read asks;
+/// scripts read later that are named ask when they run.
+fn note_named(named: Vec<String>, w: &mut Walk, out: &mut Out) {
+    for n in named.into_iter().filter(|n| !n.is_empty()) {
+        if w.ran.contains(&n) {
+            out.push(("shell_destructive", format!("May change {n}, which this call also runs, so SuperBot can't check what will run")));
+        }
+        if !w.changed.contains(&n) {
+            w.changed.push(n);
         }
     }
 }

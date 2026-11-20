@@ -334,6 +334,53 @@ fn review_findings_ask() {
 }
 
 #[test]
+fn a_script_another_script_may_rewrite_asks() {
+    let ws = Ws::new();
+    ws.write("prepare.sh", "echo 'git push' > deploy.sh\n").write("deploy.sh", "echo ok\n");
+    const WHY: &str = "may change";
+    // In either order: a loop or `&` may run them in any order.
+    for cmd in ["./prepare.sh; ./deploy.sh", "./deploy.sh & ./prepare.sh", "bash -c ./prepare.sh; bash -c ./deploy.sh"] {
+        assert!(ws.reasons(cmd).to_lowercase().contains(WHY), "{cmd} -> {:?}", ws.found(cmd));
+    }
+    let cmd = "echo 'git push' > deploy.sh; bash -c ./deploy.sh";
+    assert!(ws.reasons(cmd).contains("may change it"), "{:?}", ws.found(cmd));
+    ws.write("prep.py", "open('deploy.sh', 'w').write('git push')\n");
+    assert!(ws.reasons("python3 prep.py; ./deploy.sh").to_lowercase().contains(WHY));
+    // A script that writes to a file only known when it runs may write any of them.
+    ws.write("gen.sh", "echo 'git push' > \"$1\"\n");
+    assert!(ws.reasons("./gen.sh deploy.sh; ./deploy.sh").to_lowercase().contains("may change"));
+    // A script writing the one it runs, outside the command that runs it.
+    ws.write("wrap.py", "import subprocess\nopen('deploy.sh', 'w').write('git push')\nsubprocess.run('./deploy.sh')\n");
+    assert!(ws.reasons("python3 wrap.py").to_lowercase().contains(WHY));
+    // Scripts that only run each other don't ask.
+    ws.write("all.sh", "./build.sh\n./test.sh\n").write("build.sh", "echo build\n").write("test.sh", "echo test\n");
+    assert!(ws.found("./all.sh").is_empty(), "{:?}", ws.found("./all.sh"));
+    ws.write("run.py", "import subprocess\nsubprocess.run('./build.sh')\n");
+    assert!(ws.found("python3 run.py && ./test.sh").is_empty(), "{:?}", ws.found("python3 run.py && ./test.sh"));
+}
+
+#[test]
+fn code_that_changes_folder_has_unknown_relative_paths() {
+    let ws = Ws::new();
+    let cmd = "python3 -c \"import os, shutil; os.chdir('/tmp'); shutil.rmtree('build')\"";
+    assert!(ws.classes(cmd).contains(&"file_delete"), "{:?}", ws.found(cmd));
+    assert!(ws.found("python3 -c \"import shutil; shutil.rmtree('build')\"").is_empty());
+    ws.write("cd.rb", "Dir.chdir('/tmp')\nsystem('./clean.sh')\n");
+    assert!(ws.reasons("ruby cd.rb").contains("from a folder SuperBot can't tell"), "{:?}", ws.found("ruby cd.rb"));
+    assert!(ws.classes("node -e \"process.chdir('/'); require('fs').rmSync('etc', {recursive: true})\"").contains(&"file_delete"));
+}
+
+#[test]
+fn a_huge_scan_stops_and_asks() {
+    let ws = Ws::new();
+    ws.write("big.py", &"system(\n".repeat(30_000));
+    let started = std::time::Instant::now();
+    let found = ws.found("python3 big.py");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "took {:?}", started.elapsed());
+    assert!(found.iter().any(|(_, why)| why.contains("too complex for SuperBot")), "{found:?}");
+}
+
+#[test]
 fn a_run_grant_for_a_command_does_not_cover_a_script_doing_it() {
     let ws = Ws::new();
     ws.write("release.sh", "git push origin main\n");
