@@ -1,6 +1,6 @@
 import React from "react";
-import { render, screen, userEvent } from "@testing-library/react-native";
-import { PlanView } from "../PlanView";
+import { act, render, screen, userEvent } from "@testing-library/react-native";
+import { CONFIRM_EVERY_MS, PlanView } from "../PlanView";
 import PlanScreen from "../../app/plan";
 import { ApiError } from "../../src/api";
 import type { BillingView } from "../../src/types";
@@ -34,7 +34,7 @@ function billing(over: Partial<BillingView> = {}): BillingView {
 
 function fakeApi(view: BillingView | null) {
   return {
-    billing: jest.fn(async () => view),
+    billing: jest.fn(async (): Promise<BillingView | null> => view),
     checkout: jest.fn(async (tier: string) => ({ url: `https://checkout.stripe.com/c/pay/${tier}` })),
     billingPortal: jest.fn(async () => ({ url: "https://billing.stripe.com/p/session/1" })),
   };
@@ -90,9 +90,31 @@ describe("PlanView (ADR 0041)", () => {
     expect(open).not.toHaveBeenCalled();
   });
 
-  it("thanks people back from Stripe", async () => {
-    await render(<PlanView api={fakeApi(billing())} onBack={jest.fn()} checkout="success" />);
-    expect(await screen.findByText(/Thanks! Your plan changes as soon as Stripe confirms/)).toBeOnTheScreen();
+  it("thanks people back from Stripe, and shows the new plan once Stripe confirms it", async () => {
+    jest.useFakeTimers();
+    try {
+      const api = fakeApi(billing());
+      await render(<PlanView api={api} onBack={jest.fn()} checkout="success" />);
+      expect(await screen.findByText(/Thanks! Your plan changes as soon as Stripe confirms/)).toBeOnTheScreen();
+      expect(screen.getByText("Starter plan")).toBeOnTheScreen();
+      const paid = billing({
+        plan: { ...pro, usage: { period: "2026-11", runs: 12, bots: 3, day: "2026-11-20", routineRuns: 4 } },
+        subscription: { status: "active", tier: "pro", periodEnd: null },
+        portal: true,
+      });
+      api.billing.mockResolvedValue(paid);
+      await act(async () => {
+        jest.advanceTimersByTime(CONFIRM_EVERY_MS);
+      });
+      expect(await screen.findByText("Pro plan")).toBeOnTheScreen();
+      const calls = api.billing.mock.calls.length;
+      await act(async () => {
+        jest.advanceTimersByTime(CONFIRM_EVERY_MS * 5);
+      });
+      expect(api.billing.mock.calls.length).toBe(calls);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it("says so on a server without billing", async () => {

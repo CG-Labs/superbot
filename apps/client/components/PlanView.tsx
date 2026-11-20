@@ -6,6 +6,10 @@ import { overLimits, planUsageLines } from "../src/plan";
 import { colors } from "../src/theme";
 import type { BillingView } from "../src/types";
 
+/** After a successful checkout, how often and how many times to look for Stripe's confirmation. */
+export const CONFIRM_EVERY_MS = 3000;
+const CONFIRM_TRIES = 20;
+
 interface Props {
   api: Pick<SuperBotApi, "billing" | "checkout" | "billingPortal">;
   onBack: () => void;
@@ -39,6 +43,18 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
     });
     return () => sub.remove();
   }, [load]);
+
+  // Stripe can send people back before its webhook reaches the server: keep looking for a minute.
+  const waiting = notice?.good === true && view != null && !view.subscription;
+  useEffect(() => {
+    if (!waiting) return;
+    let tries = 0;
+    const timer = setInterval(() => {
+      if (++tries >= CONFIRM_TRIES) clearInterval(timer);
+      void load();
+    }, CONFIRM_EVERY_MS);
+    return () => clearInterval(timer);
+  }, [waiting, load]);
 
   const go = async (key: string, start: () => Promise<{ url: string }>) => {
     setBusy(key);
