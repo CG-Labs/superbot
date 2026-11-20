@@ -330,7 +330,7 @@ export class SuperBotApi {
     }
   }
 
-  /** Your model tokens and runs this billing period. null from servers before ADR 0048. */
+  /** Your model tokens and runs this billing period. null from servers before ADR 0050. */
   async myUsage(): Promise<MyUsage | null> {
     try {
       return await this.request<MyUsage>("GET", "/api/me/usage");

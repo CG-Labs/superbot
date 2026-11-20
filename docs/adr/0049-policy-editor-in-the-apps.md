@@ -4,7 +4,7 @@
 
 Accepted (20 Nov 2026). Approvals follow-up 4 ([list](../approvals-followups.md), tracking issue [#13](https://github.com/CG-Labs/superbot/issues/13), M1). It builds on [ADR 0007](0007-approvals.md) (approvals and the policy engine), [ADR 0009](0009-audit-events.md) (audit events), [ADR 0012](0012-users-sessions-rbac.md) (roles), [ADR 0017](0017-bot-acls.md) (Bot access), [ADR 0027](0027-expo-primary-hermes-default.md) (the Expo client is the interface) and [ADR 0032](0032-console-admin-only.md) (the console is for admins).
 
-0046 and 0047 are on main ([ADR 0046](0046-shared-bots-under-isolation.md), [ADR 0047](0047-disabled-users-routines.md)), and open PR [#106](https://github.com/CG-Labs/superbot/pull/106) adds another 0047 that will need the next number, so this is 0049, leaving 0048 for it.
+0048 is teammates' own OS users on machines ([ADR 0048](0048-teammates-own-os-user-on-machines.md)); billing-period usage, merged with the same number, was renumbered to [ADR 0050](0050-billing-period-token-usage.md).
 
 ## Context
 

@@ -249,7 +249,7 @@ mod tests {
             ("GET", "/api/tiers", Perm::Admin),
             // Everyone's plan and use, against their limits (ADR 0040).
             ("GET", "/api/usage", Perm::Admin),
-            // Your own usage this billing period; anyone's is for admins (ADR 0048).
+            // Your own usage this billing period; anyone's is for admins (ADR 0050).
             ("GET", "/api/me/usage", Perm::Read),
             ("GET", "/api/users/u1/usage", Perm::Admin),
             // Your own plan's checkout and billing portal (ADR 0042).

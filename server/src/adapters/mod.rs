@@ -29,7 +29,7 @@ pub enum AgentEvent {
     /// The agent started using a tool.
     Tool { name: String, detail: String },
     Error(String),
-    /// Model tokens the harness says it used (ADR 0048). A run may report several, one
+    /// Model tokens the harness says it used (ADR 0050). A run may report several, one
     /// per model or turn; the runner adds them up. A harness that says nothing: unknown.
     Usage(Usage),
 }

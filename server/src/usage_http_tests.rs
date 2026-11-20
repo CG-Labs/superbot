@@ -1,4 +1,4 @@
-//! Billing-period usage and token metering (ADR 0048) on the real router: each run's
+//! Billing-period usage and token metering (ADR 0050) on the real router: each run's
 //! tokens are recorded for its Bot's owner, or recorded as unknown; people see only
 //! their own usage and admins everyone's; the token limit refuses runs in plain words
 //! and is audited; a paid subscription sets the period; and tokens go to a Stripe meter

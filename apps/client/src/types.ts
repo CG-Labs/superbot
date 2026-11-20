@@ -86,14 +86,14 @@ export interface PlanUsage extends TierView {
     bots: number;
     day?: string;
     routineRuns?: number;
-    /** Model tokens this billing period (ADR 0048). Missing from older servers. */
+    /** Model tokens this billing period (ADR 0050). Missing from older servers. */
     tokens?: number;
     periodStart?: number;
     periodEnd?: number;
     periodSource?: "subscription" | "calendar";
   };
 }
-/** Model tokens over some runs, as harnesses report them (ADR 0048). */
+/** Model tokens over some runs, as harnesses report them (ADR 0050). */
 export interface TokenTotals {
   input: number;
   output: number;
@@ -104,7 +104,7 @@ export interface TokenTotals {
   /** Runs whose harness reported no tokens: not counted, not free. */
   unreportedRuns: number;
 }
-/** `GET /api/me/usage`: your model tokens and runs this billing period (ADR 0048). */
+/** `GET /api/me/usage`: your model tokens and runs this billing period (ADR 0050). */
 export interface MyUsage {
   user: string;
   tier: TierView;

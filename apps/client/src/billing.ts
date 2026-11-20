@@ -11,7 +11,7 @@ export async function billingAvailable(api: Pick<SuperBotApi, "billing">): Promi
   }
 }
 
-/** Whether to offer the Plan screen: the server sells plans, or reports your usage (ADR 0048). */
+/** Whether to offer the Plan screen: the server sells plans, or reports your usage (ADR 0050). */
 export async function planAvailable(api: Pick<SuperBotApi, "billing" | "myUsage">): Promise<boolean> {
   if (await billingAvailable(api)) return true;
   try {

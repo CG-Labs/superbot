@@ -19,7 +19,7 @@ interface Props {
   open?: (url: string) => Promise<void>;
 }
 
-/** Your model tokens and runs this billing period (ADR 0048). */
+/** Your model tokens and runs this billing period (ADR 0050). */
 function UsageCard({ usage }: { usage: MyUsage }) {
   return (
     <View style={styles.card} accessibilityLabel="Usage this period">

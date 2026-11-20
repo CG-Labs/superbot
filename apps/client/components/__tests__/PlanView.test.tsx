@@ -128,7 +128,7 @@ describe("PlanView (ADR 0042)", () => {
     }
   });
 
-  it("shows your tokens and runs this period (ADR 0048)", async () => {
+  it("shows your tokens and runs this period (ADR 0050)", async () => {
     await render(<PlanView api={fakeApi(billing(), usage)} onBack={jest.fn()} />);
     expect(await screen.findByText("Usage this period")).toBeOnTheScreen();
     expect(screen.getByText("This month: 2026-11-01 to 2026-12-01 (UTC)")).toBeOnTheScreen();

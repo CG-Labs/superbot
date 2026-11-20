@@ -1,4 +1,4 @@
-//! Billing-period usage (ADR 0048): the model tokens and runs a user's Bots used in their
+//! Billing-period usage (ADR 0050): the model tokens and runs a user's Bots used in their
 //! billing period. The period is their paid Stripe subscription's month when they have
 //! one, else the calendar month (UTC). Runs and tokens count against the same period;
 //! routine runs stay per UTC day.
