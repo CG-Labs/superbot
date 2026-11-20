@@ -58,6 +58,27 @@ jobs:
       - name: Backup and restore drill (installer units, encrypted archive, fresh host, RTO and RPO budgets)
         run: sudo SUPERBOT_DRILL_THROWAWAY=1 GITHUB_ACTIONS="$GITHUB_ACTIONS" deploy/backup-drill.sh /tmp/botd-release
 
+  # Per-user accounts (ADR 0037) on a real host: accounts, sudo, and the unit's sandboxing.
+  isolation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build superbot-run and botd's tests
+        run: |
+          set -euo pipefail
+          cargo build --bin superbot-run
+          cargo test --no-run --message-format=json >/tmp/build.json
+          jq -r 'select(.reason == "compiler-artifact" and .target.name == "botd" and .target.kind == ["bin"] and .profile.test) | .executable' \
+            /tmp/build.json >/tmp/test-bin
+          test -x "$(cat /tmp/test-bin)"
+      - name: User B's Bot can't reach user A's folder or logins
+        run: |
+          sudo apt-get update -qq
+          sudo deploy/test-isolation.sh --yes target/debug/superbot-run "$(cat /tmp/test-bin)"
+
   shellcheck:
     runs-on: ubuntu-latest
     steps:
@@ -96,6 +117,14 @@ jobs:
           grep -Fq 'would install the landing page from /home/superbot/superbot/site into root-owned /var/www/superbot-site' /tmp/fresh.log
           grep -Fq 'landing page at / from /var/www/superbot-site, web client at /app/' /tmp/fresh.log
           grep -Fq 'Console:  https://ci.example.com/console/' /tmp/fresh.log
+      - name: Per-user accounts are opt-in
+        run: |
+          set -euo pipefail
+          if grep -Eq 'superbot-isolation|Per-user accounts' /tmp/fresh.log; then exit 1; fi
+          cat deploy/install.sh | sudo bash -s -- --dry-run --non-interactive --isolation \
+            --domain ci.example.com --tz UTC | tee /tmp/isolation.log
+          grep -Fq 'would install /usr/local/sbin/superbot-userctl, /etc/sudoers.d/superbot-isolation, and /etc/systemd/system/superbot.service.d/isolation.conf, make /srv/superbot/users (root, 0711)' /tmp/isolation.log
+          grep -Fq 'Per-user accounts are on (ISOLATION=users' /tmp/isolation.log
       - name: Hermes Agent is opt-in and pinned to a commit
         run: |
           set -euo pipefail

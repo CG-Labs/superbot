@@ -77,6 +77,10 @@ impl Adapter for Claude {
         "Bash"
     }
 
+    fn login_args(&self) -> Option<&'static [&'static str]> {
+        Some(&["auth", "login"])
+    }
+
     fn models(&self) -> Vec<ModelOption> {
         let efforts: Vec<String> = ["low", "medium", "high", "xhigh", "max"].map(String::from).into();
         [

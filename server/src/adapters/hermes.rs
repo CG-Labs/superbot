@@ -231,6 +231,7 @@ mod tests {
             env: HashMap::from([("BOT_TOKEN".into(), "t0k3n".into()), ("GITHUB_TOKEN".into(), "ghp_x".into())]),
             state_dir: dir,
             guard: guard.then(|| Guard { command: "'/opt/bin/botctl' hook hermes".into(), timeout_secs: 300, wait: Duration::from_secs(240) }),
+            run_as: None,
         }
     }
 

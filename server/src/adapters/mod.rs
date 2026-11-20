@@ -48,6 +48,9 @@ pub struct RunInput {
     pub state_dir: PathBuf,
     /// Set in ask mode: the harness must run `command` before every tool call.
     pub guard: Option<Guard>,
+    /// With per-user accounts (ADR 0037): the account the harness runs as on this
+    /// server. None: botd's. Runs on the owner's machine never use it.
+    pub run_as: Option<crate::accounts::RunAs>,
 }
 
 /// The approval gate, as each adapter installs it in its harness's own hook format.
@@ -129,6 +132,10 @@ pub trait Adapter: Send {
     fn shell_tool(&self) -> &'static str;
     /// The longest hook timeout the harness accepts, if it caps it.
     fn max_hook_secs(&self) -> Option<u64> {
+        None
+    }
+    /// What logs the harness in, run at a terminal as the account its runs use.
+    fn login_args(&self) -> Option<&'static [&'static str]> {
         None
     }
 }
@@ -250,11 +257,19 @@ pub fn job_for(adapter: &mut dyn Adapter, input: &RunInput, out: &mut Vec<AgentE
 }
 
 /// Runs the harness on this server, calling `emit` for every event, until it exits or
-/// `abort` fires.
+/// `abort` fires. With `input.run_as`, it starts as that account.
 pub async fn run(adapter: Box<dyn Adapter>, input: RunInput, abort: watch::Receiver<AbortReason>, emit: impl FnMut(AgentEvent)) {
     let host = local_host();
     let stop = abort.clone();
-    run_on(adapter, input, abort, emit, |job, tx| async move { job::run(&host, &job, aborted(stop), &tx).await }).await
+    let run_as = input.run_as.clone();
+    run_on(adapter, input, abort, emit, |job, tx| async move {
+        let job = match &run_as {
+            Some(r) => r.wrap(job),
+            None => job,
+        };
+        job::run(&host, &job, aborted(stop), &tx).await
+    })
+    .await
 }
 
 /// Runs the harness wherever `exec` runs a job, and turns what comes back into events.
@@ -343,6 +358,74 @@ pub fn new_uuid() -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn input(dir: &std::path::Path, run_as: Option<crate::accounts::RunAs>) -> RunInput {
+        RunInput {
+            prompt: "hi".into(),
+            system: "You are Ada.".into(),
+            session_id: None,
+            cwd: dir.to_path_buf(),
+            provider: None,
+            model: None,
+            effort: None,
+            env: HashMap::from([("PATH".into(), "/opt/superbot/bin:/usr/bin:/bin".into())]),
+            state_dir: dir.join("state"),
+            guard: Some(Guard { command: "'/opt/bin/botctl' hook x".into(), timeout_secs: 300, wait: std::time::Duration::from_secs(240) }),
+            run_as,
+        }
+    }
+
+    fn run_as(sudo: &str) -> crate::accounts::RunAs {
+        crate::accounts::RunAs { sudo: sudo.into(), runner: "/opt/superbot/bin/superbot-run".into(), account: "sb-u-u1".into() }
+    }
+
+    #[test]
+    fn isolated_harnesses_need_nothing_botd_writes() {
+        // botd writes job files and runs cleanups as itself, where a per-user account can't follow.
+        let dir = std::env::temp_dir();
+        for name in crate::accounts::HARNESSES {
+            let job = job_for(get(name).unwrap().as_mut(), &input(&dir, None), &mut Vec::new());
+            assert!(job.files.is_empty() && job.cleanup.is_none(), "{name}");
+            assert!(get(name).unwrap().login_args().is_some(), "an admin logs {name} in as each user");
+        }
+    }
+
+    #[test]
+    fn jobs_for_a_machine_never_go_through_this_servers_accounts() {
+        let dir = std::env::temp_dir();
+        let job = job_for(get("claude").unwrap().as_mut(), &input(&dir, Some(run_as("/usr/bin/sudo"))), &mut Vec::new());
+        assert_eq!(job.bin, "claude");
+        assert!(!job.args.iter().any(|a| a.contains("sudo") || a.contains("sb-u-")), "{:?}", job.args);
+        assert!(!job.env.contains_key("SUPERBOT_PATH"));
+    }
+
+    #[tokio::test]
+    async fn local_runs_start_as_the_owners_account() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::db::temp_path("run-as");
+        let sudo = dir.join("sudo");
+        let seen = dir.join("seen");
+        let script = format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho \"PATH=$SUPERBOT_PATH\" >> '{0}'\n", seen.display());
+        std::fs::write(&sudo, script).unwrap();
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (_tx, abort) = watch::channel(None);
+        let mut errors = Vec::new();
+        let input = input(&dir, Some(run_as(sudo.to_str().unwrap())));
+        run(get("claude").unwrap(), input, abort, |e| {
+            if let AgentEvent::Error(m) = e {
+                errors.push(m)
+            }
+        })
+        .await;
+        assert!(errors.is_empty(), "{errors:?}");
+        let seen = std::fs::read_to_string(&seen).unwrap();
+        let lines: Vec<&str> = seen.lines().collect();
+        assert_eq!(lines[..7], ["-n", "-E", "-u", "sb-u-u1", "--", "/opt/superbot/bin/superbot-run", "claude"], "{seen}");
+        assert!(lines.contains(&"--settings"), "the approval gate goes through: {seen}");
+        assert_eq!(lines.last(), Some(&"PATH=/opt/superbot/bin:/usr/bin:/bin"));
+    }
+
     #[test]
     fn machines_know_every_harness() {
         for name in super::NAMES {

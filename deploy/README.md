@@ -32,7 +32,7 @@ If flags are omitted, the script prompts on a TTY. The checkout must not be owne
 1. Creates user `superbot` (override with `--user`)
 2. Installs build deps, Node.js 22 LTS, rustup for the service user
 3. Clones or updates [CG-Labs/superbot](https://github.com/CG-Labs/superbot) under `~/superbot`
-4. Builds release `botd` / `botctl` → `/usr/local/bin`
+4. Builds release `botd` / `botctl` / `superbot-run` → `/usr/local/bin`
 5. Builds the [web client](#web-client) (`apps/client`) → `/var/www/superbot-app` (skip with `--no-client`)
 6. Writes `~/superbot/.env` from `.env.example` with:
    - `HOST=127.0.0.1`, `PORT=3000`, `TZ`, `USER_NAME`, data paths
@@ -44,6 +44,7 @@ If flags are omitted, the script prompts on a TTY. The checkout must not be owne
 9. Optional **UFW** (`--ufw`): allow 22, 80, 443
 10. Daily **backup** timer (on by default; `--no-backup` to skip), plus `superbot-restore`: see [Backups and restore](#backups-and-restore)
 11. With `--with-hermes`: [Hermes Agent](#hermes-agent) for the service user
+12. With `--isolation`: [one Unix account per user](#one-unix-account-per-user)
 
 Admin password file: `~superbot/.superbot-admin-password` (mode `0600`).
 
@@ -53,6 +54,8 @@ Admin password file: `~superbot/.superbot-admin-password` (mode `0600`).
 journalctl -u superbot -f
 sudo -iu superbot claude login   # or codex login, etc.
 ```
+
+With `--isolation`, log harnesses in per user instead: [one Unix account per user](#one-unix-account-per-user).
 
 Open `https://your-domain/app/` for the app (it fills in the server URL), or `https://your-domain/console/` for the built-in admin page. Sign in with the saved password. `https://your-domain/` is the public landing page. The app is the interface for everyone, admins included (chat, Bots, approvals, screens). The console is a minimal admin and break-glass page: users and roles, sign-up requests, per-user machines, the audit log, and settings (approval mode, server secrets, SCIM tokens). Only admins get it; other people who open it or sign in at `/login` land on `/app/` ([ADR 0027](../docs/adr/0027-expo-primary-hermes-default.md), [ADR 0032](../docs/adr/0032-console-admin-only.md)).
 
@@ -91,6 +94,7 @@ The installer builds the Expo client (`apps/client`) from the same commit as `bo
 | `--ufw` | Enable firewall rules |
 | `--no-backup` | Skip backup timer |
 | `--with-hermes` | Also install Hermes Agent ([below](#hermes-agent)) |
+| `--isolation` / `--no-isolation` | Each user's Bots run as their own Unix account, or not ([below](#one-unix-account-per-user)). Kept on upgrades |
 | `--no-client` | Skip building the web client |
 | `--dry-run` | Print steps only |
 | `--source-dir` | Copy a local tree instead of cloning |
@@ -104,6 +108,44 @@ sudo -u superbot env SUPERBOT_PASSWORD="$(sudo grep -oP '^AUTH_PASSWORD=\K.*' ~s
 ```
 
 To pick a provider or endpoint, set `SUPERBOT_HERMES_PROVIDER` (Hermes's `--provider`, e.g. `openrouter`) and `SUPERBOT_HERMES_BASE_URL` in `~superbot/superbot/.env`, then `sudo systemctl restart superbot`. Pick Hermes Agent for a Bot in its settings, or set `DEFAULT_HARNESS=hermes`. How it runs and its limits: [backend docs](../docs/backend.md#hermes-agent).
+
+## One Unix account per user
+
+Off by default. With `--isolation`, each user's Bots run as their own account, `sb-u-<user id>`, so one user's Bots can't read or write another's folder or harness logins, nor botd's database, `.env`, or master key. Design: [ADR 0037](../docs/adr/0037-per-user-unix-accounts.md).
+
+```sh
+sudo bash deploy/install.sh --upgrade --isolation     # or with curl, as above
+```
+
+What root sets up (and `--no-isolation` takes away again, keeping accounts and their folders):
+
+- `/usr/local/sbin/superbot-userctl` (makes one account and its folders, nothing else) and `/etc/superbot/isolation.conf` (where the folders go and botd's group).
+- `/etc/sudoers.d/superbot-isolation`: the service user may start `/usr/local/bin/superbot-run` as a member of `superbot-users`, keeping the run's env, and run `superbot-userctl ensure <id>` as root. Nothing else. Checked with `visudo -c` first.
+- `/etc/systemd/system/superbot.service.d/isolation.conf`: `NoNewPrivileges=false` (sudo is setuid) and `ProtectProc=invisible` (a run sees only its own account's processes).
+- `/srv/superbot/users` (root, `0711`; set `ISOLATION_DIR` to move it), the `superbot-users` group, the service home at `0750`, and `ISOLATION=users` in `.env`.
+
+Then, as the service user, at a terminal:
+
+```sh
+sudo -iu superbot
+export SUPERBOT_PASSWORD=...                     # AUTH_PASSWORD from ~/superbot/.env, or SUPERBOT_TOKEN from botctl login
+botctl user isolation alex@example.com           # the account and its folders
+botctl user harness-login alex@example.com claude   # claude auth login, as alex's account
+botctl user harness-login alex@example.com codex
+```
+
+Accounts are made at a user's first run, or with `botctl user isolate <user>`. Install harness CLIs system-wide (`sudo npm install -g @anthropic-ai/claude-code @openai/codex`): per-user accounts can't open the service user's `~/.local`. Only Claude Code and Codex Bots run this way; Pi and Hermes Bots, and screens, are off until they can. To check it on a throwaway host: `deploy/test-isolation.sh` (CI runs it).
+
+Turning it on doesn't move files. Each user's work starts in a new, empty `ISOLATION_DIR/<id>/workspace`; their old folder, `WORKSPACE_DIR/users/<id>`, stays where it was. Bot memory and `USER.md` carry over by themselves (botd keeps the real copies). Harness sessions don't: each Bot's next run starts a fresh one, with its memory. To bring a user's files along, as root, after `botctl user isolate <user>`:
+
+```sh
+systemctl stop superbot
+rsync -a --chown=sb-u-<id>:superbot ~superbot/superbot/workspace/users/<id>/ /srv/superbot/users/<id>/workspace/
+chmod -R g+rwX,o-rwx /srv/superbot/users/<id>/workspace
+systemctl start superbot
+```
+
+Turning it off is the same in reverse: work done meanwhile stays in `ISOLATION_DIR/<id>/workspace`, so copy it back with `--chown=superbot:superbot`.
 
 ## Binaries
 

@@ -43,6 +43,11 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl user disable <user> | enable <user>       Disabling ends the user's sessions
   botctl user tier <user> <tier|default>           Their plan: the models and limits they get
   botctl tiers                                     Every tier, its routes and limits, and the default
+  botctl user isolation <user>                     With ISOLATION=users: the user's own account and folders
+  botctl user isolate <user>                       Make that account and its folders now
+  botctl user harness-login <user> <claude|codex> [-- <args>...]
+                                                   Log a harness in as that user's account, for their
+                                                   Bots only (as botd's service account, at a terminal)
   botctl setup [status | json]                     What the server still needs: the onboarding checklist
   botctl setup done | reopen | hide | show         Finish the setup wizard, reopen it, or hide it from admins
   botctl user code <user> [--ttl <minutes>]        A one-time sign-in code (default 60 minutes)
@@ -153,6 +158,47 @@ fn api(cred: Cred, method: &str, path: &str, body: Option<String>) -> Result<Str
     } else {
         let msg = serde_json::from_str::<Value>(body).ok().and_then(|v| v["error"].as_str().map(String::from)).unwrap_or(body.into());
         Err(format!("{msg} (HTTP {code})"))
+    }
+}
+
+/// The extra arguments of `botctl user harness-login`: none, or everything after `--`.
+fn login_extra<'a>(rest: &'a [&'a str]) -> Result<Option<&'a [&'a str]>, String> {
+    match rest {
+        [] => Ok(None),
+        ["--", args @ ..] => Ok(Some(args)),
+        _ => Err("Usage: botctl user harness-login <user> <claude|codex> [-- <login arguments>...]".into()),
+    }
+}
+
+/// `botctl user harness-login`: botd makes the user's account if needed and says how to
+/// start the harness's login as it; this runs that here, at the admin's terminal. Only
+/// botd's service account may switch to per-user accounts, so run it as that account.
+fn harness_login(key: &str, harness: &str, rest: &[&str]) -> Result<String, String> {
+    let body = json!({ "harness": harness, "args": login_extra(rest)? });
+    let res = api(Cred::Operator, "POST", &format!("/api/users/{}/harness-login", encode(key)), Some(body.to_string()))?;
+    let v: Value = serde_json::from_str(&res).map_err(|e| e.to_string())?;
+    let argv: Vec<&str> = v["command"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    let (Some((bin, args)), Some(home)) = (argv.split_first(), v["home"].as_str()) else {
+        return Err(format!("Unexpected reply from the server: {res}"));
+    };
+    eprintln!("Starting the {harness} login as the user's own account (HOME {home}). Only their Bots will use it.");
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(args).current_dir(home).env_clear();
+    for (k, val) in std::env::vars_os() {
+        let k_str = k.to_string_lossy();
+        if k_str == "TERM" || k_str == "LANG" || k_str.starts_with("LC_") {
+            cmd.env(&k, val);
+        }
+    }
+    // sudo resets PATH; superbot-run puts this one back, so the harness is found as botd finds it.
+    if let Some(path) = std::env::var_os("PATH") {
+        cmd.env("SUPERBOT_PATH", path);
+    }
+    let status = cmd.status().map_err(|e| format!("Couldn't start {bin}: {e}"))?;
+    if status.success() {
+        Ok(format!("Done. The user's Bots now use this {harness} login."))
+    } else {
+        Err(format!("The login exited with {status}. If sudo asked for a password, run botctl as botd's service account (sudo -iu <service user>)."))
     }
 }
 
@@ -589,6 +635,9 @@ fn run(args: &[String]) -> Result<String, String> {
             let tier = if *t == "default" { Value::Null } else { json!(t) };
             op("PATCH", &format!("/api/users/{}", encode(key)), Some(json!({ "tier": tier }).to_string()))
         }
+        ["user", "isolation", key] => op("GET", &format!("/api/users/{}/isolation", encode(key)), None),
+        ["user", "isolate", key] => op("POST", &format!("/api/users/{}/isolation", encode(key)), None),
+        ["user", "harness-login", key, harness, rest @ ..] => harness_login(key, harness, rest),
         ["tiers"] => op("GET", "/api/tiers", None),
         ["setup", "json"] => op("GET", "/api/setup", None),
         ["setup", rest @ ..] => {
@@ -653,6 +702,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn harness_login_takes_extra_arguments_only_after_a_double_dash() {
+        assert_eq!(login_extra(&[]), Ok(None));
+        assert_eq!(login_extra(&["--"]), Ok(Some(&[][..])));
+        assert_eq!(login_extra(&["--", "setup-token"]), Ok(Some(&["setup-token"][..])));
+        assert!(login_extra(&["setup-token"]).is_err());
+    }
 
     #[test]
     fn machine_commands_name_the_users_placement() {
