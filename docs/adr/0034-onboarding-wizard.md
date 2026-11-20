@@ -25,7 +25,7 @@ After `install.sh` or `docker compose up`, the first admin signs in with the bre
 | `checklist` | Five items: public address with HTTPS, providers ready, a second admin, plans (always done: self-host is a valid choice), and approvals on. |
 | `progress` | Step, dismissed, completed (when, by whom), and `show`. |
 
-`PATCH /api/setup` (admins) takes `{step?, dismissed?, completed?}` and stores progress in the `settings` table. Finishing, reopening, hiding, and showing again are audited (`setup.completed` with the open items, `setup.reopened`, `setup.dismissed`, `setup.resumed`); moving between steps isn't.
+`PATCH /api/setup` (admins) takes `{step?, dismissed?, completed?}` and stores progress in the `settings` table, read and written under one database lock so a step save can't undo a concurrent finish. Finishing, reopening, hiding, and showing again are audited (`setup.completed` with the open items, `setup.reopened`, `setup.dismissed`, `setup.resumed`); moving between steps isn't.
 
 Both routes fall into the RBAC default arm (admins only, never a Bot) and are listed in `rbac.rs`'s route test and the router walk.
 
@@ -33,7 +33,7 @@ Both routes fall into the RBAC default arm (admins only, never a Bot) and are li
 
 Only what botd can change while running, through routes that already exist and are audited:
 
-- SSO client secrets (Apple: the private key) via `PUT /api/secrets/{name}`. The provider is offered at once, no restart.
+- SSO client secrets (Apple: the private key) via `PUT /api/secrets/{name}`. The provider is offered at once, no restart. When botd's environment already sets the secret (`SSO_<ID>_CLIENT_SECRET` or `_FILE`), that value wins, so the report says so (`secretStore: "env"`, `secretSavable: false`) and the wizard explains how to change it in `.env` instead of offering a save box.
 - The approval mode via `PUT /api/policy`.
 - Its own progress via `PATCH /api/setup`.
 
@@ -47,7 +47,7 @@ A **Setup** tab in the console, with four steps (Domain, Sign-in, Plans, Finish)
 - **Dismissible:** "Hide setup" stops sending admins there; the tab stays and can be shown again.
 - **Finish** works with items still open: the checklist is guidance, not a gate.
 
-The client gets one admin-only sidebar link, **Finish server setup ↗**, that opens `/console/#setup` while `progress.show` is true. Older servers (404) and non-admins (never asked) see nothing. The wizard isn't rebuilt in the client: it's a one-time admin task on the server, and the console is where admins already manage secrets and settings.
+The client gets one admin-only sidebar link, **Finish server setup ↗**, that opens `/console/#setup` while `progress.show` is true. It checks again whenever the app comes back to the front, so it goes away once the wizard is finished in the console. Older servers (404) and non-admins (never asked) see nothing. The wizard isn't rebuilt in the client: it's a one-time admin task on the server, and the console is where admins already manage secrets and settings.
 
 `botctl setup` prints the checklist; `botctl setup done | reopen | hide | show` change progress.
 
