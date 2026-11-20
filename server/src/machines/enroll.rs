@@ -96,6 +96,10 @@ pub struct Enrollment {
     /// Copying users' folders to their machines (MACHINE_FOLDER_SYNC, ADR 0041).
     pub folder: Option<super::folder::Settings>,
     pub(super) copying: super::folder::Copying,
+    /// Bots run as their own OS user on machines (MACHINE_BOT_USER, ADR 0042), and
+    /// when each agent was last asked to.
+    pub bot_user: bool,
+    pub(super) asked: super::botuser::Asked,
 }
 
 impl std::fmt::Debug for Enrollment {
@@ -134,6 +138,7 @@ impl Enrollment {
                 "MACHINE_HARNESS_LOGINS",
                 "MACHINE_FOLDER_SYNC",
                 "MACHINE_FOLDER_SYNC_MAX_MB",
+                "MACHINE_BOT_USER",
             ] {
                 if !var(k).trim().is_empty() {
                     return Err(format!("{k} needs MACHINE_CONTROL_URL"));
@@ -207,6 +212,7 @@ impl Enrollment {
             v => return Err(format!("MACHINE_HARNESS_LOGINS must be on or off, not \"{v}\"")),
         };
         e.folder = super::folder::Settings::from_env(var)?;
+        e.bot_user = super::botuser::from_env(var)?;
         Ok(Some(e))
     }
 
@@ -234,6 +240,8 @@ impl Enrollment {
             sessions: Default::default(),
             folder: None,
             copying: Default::default(),
+            bot_user: false,
+            asked: Default::default(),
         })
     }
 
@@ -278,6 +286,13 @@ impl Enrollment {
         self
     }
 
+    /// With MACHINE_BOT_USER=on.
+    #[cfg(test)]
+    pub fn with_bot_user(mut self) -> Enrollment {
+        self.bot_user = true;
+        self
+    }
+
     /// Serves `binary` as botctl, as if it shipped next to botd.
     #[cfg(test)]
     pub fn with_botctl(mut self, binary: &'static [u8]) -> Enrollment {
@@ -308,7 +323,7 @@ impl Enrollment {
 
     pub fn describe(&self) -> String {
         format!(
-            "on at {} (listening on {}, agents on port {}, {} minutes to enroll; {}; harness logins {}; folder copies {}){}",
+            "on at {} (listening on {}, agents on port {}, {} minutes to enroll; {}; harness logins {}; folder copies {}; Bots' own user {}){}",
             self.url,
             self.listen,
             self.agent_port,
@@ -316,6 +331,7 @@ impl Enrollment {
             self.upkeep.describe(),
             if self.logins { "on" } else { "off" },
             self.folder.as_ref().map_or("off".to_string(), |f| format!("on, up to {} MiB", f.max_bytes >> 20)),
+            if self.bot_user { "on" } else { "off" },
             match (&self.agent, &self.botctl) {
                 (Some(_), Some(_)) => "",
                 (None, _) =>
@@ -405,7 +421,7 @@ impl Enrollment {
             url = self.url,
             id = m.id,
             port = self.agent_port,
-            unit = indent(UNIT),
+            unit = indent(&self.unit()),
             guard = indent(GUARD),
         );
         if let Some((_, sha)) = &self.agent {
@@ -413,8 +429,10 @@ impl Enrollment {
             let botctl = self.botctl.as_ref().map_or(String::new(), |(_, b)| {
                 FIRSTBOOT_BOTCTL.replace("{url}", &self.url).replace("{sha}", b)
             });
+            let bots = if self.bot_user { FIRSTBOOT_BOT_USER.replace("{user}", wire::BOT_USER) } else { String::new() };
             let script = FIRSTBOOT
                 .replace("{botctl}\n", &botctl)
+                .replace("{bot_user}\n", &bots)
                 .replace("{url}", &self.url)
                 .replace("{sha}", sha);
             out.push_str(&format!(
@@ -427,6 +445,16 @@ impl Enrollment {
             ));
         }
         out
+    }
+
+    /// The agent's unit. With MACHINE_BOT_USER, its state folder lets the Bots' user
+    /// through to its home (ADR 0042).
+    pub fn unit(&self) -> String {
+        if self.bot_user {
+            UNIT.replace("StateDirectoryMode=0700", "StateDirectoryMode=0711")
+        } else {
+            UNIT.to_string()
+        }
     }
 
     /// An HTTPS client that accepts only `pins` and shows botd's certificate.
@@ -533,6 +561,7 @@ const FIRSTBOOT: &str = r#"#!/bin/sh
 set -eu
 dir=/usr/local/lib/superbot
 {botctl}
+{bot_user}
 bin=$dir/superbot-machine
 curl -fsS --retry 10 --retry-delay 5 --retry-all-errors --cacert /etc/superbot/ca.pem -o "$bin.new" "{url}/v1/agent"
 echo "{sha}  $bin.new" | sha256sum -c -
@@ -552,6 +581,13 @@ fi
 # cloud-init's copies of the user data hold the token; only the agent's file is needed.
 rm -f /var/lib/cloud/instance/user-data.txt /var/lib/cloud/instance/user-data.txt.i
 systemctl start superbot-machine
+"#;
+
+/// FIRSTBOOT's step making the Bots' own user (ADR 0042), so the agent needn't. It
+/// still hands the user its home when botd asks.
+const FIRSTBOOT_BOT_USER: &str = r#"mkdir -p -m 0711 /var/lib/superbot-machine
+mkdir -p -m 0700 /var/lib/superbot-machine/home
+id -u {user} >/dev/null 2>&1 || useradd --system --user-group --no-create-home --shell /usr/sbin/nologin --comment "SuperBot Bots" --home-dir /var/lib/superbot-machine/home {user}
 "#;
 
 /// FIRSTBOOT's botctl step (ADR 0036).

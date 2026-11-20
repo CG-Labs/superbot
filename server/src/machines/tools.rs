@@ -64,6 +64,8 @@ pub struct Tools {
     /// Jobs that may be using the tools, and whether an install is replacing some.
     gate: Mutex<Gate>,
     gate_open: tokio::sync::Notify,
+    /// Bots run as their own user (ADR 0042): what is installed must be readable by it.
+    open: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -248,6 +250,7 @@ impl Tools {
             http: b.build().map_err(|e| e.to_string())?,
             gate: Mutex::default(),
             gate_open: tokio::sync::Notify::new(),
+            open: Default::default(),
         });
         // An install a restart cut short starts again.
         {
@@ -420,6 +423,7 @@ impl Tools {
                     Ok(()) => println!("Installed Node.js {}.", n.version),
                     Err(e) => eprintln!("Installing Node.js {}: {e}", n.version),
                 }
+                self.open_up_if_open();
             }
             while let Some((h, node)) = self.next() {
                 let _replacing = if self.replaces(&h, node.as_ref()) { Some(self.replacing().await) } else { None };
@@ -430,8 +434,24 @@ impl Tools {
                     println!("Installed {} {}.", h.name, h.version);
                 }
                 self.finish(&h, res);
+                self.open_up_if_open();
             }
             self.wake.notified().await;
+        }
+    }
+
+    /// From now on, everything here is readable by others, as programs in /usr are:
+    /// the Bots' user runs them (ADR 0042).
+    pub fn open_up(&self) -> Result<(), String> {
+        self.open.store(true, std::sync::atomic::Ordering::SeqCst);
+        super::runas::open_up(&self.dir).map_err(|e| format!("{}: {e}", self.dir.display()))
+    }
+
+    fn open_up_if_open(&self) {
+        if self.open.load(std::sync::atomic::Ordering::SeqCst)
+            && let Err(e) = super::runas::open_up(&self.dir)
+        {
+            eprintln!("Opening up the tools: {e}");
         }
     }
 

@@ -413,6 +413,8 @@ async fn machines_that_dont_enroll_in_time_are_reported() {
         max_jobs: 8,
         tools: crate::db::temp_path("agent-tools"),
         exe: crate::db::temp_path("agent-exe"),
+        bot_user: crate::machines::wire::BOT_USER.into(),
+        allow_own_user: false,
     };
     agent::enroll(&cfg).await.unwrap();
     let row = env.app.db.machine(&mid).unwrap();

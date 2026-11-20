@@ -22,6 +22,7 @@
 //! - `POST /v1/sync` `SyncManifest` -> `SyncPlan`: copy the user's folder (ADR 0041).
 //! - `PUT /v1/sync/{id}/blobs/{sha256}?offset=<n>` (bytes) -> `BlobReply`.
 //! - `POST /v1/sync/{id}/finish` -> `SyncReport`.
+//! - `PUT /v1/bot-user` `BotUserRequest` (202): run Bots as their own OS user (ADR 0042).
 //!
 //! Protocol 1 (`PROTOCOL`) is the first that runs Bots. A heartbeat without `protocol`
 //! is from an agent before it, which can't. Installs, upgrades, logins and folder
@@ -93,6 +94,35 @@ pub const CAN_HARNESSES: &str = "harnesses";
 pub const CAN_UPGRADE: &str = "upgrade";
 pub const CAN_LOGINS: &str = "logins";
 pub const CAN_SYNC: &str = "sync";
+pub const CAN_BOT_USER: &str = "bot_user";
+
+/// The OS user Bots run as on a machine (ADR 0042). An agent may be set to another,
+/// as tests are; botd never names one.
+pub const BOT_USER: &str = "superbot-bots";
+pub const BOT_USER_READY: &str = "ready";
+pub const BOT_USER_SETTING_UP: &str = "setting_up";
+pub const BOT_USER_FAILED: &str = "failed";
+
+/// Whether Bots run as their own user on the machine (ADR 0042).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BotUserStatus {
+    /// `BOT_USER_READY`, `BOT_USER_SETTING_UP` or `BOT_USER_FAILED`.
+    pub state: String,
+    pub user: String,
+    #[serde(default)]
+    pub uid: Option<u32>,
+    #[serde(default)]
+    pub error: Option<String>,
+    /// When it got to this state.
+    pub at: i64,
+}
+
+/// `PUT /v1/bot-user`: from now on, run Bots as their own user. The agent makes the
+/// user if it must and hands it the Bots' home; it can't be undone.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BotUserRequest {}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -133,6 +163,9 @@ pub struct Heartbeat {
     /// Each harness the heartbeat asked about with `cred=`, plus any logging in now.
     #[serde(default)]
     pub logins: BTreeMap<String, LoginStatus>,
+    /// The Bots' own user, once botd has asked for one (ADR 0042).
+    #[serde(default)]
+    pub bot_user: Option<BotUserStatus>,
 }
 
 /// Whether a harness is logged in on the machine: whether one of the credential files

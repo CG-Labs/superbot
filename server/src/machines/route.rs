@@ -96,6 +96,10 @@ pub enum Refusal {
     NotLoggedIn(String),
     /// The owner's folder is being copied there for the first time (ADR 0041).
     FolderCopying,
+    /// Bots' own user there isn't ready yet (ADR 0042).
+    BotUserPending,
+    /// Its agent couldn't set up the Bots' own user (ADR 0042).
+    BotUserFailed,
 }
 
 impl Refusal {
@@ -113,6 +117,8 @@ impl Refusal {
             Refusal::NoBotctl => "agent_incomplete",
             Refusal::NotLoggedIn(_) => "harness_not_logged_in",
             Refusal::FolderCopying => "folder_copying",
+            Refusal::BotUserPending => "bot_user_pending",
+            Refusal::BotUserFailed => "bot_user_failed",
         }
     }
 
@@ -131,6 +137,8 @@ impl Refusal {
             Refusal::NoBotctl => "I didn't run: botctl isn't installed on your computer, so I couldn't ask you before risky steps. Ask an admin to install it.".into(),
             Refusal::NotLoggedIn(h) => format!("I didn't run: {h} isn't logged in on your computer. Ask an admin to log it in there (`botctl machine harness-login <your email> {h}`), or save an API key for it in your secrets."),
             Refusal::FolderCopying => "I didn't run: your files are still being copied to your computer. Try again in a few minutes.".into(),
+            Refusal::BotUserPending => "I didn't run: your computer is still setting up a separate account for your Bots. Try again in a few minutes.".into(),
+            Refusal::BotUserFailed => "I didn't run: your computer couldn't set up a separate account for your Bots. Ask an admin to look at it (`botctl machine agent <your email>`).".into(),
         }
     }
 }
@@ -440,5 +448,7 @@ mod tests {
         assert_eq!(Refusal::NotLoggedIn("claude".into()).reason(), "harness_not_logged_in");
         assert!(Refusal::NotLoggedIn("codex".into()).message().contains("botctl machine harness-login <your email> codex"));
         assert_eq!(Refusal::FolderCopying.reason(), "folder_copying");
+        assert_eq!(Refusal::BotUserPending.reason(), "bot_user_pending");
+        assert_eq!(Refusal::BotUserFailed.reason(), "bot_user_failed");
     }
 }

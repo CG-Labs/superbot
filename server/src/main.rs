@@ -448,6 +448,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/machine/agent/upgrade", post(machines::upkeep::upgrade_now))
         .route("/users/{key}/machine/agent/hold", put(machines::upkeep::hold).delete(machines::upkeep::release))
         .route("/users/{key}/machine/harnesses", post(machines::upkeep::harnesses_now))
+        .route("/users/{key}/machine/bot-user", post(machines::botuser::now_for))
         .route("/users/{key}/machine/harness-login", post(machines::logins::admin_start))
         .route("/users/{key}/machine/harness-login/{id}", delete(machines::logins::admin_abort))
         .route("/users/{key}/machine/harness-login/{id}/input", post(machines::logins::admin_input))

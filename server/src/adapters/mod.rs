@@ -101,7 +101,7 @@ pub(crate) fn strip_secret_env(cmd: &mut std::process::Command) {
 
 /// How jobs start on this server: botd's environment, without its secrets.
 pub fn local_host() -> job::Host {
-    job::Host { clear_env: false, remove: secret_env(), env: BTreeMap::new() }
+    job::Host { clear_env: false, remove: secret_env(), env: BTreeMap::new(), user: None }
 }
 
 pub trait Adapter: Send {

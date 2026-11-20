@@ -1,0 +1,472 @@
+//! The Bots' own OS user on a machine (ADR 0042). The agent stays root, for upgrades
+//! and its key; everything a Bot can touch runs as an unprivileged user instead:
+//! harnesses, logins and cleanups get its uid and gid, and every file the agent reads
+//! or writes in the Bots' home goes through `as_user`, so a link a Bot left there can't
+//! turn root's write into a write elsewhere, or root's read into a leak of the key.
+//! Shared by the agent binary and botd's tests, so it uses nothing of botd's.
+
+// Shared by two binaries, each of which uses only part of it.
+#![allow(dead_code)]
+
+use std::ffi::{CStr, CString};
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
+
+/// A user and group to run as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Ids {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// An OS user name useradd takes: lower case, at most 32 bytes.
+pub fn plain_user(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty()
+        && b.len() <= 32
+        && (b[0].is_ascii_lowercase() || b[0] == b'_')
+        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'_' | b'-'))
+}
+
+/// `name`'s uid, gid and home, if the user exists.
+pub fn lookup(name: &str) -> Option<(Ids, std::path::PathBuf)> {
+    let c = CString::new(name).ok()?;
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 16 << 10];
+    let mut out: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer is valid for the call; the result points into `buf`.
+    let r = unsafe { libc::getpwnam_r(c.as_ptr(), &mut pw, buf.as_mut_ptr(), buf.len(), &mut out) };
+    if r != 0 || out.is_null() {
+        return None;
+    }
+    // SAFETY: getpwnam_r succeeded, so pw_dir is a C string in `buf`.
+    let home = unsafe { CStr::from_ptr(pw.pw_dir) };
+    Some((
+        Ids { uid: pw.pw_uid, gid: pw.pw_gid },
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(home.to_bytes())),
+    ))
+}
+
+/// The user this process runs as, by name: tests stand it in for the Bots' user.
+pub fn current_user() -> Option<String> {
+    // SAFETY: getpwuid returns static storage or null; it's read at once.
+    unsafe {
+        let pw = libc::getpwuid(libc::geteuid());
+        (!pw.is_null()).then(|| CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned())
+    }
+}
+
+pub fn is_root() -> bool {
+    // SAFETY: no arguments, no failure.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// useradd's arguments for the Bots' user: a system user with its own group, no
+/// login shell, `home` as its home, which the agent made.
+pub fn useradd_args(name: &str, home: &Path) -> Vec<String> {
+    [
+        "--system",
+        "--user-group",
+        "--no-create-home",
+        "--shell",
+        "/usr/sbin/nologin",
+        "--comment",
+        "SuperBot Bots",
+        "--home-dir",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .chain([home.display().to_string(), name.to_string()])
+    .collect()
+}
+
+fn run(program: &str, args: &[String]) -> Result<(), String> {
+    let out = std::process::Command::new(program)
+        .args(args)
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("couldn't start {program}: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let why = String::from_utf8_lossy(&out.stderr);
+    Err(format!("{program} failed ({}): {}", out.status, why.trim().lines().last().unwrap_or("")))
+}
+
+/// Makes the user if it isn't there. An agent from before ADR 0042 runs in a unit that
+/// can't write /etc, so when useradd fails there, systemd runs it outside the unit.
+pub fn ensure_user(name: &str, home: &Path) -> Result<Ids, String> {
+    if let Some((ids, _)) = lookup(name) {
+        return Ok(ids);
+    }
+    let args = useradd_args(name, home);
+    if let Err(direct) = run("useradd", &args) {
+        let mut outside = vec!["--quiet".into(), "--wait".into(), "--collect".into(), "--".into(), "useradd".into()];
+        outside.extend(args);
+        if let Err(via) = run("systemd-run", &outside) {
+            return Err(format!("{direct}; through systemd: {via}"));
+        }
+    }
+    lookup(name).map(|(ids, _)| ids).ok_or_else(|| format!("useradd made no user {name}"))
+}
+
+fn raw(call: libc::c_long, a: libc::c_long, b: libc::c_long) -> libc::c_long {
+    // SAFETY: the credential syscalls below take plain integers or a valid buffer.
+    unsafe { libc::syscall(call, a, b) }
+}
+
+/// This thread's supplementary groups.
+fn groups() -> io::Result<Vec<libc::gid_t>> {
+    let n = raw(libc::SYS_getgroups, 0, 0);
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut g = vec![0 as libc::gid_t; n as usize];
+    let n = raw(libc::SYS_getgroups, n, g.as_mut_ptr() as libc::c_long);
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    g.truncate(n as usize);
+    Ok(g)
+}
+
+fn set_groups(g: &[libc::gid_t]) -> io::Result<()> {
+    // The raw call changes this thread only; glibc's would change every thread.
+    if raw(libc::SYS_setgroups, g.len() as libc::c_long, g.as_ptr() as libc::c_long) < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// setfsuid and setfsgid return the old value and can't fail loudly: asking with -1
+/// changes nothing and says what it is.
+fn fsuid(id: u32) -> u32 {
+    raw(libc::SYS_setfsuid, id as libc::c_long, 0) as u32
+}
+
+fn fsgid(id: u32) -> u32 {
+    raw(libc::SYS_setfsgid, id as libc::c_long, 0) as u32
+}
+
+/// This thread's file identity, put back when dropped.
+struct Switched {
+    uid: u32,
+    gid: u32,
+    groups: Option<Vec<libc::gid_t>>,
+}
+
+impl Drop for Switched {
+    fn drop(&mut self) {
+        fsuid(self.uid);
+        fsgid(self.gid);
+        if let Some(g) = &self.groups {
+            let _ = set_groups(g);
+        }
+    }
+}
+
+fn switch(ids: Ids) -> io::Result<Switched> {
+    let groups = if is_root() {
+        let g = groups()?;
+        set_groups(&[ids.gid])?;
+        Some(g)
+    } else {
+        None
+    };
+    let s = Switched {
+        gid: fsgid(ids.gid),
+        uid: fsuid(ids.uid),
+        groups,
+    };
+    if fsuid(u32::MAX) != ids.uid || fsgid(u32::MAX) != ids.gid {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "couldn't take on the Bots' user"));
+    }
+    Ok(s)
+}
+
+/// Runs `f` with this thread's file access as `ids` (the Bots' user), or as itself
+/// when `None`. Only file permission checks change, and only on this thread, for the
+/// length of `f`, which must not yield to other tasks.
+pub fn as_user<T>(ids: Option<Ids>, f: impl FnOnce() -> T) -> io::Result<T> {
+    let Some(ids) = ids else {
+        return Ok(f());
+    };
+    let _s = switch(ids)?;
+    Ok(f())
+}
+
+fn last<T>(r: libc::c_int, ok: T) -> io::Result<T> {
+    if r < 0 { Err(io::Error::last_os_error()) } else { Ok(ok) }
+}
+
+fn open_at(dir: libc::c_int, name: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
+    // SAFETY: a valid C string; the descriptor is owned on success.
+    let fd = unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOCTTY) };
+    last(fd, ()).map(|()| unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn fstat(fd: &OwnedFd) -> io::Result<libc::stat> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: an open descriptor and a buffer for the answer.
+    let r = unsafe { libc::fstat(fd.as_raw_fd(), &mut st) };
+    last(r, st)
+}
+
+fn lstat_at(dir: &OwnedFd, name: &CStr) -> io::Result<libc::stat> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above, never following a link.
+    let r = unsafe { libc::fstatat(dir.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+    last(r, st)
+}
+
+/// The names in an open folder, without `.` and `..`.
+fn names(dir: &OwnedFd) -> io::Result<Vec<CString>> {
+    // SAFETY: a new descriptor for the folder, owned by the DIR stream, closed with it.
+    unsafe {
+        let fd = libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0);
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let d = libc::fdopendir(fd);
+        if d.is_null() {
+            libc::close(fd);
+            return Err(io::Error::last_os_error());
+        }
+        libc::rewinddir(d);
+        let mut out = Vec::new();
+        loop {
+            let e = libc::readdir(d);
+            if e.is_null() {
+                break;
+            }
+            let name = CStr::from_ptr((*e).d_name.as_ptr());
+            if name.to_bytes() != b"." && name.to_bytes() != b".." {
+                out.push(name.to_owned());
+            }
+        }
+        libc::closedir(d);
+        Ok(out)
+    }
+}
+
+/// What a hand-over did.
+#[derive(Debug, Default, PartialEq)]
+pub struct Handed {
+    pub changed: u64,
+    /// Files with other hard links, devices, pipes and sockets: left as they were.
+    pub skipped: u64,
+}
+
+const MAX_DEPTH: usize = 256;
+const SETID: u32 = (libc::S_ISUID | libc::S_ISGID) as u32;
+
+fn give(fd: &OwnedFd, st: &libc::stat, ids: Ids, mode: Option<u32>) -> io::Result<()> {
+    // SAFETY: an open descriptor; chown and chmod act on what it is, not on a name.
+    unsafe {
+        last(libc::fchown(fd.as_raw_fd(), ids.uid, ids.gid), ())?;
+        let want = mode.unwrap_or(st.st_mode & 0o7777 & !SETID);
+        if want != st.st_mode & 0o7777 {
+            last(libc::fchmod(fd.as_raw_fd(), want as libc::mode_t), ())?;
+        }
+    }
+    Ok(())
+}
+
+fn walk(dir: &OwnedFd, ids: Ids, depth: usize, out: &mut Handed) -> io::Result<()> {
+    if depth > MAX_DEPTH {
+        return Err(io::Error::other("folders nested too deep"));
+    }
+    for name in names(dir)? {
+        let Ok(st) = lstat_at(dir, &name) else { continue };
+        match st.st_mode & libc::S_IFMT {
+            libc::S_IFDIR => {
+                let sub = open_at(dir.as_raw_fd(), &name, libc::O_RDONLY | libc::O_DIRECTORY)?;
+                let st = fstat(&sub)?;
+                give(&sub, &st, ids, None)?;
+                out.changed += 1;
+                walk(&sub, ids, depth + 1, out)?;
+            }
+            libc::S_IFREG => {
+                let Ok(f) = open_at(dir.as_raw_fd(), &name, libc::O_RDONLY | libc::O_NONBLOCK) else {
+                    out.skipped += 1;
+                    continue;
+                };
+                let st = fstat(&f)?;
+                if st.st_mode & libc::S_IFMT != libc::S_IFREG || st.st_nlink > 1 {
+                    out.skipped += 1;
+                    continue;
+                }
+                give(&f, &st, ids, None)?;
+                out.changed += 1;
+            }
+            libc::S_IFLNK => {
+                // SAFETY: changes the link itself, never what it points to.
+                let r = unsafe {
+                    libc::fchownat(dir.as_raw_fd(), name.as_ptr(), ids.uid, ids.gid, libc::AT_SYMLINK_NOFOLLOW)
+                };
+                last(r, ())?;
+                out.changed += 1;
+            }
+            _ => out.skipped += 1,
+        }
+    }
+    Ok(())
+}
+
+/// Gives `root` (made 0700) and everything under it to `ids`, never following a link,
+/// and drops setuid and setgid bits. A file with another hard link may be someone
+/// else's file, so it is left alone; so are devices, pipes and sockets.
+pub fn hand_over(root: &Path, ids: Ids) -> io::Result<Handed> {
+    let c = CString::new(root.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    let top = open_at(libc::AT_FDCWD, &c, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    let st = fstat(&top)?;
+    give(&top, &st, ids, Some(0o700))?;
+    let mut out = Handed { changed: 1, skipped: 0 };
+    walk(&top, ids, 0, &mut out)?;
+    Ok(out)
+}
+
+/// Lets everyone read `root` and run what its owner can, as for programs in
+/// /usr: the tools the Bots' user runs. Links are left alone.
+pub fn open_up(root: &Path) -> io::Result<()> {
+    fn walk(dir: &OwnedFd, depth: usize) -> io::Result<()> {
+        if depth > MAX_DEPTH {
+            return Err(io::Error::other("folders nested too deep"));
+        }
+        for name in names(dir)? {
+            let Ok(st) = lstat_at(dir, &name) else { continue };
+            let kind = st.st_mode & libc::S_IFMT;
+            if kind != libc::S_IFDIR && kind != libc::S_IFREG {
+                continue;
+            }
+            let flags = if kind == libc::S_IFDIR { libc::O_RDONLY | libc::O_DIRECTORY } else { libc::O_RDONLY | libc::O_NONBLOCK };
+            let Ok(fd) = open_at(dir.as_raw_fd(), &name, flags) else { continue };
+            readable(&fd)?;
+            if kind == libc::S_IFDIR {
+                walk(&fd, depth + 1)?;
+            }
+        }
+        Ok(())
+    }
+    fn readable(fd: &OwnedFd) -> io::Result<()> {
+        let st = fstat(fd)?;
+        let mode = st.st_mode & 0o7777;
+        let x = if mode & 0o100 != 0 || st.st_mode & libc::S_IFMT == libc::S_IFDIR { 0o011 } else { 0 };
+        let want = mode | 0o044 | x;
+        if want != mode {
+            // SAFETY: an open descriptor.
+            last(unsafe { libc::fchmod(fd.as_raw_fd(), want as libc::mode_t) }, ())?;
+        }
+        Ok(())
+    }
+    let c = CString::new(root.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    let top = open_at(libc::AT_FDCWD, &c, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    readable(&top)?;
+    walk(&top, 0)
+}
+
+/// Sets `p`'s mode, refusing a link.
+pub fn chmod_dir(p: &Path, mode: u32) -> io::Result<()> {
+    let c = CString::new(p.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    let fd = open_at(libc::AT_FDCWD, &c, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    // SAFETY: an open descriptor.
+    last(unsafe { libc::fchmod(fd.as_raw_fd(), mode as libc::mode_t) }, ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "superbot-runas-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn me() -> Ids {
+        // SAFETY: no arguments.
+        unsafe { Ids { uid: libc::geteuid(), gid: libc::getegid() } }
+    }
+
+    #[test]
+    fn user_names_are_plain() {
+        for ok in ["superbot-bots", "_x", "a1"] {
+            assert!(plain_user(ok), "{ok}");
+        }
+        for no in ["", "Root", "1a", "a b", "a/b", "-a", &"a".repeat(33)] {
+            assert!(!plain_user(no), "{no}");
+        }
+        let a = useradd_args("superbot-bots", Path::new("/var/lib/superbot-machine/home"));
+        assert_eq!(a.last().unwrap(), "superbot-bots");
+        assert!(a.windows(2).any(|w| w == ["--home-dir", "/var/lib/superbot-machine/home"]));
+        assert!(a.iter().any(|s| s == "--system") && a.iter().any(|s| s == "--no-create-home"));
+    }
+
+    #[test]
+    fn the_current_user_is_found_and_a_missing_one_is_not() {
+        let name = current_user().unwrap();
+        assert_eq!(lookup(&name).unwrap().0.uid, me().uid);
+        assert!(lookup("superbot-no-such-user").is_none());
+        assert_eq!(ensure_user(&name, Path::new("/nonexistent")).unwrap().uid, me().uid);
+    }
+
+    #[test]
+    fn as_user_switches_this_thread_and_puts_it_back() {
+        let ids = me();
+        let got = as_user(Some(ids), || (fsuid(u32::MAX), fsgid(u32::MAX))).unwrap();
+        assert_eq!(got, (ids.uid, ids.gid));
+        assert_eq!(fsuid(u32::MAX), ids.uid);
+        assert_eq!(as_user(None, || 7).unwrap(), 7);
+        if !is_root() {
+            // Someone else's uid can't be taken without root: refused, not ignored.
+            let other = Ids { uid: ids.uid + 1, gid: ids.gid };
+            assert!(as_user(Some(other), || ()).is_err());
+            assert_eq!(fsuid(u32::MAX), ids.uid);
+        }
+    }
+
+    #[test]
+    fn a_hand_over_never_follows_links_and_drops_setid_bits() {
+        let d = scratch("hand");
+        let home = d.join("home");
+        std::fs::create_dir_all(home.join("a/b")).unwrap();
+        std::fs::write(home.join("a/b/f"), "x").unwrap();
+        std::fs::set_permissions(home.join("a/b/f"), std::fs::Permissions::from_mode(0o4755)).unwrap();
+        let outside = d.join("outside");
+        std::fs::write(&outside, "keep").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o4755)).unwrap();
+        std::os::unix::fs::symlink(&outside, home.join("link")).unwrap();
+        std::os::unix::fs::symlink(&d, home.join("a/up")).unwrap();
+        std::fs::hard_link(&outside, home.join("hard")).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let r = hand_over(&home, me()).unwrap();
+        assert_eq!(r.skipped, 1, "the hard link");
+        assert_eq!(r.changed, 6);
+        let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().mode() & 0o7777;
+        assert_eq!(mode(&home), 0o700);
+        assert_eq!(mode(&home.join("a/b/f")), 0o755);
+        assert_eq!(mode(&outside), 0o4755, "never through a link or a hard link");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+        assert!(hand_over(&home.join("link"), me()).is_err(), "the top can't be a link");
+
+        std::fs::set_permissions(home.join("a"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(home.join("a/b/f"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        open_up(&home).unwrap();
+        assert_eq!(mode(&home), 0o755);
+        assert_eq!(mode(&home.join("a")), 0o755);
+        assert_eq!(mode(&home.join("a/b/f")), 0o755);
+        chmod_dir(&home, 0o711).unwrap();
+        assert_eq!(mode(&home), 0o711);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
