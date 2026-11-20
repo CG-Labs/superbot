@@ -1084,6 +1084,27 @@ async fn read_capped(r: &mut reqwest::Response, max: usize) -> Option<Vec<u8>> {
     }
 }
 
+/// The whole events in `buf` once `chunk` is added; `buf` keeps the unfinished line.
+/// Lines that aren't events are skipped. None: a line, finished or not, is over
+/// `MAX_EVENT`.
+fn take_events(buf: &mut Vec<u8>, chunk: &[u8]) -> Option<Vec<JobEvent>> {
+    // What was already in `buf` has no newline: search only what's new.
+    let mut from = buf.len();
+    buf.extend_from_slice(chunk);
+    let mut events = Vec::new();
+    while let Some(i) = buf[from..].iter().position(|b| *b == b'\n') {
+        let line: Vec<u8> = buf.drain(..=from + i).collect();
+        from = 0;
+        if line.len() > MAX_EVENT + 1 {
+            return None;
+        }
+        if let Ok(ev) = serde_json::from_slice::<JobEvent>(&line) {
+            events.push(ev);
+        }
+    }
+    (buf.len() <= MAX_EVENT).then_some(events)
+}
+
 /// Hands jobs to a user's machine over mutual TLS, to that machine's own pinned
 /// certificate only, and streams back what happens (ADR 0036).
 pub struct Mtls(pub Arc<Enrollment>);
@@ -1136,6 +1157,13 @@ impl Mtls {
                 }
             });
         };
+        let too_much = || {
+            stop_there("too much output".into());
+            Err(format!(
+                "Your computer sent more than {} MiB in one go, so I stopped listening.",
+                MAX_EVENT >> 20
+            ))
+        };
         let mut buf: Vec<u8> = Vec::new();
         let mut deadline: Option<tokio::time::Instant> = None;
         loop {
@@ -1148,24 +1176,14 @@ impl Mtls {
             tokio::select! {
                 chunk = r.chunk() => match chunk {
                     Ok(Some(bytes)) => {
-                        // What was already in `buf` has no newline: search only what's new.
-                        let mut from = buf.len();
-                        buf.extend_from_slice(&bytes);
-                        while let Some(i) = buf[from..].iter().position(|b| *b == b'\n') {
-                            let line: Vec<u8> = buf.drain(..=from + i).collect();
-                            from = 0;
-                            let Ok(ev) = serde_json::from_slice::<JobEvent>(&line) else { continue };
+                        let Some(events) = take_events(&mut buf, &bytes) else {
+                            return too_much();
+                        };
+                        for ev in events {
                             if !matches!(ev, JobEvent::Ping) && tx.send(ev).await.is_err() {
                                 stop_there("botd stopped listening".into());
                                 return Ok(());
                             }
-                        }
-                        if buf.len() > MAX_EVENT {
-                            stop_there("too much output".into());
-                            return Err(format!(
-                                "Your computer sent more than {} MiB in one go, so I stopped listening.",
-                                MAX_EVENT >> 20
-                            ));
                         }
                     }
                     Ok(None) => return Ok(()),
@@ -1513,6 +1531,38 @@ mod tests {
             .output()
             .unwrap();
         assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stderr));
+    }
+
+    #[test]
+    fn job_events_are_split_by_line_and_capped() {
+        let line = |ev: &JobEvent| format!("{}\n", serde_json::to_string(ev).unwrap());
+        let mut buf = Vec::new();
+        let started = line(&JobEvent::Started);
+        let (a, b) = started.split_at(4);
+        assert_eq!(take_events(&mut buf, a.as_bytes()), Some(vec![]));
+        let ping = line(&JobEvent::Ping);
+        assert_eq!(
+            take_events(&mut buf, format!("{b}not json\n{ping}").as_bytes()),
+            Some(vec![JobEvent::Started, JobEvent::Ping])
+        );
+        assert!(buf.is_empty());
+
+        let huge = line(&JobEvent::Line { line: "a".repeat(MAX_EVENT) });
+        assert_eq!(
+            take_events(&mut Vec::new(), huge.as_bytes()),
+            None,
+            "a whole line over the cap, in one chunk"
+        );
+        assert_eq!(
+            take_events(&mut Vec::new(), &huge.as_bytes()[..MAX_EVENT + 1]),
+            None,
+            "the start of one"
+        );
+        let most = "a".repeat(MAX_EVENT - 64);
+        assert_eq!(
+            take_events(&mut Vec::new(), line(&JobEvent::Line { line: most.clone() }).as_bytes()),
+            Some(vec![JobEvent::Line { line: most }])
+        );
     }
 
     /// The first-boot script as cloud-init will write it.
