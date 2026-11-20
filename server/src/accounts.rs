@@ -245,19 +245,10 @@ pub fn remove(path: &Path) {
     }
 }
 
-/// What logs each harness in. Run as the user's account, at a terminal.
-pub fn login_args(harness: &str) -> Option<&'static [&'static str]> {
-    match harness {
-        "claude" => Some(&["auth", "login"]),
-        "codex" => Some(&["login"]),
-        _ => None,
-    }
-}
-
 /// Admin API: a user's account, making it now, and logging a harness in as them
 /// (`botctl user isolation | isolate | harness-login`). Under `/api/users`, so admins only.
 pub mod http {
-    use super::{Isolation, HARNESSES, account, login_args};
+    use super::{Isolation, HARNESSES, account};
     use crate::audit::Who;
     use crate::users::need_user_key;
     use crate::{ApiError, AppState, Res, bad};
@@ -318,7 +309,10 @@ pub mod http {
             return Err(bad("That user is disabled"));
         }
         let harness = v["harness"].as_str().unwrap_or_default();
-        let default = login_args(harness).ok_or_else(|| bad(format!("harness must be one of: {}", HARNESSES.join(", "))))?;
+        let adapter = HARNESSES.contains(&harness).then(|| crate::adapters::get(harness)).flatten();
+        let (bin, default) = adapter
+            .and_then(|a| Some((a.bin(), a.login_args()?)))
+            .ok_or_else(|| bad(format!("harness must be one of: {}", HARNESSES.join(", "))))?;
         let custom = !matches!(v.get("args"), None | Some(Value::Null));
         let args: Vec<String> = match v.get("args") {
             None | Some(Value::Null) => default.iter().map(|s| s.to_string()).collect(),
@@ -333,7 +327,7 @@ pub mod http {
         // Not the arguments: they could hold a key.
         let details = json!({ "harness": harness, "account": run_as.account, "customArgs": custom });
         app.db.record(&by.event("harness.login_started").target("user", &u.id).details(details));
-        let command: Vec<String> = run_as.argv(harness, args).into_iter().map(|s| s.to_string_lossy().into_owned()).collect();
+        let command: Vec<String> = run_as.argv(bin, args).into_iter().map(|s| s.to_string_lossy().into_owned()).collect();
         let home = iso.home(&u.id);
         Ok(Json(json!({ "user": u.id, "account": run_as.account, "harness": harness, "home": home, "command": command })))
     }

@@ -133,6 +133,10 @@ pub trait Adapter: Send {
     fn max_hook_secs(&self) -> Option<u64> {
         None
     }
+    /// What logs the harness in, run at a terminal as the account its runs use.
+    fn login_args(&self) -> Option<&'static [&'static str]> {
+        None
+    }
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -382,6 +386,7 @@ mod tests {
         for name in crate::accounts::HARNESSES {
             let job = job_for(get(name).unwrap().as_mut(), &input(&dir, None), &mut Vec::new());
             assert!(job.files.is_empty() && job.cleanup.is_none(), "{name}");
+            assert!(get(name).unwrap().login_args().is_some(), "an admin logs {name} in as each user");
         }
     }
 

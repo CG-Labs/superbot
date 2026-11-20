@@ -75,6 +75,10 @@ impl Adapter for Codex {
         "shell"
     }
 
+    fn login_args(&self) -> Option<&'static [&'static str]> {
+        Some(&["login"])
+    }
+
     fn models(&self) -> Vec<ModelOption> {
         let v: Value = serde_json::from_str(&output("codex", &["debug", "models"])).unwrap_or_default();
         v["models"]
