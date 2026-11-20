@@ -570,12 +570,12 @@ fn usage_summary(v: &Value) -> String {
         Some(l) => format!("{}/{l}", used.as_u64().unwrap_or(0)),
         None => format!("{}/unlimited", used.as_u64().unwrap_or(0)),
     };
-    let billing = match (v["billing"] == true, v["checkout"] == true) {
+    let mode = match (v["billing"] == true, v["checkout"] == true) {
         (false, _) => "off",
         (true, false) => "Stripe webhook on, checkout off",
         (true, true) => "Stripe webhook and checkout on",
     };
-    let mut out = format!("Billing: {billing}.\n");
+    let mut out = format!("Billing: {mode}.\n");
     for u in v["users"].as_array().into_iter().flatten() {
         let (p, use_) = (&u["plan"], &u["plan"]["usage"]);
         let who = u["user"]["email"].as_str().or(u["user"]["name"].as_str()).unwrap_or_default();
