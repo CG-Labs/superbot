@@ -10,7 +10,7 @@ pub type Fut<'a, T> = Pin<Box<dyn Future<Output = Result<T, ProviderError>> + Se
 
 /// What to create. `label` is unique per provider account and is the idempotency key:
 /// a second create with the same label fails with `LabelTaken`, never makes a twin.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct CreateSpec {
     pub label: String,
     pub plan: String,
@@ -21,6 +21,44 @@ pub struct CreateSpec {
     /// cloud-init user data for the first boot: the enrollment token and how to reach
     /// the control plane (ADR 0031). None when enrollment is off.
     pub user_data: Option<String>,
+    /// The firewall the machine is behind from its first boot (ADR 0035).
+    pub firewall_id: Option<String>,
+}
+
+/// The user data holds a live enrollment token, so it never reaches a log.
+impl fmt::Debug for CreateSpec {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("CreateSpec")
+            .field("label", &self.label)
+            .field("plan", &self.plan)
+            .field("region", &self.region)
+            .field("image", &self.image)
+            .field("tags", &self.tags)
+            .field("authorized_keys", &self.authorized_keys.len())
+            .field("user_data", &self.user_data.as_ref().map(|_| "[redacted]"))
+            .field("firewall_id", &self.firewall_id)
+            .finish()
+    }
+}
+
+/// One inbound rule: accept TCP on `ports` from `sources` (canonical CIDRs, sorted).
+/// The control plane's firewalls drop every other inbound packet and let machines
+/// call out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FirewallRule {
+    pub label: String,
+    pub ports: String,
+    pub sources: Vec<String>,
+}
+
+/// A firewall as the provider sees it. `rules` is None when it isn't of the control
+/// plane's shape (inbound drop, outbound accept, only TCP accept rules inbound), so
+/// it will be set again.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProviderFirewall {
+    pub id: String,
+    pub label: String,
+    pub rules: Option<Vec<FirewallRule>>,
 }
 
 /// A machine as the provider sees it. `status` is the provider's own word for it
@@ -89,4 +127,23 @@ pub trait MachineProvider: Send + Sync {
     fn enable_backups<'a>(&'a self, id: &'a str) -> Fut<'a, ()>;
     /// Deletes the machine and its disks. Succeeds if it is already gone.
     fn delete<'a>(&'a self, id: &'a str) -> Fut<'a, ()>;
+
+    // Firewalls (ADR 0035). Labels are unique per account, as machines' are.
+
+    fn find_firewall<'a>(&'a self, label: &'a str) -> Fut<'a, Option<ProviderFirewall>>;
+    /// Makes a firewall covering no machines yet. `LabelTaken` if one has the label.
+    fn create_firewall<'a>(
+        &'a self,
+        label: &'a str,
+        tags: &'a [String],
+        rules: &'a [FirewallRule],
+    ) -> Fut<'a, ProviderFirewall>;
+    fn set_firewall_rules<'a>(&'a self, id: &'a str, rules: &'a [FirewallRule]) -> Fut<'a, ()>;
+    /// The ids of the machines it covers.
+    fn firewall_machines<'a>(&'a self, id: &'a str) -> Fut<'a, Vec<String>>;
+    fn attach_firewall<'a>(&'a self, id: &'a str, machine: &'a str) -> Fut<'a, ()>;
+    /// Succeeds if the machine isn't behind it, or either is gone.
+    fn detach_firewall<'a>(&'a self, id: &'a str, machine: &'a str) -> Fut<'a, ()>;
+    /// Succeeds if it is already gone.
+    fn delete_firewall<'a>(&'a self, id: &'a str) -> Fut<'a, ()>;
 }

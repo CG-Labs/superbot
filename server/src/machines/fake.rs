@@ -1,9 +1,15 @@
 //! An in-memory provider for tests: no network, no money. Labels are unique, as at
 //! Linode. A new machine is `provisioning` and a booted one `booting` until the next
 //! `get`, which finds them `running`, so reconciliation has something to do.
+//! Firewalls follow Linode's rules too: labels are unique, a machine is behind at most
+//! one, a create naming a firewall puts the machine behind it, and deleting a machine
+//! takes it off.
 
-use super::provider::{CreateSpec, Fut, MachineProvider, ProviderError, ProviderMachine};
-use std::collections::{BTreeMap, HashMap};
+use super::provider::{
+    CreateSpec, FirewallRule, Fut, MachineProvider, ProviderError, ProviderFirewall,
+    ProviderMachine,
+};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
 
 #[derive(Default)]
@@ -11,15 +17,40 @@ pub struct Fake {
     state: Mutex<State>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct FakeFirewall {
+    pub id: String,
+    pub label: String,
+    pub tags: Vec<String>,
+    pub rules: Vec<FirewallRule>,
+    /// Set behind the control plane's back: rules of a shape it doesn't make.
+    pub foreign: bool,
+    pub machines: BTreeSet<String>,
+}
+
 #[derive(Default)]
 struct State {
     next: u64,
     machines: BTreeMap<String, ProviderMachine>,
+    firewalls: BTreeMap<String, FakeFirewall>,
     /// One-shot failures, by operation name (`create`, `get`, `shutdown`, ...).
     fail: HashMap<&'static str, ProviderError>,
     calls: Vec<String>,
     /// The user data each create was sent, by label: what the machine boots with.
     user_data: HashMap<String, String>,
+}
+
+fn refused(message: &str) -> ProviderError {
+    ProviderError::Api {
+        status: 400,
+        message: message.into(),
+    }
+}
+
+impl State {
+    fn firewall_of(&self, machine: &str) -> Option<&FakeFirewall> {
+        self.firewalls.values().find(|f| f.machines.contains(machine))
+    }
 }
 
 impl Fake {
@@ -78,7 +109,11 @@ impl Fake {
 
     /// Deleted behind the control plane's back.
     pub fn remove(&self, id: &str) {
-        self.state.lock().unwrap().machines.remove(id);
+        let mut s = self.state.lock().unwrap();
+        s.machines.remove(id);
+        for f in s.firewalls.values_mut() {
+            f.machines.remove(id);
+        }
     }
 
     pub fn machines(&self) -> Vec<ProviderMachine> {
@@ -89,6 +124,40 @@ impl Fake {
             .values()
             .cloned()
             .collect()
+    }
+
+    pub fn firewalls(&self) -> Vec<FakeFirewall> {
+        self.state
+            .lock()
+            .unwrap()
+            .firewalls
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// A firewall changed behind the control plane's back, e.g. in the provider's console.
+    pub fn set_firewall(&self, id: &str, f: impl FnOnce(&mut FakeFirewall)) {
+        f(self.state.lock().unwrap().firewalls.get_mut(id).unwrap());
+    }
+
+    /// A firewall made behind the control plane's back.
+    pub fn insert_firewall(&self, label: &str, machines: &[&str]) -> String {
+        let mut s = self.state.lock().unwrap();
+        s.next += 1;
+        let id = (500 + s.next).to_string();
+        s.firewalls.insert(
+            id.clone(),
+            FakeFirewall {
+                id: id.clone(),
+                label: label.into(),
+                tags: Vec::new(),
+                rules: Vec::new(),
+                foreign: true,
+                machines: machines.iter().map(|m| m.to_string()).collect(),
+            },
+        );
+        id
     }
 
     /// What the last create for `label` carried as cloud-init user data.
@@ -105,6 +174,25 @@ impl Fake {
             .filter(|c| *c == op)
             .count()
     }
+
+    /// Calls to any firewall operation.
+    pub fn firewall_calls(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|c| c.contains("firewall"))
+            .count()
+    }
+}
+
+fn view(f: &FakeFirewall) -> ProviderFirewall {
+    ProviderFirewall {
+        id: f.id.clone(),
+        label: f.label.clone(),
+        rules: (!f.foreign).then(|| f.rules.clone()),
+    }
 }
 
 impl MachineProvider for Fake {
@@ -117,6 +205,11 @@ impl MachineProvider for Fake {
             self.with("create", |s| {
                 if s.machines.values().any(|m| m.label == spec.label) {
                     return Err(ProviderError::LabelTaken);
+                }
+                if let Some(fw) = &spec.firewall_id
+                    && !s.firewalls.contains_key(fw)
+                {
+                    return Err(refused("firewall_id: Not found"));
                 }
                 if let Some(ud) = &spec.user_data {
                     s.user_data.insert(spec.label.clone(), ud.clone());
@@ -133,6 +226,9 @@ impl MachineProvider for Fake {
                     backups: false,
                     tags: spec.tags.clone(),
                 };
+                if let Some(fw) = &spec.firewall_id {
+                    s.firewalls.get_mut(fw).unwrap().machines.insert(id.clone());
+                }
                 s.machines.insert(id, m.clone());
                 Ok(m)
             })
@@ -183,6 +279,106 @@ impl MachineProvider for Fake {
         Box::pin(async move {
             self.with("delete", |s| {
                 s.machines.remove(id);
+                for f in s.firewalls.values_mut() {
+                    f.machines.remove(id);
+                }
+                Ok(())
+            })
+        })
+    }
+
+    fn find_firewall<'a>(&'a self, label: &'a str) -> Fut<'a, Option<ProviderFirewall>> {
+        Box::pin(async move {
+            self.with("find_firewall", |s| {
+                Ok(s.firewalls.values().find(|f| f.label == label).map(view))
+            })
+        })
+    }
+
+    fn create_firewall<'a>(
+        &'a self,
+        label: &'a str,
+        tags: &'a [String],
+        rules: &'a [FirewallRule],
+    ) -> Fut<'a, ProviderFirewall> {
+        Box::pin(async move {
+            self.with("create_firewall", |s| {
+                if s.firewalls.values().any(|f| f.label == label) {
+                    return Err(ProviderError::LabelTaken);
+                }
+                s.next += 1;
+                let id = (500 + s.next).to_string();
+                let f = FakeFirewall {
+                    id: id.clone(),
+                    label: label.into(),
+                    tags: tags.to_vec(),
+                    rules: rules.to_vec(),
+                    foreign: false,
+                    machines: BTreeSet::new(),
+                };
+                let v = view(&f);
+                s.firewalls.insert(id, f);
+                Ok(v)
+            })
+        })
+    }
+
+    fn set_firewall_rules<'a>(&'a self, id: &'a str, rules: &'a [FirewallRule]) -> Fut<'a, ()> {
+        Box::pin(async move {
+            self.with("set_firewall_rules", |s| {
+                let f = s.firewalls.get_mut(id).ok_or(ProviderError::NotFound)?;
+                (f.rules, f.foreign) = (rules.to_vec(), false);
+                Ok(())
+            })
+        })
+    }
+
+    fn firewall_machines<'a>(&'a self, id: &'a str) -> Fut<'a, Vec<String>> {
+        Box::pin(async move {
+            self.with("firewall_machines", |s| {
+                let f = s.firewalls.get(id).ok_or(ProviderError::NotFound)?;
+                Ok(f.machines.iter().cloned().collect())
+            })
+        })
+    }
+
+    fn attach_firewall<'a>(&'a self, id: &'a str, machine: &'a str) -> Fut<'a, ()> {
+        Box::pin(async move {
+            self.with("attach_firewall", |s| {
+                if !s.firewalls.contains_key(id) {
+                    return Err(ProviderError::NotFound);
+                }
+                if !s.machines.contains_key(machine) {
+                    return Err(refused("id: Linode not found"));
+                }
+                if s.firewall_of(machine).is_some() {
+                    return Err(refused("This Linode already has an active Firewall."));
+                }
+                s.firewalls
+                    .get_mut(id)
+                    .unwrap()
+                    .machines
+                    .insert(machine.into());
+                Ok(())
+            })
+        })
+    }
+
+    fn detach_firewall<'a>(&'a self, id: &'a str, machine: &'a str) -> Fut<'a, ()> {
+        Box::pin(async move {
+            self.with("detach_firewall", |s| {
+                if let Some(f) = s.firewalls.get_mut(id) {
+                    f.machines.remove(machine);
+                }
+                Ok(())
+            })
+        })
+    }
+
+    fn delete_firewall<'a>(&'a self, id: &'a str) -> Fut<'a, ()> {
+        Box::pin(async move {
+            self.with("delete_firewall", |s| {
+                s.firewalls.remove(id);
                 Ok(())
             })
         })

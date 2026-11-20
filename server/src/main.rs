@@ -22,6 +22,8 @@ mod machines;
 #[cfg(test)]
 mod machines_http_tests;
 #[cfg(test)]
+mod machines_lockdown_tests;
+#[cfg(test)]
 mod machines_mtls_tests;
 mod paths;
 mod policy;
