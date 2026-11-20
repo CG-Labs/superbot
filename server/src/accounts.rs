@@ -406,7 +406,7 @@ mod tests {
         assert_eq!(read_plain(&mem.join("b1.md"), MAX_FILE).as_deref(), Some("# B1"));
         symlink(&secret, mem.join("b2.md")).unwrap();
         assert_eq!(read_plain(&mem.join("b2.md"), MAX_FILE), None, "a link is never followed");
-        assert_eq!(seed(&mem.join("b2.md"), "x").unwrap(), false, "nor written through");
+        assert!(!seed(&mem.join("b2.md"), "x").unwrap(), "nor written through");
         assert_eq!(std::fs::read_to_string(&secret).unwrap(), "botd only");
         remove(&mem.join("b2.md"));
         assert!(std::fs::symlink_metadata(mem.join("b2.md")).is_err() && secret.exists(), "removing drops the link, not its target");

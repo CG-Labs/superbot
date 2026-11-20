@@ -26,7 +26,14 @@ CLIENT_DIR=${CLIENT_DIR:-/var/www/superbot-app}
 SITE_DIR=${SITE_DIR:-/var/www/superbot-site}
 CLIENT_BASE_URL=/app
 BUILD_CLIENT=true
-DEPLOY_FILES=(superbot.service superbot-backup.sh superbot-restore.sh superbot-backup.service superbot-backup.timer)
+DEPLOY_FILES=(superbot.service superbot-backup.sh superbot-restore.sh superbot-backup.service superbot-backup.timer superbot-userctl.sh)
+# Per-user accounts (docs/adr/0037-per-user-unix-accounts.md): "" keeps what .env says.
+ISOLATION_MODE=""
+ISOLATION_DIR=${ISOLATION_DIR:-/srv/superbot/users}
+ISOLATION_GROUP=superbot-users
+ISOLATION_CONF=/etc/superbot/isolation.conf
+USERCTL_BIN=/usr/local/sbin/superbot-userctl
+SUDOERS_FILE=/etc/sudoers.d/superbot-isolation
 
 log() { printf '==> %s\n' "$*"; }
 warn() { printf '!! %s\n' "$*" >&2; }
@@ -47,6 +54,9 @@ Usage: install.sh [options]
   --ufw               Enable UFW (allow 22, 80, 443)
   --no-backup         Skip daily DATA_DIR backup timer
   --with-hermes       Also install the Hermes Agent CLI (about 2.5 GB; HERMES_COMMIT pins it)
+  --isolation         Run each user's Bots as their own Unix account (ISOLATION=users; ADR 0037).
+                      ISOLATION_DIR sets where their folders go (default /srv/superbot/users)
+  --no-isolation      Turn that off again (accounts and their folders are kept)
   --no-client         Skip building the web client (served at /app/)
   --dry-run           Print actions without changing the system
   --non-interactive   Fail instead of prompting for missing flags
@@ -70,6 +80,8 @@ parse_args() {
       --ufw) ENABLE_UFW=true; shift ;;
       --no-backup) ENABLE_BACKUP=false; shift ;;
       --with-hermes) WITH_HERMES=true; shift ;;
+      --isolation) ISOLATION_MODE=users; shift ;;
+      --no-isolation) ISOLATION_MODE=off; shift ;;
       --no-client) BUILD_CLIENT=false; shift ;;
       --dry-run) DRY_RUN=true; shift ;;
       --non-interactive) INTERACTIVE=false; shift ;;
@@ -318,6 +330,7 @@ build_botd() {
   run install -m 0755 "$repo_path/target/release/botd" "$BIN_DIR/botd"
   run install -m 0755 "$repo_path/target/release/botctl" "$BIN_DIR/botctl"
   run install -m 0755 "$repo_path/target/release/superbot-machine" "$BIN_DIR/superbot-machine"
+  run install -m 0755 "$repo_path/target/release/superbot-run" "$BIN_DIR/superbot-run"
 }
 
 releases_dir() { printf '%s.releases\n' "$1"; }
@@ -620,6 +633,102 @@ backup_unit_fixed() {
     "ExecStart=$BIN_DIR/superbot-backup --home $home"
 }
 
+# --isolation or --no-isolation, else what .env already says, so an upgrade keeps it.
+isolation_mode() {
+  local env_file
+  if [[ -n "$ISOLATION_MODE" ]]; then
+    printf '%s\n' "$ISOLATION_MODE"
+    return
+  fi
+  env_file="$(user_home)/superbot/.env"
+  if [[ -f "$env_file" ]] && grep -qx 'ISOLATION=users' "$env_file"; then
+    echo users
+  else
+    echo off
+  fi
+}
+
+isolation_sudoers() {
+  cat <<EOF
+# SuperBot per-user accounts (docs/adr/0037-per-user-unix-accounts.md). Written by
+# deploy/install.sh --isolation; --no-isolation removes it. botd's account may start
+# superbot-run (which runs a harness) as a per-user account, keeping the run's env, and
+# make a user's account with the root helper. Nothing else, and no one else.
+Defaults!$BIN_DIR/superbot-run !syslog
+$SUPERBOT_USER ALL=(%$ISOLATION_GROUP) NOPASSWD:SETENV: $BIN_DIR/superbot-run
+$SUPERBOT_USER ALL=(root) NOPASSWD: $USERCTL_BIN ensure *
+EOF
+}
+
+isolation_dropin() {
+  cat <<'EOF'
+# SuperBot per-user accounts (docs/adr/0037-per-user-unix-accounts.md), from deploy/install.sh.
+[Service]
+# sudo is setuid: botd needs it to start runs as each user's account.
+NoNewPrivileges=false
+# Runs see only their own account's processes, not other users' command lines.
+ProtectProc=invisible
+EOF
+}
+
+# Per-user accounts on or off. On: the root helper, the sudoers rule, the unit drop-in,
+# the users' folder, and ISOLATION=users in .env. Off: the rule and drop-in go; accounts
+# and their folders stay, as data.
+configure_isolation() {
+  local mode home env_file group dropin tmp
+  mode=$(isolation_mode)
+  home=$(user_home)
+  env_file="$home/superbot/.env"
+  dropin="$SYSTEMD_DIR/superbot.service.d/isolation.conf"
+  if [[ "$mode" != users ]]; then
+    [[ "$ISOLATION_MODE" == off ]] || return 0
+    if [[ "$DRY_RUN" == true ]]; then
+      log "[dry-run] would set ISOLATION=off in $env_file and remove $SUDOERS_FILE and $dropin"
+      return
+    fi
+    log "Per-user accounts: off (accounts and $ISOLATION_DIR are kept)"
+    rm -f "$SUDOERS_FILE" "$dropin"
+    set_env_var "$env_file" ISOLATION off
+    return
+  fi
+  [[ "$ISOLATION_DIR" =~ ^(/[A-Za-z0-9._-]+)+$ && "$ISOLATION_DIR/" != */../* ]] || die "ISOLATION_DIR must be a plain absolute path: $ISOLATION_DIR"
+  case "$ISOLATION_DIR/" in
+    "$home"/*) die "ISOLATION_DIR must not be under $home" ;;
+  esac
+  if [[ "$DRY_RUN" == true ]]; then
+    log "[dry-run] would install $USERCTL_BIN, $SUDOERS_FILE, and $dropin, make $ISOLATION_DIR (root, 0711) and group $ISOLATION_GROUP, chmod 0750 $home, and set ISOLATION=users in $env_file"
+    return
+  fi
+  log "Per-user accounts: on, in $ISOLATION_DIR"
+  apt-get install -y -qq acl sudo
+  group=$(id -gn "$SUPERBOT_USER")
+  groupadd -r -f "$ISOLATION_GROUP"
+  install -d -m 0755 -o root -g root /etc/superbot
+  # The folders above it are checked (root's, only root's to write) by the helper, not changed.
+  [[ -d "$(dirname "$ISOLATION_DIR")" ]] || install -d -m 0755 -o root -g root "$(dirname "$ISOLATION_DIR")"
+  install -d -m 0711 -o root -g root "$ISOLATION_DIR"
+  chown root:root "$ISOLATION_DIR"
+  chmod 0711 "$ISOLATION_DIR"
+  tmp=$(mktemp)
+  printf '%s\n' "# Read by $USERCTL_BIN. Written by deploy/install.sh." "ISOLATION_DIR=$ISOLATION_DIR" "SERVICE_GROUP=$group" >"$tmp"
+  install -m 0644 -o root -g root "$tmp" "$ISOLATION_CONF"
+  install -m 0755 -o root -g root "$(trusted_deploy_dir)/superbot-userctl.sh" "$USERCTL_BIN"
+  isolation_sudoers >"$tmp"
+  visudo -cqf "$tmp" || { rm -f "$tmp"; die "The sudoers rule for per-user accounts didn't check out"; }
+  install -m 0440 -o root -g root "$tmp" "$SUDOERS_FILE"
+  install -d -m 0755 -o root -g root "$(dirname "$dropin")"
+  isolation_dropin >"$tmp"
+  install -m 0644 -o root -g root "$tmp" "$dropin"
+  rm -f "$tmp"
+  # Per-user accounts must not read botd's database, .env, or master key.
+  chmod 0750 "$home"
+  set_env_var "$env_file" ISOLATION users
+  set_env_var "$env_file" ISOLATION_DIR "$ISOLATION_DIR"
+  if [[ "$WITH_HERMES" == true ]]; then
+    warn "Hermes and Pi Bots don't run with per-user accounts yet: switch them to Claude Code or Codex"
+  fi
+}
+
 install_systemd() {
   local home deploy unit
   home=$(user_home)
@@ -798,6 +907,17 @@ Next steps (as the service user):
   # Hermes Agent (--with-hermes): save its provider key with botctl secret set (docs/backend.md)
 
 EOF
+  if [[ "$(isolation_mode)" == users ]]; then
+    cat <<EOF
+Per-user accounts are on (ISOLATION=users, docs/adr/0037-per-user-unix-accounts.md):
+  each user's Bots run as sb-u-<user id>, in $ISOLATION_DIR/<user id>. Install harness
+  CLIs system-wide (sudo npm install -g ...), not in ~/.local, so every account finds them.
+  Then log a harness in for each user, as $SUPERBOT_USER, at a terminal:
+    botctl user harness-login <user> claude    # or codex
+  Only Claude Code and Codex Bots run this way so far.
+
+EOF
+  fi
   if [[ -f "$pass_file" ]] && [[ "${NEW_PASSWORD_FILE:-}" == "$pass_file" ]]; then
     warn "New login password (saved to $pass_file): $(cat "$pass_file")"
   fi
@@ -829,6 +949,7 @@ main() {
   configure_env
   ensure_master_key
   install_hermes
+  configure_isolation
   install_systemd
   install_backup
   install_caddy

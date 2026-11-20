@@ -4,6 +4,8 @@
 mod accounts;
 #[cfg(test)]
 mod accounts_http_tests;
+#[cfg(test)]
+mod accounts_os_tests;
 mod acl;
 #[cfg(test)]
 mod acl_http_tests;

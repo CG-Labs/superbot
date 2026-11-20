@@ -11,6 +11,7 @@
 #[path = "../passwd.rs"]
 mod passwd;
 
+use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -76,8 +77,12 @@ async fn main() -> ExitCode {
         return fail("couldn't watch for signals");
     };
 
+    // botd's /tmp is shared by every account's runs; this one isn't.
+    let tmp = home.join(".tmp");
+    let _ = std::fs::DirBuilder::new().mode(0o700).create(&tmp);
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.args(args)
+        .env("TMPDIR", &tmp)
         .env("HOME", &home)
         .env("USER", &me.name)
         .env("LOGNAME", &me.name)
