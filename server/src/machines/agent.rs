@@ -603,9 +603,9 @@ impl Agent {
         self.jobs.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Jobs running now.
+    /// Jobs and logins running now: either holds off an upgrade.
     pub fn running(&self) -> usize {
-        self.jobs().len()
+        self.jobs().len() + self.logins.running().len()
     }
 
     pub fn identity(&self) -> Arc<Identity> {
@@ -968,15 +968,22 @@ fn code_or(code: u16, fallback: StatusCode) -> StatusCode {
 
 /// `POST /v1/logins`: runs a harness's login in a terminal here and streams what it
 /// shows (ADR 0041). Its credentials stay in this machine's HOME. A dropped stream
-/// stops it.
+/// stops it. Like a job, it holds off agent upgrades and harness updates.
 async fn start_login(State(a): State<Arc<Agent>>, Json(r): Json<wire::LoginRequest>) -> Response {
     let bin = match super::terminal::check(&r, |b| a.cfg.has(b)) {
         Ok(b) => b,
         Err((code, msg)) => return refuse(code_or(code, StatusCode::BAD_REQUEST), msg),
     };
     let env = a.cfg.host().env;
+    let _jobs = a.jobs();
+    if a.upgrader.staging() {
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, "This machine is updating its agent. Try again in a minute.");
+    }
+    let Some(permit) = a.tools.job_permit() else {
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, "This machine is updating its harnesses. Try again in a minute.");
+    };
     match a.logins.start(&r, bin, &a.cfg.home, &env) {
-        Ok((rx, stop)) => stream(rx, wire::LoginEvent::Ping, StopOnDrop(stop)),
+        Ok((rx, stop)) => stream(rx, wire::LoginEvent::Ping, (StopOnDrop(stop), permit)),
         Err((code, msg)) => refuse(code_or(code, StatusCode::CONFLICT), msg),
     }
 }
@@ -1106,11 +1113,11 @@ async fn fetch(a: &Agent, path: &str) -> Result<Vec<u8>, String> {
 }
 
 /// `POST /v1/upgrade`: replaces this agent with botd's build, then restarts (ADR
-/// 0039). Refused while jobs run; no job starts until it's done.
+/// 0039). Refused while jobs or logins run; neither starts until it's done.
 async fn start_upgrade(State(a): State<Arc<Agent>>, Json(req): Json<wire::UpgradeRequest>) -> Response {
     {
         let jobs = a.jobs();
-        if let Some((code, msg)) = a.upgrader.refuse(&req, jobs.len()) {
+        if let Some((code, msg)) = a.upgrader.refuse(&req, jobs.len() + a.logins.running().len()) {
             return refuse(StatusCode::from_u16(code).unwrap_or(StatusCode::CONFLICT), msg);
         }
         if !a.upgrader.begin(&req) {

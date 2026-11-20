@@ -104,7 +104,7 @@ pub struct Heartbeat {
     /// Of the `bin`s the heartbeat asked about, those not on the harness PATH.
     #[serde(default)]
     pub missing: Vec<String>,
-    /// Jobs running now.
+    /// Jobs and harness logins running now.
     #[serde(default)]
     pub jobs: u32,
     /// `CAN_HARNESSES`, `CAN_UPGRADE`: empty before ADR 0039.

@@ -223,7 +223,7 @@ fn blocker(e: &Enrollment, m: &Machine, hb: &Heartbeat) -> Option<String> {
         return Some("Its agent is held at its build. Release it first.".into());
     }
     if hb.jobs > 0 {
-        return Some(format!("It's running {} jobs. Upgrade it when they're done.", hb.jobs));
+        return Some(format!("It's running {} jobs or logins. Upgrade it when they're done.", hb.jobs));
     }
     None
 }
