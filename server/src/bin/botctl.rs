@@ -171,10 +171,10 @@ fn harness_login(key: &str, harness: &str, rest: &[&str]) -> Result<String, Stri
     let res = api(Cred::Operator, "POST", &format!("/api/users/{}/harness-login", encode(key)), Some(body.to_string()))?;
     let v: Value = serde_json::from_str(&res).map_err(|e| e.to_string())?;
     let argv: Vec<&str> = v["command"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-    let (Some((bin, args)), Some(home), Some(account)) = (argv.split_first(), v["home"].as_str(), v["account"].as_str()) else {
+    let (Some((bin, args)), Some(home)) = (argv.split_first(), v["home"].as_str()) else {
         return Err(format!("Unexpected reply from the server: {res}"));
     };
-    eprintln!("Starting the {harness} login as {account} (HOME {home}). Only this user's Bots will use it.");
+    eprintln!("Starting the {harness} login as the user's own account (HOME {home}). Only their Bots will use it.");
     let mut cmd = std::process::Command::new(bin);
     cmd.args(args).current_dir(home).env_clear();
     for (k, val) in std::env::vars_os() {
@@ -189,7 +189,7 @@ fn harness_login(key: &str, harness: &str, rest: &[&str]) -> Result<String, Stri
     }
     let status = cmd.status().map_err(|e| format!("Couldn't start {bin}: {e}"))?;
     if status.success() {
-        Ok(format!("Done. {account}'s Bots now use this {harness} login."))
+        Ok(format!("Done. The user's Bots now use this {harness} login."))
     } else {
         Err(format!("The login exited with {status}. If sudo asked for a password, run botctl as botd's service account (sudo -iu <service user>)."))
     }

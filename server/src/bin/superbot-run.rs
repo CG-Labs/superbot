@@ -54,15 +54,15 @@ async fn main() -> ExitCode {
     let Some(bin) = args.next() else { return fail("usage: superbot-run <harness> [args...]") };
     // SAFETY: getuid can't fail.
     let uid = unsafe { libc::getuid() };
-    let Some(me) = passwd::by_uid(uid) else { return fail(&format!("uid {uid} has no account")) };
+    let Some(me) = passwd::by_uid(uid) else { return fail("this uid has no account") };
     if !account_ok(&me.name, uid) {
-        return fail(&format!("refusing to run as {}: only per-user SuperBot accounts ({PREFIX}<user id>) run harnesses", me.name));
+        return fail(&format!("refusing to run as this account: only per-user SuperBot accounts ({PREFIX}<user id>) run harnesses"));
     }
     let (Ok(home), Ok(cwd)) = (std::fs::canonicalize(&me.home), std::env::current_dir().and_then(std::fs::canonicalize)) else {
-        return fail(&format!("{}'s home ({}) or the working folder is missing", me.name, me.home.display()));
+        return fail("the account's home or the working folder is missing");
     };
     if !inside(&home, &cwd) {
-        return fail(&format!("refusing to start in {}: it isn't in {}'s folders", cwd.display(), me.name));
+        return fail("refusing to start outside the account's own folders");
     }
     // SAFETY: plain syscalls on this process.
     unsafe {
@@ -100,7 +100,7 @@ async fn main() -> ExitCode {
     }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return fail(&format!("couldn't start {} as {}: {e}", bin.to_string_lossy(), me.name)),
+        Err(e) => return fail(&format!("couldn't start {}: {e}", bin.to_string_lossy())),
     };
     let Some(pid) = child.id().map(|p| p as i32) else { return exit_code(child.wait().await) };
     let target = if tty { pid } else { -pid };
@@ -129,7 +129,7 @@ mod tests {
         assert!(account_ok("sb-u-u1a2b3c4d", 1001));
         assert!(account_ok("sb-u-operator", 1002));
         for (name, uid) in [("root", 0), ("sb-u-x", 0), ("superbot", 999), ("sb-u-", 1001), ("sb-u-UPPER", 1001), ("sb-u-a.b", 1001), ("sb-u-a-b", 1001), ("sbu-x", 1001)] {
-            assert!(!account_ok(name, uid), "{name} {uid}");
+            assert!(!account_ok(name, uid), "{name}");
         }
         assert!(!account_ok(&format!("sb-u-{}", "a".repeat(28)), 1001));
     }

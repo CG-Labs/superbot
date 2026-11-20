@@ -329,7 +329,7 @@ impl App {
                 Ok(run_as)
             }
             Err(e) => {
-                eprintln!("Isolation: couldn't set up {}: {e}", run_as.account);
+                eprintln!("Isolation: couldn't set up a user's account (see isolation.account_failed in the audit log): {e}");
                 self.db.record(&event("isolation.account_failed").outcome(Outcome::Failure).details(json!({ "account": run_as.account, "error": e })));
                 Err(e)
             }
