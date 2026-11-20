@@ -2255,8 +2255,13 @@ impl Db {
         let outcome = if by_id.as_ref().is_some_and(|s| s.user_id != sub.user_id) {
             Applied::OtherUser
         } else if by_id.as_ref().is_some_and(|s| {
+            // Stripe never revives a subscription it cancelled for good. Its `created` is
+            // in seconds, so two events can tie; an ended state wins the tie.
             let fin = |status: &str| crate::billing::FINAL.contains(&status);
-            sub.event_created < s.event_created || (fin(&s.status) && !fin(&sub.status))
+            let ended = |status: &str| crate::billing::ENDED.contains(&status);
+            sub.event_created < s.event_created
+                || (fin(&s.status) && !fin(&sub.status))
+                || (sub.event_created == s.event_created && ended(&s.status) && !ended(&sub.status))
         }) {
             Applied::Stale
         } else {
@@ -3455,8 +3460,9 @@ mod tests {
         }
         let db = Db::open(&temp_path("sub-order").join("app.sqlite")).unwrap();
         // Plan A (pro) started at 10, was updated at 25 and cancelled at 30. Plan B
-        // (starter) started at 20, replacing it, and was cancelled at 40. Or A was
-        // cancelled in the same second it started.
+        // (starter) started at 20, replacing it, and was cancelled at 40. Then ties:
+        // A cancelled in the same second it started, an update to A in the same second
+        // as its cancellation, and A paused and resumed in the same second.
         let events = [
             ("a", "active", Some("pro"), 10, 10),
             ("b", "active", Some("starter"), 20, 20),
@@ -3464,8 +3470,18 @@ mod tests {
             ("a", "canceled", None, 10, 30),
             ("b", "canceled", None, 20, 40),
             ("a", "canceled", None, 10, 10),
+            ("a", "active", Some("pro"), 10, 30),
+            ("a", "paused", None, 10, 50),
+            ("a", "active", Some("pro"), 10, 50),
         ];
-        let cases = [(&[0, 1, 2, 3][..], Some("starter")), (&[0, 1, 2, 3, 4][..], None), (&[0, 1, 2, 4][..], Some("pro")), (&[0, 5][..], None)];
+        let cases = [
+            (&[0, 1, 2, 3][..], Some("starter")),
+            (&[0, 1, 2, 3, 4][..], None),
+            (&[0, 1, 2, 4][..], Some("pro")),
+            (&[0, 5][..], None),
+            (&[0, 3, 6][..], None),
+            (&[0, 7, 8][..], None),
+        ];
         for (picked, want) in cases {
             for order in orders(picked.len()) {
                 let u = db.create_user(None, None, "Payer", Role::Member).unwrap();

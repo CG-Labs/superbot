@@ -889,13 +889,19 @@ impl App {
         self.give_back_routine(bot, msg);
     }
 
-    /// To the owner the routine run was charged to when it fired (its requester's
-    /// `on_behalf_of`), who may no longer own the Bot.
     fn give_back_routine(&self, bot: &Bot, msg: &Message) {
-        if msg.role == "routine" {
-            let charged = msg.requested_by.as_ref().and_then(|w| w.actor.on_behalf_of.as_deref()).unwrap_or(&bot.owner_id);
-            self.db.give_back_routine_run(charged, &tiers::day(msg.created_at));
+        self.give_back_routine_to(&bot.owner_id, msg);
+    }
+
+    /// Gives a routine message's run back to whoever it was charged to when it fired
+    /// (the scheduler acts on their behalf), which is `owner` only if the Bot hasn't
+    /// changed hands since.
+    fn give_back_routine_to(&self, owner: &str, msg: &Message) {
+        if msg.role != "routine" {
+            return;
         }
+        let charged = self.db.message(msg.id).and_then(|m| m.requested_by).and_then(|w| w.actor.on_behalf_of);
+        self.db.give_back_routine_run(charged.as_deref().unwrap_or(owner), &tiers::day(msg.created_at));
     }
 
     /// Who a run is for: whoever queued its message. Routines run as the scheduler,
@@ -1000,15 +1006,15 @@ impl App {
     pub fn stop_if(&self, bot_id: &str, first: impl FnOnce() -> bool) -> bool {
         {
             let mut st = self.state();
-            let bot = self.db.bot(bot_id);
+            let owner = self.db.bot(bot_id).map(|b| b.owner_id);
             if !first() {
                 return false;
             }
             if let Some(s) = st.get_mut(bot_id) {
                 for m in s.queue.drain(..) {
                     self.db.set_status(m.id, "done");
-                    if let Some(b) = &bot {
-                        self.give_back_routine(b, &m);
+                    if let Some(o) = &owner {
+                        self.give_back_routine_to(o, &m);
                     }
                 }
                 if let Some(r) = &s.run {
