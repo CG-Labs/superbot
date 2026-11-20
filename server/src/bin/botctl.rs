@@ -43,6 +43,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl user disable <user> | enable <user>       Disabling ends the user's sessions
   botctl user tier <user> <tier|default>           Their plan: the models and limits they get
   botctl tiers                                     Every tier, its routes and limits, and the default
+  botctl setup [status | json]                     What the server still needs: the onboarding checklist
+  botctl setup done | reopen | hide | show         Finish the setup wizard, reopen it, or hide it from admins
   botctl user code <user> [--ttl <minutes>]        A one-time sign-in code (default 60 minutes)
   botctl user identities <user>                    The user's SSO identities
   botctl user link <user> <provider> <subject> [--tenant <tenant-id>]
@@ -443,6 +445,43 @@ fn stdin_value(mut input: impl Read) -> Result<String, String> {
     Ok(v)
 }
 
+/// `botctl setup ...`: the method and body for `/api/setup` (ADR 0034).
+fn setup_request(a: &[&str]) -> Result<(&'static str, Option<String>), String> {
+    let patch = |v: Value| Ok(("PATCH", Some(v.to_string())));
+    match a {
+        [] | ["status"] => Ok(("GET", None)),
+        ["done"] => patch(json!({ "completed": true })),
+        ["reopen"] => patch(json!({ "completed": false })),
+        ["hide"] => patch(json!({ "dismissed": true })),
+        ["show"] => patch(json!({ "dismissed": false })),
+        _ => Err("Usage: botctl setup [status | json | done | reopen | hide | show]".into()),
+    }
+}
+
+/// The setup checklist, for a terminal.
+fn setup_summary(s: &Value) -> String {
+    let p = &s["progress"];
+    let state = if p["completedAt"].is_i64() {
+        "finished"
+    } else if p["dismissed"] == true {
+        "hidden from admins"
+    } else {
+        "admins see the wizard in the console's Setup tab"
+    };
+    let mut out = format!("Setup: {} of {} done ({state}).\n", s["done"], s["total"]);
+    for c in s["checklist"].as_array().into_iter().flatten() {
+        let mark = if c["done"] == true { "x" } else { " " };
+        out += &format!("  [{mark}] {}\n      {}\n", c["label"].as_str().unwrap_or_default(), c["detail"].as_str().unwrap_or_default());
+    }
+    for p in s["signIn"]["providers"].as_array().into_iter().flatten().filter(|p| p["ready"] != true) {
+        out += &format!("\n{} needs its secret: botctl secret set {} < file\n", p["label"].as_str().unwrap_or_default(), p["secret"].as_str().unwrap_or_default());
+    }
+    if !p["completedAt"].is_i64() {
+        out += "\nThe console's Setup tab has the commands for each step. When you're done: botctl setup done\n";
+    }
+    out
+}
+
 fn run(args: &[String]) -> Result<String, String> {
     let bot = std::env::var("BOT_ID").unwrap_or_default();
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -538,6 +577,12 @@ fn run(args: &[String]) -> Result<String, String> {
             op("PATCH", &format!("/api/users/{}", encode(key)), Some(json!({ "tier": tier }).to_string()))
         }
         ["tiers"] => op("GET", "/api/tiers", None),
+        ["setup", "json"] => op("GET", "/api/setup", None),
+        ["setup", rest @ ..] => {
+            let (method, body) = setup_request(rest)?;
+            let res = api(Cred::Operator, method, "/api/setup", body)?;
+            Ok(setup_summary(&serde_json::from_str(&res).map_err(|e| e.to_string())?))
+        }
         ["user", cmd @ ("disable" | "enable"), key] => {
             let status = if *cmd == "disable" { "disabled" } else { "active" };
             op("PATCH", &format!("/api/users/{}", encode(key)), Some(json!({ "status": status }).to_string()))
@@ -675,6 +720,34 @@ mod tests {
         assert!(req(&["grant", "b1", "u1", "owner"]).is_err());
         assert!(req(&["share"]).is_err());
         assert!(req(&[]).is_err());
+    }
+
+    #[test]
+    fn setup_commands() {
+        let req = |a: &[&str]| setup_request(a).map(|(m, b)| (m, b.map(|b| serde_json::from_str::<Value>(&b).unwrap())));
+        assert_eq!(req(&[]), Ok(("GET", None)));
+        assert_eq!(req(&["status"]), Ok(("GET", None)));
+        assert_eq!(req(&["done"]), Ok(("PATCH", Some(json!({ "completed": true })))));
+        assert_eq!(req(&["reopen"]), Ok(("PATCH", Some(json!({ "completed": false })))));
+        assert_eq!(req(&["hide"]), Ok(("PATCH", Some(json!({ "dismissed": true })))));
+        assert_eq!(req(&["show"]), Ok(("PATCH", Some(json!({ "dismissed": false })))));
+        assert!(req(&["finish", "now"]).is_err());
+
+        let s = json!({
+            "progress": { "step": "signin", "dismissed": false, "completedAt": null },
+            "done": 1, "total": 2,
+            "checklist": [
+                { "id": "domain", "label": "A public address with HTTPS", "done": true, "detail": "People reach SuperBot at https://bots.example.com." },
+                { "id": "signin", "label": "Sign-in providers ready", "done": false, "detail": "Waiting for a secret: Okta." },
+            ],
+            "signIn": { "providers": [{ "label": "Okta", "ready": false, "secret": "SSO_OKTA_CLIENT_SECRET" }] },
+        });
+        let out = setup_summary(&s);
+        assert!(out.starts_with("Setup: 1 of 2 done (admins see the wizard"), "{out}");
+        assert!(out.contains("[x] A public address with HTTPS") && out.contains("[ ] Sign-in providers ready"), "{out}");
+        assert!(out.contains("botctl secret set SSO_OKTA_CLIENT_SECRET < file") && out.contains("botctl setup done"), "{out}");
+        let done = setup_summary(&json!({ "progress": { "completedAt": 1 }, "done": 2, "total": 2, "checklist": [] }));
+        assert!(done.starts_with("Setup: 2 of 2 done (finished).") && !done.contains("botctl setup done"), "{done}");
     }
 
     #[test]

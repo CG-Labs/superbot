@@ -15,10 +15,12 @@ interface Props {
   onOpenAudit?: () => void;
   /** The server's admin console (ADR 0027), in a new tab or the system browser. */
   onOpenConsole?: () => void;
+  /** Set while the server's setup wizard waits for an admin (ADR 0034); opens it in the console. */
+  onOpenSetup?: () => void;
   compact?: boolean;
 }
 
-export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOpenUsers, onOpenAudit, onOpenConsole, compact }: Props) {
+export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOpenUsers, onOpenAudit, onOpenConsole, onOpenSetup, compact }: Props) {
   const {
     bots,
     activeId,
@@ -110,6 +112,17 @@ export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOp
       </Pressable>
       {isAdmin(me) ? (
         <>
+          {onOpenSetup ? (
+            <Pressable
+              style={styles.approvalsBtn}
+              onPress={onOpenSetup}
+              accessibilityRole="link"
+              accessibilityLabel="Finish server setup"
+              accessibilityHint="Opens the setup wizard in the server's admin console"
+            >
+              <Text style={styles.approvalsWaiting}>Finish server setup ↗</Text>
+            </Pressable>
+          ) : null}
           {onOpenUsers ? (
             <Pressable style={styles.approvalsBtn} onPress={onOpenUsers} accessibilityRole="button">
               <Text style={styles.hiddenText}>Users</Text>

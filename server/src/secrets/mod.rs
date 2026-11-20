@@ -239,6 +239,11 @@ impl Secrets {
         Ok(self.find(name)?.map(|(v, _)| v))
     }
 
+    /// The store whose value wins for `name` (`env` or `sealed`), and whether it can be written.
+    pub fn source(&self, name: &str) -> Result<Option<(&'static str, bool)>, Error> {
+        Ok(self.find(name)?.map(|(_, s)| (s.kind(), s.writable())))
+    }
+
     fn writable(&self) -> Result<&dyn SecretStore, Error> {
         self.stores.iter().find(|s| s.writable()).map(|s| s.as_ref()).ok_or(Error::ReadOnly)
     }
@@ -495,6 +500,10 @@ mod tests {
         assert_eq!(gh.len(), 2);
         assert_eq!((gh[0].store, gh[0].shadowed_by), ("env", None));
         assert_eq!((gh[1].store, gh[1].shadowed_by), ("sealed", Some("env")));
+        assert_eq!(s.source("GITHUB_TOKEN").unwrap(), Some(("env", false)), "the saved one can't replace it");
+        assert_eq!(s.source("NPM_TOKEN").unwrap(), Some(("env", false)));
+        assert_eq!(s.source("OPENAI_API_KEY").unwrap(), Some(("sealed", true)));
+        assert_eq!(s.source("NOPE").unwrap(), None);
 
         let env: Vec<(String, String)> = s.harness_env().into_iter().map(|(k, v)| (k, v.expose().to_string())).collect();
         assert_eq!(
