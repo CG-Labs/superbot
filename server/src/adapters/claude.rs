@@ -1,13 +1,15 @@
 //! Claude Code CLI: `claude -p --output-format stream-json`.
 //! Resumes with `--resume <session id>`. The system prompt is applied fresh every run.
 
-use super::{describe, new_uuid, str_of, Adapter, AgentEvent, ModelOption, RunInput};
+use super::{describe, new_uuid, str_of, Adapter, AgentEvent, ModelOption, RunInput, Usage};
 use serde_json::{json, Value};
 
 #[derive(Default)]
 pub struct Claude {
     id: String,
     saw_turn: bool,
+    /// The model `system/init` named.
+    model: Option<String>,
 }
 
 impl Adapter for Claude {
@@ -63,9 +65,15 @@ impl Adapter for Claude {
                     }
                 }
             }
-            "result" if e["is_error"].as_bool() == Some(true) => {
-                let msg = e["result"].as_str().unwrap_or("Claude Code failed");
-                out.push(AgentEvent::Error(msg.into()));
+            "system" if str_of(e, "subtype") == "init" => {
+                self.model = e["model"].as_str().filter(|m| !m.is_empty()).map(String::from);
+            }
+            "result" => {
+                usage(e, self.model.as_deref(), out);
+                if e["is_error"].as_bool() == Some(true) {
+                    let msg = e["result"].as_str().unwrap_or("Claude Code failed");
+                    out.push(AgentEvent::Error(msg.into()));
+                }
             }
             _ => {}
         }
@@ -99,5 +107,70 @@ impl Adapter for Claude {
         ]
         .map(|(id, label, alias)| ModelOption { id: id.into(), label: label.into(), efforts: efforts.clone(), aliases: vec![alias.into()] })
         .into()
+    }
+}
+
+/// The tokens a `result` reports: `modelUsage`, one entry per model the run used (a
+/// main model and a small one for background work), else the run's `usage` for the
+/// model `system/init` named. Anthropic's `input_tokens` already leaves out the cache.
+fn usage(e: &Value, model: Option<&str>, out: &mut Vec<AgentEvent>) {
+    let n = Usage::count;
+    let mut found = Vec::new();
+    for (name, m) in e["modelUsage"].as_object().into_iter().flatten() {
+        found.push(Usage {
+            model: Some(name.clone()).filter(|n| !n.is_empty()),
+            input: n(&m["inputTokens"]),
+            output: n(&m["outputTokens"]),
+            cache_read: n(&m["cacheReadInputTokens"]),
+            cache_write: n(&m["cacheCreationInputTokens"]),
+        });
+    }
+    if found.is_empty() {
+        let u = &e["usage"];
+        found.push(Usage {
+            model: model.map(String::from),
+            input: n(&u["input_tokens"]),
+            output: n(&u["output_tokens"]),
+            cache_read: n(&u["cache_read_input_tokens"]),
+            cache_write: n(&u["cache_creation_input_tokens"]),
+        });
+    }
+    out.extend(found.into_iter().filter(|u| u.total() > 0).map(AgentEvent::Usage));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn usage_of(lines: &[&str]) -> Vec<Usage> {
+        let mut c = Claude::default();
+        let mut out = Vec::new();
+        for l in lines {
+            c.on_event(&serde_json::from_str(l).unwrap(), &mut out);
+        }
+        out.into_iter().filter_map(|e| if let AgentEvent::Usage(u) = e { Some(u) } else { None }).collect()
+    }
+
+    #[test]
+    fn tokens_come_from_the_result() {
+        let init = r#"{"type":"system","subtype":"init","model":"claude-sonnet-5-5","session_id":"s"}"#;
+        // Per model when Claude Code breaks it down.
+        let both = usage_of(&[
+            init,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","usage":{"input_tokens":9,"output_tokens":9},
+               "modelUsage":{"claude-sonnet-5-5":{"inputTokens":120,"outputTokens":45,"cacheReadInputTokens":3000,"cacheCreationInputTokens":200},
+                             "claude-haiku-5-5":{"inputTokens":30,"outputTokens":5,"cacheReadInputTokens":0,"cacheCreationInputTokens":0}}}"#,
+        ]);
+        let sonnet = both.iter().find(|u| u.model.as_deref() == Some("claude-sonnet-5-5")).unwrap();
+        assert_eq!((sonnet.input, sonnet.output, sonnet.cache_read, sonnet.cache_write, sonnet.total()), (120, 45, 3000, 200, 3365));
+        assert_eq!(both.len(), 2);
+        // Else the run's usage, for the model init named; an error result still counts.
+        let one = usage_of(&[
+            init,
+            r#"{"type":"result","is_error":true,"result":"overloaded","usage":{"input_tokens":7,"output_tokens":2,"cache_read_input_tokens":1,"cache_creation_input_tokens":0}}"#,
+        ]);
+        assert_eq!(one, [Usage { model: Some("claude-sonnet-5-5".into()), input: 7, output: 2, cache_read: 1, cache_write: 0 }]);
+        // Nothing reported: no usage, so the run is unknown.
+        assert!(usage_of(&[r#"{"type":"result","is_error":false,"result":"ok"}"#]).is_empty());
     }
 }

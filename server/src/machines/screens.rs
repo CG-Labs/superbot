@@ -11,6 +11,12 @@
 //! server's own display, never another user's machine. The viewer token is botd's;
 //! narrowing who may see the Bot gives it a new one and cuts open viewers. Every open,
 //! start, new token, refusal and close is audited. Off, nothing here does anything.
+//!
+//! With MACHINE_TEAMMATE_USERS=on (ADR 0048), a teammate's runs of a shared Bot get a
+//! screen of their own, as their own OS user, apart from the owner's: kept under
+//! `wire::screen_key`, shown only to that teammate (and admins, who may ask for it),
+//! and closed once they can no longer operate the Bot. Every display then takes an X
+//! cookie, so one OS user on the machine can't open another's.
 
 use super::enroll::Enrollment;
 use super::route::{Assigned, Refusal, Target};
@@ -84,6 +90,9 @@ impl Drop for Abort {
 
 /// A Bot's screen on its owner's machine, as botd knows it.
 struct Open {
+    bot_id: String,
+    /// The teammate whose own screen of the Bot this is (ADR 0048); None: the owner's.
+    for_user: Option<String>,
     machine_id: String,
     owner_id: String,
     token: Zeroizing<String>,
@@ -98,7 +107,8 @@ struct Open {
     tunnels: Arc<AtomicUsize>,
 }
 
-/// Machine screens botd shows, by Bot id; and one start or new token per Bot at a time.
+/// Machine screens botd shows, by `wire::screen_key`; and one start or new token per
+/// Bot at a time, for all its screens.
 #[derive(Default)]
 pub struct Shown {
     open: Mutex<HashMap<String, Open>>,
@@ -113,6 +123,19 @@ impl Shown {
     async fn one_at_a_time(&self, bot: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let m = self.busy.lock().unwrap_or_else(|e| e.into_inner()).entry(bot.to_string()).or_default().clone();
         m.lock_owned().await
+    }
+
+    /// The keys of `bot`'s open screens: its owner's and its teammates'.
+    fn keys_of(&self, bot: &str) -> Vec<String> {
+        self.open().iter().filter(|(_, o)| o.bot_id == bot).map(|(k, _)| k.clone()).collect()
+    }
+}
+
+/// The agent's path for a screen, with `?for=` for a teammate's.
+fn agent_path(bot: &str, for_user: Option<&str>, rest: &str) -> String {
+    match for_user {
+        Some(u) => format!("/v1/screens/{bot}{rest}?for={u}"),
+        None => format!("/v1/screens/{bot}{rest}"),
     }
 }
 
@@ -172,8 +195,12 @@ impl Why {
 }
 
 /// Whether the machine can show screens, from its heartbeat. An agent from before
-/// screens, or speaking another screen protocol, is outdated.
+/// screens, or speaking another screen protocol, is outdated; so is one that can't
+/// keep teammates' screens apart from the owner's, once those are on (ADR 0048).
 pub fn fit(e: &Enrollment, hb: &Heartbeat) -> Result<(), Why> {
+    if e.teammate_users {
+        super::teammate::fit(hb).map_err(Why::Route)?;
+    }
     let report = hb.screens.as_ref().filter(|s| {
         hb.protocol >= wire::PROTOCOL && hb.can.iter().any(|c| c == wire::CAN_SCREENS) && s.protocol == wire::SCREEN_PROTOCOL
     });
@@ -188,8 +215,11 @@ pub fn fit(e: &Enrollment, hb: &Heartbeat) -> Result<(), Why> {
     Ok(())
 }
 
-fn screen_event(by: &Who, action: &str, machine_id: &str, bot: &str, extra: Value) -> Event {
+fn screen_event(by: &Who, action: &str, machine_id: &str, bot: &str, for_user: Option<&str>, extra: Value) -> Event {
     let mut d = json!({ "botId": bot });
+    if let Some(u) = for_user {
+        d["forUser"] = json!(u);
+    }
     if let (Some(d), Value::Object(x)) = (d.as_object_mut(), extra) {
         d.extend(x);
     }
@@ -200,8 +230,9 @@ fn enrollment(app: &App) -> Option<&Arc<Enrollment>> {
     app.control_plane.get()?.enrollment.as_ref()
 }
 
-/// Asks `to`'s agent to start `bot`'s screen with `token`, or give it that token.
-async fn put(e: &Enrollment, s: &Settings, to: &Assigned, bot: &str, token: &str) -> Result<ScreenReply, Why> {
+/// Asks `to`'s agent to start `bot`'s screen (`for_user`'s own, if given) with `token`,
+/// or give it that token.
+async fn put(e: &Enrollment, s: &Settings, to: &Assigned, bot: &str, for_user: Option<&str>, token: &str) -> Result<ScreenReply, Why> {
     let address = to.address.as_deref().ok_or_else(|| Why::Route(Refusal::Offline("it has no address yet".into())))?;
     let client = e.upload_client(to.pins.clone(), START_SECS).map_err(|m| Why::Route(Refusal::Offline(m)))?;
     let body = ScreenRequest {
@@ -211,6 +242,8 @@ async fn put(e: &Enrollment, s: &Settings, to: &Assigned, bot: &str, token: &str
         width: s.width,
         height: s.height,
         idle_secs: (s.idle_ms / 1000) as u64,
+        for_user: for_user.map(str::to_string),
+        xauth: e.teammate_users,
     };
     let r = client
         .put(e.agent_url(address, &format!("/v1/screens/{bot}")))
@@ -227,20 +260,22 @@ async fn put(e: &Enrollment, s: &Settings, to: &Assigned, bot: &str, token: &str
     serde_json::from_str(&text).map_err(|_| Why::Failed(502, "its agent's answer wasn't a screen".into()))
 }
 
-/// Starts `bot`'s screen on `to`, or keeps it, with the token botd holds for it (a new
-/// one if it has none). One left on another machine, or for another owner, is closed
-/// first. Records the open screen.
-async fn ensure(app: &App, e: &Enrollment, s: &Settings, by: &Who, bot: &Bot, to: &Assigned, why: &str) -> Result<(ScreenReply, Zeroizing<String>), Why> {
-    let elsewhere = e.shown.open().get(&bot.id).is_some_and(|o| o.machine_id != to.machine_id || o.owner_id != bot.owner_id);
+/// Starts `bot`'s screen on `to` (`for_user`'s own, if given), or keeps it, with the
+/// token botd holds for it (a new one if it has none). One left on another machine, or
+/// for another owner, is closed first. Records the open screen.
+#[allow(clippy::too_many_arguments)]
+async fn ensure(app: &App, e: &Enrollment, s: &Settings, by: &Who, bot: &Bot, for_user: Option<&str>, to: &Assigned, why: &str) -> Result<(ScreenReply, Zeroizing<String>), Why> {
+    let key = wire::screen_key(&bot.id, for_user);
+    let elsewhere = e.shown.open().get(&key).is_some_and(|o| o.machine_id != to.machine_id || o.owner_id != bot.owner_id);
     if elsewhere {
-        close_locked(app, e, by, &bot.id, "moved").await;
+        close_locked(app, e, by, &key, "moved").await;
     }
-    let token = e.shown.open().get(&bot.id).map(|o| o.token.clone());
+    let token = e.shown.open().get(&key).map(|o| o.token.clone());
     let token = token.unwrap_or_else(|| Zeroizing::new(crate::random_hex(16)));
     crate::secrets::redact::register(&token);
-    let reply = put(e, s, to, &bot.id, &token).await?;
+    let reply = put(e, s, to, &bot.id, for_user, &token).await?;
     if app.db.bot(&bot.id).is_none_or(|b| b.owner_id != bot.owner_id) {
-        let path = format!("/v1/screens/{}", bot.id);
+        let path = agent_path(&bot.id, for_user, "");
         if let Some(m) = app.db.machine(&to.machine_id) {
             let _ = e.call_agent(app, &m, reqwest::Method::DELETE, &path, &()).await;
         }
@@ -249,11 +284,13 @@ async fn ensure(app: &App, e: &Enrollment, s: &Settings, by: &Who, bot: &Bot, to
     let at = now();
     {
         let mut open = e.shown.open();
-        match open.get_mut(&bot.id).filter(|o| o.machine_id == to.machine_id && o.token == token) {
+        match open.get_mut(&key).filter(|o| o.machine_id == to.machine_id && o.token == token) {
             Some(o) => o.used = at,
             None => drop(open.insert(
-                bot.id.clone(),
+                key.clone(),
                 Open {
+                    bot_id: bot.id.clone(),
+                    for_user: for_user.map(str::to_string),
                     machine_id: to.machine_id.clone(),
                     owner_id: bot.owner_id.clone(),
                     token: token.clone(),
@@ -268,7 +305,7 @@ async fn ensure(app: &App, e: &Enrollment, s: &Settings, by: &Who, bot: &Bot, to
         }
     }
     if reply.started {
-        app.db.record(&screen_event(by, "machine.screen_started", &to.machine_id, &bot.id, json!({ "display": reply.display, "for": why })));
+        app.db.record(&screen_event(by, "machine.screen_started", &to.machine_id, &bot.id, for_user, json!({ "display": reply.display, "for": why })));
     }
     Ok((reply, token))
 }
@@ -291,10 +328,11 @@ pub async fn target(app: &App, bot: &Bot) -> Result<Option<(Arc<Enrollment>, Set
 /// started if need be, as a `/screen/<port>/?token=` link. `Ok(None)`: the Bot runs on
 /// this server, which shows it as before. The caller has checked access to the Bot;
 /// `still` checks it again once no new token for it is under way, before anything starts:
-/// a revocation that finished meanwhile must not hand out the new token.
-pub async fn open(app: &AppState, by: &Who, bot: &Bot, still: impl Fn() -> Res<()>) -> Res<Option<String>> {
+/// a revocation that finished meanwhile must not hand out the new token. `for_user`: the
+/// teammate whose own screen of it this is (ADR 0048), made their user there if need be.
+pub async fn open(app: &AppState, by: &Who, bot: &Bot, for_user: Option<&str>, still: impl Fn() -> Res<()>) -> Res<Option<String>> {
     let refused = |machine: Option<&str>, w: Why| {
-        let d = json!({ "reason": w.reason(), "owner": bot.owner_id, "machine": machine });
+        let d = json!({ "reason": w.reason(), "owner": bot.owner_id, "machine": machine, "forUser": for_user });
         let e = by.event("machine.screen_refused").bot(&bot.id).outcome(Outcome::Denied).details(d);
         app.db.record(&match machine {
             Some(m) => e.target("machine", m),
@@ -311,22 +349,30 @@ pub async fn open(app: &AppState, by: &Who, bot: &Bot, still: impl Fn() -> Res<(
     still()?;
     let hb = super::enroll::check(app, &e, &to).await.map_err(|m| refused(Some(&to.machine_id), Why::Route(Refusal::Offline(m))))?;
     fit(&e, &hb).map_err(|w| refused(Some(&to.machine_id), w))?;
-    let (reply, token) = ensure(app, &e, &s, by, bot, &to, "viewer").await.map_err(|w| refused(Some(&to.machine_id), w))?;
+    if let Some(u) = for_user {
+        let t = super::teammate::ask(&e, &to, u).await.map_err(|m| refused(Some(&to.machine_id), Why::Route(Refusal::TeammateUserFailed(m))))?;
+        if t.created {
+            let d = json!({ "owner": bot.owner_id, "forUser": u, "user": t.user, "uid": t.uid });
+            app.db.record(&by.event("machine.teammate_user_created").target("machine", &to.machine_id).bot(&bot.id).details(d));
+        }
+    }
+    let (reply, token) = ensure(app, &e, &s, by, bot, for_user, &to, "viewer").await.map_err(|w| refused(Some(&to.machine_id), w))?;
     let viewer = by.actor.id.clone().unwrap_or_default();
-    let (port, first) = listen(app, &e, &s, &bot.id, &viewer).map_err(|w| refused(Some(&to.machine_id), w))?;
+    let key = wire::screen_key(&bot.id, for_user);
+    let (port, first) = listen(app, &e, &s, &key, &viewer).map_err(|w| refused(Some(&to.machine_id), w))?;
     if first {
         let d = json!({ "port": port, "display": reply.display, "viewer": viewer });
-        app.db.record(&screen_event(by, "machine.screen_opened", &to.machine_id, &bot.id, d));
+        app.db.record(&screen_event(by, "machine.screen_opened", &to.machine_id, &bot.id, for_user, d));
     }
     Ok(Some(format!("/screen/{port}/?token={}", token.as_str())))
 }
 
-/// botd's loopback port for `bot`'s open screen, listening from now if it wasn't; and
-/// whether `viewer` is new to it.
-fn listen(app: &AppState, e: &Enrollment, s: &Settings, bot: &str, viewer: &str) -> Result<(u16, bool), Why> {
+/// botd's loopback port for the open screen under `key`, listening from now if it
+/// wasn't; and whether `viewer` is new to it.
+fn listen(app: &AppState, e: &Enrollment, s: &Settings, key: &str, viewer: &str) -> Result<(u16, bool), Why> {
     let mut open = e.shown.open();
     let taken: Vec<u16> = open.values().filter_map(|o| o.port.as_ref().map(|p| p.0)).collect();
-    let o = open.get_mut(bot).ok_or_else(|| Why::Failed(503, "it closed meanwhile".into()))?;
+    let o = open.get_mut(key).ok_or_else(|| Why::Failed(503, "it closed meanwhile".into()))?;
     o.used = now();
     if o.port.is_none() {
         let l = (s.ports.0..=s.ports.1)
@@ -335,40 +381,50 @@ fn listen(app: &AppState, e: &Enrollment, s: &Settings, bot: &str, viewer: &str)
         let (port, l) = l.ok_or(Why::NoPort)?;
         l.set_nonblocking(true).map_err(|err| Why::Failed(500, err.to_string()))?;
         let l = TcpListener::from_std(l).map_err(|err| Why::Failed(500, err.to_string()))?;
-        o.port = Some((port, Abort(tokio::spawn(accept(app.clone(), bot.to_string(), l)))));
+        o.port = Some((port, Abort(tokio::spawn(accept(app.clone(), key.to_string(), l)))));
     }
     let port = o.port.as_ref().map_or(0, |p| p.0);
     Ok((port, o.viewers.insert(viewer.to_string())))
 }
 
-async fn accept(app: AppState, bot: String, l: TcpListener) {
+async fn accept(app: AppState, key: String, l: TcpListener) {
     loop {
         let Ok((tcp, _)) = l.accept().await else {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             continue;
         };
-        let (app, bot) = (app.clone(), bot.clone());
+        let (app, key) = (app.clone(), key.clone());
         tokio::spawn(async move {
-            if let Err(why) = tunnel(&app, &bot, tcp).await {
-                eprintln!("Screen of Bot {bot}: {why}");
+            if let Err(why) = tunnel(&app, &key, tcp).await {
+                eprintln!("Screen {key}: {why}");
             }
         });
     }
 }
 
+/// Whether the teammate a screen is for can still operate its Bot (ADR 0048).
+fn still_theirs(app: &App, bot: &Bot, for_user: Option<&str>) -> bool {
+    for_user.is_none_or(|u| crate::acl::Viewer::person(&app.db, u).access(&app.db, bot) >= crate::acl::Access::Operate)
+}
+
 /// One viewer connection, piped to the Bot's voxl through its machine's agent. Checked
-/// afresh each time: the Bot is still its owner's, and its owner still routed to that
-/// machine, reached at its current certificates.
-async fn tunnel(app: &AppState, bot: &str, mut tcp: TcpStream) -> Result<(), String> {
+/// afresh each time: the Bot is still its owner's, its owner still routed to that
+/// machine, reached at its current certificates, and a teammate's screen still theirs.
+async fn tunnel(app: &AppState, key: &str, mut tcp: TcpStream) -> Result<(), String> {
     let e = enrollment(app).ok_or("machine enrollment is off")?.clone();
-    let (machine_id, owner, mut cut, tunnels) = {
+    let (bot, for_user, machine_id, owner, mut cut, tunnels) = {
         let open = e.shown.open();
-        let o = open.get(bot).ok_or("it isn't open")?;
-        (o.machine_id.clone(), o.owner_id.clone(), o.cut.subscribe(), o.tunnels.clone())
+        let o = open.get(key).ok_or("it isn't open")?;
+        (o.bot_id.clone(), o.for_user.clone(), o.machine_id.clone(), o.owner_id.clone(), o.cut.subscribe(), o.tunnels.clone())
     };
-    let still = app.db.bot(bot).is_some_and(|b| b.owner_id == owner);
+    let bot = bot.as_str();
+    let here = app.db.bot(bot).filter(|b| b.owner_id == owner);
+    if here.as_ref().is_some_and(|b| !still_theirs(app, b, for_user.as_deref())) {
+        close_key(app, &Who::system("control_plane"), bot, key, "access_lost").await;
+        return Err("the teammate it's for can no longer use its Bot".into());
+    }
     let to = match app.control_plane.get().map(|cp| cp.route(&app.db, &owner)) {
-        Some(Ok(Target::Machine(to))) if still && to.machine_id == machine_id => to,
+        Some(Ok(Target::Machine(to))) if here.is_some() && to.machine_id == machine_id => to,
         _ => {
             close(app, &Who::system("control_plane"), bot, "moved").await;
             return Err("its Bot or owner moved off that machine".into());
@@ -377,7 +433,7 @@ async fn tunnel(app: &AppState, bot: &str, mut tcp: TcpStream) -> Result<(), Str
     let address = to.address.as_deref().ok_or("its machine has no address")?;
     let client = e.tunnel_client(to.pins.clone())?;
     let r = client
-        .get(e.agent_url(address, &format!("/v1/screens/{bot}/tunnel")))
+        .get(e.agent_url(address, &agent_path(bot, for_user.as_deref(), "/tunnel")))
         .header(header::CONNECTION, "upgrade")
         .header(header::UPGRADE, wire::SCREEN_UPGRADE)
         .send()
@@ -399,7 +455,7 @@ async fn tunnel(app: &AppState, bot: &str, mut tcp: TcpStream) -> Result<(), Str
         _ = tokio::io::copy_bidirectional(&mut up, &mut tcp) => {}
         _ = cut.changed() => {}
     }
-    if let Some(o) = e.shown.open().get_mut(bot) {
+    if let Some(o) = e.shown.open().get_mut(key) {
         o.used = now();
     }
     Ok(())
@@ -411,17 +467,22 @@ pub async fn hold_for_tests(e: &Enrollment, bot: &str) -> tokio::sync::OwnedMute
     e.shown.one_at_a_time(bot).await
 }
 
-/// The screen's environment for a run of `bot` on `to`, starting it there if need be.
-/// None when screens are off or the machine can't show one: the Bot runs without.
-pub async fn for_run(app: &App, bot: &Bot, to: &Assigned, state_dir: &std::path::Path) -> Option<HashMap<String, String>> {
+/// The screen's environment for a run of `bot` on `to`, starting it there if need be:
+/// `for_user`'s own, for a teammate's run as their own user (ADR 0048). None when
+/// screens are off or the machine can't show one: the Bot runs without.
+pub async fn for_run(app: &App, bot: &Bot, for_user: Option<&str>, to: &Assigned, state_dir: &std::path::Path) -> Option<HashMap<String, String>> {
     let e = enrollment(app)?.clone();
     let s = e.screens.clone()?;
     let _one = e.shown.one_at_a_time(&bot.id).await;
     let by = Who::system("runner");
-    match ensure(app, &e, &s, &by, bot, to, "run").await {
+    match ensure(app, &e, &s, &by, bot, for_user, to, "run").await {
         Ok((reply, _)) => {
             let info = crate::screen::Info { display: reply.display, bus: reply.bus, port: 0, token: String::new() };
-            Some(crate::screen::bot_env(&info, &bot.id, state_dir))
+            let mut env = crate::screen::bot_env(&info, &bot.id, state_dir);
+            if let Some(x) = reply.xauthority {
+                env.insert("XAUTHORITY".into(), x);
+            }
+            Some(env)
         }
         Err(w) => {
             eprintln!("Screen of Bot {} on machine {}: {}", bot.id, to.machine_id, w.message());
@@ -436,40 +497,62 @@ pub async fn for_run(app: &App, bot: &Bot, to: &Assigned, state_dir: &std::path:
 pub async fn rotate(app: &App, bot: &str) {
     let Some(e) = enrollment(app).cloned() else { return };
     let _one = e.shown.one_at_a_time(bot).await;
-    let owner = e.shown.open().get(bot).map(|o| o.owner_id.clone());
-    let Some(owner) = owner else { return };
-    if app.db.bot(bot).is_none_or(|b| b.owner_id != owner) {
-        close_locked(app, &e, &Who::system("control_plane"), bot, "moved").await;
+    for key in e.shown.keys_of(bot) {
+        rotate_key(app, &e, bot, &key).await;
+    }
+}
+
+async fn rotate_key(app: &App, e: &Enrollment, bot: &str, key: &str) {
+    let open = e.shown.open().get(key).map(|o| (o.owner_id.clone(), o.for_user.clone()));
+    let Some((owner, for_user)) = open else { return };
+    let by = Who::system("control_plane");
+    let Some(b) = app.db.bot(bot).filter(|b| b.owner_id == owner) else {
+        close_locked(app, e, &by, key, "moved").await;
+        return;
+    };
+    // A teammate who lost the Bot loses their screen of it (ADR 0048).
+    if !still_theirs(app, &b, for_user.as_deref()) {
+        close_locked(app, e, &by, key, "access_lost").await;
         return;
     }
     let token = Zeroizing::new(crate::random_hex(16));
     crate::secrets::redact::register(&token);
     let machine = {
         let mut open = e.shown.open();
-        let Some(o) = open.get_mut(bot) else { return };
+        let Some(o) = open.get_mut(key) else { return };
         o.token = token.clone();
         o.port = None;
         o.viewers.clear();
         o.cut.send_modify(|n| *n += 1);
         o.machine_id.clone()
     };
-    let by = Who::system("control_plane");
-    let told = match (app.db.bot(bot), e.screens.clone(), app.db.machine(&machine)) {
-        (Some(b), Some(s), Some(m)) => {
+    let told = match (e.screens.clone(), app.db.machine(&machine)) {
+        (Some(s), Some(m)) => {
             let to = Assigned { machine_id: m.id.clone(), user_id: m.user_id.clone(), address: m.ipv4.clone(), pins: app.db.machine_pins(&m.id) };
-            put(&e, &s, &to, &b.id, &token).await.is_ok()
+            put(e, &s, &to, &b.id, for_user.as_deref(), &token).await.is_ok()
         }
         _ => false,
     };
-    app.db.record(&screen_event(&by, "machine.screen_rotated", &machine, bot, json!({ "machineTold": told })));
+    app.db.record(&screen_event(&by, "machine.screen_rotated", &machine, bot, for_user.as_deref(), json!({ "machineTold": told })));
 }
 
-/// Stops showing `bot`'s machine screen and asks its agent to stop it, after any start
-/// or new token for it under way.
+/// Stops showing `bot`'s machine screens, its owner's and its teammates', and asks its
+/// agent to stop them, after any start or new token for it under way.
 pub async fn close(app: &App, by: &Who, bot: &str, reason: &str) -> bool {
     let Some(e) = enrollment(app).cloned() else { return false };
     let _one = e.shown.one_at_a_time(bot).await;
-    close_locked(app, &e, by, bot, reason).await
+    let mut closed = false;
+    for key in e.shown.keys_of(bot) {
+        closed |= close_locked(app, &e, by, &key, reason).await;
+    }
+    closed
+}
+
+/// `close` for one of `bot`'s screens.
+async fn close_key(app: &App, by: &Who, bot: &str, key: &str, reason: &str) -> bool {
+    let Some(e) = enrollment(app).cloned() else { return false };
+    let _one = e.shown.one_at_a_time(bot).await;
+    close_locked(app, &e, by, key, reason).await
 }
 
 /// `rotate` for every open machine screen, when someone loses access: a link doesn't
@@ -477,49 +560,57 @@ pub async fn close(app: &App, by: &Who, bot: &str, reason: &str) -> bool {
 /// under way: it isn't open until that ends, and `rotate` waits for it.
 pub async fn rotate_all(app: &App) {
     let Some(e) = enrollment(app) else { return };
-    let mut bots: BTreeSet<String> = e.shown.open().keys().cloned().collect();
+    let mut bots: BTreeSet<String> = e.shown.open().values().map(|o| o.bot_id.clone()).collect();
     bots.extend(e.shown.busy.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned());
     for bot in bots {
         rotate(app, &bot).await;
     }
 }
 
-async fn close_locked(app: &App, e: &Enrollment, by: &Who, bot: &str, reason: &str) -> bool {
-    let Some(o) = e.shown.open().remove(bot) else { return false };
+async fn close_locked(app: &App, e: &Enrollment, by: &Who, key: &str, reason: &str) -> bool {
+    let Some(o) = e.shown.open().remove(key) else { return false };
+    let path = agent_path(&o.bot_id, o.for_user.as_deref(), "");
     let stopped = match app.db.machine(&o.machine_id) {
-        Some(m) => e.call_agent(app, &m, reqwest::Method::DELETE, &format!("/v1/screens/{bot}"), &()).await.is_ok_and(|(c, _)| c == 204 || c == 404),
+        Some(m) => e.call_agent(app, &m, reqwest::Method::DELETE, &path, &()).await.is_ok_and(|(c, _)| c == 204 || c == 404),
         None => false,
     };
     let d = json!({ "reason": reason, "openMs": now() - o.since, "machineStopped": stopped });
-    app.db.record(&screen_event(by, "machine.screen_closed", &o.machine_id, bot, d));
+    app.db.record(&screen_event(by, "machine.screen_closed", &o.machine_id, &o.bot_id, o.for_user.as_deref(), d));
     true
 }
 
-/// Closes screens no one has asked for, viewed or run on lately, and those whose Bot or
-/// owner left that machine. After every round of heartbeats.
+/// Closes screens no one has asked for, viewed or run on lately, those whose Bot or
+/// owner left that machine, and teammates' whose teammate lost the Bot. After every
+/// round of heartbeats.
 pub async fn reap(app: &App) {
     let Some(e) = enrollment(app).cloned() else { return };
     let Some(s) = e.screens.clone() else { return };
     let at = now();
-    let due: Vec<(String, &'static str)> = {
+    let due: Vec<(String, String, &'static str)> = {
         let open = e.shown.open();
         open.iter()
-            .filter_map(|(bot, o)| {
-                let here = app.db.bot(bot).filter(|b| b.owner_id == o.owner_id);
+            .filter_map(|(key, o)| {
+                let here = app.db.bot(&o.bot_id).filter(|b| b.owner_id == o.owner_id);
                 let routed = app.control_plane.get().map(|cp| cp.route(&app.db, &o.owner_id));
                 let moved = here.is_none() || !matches!(routed, Some(Ok(Target::Machine(ref to))) if to.machine_id == o.machine_id);
-                let idle = at - o.used >= s.idle_ms && o.tunnels.load(Ordering::SeqCst) == 0 && !app.is_running(bot);
-                match (moved, idle) {
-                    (true, _) => Some((bot.clone(), "moved")),
-                    (_, true) => Some((bot.clone(), "idle")),
-                    _ => None,
-                }
+                let lost = here.as_ref().is_some_and(|b| !still_theirs(app, b, o.for_user.as_deref()));
+                let idle = at - o.used >= s.idle_ms && o.tunnels.load(Ordering::SeqCst) == 0 && !app.is_running(&o.bot_id);
+                let reason = if moved {
+                    "moved"
+                } else if lost {
+                    "access_lost"
+                } else if idle {
+                    "idle"
+                } else {
+                    return None;
+                };
+                Some((o.bot_id.clone(), key.clone(), reason))
             })
             .collect()
     };
     let by = Who::system("control_plane");
-    for (bot, reason) in due {
-        close(app, &by, &bot, reason).await;
+    for (bot, key, reason) in due {
+        close_key(app, &by, &bot, &key, reason).await;
     }
 }
 
@@ -535,22 +626,22 @@ pub async fn list(AppS(app): AppS<AppState>, Path(key): Path<String>) -> Res {
         let mut v: Vec<Value> = open
             .iter()
             .filter(|(_, o)| o.machine_id == m.id)
-            .map(|(bot, o)| {
+            .map(|(_, o)| {
                 json!({
-                    "botId": bot, "since": o.since, "usedAt": o.used, "port": o.port.as_ref().map(|p| p.0),
+                    "botId": o.bot_id, "forUser": o.for_user, "since": o.since, "usedAt": o.used, "port": o.port.as_ref().map(|p| p.0),
                     "viewers": o.viewers.len(), "connections": o.tunnels.load(Ordering::SeqCst),
                 })
             })
             .collect();
-        v.sort_by(|a, b| a["botId"].as_str().cmp(&b["botId"].as_str()));
+        v.sort_by(|a, b| (a["botId"].as_str(), a["forUser"].as_str()).cmp(&(b["botId"].as_str(), b["forUser"].as_str())));
         v
     };
     let agent = m.agent_upkeep.as_ref().map(|u| u["screens"].clone()).unwrap_or(Value::Null);
     Ok(Json(json!({ "machineId": m.id, "on": e.screens.is_some(), "screens": screens, "agent": agent })))
 }
 
-/// `DELETE /api/users/{key}/machine/screens/{bot}`: stops showing a Bot's screen and
-/// stops it on the machine.
+/// `DELETE /api/users/{key}/machine/screens/{bot}`: stops showing a Bot's screens, its
+/// owner's and its teammates', and stops them on the machine.
 pub async fn close_now(
     AppS(app): AppS<AppState>,
     axum::extract::Extension(by): axum::extract::Extension<Who>,
@@ -562,8 +653,8 @@ pub async fn close_now(
         return Err(ApiError(StatusCode::CONFLICT, OFF.into()));
     }
     let u = need_user_key(&app, &key)?;
-    let open = e.shown.open().get(&bot).map(|o| o.owner_id.clone());
-    if open.as_deref() != Some(u.id.as_str()) {
+    let mine = e.shown.open().values().any(|o| o.bot_id == bot && o.owner_id == u.id);
+    if !mine {
         return Err(crate::not_found("Screen"));
     }
     close(&app, &by, &bot, "closed_by_admin").await;

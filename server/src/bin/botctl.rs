@@ -50,6 +50,9 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl tiers                                     Every tier, its routes and limits, and the default
   botctl usage [json]                              Everyone's plan, use against its limits, machine size,
                                                    and subscription (admins)
+  botctl usage me [json]                           Your own model tokens and runs this billing period
+  botctl usage user <user> [json]                  A user's tokens and runs this billing period, by Bot
+                                                   and model (admins)
   botctl user isolation <user>                     With ISOLATION=users: the user's own account and folders
   botctl user isolate <user>                       Make that account and its folders now
   botctl user harness-login <user> <claude|codex> [-- <args>...]
@@ -652,6 +655,42 @@ fn license_summary(l: &Value) -> String {
 
 /// One line per user: their plan, each limit as used/allowed, their machine, their
 /// subscription, and any limit they're past (ADR 0040).
+/// One user's billing period (`GET /api/me/usage` or `/api/users/{key}/usage`), for people.
+fn period_summary(v: &Value) -> String {
+    let n = |v: &Value| v.as_u64().unwrap_or(0);
+    let of = |used: &Value, limit: &Value| match limit.as_u64() {
+        Some(l) => format!("{}/{}", n(used), l),
+        None => format!("{}/unlimited", n(used)),
+    };
+    let day = |ms: &Value| chrono::DateTime::from_timestamp_millis(ms.as_i64().unwrap_or(0)).map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default();
+    let (p, t) = (&v["period"], &v["tokens"]);
+    let source = if p["source"] == "subscription" { "subscription period" } else { "calendar month, UTC" };
+    let mut out = format!(
+        "{} plan, {} to {} ({source})\nTokens {} (input {}, output {}, cache read {}, cache write {})\nRuns {}",
+        v["tier"]["label"].as_str().unwrap_or_default(),
+        day(&p["start"]),
+        day(&p["end"]),
+        of(&t["total"], &t["limit"]),
+        n(&t["input"]),
+        n(&t["output"]),
+        n(&t["cacheRead"]),
+        n(&t["cacheWrite"]),
+        of(&v["runs"]["used"], &v["runs"]["limit"]),
+    );
+    if n(&t["unreportedRuns"]) > 0 {
+        out += &format!("; {} reported no tokens", n(&t["unreportedRuns"]));
+    }
+    out.push('\n');
+    for b in v["byBot"].as_array().into_iter().flatten() {
+        let name = b["name"].as_str().unwrap_or("(deleted or not yours now)");
+        out += &format!("  Bot {name} ({}): {} tokens in {} runs\n", b["bot"].as_str().unwrap_or_default(), n(&b["total"]), n(&b["runs"]));
+    }
+    for m in v["byModel"].as_array().into_iter().flatten() {
+        out += &format!("  Model {}: {} tokens in {} runs\n", m["model"].as_str().unwrap_or("(not named)"), n(&m["total"]), n(&m["runs"]));
+    }
+    out
+}
+
 fn usage_summary(v: &Value) -> String {
     let of = |used: &Value, limit: &Value| match limit.as_u64() {
         Some(l) => format!("{}/{l}", used.as_u64().unwrap_or(0)),
@@ -667,10 +706,11 @@ fn usage_summary(v: &Value) -> String {
         let (p, use_) = (&u["plan"], &u["plan"]["usage"]);
         let who = u["user"]["email"].as_str().or(u["user"]["name"].as_str()).unwrap_or_default();
         let mut line = format!(
-            "{who}: {} plan; Bots {}; runs {} in {}; routine runs {} on {}",
+            "{who}: {} plan; Bots {}; runs {} and tokens {} in {}; routine runs {} on {}",
             p["label"].as_str().unwrap_or_default(),
             of(&use_["bots"], &p["limits"]["maxBots"]),
             of(&use_["runs"], &p["limits"]["monthlyRuns"]),
+            of(&use_["tokens"], &p["limits"]["monthlyTokens"]),
             use_["period"].as_str().unwrap_or_default(),
             of(&use_["routineRuns"], &p["limits"]["dailyRoutineRuns"]),
             use_["day"].as_str().unwrap_or_default(),
@@ -801,6 +841,10 @@ fn run(args: &[String]) -> Result<String, String> {
         ["tiers"] => op("GET", "/api/tiers", None),
         ["usage"] => Ok(usage_summary(&serde_json::from_str(&api(Cred::Operator, "GET", "/api/usage", None)?).map_err(|e| e.to_string())?)),
         ["usage", "json"] => op("GET", "/api/usage", None),
+        ["usage", "me"] => Ok(period_summary(&serde_json::from_str(&op("GET", "/api/me/usage", None)?).map_err(|e| e.to_string())?)),
+        ["usage", "me", "json"] => op("GET", "/api/me/usage", None),
+        ["usage", "user", key] => Ok(period_summary(&serde_json::from_str(&op("GET", &format!("/api/users/{}/usage", encode(key)), None)?).map_err(|e| e.to_string())?)),
+        ["usage", "user", key, "json"] => op("GET", &format!("/api/users/{}/usage", encode(key)), None),
         ["license"] | ["license", "status"] => Ok(license_summary(&serde_json::from_str(&api(Cred::Operator, "GET", "/api/license", None)?).map_err(|e| e.to_string())?)),
         ["license", "json"] => op("GET", "/api/license", None),
         ["license", "install", rest @ ..] if rest.len() <= 1 => {
@@ -1047,16 +1091,39 @@ mod tests {
         let v = json!({ "billing": true, "checkout": true, "users": [
             { "user": { "email": "ada@example.com" }, "over": ["bots", "machineType"],
               "plan": { "label": "Starter", "limits": { "maxBots": 2, "monthlyRuns": 300, "dailyRoutineRuns": 24, "machineType": "g6-standard-1" },
-                        "usage": { "bots": 3, "runs": 12, "period": "2026-11", "routineRuns": 4, "day": "2026-11-20" } },
+                        "usage": { "bots": 3, "runs": 12, "tokens": 4500, "period": "2026-11", "routineRuns": 4, "day": "2026-11-20" } },
               "machine": { "plan": "g6-standard-2", "state": "running" }, "subscription": { "status": "active" }, "customer": "cus_123" },
             { "user": { "name": "Owner" }, "over": [], "machine": null, "subscription": null,
               "plan": { "label": "Self-host", "limits": {}, "usage": { "bots": 1, "runs": 0, "period": "2026-11", "routineRuns": 0, "day": "2026-11-20" } } },
         ]});
         let out = usage_summary(&v);
         assert!(out.starts_with("Billing: Stripe webhook and checkout on.\n"), "{out}");
-        assert!(out.contains("ada@example.com: Starter plan; Bots 3/2; runs 12/300 in 2026-11; routine runs 4/24 on 2026-11-20; machine g6-standard-2 (running), plan size g6-standard-1; Stripe active; customer cus_123; OVER: bots, machineType\n"), "{out}");
+        assert!(out.contains("ada@example.com: Starter plan; Bots 3/2; runs 12/300 and tokens 4500/unlimited in 2026-11; routine runs 4/24 on 2026-11-20; machine g6-standard-2 (running), plan size g6-standard-1; Stripe active; customer cus_123; OVER: bots, machineType\n"), "{out}");
         assert!(usage_summary(&json!({ "billing": true, "users": [] })).starts_with("Billing: Stripe webhook on, checkout off.\n"));
-        assert!(out.contains("Owner: Self-host plan; Bots 1/unlimited; runs 0/unlimited in 2026-11; routine runs 0/unlimited on 2026-11-20\n"), "{out}");
+        assert!(out.contains("Owner: Self-host plan; Bots 1/unlimited; runs 0/unlimited and tokens 0/unlimited in 2026-11; routine runs 0/unlimited on 2026-11-20\n"), "{out}");
+    }
+
+    #[test]
+    fn period_summary_shows_tokens_by_bot_and_model() {
+        let v = json!({
+            "tier": { "label": "Pro" },
+            "period": { "start": 1_794_990_000_000_i64, "end": 1_797_582_000_000_i64, "source": "subscription" },
+            "tokens": { "input": 1000, "output": 200, "cacheRead": 300, "cacheWrite": 0, "total": 1500, "limit": 5_000_000, "unreportedRuns": 1 },
+            "runs": { "used": 2, "limit": null },
+            "byBot": [{ "bot": "b1", "name": "Ada's", "total": 1500, "runs": 2 }, { "bot": "b2", "name": null, "total": 0, "runs": 1 }],
+            "byModel": [{ "model": "claude-sonnet-4-5", "total": 1500, "runs": 1 }],
+        });
+        let out = period_summary(&v);
+        assert_eq!(
+            out,
+            "Pro plan, 2026-11-18 to 2026-12-18 (subscription period)\nTokens 1500/5000000 (input 1000, output 200, cache read 300, cache write 0)\nRuns 2/unlimited; 1 reported no tokens\n  Bot Ada's (b1): 1500 tokens in 2 runs\n  Bot (deleted or not yours now) (b2): 0 tokens in 1 runs\n  Model claude-sonnet-4-5: 1500 tokens in 1 runs\n"
+        );
+        // A member on a managed plan gets no models; the calendar month says so.
+        let mut member = v.clone();
+        member.as_object_mut().unwrap().remove("byModel");
+        member["period"]["source"] = json!("calendar");
+        let out = period_summary(&member);
+        assert!(out.contains("(calendar month, UTC)") && !out.contains("Model"), "{out}");
     }
 
     #[test]

@@ -146,6 +146,8 @@ pub(crate) fn config(env: &Env, machine_id: &str, token: Option<&str>) -> Config
         bot_user: crate::machines::runas::current_user().unwrap(),
         allow_own_user: true,
         screens: crate::machines_mtls_tests::no_screens(),
+        teammates: crate::db::temp_path("agent-teammates"),
+        teammate_stand_in: None,
     }
 }
 
@@ -1104,7 +1106,7 @@ pub(crate) async fn agent_with_config(
         std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     cfg.botctl = bin.join("botctl");
-    cfg.harness_path = format!("{}:/usr/bin:/bin", bin.display());
+    cfg.harness_path = format!("{}:{}", bin.display(), cfg.harness_path);
     let relay = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     cfg.api_listen = relay.local_addr().unwrap();
     let id = agent::enroll(&cfg).await.unwrap();
@@ -1597,6 +1599,8 @@ fn agent_counts_programs_only_under_its_home_or_the_system() {
         bot_user: crate::machines::wire::BOT_USER.into(),
         allow_own_user: false,
         screens: crate::machines_mtls_tests::no_screens(),
+        teammates: crate::db::temp_path("roots-teammates"),
+        teammate_stand_in: None,
     };
     assert_eq!(cfg.layout().botctl, None, "outside the home and the system's directories");
 

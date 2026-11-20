@@ -21,6 +21,8 @@ mod landing;
 mod pki;
 #[path = "../machines/runas.rs"]
 mod runas;
+#[path = "../machines/teammates.rs"]
+mod teammates;
 #[path = "../machines/terminal.rs"]
 mod terminal;
 #[path = "../machines/tools.rs"]

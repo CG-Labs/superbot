@@ -232,13 +232,22 @@ botctl bot owner <bot-id> alex@example.com          # admins only
 
 ### Tiers and model routing
 
-Each user is on a **tier** (a plan). A tier lists the harness and model **routes** its users' Bots may run on, and limits per user: `maxBots`, `monthlyRuns` (UTC calendar month), and `monthlyTokens` (shown, not enforced yet). Design: [ADR 0033](adr/0033-tiers-model-routing.md).
+Each user is on a **tier** (a plan). A tier lists the harness and model **routes** its users' Bots may run on, and limits per user: `maxBots`, and per billing period `monthlyRuns` and `monthlyTokens` (model tokens, as harnesses report them). Design: [ADR 0033](adr/0033-tiers-model-routing.md).
 
 - **Default: nothing changes.** Without `TIERS_FILE` there is one tier, `self-host`: any harness and model, no limits.
 - **Turn on**: copy [`deploy/tiers.example.json`](../deploy/tiers.example.json), edit it, set `TIERS_FILE` to its path, and restart. `DEFAULT_TIER` (or the file's `default`, else its first tier) is the tier for users without one. botd refuses to start on a bad file.
 - **Managed tiers** (with routes): each run takes the route the Bot **owner's** tier picks (the Bot's model if the tier has it for that harness, else the harness's first route; provider and effort always from the route). A harness outside the tier doesn't run. Setting a model, effort or harness outside the owner's tier is a 403, for admins too. Only admins see model names; others see the plan.
 - **Assign**: `botctl user tier alex@example.com pro` (or `default`), or `PATCH /api/users/:id {tier}`. Admins only; audited as `user.tier_changed`. `botctl tiers` lists them.
-- **Audit**: `harness.invoked` records the tier and route; refusals are `bot.run_refused` with reason `tier_harness` or `tier_limit`.
+- **Audit**: `harness.invoked` records the tier and route; refusals are `bot.run_refused` with reason `tier_harness`, `tier_limit`, or `tier_token_limit`.
+
+### Usage and token metering
+
+Each run's model tokens are recorded for its Bot's **owner**, the same person its run counts for: one row per model with input, output, cache-read and cache-write tokens, the Bot, a run id, and the time. Hermes Agent, Claude Code, Codex and Pi report tokens; a run whose harness reports none is recorded as **unknown** (counted as a run, not as zero tokens). `harness.invoked` and `bot.run_finished` carry the `runId`, and `bot.run_finished` the run's tokens as `usage` (null when unknown). Design: [ADR 0048](adr/0048-billing-period-token-usage.md).
+
+- **Billing period**: a user with a paid Stripe subscription counts runs and tokens in its period (a yearly plan's months, counted from its start); everyone else in the calendar month, UTC. Routine runs stay per UTC day.
+- **Limit**: once a user's tokens reach their tier's `monthlyTokens`, their Bots' runs are refused until the next period: `bot.run_refused` (reason `tier_token_limit`, with `used`, `limit`, `period`) and a chat message saying when more start. The run that crosses it is audited as `usage.token_limit_reached` (by `billing`, on behalf of the user). Runs already going when the limit is reached finish, so use can pass the limit by those runs.
+- **See it**: `GET /api/me/usage` and `botctl usage me` (yours), the client's Plan screen (offered with or without billing); a Bot you no longer own shows no name; `GET /api/users/{key}/usage` and `botctl usage user <user>` (admins); `GET /api/usage` and `botctl usage` add tokens per user.
+- **Stripe meter** (off by default): set `STRIPE_METER_EVENT` to a Stripe meter's event name, with `STRIPE_SECRET_KEY`, and botd sends each run's tokens (for a user with a Stripe customer) as a meter event every minute, at most once each. A meter event Stripe refuses, or that can't reach it after five tries, is marked failed and audited as `billing.meter_failed`.
 
 ### One Unix account per user
 
@@ -276,6 +285,12 @@ For CG-Labs managed hosting: botd can rent one Linode per user and track it. **O
   - Audited as `machine.harness_login*`, `machine.harness_logged_out` and `machine.folder_sync_*`.
 - **Bots' own user on machines** ([ADR 0043](adr/0043-bots-own-os-user-on-machines.md)), off by default: with `MACHINE_BOT_USER=on`, after a heartbeat botd asks each idle agent to run its Bots as the unprivileged `superbot-bots` user. The agent makes it if it must, hands it the Bots' home without following links, and from then on runs harnesses, logins and cleanups as it, and touches files in the home only with its access. Until it's ready, routed runs are refused with `bot_user_pending` (or `bot_user_failed`, or `agent_outdated` for an agent too old to do it). `POST /api/users/{key}/machine/bot-user` asks now; `GET .../machine/agent` shows `agent.botUser`. Audited as `machine.bot_user_requested`, `machine.bot_user_ready` and `machine.bot_user_failed`.
 - **Screens on machines** ([ADR 0045](adr/0045-screens-on-machines.md)), off by default: with `MACHINE_SCREENS=on` (needs `MACHINE_BOT_USER=on`), `GET /api/bots/:id/screen` for a Bot routed to its owner's machine starts its screen there (Xvfb, Openbox, D-Bus, voxl as the Bots' user) and returns the usual `/screen/<port>/?token=` link. botd listens on a loopback port in `MACHINE_SCREEN_PORTS` and pipes each connection through the agent's mutual-TLS port (an HTTP upgrade), checking the route again each time. It is never shown from this server or another machine: refusals carry the route's reason, or `machine_screens_off`, `screen_stack_missing`, `screen_ports_full`, `screen_failed`. Runs there get its `DISPLAY`. Narrowing access gives it a new token. `GET /api/users/{key}/machine/screens` lists a user's open screens and `DELETE .../machine/screens/{bot}` closes one (admin). Audited as `machine.screen_started`, `machine.screen_opened`, `machine.screen_rotated`, `machine.screen_refused` and `machine.screen_closed`.
+- **Teammates' own user on machines** ([ADR 0048](adr/0048-teammates-own-os-user-on-machines.md)), off by default: with `MACHINE_TEAMMATE_USERS=on` (needs `MACHINE_BOT_USER=on`), a run of a shared Bot for someone other than its owner goes to the owner's machine as that teammate's own user.
+  - botd asks the agent with `PUT /v1/teammates/{user}`. The agent makes `superbot-t-<hash>` with a 0700 home under `<state>/teammates`, apart from the Bots' home, and runs the job (`for_user`) there. It refuses paths outside that home.
+  - The run's `BOT_TOKEN` is bound to the teammate and refused (`run_over`) once the Bot's latest run is someone else's.
+  - Refusals: `agent_outdated` (no `can: teammates`), `teammate_user_failed`, `teammate_no_key` (Claude Code or Codex with no server-wide key).
+  - Screens are per person. `GET /api/bots/:id/screen` gives the caller their own (`?for=<user>` for admins). Every display takes an X cookie, and a teammate who loses the Bot loses their screen (`access_lost`).
+  - Audited as `machine.teammate_user_created`, with `teammateUser` on `bot.run_routed` and `harness.invoked`, and `forUser` on `machine.screen_*`.
 - **Not yet**: tying tiers to billing.
 
 ## API
@@ -289,7 +304,8 @@ All JSON. Auth: a session cookie (sign-in page and console) or `Authorization: B
 - `GET /api/bots/:id/access` → `{botId, owner, visibility, access, grants?}` (grants for the owner and admins). `PATCH` `{visibility?, owner?}` (owner: admins only)
 - `PUT /api/bots/:id/grants/:user` `{level: viewer|operator}`, `DELETE /api/bots/:id/grants/:user`: owner or admin; `:user` is an id or email
 - `GET /api/harnesses/:name/models`: models and reasoning efforts the harness offers (Claude Code: aliases; Codex: `codex debug models`; Pi: `pi --list-models`; Hermes Agent: one entry with an empty `id`, meaning any model name, with its efforts). 403 for non-admins on a managed tier; `?tier=<name>` (admins): only that tier's models
-- `GET /api/me/tier` → `{name, label, managed, limits: {maxBots, monthlyRuns, monthlyTokens}, usage: {period, runs, bots}}`: your plan, no model names. People only ([ADR 0033](adr/0033-tiers-model-routing.md))
+- `GET /api/me/tier` → `{name, label, managed, limits: {maxBots, monthlyRuns, monthlyTokens}, usage: {period, runs, bots, tokens, periodStart, periodEnd, periodSource}}`: your plan, no model names. People only ([ADR 0033](adr/0033-tiers-model-routing.md))
+- `GET /api/me/usage` → `{user, tier, period: {key, start, end, source}, tokens: {input, output, cacheRead, cacheWrite, total, runs, unreportedRuns, limit}, runs: {used, limit}, byBot: [...], byModel?: [...]}`: your own usage this billing period. People only; `byModel` only for admins or on a tier that lets you pick models. `GET /api/users/{key}/usage`: the same for anyone, admins only ([ADR 0048](adr/0048-billing-period-token-usage.md))
 - `GET /api/tiers` → `{default, source, tiers: [{name, label, managed, limits, routes: "any" | [{harness, provider?, model, effort?}]}]}`: admins only
 - `GET /api/setup` → `{progress: {step, dismissed, completedAt, completedBy, show}, steps, domain, signIn, tiers, approvals, checklist: [{id, label, done, detail}], done, total}`: the onboarding wizard's report, with commands and `.env` lines for what botd reads at startup; never secret values or models. `PATCH /api/setup` `{step?: domain|signin|tiers|finish, dismissed?, completed?}`; finishing, reopening, hiding, and showing again are audited as `setup.*`. Admins only ([ADR 0034](adr/0034-onboarding-wizard.md))
 - `GET|POST /api/bots/:id/messages` `{text, answer?: {messageId, option}}`
@@ -351,6 +367,6 @@ Approvals, policy, and audit. Writes, decisions, the approvals list, and the aud
 
 ## Not built yet
 
-Sign-up emails, self-serve SSO linking, and sign-up retention ([ADR 0022](adr/0022-landing-and-signups.md)). SCIM groups, group-to-role mapping, and bulk ([ADR 0023](adr/0023-scim.md)). Enrollment and mTLS with per-user machines, moving a user's Bots onto theirs, and `botctl machine` commands ([ADR 0025](adr/0025-control-plane-linode.md)). Billing (payment provider, subscriptions), token metering, and machine size following the user's tier ([ADR 0033](adr/0033-tiers-model-routing.md)). Vault/Key Vault/Secret Manager stores and master-key rotation (the `SecretStore` trait is ready for them), per-Bot resource limits, Slack. Approvals follow-ups are in [approvals-followups.md](approvals-followups.md).
+Sign-up emails, self-serve SSO linking, and sign-up retention ([ADR 0022](adr/0022-landing-and-signups.md)). SCIM groups, group-to-role mapping, and bulk ([ADR 0023](adr/0023-scim.md)). Enrollment and mTLS with per-user machines, moving a user's Bots onto theirs, and `botctl machine` commands ([ADR 0025](adr/0025-control-plane-linode.md)). Storage limits, resizing a user's machine when their tier changes, and billing emails ([#31](https://github.com/CG-Labs/superbot/issues/31)). Vault/Key Vault/Secret Manager stores and master-key rotation (the `SecretStore` trait is ready for them), per-Bot resource limits, Slack. Approvals follow-ups are in [approvals-followups.md](approvals-followups.md).
 
 Computer use (each Bot's screen, browser, and live view) is in [computer.md](computer.md).

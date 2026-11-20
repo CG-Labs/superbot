@@ -26,6 +26,9 @@ pub mod provider;
 pub mod route;
 pub mod runas;
 pub mod screens;
+pub mod teammate;
+#[cfg(test)]
+pub mod teammates;
 #[cfg(test)]
 pub mod terminal;
 pub mod tools;
@@ -373,6 +376,12 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Whether a teammate's runs of shared Bots go to the owner's machine as the
+    /// teammate's own user (MACHINE_TEAMMATE_USERS, ADR 0048).
+    pub fn teammate_users(&self) -> bool {
+        self.enrollment.as_ref().is_some_and(|e| e.teammate_users)
+    }
+
     /// Where `user_id`'s Bots run (`route::target`).
     pub fn route(&self, db: &crate::db::Db, user_id: &str) -> Result<route::Target, route::Refusal> {
         route::target(db, self, user_id)
@@ -381,9 +390,15 @@ impl ControlPlane {
     /// Whether a run of `bin` may start on `machine_id` now, beyond `route::fit`: the Bots'
     /// own user is ready there (ADR 0043), their first folder copy is done and the harness
     /// is logged in there (ADR 0041) or keyed. `keys`: whose own keys the run gets, if any.
-    pub fn ready(&self, app: &App, hb: &wire::Heartbeat, keys: Option<&str>, machine_id: &str, bin: &str) -> Result<(), route::Refusal> {
+    /// `teammate`: the run is a teammate's, as their own user (ADR 0048), which the
+    /// agent must be able to do, and which only a server-wide key logs in.
+    pub fn ready(&self, app: &App, hb: &wire::Heartbeat, keys: Option<&str>, machine_id: &str, bin: &str, teammate: bool) -> Result<(), route::Refusal> {
         let Some(e) = &self.enrollment else { return Ok(()) };
         botuser::check_run(e, hb)?;
+        if teammate {
+            teammate::fit(hb)?;
+            return logins::check_teammate_run(bin);
+        }
         if folder::first_copy_running(app, e, machine_id) {
             return Err(route::Refusal::FolderCopying);
         }

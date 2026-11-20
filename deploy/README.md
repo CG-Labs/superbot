@@ -282,6 +282,18 @@ botctl machine screens <user> close <bot> # close one now
 
 Each step is audited as `machine.screen_*`. Design: [ADR 0045](../docs/adr/0045-screens-on-machines.md).
 
+### Teammates' own user on machines
+
+A shared Bot runs on its owner's machine even when a teammate uses it. By default that run is the owner's Bots' user, so its tools could read the owner's folder and harness logins. With the Bots' own user on, add:
+
+```sh
+MACHINE_TEAMMATE_USERS=on   # a teammate's run of a shared Bot is their own OS user, in their own home
+```
+
+Before a teammate's run, botd asks the owner's agent to make that teammate a user there (`superbot-t-...`, no login shell) with a home of its own under the agent's state folder, readable by no one else. The run works there, can't read the owner's home, and carries a token that stops working once someone else runs the Bot. The machine's harness logins live in the owner's home, so Claude Code and Codex Bots need a server-wide key for teammates' runs; otherwise the Bot says so and doesn't run. Each person gets their own screen of the Bot (admins can open a teammate's with `?for=<user>`), and every display there takes an X cookie. Agents must be botd's build: an older one refuses teammates' runs as outdated rather than running them as the Bots' user. Off, teammates' runs stay as before.
+
+Audited as `machine.teammate_user_created`, with `teammateUser` on `bot.run_routed` and `harness.invoked`. Design: [ADR 0048](../docs/adr/0048-teammates-own-os-user-on-machines.md).
+
 ## Approvals after an upgrade
 
 Fresh installs ask before risky actions. An install from before approvals keeps running without them (`bypass`) after `--upgrade`, and botd logs a warning at start. To opt in, on the server:
@@ -364,6 +376,8 @@ Off unless `STRIPE_WEBHOOK_SECRET` is set; `/billing/stripe/webhook` answers 404
 Everyone then sees **Plan** in the client's sidebar: their plan and use against its limits, **Upgrade** buttons for each plan with a price, and **Manage billing** once they have a Stripe customer. Read-only people see their plan but can't buy one. Someone who already pays is sent to the portal instead of a second checkout. Without `STRIPE_SECRET_KEY`, subscriptions you create in Stripe still set tiers if they carry `metadata.superbot_user_id` (the user's id from `botctl users`) or belong to a customer botd has linked.
 
 Each Stripe customer is linked to one user, from a completed checkout or the first subscription event botd can place; the first link stands, and deleting the customer in Stripe removes it. Users are never matched by email. `botctl usage` shows each user's customer.
+
+Usage and token metering ([ADR 0048](../docs/adr/0048-billing-period-token-usage.md)): botd records each run's model tokens and counts runs and tokens per billing period, the paid subscription's period or else the calendar month. People see theirs on the Plan screen and with `botctl usage me`. To report tokens to Stripe for usage-based prices, create a meter in Stripe (aggregation: sum; customer mapping from `stripe_customer_id`), set `STRIPE_METER_EVENT` to its event name, and restart. Off unless set; it needs `STRIPE_SECRET_KEY`, and a restricted key also needs write access to Meter Events.
 
 An active, trialing, or past-due subscription puts the user on its price's tier; a canceled, unpaid, or paused one moves them back to the default tier. Events are checked against their signature and a 5-minute clock window, applied once, and in order. Every change is audited (`user.tier_changed` with `source: stripe`, `billing.subscription_synced`); events botd can't place are audited as `billing.event_ignored`. A subscription event replaces a tier an admin set by hand.
 

@@ -100,6 +100,15 @@ pub fn check_run(e: &Enrollment, hb: &Heartbeat, owner: Option<&str>, bin: &str)
     }
 }
 
+/// The same, for a teammate's run as their own user (ADR 0048): the machine's logins
+/// live in the Bots' home, which that user can't read, so only a server-wide key does.
+pub fn check_teammate_run(bin: &str) -> Result<(), Refusal> {
+    match recipe(bin) {
+        Some(r) if !keyed(None, &r) => Err(Refusal::NoTeammateKey(bin.into())),
+        _ => Ok(()),
+    }
+}
+
 fn control_plane(app: &App) -> Res<&ControlPlane> {
     app.control_plane
         .get()

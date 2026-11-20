@@ -9,7 +9,7 @@ import { CreateBotModal } from "../components/CreateBotModal";
 import { ScreenViewer } from "../components/ScreenViewer";
 import { Sidebar } from "../components/Sidebar";
 import { openConsole, openSetup, watchSetup } from "../src/admin";
-import { billingAvailable } from "../src/billing";
+import { planAvailable } from "../src/billing";
 import { showError } from "../src/dialogs";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
@@ -33,7 +33,7 @@ export default function HomeScreen() {
   useEffect(() => {
     if (!api) return;
     let live = true;
-    void billingAvailable(api).then((on) => live && setBilling(on));
+    void planAvailable(api).then((on) => live && setBilling(on));
     return () => {
       live = false;
     };

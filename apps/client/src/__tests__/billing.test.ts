@@ -1,6 +1,6 @@
 import { Linking } from "react-native";
 import { ApiError, SuperBotApi } from "../api";
-import { billingAvailable, checkoutNotice, limitSummary, openBillingPage, subscriptionLine } from "../billing";
+import { billingAvailable, checkoutNotice, limitSummary, openBillingPage, planAvailable, subscriptionLine } from "../billing";
 
 const BASE = "https://bots.example.com";
 
@@ -26,6 +26,20 @@ describe("billing API (ADR 0042)", () => {
     expect(await billingAvailable(api())).toBe(true);
   });
 
+  it("offers the Plan screen without billing when the server reports usage (ADR 0048)", async () => {
+    const fake = (billing: unknown, usage: unknown) => ({
+      billing: jest.fn(async () => billing as never),
+      myUsage: jest.fn(async () => {
+        if (usage instanceof Error) throw usage;
+        return usage as never;
+      }),
+    });
+    expect(await planAvailable(fake({ plans: [] }, null))).toBe(true);
+    expect(await planAvailable(fake(null, { tokens: {} }))).toBe(true);
+    expect(await planAvailable(fake(null, null))).toBe(false);
+    expect(await planAvailable(fake(null, new ApiError("boom", 500)))).toBe(false);
+  });
+
   it("asks for a checkout of a plan by name, and for the portal", async () => {
     answer(200, { url: "https://checkout.stripe.com/c/pay/cs_1" });
     expect(await api().checkout("pro")).toEqual({ url: "https://checkout.stripe.com/c/pay/cs_1" });
@@ -47,6 +61,7 @@ describe("billing helpers", () => {
       "Machine: g6-standard-1",
     ]);
     expect(limitSummary({ maxBots: 10 })).toEqual(["10 Bots", "Unlimited runs", "Unlimited routine runs"]);
+    expect(limitSummary({ maxBots: 10, monthlyTokens: 5_000_000 })).toEqual(["10 Bots", "Unlimited runs", "5,000,000 model tokens a month", "Unlimited routine runs"]);
   });
 
   it("says how the subscription stands", () => {
