@@ -45,8 +45,14 @@ struct Saved {
     plan: Option<HarnessPlan>,
     /// The Node.js version in `node-<version>`, once installed.
     node: Option<String>,
+    /// The SHA-256 of the tarball it came from.
+    #[serde(default)]
+    node_sha256: Option<String>,
     /// What is installed, by harness name.
     installed: BTreeMap<String, String>,
+    /// The recipe each was installed from: a changed pin installs it again.
+    #[serde(default)]
+    recipes: BTreeMap<String, HarnessInstall>,
     status: BTreeMap<String, HarnessStatus>,
 }
 
@@ -186,6 +192,16 @@ pub fn check(plan: &HarnessPlan) -> Result<(), String> {
     }
 }
 
+/// The tarball this machine would install `n` from.
+fn node_pin(n: &NodeRuntime) -> Option<&str> {
+    n.downloads.get(std::env::consts::ARCH).map(|d| d.sha256.as_str())
+}
+
+/// Whether the installed Node.js is the one `n` pins.
+fn node_current(s: &Saved, n: &NodeRuntime) -> bool {
+    s.node.as_deref() == Some(&n.version) && s.node_sha256.as_deref() == node_pin(n)
+}
+
 /// An installed program: an executable file, with symlinks resolved.
 fn runnable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -285,7 +301,13 @@ impl Tools {
     fn replaces(&self, h: &HarnessInstall, node: Option<&NodeRuntime>) -> bool {
         let s = self.lock();
         let npm = matches!(h.source, InstallSource::Npm { .. });
-        s.installed.contains_key(&h.name) || (npm && s.node.is_some() && node.is_some_and(|n| s.node.as_deref() != Some(&n.version)))
+        s.installed.contains_key(&h.name) || (npm && s.node.is_some() && node.is_some_and(|n| !node_current(&s, n)))
+    }
+
+    /// The plan's Node.js, if it isn't the one installed.
+    fn node_due(&self) -> Option<NodeRuntime> {
+        let s = self.lock();
+        s.plan.as_ref()?.node.clone().filter(|n| !node_current(&s, n))
     }
 
     fn save(&self, s: &Saved) {
@@ -305,23 +327,25 @@ impl Tools {
         (s.plan.as_ref().map(HarnessPlan::id), s.status.clone())
     }
 
-    /// Takes `plan` as the one to install. A harness already at its version is left
-    /// alone; one that failed is tried again, and npm harnesses are installed again
-    /// on a new Node.js. Harnesses no longer planned stay installed, since a Bot may be
-    /// using one.
+    /// Takes `plan` as the one to install. A harness installed from the very same
+    /// recipe is left alone; one that failed or whose pin changed is installed again,
+    /// and so are npm harnesses on a new Node.js. Harnesses no longer planned stay
+    /// installed, since a Bot may be using one.
     pub fn set_plan(&self, plan: HarnessPlan) -> Result<(), String> {
         check(&plan)?;
         let mut s = self.lock();
         let at = now_ms();
-        let new_node = plan.node.as_ref().is_some_and(|n| s.node.as_deref() != Some(&n.version));
+        let new_node = plan.node.as_ref().is_some_and(|n| !node_current(&s, n));
         let mut status = BTreeMap::new();
         for h in &plan.harnesses {
             let have = s.installed.get(&h.name).cloned();
             let old = s.status.get(&h.name);
-            // Only the very same recipe carries on; a corrected one is installed again.
-            let same = s.plan.as_ref().is_some_and(|p| p.harnesses.contains(h));
             let npm = matches!(h.source, InstallSource::Npm { .. });
-            let st = if have.as_deref() == Some(&h.version) && !(npm && new_node) && runnable(&self.bin_dir().join(&h.name)) {
+            // Only the very same recipe, on the same Node.js, carries on; a corrected
+            // one is installed again.
+            let same = s.plan.as_ref().is_some_and(|p| p.harnesses.contains(h) && (!npm || p.node == plan.node));
+            let from_this = s.recipes.get(&h.name) == Some(h) && have.as_deref() == Some(&h.version);
+            let st = if from_this && !(npm && new_node) && runnable(&self.bin_dir().join(&h.name)) {
                 HarnessStatus { version: have, wanted: Some(h.version.clone()), state: wire::HARNESS_INSTALLED.into(), error: None, at: old.map_or(at, |o| o.at) }
             } else if same && old.is_some_and(|o| o.state == wire::HARNESS_INSTALLING) {
                 old.cloned().unwrap_or_default()
@@ -369,6 +393,7 @@ impl Tools {
         let still = s.plan.as_ref().is_some_and(|p| p.harnesses.contains(h));
         if let Ok(v) = &res {
             s.installed.insert(h.name.clone(), v.clone());
+            s.recipes.insert(h.name.clone(), h.clone());
         }
         let version = s.installed.get(&h.name).cloned();
         let Some(st) = s.status.get_mut(&h.name) else { return };
@@ -388,6 +413,14 @@ impl Tools {
     /// be using waits for running jobs to end, and no job starts until it's done.
     pub async fn work(self: Arc<Self>) {
         loop {
+            // Node.js first, even if no harness needs installing: npm harnesses run on it.
+            if let Some(n) = self.node_due() {
+                let _replacing = if self.lock().node.is_some() { Some(self.replacing().await) } else { None };
+                match self.in_dl(self.node(&n)).await {
+                    Ok(()) => println!("Installed Node.js {}.", n.version),
+                    Err(e) => eprintln!("Installing Node.js {}: {e}", n.version),
+                }
+            }
             while let Some((h, node)) = self.next() {
                 let _replacing = if self.replaces(&h, node.as_ref()) { Some(self.replacing().await) } else { None };
                 let res = self.install(&h, node.as_ref()).await;
@@ -402,18 +435,28 @@ impl Tools {
         }
     }
 
-    async fn install(&self, h: &HarnessInstall, node: Option<&NodeRuntime>) -> Result<String, String> {
+    /// Runs `step` with a fresh, empty `.dl`, and removes it after.
+    async fn in_dl(&self, step: impl std::future::Future<Output = Result<(), String>>) -> Result<(), String> {
         let dl = self.dir.join(".dl");
         let _ = std::fs::remove_dir_all(&dl);
         std::fs::create_dir_all(&dl).map_err(|e| e.to_string())?;
-        let res = match &h.source {
-            InstallSource::Npm { package, integrity } => {
-                self.node(node.ok_or("npm harnesses need Node.js")?).await?;
-                self.npm(package, &h.version, integrity.as_deref()).await
-            }
-            InstallSource::Script { url, sha256, args, bin } => self.script(&h.name, url, sha256, args, bin).await,
-        };
+        let res = step.await;
         let _ = std::fs::remove_dir_all(&dl);
+        res
+    }
+
+    async fn install(&self, h: &HarnessInstall, node: Option<&NodeRuntime>) -> Result<String, String> {
+        let res = self
+            .in_dl(async {
+                match &h.source {
+                    InstallSource::Npm { package, integrity } => {
+                        self.node(node.ok_or("npm harnesses need Node.js")?).await?;
+                        self.npm(package, &h.version, integrity.as_deref()).await
+                    }
+                    InstallSource::Script { url, sha256, args, bin } => self.script(&h.name, url, sha256, args, bin).await,
+                }
+            })
+            .await;
         res.map(|()| h.version.clone())
     }
 
@@ -485,8 +528,7 @@ impl Tools {
     }
 
     async fn node(&self, n: &NodeRuntime) -> Result<(), String> {
-        let have = self.lock().node.clone();
-        if have.as_deref() == Some(&n.version) && runnable(&self.bin_dir().join("node")) {
+        if node_current(&self.lock(), n) && runnable(&self.bin_dir().join("node")) {
             return Ok(());
         }
         let arch = std::env::consts::ARCH;
@@ -518,6 +560,7 @@ impl Tools {
         }
         let mut s = self.lock();
         let old = s.node.replace(n.version.clone());
+        s.node_sha256 = Some(d.sha256.clone());
         self.save(&s);
         drop(s);
         if let Some(old) = old.filter(|o| *o != n.version) {
@@ -685,31 +728,65 @@ mod tests {
     }
 
     #[test]
-    fn a_new_node_reinstalls_npm_harnesses() {
+    fn a_new_node_or_pin_installs_again() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("superbot-tools-node-{}", now_ms()));
         let t = Tools::new(dir, None).unwrap();
         let claude = t.bin_dir().join("claude");
         std::fs::write(&claude, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let node = |version: &str, sha: char| NodeRuntime {
+            version: version.into(),
+            downloads: BTreeMap::from([(
+                std::env::consts::ARCH.into(),
+                wire::Download { url: "https://nodejs.org/n.tar.xz".into(), sha256: sha.to_string().repeat(64) },
+            )]),
+        };
+        let sum = |b: u8| Some(format!("sha512-{}", base64::engine::general_purpose::STANDARD.encode([b; 64])));
+        let claude_with = |integrity: Option<String>| HarnessInstall {
+            source: InstallSource::Npm { package: "@anthropic-ai/claude-code".into(), integrity },
+            ..npm("claude", "@anthropic-ai/claude-code", "2.1.329")
+        };
+        let on = |n: NodeRuntime, integrity: Option<String>| HarnessPlan { node: Some(n), harnesses: vec![claude_with(integrity)] };
         {
             let mut s = t.lock();
             s.node = Some("24.22.3".into());
+            s.node_sha256 = Some("a".repeat(64));
             s.installed.insert("claude".into(), "2.1.329".into());
+            s.recipes.insert("claude".into(), claude_with(None));
         }
-        let on = |version: &str| HarnessPlan {
-            node: Some(NodeRuntime {
-                version: version.into(),
-                downloads: BTreeMap::from([("x86_64".into(), wire::Download { url: "https://nodejs.org/n.tar.xz".into(), sha256: "a".repeat(64) })]),
-            }),
-            harnesses: vec![npm("claude", "@anthropic-ai/claude-code", "2.1.329")],
-        };
-        t.set_plan(on("24.22.3")).unwrap();
-        assert_eq!(t.report().1["claude"].state, wire::HARNESS_INSTALLED);
-        t.set_plan(on("24.22.4")).unwrap();
-        assert_eq!(t.report().1["claude"].state, wire::HARNESS_QUEUED, "a plan that only moves Node.js is applied");
-        let (h, node) = t.next().unwrap();
-        assert!(t.replaces(&h, node.as_ref()), "running Bots use the old Node.js");
+        let state = || t.report().1["claude"].state.clone();
+
+        t.set_plan(on(node("24.22.3", 'a'), None)).unwrap();
+        assert_eq!(state(), wire::HARNESS_INSTALLED);
+        assert!(t.node_due().is_none());
+
+        // A pin added to the installed version is checked by installing it again,
+        // and stays due until an install from it succeeds.
+        t.set_plan(on(node("24.22.3", 'a'), sum(1))).unwrap();
+        assert_eq!(state(), wire::HARNESS_QUEUED, "a new pin is checked");
+        let (h, _) = t.next().unwrap();
+        assert!(t.replaces(&h, None), "running Bots use the installed one");
+        t.finish(&h, Err("not the pinned sha512".into()));
+        t.set_plan(on(node("24.22.3", 'a'), sum(1))).unwrap();
+        assert_eq!(state(), wire::HARNESS_QUEUED, "a failed check isn't taken as installed");
+        let (h, _) = t.next().unwrap();
+        t.finish(&h, Ok("2.1.329".into()));
+        t.set_plan(on(node("24.22.3", 'a'), sum(1))).unwrap();
+        assert_eq!(state(), wire::HARNESS_INSTALLED);
+
+        // A new Node.js, by version or by checksum, is installed by itself and the npm
+        // harnesses again on it.
+        for n in [node("24.22.4", 'a'), node("24.22.3", 'b')] {
+            t.set_plan(on(n.clone(), sum(1))).unwrap();
+            assert_eq!(state(), wire::HARNESS_QUEUED, "a plan that only moves Node.js is applied");
+            assert_eq!(t.node_due().as_ref(), Some(&n));
+            let (h, node) = t.next().unwrap();
+            assert!(t.replaces(&h, node.as_ref()), "running Bots use the old Node.js");
+        }
+        let only_node = HarnessPlan { node: Some(node("24.22.5", 'c')), harnesses: vec![] };
+        t.set_plan(only_node.clone()).unwrap();
+        assert_eq!(t.node_due(), only_node.node, "even with no npm harness planned");
     }
 
     #[tokio::test]
