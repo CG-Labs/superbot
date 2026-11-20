@@ -12,7 +12,7 @@ jest.mock("expo-router", () => ({
   useLocalSearchParams: () => mockParams,
 }));
 jest.mock("../../src/SuperBotContext", () => ({ useSuperBot: () => mockCtx }));
-// Typing key by key through whole edit flows passes 5 s on slow CI runners.
+// A backstop for slow CI runners; the warm-up and fake timers below keep each test well under 1 s.
 jest.setTimeout(20_000);
 
 const CLASSES = [
@@ -85,7 +85,6 @@ beforeAll(async () => {
 // userEvent.press holds each press for a real 130 ms; fake timers skip that wait.
 beforeEach(() => jest.useFakeTimers());
 afterEach(() => jest.useRealTimers());
-jest.setTimeout(15_000);
 
 describe("PolicyEditor (ADR 0049)", () => {
   beforeEach(() => yes.mockClear());
