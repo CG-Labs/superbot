@@ -78,6 +78,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Installer checks without root (pipes under pipefail, web client archive, loud client failures)
+        run: deploy/test-install.sh
       - name: Piped dry run on a fresh host (no user, no clone)
         run: |
           set -euo pipefail
@@ -236,12 +238,19 @@ jobs:
             live=$(readlink -f "$CLIENT_DIR")
             [[ $(stat -c "%U %a" "$live") == "root 755" ]]
             [[ $(stat -c "%U %a" "$live/index.html") == "root 644" ]]
-            if find "$live" ! -user root | grep -q .; then exit 1; fi
+            [[ -z $(find "$live" ! -user root) ]]
             grep -q "/app/_expo/static/js/web/entry-" "$live/index.html"
             grep -qx manual "$(client_releases_dir)"/previous-*/index.html
             # An upgrade swaps in a new release and keeps only the previous one.
             install_client "$dist"
             [[ $(readlink -f "$CLIENT_DIR") != "$live" ]]
+            [[ $(find "$(client_releases_dir)" -mindepth 1 -maxdepth 1 | wc -l) == 2 ]]
+            # A big build installs every time: checking its listing never trips pipefail.
+            sudo -u superbot mkdir "$dist"/bulk-{01..50}
+            printf "%s\n" "$dist"/bulk-{01..50}/chunk-{001..600}.js | sudo -u superbot xargs touch
+            for _ in 1 2 3; do install_client "$dist"; done
+            [[ -f $(readlink -f "$CLIENT_DIR")/bulk-50/chunk-600.js ]]
+            sudo -u superbot rm -rf "$dist"/bulk-*
             [[ $(find "$(client_releases_dir)" -mindepth 1 -maxdepth 1 | wc -l) == 2 ]]
             # A failure while unpacking leaves the live client and no half-made release.
             live=$(readlink -f "$CLIENT_DIR")
@@ -256,13 +265,13 @@ jobs:
             [[ $(readlink -f "$CLIENT_DIR") == "$live" ]]
             # No Node for the service user: a warning, not a failed install.
             client_node_ok() { return 1; }
-            build_client 2>&1 | grep -q "skipping the web client"
+            grep -q "skipping the web client" <<<"$(build_client 2>&1)"
             # The landing page: plain files, installed like the client; a link is refused.
             install_site
             site=$(readlink -f "$SITE_DIR")
             [[ $(stat -c "%U %a" "$site/get-started.html") == "root 644" ]]
             sudo -u superbot ln -s /etc/shadow /home/superbot/superbot/site/leak
-            install_site 2>&1 | grep -q "Landing page not installed"
+            grep -q "Landing page not installed" <<<"$(install_site 2>&1)"
             [[ $(readlink -f "$SITE_DIR") == "$site" ]]
             sudo -u superbot rm /home/superbot/superbot/site/leak
             render_caddyfile :18090 127.0.0.1:3999 "$CLIENT_DIR" "$SITE_DIR" >/tmp/Caddyfile
@@ -277,14 +286,14 @@ jobs:
           [[ $(code "$B/app/") == 200 ]]
           [[ $(code "$B/app") == 302 ]]
           [[ $(code "$B/app/some/deep/link") == 200 ]]
-          curl -fsSI "$B/app/" | grep -qi '^cache-control: no-cache'
-          js=$(curl -fsS "$B/app/" | grep -o '/app/_expo/static/js/web/entry-[0-9a-f]*\.js' | head -1)
-          curl -fsSI "$B$js" | grep -qi '^cache-control: public, max-age=31536000, immutable'
+          grep -qi '^cache-control: no-cache' <<<"$(curl -fsSI "$B/app/")"
+          js=$(curl -fsS "$B/app/" | grep -o '/app/_expo/static/js/web/entry-[0-9a-f]*\.js' | sed -n 1p)
+          grep -qi '^cache-control: public, max-age=31536000, immutable' <<<"$(curl -fsSI "$B$js")"
           # The landing page and its assets come from SITE_DIR, with botd's headers.
           [[ $(code "$B/") == 200 && $(code "$B/get-started") == 200 && $(code "$B/site/site.css") == 200 ]]
-          curl -fsS "$B/get-started" | grep -q '/site/get-started.js'
-          curl -fsSI "$B/" | grep -qi "^content-security-policy: default-src 'self'"
-          curl -fsSI "$B/site/get-started.js" | grep -qi '^x-content-type-options: nosniff'
+          grep -q '/site/get-started.js' <<<"$(curl -fsS "$B/get-started")"
+          grep -qi "^content-security-policy: default-src 'self'" <<<"$(curl -fsSI "$B/")"
+          grep -qi '^x-content-type-options: nosniff' <<<"$(curl -fsSI "$B/site/get-started.js")"
           [[ $(code "$B/site/nope.js") == 404 ]]
           # Everything else goes to botd (not running here, so 502), never to the client.
           [[ $(code "$B/console/") == 502 ]]

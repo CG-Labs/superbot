@@ -26,6 +26,9 @@ CLIENT_DIR=${CLIENT_DIR:-/var/www/superbot-app}
 SITE_DIR=${SITE_DIR:-/var/www/superbot-site}
 CLIENT_BASE_URL=/app
 BUILD_CLIENT=true
+# Exit status when everything else installed but this run's web client did not.
+CLIENT_NOT_INSTALLED_EXIT=3
+CLIENT_NOT_INSTALLED=""
 DEPLOY_FILES=(superbot.service superbot-backup.sh superbot-restore.sh superbot-backup.service superbot-backup.timer)
 
 log() { printf '==> %s\n' "$*"; }
@@ -194,8 +197,8 @@ stage_trusted_deploy() {
 # or as whom.
 render_unit() {
   local template=$1 out=$2 fixed=$3 tmp
-  if grep -Ev '^[[:space:]]*ExecStart[[:space:]]*=' "$template" |
-    grep -Eq '^[[:space:]]*(Exec[A-Za-z]*|DynamicUser|SupplementaryGroups|AmbientCapabilities|PermissionsStartOnly|RootDirectory|RootImage|Alias)[[:space:]]*='; then
+  if grep -Eq '^[[:space:]]*(Exec[A-Za-z]*|DynamicUser|SupplementaryGroups|AmbientCapabilities|PermissionsStartOnly|RootDirectory|RootImage|Alias)[[:space:]]*=' \
+    <<<"$(grep -Ev '^[[:space:]]*ExecStart[[:space:]]*=' "$template")"; then
     die "Refusing $template: unexpected privileged directive"
   fi
   tmp=$(mktemp)
@@ -262,7 +265,7 @@ install_rustup_user() {
     log "[dry-run] install rustup for $SUPERBOT_USER"
     return
   fi
-  if sudo -u "$SUPERBOT_USER" -H bash -lc 'command -v cargo' 2>/dev/null | grep -q cargo; then
+  if sudo -u "$SUPERBOT_USER" -H bash -lc 'command -v cargo' >/dev/null 2>&1; then
     log "Rust toolchain present for $SUPERBOT_USER"
     return
   fi
@@ -349,20 +352,26 @@ build_client() {
   log "Building the web client"
   if ! sudo -u "$SUPERBOT_USER" -H env CI=1 EXPO_NO_TELEMETRY=1 ELECTRON_SKIP_BINARY_DOWNLOAD=1 SUPERBOT_WEB_BASE_URL="$CLIENT_BASE_URL" \
     bash -lc "cd '$client' && npm ci --no-audit --no-fund && npx expo export --platform web --output-dir dist-app"; then
-    warn "Web client build failed: keeping the previous one, if any"
+    client_not_installed "Web client build failed"
     return
   fi
-  install_client "$client/dist-app" || warn "Web client not installed: keeping the previous one, if any"
+  install_client "$client/dist-app" || client_not_installed "Web client not installed"
+}
+
+# main exits non-zero at the end, so an upgrade can't quietly leave /app/ on the old client.
+client_not_installed() {
+  CLIENT_NOT_INSTALLED=$1
+  warn "$1: keeping the previous one, if any"
 }
 
 # Plain files and folders only (no links, devices, or ".."), with an index.html.
+# Never pipe tar into `grep -q`: grep exits at the first match, tar dies of SIGPIPE, and
+# pipefail turns a good archive into a refused one (#93).
 client_archive_ok() {
-  local archive=$1
-  tar -tvf "$archive" | awk '{ t = substr($0, 1, 1) } t != "-" && t != "d" { bad = 1 } END { exit bad }' || return 1
-  if tar -tf "$archive" | grep -Eq '^/|(^|/)\.\.(/|$)'; then
-    return 1
-  fi
-  tar -tf "$archive" | grep -qx './index.html'
+  local archive=$1 entries names
+  entries=$(tar -tvf "$archive") && names=$(tar -tf "$archive") || return 1
+  awk '{ t = substr($0, 1, 1) } t != "-" && t != "d" { bad = 1 } END { exit bad }' <<<"$entries" || return 1
+  ! grep -Eq '^/|(^|/)\.\.(/|$)' <<<"$names" && grep -qx './index.html' <<<"$names"
 }
 
 install_client() { install_release "$CLIENT_DIR" "$1" "web client"; }
@@ -496,7 +505,9 @@ configure_env() {
 
   if ! grep -q '^AUTH_PASSWORD=.' "$env_file" && ! grep -q '^AUTH_PASSWORD_FILE=.' "$env_file"; then
     local pass
-    pass=$(openssl rand -base64 32 | tr -d '/+=' | head -c 32)
+    pass=$(openssl rand -base64 48 | tr -d '/+=\n')
+    pass=${pass:0:32}
+    [[ ${#pass} == 32 ]] || die "Could not generate a password"
     set_env_var "$env_file" AUTH_PASSWORD "$pass"
     printf '%s\n' "$pass" >"$pass_file"
     chown "$SUPERBOT_USER:$SUPERBOT_USER" "$pass_file"
@@ -775,6 +786,11 @@ summary() {
   if [[ -n "$DOMAIN" ]] && client_installed; then
     app="https://${DOMAIN}/app/"
   fi
+  if [[ -n "$CLIENT_NOT_INSTALLED" ]] && ! client_installed; then
+    app="not served (this run's web client was not installed)"
+  elif [[ -n "$CLIENT_NOT_INSTALLED" && -n "$DOMAIN" ]]; then
+    app="$app (still the previous web client: this run's was not installed)"
+  fi
   cat <<EOF
 
 SuperBot is installed.
@@ -806,6 +822,13 @@ EOF
   fi
 }
 
+finish() {
+  [[ -n "$CLIENT_NOT_INSTALLED" ]] || return 0
+  warn "$CLIENT_NOT_INSTALLED. Everything else is installed, but /app/ still serves the previous web client, if any."
+  warn "Fix the cause above and re-run the installer. Exiting with status $CLIENT_NOT_INSTALLED_EXIT."
+  exit "$CLIENT_NOT_INSTALLED_EXIT"
+}
+
 main() {
   parse_args "$@"
   need_root
@@ -834,6 +857,7 @@ main() {
   install_caddy
   configure_ufw
   summary
+  finish
 }
 
 # CI sources the functions without running the install.
