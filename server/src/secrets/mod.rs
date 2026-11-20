@@ -218,7 +218,7 @@ impl Secrets {
                     out.push((name, v));
                 }
                 Ok(None) => {}
-                Err(e) => eprintln!("secret {name} of {owner}: {e}"),
+                Err(e) => eprintln!("A user's secret {name} couldn't be read: {e}"),
             }
         }
         out
