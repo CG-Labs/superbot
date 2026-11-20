@@ -183,7 +183,7 @@ pub async fn ensure(
 ) -> Result<String, ProviderError> {
     let found = match p.find_firewall(&fw.label).await? {
         Some(f) => f,
-        None => match p.create_firewall(&fw.label, &[fw.tag.clone()], &fw.rules).await {
+        None => match p.create_firewall(&fw.label, std::slice::from_ref(&fw.tag), &fw.rules).await {
             Ok(f) => {
                 record(
                     app,
