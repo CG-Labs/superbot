@@ -127,8 +127,19 @@ export default function HomeScreen() {
         visible={detailsOpen}
         onClose={() => setDetailsOpen(false)}
         onOpenScreen={() => setScreen((s) => s ?? { takeOver: false, n: 0 })}
+        onOpenPolicy={(id) => {
+          setDetailsOpen(false);
+          router.push({ pathname: "/policy", params: { bot: id } });
+        }}
       />
-      <ApprovalsInbox visible={approvalsOpen} onClose={() => setApprovalsOpen(false)} />
+      <ApprovalsInbox
+        visible={approvalsOpen}
+        onClose={() => setApprovalsOpen(false)}
+        onOpenPolicy={() => {
+          setApprovalsOpen(false);
+          router.push("/policy");
+        }}
+      />
     </SafeAreaView>
   );
 }

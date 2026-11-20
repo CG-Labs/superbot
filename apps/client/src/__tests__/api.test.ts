@@ -152,3 +152,43 @@ describe("personal secrets (ADR 0029, 0044)", () => {
     expect(fetchMock).toHaveBeenLastCalledWith(`${BASE}/api/me/secrets/A%2F..%2FB`, expect.objectContaining({ method: "DELETE" }));
   });
 });
+
+describe("SuperBotApi policy editor (ADR 0048)", () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  it("reads and patches the global or a Bot's policy, and adds and deletes rules", async () => {
+    const policy = { mode: "ask", classes: { git_push: "deny" }, timeoutMinutes: 10 };
+    const fetchMock = jest.fn(async (url: string, init: RequestInit = {}) => ({
+      ok: true,
+      status: 200,
+      json: async () =>
+        url.endsWith("/api/policy") && init.method === "PUT"
+          ? { policy }
+          : url.endsWith("/api/policy/rules")
+            ? { id: "r1", botId: null, action: "deny", tool: "*", pattern: "rm *", note: null, at: 1 }
+            : { policy, classes: [], rules: [], override: null },
+    }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const api = new SuperBotApi({ baseUrl: BASE, token: "sbs_" + "a".repeat(64) });
+    const call = (url: string, method: string, body?: unknown) =>
+      expect(fetchMock).toHaveBeenLastCalledWith(`${BASE}${url}`, expect.objectContaining({ method, body: body === undefined ? undefined : JSON.stringify(body) }));
+
+    expect((await api.policyView()).policy).toEqual(policy);
+    call("/api/policy", "GET");
+    await api.policyView("b1");
+    call("/api/bots/b1/policy", "GET");
+    expect(await api.patchGlobalPolicy({ timeoutMinutes: 15 })).toEqual(policy);
+    call("/api/policy", "PUT", { timeoutMinutes: 15 });
+    await api.patchBotPolicy("b1", { classes: { git_push: null }, timeoutMinutes: null });
+    call("/api/bots/b1/policy", "PUT", { classes: { git_push: null }, timeoutMinutes: null });
+    await api.resetBotPolicy("b1");
+    call("/api/bots/b1/policy", "DELETE");
+    expect((await api.addPolicyRule({ action: "deny", tool: "*", pattern: "rm *" })).id).toBe("r1");
+    call("/api/policy/rules", "POST", { action: "deny", tool: "*", pattern: "rm *" });
+    await api.deletePolicyRule("r/1");
+    call("/api/policy/rules/r%2F1", "DELETE");
+  });
+});

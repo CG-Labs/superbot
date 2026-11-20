@@ -127,6 +127,56 @@ export interface Policy {
   timeoutMinutes: number;
 }
 
+/** A Bot's own settings on top of the global policy; missing fields follow it. */
+export interface PolicyOverride {
+  mode?: PolicyMode;
+  classes?: Record<string, PolicyAction>;
+  timeoutMinutes?: number;
+}
+
+/** A change to a policy. On a Bot, `null` puts that field back to following the global policy. */
+export interface PolicyPatch {
+  mode?: PolicyMode | null;
+  classes?: Record<string, PolicyAction | null>;
+  timeoutMinutes?: number | null;
+}
+
+export interface PolicyClass {
+  id: string;
+  label: string;
+}
+
+/** An allow or deny rule. `tool` is "*", a kind (shell, file, web, mcp, other), or a tool name. */
+export interface PolicyRule {
+  id: string;
+  /** null: applies to every Bot. */
+  botId: string | null;
+  action: "allow" | "deny";
+  tool: string;
+  pattern: string;
+  note: string | null;
+  at: number;
+}
+
+export interface NewPolicyRule {
+  botId?: string;
+  action: "allow" | "deny";
+  tool: string;
+  pattern: string;
+  note?: string;
+}
+
+/**
+ * `/api/policy` (global rules only) or `/api/bots/{id}/policy`: the Bot's effective policy,
+ * its override (null when it follows the global policy), and its rules plus the global ones.
+ */
+export interface PolicyView {
+  policy: Policy;
+  classes: PolicyClass[];
+  rules: PolicyRule[];
+  override?: PolicyOverride | null;
+}
+
 export type ApprovalStatus = "pending" | "approved" | "denied" | "expired" | "cancelled";
 
 export interface Approval {
