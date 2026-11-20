@@ -8,6 +8,7 @@
 // Shared by two binaries, each of which uses only part of it.
 #![allow(dead_code)]
 
+use super::runas::{self, Ids};
 use super::wire::{self, LoginEvent, LoginRequest};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
@@ -204,16 +205,25 @@ impl Logins {
         self.sessions().values().map(|s| s.harness.clone()).collect()
     }
 
-    /// Starts the login, `run` (from `check`) in `home` with exactly `env`. Its events come
-    /// on the receiver, which ends after `Exit` or `Error`; `stop` (or `abort`) ends it early.
+    /// Starts the login, `run` (from `check`) in `home` with exactly `env`, as `user`
+    /// if one is given (ADR 0043). Its events come on the receiver, which ends after
+    /// `Exit` or `Error`; `stop` (or `abort`) ends it early.
     pub fn start(
         self: &Arc<Self>,
         r: &LoginRequest,
         run: &Command,
         home: &Path,
         env: &BTreeMap<String, String>,
+        user: Option<Ids>,
     ) -> Result<(mpsc::Receiver<LoginEvent>, watch::Sender<bool>), Refused> {
         let (master, slave) = open_pty().map_err(|e| (500, format!("Couldn't open a terminal: {e}")))?;
+        if let Some(ids) = user {
+            use std::os::fd::AsRawFd;
+            // SAFETY: an open descriptor; the login's user owns its terminal.
+            if unsafe { libc::fchown(slave.as_raw_fd(), ids.uid, ids.gid) } != 0 {
+                return Err((500, format!("Couldn't give the terminal to the Bots' user: {}", std::io::Error::last_os_error())));
+            }
+        }
         let input = std::fs::File::from(master);
         let reader = input.try_clone().map_err(|e| (500, e.to_string()))?;
         let (stop_tx, mut stop_rx) = watch::channel(false);
@@ -249,6 +259,9 @@ impl Logins {
             .stdout(o)
             .stderr(e)
             .kill_on_drop(true);
+        if let Some(ids) = user {
+            cmd.uid(ids.uid).gid(ids.gid);
+        }
         // SAFETY: only async-signal-safe calls between fork and exec.
         unsafe {
             cmd.pre_exec(|| {
@@ -295,7 +308,7 @@ impl Logins {
             // holds the terminal open.
             let _ = tokio::time::timeout(GRACE, reading).await;
             let status = status.expect("set above");
-            let logged_in = logged_in(&home, &files).is_some();
+            let logged_in = runas::as_user(user, || logged_in(&home, &files).is_some()).unwrap_or(false);
             let _ = tx
                 .send(LoginEvent::Exit {
                     success: status.as_ref().is_ok_and(|s| s.success()),
@@ -435,9 +448,9 @@ mod tests {
         let logins = Arc::new(Logins::default());
         let r = req(&[".claude/.credentials.json"]);
         let env = BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
-        let (mut rx, _stop) = logins.start(&r, &fake(&bin), &home, &env).unwrap();
+        let (mut rx, _stop) = logins.start(&r, &fake(&bin), &home, &env, None).unwrap();
         assert_eq!(logins.running(), vec!["claude".to_string()]);
-        assert_eq!(logins.start(&r, &fake(&bin), &home, &env).unwrap_err().0, 409);
+        assert_eq!(logins.start(&r, &fake(&bin), &home, &env, None).unwrap_err().0, 409);
         let mut shown = String::new();
         let mut typed = false;
         let exit = loop {
@@ -478,7 +491,7 @@ mod tests {
         let logins = Arc::new(Logins::default());
         let r = req(&[".claude/.credentials.json"]);
         let env = BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
-        let (mut rx, _stop) = logins.start(&r, &fake(&bin), &home, &env).unwrap();
+        let (mut rx, _stop) = logins.start(&r, &fake(&bin), &home, &env, None).unwrap();
         let _ = rx.recv().await;
         assert!(logins.abort("l1"));
         let exit = loop {

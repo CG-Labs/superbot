@@ -25,10 +25,13 @@
 //! - `SUPERBOT_MAX_JOBS`: jobs at once (default 8).
 //! - `SUPERBOT_AGENT_BIN`: this binary, replaced by upgrades (ADR 0039; default
 //!   `/usr/local/lib/superbot/superbot-machine`).
+//! - `SUPERBOT_BOT_USER`: the OS user Bots run as once botd asks (ADR 0043; default
+//!   `superbot-bots`). Never root, nor the agent's own user.
 
 use super::job;
 use super::landing::Landing;
 use super::pki::{self, Peer};
+use super::runas::{self, Ids};
 use super::terminal::Logins;
 use super::tools::Tools;
 use super::upgrade::{self, Upgrader};
@@ -84,6 +87,10 @@ pub struct Config {
     pub tools: PathBuf,
     /// This agent's own binary, which an upgrade replaces.
     pub exe: PathBuf,
+    /// The OS user Bots run as once botd asks (ADR 0043).
+    pub bot_user: String,
+    /// Lets that be this agent's own user: only for tests, which can't make users.
+    pub allow_own_user: bool,
 }
 
 /// Where harnesses and botctl may live, besides the Bots' home: the system's program
@@ -178,6 +185,10 @@ impl Config {
             .transpose()?
             .unwrap_or(8)
             .max(1);
+        let bot_user = var("SUPERBOT_BOT_USER").unwrap_or_else(|| wire::BOT_USER.into());
+        if !runas::plain_user(&bot_user) || bot_user == "root" {
+            return Err("SUPERBOT_BOT_USER must be a plain user name, not root".into());
+        }
         Ok(Config {
             control_url,
             machine_id,
@@ -193,6 +204,8 @@ impl Config {
             max_jobs,
             tools,
             exe: var("SUPERBOT_AGENT_BIN").unwrap_or_else(|| AGENT_BIN.into()).into(),
+            bot_user,
+            allow_own_user: false,
         })
     }
 
@@ -220,17 +233,43 @@ impl Config {
             .collect()
     }
 
-    /// The environment every job starts from; nothing of the agent's own.
-    fn host(&self) -> job::Host {
+    /// The environment every job starts from; nothing of the agent's own. With
+    /// `user`, jobs run as the Bots' user.
+    fn host(&self, user: Option<Ids>) -> job::Host {
+        let mut env = BTreeMap::from([
+            ("HOME".to_string(), self.home.display().to_string()),
+            ("PATH".to_string(), self.harness_path.clone()),
+            ("LANG".to_string(), "C.UTF-8".to_string()),
+        ]);
+        if user.is_some() {
+            env.insert("USER".into(), self.bot_user.clone());
+            env.insert("LOGNAME".into(), self.bot_user.clone());
+        }
         job::Host {
             clear_env: true,
             remove: Vec::new(),
-            env: BTreeMap::from([
-                ("HOME".to_string(), self.home.display().to_string()),
-                ("PATH".to_string(), self.harness_path.clone()),
-                ("LANG".to_string(), "C.UTF-8".to_string()),
-            ]),
+            env,
+            user,
         }
+    }
+
+    /// Why `ids` can't be the Bots' user, if it can't.
+    fn check_bot_ids(&self, ids: Ids) -> Result<(), String> {
+        if ids.uid == 0 || ids.gid == 0 {
+            return Err(format!("{} is root or in root's group; Bots can't run as it.", self.bot_user));
+        }
+        // SAFETY: no arguments.
+        if ids.uid == unsafe { libc::geteuid() } && !self.allow_own_user {
+            return Err(format!("{} is the agent's own user; Bots need their own.", self.bot_user));
+        }
+        Ok(())
+    }
+
+    /// The state folder lets the Bots' user through to its home and the tools; the
+    /// tools are readable by it. systemd makes the folder 0700 at every start.
+    fn open_paths(&self, tools: &Tools) -> Result<(), String> {
+        runas::chmod_dir(&self.state_dir, 0o711).map_err(|e| format!("{}: {e}", self.state_dir.display()))?;
+        tools.open_up()
     }
 
     /// Whether `bin` is an executable on the harness PATH, under `roots`.
@@ -541,6 +580,102 @@ pub struct Agent {
     pub landing: Arc<Landing>,
     /// True once the agent should exit, for systemd to start it again.
     restart: watch::Sender<bool>,
+    /// The Bots' own user, once botd asked for one (ADR 0043).
+    bot: RwLock<Bot>,
+}
+
+/// Where the Bots' user stands. Once botd has asked, no job runs as root again.
+#[derive(Clone, Default)]
+struct Bot {
+    status: Option<wire::BotUserStatus>,
+    /// Set only when ready.
+    ids: Option<Ids>,
+}
+
+const BOT_USER_FILE: &str = "bot-user.json";
+
+/// The Bots' user, saved before it's handed the home, so a restart part-way picks up
+/// where it stopped rather than running as root in a home that may already be its.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedBotUser {
+    user: String,
+    uid: u32,
+    gid: u32,
+    /// The whole home is its.
+    #[serde(default)]
+    handed: bool,
+}
+
+fn save_bot_user(cfg: &Config, ids: Ids, handed: bool) -> Result<(), String> {
+    let saved = SavedBotUser { user: cfg.bot_user.clone(), uid: ids.uid, gid: ids.gid, handed };
+    write_private(&cfg.state_dir.join(BOT_USER_FILE), &serde_json::to_string(&saved).unwrap_or_default(), 0o600)
+}
+
+fn bot_failed(user: &str, e: String) -> Bot {
+    eprintln!("Bots' user: {e}");
+    Bot { status: Some(bot_status(wire::BOT_USER_FAILED, user, None, Some(e))), ids: None }
+}
+
+fn bot_status(state: &str, user: &str, uid: Option<u32>, error: Option<String>) -> wire::BotUserStatus {
+    wire::BotUserStatus {
+        state: state.into(),
+        user: user.into(),
+        uid,
+        error,
+        at: now_ms(),
+    }
+}
+
+/// The saved Bots' user, checked: still there, with the same ids, owning the home.
+fn load_bot_user(cfg: &Config, tools: &Tools) -> Bot {
+    use std::os::unix::fs::MetadataExt;
+    let path = cfg.state_dir.join(BOT_USER_FILE);
+    let saved = match std::fs::read(&path) {
+        Ok(b) => match serde_json::from_slice::<SavedBotUser>(&b) {
+            Ok(s) => s,
+            Err(e) => return bot_failed(&cfg.bot_user, format!("{}: {e}", path.display())),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // SAFETY: no arguments.
+            let me = unsafe { libc::geteuid() };
+            return match std::fs::symlink_metadata(&cfg.home) {
+                Ok(m) if m.uid() != me => bot_failed(
+                    &cfg.bot_user,
+                    format!("{} belongs to another user, but no Bots' user is saved.", cfg.home.display()),
+                ),
+                _ => Bot::default(),
+            };
+        }
+        Err(e) => return bot_failed(&cfg.bot_user, format!("{}: {e}", path.display())),
+    };
+    let want = Ids { uid: saved.uid, gid: saved.gid };
+    let checked = (|| {
+        if saved.user != cfg.bot_user {
+            return Err(format!("Bots ran as {}, but the agent is set to {}.", saved.user, cfg.bot_user));
+        }
+        match runas::lookup(&saved.user) {
+            Some((ids, _)) if ids == want => {}
+            Some(_) => return Err(format!("{} isn't the user it was.", saved.user)),
+            None => return Err(format!("{} is gone.", saved.user)),
+        }
+        cfg.check_bot_ids(want)?;
+        let owned = std::fs::symlink_metadata(&cfg.home).is_ok_and(|m| m.is_dir() && m.uid() == want.uid);
+        if !saved.handed || !owned {
+            runas::hand_over(&cfg.home, want).map_err(|e| format!("{}: {e}", cfg.home.display()))?;
+        }
+        cfg.open_paths(tools)?;
+        if !saved.handed {
+            save_bot_user(cfg, want, true)?;
+        }
+        Ok(())
+    })();
+    match checked {
+        Ok(()) => Bot {
+            status: Some(bot_status(wire::BOT_USER_READY, &saved.user, Some(want.uid), None)),
+            ids: Some(want),
+        },
+        Err(e) => bot_failed(&saved.user, e),
+    }
 }
 
 impl Agent {
@@ -548,17 +683,23 @@ impl Agent {
     /// upgrade, the clock on the new agent's trial.
     pub fn new(cfg: Config, id: Identity) -> Result<Arc<Agent>, String> {
         let server = Arc::new(server_config(&cfg, &id)?);
-        for dir in [cfg.home.join("work"), cfg.home.join("bots")] {
-            use std::os::unix::fs::DirBuilderExt;
+        let tools = Tools::new(cfg.tools.clone(), Some(cfg.ca_pem.as_str()).filter(|p| !p.is_empty()))?;
+        let bot = load_bot_user(&cfg, &tools);
+        if bot.status.is_none() {
             std::fs::DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
-                .create(&dir)
-                .map_err(|e| format!("{}: {e}", dir.display()))?;
+                .create(&cfg.home)
+                .map_err(|e| format!("{}: {e}", cfg.home.display()))?;
         }
-        let tools = Tools::new(cfg.tools.clone(), Some(cfg.ca_pem.as_str()).filter(|p| !p.is_empty()))?;
+        if bot.status.is_none() || bot.ids.is_some() {
+            work_dirs(&cfg, bot.ids)?;
+        }
         let upgrader = Upgrader::new(cfg.exe.clone(), cfg.state_dir.clone(), VERSION);
         let landing = Arc::new(Landing::new(cfg.home.clone(), &cfg.state_dir)?);
+        if let Some(ids) = bot.ids {
+            landing.set_user(ids);
+        }
         let a = Arc::new(Agent {
             cfg,
             current: RwLock::new((Arc::new(id), server)),
@@ -568,6 +709,7 @@ impl Agent {
             logins: Arc::default(),
             landing,
             restart: watch::channel(false).0,
+            bot: RwLock::new(bot),
         });
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::spawn(a.tools.clone().work());
@@ -606,6 +748,69 @@ impl Agent {
     /// Jobs and logins running now: either holds off an upgrade.
     pub fn running(&self) -> usize {
         self.jobs().len() + self.logins.running().len()
+    }
+
+    /// Where the Bots' own user stands, as heartbeats say.
+    #[allow(dead_code)]
+    pub fn bot_user(&self) -> Option<wire::BotUserStatus> {
+        self.bot().status
+    }
+
+    fn bot(&self) -> Bot {
+        self.bot.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn set_bot(&self, b: Bot) {
+        *self.bot.write().unwrap_or_else(|e| e.into_inner()) = b;
+    }
+
+    /// Whether the agent is handing the home to the Bots' user now.
+    fn setting_up(&self) -> bool {
+        self.bot().status.is_some_and(|s| s.state == wire::BOT_USER_SETTING_UP)
+    }
+
+    /// Who jobs and logins run as: the agent's user until botd asks for the Bots' own
+    /// (ADR 0043), then only that one. Refused while it's set up, or if it can't be.
+    #[allow(clippy::result_large_err)]
+    fn job_user(&self) -> Result<Option<Ids>, Response> {
+        let b = self.bot();
+        match &b.status {
+            None => Ok(None),
+            Some(s) if s.state == wire::BOT_USER_READY => Ok(b.ids),
+            Some(s) if s.state == wire::BOT_USER_SETTING_UP => Err(refuse(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "This machine is setting up its Bots' user. Try again in a few minutes.",
+            )),
+            Some(s) => Err(refuse(
+                StatusCode::CONFLICT,
+                format!(
+                    "This machine couldn't set up its Bots' user: {}",
+                    s.error.as_deref().unwrap_or("no reason given")
+                ),
+            )),
+        }
+    }
+
+    /// Makes the Bots' user if it must, hands it the home, and saves it, so from now on
+    /// everything a Bot touches runs as it. Copies of the folder wait meanwhile.
+    fn set_up_bot_user(&self) -> Result<Ids, String> {
+        let cfg = &self.cfg;
+        let ids = runas::ensure_user(&cfg.bot_user, &cfg.home)?;
+        cfg.check_bot_ids(ids)?;
+        let _copies = self.landing.hold();
+        // Saved, and copies switched, before anything is the Bots' user's: whatever fails
+        // after this, or a restart, never has root writing in its home.
+        save_bot_user(cfg, ids, false)?;
+        self.landing.set_user(ids);
+        let handed = runas::hand_over(&cfg.home, ids).map_err(|e| format!("{}: {e}", cfg.home.display()))?;
+        cfg.open_paths(&self.tools)?;
+        work_dirs(cfg, Some(ids))?;
+        save_bot_user(cfg, ids, true)?;
+        println!(
+            "Bots now run as {}: handed it {} files, left {} as they were.",
+            cfg.bot_user, handed.changed, handed.skipped
+        );
+        Ok(ids)
     }
 
     pub fn identity(&self) -> Arc<Identity> {
@@ -734,7 +939,9 @@ fn logins(a: &Agent, query: Option<&str>) -> BTreeMap<String, wire::LoginStatus>
     let mut out: BTreeMap<String, wire::LoginStatus> = creds(query)
         .into_iter()
         .map(|(h, files)| {
-            let since = super::terminal::logged_in(&a.cfg.home, &files);
+            let since = runas::as_user(a.bot().ids, || super::terminal::logged_in(&a.cfg.home, &files))
+                .ok()
+                .flatten();
             let state = match since {
                 Some(_) => wire::LOGGED_IN,
                 None if running.iter().any(|r| r == h) => wire::LOGGING_IN,
@@ -750,6 +957,21 @@ fn logins(a: &Agent, query: Option<&str>) -> BTreeMap<String, wire::LoginStatus>
         });
     }
     out
+}
+
+/// The Bots' working folders, made as `user` (or the agent) if they aren't there.
+fn work_dirs(cfg: &Config, user: Option<Ids>) -> Result<(), String> {
+    runas::as_user(user, || {
+        for dir in [cfg.home.join("work"), cfg.home.join("bots")] {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&dir)
+                .map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        Ok(())
+    })
+    .map_err(|e| e.to_string())?
 }
 
 /// Only the control plane's certificate gets here (`admit`), so answering one is the
@@ -774,7 +996,7 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
             .map(|(b, _)| b)
             .collect(),
         jobs: a.running() as u32,
-        can: [wire::CAN_HARNESSES, wire::CAN_LOGINS, wire::CAN_SYNC]
+        can: [wire::CAN_HARNESSES, wire::CAN_LOGINS, wire::CAN_SYNC, wire::CAN_BOT_USER]
             .into_iter()
             .chain(a.upgrader.build.is_some().then_some(wire::CAN_UPGRADE))
             .map(String::from)
@@ -784,6 +1006,7 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
         harnesses,
         upgrade: a.upgrader.report(),
         logins: logins(&a, q.as_deref()),
+        bot_user: a.bot().status,
     })
 }
 
@@ -915,8 +1138,12 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
         scrub(&mut c.env);
     }
     let (stop_tx, mut stop_rx) = watch::channel(false);
-    let permit = {
+    let (permit, user) = {
         let mut jobs = a.jobs();
+        let user = match a.job_user() {
+            Ok(u) => u,
+            Err(r) => return r,
+        };
         if a.upgrader.staging() {
             return refuse(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -939,18 +1166,13 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
             );
         };
         jobs.insert(j.job_id.clone(), stop_tx.clone());
-        permit
+        (permit, user)
     };
     let running = Running(a.clone(), j.job_id.clone(), permit);
     let stop = StopOnDrop(stop_tx);
-    for dir in [a.cfg.home.join("work"), a.cfg.home.join("bots")] {
-        let _ = std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir);
-    }
+    let _ = work_dirs(&a.cfg, user);
     let (ev_tx, ev_rx) = mpsc::channel::<wire::JobEvent>(256);
-    let host = a.cfg.host();
+    let host = a.cfg.host(user);
     tokio::spawn(async move {
         let _running = running;
         let abort = async move {
@@ -974,15 +1196,19 @@ async fn start_login(State(a): State<Arc<Agent>>, Json(r): Json<wire::LoginReque
         Ok(run) => run,
         Err((code, msg)) => return refuse(code_or(code, StatusCode::BAD_REQUEST), msg),
     };
-    let env = a.cfg.host().env;
     let _jobs = a.jobs();
+    let user = match a.job_user() {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let env = a.cfg.host(user).env;
     if a.upgrader.staging() {
         return refuse(StatusCode::SERVICE_UNAVAILABLE, "This machine is updating its agent. Try again in a minute.");
     }
     let Some(permit) = a.tools.job_permit() else {
         return refuse(StatusCode::SERVICE_UNAVAILABLE, "This machine is updating its harnesses. Try again in a minute.");
     };
-    match a.logins.start(&r, &run, &a.cfg.home, &env) {
+    match a.logins.start(&r, &run, &a.cfg.home, &env, user) {
         Ok((rx, stop)) => stream(rx, wire::LoginEvent::Ping, (StopOnDrop(stop), permit)),
         Err((code, msg)) => refuse(code_or(code, StatusCode::CONFLICT), msg),
     }
@@ -1017,8 +1243,14 @@ async fn login_forget(State(a): State<Arc<Agent>>, Json(f): Json<wire::ForgetReq
     if a.logins.running().contains(&f.harness) {
         return refuse(StatusCode::CONFLICT, format!("A {} login is running here.", f.harness));
     }
-    let removed = super::terminal::forget(&a.cfg.home, &f.files);
-    Json(wire::ForgetReply { removed }).into_response()
+    let user = match a.job_user() {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    match runas::as_user(user, || super::terminal::forget(&a.cfg.home, &f.files)) {
+        Ok(removed) => Json(wire::ForgetReply { removed }).into_response(),
+        Err(e) => refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't act as the Bots' user: {e}")),
+    }
 }
 
 fn landed<T: serde::Serialize>(r: Result<Result<T, (u16, String)>, tokio::task::JoinError>) -> Response {
@@ -1031,6 +1263,9 @@ fn landed<T: serde::Serialize>(r: Result<Result<T, (u16, String)>, tokio::task::
 
 /// `POST /v1/sync`: a copy of the user's folder begins (ADR 0041).
 async fn sync_plan(State(a): State<Arc<Agent>>, Json(m): Json<wire::SyncManifest>) -> Response {
+    if let Err(r) = a.job_user() {
+        return r;
+    }
     let landing = a.landing.clone();
     landed(tokio::task::spawn_blocking(move || landing.plan(m)).await)
 }
@@ -1056,6 +1291,9 @@ async fn sync_blob(
 }
 
 async fn sync_finish(State(a): State<Arc<Agent>>, UrlPath(id): UrlPath<String>) -> Response {
+    if let Err(r) = a.job_user() {
+        return r;
+    }
     let landing = a.landing.clone();
     landed(tokio::task::spawn_blocking(move || landing.finish(&id)).await)
 }
@@ -1117,6 +1355,9 @@ async fn fetch(a: &Agent, path: &str) -> Result<Vec<u8>, String> {
 async fn start_upgrade(State(a): State<Arc<Agent>>, Json(req): Json<wire::UpgradeRequest>) -> Response {
     {
         let jobs = a.jobs();
+        if a.setting_up() {
+            return refuse(StatusCode::CONFLICT, "This machine is setting up its Bots' user. Try again in a few minutes.");
+        }
         if let Some((code, msg)) = a.upgrader.refuse(&req, jobs.len() + a.logins.running().len()) {
             return refuse(StatusCode::from_u16(code).unwrap_or(StatusCode::CONFLICT), msg);
         }
@@ -1137,6 +1378,43 @@ async fn start_upgrade(State(a): State<Arc<Agent>>, Json(req): Json<wire::Upgrad
     (StatusCode::ACCEPTED, Json(a.upgrader.report())).into_response()
 }
 
+/// `PUT /v1/bot-user`: from now on, run Bots as their own user (ADR 0043). Refused
+/// while jobs or logins run; none start until it's done. Heartbeats say how it went.
+async fn set_bot_user(State(a): State<Arc<Agent>>, Json(_r): Json<wire::BotUserRequest>) -> Response {
+    {
+        let jobs = a.jobs();
+        let b = a.bot();
+        if let Some(s) = b.status.as_ref().filter(|s| s.state != wire::BOT_USER_FAILED) {
+            let code = if s.state == wire::BOT_USER_READY { StatusCode::OK } else { StatusCode::ACCEPTED };
+            return (code, Json(s.clone())).into_response();
+        }
+        if a.upgrader.staging() {
+            return refuse(StatusCode::SERVICE_UNAVAILABLE, "This machine is updating its agent. Try again in a minute.");
+        }
+        let running = jobs.len() + a.logins.running().len();
+        if running > 0 {
+            return refuse(StatusCode::CONFLICT, format!("{running} jobs or logins are running here. Try again when they're done."));
+        }
+        a.set_bot(Bot {
+            status: Some(bot_status(wire::BOT_USER_SETTING_UP, &a.cfg.bot_user, None, None)),
+            ids: None,
+        });
+    }
+    let up = a.clone();
+    tokio::task::spawn_blocking(move || {
+        let user = up.cfg.bot_user.clone();
+        let b = match up.set_up_bot_user() {
+            Ok(ids) => Bot {
+                status: Some(bot_status(wire::BOT_USER_READY, &user, Some(ids.uid), None)),
+                ids: Some(ids),
+            },
+            Err(e) => bot_failed(&user, e),
+        };
+        up.set_bot(b);
+    });
+    (StatusCode::ACCEPTED, Json(a.bot().status)).into_response()
+}
+
 pub fn router(a: Arc<Agent>) -> Router {
     Router::new()
         .route("/v1/heartbeat", get(heartbeat))
@@ -1151,6 +1429,7 @@ pub fn router(a: Arc<Agent>) -> Router {
         .route("/v1/sync", post(sync_plan))
         .route("/v1/sync/{id}/blobs/{sha}", axum::routing::put(sync_blob))
         .route("/v1/sync/{id}/finish", post(sync_finish))
+        .route("/v1/bot-user", axum::routing::put(set_bot_user))
         .layer(DefaultBodyLimit::max(MAX_RELAY_BODY))
         .with_state(a)
 }

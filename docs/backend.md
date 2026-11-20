@@ -266,6 +266,7 @@ For CG-Labs managed hosting: botd can rent one Linode per user and track it. **O
   - With `MACHINE_FOLDER_SYNC=on` (and `MACHINE_FOLDER_SYNC_MAX_MB`, default 2048), assigning a user copies their working folder to `work/` on their machine, and seeds `USER.md` and their Bots' `MEMORY.md` where the machine has none. `POST .../machine/folder-sync` copies it again, and `GET` shows how the last copy went.
   - Each file is checked by SHA-256, the copy resumes where it stopped, files changed on the machine are kept, and nothing there is deleted. Runs wait for the first copy (`folder_copying`).
   - Audited as `machine.harness_login*`, `machine.harness_logged_out` and `machine.folder_sync_*`.
+- **Bots' own user on machines** ([ADR 0043](adr/0043-bots-own-os-user-on-machines.md)), off by default: with `MACHINE_BOT_USER=on`, after a heartbeat botd asks each idle agent to run its Bots as the unprivileged `superbot-bots` user. The agent makes it if it must, hands it the Bots' home without following links, and from then on runs harnesses, logins and cleanups as it, and touches files in the home only with its access. Until it's ready, routed runs are refused with `bot_user_pending` (or `bot_user_failed`, or `agent_outdated` for an agent too old to do it). `POST /api/users/{key}/machine/bot-user` asks now; `GET .../machine/agent` shows `agent.botUser`. Audited as `machine.bot_user_requested`, `machine.bot_user_ready` and `machine.bot_user_failed`.
 - **Not yet**: tying tiers to billing.
 
 ## API

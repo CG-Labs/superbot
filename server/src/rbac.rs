@@ -283,6 +283,7 @@ mod tests {
             ("PUT", "/api/users/u1/machine/agent/hold", Perm::Admin),
             ("DELETE", "/api/users/u1/machine/agent/hold", Perm::Admin),
             ("POST", "/api/users/u1/machine/harnesses", Perm::Admin),
+            ("POST", "/api/users/u1/machine/bot-user", Perm::Admin),
             ("POST", "/api/users/u1/machine/harness-login", Perm::Admin),
             ("POST", "/api/users/u1/machine/harness-login/l1/input", Perm::Admin),
             ("DELETE", "/api/users/u1/machine/harness-login/l1", Perm::Admin),

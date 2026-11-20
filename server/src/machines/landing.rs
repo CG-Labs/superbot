@@ -9,13 +9,14 @@
 // Shared by two binaries, each of which uses only part of it.
 #![allow(dead_code)]
 
+use super::runas::{self, Ids};
 use super::wire::{self, BlobReply, SyncFile, SyncManifest, SyncNeed, SyncPlan, SyncReport};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 /// Hard limits, whatever botd sends. botd's own (`MACHINE_FOLDER_SYNC_MAX_MB`) is lower.
 pub const MAX_FILES: usize = 200_000;
@@ -44,6 +45,9 @@ pub struct Landing {
     /// `<state dir>/sync`: `blobs/` and `synced.json`.
     dir: PathBuf,
     state: Mutex<State>,
+    /// The Bots' user, who owns the home and everything put there (ADR 0043). The
+    /// contents wait in `dir` as root; files in the home are made as this user.
+    user: RwLock<Option<Ids>>,
 }
 
 fn hex64(s: &str) -> bool {
@@ -244,6 +248,7 @@ impl Landing {
             home,
             dir,
             state: Mutex::default(),
+            user: RwLock::default(),
         };
         l.sweep();
         Ok(l)
@@ -251,6 +256,22 @@ impl Landing {
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Holds off copies until dropped, while the home changes hands.
+    pub fn hold(&self) -> impl Drop + '_ {
+        self.state()
+    }
+
+    /// From now on, works in the home as `ids`.
+    pub fn set_user(&self, ids: Ids) {
+        *self.user.write().unwrap_or_else(|e| e.into_inner()) = Some(ids);
+    }
+
+    /// Runs `f` with the home's owner's file access.
+    fn in_home<T>(&self, f: impl FnOnce() -> T) -> Result<T, String> {
+        let ids = *self.user.read().unwrap_or_else(|e| e.into_inner());
+        runas::as_user(ids, f).map_err(|e| format!("Couldn't act as the Bots' user: {e}"))
     }
 
     fn blob(&self, sha: &str, done: bool) -> PathBuf {
@@ -344,9 +365,12 @@ impl Landing {
         }
         let mut st = self.state();
         let synced = self.synced();
+        let dests: Vec<Dest> = self
+            .in_home(|| m.files.iter().map(|f| dest(&self.home, &f.path)).collect())
+            .map_err(|e| (500, e))?;
         let mut need: HashMap<String, u64> = HashMap::new();
-        for f in &m.files {
-            if Self::wanted(f, &dest(&self.home, &f.path), &synced) == Act::Write
+        for (f, now) in m.files.iter().zip(&dests) {
+            if Self::wanted(f, now, &synced) == Act::Write
                 && !self.blob(&f.sha256, true).exists()
             {
                 need.insert(f.sha256.clone(), f.size);
@@ -432,9 +456,13 @@ impl Landing {
     /// Writes one file next to where it goes, checks it, and moves it into place, only
     /// if what was there (`was`) is still there untouched.
     fn place(&self, f: &SyncFile, was: &Dest) -> Result<(), Missed> {
-        let fail = |e: String| Missed::Failed(e);
         let blob = self.blob(&f.sha256, true);
-        let mut from = open_nofollow(&blob).map_err(|_| fail(format!("The content of {} hasn't arrived.", f.path)))?;
+        let from = open_nofollow(&blob).map_err(|_| Missed::Failed(format!("The content of {} hasn't arrived.", f.path)))?;
+        self.in_home(|| self.place_from(f, was, from)).map_err(Missed::Failed)?
+    }
+
+    fn place_from(&self, f: &SyncFile, was: &Dest, mut from: std::fs::File) -> Result<(), Missed> {
+        let fail = |e: String| Missed::Failed(e);
         let parent = make_parents(&self.home, &f.path).map_err(|e| fail(e.to_string()))?;
         let (tmp, mut to) = (0..16)
             .find_map(|_| {
@@ -529,7 +557,13 @@ impl Landing {
             exec: f.exec,
         };
         for f in &active.files {
-            let now = dest(&self.home, &f.path);
+            let now = match self.in_home(|| dest(&self.home, &f.path)) {
+                Ok(now) => now,
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            };
             let done = match (Self::wanted(f, &now, &synced), &now) {
                 (Act::Same, _) => {
                     r.unchanged += 1;
@@ -539,7 +573,7 @@ impl Landing {
                     continue;
                 }
                 (Act::Write, _) => self.place(f, &now).map(|()| r.bytes += f.size),
-                (Act::Exec, Dest::File(h)) => self.set_exec(f, h),
+                (Act::Exec, Dest::File(h)) => self.in_home(|| self.set_exec(f, h)).unwrap_or_else(|e| Err(Missed::Failed(e))),
                 _ => Err(Missed::Raced),
             };
             match done {

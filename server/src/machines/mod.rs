@@ -7,6 +7,7 @@
 #[cfg(test)]
 #[allow(dead_code)]
 pub mod agent;
+pub mod botuser;
 pub mod enroll;
 
 #[cfg(test)]
@@ -21,6 +22,7 @@ pub mod logins;
 pub mod pki;
 pub mod provider;
 pub mod route;
+pub mod runas;
 #[cfg(test)]
 pub mod terminal;
 pub mod tools;
@@ -373,10 +375,12 @@ impl ControlPlane {
         route::target(db, self, user_id)
     }
 
-    /// Whether a run of `bin` for `owner` may start on `machine_id` now, beyond `route::fit`
-    /// (ADR 0041): their first folder copy is done and the harness is logged in there.
+    /// Whether a run of `bin` for `owner` may start on `machine_id` now, beyond `route::fit`:
+    /// the Bots' own user is ready there (ADR 0043), their first folder copy is done and
+    /// the harness is logged in there (ADR 0041).
     pub fn ready(&self, app: &App, hb: &wire::Heartbeat, owner: &str, machine_id: &str, bin: &str) -> Result<(), route::Refusal> {
         let Some(e) = &self.enrollment else { return Ok(()) };
+        botuser::check_run(e, hb)?;
         if folder::first_copy_running(app, e, machine_id) {
             return Err(route::Refusal::FolderCopying);
         }
@@ -801,6 +805,7 @@ pub async fn heartbeats(app: &AppState, cp: &ControlPlane) -> Option<usize> {
                 return false;
             };
             upkeep::follow_up(app, cp, e, &m.id, &hb).await;
+            botuser::follow_up(app, e, &m, &hb).await;
             folder::follow_up(app, e, &m, &hb);
             true
         })
