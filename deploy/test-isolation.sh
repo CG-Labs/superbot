@@ -51,6 +51,11 @@ SUPERBOT_INSTALL_NO_MAIN=1 source "$repo/deploy/install.sh"
 SUPERBOT_USER=$SVC BIN_DIR=$LIB/bin SHARE_DIR=$LIB/share SYSTEMD_DIR=$LIB/systemd \
   ISOLATION_MODE=users ISOLATION_DIR=$TEST_DIR/users configure_isolation
 grep -qx 'ISOLATION=users' "$home/superbot/.env" || die ".env lacks ISOLATION=users"
+# An upgrade with no flags keeps it on, in the same folder.
+SUPERBOT_USER=$SVC BIN_DIR=$LIB/bin SHARE_DIR=$LIB/share SYSTEMD_DIR=$LIB/systemd \
+  ISOLATION_MODE="" ISOLATION_DIR="" configure_isolation
+grep -qx "ISOLATION_DIR=$TEST_DIR/users" "$home/superbot/.env" || die "the upgrade lost ISOLATION_DIR in .env"
+grep -qx "ISOLATION_DIR=$TEST_DIR/users" /etc/superbot/isolation.conf || die "the upgrade lost ISOLATION_DIR in isolation.conf"
 grep -qx 'ProtectProc=invisible' "$LIB/systemd/superbot.service.d/isolation.conf" || die "no drop-in"
 [[ "$(stat -c '%a %U' "$TEST_DIR/users")" == "711 root" ]] || die "$TEST_DIR/users isn't root's 0711"
 [[ "$(stat -c '%a' "$home")" == 750 ]] || die "$home isn't 0750"

@@ -29,7 +29,8 @@ BUILD_CLIENT=true
 DEPLOY_FILES=(superbot.service superbot-backup.sh superbot-restore.sh superbot-backup.service superbot-backup.timer superbot-userctl.sh)
 # Per-user accounts (docs/adr/0037-per-user-unix-accounts.md): "" keeps what .env says.
 ISOLATION_MODE=""
-ISOLATION_DIR=${ISOLATION_DIR:-/srv/superbot/users}
+# Unset: what .env says, else /srv/superbot/users (isolation_dir).
+ISOLATION_DIR=${ISOLATION_DIR:-}
 ISOLATION_GROUP=superbot-users
 ISOLATION_CONF=/etc/superbot/isolation.conf
 USERCTL_BIN=/usr/local/sbin/superbot-userctl
@@ -671,6 +672,24 @@ ProtectProc=invisible
 EOF
 }
 
+# ISOLATION_DIR as given, else the one .env has, so an upgrade keeps a custom folder.
+isolation_dir() {
+  local env_file saved
+  env_file="$(user_home)/superbot/.env"
+  saved=""
+  if [[ -f "$env_file" ]]; then
+    saved=$(sed -n 's/^ISOLATION_DIR=//p' "$env_file" | tail -n 1)
+  fi
+  if [[ -n "$ISOLATION_DIR" ]]; then
+    if [[ -n "$saved" && "$saved" != "$ISOLATION_DIR" ]]; then
+      warn "ISOLATION_DIR changes from $saved to $ISOLATION_DIR: existing accounts keep their homes in $saved, and botd refuses their runs until they're moved by hand"
+    fi
+    printf '%s\n' "$ISOLATION_DIR"
+  else
+    printf '%s\n' "${saved:-/srv/superbot/users}"
+  fi
+}
+
 # Per-user accounts on or off. On: the root helper, the sudoers rule, the unit drop-in,
 # the users' folder, and ISOLATION=users in .env. Off: the rule and drop-in go; accounts
 # and their folders stay, as data.
@@ -679,6 +698,7 @@ configure_isolation() {
   mode=$(isolation_mode)
   home=$(user_home)
   env_file="$home/superbot/.env"
+  ISOLATION_DIR=$(isolation_dir)
   dropin="$SYSTEMD_DIR/superbot.service.d/isolation.conf"
   if [[ "$mode" != users ]]; then
     [[ "$ISOLATION_MODE" == off ]] || return 0
