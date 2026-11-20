@@ -28,13 +28,13 @@ The recipes live in the adapters (`Adapter::machine_login`), so the agent and bo
 | `claude` | `claude auth login` | `.claude/.credentials.json` | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` |
 | `codex` | `codex login --device-auth` | `.codex/auth.json` | `OPENAI_API_KEY`, `CODEX_API_KEY` |
 
-Pi and Hermes have no login there. They keep using API keys from secrets, as on one server. Unlike `botctl user harness-login` (ADR 0037), extra login arguments aren't accepted: a machine runs only the recipe.
+Pi and Hermes have no login there. They keep using API keys from secrets, as on one server. Unlike `botctl user harness-login` (ADR 0037), extra login arguments aren't accepted: a machine runs only the recipe. The agent takes only words from a fixed list in the wire protocol (`LOGIN_WORDS`, every adapter's recipe words, kept in step by a test), as it does for harness names (`HARNESS_BINS`). So what it runs is never the request's own text.
 
 How a login runs:
 
 1. An admin starts it: `POST /api/users/{key}/machine/harness-login {harness}` (`botctl machine harness-login <user> <claude|codex>`). The person themselves can use `POST /api/machine/harness-login`. Bots can't.
 2. botd checks that the user's machine is running and enrolled, and that its agent `can` do `logins`. The machine doesn't need to be assigned yet, so a login can come before the switch. Then it sends `POST /v1/logins` over the pinned mutual-TLS channel, with a `LoginRequest` (id, harness, command arguments, credential files, timeout of 15 minutes).
-3. The agent checks the request: a known harness that is installed there, plain arguments, and credential paths inside HOME. It runs at most one login per harness and two in all. It runs the CLI in a pseudo-terminal of its own, with echo off, in its own session. It gets only the harness environment, so no secrets.
+3. The agent checks the request: a known harness that is installed there, arguments from that list, and credential paths inside HOME. It runs at most one login per harness and two in all. It runs the CLI in a pseudo-terminal of its own, with echo off, in its own session. It gets only the harness environment, so no secrets.
 4. The agent streams what the terminal shows back as JSON lines (`LoginEvent`: `started`, `output`, `ping`, `error`, `exit`). botd relays them to the caller as `application/x-ndjson` and keeps none of it.
 5. Lines the person types go to `POST .../harness-login/{id}/input`, then to the agent, then into the terminal. botd never stores them. The audit records only how many characters were sent.
 6. When the CLI exits, or the timeout passes, or someone stops it (`DELETE .../harness-login/{id}`), the agent ends the whole process group. It then reports whether the credential file now exists. If the caller goes away, botd stops the login on the machine.

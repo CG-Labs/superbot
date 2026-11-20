@@ -49,9 +49,9 @@ struct Login {
 }
 
 impl Login {
-    async fn start(env: &Env, uid: &str, harness: &str) -> Login {
+    async fn start(env: &Env, user: &str, harness: &str) -> Login {
         let res = reqwest::Client::new()
-            .post(format!("http://127.0.0.1:{}/api/users/{uid}/machine/harness-login", env.port))
+            .post(format!("http://127.0.0.1:{}/api/users/{user}/machine/harness-login", env.port))
             .header("Authorization", &env.admin)
             .json(&json!({ "harness": harness }))
             .send()
@@ -105,9 +105,9 @@ impl Login {
 #[tokio::test]
 async fn a_harness_logs_in_on_the_users_machine_and_only_then_runs_there() {
     let mut env = serve_with(|e| e.with_logins()).await;
-    let (uid, mid, token) = machine_for(&env, "ada@example.com").await;
+    let (user, mid, token) = machine_for(&env, "ada@example.com").await;
     let m = agent_with(&mut env, &mid, &token, CLAUDE).await;
-    let bot = owned_bot(&env, &uid);
+    let bot = owned_bot(&env, &user);
 
     // Not logged in there, and no key: refused, never run here instead.
     let before = send(&env, &bot, "hello").await;
@@ -115,18 +115,18 @@ async fn a_harness_logs_in_on_the_users_machine_and_only_then_runs_there() {
     assert!(said.contains("claude isn't logged in on your computer"), "{said}");
     assert_eq!(refusals(&events(&env, "bot.run_refused").await, "harness_not_logged_in"), 1);
     assert!(events(&env, "harness.invoked").await.is_empty());
-    let (code, v) = json_call(&env, "GET", &format!("/api/users/{uid}/machine/harness-logins"), "").await;
+    let (code, v) = json_call(&env, "GET", &format!("/api/users/{user}/machine/harness-logins"), "").await;
     assert_eq!(code, 200, "{v}");
     assert_eq!((v["logins"].as_str(), v["harnesses"]["claude"]["state"].as_str()), (Some("on"), Some("logged_out")), "{v}");
     assert_eq!(v["harnesses"]["codex"]["state"], "logged_out");
     assert!(v["harnesses"]["pi"].is_null(), "Pi keeps using API keys: {v}");
 
     // The login runs in a terminal there; what it shows comes back, what's typed goes in.
-    let mut login = Login::start(&env, &uid, "claude").await;
+    let mut login = Login::start(&env, &user, "claude").await;
     let (started, _) = login.until("started").await;
     let id = started["loginId"].as_str().unwrap().to_string();
     login.until_shown("paste the code here").await;
-    let (code, v) = json_call(&env, "POST", &format!("/api/users/{uid}/machine/harness-login/{id}/input"), r#"{"text":"code-7a1f"}"#).await;
+    let (code, v) = json_call(&env, "POST", &format!("/api/users/{user}/machine/harness-login/{id}/input"), r#"{"text":"code-7a1f"}"#).await;
     assert_eq!(code, 204, "{v}");
     let (exit, out) = login.until("exit").await;
     assert_eq!((exit["loggedIn"].as_bool(), exit["success"].as_bool()), (Some(true), Some(true)), "{exit}");
@@ -144,7 +144,7 @@ async fn a_harness_logs_in_on_the_users_machine_and_only_then_runs_there() {
     // Logged in there now: the run goes ahead.
     let before = send(&env, &bot, "again").await;
     assert_eq!(reply_after(&env, &bot, before).await, "ran on the machine");
-    let (_, v) = json_call(&env, "GET", &format!("/api/users/{uid}/machine/harness-logins"), "").await;
+    let (_, v) = json_call(&env, "GET", &format!("/api/users/{user}/machine/harness-logins"), "").await;
     assert_eq!(v["harnesses"]["claude"]["state"], "logged_in", "{v}");
     assert!(v["harnesses"]["claude"]["since"].is_i64(), "{v}");
     let changed = wait_for_event(&env, "machine.harness_login_changed").await;
@@ -157,7 +157,7 @@ async fn a_harness_logs_in_on_the_users_machine_and_only_then_runs_there() {
     assert!(!upkeep.contains("code-7a1f") && upkeep.contains("logged_in"), "{upkeep}");
 
     // Logged out: the file is gone there, and runs are refused again.
-    let (code, v) = json_call(&env, "DELETE", &format!("/api/users/{uid}/machine/harness-logins/claude"), "").await;
+    let (code, v) = json_call(&env, "DELETE", &format!("/api/users/{user}/machine/harness-logins/claude"), "").await;
     assert_eq!((code, v["removed"].as_u64()), (200, Some(1)), "{v}");
     assert!(!m.home.join(".claude/.credentials.json").exists());
     assert_eq!(events(&env, "machine.harness_logged_out").await.len(), 1);
@@ -166,33 +166,33 @@ async fn a_harness_logs_in_on_the_users_machine_and_only_then_runs_there() {
     assert_eq!(refusals(&events(&env, "bot.run_refused").await, "harness_not_logged_in"), 2);
 
     // A key of their own is enough instead.
-    crate::secrets::global().user_put(&uid, "ANTHROPIC_API_KEY", "sk-ant-test-7f3e9c2b").unwrap();
+    crate::secrets::global().user_put(&user, "ANTHROPIC_API_KEY", "sk-ant-test-7f3e9c2b").unwrap();
     let before = send(&env, &bot, "with a key").await;
     assert_eq!(reply_after(&env, &bot, before).await, "ran on the machine");
-    crate::secrets::global().user_delete(&uid, "ANTHROPIC_API_KEY").unwrap();
+    crate::secrets::global().user_delete(&user, "ANTHROPIC_API_KEY").unwrap();
 }
 
 #[tokio::test]
 async fn a_login_can_be_stopped_and_only_known_harnesses_log_in() {
     let mut env = serve_with(|e| e.with_logins()).await;
-    let (uid, mid, token) = machine_for(&env, "ada@example.com").await;
+    let (user, mid, token) = machine_for(&env, "ada@example.com").await;
     let m = agent_with(&mut env, &mid, &token, SLOW_LOGIN).await;
     for (harness, code) in [("pi", 400), ("hermes", 400), ("nope", 400)] {
-        let (got, v) = json_call(&env, "POST", &format!("/api/users/{uid}/machine/harness-login"), &json!({ "harness": harness }).to_string()).await;
+        let (got, v) = json_call(&env, "POST", &format!("/api/users/{user}/machine/harness-login"), &json!({ "harness": harness }).to_string()).await;
         assert_eq!(got, code, "{harness}: {v}");
     }
-    let (code, v) = json_call(&env, "POST", &format!("/api/users/{uid}/machine/harness-login"), r#"{"harness":"codex"}"#).await;
+    let (code, v) = json_call(&env, "POST", &format!("/api/users/{user}/machine/harness-login"), r#"{"harness":"codex"}"#).await;
     assert_eq!(code, 502, "codex isn't installed there: {v}");
 
-    let mut login = Login::start(&env, &uid, "claude").await;
+    let mut login = Login::start(&env, &user, "claude").await;
     let (started, _) = login.until("started").await;
     let id = started["loginId"].as_str().unwrap().to_string();
     assert_eq!(m.agent.running(), 1, "a login counts as busy, so upgrades wait for it");
-    let (code, v) = json_call(&env, "POST", &format!("/api/users/{uid}/machine/harness-login"), r#"{"harness":"claude"}"#).await;
+    let (code, v) = json_call(&env, "POST", &format!("/api/users/{user}/machine/harness-login"), r#"{"harness":"claude"}"#).await;
     assert_eq!(code, 409, "one at a time: {v}");
-    let (code, v) = json_call(&env, "DELETE", &format!("/api/users/{uid}/machine/harness-logins/claude"), "").await;
+    let (code, v) = json_call(&env, "DELETE", &format!("/api/users/{user}/machine/harness-logins/claude"), "").await;
     assert_eq!(code, 502, "can't log out mid-login: {v}");
-    let (code, _) = json_call(&env, "DELETE", &format!("/api/users/{uid}/machine/harness-login/{id}"), "").await;
+    let (code, _) = json_call(&env, "DELETE", &format!("/api/users/{user}/machine/harness-login/{id}"), "").await;
     assert_eq!(code, 204);
     let (exit, _) = login.until("exit").await;
     assert_eq!(exit["loggedIn"], false, "{exit}");
@@ -201,7 +201,7 @@ async fn a_login_can_be_stopped_and_only_known_harnesses_log_in() {
     assert_eq!(finished[0]["outcome"], "failure", "{finished:?}");
     assert!(m.agent.logins.running().is_empty());
     assert_eq!(m.agent.running(), 0);
-    let (code, _) = json_call(&env, "POST", &format!("/api/users/{uid}/machine/harness-login/{id}/input"), r#"{"text":"late"}"#).await;
+    let (code, _) = json_call(&env, "POST", &format!("/api/users/{user}/machine/harness-login/{id}/input"), r#"{"text":"late"}"#).await;
     assert_eq!(code, 404, "an ended login takes no input");
 }
 

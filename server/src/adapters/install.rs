@@ -148,6 +148,21 @@ mod tests {
     }
 
     #[test]
+    fn every_machine_login_word_is_one_an_agent_takes() {
+        use crate::machines::wire;
+        let mut words: Vec<&str> = wire::HARNESS_BINS
+            .iter()
+            .filter_map(|b| adapters::get(b)?.machine_login())
+            .flat_map(|l| l.args.iter().copied())
+            .collect();
+        words.sort();
+        words.dedup();
+        let mut known = wire::LOGIN_WORDS.to_vec();
+        known.sort();
+        assert_eq!(words, known);
+    }
+
+    #[test]
     fn pins_are_exact_and_overrides_are_checked() {
         let c = install("claude", None, None).unwrap();
         assert_eq!(c.version, "2.1.329");

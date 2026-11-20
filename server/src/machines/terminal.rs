@@ -50,8 +50,16 @@ fn plain(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// A login this agent will run: the harness CLI and its arguments, each one of `wire`'s
+/// own words.
+#[derive(Debug, PartialEq)]
+pub struct Command {
+    pub bin: &'static str,
+    pub args: Vec<&'static str>,
+}
+
 /// Whether `r` is a login this agent will run, `has` saying which harnesses are installed.
-pub fn check(r: &LoginRequest, has: impl Fn(&str) -> bool) -> Result<&'static str, Refused> {
+pub fn check(r: &LoginRequest, has: impl Fn(&str) -> bool) -> Result<Command, Refused> {
     let bad = |m: &str| Err((400, m.to_string()));
     if !plain(&r.login_id) {
         return bad("The login id isn't a plain name.");
@@ -59,20 +67,27 @@ pub fn check(r: &LoginRequest, has: impl Fn(&str) -> bool) -> Result<&'static st
     let Some(bin) = wire::harness_bin(&r.harness) else {
         return bad("That isn't a harness this machine runs.");
     };
-    if r.args.len() > 16
-        || r.args
-            .iter()
-            .any(|a| a.len() > 256 || a.chars().any(char::is_control))
-    {
-        return bad("The login's arguments aren't plain.");
-    }
+    let Some(args) = r.args.iter().map(|a| wire::login_word(a)).collect::<Option<Vec<_>>>() else {
+        return bad("The login's arguments aren't ones a machine login takes.");
+    };
     if r.files.is_empty() || r.files.len() > 4 || !r.files.iter().all(|f| wire::home_path(f)) {
         return bad("Credential files must be paths inside HOME.");
     }
     if !has(bin) {
         return Err((422, format!("{bin} isn't installed on this machine.")));
     }
-    Ok(bin)
+    Ok(Command { bin, args })
+}
+
+/// `f` under `home`, if it is a plain relative path there.
+fn under(home: &Path, f: &str) -> Option<std::path::PathBuf> {
+    if f.contains("..") {
+        return None;
+    }
+    if !wire::home_path(f) {
+        return None;
+    }
+    Some(home.join(f))
 }
 
 /// When the newest of `files` (relative to `home`) last changed, if one is there. A
@@ -80,8 +95,8 @@ pub fn check(r: &LoginRequest, has: impl Fn(&str) -> bool) -> Result<&'static st
 pub fn logged_in(home: &Path, files: &[String]) -> Option<i64> {
     files
         .iter()
-        .filter(|f| wire::home_path(f))
-        .filter_map(|f| std::fs::symlink_metadata(home.join(f)).ok())
+        .filter_map(|f| under(home, f))
+        .filter_map(|p| std::fs::symlink_metadata(p).ok())
         .filter(|m| m.is_file() && m.len() > 0)
         .filter_map(|m| m.modified().ok())
         .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -92,8 +107,7 @@ pub fn logged_in(home: &Path, files: &[String]) -> Option<i64> {
 /// Logs out: removes `files` (relative to `home`). Returns how many were there.
 pub fn forget(home: &Path, files: &[String]) -> u32 {
     let mut n = 0;
-    for f in files.iter().filter(|f| wire::home_path(f)) {
-        let p = home.join(f);
+    for p in files.iter().filter_map(|f| under(home, f)) {
         // Removing a link removes the link, never what it points to.
         if std::fs::symlink_metadata(&p).is_ok_and(|m| !m.is_dir()) && std::fs::remove_file(&p).is_ok() {
             n += 1;
@@ -190,12 +204,12 @@ impl Logins {
         self.sessions().values().map(|s| s.harness.clone()).collect()
     }
 
-    /// Starts the login, as `bin` in `home` with exactly `env`. Its events come on the
-    /// receiver, which ends after `Exit` or `Error`; `stop` (or `abort`) ends it early.
+    /// Starts the login, `run` (from `check`) in `home` with exactly `env`. Its events come
+    /// on the receiver, which ends after `Exit` or `Error`; `stop` (or `abort`) ends it early.
     pub fn start(
         self: &Arc<Self>,
         r: &LoginRequest,
-        bin: &str,
+        run: &Command,
         home: &Path,
         env: &BTreeMap<String, String>,
     ) -> Result<(mpsc::Receiver<LoginEvent>, watch::Sender<bool>), Refused> {
@@ -225,8 +239,8 @@ impl Logins {
         let (Ok(i), Ok(o), Ok(e)) = (stdio(&slave), stdio(&slave), stdio(&slave)) else {
             return Err((500, "Couldn't set up the terminal.".into()));
         };
-        let mut cmd = tokio::process::Command::new(bin);
-        cmd.args(&r.args)
+        let mut cmd = tokio::process::Command::new(run.bin);
+        cmd.args(&run.args)
             .current_dir(home)
             .env_clear()
             .envs(env)
@@ -244,7 +258,7 @@ impl Logins {
                 Ok(())
             });
         }
-        let mut child = cmd.spawn().map_err(|e| (500, format!("Couldn't start {bin}: {e}")))?;
+        let mut child = cmd.spawn().map_err(|e| (500, format!("Couldn't start {}: {e}", run.bin)))?;
         drop(slave);
         let pid = child.id();
         let (tx, rx) = mpsc::channel::<LoginEvent>(256);
@@ -336,6 +350,14 @@ fn echoes(fd: &OwnedFd) -> bool {
 mod tests {
     use super::*;
 
+    /// A stand-in CLI at `path`, run as a login is.
+    fn fake(path: &Path) -> Command {
+        Command {
+            bin: Box::leak(path.to_str().unwrap().to_string().into_boxed_str()),
+            args: vec!["auth", "login"],
+        }
+    }
+
     fn scratch(tag: &str) -> std::path::PathBuf {
         let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let d = std::env::temp_dir().join(format!("superbot-login-{tag}-{}-{t}", std::process::id()));
@@ -355,7 +377,7 @@ mod tests {
 
     #[test]
     fn only_plain_logins_of_installed_harnesses_run() {
-        assert_eq!(check(&req(&[".claude/.credentials.json"]), |_| true), Ok("claude"));
+        assert_eq!(check(&req(&[".claude/.credentials.json"]), |_| true), Ok(Command { bin: "claude", args: vec!["auth", "login"] }));
         assert_eq!(check(&req(&[".claude/x"]), |_| false).unwrap_err().0, 422);
         for files in [&[][..], &["/etc/shadow"], &["../x"], &[".claude/../../x"]] {
             assert_eq!(check(&req(files), |_| true).unwrap_err().0, 400, "{files:?}");
@@ -369,6 +391,9 @@ mod tests {
         let mut r = req(&["a"]);
         r.args.push("a\nb".into());
         assert!(check(&r, |_| true).is_err());
+        let mut r = req(&["a"]);
+        r.args.push("--dangerously-skip-permissions".into());
+        assert_eq!(check(&r, |_| true).unwrap_err().0, 400, "only a login's own words");
     }
 
     #[test]
@@ -410,9 +435,9 @@ mod tests {
         let logins = Arc::new(Logins::default());
         let r = req(&[".claude/.credentials.json"]);
         let env = BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
-        let (mut rx, _stop) = logins.start(&r, bin.to_str().unwrap(), &home, &env).unwrap();
+        let (mut rx, _stop) = logins.start(&r, &fake(&bin), &home, &env).unwrap();
         assert_eq!(logins.running(), vec!["claude".to_string()]);
-        assert_eq!(logins.start(&r, bin.to_str().unwrap(), &home, &env).unwrap_err().0, 409);
+        assert_eq!(logins.start(&r, &fake(&bin), &home, &env).unwrap_err().0, 409);
         let mut shown = String::new();
         let mut typed = false;
         let exit = loop {
@@ -453,7 +478,7 @@ mod tests {
         let logins = Arc::new(Logins::default());
         let r = req(&[".claude/.credentials.json"]);
         let env = BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
-        let (mut rx, _stop) = logins.start(&r, bin.to_str().unwrap(), &home, &env).unwrap();
+        let (mut rx, _stop) = logins.start(&r, &fake(&bin), &home, &env).unwrap();
         let _ = rx.recv().await;
         assert!(logins.abort("l1"));
         let exit = loop {

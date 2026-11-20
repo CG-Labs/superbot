@@ -45,6 +45,14 @@ pub fn harness_bin(name: &str) -> Option<&'static str> {
     HARNESS_BINS.into_iter().find(|k| *k == name)
 }
 
+/// The words a machine login may pass its harness: every adapter's `machine_login().args`.
+pub const LOGIN_WORDS: [&str; 3] = ["auth", "login", "--device-auth"];
+
+/// `word` as one of `LOGIN_WORDS`, so what an agent runs is never the request's own text.
+pub fn login_word(word: &str) -> Option<&'static str> {
+    LOGIN_WORDS.into_iter().find(|k| *k == word)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EnrollRequest {

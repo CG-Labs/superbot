@@ -970,8 +970,8 @@ fn code_or(code: u16, fallback: StatusCode) -> StatusCode {
 /// shows (ADR 0041). Its credentials stay in this machine's HOME. A dropped stream
 /// stops it. Like a job, it holds off agent upgrades and harness updates.
 async fn start_login(State(a): State<Arc<Agent>>, Json(r): Json<wire::LoginRequest>) -> Response {
-    let bin = match super::terminal::check(&r, |b| a.cfg.has(b)) {
-        Ok(b) => b,
+    let run = match super::terminal::check(&r, |b| a.cfg.has(b)) {
+        Ok(run) => run,
         Err((code, msg)) => return refuse(code_or(code, StatusCode::BAD_REQUEST), msg),
     };
     let env = a.cfg.host().env;
@@ -982,7 +982,7 @@ async fn start_login(State(a): State<Arc<Agent>>, Json(r): Json<wire::LoginReque
     let Some(permit) = a.tools.job_permit() else {
         return refuse(StatusCode::SERVICE_UNAVAILABLE, "This machine is updating its harnesses. Try again in a minute.");
     };
-    match a.logins.start(&r, bin, &a.cfg.home, &env) {
+    match a.logins.start(&r, &run, &a.cfg.home, &env) {
         Ok((rx, stop)) => stream(rx, wire::LoginEvent::Ping, (StopOnDrop(stop), permit)),
         Err((code, msg)) => refuse(code_or(code, StatusCode::CONFLICT), msg),
     }
