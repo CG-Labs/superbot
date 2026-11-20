@@ -10,6 +10,7 @@ import type {
   LoginCode,
   Message,
   ModelOption,
+  PersonalSecret,
   Policy,
   PolicyMode,
   Role,
@@ -304,6 +305,21 @@ export class SuperBotApi {
   /** Your Stripe billing portal: change or cancel the plan, cards, invoices. */
   async billingPortal(): Promise<{ url: string }> {
     return this.request<{ url: string }>("POST", "/api/billing/portal");
+  }
+
+  // Your own secrets, for your Bots only (ADR 0029, 0044). Values go in, never come back.
+
+  async mySecrets(): Promise<PersonalSecret[]> {
+    return (await this.request<{ secrets: PersonalSecret[] }>("GET", "/api/me/secrets")).secrets ?? [];
+  }
+
+  /** Saves a new secret, or replaces the value of one you have. */
+  async setMySecret(name: string, value: string): Promise<PersonalSecret> {
+    return (await this.request<{ secret: PersonalSecret }>("PUT", `/api/me/secrets/${encodeURIComponent(name)}`, { value })).secret;
+  }
+
+  async deleteMySecret(name: string): Promise<void> {
+    await this.request("DELETE", `/api/me/secrets/${encodeURIComponent(name)}`);
   }
 
   // Requests for access from the landing page: admins only (ADR 0022).

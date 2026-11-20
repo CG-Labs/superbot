@@ -161,7 +161,12 @@ fn check_value(v: &str) -> Result<(), Error> {
 #[serde(rename_all = "camelCase")]
 pub struct UserListed {
     pub name: String,
+    pub created_at: i64,
     pub updated_at: i64,
+    /// A server-wide secret of this name also reaches Bots; for this user's Bots, theirs
+    /// wins. Their Bots see that name in their environment anyway, so this tells them
+    /// nothing new about the server's secrets.
+    pub overrides: bool,
 }
 
 pub struct Secrets {
@@ -185,18 +190,32 @@ impl Secrets {
     }
 
     pub fn user_list(&self, user_id: &str) -> Result<Vec<UserListed>, Error> {
-        Ok(self.users()?.names(user_id)?.into_iter().map(|(name, updated_at)| UserListed { name, updated_at }).collect())
+        let rows = self.users()?.names(user_id)?;
+        let server: Vec<String> = self.list().unwrap_or_default().into_iter().filter(|l| l.for_bots).map(|l| l.name).collect();
+        Ok(rows
+            .into_iter()
+            .map(|(name, created_at, updated_at)| {
+                let overrides = server.contains(&name);
+                UserListed { name, created_at, updated_at, overrides }
+            })
+            .collect())
+    }
+
+    #[cfg(test)]
+    pub fn user_put(&self, user_id: &str, name: &str, value: &str) -> Result<UserListed, Error> {
+        Ok(self.user_save(user_id, name, value)?.0)
     }
 
     /// Saves a secret that reaches only `user_id`'s Bots, over a server-wide one of the
-    /// same name. botd's own secrets can't be saved here: no Bot may get them.
-    pub fn user_put(&self, user_id: &str, name: &str, value: &str) -> Result<UserListed, Error> {
+    /// same name, and says whether it replaced one the user had. botd's own secrets
+    /// can't be saved here: no Bot may get them.
+    pub fn user_save(&self, user_id: &str, name: &str, value: &str) -> Result<(UserListed, bool), Error> {
         check_user_name(name)?;
         check_value(value)?;
         redact::register_for(user_id, value);
-        let users = self.users()?;
-        users.put(user_id, name, value)?;
-        self.user_list(user_id)?.into_iter().find(|l| l.name == name).ok_or_else(|| Error::Store(format!("{name} was not saved")))
+        let replaced = self.users()?.put(user_id, name, value)?;
+        let listed = self.user_list(user_id)?.into_iter().find(|l| l.name == name).ok_or_else(|| Error::Store(format!("{name} was not saved")))?;
+        Ok((listed, replaced))
     }
 
     pub fn user_delete(&self, user_id: &str, name: &str) -> Result<bool, Error> {
@@ -208,7 +227,7 @@ impl Secrets {
     pub fn user_forget(&self, user_id: &str) -> Result<usize, Error> {
         let Ok(users) = self.users() else { return Ok(0) };
         let names = users.names(user_id)?;
-        for (n, _) in &names {
+        for (n, ..) in &names {
             users.delete(user_id, n)?;
         }
         Ok(names.len())
@@ -219,7 +238,7 @@ impl Secrets {
     pub fn harness_env_for(&self, owner: &str) -> Vec<(String, Secret)> {
         let mut out = self.harness_env();
         let Ok(users) = self.users() else { return out };
-        for (name, _) in users.names(owner).unwrap_or_default() {
+        for (name, ..) in users.names(owner).unwrap_or_default() {
             if check_user_name(&name).is_err() {
                 continue;
             }
