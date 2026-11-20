@@ -39,6 +39,8 @@ use tokio::sync::{mpsc, watch};
 
 /// How long an enrollment token lasts. Building and booting a Linode takes minutes.
 pub const TOKEN_MINUTES: i64 = 60;
+/// How long a machine has to enroll before the reconciler reports it (ADR 0035).
+pub const DEFAULT_ENROLL_TIMEOUT_MINUTES: i64 = 15;
 /// A machine's certificate lifetime. Its agent asks for a new one with a third left.
 pub const CERT_DAYS: i64 = 30;
 /// botd's own certificate, renewed by itself with a third left.
@@ -75,6 +77,9 @@ pub struct Enrollment {
     pub listen: SocketAddr,
     /// Where each machine's agent answers.
     pub agent_port: u16,
+    /// A machine not enrolled this long after its token was issued is reported
+    /// (MACHINE_ENROLL_TIMEOUT_MINUTES).
+    pub enroll_timeout_ms: i64,
     ca: Ca,
     current: RwLock<Arc<ControlCert>>,
     /// The agent binary and its SHA-256, when it ships next to botd. Read once at
@@ -111,7 +116,7 @@ impl Enrollment {
     ) -> Result<Option<Enrollment>, String> {
         let raw = var("MACHINE_CONTROL_URL").trim().to_string();
         if raw.is_empty() {
-            for k in ["MACHINE_LISTEN", "MACHINE_AGENT_PORT"] {
+            for k in ["MACHINE_LISTEN", "MACHINE_AGENT_PORT", "MACHINE_ENROLL_TIMEOUT_MINUTES"] {
                 if !var(k).trim().is_empty() {
                     return Err(format!("{k} needs MACHINE_CONTROL_URL"));
                 }
@@ -150,6 +155,16 @@ impl Enrollment {
                 .filter(|p| *p > 0)
                 .ok_or("MACHINE_AGENT_PORT must be 1 to 65535")?,
         };
+        let timeout = match var("MACHINE_ENROLL_TIMEOUT_MINUTES").trim() {
+            "" => DEFAULT_ENROLL_TIMEOUT_MINUTES,
+            m => m
+                .parse::<i64>()
+                .ok()
+                .filter(|m| (5..=TOKEN_MINUTES).contains(m))
+                .ok_or(format!(
+                    "MACHINE_ENROLL_TIMEOUT_MINUTES must be 5 to {TOKEN_MINUTES} (a token lasts {TOKEN_MINUTES} minutes)"
+                ))?,
+        };
         let read = |name: &str| {
             std::fs::read(bin_dir.join(name)).ok().map(|b| {
                 let sha = sha256_hex(&b);
@@ -166,6 +181,7 @@ impl Enrollment {
             read(AGENT_BIN),
         )?;
         e.botctl = read(BOTCTL_BIN);
+        e.enroll_timeout_ms = timeout * 60_000;
         Ok(Some(e))
     }
 
@@ -183,11 +199,17 @@ impl Enrollment {
             host,
             listen,
             agent_port,
+            enroll_timeout_ms: DEFAULT_ENROLL_TIMEOUT_MINUTES * 60_000,
             ca,
             current,
             agent,
             botctl: None,
         })
+    }
+
+    /// The host in MACHINE_CONTROL_URL: a name, or an address without brackets.
+    pub fn host(&self) -> &str {
+        &self.host
     }
 
     /// botd's machine port on 127.0.0.1:`port`, agents on `agent_port`, a CA from `seed`.
@@ -226,10 +248,11 @@ impl Enrollment {
 
     pub fn describe(&self) -> String {
         format!(
-            "on at {} (listening on {}, agents on port {}){}",
+            "on at {} (listening on {}, agents on port {}, {} minutes to enroll){}",
             self.url,
             self.listen,
             self.agent_port,
+            self.enroll_timeout_ms / 60_000,
             match (&self.agent, &self.botctl) {
                 (Some(_), Some(_)) => "",
                 (None, _) =>
@@ -261,7 +284,8 @@ impl Enrollment {
         Arc::new(move || e.control().server.clone())
     }
 
-    /// A one-time token for `machine_id`: only its hash is kept.
+    /// A one-time token for `machine_id`: only its hash is kept. The machine must
+    /// enroll within the timeout from now.
     pub fn mint_token(
         &self,
         app: &App,
@@ -272,13 +296,15 @@ impl Enrollment {
             "{TOKEN_PREFIX}{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(crate::random_bytes(32))
         );
-        let expires = now() + TOKEN_MINUTES * 60_000;
+        let at = now();
+        let expires = at + TOKEN_MINUTES * 60_000;
         app.db
             .add_machine_token(
                 machine_id,
                 &sha256_hex(token.as_bytes()),
                 expires,
                 created_by,
+                at + self.enroll_timeout_ms,
             )
             .map_err(|e| e.to_string())?;
         Ok((token, expires))
@@ -315,24 +341,22 @@ impl Enrollment {
             port = self.agent_port,
             unit = indent(UNIT),
         );
-        let install = |path: &str, name: &str, sha: &str| {
-            format!(
-                "curl -fsS --retry 5 --cacert /etc/superbot/ca.pem -o /usr/local/bin/{name}.new {url}{path} && echo '{sha}  /usr/local/bin/{name}.new' | sha256sum -c - && chmod 755 /usr/local/bin/{name}.new && mv /usr/local/bin/{name}.new /usr/local/bin/{name}",
-                url = self.url,
-            )
-        };
         if let Some((_, sha)) = &self.agent {
-            out.push_str("runcmd:\n");
             // botctl first: the agent reports whether it's there when botd checks.
-            if let Some((_, b)) = &self.botctl {
-                out.push_str(&format!(
-                    "  - [sh, -c, \"{}\"]\n",
-                    install("/v1/botctl", BOTCTL_BIN, b)
-                ));
-            }
+            let botctl = self.botctl.as_ref().map_or(String::new(), |(_, b)| {
+                FIRSTBOOT_BOTCTL.replace("{url}", &self.url).replace("{sha}", b)
+            });
+            let script = FIRSTBOOT
+                .replace("{botctl}\n", &botctl)
+                .replace("{url}", &self.url)
+                .replace("{sha}", sha);
             out.push_str(&format!(
-                "  - [sh, -c, \"{} && systemctl daemon-reload && systemctl enable --now superbot-machine\"]\n",
-                install("/v1/agent", AGENT_BIN, sha)
+                "\x20 - path: {FIRSTBOOT_PATH}\n\
+                 \x20   permissions: \"0700\"\n\
+                 \x20   content: |\n{}\
+                 runcmd:\n\
+                 \x20 - [{FIRSTBOOT_PATH}]\n",
+                indent(&script),
             ));
         }
         out
@@ -387,6 +411,43 @@ fn control_cert(ca: &Ca, host: &str) -> Result<ControlCert, String> {
         server,
     })
 }
+
+const FIRSTBOOT_PATH: &str = "/usr/local/lib/superbot/firstboot";
+
+/// Run once by cloud-init (ADR 0035): installs the agent botd ships (and botctl, when
+/// botd ships it), each checked against the SHA-256 botd pinned, enrolls, and starts
+/// the agent. Its output goes to the cloud-init log, so nothing in it may print the
+/// token.
+const FIRSTBOOT: &str = r#"#!/bin/sh
+set -eu
+{botctl}
+bin=/usr/local/bin/superbot-machine
+curl -fsS --retry 10 --retry-delay 5 --retry-all-errors --cacert /etc/superbot/ca.pem -o "$bin.new" "{url}/v1/agent"
+echo "{sha}  $bin.new" | sha256sum -c -
+chmod 755 "$bin.new"
+mv "$bin.new" "$bin"
+systemctl daemon-reload
+systemctl enable superbot-machine
+set -a
+. /etc/superbot/machine.env
+set +a
+if SUPERBOT_ENROLL_TOKEN_FILE=/etc/superbot/enroll-token SUPERBOT_STATE_DIR=/var/lib/superbot-machine "$bin" enroll; then
+  echo "superbot: enrolled"
+else
+  echo "superbot: enrolling failed; the agent will keep trying" >&2
+fi
+# cloud-init's copies of the user data hold the token; only the agent's file is needed.
+rm -f /var/lib/cloud/instance/user-data.txt /var/lib/cloud/instance/user-data.txt.i
+systemctl start superbot-machine
+"#;
+
+/// FIRSTBOOT's botctl step (ADR 0036).
+const FIRSTBOOT_BOTCTL: &str = r#"ctl=/usr/local/bin/botctl
+curl -fsS --retry 10 --retry-delay 5 --retry-all-errors --cacert /etc/superbot/ca.pem -o "$ctl.new" "{url}/v1/botctl"
+echo "{sha}  $ctl.new" | sha256sum -c -
+chmod 755 "$ctl.new"
+mv "$ctl.new" "$ctl"
+"#;
 
 const UNIT: &str = "[Unit]
 Description=SuperBot machine agent
@@ -1280,6 +1341,18 @@ mod tests {
             with(&[("MACHINE_AGENT_PORT", "7000")]).is_err(),
             "agent settings alone are a mistake"
         );
+        assert!(with(&[("MACHINE_ENROLL_TIMEOUT_MINUTES", "20")]).is_err());
+        for (raw, ok) in [("", Some(15)), ("5", Some(5)), ("60", Some(60)), ("4", None), ("61", None), ("soon", None)] {
+            let vars: &'static [(&'static str, &'static str)] = Box::leak(Box::new([
+                ("MACHINE_CONTROL_URL", "https://cp.example:8443"),
+                ("MACHINE_ENROLL_TIMEOUT_MINUTES", raw),
+            ]));
+            assert_eq!(
+                with(vars).ok().flatten().map(|e| e.enroll_timeout_ms / 60_000),
+                ok,
+                "{raw}"
+            );
+        }
         let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443/")])
             .unwrap()
             .unwrap();
@@ -1392,16 +1465,64 @@ mod tests {
         );
         e.agent = Some((Bytes::from_static(b"agent"), "ab".repeat(32)));
         let ud = e.user_data(&m, "sbe_tok");
+        let script = firstboot_in(&ud);
+        for want in [
+            format!("echo \"{}  $bin.new\" | sha256sum -c -", "ab".repeat(32)),
+            "--cacert /etc/superbot/ca.pem -o \"$bin.new\" \"https://127.0.0.1:1/v1/agent\"".into(),
+            "SUPERBOT_ENROLL_TOKEN_FILE=/etc/superbot/enroll-token SUPERBOT_STATE_DIR=/var/lib/superbot-machine \"$bin\" enroll".into(),
+            "systemctl enable superbot-machine".into(),
+            "rm -f /var/lib/cloud/instance/user-data.txt".into(),
+        ] {
+            assert!(script.contains(&want), "{want}\n{script}");
+        }
+        let order = ["sha256sum -c", "systemctl enable", "\" enroll;", "rm -f /var/lib/cloud", "systemctl start"]
+            .map(|s| script.find(s).unwrap_or_else(|| panic!("{s}")));
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "verify, install, enroll, scrub, start: {order:?}");
         assert!(
-            ud.contains(&format!(
-                "echo '{}  /usr/local/bin/superbot-machine.new' | sha256sum -c -",
-                "ab".repeat(32)
-            )),
+            ud.ends_with(&format!("runcmd:\n  - [{FIRSTBOOT_PATH}]\n")),
             "{ud}"
         );
-        assert!(
-            ud.contains("--cacert /etc/superbot/ca.pem"),
-            "the download trusts only our CA"
+        assert_eq!(
+            ud.matches("sbe_tok").count(),
+            1,
+            "the token is written to its file only, never into a command"
         );
+        assert!(!script.contains("set -x"), "the script's output is logged");
+        assert!(!script.contains("botctl"), "no botctl to install");
+        assert!(!script.contains("{botctl}"), "{script}");
+        let check = std::process::Command::new("sh")
+            .args(["-n", "-c", &script])
+            .output()
+            .unwrap();
+        assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stderr));
+
+        e.botctl = Some((Bytes::from_static(b"botctl"), "cd".repeat(32)));
+        let script = firstboot_in(&e.user_data(&m, "sbe_tok"));
+        for want in [
+            format!("echo \"{}  $ctl.new\" | sha256sum -c -", "cd".repeat(32)),
+            "--cacert /etc/superbot/ca.pem -o \"$ctl.new\" \"https://127.0.0.1:1/v1/botctl\"".into(),
+            format!("echo \"{}  $bin.new\" | sha256sum -c -", "ab".repeat(32)),
+        ] {
+            assert!(script.contains(&want), "{want}\n{script}");
+        }
+        let order = ["/v1/botctl", "/v1/agent", "systemctl start"]
+            .map(|s| script.find(s).unwrap_or_else(|| panic!("{s}")));
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "botctl before the agent starts: {order:?}");
+        let check = std::process::Command::new("sh")
+            .args(["-n", "-c", &script])
+            .output()
+            .unwrap();
+        assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stderr));
+    }
+
+    /// The first-boot script as cloud-init will write it.
+    fn firstboot_in(ud: &str) -> String {
+        let at = ud.find(&format!("path: {FIRSTBOOT_PATH}")).unwrap();
+        ud[at..]
+            .lines()
+            .skip(3)
+            .take_while(|l| l.starts_with("      "))
+            .map(|l| format!("{}\n", &l[6..]))
+            .collect()
     }
 }

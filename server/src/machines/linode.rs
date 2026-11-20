@@ -2,7 +2,10 @@
 //! production; tests point it at a local stand-in. The token goes in the
 //! Authorization header and nowhere else: not in errors, logs, or `Debug`.
 
-use super::provider::{CreateSpec, Fut, MachineProvider, ProviderError, ProviderMachine};
+use super::provider::{
+    CreateSpec, FirewallDevices, FirewallRule, Fut, MachineProvider, ProviderError, ProviderFirewall,
+    ProviderMachine,
+};
 use base64::Engine;
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
@@ -76,6 +79,110 @@ impl Linode {
         }
         Err(error(status, &v))
     }
+
+    /// Every item of a paged list.
+    async fn all(&self, path: &str, filter: Option<&Value>) -> Result<Vec<Value>, ProviderError> {
+        let mut out = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let v = self
+                .call(
+                    Method::GET,
+                    &format!("{path}?page={page}&page_size={PAGE_SIZE}"),
+                    filter,
+                    None,
+                )
+                .await?;
+            out.extend(v["data"].as_array().cloned().unwrap_or_default());
+            if page >= v["pages"].as_u64().unwrap_or(1) as u32 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// The firewall's devices that are Linodes, as (device id, Linode id).
+    /// Every device behind the firewall: `(device id, Linode id)` for Linodes, None
+    /// for anything else.
+    async fn devices(&self, id: &str) -> Result<Vec<Option<(u64, String)>>, ProviderError> {
+        Ok(self
+            .all(&format!("/networking/firewalls/{}/devices", path_id(id)?), None)
+            .await?
+            .iter()
+            .map(|d| {
+                (d["entity"]["type"] == "linode")
+                    .then(|| Some((d["id"].as_u64()?, d["entity"]["id"].as_u64()?.to_string())))
+                    .flatten()
+            })
+            .collect())
+    }
+
+    async fn linode_devices(&self, id: &str) -> Result<Vec<(u64, String)>, ProviderError> {
+        Ok(self.devices(id).await?.into_iter().flatten().collect())
+    }
+}
+
+/// Our rules as Linode's: inbound dropped but for each rule, outbound open.
+fn rules_body(rules: &[FirewallRule]) -> Value {
+    let inbound: Vec<Value> = rules
+        .iter()
+        .map(|r| {
+            let (v6, v4): (Vec<&String>, Vec<&String>) =
+                r.sources.iter().partition(|s| s.contains(':'));
+            let mut addresses = json!({});
+            if !v4.is_empty() {
+                addresses["ipv4"] = json!(v4);
+            }
+            if !v6.is_empty() {
+                addresses["ipv6"] = json!(v6);
+            }
+            json!({ "label": r.label, "action": "ACCEPT", "protocol": "TCP", "ports": r.ports, "addresses": addresses })
+        })
+        .collect();
+    json!({ "inbound_policy": "DROP", "outbound_policy": "ACCEPT", "inbound": inbound, "outbound": [] })
+}
+
+/// Linode's rules as ours, or None if they aren't of the shape we make.
+fn our_rules(r: &Value) -> Option<Vec<FirewallRule>> {
+    if r["inbound_policy"] != "DROP"
+        || r["outbound_policy"] != "ACCEPT"
+        || r["outbound"].as_array().is_some_and(|a| !a.is_empty())
+    {
+        return None;
+    }
+    r["inbound"]
+        .as_array()?
+        .iter()
+        .map(|x| {
+            if x["action"] != "ACCEPT" || x["protocol"] != "TCP" {
+                return None;
+            }
+            let mut sources = Vec::new();
+            for family in ["ipv4", "ipv6"] {
+                for a in x["addresses"][family].as_array().into_iter().flatten() {
+                    sources.push(super::firewall::cidr(a.as_str()?).ok()?);
+                }
+            }
+            sources.sort();
+            sources.dedup();
+            Some(FirewallRule {
+                label: x["label"].as_str()?.into(),
+                ports: x["ports"].as_str()?.replace(' ', ""),
+                sources,
+            })
+        })
+        .collect()
+}
+
+fn firewall(v: &Value) -> Result<ProviderFirewall, ProviderError> {
+    let id = v["id"]
+        .as_u64()
+        .ok_or_else(|| ProviderError::Transport("Linode sent a firewall we couldn't read".into()))?;
+    Ok(ProviderFirewall {
+        id: id.to_string(),
+        label: v["label"].as_str().unwrap_or_default().into(),
+        rules: our_rules(&v["rules"]),
+        enabled: v["status"] == "enabled",
+    })
 }
 
 /// Linode's `{"errors": [{"field", "reason"}]}`, as one of ours.
@@ -190,6 +297,9 @@ impl MachineProvider for Linode {
                     "user_data": base64::engine::general_purpose::STANDARD.encode(ud)
                 });
             }
+            if let Some(fw) = &spec.firewall_id {
+                body["firewall_id"] = json!(path_id(fw)?.parse::<u64>().unwrap_or_default());
+            }
             machine(
                 &self
                     .call(Method::POST, "/linode/instances", None, Some(&body))
@@ -216,24 +326,11 @@ impl MachineProvider for Linode {
     fn list<'a>(&'a self, tag: &'a str) -> Fut<'a, Vec<ProviderMachine>> {
         Box::pin(async move {
             let filter = json!({ "tags": tag });
-            let mut out = Vec::new();
-            for page in 1..=MAX_PAGES {
-                let v = self
-                    .call(
-                        Method::GET,
-                        &format!("/linode/instances?page={page}&page_size={PAGE_SIZE}"),
-                        Some(&filter),
-                        None,
-                    )
-                    .await?;
-                for m in v["data"].as_array().map(Vec::as_slice).unwrap_or_default() {
-                    out.push(machine(m)?);
-                }
-                if page >= v["pages"].as_u64().unwrap_or(1) as u32 {
-                    break;
-                }
-            }
-            Ok(out)
+            self.all("/linode/instances", Some(&filter))
+                .await?
+                .iter()
+                .map(machine)
+                .collect()
         })
     }
 
@@ -297,6 +394,143 @@ impl MachineProvider for Linode {
                 .call(
                     Method::DELETE,
                     &format!("/linode/instances/{}", path_id(id)?),
+                    None,
+                    None,
+                )
+                .await
+            {
+                Ok(_) | Err(ProviderError::NotFound) => Ok(()),
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    fn find_firewall<'a>(&'a self, label: &'a str) -> Fut<'a, Option<ProviderFirewall>> {
+        Box::pin(async move {
+            let filter = json!({ "label": label });
+            for f in self.all("/networking/firewalls", Some(&filter)).await? {
+                let f = firewall(&f)?;
+                if f.label == label {
+                    return Ok(Some(f));
+                }
+            }
+            Ok(None)
+        })
+    }
+
+    fn get_firewall<'a>(&'a self, id: &'a str) -> Fut<'a, ProviderFirewall> {
+        Box::pin(async move {
+            let v = self
+                .call(
+                    Method::GET,
+                    &format!("/networking/firewalls/{}", path_id(id)?),
+                    None,
+                    None,
+                )
+                .await?;
+            firewall(&v)
+        })
+    }
+
+    fn create_firewall<'a>(
+        &'a self,
+        label: &'a str,
+        tags: &'a [String],
+        rules: &'a [FirewallRule],
+    ) -> Fut<'a, ProviderFirewall> {
+        Box::pin(async move {
+            let body = json!({ "label": label, "tags": tags, "rules": rules_body(rules) });
+            firewall(
+                &self
+                    .call(Method::POST, "/networking/firewalls", None, Some(&body))
+                    .await?,
+            )
+        })
+    }
+
+    fn set_firewall_rules<'a>(&'a self, id: &'a str, rules: &'a [FirewallRule]) -> Fut<'a, ()> {
+        Box::pin(async move {
+            self.call(
+                Method::PUT,
+                &format!("/networking/firewalls/{}/rules", path_id(id)?),
+                None,
+                Some(&rules_body(rules)),
+            )
+            .await
+            .map(drop)
+        })
+    }
+
+    fn enable_firewall<'a>(&'a self, id: &'a str) -> Fut<'a, ()> {
+        Box::pin(async move {
+            self.call(
+                Method::PUT,
+                &format!("/networking/firewalls/{}", path_id(id)?),
+                None,
+                Some(&json!({ "status": "enabled" })),
+            )
+            .await
+            .map(drop)
+        })
+    }
+
+    fn firewall_devices<'a>(&'a self, id: &'a str) -> Fut<'a, FirewallDevices> {
+        Box::pin(async move {
+            let mut out = FirewallDevices::default();
+            for d in self.devices(id).await? {
+                match d {
+                    Some((_, linode)) => out.machines.push(linode),
+                    None => out.others += 1,
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    fn attach_firewall<'a>(&'a self, id: &'a str, machine: &'a str) -> Fut<'a, ()> {
+        Box::pin(async move {
+            let linode: u64 = path_id(machine)?.parse().unwrap_or_default();
+            self.call(
+                Method::POST,
+                &format!("/networking/firewalls/{}/devices", path_id(id)?),
+                None,
+                Some(&json!({ "id": linode, "type": "linode" })),
+            )
+            .await
+            .map(drop)
+        })
+    }
+
+    fn detach_firewall<'a>(&'a self, id: &'a str, machine: &'a str) -> Fut<'a, ()> {
+        Box::pin(async move {
+            let devices = match self.linode_devices(id).await {
+                Err(ProviderError::NotFound) => return Ok(()),
+                d => d?,
+            };
+            let Some((device, _)) = devices.into_iter().find(|(_, l)| l == machine) else {
+                return Ok(());
+            };
+            match self
+                .call(
+                    Method::DELETE,
+                    &format!("/networking/firewalls/{}/devices/{device}", path_id(id)?),
+                    None,
+                    None,
+                )
+                .await
+            {
+                Ok(_) | Err(ProviderError::NotFound) => Ok(()),
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    fn delete_firewall<'a>(&'a self, id: &'a str) -> Fut<'a, ()> {
+        Box::pin(async move {
+            match self
+                .call(
+                    Method::DELETE,
+                    &format!("/networking/firewalls/{}", path_id(id)?),
                     None,
                     None,
                 )
@@ -412,6 +646,80 @@ mod tests {
                     }
                 }),
             )
+            .route(
+                "/v4/networking/firewalls",
+                post(move |State(s): State<Seen>, h: HeaderMap, Json(b): Json<Value>| async move {
+                    record(&s, "POST", "/networking/firewalls".into(), &h, b.clone());
+                    if b["label"] == "taken-fw" {
+                        return (StatusCode::BAD_REQUEST, Json(json!({ "errors": [{ "field": "label", "reason": "Label must be unique" }] })));
+                    }
+                    (StatusCode::OK, Json(json!({ "id": 77, "label": b["label"], "rules": b["rules"], "status": "enabled", "tags": b["tags"] })))
+                })
+                .get(move |State(s): State<Seen>, h: HeaderMap, Query(q): Query<HashMap<String, String>>| async move {
+                    record(&s, "GET", format!("/networking/firewalls?page={}&page_size={}", q["page"], q["page_size"]), &h, Value::Null);
+                    // As Linode answers: its own spellings of addresses and ports, and
+                    // a near-namesake the filter would have matched as a prefix.
+                    let ours = json!({ "id": 77, "label": "superbot-fw", "status": "disabled", "rules": {
+                        "inbound_policy": "DROP", "outbound_policy": "ACCEPT", "outbound": [], "version": 3,
+                        "inbound": [{ "label": "agent-from-control-plane", "action": "ACCEPT", "protocol": "TCP", "ports": "7443",
+                            "addresses": { "ipv4": ["192.0.2.1/32"], "ipv6": ["2001:DB8::1/128"] } }] } });
+                    let other = json!({ "id": 78, "label": "superbot-fw-old", "status": "enabled", "rules": { "inbound_policy": "ACCEPT", "outbound_policy": "ACCEPT", "inbound": [], "outbound": [] } });
+                    (StatusCode::OK, Json(json!({ "data": [other, ours], "page": 1, "pages": 1, "results": 2 })))
+                }),
+            )
+            .route(
+                "/v4/networking/firewalls/{id}",
+                axum::routing::delete(move |State(s): State<Seen>, h: HeaderMap, Path(id): Path<u64>| async move {
+                    record(&s, "DELETE", format!("/networking/firewalls/{id}"), &h, Value::Null);
+                    match id {
+                        77 => (StatusCode::OK, Json(json!({}))),
+                        _ => (StatusCode::NOT_FOUND, Json(json!({ "errors": [{ "reason": "Not found" }] }))),
+                    }
+                })
+                .put(move |State(s): State<Seen>, h: HeaderMap, Path(id): Path<u64>, Json(b): Json<Value>| async move {
+                    record(&s, "PUT", format!("/networking/firewalls/{id}"), &h, b);
+                    (StatusCode::OK, Json(json!({})))
+                })
+                .get(move |State(s): State<Seen>, h: HeaderMap, Path(id): Path<u64>| async move {
+                    record(&s, "GET", format!("/networking/firewalls/{id}"), &h, Value::Null);
+                    match id {
+                        78 => (StatusCode::OK, Json(json!({ "id": 78, "label": "superbot-fw-old", "status": "enabled",
+                            "rules": { "inbound_policy": "ACCEPT", "outbound_policy": "ACCEPT", "inbound": [], "outbound": [] } }))),
+                        _ => (StatusCode::NOT_FOUND, Json(json!({ "errors": [{ "reason": "Not found" }] }))),
+                    }
+                }),
+            )
+            .route(
+                "/v4/networking/firewalls/{id}/rules",
+                axum::routing::put(move |State(s): State<Seen>, h: HeaderMap, Path(id): Path<u64>, Json(b): Json<Value>| async move {
+                    record(&s, "PUT", format!("/networking/firewalls/{id}/rules"), &h, b);
+                    (StatusCode::OK, Json(json!({})))
+                }),
+            )
+            .route(
+                "/v4/networking/firewalls/{id}/devices",
+                get(move |State(s): State<Seen>, h: HeaderMap, Path(id): Path<u64>| async move {
+                    record(&s, "GET", format!("/networking/firewalls/{id}/devices"), &h, Value::Null);
+                    match id {
+                        77 => (StatusCode::OK, Json(json!({ "data": [
+                            { "id": 9001, "entity": { "id": 7, "type": "linode", "label": "superbot-m7" } },
+                            { "id": 9002, "entity": { "id": 3, "type": "nodebalancer", "label": "lb" } },
+                        ], "page": 1, "pages": 1, "results": 2 }))),
+                        _ => (StatusCode::NOT_FOUND, Json(json!({ "errors": [{ "reason": "Not found" }] }))),
+                    }
+                })
+                .post(move |State(s): State<Seen>, h: HeaderMap, Path(id): Path<u64>, Json(b): Json<Value>| async move {
+                    record(&s, "POST", format!("/networking/firewalls/{id}/devices"), &h, b);
+                    (StatusCode::OK, Json(json!({ "id": 9003 })))
+                }),
+            )
+            .route(
+                "/v4/networking/firewalls/{id}/devices/{device}",
+                axum::routing::delete(move |State(s): State<Seen>, h: HeaderMap, Path((id, device)): Path<(u64, u64)>| async move {
+                    record(&s, "DELETE", format!("/networking/firewalls/{id}/devices/{device}"), &h, Value::Null);
+                    (StatusCode::OK, Json(json!({})))
+                }),
+            )
             .with_state(seen.clone());
         tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
         (
@@ -429,6 +737,7 @@ mod tests {
             tags: vec!["superbot".into(), "superbot-user-u1".into()],
             authorized_keys: vec!["ssh-ed25519 AAAAC3Nza test@example".into()],
             user_data: None,
+            firewall_id: None,
         }
     }
 
@@ -553,6 +862,148 @@ mod tests {
         for text in [e.to_string(), format!("{e:?}"), format!("{unreachable:?}")] {
             assert!(!text.contains(TOKEN), "{text}");
         }
+    }
+
+    #[tokio::test]
+    async fn firewalls() {
+        let (api, seen) = fake_api().await;
+        let rules = vec![
+            FirewallRule {
+                label: "agent-from-control-plane".into(),
+                ports: "7443".into(),
+                sources: vec!["192.0.2.1/32".into(), "2001:db8::1/128".into()],
+            },
+            FirewallRule {
+                label: "ssh-from-operators".into(),
+                ports: "22".into(),
+                sources: vec!["203.0.113.0/24".into()],
+            },
+        ];
+        let made = api
+            .create_firewall("superbot-fw", &["superbot".into()], &rules)
+            .await
+            .unwrap();
+        assert_eq!(
+            (made.id.as_str(), made.rules.as_deref()),
+            ("77", Some(&rules[..])),
+            "what we sent reads back as ours"
+        );
+        assert_eq!(
+            api.create_firewall("taken-fw", &[], &rules).await,
+            Err(ProviderError::LabelTaken)
+        );
+        let found = api.find_firewall("superbot-fw").await.unwrap().unwrap();
+        assert_eq!(found.id, "77", "the exact label, not a namesake");
+        assert!(made.enabled && !found.enabled, "a disabled one is told apart");
+        assert_eq!(
+            found.rules,
+            Some(vec![rules[0].clone()]),
+            "Linode's spelling of an address is the same address"
+        );
+        assert_eq!(api.find_firewall("superbot-fw-x").await.unwrap(), None);
+        let old = api.get_firewall("78").await.unwrap();
+        assert_eq!(
+            (old.label.as_str(), old.enabled, old.rules),
+            ("superbot-fw-old", true, None),
+            "an open inbound policy isn't ours"
+        );
+        assert_eq!(api.get_firewall("79").await, Err(ProviderError::NotFound));
+        api.set_firewall_rules("77", &rules[..1]).await.unwrap();
+        api.enable_firewall("77").await.unwrap();
+        assert_eq!(
+            api.firewall_devices("77").await.unwrap(),
+            FirewallDevices {
+                machines: vec!["7".into()],
+                others: 1
+            },
+            "Linodes by id; anything else counted"
+        );
+        api.attach_firewall("77", "8").await.unwrap();
+        api.detach_firewall("77", "7").await.unwrap();
+        api.detach_firewall("77", "8").await.unwrap();
+        api.detach_firewall("79", "7").await.unwrap();
+        api.delete_firewall("77").await.unwrap();
+        api.delete_firewall("78").await.unwrap();
+        assert!(api.attach_firewall("77", "../7").await.is_err());
+        let behind = CreateSpec {
+            firewall_id: Some("77".into()),
+            ..spec("superbot-m9")
+        };
+        api.create(&behind).await.unwrap();
+
+        let seen = seen.lock().unwrap();
+        let calls: Vec<(&str, &str)> = seen
+            .iter()
+            .map(|(m, p, _, _)| (m.as_str(), p.as_str()))
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                ("POST", "/networking/firewalls"),
+                ("POST", "/networking/firewalls"),
+                ("GET", "/networking/firewalls?page=1&page_size=500"),
+                ("GET", "/networking/firewalls?page=1&page_size=500"),
+                ("GET", "/networking/firewalls/78"),
+                ("GET", "/networking/firewalls/79"),
+                ("PUT", "/networking/firewalls/77/rules"),
+                ("PUT", "/networking/firewalls/77"),
+                ("GET", "/networking/firewalls/77/devices"),
+                ("POST", "/networking/firewalls/77/devices"),
+                ("GET", "/networking/firewalls/77/devices"),
+                ("DELETE", "/networking/firewalls/77/devices/9001"),
+                ("GET", "/networking/firewalls/77/devices"),
+                ("GET", "/networking/firewalls/79/devices"),
+                ("DELETE", "/networking/firewalls/77"),
+                ("DELETE", "/networking/firewalls/78"),
+                ("POST", "/linode/instances"),
+            ],
+            "detach finds the device for the Linode; one not behind it is left alone"
+        );
+        assert_eq!(
+            seen[0].3,
+            json!({ "label": "superbot-fw", "tags": ["superbot"], "rules": {
+                "inbound_policy": "DROP", "outbound_policy": "ACCEPT", "outbound": [],
+                "inbound": [
+                    { "label": "agent-from-control-plane", "action": "ACCEPT", "protocol": "TCP", "ports": "7443",
+                      "addresses": { "ipv4": ["192.0.2.1/32"], "ipv6": ["2001:db8::1/128"] } },
+                    { "label": "ssh-from-operators", "action": "ACCEPT", "protocol": "TCP", "ports": "22",
+                      "addresses": { "ipv4": ["203.0.113.0/24"] } },
+                ] } })
+        );
+        assert_eq!(seen[2].2.as_deref(), Some(r#"{"label":"superbot-fw"}"#));
+        assert_eq!(seen[6].3["inbound"].as_array().unwrap().len(), 1);
+        assert_eq!(seen[7].3, json!({ "status": "enabled" }));
+        assert_eq!(seen[9].3, json!({ "id": 8, "type": "linode" }));
+        assert_eq!(seen[16].3["firewall_id"], json!(77), "behind it from the first boot");
+    }
+
+    #[test]
+    fn only_our_shape_of_rules_reads_as_ours() {
+        let base = json!({ "inbound_policy": "DROP", "outbound_policy": "ACCEPT", "outbound": [], "inbound": [
+            { "label": "a", "action": "ACCEPT", "protocol": "TCP", "ports": "7443", "addresses": { "ipv4": ["192.0.2.1/32"] } }] });
+        assert!(our_rules(&base).is_some());
+        for (path, v) in [
+            ("/inbound_policy", json!("ACCEPT")),
+            ("/outbound_policy", json!("DROP")),
+            ("/outbound", json!([{ "action": "DROP", "protocol": "TCP" }])),
+            ("/inbound/0/action", json!("DROP")),
+            ("/inbound/0/protocol", json!("UDP")),
+            ("/inbound/0/addresses/ipv4/0", json!("not an address")),
+        ] {
+            let mut r = base.clone();
+            *r.pointer_mut(path).unwrap() = v;
+            assert_eq!(our_rules(&r), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_create_spec_never_shows_its_user_data() {
+        let s = CreateSpec {
+            user_data: Some("enroll-token: sbe_secret".into()),
+            ..spec("superbot-m1")
+        };
+        let d = format!("{s:?}");
+        assert!(!d.contains("sbe_secret") && d.contains("[redacted]"), "{d}");
     }
 
     #[tokio::test]
