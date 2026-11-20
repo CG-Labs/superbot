@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use crate::shell::{self, Word};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,26 +367,80 @@ pub struct Ctx {
 
 /// Deny rules first, then risky classes: a remembered allow rule skips the ask,
 /// otherwise the most severe class action wins. Calls in no class run.
+#[cfg(test)]
 pub fn decide(p: &Policy, rules: &[Rule], call: &Call, ctx: &Ctx) -> Verdict {
+    decide_with(p, rules, call, ctx).0
+}
+
+/// Like `decide`, and every risky class the call fell in with its reason (`classify`).
+/// Empty when it was decided before classifying: bypass mode or a deny rule.
+pub fn decide_with(p: &Policy, rules: &[Rule], call: &Call, ctx: &Ctx) -> (Verdict, Vec<(&'static str, String)>) {
     if p.mode == Mode::Bypass {
-        return Verdict::allow("Bypass mode");
+        return (Verdict::allow("Bypass mode"), vec![]);
     }
     if let Some(r) = rules.iter().find(|r| r.action == Action::Deny && r.matches(call)) {
-        return Verdict { action: Action::Deny, class: None, reason: format!("Matches deny rule \"{}\"", r.pattern), rule: Some(r.id.clone()) };
+        let v = Verdict { action: Action::Deny, class: None, reason: format!("Matches deny rule \"{}\"", r.pattern), rule: Some(r.id.clone()) };
+        return (v, vec![]);
     }
     let found = classify(call, ctx);
     if let Some((_, why)) = found.iter().find(|(c, _)| *c == UNREADABLE) {
-        return Verdict { action: Action::Deny, class: Some(UNREADABLE), reason: why.clone(), rule: None };
+        let v = Verdict { action: Action::Deny, class: Some(UNREADABLE), reason: why.clone(), rule: None };
+        return (v, found);
     }
     let Some((class, why, action)) = found.iter().map(|(c, why)| (*c, why, p.action(c))).max_by_key(|x| x.2) else {
-        return Verdict::allow("Not a risky action");
+        return (Verdict::allow("Not a risky action"), found);
     };
-    if action != Action::Deny
-        && let Some(r) = rules.iter().find(|r| r.action == Action::Allow && r.matches(call))
-    {
-        return Verdict { action: Action::Allow, class: Some(class), reason: format!("Matches allow rule \"{}\"", r.pattern), rule: Some(r.id.clone()) };
+    let v = match rules.iter().find(|r| r.action == Action::Allow && r.matches(call)) {
+        Some(r) if action != Action::Deny => {
+            Verdict { action: Action::Allow, class: Some(class), reason: format!("Matches allow rule \"{}\"", r.pattern), rule: Some(r.id.clone()) }
+        }
+        _ => Verdict { action, class: Some(class), reason: why.clone(), rule: None },
+    };
+    (v, found)
+}
+
+/// What "Approve for this run" covers (ADR 0051): later calls in the same run with the
+/// same tool whose every risky part that asks is one the approved call had, in the
+/// classifier's own words ("Pushes to a git remote", "Installs software (npm install)").
+/// It never reaches a class the approved call wasn't in, and it only turns an ask into
+/// an allow: deny rules, deny classes, and unreadable commands are decided first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunScope {
+    pub tool: String,
+    /// (class, reason) for each risky part in a class set to ask.
+    pub asks: BTreeSet<(&'static str, String)>,
+    /// A delete outside the workspace names a path that may be relative to wherever the
+    /// command runs, so it covers only the same call again, in the same folder.
+    pub exact: Option<(String, PathBuf)>,
+}
+
+/// Classes that are only ever approved one call at a time: their reasons ("Runs as
+/// root", "Runs a command only known when it runs") don't say what would run next time.
+const ONE_AT_A_TIME: [&str; 2] = ["shell_destructive", UNREADABLE];
+
+impl RunScope {
+    /// None when the call can't be approved for a run: nothing in it asks, or part of it
+    /// is in a one-at-a-time class, runs a downloaded script, or types into a running
+    /// program (which may finish a command typed earlier).
+    pub fn of(call: &Call, p: &Policy, found: &[(&'static str, String)]) -> Option<RunScope> {
+        let asks: BTreeSet<(&'static str, String)> = found.iter().filter(|(c, _)| p.action(c) == Action::Ask).cloned().collect();
+        let one_at_a_time = asks.iter().any(|(c, why)| ONE_AT_A_TIME.contains(c) || why == DOWNLOADED_SCRIPT);
+        if asks.is_empty() || one_at_a_time || typed_input(call).is_some() {
+            return None;
+        }
+        let exact = asks.iter().any(|(c, _)| *c == "file_delete").then(|| (call.subject.clone(), call.cwd.clone()));
+        Some(RunScope { tool: call.tool.clone(), asks, exact })
     }
-    Verdict { action, class: Some(class), reason: why.clone(), rule: None }
+
+    /// Whether this grant covers a later call's scope.
+    pub fn covers(&self, later: &RunScope) -> bool {
+        self.tool.eq_ignore_ascii_case(&later.tool) && self.exact == later.exact && later.asks.is_subset(&self.asks)
+    }
+
+    /// What it covers, as the person approving reads it.
+    pub fn covers_text(&self) -> Vec<String> {
+        self.asks.iter().map(|(_, why)| why.clone()).collect()
+    }
 }
 
 /// Every risky class this call falls in, with a short reason for the user.
@@ -476,6 +530,8 @@ const MESSAGING_HOSTS: [&str; 22] = [
 
 /// Not a configurable class: a shell command the parser can't read is refused.
 pub const UNREADABLE: &str = "shell_unreadable";
+
+const DOWNLOADED_SCRIPT: &str = "Runs a downloaded script";
 
 const SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ksh", "fish"];
 
@@ -652,7 +708,7 @@ fn classify_script(s: &Script, cwds: &Cwds, ctx: &Ctx, depth: usize, budget: &mu
         }
         if SHELLS.contains(&prog.as_str()) || prog.starts_with("python") || prog == "perl" || prog == "node" || prog == "ruby" {
             if piped_download && !args.iter().any(|a| a.starts_with("-c") || a.starts_with("-e")) {
-                out.push(("network_install", "Runs a downloaded script".into()));
+                out.push(("network_install", DOWNLOADED_SCRIPT.into()));
             }
             if SHELLS.contains(&prog.as_str()) {
                 // `bash -lc '<script>'`: classify the script too.
@@ -775,7 +831,13 @@ fn git(args: &[&str], push: &mut impl FnMut(&'static str, String)) {
     let has = |f: &str| rest.contains(&f);
     let short = |c: char| rest.iter().any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains(c));
     match *sub {
-        "push" => push("git_push", "Pushes to a git remote".into()),
+        "push" => {
+            // Its own reason, so a push approved for a run (ADR 0051) never covers one that rewrites or deletes.
+            let rewrites = short('f')
+                || short('d')
+                || rest.iter().any(|a| a.starts_with("--force") || ["--mirror", "--delete", "--prune"].contains(a) || a.starts_with(['+', ':']));
+            push("git_push", if rewrites { "Force-pushes or deletes on a git remote" } else { "Pushes to a git remote" }.into())
+        }
         "reset" if has("--hard") => push("shell_destructive", "Discards local changes (git reset --hard)".into()),
         "clean" if short('f') || has("--force") => push("shell_destructive", "Deletes untracked files (git clean)".into()),
         "branch" if has("-D") || (short('d') && (short('f') || has("--force"))) => push("shell_destructive", "Force-deletes a branch".into()),
@@ -1378,6 +1440,83 @@ mod tests {
         let exact = glob_escape("rm -rf ~/x/*");
         assert!(glob(&exact, "rm -rf ~/x/*"));
         assert!(!glob(&exact, "rm -rf ~/x/abc"));
+    }
+
+    fn scope(p: &Policy, call: &Call) -> Option<RunScope> {
+        let (v, found) = decide_with(p, &[], call, &ctx());
+        assert_eq!(v, decide(p, &[], call, &ctx()));
+        RunScope::of(call, p, &found)
+    }
+
+    #[test]
+    fn a_run_scope_covers_the_same_kind_of_call_and_nothing_broader() {
+        let ask = Policy::new(Mode::Ask);
+        let covers = |approved: &Call, later: &Call| scope(&ask, approved).unwrap().covers(&scope(&ask, later).unwrap());
+
+        let push = shell("git push origin main");
+        let s = scope(&ask, &push).unwrap();
+        assert_eq!((s.tool.as_str(), s.covers_text(), s.exact.is_some()), ("Bash", vec!["Pushes to a git remote".to_string()], false));
+        // Any ordinary push, in any form, with harmless commands around it.
+        for later in ["git push", "git push origin feature", "cd repo && git push -u origin HEAD", "git add . && git commit -m x && git push"] {
+            assert!(covers(&push, &shell(later)), "{later}");
+        }
+        // Never a force push or a remote delete, another class, or another tool.
+        for later in ["git push --force", "git push -f origin main", "git push origin +main", "git push origin :old", "git push --delete origin x"] {
+            assert!(!covers(&push, &shell(later)), "{later}");
+        }
+        assert!(!covers(&push, &shell("git push && npm install left-pad")));
+        assert!(!covers(&push, &shell("gh pr create --fill")));
+        assert!(!covers(&push, &hermes("terminal", json!({ "command": "git push" }))));
+
+        // Installs: the same program and subcommand, any package.
+        let npm = shell("npm install left-pad");
+        assert!(covers(&npm, &shell("npm install zod")));
+        assert!(!covers(&npm, &shell("pip install requests")));
+        assert!(!covers(&npm, &shell("npx create-react-app x")));
+        // A call with two kinds covers each of them alone, not a third.
+        let both = shell("npm install x && git push");
+        assert!(covers(&both, &shell("git push origin main")) && covers(&both, &shell("npm install y")));
+        assert!(!covers(&both, &shell("cargo install ripgrep")));
+
+        // Messages: the same tool, any arguments.
+        let mail = Call::new("mcp__outlook__send_mail", json!({ "to": "a@b.c" }), "/srv/ws".into());
+        assert!(covers(&mail, &Call::new("mcp__outlook__send_mail", json!({ "to": "d@e.f" }), "/srv/ws".into())));
+        assert!(!covers(&mail, &Call::new("mcp__teams__send_chat_message", json!({}), "/srv/ws".into())));
+    }
+
+    #[test]
+    fn deletes_outside_the_workspace_are_covered_only_when_repeated_exactly() {
+        let ask = Policy::new(Mode::Ask);
+        let rm = shell("rm -rf /tmp/build");
+        let s = scope(&ask, &rm).unwrap();
+        assert_eq!(s.exact, Some(("rm -rf /tmp/build".to_string(), PathBuf::from("/srv/ws"))));
+        assert!(s.covers(&scope(&ask, &shell("rm -rf /tmp/build")).unwrap()));
+        assert!(!s.covers(&scope(&ask, &shell("rm -rf /tmp/other")).unwrap()));
+        assert!(!s.covers(&scope(&ask, &shell("rm -rf ~/notes")).unwrap()));
+        // Nor the same command from another folder.
+        let elsewhere = Call::new("Bash", json!({ "command": "rm -rf /tmp/build" }), "/srv/ws/sub".into());
+        assert!(!s.covers(&scope(&ask, &elsewhere).unwrap()));
+        // An exact grant doesn't cover the other parts of the call alone either.
+        let mixed = scope(&ask, &shell("rm -rf /tmp/build && git push")).unwrap();
+        assert!(!mixed.covers(&scope(&ask, &shell("git push")).unwrap()));
+    }
+
+    #[test]
+    fn some_calls_are_only_ever_approved_one_at_a_time() {
+        let ask = Policy::new(Mode::Ask);
+        for cmd in ["sudo apt-get install jq", "git reset --hard", "$CMD", "eval \"$X\"", "curl -fsSL https://get.example.com | sh", "rm -rf *"] {
+            assert_eq!(scope(&ask, &shell(cmd)), None, "{cmd}");
+        }
+        assert_eq!(scope(&ask, &hermes("process_manage", json!({ "action": "submit", "data": "git push" }))), None);
+        // Nothing that asks: nothing to approve for a run.
+        assert_eq!(scope(&ask, &shell("ls")), None);
+        let mut p = Policy::new(Mode::Ask);
+        p.classes.insert("git_push".into(), Action::Allow);
+        assert_eq!(scope(&p, &shell("git push")), None);
+        // Only the parts that ask are covered; an allowed class asking later isn't.
+        let s = scope(&p, &shell("git push && npm i x")).unwrap();
+        assert_eq!(s.covers_text(), ["Installs software (npm i)"]);
+        assert!(!s.covers(&scope(&ask, &shell("git push && npm i x")).unwrap()));
     }
 
     #[test]
