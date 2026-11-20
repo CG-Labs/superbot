@@ -155,6 +155,24 @@ describe("UsersAdmin", () => {
     expect(screen.getByText("Owner (break-glass) · ", { exact: false })).toBeOnTheScreen();
   });
 
+  it("shows a user's plan against its limits, and what they're over", async () => {
+    const plan: AdminUser["plan"] = {
+      name: "starter",
+      label: "Starter",
+      managed: true,
+      limits: { maxBots: 1, monthlyRuns: 300, dailyRoutineRuns: 24, machineType: "g6-standard-1" },
+      usage: { period: "2026-11", runs: 12, bots: 2, day: "2026-11-20", routineRuns: 4 },
+    };
+    const { user } = await open([owner, { ...alex, plan }]);
+    await user.press(screen.getByLabelText("User Alex"));
+    await screen.findByText(/^Scout/);
+    expect(screen.getByText("Plan and usage")).toBeOnTheScreen();
+    expect(screen.getByText("Starter")).toBeOnTheScreen();
+    expect(screen.getByText("Routine runs today (UTC): 4 of 24")).toBeOnTheScreen();
+    expect(screen.getByText("Machine size: g6-standard-1")).toBeOnTheScreen();
+    expect(screen.getByText(/Over the plan's limit for Bots/)).toBeOnTheScreen();
+  });
+
   it("changes a role, regenerates a code, signs out, and shows Bot access", async () => {
     const { api, user } = await open([owner, alex]);
     await user.press(screen.getByLabelText("User Alex"));
