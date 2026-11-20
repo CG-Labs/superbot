@@ -786,7 +786,9 @@ summary() {
   if [[ -n "$DOMAIN" ]] && client_installed; then
     app="https://${DOMAIN}/app/"
   fi
-  if [[ -n "$CLIENT_NOT_INSTALLED" ]]; then
+  if [[ -n "$CLIENT_NOT_INSTALLED" ]] && ! client_installed; then
+    app="not served (this run's web client was not installed)"
+  elif [[ -n "$CLIENT_NOT_INSTALLED" && -n "$DOMAIN" ]]; then
     app="$app (still the previous web client: this run's was not installed)"
   fi
   cat <<EOF

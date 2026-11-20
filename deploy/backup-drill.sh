@@ -138,7 +138,8 @@ step "reinstall on the 'new' host (default paths: it knows nothing of the old on
 install_superbot
 NEW_KEY=$(setting SUPERBOT_MASTER_KEY_FILE)
 [[ $(password) != "$OLD_PASSWORD" ]] || fail "reinstall reused the old password"
-if grep -q DrillKeep <<<"$(api "$BASE/api/bots")"; then fail "fresh install already has DrillKeep"; fi
+bots=$(api "$BASE/api/bots") || fail "could not list Bots on the fresh install"
+if grep -q DrillKeep <<<"$bots"; then fail "fresh install already has DrillKeep"; fi
 
 step "restore in the documented order: old .env first, then its key path and DATA_DIR (timed)"
 t0=$(date +%s)

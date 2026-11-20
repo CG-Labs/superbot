@@ -142,7 +142,7 @@ wait "$manual_pid" || fail "manual backup in botd failed"
 after=$(dc exec -T backup sh -c 'ls /backups/superbot-*.tar.gz | wc -l')
 [[ "$after" -eq $((before + 2)) ]] || fail "expected 2 new archives in the backups volume, got $((after - before))"
 # shellcheck disable=SC2016
-dc exec -T backup sh -c 'for f in /backups/superbot-*.tar.gz; do [ "$(tar -tzf "$f" | grep -cx app.sqlite)" -ge 1 ] || exit 1; done' \
+dc exec -T backup sh -c 'for f in /backups/superbot-*.tar.gz; do l=$(tar -tzf "$f") || exit 1; [ "$(printf "%s\n" "$l" | grep -cx app.sqlite)" -ge 1 ] || exit 1; done' \
   || fail "a backup archive is damaged"
 
 log "SSE events stream through Caddy without buffering"
@@ -161,11 +161,13 @@ printf '%s\n' "$SECRET_VALUE" | SUPERBOT_PASSWORD="$PASSWORD" dc exec -T -e SUPE
 secrets=$(curl -fsS "${AUTH[@]}" "$BASE/api/secrets")
 grep -q '"name":"SMOKE_API_KEY"' <<<"$secrets" || fail "saved secret not listed: $secrets"
 if grep -qF "$SECRET_VALUE" <<<"$secrets"; then fail "the API returned a secret value"; fi
-if grep -qF -e "$SECRET_VALUE" -e "$MASTER_KEY" <<<"$(dc logs --no-color botd)"; then fail "a secret reached botd's logs"; fi
+logs=$(dc logs --no-color botd) || fail "could not read botd's logs"
+if grep -qF -e "$SECRET_VALUE" -e "$MASTER_KEY" <<<"$logs"; then fail "a secret reached botd's logs"; fi
 
 log "Backup and restore round trip"
 dc exec -T botd superbot-backup - >"$WORK/backup.tar.gz"
-grep -qx 'app.sqlite' <<<"$(tar -tzf "$WORK/backup.tar.gz")" || fail "archive has no app.sqlite"
+listing=$(tar -tzf "$WORK/backup.tar.gz") || fail "the archive is unreadable"
+grep -qx 'app.sqlite' <<<"$listing" || fail "archive has no app.sqlite"
 mkdir "$WORK/unpacked"
 tar -xzf "$WORK/backup.tar.gz" -C "$WORK/unpacked"
 if grep -rqF -e "$SECRET_VALUE" -e "$MASTER_KEY" "$WORK/unpacked"; then fail "a backup holds a secret or the master key"; fi

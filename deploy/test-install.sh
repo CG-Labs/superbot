@@ -87,11 +87,12 @@ upgrade() { # node build install [flags...]
     >"$T/out" 2>"$T/err" || rc=$?
   grep -q 'SuperBot is installed.' "$T/out" || { cat "$T/out" "$T/err" >&2; fail "no summary (exit $rc)"; }
 }
-loud() { # message
+loud() { # message [app line]
+  local app=${2:-"https://ci.example.com/app/ (still the previous web client: this run's was not installed)"}
   [[ $rc == 3 ]] || { cat "$T/out" "$T/err" >&2; fail "expected exit status 3 for '$1', got $rc"; }
   [[ $(tail -n 2 "$T/err" | sed -n 1p) == "!! $1. Everything else is installed, but /app/ still serves the previous web client, if any." ]] ||
     { cat "$T/err" >&2; fail "no final warning for '$1'"; }
-  grep -qF 'App:      https://ci.example.com/app/ (still the previous web client' "$T/out" || { cat "$T/out" >&2; fail "the summary hides '$1'"; }
+  grep -qxF "  App:      $app" "$T/out" || { cat "$T/out" >&2; fail "the summary hides '$1'"; }
 }
 quiet() {
   [[ $rc == 0 ]] || { cat "$T/out" "$T/err" >&2; fail "expected exit status 0, got $rc"; }
@@ -105,7 +106,11 @@ upgrade yes ok refused
 loud "Web client not installed"
 upgrade yes failed ok
 loud "Web client build failed"
-ok "a refused or failed web client ends the upgrade with a final warning and exit status 3"
+rm "$T/app/index.html"
+upgrade yes ok refused
+loud "Web client not installed" "not served (this run's web client was not installed)"
+echo previous >"$T/app/index.html"
+ok "a refused or failed web client ends the run with a final warning and exit status 3"
 
 upgrade no ok ok
 quiet
