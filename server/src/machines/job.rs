@@ -55,6 +55,9 @@ impl Drop for Group {
     }
 }
 
+/// How long a stopped harness gets between TERM and KILL.
+const STOP_GRACE: Duration = Duration::from_secs(5);
+
 fn kill_group(pid: u32, signal: &str) {
     let _ = std::process::Command::new("kill")
         .args([format!("-{signal}"), "--".into(), format!("-{pid}")])
@@ -197,16 +200,27 @@ async fn run_child(
         });
     }
     let mut stderr = child.stderr.take().expect("piped");
-    let stderr_task = tokio::spawn(async move {
+    let mut stderr_task = tokio::spawn(async move {
         let mut s = String::new();
         let _ = stderr.read_to_string(&mut s).await;
         s
     });
 
-    // JSON lines. Split only on "\n": some harnesses put U+2028 inside JSON strings.
-    let mut lines = BufReader::new(child.stdout.take().expect("piped")).split(b'\n');
+    // Abort is honoured until the end: a harness can close its output and keep running.
     let mut abort = std::pin::pin!(abort);
     let mut aborted = false;
+    let stop = |aborted: &mut bool| {
+        *aborted = true;
+        if let Some(pid) = group.0 {
+            kill_group(pid, "TERM");
+            tokio::spawn(async move {
+                tokio::time::sleep(STOP_GRACE).await;
+                kill_group(pid, "KILL");
+            });
+        }
+    };
+    // JSON lines. Split only on "\n": some harnesses put U+2028 inside JSON strings.
+    let mut lines = BufReader::new(child.stdout.take().expect("piped")).split(b'\n');
     loop {
         tokio::select! {
             line = lines.next_segment() => match line {
@@ -218,21 +232,27 @@ async fn run_child(
                 }
                 _ => break,
             },
-            _ = &mut abort, if !aborted => {
-                aborted = true;
-                if let Some(pid) = group.0 {
-                    kill_group(pid, "TERM");
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                        kill_group(pid, "KILL");
-                    });
-                }
-            }
+            _ = &mut abort, if !aborted => stop(&mut aborted),
         }
     }
-    let status = child.wait().await;
+    let status = loop {
+        tokio::select! {
+            status = child.wait() => break status,
+            _ = &mut abort, if !aborted => stop(&mut aborted),
+        }
+    };
+    // Something it started may still hold stderr open; once stopped, don't wait for it.
+    let stderr = loop {
+        tokio::select! {
+            s = &mut stderr_task => break s.unwrap_or_default(),
+            _ = &mut abort, if !aborted => stop(&mut aborted),
+            _ = tokio::time::sleep(STOP_GRACE * 2), if aborted => {
+                stderr_task.abort();
+                break String::new();
+            }
+        }
+    };
     group.0 = None;
-    let stderr = stderr_task.await.unwrap_or_default();
     let _ = tx
         .send(JobEvent::Exit {
             success: status.as_ref().is_ok_and(|s| s.success()),
@@ -332,6 +352,15 @@ mod tests {
         // Aborted: the whole group stops, so the run ends long before the sleep would.
         let started = std::time::Instant::now();
         let ev = events(&Host::default(), &job("sleep 30 & sleep 30", &dir), true).await;
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(matches!(
+            ev.last(),
+            Some(JobEvent::Exit { success: false, .. })
+        ));
+        // Even once it has closed its output and only waits.
+        let started = std::time::Instant::now();
+        let quiet = job("exec 1>&- 2>&-; sleep 30 & sleep 30", &dir);
+        let ev = events(&Host::default(), &quiet, true).await;
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(matches!(
             ev.last(),
