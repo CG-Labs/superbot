@@ -2898,6 +2898,14 @@ mod tests {
         assert!(db.machines(None).is_empty());
         assert!(db.add_machine(&new).is_ok());
 
+        // An install with tiers but no enrollment (user_version 11) gets enrollment on upgrade.
+        db.c().execute_batch("DROP TABLE machine_certs; DROP TABLE machine_tokens; PRAGMA user_version = 11;").unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        let v: i64 = db.c().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, MIGRATIONS.len() as i64);
+        let tables: i64 = db.c().query_row("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('machine_certs', 'machine_tokens', 'usage_monthly')", [], |r| r.get(0)).unwrap();
+        assert_eq!(tables, 3);
     }
 
     #[test]
