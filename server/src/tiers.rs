@@ -357,6 +357,10 @@ mod tests {
         let t = Tiers::from_env(|k| if k == "TIERS_FILE" { p.clone() } else { String::new() }).unwrap();
         assert_eq!(t.source, p);
         assert!(t.describe().contains("starter (1 routes, default)"), "{}", t.describe());
+        // The example operators copy must stay valid.
+        let shipped = Tiers::parse(include_str!("../../deploy/tiers.example.json"), None).unwrap();
+        assert_eq!(shipped.default_tier().name, "starter");
+        assert!(shipped.all().iter().any(|t| !t.managed()));
         let missing = Tiers::from_env(|k| if k == "TIERS_FILE" { "/nonexistent/tiers.json".into() } else { String::new() }).unwrap_err();
         assert!(missing.starts_with("TIERS_FILE /nonexistent/tiers.json"), "{missing}");
 
