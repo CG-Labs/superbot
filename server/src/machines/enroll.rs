@@ -31,7 +31,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
-use std::path::{Path as FsPath, PathBuf};
+use std::path::Path as FsPath;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -68,8 +68,9 @@ pub struct Enrollment {
     pub agent_port: u16,
     ca: Ca,
     current: RwLock<Arc<ControlCert>>,
-    /// The agent binary and its SHA-256, when it ships next to botd.
-    agent: Option<(PathBuf, String)>,
+    /// The agent binary and its SHA-256, when it ships next to botd. Read once at
+    /// start and shared by every download, so a download costs no new memory.
+    agent: Option<(Bytes, String)>,
 }
 
 impl std::fmt::Debug for Enrollment {
@@ -138,9 +139,10 @@ impl Enrollment {
                 .filter(|p| *p > 0)
                 .ok_or("MACHINE_AGENT_PORT must be 1 to 65535")?,
         };
-        let agent = std::fs::read(bin_dir.join(AGENT_BIN))
-            .ok()
-            .map(|b| (bin_dir.join(AGENT_BIN), sha256_hex(&b)));
+        let agent = std::fs::read(bin_dir.join(AGENT_BIN)).ok().map(|b| {
+            let sha = sha256_hex(&b);
+            (Bytes::from(b), sha)
+        });
         let ca = Ca::from_seed(&cipher.derive(CA_PURPOSE))?;
         Enrollment::new(
             u.as_str().trim_end_matches('/').to_string(),
@@ -159,7 +161,7 @@ impl Enrollment {
         listen: SocketAddr,
         agent_port: u16,
         ca: Ca,
-        agent: Option<(PathBuf, String)>,
+        agent: Option<(Bytes, String)>,
     ) -> Result<Enrollment, String> {
         let current = RwLock::new(Arc::new(control_cert(&ca, &host)?));
         Ok(Enrollment {
@@ -186,6 +188,13 @@ impl Enrollment {
             None,
         )
         .unwrap()
+    }
+
+    /// Serves `binary` as the agent download, as if it shipped next to botd.
+    #[cfg(test)]
+    pub fn with_agent(mut self, binary: &'static [u8]) -> Enrollment {
+        self.agent = Some((Bytes::from_static(binary), sha256_hex(binary)));
+        self
     }
 
     /// A certificate from this CA that botd never recorded.
@@ -713,7 +722,11 @@ async fn rotate(
             .db
             .machine_cert(&c.fingerprint)
             .is_none_or(|now| now.status != "active");
-        let machine_gone = !p.app.db.machine(&m.id).is_some_and(|now| accepting(now.state));
+        let machine_gone = !p
+            .app
+            .db
+            .machine(&m.id)
+            .is_some_and(|now| accepting(now.state));
         if cert_gone || machine_gone {
             return reply(
                 StatusCode::UNAUTHORIZED,
@@ -746,16 +759,13 @@ async fn rotate(
 
 /// `GET /v1/agent`: the agent binary. Public code; cloud-init checks its SHA-256.
 async fn agent_binary(AxState(p): AxState<Arc<Port>>) -> Response {
-    let Some((path, _)) = p.e.agent.clone() else {
+    let Some((bytes, _)) = p.e.agent.clone() else {
         return reply(
             StatusCode::NOT_FOUND,
             "superbot-machine isn't installed next to botd.",
         );
     };
-    match tokio::task::spawn_blocking(move || std::fs::read(path)).await {
-        Ok(Ok(b)) => ([(header::CONTENT_TYPE, "application/octet-stream")], b).into_response(),
-        _ => reply(StatusCode::NOT_FOUND, "superbot-machine couldn't be read."),
-    }
+    ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response()
 }
 
 pub fn router(app: AppState, e: Arc<Enrollment>) -> axum::Router {
@@ -1077,7 +1087,7 @@ mod tests {
             !ud.contains("runcmd"),
             "no download when botd has no agent to serve"
         );
-        e.agent = Some((PathBuf::from("/nowhere"), "ab".repeat(32)));
+        e.agent = Some((Bytes::from_static(b"agent"), "ab".repeat(32)));
         let ud = e.user_data(&m, "sbe_tok");
         assert!(
             ud.contains(&format!(

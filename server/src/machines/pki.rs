@@ -412,6 +412,12 @@ pub struct Peer {
 /// effect without a restart.
 pub type Tls = Arc<dyn Fn() -> Arc<ServerConfig> + Send + Sync>;
 
+/// Connections served at once; more are closed as they arrive. The ports are open to
+/// the internet, so a flood of slow clients mustn't grow without bound.
+const MAX_CONNECTIONS: usize = 256;
+/// The longest a connection lives, slow downloads of the agent included.
+const CONNECTION_LIFETIME: Duration = Duration::from_secs(600);
+
 /// Serves `router` over TLS on `listener`. Each request carries the connection's
 /// `Peer` as an extension. `admit` can drop a connection right after the handshake.
 pub async fn serve(
@@ -420,6 +426,7 @@ pub async fn serve(
     router: axum::Router,
     admit: fn(&Peer) -> bool,
 ) {
+    let open = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (tcp, addr) = match listener.accept().await {
             Ok(c) => c,
@@ -428,8 +435,12 @@ pub async fn serve(
                 continue;
             }
         };
+        let Ok(slot) = open.clone().try_acquire_owned() else {
+            continue;
+        };
         let (tls, router) = (tls.clone(), router.clone());
         tokio::spawn(async move {
+            let _slot = slot;
             let acceptor = tokio_rustls::TlsAcceptor::from(tls());
             let Ok(Ok(stream)) =
                 tokio::time::timeout(Duration::from_secs(10), acceptor.accept(tcp)).await
@@ -453,14 +464,14 @@ pub async fn serve(
                     r
                 },
             );
-            let _ = hyper::server::conn::http1::Builder::new()
+            let conn = hyper::server::conn::http1::Builder::new()
                 .timer(hyper_util::rt::TokioTimer::new())
                 .header_read_timeout(Duration::from_secs(10))
                 .serve_connection(
                     hyper_util::rt::TokioIo::new(stream),
                     hyper_util::service::TowerToHyperService::new(svc),
-                )
-                .await;
+                );
+            let _ = tokio::time::timeout(CONNECTION_LIFETIME, conn).await;
         });
     }
 }

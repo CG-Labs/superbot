@@ -25,6 +25,8 @@ struct Env {
     agent_listener: Option<TcpListener>,
 }
 
+const AGENT: &str = "stand-in for the superbot-machine binary";
+
 /// botd with the fake provider, routing on, and enrollment on a loopback machine port.
 async fn serve() -> Env {
     let machine_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -38,7 +40,7 @@ async fn serve() -> Env {
     let mut cp = ControlPlane::for_tests(p);
     cp.routing = true;
     let e = cp
-        .enroll_with(Enrollment::for_tests(9, mport, aport))
+        .enroll_with(Enrollment::for_tests(9, mport, aport).with_agent(AGENT.as_bytes()))
         .unwrap();
     let cp = Arc::new(cp);
     let shared = cp.clone();
@@ -316,6 +318,38 @@ async fn wait_for_heartbeat(env: &Env) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("the agent never answered");
+}
+
+#[tokio::test]
+async fn new_machines_download_the_agent_botd_hashed() {
+    let env = serve().await;
+    let (_, mid, _) = machine_for(&env, "ada@example.com").await;
+    let ud = env
+        .fake
+        .user_data(&env.app.db.machine(&mid).unwrap().label)
+        .unwrap();
+    assert!(
+        ud.contains(&format!(
+            "echo '{}  /usr/local/bin/superbot-machine.new'",
+            sha(AGENT)
+        )),
+        "{ud}"
+    );
+    let config = pki::client_config(&pki::cert_der(env.e.ca_pem()).unwrap(), None).unwrap();
+    let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(config)
+        .build()
+        .unwrap();
+    let url = format!("{}/v1/agent", env.e.url);
+    let (a, b) = tokio::join!(client.get(&url).send(), client.get(&url).send());
+    for r in [a.unwrap(), b.unwrap()] {
+        assert_eq!(r.status(), 200);
+        assert_eq!(
+            r.bytes().await.unwrap().as_ref(),
+            AGENT.as_bytes(),
+            "the same bytes cloud-init checks"
+        );
+    }
 }
 
 #[tokio::test]
@@ -662,18 +696,22 @@ async fn a_revocation_between_a_rotations_check_and_its_write_wins() {
     assert_eq!(env.app.db.machine(&mid).unwrap().enrollment, "revoked");
     assert_eq!(env.cp.route(&env.app.db, &uid), Err(Refusal::NotEnrolled));
     assert_eq!(
-        raw(&env, Some(&id), "GET", &format!("/v1/machines/{mid}"), Value::Null)
-            .await
-            .unwrap()
-            .0,
+        raw(
+            &env,
+            Some(&id),
+            "GET",
+            &format!("/v1/machines/{mid}"),
+            Value::Null
+        )
+        .await
+        .unwrap()
+        .0,
         401
     );
 
     // Stopped after the check, before its certificates were revoked.
     let (ub, mb, tb) = machine_for(&env, "bea@example.com").await;
-    let idb = agent::enroll(&config(&env, &mb, Some(&tb)))
-        .await
-        .unwrap();
+    let idb = agent::enroll(&config(&env, &mb, Some(&tb))).await.unwrap();
     let checked = env.app.db.machine_cert(&idb.fingerprint).unwrap();
     let (_, csr) = pki::new_request(&mb).unwrap();
     let issued = env.e.issue_unrecorded(&csr, &ub, &mb);
