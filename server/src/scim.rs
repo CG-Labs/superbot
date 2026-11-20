@@ -723,11 +723,15 @@ async fn changed(app: &AppState, a: &Auth, c: &Caller, before_user: &User, befor
         app.db.record(&ev("user.updated").details(json!({ "changes": changes, "tenant": c.token.tenant })));
     }
     match active {
-        Some(true) => app.db.record(&ev("user.enabled").details(json!({ "tenant": c.token.tenant }))),
+        Some(true) => {
+            let resumed = crate::handover::user_enabled(app, by, &after.user.id);
+            app.db.record(&ev("user.enabled").details(json!({ "tenant": c.token.tenant, "routinesResumed": resumed })))
+        }
         Some(false) => {
             a.sso.forget_user(&after.user.id);
             let n = app.db.revoke_user_sessions(&after.user.id, by.actor.id.as_deref().unwrap_or("scim"), "deprovisioned by SCIM");
-            app.db.record(&ev("user.disabled").details(json!({ "sessionsRevoked": n, "tenant": c.token.tenant })));
+            let paused = crate::handover::user_disabled(app, by, &after.user.id);
+            app.db.record(&ev("user.disabled").details(json!({ "sessionsRevoked": n, "routinesPaused": paused, "tenant": c.token.tenant })));
             if let Some(screens) = &app.screens {
                 screens.rotate_all().await;
             }
@@ -906,8 +910,9 @@ pub async fn delete_user(State(app): State<AppState>, Extension(a): Extension<Ar
     }
     a.sso.forget_user(&id);
     let n = app.db.revoke_user_sessions(&id, c.who.actor.id.as_deref().unwrap_or("scim"), "deleted by SCIM");
+    let paused = crate::handover::user_disabled(&app, &c.who, &id);
     app.db.record(&c.who.event("scim.user_deleted").target("user", &id).details(json!({
-        "tenant": c.token.tenant, "externalId": before.external_id, "userName": before.user_name, "sessionsRevoked": n,
+        "tenant": c.token.tenant, "externalId": before.external_id, "userName": before.user_name, "sessionsRevoked": n, "routinesPaused": paused,
     })));
     if before.user.active()
         && let Some(screens) = &app.screens

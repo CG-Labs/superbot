@@ -112,6 +112,9 @@ pub struct App {
     /// With isolated shared Bots: whom each Bot's latest run is for, by Bot. Kept after
     /// the run ends, so whatever it left running stays capped until the next run.
     askers: Mutex<HashMap<String, String>>,
+    /// ROUTINES_ON_ENABLE=resume (ADR 0047): re-enabling a user resumes the routines
+    /// paused when they were disabled. Unset: they stay paused until an admin resumes them.
+    pub resume_routines_on_enable: OnceLock<bool>,
     closing: AtomicBool,
 }
 
@@ -135,6 +138,7 @@ impl App {
             on_machines: Mutex::default(),
             shared_bots: OnceLock::new(),
             askers: Mutex::default(),
+            resume_routines_on_enable: OnceLock::new(),
             closing: AtomicBool::new(false),
         })
     }
@@ -553,6 +557,15 @@ impl App {
             return cant_run("This Bot's id isn't a safe folder name, so it can't run.");
         };
         let by = self.requester(&bot, msg);
+        // A routine queued before its owner or author was disabled doesn't run (ADR 0047).
+        if msg.role == "routine"
+            && let Some((reason, user)) = crate::handover::blocked(&self.db, &bot.owner_id, by.actor.asker.as_deref())
+        {
+            self.give_back_routine(&bot, msg);
+            let e = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied);
+            self.db.record(&e.details(json!({ "reason": reason, "owner": bot.owner_id, "forUser": user, "messageId": msg.id })));
+            return;
+        }
         let isolated = self.shared_bots() == SharedBots::Isolated;
         let for_other = Some(Self::asker_of(&bot, &by)).filter(|a| isolated && *a != bot.owner_id);
         if isolated && let Some((reason, text)) = self.wont_run(&bot, for_other.as_deref()) {

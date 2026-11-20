@@ -40,7 +40,12 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl users                                     List users
   botctl user add <email> ["<name>"] [--role admin|member|readonly]
   botctl user role <user> <admin|member|readonly>  <user> is an id or email
-  botctl user disable <user> | enable <user>       Disabling ends the user's sessions
+  botctl user disable <user> | enable <user>       Disabling ends the user's sessions and pauses the routines
+                                                   that run for them; enabling leaves those paused
+  botctl user routines <user>                      Routines that run for the user, and which are paused
+  botctl user resume-routines <user>               Turn back on the routines paused when they were disabled
+  botctl user handover <user> <to> [--resume]      Give a disabled user's Bots and routines to <to>;
+                                                   --resume turns their paused routines back on
   botctl user tier <user> <tier|default>           Their plan: the models and limits they get
   botctl tiers                                     Every tier, its routes and limits, and the default
   botctl usage [json]                              Everyone's plan, use against its limits, machine size,
@@ -816,6 +821,12 @@ fn run(args: &[String]) -> Result<String, String> {
             let status = if *cmd == "disable" { "disabled" } else { "active" };
             op("PATCH", &format!("/api/users/{}", encode(key)), Some(json!({ "status": status }).to_string()))
         }
+        ["user", "routines", key] => op("GET", &format!("/api/users/{}/routines", encode(key)), None),
+        ["user", "resume-routines", key] => op("POST", &format!("/api/users/{}/routines/resume", encode(key)), None),
+        ["user", "handover", key, rest @ ..] => {
+            let (path, body) = handover_request(key, rest)?;
+            op("POST", &path, Some(body.to_string()))
+        }
         ["user", "code", key, rest @ ..] => {
             let ttl = flag(rest, "--ttl").map(|t| t.parse::<u32>().map_err(|_| "--ttl must be minutes")).transpose()?;
             let body = json!({ "ttlMinutes": ttl }).to_string();
@@ -850,6 +861,20 @@ fn run(args: &[String]) -> Result<String, String> {
     }
 }
 
+/// `user handover <user> <to> [--resume]`: the path and body.
+fn handover_request(key: &str, rest: &[&str]) -> Result<(String, Value), String> {
+    let usage = "Usage: botctl user handover <user> <to> [--resume]";
+    let (to, resume) = match rest {
+        [to] => (*to, false),
+        [to, "--resume"] | ["--resume", to] => (*to, true),
+        _ => return Err(usage.into()),
+    };
+    if to.starts_with("--") {
+        return Err(usage.into());
+    }
+    Ok((format!("/api/users/{}/handover", encode(key)), json!({ "to": to, "resumeRoutines": resume })))
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
@@ -869,6 +894,18 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handover_names_the_disabled_user_and_who_takes_over() {
+        let (path, body) = handover_request("ada@example.com", &["bea@example.com"]).unwrap();
+        assert_eq!(path, "/api/users/ada%40example.com/handover");
+        assert_eq!(body, json!({ "to": "bea@example.com", "resumeRoutines": false }));
+        assert_eq!(handover_request("u1", &["u2", "--resume"]).unwrap().1["resumeRoutines"], true);
+        assert_eq!(handover_request("u1", &["--resume", "u2"]).unwrap().1["to"], "u2");
+        assert!(handover_request("u1", &[]).is_err());
+        assert!(handover_request("u1", &["--resume"]).is_err());
+        assert!(handover_request("u1", &["u2", "u3"]).is_err());
+    }
 
     #[test]
     fn harness_login_takes_extra_arguments_only_after_a_double_dash() {
