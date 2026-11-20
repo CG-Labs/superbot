@@ -183,16 +183,20 @@ $("add-user").addEventListener("submit", async (e) => {
 // Requests for access (ADR 0022)
 
 let requests = [];
+const REQUEST_LIMIT = 1000;
 
 async function loadRequests() {
   const status = $("requests-status").value;
   try {
-    requests = await api("GET", `/api/signups?status=${status}`);
+    requests = await api("GET", `/api/signups?status=${status}&limit=${REQUEST_LIMIT}`);
     $("requests-empty").textContent = status === "pending" ? "Nobody is waiting." : "No requests.";
     $("requests-empty").hidden = requests.length > 0;
+    $("requests-capped").textContent = `Showing the newest ${REQUEST_LIMIT}. Older requests are in the audit log.`;
+    $("requests-capped").hidden = requests.length < REQUEST_LIMIT;
     if (status === "pending") setRequestCount(requests.length);
   } catch (err) {
     requests = [];
+    $("requests-capped").hidden = true;
     $("requests-empty").textContent = err.message;
     $("requests-empty").hidden = false;
   }
@@ -203,7 +207,7 @@ function setRequestCount(n) {
   $("requests-count").textContent = n || "";
 }
 async function refreshRequestCount() {
-  try { setRequestCount((await api("GET", "/api/signups?status=pending")).length); } catch {}
+  try { setRequestCount((await api("GET", `/api/signups?status=pending&limit=${REQUEST_LIMIT}`)).length); } catch {}
 }
 
 function renderRequests() {

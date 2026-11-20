@@ -58,11 +58,12 @@ h2:first-child { margin-top: 8px; }
 .bar label { display: flex; align-items: center; gap: 6px; color: var(--text-dim); }
 .push { margin-left: auto; }
 
-input, select {
+input, select, textarea {
   padding: 7px 10px; border-radius: 10px; border: 1px solid var(--border);
   background: var(--bg-field); color: var(--text); font: inherit; outline: none;
 }
-input:focus, select:focus { border-color: var(--blue-dot); }
+input:focus, select:focus, textarea:focus { border-color: var(--blue-dot); }
+textarea { resize: vertical; min-width: 16em; font-family: ui-monospace, monospace; font-size: 13px; }
 input[type="checkbox"] { padding: 0; }
 input[type="date"] { color-scheme: dark; }
 

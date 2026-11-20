@@ -71,6 +71,7 @@
       </div>
       <div id="requests-list"></div>
       <div class="empty" id="requests-empty" hidden></div>
+      <p class="hint" id="requests-capped" hidden></p>
     </section>
 
     <section id="tab-machines" hidden>
@@ -138,7 +139,7 @@
       <p class="hint">Server-wide API keys and logins. Values are never shown; a person's own secret of the same name wins for their Bots.</p>
       <form class="bar" id="secret-form" autocomplete="off">
         <input id="secret-name" placeholder="NAME" required spellcheck="false" />
-        <input id="secret-value" type="password" placeholder="Value" required autocomplete="new-password" />
+        <textarea id="secret-value" rows="1" placeholder="Value (multi-line keys are fine)" required spellcheck="false" autocomplete="off"></textarea>
         <button type="submit" class="btn primary">Save</button>
       </form>
       <table class="grid">
