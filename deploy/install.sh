@@ -27,9 +27,9 @@ SITE_DIR=${SITE_DIR:-/var/www/superbot-site}
 CLIENT_BASE_URL=/app
 BUILD_CLIENT=true
 DEPLOY_FILES=(superbot.service superbot-backup.sh superbot-restore.sh superbot-backup.service superbot-backup.timer superbot-userctl.sh)
-# Per-user accounts (docs/adr/0037-per-user-unix-accounts.md): "" keeps what .env says.
+# Per-user accounts (docs/adr/0037-per-user-unix-accounts.md): "" keeps what root set up last.
 ISOLATION_MODE=""
-# Unset: what .env says, else /srv/superbot/users (isolation_dir).
+# Unset: the one in root's isolation.conf, else /srv/superbot/users (isolation_dir).
 ISOLATION_DIR=${ISOLATION_DIR:-}
 ISOLATION_GROUP=superbot-users
 ISOLATION_CONF=/etc/superbot/isolation.conf
@@ -635,14 +635,17 @@ backup_unit_fixed() {
 }
 
 # --isolation or --no-isolation, else what .env already says, so an upgrade keeps it.
+# Root-owned and writable by root alone, so botd's account can't steer root through it.
+root_only() {
+  [[ -f "$1" && ! -L "$1" && "$(stat -c '%u' "$1")" == 0 && $(( 0$(stat -c '%a' "$1") & 022 )) == 0 ]]
+}
+
+# On or off: the flag, else whether root's sudoers rule is there. Never .env, which
+# botd's account can write.
 isolation_mode() {
-  local env_file
   if [[ -n "$ISOLATION_MODE" ]]; then
     printf '%s\n' "$ISOLATION_MODE"
-    return
-  fi
-  env_file="$(user_home)/superbot/.env"
-  if [[ -f "$env_file" ]] && grep -qx 'ISOLATION=users' "$env_file"; then
+  elif root_only "$SUDOERS_FILE"; then
     echo users
   else
     echo off
@@ -672,13 +675,11 @@ ProtectProc=invisible
 EOF
 }
 
-# ISOLATION_DIR as given, else the one .env has, so an upgrade keeps a custom folder.
+# ISOLATION_DIR as given, else root's saved one, so an upgrade keeps a custom folder.
 isolation_dir() {
-  local env_file saved
-  env_file="$(user_home)/superbot/.env"
-  saved=""
-  if [[ -f "$env_file" ]]; then
-    saved=$(sed -n 's/^ISOLATION_DIR=//p' "$env_file" | tail -n 1)
+  local saved=""
+  if root_only "$ISOLATION_CONF"; then
+    saved=$(sed -n 's/^ISOLATION_DIR=//p' "$ISOLATION_CONF" | tail -n 1)
   fi
   if [[ -n "$ISOLATION_DIR" ]]; then
     if [[ -n "$saved" && "$saved" != "$ISOLATION_DIR" ]]; then

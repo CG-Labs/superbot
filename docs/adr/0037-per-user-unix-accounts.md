@@ -49,6 +49,8 @@ A Bot can't choose a uid or path: the account comes from the Bot's owner id in b
 
 The unit gets a drop-in: `NoNewPrivileges=false` (sudo is setuid) and `ProtectProc=invisible`, so a run sees only its own account's processes, not other users' command lines or env. botd warns at startup if it can see other accounts' processes. The installer also makes the service home `0750`, so accounts can't read the database, `.env` or the master key.
 
+On an upgrade, the installer keeps isolation on if root's sudoers rule exists, and keeps the folder named in root's `isolation.conf`. It never takes either from `.env`, because botd's account can write `.env`, and the installer runs as root.
+
 ### Layout
 
 | Path (`ISOLATION_DIR`, default `/srv/superbot/users`) | Owner, mode | Holds |

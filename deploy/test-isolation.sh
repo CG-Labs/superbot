@@ -29,7 +29,8 @@ cleanup() {
     userdel "$u" 2>/dev/null || true
     groupdel "$u" 2>/dev/null || true
   done
-  rm -rf "$TEST_DIR" "$LIB" /etc/sudoers.d/superbot-isolation
+  rm -rf "$TEST_DIR" "$LIB" /etc/sudoers.d/superbot-isolation /etc/superbot/isolation.conf \
+    /usr/local/sbin/superbot-userctl /run/superbot-userctl.lock
 }
 cleanup
 trap cleanup EXIT
@@ -51,9 +52,13 @@ SUPERBOT_INSTALL_NO_MAIN=1 source "$repo/deploy/install.sh"
 SUPERBOT_USER=$SVC BIN_DIR=$LIB/bin SHARE_DIR=$LIB/share SYSTEMD_DIR=$LIB/systemd \
   ISOLATION_MODE=users ISOLATION_DIR=$TEST_DIR/users configure_isolation
 grep -qx 'ISOLATION=users' "$home/superbot/.env" || die ".env lacks ISOLATION=users"
-# An upgrade with no flags keeps it on, in the same folder.
+# An upgrade with no flags keeps it on, in the same folder, whatever botd's account
+# wrote into .env meanwhile.
+printf '%s\n' "ISOLATION_DIR=$TEST_DIR/tampered" >>"$home/superbot/.env"
 SUPERBOT_USER=$SVC BIN_DIR=$LIB/bin SHARE_DIR=$LIB/share SYSTEMD_DIR=$LIB/systemd \
   ISOLATION_MODE="" ISOLATION_DIR="" configure_isolation
+[[ ! -e "$TEST_DIR/tampered" ]] || die "the upgrade used ISOLATION_DIR from .env"
+[[ "$(SUPERBOT_USER=$SVC SUDOERS_FILE=/nonexistent isolation_mode)" == off ]] || die "ISOLATION=users in .env alone turned isolation on"
 grep -qx "ISOLATION_DIR=$TEST_DIR/users" "$home/superbot/.env" || die "the upgrade lost ISOLATION_DIR in .env"
 grep -qx "ISOLATION_DIR=$TEST_DIR/users" /etc/superbot/isolation.conf || die "the upgrade lost ISOLATION_DIR in isolation.conf"
 grep -qx 'ProtectProc=invisible' "$LIB/systemd/superbot.service.d/isolation.conf" || die "no drop-in"
