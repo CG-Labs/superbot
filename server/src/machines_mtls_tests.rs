@@ -1117,6 +1117,17 @@ async fn send(env: &Env, bot: &str, text: &str) -> i64 {
     before
 }
 
+async fn wait_for_event(env: &Env, action: &str) -> Vec<Value> {
+    for _ in 0..600 {
+        let evs = events(env, action).await;
+        if !evs.is_empty() {
+            return evs;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("no {action} event");
+}
+
 async fn wait_for_file(path: &std::path::Path) -> String {
     for _ in 0..600 {
         if let Ok(s) = std::fs::read_to_string(path) {
@@ -1230,7 +1241,8 @@ async fn a_users_bot_runs_on_their_machine_with_approvals_and_memory() {
     let said = reply_after(&env, &bot.id, before).await;
     assert_eq!(said, format!("pwd={work} said=approved"));
 
-    // What it learned there is botd's now too.
+    // What it learned there is botd's now too, once the run is over.
+    wait_for_event(&env, "bot.run_finished").await;
     let memory = std::fs::read_to_string(env.app.memory_file(&bot.id).unwrap()).unwrap();
     assert!(memory.contains("- learned on the machine"), "{memory}");
 
