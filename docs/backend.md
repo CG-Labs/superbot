@@ -99,6 +99,7 @@ The policy decides what each tool call does: run, ask a person, or be blocked.
   - `network_install`: `apt`, `brew`, `npm i`, `pip install`, `cargo install`, `curl ... | sh`.
   - `git_push`: any `git push`, and `git config` that changes what a push does (a remote's push refspecs or mirroring, `push.*`, aliases).
 - **Shell commands** are parsed like `sh`/`bash` reads them (`server/src/shell.rs`): every command in pipes, lists, groups, `$(…)`, backticks, `<(…)`, `${…}`, and expanding here-documents is checked. `$'…'` escapes are decoded as bash does. A command whose name is only known at run time (`$CMD`, `gi?`, `{git,x}`, `eval "$X"`, `bash -c "$S"`) counts as `shell_destructive`.
+- **Scripts and hidden code** ([ADR 0053](adr/0053-smarter-command-analysis.md)): a script the command runs from the Bot's workspace (`./x.sh`, `bash x.sh`, `source x.sh`, `python3 x.py`, `node x.js`, Ruby, Perl, PHP) is read (at most 256 KiB, 32 files, never through a link out of the workspace) and classified like the command line; what it finds says where ("Pushes to a git remote (in deploy.sh)"). Inline code (`bash -c`, `python3 -c`, `node -e`, here-documents, here-strings, `echo … | sh`) is checked the same way. Shell is parsed; other languages are scanned for calls that run commands, run code, delete files, or send email. A script that is missing, too big, unreadable, outside the workspace, written by the same command, or on the Bot's own machine asks. Decoded or piped code (`base64 -d | sh`, `xxd -r`, `printf '\x..' | sh`, `eval "$(…)"`, `make | sh`) asks as `shell_destructive`, so it is approved one call at a time.
 - **Folders**: a `cd` may fail or run in a subshell, so a relative path must be inside the workspace from every folder the command could be in. When a folder can't be known (`cd -`, `cd "$D"`, `popd`, `source`), relative deletes count as outside.
 - **Shell tools** may send `command` or `cmd`, as text or argv. A shell call with neither, or two that differ, is denied.
 - **Unreadable commands are denied**, whatever the classes or rules say: unclosed quotes or substitutions, syntax the parser doesn't know, over 1 MiB, nesting over 16 levels, or over 10,000 commands. The Bot is told why, so it can simplify the command.
@@ -128,7 +129,7 @@ botctl rule add allow "npm install*" --bot <bot-id> # this Bot may install npm p
 botctl approvals | botctl approve <id> [--run | --remember] | botctl deny <id>
 ```
 
-Limits: the parser sees commands, not what scripts or programs do inside, so this catches mistakes and prompt injection, not a determined attacker. Bots run as the same OS user as `botd`. See [ADR 0007](adr/0007-approvals.md).
+Limits: the parser sees commands and the scripts they run, not what compiled programs do inside, and its scan of languages other than shell is a heuristic, so this catches mistakes and prompt injection, not a determined attacker. Bots run as the same OS user as `botd`. See [ADR 0007](adr/0007-approvals.md).
 
 ### Harness sandboxes
 
