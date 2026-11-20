@@ -112,6 +112,7 @@ export interface MyUsage {
   period: { key: string; start: number; end: number; source: "subscription" | "calendar" };
   tokens: TokenTotals & { limit: number | null };
   runs: { used: number; limit: number | null };
+  /** `name` is null for a Bot that was deleted, or that you no longer own. */
   byBot: (TokenTotals & { bot: string; name: string | null })[];
   /** Only when your plan lets you pick models (ADR 0033), or for admins. */
   byModel?: (TokenTotals & { model: string | null })[];

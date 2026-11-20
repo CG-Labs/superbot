@@ -49,7 +49,7 @@ export function usageLines(u: MyUsage): string[] {
     `Runs: ${of(u.runs.used, u.runs.limit)}`,
   ];
   if (t.unreportedRuns > 0) lines.push(`${runs(t.unreportedRuns)} didn't report tokens, so ${t.unreportedRuns === 1 ? "it isn't" : "they aren't"} counted.`);
-  for (const b of u.byBot) lines.push(`${b.name ?? "A deleted Bot"}: ${num(b.total)} tokens in ${runs(b.runs)}`);
+  for (const b of u.byBot) lines.push(`${b.name ?? "A Bot that's gone or no longer yours"}: ${num(b.total)} tokens in ${runs(b.runs)}`);
   for (const m of u.byModel ?? []) lines.push(`${m.model ?? "Unnamed model"}: ${num(m.total)} tokens`);
   return lines;
 }

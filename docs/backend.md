@@ -245,7 +245,7 @@ Each run's model tokens are recorded for its Bot's **owner**, the same person it
 
 - **Billing period**: a user with a paid Stripe subscription counts runs and tokens in its period (a yearly plan's months, counted from its start); everyone else in the calendar month, UTC. Routine runs stay per UTC day.
 - **Limit**: once a user's tokens reach their tier's `monthlyTokens`, their Bots' runs are refused until the next period: `bot.run_refused` (reason `tier_token_limit`, with `used`, `limit`, `period`) and a chat message saying when more start. The run that crosses it is audited as `usage.token_limit_reached` (by `billing`, on behalf of the user). Runs already going when the limit is reached finish, so use can pass the limit by those runs.
-- **See it**: `GET /api/me/usage` and `botctl usage me` (yours), the client's Plan screen; `GET /api/users/{key}/usage` and `botctl usage user <user>` (admins); `GET /api/usage` and `botctl usage` add tokens per user.
+- **See it**: `GET /api/me/usage` and `botctl usage me` (yours), the client's Plan screen (offered with or without billing); a Bot you no longer own shows no name; `GET /api/users/{key}/usage` and `botctl usage user <user>` (admins); `GET /api/usage` and `botctl usage` add tokens per user.
 - **Stripe meter** (off by default): set `STRIPE_METER_EVENT` to a Stripe meter's event name, with `STRIPE_SECRET_KEY`, and botd sends each run's tokens (for a user with a Stripe customer) as a meter event every minute, at most once each. A meter event Stripe refuses, or that can't reach it after five tries, is marked failed and audited as `billing.meter_failed`.
 
 ### One Unix account per user

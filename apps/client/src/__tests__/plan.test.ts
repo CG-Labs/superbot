@@ -61,7 +61,7 @@ describe("usage this period (ADR 0048)", () => {
       "Runs: 2 (no limit)",
       "1 run didn't report tokens, so it isn't counted.",
       "Scout: 1,500 tokens in 2 runs",
-      "A deleted Bot: 0 tokens in 1 run",
+      "A Bot that's gone or no longer yours: 0 tokens in 1 run",
     ]);
   });
 

@@ -28,20 +28,20 @@ Rows are charged to the **Bot's owner**, the same person the run counts for (ADR
 A user's period is:
 
 1. their paid subscription's own period (Stripe's `current_period_start` and `current_period_end`, now kept), while now is in it and it's a month or shorter;
-2. otherwise months counted from that subscription's start (or its end, for rows from before starts were kept). This covers a yearly plan, and the days after a period ends before Stripe's renewal event arrives;
+2. otherwise months counted from that period's end once now is past it (the days before Stripe's late renewal event arrives; Stripe starts the next period at that end, so the key doesn't change when it does), else from its start (a yearly plan's months, or from its end for rows from before starts were kept);
 3. with no paid subscription, the calendar month, UTC.
 
 Runs (`monthlyRuns`) and tokens (`monthlyTokens`) both count in it. A subscription period's key is its start, like `2026-11-14T08:00:00Z`, and a calendar month keeps `YYYY-MM`, so runs counted before this change stay counted. Someone who subscribes starts a fresh period, which is what they paid for. Routine runs stay per UTC day.
 
 ### The token limit
 
-Before a run starts, it's refused if the owner's tokens in the period have reached their tier's `monthlyTokens`. The refusal is audited as `bot.run_refused` (reason `tier_token_limit`, with `used`, `limit`, `period`, `periodEnd`) and explained in chat: "The Pro plan allows 5,000,000 model tokens a month, and this month's are used up. More start on the 1st (UTC)." For a subscription period, the message names the period's end date. A routine that keeps firing doesn't repeat the bubble. A refused run takes no run from `monthlyRuns`. The run that crosses the limit is audited as `usage.token_limit_reached`, by `billing` on behalf of the owner.
+Before a run starts, it's refused if the owner's tokens in the period have reached their tier's `monthlyTokens`. The refusal is audited as `bot.run_refused` (reason `tier_token_limit`, with `used`, `limit`, `period`, `periodEnd`) and explained in chat: "The Pro plan allows 5,000,000 model tokens a month, and this month's are used up. More start on the 1st (UTC)." For a subscription period, the message names the period's end date. A routine that keeps firing doesn't repeat the bubble. A refused run takes no run from `monthlyRuns`. The run that crosses the limit is audited as `usage.token_limit_reached`, by `billing` on behalf of the owner, judged in the period the run ends in, where its tokens count.
 
 Tokens are known only when a run ends, so runs already going when the limit is reached finish. Use can therefore pass the limit by what those runs used. Stopping a run midway would lose work the user is paying for. Admins see users past the limit in `GET /api/usage` (`over` includes `monthlyTokens`).
 
 ### Who sees what
 
-- `GET /api/me/usage`: the caller's own period, tokens (in all, by Bot, and by model), and runs. People only, never Bots. There's no parameter naming a user, so nobody can ask for someone else's. On a managed tier, the per-model breakdown is left out for non-admins, as model names are (ADR 0033).
+- `GET /api/me/usage`: the caller's own period, tokens (in all, by Bot, and by model), and runs. People only, never Bots. There's no parameter naming a user, so nobody can ask for someone else's. On a managed tier, the per-model breakdown is left out for non-admins, as model names are (ADR 0033). A Bot the caller no longer owns (given to someone else, or deleted) keeps its usage but shows no name, so its new owner's name for it stays private.
 - `GET /api/users/{key}/usage`: anyone's, admins only (every `users/...` route is Admin in RBAC).
 - `GET /api/usage` (admins) and `GET /api/me/tier` add the period and its tokens.
 - `botctl usage me`, `botctl usage user <user>`, and the client's Plan screen ("Usage this period") read these.

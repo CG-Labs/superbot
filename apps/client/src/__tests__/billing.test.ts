@@ -1,6 +1,6 @@
 import { Linking } from "react-native";
 import { ApiError, SuperBotApi } from "../api";
-import { billingAvailable, checkoutNotice, limitSummary, openBillingPage, subscriptionLine } from "../billing";
+import { billingAvailable, checkoutNotice, limitSummary, openBillingPage, planAvailable, subscriptionLine } from "../billing";
 
 const BASE = "https://bots.example.com";
 
@@ -24,6 +24,20 @@ describe("billing API (ADR 0042)", () => {
     expect(await billingAvailable(api())).toBe(false);
     answer(200, { plan: {}, plans: [], subscription: null, portal: false, canChange: true });
     expect(await billingAvailable(api())).toBe(true);
+  });
+
+  it("offers the Plan screen without billing when the server reports usage (ADR 0048)", async () => {
+    const fake = (billing: unknown, usage: unknown) => ({
+      billing: jest.fn(async () => billing as never),
+      myUsage: jest.fn(async () => {
+        if (usage instanceof Error) throw usage;
+        return usage as never;
+      }),
+    });
+    expect(await planAvailable(fake({ plans: [] }, null))).toBe(true);
+    expect(await planAvailable(fake(null, { tokens: {} }))).toBe(true);
+    expect(await planAvailable(fake(null, null))).toBe(false);
+    expect(await planAvailable(fake(null, new ApiError("boom", 500)))).toBe(false);
   });
 
   it("asks for a checkout of a plan by name, and for the portal", async () => {
