@@ -328,6 +328,7 @@ impl App {
         let by = self.requester(&bot, msg);
         let period = tiers::period(crate::db::now());
         let Some((tier, route)) = self.tier_route(&bot, msg, &by, &period) else { return };
+        let placed_at = self.db.placed_at(&bot.owner_id);
         let Some(place) = self.place(&bot, msg, &by, &period, bin).await else { return };
         let spot = self.spot(&bot, bot_dir.clone(), space, place);
         self.init_bot_files(&bot);
@@ -402,9 +403,7 @@ impl App {
             let mut saw_shell = false;
             let emit = |e| match e {
                 AgentEvent::Session(s) => {
-                    if self.db.bot(&id).and_then(|b| b.session_id).as_deref() != Some(&s) {
-                        self.db.update_bot(&id, BotPatch { session_id: Some(Some(s)), ..Default::default() });
-                    }
+                    self.db.keep_session(&id, &s, placed_at);
                 }
                 AgentEvent::TextDelta(t) => {
                     let draft = self.with_run(&id, |r| { r.draft.push_str(&t); r.draft.clone() });

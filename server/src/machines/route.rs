@@ -333,6 +333,32 @@ mod tests {
     }
 
     #[test]
+    fn a_run_from_before_a_move_keeps_no_session() {
+        let app = crate::runner::test_app();
+        let db = &app.db;
+        let a = db.create_user(None, Some("a@example.com"), "A", crate::rbac::Role::Member).unwrap();
+        let bot = db.create_bot_owned("Bot", "#fff", "waddle", "claude", None, true, &a.id, crate::acl::Visibility::Private);
+        let session = |db: &Db| db.bot(&bot.id).unwrap().session_id;
+        let m = machine(db, &a.id, State::Running);
+        let here = db.placed_at(&a.id);
+        assert!(db.keep_session(&bot.id, "s1", here));
+        assert!(!db.keep_session(&bot.id, "s1", here), "unchanged");
+
+        let before = db.placed_at(&a.id);
+        assert!(db.assign_machine(&m.id, None));
+        db.forget_sessions_of(&a.id);
+        assert!(!db.keep_session(&bot.id, "old", before), "the old host's run");
+        assert_eq!(session(db), None);
+        let there = db.placed_at(&a.id);
+        assert!(there.is_some() && db.keep_session(&bot.id, "s2", there));
+
+        assert!(db.unassign_machine(&m.id));
+        db.forget_sessions_of(&a.id);
+        assert!(!db.keep_session(&bot.id, "old", there));
+        assert_eq!(session(db), None);
+    }
+
+    #[test]
     fn a_machine_must_be_fit_for_the_run() {
         let ok = Heartbeat {
             machine_id: "m".into(),

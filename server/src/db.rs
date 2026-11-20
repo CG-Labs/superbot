@@ -2839,6 +2839,25 @@ impl Db {
         self.c().execute("UPDATE bots SET session_id = NULL WHERE owner_id = ? AND session_id IS NOT NULL", [owner_id]).unwrap_or(0)
     }
 
+    /// When the owner's machine was assigned (None: it isn't). A run reads this as it
+    /// starts and passes it to `keep_session`.
+    pub fn placed_at(&self, owner_id: &str) -> Option<i64> {
+        self.user_machine(owner_id).and_then(|m| m.assigned_at)
+    }
+
+    /// Saves a run's session unless the owner was assigned or unassigned since the run
+    /// began (`placed_at` then), so a run on the old host can't undo `forget_sessions_of`.
+    pub fn keep_session(&self, bot_id: &str, session_id: &str, placed_at: Option<i64>) -> bool {
+        self.c()
+            .execute(
+                "UPDATE bots SET session_id = ?1 WHERE id = ?2 AND session_id IS NOT ?1
+                 AND (SELECT assigned_at FROM machines WHERE user_id = bots.owner_id AND state <> 'destroyed') IS ?3",
+                params![session_id, bot_id, placed_at],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
     /// Records a heartbeat: `Ok(version)` when the agent answered, `Err(why)` when not.
     pub fn machine_agent_seen(&self, machine_id: &str, result: Result<&str, &str>) {
         let _ = match result {
