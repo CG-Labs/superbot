@@ -459,7 +459,7 @@ for (const id of ["au-action", "au-person"]) {
 let policyMode = "ask";
 
 async function loadSettings() {
-  await loadPolicy();
+  await queuePolicy(loadPolicy);
   loadLicense();
   loadSignIn();
   loadSecrets();
@@ -536,10 +536,19 @@ $("license-box").addEventListener("click", async (e) => {
 const ACTIONS = { allow: "Allow", ask: "Ask", deny: "Deny" };
 const TOOLS = { "*": "Any tool", shell: "Shell", file: "Files", web: "Web", mcp: "MCP", other: "Other tools" };
 
-function showPolicy(policy) {
+// Saves run one at a time, so an older answer never replaces a newer one on screen.
+let policyQueue = Promise.resolve();
+const queuePolicy = (fn) => (policyQueue = policyQueue.then(fn, fn));
+
+// The timeout last shown from the server: a different number in the box is a draft to keep.
+let shownTimeout = null;
+
+function showPolicy(policy, { timeout = false } = {}) {
   policyMode = policy.mode;
   $("policy-mode").value = policyMode;
-  $("policy-timeout").value = policy.timeoutMinutes;
+  const box = $("policy-timeout");
+  if (timeout || box.value === "" || box.value === String(shownTimeout)) box.value = policy.timeoutMinutes;
+  shownTimeout = policy.timeoutMinutes;
   for (const sel of document.querySelectorAll("#policy-classes select")) sel.value = policy.classes[sel.dataset.class] || "ask";
 }
 
@@ -566,14 +575,16 @@ async function loadPolicy() {
     </tr>`).join("");
 }
 
-async function patchPolicy(patch, done) {
-  try {
-    showPolicy((await api("PUT", "/api/policy", patch)).policy);
-    notice(done, false);
-  } catch (err) {
-    fail(err);
-    loadPolicy();
-  }
+function patchPolicy(patch, done) {
+  return queuePolicy(async () => {
+    try {
+      showPolicy((await api("PUT", "/api/policy", patch)).policy, { timeout: "timeoutMinutes" in patch });
+      notice(done, false);
+    } catch (err) {
+      fail(err);
+      await loadPolicy();
+    }
+  });
 }
 
 $("policy-classes").addEventListener("change", (e) => {
@@ -591,19 +602,24 @@ $("policy-timeout-save").addEventListener("click", () => {
   patchPolicy({ timeoutMinutes: m }, `Approvals now wait ${m} minute${m === 1 ? "" : "s"}.`);
 });
 
-$("rule-form").addEventListener("submit", async (e) => {
+$("rule-form").addEventListener("submit", (e) => {
   e.preventDefault();
+  const submit = e.target.querySelector("button[type=submit]");
+  if (submit.disabled) return;
+  submit.disabled = true;
   const body = { action: $("rule-action").value, tool: $("rule-tool").value.trim() || "*", pattern: $("rule-pattern").value.trim() };
   const note = $("rule-note").value.trim();
   if (note) body.note = note;
-  try {
-    await api("POST", "/api/policy/rules", body);
-    for (const id of ["rule-tool", "rule-pattern", "rule-note"]) $(id).value = "";
-    notice(`${ACTIONS[body.action]} rule added for all Bots.`, false);
-  } catch (err) {
-    fail(err);
-  }
-  loadPolicy();
+  queuePolicy(async () => {
+    try {
+      await api("POST", "/api/policy/rules", body);
+      for (const id of ["rule-tool", "rule-pattern", "rule-note"]) $(id).value = "";
+      notice(`${ACTIONS[body.action]} rule added for all Bots.`, false);
+    } catch (err) {
+      fail(err);
+    }
+    await loadPolicy();
+  }).finally(() => { submit.disabled = false; });
 });
 
 $("rules-rows").addEventListener("click", async (e) => {
@@ -611,8 +627,10 @@ $("rules-rows").addEventListener("click", async (e) => {
   if (!t) return;
   const row = t.closest("tr");
   if (!confirm(`Delete this rule for all Bots?\n\n${row.querySelector("code").textContent}`)) return;
-  try { await api("DELETE", `/api/policy/rules/${key(row.dataset.rule)}`); } catch (err) { fail(err); }
-  loadPolicy();
+  queuePolicy(async () => {
+    try { await api("DELETE", `/api/policy/rules/${key(row.dataset.rule)}`); } catch (err) { fail(err); }
+    await loadPolicy();
+  });
 });
 
 $("policy-mode").addEventListener("change", async (e) => {
@@ -621,12 +639,14 @@ $("policy-mode").addEventListener("change", async (e) => {
     e.target.value = policyMode;
     return;
   }
-  try {
-    policyMode = (await api("PUT", "/api/policy", { mode })).policy.mode;
-  } catch (err) {
-    fail(err);
-  }
-  e.target.value = policyMode;
+  queuePolicy(async () => {
+    try {
+      showPolicy((await api("PUT", "/api/policy", { mode })).policy);
+    } catch (err) {
+      fail(err);
+      e.target.value = policyMode;
+    }
+  });
 });
 
 async function loadSignIn() {
