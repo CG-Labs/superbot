@@ -908,10 +908,11 @@ pub fn size_for(app: &App, cp: &ControlPlane, user_id: &str) -> Option<(String, 
     Some((name, plan))
 }
 
-/// The provider plan a machine tier means: a `MACHINE_TIERS` entry, or the name of the
-/// size the user's plan gives them.
+/// The provider plan a machine tier means: the name of the size the user's plan gives
+/// them, else a `MACHINE_TIERS` entry. The user's own size wins, since it may be named
+/// after their tier and a `MACHINE_TIERS` entry of that name may be another plan.
 fn plan_of(cp: &ControlPlane, size: &Option<(String, String)>, tier: &str) -> Option<String> {
-    cp.plan(tier).map(String::from).or_else(|| size.as_ref().filter(|(n, _)| n == tier).map(|(_, p)| p.clone()))
+    size.as_ref().filter(|(n, _)| n == tier).map(|(_, p)| p.clone()).or_else(|| cp.plan(tier).map(String::from))
 }
 
 fn tier_choices(cp: &ControlPlane, size: &Option<(String, String)>) -> String {
