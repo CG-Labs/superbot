@@ -34,7 +34,7 @@ const TEMP_DIRS: [&str; 3] = ["/tmp", "/var/tmp", "/dev/shm"];
 
 /// Finds, makes and removes OS users, and stops their processes. The system's on a
 /// machine; tests, which can't make users, use a stand-in or a fake.
-pub trait Accounts: Send + Sync {
+pub trait OsUsers: Send + Sync {
     fn lookup(&self, name: &str) -> Option<Ids>;
     fn add(&self, name: &str, home: &Path) -> Result<Ids, String>;
     /// Whether it deleted the user.
@@ -48,7 +48,7 @@ pub trait Accounts: Send + Sync {
 /// The machine's own users and processes.
 pub struct System;
 
-impl Accounts for System {
+impl OsUsers for System {
     fn lookup(&self, name: &str) -> Option<Ids> {
         runas::lookup(name).map(|(ids, _)| ids)
     }
@@ -140,7 +140,7 @@ fn pids_of(uid: u32) -> Vec<u32> {
 /// deleted or stopped.
 pub struct StandIn;
 
-impl Accounts for StandIn {
+impl OsUsers for StandIn {
     fn lookup(&self, name: &str) -> Option<Ids> {
         runas::lookup(name).map(|(ids, _)| ids)
     }
@@ -316,7 +316,7 @@ pub struct Teammates {
     state_dir: PathBuf,
     /// Tests can't make users: every teammate runs as this existing one instead.
     stand_in: Option<String>,
-    accounts: Arc<dyn Accounts>,
+    os_users: Arc<dyn OsUsers>,
     /// One teammate made or removed at a time, and the record written by one at a time.
     making: Mutex<()>,
     /// Teammates being removed now, by id.
@@ -325,25 +325,25 @@ pub struct Teammates {
 
 impl Teammates {
     pub fn new(root: PathBuf, state_dir: PathBuf, stand_in: Option<String>) -> Teammates {
-        let accounts: Arc<dyn Accounts> = if stand_in.is_some() {
+        let os_users: Arc<dyn OsUsers> = if stand_in.is_some() {
             Arc::new(StandIn)
         } else {
             Arc::new(System)
         };
-        Teammates::with_accounts(root, state_dir, stand_in, accounts)
+        Teammates::with_os_users(root, state_dir, stand_in, os_users)
     }
 
-    pub fn with_accounts(
+    pub fn with_os_users(
         root: PathBuf,
         state_dir: PathBuf,
         stand_in: Option<String>,
-        accounts: Arc<dyn Accounts>,
+        os_users: Arc<dyn OsUsers>,
     ) -> Teammates {
         Teammates {
             root,
             state_dir,
             stand_in,
-            accounts,
+            os_users,
             making: Mutex::new(()),
             leaving: Mutex::default(),
         }
@@ -419,7 +419,7 @@ impl Teammates {
         let mut record = self.record()?;
         // A removal that deleted the user and home but stopped before dropping the
         // record leaves nothing of theirs: start again rather than refuse for good.
-        if record.get(user_id).is_some_and(|s| self.accounts.lookup(&s.user).is_none())
+        if record.get(user_id).is_some_and(|s| self.os_users.lookup(&s.user).is_none())
             && std::fs::symlink_metadata(&home).is_err()
         {
             record.remove(user_id);
@@ -431,19 +431,19 @@ impl Teammates {
                     uid: s.uid,
                     gid: s.gid,
                 };
-                match self.accounts.lookup(&s.user) {
+                match self.os_users.lookup(&s.user) {
                     Some(ids) if s.user == name && ids == want => (want, false),
                     Some(_) => return Err(format!("{} isn't the user it was.", s.user)),
                     None => return Err(format!("{} is gone.", s.user)),
                 }
             }
             None => {
-                if self.stand_in.is_none() && self.accounts.lookup(&name).is_some() {
+                if self.stand_in.is_none() && self.os_users.lookup(&name).is_some() {
                     return Err(format!(
                         "{name} is already a user here, but this agent didn't make it for that teammate."
                     ));
                 }
-                let ids = self.accounts.add(&name, &home)?;
+                let ids = self.os_users.add(&name, &home)?;
                 record.insert(
                     user_id.to_string(),
                     Saved {
@@ -456,7 +456,7 @@ impl Teammates {
                 // on every later try, so one that can't be kept is taken back.
                 if let Err(e) = check(ids).and_then(|_| self.save(&record)) {
                     if self.stand_in.is_none()
-                        && let Err(undo) = self.accounts.remove(&name)
+                        && let Err(undo) = self.os_users.remove(&name)
                     {
                         return Err(format!("{e}; and couldn't remove {name}: {undo}"));
                     }
@@ -562,7 +562,7 @@ impl Teammates {
                     uid: s.uid,
                     gid: s.gid,
                 };
-                match self.accounts.lookup(&s.user) {
+                match self.os_users.lookup(&s.user) {
                     Some(ids) if ids == want => {
                         check(want)?;
                         Some(want)
@@ -574,7 +574,7 @@ impl Teammates {
             None => None,
         };
         if let Some(ids) = ids {
-            out.processes_stopped = self.accounts.stop_all(ids.uid)?;
+            out.processes_stopped = self.os_users.stop_all(ids.uid)?;
         }
         // The teammates' folder is root's, so their home can't be swapped for a link;
         // `work` in it can, and a rename moves the link, not what it points to.
@@ -595,8 +595,8 @@ impl Teammates {
             Err(e) => return Err(at(&home, e)),
         }
         if let Some(ids) = ids {
-            out.temp_removed = self.accounts.clear_temp(ids.uid);
-            out.user_removed = self.accounts.remove(&out.user)?;
+            out.temp_removed = self.os_users.clear_temp(ids.uid);
+            out.user_removed = self.os_users.remove(&out.user)?;
         }
         out.files = match std::fs::symlink_metadata(&held) {
             Err(_) => "none",
@@ -777,7 +777,7 @@ mod tests {
         refuse_removal: Mutex<bool>,
     }
 
-    impl Accounts for Fake {
+    impl OsUsers for Fake {
         fn lookup(&self, name: &str) -> Option<Ids> {
             self.users.lock().unwrap().get(name).copied()
         }
@@ -815,7 +815,7 @@ mod tests {
         std::fs::create_dir_all(owner.join("work")).unwrap();
         std::fs::write(owner.join("work/plan.md"), "ada's").unwrap();
         let fake = Arc::new(Fake::default());
-        let t = Teammates::with_accounts(d.join("teammates"), state.clone(), None, fake.clone());
+        let t = Teammates::with_os_users(d.join("teammates"), state.clone(), None, fake.clone());
         let bea = t.ensure("ubea", |_| Ok(())).unwrap();
         let cy = t.ensure("ucy", |_| Ok(())).unwrap();
         std::fs::write(bea.workspace().join("notes.md"), "bea's").unwrap();
