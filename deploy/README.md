@@ -109,6 +109,24 @@ MACHINE_CONTROL_URL=https://<server-ip>:8443   # how machines reach this server;
 
 botd then listens on that port for machines (TLS from its own CA, not Caddy's), so open it in the firewall (`sudo ufw allow 8443/tcp`; with Docker, publish it too). Each new machine gets a one-time token in its cloud-init data, downloads `superbot-machine` from botd, enrolls for a 30-day certificate, and answers botd over mutual TLS. Suspend holds its certificate; destroy revokes it. The CA key is derived from the [master key](#master-key), so there is nothing new to back up; a new master key means every machine re-enrolls. A new token for a machine (shown once): `POST /api/users/<user>/machine/enrollment`; revoke its certificates: `DELETE /api/users/<user>/machine/certificates`. Design: [ADR 0031](../docs/adr/0031-machine-enrollment-mtls.md).
 
+### Running Bots on machines
+
+Once machines enroll, choose where Bots run with `MACHINE_ROUTING` in `.env`:
+
+```sh
+MACHINE_ROUTING=assigned   # off (default): all here; assigned: assigned users on their machine; on: everyone, or refused
+```
+
+Then move users over one at a time, on the server:
+
+```sh
+botctl machine assign <user>       # their machine must be running and enrolled
+botctl machine placement [<user>]  # where each user's Bots run, and why
+botctl machine unassign <user>     # back to this server (with MACHINE_ROUTING=assigned)
+```
+
+An assigned user's Bots run only on their machine. If it is down, suspended, outdated, or missing the Bot's harness, the Bot says so and nothing runs here instead. New machines download `botctl` from botd as well as the agent, so keep `botctl` next to `botd` (the installer and image do). On the machine, Bots reach botd through the agent on `127.0.0.1:7444` (loopback only; no new firewall rule). The harness CLIs themselves aren't installed on machines yet. Design: [ADR 0034](../docs/adr/0034-bots-on-the-users-machine.md).
+
 ## Approvals after an upgrade
 
 Fresh installs ask before risky actions. An install from before approvals keeps running without them (`bypass`) after `--upgrade`, and botd logs a warning at start. To opt in, on the server:

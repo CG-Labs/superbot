@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. Next slice of [#29](https://github.com/CG-Labs/superbot/issues/29) (M3). It builds on [ADR 0025](0025-control-plane-linode.md) (one machine per user, whose "out of scope" section sketched this), [ADR 0029](0029-per-user-isolation.md) (the `MachineLink` routing hook) and [ADR 0010](0010-secrets.md) (the master key). Moving a user's Bots onto their machine is the next slice.
+Accepted. Next slice of [#29](https://github.com/CG-Labs/superbot/issues/29) (M3). It builds on [ADR 0025](0025-control-plane-linode.md) (one machine per user, whose "out of scope" section sketched this), [ADR 0029](0029-per-user-isolation.md) (the `MachineLink` routing hook) and [ADR 0010](0010-secrets.md) (the master key). Moving a user's Bots onto their machine is the next slice: [ADR 0034](0034-bots-on-the-users-machine.md), which replaces the agent's 501 on `/v1/jobs` with the job protocol.
 
 ## Context
 
