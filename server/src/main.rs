@@ -39,6 +39,8 @@ mod machines_mtls_tests;
 mod machines_logins_tests;
 #[cfg(test)]
 mod machines_upkeep_tests;
+#[cfg(test)]
+mod machines_screens_tests;
 mod passwd;
 mod paths;
 mod policy;

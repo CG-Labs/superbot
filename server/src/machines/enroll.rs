@@ -1854,6 +1854,19 @@ mod tests {
         assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
         let check = std::process::Command::new("sh").args(["-n", "-c", &script]).output().unwrap();
         assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stderr));
+
+        // MACHINE_SCREENS (ADR 0045): the screen programs, after the agent, never fatal.
+        e.screens = Some(super::super::screens::Settings { ports: (6960, 6999), width: 1280, height: 800, idle_ms: 600_000 });
+        for voxl in [None, Some((Bytes::from_static(b"voxl"), "ef".repeat(32)))] {
+            e.voxl = voxl.clone();
+            let script = firstboot_in(&e.user_data(&m, "sbe_tok"));
+            let (start, apt) = (script.find("systemctl start").unwrap(), script.find("apt-get install").unwrap());
+            assert!(start < apt, "{script}");
+            assert_eq!(script.contains(&format!("echo \"{}  /usr/local/bin/.voxl.new\" | sha256sum -c -", "ef".repeat(32))), voxl.is_some(), "{script}");
+            assert!(script.trim_end().ends_with("else echo \"superbot: screen programs didn't install\" >&2; fi"), "{script}");
+            let check = std::process::Command::new("sh").args(["-n", "-c", &script]).output().unwrap();
+            assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stderr));
+        }
     }
 
     #[test]

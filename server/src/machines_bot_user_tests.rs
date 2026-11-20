@@ -27,7 +27,7 @@ printf '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"ran 
     )
 }
 
-fn owned_bot(env: &Env, uid: &str) -> String {
+pub(crate) fn owned_bot(env: &Env, uid: &str) -> String {
     env.app
         .db
         .create_bot_owned(
@@ -58,7 +58,7 @@ fn owner(p: &std::path::Path) -> u32 {
 }
 
 /// Heartbeats until the agent says its Bots' user is ready, and botd has heard.
-async fn until_ready(env: &Env, a: &Agent) -> Vec<Value> {
+pub(crate) async fn until_ready(env: &Env, a: &Agent) -> Vec<Value> {
     for _ in 0..400 {
         if a.bot_user()
             .is_some_and(|s| s.state == wire::BOT_USER_READY)
