@@ -464,7 +464,6 @@ mod tests {
         assert_eq!((old.step.as_str(), old.dismissed), ("tiers", false));
     }
 
-    /// The `.env` lines the wizard hands out start botd once the placeholders are filled in.
     #[test]
     fn installer_flags_are_shell_quoted() {
         assert_eq!(sh_quote("bots.example.com"), "bots.example.com");
@@ -475,6 +474,7 @@ mod tests {
         assert_eq!(sh_quote(""), "''");
     }
 
+    /// The `.env` lines the wizard hands out start botd once the placeholders are filled in.
     #[test]
     fn provider_templates_are_valid_settings() {
         let fill = [
