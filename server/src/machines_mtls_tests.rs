@@ -135,6 +135,8 @@ fn config(env: &Env, machine_id: &str, token: Option<&str>) -> Config {
         botctl: PathBuf::from("/nonexistent/botctl"),
         harness_path: "/usr/bin:/bin".into(),
         max_jobs: 8,
+        tools: crate::db::temp_path("agent-tools"),
+        exe: crate::db::temp_path("agent-exe"),
     }
 }
 
@@ -1449,6 +1451,8 @@ fn agent_counts_programs_only_under_its_home_or_the_system() {
         botctl: elsewhere.join("botctl"),
         harness_path: "/usr/bin:/bin".into(),
         max_jobs: 1,
+        tools: crate::db::temp_path("agent-tools"),
+        exe: crate::db::temp_path("agent-exe"),
     };
     assert_eq!(cfg.layout().botctl, None, "outside the home and the system's directories");
 

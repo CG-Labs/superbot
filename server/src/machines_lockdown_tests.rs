@@ -411,6 +411,8 @@ async fn machines_that_dont_enroll_in_time_are_reported() {
         botctl: std::path::PathBuf::from("/nonexistent/botctl"),
         harness_path: "/usr/bin:/bin".into(),
         max_jobs: 8,
+        tools: crate::db::temp_path("agent-tools"),
+        exe: crate::db::temp_path("agent-exe"),
     };
     agent::enroll(&cfg).await.unwrap();
     let row = env.app.db.machine(&mid).unwrap();

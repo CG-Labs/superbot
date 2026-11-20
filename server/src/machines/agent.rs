@@ -16,13 +16,19 @@
 //!   certificate live (default /var/lib/superbot-machine).
 //! - `SUPERBOT_HOME`: where Bots work (default `<state dir>/home`).
 //! - `SUPERBOT_AGENT_API`: the relay to botd's API, loopback (default 127.0.0.1:7444).
-//! - `SUPERBOT_HARNESS_PATH`: PATH for harnesses (default `<home>/.local/bin`, then
-//!   the system's). A harness counts as installed only if it resolves to a file
-//!   under the home or `PROGRAM_ROOTS`.
+//! - `SUPERBOT_TOOLS`: where harness CLIs are installed (ADR 0038; default
+//!   `<state dir>/tools`).
+//! - `SUPERBOT_HARNESS_PATH`: PATH for harnesses (default `<tools>/bin`, then
+//!   `<home>/.local/bin`, then the system's). A harness counts as installed only if it
+//!   resolves to a file under the tools, the home or `PROGRAM_ROOTS`.
 //! - `SUPERBOT_MAX_JOBS`: jobs at once (default 8).
+//! - `SUPERBOT_AGENT_BIN`: this binary, replaced by upgrades (ADR 0038; default
+//!   `/usr/local/lib/superbot/superbot-machine`).
 
 use super::job;
 use super::pki::{self, Peer};
+use super::tools::Tools;
+use super::upgrade::{self, Upgrader};
 use super::wire;
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path as UrlPath, RawQuery, Request, State};
@@ -50,6 +56,9 @@ pub const PING_EVERY: Duration = Duration::from_secs(15);
 pub const MAX_RELAY_BODY: usize = 32 << 20;
 /// Where the machine image installs botctl.
 pub const BOTCTL: &str = "/usr/local/bin/botctl";
+/// Where cloud-init installs the agent (ADR 0038): a folder the unit lets it write,
+/// so it can replace itself. `/usr/local/bin/superbot-machine` links here.
+pub const AGENT_BIN: &str = "/usr/local/lib/superbot/superbot-machine";
 
 #[derive(Clone)]
 pub struct Config {
@@ -68,6 +77,10 @@ pub struct Config {
     /// PATH for harnesses and what they run.
     pub harness_path: String,
     pub max_jobs: usize,
+    /// Where harness CLIs are installed (ADR 0038).
+    pub tools: PathBuf,
+    /// This agent's own binary, which an upgrade replaces.
+    pub exe: PathBuf,
 }
 
 /// Where harnesses and botctl may live, besides the Bots' home: the system's program
@@ -144,9 +157,16 @@ impl Config {
         if !home.is_absolute() {
             return Err("SUPERBOT_HOME must be an absolute path".into());
         }
+        let tools = var("SUPERBOT_TOOLS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| state_dir.join("tools"));
+        if !tools.is_absolute() {
+            return Err("SUPERBOT_TOOLS must be an absolute path".into());
+        }
         let harness_path = var("SUPERBOT_HARNESS_PATH").unwrap_or_else(|| {
             format!(
-                "{}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "{}/bin:{}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                tools.display(),
                 home.display()
             )
         });
@@ -168,6 +188,8 @@ impl Config {
             botctl: BOTCTL.into(),
             harness_path,
             max_jobs,
+            tools,
+            exe: var("SUPERBOT_AGENT_BIN").unwrap_or_else(|| AGENT_BIN.into()).into(),
         })
     }
 
@@ -184,12 +206,13 @@ impl Config {
         }
     }
 
-    /// `PROGRAM_ROOTS` and the home, canonicalized; those that don't exist are left out.
+    /// `PROGRAM_ROOTS`, the tools and the home, canonicalized; those that don't exist
+    /// are left out.
     fn roots(&self) -> Vec<PathBuf> {
         PROGRAM_ROOTS
             .iter()
             .map(Path::new)
-            .chain([self.home.as_path()])
+            .chain([self.tools.as_path(), self.home.as_path()])
             .filter_map(|r| r.canonicalize().ok())
             .collect()
     }
@@ -506,9 +529,17 @@ pub struct Agent {
     current: RwLock<(Arc<Identity>, Arc<ServerConfig>)>,
     /// Running jobs by id; sending true stops one.
     jobs: Mutex<HashMap<String, watch::Sender<bool>>>,
+    /// Harness CLIs botd asked for (ADR 0038).
+    pub tools: Arc<Tools>,
+    /// Replacing this agent with botd's build (ADR 0038).
+    pub upgrader: Upgrader,
+    /// True once the agent should exit, for systemd to start it again.
+    restart: watch::Sender<bool>,
 }
 
 impl Agent {
+    /// Also starts installing any harness CLIs a restart interrupted, and, after an
+    /// upgrade, the clock on the new agent's trial.
     pub fn new(cfg: Config, id: Identity) -> Result<Arc<Agent>, String> {
         let server = Arc::new(server_config(&cfg, &id)?);
         for dir in [cfg.home.join("work"), cfg.home.join("bots")] {
@@ -519,11 +550,44 @@ impl Agent {
                 .create(&dir)
                 .map_err(|e| format!("{}: {e}", dir.display()))?;
         }
-        Ok(Arc::new(Agent {
+        let tools = Tools::new(cfg.tools.clone(), Some(cfg.ca_pem.as_str()).filter(|p| !p.is_empty()))?;
+        let upgrader = Upgrader::new(cfg.exe.clone(), cfg.state_dir.clone(), VERSION);
+        let a = Arc::new(Agent {
             cfg,
             current: RwLock::new((Arc::new(id), server)),
             jobs: Mutex::default(),
-        }))
+            tools,
+            upgrader,
+            restart: watch::channel(false).0,
+        });
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(a.tools.clone().work());
+            if let Some(deadline) = a.upgrader.trial_deadline() {
+                let trial = a.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep_until(deadline).await;
+                    if trial.upgrader.trial_deadline().is_some() {
+                        let why = "the control plane didn't reach the new agent in time";
+                        eprintln!("Upgrade: {why}; putting the old agent back.");
+                        if let Err(e) = trial.upgrader.roll_back(why) {
+                            eprintln!("Upgrade: {e}");
+                        }
+                        trial.request_restart();
+                    }
+                });
+            }
+        }
+        Ok(a)
+    }
+
+    /// Asks `run` to return, so systemd starts the agent again (its new binary).
+    pub fn request_restart(&self) {
+        self.restart.send_replace(true);
+    }
+
+    /// Becomes true when the agent should exit and be started again.
+    pub fn restarting(&self) -> watch::Receiver<bool> {
+        self.restart.subscribe()
     }
 
     fn jobs(&self) -> std::sync::MutexGuard<'_, HashMap<String, watch::Sender<bool>>> {
@@ -621,8 +685,14 @@ fn bins(query: Option<&str>) -> Vec<(String, Option<&'static str>)> {
         .collect()
 }
 
+/// Only the control plane's certificate gets here (`admit`), so answering one is the
+/// proof an upgraded agent works: its trial ends.
 async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<wire::Heartbeat> {
+    if a.upgrader.commit() {
+        println!("Upgrade: the control plane reached the new agent; keeping it.");
+    }
     let id = a.identity();
+    let (plan, harnesses) = a.tools.report();
     Json(wire::Heartbeat {
         machine_id: id.machine_id.clone(),
         user_id: id.user_id.clone(),
@@ -637,6 +707,15 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
             .map(|(b, _)| b)
             .collect(),
         jobs: a.running() as u32,
+        can: if a.upgrader.build.is_some() {
+            vec![wire::CAN_HARNESSES.into(), wire::CAN_UPGRADE.into()]
+        } else {
+            vec![wire::CAN_HARNESSES.into()]
+        },
+        build: a.upgrader.build.clone(),
+        plan,
+        harnesses,
+        upgrade: a.upgrader.report(),
     })
 }
 
@@ -732,6 +811,12 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
     let (stop_tx, mut stop_rx) = watch::channel(false);
     {
         let mut jobs = a.jobs();
+        if a.upgrader.staging() {
+            return refuse(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "This machine is updating its agent. Try again in a minute.",
+            );
+        }
         if jobs.contains_key(&j.job_id) {
             return refuse(StatusCode::CONFLICT, "That job is already running.");
         }
@@ -796,11 +881,75 @@ async fn abort_job(
     }
 }
 
+/// `PUT /v1/harnesses`: the harness CLIs botd wants here (ADR 0038). They install in
+/// the background; heartbeats say how it goes.
+async fn set_harnesses(State(a): State<Arc<Agent>>, Json(plan): Json<wire::HarnessPlan>) -> Response {
+    match a.tools.set_plan(plan) {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(e) => refuse(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+/// botd's `/v1/agent` or `/v1/botctl`, over the CA-pinned channel, with this machine's
+/// certificate.
+async fn fetch(a: &Agent, path: &str) -> Result<Vec<u8>, String> {
+    let config = pki::client_config(&a.cfg.ca(), Some(a.identity().chain()))?;
+    let http = reqwest::Client::builder()
+        .tls_backend_preconfigured(config)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(600))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut r = http
+        .get(format!("{}{path}", a.cfg.control_url))
+        .send()
+        .await
+        .map_err(|e| format!("couldn't reach the control plane: {}", e.without_url()))?;
+    if !r.status().is_success() {
+        return Err(format!("the control plane answered {} for {path}", r.status().as_u16()));
+    }
+    let mut out = Vec::new();
+    while let Some(c) = r.chunk().await.map_err(|e| format!("{path}: {}", e.without_url()))? {
+        if out.len() + c.len() > upgrade::MAX_BINARY {
+            return Err(format!("{path} is over {} MiB", upgrade::MAX_BINARY >> 20));
+        }
+        out.extend_from_slice(&c);
+    }
+    Ok(out)
+}
+
+/// `POST /v1/upgrade`: replaces this agent with botd's build, then restarts (ADR
+/// 0038). Refused while jobs run; no job starts until it's done.
+async fn start_upgrade(State(a): State<Arc<Agent>>, Json(req): Json<wire::UpgradeRequest>) -> Response {
+    {
+        let jobs = a.jobs();
+        if let Some((code, msg)) = a.upgrader.refuse(&req, jobs.len()) {
+            return refuse(StatusCode::from_u16(code).unwrap_or(StatusCode::CONFLICT), msg);
+        }
+        if !a.upgrader.begin(&req) {
+            return refuse(StatusCode::CONFLICT, "This agent is upgrading already.");
+        }
+    }
+    let up = a.clone();
+    tokio::spawn(async move {
+        match up.upgrader.stage(&req, |path| fetch(&up, path)).await {
+            Ok(()) => {
+                println!("Upgrade: installed superbot-machine {} ({}); restarting.", req.version, &req.sha256[..16]);
+                up.request_restart();
+            }
+            Err(e) => eprintln!("Upgrade: {e}"),
+        }
+    });
+    (StatusCode::ACCEPTED, Json(a.upgrader.report())).into_response()
+}
+
 pub fn router(a: Arc<Agent>) -> Router {
     Router::new()
         .route("/v1/heartbeat", get(heartbeat))
         .route("/v1/jobs", post(start_job))
         .route("/v1/jobs/{id}/abort", post(abort_job))
+        .route("/v1/harnesses", axum::routing::put(set_harnesses))
+        .route("/v1/upgrade", post(start_upgrade))
         .layer(DefaultBodyLimit::max(MAX_RELAY_BODY))
         .with_state(a)
 }
@@ -955,6 +1104,10 @@ pub async fn run(cfg: Config) -> Result<(), String> {
             }
         }
     });
-    serve(listener, agent).await;
+    let mut restarting = agent.restarting();
+    tokio::select! {
+        () = serve(listener, agent) => {}
+        _ = restarting.wait_for(|r| *r) => println!("Restarting."),
+    }
     Ok(())
 }

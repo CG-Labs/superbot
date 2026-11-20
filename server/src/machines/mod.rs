@@ -17,6 +17,13 @@ pub mod linode;
 pub mod pki;
 pub mod provider;
 pub mod route;
+#[cfg(test)]
+#[allow(dead_code)]
+pub mod tools;
+#[cfg(test)]
+#[allow(dead_code)]
+pub mod upgrade;
+pub mod upkeep;
 pub mod wire;
 
 use crate::audit::{Actor, Event, Outcome, Source, Who};
