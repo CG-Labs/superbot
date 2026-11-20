@@ -112,9 +112,11 @@ async fn the_domain_counts_once_https_reaches_botd_through_its_proxy() {
     assert!(d["instructions"].to_string().contains("install.sh --domain bots.example.com"));
     let d = get(port, &admin, "X-Forwarded-Proto: http\r\n").await["domain"].clone();
     assert_eq!((d["scheme"].as_str(), d["ok"].as_bool()), (Some("http"), Some(false)));
-    assert!(d["detail"].as_str().unwrap().contains("plain HTTP"), "{d}");
+    assert!(d["detail"].as_str().unwrap().contains("plain HTTP") && d["httpsChecked"] == true, "{d}");
+    // botctl and SSH tunnels reach botd on loopback without the proxy: HTTPS can't be checked from there.
     let d = get(port, &admin, "").await["domain"].clone();
-    assert_eq!((d["scheme"].as_str(), d["ok"].as_bool()), (Some("direct"), Some(false)));
+    assert_eq!((d["scheme"].as_str(), d["httpsChecked"].as_bool(), d["ok"].as_bool()), (Some("direct"), Some(false), Some(true)));
+    assert!(d["detail"].as_str().unwrap().contains("can't be checked from this machine"), "{d}");
 }
 
 #[tokio::test]

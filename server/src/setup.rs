@@ -103,18 +103,22 @@ fn restart() -> Vec<Value> {
     ]
 }
 
-fn domain_view(a: &Auth, host: &str, scheme: &str) -> Value {
+/// `scheme` is how this request came (see [`scheme`]); `on_this_machine`, whether it came
+/// from loopback, where botctl and SSH tunnels reach botd without the proxy.
+fn domain_view(a: &Auth, host: &str, scheme: &str, on_this_machine: bool) -> Value {
     let hosts = public_hosts(&a.hosts);
     let public_url = a.sso.public_url().map(String::from).or_else(|| hosts.first().map(|h| format!("https://{}", h.to_ascii_lowercase())));
     let here = Some(host.to_ascii_lowercase()).filter(|h| !local(host_name(h)) && hosts.contains(h));
     let name = here.or_else(|| hosts.first().cloned()).or_else(|| public_url.as_deref().and_then(|u| u.strip_prefix("https://")).map(String::from));
     let shown = name.clone().unwrap_or_else(|| "<your-domain>".into());
-    let ok = public_url.is_some() && scheme == "https";
+    let unchecked = scheme == "direct" && on_this_machine;
+    let ok = public_url.is_some() && (scheme == "https" || unchecked);
     let detail = match (&public_url, scheme) {
         (None, _) => "No public address yet: botd answers only on this machine, and nobody else can sign in.".to_string(),
         (Some(u), "https") => format!("People reach SuperBot at {u}, over HTTPS."),
-        (Some(u), "http") => format!("This page came over plain HTTP. Open {u}/console/ over HTTPS, and check that Caddy has its certificate."),
-        (Some(u), _) => format!("Set up for {u}, but this page didn't come through the HTTPS proxy. Open {u}/console/ to check HTTPS."),
+        (Some(u), "http") => format!("This request came over plain HTTP. Open {u}/console/ over HTTPS, and check that Caddy has its certificate."),
+        (Some(u), _) if unchecked => format!("Set up for {u}. HTTPS can't be checked from this machine: open {u}/console/ in a browser to see."),
+        (Some(u), _) => format!("Set up for {u}, but this request reached botd over plain HTTP, not through the HTTPS proxy. Open {u}/console/."),
     };
     let instructions = vec![
         step("DNS", format!("Point an A (and AAAA) record for {shown} at this server, and open ports 80 and 443."), &[]),
@@ -129,7 +133,17 @@ fn domain_view(a: &Auth, host: &str, scheme: &str) -> Value {
             &[format!("./init.sh --domain {shown}"), "docker compose up -d".into()],
         ),
     ];
-    json!({ "publicUrl": public_url, "hosts": hosts, "domain": name, "requestHost": host, "scheme": scheme, "ok": ok, "detail": detail, "instructions": instructions })
+    json!({
+        "publicUrl": public_url,
+        "hosts": hosts,
+        "domain": name,
+        "requestHost": host,
+        "scheme": scheme,
+        "httpsChecked": scheme != "direct" || !on_this_machine,
+        "ok": ok,
+        "detail": detail,
+        "instructions": instructions,
+    })
 }
 
 /// Settings each provider type needs, after `SSO_<ID>_`. `<...>` are placeholders.
@@ -218,7 +232,7 @@ fn sign_in_view(app: &AppState, a: &Auth, public_url: Option<&str>) -> Value {
     let detail = match (a.sso.providers.len(), waiting.is_empty()) {
         (0, _) => "No SSO providers: people sign in with one-time codes from Users. Add a provider any time.".to_string(),
         (n, true) => format!("{n} SSO provider{} ready.", if n == 1 { "" } else { "s" }),
-        (_, false) => format!("Waiting for a secret: {}. Save it below; no restart needed.", waiting.join(", ")),
+        (_, false) => format!("Waiting for a secret: {}. Saving it takes effect at once, no restart.", waiting.join(", ")),
     };
     json!({
         "breakGlass": a.break_glass,
@@ -272,7 +286,8 @@ fn item(id: &str, label: &str, done: bool, detail: impl Into<String>) -> Value {
 fn report(app: &AppState, a: &Auth, headers: &HeaderMap, peer: Option<IpAddr>) -> Value {
     let progress = app.db.setup_progress();
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or_default();
-    let domain = domain_view(a, host, scheme(headers, peer, a.trust_forwarded));
+    let on_this_machine = peer.is_some_and(|p| p.to_canonical().is_loopback());
+    let domain = domain_view(a, host, scheme(headers, peer, a.trust_forwarded), on_this_machine);
     let sign_in = sign_in_view(app, a, domain["publicUrl"].as_str());
     let tiers = tiers_view(app);
     let mode = app.db.global_policy().mode;
