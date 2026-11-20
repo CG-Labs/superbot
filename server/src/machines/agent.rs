@@ -36,7 +36,7 @@ use super::job;
 use super::landing::Landing;
 use super::pki::{self, Peer};
 use super::runas::{self, Ids};
-use super::teammates::{Teammate, Teammates};
+use super::teammates::{Files, Teammate, Teammates};
 use super::terminal::Logins;
 use super::tools::Tools;
 use super::upgrade::{self, Upgrader};
@@ -609,8 +609,8 @@ pub async fn status(cfg: &Config, id: &Identity) -> Result<wire::MachineStatus, 
 pub struct Agent {
     pub cfg: Config,
     current: RwLock<(Arc<Identity>, Arc<ServerConfig>)>,
-    /// Running jobs by id; sending true stops one.
-    jobs: Mutex<HashMap<String, watch::Sender<bool>>>,
+    /// Running jobs by id.
+    jobs: Mutex<HashMap<String, RunningJob>>,
     /// Harness CLIs botd asked for (ADR 0039).
     pub tools: Arc<Tools>,
     /// Replacing this agent with botd's build (ADR 0039).
@@ -626,6 +626,30 @@ pub struct Agent {
     pub screens: Arc<Screens>,
     /// Teammates' own users and homes (ADR 0048).
     pub teammates: Arc<Teammates>,
+}
+
+struct RunningJob {
+    /// Sending true stops it.
+    stop: watch::Sender<bool>,
+    /// The teammate it runs for (ADR 0048); None: the owner.
+    for_user: Option<String>,
+}
+
+/// Why `ids` can't be a teammate's user: root, the agent's own, or the Bots' (`bots`).
+/// With a stand-in (tests) every teammate is the agent's user, so only root is refused.
+fn not_teammates(stand_in: bool, bots: Option<Ids>) -> impl Fn(Ids) -> Result<(), String> {
+    move |ids: Ids| {
+        if ids.uid == 0 || ids.gid == 0 {
+            return Err("a teammate's user can't be root or in root's group".into());
+        }
+        // SAFETY: no arguments.
+        let own = ids.uid == unsafe { libc::geteuid() };
+        let bots = bots.is_some_and(|b| ids.uid == b.uid || ids.gid == b.gid);
+        if !stand_in && (own || bots) {
+            return Err("a teammate's user can't be the agent's or the Bots' user".into());
+        }
+        Ok(())
+    }
 }
 
 /// Where the Bots' user stands. Once botd has asked, no job runs as root again.
@@ -790,8 +814,28 @@ impl Agent {
         self.restart.subscribe()
     }
 
-    fn jobs(&self) -> std::sync::MutexGuard<'_, HashMap<String, watch::Sender<bool>>> {
+    fn jobs(&self) -> std::sync::MutexGuard<'_, HashMap<String, RunningJob>> {
         self.jobs.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Stops `user_id`'s jobs and waits a while for them to end. How many there were.
+    async fn stop_jobs_for(&self, user_id: &str) -> u32 {
+        let theirs: Vec<String> = self
+            .jobs()
+            .iter()
+            .filter(|(_, j)| j.for_user.as_deref() == Some(user_id))
+            .map(|(id, j)| {
+                let _ = j.stop.send(true);
+                id.clone()
+            })
+            .collect();
+        for _ in 0..150 {
+            if !theirs.iter().any(|id| self.jobs().contains_key(id)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        theirs.len() as u32
     }
 
     /// Jobs and logins running now: either holds off an upgrade.
@@ -863,17 +907,7 @@ impl Agent {
         let (a, id) = (self.clone(), user_id.to_string());
         let made = tokio::task::spawn_blocking(move || {
             let stand_in = a.cfg.teammate_stand_in.is_some();
-            a.teammates.ensure(&id, |ids| {
-                if ids.uid == 0 || ids.gid == 0 {
-                    return Err("a teammate's user can't be root or in root's group".into());
-                }
-                // SAFETY: no arguments.
-                let own = ids.uid == unsafe { libc::geteuid() };
-                if !stand_in && (own || ids.uid == bots.uid || ids.gid == bots.gid) {
-                    return Err("a teammate's user can't be the agent's or the Bots' user".into());
-                }
-                Ok(())
-            })
+            a.teammates.ensure(&id, not_teammates(stand_in, Some(bots)))
         })
         .await;
         match made {
@@ -1088,7 +1122,15 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
             .map(|(b, _)| b)
             .collect(),
         jobs: a.running() as u32,
-        can: [wire::CAN_HARNESSES, wire::CAN_LOGINS, wire::CAN_SYNC, wire::CAN_BOT_USER, wire::CAN_SCREENS, wire::CAN_TEAMMATES]
+        can: [
+            wire::CAN_HARNESSES,
+            wire::CAN_LOGINS,
+            wire::CAN_SYNC,
+            wire::CAN_BOT_USER,
+            wire::CAN_SCREENS,
+            wire::CAN_TEAMMATES,
+            wire::CAN_TEAMMATE_REMOVAL,
+        ]
             .into_iter()
             .chain(a.upgrader.build.is_some().then_some(wire::CAN_UPGRADE))
             .map(String::from)
@@ -1100,6 +1142,7 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
         logins: logins(&a, q.as_deref()),
         bot_user: a.bot().status,
         screens: Some(a.screens.report()),
+        teammates: Some(a.teammates.known()),
     })
 }
 
@@ -1255,6 +1298,10 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
         if jobs.contains_key(&j.job_id) {
             return refuse(StatusCode::CONFLICT, "That job is already running.");
         }
+        // Checked with the jobs held: a removal marks the teammate, then stops what's here.
+        if j.for_user.as_deref().is_some_and(|u| a.teammates.is_leaving(u)) {
+            return refuse(StatusCode::CONFLICT, "That teammate's user is being removed.");
+        }
         if jobs.len() >= a.cfg.max_jobs {
             return refuse(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1267,7 +1314,7 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
                 "This machine is updating its harnesses. Try again in a minute.",
             );
         };
-        jobs.insert(j.job_id.clone(), stop_tx.clone());
+        jobs.insert(j.job_id.clone(), RunningJob { stop: stop_tx.clone(), for_user: j.for_user.clone() });
         (permit, user)
     };
     let running = Running(a.clone(), j.job_id.clone(), permit);
@@ -1414,8 +1461,8 @@ async fn abort_job(
     Json(_why): Json<wire::AbortRequest>,
 ) -> Response {
     match a.jobs().get(&id) {
-        Some(stop) => {
-            let _ = stop.send(true);
+        Some(j) => {
+            let _ = j.stop.send(true);
             StatusCode::NO_CONTENT.into_response()
         }
         None => refuse(StatusCode::NOT_FOUND, "No such job is running."),
@@ -1562,6 +1609,9 @@ async fn put_screen(State(a): State<Arc<Agent>>, UrlPath(bot): UrlPath<String>, 
         None => display::As { ids, home: a.cfg.home.clone(), user: a.cfg.bot_user.clone() },
     };
     let key = wire::screen_key(&bot, r.for_user.as_deref());
+    if r.for_user.as_deref().is_some_and(|u| a.teammates.is_leaving(u)) {
+        return refuse(StatusCode::CONFLICT, "That teammate's user is being removed.");
+    }
     if a.upgrader.staging() {
         return refuse(StatusCode::SERVICE_UNAVAILABLE, "This machine is updating its agent. Try again in a minute.");
     }
@@ -1666,6 +1716,78 @@ async fn put_teammate(State(a): State<Arc<Agent>>, UrlPath(user): UrlPath<String
     }
 }
 
+/// `POST /v1/teammates/{user}/remove`: the teammate left (ADR 0052). Their jobs and
+/// screens stop, then `Teammates::remove` does the rest. Never the machine's own user.
+async fn remove_teammate(State(a): State<Arc<Agent>>, UrlPath(user): UrlPath<String>, Json(r): Json<wire::TeammateRemoval>) -> Response {
+    if r.owner_id != a.identity().user_id {
+        return refuse(StatusCode::FORBIDDEN, "This machine runs only its own user's Bots.");
+    }
+    if !plain_name(&user) || !plain_name(&r.cleanup_id) {
+        return refuse(StatusCode::BAD_REQUEST, "The teammate's and the removal's ids must be plain names.");
+    }
+    if user == r.owner_id {
+        return refuse(StatusCode::BAD_REQUEST, "That is this machine's own user, not a teammate.");
+    }
+    let files = match (r.files.as_str(), r.archive_name.as_deref()) {
+        (wire::TEAMMATE_FILES_ARCHIVE, Some(name)) if plain_name(name) => match a.job_user() {
+            Ok(Some(ids)) => Files::Archive { home: a.cfg.home.clone(), ids, name: name.to_string() },
+            Ok(None) => return refuse(StatusCode::CONFLICT, "Work is archived only to the Bots' own user, and this machine has none."),
+            Err(r) => return r,
+        },
+        (wire::TEAMMATE_FILES_DELETE, None) if r.hold => Files::Hold,
+        (wire::TEAMMATE_FILES_DELETE, None) => Files::Delete,
+        _ => return refuse(StatusCode::BAD_REQUEST, "Say archive with a plain archive name, or delete."),
+    };
+    if a.upgrader.staging() {
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, "This machine is updating its agent. Try again in a minute.");
+    }
+    let Some(leaving) = a.teammates.start_leaving(&user) else {
+        return refuse(StatusCode::CONFLICT, "That teammate's user is being removed already.");
+    };
+    let jobs = a.stop_jobs_for(&user).await;
+    let mut screens = 0;
+    let suffix = format!("@{user}");
+    for key in a.screens.report().running.into_iter().filter(|k| k.ends_with(&suffix)) {
+        screens += a.screens.stop(&key).await as u32;
+    }
+    let (b, id) = (a.clone(), user.clone());
+    let done = tokio::task::spawn_blocking(move || {
+        let stand_in = b.cfg.teammate_stand_in.is_some();
+        b.teammates.remove(&id, &r.cleanup_id, &files, not_teammates(stand_in, b.bot().ids))
+    })
+    .await;
+    drop(leaving);
+    match done {
+        Ok(Ok(done)) => {
+            if !done.already_gone {
+                println!(
+                    "Teammate user {} removed: {} jobs, {} screens and {} processes stopped; work {}.",
+                    done.user, jobs, screens, done.processes_stopped, done.files
+                );
+            }
+            Json(done.reply(jobs, screens)).into_response()
+        }
+        Ok(Err(e)) => refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't remove the teammate's user: {e}")),
+        Err(e) => refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// `POST /v1/teammates/{user}/purge`: deletes the work a removal held aside.
+async fn purge_teammate(State(a): State<Arc<Agent>>, UrlPath(user): UrlPath<String>, Json(r): Json<wire::TeammatePurge>) -> Response {
+    if r.owner_id != a.identity().user_id {
+        return refuse(StatusCode::FORBIDDEN, "This machine runs only its own user's Bots.");
+    }
+    if !plain_name(&user) || !plain_name(&r.cleanup_id) {
+        return refuse(StatusCode::BAD_REQUEST, "The teammate's and the removal's ids must be plain names.");
+    }
+    let t = a.teammates.clone();
+    match tokio::task::spawn_blocking(move || t.purge(&r.cleanup_id)).await {
+        Ok(Ok(purged)) => Json(wire::TeammatePurged { purged }).into_response(),
+        Ok(Err(e)) => refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't delete the held work: {e}")),
+        Err(e) => refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 pub fn router(a: Arc<Agent>) -> Router {
     Router::new()
         .route("/v1/heartbeat", get(heartbeat))
@@ -1684,6 +1806,8 @@ pub fn router(a: Arc<Agent>) -> Router {
         .route("/v1/screens/{bot}", axum::routing::put(put_screen).delete(delete_screen))
         .route("/v1/screens/{bot}/tunnel", get(screen_tunnel))
         .route("/v1/teammates/{user}", axum::routing::put(put_teammate))
+        .route("/v1/teammates/{user}/remove", post(remove_teammate))
+        .route("/v1/teammates/{user}/purge", post(purge_teammate))
         .layer(DefaultBodyLimit::max(MAX_RELAY_BODY))
         .with_state(a)
 }

@@ -97,7 +97,7 @@ With the setting on, each teammate who uses a shared Bot on a machine gets their
 ## Limits and follow-ups
 
 - **No harness logins for teammates.** Only server-wide keys work for Claude Code and Codex. Per-teammate logins on the owner's machine are a follow-up, if wanted at all.
-- **Teammate users are never removed.** A teammate who leaves, or loses every shared Bot of the owner's, keeps an idle user and home on that machine. Removing them on deprovisioning (SCIM) or on access loss is a follow-up.
+- **Teammate users are never removed.** A teammate who leaves, or loses every shared Bot of the owner's, keeps an idle user and home on that machine. Removing them on deprovisioning (SCIM) or on access loss is a follow-up. Done in [ADR 0052](0052-teammate-offboarding-on-machines.md): their user, home and processes go, and their work goes to the owner or is deleted after a grace period.
 - **`/tmp` and the network are shared** with the owner's Bots' user, as for any two users on one host. A private `/tmp` and egress limits come with per-user containers (M5).
 - **Memory stays shared**, as ADR 0046 decided. The Bot's `MEMORY.md` goes to the teammate's run and comes back.
 - **Harnesses installed only in the Bots' home** (not the tools folder) can't run for teammates. The check passes, but the job fails to start. Agent-installed harnesses are in the tools folder.

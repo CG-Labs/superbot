@@ -57,7 +57,7 @@ fn mode(p: &Path) -> u32 {
 }
 
 /// What a line of the stand-in's reply says of `key`.
-fn said<'a>(reply: &'a str, key: &str) -> &'a str {
+pub(crate) fn said<'a>(reply: &'a str, key: &str) -> &'a str {
     reply
         .split(' ')
         .find_map(|w| w.strip_prefix(&format!("{key}=")))
@@ -65,17 +65,26 @@ fn said<'a>(reply: &'a str, key: &str) -> &'a str {
 }
 
 /// Ada's machine, its Bots' user ready, with teammates' users on; Bea is a member.
-struct World {
-    env: Env,
-    m: OnMachine,
-    ada: String,
-    bea_id: String,
-    bea: String,
-    secret: std::path::PathBuf,
+pub(crate) struct World {
+    pub env: Env,
+    pub m: OnMachine,
+    pub ada: String,
+    pub bea_id: String,
+    pub bea: String,
+    pub secret: std::path::PathBuf,
 }
 
 async fn world(f: impl FnOnce(agent::Config) -> agent::Config) -> World {
-    let mut env = serve_with(|e| e.with_teammate_users()).await;
+    world_with(|e| e, |_| {}, f).await
+}
+
+/// `world`, with enrollment changed by `ef` as well.
+pub(crate) async fn world_with(
+    ef: impl FnOnce(crate::machines::enroll::Enrollment) -> crate::machines::enroll::Enrollment,
+    auth: impl FnOnce(&mut crate::Auth) + Send + 'static,
+    f: impl FnOnce(agent::Config) -> agent::Config,
+) -> World {
+    let mut env = crate::machines_mtls_tests::serve_with_auth(|e| ef(e.with_teammate_users()), auth).await;
     let (ada, mid, token) = machine_for(&env, "ada@example.com").await;
     let m = agent_with_config(&mut env, &mid, &token, "#!/bin/sh\nexit 3\n", |c| {
         with_pi(f(c))
@@ -96,7 +105,7 @@ async fn world(f: impl FnOnce(agent::Config) -> agent::Config) -> World {
     }
 }
 
-fn shared_pi(w: &World) -> String {
+pub(crate) fn shared_pi(w: &World) -> String {
     w.env
         .app
         .db
@@ -114,7 +123,7 @@ fn shared_pi(w: &World) -> String {
 }
 
 /// Sends as `auth` and waits for the reply.
-async fn run(w: &World, auth: &str, bot: &str, text: &str) -> String {
+pub(crate) async fn run(w: &World, auth: &str, bot: &str, text: &str) -> String {
     let before = w.env.app.db.last_id();
     let (code, m) = call(
         w.env.port,
@@ -128,7 +137,7 @@ async fn run(w: &World, auth: &str, bot: &str, text: &str) -> String {
     reply_after(&w.env, bot, before).await
 }
 
-async fn ada_auth(w: &World) -> String {
+pub(crate) async fn ada_auth(w: &World) -> String {
     crate::users_http_tests::signed_in(w.env.port, &w.env.admin, &w.ada)
         .await
         .unwrap()

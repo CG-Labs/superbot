@@ -110,6 +110,10 @@ pub struct Enrollment {
     /// Teammates' runs of shared Bots as their own OS user (MACHINE_TEAMMATE_USERS,
     /// ADR 0048), with screens of their own.
     pub teammate_users: bool,
+    /// What becomes of leaving teammates' work (ADR 0052), and the removals being
+    /// tried now.
+    pub offboard: super::offboard::Settings,
+    pub(super) offboarding: super::offboard::Working,
     voxl: Option<(Bytes, String)>,
 }
 
@@ -153,6 +157,8 @@ impl Enrollment {
                 "MACHINE_SCREENS",
                 "MACHINE_SCREEN_PORTS",
                 "MACHINE_TEAMMATE_USERS",
+                "MACHINE_TEAMMATE_FILES",
+                "MACHINE_TEAMMATE_FILES_DAYS",
             ] {
                 if !var(k).trim().is_empty() {
                     return Err(format!("{k} needs MACHINE_CONTROL_URL"));
@@ -229,6 +235,7 @@ impl Enrollment {
         e.bot_user = super::botuser::from_env(var)?;
         e.screens = super::screens::from_env(var, e.bot_user)?;
         e.teammate_users = super::teammate::from_env(var, e.bot_user)?;
+        e.offboard = super::offboard::Settings::from_env(var)?;
         if e.screens.is_some() {
             let on_path = std::env::var_os("PATH")
                 .and_then(|p| std::env::split_paths(&p).map(|d| d.join(VOXL_BIN)).find(|p| p.is_file()));
@@ -270,6 +277,8 @@ impl Enrollment {
             screens: None,
             shown: Default::default(),
             teammate_users: false,
+            offboard: Default::default(),
+            offboarding: Default::default(),
             voxl: None,
         })
     }
@@ -330,6 +339,13 @@ impl Enrollment {
         self
     }
 
+    /// With MACHINE_TEAMMATE_FILES=delete, held for `days`.
+    #[cfg(test)]
+    pub fn with_teammate_files_deleted(mut self, days: u32) -> Enrollment {
+        self.offboard = super::offboard::Settings { files: super::offboard::Files::Delete, grace_days: days };
+        self
+    }
+
     /// With MACHINE_SCREENS=on (and so MACHINE_BOT_USER=on), showing screens through
     /// botd's loopback ports `ports`.
     #[cfg(test)]
@@ -376,7 +392,7 @@ impl Enrollment {
 
     pub fn describe(&self) -> String {
         format!(
-            "on at {} (listening on {}, agents on port {}, {} minutes to enroll; {}; harness logins {}; folder copies {}; Bots' own user {}; teammates' own users {}; screens {}){}",
+            "on at {} (listening on {}, agents on port {}, {} minutes to enroll; {}; harness logins {}; folder copies {}; Bots' own user {}; teammates' own users {}, {}; screens {}){}",
             self.url,
             self.listen,
             self.agent_port,
@@ -386,6 +402,7 @@ impl Enrollment {
             self.folder.as_ref().map_or("off".to_string(), |f| format!("on, up to {} MiB", f.max_bytes >> 20)),
             if self.bot_user { "on" } else { "off" },
             if self.teammate_users { "on" } else { "off" },
+            self.offboard.describe(),
             match (&self.screens, &self.voxl) {
                 (None, _) => "off".to_string(),
                 (Some(s), v) => format!(

@@ -46,6 +46,8 @@ mod machines_upkeep_tests;
 mod machines_screens_tests;
 #[cfg(test)]
 mod machines_teammates_tests;
+#[cfg(test)]
+mod machines_offboard_tests;
 mod passwd;
 mod paths;
 mod policy;
@@ -516,10 +518,13 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/machine/harness-logins", get(machines::logins::admin_status))
         .route("/users/{key}/machine/harness-logins/{harness}", delete(machines::logins::admin_logout))
         .route("/users/{key}/machine/folder-sync", get(machines::folder::get).post(machines::folder::now_copy))
+        .route("/users/{key}/machine/teammates", get(machines::offboard::on_machine))
+        .route("/users/{key}/machine/teammates/{teammate}/remove", post(machines::offboard::remove_now))
         .route("/users/{key}/placement", get(machines::placement).put(machines::assign).delete(machines::unassign))
         .route("/machines", get(machines::list_all))
         .route("/machines/placements", get(machines::placements))
         .route("/machines/reconcile", post(machines::reconcile_now))
+        .route("/machines/teammate-removals", get(machines::offboard::list_all))
         .route("/machine", get(machines::mine))
         .route("/machine/harness-login", post(machines::logins::my_start))
         .route("/machine/harness-login/{id}", delete(machines::logins::my_abort))
@@ -1685,6 +1690,7 @@ async fn delete_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
     machines::screens::close(&app, &by, &id, "bot_deleted").await;
     app.db.delete_bot(&id);
     app.db.record(&by.event("bot.deleted").target("bot", &id).bot(&id).details(json!({ "name": bot.name, "harness": bot.harness })));
+    machines::offboard::check_owner(&app, &by, &bot.owner_id);
     app.send(json!({ "type": "botDeleted", "botId": id }));
     Ok(Json(json!({ "ok": true })))
 }
@@ -1724,8 +1730,9 @@ fn access_view(app: &App, b: &db::Bot, access: Access) -> Value {
 /// When someone may have lost access, its screen also gets a new token: the
 /// proxy sends screen traffic straight to voxl, so an old link would keep working.
 /// That waits on the screen, so it comes after the resync: streams must not run on
-/// stale access meanwhile.
-async fn acl_changed(app: &App, id: &str, narrowed: bool) {
+/// stale access meanwhile. Teammates who lost the owner's Bots lose their users on
+/// the owner's machine (ADR 0052).
+async fn acl_changed(app: &AppState, by: &Who, id: &str, narrowed: bool) {
     app.send(json!({ "type": "resync" }));
     app.push_bot(id);
     if narrowed && let Some(screens) = &app.screens {
@@ -1733,13 +1740,16 @@ async fn acl_changed(app: &App, id: &str, narrowed: bool) {
     }
     if narrowed {
         machines::screens::rotate(app, id).await;
+        if let Some(b) = app.db.bot(id) {
+            machines::offboard::check_owner(app, by, &b.owner_id);
+        }
     }
 }
 
 /// Gives `bot` to `to` (an admin's choice): it takes one of their Bot slots, work
 /// started for the old owner ends, and its memory follows it. Its harness and model
 /// they can change after.
-pub(crate) async fn give_bot(app: &App, by: &Who, bot: &db::Bot, to: &db::User) -> Res<()> {
+pub(crate) async fn give_bot(app: &AppState, by: &Who, bot: &db::Bot, to: &db::User) -> Res<()> {
     if to.id == bot.owner_id {
         return Ok(());
     }
@@ -1758,7 +1768,9 @@ pub(crate) async fn give_bot(app: &App, by: &Who, bot: &db::Bot, to: &db::User) 
     app.db.remove_grant(id, &to.id);
     app.hand_over_memory(id, &bot.owner_id, &to.id);
     app.db.record(&by.event("bot.owner_changed").target("bot", id).bot(id).details(json!({ "from": bot.owner_id, "to": to.id })));
-    acl_changed(app, id, true).await;
+    acl_changed(app, by, id, true).await;
+    // It runs on the new owner's machine now: teammates may have no use for the old one.
+    machines::offboard::check_owner(app, by, &bot.owner_id);
     Ok(())
 }
 
@@ -1801,7 +1813,7 @@ async fn update_access(State(app): State<AppState>, Extension(c): Extension<Call
         app.db.record(&by.event("bot.visibility_changed").target("bot", &id).bot(&id).details(json!({ "from": bot.visibility, "to": to })));
         narrowed |= to == Visibility::Private;
     }
-    acl_changed(&app, &id, narrowed).await;
+    acl_changed(&app, &by, &id, narrowed).await;
     let after = need_bot(&app, &id)?;
     let access = viewer(&app, &c, &by).access(&app.db, &after);
     Ok(Json(access_view(&app, &after, access)))
@@ -1820,7 +1832,7 @@ async fn put_grant(State(app): State<AppState>, Extension(c): Extension<Caller>,
     let before = app.db.set_grant(&id, &u.id, level, by_id);
     if before != Some(level) {
         app.db.record(&by.event("bot.access_granted").target("bot", &id).bot(&id).details(json!({ "user": u.id, "level": level, "from": before })));
-        acl_changed(&app, &id, before == Some(acl::Grant::Operator) && level == acl::Grant::Viewer).await;
+        acl_changed(&app, &by, &id, before == Some(acl::Grant::Operator) && level == acl::Grant::Viewer).await;
     }
     Ok(Json(access_view(&app, &bot, access)))
 }
@@ -1831,7 +1843,7 @@ async fn delete_grant(State(app): State<AppState>, Extension(c): Extension<Calle
     let u = app.db.find_user(&key).ok_or_else(|| not_found("User"))?;
     let level = app.db.remove_grant(&id, &u.id).ok_or_else(|| not_found("Grant"))?;
     app.db.record(&by.event("bot.access_revoked").target("bot", &id).bot(&id).details(json!({ "user": u.id, "level": level })));
-    acl_changed(&app, &id, true).await;
+    acl_changed(&app, &by, &id, true).await;
     Ok(Json(access_view(&app, &bot, access)))
 }
 

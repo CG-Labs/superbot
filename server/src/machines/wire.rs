@@ -31,6 +31,11 @@
 //! - `PUT /v1/teammates/{user}` `TeammateRequest` -> `TeammateReply`: the OS user and
 //!   home a teammate's runs of the owner's shared Bots get on this machine (ADR 0048).
 //!   Screen routes take `?for=<user>` for that teammate's own screen of the Bot.
+//! - `POST /v1/teammates/{user}/remove` `TeammateRemoval` -> `TeammateRemoved`: the
+//!   teammate left; stop their jobs, screens and processes, take their work aside,
+//!   and remove their user and home (ADR 0052).
+//! - `POST /v1/teammates/{user}/purge` `TeammatePurge` -> `TeammatePurged`: delete
+//!   work a removal held aside.
 //!
 //! Protocol 1 (`PROTOCOL`) is the first that runs Bots. A heartbeat without `protocol`
 //! is from an agent before it, which can't. Installs, upgrades, logins and folder
@@ -105,6 +110,7 @@ pub const CAN_SYNC: &str = "sync";
 pub const CAN_BOT_USER: &str = "bot_user";
 pub const CAN_SCREENS: &str = "screens";
 pub const CAN_TEAMMATES: &str = "teammates";
+pub const CAN_TEAMMATE_REMOVAL: &str = "teammate_removal";
 
 /// The screen protocol this build speaks (ADR 0045). A request names it, an agent
 /// refuses any other, and botd treats an agent that reports another as outdated.
@@ -212,6 +218,70 @@ pub struct TeammateReply {
     pub created: bool,
 }
 
+/// What becomes of a leaving teammate's `work` folder (ADR 0052).
+pub const TEAMMATE_FILES_ARCHIVE: &str = "archive";
+pub const TEAMMATE_FILES_DELETE: &str = "delete";
+/// Where archived work lands, in the owner's workspace.
+pub const TEAMMATE_ARCHIVE_DIR: &str = "from-teammates";
+
+/// `POST /v1/teammates/{user}/remove`: the teammate left (ADR 0052). Their jobs,
+/// screens and processes stop; their `work` folder is archived to the owner's
+/// workspace, held aside, or deleted; the rest of their home and their OS user go.
+/// Asking again after it's done changes nothing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TeammateRemoval {
+    /// Must be the machine's own user, as for jobs.
+    pub owner_id: String,
+    /// botd's id for this removal: names held work, so a retry finds it.
+    pub cleanup_id: String,
+    /// `TEAMMATE_FILES_ARCHIVE` or `TEAMMATE_FILES_DELETE`.
+    pub files: String,
+    /// Archive: the folder's name in the owner's `work/from-teammates`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_name: Option<String>,
+    /// Delete: keep the work aside, root's alone, until botd purges it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hold: bool,
+}
+
+/// What a removal did.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeammateRemoved {
+    /// Their OS user's name.
+    pub user: String,
+    /// Nothing of theirs was left: done before.
+    pub already_gone: bool,
+    /// Their OS user was deleted by this request.
+    pub user_removed: bool,
+    pub jobs_stopped: u32,
+    pub screens_stopped: u32,
+    pub processes_stopped: u32,
+    /// Their files in shared temporary folders.
+    pub temp_removed: u32,
+    /// `archived`, `held`, `deleted` or `none` (no work folder).
+    pub files: String,
+    /// Where archived work is, in the owner's workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_to: Option<String>,
+}
+
+/// `POST /v1/teammates/{user}/purge`: delete work a removal held aside.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TeammatePurge {
+    pub owner_id: String,
+    pub cleanup_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeammatePurged {
+    /// There was held work, and it's gone now.
+    pub purged: bool,
+}
+
 /// `token` as a viewer password: plain lowercase hex, long enough to guess at no rate.
 pub fn screen_token(token: &str) -> bool {
     (32..=128).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -290,6 +360,10 @@ pub struct Heartbeat {
     /// Its screens, if it can show them (`CAN_SCREENS`).
     #[serde(default)]
     pub screens: Option<ScreenReport>,
+    /// The ids of teammates who have their own user on it (ADR 0048), when it can
+    /// remove them (`CAN_TEAMMATE_REMOVAL`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teammates: Option<Vec<String>>,
 }
 
 /// Whether a harness is logged in on the machine: whether one of the credential files
