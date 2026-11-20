@@ -20,6 +20,7 @@ export function limitSummary(limits: TierView["limits"]): string[] {
     n(limits.monthlyRuns, "run a month", "runs a month", "Unlimited runs"),
     n(limits.dailyRoutineRuns, "routine run a day", "routine runs a day", "Unlimited routine runs"),
   ];
+  if (limits.monthlyTokens != null) lines.splice(2, 0, n(limits.monthlyTokens, "model token a month", "model tokens a month", ""));
   if (limits.machineType) lines.push(`Machine: ${limits.machineType}`);
   return lines;
 }

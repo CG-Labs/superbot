@@ -3,7 +3,7 @@ import { act, render, screen, userEvent } from "@testing-library/react-native";
 import { CONFIRM_EVERY_MS, PlanView } from "../PlanView";
 import PlanScreen from "../../app/plan";
 import { ApiError } from "../../src/api";
-import type { BillingView } from "../../src/types";
+import type { BillingView, MyUsage } from "../../src/types";
 
 const mockCtx: Record<string, unknown> = {};
 const mockRedirect = jest.fn((_href: string) => null);
@@ -32,9 +32,20 @@ function billing(over: Partial<BillingView> = {}): BillingView {
   };
 }
 
-function fakeApi(view: BillingView | null) {
+const totals = { input: 1000, output: 200, cacheRead: 300, cacheWrite: 0, total: 1500, runs: 1, unreportedRuns: 0 };
+const usage: MyUsage = {
+  user: "u1",
+  tier: starter,
+  period: { key: "2026-11", start: Date.UTC(2026, 10, 1), end: Date.UTC(2026, 11, 1), source: "calendar" },
+  tokens: { ...totals, limit: null },
+  runs: { used: 12, limit: 300 },
+  byBot: [{ ...totals, bot: "b1", name: "Scout" }],
+};
+
+function fakeApi(view: BillingView | null, mine: MyUsage | null = null) {
   return {
     billing: jest.fn(async (): Promise<BillingView | null> => view),
+    myUsage: jest.fn(async (): Promise<MyUsage | null> => mine),
     checkout: jest.fn(async (tier: string) => ({ url: `https://checkout.stripe.com/c/pay/${tier}` })),
     billingPortal: jest.fn(async () => ({ url: "https://billing.stripe.com/p/session/1" })),
   };
@@ -115,6 +126,29 @@ describe("PlanView (ADR 0042)", () => {
     } finally {
       jest.useRealTimers();
     }
+  });
+
+  it("shows your tokens and runs this period (ADR 0048)", async () => {
+    await render(<PlanView api={fakeApi(billing(), usage)} onBack={jest.fn()} />);
+    expect(await screen.findByText("Usage this period")).toBeOnTheScreen();
+    expect(screen.getByText("This month: 2026-11-01 to 2026-12-01 (UTC)")).toBeOnTheScreen();
+    expect(screen.getByText("Model tokens: 1,500 (no limit)")).toBeOnTheScreen();
+    expect(screen.getByText("Scout: 1,500 tokens in 1 run")).toBeOnTheScreen();
+  });
+
+  it("still shows the plan when usage can't load", async () => {
+    const api = fakeApi(billing());
+    api.myUsage.mockRejectedValueOnce(new ApiError("Server error", 500));
+    await render(<PlanView api={api} onBack={jest.fn()} />);
+    expect(await screen.findByText("Starter plan")).toBeOnTheScreen();
+    expect(screen.queryByText("Usage this period")).toBeNull();
+    expect(screen.queryByText("Server error")).toBeNull();
+  });
+
+  it("shows usage on a server without billing", async () => {
+    await render(<PlanView api={fakeApi(null, usage)} onBack={jest.fn()} />);
+    expect(await screen.findByText("Billing isn't set up on this server.")).toBeOnTheScreen();
+    expect(screen.getByText("Usage this period")).toBeOnTheScreen();
   });
 
   it("says so on a server without billing", async () => {

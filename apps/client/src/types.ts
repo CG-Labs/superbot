@@ -80,7 +80,41 @@ export interface TierView extends TierBadge {
 
 /** A plan with what the user has used of it (`/api/me/tier`, and admins' user views). */
 export interface PlanUsage extends TierView {
-  usage: { period: string; runs: number; bots: number; day?: string; routineRuns?: number };
+  usage: {
+    period: string;
+    runs: number;
+    bots: number;
+    day?: string;
+    routineRuns?: number;
+    /** Model tokens this billing period (ADR 0048). Missing from older servers. */
+    tokens?: number;
+    periodStart?: number;
+    periodEnd?: number;
+    periodSource?: "subscription" | "calendar";
+  };
+}
+/** Model tokens over some runs, as harnesses report them (ADR 0048). */
+export interface TokenTotals {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  total: number;
+  runs: number;
+  /** Runs whose harness reported no tokens: not counted, not free. */
+  unreportedRuns: number;
+}
+/** `GET /api/me/usage`: your model tokens and runs this billing period (ADR 0048). */
+export interface MyUsage {
+  user: string;
+  tier: TierView;
+  /** Your paid subscription's period, else the calendar month (UTC). Unix ms, end excluded. */
+  period: { key: string; start: number; end: number; source: "subscription" | "calendar" };
+  tokens: TokenTotals & { limit: number | null };
+  runs: { used: number; limit: number | null };
+  byBot: (TokenTotals & { bot: string; name: string | null })[];
+  /** Only when your plan lets you pick models (ADR 0033), or for admins. */
+  byModel?: (TokenTotals & { model: string | null })[];
 }
 
 /** A plan for sale through Stripe Checkout (ADR 0042). */
