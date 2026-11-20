@@ -1091,10 +1091,9 @@ async fn agent_with(env: &mut Env, mid: &str, token: &str, harness: &str) -> OnM
     }
 }
 
-/// The Bot's next reply after message `before`. Generous: a debug build under a
-/// loaded CI runner moves the flood test's 17 MB slowly.
+/// The Bot's next reply after message `before`.
 async fn reply_after(env: &Env, bot: &str, before: i64) -> String {
-    for _ in 0..2400 {
+    for _ in 0..600 {
         if let Some(m) = env.app.db.replies_after(bot, before).into_iter().next() {
             return m.text;
         }
