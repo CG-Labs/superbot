@@ -45,6 +45,16 @@ describe("Sidebar admin entries", () => {
     expect(props.onOpenAudit).toHaveBeenCalledTimes(1);
     await user.press(screen.getByText("Users"));
     expect(props.onOpenUsers).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("link", { name: "Finish server setup" })).toBeNull();
+  });
+
+  it("points admins at the setup wizard while it waits for them", async () => {
+    const onOpenSetup = jest.fn();
+    const props = { ...setup({ name: "Owner", role: "admin", permissions: ALL }), onOpenSetup };
+    const user = userEvent.setup();
+    await render(<Sidebar {...props} />);
+    await user.press(screen.getByRole("link", { name: "Finish server setup" }));
+    expect(onOpenSetup).toHaveBeenCalledTimes(1);
   });
 
   it.each([
@@ -53,7 +63,8 @@ describe("Sidebar admin entries", () => {
     ["a Bot", { name: "Scout", role: "bot", permissions: ["account", "read", "write"] }],
     ["a server from before roles", { name: "You" }],
   ] as [string, Me][])("shows %s none of them", async (_, me) => {
-    await render(<Sidebar {...setup(me)} />);
+    await render(<Sidebar {...setup(me)} onOpenSetup={jest.fn()} />);
+    expect(screen.queryByRole("link", { name: "Finish server setup" })).toBeNull();
     expect(screen.queryByRole("link", { name: "Admin console" })).toBeNull();
     expect(screen.queryByText("Admin console ↗")).toBeNull();
     expect(screen.queryByText("Audit log")).toBeNull();

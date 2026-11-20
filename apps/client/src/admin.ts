@@ -1,4 +1,5 @@
 import { Linking } from "react-native";
+import type { SuperBotApi } from "./api";
 import { normalizeBaseUrl } from "./auth";
 import type { Me } from "./types";
 
@@ -21,4 +22,26 @@ export function consoleUrl(baseUrl: string): string {
  */
 export function openConsole(baseUrl: string): Promise<void> {
   return Linking.openURL(consoleUrl(baseUrl));
+}
+
+/** The console's onboarding wizard (ADR 0034). */
+export function setupUrl(baseUrl: string): string {
+  return `${consoleUrl(baseUrl)}#setup`;
+}
+
+export function openSetup(baseUrl: string): Promise<void> {
+  return Linking.openURL(setupUrl(baseUrl));
+}
+
+/**
+ * Whether to point this admin at the setup wizard: until an admin finishes or hides it.
+ * Never for anyone else, and not when the server is older than the wizard or can't say.
+ */
+export async function setupPending(api: Pick<SuperBotApi, "setupStatus">, me: Me): Promise<boolean> {
+  if (!isAdmin(me)) return false;
+  try {
+    return (await api.setupStatus()).progress?.show === true;
+  } catch {
+    return false;
+  }
 }

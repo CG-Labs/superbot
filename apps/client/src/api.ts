@@ -15,6 +15,7 @@ import type {
   Routine,
   ServerConfig,
   SessionView,
+  SetupStatus,
   SignupApproval,
   SignupRequest,
   UserBots,
@@ -272,6 +273,11 @@ export class SuperBotApi {
 
   async userBots(id: string): Promise<UserBots> {
     return this.request<UserBots>("GET", `/api/users/${encodeURIComponent(id)}/bots`);
+  }
+
+  /** The onboarding wizard's progress and checklist: admins only (ADR 0034). The wizard is in the console. */
+  async setupStatus(): Promise<SetupStatus> {
+    return this.request<SetupStatus>("GET", "/api/setup");
   }
 
   // Requests for access from the landing page: admins only (ADR 0022).
