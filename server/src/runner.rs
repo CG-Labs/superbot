@@ -314,18 +314,27 @@ impl App {
     /// users' folders from the last time may be older than botd's originals, which
     /// runs changed meanwhile, so they're dropped and made again at each Bot's next run.
     /// While accounts stay on, a copy is never replaced: it may hold a running Bot's edits.
+    /// Saved as on only once every copy is gone, so a cleanup cut short runs again.
     pub fn start_isolation(&self) {
         let Some(iso) = self.isolation() else {
-            self.db.swap_isolation(false);
+            self.db.save_isolation(false);
             return;
         };
-        if self.db.swap_isolation(true) {
+        if self.db.isolation_was_on() {
             return;
         }
         let bots = self.db.bots().into_iter().filter_map(|b| iso.memory_file(&b.owner_id, &b.id));
         let users = self.db.users().into_iter().filter_map(|u| iso.user_file(&u.id));
-        for copy in bots.chain(users) {
-            accounts::remove(&copy);
+        let left: Vec<PathBuf> = bots
+            .chain(users)
+            .filter(|copy| {
+                accounts::remove(copy);
+                std::fs::symlink_metadata(copy).is_ok()
+            })
+            .collect();
+        match left.first() {
+            None => self.db.save_isolation(true),
+            Some(p) => eprintln!("WARNING: couldn't remove {} old memory copies (e.g. {}); botd tries again at its next start.", left.len(), p.display()),
         }
     }
 
@@ -1347,11 +1356,18 @@ mod tests {
 
         // Turned off, then on again: runs changed the originals meanwhile, so the old copies
         // are dropped at startup and made again, never copied back over the originals.
-        assert!(!app.db.swap_isolation(false));
+        app.db.save_isolation(false);
         std::fs::write(&mem, "# A1\n- from before\n").unwrap();
         std::fs::write(&kept, "# A1\n- learned while off\n").unwrap();
+        // A copy it can't remove keeps the cleanup due at the next start.
+        std::fs::remove_file(&facts).unwrap();
+        std::fs::create_dir(&facts).unwrap();
         app.start_isolation();
-        assert!(!mem.exists() && !facts.exists());
+        assert!(!mem.exists() && !app.db.isolation_was_on());
+        std::fs::remove_dir(&facts).unwrap();
+        std::fs::write(&mem, "# A1\n- from before\n").unwrap();
+        app.start_isolation();
+        assert!(!mem.exists() && app.db.isolation_was_on());
         app.init_bot_files(&a);
         assert_eq!(read(&mem), "# A1\n- learned while off\n");
         app.keep_memory(&a);
