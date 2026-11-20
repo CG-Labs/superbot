@@ -17,6 +17,8 @@ use std::time::Duration;
 pub struct Hermes {
     /// Text streamed since the last tool call: one chat bubble.
     block: String,
+    /// The model `system/init` named, for the tokens `result` reports.
+    model: Option<String>,
 }
 
 /// Hermes caps shell hook timeouts at 300 seconds.
@@ -155,7 +157,10 @@ impl Adapter for Hermes {
             }
         };
         match str_of(e, "type") {
-            "system" => session(out),
+            "system" => {
+                self.model = e["model"].as_str().map(str::trim).filter(|m| !m.is_empty()).map(String::from);
+                session(out);
+            }
             "text" => {
                 let t = str_of(e, "text");
                 // A new block after a tool call starts with blank lines.
@@ -171,6 +176,7 @@ impl Adapter for Hermes {
             }
             "result" => {
                 session(out);
+                self.usage(&e["tokens"], out);
                 let code = e["exit_code"].as_i64().unwrap_or(0);
                 let error = e["error"].as_str().filter(|s| !s.trim().is_empty());
                 if code != 0 || error.is_some() {
@@ -204,6 +210,17 @@ impl Adapter for Hermes {
 }
 
 impl Hermes {
+    /// `result.tokens`: `{input, output, total, cache_read, cache_write}`, Hermes's
+    /// canonical counts (input excludes the cache). Hermes writes 0 for counts the
+    /// provider didn't give, so all zeros is unknown, not free.
+    fn usage(&self, t: &Value, out: &mut Vec<AgentEvent>) {
+        let n = |k: &str| super::Usage::count(&t[k]);
+        let u = super::Usage { model: self.model.clone(), input: n("input"), output: n("output"), cache_read: n("cache_read"), cache_write: n("cache_write") };
+        if u.total() > 0 {
+            out.push(AgentEvent::Usage(u));
+        }
+    }
+
     fn flush(&mut self, out: &mut Vec<AgentEvent>) {
         let text = std::mem::take(&mut self.block);
         if !text.trim().is_empty() {
@@ -248,8 +265,25 @@ mod tests {
                 AgentEvent::Text(t) => format!("text {t}"),
                 AgentEvent::Tool { name, detail } => format!("tool {name}: {detail}"),
                 AgentEvent::Error(m) => format!("error {m}"),
+                AgentEvent::Usage(u) => format!("usage {} in={} out={} read={} write={}", u.model.unwrap_or_default(), u.input, u.output, u.cache_read, u.cache_write),
             })
             .collect()
+    }
+
+    #[test]
+    fn tokens_come_from_the_result() {
+        let ran = events(&[
+            r#"{"type": "system", "subtype": "init", "model": "anthropic/claude-sonnet-4.5", "session_id": "", "timestamp": 1}"#,
+            r#"{"type": "result", "session_id": "local-1", "exit_code": 0, "text": "Done.", "tokens": {"input": 1200, "output": 340, "total": 1940, "cache_read": 400, "cache_write": 0}}"#,
+        ]);
+        assert_eq!(ran[1], "usage anthropic/claude-sonnet-4.5 in=1200 out=340 read=400 write=0");
+        // A failed turn still spent what it spent.
+        let failed = events(&[r#"{"type": "result", "exit_code": 1, "text": "", "error": "rate limited", "tokens": {"input": 10, "output": 0, "total": 10, "cache_read": 0, "cache_write": 0}}"#]);
+        assert_eq!(failed, ["usage  in=10 out=0 read=0 write=0", "error rate limited"]);
+        // All zeros (the provider gave no counts) or no tokens at all: unknown, so nothing.
+        let zeros = events(&[r#"{"type": "result", "session_id": "s", "exit_code": 0, "text": "Hi", "tokens": {"input": 0, "output": 0, "total": 0, "cache_read": 0, "cache_write": 0}}"#]);
+        assert!(!zeros.iter().any(|e| e.starts_with("usage")), "{zeros:?}");
+        assert!(!events(&[r#"{"type": "result", "session_id": "s", "exit_code": 0, "text": "Hi"}"#]).iter().any(|e| e.starts_with("usage")));
     }
 
     #[test]

@@ -2,16 +2,16 @@ import React, { useCallback, useEffect, useState } from "react";
 import { ActivityIndicator, AppState, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
 import { checkoutNotice, limitSummary, openBillingPage, subscriptionLine } from "../src/billing";
-import { overLimits, planUsageLines } from "../src/plan";
+import { overLimits, planUsageLines, usageLines } from "../src/plan";
 import { colors } from "../src/theme";
-import type { BillingView } from "../src/types";
+import type { BillingView, MyUsage } from "../src/types";
 
 /** After a successful checkout, how often and how many times to look for Stripe's confirmation. */
 export const CONFIRM_EVERY_MS = 3000;
 const CONFIRM_TRIES = 20;
 
 interface Props {
-  api: Pick<SuperBotApi, "billing" | "checkout" | "billingPortal">;
+  api: Pick<SuperBotApi, "billing" | "checkout" | "billingPortal" | "myUsage">;
   onBack: () => void;
   /** `?checkout=` from Stripe's return link. */
   checkout?: string | string[];
@@ -19,16 +19,34 @@ interface Props {
   open?: (url: string) => Promise<void>;
 }
 
+/** Your model tokens and runs this billing period (ADR 0048). */
+function UsageCard({ usage }: { usage: MyUsage }) {
+  return (
+    <View style={styles.card} accessibilityLabel="Usage this period">
+      <Text style={styles.cardTitle}>Usage this period</Text>
+      {usageLines(usage).map((l) => (
+        <Text key={l} style={styles.line}>
+          {l}
+        </Text>
+      ))}
+    </View>
+  );
+}
+
 /** Your plan, your use of it, and Stripe's pages to buy or manage one (ADR 0042). */
 export function PlanView({ api, onBack, checkout, open = openBillingPage }: Props) {
   const [view, setView] = useState<BillingView | null | undefined>(undefined);
+  const [usage, setUsage] = useState<MyUsage | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const notice = checkoutNotice(checkout);
 
   const load = useCallback(async () => {
     try {
-      setView(await api.billing());
+      // Usage is extra: the plan still shows if it can't load.
+      const [b, u] = await Promise.all([api.billing(), api.myUsage().catch(() => null)]);
+      setView(b);
+      setUsage(u);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -90,6 +108,11 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
       <View style={styles.root}>
         {header}
         <Text style={[styles.dim, styles.pad]}>Billing isn't set up on this server.</Text>
+        {usage ? (
+          <ScrollView contentContainerStyle={styles.body}>
+            <UsageCard usage={usage} />
+          </ScrollView>
+        ) : null}
       </View>
     );
   }
@@ -137,6 +160,7 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
             ) : null}
           </View>
         ) : null}
+        {usage ? <UsageCard usage={usage} /> : null}
         {view?.plans.length ? <Text style={styles.section}>Plans</Text> : null}
         {view?.plans.map((p) => (
           <View key={p.name} style={[styles.card, p.current && styles.currentCard]}>

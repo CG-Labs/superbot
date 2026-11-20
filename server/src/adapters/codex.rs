@@ -3,7 +3,7 @@
 //! changes reach it only through its memory file, not the system prompt.
 //! Approvals: an inline PreToolUse hook. Hosted tools such as web search skip hooks.
 
-use super::{output, short, str_of, Adapter, AgentEvent, ModelOption, RunInput};
+use super::{output, short, str_of, Adapter, AgentEvent, ModelOption, RunInput, Usage};
 use serde_json::Value;
 
 pub struct Codex;
@@ -62,6 +62,16 @@ impl Adapter for Codex {
                 };
                 out.push(AgentEvent::Tool { name: kind.into(), detail })
             }
+            // OpenAI counts cached prompt tokens inside `input_tokens`, and reasoning inside
+            // `output_tokens`; `codex exec` doesn't name the model.
+            "turn.completed" => {
+                let u = &e["usage"];
+                let (input, read, write) = (Usage::count(&u["input_tokens"]), Usage::count(&u["cached_input_tokens"]), Usage::count(&u["cache_write_input_tokens"]));
+                let usage = Usage { model: None, input: input.saturating_sub(read).saturating_sub(write), output: Usage::count(&u["output_tokens"]), cache_read: read, cache_write: write };
+                if usage.total() > 0 {
+                    out.push(AgentEvent::Usage(usage));
+                }
+            }
             "turn.failed" | "error" => {
                 let msg = e["error"]["message"].as_str().or(e["message"].as_str()).unwrap_or("Codex failed");
                 out.push(AgentEvent::Error(msg.into()))
@@ -118,4 +128,22 @@ fn unwrap(cmd: &str) -> String {
         .and_then(|(_, rest)| rest.strip_suffix('\''))
         .unwrap_or(cmd);
     short(inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokens_come_from_the_finished_turn() {
+        let mut out = Vec::new();
+        let line = r#"{"type":"turn.completed","usage":{"input_tokens":24763,"cached_input_tokens":24448,"cache_write_input_tokens":0,"output_tokens":122,"reasoning_output_tokens":64}}"#;
+        Codex.on_event(&serde_json::from_str(line).unwrap(), &mut out);
+        let [AgentEvent::Usage(u)] = out.as_slice() else { panic!("one usage event") };
+        assert_eq!((u.model.as_deref(), u.input, u.cache_read, u.output, u.total()), (None, 315, 24448, 122, 24885));
+        out.clear();
+        Codex.on_event(&serde_json::from_str(r#"{"type":"turn.completed","usage":{}}"#).unwrap(), &mut out);
+        Codex.on_event(&serde_json::from_str(r#"{"type":"turn.completed"}"#).unwrap(), &mut out);
+        assert!(out.is_empty(), "no counts: unknown");
+    }
 }

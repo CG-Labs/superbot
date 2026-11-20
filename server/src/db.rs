@@ -159,6 +159,61 @@ fn message_row(r: &Row) -> rusqlite::Result<Message> {
     })
 }
 
+/// One model's tokens for one run, to record (ADR 0048). `reported` false: the harness
+/// didn't say, so the counts are 0 and unknown.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TokenRow {
+    pub user_id: String,
+    pub bot_id: String,
+    pub run_id: String,
+    pub message_id: Option<i64>,
+    pub harness: String,
+    pub model: Option<String>,
+    pub reported: bool,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub at: i64,
+    /// Queue it for Stripe's meter.
+    pub meter: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TokenTotals {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub runs: u64,
+    /// Runs whose harness didn't report tokens.
+    pub unreported_runs: u64,
+}
+
+impl TokenTotals {
+    pub fn total(&self) -> u64 {
+        self.input + self.output + self.cache_read + self.cache_write
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TokenSummary {
+    pub all: TokenTotals,
+    pub by_model: Vec<(Option<String>, TokenTotals)>,
+    pub by_bot: Vec<(String, TokenTotals)>,
+}
+
+/// A token row waiting for Stripe's meter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MeterRow {
+    pub id: i64,
+    pub user_id: String,
+    pub run_id: String,
+    pub tokens: u64,
+    pub at: i64,
+    pub attempts: i64,
+}
+
 /// A subscription at a payment provider (ADR 0040). Every one a user has had is kept,
 /// ended ones too, so a late event for one is judged against its own history.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -172,6 +227,8 @@ pub struct Subscription {
     pub price_id: Option<String>,
     /// The tier it pays for; None when it pays for none (ended, or an unknown price).
     pub tier: Option<String>,
+    /// Start of the paid period, Unix seconds (ADR 0048). None: from before it was kept.
+    pub period_start: Option<i64>,
     /// End of the paid period, Unix seconds.
     pub period_end: Option<i64>,
     /// When the provider created the subscription, Unix seconds. Of a user's paying
@@ -192,6 +249,7 @@ fn subscription_row(r: &Row) -> rusqlite::Result<Subscription> {
         status: r.get("status")?,
         price_id: r.get("price_id")?,
         tier: r.get("tier")?,
+        period_start: r.get("period_start")?,
         period_end: r.get("period_end")?,
         started: r.get("started")?,
         event_created: r.get("event_created")?,
@@ -1036,7 +1094,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 19] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 20] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1056,7 +1114,42 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 19] = [
     migrate_billing_customers,
     migrate_routine_authors,
     migrate_routine_pauses,
+    migrate_token_usage,
 ];
+
+/// Token metering (ADR 0048): the model tokens each run used, one row per model, or one
+/// row with `reported = 0` when the harness didn't say. Charged to the Bot's owner, like
+/// the run; `user_id` and `bot_id` have no foreign key, as `bots.owner_id` doesn't, so a
+/// deleted Bot's usage stays billed. `meter_status` is for reporting to Stripe, when
+/// that's on. Subscriptions keep their period's start, for billing-period usage.
+fn migrate_token_usage(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('subscriptions') WHERE name = 'period_start'", [], |r| r.get(0))?;
+    if !has {
+        c.execute_batch("ALTER TABLE subscriptions ADD COLUMN period_start INTEGER;")?;
+    }
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS token_usage (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          bot_id TEXT NOT NULL,
+          run_id TEXT NOT NULL,
+          message_id INTEGER,
+          harness TEXT NOT NULL,
+          model TEXT,
+          reported INTEGER NOT NULL CHECK (reported IN (0, 1)),
+          input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
+          output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
+          cache_read_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_read_tokens >= 0),
+          cache_write_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_write_tokens >= 0),
+          at INTEGER NOT NULL,
+          meter_status TEXT CHECK (meter_status IN ('pending', 'sent', 'failed')),
+          meter_attempts INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS token_usage_user_at ON token_usage(user_id, at);
+        CREATE INDEX IF NOT EXISTS token_usage_run ON token_usage(run_id);
+        CREATE INDEX IF NOT EXISTS token_usage_meter ON token_usage(id) WHERE meter_status = 'pending';",
+    )
+}
 
 /// Why botd paused a routine, and for whom (ADR 0047), so it can be resumed.
 fn migrate_routine_pauses(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
@@ -2381,6 +2474,96 @@ impl Db {
 
     /// Notes a refused routine run. True for the user's first refusal that day, so the
     /// Bot says so once a day instead of at every firing.
+    /// Records one run's model tokens (ADR 0048), all rows or none.
+    pub fn record_tokens(&self, rows: &[TokenRow]) -> rusqlite::Result<()> {
+        let mut c = self.c();
+        let tx = c.transaction()?;
+        for r in rows {
+            let n = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+            tx.execute(
+                "INSERT INTO token_usage (user_id, bot_id, run_id, message_id, harness, model, reported,
+                   input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, at, meter_status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    r.user_id,
+                    r.bot_id,
+                    r.run_id,
+                    r.message_id,
+                    r.harness,
+                    r.model,
+                    r.reported,
+                    n(r.input),
+                    n(r.output),
+                    n(r.cache_read),
+                    n(r.cache_write),
+                    r.at,
+                    r.meter.then_some("pending")
+                ],
+            )?;
+        }
+        tx.commit()
+    }
+
+    /// Every model token a user's runs used in `[start, end)`, Unix ms.
+    pub fn tokens_used(&self, user_id: &str, start: i64, end: i64) -> u64 {
+        self.c()
+            .query_row(
+                "SELECT COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens), 0)
+                 FROM token_usage WHERE user_id = ?1 AND at >= ?2 AND at < ?3",
+                params![user_id, start, end],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_or(0, |n| u64::try_from(n).unwrap_or(0))
+    }
+
+    /// A user's tokens in `[start, end)`, Unix ms: in all, per model, and per Bot.
+    pub fn token_summary(&self, user_id: &str, start: i64, end: i64) -> TokenSummary {
+        let c = self.c();
+        let sums = "COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(cache_write_tokens), 0), COUNT(DISTINCT run_id), COUNT(DISTINCT CASE WHEN reported = 0 THEN run_id END)";
+        let totals = |r: &rusqlite::Row, at: usize| -> rusqlite::Result<TokenTotals> {
+            let n = |i: usize| r.get::<_, i64>(at + i).map(|v| u64::try_from(v).unwrap_or(0));
+            Ok(TokenTotals { input: n(0)?, output: n(1)?, cache_read: n(2)?, cache_write: n(3)?, runs: n(4)?, unreported_runs: n(5)? })
+        };
+        let all = c
+            .query_row(&format!("SELECT {sums} FROM token_usage WHERE user_id = ?1 AND at >= ?2 AND at < ?3"), params![user_id, start, end], |r| totals(r, 0))
+            .unwrap_or_default();
+        let grouped = |by: &str| -> Vec<(Option<String>, TokenTotals)> {
+            let sql = format!("SELECT {by}, {sums} FROM token_usage WHERE user_id = ?1 AND at >= ?2 AND at < ?3 GROUP BY {by} ORDER BY {by}");
+            let Ok(mut st) = c.prepare(&sql) else { return Vec::new() };
+            st.query_map(params![user_id, start, end], |r| Ok((r.get::<_, Option<String>>(0)?, totals(r, 1)?)))
+                .map(|rows| rows.filter_map(Result::ok).collect())
+                .unwrap_or_default()
+        };
+        let by_model = grouped("model");
+        let by_bot = grouped("bot_id").into_iter().filter_map(|(id, t)| Some((id?, t))).collect();
+        TokenSummary { all, by_model, by_bot }
+    }
+
+    /// The oldest token rows waiting to go to Stripe.
+    pub fn pending_meter(&self, limit: u32) -> Vec<MeterRow> {
+        let c = self.c();
+        let Ok(mut st) = c.prepare(
+            "SELECT id, user_id, run_id, input_tokens + output_tokens + cache_read_tokens + cache_write_tokens, at, meter_attempts
+             FROM token_usage WHERE meter_status = 'pending' ORDER BY id LIMIT ?1",
+        ) else {
+            return Vec::new();
+        };
+        st.query_map([limit], |r| {
+            Ok(MeterRow { id: r.get(0)?, user_id: r.get(1)?, run_id: r.get(2)?, tokens: u64::try_from(r.get::<_, i64>(3)?).unwrap_or(0), at: r.get(4)?, attempts: r.get(5)? })
+        })
+        .map(|rows| rows.filter_map(Result::ok).collect())
+        .unwrap_or_default()
+    }
+
+    /// Marks a token row `sent` or `failed` at Stripe, or counts one more try when None.
+    pub fn meter_result(&self, id: i64, status: Option<&str>) {
+        let _ = self.c().execute(
+            "UPDATE token_usage SET meter_status = COALESCE(?2, meter_status), meter_attempts = meter_attempts + 1 WHERE id = ?1",
+            params![id, status],
+        );
+    }
+
     pub fn routine_refused(&self, user_id: &str, day: &str) -> bool {
         self.c()
             .query_row(
@@ -2457,11 +2640,11 @@ impl Db {
             let before = paying_subscription(&tx, &sub.user_id).map_err(|e| e.to_string())?;
             let tier = if set_tier { sub.tier.clone() } else { by_id.and_then(|s| s.tier) };
             tx.execute(
-                "INSERT INTO subscriptions (subscription_id, user_id, provider, customer_id, status, price_id, tier, period_end, started, event_created, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                "INSERT INTO subscriptions (subscription_id, user_id, provider, customer_id, status, price_id, tier, period_end, started, event_created, updated_at, period_start)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT (subscription_id) DO UPDATE SET provider = ?3, customer_id = ?4, status = ?5, price_id = ?6,
-                   tier = ?7, period_end = ?8, event_created = ?10, updated_at = ?11",
-                params![sub.subscription_id, sub.user_id, sub.provider, sub.customer_id, sub.status, sub.price_id, tier, sub.period_end, sub.started, sub.event_created, now()],
+                   tier = ?7, period_end = ?8, event_created = ?10, updated_at = ?11, period_start = ?12",
+                params![sub.subscription_id, sub.user_id, sub.provider, sub.customer_id, sub.status, sub.price_id, tier, sub.period_end, sub.started, sub.event_created, now(), sub.period_start],
             )
             .map_err(|e| e.to_string())?;
             let after = paying_subscription(&tx, &sub.user_id).map_err(|e| e.to_string())?;
@@ -3744,6 +3927,7 @@ mod tests {
                         status: status.into(),
                         price_id: None,
                         tier: tier.map(String::from),
+                        period_start: None,
                         period_end: None,
                         started,
                         event_created: at,

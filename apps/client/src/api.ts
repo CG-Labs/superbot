@@ -10,6 +10,7 @@ import type {
   LoginCode,
   Message,
   ModelOption,
+  MyUsage,
   PersonalSecret,
   Policy,
   PolicyMode,
@@ -291,6 +292,16 @@ export class SuperBotApi {
   async billing(): Promise<BillingView | null> {
     try {
       return await this.request<BillingView>("GET", "/api/billing");
+    } catch (e) {
+      if (e instanceof ApiError && [403, 404, 405].includes(e.status)) return null;
+      throw e;
+    }
+  }
+
+  /** Your model tokens and runs this billing period. null from servers before ADR 0048. */
+  async myUsage(): Promise<MyUsage | null> {
+    try {
+      return await this.request<MyUsage>("GET", "/api/me/usage");
     } catch (e) {
       if (e instanceof ApiError && [403, 404, 405].includes(e.status)) return null;
       throw e;

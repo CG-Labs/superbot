@@ -73,6 +73,9 @@ mod billing;
 mod tiers_http_tests;
 #[cfg(test)]
 mod billing_http_tests;
+mod usage;
+#[cfg(test)]
+mod usage_http_tests;
 mod users;
 #[cfg(test)]
 mod users_http_tests;
@@ -315,7 +318,10 @@ async fn main() {
         ..Auth::new(Some(app.clone()))
     });
     println!("Control plane: {}.", auth_state.machines.describe());
-    println!("Billing: {}.", billing::describe(auth_state.payments.enabled(), auth_state.payments.checkout_enabled(), app.tiers()));
+    if let Some(m) = auth_state.payments.meter() {
+        let _ = app.meter.set(m);
+    }
+    println!("Billing: {}.", billing::describe(auth_state.payments.enabled(), auth_state.payments.checkout_enabled(), app.meter.get().is_some(), app.tiers()));
     match auth_state.scim.enabled {
         true => println!("SCIM: on at /scim/v2; new users get the {} role.", auth_state.scim.default_role.as_str()),
         false => println!("SCIM: off (SCIM=off)."),
@@ -377,6 +383,7 @@ async fn main() {
 
     app.recover();
     cron::start(app.clone());
+    billing::start_metering(app.clone());
     if app.screens.is_some() {
         let app = app.clone();
         tokio::spawn(async move {
@@ -454,6 +461,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/secrets", get(list_secrets))
         .route("/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/me/tier", get(my_tier))
+        .route("/me/usage", get(usage::mine))
         .route("/tiers", get(list_tiers))
         .route("/usage", get(admin_usage))
         .route("/billing", get(billing::info))
@@ -476,6 +484,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/login-codes", post(users::create_login_code))
         .route("/users/{key}/sessions", delete(users::revoke_user_sessions))
         .route("/users/{key}/bots", get(users::user_bots))
+        .route("/users/{key}/usage", get(usage::of_user))
         .route("/users/{key}/routines", get(handover::list))
         .route("/users/{key}/routines/resume", post(handover::resume_for))
         .route("/users/{key}/handover", post(handover::handover))
@@ -1359,11 +1368,13 @@ async fn my_tier(State(app): State<AppState>, Extension(c): Extension<Caller>) -
 /// A user's tier and their use of it: runs this month, routine runs today (UTC), Bots.
 pub(crate) fn tier_usage(app: &App, user_id: &str) -> Value {
     let at = db::now();
-    let (period, day) = (tiers::period(at), tiers::day(at));
+    let (period, day) = (app.billing_period(user_id, at), tiers::day(at));
     let mut v = app.tier_of(user_id).view();
     v["usage"] = json!({
-        "period": period, "runs": app.db.runs_used(user_id, &period), "bots": app.db.owned_bot_count(user_id),
+        "period": period.key, "runs": app.db.runs_used(user_id, &period.key), "bots": app.db.owned_bot_count(user_id),
         "day": day, "routineRuns": app.db.routine_runs_used(user_id, &day),
+        "tokens": app.db.tokens_used(user_id, period.start, period.end),
+        "periodStart": period.start, "periodEnd": period.end, "periodSource": period.source.as_str(),
     });
     v
 }
@@ -1384,11 +1395,12 @@ async fn admin_usage(State(app): State<AppState>, Extension(a): Extension<Arc<Au
             let used = |k: &str| plan["usage"][k].as_u64().unwrap_or(0);
             let mut over = Vec::new();
             for (name, limit, n) in [
-                ("bots", limits.max_bots, used("bots")),
-                ("monthlyRuns", limits.monthly_runs, used("runs")),
-                ("dailyRoutineRuns", limits.daily_routine_runs, used("routineRuns")),
+                ("bots", limits.max_bots.map(u64::from), used("bots")),
+                ("monthlyRuns", limits.monthly_runs.map(u64::from), used("runs")),
+                ("monthlyTokens", limits.monthly_tokens, used("tokens")),
+                ("dailyRoutineRuns", limits.daily_routine_runs.map(u64::from), used("routineRuns")),
             ] {
-                if limit.is_some_and(|l| n > u64::from(l)) {
+                if limit.is_some_and(|l| n > l) {
                     over.push(name);
                 }
             }
