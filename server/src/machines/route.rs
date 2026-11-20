@@ -183,9 +183,16 @@ pub fn fit(hb: &Heartbeat, bin: &str) -> Result<wire::Layout, Refusal> {
 
 /// Whether the machine's login for `bin` lets a run start (ADR 0041): it's logged in
 /// there, or the run has a key that makes a login unneeded (`keyed`).
+/// An agent from before ADR 0041 can't log in or say whether it is, so it's outdated.
 pub fn logged_in(hb: &Heartbeat, bin: &str, keyed: bool) -> Result<(), Refusal> {
     let there = hb.logins.get(bin).is_some_and(|l| l.state == wire::LOGGED_IN);
-    if there || keyed { Ok(()) } else { Err(Refusal::NotLoggedIn(bin.into())) }
+    if there || keyed {
+        Ok(())
+    } else if !hb.can.iter().any(|c| c == wire::CAN_LOGINS) {
+        Err(Refusal::Outdated(hb.version.clone()))
+    } else {
+        Err(Refusal::NotLoggedIn(bin.into()))
+    }
 }
 
 pub type Checked<'a> = Pin<Box<dyn Future<Output = Result<Heartbeat, String>> + Send + 'a>>;
@@ -421,10 +428,11 @@ mod tests {
 
     #[test]
     fn a_run_needs_its_harness_logged_in_there_or_a_key() {
-        let mut hb = Heartbeat::default();
-        let refused: Result<(), Refusal> = Err(Refusal::NotLoggedIn("claude".into()));
-        assert_eq!(logged_in(&hb, "claude", false), refused, "an agent that can't say is no login");
+        let mut hb = Heartbeat { version: "0.1.0".into(), ..Heartbeat::default() };
+        assert_eq!(logged_in(&hb, "claude", false), Err(Refusal::Outdated("0.1.0".into())), "an agent that can't log in");
         assert_eq!(logged_in(&hb, "claude", true), Ok(()));
+        hb.can.push(wire::CAN_LOGINS.into());
+        assert_eq!(logged_in(&hb, "claude", false), Err(Refusal::NotLoggedIn("claude".into())));
         for (state, ok) in [(wire::LOGGED_OUT, false), (wire::LOGGING_IN, false), (wire::LOGGED_IN, true)] {
             hb.logins.insert("claude".into(), wire::LoginStatus { state: state.into(), since: None });
             assert_eq!(logged_in(&hb, "claude", false).is_ok(), ok, "{state}");
