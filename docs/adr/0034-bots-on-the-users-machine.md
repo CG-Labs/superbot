@@ -58,8 +58,8 @@ botd still builds the harness command. The adapters stay in botd, and the agent 
   - `exit`, with the exit status, the end of stderr and the collected files;
   - `ping` every 15 s while the harness is quiet.
 
-  botd gives up when the machine has been silent for 60 s, and says so in the chat.
-- `POST /v1/jobs/{id}/abort` stops a job (stop, timeout, a missing approval hook, shutdown). The agent sends TERM to the harness's process group, then KILL 5 s later. If the stream hasn't ended 30 s after the abort, botd lets go. The agent also stops a job whose stream botd drops.
+  botd gives up when the machine has been silent for 60 s, and says so in the chat. A machine's certificate says who answered, not that the answer is sane: botd keeps at most 16 MiB of one event and 1 MiB of a heartbeat or refusal, and stops listening beyond that.
+- `POST /v1/jobs/{id}/abort` stops a job (stop, timeout, a missing approval hook, shutdown). The agent sends TERM to the harness's process group, then KILL 5 s later. If the stream hasn't ended 30 s after the abort, botd lets go. Whenever botd stops listening early (too much output, a lost stream), it sends the abort too. The agent also stops a job whose stream botd drops, which it notices by the next ping at the latest. Abort is honoured until the harness and its output have fully ended, so a harness that closes its output and keeps running is still stopped.
 
 The agent checks each job before running it:
 - the job's owner must be the user in the agent's own certificate (403 otherwise: "This machine runs only its own user's Bots");
@@ -67,7 +67,7 @@ The agent checks each job before running it:
 - every path must be inside its home;
 - the program must be on its harness PATH.
 
-It starts each harness from a clean environment: HOME, PATH (`SUPERBOT_HARNESS_PATH`) and LANG are its own, and botd's job env goes on top of that, minus HOME and PATH. Each machine runs at most 8 jobs at once (`SUPERBOT_MAX_JOBS`), and a job id that is already running is refused.
+It starts each harness from a clean environment: HOME, PATH (`SUPERBOT_HARNESS_PATH`) and LANG are its own, and botd's job env goes on top of that, minus HOME and PATH. Because nothing is inherited there, the job env carries every secret a local run would get, including the ones local runs inherit from botd's own environment (never botd's own secrets, such as `AUTH_PASSWORD`). Each machine runs at most 8 jobs at once (`SUPERBOT_MAX_JOBS`), and a job id that is already running is refused.
 
 A new `protocol` number means an incompatible change. botd refuses runs on agents that report an older one (`agent_outdated`) rather than guessing.
 
