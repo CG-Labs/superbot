@@ -61,7 +61,20 @@ export interface TierBadge {
 
 /** A plan as anyone may see it: no model names. */
 export interface TierView extends TierBadge {
-  limits: { maxBots?: number | null; monthlyRuns?: number | null; monthlyTokens?: number | null };
+  limits: {
+    maxBots?: number | null;
+    monthlyRuns?: number | null;
+    monthlyTokens?: number | null;
+    /** Routine runs a day, UTC (ADR 0040). */
+    dailyRoutineRuns?: number | null;
+    /** The machine size (provider plan) the control plane gives this plan's users. */
+    machineType?: string | null;
+  };
+}
+
+/** A plan with what the user has used of it (`/api/me/tier`, and admins' user views). */
+export interface PlanUsage extends TierView {
+  usage: { period: string; runs: number; bots: number; day?: string; routineRuns?: number };
 }
 
 export type Visibility = "private" | "shared";
@@ -131,6 +144,8 @@ export interface AdminUser {
   identities?: UserIdentity[];
   /** Codes made for this user and not used yet. Never the codes themselves. */
   pendingCodes?: { count: number; expiresAt: number } | null;
+  /** Their plan and their use of it (ADR 0033, 0040). */
+  plan?: PlanUsage;
 }
 
 export interface LastLogin {

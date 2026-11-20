@@ -39,6 +39,13 @@ pub struct Limits {
     /// Not enforced: harnesses don't report tokens to botd yet. Shown, for billing (#31).
     #[serde(default)]
     pub monthly_tokens: Option<u64>,
+    /// Routine runs a day (UTC), counted for the Bot's owner when a routine fires (ADR 0040).
+    #[serde(default)]
+    pub daily_routine_runs: Option<u32>,
+    /// The provider plan (a Linode type, e.g. `g6-standard-2`) this tier's users' machines
+    /// get, and the only one the control plane gives them (ADR 0040). Unset: any.
+    #[serde(default)]
+    pub machine_type: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -48,6 +55,8 @@ pub struct Tier {
     /// None: any harness and model. Some: only these, never empty.
     pub routes: Option<Vec<Route>>,
     pub limits: Limits,
+    /// Stripe price ids that pay for this tier (ADR 0040). Admins only see them.
+    pub stripe_prices: Vec<String>,
 }
 
 impl Tier {
@@ -115,6 +124,7 @@ impl Tier {
     pub fn admin_view(&self) -> Value {
         let mut v = self.view();
         v["routes"] = self.routes.as_ref().map_or(json!("any"), |r| json!(r));
+        v["stripePrices"] = json!(self.stripe_prices);
         v
     }
 }
@@ -151,10 +161,16 @@ struct TierCfg {
     routes: Value,
     #[serde(default)]
     limits: Limits,
+    #[serde(default, rename = "stripePrices")]
+    stripe_prices: Vec<String>,
 }
 
 fn slug(s: &str) -> bool {
-    (1..=32).contains(&s.len())
+    slug_of(s, 32)
+}
+
+pub(crate) fn slug_of(s: &str, max: usize) -> bool {
+    (1..=max).contains(&s.len())
         && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         && !s.starts_with('-')
         && !s.ends_with('-')
@@ -177,7 +193,7 @@ fn word(what: &str, s: &Option<String>) -> Result<Option<String>, String> {
 impl Tiers {
     /// The built-in tier: any harness and model, no limits.
     pub fn self_host() -> Tiers {
-        let t = Tier { name: SELF_HOST.into(), label: "Self-host".into(), routes: None, limits: Limits::default() };
+        let t = Tier { name: SELF_HOST.into(), label: "Self-host".into(), routes: None, limits: Limits::default(), stripe_prices: Vec::new() };
         Tiers { list: vec![t], default: 0, source: "built-in".into() }
     }
 
@@ -230,7 +246,27 @@ impl Tiers {
                 _ => return Err(format!("tier \"{name}\": routes must be \"any\" or a list of routes")),
             };
             let label = t.label.map(|l| l.trim().chars().filter(|c| !c.is_control()).take(40).collect::<String>()).filter(|l| !l.is_empty());
-            list.push(Tier { label: label.unwrap_or_else(|| name.clone()), name, routes, limits: t.limits });
+            let mut limits = t.limits;
+            if let Some(m) = &limits.machine_type {
+                let m = m.trim().to_string();
+                if !slug_of(&m, 64) {
+                    return Err(format!("tier \"{name}\": machineType \"{m}\" must be a provider plan id: lowercase letters, digits, and dashes"));
+                }
+                limits.machine_type = Some(m);
+            }
+            let mut prices = Vec::new();
+            for p in t.stripe_prices {
+                let p = p.trim().to_string();
+                let ok = p.starts_with("price_") && (7..=100).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+                if !ok {
+                    return Err(format!("tier \"{name}\": stripePrices: \"{p}\" isn't a Stripe price id (price_...)"));
+                }
+                if prices.contains(&p) || list.iter().any(|x| x.stripe_prices.contains(&p)) {
+                    return Err(format!("tier \"{name}\": Stripe price \"{p}\" is listed twice"));
+                }
+                prices.push(p);
+            }
+            list.push(Tier { label: label.unwrap_or_else(|| name.clone()), name, routes, limits, stripe_prices: prices });
         }
         let default = match default.or(cfg.default.as_deref()).map(str::trim) {
             None => 0,
@@ -269,6 +305,11 @@ impl Tiers {
         &self.list[self.default]
     }
 
+    /// The tier a Stripe price pays for.
+    pub fn by_stripe_price(&self, price: &str) -> Option<&Tier> {
+        self.list.iter().find(|t| t.stripe_prices.iter().any(|p| p == price))
+    }
+
     /// A user's tier: the one assigned to them, else the default. One assigned but no
     /// longer configured is the default too; botd warns about those at startup.
     pub fn of(&self, assigned: Option<&str>) -> &Tier {
@@ -298,14 +339,21 @@ pub fn period(at_ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(at_ms).unwrap_or_default().format("%Y-%m").to_string()
 }
 
+/// The routine-run day a time falls in, as `YYYY-MM-DD` in UTC.
+pub fn day(at_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(at_ms).unwrap_or_default().format("%Y-%m-%d").to_string()
+}
+
 #[cfg(test)]
 pub(crate) const EXAMPLE: &str = r#"{
   "default": "starter",
   "tiers": [
     { "name": "starter", "label": "Starter",
       "routes": [{ "harness": "claude", "model": "claude-haiku-4-5", "effort": "low" }],
-      "limits": { "maxBots": 2, "monthlyRuns": 3 } },
+      "limits": { "maxBots": 2, "monthlyRuns": 3, "dailyRoutineRuns": 2, "machineType": "g6-standard-1" },
+      "stripePrices": ["price_starter_monthly"] },
     { "name": "pro", "label": "Pro",
+      "stripePrices": ["price_pro_monthly", "price_pro_yearly"],
       "routes": [
         { "harness": "claude", "model": "claude-sonnet-4-5" },
         { "harness": "claude", "model": "claude-opus-4-1", "effort": "high" },
@@ -380,6 +428,37 @@ mod tests {
         assert!(bad(&one(r#"{"name":"a","routes":[{"harness":"claude","modle":"x"}]}"#)).contains("unknown field"));
         assert!(bad(&one(r#"{"name":"a","routes":"any","limits":{"maxBot":1}}"#)).contains("unknown field"));
         assert!(bad(&format!(r#"{{"default":"gold","tiers":[{}]}}"#, r#"{"name":"a","routes":"any"}"#)).contains("\"gold\" isn't listed"));
+        assert!(bad(&one(r#"{"name":"a","routes":"any","limits":{"machineType":"G6 Standard"}}"#)).contains("machineType"));
+        assert!(bad(&one(r#"{"name":"a","routes":"any","stripePrices":["prod_123"]}"#)).contains("isn't a Stripe price id"));
+        assert!(bad(&one(r#"{"name":"a","routes":"any","stripePrices":["price_1","price_1"]}"#)).contains("twice"));
+        assert!(bad(r#"{"tiers":[{"name":"a","routes":"any","stripePrices":["price_1"]},{"name":"b","routes":"any","stripePrices":["price_1"]}]}"#).contains("twice"));
+    }
+
+    #[test]
+    fn limits_for_routines_machines_and_prices() {
+        let t = tiers();
+        let starter = t.get("starter").unwrap();
+        assert_eq!((starter.limits.daily_routine_runs, starter.limits.machine_type.as_deref()), (Some(2), Some("g6-standard-1")));
+        let pro = t.get("pro").unwrap();
+        assert_eq!((pro.limits.daily_routine_runs, pro.limits.machine_type.as_deref()), (None, None));
+        assert_eq!(t.by_stripe_price("price_pro_yearly").unwrap().name, "pro");
+        assert_eq!(t.by_stripe_price("price_starter_monthly").unwrap().name, "starter");
+        assert!(t.by_stripe_price("price_unknown").is_none());
+        // Prices are for admins; everyone sees the limits.
+        assert!(starter.view().get("stripePrices").is_none());
+        assert_eq!(starter.view()["limits"]["dailyRoutineRuns"], 2);
+        assert_eq!(starter.admin_view()["stripePrices"], json!(["price_starter_monthly"]));
+        // The built-in tier limits nothing.
+        let open = Tiers::self_host();
+        let l = &open.default_tier().limits;
+        assert_eq!((l.daily_routine_runs, l.machine_type.as_deref(), open.by_stripe_price("price_x").is_none()), (None, None, true));
+    }
+
+    #[test]
+    fn days_are_utc() {
+        assert_eq!(day(0), "1970-01-01");
+        assert_eq!(day(1_796_083_199_999), "2026-11-30");
+        assert_eq!(day(1_796_083_200_000), "2026-12-01");
     }
 
     #[test]

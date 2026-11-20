@@ -33,7 +33,7 @@ async fn world() -> World {
 }
 
 /// A stand-in `claude` that replies with the model and effort it was started with.
-fn fake_claude(app: &App) {
+pub(crate) fn fake_claude(app: &App) {
     use std::os::unix::fs::PermissionsExt;
     let path = app.cfg.bin_dir.join("claude");
     let script = r#"#!/bin/sh
@@ -53,7 +53,7 @@ printf '%s\n' "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tex
 }
 
 /// Sends `text` and waits for the Bot's reply.
-async fn run(port: u16, app: &App, who: &str, bot: &str) -> String {
+pub(crate) async fn run(port: u16, app: &App, who: &str, bot: &str) -> String {
     let before = app.db.last_id();
     let (code, body) = call(port, "POST", &format!("/api/bots/{bot}/messages"), who, r#"{"text":"go"}"#).await;
     assert_eq!(code, 202, "{body}");

@@ -471,14 +471,18 @@ impl App {
     }
 
     async fn run_one(self: &Arc<Self>, mut bot: Bot, msg: &Message) {
+        let cant_run = |text: &str| {
+            self.give_back_routine(&bot, msg);
+            self.say(&bot.id, text, true);
+        };
         let Some((shell_tool, bin)) = adapters::get(&bot.harness).map(|a| (a.shell_tool(), a.bin())) else {
-            return self.say(&bot.id, &format!("Unknown harness \"{}\".", bot.harness), true);
+            return cant_run(&format!("Unknown harness \"{}\".", bot.harness));
         };
         let Some(bot_dir) = self.bot_dir(&bot.id) else {
-            return self.say(&bot.id, "This Bot's id isn't a safe folder name, so it can't run.", true);
+            return cant_run("This Bot's id isn't a safe folder name, so it can't run.");
         };
         let Some(space) = self.run_space(&bot) else {
-            return self.say(&bot.id, "This Bot's owner id isn't a safe folder name, so it can't run.", true);
+            return cant_run("This Bot's owner id isn't a safe folder name, so it can't run.");
         };
         let by = self.requester(&bot, msg);
         let period = tiers::period(crate::db::now());
@@ -688,7 +692,7 @@ impl App {
     async fn place(&self, bot: &Bot, msg: &Message, by: &Who, period: &str, bin: &str) -> Option<Place> {
         let Some(cp) = self.control_plane.get() else { return Some(Place::Here) };
         let refused = |r: Refusal, machine: Option<&str>| {
-            self.db.give_back_run(&bot.owner_id, period);
+            self.give_back(bot, msg, period);
             let e = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied);
             self.db.record(&e.details(json!({ "reason": r.reason(), "owner": bot.owner_id, "machine": machine, "messageId": msg.id })));
             self.say(&bot.id, &r.message(), true);
@@ -840,7 +844,7 @@ impl App {
             return Ok(None);
         }
         let refused = |reason: &str, text: &str| {
-            self.db.give_back_run(&bot.owner_id, period);
+            self.give_back(bot, msg, period);
             let e = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied);
             let account = accounts::account(&bot.owner_id);
             self.db.record(&e.details(json!({ "reason": reason, "owner": bot.owner_id, "account": account, "harness": bot.harness, "messageId": msg.id })));
@@ -866,6 +870,7 @@ impl App {
     fn tier_route(&self, bot: &Bot, msg: &Message, by: &Who, period: &str) -> Option<(String, Route)> {
         let tier = self.tier_of(&bot.owner_id);
         let refused = |reason: &str, text: String, limit: Option<u32>| {
+            self.give_back_routine(bot, msg);
             let details = json!({ "reason": reason, "owner": bot.owner_id, "tier": tier.name, "limit": limit, "period": period, "messageId": msg.id });
             self.db.record(&by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied).details(details));
             self.say(&bot.id, &text, true);
@@ -880,6 +885,28 @@ impl App {
             return refused("tier_limit", text, Some(limit));
         }
         Some((tier.name.clone(), route))
+    }
+
+    /// Gives back what a refused run took: its monthly run, and for a routine, the
+    /// routine run counted for the day it fired (ADR 0040).
+    fn give_back(&self, bot: &Bot, msg: &Message, period: &str) {
+        self.db.give_back_run(&bot.owner_id, period);
+        self.give_back_routine(bot, msg);
+    }
+
+    fn give_back_routine(&self, bot: &Bot, msg: &Message) {
+        self.give_back_routine_to(&bot.owner_id, msg);
+    }
+
+    /// Gives a routine message's run back to whoever it was charged to when it fired
+    /// (the scheduler acts on their behalf), which is `owner` only if the Bot hasn't
+    /// changed hands since.
+    fn give_back_routine_to(&self, owner: &str, msg: &Message) {
+        if msg.role != "routine" {
+            return;
+        }
+        let charged = self.db.message(msg.id).and_then(|m| m.requested_by).and_then(|w| w.actor.on_behalf_of);
+        self.db.give_back_routine_run(charged.as_deref().unwrap_or(owner), &tiers::day(msg.created_at));
     }
 
     /// Who a run is for: whoever queued its message. Routines run as the scheduler,
@@ -984,12 +1011,16 @@ impl App {
     pub fn stop_if(&self, bot_id: &str, first: impl FnOnce() -> bool) -> bool {
         {
             let mut st = self.state();
+            let owner = self.db.bot(bot_id).map(|b| b.owner_id);
             if !first() {
                 return false;
             }
             if let Some(s) = st.get_mut(bot_id) {
                 for m in s.queue.drain(..) {
                     self.db.set_status(m.id, "done");
+                    if let Some(o) = &owner {
+                        self.give_back_routine_to(o, &m);
+                    }
                 }
                 if let Some(r) = &s.run {
                     r.abort.send_if_modified(|v| v.get_or_insert("stopped") == &"stopped");

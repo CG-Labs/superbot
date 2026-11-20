@@ -301,6 +301,27 @@ Off unless you set `TIERS_FILE`: without it every user is on one open `self-host
 - Assign users: `botctl user tier alex@example.com pro`, or `default`. `botctl tiers` lists them with their routes.
 - Upgrading needs no config change. The first start adds the `users.tier` column and the `usage_monthly` table.
 
+Each tier's `limits` ([ADR 0040](../docs/adr/0040-billing-v0-tier-limits.md)) are checked on the server, and a limit left out is unlimited:
+
+| Limit | What it caps | When it's reached |
+|-------|--------------|-------------------|
+| `maxBots` | Bots a user owns | Creating or taking over another Bot is refused. |
+| `monthlyRuns` | Bot runs per calendar month (UTC) | Runs are refused, and the Bot says why. |
+| `dailyRoutineRuns` | Routine runs per day (UTC) | Routine firings are skipped until midnight. The Bot says so once a day. |
+| `machineType` | The Linode plan (`g6-standard-2`, …) for the user's machine | Admins can't request or resize their machine to another size. Without one, `MACHINE_TIERS` decides as before. |
+
+Every refusal is in the audit log (`bot.create_refused`, `routine.run_refused`, `machine.refused`, `bot.run_refused`). `botctl usage` (or `GET /api/usage`, admins) lists each person's use against their limits and flags anyone over, for example after moving to a smaller plan; the client shows the same on each user.
+
+### Stripe (optional)
+
+Off unless `STRIPE_WEBHOOK_SECRET` is set; `/billing/stripe/webhook` answers 404 until then. botd never calls Stripe: it only receives signed events.
+
+1. In each tier, list its Stripe price ids in `stripePrices` (see [`tiers.example.json`](tiers.example.json)). A price may belong to one tier only.
+2. In Stripe, add a webhook endpoint at `https://<your-host>/billing/stripe/webhook` for `customer.subscription.created`, `.updated`, and `.deleted`, and put its signing secret (`whsec_…`) in `STRIPE_WEBHOOK_SECRET` (or `STRIPE_WEBHOOK_SECRET_FILE`). Restart `botd`.
+3. Create each subscription with `metadata.superbot_user_id` set to the user's id (from `botctl users`).
+
+An active, trialing, or past-due subscription puts the user on its price's tier; a canceled, unpaid, or paused one moves them back to the default tier. Events are checked against their signature and a 5-minute clock window, applied once, and in order. Every change is audited (`user.tier_changed` with `source: stripe`, `billing.subscription_synced`); events botd can't place are audited as `billing.event_ignored`. A subscription event replaces a tier an admin set by hand.
+
 ## License
 
 Without a license, SuperBot is the **community edition**: every feature, for up to 10 active people. The owner (break-glass) account doesn't count. A license from CG-Labs names your organisation and sets your seats ([ADR 0038](../docs/adr/0038-self-host-license-key.md)). botd checks it offline, so nothing phones home.
