@@ -65,7 +65,9 @@ botd keeps its own copies of memory in `DATA_DIR`, so backups and handovers keep
 
 ### Runs
 
-After machine routing (unchanged: a run sent to a machine never reaches this) and before the harness starts, botd makes the owner's account if it's new, then starts `sudo -n -E -u sb-u-<id> -- superbot-run <harness> ...` in the owner's workspace. If the account can't be made, or the harness can't run this way yet, the run is refused (`bot.run_refused`, with `isolation_harness` or `no_account`), the Bot says why, and the run is given back. It never falls back to botd's account.
+After machine routing and before the harness starts, botd makes the owner's account if it's new, then starts `sudo -n -E -u sb-u-<id> -- superbot-run <harness> ...` in the owner's workspace. If the account can't be made, or the harness can't run this way yet, the run is refused (`bot.run_refused`, with `isolation_harness` or `no_account`), the Bot says why, and the run is given back. It never falls back to botd's account.
+
+A run routed to its owner's own machine ([ADR 0036](0036-bots-on-the-users-machine.md)) skips all of this: that machine runs only their Bots, so no account is made here, any harness the machine has may run, and the job never goes through sudo. It takes the memory and facts from botd's copies in `DATA_DIR`. When it sends back changes, botd drops the now stale copies in the owner's folder here, so a later run here starts again from botd's.
 
 Only **Claude Code and Codex** run this way. Pi's approval gate and Hermes's managed config and daemon live in files botd writes in a folder the run could change; they're refused until that's reworked. **Screens are off**: their X displays belong to botd's account.
 
@@ -114,5 +116,5 @@ A half-made setup is a startup error, not a silent fallback.
 - **Per-user screens.**
 - **Shared team Bots**: a Bot runs as its owner. A team account is a later decision.
 - **The client's personal-secrets screen.**
-- **Running on the machine agent** (#29): the same account model, on the user's own machine.
+- **A separate account for Bots on the user's machine** (#29): runs there use the agent's account for now ([ADR 0036](0036-bots-on-the-users-machine.md)).
 - **Removing accounts** when a user is deleted (by hand for now: `userdel sb-u-<id>`).
