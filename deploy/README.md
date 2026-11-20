@@ -262,6 +262,24 @@ botctl machine agent <user>      # agent.botUser shows ready, setting_up or fail
 
 Each step is audited as `machine.bot_user_*`. Design: [ADR 0043](../docs/adr/0043-bots-own-os-user-on-machines.md).
 
+### Screens on machines
+
+A Bot running on its owner's machine has its browser and files there, so its screen should be there too. With the Bots' own user on, add:
+
+```sh
+MACHINE_SCREENS=on            # Bots routed to a machine get their screen there
+MACHINE_SCREEN_PORTS=6960-6999  # botd's loopback ports for them (the default); inside the /screen/ route
+```
+
+The machine's agent runs the screen (Xvfb, Openbox, D-Bus, voxl) as `superbot-bots`, and botd shows it at the usual `/screen/<port>/` link through the agent's mutual-TLS port. Nothing new opens on the machine. The same Bot access checks apply, and narrowing who may see a Bot gives its screen a new link. New machines install the programs at first boot. If a `voxl` binary sits next to `botd` (or on its `PATH`), they download it from botd; otherwise install it there yourself (`install-computer.sh` builds it). Already enrolled machines need the programs installed and botd's agent build. On the server:
+
+```sh
+botctl machine screens <user>             # screens open on their machine, and what's missing there
+botctl machine screens <user> close <bot> # close one now
+```
+
+Each step is audited as `machine.screen_*`. Design: [ADR 0045](../docs/adr/0045-screens-on-machines.md).
+
 ## Approvals after an upgrade
 
 Fresh installs ask before risky actions. An install from before approvals keeps running without them (`bypass`) after `--upgrade`, and botd logs a warning at start. To opt in, on the server:
