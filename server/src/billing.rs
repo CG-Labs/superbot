@@ -589,16 +589,16 @@ pub async fn checkout(State(app): State<AppState>, Extension(a): Extension<Arc<A
     }
     let lock = co.lock(&u.id);
     let _one_at_a_time = lock.lock().await;
-    let replaces = app.db.open_checkout(&u.id);
+    let last = app.db.open_checkout(&u.id);
     match close_last(&app, co, &u.id).await {
         Last::Closed => {}
         Last::Paid => {
-            app.db.record(&event(Outcome::Denied, json!({ "tier": tier.name, "reason": "checkout_completed", "session": replaces })));
+            app.db.record(&event(Outcome::Denied, json!({ "tier": tier.name, "reason": "checkout_completed", "session": last })));
             return reply(StatusCode::CONFLICT, json!({ "error": "Your last checkout went through. Your plan changes as soon as Stripe confirms the payment." }));
         }
         Last::Unknown(e) => {
             eprintln!("billing: closing {}'s last Stripe checkout: {e}", u.id);
-            app.db.record(&event(Outcome::Failure, json!({ "tier": tier.name, "reason": format!("last checkout: {e}"), "session": replaces })));
+            app.db.record(&event(Outcome::Failure, json!({ "tier": tier.name, "reason": format!("last checkout: {e}"), "session": last })));
             return bad(StatusCode::BAD_GATEWAY, "Stripe couldn't open the checkout just now. Try again in a minute; if it keeps happening, an admin can see why in the server log.".into());
         }
     }
@@ -626,9 +626,10 @@ pub async fn checkout(State(app): State<AppState>, Extension(a): Extension<Arc<A
     let now = crate::db::now();
     let expires_at = (now / 60_000 + CHECKOUT_MINUTES) * 60;
     form.push(("expires_at".into(), expires_at.to_string()));
-    // A page that replaces another is a new request, not a retry of the one before.
+    // Each checkout is a new page (the last one was just closed), so only this request's
+    // own retry may share its key: a key reused later would bring back a closed page.
     let mut keyed = form.clone();
-    keyed.extend(replaces.map(|r| ("replaces".to_string(), r)));
+    keyed.push(("request".into(), crate::random_hex(16)));
     let key = stripe::idempotency_key("checkout", &u.id, &keyed, now);
     match session("checkout", &u.id, co.stripe.post("/v1/checkout/sessions", &form, &key).await) {
         Ok((id, url)) => {

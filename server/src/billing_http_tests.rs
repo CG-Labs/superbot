@@ -558,7 +558,8 @@ async fn fake_stripe() -> (String, FakeStripe) {
         let form = url::form_urlencoded::parse(&body).into_owned().collect();
         let seen = Seen { path: uri.path().into(), auth: h("authorization"), key: h("idempotency-key"), version: h("stripe-version"), form };
         f.seen.lock().unwrap().push(seen.clone());
-        if let Some((code, v)) = f.answered.lock().unwrap().get(&seen.key) {
+        // Stripe replays answers by idempotency key, which only POSTs carry.
+        if let Some((code, v)) = f.answered.lock().unwrap().get(&seen.key).filter(|_| !seen.key.is_empty()) {
             return (StatusCode::from_u16(*code).unwrap(), Json(v.clone()));
         }
         let n = f.seen.lock().unwrap().len();
@@ -570,7 +571,7 @@ async fn fake_stripe() -> (String, FakeStripe) {
             (_, Some(id)) => (200, json!({ "id": id, "object": "checkout.session", "status": if paid { "complete" } else { "expired" } })),
             _ => (200, json!({ "id": format!("bps_test_{n}"), "object": "billing_portal.session", "url": format!("https://billing.stripe.com/p/session/test_{n}") })),
         });
-        if code < 500 {
+        if code < 500 && !seen.key.is_empty() {
             f.answered.lock().unwrap().insert(seen.key, (code, v.clone()));
         }
         (StatusCode::from_u16(code).unwrap(), Json(v))
@@ -802,6 +803,18 @@ async fn only_one_checkout_page_can_be_paid() {
     // Once it answers, the old page is expired and a new one opens.
     assert_eq!(buy(&w, &w.b, "starter").await.0, 200);
     assert_eq!(stripe.created().len(), before + 1);
+
+    // The old page closed but its replacement failed: trying again opens a new page,
+    // never the closed one again, however soon.
+    let (_, first) = buy(&w, &w.b, "pro").await;
+    let first_key = stripe.created().last().unwrap().key.clone();
+    stripe.reply(200, json!({ "id": "x", "object": "checkout.session", "status": "expired" }));
+    stripe.reply(400, json!({ "error": { "type": "invalid_request_error" } }));
+    assert_eq!(buy(&w, &w.b, "pro").await.0, 502);
+    let (code, again) = buy(&w, &w.b, "pro").await;
+    assert_eq!(code, 200, "{again}");
+    assert_ne!(again["url"], first["url"]);
+    assert!(stripe.created().iter().rev().take(2).all(|s| s.key != first_key));
 }
 
 #[tokio::test]
