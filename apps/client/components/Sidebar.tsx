@@ -12,6 +12,8 @@ interface Props {
   onOpenApprovals: () => void;
   /** Everyone's own plan and billing; set only when the server sells plans (ADR 0042). */
   onOpenPlan?: () => void;
+  /** Everyone's own secrets for their Bots (ADR 0044). */
+  onOpenSecrets?: () => void;
   /** These three are shown to admins only; the server refuses the admin API and console to everyone else. */
   onOpenUsers?: () => void;
   onOpenAudit?: () => void;
@@ -22,7 +24,7 @@ interface Props {
   compact?: boolean;
 }
 
-export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOpenPlan, onOpenUsers, onOpenAudit, onOpenConsole, onOpenSetup, compact }: Props) {
+export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOpenPlan, onOpenSecrets, onOpenUsers, onOpenAudit, onOpenConsole, onOpenSetup, compact }: Props) {
   const {
     bots,
     activeId,
@@ -115,6 +117,11 @@ export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOp
       {onOpenPlan ? (
         <Pressable style={styles.approvalsBtn} onPress={onOpenPlan} accessibilityRole="button">
           <Text style={styles.hiddenText}>Plan</Text>
+        </Pressable>
+      ) : null}
+      {onOpenSecrets ? (
+        <Pressable style={styles.approvalsBtn} onPress={onOpenSecrets} accessibilityRole="button">
+          <Text style={styles.hiddenText}>Your secrets</Text>
         </Pressable>
       ) : null}
       {isAdmin(me) ? (
