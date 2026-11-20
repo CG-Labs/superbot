@@ -35,6 +35,9 @@ mod signups;
 #[cfg(test)]
 mod signups_http_tests;
 mod sso;
+mod tiers;
+#[cfg(test)]
+mod tiers_http_tests;
 mod users;
 #[cfg(test)]
 mod users_http_tests;
@@ -123,6 +126,7 @@ async fn main() {
     let control_plane = machines::ControlPlane::from_env(&secrets::env::EnvStore::process(), |k| env(k, ""))
         .unwrap_or_else(|e| exit(format!("Control plane: {e}")));
     let scim = scim::Scim::from_env(&env("SCIM", ""), &env("SCIM_DEFAULT_ROLE", "")).unwrap_or_else(|e| exit(format!("SCIM: {e}")));
+    let tiers = tiers::Tiers::from_env(|k| env(k, "")).unwrap_or_else(|e| exit(format!("Tiers: {e}")));
     let allow_no_auth = auth_startup(&host, &password, break_glass);
     secrets::redact::register(&password);
     if adapters::get(&default_harness).is_none() {
@@ -174,6 +178,11 @@ async fn main() {
         run_timeout: Duration::from_secs(60 * env("RUN_TIMEOUT_MINUTES", "60").parse::<u64>().unwrap_or(60)),
         default_harness,
     }, screens);
+    let _ = app.tiers.set(Arc::new(tiers));
+    println!("Tiers: {}.", app.tiers().describe());
+    for t in app.db.assigned_tiers().into_iter().filter(|t| app.tiers().get(t).is_none()) {
+        eprintln!("WARNING: some users have tier \"{t}\", which TIERS_FILE no longer lists. They get the default tier ({}) until an admin picks another.", app.tiers().default_tier().name);
+    }
 
     // Each user's Bots work in that user's folders (ADR 0029). Files from before were
     // the owner account's.
@@ -191,7 +200,8 @@ async fn main() {
     // First start: create the primary Bot.
     if app.db.bots().is_empty() {
         let name = env("PRIMARY_BOT_NAME", "Assistant");
-        let bot = app.db.create_bot(&name, "#f5f5f5", "waddle", &app.cfg.default_harness, None, true);
+        let harness = default_harness_for(&app, users::OPERATOR);
+        let bot = app.db.create_bot(&name, "#f5f5f5", "waddle", &harness, None, true);
         app.init_bot_files(&bot);
     }
     // First start, or the first after upgrading to users: the owner becomes the admin
@@ -251,6 +261,8 @@ async fn main() {
         "sso": sso_ids,
         "controlPlane": control_plane.enabled(),
         "scim": auth_state_scim,
+        "tiers": app.tiers().all().iter().map(|t| &t.name).collect::<Vec<_>>(),
+        "defaultTier": app.tiers().default_tier().name,
     })));
     audit::start_retention(app.clone(), retention);
     users::start_pruning(app.clone(), sessions);
@@ -326,6 +338,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/audit/export.csv", get(export_audit))
         .route("/secrets", get(list_secrets))
         .route("/secrets/{name}", put(put_secret).delete(delete_secret))
+        .route("/me/tier", get(my_tier))
+        .route("/tiers", get(list_tiers))
         .route("/me/secrets", get(list_my_secrets))
         .route("/me/secrets/{name}", put(put_my_secret).delete(delete_my_secret))
         .route("/ask", post(ask))
@@ -1008,7 +1022,15 @@ async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => RESYNC.into(),
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     };
-                    let Some(data) = filter.apply(&app.db, &data) else { continue };
+                    let Some(mut data) = filter.apply(&app.db, &data) else { continue };
+                    // Admins (people, not their Bots) see each Bot's model and route, as in `bot_view_for`.
+                    if bot.is_none() && filter.viewer == Viewer::All
+                        && let Ok(mut v) = serde_json::from_str::<Value>(&data)
+                        && let Some(b) = v["bot"]["id"].as_str().and_then(|id| app.db.bot(id))
+                    {
+                        app.bot_admin_fields(&b, &mut v["bot"]);
+                        data = v.to_string();
+                    }
                     if tx.send(Ok(SseEvent::default().data(data))).await.is_err() {
                         break;
                     }
@@ -1063,7 +1085,7 @@ async fn login_page() -> Response {
 
 /// Every Bot the caller can see, each with their `access` to it.
 fn visible_bots(app: &App, c: &Caller, by: &Who) -> Vec<Value> {
-    viewer(app, c, by).bots(&app.db).iter().map(|(b, a)| bot_view_for(app, b, *a)).collect()
+    viewer(app, c, by).bots(&app.db).iter().map(|(b, a)| bot_view_for(app, c, b, *a)).collect()
 }
 
 async fn state(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>) -> Json<Value> {
@@ -1078,23 +1100,93 @@ async fn state(State(app): State<AppState>, Extension(c): Extension<Caller>, Ext
         Principal::User(r) => json!(r),
         Principal::Bot => json!("bot"),
     };
+    // New Bots are the caller's, so the harnesses offered are the ones their tier has.
+    let me_id = c.user.as_ref().map_or(users::OPERATOR, |u| u.id.as_str());
+    let tier = app.tier_of(me_id);
+    let harnesses: Vec<&str> = adapters::installed().into_iter().filter(|h| tier.allows_harness(h)).collect();
     Json(json!({
-        "me": { "name": name, "id": c.user.as_ref().map(|u| &u.id), "email": c.user.as_ref().and_then(|u| u.email.as_ref()), "role": role, "permissions": rbac::granted(c.principal), "session": c.session.is_some() },
-        "harnesses": adapters::installed(),
-        "defaultHarness": app.cfg.default_harness,
+        "me": { "name": name, "id": c.user.as_ref().map(|u| &u.id), "email": c.user.as_ref().and_then(|u| u.email.as_ref()), "role": role, "permissions": rbac::granted(c.principal), "session": c.session.is_some(), "tier": tier.view() },
+        "harnesses": harnesses,
+        "defaultHarness": default_harness_for(&app, me_id),
         "bots": bots,
         "policy": app.db.global_policy(),
         "approvals": approvals,
     }))
 }
 
-/// Models and reasoning efforts the harness offers on this server.
-async fn list_models(Path(name): Path<String>) -> Res {
+/// Models and reasoning efforts the harness offers on this server. On a managed tier
+/// the plan picks the model, so only admins may list them (ADR 0032). `?tier=` (admins):
+/// only that tier's models for the harness, for picking one for a Bot on that tier.
+async fn list_models(State(app): State<AppState>, Extension(c): Extension<Caller>, Path(name): Path<String>, Query(q): Query<HashMap<String, String>>) -> Res {
     if adapters::get(&name).is_none() {
         return Err(not_found("Harness"));
     }
+    let admin = c.principal == Principal::User(Role::Admin);
+    let me_id = c.user.as_ref().map_or(users::OPERATOR, |u| u.id.as_str());
+    if !admin && (q.contains_key("tier") || app.tier_of(me_id).managed()) {
+        return Err(ApiError(StatusCode::FORBIDDEN, "Your plan picks the model.".into()));
+    }
+    let tier = match q.get("tier") {
+        None => None,
+        Some(t) => Some(app.tiers().get(t).cloned().ok_or_else(|| not_found("Tier"))?),
+    };
+    let harness = name.clone();
     let list = tokio::task::spawn_blocking(move || adapters::models(&name)).await.unwrap_or_default();
-    Ok(Json(json!(list)))
+    let Some(routes) = tier.and_then(|t| t.routes) else { return Ok(Json(json!(list))) };
+    // The tier's own models, named as the harness names them. "Default model" (no id)
+    // is always offered by clients, so routes without a model add nothing here.
+    let picked: Vec<adapters::ModelOption> = routes
+        .iter()
+        .filter(|r| r.harness == harness)
+        .filter_map(|r| {
+            let id = r.model.clone()?;
+            let known = list.iter().find(|m| m.id == id || m.aliases.contains(&id));
+            Some(adapters::ModelOption { label: known.map_or_else(|| id.clone(), |m| m.label.clone()), id, efforts: vec![], aliases: vec![] })
+        })
+        .collect();
+    Ok(Json(json!(picked)))
+}
+
+/// The harness new Bots of this user get: `DEFAULT_HARNESS`, unless their tier has
+/// no route for it; then the tier's first.
+fn default_harness_for(app: &App, user_id: &str) -> String {
+    let tier = app.tier_of(user_id);
+    match tier.harnesses() {
+        Some(h) if !h.contains(&app.cfg.default_harness.as_str()) => h[0].to_string(),
+        _ => app.cfg.default_harness.clone(),
+    }
+}
+
+/// `GET /api/me/tier`: your plan, its limits, and what you've used this month. No
+/// model names. People only: a Bot's plan is its owner's.
+async fn my_tier(State(app): State<AppState>, Extension(c): Extension<Caller>) -> Res {
+    need_user(c.principal)?;
+    let id = c.user.as_ref().map_or(users::OPERATOR, |u| u.id.as_str());
+    Ok(Json(tier_usage(&app, id)))
+}
+
+/// A user's tier and their use of it this month.
+pub(crate) fn tier_usage(app: &App, user_id: &str) -> Value {
+    let period = tiers::period(db::now());
+    let mut v = app.tier_of(user_id).view();
+    v["usage"] = json!({ "period": period, "runs": app.db.runs_used(user_id, &period), "bots": app.db.owned_bot_count(user_id) });
+    v
+}
+
+/// `GET /api/tiers` (admins): every tier with its routes, and the default.
+async fn list_tiers(State(app): State<AppState>) -> Json<Value> {
+    Json(app.tiers().admin_view())
+}
+
+/// The Bot settings must fit the owner's tier: harness, model, and effort, and on
+/// create a free Bot slot (ADR 0032). Admins too: the tier is the routing table.
+fn check_tier(app: &App, owner_id: &str, harness: &str, model: Option<&str>, effort: Option<&str>, new_bot: bool) -> Res<()> {
+    let tier = app.tier_of(owner_id);
+    tier.check(harness, model, effort).map_err(|e| ApiError(StatusCode::FORBIDDEN, e))?;
+    if let Some(max) = tier.limits.max_bots.filter(|max| new_bot && app.db.owned_bot_count(owner_id) >= *max) {
+        return Err(ApiError(StatusCode::FORBIDDEN, format!("The {} plan allows {max} Bots, and they're all in use. Delete one first.", tier.label)));
+    }
+    Ok(())
 }
 
 async fn list_bots(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>) -> Json<Value> {
@@ -1165,10 +1257,13 @@ fn visible_approvals(app: &App, c: &Caller, by: &Who, status: Option<&str>, bot:
     app.db.approvals_among(status, &ids, limit)
 }
 
-/// A Bot view as this caller sees it.
-fn bot_view_for(app: &App, b: &db::Bot, access: Access) -> Value {
+/// A Bot view as this caller sees it. Admins also see its model and route.
+fn bot_view_for(app: &App, c: &Caller, b: &db::Bot, access: Access) -> Value {
     let mut v = app.bot_view(b);
     v["access"] = json!(access);
+    if c.principal == Principal::User(Role::Admin) {
+        app.bot_admin_fields(b, &mut v);
+    }
     v
 }
 
@@ -1219,7 +1314,6 @@ fn visibility_field(v: &Value) -> Res<Option<Visibility>> {
 async fn create_bot(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
     let p = bot_patch(&v)?;
     let name = p.name.ok_or_else(|| bad("Name is required"))?;
-    let harness = p.harness.unwrap_or_else(|| app.cfg.default_harness.clone());
     // Shared unless asked otherwise, as every Bot was before ACLs.
     let visibility = visibility_field(&v)?.unwrap_or(Visibility::Shared);
     // A person owns what they make. A Bot's new Bot belongs to that Bot's owner.
@@ -1228,6 +1322,8 @@ async fn create_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
         (None, Principal::Bot) => acting_bot(&app, &c, &by, None)?.owner_id,
         (None, _) => users::OPERATOR.into(),
     };
+    let harness = p.harness.unwrap_or_else(|| default_harness_for(&app, &owner));
+    check_tier(&app, &owner, &harness, p.model.clone().flatten().as_deref(), p.effort.clone().flatten().as_deref(), true)?;
     let bot = app.db.create_bot_owned(
         &name,
         p.color.as_deref().unwrap_or(pick(&COLORS)),
@@ -1243,7 +1339,7 @@ async fn create_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
     let details = json!({ "name": bot.name, "harness": bot.harness, "model": bot.model, "owner": bot.owner_id, "visibility": bot.visibility });
     app.db.record(&by.event("bot.created").target("bot", &bot.id).bot(&bot.id).details(details));
     let access = viewer(&app, &c, &by).access(&app.db, &bot);
-    Ok((StatusCode::CREATED, Json(bot_view_for(&app, &bot, access))))
+    Ok((StatusCode::CREATED, Json(bot_view_for(&app, &c, &bot, access))))
 }
 
 /// Settings that changed, as `{field: {from, to}}`.
@@ -1273,6 +1369,15 @@ async fn update_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
         p.model.get_or_insert(None);
         p.effort.get_or_insert(None);
     }
+    let harness = p.harness.clone().unwrap_or_else(|| bot.harness.clone());
+    let model = p.model.clone().unwrap_or_else(|| bot.model.clone());
+    let effort = p.effort.clone().unwrap_or_else(|| bot.effort.clone());
+    if p.harness.is_some() || p.model.is_some() || p.effort.is_some() {
+        // Only what's changing is checked against the tier: a Bot set up before its
+        // owner's tier changed can still be renamed, and runs on the tier's route anyway.
+        let (model, effort) = (p.model.is_some().then_some(model).flatten(), p.effort.is_some().then_some(effort).flatten());
+        check_tier(&app, &bot.owner_id, &harness, model.as_deref(), effort.as_deref(), false)?;
+    }
     app.db.update_bot(&id, p);
     app.push_bot(&id);
     let after = need_bot(&app, &id)?;
@@ -1280,7 +1385,7 @@ async fn update_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
     if !changes.is_empty() {
         app.db.record(&by.event("bot.updated").target("bot", &id).bot(&id).details(json!({ "changes": changes })));
     }
-    Ok(Json(bot_view_for(&app, &after, access)))
+    Ok(Json(bot_view_for(&app, &c, &after, access)))
 }
 
 async fn delete_bot(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
@@ -1363,6 +1468,13 @@ async fn update_access(State(app): State<AppState>, Extension(c): Extension<Call
             let u = app.db.find_user(key).ok_or_else(|| not_found("User"))?;
             if !u.active() {
                 return Err(bad("That user is disabled"));
+            }
+            if u.id != bot.owner_id {
+                // It takes one of the new owner's Bot slots; its harness and model they can change after.
+                let tier = app.tier_of(&u.id);
+                if let Some(max) = tier.limits.max_bots.filter(|max| app.db.owned_bot_count(&u.id) >= *max) {
+                    return Err(ApiError(StatusCode::FORBIDDEN, format!("{}'s plan ({}) allows {max} Bots, and they're all in use.", u.name, tier.label)));
+                }
             }
             Some(u)
         }

@@ -34,6 +34,8 @@ pub struct RunInput {
     /// None = start a new harness session.
     pub session_id: Option<String>,
     pub cwd: PathBuf,
+    /// The model provider, for harnesses that take one (`supports_provider`).
+    pub provider: Option<String>,
     pub model: Option<String>,
     /// Reasoning effort, in the harness's own words (e.g. "high").
     pub effort: Option<String>,
@@ -87,6 +89,10 @@ pub trait Adapter: Send {
     fn on_event(&mut self, e: &Value, out: &mut Vec<AgentEvent>);
     /// Models this harness can run here, with their reasoning efforts. Blocking.
     fn models(&self) -> Vec<ModelOption>;
+    /// Whether it uses `RunInput::provider`. Tiers may name a provider only for these.
+    fn supports_provider(&self) -> bool {
+        false
+    }
     /// Environment the harness needs on top of `input.env`.
     fn env(&self, _input: &RunInput) -> Vec<(String, String)> {
         Vec::new()

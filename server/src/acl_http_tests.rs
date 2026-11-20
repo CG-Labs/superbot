@@ -242,7 +242,7 @@ async fn handoff_answers_stay_with_their_bot() {
 }
 
 /// Reads the stream until `until` shows up. Returns all it read.
-async fn read_until(s: &mut tokio::net::TcpStream, until: &str) -> String {
+pub(super) async fn read_until(s: &mut tokio::net::TcpStream, until: &str) -> String {
     let mut got = String::new();
     let mut buf = [0u8; 4096];
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);

@@ -250,6 +250,8 @@ pub struct User {
     pub last_login_at: Option<i64>,
     pub last_login_method: Option<String>,
     pub last_login_idp_provider: Option<String>,
+    /// The tier an admin (later, billing) gave them. None: the default tier (ADR 0032).
+    pub tier: Option<String>,
 }
 
 impl User {
@@ -412,6 +414,8 @@ pub struct UserPatch {
     pub name: Option<String>,
     pub role: Option<Role>,
     pub status: Option<&'static str>,
+    /// Some(None): back to the default tier.
+    pub tier: Option<Option<String>>,
 }
 
 /// A sign-in. The token itself is never stored, only its SHA-256.
@@ -647,6 +651,7 @@ fn user_row(r: &Row) -> rusqlite::Result<User> {
         last_login_at: r.get("last_login_at")?,
         last_login_method: r.get("last_login_method")?,
         last_login_idp_provider: r.get("last_login_idp_provider")?,
+        tier: r.get("tier")?,
     })
 }
 
@@ -746,7 +751,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 10] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 11] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -757,7 +762,26 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 10] = [
     migrate_last_login,
     migrate_scim,
     migrate_machines,
+    migrate_tiers,
 ];
+
+/// Tiers (ADR 0032): each user's assigned tier (NULL: the configured default) and runs
+/// counted per user and UTC month, for the tier's monthly limit. Keyed by user, so
+/// every query names one.
+fn migrate_tiers(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has_tier = c.prepare("SELECT 1 FROM pragma_table_info('users') WHERE name = 'tier'")?.exists([])?;
+    if !has_tier {
+        c.execute_batch("ALTER TABLE users ADD COLUMN tier TEXT;")?;
+    }
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS usage_monthly (
+          user_id TEXT NOT NULL REFERENCES users(id),
+          period TEXT NOT NULL,
+          runs INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (user_id, period)
+        );",
+    )
+}
 
 /// SCIM provisioning (ADR 0023): bearer tokens (hashes only), each in a tenant, and the
 /// users a tenant provisioned. One row per user: a user belongs to at most one tenant.
@@ -1632,6 +1656,7 @@ impl Db {
             if let Some(v) = &p.name { set("display_name", v)? }
             if let Some(v) = p.role { set("role", &v.as_str())? }
             if let Some(v) = p.status { set("status", &v)? }
+            if let Some(v) = &p.tier { set("tier", v)? }
             Ok::<_, rusqlite::Error>(())
         })();
         match res {
@@ -1641,6 +1666,53 @@ impl Db {
             }
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    // Tiers and usage (ADR 0032). Every query names the user.
+
+    /// Tiers assigned to users, each once.
+    pub fn assigned_tiers(&self) -> Vec<String> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT DISTINCT tier FROM users WHERE tier IS NOT NULL ORDER BY tier").unwrap();
+        s.query_map([], |r| r.get(0)).unwrap().filter_map(Result::ok).collect()
+    }
+
+    pub fn owned_bot_count(&self, owner_id: &str) -> u32 {
+        self.c().query_row("SELECT COUNT(*) FROM bots WHERE owner_id = ?", [owner_id], |r| r.get(0)).unwrap_or(0)
+    }
+
+    /// Runs counted for this user in `period` (`YYYY-MM`).
+    pub fn runs_used(&self, user_id: &str, period: &str) -> u32 {
+        self.c()
+            .query_row("SELECT runs FROM usage_monthly WHERE user_id = ? AND period = ?", [user_id, period], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    }
+
+    /// Counts one run for the user, unless that would pass `limit`. One statement, so
+    /// runs racing for the last one can't both get it. Ok: runs used now; Err: the limit.
+    pub fn take_run(&self, user_id: &str, period: &str, limit: Option<u32>) -> Result<u32, u32> {
+        let c = self.c();
+        let cap = limit.map_or(i64::MAX, i64::from);
+        let taken = c
+            .query_row(
+                "INSERT INTO usage_monthly (user_id, period, runs) SELECT ?1, ?2, 1 WHERE ?3 >= 1
+                 ON CONFLICT (user_id, period) DO UPDATE SET runs = runs + 1 WHERE runs < ?3
+                 RETURNING runs",
+                params![user_id, period, cap],
+                |r| r.get::<_, u32>(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        taken.ok_or(limit.unwrap_or(0))
+    }
+
+    /// Gives back a run that was counted but didn't happen (it was refused).
+    pub fn give_back_run(&self, user_id: &str, period: &str) {
+        let _ = self.c().execute("UPDATE usage_monthly SET runs = runs - 1 WHERE user_id = ? AND period = ? AND runs > 0", [user_id, period]);
     }
 
     // SSO identities (ADR 0014)
