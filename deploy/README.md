@@ -94,6 +94,7 @@ The installer builds the Expo client (`apps/client`) from the same commit as `bo
 | `--ufw` | Enable firewall rules |
 | `--no-backup` | Skip backup timer |
 | `--with-hermes` | Also install Hermes Agent ([below](#hermes-agent)) |
+| `--license-file` | Install the license key CG-Labs sent ([below](#license)) |
 | `--isolation` / `--no-isolation` | Each user's Bots run as their own Unix account, or not ([below](#one-unix-account-per-user)). Kept on upgrades |
 | `--no-client` | Skip building the web client |
 | `--dry-run` | Print steps only |
@@ -256,6 +257,21 @@ Off unless you set `TIERS_FILE`: without it every user is on one open `self-host
 - Assign users: `botctl user tier alex@example.com pro`, or `default`. `botctl tiers` lists them with their routes.
 - Upgrading needs no config change. The first start adds the `users.tier` column and the `usage_monthly` table.
 
+## License
+
+Without a license, SuperBot is the **community edition**: every feature, for up to 10 active people. The owner (break-glass) account doesn't count. A license from CG-Labs names your organisation and sets your seats ([ADR 0038](../docs/adr/0038-self-host-license-key.md)). botd checks it offline, so nothing phones home.
+
+```sh
+sudo deploy/install.sh --upgrade --license-file /path/to/license.key   # or, on a running server:
+sudo -u superbot env SUPERBOT_PASSWORD="$(sudo grep -oP '^AUTH_PASSWORD=\K.*' ~superbot/superbot/.env)" sh -c 'botctl license install < /path/to/license.key; botctl license'
+```
+
+Or paste it into the console under Settings (or the setup wizard's Plans step). These all save `DATA_DIR/license.key` (mode `0600`; backups include it) and take effect at once. `LICENSE_KEY` or `LICENSE_KEY_FILE` in `.env` wins over that file and needs a restart.
+
+- **Seats**: active people other than the owner account. Over the limit, nobody is signed out or disabled, but nobody new can be added or re-enabled (by an admin, SSO sign-up, an approved request, or SCIM) until one is free. The error says so, and `license.seat_refused` is audited.
+- **Renewals**: admins are warned 30 days before the license ends. After it ends, it keeps its seats for 14 more days, then the server is the community edition again. Nothing stops working; install the renewed key any time.
+- **A bad key** (changed, signed by someone else, or for something else) never stops botd: it logs why at start, and runs as the community edition. `botctl license` and the console show the reason. Installs, removals, refusals, and status changes are audited (`license.*`).
+
 ## Landing page and sign-ups
 
 `/` is a public landing page and `/get-started` a form to ask for access ([ADR 0022](../docs/adr/0022-landing-and-signups.md)). The built-in admin page moved from `/` to `/console/`; `/app/` is unchanged.
@@ -314,7 +330,7 @@ Without a domain, `./init.sh` gives plain HTTP at `http://localhost`, published 
 
 Secure by default: Compose refuses to start without `AUTH_PASSWORD`; the image sets `HOST=0.0.0.0`, so `botd` itself also refuses to run without it, and `ALLOW_NO_AUTH` is forced off. `ALLOWED_HOSTS` always includes `SUPERBOT_DOMAIN` (or `localhost`); add other names, such as `localhost:8080` when you change `SUPERBOT_HTTP_PORT`, in `.env`.
 
-Every other `botd` setting (`TZ`, `USER_NAME`, `DEFAULT_HARNESS`, `CORS_ORIGINS`, `RUN_TIMEOUT_MINUTES`, …) goes in `.env`; apply changes with `docker compose up -d`. For tiers ([ADR 0033](../docs/adr/0033-tiers-model-routing.md)), copy the file into the data volume (`docker compose cp tiers.json botd:/data/tiers.json`) and set `TIERS_FILE=/data/tiers.json`; without it every user is on the open `self-host` tier, as before. `HOST`, `PORT`, `DATA_DIR`, and `WORKSPACE_DIR` are fixed by the image.
+Every other `botd` setting (`TZ`, `USER_NAME`, `DEFAULT_HARNESS`, `CORS_ORIGINS`, `RUN_TIMEOUT_MINUTES`, …) goes in `.env`; apply changes with `docker compose up -d`. For tiers ([ADR 0033](../docs/adr/0033-tiers-model-routing.md)), copy the file into the data volume (`docker compose cp tiers.json botd:/data/tiers.json`) and set `TIERS_FILE=/data/tiers.json`; without it every user is on the open `self-host` tier, as before. For a [license](#license), paste the key into the console (it lands in the `data` volume) or set `LICENSE_KEY` in `.env`. `HOST`, `PORT`, `DATA_DIR`, and `WORKSPACE_DIR` are fixed by the image.
 
 ### Harness CLIs and logins
 

@@ -465,10 +465,75 @@ async function loadSettings() {
   } catch (err) {
     fail(err);
   }
+  loadLicense();
   loadSignIn();
   loadSecrets();
   loadScim();
 }
+
+// The license (ADR 0038). botd checks the key; once saved it's never sent back.
+
+const LICENSE_MODES = { community: "Community edition", active: "Licensed", grace: "Grace period", expired: "Ended", invalid: "Invalid key" };
+
+function licenseView(l) {
+  const lic = l.license;
+  const day = (ms) => new Date(ms).toLocaleDateString();
+  const facts = lic
+    ? `<p>${esc(lic.licensee)} · ${esc(lic.edition)} edition · ends ${esc(day(lic.expiresAt))}${lic.features.length ? ` · ${esc(lic.features.join(", "))}` : ""}<span class="sub">License ${esc(lic.id)}</span></p>`
+    : "";
+  const seats = l.seats.limit == null ? `${l.seats.used} active, no seat limit.` : `${l.seats.used} of ${l.seats.limit} seats in use.`;
+  const warnings = l.warnings.filter((w) => w !== l.detail);
+  const change = l.savable
+    ? `<form class="secret-inline" data-license autocomplete="off">
+        <textarea rows="2" placeholder="Paste the license key from CG-Labs" required spellcheck="false" autocomplete="off"></textarea>
+        <button type="submit" class="btn primary">${lic ? "Replace" : "Install"}</button>
+        ${l.source === "file" ? '<button type="button" class="btn" data-act="license-remove">Remove</button>' : ""}
+      </form>`
+    : `<p class="hint">Set by <code>LICENSE_KEY</code> or <code>LICENSE_KEY_FILE</code> in botd's environment, which wins. To change it, edit .env and restart botd.</p>`;
+  return verdict(l.ok && !warnings.length, `${LICENSE_MODES[l.mode] || l.mode}. ${l.detail}`)
+    + facts
+    + `<p class="hint">${esc(seats)} Active people other than the owner account take a seat; over the limit, nobody is signed out, but nobody new can be added.</p>`
+    + warnings.map((w) => `<p class="warn">${esc(w)}</p>`).join("")
+    + change;
+}
+
+async function loadLicense() {
+  try {
+    $("license-box").innerHTML = licenseView(await api("GET", "/api/license"));
+  } catch (err) {
+    $("license-box").innerHTML = `<p class="warn">${esc(err.message)}</p>`;
+  }
+}
+
+async function installLicense(form) {
+  try {
+    const l = await api("PUT", "/api/license", { key: form.querySelector("textarea").value.trim() });
+    notice(`License installed: ${l.detail}`, false);
+  } catch (err) {
+    fail(err);
+  }
+}
+
+async function removeLicense() {
+  if (!confirm("Remove the license? The server becomes the community edition, free for up to 10 active people. Nobody is signed out.")) return;
+  try {
+    await api("DELETE", "/api/license");
+    notice("License removed.", false);
+  } catch (err) {
+    fail(err);
+  }
+}
+
+$("license-box").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  await installLicense(e.target);
+  loadLicense();
+});
+$("license-box").addEventListener("click", async (e) => {
+  if (!e.target.closest("button[data-act=license-remove]")) return;
+  await removeLicense();
+  loadLicense();
+});
 
 $("policy-mode").addEventListener("change", async (e) => {
   const mode = e.target.value;
@@ -713,11 +778,18 @@ function setupTiers(t) {
     + howto(t.instructions);
 }
 
+function setupLicense(l) {
+  return `<h2>License</h2><p class="hint">Without one, SuperBot is the community edition: every feature, for up to ${esc(l.seats.community)} active people. A license from CG-Labs sets your seats.</p>`
+    + licenseView(l)
+    + howto(l.instructions);
+}
+
 function setupFinish(s) {
   const fix = (c) => {
     if (c.done) return "";
     if (c.id === "admin") return '<a class="btn" href="#users">Open Users</a>';
     if (c.id === "approvals") return '<button type="button" class="btn" data-act="approvals">Turn approvals on</button>';
+    if (c.id === "license") return '<button type="button" class="btn" data-go="tiers">Go to Plans</button>';
     return c.id in SETUP_STEPS ? `<button type="button" class="btn" data-go="${esc(c.id)}">Go to ${esc(SETUP_STEPS[c.id])}</button>` : "";
   };
   const row = (c) => `<li class="${c.done ? "good" : "todo"}">
@@ -741,7 +813,7 @@ function renderSetup() {
   $("setup-body").innerHTML = "";
   renderSetupHead();
   if (!s) return;
-  const view = { domain: () => setupDomain(s.domain), signin: () => setupSignIn(s.signIn), tiers: () => setupTiers(s.tiers), finish: () => setupFinish(s) }[setup.step];
+  const view = { domain: () => setupDomain(s.domain), signin: () => setupSignIn(s.signIn), tiers: () => setupTiers(s.tiers) + setupLicense(s.license), finish: () => setupFinish(s) }[setup.step];
   $("setup-body").innerHTML = view ? view() : "";
 }
 
@@ -788,6 +860,10 @@ $("setup-body").addEventListener("click", async (e) => {
   const t = e.target.closest("button[data-act]");
   if (!t) return;
   t.disabled = true;
+  if (t.dataset.act === "license-remove") {
+    await removeLicense();
+    return loadSetup();
+  }
   if (t.dataset.act === "approvals") {
     try { await api("PUT", "/api/policy", { mode: "ask" }); } catch (err) { fail(err); }
     return loadSetup();
@@ -806,6 +882,12 @@ $("setup-body").addEventListener("change", (e) => {
 });
 
 $("setup-body").addEventListener("submit", async (e) => {
+  const l = e.target.closest("form[data-license]");
+  if (l) {
+    e.preventDefault();
+    await installLicense(l);
+    return loadSetup();
+  }
   const f = e.target.closest("form[data-secret]");
   if (!f) return;
   e.preventDefault();

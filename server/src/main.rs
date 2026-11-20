@@ -23,6 +23,9 @@ mod isolation;
 #[cfg(test)]
 mod isolation_http_tests;
 mod db;
+mod license;
+#[cfg(test)]
+mod license_http_tests;
 mod machines;
 #[cfg(test)]
 mod machines_http_tests;
@@ -219,6 +222,13 @@ async fn main() {
     for t in app.db.assigned_tiers().into_iter().filter(|t| app.tiers().get(t).is_none()) {
         eprintln!("WARNING: some users have tier \"{t}\", which TIERS_FILE no longer lists. They get the default tier ({}) until an admin picks another.", app.tiers().default_tier().name);
     }
+    secrets::redact::register(env("LICENSE_KEY", "").trim());
+    app.license.load(|k| env(k, ""));
+    let license = app.license.status();
+    println!("License: {}", license.detail());
+    for w in license.warnings(app.db.active_seats()).into_iter().filter(|w| *w != license.detail()) {
+        eprintln!("WARNING: {w}");
+    }
 
     // Each user's Bots work in that user's folders (ADR 0029). Files from before were
     // the owner account's.
@@ -300,7 +310,9 @@ async fn main() {
         "scim": auth_state_scim,
         "tiers": app.tiers().all().iter().map(|t| &t.name).collect::<Vec<_>>(),
         "defaultTier": app.tiers().default_tier().name,
+        "license": license.summary(),
     })));
+    license::start(app.clone());
     audit::start_retention(app.clone(), retention);
     users::start_pruning(app.clone(), sessions);
     machines::start(app.clone(), control_plane);
@@ -392,6 +404,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/me/tier", get(my_tier))
         .route("/tiers", get(list_tiers))
         .route("/setup", get(setup::status).patch(setup::update))
+        .route("/license", get(license::get).put(license::put).delete(license::delete))
         .route("/me/secrets", get(list_my_secrets))
         .route("/me/secrets/{name}", put(put_my_secret).delete(delete_my_secret))
         .route("/ask", post(ask))

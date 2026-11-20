@@ -198,6 +198,28 @@ jobs:
           [[ ! -e "$key" ]]
           echo ok
           EOF
+      - name: A license key is checked early and saved privately by the service user
+        run: |
+          set -euo pipefail
+          printf 'eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJ4In0.c2ln\n' >/tmp/license.key
+          cat deploy/install.sh | sudo bash -s -- --dry-run --non-interactive --license-file /tmp/license.key \
+            --domain ci.example.com --tz UTC | tee /tmp/license.log
+          grep -Fq 'would install the license key from /tmp/license.key as /home/superbot/superbot/data/license.key (0600, superbot)' /tmp/license.log
+          printf 'not a license\n' >/tmp/bad.key
+          if cat deploy/install.sh | sudo bash -s -- --dry-run --non-interactive --license-file /tmp/bad.key --tz UTC; then exit 1; fi
+          if cat deploy/install.sh | sudo bash -s -- --dry-run --non-interactive --license-file /tmp/missing.key --tz UTC; then exit 1; fi
+          id superbot >/dev/null 2>&1 || sudo useradd -m -s /bin/bash superbot
+          sudo -u superbot mkdir -p /home/superbot/superbot
+          sudo env SUPERBOT_INSTALL_NO_MAIN=1 LICENSE_FILE=/tmp/license.key bash -c '
+            set -euo pipefail
+            source deploy/install.sh
+            LICENSE_FILE=/tmp/license.key
+            check_license_file
+            install_license
+            dest=/home/superbot/superbot/data/license.key
+            [[ $(stat -c "%U %a" "$dest") == "superbot 600" ]]
+            [[ $(cat "$dest") == "eyJhbGciOiJFZERTQSJ9.eyJzdWIiOiJ4In0.c2ln" ]]
+            echo ok'
       - name: .env values are written as given
         run: |
           set -euo pipefail

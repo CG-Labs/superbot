@@ -285,10 +285,14 @@ pub mod http {
     }
 
     /// `POST /api/users/{key}/isolation`: makes the user's account and folders now
-    /// rather than at their first run.
+    /// rather than at their first run. Only for active users: a disabled one holds no
+    /// seat (ADR 0038) and their Bots can't run.
     pub async fn ensure(State(app): State<AppState>, Extension(by): Extension<Who>, UrlPath(key): UrlPath<String>) -> Res {
         let iso = need_on(&app)?;
         let u = need_user_key(&app, &key)?;
+        if !u.active() {
+            return Err(bad("That user is disabled"));
+        }
         app.ensure_account(&u.id, &by).await.map_err(|e| failed(&u.id, e))?;
         Ok(Json(view(&iso, &u.id)))
     }

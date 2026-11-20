@@ -132,6 +132,14 @@ fn too_many(retry: i64) -> Response {
     r
 }
 
+/// [`conflict`], but a refused seat is audited and explained (ADR 0038).
+fn save_error(app: &AppState, c: &Caller, e: ScimConflict, user: Option<&str>, email: Option<&str>) -> ScimError {
+    match e {
+        ScimConflict::NoSeat => ScimError::new(StatusCode::FORBIDDEN, None, crate::license::refuse_seat(app, &c.who, "scim", user, email)),
+        e => conflict(e),
+    }
+}
+
 fn conflict(e: ScimConflict) -> ScimError {
     match e {
         ScimConflict::Email => uniqueness(
@@ -142,6 +150,7 @@ fn conflict(e: ScimConflict) -> ScimError {
         ScimConflict::Identity => uniqueness("This person's SSO identity is linked to another SuperBot user."),
         ScimConflict::OtherTenant => uniqueness("This person is managed by another SCIM tenant."),
         ScimConflict::Gone => missing("User"),
+        ScimConflict::NoSeat => ScimError::new(StatusCode::FORBIDDEN, None, "No seats left."),
         ScimConflict::Db(e) => {
             eprintln!("scim: database error: {e}");
             server_error("Database error")
@@ -743,7 +752,8 @@ async fn update(app: &AppState, a: &Auth, c: &Caller, user: &User, before: Optio
         _ => d.shown_name(),
     };
     let active = (d.active != user.active()).then_some(d.active);
-    app.db.save_scim_user(&c.token.tenant, &user.id, &fields(d, &shown, active), taken.is_some()).map_err(conflict)?;
+    let f = fields(d, &shown, active);
+    app.db.save_scim_user(&c.token.tenant, &user.id, &f, taken.is_some()).map_err(|e| save_error(app, c, e, Some(&user.id), f.email))?;
     let after = app.db.scim_user(&c.token.tenant, &user.id).ok_or_else(|| server_error("user not saved"))?;
     if let Some((action, details)) = taken {
         app.db.record(&c.who.event(action).target("user", &user.id).details(details));
@@ -855,7 +865,8 @@ pub async fn create_user(State(app): State<AppState>, Extension(a): Extension<Ar
         email: None,
         created_by: created_by.as_deref(),
     });
-    let user = app.db.create_scim_user(tenant, &fields(&d, &shown, Some(d.active)), a.scim.default_role, identity.as_ref()).map_err(conflict)?;
+    let f = fields(&d, &shown, Some(d.active));
+    let user = app.db.create_scim_user(tenant, &f, a.scim.default_role, identity.as_ref()).map_err(|e| save_error(&app, &c, e, None, f.email))?;
     app.db.record(&c.who.event("user.created").target("user", &user.id).details(json!({
         "email": user.email, "name": user.name, "role": user.role, "reason": "scim",
         "tenant": tenant, "externalId": d.external_id, "userName": d.user_name, "active": d.active,
