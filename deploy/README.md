@@ -109,6 +109,23 @@ MACHINE_CONTROL_URL=https://<server-ip>:8443   # how machines reach this server;
 
 botd then listens on that port for machines (TLS from its own CA, not Caddy's), so open it in the firewall (`sudo ufw allow 8443/tcp`; with Docker, publish it too). Each new machine gets a one-time token in its cloud-init data, downloads `superbot-machine` from botd, enrolls for a 30-day certificate, and answers botd over mutual TLS. Suspend holds its certificate; destroy revokes it. The CA key is derived from the [master key](#master-key), so there is nothing new to back up; a new master key means every machine re-enrolls. A new token for a machine (shown once): `POST /api/users/<user>/machine/enrollment`; revoke its certificates: `DELETE /api/users/<user>/machine/certificates`. Design: [ADR 0031](../docs/adr/0031-machine-enrollment-mtls.md).
 
+### Firewall and first boot
+
+To put every machine behind a Linode Cloud Firewall, add (the Linode token also needs **Firewalls: read/write**):
+
+```sh
+MACHINE_FIREWALL=on
+# MACHINE_FIREWALL_SOURCES=<server-ip>/32   # who may reach the agent; default: the control URL's address
+# MACHINE_SSH_SOURCES=<your-ip>/32          # SSH stays closed unless set
+# MACHINE_ENROLL_TIMEOUT_MINUTES=15         # then a machine that hasn't enrolled is flagged
+```
+
+botd makes one firewall, `<MACHINE_LABEL_PREFIX>-fw`. It drops all inbound traffic except the agent port from those sources, and lets all outbound traffic out. Each new machine is behind it from its first boot. The reconciler puts back changed rules and detached machines, and botd deletes the firewall with the last machine. If the URL names a host rather than an IP, set `MACHINE_FIREWALL_SOURCES`.
+
+On first boot, cloud-init downloads `superbot-machine` from botd. The download trusts only botd's CA, and the binary must match the SHA-256 in the user data. cloud-init then enrolls with the one-time token, deletes the token and its own copy of the user data, and starts `superbot-machine.service`. Nothing needs doing by hand.
+
+A machine that hasn't enrolled within the timeout shows "Didn't enroll in time" in the console, and botd records `machine.enroll_timeout` once. Open the machine's Lish console in Linode Cloud Manager and read `/var/log/cloud-init-output.log`. Then issue a new token and run `superbot-machine enroll` there, or destroy the machine and request a new one. Firewall changes are audited as `machine.firewall_*`. Design: [ADR 0035](../docs/adr/0035-machine-firewall-auto-enroll.md).
+
 ## Approvals after an upgrade
 
 Fresh installs ask before risky actions. An install from before approvals keeps running without them (`bypass`) after `--upgrade`, and botd logs a warning at start. To opt in, on the server:
