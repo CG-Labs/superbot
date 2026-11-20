@@ -52,7 +52,7 @@ fn signed_for(bot_id: &str, owner_id: &str, for_user: &str) -> String {
 }
 
 /// The token a teammate's run of a shared Bot carries when it runs as the teammate's
-/// own OS user (ADR 0047): `sbb_<bot id>.<owner id>.<teammate id>.<HMAC-SHA256>`. It
+/// own OS user (ADR 0048): `sbb_<bot id>.<owner id>.<teammate id>.<HMAC-SHA256>`. It
 /// works only while the Bot's latest run is that teammate's, so what their run keeps
 /// can't act with the owner's access once the owner runs the Bot again.
 pub fn bot_token_for(key: &str, bot_id: &str, owner_id: &str, for_user: &str) -> String {

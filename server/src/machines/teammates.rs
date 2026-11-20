@@ -1,4 +1,4 @@
-//! Teammates' own OS users on a machine (ADR 0047). When someone other than the
+//! Teammates' own OS users on a machine (ADR 0048). When someone other than the
 //! machine's user runs one of that user's shared Bots there, the run gets an OS user and
 //! home of its own (`superbot-t-<hash of their id>`, home `<state>/teammates/<that>`),
 //! never the Bots' user (ADR 0043) the owner's runs share. The owner's home (their

@@ -1,8 +1,8 @@
-# 0047: Teammates' own OS user on machines
+# 0048: Teammates' own OS user on machines
 
 ## Status
 
-Accepted (20 Nov 2026). A follow-up on [#30](https://github.com/CG-Labs/superbot/issues/30) (M3, per-user isolation). It closes the first limit of [ADR 0046](0046-shared-bots-under-isolation.md) ("one trust domain on the owner's computer") and builds on [ADR 0036](0036-bots-on-the-users-machine.md) (Bots on the user's machine), [ADR 0043](0043-bots-own-os-user-on-machines.md) (Bots' own OS user there) and [ADR 0045](0045-screens-on-machines.md) (screens there). 0046 was the highest on `main`, with no open PR taking 0047.
+Accepted (20 Nov 2026). A follow-up on [#30](https://github.com/CG-Labs/superbot/issues/30) (M3, per-user isolation). It closes the first limit of [ADR 0046](0046-shared-bots-under-isolation.md) ("one trust domain on the owner's computer") and builds on [ADR 0036](0036-bots-on-the-users-machine.md) (Bots on the user's machine), [ADR 0043](0043-bots-own-os-user-on-machines.md) (Bots' own OS user there) and [ADR 0045](0045-screens-on-machines.md) (screens there). Numbered 0048 because [ADR 0047](0047-disabled-users-routines.md) (disabled users' routines) took 0047 on `main` first.
 
 ## Context
 

@@ -55,7 +55,7 @@ struct Run {
 /// Where a run happens: here, or on its owner's machine (ADR 0036).
 enum Place {
     Here,
-    /// The owner's machine, and the teammate's own user there the run is for (ADR 0047).
+    /// The owner's machine, and the teammate's own user there the run is for (ADR 0048).
     There(Box<(Assigned, wire::Layout, Option<wire::TeammateReply>)>),
 }
 
@@ -76,7 +76,7 @@ struct Spot {
     /// The person the run is for, when that isn't the Bot's owner and shared Bots are
     /// isolated (ADR 0046): the run gets neither the owner's own keys nor their facts.
     for_other: Option<String>,
-    /// The teammate's own OS user the run is for on the machine (ADR 0047).
+    /// The teammate's own OS user the run is for on the machine (ADR 0048).
     teammate_user: Option<String>,
 }
 
@@ -115,6 +115,9 @@ pub struct App {
     /// With isolated shared Bots: whom each Bot's latest run is for, by Bot. Kept after
     /// the run ends, so whatever it left running stays capped until the next run.
     askers: Mutex<HashMap<String, String>>,
+    /// ROUTINES_ON_ENABLE=resume (ADR 0047): re-enabling a user resumes the routines
+    /// paused when they were disabled. Unset: they stay paused until an admin resumes them.
+    pub resume_routines_on_enable: OnceLock<bool>,
     closing: AtomicBool,
 }
 
@@ -138,6 +141,7 @@ impl App {
             on_machines: Mutex::default(),
             shared_bots: OnceLock::new(),
             askers: Mutex::default(),
+            resume_routines_on_enable: OnceLock::new(),
             closing: AtomicBool::new(false),
         })
     }
@@ -556,6 +560,15 @@ impl App {
             return cant_run("This Bot's id isn't a safe folder name, so it can't run.");
         };
         let by = self.requester(&bot, msg);
+        // A routine queued before its owner or author was disabled doesn't run (ADR 0047).
+        if msg.role == "routine"
+            && let Some((reason, user)) = crate::handover::blocked(&self.db, &bot.owner_id, by.actor.asker.as_deref())
+        {
+            self.give_back_routine(&bot, msg);
+            let e = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied);
+            self.db.record(&e.details(json!({ "reason": reason, "owner": bot.owner_id, "forUser": user, "messageId": msg.id })));
+            return;
+        }
         let isolated = self.shared_bots() == SharedBots::Isolated;
         let for_other = Some(Self::asker_of(&bot, &by)).filter(|a| isolated && *a != bot.owner_id);
         if isolated && let Some((reason, text)) = self.wont_run(&bot, for_other.as_deref()) {
@@ -835,7 +848,7 @@ impl App {
             Err(r) => return refused(r, None),
             Ok(Target::Machine(to)) => to,
         };
-        // A teammate's run goes there as their own user (ADR 0047), never the Bots'.
+        // A teammate's run goes there as their own user (ADR 0048), never the Bots'.
         let teammate = for_other.filter(|_| cp.teammate_users());
         let checked = cp.link.check(self, &to, &[bin]).await.map_err(Refusal::Offline);
         let ready = checked.and_then(|hb| {
@@ -873,7 +886,7 @@ impl App {
     /// The run's folders and environment where it happens. On a machine: the machine's
     /// folders, botctl there, and botd's API through the agent's relay; its screen
     /// there, if any, comes after (ADR 0045).
-    /// A teammate's run as their own user (ADR 0047) works in that user's home, and its
+    /// A teammate's run as their own user (ADR 0048) works in that user's home, and its
     /// token is bound to them (`isolation::bot_token_for`).
     fn spot(&self, bot: &Bot, bot_dir: PathBuf, (cwd, mut env): (PathBuf, HashMap<String, String>), place: Place, for_other: Option<&str>) -> Spot {
         let local = |p: Option<PathBuf>| p.unwrap_or_default();

@@ -214,7 +214,7 @@ pub struct Caller {
     pub method: &'static str,
     /// The Bot a Bot's token was issued to (ADR 0029). Only ever set for `Principal::Bot`.
     pub bot: Option<String>,
-    /// The teammate a Bot's token is bound to (ADR 0047): it acts only while the Bot's
+    /// The teammate a Bot's token is bound to (ADR 0048): it acts only while the Bot's
     /// latest run is still theirs.
     pub bot_for: Option<String>,
 }
@@ -587,11 +587,13 @@ pub async fn update_user(State(app): State<AppState>, Extension(a): Extension<Ar
     }
     if before.status != after.status {
         if after.active() {
-            app.db.record(&ev("user.enabled"));
+            let resumed = crate::handover::user_enabled(&app, &by, &after.id);
+            app.db.record(&ev("user.enabled").details(json!({ "routinesResumed": resumed })));
         } else {
             a.sso.forget_user(&after.id);
             let n = app.db.revoke_user_sessions(&after.id, by.actor.id.as_deref().unwrap_or(""), "user disabled");
-            app.db.record(&ev("user.disabled").details(json!({ "sessionsRevoked": n })));
+            let paused = crate::handover::user_disabled(&app, &by, &after.id);
+            app.db.record(&ev("user.disabled").details(json!({ "sessionsRevoked": n, "routinesPaused": paused })));
         }
     }
     // Screen links don't know who opened them, so anyone losing access closes them all.

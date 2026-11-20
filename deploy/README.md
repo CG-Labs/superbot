@@ -292,7 +292,7 @@ MACHINE_TEAMMATE_USERS=on   # a teammate's run of a shared Bot is their own OS u
 
 Before a teammate's run, botd asks the owner's agent to make that teammate a user there (`superbot-t-...`, no login shell) with a home of its own under the agent's state folder, readable by no one else. The run works there, can't read the owner's home, and carries a token that stops working once someone else runs the Bot. The machine's harness logins live in the owner's home, so Claude Code and Codex Bots need a server-wide key for teammates' runs; otherwise the Bot says so and doesn't run. Each person gets their own screen of the Bot (admins can open a teammate's with `?for=<user>`), and every display there takes an X cookie. Agents must be botd's build: an older one refuses teammates' runs as outdated rather than running them as the Bots' user. Off, teammates' runs stay as before.
 
-Audited as `machine.teammate_user_created`, with `teammateUser` on `bot.run_routed` and `harness.invoked`. Design: [ADR 0047](../docs/adr/0047-teammates-own-os-user-on-machines.md).
+Audited as `machine.teammate_user_created`, with `teammateUser` on `bot.run_routed` and `harness.invoked`. Design: [ADR 0048](../docs/adr/0048-teammates-own-os-user-on-machines.md).
 
 ## Approvals after an upgrade
 

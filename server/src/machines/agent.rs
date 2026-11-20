@@ -29,7 +29,7 @@
 //!   `superbot-bots`). Never root, nor the agent's own user.
 //! - `SUPERBOT_MAX_SCREENS`: Bots' screens shown at once (ADR 0045; default 4).
 //! - `SUPERBOT_TEAMMATES`: where teammates' own homes are, for their runs of the
-//!   user's shared Bots (ADR 0047; default `<state dir>/teammates`).
+//!   user's shared Bots (ADR 0048; default `<state dir>/teammates`).
 
 use super::display::{self, Screens};
 use super::job;
@@ -98,7 +98,7 @@ pub struct Config {
     pub allow_own_user: bool,
     /// Bots' screens (ADR 0045).
     pub screens: display::Settings,
-    /// Holds each teammate's own home (ADR 0047).
+    /// Holds each teammate's own home (ADR 0048).
     pub teammates: PathBuf,
     /// Tests can't make users: every teammate runs as this existing one instead.
     pub teammate_stand_in: Option<String>,
@@ -281,7 +281,7 @@ impl Config {
         }
     }
 
-    /// The environment a teammate's jobs start from: their own home and user (ADR 0047).
+    /// The environment a teammate's jobs start from: their own home and user (ADR 0048).
     fn teammate_host(&self, t: &Teammate) -> job::Host {
         let env = BTreeMap::from([
             ("HOME".to_string(), t.home.display().to_string()),
@@ -624,7 +624,7 @@ pub struct Agent {
     bot: RwLock<Bot>,
     /// Bots' screens (ADR 0045).
     pub screens: Arc<Screens>,
-    /// Teammates' own users and homes (ADR 0047).
+    /// Teammates' own users and homes (ADR 0048).
     pub teammates: Arc<Teammates>,
 }
 
@@ -840,7 +840,7 @@ impl Agent {
         }
     }
 
-    /// `user_id`'s own user and home here, made on their first run (ADR 0047). Only
+    /// `user_id`'s own user and home here, made on their first run (ADR 0048). Only
     /// once the Bots' user is ready: the owner's home must be that user's alone. Never
     /// the machine's own user, root, the agent's user or the Bots' user.
     #[allow(clippy::result_large_err)]
@@ -1223,7 +1223,7 @@ impl Drop for StopOnDrop {
 /// `POST /v1/jobs`: runs the job and streams its events, one JSON object per line.
 /// A request it refuses gets an error status before anything runs.
 async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobRequest>) -> Response {
-    // A teammate's run (ADR 0047): their own user, and nothing outside their home.
+    // A teammate's run (ADR 0048): their own user, and nothing outside their home.
     let home = j.for_user.as_deref().map_or(a.cfg.home.clone(), |u| a.teammates.home_of(u));
     if let Err((code, msg)) = check(&a.cfg, &a.identity().user_id, &j, &home) {
         return refuse(code, msg);
@@ -1553,7 +1553,7 @@ async fn put_screen(State(a): State<Arc<Agent>>, UrlPath(bot): UrlPath<String>, 
         }
         Err(r) => return r,
     };
-    // A teammate's own screen of the Bot runs as their user, in their home (ADR 0047).
+    // A teammate's own screen of the Bot runs as their user, in their home (ADR 0048).
     let who = match &r.for_user {
         Some(u) => match a.teammate(u).await {
             Ok(t) => display::As { ids: t.ids, home: t.home, user: t.user },
@@ -1580,7 +1580,7 @@ async fn put_screen(State(a): State<Arc<Agent>>, UrlPath(bot): UrlPath<String>, 
     }
 }
 
-/// `?for=<user>`: a teammate's own screen of the Bot (ADR 0047).
+/// `?for=<user>`: a teammate's own screen of the Bot (ADR 0048).
 #[derive(serde::Deserialize)]
 struct ScreenFor {
     #[serde(rename = "for")]
@@ -1647,7 +1647,7 @@ async fn screen_tunnel(State(a): State<Arc<Agent>>, UrlPath(bot): UrlPath<String
 }
 
 /// `PUT /v1/teammates/{user}`: the OS user and home a teammate's runs of this machine's
-/// user's shared Bots get here, made on first use (ADR 0047).
+/// user's shared Bots get here, made on first use (ADR 0048).
 async fn put_teammate(State(a): State<Arc<Agent>>, UrlPath(user): UrlPath<String>, Json(r): Json<wire::TeammateRequest>) -> Response {
     if r.owner_id != a.identity().user_id {
         return refuse(StatusCode::FORBIDDEN, "This machine runs only its own user's Bots.");

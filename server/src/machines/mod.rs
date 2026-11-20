@@ -377,7 +377,7 @@ impl ControlPlane {
     }
 
     /// Whether a teammate's runs of shared Bots go to the owner's machine as the
-    /// teammate's own user (MACHINE_TEAMMATE_USERS, ADR 0047).
+    /// teammate's own user (MACHINE_TEAMMATE_USERS, ADR 0048).
     pub fn teammate_users(&self) -> bool {
         self.enrollment.as_ref().is_some_and(|e| e.teammate_users)
     }
@@ -390,7 +390,7 @@ impl ControlPlane {
     /// Whether a run of `bin` may start on `machine_id` now, beyond `route::fit`: the Bots'
     /// own user is ready there (ADR 0043), their first folder copy is done and the harness
     /// is logged in there (ADR 0041) or keyed. `keys`: whose own keys the run gets, if any.
-    /// `teammate`: the run is a teammate's, as their own user (ADR 0047), which the
+    /// `teammate`: the run is a teammate's, as their own user (ADR 0048), which the
     /// agent must be able to do, and which only a server-wide key logs in.
     pub fn ready(&self, app: &App, hb: &wire::Heartbeat, keys: Option<&str>, machine_id: &str, bin: &str, teammate: bool) -> Result<(), route::Refusal> {
         let Some(e) = &self.enrollment else { return Ok(()) };

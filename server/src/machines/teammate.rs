@@ -1,4 +1,4 @@
-//! Teammates' own OS users on machines (ADR 0047), botd's side. With
+//! Teammates' own OS users on machines (ADR 0048), botd's side. With
 //! MACHINE_TEAMMATE_USERS=on, a run of a shared Bot for someone other than its owner
 //! (ADR 0046) runs on the owner's machine as that teammate's own unprivileged user,
 //! with its own home: not as the Bots' user, so it can't read the owner's folder,

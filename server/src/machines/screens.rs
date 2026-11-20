@@ -12,7 +12,7 @@
 //! narrowing who may see the Bot gives it a new one and cuts open viewers. Every open,
 //! start, new token, refusal and close is audited. Off, nothing here does anything.
 //!
-//! With MACHINE_TEAMMATE_USERS=on (ADR 0047), a teammate's runs of a shared Bot get a
+//! With MACHINE_TEAMMATE_USERS=on (ADR 0048), a teammate's runs of a shared Bot get a
 //! screen of their own, as their own OS user, apart from the owner's: kept under
 //! `wire::screen_key`, shown only to that teammate (and admins, who may ask for it),
 //! and closed once they can no longer operate the Bot. Every display then takes an X
@@ -91,7 +91,7 @@ impl Drop for Abort {
 /// A Bot's screen on its owner's machine, as botd knows it.
 struct Open {
     bot_id: String,
-    /// The teammate whose own screen of the Bot this is (ADR 0047); None: the owner's.
+    /// The teammate whose own screen of the Bot this is (ADR 0048); None: the owner's.
     for_user: Option<String>,
     machine_id: String,
     owner_id: String,
@@ -196,7 +196,7 @@ impl Why {
 
 /// Whether the machine can show screens, from its heartbeat. An agent from before
 /// screens, or speaking another screen protocol, is outdated; so is one that can't
-/// keep teammates' screens apart from the owner's, once those are on (ADR 0047).
+/// keep teammates' screens apart from the owner's, once those are on (ADR 0048).
 pub fn fit(e: &Enrollment, hb: &Heartbeat) -> Result<(), Why> {
     if e.teammate_users {
         super::teammate::fit(hb).map_err(Why::Route)?;
@@ -329,7 +329,7 @@ pub async fn target(app: &App, bot: &Bot) -> Result<Option<(Arc<Enrollment>, Set
 /// this server, which shows it as before. The caller has checked access to the Bot;
 /// `still` checks it again once no new token for it is under way, before anything starts:
 /// a revocation that finished meanwhile must not hand out the new token. `for_user`: the
-/// teammate whose own screen of it this is (ADR 0047), made their user there if need be.
+/// teammate whose own screen of it this is (ADR 0048), made their user there if need be.
 pub async fn open(app: &AppState, by: &Who, bot: &Bot, for_user: Option<&str>, still: impl Fn() -> Res<()>) -> Res<Option<String>> {
     let refused = |machine: Option<&str>, w: Why| {
         let d = json!({ "reason": w.reason(), "owner": bot.owner_id, "machine": machine, "forUser": for_user });
@@ -402,7 +402,7 @@ async fn accept(app: AppState, key: String, l: TcpListener) {
     }
 }
 
-/// Whether the teammate a screen is for can still operate its Bot (ADR 0047).
+/// Whether the teammate a screen is for can still operate its Bot (ADR 0048).
 fn still_theirs(app: &App, bot: &Bot, for_user: Option<&str>) -> bool {
     for_user.is_none_or(|u| crate::acl::Viewer::person(&app.db, u).access(&app.db, bot) >= crate::acl::Access::Operate)
 }
@@ -468,7 +468,7 @@ pub async fn hold_for_tests(e: &Enrollment, bot: &str) -> tokio::sync::OwnedMute
 }
 
 /// The screen's environment for a run of `bot` on `to`, starting it there if need be:
-/// `for_user`'s own, for a teammate's run as their own user (ADR 0047). None when
+/// `for_user`'s own, for a teammate's run as their own user (ADR 0048). None when
 /// screens are off or the machine can't show one: the Bot runs without.
 pub async fn for_run(app: &App, bot: &Bot, for_user: Option<&str>, to: &Assigned, state_dir: &std::path::Path) -> Option<HashMap<String, String>> {
     let e = enrollment(app)?.clone();
@@ -510,7 +510,7 @@ async fn rotate_key(app: &App, e: &Enrollment, bot: &str, key: &str) {
         close_locked(app, e, &by, key, "moved").await;
         return;
     };
-    // A teammate who lost the Bot loses their screen of it (ADR 0047).
+    // A teammate who lost the Bot loses their screen of it (ADR 0048).
     if !still_theirs(app, &b, for_user.as_deref()) {
         close_locked(app, e, &by, key, "access_lost").await;
         return;

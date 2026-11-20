@@ -84,7 +84,7 @@ jobs:
           cp "$(cat /tmp/test-bin)" /tmp/botd-tests
           sudo SUPERBOT_MACHINE_BOT_USER_TEST=1 /tmp/botd-tests --ignored --exact \
             machines_bot_user_tests::as_root_bots_get_their_own_os_user_and_cant_reach_the_agents_files
-      # ADR 0047: a teammate's run of a shared Bot is their own OS user, apart from the owner's.
+      # ADR 0048: a teammate's run of a shared Bot is their own OS user, apart from the owner's.
       - name: Teammates' runs on a machine are their own OS user
         run: |
           sudo SUPERBOT_MACHINE_BOT_USER_TEST=1 /tmp/botd-tests --ignored --exact \

@@ -4,6 +4,7 @@
 
 use crate::audit::{Actor, Outcome, Who};
 use crate::db::Routine;
+use crate::handover;
 use crate::runner::App;
 use crate::tiers;
 use chrono::{Datelike, Local, Timelike};
@@ -74,14 +75,23 @@ pub fn start(app: Arc<App>) {
     });
 }
 
-/// Runs a routine now: queues its instruction for its Bot, unless the owner's tier has
-/// no routine runs left today.
+/// Runs a routine now: queues its instruction for its Bot, unless its owner or author is
+/// disabled (then it's paused) or the owner's tier has no routine runs left today.
 pub(crate) fn fire(app: &Arc<App>, r: &Routine, at_ms: i64) {
     app.db.routine_ran(&r.id, at_ms);
     let mut scheduler = Actor::system("scheduler");
     scheduler.on_behalf_of = app.db.bot(&r.bot_id).map(|b| b.owner_id);
     scheduler.asker = r.author_id.clone();
     let by = Who { actor: scheduler, source: Default::default() };
+    // Disabling someone pauses their routines; this catches one that fires anyway (ADR 0047).
+    if let Some(owner) = by.actor.on_behalf_of.as_deref()
+        && let Some((reason, user)) = handover::blocked(&app.db, owner, r.author_id.as_deref())
+    {
+        let details = json!({ "reason": reason, "name": r.name, "owner": owner, "author": r.author_id, "forUser": user });
+        app.db.record(&by.event("routine.run_refused").target("routine", &r.id).bot(&r.bot_id).outcome(Outcome::Denied).details(details));
+        handover::pause(app, &by, r, reason, &user);
+        return;
+    }
     if let Some(owner) = by.actor.on_behalf_of.as_deref()
         && !take_routine_run(app, r, owner, &by, at_ms)
     {

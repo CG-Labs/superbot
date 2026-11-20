@@ -108,7 +108,7 @@ pub struct Enrollment {
     pub screens: Option<super::screens::Settings>,
     pub(super) shown: super::screens::Shown,
     /// Teammates' runs of shared Bots as their own OS user (MACHINE_TEAMMATE_USERS,
-    /// ADR 0047), with screens of their own.
+    /// ADR 0048), with screens of their own.
     pub teammate_users: bool,
     voxl: Option<(Bytes, String)>,
 }

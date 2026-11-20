@@ -29,7 +29,7 @@
 //! - `GET /v1/screens/{bot}/tunnel` with `Upgrade: SCREEN_UPGRADE` (101): a raw byte
 //!   pipe to the screen's viewer on the machine's loopback, one per viewer connection.
 //! - `PUT /v1/teammates/{user}` `TeammateRequest` -> `TeammateReply`: the OS user and
-//!   home a teammate's runs of the owner's shared Bots get on this machine (ADR 0047).
+//!   home a teammate's runs of the owner's shared Bots get on this machine (ADR 0048).
 //!   Screen routes take `?for=<user>` for that teammate's own screen of the Bot.
 //!
 //! Protocol 1 (`PROTOCOL`) is the first that runs Bots. A heartbeat without `protocol`
@@ -145,7 +145,7 @@ pub struct ScreenRequest {
     /// Stop it after this long with no viewer, request or job of the Bot.
     pub idle_secs: u64,
     /// The teammate whose own screen of the Bot this is, run as their OS user on the
-    /// machine (ADR 0047). None: the owner's, as the Bots' user.
+    /// machine (ADR 0048). None: the owner's, as the Bots' user.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub for_user: Option<String>,
     /// Only X clients with the screen's cookie may connect to its display. Always so for
@@ -178,7 +178,7 @@ pub fn screen_key(bot: &str, for_user: Option<&str>) -> String {
     }
 }
 
-/// The OS user a teammate's runs get on a machine (ADR 0047): from their user id, so
+/// The OS user a teammate's runs get on a machine (ADR 0048): from their user id, so
 /// it never holds the request's own text and fits useradd's 32 bytes.
 pub fn teammate_user(user_id: &str) -> String {
     use sha2::Digest;
@@ -190,7 +190,7 @@ pub fn teammate_user(user_id: &str) -> String {
 pub const TEAMMATE_USER_PREFIX: &str = "superbot-t-";
 
 /// `PUT /v1/teammates/{user}`: make or check the OS user and home of a teammate who
-/// runs the machine's user's shared Bots (ADR 0047). Never the machine's own user.
+/// runs the machine's user's shared Bots (ADR 0048). Never the machine's own user.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TeammateRequest {
@@ -632,7 +632,7 @@ pub struct JobRequest {
     pub cleanup: Option<JobCleanup>,
     /// Files to send back when the job ends (as they are then), e.g. the Bot's memory.
     pub collect: Vec<String>,
-    /// A teammate's run of the owner's shared Bot (ADR 0047): it runs as that teammate's
+    /// A teammate's run of the owner's shared Bot (ADR 0048): it runs as that teammate's
     /// own OS user, in their home there, and every path must be inside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub for_user: Option<String>,

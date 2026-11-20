@@ -101,9 +101,9 @@ pub enum Refusal {
     /// Its agent couldn't set up the Bots' own user (ADR 0043).
     BotUserFailed,
     /// A teammate's run there needs a server-wide key for this harness, since it runs as
-    /// the teammate's own user, outside the machine's logins (ADR 0047).
+    /// the teammate's own user, outside the machine's logins (ADR 0048).
     NoTeammateKey(String),
-    /// Its agent couldn't set up the teammate's own user (ADR 0047): its words.
+    /// Its agent couldn't set up the teammate's own user (ADR 0048): its words.
     TeammateUserFailed(String),
 }
 
@@ -271,7 +271,7 @@ pub trait MachineLink: Send + Sync {
     /// start, or a machine lost on the way, ends with an `Error`.
     fn run<'a>(&'a self, to: &'a Assigned, job: JobRequest, abort: watch::Receiver<AbortReason>, tx: mpsc::Sender<JobEvent>) -> Ran<'a>;
     /// Makes sure `user_id`, a teammate of the machine's owner, has their own user
-    /// there (ADR 0047), and says where its folders are.
+    /// there (ADR 0048), and says where its folders are.
     fn teammate<'a>(&'a self, to: &'a Assigned, user_id: &'a str) -> Teammated<'a>;
 }
 

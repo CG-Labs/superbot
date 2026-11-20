@@ -1,4 +1,4 @@
-//! Teammates' own OS users on the owner's machine (ADR 0047), end to end on loopback:
+//! Teammates' own OS users on the owner's machine (ADR 0048), end to end on loopback:
 //! the real router, botd's machine port and the real agent over mutual TLS. Tests can't
 //! make users, so here a teammate's user is whoever runs them (`teammate_stand_in`) and
 //! only the homes are apart; the same code paths run. The last test makes real users

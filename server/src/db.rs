@@ -81,6 +81,12 @@ pub struct Routine {
     /// Who last wrote its instruction (ADR 0046); its runs are for them. None: from
     /// before, so its Bot's owner.
     pub author_id: Option<String>,
+    /// Set when botd turned it off because someone it runs for was disabled (ADR 0047):
+    /// `owner_disabled` or `author_disabled`. Cleared when it's resumed or turned on by hand.
+    pub paused_reason: Option<String>,
+    /// The disabled user it was paused for; resuming for them turns it back on.
+    pub paused_for: Option<String>,
+    pub paused_at: Option<i64>,
 }
 
 #[derive(Default)]
@@ -268,6 +274,9 @@ fn routine_row(r: &Row) -> rusqlite::Result<Routine> {
         last_run_at: r.get("last_run_at")?,
         created_at: r.get("created_at")?,
         author_id: r.get("author_id")?,
+        paused_reason: r.get("paused_reason")?,
+        paused_for: r.get("paused_for")?,
+        paused_at: r.get("paused_at")?,
     })
 }
 
@@ -1027,7 +1036,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 18] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 19] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1046,7 +1055,19 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 18] = [
     migrate_billing,
     migrate_billing_customers,
     migrate_routine_authors,
+    migrate_routine_pauses,
 ];
+
+/// Why botd paused a routine, and for whom (ADR 0047), so it can be resumed.
+fn migrate_routine_pauses(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    for (col, ty) in [("paused_reason", "TEXT"), ("paused_for", "TEXT"), ("paused_at", "INTEGER")] {
+        let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('routines') WHERE name = ?", [col], |r| r.get(0))?;
+        if !has {
+            c.execute_batch(&format!("ALTER TABLE routines ADD COLUMN {col} {ty};"))?;
+        }
+    }
+    Ok(())
+}
 
 /// Who wrote each routine's instruction, so its runs are for them (ADR 0046). Routines
 /// from before have none, and run for their Bot's owner as they did.
@@ -1953,7 +1974,56 @@ impl Db {
             }
             set("instruction", &v)
         }
-        if let Some(v) = enabled { set("enabled", &v) }
+        if let Some(v) = enabled {
+            c.execute("UPDATE routines SET enabled = ?, paused_reason = NULL, paused_for = NULL, paused_at = NULL WHERE id = ?", params![v, id]).unwrap();
+        }
+    }
+
+    /// Turns a routine off for a disabled user (ADR 0047). False when it was already off.
+    pub fn pause_routine(&self, id: &str, reason: &str, for_user: &str, at: i64) -> bool {
+        self.c()
+            .execute(
+                "UPDATE routines SET enabled = 0, paused_reason = ?, paused_for = ?, paused_at = ? WHERE id = ? AND enabled = 1",
+                params![reason, for_user, at, id],
+            )
+            .unwrap()
+            > 0
+    }
+
+    /// Routines botd paused for `user_id`.
+    pub fn routines_paused_for(&self, user_id: &str) -> Vec<Routine> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM routines WHERE paused_for = ? AND enabled = 0 ORDER BY created_at").unwrap();
+        s.query_map([user_id], routine_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Turns a paused routine back on. False when it isn't paused any more.
+    pub fn resume_routine(&self, id: &str) -> bool {
+        self.c()
+            .execute(
+                "UPDATE routines SET enabled = 1, paused_reason = NULL, paused_for = NULL, paused_at = NULL WHERE id = ? AND enabled = 0 AND paused_reason IS NOT NULL",
+                [id],
+            )
+            .unwrap()
+            > 0
+    }
+
+    /// Keeps a paused routine off, now for someone else who is still disabled.
+    pub fn repause_routine(&self, id: &str, reason: &str, for_user: &str) {
+        self.c()
+            .execute("UPDATE routines SET paused_reason = ?, paused_for = ? WHERE id = ? AND enabled = 0 AND paused_reason IS NOT NULL", params![reason, for_user, id])
+            .unwrap();
+    }
+
+    /// Moves what a routine holds for `from` (its authorship, its pause) to `to`.
+    pub fn hand_over_routine(&self, id: &str, from: &str, to: &str) {
+        self.c()
+            .execute(
+                "UPDATE routines SET author_id = CASE WHEN author_id = ?1 THEN ?2 ELSE author_id END,
+                   paused_for = CASE WHEN paused_for = ?1 THEN ?2 ELSE paused_for END WHERE id = ?3",
+                params![from, to, id],
+            )
+            .unwrap();
     }
 
     pub fn routine_ran(&self, id: &str, at: i64) {
