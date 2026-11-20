@@ -8,6 +8,8 @@ import { ChatView } from "../components/ChatView";
 import { CreateBotModal } from "../components/CreateBotModal";
 import { ScreenViewer } from "../components/ScreenViewer";
 import { Sidebar } from "../components/Sidebar";
+import { openConsole } from "../src/admin";
+import { showError } from "../src/dialogs";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
 
@@ -77,6 +79,8 @@ export default function HomeScreen() {
             onLogout={onLogout}
             onOpenApprovals={() => setApprovalsOpen(true)}
             onOpenUsers={() => router.push("/users")}
+            onOpenAudit={() => router.push("/audit")}
+            onOpenConsole={() => void openConsole(api.baseUrl).catch((err) => showError(err, "Couldn't open the admin console"))}
           />
         ) : null}
         {wide || mobilePane === "chat" ? (
