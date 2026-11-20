@@ -69,6 +69,11 @@ pub struct Config {
     pub max_jobs: usize,
 }
 
+fn runnable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -160,7 +165,7 @@ impl Config {
             bots: p(self.home.join("bots")),
             user_file: p(self.home.join("USER.md")),
             api: format!("http://{}", self.api_listen),
-            botctl: self.botctl.is_file().then(|| p(self.botctl.clone())),
+            botctl: runnable(&self.botctl).then(|| p(self.botctl.clone())),
         }
     }
 
@@ -179,11 +184,9 @@ impl Config {
 
     /// Whether `bin` is an executable on the harness PATH.
     fn has(&self, bin: &str) -> bool {
-        use std::os::unix::fs::PermissionsExt;
-        self.harness_path.split(':').any(|dir| {
-            std::fs::metadata(Path::new(dir).join(bin))
-                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        })
+        self.harness_path
+            .split(':')
+            .any(|dir| runnable(&Path::new(dir).join(bin)))
     }
 
     fn ca(&self) -> CertificateDer<'static> {
