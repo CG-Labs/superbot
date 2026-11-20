@@ -66,7 +66,7 @@ A routed run with screens on starts or keeps the Bot's screen first. The run get
 ### Who may see it, and closing it
 
 - Narrowing who may see a Bot (private, a grant removed or lowered) gives its open screen a new token at once: botd stops accepting the old one, cuts open viewers, and tells the agent. The agent replaces voxl with the new password and keeps the display, so the Bot's windows stay.
-- Disabling a user, lowering their role, deleting them by SCIM, or revoking all their sessions does the same for every open machine screen, as for botd's own screens: a link doesn't know who opened it.
+- Disabling a user, lowering their role, deleting them by SCIM, or revoking all their sessions does the same for every open machine screen, as for botd's own screens: a link doesn't know who opened it. A request for a link is checked again, from the stored user, session and Bot, once no new token is under way, so one that waited out a revocation gets no link.
 - A screen is closed (botd stops listening, the agent stops it) when its Bot is deleted, when the Bot or its owner leaves that machine, when idle for `SCREEN_IDLE_MINUTES` with no viewer and no run, or by an admin. A close waits for a start under way for that Bot, and a start re-checks the Bot afterwards, so a Bot deleted meanwhile leaves no screen running.
 
 ### Old agents and versions

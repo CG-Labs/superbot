@@ -1840,8 +1840,20 @@ async fn ask(State(app): State<AppState>, Extension(c): Extension<Caller>, Exten
 async fn screen_info(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     // The link gives control of the screen.
     let (bot, _) = need_bot_access(&app, &c, &by, &id, Access::Operate)?;
-    // A Bot on its owner's machine is shown from there or not at all (ADR 0045).
-    if let Some(url) = machines::screens::open(&app, &by, &bot).await? {
+    // A Bot on its owner's machine is shown from there or not at all (ADR 0045). Access
+    // is checked again once no new token is under way, from what's stored now: a
+    // revocation that finished meanwhile must not hand out the new token.
+    let still = || {
+        let mut now = c.clone();
+        if let Some(u) = &c.user {
+            now.user = Some(app.db.user(&u.id).filter(|u| u.active()).ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "Login required".into()))?);
+        }
+        if let Some(s) = &c.session {
+            now.session = Some(app.db.session(&s.id).filter(|s| s.revoked_at.is_none()).ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "Login required".into()))?);
+        }
+        need_bot_access(&app, &now, &by, &id, Access::Operate).map(|_| ())
+    };
+    if let Some(url) = machines::screens::open(&app, &by, &bot, still).await? {
         return Ok(Json(json!({ "url": url })));
     }
     let off = || ApiError(StatusCode::NOT_FOUND, "Screens are off on this server. Install Xvfb, openbox, and voxl.".into());
