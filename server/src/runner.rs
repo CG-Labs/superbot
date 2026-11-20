@@ -471,14 +471,18 @@ impl App {
     }
 
     async fn run_one(self: &Arc<Self>, mut bot: Bot, msg: &Message) {
+        let cant_run = |text: &str| {
+            self.give_back_routine(&bot, msg);
+            self.say(&bot.id, text, true);
+        };
         let Some((shell_tool, bin)) = adapters::get(&bot.harness).map(|a| (a.shell_tool(), a.bin())) else {
-            return self.say(&bot.id, &format!("Unknown harness \"{}\".", bot.harness), true);
+            return cant_run(&format!("Unknown harness \"{}\".", bot.harness));
         };
         let Some(bot_dir) = self.bot_dir(&bot.id) else {
-            return self.say(&bot.id, "This Bot's id isn't a safe folder name, so it can't run.", true);
+            return cant_run("This Bot's id isn't a safe folder name, so it can't run.");
         };
         let Some(space) = self.run_space(&bot) else {
-            return self.say(&bot.id, "This Bot's owner id isn't a safe folder name, so it can't run.", true);
+            return cant_run("This Bot's owner id isn't a safe folder name, so it can't run.");
         };
         let by = self.requester(&bot, msg);
         let period = tiers::period(crate::db::now());

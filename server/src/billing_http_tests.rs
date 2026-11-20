@@ -163,6 +163,20 @@ async fn stopping_a_bot_gives_back_its_queued_routine_runs() {
 }
 
 #[tokio::test]
+async fn a_routine_whose_bot_cant_start_gives_back_its_run() {
+    let w = world(false).await;
+    let app = &w.app;
+    let bot = app.db.create_bot_owned("Gone", "#fff", "waddle", "no-such-harness", None, false, &w.a_id, Visibility::Private);
+    let r = app.db.add_routine(&bot.id, "Digest", "0 9 * * *", "x");
+    let now = db::now();
+    let before = app.db.last_id();
+    cron::fire(app, &r, now);
+    let said = replies(app, &bot.id, before, 1).await;
+    assert!(said[0].contains("Unknown harness"), "{said:?}");
+    assert_eq!(app.db.routine_runs_used(&w.a_id, &tiers::day(now)), 0);
+}
+
+#[tokio::test]
 async fn without_a_tiers_file_routines_bots_and_machines_are_unlimited() {
     let (port, app, admin, _) = serve_app().await;
     fake_claude(&app);
