@@ -34,6 +34,24 @@ pub struct Command {
     pub argv: Vec<Word>,
     /// Index of the command whose output is piped into this one.
     pub pipe_from: Option<usize>,
+    /// Where its standard input comes from, when a redirection says (the last one wins).
+    pub stdin: Option<Input>,
+    /// Files its output redirections write to (`> f`, `>> f`, `&> f`, `<> f`).
+    pub writes: Vec<Word>,
+}
+
+/// A command's standard input, from a redirection.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Input {
+    /// `<<EOF`: the body as written. `expand` when the delimiter isn't quoted, so the
+    /// shell expands `$…` and backticks in it first.
+    Heredoc { body: String, expand: bool },
+    /// `<<< word`
+    HereString(Word),
+    /// `< file`
+    File(Word),
+    /// Anything else, like `<&3`.
+    Other,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -69,7 +87,7 @@ pub fn parse(src: &str, depth: usize) -> Result<Vec<Command>, Error> {
     if depth > MAX_DEPTH {
         return Err(Error::TooDeep);
     }
-    let mut p = Parser { s: src.chars().collect(), i: 0, depth, out: Vec::new(), heredocs: Vec::new() };
+    let mut p = Parser::new(src.chars().collect(), depth, Vec::new());
     p.list(false)?;
     Ok(p.out)
 }
@@ -78,9 +96,23 @@ pub fn parse(src: &str, depth: usize) -> Result<Vec<Command>, Error> {
 const RESERVED: [&str; 14] = ["if", "then", "else", "elif", "fi", "do", "done", "while", "until", "!", "{", "}", "time", "esac"];
 
 struct Heredoc {
+    id: usize,
     delim: String,
     expand: bool,
     strip_tabs: bool,
+    /// The command it is standard input of, once that command ends.
+    feeds: Option<usize>,
+}
+
+/// Redirections of the simple command being read.
+#[derive(Default)]
+struct Pending {
+    stdin: Option<Input>,
+    /// The id of the here-document that is its standard input, if it is one.
+    heredoc: Option<usize>,
+    writes: Vec<Word>,
+    /// The fd digits written right before a redirection (`2>`).
+    fd: Option<String>,
 }
 
 struct Parser {
@@ -89,6 +121,8 @@ struct Parser {
     depth: usize,
     out: Vec<Command>,
     heredocs: Vec<Heredoc>,
+    next_heredoc: usize,
+    pending: Pending,
 }
 
 fn is_name(s: &str) -> bool {
@@ -96,6 +130,10 @@ fn is_name(s: &str) -> bool {
 }
 
 impl Parser {
+    fn new(s: Vec<char>, depth: usize, out: Vec<Command>) -> Parser {
+        Parser { s, i: 0, depth, out, heredocs: Vec::new(), next_heredoc: 0, pending: Pending::default() }
+    }
+
     fn peek(&self) -> Option<char> {
         self.s.get(self.i).copied()
     }
@@ -126,13 +164,16 @@ impl Parser {
         }
     }
 
-    /// Runs `f` one level deeper, failing past MAX_DEPTH.
+    /// Runs `f` one level deeper, failing past MAX_DEPTH. The commands inside keep their
+    /// own redirections apart from the command around them.
     fn nested<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, Error>) -> Result<T, Error> {
         if self.depth >= MAX_DEPTH {
             return Err(Error::TooDeep);
         }
         self.depth += 1;
+        let outer = std::mem::take(&mut self.pending);
         let r = f(self);
+        self.pending = outer;
         self.depth -= 1;
         r
     }
@@ -141,7 +182,7 @@ impl Parser {
     /// source, one level deeper, adding its commands to ours.
     fn sub(&mut self, text: String, heredoc_body: bool) -> Result<(), Error> {
         self.nested(|p| {
-            let mut q = Parser { s: text.chars().collect(), i: 0, depth: p.depth, out: std::mem::take(&mut p.out), heredocs: Vec::new() };
+            let mut q = Parser::new(text.chars().collect(), p.depth, std::mem::take(&mut p.out));
             let r = if heredoc_body { q.text(None, &mut Word::default()) } else { q.list(false) };
             p.out = q.out;
             r
@@ -151,6 +192,7 @@ impl Parser {
     /// Ends the current simple command. Returns its index if it names a program.
     fn end_command(&mut self, argv: &mut Vec<Word>, pipe_from: &mut Option<usize>) -> Result<Option<usize>, Error> {
         let from = pipe_from.take();
+        let pending = std::mem::take(&mut self.pending);
         let mut words = std::mem::take(argv);
         let skip = words.iter().take_while(|w| !w.dynamic && RESERVED.contains(&w.text.as_str())).count();
         words.drain(..skip);
@@ -162,8 +204,12 @@ impl Parser {
         if self.out.len() >= MAX_COMMANDS {
             return Err(Error::TooMany);
         }
-        self.out.push(Command { argv: words, pipe_from: from });
-        Ok(Some(self.out.len() - 1))
+        let idx = self.out.len();
+        if let Some(h) = pending.heredoc.and_then(|id| self.heredocs.iter_mut().find(|h| h.id == id)) {
+            h.feeds = Some(idx);
+        }
+        self.out.push(Command { argv: words, pipe_from: from, stdin: pending.stdin, writes: pending.writes });
+        Ok(Some(idx))
     }
 
     /// A command list, up to the end of input or (when `close`) a `)`.
@@ -257,6 +303,7 @@ impl Parser {
                     let w = self.word()?;
                     // `2>file`: digits right before a redirection are its fd, not a word.
                     if matches!(self.peek(), Some('<' | '>')) && !w.dynamic && !w.text.is_empty() && w.text.chars().all(|c| c.is_ascii_digit()) {
+                        self.pending.fd = Some(w.text);
                         continue;
                     }
                     let test = !w.dynamic && w.text == "[[" && argv.iter().all(|w| !w.dynamic && RESERVED.contains(&w.text.as_str()));
@@ -373,6 +420,7 @@ impl Parser {
     /// A redirection starting at `<` or `>`. Its target is read (it may expand)
     /// but is not an argument. `<(…)` and `>(…)` are process substitutions.
     fn redirect(&mut self, argv: &mut Vec<Word>) -> Result<(), Error> {
+        let stdin = self.pending.fd.take().is_none_or(|fd| fd == "0");
         let c = self.bump().unwrap_or('>');
         if self.peek() == Some('(') {
             self.i += 1;
@@ -380,6 +428,7 @@ impl Parser {
             argv.push(Word { text: format!("{c}(…)"), dynamic: true });
             return Ok(());
         }
+        let (mut here_string, mut read_write) = (false, false);
         if c == '<' && self.eat('<') {
             if !self.eat('<') {
                 let strip_tabs = self.eat('-');
@@ -390,21 +439,41 @@ impl Parser {
                 if raw.is_empty() {
                     return Err(Error::Unterminated("here-document"));
                 }
-                self.heredocs.push(Heredoc { delim: w.text, expand: !raw.contains(['\'', '"', '\\']), strip_tabs });
+                let (id, expand) = (self.next_heredoc, !raw.contains(['\'', '"', '\\']));
+                self.next_heredoc += 1;
+                self.heredocs.push(Heredoc { id, delim: w.text, expand, strip_tabs, feeds: None });
+                if stdin {
+                    self.pending.stdin = Some(Input::Heredoc { body: String::new(), expand });
+                    self.pending.heredoc = Some(id);
+                }
                 return Ok(());
             }
+            here_string = true;
         } else if c == '>' {
             let _ = self.eat('>') || self.eat('|');
         } else {
-            self.eat('>');
+            read_write = self.eat('>');
         }
-        self.eat('&');
+        let dup = self.eat('&');
         self.skip_blanks();
-        match self.peek() {
-            None => Err(Error::Unterminated("redirection")),
-            Some(c) if c.is_whitespace() || ";&|()<>".contains(c) => Err(Error::Unexpected(c)),
-            Some(_) => self.word().map(drop),
+        let target = match self.peek() {
+            None => return Err(Error::Unterminated("redirection")),
+            Some(c) if c.is_whitespace() || ";&|()<>".contains(c) => return Err(Error::Unexpected(c)),
+            Some(_) => self.word()?,
+        };
+        let fd_dup = dup && !target.dynamic && (target.text == "-" || target.text.chars().all(|c| c.is_ascii_digit()));
+        if c == '>' && !fd_dup || read_write {
+            self.pending.writes.push(target.clone());
         }
+        if c == '<' && stdin {
+            self.pending.heredoc = None;
+            self.pending.stdin = Some(match () {
+                _ if dup => Input::Other,
+                _ if here_string => Input::HereString(target),
+                _ => Input::File(target),
+            });
+        }
+        Ok(())
     }
 
     /// Here-document bodies, which start after the line that opened them.
@@ -422,10 +491,11 @@ impl Parser {
                 if l == h.delim {
                     break;
                 }
-                if h.expand {
-                    body.push_str(&line);
-                    body.push('\n');
-                }
+                body.push_str(l);
+                body.push('\n');
+            }
+            if let Some(Command { stdin: Some(Input::Heredoc { body: b, .. }), .. }) = h.feeds.and_then(|i| self.out.get_mut(i)) {
+                b.clone_from(&body);
             }
             if h.expand && body.contains(['$', '`']) {
                 self.sub(body, true)?;
@@ -910,5 +980,40 @@ mod tests {
         let t = std::time::Instant::now();
         assert_eq!(parse(&wide, 0).unwrap()[0].argv.len(), MAX_LEN / 2 - 1);
         assert!(t.elapsed() < std::time::Duration::from_secs(5), "linear time");
+    }
+
+    fn one(src: &str) -> Command {
+        parse(src, 0).unwrap().pop().unwrap()
+    }
+
+    #[test]
+    fn standard_input_and_writes() {
+        let lit = |s: &str| Word { text: s.into(), dynamic: false };
+        assert_eq!(one("sh < cmds.txt").stdin, Some(Input::File(lit("cmds.txt"))));
+        assert_eq!(one("sh 0< cmds.txt").stdin, Some(Input::File(lit("cmds.txt"))));
+        assert_eq!(one("bash <<< 'git push'").stdin, Some(Input::HereString(lit("git push"))));
+        assert_eq!(one("sh <&3").stdin, Some(Input::Other));
+        assert_eq!(one("sh <> f").stdin, Some(Input::File(lit("f"))));
+        assert_eq!(one("sh <> f").writes, [lit("f")]);
+        // Another file descriptor isn't standard input.
+        assert_eq!(one("sh 3< cmds.txt").stdin, None);
+        assert_eq!(one("sh").stdin, None);
+        let c = one("echo hi > a.sh 2>> log 2>&1 >&- &> both");
+        assert_eq!(c.writes, [lit("a.sh"), lit("log"), lit("both")]);
+        assert!(one("echo > \"$F\"").writes[0].dynamic);
+        // A pipe is recorded as where input comes from, not a redirection.
+        let p = parse("curl x | sh", 0).unwrap();
+        assert_eq!((p[1].pipe_from, &p[1].stdin), (Some(0), &None));
+    }
+
+    #[test]
+    fn here_documents_feed_their_command() {
+        let p = parse("cat <<A; sh <<-'B'\nhello $X\nA\n\tgit push\n\tB\n", 0).unwrap();
+        assert_eq!(p[0].stdin, Some(Input::Heredoc { body: "hello $X\n".into(), expand: true }));
+        assert_eq!(p[1].stdin, Some(Input::Heredoc { body: "git push\n".into(), expand: false }));
+        // On another descriptor it is not the command's input.
+        assert_eq!(one("sh 3<<EOF\ngit push\nEOF").stdin, None);
+        // Two here-documents for one command: the last one is its input.
+        assert_eq!(one("sh <<A <<B\nls\nA\ngit push\nB").stdin, Some(Input::Heredoc { body: "git push\n".into(), expand: true }));
     }
 }
