@@ -95,7 +95,7 @@ pub struct Listed {
 }
 
 /// Names botd or the harnesses rely on; a stored secret must not replace them in a Bot's environment.
-const RESERVED: [&str; 12] = ["AUTH_PASSWORD", "LICENSE_KEY", "PATH", "HOME", "USER", "LOGNAME", "SHELL", "ENV", "BASH_ENV", "NODE_OPTIONS", "DISPLAY", "DBUS_SESSION_BUS_ADDRESS"];
+const RESERVED: [&str; 13] = ["AUTH_PASSWORD", "LICENSE_KEY", "STRIPE_WEBHOOK_SECRET", "PATH", "HOME", "USER", "LOGNAME", "SHELL", "ENV", "BASH_ENV", "NODE_OPTIONS", "DISPLAY", "DBUS_SESSION_BUS_ADDRESS"];
 const RESERVED_PREFIXES: [&str; 7] = ["SUPERBOT_", "BOT_", "SSO_", "LD_", "DYLD_", "AGENT_BROWSER_", "VOXL_"];
 pub const MAX_VALUE: usize = 64 * 1024;
 
@@ -577,6 +577,26 @@ mod tests {
             assert!(s.list().unwrap().is_empty(), "{vars:?}");
         }
         assert!(secrets(&[]).put("LICENSE_KEY", "x").is_err(), "installed through /api/license, not as a secret");
+    }
+
+    #[test]
+    fn the_stripe_webhook_secret_never_reaches_bots() {
+        let f = crate::db::temp_path("stripe-env").join("whsec");
+        std::fs::write(&f, "whsec_from_file_test\n").unwrap();
+        for vars in [vec![("STRIPE_WEBHOOK_SECRET", "whsec_inline_test")], vec![("STRIPE_WEBHOOK_SECRET_FILE", f.to_str().unwrap())]] {
+            let s = secrets(&vars);
+            assert!(s.harness_env().is_empty() && s.inherited_harness_env().is_empty(), "{vars:?}");
+            assert!(s.harness_env_for("ua").is_empty(), "a Bot's run space: {vars:?}");
+            assert!(s.list().unwrap().is_empty(), "{vars:?}");
+        }
+        // Even one already in the sealed store (put there before the name was reserved).
+        let s = secrets(&[]);
+        s.stores[1].put("STRIPE_WEBHOOK_SECRET", "whsec_sealed_test").unwrap();
+        assert!(s.harness_env_for("ua").is_empty() && s.inherited_harness_env().is_empty());
+        let host = crate::adapters::local_host();
+        assert!(["STRIPE_WEBHOOK_SECRET", "STRIPE_WEBHOOK_SECRET_FILE"].iter().all(|k| host.remove.iter().any(|r| r == k)), "removed from local jobs");
+        assert!(secrets(&[]).put("STRIPE_WEBHOOK_SECRET", "whsec_x").is_err(), "set in the environment, not as a secret");
+        assert!(secrets(&[]).user_put("ua", "STRIPE_WEBHOOK_SECRET", "whsec_x").is_err());
     }
 
     #[test]

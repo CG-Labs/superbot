@@ -1,0 +1,49 @@
+{
+  "id": "evt_test_subscription_updated",
+  "object": "event",
+  "api_version": "2025-09-30.clover",
+  "created": 1795000000,
+  "livemode": false,
+  "pending_webhooks": 1,
+  "request": { "id": null, "idempotency_key": null },
+  "type": "customer.subscription.updated",
+  "data": {
+    "object": {
+      "id": "sub_test_ada",
+      "object": "subscription",
+      "cancel_at_period_end": false,
+      "collection_method": "charge_automatically",
+      "created": 1794990000,
+      "currency": "gbp",
+      "customer": "cus_test_ada",
+      "items": {
+        "object": "list",
+        "data": [
+          {
+            "id": "si_test_ada",
+            "object": "subscription_item",
+            "current_period_start": 1794990000,
+            "current_period_end": 1797582000,
+            "price": {
+              "id": "price_pro_monthly",
+              "object": "price",
+              "active": true,
+              "currency": "gbp",
+              "product": "prod_test_pro",
+              "recurring": { "interval": "month", "interval_count": 1 },
+              "type": "recurring",
+              "unit_amount": 2000
+            },
+            "quantity": 1,
+            "subscription": "sub_test_ada"
+          }
+        ],
+        "has_more": false
+      },
+      "livemode": false,
+      "metadata": { "superbot_user_id": "{{USER_ID}}" },
+      "status": "active"
+    },
+    "previous_attributes": { "status": "incomplete" }
+  }
+}

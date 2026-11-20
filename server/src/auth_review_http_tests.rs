@@ -20,6 +20,8 @@ const PUBLIC: &[(&str, &str)] = &[
     ("POST", "/api/auth/sso/{id}/callback"),
     ("POST", "/api/signups"),
     ("GET", "/api/signups/config"),
+    // Stripe signs it; checked in `billing` (ADR 0040).
+    ("POST", "/billing/stripe/webhook"),
 ];
 
 /// Every `(method, path)` in `router()`, read from its source so a new route can't be missed.
@@ -130,7 +132,7 @@ async fn every_route_but_the_public_ones_needs_credentials_and_the_right_role() 
             assert!(!rbac::allows(Principal::User(Role::Readonly), need), "readonly could {m} {p}");
         }
         // The admin portal, the audit log, secrets, signups, the setup wizard, and the license are admin-only.
-        if ["/api/users", "/api/sessions", "/api/audit", "/api/secrets", "/api/signups", "/api/policy", "/api/setup", "/api/license"].iter().any(|s| p.starts_with(s)) && !(m == "GET" && p.starts_with("/api/policy")) {
+        if ["/api/users", "/api/sessions", "/api/audit", "/api/secrets", "/api/signups", "/api/policy", "/api/setup", "/api/license", "/api/usage"].iter().any(|s| p.starts_with(s)) && !(m == "GET" && p.starts_with("/api/policy")) {
             assert_eq!(need, rbac::Perm::Admin, "{m} {p}");
         }
         checked += 1;

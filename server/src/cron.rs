@@ -2,8 +2,10 @@
 //! Supports *, numbers, lists (1,2), ranges (1-5), and steps (*/15, 1-10/2).
 //! Uses the server's local time (set TZ).
 
-use crate::audit::{Actor, Who};
+use crate::audit::{Actor, Outcome, Who};
+use crate::db::Routine;
 use crate::runner::App;
+use crate::tiers;
 use chrono::{Datelike, Local, Timelike};
 use serde_json::json;
 use std::sync::Arc;
@@ -66,20 +68,50 @@ pub fn start(app: Arc<App>) {
                 if !r.enabled || r.last_run_at.is_some_and(|t| t / 60_000 == minute) || !matches(&r.cron, &now) {
                     continue;
                 }
-                app.db.routine_ran(&r.id, now.timestamp_millis());
-                let mut scheduler = Actor::system("scheduler");
-                scheduler.on_behalf_of = app.db.bot(&r.bot_id).map(|b| b.owner_id);
-                let by = Who { actor: scheduler, source: Default::default() };
-                app.db.record(&by.event("routine.fired").target("routine", &r.id).bot(&r.bot_id).details(json!({ "name": r.name, "cron": r.cron })));
-                let text = format!("{}: {}", r.name, r.instruction);
-                let mut msg = app.db.add_message(&r.bot_id, "routine", &text, None, false, Some("queued"));
-                app.db.set_requested_by(msg.id, &by);
-                msg.requested_by = Some(by);
-                app.push_message(&msg);
-                app.enqueue(msg);
+                fire(&app, &r, now.timestamp_millis());
             }
         }
     });
+}
+
+/// Runs a routine now: queues its instruction for its Bot, unless the owner's tier has
+/// no routine runs left today.
+pub(crate) fn fire(app: &Arc<App>, r: &Routine, at_ms: i64) {
+    app.db.routine_ran(&r.id, at_ms);
+    let mut scheduler = Actor::system("scheduler");
+    scheduler.on_behalf_of = app.db.bot(&r.bot_id).map(|b| b.owner_id);
+    let by = Who { actor: scheduler, source: Default::default() };
+    if let Some(owner) = by.actor.on_behalf_of.as_deref()
+        && !take_routine_run(app, r, owner, &by, at_ms)
+    {
+        return;
+    }
+    app.db.record(&by.event("routine.fired").target("routine", &r.id).bot(&r.bot_id).details(json!({ "name": r.name, "cron": r.cron })));
+    let text = format!("{}: {}", r.name, r.instruction);
+    let mut msg = app.db.add_message(&r.bot_id, "routine", &text, None, false, Some("queued"));
+    app.db.set_requested_by(msg.id, &by);
+    msg.requested_by = Some(by);
+    app.push_message(&msg);
+    app.enqueue(msg);
+}
+
+/// Counts a firing against the owner's daily routine runs (ADR 0040). False: the
+/// tier's are used up today, so it doesn't run; that is audited every time, and the
+/// Bot says so at the first refusal of the day only.
+fn take_routine_run(app: &App, r: &Routine, owner: &str, by: &Who, at_ms: i64) -> bool {
+    let day = tiers::day(at_ms);
+    let tier = app.tier_of(owner);
+    let Err(limit) = app.db.take_routine_run(owner, &day, tier.limits.daily_routine_runs) else { return true };
+    let details = json!({ "reason": "tier_routine_limit", "name": r.name, "owner": owner, "tier": tier.name, "limit": limit, "day": day });
+    app.db.record(&by.event("routine.run_refused").target("routine", &r.id).bot(&r.bot_id).outcome(Outcome::Denied).details(details));
+    if app.db.routine_refused(owner, &day) {
+        let text = format!(
+            "The {} plan allows {limit} routine runs a day, and today's are used up, so I skipped \"{}\". Routines run again after midnight (UTC).",
+            tier.label, r.name
+        );
+        app.say(&r.bot_id, &text, true);
+    }
+    false
 }
 
 #[cfg(test)]

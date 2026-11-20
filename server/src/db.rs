@@ -150,6 +150,69 @@ fn message_row(r: &Row) -> rusqlite::Result<Message> {
     })
 }
 
+/// A subscription at a payment provider (ADR 0040). Every one a user has had is kept,
+/// ended ones too, so a late event for one is judged against its own history.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Subscription {
+    pub user_id: String,
+    pub provider: String,
+    pub customer_id: Option<String>,
+    pub subscription_id: String,
+    pub status: String,
+    pub price_id: Option<String>,
+    /// The tier it pays for; None when it pays for none (ended, or an unknown price).
+    pub tier: Option<String>,
+    /// End of the paid period, Unix seconds.
+    pub period_end: Option<i64>,
+    /// When the provider created the subscription, Unix seconds. Of a user's paying
+    /// subscriptions, the one started last sets their tier.
+    pub started: i64,
+    /// When the provider made the last event applied, Unix seconds.
+    pub event_created: i64,
+    #[serde(skip)]
+    pub updated_at: i64,
+}
+
+fn subscription_row(r: &Row) -> rusqlite::Result<Subscription> {
+    Ok(Subscription {
+        user_id: r.get("user_id")?,
+        provider: r.get("provider")?,
+        customer_id: r.get("customer_id")?,
+        subscription_id: r.get("subscription_id")?,
+        status: r.get("status")?,
+        price_id: r.get("price_id")?,
+        tier: r.get("tier")?,
+        period_end: r.get("period_end")?,
+        started: r.get("started")?,
+        event_created: r.get("event_created")?,
+        updated_at: r.get("updated_at")?,
+    })
+}
+
+/// The user's paying subscription started last: the one that sets their tier.
+fn paying_subscription(c: &Connection, user_id: &str) -> rusqlite::Result<Option<Subscription>> {
+    c.query_row(
+        "SELECT * FROM subscriptions WHERE user_id = ? AND tier IS NOT NULL ORDER BY started DESC, subscription_id DESC LIMIT 1",
+        [user_id],
+        subscription_row,
+    )
+    .optional()
+}
+
+/// What a payment-provider event did (`Db::apply_subscription`).
+#[derive(Debug, PartialEq)]
+pub enum Applied {
+    Duplicate,
+    Stale,
+    /// Recorded, but another subscription of the user's sets their tier.
+    Superseded,
+    /// The subscription belongs to another user.
+    OtherUser,
+    Unchanged,
+    Changed { from: Option<String>, to: Option<String> },
+}
+
 fn routine_row(r: &Row) -> rusqlite::Result<Routine> {
     Ok(Routine {
         id: r.get("id")?,
@@ -919,7 +982,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 15] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 16] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -935,6 +998,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 15] = [
     migrate_machine_lockdown,
     migrate_machine_placement,
     migrate_machine_upkeep,
+    migrate_billing,
 ];
 /// Harness CLIs and agent upgrades on machines (ADR 0039): what each agent last said,
 /// the plan sent to it, and an upgrade on its way, held, or failed.
@@ -954,6 +1018,40 @@ fn migrate_machine_upkeep(c: &Connection, _fresh: bool) -> rusqlite::Result<()> 
         ALTER TABLE machines ADD COLUMN upgrade_sent_at INTEGER;
         ALTER TABLE machines ADD COLUMN upgrade_by TEXT;
         ALTER TABLE machines ADD COLUMN upgrade_failed_build TEXT;",
+    )
+}
+
+/// Billing v0 (ADR 0040): routine runs counted per user and UTC day, every Stripe
+/// subscription with its user, and the Stripe event ids already applied, so a
+/// redelivered event changes nothing.
+fn migrate_billing(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS usage_daily (
+          user_id TEXT NOT NULL REFERENCES users(id),
+          day TEXT NOT NULL,
+          routine_runs INTEGER NOT NULL DEFAULT 0,
+          routine_refused INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (user_id, day)
+        );
+        CREATE TABLE IF NOT EXISTS subscriptions (
+          subscription_id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id),
+          provider TEXT NOT NULL,
+          customer_id TEXT,
+          status TEXT NOT NULL,
+          price_id TEXT,
+          tier TEXT,
+          period_end INTEGER,
+          started INTEGER NOT NULL,
+          event_created INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS subscriptions_user ON subscriptions (user_id);
+        CREATE TABLE IF NOT EXISTS billing_events (
+          event_id TEXT PRIMARY KEY,
+          type TEXT NOT NULL,
+          received_at INTEGER NOT NULL
+        );",
     )
 }
 /// Machines come up firewalled and enrolled (ADR 0035): the provider firewall each is
@@ -2066,6 +2164,137 @@ impl Db {
     /// Gives back a run that was counted but didn't happen (it was refused).
     pub fn give_back_run(&self, user_id: &str, period: &str) {
         let _ = self.c().execute("UPDATE usage_monthly SET runs = runs - 1 WHERE user_id = ? AND period = ? AND runs > 0", [user_id, period]);
+    }
+
+    /// Routine runs counted for this user on `day` (`YYYY-MM-DD`).
+    pub fn routine_runs_used(&self, user_id: &str, day: &str) -> u32 {
+        self.c()
+            .query_row("SELECT routine_runs FROM usage_daily WHERE user_id = ? AND day = ?", [user_id, day], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    }
+
+    /// Counts one routine run for the user, unless that would pass `limit`, in one
+    /// statement like `take_run`. Ok: routine runs used now; Err: the limit.
+    pub fn take_routine_run(&self, user_id: &str, day: &str, limit: Option<u32>) -> Result<u32, u32> {
+        let cap = limit.map_or(i64::MAX, i64::from);
+        let taken = self
+            .c()
+            .query_row(
+                "INSERT INTO usage_daily (user_id, day, routine_runs) SELECT ?1, ?2, 1 WHERE ?3 >= 1
+                 ON CONFLICT (user_id, day) DO UPDATE SET routine_runs = routine_runs + 1 WHERE routine_runs < ?3
+                 RETURNING routine_runs",
+                params![user_id, day, cap],
+                |r| r.get::<_, u32>(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        taken.ok_or(limit.unwrap_or(0))
+    }
+
+    /// Gives back a routine run that was counted but didn't happen.
+    pub fn give_back_routine_run(&self, user_id: &str, day: &str) {
+        let _ = self.c().execute("UPDATE usage_daily SET routine_runs = routine_runs - 1 WHERE user_id = ? AND day = ? AND routine_runs > 0", [user_id, day]);
+    }
+
+    /// Notes a refused routine run. True for the user's first refusal that day, so the
+    /// Bot says so once a day instead of at every firing.
+    pub fn routine_refused(&self, user_id: &str, day: &str) -> bool {
+        self.c()
+            .query_row(
+                "INSERT INTO usage_daily (user_id, day, routine_refused) VALUES (?1, ?2, 1)
+                 ON CONFLICT (user_id, day) DO UPDATE SET routine_refused = routine_refused + 1
+                 RETURNING routine_refused",
+                [user_id, day],
+                |r| r.get::<_, i64>(0),
+            )
+            .is_ok_and(|n| n == 1)
+    }
+
+    // Billing (ADR 0040)
+
+    /// The subscription that sets the user's tier (`paying_subscription`), else the one
+    /// with the latest event, to show how it ended.
+    pub fn subscription(&self, user_id: &str) -> Option<Subscription> {
+        let c = self.c();
+        paying_subscription(&c, user_id)
+            .ok()
+            .flatten()
+            .or_else(|| c.query_row("SELECT * FROM subscriptions WHERE user_id = ? ORDER BY event_created DESC, started DESC LIMIT 1", [user_id], subscription_row).optional().ok().flatten())
+    }
+
+    pub fn subscription_by_id(&self, subscription_id: &str) -> Option<Subscription> {
+        self.c().query_row("SELECT * FROM subscriptions WHERE subscription_id = ?", [subscription_id], subscription_row).optional().ok().flatten()
+    }
+
+    /// Applies one payment-provider event, in one transaction: records the event id (a
+    /// redelivery is `Duplicate`), skips events older than the last one applied to the
+    /// same subscription, or that would revive one cancelled for good (`Stale`; Stripe
+    /// times events to the second, so an update can tie with the cancellation after
+    /// it), and keeps the subscription's latest state. The
+    /// user's tier is then that of their paying subscription started last (None, the
+    /// default tier, when nothing pays); `users.tier` is set to it when this event
+    /// changed which one that is, or is for that one. An event for any other
+    /// subscription is `Superseded`. So the outcome doesn't depend on the order events
+    /// arrive in: a late event for a replaced plan can't bring it back, and a new plan
+    /// applies whenever the old one's cancellation arrives. `set_tier` false (a
+    /// subscription not paid for yet) records it without changing any tier.
+    pub fn apply_subscription(&self, event_id: &str, event_type: &str, sub: &Subscription, set_tier: bool) -> Result<Applied, String> {
+        let c = self.c();
+        let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
+        let new = tx
+            .execute("INSERT OR IGNORE INTO billing_events (event_id, type, received_at) VALUES (?, ?, ?)", params![event_id, event_type, now()])
+            .map_err(|e| e.to_string())?;
+        if new == 0 {
+            return Ok(Applied::Duplicate);
+        }
+        let by_id = tx.query_row("SELECT * FROM subscriptions WHERE subscription_id = ?", [&sub.subscription_id], subscription_row).optional().map_err(|e| e.to_string())?;
+        let outcome = if by_id.as_ref().is_some_and(|s| s.user_id != sub.user_id) {
+            Applied::OtherUser
+        } else if by_id.as_ref().is_some_and(|s| {
+            // Stripe never revives a subscription it cancelled for good. Its `created` is
+            // in seconds, so two events can tie; an ended state wins the tie.
+            let fin = |status: &str| crate::billing::FINAL.contains(&status);
+            let ended = |status: &str| crate::billing::ENDED.contains(&status);
+            sub.event_created < s.event_created
+                || (fin(&s.status) && !fin(&sub.status))
+                || (sub.event_created == s.event_created && ended(&s.status) && !ended(&sub.status))
+        }) {
+            Applied::Stale
+        } else {
+            let paying_id = |s: &Option<Subscription>| s.as_ref().map(|s| s.subscription_id.clone());
+            let before = paying_subscription(&tx, &sub.user_id).map_err(|e| e.to_string())?;
+            let tier = if set_tier { sub.tier.clone() } else { by_id.and_then(|s| s.tier) };
+            tx.execute(
+                "INSERT INTO subscriptions (subscription_id, user_id, provider, customer_id, status, price_id, tier, period_end, started, event_created, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT (subscription_id) DO UPDATE SET provider = ?3, customer_id = ?4, status = ?5, price_id = ?6,
+                   tier = ?7, period_end = ?8, event_created = ?10, updated_at = ?11",
+                params![sub.subscription_id, sub.user_id, sub.provider, sub.customer_id, sub.status, sub.price_id, tier, sub.period_end, sub.started, sub.event_created, now()],
+            )
+            .map_err(|e| e.to_string())?;
+            let after = paying_subscription(&tx, &sub.user_id).map_err(|e| e.to_string())?;
+            let moved = paying_id(&before) != paying_id(&after);
+            let to = after.as_ref().and_then(|s| s.tier.clone());
+            if after.as_ref().is_some_and(|s| s.subscription_id != sub.subscription_id) && !moved {
+                Applied::Superseded
+            } else if !set_tier && !moved {
+                Applied::Unchanged
+            } else {
+                let from: Option<String> = tx.query_row("SELECT tier FROM users WHERE id = ?", [&sub.user_id], |r| r.get(0)).map_err(|e| e.to_string())?;
+                if from != to {
+                    tx.execute("UPDATE users SET tier = ?, updated_at = ? WHERE id = ?", params![to, now(), sub.user_id]).map_err(|e| e.to_string())?;
+                    Applied::Changed { from, to }
+                } else {
+                    Applied::Unchanged
+                }
+            }
+        };
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(outcome)
     }
 
     // SSO identities (ADR 0014)
@@ -3210,6 +3439,72 @@ mod tests {
         let won = threads.into_iter().map(|t| t.join().unwrap()).filter(|ok| *ok).count();
         assert_eq!((won, db.owned_bot_count(&u.id)), (3, 3));
         assert!(db.create_bot_capped("B", "#fff", "waddle", "claude", None, false, &other.id, Visibility::Private, None).is_some());
+    }
+
+    #[test]
+    fn subscription_events_end_in_the_same_tier_whatever_order_they_arrive_in() {
+        fn orders(n: usize) -> Vec<Vec<usize>> {
+            if n == 0 {
+                return vec![vec![]];
+            }
+            orders(n - 1)
+                .into_iter()
+                .flat_map(|o| {
+                    (0..n).map(move |i| {
+                        let mut o = o.clone();
+                        o.insert(i, n - 1);
+                        o
+                    })
+                })
+                .collect()
+        }
+        let db = Db::open(&temp_path("sub-order").join("app.sqlite")).unwrap();
+        // Plan A (pro) started at 10, was updated at 25 and cancelled at 30. Plan B
+        // (starter) started at 20, replacing it, and was cancelled at 40. Then ties:
+        // A cancelled in the same second it started, an update to A in the same second
+        // as its cancellation, and A paused and resumed in the same second.
+        let events = [
+            ("a", "active", Some("pro"), 10, 10),
+            ("b", "active", Some("starter"), 20, 20),
+            ("a", "active", Some("pro"), 10, 25),
+            ("a", "canceled", None, 10, 30),
+            ("b", "canceled", None, 20, 40),
+            ("a", "canceled", None, 10, 10),
+            ("a", "active", Some("pro"), 10, 30),
+            ("a", "paused", None, 10, 50),
+            ("a", "active", Some("pro"), 10, 50),
+        ];
+        let cases = [
+            (&[0, 1, 2, 3][..], Some("starter")),
+            (&[0, 1, 2, 3, 4][..], None),
+            (&[0, 1, 2, 4][..], Some("pro")),
+            (&[0, 5][..], None),
+            (&[0, 3, 6][..], None),
+            (&[0, 7, 8][..], None),
+        ];
+        for (picked, want) in cases {
+            for order in orders(picked.len()) {
+                let u = db.create_user(None, None, "Payer", Role::Member).unwrap();
+                for (n, &i) in order.iter().enumerate() {
+                    let (plan, status, tier, started, at) = events[picked[i]];
+                    let s = Subscription {
+                        user_id: u.id.clone(),
+                        provider: "stripe".into(),
+                        customer_id: None,
+                        subscription_id: format!("{}-{plan}", u.id),
+                        status: status.into(),
+                        price_id: None,
+                        tier: tier.map(String::from),
+                        period_end: None,
+                        started,
+                        event_created: at,
+                        updated_at: 0,
+                    };
+                    db.apply_subscription(&format!("{}-{n}", u.id), "customer.subscription.updated", &s, true).unwrap();
+                }
+                assert_eq!(db.user(&u.id).unwrap().tier.as_deref(), want, "events {picked:?} in order {order:?}");
+            }
+        }
     }
 
     #[test]
