@@ -12,6 +12,8 @@ jest.mock("expo-router", () => ({
   useLocalSearchParams: () => mockParams,
 }));
 jest.mock("../../src/SuperBotContext", () => ({ useSuperBot: () => mockCtx }));
+// Typing key by key through whole edit flows passes 5 s on slow CI runners.
+jest.setTimeout(20_000);
 
 const CLASSES = [
   { id: "shell_destructive", label: "Destructive shell command" },
