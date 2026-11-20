@@ -137,7 +137,18 @@ impl Upgrader {
                 r.state = wire::UPGRADE_TRIAL.into();
                 *u.trial.lock().unwrap() = Some((r, tokio::time::Instant::now() + left));
             } else {
-                u.end(t.report, wire::UPGRADE_ROLLED_BACK, Some("the new agent didn't start, so the old one was put back".into()));
+                // The guard put the old agent back, or it never left (a restart between
+                // the swaps): either way botctl goes back too.
+                let res = restore(&u.botctl);
+                for p in [&u.exe, &u.botctl] {
+                    let _ = std::fs::remove_file(suffixed(p, ".prev"));
+                    let _ = std::fs::remove_file(suffixed(p, ".new"));
+                }
+                let mut why = "the new agent didn't start, so the old one was put back".to_string();
+                if let Err(e) = res {
+                    why = format!("{why}; {e}");
+                }
+                u.end(t.report, wire::UPGRADE_ROLLED_BACK, Some(why));
             }
         }
         u
@@ -444,6 +455,8 @@ mod tests {
         let old = Upgrader::new(u.exe.clone(), state.clone(), "0.1.0");
         assert_eq!(old.report().map(|r| r.state), Some(wire::UPGRADE_ROLLED_BACK.to_string()));
         assert!(!state.join(TRIAL_FILE).exists());
+        assert_eq!(std::fs::read(&u.botctl).unwrap(), b"old botctl", "botctl goes back with it");
+        assert!(!suffixed(&u.botctl, ".prev").exists());
     }
 
     #[test]

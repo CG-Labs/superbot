@@ -222,7 +222,12 @@ async fn upgrade(app: &App, cp: &ControlPlane, e: &Enrollment, m: &Machine, hb: 
         None => (&auto, "auto".to_string()),
     };
     if !app.db.machine_upgrade_claim(&m.id, &id, &served, &who, stale) {
-        return Err(conflict("An upgrade is on its way to it already.".into()));
+        let held = app.db.machine(&m.id).is_some_and(|m| m.upgrade_hold_at.is_some());
+        return Err(conflict(if held {
+            "Its agent is held at its build. Release it first.".into()
+        } else {
+            "An upgrade is on its way to it already.".into()
+        }));
     }
     let req = UpgradeRequest {
         id: id.clone(),
@@ -295,17 +300,24 @@ fn plan_due(plan: &HarnessPlan, m: &Machine, hb: &Heartbeat, at: i64) -> bool {
         })
 }
 
+/// Ends `m`'s upgrade as failed if its agent hasn't said how it went in time, answering
+/// or not. Its build isn't tried again by itself.
+pub fn expire_upgrade(app: &App, cp: &ControlPlane, m: &Machine) {
+    let (Some(id), Some(at)) = (&m.upgrade_id, m.upgrade_sent_at) else { return };
+    if now() - at > trial_secs(cp) as i64 * 1000 + UPGRADE_GRACE_MS
+        && app.db.machine_upgrade_end(&m.id, id, m.upgrade_build.as_deref())
+    {
+        let d = json!({ "upgradeId": id, "by": m.upgrade_by, "toBuild": m.upgrade_build, "reason": "timeout", "error": "it never said how the upgrade went" });
+        app.db.record(&event(&system(m), "machine.agent_upgrade_failed", m, d).outcome(Outcome::Failure));
+    }
+}
+
 /// After a periodic heartbeat: ends an upgrade that never finished, then sends an
 /// upgrade (MACHINE_AGENT_UPGRADES=auto) or the harness plan, if either is due.
 pub async fn follow_up(app: &App, cp: &ControlPlane, e: &Enrollment, machine_id: &str, hb: &Heartbeat) {
     let Some(m) = app.db.machine(machine_id) else { return };
-    if let (Some(id), Some(at)) = (&m.upgrade_id, m.upgrade_sent_at) {
-        if now() - at > trial_secs(cp) as i64 * 1000 + UPGRADE_GRACE_MS
-            && app.db.machine_upgrade_end(&m.id, id, m.upgrade_build.as_deref())
-        {
-            let d = json!({ "upgradeId": id, "by": m.upgrade_by, "toBuild": m.upgrade_build, "reason": "timeout", "error": "it never said how the upgrade went" });
-            app.db.record(&event(&system(&m), "machine.agent_upgrade_failed", &m, d).outcome(Outcome::Failure));
-        }
+    if m.upgrade_id.is_some() {
+        expire_upgrade(app, cp, &m);
         return;
     }
     let auto = e.upkeep.upgrades == Upgrades::Auto

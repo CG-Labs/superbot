@@ -247,9 +247,11 @@ impl Tools {
         for h in &plan.harnesses {
             let have = s.installed.get(&h.name).cloned();
             let old = s.status.get(&h.name);
+            // Only the very same recipe carries on; a corrected one is installed again.
+            let same = s.plan.as_ref().is_some_and(|p| p.harnesses.contains(h));
             let st = if have.as_deref() == Some(&h.version) && runnable(&self.bin_dir().join(&h.name)) {
                 HarnessStatus { version: have, wanted: Some(h.version.clone()), state: wire::HARNESS_INSTALLED.into(), error: None, at: old.map_or(at, |o| o.at) }
-            } else if old.is_some_and(|o| o.state == wire::HARNESS_INSTALLING && o.wanted.as_deref() == Some(&h.version)) {
+            } else if same && old.is_some_and(|o| o.state == wire::HARNESS_INSTALLING) {
                 old.cloned().unwrap_or_default()
             } else {
                 HarnessStatus { version: have, wanted: Some(h.version.clone()), state: wire::HARNESS_QUEUED.into(), error: None, at }
@@ -307,9 +309,7 @@ impl Tools {
         } else {
             st.version = version;
         }
-        let snapshot = s.clone();
-        drop(s);
-        self.save(&snapshot);
+        self.save(&s);
     }
 
     /// Installs what's queued, one at a time, until stopped.
@@ -580,6 +580,34 @@ mod tests {
         let mut n = node.clone().unwrap();
         n.downloads.insert("aarch64".into(), wire::Download { url: "https://nodejs.org/n.tar.xz".into(), sha256: "short".into() });
         assert!(check(&plan(vec![], Some(n))).is_err());
+    }
+
+    #[test]
+    fn a_recipe_corrected_mid_install_is_installed_again() {
+        let dir = std::env::temp_dir().join(format!("superbot-tools-corrected-{}", now_ms()));
+        let t = Tools::new(dir, None).unwrap();
+        let node = NodeRuntime {
+            version: "24.22.3".into(),
+            downloads: BTreeMap::from([("x86_64".into(), wire::Download { url: "https://nodejs.org/n.tar.xz".into(), sha256: "a".repeat(64) })]),
+        };
+        let with = |integrity: Option<String>| HarnessPlan {
+            node: Some(node.clone()),
+            harnesses: vec![HarnessInstall {
+                source: InstallSource::Npm { package: "@anthropic-ai/claude-code".into(), integrity },
+                ..npm("claude", "@anthropic-ai/claude-code", "2.1.329")
+            }],
+        };
+        let sum = |b: u8| Some(format!("sha512-{}", base64::engine::general_purpose::STANDARD.encode([b; 64])));
+        t.set_plan(with(sum(1))).unwrap();
+        let (old, _) = t.next().unwrap();
+        t.set_plan(with(sum(1))).unwrap();
+        assert_eq!(t.report().1["claude"].state, wire::HARNESS_INSTALLING, "the same recipe carries on");
+        t.set_plan(with(sum(2))).unwrap();
+        assert_eq!(t.report().1["claude"].state, wire::HARNESS_QUEUED);
+        t.finish(&old, Err("bad checksum".into()));
+        assert_eq!(t.report().1["claude"].state, wire::HARNESS_QUEUED, "the old run's end doesn't count");
+        let (new, _) = t.next().unwrap();
+        assert_eq!(new, with(sum(2)).harnesses[0]);
     }
 
     #[test]

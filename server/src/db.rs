@@ -3002,13 +3002,13 @@ impl Db {
         );
     }
 
-    /// Records an upgrade as on its way, unless another is (one sent before
-    /// `stale_before` no longer counts). Returns whether this one is.
+    /// Records an upgrade as on its way, unless the machine is held or another is (one
+    /// sent before `stale_before` no longer counts). Returns whether this one is.
     pub fn machine_upgrade_claim(&self, machine_id: &str, id: &str, build: &str, by: &str, stale_before: i64) -> bool {
         self.c()
             .execute(
                 "UPDATE machines SET upgrade_id = ?, upgrade_build = ?, upgrade_sent_at = ?, upgrade_by = ?
-                 WHERE id = ? AND (upgrade_id IS NULL OR upgrade_sent_at < ?)",
+                 WHERE id = ? AND upgrade_hold_at IS NULL AND (upgrade_id IS NULL OR upgrade_sent_at < ?)",
                 params![id, build, now(), by, machine_id, stale_before],
             )
             .unwrap_or(0)
@@ -3122,6 +3122,19 @@ mod tests {
         let e = &all_events(&db)[0];
         assert_eq!((e.action.as_str(), e.actor_kind.as_str(), e.target_type.as_deref(), e.outcome.as_str()), ("policy.initialized", "system", Some("policy"), "success"));
         assert!(e.time.ends_with('Z'), "{}", e.time);
+    }
+
+    #[test]
+    fn a_held_machine_claims_no_upgrade() {
+        let db = Db::open(&temp_path("upgrade-hold").join("app.sqlite")).unwrap();
+        let u = db.create_user(None, Some("ada@example.com"), "Ada", Role::Member).unwrap();
+        let new = NewMachine { user_id: &u.id, provider: "fake", label_prefix: "superbot", tier: "starter", plan: "g6-standard-1", region: "gb-lon", created_by: None };
+        let m = db.add_machine(&new).unwrap();
+        assert!(db.machine_upgrade_hold(&m.id, Some(Some("admin"))));
+        assert!(!db.machine_upgrade_claim(&m.id, "u1", "b", "admin", 0), "held");
+        assert!(db.machine_upgrade_hold(&m.id, None));
+        assert!(db.machine_upgrade_claim(&m.id, "u1", "b", "admin", 0));
+        assert!(!db.machine_upgrade_claim(&m.id, "u2", "b", "admin", 0), "one on its way");
     }
 
     #[test]

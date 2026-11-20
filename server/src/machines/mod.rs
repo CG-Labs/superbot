@@ -778,7 +778,12 @@ pub async fn heartbeats(app: &App, cp: &ControlPlane) -> Option<usize> {
     let enrolled = app.db.machines(Some(State::Running)).into_iter().filter(|m| m.enrollment == "enrolled");
     let answered = futures_util::stream::iter(enrolled)
         .map(|m| async move {
-            let Ok(hb) = enroll::heartbeat(app, e, &m).await else { return false };
+            let Ok(hb) = enroll::heartbeat(app, e, &m).await else {
+                if let Some(m) = app.db.machine(&m.id) {
+                    upkeep::expire_upgrade(app, cp, &m);
+                }
+                return false;
+            };
             upkeep::follow_up(app, cp, e, &m.id, &hb).await;
             true
         })
