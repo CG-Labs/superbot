@@ -418,6 +418,20 @@ impl MachineProvider for Linode {
         })
     }
 
+    fn get_firewall<'a>(&'a self, id: &'a str) -> Fut<'a, ProviderFirewall> {
+        Box::pin(async move {
+            let v = self
+                .call(
+                    Method::GET,
+                    &format!("/networking/firewalls/{}", path_id(id)?),
+                    None,
+                    None,
+                )
+                .await?;
+            firewall(&v)
+        })
+    }
+
     fn create_firewall<'a>(
         &'a self,
         label: &'a str,
@@ -665,6 +679,14 @@ mod tests {
                 .put(move |State(s): State<Seen>, h: HeaderMap, Path(id): Path<u64>, Json(b): Json<Value>| async move {
                     record(&s, "PUT", format!("/networking/firewalls/{id}"), &h, b);
                     (StatusCode::OK, Json(json!({})))
+                })
+                .get(move |State(s): State<Seen>, h: HeaderMap, Path(id): Path<u64>| async move {
+                    record(&s, "GET", format!("/networking/firewalls/{id}"), &h, Value::Null);
+                    match id {
+                        78 => (StatusCode::OK, Json(json!({ "id": 78, "label": "superbot-fw-old", "status": "enabled",
+                            "rules": { "inbound_policy": "ACCEPT", "outbound_policy": "ACCEPT", "inbound": [], "outbound": [] } }))),
+                        _ => (StatusCode::NOT_FOUND, Json(json!({ "errors": [{ "reason": "Not found" }] }))),
+                    }
                 }),
             )
             .route(
@@ -879,6 +901,13 @@ mod tests {
             "Linode's spelling of an address is the same address"
         );
         assert_eq!(api.find_firewall("superbot-fw-x").await.unwrap(), None);
+        let old = api.get_firewall("78").await.unwrap();
+        assert_eq!(
+            (old.label.as_str(), old.enabled, old.rules),
+            ("superbot-fw-old", true, None),
+            "an open inbound policy isn't ours"
+        );
+        assert_eq!(api.get_firewall("79").await, Err(ProviderError::NotFound));
         api.set_firewall_rules("77", &rules[..1]).await.unwrap();
         api.enable_firewall("77").await.unwrap();
         assert_eq!(
@@ -914,6 +943,8 @@ mod tests {
                 ("POST", "/networking/firewalls"),
                 ("GET", "/networking/firewalls?page=1&page_size=500"),
                 ("GET", "/networking/firewalls?page=1&page_size=500"),
+                ("GET", "/networking/firewalls/78"),
+                ("GET", "/networking/firewalls/79"),
                 ("PUT", "/networking/firewalls/77/rules"),
                 ("PUT", "/networking/firewalls/77"),
                 ("GET", "/networking/firewalls/77/devices"),
@@ -940,10 +971,10 @@ mod tests {
                 ] } })
         );
         assert_eq!(seen[2].2.as_deref(), Some(r#"{"label":"superbot-fw"}"#));
-        assert_eq!(seen[4].3["inbound"].as_array().unwrap().len(), 1);
-        assert_eq!(seen[5].3, json!({ "status": "enabled" }));
-        assert_eq!(seen[7].3, json!({ "id": 8, "type": "linode" }));
-        assert_eq!(seen[14].3["firewall_id"], json!(77), "behind it from the first boot");
+        assert_eq!(seen[6].3["inbound"].as_array().unwrap().len(), 1);
+        assert_eq!(seen[7].3, json!({ "status": "enabled" }));
+        assert_eq!(seen[9].3, json!({ "id": 8, "type": "linode" }));
+        assert_eq!(seen[16].3["firewall_id"], json!(77), "behind it from the first boot");
     }
 
     #[test]

@@ -141,6 +141,7 @@ pub trait MachineProvider: Send + Sync {
     // Firewalls (ADR 0035). Labels are unique per account, as machines' are.
 
     fn find_firewall<'a>(&'a self, label: &'a str) -> Fut<'a, Option<ProviderFirewall>>;
+    fn get_firewall<'a>(&'a self, id: &'a str) -> Fut<'a, ProviderFirewall>;
     /// Makes a firewall covering no machines yet. `LabelTaken` if one has the label.
     fn create_firewall<'a>(
         &'a self,

@@ -251,6 +251,42 @@ async fn the_reconciler_puts_machines_and_rules_back() {
     );
 }
 
+/// After a label prefix change, machines stay behind the firewall they were made
+/// behind, which still gets our rules, until they go.
+#[tokio::test]
+async fn an_older_firewall_is_kept_right_until_its_machines_go() {
+    let env = serve(on(), None).await;
+    let (ua, _, a) = request(&env, "ada@example.com").await;
+    let pa = machine(&env, &a).provider_id.unwrap();
+    let old = env.fake.firewalls()[0].id.clone();
+    env.fake.set_firewall(&old, |f| f.label = "oldprefix-fw".into());
+
+    reconcile(&env).await;
+    let new = env.fake.firewalls().into_iter().find(|f| f.label == "superbot-fw").unwrap();
+    assert!(new.machines.is_empty(), "not moved: moving would open it for a moment");
+    assert_eq!(machine(&env, &a).firewall_id.as_deref(), Some(old.as_str()));
+
+    env.fake.set_firewall(&old, |f| {
+        f.foreign = true;
+        f.enabled = false;
+    });
+    reconcile(&env).await;
+    let o = env.fake.firewalls().into_iter().find(|f| f.id == old).unwrap();
+    assert!(!o.foreign && o.enabled && o.machines.contains(&pa), "{o:?}");
+    assert_eq!(o.rules, [agent_rule()]);
+    assert!(events(&env, "machine.firewall_failed").await.is_empty(), "no attach tried");
+    assert!(events(&env, "machine.firewall_attached").await.is_empty());
+
+    let (_, _, b) = request(&env, "bea@example.com").await;
+    assert_eq!(machine(&env, &b).firewall_id.as_deref(), Some(new.id.as_str()));
+    assert_eq!(
+        json_call(&env, "DELETE", &format!("/api/users/{ua}/machine")).await.0,
+        200
+    );
+    let left: Vec<String> = env.fake.firewalls().into_iter().map(|f| f.id).collect();
+    assert_eq!(left, [new.id], "the older one goes with its last machine");
+}
+
 #[tokio::test]
 async fn no_firewall_no_machine() {
     let env = serve(on(), None).await;

@@ -50,9 +50,11 @@ If botd can't get the firewall, it creates no machine and mints no token:
 
 **Each reconcile pass** keeps things right while any machine exists. It restores changed rules, re-enables a disabled firewall, re-creates a deleted one, and reattaches machines that are off it. These are machines taken off at the provider, adopted after a lost create, or made before the firewall was turned on. A machine botd can't attach (Linode allows one firewall per Linode) is audited once per distinct error, not on every pass.
 
+A machine that is still behind an older firewall of ours stays there. This happens after a `MACHINE_LABEL_PREFIX` change, for example. Moving it would mean detaching first, since Linode allows one firewall per Linode, and that would leave it open for a moment. Instead, botd keeps that firewall's rules and status right too, and deletes it with its last machine. New machines go behind the current one.
+
 **When a machine is destroyed,** botd takes it off the firewall. Linode does this on delete too, so it is idempotent. When no live machine of ours uses the firewall and Linode reports no devices of any kind on it, botd deletes it. It never deletes a firewall that still covers something botd doesn't know, such as a NodeBalancer someone attached. If the delete fails, the empty firewall costs nothing and the next machine reuses it.
 
-The provider trait has the firewall operations: find, create, set rules, enable, list devices, attach, detach, delete. So the in-memory fake covers all of it in tests, and only the Linode adapter knows Linode's API.
+The provider trait has the firewall operations: find by label, get by id, create, set rules, enable, list devices, attach, detach, delete. So the in-memory fake covers all of it in tests, and only the Linode adapter knows Linode's API.
 
 ### First boot installs and enrolls
 

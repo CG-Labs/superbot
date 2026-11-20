@@ -301,6 +301,14 @@ impl MachineProvider for Fake {
         })
     }
 
+    fn get_firewall<'a>(&'a self, id: &'a str) -> Fut<'a, ProviderFirewall> {
+        Box::pin(async move {
+            self.with("get_firewall", |s| {
+                s.firewalls.get(id).map(view).ok_or(ProviderError::NotFound)
+            })
+        })
+    }
+
     fn create_firewall<'a>(
         &'a self,
         label: &'a str,

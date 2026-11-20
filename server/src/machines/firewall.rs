@@ -4,13 +4,13 @@
 //! are created behind it, so none is ever open, and the reconciler puts back any that
 //! left it. Off unless MACHINE_FIREWALL=on, which needs enrollment.
 
-use super::provider::{FirewallRule, MachineProvider, ProviderError};
+use super::provider::{FirewallRule, MachineProvider, ProviderError, ProviderFirewall};
 use super::{SYSTEM, State, event, system};
 use crate::audit::{Outcome, Who};
 use crate::db::Machine;
 use crate::runner::App;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::sync::Mutex;
 
@@ -204,6 +204,18 @@ pub async fn ensure(
             Err(e) => return Err(e),
         },
     };
+    repair(app, fw, p, by, &found).await?;
+    Ok(found.id)
+}
+
+/// Sets `found`'s rules back to ours if they differ, and enables it if it was off.
+async fn repair(
+    app: &App,
+    fw: &Firewall,
+    p: &dyn MachineProvider,
+    by: &Who,
+    found: &ProviderFirewall,
+) -> Result<(), ProviderError> {
     if found.rules.as_deref() != Some(&fw.rules[..]) {
         p.set_firewall_rules(&found.id, &fw.rules).await?;
         record(
@@ -212,7 +224,7 @@ pub async fn ensure(
             "machine.firewall_updated",
             &found.id,
             Outcome::Success,
-            json!({ "label": fw.label, "rules": rules_json(&fw.rules), "was": found.rules.as_deref().map(rules_json) }),
+            json!({ "label": found.label, "rules": rules_json(&fw.rules), "was": found.rules.as_deref().map(rules_json) }),
         );
     }
     if !found.enabled {
@@ -223,10 +235,10 @@ pub async fn ensure(
             "machine.firewall_updated",
             &found.id,
             Outcome::Success,
-            json!({ "label": fw.label, "status": "enabled", "was": "disabled" }),
+            json!({ "label": found.label, "status": "enabled", "was": "disabled" }),
         );
     }
-    Ok(found.id)
+    Ok(())
 }
 
 fn failed(app: &App, by: &Who, m: &Machine, firewall_id: &str, step: &str, e: &ProviderError) {
@@ -243,8 +255,10 @@ fn failed(app: &App, by: &Who, m: &Machine, firewall_id: &str, step: &str, e: &P
 
 /// Keeps the firewall as configured and every machine the provider has behind it:
 /// those adopted from a lost create, made before the firewall was on, or taken off it
-/// at the provider. Nothing is called when there are no such machines. Returns how
-/// many it put back.
+/// at the provider. A machine still behind an older firewall of ours (e.g. from
+/// before a label prefix change) stays there, since moving it would leave it open
+/// for a moment, and that firewall gets our rules too. Nothing is called when there
+/// are no machines. Returns how many it put back.
 pub async fn sync(app: &App, fw: &Firewall, p: &dyn MachineProvider) -> usize {
     let live: Vec<Machine> = app
         .db
@@ -265,26 +279,67 @@ pub async fn sync(app: &App, fw: &Firewall, p: &dyn MachineProvider) -> usize {
             return 0;
         }
     };
-    let covered = match p.firewall_devices(&id).await {
-        Ok(c) => c.machines,
+    let mut covers: HashMap<String, Option<Vec<String>>> = HashMap::new();
+    match p.firewall_devices(&id).await {
+        Ok(c) => covers.insert(id.clone(), Some(c.machines)),
         Err(e) => {
             eprintln!("Machine firewall: {e}");
             return 0;
         }
     };
+    let older: BTreeSet<String> = live
+        .iter()
+        .filter_map(|m| m.firewall_id.clone())
+        .filter(|f| *f != id)
+        .collect();
+    for old in older {
+        let found = async {
+            let f = p.get_firewall(&old).await?;
+            repair(app, fw, p, &Who::system(SYSTEM), &f).await?;
+            Ok(p.firewall_devices(&old).await?.machines)
+        };
+        match found.await {
+            Ok(c) => {
+                covers.insert(old, Some(c));
+            }
+            // Gone: its machines join the current one.
+            Err(ProviderError::NotFound) => {}
+            Err(e) => {
+                eprintln!("Machine firewall {old}: {e}");
+                covers.insert(old, None);
+            }
+        }
+    }
     let mut attached = 0;
     for m in live {
         let pid = m.provider_id.as_deref().unwrap_or_default();
-        let res = if covered.iter().any(|c| c == pid) {
-            Ok(false)
+        let behind = |f: &str| {
+            covers
+                .get(f)
+                .and_then(|c| c.as_ref())
+                .is_some_and(|c| c.iter().any(|c| c == pid))
+        };
+        let saved = m.firewall_id.as_deref().filter(|f| *f != id);
+        // Where it is behind, and whether we just put it there.
+        let res = if behind(&id) {
+            Ok((id.clone(), false))
+        } else if let Some(old) = saved
+            && behind(old)
+        {
+            Ok((old.to_string(), false))
+        } else if let Some(old) = saved
+            && matches!(covers.get(old), Some(None))
+        {
+            // Couldn't read it this pass; attaching would fail if it's still there.
+            continue;
         } else {
-            p.attach_firewall(&id, pid).await.map(|()| true)
+            p.attach_firewall(&id, pid).await.map(|()| (id.clone(), true))
         };
         match res {
-            Ok(put_back) => {
+            Ok((home, put_back)) => {
                 fw.failed.lock().unwrap().remove(&m.id);
-                if m.firewall_id.as_deref() != Some(id.as_str()) {
-                    app.db.set_machine_firewall(&m.id, &id);
+                if m.firewall_id.as_deref() != Some(home.as_str()) {
+                    app.db.set_machine_firewall(&m.id, &home);
                 }
                 if put_back {
                     attached += 1;
