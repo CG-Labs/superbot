@@ -620,8 +620,8 @@ async function saveSetup(body) {
   if (seq === setup.seq) renderSetup();
 }
 
-// Shows the step at once and saves it in the background. The reply only refreshes the
-// header, so nothing typed into the new step is lost.
+// Shows the step at once and saves it in the background. The reply redraws the step only
+// if the server's state changed meanwhile and nothing has been typed into it yet.
 async function goSetup(step) {
   setup.step = step;
   renderSetup();
@@ -629,12 +629,17 @@ async function goSetup(step) {
   try {
     const data = await api("PATCH", "/api/setup", { step });
     if (seq !== setup.seq) return;
+    const changed = setupState(setup.data) !== setupState(data);
     setup.data = data;
-    renderSetupHead();
+    const typed = [...$("setup-body").querySelectorAll("textarea")].some((t) => t.value);
+    if (changed && !typed) renderSetup();
+    else renderSetupHead();
   } catch (err) {
     fail(err);
   }
 }
+
+const setupState = (s) => JSON.stringify(s && { ...s, progress: { ...s.progress, step: null } });
 
 // Open checklist items on the tab while admins are still sent here.
 function setupCount(s) {
