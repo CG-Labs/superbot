@@ -130,7 +130,8 @@ async fn the_honeypot_answers_like_a_success_and_saves_nothing() {
 
 #[tokio::test]
 async fn only_admins_see_and_decide_signups() {
-    let (port, _, admin, bot) = serve_app().await;
+    let (port, app, admin, key) = serve_app().await;
+    let bot = key.auth(&app.db.create_bot("Ops", "#fff", "waddle", "claude", None, false).id);
     assert_eq!(submit(port, "192.0.2.1", &form("ada@example.com").to_string()).await.0, 202);
     let id = signups(port, &admin, "all").await[0]["id"].as_str().unwrap().to_string();
     let (_, member) = user_with(port, &admin, "m@example.com", "member").await;

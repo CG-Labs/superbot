@@ -80,25 +80,29 @@ async fn people_are_recorded_with_how_they_signed_in() {
 
 #[tokio::test]
 async fn bots_act_for_their_owner() {
-    let (port, _, admin, bot_auth) = serve_app().await;
+    let (port, _, admin, key) = serve_app().await;
     let (ada, ada_auth) = user_with(port, &admin, "ada@example.com", "member").await;
     let (_, b) = call(port, "POST", "/api/bots", &ada_auth, r#"{"name":"Scout"}"#).await;
     let bot = parse(&b)["id"].as_str().unwrap().to_string();
+    let bot_auth = key.auth(&bot);
 
-    // botctl: the Bot, by BOT_TOKEN, for Ada.
-    let botctl = format!("User-Agent: botctl\r\nX-SuperBot-Bot: {bot}\r\n");
+    // botctl: the Bot, by its own BOT_TOKEN, for Ada.
+    let botctl = "User-Agent: botctl\r\n";
     let routine = r#"{"name":"Standup","cron":"0 9 * * 1-5","instruction":"post the plan"}"#;
-    assert_eq!(call_with(port, "POST", &format!("/api/bots/{bot}/routines"), &bot_auth, &botctl, routine).await.0, 201);
+    assert_eq!(call_with(port, "POST", &format!("/api/bots/{bot}/routines"), &bot_auth, botctl, routine).await.0, 201);
     let e = &events(port, &admin, "action=routine.created").await[0];
     assert_eq!(
         (e["actorKind"].as_str(), e["actorId"].as_str(), e["actorName"].as_str(), e["authMethod"].as_str(), e["onBehalfOf"].as_str()),
         (Some("bot"), Some(bot.as_str()), Some("Scout"), Some("bot_token"), Some(ada.as_str()))
     );
     assert_eq!((e["actorEmail"].as_str(), e["sessionId"].as_str()), (None, None), "a Bot has no email or session");
-    // A Bot that doesn't name itself acts for no one in particular.
+    // Its refusals are on the record as that Bot's, for Ada.
     assert_eq!(call(port, "GET", "/api/audit", &bot_auth, "").await.0, 403);
     let denied = &events(port, &admin, "action=access.denied&actor=bot").await[0];
-    assert_eq!((denied["actorId"].as_str(), denied["authMethod"].as_str(), denied["onBehalfOf"].as_str()), (None, Some("bot_token"), None));
+    assert_eq!(
+        (denied["actorId"].as_str(), denied["authMethod"].as_str(), denied["onBehalfOf"].as_str()),
+        (Some(bot.as_str()), Some("bot_token"), Some(ada.as_str()))
+    );
 
     // Its approval request is the Bot's, for Ada; her decision is hers, with her session.
     let check = json!({ "from": bot, "harness": "claude", "event": { "tool_name": "Bash", "tool_input": { "command": "git push origin main" }, "cwd": "/tmp" } }).to_string();
@@ -142,7 +146,7 @@ fn fake_claude(app: &App) {
 
 #[tokio::test]
 async fn runs_and_harness_calls_are_attributed_to_who_asked() {
-    let (port, app, admin, bot_auth) = serve_app().await;
+    let (port, app, admin, key) = serve_app().await;
     fake_claude(&app);
     let (ada, ada_auth) = user_with(port, &admin, "ada@example.com", "member").await;
     let ada_session = session_id(port, &ada_auth).await;
@@ -174,7 +178,7 @@ async fn runs_and_harness_calls_are_attributed_to_who_asked() {
 
     // botctl ask: the asked Bot's run is the asking Bot's, for Ada.
     let ask = json!({ "from": scout, "to": "Helper", "text": "status?" }).to_string();
-    let (code, _, reply) = call_with(port, "POST", "/api/ask", &bot_auth, &format!("X-SuperBot-Bot: {scout}\r\n"), &ask).await;
+    let (code, reply) = call(port, "POST", "/api/ask", &key.auth(&scout), &ask).await;
     assert_eq!((code, reply.as_str()), (200, "On it."));
     let asked = &events(port, &admin, "action=bot.asked").await[0];
     assert_eq!((asked["actorId"].as_str(), asked["authMethod"].as_str(), asked["onBehalfOf"].as_str()), (Some(scout.as_str()), Some("bot_token"), Some(ada.as_str())));

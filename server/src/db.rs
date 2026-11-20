@@ -1329,11 +1329,13 @@ impl Db {
 
     #[allow(clippy::too_many_arguments)]
     pub fn add_message_from(&self, bot_id: &str, role: &str, text: &str, question: Option<&Value>, error: bool, status: Option<&str>, from_bot: Option<&str>) -> Message {
-        let question = question.map(|q| redact::value(q.clone()).to_string());
+        let owners: Vec<String> = [Some(bot_id), from_bot].into_iter().flatten().filter_map(|b| self.bot_owner(b)).collect();
+        let owners: Vec<&str> = owners.iter().map(String::as_str).collect();
+        let question = question.map(|q| redact::value_for(&owners, q.clone()).to_string());
         let c = self.c();
         c.execute(
             "INSERT INTO messages (bot_id, role, text, question, error, status, from_bot, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            params![bot_id, role, redact::text(text), question, error, status, from_bot, now()],
+            params![bot_id, role, redact::text_for(&owners, text), question, error, status, from_bot, now()],
         )
         .unwrap();
         let id = c.last_insert_rowid();
@@ -1367,7 +1369,14 @@ impl Db {
     }
 
     pub fn set_question(&self, id: i64, q: &Value) {
-        self.c().execute("UPDATE messages SET question = ? WHERE id = ?", params![redact::value(q.clone()).to_string(), id]).unwrap();
+        let owner = self.message(id).and_then(|m| self.bot_owner(&m.bot_id));
+        let q = redact::value_for(owner.as_deref().as_slice(), q.clone()).to_string();
+        self.c().execute("UPDATE messages SET question = ? WHERE id = ?", params![q, id]).unwrap();
+    }
+
+    /// Who owns a Bot: whose own secrets are redacted from what it writes (ADR 0029).
+    pub fn bot_owner(&self, bot_id: &str) -> Option<String> {
+        self.c().query_row("SELECT owner_id FROM bots WHERE id = ?", [bot_id], |r| r.get(0)).ok()
     }
 
     pub fn pending(&self) -> Vec<Message> {
@@ -1490,7 +1499,10 @@ impl Db {
     pub fn add_approval(&self, bot_id: &str, harness: &str, tool: &str, kind: &str, subject: &str, input: &Value, class: &str, reason: &str, expires_at: i64) -> Approval {
         let id = crate::short_id();
         // Keep the row small: a huge file write is summarized by its subject anyway.
-        let mut input = redact::value(input.clone()).to_string();
+        let owner = self.bot_owner(bot_id);
+        let owners: Vec<&str> = owner.as_deref().into_iter().collect();
+        let owners = owners.as_slice();
+        let mut input = redact::value_for(owners, input.clone()).to_string();
         if input.len() > 20_000 {
             input = serde_json::json!({ "truncated": input.chars().take(20_000).collect::<String>() }).to_string();
         }
@@ -1500,7 +1512,7 @@ impl Db {
             .execute(
                 "INSERT INTO approvals (id, bot_id, harness, tool, kind, subject, input, class, reason, status, created_at, expires_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
-                params![id, bot_id, harness, tool, kind, redact::text(subject), input, class, reason, now(), expires_at],
+                params![id, bot_id, harness, tool, kind, redact::text_for(owners, subject), input, class, reason, now(), expires_at],
             )
             .unwrap();
         self.approval(&id).unwrap()
@@ -2124,9 +2136,12 @@ impl Db {
     /// agent) is masked the same way; everything is clipped.
     pub fn record(&self, e: &audit::Event) {
         let o = |v: &Option<String>, max: usize| v.as_deref().map(|s| audit::clip(s, max));
-        let text = |v: &Option<String>, max: usize| v.as_deref().map(|s| audit::clip(&redact::text(&audit::redact_text(s)), max));
-        let details = redact::value(audit::scrub(e.details.clone())).to_string();
         let a = &e.actor;
+        let bot_actor = matches!(a.kind, audit::ActorKind::Bot).then_some(a.id.as_deref()).flatten();
+        let owners: Vec<String> = [e.bot_id.as_deref(), bot_actor].into_iter().flatten().filter_map(|b| self.bot_owner(b)).collect();
+        let owners: Vec<&str> = owners.iter().map(String::as_str).collect();
+        let text = |v: &Option<String>, max: usize| v.as_deref().map(|s| audit::clip(&redact::text_for(&owners, &audit::redact_text(s)), max));
+        let details = redact::value_for(&owners, audit::scrub(e.details.clone())).to_string();
         let res = self.c().execute(
             "INSERT INTO audit_events (at, actor_kind, actor_id, actor_name, actor_subject, action, target_type, target_id, bot_id, outcome, ip, user_agent, details,
                actor_email, actor_role, auth_method, idp, idp_provider, session_id, on_behalf_of)
