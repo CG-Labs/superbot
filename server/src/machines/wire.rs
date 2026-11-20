@@ -13,7 +13,7 @@
 //! - `GET /v1/heartbeat[?bin=<name>...]` -> `Heartbeat`.
 //! - `POST /v1/jobs` `JobRequest` -> a stream of `JobEvent`s, one JSON object per line.
 //! - `POST /v1/jobs/{id}/abort` `AbortRequest`.
-//! - `PUT /v1/harnesses` `HarnessPlan` (202): the harness CLIs to install (ADR 0038).
+//! - `PUT /v1/harnesses` `HarnessPlan` (202): the harness CLIs to install (ADR 0039).
 //! - `POST /v1/upgrade` `UpgradeRequest` (202): replace the agent with botd's build.
 //!
 //! Protocol 1 (`PROTOCOL`) is the first that runs Bots. A heartbeat without `protocol`
@@ -98,7 +98,7 @@ pub struct Heartbeat {
     /// Jobs running now.
     #[serde(default)]
     pub jobs: u32,
-    /// `CAN_HARNESSES`, `CAN_UPGRADE`: empty before ADR 0038.
+    /// `CAN_HARNESSES`, `CAN_UPGRADE`: empty before ADR 0039.
     #[serde(default)]
     pub can: Vec<String>,
     /// SHA-256 of the agent's own binary, when it knows it.
@@ -115,7 +115,7 @@ pub struct Heartbeat {
     pub upgrade: Option<UpgradeReport>,
 }
 
-/// The harness CLIs a machine should have (ADR 0038): pinned versions, each checked
+/// The harness CLIs a machine should have (ADR 0039): pinned versions, each checked
 /// against a checksum where its source has one. botd builds it from its adapters'
 /// pins; the agent installs it without knowing what a harness is.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -200,7 +200,7 @@ pub const HARNESS_QUEUED: &str = "queued";
 pub const HARNESS_INSTALLING: &str = "installing";
 pub const HARNESS_FAILED: &str = "failed";
 
-/// Replace the agent with botd's build, served at `/v1/agent` (ADR 0038).
+/// Replace the agent with botd's build, served at `/v1/agent` (ADR 0039).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpgradeRequest {

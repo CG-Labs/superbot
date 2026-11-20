@@ -88,7 +88,7 @@ pub struct Enrollment {
     agent: Option<(Bytes, String)>,
     /// botctl, the same way.
     botctl: Option<(Bytes, String)>,
-    /// Harness CLIs and agent upgrades on machines (ADR 0038).
+    /// Harness CLIs and agent upgrades on machines (ADR 0039).
     pub upkeep: Upkeep,
 }
 
@@ -481,7 +481,7 @@ const GUARD_PATH: &str = "/usr/local/lib/superbot/agent-guard";
 /// botd ships it), each checked against the SHA-256 botd pinned, enrolls, and starts
 /// the agent. Its output goes to the cloud-init log, so nothing in it may print the
 /// token. Both live in /usr/local/lib/superbot, which the unit lets the agent write,
-/// so it can upgrade them (ADR 0038); /usr/local/bin links to them.
+/// so it can upgrade them (ADR 0039); /usr/local/bin links to them.
 const FIRSTBOOT: &str = r#"#!/bin/sh
 set -eu
 dir=/usr/local/lib/superbot
@@ -516,7 +516,7 @@ mv "$ctl.new" "$ctl"
 ln -sfn "$ctl" /usr/local/bin/botctl
 "#;
 
-/// Run before every start of the agent (ADR 0038). While an upgraded agent is on
+/// Run before every start of the agent (ADR 0039). While an upgraded agent is on
 /// trial it counts the starts; past three, the new agent can't be working, so the
 /// files before it go back. The old agent then reports the upgrade rolled back. It
 /// never stops the agent from starting.

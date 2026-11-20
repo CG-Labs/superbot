@@ -1,4 +1,4 @@
-//! Harness CLIs on the machine (ADR 0038). botd sends a `HarnessPlan`; this installs
+//! Harness CLIs on the machine (ADR 0039). botd sends a `HarnessPlan`; this installs
 //! it under the tools folder, one harness at a time, and keeps what it did in a state
 //! file, so a restart carries on where it stopped. It knows npm packages and installer
 //! scripts, not harnesses: what to install comes from botd's adapters. Shared by the

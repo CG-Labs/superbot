@@ -343,7 +343,7 @@ fn bot_access(args: &[&str]) -> Result<(&'static str, String, Option<String>), S
 }
 
 /// `botctl machine ...`: which computer each user's Bots run on (ADR 0036), and its
-/// agent's harnesses and upgrades (ADR 0038).
+/// agent's harnesses and upgrades (ADR 0039).
 fn machine_request(args: &[&str]) -> Result<(&'static str, String), String> {
     let at = |user: &str| format!("/api/users/{}/placement", encode(user));
     let machine = |user: &str, rest: &str| format!("/api/users/{}/machine/{rest}", encode(user));

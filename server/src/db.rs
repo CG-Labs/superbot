@@ -382,7 +382,7 @@ pub struct Machine {
     /// When an admin assigned it to its user, so their Bots run on it (ADR 0036).
     pub assigned_at: Option<i64>,
     pub assigned_by: Option<String>,
-    /// What its agent last said of its build, harness CLIs and upgrades (ADR 0038).
+    /// What its agent last said of its build, harness CLIs and upgrades (ADR 0039).
     pub agent_upkeep: Option<Value>,
     /// When botd last sent it the harness plan, and the plan's id.
     pub harnesses_sent_at: Option<i64>,
@@ -906,7 +906,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 15] = [
     migrate_machine_placement,
     migrate_machine_upkeep,
 ];
-/// Harness CLIs and agent upgrades on machines (ADR 0038): what each agent last said,
+/// Harness CLIs and agent upgrades on machines (ADR 0039): what each agent last said,
 /// the plan sent to it, and an upgrade on its way, held, or failed.
 fn migrate_machine_upkeep(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
     let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'agent_upkeep'", [], |r| r.get(0))?;
@@ -2983,7 +2983,7 @@ impl Db {
         };
     }
 
-    /// What the agent said of its build, harnesses and upgrades (ADR 0038), if it was
+    /// What the agent said of its build, harnesses and upgrades (ADR 0039), if it was
     /// still `old`. Returns whether it was, so each change is seen once.
     pub fn machine_upkeep_swap(&self, machine_id: &str, old: Option<&Value>, new: &Value) -> bool {
         self.c()

@@ -1,4 +1,4 @@
-//! Each harness's CLI as a user's machine installs it (ADR 0038): its npm package or
+//! Each harness's CLI as a user's machine installs it (ADR 0039): its npm package or
 //! installer script, pinned to an exact version and, where the source has one, a
 //! checksum. The machine agent installs whatever botd sends and knows none of this.
 //! The Dockerfile and deploy/install.sh install the same CLIs on a server.

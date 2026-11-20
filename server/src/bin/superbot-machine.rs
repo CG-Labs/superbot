@@ -5,7 +5,7 @@
 //!   superbot-machine enroll   enroll now and exit (a token from an admin, by hand)
 //!   superbot-machine status   ask the control plane how it sees this machine
 //!
-//! `run` returns after an upgrade (ADR 0038) so systemd starts the new binary.
+//! `run` returns after an upgrade (ADR 0039) so systemd starts the new binary.
 //!
 //! Settings come from the environment; see `machines/agent.rs`.
 

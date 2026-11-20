@@ -1,4 +1,4 @@
-//! The agent replacing itself with botd's build (ADR 0038). botd asks with an
+//! The agent replacing itself with botd's build (ADR 0039). botd asks with an
 //! `UpgradeRequest`; the agent downloads `/v1/agent` (and `/v1/botctl`) from botd over
 //! the CA-pinned channel, checks each against the SHA-256 botd sent, checks the new
 //! agent runs, then swaps each file in one rename, keeping the old one as `.prev`, and

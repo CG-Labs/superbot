@@ -1,4 +1,4 @@
-//! Harness CLIs and agent upgrades on users' machines (ADR 0038). Needs enrollment
+//! Harness CLIs and agent upgrades on users' machines (ADR 0039). Needs enrollment
 //! (MACHINE_CONTROL_URL); with neither setting below, nothing here does anything.
 //!
 //! - MACHINE_HARNESSES: the harness CLIs every machine gets, e.g. `claude,codex,pi`.
@@ -191,7 +191,7 @@ fn blocker(e: &Enrollment, m: &Machine, hb: &Heartbeat) -> Option<String> {
         return Some("Its agent is botd's build already.".into());
     }
     if !hb.can.iter().any(|c| c == wire::CAN_UPGRADE) {
-        return Some("Its agent can't replace itself: it was installed before agent upgrades (ADR 0038). Reinstall it.".into());
+        return Some("Its agent can't replace itself: it was installed before agent upgrades (ADR 0039). Reinstall it.".into());
     }
     if newer(&hb.version) {
         return Some(format!("Its agent ({}) is newer than botd ({VERSION}), and botd doesn't downgrade agents.", hb.version));
@@ -436,7 +436,7 @@ pub async fn harnesses_now(
     if !hb.can.iter().any(|c| c == wire::CAN_HARNESSES) {
         return Err(ApiError(
             StatusCode::CONFLICT,
-            "Its agent can't install harnesses: it was installed before ADR 0038. Upgrade or reinstall it.".into(),
+            "Its agent can't install harnesses: it was installed before ADR 0039. Upgrade or reinstall it.".into(),
         ));
     }
     send_plan(&app, e, &m, plan, &by).await?;

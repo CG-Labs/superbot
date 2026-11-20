@@ -16,13 +16,13 @@
 //!   certificate live (default /var/lib/superbot-machine).
 //! - `SUPERBOT_HOME`: where Bots work (default `<state dir>/home`).
 //! - `SUPERBOT_AGENT_API`: the relay to botd's API, loopback (default 127.0.0.1:7444).
-//! - `SUPERBOT_TOOLS`: where harness CLIs are installed (ADR 0038; default
+//! - `SUPERBOT_TOOLS`: where harness CLIs are installed (ADR 0039; default
 //!   `<state dir>/tools`).
 //! - `SUPERBOT_HARNESS_PATH`: PATH for harnesses (default `<tools>/bin`, then
 //!   `<home>/.local/bin`, then the system's). A harness counts as installed only if it
 //!   resolves to a file under the tools, the home or `PROGRAM_ROOTS`.
 //! - `SUPERBOT_MAX_JOBS`: jobs at once (default 8).
-//! - `SUPERBOT_AGENT_BIN`: this binary, replaced by upgrades (ADR 0038; default
+//! - `SUPERBOT_AGENT_BIN`: this binary, replaced by upgrades (ADR 0039; default
 //!   `/usr/local/lib/superbot/superbot-machine`).
 
 use super::job;
@@ -56,7 +56,7 @@ pub const PING_EVERY: Duration = Duration::from_secs(15);
 pub const MAX_RELAY_BODY: usize = 32 << 20;
 /// Where the machine image installs botctl.
 pub const BOTCTL: &str = "/usr/local/bin/botctl";
-/// Where cloud-init installs the agent (ADR 0038): a folder the unit lets it write,
+/// Where cloud-init installs the agent (ADR 0039): a folder the unit lets it write,
 /// so it can replace itself. `/usr/local/bin/superbot-machine` links here.
 pub const AGENT_BIN: &str = "/usr/local/lib/superbot/superbot-machine";
 
@@ -77,7 +77,7 @@ pub struct Config {
     /// PATH for harnesses and what they run.
     pub harness_path: String,
     pub max_jobs: usize,
-    /// Where harness CLIs are installed (ADR 0038).
+    /// Where harness CLIs are installed (ADR 0039).
     pub tools: PathBuf,
     /// This agent's own binary, which an upgrade replaces.
     pub exe: PathBuf,
@@ -529,9 +529,9 @@ pub struct Agent {
     current: RwLock<(Arc<Identity>, Arc<ServerConfig>)>,
     /// Running jobs by id; sending true stops one.
     jobs: Mutex<HashMap<String, watch::Sender<bool>>>,
-    /// Harness CLIs botd asked for (ADR 0038).
+    /// Harness CLIs botd asked for (ADR 0039).
     pub tools: Arc<Tools>,
-    /// Replacing this agent with botd's build (ADR 0038).
+    /// Replacing this agent with botd's build (ADR 0039).
     pub upgrader: Upgrader,
     /// True once the agent should exit, for systemd to start it again.
     restart: watch::Sender<bool>,
@@ -881,7 +881,7 @@ async fn abort_job(
     }
 }
 
-/// `PUT /v1/harnesses`: the harness CLIs botd wants here (ADR 0038). They install in
+/// `PUT /v1/harnesses`: the harness CLIs botd wants here (ADR 0039). They install in
 /// the background; heartbeats say how it goes.
 async fn set_harnesses(State(a): State<Arc<Agent>>, Json(plan): Json<wire::HarnessPlan>) -> Response {
     match a.tools.set_plan(plan) {
@@ -919,7 +919,7 @@ async fn fetch(a: &Agent, path: &str) -> Result<Vec<u8>, String> {
 }
 
 /// `POST /v1/upgrade`: replaces this agent with botd's build, then restarts (ADR
-/// 0038). Refused while jobs run; no job starts until it's done.
+/// 0039). Refused while jobs run; no job starts until it's done.
 async fn start_upgrade(State(a): State<Arc<Agent>>, Json(req): Json<wire::UpgradeRequest>) -> Response {
     {
         let jobs = a.jobs();

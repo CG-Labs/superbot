@@ -1,4 +1,4 @@
-//! Harness CLIs and agent upgrades on a user's machine (ADR 0038), end to end on
+//! Harness CLIs and agent upgrades on a user's machine (ADR 0039), end to end on
 //! loopback: botd, its machine port and the real agent over mutual TLS, as in
 //! `machines_mtls_tests`. Downloads come from a local HTTPS server; its Node.js is a
 //! stand-in whose npm installs packages baked in beside it, so nothing here touches the
@@ -200,7 +200,7 @@ async fn a_new_machine_installs_the_planned_harnesses_and_runs_bots_with_them() 
     let mut m = agent_on(&mut env, &mid, &token, "#!/bin/sh\n").await;
     let bot = env.app.db.create_bot_owned("Ada's", "#fff", "waddle", "claude", None, false, &uid, crate::acl::Visibility::Shared);
 
-    // Before the plan: refused, as before ADR 0038.
+    // Before the plan: refused, as before ADR 0039.
     let before = send(&env, &bot.id, "hello").await;
     assert!(reply_after(&env, &bot.id, before).await.contains("isn't installed"));
 

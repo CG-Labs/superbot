@@ -86,9 +86,9 @@ pub enum Refusal {
     Outdated(String),
     /// The Bot's harness isn't installed on it.
     HarnessMissing(String),
-    /// The Bot's harness is still being installed on it (ADR 0038).
+    /// The Bot's harness is still being installed on it (ADR 0039).
     HarnessInstalling(String),
-    /// Its agent is replacing itself (ADR 0038).
+    /// Its agent is replacing itself (ADR 0039).
     Upgrading,
     /// `botctl` isn't installed on it, so approvals can't be asked for there.
     NoBotctl,
