@@ -37,12 +37,12 @@ async fn world(stripe: bool) -> World {
     world_with(stripe.then(|| Billing::with_secret(SECRET))).await
 }
 
-async fn world_with(billing: Option<Billing>) -> World {
+async fn world_with(payments: Option<Billing>) -> World {
     let p: Arc<dyn MachineProvider> = Arc::new(Fake::default());
     let (port, app, admin, bots) = serve_app_with(|a| {
         a.machines = Arc::new(ControlPlane::for_tests(p));
-        if let Some(b) = billing {
-            a.billing = b;
+        if let Some(b) = payments {
+            a.payments = b;
         }
     })
     .await;

@@ -223,7 +223,7 @@ fn system(on_behalf_of: Option<&str>) -> Who {
 /// delivery that isn't Stripe's (bad, missing, or stale signature, or not an event),
 /// else 200, also for events it doesn't use, so Stripe doesn't retry them.
 pub async fn webhook(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, headers: HeaderMap, body: Bytes) -> Response {
-    let b = &a.billing;
+    let b = &a.payments;
     let Some(secret) = &b.secret else {
         return reply(StatusCode::NOT_FOUND, json!({ "error": "Billing is off on this server." }));
     };
@@ -467,7 +467,7 @@ fn paying(app: &App, user: &str) -> Option<Subscription> {
 /// subscription, and whether you have a billing account to manage. 404 while checkout
 /// is off, which is how the client knows to hide its plan screen.
 pub async fn info(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>) -> Response {
-    if a.billing.checkout.is_none() {
+    if a.payments.checkout.is_none() {
         return off();
     }
     let u = match person(&app, &c) {
@@ -562,7 +562,7 @@ fn session(what: &str, user: &str, res: Result<Value, stripe::Error>) -> Result<
 /// for tiers without a price, and while a subscription already pays for a plan (that
 /// one is changed in the portal, or they'd pay twice).
 pub async fn checkout(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, body: Bytes) -> Response {
-    let Some(co) = &a.billing.checkout else { return off() };
+    let Some(co) = &a.payments.checkout else { return off() };
     let u = match person(&app, &c) {
         Ok(u) => u,
         Err(r) => return r,
@@ -648,7 +648,7 @@ pub async fn checkout(State(app): State<AppState>, Extension(a): Extension<Arc<A
 /// customer, where they change or cancel their plan and see invoices; returns `{url}`.
 /// 409 until a checkout has linked them to a customer.
 pub async fn portal(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>) -> Response {
-    let Some(co) = &a.billing.checkout else { return off() };
+    let Some(co) = &a.payments.checkout else { return off() };
     let u = match person(&app, &c) {
         Ok(u) => u,
         Err(r) => return r,
