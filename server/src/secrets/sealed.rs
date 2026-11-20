@@ -12,7 +12,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use zeroize::Zeroizing;
@@ -376,23 +376,30 @@ impl UserSecrets {
         v.map(|v| self.cipher.open_text(&user_context(user_id, name), &v)).transpose()
     }
 
-    /// The user's secret names and when each was last set. Never values.
-    pub fn names(&self, user_id: &str) -> Result<Vec<(String, i64)>, Error> {
+    /// The user's secret names, when each was first saved and when last set. Never values.
+    pub fn names(&self, user_id: &str) -> Result<Vec<(String, i64, i64)>, Error> {
         let c = self.c();
-        let mut s = c.prepare("SELECT name, updated_at FROM user_secrets WHERE user_id = ? ORDER BY name").map_err(store_err)?;
-        s.query_map([user_id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(store_err)?.collect::<rusqlite::Result<_>>().map_err(store_err)
+        let mut s = c.prepare("SELECT name, created_at, updated_at FROM user_secrets WHERE user_id = ? ORDER BY name").map_err(store_err)?;
+        s.query_map([user_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(store_err)?.collect::<rusqlite::Result<_>>().map_err(store_err)
     }
 
-    pub fn put(&self, user_id: &str, name: &str, value: &str) -> Result<(), Error> {
+    /// True if it replaced a value the user already had. Checked and written in one
+    /// transaction, so two first saves can't both say they were first. It takes the write
+    /// lock before the read (`IMMEDIATE`): a deferred one that reads first fails with
+    /// `SQLITE_BUSY_SNAPSHOT`, with no wait, if another connection writes in between.
+    pub fn put(&self, user_id: &str, name: &str, value: &str) -> Result<bool, Error> {
         let sealed = self.cipher.seal(&user_context(user_id, name), value.as_bytes());
-        self.c()
-            .execute(
-                "INSERT INTO user_secrets (user_id, name, value, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)
-                 ON CONFLICT(user_id, name) DO UPDATE SET value = ?3, updated_at = ?4",
-                params![user_id, name, sealed, crate::db::now()],
-            )
-            .map_err(store_err)?;
-        Ok(())
+        let mut c = self.c();
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate).map_err(store_err)?;
+        let existed = tx.query_row("SELECT 1 FROM user_secrets WHERE user_id = ? AND name = ?", [user_id, name], |_| Ok(())).optional().map_err(store_err)?.is_some();
+        tx.execute(
+            "INSERT INTO user_secrets (user_id, name, value, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(user_id, name) DO UPDATE SET value = ?3, updated_at = ?4",
+            params![user_id, name, sealed, crate::db::now()],
+        )
+        .map_err(store_err)?;
+        tx.commit().map_err(store_err)?;
+        Ok(existed)
     }
 
     /// True if the user had it.
@@ -482,7 +489,15 @@ mod tests {
         assert_eq!(s.get("ua", "ANTHROPIC_API_KEY").unwrap().unwrap().expose(), a);
         assert_eq!(s.get("ub", "ANTHROPIC_API_KEY").unwrap().unwrap().expose(), "b-key");
         assert!(s.get("ua", "OPENAI_API_KEY").unwrap().is_none(), "B's key isn't A's");
-        assert_eq!(s.names("ua").unwrap().into_iter().map(|(n, _)| n).collect::<Vec<_>>(), ["ANTHROPIC_API_KEY"]);
+        assert_eq!(s.names("ua").unwrap().into_iter().map(|(n, ..)| n).collect::<Vec<_>>(), ["ANTHROPIC_API_KEY"]);
+        // Replacing a value keeps when it was first saved.
+        s.c().execute("UPDATE user_secrets SET created_at = 1, updated_at = 1 WHERE user_id = 'ub' AND name = 'OPENAI_API_KEY'", []).unwrap();
+        assert!(s.put("ub", "OPENAI_API_KEY", "b-openai-2").unwrap(), "says it replaced one");
+        assert!(!s.put("ua", "OPENAI_API_KEY", "a-openai").unwrap(), "B's isn't A's to replace");
+        assert!(s.delete("ua", "OPENAI_API_KEY").unwrap());
+        let (_, created, updated) = s.names("ub").unwrap().into_iter().find(|(n, ..)| n == "OPENAI_API_KEY").unwrap();
+        assert!(created == 1 && updated > 1, "{created} {updated}");
+        assert_eq!(s.get("ub", "OPENAI_API_KEY").unwrap().unwrap().expose(), "b-openai-2");
         assert!(!s.delete("ua", "OPENAI_API_KEY").unwrap(), "A can't delete B's");
         assert!(s.get("ub", "OPENAI_API_KEY").unwrap().is_some());
         // A ciphertext moved to another user's row doesn't open there.
@@ -579,6 +594,24 @@ mod tests {
         SealedStore::new(connect_again(&c), Arc::new(cipher)).put("X_TOKEN", "v").unwrap();
         c.execute("DELETE FROM settings WHERE key = ?", [KEY_CHECK]).unwrap();
         assert_eq!(bootstrap(&c, Some(MasterKey::generate()), no_key, false).err().unwrap(), WRONG_KEY);
+    }
+
+    #[test]
+    fn a_save_waits_for_another_connections_write() {
+        let (_path, _db, c) = fresh();
+        let (cipher, _) = bootstrap(&c, None, || Ok(MasterKey::generate()), false).unwrap();
+        let other = connect_again(&c);
+        let s = UserSecrets::new(c, Arc::new(cipher));
+        s.put("ua", "A_TOKEN", "first").unwrap();
+        // Another connection holds the write lock and commits a change while the save waits.
+        other.execute_batch("BEGIN IMMEDIATE; INSERT INTO secrets (name, value, created_at, updated_at) VALUES ('OTHER_TOKEN', 'x', 1, 1);").unwrap();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            other.execute_batch("COMMIT").unwrap();
+        });
+        assert!(s.put("ua", "A_TOKEN", "second").unwrap(), "saved after the other write, not refused as a stale read");
+        writer.join().unwrap();
+        assert_eq!(s.get("ua", "A_TOKEN").unwrap().unwrap().expose(), "second");
     }
 
     fn connect_again(c: &Connection) -> Connection {

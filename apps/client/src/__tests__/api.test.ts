@@ -121,3 +121,34 @@ describe("audit log (ADR 0009, 0019)", () => {
     await expect(api.auditCsv("")).rejects.toMatchObject({ message: "Admins only", status: 403 });
   });
 });
+
+describe("personal secrets (ADR 0029, 0044)", () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  it("lists names, sends a value only to save it, and deletes by name", async () => {
+    const fetchMock = jest.fn(async (_url: string, init: RequestInit = {}) => ({
+      ok: true,
+      status: 200,
+      json: async () =>
+        init.method === "GET"
+          ? { secrets: [{ name: "OPENAI_API_KEY", createdAt: 1, updatedAt: 2, overrides: false }] }
+          : init.method === "PUT"
+            ? { secret: { name: "OPENAI_API_KEY", createdAt: 1, updatedAt: 3, overrides: false } }
+            : { ok: true },
+    }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const api = new SuperBotApi({ baseUrl: BASE, token: "sbs_" + "a".repeat(64) });
+    expect(await api.mySecrets()).toEqual([{ name: "OPENAI_API_KEY", createdAt: 1, updatedAt: 2, overrides: false }]);
+    expect(fetchMock).toHaveBeenLastCalledWith(`${BASE}/api/me/secrets`, expect.objectContaining({ method: "GET", body: undefined }));
+    expect((await api.setMySecret("OPENAI_API_KEY", "sk-test")).updatedAt).toBe(3);
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      `${BASE}/api/me/secrets/OPENAI_API_KEY`,
+      expect.objectContaining({ method: "PUT", body: JSON.stringify({ value: "sk-test" }) }),
+    );
+    await api.deleteMySecret("A/../B");
+    expect(fetchMock).toHaveBeenLastCalledWith(`${BASE}/api/me/secrets/A%2F..%2FB`, expect.objectContaining({ method: "DELETE" }));
+  });
+});

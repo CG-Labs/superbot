@@ -2232,8 +2232,8 @@ async fn list_my_secrets(Extension(c): Extension<Caller>) -> Res {
 async fn put_my_secret(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(name): Path<String>, Json(v): Json<Value>) -> Res {
     let me = secrets_owner(&c)?;
     let value = v["value"].as_str().ok_or_else(|| bad("Send {\"value\": \"...\"}."))?;
-    let listed = secrets::global().user_put(&me, &name, value).map_err(secret_error)?;
-    app.db.record(&by.event("secret.set").target("secret", &name).details(json!({ "scope": "user", "userId": me })));
+    let (listed, replaced) = secrets::global().user_save(&me, &name, value).map_err(secret_error)?;
+    app.db.record(&by.event("secret.set").target("secret", &name).details(json!({ "scope": "user", "userId": me, "replaced": replaced })));
     Ok(Json(json!({ "secret": listed })))
 }
 

@@ -87,3 +87,17 @@ describe("Sidebar plan entry (ADR 0042)", () => {
     expect(screen.queryByText("Plan")).toBeNull();
   });
 });
+
+describe("Sidebar secrets entry (ADR 0044)", () => {
+  it.each([
+    ["an admin", { name: "Owner", role: "admin", permissions: ALL }],
+    ["a member", { name: "Alex", role: "member", permissions: ["account", "read", "write"] }],
+    ["a read-only person", { name: "Rae", role: "readonly", permissions: ["account", "read", "review"] }],
+  ] as [string, Me][])("opens their own secrets for %s", async (_, me) => {
+    const onOpenSecrets = jest.fn();
+    const user = userEvent.setup();
+    await render(<Sidebar {...setup(me)} onOpenSecrets={onOpenSecrets} />);
+    await user.press(screen.getByText("Your secrets"));
+    expect(onOpenSecrets).toHaveBeenCalledTimes(1);
+  });
+});
