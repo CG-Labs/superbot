@@ -23,6 +23,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const RECORD: &str = "teammates.json";
+/// Removals done, by cleanup id (the last `KEEP_REMOVED`), in the state folder too.
+const REMOVED: &str = "teammates-removed.json";
+const KEEP_REMOVED: usize = 1000;
 /// In the teammates' folder: work removals took aside, one folder per removal. Root's,
 /// `0700`; never a teammate's user name.
 const LEFT: &str = ".left";
@@ -247,6 +250,65 @@ struct Saved {
     gid: u32,
 }
 
+/// A removal done, kept by its cleanup id so asking again repeats its answer.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Removed {
+    user_id: String,
+    user: String,
+    files: String,
+    archived_to: Option<PathBuf>,
+    at: i64,
+}
+
+impl Removed {
+    fn of(user_id: &str, r: &Removal) -> Removed {
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64);
+        Removed {
+            user_id: user_id.to_string(),
+            user: r.user.clone(),
+            files: r.files.to_string(),
+            archived_to: r.archived_to.clone(),
+            at,
+        }
+    }
+
+    fn replay(&self) -> Removal {
+        Removal {
+            user: self.user.clone(),
+            already_gone: true,
+            files: match self.files.as_str() {
+                "archived" => "archived",
+                "held" => "held",
+                "deleted" => "deleted",
+                _ => "none",
+            },
+            archived_to: self.archived_to.clone(),
+            ..Removal::default()
+        }
+    }
+}
+
+/// Writes `body` to `path` (0600) whole or not at all.
+fn write_private(path: &Path, body: &[u8]) -> Result<(), String> {
+    let tmp = path.with_extension("tmp");
+    let write = || -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = std::fs::remove_file(&tmp);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(body)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+    write().map_err(|e| format!("{}: {e}", path.display()))
+}
+
 pub struct Teammates {
     /// Holds one home per teammate. Root's, `0711`: each can pass to their own.
     root: PathBuf,
@@ -328,23 +390,8 @@ impl Teammates {
     }
 
     fn save(&self, r: &BTreeMap<String, Saved>) -> Result<(), String> {
-        let path = self.state_dir.join(RECORD);
-        let tmp = path.with_extension("tmp");
         let body = serde_json::to_vec(r).map_err(|e| e.to_string())?;
-        let write = || -> std::io::Result<()> {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let _ = std::fs::remove_file(&tmp);
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            f.write_all(&body)?;
-            f.sync_all()?;
-            std::fs::rename(&tmp, &path)
-        };
-        write().map_err(|e| format!("{}: {e}", path.display()))
+        write_private(&self.state_dir.join(RECORD), &body)
     }
 
     /// Where `user_id`'s home is, whether or not it's made yet.
@@ -359,16 +406,25 @@ impl Teammates {
         user_id: &str,
         check: impl Fn(Ids) -> Result<(), String>,
     ) -> Result<Teammate, String> {
+        let _one = self.making.lock().unwrap_or_else(|e| e.into_inner());
+        // Checked under the lock, so a request that waited out a removal can't undo it.
         if self.leaving().contains(user_id) {
             return Err("that teammate's user is being removed".into());
         }
-        let _one = self.making.lock().unwrap_or_else(|e| e.into_inner());
         let name = self
             .stand_in
             .clone()
             .unwrap_or_else(|| wire::teammate_user(user_id));
         let home = self.home_of(user_id);
         let mut record = self.record()?;
+        // A removal that deleted the user and home but stopped before dropping the
+        // record leaves nothing of theirs: start again rather than refuse for good.
+        if record.get(user_id).is_some_and(|s| self.accounts.lookup(&s.user).is_none())
+            && std::fs::symlink_metadata(&home).is_err()
+        {
+            record.remove(user_id);
+            self.save(&record)?;
+        }
         let (ids, created) = match record.get(user_id) {
             Some(s) => {
                 let want = Ids {
@@ -478,6 +534,12 @@ impl Teammates {
         check: impl Fn(Ids) -> Result<(), String>,
     ) -> Result<Removal, String> {
         let _one = self.making.lock().unwrap_or_else(|e| e.into_inner());
+        // Done before, with its answer lost: say so again. A user made for them since
+        // is a new one, and isn't this removal's to delete.
+        let mut done = self.removed()?;
+        if let Some(d) = done.get(cleanup_id).filter(|d| d.user_id == user_id) {
+            return Ok(d.replay());
+        }
         let mut record = self.record()?;
         let home = self.home_of(user_id);
         let held = self.held(cleanup_id);
@@ -569,7 +631,27 @@ impl Teammates {
         if record.remove(user_id).is_some() {
             self.save(&record)?;
         }
+        done.insert(cleanup_id.to_string(), Removed::of(user_id, &out));
+        while done.len() > KEEP_REMOVED {
+            let oldest = done.iter().min_by_key(|(_, d)| d.at).map(|(k, _)| k.clone());
+            oldest.map(|k| done.remove(&k));
+        }
+        self.save_removed(&done)?;
         Ok(out)
+    }
+
+    fn removed(&self) -> Result<BTreeMap<String, Removed>, String> {
+        let path = self.state_dir.join(REMOVED);
+        match std::fs::read(&path) {
+            Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("{}: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        }
+    }
+
+    fn save_removed(&self, r: &BTreeMap<String, Removed>) -> Result<(), String> {
+        let body = serde_json::to_vec(r).map_err(|e| e.to_string())?;
+        write_private(&self.state_dir.join(REMOVED), &body)
     }
 
     /// Deletes the work removal `cleanup_id` held aside. Whether there was any.
@@ -760,14 +842,20 @@ mod tests {
         assert_eq!(*fake.removed.lock().unwrap(), std::slice::from_ref(&bea.user));
         assert!(fake.lookup(&cy.user).is_some());
 
-        // Again: nothing left, nothing done.
+        // Again, as when its answer was lost: the same answer, nothing done.
         let again = t.remove("ubea", "c1", &archive, |_| Ok(())).unwrap();
-        assert!(again.already_gone && again.files == "none", "{again:?}");
+        assert!(again.already_gone && again.files == "archived", "{again:?}");
+        assert_eq!(again.archived_to.as_deref(), Some(to.as_path()));
         assert_eq!(fake.removed.lock().unwrap().len(), 1);
         assert_eq!(*fake.stopped.lock().unwrap(), 1);
 
-        // Back again later: a fresh user and home.
-        assert!(t.ensure("ubea", |_| Ok(())).unwrap().created);
+        // Back again later: a fresh user and home, which that old removal never touches.
+        let back = t.ensure("ubea", |_| Ok(())).unwrap();
+        assert!(back.created);
+        std::fs::write(back.workspace().join("new.md"), "bea's new").unwrap();
+        assert!(t.remove("ubea", "c1", &archive, |_| Ok(())).unwrap().already_gone);
+        assert_eq!(std::fs::read_to_string(back.workspace().join("new.md")).unwrap(), "bea's new");
+        assert!(t.known().contains(&"ubea".to_string()) && fake.lookup(&back.user).is_some());
 
         // Held, then purged.
         let r = t.remove("ucy", "c2", &Files::Hold, |_| Ok(())).unwrap();
@@ -788,6 +876,13 @@ mod tests {
         let r = t.remove("ueve", "c3", &Files::Delete, |_| Ok(())).unwrap();
         assert_eq!((r.files, r.user_removed), ("deleted", true));
         assert!(!t.held("c3").exists() && !eve.home.exists());
+
+        // One that stopped after deleting the user and home, before dropping the record:
+        // a later run starts afresh instead of finding the user gone for good.
+        let gus = t.ensure("ugus", |_| Ok(())).unwrap();
+        fake.users.lock().unwrap().remove(&gus.user);
+        std::fs::remove_dir_all(&gus.home).unwrap();
+        assert!(t.ensure("ugus", |_| Ok(())).unwrap().created);
 
         // Refused ids, or a user that isn't the recorded one: nothing is touched.
         let fay = t.ensure("ufay", |_| Ok(())).unwrap();
