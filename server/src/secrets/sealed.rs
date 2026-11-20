@@ -376,11 +376,11 @@ impl UserSecrets {
         v.map(|v| self.cipher.open_text(&user_context(user_id, name), &v)).transpose()
     }
 
-    /// The user's secret names and when each was last set. Never values.
-    pub fn names(&self, user_id: &str) -> Result<Vec<(String, i64)>, Error> {
+    /// The user's secret names, when each was first saved and when last set. Never values.
+    pub fn names(&self, user_id: &str) -> Result<Vec<(String, i64, i64)>, Error> {
         let c = self.c();
-        let mut s = c.prepare("SELECT name, updated_at FROM user_secrets WHERE user_id = ? ORDER BY name").map_err(store_err)?;
-        s.query_map([user_id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(store_err)?.collect::<rusqlite::Result<_>>().map_err(store_err)
+        let mut s = c.prepare("SELECT name, created_at, updated_at FROM user_secrets WHERE user_id = ? ORDER BY name").map_err(store_err)?;
+        s.query_map([user_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(store_err)?.collect::<rusqlite::Result<_>>().map_err(store_err)
     }
 
     pub fn put(&self, user_id: &str, name: &str, value: &str) -> Result<(), Error> {
@@ -482,7 +482,13 @@ mod tests {
         assert_eq!(s.get("ua", "ANTHROPIC_API_KEY").unwrap().unwrap().expose(), a);
         assert_eq!(s.get("ub", "ANTHROPIC_API_KEY").unwrap().unwrap().expose(), "b-key");
         assert!(s.get("ua", "OPENAI_API_KEY").unwrap().is_none(), "B's key isn't A's");
-        assert_eq!(s.names("ua").unwrap().into_iter().map(|(n, _)| n).collect::<Vec<_>>(), ["ANTHROPIC_API_KEY"]);
+        assert_eq!(s.names("ua").unwrap().into_iter().map(|(n, ..)| n).collect::<Vec<_>>(), ["ANTHROPIC_API_KEY"]);
+        // Replacing a value keeps when it was first saved.
+        s.c().execute("UPDATE user_secrets SET created_at = 1, updated_at = 1 WHERE user_id = 'ub' AND name = 'OPENAI_API_KEY'", []).unwrap();
+        s.put("ub", "OPENAI_API_KEY", "b-openai-2").unwrap();
+        let (_, created, updated) = s.names("ub").unwrap().into_iter().find(|(n, ..)| n == "OPENAI_API_KEY").unwrap();
+        assert!(created == 1 && updated > 1, "{created} {updated}");
+        assert_eq!(s.get("ub", "OPENAI_API_KEY").unwrap().unwrap().expose(), "b-openai-2");
         assert!(!s.delete("ua", "OPENAI_API_KEY").unwrap(), "A can't delete B's");
         assert!(s.get("ub", "OPENAI_API_KEY").unwrap().is_some());
         // A ciphertext moved to another user's row doesn't open there.
