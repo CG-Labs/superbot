@@ -83,6 +83,15 @@ fn default_kid() -> String {
     format!("cg-{}", chrono::Utc::now().format("%Y"))
 }
 
+/// Dated for people, with a random tail so licenses signed together still differ.
+fn default_id() -> Res<String> {
+    use aws_lc_rs::rand::SecureRandom;
+    let mut tail = [0u8; 4];
+    aws_lc_rs::rand::SystemRandom::new().fill(&mut tail).map_err(|_| "no randomness for the license id")?;
+    let tail: String = tail.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(format!("lic-{}-{tail}", chrono::Utc::now().format("%Y%m%d")))
+}
+
 fn trusted_line(kid: &str, key: &aws_lc_rs::signature::Ed25519KeyPair) -> String {
     format!("(\"{kid}\", \"{}\"),", token::public_b64(key))
 }
@@ -128,7 +137,10 @@ fn sign(mut a: Args) -> Res<String> {
         iss: token::ISSUER.into(),
         aud: token::AUDIENCE.into(),
         sub: licensee,
-        jti: a.take("--id")?.unwrap_or_else(|| format!("lic-{}", chrono::Utc::now().format("%Y%m%d%H%M%S"))),
+        jti: match a.take("--id")? {
+            Some(id) => id,
+            None => default_id()?,
+        },
         iat: at,
         nbf: a.take("--starts")?.map(|d| day(&d)).transpose()?,
         exp,
@@ -250,6 +262,10 @@ mod tests {
         let dated = sign(args(&["--key", k, "--kid", "cg-test", "--licensee", "Acme", "--expires", "2999-12-31"])).unwrap();
         let c: Claims = serde_json::from_str(&verify(args(&["--key", k, &dated])).unwrap()).unwrap();
         assert_eq!((c.exp, c.seats), (day("3000-01-01").unwrap(), None));
+        // Signed in the same second, still two licenses.
+        let again = sign(args(&["--key", k, "--kid", "cg-test", "--licensee", "Acme", "--expires", "2999-12-31"])).unwrap();
+        let c2: Claims = serde_json::from_str(&verify(args(&["--key", k, &again])).unwrap()).unwrap();
+        assert!(c.jti.starts_with("lic-") && c.jti != c2.jti, "{} {}", c.jti, c2.jti);
 
         for bad in [
             vec!["--key", k, "--kid", "cg-test", "--licensee", "Acme"],

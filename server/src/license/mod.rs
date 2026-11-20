@@ -337,7 +337,25 @@ impl Licensing {
         self.status_at(db::now())
     }
 
+    /// A key loaded before its start date becomes the license once that date passes.
+    fn start_if_due(&self, now_ms: i64) {
+        let waiting = {
+            let l = self.loaded.read().unwrap_or_else(|e| e.into_inner());
+            match (&l.license, &l.token) {
+                (Some(Err(p)), Some(t)) if p.code == Invalid::NotYetValid.code() => t.clone(),
+                _ => return,
+            }
+        };
+        if let Ok(c) = self.check(&waiting, now_ms) {
+            let mut l = self.loaded.write().unwrap_or_else(|e| e.into_inner());
+            if l.token.as_deref() == Some(waiting.as_str()) {
+                l.license = Some(Ok(c));
+            }
+        }
+    }
+
     pub fn status_at(&self, now_ms: i64) -> Status {
+        self.start_if_due(now_ms);
         let l = self.loaded.read().unwrap_or_else(|e| e.into_inner());
         let (mode, claims, problem) = match &l.license {
             None => (Mode::Community, None, None),
@@ -710,6 +728,20 @@ mod tests {
         assert_eq!(l.seat_cap(), None);
         l.load(env(&[("LICENSE_KEY", &mint(&claims(Some(3), 20)))]));
         assert_eq!(l.seat_cap(), Some(COMMUNITY_SEATS));
+    }
+
+    #[test]
+    fn a_key_loaded_before_it_starts_takes_over_when_it_starts() {
+        let l = lic("lic-later");
+        let mut c = claims(Some(50), 20);
+        let starts = crate::db::now() / 1000 + 7 * 86_400;
+        c.nbf = Some(starts);
+        l.load(env(&[("LICENSE_KEY", &mint(&c))]));
+        let s = l.status();
+        assert_eq!((s.mode, s.problem.as_ref().map(|p| p.code), s.seat_cap()), (Mode::Invalid, Some("not_yet_valid"), Some(COMMUNITY_SEATS)));
+        let s = l.status_at(starts * 1000);
+        assert_eq!((s.mode, s.seat_cap(), s.source), (Mode::Active, Some(50), Source::Env));
+        assert_eq!(l.status().mode, Mode::Active, "kept, not checked again");
     }
 
     #[test]

@@ -26,7 +26,7 @@ A license is a compact JWT signed with Ed25519 (`alg: EdDSA`, a `kid` naming the
 | `edition` | A name, e.g. `business`. |
 | `features` | Names paid modules may check with `Status::allows`. Nothing in this repository is gated: every feature in the open source code works for everyone. |
 
-Unknown claims are ignored, so older servers read newer licenses. botd checks only `EdDSA`, only `kid`s it knows, rejects `crit`, bounds the token at 8 KiB, and parses the payload only after the signature verifies. A license that hasn't started (`nbf`, 5 minutes' clock skew allowed) is invalid. Expiry is not a verification failure: an ended license is still a license, and the mode below decides what it means.
+Unknown claims are ignored, so older servers read newer licenses. botd checks only `EdDSA`, only `kid`s it knows, rejects `crit`, bounds the token at 8 KiB, and parses the payload only after the signature verifies. A license that hasn't started (`nbf`, 5 minutes' clock skew allowed) is invalid until it starts; a key set in the environment early takes over on its start date without a restart. Expiry is not a verification failure: an ended license is still a license, and the mode below decides what it means.
 
 The public keys are built into botd (`TRUSTED` in `server/src/license/mod.rs`), so licenses work offline and nobody can add a key by editing the server. Test builds also trust a fixed test key; release builds don't. The private keys never enter this repository.
 
