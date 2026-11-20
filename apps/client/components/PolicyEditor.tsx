@@ -133,7 +133,8 @@ export function PolicyEditor({ api, bot, canEdit, onBack, confirm = confirmAsync
     patch(`class:${cls}`, a === "inherit" ? `${label}: following the default.` : `${label}: ${ACTION_LABELS[a]}.`, { classes: { [cls]: a === "inherit" ? null : a } });
 
   const parsedTimeout = parseTimeout(timeout);
-  const timeoutChanged = "minutes" in parsedTimeout && parsedTimeout.minutes !== view.policy.timeoutMinutes;
+  // A Bot following the default may still save the same number, to keep it when the default changes.
+  const timeoutChanged = "minutes" in parsedTimeout && (parsedTimeout.minutes !== view.policy.timeoutMinutes || (!!bot && o?.timeoutMinutes === undefined));
 
   const saveTimeout = () => {
     if (!("minutes" in parsedTimeout)) return;

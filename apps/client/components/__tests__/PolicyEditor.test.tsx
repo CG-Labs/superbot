@@ -135,6 +135,18 @@ describe("PolicyEditor (ADR 0049)", () => {
     expect(await screen.findByText(/denied after 10 minutes \(the default\)/)).toBeOnTheScreen();
   });
 
+  it("lets a Bot keep the default timeout as its own", async () => {
+    const api = fakeApi();
+    const user = userEvent.setup();
+    await render(<PolicyEditor api={api} bot={{ id: "b1", name: "Scout" }} canEdit onBack={jest.fn()} confirm={yes} />);
+    const save = await screen.findByRole("button", { name: "Save time to answer" });
+    expect(save).toBeEnabled();
+    await user.press(save);
+    expect(api.patchBotPolicy).toHaveBeenLastCalledWith("b1", { timeoutMinutes: 10 });
+    expect(await screen.findByRole("button", { name: "Use default (10 minutes)" })).toBeOnTheScreen();
+    expect(screen.getByRole("button", { name: "Save time to answer" })).toBeDisabled();
+  });
+
   it("adds a rule for the Bot and deletes one after asking", async () => {
     const api = fakeApi();
     const user = userEvent.setup();
