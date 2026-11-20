@@ -108,6 +108,7 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine upgrade <user>                    Upgrade its agent to botd's build now
   botctl machine upgrade <user> hold|release       Keep its agent at its build, or let it be upgraded again
   botctl machine harnesses <user>                  Install MACHINE_HARNESSES on it now, retrying failures
+  botctl machine bot-user <user>                   Run its Bots as their own OS user now (MACHINE_BOT_USER), retrying a failure
   botctl machine harness-login <user|me> <claude|codex>  Log the harness in on the machine; the login stays there
   botctl machine harness-logins <user|me>          Which harnesses are logged in on it
   botctl machine harness-logout <user|me> <harness>  Remove that login from it
@@ -478,10 +479,11 @@ fn machine_request(args: &[&str]) -> Result<(&'static str, String), String> {
         ["upgrade", user, "hold"] => ("PUT", machine(user, "agent/hold")),
         ["upgrade", user, "release"] => ("DELETE", machine(user, "agent/hold")),
         ["harnesses", user] => ("POST", machine(user, "harnesses")),
+        ["bot-user", user] => ("POST", machine(user, "bot-user")),
         ["folder", user] => ("GET", machine(user, "folder-sync")),
         ["sync", user] => ("POST", machine(user, "folder-sync")),
         _ => {
-            return Err("Usage: botctl machine placement [<user>] | assign <user> | unassign <user> | agent <user> | upgrade <user> [hold|release] | harnesses <user> | harness-login <user|me> <claude|codex> | harness-logins <user|me> | harness-logout <user|me> <harness> | folder <user> | sync <user>".into());
+            return Err("Usage: botctl machine placement [<user>] | assign <user> | unassign <user> | agent <user> | upgrade <user> [hold|release] | harnesses <user> | bot-user <user> | harness-login <user|me> <claude|codex> | harness-logins <user|me> | harness-logout <user|me> <harness> | folder <user> | sync <user>".into());
         }
     })
 }
@@ -883,6 +885,7 @@ mod tests {
         assert_eq!(machine_request(&["upgrade", "u1", "hold"]).unwrap(), ("PUT", "/api/users/u1/machine/agent/hold".into()));
         assert_eq!(machine_request(&["upgrade", "u1", "release"]).unwrap(), ("DELETE", "/api/users/u1/machine/agent/hold".into()));
         assert_eq!(machine_request(&["harnesses", "u1"]).unwrap(), ("POST", "/api/users/u1/machine/harnesses".into()));
+        assert_eq!(machine_request(&["bot-user", "u1"]).unwrap(), ("POST", "/api/users/u1/machine/bot-user".into()));
         assert!(machine_request(&["upgrade", "u1", "now"]).is_err());
         assert_eq!(machine_request(&["folder", "u1"]).unwrap(), ("GET", "/api/users/u1/machine/folder-sync".into()));
         assert_eq!(machine_request(&["sync", "u1"]).unwrap(), ("POST", "/api/users/u1/machine/folder-sync".into()));

@@ -17,6 +17,8 @@ mod job;
 mod landing;
 #[path = "../machines/pki.rs"]
 mod pki;
+#[path = "../machines/runas.rs"]
+mod runas;
 #[path = "../machines/terminal.rs"]
 mod terminal;
 #[path = "../machines/tools.rs"]

@@ -6,6 +6,7 @@
 // Shared by two binaries, each of which uses only part of it.
 #![allow(dead_code)]
 
+use super::runas::{self, Ids};
 use super::wire::{JobCleanup, JobEvent, JobFile, JobRequest};
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -28,6 +29,8 @@ pub struct Host {
     pub remove: Vec<String>,
     /// Set before the job's own `env`.
     pub env: BTreeMap<String, String>,
+    /// Run as this user, and touch the job's files as it (ADR 0043).
+    pub user: Option<Ids>,
 }
 
 impl Host {
@@ -40,7 +43,15 @@ impl Host {
             cmd.env_remove(k);
         }
         cmd.envs(&self.env).envs(env);
+        if let Some(ids) = self.user {
+            cmd.uid(ids.uid).gid(ids.gid);
+        }
         cmd
+    }
+
+    /// Runs `f` with the job's file access.
+    fn files<T>(&self, f: impl FnOnce() -> T) -> Result<T, String> {
+        runas::as_user(self.user, f).map_err(|e| format!("Couldn't act as the Bots' user: {e}"))
     }
 }
 
@@ -97,7 +108,7 @@ fn write_files(files: &[JobFile], collect: &[String]) -> Result<(), String> {
 /// Runs a cleanup command if its `when_exists` file is there. The error says why it
 /// failed, in a few words.
 pub async fn cleanup(host: &Host, c: &JobCleanup) -> Result<(), String> {
-    if !Path::new(&c.when_exists).exists() {
+    if !host.files(|| Path::new(&c.when_exists).exists())? {
         return Ok(());
     }
     let label = format!("`{} {}`", c.bin, c.args.join(" "));
@@ -161,7 +172,7 @@ pub async fn run(
         let _ = tx.send(JobEvent::Cleanup { why }).await;
         return;
     }
-    match write_files(&job.files, &job.collect) {
+    match host.files(|| write_files(&job.files, &job.collect)).and_then(|r| r) {
         Ok(()) => run_child(host, job, abort, tx).await,
         Err(message) => {
             let _ = tx.send(JobEvent::Error { message }).await;
@@ -266,7 +277,7 @@ async fn run_child(
         }
     };
     group.0 = None;
-    let (files, too_big) = collect(&job.collect);
+    let (files, too_big) = host.files(|| collect(&job.collect)).unwrap_or_default();
     let _ = tx
         .send(JobEvent::Exit {
             success: status.as_ref().is_ok_and(|s| s.success()),
@@ -435,6 +446,7 @@ mod tests {
             clear_env: true,
             remove: Vec::new(),
             env: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
+            user: None,
         };
         let ev = events(&host, &job("echo \"[$HOME]\"", &dir), false).await;
         assert!(ev.contains(&JobEvent::Line { line: "[]".into() }), "{ev:?}");

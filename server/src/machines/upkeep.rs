@@ -129,7 +129,10 @@ fn upkeep_json(hb: &Heartbeat) -> Value {
         .iter()
         .map(|(h, l)| (h, if l.state == wire::LOGGED_IN { wire::LOGGED_IN } else { wire::LOGGED_OUT }))
         .collect();
-    json!({ "can": hb.can, "build": hb.build, "plan": hb.plan, "harnesses": hb.harnesses, "upgrade": hb.upgrade, "logins": logins })
+    json!({
+        "can": hb.can, "build": hb.build, "plan": hb.plan, "harnesses": hb.harnesses, "upgrade": hb.upgrade, "logins": logins,
+        "botUser": super::botuser::upkeep_json(hb),
+    })
 }
 
 /// Records what a heartbeat says of harnesses and upgrades, and what changed, in the
@@ -172,6 +175,7 @@ pub fn observe(app: &App, machine_id: &str, hb: &Heartbeat) {
                 app.db.record(&event(&by, "machine.harness_login_changed", &m, json!({ "harness": name, "from": was, "to": now })));
             }
         }
+        super::botuser::observed(app, &m, &by, m.agent_upkeep.as_ref().map(|v| &v["botUser"]), &new["botUser"]);
     }
     let (Some(id), Some(report)) = (&m.upgrade_id, hb.upgrade.as_ref()) else { return };
     if report.id != *id {

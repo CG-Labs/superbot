@@ -4,7 +4,7 @@
 
 Accepted (20 Nov 2026). A follow-up on [#30](https://github.com/CG-Labs/superbot/issues/30) (M3, per-user isolation): the "client UI for `/api/me/secrets`" that [ADR 0029](0029-per-user-isolation.md) deferred. It builds on [ADR 0010](0010-secrets.md) (secrets), [ADR 0012](0012-users-sessions-rbac.md) (roles), [ADR 0017](0017-bot-acls.md) (Bot owners and sharing), [ADR 0019](0019-audit-actors.md) (audit actors), [ADR 0027](0027-expo-primary-hermes-default.md) (the Expo client is the interface) and [ADR 0032](0032-console-admin-only.md) (the console is for admins).
 
-0043 is taken by the separate OS user for Bots on machines (#29, in review), so this is 0044.
+0043 is taken by the separate OS user for Bots on machines ([ADR 0043](0043-bots-own-os-user-on-machines.md), #29), so this is 0044.
 
 ## Context
 

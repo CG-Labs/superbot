@@ -142,6 +142,9 @@ pub(crate) fn config(env: &Env, machine_id: &str, token: Option<&str>) -> Config
         max_jobs: 8,
         tools: crate::db::temp_path("agent-tools"),
         exe: crate::db::temp_path("agent-exe"),
+        // Tests can't make users: the Bots' user is whoever runs them.
+        bot_user: crate::machines::runas::current_user().unwrap(),
+        allow_own_user: true,
     }
 }
 
@@ -1071,8 +1074,19 @@ impl OnMachine {
 }
 
 pub(crate) async fn agent_with(env: &mut Env, mid: &str, token: &str, harness: &str) -> OnMachine {
+    agent_with_config(env, mid, token, harness, |c| c).await
+}
+
+/// `agent_with`, with its settings changed by `f`.
+pub(crate) async fn agent_with_config(
+    env: &mut Env,
+    mid: &str,
+    token: &str,
+    harness: &str,
+    f: impl FnOnce(Config) -> Config,
+) -> OnMachine {
     use std::os::unix::fs::PermissionsExt;
-    let mut cfg = config(env, mid, Some(token));
+    let mut cfg = f(config(env, mid, Some(token)));
     let bin = cfg.home.join(".local/bin");
     std::fs::create_dir_all(&bin).unwrap();
     for (name, body) in [("claude", harness), ("botctl", "#!/bin/sh\nexit 2\n")] {
@@ -1574,6 +1588,8 @@ fn agent_counts_programs_only_under_its_home_or_the_system() {
         max_jobs: 1,
         tools: crate::db::temp_path("agent-tools"),
         exe: crate::db::temp_path("agent-exe"),
+        bot_user: crate::machines::wire::BOT_USER.into(),
+        allow_own_user: false,
     };
     assert_eq!(cfg.layout().botctl, None, "outside the home and the system's directories");
 

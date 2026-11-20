@@ -243,6 +243,25 @@ The login runs on the machine. Its sign-in link or code shows in your terminal, 
 
 The folder copy sends only what the machine doesn't have. Each file is checked by SHA-256, and a copy cut short picks up where it stopped. Links are never followed. Files changed on the machine, even during the copy, are kept, and nothing there is deleted. Bots wait for the first copy, and agent upgrades wait for a running login. Each step is audited as `machine.harness_login*` and `machine.folder_sync_*`. Design: [ADR 0041](../docs/adr/0041-machine-harness-logins-and-folder-copy.md).
 
+### Bots' own user on machines
+
+The agent on a machine runs as root, and by default so do its Bots. To run them as their own unprivileged user instead, add:
+
+```sh
+MACHINE_BOT_USER=on   # Bots, their harness CLIs, logins and the folder copy run as superbot-bots
+```
+
+After the next heartbeat, botd asks each idle agent to switch. The agent makes the `superbot-bots` user if it must, hands it the Bots' home (workspace, logins, folder copy) without following links, and from then on runs every harness, login and cleanup as it. The agent's key and the harness CLIs stay root's. Until the switch is done, a Bot says it's being set up and doesn't run; nothing runs on the server instead. New machines get the user at first boot.
+
+Machines already enrolled switch once their agent is botd's build (`MACHINE_AGENT_UPGRADES=auto`, or `botctl machine upgrade <user>`). Agents from before ADR 0039 can't upgrade: reinstall them. Turning the setting off later doesn't switch a machine back. On the server:
+
+```sh
+botctl machine bot-user <user>   # ask its agent now, retrying a failure
+botctl machine agent <user>      # agent.botUser shows ready, setting_up or failed
+```
+
+Each step is audited as `machine.bot_user_*`. Design: [ADR 0043](../docs/adr/0043-bots-own-os-user-on-machines.md).
+
 ## Approvals after an upgrade
 
 Fresh installs ask before risky actions. An install from before approvals keeps running without them (`bypass`) after `--upgrade`, and botd logs a warning at start. To opt in, on the server:
