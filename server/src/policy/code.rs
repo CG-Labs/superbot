@@ -233,13 +233,16 @@ impl Level<'_> {
             let cwds = if f.moves { &moved } else { self.cwds };
             // Any string naming a file may be a file it writes (`open('deploy.sh', 'w')`),
             // except as a word of a command it runs.
-            let mut named: Vec<String> = f.strings.iter().map(|s| file_name(s)).collect();
+            let mut named: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+            for s in &f.strings {
+                *named.entry(file_name(s)).or_default() += 1;
+            }
             for word in f.commands.iter().flat_map(|c| c.split_whitespace()) {
-                if let Some(i) = named.iter().position(|n| *n == file_name(word.trim_matches(['\'', '"']))) {
-                    named.swap_remove(i);
+                if let Some(n) = named.get_mut(&file_name(word.trim_matches(['\'', '"']))) {
+                    *n = n.saturating_sub(1);
                 }
             }
-            note_named(named, w, &mut found);
+            note_named(named.into_iter().filter(|(_, n)| *n > 0).map(|(s, _)| s).collect(), w, &mut found);
             for cmd in &f.commands {
                 classify_shell(cmd, cwds, self.ctx, self.depth + 1, w, false, &mut found);
             }

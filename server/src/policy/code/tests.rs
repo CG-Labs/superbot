@@ -336,6 +336,12 @@ fn review_findings_ask() {
     let started = std::time::Instant::now();
     ws.found(&format!("sort {}", names.join(" ")));
     assert!(started.elapsed() < std::time::Duration::from_secs(10), "took {:?}", started.elapsed());
+    // So is a script with many strings and many commands.
+    let strings: String = (0..20_000).map(|i| format!("'s{i}'\n")).collect();
+    ws.write("many.py", &format!("import os\n{strings}{}", "os.system('true')\n".repeat(7_000)));
+    let started = std::time::Instant::now();
+    ws.found("python3 many.py");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "took {:?}", started.elapsed());
 }
 
 #[test]
