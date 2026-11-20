@@ -228,24 +228,23 @@ async fn put(e: &Enrollment, s: &Settings, to: &Assigned, bot: &str, token: &str
 }
 
 /// Starts `bot`'s screen on `to`, or keeps it, with the token botd holds for it (a new
-/// one if it has none, or held one for another machine). Records the open screen.
+/// one if it has none). One left on another machine, or for another owner, is closed
+/// first. Records the open screen.
 async fn ensure(app: &App, e: &Enrollment, s: &Settings, by: &Who, bot: &Bot, to: &Assigned, why: &str) -> Result<(ScreenReply, Zeroizing<String>), Why> {
-    let token = {
-        let open = e.shown.open();
-        open.get(&bot.id).filter(|o| o.machine_id == to.machine_id).map(|o| o.token.clone())
-    };
+    let elsewhere = e.shown.open().get(&bot.id).is_some_and(|o| o.machine_id != to.machine_id || o.owner_id != bot.owner_id);
+    if elsewhere {
+        close(app, by, &bot.id, "moved").await;
+    }
+    let token = e.shown.open().get(&bot.id).map(|o| o.token.clone());
     let token = token.unwrap_or_else(|| Zeroizing::new(crate::random_hex(16)));
     crate::secrets::redact::register(&token);
     let reply = put(e, s, to, &bot.id, &token).await?;
     let at = now();
-    let replaced = {
+    {
         let mut open = e.shown.open();
         match open.get_mut(&bot.id).filter(|o| o.machine_id == to.machine_id && o.token == token) {
-            Some(o) => {
-                o.used = at;
-                None
-            }
-            None => open.insert(
+            Some(o) => o.used = at,
+            None => drop(open.insert(
                 bot.id.clone(),
                 Open {
                     machine_id: to.machine_id.clone(),
@@ -258,11 +257,8 @@ async fn ensure(app: &App, e: &Enrollment, s: &Settings, by: &Who, bot: &Bot, to
                     cut: watch::channel(0).0,
                     tunnels: Arc::default(),
                 },
-            ),
+            )),
         }
-    };
-    if let Some(old) = replaced.filter(|o| o.machine_id != to.machine_id) {
-        app.db.record(&screen_event(by, "machine.screen_closed", &old.machine_id, &bot.id, json!({ "reason": "moved" })));
     }
     if reply.started {
         app.db.record(&screen_event(by, "machine.screen_started", &to.machine_id, &bot.id, json!({ "display": reply.display, "for": why })));
@@ -424,6 +420,12 @@ pub async fn for_run(app: &App, bot: &Bot, to: &Assigned, state_dir: &std::path:
 pub async fn rotate(app: &App, bot: &str) {
     let Some(e) = enrollment(app).cloned() else { return };
     let _one = e.shown.one_at_a_time(bot).await;
+    let owner = e.shown.open().get(bot).map(|o| o.owner_id.clone());
+    let Some(owner) = owner else { return };
+    if app.db.bot(bot).is_none_or(|b| b.owner_id != owner) {
+        close(app, &Who::system("control_plane"), bot, "moved").await;
+        return;
+    }
     let token = Zeroizing::new(crate::random_hex(16));
     crate::secrets::redact::register(&token);
     let machine = {
