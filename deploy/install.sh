@@ -18,6 +18,7 @@ UPGRADE=false
 DRY_RUN=false
 INTERACTIVE=true
 WITH_HERMES=false
+LICENSE_FILE=""
 # Hermes Agent release --with-hermes installs: the commit of tag v0.23.2 (NousResearch/hermes-agent).
 HERMES_COMMIT=${HERMES_COMMIT:-ae2a81ccc00e9b7c06301523e5bb09608397149c}
 SHARE_DIR=${SHARE_DIR:-/usr/local/share/superbot}
@@ -47,6 +48,7 @@ Usage: install.sh [options]
   --ufw               Enable UFW (allow 22, 80, 443)
   --no-backup         Skip daily DATA_DIR backup timer
   --with-hermes       Also install the Hermes Agent CLI (about 2.5 GB; HERMES_COMMIT pins it)
+  --license-file PATH Install the license key CG-Labs sent (without one: community edition)
   --no-client         Skip building the web client (served at /app/)
   --dry-run           Print actions without changing the system
   --non-interactive   Fail instead of prompting for missing flags
@@ -70,6 +72,7 @@ parse_args() {
       --ufw) ENABLE_UFW=true; shift ;;
       --no-backup) ENABLE_BACKUP=false; shift ;;
       --with-hermes) WITH_HERMES=true; shift ;;
+      --license-file) LICENSE_FILE=$2; shift 2 ;;
       --no-client) BUILD_CLIENT=false; shift ;;
       --dry-run) DRY_RUN=true; shift ;;
       --non-interactive) INTERACTIVE=false; shift ;;
@@ -575,6 +578,46 @@ ensure_master_key() {
   set_env_var "$env_file" SUPERBOT_MASTER_KEY_FILE "$key_file"
 }
 
+# The license key (docs/adr/0038-self-host-license-key.md). Its shape is checked early,
+# before the long build; botd checks its signature when it starts and logs what it found.
+check_license_file() {
+  [[ -n "$LICENSE_FILE" ]] || return 0
+  [[ -f "$LICENSE_FILE" && -r "$LICENSE_FILE" ]] || die "--license-file: can't read $LICENSE_FILE"
+  (( $(stat -c %s "$LICENSE_FILE") <= 8192 )) || die "--license-file: $LICENSE_FILE is too big to be a license key"
+  local key
+  key=$(tr -d '[:space:]' <"$LICENSE_FILE")
+  [[ "$key" =~ ^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]] \
+    || die "--license-file: $LICENSE_FILE isn't a SuperBot license key (three parts separated by dots)"
+}
+
+# Saved where PUT /api/license saves it, DATA_DIR/license.key, written by the service
+# user (DATA_DIR is theirs) so root never writes through a path they control.
+# shellcheck disable=SC2016
+install_license() {
+  [[ -n "$LICENSE_FILE" ]] || return 0
+  local home repo_path env_file dest
+  home=$(user_home)
+  repo_path="$home/superbot"
+  env_file="$repo_path/.env"
+  dest="$repo_path/data/license.key"
+  if [[ "$DRY_RUN" == true ]]; then
+    log "[dry-run] would install the license key from $LICENSE_FILE as $dest (0600, $SUPERBOT_USER)"
+    return
+  fi
+  tr -d '[:space:]' <"$LICENSE_FILE" | sudo -u "$SUPERBOT_USER" -H env DEST="$dest" sh -c '
+    set -eu
+    umask 077
+    mkdir -p "$(dirname "$DEST")"
+    tmp=$(mktemp "$DEST.XXXXXX")
+    cat >"$tmp"
+    printf "\n" >>"$tmp"
+    mv -f "$tmp" "$DEST"'
+  log "License key installed as $dest. botd checks it when it starts: journalctl -u superbot | grep License"
+  if grep -Eq '^LICENSE_KEY(_FILE)?=.' "$env_file" 2>/dev/null; then
+    warn "$env_file sets LICENSE_KEY or LICENSE_KEY_FILE, which wins over $dest. Remove it to use this key."
+  fi
+}
+
 # Hermes's own installer, as the service user (Hermes refuses a checkout another user
 # owns). Its launcher lands in ~/.local/bin, which botd gets on PATH through .env.
 # shellcheck disable=SC2016
@@ -786,6 +829,7 @@ SuperBot is installed.
   Password: stored in $pass_file (also in $repo_path/.env as AUTH_PASSWORD)
   Key:      $(master_key_default "$home") encrypts saved secrets. Back it up apart from
             the database: without it they can't be read (deploy/README.md).
+  License:  botctl license (none: the community edition, free for up to 10 active people)
   Logs:     journalctl -u superbot -f
   Upgrade:  sudo bash -s -- --upgrade < <(curl -fsSL https://raw.githubusercontent.com/CG-Labs/superbot/main/deploy/install.sh)
 
@@ -809,6 +853,7 @@ EOF
 main() {
   parse_args "$@"
   need_root
+  check_license_file
   prompt_missing
   detect_source_dir
   TZ_VALUE=${TZ_VALUE:-UTC}
@@ -828,6 +873,7 @@ main() {
   install_site
   configure_env
   ensure_master_key
+  install_license
   install_hermes
   install_systemd
   install_backup
