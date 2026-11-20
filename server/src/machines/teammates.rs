@@ -757,7 +757,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(owner.join("work/plan.md")).unwrap(), "ada's");
         assert_eq!(std::fs::read_to_string(cy.workspace().join("notes.md")).unwrap(), "cy's");
         assert_eq!(t.known(), ["ucy"]);
-        assert_eq!(*fake.removed.lock().unwrap(), [bea.user.clone()]);
+        assert_eq!(*fake.removed.lock().unwrap(), std::slice::from_ref(&bea.user));
         assert!(fake.lookup(&cy.user).is_some());
 
         // Again: nothing left, nothing done.

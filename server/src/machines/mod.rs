@@ -21,6 +21,7 @@ pub mod job;
 pub mod landing;
 pub mod linode;
 pub mod logins;
+pub mod offboard;
 pub mod pki;
 pub mod provider;
 pub mod route;
@@ -832,6 +833,7 @@ pub async fn heartbeats(app: &AppState, cp: &ControlPlane) -> Option<usize> {
         .count()
         .await;
     screens::reap(app).await;
+    offboard::follow_up(app).await;
     Some(answered)
 }
 
