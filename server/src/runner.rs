@@ -298,12 +298,14 @@ impl App {
         // With per-user accounts the run edits copies in its owner's folder, made from
         // botd's. Until the account exists there's no folder, and nothing is made.
         if let Some(iso) = self.isolation() {
-            let kept = |p: Option<PathBuf>| p.and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
-            if let Some(mem) = iso.memory_file(&bot.owner_id, &bot.id) {
-                let _ = accounts::seed(&mem, &kept(self.data_memory_file(&bot.id)));
-            }
-            if let Some(user) = iso.user_file(&bot.owner_id) {
-                let _ = accounts::seed(&user, &kept(self.data_user_file(&bot.owner_id)));
+            let pairs = [
+                (iso.memory_file(&bot.owner_id, &bot.id), self.data_memory_file(&bot.id)),
+                (iso.user_file(&bot.owner_id), self.data_user_file(&bot.owner_id)),
+            ];
+            for (copy, kept) in pairs {
+                if let (Some(copy), Some(kept)) = (copy, kept) {
+                    let _ = accounts::seed_from(&copy, &kept);
+                }
             }
         }
     }
@@ -323,7 +325,6 @@ impl App {
         for (from, to) in pairs {
             if let (Some(from), Some(to)) = (from, to)
                 && let Some(text) = accounts::read_plain(&from, accounts::MAX_FILE)
-                && !text.trim().is_empty()
                 && std::fs::read_to_string(&to).ok().as_deref() != Some(text.as_str())
             {
                 let _ = std::fs::write(&to, text);
@@ -337,7 +338,6 @@ impl App {
         let Some(iso) = self.isolation() else { return };
         if let (Some(old), Some(kept)) = (iso.memory_file(from, bot_id), self.data_memory_file(bot_id))
             && let Some(text) = accounts::read_plain(&old, accounts::MAX_FILE)
-            && !text.trim().is_empty()
         {
             let _ = std::fs::write(kept, text);
         }
@@ -1299,6 +1299,40 @@ mod tests {
         app.init_bot_files(&b);
         assert!(std::fs::read_to_string(app.memory_file(&b).unwrap()).unwrap().contains("Learned a thing."));
         assert_eq!(app.memory_file(&b).unwrap().parent().unwrap(), root.join(&bea.id).join("memory"));
+    }
+
+    #[test]
+    fn isolated_copies_keep_cleared_memory_and_follow_newer_originals() {
+        use crate::acl::Visibility;
+        use crate::rbac::Role;
+        let (app, root) = isolated_app("/bin/false");
+        let ada = app.db.create_user(None, Some("ada@example.com"), "Ada", Role::Member).unwrap();
+        let a = app.db.create_bot_owned("A1", "#fff", "waddle", "claude", None, false, &ada.id, Visibility::Private);
+        std::fs::create_dir_all(root.join(&ada.id).join("memory")).unwrap();
+        app.init_bot_files(&a);
+        let (mem, kept) = (app.memory_file(&a).unwrap(), app.data_memory_file(&a.id).unwrap());
+        let read = |p: &Path| std::fs::read_to_string(p).unwrap();
+
+        // A Bot that clears its memory keeps it cleared, as it would without accounts.
+        std::fs::write(&mem, "").unwrap();
+        app.keep_memory(&a);
+        assert_eq!(read(&kept), "");
+
+        // botd's original changed after the copy, as while isolation was off: the next run
+        // here starts from the original, and doesn't copy the old text back over it.
+        std::fs::write(&mem, "# A1\n- from before\n").unwrap();
+        let earlier = std::time::SystemTime::now() - Duration::from_secs(60);
+        std::fs::File::options().write(true).open(&mem).unwrap().set_modified(earlier).unwrap();
+        std::fs::write(&kept, "# A1\n- learned while off\n").unwrap();
+        app.init_bot_files(&a);
+        assert_eq!(read(&mem), "# A1\n- learned while off\n");
+        app.keep_memory(&a);
+        assert_eq!(read(&kept), "# A1\n- learned while off\n");
+
+        // A copy changed after the original is the newest, and stays.
+        std::fs::write(&mem, "# A1\n- learned just now\n").unwrap();
+        app.init_bot_files(&a);
+        assert_eq!(read(&mem), "# A1\n- learned just now\n");
     }
 
     #[tokio::test]
