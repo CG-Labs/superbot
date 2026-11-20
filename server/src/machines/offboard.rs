@@ -28,6 +28,7 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const DISABLED: &str = "disabled";
 pub const DEPROVISIONED: &str = "deprovisioned";
@@ -107,10 +108,17 @@ impl Settings {
     }
 }
 
+/// Removals tried at once, across machines: each can wait minutes on its agent.
+const AT_ONCE: usize = 4;
+
 /// Removals being tried now, by id, so an event and the reconciler never send one twice
-/// at once.
+/// at once; and whether a background pass is running, or wanted again after it.
 #[derive(Default)]
-pub struct Working(Mutex<HashSet<String>>);
+pub struct Working {
+    taken: Mutex<HashSet<String>>,
+    running: AtomicBool,
+    again: AtomicBool,
+}
 
 struct Taken<'a>(&'a Working, String);
 
@@ -122,7 +130,7 @@ impl Drop for Taken<'_> {
 
 impl Working {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+        self.taken.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn take(&self, id: &str) -> Option<Taken<'_>> {
@@ -236,12 +244,40 @@ fn sweep(app: &App, e: &Enrollment, by: &Who, m: &Machine, only: Option<(&str, &
         .count()
 }
 
-/// Tries what's pending now, in the background.
+/// Tries what's pending now, in the background, so heartbeats never wait on a slow
+/// agent. One pass runs at a time; a kick during it runs another after.
 fn kick(app: &AppState) {
+    let Some(e) = enrollment(app).cloned() else { return };
+    e.offboarding.again.store(true, Ordering::SeqCst);
+    if e.offboarding.running.swap(true, Ordering::SeqCst) {
+        return;
+    }
     let app = app.clone();
     tokio::spawn(async move {
-        run(&app).await;
+        let w = &e.offboarding;
+        loop {
+            while w.again.swap(false, Ordering::SeqCst) {
+                run(&app).await;
+            }
+            w.running.store(false, Ordering::SeqCst);
+            if !w.again.load(Ordering::SeqCst) || w.running.swap(true, Ordering::SeqCst) {
+                break;
+            }
+        }
     });
+}
+
+/// Waits until no background pass is running or wanted.
+#[cfg(test)]
+pub async fn settled(app: &App) {
+    let Some(e) = enrollment(app) else { return };
+    for _ in 0..3000 {
+        if !e.offboarding.running.load(Ordering::SeqCst) && !e.offboarding.again.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("teammate removals never settled");
 }
 
 /// `user_id` was disabled, deprovisioned or lost their role: queue their removal from
@@ -268,35 +304,51 @@ pub fn check_owner(app: &AppState, by: &Who, owner_id: &str) {
 }
 
 /// After every round of heartbeats: queues removals for teammates heartbeats show who
-/// shouldn't be there, then tries every pending one and purges held work that's due.
-pub async fn follow_up(app: &App) -> Value {
-    let Some(e) = enrollment(app) else { return Value::Null };
+/// shouldn't be there, then tries every pending one and purges held work that's due,
+/// in the background.
+pub fn follow_up(app: &AppState) {
+    let Some(e) = enrollment(app) else { return };
     for m in app.db.machines(None) {
         sweep(app, e, &system(&m), &m, None);
     }
-    run(app).await
+    let at = now();
+    let held = app.db.teammate_cleanups(Some(HELD), None);
+    if !app.db.teammate_cleanups(Some(PENDING), None).is_empty() || held.iter().any(|r| r.purge_at.is_some_and(|p| p <= at)) {
+        kick(app);
+    }
 }
 
-/// Tries every pending removal, and purges held work that's due. Counts what happened.
-pub async fn run(app: &App) -> Value {
+/// Tries every pending removal, and purges held work that's due, `AT_ONCE` at a time.
+/// Counts what happened.
+async fn run(app: &App) -> Value {
+    use futures_util::StreamExt;
     let Some(e) = enrollment(app) else { return Value::Null };
-    let mut out = json!({ "removed": 0, "failed": 0, "waiting": 0, "cancelled": 0, "purged": 0 });
-    for row in app.db.teammate_cleanups(Some(PENDING), None) {
-        let Some(m) = app.db.machine(&row.machine_id) else { continue };
-        let k = match try_removal(app, e, &system(&m), &row, false).await {
-            Tried::Removed(_) => "removed",
-            Tried::Failed(_) => "failed",
-            Tried::Waiting(_) => "waiting",
-            Tried::Cancelled => "cancelled",
-            Tried::Busy => continue,
-        };
-        out[k] = json!(out[k].as_i64().unwrap_or(0) + 1);
-    }
+    let tried: Vec<&str> = futures_util::stream::iter(app.db.teammate_cleanups(Some(PENDING), None))
+        .map(|row| async move {
+            let m = app.db.machine(&row.machine_id)?;
+            Some(match try_removal(app, e, &system(&m), &row, false).await {
+                Tried::Removed(_) => "removed",
+                Tried::Failed(_) => "failed",
+                Tried::Waiting(_) => "waiting",
+                Tried::Cancelled => "cancelled",
+                Tried::Busy => return None,
+            })
+        })
+        .buffer_unordered(AT_ONCE)
+        .filter_map(|k| async move { k })
+        .collect()
+        .await;
     let at = now();
-    for row in app.db.teammate_cleanups(Some(HELD), None).into_iter().filter(|r| r.purge_at.is_some_and(|p| p <= at)) {
-        if purge(app, e, &row).await {
-            out["purged"] = json!(out["purged"].as_i64().unwrap_or(0) + 1);
-        }
+    let due = app.db.teammate_cleanups(Some(HELD), None).into_iter().filter(|r| r.purge_at.is_some_and(|p| p <= at));
+    let purged = futures_util::stream::iter(due)
+        .map(|row| async move { purge(app, e, &row).await })
+        .buffer_unordered(AT_ONCE)
+        .filter(|done| std::future::ready(*done))
+        .count()
+        .await;
+    let mut out = json!({ "removed": 0, "failed": 0, "waiting": 0, "cancelled": 0, "purged": purged });
+    for k in tried {
+        out[k] = json!(out[k].as_i64().unwrap_or(0) + 1);
     }
     out
 }
@@ -377,7 +429,10 @@ async fn try_removal(app: &App, e: &Enrollment, by: &Who, row: &TeammateCleanup,
     if !live(&m) || m.user_id != row.owner_id {
         return cancel(app, by, &m, &row, "machine_gone");
     }
-    if !forced && row.reason != ADMIN && wanted(app, &row.owner_id, &row.user_id) {
+    // Once the agent has been asked, it may have done some of it (the user deleted, the
+    // work not yet moved): finish rather than leave it half done. A later run makes the
+    // teammate a new user.
+    if !forced && row.reason != ADMIN && row.attempts == 0 && wanted(app, &row.owner_id, &row.user_id) {
         return cancel(app, by, &m, &row, "access_back");
     }
     if let Err(why) = reachable(&m) {

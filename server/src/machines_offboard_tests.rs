@@ -31,6 +31,12 @@ fn removals(w: &World, state: &str) -> Vec<crate::db::TeammateCleanup> {
     w.env.app.db.teammate_cleanups(Some(state), None)
 }
 
+/// A round of heartbeats, and the removals it started.
+async fn pass(w: &World) {
+    heartbeats(&w.env.app, &w.env.cp).await;
+    crate::machines::offboard::settled(&w.env.app).await;
+}
+
 async fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
     for _ in 0..600 {
         if f() {
@@ -81,11 +87,11 @@ async fn a_disabled_teammate_loses_their_user_and_their_work_goes_to_the_owner()
 
     // Asking again changes nothing: no second removal, however many passes.
     for _ in 0..2 {
-        heartbeats(&w.env.app, &w.env.cp).await;
+        pass(&w).await;
         json_call(&w.env, "POST", "/api/machines/reconcile", "").await;
     }
     crate::machines::offboard::left(&w.env.app, &crate::audit::Who::system("test"), &w.bea_id, "disabled");
-    heartbeats(&w.env.app, &w.env.cp).await;
+    pass(&w).await;
     assert_eq!(events(&w.env, "machine.teammate_removed").await.len(), 1);
     assert_eq!(events(&w.env, "machine.teammate_removal_queued").await.len(), 1);
     assert_eq!(removals(&w, "done").len(), 1);
@@ -114,7 +120,7 @@ async fn a_disabled_teammate_loses_their_user_and_their_work_goes_to_the_owner()
 }
 
 #[tokio::test]
-async fn a_revoked_grant_is_retried_while_the_machine_is_offline_and_cancelled_if_access_comes_back() {
+async fn a_revoked_grant_is_retried_while_the_machine_is_offline_and_cancelled_only_if_never_asked() {
     let mut w = world_with(|e| e, |_| {}, stand_in).await;
     let private = w
         .env
@@ -132,7 +138,7 @@ async fn a_revoked_grant_is_retried_while_the_machine_is_offline_and_cancelled_i
     run(&w, &cy, &private, "go").await;
     let t = w.m.agent.teammates.clone();
     let (bea_home, cy_home) = (t.home_of(&w.bea_id), t.home_of(&cy_id));
-    heartbeats(&w.env.app, &w.env.cp).await;
+    pass(&w).await;
 
     // The machine goes away; both lose the Bot.
     w.m.server.abort();
@@ -145,29 +151,56 @@ async fn a_revoked_grant_is_retried_while_the_machine_is_offline_and_cancelled_i
     let (_, v) = json_call(&w.env, "GET", "/api/machines/teammate-removals", "").await;
     assert_eq!(v["openByMachine"][0]["pending"], 2, "{v}");
     for _ in 0..3 {
-        heartbeats(&w.env.app, &w.env.cp).await;
+        pass(&w).await;
     }
     let failed = events(&w.env, "machine.teammate_removal_failed").await;
     assert_eq!(failed.len(), 2, "one failure each in the log, not one a pass: {failed:?}");
     assert!(removals(&w, "pending").iter().all(|r| r.attempts >= 2 && r.last_error.is_some()));
     assert!(bea_home.is_dir() && cy_home.is_dir());
 
-    // Cy gets it back before the machine does; then it's back.
+    // Cy gets it back before the machine does. The agent may have done part of hers
+    // already, so it's finished rather than left half done; then it's back.
     let (code, _) = call(w.env.port, "PUT", &format!("/api/bots/{private}/grants/{cy_id}"), &ada, r#"{"level":"operator"}"#).await;
     assert_eq!(code, 200);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", w.env.e.agent_port)).await.unwrap();
     tokio::spawn(agent::serve(listener, w.m.agent.clone()));
-    heartbeats(&w.env.app, &w.env.cp).await;
+    pass(&w).await;
 
     let removed = events(&w.env, "machine.teammate_removed").await;
-    assert_eq!(removed.len(), 1, "{removed:?}");
-    assert_eq!(removed[0]["details"]["forUser"], w.bea_id.as_str());
-    assert_eq!(removed[0]["details"]["reason"], "access_lost");
-    let cancelled = events(&w.env, "machine.teammate_removal_cancelled").await;
-    assert_eq!((cancelled.len(), cancelled[0]["details"]["forUser"].as_str(), cancelled[0]["details"]["why"].as_str()), (1, Some(cy_id.as_str()), Some("access_back")));
-    assert!(std::fs::symlink_metadata(&bea_home).is_err());
-    assert!(cy_home.join("whoami").is_file(), "Cy keeps her home");
+    let mut who: Vec<&str> = removed.iter().filter_map(|e| e["details"]["forUser"].as_str()).collect();
+    who.sort();
+    let mut both = [w.bea_id.as_str(), cy_id.as_str()];
+    both.sort();
+    assert_eq!(who, both, "{removed:?}");
+    assert!(removed.iter().all(|e| e["details"]["reason"] == "access_lost"));
+    assert!(events(&w.env, "machine.teammate_removal_cancelled").await.is_empty());
+    assert!(std::fs::symlink_metadata(&bea_home).is_err() && std::fs::symlink_metadata(&cy_home).is_err());
     assert_eq!(std::fs::read_to_string(&w.secret).unwrap(), "ada's login");
+    assert!(removals(&w, "pending").is_empty());
+    run(&w, &cy, &private, "back").await;
+    assert!(cy_home.join("whoami").is_file(), "Cy gets a new home on her next run");
+
+    // An agent too old to remove anyone isn't asked: Dee's removal waits, and is
+    // cancelled when she gets the Bot back before the agent is upgraded.
+    let (dee_id, dee) = user_with(w.env.port, &w.env.admin, "dee@example.com", "member").await;
+    let (code, _) = call(w.env.port, "PUT", &format!("/api/bots/{private}/grants/{dee_id}"), &ada, r#"{"level":"operator"}"#).await;
+    assert_eq!(code, 200);
+    run(&w, &dee, &private, "go").await;
+    pass(&w).await;
+    let m = w.env.app.db.user_machine(&w.ada).unwrap();
+    let mut old = m.agent_upkeep.clone().unwrap();
+    old["can"] = json!(old["can"].as_array().unwrap().iter().filter(|c| *c != "teammate_removal").cloned().collect::<Vec<_>>());
+    assert!(w.env.app.db.machine_upkeep_swap(&m.id, m.agent_upkeep.as_ref(), &old));
+    assert_eq!(call(w.env.port, "DELETE", &format!("/api/bots/{private}/grants/{dee_id}"), &ada, "").await.0, 200);
+    crate::machines::offboard::settled(&w.env.app).await;
+    let waiting = removals(&w, "pending");
+    assert_eq!((waiting.len(), waiting[0].attempts), (1, 0), "not asked");
+    assert!(waiting[0].last_error.as_deref().unwrap().contains("upgrade"), "{:?}", waiting[0].last_error);
+    assert_eq!(call(w.env.port, "PUT", &format!("/api/bots/{private}/grants/{dee_id}"), &ada, r#"{"level":"operator"}"#).await.0, 200);
+    pass(&w).await;
+    let cancelled = events(&w.env, "machine.teammate_removal_cancelled").await;
+    assert_eq!((cancelled.len(), cancelled[0]["details"]["forUser"].as_str(), cancelled[0]["details"]["why"].as_str()), (1, Some(dee_id.as_str()), Some("access_back")));
+    assert!(t.home_of(&dee_id).join("whoami").is_file(), "Dee keeps her home");
     assert!(removals(&w, "pending").is_empty());
 }
 
@@ -314,12 +347,12 @@ async fn deleted_work_is_held_then_purged_and_an_admin_can_remove_a_teammate_now
     assert_eq!(std::fs::read_to_string(held.join("notes.txt")).unwrap(), "bea's notes");
 
     // Its days aren't up: kept. Then they are: deleted, once.
-    heartbeats(&w.env.app, &w.env.cp).await;
+    pass(&w).await;
     assert!(held.is_dir());
     w.env.app.db.teammate_cleanup_due_now(&id);
-    heartbeats(&w.env.app, &w.env.cp).await;
+    pass(&w).await;
     assert!(!held.exists());
-    heartbeats(&w.env.app, &w.env.cp).await;
+    pass(&w).await;
     let purged = events(&w.env, "machine.teammate_files_purged").await;
     assert_eq!((purged.len(), purged[0]["details"]["purged"].as_bool()), (1, Some(true)), "{purged:?}");
     assert_eq!(w.env.app.db.teammate_cleanup(&id).unwrap().state, "done");

@@ -833,7 +833,7 @@ pub async fn heartbeats(app: &AppState, cp: &ControlPlane) -> Option<usize> {
         .count()
         .await;
     screens::reap(app).await;
-    offboard::follow_up(app).await;
+    offboard::follow_up(app);
     Some(answered)
 }
 
