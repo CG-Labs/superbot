@@ -48,7 +48,7 @@ ARG SUPERBOT_UID=10001
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates curl git procps sqlite3 tini tzdata \
+        age ca-certificates curl git procps sqlite3 tini tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eu; pkgs=""; \
@@ -88,8 +88,8 @@ RUN set -eu; case " $HARNESSES " in *" hermes "*) ;; *) exit 0 ;; esac; \
 
 # botd prepends its own folder to each Bot's PATH, so it lives apart from the npm CLIs in /usr/local/bin.
 COPY --from=build /out/botd /out/botctl /opt/superbot/bin/
-COPY --chmod=0755 deploy/docker/superbot-backup.sh /usr/local/bin/superbot-backup
-COPY --chmod=0755 deploy/docker/superbot-restore.sh /usr/local/bin/superbot-restore
+COPY --chmod=0755 deploy/superbot-backup.sh /usr/local/bin/superbot-backup
+COPY --chmod=0755 deploy/superbot-restore.sh /usr/local/bin/superbot-restore
 
 # HOST=0.0.0.0 makes botd refuse to start without AUTH_PASSWORD.
 # Harness CLIs installed at runtime (npm i -g) land in the persistent home volume and win on PATH.

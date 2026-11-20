@@ -33,7 +33,30 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
+      - name: Keep the release binaries for the backup drill
+        uses: actions/upload-artifact@v4
+        with:
+          name: botd-release
+          path: |
+            target/release/botd
+            target/release/botctl
+          retention-days: 1
       - run: cargo test
+
+  backup-drill:
+    needs: rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: botd-release
+          path: /tmp/botd-release
+      - name: Install age and sqlite3
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq age sqlite3
+      - name: Backup and restore drill (installer units, encrypted archive, fresh host, RTO and RPO budgets)
+        run: sudo SUPERBOT_DRILL_THROWAWAY=1 GITHUB_ACTIONS="$GITHUB_ACTIONS" deploy/backup-drill.sh /tmp/botd-release
 
   shellcheck:
     runs-on: ubuntu-latest
@@ -41,7 +64,15 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install ShellCheck
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-      - run: shellcheck -S warning deploy/install.sh deploy/superbot-backup.sh deploy/install-computer.sh deploy/docker/*.sh
+      - run: shellcheck -S warning deploy/*.sh deploy/docker/*.sh
+
+  backup-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install age and sqlite3
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq age sqlite3
+      - run: deploy/test-backup.sh
 
   install-pipe-dry-run:
     runs-on: ubuntu-latest
@@ -157,7 +188,7 @@ jobs:
             [[ $(grep -c "^User=" "$SYSTEMD_DIR/superbot.service") == 1 ]]
             grep -qx "User=superbot" "$SYSTEMD_DIR/superbot.service"
             grep -qx "ExecStart=/usr/local/bin/botd" "$SYSTEMD_DIR/superbot.service"
-            grep -qx "ExecStart=/usr/local/bin/superbot-backup /home/superbot" "$SYSTEMD_DIR/superbot-backup.service"
+            grep -qx "ExecStart=/usr/local/bin/superbot-backup --home /home/superbot" "$SYSTEMD_DIR/superbot-backup.service"
             grep -qx "OnCalendar=\*-\*-\* 03:15:00" "$SYSTEMD_DIR/superbot-backup.timer"
             printf "[Service]\nUser=root\nExecStart=/bin/sh\n" >/tmp/evil-identity.service
             render_unit /tmp/evil-identity.service /tmp/out.service "$(service_unit_fixed /home/superbot)"

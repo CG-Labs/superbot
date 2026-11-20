@@ -191,4 +191,45 @@ IFS= read -r header <"$WORK/audit.csv" || true
 [[ "${header%$'\r'}" == id,time,actor_kind,* ]] || fail "audit CSV has no header: $header"
 grep -q ',bot.created,' "$WORK/audit.csv" || fail "audit CSV has no bot.created row"
 
+log "Restore drill: the backup service writes an age-encrypted archive"
+dc exec -T botd age-keygen >"$WORK/identity.txt" 2>/dev/null
+RECIPIENT=$(sed -n 's/^# public key: //p' "$WORK/identity.txt")
+[[ "$RECIPIENT" == age1* ]] || fail "age-keygen in the image gave no public key"
+# Read by the container's uid; WORK itself stays private to this user.
+chmod 0644 "$WORK/identity.txt"
+echo "SUPERBOT_BACKUP_AGE_RECIPIENTS=$RECIPIENT" >>"$SUPERBOT_ENV_FILE"
+dc up -d --no-build --wait --wait-timeout 120 backup
+encrypted=""
+for _ in $(seq 1 30); do
+  encrypted=$(dc exec -T backup sh -c 'ls /backups/superbot-*.tar.gz.age 2>/dev/null | tail -n 1' || true)
+  [[ -z "$encrypted" ]] || break
+  sleep 1
+done
+[[ -n "$encrypted" ]] || fail "the backup service wrote no .age archive"
+dc cp "backup:$encrypted" "$WORK/drill.tar.gz.age"
+[[ $(head -c 21 "$WORK/drill.tar.gz.age") == age-encryption.org/v1 ]] || fail "the archive is not age-encrypted"
+if tar -tzf "$WORK/drill.tar.gz.age" >/dev/null 2>&1; then fail "the encrypted archive opens without the identity"; fi
+restore_run() { dc run --rm --no-deps -T -v "$WORK/identity.txt:/run/age-identity:ro" botd superbot-restore --identity /run/age-identity "$@"; }
+if dc run --rm --no-deps -T botd superbot-restore --check - <"$WORK/drill.tar.gz.age" 2>/dev/null; then
+  fail "an encrypted archive was accepted without the identity"
+fi
+restore_run --check - <"$WORK/drill.tar.gz.age" >"$WORK/check.txt" || fail "superbot-restore --check rejected the archive"
+grep -q '^needs master key: yes' "$WORK/check.txt" || fail "--check did not report the sealed secret"
+
+log "Restore drill: lose every volume, start fresh, restore (timed against the RTO budget)"
+dc down -v
+dc up -d --no-build --wait --wait-timeout 180
+if grep -q '"name":"KeepMe"' <<<"$(curl -fsS "${AUTH[@]}" "$BASE/api/bots")"; then fail "fresh volumes still hold KeepMe"; fi
+t0=$(date +%s)
+dc stop botd backup
+restore_run - <"$WORK/drill.tar.gz.age" >/dev/null
+dc up -d --no-build --wait --wait-timeout 120
+rto=$(($(date +%s) - t0))
+[[ $(curl -fsS "$BASE/healthz") == '{"ok":true}' ]] || fail "/healthz is not ok after the restore"
+grep -q '"name":"KeepMe"' <<<"$(curl -fsS "${AUTH[@]}" "$BASE/api/bots")" || fail "KeepMe is missing after restoring onto fresh volumes"
+grep -q '"name":"SMOKE_API_KEY"' <<<"$(curl -fsS "${AUTH[@]}" "$BASE/api/secrets")" || fail "the saved secret is missing after the restore"
+grep -q '"name":"KeepMe"' <<<"$(curl -fsS "${AUTH[@]}" "$BASE/api/audit?action=bot.created")" || fail "the audit log is missing after the restore"
+((rto <= ${SMOKE_RTO_SECONDS:-300})) || fail "restore took ${rto}s (budget ${SMOKE_RTO_SECONDS:-300}s)"
+log "Restore drill passed: back up in ${rto}s"
+
 log "Smoke test passed"
