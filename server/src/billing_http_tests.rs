@@ -27,17 +27,22 @@ struct World {
     a: String,
     b_id: String,
     b: String,
+    bots: crate::tests::BotKey,
 }
 
 /// A server on the example tiers (starter: 2 Bots, 3 runs a month, 2 routine runs a
 /// day, g6-standard-1 machines), the fake machine provider, Ada and Bea (members), and
 /// with `stripe`, the webhook on.
 async fn world(stripe: bool) -> World {
+    world_with(stripe.then(|| Billing::with_secret(SECRET))).await
+}
+
+async fn world_with(billing: Option<Billing>) -> World {
     let p: Arc<dyn MachineProvider> = Arc::new(Fake::default());
-    let (port, app, admin, _) = serve_app_with(|a| {
+    let (port, app, admin, bots) = serve_app_with(|a| {
         a.machines = Arc::new(ControlPlane::for_tests(p));
-        if stripe {
-            a.billing = Billing::with_secret(SECRET);
+        if let Some(b) = billing {
+            a.billing = b;
         }
     })
     .await;
@@ -45,7 +50,7 @@ async fn world(stripe: bool) -> World {
     let (a_id, a) = user_with(port, &admin, "ada@example.com", "member").await;
     let (b_id, b) = user_with(port, &admin, "bea@example.com", "member").await;
     fake_claude(&app);
-    World { port, app, admin, a_id, a, b_id, b }
+    World { port, app, admin, a_id, a, b_id, b, bots }
 }
 
 async fn audit(port: u16, admin: &str, q: &str) -> Vec<Value> {
@@ -435,26 +440,31 @@ async fn signed_subscription_events_set_the_users_tier() {
     assert_eq!(audit(port, admin, "action=billing.event_ignored").await[0]["details"]["reason"], "subscription_of_another_user");
     assert_eq!((tier(&w.a_id), tier(&w.b_id)), (None, None));
 
+    // Bea's own subscriptions, under her own customer.
+    let bea = |v: &mut Value, id: &str| {
+        v["data"]["object"]["id"] = json!(id);
+        v["data"]["object"]["customer"] = json!("cus_test_bea");
+    };
     // Bea moves to a subscription started after her first. The old one's events, late or
     // not, don't undo the move. One whose first payment hasn't gone through changes nothing.
-    let pro = event(UPDATED, &w.b_id, "evt_6", 1_795_300_000, |v| v["data"]["object"]["id"] = json!("sub_test_bea_1"));
+    let pro = event(UPDATED, &w.b_id, "evt_6", 1_795_300_000, |v| bea(v, "sub_test_bea_1"));
     assert_eq!(deliver(port, &pro, None).await.1["outcome"], "tier_changed");
     let starter = event(UPDATED, &w.b_id, "evt_7", 1_795_300_100, |v| {
-        v["data"]["object"]["id"] = json!("sub_test_bea_2");
+        bea(v, "sub_test_bea_2");
         v["data"]["object"]["created"] = json!(1_795_300_090);
         v["data"]["object"]["items"]["data"][0]["price"]["id"] = json!("price_starter_monthly");
     });
     assert_eq!(deliver(port, &starter, None).await.1["outcome"], "tier_changed");
     assert_eq!(tier(&w.b_id).as_deref(), Some("starter"));
     // An update to the old one made after the move, still active: recorded, but the newer plan stands.
-    let late = event(UPDATED, &w.b_id, "evt_8a", 1_795_300_150, |v| v["data"]["object"]["id"] = json!("sub_test_bea_1"));
+    let late = event(UPDATED, &w.b_id, "evt_8a", 1_795_300_150, |v| bea(v, "sub_test_bea_1"));
     assert_eq!(deliver(port, &late, None).await.1["outcome"], "superseded");
     assert_eq!(tier(&w.b_id).as_deref(), Some("starter"));
-    let old_gone = event(DELETED, &w.b_id, "evt_8", 1_795_300_200, |v| v["data"]["object"]["id"] = json!("sub_test_bea_1"));
+    let old_gone = event(DELETED, &w.b_id, "evt_8", 1_795_300_200, |v| bea(v, "sub_test_bea_1"));
     assert_eq!(deliver(port, &old_gone, None).await.1["outcome"], "superseded");
     assert_eq!(tier(&w.b_id).as_deref(), Some("starter"));
     // One from before that cancellation, arriving after it, is stale.
-    let later = event(UPDATED, &w.b_id, "evt_8b", 1_795_300_180, |v| v["data"]["object"]["id"] = json!("sub_test_bea_1"));
+    let later = event(UPDATED, &w.b_id, "evt_8b", 1_795_300_180, |v| bea(v, "sub_test_bea_1"));
     assert_eq!(deliver(port, &later, None).await.1["outcome"], "stale");
     assert_eq!(tier(&w.b_id).as_deref(), Some("starter"));
     assert_eq!(app.db.subscription(&w.b_id).unwrap().subscription_id, "sub_test_bea_2");
@@ -475,7 +485,7 @@ async fn signed_subscription_events_set_the_users_tier() {
     assert_eq!(deliver(port, &old_late, None).await.1["outcome"], "stale");
     assert_eq!(tier(&w.a_id), None);
     let incomplete = event(UPDATED, &w.b_id, "evt_9", 1_795_300_300, |v| {
-        v["data"]["object"]["id"] = json!("sub_test_bea_2");
+        bea(v, "sub_test_bea_2");
         v["data"]["object"]["status"] = json!("incomplete");
     });
     assert_eq!(deliver(port, &incomplete, None).await.1["outcome"], "unchanged");
@@ -489,4 +499,339 @@ async fn signed_subscription_events_set_the_users_tier() {
     assert_eq!((bea["subscription"]["status"].as_str(), bea["subscription"]["subscriptionId"].as_str()), (Some("incomplete"), Some("sub_test_bea_2")));
     let synced = audit(port, admin, "action=billing.subscription_synced").await;
     assert!(synced.iter().any(|e| e["details"]["outcome"] == "superseded"), "{synced:?}");
+}
+
+// Checkout, the customer portal, and customer links (ADR 0041). Stripe is a fake on
+// loopback: nothing here reaches Stripe, and the key is made up.
+
+const KEY: &str = "sk_test_not_a_real_key_for_tests";
+const PUBLIC: &str = "https://bots.example.com";
+const CHECKOUT_DONE: &str = include_str!("../tests/fixtures/stripe/checkout.session.completed.json");
+const CUSTOMER_DELETED: &str = include_str!("../tests/fixtures/stripe/customer.deleted.json");
+
+/// One request the fake Stripe got.
+#[derive(Clone, Debug)]
+struct Seen {
+    path: String,
+    auth: String,
+    key: String,
+    version: String,
+    form: Vec<(String, String)>,
+}
+
+impl Seen {
+    fn get(&self, k: &str) -> Option<&str> {
+        self.form.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str())
+    }
+}
+
+/// Stripe's API as far as botd uses it: answers from `replies` first, else a new
+/// session; like Stripe, a repeated idempotency key gets the first answer again.
+#[derive(Clone, Default)]
+struct FakeStripe {
+    seen: Arc<std::sync::Mutex<Vec<Seen>>>,
+    replies: Arc<std::sync::Mutex<std::collections::VecDeque<(u16, Value)>>>,
+    answered: Arc<std::sync::Mutex<HashMap<String, (u16, Value)>>>,
+}
+
+impl FakeStripe {
+    fn seen(&self) -> Vec<Seen> {
+        self.seen.lock().unwrap().clone()
+    }
+    fn reply(&self, status: u16, body: Value) {
+        self.replies.lock().unwrap().push_back((status, body));
+    }
+}
+
+async fn fake_stripe() -> (String, FakeStripe) {
+    use axum::extract::{OriginalUri, State as S};
+    async fn handle(S(f): S<FakeStripe>, OriginalUri(uri): OriginalUri, headers: axum::http::HeaderMap, body: axum::body::Bytes) -> (StatusCode, Json<Value>) {
+        let h = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+        let form = url::form_urlencoded::parse(&body).into_owned().collect();
+        let seen = Seen { path: uri.path().into(), auth: h("authorization"), key: h("idempotency-key"), version: h("stripe-version"), form };
+        f.seen.lock().unwrap().push(seen.clone());
+        if let Some((code, v)) = f.answered.lock().unwrap().get(&seen.key) {
+            return (StatusCode::from_u16(*code).unwrap(), Json(v.clone()));
+        }
+        let n = f.seen.lock().unwrap().len();
+        let (code, v) = f.replies.lock().unwrap().pop_front().unwrap_or_else(|| match seen.path.as_str() {
+            "/v1/checkout/sessions" => (200, json!({ "id": format!("cs_test_{n}"), "object": "checkout.session", "url": format!("https://checkout.stripe.com/c/pay/cs_test_{n}") })),
+            _ => (200, json!({ "id": format!("bps_test_{n}"), "object": "billing_portal.session", "url": format!("https://billing.stripe.com/p/session/test_{n}") })),
+        });
+        if code < 500 {
+            f.answered.lock().unwrap().insert(seen.key, (code, v.clone()));
+        }
+        (StatusCode::from_u16(code).unwrap(), Json(v))
+    }
+    let f = FakeStripe::default();
+    let r = axum::Router::new().route("/v1/{*rest}", axum::routing::post(handle)).with_state(f.clone());
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, r).await.unwrap() });
+    (url, f)
+}
+
+/// `world(true)` with checkout, against a fake Stripe.
+async fn shop() -> (World, FakeStripe) {
+    let (url, f) = fake_stripe().await;
+    (world_with(Some(Billing::with_checkout(SECRET, KEY, &url, PUBLIC))).await, f)
+}
+
+async fn buy(w: &World, who: &str, tier: &str) -> (u16, Value) {
+    let (code, body) = call(w.port, "POST", "/api/billing/checkout", who, &json!({ "tier": tier }).to_string()).await;
+    (code, parse(&body))
+}
+
+#[tokio::test]
+async fn checkout_is_off_without_the_secret_key() {
+    for stripe in [false, true] {
+        let w = world(stripe).await;
+        let owned = w.app.db.create_bot_owned("Scout", "#fff", "waddle", "claude", None, false, &w.a_id, Visibility::Private);
+        for who in [w.a.clone(), w.admin.clone(), w.bots.auth(&owned.id)] {
+            for (m, p, body) in [("GET", "/api/billing", ""), ("POST", "/api/billing/checkout", r#"{"tier":"pro"}"#), ("POST", "/api/billing/portal", ""), ("POST", "/api/billing/checkout", "not json")] {
+                let (code, res) = call(w.port, m, p, &who, body).await;
+                assert_eq!((code, parse(&res)["error"].as_str()), (404, Some("Billing isn't set up on this server.")), "{m} {p} (webhook {stripe})");
+            }
+        }
+        let (_, usage) = call(w.port, "GET", "/api/usage", &w.admin, "").await;
+        assert_eq!((parse(&usage)["billing"].as_bool(), parse(&usage)["checkout"].as_bool()), (Some(stripe), Some(false)));
+    }
+}
+
+#[tokio::test]
+async fn people_buy_plans_with_a_price_through_stripe_checkout() {
+    let (w, stripe) = shop().await;
+    let port = w.port;
+
+    // Ada sees her plan and use, and the plans she can buy, without their price ids.
+    let (code, info) = call(port, "GET", "/api/billing", &w.a, "").await;
+    assert_eq!(code, 200, "{info}");
+    let info = parse(&info);
+    assert_eq!((info["plan"]["name"].as_str(), info["plan"]["usage"]["runs"].as_u64()), (Some("starter"), Some(0)));
+    let plans: Vec<(&str, bool)> = info["plans"].as_array().unwrap().iter().map(|p| (p["name"].as_str().unwrap(), p["current"] == true)).collect();
+    assert_eq!(plans, [("starter", true), ("pro", false)]);
+    assert!(!info.to_string().contains("price_"), "{info}");
+    assert_eq!((info["portal"].as_bool(), &info["subscription"], info["canChange"].as_bool()), (Some(false), &Value::Null, Some(true)));
+
+    // Read-only people see their plan but change nothing.
+    let (_, ro) = user_with(port, &w.admin, "ro@example.com", "readonly").await;
+    let (code, seen) = call(port, "GET", "/api/billing", &ro, "").await;
+    assert_eq!((code, parse(&seen)["canChange"].as_bool()), (200, Some(false)), "{seen}");
+    for p in ["/api/billing/checkout", "/api/billing/portal"] {
+        assert_eq!(call(port, "POST", p, &ro, r#"{"tier":"pro"}"#).await.0, 403, "{p}");
+    }
+
+    // Bots can't, and only plans with a price are for sale.
+    let bot = w.app.db.create_bot_owned("Scout", "#fff", "waddle", "claude", None, false, &w.a_id, Visibility::Private);
+    for (m, p) in [("GET", "/api/billing"), ("POST", "/api/billing/checkout"), ("POST", "/api/billing/portal")] {
+        assert_eq!(call(port, m, p, &w.bots.auth(&bot.id), r#"{"tier":"pro"}"#).await.0, 403, "{m} {p}");
+    }
+    for (tier, says) in [("self-host", "can't be bought here"), ("gold", "no plan called \"gold\""), ("", "Say which plan")] {
+        let (code, res) = buy(&w, &w.a, tier).await;
+        assert_eq!(code, 400, "{tier}: {res}");
+        assert!(res["error"].as_str().unwrap().contains(says), "{res}");
+    }
+    assert!(stripe.seen().is_empty());
+
+    // Pro: a Checkout Session for its first price, for Ada, back to the app's plan screen.
+    let minute = db::now() / 60_000;
+    let (code, res) = buy(&w, &w.a, "pro").await;
+    assert_eq!(code, 200, "{res}");
+    let url = res["url"].as_str().unwrap().to_string();
+    assert!(url.starts_with("https://checkout.stripe.com/"), "{url}");
+    let s = stripe.seen()[0].clone();
+    assert_eq!((s.path.as_str(), s.auth.as_str(), s.version.as_str()), ("/v1/checkout/sessions", "Bearer sk_test_not_a_real_key_for_tests", stripe::VERSION));
+    assert!(s.key.starts_with("superbot-checkout-"), "{s:?}");
+    for (k, v) in [
+        ("mode", "subscription"),
+        ("line_items[0][price]", "price_pro_monthly"),
+        ("line_items[0][quantity]", "1"),
+        ("client_reference_id", w.a_id.as_str()),
+        ("metadata[superbot_user_id]", w.a_id.as_str()),
+        ("metadata[superbot_tier]", "pro"),
+        ("subscription_data[metadata][superbot_user_id]", w.a_id.as_str()),
+        ("customer_email", "ada@example.com"),
+        ("success_url", "https://bots.example.com/app/plan?checkout=success"),
+        ("cancel_url", "https://bots.example.com/app/plan?checkout=cancelled"),
+    ] {
+        assert_eq!(s.get(k), Some(v), "{k}: {s:?}");
+    }
+    assert_eq!(s.get("customer"), None);
+    // A double click is the same request: the same key, so Stripe gives the same session.
+    let (_, again) = buy(&w, &w.a, "pro").await;
+    if db::now() / 60_000 == minute {
+        assert_eq!(stripe.seen()[1].key, s.key);
+        assert_eq!(again["url"].as_str(), Some(url.as_str()));
+    }
+    let created = audit(port, &w.admin, "action=billing.checkout_created").await;
+    let c = created.last().unwrap();
+    assert_eq!((c["actorId"].as_str(), c["targetId"].as_str(), c["outcome"].as_str()), (Some(w.a_id.as_str()), Some(w.a_id.as_str()), Some("success")), "{c}");
+    assert_eq!((c["details"]["tier"].as_str(), c["details"]["price"].as_str(), c["details"]["session"].as_str()), (Some("pro"), Some("price_pro_monthly"), Some("cs_test_1")));
+
+    // No billing account to manage until a checkout completes.
+    let (code, res) = call(port, "POST", "/api/billing/portal", &w.a, "").await;
+    assert_eq!(code, 409, "{res}");
+
+    // Stripe says the checkout completed: Ada is linked to her new customer, once.
+    let done = event(CHECKOUT_DONE, &w.a_id, "evt_c1", 1_794_990_000, |_| {});
+    assert_eq!(deliver(port, &done, None).await, (200, json!({ "received": true, "outcome": "customer_linked" })));
+    assert_eq!(deliver(port, &done, None).await.1["outcome"], "duplicate");
+    assert_eq!(w.app.db.customer_of(&w.a_id).as_deref(), Some("cus_test_ada"));
+    let linked = audit(port, &w.admin, "action=billing.customer_linked").await;
+    assert_eq!(linked.len(), 1, "{linked:?}");
+    let l = &linked[0];
+    assert_eq!((l["actorId"].as_str(), l["onBehalfOf"].as_str(), l["targetId"].as_str()), (Some("billing"), Some(w.a_id.as_str()), Some(w.a_id.as_str())));
+    assert_eq!((l["details"]["customer"].as_str(), l["details"]["via"].as_str()), (Some("cus_test_ada"), Some("checkout")));
+    // Her subscription's events set the plan, as before.
+    let sub = event(UPDATED, &w.a_id, "evt_s1", 1_795_000_000, |_| {});
+    assert_eq!(deliver(port, &sub, None).await.1["outcome"], "tier_changed");
+    let info = parse(&call(port, "GET", "/api/billing", &w.a, "").await.1);
+    assert_eq!((info["plan"]["name"].as_str(), info["portal"].as_bool(), info["subscription"]["status"].as_str()), (Some("pro"), Some(true), Some("active")));
+    assert_eq!(info["plans"][1]["current"], true);
+
+    // Paying already: another checkout would bill her twice, so she's sent to the portal.
+    let (code, res) = buy(&w, &w.a, "starter").await;
+    assert_eq!((code, res["portal"].as_bool()), (409, Some(true)), "{res}");
+    let denied = audit(port, &w.admin, "action=billing.checkout_created&outcome=denied").await;
+    assert_eq!(denied[0]["details"]["reason"], "already_subscribed");
+    let before = stripe.seen().len();
+    let (code, res) = call(port, "POST", "/api/billing/portal", &w.a, "").await;
+    assert_eq!(code, 200, "{res}");
+    let portal = parse(&res)["url"].as_str().unwrap().to_string();
+    assert!(portal.starts_with("https://billing.stripe.com/"), "{portal}");
+    let p = stripe.seen()[before].clone();
+    assert_eq!((p.path.as_str(), p.get("customer"), p.get("return_url")), ("/v1/billing_portal/sessions", Some("cus_test_ada"), Some("https://bots.example.com/app/plan")));
+    assert!(p.key.starts_with("superbot-portal-"), "{p:?}");
+    let opened = audit(port, &w.admin, "action=billing.portal_created").await;
+    assert_eq!((opened[0]["actorId"].as_str(), opened[0]["details"]["customer"].as_str()), (Some(w.a_id.as_str()), Some("cus_test_ada")));
+
+    // Bea's checkout knows nothing of Ada's customer.
+    let (code, _) = buy(&w, &w.b, "starter").await;
+    assert_eq!(code, 200);
+    let s = stripe.seen().last().unwrap().clone();
+    assert_eq!((s.get("customer"), s.get("customer_email"), s.get("line_items[0][price]")), (None, Some("bea@example.com"), Some("price_starter_monthly")));
+    // After her plan ends, a linked customer checks out as that customer.
+    let gone = event(DELETED, &w.a_id, "evt_s2", 1_795_100_000, |_| {});
+    assert_eq!(deliver(port, &gone, None).await.1["outcome"], "tier_changed");
+    assert_eq!(buy(&w, &w.a, "pro").await.0, 200);
+    let s = stripe.seen().last().unwrap().clone();
+    assert_eq!((s.get("customer"), s.get("customer_email")), (Some("cus_test_ada"), None));
+
+    // The page links are for the person, never in the audit log; nor is the key.
+    let all = call(port, "GET", "/api/audit?limit=500", &w.admin, "").await.1;
+    assert!(!all.contains(&portal) && !all.contains(&url) && !all.contains(KEY), "{all}");
+}
+
+#[tokio::test]
+async fn stripe_failures_are_retried_once_and_said_plainly() {
+    let (w, stripe) = shop().await;
+    // A 500, then an answer: retried with the same idempotency key.
+    stripe.reply(500, json!({ "error": { "type": "api_error" } }));
+    let (code, res) = buy(&w, &w.a, "pro").await;
+    assert_eq!(code, 200, "{res}");
+    let seen = stripe.seen();
+    assert_eq!((seen.len(), seen[0].key == seen[1].key), (2, true), "{seen:?}");
+
+    // Refused: not retried, and the person gets a plain 502.
+    stripe.reply(400, json!({ "error": { "type": "invalid_request_error", "code": "resource_missing", "message": "No such price: 'price_pro_monthly'", "param": "line_items[0][price]" } }));
+    let (code, res) = buy(&w, &w.b, "pro").await;
+    assert_eq!(code, 502, "{res}");
+    assert!(res["error"].as_str().unwrap().starts_with("Stripe couldn't open the checkout"), "{res}");
+    assert_eq!(stripe.seen().len(), 3);
+    let failed = audit(w.port, &w.admin, "action=billing.checkout_created&outcome=failure").await;
+    assert_eq!(failed[0]["details"]["reason"], "HTTP 400 invalid_request_error resource_missing");
+
+    // An answer without a link isn't a session.
+    stripe.reply(200, json!({ "id": "cs_test_x", "url": null }));
+    assert_eq!(buy(&w, &w.b, "starter").await.0, 502);
+
+    // Nobody there at all.
+    let closed = { tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap().local_addr().unwrap() };
+    let w = world_with(Some(Billing::with_checkout(SECRET, KEY, &format!("http://{closed}"), PUBLIC))).await;
+    let (code, res) = buy(&w, &w.a, "pro").await;
+    assert_eq!(code, 502, "{res}");
+    assert_eq!(audit(w.port, &w.admin, "action=billing.checkout_created&outcome=failure").await[0]["details"]["reason"], "no answer from Stripe");
+}
+
+#[tokio::test]
+async fn too_many_sessions_at_once_are_refused() {
+    let (w, stripe) = shop().await;
+    for n in 0..10 {
+        assert_eq!(buy(&w, &w.a, "pro").await.0, 200, "{n}");
+    }
+    let (code, res) = buy(&w, &w.a, "pro").await;
+    assert_eq!(code, 429, "{res}");
+    assert_eq!(stripe.seen().len(), 10);
+    // Per person: Bea still can.
+    assert_eq!(buy(&w, &w.b, "pro").await.0, 200);
+}
+
+#[tokio::test]
+async fn customers_tie_subscriptions_to_their_user() {
+    let w = world(true).await;
+    let port = w.port;
+    let tier = |u: &str| w.app.db.user(u).unwrap().tier;
+    let done = |user: &str, id: &str, f: &dyn Fn(&mut Value)| event(CHECKOUT_DONE, user, id, 1_794_990_000, f);
+    assert_eq!(deliver(port, &done(&w.a_id, "evt_c1", &|_| {}), None).await.1["outcome"], "customer_linked");
+
+    // A subscription made outside SuperBot's checkout, with no metadata, finds Ada
+    // through her customer.
+    let bare = event(UPDATED, &w.a_id, "evt_s1", 1_795_000_000, |v| {
+        v["data"]["object"]["metadata"] = json!({});
+        v["data"]["object"]["id"] = json!("sub_test_portal");
+    });
+    assert_eq!(deliver(port, &bare, None).await.1["outcome"], "tier_changed");
+    assert_eq!(tier(&w.a_id).as_deref(), Some("pro"));
+
+    // Ada's customer can't pay for Bea, whatever the metadata says.
+    let theirs = event(UPDATED, &w.b_id, "evt_s2", 1_795_000_100, |v| v["data"]["object"]["id"] = json!("sub_test_bea"));
+    assert_eq!(deliver(port, &theirs, None).await.1["outcome"], "ignored");
+    assert_eq!(audit(port, &w.admin, "action=billing.event_ignored").await[0]["details"]["reason"], "customer_of_another_user");
+    assert_eq!(tier(&w.b_id), None);
+    assert!(w.app.db.subscription_by_id("sub_test_bea").is_none());
+    let bea_with_adas = done(&w.b_id, "evt_c2", &|_| {});
+    assert_eq!(deliver(port, &bea_with_adas, None).await.1["outcome"], "ignored");
+    assert_eq!(audit(port, &w.admin, "action=billing.event_ignored").await[0]["details"]["reason"], "customer_of_another_user");
+
+    // Ada keeps the customer she has; a second one is recorded as ignored.
+    let second = done(&w.a_id, "evt_c3", &|v| v["data"]["object"]["customer"] = json!("cus_test_ada_2"));
+    assert_eq!(deliver(port, &second, None).await.1["outcome"], "ignored");
+    let i = &audit(port, &w.admin, "action=billing.event_ignored").await[0];
+    assert_eq!((i["details"]["reason"].as_str(), i["details"]["linked"].as_str()), (Some("user_has_another_customer"), Some("cus_test_ada")));
+    assert_eq!(w.app.db.customer_of(&w.a_id).as_deref(), Some("cus_test_ada"));
+
+    // A session naming two people, or nobody known, or with no customer, links nobody.
+    let mixed = done(&w.b_id, "evt_c4", &|v| v["data"]["object"]["client_reference_id"] = json!("someone-else"));
+    let nobody = done("u-nobody", "evt_c5", &|v| v["data"]["object"]["customer"] = json!("cus_test_x"));
+    let guest = done(&w.b_id, "evt_c6", &|v| v["data"]["object"]["customer"] = Value::Null);
+    for (body, reason) in [(mixed, "user_mismatch"), (nobody, "unknown_user"), (guest, "no_customer")] {
+        assert_eq!(deliver(port, &body, None).await.1["outcome"], "ignored", "{reason}");
+        assert_eq!(audit(port, &w.admin, "action=billing.event_ignored").await[0]["details"]["reason"], reason);
+    }
+    assert_eq!(w.app.db.customer_of(&w.b_id), None);
+
+    // A subscription event links its user's first customer too.
+    let bea = event(UPDATED, &w.b_id, "evt_s3", 1_795_000_200, |v| {
+        v["data"]["object"]["id"] = json!("sub_test_bea");
+        v["data"]["object"]["customer"] = json!("cus_test_bea");
+    });
+    assert_eq!(deliver(port, &bea, None).await.1["outcome"], "tier_changed");
+    assert_eq!(w.app.db.customer_of(&w.b_id).as_deref(), Some("cus_test_bea"));
+    let l = &audit(port, &w.admin, "action=billing.customer_linked").await[0];
+    assert_eq!((l["targetId"].as_str(), l["details"]["via"].as_str()), (Some(w.b_id.as_str()), Some("subscription")));
+
+    // Stripe deletes Ada's customer: the link goes, once; a customer nobody has changes nothing.
+    let deleted = event(CUSTOMER_DELETED, &w.a_id, "evt_d1", 1_795_600_000, |_| {});
+    assert_eq!(deliver(port, &deleted, None).await.1["outcome"], "customer_unlinked");
+    assert_eq!(deliver(port, &deleted, None).await.1["outcome"], "duplicate");
+    assert_eq!(w.app.db.customer_of(&w.a_id), None);
+    let u = &audit(port, &w.admin, "action=billing.customer_unlinked").await[0];
+    assert_eq!((u["targetId"].as_str(), u["details"]["customer"].as_str()), (Some(w.a_id.as_str()), Some("cus_test_ada")));
+    let unknown = event(CUSTOMER_DELETED, &w.a_id, "evt_d2", 1_795_600_100, |v| v["data"]["object"]["id"] = json!("cus_test_nobody"));
+    assert_eq!(deliver(port, &unknown, None).await.1["outcome"], "unchanged");
+
+    // Admins see who is linked to which customer.
+    let usage = parse(&call(port, "GET", "/api/usage", &w.admin, "").await.1);
+    let row = |id: &str| usage["users"].as_array().unwrap().iter().find(|u| u["user"]["id"] == id).unwrap().clone();
+    assert_eq!((row(&w.a_id)["customer"].clone(), row(&w.b_id)["customer"].as_str()), (Value::Null, Some("cus_test_bea")));
 }

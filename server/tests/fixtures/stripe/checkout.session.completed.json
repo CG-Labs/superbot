@@ -1,0 +1,34 @@
+{
+  "id": "evt_test_checkout_completed",
+  "object": "event",
+  "api_version": "2025-09-30.clover",
+  "created": 1794990000,
+  "livemode": false,
+  "pending_webhooks": 1,
+  "request": { "id": null, "idempotency_key": null },
+  "type": "checkout.session.completed",
+  "data": {
+    "object": {
+      "id": "cs_test_ada",
+      "object": "checkout.session",
+      "amount_subtotal": 2000,
+      "amount_total": 2000,
+      "cancel_url": "https://bots.example.com/app/plan?checkout=cancelled",
+      "client_reference_id": "{{USER_ID}}",
+      "created": 1794989900,
+      "currency": "gbp",
+      "customer": "cus_test_ada",
+      "customer_details": { "email": "ada@example.com", "name": null },
+      "customer_email": "ada@example.com",
+      "expires_at": 1795076300,
+      "livemode": false,
+      "metadata": { "superbot_user_id": "{{USER_ID}}", "superbot_tier": "pro" },
+      "mode": "subscription",
+      "payment_status": "paid",
+      "status": "complete",
+      "subscription": "sub_test_ada",
+      "success_url": "https://bots.example.com/app/plan?checkout=success",
+      "url": null
+    }
+  }
+}

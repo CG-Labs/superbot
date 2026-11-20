@@ -209,8 +209,43 @@ pub enum Applied {
     Superseded,
     /// The subscription belongs to another user.
     OtherUser,
+    /// Its customer is linked to another user (ADR 0041).
+    CustomerOfAnotherUser,
     Unchanged,
     Changed { from: Option<String>, to: Option<String> },
+}
+
+/// What linking a payment-provider customer to a user did (ADR 0041). A user has at most
+/// one customer and a customer pays for one user; the first link stands.
+#[derive(Debug, PartialEq)]
+pub enum Linked {
+    New,
+    Already,
+    /// The user is linked to this other customer already.
+    UserHasAnother(String),
+    /// The customer is linked to this other user already.
+    OfAnotherUser(String),
+}
+
+fn link_in(c: &Connection, user_id: &str, provider: &str, customer_id: &str, via: &str) -> rusqlite::Result<Linked> {
+    let by_customer: Option<String> = c.query_row("SELECT user_id FROM billing_customers WHERE customer_id = ?", [customer_id], |r| r.get(0)).optional()?;
+    if let Some(u) = by_customer {
+        return Ok(if u == user_id { Linked::Already } else { Linked::OfAnotherUser(u) });
+    }
+    let by_user: Option<String> = c.query_row("SELECT customer_id FROM billing_customers WHERE user_id = ?", [user_id], |r| r.get(0)).optional()?;
+    if let Some(other) = by_user {
+        return Ok(Linked::UserHasAnother(other));
+    }
+    c.execute(
+        "INSERT INTO billing_customers (user_id, provider, customer_id, linked_at, linked_via) VALUES (?, ?, ?, ?, ?)",
+        params![user_id, provider, customer_id, now(), via],
+    )?;
+    Ok(Linked::New)
+}
+
+/// Records a payment-provider event id. False when it was already applied.
+fn first_delivery(c: &Connection, event_id: &str, event_type: &str) -> rusqlite::Result<bool> {
+    Ok(c.execute("INSERT OR IGNORE INTO billing_events (event_id, type, received_at) VALUES (?, ?, ?)", params![event_id, event_type, now()])? == 1)
 }
 
 fn routine_row(r: &Row) -> rusqlite::Result<Routine> {
@@ -982,7 +1017,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 16] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 17] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -999,7 +1034,20 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 16] = [
     migrate_machine_placement,
     migrate_machine_upkeep,
     migrate_billing,
+    migrate_billing_customers,
 ];
+/// Users linked to their payment-provider customer (ADR 0041), at most one each way.
+fn migrate_billing_customers(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS billing_customers (
+          user_id TEXT PRIMARY KEY REFERENCES users(id),
+          provider TEXT NOT NULL,
+          customer_id TEXT NOT NULL UNIQUE,
+          linked_at INTEGER NOT NULL,
+          linked_via TEXT NOT NULL
+        );",
+    )
+}
 /// Harness CLIs and agent upgrades on machines (ADR 0039): what each agent last said,
 /// the plan sent to it, and an upgrade on its way, held, or failed.
 fn migrate_machine_upkeep(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
@@ -2242,18 +2290,27 @@ impl Db {
     /// arrive in: a late event for a replaced plan can't bring it back, and a new plan
     /// applies whenever the old one's cancellation arrives. `set_tier` false (a
     /// subscription not paid for yet) records it without changing any tier.
-    pub fn apply_subscription(&self, event_id: &str, event_type: &str, sub: &Subscription, set_tier: bool) -> Result<Applied, String> {
+    ///
+    /// The subscription's customer (ADR 0041) must not be another user's
+    /// (`CustomerOfAnotherUser`); a user with no customer yet is linked to it, and the
+    /// second value says how.
+    pub fn apply_subscription(&self, event_id: &str, event_type: &str, sub: &Subscription, set_tier: bool) -> Result<(Applied, Option<Linked>), String> {
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
-        let new = tx
-            .execute("INSERT OR IGNORE INTO billing_events (event_id, type, received_at) VALUES (?, ?, ?)", params![event_id, event_type, now()])
-            .map_err(|e| e.to_string())?;
-        if new == 0 {
-            return Ok(Applied::Duplicate);
+        if !first_delivery(&tx, event_id, event_type).map_err(|e| e.to_string())? {
+            return Ok((Applied::Duplicate, None));
         }
         let by_id = tx.query_row("SELECT * FROM subscriptions WHERE subscription_id = ?", [&sub.subscription_id], subscription_row).optional().map_err(|e| e.to_string())?;
+        let customer_user = |cus: &str| tx.query_row("SELECT user_id FROM billing_customers WHERE customer_id = ?", [cus], |r| r.get::<_, String>(0)).optional();
+        let others_customer = match (&by_id, &sub.customer_id) {
+            (Some(s), _) if s.user_id != sub.user_id => false,
+            (_, Some(cus)) => customer_user(cus).map_err(|e| e.to_string())?.is_some_and(|u| u != sub.user_id),
+            (_, None) => false,
+        };
         let outcome = if by_id.as_ref().is_some_and(|s| s.user_id != sub.user_id) {
             Applied::OtherUser
+        } else if others_customer {
+            Applied::CustomerOfAnotherUser
         } else if by_id.as_ref().is_some_and(|s| {
             // Stripe never revives a subscription it cancelled for good. Its `created` is
             // in seconds, so two events can tie; an ended state wins the tie.
@@ -2293,8 +2350,49 @@ impl Db {
                 }
             }
         };
+        let linked = match (&outcome, &sub.customer_id) {
+            (Applied::OtherUser | Applied::CustomerOfAnotherUser, _) | (_, None) => None,
+            (_, Some(cus)) => Some(link_in(&tx, &sub.user_id, &sub.provider, cus, "subscription").map_err(|e| e.to_string())?),
+        };
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(outcome)
+        Ok((outcome, linked))
+    }
+
+    /// The user's payment-provider customer (ADR 0041).
+    pub fn customer_of(&self, user_id: &str) -> Option<String> {
+        self.c().query_row("SELECT customer_id FROM billing_customers WHERE user_id = ?", [user_id], |r| r.get(0)).optional().ok().flatten()
+    }
+
+    /// The user a customer is linked to.
+    pub fn customer_user(&self, customer_id: &str) -> Option<String> {
+        self.c().query_row("SELECT user_id FROM billing_customers WHERE customer_id = ?", [customer_id], |r| r.get(0)).optional().ok().flatten()
+    }
+
+    /// Links a customer to a user for one provider event, in one transaction with
+    /// recording the event. None: the event was applied already.
+    pub fn link_customer(&self, event_id: &str, event_type: &str, user_id: &str, provider: &str, customer_id: &str, via: &str) -> Result<Option<Linked>, String> {
+        let c = self.c();
+        let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
+        if !first_delivery(&tx, event_id, event_type).map_err(|e| e.to_string())? {
+            return Ok(None);
+        }
+        let linked = link_in(&tx, user_id, provider, customer_id, via).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(Some(linked))
+    }
+
+    /// Drops a customer the provider deleted, for one provider event. `Ok(None)`: the
+    /// event was applied already; `Ok(Some(None))`: no user had that customer.
+    pub fn unlink_customer(&self, event_id: &str, event_type: &str, customer_id: &str) -> Result<Option<Option<String>>, String> {
+        let c = self.c();
+        let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
+        if !first_delivery(&tx, event_id, event_type).map_err(|e| e.to_string())? {
+            return Ok(None);
+        }
+        let user: Option<String> =
+            tx.query_row("DELETE FROM billing_customers WHERE customer_id = ? RETURNING user_id", [customer_id], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(Some(user))
     }
 
     // SSO identities (ADR 0014)

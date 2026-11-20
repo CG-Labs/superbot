@@ -570,7 +570,12 @@ fn usage_summary(v: &Value) -> String {
         Some(l) => format!("{}/{l}", used.as_u64().unwrap_or(0)),
         None => format!("{}/unlimited", used.as_u64().unwrap_or(0)),
     };
-    let mut out = format!("Billing: {}.\n", if v["billing"] == true { "Stripe webhook on" } else { "off" });
+    let billing = match (v["billing"] == true, v["checkout"] == true) {
+        (false, _) => "off",
+        (true, false) => "Stripe webhook on, checkout off",
+        (true, true) => "Stripe webhook and checkout on",
+    };
+    let mut out = format!("Billing: {billing}.\n");
     for u in v["users"].as_array().into_iter().flatten() {
         let (p, use_) = (&u["plan"], &u["plan"]["usage"]);
         let who = u["user"]["email"].as_str().or(u["user"]["name"].as_str()).unwrap_or_default();
@@ -591,6 +596,9 @@ fn usage_summary(v: &Value) -> String {
         }
         if let Some(st) = u["subscription"]["status"].as_str() {
             line += &format!("; Stripe {st}");
+        }
+        if let Some(c) = u["customer"].as_str() {
+            line += &format!("; customer {c}");
         }
         let over: Vec<&str> = u["over"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
         if !over.is_empty() {
@@ -905,17 +913,18 @@ mod tests {
 
     #[test]
     fn usage_summary_shows_use_against_limits() {
-        let v = json!({ "billing": true, "users": [
+        let v = json!({ "billing": true, "checkout": true, "users": [
             { "user": { "email": "ada@example.com" }, "over": ["bots", "machineType"],
               "plan": { "label": "Starter", "limits": { "maxBots": 2, "monthlyRuns": 300, "dailyRoutineRuns": 24, "machineType": "g6-standard-1" },
                         "usage": { "bots": 3, "runs": 12, "period": "2026-11", "routineRuns": 4, "day": "2026-11-20" } },
-              "machine": { "plan": "g6-standard-2", "state": "running" }, "subscription": { "status": "active" } },
+              "machine": { "plan": "g6-standard-2", "state": "running" }, "subscription": { "status": "active" }, "customer": "cus_123" },
             { "user": { "name": "Owner" }, "over": [], "machine": null, "subscription": null,
               "plan": { "label": "Self-host", "limits": {}, "usage": { "bots": 1, "runs": 0, "period": "2026-11", "routineRuns": 0, "day": "2026-11-20" } } },
         ]});
         let out = usage_summary(&v);
-        assert!(out.starts_with("Billing: Stripe webhook on.\n"), "{out}");
-        assert!(out.contains("ada@example.com: Starter plan; Bots 3/2; runs 12/300 in 2026-11; routine runs 4/24 on 2026-11-20; machine g6-standard-2 (running), plan size g6-standard-1; Stripe active; OVER: bots, machineType\n"), "{out}");
+        assert!(out.starts_with("Billing: Stripe webhook and checkout on.\n"), "{out}");
+        assert!(out.contains("ada@example.com: Starter plan; Bots 3/2; runs 12/300 in 2026-11; routine runs 4/24 on 2026-11-20; machine g6-standard-2 (running), plan size g6-standard-1; Stripe active; customer cus_123; OVER: bots, machineType\n"), "{out}");
+        assert!(usage_summary(&json!({ "billing": true, "users": [] })).starts_with("Billing: Stripe webhook on, checkout off.\n"));
         assert!(out.contains("Owner: Self-host plan; Bots 1/unlimited; runs 0/unlimited in 2026-11; routine runs 0/unlimited on 2026-11-20\n"), "{out}");
     }
 
