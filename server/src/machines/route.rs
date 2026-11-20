@@ -124,13 +124,23 @@ impl Refusal {
 
     /// What the Bot tells the user.
     pub fn message(&self) -> String {
+        self.message_in(true)
+    }
+
+    /// `message`, with the machine's own errors and versions only if `detail`: a shared
+    /// Bot's chat is read by others than its owner (ADR 0046).
+    pub fn message_in(&self, detail: bool) -> String {
+        let quiet = |s: &str, wrap: fn(&str) -> String| if detail { wrap(s) } else { String::new() };
         match self {
             Refusal::NoMachine => "I can't run yet: you don't have a computer. Ask an admin to set one up for you.".into(),
             Refusal::NotAssigned => "I can't run yet: your computer isn't assigned to you. Ask an admin to assign it.".into(),
             Refusal::NotReady(s) => format!("I can't run yet: your computer is {}. Try again when it's running.", s.as_str()),
             Refusal::NotEnrolled => "I can't run yet: your computer hasn't connected to this server. Ask an admin to check on it.".into(),
-            Refusal::Offline(e) => format!("I didn't run: your computer is offline ({e}). Try again soon; if it stays offline, ask an admin to check on it."),
-            Refusal::Outdated(v) => format!("I didn't run: your computer's agent ({v}) is too old to run Bots. Ask an admin to update it."),
+            Refusal::Offline(e) => format!(
+                "I didn't run: your computer is offline{}. Try again soon; if it stays offline, ask an admin to check on it.",
+                quiet(e, |e| format!(" ({e})"))
+            ),
+            Refusal::Outdated(v) => format!("I didn't run: your computer's agent{} is too old to run Bots. Ask an admin to update it.", quiet(v, |v| format!(" ({v})"))),
             Refusal::HarnessMissing(h) => format!("I didn't run: {h} isn't installed on your computer. Ask an admin to install it, or switch me to another harness."),
             Refusal::HarnessInstalling(h) => format!("I didn't run: {h} is still being installed on your computer. Try again in a few minutes."),
             Refusal::Upgrading => "I didn't run: your computer's agent is updating itself. Try again in a minute.".into(),
@@ -140,6 +150,26 @@ impl Refusal {
             Refusal::BotUserPending => "I didn't run: your computer is still setting up a separate account for your Bots. Try again in a few minutes.".into(),
             Refusal::BotUserFailed => "I didn't run: your computer couldn't set up a separate account for your Bots. Ask an admin to look at it (`botctl machine agent <your email>`).".into(),
         }
+    }
+
+    /// What a shared Bot tells everyone who uses it (ADR 0046): whose computer it is,
+    /// and never that computer's state, errors, or versions; those stay in the audit log.
+    pub fn message_for(&self, owner: Option<&str>) -> String {
+        let o = owner.unwrap_or("my owner");
+        let why = match self {
+            Refusal::NoMachine | Refusal::NotAssigned | Refusal::NotEnrolled => {
+                return format!("I can't run yet: I run on {o}'s computer, and it isn't set up. {o} or an admin can fix that.");
+            }
+            Refusal::NotReady(_) | Refusal::Offline(_) => "it isn't reachable right now",
+            Refusal::HarnessMissing(_) | Refusal::HarnessInstalling(_) => "it doesn't have my harness ready",
+            Refusal::NotLoggedIn(h) => {
+                return format!("I didn't run: {h} isn't logged in for me on {o}'s computer. An admin can log it in there, or save a server-wide key for it.");
+            }
+            Refusal::Outdated(_) | Refusal::Upgrading | Refusal::NoBotctl | Refusal::FolderCopying | Refusal::BotUserPending | Refusal::BotUserFailed => {
+                "it isn't ready to run Bots"
+            }
+        };
+        format!("I didn't run: I run on {o}'s computer, and {why}. Try again later; if it lasts, tell {o} or an admin.")
     }
 }
 
@@ -322,6 +352,28 @@ pub mod recording {
 mod tests {
     use super::*;
     use crate::db::{Machine, NewMachine};
+
+    #[test]
+    fn a_shared_bot_says_whose_computer_it_is_and_nothing_inside() {
+        let all = [
+            Refusal::NoMachine,
+            Refusal::NotReady(State::Suspended),
+            Refusal::Offline("connection refused at 192.0.2.7".into()),
+            Refusal::Outdated("0.1.0-old".into()),
+            Refusal::HarnessMissing("claude".into()),
+            Refusal::NotLoggedIn("claude".into()),
+            Refusal::BotUserFailed,
+        ];
+        for r in &all {
+            let m = r.message_for(Some("Ada"));
+            assert!(m.contains("Ada's computer"), "{m}");
+            assert!(!m.contains("your") && !m.contains("192.0.2.7") && !m.contains("0.1.0-old") && !m.contains("suspended") && !m.contains("botctl"), "{m}");
+            let own = r.message_in(false);
+            assert!(!own.contains("192.0.2.7") && !own.contains("0.1.0-old"), "{own}");
+        }
+        assert!(Refusal::Offline("refused".into()).message().contains("offline (refused)"), "the owner's private Bots keep the detail");
+        assert!(Refusal::NoMachine.message_for(None).contains("my owner's computer"));
+    }
 
     fn machine(db: &Db, user: &str, state: State) -> Machine {
         let m = db

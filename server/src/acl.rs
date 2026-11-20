@@ -94,6 +94,32 @@ pub fn access(user_id: &str, role: Role, owner_id: &str, visibility: Visibility,
     if role == Role::Readonly { base.min(Access::View) } else { base }
 }
 
+/// How a shared Bot behaves when someone other than its owner uses it (ADR 0046).
+/// `SHARED_BOTS`; `isolated` unless MACHINE_ROUTING is off, and always with it on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SharedBots {
+    /// As before: a Bot acts with its owner's access, keys and facts, whoever asked.
+    #[default]
+    Open,
+    /// A run for someone else reaches no Bot that person can't, gets the server's keys
+    /// but not its owner's own, nor its owner's facts; a disabled owner's Bots don't run;
+    /// new Bots are private.
+    Isolated,
+}
+
+impl SharedBots {
+    /// `routed`: MACHINE_ROUTING isn't off. Bots on users' own machines need `isolated`.
+    pub fn parse(raw: &str, routed: bool) -> Result<SharedBots, String> {
+        match (raw.trim().to_ascii_lowercase().as_str(), routed) {
+            ("", true) | ("isolated", _) => Ok(SharedBots::Isolated),
+            ("", false) | ("open", false) => Ok(SharedBots::Open),
+            ("open", true) => Err("SHARED_BOTS=open can't be used with MACHINE_ROUTING on or assigned: Bots on users' own machines need isolated shared Bots".into()),
+            (v, _) => Err(format!("SHARED_BOTS must be open or isolated, not \"{v}\"")),
+        }
+    }
+}
+
 /// Whose access a request has, for ACL checks.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Viewer {
@@ -102,6 +128,9 @@ pub enum Viewer {
     User { id: String, role: Role },
     /// A person without a user record. Only reachable if the owner account is missing.
     Nobody,
+    /// A Bot's run for someone other than its owner (ADR 0046): the lesser of its
+    /// owner's access and theirs, Bot by Bot.
+    Within(Box<Viewer>, Box<Viewer>),
 }
 
 impl Viewer {
@@ -118,11 +147,26 @@ impl Viewer {
     /// The access a Bot acts with toward other Bots: its owner's, as the user's role is now.
     /// A Bot whose owner is disabled or gone acts with none.
     pub fn owner_of(db: &Db, bot: &Bot) -> Viewer {
-        match db.user(&bot.owner_id) {
+        Viewer::person(db, &bot.owner_id)
+    }
+
+    /// A user's access as their role is now. Disabled or gone: none.
+    pub fn person(db: &Db, user_id: &str) -> Viewer {
+        match db.user(user_id) {
             Some(u) if !u.active() => Viewer::Nobody,
             Some(u) if u.role == Role::Admin => Viewer::All,
             Some(u) => Viewer::User { id: u.id, role: u.role },
             None => Viewer::Nobody,
+        }
+    }
+
+    /// No more than both: `self` capped by `other`.
+    pub fn within(self, other: Viewer) -> Viewer {
+        match (self, other) {
+            (Viewer::Nobody, _) | (_, Viewer::Nobody) => Viewer::Nobody,
+            (v, Viewer::All) | (Viewer::All, v) => v,
+            (a, b) if a == b => a,
+            (a, b) => Viewer::Within(Box::new(a), Box::new(b)),
         }
     }
 
@@ -131,11 +175,22 @@ impl Viewer {
             Viewer::All => Access::Manage,
             Viewer::Nobody => Access::None,
             Viewer::User { id, role } => access(id, *role, &bot.owner_id, bot.visibility, db.grant(&bot.id, id)),
+            Viewer::Within(a, b) => a.access(db, bot).min(b.access(db, bot)),
         }
     }
 
     /// Every Bot this viewer can see, with its access, in the usual order.
     pub fn bots(&self, db: &Db) -> Vec<(Bot, Access)> {
+        if let Viewer::Within(a, b) = self {
+            return a
+                .bots(db)
+                .into_iter()
+                .filter_map(|(bot, x)| {
+                    let both = x.min(b.access(db, &bot));
+                    (both > Access::None).then_some((bot, both))
+                })
+                .collect();
+        }
         let grants = match self {
             Viewer::User { id, .. } => db.user_grants(id),
             _ => HashMap::new(),
@@ -145,7 +200,7 @@ impl Viewer {
             .filter_map(|b| {
                 let a = match self {
                     Viewer::All => Access::Manage,
-                    Viewer::Nobody => Access::None,
+                    Viewer::Nobody | Viewer::Within(..) => Access::None,
                     Viewer::User { id, role } => access(id, *role, &b.owner_id, b.visibility, grants.get(&b.id).copied()),
                 };
                 (a > Access::None).then_some((b, a))
@@ -256,6 +311,44 @@ mod tests {
         assert_eq!(Grant::parse("VIEWER"), Some(Grant::Viewer));
         assert_eq!(Grant::parse("owner"), Option::None);
         assert_eq!(serde_json::to_value(Access::Operate).unwrap(), json!("operate"));
+    }
+
+    #[test]
+    fn shared_bots_are_isolated_whenever_bots_run_on_users_machines() {
+        assert_eq!(SharedBots::parse("", false), Ok(SharedBots::Open), "self-host: as before");
+        assert_eq!(SharedBots::parse("", true), Ok(SharedBots::Isolated));
+        assert_eq!(SharedBots::parse(" Isolated ", false), Ok(SharedBots::Isolated), "self-host may opt in");
+        assert_eq!(SharedBots::parse("open", false), Ok(SharedBots::Open));
+        assert!(SharedBots::parse("open", true).unwrap_err().contains("MACHINE_ROUTING"));
+        assert!(SharedBots::parse("team", false).is_err());
+    }
+
+    #[test]
+    fn a_run_for_someone_else_reaches_no_more_than_both() {
+        let db = Db::open(&crate::db::temp_path("acl-within").join("app.sqlite")).unwrap();
+        for (id, role) in [("ada", Role::Member), ("bea", Role::Member), ("root", Role::Admin)] {
+            db.create_user(Some(id), None, id, role).unwrap();
+        }
+        let team = db.create_bot_owned("Team", "#fff", "waddle", "claude", None, false, "ada", Visibility::Shared);
+        let ledger = db.create_bot_owned("Ledger", "#fff", "waddle", "claude", None, false, "ada", Visibility::Private);
+        let scout = db.create_bot_owned("Scout", "#fff", "waddle", "claude", None, false, "bea", Visibility::Private);
+        let notes = db.create_bot_owned("Notes", "#fff", "waddle", "claude", None, false, "bea", Visibility::Shared);
+        let (ada, bea) = (Viewer::person(&db, "ada"), Viewer::person(&db, "bea"));
+        let capped = ada.clone().within(bea.clone());
+        assert!(matches!(capped, Viewer::Within(..)));
+        let names = |v: &Viewer| v.bots(&db).into_iter().map(|(b, a)| (b.name, a)).collect::<Vec<_>>();
+        assert_eq!(names(&capped), vec![("Team".to_string(), Operate), ("Notes".to_string(), Operate)], "never Ada's private Bot or Bea's");
+        assert_eq!(capped.access(&db, &ledger), HIDDEN);
+        assert_eq!(capped.access(&db, &scout), HIDDEN, "nor a private Bot of the asker's that the owner can't see");
+        assert_eq!(capped.access(&db, &team), Operate);
+        assert_eq!(capped.access(&db, &notes), Operate, "both can use the asker's shared Bot");
+        assert_eq!(ada.access(&db, &ledger), Manage, "Ada's own runs are unchanged");
+
+        assert_eq!(ada.clone().within(Viewer::person(&db, "root")), ada, "an admin asking adds no cap");
+        assert_eq!(Viewer::All.within(bea.clone()), bea);
+        assert_eq!(ada.clone().within(ada.clone()), ada);
+        db.update_user("bea", crate::db::UserPatch { status: Some("disabled"), ..Default::default() }).unwrap();
+        assert_eq!(ada.within(Viewer::person(&db, "bea")), Viewer::Nobody, "a disabled asker reaches nothing");
     }
 
     #[test]

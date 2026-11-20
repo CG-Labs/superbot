@@ -375,16 +375,16 @@ impl ControlPlane {
         route::target(db, self, user_id)
     }
 
-    /// Whether a run of `bin` for `owner` may start on `machine_id` now, beyond `route::fit`:
-    /// the Bots' own user is ready there (ADR 0043), their first folder copy is done and
-    /// the harness is logged in there (ADR 0041).
-    pub fn ready(&self, app: &App, hb: &wire::Heartbeat, owner: &str, machine_id: &str, bin: &str) -> Result<(), route::Refusal> {
+    /// Whether a run of `bin` may start on `machine_id` now, beyond `route::fit`: the Bots'
+    /// own user is ready there (ADR 0043), their first folder copy is done and the harness
+    /// is logged in there (ADR 0041) or keyed. `keys`: whose own keys the run gets, if any.
+    pub fn ready(&self, app: &App, hb: &wire::Heartbeat, keys: Option<&str>, machine_id: &str, bin: &str) -> Result<(), route::Refusal> {
         let Some(e) = &self.enrollment else { return Ok(()) };
         botuser::check_run(e, hb)?;
         if folder::first_copy_running(app, e, machine_id) {
             return Err(route::Refusal::FolderCopying);
         }
-        logins::check_run(e, hb, owner, bin)
+        logins::check_run(e, hb, keys, bin)
     }
 
     #[cfg(test)]

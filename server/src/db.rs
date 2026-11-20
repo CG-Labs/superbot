@@ -78,6 +78,9 @@ pub struct Routine {
     pub enabled: bool,
     pub last_run_at: Option<i64>,
     pub created_at: i64,
+    /// Who last wrote its instruction (ADR 0046); its runs are for them. None: from
+    /// before, so its Bot's owner.
+    pub author_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -264,6 +267,7 @@ fn routine_row(r: &Row) -> rusqlite::Result<Routine> {
         enabled: r.get("enabled")?,
         last_run_at: r.get("last_run_at")?,
         created_at: r.get("created_at")?,
+        author_id: r.get("author_id")?,
     })
 }
 
@@ -1023,7 +1027,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 17] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 18] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1041,7 +1045,19 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 17] = [
     migrate_machine_upkeep,
     migrate_billing,
     migrate_billing_customers,
+    migrate_routine_authors,
 ];
+
+/// Who wrote each routine's instruction, so its runs are for them (ADR 0046). Routines
+/// from before have none, and run for their Bot's owner as they did.
+fn migrate_routine_authors(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('routines') WHERE name = 'author_id'", [], |r| r.get(0))?;
+    if !has {
+        c.execute_batch("ALTER TABLE routines ADD COLUMN author_id TEXT;")?;
+    }
+    Ok(())
+}
+
 /// Users linked to their payment-provider customer (ADR 0042), at most one each way;
 /// customers the provider deleted, which are never linked again; and each user's open
 /// checkout, closed before another is opened so only one can be paid. Subscribers from
@@ -1924,6 +1940,10 @@ impl Db {
         if let Some(v) = cron { set("cron", &v) }
         if let Some(v) = instruction { set("instruction", &v) }
         if let Some(v) = enabled { set("enabled", &v) }
+    }
+
+    pub fn set_routine_author(&self, id: &str, author: &str) {
+        self.c().execute("UPDATE routines SET author_id = ? WHERE id = ?", params![author, id]).unwrap();
     }
 
     pub fn routine_ran(&self, id: &str, at: i64) {
