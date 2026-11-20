@@ -17,7 +17,8 @@ pub fn caches(home: &Path) -> Vec<PathBuf> {
     CACHE_DIRS.iter().map(|d| home.join(d)).filter(|p| plain_down_to(home, p)).collect()
 }
 
-/// [`caches`], after making the missing ones (mode 0700). Run it as the user the run
+/// [`caches`], after making the missing ones (mode 0700, the folders on the way 0755,
+/// whatever the umask). Run it as the user the run
 /// is, in that user's HOME, so the folders are theirs. Never through a link: a folder
 /// on the way that is a link, or not a folder, leaves that cache out.
 pub fn ensure_caches(home: &Path) -> Vec<PathBuf> {
@@ -27,12 +28,18 @@ pub fn ensure_caches(home: &Path) -> Vec<PathBuf> {
     }
     for d in CACHE_DIRS {
         let mut at = home.to_path_buf();
-        for c in Path::new(d).components() {
+        let last = Path::new(d).components().count();
+        for (i, c) in Path::new(d).components().enumerate() {
             at.push(c);
+            // Folders on the way stay searchable so botd can still check the path to
+            // a per-user account's caches on later runs ([`makeable_caches`]).
+            let mode = if i + 1 == last { 0o700 } else { 0o755 };
             match std::fs::symlink_metadata(&at) {
                 Ok(m) if m.file_type().is_dir() => continue,
                 Ok(_) => break,
-                Err(_) if std::fs::DirBuilder::new().mode(0o700).create(&at).is_ok() => continue,
+                Err(_) if std::fs::DirBuilder::new().mode(mode).create(&at).is_ok() => {
+                    let _ = std::fs::set_permissions(&at, std::os::unix::fs::PermissionsExt::from_mode(mode));
+                }
                 Err(_) => break,
             }
         }
@@ -171,6 +178,7 @@ mod tests {
         assert_eq!(made, want);
         assert!(!outside.join("caches").exists(), "nothing made through the link");
         assert_eq!(std::fs::metadata(home.join(".cargo/registry")).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(home.join(".cargo")).unwrap().permissions().mode() & 0o777, 0o755, "the way there stays searchable");
         assert_eq!(ensure_caches(&home), want, "the same again");
         let fresh = temp_home("fresh");
         std::os::unix::fs::symlink(&outside, fresh.join(".npm")).unwrap();
