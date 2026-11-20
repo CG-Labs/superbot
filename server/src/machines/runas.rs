@@ -465,6 +465,70 @@ pub fn chmod_dir(p: &Path, mode: u32) -> io::Result<()> {
     )
 }
 
+/// Moves `from` to `<base>/<under>.../<name>`, making the folders under `base` as `ids`
+/// where they're missing. Nothing below `base` is followed if it's a link, and each
+/// folder there must be `ids`', so whoever owns them can't steer the move elsewhere. A
+/// name that's taken becomes `<name>-2`, `<name>-3`... Returns where it went.
+pub fn move_into(
+    from: &Path,
+    base: &Path,
+    under: &[&str],
+    name: &str,
+    ids: Ids,
+) -> io::Result<std::path::PathBuf> {
+    let c = |b: &[u8]| CString::new(b).map_err(io::Error::other);
+    let dir_flags = libc::O_RDONLY | libc::O_DIRECTORY;
+    let (Some(parent), Some(leaf)) = (from.parent(), from.file_name()) else {
+        return Err(io::Error::other("nothing to move"));
+    };
+    let leaf = c(leaf.as_bytes())?;
+    let src = open_at(libc::AT_FDCWD, &c(parent.as_os_str().as_bytes())?, dir_flags)?;
+    let mut dir = open_at(libc::AT_FDCWD, &c(base.as_os_str().as_bytes())?, dir_flags)?;
+    let mut to = base.to_path_buf();
+    for part in under {
+        let p = c(part.as_bytes())?;
+        to.push(part);
+        // SAFETY: an open descriptor and a C string.
+        let r = as_user(Some(ids), || unsafe { libc::mkdirat(dir.as_raw_fd(), p.as_ptr(), 0o700) })?;
+        if r < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EEXIST) {
+                return Err(e);
+            }
+        }
+        let next = open_at(dir.as_raw_fd(), &p, dir_flags)?;
+        if fstat(&next)?.st_uid != ids.uid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} isn't the Bots' user's", to.display()),
+            ));
+        }
+        dir = next;
+    }
+    for n in 1..=100 {
+        let tried = if n == 1 { name.to_string() } else { format!("{name}-{n}") };
+        let t = c(tried.as_bytes())?;
+        // SAFETY: open descriptors and C strings; never replaces what's there.
+        let r = unsafe {
+            libc::renameat2(
+                src.as_raw_fd(),
+                leaf.as_ptr(),
+                dir.as_raw_fd(),
+                t.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if r == 0 {
+            return Ok(to.join(tried));
+        }
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EEXIST) {
+            return Err(e);
+        }
+    }
+    Err(io::Error::other(format!("{name} and the next 99 names are taken")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,6 +645,37 @@ mod tests {
         assert_eq!(mode(&home.join("a/b/f")), 0o755);
         chmod_dir(&home, 0o711).unwrap();
         assert_eq!(mode(&home), 0o711);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_move_into_a_home_never_follows_links_and_never_replaces() {
+        let d = scratch("move");
+        let (base, outside) = (d.join("home"), d.join("outside"));
+        std::fs::create_dir_all(base.join("work")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let staged = |n: &str| {
+            let p = d.join(n);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("notes.md"), n).unwrap();
+            p
+        };
+
+        let to = move_into(&staged("a"), &base, &["work", "from-teammates"], "bea", me()).unwrap();
+        assert_eq!(to, base.join("work/from-teammates/bea"));
+        assert_eq!(std::fs::read_to_string(to.join("notes.md")).unwrap(), "a");
+        assert_eq!(std::fs::symlink_metadata(base.join("work/from-teammates")).unwrap().mode() & 0o777, 0o700);
+        let again = move_into(&staged("b"), &base, &["work", "from-teammates"], "bea", me()).unwrap();
+        assert_eq!(again, base.join("work/from-teammates/bea-2"), "never over what's there");
+        assert_eq!(std::fs::read_to_string(to.join("notes.md")).unwrap(), "a");
+
+        // A folder on the way that's a link is refused, and nothing lands where it points.
+        std::fs::remove_dir_all(base.join("work")).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("work")).unwrap();
+        let c = staged("c");
+        assert!(move_into(&c, &base, &["work", "from-teammates"], "bea", me()).is_err());
+        assert!(c.join("notes.md").is_file(), "left where it was");
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&d);
     }
 }
