@@ -16,7 +16,6 @@
 //!   certificate live (default /var/lib/superbot-machine).
 //! - `SUPERBOT_HOME`: where Bots work (default `<state dir>/home`).
 //! - `SUPERBOT_AGENT_API`: the relay to botd's API, loopback (default 127.0.0.1:7444).
-//! - `SUPERBOT_BOTCTL`: botctl on this machine (default /usr/local/bin/botctl).
 //! - `SUPERBOT_HARNESS_PATH`: PATH for harnesses (default `<home>/.local/bin`, then
 //!   the system's).
 //! - `SUPERBOT_MAX_JOBS`: jobs at once (default 8).
@@ -48,6 +47,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PING_EVERY: Duration = Duration::from_secs(15);
 /// The largest request a Bot may send botd through the relay.
 pub const MAX_RELAY_BODY: usize = 32 << 20;
+/// Where the machine image installs botctl.
+pub const BOTCTL: &str = "/usr/local/bin/botctl";
 
 #[derive(Clone)]
 pub struct Config {
@@ -144,9 +145,7 @@ impl Config {
             token_file: var("SUPERBOT_ENROLL_TOKEN_FILE").map(PathBuf::from),
             home,
             api_listen,
-            botctl: var("SUPERBOT_BOTCTL")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| "/usr/local/bin/botctl".into()),
+            botctl: BOTCTL.into(),
             harness_path,
             max_jobs,
         })
