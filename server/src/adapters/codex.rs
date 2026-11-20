@@ -79,6 +79,15 @@ impl Adapter for Codex {
         Some(&["login"])
     }
 
+    /// The device code: nothing on a remote machine can take the browser's callback.
+    fn machine_login(&self) -> Option<super::MachineLogin> {
+        Some(super::MachineLogin {
+            args: &["login", "--device-auth"],
+            files: &[".codex/auth.json"],
+            keys: &["OPENAI_API_KEY", "CODEX_API_KEY"],
+        })
+    }
+
     fn models(&self) -> Vec<ModelOption> {
         let v: Value = serde_json::from_str(&output("codex", &["debug", "models"])).unwrap_or_default();
         v["models"]

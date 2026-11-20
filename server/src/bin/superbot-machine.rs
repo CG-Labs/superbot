@@ -13,8 +13,12 @@
 mod agent;
 #[path = "../machines/job.rs"]
 mod job;
+#[path = "../machines/landing.rs"]
+mod landing;
 #[path = "../machines/pki.rs"]
 mod pki;
+#[path = "../machines/terminal.rs"]
+mod terminal;
 #[path = "../machines/tools.rs"]
 mod tools;
 #[path = "../machines/upgrade.rs"]

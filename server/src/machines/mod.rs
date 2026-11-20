@@ -12,11 +12,17 @@ pub mod enroll;
 #[cfg(test)]
 pub mod fake;
 pub mod firewall;
+pub mod folder;
 pub mod job;
+#[cfg(test)]
+pub mod landing;
 pub mod linode;
+pub mod logins;
 pub mod pki;
 pub mod provider;
 pub mod route;
+#[cfg(test)]
+pub mod terminal;
 pub mod tools;
 #[cfg(test)]
 pub mod upgrade;
@@ -365,6 +371,16 @@ impl ControlPlane {
     /// Where `user_id`'s Bots run (`route::target`).
     pub fn route(&self, db: &crate::db::Db, user_id: &str) -> Result<route::Target, route::Refusal> {
         route::target(db, self, user_id)
+    }
+
+    /// Whether a run of `bin` for `owner` may start on `machine_id` now, beyond `route::fit`
+    /// (ADR 0041): their first folder copy is done and the harness is logged in there.
+    pub fn ready(&self, app: &App, hb: &wire::Heartbeat, owner: &str, machine_id: &str, bin: &str) -> Result<(), route::Refusal> {
+        let Some(e) = &self.enrollment else { return Ok(()) };
+        if folder::first_copy_running(app, e, machine_id) {
+            return Err(route::Refusal::FolderCopying);
+        }
+        logins::check_run(e, hb, owner, bin)
     }
 
     #[cfg(test)]
@@ -772,7 +788,7 @@ pub async fn reconcile(app: &App, cp: &ControlPlane) -> Value {
 /// Asks every enrolled running machine's agent how it is, a few at a time, sends
 /// what's due to those that answered (`upkeep`), and returns how many did. None when enrollment is off. Heartbeats change only the
 /// agent columns, so they don't take the lock.
-pub async fn heartbeats(app: &App, cp: &ControlPlane) -> Option<usize> {
+pub async fn heartbeats(app: &AppState, cp: &ControlPlane) -> Option<usize> {
     use futures_util::StreamExt;
     let e = cp.enrollment.as_ref()?;
     let enrolled = app.db.machines(Some(State::Running)).into_iter().filter(|m| m.enrollment == "enrolled");
@@ -785,6 +801,7 @@ pub async fn heartbeats(app: &App, cp: &ControlPlane) -> Option<usize> {
                 return false;
             };
             upkeep::follow_up(app, cp, e, &m.id, &hb).await;
+            folder::follow_up(app, e, &m, &hb);
             true
         })
         .buffer_unordered(HEARTBEATS_AT_ONCE)
@@ -1405,6 +1422,7 @@ pub async fn assign(
         if app.db.assign_machine(&m.id, by.actor.id.as_deref()) {
             let forgot = app.db.forget_sessions_of(&u.id);
             app.db.record(&event(&by, "placement.assigned", &m, json!({ "routing": cp.routing.as_str(), "userEmail": u.email, "sessionsReset": forgot })));
+            folder::assigned(&app, cp, &m, &by);
         }
     }
     Ok(Json(placement_view(&app, cp, &u.id)))

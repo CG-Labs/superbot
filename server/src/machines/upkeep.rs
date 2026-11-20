@@ -123,7 +123,13 @@ fn newer(agent: &str) -> bool {
 }
 
 fn upkeep_json(hb: &Heartbeat) -> Value {
-    json!({ "can": hb.can, "build": hb.build, "plan": hb.plan, "harnesses": hb.harnesses, "upgrade": hb.upgrade })
+    // Logging in means no login is saved yet.
+    let logins: BTreeMap<&String, &str> = hb
+        .logins
+        .iter()
+        .map(|(h, l)| (h, if l.state == wire::LOGGED_IN { wire::LOGGED_IN } else { wire::LOGGED_OUT }))
+        .collect();
+    json!({ "can": hb.can, "build": hb.build, "plan": hb.plan, "harnesses": hb.harnesses, "upgrade": hb.upgrade, "logins": logins })
 }
 
 /// Records what a heartbeat says of harnesses and upgrades, and what changed, in the
@@ -136,6 +142,11 @@ pub fn observe(app: &App, machine_id: &str, hb: &Heartbeat) {
             .agent_upkeep
             .as_ref()
             .and_then(|v| serde_json::from_value(v["harnesses"].clone()).ok())
+            .unwrap_or_default();
+        let old_logins: BTreeMap<String, String> = m
+            .agent_upkeep
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v["logins"].clone()).ok())
             .unwrap_or_default();
         if !app.db.machine_upkeep_swap(&m.id, m.agent_upkeep.as_ref(), &new) {
             return;
@@ -151,6 +162,14 @@ pub fn observe(app: &App, machine_id: &str, hb: &Heartbeat) {
                     &event(&by, "machine.harness_install_failed", &m, json!({ "harness": name, "version": st.wanted, "error": st.error }))
                         .outcome(Outcome::Failure),
                 );
+            }
+        }
+        // A login made or lost there, however it happened (ADR 0041).
+        let logins: BTreeMap<String, String> = serde_json::from_value(new["logins"].clone()).unwrap_or_default();
+        for (name, now) in &logins {
+            let was = old_logins.get(name);
+            if was.map_or(now == wire::LOGGED_IN, |w| w != now) {
+                app.db.record(&event(&by, "machine.harness_login_changed", &m, json!({ "harness": name, "from": was, "to": now })));
             }
         }
     }
@@ -204,7 +223,7 @@ fn blocker(e: &Enrollment, m: &Machine, hb: &Heartbeat) -> Option<String> {
         return Some("Its agent is held at its build. Release it first.".into());
     }
     if hb.jobs > 0 {
-        return Some(format!("It's running {} jobs. Upgrade it when they're done.", hb.jobs));
+        return Some(format!("It's running {} jobs or logins. Upgrade it when they're done.", hb.jobs));
     }
     None
 }
