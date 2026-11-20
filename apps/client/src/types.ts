@@ -44,6 +44,22 @@ export interface BotView {
   visibility?: Visibility;
   /** What you may do with it. */
   access?: BotAccess;
+  /** The owner's plan (ADR 0032). On a managed plan the server picks the model and
+   *  sends `model` and `effort` only to admins. */
+  tier?: TierBadge;
+  /** Admins only: the route this Bot's runs take. */
+  route?: { harness: string; provider?: string; model?: string | null; effort?: string };
+}
+
+export interface TierBadge {
+  name: string;
+  label: string;
+  managed: boolean;
+}
+
+/** A plan as anyone may see it: no model names. */
+export interface TierView extends TierBadge {
+  limits: { maxBots?: number | null; monthlyRuns?: number | null; monthlyTokens?: number | null };
 }
 
 export type Visibility = "private" | "shared";
@@ -238,6 +254,7 @@ export interface Me {
   role?: Role | "bot";
   permissions?: string[];
   session?: boolean;
+  tier?: TierView;
 }
 
 export interface AppState {

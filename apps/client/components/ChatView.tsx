@@ -19,7 +19,7 @@ import type { Message } from "../src/types";
 import { ApprovalCard } from "./ApprovalsInbox";
 import { BotAvatar } from "./BotAvatar";
 import { HandoffBanner } from "./HandoffBanner";
-import { ModelBar } from "./ModelBar";
+import { ModelBar, PlanBar } from "./ModelBar";
 
 interface Props {
   onOpenDetails: () => void;
@@ -54,6 +54,7 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen }: 
     approvals,
     canWrite,
     canOnBot,
+    me,
   } = useSuperBot();
   const [text, setText] = useState("");
   const [loading, setLoading] = useState(false);
@@ -224,7 +225,17 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen }: 
           onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
         />
       )}
-      {canOnBot(bot, "manage") ? <ModelBar botId={bot.id} harness={bot.harness} model={bot.model} effort={bot.effort} /> : null}
+      {!canOnBot(bot, "manage") ? null : bot.tier?.managed && me?.role !== "admin" ? (
+        <PlanBar label={bot.tier.label} />
+      ) : (
+        <ModelBar
+          botId={bot.id}
+          harness={bot.harness}
+          model={bot.model}
+          effort={bot.effort}
+          tier={bot.tier?.managed ? bot.tier.name : undefined}
+        />
+      )}
       {canOperate ? (
       <View style={styles.composer}>
         <TextInput
