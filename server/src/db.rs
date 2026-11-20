@@ -364,6 +364,98 @@ pub struct Machine {
     pub created_by: Option<String>,
     pub updated_at: i64,
     pub destroyed_at: Option<i64>,
+    /// Its agent's certificates (ADR 0031): `none` yet, `enrolled` (one is active),
+    /// `held` (while suspended), or `revoked`.
+    pub enrollment: String,
+    pub enrolled_at: Option<i64>,
+    /// The last heartbeat its agent answered, and what it said or why it didn't.
+    pub agent_seen_at: Option<i64>,
+    pub agent_version: Option<String>,
+    pub agent_error: Option<String>,
+}
+
+/// A certificate the control plane issued a machine (ADR 0031). Looked up by
+/// fingerprint; the machine and user are botd's record, whatever the certificate says.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineCert {
+    pub fingerprint: String,
+    pub serial: String,
+    pub machine_id: String,
+    pub user_id: String,
+    /// `active`, `held` (the machine is suspended), or `revoked`.
+    pub status: String,
+    /// `enrolled` or `rotated`.
+    pub issued_for: String,
+    pub issued_at: i64,
+    pub not_before: i64,
+    pub not_after: i64,
+    /// First used: after a rotation, the certificates before it are revoked then.
+    pub first_seen_at: Option<i64>,
+    pub revoked_at: Option<i64>,
+    pub revoked_reason: Option<String>,
+}
+
+impl MachineCert {
+    pub fn usable(&self, at: i64) -> bool {
+        self.status == "active" && self.not_before <= at && at < self.not_after
+    }
+}
+
+/// A one-time enrollment token, by its hash.
+#[derive(Clone, Debug)]
+pub struct MachineToken {
+    pub id: i64,
+    pub machine_id: String,
+    pub expires_at: i64,
+    pub used_at: Option<i64>,
+    pub revoked_at: Option<i64>,
+}
+
+fn machine_cert_row(r: &Row) -> rusqlite::Result<MachineCert> {
+    Ok(MachineCert {
+        fingerprint: r.get("fingerprint")?,
+        serial: r.get("serial")?,
+        machine_id: r.get("machine_id")?,
+        user_id: r.get("user_id")?,
+        status: r.get("status")?,
+        issued_for: r.get("issued_for")?,
+        issued_at: r.get("issued_at")?,
+        not_before: r.get("not_before")?,
+        not_after: r.get("not_after")?,
+        first_seen_at: r.get("first_seen_at")?,
+        revoked_at: r.get("revoked_at")?,
+        revoked_reason: r.get("revoked_reason")?,
+    })
+}
+
+/// Sets a machine's `enrollment` from its certificates.
+fn refresh_enrollment(c: &Connection, machine_id: &str) -> rusqlite::Result<usize> {
+    c.execute(
+        "UPDATE machines SET enrollment = COALESCE((
+           SELECT CASE WHEN SUM(status = 'active') > 0 THEN 'enrolled' WHEN SUM(status = 'held') > 0 THEN 'held' ELSE 'revoked' END
+           FROM machine_certs WHERE machine_id = ?1 HAVING COUNT(*) > 0), 'none')
+         WHERE id = ?1",
+        [machine_id],
+    )
+}
+
+/// Revokes `machine_id`'s certificates that aren't yet and match `filter` (SQL over
+/// `machine_certs`, never user input), and returns their fingerprints.
+fn revoke_where(
+    c: &Connection,
+    machine_id: &str,
+    filter: &str,
+    reason: &str,
+) -> rusqlite::Result<Vec<String>> {
+    let mut s = c.prepare(&format!(
+        "UPDATE machine_certs SET status = 'revoked', revoked_at = ?2, revoked_reason = ?3
+         WHERE machine_id = ?1 AND status <> 'revoked' AND ({filter}) RETURNING fingerprint"
+    ))?;
+    let out = s
+        .query_map(params![machine_id, now(), reason], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(out)
 }
 
 pub struct NewMachine<'a> {
@@ -405,6 +497,11 @@ fn machine_row(r: &Row) -> rusqlite::Result<Machine> {
         created_by: r.get("created_by")?,
         updated_at: r.get("updated_at")?,
         destroyed_at: r.get("destroyed_at")?,
+        enrollment: r.get("enrollment")?,
+        enrolled_at: r.get("enrolled_at")?,
+        agent_seen_at: r.get("agent_seen_at")?,
+        agent_version: r.get("agent_version")?,
+        agent_error: r.get("agent_error")?,
     })
 }
 
@@ -751,7 +848,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 11] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 12] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -763,7 +860,57 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 11] = [
     migrate_scim,
     migrate_machines,
     migrate_tiers,
+    migrate_machine_enrollment,
 ];
+/// Machine enrollment (ADR 0031). Tokens are kept as SHA-256 hashes, bound to one
+/// machine, and used once. Certificates are kept by fingerprint, never with their keys
+/// (botd never sees a machine's key); `id` orders them, so the ones before a rotated
+/// certificate can be revoked once it's in use.
+fn migrate_machine_enrollment(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'enrollment'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has {
+        c.execute_batch(
+            "ALTER TABLE machines ADD COLUMN enrollment TEXT NOT NULL DEFAULT 'none' CHECK (enrollment IN ('none', 'enrolled', 'held', 'revoked'));
+            ALTER TABLE machines ADD COLUMN enrolled_at INTEGER;
+            ALTER TABLE machines ADD COLUMN agent_seen_at INTEGER;
+            ALTER TABLE machines ADD COLUMN agent_version TEXT;
+            ALTER TABLE machines ADD COLUMN agent_error TEXT;",
+        )?;
+    }
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS machine_tokens (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          machine_id TEXT NOT NULL REFERENCES machines(id),
+          token_hash TEXT NOT NULL UNIQUE,
+          created_at INTEGER NOT NULL,
+          created_by TEXT,
+          expires_at INTEGER NOT NULL,
+          used_at INTEGER,
+          revoked_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS machine_tokens_machine ON machine_tokens(machine_id);
+        CREATE TABLE IF NOT EXISTS machine_certs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          fingerprint TEXT NOT NULL UNIQUE,
+          serial TEXT NOT NULL UNIQUE,
+          machine_id TEXT NOT NULL REFERENCES machines(id),
+          user_id TEXT NOT NULL REFERENCES users(id),
+          status TEXT NOT NULL CHECK (status IN ('active', 'held', 'revoked')),
+          issued_for TEXT NOT NULL CHECK (issued_for IN ('enrolled', 'rotated')),
+          issued_at INTEGER NOT NULL,
+          not_before INTEGER NOT NULL,
+          not_after INTEGER NOT NULL,
+          first_seen_at INTEGER,
+          revoked_at INTEGER,
+          revoked_reason TEXT
+        );
+        CREATE INDEX IF NOT EXISTS machine_certs_machine ON machine_certs(machine_id, status);",
+    )
+}
 
 /// Tiers (ADR 0033): each user's assigned tier (NULL: the configured default) and runs
 /// counted per user and UTC month, for the tier's monthly limit. Keyed by user, so
@@ -2418,6 +2565,227 @@ impl Db {
             .unwrap()
             == 1
     }
+
+    // Machine enrollment (ADR 0031)
+
+    pub fn add_machine_token(
+        &self,
+        machine_id: &str,
+        token_hash: &str,
+        expires_at: i64,
+        created_by: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        self.c()
+            .execute(
+                "INSERT INTO machine_tokens (machine_id, token_hash, created_at, created_by, expires_at) VALUES (?, ?, ?, ?, ?)",
+                params![machine_id, token_hash, now(), created_by, expires_at],
+            )
+            .map(|_| ())
+    }
+
+    /// A token by its hash, used or not.
+    pub fn machine_token(&self, token_hash: &str) -> Option<MachineToken> {
+        self.c()
+            .query_row("SELECT id, machine_id, expires_at, used_at, revoked_at FROM machine_tokens WHERE token_hash = ?", [token_hash], |r| {
+                Ok(MachineToken { id: r.get(0)?, machine_id: r.get(1)?, expires_at: r.get(2)?, used_at: r.get(3)?, revoked_at: r.get(4)? })
+            })
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Unused tokens for the machine can't be used any more. Returns how many.
+    pub fn revoke_machine_tokens(&self, machine_id: &str) -> usize {
+        self.c()
+            .execute("UPDATE machine_tokens SET revoked_at = ? WHERE machine_id = ? AND used_at IS NULL AND revoked_at IS NULL", params![now(), machine_id])
+            .unwrap_or(0)
+    }
+
+    /// Uses token `token_id` for `machine_id` and records `cert` as the machine's one
+    /// active certificate, all at once. The token must be unused, unrevoked, and
+    /// unexpired at this moment, so two enrollments with it can't both win. Every other
+    /// unused token for the machine is revoked, and its earlier certificates too
+    /// (`replaced`). Returns those certificates' fingerprints, or None if the token
+    /// couldn't be used.
+    pub fn enroll_machine(
+        &self,
+        token_id: i64,
+        machine_id: &str,
+        user_id: &str,
+        cert: &crate::machines::pki::Issued,
+    ) -> Option<Vec<String>> {
+        let c = self.c();
+        let tx = c.unchecked_transaction().ok()?;
+        let at = now();
+        let used = tx
+            .execute(
+                "UPDATE machine_tokens SET used_at = ?1 WHERE id = ?2 AND machine_id = ?3 AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?1",
+                params![at, token_id, machine_id],
+            )
+            .ok()?;
+        if used != 1 {
+            return None;
+        }
+        tx.execute("UPDATE machine_tokens SET revoked_at = ?1 WHERE machine_id = ?2 AND used_at IS NULL AND revoked_at IS NULL", params![at, machine_id]).ok()?;
+        let replaced = revoke_where(&tx, machine_id, "1", "replaced").ok()?;
+        tx.execute(
+            "INSERT INTO machine_certs (fingerprint, serial, machine_id, user_id, status, issued_for, issued_at, not_before, not_after)
+             VALUES (?, ?, ?, ?, 'active', 'enrolled', ?, ?, ?)",
+            params![cert.fingerprint, cert.serial, machine_id, user_id, at, cert.not_before, cert.not_after],
+        )
+        .ok()?;
+        tx.execute(
+            "UPDATE machines SET enrolled_at = ? WHERE id = ?",
+            params![at, machine_id],
+        )
+        .ok()?;
+        refresh_enrollment(&tx, machine_id).ok()?;
+        tx.commit().ok()?;
+        Some(replaced)
+    }
+
+    pub fn machine_cert(&self, fingerprint: &str) -> Option<MachineCert> {
+        self.c()
+            .query_row(
+                "SELECT * FROM machine_certs WHERE fingerprint = ?",
+                [fingerprint],
+                machine_cert_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Every certificate the machine was issued, newest first.
+    pub fn machine_certs(&self, machine_id: &str) -> Vec<MachineCert> {
+        let c = self.c();
+        let mut s = c
+            .prepare("SELECT * FROM machine_certs WHERE machine_id = ? ORDER BY id DESC")
+            .unwrap();
+        s.query_map([machine_id], machine_cert_row)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
+    }
+
+    /// Fingerprints of the machine's usable certificates: the only ones botd accepts
+    /// from it when calling it.
+    pub fn machine_pins(&self, machine_id: &str) -> Vec<String> {
+        let at = now();
+        self.machine_certs(machine_id)
+            .into_iter()
+            .filter(|c| c.usable(at))
+            .map(|c| c.fingerprint)
+            .collect()
+    }
+
+    /// Records `new`, issued to replace `old`. `old` stays usable until `new` is first
+    /// used, so a machine that never got the answer isn't locked out. A replacement
+    /// issued earlier that was never used is revoked (`superseded`); returns those.
+    /// None if `old` was held or revoked, or its machine stopped, after the caller
+    /// checked it: a rotation can't undo that. The check and the insert share one
+    /// transaction on the one connection, so a revocation lands wholly before or after.
+    pub fn add_rotated_cert(
+        &self,
+        old: &MachineCert,
+        new: &crate::machines::pki::Issued,
+    ) -> Option<Vec<String>> {
+        let c = self.c();
+        let tx = c.unchecked_transaction().ok()?;
+        let old_id: i64 = tx
+            .query_row(
+                "SELECT mc.id FROM machine_certs mc JOIN machines m ON m.id = mc.machine_id AND m.user_id = mc.user_id
+                 WHERE mc.fingerprint = ?1 AND mc.machine_id = ?2 AND mc.status = 'active'
+                   AND m.state IN ('provisioning', 'running')",
+                params![old.fingerprint, old.machine_id],
+                |r| r.get(0),
+            )
+            .ok()?;
+        let filter = format!(
+            "issued_for = 'rotated' AND first_seen_at IS NULL AND status = 'active' AND id > {old_id}"
+        );
+        let superseded = revoke_where(&tx, &old.machine_id, &filter, "superseded").ok()?;
+        tx.execute(
+            "INSERT INTO machine_certs (fingerprint, serial, machine_id, user_id, status, issued_for, issued_at, not_before, not_after)
+             VALUES (?, ?, ?, ?, 'active', 'rotated', ?, ?, ?)",
+            params![new.fingerprint, new.serial, old.machine_id, old.user_id, now(), new.not_before, new.not_after],
+        )
+        .ok()?;
+        refresh_enrollment(&tx, &old.machine_id).ok()?;
+        tx.commit().ok()?;
+        Some(superseded)
+    }
+
+    /// Marks the certificate used. The first time, the machine's certificates issued
+    /// before it are revoked (`rotated`); returns those.
+    pub fn machine_cert_seen(&self, fingerprint: &str) -> Vec<String> {
+        let c = self.c();
+        let Ok(tx) = c.unchecked_transaction() else {
+            return Vec::new();
+        };
+        let Ok(Some((id, machine_id))) = tx
+            .query_row(
+                "UPDATE machine_certs SET first_seen_at = ? WHERE fingerprint = ? AND first_seen_at IS NULL AND status = 'active' RETURNING id, machine_id",
+                params![now(), fingerprint],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()
+        else {
+            return Vec::new();
+        };
+        let revoked =
+            revoke_where(&tx, &machine_id, &format!("id < {id}"), "rotated").unwrap_or_default();
+        if refresh_enrollment(&tx, &machine_id).is_err() || tx.commit().is_err() {
+            return Vec::new();
+        }
+        revoked
+    }
+
+    /// Moves the machine's certificates from `from` to `to` (`held`, `active`, or
+    /// `revoked` with `reason`). Returns the fingerprints that changed.
+    pub fn set_machine_certs(
+        &self,
+        machine_id: &str,
+        from: &[&str],
+        to: &str,
+        reason: Option<&str>,
+    ) -> Vec<String> {
+        let c = self.c();
+        let Ok(tx) = c.unchecked_transaction() else {
+            return Vec::new();
+        };
+        let list = from
+            .iter()
+            .map(|s| format!("'{s}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let changed: rusqlite::Result<Vec<String>> = if to == "revoked" {
+            revoke_where(
+                &tx,
+                machine_id,
+                &format!("status IN ({list})"),
+                reason.unwrap_or("revoked"),
+            )
+        } else {
+            tx.prepare(&format!("UPDATE machine_certs SET status = ?2 WHERE machine_id = ?1 AND status IN ({list}) RETURNING fingerprint"))
+                .and_then(|mut s| s.query_map(params![machine_id, to], |r| r.get(0))?.collect())
+        };
+        match changed {
+            Ok(fps) if refresh_enrollment(&tx, machine_id).is_ok() && tx.commit().is_ok() => fps,
+            _ => Vec::new(),
+        }
+    }
+
+    /// Records a heartbeat: `Ok(version)` when the agent answered, `Err(why)` when not.
+    pub fn machine_agent_seen(&self, machine_id: &str, result: Result<&str, &str>) {
+        let _ = match result {
+            Ok(version) => self.c().execute(
+                "UPDATE machines SET agent_seen_at = ?, agent_version = ?, agent_error = NULL WHERE id = ?",
+                params![now(), version, machine_id],
+            ),
+            Err(why) => self.c().execute("UPDATE machines SET agent_error = ? WHERE id = ?", params![why, machine_id]),
+        };
+    }
 }
 
 #[cfg(test)]
@@ -2529,6 +2897,15 @@ mod tests {
         let db = Db::open(&path).unwrap();
         assert!(db.machines(None).is_empty());
         assert!(db.add_machine(&new).is_ok());
+
+        // An install with tiers but no enrollment (user_version 11) gets enrollment on upgrade.
+        db.c().execute_batch("DROP TABLE machine_certs; DROP TABLE machine_tokens; PRAGMA user_version = 11;").unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        let v: i64 = db.c().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, MIGRATIONS.len() as i64);
+        let tables: i64 = db.c().query_row("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('machine_certs', 'machine_tokens', 'usage_monthly')", [], |r| r.get(0)).unwrap();
+        assert_eq!(tables, 3);
     }
 
     #[test]

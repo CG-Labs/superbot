@@ -60,6 +60,8 @@ fn admin_routes(u: &str) -> Vec<(&'static str, String, &'static str)> {
             r#"{"tier":"pro"}"#,
         ),
         ("DELETE", format!("/api/users/{u}/machine"), ""),
+        ("POST", format!("/api/users/{u}/machine/enrollment"), ""),
+        ("DELETE", format!("/api/users/{u}/machine/certificates"), ""),
     ]
 }
 

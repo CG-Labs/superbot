@@ -523,7 +523,7 @@ async fn with_routing_on_a_bot_runs_only_on_its_owners_machine() {
 #[test]
 fn the_unenrolled_link_refuses_every_job() {
     use crate::machines::route::{Assigned, Job, MachineLink, Unenrolled};
-    let to = Assigned { machine_id: "m1".into(), user_id: "u1".into(), address: Some("192.0.2.1".into()) };
+    let to = Assigned { machine_id: "m1".into(), user_id: "u1".into(), address: Some("192.0.2.1".into()), pins: vec![] };
     let job = Job { bot_id: "b1".into(), owner_id: "u1".into(), message_id: 1 };
     let r = tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(Unenrolled.dispatch(&to, job));
     assert!(r.unwrap_err().contains("can't send work"));

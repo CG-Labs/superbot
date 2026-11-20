@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1
-# SuperBot server image: botd + botctl, with the harness CLIs baked in.
+# SuperBot server image: botd + botctl (and superbot-machine, the agent botd serves to managed machines),
+# with the harness CLIs baked in.
 # Compose setup and docs: deploy/README.md ("Docker Compose (supported)").
 
 ARG DEBIAN_RELEASE=trixie
@@ -31,7 +32,7 @@ COPY site site
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked \
-    && install -D -m 0755 -t /out target/release/botd target/release/botctl
+    && install -D -m 0755 -t /out target/release/botd target/release/botctl target/release/superbot-machine
 
 # Harness CLIs are Node packages, so the runtime is Node's slim Debian image.
 FROM ${NODE_IMAGE} AS runtime
@@ -87,7 +88,7 @@ RUN set -eu; case " $HARNESSES " in *" hermes "*) ;; *) exit 0 ;; esac; \
     if find /opt/hermes \! -user superbot | grep -q .; then echo "root-owned files in /opt/hermes" >&2; exit 1; fi
 
 # botd prepends its own folder to each Bot's PATH, so it lives apart from the npm CLIs in /usr/local/bin.
-COPY --from=build /out/botd /out/botctl /opt/superbot/bin/
+COPY --from=build /out/botd /out/botctl /out/superbot-machine /opt/superbot/bin/
 COPY --chmod=0755 deploy/superbot-backup.sh /usr/local/bin/superbot-backup
 COPY --chmod=0755 deploy/superbot-restore.sh /usr/local/bin/superbot-restore
 

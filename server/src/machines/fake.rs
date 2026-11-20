@@ -18,6 +18,8 @@ struct State {
     /// One-shot failures, by operation name (`create`, `get`, `shutdown`, ...).
     fail: HashMap<&'static str, ProviderError>,
     calls: Vec<String>,
+    /// The user data each create was sent, by label: what the machine boots with.
+    user_data: HashMap<String, String>,
 }
 
 impl Fake {
@@ -89,6 +91,11 @@ impl Fake {
             .collect()
     }
 
+    /// What the last create for `label` carried as cloud-init user data.
+    pub fn user_data(&self, label: &str) -> Option<String> {
+        self.state.lock().unwrap().user_data.get(label).cloned()
+    }
+
     pub fn calls(&self, op: &str) -> usize {
         self.state
             .lock()
@@ -110,6 +117,9 @@ impl MachineProvider for Fake {
             self.with("create", |s| {
                 if s.machines.values().any(|m| m.label == spec.label) {
                     return Err(ProviderError::LabelTaken);
+                }
+                if let Some(ud) = &spec.user_data {
+                    s.user_data.insert(spec.label.clone(), ud.clone());
                 }
                 s.next += 1;
                 let id = (1000 + s.next).to_string();
