@@ -187,6 +187,7 @@ async fn a_login_can_be_stopped_and_only_known_harnesses_log_in() {
     let mut login = Login::start(&env, &uid, "claude").await;
     let (started, _) = login.until("started").await;
     let id = started["loginId"].as_str().unwrap().to_string();
+    assert_eq!(m.agent.running(), 1, "a login counts as busy, so upgrades wait for it");
     let (code, v) = json_call(&env, "POST", &format!("/api/users/{uid}/machine/harness-login"), r#"{"harness":"claude"}"#).await;
     assert_eq!(code, 409, "one at a time: {v}");
     let (code, v) = json_call(&env, "DELETE", &format!("/api/users/{uid}/machine/harness-logins/claude"), "").await;
@@ -199,6 +200,7 @@ async fn a_login_can_be_stopped_and_only_known_harnesses_log_in() {
     let finished = wait_for_event(&env, "machine.harness_login_finished").await;
     assert_eq!(finished[0]["outcome"], "failure", "{finished:?}");
     assert!(m.agent.logins.running().is_empty());
+    assert_eq!(m.agent.running(), 0);
     let (code, _) = json_call(&env, "POST", &format!("/api/users/{uid}/machine/harness-login/{id}/input"), r#"{"text":"late"}"#).await;
     assert_eq!(code, 404, "an ended login takes no input");
 }
@@ -236,6 +238,7 @@ async fn the_users_folder_is_copied_checked_once_and_never_over_their_changes() 
     let bot = owned_bot(&env, &uid);
     let ws = env.app.workspace_for(&uid).unwrap();
     write(&ws.join("notes/a.txt"), "alpha");
+    write(&ws.join("empty.txt"), "");
     write(&ws.join("run.sh"), "#!/bin/sh\n");
     std::fs::set_permissions(ws.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
     std::os::unix::fs::symlink("/etc/passwd", ws.join("link")).unwrap();
@@ -250,9 +253,10 @@ async fn the_users_folder_is_copied_checked_once_and_never_over_their_changes() 
     let done = wait_for_events(&env, "machine.folder_sync_finished", 1).await;
     assert_eq!(events(&env, "machine.folder_sync_started").await[0]["details"]["trigger"], "assigned");
     let d = &done[0]["details"];
-    assert_eq!((d["files"].as_u64(), d["skipped"].as_u64(), d["copied"].as_u64(), d["seeded"].as_u64()), (Some(4), Some(1), Some(2), Some(2)), "{d}");
+    assert_eq!((d["files"].as_u64(), d["skipped"].as_u64(), d["copied"].as_u64(), d["seeded"].as_u64()), (Some(5), Some(1), Some(3), Some(2)), "{d}");
     let home = &m.home;
     assert_eq!(std::fs::read_to_string(home.join("work/notes/a.txt")).unwrap(), "alpha");
+    assert_eq!(std::fs::read_to_string(home.join("work/empty.txt")).unwrap(), "");
     assert_ne!(std::fs::metadata(home.join("work/run.sh")).unwrap().permissions().mode() & 0o100, 0);
     assert!(std::fs::symlink_metadata(home.join("work/link")).is_err(), "links aren't copied");
     assert_eq!(std::fs::read_to_string(home.join("USER.md")).unwrap(), "Ada likes tea.");
@@ -265,7 +269,7 @@ async fn the_users_folder_is_copied_checked_once_and_never_over_their_changes() 
     assert_eq!(code, 202, "{v}");
     let done = wait_for_events(&env, "machine.folder_sync_finished", 2).await;
     let d = &done[0]["details"];
-    assert_eq!((d["sent"].as_u64(), d["copied"].as_u64(), d["unchanged"].as_u64()), (Some(0), Some(0), Some(4)), "{d}");
+    assert_eq!((d["sent"].as_u64(), d["copied"].as_u64(), d["unchanged"].as_u64()), (Some(0), Some(0), Some(5)), "{d}");
 
     // Changed both here and there: theirs is kept. New and untouched files come over;
     // facts and memory on the machine are never replaced.
