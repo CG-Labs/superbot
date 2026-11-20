@@ -12,6 +12,7 @@
 //! `superbot-userctl ensure <id>` as root, nothing else (deploy/install.sh). Off by
 //! default: then runs work as in ADR 0029.
 
+use crate::machines::wire::JobRequest;
 use crate::passwd;
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
@@ -62,6 +63,19 @@ impl RunAs {
         v.push(bin.into());
         v.extend(args.into_iter().map(OsString::from));
         v
+    }
+
+    /// `job`, started as this account (`argv`). Only for jobs on this server.
+    pub fn wrap(&self, mut job: JobRequest) -> JobRequest {
+        let argv = self.argv(&job.bin, std::mem::take(&mut job.args));
+        let mut argv = argv.into_iter().map(|s| s.to_string_lossy().into_owned());
+        job.bin = argv.next().unwrap_or_default();
+        job.args = argv.collect();
+        // sudo resets PATH; superbot-run puts this one back.
+        if let Some(path) = job.env.get("PATH").cloned() {
+            job.env.insert("SUPERBOT_PATH".into(), path);
+        }
+        job
     }
 }
 

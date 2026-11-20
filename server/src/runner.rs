@@ -6,10 +6,11 @@ use crate::adapters::{self, AbortReason, AgentEvent, Guard, RunInput};
 use crate::audit::{Actor, Event, Outcome, Who};
 use crate::db::{Bot, BotPatch, Db, Message};
 use crate::machines::ControlPlane;
-use crate::machines::route::{Job, Refusal, Target};
+use crate::machines::route::{self, Assigned, Refusal, Target};
+use crate::machines::wire::{self, JobEvent};
 use crate::tiers::{self, Route, Tier, Tiers};
 use crate::{isolation, paths};
-use crate::policy::Mode;
+use crate::policy::{Ctx, Mode};
 use crate::screen::{self, Screens};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -46,6 +47,30 @@ struct Run {
     hooks: Arc<AtomicU32>,
     /// Longest an approval may wait: just under the harness's hook timeout.
     hook_wait: Option<Duration>,
+    /// The folders its tool calls are judged by, when it isn't on this server.
+    ctx: Option<Ctx>,
+}
+
+/// Where a run happens: here, or on its owner's machine (ADR 0036).
+enum Place {
+    Here,
+    There(Box<(Assigned, wire::Layout)>),
+}
+
+/// What a job on a machine sent back: files by path, and those too big to send.
+type Back = (std::collections::BTreeMap<String, String>, Vec<String>);
+
+/// What a run sees where it happens: its folders, environment, and tools there.
+struct Spot {
+    machine: Option<Assigned>,
+    cwd: PathBuf,
+    state_dir: PathBuf,
+    memory: PathBuf,
+    user_file: PathBuf,
+    botctl: PathBuf,
+    env: HashMap<String, String>,
+    screens: bool,
+    ctx: Option<Ctx>,
 }
 
 #[derive(Default)]
@@ -73,6 +98,8 @@ pub struct App {
     pub tiers: OnceLock<Arc<Tiers>>,
     /// Each user's Bots run as that user's own account (ADR 0037). Unset: all as botd's.
     pub isolation: OnceLock<Arc<Isolation>>,
+    /// Runs on each user's machine now, by user.
+    on_machines: Mutex<HashMap<String, u32>>,
     closing: AtomicBool,
 }
 
@@ -89,6 +116,7 @@ impl App {
             control_plane: OnceLock::new(),
             tiers: OnceLock::new(),
             isolation: OnceLock::new(),
+            on_machines: Mutex::default(),
             closing: AtomicBool::new(false),
         })
     }
@@ -99,6 +127,11 @@ impl App {
             r.hooks.fetch_add(1, Ordering::SeqCst);
             r.hook_wait
         })
+    }
+
+    /// The folders a running Bot's tool calls are judged by, when it runs elsewhere.
+    pub fn run_ctx(&self, bot_id: &str) -> Option<Ctx> {
+        self.with_run(bot_id, |r| r.ctx.clone())
     }
 
     pub fn set_run_status(&self, bot_id: &str, status: &str) {
@@ -204,7 +237,7 @@ impl App {
         }
     }
     /// `DATA_DIR/bots/<id>/MEMORY.md`. With per-user accounts, botd's copy of the memory file.
-    fn data_memory_file(&self, id: &str) -> Option<PathBuf> {
+    pub(crate) fn data_memory_file(&self, id: &str) -> Option<PathBuf> {
         paths::child(&self.bot_dir(id)?, "MEMORY.md")
     }
 
@@ -402,7 +435,7 @@ impl App {
     }
 
     async fn run_one(self: &Arc<Self>, mut bot: Bot, msg: &Message) {
-        let Some(shell_tool) = adapters::get(&bot.harness).map(|a| a.shell_tool()) else {
+        let Some((shell_tool, bin)) = adapters::get(&bot.harness).map(|a| (a.shell_tool(), a.bin())) else {
             return self.say(&bot.id, &format!("Unknown harness \"{}\".", bot.harness), true);
         };
         let Some(bot_dir) = self.bot_dir(&bot.id) else {
@@ -414,10 +447,17 @@ impl App {
         let by = self.requester(&bot, msg);
         let period = tiers::period(crate::db::now());
         let Some((tier, route)) = self.tier_route(&bot, msg, &by, &period) else { return };
-        if !self.route_here(&bot, msg, &by, &period).await {
-            return;
-        }
-        let Ok(run_as) = self.isolate(&bot, msg, &by, &period).await else { return };
+        let placed_at = self.db.placed_at(&bot.owner_id);
+        let Some(place) = self.place(&bot, msg, &by, &period, bin).await else { return };
+        // A user's machine is theirs alone; accounts keep users apart on this server.
+        let run_as = match place {
+            Place::Here => match self.isolate(&bot, msg, &by, &period).await {
+                Ok(r) => r,
+                Err(()) => return,
+            },
+            Place::There(_) => None,
+        };
+        let spot = self.spot(&bot, bot_dir.clone(), space, place);
         self.init_bot_files(&bot);
         self.db.set_status(msg.id, "running");
         let started = Instant::now();
@@ -428,6 +468,7 @@ impl App {
             "reply" => format!("(Reply from {} to what you asked earlier. Tell the user what matters.)\n\n{}", from(), msg.text),
             _ => msg.text.clone(),
         };
+        let host = json!({ "host": if spot.machine.is_some() { "machine" } else { "server" }, "machine": spot.machine.as_ref().map(|m| &m.machine_id) });
 
         for attempt in 0..2 {
             let (abort_tx, abort_rx) = watch::channel(None);
@@ -435,7 +476,7 @@ impl App {
             // stays above our wait, so the hook is never killed into failing open. A harness
             // that caps hook timeouts gets a shorter wait instead.
             let policy = self.db.effective_policy(&bot.id);
-            let guard = (policy.mode == Mode::Ask).then(|| guard(&self.cfg.bin_dir, &bot.harness, policy.timeout_minutes));
+            let guard = (policy.mode == Mode::Ask).then(|| guard(&spot.botctl, &bot.harness, policy.timeout_minutes));
             let hooks = Arc::new(AtomicU32::new(0));
             self.state().entry(bot.id.clone()).or_default().run = Some(Run {
                 abort: abort_tx.clone(),
@@ -443,6 +484,7 @@ impl App {
                 draft: String::new(),
                 hooks: hooks.clone(),
                 hook_wait: guard.as_ref().map(|g| g.wait),
+                ctx: spot.ctx.clone(),
             });
             self.send(json!({ "type": "status", "botId": bot.id, "working": true, "status": "Thinking" }));
             let timeout = self.cfg.run_timeout;
@@ -454,8 +496,9 @@ impl App {
                 }
             });
 
-            let (cwd, mut env) = space.clone();
-            if let Some(screens) = &self.screens
+            let mut env = spot.env.clone();
+            if spot.screens
+                && let Some(screens) = &self.screens
                 && let Some(info) = screens.ensure(&bot.id, |id| self.is_running(id)).await
             {
                 env.extend(screen::bot_env(&info, &bot.id, &bot_dir));
@@ -465,20 +508,21 @@ impl App {
                 "guarded": guard.is_some(), "resumed": bot.session_id.is_some(), "attempt": attempt + 1,
                 "trigger": msg.role, "messageId": msg.id,
             });
+            merge(&mut invoked, &host);
             if let Some(r) = &run_as {
                 invoked["runAs"] = json!(r.account);
             }
             self.db.record(&by.event("harness.invoked").target("message", &msg.id.to_string()).bot(&bot.id).details(invoked));
             let input = RunInput {
                 prompt: prompt.clone(),
-                system: self.system_prompt(&bot),
+                system: self.system_prompt_at(&bot, &spot),
                 session_id: bot.session_id.clone(),
-                cwd,
+                cwd: spot.cwd.clone(),
                 provider: route.provider.clone(),
                 model: route.model.clone(),
                 effort: route.effort.clone(),
                 env,
-                state_dir: bot_dir.clone(),
+                state_dir: spot.state_dir.clone(),
                 guard: guard.clone(),
                 run_as: run_as.clone(),
             };
@@ -488,11 +532,9 @@ impl App {
             let id = bot.id.clone();
             let mut canary: Option<tokio::task::JoinHandle<()>> = None;
             let mut saw_shell = false;
-            adapters::run(adapters::get(&bot.harness).unwrap(), input, abort_rx.clone(), |e| match e {
+            let emit = |e| match e {
                 AgentEvent::Session(s) => {
-                    if self.db.bot(&id).and_then(|b| b.session_id).as_deref() != Some(&s) {
-                        self.db.update_bot(&id, BotPatch { session_id: Some(Some(s)), ..Default::default() });
-                    }
+                    self.db.keep_session(&id, &s, placed_at);
                 }
                 AgentEvent::TextDelta(t) => {
                     let draft = self.with_run(&id, |r| { r.draft.push_str(&t); r.draft.clone() });
@@ -521,10 +563,16 @@ impl App {
                     self.send(json!({ "type": "status", "botId": id, "working": true, "status": status }));
                 }
                 AgentEvent::Error(m) => errors.push(m),
-            })
-            .await;
+            };
+            let adapter = adapters::get(&bot.harness).unwrap();
+            match &spot.machine {
+                None => adapters::run(adapter, input, abort_rx.clone(), emit).await,
+                Some(to) => self.run_there(&bot, msg, &spot, to, adapter, input, abort_rx.clone(), emit).await,
+            }
             timer.abort();
-            self.keep_memory(&bot);
+            if spot.machine.is_none() {
+                self.keep_memory(&bot);
+            }
             if let Some(c) = canary {
                 c.abort();
             }
@@ -563,10 +611,11 @@ impl App {
                 _ if !errors.is_empty() => ("error", Outcome::Failure),
                 _ => ("done", Outcome::Success),
             };
-            let finished = json!({
+            let mut finished = json!({
                 "result": result, "durationMs": started.elapsed().as_millis() as u64, "replies": replies,
                 "attempts": attempt + 1, "trigger": msg.role, "messageId": msg.id,
             });
+            merge(&mut finished, &host);
             self.db.record(&by.event("bot.run_finished").target("message", &msg.id.to_string()).bot(&bot.id).outcome(outcome).details(finished));
             match reason {
                 Some("shutdown") => {}
@@ -597,30 +646,148 @@ impl App {
         }
     }
 
-    /// True when the Bot runs on this server. Otherwise the message went to its owner's
-    /// own machine, or the run was refused and the Bot said why. Never another user's
-    /// machine, and never here instead when routing is on.
-    async fn route_here(&self, bot: &Bot, msg: &Message, by: &Who, period: &str) -> bool {
-        let Some(cp) = self.control_plane.get() else { return true };
+    /// Where the Bot runs: here, or its owner's machine once that machine answered a
+    /// check and can run it. None: refused (the run is given back), and the Bot said
+    /// why. Never another user's machine, and never here instead of an assigned one.
+    async fn place(&self, bot: &Bot, msg: &Message, by: &Who, period: &str, bin: &str) -> Option<Place> {
+        let Some(cp) = self.control_plane.get() else { return Some(Place::Here) };
         let refused = |r: Refusal, machine: Option<&str>| {
             self.db.give_back_run(&bot.owner_id, period);
             let e = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied);
             self.db.record(&e.details(json!({ "reason": r.reason(), "owner": bot.owner_id, "machine": machine, "messageId": msg.id })));
             self.say(&bot.id, &r.message(), true);
-            false
+            None
         };
-        match cp.route(&self.db, &bot.owner_id) {
-            Ok(Target::Local) => true,
-            Err(r) => refused(r, None),
-            Ok(Target::Machine(to)) => {
-                let job = Job { bot_id: bot.id.clone(), owner_id: bot.owner_id.clone(), message_id: msg.id };
-                match cp.link.dispatch(&to, job).await {
-                    Ok(()) => {
-                        let e = by.event("bot.run_routed").target("message", &msg.id.to_string()).bot(&bot.id);
-                        self.db.record(&e.details(json!({ "owner": bot.owner_id, "machine": to.machine_id, "link": cp.link.name(), "messageId": msg.id })));
-                        false
+        let to = match cp.route(&self.db, &bot.owner_id) {
+            Ok(Target::Local) => return Some(Place::Here),
+            Err(r) => return refused(r, None),
+            Ok(Target::Machine(to)) => to,
+        };
+        let checked = cp.link.check(self, &to, &[bin]).await.map_err(Refusal::Offline);
+        match checked.and_then(|hb| route::fit(&hb, bin).map(|l| (l, hb.version))) {
+            Err(r) => refused(r, Some(&to.machine_id)),
+            Ok((layout, version)) => {
+                let e = by.event("bot.run_routed").target("message", &msg.id.to_string()).bot(&bot.id);
+                self.db.record(&e.details(json!({ "owner": bot.owner_id, "machine": to.machine_id, "link": cp.link.name(), "agentVersion": version, "messageId": msg.id })));
+                Some(Place::There(Box::new((to, layout))))
+            }
+        }
+    }
+
+    /// The run's folders and environment where it happens. On a machine: the machine's
+    /// folders, botctl there, and botd's API through the agent's relay; no screen yet.
+    fn spot(&self, bot: &Bot, bot_dir: PathBuf, (cwd, mut env): (PathBuf, HashMap<String, String>), place: Place) -> Spot {
+        let local = |p: Option<PathBuf>| p.unwrap_or_default();
+        match place {
+            Place::Here => Spot {
+                machine: None,
+                cwd,
+                memory: local(self.memory_file(bot)),
+                user_file: local(self.user_file(&bot.owner_id)),
+                state_dir: bot_dir,
+                botctl: self.cfg.bin_dir.join("botctl"),
+                env,
+                screens: self.screens.is_some(),
+                ctx: None,
+            },
+            Place::There(there) => {
+                let (to, layout) = *there;
+                let botctl = PathBuf::from(layout.botctl.clone().unwrap_or_default());
+                // HOME and PATH are the machine's own; it inherits nothing of botd's.
+                env.remove("PATH");
+                for (k, v) in crate::secrets::global().inherited_harness_env() {
+                    env.entry(k).or_insert_with(|| v.expose().to_string());
+                }
+                env.insert("BOT_API".into(), layout.api.clone());
+                env.insert("SUPERBOT_BOTCTL".into(), botctl.display().to_string());
+                let state_dir = PathBuf::from(&layout.bots).join(&bot.id);
+                Spot {
+                    machine: Some(to),
+                    cwd: PathBuf::from(&layout.workspace),
+                    memory: state_dir.join("MEMORY.md"),
+                    user_file: PathBuf::from(&layout.user_file),
+                    state_dir,
+                    botctl,
+                    env,
+                    screens: false,
+                    ctx: Some(Ctx { workspace: PathBuf::from(&layout.workspace), home: PathBuf::from(&layout.home) }),
+                }
+            }
+        }
+    }
+
+    /// Runs the harness on the owner's machine. botd keeps the Bot's memory and its
+    /// owner's facts: they go with the job and come back changed. The owner's facts
+    /// are sent only when none of their other Bots is running there, so one Bot's run
+    /// can't undo another's edits. With per-user accounts, the copies in the owner's
+    /// folder on this server are dropped for those that came back, so the next run here
+    /// starts from them.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_there(&self, bot: &Bot, msg: &Message, spot: &Spot, to: &Assigned, adapter: Box<dyn adapters::Adapter>, input: RunInput, abort: watch::Receiver<AbortReason>, emit: impl FnMut(AgentEvent)) {
+        let Some(cp) = self.control_plane.get() else { return };
+        let read = |p: Option<PathBuf>| p.and_then(|p| std::fs::read_to_string(p).ok());
+        let (memory, facts) = (read(self.data_memory_file(&bot.id)), read(self.data_user_file(&bot.owner_id)));
+        let alone = {
+            let mut on = self.on_machines.lock().unwrap_or_else(|e| e.into_inner());
+            let n = on.entry(bot.owner_id.clone()).or_default();
+            *n += 1;
+            *n == 1
+        };
+        let back: Arc<Mutex<Back>> = Arc::default();
+        let (memory_at, user_at) = (spot.memory.display().to_string(), spot.user_file.display().to_string());
+        let job_abort = abort.clone();
+        let exec = |mut job: wire::JobRequest, tx: tokio::sync::mpsc::Sender<JobEvent>| {
+            let (link, back, abort) = (cp.link.clone(), back.clone(), job_abort);
+            job.job_id = format!("j{}", crate::random_hex(8));
+            job.bot_id = bot.id.clone();
+            job.owner_id = bot.owner_id.clone();
+            job.message_id = msg.id;
+            let files = [(memory_at.clone(), memory), (user_at.clone(), facts.filter(|_| alone))];
+            job.files.extend(files.into_iter().filter_map(|(path, body)| Some(wire::JobFile { path, body: body? })));
+            job.collect = vec![memory_at.clone(), user_at.clone()];
+            async move {
+                let (mid_tx, mut mid_rx) = tokio::sync::mpsc::channel::<JobEvent>(64);
+                let forward = async {
+                    while let Some(ev) = mid_rx.recv().await {
+                        if let JobEvent::Exit { files, too_big, .. } = &ev {
+                            *back.lock().unwrap_or_else(|e| e.into_inner()) = (files.clone(), too_big.clone());
+                        }
+                        if tx.send(ev).await.is_err() {
+                            return;
+                        }
                     }
-                    Err(e) => refused(Refusal::Unreachable(e), Some(&to.machine_id)),
+                };
+                tokio::join!(link.run(to, job, abort, mid_tx), forward);
+            }
+        };
+        adapters::run_on(adapter, input, abort, emit, exec).await;
+        {
+            let mut on = self.on_machines.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(n) = on.get_mut(&bot.owner_id) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    on.remove(&bot.owner_id);
+                }
+            }
+        }
+        let (back, too_big) = std::mem::take(&mut *back.lock().unwrap_or_else(|e| e.into_inner()));
+        for path in &too_big {
+            let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let mib = crate::machines::job::MAX_COLLECT >> 20;
+            self.say(&bot.id, &format!("{name} on your machine is over {mib} MiB, so it no longer syncs back here. The machine keeps its copy; trim it to sync again."), true);
+        }
+        let iso = self.isolation();
+        let kept = [
+            (memory_at, self.data_memory_file(&bot.id), iso.and_then(|i| i.memory_file(&bot.owner_id, &bot.id))),
+            (user_at, self.data_user_file(&bot.owner_id), iso.and_then(|i| i.user_file(&bot.owner_id))),
+        ];
+        for (there, here, copy) in kept {
+            if let (Some(body), Some(here)) = (back.get(&there), here)
+                && std::fs::read_to_string(&here).ok().as_ref() != Some(body)
+            {
+                let _ = std::fs::write(here, body);
+                if let Some(copy) = copy {
+                    accounts::remove(&copy);
                 }
             }
         }
@@ -839,9 +1006,22 @@ impl App {
         }
     }
 
+    /// The prompt for a run on this server.
+    #[cfg(test)]
     pub(crate) fn system_prompt(&self, bot: &Bot) -> String {
+        let (cwd, env) = (self.workspace_for(&bot.owner_id).unwrap_or_default(), HashMap::new());
+        let spot = self.spot(bot, self.bot_dir(&bot.id).unwrap_or_default(), (cwd, env), Place::Here);
+        self.system_prompt_at(bot, &spot)
+    }
+
+    /// The prompt for a run at `spot`: its paths are where the run is. The memory and
+    /// facts in it are the run's own copies here, or botd's, which runs elsewhere send back.
+    fn system_prompt_at(&self, bot: &Bot, spot: &Spot) -> String {
         let read = |p: &Option<PathBuf>| p.as_deref().and_then(|p| self.read_memory(p)).unwrap_or_default().trim().to_string();
-        let (mem_file, user_file) = (self.memory_file(bot), self.user_file(&bot.owner_id));
+        let (mem_file, user_file) = match spot.machine {
+            None => (self.memory_file(bot), self.user_file(&bot.owner_id)),
+            Some(_) => (self.data_memory_file(&bot.id), self.data_user_file(&bot.owner_id)),
+        };
         // Only the Bots its owner can see: a Bot acts for its owner (ADR 0017).
         let others: Vec<String> = crate::acl::Viewer::owner_of(&self.db, bot)
             .bots(&self.db)
@@ -859,7 +1039,7 @@ impl App {
 They talk to you in a chat app, like messaging a coworker. Finish work end to end.
 
 ## Your computer
-- You run on a Linux computer you share with {user}'s other Bots. Your working folder is {ws}; it belongs to {user}.
+- You run on a Linux computer you share with {user}'s other Bots. Your working folder is {ws}; it belongs to {user}.{own}
 - Keep {user}'s work inside it, in clear project folders. Other people's folders on this computer aren't yours to open.
 
 ## Memory
@@ -894,8 +1074,9 @@ They talk to you in a chat app, like messaging a coworker. Finish work end to en
 Current time: {now}."#,
             name = bot.name,
             // Full path: some harnesses run commands in a login shell that resets PATH.
-            botctl = self.cfg.bin_dir.join("botctl").display(),
-            screen = if self.screens.is_some() { screen_prompt(&self.cfg.bin_dir.join("botctl").display().to_string()) } else { String::new() },
+            botctl = spot.botctl.display(),
+            screen = if spot.screens && self.screens.is_some() { screen_prompt(&spot.botctl.display().to_string()) } else { String::new() },
+            own = if spot.machine.is_some() { format!(" It is {user}'s own computer: only their Bots run on it.", user = self.owner_name(bot)) } else { String::new() },
             user = self.owner_name(bot),
             approvals = if self.db.effective_policy(&bot.id).mode == Mode::Ask {
                 "\n- Risky actions (destructive commands, deleting outside your folder, sending messages, installing software, git push) \
@@ -903,9 +1084,9 @@ Current time: {now}."#,
             } else {
                 ""
             },
-            ws = self.workspace_for(&bot.owner_id).unwrap_or_default().display(),
-            mem_path = mem_file.clone().unwrap_or_default().display(),
-            user_path = user_file.clone().unwrap_or_default().display(),
+            ws = spot.cwd.display(),
+            mem_path = spot.memory.display(),
+            user_path = spot.user_file.display(),
             mem = read(&mem_file),
             user_facts = read(&user_file),
             others = if others.is_empty() { "None yet.".into() } else { others.join("\n") },
@@ -919,13 +1100,20 @@ fn shell_quote(s: &str) -> String {
 }
 
 /// The approval gate for one run. The hook timeout stays a minute above the wait.
-fn guard(bin_dir: &Path, harness: &str, timeout_minutes: u32) -> Guard {
+fn guard(botctl: &Path, harness: &str, timeout_minutes: u32) -> Guard {
     let mut wait = Duration::from_secs(timeout_minutes as u64 * 60 + 60);
     if let Some(cap) = adapters::get(harness).and_then(|a| a.max_hook_secs()) {
         wait = wait.min(Duration::from_secs(cap.saturating_sub(60).max(1)));
     }
-    let botctl = bin_dir.join("botctl").display().to_string();
+    let botctl = botctl.display().to_string();
     Guard { command: format!("{} hook {harness}", shell_quote(&botctl)), timeout_secs: wait.as_secs() + 60, wait }
+}
+
+/// Adds `extra`'s fields to the object `v`.
+fn merge(v: &mut Value, extra: &Value) {
+    if let (Some(v), Some(x)) = (v.as_object_mut(), extra.as_object()) {
+        v.extend(x.iter().map(|(k, x)| (k.clone(), x.clone())));
+    }
 }
 
 #[cfg(test)]
@@ -1000,13 +1188,13 @@ mod tests {
 
     #[test]
     fn the_approval_wait_fits_the_harness_hook_limit() {
-        let g = guard(Path::new("/opt/it's"), "claude", 10);
+        let g = guard(Path::new("/opt/it's/botctl"), "claude", 10);
         assert_eq!(g.command, r"'/opt/it'\''s/botctl' hook claude");
         assert_eq!((g.wait, g.timeout_secs), (Duration::from_secs(660), 720));
         // Hermes kills hooks after 300 seconds, so its wait stays under that.
-        let g = guard(Path::new("/opt"), "hermes", 10);
+        let g = guard(Path::new("/opt/botctl"), "hermes", 10);
         assert_eq!((g.wait, g.timeout_secs), (Duration::from_secs(240), 300));
-        let g = guard(Path::new("/opt"), "hermes", 1);
+        let g = guard(Path::new("/opt/botctl"), "hermes", 1);
         assert_eq!((g.wait, g.timeout_secs), (Duration::from_secs(120), 180));
         assert_eq!(tool_label("terminal", "ls"), "Running: ls");
     }
@@ -1218,7 +1406,7 @@ mod tests {
         let (tx, rx) = watch::channel(None);
         let hook_wait = guarded.then_some(Duration::from_secs(60));
         app.state().entry(bot_id.into()).or_default().run =
-            Some(Run { abort: tx, status: String::new(), draft: String::new(), hooks: Default::default(), hook_wait });
+            Some(Run { abort: tx, status: String::new(), draft: String::new(), hooks: Default::default(), hook_wait, ctx: None });
         rx
     }
 

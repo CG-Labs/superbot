@@ -46,6 +46,10 @@ impl App {
     /// The Bot's workspace is its owner's folder, so deleting in another user's folder
     /// counts as outside it (ADR 0029).
     pub fn policy_ctx(&self, bot: &Bot) -> Ctx {
+        // A run on the owner's machine is judged by that machine's folders (ADR 0036).
+        if let Some(ctx) = self.run_ctx(&bot.id) {
+            return ctx;
+        }
         let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| "/".into());
         // No folder of its own (an odd owner id): nothing is inside, so every delete asks.
         let workspace = self.workspace_for(&bot.owner_id).unwrap_or_else(|| self.cfg.workspace.join(crate::isolation::USERS).join(".none"));

@@ -96,6 +96,9 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
              --idp <entra|google|oidc|github|apple|saml> --idp-provider <id> --subject <issuer|sub>
              --session <id> --on-behalf-of <user id|email> --outcome <success|failure|denied> --bot <id>
     times: YYYY-MM-DD (UTC), RFC 3339, or unix milliseconds
+  botctl machine placement [<user>]                Where each user's Bots run: this server or their machine
+  botctl machine assign <user>                     Run the user's Bots on their enrolled machine
+  botctl machine unassign <user>                   Stop using it; with MACHINE_ROUTING=assigned they run here again
   botctl secrets                                   List secret names (never values)
   botctl secret set <NAME> < value-file            Save a secret, encrypted; Bots get it as $NAME
   botctl secret rm <NAME>                          Delete a saved secret
@@ -381,6 +384,18 @@ fn bot_access(args: &[&str]) -> Result<(&'static str, String, Option<String>), S
     })
 }
 
+/// `botctl machine ...`: which computer each user's Bots run on (ADR 0036).
+fn machine_request(args: &[&str]) -> Result<(&'static str, String), String> {
+    let at = |user: &str| format!("/api/users/{}/placement", encode(user));
+    Ok(match args {
+        ["placement"] | ["placements"] => ("GET", "/api/machines/placements".into()),
+        ["placement", user] => ("GET", at(user)),
+        ["assign", user] => ("PUT", at(user)),
+        ["unassign", user] => ("DELETE", at(user)),
+        _ => return Err("Usage: botctl machine placement [<user>] | assign <user> | unassign <user>".into()),
+    })
+}
+
 /// `botctl signup ...`: people who asked for access on the get-started page (ADR 0022).
 fn signup_request(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
     let at = |id: &str, verb: &str| format!("/api/signups/{}/{verb}", encode(id));
@@ -561,6 +576,10 @@ fn run(args: &[String]) -> Result<String, String> {
             let (method, path, body) = bot_access(rest)?;
             op(method, &path, body)
         }
+        ["machine", rest @ ..] => {
+            let (method, path) = machine_request(rest)?;
+            op(method, &path, None)
+        }
         ["signups"] | ["signup", ..] => {
             let (method, path, body) = signup_request(a.get(1..).unwrap_or_default())?;
             let res = api(Cred::Operator, method, &path, body)?;
@@ -677,6 +696,15 @@ mod tests {
         assert_eq!(login_extra(&["--"]), Ok(Some(&[][..])));
         assert_eq!(login_extra(&["--", "setup-token"]), Ok(Some(&["setup-token"][..])));
         assert!(login_extra(&["setup-token"]).is_err());
+    }
+
+    #[test]
+    fn machine_commands_name_the_users_placement() {
+        assert_eq!(machine_request(&["placement"]).unwrap(), ("GET", "/api/machines/placements".into()));
+        assert_eq!(machine_request(&["placement", "a@example.com"]).unwrap(), ("GET", "/api/users/a%40example.com/placement".into()));
+        assert_eq!(machine_request(&["assign", "u1"]).unwrap(), ("PUT", "/api/users/u1/placement".into()));
+        assert_eq!(machine_request(&["unassign", "u1"]).unwrap(), ("DELETE", "/api/users/u1/placement".into()));
+        assert!(machine_request(&["assign"]).is_err());
     }
 
     #[test]

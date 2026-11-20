@@ -458,12 +458,13 @@ async fn people_reach_only_their_own_sessions() {
 
 #[tokio::test]
 async fn with_routing_on_a_bot_runs_only_on_its_owners_machine() {
+    use crate::machines::route::Routing;
     let fake = Arc::new(Fake::default());
     let link = Arc::new(Recording::default());
     let (p, l): (Arc<dyn MachineProvider>, Arc<dyn crate::machines::route::MachineLink>) = (fake.clone(), link.clone());
     let (port, app, owner, key) = serve_app_with(|a| {
         let mut cp = ControlPlane::for_tests(p);
-        (cp.routing, cp.link) = (true, l);
+        (cp.routing, cp.link) = (Routing::On, l);
         a.machines = Arc::new(cp);
     })
     .await;
@@ -479,11 +480,20 @@ async fn with_routing_on_a_bot_runs_only_on_its_owners_machine() {
     // Ada's machine isn't up yet: her Bots don't run, here or anywhere.
     assert_eq!(call(port, "POST", &format!("/api/users/{a_id}/machine"), &admin, "{}").await.0, 202);
     let said = run(&w, &a, &ab.id, "hi").await;
-    assert!(said.contains("your computer is provisioning"), "{said}");
+    assert!(said.contains("isn't assigned to you"), "{said}");
+    let (code, v) = call(port, "PUT", &format!("/api/users/{a_id}/placement"), &admin, "").await;
+    assert_eq!(code, 409, "only a running, enrolled machine can be assigned: {v}");
     let (code, v) = call(port, "POST", "/api/machines/reconcile", &admin, "").await;
     assert_eq!(code, 200, "{v}");
     let machine = app.db.user_machine(&a_id).unwrap();
     assert_eq!(machine.state, crate::machines::State::Running);
+    crate::machines::route::recording::enroll(&app.db, &machine);
+    assert_eq!(call(port, "PUT", &format!("/api/users/{a_id}/placement"), &b, "").await.0, 403, "admins only");
+    let (code, v) = call(port, "PUT", &format!("/api/users/{a_id}/placement"), &admin, "").await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!((parse(&v)["runsOn"].as_str(), parse(&v)["assigned"].as_bool()), (Some("machine"), Some(true)), "{v}");
+    let assigned = events(port, &admin, "action=placement.assigned").await;
+    assert!(assigned.iter().any(|e| e["details"]["routing"] == "on" && e["targetId"] == machine.id.as_str()), "{assigned:?}");
 
     // Running: Ada's work goes to her machine, and nothing runs here.
     for (who, bot) in [(&a, &ab), (&b, &team)] {
@@ -500,11 +510,14 @@ async fn with_routing_on_a_bot_runs_only_on_its_owners_machine() {
         let sent = link.sent.lock().unwrap().last().cloned().unwrap();
         assert_eq!((sent.0.machine_id.as_str(), sent.0.user_id.as_str()), (machine.id.as_str(), a_id.as_str()), "the owner's machine, whoever asked");
         assert_eq!((sent.1.bot_id.as_str(), sent.1.owner_id.as_str(), sent.1.message_id), (bot.id.as_str(), a_id.as_str(), id));
+        assert_eq!(sent.1.cwd, "/home/bots/work", "the machine's folders, not this server's");
+        assert!(!sent.1.env.contains_key("PATH") && sent.1.env.get("BOT_API").map(String::as_str) == Some("http://127.0.0.1:7444"));
     }
     let routed = events(port, &admin, "action=bot.run_routed").await;
     assert_eq!(routed.len(), 2);
     assert!(routed.iter().all(|e| e["details"]["machine"] == machine.id.as_str() && e["details"]["link"] == "recording"));
-    assert!(events(port, &admin, &format!("action=harness.invoked&bot={}", ab.id)).await.is_empty(), "nothing ran on this server");
+    let invoked = events(port, &admin, &format!("action=harness.invoked&bot={}", ab.id)).await;
+    assert!(!invoked.is_empty() && invoked.iter().all(|e| e["details"]["host"] == "machine"), "nothing ran on this server: {invoked:?}");
 
     // Bea has no machine: her Bot is refused, not run on Ada's or here.
     let said = run(&w, &b, &bb.id, "hi").await;
@@ -513,18 +526,38 @@ async fn with_routing_on_a_bot_runs_only_on_its_owners_machine() {
     let refused = events(port, &admin, "action=bot.run_refused").await;
     assert!(refused.iter().any(|e| e["botId"] == bb.id.as_str() && e["details"]["reason"] == "no_machine" && e["outcome"] == "denied"), "{refused:?}");
 
+    // Her agent doesn't answer: refused, and said why.
+    *link.heartbeat.lock().unwrap() = Err("connection refused".into());
+    let said = run(&w, &a, &ab.id, "hi").await;
+    assert!(said.contains("offline (connection refused)"), "{said}");
+    *link.heartbeat.lock().unwrap() = Recording::default().heartbeat.into_inner().unwrap();
+
     // Suspended: refused again.
     assert_eq!(call(port, "POST", &format!("/api/users/{a_id}/machine/suspend"), &admin, "").await.0, 200);
     let said = run(&w, &a, &ab.id, "hi").await;
     assert!(said.contains("suspended"), "{said}");
     assert_eq!(fake.calls("create"), 1);
+
+    // Unassigned: refused under `on`, with the reason.
+    let (code, v) = call(port, "DELETE", &format!("/api/users/{a_id}/placement"), &admin, "").await;
+    assert_eq!((code, parse(&v)["runsOn"].as_str()), (200, Some("nowhere")), "{v}");
+    assert!(!events(port, &admin, "action=placement.unassigned").await.is_empty());
 }
 
 #[test]
 fn the_unenrolled_link_refuses_every_job() {
-    use crate::machines::route::{Assigned, Job, MachineLink, Unenrolled};
+    use crate::machines::route::{Assigned, MachineLink, Unenrolled};
+    use crate::machines::wire::JobEvent;
     let to = Assigned { machine_id: "m1".into(), user_id: "u1".into(), address: Some("192.0.2.1".into()), pins: vec![] };
-    let job = Job { bot_id: "b1".into(), owner_id: "u1".into(), message_id: 1 };
-    let r = tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(Unenrolled.dispatch(&to, job));
-    assert!(r.unwrap_err().contains("can't send work"));
+    let job: crate::machines::wire::JobRequest = serde_json::from_value(json!({
+        "protocol": 1, "jobId": "j1", "botId": "b1", "ownerId": "u1", "messageId": 1, "bin": "claude", "args": [], "env": {}, "cwd": "/",
+        "stdin": null, "files": [], "cleanup": null, "collect": []
+    }))
+    .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let (_abort_tx, abort) = tokio::sync::watch::channel(None);
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    rt.block_on(Unenrolled.run(&to, job, abort, tx));
+    let Some(JobEvent::Error { message }) = rx.try_recv().ok() else { panic!("an error") };
+    assert!(message.contains("can't reach machines"), "{message}");
 }

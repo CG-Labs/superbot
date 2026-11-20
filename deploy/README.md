@@ -179,6 +179,24 @@ On first boot, cloud-init downloads `superbot-machine` from botd. The download t
 
 A machine that hasn't enrolled within the timeout shows "Didn't enroll in time" in the console, and botd records `machine.enroll_timeout` once. Open the machine's Lish console in Linode Cloud Manager and read `/var/log/cloud-init-output.log`. Then issue a new token and run `superbot-machine enroll` there, or destroy the machine and request a new one. Firewall changes are audited as `machine.firewall_*`. Design: [ADR 0035](../docs/adr/0035-machine-firewall-auto-enroll.md).
 
+### Running Bots on machines
+
+Once machines enroll, choose where Bots run with `MACHINE_ROUTING` in `.env`:
+
+```sh
+MACHINE_ROUTING=assigned   # off (default): all here; assigned: assigned users on their machine; on: everyone, or refused
+```
+
+Then move users over one at a time, on the server:
+
+```sh
+botctl machine assign <user>       # their machine must be running and enrolled
+botctl machine placement [<user>]  # where each user's Bots run, and why
+botctl machine unassign <user>     # back to this server (with MACHINE_ROUTING=assigned)
+```
+
+An assigned user's Bots run only on their machine. If it is down, suspended, outdated, or missing the Bot's harness, the Bot says so and nothing runs here instead. New machines download `botctl` from botd as well as the agent, so keep `botctl` next to `botd` (the installer and image do). On the machine, Bots reach botd through the agent on `127.0.0.1:7444` (loopback only; no new firewall rule). The harness CLIs themselves aren't installed on machines yet. Design: [ADR 0036](../docs/adr/0036-bots-on-the-users-machine.md).
+
 ## Approvals after an upgrade
 
 Fresh installs ask before risky actions. An install from before approvals keeps running without them (`bypass`) after `--upgrade`, and botd logs a warning at start. To opt in, on the server:

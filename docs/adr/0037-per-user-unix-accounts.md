@@ -61,7 +61,7 @@ On an upgrade, the installer keeps isolation on if root's sudoers rule exists, a
 | `<id>/workspace/` | account:botd, `2770` | Where the user's Bots work |
 | `<id>/memory/` | root:botd, `2770`, ACL account `rwx` | `USER.md` and `<bot id>.md`, copies botd makes |
 
-botd keeps its own copies of memory in `DATA_DIR`, so backups and handovers keep working. It seeds a run's copy (never overwriting, never through a link), and after each run reads it back with `O_NOFOLLOW`, only from a real folder it or root made, at most 1 MiB. When a Bot changes hands, its memory leaves the old owner's folder. `state_dir` stays in `DATA_DIR`; Claude Code and Codex don't use it.
+botd keeps its own copies of memory in `DATA_DIR`, so backups and handovers keep working. It seeds a run's copy (never overwriting, never through a link), and after each run reads it back with `O_NOFOLLOW`, only from a real folder it or root made, at most 1 MiB. When a Bot changes hands, its memory leaves the old owner's folder. A run on the user's machine ([ADR 0036](0036-bots-on-the-users-machine.md)) takes botd's copies; the files it sends back replace them and drop the copies in the user's folder here, so the next run here starts from them. `state_dir` stays in `DATA_DIR`; Claude Code and Codex don't use it.
 
 ### Runs
 
