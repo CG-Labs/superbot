@@ -221,7 +221,7 @@ async fn the_sandbox_is_on_for_new_installs_set_per_bot_and_audited() {
     // Back to inheriting.
     let (_, body) = call(port, "PUT", &path, &admin, r#"{"sandbox":null}"#).await;
     assert!(parse(&body)["override"].is_null());
-    assert_eq!(app.db.effective_policy(&bot.id).sandbox, true);
+    assert!(app.db.effective_policy(&bot.id).sandbox);
 
     let (_, audit) = call(port, "GET", &format!("/api/audit?action=policy.updated&bot={}", bot.id), &admin, "").await;
     let events = audit_list(&audit);
