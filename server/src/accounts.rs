@@ -40,6 +40,8 @@ pub struct Isolation {
     /// `superbot-run`, next to botd.
     pub runner: PathBuf,
     pub userctl: PathBuf,
+    /// One account setup at a time, so two first runs don't both run `useradd`.
+    setup: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 /// How one run starts as its owner's account.
@@ -98,6 +100,7 @@ impl Isolation {
             sudo: or("ISOLATION_SUDO", DEFAULT_SUDO).into(),
             runner: bin_dir.join("superbot-run"),
             userctl: or("ISOLATION_USERCTL", DEFAULT_USERCTL).into(),
+            setup: Default::default(),
         };
         for (what, p) in [("sudo", &iso.sudo), ("superbot-run", &iso.runner), ("superbot-userctl", &iso.userctl)] {
             if !p.is_file() {
@@ -147,6 +150,7 @@ impl Isolation {
     /// Ok(true): made now. Blocking.
     pub fn ensure(&self, user_id: &str) -> Result<bool, String> {
         account(user_id).ok_or_else(|| format!("{user_id:?} can't be part of a Unix account name"))?;
+        let _one = self.setup.lock().unwrap_or_else(|e| e.into_inner());
         if self.ready(user_id) {
             return Ok(false);
         }
@@ -323,7 +327,7 @@ pub mod http {
 
 #[cfg(test)]
 pub(crate) fn for_tests(root: &Path, sudo: &str) -> Isolation {
-    Isolation { root: root.to_path_buf(), sudo: sudo.into(), runner: "/usr/local/bin/superbot-run".into(), userctl: DEFAULT_USERCTL.into() }
+    Isolation { root: root.to_path_buf(), sudo: sudo.into(), runner: "/usr/local/bin/superbot-run".into(), userctl: DEFAULT_USERCTL.into(), setup: Default::default() }
 }
 
 #[cfg(test)]
@@ -429,5 +433,20 @@ mod tests {
         assert_eq!(read_plain(&swapped.join("secret"), MAX_FILE), None);
         assert!(seed(&swapped.join("new.md"), "x").is_err());
         assert!(!dir.join("new.md").exists());
+    }
+
+    #[test]
+    fn account_setups_never_overlap() {
+        let dir = crate::db::temp_path("setup");
+        let log = dir.join("log");
+        let sudo = dir.join("sudo");
+        std::fs::write(&sudo, format!("#!/bin/sh\necho start >>'{0}'\nsleep 0.3\necho end >>'{0}'\nexit 1\n", log.display())).unwrap();
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let iso = for_tests(&dir, sudo.to_str().unwrap());
+        let runs: Vec<_> = (0..2).map(|_| std::thread::spawn({ let iso = iso.clone(); move || iso.ensure("u1") })).collect();
+        for r in runs {
+            assert!(r.join().unwrap().is_err());
+        }
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "start\nend\nstart\nend\n");
     }
 }

@@ -41,6 +41,10 @@ SERVICE_GROUP=$(conf_value SERVICE_GROUP)
 getent group "$SERVICE_GROUP" >/dev/null || die "no group $SERVICE_GROUP"
 getent group "$RUN_GROUP" >/dev/null || die "no group $RUN_GROUP (run deploy/install.sh --isolation)"
 
+# One at a time: two first runs for one user must not both run useradd.
+exec 9>/run/superbot-userctl.lock
+flock 9
+
 # Every folder from / down to ISOLATION_DIR is a real folder only root can change, so no one
 # else can swap a link into the path this script then chowns and chmods.
 trusted_path() {
