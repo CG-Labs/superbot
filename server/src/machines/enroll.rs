@@ -1087,9 +1087,12 @@ impl Mtls {
             tokio::select! {
                 chunk = r.chunk() => match chunk {
                     Ok(Some(bytes)) => {
+                        // What was already in `buf` has no newline: search only what's new.
+                        let mut from = buf.len();
                         buf.extend_from_slice(&bytes);
-                        while let Some(i) = buf.iter().position(|b| *b == b'\n') {
-                            let line: Vec<u8> = buf.drain(..=i).collect();
+                        while let Some(i) = buf[from..].iter().position(|b| *b == b'\n') {
+                            let line: Vec<u8> = buf.drain(..=from + i).collect();
+                            from = 0;
                             let Ok(ev) = serde_json::from_slice::<JobEvent>(&line) else { continue };
                             if !matches!(ev, JobEvent::Ping) && tx.send(ev).await.is_err() {
                                 stop_there("botd stopped listening".into());
