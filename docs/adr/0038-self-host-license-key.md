@@ -4,7 +4,7 @@
 
 Accepted (20 Nov 2026). Part of [#34](https://github.com/CG-Labs/superbot/issues/34) (M3, billing and licensing). Builds on users and RBAC ([ADR 0012](0012-users-sessions-rbac.md)), the audit log ([ADR 0009](0009-audit-events.md)), tiers ([ADR 0033](0033-tiers-model-routing.md)), and the setup wizard ([ADR 0034](0034-onboarding-wizard.md)).
 
-0037 is taken by [PR #94](https://github.com/CG-Labs/superbot/pull/94), so this is 0038.
+0037 is per-user Unix accounts ([ADR 0037](0037-per-user-unix-accounts.md), [PR #94](https://github.com/CG-Labs/superbot/pull/94)), so this is 0038.
 
 ## Context
 
@@ -63,6 +63,8 @@ A license never allows fewer than the community edition's 10. Admins are warned 
 A seat is an active user other than the owner (break-glass) account, which always works so admins can't be locked out. Seats are checked inside the same database lock and transaction as every way a person becomes active: an admin adding or re-enabling someone, SSO just-in-time sign-up, approving an access request, and SCIM creating or re-activating a user. So concurrent requests can't both take the last seat. The `Db` holds a seat-cap callback the license sets at start; nothing else needs threading through.
 
 Over the limit (a license removed or ended, or seats lowered), nobody is signed out, disabled, or loses a session. Only adding or re-enabling people is refused, with a `403` that names the limit and what to do; SSO sends people to `/login?error=sso_no_seat`, and a refused access request stays pending. Disabling people, renaming them, or changing roles needs no seat. A SCIM user provisioned inactive takes no seat until it is activated.
+
+With per-user Unix accounts on ([ADR 0037](0037-per-user-unix-accounts.md), `ISOLATION=users`), a seat is still a person, not an account: each active user has at most one `sb-u-<id>` account, and making it, or logging a harness in as it, takes no extra seat. A disabled user keeps their account and folders but holds no seat, so botd won't make their account or start a harness login as them (`400`), and their Bots can't run. Re-enabling them needs a seat as usual.
 
 The community limit is the default for a server without a license, including existing ones. That is the point of the license, but it means an upgraded server with more than 10 active people keeps everyone and can't add more until it has a license. The setup wizard's new checklist item, the console, and the start-up log say so.
 

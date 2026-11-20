@@ -27,7 +27,18 @@ CLIENT_DIR=${CLIENT_DIR:-/var/www/superbot-app}
 SITE_DIR=${SITE_DIR:-/var/www/superbot-site}
 CLIENT_BASE_URL=/app
 BUILD_CLIENT=true
-DEPLOY_FILES=(superbot.service superbot-backup.sh superbot-restore.sh superbot-backup.service superbot-backup.timer)
+# Exit status when everything else installed but this run's web client did not.
+CLIENT_NOT_INSTALLED_EXIT=3
+CLIENT_NOT_INSTALLED=""
+DEPLOY_FILES=(superbot.service superbot-backup.sh superbot-restore.sh superbot-backup.service superbot-backup.timer superbot-userctl.sh)
+# Per-user accounts (docs/adr/0037-per-user-unix-accounts.md): "" keeps what root set up last.
+ISOLATION_MODE=""
+# Unset: the one in root's isolation.conf, else /srv/superbot/users (isolation_dir).
+ISOLATION_DIR=${ISOLATION_DIR:-}
+ISOLATION_GROUP=superbot-users
+ISOLATION_CONF=/etc/superbot/isolation.conf
+USERCTL_BIN=/usr/local/sbin/superbot-userctl
+SUDOERS_FILE=/etc/sudoers.d/superbot-isolation
 
 log() { printf '==> %s\n' "$*"; }
 warn() { printf '!! %s\n' "$*" >&2; }
@@ -49,6 +60,9 @@ Usage: install.sh [options]
   --no-backup         Skip daily DATA_DIR backup timer
   --with-hermes       Also install the Hermes Agent CLI (about 2.5 GB; HERMES_COMMIT pins it)
   --license-file PATH Install the license key CG-Labs sent (without one: community edition)
+  --isolation         Run each user's Bots as their own Unix account (ISOLATION=users; ADR 0037).
+                      ISOLATION_DIR sets where their folders go (default /srv/superbot/users)
+  --no-isolation      Turn that off again (accounts and their folders are kept)
   --no-client         Skip building the web client (served at /app/)
   --dry-run           Print actions without changing the system
   --non-interactive   Fail instead of prompting for missing flags
@@ -73,6 +87,8 @@ parse_args() {
       --no-backup) ENABLE_BACKUP=false; shift ;;
       --with-hermes) WITH_HERMES=true; shift ;;
       --license-file) LICENSE_FILE=$2; shift 2 ;;
+      --isolation) ISOLATION_MODE=users; shift ;;
+      --no-isolation) ISOLATION_MODE=off; shift ;;
       --no-client) BUILD_CLIENT=false; shift ;;
       --dry-run) DRY_RUN=true; shift ;;
       --non-interactive) INTERACTIVE=false; shift ;;
@@ -197,8 +213,8 @@ stage_trusted_deploy() {
 # or as whom.
 render_unit() {
   local template=$1 out=$2 fixed=$3 tmp
-  if grep -Ev '^[[:space:]]*ExecStart[[:space:]]*=' "$template" |
-    grep -Eq '^[[:space:]]*(Exec[A-Za-z]*|DynamicUser|SupplementaryGroups|AmbientCapabilities|PermissionsStartOnly|RootDirectory|RootImage|Alias)[[:space:]]*='; then
+  if grep -Eq '^[[:space:]]*(Exec[A-Za-z]*|DynamicUser|SupplementaryGroups|AmbientCapabilities|PermissionsStartOnly|RootDirectory|RootImage|Alias)[[:space:]]*=' \
+    <<<"$(grep -Ev '^[[:space:]]*ExecStart[[:space:]]*=' "$template")"; then
     die "Refusing $template: unexpected privileged directive"
   fi
   tmp=$(mktemp)
@@ -265,7 +281,7 @@ install_rustup_user() {
     log "[dry-run] install rustup for $SUPERBOT_USER"
     return
   fi
-  if sudo -u "$SUPERBOT_USER" -H bash -lc 'command -v cargo' 2>/dev/null | grep -q cargo; then
+  if sudo -u "$SUPERBOT_USER" -H bash -lc 'command -v cargo' >/dev/null 2>&1; then
     log "Rust toolchain present for $SUPERBOT_USER"
     return
   fi
@@ -321,6 +337,7 @@ build_botd() {
   run install -m 0755 "$repo_path/target/release/botd" "$BIN_DIR/botd"
   run install -m 0755 "$repo_path/target/release/botctl" "$BIN_DIR/botctl"
   run install -m 0755 "$repo_path/target/release/superbot-machine" "$BIN_DIR/superbot-machine"
+  run install -m 0755 "$repo_path/target/release/superbot-run" "$BIN_DIR/superbot-run"
 }
 
 releases_dir() { printf '%s.releases\n' "$1"; }
@@ -352,20 +369,26 @@ build_client() {
   log "Building the web client"
   if ! sudo -u "$SUPERBOT_USER" -H env CI=1 EXPO_NO_TELEMETRY=1 ELECTRON_SKIP_BINARY_DOWNLOAD=1 SUPERBOT_WEB_BASE_URL="$CLIENT_BASE_URL" \
     bash -lc "cd '$client' && npm ci --no-audit --no-fund && npx expo export --platform web --output-dir dist-app"; then
-    warn "Web client build failed: keeping the previous one, if any"
+    client_not_installed "Web client build failed"
     return
   fi
-  install_client "$client/dist-app" || warn "Web client not installed: keeping the previous one, if any"
+  install_client "$client/dist-app" || client_not_installed "Web client not installed"
+}
+
+# main exits non-zero at the end, so an upgrade can't quietly leave /app/ on the old client.
+client_not_installed() {
+  CLIENT_NOT_INSTALLED=$1
+  warn "$1: keeping the previous one, if any"
 }
 
 # Plain files and folders only (no links, devices, or ".."), with an index.html.
+# Never pipe tar into `grep -q`: grep exits at the first match, tar dies of SIGPIPE, and
+# pipefail turns a good archive into a refused one (#93).
 client_archive_ok() {
-  local archive=$1
-  tar -tvf "$archive" | awk '{ t = substr($0, 1, 1) } t != "-" && t != "d" { bad = 1 } END { exit bad }' || return 1
-  if tar -tf "$archive" | grep -Eq '^/|(^|/)\.\.(/|$)'; then
-    return 1
-  fi
-  tar -tf "$archive" | grep -qx './index.html'
+  local archive=$1 entries names
+  entries=$(tar -tvf "$archive") && names=$(tar -tf "$archive") || return 1
+  awk '{ t = substr($0, 1, 1) } t != "-" && t != "d" { bad = 1 } END { exit bad }' <<<"$entries" || return 1
+  ! grep -Eq '^/|(^|/)\.\.(/|$)' <<<"$names" && grep -qx './index.html' <<<"$names"
 }
 
 install_client() { install_release "$CLIENT_DIR" "$1" "web client"; }
@@ -499,7 +522,9 @@ configure_env() {
 
   if ! grep -q '^AUTH_PASSWORD=.' "$env_file" && ! grep -q '^AUTH_PASSWORD_FILE=.' "$env_file"; then
     local pass
-    pass=$(openssl rand -base64 32 | tr -d '/+=' | head -c 32)
+    pass=$(openssl rand -base64 48 | tr -d '/+=\n')
+    pass=${pass:0:32}
+    [[ ${#pass} == 32 ]] || die "Could not generate a password"
     set_env_var "$env_file" AUTH_PASSWORD "$pass"
     printf '%s\n' "$pass" >"$pass_file"
     chown "$SUPERBOT_USER:$SUPERBOT_USER" "$pass_file"
@@ -663,6 +688,122 @@ backup_unit_fixed() {
     "ExecStart=$BIN_DIR/superbot-backup --home $home"
 }
 
+# --isolation or --no-isolation, else what .env already says, so an upgrade keeps it.
+# Root-owned and writable by root alone, so botd's account can't steer root through it.
+root_only() {
+  [[ -f "$1" && ! -L "$1" && "$(stat -c '%u' "$1")" == 0 && $(( 0$(stat -c '%a' "$1") & 022 )) == 0 ]]
+}
+
+# On or off: the flag, else whether root's sudoers rule is there. Never .env, which
+# botd's account can write.
+isolation_mode() {
+  if [[ -n "$ISOLATION_MODE" ]]; then
+    printf '%s\n' "$ISOLATION_MODE"
+  elif root_only "$SUDOERS_FILE"; then
+    echo users
+  else
+    echo off
+  fi
+}
+
+isolation_sudoers() {
+  cat <<EOF
+# SuperBot per-user accounts (docs/adr/0037-per-user-unix-accounts.md). Written by
+# deploy/install.sh --isolation; --no-isolation removes it. botd's account may start
+# superbot-run (which runs a harness) as a per-user account, keeping the run's env, and
+# make a user's account with the root helper. Nothing else, and no one else.
+Defaults!$BIN_DIR/superbot-run !syslog
+$SUPERBOT_USER ALL=(%$ISOLATION_GROUP) NOPASSWD:SETENV: $BIN_DIR/superbot-run
+$SUPERBOT_USER ALL=(root) NOPASSWD: $USERCTL_BIN ensure *
+EOF
+}
+
+isolation_dropin() {
+  cat <<'EOF'
+# SuperBot per-user accounts (docs/adr/0037-per-user-unix-accounts.md), from deploy/install.sh.
+[Service]
+# sudo is setuid: botd needs it to start runs as each user's account.
+NoNewPrivileges=false
+# Runs see only their own account's processes, not other users' command lines.
+ProtectProc=invisible
+EOF
+}
+
+# ISOLATION_DIR as given, else root's saved one, so an upgrade keeps a custom folder.
+isolation_dir() {
+  local saved=""
+  if root_only "$ISOLATION_CONF"; then
+    saved=$(sed -n 's/^ISOLATION_DIR=//p' "$ISOLATION_CONF" | tail -n 1)
+  fi
+  if [[ -n "$ISOLATION_DIR" ]]; then
+    if [[ -n "$saved" && "$saved" != "$ISOLATION_DIR" ]]; then
+      warn "ISOLATION_DIR changes from $saved to $ISOLATION_DIR: existing accounts keep their homes in $saved, and botd refuses their runs until they're moved by hand"
+    fi
+    printf '%s\n' "$ISOLATION_DIR"
+  else
+    printf '%s\n' "${saved:-/srv/superbot/users}"
+  fi
+}
+
+# Per-user accounts on or off. On: the root helper, the sudoers rule, the unit drop-in,
+# the users' folder, and ISOLATION=users in .env. Off: the rule and drop-in go; accounts
+# and their folders stay, as data.
+configure_isolation() {
+  local mode home env_file group dropin tmp
+  mode=$(isolation_mode)
+  home=$(user_home)
+  env_file="$home/superbot/.env"
+  ISOLATION_DIR=$(isolation_dir)
+  dropin="$SYSTEMD_DIR/superbot.service.d/isolation.conf"
+  if [[ "$mode" != users ]]; then
+    [[ "$ISOLATION_MODE" == off ]] || return 0
+    if [[ "$DRY_RUN" == true ]]; then
+      log "[dry-run] would set ISOLATION=off in $env_file and remove $SUDOERS_FILE and $dropin"
+      return
+    fi
+    log "Per-user accounts: off (accounts and $ISOLATION_DIR are kept)"
+    rm -f "$SUDOERS_FILE" "$dropin"
+    set_env_var "$env_file" ISOLATION off
+    return
+  fi
+  [[ "$ISOLATION_DIR" =~ ^(/[A-Za-z0-9._-]+)+$ && "$ISOLATION_DIR/" != */../* ]] || die "ISOLATION_DIR must be a plain absolute path: $ISOLATION_DIR"
+  case "$ISOLATION_DIR/" in
+    "$home"/*) die "ISOLATION_DIR must not be under $home" ;;
+  esac
+  if [[ "$DRY_RUN" == true ]]; then
+    log "[dry-run] would install $USERCTL_BIN, $SUDOERS_FILE, and $dropin, make $ISOLATION_DIR (root, 0711) and group $ISOLATION_GROUP, chmod 0750 $home, and set ISOLATION=users in $env_file"
+    return
+  fi
+  log "Per-user accounts: on, in $ISOLATION_DIR"
+  apt-get install -y -qq acl sudo
+  group=$(id -gn "$SUPERBOT_USER")
+  groupadd -r -f "$ISOLATION_GROUP"
+  install -d -m 0755 -o root -g root /etc/superbot
+  # The folders above it are checked (root's, only root's to write) by the helper, not changed.
+  [[ -d "$(dirname "$ISOLATION_DIR")" ]] || install -d -m 0755 -o root -g root "$(dirname "$ISOLATION_DIR")"
+  install -d -m 0711 -o root -g root "$ISOLATION_DIR"
+  chown root:root "$ISOLATION_DIR"
+  chmod 0711 "$ISOLATION_DIR"
+  tmp=$(mktemp)
+  printf '%s\n' "# Read by $USERCTL_BIN. Written by deploy/install.sh." "ISOLATION_DIR=$ISOLATION_DIR" "SERVICE_GROUP=$group" >"$tmp"
+  install -m 0644 -o root -g root "$tmp" "$ISOLATION_CONF"
+  install -m 0755 -o root -g root "$(trusted_deploy_dir)/superbot-userctl.sh" "$USERCTL_BIN"
+  isolation_sudoers >"$tmp"
+  visudo -cqf "$tmp" || { rm -f "$tmp"; die "The sudoers rule for per-user accounts didn't check out"; }
+  install -m 0440 -o root -g root "$tmp" "$SUDOERS_FILE"
+  install -d -m 0755 -o root -g root "$(dirname "$dropin")"
+  isolation_dropin >"$tmp"
+  install -m 0644 -o root -g root "$tmp" "$dropin"
+  rm -f "$tmp"
+  # Per-user accounts must not read botd's database, .env, or master key.
+  chmod 0750 "$home"
+  set_env_var "$env_file" ISOLATION users
+  set_env_var "$env_file" ISOLATION_DIR "$ISOLATION_DIR"
+  if [[ "$WITH_HERMES" == true ]]; then
+    warn "Hermes and Pi Bots don't run with per-user accounts yet: switch them to Claude Code or Codex"
+  fi
+}
+
 install_systemd() {
   local home deploy unit
   home=$(user_home)
@@ -818,6 +959,11 @@ summary() {
   if [[ -n "$DOMAIN" ]] && client_installed; then
     app="https://${DOMAIN}/app/"
   fi
+  if [[ -n "$CLIENT_NOT_INSTALLED" ]] && ! client_installed; then
+    app="not served (this run's web client was not installed)"
+  elif [[ -n "$CLIENT_NOT_INSTALLED" && -n "$DOMAIN" ]]; then
+    app="$app (still the previous web client: this run's was not installed)"
+  fi
   cat <<EOF
 
 SuperBot is installed.
@@ -842,12 +988,30 @@ Next steps (as the service user):
   # Hermes Agent (--with-hermes): save its provider key with botctl secret set (docs/backend.md)
 
 EOF
+  if [[ "$(isolation_mode)" == users ]]; then
+    cat <<EOF
+Per-user accounts are on (ISOLATION=users, docs/adr/0037-per-user-unix-accounts.md):
+  each user's Bots run as sb-u-<user id>, in $ISOLATION_DIR/<user id>. Install harness
+  CLIs system-wide (sudo npm install -g ...), not in ~/.local, so every account finds them.
+  Then log a harness in for each user, as $SUPERBOT_USER, at a terminal:
+    botctl user harness-login <user> claude    # or codex
+  Only Claude Code and Codex Bots run this way so far.
+
+EOF
+  fi
   if [[ -f "$pass_file" ]] && [[ "${NEW_PASSWORD_FILE:-}" == "$pass_file" ]]; then
     warn "New login password (saved to $pass_file): $(cat "$pass_file")"
   fi
   if [[ -n "${NEW_MASTER_KEY_FILE:-}" ]]; then
     warn "New master key at $NEW_MASTER_KEY_FILE. Copy it somewhere safe, away from your database backups."
   fi
+}
+
+finish() {
+  [[ -n "$CLIENT_NOT_INSTALLED" ]] || return 0
+  warn "$CLIENT_NOT_INSTALLED. Everything else is installed, but /app/ still serves the previous web client, if any."
+  warn "Fix the cause above and re-run the installer. Exiting with status $CLIENT_NOT_INSTALLED_EXIT."
+  exit "$CLIENT_NOT_INSTALLED_EXIT"
 }
 
 main() {
@@ -875,11 +1039,13 @@ main() {
   ensure_master_key
   install_license
   install_hermes
+  configure_isolation
   install_systemd
   install_backup
   install_caddy
   configure_ufw
   summary
+  finish
 }
 
 # CI sources the functions without running the install.

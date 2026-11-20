@@ -1243,7 +1243,7 @@ async fn a_users_bot_runs_on_their_machine_with_approvals_and_memory() {
 
     // What it learned there is botd's now too, once the run is over.
     wait_for_event(&env, "bot.run_finished").await;
-    let memory = std::fs::read_to_string(env.app.memory_file(&bot.id).unwrap()).unwrap();
+    let memory = std::fs::read_to_string(env.app.data_memory_file(&bot.id).unwrap()).unwrap();
     assert!(memory.contains("- learned on the machine"), "{memory}");
 
     let routed = events(&env, "bot.run_routed").await;
@@ -1280,6 +1280,59 @@ async fn a_users_bot_runs_on_their_machine_with_approvals_and_memory() {
     let refused = events(&env, "bot.run_refused").await;
     assert_eq!(reason_count(&refused, "machine_offline"), 1, "{refused:?}");
     assert_eq!(events(&env, "harness.invoked").await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_bot_on_its_owners_machine_skips_this_servers_accounts() {
+    let mut env = serve().await;
+    let (uid, mid, token) = machine_for(&env, "ada@example.com").await;
+    let m = agent_with(&mut env, &mid, &token, CHAT).await;
+    // Per-user accounts on, but no account can be made: a run here would be refused.
+    let root = crate::db::temp_path("iso-machine");
+    let _ = env
+        .app
+        .isolation
+        .set(Arc::new(crate::accounts::for_tests(&root, "/bin/false")));
+    let bot = env.app.db.create_bot_owned(
+        "Ada's",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &uid,
+        crate::acl::Visibility::Shared,
+    );
+    env.app.init_bot_files(&bot);
+    let kept = env.app.data_memory_file(&bot.id).unwrap();
+    std::fs::write(&kept, "# Ada's\n- kept by botd\n").unwrap();
+    let copy = env.app.memory_file(&bot).unwrap();
+    std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    std::fs::write(&copy, "# Ada's\n- stale copy on the server\n").unwrap();
+
+    std::fs::write(m.home.join("go"), "hi").unwrap();
+    let before = send(&env, &bot.id, "hello").await;
+    let said = reply_after(&env, &bot.id, before).await;
+    assert_eq!(
+        said,
+        format!("pwd={} said=hi", m.home.join("work").display())
+    );
+    let finished = wait_for_event(&env, "bot.run_finished").await;
+    assert_eq!(finished[0]["outcome"], "success", "{finished:?}");
+    assert!(events(&env, "bot.run_refused").await.is_empty());
+    assert!(events(&env, "isolation.*").await.is_empty());
+    let invoked = &events(&env, "harness.invoked").await[0];
+    assert_eq!(invoked["details"]["host"], "machine");
+    assert!(invoked["details"].get("runAs").is_none(), "{invoked}");
+
+    // botd's copy went there and came back; the server's copy is out of date, so it's gone.
+    let memory = std::fs::read_to_string(&kept).unwrap();
+    assert!(
+        memory.contains("- kept by botd") && memory.contains("- learned on the machine"),
+        "{memory}"
+    );
+    assert!(!memory.contains("stale"), "{memory}");
+    assert!(!copy.exists());
 }
 
 #[tokio::test]

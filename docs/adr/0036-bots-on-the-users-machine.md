@@ -116,7 +116,7 @@ Approvals made from the machine are audited exactly as local ones.
 - **Harness logins and server-wide secrets.** Per-user secrets reach the machine in the job env, as they reach local runs. Server-wide secrets do too. Harness logins (`~/.claude`, `~/.codex`) aren't moved yet.
 - **The user's existing folder.** `WORKSPACE_DIR/users/<id>` on the server isn't copied to the machine. The machine's `work` starts empty.
 - **Screens on machines.** Runs there get no screen yet.
-- **The agent runs as root**, so a Bot there could read the agent's key. A separate OS user for Bots belongs with #30's OS isolation.
+- **The agent runs as root**, so a Bot there could read the agent's key. A separate OS user for Bots belongs with #30's OS isolation ([ADR 0037](0037-per-user-unix-accounts.md) does it on one server; runs sent to a machine skip it).
 - **Agent upgrades.** A machine keeps the agent it installed. An outdated one is refused, not upgraded.
 - **Firewall.** Restricting the agent port at the provider is [ADR 0035](0035-machine-firewall-auto-enroll.md) (`MACHINE_FIREWALL=on`, off by default). Without it, mutual TLS and the control-plane-only admit are the defence.
 - **Per-peer connection limits** on botd's machine port.
