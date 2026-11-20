@@ -10,6 +10,9 @@
 
 #[path = "../passwd.rs"]
 mod passwd;
+#[path = "../sandbox.rs"]
+#[allow(dead_code)]
+mod sandbox;
 
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
@@ -82,6 +85,9 @@ async fn main() -> ExitCode {
     // botd's /tmp is shared by every account's runs; this one isn't.
     let tmp = home.join(".tmp");
     let _ = std::fs::DirBuilder::new().mode(0o700).create(&tmp);
+    // Package caches a sandboxed run may write (ADR 0055); botd lists them, but only the
+    // account can make them in its home.
+    sandbox::ensure_caches(&home);
     let mut cmd = tokio::process::Command::new(&bin);
     cmd.args(args)
         .env("TMPDIR", &tmp)

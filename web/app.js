@@ -535,6 +535,7 @@ $("license-box").addEventListener("click", async (e) => {
 // and rules for all Bots. Each Bot's own settings and rules are edited in the app.
 
 const ACTIONS = { allow: "Allow", ask: "Ask", deny: "Deny" };
+const HARNESS_NAMES = { claude: "Claude Code", codex: "Codex", pi: "Pi", hermes: "Hermes Agent" };
 const TOOLS = { "*": "Any tool", shell: "Shell", file: "Files", web: "Web", mcp: "MCP", other: "Other tools" };
 
 // Saves run one at a time, so an older answer never replaces a newer one on screen.
@@ -570,7 +571,9 @@ async function loadPolicy() {
   showPolicy(v.policy);
   const sb = v.sandbox;
   $("policy-sandbox-hint").textContent = "Codex and Claude Code run commands in their own sandbox: they write only in the workspace, temp folders, the Bot's memory, and package caches. It holds in Bypass too."
-    + (sb && !sb.available ? " Sandboxes can't start on this server, so runs here go without: install bubblewrap and socat." : "");
+    + (sb && sb.harnesses.some((h) => !sb.available.includes(h))
+      ? ` ${sb.harnesses.filter((h) => !sb.available.includes(h)).map((h) => HARNESS_NAMES[h] || h).join(" and ")}'s sandbox can't start on this server, so those runs go without: install bubblewrap and socat.`
+      : "");
   const rules = v.rules || [];
   $("rules-empty").textContent = "No rules for all Bots.";
   $("rules-empty").hidden = rules.length > 0;

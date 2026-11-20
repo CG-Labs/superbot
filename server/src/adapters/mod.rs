@@ -192,6 +192,10 @@ pub trait Adapter: Send {
     fn has_sandbox(&self) -> bool {
         false
     }
+    /// What its sandbox needs from the host beyond user namespaces, of `sandbox::PROGRAMS`.
+    fn sandbox_needs(&self) -> &'static [&'static str] {
+        &[]
+    }
     /// The longest hook timeout the harness accepts, if it caps it.
     fn max_hook_secs(&self) -> Option<u64> {
         None

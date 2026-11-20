@@ -247,7 +247,7 @@ impl Config {
             user_file: p(self.home.join("USER.md")),
             api: format!("http://{}", self.api_listen),
             botctl: runnable(&self.botctl, &self.roots()).then(|| p(self.botctl.clone())),
-            sandbox: Some(crate::sandbox::available()),
+            sandbox: Some(crate::sandbox::host()),
             caches: crate::sandbox::caches(&self.home).into_iter().map(p).collect(),
         }
     }
@@ -1102,6 +1102,16 @@ fn work_dirs(cfg: &Config, user: Option<Ids>) -> Result<(), String> {
     .map_err(|e| e.to_string())?
 }
 
+/// The layout, with the Bots' package caches made first, as their user, so a sandboxed
+/// run's first build has somewhere to download to (ADR 0055).
+fn layout(a: &Agent) -> wire::Layout {
+    let mut l = a.cfg.layout();
+    if let Ok(made) = runas::as_user(a.bot().ids, || crate::sandbox::ensure_caches(&a.cfg.home)) {
+        l.caches = made.into_iter().map(|p| p.display().to_string()).collect();
+    }
+    l
+}
+
 /// Only the control plane's certificate gets here (`admit`), so answering one is the
 /// proof an upgraded agent works: its trial ends.
 async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<wire::Heartbeat> {
@@ -1117,7 +1127,7 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
         certificate: id.fingerprint.clone(),
         time: now_ms(),
         protocol: wire::PROTOCOL,
-        layout: Some(a.cfg.layout()),
+        layout: Some(layout(&a)),
         missing: bins(q.as_deref())
             .into_iter()
             .filter(|(_, known)| !known.is_some_and(|k| a.cfg.has(k)))

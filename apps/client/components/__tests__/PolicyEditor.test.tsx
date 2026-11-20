@@ -23,7 +23,7 @@ const CLASSES = [
 /** A fake botd: a global policy, per-Bot overrides where null inherits, and rules. */
 function fakeApi() {
   let global: Policy = { mode: "ask", classes: { shell_destructive: "ask", git_push: "ask" }, timeoutMinutes: 10, sandbox: true };
-  const sandbox = { harnesses: ["claude", "codex"], available: true };
+  const sandbox = { harnesses: ["claude", "codex"], available: ["claude", "codex"] };
   const overrides = new Map<string, PolicyOverride>();
   let rules: PolicyRule[] = [{ id: "g1", botId: null, action: "deny", tool: "shell", pattern: "rm -rf /*", note: "never", at: 1 }];
   let n = 0;
@@ -139,6 +139,7 @@ describe("PolicyEditor (ADR 0049)", () => {
     const { rerender } = await render(<PolicyEditor api={api} canEdit onBack={jest.fn()} confirm={no} />);
     const card = await screen.findByLabelText("Sandbox");
     expect(within(card).getByText(/Claude Code and Codex have one/)).toBeOnTheScreen();
+    expect(within(card).queryByText(/can't start/)).toBeNull();
     expect(within(card).getByRole("radio", { name: "On" })).toBeChecked();
     await user.press(within(card).getByRole("radio", { name: "Off" }));
     expect(no).toHaveBeenCalledWith("Turn the sandbox off?", expect.stringContaining("every Bot"), "Turn off");
@@ -174,9 +175,9 @@ describe("PolicyEditor (ADR 0049)", () => {
   it("warns when sandboxes can't start on the server", async () => {
     const api = fakeApi();
     const view = await api.policyView();
-    api.policyView.mockResolvedValue({ ...view, sandbox: { harnesses: ["claude", "codex"], available: false } });
+    api.policyView.mockResolvedValue({ ...view, sandbox: { harnesses: ["claude", "codex"], available: ["codex"] } });
     await render(<PolicyEditor api={api} canEdit onBack={jest.fn()} confirm={yes} />);
-    expect(await screen.findByText(/can't start on this server/)).toBeOnTheScreen();
+    expect(await screen.findByText(/^Claude Code's sandbox can't start on this server/)).toBeOnTheScreen();
   });
 
   it("puts a Bot's class and timeout back to the default one at a time", async () => {

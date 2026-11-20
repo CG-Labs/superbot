@@ -1076,8 +1076,8 @@ pub(crate) const CHAT: &str = r#"#!/bin/sh
 printf 'BOT_TOKEN=%s\nBOT_API=%s\n' "$BOT_TOKEN" "$BOT_API" > "$HOME/run.env"
 echo "- learned on the machine" >> "$HOME/bots/$BOT_ID/MEMORY.md"
 i=0
-while [ ! -f "$HOME/go" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done
-said=$(cat "$HOME/go" 2>/dev/null)
+while [ ! -f "$HOME/go-ahead" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done
+said=$(cat "$HOME/go-ahead" 2>/dev/null)
 printf '%s\n' "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"pwd=$(pwd) said=$said\"}]}}"
 "#;
 
@@ -1275,7 +1275,7 @@ async fn a_users_bot_runs_on_their_machine_with_approvals_and_memory() {
     assert_eq!(code, 200);
     assert!(verdict.starts_with("allow"), "{verdict}");
 
-    std::fs::write(m.home.join("go"), "approved").unwrap();
+    std::fs::write(m.home.join("go-ahead"), "approved").unwrap();
     let said = reply_after(&env, &bot.id, before).await;
     assert_eq!(said, format!("pwd={work} said=approved"));
 
@@ -1348,7 +1348,7 @@ async fn a_bot_on_its_owners_machine_skips_this_servers_accounts() {
     std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
     std::fs::write(&copy, "# Ada's\n- stale copy on the server\n").unwrap();
 
-    std::fs::write(m.home.join("go"), "hi").unwrap();
+    std::fs::write(m.home.join("go-ahead"), "hi").unwrap();
     let before = send(&env, &bot.id, "hello").await;
     let said = reply_after(&env, &bot.id, before).await;
     assert_eq!(

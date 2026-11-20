@@ -188,10 +188,10 @@ export interface PolicyPatch {
   sandbox?: boolean | null;
 }
 
-/** Which harnesses have a sandbox of their own, and whether it can start on the server. */
+/** Which harnesses have a sandbox of their own, and which of those can start it on the server. */
 export interface SandboxSupport {
   harnesses: string[];
-  available: boolean;
+  available: string[];
 }
 
 export interface PolicyClass {

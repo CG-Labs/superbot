@@ -194,6 +194,7 @@ export function PolicyEditor({ api, bot, canEdit, onBack, confirm = confirmAsync
   ];
   const sandboxValue = bot && o?.sandbox === undefined ? "inherit" : view.policy.sandbox ? "on" : "off";
   const support = view.sandbox;
+  const cantStart = support ? support.harnesses.filter((h) => !support.available.includes(h)).map((h) => HARNESS_NAMES[h] ?? h) : [];
   const rules = sortRules(view.rules);
 
   return (
@@ -231,8 +232,10 @@ export function PolicyEditor({ api, bot, canEdit, onBack, confirm = confirmAsync
             {support ? ` ${support.harnesses.map((h) => HARNESS_NAMES[h] ?? h).join(" and ")} have one; other harnesses run without.` : ""}
           </Text>
           <Chips options={sandboxOptions} value={sandboxValue} onChange={(v) => void setSandbox(v)} disabled={locked} />
-          {view.policy.sandbox && support && !support.available ? (
-            <Text style={styles.warn}>Sandboxes can't start on this server, so runs here go without. Install bubblewrap and socat (see docs/backend.md).</Text>
+          {view.policy.sandbox && cantStart.length ? (
+            <Text style={styles.warn}>
+              {cantStart.join(" and ")}'s sandbox can't start on this server, so those runs here go without. Install bubblewrap and socat (see docs/backend.md).
+            </Text>
           ) : null}
         </View>
 

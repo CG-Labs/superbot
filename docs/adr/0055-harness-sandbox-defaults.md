@@ -21,7 +21,7 @@ What each harness has (Codex checked on 0.171; the others from their current doc
 
 The policy gets `sandbox: bool`, globally and per Bot like every other field (`null` on a Bot follows the global value). It holds in `bypass` too: bypass is about asking, the sandbox about reach. `PUT /api/policy` and `PUT /api/bots/{id}/policy` take it; `botctl policy set <global|bot> sandbox=on|off|inherit` sends it. Changes are `policy.updated` with before and after, like other policy changes. A change applies from the next run.
 
-`GET /api/policy` and a Bot's policy add `sandbox: { harnesses, available }`: which harnesses have one (`claude`, `codex`), and whether it can start on this server.
+`GET /api/policy` and a Bot's policy add `sandbox: { harnesses, available }`: which harnesses have one (`claude`, `codex`), and which of those can start it on this server.
 
 ### New installs on, existing installs off
 
@@ -38,7 +38,8 @@ A new install's policy has the sandbox on. An install from before keeps it off: 
 Both harnesses already allow the working folder and the temp folders. We add, per run:
 
 - **The memory and facts files' folders**, so Bots can keep editing `MEMORY.md` and `USER.md`: `DATA_DIR/bots/<id>` and `DATA_DIR/users/<owner>` here; `ISOLATION_DIR/<owner>/memory` with per-user accounts (ADR 0037); `bots/<id>` on a machine (ADR 0036). Never HOME itself: on a machine `USER.md` sits in HOME, so it stays read-only there. A run for someone other than the owner (ADR 0046) doesn't get the owner's facts folder. Here each folder must exist (Codex refuses one that doesn't); on a machine the job makes the memory folder.
-- **Package caches under the run's HOME that exist**: `~/.cache`, `~/.npm`, `~/.cargo/registry`, `~/.cargo/git`, `~/go/pkg/mod`, Bun, Yarn, Gradle and Maven caches. Without them `npm install` and `cargo build` fail, as HOME is read-only. Not followed through links, and never folders holding programs or settings (`~/.local`, `~/.cargo/bin`, `~/.config`): a Bot that could change those changes what runs outside its sandbox later. HOME is botd's here, the account's with per-user accounts, and the machine user's on a machine. The machine agent lists its own (`Layout.caches`); botd keeps only paths under that HOME, and none for a teammate's own user (ADR 0048), whose home is another.
+- **Package caches under the run's HOME**: `~/.cache`, `~/.npm`, `~/.cargo/registry`, `~/.cargo/git`, `~/go/pkg/mod`, Bun, Yarn, Gradle and Maven caches. Without them `npm install` and `cargo build` fail, as HOME is read-only. Missing ones are made (0700) before the run, as the run's user, so a fresh home's first build works: by botd for its own runs, by `superbot-run` for a per-user account (botd only checks that nothing on the way is a link), and by the machine agent as the Bots' user. Never made or followed through links, and never folders holding programs or settings (`~/.local`, `~/.cargo/bin`, `~/.config`): a Bot that could change those changes what runs outside its sandbox later. HOME is botd's here, the account's with per-user accounts, and the machine user's on a machine. The machine agent lists its own (`Layout.caches`); botd keeps only paths under that HOME, and none for a teammate's own user (ADR 0048), whose home is another.
+- **A per-user account's `TMPDIR`** (`~/.tmp`, which `superbot-run` sets).
 
 Harness logins (`~/.claude`, `~/.codex`) stay read-only to commands. The harness process itself runs outside its sandbox, so it still reads and refreshes them.
 
@@ -48,11 +49,11 @@ Sandboxed commands in Claude Code can't open a socket to `127.0.0.1`. `botctl` t
 
 ### Where sandboxes can't start
 
-botd checks once at start whether user namespaces work (`bwrap`, or `unshare` when bwrap isn't installed); machines check for themselves and send it with each run (`Layout.sandbox`; an older agent counts as able). When they can't, the run goes without and `harness.invoked` records `unavailable`, botd prints a warning at start, and the policy editors say so. A Codex run whose sandbox fails anyway gets one clear error naming bubblewrap and the per-Bot switch, instead of a run of failed commands. The installer adds `bubblewrap` and `socat`.
+botd checks once at start what the host has (`sandbox::Host`): whether user namespaces work (with `bwrap`, or `unshare` when it isn't installed), whether `bwrap` can make a sandbox, and whether `socat` is on PATH. Each adapter says what its sandbox needs (`sandbox_needs`): Codex brings its own bubblewrap and needs only namespaces; Claude Code needs `bwrap` and `socat`, without which it would run commands unsandboxed while we said otherwise. Machines check for themselves and send it with each run (`Layout.sandbox`). When a harness's sandbox can't start, its run goes without and `harness.invoked` records `unavailable`, botd prints a warning at start naming the harness, and the policy editors say so. An agent from before this check gets the settings anyway (they do nothing where the sandbox can't start), recorded as `unverified`. A Codex run whose sandbox fails anyway gets one clear error naming bubblewrap and the per-Bot switch, instead of a run of failed commands. The installer adds `bubblewrap` and `socat`.
 
 ### Audit
 
-`harness.invoked` gets `sandbox`: `on`, `off`, `unsupported`, or `unavailable`. `server.started` records the global setting and whether sandboxes can start.
+`harness.invoked` gets `sandbox`: `on`, `off`, `unsupported`, `unavailable`, or `unverified`. `server.started` records the global setting and what the host has for sandboxes.
 
 ### The editors
 

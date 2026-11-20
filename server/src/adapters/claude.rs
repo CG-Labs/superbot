@@ -111,6 +111,12 @@ impl Adapter for Claude {
         true
     }
 
+    /// The system's bubblewrap, and socat for its network proxy. Without them it runs
+    /// commands unsandboxed.
+    fn sandbox_needs(&self) -> &'static [&'static str] {
+        &["bwrap", "socat"]
+    }
+
     fn login_args(&self) -> Option<&'static [&'static str]> {
         Some(&["auth", "login"])
     }

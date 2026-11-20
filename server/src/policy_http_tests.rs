@@ -178,7 +178,7 @@ async fn the_sandbox_is_on_for_new_installs_set_per_bot_and_audited() {
     let (_, body) = call(port, "GET", "/api/policy", &member, "").await;
     let v = parse(&body);
     assert_eq!(v["policy"]["sandbox"], true, "on for a new install");
-    assert_eq!(v["sandbox"], json!({ "harnesses": ["claude", "codex"], "available": true }));
+    assert_eq!(v["sandbox"], json!({ "harnesses": ["claude", "codex"], "available": ["claude", "codex"] }));
     assert_eq!(call(port, "PUT", "/api/policy", &member, r#"{"sandbox":false}"#).await.0, 403);
     for bad in [r#"{"sandbox":"yes"}"#, r#"{"sandbox":1}"#] {
         assert_eq!(call(port, "PUT", "/api/policy", &admin, bad).await.0, 400, "{bad}");

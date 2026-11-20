@@ -662,9 +662,9 @@ pub struct Layout {
     pub api: String,
     /// `botctl` on the machine, if it is installed.
     pub botctl: Option<String>,
-    /// Whether harness sandboxes can start there (ADR 0055). None: an older agent.
+    /// What it has for harness sandboxes (ADR 0055). None: an older agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sandbox: Option<bool>,
+    pub sandbox: Option<crate::sandbox::Host>,
     /// Package caches under `home` that exist there, which a sandboxed Bot may write.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub caches: Vec<String>,

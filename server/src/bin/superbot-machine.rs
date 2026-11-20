@@ -20,6 +20,7 @@ mod landing;
 #[path = "../machines/pki.rs"]
 mod pki;
 #[path = "../sandbox.rs"]
+#[allow(dead_code)]
 mod sandbox;
 #[path = "../machines/runas.rs"]
 mod runas;

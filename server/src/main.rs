@@ -244,7 +244,8 @@ async fn main() {
         bot_key: bot_key.clone(),
         run_timeout: Duration::from_secs(60 * env("RUN_TIMEOUT_MINUTES", "60").parse::<u64>().unwrap_or(60)),
         default_harness,
-        sandbox_available: sandbox::available(),
+        sandbox_host: sandbox::host(),
+        home: std::env::var_os("HOME").map(PathBuf::from),
     }, screens);
     let _ = app.tiers.set(Arc::new(tiers));
     println!("Tiers: {}.", app.tiers().describe());
@@ -361,7 +362,7 @@ async fn main() {
         "defaultHarness": app.cfg.default_harness,
         "policyMode": policy.mode,
         "sandbox": policy.sandbox,
-        "sandboxAvailable": app.cfg.sandbox_available,
+        "sandboxHost": app.cfg.sandbox_host,
         "auth": match (break_glass, password.is_empty()) {
             (true, false) => "sessions+password",
             (true, true) => "none",
@@ -394,11 +395,16 @@ async fn main() {
     }
     if !policy.sandbox {
         eprintln!("Harness sandboxes: off. Turn them on with `botctl policy set global sandbox=on` (ADR 0055).");
-    } else if !app.cfg.sandbox_available {
-        eprintln!(
-            "WARNING: harness sandboxes are on but can't start here (no unprivileged user namespaces, or no bubblewrap), \
-             so runs on this server go without them. Install bubblewrap and socat, or allow user namespaces (ADR 0055)."
-        );
+    } else {
+        let (with, can) = sandbox_harnesses(&app.cfg.sandbox_host);
+        let cant: Vec<_> = with.into_iter().filter(|h| !can.contains(h)).collect();
+        if !cant.is_empty() {
+            eprintln!(
+                "WARNING: harness sandboxes are on, but {}'s can't start here (no unprivileged user namespaces, or no working bubblewrap or socat), \
+                 so those runs on this server go without. Install bubblewrap and socat, or allow user namespaces (ADR 0055).",
+                cant.join(" and ")
+            );
+        }
     }
 
     app.recover();
@@ -2223,11 +2229,18 @@ fn classes_view() -> Value {
     json!(policy::CLASSES.iter().map(|(id, label)| json!({ "id": id, "label": label })).collect::<Vec<_>>())
 }
 
+/// Harnesses with a sandbox of their own, and those whose sandbox can start on `host`.
+fn sandbox_harnesses(host: &sandbox::Host) -> (Vec<&'static str>, Vec<&'static str>) {
+    let with: Vec<_> = adapters::NAMES.iter().copied().filter_map(|n| adapters::get(n).filter(|a| a.has_sandbox()).map(|a| (n, a))).collect();
+    let can = with.iter().filter(|(_, a)| host.has(a.sandbox_needs())).map(|(n, _)| *n).collect();
+    (with.into_iter().map(|(n, _)| n).collect(), can)
+}
+
 /// What the policy's `sandbox` can do here (ADR 0055): which harnesses have one, and
-/// whether it can start on this server. A machine reports its own at each run.
+/// which of those can start it on this server. A machine reports its own at each run.
 fn sandbox_view(app: &App) -> Value {
-    let harnesses: Vec<&str> = adapters::NAMES.iter().copied().filter(|n| adapters::get(n).is_some_and(|a| a.has_sandbox())).collect();
-    json!({ "harnesses": harnesses, "available": app.cfg.sandbox_available })
+    let (harnesses, available) = sandbox_harnesses(&app.cfg.sandbox_host);
+    json!({ "harnesses": harnesses, "available": available })
 }
 
 async fn get_policy(State(app): State<AppState>) -> Json<Value> {
@@ -3072,7 +3085,8 @@ mod tests {
             bot_key: "bot-key".into(),
             run_timeout: Duration::from_secs(60),
             default_harness: "claude".into(),
-            sandbox_available: true,
+            sandbox_host: sandbox::Host { namespaces: true, programs: sandbox::PROGRAMS.map(String::from).into() },
+            home: None,
         }, None);
         users::ensure_operator(&app.db, "Owner", None);
         let bot = app.db.create_bot("Tester", "#f5f5f5", "waddle", "claude", None, true);
