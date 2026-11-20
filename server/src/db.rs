@@ -3942,6 +3942,31 @@ impl Db {
             == 1
     }
 
+    /// An admin asked for this pending removal: it's theirs now, so it's never cancelled
+    /// because the teammate is wanted again. Returns whether it changed.
+    pub fn teammate_cleanup_force(&self, id: &str) -> bool {
+        self.c()
+            .execute(
+                "UPDATE teammate_cleanups SET reason = 'admin' WHERE id = ? AND state = 'pending' AND reason <> 'admin'",
+                [id],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Cancels a pending removal with `note`, but only if no admin asked for it and the
+    /// agent was never asked. Returns whether it did.
+    pub fn teammate_cleanup_cancel_unasked(&self, id: &str, note: &str) -> bool {
+        self.c()
+            .execute(
+                "UPDATE teammate_cleanups SET state = 'cancelled', done_at = ?, last_error = ?
+                 WHERE id = ? AND state = 'pending' AND reason <> 'admin' AND attempts = 0",
+                params![now(), note, id],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
     pub fn machine_harnesses_sent(&self, machine_id: &str, plan: &str) {
         let _ = self.c().execute(
             "UPDATE machines SET harnesses_sent_at = ?, harnesses_sent_plan = ? WHERE id = ?",

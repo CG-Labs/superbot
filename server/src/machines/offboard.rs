@@ -432,8 +432,14 @@ async fn try_removal(app: &App, e: &Enrollment, by: &Who, row: &TeammateCleanup,
     // Once the agent has been asked, it may have done some of it (the user deleted, the
     // work not yet moved): finish rather than leave it half done. A later run makes the
     // teammate a new user.
+    // The update checks again, so an admin's ask that lands meanwhile still stands.
     if !forced && row.reason != ADMIN && row.attempts == 0 && wanted(app, &row.owner_id, &row.user_id) {
-        return cancel(app, by, &m, &row, "access_back");
+        let why = "access_back";
+        if app.db.teammate_cleanup_cancel_unasked(&row.id, why) {
+            app.db.record(&cleanup_event(by, "machine.teammate_removal_cancelled", &m, &row, json!({ "why": why })));
+            return Tried::Cancelled;
+        }
+        return Tried::Busy;
     }
     if let Err(why) = reachable(&m) {
         note(app, by, &m, &row, PENDING, &why, false);
@@ -625,6 +631,11 @@ pub async fn remove_now(AppS(app): AppS<AppState>, Extension(by): Extension<Who>
         return Err(bad("Name a teammate by id or email."));
     }
     let (row, _) = queue(&app, e, &by, &m, &t, ADMIN).ok_or_else(|| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Couldn't queue the removal.".into()))?;
+    // A removal already waiting for another reason is the admin's from now on, so a
+    // later pass never cancels it because the teammate is wanted again.
+    if row.reason != ADMIN && app.db.teammate_cleanup_force(&row.id) {
+        app.db.record(&cleanup_event(&by, "machine.teammate_removal_forced", &m, &row, json!({ "was": row.reason })));
+    }
     let tried = try_removal(&app, e, &by, &row, true).await;
     let after = app.db.teammate_cleanup(&row.id).map(|r| view(&app, &r)).unwrap_or(Value::Null);
     Ok(match tried {

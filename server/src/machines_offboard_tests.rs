@@ -202,6 +202,27 @@ async fn a_revoked_grant_is_retried_while_the_machine_is_offline_and_cancelled_o
     assert_eq!((cancelled.len(), cancelled[0]["details"]["forUser"].as_str(), cancelled[0]["details"]["why"].as_str()), (1, Some(dee_id.as_str()), Some("access_back")));
     assert!(t.home_of(&dee_id).join("whoami").is_file(), "Dee keeps her home");
     assert!(removals(&w, "pending").is_empty());
+
+    // Dee loses it again, and an admin asks for her removal while it waits: it's the
+    // admin's now, so getting the Bot back before the agent is upgraded doesn't cancel it.
+    let m = w.env.app.db.user_machine(&w.ada).unwrap();
+    assert!(w.env.app.db.machine_upkeep_swap(&m.id, m.agent_upkeep.as_ref(), &old));
+    assert_eq!(call(w.env.port, "DELETE", &format!("/api/bots/{private}/grants/{dee_id}"), &ada, "").await.0, 200);
+    crate::machines::offboard::settled(&w.env.app).await;
+    assert_eq!(removals(&w, "pending")[0].reason, "access_lost");
+    let (code, v) = json_call(&w.env, "POST", &format!("/api/users/{}/machine/teammates/{dee_id}/remove", w.ada), "").await;
+    assert_eq!(code, 202, "the agent is still too old: {v}");
+    assert_eq!(removals(&w, "pending")[0].reason, "admin");
+    let forced = events(&w.env, "machine.teammate_removal_forced").await;
+    assert_eq!((forced.len(), forced[0]["details"]["was"].as_str()), (1, Some("access_lost")), "{forced:?}");
+    assert_eq!(call(w.env.port, "PUT", &format!("/api/bots/{private}/grants/{dee_id}"), &ada, r#"{"level":"operator"}"#).await.0, 200);
+    pass(&w).await;
+    assert_eq!(events(&w.env, "machine.teammate_removal_cancelled").await.len(), 1, "only the earlier one");
+    assert!(removals(&w, "pending").is_empty());
+    let done = events(&w.env, "machine.teammate_removed").await;
+    let dees: Vec<_> = done.iter().filter(|e| e["details"]["forUser"] == dee_id.as_str()).collect();
+    assert_eq!((dees.len(), &dees[0]["details"]["reason"]), (1, &json!("admin")), "{done:?}");
+    assert!(std::fs::symlink_metadata(t.home_of(&dee_id)).is_err(), "the admin's removal went through");
 }
 
 #[tokio::test]
@@ -286,6 +307,12 @@ async fn as_root_a_leaving_teammates_user_processes_and_files_go_and_no_one_else
     let (bea_home, cy_home) = (t.home_of(&w.bea_id), t.home_of(&cy_id));
     work_in(&bea_home, "notes.txt", "bea's notes");
     std::os::unix::fs::chown(bea_home.join("work/notes.txt"), Some(bea_ids.uid), Some(bea_ids.gid)).unwrap();
+    // A second link to her own file is copied; one to root's secret is never read.
+    std::fs::hard_link(bea_home.join("work/notes.txt"), bea_home.join("work/again.txt")).unwrap();
+    let secret = state.join("root-only");
+    std::fs::write(&secret, "root's").unwrap();
+    std::fs::set_permissions(&secret, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    std::fs::hard_link(&secret, bea_home.join("work/secret")).unwrap();
     let as_user = |u: &str, cmd: &str| std::process::Command::new("runuser").args(["-u", u, "--", "sh", "-c", cmd]).spawn().unwrap();
     let mut bea_sleep = as_user(&bea_user, "exec sleep 300");
     let mut cy_sleep = as_user(&cy_user, "exec sleep 300");
@@ -308,6 +335,11 @@ async fn as_root_a_leaving_teammates_user_processes_and_files_go_and_no_one_else
     let to = Path::new(d["archivedTo"].as_str().unwrap()).to_path_buf();
     assert_eq!(std::fs::read_to_string(to.join("notes.txt")).unwrap(), "bea's notes");
     assert_eq!(std::fs::metadata(to.join("notes.txt")).unwrap().uid(), bots.uid, "the Bots' user has her work");
+    let again = std::fs::metadata(to.join("again.txt")).unwrap();
+    assert_eq!((again.uid(), again.nlink()), (bots.uid, 1), "a hard link of hers is a copy of its own");
+    let s = std::fs::metadata(to.join("secret")).unwrap();
+    assert_eq!((s.uid(), s.mode() & 0o777), (0, 0o600), "root's file isn't given away");
+    assert_eq!(std::fs::read_to_string(&secret).unwrap(), "root's");
 
     // Cy and the Bots' user are untouched.
     assert_eq!(runas::lookup(&cy_user).map(|(i, _)| i), Some(cy_ids));
