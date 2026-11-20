@@ -840,12 +840,7 @@ async fn one_users_machine_cannot_act_for_another() {
         panic!("B's machine")
     };
     assert_eq!(to_b.pins, std::slice::from_ref(&b.fingerprint));
-    let err = env
-        .cp
-        .link
-        .check(&env.app, &to_b, &[])
-        .await
-        .unwrap_err();
+    let err = env.cp.link.check(&env.app, &to_b, &[]).await.unwrap_err();
     assert!(
         err.contains("didn't answer"),
         "B's job never reaches A's machine: {err}"
@@ -1042,4 +1037,340 @@ async fn off_without_a_control_url() {
         "{}",
         cp.describe()
     );
+}
+
+/// A stand-in Claude: it notes what botd gave it, writes to its memory, waits for the
+/// test to say go, then replies with where it ran and what it was told.
+const CHAT: &str = r#"#!/bin/sh
+printf 'BOT_TOKEN=%s\nBOT_API=%s\n' "$BOT_TOKEN" "$BOT_API" > "$HOME/run.env"
+echo "- learned on the machine" >> "$HOME/bots/$BOT_ID/MEMORY.md"
+i=0
+while [ ! -f "$HOME/go" ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done
+said=$(cat "$HOME/go" 2>/dev/null)
+printf '%s\n' "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"pwd=$(pwd) said=$said\"}]}}"
+"#;
+
+/// The real agent, enrolled, with `harness` as its `claude` and a botctl.
+struct OnMachine {
+    home: PathBuf,
+    server: tokio::task::JoinHandle<()>,
+    agent: Arc<Agent>,
+}
+
+impl OnMachine {
+    fn agent_api(&self) -> String {
+        self.agent.cfg.layout().api
+    }
+}
+
+async fn agent_with(env: &mut Env, mid: &str, token: &str, harness: &str) -> OnMachine {
+    use std::os::unix::fs::PermissionsExt;
+    let mut cfg = config(env, mid, Some(token));
+    let bin = cfg.state_dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for (name, body) in [("claude", harness), ("botctl", "#!/bin/sh\nexit 2\n")] {
+        std::fs::write(bin.join(name), body).unwrap();
+        std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    cfg.botctl = bin.join("botctl");
+    cfg.harness_path = format!("{}:/usr/bin:/bin", bin.display());
+    let relay = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    cfg.api_listen = relay.local_addr().unwrap();
+    let id = agent::enroll(&cfg).await.unwrap();
+    let home = cfg.home.clone();
+    let agent = Agent::new(cfg, id).unwrap();
+    tokio::spawn(agent::serve_relay(relay, agent.clone()));
+    let server = tokio::spawn(agent::serve(
+        env.agent_listener.take().unwrap(),
+        agent.clone(),
+    ));
+    OnMachine {
+        home,
+        server,
+        agent,
+    }
+}
+
+/// The Bot's next reply after message `before`.
+async fn reply_after(env: &Env, bot: &str, before: i64) -> String {
+    for _ in 0..600 {
+        if let Some(m) = env.app.db.replies_after(bot, before).into_iter().next() {
+            return m.text;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("no reply from {bot}");
+}
+
+async fn send(env: &Env, bot: &str, text: &str) -> i64 {
+    let before = env.app.db.last_id();
+    let body = json!({ "text": text }).to_string();
+    let (code, m) = call(
+        env.port,
+        "POST",
+        &format!("/api/bots/{bot}/messages"),
+        &env.admin,
+        &body,
+    )
+    .await;
+    assert_eq!(code, 202, "{m}");
+    before
+}
+
+async fn wait_for_file(path: &std::path::Path) -> String {
+    for _ in 0..600 {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            return s;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("{} never appeared", path.display());
+}
+
+/// A call to the agent's loopback relay, as a Bot's botctl makes it.
+async fn via_relay(api: &str, auth: Option<&str>, path: &str, body: Value) -> (u16, String) {
+    let req = reqwest::Client::new()
+        .post(format!("{api}{path}"))
+        .json(&body);
+    let req = match auth {
+        Some(t) => req.bearer_auth(t),
+        None => req,
+    };
+    let r = req.send().await.unwrap();
+    (r.status().as_u16(), r.text().await.unwrap())
+}
+
+#[tokio::test]
+async fn a_users_bot_runs_on_their_machine_with_approvals_and_memory() {
+    let mut env = serve().await;
+    let (uid, mid, token) = machine_for(&env, "ada@example.com").await;
+    let m = agent_with(&mut env, &mid, &token, CHAT).await;
+    let (code, v) = json_call(&env, "GET", &format!("/api/users/{uid}/placement"), "").await;
+    assert_eq!(
+        (code, v["runsOn"].as_str(), v["routing"].as_str()),
+        (200, Some("machine"), Some("on")),
+        "{v}"
+    );
+    // Shared, so the admin's message runs as Ada's Bot: on Ada's machine.
+    let bot = env.app.db.create_bot_owned(
+        "Ada's",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &uid,
+        crate::acl::Visibility::Shared,
+    );
+    let before = send(&env, &bot.id, "hello").await;
+
+    let run_env = wait_for_file(&m.home.join("run.env")).await;
+    let var = |k: &str| {
+        run_env
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{k}=")))
+            .unwrap()
+            .to_string()
+    };
+    let (bot_token, api) = (var("BOT_TOKEN"), var("BOT_API"));
+    assert_eq!(
+        api,
+        m.agent_api(),
+        "botctl there talks to the agent's relay"
+    );
+    let work = m.home.join("work").display().to_string();
+
+    // The machine's own folders are this run's workspace for approvals.
+    let check = |command: &str| {
+        json!({ "from": bot.id, "harness": "claude",
+            "event": { "tool_name": "Bash", "tool_input": { "command": command }, "cwd": work } })
+    };
+    let (code, verdict) = via_relay(
+        &api,
+        Some(&bot_token),
+        "/api/approvals/check",
+        check(&format!("rm -r {work}/old")),
+    )
+    .await;
+    assert_eq!(code, 200);
+    assert!(
+        verdict.starts_with("allow"),
+        "inside the machine's workspace: {verdict}"
+    );
+
+    // A risky step waits for a person, through the relay, and goes on once approved.
+    let asking = tokio::spawn({
+        let (api, bot_token, body) = (
+            api.clone(),
+            bot_token.clone(),
+            check("git push origin main"),
+        );
+        async move { via_relay(&api, Some(&bot_token), "/api/approvals/check", body).await }
+    });
+    let approval = loop {
+        if let Some(a) = env.app.db.approvals(Some("pending"), None, 1).pop() {
+            break a;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(approval.bot_id, bot.id);
+    let (code, r) = json_call(
+        &env,
+        "POST",
+        &format!("/api/approvals/{}/approve", approval.id),
+        r#"{"remember":null}"#,
+    )
+    .await;
+    assert_eq!(code, 200, "{r}");
+    let (code, verdict) = asking.await.unwrap();
+    assert_eq!(code, 200);
+    assert!(verdict.starts_with("allow"), "{verdict}");
+
+    std::fs::write(m.home.join("go"), "approved").unwrap();
+    let said = reply_after(&env, &bot.id, before).await;
+    assert_eq!(said, format!("pwd={work} said=approved"));
+
+    // What it learned there is botd's now too.
+    let memory = std::fs::read_to_string(env.app.memory_file(&bot.id).unwrap()).unwrap();
+    assert!(memory.contains("- learned on the machine"), "{memory}");
+
+    let routed = events(&env, "bot.run_routed").await;
+    assert_eq!(
+        (
+            routed.len(),
+            routed[0]["details"]["machine"].as_str(),
+            routed[0]["details"]["link"].as_str()
+        ),
+        (1, Some(mid.as_str()), Some("mtls"))
+    );
+    for action in ["harness.invoked", "bot.run_finished"] {
+        let e = &events(&env, action).await[0];
+        assert_eq!(
+            (
+                e["details"]["host"].as_str(),
+                e["details"]["machine"].as_str()
+            ),
+            (Some("machine"), Some(mid.as_str())),
+            "{e}"
+        );
+    }
+    assert_eq!(
+        events(&env, "bot.run_finished").await[0]["outcome"],
+        "success"
+    );
+
+    // The machine goes quiet: the next run is refused and nothing runs here.
+    m.server.abort();
+    let _ = m.server.await;
+    let before = send(&env, &bot.id, "again").await;
+    let said = reply_after(&env, &bot.id, before).await;
+    assert!(said.contains("your computer is offline"), "{said}");
+    let refused = events(&env, "bot.run_refused").await;
+    assert_eq!(reason_count(&refused, "machine_offline"), 1, "{refused:?}");
+    assert_eq!(events(&env, "harness.invoked").await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_machine_runs_and_relays_only_for_its_own_user() {
+    let mut env = serve().await;
+    let (ua, ma, token) = machine_for(&env, "ada@example.com").await;
+    let m = agent_with(&mut env, &ma, &token, CHAT).await;
+    let (ub, _) = user_with(env.port, &env.admin, "bea@example.com", "member").await;
+    let bea_bot = env.app.db.create_bot_owned(
+        "Bea's",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &ub,
+        crate::acl::Visibility::Private,
+    );
+    let ada_bot = env.app.db.create_bot_owned(
+        "Ada's",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &ua,
+        crate::acl::Visibility::Private,
+    );
+
+    // Even if botd were tricked into it, Ada's agent won't run Bea's Bot.
+    let Ok(Target::Machine(to)) = env.cp.route(&env.app.db, &ua) else {
+        panic!("Ada's machine")
+    };
+    let job: wire::JobRequest = serde_json::from_value(json!({
+        "protocol": wire::PROTOCOL, "jobId": "j1", "botId": bea_bot.id, "ownerId": ub,
+        "messageId": 1, "bin": "claude", "args": [], "env": {}, "cwd": m.home.join("work"),
+        "stdin": null, "files": [], "cleanup": null, "collect": []
+    }))
+    .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let (_abort_tx, abort) = tokio::sync::watch::channel(None);
+    env.cp.link.run(&to, job, abort, tx).await;
+    match rx.recv().await {
+        Some(wire::JobEvent::Error { message }) => assert!(
+            message.contains("(403)") && message.contains("only its own user's Bots"),
+            "{message}"
+        ),
+        other => panic!("refused, not {other:?}"),
+    }
+    assert!(!m.home.join("run.env").exists(), "nothing ran");
+
+    // Bea's Bot token can't use Ada's machine to reach botd, and no token can't either.
+    let api = m.agent_api();
+    let bea = crate::isolation::bot_token(&env.app.cfg.bot_key, &bea_bot.id, &ub);
+    let (code, _) = via_relay(&api, Some(&bea), "/api/bots", Value::Null).await;
+    assert_eq!(code, 403);
+    let (code, _) = via_relay(&api, None, "/api/bots", Value::Null).await;
+    assert_eq!(code, 403);
+    let denied = events(&env, "access.denied").await;
+    assert_eq!(reason_count(&denied, "another_users_bot"), 1, "{denied:?}");
+    assert_eq!(reason_count(&denied, "no_bot_token"), 1, "{denied:?}");
+    // Ada's own Bot gets through.
+    let ada = crate::isolation::bot_token(&env.app.cfg.bot_key, &ada_bot.id, &ua);
+    let body = json!({ "from": ada_bot.id, "event": { "tool_name": "Bash", "tool_input": { "command": "ls" } } });
+    let (code, verdict) = via_relay(&api, Some(&ada), "/api/approvals/check", body).await;
+    assert_eq!(
+        (code, verdict.lines().next()),
+        (200, Some("allow")),
+        "{verdict}"
+    );
+}
+
+#[tokio::test]
+async fn stopping_a_bot_ends_its_run_on_the_machine() {
+    let mut env = serve().await;
+    let (uid, mid, token) = machine_for(&env, "ada@example.com").await;
+    let slow = "#!/bin/sh\ntouch \"$HOME/run.env\"\nsleep 60\n";
+    let m = agent_with(&mut env, &mid, &token, slow).await;
+    let bot = env.app.db.create_bot_owned(
+        "Ada's",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &uid,
+        crate::acl::Visibility::Shared,
+    );
+    let started = std::time::Instant::now();
+    let before = send(&env, &bot.id, "take your time").await;
+    wait_for_file(&m.home.join("run.env")).await;
+    assert_eq!(m.agent.running(), 1);
+    let (code, r) = json_call(&env, "POST", &format!("/api/bots/{}/stop", bot.id), "").await;
+    assert!((200..300).contains(&code), "{r}");
+    assert_eq!(reply_after(&env, &bot.id, before).await, "Stopped.");
+    for _ in 0..200 {
+        if m.agent.running() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(m.agent.running(), 0, "the job ended on the machine too");
+    assert!(started.elapsed() < Duration::from_secs(30));
+    let finished = &events(&env, "bot.run_finished").await[0];
+    assert_eq!(finished["details"]["result"], "stopped", "{finished}");
 }

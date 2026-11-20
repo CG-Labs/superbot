@@ -53,7 +53,7 @@ struct Run {
 /// Where a run happens: here, or on its owner's machine (ADR 0034).
 enum Place {
     Here,
-    There(Assigned, wire::Layout),
+    There(Box<(Assigned, wire::Layout)>),
 }
 
 /// What a run sees where it happens: its folders, environment, and tools there.
@@ -536,7 +536,7 @@ impl App {
             Ok((layout, version)) => {
                 let e = by.event("bot.run_routed").target("message", &msg.id.to_string()).bot(&bot.id);
                 self.db.record(&e.details(json!({ "owner": bot.owner_id, "machine": to.machine_id, "link": cp.link.name(), "agentVersion": version, "messageId": msg.id })));
-                Some(Place::There(to, layout))
+                Some(Place::There(Box::new((to, layout))))
             }
         }
     }
@@ -557,7 +557,8 @@ impl App {
                 screens: self.screens.is_some(),
                 ctx: None,
             },
-            Place::There(to, layout) => {
+            Place::There(there) => {
+                let (to, layout) = *there;
                 let botctl = PathBuf::from(layout.botctl.clone().unwrap_or_default());
                 // HOME and PATH are the machine's own.
                 env.remove("PATH");

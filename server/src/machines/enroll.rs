@@ -13,12 +13,12 @@ use super::pki::{self, Ca, Issued, Peer};
 use super::route::{Assigned, Checked, MachineLink, Ran};
 use super::wire::{self, JobEvent, JobRequest};
 use super::{ControlPlane, State};
+use crate::adapters::AbortReason;
 use crate::audit::{Actor, Outcome, Source, Who};
 use crate::db::{Machine, MachineCert, now};
 use crate::runner::App;
 use crate::secrets::sealed::Cipher;
 use crate::users::need_user_key;
-use crate::adapters::AbortReason;
 use crate::{ApiError, AppState, Auth, Res};
 use axum::Json;
 use axum::body::Bytes;
@@ -232,8 +232,10 @@ impl Enrollment {
             self.agent_port,
             match (&self.agent, &self.botctl) {
                 (Some(_), Some(_)) => "",
-                (None, _) => "; superbot-machine isn't next to botd, so machines must be given it another way",
-                (_, None) => "; botctl isn't next to botd, so machines can't run Bots until they're given it",
+                (None, _) =>
+                    "; superbot-machine isn't next to botd, so machines must be given it another way",
+                (_, None) =>
+                    "; botctl isn't next to botd, so machines can't run Bots until they're given it",
             }
         )
     }
@@ -323,7 +325,10 @@ impl Enrollment {
             out.push_str("runcmd:\n");
             // botctl first: the agent reports whether it's there when botd checks.
             if let Some((_, b)) = &self.botctl {
-                out.push_str(&format!("  - [sh, -c, \"{}\"]\n", install("/v1/botctl", BOTCTL_BIN, b)));
+                out.push_str(&format!(
+                    "  - [sh, -c, \"{}\"]\n",
+                    install("/v1/botctl", BOTCTL_BIN, b)
+                ));
             }
             out.push_str(&format!(
                 "  - [sh, -c, \"{} && systemctl daemon-reload && systemctl enable --now superbot-machine\"]\n",
@@ -872,10 +877,17 @@ async fn relay(
             "Only this machine's user's Bots can call botd through it, each with its own token.",
         );
     }
-    if rest.split('/').any(|s| s.is_empty() || s == "." || s == "..") {
+    if rest
+        .split('/')
+        .any(|s| s.is_empty() || s == "." || s == "..")
+    {
         return reply(StatusCode::NOT_FOUND, "No such API path.");
     }
-    let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+    let query = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
     let mut b = axum::http::Request::builder()
         .method(req.method().clone())
         .uri(format!("/api/{rest}{query}"))
@@ -910,7 +922,12 @@ pub fn router(app: AppState, e: Arc<Enrollment>, api: Option<Api>) -> axum::Rout
 
 /// Serves the machine port on `listener`. `api`: botd's API, relayed for Bots on
 /// machines.
-pub async fn serve(listener: tokio::net::TcpListener, app: AppState, e: Arc<Enrollment>, api: Option<Api>) {
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    app: AppState,
+    e: Arc<Enrollment>,
+    api: Option<Api>,
+) {
     pki::serve(listener, e.tls(), router(app, e, api), pki::lifetime).await
 }
 
@@ -930,7 +947,12 @@ pub async fn heartbeat(app: &App, e: &Enrollment, m: &Machine) -> Result<wire::H
 }
 
 /// `heartbeat`, also asking whether `bins` are installed there.
-async fn probe(app: &App, e: &Enrollment, to: &Assigned, bins: &[&str]) -> Result<wire::Heartbeat, String> {
+async fn probe(
+    app: &App,
+    e: &Enrollment,
+    to: &Assigned,
+    bins: &[&str],
+) -> Result<wire::Heartbeat, String> {
     let res = async {
         if to.pins.is_empty() {
             return Err("it has no usable certificate".to_string());
@@ -987,8 +1009,17 @@ fn without_url(e: reqwest::Error) -> String {
 pub struct Mtls(pub Arc<Enrollment>);
 
 impl Mtls {
-    async fn stream(&self, to: &Assigned, job: JobRequest, mut abort: watch::Receiver<AbortReason>, tx: &mpsc::Sender<JobEvent>) -> Result<(), String> {
-        let address = to.address.as_deref().ok_or("your computer has no address yet")?;
+    async fn stream(
+        &self,
+        to: &Assigned,
+        job: JobRequest,
+        mut abort: watch::Receiver<AbortReason>,
+        tx: &mpsc::Sender<JobEvent>,
+    ) -> Result<(), String> {
+        let address = to
+            .address
+            .as_deref()
+            .ok_or("your computer has no address yet")?;
         let client = self.0.job_client(to.pins.clone())?;
         let job_id = job.job_id.clone();
         let mut r = client
@@ -999,7 +1030,11 @@ impl Mtls {
             .map_err(|e| format!("Your computer didn't take the job: {}.", without_url(e)))?;
         if !r.status().is_success() {
             let code = r.status().as_u16();
-            let why = r.json::<wire::ErrorReply>().await.map(|e| e.error).unwrap_or_default();
+            let why = r
+                .json::<wire::ErrorReply>()
+                .await
+                .map(|e| e.error)
+                .unwrap_or_default();
             return Err(format!("Your computer turned the job down ({code}): {why}"));
         }
         let mut buf: Vec<u8> = Vec::new();
@@ -1051,7 +1086,13 @@ impl MachineLink for Mtls {
         Box::pin(probe(app, &self.0, to, bins))
     }
 
-    fn run<'a>(&'a self, to: &'a Assigned, job: JobRequest, abort: watch::Receiver<AbortReason>, tx: mpsc::Sender<JobEvent>) -> Ran<'a> {
+    fn run<'a>(
+        &'a self,
+        to: &'a Assigned,
+        job: JobRequest,
+        abort: watch::Receiver<AbortReason>,
+        tx: mpsc::Sender<JobEvent>,
+    ) -> Ran<'a> {
         Box::pin(async move {
             let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (fwd_tx, mut fwd_rx) = mpsc::channel::<JobEvent>(64);
@@ -1059,7 +1100,12 @@ impl MachineLink for Mtls {
                 let (ended, tx) = (ended.clone(), tx.clone());
                 async move {
                     while let Some(ev) = fwd_rx.recv().await {
-                        if matches!(ev, JobEvent::Exit { .. } | JobEvent::Cleanup { .. } | JobEvent::Error { .. }) {
+                        if matches!(
+                            ev,
+                            JobEvent::Exit { .. }
+                                | JobEvent::Cleanup { .. }
+                                | JobEvent::Error { .. }
+                        ) {
                             ended.store(true, std::sync::atomic::Ordering::SeqCst);
                         }
                         if tx.send(ev).await.is_err() {
@@ -1076,7 +1122,9 @@ impl MachineLink for Mtls {
             let (res, ()) = tokio::join!(run, watch_end);
             let message = match res {
                 Err(m) => Some(m),
-                Ok(()) if !ended.load(std::sync::atomic::Ordering::SeqCst) => Some("Your computer stopped answering before the run finished.".into()),
+                Ok(()) if !ended.load(std::sync::atomic::Ordering::SeqCst) => {
+                    Some("Your computer stopped answering before the run finished.".into())
+                }
                 Ok(()) => None,
             };
             if let Some(message) = message {

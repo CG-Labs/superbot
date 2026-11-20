@@ -126,9 +126,7 @@ fn tail(stderr: &str) -> String {
 fn collect(paths: &[String]) -> BTreeMap<String, String> {
     paths
         .iter()
-        .filter(|p| {
-            std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() <= MAX_COLLECT)
-        })
+        .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() <= MAX_COLLECT))
         .filter_map(|p| Some((p.clone(), std::fs::read_to_string(p).ok()?)))
         .collect()
 }
@@ -238,7 +236,9 @@ async fn run_child(
     let _ = tx
         .send(JobEvent::Exit {
             success: status.as_ref().is_ok_and(|s| s.success()),
-            status: status.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string()),
+            status: status
+                .map(|s| s.to_string())
+                .unwrap_or_else(|e| e.to_string()),
             stderr: tail(&stderr),
             files: collect(&job.collect),
         })
@@ -333,7 +333,10 @@ mod tests {
         let started = std::time::Instant::now();
         let ev = events(&Host::default(), &job("sleep 30 & sleep 30", &dir), true).await;
         assert!(started.elapsed() < Duration::from_secs(10));
-        assert!(matches!(ev.last(), Some(JobEvent::Exit { success: false, .. })));
+        assert!(matches!(
+            ev.last(),
+            Some(JobEvent::Exit { success: false, .. })
+        ));
 
         // A harness that isn't there, and a file that can't be written.
         let mut missing = job("", &dir);
@@ -345,7 +348,9 @@ mod tests {
         let mut unwritable = job("", &dir);
         unwritable.files[0].path = "/proc/superbot-no-such-dir/x".into();
         let ev = events(&Host::default(), &unwritable, false).await;
-        assert!(matches!(&ev[..], [JobEvent::Error { message }] if message.contains("Couldn't write")));
+        assert!(
+            matches!(&ev[..], [JobEvent::Error { message }] if message.contains("Couldn't write"))
+        );
 
         // A failed cleanup before the run stops it there.
         let mut c = job("echo ran", &dir);
@@ -358,7 +363,9 @@ mod tests {
             timeout_secs: 5,
         });
         let ev = events(&Host::default(), &c, false).await;
-        assert!(matches!(&ev[..], [JobEvent::Cleanup { why }] if why.contains("`false stop` failed")));
+        assert!(
+            matches!(&ev[..], [JobEvent::Cleanup { why }] if why.contains("`false stop` failed"))
+        );
 
         // A host that clears the environment passes only what it sets.
         let host = Host {

@@ -483,6 +483,14 @@ pub struct Agent {
 impl Agent {
     pub fn new(cfg: Config, id: Identity) -> Result<Arc<Agent>, String> {
         let server = Arc::new(server_config(&cfg, &id)?);
+        for dir in [cfg.home.join("work"), cfg.home.join("bots")] {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&dir)
+                .map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
         Ok(Arc::new(Agent {
             cfg,
             current: RwLock::new((Arc::new(id), server)),
@@ -492,6 +500,11 @@ impl Agent {
 
     fn jobs(&self) -> std::sync::MutexGuard<'_, HashMap<String, watch::Sender<bool>>> {
         self.jobs.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Jobs running now.
+    pub fn running(&self) -> usize {
+        self.jobs().len()
     }
 
     pub fn identity(&self) -> Arc<Identity> {
@@ -593,7 +606,7 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
             .into_iter()
             .filter(|b| !a.cfg.has(b))
             .collect(),
-        jobs: a.jobs().len() as u32,
+        jobs: a.running() as u32,
     })
 }
 
@@ -602,8 +615,7 @@ fn inside(home: &Path, p: &str) -> bool {
     let p = Path::new(p);
     p.is_absolute()
         && p.starts_with(home)
-        && p
-            .components()
+        && p.components()
             .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
 }
 
