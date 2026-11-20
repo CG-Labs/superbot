@@ -37,7 +37,8 @@ step() { printf '\n==> drill: %s\n' "$*"; }
 fail() { printf 'DRILL FAILED: %s\n' "$*" >&2; journalctl -u superbot -u superbot-backup --no-pager -n 40 >&2 || true; exit 1; }
 
 home() { user_home; }
-password() { sed -n 's/^AUTH_PASSWORD=//p' "$(home)/superbot/.env" | tail -n 1; }
+setting() { sed -n "s/^$1=//p" "$(home)/superbot/.env" | tail -n 1 | tr -d "\"'"; }
+password() { setting AUTH_PASSWORD; }
 api() { curl -fsS -u "drill:$(password)" "$@"; }
 as_user() { sudo -u "$SUPERBOT_USER" -H "$@"; }
 botctl_as_owner() { as_user env SUPERBOT_PASSWORD="$(password)" "$BIN_DIR/botctl" "$@"; }
@@ -51,8 +52,9 @@ wait_healthz() {
 }
 
 # The installer's steps that matter for backups, minus the builds: the drill brings its own binaries.
+# With "custom", DATA_DIR and the master key live away from the defaults, as an operator may set them.
 install_superbot() {
-  local h
+  local h custom=${1:-}
   ensure_user
   h=$(home)
   install -d -m 0755 -o "$SUPERBOT_USER" -g "$SUPERBOT_USER" "$h/superbot"
@@ -63,6 +65,10 @@ install_superbot() {
   configure_env
   set_env_var "$h/superbot/.env" SCREENS off
   set_env_var "$h/superbot/.env" SUPERBOT_BACKUP_AGE_RECIPIENTS "$RECIPIENT"
+  if [[ "$custom" == custom ]]; then
+    set_env_var "$h/superbot/.env" DATA_DIR "$h/srv-data"
+    set_env_var "$h/superbot/.env" SUPERBOT_MASTER_KEY_FILE "$h/.keys/superbot.key"
+  fi
   ensure_master_key
   install_systemd
   install_backup
@@ -75,9 +81,13 @@ for c in age age-keygen sqlite3 curl; do command -v "$c" >/dev/null || fail "nee
 age-keygen -o "$OFFSITE/identity.txt" 2>/dev/null
 RECIPIENT=$(age-keygen -y "$OFFSITE/identity.txt")
 
-step "fresh install from this checkout"
-install_superbot
+step "fresh install from this checkout, with a custom DATA_DIR and master key path"
+install_superbot custom
 H=$(home)
+OLD_DATA=$(setting DATA_DIR)
+OLD_KEY=$(setting SUPERBOT_MASTER_KEY_FILE)
+[[ "$OLD_DATA" == "$H/srv-data" && "$OLD_KEY" == "$H/.keys/superbot.key" && -f "$OLD_DATA/app.sqlite" && -s "$OLD_KEY" ]] ||
+  fail "the custom DATA_DIR or master key path was not used"
 [[ $(systemctl show -p ExecStart --value superbot-backup.service) == *"$BIN_DIR/superbot-backup --home $H"* ]] ||
   fail "the backup unit does not run superbot-backup --home $H"
 
@@ -97,7 +107,7 @@ ARCHIVE=${archives[0]}
 [[ $(stat -c '%U %a' "$ARCHIVE") == "$SUPERBOT_USER 600" ]] || fail "archive is not 0600 and owned by $SUPERBOT_USER"
 [[ $(head -c 21 "$ARCHIVE") == age-encryption.org/v1 ]] || fail "archive is not age-encrypted"
 age -d -i "$OFFSITE/identity.txt" "$ARCHIVE" | tar -xzf - -C "$WORK/plain"
-if grep -rqF -e "$SECRET_VALUE" -e "$(cat "$H/.config/superbot/master.key")" "$WORK/plain"; then
+if grep -rqF -e "$SECRET_VALUE" -e "$(cat "$OLD_KEY")" "$WORK/plain"; then
   fail "the archive holds a secret value or the master key"
 fi
 install -m 0600 -o "$SUPERBOT_USER" "$OFFSITE/identity.txt" "$WORK/identity.txt"
@@ -115,7 +125,7 @@ step "a change after the backup (inside the RPO window, so it is lost)"
 api -H 'Content-Type: application/json' -d '{"name":"DrillDrop"}' "$BASE/api/bots" >/dev/null
 cp "$ARCHIVE" "$OFFSITE/archive.tar.gz.age"
 cp "$H/superbot/.env" "$OFFSITE/env"
-cp "$H/.config/superbot/master.key" "$OFFSITE/master.key"
+cp "$OLD_KEY" "$OFFSITE/master.key"
 OLD_PASSWORD=$(password)
 [[ -z "${GITHUB_ACTIONS:-}" ]] || echo "::add-mask::$OLD_PASSWORD"
 
@@ -124,20 +134,26 @@ systemctl stop superbot.service superbot-backup.timer
 userdel -r "$SUPERBOT_USER" 2>/dev/null || true
 [[ ! -e "$H" ]] || fail "$H still exists"
 
-step "reinstall on the 'new' host"
+step "reinstall on the 'new' host (default paths: it knows nothing of the old ones)"
 install_superbot
+NEW_KEY=$(setting SUPERBOT_MASTER_KEY_FILE)
 [[ $(password) != "$OLD_PASSWORD" ]] || fail "reinstall reused the old password"
 if api "$BASE/api/bots" | grep -q DrillKeep; then fail "fresh install already has DrillKeep"; fi
 
-step "restore (timed)"
+step "restore in the documented order: old .env first, then its key path and DATA_DIR (timed)"
 t0=$(date +%s)
 systemctl stop superbot.service superbot-backup.timer
+install -m 0600 -o "$SUPERBOT_USER" -g "$SUPERBOT_USER" "$OFFSITE/env" "$H/superbot/.env"
+[[ $(setting DATA_DIR) == "$OLD_DATA" && $(setting SUPERBOT_MASTER_KEY_FILE) == "$OLD_KEY" ]] || fail "the old .env paths are not in place"
+install -d -m 0700 -o "$SUPERBOT_USER" -g "$SUPERBOT_USER" "$(dirname "$OLD_KEY")" "$OLD_DATA"
 install -m 0600 -o "$SUPERBOT_USER" "$OFFSITE/identity.txt" "$WORK/identity.txt"
 as_user superbot-restore --home "$H" --identity "$WORK/identity.txt" - <"$OFFSITE/archive.tar.gz.age" >/dev/null
 rm -f "$WORK/identity.txt"
+[[ -f "$OLD_DATA/app.sqlite" ]] || fail "the archive was not restored into the old DATA_DIR"
 t1=$(date +%s)
 
-# Untimed check: botd refuses the restored data with the new host's master key.
+# Untimed check: botd refuses the restored data with the new host's master key in the old key's place.
+install -m 0600 -o "$SUPERBOT_USER" -g "$SUPERBOT_USER" "$NEW_KEY" "$OLD_KEY"
 systemctl start superbot.service
 sleep 5
 if curl -fsS --max-time 2 "$BASE/healthz" >/dev/null 2>&1; then fail "botd started with the wrong master key"; fi
@@ -145,8 +161,7 @@ journalctl -u superbot --no-pager --since "-1min" | grep -q "wrong key" || fail 
 systemctl stop superbot.service
 
 t2=$(date +%s)
-install -m 0600 -o "$SUPERBOT_USER" -g "$SUPERBOT_USER" "$OFFSITE/env" "$H/superbot/.env"
-install -m 0600 -o "$SUPERBOT_USER" -g "$SUPERBOT_USER" "$OFFSITE/master.key" "$H/.config/superbot/master.key"
+install -m 0600 -o "$SUPERBOT_USER" -g "$SUPERBOT_USER" "$OFFSITE/master.key" "$OLD_KEY"
 systemctl start superbot.service superbot-backup.timer
 wait_healthz || fail "botd did not answer /healthz after restore"
 t3=$(date +%s)

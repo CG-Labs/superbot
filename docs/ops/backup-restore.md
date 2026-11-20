@@ -105,19 +105,27 @@ curl -fsS http://127.0.0.1:3000/healthz                                         
 ### Installer, new host
 
 1. Run the installer as usual ([deploy/README.md](../../deploy/README.md)). It makes a new password and master key; both are replaced below.
-2. Stop botd, restore the archive, and put back the old `.env` and master key (owner `superbot`, mode `0600`):
+2. Stop botd and put back the old `.env` **first**, so the restore and the key use its paths (a custom `DATA_DIR` or `SUPERBOT_MASTER_KEY_FILE`). If the domain changed, edit `ALLOWED_HOSTS` and `CORS_ORIGINS` in it now.
+3. Put the old master key where that `.env` expects it, make sure `DATA_DIR` exists for `superbot`, then restore and start (owner `superbot`, mode `0600` throughout):
 
 ```sh
 sudo systemctl stop superbot superbot-backup.timer
-sudo -u superbot superbot-restore --home /home/superbot - < superbot-<stamp>.tar.gz[.age]
-sudo install -m 0600 -o superbot -g superbot old.env /home/superbot/superbot/.env
-sudo install -m 0600 -o superbot -g superbot old-master.key /home/superbot/.config/superbot/master.key
+env=/home/superbot/superbot/.env
+sudo install -m 0600 -o superbot -g superbot old.env "$env"
+setting() { sudo sed -n "s/^$1=//p" "$env" | tail -n 1 | tr -d "\"'"; }
+key=$(setting SUPERBOT_MASTER_KEY_FILE)        # empty if the key is inline as SUPERBOT_MASTER_KEY
+if [ -n "$key" ]; then
+  sudo install -d -m 0700 -o superbot -g superbot "$(dirname "$key")"
+  sudo install -m 0600 -o superbot -g superbot old-master.key "$key"
+fi
+sudo install -d -m 0700 -o superbot -g superbot "$(setting DATA_DIR)"
+sudo -u superbot superbot-restore --home /home/superbot - < superbot-<stamp>.tar.gz[.age]   # add --identity FILE if encrypted
 sudo systemctl start superbot superbot-backup.timer
 curl -fsS http://127.0.0.1:3000/healthz
 ```
 
-3. If the domain changed, set `ALLOWED_HOSTS` and `CORS_ORIGINS` in `.env` (or re-run the installer with `--domain`), and update SSO redirect URLs at your IdP.
-4. Log the harness CLIs in again (`sudo -iu superbot claude login`, …). Restore the workspace from your own copy if you keep one.
+4. If the domain changed, update the SSO redirect URLs at your IdP (and re-run the installer with `--domain` so Caddy serves the new name).
+5. Log the harness CLIs in again (`sudo -iu superbot claude login`, …). Restore the workspace from your own copy if you keep one.
 
 With the wrong master key, botd logs `the master key doesn't open this database's encrypted values (wrong key)` and exits; fix the key and start again.
 
