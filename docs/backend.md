@@ -295,7 +295,7 @@ For CG-Labs managed hosting: botd can rent one Linode per user and track it. **O
   - botd queues a removal per machine (`teammate_cleanups`) and asks the agent with `POST /v1/teammates/{user}/remove`. The agent stops their jobs, screens and processes, deletes their home, temp files and user, and never touches the machine's own user or other teammates. Heartbeats list `teammates`, so ones missed are found too.
   - Removals run in the background, four at a time. Offline or outdated agents are asked again after each round of heartbeats until done; access coming back cancels one the agent was never asked for, and finishes one it was.
   - Work: `MACHINE_TEAMMATE_FILES=archive` (default) moves it to the owner's `work/from-teammates/`; `delete` holds it, then purges it after `MACHINE_TEAMMATE_FILES_DAYS` (default 7).
-  - `GET /api/machines/teammate-removals?state=`, `GET /api/users/{key}/machine/teammates` and `POST .../machine/teammates/{teammate}/remove` (admin). Audited as `machine.teammate_removal_queued`, `machine.teammate_removed`, `machine.teammate_removal_failed`, `machine.teammate_removal_cancelled` and `machine.teammate_files_purged`.
+  - `GET /api/machines/teammate-removals?state=`, `GET /api/users/{key}/machine/teammates` and `POST .../machine/teammates/{teammate}/remove` (admin). Audited as `machine.teammate_removal_queued`, `machine.teammate_removed`, `machine.teammate_removal_failed`, `machine.teammate_removal_cancelled`, `machine.teammate_removal_forced` and `machine.teammate_files_purged`.
 - **Not yet**: tying tiers to billing.
 
 ## API

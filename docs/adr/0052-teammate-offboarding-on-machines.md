@@ -40,7 +40,7 @@ Heartbeats now carry `teammates`: the ids in the agent's `teammates.json`. botd 
 
 1. Refuses the machine's own user, names that aren't plain, and a body for another owner.
 2. Marks the teammate as leaving, so no new job or screen starts for them meanwhile.
-3. Stops their jobs and screens, then kills every process of their uid (SIGKILL, until none are left).
+3. Stops their jobs and screens, then kills every process of their uid (SIGKILL, until none are left). Each is signalled through a pidfd opened before its owner is checked, so a pid reused by someone else's process is never hit. A kernel without pidfds (before Linux 5.3) fails the removal rather than guess.
 4. Moves their `work/` aside, deletes their home, and clears their files in `/tmp`, `/var/tmp` and `/dev/shm`.
 5. Deletes the OS user (`userdel`).
 6. Deals with their work (below), drops them from `teammates.json` last, and answers what it did.
@@ -53,7 +53,7 @@ Credentials: a teammate's harness state and anything else they kept on the machi
 
 Before ADR 0048, teammates' runs worked in the owner's own `work/`. So by default their work stays with the owner:
 
-- **`MACHINE_TEAMMATE_FILES=archive`** (default): the teammate's `work/` moves to the owner's `work/from-teammates/<email name>-<date>/`, owned by the Bots' user, so the owner's Bots can use it. The move never replaces an existing folder.
+- **`MACHINE_TEAMMATE_FILES=archive`** (default): the teammate's `work/` moves to the owner's `work/from-teammates/<email name>-<date>/`, owned by the Bots' user, so the owner's Bots can use it. The move never replaces an existing folder. A file of theirs with another hard link gets a copy of its own first, so it's handed over too; a link to someone else's file is never read and stays theirs. If the owner's home is on another filesystem, the work is copied as the Bots' user (folders, files and links; never devices, pipes or files it can't read), then the original is deleted.
 - **`MACHINE_TEAMMATE_FILES=delete`**: their `work/` is held aside, root's alone (`<state>/teammates/.left/<cleanup id>`), and deleted after `MACHINE_TEAMMATE_FILES_DAYS` (default 7, 0 to 365; 0 deletes at once). botd asks the agent to delete it once the days are up (`POST /v1/teammates/{user}/purge`).
 
 The rest of the home (dotfiles, caches, harness state) is always deleted.
@@ -62,7 +62,7 @@ The rest of the home (dotfiles, caches, harness state) is always deleted.
 
 An agent that's offline, outdated, or doesn't answer leaves the removal pending. botd asks again after every round of heartbeats until it's done. Removals run in the background, four at a time, so a slow agent never holds up heartbeats; one pass runs at a time, and an event during it runs another after. An agent that says nothing of `teammate_removal` in its heartbeat isn't asked: the removal waits until it's upgraded (ADR 0039).
 
-A removal is cancelled if the machine is destroyed. It's also cancelled if the teammate gets access back before the agent was ever asked (and an admin didn't ask for it). Once the agent has been asked, it may have done part of it, such as deleting the user but not yet moving the work, so botd finishes it instead; the teammate's next run makes them a new user.
+A removal is cancelled if the machine is destroyed. It's also cancelled if the teammate gets access back before the agent was ever asked (and an admin didn't ask for it). An admin who asks for a removal that's already waiting for another reason makes it theirs, so it's never cancelled that way. Once the agent has been asked, it may have done part of it, such as deleting the user but not yet moving the work, so botd finishes it instead; the teammate's next run makes them a new user.
 
 ### Admin view
 
@@ -83,6 +83,7 @@ All admin only.
 | `machine.teammate_removed` | The agent removed them: what it stopped, `userRemoved`, `alreadyGone`, `work` (`archived`, `held`, `deleted` or `none`), `archivedTo`, `purgeAt`, `attempts` |
 | `machine.teammate_removal_failed` | A try failed or is waiting. Logged once per new reason, not on every retry |
 | `machine.teammate_removal_cancelled` | `why`: `access_back` or `machine_gone` |
+| `machine.teammate_removal_forced` | An admin asked for a removal already waiting for another reason: `was` |
 | `machine.teammate_files_purged`, `machine.teammate_files_purge_failed` | Held work deleted, or not yet |
 | `machine.screen_closed` | Reason `teammate_left` |
 
@@ -105,10 +106,10 @@ All admin only.
   - All wire fields are optional, so older agents and botds still talk.
 - Tests:
   - The agent's removal with fake accounts: only the leaving user is removed, their processes stopped, their work archived, and nothing of the owner's or other teammates' touched (`machines::teammates`).
-  - Moves that never follow links or replace (`runas`).
+  - Moves that never follow links or replace, hard links copied only when they're the teammate's own, and a move to another filesystem copied then deleted (`runas`).
   - A retry of a finished removal after the teammate came back leaves their new home alone, and a stale record doesn't block their next run (`machines::teammates`).
-  - End to end over mTLS with the real agent (`machines_offboard_tests.rs`): disable, SCIM deactivate and delete, a revoked grant and a deleted Bot each remove the user; asking again changes nothing; an offline machine is retried and logged once; access coming back finishes a removal the agent was asked for, and cancels one it wasn't (an outdated agent); delete mode holds then purges; the admin API.
-  - As root in CI's isolation job: a real user, its processes and temp files are removed, the archive goes to the Bots' user, and the other teammate and the Bots' user are untouched.
+  - End to end over mTLS with the real agent (`machines_offboard_tests.rs`): disable, SCIM deactivate and delete, a revoked grant and a deleted Bot each remove the user; asking again changes nothing; an offline machine is retried and logged once; access coming back finishes a removal the agent was asked for, and cancels one it wasn't (an outdated agent) unless an admin asked for it; delete mode holds then purges; the admin API.
+  - As root in CI's isolation job: a real user, its processes and temp files are removed, the archive (including a hard-linked file of theirs) goes to the Bots' user while a hard link to root's file stays root's, and the other teammate and the Bots' user are untouched.
 
 ## Limits and follow-ups
 
