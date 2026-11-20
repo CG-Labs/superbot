@@ -2164,8 +2164,9 @@ impl Db {
     /// last one applied to the subscription (`Stale`), keeps the subscription row, and,
     /// when `set_tier`, sets `users.tier` to `sub.tier` (None: the default tier). An
     /// event for a subscription that isn't the user's current one changes nothing when it
-    /// ends that subscription or is older than the current one (`Superseded`), so a late
-    /// event for an old plan after moving to a new one can't undo the move.
+    /// ends that subscription, or when it is older than the current one and the current
+    /// one hasn't ended (`Superseded`): a late event for an old plan can't undo a move to
+    /// a new one, and a new plan still applies after the old one's cancellation.
     pub fn apply_subscription(&self, event_id: &str, event_type: &str, sub: &Subscription, set_tier: bool, ending: bool) -> Result<Applied, String> {
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
@@ -2181,7 +2182,10 @@ impl Db {
             Applied::OtherUser
         } else if by_id.as_ref().is_some_and(|s| sub.event_created < s.event_created) {
             Applied::Stale
-        } else if mine.as_ref().is_some_and(|s| s.subscription_id != sub.subscription_id && (ending || sub.event_created < s.event_created)) {
+        } else if mine.as_ref().is_some_and(|s| {
+            let live = !crate::billing::ENDED.contains(&s.status.as_str());
+            s.subscription_id != sub.subscription_id && (ending || (live && sub.event_created < s.event_created))
+        }) {
             Applied::Superseded
         } else {
             tx.execute(

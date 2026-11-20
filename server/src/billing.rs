@@ -31,7 +31,7 @@ pub const USER_KEY: &str = "superbot_user_id";
 /// retries the card; Stripe moves it to `canceled` or `unpaid` when it gives up.
 const PAYING: [&str; 3] = ["active", "trialing", "past_due"];
 /// Statuses that end it: the user goes back to the default tier.
-const ENDED: [&str; 4] = ["canceled", "unpaid", "incomplete_expired", "paused"];
+pub const ENDED: [&str; 4] = ["canceled", "unpaid", "incomplete_expired", "paused"];
 
 #[derive(Default)]
 pub struct Billing {

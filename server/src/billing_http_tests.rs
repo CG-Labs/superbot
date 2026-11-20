@@ -412,6 +412,13 @@ async fn signed_subscription_events_set_the_users_tier() {
     assert_eq!(deliver(port, &late, None).await.1["outcome"], "superseded");
     assert_eq!(tier(&w.b_id).as_deref(), Some("starter"));
     assert_eq!(app.db.subscription(&w.b_id).unwrap().subscription_id, "sub_test_bea_2");
+    // Ada's old plan is cancelled after her new one starts, but the cancellation arrives
+    // first: the new one still applies.
+    let cancelled = event(DELETED, &w.a_id, "evt_10", 1_795_400_100, |_| {});
+    assert_eq!(deliver(port, &cancelled, None).await.1["outcome"], "unchanged");
+    let replacement = event(UPDATED, &w.a_id, "evt_11", 1_795_400_000, |v| v["data"]["object"]["id"] = json!("sub_test_ada_2"));
+    assert_eq!(deliver(port, &replacement, None).await.1["outcome"], "tier_changed");
+    assert_eq!(tier(&w.a_id).as_deref(), Some("pro"));
     let incomplete = event(UPDATED, &w.b_id, "evt_9", 1_795_300_300, |v| {
         v["data"]["object"]["id"] = json!("sub_test_bea_2");
         v["data"]["object"]["status"] = json!("incomplete");
