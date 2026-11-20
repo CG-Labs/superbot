@@ -9,6 +9,7 @@ import { CreateBotModal } from "../components/CreateBotModal";
 import { ScreenViewer } from "../components/ScreenViewer";
 import { Sidebar } from "../components/Sidebar";
 import { openConsole, openSetup, watchSetup } from "../src/admin";
+import { billingAvailable } from "../src/billing";
 import { showError } from "../src/dialogs";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
@@ -26,8 +27,17 @@ export default function HomeScreen() {
   const [screen, setScreen] = useState<ScreenState>(null);
   const [approvalsOpen, setApprovalsOpen] = useState(false);
   const [setupWaiting, setSetupWaiting] = useState(false);
+  const [billing, setBilling] = useState(false);
 
   useEffect(() => (api ? watchSetup(api, me, setSetupWaiting) : undefined), [api, me]);
+  useEffect(() => {
+    if (!api) return;
+    let live = true;
+    void billingAvailable(api).then((on) => live && setBilling(on));
+    return () => {
+      live = false;
+    };
+  }, [api]);
 
   if (!api) {
     return <Redirect href="/" />;
@@ -81,6 +91,7 @@ export default function HomeScreen() {
             onNewBot={() => setCreateOpen(true)}
             onLogout={onLogout}
             onOpenApprovals={() => setApprovalsOpen(true)}
+            onOpenPlan={billing ? () => router.push("/plan") : undefined}
             onOpenUsers={() => router.push("/users")}
             onOpenAudit={() => router.push("/audit")}
             onOpenConsole={() => void openConsole(api.baseUrl).catch((err) => showError(err, "Couldn't open the admin console"))}

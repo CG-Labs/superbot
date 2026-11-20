@@ -10,6 +10,8 @@ interface Props {
   onNewBot: () => void;
   onLogout: () => void;
   onOpenApprovals: () => void;
+  /** Everyone's own plan and billing; set only when the server sells plans (ADR 0041). */
+  onOpenPlan?: () => void;
   /** These three are shown to admins only; the server refuses the admin API and console to everyone else. */
   onOpenUsers?: () => void;
   onOpenAudit?: () => void;
@@ -20,7 +22,7 @@ interface Props {
   compact?: boolean;
 }
 
-export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOpenUsers, onOpenAudit, onOpenConsole, onOpenSetup, compact }: Props) {
+export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOpenPlan, onOpenUsers, onOpenAudit, onOpenConsole, onOpenSetup, compact }: Props) {
   const {
     bots,
     activeId,
@@ -110,6 +112,11 @@ export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOp
           </View>
         ) : null}
       </Pressable>
+      {onOpenPlan ? (
+        <Pressable style={styles.approvalsBtn} onPress={onOpenPlan} accessibilityRole="button">
+          <Text style={styles.hiddenText}>Plan</Text>
+        </Pressable>
+      ) : null}
       {isAdmin(me) ? (
         <>
           {onOpenSetup ? (

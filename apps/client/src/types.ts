@@ -77,6 +77,24 @@ export interface PlanUsage extends TierView {
   usage: { period: string; runs: number; bots: number; day?: string; routineRuns?: number };
 }
 
+/** A plan for sale through Stripe Checkout (ADR 0041). */
+export interface BillingPlan extends TierView {
+  /** The plan the user is on now. */
+  current: boolean;
+}
+
+/** `/api/billing`: your plan and use, the plans you can buy, and your billing account. */
+export interface BillingView {
+  plan: PlanUsage;
+  plans: BillingPlan[];
+  /** The subscription paying for your plan now, if one does. Change it in the portal. */
+  subscription: { status: string; tier: string | null; periodEnd: number | null } | null;
+  /** You have a Stripe customer, so "Manage billing" works. */
+  portal: boolean;
+  /** False for read-only people: they see their plan but can't buy or manage it. */
+  canChange: boolean;
+}
+
 export type Visibility = "private" | "shared";
 /** Each level includes the ones before it. */
 export type BotAccess = "view" | "operate" | "manage";

@@ -72,3 +72,18 @@ describe("Sidebar admin entries", () => {
     expect(screen.getByText("Approvals")).toBeOnTheScreen();
   });
 });
+
+describe("Sidebar plan entry (ADR 0041)", () => {
+  it("shows everyone their plan when the server sells plans", async () => {
+    const onOpenPlan = jest.fn();
+    const user = userEvent.setup();
+    await render(<Sidebar {...setup({ name: "Alex", role: "member", permissions: ["account", "read", "write"] })} onOpenPlan={onOpenPlan} />);
+    await user.press(screen.getByText("Plan"));
+    expect(onOpenPlan).toHaveBeenCalledTimes(1);
+  });
+
+  it("hides it when billing isn't set up", async () => {
+    await render(<Sidebar {...setup({ name: "Owner", role: "admin", permissions: ALL })} />);
+    expect(screen.queryByText("Plan")).toBeNull();
+  });
+});
