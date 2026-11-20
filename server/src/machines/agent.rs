@@ -3,8 +3,9 @@
 //! heartbeat, and jobs, each one harness run for one of its user's Bots, streamed
 //! back as it happens. It knows nothing of harnesses: botd builds each command. Bots
 //! on the machine reach botd's API (approvals, `botctl`) through the agent's relay
-//! on loopback, which forwards over mutual TLS. Shared by the binary and botd's
-//! tests, so it uses nothing of botd's but `job`, `pki` and `wire`.
+//! on loopback, which forwards over mutual TLS. It also runs harness logins and takes
+//! copies of the user's folder (ADR 0041). Shared by the binary and botd's tests, so
+//! it uses nothing of botd's but its sibling modules.
 //!
 //! Settings (cloud-init writes them to /etc/superbot/machine.env):
 //! - `SUPERBOT_CONTROL_URL`: botd's machine port, `https://<host>:<port>`.
@@ -26,12 +27,14 @@
 //!   `/usr/local/lib/superbot/superbot-machine`).
 
 use super::job;
+use super::landing::Landing;
 use super::pki::{self, Peer};
+use super::terminal::Logins;
 use super::tools::Tools;
 use super::upgrade::{self, Upgrader};
 use super::wire;
 use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, Path as UrlPath, RawQuery, Request, State};
+use axum::extract::{DefaultBodyLimit, Path as UrlPath, Query, RawQuery, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
@@ -533,6 +536,9 @@ pub struct Agent {
     pub tools: Arc<Tools>,
     /// Replacing this agent with botd's build (ADR 0039).
     pub upgrader: Upgrader,
+    /// Harness logins running now, and copies of the user's folder (ADR 0041).
+    pub logins: Arc<Logins>,
+    pub landing: Arc<Landing>,
     /// True once the agent should exit, for systemd to start it again.
     restart: watch::Sender<bool>,
 }
@@ -552,12 +558,15 @@ impl Agent {
         }
         let tools = Tools::new(cfg.tools.clone(), Some(cfg.ca_pem.as_str()).filter(|p| !p.is_empty()))?;
         let upgrader = Upgrader::new(cfg.exe.clone(), cfg.state_dir.clone(), VERSION);
+        let landing = Arc::new(Landing::new(cfg.home.clone(), &cfg.state_dir)?);
         let a = Arc::new(Agent {
             cfg,
             current: RwLock::new((Arc::new(id), server)),
             jobs: Mutex::default(),
             tools,
             upgrader,
+            logins: Arc::default(),
+            landing,
             restart: watch::channel(false).0,
         });
         if tokio::runtime::Handle::try_current().is_ok() {
@@ -594,9 +603,9 @@ impl Agent {
         self.jobs.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Jobs running now.
+    /// Jobs and logins running now: either holds off an upgrade.
     pub fn running(&self) -> usize {
-        self.jobs().len()
+        self.jobs().len() + self.logins.running().len()
     }
 
     pub fn identity(&self) -> Arc<Identity> {
@@ -685,6 +694,64 @@ fn bins(query: Option<&str>) -> Vec<(String, Option<&'static str>)> {
         .collect()
 }
 
+fn unescape(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let h = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(h, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// `?cred=claude:.claude/.credentials.json`: where each harness keeps its login,
+/// relative to HOME (ADR 0041). Grouped by harness; anything else is ignored.
+fn creds(query: Option<&str>) -> BTreeMap<&'static str, Vec<String>> {
+    let mut out: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    for kv in query.unwrap_or("").split('&').filter_map(|kv| kv.strip_prefix("cred=")).take(16) {
+        let Some((h, p)) = unescape(kv).and_then(|v| v.split_once(':').map(|(h, p)| (h.to_string(), p.to_string()))) else {
+            continue;
+        };
+        if let Some(h) = wire::harness_bin(&h)
+            && wire::home_path(&p)
+        {
+            out.entry(h).or_default().push(p);
+        }
+    }
+    out
+}
+
+/// Whether each harness asked about is logged in, and those logging in now.
+fn logins(a: &Agent, query: Option<&str>) -> BTreeMap<String, wire::LoginStatus> {
+    let running = a.logins.running();
+    let mut out: BTreeMap<String, wire::LoginStatus> = creds(query)
+        .into_iter()
+        .map(|(h, files)| {
+            let since = super::terminal::logged_in(&a.cfg.home, &files);
+            let state = match since {
+                Some(_) => wire::LOGGED_IN,
+                None if running.iter().any(|r| r == h) => wire::LOGGING_IN,
+                None => wire::LOGGED_OUT,
+            };
+            (h.to_string(), wire::LoginStatus { state: state.into(), since })
+        })
+        .collect();
+    for h in running {
+        out.entry(h).or_insert_with(|| wire::LoginStatus {
+            state: wire::LOGGING_IN.into(),
+            since: None,
+        });
+    }
+    out
+}
+
 /// Only the control plane's certificate gets here (`admit`), so answering one is the
 /// proof an upgraded agent works: its trial ends.
 async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<wire::Heartbeat> {
@@ -707,15 +774,16 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
             .map(|(b, _)| b)
             .collect(),
         jobs: a.running() as u32,
-        can: if a.upgrader.build.is_some() {
-            vec![wire::CAN_HARNESSES.into(), wire::CAN_UPGRADE.into()]
-        } else {
-            vec![wire::CAN_HARNESSES.into()]
-        },
+        can: [wire::CAN_HARNESSES, wire::CAN_LOGINS, wire::CAN_SYNC]
+            .into_iter()
+            .chain(a.upgrader.build.is_some().then_some(wire::CAN_UPGRADE))
+            .map(String::from)
+            .collect(),
         build: a.upgrader.build.clone(),
         plan,
         harnesses,
         upgrade: a.upgrader.report(),
+        logins: logins(&a, q.as_deref()),
     })
 }
 
@@ -782,10 +850,39 @@ fn scrub(env: &mut BTreeMap<String, String>) {
     env.retain(|k, _| k != "HOME" && k != "PATH");
 }
 
-fn ndjson(e: &wire::JobEvent) -> Bytes {
+fn ndjson(e: &impl serde::Serialize) -> Bytes {
     let mut line = serde_json::to_vec(e).unwrap_or_default();
     line.push(b'\n');
     Bytes::from(line)
+}
+
+/// Streams `rx` as JSON lines, with `ping` while it's quiet. `guard` is dropped when the
+/// stream ends, however it ends.
+fn stream<T: serde::Serialize + Send + 'static>(
+    mut rx: mpsc::Receiver<T>,
+    ping: T,
+    guard: impl Send + 'static,
+) -> Response {
+    let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    tokio::spawn(async move {
+        let _guard = guard;
+        loop {
+            let next = tokio::time::timeout(PING_EVERY, rx.recv()).await;
+            let line = match next {
+                Ok(Some(e)) => ndjson(&e),
+                Ok(None) => break,
+                Err(_) => ndjson(&ping),
+            };
+            if body_tx.send(Ok(line)).await.is_err() {
+                break;
+            }
+        }
+    });
+    (
+        [(header::CONTENT_TYPE, "application/x-ndjson")],
+        Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(body_rx)),
+    )
+        .into_response()
 }
 
 /// A job's registration and its hold on the tools, kept until the harness has exited
@@ -852,7 +949,7 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
             .mode(0o700)
             .create(dir);
     }
-    let (ev_tx, mut ev_rx) = mpsc::channel::<wire::JobEvent>(256);
+    let (ev_tx, ev_rx) = mpsc::channel::<wire::JobEvent>(256);
     let host = a.cfg.host();
     tokio::spawn(async move {
         let _running = running;
@@ -861,27 +958,106 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
         };
         job::run(&host, &j, abort, &ev_tx).await;
     });
-    let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
-    tokio::spawn(async move {
-        // Held until the stream ends: dropping it stops the job.
-        let _stop = stop;
-        loop {
-            let next = tokio::time::timeout(PING_EVERY, ev_rx.recv()).await;
-            let line = match next {
-                Ok(Some(e)) => ndjson(&e),
-                Ok(None) => break,
-                Err(_) => ndjson(&wire::JobEvent::Ping),
-            };
-            if body_tx.send(Ok(line)).await.is_err() {
-                break;
-            }
-        }
-    });
-    (
-        [(header::CONTENT_TYPE, "application/x-ndjson")],
-        Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(body_rx)),
-    )
-        .into_response()
+    // Held until the stream ends: dropping it stops the job.
+    stream(ev_rx, wire::JobEvent::Ping, stop)
+}
+
+fn code_or(code: u16, fallback: StatusCode) -> StatusCode {
+    StatusCode::from_u16(code).unwrap_or(fallback)
+}
+
+/// `POST /v1/logins`: runs a harness's login in a terminal here and streams what it
+/// shows (ADR 0041). Its credentials stay in this machine's HOME. A dropped stream
+/// stops it. Like a job, it holds off agent upgrades and harness updates.
+async fn start_login(State(a): State<Arc<Agent>>, Json(r): Json<wire::LoginRequest>) -> Response {
+    let run = match super::terminal::check(&r, |b| a.cfg.has(b)) {
+        Ok(run) => run,
+        Err((code, msg)) => return refuse(code_or(code, StatusCode::BAD_REQUEST), msg),
+    };
+    let env = a.cfg.host().env;
+    let _jobs = a.jobs();
+    if a.upgrader.staging() {
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, "This machine is updating its agent. Try again in a minute.");
+    }
+    let Some(permit) = a.tools.job_permit() else {
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, "This machine is updating its harnesses. Try again in a minute.");
+    };
+    match a.logins.start(&r, &run, &a.cfg.home, &env) {
+        Ok((rx, stop)) => stream(rx, wire::LoginEvent::Ping, (StopOnDrop(stop), permit)),
+        Err((code, msg)) => refuse(code_or(code, StatusCode::CONFLICT), msg),
+    }
+}
+
+async fn login_input(
+    State(a): State<Arc<Agent>>,
+    UrlPath(id): UrlPath<String>,
+    Json(i): Json<wire::LoginInput>,
+) -> Response {
+    let logins = a.logins.clone();
+    match tokio::task::spawn_blocking(move || logins.input(&id, &i.text)).await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err((code, msg))) => refuse(code_or(code, StatusCode::BAD_REQUEST), msg),
+        Err(e) => refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn login_abort(State(a): State<Arc<Agent>>, UrlPath(id): UrlPath<String>) -> Response {
+    if a.logins.abort(&id) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        refuse(StatusCode::NOT_FOUND, "No such login is running.")
+    }
+}
+
+/// `POST /v1/logins/forget`: logs a harness out by removing its credential files.
+async fn login_forget(State(a): State<Arc<Agent>>, Json(f): Json<wire::ForgetRequest>) -> Response {
+    if wire::harness_bin(&f.harness).is_none() || f.files.len() > 4 || !f.files.iter().all(|p| wire::home_path(p)) {
+        return refuse(StatusCode::BAD_REQUEST, "Name a harness and its credential files inside HOME.");
+    }
+    if a.logins.running().contains(&f.harness) {
+        return refuse(StatusCode::CONFLICT, format!("A {} login is running here.", f.harness));
+    }
+    let removed = super::terminal::forget(&a.cfg.home, &f.files);
+    Json(wire::ForgetReply { removed }).into_response()
+}
+
+fn landed<T: serde::Serialize>(r: Result<Result<T, (u16, String)>, tokio::task::JoinError>) -> Response {
+    match r {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err((code, msg))) => refuse(code_or(code, StatusCode::BAD_REQUEST), msg),
+        Err(e) => refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// `POST /v1/sync`: a copy of the user's folder begins (ADR 0041).
+async fn sync_plan(State(a): State<Arc<Agent>>, Json(m): Json<wire::SyncManifest>) -> Response {
+    let landing = a.landing.clone();
+    landed(tokio::task::spawn_blocking(move || landing.plan(m)).await)
+}
+
+#[derive(serde::Deserialize)]
+struct Offset {
+    offset: u64,
+}
+
+async fn sync_blob(
+    State(a): State<Arc<Agent>>,
+    UrlPath((id, sha)): UrlPath<(String, String)>,
+    Query(o): Query<Offset>,
+    body: Bytes,
+) -> Response {
+    let landing = a.landing.clone();
+    match tokio::task::spawn_blocking(move || landing.put(&id, &sha, o.offset, &body)).await {
+        Ok(Ok(r)) => Json(r).into_response(),
+        Ok(Err((_, Some(held)))) => (StatusCode::CONFLICT, Json(held)).into_response(),
+        Ok(Err(((code, msg), None))) => refuse(code_or(code, StatusCode::BAD_REQUEST), msg),
+        Err(e) => refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn sync_finish(State(a): State<Arc<Agent>>, UrlPath(id): UrlPath<String>) -> Response {
+    let landing = a.landing.clone();
+    landed(tokio::task::spawn_blocking(move || landing.finish(&id)).await)
 }
 
 /// `POST /v1/jobs/{id}/abort`: stops a job; its stream ends with its exit.
@@ -937,11 +1113,11 @@ async fn fetch(a: &Agent, path: &str) -> Result<Vec<u8>, String> {
 }
 
 /// `POST /v1/upgrade`: replaces this agent with botd's build, then restarts (ADR
-/// 0039). Refused while jobs run; no job starts until it's done.
+/// 0039). Refused while jobs or logins run; neither starts until it's done.
 async fn start_upgrade(State(a): State<Arc<Agent>>, Json(req): Json<wire::UpgradeRequest>) -> Response {
     {
         let jobs = a.jobs();
-        if let Some((code, msg)) = a.upgrader.refuse(&req, jobs.len()) {
+        if let Some((code, msg)) = a.upgrader.refuse(&req, jobs.len() + a.logins.running().len()) {
             return refuse(StatusCode::from_u16(code).unwrap_or(StatusCode::CONFLICT), msg);
         }
         if !a.upgrader.begin(&req) {
@@ -968,6 +1144,13 @@ pub fn router(a: Arc<Agent>) -> Router {
         .route("/v1/jobs/{id}/abort", post(abort_job))
         .route("/v1/harnesses", axum::routing::put(set_harnesses))
         .route("/v1/upgrade", post(start_upgrade))
+        .route("/v1/logins", post(start_login))
+        .route("/v1/logins/forget", post(login_forget))
+        .route("/v1/logins/{id}/input", post(login_input))
+        .route("/v1/logins/{id}/abort", post(login_abort))
+        .route("/v1/sync", post(sync_plan))
+        .route("/v1/sync/{id}/blobs/{sha}", axum::routing::put(sync_blob))
+        .route("/v1/sync/{id}/finish", post(sync_finish))
         .layer(DefaultBodyLimit::max(MAX_RELAY_BODY))
         .with_state(a)
 }

@@ -1048,7 +1048,7 @@ async fn off_without_a_control_url() {
 
 /// A stand-in Claude: it notes what botd gave it, writes to its memory, waits for the
 /// test to say go, then replies with where it ran and what it was told.
-const CHAT: &str = r#"#!/bin/sh
+pub(crate) const CHAT: &str = r#"#!/bin/sh
 printf 'BOT_TOKEN=%s\nBOT_API=%s\n' "$BOT_TOKEN" "$BOT_API" > "$HOME/run.env"
 echo "- learned on the machine" >> "$HOME/bots/$BOT_ID/MEMORY.md"
 i=0
@@ -1058,10 +1058,10 @@ printf '%s\n' "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tex
 "#;
 
 /// The real agent, enrolled, with `harness` as its `claude` and a botctl.
-struct OnMachine {
-    home: PathBuf,
-    server: tokio::task::JoinHandle<()>,
-    agent: Arc<Agent>,
+pub(crate) struct OnMachine {
+    pub home: PathBuf,
+    pub server: tokio::task::JoinHandle<()>,
+    pub agent: Arc<Agent>,
 }
 
 impl OnMachine {
@@ -1070,7 +1070,7 @@ impl OnMachine {
     }
 }
 
-async fn agent_with(env: &mut Env, mid: &str, token: &str, harness: &str) -> OnMachine {
+pub(crate) async fn agent_with(env: &mut Env, mid: &str, token: &str, harness: &str) -> OnMachine {
     use std::os::unix::fs::PermissionsExt;
     let mut cfg = config(env, mid, Some(token));
     let bin = cfg.home.join(".local/bin");

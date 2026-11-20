@@ -90,6 +90,12 @@ pub struct Enrollment {
     botctl: Option<(Bytes, String)>,
     /// Harness CLIs and agent upgrades on machines (ADR 0039).
     pub upkeep: Upkeep,
+    /// Harness logins on machines (MACHINE_HARNESS_LOGINS, ADR 0041), and those running.
+    pub logins: bool,
+    pub(super) sessions: super::logins::Sessions,
+    /// Copying users' folders to their machines (MACHINE_FOLDER_SYNC, ADR 0041).
+    pub folder: Option<super::folder::Settings>,
+    pub(super) copying: super::folder::Copying,
 }
 
 impl std::fmt::Debug for Enrollment {
@@ -125,6 +131,9 @@ impl Enrollment {
                 "MACHINE_ENROLL_TIMEOUT_MINUTES",
                 "MACHINE_HARNESSES",
                 "MACHINE_AGENT_UPGRADES",
+                "MACHINE_HARNESS_LOGINS",
+                "MACHINE_FOLDER_SYNC",
+                "MACHINE_FOLDER_SYNC_MAX_MB",
             ] {
                 if !var(k).trim().is_empty() {
                     return Err(format!("{k} needs MACHINE_CONTROL_URL"));
@@ -192,6 +201,12 @@ impl Enrollment {
         e.botctl = read(BOTCTL_BIN);
         e.enroll_timeout_ms = timeout * 60_000;
         e.upkeep = Upkeep::from_env(var)?;
+        e.logins = match var("MACHINE_HARNESS_LOGINS").trim() {
+            "" | "off" => false,
+            "on" => true,
+            v => return Err(format!("MACHINE_HARNESS_LOGINS must be on or off, not \"{v}\"")),
+        };
+        e.folder = super::folder::Settings::from_env(var)?;
         Ok(Some(e))
     }
 
@@ -215,6 +230,10 @@ impl Enrollment {
             agent,
             botctl: None,
             upkeep: Upkeep::default(),
+            logins: false,
+            sessions: Default::default(),
+            folder: None,
+            copying: Default::default(),
         })
     }
 
@@ -242,6 +261,20 @@ impl Enrollment {
     #[cfg(test)]
     pub fn with_agent(mut self, binary: &'static [u8]) -> Enrollment {
         self.agent = Some((Bytes::from_static(binary), sha256_hex(binary)));
+        self
+    }
+
+    /// With MACHINE_HARNESS_LOGINS=on.
+    #[cfg(test)]
+    pub fn with_logins(mut self) -> Enrollment {
+        self.logins = true;
+        self
+    }
+
+    /// With MACHINE_FOLDER_SYNC=on, up to `max_bytes`.
+    #[cfg(test)]
+    pub fn with_folder_sync(mut self, max_bytes: u64) -> Enrollment {
+        self.folder = Some(super::folder::Settings { max_bytes });
         self
     }
 
@@ -275,12 +308,14 @@ impl Enrollment {
 
     pub fn describe(&self) -> String {
         format!(
-            "on at {} (listening on {}, agents on port {}, {} minutes to enroll; {}){}",
+            "on at {} (listening on {}, agents on port {}, {} minutes to enroll; {}; harness logins {}; folder copies {}){}",
             self.url,
             self.listen,
             self.agent_port,
             self.enroll_timeout_ms / 60_000,
             self.upkeep.describe(),
+            if self.logins { "on" } else { "off" },
+            self.folder.as_ref().map_or("off".to_string(), |f| format!("on, up to {} MiB", f.max_bytes >> 20)),
             match (&self.agent, &self.botctl) {
                 (Some(_), Some(_)) => "",
                 (None, _) =>
@@ -395,7 +430,7 @@ impl Enrollment {
     }
 
     /// An HTTPS client that accepts only `pins` and shows botd's certificate.
-    fn pinned(&self, pins: Vec<String>) -> Result<(reqwest::Client, Arc<pki::Pinned>), String> {
+    pub(super) fn pinned(&self, pins: Vec<String>) -> Result<(reqwest::Client, Arc<pki::Pinned>), String> {
         let c = self.control();
         let (config, verifier) =
             pki::pinned_client_config(pins, c.chain.clone(), c.key.clone_key())?;
@@ -410,7 +445,7 @@ impl Enrollment {
 
     /// Like `pinned`, for a job's stream: no overall timeout, since a run can take
     /// hours, but a stream silent for `JOB_SILENCE` is a lost machine.
-    fn job_client(&self, pins: Vec<String>) -> Result<reqwest::Client, String> {
+    pub(super) fn job_client(&self, pins: Vec<String>) -> Result<reqwest::Client, String> {
         let c = self.control();
         let (config, _) = pki::pinned_client_config(pins, c.chain.clone(), c.key.clone_key())?;
         reqwest::Client::builder()
@@ -421,7 +456,19 @@ impl Enrollment {
             .map_err(|e| e.to_string())
     }
 
-    fn agent_url(&self, address: &str, path: &str) -> String {
+    /// Like `pinned`, for copying a folder: each request gets up to `secs`.
+    pub(super) fn upload_client(&self, pins: Vec<String>, secs: u64) -> Result<reqwest::Client, String> {
+        let c = self.control();
+        let (config, _) = pki::pinned_client_config(pins, c.chain.clone(), c.key.clone_key())?;
+        reqwest::Client::builder()
+            .tls_backend_preconfigured(config)
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(secs))
+            .build()
+            .map_err(|e| e.to_string())
+    }
+
+    pub(super) fn agent_url(&self, address: &str, path: &str) -> String {
         format!("https://{address}:{}{path}", self.agent_port)
     }
 
@@ -1108,7 +1155,10 @@ async fn probe(
         }
         let address = to.address.as_deref().ok_or("it has no address yet")?;
         let (client, seen) = e.pinned(to.pins.clone())?;
-        let query: Vec<String> = bins.iter().map(|b| format!("bin={b}")).collect();
+        let mut query: Vec<String> = bins.iter().map(|b| format!("bin={b}")).collect();
+        if e.logins {
+            query.extend(super::logins::cred_query());
+        }
         let mut r = client
             .get(e.agent_url(address, &format!("/v1/heartbeat?{}", query.join("&"))))
             .send()
@@ -1145,7 +1195,7 @@ async fn probe(
 }
 
 /// The error and its causes (TLS refusals are in there), without the URL.
-fn without_url(e: reqwest::Error) -> String {
+pub(super) fn without_url(e: reqwest::Error) -> String {
     let e = e.without_url();
     let mut s = e.to_string();
     let mut src = std::error::Error::source(&e);
@@ -1157,14 +1207,14 @@ fn without_url(e: reqwest::Error) -> String {
 }
 
 /// The most botd keeps of an agent's heartbeat or refusal.
-const MAX_REPLY: usize = 1 << 20;
+pub(super) const MAX_REPLY: usize = 1 << 20;
 /// The largest event a machine may send: one line of harness output, or the end of a
 /// run with the files it sends back.
 pub const MAX_EVENT: usize = 16 << 20;
 
 /// The body, unless it is longer than `max` or breaks off. A machine's certificate
 /// says who answered, not that the answer is sane.
-async fn read_capped(r: &mut reqwest::Response, max: usize) -> Option<Vec<u8>> {
+pub(super) async fn read_capped(r: &mut reqwest::Response, max: usize) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     loop {
         match r.chunk().await {
@@ -1175,10 +1225,14 @@ async fn read_capped(r: &mut reqwest::Response, max: usize) -> Option<Vec<u8>> {
     }
 }
 
+fn take_events(buf: &mut Vec<u8>, chunk: &[u8]) -> Option<Vec<JobEvent>> {
+    take_lines(buf, chunk)
+}
+
 /// The whole events in `buf` once `chunk` is added; `buf` keeps the unfinished line.
 /// Lines that aren't events are skipped. None: a line, finished or not, is over
 /// `MAX_EVENT`.
-fn take_events(buf: &mut Vec<u8>, chunk: &[u8]) -> Option<Vec<JobEvent>> {
+pub(super) fn take_lines<T: serde::de::DeserializeOwned>(buf: &mut Vec<u8>, chunk: &[u8]) -> Option<Vec<T>> {
     // What was already in `buf` has no newline: search only what's new.
     let mut from = buf.len();
     buf.extend_from_slice(chunk);
@@ -1189,7 +1243,7 @@ fn take_events(buf: &mut Vec<u8>, chunk: &[u8]) -> Option<Vec<JobEvent>> {
         if line.len() > MAX_EVENT + 1 {
             return None;
         }
-        if let Ok(ev) = serde_json::from_slice::<JobEvent>(&line) {
+        if let Ok(ev) = serde_json::from_slice::<T>(&line) {
             events.push(ev);
         }
     }
@@ -1456,6 +1510,15 @@ mod tests {
         let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_HARNESSES", "pi")]).unwrap().unwrap();
         assert!(e.upkeep.plan.is_some() && e.describe().contains("harnesses on machines: pi@1.5.2; agent upgrades: manual"), "{}", e.describe());
         assert!(with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_HARNESSES", "nope")]).is_err());
+        let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443")]).unwrap().unwrap();
+        assert!(!e.logins && e.folder.is_none(), "logins and folder copies are off unless asked");
+        for v in ["MACHINE_HARNESS_LOGINS", "MACHINE_FOLDER_SYNC", "MACHINE_FOLDER_SYNC_MAX_MB"] {
+            let vars: &'static [(&'static str, &'static str)] = Box::leak(Box::new([(v, "on")]));
+            assert!(with(vars).is_err(), "{v} needs enrollment");
+        }
+        let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_HARNESS_LOGINS", "on"), ("MACHINE_FOLDER_SYNC", "on")]).unwrap().unwrap();
+        assert!(e.logins && e.folder.as_ref().is_some_and(|f| f.max_bytes == 2048 << 20), "{}", e.describe());
+        assert!(with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_HARNESS_LOGINS", "yes")]).is_err());
         for (raw, ok) in [("", Some(15)), ("5", Some(5)), ("60", Some(60)), ("4", None), ("61", None), ("soon", None)] {
             let vars: &'static [(&'static str, &'static str)] = Box::leak(Box::new([
                 ("MACHINE_CONTROL_URL", "https://cp.example:8443"),

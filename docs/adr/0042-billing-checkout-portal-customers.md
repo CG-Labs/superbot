@@ -1,10 +1,10 @@
-# 0041: Billing v0, checkout, the customer portal, and Stripe customers
+# 0042: Billing v0, checkout, the customer portal, and Stripe customers
 
 ## Status
 
 Accepted (20 Nov 2026). Second slice of [#31](https://github.com/CG-Labs/superbot/issues/31) (M3, billing v0), on top of [ADR 0040](0040-billing-v0-tier-limits.md) (tier limits and the signed Stripe webhook). Uses the audit log ([ADR 0009](0009-audit-events.md)), roles ([ADR 0012](0012-users-sessions-rbac.md)), and secrets ([ADR 0029](0029-per-user-isolation.md)).
 
-0040 is the first billing slice, so this is 0041.
+0040 is the first billing slice; 0041 was taken by machine harness logins, so this is 0042.
 
 ## Context
 

@@ -232,7 +232,7 @@ impl Upgrader {
         res.map(|_| ())
     }
 
-    /// Why this agent won't start `req` now, if it won't. `busy`: jobs are running.
+    /// Why this agent won't start `req` now, if it won't. `busy`: jobs and logins running.
     pub fn refuse(&self, req: &UpgradeRequest, busy: usize) -> Option<(u16, String)> {
         let ok_version = !req.version.is_empty()
             && req.version.len() <= 64
@@ -257,7 +257,7 @@ impl Upgrader {
             return Some((409, "This agent is on trial after an upgrade; wait for it to finish.".into()));
         }
         if busy > 0 {
-            return Some((409, format!("This machine is running {busy} jobs; upgrade it when they're done.")));
+            return Some((409, format!("This machine is running {busy} jobs or logins; upgrade it when they're done.")));
         }
         None
     }

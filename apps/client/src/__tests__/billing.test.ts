@@ -4,7 +4,7 @@ import { billingAvailable, checkoutNotice, limitSummary, openBillingPage, subscr
 
 const BASE = "https://bots.example.com";
 
-describe("billing API (ADR 0041)", () => {
+describe("billing API (ADR 0042)", () => {
   const realFetch = globalThis.fetch;
   afterEach(() => {
     globalThis.fetch = realFetch;

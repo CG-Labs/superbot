@@ -704,7 +704,12 @@ impl App {
             Ok(Target::Machine(to)) => to,
         };
         let checked = cp.link.check(self, &to, &[bin]).await.map_err(Refusal::Offline);
-        match checked.and_then(|hb| route::fit(&hb, bin).map(|l| (l, hb.version))) {
+        let ready = checked.and_then(|hb| {
+            let layout = route::fit(&hb, bin)?;
+            cp.ready(self, &hb, &bot.owner_id, &to.machine_id, bin)?;
+            Ok((layout, hb.version))
+        });
+        match ready {
             Err(r) => refused(r, Some(&to.machine_id)),
             Ok((layout, version)) => {
                 let e = by.event("bot.run_routed").target("message", &msg.id.to_string()).bot(&bot.id);

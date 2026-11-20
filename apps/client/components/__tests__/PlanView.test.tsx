@@ -40,7 +40,7 @@ function fakeApi(view: BillingView | null) {
   };
 }
 
-describe("PlanView (ADR 0041)", () => {
+describe("PlanView (ADR 0042)", () => {
   it("shows the plan against its limits, and upgrades through Stripe Checkout", async () => {
     const api = fakeApi(billing());
     const open = jest.fn(async () => {});

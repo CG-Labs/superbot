@@ -217,7 +217,31 @@ botctl machine upgrade <user> hold        # keep it at its build (release: let i
 botctl machine harnesses <user>           # install MACHINE_HARNESSES now, retrying failures
 ```
 
-Each step is audited as `machine.harness_*` and `machine.agent_upgrade*`. Machines enrolled before this change can't replace their own agent: reinstall them. Logins for harnesses on machines aren't set up yet, so give Bots there an API key in the user's secrets. Design: [ADR 0039](../docs/adr/0039-machine-harnesses-and-agent-upgrades.md).
+Each step is audited as `machine.harness_*` and `machine.agent_upgrade*`. Machines enrolled before this change can't replace their own agent: reinstall them. Harnesses there need a login (below) or an API key in the user's secrets. Design: [ADR 0039](../docs/adr/0039-machine-harnesses-and-agent-upgrades.md).
+
+### Harness logins and the user's folder on machines
+
+Both are off by default. To turn them on, add:
+
+```sh
+MACHINE_HARNESS_LOGINS=on       # Claude Code and Codex log in on the user's machine; the login stays there
+MACHINE_FOLDER_SYNC=on          # copy the user's folder to their machine when they're assigned
+MACHINE_FOLDER_SYNC_MAX_MB=2048 # a bigger folder isn't copied
+```
+
+Then, on the server:
+
+```sh
+botctl machine harness-login <user> claude  # runs `claude auth login` on their machine; type what it asks for here
+botctl machine harness-logins <user>        # which harnesses are logged in there
+botctl machine harness-logout <user> claude # remove that login from the machine
+botctl machine folder <user>                # how the last copy went
+botctl machine sync <user>                  # copy their folder again now
+```
+
+The login runs on the machine. Its sign-in link or code shows in your terminal, and the credentials stay on the machine. With logins on, a Bot whose harness isn't logged in there, and whose owner has no API key for it, says so and doesn't run. Pi and Hermes keep using API keys.
+
+The folder copy sends only what the machine doesn't have. Each file is checked by SHA-256, and a copy cut short picks up where it stopped. Links are never followed. Files changed on the machine, even during the copy, are kept, and nothing there is deleted. Bots wait for the first copy, and agent upgrades wait for a running login. Each step is audited as `machine.harness_login*` and `machine.folder_sync_*`. Design: [ADR 0041](../docs/adr/0041-machine-harness-logins-and-folder-copy.md).
 
 ## Approvals after an upgrade
 
@@ -290,7 +314,7 @@ Every refusal is in the audit log (`bot.create_refused`, `routine.run_refused`, 
 
 ### Stripe (optional)
 
-Off unless `STRIPE_WEBHOOK_SECRET` is set; `/billing/stripe/webhook` answers 404 until then. With only the webhook, botd never calls Stripe: it only receives signed events. Add `STRIPE_SECRET_KEY` to sell plans in the app ([ADR 0041](../docs/adr/0041-billing-checkout-portal-customers.md)). Use test-mode keys until you're ready to charge.
+Off unless `STRIPE_WEBHOOK_SECRET` is set; `/billing/stripe/webhook` answers 404 until then. With only the webhook, botd never calls Stripe: it only receives signed events. Add `STRIPE_SECRET_KEY` to sell plans in the app ([ADR 0042](../docs/adr/0042-billing-checkout-portal-customers.md)). Use test-mode keys until you're ready to charge.
 
 1. In each tier, list its Stripe price ids in `stripePrices` (see [`tiers.example.json`](tiers.example.json)). A price may belong to one tier only. Checkout sells a tier's first price; tiers without one can't be bought.
 2. In Stripe, add a webhook endpoint at `https://<your-host>/billing/stripe/webhook` for `customer.subscription.created`, `.updated`, `.deleted`, `checkout.session.completed`, and `customer.deleted`, and put its signing secret (`whsec_…`) in `STRIPE_WEBHOOK_SECRET` (or `STRIPE_WEBHOOK_SECRET_FILE`).

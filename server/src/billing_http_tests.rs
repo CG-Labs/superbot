@@ -501,7 +501,7 @@ async fn signed_subscription_events_set_the_users_tier() {
     assert!(synced.iter().any(|e| e["details"]["outcome"] == "superseded"), "{synced:?}");
 }
 
-// Checkout, the customer portal, and customer links (ADR 0041). Stripe is a fake on
+// Checkout, the customer portal, and customer links (ADR 0042). Stripe is a fake on
 // loopback: nothing here reaches Stripe, and the key is made up.
 
 const KEY: &str = "sk_test_not_a_real_key_for_tests";

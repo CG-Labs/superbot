@@ -7,7 +7,7 @@
 //! from `botctl login`, or the break-glass `SUPERBOT_PASSWORD`).
 
 use serde_json::{json, Map, Value};
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::TcpStream;
 
 const HELP: &str = r#"botctl: manage your routines (scheduled tasks).
@@ -108,6 +108,11 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine upgrade <user>                    Upgrade its agent to botd's build now
   botctl machine upgrade <user> hold|release       Keep its agent at its build, or let it be upgraded again
   botctl machine harnesses <user>                  Install MACHINE_HARNESSES on it now, retrying failures
+  botctl machine harness-login <user|me> <claude|codex>  Log the harness in on the machine; the login stays there
+  botctl machine harness-logins <user|me>          Which harnesses are logged in on it
+  botctl machine harness-logout <user|me> <harness>  Remove that login from it
+  botctl machine folder <user>                     The copy of their folder to it: done, running, or failed
+  botctl machine sync <user>                       Copy their folder to it again now; files changed there are kept
   botctl secrets                                   List secret names (never values)
   botctl secret set <NAME> < value-file            Save a secret, encrypted; Bots get it as $NAME
   botctl secret rm <NAME>                          Delete a saved secret
@@ -126,7 +131,8 @@ fn base() -> String {
     std::env::var("BOT_API").unwrap_or_else(|_| "http://127.0.0.1:3000".into())
 }
 
-fn api(cred: Cred, method: &str, path: &str, body: Option<String>) -> Result<String, String> {
+/// Sends a request to botd and returns the connection, ready for its reply.
+fn send(cred: Cred, method: &str, path: &str, body: Option<String>) -> Result<TcpStream, String> {
     let auth = match cred {
         Cred::Bot => match (std::env::var("BOT_API"), std::env::var("BOT_TOKEN")) {
             (Ok(_), Ok(token)) => format!("Bearer {token}"),
@@ -154,6 +160,11 @@ fn api(cred: Cred, method: &str, path: &str, body: Option<String>) -> Result<Str
         body.len()
     );
     s.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(s)
+}
+
+fn api(cred: Cred, method: &str, path: &str, body: Option<String>) -> Result<String, String> {
+    let mut s = send(cred, method, path, body)?;
     let mut res = String::new();
     s.read_to_string(&mut res).map_err(|e| e.to_string())?;
     let (head, body) = res.split_once("\r\n\r\n").unwrap_or((&res, ""));
@@ -161,9 +172,68 @@ fn api(cred: Cred, method: &str, path: &str, body: Option<String>) -> Result<Str
     if (200..300).contains(&code) {
         Ok(body.to_string())
     } else {
-        let msg = serde_json::from_str::<Value>(body).ok().and_then(|v| v["error"].as_str().map(String::from)).unwrap_or(body.into());
-        Err(format!("{msg} (HTTP {code})"))
+        Err(failure(code, body))
     }
+}
+
+fn failure(code: u16, body: &str) -> String {
+    let msg = serde_json::from_str::<Value>(body).ok().and_then(|v| v["error"].as_str().map(String::from)).unwrap_or(body.into());
+    format!("{msg} (HTTP {code})")
+}
+
+/// Where `botctl machine harness-login|harness-logins|harness-logout` go: the caller's
+/// own machine for `me`, else that user's.
+fn login_base(user: &str) -> String {
+    if user == "me" { "/api/machine".into() } else { format!("/api/users/{}/machine", encode(user)) }
+}
+
+/// `botctl machine harness-login`: runs the harness's login on the user's machine (ADR
+/// 0041), showing what it prints here and sending each line typed here to it. The login
+/// is saved there only.
+fn machine_login(user: &str, harness: &str) -> Result<String, String> {
+    let base = login_base(user);
+    let s = send(Cred::Operator, "POST", &format!("{base}/harness-login"), Some(json!({ "harness": harness }).to_string()))?;
+    let mut r = std::io::BufReader::new(s);
+    let mut status = String::new();
+    r.read_line(&mut status).map_err(|e| e.to_string())?;
+    let code: u16 = status.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    loop {
+        let mut h = String::new();
+        if r.read_line(&mut h).map_err(|e| e.to_string())? == 0 || h.trim().is_empty() {
+            break;
+        }
+    }
+    if !(200..300).contains(&code) {
+        let mut body = String::new();
+        r.read_to_string(&mut body).map_err(|e| e.to_string())?;
+        return Err(failure(code, &body));
+    }
+    let mut out = std::io::stdout();
+    for l in r.lines() {
+        let v: Value = serde_json::from_str(&l.map_err(|e| format!("Lost the server: {e}"))?).map_err(|e| e.to_string())?;
+        match v["type"].as_str() {
+            Some("started") => {
+                eprintln!("The {harness} login is running on the user's machine. Type what it asks for and press Enter; Ctrl-C stops it.");
+                let input = format!("{base}/harness-login/{}/input", encode(v["loginId"].as_str().unwrap_or_default()));
+                std::thread::spawn(move || {
+                    for line in std::io::stdin().lines().map_while(Result::ok) {
+                        if let Err(e) = api(Cred::Operator, "POST", &input, Some(json!({ "text": line.trim_end() }).to_string())) {
+                            eprintln!("Couldn't send that: {e}");
+                        }
+                    }
+                });
+            }
+            Some("output") => {
+                let _ = out.write_all(v["text"].as_str().unwrap_or_default().as_bytes());
+                let _ = out.flush();
+            }
+            Some("error") => eprintln!("\n{}", v["message"].as_str().unwrap_or_default()),
+            Some("exit") if v["loggedIn"] == true => return Ok(format!("\nDone. {harness} is logged in on the user's machine; their Bots there use it.")),
+            Some("exit") => return Err(format!("\nThe login ended ({}) without saving a {harness} login.", v["status"].as_str().unwrap_or("stopped"))),
+            _ => {}
+        }
+    }
+    Err("The server ended the login without saying how it went. See botctl machine harness-logins.".into())
 }
 
 /// The extra arguments of `botctl user harness-login`: none, or everything after `--`.
@@ -408,8 +478,10 @@ fn machine_request(args: &[&str]) -> Result<(&'static str, String), String> {
         ["upgrade", user, "hold"] => ("PUT", machine(user, "agent/hold")),
         ["upgrade", user, "release"] => ("DELETE", machine(user, "agent/hold")),
         ["harnesses", user] => ("POST", machine(user, "harnesses")),
+        ["folder", user] => ("GET", machine(user, "folder-sync")),
+        ["sync", user] => ("POST", machine(user, "folder-sync")),
         _ => {
-            return Err("Usage: botctl machine placement [<user>] | assign <user> | unassign <user> | agent <user> | upgrade <user> [hold|release] | harnesses <user>".into());
+            return Err("Usage: botctl machine placement [<user>] | assign <user> | unassign <user> | agent <user> | upgrade <user> [hold|release] | harnesses <user> | harness-login <user|me> <claude|codex> | harness-logins <user|me> | harness-logout <user|me> <harness> | folder <user> | sync <user>".into());
         }
     })
 }
@@ -658,6 +730,9 @@ fn run(args: &[String]) -> Result<String, String> {
             let (method, path, body) = bot_access(rest)?;
             op(method, &path, body)
         }
+        ["machine", "harness-login", user, harness] => machine_login(user, harness),
+        ["machine", "harness-logins", user] => op("GET", &format!("{}/harness-logins", login_base(user)), None),
+        ["machine", "harness-logout", user, harness] => op("DELETE", &format!("{}/harness-logins/{}", login_base(user), encode(harness)), None),
         ["machine", rest @ ..] => {
             let (method, path) = machine_request(rest)?;
             op(method, &path, None)
@@ -809,6 +884,10 @@ mod tests {
         assert_eq!(machine_request(&["upgrade", "u1", "release"]).unwrap(), ("DELETE", "/api/users/u1/machine/agent/hold".into()));
         assert_eq!(machine_request(&["harnesses", "u1"]).unwrap(), ("POST", "/api/users/u1/machine/harnesses".into()));
         assert!(machine_request(&["upgrade", "u1", "now"]).is_err());
+        assert_eq!(machine_request(&["folder", "u1"]).unwrap(), ("GET", "/api/users/u1/machine/folder-sync".into()));
+        assert_eq!(machine_request(&["sync", "u1"]).unwrap(), ("POST", "/api/users/u1/machine/folder-sync".into()));
+        assert_eq!(login_base("me"), "/api/machine");
+        assert_eq!(login_base("a@example.com"), "/api/users/a%40example.com/machine");
     }
 
     #[test]

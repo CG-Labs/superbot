@@ -73,7 +73,7 @@ describe("Sidebar admin entries", () => {
   });
 });
 
-describe("Sidebar plan entry (ADR 0041)", () => {
+describe("Sidebar plan entry (ADR 0042)", () => {
   it("shows everyone their plan when the server sells plans", async () => {
     const onOpenPlan = jest.fn();
     const user = userEvent.setup();

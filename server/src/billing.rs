@@ -1,5 +1,5 @@
 //! Billing v0: Stripe subscriptions set each user's tier (ADR 0040), and people buy and
-//! manage them through Stripe's own pages (ADR 0041). Off unless `STRIPE_WEBHOOK_SECRET`
+//! manage them through Stripe's own pages (ADR 0042). Off unless `STRIPE_WEBHOOK_SECRET`
 //! is set; then Stripe's signed webhook at `/billing/stripe/webhook` is the only way a
 //! tier changes. With `STRIPE_SECRET_KEY` too, botd also asks Stripe for a Checkout
 //! Session (`POST /api/billing/checkout`) and a Billing Portal session
@@ -55,7 +55,7 @@ pub struct Billing {
     secret: Option<String>,
     /// Refused deliveries recorded in the audit log, so junk can't flood it.
     refusals: crate::users::Limiter,
-    /// Checkout and the customer portal (ADR 0041). None without `STRIPE_SECRET_KEY`.
+    /// Checkout and the customer portal (ADR 0042). None without `STRIPE_SECRET_KEY`.
     checkout: Option<Checkout>,
 }
 
@@ -322,7 +322,7 @@ fn subscription_event(app: &App, event_id: &str, kind: &str, event: &Value) -> R
     };
     // The metadata names the user; later events for the same subscription may not carry
     // it, so the subscription we already know names them too, and so does a customer
-    // linked to them (ADR 0041), for subscriptions started outside SuperBot's checkout.
+    // linked to them (ADR 0042), for subscriptions started outside SuperBot's checkout.
     let known = app.db.subscription_by_id(sub.id);
     let user = sub
         .user
@@ -444,7 +444,7 @@ fn customer_deleted(app: &App, event_id: &str, kind: &str, event: &Value) -> Res
     })
 }
 
-// Checkout and the customer portal (ADR 0041)
+// Checkout and the customer portal (ADR 0042)
 
 fn off() -> Response {
     reply(StatusCode::NOT_FOUND, json!({ "error": OFF }))

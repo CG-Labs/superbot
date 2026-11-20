@@ -10,7 +10,7 @@ interface Props {
   onNewBot: () => void;
   onLogout: () => void;
   onOpenApprovals: () => void;
-  /** Everyone's own plan and billing; set only when the server sells plans (ADR 0041). */
+  /** Everyone's own plan and billing; set only when the server sells plans (ADR 0042). */
   onOpenPlan?: () => void;
   /** These three are shown to admins only; the server refuses the admin API and console to everyone else. */
   onOpenUsers?: () => void;

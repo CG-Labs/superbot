@@ -102,9 +102,9 @@ An upgrade is claimed in one conditional update, so an admin's request and an au
 
 ## Not in this slice
 
-- **Harness logins on the machine.** Per-user logins (`~/.claude`, `~/.codex`) aren't moved or made there. Harnesses that need a login need an API key in the user's secrets, as before. This waits for #30 (ADR 0037) per-user accounts and logins.
+- **Harness logins on the machine.** Per-user logins (`~/.claude`, `~/.codex`) aren't moved or made there. Harnesses that need a login need an API key in the user's secrets, as before. Done in [ADR 0041](0041-machine-harness-logins-and-folder-copy.md) (`MACHINE_HARNESS_LOGINS`).
 - **Machines enrolled before this change.** Their unit runs `/usr/local/bin/superbot-machine` under `ProtectSystem=strict`, so their agent can't replace itself and reports no `upgrade`. botd leaves them alone. Reinstall them, or install the agent by hand into `/usr/local/lib/superbot/` with the new unit (`GET /v1/agent` serves it).
 - **Hermes on machines** is best effort. Its installer may need system packages (`libatomic1`, `xz-utils`) and takes about 2.5 GB. Failures show in the heartbeat and audit.
 - **Uninstalling** harnesses dropped from the plan, and pruning old Node.js versions beyond the one replaced.
 - **A signed release channel.** The agent trusts botd's build because it comes over the pinned mutual-TLS channel with botd's hash. Signing releases separately would protect against a compromised botd, which already controls every machine.
-- Copying the user's existing folder, screens on machines, a separate OS user for Bots on the machine, and per-user containers on one virtualised server, as in ADR 0036.
+- Copying the user's existing folder (done in [ADR 0041](0041-machine-harness-logins-and-folder-copy.md)), screens on machines, a separate OS user for Bots on the machine, and per-user containers on one virtualised server, as in ADR 0036.

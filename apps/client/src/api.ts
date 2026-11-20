@@ -281,7 +281,7 @@ export class SuperBotApi {
     return this.request<SetupStatus>("GET", "/api/setup");
   }
 
-  // Your own plan, bought and managed on Stripe's pages (ADR 0041).
+  // Your own plan, bought and managed on Stripe's pages (ADR 0042).
 
   /**
    * Your plan, what you can buy, and your billing account. null when this server doesn't

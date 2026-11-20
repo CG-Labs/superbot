@@ -77,7 +77,7 @@ export interface PlanUsage extends TierView {
   usage: { period: string; runs: number; bots: number; day?: string; routineRuns?: number };
 }
 
-/** A plan for sale through Stripe Checkout (ADR 0041). */
+/** A plan for sale through Stripe Checkout (ADR 0042). */
 export interface BillingPlan extends TierView {
   /** The plan the user is on now. */
   current: boolean;

@@ -50,6 +50,17 @@ pub enum Error {
     Store(String),
 }
 
+impl Error {
+    /// What went wrong, with no detail that could name a user.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Error::ReadOnly => "read-only",
+            Error::Invalid(_) => "invalid",
+            Error::Store(_) => "store error",
+        }
+    }
+}
+
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
@@ -218,7 +229,8 @@ impl Secrets {
                     out.push((name, v));
                 }
                 Ok(None) => {}
-                Err(e) => eprintln!("secret {name} of {owner}: {e}"),
+                // The error text can name the user, so only its kind is logged.
+                Err(e) => eprintln!("A user's secret {name} couldn't be read ({}).", e.kind()),
             }
         }
         out

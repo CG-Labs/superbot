@@ -1,4 +1,4 @@
-//! The Stripe API calls botd makes (ADR 0041): opening, reading, and expiring a Checkout
+//! The Stripe API calls botd makes (ADR 0042): opening, reading, and expiring a Checkout
 //! Session, and opening a Billing Portal session, with the secret key, an idempotency key
 //! on every POST, and a timeout. Nothing here spends money: Stripe charges only when the
 //! person completes the page it returns.

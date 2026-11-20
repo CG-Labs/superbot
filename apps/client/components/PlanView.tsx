@@ -19,7 +19,7 @@ interface Props {
   open?: (url: string) => Promise<void>;
 }
 
-/** Your plan, your use of it, and Stripe's pages to buy or manage one (ADR 0041). */
+/** Your plan, your use of it, and Stripe's pages to buy or manage one (ADR 0042). */
 export function PlanView({ api, onBack, checkout, open = openBillingPage }: Props) {
   const [view, setView] = useState<BillingView | null | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);

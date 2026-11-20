@@ -6,7 +6,7 @@ import { PlanView } from "../components/PlanView";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
 
-/** Your plan, and Stripe's pages to buy or manage it (ADR 0041). Stripe sends people back here. */
+/** Your plan, and Stripe's pages to buy or manage it (ADR 0042). Stripe sends people back here. */
 export default function PlanScreen() {
   const { ready, api } = useSuperBot();
   const { checkout } = useLocalSearchParams<{ checkout?: string }>();

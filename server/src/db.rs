@@ -209,13 +209,13 @@ pub enum Applied {
     Superseded,
     /// The subscription belongs to another user.
     OtherUser,
-    /// Its customer is linked to another user (ADR 0041).
+    /// Its customer is linked to another user (ADR 0042).
     CustomerOfAnotherUser,
     Unchanged,
     Changed { from: Option<String>, to: Option<String> },
 }
 
-/// What linking a payment-provider customer to a user did (ADR 0041). A user has at most
+/// What linking a payment-provider customer to a user did (ADR 0042). A user has at most
 /// one customer and a customer pays for one user; the first link stands.
 #[derive(Debug, PartialEq)]
 pub enum Linked {
@@ -1042,7 +1042,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 17] = [
     migrate_billing,
     migrate_billing_customers,
 ];
-/// Users linked to their payment-provider customer (ADR 0041), at most one each way;
+/// Users linked to their payment-provider customer (ADR 0042), at most one each way;
 /// customers the provider deleted, which are never linked again; and each user's open
 /// checkout, closed before another is opened so only one can be paid.
 fn migrate_billing_customers(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
@@ -2308,7 +2308,7 @@ impl Db {
     /// applies whenever the old one's cancellation arrives. `set_tier` false (a
     /// subscription not paid for yet) records it without changing any tier.
     ///
-    /// The subscription's customer (ADR 0041) must not be another user's
+    /// The subscription's customer (ADR 0042) must not be another user's
     /// (`CustomerOfAnotherUser`); a user with no customer yet is linked to it, and the
     /// second value says how.
     pub fn apply_subscription(&self, event_id: &str, event_type: &str, sub: &Subscription, set_tier: bool) -> Result<(Applied, Option<Linked>), String> {
@@ -2375,7 +2375,7 @@ impl Db {
         Ok((outcome, linked))
     }
 
-    /// The user's payment-provider customer (ADR 0041).
+    /// The user's payment-provider customer (ADR 0042).
     pub fn customer_of(&self, user_id: &str) -> Option<String> {
         self.c().query_row("SELECT customer_id FROM billing_customers WHERE user_id = ?", [user_id], |r| r.get(0)).optional().ok().flatten()
     }

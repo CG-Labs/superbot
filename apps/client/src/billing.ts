@@ -2,7 +2,7 @@ import { Linking, Platform } from "react-native";
 import type { SuperBotApi } from "./api";
 import type { BillingView, TierView } from "./types";
 
-/** Whether this server sells plans, so the app shows its Plan screen (ADR 0041). */
+/** Whether this server sells plans, so the app shows its Plan screen (ADR 0042). */
 export async function billingAvailable(api: Pick<SuperBotApi, "billing">): Promise<boolean> {
   try {
     return (await api.billing()) !== null;

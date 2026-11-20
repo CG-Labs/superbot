@@ -81,6 +81,14 @@ impl Adapter for Claude {
         Some(&["auth", "login"])
     }
 
+    fn machine_login(&self) -> Option<super::MachineLogin> {
+        Some(super::MachineLogin {
+            args: &["auth", "login"],
+            files: &[".claude/.credentials.json"],
+            keys: &["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"],
+        })
+    }
+
     fn models(&self) -> Vec<ModelOption> {
         let efforts: Vec<String> = ["low", "medium", "high", "xhigh", "max"].map(String::from).into();
         [
