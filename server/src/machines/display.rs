@@ -446,6 +446,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stop_during_a_start_waits_for_it_and_leaves_no_screen() {
+        let (screens, _root) = fakes();
+        let s = screens.clone();
+        let start = tokio::spawn(async move { s.ensure("b1", &req(&"a".repeat(32)), me()).await });
+        while screens.changing.try_lock().is_ok() && !start.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        assert!(screens.stop("b1").await, "the start finished first, then stopped");
+        assert!(start.await.unwrap().unwrap().started);
+        assert!(screens.report().running.is_empty());
+    }
+
+    #[tokio::test]
     async fn a_screen_whose_window_manager_died_is_started_again() {
         let (screens, _root) = fakes();
         let a = "a".repeat(32);
