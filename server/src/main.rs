@@ -25,6 +25,8 @@ mod machines_http_tests;
 mod machines_lockdown_tests;
 #[cfg(test)]
 mod machines_mtls_tests;
+#[cfg(test)]
+mod machines_upkeep_tests;
 mod paths;
 mod policy;
 mod rbac;

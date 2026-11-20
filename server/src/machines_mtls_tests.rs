@@ -16,20 +16,25 @@ use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use zeroize::Zeroizing;
 
-struct Env {
-    port: u16,
-    app: AppState,
-    admin: String,
-    fake: Arc<Fake>,
-    e: Arc<Enrollment>,
-    cp: Arc<ControlPlane>,
-    agent_listener: Option<TcpListener>,
+pub(crate) struct Env {
+    pub port: u16,
+    pub app: AppState,
+    pub admin: String,
+    pub fake: Arc<Fake>,
+    pub e: Arc<Enrollment>,
+    pub cp: Arc<ControlPlane>,
+    pub agent_listener: Option<TcpListener>,
 }
 
 const AGENT: &str = "stand-in for the superbot-machine binary";
 
 /// botd with the fake provider, routing on, and enrollment on a loopback machine port.
 async fn serve() -> Env {
+    serve_with(|e| e).await
+}
+
+/// `serve`, with enrollment changed by `f`.
+pub(crate) async fn serve_with(f: impl FnOnce(Enrollment) -> Enrollment) -> Env {
     let machine_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let agent_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let (mport, aport) = (
@@ -41,7 +46,7 @@ async fn serve() -> Env {
     let mut cp = ControlPlane::for_tests(p);
     cp.routing = Routing::On;
     let e = cp
-        .enroll_with(Enrollment::for_tests(9, mport, aport).with_agent(AGENT.as_bytes()))
+        .enroll_with(f(Enrollment::for_tests(9, mport, aport).with_agent(AGENT.as_bytes())))
         .unwrap();
     let cp = Arc::new(cp);
     let shared = cp.clone();
@@ -69,12 +74,12 @@ async fn serve() -> Env {
     }
 }
 
-async fn json_call(env: &Env, method: &str, path: &str, body: &str) -> (u16, Value) {
+pub(crate) async fn json_call(env: &Env, method: &str, path: &str, body: &str) -> (u16, Value) {
     let (code, body) = call(env.port, method, path, &env.admin, body).await;
     (code, parse(&body))
 }
 
-async fn events(env: &Env, action: &str) -> Vec<Value> {
+pub(crate) async fn events(env: &Env, action: &str) -> Vec<Value> {
     let (code, body) = call(
         env.port,
         "GET",
@@ -97,7 +102,7 @@ fn token_in(user_data: &str) -> String {
 
 /// A member with a running machine on 127.0.0.1, assigned to them. Returns their id,
 /// the machine's id, and the token its cloud-init user data carries.
-async fn machine_for(env: &Env, email: &str) -> (String, String, String) {
+pub(crate) async fn machine_for(env: &Env, email: &str) -> (String, String, String) {
     let (uid, _) = user_with(env.port, &env.admin, email, "member").await;
     let (code, m) = json_call(env, "POST", &format!("/api/users/{uid}/machine"), "").await;
     assert_eq!(code, 202, "{m}");
@@ -121,7 +126,7 @@ async fn machine_for(env: &Env, email: &str) -> (String, String, String) {
     (uid, m.id, token_in(&ud))
 }
 
-fn config(env: &Env, machine_id: &str, token: Option<&str>) -> Config {
+pub(crate) fn config(env: &Env, machine_id: &str, token: Option<&str>) -> Config {
     Config {
         control_url: env.e.url.clone(),
         machine_id: machine_id.into(),
@@ -1094,7 +1099,7 @@ async fn agent_with(env: &mut Env, mid: &str, token: &str, harness: &str) -> OnM
 }
 
 /// The Bot's next reply after message `before`.
-async fn reply_after(env: &Env, bot: &str, before: i64) -> String {
+pub(crate) async fn reply_after(env: &Env, bot: &str, before: i64) -> String {
     for _ in 0..600 {
         if let Some(m) = env.app.db.replies_after(bot, before).into_iter().next() {
             return m.text;
@@ -1104,7 +1109,7 @@ async fn reply_after(env: &Env, bot: &str, before: i64) -> String {
     panic!("no reply from {bot}");
 }
 
-async fn send(env: &Env, bot: &str, text: &str) -> i64 {
+pub(crate) async fn send(env: &Env, bot: &str, text: &str) -> i64 {
     let before = env.app.db.last_id();
     let body = json!({ "text": text }).to_string();
     let (code, m) = call(
@@ -1119,7 +1124,7 @@ async fn send(env: &Env, bot: &str, text: &str) -> i64 {
     before
 }
 
-async fn wait_for_event(env: &Env, action: &str) -> Vec<Value> {
+pub(crate) async fn wait_for_event(env: &Env, action: &str) -> Vec<Value> {
     for _ in 0..600 {
         let evs = events(env, action).await;
         if !evs.is_empty() {

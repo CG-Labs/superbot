@@ -17,10 +17,8 @@ pub mod linode;
 pub mod pki;
 pub mod provider;
 pub mod route;
-#[allow(dead_code)]
 pub mod tools;
 #[cfg(test)]
-#[allow(dead_code)]
 pub mod upgrade;
 pub mod upkeep;
 pub mod wire;

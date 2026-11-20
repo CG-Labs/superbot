@@ -205,9 +205,9 @@ fn blocker(e: &Enrollment, m: &Machine, hb: &Heartbeat) -> Option<String> {
     None
 }
 
-/// Asks `m`'s agent to upgrade itself to botd's build. `by`: who asked; `auto` when no
-/// one did.
-async fn upgrade(app: &App, cp: &ControlPlane, e: &Enrollment, m: &Machine, hb: &Heartbeat, by: &Who) -> Result<Value, ApiError> {
+/// Asks `m`'s agent to upgrade itself to botd's build. `by`: who asked, or None when
+/// no one did (MACHINE_AGENT_UPGRADES=auto).
+async fn upgrade(app: &App, cp: &ControlPlane, e: &Enrollment, m: &Machine, hb: &Heartbeat, by: Option<&Who>) -> Result<Value, ApiError> {
     let conflict = |msg: String| ApiError(StatusCode::CONFLICT, msg);
     if let Some(why) = blocker(e, m, hb) {
         return Err(conflict(why));
@@ -216,7 +216,11 @@ async fn upgrade(app: &App, cp: &ControlPlane, e: &Enrollment, m: &Machine, hb: 
     let trial = trial_secs(cp);
     let stale = now() - (trial as i64 * 1000 + UPGRADE_GRACE_MS);
     let id = crate::short_id().replace('-', "");
-    let who = by.actor.id.clone().unwrap_or_else(|| "auto".into());
+    let auto = system(m);
+    let (by, who) = match by {
+        Some(w) => (w, w.actor.id.clone().unwrap_or_default()),
+        None => (&auto, "auto".to_string()),
+    };
     if !app.db.machine_upgrade_claim(&m.id, &id, &served, &who, stale) {
         return Err(conflict("An upgrade is on its way to it already.".into()));
     }
@@ -308,7 +312,7 @@ pub async fn follow_up(app: &App, cp: &ControlPlane, e: &Enrollment, machine_id:
         && blocker(e, &m, hb).is_none()
         && m.upgrade_failed_build.as_deref() != e.agent_sha256();
     if auto {
-        let _ = upgrade(app, cp, e, &m, hb, &system(&m)).await;
+        let _ = upgrade(app, cp, e, &m, hb, None).await;
         return;
     }
     if let Some(plan) = &e.upkeep.plan
@@ -376,7 +380,7 @@ pub async fn upgrade_now(
     let e = enroll::need(&a.machines)?;
     let m = need_machine(&app, &key)?;
     let hb = fresh(&app, e, &m).await?;
-    upgrade(&app, &a.machines, e, &m, &hb, &by).await?;
+    upgrade(&app, &a.machines, e, &m, &hb, Some(&by)).await?;
     let m = app.db.machine(&m.id).unwrap_or(m);
     Ok((StatusCode::ACCEPTED, Json(view(e, &m))))
 }
