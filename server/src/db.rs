@@ -1483,6 +1483,18 @@ impl Db {
             .unwrap();
     }
 
+    /// The onboarding wizard's progress (ADR 0034).
+    pub fn setup_progress(&self) -> crate::setup::Progress {
+        let v: Option<String> = self.c().query_row("SELECT value FROM settings WHERE key = 'setup'", [], |r| r.get(0)).optional().ok().flatten();
+        v.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    }
+
+    pub fn set_setup_progress(&self, p: &crate::setup::Progress) {
+        self.c()
+            .execute("INSERT INTO settings (key, value) VALUES ('setup', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1", [serde_json::to_string(p).unwrap()])
+            .unwrap();
+    }
+
     pub fn bot_override(&self, bot_id: &str) -> Option<Override> {
         let v: Option<String> = self.c().query_row("SELECT policy FROM bot_policies WHERE bot_id = ?", [bot_id], |r| r.get(0)).optional().ok().flatten();
         v.and_then(|s| serde_json::from_str(&s).ok())

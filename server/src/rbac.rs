@@ -236,6 +236,9 @@ mod tests {
             ("GET", "/api/me/secrets", Perm::Read),
             ("GET", "/api/me/tier", Perm::Read),
             ("GET", "/api/tiers", Perm::Admin),
+            // The onboarding wizard (ADR 0034): what the server has set up, and its progress.
+            ("GET", "/api/setup", Perm::Admin),
+            ("PATCH", "/api/setup", Perm::Admin),
             ("PUT", "/api/me/secrets/OPENAI_API_KEY", Perm::Write),
             ("DELETE", "/api/me/secrets/OPENAI_API_KEY", Perm::Write),
             ("POST", "/api/me/secrets/OPENAI_API_KEY", Perm::Admin),
