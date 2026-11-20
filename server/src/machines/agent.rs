@@ -1484,7 +1484,7 @@ async fn put_screen(State(a): State<Arc<Agent>>, UrlPath(bot): UrlPath<String>, 
 }
 
 async fn delete_screen(State(a): State<Arc<Agent>>, UrlPath(bot): UrlPath<String>) -> Response {
-    if a.screens.stop(&bot) {
+    if a.screens.stop(&bot).await {
         StatusCode::NO_CONTENT.into_response()
     } else {
         refuse(StatusCode::NOT_FOUND, "No screen is up for that Bot here.")

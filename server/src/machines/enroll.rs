@@ -481,7 +481,7 @@ impl Enrollment {
             let screens = match (&self.screens, &self.voxl) {
                 (None, _) => String::new(),
                 (Some(_), voxl) => FIRSTBOOT_SCREENS.replace(
-                    "{voxl}\n",
+                    "{voxl}",
                     &voxl.as_ref().map_or(String::new(), |(_, sha)| FIRSTBOOT_VOXL.replace("{sha}", sha)),
                 ),
             };
@@ -655,21 +655,18 @@ systemctl start superbot-machine
 /// FIRSTBOOT's last step with MACHINE_SCREENS (ADR 0045): what a screen runs, after the
 /// agent has started, so enrolling never waits on it. A failure here leaves the agent
 /// reporting what's missing; it never stops the machine from running Bots.
-const FIRSTBOOT_SCREENS: &str = r#"if (
-  set -e
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y -qq xvfb openbox dbus-daemon dbus-x11 x11-utils fonts-noto-core libx264-164 libyuv0 libopus0 >/dev/null
-{voxl}
-); then echo "superbot: screen programs installed"; else echo "superbot: screen programs didn't install" >&2; fi
+/// Every step is chained with `&&`: `set -e` doesn't apply inside an `if` condition.
+const FIRSTBOOT_SCREENS: &str = r#"if DEBIAN_FRONTEND=noninteractive apt-get update -qq &&
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq xvfb openbox dbus-daemon dbus-x11 x11-utils fonts-noto-core libx264-164 libyuv0 libopus0 >/dev/null{voxl}
+then echo "superbot: screen programs installed"; else rm -f /usr/local/bin/.voxl.new; echo "superbot: screen programs didn't install" >&2; fi
 "#;
 
 /// FIRSTBOOT_SCREENS's voxl step: botd's own build, checked like the agent.
-const FIRSTBOOT_VOXL: &str = r#"  curl -fsS --retry 10 --retry-delay 5 --retry-all-errors --cacert /etc/superbot/ca.pem -o /usr/local/bin/.voxl.new "{url}/v1/voxl"
-  echo "{sha}  /usr/local/bin/.voxl.new" | sha256sum -c -
-  chmod 755 /usr/local/bin/.voxl.new
-  mv /usr/local/bin/.voxl.new /usr/local/bin/voxl
-"#;
+const FIRSTBOOT_VOXL: &str = r#" &&
+  curl -fsS --retry 10 --retry-delay 5 --retry-all-errors --cacert /etc/superbot/ca.pem -o /usr/local/bin/.voxl.new "{url}/v1/voxl" &&
+  echo "{sha}  /usr/local/bin/.voxl.new" | sha256sum -c - &&
+  chmod 755 /usr/local/bin/.voxl.new &&
+  mv /usr/local/bin/.voxl.new /usr/local/bin/voxl"#;
 
 /// FIRSTBOOT's step making the Bots' own user (ADR 0043), so the agent needn't. It
 /// still hands the user its home when botd asks.
@@ -1863,9 +1860,39 @@ mod tests {
             let (start, apt) = (script.find("systemctl start").unwrap(), script.find("apt-get install").unwrap());
             assert!(start < apt, "{script}");
             assert_eq!(script.contains(&format!("echo \"{}  /usr/local/bin/.voxl.new\" | sha256sum -c -", "ef".repeat(32))), voxl.is_some(), "{script}");
-            assert!(script.trim_end().ends_with("else echo \"superbot: screen programs didn't install\" >&2; fi"), "{script}");
+            assert!(script.trim_end().ends_with("echo \"superbot: screen programs didn't install\" >&2; fi"), "{script}");
             let check = std::process::Command::new("sh").args(["-n", "-c", &script]).output().unwrap();
             assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stderr));
+        }
+
+        // A failed or wrong download never installs voxl, and says it didn't install.
+        let voxl = b"voxl, botd's build";
+        e.voxl = Some((Bytes::from_static(voxl), sha256_hex(voxl)));
+        let script = firstboot_in(&e.user_data(&m, "sbe_tok"));
+        let block = &script[script.find("if DEBIAN_FRONTEND").unwrap()..];
+        for (curl, installed) in [("printf 'voxl, botd' >\"$out\"; exit 22", false), ("printf 'not voxl' >\"$out\"", false), ("printf \"voxl, botd's build\" >\"$out\"", true)] {
+            let root = crate::db::temp_path("firstboot-screens");
+            let (stubs, bin) = (root.join("stubs"), root.join("bin"));
+            std::fs::create_dir_all(&stubs).unwrap();
+            std::fs::create_dir_all(&bin).unwrap();
+            let stub = |name: &str, body: &str| {
+                let p = stubs.join(name);
+                std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+                std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+            };
+            stub("apt-get", "exit 0");
+            stub("curl", &format!("while [ $# -gt 0 ]; do [ \"$1\" = -o ] && out=$2; shift; done\n{curl}"));
+            let run = block.replace("/usr/local/bin", &bin.display().to_string());
+            let out = std::process::Command::new("sh")
+                .args(["-c", &run])
+                .env("PATH", format!("{}:/usr/bin:/bin", stubs.display()))
+                .output()
+                .unwrap();
+            let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            assert_eq!(bin.join("voxl").exists(), installed, "{curl}: {stdout}{stderr}");
+            assert!(!bin.join(".voxl.new").exists(), "{curl}");
+            let said = if installed { stdout.contains("screen programs installed") } else { stderr.contains("screen programs didn't install") };
+            assert!(said, "{curl}: {stdout}{stderr}");
         }
     }
 

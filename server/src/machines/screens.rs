@@ -233,12 +233,19 @@ async fn put(e: &Enrollment, s: &Settings, to: &Assigned, bot: &str, token: &str
 async fn ensure(app: &App, e: &Enrollment, s: &Settings, by: &Who, bot: &Bot, to: &Assigned, why: &str) -> Result<(ScreenReply, Zeroizing<String>), Why> {
     let elsewhere = e.shown.open().get(&bot.id).is_some_and(|o| o.machine_id != to.machine_id || o.owner_id != bot.owner_id);
     if elsewhere {
-        close(app, by, &bot.id, "moved").await;
+        close_locked(app, e, by, &bot.id, "moved").await;
     }
     let token = e.shown.open().get(&bot.id).map(|o| o.token.clone());
     let token = token.unwrap_or_else(|| Zeroizing::new(crate::random_hex(16)));
     crate::secrets::redact::register(&token);
     let reply = put(e, s, to, &bot.id, &token).await?;
+    if app.db.bot(&bot.id).is_none_or(|b| b.owner_id != bot.owner_id) {
+        let path = format!("/v1/screens/{}", bot.id);
+        if let Some(m) = app.db.machine(&to.machine_id) {
+            let _ = e.call_agent(app, &m, reqwest::Method::DELETE, &path, &()).await;
+        }
+        return Err(Why::Failed(409, "the Bot was deleted or given to someone else meanwhile".into()));
+    }
     let at = now();
     {
         let mut open = e.shown.open();
@@ -423,7 +430,7 @@ pub async fn rotate(app: &App, bot: &str) {
     let owner = e.shown.open().get(bot).map(|o| o.owner_id.clone());
     let Some(owner) = owner else { return };
     if app.db.bot(bot).is_none_or(|b| b.owner_id != owner) {
-        close(app, &Who::system("control_plane"), bot, "moved").await;
+        close_locked(app, &e, &Who::system("control_plane"), bot, "moved").await;
         return;
     }
     let token = Zeroizing::new(crate::random_hex(16));
@@ -448,9 +455,25 @@ pub async fn rotate(app: &App, bot: &str) {
     app.db.record(&screen_event(&by, "machine.screen_rotated", &machine, bot, json!({ "machineTold": told })));
 }
 
-/// Stops showing `bot`'s machine screen and asks its agent to stop it.
+/// Stops showing `bot`'s machine screen and asks its agent to stop it, after any start
+/// or new token for it under way.
 pub async fn close(app: &App, by: &Who, bot: &str, reason: &str) -> bool {
     let Some(e) = enrollment(app).cloned() else { return false };
+    let _one = e.shown.one_at_a_time(bot).await;
+    close_locked(app, &e, by, bot, reason).await
+}
+
+/// `rotate` for every open machine screen, when someone loses access: a link doesn't
+/// know who opened it, so they all change.
+pub async fn rotate_all(app: &App) {
+    let Some(e) = enrollment(app) else { return };
+    let bots: Vec<String> = e.shown.open().keys().cloned().collect();
+    for bot in bots {
+        rotate(app, &bot).await;
+    }
+}
+
+async fn close_locked(app: &App, e: &Enrollment, by: &Who, bot: &str, reason: &str) -> bool {
     let Some(o) = e.shown.open().remove(bot) else { return false };
     let stopped = match app.db.machine(&o.machine_id) {
         Some(m) => e.call_agent(app, &m, reqwest::Method::DELETE, &format!("/v1/screens/{bot}"), &()).await.is_ok_and(|(c, _)| c == 204 || c == 404),

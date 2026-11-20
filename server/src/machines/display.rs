@@ -66,7 +66,7 @@ struct Screen {
 impl Screen {
     fn alive(&mut self) -> bool {
         let up = |c: &mut Child| matches!(c.try_wait(), Ok(None));
-        up(&mut self.x) && up(&mut self.bus) && self.viewer.as_mut().is_none_or(up)
+        up(&mut self.x) && up(&mut self.bus) && up(&mut self.wm) && self.viewer.as_mut().is_none_or(up)
     }
 }
 
@@ -364,8 +364,10 @@ impl Screens {
         Err(fail(503, "The screen's viewer didn't start."))
     }
 
-    /// Stops `bot`'s screen. Returns whether one was up.
-    pub fn stop(&self, bot: &str) -> bool {
+    /// Stops `bot`'s screen, after any start or token change under way. Returns
+    /// whether one was up.
+    pub async fn stop(&self, bot: &str) -> bool {
+        let _one = self.changing.lock().await;
         let gone = self.live().remove(bot);
         if let Some(s) = &gone {
             println!("Screen :{} of Bot {bot} stopped.", self.display(s.slot));
@@ -444,6 +446,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_screen_whose_window_manager_died_is_started_again() {
+        let (screens, _root) = fakes();
+        let a = "a".repeat(32);
+        assert!(screens.ensure("b1", &req(&a), me()).await.unwrap().started);
+        let wm = screens.live().get_mut("b1").unwrap().wm.id().unwrap();
+        unsafe { libc::kill(wm as i32, libc::SIGKILL) };
+        for _ in 0..100 {
+            if !screens.live().get_mut("b1").unwrap().alive() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(screens.ensure("b1", &req(&a), me()).await.unwrap().started, "rebuilt, not reused");
+        assert!(screens.stop("b1").await);
+    }
+
+    #[tokio::test]
     async fn a_screen_starts_once_keeps_its_display_across_tokens_and_stops() {
         let (screens, root) = fakes();
         assert!(screens.missing().is_empty(), "{:?}", screens.missing());
@@ -464,8 +483,8 @@ mod tests {
 
         assert_eq!(screens.report().running, vec!["b1".to_string()]);
         assert!(screens.tunnel("b2").is_err(), "no screen, no tunnel");
-        assert!(screens.stop("b1"));
-        assert!(!screens.stop("b1"));
+        assert!(screens.stop("b1").await);
+        assert!(!screens.stop("b1").await);
         assert!(screens.report().running.is_empty());
     }
 

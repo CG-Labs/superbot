@@ -319,3 +319,31 @@ async fn giving_the_bot_to_someone_else_closes_its_screen_on_the_old_owners_mach
     assert_eq!(reasons(&events(&env, "machine.screen_refused").await), ["no_machine"]);
     assert!(m.agent.screens.report().running.is_empty());
 }
+
+#[tokio::test]
+async fn revoking_someones_sessions_or_disabling_them_changes_every_machine_screens_link() {
+    let mut env = serve_with(|e| e.with_screens(ports())).await;
+    let (uid, m) = ready_machine(&mut env, "ada@example.com", fake_stack()).await;
+    let bot = owned_bot(&env, &uid);
+    until_ready(&env, &m.agent).await;
+    let (bob_id, bob) = user_with(env.port, &env.admin, "bob@example.com", "member").await;
+    let (code, v) = screen_of(&env, &bob, &bot).await;
+    assert_eq!(code, 200, "{v}");
+    let (port, token) = link(&v);
+    assert_eq!(view(port, &token).await.unwrap().0, 200);
+
+    let (code, v) = json_call(&env, "DELETE", &format!("/api/users/{bob_id}/sessions"), "").await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(events(&env, "machine.screen_rotated").await.len(), 1);
+    assert!(!matches!(view(port, &token).await, Ok((200, _))), "bob's saved link is dead");
+    let (code, v) = screen_of(&env, &env.admin, &bot).await;
+    assert_eq!(code, 200, "{v}");
+    let (port, fresh) = link(&v);
+    assert_eq!(view(port, &token).await.unwrap().0, 401, "the machine has the new token");
+    assert_eq!(view(port, &fresh).await.unwrap().0, 200);
+
+    let (code, v) = json_call(&env, "PATCH", &format!("/api/users/{bob_id}"), r#"{"status":"disabled"}"#).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(events(&env, "machine.screen_rotated").await.len(), 2);
+    assert!(!matches!(view(port, &fresh).await, Ok((200, _))));
+}
