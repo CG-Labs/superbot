@@ -697,7 +697,7 @@ function setupSignIn(s) {
 
 function limitsText(l) {
   const n = (v) => Number(v).toLocaleString();
-  return [l?.maxBots != null && `${n(l.maxBots)} Bots`, l?.monthlyRuns != null && `${n(l.monthlyRuns)} runs a month`, l?.monthlyTokens != null && `${n(l.monthlyTokens)} tokens a month`]
+  return [l?.maxBots != null && `${n(l.maxBots)} Bots`, l?.monthlyRuns != null && `${n(l.monthlyRuns)} runs a month`, l?.monthlyTokens != null && `${n(l.monthlyTokens)} tokens a month (not enforced yet)`]
     .filter(Boolean).join(" · ") || "No limits";
 }
 
