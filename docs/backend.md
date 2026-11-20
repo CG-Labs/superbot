@@ -248,6 +248,10 @@ With `ISOLATION=users` (`deploy/install.sh --isolation`), each user's Bots run a
 - **Turning it on or off** doesn't move files: work starts in the new folder, and the old one stays. Memory and `USER.md` carry over; harness sessions start fresh. To move files, see [deploy/README.md](../deploy/README.md#one-unix-account-per-user).
 - **Audit**: `isolation.account_created`, `isolation.account_failed`, `harness.login_started`; `harness.invoked` adds `runAs`; refusals are `bot.run_refused` with reason `isolation_harness` or `no_account`.
 
+### Shared Bots
+
+A shared Bot always runs on its owner's computer ([ADR 0046](adr/0046-shared-bots-under-isolation.md)). `SHARED_BOTS=open` (the default with `MACHINE_ROUTING=off`) keeps the old rule: it acts as its owner for everyone. `SHARED_BOTS=isolated` (the default, and the only choice, otherwise): a run for anyone but the owner (the sender, the person behind an asking Bot, or a routine's author) gets the lesser of the owner's and that person's access to other Bots, server-wide keys only, and none of the owner's `USER.md`; it can't make Bots; a disabled owner's Bots don't run; new Bots are private. Bot views add `runsOn` and `sharedBots`. Audit: `forUser` on `harness.invoked`, `bot.run_routed` and `bot.run_refused`; refusals `owner_disabled`, `asker_lost_access`; `access.denied` with reason `asker_acl`; routines' `author`.
+
 ### Per-user machines (managed hosting)
 
 For CG-Labs managed hosting: botd can rent one Linode per user and track it. **Off by default**: without `LINODE_TOKEN` the machine endpoints answer 503 "control plane not configured", and nothing else changes. Self-hosted servers don't need it. Design: [ADR 0025](adr/0025-control-plane-linode.md).
