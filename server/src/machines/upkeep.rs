@@ -133,6 +133,7 @@ fn upkeep_json(hb: &Heartbeat) -> Value {
         "can": hb.can, "build": hb.build, "plan": hb.plan, "harnesses": hb.harnesses, "upgrade": hb.upgrade, "logins": logins,
         "botUser": super::botuser::upkeep_json(hb),
         "screens": super::screens::upkeep_json(hb),
+        "teammates": hb.teammates,
     })
 }
 

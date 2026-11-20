@@ -1109,7 +1109,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 22] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 23] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1131,6 +1131,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 22] = [
     migrate_routine_pauses,
     migrate_token_usage,
     migrate_approval_runs,
+    migrate_teammate_cleanups,
     migrate_bot_prompts,
 ];
 
@@ -1154,6 +1155,100 @@ fn migrate_approval_runs(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Removing teammates' users from machines when they leave (ADR 0052): one row per
+/// removal, `pending` until the agent has done it, then `done`, or `held` while their
+/// work waits to be purged; `cancelled` if they came back or the machine went first.
+/// At most one pending per machine and teammate, so queueing again changes nothing.
+fn migrate_teammate_cleanups(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS teammate_cleanups (
+          id TEXT PRIMARY KEY,
+          machine_id TEXT NOT NULL,
+          owner_id TEXT NOT NULL,
+          user_id TEXT NOT NULL,
+          os_user TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          files TEXT NOT NULL CHECK (files IN ('archive', 'delete')),
+          grace_days INTEGER NOT NULL DEFAULT 0,
+          state TEXT NOT NULL CHECK (state IN ('pending', 'held', 'done', 'cancelled')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          tried_at INTEGER,
+          created_at INTEGER NOT NULL,
+          created_by TEXT,
+          removed_at INTEGER,
+          archived_to TEXT,
+          purge_at INTEGER,
+          done_at INTEGER
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS teammate_cleanups_pending ON teammate_cleanups(machine_id, user_id) WHERE state = 'pending';
+        CREATE INDEX IF NOT EXISTS teammate_cleanups_state ON teammate_cleanups(state, machine_id);",
+    )
+}
+
+/// One teammate's removal from one machine (ADR 0052).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeammateCleanup {
+    pub id: String,
+    pub machine_id: String,
+    /// The machine's user, whose shared Bots the teammate ran.
+    pub owner_id: String,
+    /// The teammate.
+    pub user_id: String,
+    pub os_user: String,
+    /// `disabled`, `deprovisioned`, `deleted`, `access_lost` or `admin`.
+    pub reason: String,
+    /// `archive` or `delete`: what becomes of their work folder.
+    pub files: String,
+    pub grace_days: i64,
+    pub state: String,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+    pub tried_at: Option<i64>,
+    pub created_at: i64,
+    pub created_by: Option<String>,
+    pub removed_at: Option<i64>,
+    pub archived_to: Option<String>,
+    pub purge_at: Option<i64>,
+    pub done_at: Option<i64>,
+}
+
+fn teammate_cleanup_row(r: &Row) -> rusqlite::Result<TeammateCleanup> {
+    Ok(TeammateCleanup {
+        id: r.get("id")?,
+        machine_id: r.get("machine_id")?,
+        owner_id: r.get("owner_id")?,
+        user_id: r.get("user_id")?,
+        os_user: r.get("os_user")?,
+        reason: r.get("reason")?,
+        files: r.get("files")?,
+        grace_days: r.get("grace_days")?,
+        state: r.get("state")?,
+        attempts: r.get("attempts")?,
+        last_error: r.get("last_error")?,
+        tried_at: r.get("tried_at")?,
+        created_at: r.get("created_at")?,
+        created_by: r.get("created_by")?,
+        removed_at: r.get("removed_at")?,
+        archived_to: r.get("archived_to")?,
+        purge_at: r.get("purge_at")?,
+        done_at: r.get("done_at")?,
+    })
+}
+
+/// A removal to queue: `teammate_cleanup_queue`.
+pub struct NewTeammateCleanup<'a> {
+    pub machine_id: &'a str,
+    pub owner_id: &'a str,
+    pub user_id: &'a str,
+    pub os_user: &'a str,
+    pub reason: &'a str,
+    pub files: &'a str,
+    pub grace_days: i64,
+    pub created_by: Option<&'a str>,
 }
 
 /// Token metering (ADR 0050): the model tokens each run used, one row per model, or one
@@ -3834,6 +3929,115 @@ impl Db {
             .execute(
                 "UPDATE machines SET agent_upkeep = ? WHERE id = ? AND agent_upkeep IS ?",
                 params![new.to_string(), machine_id, old.map(Value::to_string)],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Queues a teammate's removal from a machine, unless one is pending: returns that
+    /// one then, and whether this call made it.
+    pub fn teammate_cleanup_queue(&self, n: &NewTeammateCleanup) -> Option<(TeammateCleanup, bool)> {
+        let c = self.c();
+        let made = c
+            .execute(
+                "INSERT OR IGNORE INTO teammate_cleanups (id, machine_id, owner_id, user_id, os_user, reason, files, grace_days, state, created_at, created_by)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                params![crate::random_hex(8), n.machine_id, n.owner_id, n.user_id, n.os_user, n.reason, n.files, n.grace_days, now(), n.created_by],
+            )
+            .unwrap_or(0)
+            == 1;
+        c.query_row(
+            "SELECT * FROM teammate_cleanups WHERE machine_id = ? AND user_id = ? AND state = 'pending'",
+            [n.machine_id, n.user_id],
+            teammate_cleanup_row,
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .map(|r| (r, made))
+    }
+
+    pub fn teammate_cleanup(&self, id: &str) -> Option<TeammateCleanup> {
+        self.c().query_row("SELECT * FROM teammate_cleanups WHERE id = ?", [id], teammate_cleanup_row).optional().ok().flatten()
+    }
+
+    /// Newest first, in `state` (any if None), on `machine_id` (any if None).
+    pub fn teammate_cleanups(&self, state: Option<&str>, machine_id: Option<&str>) -> Vec<TeammateCleanup> {
+        let c = self.c();
+        let mut s = c
+            .prepare(
+                "SELECT * FROM teammate_cleanups WHERE (?1 IS NULL OR state = ?1) AND (?2 IS NULL OR machine_id = ?2)
+                 ORDER BY created_at DESC, id",
+            )
+            .unwrap();
+        s.query_map(params![state, machine_id], teammate_cleanup_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// An attempt at a pending (or held, for a purge) removal failed, or is waiting on
+    /// the machine (`attempt` false). Returns whether it was still in `state`.
+    pub fn teammate_cleanup_failed(&self, id: &str, state: &str, error: &str, attempt: bool) -> bool {
+        self.c()
+            .execute(
+                "UPDATE teammate_cleanups SET last_error = ?, attempts = attempts + ?, tried_at = CASE WHEN ? THEN ? ELSE tried_at END
+                 WHERE id = ? AND state = ?",
+                params![error, attempt as i64, attempt, now(), id, state],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// The agent removed the teammate: `held` while their work waits for `purge_at`,
+    /// else done. Returns whether it was still pending, so it's recorded once.
+    pub fn teammate_cleanup_removed(&self, id: &str, archived_to: Option<&str>, purge_at: Option<i64>) -> bool {
+        let at = now();
+        self.c()
+            .execute(
+                "UPDATE teammate_cleanups SET state = CASE WHEN ?1 IS NULL THEN 'done' ELSE 'held' END, purge_at = ?1, archived_to = ?2,
+                 removed_at = ?3, done_at = CASE WHEN ?1 IS NULL THEN ?3 ELSE NULL END, attempts = attempts + 1, tried_at = ?3, last_error = NULL
+                 WHERE id = ?4 AND state = 'pending'",
+                params![purge_at, archived_to, at, id],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    #[cfg(test)]
+    pub fn teammate_cleanup_due_now(&self, id: &str) {
+        self.c().execute("UPDATE teammate_cleanups SET purge_at = ? WHERE id = ?", params![now() - 1, id]).unwrap();
+    }
+
+    /// Ends a removal in `from` as `to` (`done` or `cancelled`), with `note` as its
+    /// last word. Returns whether it was still in `from`.
+    pub fn teammate_cleanup_end(&self, id: &str, from: &str, to: &str, note: Option<&str>) -> bool {
+        self.c()
+            .execute(
+                "UPDATE teammate_cleanups SET state = ?, done_at = ?, last_error = ? WHERE id = ? AND state = ?",
+                params![to, now(), note, id, from],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// An admin asked for this pending removal: it's theirs now, so it's never cancelled
+    /// because the teammate is wanted again. Returns whether it changed.
+    pub fn teammate_cleanup_force(&self, id: &str) -> bool {
+        self.c()
+            .execute(
+                "UPDATE teammate_cleanups SET reason = 'admin' WHERE id = ? AND state = 'pending' AND reason <> 'admin'",
+                [id],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Cancels a pending removal with `note`, but only if no admin asked for it and the
+    /// agent was never asked. Returns whether it did.
+    pub fn teammate_cleanup_cancel_unasked(&self, id: &str, note: &str) -> bool {
+        self.c()
+            .execute(
+                "UPDATE teammate_cleanups SET state = 'cancelled', done_at = ?, last_error = ?
+                 WHERE id = ? AND state = 'pending' AND reason <> 'admin' AND attempts = 0",
+                params![now(), note, id],
             )
             .unwrap_or(0)
             == 1

@@ -920,6 +920,7 @@ impl App {
                         let e = by.event("machine.teammate_user_created").target("machine", &to.machine_id).bot(&bot.id);
                         self.db.record(&e.details(json!({ "owner": bot.owner_id, "forUser": u, "user": t.user, "uid": t.uid, "messageId": msg.id })));
                     }
+                    crate::machines::offboard::seen(self, &to.machine_id, u);
                     Some(t)
                 }
             },
