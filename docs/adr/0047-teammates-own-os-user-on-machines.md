@@ -27,7 +27,7 @@ With the setting on, a run of Ada's shared Bot for Bea goes to Ada's machine as 
 - **Before each run**, botd asks the agent with `PUT /v1/teammates/{user}` (`owner_id` in the body) over mTLS.
 - **The agent** (`machines/teammates.rs`):
   - makes the user if needed (`useradd`, no login shell);
-  - records its uid and gid in `teammates.json` (0600, in the state folder);
+  - records its uid and gid in `teammates.json` (0600, in the state folder), and removes a user it just made if that record can't be written, so a later try isn't refused;
   - refuses an existing user it didn't record, root, its own uid, and the Bots' uid or gid;
   - makes the home `<state>/teammates/<user>` (`SUPERBOT_TEAMMATES`, 0711 root, apart from the Bots' home), 0700 and owned by that user, with `work/` and `bots/` inside;
   - refuses a home that is a link or belongs to someone else, and never follows one;
@@ -48,7 +48,7 @@ What the Bot tells the people using it names whose computer it is, as in ADR 004
 
 ### What a teammate's run keeps can't come back as the owner
 
-A teammate-user run's `BOT_TOKEN` is bound to the teammate: `sbb_<bot>.<owner>.<teammate>.<HMAC>`, signed over all three. botd accepts it only while the Bot's latest run is still that teammate's (`App::acting_for`). Once Ada or anyone else runs the Bot, it's refused (`auth.login_failed`, reason `run_over`). So a process Bea's run left on the machine can't use the Bot with Ada's access after Ada's next run. Ada's own token, and everything with the setting off, is as before.
+A teammate-user run's `BOT_TOKEN` is bound to the teammate: `sbb_<bot>.<owner>.<teammate>.<HMAC>`, signed over all three. botd accepts it only while the Bot's latest run is still that teammate's (`App::acting_for`). Once Ada or anyone else runs the Bot, it's refused (`auth.login_failed`, reason `run_over`). So a process Bea's run left on the machine can't use the Bot with Ada's access after Ada's next run. A live-update stream it opened earlier closes at that point too; it never moves over to Ada's access. Ada's own token, and everything with the setting off, is as before.
 
 ### Screens are per person
 

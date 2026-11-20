@@ -372,6 +372,24 @@ async fn routed_teammates() -> (World, Arc<Recording>) {
     (w, link)
 }
 
+/// Opens the live stream as `auth` and waits for its headers.
+async fn open_stream(port: u16, auth: &str) -> tokio::net::TcpStream {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let req = format!("GET /api/events HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nAuthorization: {auth}\r\n\r\n");
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut first = [0u8; 12];
+    s.read_exact(&mut first).await.unwrap();
+    assert_eq!(&first, b"HTTP/1.0 200");
+    s
+}
+
+async fn closes(mut s: tokio::net::TcpStream) -> bool {
+    use tokio::io::AsyncReadExt;
+    let mut rest = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(3), s.read_to_end(&mut rest)).await.is_ok()
+}
+
 fn bot_token(job: &wire::JobRequest) -> String {
     job.env.get("BOT_TOKEN").cloned().unwrap_or_default()
 }
@@ -423,7 +441,9 @@ async fn with_teammate_users_a_teammates_run_is_their_own_user_in_their_own_home
     assert_ne!(bound, bot_token(ada), "not Ada's token");
     let (code, list) = call(w.port, "GET", "/api/bots", &format!("Bearer {bound}"), "").await;
     assert_eq!(code, 200, "{list}");
+    let stream = open_stream(w.port, &format!("Bearer {bound}")).await;
     run(&w, &w.a, &team.id, "mine again").await;
+    assert!(closes(stream).await, "Bea's open stream would otherwise take Ada's access");
     let (code, _) = call(w.port, "GET", "/api/bots", &format!("Bearer {bound}"), "").await;
     assert_eq!(code, 401, "Bea's token doesn't get Ada's access back");
     let failed = events(&w, "action=auth.login_failed").await;

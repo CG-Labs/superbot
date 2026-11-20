@@ -214,6 +214,9 @@ pub struct Caller {
     pub method: &'static str,
     /// The Bot a Bot's token was issued to (ADR 0029). Only ever set for `Principal::Bot`.
     pub bot: Option<String>,
+    /// The teammate a Bot's token is bound to (ADR 0047): it acts only while the Bot's
+    /// latest run is still theirs.
+    pub bot_for: Option<String>,
 }
 
 /// The audit actor: the person, their email and role now, and how this request was

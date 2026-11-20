@@ -914,8 +914,8 @@ fn sso_path(path: &str) -> Option<&str> {
 /// it also has good ones elsewhere.
 fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<Response>> {
     let h = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
-    let operator = |method: &'static str| Caller { principal: Principal::User(Role::Admin), user: a.operator(), session: None, method, bot: None };
-    let from_session = |(s, u): (db::Session, db::User)| Caller { principal: Principal::User(u.role), user: Some(u), session: Some(s), method: "session", bot: None };
+    let operator = |method: &'static str| Caller { principal: Principal::User(Role::Admin), user: a.operator(), session: None, method, bot: None, bot_for: None };
+    let from_session = |(s, u): (db::Session, db::User)| Caller { principal: Principal::User(u.role), user: Some(u), session: Some(s), method: "session", bot: None, bot_for: None };
     let fail = |method: &str, reason: Option<&str>, clear: bool| {
         a.login_failed(source, method, reason);
         Err(Box::new(unauthorized(a, req, clear)))
@@ -934,7 +934,7 @@ fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<
                     Some(None) => fail("bot_token", Some("bot_gone"), false),
                     Some(Some(b)) if b.owner_id != owner => fail("bot_token", Some("bot_moved"), false),
                     Some(Some(b)) if isolation::token_for_user(&a.bot_key, t).is_some_and(|u| run_over(&b, u)) => fail("bot_token", Some("run_over"), false),
-                    _ => Ok(Caller { principal: Principal::Bot, user: None, session: None, method: "bot_token", bot: Some(id.to_string()) }),
+                    _ => Ok(Caller { principal: Principal::Bot, user: None, session: None, method: "bot_token", bot: Some(id.to_string()), bot_for: isolation::token_for_user(&a.bot_key, t).map(str::to_string) }),
                 },
                 None => fail("bot_token", Some("bad_token"), false),
             };
@@ -1170,10 +1170,12 @@ async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>,
     let user = c.user.filter(|_| session.is_some()).map(|u| u.id);
     let bot = c.bot.filter(|_| c.principal == Principal::Bot);
     let bot_owner = bot.as_deref().and_then(|id| app.db.bot_owner(id));
+    let bot_for = c.bot_for.filter(|_| bot.is_some());
     // The stream outlives the request that opened it, so it closes within seconds of
     // its session being revoked, expiring, or its user being disabled, and follows
     // role changes. A Bot's closes when the Bot is deleted, changes hands, or its
-    // owner is disabled, and follows its owner's role.
+    // owner is disabled, and follows its owner's role. One bound to a teammate (ADR
+    // 0047) closes once the Bot's latest run isn't theirs, never taking the owner's access.
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, Infallible>>(64);
     let mut sub = app.tx.subscribe();
     let cfg = a.sessions;
@@ -1205,6 +1207,7 @@ async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>,
                 _ = check.tick(), if session.is_some() || bot.is_some() => {
                     let now = if let Some(id) = bot.as_deref() {
                         match app.db.bot(id) {
+                            Some(b) if bot_for.as_deref().is_some_and(|u| app.acting_for(&b) != u) => break,
                             Some(b) if Some(&b.owner_id) == bot_owner.as_ref() => match app.bot_viewer(&b) {
                                 Viewer::Nobody => break,
                                 v => v,
@@ -1420,6 +1423,7 @@ fn need_bot(app: &App, id: &str) -> Res<db::Bot> {
 /// than that of the person its run is for (ADR 0046).
 fn viewer(app: &App, c: &Caller, _by: &Who) -> Viewer {
     match (c.principal, c.bot.as_deref().and_then(|id| app.db.bot(id))) {
+        (Principal::Bot, Some(b)) if c.bot_for.as_deref().is_some_and(|u| app.acting_for(&b) != u) => Viewer::Nobody,
         (Principal::Bot, Some(b)) => app.bot_viewer(&b),
         (Principal::Bot, None) => Viewer::Nobody,
         _ => Viewer::of(c),
@@ -2925,7 +2929,7 @@ mod tests {
             .route("/api/bots/{id}/routines", get(list_routines).post(create_routine))
             .route("/api/routines/{id}", patch(update_routine).delete(delete_routine))
             .layer(Extension(Who { actor: Actor::operator(), source: Source::default() }))
-            .layer(Extension(Caller { principal: Principal::User(Role::Admin), user: None, session: None, method: "none", bot: None }))
+            .layer(Extension(Caller { principal: Principal::User(Role::Admin), user: None, session: None, method: "none", bot: None, bot_for: None }))
             .with_state(app.clone());
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();

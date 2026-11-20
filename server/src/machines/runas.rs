@@ -106,6 +106,23 @@ pub fn ensure_user(name: &str, home: &Path) -> Result<Ids, String> {
     ensure_user_as(name, home, "SuperBot Bots")
 }
 
+/// Removes a user this agent just made (not its home), like `ensure_user_as` going
+/// through systemd when the unit can't write /etc.
+pub fn remove_user(name: &str) -> Result<(), String> {
+    let args = vec![name.to_string()];
+    if let Err(direct) = run("userdel", &args) {
+        let mut outside: Vec<String> = ["--quiet", "--wait", "--collect", "--", "userdel"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        outside.extend(args);
+        if let Err(via) = run("systemd-run", &outside) {
+            return Err(format!("{direct}; through systemd: {via}"));
+        }
+    }
+    Ok(())
+}
+
 /// `ensure_user`, with `comment` as the user's description.
 pub fn ensure_user_as(name: &str, home: &Path, comment: &str) -> Result<Ids, String> {
     if let Some((ids, _)) = lookup(name) {

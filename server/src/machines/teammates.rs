@@ -151,7 +151,6 @@ impl Teammates {
                     ));
                 }
                 let ids = runas::ensure_user_as(&name, &home, "SuperBot teammate")?;
-                check(ids)?;
                 record.insert(
                     user_id.to_string(),
                     Saved {
@@ -160,7 +159,16 @@ impl Teammates {
                         gid: ids.gid,
                     },
                 );
-                self.save(&record)?;
+                // A user left without its record would be refused as someone else's
+                // on every later try, so one that can't be kept is taken back.
+                if let Err(e) = check(ids).and_then(|_| self.save(&record)) {
+                    if self.stand_in.is_none()
+                        && let Err(undo) = runas::remove_user(&name)
+                    {
+                        return Err(format!("{e}; and couldn't remove {name}: {undo}"));
+                    }
+                    return Err(e);
+                }
                 (ids, true)
             }
         };
@@ -268,6 +276,13 @@ mod tests {
             t.ensure("u-dee", |_| Err("no".into())).is_err(),
             "refused ids"
         );
+
+        // A record that can't be written leaves nothing behind, so a later try works.
+        let gone = d.join("gone");
+        let t2 = Teammates::new(d.join("teammates"), gone.clone(), runas::current_user());
+        assert!(t2.ensure("u-fay", |_| Ok(())).is_err());
+        std::fs::create_dir_all(&gone).unwrap();
+        assert!(t2.ensure("u-fay", |_| Ok(())).unwrap().created);
 
         // A record naming another uid than the user has now runs nothing.
         let r = std::fs::read_to_string(state.join(RECORD)).unwrap();
