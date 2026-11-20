@@ -11,9 +11,13 @@ import type {
   Message,
   ModelOption,
   MyUsage,
+  NewPolicyRule,
   PersonalSecret,
   Policy,
   PolicyMode,
+  PolicyPatch,
+  PolicyRule,
+  PolicyView,
   Role,
   Routine,
   ServerConfig,
@@ -235,7 +239,35 @@ export class SuperBotApi {
   /** mode null drops the Bot's override, so it follows the global policy again. */
   async setBotPolicy(botId: string, mode: PolicyMode | null): Promise<void> {
     if (mode) await this.request("PUT", `/api/bots/${botId}/policy`, { mode });
-    else await this.request("DELETE", `/api/bots/${botId}/policy`);
+    else await this.resetBotPolicy(botId);
+  }
+
+  // The policy editor (ADR 0049). Anyone signed in reads; only admins change it.
+
+  /** The global policy with its rules, or one Bot's (which needs view access to it). */
+  async policyView(botId?: string): Promise<PolicyView> {
+    if (botId) return this.request<PolicyView>("GET", `/api/bots/${botId}/policy`);
+    return this.request<PolicyView>("GET", "/api/policy");
+  }
+
+  async patchGlobalPolicy(patch: PolicyPatch): Promise<Policy> {
+    return (await this.request<{ policy: Policy }>("PUT", "/api/policy", patch)).policy;
+  }
+
+  async patchBotPolicy(botId: string, patch: PolicyPatch): Promise<PolicyView> {
+    return this.request<PolicyView>("PUT", `/api/bots/${botId}/policy`, patch);
+  }
+
+  async resetBotPolicy(botId: string): Promise<PolicyView> {
+    return this.request<PolicyView>("DELETE", `/api/bots/${botId}/policy`);
+  }
+
+  async addPolicyRule(rule: NewPolicyRule): Promise<PolicyRule> {
+    return this.request<PolicyRule>("POST", "/api/policy/rules", rule);
+  }
+
+  async deletePolicyRule(id: string): Promise<void> {
+    await this.request("DELETE", `/api/policy/rules/${encodeURIComponent(id)}`);
   }
 
   // Users, codes, sessions, and sign-ins: admins only, enforced by the server (ADR 0012, 0021).
@@ -298,7 +330,7 @@ export class SuperBotApi {
     }
   }
 
-  /** Your model tokens and runs this billing period. null from servers before ADR 0048. */
+  /** Your model tokens and runs this billing period. null from servers before ADR 0050. */
   async myUsage(): Promise<MyUsage | null> {
     try {
       return await this.request<MyUsage>("GET", "/api/me/usage");

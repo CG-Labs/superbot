@@ -23,12 +23,14 @@ interface Props {
   visible: boolean;
   onClose: () => void;
   onOpenScreen: () => void;
+  /** Opens this Bot's policy editor (ADR 0049). */
+  onOpenPolicy?: (botId: string) => void;
 }
 
 /** "new" or the routine being edited; null shows the details. */
 type Editing = "new" | Routine | null;
 
-export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
+export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy }: Props) {
   const {
     bots,
     activeId,
@@ -216,6 +218,11 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
           {bot.policyOverride && can("admin") ? (
             <Pressable style={styles.row} onPress={() => void setBotPolicy(bot.id, null)}>
               <Text style={styles.policyLink}>Use the default for all Bots ({policy?.mode ?? "ask"})</Text>
+            </Pressable>
+          ) : null}
+          {onOpenPolicy ? (
+            <Pressable style={styles.row} role="button" aria-label="Approval policy" onPress={() => onOpenPolicy(bot.id)}>
+              <Text style={styles.policyLink}>{can("admin") ? "Edit risky actions, timeout, and rules ›" : "See risky actions, timeout, and rules ›"}</Text>
             </Pressable>
           ) : null}
           {bot.visibility ? (

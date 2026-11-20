@@ -8,7 +8,7 @@
 //! names its user in its metadata (`superbot_user_id`, set by the checkout), or through
 //! its customer, linked to the user when their checkout completes. With
 //! `STRIPE_METER_EVENT` too (off by default), botd reports each run's model tokens to
-//! that Stripe meter (ADR 0048); it never does without it.
+//! that Stripe meter (ADR 0050); it never does without it.
 
 use crate::audit::{Actor, Outcome, Who};
 use crate::db::{Applied, Linked, Subscription};
@@ -59,11 +59,11 @@ pub struct Billing {
     refusals: crate::users::Limiter,
     /// Checkout and the customer portal (ADR 0042). None without `STRIPE_SECRET_KEY`.
     checkout: Option<Checkout>,
-    /// Token metering (ADR 0048). None without `STRIPE_METER_EVENT`: the default.
+    /// Token metering (ADR 0050). None without `STRIPE_METER_EVENT`: the default.
     meter: Option<Arc<Meter>>,
 }
 
-/// Reports each run's tokens to a Stripe meter as meter events (ADR 0048).
+/// Reports each run's tokens to a Stripe meter as meter events (ADR 0050).
 pub struct Meter {
     stripe: Stripe,
     /// The meter's event name at Stripe.
@@ -728,7 +728,7 @@ pub async fn portal(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
 }
 
 /// Sends the token rows waiting for Stripe's meter, oldest first, one meter event each
-/// (ADR 0048). The event's `identifier` and idempotency key are the row's own, so
+/// (ADR 0050). The event's `identifier` and idempotency key are the row's own, so
 /// Stripe counts a resent row once. A row Stripe refuses, or that can't reach it after
 /// `METER_TRIES` passes, is marked failed and audited (`billing.meter_failed`); nothing
 /// is dropped silently. Returns how many went through.

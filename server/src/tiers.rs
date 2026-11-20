@@ -34,11 +34,11 @@ pub struct Limits {
     #[serde(default)]
     pub max_bots: Option<u32>,
     /// Bot runs a billing period, counted for the Bot's owner: their paid subscription's
-    /// month, else the calendar month (UTC) (ADR 0048).
+    /// month, else the calendar month (UTC) (ADR 0050).
     #[serde(default)]
     pub monthly_runs: Option<u32>,
     /// Model tokens a billing period, as harnesses report them, counted for the Bot's
-    /// owner (ADR 0048). Runs whose harness reports nothing don't count.
+    /// owner (ADR 0050). Runs whose harness reports nothing don't count.
     #[serde(default)]
     pub monthly_tokens: Option<u64>,
     /// Routine runs a day (UTC), counted for the Bot's owner when a routine fires (ADR 0040).

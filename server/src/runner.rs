@@ -118,7 +118,7 @@ pub struct App {
     /// ROUTINES_ON_ENABLE=resume (ADR 0047): re-enabling a user resumes the routines
     /// paused when they were disabled. Unset: they stay paused until an admin resumes them.
     pub resume_routines_on_enable: OnceLock<bool>,
-    /// STRIPE_METER_EVENT (ADR 0048): reports each run's tokens to a Stripe meter. Unset: off.
+    /// STRIPE_METER_EVENT (ADR 0050): reports each run's tokens to a Stripe meter. Unset: off.
     pub meter: OnceLock<Arc<crate::billing::Meter>>,
     closing: AtomicBool,
 }
@@ -219,7 +219,7 @@ impl App {
         self.tiers.get().map_or_else(|| SELF_HOST.get_or_init(Tiers::self_host), |t| t.as_ref())
     }
 
-    /// The billing period `at` (Unix ms) falls in for a user (ADR 0048): their paid
+    /// The billing period `at` (Unix ms) falls in for a user (ADR 0050): their paid
     /// subscription's month, else the calendar month.
     pub fn billing_period(&self, user_id: &str, at: i64) -> usage::Period {
         let sub = self.db.subscription(user_id).filter(|s| s.tier.is_some());
@@ -1066,7 +1066,7 @@ impl App {
 
     /// The tier this run is on and the route it takes: the Bot owner's tier picks the
     /// model, never the Bot's settings alone (ADR 0033). The run is counted for the
-    /// owner, within the tier's runs and tokens a billing period (ADR 0048). None:
+    /// owner, within the tier's runs and tokens a billing period (ADR 0050). None:
     /// refused, and the Bot said why.
     fn tier_route(&self, bot: &Bot, msg: &Message, by: &Who, period: &usage::Period) -> Option<(String, Route)> {
         let tier = self.tier_of(&bot.owner_id);
@@ -1111,7 +1111,7 @@ impl App {
     }
 
     /// Records the tokens a run used, one row per model, charged to the Bot's owner
-    /// (ADR 0048). A harness that reported nothing leaves one row saying so. Audits the
+    /// (ADR 0050). A harness that reported nothing leaves one row saying so. Audits the
     /// run that uses up the owner's tokens for the period it ends in, which its tokens
     /// count in. Returns the run's total, or None when unknown.
     fn record_tokens(&self, bot: &Bot, msg: &Message, run_id: &str, route: &Route, used: Vec<Usage>) -> Option<u64> {

@@ -159,7 +159,7 @@ fn message_row(r: &Row) -> rusqlite::Result<Message> {
     })
 }
 
-/// One model's tokens for one run, to record (ADR 0048). `reported` false: the harness
+/// One model's tokens for one run, to record (ADR 0050). `reported` false: the harness
 /// didn't say, so the counts are 0 and unknown.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TokenRow {
@@ -227,7 +227,7 @@ pub struct Subscription {
     pub price_id: Option<String>,
     /// The tier it pays for; None when it pays for none (ended, or an unknown price).
     pub tier: Option<String>,
-    /// Start of the paid period, Unix seconds (ADR 0048). None: from before it was kept.
+    /// Start of the paid period, Unix seconds (ADR 0050). None: from before it was kept.
     pub period_start: Option<i64>,
     /// End of the paid period, Unix seconds.
     pub period_end: Option<i64>,
@@ -1117,7 +1117,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 20] = [
     migrate_token_usage,
 ];
 
-/// Token metering (ADR 0048): the model tokens each run used, one row per model, or one
+/// Token metering (ADR 0050): the model tokens each run used, one row per model, or one
 /// row with `reported = 0` when the harness didn't say. Charged to the Bot's owner, like
 /// the run; `user_id` and `bot_id` have no foreign key, as `bots.owner_id` doesn't, so a
 /// deleted Bot's usage stays billed. `meter_status` is for reporting to Stripe, when
@@ -2474,7 +2474,7 @@ impl Db {
 
     /// Notes a refused routine run. True for the user's first refusal that day, so the
     /// Bot says so once a day instead of at every firing.
-    /// Records one run's model tokens (ADR 0048), all rows or none.
+    /// Records one run's model tokens (ADR 0050), all rows or none.
     pub fn record_tokens(&self, rows: &[TokenRow]) -> rusqlite::Result<()> {
         let mut c = self.c();
         let tx = c.transaction()?;

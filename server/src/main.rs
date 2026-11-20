@@ -49,6 +49,8 @@ mod machines_teammates_tests;
 mod passwd;
 mod paths;
 mod policy;
+#[cfg(test)]
+mod policy_http_tests;
 mod rbac;
 mod runner;
 mod scim;
@@ -2194,9 +2196,8 @@ async fn put_bot_policy(State(app): State<AppState>, Extension(who): Extension<P
     need_user(who)?;
     need_bot(&app, &id)?;
     let before = app.db.bot_override(&id);
-    let mut o = before.clone().unwrap_or_default();
-    o.merge(policy::parse_patch(&v).map_err(bad)?);
-    app.db.set_bot_override(&id, Some(&o));
+    let o = policy::patch_override(&before.clone().unwrap_or_default(), &v).map_err(bad)?;
+    app.db.set_bot_override(&id, Some(&o).filter(|o| !o.is_empty()));
     app.db.record(&by.event("policy.updated").target("policy", &id).bot(&id).details(json!({ "before": before, "after": o })));
     app.stop_unguarded_runs();
     app.push_bot(&id);
@@ -2235,7 +2236,17 @@ async fn add_rule(State(app): State<AppState>, Extension(who): Extension<Princip
     };
     let pattern = v["pattern"].as_str().map(str::trim).filter(|p| !p.is_empty()).ok_or_else(|| bad("pattern is required"))?;
     let tool = v["tool"].as_str().map(str::trim).filter(|t| !t.is_empty()).unwrap_or("*");
-    let r = app.db.add_rule(bot, action, tool, pattern, v["note"].as_str());
+    let note = v["note"].as_str().map(str::trim).filter(|n| !n.is_empty());
+    if pattern.chars().count() > policy::RULE_PATTERN_MAX {
+        return Err(bad(format!("pattern must be {} characters or fewer", policy::RULE_PATTERN_MAX)));
+    }
+    if tool.chars().count() > policy::RULE_TOOL_MAX || tool.chars().any(char::is_whitespace) {
+        return Err(bad(format!("tool must be \"*\", a kind, or a tool name: no spaces, {} characters or fewer", policy::RULE_TOOL_MAX)));
+    }
+    if note.is_some_and(|n| n.chars().count() > policy::RULE_NOTE_MAX) {
+        return Err(bad(format!("note must be {} characters or fewer", policy::RULE_NOTE_MAX)));
+    }
+    let r = app.db.add_rule(bot, action, tool, pattern, note);
     let added = by.event("rule.added").target("rule", &r.id).details(json!({ "rule": r }));
     app.db.record(&match bot {
         Some(b) => added.bot(b),

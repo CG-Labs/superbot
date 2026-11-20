@@ -39,7 +39,7 @@ describe("plan usage", () => {
   });
 });
 
-describe("usage this period (ADR 0048)", () => {
+describe("usage this period (ADR 0050)", () => {
   const totals = { input: 1000, output: 200, cacheRead: 300, cacheWrite: 0, total: 1500, runs: 2, unreportedRuns: 1 };
   const mine: MyUsage = {
     user: "u1",

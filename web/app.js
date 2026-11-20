@@ -459,12 +459,7 @@ for (const id of ["au-action", "au-person"]) {
 let policyMode = "ask";
 
 async function loadSettings() {
-  try {
-    policyMode = (await api("GET", "/api/policy")).policy.mode;
-    $("policy-mode").value = policyMode;
-  } catch (err) {
-    fail(err);
-  }
+  await queuePolicy(loadPolicy);
   loadLicense();
   loadSignIn();
   loadSecrets();
@@ -535,18 +530,123 @@ $("license-box").addEventListener("click", async (e) => {
   loadLicense();
 });
 
+// The global approval policy (ADR 0007, 0049): mode, an action per risky class, the timeout,
+// and rules for all Bots. Each Bot's own settings and rules are edited in the app.
+
+const ACTIONS = { allow: "Allow", ask: "Ask", deny: "Deny" };
+const TOOLS = { "*": "Any tool", shell: "Shell", file: "Files", web: "Web", mcp: "MCP", other: "Other tools" };
+
+// Saves run one at a time, so an older answer never replaces a newer one on screen.
+let policyQueue = Promise.resolve();
+const queuePolicy = (fn) => (policyQueue = policyQueue.then(fn, fn));
+
+// The timeout last shown from the server: a different number in the box is a draft to keep.
+let shownTimeout = null;
+
+function showPolicy(policy, { timeout = false } = {}) {
+  policyMode = policy.mode;
+  $("policy-mode").value = policyMode;
+  const box = $("policy-timeout");
+  if (timeout || box.value === "" || box.value === String(shownTimeout)) box.value = policy.timeoutMinutes;
+  shownTimeout = policy.timeoutMinutes;
+  for (const sel of document.querySelectorAll("#policy-classes select")) sel.value = policy.classes[sel.dataset.class] || "ask";
+}
+
+async function loadPolicy() {
+  let v;
+  try {
+    v = await api("GET", "/api/policy");
+  } catch (err) {
+    fail(err);
+    return;
+  }
+  $("policy-classes").innerHTML = v.classes.map((c) => `<tr>
+      <td>${esc(c.label)}</td>
+      <td><select data-class="${esc(c.id)}" aria-label="${esc(c.label)}">${Object.entries(ACTIONS).map(([a, l]) => `<option value="${a}">${l}</option>`).join("")}</select></td>
+    </tr>`).join("");
+  showPolicy(v.policy);
+  const rules = v.rules || [];
+  $("rules-empty").textContent = "No rules for all Bots.";
+  $("rules-empty").hidden = rules.length > 0;
+  $("rules-rows").innerHTML = rules.map((r) => `<tr data-rule="${esc(r.id)}">
+      <td>${esc(ACTIONS[r.action] || r.action)}</td><td>${esc(TOOLS[r.tool] || r.tool)}</td>
+      <td><code>${esc(r.pattern)}</code></td><td><span class="sub">${esc(r.note || "")}</span></td><td>${esc(fmt(r.at))}</td>
+      <td class="actions"><button type="button" class="btn" data-act="delete">Delete</button></td>
+    </tr>`).join("");
+}
+
+function patchPolicy(patch, done) {
+  return queuePolicy(async () => {
+    try {
+      showPolicy((await api("PUT", "/api/policy", patch)).policy, { timeout: "timeoutMinutes" in patch });
+      notice(done, false);
+    } catch (err) {
+      fail(err);
+      await loadPolicy();
+    }
+  });
+}
+
+$("policy-classes").addEventListener("change", (e) => {
+  const sel = e.target.closest("select[data-class]");
+  if (!sel) return;
+  patchPolicy({ classes: { [sel.dataset.class]: sel.value } }, `${sel.getAttribute("aria-label")}: ${ACTIONS[sel.value]}.`);
+});
+
+$("policy-timeout-save").addEventListener("click", () => {
+  const m = Number($("policy-timeout").value);
+  if (!Number.isInteger(m) || m < 1 || m > 1440) {
+    notice("Use whole minutes from 1 to 1440 (24 hours).");
+    return;
+  }
+  patchPolicy({ timeoutMinutes: m }, `Approvals now wait ${m} minute${m === 1 ? "" : "s"}.`);
+});
+
+$("rule-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const submit = e.target.querySelector("button[type=submit]");
+  if (submit.disabled) return;
+  submit.disabled = true;
+  const body = { action: $("rule-action").value, tool: $("rule-tool").value.trim() || "*", pattern: $("rule-pattern").value.trim() };
+  const note = $("rule-note").value.trim();
+  if (note) body.note = note;
+  queuePolicy(async () => {
+    try {
+      await api("POST", "/api/policy/rules", body);
+      for (const id of ["rule-tool", "rule-pattern", "rule-note"]) $(id).value = "";
+      notice(`${ACTIONS[body.action]} rule added for all Bots.`, false);
+    } catch (err) {
+      fail(err);
+    }
+    await loadPolicy();
+  }).finally(() => { submit.disabled = false; });
+});
+
+$("rules-rows").addEventListener("click", async (e) => {
+  const t = e.target.closest("button[data-act=delete]");
+  if (!t) return;
+  const row = t.closest("tr");
+  if (!confirm(`Delete this rule for all Bots?\n\n${row.querySelector("code").textContent}`)) return;
+  queuePolicy(async () => {
+    try { await api("DELETE", `/api/policy/rules/${key(row.dataset.rule)}`); } catch (err) { fail(err); }
+    await loadPolicy();
+  });
+});
+
 $("policy-mode").addEventListener("change", async (e) => {
   const mode = e.target.value;
   if (mode === "bypass" && !confirm("Let every Bot run risky actions without asking? Use this only on a dev machine.")) {
     e.target.value = policyMode;
     return;
   }
-  try {
-    policyMode = (await api("PUT", "/api/policy", { mode })).policy.mode;
-  } catch (err) {
-    fail(err);
-  }
-  e.target.value = policyMode;
+  queuePolicy(async () => {
+    try {
+      showPolicy((await api("PUT", "/api/policy", { mode })).policy);
+    } catch (err) {
+      fail(err);
+      e.target.value = policyMode;
+    }
+  });
 });
 
 async function loadSignIn() {

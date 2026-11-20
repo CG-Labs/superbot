@@ -26,7 +26,7 @@ describe("billing API (ADR 0042)", () => {
     expect(await billingAvailable(api())).toBe(true);
   });
 
-  it("offers the Plan screen without billing when the server reports usage (ADR 0048)", async () => {
+  it("offers the Plan screen without billing when the server reports usage (ADR 0050)", async () => {
     const fake = (billing: unknown, usage: unknown) => ({
       billing: jest.fn(async () => billing as never),
       myUsage: jest.fn(async () => {

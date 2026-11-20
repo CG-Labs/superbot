@@ -8,6 +8,8 @@ import { BotAvatar } from "./BotAvatar";
 interface Props {
   visible: boolean;
   onClose: () => void;
+  /** Opens the policy editor for all Bots (ADR 0049). */
+  onOpenPolicy?: () => void;
 }
 
 function minutesLeft(a: Approval): string {
@@ -72,7 +74,7 @@ export function ApprovalCard({ approval: a }: { approval: Approval }) {
   );
 }
 
-export function ApprovalsInbox({ visible, onClose }: Props) {
+export function ApprovalsInbox({ visible, onClose, onOpenPolicy }: Props) {
   const { approvals, policy, setGlobalPolicy, can } = useSuperBot();
   const ask = policy?.mode !== "bypass";
 
@@ -102,6 +104,11 @@ export function ApprovalsInbox({ visible, onClose }: Props) {
             />
           </View>
           {!ask ? <Text style={styles.faint}>Bypass: Bots run everything without asking. Dev only.</Text> : null}
+          {onOpenPolicy ? (
+            <Pressable style={styles.row} onPress={onOpenPolicy} accessibilityRole="button">
+              <Text style={styles.link}>{can("admin") ? "Edit risky actions, timeout, and rules ›" : "See risky actions, timeout, and rules ›"}</Text>
+            </Pressable>
+          ) : null}
         </View>
       </View>
     </Modal>
@@ -147,6 +154,7 @@ const styles = StyleSheet.create({
   primary: { backgroundColor: "#f2f2f2", borderColor: "#f2f2f2" },
   primaryText: { color: "#111" },
   dim: { color: colors.textDim },
+  link: { color: colors.blueDot },
   faint: { color: colors.textFaint, fontSize: 13 },
   error: { color: colors.danger },
   empty: { color: colors.textFaint, padding: 12, textAlign: "center" },

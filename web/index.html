@@ -131,7 +131,32 @@
             <option value="bypass">Bypass (dev only)</option>
           </select>
         </label>
+        <label>Unanswered approvals are denied after
+          <input id="policy-timeout" type="number" min="1" max="1440" step="1" class="minutes" /> minutes
+        </label>
+        <button type="button" class="btn" id="policy-timeout-save">Save</button>
       </div>
+      <table class="grid">
+        <thead><tr><th>Risky action</th><th>All Bots</th></tr></thead>
+        <tbody id="policy-classes"></tbody>
+      </table>
+      <h3>Rules for all Bots</h3>
+      <p class="hint">Deny rules refuse a matching call whatever else is set; allow rules skip asking but never override a class set to Deny. Patterns match the command, path, or address: <code>*</code> is any text, <code>?</code> one character. Each Bot's own settings and rules are in the app.</p>
+      <form class="bar" id="rule-form" autocomplete="off">
+        <select id="rule-action">
+          <option value="deny">Deny</option>
+          <option value="allow">Allow</option>
+        </select>
+        <input id="rule-tool" placeholder="Tool: * shell file web mcp, or a name" spellcheck="false" />
+        <input id="rule-pattern" placeholder="Pattern, like git push origin *" required spellcheck="false" maxlength="8000" />
+        <input id="rule-note" placeholder="Note (optional)" maxlength="500" />
+        <button type="submit" class="btn primary">Add rule</button>
+      </form>
+      <table class="grid">
+        <thead><tr><th>Action</th><th>Tool</th><th>Pattern</th><th>Note</th><th>Added</th><th></th></tr></thead>
+        <tbody id="rules-rows"></tbody>
+      </table>
+      <div class="empty" id="rules-empty" hidden></div>
 
       <h2>License</h2>
       <div id="license-box"></div>

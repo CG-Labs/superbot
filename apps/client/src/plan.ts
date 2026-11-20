@@ -38,7 +38,7 @@ function runs(n: number): string {
   return `${num(n)} ${n === 1 ? "run" : "runs"}`;
 }
 
-/** Your usage this billing period, one line each, for the Plan screen (ADR 0048). */
+/** Your usage this billing period, one line each, for the Plan screen (ADR 0050). */
 export function usageLines(u: MyUsage): string[] {
   const t = u.tokens;
   const what = u.period.source === "subscription" ? "Billing period" : "This month";

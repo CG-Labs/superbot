@@ -100,6 +100,37 @@ impl Override {
             self.timeout_minutes = newer.timeout_minutes;
         }
     }
+
+    pub fn is_empty(&self) -> bool {
+        self == &Override::default()
+    }
+}
+
+/// A Bot's patch on top of its override: `parse_patch`, except `null` for `mode`,
+/// `timeoutMinutes`, or a class puts that field back to following the global policy.
+pub fn patch_override(current: &Override, v: &Value) -> Result<Override, String> {
+    let mut out = current.clone();
+    let mut set = v.clone();
+    if let Some(obj) = set.as_object_mut() {
+        if obj.get("mode").is_some_and(Value::is_null) {
+            out.mode = None;
+        }
+        if obj.get("timeoutMinutes").is_some_and(Value::is_null) {
+            out.timeout_minutes = None;
+        }
+        if let Some(cs) = obj.get_mut("classes").and_then(Value::as_object_mut) {
+            let cleared: Vec<String> = cs.iter().filter(|(_, a)| a.is_null()).map(|(k, _)| k.clone()).collect();
+            for k in cleared {
+                if !CLASSES.iter().any(|(c, _)| *c == k) {
+                    return Err(format!("Unknown class \"{k}\""));
+                }
+                out.classes.remove(&k);
+                cs.remove(&k);
+            }
+        }
+    }
+    out.merge(parse_patch(&set)?);
+    Ok(out)
 }
 
 /// Parses `{mode?, classes?: {class: action}, timeoutMinutes?}` from the API.
@@ -243,6 +274,11 @@ impl Call {
 
 const SHOWN_MAX: usize = 4000;
 pub const TRUNCATED: &str = " …[cut]";
+
+/// Room for any remembered call: a shown subject with every character glob-escaped.
+pub const RULE_PATTERN_MAX: usize = 2 * SHOWN_MAX;
+pub const RULE_TOOL_MAX: usize = 200;
+pub const RULE_NOTE_MAX: usize = 500;
 
 /// The command a shell tool runs: `command` or `cmd` (harnesses differ), as text or
 /// argv. An error when there is none, it isn't text, or the two fields disagree.

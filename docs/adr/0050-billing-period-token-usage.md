@@ -1,8 +1,8 @@
-# 0048: Billing-period usage and token metering
+# 0050: Billing-period usage and token metering
 
 ## Status
 
-Accepted (20 Nov 2026). Third slice of billing v0 ([#31](https://github.com/CG-Labs/superbot/issues/31)), after [ADR 0040](0040-billing-v0-tier-limits.md) (tier limits, the Stripe webhook) and [ADR 0042](0042-billing-checkout-portal-customers.md) (checkout, the portal, customers). Builds on [ADR 0033](0033-tiers-model-routing.md) (tiers, `monthlyTokens`).
+Accepted (20 Nov 2026). Merged as 0048 alongside [ADR 0048](0048-teammates-own-os-user-on-machines.md), then renumbered. Third slice of billing v0 ([#31](https://github.com/CG-Labs/superbot/issues/31)), after [ADR 0040](0040-billing-v0-tier-limits.md) (tier limits, the Stripe webhook) and [ADR 0042](0042-billing-checkout-portal-customers.md) (checkout, the portal, customers). Builds on [ADR 0033](0033-tiers-model-routing.md) (tiers, `monthlyTokens`).
 
 ## Context
 
