@@ -16,6 +16,7 @@
       <a href="#machines" data-tab="machines">Machines</a>
       <a href="#audit" data-tab="audit">Audit log</a>
       <a href="#settings" data-tab="settings">Settings</a>
+      <a href="#setup" data-tab="setup">Setup <span class="count" id="setup-count"></span></a>
     </nav>
     <div class="me">
       <a class="btn" href="/app/" target="_blank" rel="noopener" title="Chat, Bots, approvals and screens are in the app">Open the app ↗</a>
@@ -161,6 +162,22 @@
         <tbody id="scim-rows"></tbody>
       </table>
       <div class="empty" id="scim-empty" hidden></div>
+    </section>
+
+    <section id="tab-setup" hidden>
+      <div class="bar">
+        <h2 class="setup-title">Set up this server</h2>
+        <span class="hint setup-state" id="setup-state"></span>
+        <button type="button" class="btn push" id="setup-hide">Hide setup</button>
+        <button type="button" class="btn push" id="setup-unhide" hidden>Show setup to admins again</button>
+      </div>
+      <nav class="steps" id="setup-steps" aria-label="Setup steps"></nav>
+      <div id="setup-body"></div>
+      <div class="empty" id="setup-empty" hidden></div>
+      <div class="bar setup-nav">
+        <button type="button" class="btn" id="setup-back">Back</button>
+        <button type="button" class="btn primary" id="setup-next">Next</button>
+      </div>
     </section>
   </main>
 
