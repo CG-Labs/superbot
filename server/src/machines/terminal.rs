@@ -364,10 +364,12 @@ mod tests {
     use super::*;
 
     /// A stand-in CLI at `path`, run as a login is.
+    // Run through sh rather than exec'ing the script: a parallel test's fork can still hold
+    // the script open for writing, and exec then fails with ETXTBSY.
     fn fake(path: &Path) -> Command {
         Command {
-            bin: Box::leak(path.to_str().unwrap().to_string().into_boxed_str()),
-            args: vec!["auth", "login"],
+            bin: "/bin/sh",
+            args: vec![Box::leak(path.to_str().unwrap().to_string().into_boxed_str()), "auth", "login"],
         }
     }
 

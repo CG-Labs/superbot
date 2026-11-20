@@ -358,6 +358,83 @@ async fn each_users_secrets_reach_only_their_bots() {
     crate::secrets::redact::forget_for(&w.a_id, &value);
 }
 
+/// What the client's personal-secrets screen does (ADR 0044): two people save the same
+/// name, replace and delete theirs, and never touch each other's.
+#[tokio::test]
+async fn personal_secrets_with_the_same_name_stay_apart() {
+    let w = world().await;
+    let port = w.port;
+    let name = "ISO_PERSONAL_API_KEY";
+    let path = format!("/api/me/secrets/{name}");
+    let ada_v = format!("sk-ada-{}", crate::random_hex(12));
+    let bea_v = format!("sk-bea-{}", crate::random_hex(12));
+    let body = |v: &str| json!({ "value": v }).to_string();
+    let env_of = |u: &str| crate::secrets::global().harness_env_for(u).into_iter().find(|(n, _)| n == name).map(|(_, v)| v.expose().to_string());
+
+    let (code, res) = call(port, "PUT", &path, &w.a, &body(&ada_v)).await;
+    assert_eq!(code, 200, "{res}");
+    let saved = parse(&res)["secret"].clone();
+    assert!(saved["name"] == name && saved["createdAt"].is_i64() && saved["updatedAt"].is_i64() && saved["overrides"] == false, "{saved}");
+    assert_eq!(call(port, "PUT", &path, &w.b, &body(&bea_v)).await.0, 200);
+
+    // Each sees and gets only their own.
+    for (who, id, mine, theirs) in [(&w.a, &w.a_id, &ada_v, &bea_v), (&w.b, &w.b_id, &bea_v, &ada_v)] {
+        let (_, list) = call(port, "GET", "/api/me/secrets", who, "").await;
+        assert_eq!(parse(&list)["secrets"].as_array().map(|a| a.len()), Some(1), "{list}");
+        assert!(!list.contains(mine.as_str()) && !list.contains(theirs.as_str()), "{list}");
+        assert_eq!(env_of(id).as_deref(), Some(mine.as_str()));
+    }
+    let (_, admins) = call(port, "GET", "/api/me/secrets", &w.admin, "").await;
+    assert!(!admins.contains(name), "an admin's own list isn't everyone's: {admins}");
+
+    // Ada replaces hers; Bea's stays.
+    let ada_v2 = format!("sk-ada2-{}", crate::random_hex(12));
+    let (code, res) = call(port, "PUT", &path, &w.a, &body(&ada_v2)).await;
+    assert_eq!(code, 200, "{res}");
+    assert_eq!(parse(&res)["secret"]["createdAt"], saved["createdAt"], "replacing keeps when it was first saved");
+    assert_eq!(env_of(&w.a_id).as_deref(), Some(ada_v2.as_str()));
+    assert_eq!(env_of(&w.b_id).as_deref(), Some(bea_v.as_str()));
+
+    // A server-wide secret of the same name: each person's own still wins for their Bots.
+    let server_v = format!("sk-server-{}", crate::random_hex(12));
+    assert_eq!(call(port, "PUT", &format!("/api/secrets/{name}"), &w.admin, &body(&server_v)).await.0, 200);
+    let (_, list) = call(port, "GET", "/api/me/secrets", &w.a, "").await;
+    assert_eq!(parse(&list)["secrets"][0]["overrides"], true, "{list}");
+    assert_eq!(env_of(&w.a_id).as_deref(), Some(ada_v2.as_str()));
+
+    // Bea deletes hers: Ada's is untouched, and Bea's Bots fall back to the server's.
+    assert_eq!(call(port, "DELETE", &path, &w.b, "").await.0, 200);
+    assert_eq!(call(port, "DELETE", &path, &w.b, "").await.0, 404, "already gone, and Ada's isn't hers to delete");
+    assert_eq!(env_of(&w.a_id).as_deref(), Some(ada_v2.as_str()));
+    assert_eq!(env_of(&w.b_id).as_deref(), Some(server_v.as_str()));
+    let (_, list) = call(port, "GET", "/api/me/secrets", &w.b, "").await;
+    assert_eq!(parse(&list)["secrets"], json!([]));
+    assert_eq!(call(port, "DELETE", &format!("/api/secrets/{name}"), &w.admin, "").await.0, 200);
+
+    // Read-only people can see their list but not change it.
+    let (_, viewer) = user_with(port, &w.admin, "rory@example.com", "readonly").await;
+    let (code, list) = call(port, "GET", "/api/me/secrets", &viewer, "").await;
+    assert!(code == 200 && parse(&list)["secrets"] == json!([]), "{code} {list}");
+    assert_eq!(call(port, "PUT", &path, &viewer, &body("x-value")).await.0, 403);
+    assert_eq!(call(port, "DELETE", &path, &viewer, "").await.0, 403);
+
+    // Audited with who did it and whether it replaced a value; never the value.
+    let audit = events(port, &w.admin, "action=secret.*").await;
+    let mine: Vec<_> = audit.iter().filter(|e| e["targetId"] == name && e["details"]["userId"] == w.a_id.as_str()).collect();
+    assert!(mine.iter().any(|e| e["details"]["replaced"] == false) && mine.iter().any(|e| e["details"]["replaced"] == true), "{mine:?}");
+    assert!(mine.iter().all(|e| e["actorEmail"] == "ada@example.com"), "{mine:?}");
+    assert!(audit.iter().any(|e| e["action"] == "secret.deleted" && e["details"]["userId"] == w.b_id.as_str() && e["actorEmail"] == "bea@example.com"));
+    let text = serde_json::to_string(&audit).unwrap();
+    for v in [&ada_v, &ada_v2, &bea_v, &server_v] {
+        assert!(!text.contains(v.as_str()), "a value reached the audit log");
+    }
+
+    crate::secrets::global().user_forget(&w.a_id).unwrap();
+    for (u, v) in [(&w.a_id, &ada_v), (&w.a_id, &ada_v2), (&w.b_id, &bea_v)] {
+        crate::secrets::redact::forget_for(u, v);
+    }
+}
+
 #[tokio::test]
 async fn each_users_bots_work_in_their_own_folder() {
     let w = world().await;

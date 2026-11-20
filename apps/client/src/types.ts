@@ -95,6 +95,16 @@ export interface BillingView {
   canChange: boolean;
 }
 
+/** One of your own secrets, as `/api/me/secrets` lists it (ADR 0029, 0044). Never the value. */
+export interface PersonalSecret {
+  name: string;
+  /** Unix seconds. Older servers send only `updatedAt`. */
+  createdAt?: number;
+  updatedAt: number;
+  /** The server has a secret of this name for every Bot; yours wins for your Bots. */
+  overrides?: boolean;
+}
+
 export type Visibility = "private" | "shared";
 /** Each level includes the ones before it. */
 export type BotAccess = "view" | "operate" | "manage";
