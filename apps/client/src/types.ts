@@ -193,6 +193,43 @@ export interface UserBots {
   }[];
 }
 
+/** One row of `/api/audit` (ADR 0009, 0019). Admins only. Actor fields are null on rows from before ADR 0019. */
+export interface AuditEvent {
+  id: number;
+  /** Unix ms. */
+  at: number;
+  /** `at` as RFC 3339 UTC. */
+  time: string;
+  actorKind: "user" | "bot" | "system";
+  actorId?: string | null;
+  actorName?: string | null;
+  /** The IdP subject, `<issuer>|<sub>`, after an SSO sign-in. */
+  actorSubject?: string | null;
+  action: string;
+  targetType?: string | null;
+  targetId?: string | null;
+  botId?: string | null;
+  outcome: "success" | "failure" | "denied";
+  ip?: string | null;
+  userAgent?: string | null;
+  details?: Record<string, unknown> | null;
+  actorEmail?: string | null;
+  actorRole?: string | null;
+  /** "password" (break-glass), "code", "sso", "none", or "bot_token". */
+  authMethod?: string | null;
+  idp?: string | null;
+  idpProvider?: string | null;
+  sessionId?: string | null;
+  /** The user a Bot or the scheduler acted for. */
+  onBehalfOf?: string | null;
+}
+
+/** `GET /api/audit`: newest first. Pass `nextBefore` back as `before` for the next page. */
+export interface AuditPage {
+  events: AuditEvent[];
+  nextBefore: number | null;
+}
+
 /** `/api/state` `me`. Servers from before ADR 0012 send only the name. */
 export interface Me {
   name: string;
