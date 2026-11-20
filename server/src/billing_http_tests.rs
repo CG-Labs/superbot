@@ -394,31 +394,45 @@ async fn signed_subscription_events_set_the_users_tier() {
     assert_eq!(audit(port, admin, "action=billing.event_ignored").await[0]["details"]["reason"], "subscription_of_another_user");
     assert_eq!((tier(&w.a_id), tier(&w.b_id)), (None, None));
 
-    // Bea moves from one subscription to another; the old one's cancellation, arriving
-    // after, doesn't undo the new one. One whose first payment hasn't gone through changes nothing.
+    // Bea moves to a subscription started after her first. The old one's events, late or
+    // not, don't undo the move. One whose first payment hasn't gone through changes nothing.
     let pro = event(UPDATED, &w.b_id, "evt_6", 1_795_300_000, |v| v["data"]["object"]["id"] = json!("sub_test_bea_1"));
     assert_eq!(deliver(port, &pro, None).await.1["outcome"], "tier_changed");
     let starter = event(UPDATED, &w.b_id, "evt_7", 1_795_300_100, |v| {
         v["data"]["object"]["id"] = json!("sub_test_bea_2");
+        v["data"]["object"]["created"] = json!(1_795_300_090);
         v["data"]["object"]["items"]["data"][0]["price"]["id"] = json!("price_starter_monthly");
     });
     assert_eq!(deliver(port, &starter, None).await.1["outcome"], "tier_changed");
     assert_eq!(tier(&w.b_id).as_deref(), Some("starter"));
+    // An update to the old one made after the move, still active: recorded, but the newer plan stands.
+    let late = event(UPDATED, &w.b_id, "evt_8a", 1_795_300_150, |v| v["data"]["object"]["id"] = json!("sub_test_bea_1"));
+    assert_eq!(deliver(port, &late, None).await.1["outcome"], "superseded");
+    assert_eq!(tier(&w.b_id).as_deref(), Some("starter"));
     let old_gone = event(DELETED, &w.b_id, "evt_8", 1_795_300_200, |v| v["data"]["object"]["id"] = json!("sub_test_bea_1"));
     assert_eq!(deliver(port, &old_gone, None).await.1["outcome"], "superseded");
     assert_eq!(tier(&w.b_id).as_deref(), Some("starter"));
-    // A late update to the old one, from before the move, doesn't bring back its plan.
-    let late = event(UPDATED, &w.b_id, "evt_8b", 1_795_300_050, |v| v["data"]["object"]["id"] = json!("sub_test_bea_1"));
-    assert_eq!(deliver(port, &late, None).await.1["outcome"], "superseded");
+    // One from before that cancellation, arriving after it, is stale.
+    let later = event(UPDATED, &w.b_id, "evt_8b", 1_795_300_180, |v| v["data"]["object"]["id"] = json!("sub_test_bea_1"));
+    assert_eq!(deliver(port, &later, None).await.1["outcome"], "stale");
     assert_eq!(tier(&w.b_id).as_deref(), Some("starter"));
     assert_eq!(app.db.subscription(&w.b_id).unwrap().subscription_id, "sub_test_bea_2");
     // Ada's old plan is cancelled after her new one starts, but the cancellation arrives
     // first: the new one still applies.
     let cancelled = event(DELETED, &w.a_id, "evt_10", 1_795_400_100, |_| {});
     assert_eq!(deliver(port, &cancelled, None).await.1["outcome"], "unchanged");
-    let replacement = event(UPDATED, &w.a_id, "evt_11", 1_795_400_000, |v| v["data"]["object"]["id"] = json!("sub_test_ada_2"));
+    let replacement = event(UPDATED, &w.a_id, "evt_11", 1_795_400_000, |v| {
+        v["data"]["object"]["id"] = json!("sub_test_ada_2");
+        v["data"]["object"]["created"] = json!(1_795_399_000);
+    });
     assert_eq!(deliver(port, &replacement, None).await.1["outcome"], "tier_changed");
     assert_eq!(tier(&w.a_id).as_deref(), Some("pro"));
+    // Once the new one ends too, a late active event for the old one doesn't bring it back.
+    let new_gone = event(DELETED, &w.a_id, "evt_12", 1_795_500_000, |v| v["data"]["object"]["id"] = json!("sub_test_ada_2"));
+    assert_eq!(deliver(port, &new_gone, None).await.1["outcome"], "tier_changed");
+    let old_late = event(UPDATED, &w.a_id, "evt_13", 1_795_400_050, |_| {});
+    assert_eq!(deliver(port, &old_late, None).await.1["outcome"], "stale");
+    assert_eq!(tier(&w.a_id), None);
     let incomplete = event(UPDATED, &w.b_id, "evt_9", 1_795_300_300, |v| {
         v["data"]["object"]["id"] = json!("sub_test_bea_2");
         v["data"]["object"]["status"] = json!("incomplete");

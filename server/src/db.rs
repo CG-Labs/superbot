@@ -150,7 +150,8 @@ fn message_row(r: &Row) -> rusqlite::Result<Message> {
     })
 }
 
-/// A user's subscription at a payment provider (ADR 0040). One per user.
+/// A subscription at a payment provider (ADR 0040). Every one a user has had is kept,
+/// ended ones too, so a late event for one is judged against its own history.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Subscription {
@@ -164,6 +165,9 @@ pub struct Subscription {
     pub tier: Option<String>,
     /// End of the paid period, Unix seconds.
     pub period_end: Option<i64>,
+    /// When the provider created the subscription, Unix seconds. Of a user's paying
+    /// subscriptions, the one started last sets their tier.
+    pub started: i64,
     /// When the provider made the last event applied, Unix seconds.
     pub event_created: i64,
     #[serde(skip)]
@@ -180,9 +184,20 @@ fn subscription_row(r: &Row) -> rusqlite::Result<Subscription> {
         price_id: r.get("price_id")?,
         tier: r.get("tier")?,
         period_end: r.get("period_end")?,
+        started: r.get("started")?,
         event_created: r.get("event_created")?,
         updated_at: r.get("updated_at")?,
     })
+}
+
+/// The user's paying subscription started last: the one that sets their tier.
+fn paying_subscription(c: &Connection, user_id: &str) -> rusqlite::Result<Option<Subscription>> {
+    c.query_row(
+        "SELECT * FROM subscriptions WHERE user_id = ? AND tier IS NOT NULL ORDER BY started DESC, subscription_id DESC LIMIT 1",
+        [user_id],
+        subscription_row,
+    )
+    .optional()
 }
 
 /// What a payment-provider event did (`Db::apply_subscription`).
@@ -190,6 +205,7 @@ fn subscription_row(r: &Row) -> rusqlite::Result<Subscription> {
 pub enum Applied {
     Duplicate,
     Stale,
+    /// Recorded, but another subscription of the user's sets their tier.
     Superseded,
     /// The subscription belongs to another user.
     OtherUser,
@@ -958,9 +974,9 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 15] = [
     migrate_billing,
 ];
 
-/// Billing v0 (ADR 0040): routine runs counted per user and UTC day, each user's Stripe
-/// subscription, and the Stripe event ids already applied, so a redelivered event
-/// changes nothing. Keyed by user, so every query names one.
+/// Billing v0 (ADR 0040): routine runs counted per user and UTC day, every Stripe
+/// subscription with its user, and the Stripe event ids already applied, so a
+/// redelivered event changes nothing.
 fn migrate_billing(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
     c.execute_batch(
         "CREATE TABLE IF NOT EXISTS usage_daily (
@@ -971,17 +987,19 @@ fn migrate_billing(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
           PRIMARY KEY (user_id, day)
         );
         CREATE TABLE IF NOT EXISTS subscriptions (
-          user_id TEXT PRIMARY KEY REFERENCES users(id),
+          subscription_id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id),
           provider TEXT NOT NULL,
           customer_id TEXT,
-          subscription_id TEXT NOT NULL UNIQUE,
           status TEXT NOT NULL,
           price_id TEXT,
           tier TEXT,
           period_end INTEGER,
+          started INTEGER NOT NULL,
           event_created INTEGER NOT NULL,
           updated_at INTEGER NOT NULL
         );
+        CREATE INDEX IF NOT EXISTS subscriptions_user ON subscriptions (user_id);
         CREATE TABLE IF NOT EXISTS billing_events (
           event_id TEXT PRIMARY KEY,
           type TEXT NOT NULL,
@@ -2151,23 +2169,31 @@ impl Db {
 
     // Billing (ADR 0040)
 
+    /// The subscription that sets the user's tier (`paying_subscription`), else the one
+    /// with the latest event, to show how it ended.
     pub fn subscription(&self, user_id: &str) -> Option<Subscription> {
-        self.c().query_row("SELECT * FROM subscriptions WHERE user_id = ?", [user_id], subscription_row).optional().ok().flatten()
+        let c = self.c();
+        paying_subscription(&c, user_id)
+            .ok()
+            .flatten()
+            .or_else(|| c.query_row("SELECT * FROM subscriptions WHERE user_id = ? ORDER BY event_created DESC, started DESC LIMIT 1", [user_id], subscription_row).optional().ok().flatten())
     }
 
     pub fn subscription_by_id(&self, subscription_id: &str) -> Option<Subscription> {
         self.c().query_row("SELECT * FROM subscriptions WHERE subscription_id = ?", [subscription_id], subscription_row).optional().ok().flatten()
     }
 
-    /// Applies one payment-provider event to a user's subscription, in one transaction:
-    /// records the event id (a redelivery is `Duplicate`), skips events older than the
-    /// last one applied to the subscription (`Stale`), keeps the subscription row, and,
-    /// when `set_tier`, sets `users.tier` to `sub.tier` (None: the default tier). An
-    /// event for a subscription that isn't the user's current one changes nothing when it
-    /// ends that subscription, or when it is older than the current one and the current
-    /// one hasn't ended (`Superseded`): a late event for an old plan can't undo a move to
-    /// a new one, and a new plan still applies after the old one's cancellation.
-    pub fn apply_subscription(&self, event_id: &str, event_type: &str, sub: &Subscription, set_tier: bool, ending: bool) -> Result<Applied, String> {
+    /// Applies one payment-provider event, in one transaction: records the event id (a
+    /// redelivery is `Duplicate`), skips events older than the last one applied to the
+    /// same subscription (`Stale`), and keeps the subscription's latest state. The
+    /// user's tier is then that of their paying subscription started last (None, the
+    /// default tier, when nothing pays); `users.tier` is set to it when this event
+    /// changed which one that is, or is for that one. An event for any other
+    /// subscription is `Superseded`. So the outcome doesn't depend on the order events
+    /// arrive in: a late event for a replaced plan can't bring it back, and a new plan
+    /// applies whenever the old one's cancellation arrives. `set_tier` false (a
+    /// subscription not paid for yet) records it without changing any tier.
+    pub fn apply_subscription(&self, event_id: &str, event_type: &str, sub: &Subscription, set_tier: bool) -> Result<Applied, String> {
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
         let new = tx
@@ -2177,31 +2203,37 @@ impl Db {
             return Ok(Applied::Duplicate);
         }
         let by_id = tx.query_row("SELECT * FROM subscriptions WHERE subscription_id = ?", [&sub.subscription_id], subscription_row).optional().map_err(|e| e.to_string())?;
-        let mine = tx.query_row("SELECT * FROM subscriptions WHERE user_id = ?", [&sub.user_id], subscription_row).optional().map_err(|e| e.to_string())?;
         let outcome = if by_id.as_ref().is_some_and(|s| s.user_id != sub.user_id) {
             Applied::OtherUser
         } else if by_id.as_ref().is_some_and(|s| sub.event_created < s.event_created) {
             Applied::Stale
-        } else if mine.as_ref().is_some_and(|s| {
-            let live = !crate::billing::ENDED.contains(&s.status.as_str());
-            s.subscription_id != sub.subscription_id && (ending || (live && sub.event_created < s.event_created))
-        }) {
-            Applied::Superseded
         } else {
+            let paying_id = |s: &Option<Subscription>| s.as_ref().map(|s| s.subscription_id.clone());
+            let before = paying_subscription(&tx, &sub.user_id).map_err(|e| e.to_string())?;
+            let tier = if set_tier { sub.tier.clone() } else { by_id.and_then(|s| s.tier) };
             tx.execute(
-                "INSERT INTO subscriptions (user_id, provider, customer_id, subscription_id, status, price_id, tier, period_end, event_created, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                 ON CONFLICT (user_id) DO UPDATE SET provider = ?2, customer_id = ?3, subscription_id = ?4, status = ?5, price_id = ?6,
-                   tier = ?7, period_end = ?8, event_created = ?9, updated_at = ?10",
-                params![sub.user_id, sub.provider, sub.customer_id, sub.subscription_id, sub.status, sub.price_id, sub.tier, sub.period_end, sub.event_created, now()],
+                "INSERT INTO subscriptions (subscription_id, user_id, provider, customer_id, status, price_id, tier, period_end, started, event_created, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT (subscription_id) DO UPDATE SET provider = ?3, customer_id = ?4, status = ?5, price_id = ?6,
+                   tier = ?7, period_end = ?8, event_created = ?10, updated_at = ?11",
+                params![sub.subscription_id, sub.user_id, sub.provider, sub.customer_id, sub.status, sub.price_id, tier, sub.period_end, sub.started, sub.event_created, now()],
             )
             .map_err(|e| e.to_string())?;
-            let from: Option<String> = tx.query_row("SELECT tier FROM users WHERE id = ?", [&sub.user_id], |r| r.get(0)).map_err(|e| e.to_string())?;
-            if set_tier && from != sub.tier {
-                tx.execute("UPDATE users SET tier = ?, updated_at = ? WHERE id = ?", params![sub.tier, now(), sub.user_id]).map_err(|e| e.to_string())?;
-                Applied::Changed { from, to: sub.tier.clone() }
-            } else {
+            let after = paying_subscription(&tx, &sub.user_id).map_err(|e| e.to_string())?;
+            let moved = paying_id(&before) != paying_id(&after);
+            let to = after.as_ref().and_then(|s| s.tier.clone());
+            if after.as_ref().is_some_and(|s| s.subscription_id != sub.subscription_id) && !moved {
+                Applied::Superseded
+            } else if !set_tier && !moved {
                 Applied::Unchanged
+            } else {
+                let from: Option<String> = tx.query_row("SELECT tier FROM users WHERE id = ?", [&sub.user_id], |r| r.get(0)).map_err(|e| e.to_string())?;
+                if from != to {
+                    tx.execute("UPDATE users SET tier = ?, updated_at = ? WHERE id = ?", params![to, now(), sub.user_id]).map_err(|e| e.to_string())?;
+                    Applied::Changed { from, to }
+                } else {
+                    Applied::Unchanged
+                }
             }
         };
         tx.commit().map_err(|e| e.to_string())?;
@@ -3268,6 +3300,52 @@ mod tests {
         let won = threads.into_iter().map(|t| t.join().unwrap()).filter(|ok| *ok).count();
         assert_eq!((won, db.owned_bot_count(&u.id)), (3, 3));
         assert!(db.create_bot_capped("B", "#fff", "waddle", "claude", None, false, &other.id, Visibility::Private, None).is_some());
+    }
+
+    #[test]
+    fn subscription_events_end_in_the_same_tier_whatever_order_they_arrive_in() {
+        fn orders(n: usize) -> Vec<Vec<usize>> {
+            if n == 0 {
+                return vec![vec![]];
+            }
+            orders(n - 1)
+                .into_iter()
+                .flat_map(|o| {
+                    (0..n).map(move |i| {
+                        let mut o = o.clone();
+                        o.insert(i, n - 1);
+                        o
+                    })
+                })
+                .collect()
+        }
+        let db = Db::open(&temp_path("sub-order").join("app.sqlite")).unwrap();
+        // Plan A (pro) started at 10, was updated at 25 and cancelled at 30. Plan B
+        // (starter) started at 20, replacing it, and was cancelled at 40.
+        let events = [("a", "active", Some("pro"), 10, 10), ("b", "active", Some("starter"), 20, 20), ("a", "active", Some("pro"), 10, 25), ("a", "canceled", None, 10, 30), ("b", "canceled", None, 20, 40)];
+        for (picked, want) in [(&[0, 1, 2, 3][..], Some("starter")), (&[0, 1, 2, 3, 4][..], None), (&[0, 1, 2, 4][..], Some("pro"))] {
+            for order in orders(picked.len()) {
+                let u = db.create_user(None, None, "Payer", Role::Member).unwrap();
+                for (n, &i) in order.iter().enumerate() {
+                    let (plan, status, tier, started, at) = events[picked[i]];
+                    let s = Subscription {
+                        user_id: u.id.clone(),
+                        provider: "stripe".into(),
+                        customer_id: None,
+                        subscription_id: format!("{}-{plan}", u.id),
+                        status: status.into(),
+                        price_id: None,
+                        tier: tier.map(String::from),
+                        period_end: None,
+                        started,
+                        event_created: at,
+                        updated_at: 0,
+                    };
+                    db.apply_subscription(&format!("{}-{n}", u.id), "customer.subscription.updated", &s, true).unwrap();
+                }
+                assert_eq!(db.user(&u.id).unwrap().tier.as_deref(), want, "events {picked:?} in order {order:?}");
+            }
+        }
     }
 
     #[test]

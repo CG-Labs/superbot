@@ -178,6 +178,7 @@ struct Sub<'a> {
     user: Option<&'a str>,
     prices: Vec<&'a str>,
     period_end: Option<i64>,
+    created: Option<i64>,
 }
 
 fn read_sub(o: &Value) -> Option<Sub<'_>> {
@@ -189,6 +190,7 @@ fn read_sub(o: &Value) -> Option<Sub<'_>> {
         user: o["metadata"][USER_KEY].as_str().map(str::trim).filter(|s| !s.is_empty()),
         prices: items.iter().filter_map(|i| i["price"]["id"].as_str()).collect(),
         period_end: o["current_period_end"].as_i64().or_else(|| items.iter().find_map(|i| i["current_period_end"].as_i64())),
+        created: o["created"].as_i64(),
     })
 }
 
@@ -231,6 +233,7 @@ fn subscription_event(app: &App, event_id: &str, kind: &str, event: &Value) -> R
         // `incomplete`: the first payment hasn't gone through. Nothing changes yet.
         (None, false)
     };
+    let created = event["created"].as_i64().unwrap_or(0);
     let row = Subscription {
         user_id: user.clone(),
         provider: "stripe".into(),
@@ -240,10 +243,11 @@ fn subscription_event(app: &App, event_id: &str, kind: &str, event: &Value) -> R
         price_id: priced.map(|(p, _)| p.to_string()).or_else(|| sub.prices.first().map(|p| p.to_string())),
         tier: tier.clone(),
         period_end: sub.period_end,
-        event_created: event["created"].as_i64().unwrap_or(0),
+        started: sub.created.or(known.as_ref().map(|s| s.started)).unwrap_or(created),
+        event_created: created,
         updated_at: 0,
     };
-    let applied = app.db.apply_subscription(event_id, kind, &row, set_tier, ending)?;
+    let applied = app.db.apply_subscription(event_id, kind, &row, set_tier)?;
     let details = json!({ "eventId": event_id, "type": kind, "subscription": sub.id, "status": row.status, "price": row.price_id, "tier": tier });
     let by = system(Some(&user));
     let outcome = match applied {
