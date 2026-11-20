@@ -49,6 +49,8 @@ export interface BotView {
   tier?: TierBadge;
   /** Admins only: the route this Bot's runs take. */
   route?: { harness: string; provider?: string; model?: string | null; effort?: string };
+  /** Admins only: the harnesses the owner's plan allows, for editing someone else's Bot. */
+  harnesses?: string[];
 }
 
 export interface TierBadge {

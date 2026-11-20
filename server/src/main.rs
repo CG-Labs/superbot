@@ -1180,14 +1180,11 @@ async fn list_tiers(State(app): State<AppState>) -> Json<Value> {
 
 /// The Bot settings must fit the owner's tier: harness, model, and effort, and on
 /// create a free Bot slot (ADR 0033). Admins too: the tier is the routing table.
-fn check_tier(app: &App, owner_id: &str, harness: &str, model: Option<&str>, effort: Option<&str>, new_bot: bool) -> Res<()> {
-    let tier = app.tier_of(owner_id);
-    tier.check(harness, model, effort).map_err(|e| ApiError(StatusCode::FORBIDDEN, e))?;
-    if let Some(max) = tier.limits.max_bots.filter(|max| new_bot && app.db.owned_bot_count(owner_id) >= *max) {
-        return Err(ApiError(StatusCode::FORBIDDEN, format!("The {} plan allows {max} Bots, and they're all in use. Delete one first.", tier.label)));
-    }
-    Ok(())
+/// `current` is the Bot's model when only its effort changes.
+fn check_tier(app: &App, owner_id: &str, harness: &str, model: Option<&str>, effort: Option<&str>, current: Option<&str>) -> Res<()> {
+    app.tier_of(owner_id).check(harness, model, effort, current).map_err(|e| ApiError(StatusCode::FORBIDDEN, e))
 }
+
 
 async fn list_bots(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>) -> Json<Value> {
     Json(json!(visible_bots(&app, &c, &by)))
@@ -1323,17 +1320,23 @@ async fn create_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
         (None, _) => users::OPERATOR.into(),
     };
     let harness = p.harness.unwrap_or_else(|| default_harness_for(&app, &owner));
-    check_tier(&app, &owner, &harness, p.model.clone().flatten().as_deref(), p.effort.clone().flatten().as_deref(), true)?;
-    let bot = app.db.create_bot_owned(
-        &name,
-        p.color.as_deref().unwrap_or(pick(&COLORS)),
-        p.shape.as_deref().unwrap_or(pick(&SHAPES)),
-        &harness,
-        p.model.flatten().as_deref(),
-        false,
-        &owner,
-        visibility,
-    );
+    check_tier(&app, &owner, &harness, p.model.clone().flatten().as_deref(), p.effort.clone().flatten().as_deref(), None)?;
+    let tier = app.tier_of(&owner);
+    let max = tier.limits.max_bots;
+    let bot = app
+        .db
+        .create_bot_capped(
+            &name,
+            p.color.as_deref().unwrap_or(pick(&COLORS)),
+            p.shape.as_deref().unwrap_or(pick(&SHAPES)),
+            &harness,
+            p.model.flatten().as_deref(),
+            false,
+            &owner,
+            visibility,
+            max,
+        )
+        .ok_or_else(|| ApiError(StatusCode::FORBIDDEN, format!("The {} plan allows {} Bots, and they're all in use. Delete one first.", tier.label, max.unwrap_or(0))))?;
     app.init_bot_files(&bot);
     app.push_bot(&bot.id);
     let details = json!({ "name": bot.name, "harness": bot.harness, "model": bot.model, "owner": bot.owner_id, "visibility": bot.visibility });
@@ -1375,8 +1378,9 @@ async fn update_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
     if p.harness.is_some() || p.model.is_some() || p.effort.is_some() {
         // Only what's changing is checked against the tier: a Bot set up before its
         // owner's tier changed can still be renamed, and runs on the tier's route anyway.
+        let current = model.clone();
         let (model, effort) = (p.model.is_some().then_some(model).flatten(), p.effort.is_some().then_some(effort).flatten());
-        check_tier(&app, &bot.owner_id, &harness, model.as_deref(), effort.as_deref(), false)?;
+        check_tier(&app, &bot.owner_id, &harness, model.as_deref(), effort.as_deref(), current.as_deref())?;
     }
     app.db.update_bot(&id, p);
     app.push_bot(&id);
@@ -1469,13 +1473,6 @@ async fn update_access(State(app): State<AppState>, Extension(c): Extension<Call
             if !u.active() {
                 return Err(bad("That user is disabled"));
             }
-            if u.id != bot.owner_id {
-                // It takes one of the new owner's Bot slots; its harness and model they can change after.
-                let tier = app.tier_of(&u.id);
-                if let Some(max) = tier.limits.max_bots.filter(|max| app.db.owned_bot_count(&u.id) >= *max) {
-                    return Err(ApiError(StatusCode::FORBIDDEN, format!("{}'s plan ({}) allows {max} Bots, and they're all in use.", u.name, tier.label)));
-                }
-            }
             Some(u)
         }
     };
@@ -1483,20 +1480,30 @@ async fn update_access(State(app): State<AppState>, Extension(c): Extension<Call
         return Err(bad("Send visibility or owner"));
     }
     let mut narrowed = false;
-    if let Some(to) = visibility.filter(|to| *to != bot.visibility) {
-        app.db.set_bot_visibility(&id, to);
-        app.db.record(&by.event("bot.visibility_changed").target("bot", &id).bot(&id).details(json!({ "from": bot.visibility, "to": to })));
-        narrowed |= to == Visibility::Private;
-    }
+    // The owner first: it can be refused for the new owner's Bot limit.
     if let Some(u) = owner.filter(|u| u.id != bot.owner_id) {
+        // It takes one of the new owner's Bot slots; its harness and model they can change after.
+        let tier = app.tier_of(&u.id);
+        let max = tier.limits.max_bots;
+        let full = || ApiError(StatusCode::FORBIDDEN, format!("{}'s plan ({}) allows {} Bots, and they're all in use.", u.name, tier.label, max.unwrap_or(0)));
+        if max.is_some_and(|max| app.db.owned_bot_count(&u.id) >= max) {
+            return Err(full());
+        }
         // Work started for the old owner runs in their folder with their keys; it
         // ends here, and its token stops working (it names the old owner).
         app.stop(&id);
-        app.db.set_bot_owner(&id, &u.id);
+        if !app.db.set_bot_owner_capped(&id, &u.id, max) {
+            return Err(full());
+        }
         // The new owner manages it anyway; a leftover grant would only confuse.
         app.db.remove_grant(&id, &u.id);
         app.db.record(&by.event("bot.owner_changed").target("bot", &id).bot(&id).details(json!({ "from": bot.owner_id, "to": u.id })));
         narrowed = true;
+    }
+    if let Some(to) = visibility.filter(|to| *to != bot.visibility) {
+        app.db.set_bot_visibility(&id, to);
+        app.db.record(&by.event("bot.visibility_changed").target("bot", &id).bot(&id).details(json!({ "from": bot.visibility, "to": to })));
+        narrowed |= to == Visibility::Private;
     }
     acl_changed(&app, &id, narrowed).await;
     let after = need_bot(&app, &id)?;

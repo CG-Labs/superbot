@@ -153,6 +153,15 @@ async fn nobody_sets_a_model_outside_their_tier() {
     let mine = parse(&list).as_array().unwrap().iter().find(|b| b["id"] == id.as_str()).cloned().unwrap();
     assert_eq!(mine["route"], json!({ "harness": "claude", "model": "claude-haiku-4-5", "effort": "low" }));
     assert!(mine.get("model").is_some(), "{mine}");
+    // An admin editing Ada's Bot is offered her tier's installed harnesses, not their own.
+    let installed = |of: &[&str]| json!(adapters::installed().into_iter().filter(|h| of.contains(h)).collect::<Vec<_>>());
+    assert_eq!(set_tier(&w, &w.a_id, json!("pro")).await.0, 200);
+    let (_, list) = call(port, "GET", "/api/bots", &w.admin, "").await;
+    let mine = parse(&list).as_array().unwrap().iter().find(|b| b["id"] == id.as_str()).cloned().unwrap();
+    assert_eq!(mine["harnesses"], installed(&["claude", "hermes"]));
+    let (_, state) = call(port, "GET", "/api/state", &w.admin, "").await;
+    assert_eq!(parse(&state)["harnesses"], installed(&["claude"]), "the admin's own tier, starter");
+    assert_eq!(set_tier(&w, &w.a_id, Value::Null).await.0, 200);
     let (_, models) = call(port, "GET", "/api/harnesses/claude/models?tier=pro", &w.admin, "").await;
     let ids: Vec<String> = parse(&models).as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap().to_string()).collect();
     assert_eq!(ids, ["claude-sonnet-4-5", "claude-opus-4-1"]);
@@ -186,8 +195,13 @@ async fn every_run_takes_the_owners_tier_route() {
     // Pro has that model: now it runs on it, at the route's effort.
     assert_eq!(set_tier(&w, &w.a_id, json!("pro")).await.0, 200);
     assert_eq!(run(port, app, &w.a, &bot.id).await, "model=claude-opus-4-1 effort=high");
+    // An effort alone is checked against the route of the model the Bot keeps.
+    let path = format!("/api/bots/{}", bot.id);
+    assert_eq!(call(port, "PATCH", &path, &w.a, r#"{"effort":"high"}"#).await.0, 200);
+    assert_eq!(call(port, "PATCH", &path, &w.a, r#"{"effort":"low"}"#).await.0, 403);
     // Self-host: exactly the Bot's settings.
     assert_eq!(set_tier(&w, &w.a_id, json!("self-host")).await.0, 200);
+    assert_eq!(call(port, "PATCH", &path, &w.a, r#"{"effort":"max"}"#).await.0, 200);
     assert_eq!(run(port, app, &w.a, &bot.id).await, "model=claude-opus-4-1 effort=max");
     assert_eq!(set_tier(&w, &w.a_id, Value::Null).await.0, 200);
 

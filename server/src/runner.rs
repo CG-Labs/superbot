@@ -117,7 +117,10 @@ impl App {
     pub fn bot_admin_fields(&self, b: &Bot, v: &mut Value) {
         v["model"] = json!(b.model);
         v["effort"] = json!(b.effort);
-        match self.tier_of(&b.owner_id).route(&b.harness, b.model.as_deref(), b.effort.as_deref()) {
+        let tier = self.tier_of(&b.owner_id);
+        // Admins edit others' Bots, whose owners' tiers may offer other harnesses than theirs.
+        v["harnesses"] = json!(crate::adapters::installed().into_iter().filter(|h| tier.allows_harness(h)).collect::<Vec<_>>());
+        match tier.route(&b.harness, b.model.as_deref(), b.effort.as_deref()) {
             Ok(r) => v["route"] = json!(r),
             Err(e) => v["routeError"] = json!(e),
         }

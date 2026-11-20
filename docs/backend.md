@@ -253,7 +253,7 @@ All JSON. Auth: a session cookie (web app) or `Authorization: Bearer <session to
 
 - `GET /api/state`: user name, installed harnesses, the Bots you can see, global policy, pending approvals on those Bots. Each Bot's `handoff` is the id of its unanswered handoff card, or null; `owner` is `{id, name}`, `visibility` is `private` or `shared`, and `access` is yours: `view`, `operate`, or `manage`.
 - `GET /api/events`: SSE stream (`message`, `draft`, `status`, `bot`, `botDeleted`, `approval`, `policy`, `resync`), only about Bots you can see
-- `POST /api/bots` `{name, harness?, model?, color?, shape?, visibility?}`: you own it; shared unless `visibility` is `private`. 403 outside your tier's routes or past its `maxBots`. Each Bot has `tier: {name, label, managed}`; on a managed tier `model` and `effort` go to admins only, with `route`
+- `POST /api/bots` `{name, harness?, model?, color?, shape?, visibility?}`: you own it; shared unless `visibility` is `private`. 403 outside your tier's routes or past its `maxBots`. Each Bot has `tier: {name, label, managed}`; on a managed tier `model` and `effort` go to admins only, with `route` and `harnesses` (the owner's tier's)
 - `PATCH /api/bots/:id` `{name?, hidden?, harness?, model?, effort?}`, `DELETE /api/bots/:id`: owner or admin
 - `GET /api/bots/:id/access` → `{botId, owner, visibility, access, grants?}` (grants for the owner and admins). `PATCH` `{visibility?, owner?}` (owner: admins only)
 - `PUT /api/bots/:id/grants/:user` `{level: viewer|operator}`, `DELETE /api/bots/:id/grants/:user`: owner or admin; `:user` is an id or email

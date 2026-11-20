@@ -85,12 +85,13 @@ impl Tier {
     }
 
     /// Whether a Bot owned by this tier's user may be set to these. Leaving the model
-    /// or effort out is always fine: the tier picks.
-    pub fn check(&self, harness: &str, model: Option<&str>, effort: Option<&str>) -> Result<(), String> {
+    /// or effort out is always fine: the tier picks. `current` is the Bot's model when
+    /// the model isn't changing, so an effort is checked against that model's route.
+    pub fn check(&self, harness: &str, model: Option<&str>, effort: Option<&str>, current: Option<&str>) -> Result<(), String> {
         if !self.managed() {
             return Ok(());
         }
-        let route = self.route(harness, model, effort)?;
+        let route = self.route(harness, model.or(current), effort)?;
         if model.is_some() && route.model.as_deref() != model {
             return Err(format!("The {} plan doesn't include that model. The plan picks the model.", self.label));
         }
@@ -334,7 +335,7 @@ mod tests {
         // Anything goes, exactly as the Bot is set: today's behaviour.
         let r = d.route("codex", Some("gpt-5-codex"), Some("high")).unwrap();
         assert_eq!(r, Route { harness: "codex".into(), provider: None, model: Some("gpt-5-codex".into()), effort: Some("high".into()) });
-        assert!(d.check("pi", Some("anything/at-all"), Some("max")).is_ok());
+        assert!(d.check("pi", Some("anything/at-all"), Some("max"), None).is_ok());
         assert!(Tiers::from_env(|k| if k == "DEFAULT_TIER" { "self-host".into() } else { String::new() }).is_ok());
         let e = Tiers::from_env(|k| if k == "DEFAULT_TIER" { "pro".into() } else { String::new() }).unwrap_err();
         assert!(e.contains("without TIERS_FILE"), "{e}");
@@ -398,12 +399,15 @@ mod tests {
         assert!(e.contains("doesn't include the codex harness") && e.contains("claude, hermes"), "{e}");
         assert!(!pro.allows_harness("codex"));
 
-        assert!(pro.check("claude", None, None).is_ok());
-        assert!(pro.check("claude", Some("claude-opus-4-1"), Some("high")).is_ok());
-        assert!(pro.check("claude", Some("claude-mythos-9"), None).unwrap_err().contains("doesn't include that model"));
-        assert!(pro.check("claude", Some("claude-opus-4-1"), Some("max")).unwrap_err().contains("sets the reasoning effort"));
-        assert!(pro.check("codex", None, None).is_err());
-        assert!(t.get("starter").unwrap().check("claude", Some("claude-sonnet-4-5"), None).is_err());
+        assert!(pro.check("claude", None, None, None).is_ok());
+        assert!(pro.check("claude", Some("claude-opus-4-1"), Some("high"), None).is_ok());
+        assert!(pro.check("claude", Some("claude-mythos-9"), None, None).unwrap_err().contains("doesn't include that model"));
+        assert!(pro.check("claude", Some("claude-opus-4-1"), Some("max"), None).unwrap_err().contains("sets the reasoning effort"));
+        assert!(pro.check("codex", None, None, None).is_err());
+        // An effort alone is checked against the route of the model the Bot keeps.
+        assert!(pro.check("claude", None, Some("high"), Some("claude-opus-4-1")).is_ok());
+        assert!(pro.check("claude", None, Some("high"), Some("claude-sonnet-4-5")).is_err());
+        assert!(t.get("starter").unwrap().check("claude", Some("claude-sonnet-4-5"), None, None).is_err());
     }
 
     #[test]

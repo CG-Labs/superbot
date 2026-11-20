@@ -75,9 +75,9 @@ So the stored model on a Bot is only a preference among the tier's routes. A Bot
 
 ### Enforcement on the API
 
-- `POST /api/bots` and `PATCH /api/bots/:id`: a harness, model or effort outside the owner's tier is a **403** with a plain reason. Leaving model and effort out is always fine; the tier picks. Only fields being changed are checked, so a Bot from before a downgrade can still be renamed. Admins are held to this too: the tier is the routing table, and an admin who wants a model for someone gives them a tier that has it.
+- `POST /api/bots` and `PATCH /api/bots/:id`: a harness, model or effort outside the owner's tier is a **403** with a plain reason. Leaving model and effort out is always fine; the tier picks. Only fields being changed are checked, so a Bot from before a downgrade can still be renamed; an effort alone is checked against the route of the model the Bot keeps. Admins are held to this too: the tier is the routing table, and an admin who wants a model for someone gives them a tier that has it.
 - New Bots without a harness get `DEFAULT_HARNESS`, or the tier's first harness if it doesn't have that one. `/api/state` lists only the caller's tier's harnesses.
-- `maxBots`: creating a Bot, a Bot making one for its owner, and an admin handing a Bot to someone are all refused (403) at the limit. Lowering a limit doesn't delete Bots.
+- `maxBots`: creating a Bot, a Bot making one for its owner, and an admin handing a Bot to someone are all refused (403) at the limit. The count and the insert (or owner change) are one SQL statement, so racing requests can't pass it together. Lowering a limit doesn't delete Bots.
 - `monthlyRuns`: each run takes one from the owner's count for the month (`usage_monthly`, keyed by user and `YYYY-MM`) in one SQL statement, so racing runs can't both take the last one. At the limit the run is refused (`bot.run_refused`, reason `tier_limit`) and the Bot says when more start. A run refused afterwards by machine routing gives its count back. Runs by anyone on a shared Bot count for its owner, who pays for it.
 
 Every new query names the user (`users.id`, `bots.owner_id`, `usage_monthly.user_id`).
@@ -87,7 +87,7 @@ Every new query names the user (`users.id`, `bots.owner_id`, `usage_monthly.user
 On a managed tier, models are the back end's business:
 
 - Bot views carry `tier: {name, label, managed}`. On a managed tier they leave out `model` and `effort`, for everyone, in every response and in the live stream.
-- **Admins** (people, not their Bots) also get `model`, `effort`, and `route` (or `routeError`) on every Bot, in responses and the stream.
+- **Admins** (people, not their Bots) also get `model`, `effort`, `route` (or `routeError`), and `harnesses` (the owner's tier's, for editing someone else's Bot) on every Bot, in responses and the stream.
 - `GET /api/harnesses/:name/models` is 403 for non-admins on a managed tier. Admins can add `?tier=<name>` to list just that tier's models for the harness.
 - `GET /api/me/tier` (people only): your tier's name, label, managed flag, limits and this month's use (`runs`, `bots`). No routes. `/api/state` has the same tier under `me.tier`.
 - `GET /api/tiers` (admins): every tier with its routes, the default, and where they came from. `botctl tiers`.
