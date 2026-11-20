@@ -170,8 +170,20 @@ pub fn get(name: &str) -> Option<Box<dyn Adapter>> {
     }
 }
 
-/// Harnesses whose CLI is on PATH.
+/// Harnesses whose CLI is on PATH. Remembered for a few seconds: views ask for
+/// every Bot, and each check starts a shell per harness.
 pub fn installed() -> Vec<&'static str> {
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<&'static str>)>> = std::sync::Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, list)) = cache.as_ref().filter(|(at, _)| at.elapsed() < std::time::Duration::from_secs(5)) {
+        return list.clone();
+    }
+    let list = find_installed();
+    *cache = Some((std::time::Instant::now(), list.clone()));
+    list
+}
+
+fn find_installed() -> Vec<&'static str> {
     NAMES
         .into_iter()
         .filter(|n| {

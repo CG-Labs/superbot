@@ -273,6 +273,7 @@ async fn tier_limits_hold_per_user() {
     let theirs = app.db.create_bot_owned("Spare", "#fff", "waddle", "claude", None, false, &w.b_id, Visibility::Private);
     let (code, res) = call(port, "PATCH", &format!("/api/bots/{}/access", theirs.id), &w.admin, &json!({ "owner": w.a_id }).to_string()).await;
     assert_eq!(code, 403, "{res}");
+    assert_eq!(app.db.bot(&theirs.id).unwrap().owner_id, w.b_id, "a refused transfer changes nothing");
 
     // Starter: 3 runs a month, counted for the Bot's owner whoever asks.
     let shared = &mine[0];

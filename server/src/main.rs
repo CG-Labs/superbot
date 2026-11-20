@@ -1485,16 +1485,13 @@ async fn update_access(State(app): State<AppState>, Extension(c): Extension<Call
         // It takes one of the new owner's Bot slots; its harness and model they can change after.
         let tier = app.tier_of(&u.id);
         let max = tier.limits.max_bots;
-        let full = || ApiError(StatusCode::FORBIDDEN, format!("{}'s plan ({}) allows {} Bots, and they're all in use.", u.name, tier.label, max.unwrap_or(0)));
-        if max.is_some_and(|max| app.db.owned_bot_count(&u.id) >= max) {
-            return Err(full());
+        if !app.db.set_bot_owner_capped(&id, &u.id, max) {
+            return Err(ApiError(StatusCode::FORBIDDEN, format!("{}'s plan ({}) allows {} Bots, and they're all in use.", u.name, tier.label, max.unwrap_or(0))));
         }
+        // Only once it's theirs: a refused transfer leaves the old owner's work alone.
         // Work started for the old owner runs in their folder with their keys; it
         // ends here, and its token stops working (it names the old owner).
         app.stop(&id);
-        if !app.db.set_bot_owner_capped(&id, &u.id, max) {
-            return Err(full());
-        }
         // The new owner manages it anyway; a leftover grant would only confuse.
         app.db.remove_grant(&id, &u.id);
         app.db.record(&by.event("bot.owner_changed").target("bot", &id).bot(&id).details(json!({ "from": bot.owner_id, "to": u.id })));
