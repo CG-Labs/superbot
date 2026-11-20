@@ -18,6 +18,8 @@ use std::time::Duration;
 use tokio::signal::unix::{signal, SignalKind};
 
 const PREFIX: &str = "sb-u-";
+/// How long a stopped run has to exit before KILL. Under botd's 5 seconds.
+const GRACE: Duration = Duration::from_secs(4);
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 /// Settings that would point the harness at another account's files.
 const DROP: [&str; 6] = ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "MAIL"];
@@ -110,13 +112,22 @@ async fn main() -> ExitCode {
         _ = int.recv() => {}
         _ = hup.recv() => {}
     }
+    // Everything left of the run gets KILL before botd's own KILL, 5 seconds after its
+    // TERM, takes sudo and this process away: tools that ignore TERM, or outlive the harness.
+    let deadline = tokio::time::Instant::now() + GRACE;
     // SAFETY: signals this account's own processes.
     unsafe { libc::kill(target, libc::SIGTERM) };
-    if tokio::time::timeout(Duration::from_secs(5), child.wait()).await.is_err() {
+    let exited = tokio::time::timeout_at(deadline, child.wait()).await.is_ok();
+    // SAFETY: signal 0 only checks that the group still has a process.
+    let group_left = || !tty && unsafe { libc::kill(target, 0) } == 0;
+    while group_left() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if !exited || group_left() {
         // SAFETY: as above.
         unsafe { libc::kill(target, libc::SIGKILL) };
-        let _ = child.wait().await;
     }
+    let _ = child.wait().await;
     ExitCode::from(143)
 }
 

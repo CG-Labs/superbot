@@ -23,7 +23,8 @@ case "$prompt" in
     mkdir -p "$HOME/.claude" && printf 'A-SECRET\n' >"$HOME/.claude/.credentials.json" && out=wrote || out=failed
     ;;
   SLEEP)
-    (while :; do date +%s.%N >"$PWD/heartbeat"; sleep 0.2; done) &
+    # A tool that ignores TERM and would outlive the harness: only KILL stops it.
+    (trap '' TERM; while :; do date +%s.%N >"$PWD/heartbeat"; sleep 0.2; done) &
     sleep 300
     out=slept
     ;;
