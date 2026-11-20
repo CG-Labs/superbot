@@ -950,7 +950,7 @@ fn site(file: &'static str) -> Response {
 }
 
 /// Where a signed-in person lands on the web. The Expo client at /app/ is the interface
-/// for everyone; the console is an admin fallback (ADR 0027).
+/// for everyone; the console is an admin page only (ADR 0027, ADR 0032).
 pub fn landing(p: Principal) -> &'static str {
     match p {
         Principal::User(Role::Admin) => "/console/",
@@ -991,8 +991,23 @@ async fn web(uri: axum::http::Uri, principal: Option<Extension<Principal>>) -> R
         }
         .to_string(),
     };
-    ([(header::CONTENT_TYPE, content_type(file)), (header::CACHE_CONTROL, "no-cache")], body).into_response()
+    (
+        [
+            (header::CONTENT_TYPE, content_type(file)),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::CONTENT_SECURITY_POLICY, CONSOLE_CSP),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::REFERRER_POLICY, "same-origin"),
+        ],
+        body,
+    )
+        .into_response()
 }
+
+/// The console is admin-only (ADR 0032): it runs only its own script, talks only to
+/// this server, and can't be framed.
+pub const CONSOLE_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
+     connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
 // Live updates: one Server-Sent Events stream with everything.
 

@@ -1,75 +1,11 @@
-// Thin client: all state lives on the server. Live updates come over /api/events.
-
-// Bot avatars: soft "Squish" robots. One body color, plus a dark visor with two eyes.
-// Each shape is (color, face) => SVG. face is the visor function, or none() for the bare silhouette.
-const DARK = "#141414";
-const rect = (x, y, w, h, rx, f) => `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${rx}" fill="${f}"/>`;
-const circ = (cx, cy, r, f) => `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${f}"/>`;
-const ell = (cx, cy, rx, ry, f, rot = 0) => `<ellipse cx="${cx}" cy="${cy}" rx="${rx}" ry="${ry}" fill="${f}" transform="rotate(${rot} ${cx} ${cy})"/>`;
-const path = (d, f, round = 0) => `<path d="${d}" fill="${f}"${round ? ` stroke="${f}" stroke-width="${round}" stroke-linejoin="round"` : ""}/>`;
-const tilt = (deg, s) => `<g transform="rotate(${deg} 24 24)">${s}</g>`;
-const nub = (x, y, h, f) => rect(x - 1.3, y - h, 2.6, h + 2, 1.3, f) + circ(x, y - h, 3, f);
-const visor = (k) => (x, y, w, h) => {
-  const s = h / 12, g = w * 0.22, eye = (ex) => rect(ex - 1.5 * s, y - 2.9 * s, 3 * s, 5.8 * s, 1.5 * s, k);
-  return rect(x - w / 2, y - h / 2, w, h, h / 2, DARK) + eye(x - g) + eye(x + g);
-};
-const none = () => "";
-const GEAR = Array.from({ length: 97 }, (_, i) => {
-  const a = (i / 96) * Math.PI * 2, r = 18.5 + 2.6 * Math.cos(8 * a);
-  return `${i ? "L" : "M"}${(24 + r * Math.sin(a)).toFixed(2)} ${(24 - r * Math.cos(a)).toFixed(2)}`;
-}).join("") + "Z";
-
-// Order matters: the New Bot window shows them in this order.
-const SHAPES = {
-  waddle: (k, f) => nub(24, 9, 3, k) + ell(16.5, 41, 5.5, 3, k) + ell(31.5, 41, 5.5, 3, k) + circ(24, 24, 16.5, k) + f(24, 24, 23, 12),
-  drop: (k, f) => path("M24 6c9 0 15 12 17 22 2 10-6 15-17 15S5 38 7 28C9 18 15 6 24 6z", k) + f(24, 27, 22, 12),
-  cloud: (k, f) => nub(26, 12, 6, k) + circ(15, 27, 10, k) + circ(26, 22, 12, k) + circ(35, 29, 9, k) + rect(5, 27, 38, 15, 7.5, k) + f(24, 30, 22, 11),
-  bean: (k, f) => nub(20, 9, 5, k) + ell(24, 26, 20, 14, k, -12) + f(24, 26, 23, 12),
-  onigiri: (k, f) => path("M24 9L41 38H7Z", k, 12) + f(24, 30, 20, 11),
-  peanut: (k, f) => nub(24, 11, 4, k) + circ(15, 26, 12, k) + circ(33, 26, 12, k) + rect(15, 17, 18, 18, 0, k) + f(24, 25, 26, 12),
-  pebble: (k, f) => path("M9 16C13 8 30 4 38 11s7 22-3 29-26 5-29-7c-1-6 1-13 3-17z", k) + f(25, 25, 23, 12),
-  square: (k, f) => tilt(12, nub(24, 9, 4, k) + rect(8, 9, 32, 32, 12, k) + f(24, 25, 22, 12)),
-  jelly: (k, f) => tilt(18, ell(24, 25, 13.5, 19, k) + f(24, 22, 19, 11)),
-  gem: (k, f) => path("M24 7L40.5 18.5L34.5 40H13.5L7.5 18.5Z", k, 9) + f(24, 26, 22, 12),
-  gear: (k, f) => path(GEAR, k) + f(24, 24, 24, 12),
-  heart: (k, f) => path("M24 42L7 25A9.5 9.5 0 0 1 24 13A9.5 9.5 0 0 1 41 25Z", k, 6) + f(24, 25, 22, 11),
-};
-// Shapes from before the robots, so existing Bots keep a similar look.
-const OLD_SHAPES = { round: "waddle", star: "gear", flower: "gear", scallop: "gear", splat: "gear", blob: "pebble", egg: "drop", wide: "bean", triangle: "onigiri", pentagon: "gem", hexagon: "gem" };
-
-// ring: draw a selection outline that follows the shape.
-function avatar(color, shape = "waddle", size = 48, ring = false) {
-  const draw = SHAPES[shape] ?? SHAPES[OLD_SHAPES[shape]] ?? SHAPES.waddle;
-  const scaled = (k, s) => `<g transform="translate(24 24) scale(${k}) translate(-24 -24)">${s}</g>`;
-  const body = draw(color, visor(color));
-  return `<svg class="avatar" viewBox="0 0 48 48" width="${size}" height="${size}" style="stroke:none;width:${size}px;height:${size}px;overflow:visible">
-    ${ring ? scaled(1.1, draw("#4a4a4a", none)) + scaled(1.02, draw("#1f1f1f", none)) + scaled(.86, body) : body}
-  </svg>`;
-}
+// The admin console (ADR 0032): people, requests for access, machines, the audit log,
+// and server settings. Chat, Bots, approvals of Bot actions, and screens are in the app
+// at /app/. The server decides what each role may do; this page only shows admin tools.
 
 const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-
-// Small, safe Markdown: escape first, then add formatting.
-function md(src) {
-  const blocks = [];
-  let s = esc(src).replace(/```[^\n]*\n([\s\S]*?)```/g, (_, code) => `\u0000${blocks.push(code) - 1}\u0000`);
-  const inline = (t) => t
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
-    .replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
-  return s.split(/\n{2,}/).map((para) => {
-    const lines = para.split("\n");
-    if (/^\u0000\d+\u0000$/.test(para.trim())) return para.trim();
-    if (lines.every((l) => /^\s*[-*] /.test(l))) return `<ul>${lines.map((l) => `<li>${inline(l.replace(/^\s*[-*] /, ""))}</li>`).join("")}</ul>`;
-    if (lines.every((l) => /^\s*\d+[.)] /.test(l))) return `<ol>${lines.map((l) => `<li>${inline(l.replace(/^\s*\d+[.)] /, ""))}</li>`).join("")}</ol>`;
-    const h = para.match(/^#{1,4} (.*)$/);
-    if (h && lines.length === 1) return `<p><strong>${inline(h[1])}</strong></p>`;
-    return `<p>${lines.map(inline).join("<br>")}</p>`;
-  }).join("").replace(/\u0000(\d+)\u0000/g, (_, i) => `<pre><code>${blocks[i]}</code></pre>`);
-}
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const key = (id) => encodeURIComponent(id);
+const fmt = (ms) => (ms ? new Date(ms).toLocaleString() : "Never");
 
 async function api(method, path, body) {
   const res = await fetch(path, {
@@ -79,591 +15,351 @@ async function api(method, path, body) {
   });
   const data = await res.json().catch(() => ({}));
   if (res.status === 401) location.href = "/login";
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  if (res.status === 403) stillAdmin();
+  if (!res.ok) throw Object.assign(new Error(data.error || `HTTP ${res.status}`), { status: res.status });
   return data;
 }
 
-// State
-let me = { name: "", permissions: [] };
-// What this person's role allows (see docs/adr/0012-users-sessions-rbac.md). The server enforces it; this only hides what would fail.
-const can = (perm) => (me.permissions || []).includes(perm);
-let harnesses = [];
-let defaultHarness = "claude";
-let bots = [];
-const messages = {}; // botId -> array, loaded on first open
-const drafts = {}; // botId -> streaming text
-let activeId = localStorage.getItem("activeBot");
-let filter = "";
-let showHidden = false;
-let approvals = []; // pending, oldest first
-let globalPolicy = { mode: "ask" };
-const remembered = new Set(); // approval ids with "Always allow" ticked; survives re-renders
-
-const bot = (id) => bots.find((b) => b.id === id);
-const primary = () => bots.find((b) => b.primary);
-
-function upsertBot(b) {
-  const i = bots.findIndex((x) => x.id === b.id);
-  if (i >= 0) bots[i] = { ...bots[i], ...b }; else bots.push(b);
+// Someone who stops being an admin goes to the app, as the server sends them there on reload.
+async function stillAdmin() {
+  const r = await fetch("/api/auth/me").catch(() => null);
+  const me = r?.ok ? await r.json().catch(() => null) : null;
+  if (me && !(me.permissions || []).includes("admin")) location.replace("/app/");
 }
 
-// Sidebar
-function renderSidebar() {
-  const p = primary();
-  $("primary-bot").innerHTML = p ? `<div class="avatar-wrap">${avatar(p.color, p.shape, 82)}
-    <span class="badge"><svg viewBox="0 0 24 24"><path d="M12 2l3 7 7 .6-5.3 4.7 1.6 7.2L12 17.8 5.7 21.5l1.6-7.2L2 9.6 9 9z"/></svg></span>
-    ${p.unread && p.id !== activeId ? '<span class="unread"></span>' : ""}</div>
-    <span>${esc(p.name)}</span>` : "";
-  $("primary-bot").classList.toggle("active", p?.id === activeId);
-
-  const q = filter.toLowerCase();
-  const list = bots.filter((b) => !b.primary && b.hidden === showHidden)
-    .filter((b) => !q || b.name.toLowerCase().includes(q) || (b.preview || "").toLowerCase().includes(q));
-  $("bot-list").innerHTML = list.map((b) => `<button class="bot-row ${b.id === activeId ? "active" : ""}" data-id="${b.id}">
-      ${avatar(b.color, b.shape, 52)}
-      <div class="meta"><div class="name">${esc(b.name)}</div>
-        <div class="preview">${b.working ? `<em>${esc(b.status || "Working")}…</em>` : esc(b.preview || "")}</div></div>
-      ${b.unread && b.id !== activeId ? '<span class="unread"></span>' : ""}
-    </button>`).join("") || (showHidden ? '<div class="empty">No hidden Bots.</div>' : "");
-
-  const hidden = bots.filter((b) => b.hidden).length;
-  $("hidden-label").textContent = showHidden ? "Back to Bots" : "Hidden Bots";
-  $("hidden-count").textContent = showHidden ? "" : hidden;
-  $("me-name").textContent = me.name;
-  $("me-avatar").textContent = (me.name || "?")[0].toUpperCase();
-  $("approvals-count").textContent = approvals.length || "";
-  $("approvals-btn").classList.toggle("waiting", approvals.length > 0);
-  $("new-btn").hidden = !can("write");
-  $("audit-btn").hidden = !can("admin");
-  $("signout-btn").hidden = !me.session;
-  $("ap-mode").disabled = !can("admin");
-  $("input").disabled = !can("write");
-  $("input").placeholder = can("write") ? "" : "Read-only access";
+let noticeTimer = null;
+function notice(msg, isError = true) {
+  const el = $("error");
+  el.textContent = msg;
+  el.classList.toggle("ok", !isError);
+  el.hidden = !msg;
+  clearTimeout(noticeTimer);
+  if (msg) noticeTimer = setTimeout(() => { el.hidden = true; }, isError ? 8000 : 4000);
 }
+const fail = (err) => notice(err.message || String(err));
 
-// Approvals: risky tool calls wait here for a person (see docs/adr/0007-approvals.md).
-function upsertApproval(a) {
-  approvals = approvals.filter((x) => x.id !== a.id);
-  if (a.status === "pending") approvals.push(a);
-  approvals.sort((x, y) => x.createdAt - y.createdAt);
+// Shown-once values: sign-in codes and SCIM tokens. Closing forgets them; the server keeps only hashes.
+function showOnce({ title, note, value, link }) {
+  $("once-title").textContent = title;
+  $("once-note").textContent = note;
+  $("once-value").textContent = value;
+  $("once-copy-link").hidden = !link;
+  $("once-copy-link").dataset.link = link || "";
+  $("once").hidden = false;
+  $("once-copy").focus();
 }
-
-function minutesLeft(a) {
-  const m = Math.max(0, Math.ceil((a.expiresAt - Date.now()) / 60000));
-  return m <= 1 ? "under a minute" : `${m} minutes`;
+function closeOnce() {
+  $("once").hidden = true;
+  $("once-value").textContent = "";
+  $("once-copy-link").dataset.link = "";
 }
-
-function approvalCard(a, withBot) {
-  const b = bot(a.botId);
-  return `<div class="approval" data-approval="${esc(a.id)}">
-    <div class="ap-head">${withBot && b ? `${avatar(b.color, b.shape, 22)}<b>${esc(b.name)}</b>` : ""}
-      <span class="ap-what">wants to run <code>${esc(a.tool)}</code></span></div>
-    <div class="ap-reason">${esc(a.reason)}</div>
-    <pre class="ap-subject">${esc(a.subject)}</pre>
-    <div class="ap-foot">
-      ${can("admin") ? `<label class="ap-remember"><input type="checkbox" ${remembered.has(a.id) ? "checked" : ""} /> Remember for ${esc(b?.name || "this Bot")}</label>` : ""}
-      <span class="ap-left">Denied in ${minutesLeft(a)}</span>
-      ${can("approve") ? `<button class="nb-btn" data-decide="deny">Deny</button>
-      <button class="nb-btn primary" data-decide="approve">Approve</button>` : ""}
-    </div>
-  </div>`;
-}
-
-async function decideApproval(card, verb) {
-  const remember = card.querySelector(".ap-remember input")?.checked ? "bot" : null;
-  card.querySelectorAll("button").forEach((x) => (x.disabled = true));
+async function copy(text, done) {
   try {
-    upsertApproval(await api("POST", `/api/approvals/${card.dataset.approval}/${verb}`, { remember }));
-  } catch (err) {
-    alert(err.message);
-  }
-  render(true);
-}
-
-function renderApprovals() {
-  if ($("ap").hidden) return;
-  $("ap-list").innerHTML = approvals.map((a) => approvalCard(a, true)).join("") || '<div class="empty">Nothing is waiting for you.</div>';
-  $("ap-mode").value = globalPolicy.mode;
-}
-
-// Chat
-const ACTIONS = `<div class="actions">
-  <button title="Copy" data-act="copy"><svg viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3"/></svg></button>
-</div>`;
-
-function when(ts) {
-  const d = new Date(ts);
-  const today = new Date(); today.setHours(0, 0, 0, 0);
-  const day = new Date(d); day.setHours(0, 0, 0, 0);
-  const diff = (today - day) / 86400000;
-  const time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-  if (diff === 0) return `Today ${time}`;
-  if (diff === 1) return `Yesterday ${time}`;
-  return `${d.toLocaleDateString([], { month: "short", day: "numeric" })} ${time}`;
-}
-
-function renderMessage(m, prev) {
-  let out = !prev || m.at - prev.at > 30 * 60000 ? `<div class="timestamp">${when(m.at)}</div>` : "";
-  if (m.role === "routine") return out + `<div class="timestamp routine">Routine · ${esc(m.text)}</div>`;
-  if (m.role === "peer" || m.role === "reply") {
-    const who = bot(m.fromBot)?.name || "another Bot";
-    const label = m.role === "peer" ? `From ${esc(who)}` : `Reply from ${esc(who)}`;
-    return out + `<div class="msg-row peer"><div class="bubble"><div class="from">${label}</div>${md(m.text)}</div></div>`;
-  }
-  if (m.role === "user") return out + `<div class="msg-row user"><div class="bubble">${esc(m.text).replace(/\n/g, "<br>")}</div></div>`;
-  if (m.text) {
-    out += `<div class="msg-row bot" data-id="${m.id}"><div class="bubble ${m.error ? "error" : ""}">${md(m.text)}</div>${ACTIONS}</div>`;
-  }
-  if (m.question) {
-    const q = m.question;
-    out += `<div class="msg-row bot"><div class="bubble question ${q.picked != null ? "answered" : ""}" data-id="${m.id}">
-      <h4>${esc(q.title)}</h4>
-      ${q.handoff && q.picked == null ? `<button class="open-screen">Open screen</button>` : ""}
-      ${q.options.map((o, k) => `<button class="option ${q.picked === k ? "picked" : ""}" data-k="${k}">
-        <span class="key">${"ABCDEF"[k]}</span>${esc(o)}</button>`).join("")}
-    </div></div>`;
-  }
-  return out;
-}
-
-function renderChat(keepScroll) {
-  const b = bot(activeId);
-  if (!b) { $("messages").innerHTML = ""; return; }
-  const el = $("messages");
-  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-  $("bot-pill").innerHTML = `${avatar(b.color, b.shape, 30)}<span>${esc(b.name)}</span><span class="harness">${esc(b.harness)}</span>`;
-  $("input").placeholder = `Message ${b.name}`;
-  const list = messages[b.id] || [];
-  let html = list.map((m, i) => renderMessage(m, list[i - 1])).join("");
-  html += approvals.filter((a) => a.botId === b.id).map((a) => `<div class="msg-row bot">${approvalCard(a, false)}</div>`).join("");
-  if (b.working) {
-    const draft = drafts[b.id];
-    if (draft) html += `<div class="msg-row bot"><div class="bubble">${md(draft)}</div></div>`;
-    html += `<div class="msg-row bot"><div class="bubble typing"><span></span><span></span><span></span>
-      <em class="status">${esc(b.status || "Working")}</em><button class="stop" id="stop">Stop</button></div></div>`;
-  }
-  el.innerHTML = html;
-  if (!keepScroll || atBottom) scrollToBottom(); else updateScrollBtn();
-}
-
-function scrollToBottom() {
-  const el = $("messages");
-  el.scrollTop = el.scrollHeight;
-  updateScrollBtn();
-}
-
-function updateScrollBtn() {
-  const el = $("messages");
-  $("scroll-down").classList.toggle("show", el.scrollHeight - el.scrollTop - el.clientHeight > 80);
-}
-
-async function open(id) {
-  if (!bot(id)) id = primary()?.id;
-  if (!id) return;
-  activeId = id;
-  localStorage.setItem("activeBot", id);
-  if (!messages[id]) messages[id] = await api("GET", `/api/bots/${id}/messages`);
-  markRead();
-  render();
-  if (details.open) openDetails(); // load the new Bot's routines
-  if (!$("screen").hidden) loadScreen();
-}
-
-function markRead() {
-  const b = bot(activeId);
-  if (b?.unread && document.hasFocus() && can("write")) {
-    b.unread = false;
-    api("POST", `/api/bots/${b.id}/read`).catch(() => {});
+    await navigator.clipboard.writeText(text);
+    notice(done, false);
+  } catch {
+    getSelection().selectAllChildren($("once-value"));
+    notice("Copy isn't available here. The value is selected; copy it yourself.");
   }
 }
+$("once-copy").addEventListener("click", () => copy($("once-value").textContent, "Copied."));
+$("once-copy-link").addEventListener("click", () => copy($("once-copy-link").dataset.link, "Invite link copied."));
+$("once-close").addEventListener("click", closeOnce);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("once").hidden) closeOnce(); });
 
-async function sendText(text, answer) {
-  const b = bot(activeId);
-  if (!b || !text) return;
+const ROLES = { admin: "Admin", member: "Member", readonly: "Read-only" };
+const SIGN_IN = { password: "Password (break-glass)", code: "Sign-in code", sso: "SSO", none: "No auth (dev)", bot_token: "Bot token" };
+const roleOptions = (current) => Object.entries(ROLES).map(([v, l]) => `<option value="${v}" ${v === current ? "selected" : ""}>${l}</option>`).join("");
+
+// Users
+
+let users = [];
+
+async function loadUsers() {
   try {
-    await api("POST", `/api/bots/${b.id}/messages`, { text, answer });
+    users = await api("GET", "/api/users");
+    $("users-empty").hidden = users.length > 0;
+    $("users-empty").textContent = "No users yet.";
   } catch (err) {
-    alert(err.message);
+    users = [];
+    $("users-empty").textContent = err.message;
+    $("users-empty").hidden = false;
   }
+  renderUsers();
 }
 
-function render(keepScroll) {
-  renderSidebar();
-  renderChat(keepScroll);
-  renderApprovals();
-  renderModelBar();
-  if (details.open && document.activeElement?.id !== "d-name") renderDetails();
+function lastLogin(u) {
+  const l = u.lastLogin;
+  if (!l) return "Never";
+  const how = l.authMethod === "sso" && (l.idp || l.idpProvider) ? `SSO · ${l.idp || l.idpProvider}` : SIGN_IN[l.authMethod] || l.authMethod || "";
+  return `${esc(fmt(l.at))}<div class="sub">${esc(how)}</div>`;
 }
 
-// Model and effort picker above the input. Saved on the Bot, so each Bot keeps its own.
-const modelLists = {}; // harness -> Promise<[{id, label, efforts}]>
-let modelBarKey = "";
-const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
-const OTHER_MODEL = "__other_model__";
-
-async function renderModelBar() {
-  const first = bot(activeId);
-  if (!first) return;
-  modelLists[first.harness] ??= api("GET", `/api/harnesses/${first.harness}/models`).catch(() => []);
-  const list = await modelLists[first.harness];
-  const b = bot(activeId); // re-read: the Bot may have changed while loading
-  if (!b || b.id !== first.id || b.harness !== first.harness) return;
-  const key = [b.id, b.harness, b.model, b.effort, list.length].join("|");
-  if (key === modelBarKey) return;
-  modelBarKey = key;
-
-  const all = [...new Set(list.flatMap((m) => m.efforts))];
-  // An entry without an id: the harness takes any model name (typed in "Other model…").
-  const freeText = list.some((m) => !m.id);
-  const models = [{ id: "", label: "Default model", efforts: all }, ...list.filter((m) => m.id)];
-  // A Bot saved with an alias (e.g. "opus") shows as its exact model.
-  const isCurrent = (m) => m.id === (b.model || "") || (b.model && m.aliases?.includes(b.model));
-  if (b.model && !list.some(isCurrent)) models.push({ id: b.model, label: b.model, efforts: all });
-  const current = models.find(isCurrent);
-  $("model-select").innerHTML = models.map((m) =>
-    `<option value="${esc(m.id)}" ${m === current ? "selected" : ""}>${esc(m.label)}</option>`).join("") +
-    (freeText ? `<option value="${OTHER_MODEL}">Other model…</option>` : "");
-  $("effort-select").innerHTML = ["", ...current.efforts].map((e) =>
-    `<option value="${esc(e)}" ${e === (b.effort || "") ? "selected" : ""}>${e ? cap(e) : "Default effort"}</option>`).join("");
-  $("effort-select").hidden = !current.efforts.length;
-  $("model-bar").hidden = false;
+function renderUsers() {
+  $("users-rows").innerHTML = users.map((u) => {
+    const active = u.status === "active";
+    return `<tr data-user="${esc(u.id)}">
+      <td><div>${esc(u.name)}${u.breakGlass ? ' <span class="tag">owner</span>' : ""}</div><div class="sub">${esc(u.email || u.id)}</div></td>
+      <td><select data-act="role" title="Role" ${u.breakGlass ? "disabled" : ""}>${roleOptions(u.role)}</select></td>
+      <td>${active ? "Active" : '<span class="bad">Disabled</span>'}</td>
+      <td>${lastLogin(u)}</td>
+      <td>${u.pendingCodes ? `Waiting<div class="sub">until ${esc(fmt(u.pendingCodes.expiresAt))}</div>` : ""}</td>
+      <td class="actions">
+        <button type="button" class="btn" data-act="code" ${active ? "" : "disabled"}>New code</button>
+        ${u.breakGlass ? "" : `<button type="button" class="btn" data-act="status">${active ? "Disable" : "Enable"}</button>`}
+        <button type="button" class="btn" data-act="sessions">Sign out everywhere</button>
+      </td>
+    </tr>`;
+  }).join("");
 }
 
-async function saveModel(patch) {
-  const b = bot(activeId);
-  if (!b) return;
-  try { upsertBot(await api("PATCH", `/api/bots/${b.id}`, patch)); } catch (err) { alert(err.message); }
-  renderModelBar();
+function codeNote(expiresAt, extra = "") {
+  return `Works once, until ${fmt(expiresAt)}. It can't be shown again. ${extra}`.trim();
 }
 
-$("model-select").addEventListener("change", async (e) => {
-  const b = bot(activeId);
-  const list = await modelLists[b.harness];
-  if (e.target.value === OTHER_MODEL) {
-    const typed = prompt("Model name, as the harness expects it:", b.model || "")?.trim();
-    if (typed) saveModel({ model: typed });
-    else { modelBarKey = ""; renderModelBar(); }
-    return;
-  }
-  const m = list.find((x) => x.id === e.target.value && x.id);
-  // Keep the effort only if the new model supports it.
-  const effort = m && b.effort && !m.efforts.includes(b.effort) ? null : b.effort;
-  saveModel({ model: e.target.value || null, effort });
-});
-$("effort-select").addEventListener("change", (e) => saveModel({ effort: e.target.value || null }));
-
-// Live screen: the Bot's own desktop, streamed by voxl. View only until you take over.
-let screenTimer = null;
-function setTakeover(on) {
-  $("screen-shield").hidden = on;
-  $("screen-take").classList.toggle("on", on);
-  $("screen-take").textContent = on ? "Give back" : "Take over";
-}
-async function loadScreen() {
-  const id = activeId;
-  $("screen-title").textContent = `${bot(id)?.name || "Bot"}'s screen`;
-  const frame = $("screen-frame");
-  try {
-    const { url } = await api("GET", `/api/bots/${id}/screen`); // also keeps it running while you watch
-    if (id !== activeId || $("screen").hidden) return;
-    if (frame.dataset.url !== url) { frame.dataset.url = url; frame.src = url; setTakeover(false); }
-    $("screen-msg").hidden = true;
-  } catch (err) {
-    frame.removeAttribute("src"); delete frame.dataset.url;
-    $("screen-msg").textContent = err.message;
-    $("screen-msg").hidden = false;
-  }
-}
-function openScreen() {
-  if (details.open) closeDetails(); // one right-hand panel at a time
-  $("screen").hidden = false;
-  loadScreen();
-  clearInterval(screenTimer);
-  screenTimer = setInterval(loadScreen, 60000);
-}
-function closeScreen() {
-  $("screen").hidden = true;
-  clearInterval(screenTimer);
-  $("screen-frame").removeAttribute("src");
-  delete $("screen-frame").dataset.url;
-}
-$("screen-btn").addEventListener("click", () => ($("screen").hidden ? openScreen() : closeScreen()));
-$("screen-close").addEventListener("click", closeScreen);
-$("screen-take").addEventListener("click", () => {
-  const on = !$("screen-shield").hidden;
-  setTakeover(on);
-  if (on) $("screen-frame").focus();
-});
-
-// Live updates
-function connect() {
-  const es = new EventSource("/api/events");
-  es.onmessage = (ev) => {
-    const e = JSON.parse(ev.data);
-    if (e.type === "resync") return void load(true);
-    if (e.type === "message") {
-      const list = messages[e.message.botId];
-      if (list && !list.some((m) => m.id === e.message.id)) list.push(e.message);
-      if (e.message.role === "bot") delete drafts[e.message.botId];
-      if (e.bot) upsertBot(e.bot);
-      if (e.message.botId === activeId) markRead();
-    } else if (e.type === "bot") {
-      upsertBot(e.bot);
-    } else if (e.type === "botDeleted") {
-      bots = bots.filter((b) => b.id !== e.botId);
-      if (activeId === e.botId) return void open(primary()?.id);
-    } else if (e.type === "draft") {
-      drafts[e.botId] = e.text;
-    } else if (e.type === "status") {
-      const b = bot(e.botId);
-      if (b) { b.working = e.working; b.status = e.status; }
-      if (!e.working) delete drafts[e.botId];
-    } else if (e.type === "approval") {
-      upsertApproval(e.approval);
-    } else if (e.type === "policy") {
-      globalPolicy = e.policy;
-    }
-    render(true);
-  };
-  // Resync after a reconnect, in case events were missed.
-  let opened = false;
-  es.onopen = () => { if (opened) load(true); opened = true; };
-  // The stream ends when the session does; the browser then gives up after a 401.
-  es.onerror = () => { if (es.readyState === EventSource.CLOSED) api("GET", "/api/auth/me").catch(() => {}); };
+async function newCode(u, replace) {
+  const r = await api("POST", `/api/users/${key(u.id)}/login-codes`, { ttlMinutes: +$("code-ttl").value, replace });
+  showOnce({
+    title: `Sign-in code for ${u.name}`,
+    note: codeNote(r.expiresAt, replace ? "Earlier unused codes no longer work." : ""),
+    value: r.code,
+    link: `${location.origin}/app/#code=${encodeURIComponent(r.code)}`,
+  });
 }
 
-async function load(refresh) {
-  const state = await api("GET", "/api/state");
-  me = state.me;
-  harnesses = state.harnesses;
-  defaultHarness = state.defaultHarness;
-  bots = state.bots;
-  approvals = [];
-  (state.approvals || []).forEach(upsertApproval);
-  if (state.policy) globalPolicy = state.policy;
-  if (refresh) for (const id of Object.keys(messages)) messages[id] = await api("GET", `/api/bots/${id}/messages`);
-  await open(activeId);
-}
-
-// Events
-$("bot-list").addEventListener("click", (e) => {
-  const row = e.target.closest(".bot-row");
-  if (row) open(row.dataset.id);
-});
-$("primary-bot").addEventListener("click", () => open(primary()?.id));
-
-$("messages").addEventListener("click", (e) => {
-  if (e.target.closest("#stop")) return void api("POST", `/api/bots/${activeId}/stop`).catch(() => {});
-  const copy = e.target.closest('[data-act="copy"]');
-  if (copy) {
-    const m = messages[activeId]?.find((x) => x.id === +copy.closest(".msg-row").dataset.id);
-    if (m) navigator.clipboard.writeText(m.text);
-    return;
-  }
-  if (e.target.closest(".open-screen")) return void openScreen();
-  const decide = e.target.closest("[data-decide]");
-  if (decide) return void decideApproval(decide.closest(".approval"), decide.dataset.decide);
-  const opt = e.target.closest(".option");
-  if (!opt) return;
-  const card = opt.closest(".question");
-  const m = messages[activeId]?.find((x) => x.id === +card.dataset.id);
-  if (!m || m.question.picked != null) return;
-  m.question.picked = +opt.dataset.k;
-  render(true);
-  sendText(m.question.options[m.question.picked], { messageId: m.id, option: m.question.picked });
-});
-
-$("composer").addEventListener("submit", (e) => {
-  e.preventDefault();
-  const text = $("input").value.trim();
-  if (!text) return;
-  $("input").value = "";
-  sendText(text);
-});
-
-// New Bot window
-const COLORS = ["#f5f5f5", "#9a6b3f", "#e5484d", "#e8702e", "#e9a23b", "#4cc06a", "#4fb5a5", "#3b82f6", "#8b5cf6", "#e64a9c", "#7a7a7a"];
-const HARNESS_NAMES = { claude: "Claude Code", codex: "Codex", pi: "Pi", hermes: "Hermes Agent" };
-const nb = { color: COLORS[0], shape: "waddle", harness: "claude" };
-const pickOne = (a) => a[Math.floor(Math.random() * a.length)];
-
-function renderNewBot() {
-  $("nb-preview").innerHTML = avatar(nb.color, nb.shape, 150);
-  $("nb-shapes").innerHTML = Object.keys(SHAPES).map((s) =>
-    `<button type="button" class="nb-shape" data-shape="${s}" title="${s}">${avatar(nb.color, s, 60, s === nb.shape)}</button>`).join("");
-  $("nb-colors").innerHTML = COLORS.map((c) =>
-    `<button type="button" class="nb-color ${c === nb.color ? "on" : ""}" data-color="${c}" style="background:${c}" title="${c}"></button>`).join("");
-  const list = harnesses.length ? harnesses : Object.keys(HARNESS_NAMES);
-  $("nb-harness").innerHTML = list.map((h) =>
-    `<option value="${h}" ${h === nb.harness ? "selected" : ""}>${HARNESS_NAMES[h] || h}</option>`).join("");
-  $("nb-create").disabled = !$("nb-name").value.trim();
-}
-
-function openNewBot() {
-  Object.assign(nb, { color: pickOne(COLORS), shape: pickOne(Object.keys(SHAPES)), harness: defaultHarness });
-  $("nb-name").value = "";
-  $("nb-error").hidden = true;
-  renderNewBot();
-  $("nb").hidden = false;
-  $("nb-name").focus();
-}
-const closeNewBot = () => { $("nb").hidden = true; };
-
-$("new-btn").addEventListener("click", openNewBot);
-$("nb-close").addEventListener("click", closeNewBot);
-$("nb-cancel").addEventListener("click", closeNewBot);
-$("nb").addEventListener("mousedown", (e) => { if (e.target === $("nb")) closeNewBot(); });
-document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("nb").hidden) closeNewBot(); });
-$("nb-name").addEventListener("input", () => { $("nb-create").disabled = !$("nb-name").value.trim(); });
-$("nb-form").addEventListener("click", (e) => {
-  const t = e.target.closest("[data-shape], [data-color]");
+$("users-rows").addEventListener("click", async (e) => {
+  const t = e.target.closest("button[data-act]");
   if (!t) return;
-  if (t.dataset.shape) nb.shape = t.dataset.shape;
-  if (t.dataset.color) nb.color = t.dataset.color;
-  renderNewBot();
-});
-$("nb-harness").addEventListener("change", (e) => { nb.harness = e.target.value; });
-$("nb-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const name = $("nb-name").value.trim();
-  if (!name) return;
-  $("nb-create").disabled = true;
+  const u = users.find((x) => x.id === t.closest("tr").dataset.user);
+  if (!u) return;
+  t.disabled = true;
   try {
-    const b = await api("POST", "/api/bots", { name, color: nb.color, shape: nb.shape, harness: nb.harness });
-    upsertBot(b);
-    closeNewBot();
-    open(b.id);
-  } catch (err) {
-    $("nb-error").textContent = err.message;
-    $("nb-error").hidden = false;
-    $("nb-create").disabled = false;
-  }
-});
-
-// Bot details: a right-hand panel, opened by clicking the name at the top of the chat.
-const ICONS = {
-  clock: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>',
-  job: '<svg viewBox="0 0 24 24"><rect x="4" y="7" width="16" height="12" rx="2"/><path d="M9 7V5.5A1.5 1.5 0 0 1 10.5 4h3A1.5 1.5 0 0 1 15 5.5V7"/></svg>',
-  chevron: '<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>',
-  trash: '<svg viewBox="0 0 24 24"><path d="M5 7h14M10 7V5h4v2M7 7l1 12h8l1-12"/></svg>',
-};
-const details = { open: false, tab: "activity", routines: [] };
-
-async function openDetails() {
-  details.open = true;
-  if (!$("screen").hidden) closeScreen(); // one right-hand panel at a time
-  details.routines = [];
-  renderDetails();
-  try { details.routines = await api("GET", `/api/bots/${activeId}/routines`); } catch {}
-  renderDetails();
-}
-function closeDetails() { details.open = false; renderDetails(); }
-
-function renderDetails() {
-  const el = $("details");
-  const b = bot(activeId);
-  el.hidden = !details.open || !b;
-  if (el.hidden) return;
-  const toggle = (on, attrs) => `<button type="button" class="switch ${on ? "on" : ""}" ${attrs}><span></span></button>`;
-  const routines = details.routines.length
-    ? details.routines.map((r) => `<div class="d-item"><div class="d-text"><div>${esc(r.name)}</div><div class="d-sub">${esc(r.cron)}</div></div>
-        ${toggle(r.enabled, `data-routine="${r.id}" title="${r.enabled ? "Pause" : "Resume"}"`)}</div>`).join("")
-    : `<div class="d-item d-empty">No routines yet.</div>`;
-  const activity = `
-    <div class="d-section"><span>Suggested</span></div>
-    <div class="d-card">
-      <button class="d-item d-link" data-prefill="Set up a routine to ">${ICONS.clock}<span>Create a routine</span>${ICONS.chevron}</button>
-      <button class="d-item d-link" data-prefill="Your job: ">${ICONS.job}<span>Give it a job</span>${ICONS.chevron}</button>
-    </div>
-    <div class="d-section"><span>Routines</span></div>
-    <div class="d-card">${routines}</div>
-    <div class="d-section"><span>Computer</span></div>
-    <div class="d-card"><div class="d-item d-computer">
-      <div class="d-text"><div>Bot's computer</div><div class="d-sub">${b.working ? esc(b.status || "Working") : "Asleep"}</div></div>
-      <div class="d-screen ${b.working ? "awake" : ""}">${avatar(b.color, b.shape, 40)}${b.working ? "" : "<i>z</i>"}</div>
-    </div></div>`;
-  const list = harnesses.length ? harnesses : Object.keys(HARNESS_NAMES);
-  const settings = `
-    <div class="d-section"><span>Bot</span></div>
-    <div class="d-card">
-      <label class="d-item"><span class="d-text">Runs on</span>
-        <select id="d-harness">${list.map((h) => `<option value="${h}" ${h === b.harness ? "selected" : ""}>${HARNESS_NAMES[h] || h}</option>`).join("")}</select></label>
-      <div class="d-item"><span class="d-text">Hide from sidebar</span>${toggle(b.hidden, 'id="d-hide"')}</div>
-      <label class="d-item"><span class="d-text">Risky actions</span>
-        <select id="d-policy">
-          <option value="" ${b.policyOverride ? "" : "selected"}>Like all Bots (${globalPolicy.mode === "ask" ? "ask" : "bypass"})</option>
-          <option value="ask" ${b.policyOverride && b.policy === "ask" ? "selected" : ""}>Ask me first</option>
-          <option value="bypass" ${b.policyOverride && b.policy === "bypass" ? "selected" : ""}>Bypass (dev only)</option>
-        </select></label>
-    </div>
-    ${b.primary ? "" : `<div class="d-card"><button class="d-item d-link d-danger" id="d-delete">${ICONS.trash}<span>Delete Bot</span></button></div>`}`;
-  el.innerHTML = `
-    <button class="d-close" id="d-close" title="Close"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
-    <div class="d-hero">${avatar(b.color, b.shape, 120)}
-      <input class="d-name" id="d-name" value="${esc(b.name)}" maxlength="60" title="Rename" spellcheck="false" /></div>
-    <div class="d-tabs">
-      <button data-tab="activity" class="${details.tab === "activity" ? "on" : ""}">Activity</button>
-      <button data-tab="settings" class="${details.tab === "settings" ? "on" : ""}">Settings</button>
-    </div>
-    ${details.tab === "activity" ? activity : settings}`;
-}
-
-async function patchBot(body) {
-  try { upsertBot(await api("PATCH", `/api/bots/${activeId}`, body)); render(true); renderDetails(); }
-  catch (err) { alert(err.message); }
-}
-
-$("bot-pill").addEventListener("click", () => (details.open ? closeDetails() : openDetails()));
-$("details").addEventListener("click", async (e) => {
-  const t = e.target.closest("button");
-  if (!t) return;
-  if (t.id === "d-close") return closeDetails();
-  if (t.dataset.tab) { details.tab = t.dataset.tab; return renderDetails(); }
-  if (t.dataset.prefill) { $("input").value = t.dataset.prefill; $("input").focus(); return; }
-  if (t.id === "d-hide") return patchBot({ hidden: !bot(activeId).hidden });
-  if (t.dataset.routine) {
-    const r = details.routines.find((x) => x.id === t.dataset.routine);
-    try { Object.assign(r, await api("PATCH", `/api/routines/${r.id}`, { enabled: !r.enabled })); } catch (err) { alert(err.message); }
-    return renderDetails();
-  }
-  if (t.id === "d-delete") {
-    const b = bot(activeId);
-    if (confirm(`Delete ${b.name}? This erases its chat, memory, and routines. Files on the computer stay.`)) {
-      try { await api("DELETE", `/api/bots/${b.id}`); closeDetails(); } catch (err) { alert(err.message); }
+    if (t.dataset.act === "code") await newCode(u, true);
+    if (t.dataset.act === "status") {
+      const disable = u.status === "active";
+      if (disable && !confirm(`Disable ${u.name}? They are signed out everywhere and can't sign in until enabled.`)) return;
+      await api("PATCH", `/api/users/${key(u.id)}`, { status: disable ? "disabled" : "active" });
     }
+    if (t.dataset.act === "sessions") {
+      if (!confirm(`Sign ${u.name} out of every session?`)) return;
+      const r = await api("DELETE", `/api/users/${key(u.id)}/sessions`);
+      notice(`Ended ${r.revoked} session${r.revoked === 1 ? "" : "s"}.`, false);
+    }
+  } catch (err) {
+    fail(err);
+  } finally {
+    t.disabled = false;
+    loadUsers();
   }
-});
-$("details").addEventListener("change", async (e) => {
-  if (e.target.id === "d-harness") return patchBot({ harness: e.target.value });
-  if (e.target.id !== "d-policy") return;
-  const mode = e.target.value;
-  try {
-    await (mode ? api("PUT", `/api/bots/${activeId}/policy`, { mode }) : api("DELETE", `/api/bots/${activeId}/policy`));
-  } catch (err) { alert(err.message); }
 });
 
-const closeApprovals = () => { $("ap").hidden = true; };
-$("approvals-btn").addEventListener("click", () => { $("ap").hidden = false; renderApprovals(); });
-$("ap-close").addEventListener("click", closeApprovals);
-$("ap").addEventListener("mousedown", (e) => { if (e.target === $("ap")) closeApprovals(); });
-document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("ap").hidden) closeApprovals(); });
-$("ap-list").addEventListener("click", (e) => {
-  const t = e.target.closest("[data-decide]");
-  if (t) decideApproval(t.closest(".approval"), t.dataset.decide);
-});
-$("ap-mode").addEventListener("change", async (e) => {
-  const mode = e.target.value;
-  if (mode === "bypass" && !confirm("Let every Bot run risky actions without asking? Use this only on a dev machine.")) {
-    e.target.value = globalPolicy.mode;
-    return;
+$("users-rows").addEventListener("change", async (e) => {
+  if (e.target.dataset.act !== "role") return;
+  const u = users.find((x) => x.id === e.target.closest("tr").dataset.user);
+  try {
+    await api("PATCH", `/api/users/${key(u.id)}`, { role: e.target.value });
+  } catch (err) {
+    fail(err);
   }
-  try { globalPolicy = (await api("PUT", "/api/policy", { mode })).policy; } catch (err) { alert(err.message); }
-  render(true);
+  loadUsers();
 });
-document.addEventListener("change", (e) => {
-  const card = e.target.closest(".ap-remember") && e.target.closest(".approval");
-  if (card) e.target.checked ? remembered.add(card.dataset.approval) : remembered.delete(card.dataset.approval);
+
+$("add-user").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const body = { email: $("add-email").value.trim(), role: $("add-role").value };
+  const name = $("add-name").value.trim();
+  if (name) body.name = name;
+  try {
+    const u = await api("POST", "/api/users", body);
+    $("add-email").value = "";
+    $("add-name").value = "";
+    await newCode(u, false);
+  } catch (err) {
+    fail(err);
+  }
+  loadUsers();
 });
+
+// Requests for access (ADR 0022)
+
+let requests = [];
+const REQUEST_LIMIT = 1000;
+
+async function loadRequests() {
+  const status = $("requests-status").value;
+  try {
+    requests = await api("GET", `/api/signups?status=${status}&limit=${REQUEST_LIMIT}`);
+    $("requests-empty").textContent = status === "pending" ? "Nobody is waiting." : "No requests.";
+    $("requests-empty").hidden = requests.length > 0;
+    $("requests-capped").textContent = `Showing the newest ${REQUEST_LIMIT}. Older requests are in the audit log.`;
+    $("requests-capped").hidden = requests.length < REQUEST_LIMIT;
+    if (status === "pending") setRequestCount(requests.length);
+  } catch (err) {
+    requests = [];
+    $("requests-capped").hidden = true;
+    $("requests-empty").textContent = err.message;
+    $("requests-empty").hidden = false;
+  }
+  renderRequests();
+}
+
+function setRequestCount(n) {
+  $("requests-count").textContent = n || "";
+}
+async function refreshRequestCount() {
+  try { setRequestCount((await api("GET", `/api/signups?status=pending&limit=${REQUEST_LIMIT}`)).length); } catch {}
+}
+
+function renderRequests() {
+  $("requests-list").innerHTML = requests.map((s) => {
+    const decided = s.status === "approved"
+      ? `<p class="sub">Approved as ${esc(ROLES[s.role] || s.role)} on ${esc(fmt(s.decidedAt))}.</p>`
+      : `<p class="sub">Rejected on ${esc(fmt(s.decidedAt))}${s.reason ? `: ${esc(s.reason)}` : "."}</p>`;
+    const actions = s.existingUser
+      ? `<p class="warn">A user with this email exists already. Reject this request, or give them a code from Users.</p>
+         <div class="actions"><button type="button" class="btn" data-act="reject">Reject</button></div>`
+      : `<div class="actions">
+           <select data-role title="Role">${roleOptions("member")}</select>
+           <button type="button" class="btn primary" data-act="approve">Approve</button>
+           <button type="button" class="btn" data-act="reject">Reject</button>
+         </div>`;
+    return `<div class="card" data-signup="${esc(s.id)}">
+      <div><b>${esc(s.name)}</b> <span class="sub">${esc(s.email)}</span></div>
+      <div class="sub">${esc(s.company)} · ${esc(s.teamSize)} people · signs in with ${esc(s.signIn)} · ${esc(fmt(s.createdAt))}</div>
+      <p class="use">${esc(s.useCase)}</p>
+      ${s.status === "pending" ? actions : decided}
+    </div>`;
+  }).join("");
+}
+
+$("requests-status").addEventListener("change", loadRequests);
+$("requests-list").addEventListener("click", async (e) => {
+  const t = e.target.closest("button[data-act]");
+  if (!t) return;
+  const card = t.closest(".card");
+  const s = requests.find((x) => x.id === card.dataset.signup);
+  if (!s) return;
+  try {
+    if (t.dataset.act === "approve") {
+      t.disabled = true;
+      const role = card.querySelector("[data-role]").value;
+      const r = await api("POST", `/api/signups/${key(s.id)}/approve`, { role, ttlMinutes: +$("request-ttl").value });
+      const sso = (r.sso || []).map((p) => p.label || p.id).join(", ");
+      const extra = [r.emailed ? "It was emailed to them too." : "", sso ? `They could use ${sso} once you link it in the app's Users page.` : ""].join(" ");
+      showOnce({ title: `Sign-in code for ${r.user.name}`, note: codeNote(r.expiresAt, extra), value: r.code, link: `${location.origin}/app/#code=${encodeURIComponent(r.code)}` });
+    }
+    if (t.dataset.act === "reject") {
+      const reason = prompt(`Reject ${s.name}'s request? Reason (optional, only admins see it):`, "");
+      if (reason === null) return;
+      await api("POST", `/api/signups/${key(s.id)}/reject`, { reason: reason.trim() || null });
+    }
+  } catch (err) {
+    fail(err);
+  } finally {
+    t.disabled = false;
+  }
+  loadRequests();
+  refreshRequestCount();
+});
+
+// Machines: one per user from the control plane (ADR 0025). Off unless it's configured.
+
+let machines = [];
+
+async function loadMachines() {
+  let off = false;
+  try {
+    machines = await api("GET", "/api/machines");
+    $("machines-empty").textContent = "No machines yet.";
+  } catch (err) {
+    machines = [];
+    off = err.status === 503;
+    $("machines-empty").textContent = err.message;
+  }
+  $("give-machine").hidden = off;
+  renderMachines();
+}
+
+function machineActions(m) {
+  const b = (act, label) => `<button type="button" class="btn" data-act="${act}">${label}</button>`;
+  switch (m.state) {
+    case "running": return b("suspend", "Suspend") + b("resize", "Resize") + b("destroy", "Destroy");
+    case "suspended": return b("resume", "Resume") + b("resize", "Resize") + b("destroy", "Destroy");
+    case "error": return b("retry", "Retry") + b("destroy", "Destroy");
+    case "destroyed": return "";
+    default: return b("destroy", "Destroy");
+  }
+}
+
+function renderMachines() {
+  const list = $("machines-destroyed").checked ? machines : machines.filter((m) => m.state !== "destroyed");
+  $("machines-empty").hidden = list.length > 0;
+  $("machines-rows").innerHTML = list.map((m) => `<tr data-machine="${esc(m.id)}">
+      <td>${esc(m.userEmail || m.userId)}</td>
+      <td>${esc(m.state)}${m.providerStatus ? `<div class="sub">${esc(m.providerStatus)}</div>` : ""}${m.lastError ? `<div class="sub bad">${esc(m.lastError)}</div>` : ""}</td>
+      <td>${esc(m.tier)}<div class="sub">${esc(m.plan)}</div></td>
+      <td>${esc(m.region)}</td>
+      <td>${esc(m.ipv4 || "")}</td>
+      <td>${esc(fmt(m.updatedAt))}</td>
+      <td class="actions">${machineActions(m)}</td>
+    </tr>`).join("");
+}
+
+$("machines-destroyed").addEventListener("change", renderMachines);
+$("machines-rows").addEventListener("click", async (e) => {
+  const t = e.target.closest("button[data-act]");
+  if (!t) return;
+  const m = machines.find((x) => x.id === t.closest("tr").dataset.machine);
+  if (!m) return;
+  const who = m.userEmail || m.userId;
+  t.disabled = true;
+  try {
+    if (t.dataset.act === "suspend") await api("POST", `/api/users/${key(m.userId)}/machine/suspend`);
+    if (t.dataset.act === "resume") await api("POST", `/api/users/${key(m.userId)}/machine/resume`);
+    if (t.dataset.act === "retry") await api("POST", `/api/users/${key(m.userId)}/machine`);
+    if (t.dataset.act === "resize") {
+      const tier = prompt(`Move ${who}'s machine to which tier? The provider may restart it.`, m.tier)?.trim();
+      if (!tier || tier === m.tier) return;
+      await api("POST", `/api/users/${key(m.userId)}/machine/resize`, { tier });
+    }
+    if (t.dataset.act === "destroy") {
+      if (!confirm(`Destroy ${who}'s machine and its disks? This can't be undone.`)) return;
+      await api("DELETE", `/api/users/${key(m.userId)}/machine`);
+    }
+  } catch (err) {
+    fail(err);
+  } finally {
+    t.disabled = false;
+    loadMachines();
+  }
+});
+
+$("give-machine").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const body = {};
+  for (const f of ["tier", "region"]) {
+    const v = $(`machine-${f}`).value.trim();
+    if (v) body[f] = v;
+  }
+  try {
+    await api("POST", `/api/users/${key($("machine-user").value.trim())}/machine`, body);
+    $("machine-user").value = "";
+  } catch (err) {
+    fail(err);
+  }
+  loadMachines();
+});
+
+$("machines-reconcile").addEventListener("click", async () => {
+  try {
+    const r = await api("POST", "/api/machines/reconcile");
+    notice(`Checked ${r.checked}, changed ${r.changed}.`, false);
+  } catch (err) {
+    fail(err);
+  }
+  loadMachines();
+});
+
 // Audit log: append-only record of sign-ins and admin actions (docs/adr/0009-audit-events.md),
 // with who acted and how they signed in (docs/adr/0019-audit-actors.md).
 // `query` is the filter the shown rows came from; Load more pages with it, not the form.
@@ -717,11 +413,9 @@ async function loadAudit(more) {
   renderAudit();
 }
 
-const SIGN_IN = { password: "Password (break-glass)", code: "Sign-in code", sso: "SSO", none: "No auth (dev)", bot_token: "Bot token" };
-
 function renderAudit() {
   const who = (e) => {
-    if (e.actorKind === "bot") return e.actorName || bot(e.actorId)?.name || e.actorId || "A Bot";
+    if (e.actorKind === "bot") return e.actorName || e.actorId || "A Bot";
     if (e.actorKind === "user") return e.actorName || e.actorEmail || e.actorId || "Unknown person";
     return `System${e.actorId ? ` · ${e.actorId}` : ""}`;
   };
@@ -740,7 +434,7 @@ function renderAudit() {
   const details = (e) => { const s = JSON.stringify(e.details ?? {}); return s === "{}" ? "" : s; };
   $("au-rows").innerHTML = audit.events.map((e) => `<tr class="${e.outcome === "success" ? "" : "au-bad"}">
       <td title="${esc(e.time)}">${esc(new Date(e.at).toLocaleString())}</td>
-      <td class="au-who" title="${esc(tip(e))}">${esc(who(e))}${how(e) ? `<span class="au-how">${esc(how(e))}</span>` : ""}</td>
+      <td class="au-who" title="${esc(tip(e))}">${esc(who(e))}${how(e) ? `<span class="sub">${esc(how(e))}</span>` : ""}</td>
       <td><code>${esc(e.action)}</code></td>
       <td>${esc(target(e))}</td>
       <td>${esc(e.outcome)}</td>
@@ -753,15 +447,6 @@ function renderAudit() {
 }
 
 let auditTimer = null;
-const closeAudit = () => { $("au").hidden = true; };
-$("signout-btn").addEventListener("click", async () => {
-  await api("POST", "/api/auth/logout").catch(() => {});
-  location.href = "/login";
-});
-$("audit-btn").addEventListener("click", () => { $("au").hidden = false; loadAudit(); });
-$("au-close").addEventListener("click", closeAudit);
-$("au").addEventListener("mousedown", (e) => { if (e.target === $("au")) closeAudit(); });
-document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("au").hidden) closeAudit(); });
 $("au-more").addEventListener("click", () => loadAudit(true));
 $("au-filters").addEventListener("submit", (e) => { e.preventDefault(); loadAudit(); });
 $("au-filters").addEventListener("change", () => loadAudit());
@@ -769,26 +454,158 @@ for (const id of ["au-action", "au-person"]) {
   $(id).addEventListener("input", () => { clearTimeout(auditTimer); auditTimer = setTimeout(() => loadAudit(), 300); });
 }
 
-// Keep the "Denied in N minutes" countdowns fresh.
-setInterval(() => { if (approvals.length) render(true); }, 30000);
-$("details").addEventListener("keydown", (e) => { if (e.target.id === "d-name" && e.key === "Enter") e.target.blur(); });
-$("details").addEventListener("focusout", (e) => {
-  if (e.target.id !== "d-name") return;
-  const name = e.target.value.trim();
-  if (name && name !== bot(activeId)?.name) patchBot({ name });
-  else e.target.value = bot(activeId)?.name ?? "";
-});
-document.addEventListener("keydown", (e) => { if (e.key === "Escape" && details.open && $("nb").hidden) closeDetails(); });
+// Settings
 
-$("hidden-btn").addEventListener("click", () => { showHidden = !showHidden; renderSidebar(); });
-$("search-btn").addEventListener("click", () => {
-  const s = $("search");
-  s.hidden = !s.hidden;
-  if (!s.hidden) s.focus(); else { filter = ""; s.value = ""; renderSidebar(); }
-});
-$("search").addEventListener("input", (e) => { filter = e.target.value; renderSidebar(); });
-$("messages").addEventListener("scroll", updateScrollBtn);
-$("scroll-down").addEventListener("click", () => $("messages").scrollTo({ top: $("messages").scrollHeight, behavior: "smooth" }));
-window.addEventListener("focus", () => { markRead(); renderSidebar(); });
+let policyMode = "ask";
 
-load().then(connect).catch((err) => { $("messages").innerHTML = `<div class="timestamp">Can't reach the server: ${esc(err.message)}</div>`; });
+async function loadSettings() {
+  try {
+    policyMode = (await api("GET", "/api/policy")).policy.mode;
+    $("policy-mode").value = policyMode;
+  } catch (err) {
+    fail(err);
+  }
+  loadSignIn();
+  loadSecrets();
+  loadScim();
+}
+
+$("policy-mode").addEventListener("change", async (e) => {
+  const mode = e.target.value;
+  if (mode === "bypass" && !confirm("Let every Bot run risky actions without asking? Use this only on a dev machine.")) {
+    e.target.value = policyMode;
+    return;
+  }
+  try {
+    policyMode = (await api("PUT", "/api/policy", { mode })).policy.mode;
+  } catch (err) {
+    fail(err);
+  }
+  e.target.value = policyMode;
+});
+
+async function loadSignIn() {
+  let providers = [];
+  try { providers = (await api("GET", "/api/auth/sso")).providers || []; } catch {}
+  const sso = providers.length ? `SSO: ${providers.map((p) => `${p.label || p.id} (${p.type || "oidc"})`).join(", ")}.` : "No SSO providers are set up (SSO_PROVIDERS).";
+  const glass = me.breakGlass ? "Break-glass password sign-in at /login is on (AUTH_BREAK_GLASS)." : "Break-glass password sign-in is off.";
+  $("signin-info").textContent = `${glass} ${sso} Sign-in codes come from Users.`;
+}
+
+let secrets = [];
+
+async function loadSecrets() {
+  try {
+    secrets = (await api("GET", "/api/secrets")).secrets || [];
+    $("secrets-empty").textContent = "No server secrets.";
+  } catch (err) {
+    secrets = [];
+    $("secrets-empty").textContent = err.message;
+  }
+  $("secrets-empty").hidden = secrets.length > 0;
+  $("secrets-rows").innerHTML = secrets.map((s) => {
+    const notes = [s.shadowedBy && `Overridden by ${s.shadowedBy}`, s.forBots === false && "Server only, no Bot gets it"].filter(Boolean).join(" · ");
+    return `<tr data-secret="${esc(s.name)}">
+      <td><code>${esc(s.name)}</code></td><td>${esc(s.store)}</td><td><span class="sub">${esc(notes)}</span></td>
+      <td class="actions">${s.writable ? '<button type="button" class="btn" data-act="delete">Delete</button>' : ""}</td>
+    </tr>`;
+  }).join("");
+}
+
+$("secret-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const name = $("secret-name").value.trim();
+  try {
+    await api("PUT", `/api/secrets/${key(name)}`, { value: $("secret-value").value });
+    $("secret-name").value = "";
+    $("secret-value").value = "";
+    notice(`Saved ${name}.`, false);
+  } catch (err) {
+    fail(err);
+  }
+  loadSecrets();
+});
+
+$("secrets-rows").addEventListener("click", async (e) => {
+  const t = e.target.closest("button[data-act=delete]");
+  if (!t) return;
+  const name = t.closest("tr").dataset.secret;
+  if (!confirm(`Delete the secret ${name}? Bots that use it lose it on their next run.`)) return;
+  try { await api("DELETE", `/api/secrets/${key(name)}`); } catch (err) { fail(err); }
+  loadSecrets();
+});
+
+let scimTokens = [];
+
+async function loadScim() {
+  try {
+    const r = await api("GET", "/api/scim/tokens");
+    scimTokens = r.tokens || [];
+    $("scim-info").textContent = `${r.enabled ? "SCIM is on" : "SCIM is off (set SCIM=on to turn it on)"}. Provisioned people get the ${ROLES[r.defaultRole] || r.defaultRole} role. Endpoint: ${location.origin}/scim/v2`;
+    $("scim-empty").textContent = "No SCIM tokens.";
+  } catch (err) {
+    scimTokens = [];
+    $("scim-info").textContent = "";
+    $("scim-empty").textContent = err.message;
+  }
+  $("scim-empty").hidden = scimTokens.length > 0;
+  $("scim-rows").innerHTML = scimTokens.map((t) => `<tr data-token="${esc(t.id)}" class="${t.revokedAt ? "revoked" : ""}">
+      <td>${esc(t.tenant)}</td><td>${esc(t.label || "")}</td><td>${esc(t.ssoProvider || "")}</td>
+      <td>${esc(fmt(t.createdAt))}</td><td>${esc(fmt(t.lastUsedAt))}</td>
+      <td class="actions">${t.revokedAt ? `Revoked ${esc(fmt(t.revokedAt))}` : '<button type="button" class="btn" data-act="revoke">Revoke</button>'}</td>
+    </tr>`).join("");
+}
+
+$("scim-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const body = { tenant: $("scim-tenant").value.trim() };
+  const label = $("scim-label").value.trim(), sso = $("scim-sso").value.trim();
+  if (label) body.label = label;
+  if (sso) body.sso = sso;
+  try {
+    const r = await api("POST", "/api/scim/tokens", body);
+    for (const id of ["scim-tenant", "scim-label", "scim-sso"]) $(id).value = "";
+    showOnce({ title: `SCIM token for ${r.scimToken.tenant}`, note: "Paste it into your identity provider's provisioning settings now. It can't be shown again.", value: r.token });
+  } catch (err) {
+    fail(err);
+  }
+  loadScim();
+});
+
+$("scim-rows").addEventListener("click", async (e) => {
+  const t = e.target.closest("button[data-act=revoke]");
+  if (!t) return;
+  const tok = scimTokens.find((x) => x.id === t.closest("tr").dataset.token);
+  if (!tok || !confirm(`Revoke this ${tok.tenant} token? The identity provider can't provision with it any more.`)) return;
+  try { await api("DELETE", `/api/scim/tokens/${key(tok.id)}`); } catch (err) { fail(err); }
+  loadScim();
+});
+
+// Tabs, from the address bar's #fragment so a reload keeps your place.
+
+const TABS = { users: loadUsers, requests: loadRequests, machines: loadMachines, audit: () => loadAudit(), settings: loadSettings };
+
+function showTab() {
+  const name = location.hash.slice(1);
+  const tab = name in TABS ? name : "users";
+  for (const t of Object.keys(TABS)) $(`tab-${t}`).hidden = t !== tab;
+  for (const a of document.querySelectorAll("#tabs a")) a.classList.toggle("on", a.dataset.tab === tab);
+  TABS[tab]();
+}
+window.addEventListener("hashchange", showTab);
+
+$("signout-btn").addEventListener("click", async () => {
+  await api("POST", "/api/auth/logout").catch(() => {});
+  location.href = "/login";
+});
+
+let me = {};
+async function start() {
+  me = await api("GET", "/api/auth/me");
+  if (!(me.permissions || []).includes("admin")) return location.replace("/app/");
+  $("me-name").textContent = me.user?.name || "";
+  showTab();
+  refreshRequestCount();
+}
+
+start().catch((err) => notice(`Can't reach the server: ${err.message}`));
