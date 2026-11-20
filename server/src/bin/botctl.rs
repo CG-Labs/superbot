@@ -204,7 +204,11 @@ fn api(cred: Cred, method: &str, path: &str, body: Option<String>) -> Result<Str
 }
 
 fn failure(code: u16, body: &str) -> String {
-    let msg = serde_json::from_str::<Value>(body).ok().and_then(|v| v["error"].as_str().map(String::from)).unwrap_or(body.into());
+    #[derive(serde::Deserialize)]
+    struct Failure {
+        error: String,
+    }
+    let msg = <Failure as serde::Deserialize>::deserialize(&mut serde_json::Deserializer::from_str(body)).map(|f| f.error).unwrap_or(body.into());
     format!("{msg} (HTTP {code})")
 }
 
@@ -1033,6 +1037,13 @@ mod tests {
 
     /// Held by tests that set botctl's environment variables.
     static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn a_failure_shows_the_servers_error() {
+        assert_eq!(failure(403, r#"{"error":"not allowed"}"#), "not allowed (HTTP 403)");
+        assert_eq!(failure(502, "Bad Gateway"), "Bad Gateway (HTTP 502)");
+        assert_eq!(failure(400, r#"{"error":7}"#), r#"{"error":7} (HTTP 400)"#);
+    }
 
     #[test]
     fn handover_names_the_disabled_user_and_who_takes_over() {
