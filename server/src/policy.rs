@@ -805,10 +805,15 @@ fn deletion(ctx: &Ctx, cwds: &Cwds, target: &str, push: &mut impl FnMut(&'static
 }
 
 /// Whether `git config` sets push config: such a key with a value after it, in the old
-/// form (`git config [--add] k v`) or the new one (`git config set k v`). Reads and unsets
-/// have no value after the key.
+/// form (`git config [--add] k v`) or the new one (`git config set k v`). Reads, unsets and
+/// renames don't, even with a value pattern after the key (`--get k '.*'`).
 fn sets_push_config(rest: &[&str]) -> bool {
-    operands(rest).windows(2).any(|w| push_config(w[0]))
+    const NOT_SETTING: [&str; 12] = ["--get", "--get-all", "--get-regexp", "--get-urlmatch", "--get-color", "--get-colorbool", "--list", "-l", "--unset", "--unset-all", "--rename-section", "--remove-section"];
+    let ops = operands(rest);
+    if rest.iter().any(|a| NOT_SETTING.contains(a)) || ops.first().is_some_and(|o| ["get", "list", "unset", "rename-section", "remove-section"].contains(o)) {
+        return false;
+    }
+    ops.windows(2).any(|w| push_config(w[0]))
 }
 
 /// Arguments that are not flags. Everything after `--` is an operand.
@@ -1229,7 +1234,7 @@ mod tests {
         for cmd in ["git config remote.origin.push +refs/heads/*:refs/heads/*", "git config set remote.origin.mirror true", "git config --file x.cfg --add Remote.Origin.Push +main", "git config alias.p 'push --force'", "git config push.default matching"] {
             assert_eq!(cls(cmd), ["git_push"], "{cmd}");
         }
-        for cmd in ["git config remote.origin.push", "git config get remote.origin.mirror", "git config --unset remote.origin.push", "git config user.name Ada", "git config remote.origin.url https://example.invalid/r.git"] {
+        for cmd in ["git config remote.origin.push", "git config get remote.origin.mirror", "git config --unset remote.origin.push", "git config --get remote.origin.push '.*'", "git config --get-all remote.origin.push +", "git config --unset-all remote.origin.push '^\\+'", "git config get --all --value=x remote.origin.push", "git config --rename-section alias.a alias.b", "git config user.name Ada", "git config remote.origin.url https://example.invalid/r.git"] {
             assert!(cls(cmd).is_empty(), "{cmd}");
         }
     }
