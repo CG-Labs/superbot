@@ -339,12 +339,20 @@ impl Screens {
             Some(_) => Some(Zeroizing::new(random16().map_err(|e| fail(500, format!("No randomness for the screen's cookie: {e}")))?)),
             None => None,
         };
-        // A screen that died leaves its sockets and lock; they're its user's.
+        // A display that was killed leaves its socket and lock in the sticky shared folders,
+        // owned by whoever it ran as, maybe another person: only the agent can remove them,
+        // and one left behind would pass for this display being up.
+        for p in [&socket, &self.s.tmp.join(format!(".X{n}-lock"))] {
+            match std::fs::remove_file(p) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(fail(503, format!("{}: {e}", p.display())));
+                }
+                _ => {}
+            }
+        }
         runas::as_user(Some(who.ids), || -> std::io::Result<()> {
             std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&run)?;
-            for p in [&socket, &self.s.tmp.join(format!(".X{n}-lock")), &bus] {
-                let _ = std::fs::remove_file(p);
-            }
+            let _ = std::fs::remove_file(&bus);
             if let (Some(path), Some(secret)) = (&cookie, &secret) {
                 write_private(path, &xauth_entry(n, secret))?;
             }
@@ -618,6 +626,28 @@ mod tests {
         assert_eq!(screens.report().running, vec!["b1".to_string()], "idle counts from when the last hold ended");
         screens.live().get_mut("b1").unwrap().used = Instant::now() - Duration::from_secs(120);
         screens.reap();
+        assert!(screens.report().running.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_killed_displays_leftovers_never_pass_for_a_new_one() {
+        let (screens, root) = fakes();
+        let x11 = root.join("tmp/.X11-unix");
+        std::fs::create_dir_all(&x11).unwrap();
+        let a = "a".repeat(32);
+
+        // Its socket and lock are cleared before the next display starts on that slot.
+        std::fs::write(x11.join("X101"), "").unwrap();
+        std::fs::write(root.join("tmp/.X101-lock"), "").unwrap();
+        script(&root.join("bin"), "Xvfb", "#!/bin/sh\nexec sleep 60\n");
+        let e = screens.ensure("b1", &req(&a), me()).await.unwrap_err();
+        assert_eq!(e.0, 503, "{e:?}");
+        assert!(!x11.join("X101").exists() && !root.join("tmp/.X101-lock").exists());
+
+        // One that can't be cleared refuses the slot rather than trusting it.
+        std::fs::create_dir_all(x11.join("X101/stuck")).unwrap();
+        let e = screens.ensure("b1", &req(&a), me()).await.unwrap_err();
+        assert!(e.0 == 503 && e.1.contains("X101"), "{e:?}");
         assert!(screens.report().running.is_empty());
     }
 
