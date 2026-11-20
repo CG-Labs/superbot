@@ -8,6 +8,8 @@
 #[allow(dead_code)]
 pub mod agent;
 pub mod botuser;
+#[cfg(test)]
+pub mod display;
 pub mod enroll;
 
 #[cfg(test)]
@@ -23,6 +25,7 @@ pub mod pki;
 pub mod provider;
 pub mod route;
 pub mod runas;
+pub mod screens;
 #[cfg(test)]
 pub mod terminal;
 pub mod tools;
@@ -813,6 +816,7 @@ pub async fn heartbeats(app: &AppState, cp: &ControlPlane) -> Option<usize> {
         .filter(|ok| std::future::ready(*ok))
         .count()
         .await;
+    screens::reap(app).await;
     Some(answered)
 }
 

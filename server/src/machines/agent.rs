@@ -27,7 +27,9 @@
 //!   `/usr/local/lib/superbot/superbot-machine`).
 //! - `SUPERBOT_BOT_USER`: the OS user Bots run as once botd asks (ADR 0043; default
 //!   `superbot-bots`). Never root, nor the agent's own user.
+//! - `SUPERBOT_MAX_SCREENS`: Bots' screens shown at once (ADR 0045; default 4).
 
+use super::display::{self, Screens};
 use super::job;
 use super::landing::Landing;
 use super::pki::{self, Peer};
@@ -91,6 +93,8 @@ pub struct Config {
     pub bot_user: String,
     /// Lets that be this agent's own user: only for tests, which can't make users.
     pub allow_own_user: bool,
+    /// Bots' screens (ADR 0045).
+    pub screens: display::Settings,
 }
 
 /// Where harnesses and botctl may live, besides the Bots' home: the system's program
@@ -189,6 +193,11 @@ impl Config {
         if !runas::plain_user(&bot_user) || bot_user == "root" {
             return Err("SUPERBOT_BOT_USER must be a plain user name, not root".into());
         }
+        let max_screens = var("SUPERBOT_MAX_SCREENS")
+            .map(|v| v.parse::<u32>().map_err(|_| "SUPERBOT_MAX_SCREENS must be a number"))
+            .transpose()?
+            .unwrap_or(4)
+            .clamp(1, 50);
         Ok(Config {
             control_url,
             machine_id,
@@ -206,6 +215,10 @@ impl Config {
             exe: var("SUPERBOT_AGENT_BIN").unwrap_or_else(|| AGENT_BIN.into()).into(),
             bot_user,
             allow_own_user: false,
+            screens: display::Settings {
+                max: max_screens,
+                ..display::Settings::default()
+            },
         })
     }
 
@@ -582,6 +595,8 @@ pub struct Agent {
     restart: watch::Sender<bool>,
     /// The Bots' own user, once botd asked for one (ADR 0043).
     bot: RwLock<Bot>,
+    /// Bots' screens (ADR 0045).
+    pub screens: Arc<Screens>,
 }
 
 /// Where the Bots' user stands. Once botd has asked, no job runs as root again.
@@ -700,6 +715,7 @@ impl Agent {
         if let Some(ids) = bot.ids {
             landing.set_user(ids);
         }
+        let screens = Arc::new(Screens::new(cfg.screens.clone(), cfg.home.clone(), cfg.bot_user.clone()));
         let a = Arc::new(Agent {
             cfg,
             current: RwLock::new((Arc::new(id), server)),
@@ -710,9 +726,11 @@ impl Agent {
             landing,
             restart: watch::channel(false).0,
             bot: RwLock::new(bot),
+            screens,
         });
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::spawn(a.tools.clone().work());
+            a.screens.reap_in_background();
             if let Some(deadline) = a.upgrader.trial_deadline() {
                 let trial = a.clone();
                 tokio::spawn(async move {
@@ -996,7 +1014,7 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
             .map(|(b, _)| b)
             .collect(),
         jobs: a.running() as u32,
-        can: [wire::CAN_HARNESSES, wire::CAN_LOGINS, wire::CAN_SYNC, wire::CAN_BOT_USER]
+        can: [wire::CAN_HARNESSES, wire::CAN_LOGINS, wire::CAN_SYNC, wire::CAN_BOT_USER, wire::CAN_SCREENS]
             .into_iter()
             .chain(a.upgrader.build.is_some().then_some(wire::CAN_UPGRADE))
             .map(String::from)
@@ -1007,6 +1025,7 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
         upgrade: a.upgrader.report(),
         logins: logins(&a, q.as_deref()),
         bot_user: a.bot().status,
+        screens: Some(a.screens.report()),
     })
 }
 
@@ -1173,8 +1192,10 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
     let _ = work_dirs(&a.cfg, user);
     let (ev_tx, ev_rx) = mpsc::channel::<wire::JobEvent>(256);
     let host = a.cfg.host(user);
+    let screen = a.screens.hold(&j.bot_id);
     tokio::spawn(async move {
         let _running = running;
+        let _screen = screen;
         let abort = async move {
             let _ = stop_rx.wait_for(|s| *s).await;
         };
@@ -1415,6 +1436,97 @@ async fn set_bot_user(State(a): State<Arc<Agent>>, Json(_r): Json<wire::BotUserR
     (StatusCode::ACCEPTED, Json(a.bot().status)).into_response()
 }
 
+/// `PUT /v1/screens/{bot}`: starts the Bot's screen, or gives it a new viewer token
+/// (ADR 0045). Only ever as the Bots' own user: before botd has asked for one, or
+/// while it can't be used, no screen starts.
+async fn put_screen(State(a): State<Arc<Agent>>, UrlPath(bot): UrlPath<String>, Json(r): Json<wire::ScreenRequest>) -> Response {
+    if r.protocol != wire::SCREEN_PROTOCOL {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            format!("This agent speaks screen protocol {}, not {}. Update it.", wire::SCREEN_PROTOCOL, r.protocol),
+        );
+    }
+    if r.owner_id != a.identity().user_id {
+        return refuse(StatusCode::FORBIDDEN, "This machine shows only its own user's Bots.");
+    }
+    if !plain_name(&bot) || !wire::screen_token(&r.token) {
+        return refuse(StatusCode::BAD_REQUEST, "Name a Bot and give a long hex token.");
+    }
+    if !(320..=7680).contains(&r.width) || !(240..=4320).contains(&r.height) {
+        return refuse(StatusCode::BAD_REQUEST, "That screen size is out of range.");
+    }
+    let ids = match a.job_user() {
+        Ok(Some(ids)) => ids,
+        Ok(None) => {
+            return refuse(
+                StatusCode::CONFLICT,
+                "Screens run only as the Bots' own user, and this machine hasn't been asked to set one up.",
+            );
+        }
+        Err(r) => return r,
+    };
+    if a.upgrader.staging() {
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, "This machine is updating its agent. Try again in a minute.");
+    }
+    let missing = a.screens.missing();
+    if !missing.is_empty() {
+        return refuse(StatusCode::UNPROCESSABLE_ENTITY, format!("This machine is missing {}.", missing.join(", ")));
+    }
+    match a.screens.ensure(&bot, &r, ids).await {
+        Ok(reply) => {
+            if reply.started {
+                println!("Screen {} of Bot {bot} started.", reply.display);
+            }
+            Json(reply).into_response()
+        }
+        Err((code, msg)) => refuse(code_or(code, StatusCode::SERVICE_UNAVAILABLE), msg),
+    }
+}
+
+async fn delete_screen(State(a): State<Arc<Agent>>, UrlPath(bot): UrlPath<String>) -> Response {
+    if a.screens.stop(&bot) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        refuse(StatusCode::NOT_FOUND, "No screen is up for that Bot here.")
+    }
+}
+
+/// How long one viewer connection may stay open.
+const TUNNEL_LIFETIME: Duration = Duration::from_secs(12 * 3600);
+
+/// `GET /v1/screens/{bot}/tunnel`: one viewer connection, piped as raw bytes to the
+/// Bot's voxl on loopback. The viewer port itself is never reachable from outside.
+async fn screen_tunnel(State(a): State<Arc<Agent>>, UrlPath(bot): UrlPath<String>, mut req: Request) -> Response {
+    let wants = req.headers().get(header::UPGRADE).and_then(|v| v.to_str().ok());
+    if wants != Some(wire::SCREEN_UPGRADE) {
+        return refuse(StatusCode::BAD_REQUEST, format!("Ask with Upgrade: {}.", wire::SCREEN_UPGRADE));
+    }
+    let (port, hold, permit) = match a.screens.tunnel(&bot) {
+        Ok(t) => t,
+        Err((code, msg)) => return refuse(code_or(code, StatusCode::NOT_FOUND), msg),
+    };
+    let viewer = match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+        Ok(s) => s,
+        Err(e) => return refuse(StatusCode::BAD_GATEWAY, format!("The screen's viewer didn't answer: {e}")),
+    };
+    let Some(on) = req.extensions_mut().remove::<hyper::upgrade::OnUpgrade>() else {
+        return refuse(StatusCode::INTERNAL_SERVER_ERROR, "This connection can't be upgraded.");
+    };
+    tokio::spawn(async move {
+        let _hold = (hold, permit);
+        let Ok(up) = on.await else { return };
+        let mut up = hyper_util::rt::TokioIo::new(up);
+        let mut viewer = viewer;
+        let _ = tokio::time::timeout(TUNNEL_LIFETIME, tokio::io::copy_bidirectional(&mut up, &mut viewer)).await;
+    });
+    Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(header::CONNECTION, "upgrade")
+        .header(header::UPGRADE, wire::SCREEN_UPGRADE)
+        .body(Body::empty())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 pub fn router(a: Arc<Agent>) -> Router {
     Router::new()
         .route("/v1/heartbeat", get(heartbeat))
@@ -1430,6 +1542,8 @@ pub fn router(a: Arc<Agent>) -> Router {
         .route("/v1/sync/{id}/blobs/{sha}", axum::routing::put(sync_blob))
         .route("/v1/sync/{id}/finish", post(sync_finish))
         .route("/v1/bot-user", axum::routing::put(set_bot_user))
+        .route("/v1/screens/{bot}", axum::routing::put(put_screen).delete(delete_screen))
+        .route("/v1/screens/{bot}/tunnel", get(screen_tunnel))
         .layer(DefaultBodyLimit::max(MAX_RELAY_BODY))
         .with_state(a)
 }
@@ -1437,7 +1551,7 @@ pub fn router(a: Arc<Agent>) -> Router {
 pub async fn serve(listener: tokio::net::TcpListener, a: Arc<Agent>) {
     let tls_agent = a.clone();
     let tls: pki::Tls = Arc::new(move || tls_agent.current.read().unwrap().1.clone());
-    pki::serve(listener, tls, router(a), admit).await
+    pki::serve_with(listener, tls, router(a), admit, true).await
 }
 
 /// For the relay: no overall timeout, since an approval can wait a day.

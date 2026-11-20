@@ -51,6 +51,9 @@ pub const DEFAULT_AGENT_PORT: u16 = 7443;
 pub const AGENT_BIN: &str = "superbot-machine";
 /// Bots on a machine run `botctl` there too, served at `/v1/botctl`.
 pub const BOTCTL_BIN: &str = "botctl";
+/// voxl, the screen viewer, served at `/v1/voxl` with MACHINE_SCREENS (ADR 0045): next
+/// to botd, or the one on its PATH.
+pub const VOXL_BIN: &str = "voxl";
 /// A job stream with nothing on it this long (the agent pings every 15 seconds)
 /// means the machine is gone.
 const JOB_SILENCE: Duration = Duration::from_secs(60);
@@ -100,6 +103,11 @@ pub struct Enrollment {
     /// when each agent was last asked to.
     pub bot_user: bool,
     pub(super) asked: super::botuser::Asked,
+    /// Bots' screens on machines (MACHINE_SCREENS, ADR 0045), those botd shows, and
+    /// voxl for new machines.
+    pub screens: Option<super::screens::Settings>,
+    pub(super) shown: super::screens::Shown,
+    voxl: Option<(Bytes, String)>,
 }
 
 impl std::fmt::Debug for Enrollment {
@@ -139,6 +147,8 @@ impl Enrollment {
                 "MACHINE_FOLDER_SYNC",
                 "MACHINE_FOLDER_SYNC_MAX_MB",
                 "MACHINE_BOT_USER",
+                "MACHINE_SCREENS",
+                "MACHINE_SCREEN_PORTS",
             ] {
                 if !var(k).trim().is_empty() {
                     return Err(format!("{k} needs MACHINE_CONTROL_URL"));
@@ -213,6 +223,16 @@ impl Enrollment {
         };
         e.folder = super::folder::Settings::from_env(var)?;
         e.bot_user = super::botuser::from_env(var)?;
+        e.screens = super::screens::from_env(var, e.bot_user)?;
+        if e.screens.is_some() {
+            let on_path = std::env::var_os("PATH")
+                .and_then(|p| std::env::split_paths(&p).map(|d| d.join(VOXL_BIN)).find(|p| p.is_file()));
+            e.voxl = read(VOXL_BIN).or_else(|| {
+                let b = std::fs::read(on_path?).ok()?;
+                let sha = sha256_hex(&b);
+                Some((Bytes::from(b), sha))
+            });
+        }
         Ok(Some(e))
     }
 
@@ -242,6 +262,9 @@ impl Enrollment {
             copying: Default::default(),
             bot_user: false,
             asked: Default::default(),
+            screens: None,
+            shown: Default::default(),
+            voxl: None,
         })
     }
 
@@ -293,6 +316,22 @@ impl Enrollment {
         self
     }
 
+    /// With MACHINE_SCREENS=on (and so MACHINE_BOT_USER=on), showing screens through
+    /// botd's loopback ports `ports`.
+    #[cfg(test)]
+    pub fn with_screens(mut self, ports: (u16, u16)) -> Enrollment {
+        self.bot_user = true;
+        self.screens = Some(super::screens::Settings { ports, width: 1280, height: 800, idle_ms: 600_000 });
+        self
+    }
+
+    /// Serves `binary` as voxl, as if it shipped next to botd.
+    #[cfg(test)]
+    pub fn with_voxl(mut self, binary: &'static [u8]) -> Enrollment {
+        self.voxl = Some((Bytes::from_static(binary), sha256_hex(binary)));
+        self
+    }
+
     /// Serves `binary` as botctl, as if it shipped next to botd.
     #[cfg(test)]
     pub fn with_botctl(mut self, binary: &'static [u8]) -> Enrollment {
@@ -323,7 +362,7 @@ impl Enrollment {
 
     pub fn describe(&self) -> String {
         format!(
-            "on at {} (listening on {}, agents on port {}, {} minutes to enroll; {}; harness logins {}; folder copies {}; Bots' own user {}){}",
+            "on at {} (listening on {}, agents on port {}, {} minutes to enroll; {}; harness logins {}; folder copies {}; Bots' own user {}; screens {}){}",
             self.url,
             self.listen,
             self.agent_port,
@@ -332,6 +371,15 @@ impl Enrollment {
             if self.logins { "on" } else { "off" },
             self.folder.as_ref().map_or("off".to_string(), |f| format!("on, up to {} MiB", f.max_bytes >> 20)),
             if self.bot_user { "on" } else { "off" },
+            match (&self.screens, &self.voxl) {
+                (None, _) => "off".to_string(),
+                (Some(s), v) => format!(
+                    "on, botd ports {}-{}{}",
+                    s.ports.0,
+                    s.ports.1,
+                    if v.is_some() { "" } else { ", no voxl to give new machines" }
+                ),
+            },
             match (&self.agent, &self.botctl) {
                 (Some(_), Some(_)) => "",
                 (None, _) =>
@@ -430,9 +478,17 @@ impl Enrollment {
                 FIRSTBOOT_BOTCTL.replace("{url}", &self.url).replace("{sha}", b)
             });
             let bots = if self.bot_user { FIRSTBOOT_BOT_USER.replace("{user}", wire::BOT_USER) } else { String::new() };
+            let screens = match (&self.screens, &self.voxl) {
+                (None, _) => String::new(),
+                (Some(_), voxl) => FIRSTBOOT_SCREENS.replace(
+                    "{voxl}\n",
+                    &voxl.as_ref().map_or(String::new(), |(_, sha)| FIRSTBOOT_VOXL.replace("{sha}", sha)),
+                ),
+            };
             let script = FIRSTBOOT
                 .replace("{botctl}\n", &botctl)
                 .replace("{bot_user}\n", &bots)
+                .replace("{screens}\n", &screens)
                 .replace("{url}", &self.url)
                 .replace("{sha}", sha);
             out.push_str(&format!(
@@ -480,6 +536,18 @@ impl Enrollment {
             .tls_backend_preconfigured(config)
             .connect_timeout(Duration::from_secs(5))
             .read_timeout(JOB_SILENCE)
+            .build()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Like `pinned`, for a screen tunnel (ADR 0045): no timeout once it's open, since
+    /// a quiet screen sends nothing.
+    pub(super) fn tunnel_client(&self, pins: Vec<String>) -> Result<reqwest::Client, String> {
+        let c = self.control();
+        let (config, _) = pki::pinned_client_config(pins, c.chain.clone(), c.key.clone_key())?;
+        reqwest::Client::builder()
+            .tls_backend_preconfigured(config)
+            .connect_timeout(Duration::from_secs(5))
             .build()
             .map_err(|e| e.to_string())
     }
@@ -581,6 +649,26 @@ fi
 # cloud-init's copies of the user data hold the token; only the agent's file is needed.
 rm -f /var/lib/cloud/instance/user-data.txt /var/lib/cloud/instance/user-data.txt.i
 systemctl start superbot-machine
+{screens}
+"#;
+
+/// FIRSTBOOT's last step with MACHINE_SCREENS (ADR 0045): what a screen runs, after the
+/// agent has started, so enrolling never waits on it. A failure here leaves the agent
+/// reporting what's missing; it never stops the machine from running Bots.
+const FIRSTBOOT_SCREENS: &str = r#"if (
+  set -e
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq xvfb openbox dbus-daemon dbus-x11 x11-utils fonts-noto-core libx264-164 libyuv0 libopus0 >/dev/null
+{voxl}
+); then echo "superbot: screen programs installed"; else echo "superbot: screen programs didn't install" >&2; fi
+"#;
+
+/// FIRSTBOOT_SCREENS's voxl step: botd's own build, checked like the agent.
+const FIRSTBOOT_VOXL: &str = r#"  curl -fsS --retry 10 --retry-delay 5 --retry-all-errors --cacert /etc/superbot/ca.pem -o /usr/local/bin/.voxl.new "{url}/v1/voxl"
+  echo "{sha}  /usr/local/bin/.voxl.new" | sha256sum -c -
+  chmod 755 /usr/local/bin/.voxl.new
+  mv /usr/local/bin/.voxl.new /usr/local/bin/voxl
 "#;
 
 /// FIRSTBOOT's step making the Bots' own user (ADR 0043), so the agent needn't. It
@@ -1061,6 +1149,11 @@ async fn botctl_binary(AxState(p): AxState<Arc<Port>>) -> Response {
     binary(&p.e.botctl, BOTCTL_BIN)
 }
 
+/// `GET /v1/voxl`: the screen viewer, with MACHINE_SCREENS. Public code, checked the same way.
+async fn voxl_binary(AxState(p): AxState<Arc<Port>>) -> Response {
+    binary(&p.e.voxl, VOXL_BIN)
+}
+
 /// Headers a Bot's call carries through the relay; nothing else crosses.
 const RELAYED: [header::HeaderName; 4] = [
     header::AUTHORIZATION,
@@ -1148,6 +1241,7 @@ pub fn router(app: AppState, e: Arc<Enrollment>, api: Option<Api>) -> axum::Rout
         .route("/v1/machines/{id}/api/{*rest}", any(relay))
         .route("/v1/agent", get(agent_binary))
         .route("/v1/botctl", get(botctl_binary))
+        .route("/v1/voxl", get(voxl_binary))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(Arc::new(Port { app, e, api }))
 }
@@ -1176,6 +1270,11 @@ pub async fn heartbeat(app: &App, e: &Enrollment, m: &Machine) -> Result<wire::H
         pins: app.db.machine_pins(&m.id),
     };
     probe(app, e, &to, &[]).await
+}
+
+/// `heartbeat`, for the machine routing picked.
+pub(super) async fn check(app: &App, e: &Enrollment, to: &Assigned) -> Result<wire::Heartbeat, String> {
+    probe(app, e, to, &[]).await
 }
 
 /// `heartbeat`, also asking whether `bins` are installed there.

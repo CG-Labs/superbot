@@ -201,6 +201,15 @@ async fn main() {
     let isolation = accounts::Isolation::from_env(|k| env(k, ""), &bin_dir, &data_dir).unwrap_or_else(|e| exit(format!("Isolation: {e}")));
     // Screens are X displays botd's account runs; any local account could open them.
     let screens = if isolation.is_some() { None } else { paths::child(&data_dir, "screens").and_then(screen::Screens::from_env) };
+    if let (Some(local), Some(machine)) = (&screens, enrollment.as_ref().and_then(|e| e.screens.as_ref())) {
+        let (a, b) = local.ports();
+        if a <= machine.ports.1 && machine.ports.0 <= b {
+            exit(format!(
+                "MACHINE_SCREEN_PORTS ({}-{}) overlaps this server's own screen ports ({a}-{b}); move one (SCREEN_BASE, MAX_SCREENS)",
+                machine.ports.0, machine.ports.1
+            ));
+        }
+    }
     let app = App::new(db, Config {
         data_dir,
         workspace,
@@ -457,6 +466,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/machine/agent/hold", put(machines::upkeep::hold).delete(machines::upkeep::release))
         .route("/users/{key}/machine/harnesses", post(machines::upkeep::harnesses_now))
         .route("/users/{key}/machine/bot-user", post(machines::botuser::now_for))
+        .route("/users/{key}/machine/screens", get(machines::screens::list))
+        .route("/users/{key}/machine/screens/{bot}", axum::routing::delete(machines::screens::close_now))
         .route("/users/{key}/machine/harness-login", post(machines::logins::admin_start))
         .route("/users/{key}/machine/harness-login/{id}", delete(machines::logins::admin_abort))
         .route("/users/{key}/machine/harness-login/{id}/input", post(machines::logins::admin_input))
@@ -1593,6 +1604,7 @@ async fn delete_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
     if let Some(screens) = &app.screens {
         screens.remove(&id).await;
     }
+    machines::screens::close(&app, &by, &id, "bot_deleted").await;
     app.db.delete_bot(&id);
     app.db.record(&by.event("bot.deleted").target("bot", &id).bot(&id).details(json!({ "name": bot.name, "harness": bot.harness })));
     app.send(json!({ "type": "botDeleted", "botId": id }));
@@ -1640,6 +1652,9 @@ async fn acl_changed(app: &App, id: &str, narrowed: bool) {
     app.push_bot(id);
     if narrowed && let Some(screens) = &app.screens {
         screens.rotate_token(id).await;
+    }
+    if narrowed {
+        machines::screens::rotate(app, id).await;
     }
 }
 
@@ -1822,7 +1837,11 @@ async fn ask(State(app): State<AppState>, Extension(c): Extension<Caller>, Exten
 
 async fn screen_info(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     // The link gives control of the screen.
-    need_bot_access(&app, &c, &by, &id, Access::Operate)?;
+    let (bot, _) = need_bot_access(&app, &c, &by, &id, Access::Operate)?;
+    // A Bot on its owner's machine is shown from there or not at all (ADR 0045).
+    if let Some(url) = machines::screens::open(&app, &by, &bot).await? {
+        return Ok(Json(json!({ "url": url })));
+    }
     let off = || ApiError(StatusCode::NOT_FOUND, "Screens are off on this server. Install Xvfb, openbox, and voxl.".into());
     let screens = app.screens.as_ref().filter(|_| screen::on_path("voxl")).ok_or_else(off)?;
     let info = screens.ensure(&id, |b| app.is_running(b)).await;
