@@ -20,6 +20,7 @@ export const SSO_ERRORS: Record<string, string> = {
   sso_not_allowed: "Your SuperBot account is disabled.",
   sso_wrong_account: "That account can't sign in here. Use your organization's account, with a verified email.",
   sso_email_taken: "A user with your email already exists. Ask an admin to link your sign-in to it.",
+  sso_no_seat: "This server has no seats left for new people. Ask an admin to free one or add seats.",
   sso_cancelled: "Sign-in was cancelled.",
   sso_expired: "That sign-in expired. Try again.",
   sso_too_many: "Too many failed sign-ins. Try again later.",

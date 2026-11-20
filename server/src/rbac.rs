@@ -239,6 +239,10 @@ mod tests {
             // The onboarding wizard (ADR 0034): what the server has set up, and its progress.
             ("GET", "/api/setup", Perm::Admin),
             ("PATCH", "/api/setup", Perm::Admin),
+            // The self-host license (ADR 0038).
+            ("GET", "/api/license", Perm::Admin),
+            ("PUT", "/api/license", Perm::Admin),
+            ("DELETE", "/api/license", Perm::Admin),
             ("PUT", "/api/me/secrets/OPENAI_API_KEY", Perm::Write),
             ("DELETE", "/api/me/secrets/OPENAI_API_KEY", Perm::Write),
             ("POST", "/api/me/secrets/OPENAI_API_KEY", Perm::Admin),

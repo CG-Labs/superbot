@@ -50,6 +50,9 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    Bots only (as botd's service account, at a terminal)
   botctl setup [status | json]                     What the server still needs: the onboarding checklist
   botctl setup done | reopen | hide | show         Finish the setup wizard, reopen it, or hide it from admins
+  botctl license [json]                            The self-host license, its seats, and when it ends
+  botctl license install [<file> | -] < key        Install the license key CG-Labs sent (stdin by default)
+  botctl license remove                            Back to the community edition (10 active people)
   botctl user code <user> [--ttl <minutes>]        A one-time sign-in code (default 60 minutes)
   botctl user identities <user>                    The user's SSO identities
   botctl user link <user> <provider> <subject> [--tenant <tenant-id>]
@@ -541,6 +544,23 @@ fn setup_summary(s: &Value) -> String {
     out
 }
 
+/// `GET /api/license`, for a terminal (ADR 0038).
+fn license_summary(l: &Value) -> String {
+    let s = &l["seats"];
+    let seats = match s["limit"].as_u64() {
+        Some(n) => format!("{} of {n} seats in use", s["used"]),
+        None => format!("{} active, no seat limit", s["used"]),
+    };
+    let mut out = format!("License: {} ({seats}).\n  {}\n", l["mode"].as_str().unwrap_or_default(), l["detail"].as_str().unwrap_or_default());
+    if let Some(id) = l["license"]["id"].as_str() {
+        out += &format!("  Id {id}, source {}.\n", l["source"].as_str().unwrap_or_default());
+    }
+    for w in l["warnings"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|w| Some(*w) != l["detail"].as_str()) {
+        out += &format!("  Warning: {w}\n");
+    }
+    out
+}
+
 fn run(args: &[String]) -> Result<String, String> {
     let bot = std::env::var("BOT_ID").unwrap_or_default();
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -639,6 +659,20 @@ fn run(args: &[String]) -> Result<String, String> {
         ["user", "isolate", key] => op("POST", &format!("/api/users/{}/isolation", encode(key)), None),
         ["user", "harness-login", key, harness, rest @ ..] => harness_login(key, harness, rest),
         ["tiers"] => op("GET", "/api/tiers", None),
+        ["license"] | ["license", "status"] => Ok(license_summary(&serde_json::from_str(&api(Cred::Operator, "GET", "/api/license", None)?).map_err(|e| e.to_string())?)),
+        ["license", "json"] => op("GET", "/api/license", None),
+        ["license", "install", rest @ ..] if rest.len() <= 1 => {
+            let key = match rest.first() {
+                None | Some(&"-") => stdin_value(std::io::stdin())?,
+                Some(path) => std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?,
+            };
+            let res = api(Cred::Operator, "PUT", "/api/license", Some(json!({ "key": key.trim() }).to_string()))?;
+            Ok(format!("Installed.\n{}", license_summary(&serde_json::from_str(&res).map_err(|e| e.to_string())?)))
+        }
+        ["license", "remove"] => {
+            let res = api(Cred::Operator, "DELETE", "/api/license", None)?;
+            Ok(format!("Removed.\n{}", license_summary(&serde_json::from_str(&res).map_err(|e| e.to_string())?)))
+        }
         ["setup", "json"] => op("GET", "/api/setup", None),
         ["setup", rest @ ..] => {
             let (method, body) = setup_request(rest)?;
@@ -824,6 +858,20 @@ mod tests {
         assert!(out.contains("botctl secret set SSO_OKTA_CLIENT_SECRET < file") && out.contains("botctl setup done"), "{out}");
         let done = setup_summary(&json!({ "progress": { "completedAt": 1 }, "done": 2, "total": 2, "checklist": [] }));
         assert!(done.starts_with("Setup: 2 of 2 done (finished).") && !done.contains("botctl setup done"), "{done}");
+    }
+
+    #[test]
+    fn license_summary_reads_like_a_status_line() {
+        let grace = json!({
+            "mode": "grace", "source": "file", "detail": "The license for Acme Ltd ended on 2027-01-01.",
+            "license": { "id": "lic-7" }, "seats": { "limit": 30, "used": 31 },
+            "warnings": ["The license for Acme Ltd ended on 2027-01-01.", "31 people are active, over the 30 seats allowed."],
+        });
+        let out = license_summary(&grace);
+        assert!(out.starts_with("License: grace (31 of 30 seats in use).\n  The license for Acme Ltd ended"), "{out}");
+        assert!(out.contains("Id lic-7, source file.") && out.contains("Warning: 31 people") && out.matches("ended on").count() == 1, "{out}");
+        let open = license_summary(&json!({ "mode": "active", "detail": "Licensed.", "seats": { "limit": null, "used": 4 }, "warnings": [] }));
+        assert!(open.starts_with("License: active (4 active, no seat limit)."), "{open}");
     }
 
     #[test]

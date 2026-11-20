@@ -44,7 +44,10 @@ async fn a_fresh_install_reports_what_it_lacks() {
     assert_eq!(check(&s, "domain")["done"], false);
     assert_eq!(check(&s, "admin")["done"], false, "break-glass is the only admin");
     assert_eq!(check(&s, "approvals")["done"], true);
-    assert_eq!((s["done"].as_u64(), s["total"].as_u64()), (Some(3), Some(5)));
+    // No license: the community edition, which needs nothing more (ADR 0038).
+    assert_eq!((s["license"]["mode"].as_str(), s["license"]["seats"]["limit"].as_u64()), (Some("community"), Some(crate::license::COMMUNITY_SEATS as u64)));
+    assert_eq!(check(&s, "license")["done"], true);
+    assert_eq!((s["done"].as_u64(), s["total"].as_u64()), (Some(4), Some(6)));
 }
 
 #[tokio::test]

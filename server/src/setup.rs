@@ -1,6 +1,6 @@
 //! The onboarding wizard (ADR 0034): what a fresh install still needs, for its admins.
 //! It reports the public address and HTTPS, the sign-in providers and whether each is
-//! complete, the tiers, the admins besides the break-glass owner, and the approval mode,
+//! complete, the tiers, the license (ADR 0038), the admins besides the break-glass owner, and the approval mode,
 //! and keeps the wizard's progress. botd writes only what it can change while running:
 //! the progress here, and SSO secrets and the approval mode through their own audited
 //! routes. Settings read at startup come back as copy-ready `.env` lines and commands.
@@ -304,6 +304,18 @@ fn tiers_view(app: &AppState) -> Value {
     })
 }
 
+/// The license (ADR 0038), and how to install one. On the wizard's Plans step.
+fn license_view(app: &AppState) -> Value {
+    let mut v = app.license.status().view(app.db.active_seats());
+    v["instructions"] = json!([
+        step("Console", "Paste the key CG-Labs sent you below, or in Settings. It takes effect at once, no restart.", &[]),
+        step("botctl", "On the server, as the superbot user.", &["botctl license install < license.key".into(), "botctl license".into()]),
+        step("Bash installer", "Or install it with the installer, which saves it in DATA_DIR.", &["sudo deploy/install.sh --upgrade --license-file <path-to>/license.key".into()]),
+        step("Docker Compose", "Or set it in .env (it then wins over the console), and recreate botd.", &["LICENSE_KEY=<license-key>".into(), "docker compose up -d".into()]),
+    ]);
+    v
+}
+
 fn item(id: &str, label: &str, done: bool, detail: impl Into<String>) -> Value {
     json!({ "id": id, "label": label, "done": done, "detail": detail.into() })
 }
@@ -316,6 +328,7 @@ fn report(app: &AppState, a: &Auth, headers: &HeaderMap, peer: Option<IpAddr>) -
     let domain = domain_view(a, host, scheme(headers, peer, a.trust_forwarded), on_this_machine);
     let sign_in = sign_in_view(app, a, domain["publicUrl"].as_str());
     let tiers = tiers_view(app);
+    let license = license_view(app);
     let mode = app.db.global_policy().mode;
     let ask = mode == crate::policy::Mode::Ask;
     let others = sign_in["admins"].as_array().map_or(0, Vec::len);
@@ -329,6 +342,8 @@ fn report(app: &AppState, a: &Auth, headers: &HeaderMap, peer: Option<IpAddr>) -
         item("signin", "Sign-in providers ready", sign_in["ok"] == true, sign_in["detail"].as_str().unwrap_or_default()),
         item("admin", "An admin besides the break-glass owner", others > 0, admin_detail),
         item("tiers", "Plans chosen", true, tiers["detail"].as_str().unwrap_or_default()),
+        // The community edition is a fine answer; an ended or broken license isn't.
+        item("license", "License in order", license["ok"] == true && license["warnings"].as_array().is_none_or(Vec::is_empty), license["detail"].as_str().unwrap_or_default()),
         item(
             "approvals",
             "Bots ask before risky actions",
@@ -345,6 +360,7 @@ fn report(app: &AppState, a: &Auth, headers: &HeaderMap, peer: Option<IpAddr>) -
         "domain": domain,
         "signIn": sign_in,
         "tiers": tiers,
+        "license": license,
         "approvals": { "mode": mode, "ok": ask },
         "checklist": checklist,
         "done": done,

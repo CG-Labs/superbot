@@ -17,6 +17,10 @@ name = "superbot-machine"
 path = "src/bin/superbot-machine.rs"
 
 [[bin]]
+name = "superbot-license"
+path = "src/bin/superbot-license.rs"
+
+[[bin]]
 name = "superbot-run"
 path = "src/bin/superbot-run.rs"
 

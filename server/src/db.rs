@@ -93,7 +93,12 @@ pub struct BotPatch {
     pub unread: Option<bool>,
 }
 
-pub struct Db(Mutex<Connection>);
+/// How many active users may hold a seat now (ADR 0038). None: no limit.
+pub type SeatCap = Box<dyn Fn() -> Option<u32> + Send + Sync>;
+
+/// The connection, and the seat limit every way of adding or re-enabling a user checks
+/// under the same lock. Unset (as in most tests): no limit.
+pub struct Db(Mutex<Connection>, std::sync::OnceLock<SeatCap>);
 
 pub fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -299,6 +304,8 @@ pub enum SignupError {
     /// Approved or rejected already: the status it has.
     Closed(String),
     EmailTaken,
+    /// Every seat is taken (ADR 0038); the request stays pending.
+    NoSeat,
     Db(String),
 }
 
@@ -746,6 +753,8 @@ pub enum ScimConflict {
     OtherTenant,
     /// Deleted (or never this tenant's) by the time the write ran.
     Gone,
+    /// Making the user active needs a seat, and none is free (ADR 0038).
+    NoSeat,
     Db(String),
 }
 
@@ -767,7 +776,28 @@ pub enum JitError {
     EmailTaken,
     /// Another sign-in linked this identity first.
     IdentityTaken,
+    /// Every seat is taken (ADR 0038).
+    NoSeat,
     Database,
+}
+
+/// Why a user wasn't added or changed.
+#[derive(Debug, PartialEq)]
+pub enum UserError {
+    EmailTaken,
+    /// Every seat the license, or the community edition, allows is taken (ADR 0038).
+    NoSeat,
+    Db(String),
+}
+
+impl std::fmt::Display for UserError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            UserError::EmailTaken => f.write_str("A user with that email already exists"),
+            UserError::NoSeat => f.write_str("No seats left"),
+            UserError::Db(e) => f.write_str(e),
+        }
+    }
 }
 
 fn constraint(e: &rusqlite::Error) -> bool {
@@ -1435,11 +1465,30 @@ impl Db {
             tx.pragma_update(None, "user_version", i as i64 + 1)?;
             tx.commit()?;
         }
-        Ok(Db(Mutex::new(c)))
+        Ok(Db(Mutex::new(c), std::sync::OnceLock::new()))
     }
 
     fn c(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Set once, by the app, from its license (ADR 0038).
+    pub fn set_seat_cap(&self, cap: SeatCap) {
+        let _ = self.1.set(cap);
+    }
+
+    fn seat_cap(&self) -> Option<u32> {
+        self.1.get().and_then(|f| f())
+    }
+
+    // Generic settings, for small values that need no table of their own.
+
+    pub fn setting(&self, key: &str) -> Option<String> {
+        self.c().query_row("SELECT value FROM settings WHERE key = ?", [key], |r| r.get(0)).optional().ok().flatten()
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) {
+        self.c().execute("INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2", [key, value]).unwrap();
     }
 
     // Bots
@@ -1903,17 +1952,39 @@ impl Db {
         }
     }
 
-    /// Err when the email or id is taken.
-    pub fn create_user(&self, id: Option<&str>, email: Option<&str>, name: &str, role: Role) -> Result<User, String> {
+    /// Err when the email or id is taken, or no seat is free. The owner account never
+    /// needs a seat: it is how an operator gets back in.
+    pub fn create_user(&self, id: Option<&str>, email: Option<&str>, name: &str, role: Role) -> Result<User, UserError> {
         let id = id.map(String::from).unwrap_or_else(|| format!("u{}", crate::short_id()));
-        let res = Self::insert_user(&self.c(), &id, email, name, role);
-        match res {
-            Ok(_) => Ok(self.user(&id).unwrap()),
-            Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ConstraintViolation => {
-                Err("A user with that email already exists".into())
+        let cap = if id == crate::users::OPERATOR { None } else { self.seat_cap() };
+        {
+            let c = self.c();
+            if !Self::seat_free(&c, cap) {
+                return Err(UserError::NoSeat);
             }
-            Err(e) => Err(e.to_string()),
+            Self::insert_user(&c, &id, email, name, role).map_err(|e| if constraint(&e) { UserError::EmailTaken } else { UserError::Db(e.to_string()) })?;
         }
+        self.user(&id).ok_or_else(|| UserError::Db("user not saved".into()))
+    }
+
+    /// Active users holding a seat (ADR 0038): everyone but the owner account.
+    pub fn active_seats(&self) -> u32 {
+        Self::seats_used(&self.c())
+    }
+
+    fn seats_used(c: &Connection) -> u32 {
+        c.query_row("SELECT COUNT(*) FROM users WHERE status = 'active' AND id != ?", [crate::users::OPERATOR], |r| r.get(0)).unwrap_or(0)
+    }
+
+    /// Whether one more active user fits under `cap`. Callers hold the one connection
+    /// for the count and the write after it, so nothing can take the seat in between.
+    fn seat_free(c: &Connection, cap: Option<u32>) -> bool {
+        cap.is_none_or(|cap| Self::seats_used(c) < cap)
+    }
+
+    /// Whether making this existing user active takes a seat: they're disabled now.
+    fn enabling(c: &Connection, user_id: &str) -> bool {
+        c.query_row("SELECT status != 'active' AND id != ?2 FROM users WHERE id = ?1", [user_id, crate::users::OPERATOR], |r| r.get(0)).unwrap_or(false)
     }
 
     fn insert_user(c: &Connection, id: &str, email: Option<&str>, name: &str, role: Role) -> rusqlite::Result<usize> {
@@ -1924,9 +1995,14 @@ impl Db {
         )
     }
 
-    pub fn update_user(&self, id: &str, p: UserPatch) -> Result<(), String> {
+    /// Re-enabling a disabled user needs a free seat, checked in the same transaction.
+    pub fn update_user(&self, id: &str, p: UserPatch) -> Result<(), UserError> {
+        let cap = self.seat_cap();
         let c = self.c();
-        let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
+        let tx = c.unchecked_transaction().map_err(|e| UserError::Db(e.to_string()))?;
+        if p.status == Some("active") && Self::enabling(&tx, id) && !Self::seat_free(&tx, cap) {
+            return Err(UserError::NoSeat);
+        }
         let set = |col: &str, v: &dyn rusqlite::ToSql| {
             tx.execute(&format!("UPDATE users SET {col} = ?, updated_at = ? WHERE id = ?"), params![v, now(), id]).map(|_| ())
         };
@@ -1939,11 +2015,9 @@ impl Db {
             Ok::<_, rusqlite::Error>(())
         })();
         match res {
-            Ok(()) => tx.commit().map_err(|e| e.to_string()),
-            Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ConstraintViolation => {
-                Err("A user with that email already exists".into())
-            }
-            Err(e) => Err(e.to_string()),
+            Ok(()) => tx.commit().map_err(|e| UserError::Db(e.to_string())),
+            Err(e) if constraint(&e) => Err(UserError::EmailTaken),
+            Err(e) => Err(UserError::Db(e.to_string())),
         }
     }
 
@@ -2058,9 +2132,13 @@ impl Db {
     /// Just-in-time sign-up: a new user and their first identity, together or not at all.
     pub fn create_sso_user(&self, email: Option<&str>, name: &str, role: Role, i: &NewIdentity) -> Result<User, JitError> {
         let id = format!("u{}", crate::short_id());
+        let cap = self.seat_cap();
         {
             let c = self.c();
             let tx = c.unchecked_transaction().map_err(|_| JitError::Database)?;
+            if !Self::seat_free(&tx, cap) {
+                return Err(JitError::NoSeat);
+            }
             let at = now();
             tx.execute(
                 "INSERT INTO users (id, email, display_name, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -2263,6 +2341,7 @@ impl Db {
     /// Approves a pending request: its user is made in the same transaction, so a
     /// request is never approved without one, nor a user made for a closed request.
     pub fn approve_signup(&self, id: &str, role: Role, by: &str) -> Result<(Signup, User), SignupError> {
+        let cap = self.seat_cap();
         let user_id = {
             let c = self.c();
             let tx = c.unchecked_transaction().map_err(|e| SignupError::Db(e.to_string()))?;
@@ -2270,6 +2349,9 @@ impl Db {
             let s = s.ok_or(SignupError::NotFound)?;
             if s.status != "pending" {
                 return Err(SignupError::Closed(s.status));
+            }
+            if !Self::seat_free(&tx, cap) {
+                return Err(SignupError::NoSeat);
             }
             let user_id = format!("u{}", crate::short_id());
             Self::insert_user(&tx, &user_id, Some(&s.email), &s.name, role).map_err(|e| if constraint(&e) { SignupError::EmailTaken } else { SignupError::Db(e.to_string()) })?;
@@ -2390,7 +2472,15 @@ impl Db {
         (total, list)
     }
 
-    fn write_scim_user(tx: &Connection, tenant: &str, user_id: &str, f: &ScimFields, at: i64) -> rusqlite::Result<()> {
+    /// Turning a disabled user back on takes a seat under `cap`, checked here, in the write's transaction.
+    fn write_scim_user(tx: &Connection, tenant: &str, user_id: &str, f: &ScimFields, at: i64, cap: Option<u32>) -> Result<(), ScimConflict> {
+        if f.active == Some(true) && Self::enabling(tx, user_id) && !Self::seat_free(tx, cap) {
+            return Err(ScimConflict::NoSeat);
+        }
+        Self::write_scim_rows(tx, tenant, user_id, f, at).map_err(scim_conflict)
+    }
+
+    fn write_scim_rows(tx: &Connection, tenant: &str, user_id: &str, f: &ScimFields, at: i64) -> rusqlite::Result<()> {
         tx.execute(
             "UPDATE users SET email = ?, display_name = ?, status = coalesce(?, status), updated_at = ? WHERE id = ?",
             params![f.email, f.display_name, f.active.map(|on| if on { "active" } else { "disabled" }), at, user_id],
@@ -2409,11 +2499,16 @@ impl Db {
     /// All of it or none.
     pub fn create_scim_user(&self, tenant: &str, f: &ScimFields, role: Role, identity: Option<&NewIdentity>) -> Result<User, ScimConflict> {
         let id = format!("u{}", crate::short_id());
+        let cap = self.seat_cap();
         {
             let c = self.c();
             let tx = c.unchecked_transaction().map_err(scim_conflict)?;
+            // A user provisioned inactive takes no seat until they're turned on.
+            if f.active != Some(false) && !Self::seat_free(&tx, cap) {
+                return Err(ScimConflict::NoSeat);
+            }
             Self::insert_user(&tx, &id, f.email, f.display_name, role).map_err(scim_conflict)?;
-            Self::write_scim_user(&tx, tenant, &id, f, now()).map_err(scim_conflict)?;
+            Self::write_scim_user(&tx, tenant, &id, f, now(), None)?;
             if let Some(i) = identity {
                 Self::insert_identity(&tx, &id, i).map_err(scim_conflict)?;
             }
@@ -2426,6 +2521,7 @@ impl Db {
     /// tenant's live user; `restore` also takes a user the tenant deleted, or one no tenant
     /// manages. Never another tenant's: checked in the same transaction as the write.
     pub fn save_scim_user(&self, tenant: &str, user_id: &str, f: &ScimFields, restore: bool) -> Result<(), ScimConflict> {
+        let cap = self.seat_cap();
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(scim_conflict)?;
         let row: Option<(String, Option<i64>)> =
@@ -2436,7 +2532,7 @@ impl Db {
             _ if !restore => return Err(ScimConflict::Gone),
             _ => {}
         }
-        Self::write_scim_user(&tx, tenant, user_id, f, now()).map_err(scim_conflict)?;
+        Self::write_scim_user(&tx, tenant, user_id, f, now(), cap)?;
         tx.commit().map_err(scim_conflict)
     }
 

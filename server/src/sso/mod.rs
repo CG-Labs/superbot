@@ -731,6 +731,10 @@ fn resolve(app: &AppState, p: &Provider, c: &Claims) -> Result<User, (&'static s
                 // Never merged by email: an admin links the identity to the existing user.
                 Err(JitError::EmailTaken) => return Err(("email_taken", "sso_email_taken")),
                 Err(JitError::IdentityTaken) => {}
+                Err(JitError::NoSeat) => {
+                    crate::license::refuse_seat(app, &crate::audit::Who::system("sso"), "sso", None, email);
+                    return Err(("no_seat", "sso_no_seat"));
+                }
                 Err(JitError::Database) => return Err(("database", "sso_failed")),
             }
             app.db.identity(&c.issuer, &c.subject).ok_or(("database", "sso_failed"))?
