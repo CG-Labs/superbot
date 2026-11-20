@@ -376,7 +376,7 @@ impl ControlPlane {
     }
 
     /// Whether a run of `bin` for `owner` may start on `machine_id` now, beyond `route::fit`:
-    /// the Bots' own user is ready there (ADR 0042), their first folder copy is done and
+    /// the Bots' own user is ready there (ADR 0043), their first folder copy is done and
     /// the harness is logged in there (ADR 0041).
     pub fn ready(&self, app: &App, hb: &wire::Heartbeat, owner: &str, machine_id: &str, bin: &str) -> Result<(), route::Refusal> {
         let Some(e) = &self.enrollment else { return Ok(()) };

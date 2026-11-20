@@ -1,4 +1,4 @@
-//! The Bots' own OS user on a machine (ADR 0042). The agent stays root, for upgrades
+//! The Bots' own OS user on a machine (ADR 0043). The agent stays root, for upgrades
 //! and its key; everything a Bot can touch runs as an unprivileged user instead:
 //! harnesses, logins and cleanups get its uid and gid, and every file the agent reads
 //! or writes in the Bots' home goes through `as_user`, so a link a Bot left there can't
@@ -27,7 +27,8 @@ pub fn plain_user(name: &str) -> bool {
     !b.is_empty()
         && b.len() <= 32
         && (b[0].is_ascii_lowercase() || b[0] == b'_')
-        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'_' | b'-'))
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'_' | b'-'))
 }
 
 /// `name`'s uid, gid and home, if the user exists.
@@ -44,7 +45,10 @@ pub fn lookup(name: &str) -> Option<(Ids, std::path::PathBuf)> {
     // SAFETY: getpwnam_r succeeded, so pw_dir is a C string in `buf`.
     let home = unsafe { CStr::from_ptr(pw.pw_dir) };
     Some((
-        Ids { uid: pw.pw_uid, gid: pw.pw_gid },
+        Ids {
+            uid: pw.pw_uid,
+            gid: pw.pw_gid,
+        },
         std::path::PathBuf::from(std::ffi::OsStr::from_bytes(home.to_bytes())),
     ))
 }
@@ -94,10 +98,14 @@ fn run(program: &str, args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     let why = String::from_utf8_lossy(&out.stderr);
-    Err(format!("{program} failed ({}): {}", out.status, why.trim().lines().last().unwrap_or("")))
+    Err(format!(
+        "{program} failed ({}): {}",
+        out.status,
+        why.trim().lines().last().unwrap_or("")
+    ))
 }
 
-/// Makes the user if it isn't there. An agent from before ADR 0042 runs in a unit that
+/// Makes the user if it isn't there. An agent from before ADR 0043 runs in a unit that
 /// can't write /etc, so when useradd fails there, systemd runs it outside the unit.
 pub fn ensure_user(name: &str, home: &Path) -> Result<Ids, String> {
     if let Some((ids, _)) = lookup(name) {
@@ -105,13 +113,21 @@ pub fn ensure_user(name: &str, home: &Path) -> Result<Ids, String> {
     }
     let args = useradd_args(name, home);
     if let Err(direct) = run("useradd", &args) {
-        let mut outside = vec!["--quiet".into(), "--wait".into(), "--collect".into(), "--".into(), "useradd".into()];
+        let mut outside = vec![
+            "--quiet".into(),
+            "--wait".into(),
+            "--collect".into(),
+            "--".into(),
+            "useradd".into(),
+        ];
         outside.extend(args);
         if let Err(via) = run("systemd-run", &outside) {
             return Err(format!("{direct}; through systemd: {via}"));
         }
     }
-    lookup(name).map(|(ids, _)| ids).ok_or_else(|| format!("useradd made no user {name}"))
+    lookup(name)
+        .map(|(ids, _)| ids)
+        .ok_or_else(|| format!("useradd made no user {name}"))
 }
 
 fn raw(call: libc::c_long, a: libc::c_long, b: libc::c_long) -> libc::c_long {
@@ -136,7 +152,12 @@ fn groups() -> io::Result<Vec<libc::gid_t>> {
 
 fn set_groups(g: &[libc::gid_t]) -> io::Result<()> {
     // The raw call changes this thread only; glibc's would change every thread.
-    if raw(libc::SYS_setgroups, g.len() as libc::c_long, g.as_ptr() as libc::c_long) < 0 {
+    if raw(
+        libc::SYS_setgroups,
+        g.len() as libc::c_long,
+        g.as_ptr() as libc::c_long,
+    ) < 0
+    {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -183,7 +204,10 @@ fn switch(ids: Ids) -> io::Result<Switched> {
         groups,
     };
     if fsuid(u32::MAX) != ids.uid || fsgid(u32::MAX) != ids.gid {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "couldn't take on the Bots' user"));
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "couldn't take on the Bots' user",
+        ));
     }
     Ok(s)
 }
@@ -200,12 +224,22 @@ pub fn as_user<T>(ids: Option<Ids>, f: impl FnOnce() -> T) -> io::Result<T> {
 }
 
 fn last<T>(r: libc::c_int, ok: T) -> io::Result<T> {
-    if r < 0 { Err(io::Error::last_os_error()) } else { Ok(ok) }
+    if r < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(ok)
+    }
 }
 
 fn open_at(dir: libc::c_int, name: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
     // SAFETY: a valid C string; the descriptor is owned on success.
-    let fd = unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOCTTY) };
+    let fd = unsafe {
+        libc::openat(
+            dir,
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NOCTTY,
+        )
+    };
     last(fd, ()).map(|()| unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
@@ -219,7 +253,14 @@ fn fstat(fd: &OwnedFd) -> io::Result<libc::stat> {
 fn lstat_at(dir: &OwnedFd, name: &CStr) -> io::Result<libc::stat> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: as above, never following a link.
-    let r = unsafe { libc::fstatat(dir.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+    let r = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
     last(r, st)
 }
 
@@ -262,7 +303,7 @@ pub struct Handed {
 }
 
 const MAX_DEPTH: usize = 256;
-const SETID: u32 = (libc::S_ISUID | libc::S_ISGID) as u32;
+const SETID: u32 = libc::S_ISUID | libc::S_ISGID;
 
 fn give(fd: &OwnedFd, st: &libc::stat, ids: Ids, mode: Option<u32>) -> io::Result<()> {
     // SAFETY: an open descriptor; chown and chmod act on what it is, not on a name.
@@ -270,7 +311,7 @@ fn give(fd: &OwnedFd, st: &libc::stat, ids: Ids, mode: Option<u32>) -> io::Resul
         last(libc::fchown(fd.as_raw_fd(), ids.uid, ids.gid), ())?;
         let want = mode.unwrap_or(st.st_mode & 0o7777 & !SETID);
         if want != st.st_mode & 0o7777 {
-            last(libc::fchmod(fd.as_raw_fd(), want as libc::mode_t), ())?;
+            last(libc::fchmod(fd.as_raw_fd(), want), ())?;
         }
     }
     Ok(())
@@ -281,7 +322,9 @@ fn walk(dir: &OwnedFd, ids: Ids, depth: usize, out: &mut Handed) -> io::Result<(
         return Err(io::Error::other("folders nested too deep"));
     }
     for name in names(dir)? {
-        let Ok(st) = lstat_at(dir, &name) else { continue };
+        let Ok(st) = lstat_at(dir, &name) else {
+            continue;
+        };
         match st.st_mode & libc::S_IFMT {
             libc::S_IFDIR => {
                 let sub = open_at(dir.as_raw_fd(), &name, libc::O_RDONLY | libc::O_DIRECTORY)?;
@@ -291,7 +334,8 @@ fn walk(dir: &OwnedFd, ids: Ids, depth: usize, out: &mut Handed) -> io::Result<(
                 walk(&sub, ids, depth + 1, out)?;
             }
             libc::S_IFREG => {
-                let Ok(f) = open_at(dir.as_raw_fd(), &name, libc::O_RDONLY | libc::O_NONBLOCK) else {
+                let Ok(f) = open_at(dir.as_raw_fd(), &name, libc::O_RDONLY | libc::O_NONBLOCK)
+                else {
                     out.skipped += 1;
                     continue;
                 };
@@ -306,7 +350,13 @@ fn walk(dir: &OwnedFd, ids: Ids, depth: usize, out: &mut Handed) -> io::Result<(
             libc::S_IFLNK => {
                 // SAFETY: changes the link itself, never what it points to.
                 let r = unsafe {
-                    libc::fchownat(dir.as_raw_fd(), name.as_ptr(), ids.uid, ids.gid, libc::AT_SYMLINK_NOFOLLOW)
+                    libc::fchownat(
+                        dir.as_raw_fd(),
+                        name.as_ptr(),
+                        ids.uid,
+                        ids.gid,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
                 };
                 last(r, ())?;
                 out.changed += 1;
@@ -325,7 +375,10 @@ pub fn hand_over(root: &Path, ids: Ids) -> io::Result<Handed> {
     let top = open_at(libc::AT_FDCWD, &c, libc::O_RDONLY | libc::O_DIRECTORY)?;
     let st = fstat(&top)?;
     give(&top, &st, ids, Some(0o700))?;
-    let mut out = Handed { changed: 1, skipped: 0 };
+    let mut out = Handed {
+        changed: 1,
+        skipped: 0,
+    };
     walk(&top, ids, 0, &mut out)?;
     Ok(out)
 }
@@ -338,13 +391,21 @@ pub fn open_up(root: &Path) -> io::Result<()> {
             return Err(io::Error::other("folders nested too deep"));
         }
         for name in names(dir)? {
-            let Ok(st) = lstat_at(dir, &name) else { continue };
+            let Ok(st) = lstat_at(dir, &name) else {
+                continue;
+            };
             let kind = st.st_mode & libc::S_IFMT;
             if kind != libc::S_IFDIR && kind != libc::S_IFREG {
                 continue;
             }
-            let flags = if kind == libc::S_IFDIR { libc::O_RDONLY | libc::O_DIRECTORY } else { libc::O_RDONLY | libc::O_NONBLOCK };
-            let Ok(fd) = open_at(dir.as_raw_fd(), &name, flags) else { continue };
+            let flags = if kind == libc::S_IFDIR {
+                libc::O_RDONLY | libc::O_DIRECTORY
+            } else {
+                libc::O_RDONLY | libc::O_NONBLOCK
+            };
+            let Ok(fd) = open_at(dir.as_raw_fd(), &name, flags) else {
+                continue;
+            };
             readable(&fd)?;
             if kind == libc::S_IFDIR {
                 walk(&fd, depth + 1)?;
@@ -355,11 +416,18 @@ pub fn open_up(root: &Path) -> io::Result<()> {
     fn readable(fd: &OwnedFd) -> io::Result<()> {
         let st = fstat(fd)?;
         let mode = st.st_mode & 0o7777;
-        let x = if mode & 0o100 != 0 || st.st_mode & libc::S_IFMT == libc::S_IFDIR { 0o011 } else { 0 };
+        let x = if mode & 0o100 != 0 || st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            0o011
+        } else {
+            0
+        };
         let want = mode | 0o044 | x;
         if want != mode {
             // SAFETY: an open descriptor.
-            last(unsafe { libc::fchmod(fd.as_raw_fd(), want as libc::mode_t) }, ())?;
+            last(
+                unsafe { libc::fchmod(fd.as_raw_fd(), want as libc::mode_t) },
+                (),
+            )?;
         }
         Ok(())
     }
@@ -374,7 +442,10 @@ pub fn chmod_dir(p: &Path, mode: u32) -> io::Result<()> {
     let c = CString::new(p.as_os_str().as_bytes()).map_err(io::Error::other)?;
     let fd = open_at(libc::AT_FDCWD, &c, libc::O_RDONLY | libc::O_DIRECTORY)?;
     // SAFETY: an open descriptor.
-    last(unsafe { libc::fchmod(fd.as_raw_fd(), mode as libc::mode_t) }, ())
+    last(
+        unsafe { libc::fchmod(fd.as_raw_fd(), mode as libc::mode_t) },
+        (),
+    )
 }
 
 #[cfg(test)]
@@ -386,7 +457,10 @@ mod tests {
         let d = std::env::temp_dir().join(format!(
             "superbot-runas-{tag}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -394,7 +468,12 @@ mod tests {
 
     fn me() -> Ids {
         // SAFETY: no arguments.
-        unsafe { Ids { uid: libc::geteuid(), gid: libc::getegid() } }
+        unsafe {
+            Ids {
+                uid: libc::geteuid(),
+                gid: libc::getegid(),
+            }
+        }
     }
 
     #[test]
@@ -407,7 +486,10 @@ mod tests {
         }
         let a = useradd_args("superbot-bots", Path::new("/var/lib/superbot-machine/home"));
         assert_eq!(a.last().unwrap(), "superbot-bots");
-        assert!(a.windows(2).any(|w| w == ["--home-dir", "/var/lib/superbot-machine/home"]));
+        assert!(
+            a.windows(2)
+                .any(|w| w == ["--home-dir", "/var/lib/superbot-machine/home"])
+        );
         assert!(a.iter().any(|s| s == "--system") && a.iter().any(|s| s == "--no-create-home"));
     }
 
@@ -416,7 +498,10 @@ mod tests {
         let name = current_user().unwrap();
         assert_eq!(lookup(&name).unwrap().0.uid, me().uid);
         assert!(lookup("superbot-no-such-user").is_none());
-        assert_eq!(ensure_user(&name, Path::new("/nonexistent")).unwrap().uid, me().uid);
+        assert_eq!(
+            ensure_user(&name, Path::new("/nonexistent")).unwrap().uid,
+            me().uid
+        );
     }
 
     #[test]
@@ -428,7 +513,10 @@ mod tests {
         assert_eq!(as_user(None, || 7).unwrap(), 7);
         if !is_root() {
             // Someone else's uid can't be taken without root: refused, not ignored.
-            let other = Ids { uid: ids.uid + 1, gid: ids.gid };
+            let other = Ids {
+                uid: ids.uid + 1,
+                gid: ids.gid,
+            };
             assert!(as_user(Some(other), || ()).is_err());
             assert_eq!(fsuid(u32::MAX), ids.uid);
         }
@@ -440,7 +528,8 @@ mod tests {
         let home = d.join("home");
         std::fs::create_dir_all(home.join("a/b")).unwrap();
         std::fs::write(home.join("a/b/f"), "x").unwrap();
-        std::fs::set_permissions(home.join("a/b/f"), std::fs::Permissions::from_mode(0o4755)).unwrap();
+        std::fs::set_permissions(home.join("a/b/f"), std::fs::Permissions::from_mode(0o4755))
+            .unwrap();
         let outside = d.join("outside");
         std::fs::write(&outside, "keep").unwrap();
         std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o4755)).unwrap();
@@ -455,12 +544,20 @@ mod tests {
         let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().mode() & 0o7777;
         assert_eq!(mode(&home), 0o700);
         assert_eq!(mode(&home.join("a/b/f")), 0o755);
-        assert_eq!(mode(&outside), 0o4755, "never through a link or a hard link");
+        assert_eq!(
+            mode(&outside),
+            0o4755,
+            "never through a link or a hard link"
+        );
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
-        assert!(hand_over(&home.join("link"), me()).is_err(), "the top can't be a link");
+        assert!(
+            hand_over(&home.join("link"), me()).is_err(),
+            "the top can't be a link"
+        );
 
         std::fs::set_permissions(home.join("a"), std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::set_permissions(home.join("a/b/f"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(home.join("a/b/f"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
         open_up(&home).unwrap();
         assert_eq!(mode(&home), 0o755);
         assert_eq!(mode(&home.join("a")), 0o755);

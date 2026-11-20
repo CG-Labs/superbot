@@ -206,7 +206,7 @@ impl Logins {
     }
 
     /// Starts the login, `run` (from `check`) in `home` with exactly `env`, as `user`
-    /// if one is given (ADR 0042). Its events come on the receiver, which ends after
+    /// if one is given (ADR 0043). Its events come on the receiver, which ends after
     /// `Exit` or `Error`; `stop` (or `abort`) ends it early.
     pub fn start(
         self: &Arc<Self>,

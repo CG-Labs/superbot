@@ -96,7 +96,7 @@ pub struct Enrollment {
     /// Copying users' folders to their machines (MACHINE_FOLDER_SYNC, ADR 0041).
     pub folder: Option<super::folder::Settings>,
     pub(super) copying: super::folder::Copying,
-    /// Bots run as their own OS user on machines (MACHINE_BOT_USER, ADR 0042), and
+    /// Bots run as their own OS user on machines (MACHINE_BOT_USER, ADR 0043), and
     /// when each agent was last asked to.
     pub bot_user: bool,
     pub(super) asked: super::botuser::Asked,
@@ -448,7 +448,7 @@ impl Enrollment {
     }
 
     /// The agent's unit. With MACHINE_BOT_USER, its state folder lets the Bots' user
-    /// through to its home (ADR 0042).
+    /// through to its home (ADR 0043).
     pub fn unit(&self) -> String {
         if self.bot_user {
             UNIT.replace("StateDirectoryMode=0700", "StateDirectoryMode=0711")
@@ -583,7 +583,7 @@ rm -f /var/lib/cloud/instance/user-data.txt /var/lib/cloud/instance/user-data.tx
 systemctl start superbot-machine
 "#;
 
-/// FIRSTBOOT's step making the Bots' own user (ADR 0042), so the agent needn't. It
+/// FIRSTBOOT's step making the Bots' own user (ADR 0043), so the agent needn't. It
 /// still hands the user its home when botd asks.
 const FIRSTBOOT_BOT_USER: &str = r#"mkdir -p -m 0711 /var/lib/superbot-machine
 mkdir -p -m 0700 /var/lib/superbot-machine/home
@@ -1741,7 +1741,7 @@ mod tests {
         let ud = e.user_data(&m, "sbe_tok");
         assert!(ud.contains("StateDirectoryMode=0700") && !ud.contains("useradd"), "no Bots' user unless asked");
 
-        // MACHINE_BOT_USER (ADR 0042): the user is made at first boot, and the state
+        // MACHINE_BOT_USER (ADR 0043): the user is made at first boot, and the state
         // folder lets it through to its home.
         e.bot_user = true;
         let ud = e.user_data(&m, "sbe_tok");

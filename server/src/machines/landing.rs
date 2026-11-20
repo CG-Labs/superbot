@@ -45,7 +45,7 @@ pub struct Landing {
     /// `<state dir>/sync`: `blobs/` and `synced.json`.
     dir: PathBuf,
     state: Mutex<State>,
-    /// The Bots' user, who owns the home and everything put there (ADR 0042). The
+    /// The Bots' user, who owns the home and everything put there (ADR 0043). The
     /// contents wait in `dir` as root; files in the home are made as this user.
     user: RwLock<Option<Ids>>,
 }

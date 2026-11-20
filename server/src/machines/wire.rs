@@ -22,7 +22,7 @@
 //! - `POST /v1/sync` `SyncManifest` -> `SyncPlan`: copy the user's folder (ADR 0041).
 //! - `PUT /v1/sync/{id}/blobs/{sha256}?offset=<n>` (bytes) -> `BlobReply`.
 //! - `POST /v1/sync/{id}/finish` -> `SyncReport`.
-//! - `PUT /v1/bot-user` `BotUserRequest` (202): run Bots as their own OS user (ADR 0042).
+//! - `PUT /v1/bot-user` `BotUserRequest` (202): run Bots as their own OS user (ADR 0043).
 //!
 //! Protocol 1 (`PROTOCOL`) is the first that runs Bots. A heartbeat without `protocol`
 //! is from an agent before it, which can't. Installs, upgrades, logins and folder
@@ -96,14 +96,14 @@ pub const CAN_LOGINS: &str = "logins";
 pub const CAN_SYNC: &str = "sync";
 pub const CAN_BOT_USER: &str = "bot_user";
 
-/// The OS user Bots run as on a machine (ADR 0042). An agent may be set to another,
+/// The OS user Bots run as on a machine (ADR 0043). An agent may be set to another,
 /// as tests are; botd never names one.
 pub const BOT_USER: &str = "superbot-bots";
 pub const BOT_USER_READY: &str = "ready";
 pub const BOT_USER_SETTING_UP: &str = "setting_up";
 pub const BOT_USER_FAILED: &str = "failed";
 
-/// Whether Bots run as their own user on the machine (ADR 0042).
+/// Whether Bots run as their own user on the machine (ADR 0043).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BotUserStatus {
@@ -163,7 +163,7 @@ pub struct Heartbeat {
     /// Each harness the heartbeat asked about with `cred=`, plus any logging in now.
     #[serde(default)]
     pub logins: BTreeMap<String, LoginStatus>,
-    /// The Bots' own user, once botd has asked for one (ADR 0042).
+    /// The Bots' own user, once botd has asked for one (ADR 0043).
     #[serde(default)]
     pub bot_user: Option<BotUserStatus>,
 }

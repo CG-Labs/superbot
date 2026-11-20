@@ -96,9 +96,9 @@ pub enum Refusal {
     NotLoggedIn(String),
     /// The owner's folder is being copied there for the first time (ADR 0041).
     FolderCopying,
-    /// Bots' own user there isn't ready yet (ADR 0042).
+    /// Bots' own user there isn't ready yet (ADR 0043).
     BotUserPending,
-    /// Its agent couldn't set up the Bots' own user (ADR 0042).
+    /// Its agent couldn't set up the Bots' own user (ADR 0043).
     BotUserFailed,
 }
 

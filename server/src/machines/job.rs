@@ -29,7 +29,7 @@ pub struct Host {
     pub remove: Vec<String>,
     /// Set before the job's own `env`.
     pub env: BTreeMap<String, String>,
-    /// Run as this user, and touch the job's files as it (ADR 0042).
+    /// Run as this user, and touch the job's files as it (ADR 0043).
     pub user: Option<Ids>,
 }
 

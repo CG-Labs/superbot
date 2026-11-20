@@ -25,7 +25,7 @@
 //! - `SUPERBOT_MAX_JOBS`: jobs at once (default 8).
 //! - `SUPERBOT_AGENT_BIN`: this binary, replaced by upgrades (ADR 0039; default
 //!   `/usr/local/lib/superbot/superbot-machine`).
-//! - `SUPERBOT_BOT_USER`: the OS user Bots run as once botd asks (ADR 0042; default
+//! - `SUPERBOT_BOT_USER`: the OS user Bots run as once botd asks (ADR 0043; default
 //!   `superbot-bots`). Never root, nor the agent's own user.
 
 use super::job;
@@ -87,7 +87,7 @@ pub struct Config {
     pub tools: PathBuf,
     /// This agent's own binary, which an upgrade replaces.
     pub exe: PathBuf,
-    /// The OS user Bots run as once botd asks (ADR 0042).
+    /// The OS user Bots run as once botd asks (ADR 0043).
     pub bot_user: String,
     /// Lets that be this agent's own user: only for tests, which can't make users.
     pub allow_own_user: bool,
@@ -580,7 +580,7 @@ pub struct Agent {
     pub landing: Arc<Landing>,
     /// True once the agent should exit, for systemd to start it again.
     restart: watch::Sender<bool>,
-    /// The Bots' own user, once botd asked for one (ADR 0042).
+    /// The Bots' own user, once botd asked for one (ADR 0043).
     bot: RwLock<Bot>,
 }
 
@@ -726,6 +726,7 @@ impl Agent {
     }
 
     /// Where the Bots' own user stands, as heartbeats say.
+    #[allow(dead_code)]
     pub fn bot_user(&self) -> Option<wire::BotUserStatus> {
         self.bot().status
     }
@@ -744,7 +745,8 @@ impl Agent {
     }
 
     /// Who jobs and logins run as: the agent's user until botd asks for the Bots' own
-    /// (ADR 0042), then only that one. Refused while it's set up, or if it can't be.
+    /// (ADR 0043), then only that one. Refused while it's set up, or if it can't be.
+    #[allow(clippy::result_large_err)]
     fn job_user(&self) -> Result<Option<Ids>, Response> {
         let b = self.bot();
         match &b.status {
@@ -1350,7 +1352,7 @@ async fn start_upgrade(State(a): State<Arc<Agent>>, Json(req): Json<wire::Upgrad
     (StatusCode::ACCEPTED, Json(a.upgrader.report())).into_response()
 }
 
-/// `PUT /v1/bot-user`: from now on, run Bots as their own user (ADR 0042). Refused
+/// `PUT /v1/bot-user`: from now on, run Bots as their own user (ADR 0043). Refused
 /// while jobs or logins run; none start until it's done. Heartbeats say how it went.
 async fn set_bot_user(State(a): State<Arc<Agent>>, Json(_r): Json<wire::BotUserRequest>) -> Response {
     {
