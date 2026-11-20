@@ -63,9 +63,17 @@ pub struct Guard {
 }
 
 /// Server secrets the harness (and everything it runs) must not inherit, or a Bot
-/// could approve its own actions or read what botd seals.
-pub(crate) const SECRET_ENV: [&str; 6] =
-    ["AUTH_PASSWORD", "AUTH_PASSWORD_FILE", "SUPERBOT_PASSWORD", "SUPERBOT_TOKEN", "SUPERBOT_MASTER_KEY", "SUPERBOT_MASTER_KEY_FILE"];
+/// could approve its own actions, read what botd seals, or copy the license key.
+pub(crate) const SECRET_ENV: [&str; 8] = [
+    "AUTH_PASSWORD",
+    "AUTH_PASSWORD_FILE",
+    "SUPERBOT_PASSWORD",
+    "SUPERBOT_TOKEN",
+    "SUPERBOT_MASTER_KEY",
+    "SUPERBOT_MASTER_KEY_FILE",
+    "LICENSE_KEY",
+    "LICENSE_KEY_FILE",
+];
 
 /// `SECRET_ENV`, `secrets::SERVER_SECRETS` (and their `_FILE`), and every `SSO_*`
 /// setting: sign-in config, including client secrets (ADR 0014).
@@ -355,7 +363,7 @@ mod tests {
         let mut cmd = std::process::Command::new("true");
         super::strip_secret_env(&mut cmd);
         let removed: Vec<_> = cmd.get_envs().filter(|(_, v)| v.is_none()).map(|(k, _)| k.to_string_lossy().into_owned()).collect();
-        for k in ["AUTH_PASSWORD", "SUPERBOT_MASTER_KEY_FILE", "LINODE_TOKEN", "LINODE_TOKEN_FILE", "TURNSTILE_SECRET", "TURNSTILE_SECRET_FILE"] {
+        for k in ["AUTH_PASSWORD", "SUPERBOT_MASTER_KEY_FILE", "LINODE_TOKEN", "LINODE_TOKEN_FILE", "TURNSTILE_SECRET", "TURNSTILE_SECRET_FILE", "LICENSE_KEY", "LICENSE_KEY_FILE"] {
             assert!(removed.iter().any(|r| r == k), "{k}");
         }
     }

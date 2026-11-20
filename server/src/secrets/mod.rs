@@ -95,7 +95,7 @@ pub struct Listed {
 }
 
 /// Names botd or the harnesses rely on; a stored secret must not replace them in a Bot's environment.
-const RESERVED: [&str; 11] = ["AUTH_PASSWORD", "PATH", "HOME", "USER", "LOGNAME", "SHELL", "ENV", "BASH_ENV", "NODE_OPTIONS", "DISPLAY", "DBUS_SESSION_BUS_ADDRESS"];
+const RESERVED: [&str; 12] = ["AUTH_PASSWORD", "LICENSE_KEY", "PATH", "HOME", "USER", "LOGNAME", "SHELL", "ENV", "BASH_ENV", "NODE_OPTIONS", "DISPLAY", "DBUS_SESSION_BUS_ADDRESS"];
 const RESERVED_PREFIXES: [&str; 7] = ["SUPERBOT_", "BOT_", "SSO_", "LD_", "DYLD_", "AGENT_BROWSER_", "VOXL_"];
 pub const MAX_VALUE: usize = 64 * 1024;
 
@@ -565,6 +565,18 @@ mod tests {
         assert!(s.list().unwrap().iter().all(|l| !l.for_bots), "listed as botd's own");
         redact::forget("linode-from-file-7c1e");
         redact::forget("0x4AAA-sealed");
+    }
+
+    #[test]
+    fn the_license_key_never_reaches_bots() {
+        let f = crate::db::temp_path("license-env").join("license.key");
+        std::fs::write(&f, "eyJ.license.file\n").unwrap();
+        for vars in [vec![("LICENSE_KEY", "eyJ.license.inline")], vec![("LICENSE_KEY_FILE", f.to_str().unwrap())]] {
+            let s = secrets(&vars);
+            assert!(s.harness_env().is_empty() && s.inherited_harness_env().is_empty(), "{vars:?}");
+            assert!(s.list().unwrap().is_empty(), "{vars:?}");
+        }
+        assert!(secrets(&[]).put("LICENSE_KEY", "x").is_err(), "installed through /api/license, not as a secret");
     }
 
     #[test]
