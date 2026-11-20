@@ -226,6 +226,16 @@ botctl bot revoke <bot-id> alex@example.com
 botctl bot owner <bot-id> alex@example.com          # admins only
 ```
 
+### Tiers and model routing
+
+Each user is on a **tier** (a plan). A tier lists the harness and model **routes** its users' Bots may run on, and limits per user: `maxBots`, `monthlyRuns` (UTC calendar month), and `monthlyTokens` (shown, not enforced yet). Design: [ADR 0033](adr/0033-tiers-model-routing.md).
+
+- **Default: nothing changes.** Without `TIERS_FILE` there is one tier, `self-host`: any harness and model, no limits.
+- **Turn on**: copy [`deploy/tiers.example.json`](../deploy/tiers.example.json), edit it, set `TIERS_FILE` to its path, and restart. `DEFAULT_TIER` (or the file's `default`, else its first tier) is the tier for users without one. botd refuses to start on a bad file.
+- **Managed tiers** (with routes): each run takes the route the Bot **owner's** tier picks (the Bot's model if the tier has it for that harness, else the harness's first route; provider and effort always from the route). A harness outside the tier doesn't run. Setting a model, effort or harness outside the owner's tier is a 403, for admins too. Only admins see model names; others see the plan.
+- **Assign**: `botctl user tier alex@example.com pro` (or `default`), or `PATCH /api/users/:id {tier}`. Admins only; audited as `user.tier_changed`. `botctl tiers` lists them.
+- **Audit**: `harness.invoked` records the tier and route; refusals are `bot.run_refused` with reason `tier_harness` or `tier_limit`.
+
 ### Per-user machines (managed hosting)
 
 For CG-Labs managed hosting: botd can rent one Linode per user and track it. **Off by default**: without `LINODE_TOKEN` the machine endpoints answer 503 "control plane not configured", and nothing else changes. Self-hosted servers don't need it. Design: [ADR 0025](adr/0025-control-plane-linode.md).
@@ -243,11 +253,13 @@ All JSON. Auth: a session cookie (sign-in page and console) or `Authorization: B
 
 - `GET /api/state`: user name, installed harnesses, the Bots you can see, global policy, pending approvals on those Bots. Each Bot's `handoff` is the id of its unanswered handoff card, or null; `owner` is `{id, name}`, `visibility` is `private` or `shared`, and `access` is yours: `view`, `operate`, or `manage`.
 - `GET /api/events`: SSE stream (`message`, `draft`, `status`, `bot`, `botDeleted`, `approval`, `policy`, `resync`), only about Bots you can see
-- `POST /api/bots` `{name, harness?, model?, color?, shape?, visibility?}`: you own it; shared unless `visibility` is `private`
+- `POST /api/bots` `{name, harness?, model?, color?, shape?, visibility?}`: you own it; shared unless `visibility` is `private`. 403 outside your tier's routes or past its `maxBots`. Each Bot has `tier: {name, label, managed}`; on a managed tier `model` and `effort` go to admins only, with `route` and `harnesses` (the owner's tier's)
 - `PATCH /api/bots/:id` `{name?, hidden?, harness?, model?, effort?}`, `DELETE /api/bots/:id`: owner or admin
 - `GET /api/bots/:id/access` → `{botId, owner, visibility, access, grants?}` (grants for the owner and admins). `PATCH` `{visibility?, owner?}` (owner: admins only)
 - `PUT /api/bots/:id/grants/:user` `{level: viewer|operator}`, `DELETE /api/bots/:id/grants/:user`: owner or admin; `:user` is an id or email
-- `GET /api/harnesses/:name/models`: models and reasoning efforts the harness offers (Claude Code: aliases; Codex: `codex debug models`; Pi: `pi --list-models`; Hermes Agent: one entry with an empty `id`, meaning any model name, with its efforts)
+- `GET /api/harnesses/:name/models`: models and reasoning efforts the harness offers (Claude Code: aliases; Codex: `codex debug models`; Pi: `pi --list-models`; Hermes Agent: one entry with an empty `id`, meaning any model name, with its efforts). 403 for non-admins on a managed tier; `?tier=<name>` (admins): only that tier's models
+- `GET /api/me/tier` → `{name, label, managed, limits: {maxBots, monthlyRuns, monthlyTokens}, usage: {period, runs, bots}}`: your plan, no model names. People only ([ADR 0033](adr/0033-tiers-model-routing.md))
+- `GET /api/tiers` → `{default, source, tiers: [{name, label, managed, limits, routes: "any" | [{harness, provider?, model, effort?}]}]}`: admins only
 - `GET|POST /api/bots/:id/messages` `{text, answer?: {messageId, option}}`
 - `POST /api/bots/:id/read`, `POST /api/bots/:id/stop`
 - `GET|POST /api/bots/:id/routines` `{name, cron, instruction}`
@@ -261,7 +273,7 @@ Sign-in, users, and sessions ([ADR 0012](adr/0012-users-sessions-rbac.md)). User
 - Single sign-on ([ADR 0014](adr/0014-oidc-sso-entra.md), [ADR 0016](adr/0016-sso-multi-provider.md), [ADR 0018](adr/0018-sso-github-apple.md), [ADR 0020](adr/0020-saml-bridge.md)), no credentials needed: `GET /api/auth/sso` → `{providers: [{id, label, type: "entra" | "google" | "oidc" | "github" | "apple" | "saml"}]}` in `SSO_PROVIDERS` order; `GET /api/auth/sso/:id/start?session=cookie|token&redirect=&challenge=&state=&label=` redirects to the IdP; `GET /api/auth/sso/:id/callback` is where it comes back
 - `GET|POST /api/users/:id/identities` `{provider, subject, tenant?}`, `DELETE /api/users/:id/identities/:identity`: SSO identities linked to a user
 - `POST /api/auth/logout`, `GET /api/auth/me`: the caller's user, role, permissions, and session
-- `GET|POST /api/users` `{email, name?, role?}`, `GET|PATCH /api/users/:id-or-email` `{name?, email?, role?, status?: active|disabled}`. The owner can't be demoted or disabled, and admins can't demote or disable themselves (409). Listed and fetched users carry `lastLoginAt`, `lastLogin: {at, authMethod, idpProvider, idp}`, `identities`, and `pendingCodes: {count, expiresAt}` (never the codes) ([ADR 0021](adr/0021-admin-portal.md))
+- `GET|POST /api/users` `{email, name?, role?}`, `GET|PATCH /api/users/:id-or-email` `{name?, email?, role?, status?: active|disabled, tier?: <name> | null}`. The owner can't be demoted or disabled, and admins can't demote or disable themselves (409). Listed and fetched users carry `lastLoginAt`, `lastLogin: {at, authMethod, idpProvider, idp}`, `identities`, and `pendingCodes: {count, expiresAt}` (never the codes) ([ADR 0021](adr/0021-admin-portal.md)), `tier` (theirs, or null for the default) and `plan` (the tier they're on, with this month's use)
 - `POST /api/users/:id/login-codes` `{ttlMinutes?, replace?}` → `{code, expiresAt}`, `Cache-Control: no-store`. `replace: true` drops the user's unused codes first
 - `GET /api/users/:id-or-email/bots` → `{user, active, bots: [{bot, owner, visibility, access, grant}]}`: the Bots that user can reach now and how ([ADR 0017](adr/0017-bot-acls.md))
 - `GET /api/sessions?user=`, `DELETE /api/sessions/:id`, `DELETE /api/users/:id/sessions`
@@ -305,6 +317,6 @@ Approvals, policy, and audit. Writes, decisions, the approvals list, and the aud
 
 ## Not built yet
 
-Sign-up emails, self-serve SSO linking, and sign-up retention ([ADR 0022](adr/0022-landing-and-signups.md)). SCIM groups, group-to-role mapping, and bulk ([ADR 0023](adr/0023-scim.md)). Enrollment and mTLS with per-user machines, moving a user's Bots onto theirs, and `botctl machine` commands ([ADR 0025](adr/0025-control-plane-linode.md)). Vault/Key Vault/Secret Manager stores and master-key rotation (the `SecretStore` trait is ready for them), per-Bot resource limits, Slack. Approvals follow-ups are in [approvals-followups.md](approvals-followups.md).
+Sign-up emails, self-serve SSO linking, and sign-up retention ([ADR 0022](adr/0022-landing-and-signups.md)). SCIM groups, group-to-role mapping, and bulk ([ADR 0023](adr/0023-scim.md)). Enrollment and mTLS with per-user machines, moving a user's Bots onto theirs, and `botctl machine` commands ([ADR 0025](adr/0025-control-plane-linode.md)). Billing (payment provider, subscriptions), token metering, and machine size following the user's tier ([ADR 0033](adr/0033-tiers-model-routing.md)). Vault/Key Vault/Secret Manager stores and master-key rotation (the `SecretStore` trait is ready for them), per-Bot resource limits, Slack. Approvals follow-ups are in [approvals-followups.md](approvals-followups.md).
 
 Computer use (each Bot's screen, browser, and live view) is in [computer.md](computer.md).

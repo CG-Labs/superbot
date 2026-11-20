@@ -34,6 +34,8 @@ pub struct RunInput {
     /// None = start a new harness session.
     pub session_id: Option<String>,
     pub cwd: PathBuf,
+    /// The model provider, for harnesses that take one (`supports_provider`).
+    pub provider: Option<String>,
     pub model: Option<String>,
     /// Reasoning effort, in the harness's own words (e.g. "high").
     pub effort: Option<String>,
@@ -87,6 +89,10 @@ pub trait Adapter: Send {
     fn on_event(&mut self, e: &Value, out: &mut Vec<AgentEvent>);
     /// Models this harness can run here, with their reasoning efforts. Blocking.
     fn models(&self) -> Vec<ModelOption>;
+    /// Whether it uses `RunInput::provider`. Tiers may name a provider only for these.
+    fn supports_provider(&self) -> bool {
+        false
+    }
     /// Environment the harness needs on top of `input.env`.
     fn env(&self, _input: &RunInput) -> Vec<(String, String)> {
         Vec::new()
@@ -164,8 +170,20 @@ pub fn get(name: &str) -> Option<Box<dyn Adapter>> {
     }
 }
 
-/// Harnesses whose CLI is on PATH.
+/// Harnesses whose CLI is on PATH. Remembered for a few seconds: views ask for
+/// every Bot, and each check starts a shell per harness.
 pub fn installed() -> Vec<&'static str> {
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<&'static str>)>> = std::sync::Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, list)) = cache.as_ref().filter(|(at, _)| at.elapsed() < std::time::Duration::from_secs(5)) {
+        return list.clone();
+    }
+    let list = find_installed();
+    *cache = Some((std::time::Instant::now(), list.clone()));
+    list
+}
+
+fn find_installed() -> Vec<&'static str> {
     NAMES
         .into_iter()
         .filter(|n| {

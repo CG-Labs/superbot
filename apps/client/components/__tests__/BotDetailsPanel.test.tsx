@@ -135,6 +135,20 @@ describe("BotDetailsPanel", () => {
     Object.assign(mockCtx, { harnesses: undefined });
   });
 
+  it("offers an admin the harnesses of the owner's plan, not their own", async () => {
+    Object.assign(mockCtx, {
+      bots: [{ ...bot("b", "Bob"), harnesses: ["claude", "codex"] }],
+      activeId: "b",
+      fetchRoutines: jest.fn(async () => []),
+      patchBot: jest.fn(async () => {}),
+      harnesses: ["claude", "hermes"],
+    });
+    await render(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} />);
+    expect(screen.getByRole("radio", { name: "Codex" })).toBeOnTheScreen();
+    expect(screen.queryByText("Hermes Agent")).not.toBeOnTheScreen();
+    Object.assign(mockCtx, { harnesses: undefined });
+  });
+
   it("asks before deleting a Bot", async () => {
     const confirm = jest.spyOn(dialogs, "confirmAsync").mockResolvedValueOnce(false).mockResolvedValueOnce(true);
     const deleteBot = jest.fn(async () => {});

@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { Picker } from "@react-native-picker/picker";
-import { Platform, StyleSheet, TextInput, View } from "react-native";
+import { Platform, StyleSheet, Text, TextInput, View } from "react-native";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
 import type { ModelOption } from "../src/types";
@@ -10,15 +10,28 @@ interface Props {
   harness: string;
   model?: string | null;
   effort?: string | null;
+  /** The Bot's managed plan: only its models are offered (admins). */
+  tier?: string;
 }
 
-export function ModelBar({ botId, harness, model, effort }: Props) {
+/** On a managed plan the plan picks the model (ADR 0033): people see the plan, not models. */
+export function PlanBar({ label }: { label: string }) {
+  return (
+    <View style={styles.row}>
+      <Text style={styles.plan} accessibilityLabel="Plan">
+        {label} plan · the plan picks the model
+      </Text>
+    </View>
+  );
+}
+
+export function ModelBar({ botId, harness, model, effort, tier }: Props) {
   const { fetchModels, patchBot } = useSuperBot();
   const [models, setModels] = useState<ModelOption[]>([]);
 
   useEffect(() => {
-    void fetchModels(harness).then(setModels);
-  }, [harness, fetchModels]);
+    void fetchModels(harness, tier).then(setModels);
+  }, [harness, tier, fetchModels]);
 
   // Typed text belongs to one Bot, so switching Bots never shows or saves another's.
   const [draft, setDraft] = useState({ botId, model, text: model || "" });
@@ -144,6 +157,7 @@ const styles = StyleSheet.create({
     borderTopColor: colors.border,
   },
   picker: { flex: 1, color: colors.text, backgroundColor: colors.bgBubble },
+  plan: { color: colors.textDim, fontSize: 13, paddingVertical: 4 },
   input: { borderRadius: 8, borderWidth: 1, borderColor: colors.border, paddingHorizontal: 8, paddingVertical: 6 },
 });
 

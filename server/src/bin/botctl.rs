@@ -41,6 +41,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl user add <email> ["<name>"] [--role admin|member|readonly]
   botctl user role <user> <admin|member|readonly>  <user> is an id or email
   botctl user disable <user> | enable <user>       Disabling ends the user's sessions
+  botctl user tier <user> <tier|default>           Their plan: the models and limits they get
+  botctl tiers                                     Every tier, its routes and limits, and the default
   botctl user code <user> [--ttl <minutes>]        A one-time sign-in code (default 60 minutes)
   botctl user identities <user>                    The user's SSO identities
   botctl user link <user> <provider> <subject> [--tenant <tenant-id>]
@@ -512,6 +514,11 @@ fn run(args: &[String]) -> Result<String, String> {
             op("POST", "/api/users", Some(body.to_string()))
         }
         ["user", "role", key, r] => op("PATCH", &format!("/api/users/{}", encode(key)), Some(json!({ "role": role(r)? }).to_string())),
+        ["user", "tier", key, t] => {
+            let tier = if *t == "default" { Value::Null } else { json!(t) };
+            op("PATCH", &format!("/api/users/{}", encode(key)), Some(json!({ "tier": tier }).to_string()))
+        }
+        ["tiers"] => op("GET", "/api/tiers", None),
         ["user", cmd @ ("disable" | "enable"), key] => {
             let status = if *cmd == "disable" { "disabled" } else { "active" };
             op("PATCH", &format!("/api/users/{}", encode(key)), Some(json!({ "status": status }).to_string()))

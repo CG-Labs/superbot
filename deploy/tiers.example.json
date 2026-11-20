@@ -1,0 +1,34 @@
+{
+  "default": "starter",
+  "tiers": [
+    {
+      "name": "starter",
+      "label": "Starter",
+      "routes": [
+        { "harness": "hermes", "provider": "openrouter", "model": "anthropic/claude-haiku-4.5" }
+      ],
+      "limits": { "maxBots": 3, "monthlyRuns": 300 }
+    },
+    {
+      "name": "pro",
+      "label": "Pro",
+      "routes": [
+        { "harness": "hermes", "provider": "openrouter", "model": "anthropic/claude-sonnet-4.5" },
+        { "harness": "claude", "model": "claude-sonnet-4-5", "effort": "high" }
+      ],
+      "limits": { "maxBots": 10, "monthlyRuns": 3000, "monthlyTokens": 20000000 }
+    },
+    {
+      "name": "max",
+      "label": "Max",
+      "routes": [
+        { "harness": "hermes", "provider": "openrouter", "model": "anthropic/claude-opus-4.1" },
+        { "harness": "hermes", "provider": "openrouter", "model": "anthropic/claude-sonnet-4.5" },
+        { "harness": "claude", "model": "claude-opus-4-1", "effort": "high" },
+        { "harness": "codex", "model": "gpt-5-codex" }
+      ],
+      "limits": { "maxBots": 30 }
+    },
+    { "name": "self-host", "label": "Self-host", "routes": "any" }
+  ]
+}

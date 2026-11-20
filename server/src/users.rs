@@ -283,6 +283,7 @@ pub fn user_view(u: &User) -> Value {
         "id": u.id, "email": u.email, "name": u.name, "role": u.role, "status": u.status,
         "breakGlass": u.id == OPERATOR, "idpIssuer": u.idp_issuer, "idpSubject": u.idp_subject,
         "createdAt": u.created_at, "updatedAt": u.updated_at, "lastLoginAt": u.last_login_at,
+        "tier": u.tier,
     })
 }
 
@@ -307,6 +308,9 @@ fn admin_view(a: &Auth, u: &User, identities: &[db::Identity], pending: Option<&
         }))
         .collect::<Vec<_>>());
     v["pendingCodes"] = pending.map_or(Value::Null, |(n, exp)| json!({ "count": n, "expiresAt": exp }));
+    if let Some(app) = &a.app {
+        v["plan"] = crate::tier_usage(app, &u.id);
+    }
     v
 }
 
@@ -509,7 +513,8 @@ pub fn record_created(app: &AppState, by: &Who, u: &User, reason: Option<&str>) 
     app.db.record(&by.event("user.created").target("user", &u.id).details(details));
 }
 
-/// `{name?, email?, role?, status?: "active" | "disabled"}`. Disabling ends the
+/// `{name?, email?, role?, status?: "active" | "disabled", tier?: name | null}`. A
+/// tier is one `TIERS_FILE` lists; null puts them back on the default. Disabling ends the
 /// user's sessions. The owner account can't be demoted or disabled: it is the way
 /// back in (turn off AUTH_BREAK_GLASS instead).
 pub async fn update_user(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path(key): Path<String>, Json(v): Json<Value>) -> Res {
@@ -528,6 +533,15 @@ pub async fn update_user(State(app): State<AppState>, Extension(a): Extension<Ar
         Some("active") => Some("active"),
         Some("disabled") => Some("disabled"),
         _ => return Err(bad("status must be active or disabled")),
+    };
+    p.tier = match v.get("tier") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(t) => {
+            let names = || app.tiers().all().iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ");
+            let t = t.as_str().and_then(|t| app.tiers().get(t.trim())).ok_or_else(|| bad(format!("tier must be one of: {}", names())))?;
+            Some(Some(t.name.clone()))
+        }
     };
     let demotes = p.role.is_some_and(|r| r != Role::Admin) || p.status == Some("disabled");
     if before.id == OPERATOR && demotes {
@@ -551,6 +565,13 @@ pub async fn update_user(State(app): State<AppState>, Extension(a): Extension<Ar
     }
     if before.role != after.role {
         app.db.record(&ev("user.role_changed").details(json!({ "from": before.role, "to": after.role })));
+    }
+    if before.tier != after.tier {
+        // `effective` is the tier they're on: an unset one is the default.
+        let effective = |t: &Option<String>| app.tiers().of(t.as_deref()).name.clone();
+        let details = json!({ "from": before.tier, "to": after.tier, "effectiveFrom": effective(&before.tier), "effectiveTo": effective(&after.tier) });
+        app.db.record(&ev("user.tier_changed").details(details));
+        app.send(json!({ "type": "resync" }));
     }
     if before.status != after.status {
         if after.active() {

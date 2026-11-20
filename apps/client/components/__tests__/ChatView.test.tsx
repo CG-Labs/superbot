@@ -5,7 +5,13 @@ import { copyText } from "../../src/clipboard";
 import type { BotView, Message } from "../../src/types";
 
 jest.mock("../BotAvatar", () => ({ BotAvatar: () => null }));
-jest.mock("../ModelBar", () => ({ ModelBar: () => null }));
+jest.mock("../ModelBar", () => {
+  const { Text } = jest.requireActual("react-native");
+  return {
+    ModelBar: ({ tier }: { tier?: string }) => <Text>{`Model picker${tier ? ` for ${tier}` : ""}`}</Text>,
+    PlanBar: ({ label }: { label: string }) => <Text>{`${label} plan`}</Text>,
+  };
+});
 jest.mock("../../src/clipboard", () => ({ COPY_LABEL: "Copy", copyText: jest.fn(async () => true) }));
 
 const bot = (id: string, name: string): BotView => ({
@@ -39,6 +45,31 @@ const mockCtx: Record<string, unknown> = {
 jest.mock("../../src/SuperBotContext", () => ({ useSuperBot: () => mockCtx }));
 
 describe("ChatView", () => {
+  afterEach(() => {
+    mockCtx.bots = [bot("a", "Ada"), bot("b", "Bob")];
+    mockCtx.me = undefined;
+  });
+
+  it("shows a managed plan instead of a model picker, except to admins", async () => {
+    const tier = { name: "pro", label: "Pro", managed: true };
+    mockCtx.bots = [bot("a", "Ada"), { ...bot("b", "Bob"), tier }];
+    mockCtx.me = { name: "Bea", role: "member" };
+    const view = await render(<ChatView onOpenDetails={jest.fn()} onToggleScreen={jest.fn()} />);
+    expect(screen.getByText("Pro plan")).toBeOnTheScreen();
+    expect(screen.queryByText(/Model picker/)).toBeNull();
+
+    mockCtx.me = { name: "Owner", role: "admin" };
+    await view.rerender(<ChatView onOpenDetails={jest.fn()} onToggleScreen={jest.fn()} />);
+    expect(screen.getByText("Model picker for pro")).toBeOnTheScreen();
+  });
+
+  it("keeps the model picker on self-host", async () => {
+    mockCtx.bots = [bot("a", "Ada"), { ...bot("b", "Bob"), tier: { name: "self-host", label: "Self-host", managed: false } }];
+    mockCtx.me = { name: "Bea", role: "member" };
+    await render(<ChatView onOpenDetails={jest.fn()} onToggleScreen={jest.fn()} />);
+    expect(screen.getByText("Model picker")).toBeOnTheScreen();
+  });
+
   it("says which Bot sent a Bot-to-Bot message", () => {
     expect(peerLabel(list[1], [bot("a", "Ada")])).toBe("From Ada");
     expect(peerLabel(list[2], [bot("a", "Ada")])).toBe("Reply from another Bot");

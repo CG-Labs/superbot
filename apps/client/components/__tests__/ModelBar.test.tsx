@@ -1,6 +1,6 @@
 import React from "react";
 import { render, screen, userEvent } from "@testing-library/react-native";
-import { ModelBar } from "../ModelBar";
+import { ModelBar, PlanBar } from "../ModelBar";
 
 const mockCtx = {
   fetchModels: jest.fn(),
@@ -37,4 +37,15 @@ it("doesn't carry typed text to another Bot", async () => {
   expect(field.props.value).toBe("");
   await user.type(field, "{Enter}", { submitEditing: true });
   expect(mockCtx.patchBot).not.toHaveBeenCalledWith("b2", expect.anything());
+});
+
+it("asks only for the plan's models when the Bot is on a managed plan", async () => {
+  mockCtx.fetchModels.mockResolvedValue([{ id: "claude-sonnet-4-5", label: "Sonnet", efforts: [] }]);
+  await render(<ModelBar botId="b1" harness="claude" tier="pro" />);
+  expect(mockCtx.fetchModels).toHaveBeenLastCalledWith("claude", "pro");
+});
+
+it("names the plan, not a model", async () => {
+  await render(<PlanBar label="Pro" />);
+  expect(screen.getByLabelText("Plan")).toHaveTextContent("Pro plan · the plan picks the model");
 });

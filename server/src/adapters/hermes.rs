@@ -99,12 +99,18 @@ impl Adapter for Hermes {
         if let Some(e) = &input.effort {
             a.extend(["--reasoning".into(), e.clone()]);
         }
-        for (var, flag) in [("SUPERBOT_HERMES_PROVIDER", "--provider"), ("SUPERBOT_HERMES_BASE_URL", "--base-url")] {
-            if let Some(v) = std::env::var(var).ok().filter(|v| !v.trim().is_empty()) {
-                a.extend([flag.into(), v.trim().into()]);
+        // A tier's route names the provider (ADR 0033); else the server's setting.
+        let env = |var: &str| std::env::var(var).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        for (value, flag) in [(input.provider.clone().or_else(|| env("SUPERBOT_HERMES_PROVIDER")), "--provider"), (env("SUPERBOT_HERMES_BASE_URL"), "--base-url")] {
+            if let Some(v) = value {
+                a.extend([flag.into(), v]);
             }
         }
         a
+    }
+
+    fn supports_provider(&self) -> bool {
+        true
     }
 
     fn env(&self, input: &RunInput) -> Vec<(String, String)> {
@@ -242,6 +248,7 @@ mod tests {
             system: "You are Ada.".into(),
             session_id: None,
             cwd: "/srv/it's here".into(),
+            provider: None,
             model: None,
             effort: None,
             env: HashMap::from([("BOT_TOKEN".into(), "t0k3n".into()), ("GITHUB_TOKEN".into(), "ghp_x".into())]),
@@ -286,6 +293,11 @@ mod tests {
         assert!(a.windows(2).any(|w| w == ["--resume", "local-abc"]));
         assert!(a.windows(2).any(|w| w == ["--model", "anthropic/claude-sonnet-4"]));
         assert!(a.windows(2).any(|w| w == ["--reasoning", "high"]));
+        // A tier route's provider (ADR 0033).
+        i.provider = Some("openrouter".into());
+        let a = Hermes::default().args(&i, &mut out);
+        assert!(a.windows(2).any(|w| w == ["--provider", "openrouter"]));
+        assert_eq!(a.iter().filter(|x| *x == "--provider").count(), 1);
         let _ = std::fs::remove_dir_all(&i.state_dir);
     }
 

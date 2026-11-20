@@ -6,6 +6,7 @@ use crate::audit::{Actor, Event, Outcome, Who};
 use crate::db::{Bot, BotPatch, Db, Message};
 use crate::machines::ControlPlane;
 use crate::machines::route::{Job, Refusal, Target};
+use crate::tiers::{self, Route, Tier, Tiers};
 use crate::{isolation, paths};
 use crate::policy::Mode;
 use crate::screen::{self, Screens};
@@ -67,6 +68,8 @@ pub struct App {
     pub approval_waiters: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     /// Picks where each Bot runs: its owner's machine, or here (ADR 0029). Unset: here.
     pub control_plane: OnceLock<Arc<ControlPlane>>,
+    /// Each user's plan and the models it routes to (ADR 0033). Unset: self-host only.
+    pub tiers: OnceLock<Arc<Tiers>>,
     closing: AtomicBool,
 }
 
@@ -81,6 +84,7 @@ impl App {
             waiters: Mutex::default(),
             approval_waiters: Mutex::default(),
             control_plane: OnceLock::new(),
+            tiers: OnceLock::new(),
             closing: AtomicBool::new(false),
         })
     }
@@ -96,6 +100,29 @@ impl App {
     pub fn set_run_status(&self, bot_id: &str, status: &str) {
         if self.with_run(bot_id, |r| { r.status = status.into(); true }) {
             self.send(json!({ "type": "status", "botId": bot_id, "working": true, "status": status }));
+        }
+    }
+
+    pub fn tiers(&self) -> &Tiers {
+        static SELF_HOST: OnceLock<Tiers> = OnceLock::new();
+        self.tiers.get().map_or_else(|| SELF_HOST.get_or_init(Tiers::self_host), |t| t.as_ref())
+    }
+
+    /// The tier a user is on: theirs, else the default.
+    pub fn tier_of(&self, user_id: &str) -> &Tier {
+        self.tiers().of(self.db.user(user_id).and_then(|u| u.tier).as_deref())
+    }
+
+    /// What only admins see of a Bot: the model it's set to and the route it runs on.
+    pub fn bot_admin_fields(&self, b: &Bot, v: &mut Value) {
+        v["model"] = json!(b.model);
+        v["effort"] = json!(b.effort);
+        let tier = self.tier_of(&b.owner_id);
+        // Admins edit others' Bots, whose owners' tiers may offer other harnesses than theirs.
+        v["harnesses"] = json!(crate::adapters::installed().into_iter().filter(|h| tier.allows_harness(h)).collect::<Vec<_>>());
+        match tier.route(&b.harness, b.model.as_deref(), b.effort.as_deref()) {
+            Ok(r) => v["route"] = json!(r),
+            Err(e) => v["routeError"] = json!(e),
         }
     }
 
@@ -128,6 +155,14 @@ impl App {
             "owner": self.db.user(&b.owner_id).map(|u| json!({ "id": u.id, "name": u.name })),
             "visibility": b.visibility,
         });
+        // Users pick a tier, not a model: on a managed tier the model isn't theirs to see.
+        let tier = self.tier_of(&b.owner_id);
+        v["tier"] = json!({ "name": tier.name, "label": tier.label, "managed": tier.managed() });
+        if tier.managed() {
+            let o = v.as_object_mut().unwrap();
+            o.remove("model");
+            o.remove("effort");
+        }
         if let Some(run) = self.state().get(&b.id).and_then(|s| s.run.as_ref()) {
             v["working"] = json!(true);
             let owner = [b.owner_id.as_str()];
@@ -261,7 +296,9 @@ impl App {
             return self.say(&bot.id, "This Bot's owner id isn't a safe folder name, so it can't run.", true);
         };
         let by = self.requester(&bot, msg);
-        if !self.route_here(&bot, msg, &by).await {
+        let period = tiers::period(crate::db::now());
+        let Some((tier, route)) = self.tier_route(&bot, msg, &by, &period) else { return };
+        if !self.route_here(&bot, msg, &by, &period).await {
             return;
         }
         self.init_bot_files(&bot);
@@ -307,7 +344,7 @@ impl App {
                 env.extend(screen::bot_env(&info, &bot.id, &bot_dir));
             }
             let invoked = json!({
-                "harness": bot.harness, "model": bot.model, "effort": bot.effort, "policy": policy.mode,
+                "harness": bot.harness, "model": route.model, "effort": route.effort, "provider": route.provider, "tier": tier, "policy": policy.mode,
                 "guarded": guard.is_some(), "resumed": bot.session_id.is_some(), "attempt": attempt + 1,
                 "trigger": msg.role, "messageId": msg.id,
             });
@@ -317,8 +354,9 @@ impl App {
                 system: self.system_prompt(&bot),
                 session_id: bot.session_id.clone(),
                 cwd,
-                model: bot.model.clone(),
-                effort: bot.effort.clone(),
+                provider: route.provider.clone(),
+                model: route.model.clone(),
+                effort: route.effort.clone(),
                 env,
                 state_dir: bot_dir.clone(),
                 guard: guard.clone(),
@@ -440,9 +478,10 @@ impl App {
     /// True when the Bot runs on this server. Otherwise the message went to its owner's
     /// own machine, or the run was refused and the Bot said why. Never another user's
     /// machine, and never here instead when routing is on.
-    async fn route_here(&self, bot: &Bot, msg: &Message, by: &Who) -> bool {
+    async fn route_here(&self, bot: &Bot, msg: &Message, by: &Who, period: &str) -> bool {
         let Some(cp) = self.control_plane.get() else { return true };
         let refused = |r: Refusal, machine: Option<&str>| {
+            self.db.give_back_run(&bot.owner_id, period);
             let e = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied);
             self.db.record(&e.details(json!({ "reason": r.reason(), "owner": bot.owner_id, "machine": machine, "messageId": msg.id })));
             self.say(&bot.id, &r.message(), true);
@@ -463,6 +502,28 @@ impl App {
                 }
             }
         }
+    }
+
+    /// The tier this run is on and the route it takes: the Bot owner's tier picks the
+    /// model, never the Bot's settings alone (ADR 0033). The run is counted for the
+    /// owner, within the tier's monthly limit. None: refused, and the Bot said why.
+    fn tier_route(&self, bot: &Bot, msg: &Message, by: &Who, period: &str) -> Option<(String, Route)> {
+        let tier = self.tier_of(&bot.owner_id);
+        let refused = |reason: &str, text: String, limit: Option<u32>| {
+            let details = json!({ "reason": reason, "owner": bot.owner_id, "tier": tier.name, "limit": limit, "period": period, "messageId": msg.id });
+            self.db.record(&by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied).details(details));
+            self.say(&bot.id, &text, true);
+            None
+        };
+        let route = match tier.route(&bot.harness, bot.model.as_deref(), bot.effort.as_deref()) {
+            Ok(r) => r,
+            Err(e) => return refused("tier_harness", format!("{e} Switch me to one of those in my settings."), None),
+        };
+        if let Err(limit) = self.db.take_run(&bot.owner_id, period, tier.limits.monthly_runs) {
+            let text = format!("The {} plan allows {limit} runs a month, and this month's are used up. More start on the 1st (UTC).", tier.label);
+            return refused("tier_limit", text, Some(limit));
+        }
+        Some((tier.name.clone(), route))
     }
 
     /// Who a run is for: whoever queued its message. Routines run as the scheduler,
@@ -558,8 +619,18 @@ impl App {
 
     /// Stops the current task and drops queued ones.
     pub fn stop(&self, bot_id: &str) {
+        self.stop_if(bot_id, || true);
+    }
+
+    /// Like `stop`, but only once `first` returns true. It runs under the lock that
+    /// queues work, so nothing is queued between it and the stop, and a false leaves
+    /// the Bot's work untouched.
+    pub fn stop_if(&self, bot_id: &str, first: impl FnOnce() -> bool) -> bool {
         {
             let mut st = self.state();
+            if !first() {
+                return false;
+            }
             if let Some(s) = st.get_mut(bot_id) {
                 for m in s.queue.drain(..) {
                     self.db.set_status(m.id, "done");
@@ -570,6 +641,7 @@ impl App {
             }
         }
         self.cancel_approvals(bot_id, "The Bot was stopped");
+        true
     }
 
     /// After a policy change: a run that started in bypass has no approval hook, so
@@ -787,6 +859,21 @@ mod tests {
         let g = guard(Path::new("/opt"), "hermes", 1);
         assert_eq!((g.wait, g.timeout_secs), (Duration::from_secs(120), 180));
         assert_eq!(tool_label("terminal", "ls"), "Running: ls");
+    }
+
+    #[test]
+    fn a_refused_stop_if_leaves_queued_work() {
+        let app = test_app();
+        let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
+        let m = app.db.add_message(&bot.id, "user", "hi", None, false, Some("queued"));
+        app.state().entry(bot.id.clone()).or_default().queue.push_back(m.clone());
+        let status = || app.db.message(m.id).unwrap().status;
+        assert!(!app.stop_if(&bot.id, || false));
+        assert_eq!(app.state()[&bot.id].queue.len(), 1);
+        assert_eq!(status().as_deref(), Some("queued"));
+        assert!(app.stop_if(&bot.id, || true));
+        assert!(app.state()[&bot.id].queue.is_empty());
+        assert_eq!(status().as_deref(), Some("done"));
     }
 
     #[test]
