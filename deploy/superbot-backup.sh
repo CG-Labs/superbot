@@ -114,6 +114,14 @@ tar_files() {
 }
 excludes=(--anchored --exclude=./app.sqlite --exclude='./app.sqlite-*' --exclude=./screens
   --exclude=./.superbot-backup --exclude='./.restore-*' --exclude='./.pre-restore-*')
+# A BACKUP_DIR inside DATA_DIR would put every earlier archive into the next one.
+data_real=$(realpath -m -- "$DATA_DIR")
+backup_real=$(realpath -m -- "$BACKUP_DIR")
+if [[ "$backup_real" == "$data_real" ]]; then
+  [[ "$mode" == - ]] || die "BACKUP_DIR must not be DATA_DIR ($DATA_DIR)"
+elif [[ "$backup_real" == "$data_real"/* ]]; then
+  excludes+=("--exclude=./${backup_real#"$data_real"/}")
+fi
 
 # The backup sidecar and `docker compose exec botd superbot-backup` share BACKUP_DIR, so runs
 # take a lock on it and never reuse a file name. Explicit exits: callers use `||`, which turns off set -e.

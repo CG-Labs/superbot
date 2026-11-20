@@ -62,6 +62,18 @@ touch -d 2020-01-01 "$H/superbot/backups/superbot-20200101-000000.tar.gz"
   fail "retention kept an old archive or old-style snapshot folder"
 ok "retention prunes old archives and pre-ADR 0030 snapshot folders"
 
+N="$T/nested"
+seed "$N"
+DATA_DIR=$N BACKUP_DIR=$N/./backups "$BACKUP" 2>/dev/null
+DATA_DIR=$N BACKUP_DIR=$N/backups "$BACKUP" 2>/dev/null
+mapfile -t nested < <(find "$N/backups" -name 'superbot-*.tar.gz' | sort)
+[[ ${#nested[@]} == 2 ]] || fail "BACKUP_DIR inside DATA_DIR did not write two archives"
+tar -tzf "${nested[1]}" >"$T/list"
+grep -qx ./bots/b1/MEMORY.md "$T/list" || fail "nested-BACKUP_DIR archive lacks Bot memory"
+if grep -q backups "$T/list"; then fail "an archive holds the backups inside DATA_DIR"; fi
+refuses "BACKUP_DIR must not be DATA_DIR" env DATA_DIR="$N" BACKUP_DIR="$N/" "$BACKUP"
+ok "a BACKUP_DIR inside DATA_DIR is left out of archives, and BACKUP_DIR = DATA_DIR is refused"
+
 age-keygen -o "$T/id.txt" 2>/dev/null
 RECIPIENT=$(age-keygen -y "$T/id.txt")
 age-keygen -o "$T/other.txt" 2>/dev/null

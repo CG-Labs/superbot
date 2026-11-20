@@ -26,7 +26,7 @@ The copy is safe while Bots are running: SQLite's `.backup` takes a consistent s
 
 ## Schedule
 
-**Installer.** `superbot-backup.timer` runs daily (`Persistent=true`, so a missed run happens at boot). Archives go to `~superbot/superbot/backups` (or `BACKUP_DIR` in `.env`) and are kept `SUPERBOT_BACKUP_RETENTION_DAYS` (default 14). For a 1-hour RPO, add a drop-in, which upgrades keep:
+**Installer.** `superbot-backup.timer` runs daily (`Persistent=true`, so a missed run happens at boot). Archives go to `~superbot/superbot/backups` (or `BACKUP_DIR` in `.env`; a folder inside `DATA_DIR` is left out of archives) and are kept `SUPERBOT_BACKUP_RETENTION_DAYS` (default 14). For a 1-hour RPO, add a drop-in, which upgrades keep:
 
 ```sh
 sudo systemctl edit superbot-backup.timer
