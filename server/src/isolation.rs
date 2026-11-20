@@ -15,6 +15,8 @@ pub const BOT_TOKEN_PREFIX: &str = "sbb_";
 pub const USERS: &str = "users";
 /// Marks a workspace that has the per-user layout. Holds `moving` while it's being set up.
 const LAYOUT: &str = ".superbot-layout";
+const LAYOUT_TMP: &str = ".superbot-layout.tmp";
+const DONE: &str = "per-user 1";
 /// Where an old shared workspace's files wait on their way to the owner's folder.
 const STAGING: &str = ".superbot-owner-files";
 
@@ -79,25 +81,34 @@ pub fn migrate_workspace(root: &Path, owner: &str, data: &Path) -> io::Result<us
     }
     let marker = root.join(LAYOUT);
     let staging = root.join(STAGING);
+    let mark = |state: &str| -> io::Result<()> {
+        let tmp = root.join(LAYOUT_TMP);
+        std::fs::write(&tmp, format!("{state}\n"))?;
+        std::fs::rename(&tmp, &marker)
+    };
     let state = std::fs::read_to_string(&marker).ok();
     let mut moved = 0;
     if state.is_none() {
         let entries: Vec<_> = std::fs::read_dir(&root)?.collect::<io::Result<_>>()?;
-        let entries: Vec<_> = entries.into_iter().filter(|e| !data.starts_with(e.path())).collect();
-        let old = entries.iter().filter(|e| e.file_name() != STAGING).count();
-        if old == 0 && !staging.exists() {
-            std::fs::write(&marker, "per-user 1\n")?;
+        let entries: Vec<_> = entries.into_iter().filter(|e| !data.starts_with(e.path()) && ![STAGING, LAYOUT_TMP].iter().any(|n| e.file_name() == *n)).collect();
+        if entries.is_empty() && !staging.exists() {
+            mark(DONE)?;
             return Ok(0);
         }
         std::fs::create_dir_all(&staging)?;
-        for e in entries.into_iter().filter(|e| e.file_name() != STAGING) {
+        for e in entries {
             std::fs::rename(e.path(), staging.join(e.file_name()))?;
             moved += 1;
         }
-        std::fs::write(&marker, "moving\n")?;
-    } else if state.as_deref().map(str::trim) != Some("moving") {
+        mark("moving")?;
+    } else if !staging.exists() {
+        // Done, or a crash after the last move: either way nothing is left to move.
+        if state.as_deref().map(str::trim) != Some(DONE) {
+            mark(DONE)?;
+        }
         return Ok(0);
     }
+    // Anything still staged, whatever the marker says, finishes moving.
     let users = root.join(USERS);
     std::fs::create_dir_all(&users)?;
     let dest = paths::child(&users, owner).ok_or_else(|| io::Error::other(format!("{owner} isn't a folder name")))?;
@@ -112,7 +123,7 @@ pub fn migrate_workspace(root: &Path, owner: &str, data: &Path) -> io::Result<us
             std::fs::rename(&staging, &dest)?;
         }
     }
-    std::fs::write(&marker, "per-user 1\n")?;
+    mark(DONE)?;
     Ok(moved)
 }
 
@@ -203,6 +214,21 @@ mod tests {
         assert!(root.join("users/operator/a.txt").is_file() && root.join("users/operator/b.txt").is_file());
         assert!(!root.join(STAGING).exists());
         assert_eq!(std::fs::read_to_string(root.join(LAYOUT)).unwrap().trim(), "per-user 1");
+
+        // A marker cut short (empty) with files still staged: they still move.
+        let cut = crate::db::temp_path("ws-cut");
+        std::fs::create_dir_all(cut.join(STAGING)).unwrap();
+        std::fs::write(cut.join(STAGING).join("c.txt"), "c").unwrap();
+        std::fs::write(cut.join(LAYOUT), "").unwrap();
+        migrate_workspace(&cut, "operator", &elsewhere).unwrap();
+        assert!(cut.join("users/operator/c.txt").is_file() && !cut.join(STAGING).exists());
+        assert_eq!(std::fs::read_to_string(cut.join(LAYOUT)).unwrap().trim(), DONE);
+        let cut = crate::db::temp_path("ws-cut-done");
+        std::fs::write(cut.join(LAYOUT), "").unwrap();
+        std::fs::write(cut.join("later.md"), "x").unwrap();
+        assert_eq!(migrate_workspace(&cut, "operator", &elsewhere).unwrap(), 0);
+        assert!(cut.join("later.md").is_file(), "nothing staged: the move had finished");
+        assert_eq!(std::fs::read_to_string(cut.join(LAYOUT)).unwrap().trim(), DONE);
 
         let fresh = crate::db::temp_path("ws-fresh");
         assert_eq!(migrate_workspace(&fresh, "operator", &elsewhere).unwrap(), 0);
