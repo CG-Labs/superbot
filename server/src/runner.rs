@@ -997,8 +997,12 @@ impl App {
                 return false;
             }
             if let Some(s) = st.get_mut(bot_id) {
+                let bot = self.db.bot(bot_id);
                 for m in s.queue.drain(..) {
                     self.db.set_status(m.id, "done");
+                    if let Some(b) = &bot {
+                        self.give_back_routine(b, &m);
+                    }
                 }
                 if let Some(r) = &s.run {
                     r.abort.send_if_modified(|v| v.get_or_insert("stopped") == &"stopped");
