@@ -13,9 +13,12 @@
 //! - `GET /v1/heartbeat[?bin=<name>...]` -> `Heartbeat`.
 //! - `POST /v1/jobs` `JobRequest` -> a stream of `JobEvent`s, one JSON object per line.
 //! - `POST /v1/jobs/{id}/abort` `AbortRequest`.
+//! - `PUT /v1/harnesses` `HarnessPlan` (202): the harness CLIs to install (ADR 0039).
+//! - `POST /v1/upgrade` `UpgradeRequest` (202): replace the agent with botd's build.
 //!
 //! Protocol 1 (`PROTOCOL`) is the first that runs Bots. A heartbeat without `protocol`
-//! is from an agent before it, which can't.
+//! is from an agent before it, which can't. Installs and upgrades are additions to it:
+//! an agent lists them in `can`.
 
 // Shared by two binaries, each of which uses only part of it.
 #![allow(dead_code)]
@@ -70,7 +73,11 @@ pub struct MachineStatus {
     pub not_after: i64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// What an agent can do besides running jobs (`Heartbeat::can`).
+pub const CAN_HARNESSES: &str = "harnesses";
+pub const CAN_UPGRADE: &str = "upgrade";
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Heartbeat {
     pub machine_id: String,
@@ -91,7 +98,144 @@ pub struct Heartbeat {
     /// Jobs running now.
     #[serde(default)]
     pub jobs: u32,
+    /// `CAN_HARNESSES`, `CAN_UPGRADE`: empty before ADR 0039.
+    #[serde(default)]
+    pub can: Vec<String>,
+    /// SHA-256 of the agent's own binary, when it knows it.
+    #[serde(default)]
+    pub build: Option<String>,
+    /// `HarnessPlan::id` of the plan it holds, if any.
+    #[serde(default)]
+    pub plan: Option<String>,
+    /// Each harness CLI it was asked for or has installed, by name.
+    #[serde(default)]
+    pub harnesses: BTreeMap<String, HarnessStatus>,
+    /// Its current or last self-upgrade.
+    #[serde(default)]
+    pub upgrade: Option<UpgradeReport>,
 }
+
+/// The harness CLIs a machine should have (ADR 0039): pinned versions, each checked
+/// against a checksum where its source has one. botd builds it from its adapters'
+/// pins; the agent installs it without knowing what a harness is.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HarnessPlan {
+    /// Node.js, for `Npm` sources. None when none is planned.
+    pub node: Option<NodeRuntime>,
+    pub harnesses: Vec<HarnessInstall>,
+}
+
+impl HarnessPlan {
+    /// Names the plan: the start of the SHA-256 of its JSON.
+    pub fn id(&self) -> String {
+        use sha2::Digest;
+        let d = sha2::Sha256::digest(serde_json::to_vec(self).unwrap_or_default());
+        d.iter().take(8).map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NodeRuntime {
+    pub version: String,
+    /// By `std::env::consts::ARCH` (`x86_64`, `aarch64`).
+    pub downloads: BTreeMap<String, Download>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Download {
+    pub url: String,
+    pub sha256: String,
+}
+
+/// One harness CLI: its program name (one of `HARNESS_BINS`), the exact version, and
+/// where it comes from.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HarnessInstall {
+    pub name: String,
+    pub version: String,
+    pub source: InstallSource,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum InstallSource {
+    /// An npm package at `version`. `integrity` is the registry's SRI hash of its
+    /// tarball (`sha512-...`), checked before it is installed; npm checks its
+    /// dependencies against the registry's own hashes.
+    Npm {
+        package: String,
+        integrity: Option<String>,
+    },
+    /// An installer script, checked against `sha256`, run with `args` and HOME set to
+    /// a folder of its own. `bin` is where it leaves the program, under that folder.
+    Script {
+        url: String,
+        sha256: String,
+        args: Vec<String>,
+        bin: String,
+    },
+}
+
+/// A harness CLI on a machine.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessStatus {
+    /// What is installed, if anything.
+    pub version: Option<String>,
+    /// What the plan asks for. None: installed, but no longer planned.
+    pub wanted: Option<String>,
+    /// `HARNESS_INSTALLED`, `HARNESS_QUEUED`, `HARNESS_INSTALLING` or `HARNESS_FAILED`.
+    pub state: String,
+    pub error: Option<String>,
+    /// When `state` last changed.
+    pub at: i64,
+}
+
+pub const HARNESS_INSTALLED: &str = "installed";
+pub const HARNESS_QUEUED: &str = "queued";
+pub const HARNESS_INSTALLING: &str = "installing";
+pub const HARNESS_FAILED: &str = "failed";
+
+/// Replace the agent with botd's build, served at `/v1/agent` (ADR 0039).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpgradeRequest {
+    /// Chosen by botd; the agent's reports carry it back.
+    pub id: String,
+    pub version: String,
+    /// SHA-256 of the new agent binary.
+    pub sha256: String,
+    /// SHA-256 of the botctl botd serves at `/v1/botctl`, replaced along with it.
+    pub botctl_sha256: Option<String>,
+    /// How long the new agent has to answer a heartbeat before it rolls back.
+    pub trial_secs: u64,
+}
+
+/// How an upgrade went, as the agent saw it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradeReport {
+    pub id: String,
+    /// `UPGRADE_STAGING`, `UPGRADE_TRIAL`, `UPGRADE_DONE`, `UPGRADE_ROLLED_BACK` or
+    /// `UPGRADE_FAILED` (before the swap; nothing changed).
+    pub state: String,
+    pub from_version: String,
+    pub from_build: String,
+    pub to_version: String,
+    pub to_build: String,
+    pub reason: Option<String>,
+    pub at: i64,
+}
+
+pub const UPGRADE_STAGING: &str = "staging";
+pub const UPGRADE_TRIAL: &str = "trial";
+pub const UPGRADE_DONE: &str = "done";
+pub const UPGRADE_ROLLED_BACK: &str = "rolled_back";
+pub const UPGRADE_FAILED: &str = "failed";
 
 /// The machine's folders, as absolute paths on it. Every path in a job must be inside
 /// `home`.

@@ -86,6 +86,10 @@ pub enum Refusal {
     Outdated(String),
     /// The Bot's harness isn't installed on it.
     HarnessMissing(String),
+    /// The Bot's harness is still being installed on it (ADR 0039).
+    HarnessInstalling(String),
+    /// Its agent is replacing itself (ADR 0039).
+    Upgrading,
     /// `botctl` isn't installed on it, so approvals can't be asked for there.
     NoBotctl,
 }
@@ -100,6 +104,8 @@ impl Refusal {
             Refusal::Offline(_) => "machine_offline",
             Refusal::Outdated(_) => "agent_outdated",
             Refusal::HarnessMissing(_) => "harness_missing",
+            Refusal::HarnessInstalling(_) => "harness_installing",
+            Refusal::Upgrading => "agent_upgrading",
             Refusal::NoBotctl => "agent_incomplete",
         }
     }
@@ -114,6 +120,8 @@ impl Refusal {
             Refusal::Offline(e) => format!("I didn't run: your computer is offline ({e}). Try again soon; if it stays offline, ask an admin to check on it."),
             Refusal::Outdated(v) => format!("I didn't run: your computer's agent ({v}) is too old to run Bots. Ask an admin to update it."),
             Refusal::HarnessMissing(h) => format!("I didn't run: {h} isn't installed on your computer. Ask an admin to install it, or switch me to another harness."),
+            Refusal::HarnessInstalling(h) => format!("I didn't run: {h} is still being installed on your computer. Try again in a few minutes."),
+            Refusal::Upgrading => "I didn't run: your computer's agent is updating itself. Try again in a minute.".into(),
             Refusal::NoBotctl => "I didn't run: botctl isn't installed on your computer, so I couldn't ask you before risky steps. Ask an admin to install it.".into(),
         }
     }
@@ -149,8 +157,15 @@ pub fn target(db: &Db, cp: &ControlPlane, user_id: &str) -> Result<Target, Refus
 /// Whether the machine can run a job for `bin`, from its answer to the check.
 pub fn fit(hb: &Heartbeat, bin: &str) -> Result<wire::Layout, Refusal> {
     let layout = hb.layout.clone().filter(|_| hb.protocol >= wire::PROTOCOL).ok_or_else(|| Refusal::Outdated(hb.version.clone()))?;
+    if hb.upgrade.as_ref().is_some_and(|u| u.state == wire::UPGRADE_STAGING) {
+        return Err(Refusal::Upgrading);
+    }
     if hb.missing.iter().any(|m| m == bin) {
-        return Err(Refusal::HarnessMissing(bin.into()));
+        let installing = hb
+            .harnesses
+            .get(bin)
+            .is_some_and(|h| h.state == wire::HARNESS_QUEUED || h.state == wire::HARNESS_INSTALLING);
+        return Err(if installing { Refusal::HarnessInstalling(bin.into()) } else { Refusal::HarnessMissing(bin.into()) });
     }
     if layout.botctl.is_none() {
         return Err(Refusal::NoBotctl);
@@ -241,8 +256,7 @@ pub mod recording {
                     time: 0,
                     protocol: wire::PROTOCOL,
                     layout: Some(layout()),
-                    missing: Vec::new(),
-                    jobs: 0,
+                    ..Heartbeat::default()
                 })),
                 script: Mutex::new(vec![
                     JobEvent::Started,
@@ -368,18 +382,24 @@ mod tests {
             time: 0,
             protocol: wire::PROTOCOL,
             layout: Some(recording::layout()),
-            missing: Vec::new(),
-            jobs: 0,
+            ..Heartbeat::default()
         };
         assert_eq!(fit(&ok, "claude"), Ok(recording::layout()));
         let old = Heartbeat { protocol: 0, layout: None, version: "0.1.0".into(), ..ok.clone() };
         assert_eq!(fit(&old, "claude"), Err(Refusal::Outdated("0.1.0".into())));
         let missing = Heartbeat { missing: vec!["hermes".into()], ..ok.clone() };
         assert_eq!(fit(&missing, "hermes"), Err(Refusal::HarnessMissing("hermes".into())));
+        let mut installing = missing.clone();
+        installing.harnesses.insert("hermes".into(), wire::HarnessStatus { state: wire::HARNESS_INSTALLING.into(), ..Default::default() });
+        assert_eq!(fit(&installing, "hermes"), Err(Refusal::HarnessInstalling("hermes".into())));
+        installing.harnesses.get_mut("hermes").unwrap().state = wire::HARNESS_FAILED.into();
+        assert_eq!(fit(&installing, "hermes"), Err(Refusal::HarnessMissing("hermes".into())), "a failed install is missing");
+        let upgrading = Heartbeat { upgrade: Some(wire::UpgradeReport { state: wire::UPGRADE_STAGING.into(), ..Default::default() }), ..ok.clone() };
+        assert_eq!(fit(&upgrading, "claude"), Err(Refusal::Upgrading));
         let mut layout = recording::layout();
         layout.botctl = None;
         assert_eq!(fit(&Heartbeat { layout: Some(layout), ..ok }, "claude"), Err(Refusal::NoBotctl));
-        for r in [Refusal::Offline("x".into()), Refusal::NotAssigned, Refusal::NoBotctl] {
+        for r in [Refusal::Offline("x".into()), Refusal::NotAssigned, Refusal::NoBotctl, Refusal::Upgrading, Refusal::HarnessInstalling("pi".into())] {
             assert!(!r.message().is_empty() && !r.reason().is_empty());
         }
     }

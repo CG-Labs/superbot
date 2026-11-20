@@ -5,6 +5,8 @@
 //!   superbot-machine enroll   enroll now and exit (a token from an admin, by hand)
 //!   superbot-machine status   ask the control plane how it sees this machine
 //!
+//! `run` returns after an upgrade (ADR 0039) so systemd starts the new binary.
+//!
 //! Settings come from the environment; see `machines/agent.rs`.
 
 #[path = "../machines/agent.rs"]
@@ -13,6 +15,10 @@ mod agent;
 mod job;
 #[path = "../machines/pki.rs"]
 mod pki;
+#[path = "../machines/tools.rs"]
+mod tools;
+#[path = "../machines/upgrade.rs"]
+mod upgrade;
 #[path = "../machines/wire.rs"]
 mod wire;
 

@@ -238,8 +238,9 @@ async fn run_child(
             line = lines.next_segment() => match line {
                 Ok(Some(bytes)) => {
                     let line = String::from_utf8_lossy(&bytes).into_owned();
-                    if tx.send(JobEvent::Line { line }).await.is_err() {
-                        return;
+                    // No one is listening: stop it, and still wait for it to exit.
+                    if tx.send(JobEvent::Line { line }).await.is_err() && !aborted {
+                        stop(&mut aborted);
                     }
                 }
                 _ => break,

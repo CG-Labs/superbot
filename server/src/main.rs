@@ -33,6 +33,8 @@ mod machines_http_tests;
 mod machines_lockdown_tests;
 #[cfg(test)]
 mod machines_mtls_tests;
+#[cfg(test)]
+mod machines_upkeep_tests;
 mod passwd;
 mod paths;
 mod policy;
@@ -440,6 +442,10 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/machine/resize", post(machines::resize))
         .route("/users/{key}/machine/enrollment", post(machines::enroll::issue_token))
         .route("/users/{key}/machine/certificates", delete(machines::enroll::revoke))
+        .route("/users/{key}/machine/agent", get(machines::upkeep::get))
+        .route("/users/{key}/machine/agent/upgrade", post(machines::upkeep::upgrade_now))
+        .route("/users/{key}/machine/agent/hold", put(machines::upkeep::hold).delete(machines::upkeep::release))
+        .route("/users/{key}/machine/harnesses", post(machines::upkeep::harnesses_now))
         .route("/users/{key}/placement", get(machines::placement).put(machines::assign).delete(machines::unassign))
         .route("/machines", get(machines::list_all))
         .route("/machines/placements", get(machines::placements))
