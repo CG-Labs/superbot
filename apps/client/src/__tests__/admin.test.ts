@@ -1,6 +1,7 @@
-import { Linking } from "react-native";
+import { AppState, Linking } from "react-native";
+import { waitFor } from "@testing-library/react-native";
 import { ApiError } from "../api";
-import { consoleUrl, isAdmin, openConsole, openSetup, setupPending, setupUrl } from "../admin";
+import { consoleUrl, isAdmin, openConsole, openSetup, setupPending, setupUrl, watchSetup } from "../admin";
 import type { Me, SetupStatus } from "../types";
 
 const ADMIN: Me = { name: "Owner", role: "admin", permissions: ["account", "read", "admin"] };
@@ -52,6 +53,31 @@ describe("setup wizard link (ADR 0034)", () => {
     expect(await setupPending({ setupStatus }, { name: "Alex", role: "member", permissions: ["account", "read", "write"] })).toBe(false);
     expect(await setupPending({ setupStatus }, { name: "You" })).toBe(false);
     expect(setupStatus).not.toHaveBeenCalled();
+  });
+
+  it("checks again when the app comes back from the console", async () => {
+    let onState: (s: string) => void = () => {};
+    const remove = jest.fn();
+    const listen = jest.spyOn(AppState, "addEventListener").mockImplementation((_, fn) => {
+      onState = fn as (s: string) => void;
+      return { remove } as unknown as ReturnType<typeof AppState.addEventListener>;
+    });
+    let show = true;
+    const setupStatus = jest.fn(async () => status(show));
+    const seen: boolean[] = [];
+    const stop = watchSetup({ setupStatus }, ADMIN, (v) => seen.push(v));
+    await waitFor(() => expect(seen).toEqual([true]));
+    show = false;
+    onState("background");
+    onState("active");
+    await waitFor(() => expect(seen).toEqual([true, false]));
+    expect(setupStatus).toHaveBeenCalledTimes(2);
+    stop();
+    expect(remove).toHaveBeenCalled();
+    onState("active");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(seen).toEqual([true, false]);
+    listen.mockRestore();
   });
 
   it("stays quiet on servers without the wizard", async () => {

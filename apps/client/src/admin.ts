@@ -1,4 +1,4 @@
-import { Linking } from "react-native";
+import { AppState, Linking } from "react-native";
 import type { SuperBotApi } from "./api";
 import { normalizeBaseUrl } from "./auth";
 import type { Me } from "./types";
@@ -44,4 +44,22 @@ export async function setupPending(api: Pick<SuperBotApi, "setupStatus">, me: Me
   } catch {
     return false;
   }
+}
+
+/**
+ * Calls `onChange` with `setupPending` now and each time the app comes back to the front
+ * (on web: the tab is shown again), since the wizard is finished in the console, elsewhere.
+ * Returns a function that stops watching.
+ */
+export function watchSetup(api: Pick<SuperBotApi, "setupStatus">, me: Me, onChange: (pending: boolean) => void): () => void {
+  let live = true;
+  const check = () => void setupPending(api, me).then((v) => live && onChange(v));
+  check();
+  const sub = AppState.addEventListener("change", (s) => {
+    if (s === "active") check();
+  });
+  return () => {
+    live = false;
+    sub.remove();
+  };
 }

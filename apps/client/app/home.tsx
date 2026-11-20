@@ -8,7 +8,7 @@ import { ChatView } from "../components/ChatView";
 import { CreateBotModal } from "../components/CreateBotModal";
 import { ScreenViewer } from "../components/ScreenViewer";
 import { Sidebar } from "../components/Sidebar";
-import { openConsole, openSetup, setupPending } from "../src/admin";
+import { openConsole, openSetup, watchSetup } from "../src/admin";
 import { showError } from "../src/dialogs";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
@@ -27,13 +27,7 @@ export default function HomeScreen() {
   const [approvalsOpen, setApprovalsOpen] = useState(false);
   const [setupWaiting, setSetupWaiting] = useState(false);
 
-  useEffect(() => {
-    let live = true;
-    if (api) void setupPending(api, me).then((v) => live && setSetupWaiting(v));
-    return () => {
-      live = false;
-    };
-  }, [api, me]);
+  useEffect(() => (api ? watchSetup(api, me, setSetupWaiting) : undefined), [api, me]);
 
   if (!api) {
     return <Redirect href="/" />;
