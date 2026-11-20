@@ -95,11 +95,51 @@ pub fn hash_file(p: &Path) -> std::io::Result<String> {
     hash_reader(open_nofollow(p)?)
 }
 
+/// What the last copy wrote at a path.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Synced {
+    sha256: String,
+    exec: bool,
+}
+
+/// A file as it was when looked at, to tell whether anyone has touched it since.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Stamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mode: u32,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl Stamp {
+    fn of(m: &std::fs::Metadata) -> Stamp {
+        use std::os::unix::fs::MetadataExt;
+        Stamp {
+            dev: m.dev(),
+            ino: m.ino(),
+            len: m.len(),
+            mode: m.mode(),
+            mtime: (m.mtime(), m.mtime_nsec()),
+            ctime: (m.ctime(), m.ctime_nsec()),
+        }
+    }
+}
+
+/// A file at a destination: its hash, owner exec bit, and stamp.
+#[derive(Clone, Debug, PartialEq)]
+struct Here {
+    sha256: String,
+    exec: bool,
+    stamp: Stamp,
+}
+
 /// What is at a destination now.
 #[derive(Debug, PartialEq)]
 enum Dest {
     Missing,
-    File(String),
+    File(Here),
     /// A link, a folder, or a file where a folder should be: never written through.
     Blocked,
 }
@@ -113,14 +153,62 @@ fn dest(home: &Path, rel: &str) -> Dest {
         match std::fs::symlink_metadata(&at) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Dest::Missing,
             Err(_) => return Dest::Blocked,
-            Ok(m) if last && m.is_file() => {
-                return hash_file(&at).map(Dest::File).unwrap_or(Dest::Blocked);
-            }
+            Ok(m) if last && m.is_file() => return here(&at).map(Dest::File).unwrap_or(Dest::Blocked),
             Ok(m) if !last && m.is_dir() => {}
             Ok(_) => return Dest::Blocked,
         }
     }
     Dest::Blocked
+}
+
+/// Hashes a file, stamping it after so a change while hashing shows as a change later.
+fn here(p: &Path) -> std::io::Result<Here> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = open_nofollow(p)?;
+    let sha256 = hash_reader(&mut f)?;
+    let m = f.metadata()?;
+    if !m.is_file() {
+        return Err(std::io::Error::other("not a file"));
+    }
+    Ok(Here {
+        sha256,
+        exec: m.permissions().mode() & 0o100 != 0,
+        stamp: Stamp::of(&m),
+    })
+}
+
+/// What a copy does with one file.
+#[derive(Debug, PartialEq)]
+enum Act {
+    Write,
+    /// Already the same.
+    Same,
+    /// The same content; only the exec bit changed on the server.
+    Exec,
+    /// Changed on the machine (or, for a seed, there at all): left alone.
+    Keep,
+}
+
+/// Why a file wasn't put in place.
+enum Missed {
+    /// It changed on the machine while the copy was putting it there.
+    Raced,
+    Failed(String),
+}
+
+/// Moves `tmp` to `to` only if nothing is at `to`.
+fn rename_noreplace(tmp: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(std::io::Error::other);
+    let (a, b) = (c(tmp)?, c(to)?);
+    // SAFETY: two valid C strings.
+    let r = unsafe { libc::renameat2(libc::AT_FDCWD, a.as_ptr(), libc::AT_FDCWD, b.as_ptr(), libc::RENAME_NOREPLACE) };
+    if r == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
+/// Whether the file at `p` is still the one stamped.
+fn untouched(p: &Path, was: &Stamp) -> bool {
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file() && Stamp::of(&m) == *was)
 }
 
 /// Makes the folders above `rel` one at a time, 0700, refusing any that is a link.
@@ -189,16 +277,16 @@ impl Landing {
         }
     }
 
-    /// The last copy's hash of each file it wrote, so a later copy can tell a file
-    /// nobody touched (updated) from one changed on the machine (left alone).
-    fn synced(&self) -> BTreeMap<String, String> {
+    /// The last copy's hash and exec bit of each file it wrote, so a later copy can tell
+    /// a file nobody touched (updated) from one changed on the machine (left alone).
+    fn synced(&self) -> BTreeMap<String, Synced> {
         std::fs::read(self.dir.join(SYNCED))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default()
     }
 
-    fn save_synced(&self, s: &BTreeMap<String, String>) -> std::io::Result<()> {
+    fn save_synced(&self, s: &BTreeMap<String, Synced>) -> std::io::Result<()> {
         let p = self.dir.join(SYNCED);
         let tmp = self.dir.join(format!("{SYNCED}.tmp"));
         let _ = std::fs::remove_file(&tmp);
@@ -212,14 +300,22 @@ impl Landing {
         std::fs::rename(tmp, p)
     }
 
-    /// Whether `f` should be written: there's nothing there, or (not a seed) what is
-    /// there is what the last copy wrote. `Ok(false)` when it's already the same.
-    fn wanted(f: &SyncFile, now: &Dest, synced: &BTreeMap<String, String>) -> Option<bool> {
+    /// What to do with `f`: write it if nothing is there, or (not a seed) if what is
+    /// there, content and exec bit, is what the last copy wrote.
+    fn wanted(f: &SyncFile, now: &Dest, synced: &BTreeMap<String, Synced>) -> Act {
+        let ours = |h: &Here| {
+            synced.get(&f.path)
+                == Some(&Synced {
+                    sha256: h.sha256.clone(),
+                    exec: h.exec,
+                })
+        };
         match now {
-            Dest::Missing => Some(true),
-            Dest::File(h) if *h == f.sha256 => Some(false),
-            Dest::File(h) if !f.seed && synced.get(&f.path) == Some(h) => Some(true),
-            _ => None,
+            Dest::Missing => Act::Write,
+            Dest::File(h) if h.sha256 == f.sha256 && (f.seed || h.exec == f.exec) => Act::Same,
+            Dest::File(h) if !f.seed && ours(h) && h.sha256 == f.sha256 => Act::Exec,
+            Dest::File(h) if !f.seed && ours(h) => Act::Write,
+            _ => Act::Keep,
         }
     }
 
@@ -250,7 +346,7 @@ impl Landing {
         let synced = self.synced();
         let mut need: HashMap<String, u64> = HashMap::new();
         for f in &m.files {
-            if Self::wanted(f, &dest(&self.home, &f.path), &synced) == Some(true)
+            if Self::wanted(f, &dest(&self.home, &f.path), &synced) == Act::Write
                 && !self.blob(&f.sha256, true).exists()
             {
                 need.insert(f.sha256.clone(), f.size);
@@ -333,23 +429,32 @@ impl Landing {
         Ok(BlobReply { have, done: true })
     }
 
-    /// Writes one file next to where it goes, checks it, and moves it into place.
-    fn place(&self, f: &SyncFile) -> Result<(), String> {
+    /// Writes one file next to where it goes, checks it, and moves it into place, only
+    /// if what was there (`was`) is still there untouched.
+    fn place(&self, f: &SyncFile, was: &Dest) -> Result<(), Missed> {
+        let fail = |e: String| Missed::Failed(e);
         let blob = self.blob(&f.sha256, true);
-        let mut from = open_nofollow(&blob).map_err(|_| format!("The content of {} hasn't arrived.", f.path))?;
-        let parent = make_parents(&self.home, &f.path).map_err(|e| e.to_string())?;
+        let mut from = open_nofollow(&blob).map_err(|_| fail(format!("The content of {} hasn't arrived.", f.path)))?;
+        let parent = make_parents(&self.home, &f.path).map_err(|e| fail(e.to_string()))?;
         let name = f.path.rsplit('/').next().unwrap_or_default();
-        let tmp = parent.join(format!(".{name}.superbot-sync"));
-        if std::fs::symlink_metadata(&tmp).is_ok() {
-            std::fs::remove_file(&tmp).map_err(|e| e.to_string())?;
-        }
-        let mut to = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(if f.exec { 0o700 } else { 0o600 })
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&tmp)
-            .map_err(|e| format!("{}: {e}", tmp.display()))?;
+        let (tmp, mut to) = (0..16)
+            .find_map(|_| {
+                let mut r = [0u8; 8];
+                aws_lc_rs::rand::fill(&mut r).ok()?;
+                let tmp = parent.join(format!(".{name}.superbot-sync-{:016x}", u64::from_le_bytes(r)));
+                let opened = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(if f.exec { 0o700 } else { 0o600 })
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&tmp);
+                match opened {
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+                    other => Some(other.map(|to| (tmp.clone(), to)).map_err(|e| format!("{}: {e}", tmp.display()))),
+                }
+            })
+            .unwrap_or_else(|| Err(format!("No free name next to {}.", f.path)))
+            .map_err(fail)?;
         let mut h = Sha256::new();
         let mut buf = vec![0u8; 64 << 10];
         let copied = (|| -> std::io::Result<()> {
@@ -364,15 +469,42 @@ impl Landing {
             to.sync_all()
         })();
         let got: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
-        if let Err(e) = copied {
+        let drop = |m: Missed| {
             let _ = std::fs::remove_file(&tmp);
-            return Err(format!("{}: {e}", f.path));
+            Err(m)
+        };
+        if let Err(e) = copied {
+            return drop(fail(format!("{}: {e}", f.path)));
         }
         if got != f.sha256 {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(format!("{} didn't match its SHA-256 once written.", f.path));
+            return drop(fail(format!("{} didn't match its SHA-256 once written.", f.path)));
         }
-        std::fs::rename(&tmp, self.home.join(&f.path)).map_err(|e| format!("{}: {e}", f.path))
+        let at = self.home.join(&f.path);
+        let moved = match was {
+            Dest::Missing => rename_noreplace(&tmp, &at),
+            Dest::File(h) if untouched(&at, &h.stamp) => std::fs::rename(&tmp, &at),
+            _ => return drop(Missed::Raced),
+        };
+        match moved {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => drop(Missed::Raced),
+            Err(e) => drop(fail(format!("{}: {e}", f.path))),
+        }
+    }
+
+    /// Sets the owner exec bit of the file at `path`, only if it is still the one stamped.
+    fn set_exec(&self, f: &SyncFile, was: &Here) -> Result<(), Missed> {
+        use std::os::unix::fs::PermissionsExt;
+        let at = self.home.join(&f.path);
+        let file = open_nofollow(&at).map_err(|_| Missed::Raced)?;
+        let m = file.metadata().map_err(|e| Missed::Failed(e.to_string()))?;
+        if !m.is_file() || Stamp::of(&m) != was.stamp {
+            return Err(Missed::Raced);
+        }
+        let mode = m.permissions().mode() & 0o7777;
+        let mode = if f.exec { mode | 0o100 } else { mode & !0o100 };
+        file.set_permissions(std::fs::Permissions::from_mode(mode))
+            .map_err(|e| Missed::Failed(format!("{}: {e}", f.path)))
     }
 
     /// `POST /v1/sync/{id}/finish`: puts every file in place. What it wrote is
@@ -392,32 +524,36 @@ impl Landing {
             ..SyncReport::default()
         };
         let mut failed = None;
+        let mine = |f: &SyncFile| Synced {
+            sha256: f.sha256.clone(),
+            exec: f.exec,
+        };
         for f in &active.files {
             let now = dest(&self.home, &f.path);
-            match Self::wanted(f, &now, &synced) {
-                Some(false) => {
+            let done = match (Self::wanted(f, &now, &synced), &now) {
+                (Act::Same, _) => {
                     r.unchanged += 1;
                     if !f.seed {
-                        synced.insert(f.path.clone(), f.sha256.clone());
+                        synced.insert(f.path.clone(), mine(f));
                     }
+                    continue;
                 }
-                Some(true) => match self.place(f) {
-                    Ok(()) => {
-                        r.bytes += f.size;
-                        if f.seed {
-                            r.seeded += 1;
-                        } else {
-                            r.copied += 1;
-                            synced.insert(f.path.clone(), f.sha256.clone());
-                        }
-                    }
-                    Err(e) => {
-                        failed = Some(e);
-                        break;
-                    }
-                },
-                None if f.seed => r.kept += 1,
-                None => {
+                (Act::Write, _) => self.place(f, &now).map(|()| r.bytes += f.size),
+                (Act::Exec, Dest::File(h)) => self.set_exec(f, h),
+                _ => Err(Missed::Raced),
+            };
+            match done {
+                Ok(()) if f.seed => r.seeded += 1,
+                Ok(()) => {
+                    r.copied += 1;
+                    synced.insert(f.path.clone(), mine(f));
+                }
+                Err(Missed::Failed(e)) => {
+                    failed = Some(e);
+                    break;
+                }
+                Err(Missed::Raced) if f.seed => r.kept += 1,
+                Err(Missed::Raced) => {
                     r.conflict_count += 1;
                     if r.conflicts.len() < MAX_CONFLICTS {
                         r.conflicts.push(f.path.clone());
@@ -570,6 +706,70 @@ mod tests {
         assert!(l.finish("s3").is_err(), "nothing to put in place");
         assert!(!home.join("work/w.txt").exists());
         assert_eq!(l.put("nope", &wrong.sha256, 0, b"right").unwrap_err().0.0, 404);
+    }
+
+    #[test]
+    fn an_edit_while_placing_is_kept_and_nothing_next_to_it_is_removed() {
+        let (home, state, outside) = (scratch("home"), scratch("state"), scratch("outside"));
+        let l = Landing::new(home.clone(), &state).unwrap();
+        copy(&l, "s1", &[("work/a.txt", b"v1")]);
+        std::fs::write(outside.join("t"), b"theirs").unwrap();
+        std::os::unix::fs::symlink(outside.join("t"), home.join("work/.a.txt.superbot-sync")).unwrap();
+        std::os::unix::fs::symlink(outside.join("t"), home.join("work/.b.txt.superbot-sync")).unwrap();
+
+        let (a, b) = (file("work/a.txt", b"v2"), file("work/b.txt", b"new"));
+        let plan = l.plan(manifest("s2", &[a.clone(), b.clone()])).unwrap();
+        for n in &plan.need {
+            let body: &[u8] = if n.sha256 == a.sha256 { b"v2" } else { b"new" };
+            l.put("s2", &n.sha256, 0, body).unwrap();
+        }
+        let (was_a, was_b) = (dest(&home, &a.path), dest(&home, &b.path));
+        assert!(matches!(was_a, Dest::File(_)) && was_b == Dest::Missing);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(home.join("work/a.txt"), b"edited meanwhile").unwrap();
+        std::fs::write(home.join("work/b.txt"), b"made meanwhile").unwrap();
+        assert!(matches!(l.place(&a, &was_a), Err(Missed::Raced)));
+        assert!(matches!(l.place(&b, &was_b), Err(Missed::Raced)));
+        assert_eq!(std::fs::read(home.join("work/a.txt")).unwrap(), b"edited meanwhile");
+        assert_eq!(std::fs::read(home.join("work/b.txt")).unwrap(), b"made meanwhile");
+        assert_eq!(std::fs::read(outside.join("t")).unwrap(), b"theirs");
+        assert!(std::fs::symlink_metadata(home.join("work/.a.txt.superbot-sync")).unwrap().is_symlink(), "never removed");
+        let left: Vec<_> = std::fs::read_dir(home.join("work")).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left.len(), 4, "no temp files left behind: {left:?}");
+    }
+
+    #[test]
+    fn an_exec_bit_changed_on_the_server_follows_unless_changed_on_the_machine() {
+        let (home, state) = (scratch("home"), scratch("state"));
+        let l = Landing::new(home.clone(), &state).unwrap();
+        let mode = |p: &str| std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(home.join(p)).unwrap().permissions()) & 0o777;
+        let run = |id: &str, files: &[SyncFile]| {
+            assert!(l.plan(manifest(id, files)).unwrap().need.is_empty());
+            l.finish(id).unwrap()
+        };
+        copy(&l, "s1", &[("work/x.sh", b"echo"), ("work/y.sh", b"echo y")]);
+        let (mut x, mut y) = (file("work/x.sh", b"echo"), file("work/y.sh", b"echo y"));
+        x.exec = true;
+        let r = run("s2", &[x.clone(), y.clone()]);
+        assert_eq!((r.copied, r.unchanged, mode("work/x.sh")), (1, 1, 0o700));
+        let r = run("s3", &[x.clone(), y.clone()]);
+        assert_eq!((r.copied, r.unchanged), (0, 2), "a second copy changes nothing");
+
+        std::fs::set_permissions(home.join("work/y.sh"), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        x.exec = false;
+        y.exec = false;
+        let r = run("s4", &[x, y]);
+        assert_eq!((r.copied, r.conflicts.clone()), (1, vec!["work/y.sh".to_string()]));
+        assert_eq!((mode("work/x.sh"), mode("work/y.sh")), (0o600, 0o700));
+    }
+
+    #[test]
+    fn an_empty_file_lands() {
+        let (home, state) = (scratch("home"), scratch("state"));
+        let l = Landing::new(home.clone(), &state).unwrap();
+        let r = copy(&l, "s1", &[("work/empty", b"")]);
+        assert_eq!(r.copied, 1);
+        assert_eq!(std::fs::read(home.join("work/empty")).unwrap(), b"");
     }
 
     #[test]
