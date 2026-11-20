@@ -56,6 +56,9 @@ enum Place {
     There(Box<(Assigned, wire::Layout)>),
 }
 
+/// What a job on a machine sent back: files by path, and those too big to send.
+type Back = (std::collections::BTreeMap<String, String>, Vec<String>);
+
 /// What a run sees where it happens: its folders, environment, and tools there.
 struct Spot {
     machine: Option<Assigned>,
@@ -597,7 +600,7 @@ impl App {
             *n += 1;
             *n == 1
         };
-        let back: Arc<Mutex<std::collections::BTreeMap<String, String>>> = Arc::default();
+        let back: Arc<Mutex<Back>> = Arc::default();
         let (memory_at, user_at) = (spot.memory.display().to_string(), spot.user_file.display().to_string());
         let job_abort = abort.clone();
         let exec = |mut job: wire::JobRequest, tx: tokio::sync::mpsc::Sender<JobEvent>| {
@@ -613,8 +616,8 @@ impl App {
                 let (mid_tx, mut mid_rx) = tokio::sync::mpsc::channel::<JobEvent>(64);
                 let forward = async {
                     while let Some(ev) = mid_rx.recv().await {
-                        if let JobEvent::Exit { files, .. } = &ev {
-                            *back.lock().unwrap_or_else(|e| e.into_inner()) = files.clone();
+                        if let JobEvent::Exit { files, too_big, .. } = &ev {
+                            *back.lock().unwrap_or_else(|e| e.into_inner()) = (files.clone(), too_big.clone());
                         }
                         if tx.send(ev).await.is_err() {
                             return;
@@ -634,7 +637,12 @@ impl App {
                 }
             }
         }
-        let back = std::mem::take(&mut *back.lock().unwrap_or_else(|e| e.into_inner()));
+        let (back, too_big) = std::mem::take(&mut *back.lock().unwrap_or_else(|e| e.into_inner()));
+        for path in &too_big {
+            let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let mib = crate::machines::job::MAX_COLLECT >> 20;
+            self.say(&bot.id, &format!("{name} on your machine is over {mib} MiB, so it no longer syncs back here. The machine keeps its copy; trim it to sync again."), true);
+        }
         for (there, here) in [(memory_at, self.memory_file(&bot.id)), (user_at, self.user_file(&bot.owner_id))] {
             if let (Some(body), Some(here)) = (back.get(&there), here)
                 && std::fs::read_to_string(&here).ok().as_ref() != Some(body)

@@ -178,6 +178,10 @@ pub enum JobEvent {
         stderr: String,
         /// The `collect` files that exist, by path.
         files: BTreeMap<String, String>,
+        /// `collect` files too big to send. The agent keeps them: later jobs don't
+        /// overwrite them until they're small enough to come back.
+        #[serde(default)]
+        too_big: Vec<String>,
     },
 }
 

@@ -80,7 +80,7 @@ The agent reports its folders. Under `SUPERBOT_HOME` (default `<state dir>/home`
 
 A run there uses those paths in its system prompt, cwd and approval checks. Deleting inside the machine's `work` counts as inside the workspace.
 
-botd keeps the source of truth for memory and facts, since the client and backups read them there. Each job carries the Bot's `MEMORY.md` and, when no other Bot of the same user is running there, the user's `USER.md`. That way one Bot's run can't overwrite another's edits to the facts. Both files come back in `exit`, and botd saves whatever changed.
+botd keeps the source of truth for memory and facts, since the client and backups read them there. Each job carries the Bot's `MEMORY.md` and, when no other Bot of the same user is running there, the user's `USER.md`. That way one Bot's run can't overwrite another's edits to the facts. Both files come back in `exit`, and botd saves whatever changed. A file over 1 MiB doesn't come back: `exit` names it, the Bot says so in the chat, and the agent keeps the machine's copy instead of letting the next job's older one replace it. Once it's trimmed under the limit, it syncs again.
 
 ### Approvals and botctl from the machine
 
