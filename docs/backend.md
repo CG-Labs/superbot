@@ -244,6 +244,7 @@ With `ISOLATION=users` (`deploy/install.sh --isolation`), each user's Bots run a
 - **How a run starts**: `sudo -n -E -u sb-u-<id> -- superbot-run <harness> ...`. botd may only start `superbot-run` as a per-user account, and `superbot-userctl ensure <id>` as root to make an account; nothing else. A user's account is made at their first run, or with `botctl user isolate <user>`.
 - **Harness logins**: on the server, as botd's account, `botctl user harness-login <user> claude` (runs `claude auth login` as that user) or `codex`. `-- <args>` replaces the login arguments, e.g. `-- setup-token`. Per-user API keys as secrets still work too.
 - **Limits**: only Claude Code and Codex Bots run this way; Pi and Hermes Bots are refused with a message. Screens are off. Harness CLIs must be installed system-wide. Accounts share the network.
+- **Turning it on or off** doesn't move files: work starts in the new folder, and the old one stays. Memory and `USER.md` carry over; harness sessions start fresh. To move files, see [deploy/README.md](../deploy/README.md#one-unix-account-per-user).
 - **Audit**: `isolation.account_created`, `isolation.account_failed`, `harness.login_started`; `harness.invoked` adds `runAs`; refusals are `bot.run_refused` with reason `isolation_harness` or `no_account`.
 
 ### Per-user machines (managed hosting)

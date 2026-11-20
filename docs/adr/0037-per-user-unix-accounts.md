@@ -103,6 +103,7 @@ A half-made setup is a startup error, not a silent fallback.
 - Harness CLIs must be installed system-wide (`sudo npm install -g ...`), not in botd's `~/.local`.
 - botd's account can run code as any per-user account. botd is already trusted with every user's keys, so this adds no new trust.
 - Turning it off (`--no-isolation`) removes the sudo rule and drop-in. Accounts and their folders stay, as data.
+- Switching either way doesn't move workspaces: a user's files stay in the old folder until an admin copies them (steps in `deploy/README.md`). Memory and `USER.md` carry over, since botd keeps the originals. Harness sessions live in the old HOME, so each Bot starts a fresh one, which botd already does when a session is lost.
 
 ## Deferred
 
