@@ -11,6 +11,7 @@ import { Sidebar } from "../components/Sidebar";
 import { openConsole, openSetup, watchSetup } from "../src/admin";
 import { planAvailable } from "../src/billing";
 import { showError } from "../src/dialogs";
+import { isStarter, starterText } from "../src/prompts";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
 
@@ -18,7 +19,7 @@ import { colors } from "../src/theme";
 type ScreenState = { takeOver: boolean; n: number } | null;
 
 export default function HomeScreen() {
-  const { api, me, bots, activeId, setActiveId, logout, handoffs, fetchScreenUrl, answerQuestion } = useSuperBot();
+  const { api, me, bots, activeId, setActiveId, logout, handoffs, fetchScreenUrl, answerQuestion, sendText } = useSuperBot();
   const { width } = useWindowDimensions();
   const wide = width >= 800;
   const [mobilePane, setMobilePane] = useState<"list" | "chat">("list");
@@ -28,6 +29,7 @@ export default function HomeScreen() {
   const [approvalsOpen, setApprovalsOpen] = useState(false);
   const [setupWaiting, setSetupWaiting] = useState(false);
   const [billing, setBilling] = useState(false);
+  const [prefill, setPrefill] = useState<string | null>(null);
 
   useEffect(() => (api ? watchSetup(api, me, setSetupWaiting) : undefined), [api, me]);
   useEffect(() => {
@@ -55,6 +57,12 @@ export default function HomeScreen() {
   const onLogout = () => {
     setScreen(null);
     void logout();
+  };
+
+  const runPrompt = (prompt: string) => {
+    if (!wide) setMobilePane("chat");
+    if (isStarter(prompt)) setPrefill(starterText(prompt));
+    else void sendText(prompt).catch((err) => showError(err, "Couldn't send it"));
   };
 
   const toggleScreen = (takeOver?: boolean) => {
@@ -107,6 +115,8 @@ export default function HomeScreen() {
             onBack={wide ? undefined : () => setMobilePane("list")}
             onToggleScreen={toggleScreen}
             screenOpen={!!screen}
+            prefill={prefill}
+            onPrefilled={() => setPrefill(null)}
           />
         ) : null}
         {wide && viewer ? <View style={styles.screenPanel}>{viewer}</View> : null}
@@ -127,6 +137,7 @@ export default function HomeScreen() {
         visible={detailsOpen}
         onClose={() => setDetailsOpen(false)}
         onOpenScreen={() => setScreen((s) => s ?? { takeOver: false, n: 0 })}
+        onUsePrompt={runPrompt}
         onOpenPolicy={(id) => {
           setDetailsOpen(false);
           router.push({ pathname: "/policy", params: { bot: id } });

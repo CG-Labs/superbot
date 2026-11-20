@@ -297,7 +297,7 @@ impl App {
             "handoff": self.db.open_handoff(&b.id),
             "policy": self.db.effective_policy(&b.id).mode, "policyOverride": self.db.bot_override(&b.id).is_some(),
             "owner": self.db.user(&b.owner_id).map(|u| json!({ "id": u.id, "name": u.name })),
-            "visibility": b.visibility,
+            "visibility": b.visibility, "prompts": b.prompts,
         });
         if let Some(on) = self.runs_on(b) {
             v["runsOn"] = json!(on);

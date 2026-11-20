@@ -31,6 +31,8 @@ pub struct Bot {
     /// The user who owns it (ADR 0017). Bots from before ACLs belong to `operator`.
     pub owner_id: String,
     pub visibility: Visibility,
+    /// Suggested prompts in its details. None: the client's defaults; empty: none.
+    pub prompts: Option<Vec<String>>,
 }
 
 /// One user's grant on one Bot (ADR 0017).
@@ -100,6 +102,7 @@ pub struct BotPatch {
     pub session_id: Option<Option<String>>,
     pub hidden: Option<bool>,
     pub unread: Option<bool>,
+    pub prompts: Option<Option<Vec<String>>>,
 }
 
 /// How many active users may hold a seat now (ADR 0038). None: no limit.
@@ -130,6 +133,7 @@ fn bot_row(r: &Row) -> rusqlite::Result<Bot> {
         owner_id: r.get("owner_id")?,
         // The column's CHECK allows only the two; anything else would fail closed.
         visibility: Visibility::parse(&r.get::<_, String>("visibility")?).unwrap_or(Visibility::Private),
+        prompts: r.get::<_, Option<String>>("prompts")?.and_then(|j| serde_json::from_str(&j).ok()),
     })
 }
 
@@ -1105,7 +1109,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 22] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 23] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1128,7 +1132,17 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 22] = [
     migrate_token_usage,
     migrate_approval_runs,
     migrate_teammate_cleanups,
+    migrate_bot_prompts,
 ];
+
+/// Suggested prompts per Bot (ADR 0054), as a JSON array. NULL: the client's defaults.
+fn migrate_bot_prompts(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('bots') WHERE name = 'prompts'", [], |r| r.get(0))?;
+    if !has {
+        c.execute_batch("ALTER TABLE bots ADD COLUMN prompts TEXT;")?;
+    }
+    Ok(())
+}
 
 /// Approve once per run (ADR 0051): the run each approval was asked in, what approving
 /// it for that run would cover, and which of the two it got. The grants themselves are
@@ -2030,6 +2044,7 @@ impl Db {
         if let Some(v) = p.session_id { set("session_id", &v) }
         if let Some(v) = p.hidden { set("hidden", &v) }
         if let Some(v) = p.unread { set("unread", &v) }
+        if let Some(v) = p.prompts { set("prompts", &v.map(|l| serde_json::to_string(&l).unwrap())) }
     }
 
     pub fn delete_bot(&self, id: &str) {
