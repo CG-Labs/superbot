@@ -8,6 +8,8 @@ use crate::machines::fake::Fake;
 use crate::machines::provider::MachineProvider;
 use crate::machines::route::recording::Recording;
 use crate::machines::route::{MachineLink, Routing};
+use crate::machines::enroll::Enrollment;
+use crate::machines::wire;
 use crate::machines::ControlPlane;
 use crate::tests::{audit_list, call, serve_app, serve_app_with, BotKey};
 use crate::users_http_tests::{parse, user_with};
@@ -286,11 +288,17 @@ async fn self_host_keeps_open_shared_bots_unless_asked() {
 
 /// With routing on: Ada's machine is up, enrolled, and assigned; Bea has none.
 async fn routed() -> (World, Arc<Recording>) {
+    routed_with(|_| {}).await
+}
+
+/// `routed`, with the control plane changed by `f` first.
+async fn routed_with(f: impl FnOnce(&mut ControlPlane) + Send + 'static) -> (World, Arc<Recording>) {
     let link = Arc::new(Recording::default());
     let (p, l): (Arc<dyn MachineProvider>, Arc<dyn MachineLink>) = (Arc::new(Fake::default()), link.clone());
     let (port, app, owner, key) = serve_app_with(|a| {
         let mut cp = ControlPlane::for_tests(p);
         (cp.routing, cp.link) = (Routing::On, l);
+        f(&mut cp);
         a.machines = Arc::new(cp);
     })
     .await;
@@ -352,4 +360,122 @@ async fn with_routing_on_a_teammates_run_stays_on_the_owners_machine_without_the
 
     // SHARED_BOTS=open can't be used with routing on.
     assert!(SharedBots::parse("open", true).is_err());
+}
+
+/// `routed`, with teammates' own users on (ADR 0047), and an agent that can.
+async fn routed_teammates() -> (World, Arc<Recording>) {
+    let (w, link) = routed_with(|cp| cp.enrollment = Some(Arc::new(Enrollment::for_tests(41, 1, 1).with_teammate_users()))).await;
+    if let Ok(hb) = link.heartbeat.lock().unwrap().as_mut() {
+        hb.can = vec![wire::CAN_BOT_USER.into(), wire::CAN_TEAMMATES.into()];
+        hb.bot_user = Some(wire::BotUserStatus { state: wire::BOT_USER_READY.into(), ..Default::default() });
+    }
+    (w, link)
+}
+
+fn bot_token(job: &wire::JobRequest) -> String {
+    job.env.get("BOT_TOKEN").cloned().unwrap_or_default()
+}
+
+#[tokio::test]
+async fn with_teammate_users_a_teammates_run_is_their_own_user_in_their_own_home() {
+    let (w, link) = routed_teammates().await;
+    // Pi has no machine login, so no key is needed to run it as Bea's user.
+    let team = w.app.db.create_bot_owned("Team", "#fff", "waddle", "pi", None, false, &w.a_id, Visibility::Shared);
+    let machine = w.app.db.user_machine(&w.a_id).unwrap();
+
+    run(&w, &w.a, &team.id, "go").await;
+    run(&w, &w.b, &team.id, "go").await;
+    run(&w, &w.b, &team.id, "again").await;
+    let sent = link.sent.lock().unwrap().clone();
+    assert_eq!(sent.len(), 3);
+    let (ada, bea) = (&sent[0].1, &sent[1].1);
+    let theirs = crate::machines::route::recording::teammate_reply(&w.b_id, true);
+    // Ada's own run: as before, the Bots' user in the Bots' home.
+    assert_eq!(ada.for_user, None);
+    assert!(ada.cwd.starts_with("/home/bots"), "{}", ada.cwd);
+    assert_eq!(isolation::token_for_user(&w.app.cfg.bot_key, &bot_token(ada)), None);
+    // Bea's: her own user, nothing in Ada's home, and none of Ada's keys.
+    assert_eq!(bea.for_user.as_deref(), Some(w.b_id.as_str()), "the agent runs it as Bea's user");
+    assert!(sent.iter().all(|(to, job)| to.machine_id == machine.id && job.owner_id == w.a_id), "still Ada's machine");
+    assert_eq!(bea.cwd, theirs.workspace);
+    let mut paths: Vec<&String> = bea.files.iter().map(|f| &f.path).chain(&bea.collect).collect();
+    paths.push(&bea.cwd);
+    assert!(paths.iter().all(|p| p.starts_with(&theirs.home)), "{paths:?}");
+    assert!(!paths.iter().any(|p| p.starts_with("/home/bots")), "{paths:?}");
+    assert!(!bea.env.contains_key(KEY) && !bea.env.values().any(|v| v == &w.secret));
+    assert!(bea.env.get("SUPERBOT_HOME").is_none_or(|h| h.starts_with(&theirs.home)));
+    assert_eq!(*link.teammates.lock().unwrap(), [w.b_id.clone(), w.b_id.clone()], "asked before each of Bea's runs, never Ada's");
+
+    let created = events(&w, "action=machine.teammate_user_created").await;
+    assert_eq!(created.len(), 1, "made once: {created:?}");
+    assert_eq!((created[0]["targetId"].as_str(), created[0]["details"]["forUser"].as_str()), (Some(machine.id.as_str()), Some(w.b_id.as_str())));
+    assert_eq!(created[0]["details"]["user"], theirs.user.as_str());
+    let routed = events(&w, "action=bot.run_routed").await;
+    assert_eq!(routed.iter().filter(|e| e["details"]["teammateUser"] == theirs.user.as_str()).count(), 2, "{routed:?}");
+    assert!(routed.iter().any(|e| e["details"]["teammateUser"].is_null()), "Ada's run has none");
+    let invoked = events(&w, &format!("action=harness.invoked&bot={}", team.id)).await;
+    assert_eq!(invoked.iter().filter(|e| e["details"]["teammateUser"] == theirs.user.as_str()).count(), 2, "{invoked:?}");
+
+    // What Bea's run left behind carries a token bound to her: it works while the Bot's
+    // latest run is hers, and stops once Ada's run takes the Bot back.
+    let bound = bot_token(&sent[2].1);
+    assert_eq!(isolation::token_for_user(&w.app.cfg.bot_key, &bound), Some(w.b_id.as_str()));
+    assert_ne!(bound, bot_token(ada), "not Ada's token");
+    let (code, list) = call(w.port, "GET", "/api/bots", &format!("Bearer {bound}"), "").await;
+    assert_eq!(code, 200, "{list}");
+    run(&w, &w.a, &team.id, "mine again").await;
+    let (code, _) = call(w.port, "GET", "/api/bots", &format!("Bearer {bound}"), "").await;
+    assert_eq!(code, 401, "Bea's token doesn't get Ada's access back");
+    let failed = events(&w, "action=auth.login_failed").await;
+    assert!(failed.iter().any(|e| e["details"]["reason"] == "run_over"), "{failed:?}");
+    let (code, _) = call(w.port, "GET", "/api/bots", &format!("Bearer {}", bot_token(ada)), "").await;
+    assert_eq!(code, 200, "Ada's own token works as before");
+}
+
+#[tokio::test]
+async fn with_teammate_users_a_teammates_run_is_refused_rather_than_run_as_the_bots_user() {
+    let (w, link) = routed_teammates().await;
+    let team = bot(&w, "Team", &w.a_id, Visibility::Shared);
+    let pi = w.app.db.create_bot_owned("Pi", "#fff", "waddle", "pi", None, false, &w.a_id, Visibility::Shared);
+    let refusals = async |w: &World, reason: &str| events(w, "action=bot.run_refused").await.into_iter().filter(|e| e["details"]["reason"] == reason).collect::<Vec<_>>();
+
+    // Claude logs in through the machine's login in Ada's home, which Bea's user can't
+    // read: without a server-wide key Bea's run is refused, and Ada's runs as before.
+    let said = run(&w, &w.b, &team.id, "go").await;
+    assert!(said.contains("separate account") && said.contains("server-wide key"), "{said}");
+    assert!(!said.contains("superbot-t-"), "{said}");
+    let no_key = refusals(&w, "teammate_no_key").await;
+    assert_eq!((no_key.len(), no_key[0]["details"]["forUser"].as_str()), (1, Some(w.b_id.as_str())), "{no_key:?}");
+    run(&w, &w.a, &team.id, "go").await;
+    assert_eq!(link.sent.lock().unwrap().len(), 1, "only Ada's ran");
+
+    // An agent that can't make users is outdated for Bea's runs, not Ada's.
+    let can = link.heartbeat.lock().unwrap().as_ref().unwrap().can.clone();
+    link.heartbeat.lock().unwrap().as_mut().unwrap().can = vec![wire::CAN_BOT_USER.into()];
+    run(&w, &w.b, &pi.id, "go").await;
+    assert_eq!(refusals(&w, "agent_outdated").await.len(), 1);
+    run(&w, &w.a, &pi.id, "go").await;
+    assert_eq!(link.sent.lock().unwrap().len(), 2);
+    link.heartbeat.lock().unwrap().as_mut().unwrap().can = can;
+
+    // One that fails to make the user: refused, its words for admins only.
+    *link.teammate_error.lock().unwrap() = Some("useradd: failure at 192.0.2.7".into());
+    let said = run(&w, &w.b, &pi.id, "go").await;
+    assert!(said.contains("couldn't set up an account for you") && !said.contains("192.0.2.7"), "{said}");
+    let failed = refusals(&w, "teammate_user_failed").await;
+    assert_eq!(failed[0]["details"]["detail"], "useradd: failure at 192.0.2.7");
+    assert_eq!(link.sent.lock().unwrap().len(), 2, "never sent as the Bots' user");
+    assert!(events(&w, "action=machine.teammate_user_created").await.is_empty());
+}
+
+#[tokio::test]
+async fn teammate_users_are_off_unless_asked() {
+    let (w, link) = routed().await;
+    let team = w.app.db.create_bot_owned("Team", "#fff", "waddle", "pi", None, false, &w.a_id, Visibility::Shared);
+    run(&w, &w.b, &team.id, "go").await;
+    let sent = link.sent.lock().unwrap().clone();
+    assert_eq!(sent[0].1.for_user, None, "as ADR 0046 has it");
+    assert!(sent[0].1.cwd.starts_with("/home/bots"));
+    assert!(link.teammates.lock().unwrap().is_empty());
+    assert_eq!(isolation::token_for_user(&w.app.cfg.bot_key, &bot_token(&sent[0].1)), None);
 }

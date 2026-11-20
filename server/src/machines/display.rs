@@ -228,7 +228,7 @@ impl Screens {
         let _one = self.changing.lock().await;
         let idle = Duration::from_secs(r.idle_secs.clamp(60, 86_400));
         let xauth = r.xauth || r.for_user.is_some();
-        let old_viewer = {
+        let (old_viewer, unfit) = {
             let mut live = self.live();
             let fits = live.get_mut(key).map(|s| s.alive() && s.xauth.is_some() == xauth && s.user == who.user && s.home == who.home);
             match live.get_mut(key).filter(|_| fits == Some(true)) {
@@ -238,14 +238,17 @@ impl Screens {
                     if s.token.as_str() == r.token {
                         return Ok(self.reply(s, false));
                     }
-                    Some((s.slot, s.viewer.take(), s.xauth.clone()))
+                    (Some((s.slot, s.viewer.take(), s.xauth.clone())), None)
                 }
-                None => {
-                    live.remove(key);
-                    None
-                }
+                None => (None, live.remove(key)),
             }
         };
+        // One for another user or cookie ends before its slot is used again.
+        if let Some(mut s) = unfit {
+            for c in [&mut s.x, &mut s.bus, &mut s.wm].into_iter().chain(s.viewer.as_mut()) {
+                let _ = c.kill().await;
+            }
+        }
         if let Some((slot, viewer, cookie)) = old_viewer {
             if let Some(mut v) = viewer {
                 let _ = v.kill().await;

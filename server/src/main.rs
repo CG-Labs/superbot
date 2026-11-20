@@ -41,6 +41,8 @@ mod machines_logins_tests;
 mod machines_upkeep_tests;
 #[cfg(test)]
 mod machines_screens_tests;
+#[cfg(test)]
+mod machines_teammates_tests;
 mod passwd;
 mod paths;
 mod policy;
@@ -1914,7 +1916,7 @@ fn screen_for(app: &App, c: &Caller, bot: &db::Bot, asked: Option<&str>) -> Res<
     };
     let admin = c.principal == Principal::User(Role::Admin);
     let who = match asked.map(str::trim).filter(|u| !u.is_empty()) {
-        Some(u) if !on => return Err(bad(&format!("Screens are per teammate only with MACHINE_TEAMMATE_USERS=on, so there's no screen for {u}."))),
+        Some(u) if !on => return Err(bad(format!("Screens are per teammate only with MACHINE_TEAMMATE_USERS=on, so there's no screen for {u}."))),
         Some(u) if admin || me.as_deref() == Some(u) => Some(u.to_string()),
         Some(_) => return Err(ApiError(StatusCode::FORBIDDEN, "Only an admin can open someone else's screen of this Bot.".into())),
         None if on && !admin => me,

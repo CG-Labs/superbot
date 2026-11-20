@@ -72,7 +72,12 @@ pub struct Teammates {
 
 impl Teammates {
     pub fn new(root: PathBuf, state_dir: PathBuf, stand_in: Option<String>) -> Teammates {
-        Teammates { root, state_dir, stand_in, making: Mutex::new(()) }
+        Teammates {
+            root,
+            state_dir,
+            stand_in,
+            making: Mutex::new(()),
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -96,7 +101,11 @@ impl Teammates {
             use std::io::Write;
             use std::os::unix::fs::OpenOptionsExt;
             let _ = std::fs::remove_file(&tmp);
-            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
             f.write_all(&body)?;
             f.sync_all()?;
             std::fs::rename(&tmp, &path)
@@ -111,14 +120,24 @@ impl Teammates {
 
     /// `user_id`'s user and home, made if this is their first run here. `check` refuses
     /// ids that must never be a teammate's (root, the agent's, the Bots' user's).
-    pub fn ensure(&self, user_id: &str, check: impl Fn(Ids) -> Result<(), String>) -> Result<Teammate, String> {
+    pub fn ensure(
+        &self,
+        user_id: &str,
+        check: impl Fn(Ids) -> Result<(), String>,
+    ) -> Result<Teammate, String> {
         let _one = self.making.lock().unwrap_or_else(|e| e.into_inner());
-        let name = self.stand_in.clone().unwrap_or_else(|| wire::teammate_user(user_id));
+        let name = self
+            .stand_in
+            .clone()
+            .unwrap_or_else(|| wire::teammate_user(user_id));
         let home = self.home_of(user_id);
         let mut record = self.record()?;
         let (ids, created) = match record.get(user_id) {
             Some(s) => {
-                let want = Ids { uid: s.uid, gid: s.gid };
+                let want = Ids {
+                    uid: s.uid,
+                    gid: s.gid,
+                };
                 match runas::lookup(&s.user) {
                     Some((ids, _)) if s.user == name && ids == want => (want, false),
                     Some(_) => return Err(format!("{} isn't the user it was.", s.user)),
@@ -127,18 +146,32 @@ impl Teammates {
             }
             None => {
                 if self.stand_in.is_none() && runas::lookup(&name).is_some() {
-                    return Err(format!("{name} is already a user here, but this agent didn't make it for that teammate."));
+                    return Err(format!(
+                        "{name} is already a user here, but this agent didn't make it for that teammate."
+                    ));
                 }
                 let ids = runas::ensure_user_as(&name, &home, "SuperBot teammate")?;
                 check(ids)?;
-                record.insert(user_id.to_string(), Saved { user: name.clone(), uid: ids.uid, gid: ids.gid });
+                record.insert(
+                    user_id.to_string(),
+                    Saved {
+                        user: name.clone(),
+                        uid: ids.uid,
+                        gid: ids.gid,
+                    },
+                );
                 self.save(&record)?;
                 (ids, true)
             }
         };
         check(ids)?;
         self.make_home(&home, ids)?;
-        Ok(Teammate { user: name, ids, home, created })
+        Ok(Teammate {
+            user: name,
+            ids,
+            home,
+            created,
+        })
     }
 
     /// The teammates' folder (root's, `0711`) and this teammate's home in it (theirs,
@@ -149,21 +182,36 @@ impl Teammates {
         match std::fs::symlink_metadata(&self.root) {
             Ok(m) if m.is_dir() => {}
             Ok(_) => return Err(format!("{} isn't a folder.", self.root.display())),
-            Err(_) => std::fs::DirBuilder::new().recursive(true).mode(0o711).create(&self.root).map_err(|e| at(&self.root, e))?,
+            Err(_) => std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o711)
+                .create(&self.root)
+                .map_err(|e| at(&self.root, e))?,
         }
         runas::chmod_dir(&self.root, 0o711).map_err(|e| at(&self.root, e))?;
         match std::fs::symlink_metadata(home) {
             Ok(m) if m.is_dir() && m.uid() == ids.uid => {}
-            Ok(_) => return Err(format!("{} belongs to someone else, or isn't a folder.", home.display())),
+            Ok(_) => {
+                return Err(format!(
+                    "{} belongs to someone else, or isn't a folder.",
+                    home.display()
+                ));
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::DirBuilder::new().mode(0o700).create(home).map_err(|e| at(home, e))?;
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(home)
+                    .map_err(|e| at(home, e))?;
                 runas::hand_over(home, ids).map_err(|e| at(home, e))?;
             }
             Err(e) => return Err(at(home, e)),
         }
         runas::as_user(Some(ids), || -> std::io::Result<()> {
             for d in [home.join("work"), home.join("bots")] {
-                std::fs::DirBuilder::new().recursive(true).mode(0o700).create(d)?;
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(d)?;
             }
             Ok(())
         })
@@ -179,7 +227,12 @@ mod tests {
 
     fn me() -> Ids {
         // SAFETY: no arguments.
-        unsafe { Ids { uid: libc::geteuid(), gid: libc::getegid() } }
+        unsafe {
+            Ids {
+                uid: libc::geteuid(),
+                gid: libc::getegid(),
+            }
+        }
     }
 
     #[test]
@@ -192,7 +245,10 @@ mod tests {
         let first = t.ensure("u-bea", |_| Ok(())).unwrap();
         assert!(first.created);
         assert_eq!(first.ids, me());
-        assert_eq!(first.home, d.join("teammates").join(wire::teammate_user("u-bea")));
+        assert_eq!(
+            first.home,
+            d.join("teammates").join(wire::teammate_user("u-bea"))
+        );
         let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode(&d.join("teammates")), 0o711);
         assert_eq!(mode(&first.home), 0o700);
@@ -202,13 +258,24 @@ mod tests {
         let again = t.ensure("u-bea", |_| Ok(())).unwrap();
         assert!(!again.created, "made once");
         assert_eq!(again.home, first.home);
-        assert_ne!(t.ensure("u-cy", |_| Ok(())).unwrap().home, first.home, "each teammate their own home");
+        assert_ne!(
+            t.ensure("u-cy", |_| Ok(())).unwrap().home,
+            first.home,
+            "each teammate their own home"
+        );
 
-        assert!(t.ensure("u-dee", |_| Err("no".into())).is_err(), "refused ids");
+        assert!(
+            t.ensure("u-dee", |_| Err("no".into())).is_err(),
+            "refused ids"
+        );
 
         // A record naming another uid than the user has now runs nothing.
         let r = std::fs::read_to_string(state.join(RECORD)).unwrap();
-        std::fs::write(state.join(RECORD), r.replacen(&format!("\"uid\":{}", me().uid), "\"uid\":4000000", 1)).unwrap();
+        std::fs::write(
+            state.join(RECORD),
+            r.replacen(&format!("\"uid\":{}", me().uid), "\"uid\":4000000", 1),
+        )
+        .unwrap();
         let e = t.ensure("u-bea", |_| Ok(())).unwrap_err();
         assert!(e.contains("isn't the user it was"), "{e}");
 
@@ -223,7 +290,10 @@ mod tests {
     fn teammate_users_are_plain_and_distinct() {
         let (a, b) = (wire::teammate_user("u1"), wire::teammate_user("u2"));
         assert_ne!(a, b);
-        assert!(runas::plain_user(&a) && a.len() <= 32 && a.starts_with(wire::TEAMMATE_USER_PREFIX), "{a}");
+        assert!(
+            runas::plain_user(&a) && a.len() <= 32 && a.starts_with(wire::TEAMMATE_USER_PREFIX),
+            "{a}"
+        );
         assert_ne!(a, wire::BOT_USER);
     }
 }

@@ -185,7 +185,7 @@ impl Refusal {
                 return format!("I didn't run: {h} isn't logged in for me on {o}'s computer. An admin can log it in there, or save a server-wide key for it.");
             }
             Refusal::NoTeammateKey(h) => {
-                return format!("I didn't run: on {o}'s computer I run for you under your own account, and {h} has no server-wide key for that. An admin can save one.");
+                return format!("I didn't run: on {o}'s computer, runs for teammates use a separate account, and {h} has no server-wide key for that. An admin can save one.");
             }
             Refusal::TeammateUserFailed(_) => "it couldn't set up an account for you there",
             Refusal::Outdated(_) | Refusal::Upgrading | Refusal::NoBotctl | Refusal::FolderCopying | Refusal::BotUserPending | Refusal::BotUserFailed => {
