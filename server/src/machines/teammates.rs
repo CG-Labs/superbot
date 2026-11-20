@@ -17,6 +17,7 @@
 use super::runas::{self, Ids};
 use super::wire;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -69,8 +70,28 @@ impl OsUsers for System {
                 return Ok(stopped.len() as u32);
             }
             for pid in left {
-                // SAFETY: a signal to a pid; at worst it's gone already.
-                if unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) } == 0 {
+                // A pid can be reused once its process is gone, so it's signalled
+                // through a pidfd, opened before its owner is checked again: while the
+                // process the pidfd names is alive (as the signal needs), the pid is its.
+                // SAFETY: plain integers; the descriptor is owned on success.
+                let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_long, 0 as libc::c_long) };
+                if fd < 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.raw_os_error() == Some(libc::ENOSYS) {
+                        return Err("this kernel can't stop processes safely (needs Linux 5.3 or later)".into());
+                    }
+                    continue;
+                }
+                // SAFETY: a new descriptor, owned only here.
+                let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as libc::c_int) };
+                if !runs_as(pid, uid) {
+                    continue;
+                }
+                // SAFETY: an open pidfd, a signal number and no extra info.
+                let sent = unsafe {
+                    libc::syscall(libc::SYS_pidfd_send_signal, fd.as_raw_fd() as libc::c_long, libc::SIGKILL as libc::c_long, std::ptr::null::<libc::siginfo_t>(), 0 as libc::c_long)
+                };
+                if sent == 0 {
                     stopped.insert(pid);
                 }
             }
@@ -114,26 +135,29 @@ fn pids_of(uid: u32) -> Vec<u32> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
-    let uid = uid.to_string();
     entries
         .flatten()
         .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
         .filter(|pid| *pid > 1 && *pid != me)
-        .filter(|pid| {
-            let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
-                return false;
-            };
-            let zombie = s
-                .lines()
-                .find_map(|l| l.strip_prefix("State:"))
-                .is_some_and(|st| st.trim_start().starts_with('Z'));
-            let theirs = s
-                .lines()
-                .find_map(|l| l.strip_prefix("Uid:"))
-                .is_some_and(|ids| ids.split_whitespace().take(3).any(|i| i == uid));
-            theirs && !zombie
-        })
+        .filter(|pid| runs_as(*pid, uid))
         .collect()
+}
+
+/// Whether `pid` is a live process whose real, effective or saved uid is `uid`.
+fn runs_as(pid: u32, uid: u32) -> bool {
+    let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return false;
+    };
+    let uid = uid.to_string();
+    let zombie = s
+        .lines()
+        .find_map(|l| l.strip_prefix("State:"))
+        .is_some_and(|st| st.trim_start().starts_with('Z'));
+    let theirs = s
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))
+        .is_some_and(|ids| ids.split_whitespace().take(3).any(|i| i == uid));
+    theirs && !zombie
 }
 
 /// Every teammate runs as one existing user (whoever runs the tests): nothing is made,
@@ -598,6 +622,7 @@ impl Teammates {
             out.temp_removed = self.os_users.clear_temp(ids.uid);
             out.user_removed = self.os_users.remove(&out.user)?;
         }
+        let their_uid = saved.map(|s| s.uid);
         out.files = match std::fs::symlink_metadata(&held) {
             Err(_) => "none",
             Ok(m) if !m.is_dir() => {
@@ -606,6 +631,10 @@ impl Teammates {
             }
             Ok(_) => match files {
                 Files::Archive { home, ids, name } => {
+                    // Their user is gone and the folder is root's: nothing changes it now.
+                    if let Some(uid) = their_uid {
+                        runas::unshare_links(&held, uid).map_err(|e| at(&held, e))?;
+                    }
                     runas::hand_over(&held, *ids).map_err(|e| at(&held, e))?;
                     let to = runas::move_into(
                         &held,
