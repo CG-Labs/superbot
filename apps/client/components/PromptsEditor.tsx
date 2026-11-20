@@ -56,6 +56,7 @@ export function PromptsEditor({ prompts, custom, onSave, onCancel }: Props) {
             placeholder={i === 0 ? "Check the build and tell me what broke" : "Another prompt"}
             placeholderTextColor={colors.textFaint}
             value={p}
+            editable={!busy}
             maxLength={MAX_PROMPT_CHARS}
             onChangeText={(t) => setList((l) => l.map((x, k) => (k === i ? t : x)))}
           />

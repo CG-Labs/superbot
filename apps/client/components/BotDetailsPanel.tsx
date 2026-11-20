@@ -63,7 +63,13 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, 
   const botId = bot?.id;
   const [name, setName] = useState(bot?.name || "");
   const [routines, setRoutines] = useState<Routine[]>([]);
-  const [editing, setEditing] = useState<Editing>(null);
+  const [editing, setEditingState] = useState<Editing>(null);
+  /** Bumped whenever the form changes, so a save that finishes late can't close a newer one. */
+  const sessionRef = useRef(0);
+  const setEditing = (e: Editing) => {
+    sessionRef.current += 1;
+    setEditingState(e);
+  };
   /** The Bot whose routines are on screen; a load for any other (or a closed panel) is stale. */
   const shownRef = useRef<string | null>(null);
 
@@ -108,8 +114,9 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, 
         custom={bot.prompts != null}
         onCancel={() => setEditing(null)}
         onSave={async (list) => {
+          const session = sessionRef.current;
           await patchBot(bot.id, { prompts: list });
-          setEditing(null);
+          if (sessionRef.current === session) setEditing(null);
         }}
       />
     ) : (

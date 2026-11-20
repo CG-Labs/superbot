@@ -1,5 +1,5 @@
 import React from "react";
-import { render, screen, userEvent } from "@testing-library/react-native";
+import { act, render, screen, userEvent } from "@testing-library/react-native";
 import { PromptsEditor } from "../PromptsEditor";
 import { DEFAULT_PROMPTS } from "../../src/prompts";
 
@@ -39,6 +39,18 @@ describe("PromptsEditor", () => {
     await user.press(screen.getByRole("button", { name: "Remove prompt 1" }));
     await user.press(screen.getByRole("button", { name: "Save prompts" }));
     expect(onSave).toHaveBeenCalledWith([]);
+  });
+
+  it("locks the fields while saving, so later typing isn't lost", async () => {
+    const user = userEvent.setup();
+    let finish = () => {};
+    const onSave = jest.fn(() => new Promise<void>((resolve) => (finish = resolve)));
+    await render(<PromptsEditor prompts={["Hi"]} custom onSave={onSave} onCancel={jest.fn()} />);
+
+    await user.press(screen.getByRole("button", { name: "Save prompts" }));
+    expect(screen.getByLabelText("Prompt 1").props.editable).toBe(false);
+    await act(async () => finish());
+    expect(screen.getByLabelText("Prompt 1").props.editable).toBe(true);
   });
 
   it("shows the server's refusal and cancels", async () => {

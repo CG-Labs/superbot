@@ -194,6 +194,20 @@ describe("BotDetailsPanel", () => {
     expect(screen.queryByText("Suggested prompts")).not.toBeOnTheScreen();
   });
 
+  it("never lets a late save close a newer prompts form", async () => {
+    let finish = () => {};
+    const patchBot = jest.fn(() => new Promise<void>((resolve) => (finish = resolve)));
+    Object.assign(mockCtx, { bots: [{ ...bot("b", "Bob"), prompts: ["Old"] }], activeId: "b", fetchRoutines: jest.fn(async () => []), patchBot });
+    await render(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} onUsePrompt={jest.fn()} />);
+
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Edit suggested prompts" })));
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Save prompts" })));
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Close details" })));
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Edit suggested prompts" })));
+    await act(async () => finish());
+    expect(screen.getByText("Suggested prompts")).toBeOnTheScreen();
+  });
+
   it("lets operators use prompts but not edit them", async () => {
     Object.assign(mockCtx, { bots: [{ ...shared("operate"), prompts: ["Check the build"] }], activeId: "b", fetchRoutines: jest.fn(async () => []) });
     await render(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} onUsePrompt={jest.fn()} />);
