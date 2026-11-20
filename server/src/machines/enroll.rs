@@ -708,14 +708,16 @@ async fn rotate(
         Err(e) => return reply(StatusCode::BAD_REQUEST, &e),
     };
     let Some(superseded) = p.app.db.add_rotated_cert(&c, &issued) else {
-        if p.app
+        let cert_gone = p
+            .app
             .db
             .machine_cert(&c.fingerprint)
-            .is_some_and(|now| now.status != "active")
-        {
+            .is_none_or(|now| now.status != "active");
+        let machine_gone = !p.app.db.machine(&m.id).is_some_and(|now| accepting(now.state));
+        if cert_gone || machine_gone {
             return reply(
                 StatusCode::UNAUTHORIZED,
-                "This certificate was held or revoked meanwhile.",
+                "This certificate was held or revoked, or the machine stopped, meanwhile.",
             );
         }
         return reply(

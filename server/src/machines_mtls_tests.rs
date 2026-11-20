@@ -591,15 +591,6 @@ async fn unenrolled_rotated_and_revoked_certificates_are_refused() {
         .await
         .unwrap();
     assert_eq!(code, 401);
-    // A rotation that passed its check just before the revocation can't bring it back.
-    let (_, csr) = pki::new_request(&mid).unwrap();
-    let late = env.e.issue_unrecorded(&csr, &uid, &mid);
-    let revoked3 = env.app.db.machine_cert(&id3.fingerprint).unwrap();
-    assert_eq!(env.app.db.add_rotated_cert(&revoked3, &late), None);
-    assert!(
-        env.app.db.machine_cert(&late.fingerprint).is_none()
-            && env.app.db.machine_pins(&mid).is_empty()
-    );
     assert!(reason_count(&events(&env, "access.denied").await, "revoked") >= 2);
     assert_eq!(env.app.db.machine(&mid).unwrap().enrollment, "revoked");
     assert_eq!(env.cp.route(&env.app.db, &uid), Err(Refusal::NotEnrolled));
@@ -629,6 +620,73 @@ async fn unenrolled_rotated_and_revoked_certificates_are_refused() {
         "enrolled again with a new token"
     );
     assert_eq!(env.app.db.machine(&mid).unwrap().enrollment, "enrolled");
+}
+
+/// A rotation passes `authenticate`, then the machine is revoked or stopped before
+/// `add_rotated_cert` runs: the revocation wins and nothing usable is left.
+#[tokio::test]
+async fn a_revocation_between_a_rotations_check_and_its_write_wins() {
+    let env = serve().await;
+    let (uid, mid, token) = machine_for(&env, "ada@example.com").await;
+    let id = agent::enroll(&config(&env, &mid, Some(&token)))
+        .await
+        .unwrap();
+    let checked = env.app.db.machine_cert(&id.fingerprint).unwrap();
+    assert_eq!(checked.status, "active", "what authenticate saw");
+    let (_, csr) = pki::new_request(&mid).unwrap();
+    let issued = env.e.issue_unrecorded(&csr, &uid, &mid);
+
+    let (code, r) = json_call(
+        &env,
+        "DELETE",
+        "/api/users/ada@example.com/machine/certificates",
+        "",
+    )
+    .await;
+    assert_eq!((code, r["revoked"].as_u64()), (200, Some(1)), "{r}");
+
+    assert_eq!(env.app.db.add_rotated_cert(&checked, &issued), None);
+    assert!(
+        env.app.db.machine_cert(&issued.fingerprint).is_none(),
+        "the new certificate wasn't recorded"
+    );
+    assert!(
+        env.app
+            .db
+            .machine_certs(&mid)
+            .iter()
+            .all(|c| c.status == "revoked"),
+        "no valid certificate is left"
+    );
+    assert!(env.app.db.machine_pins(&mid).is_empty());
+    assert_eq!(env.app.db.machine(&mid).unwrap().enrollment, "revoked");
+    assert_eq!(env.cp.route(&env.app.db, &uid), Err(Refusal::NotEnrolled));
+    assert_eq!(
+        raw(&env, Some(&id), "GET", &format!("/v1/machines/{mid}"), Value::Null)
+            .await
+            .unwrap()
+            .0,
+        401
+    );
+
+    // Stopped after the check, before its certificates were revoked.
+    let (ub, mb, tb) = machine_for(&env, "bea@example.com").await;
+    let idb = agent::enroll(&config(&env, &mb, Some(&tb)))
+        .await
+        .unwrap();
+    let checked = env.app.db.machine_cert(&idb.fingerprint).unwrap();
+    let (_, csr) = pki::new_request(&mb).unwrap();
+    let issued = env.e.issue_unrecorded(&csr, &ub, &mb);
+    let mut m = env.app.db.machine(&mb).unwrap();
+    m.state = State::Destroying;
+    assert!(env.app.db.save_machine(&m, State::Running));
+    assert_eq!(env.app.db.add_rotated_cert(&checked, &issued), None);
+    assert!(env.app.db.machine_cert(&issued.fingerprint).is_none());
+    assert_eq!(
+        env.app.db.machine_pins(&mb),
+        std::slice::from_ref(&idb.fingerprint),
+        "only the certificate destroy is about to revoke"
+    );
 }
 
 #[tokio::test]
