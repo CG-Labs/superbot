@@ -195,10 +195,6 @@ pub async fn handover(State(app): State<AppState>, Extension(by): Extension<Who>
         app.db.record(&by.event("routine.handed_over").target("routine", &r.id).bot(&r.bot_id).details(details));
         routines.push(r.id);
     }
-    if let Some(e) = refused {
-        record(&app, &by, &from, &to, &moved, &routines, &skipped, &[]);
-        return Err(e);
-    }
     let resumed: Vec<String> = if resume_now {
         let paused = routines.iter().filter_map(|id| app.db.routine(id)).filter(|r| r.paused_for.as_deref() == Some(&to.id)).collect();
         resume(&app, &by, paused, "handover").into_iter().map(|r| r.id).collect()
@@ -206,6 +202,9 @@ pub async fn handover(State(app): State<AppState>, Extension(by): Extension<Who>
         Vec::new()
     };
     record(&app, &by, &from, &to, &moved, &routines, &skipped, &resumed);
+    if let Some(e) = refused {
+        return Err(e);
+    }
     Ok(Json(json!({ "from": from.id, "to": to.id, "bots": moved, "routines": routines, "skipped": skipped, "resumed": resumed })))
 }
 

@@ -51,7 +51,7 @@ Resuming re-checks each routine: one whose owner or author is still disabled sta
 - **From** a disabled user only (409 if active: give one Bot away from its access settings instead). **To** an active user who isn't them and isn't read-only (400).
 - **Bots**: every Bot they own goes to `to`, the same way an admin gives one Bot away (ADR 0017): work in progress stops, its memory follows, `to`'s grant on it is dropped, `bot.owner_changed`. The whole set must fit `to`'s plan's Bot limit, checked first (403, `user.handover_refused`).
 - **Routines**: those they wrote become `to`'s (`author_id`), and pauses held for them move to `to`, on every Bot `to` can operate. A routine on a Bot `to` can't operate (someone else's private Bot) is left as it was, paused for the disabled user, and listed in `skipped`, so nobody's routine starts running on a Bot they can't use.
-- If a Bot can't be given midway (someone took one of `to`'s slots meanwhile), the hand-over stops there with a 403, but the routines are still moved for the Bots already given, so none is left with `to` but held for the disabled user. `user.handed_over` records what moved. Running it again moves the rest.
+- If a Bot can't be given midway (someone took one of `to`'s slots meanwhile), the hand-over stops there with a 403, but the routines are still moved (and resumed, with `resumeRoutines`) for the Bots already given, so none is left with `to` but held for the disabled user. `user.handed_over` records what moved. Running it again moves the rest.
 - They **stay paused** unless `resumeRoutines: true`, which resumes the ones just handed over. Otherwise resume them later for `to`.
 
 ### Audit
