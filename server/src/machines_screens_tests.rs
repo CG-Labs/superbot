@@ -362,12 +362,34 @@ async fn a_screen_request_waiting_out_a_revocation_gets_no_link() {
     let pending = tokio::spawn(async move { call(port, "GET", &path, &bob, "").await });
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert!(!pending.is_finished(), "waiting on the Bot's lock");
-    let (code, v) = json_call(&env, "DELETE", &format!("/api/users/{bob_id}/sessions"), "").await;
-    assert_eq!(code, 200, "{v}");
+    // The revocation is stored, then waits for the Bot's lock behind Bob's request.
+    let (admin, path) = (env.admin.clone(), format!("/api/users/{bob_id}/sessions"));
+    let revoke = tokio::spawn(async move { call(port, "DELETE", &path, &admin, "").await });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     drop(held);
     let (code, body) = pending.await.unwrap();
     assert_eq!(code, 401, "{body}");
+    assert_eq!(revoke.await.unwrap().0, 200);
     assert!(m.agent.screens.report().running.is_empty(), "nothing started for it");
+}
+
+/// A first start already past its access check isn't open yet: revoking sessions waits
+/// for it, so the screen it opens gets a new token too.
+#[tokio::test]
+async fn a_bulk_revocation_waits_out_a_first_start_under_way() {
+    let mut env = serve_with(|e| e.with_screens(ports())).await;
+    let (uid, m) = ready_machine(&mut env, "ada@example.com", fake_stack()).await;
+    let bot = owned_bot(&env, &uid);
+    until_ready(&env, &m.agent).await;
+    let (bob_id, _) = user_with(env.port, &env.admin, "bob@example.com", "member").await;
+
+    let held = crate::machines::screens::hold_for_tests(&env.e, &bot).await;
+    let (port, admin, path) = (env.port, env.admin.clone(), format!("/api/users/{bob_id}/sessions"));
+    let revoke = tokio::spawn(async move { call(port, "DELETE", &path, &admin, "").await });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!revoke.is_finished(), "waiting for the start under way");
+    drop(held);
+    assert_eq!(revoke.await.unwrap().0, 200);
 }
 
 #[tokio::test]

@@ -473,10 +473,12 @@ pub async fn close(app: &App, by: &Who, bot: &str, reason: &str) -> bool {
 }
 
 /// `rotate` for every open machine screen, when someone loses access: a link doesn't
-/// know who opened it, so they all change.
+/// know who opened it, so they all change. Also every Bot whose first start may be
+/// under way: it isn't open until that ends, and `rotate` waits for it.
 pub async fn rotate_all(app: &App) {
     let Some(e) = enrollment(app) else { return };
-    let bots: Vec<String> = e.shown.open().keys().cloned().collect();
+    let mut bots: BTreeSet<String> = e.shown.open().keys().cloned().collect();
+    bots.extend(e.shown.busy.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned());
     for bot in bots {
         rotate(app, &bot).await;
     }
