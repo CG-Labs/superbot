@@ -586,14 +586,20 @@ $("scim-rows").addEventListener("click", async (e) => {
 // reads at startup come back as commands and .env lines to copy.
 
 const SETUP_STEPS = { domain: "Domain", signin: "Sign-in", tiers: "Plans", finish: "Finish" };
-const setup = { data: null, step: "domain", template: "", copies: [] };
+// `seq` numbers requests; only the newest one's reply is used, so a slow reply can't move
+// the page back to an older step.
+const setup = { data: null, step: "domain", template: "", copies: [], seq: 0 };
 
 async function loadSetup() {
+  const seq = ++setup.seq;
   try {
-    setup.data = await api("GET", "/api/setup");
-    setup.step = setup.data.progress.step;
+    const data = await api("GET", "/api/setup");
+    if (seq !== setup.seq) return;
+    setup.data = data;
+    setup.step = data.progress.step;
     $("setup-empty").hidden = true;
   } catch (err) {
+    if (seq !== setup.seq) return;
     setup.data = null;
     $("setup-empty").textContent = err.message;
     $("setup-empty").hidden = false;
@@ -602,19 +608,32 @@ async function loadSetup() {
 }
 
 async function saveSetup(body) {
+  const seq = ++setup.seq;
   try {
-    setup.data = await api("PATCH", "/api/setup", body);
-    setup.step = setup.data.progress.step;
+    const data = await api("PATCH", "/api/setup", body);
+    if (seq !== setup.seq) return;
+    setup.data = data;
+    setup.step = data.progress.step;
   } catch (err) {
     fail(err);
   }
-  renderSetup();
+  if (seq === setup.seq) renderSetup();
 }
 
-function goSetup(step) {
+// Shows the step at once and saves it in the background. The reply only refreshes the
+// header, so nothing typed into the new step is lost.
+async function goSetup(step) {
   setup.step = step;
   renderSetup();
-  saveSetup({ step });
+  const seq = ++setup.seq;
+  try {
+    const data = await api("PATCH", "/api/setup", { step });
+    if (seq !== setup.seq) return;
+    setup.data = data;
+    renderSetupHead();
+  } catch (err) {
+    fail(err);
+  }
 }
 
 // Open checklist items on the tab while admins are still sent here.
@@ -640,17 +659,20 @@ const providerRow = (p) => `<tr>
     <td>${esc(p.label)}<div class="sub">${esc(p.id)} · ${esc(p.type)}${p.jitRole ? ` · new people join as ${esc(ROLES[p.jitRole] || p.jitRole)}` : ""}</div></td>
     <td>${p.ready ? "Ready" : `<span class="warn-text">${esc(p.problem || "Not ready")}</span>`}</td>
     <td>${copyBlock(p.callbackUrl)}</td>
-    <td><form class="secret-inline" data-secret="${esc(p.secret)}" autocomplete="off">
-      <textarea rows="1" placeholder="${esc(p.secret)}" required spellcheck="false" autocomplete="off"></textarea>
-      <button type="submit" class="btn">${p.ready ? "Replace" : "Save"}</button>
-    </form></td>
+    <td>${p.secretSavable === false ? envSecret(p.secret) : secretForm(p)}</td>
   </tr>`;
+const secretForm = (p) => `<form class="secret-inline" data-secret="${esc(p.secret)}" autocomplete="off">
+    <textarea rows="1" placeholder="${esc(p.secret)}" required spellcheck="false" autocomplete="off"></textarea>
+    <button type="submit" class="btn">${p.ready ? "Replace" : "Save"}</button>
+  </form>`;
+// botd's environment wins over a saved value, so saving here would change nothing.
+const envSecret = (name) => `<span class="sub">Set by <code>${esc(name)}</code> (or <code>${esc(name)}_FILE</code>) in botd's environment. To change it, edit .env and restart botd.</span>`;
 
 function setupSignIn(s) {
   const providers = s.providers.length
     ? `<table class="grid"><thead><tr><th>Provider</th><th>State</th><th>Redirect URI to register at the IdP</th><th>Secret</th></tr></thead>
       <tbody>${s.providers.map(providerRow).join("")}</tbody></table>
-      <p class="hint">Secrets go to the server's secrets store and take effect at once, no restart. They're never shown again.</p>`
+      <p class="hint">Secrets saved here go to the server's secrets store and take effect at once, no restart. They're never shown again.</p>`
     : "";
   const admins = s.admins.length
     ? `<p>Admins besides the owner: ${s.admins.map((a) => esc(a.name || a.email || a.id)).join(", ")}.</p>`
@@ -710,18 +732,25 @@ function setupFinish(s) {
 
 function renderSetup() {
   const s = setup.data;
-  setupCount(s);
   setup.copies = [];
-  $("setup-steps").innerHTML = "";
   $("setup-body").innerHTML = "";
+  renderSetupHead();
+  if (!s) return;
+  const view = { domain: () => setupDomain(s.domain), signin: () => setupSignIn(s.signIn), tiers: () => setupTiers(s.tiers), finish: () => setupFinish(s) }[setup.step];
+  $("setup-body").innerHTML = view ? view() : "";
+}
+
+// Everything but the step's own content: the count, the step buttons, and the controls.
+function renderSetupHead() {
+  const s = setup.data;
+  setupCount(s);
+  $("setup-steps").innerHTML = "";
   for (const id of ["setup-hide", "setup-unhide", "setup-back", "setup-next"]) $(id).hidden = true;
   $("setup-state").textContent = "";
   if (!s) return;
   const done = (id) => (id === "finish" ? !!s.progress.completedAt : s.checklist.find((c) => c.id === id)?.done);
   $("setup-steps").innerHTML = s.steps.map((id, i) => `<button type="button" class="step ${id === setup.step ? "on" : ""}" data-step="${esc(id)}" ${id === setup.step ? 'aria-current="step"' : ""}>
       <span class="n">${done(id) ? "✓" : i + 1}</span>${esc(SETUP_STEPS[id] || id)}</button>`).join("");
-  const view = { domain: () => setupDomain(s.domain), signin: () => setupSignIn(s.signIn), tiers: () => setupTiers(s.tiers), finish: () => setupFinish(s) }[setup.step];
-  $("setup-body").innerHTML = view ? view() : "";
   const i = s.steps.indexOf(setup.step);
   $("setup-back").hidden = i <= 0;
   $("setup-next").hidden = i < 0 || i >= s.steps.length - 1;
@@ -777,8 +806,9 @@ $("setup-body").addEventListener("submit", async (e) => {
   e.preventDefault();
   const name = f.dataset.secret;
   try {
-    await api("PUT", `/api/secrets/${key(name)}`, { value: f.querySelector("textarea").value });
-    notice(`Saved ${name}.`, false);
+    const r = await api("PUT", `/api/secrets/${key(name)}`, { value: f.querySelector("textarea").value });
+    if (r.secret?.shadowedBy) notice(`Saved ${name}, but botd's environment sets it too, and that value still wins. Remove ${name} (and ${name}_FILE) from .env and restart botd.`);
+    else notice(`Saved ${name}.`, false);
   } catch (err) {
     fail(err);
   }
