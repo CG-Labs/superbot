@@ -11,6 +11,8 @@
 
 #[path = "../machines/agent.rs"]
 mod agent;
+#[path = "../machines/display.rs"]
+mod display;
 #[path = "../machines/job.rs"]
 mod job;
 #[path = "../machines/landing.rs"]

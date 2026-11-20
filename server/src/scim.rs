@@ -731,6 +731,7 @@ async fn changed(app: &AppState, a: &Auth, c: &Caller, before_user: &User, befor
             if let Some(screens) = &app.screens {
                 screens.rotate_all().await;
             }
+            crate::machines::screens::rotate_all(app).await;
         }
         None => {}
     }
@@ -912,6 +913,9 @@ pub async fn delete_user(State(app): State<AppState>, Extension(a): Extension<Ar
         && let Some(screens) = &app.screens
     {
         screens.rotate_all().await;
+    }
+    if before.user.active() {
+        crate::machines::screens::rotate_all(&app).await;
     }
     Ok(StatusCode::NO_CONTENT.into_response())
 }

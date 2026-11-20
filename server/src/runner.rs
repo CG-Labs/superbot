@@ -591,6 +591,12 @@ impl App {
         };
         let mut spot = self.spot(&bot, bot_dir.clone(), space, place);
         spot.for_other = for_other.clone();
+        if let Some(to) = spot.machine.clone()
+            && let Some(env) = crate::machines::screens::for_run(self, &bot, &to, &spot.state_dir).await
+        {
+            spot.env.extend(env);
+            spot.screens = true;
+        }
         self.init_bot_files(&bot);
         self.db.set_status(msg.id, "running");
         let started = Instant::now();
@@ -631,6 +637,7 @@ impl App {
 
             let mut env = spot.env.clone();
             if spot.screens
+                && spot.machine.is_none()
                 && let Some(screens) = &self.screens
                 && let Some(info) = screens.ensure(&bot.id, |id| self.is_running(id)).await
             {
@@ -840,7 +847,8 @@ impl App {
     }
 
     /// The run's folders and environment where it happens. On a machine: the machine's
-    /// folders, botctl there, and botd's API through the agent's relay; no screen yet.
+    /// folders, botctl there, and botd's API through the agent's relay; its screen
+    /// there, if any, comes after (ADR 0045).
     fn spot(&self, bot: &Bot, bot_dir: PathBuf, (cwd, mut env): (PathBuf, HashMap<String, String>), place: Place) -> Spot {
         let local = |p: Option<PathBuf>| p.unwrap_or_default();
         match place {
@@ -1292,7 +1300,11 @@ Current time: {now}."#,
             name = bot.name,
             // Full path: some harnesses run commands in a login shell that resets PATH.
             botctl = spot.botctl.display(),
-            screen = if spot.screens && self.screens.is_some() { screen_prompt(&spot.botctl.display().to_string()) } else { String::new() },
+            screen = match (spot.screens, spot.machine.is_some()) {
+                (true, true) => machine_screen_prompt(&spot.botctl.display().to_string()),
+                (true, false) if self.screens.is_some() => screen_prompt(&spot.botctl.display().to_string()),
+                _ => String::new(),
+            },
             own = if spot.machine.is_some() { format!(" It is {user}'s own computer: only their Bots run on it.") } else { String::new() },
             approvals = if self.db.effective_policy(&bot.id).mode == Mode::Ask {
                 "\n- Risky actions (destructive commands, deleting outside your folder, sending messages, installing software, git push) \
@@ -1391,6 +1403,19 @@ fn screen_prompt(botctl: &str) -> String {
 - Prefer APIs and command-line tools. Use the browser for sites that have no API.
 - Websites: `agent-browser`. Before your first use in a task, run `agent-browser skills get core` and follow it, with one exception: your session and browser profile are already set for you, so never pass `--session`, `--profile`, or `--headed`, and never create other sessions. Your sign-ins persist between tasks.
 - Desktop apps: `agent-desktop`. Before your first use, run `agent-desktop skills get desktop`.
+- When you need the user on your screen (a login, 2FA code, CAPTCHA, or payment check), run: {botctl} handoff "<what you need, in one line>". It waits until they finish, so give the command a 10 minute timeout. Never ask for passwords in chat.
+"#
+    )
+}
+
+/// The screen on the owner's computer (ADR 0045): a display and window manager, but
+/// none of this server's browser tools.
+fn machine_screen_prompt(botctl: &str) -> String {
+    format!(
+        r#"
+## Your screen
+- You have your own screen on this computer: DISPLAY is set, so windows you open show there. The user can watch it live and take over.
+- Prefer APIs and command-line tools. Use windowed apps only when nothing else works.
 - When you need the user on your screen (a login, 2FA code, CAPTCHA, or payment check), run: {botctl} handoff "<what you need, in one line>". It waits until they finish, so give the command a 10 minute timeout. Never ask for passwords in chat.
 "#
     )

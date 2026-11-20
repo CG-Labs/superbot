@@ -16,6 +16,12 @@ At most `MAX_SCREENS` run at once. When all are in use, the least recently used 
 
 Screens are work surfaces, not security boundaries. All Bots run as one Linux user.
 
+## On the owner's machine
+
+With per-user machines ([ADR 0036](adr/0036-bots-on-the-users-machine.md)), a Bot whose owner is routed to a machine runs there, so its screen is there too. Turn it on with `MACHINE_SCREENS=on` (it needs `MACHINE_BOT_USER=on`). The machine's agent runs Xvfb, Openbox, D-Bus and voxl as the Bots' user, `superbot-bots`, and botd shows it at the usual `/screen/<port>/` link by piping the viewer through the agent's mutual-TLS port. No port opens on the machine; its firewall is unchanged. botd's ports for these are `MACHINE_SCREEN_PORTS` (default 6960-6999), inside the proxy route below.
+
+Such a Bot is shown from its machine or not at all, never from this server. When the machine is down, outdated, still setting up its Bots' user, or missing a program, the screen request says why. New machines install the programs at first boot; others need `xvfb openbox dbus-daemon` and `voxl` (from [`install-computer.sh`](../deploy/install-computer.sh), or the `voxl` binary placed next to botd, which new machines download). Design: [ADR 0045](adr/0045-screens-on-machines.md).
+
 ## Install
 
 On Ubuntu 24.04 or later, as root:

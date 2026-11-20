@@ -114,6 +114,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine harness-logout <user|me> <harness>  Remove that login from it
   botctl machine folder <user>                     The copy of their folder to it: done, running, or failed
   botctl machine sync <user>                       Copy their folder to it again now; files changed there are kept
+  botctl machine screens <user>                    Bots' screens open on it (MACHINE_SCREENS), and what its agent reports
+  botctl machine screens <user> close <bot>        Close that Bot's screen there now
   botctl secrets                                   List secret names (never values)
   botctl secret set <NAME> < value-file            Save a secret, encrypted; Bots get it as $NAME
   botctl secret rm <NAME>                          Delete a saved secret
@@ -482,8 +484,10 @@ fn machine_request(args: &[&str]) -> Result<(&'static str, String), String> {
         ["bot-user", user] => ("POST", machine(user, "bot-user")),
         ["folder", user] => ("GET", machine(user, "folder-sync")),
         ["sync", user] => ("POST", machine(user, "folder-sync")),
+        ["screens", user] => ("GET", machine(user, "screens")),
+        ["screens", user, "close", bot] => ("DELETE", machine(user, &format!("screens/{}", encode(bot)))),
         _ => {
-            return Err("Usage: botctl machine placement [<user>] | assign <user> | unassign <user> | agent <user> | upgrade <user> [hold|release] | harnesses <user> | bot-user <user> | harness-login <user|me> <claude|codex> | harness-logins <user|me> | harness-logout <user|me> <harness> | folder <user> | sync <user>".into());
+            return Err("Usage: botctl machine placement [<user>] | assign <user> | unassign <user> | agent <user> | upgrade <user> [hold|release] | harnesses <user> | bot-user <user> | harness-login <user|me> <claude|codex> | harness-logins <user|me> | harness-logout <user|me> <harness> | folder <user> | sync <user> | screens <user> [close <bot>]".into());
         }
     })
 }
@@ -737,7 +741,8 @@ fn run(args: &[String]) -> Result<String, String> {
         ["machine", "harness-logout", user, harness] => op("DELETE", &format!("{}/harness-logins/{}", login_base(user), encode(harness)), None),
         ["machine", rest @ ..] => {
             let (method, path) = machine_request(rest)?;
-            op(method, &path, None)
+            let res = op(method, &path, None)?;
+            Ok(if matches!(rest, ["screens", _, "close", _]) { "Closed.".into() } else { res })
         }
         ["signups"] | ["signup", ..] => {
             let (method, path, body) = signup_request(a.get(1..).unwrap_or_default())?;
@@ -889,6 +894,9 @@ mod tests {
         assert!(machine_request(&["upgrade", "u1", "now"]).is_err());
         assert_eq!(machine_request(&["folder", "u1"]).unwrap(), ("GET", "/api/users/u1/machine/folder-sync".into()));
         assert_eq!(machine_request(&["sync", "u1"]).unwrap(), ("POST", "/api/users/u1/machine/folder-sync".into()));
+        assert_eq!(machine_request(&["screens", "a@example.com"]).unwrap(), ("GET", "/api/users/a%40example.com/machine/screens".into()));
+        assert_eq!(machine_request(&["screens", "u1", "close", "b 1"]).unwrap(), ("DELETE", "/api/users/u1/machine/screens/b%201".into()));
+        assert!(machine_request(&["screens", "u1", "close"]).is_err());
         assert_eq!(login_base("me"), "/api/machine");
         assert_eq!(login_base("a@example.com"), "/api/users/a%40example.com/machine");
     }

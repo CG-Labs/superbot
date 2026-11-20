@@ -76,7 +76,7 @@ fn spawn(cmd: &mut Command) -> std::io::Result<Child> {
 
 /// `WIDTHxHEIGHT` within sane bounds, else the default 1280x800. Only these
 /// numbers reach Xvfb's command line.
-fn parse_size(s: &str) -> (u32, u32) {
+pub(crate) fn parse_size(s: &str) -> (u32, u32) {
     s.trim()
         .split_once('x')
         .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
@@ -111,6 +111,11 @@ impl Screens {
             run_dir,
             live: Mutex::default(),
         })
+    }
+
+    /// The voxl ports these screens may use, first to last.
+    pub fn ports(&self) -> (u16, u16) {
+        (6800 + self.base + 1, 6800 + self.base + self.max)
     }
 
     fn bus_path(&self, n: u16) -> Option<PathBuf> {

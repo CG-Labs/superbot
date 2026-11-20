@@ -145,6 +145,16 @@ pub(crate) fn config(env: &Env, machine_id: &str, token: Option<&str>) -> Config
         // Tests can't make users: the Bots' user is whoever runs them.
         bot_user: crate::machines::runas::current_user().unwrap(),
         allow_own_user: true,
+        screens: crate::machines_mtls_tests::no_screens(),
+    }
+}
+
+/// Screen settings that find none of the screen's programs.
+pub(crate) fn no_screens() -> crate::machines::display::Settings {
+    crate::machines::display::Settings {
+        path: "/nonexistent".into(),
+        tmp: crate::db::temp_path("agent-tmp"),
+        ..Default::default()
     }
 }
 
@@ -1586,6 +1596,7 @@ fn agent_counts_programs_only_under_its_home_or_the_system() {
         exe: crate::db::temp_path("agent-exe"),
         bot_user: crate::machines::wire::BOT_USER.into(),
         allow_own_user: false,
+        screens: crate::machines_mtls_tests::no_screens(),
     };
     assert_eq!(cfg.layout().botctl, None, "outside the home and the system's directories");
 
