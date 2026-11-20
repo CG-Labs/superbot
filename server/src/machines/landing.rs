@@ -436,12 +436,12 @@ impl Landing {
         let blob = self.blob(&f.sha256, true);
         let mut from = open_nofollow(&blob).map_err(|_| fail(format!("The content of {} hasn't arrived.", f.path)))?;
         let parent = make_parents(&self.home, &f.path).map_err(|e| fail(e.to_string()))?;
-        let name = f.path.rsplit('/').next().unwrap_or_default();
         let (tmp, mut to) = (0..16)
             .find_map(|_| {
                 let mut r = [0u8; 8];
                 aws_lc_rs::rand::fill(&mut r).ok()?;
-                let tmp = parent.join(format!(".{name}.superbot-sync-{:016x}", u64::from_le_bytes(r)));
+                // Not named after the file: a name near the 255-byte limit leaves no room.
+                let tmp = parent.join(format!(".superbot-sync-{:016x}", u64::from_le_bytes(r)));
                 let opened = std::fs::OpenOptions::new()
                     .write(true)
                     .create_new(true)
@@ -714,8 +714,7 @@ mod tests {
         let l = Landing::new(home.clone(), &state).unwrap();
         copy(&l, "s1", &[("work/a.txt", b"v1")]);
         std::fs::write(outside.join("t"), b"theirs").unwrap();
-        std::os::unix::fs::symlink(outside.join("t"), home.join("work/.a.txt.superbot-sync")).unwrap();
-        std::os::unix::fs::symlink(outside.join("t"), home.join("work/.b.txt.superbot-sync")).unwrap();
+        std::os::unix::fs::symlink(outside.join("t"), home.join("work/.superbot-sync")).unwrap();
 
         let (a, b) = (file("work/a.txt", b"v2"), file("work/b.txt", b"new"));
         let plan = l.plan(manifest("s2", &[a.clone(), b.clone()])).unwrap();
@@ -733,9 +732,9 @@ mod tests {
         assert_eq!(std::fs::read(home.join("work/a.txt")).unwrap(), b"edited meanwhile");
         assert_eq!(std::fs::read(home.join("work/b.txt")).unwrap(), b"made meanwhile");
         assert_eq!(std::fs::read(outside.join("t")).unwrap(), b"theirs");
-        assert!(std::fs::symlink_metadata(home.join("work/.a.txt.superbot-sync")).unwrap().is_symlink(), "never removed");
+        assert!(std::fs::symlink_metadata(home.join("work/.superbot-sync")).unwrap().is_symlink(), "never removed");
         let left: Vec<_> = std::fs::read_dir(home.join("work")).unwrap().flatten().map(|e| e.file_name()).collect();
-        assert_eq!(left.len(), 4, "no temp files left behind: {left:?}");
+        assert_eq!(left.len(), 3, "no temp files left behind: {left:?}");
     }
 
     #[test]
@@ -764,12 +763,14 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_file_lands() {
+    fn an_empty_file_and_a_name_at_the_limit_land() {
         let (home, state) = (scratch("home"), scratch("state"));
         let l = Landing::new(home.clone(), &state).unwrap();
-        let r = copy(&l, "s1", &[("work/empty", b"")]);
-        assert_eq!(r.copied, 1);
+        let long = format!("work/{}", "n".repeat(255));
+        let r = copy(&l, "s1", &[("work/empty", b""), (&long, b"a name at the limit")]);
+        assert_eq!(r.copied, 2);
         assert_eq!(std::fs::read(home.join("work/empty")).unwrap(), b"");
+        assert_eq!(std::fs::read(home.join(&long)).unwrap(), b"a name at the limit");
     }
 
     #[test]
