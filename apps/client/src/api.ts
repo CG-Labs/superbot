@@ -4,6 +4,7 @@ import type {
   AppState,
   Approval,
   AuditPage,
+  BillingView,
   BotAccessView,
   BotView,
   LoginCode,
@@ -278,6 +279,31 @@ export class SuperBotApi {
   /** The onboarding wizard's progress and checklist: admins only (ADR 0034). The wizard is in the console. */
   async setupStatus(): Promise<SetupStatus> {
     return this.request<SetupStatus>("GET", "/api/setup");
+  }
+
+  // Your own plan, bought and managed on Stripe's pages (ADR 0042).
+
+  /**
+   * Your plan, what you can buy, and your billing account. null when this server doesn't
+   * sell plans: it answers 404, or, from before billing, 403 to anyone but admins.
+   */
+  async billing(): Promise<BillingView | null> {
+    try {
+      return await this.request<BillingView>("GET", "/api/billing");
+    } catch (e) {
+      if (e instanceof ApiError && [403, 404, 405].includes(e.status)) return null;
+      throw e;
+    }
+  }
+
+  /** A Stripe Checkout page for the plan; open `url` to pay. */
+  async checkout(tier: string): Promise<{ url: string }> {
+    return this.request<{ url: string }>("POST", "/api/billing/checkout", { tier });
+  }
+
+  /** Your Stripe billing portal: change or cancel the plan, cards, invoices. */
+  async billingPortal(): Promise<{ url: string }> {
+    return this.request<{ url: string }>("POST", "/api/billing/portal");
   }
 
   // Requests for access from the landing page: admins only (ADR 0022).

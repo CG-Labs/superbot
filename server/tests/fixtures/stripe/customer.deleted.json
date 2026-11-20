@@ -1,0 +1,20 @@
+{
+  "id": "evt_test_customer_deleted",
+  "object": "event",
+  "api_version": "2025-09-30.clover",
+  "created": 1795600000,
+  "livemode": false,
+  "pending_webhooks": 1,
+  "request": { "id": null, "idempotency_key": null },
+  "type": "customer.deleted",
+  "data": {
+    "object": {
+      "id": "cus_test_ada",
+      "object": "customer",
+      "created": 1794989950,
+      "email": "ada@example.com",
+      "livemode": false,
+      "metadata": {}
+    }
+  }
+}

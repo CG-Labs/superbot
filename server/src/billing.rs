@@ -1,14 +1,19 @@
-//! Billing v0 (ADR 0040): Stripe subscriptions set each user's tier. Off unless
-//! `STRIPE_WEBHOOK_SECRET` is set, and then the only way in is Stripe's signed webhook at
-//! `/billing/stripe/webhook`. botd never calls Stripe: no keys to Stripe's API, no
-//! products, prices, or checkout here. The tiers file maps Stripe price ids to tiers
-//! (`stripePrices`); a subscription event names its user in its metadata
-//! (`superbot_user_id`), set by whatever starts the checkout.
+//! Billing v0: Stripe subscriptions set each user's tier (ADR 0040), and people buy and
+//! manage them through Stripe's own pages (ADR 0042). Off unless `STRIPE_WEBHOOK_SECRET`
+//! is set; then Stripe's signed webhook at `/billing/stripe/webhook` is the only way a
+//! tier changes. With `STRIPE_SECRET_KEY` too, botd also asks Stripe for a Checkout
+//! Session (`POST /api/billing/checkout`) and a Billing Portal session
+//! (`POST /api/billing/portal`) and hands back their links; it creates nothing else at
+//! Stripe. The tiers file maps Stripe price ids to tiers (`stripePrices`); a subscription
+//! names its user in its metadata (`superbot_user_id`, set by the checkout), or through
+//! its customer, linked to the user when their checkout completes.
 
 use crate::audit::{Actor, Outcome, Who};
-use crate::db::{Applied, Subscription};
+use crate::db::{Applied, Linked, Subscription};
 use crate::runner::App;
 use crate::secrets::SecretStore;
+use crate::stripe::{self, Stripe};
+use crate::users::Caller;
 use crate::{AppState, Auth};
 use aws_lc_rs::hmac;
 use axum::body::Bytes;
@@ -26,6 +31,14 @@ pub const TOLERANCE_SECS: i64 = 300;
 pub const MAX_BODY: usize = 512 * 1024;
 /// The subscription metadata key naming the SuperBot user it pays for.
 pub const USER_KEY: &str = "superbot_user_id";
+/// Where the web client shows the plan; Stripe sends people back here.
+pub const RETURN_PATH: &str = "/app/plan";
+/// Checkout and portal sessions one person may start a minute.
+const STARTS_PER_MINUTE: u32 = 10;
+const OFF: &str = "Billing isn't set up on this server.";
+/// How long a checkout page stays payable, in minutes past the current one. Stripe's
+/// shortest is 30 minutes from creation; whole minutes keep a retried request identical.
+const CHECKOUT_MINUTES: i64 = 31;
 
 /// Statuses that pay for the subscription's tier. `past_due` keeps it while Stripe
 /// retries the card; Stripe moves it to `canceled` or `unpaid` when it gives up.
@@ -42,38 +55,114 @@ pub struct Billing {
     secret: Option<String>,
     /// Refused deliveries recorded in the audit log, so junk can't flood it.
     refusals: crate::users::Limiter,
+    /// Checkout and the customer portal (ADR 0042). None without `STRIPE_SECRET_KEY`.
+    checkout: Option<Checkout>,
+}
+
+/// What botd needs to send people to Stripe's pages and back.
+pub struct Checkout {
+    stripe: Stripe,
+    /// The https address people open SuperBot at, with no trailing slash.
+    public_url: String,
+    starts: crate::users::Limiter,
+    /// One checkout at a time per person, so two can't both be opened and paid.
+    busy: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Billing {
-    /// `STRIPE_WEBHOOK_SECRET` (or `_FILE`).
-    pub fn from_env(store: &dyn SecretStore) -> Result<Billing, String> {
-        let Some(s) = store.get("STRIPE_WEBHOOK_SECRET").map_err(|e| e.to_string())? else { return Ok(Billing::default()) };
+    /// `STRIPE_WEBHOOK_SECRET` and `STRIPE_SECRET_KEY` (or their `_FILE`s), and for
+    /// checkout, the public address from `var` (see `public_url`).
+    pub fn from_env(store: &dyn SecretStore, var: &dyn Fn(&str) -> String) -> Result<Billing, String> {
+        let key = store.get("STRIPE_SECRET_KEY").map_err(|e| e.to_string())?.map(|k| k.expose().trim().to_string()).filter(|k| !k.is_empty());
+        let Some(s) = store.get("STRIPE_WEBHOOK_SECRET").map_err(|e| e.to_string())? else {
+            return match key {
+                Some(_) => Err("STRIPE_SECRET_KEY needs STRIPE_WEBHOOK_SECRET too: without the webhook, a checkout would never change anyone's plan".into()),
+                None => Ok(Billing::default()),
+            };
+        };
         let s = s.expose().trim().to_string();
         if !s.starts_with("whsec_") || s.len() < 10 {
             return Err("STRIPE_WEBHOOK_SECRET must be the endpoint's signing secret from Stripe (whsec_...)".into());
         }
         crate::secrets::redact::register(&s);
-        Ok(Billing::with_secret(&s))
+        let mut b = Billing::with_secret(&s);
+        if let Some(key) = key {
+            if !["sk_test_", "sk_live_", "rk_test_", "rk_live_"].iter().any(|p| key.starts_with(p)) || key.len() < 16 {
+                return Err("STRIPE_SECRET_KEY must be a Stripe secret or restricted key (sk_... or rk_...), not the publishable key".into());
+            }
+            crate::secrets::redact::register(&key);
+            let public = public_url(var)?;
+            b.checkout = Some(Checkout::new(&key, stripe::API, &public));
+        }
+        Ok(b)
     }
 
     pub fn with_secret(secret: &str) -> Billing {
-        Billing { secret: Some(secret.into()), refusals: crate::users::Limiter::new(20, 60_000) }
+        Billing { secret: Some(secret.into()), refusals: crate::users::Limiter::new(20, 60_000), checkout: None }
+    }
+
+    /// `with_secret`, with checkout through the Stripe API at `api` (a fake, in tests).
+    #[cfg(test)]
+    pub fn with_checkout(secret: &str, key: &str, api: &str, public_url: &str) -> Billing {
+        Billing { checkout: Some(Checkout::new(key, api, public_url)), ..Billing::with_secret(secret) }
     }
 
     pub fn enabled(&self) -> bool {
         self.secret.is_some()
     }
+
+    pub fn checkout_enabled(&self) -> bool {
+        self.checkout.is_some()
+    }
 }
 
-/// What startup prints. Takes only whether billing is on, so nothing secret can reach the log.
-pub fn describe(enabled: bool, tiers: &crate::tiers::Tiers) -> String {
+impl Checkout {
+    fn new(key: &str, api: &str, public_url: &str) -> Checkout {
+        Checkout {
+            stripe: Stripe::new(key, api),
+            public_url: public_url.trim_end_matches('/').into(),
+            starts: crate::users::Limiter::new(STARTS_PER_MINUTE, 60_000),
+            busy: Default::default(),
+        }
+    }
+
+    fn lock(&self, user: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.busy.lock().unwrap_or_else(|e| e.into_inner()).entry(user.to_string()).or_default().clone()
+    }
+}
+
+/// The address Stripe sends people back to: `PUBLIC_URL`, else `SSO_PUBLIC_URL`, else
+/// https and the first name in `ALLOWED_HOSTS` (the installer sets it to the domain).
+/// https with no path; http only on loopback.
+pub fn public_url(var: &dyn Fn(&str) -> String) -> Result<String, String> {
+    let pick = |k: &str| Some(var(k).trim().trim_end_matches('/').to_string()).filter(|v| !v.is_empty());
+    let host = var("ALLOWED_HOSTS").split(',').map(str::trim).find(|h| !h.is_empty()).map(|h| format!("https://{h}"));
+    let Some(url) = pick("PUBLIC_URL").or_else(|| pick("SSO_PUBLIC_URL")).or(host) else {
+        return Err("STRIPE_SECRET_KEY needs the address people open SuperBot at, for Stripe to send them back to: set PUBLIC_URL (like https://superbot.example.com) or ALLOWED_HOSTS".into());
+    };
+    let ok = url::Url::parse(&url).ok().is_some_and(|u| {
+        let loopback = matches!(u.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
+        (u.scheme() == "https" || (u.scheme() == "http" && loopback)) && u.host_str().is_some() && u.path() == "/" && u.query().is_none() && u.fragment().is_none() && u.username().is_empty()
+    });
+    if !ok {
+        return Err(format!("PUBLIC_URL must be an https address with no path, like https://superbot.example.com (http only on loopback), not {url}"));
+    }
+    Ok(url)
+}
+
+/// What startup prints. Takes only whether each part is on, so nothing secret can reach the log.
+pub fn describe(enabled: bool, checkout: bool, tiers: &crate::tiers::Tiers) -> String {
     if !enabled {
         return "off (set STRIPE_WEBHOOK_SECRET to take Stripe subscriptions)".into();
     }
     let priced: Vec<String> = tiers.all().iter().filter(|t| !t.stripe_prices.is_empty()).map(|t| format!("{} ({})", t.name, t.stripe_prices.len())).collect();
+    let pages = match checkout {
+        true => "; checkout and the customer portal on",
+        false => "; checkout off (set STRIPE_SECRET_KEY to sell plans in the app)",
+    };
     match priced.is_empty() {
-        true => format!("Stripe webhook at {PATH}, but no tier lists stripePrices, so no subscription sets a tier"),
-        false => format!("Stripe webhook at {PATH}; prices for {}", priced.join(", ")),
+        true => format!("Stripe webhook at {PATH}, but no tier lists stripePrices, so no subscription sets a tier{pages}"),
+        false => format!("Stripe webhook at {PATH}; prices for {}{pages}", priced.join(", ")),
     }
 }
 
@@ -134,7 +223,7 @@ fn system(on_behalf_of: Option<&str>) -> Who {
 /// delivery that isn't Stripe's (bad, missing, or stale signature, or not an event),
 /// else 200, also for events it doesn't use, so Stripe doesn't retry them.
 pub async fn webhook(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, headers: HeaderMap, body: Bytes) -> Response {
-    let b = &a.billing;
+    let b = &a.payments;
     let Some(secret) = &b.secret else {
         return reply(StatusCode::NOT_FOUND, json!({ "error": "Billing is off on this server." }));
     };
@@ -152,10 +241,13 @@ pub async fn webhook(State(app): State<AppState>, Extension(a): Extension<Arc<Au
         refused(&app, b, "not_an_event");
         return reply(StatusCode::BAD_REQUEST, json!({ "error": "Not a Stripe event." }));
     };
-    if !kind.starts_with("customer.subscription.") {
-        return reply(StatusCode::OK, json!({ "received": true, "outcome": "ignored" }));
-    }
-    match subscription_event(&app, id, kind, &event) {
+    let handled = match kind {
+        k if k.starts_with("customer.subscription.") => subscription_event(&app, id, kind, &event),
+        "checkout.session.completed" => checkout_completed(&app, id, kind, &event),
+        "customer.deleted" => customer_deleted(&app, id, kind, &event),
+        _ => return reply(StatusCode::OK, json!({ "received": true, "outcome": "ignored" })),
+    };
+    match handled {
         Ok(outcome) => reply(StatusCode::OK, json!({ "received": true, "outcome": outcome })),
         // Stripe retries a 500, which is right for a database hiccup.
         Err(e) => {
@@ -188,7 +280,7 @@ fn read_sub(o: &Value) -> Option<Sub<'_>> {
     let items = o["items"]["data"].as_array().map(Vec::as_slice).unwrap_or_default();
     Some(Sub {
         id: o["id"].as_str().filter(|s| !s.is_empty())?,
-        customer: o["customer"].as_str().or_else(|| o["customer"]["id"].as_str()),
+        customer: customer_of(o),
         status: o["status"].as_str()?,
         user: o["metadata"][USER_KEY].as_str().map(str::trim).filter(|s| !s.is_empty()),
         prices: items.iter().filter_map(|i| i["price"]["id"].as_str()).collect(),
@@ -199,26 +291,45 @@ fn read_sub(o: &Value) -> Option<Sub<'_>> {
 
 /// Applies a `customer.subscription.*` event: the tier its price pays for while it
 /// pays, the default tier once it ends. Returns what happened, for the reply.
+/// Audits an event botd can't place (`billing.event_ignored`), and says so for the reply.
+fn ignored(app: &App, event_id: &str, kind: &str, reason: &str, user: Option<&str>, extra: Value) -> Result<&'static str, String> {
+    let mut d = json!({ "reason": reason, "eventId": event_id, "type": kind });
+    if let (Some(d), Value::Object(x)) = (d.as_object_mut(), extra) {
+        d.extend(x);
+    }
+    let e = system(user).event("billing.event_ignored").outcome(Outcome::Failure).details(d);
+    app.db.record(&match user {
+        Some(u) => e.target("user", u),
+        None => e,
+    });
+    Ok("ignored")
+}
+
+/// Audits a new link between a user and their Stripe customer.
+fn record_linked(app: &App, user: &str, customer: &str, via: &str, event_id: &str) {
+    let d = json!({ "customer": customer, "via": via, "eventId": event_id });
+    app.db.record(&system(Some(user)).event("billing.customer_linked").target("user", user).details(d));
+}
+
+fn customer_of(o: &Value) -> Option<&str> {
+    o["customer"].as_str().or_else(|| o["customer"]["id"].as_str()).filter(|c| !c.is_empty())
+}
+
 fn subscription_event(app: &App, event_id: &str, kind: &str, event: &Value) -> Result<&'static str, String> {
-    let ignore = |reason: &str, user: Option<&str>, extra: Value| {
-        let mut d = json!({ "reason": reason, "eventId": event_id, "type": kind });
-        if let (Some(d), Value::Object(x)) = (d.as_object_mut(), extra) {
-            d.extend(x);
-        }
-        let e = system(user).event("billing.event_ignored").outcome(Outcome::Failure).details(d);
-        app.db.record(&match user {
-            Some(u) => e.target("user", u),
-            None => e,
-        });
-        Ok("ignored")
-    };
+    let ignore = |reason: &str, user: Option<&str>, extra: Value| ignored(app, event_id, kind, reason, user, extra);
     let Some(sub) = read_sub(&event["data"]["object"]) else {
         return ignore("not_a_subscription", None, json!({}));
     };
     // The metadata names the user; later events for the same subscription may not carry
-    // it, so the subscription we already know names them too.
+    // it, so the subscription we already know names them too, and so does a customer
+    // linked to them (ADR 0042), for subscriptions started outside SuperBot's checkout.
     let known = app.db.subscription_by_id(sub.id);
-    let user = match sub.user.map(String::from).or_else(|| known.as_ref().map(|s| s.user_id.clone())) {
+    let user = sub
+        .user
+        .map(String::from)
+        .or_else(|| known.as_ref().map(|s| s.user_id.clone()))
+        .or_else(|| sub.customer.and_then(|c| app.db.customer_user(c)));
+    let user = match user {
         Some(u) if app.db.user(&u).is_some() => u,
         other => return ignore("unknown_user", None, json!({ "subscription": sub.id, "user": other })),
     };
@@ -250,7 +361,10 @@ fn subscription_event(app: &App, event_id: &str, kind: &str, event: &Value) -> R
         event_created: created,
         updated_at: 0,
     };
-    let applied = app.db.apply_subscription(event_id, kind, &row, set_tier)?;
+    let (applied, linked) = app.db.apply_subscription(event_id, kind, &row, set_tier)?;
+    if let (Some(Linked::New), Some(cus)) = (&linked, sub.customer) {
+        record_linked(app, &user, cus, "subscription", event_id);
+    }
     let details = json!({ "eventId": event_id, "type": kind, "subscription": sub.id, "status": row.status, "price": row.price_id, "tier": tier });
     let by = system(Some(&user));
     let outcome = match applied {
@@ -258,6 +372,7 @@ fn subscription_event(app: &App, event_id: &str, kind: &str, event: &Value) -> R
         Applied::Stale => "stale",
         Applied::Superseded => "superseded",
         Applied::OtherUser => return ignore("subscription_of_another_user", Some(&user), json!({ "subscription": sub.id })),
+        Applied::CustomerOfAnotherUser => return ignore("customer_of_another_user", Some(&user), json!({ "subscription": sub.id, "customer": sub.customer })),
         Applied::Unchanged => "unchanged",
         Applied::Changed { from, to } => {
             let effective = |t: &Option<String>| tiers.of(t.as_deref()).name.clone();
@@ -273,6 +388,291 @@ fn subscription_event(app: &App, event_id: &str, kind: &str, event: &Value) -> R
     d["outcome"] = json!(outcome);
     app.db.record(&by.event("billing.subscription_synced").target("user", &user).details(d));
     Ok(outcome)
+}
+
+/// `checkout.session.completed`: links the session's customer to the user it names
+/// (`metadata.superbot_user_id`, else `client_reference_id`, both set by `checkout`).
+/// The tier is set by the subscription's own events, which come separately.
+fn checkout_completed(app: &App, event_id: &str, kind: &str, event: &Value) -> Result<&'static str, String> {
+    let ignore = |reason: &str, user: Option<&str>, extra: Value| ignored(app, event_id, kind, reason, user, extra);
+    let o = &event["data"]["object"];
+    let field = |v: &Value| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+    let session = o["id"].as_str().unwrap_or_default();
+    let (meta, reference) = (field(&o["metadata"][USER_KEY]), field(&o["client_reference_id"]));
+    if let (Some(m), Some(r)) = (&meta, &reference)
+        && m != r
+    {
+        return ignore("user_mismatch", None, json!({ "session": session, "user": m, "clientReferenceId": r }));
+    }
+    let user = match meta.or(reference) {
+        Some(u) if app.db.user(&u).is_some() => u,
+        other => return ignore("unknown_user", None, json!({ "session": session, "user": other })),
+    };
+    app.db.close_checkout(&user, session);
+    let Some(cus) = customer_of(o) else {
+        return ignore("no_customer", Some(&user), json!({ "session": session }));
+    };
+    let outcome = match app.db.link_customer(event_id, kind, &user, "stripe", cus, "checkout")? {
+        None => "duplicate",
+        Some(Linked::New) => {
+            record_linked(app, &user, cus, "checkout", event_id);
+            "customer_linked"
+        }
+        Some(Linked::Already) => "unchanged",
+        Some(Linked::UserHasAnother(other)) => return ignore("user_has_another_customer", Some(&user), json!({ "session": session, "customer": cus, "linked": other })),
+        Some(Linked::OfAnotherUser(_)) => return ignore("customer_of_another_user", Some(&user), json!({ "session": session, "customer": cus })),
+        Some(Linked::Deleted) => return ignore("customer_deleted", Some(&user), json!({ "session": session, "customer": cus })),
+    };
+    Ok(outcome)
+}
+
+/// `customer.deleted`: the user it was linked to has no customer any more, so their
+/// next checkout makes a new one. Stripe cancels the customer's subscriptions itself,
+/// and sends their own events.
+fn customer_deleted(app: &App, event_id: &str, kind: &str, event: &Value) -> Result<&'static str, String> {
+    let Some(cus) = event["data"]["object"]["id"].as_str().filter(|c| !c.is_empty()) else {
+        return ignored(app, event_id, kind, "not_a_customer", None, json!({}));
+    };
+    Ok(match app.db.unlink_customer(event_id, kind, cus)? {
+        None => "duplicate",
+        Some(None) => "unchanged",
+        Some(Some(user)) => {
+            let d = json!({ "customer": cus, "eventId": event_id });
+            app.db.record(&system(Some(&user)).event("billing.customer_unlinked").target("user", &user).details(d));
+            "customer_unlinked"
+        }
+    })
+}
+
+// Checkout and the customer portal (ADR 0042)
+
+fn off() -> Response {
+    reply(StatusCode::NOT_FOUND, json!({ "error": OFF }))
+}
+
+/// The person asking, never a Bot. Break-glass and loopback dev act as the owner account.
+#[allow(clippy::result_large_err)]
+fn person(app: &App, c: &Caller) -> Result<crate::db::User, Response> {
+    crate::need_user(c.principal).map_err(IntoResponse::into_response)?;
+    let id = c.user.as_ref().map_or(crate::users::OPERATOR, |u| u.id.as_str());
+    app.db.user(id).ok_or_else(|| reply(StatusCode::NOT_FOUND, json!({ "error": "user not found" })))
+}
+
+/// Whether the user's paying subscription sets their tier now.
+fn paying(app: &App, user: &str) -> Option<Subscription> {
+    app.db.subscription(user).filter(|s| s.tier.is_some())
+}
+
+/// `GET /api/billing`: your plan and use, the plans you can buy (no price ids), your
+/// subscription, and whether you have a billing account to manage. 404 while checkout
+/// is off, which is how the client knows to hide its plan screen.
+pub async fn info(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>) -> Response {
+    if a.payments.checkout.is_none() {
+        return off();
+    }
+    let u = match person(&app, &c) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let current = app.tier_of(&u.id).name.clone();
+    let plans: Vec<Value> = app
+        .tiers()
+        .all()
+        .iter()
+        .filter(|t| !t.stripe_prices.is_empty())
+        .map(|t| {
+            let mut v = t.view();
+            v["current"] = json!(t.name == current);
+            v
+        })
+        .collect();
+    let sub = paying(&app, &u.id);
+    reply(
+        StatusCode::OK,
+        json!({
+            "plan": crate::tier_usage(&app, &u.id),
+            "plans": plans,
+            "subscription": sub.map(|s| json!({ "status": s.status, "tier": s.tier, "periodEnd": s.period_end })),
+            "portal": app.db.customer_of(&u.id).is_some(),
+            "canChange": crate::rbac::allows(c.principal, crate::rbac::Perm::Write),
+        }),
+    )
+}
+
+/// Counts a start for `user`; false once they've started too many this minute.
+fn may_start(co: &Checkout, user: &str) -> bool {
+    co.starts.hit(user, crate::db::now()).is_none()
+}
+
+/// What became of the person's last checkout page.
+enum Last {
+    /// None open, or expired now: a new one may open.
+    Closed,
+    /// Paid: its subscription is on the way.
+    Paid,
+    Unknown(stripe::Error),
+}
+
+/// Expires the person's open checkout page, if any, so it can't be paid as well as the
+/// next. Stripe refuses to expire a page that isn't open; then its status says why.
+async fn close_last(app: &App, co: &Checkout, user: &str) -> Last {
+    let Some(id) = app.db.open_checkout(user) else { return Last::Closed };
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        app.db.close_checkout(user, &id);
+        return Last::Closed;
+    }
+    let key = stripe::idempotency_key("expire", user, &[("session".into(), id.clone())], crate::db::now());
+    let status = match co.stripe.post(&format!("/v1/checkout/sessions/{id}/expire"), &[], &key).await {
+        Ok(v) => v["status"].as_str().map(String::from),
+        Err(stripe::Error::Refused { status, .. }) if status < 500 => match co.stripe.get(&format!("/v1/checkout/sessions/{id}")).await {
+            Ok(v) => v["status"].as_str().map(String::from),
+            Err(stripe::Error::Refused { status: 404, .. }) => Some("expired".into()),
+            Err(e) => return Last::Unknown(e),
+        },
+        Err(e) => return Last::Unknown(e),
+    };
+    match status.as_deref() {
+        Some("expired") => {
+            app.db.close_checkout(user, &id);
+            Last::Closed
+        }
+        Some("complete") => Last::Paid,
+        _ => Last::Unknown(stripe::Error::Unreachable),
+    }
+}
+
+/// Stripe's answer: the session's id and link, or a 502 that says only that Stripe
+/// didn't make one. The server log gets the status and Stripe's error type and code.
+#[allow(clippy::result_large_err)]
+fn session(what: &str, user: &str, res: Result<Value, stripe::Error>) -> Result<(String, String), (Response, String)> {
+    let got = res.and_then(|v| match (v["id"].as_str(), v["url"].as_str()) {
+        (Some(id), Some(url)) if url.starts_with("https://") => Ok((id.to_string(), url.to_string())),
+        _ => Err(stripe::Error::Unreachable),
+    });
+    got.map_err(|e| {
+        eprintln!("billing: Stripe {what} session for {user}: {e}");
+        let msg = format!("Stripe couldn't open the {what} just now. Try again in a minute; if it keeps happening, an admin can see why in the server log.");
+        (reply(StatusCode::BAD_GATEWAY, json!({ "error": msg })), e.to_string())
+    })
+}
+
+/// `POST /api/billing/checkout {tier}`: a Stripe Checkout Session for the tier's first
+/// price, for the person asking; returns `{url}`, Stripe's page to pay on. Their
+/// subscription carries their user id, and their customer if they have one. Refused
+/// for tiers without a price, and while a subscription already pays for a plan (that
+/// one is changed in the portal, or they'd pay twice).
+pub async fn checkout(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, body: Bytes) -> Response {
+    let Some(co) = &a.payments.checkout else { return off() };
+    let u = match person(&app, &c) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let bad = |code: StatusCode, msg: String| reply(code, json!({ "error": msg }));
+    let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let Some(name) = v["tier"].as_str().map(str::trim).filter(|t| !t.is_empty()) else {
+        return bad(StatusCode::BAD_REQUEST, "Say which plan: {\"tier\": \"<name>\"}.".into());
+    };
+    let tiers = app.tiers();
+    let Some(tier) = tiers.get(name) else {
+        return bad(StatusCode::BAD_REQUEST, format!("There's no plan called \"{name}\"."));
+    };
+    let Some(price) = tier.stripe_prices.first() else {
+        return bad(StatusCode::BAD_REQUEST, format!("The {} plan can't be bought here.", tier.label));
+    };
+    let event = |outcome: Outcome, d: Value| by.event("billing.checkout_created").target("user", &u.id).outcome(outcome).details(d);
+    if let Some(s) = paying(&app, &u.id) {
+        app.db.record(&event(Outcome::Denied, json!({ "tier": tier.name, "reason": "already_subscribed", "subscription": s.subscription_id })));
+        return reply(StatusCode::CONFLICT, json!({ "error": "You already pay for a plan. Change it under Manage billing.", "portal": true }));
+    }
+    if !may_start(co, &u.id) {
+        return bad(StatusCode::TOO_MANY_REQUESTS, "Too many checkouts at once. Try again in a minute.".into());
+    }
+    let lock = co.lock(&u.id);
+    let _one_at_a_time = lock.lock().await;
+    let last = app.db.open_checkout(&u.id);
+    match close_last(&app, co, &u.id).await {
+        Last::Closed => {}
+        Last::Paid => {
+            app.db.record(&event(Outcome::Denied, json!({ "tier": tier.name, "reason": "checkout_completed", "session": last })));
+            return reply(StatusCode::CONFLICT, json!({ "error": "Your last checkout went through. Your plan changes as soon as Stripe confirms the payment." }));
+        }
+        Last::Unknown(e) => {
+            eprintln!("billing: closing {}'s last Stripe checkout: {e}", u.id);
+            app.db.record(&event(Outcome::Failure, json!({ "tier": tier.name, "reason": format!("last checkout: {e}"), "session": last })));
+            return bad(StatusCode::BAD_GATEWAY, "Stripe couldn't open the checkout just now. Try again in a minute; if it keeps happening, an admin can see why in the server log.".into());
+        }
+    }
+    let customer = app.db.customer_of(&u.id);
+    let back = format!("{}{RETURN_PATH}", co.public_url);
+    let mut form: Vec<(String, String)> = [
+        ("mode", "subscription"),
+        ("line_items[0][price]", price.as_str()),
+        ("line_items[0][quantity]", "1"),
+        ("client_reference_id", u.id.as_str()),
+        ("metadata[superbot_user_id]", u.id.as_str()),
+        ("metadata[superbot_tier]", tier.name.as_str()),
+        ("subscription_data[metadata][superbot_user_id]", u.id.as_str()),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    form.push(("success_url".into(), format!("{back}?checkout=success")));
+    form.push(("cancel_url".into(), format!("{back}?checkout=cancelled")));
+    match (&customer, &u.email) {
+        (Some(cus), _) => form.push(("customer".into(), cus.clone())),
+        (None, Some(email)) => form.push(("customer_email".into(), email.clone())),
+        (None, None) => {}
+    }
+    let now = crate::db::now();
+    let expires_at = (now / 60_000 + CHECKOUT_MINUTES) * 60;
+    form.push(("expires_at".into(), expires_at.to_string()));
+    // Each checkout is a new page (the last one was just closed), so only this request's
+    // own retry may share its key: a key reused later would bring back a closed page.
+    let mut keyed = form.clone();
+    keyed.push(("request".into(), crate::random_hex(16)));
+    let key = stripe::idempotency_key("checkout", &u.id, &keyed, now);
+    match session("checkout", &u.id, co.stripe.post("/v1/checkout/sessions", &form, &key).await) {
+        Ok((id, url)) => {
+            app.db.set_open_checkout(&u.id, &id, expires_at);
+            app.db.record(&event(Outcome::Success, json!({ "tier": tier.name, "price": price, "session": id, "customer": customer })));
+            reply(StatusCode::OK, json!({ "url": url }))
+        }
+        Err((r, reason)) => {
+            app.db.record(&event(Outcome::Failure, json!({ "tier": tier.name, "price": price, "reason": reason })));
+            r
+        }
+    }
+}
+
+/// `POST /api/billing/portal`: a Stripe Billing Portal session for the person's own
+/// customer, where they change or cancel their plan and see invoices; returns `{url}`.
+/// 409 until a checkout has linked them to a customer.
+pub async fn portal(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>) -> Response {
+    let Some(co) = &a.payments.checkout else { return off() };
+    let u = match person(&app, &c) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let Some(cus) = app.db.customer_of(&u.id) else {
+        return reply(StatusCode::CONFLICT, json!({ "error": "There's no billing account to manage yet. Pick a plan first." }));
+    };
+    if !may_start(co, &u.id) {
+        return reply(StatusCode::TOO_MANY_REQUESTS, json!({ "error": "Too many requests at once. Try again in a minute." }));
+    }
+    let form = vec![("customer".to_string(), cus.clone()), ("return_url".to_string(), format!("{}{RETURN_PATH}", co.public_url))];
+    let key = stripe::idempotency_key("portal", &u.id, &form, crate::db::now());
+    let event = |outcome: Outcome, d: Value| by.event("billing.portal_created").target("user", &u.id).outcome(outcome).details(d);
+    match session("billing portal", &u.id, co.stripe.post("/v1/billing_portal/sessions", &form, &key).await) {
+        // The link signs whoever has it in to the customer's billing: never logged.
+        Ok((id, url)) => {
+            app.db.record(&event(Outcome::Success, json!({ "customer": cus, "session": id })));
+            reply(StatusCode::OK, json!({ "url": url }))
+        }
+        Err((r, reason)) => {
+            app.db.record(&event(Outcome::Failure, json!({ "customer": cus, "reason": reason })));
+            r
+        }
+    }
 }
 
 #[cfg(test)]
@@ -312,9 +712,50 @@ mod tests {
     #[test]
     fn the_secret_is_checked_at_startup() {
         use crate::secrets::env::EnvStore;
-        assert!(!Billing::from_env(&EnvStore::fixed(&[])).unwrap().enabled());
-        assert!(Billing::from_env(&EnvStore::fixed(&[("STRIPE_WEBHOOK_SECRET", SECRET)])).unwrap().enabled());
-        let e = Billing::from_env(&EnvStore::fixed(&[("STRIPE_WEBHOOK_SECRET", "sk_live_nope")])).err().unwrap();
+        let none = |_: &str| String::new();
+        assert!(!Billing::from_env(&EnvStore::fixed(&[]), &none).unwrap().enabled());
+        assert!(Billing::from_env(&EnvStore::fixed(&[("STRIPE_WEBHOOK_SECRET", SECRET)]), &none).unwrap().enabled());
+        let e = Billing::from_env(&EnvStore::fixed(&[("STRIPE_WEBHOOK_SECRET", "sk_live_nope")]), &none).err().unwrap();
         assert!(e.contains("whsec_"), "{e}");
+    }
+
+    #[test]
+    fn checkout_needs_the_key_the_webhook_and_a_public_address() {
+        use crate::secrets::env::EnvStore;
+        const KEY: &str = "sk_test_not_a_real_key_000";
+        let public = |k: &str| if k == "PUBLIC_URL" { "https://bots.example.com/".to_string() } else { String::new() };
+        let load = |vars: &[(&str, &str)], var: &dyn Fn(&str) -> String| Billing::from_env(&EnvStore::fixed(vars), var);
+        // The webhook alone, as in ADR 0040: no checkout.
+        let b = load(&[("STRIPE_WEBHOOK_SECRET", SECRET)], &public).unwrap();
+        assert!(b.enabled() && !b.checkout_enabled());
+        let b = load(&[("STRIPE_WEBHOOK_SECRET", SECRET), ("STRIPE_SECRET_KEY", KEY)], &public).unwrap();
+        assert!(b.checkout_enabled());
+        assert_eq!(b.checkout.unwrap().public_url, "https://bots.example.com");
+        // A key without the webhook would sell plans that never apply.
+        let e = load(&[("STRIPE_SECRET_KEY", KEY)], &public).err().unwrap();
+        assert!(e.contains("STRIPE_WEBHOOK_SECRET"), "{e}");
+        // The publishable key, or anything else, is refused.
+        for k in ["pk_test_1234567890abcdef", "whsec_1234567890abcdef", "sk_test_"] {
+            let e = load(&[("STRIPE_WEBHOOK_SECRET", SECRET), ("STRIPE_SECRET_KEY", k)], &public).err().unwrap();
+            assert!(e.contains("sk_") && !e.contains(k), "{e}");
+        }
+        assert!(load(&[("STRIPE_WEBHOOK_SECRET", SECRET), ("STRIPE_SECRET_KEY", "rk_live_restricted_key_00")], &public).unwrap().checkout_enabled());
+        // No public address to come back to.
+        let e = load(&[("STRIPE_WEBHOOK_SECRET", SECRET), ("STRIPE_SECRET_KEY", KEY)], &|_| String::new()).err().unwrap();
+        assert!(e.contains("PUBLIC_URL"), "{e}");
+    }
+
+    #[test]
+    fn the_public_address_comes_from_the_configured_domain() {
+        let vars = |pairs: &'static [(&'static str, &'static str)]| move |k: &str| pairs.iter().find(|(n, _)| *n == k).map_or(String::new(), |(_, v)| v.to_string());
+        assert_eq!(public_url(&vars(&[("ALLOWED_HOSTS", " bots.example.com, other.example.com")])).unwrap(), "https://bots.example.com");
+        assert_eq!(public_url(&vars(&[("ALLOWED_HOSTS", "bots.example.com"), ("SSO_PUBLIC_URL", "https://sso.example.com/")])).unwrap(), "https://sso.example.com");
+        assert_eq!(public_url(&vars(&[("SSO_PUBLIC_URL", "https://sso.example.com"), ("PUBLIC_URL", "https://pay.example.com")])).unwrap(), "https://pay.example.com");
+        assert_eq!(public_url(&vars(&[("PUBLIC_URL", "http://127.0.0.1:3000")])).unwrap(), "http://127.0.0.1:3000");
+        for bad in ["http://bots.example.com", "https://bots.example.com/app", "https://bots.example.com/?x=1", "https://user@bots.example.com", "bots.example.com", "ftp://bots.example.com"] {
+            let pairs: &'static [(&'static str, &'static str)] = Box::leak(Box::new([("PUBLIC_URL", bad)]));
+            assert!(public_url(&vars(pairs)).is_err(), "{bad}");
+        }
+        assert!(public_url(&vars(&[])).is_err());
     }
 }
