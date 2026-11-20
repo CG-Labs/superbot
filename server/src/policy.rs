@@ -806,14 +806,20 @@ fn deletion(ctx: &Ctx, cwds: &Cwds, target: &str, push: &mut impl FnMut(&'static
 
 /// Whether `git config` sets push config: such a key with a value after it, in the old
 /// form (`git config [--add] k v`) or the new one (`git config set k v`). Reads, unsets and
-/// renames don't, even with a value pattern after the key (`--get k '.*'`).
+/// renames don't, even with a value pattern after the key (`--get k '.*'`). Only options
+/// before `--` are actions; a write action with them counts as a write.
 fn sets_push_config(rest: &[&str]) -> bool {
     const NOT_SETTING: [&str; 12] = ["--get", "--get-all", "--get-regexp", "--get-urlmatch", "--get-color", "--get-colorbool", "--list", "-l", "--unset", "--unset-all", "--rename-section", "--remove-section"];
-    let ops = operands(rest);
-    if rest.iter().any(|a| NOT_SETTING.contains(a)) || ops.first().is_some_and(|o| ["get", "list", "unset", "rename-section", "remove-section"].contains(o)) {
-        return false;
+    let opts = rest.iter().take_while(|a| **a != "--").filter(|a| a.starts_with('-'));
+    let (mut reads, mut writes) = (false, false);
+    for o in opts {
+        reads |= NOT_SETTING.contains(o);
+        writes |= ["--add", "--replace-all"].contains(o);
     }
-    ops.windows(2).any(|w| push_config(w[0]))
+    // A subcommand comes first; later words may be option values (`--file get`).
+    let sub = rest.first();
+    let reads = reads || sub.is_some_and(|o| ["get", "list", "unset", "rename-section", "remove-section"].contains(o));
+    (writes || !reads) && operands(rest).windows(2).any(|w| push_config(w[0]))
 }
 
 /// Arguments that are not flags. Everything after `--` is an operand.
@@ -1231,7 +1237,7 @@ mod tests {
             assert_eq!(cls(cmd), ["git_push"], "{cmd}");
         }
         // Config that makes a later plain push force or mirror asks too.
-        for cmd in ["git config remote.origin.push +refs/heads/*:refs/heads/*", "git config set remote.origin.mirror true", "git config --file x.cfg --add Remote.Origin.Push +main", "git config alias.p 'push --force'", "git config push.default matching"] {
+        for cmd in ["git config remote.origin.push +refs/heads/*:refs/heads/*", "git config set remote.origin.mirror true", "git config --file x.cfg --add Remote.Origin.Push +main", "git config alias.p 'push --force'", "git config push.default matching", "git config --replace-all -- remote.origin.push +refs/heads/main:refs/heads/main --get", "git config --replace-all remote.origin.push +main --get", "git config --file get remote.origin.push +main"] {
             assert_eq!(cls(cmd), ["git_push"], "{cmd}");
         }
         for cmd in ["git config remote.origin.push", "git config get remote.origin.mirror", "git config --unset remote.origin.push", "git config --get remote.origin.push '.*'", "git config --get-all remote.origin.push +", "git config --unset-all remote.origin.push '^\\+'", "git config get --all --value=x remote.origin.push", "git config --rename-section alias.a alias.b", "git config user.name Ada", "git config remote.origin.url https://example.invalid/r.git"] {
