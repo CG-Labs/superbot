@@ -99,7 +99,8 @@ PATH="$T/faketar:$PATH" FAKE_TAR_EXIT=1 DATA_DIR=$D BACKUP_DIR=$B SUPERBOT_BACKU
 grep -q "changed while they were read" "$T/out" || fail "no warning for files changed mid-read"
 [[ $(find "$B" -name 'superbot-*.tar.gz' | wc -l) == 1 && $(find "$B" -name 'superbot-*.tar.gz.age' | wc -l) == 1 ]] ||
   fail "a file changing mid-read discarded the archive"
-tar -tzf "$(find "$B" -name 'superbot-*.tar.gz')" | grep -qx app.sqlite || fail "the kept archive is unreadable"
+listing=$(tar -tzf "$(find "$B" -name 'superbot-*.tar.gz')") || fail "the kept archive is unreadable"
+grep -qx app.sqlite <<<"$listing" || fail "the kept archive has no app.sqlite"
 rm -rf "$B"
 refuses "backup failed" env PATH="$T/faketar:$PATH" FAKE_TAR_EXIT=2 DATA_DIR="$D" BACKUP_DIR="$B" "$BACKUP"
 [[ -z $(find "$B" -type f ! -name .lock) ]] || fail "a fatal tar error left an archive or partial file"
@@ -132,7 +133,8 @@ prev=$(find "$D" -maxdepth 1 -name '.pre-restore-*')
 ok "restore swaps DATA_DIR and keeps the previous contents"
 
 DATA_DIR=$D "$BACKUP" - >"$T/again.tar.gz"
-if tar -tzf "$T/again.tar.gz" | grep -q -e '\.pre-restore-' -e '\.restore-'; then fail "a backup carried restore leftovers"; fi
+listing=$(tar -tzf "$T/again.tar.gz") || fail "the backup after a restore is unreadable"
+if grep -q -e '\.pre-restore-' -e '\.restore-' <<<"$listing"; then fail "a backup carried restore leftovers"; fi
 ok "backups skip restore leftovers"
 
 mkdir "$T/bad"

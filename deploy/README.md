@@ -13,7 +13,7 @@ curl -fsSL https://raw.githubusercontent.com/CG-Labs/superbot/main/deploy/instal
   --user-name "Alex"
 ```
 
-Re-run with `--upgrade` to pull latest `main`, rebuild, and restart. Root never installs units from the service user's checkout: it fetches the repo into a root-owned `/usr/local/share/superbot/src.git`, stages `deploy/` in `/usr/local/share/superbot/deploy`, and renders units with a fixed `User=`, paths, and `ExecStart=`:
+Re-run with `--upgrade` to pull latest `main`, rebuild, and restart. Exit status 3 means everything but the [web client](#web-client) was upgraded. Root never installs units from the service user's checkout: it fetches the repo into a root-owned `/usr/local/share/superbot/src.git`, stages `deploy/` in `/usr/local/share/superbot/deploy`, and renders units with a fixed `User=`, paths, and `ExecStart=`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/CG-Labs/superbot/main/deploy/install.sh | sudo bash -s -- --upgrade
@@ -77,7 +77,8 @@ To add people, open **Users** in the app's sidebar or in the console (admins onl
 The installer builds the Expo client (`apps/client`) from the same commit as `botd` on every install and `--upgrade`, and Caddy serves it at `/app/`. `/` is the [landing page](#landing-page-and-sign-ups); `/console/` (the built-in admin page), `/login`, `/api`, `/api/events`, and `/healthz` go to `botd`. Design: [ADR 0013](../docs/adr/0013-serve-web-client.md). With `--no-client`, nobody has browser chat (use the desktop or mobile app); admins keep `/console/` for admin tasks.
 
 - The service user builds it (`npm ci`, `expo export` with `SUPERBOT_WEB_BASE_URL=/app`) in `~/superbot/apps/client/dist-app`. Root copies only plain files and folders into a new root-owned release in `/var/www/superbot-app.releases/`, then switches the `/var/www/superbot-app` symlink in one step. The previous release is kept. Set `CLIENT_DIR` to use another path.
-- Needs Node.js 20+ (the installer sets up 22). Without it, or if the build fails, the installer warns and keeps the previous client. `--no-client` skips it.
+- Needs Node.js 20+ (the installer sets up 22). Without Node, the installer warns, keeps the previous client, and exits 0. `--no-client` skips it.
+- If the build fails or root refuses it, the installer still finishes everything else and keeps serving the previous client release. It then ends with a final `!!` warning and **exit status 3**, on a fresh install and on `--upgrade`, so scripts and operators can't miss it. Fix the cause it names and re-run.
 - Served only through Caddy, so it needs `--domain`.
 - A hand-made `/var/www/superbot-app` folder is kept as the previous release on the first run.
 - Build it yourself: `cd apps/client && npm ci && npm run build:web:server`. Plain `npm run build:web` (Electron, local) is unchanged.
