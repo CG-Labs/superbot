@@ -1066,7 +1066,7 @@ impl OnMachine {
 async fn agent_with(env: &mut Env, mid: &str, token: &str, harness: &str) -> OnMachine {
     use std::os::unix::fs::PermissionsExt;
     let mut cfg = config(env, mid, Some(token));
-    let bin = cfg.state_dir.join("bin");
+    let bin = cfg.home.join(".local/bin");
     std::fs::create_dir_all(&bin).unwrap();
     for (name, body) in [("claude", harness), ("botctl", "#!/bin/sh\nexit 2\n")] {
         std::fs::write(bin.join(name), body).unwrap();
@@ -1421,4 +1421,45 @@ async fn botd_stops_listening_to_a_machine_that_floods_it() {
         0,
         "dropping the stream ends the job there"
     );
+}
+
+#[test]
+fn agent_counts_programs_only_under_its_home_or_the_system() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = crate::db::temp_path("roots-home");
+    let elsewhere = crate::db::temp_path("roots-elsewhere");
+    let bin = home.join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let exe = |p: &std::path::Path| {
+        std::fs::write(p, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    exe(&elsewhere.join("botctl"));
+    let mut cfg = Config {
+        control_url: "https://127.0.0.1:1".into(),
+        machine_id: "m".into(),
+        ca_pem: String::new(),
+        state_dir: crate::db::temp_path("roots-state"),
+        listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+        token: None,
+        token_file: None,
+        home: home.clone(),
+        api_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+        botctl: elsewhere.join("botctl"),
+        harness_path: "/usr/bin:/bin".into(),
+        max_jobs: 1,
+    };
+    assert_eq!(cfg.layout().botctl, None, "outside the home and the system's directories");
+
+    cfg.botctl = bin.join("botctl");
+    std::os::unix::fs::symlink(elsewhere.join("botctl"), &cfg.botctl).unwrap();
+    assert_eq!(cfg.layout().botctl, None, "a link is judged by where it leads");
+
+    std::fs::remove_file(&cfg.botctl).unwrap();
+    exe(&cfg.botctl);
+    assert_eq!(cfg.layout().botctl.as_deref(), Some(cfg.botctl.to_str().unwrap()));
+
+    cfg.botctl = "/bin/sh".into();
+    assert_eq!(cfg.layout().botctl.as_deref(), Some("/bin/sh"), "a system program");
 }
