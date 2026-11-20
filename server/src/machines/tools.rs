@@ -789,6 +789,38 @@ mod tests {
         assert_eq!(t.node_due(), only_node.node, "even with no npm harness planned");
     }
 
+    #[test]
+    fn a_new_pin_for_an_installed_version_is_checked() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("superbot-tools-pin-{}", now_ms()));
+        let t = Tools::new(dir, None).unwrap();
+        let claude = t.bin_dir().join("claude");
+        std::fs::write(&claude, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let node = NodeRuntime {
+            version: "24.22.3".into(),
+            downloads: BTreeMap::from([(std::env::consts::ARCH.into(), wire::Download { url: "https://nodejs.org/n.tar.xz".into(), sha256: "a".repeat(64) })]),
+        };
+        let unpinned = npm("claude", "@anthropic-ai/claude-code", "2.1.329");
+        let plan = |h: HarnessInstall| HarnessPlan { node: Some(node.clone()), harnesses: vec![h] };
+        t.set_plan(plan(unpinned.clone())).unwrap();
+        let (h, _) = t.next().unwrap();
+        t.finish(&h, Ok(h.version.clone()));
+        {
+            let mut s = t.lock();
+            s.node = Some(node.version.clone());
+            s.node_sha256 = Some("a".repeat(64));
+        }
+        t.set_plan(plan(unpinned.clone())).unwrap();
+        assert_eq!(t.report().1["claude"].state, wire::HARNESS_INSTALLED, "the same recipe is left alone");
+
+        let pin = format!("sha512-{}", base64::engine::general_purpose::STANDARD.encode([9u8; 64]));
+        let pinned = HarnessInstall { source: InstallSource::Npm { package: "@anthropic-ai/claude-code".into(), integrity: Some(pin) }, ..unpinned };
+        t.set_plan(plan(pinned.clone())).unwrap();
+        assert_eq!(t.report().1["claude"].state, wire::HARNESS_QUEUED, "a new pin is checked by installing again");
+        assert_eq!(t.next().unwrap().0, pinned);
+    }
+
     #[tokio::test]
     async fn replacing_waits_for_running_jobs_and_holds_new_ones() {
         let dir = std::env::temp_dir().join(format!("superbot-tools-gate-{}", now_ms()));
