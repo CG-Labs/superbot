@@ -43,6 +43,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl user disable <user> | enable <user>       Disabling ends the user's sessions
   botctl user tier <user> <tier|default>           Their plan: the models and limits they get
   botctl tiers                                     Every tier, its routes and limits, and the default
+  botctl usage [json]                              Everyone's plan, use against its limits, machine size,
+                                                   and subscription (admins)
   botctl user isolation <user>                     With ISOLATION=users: the user's own account and folders
   botctl user isolate <user>                       Make that account and its folders now
   botctl user harness-login <user> <claude|codex> [-- <args>...]
@@ -633,6 +635,45 @@ fn license_summary(l: &Value) -> String {
     out
 }
 
+/// One line per user: their plan, each limit as used/allowed, their machine, their
+/// subscription, and any limit they're past (ADR 0040).
+fn usage_summary(v: &Value) -> String {
+    let of = |used: &Value, limit: &Value| match limit.as_u64() {
+        Some(l) => format!("{}/{l}", used.as_u64().unwrap_or(0)),
+        None => format!("{}/unlimited", used.as_u64().unwrap_or(0)),
+    };
+    let mut out = format!("Billing: {}.\n", if v["billing"] == true { "Stripe webhook on" } else { "off" });
+    for u in v["users"].as_array().into_iter().flatten() {
+        let (p, use_) = (&u["plan"], &u["plan"]["usage"]);
+        let who = u["user"]["email"].as_str().or(u["user"]["name"].as_str()).unwrap_or_default();
+        let mut line = format!(
+            "{who}: {} plan; Bots {}; runs {} in {}; routine runs {} on {}",
+            p["label"].as_str().unwrap_or_default(),
+            of(&use_["bots"], &p["limits"]["maxBots"]),
+            of(&use_["runs"], &p["limits"]["monthlyRuns"]),
+            use_["period"].as_str().unwrap_or_default(),
+            of(&use_["routineRuns"], &p["limits"]["dailyRoutineRuns"]),
+            use_["day"].as_str().unwrap_or_default(),
+        );
+        let allowed = p["limits"]["machineType"].as_str();
+        match (&u["machine"], allowed) {
+            (Value::Null, Some(t)) => line += &format!("; machine size {t}, none yet"),
+            (Value::Null, None) => {}
+            (m, _) => line += &format!("; machine {} ({}){}", m["plan"].as_str().unwrap_or_default(), m["state"].as_str().unwrap_or_default(), allowed.map_or(String::new(), |t| format!(", plan size {t}"))),
+        }
+        if let Some(st) = u["subscription"]["status"].as_str() {
+            line += &format!("; Stripe {st}");
+        }
+        let over: Vec<&str> = u["over"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        if !over.is_empty() {
+            line += &format!("; OVER: {}", over.join(", "));
+        }
+        out += &line;
+        out.push('\n');
+    }
+    out
+}
+
 fn run(args: &[String]) -> Result<String, String> {
     let bot = std::env::var("BOT_ID").unwrap_or_default();
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -734,6 +775,8 @@ fn run(args: &[String]) -> Result<String, String> {
         ["user", "isolate", key] => op("POST", &format!("/api/users/{}/isolation", encode(key)), None),
         ["user", "harness-login", key, harness, rest @ ..] => harness_login(key, harness, rest),
         ["tiers"] => op("GET", "/api/tiers", None),
+        ["usage"] => Ok(usage_summary(&serde_json::from_str(&api(Cred::Operator, "GET", "/api/usage", None)?).map_err(|e| e.to_string())?)),
+        ["usage", "json"] => op("GET", "/api/usage", None),
         ["license"] | ["license", "status"] => Ok(license_summary(&serde_json::from_str(&api(Cred::Operator, "GET", "/api/license", None)?).map_err(|e| e.to_string())?)),
         ["license", "json"] => op("GET", "/api/license", None),
         ["license", "install", rest @ ..] if rest.len() <= 1 => {
@@ -937,6 +980,22 @@ mod tests {
         assert!(out.contains("botctl secret set SSO_OKTA_CLIENT_SECRET < file") && out.contains("botctl setup done"), "{out}");
         let done = setup_summary(&json!({ "progress": { "completedAt": 1 }, "done": 2, "total": 2, "checklist": [] }));
         assert!(done.starts_with("Setup: 2 of 2 done (finished).") && !done.contains("botctl setup done"), "{done}");
+    }
+
+    #[test]
+    fn usage_summary_shows_use_against_limits() {
+        let v = json!({ "billing": true, "users": [
+            { "user": { "email": "ada@example.com" }, "over": ["bots", "machineType"],
+              "plan": { "label": "Starter", "limits": { "maxBots": 2, "monthlyRuns": 300, "dailyRoutineRuns": 24, "machineType": "g6-standard-1" },
+                        "usage": { "bots": 3, "runs": 12, "period": "2026-11", "routineRuns": 4, "day": "2026-11-20" } },
+              "machine": { "plan": "g6-standard-2", "state": "running" }, "subscription": { "status": "active" } },
+            { "user": { "name": "Owner" }, "over": [], "machine": null, "subscription": null,
+              "plan": { "label": "Self-host", "limits": {}, "usage": { "bots": 1, "runs": 0, "period": "2026-11", "routineRuns": 0, "day": "2026-11-20" } } },
+        ]});
+        let out = usage_summary(&v);
+        assert!(out.starts_with("Billing: Stripe webhook on.\n"), "{out}");
+        assert!(out.contains("ada@example.com: Starter plan; Bots 3/2; runs 12/300 in 2026-11; routine runs 4/24 on 2026-11-20; machine g6-standard-2 (running), plan size g6-standard-1; Stripe active; OVER: bots, machineType\n"), "{out}");
+        assert!(out.contains("Owner: Self-host plan; Bots 1/unlimited; runs 0/unlimited in 2026-11; routine runs 0/unlimited on 2026-11-20\n"), "{out}");
     }
 
     #[test]

@@ -7,7 +7,8 @@
       "routes": [
         { "harness": "hermes", "provider": "openrouter", "model": "anthropic/claude-haiku-4.5" }
       ],
-      "limits": { "maxBots": 3, "monthlyRuns": 300 }
+      "limits": { "maxBots": 3, "monthlyRuns": 300, "dailyRoutineRuns": 24, "machineType": "g6-standard-1" },
+      "stripePrices": ["price_replace_with_starter_monthly"]
     },
     {
       "name": "pro",
@@ -16,7 +17,8 @@
         { "harness": "hermes", "provider": "openrouter", "model": "anthropic/claude-sonnet-4.5" },
         { "harness": "claude", "model": "claude-sonnet-4-5", "effort": "high" }
       ],
-      "limits": { "maxBots": 10, "monthlyRuns": 3000, "monthlyTokens": 20000000 }
+      "limits": { "maxBots": 10, "monthlyRuns": 3000, "monthlyTokens": 20000000, "dailyRoutineRuns": 200, "machineType": "g6-standard-2" },
+      "stripePrices": ["price_replace_with_pro_monthly", "price_replace_with_pro_yearly"]
     },
     {
       "name": "max",
@@ -27,7 +29,8 @@
         { "harness": "claude", "model": "claude-opus-4-1", "effort": "high" },
         { "harness": "codex", "model": "gpt-5-codex" }
       ],
-      "limits": { "maxBots": 30 }
+      "limits": { "maxBots": 30, "machineType": "g6-standard-4" },
+      "stripePrices": ["price_replace_with_max_monthly"]
     },
     { "name": "self-host", "label": "Self-host", "routes": "any" }
   ]

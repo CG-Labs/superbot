@@ -240,6 +240,8 @@ mod tests {
             ("GET", "/api/me/secrets", Perm::Read),
             ("GET", "/api/me/tier", Perm::Read),
             ("GET", "/api/tiers", Perm::Admin),
+            // Everyone's plan and use, against their limits (ADR 0040).
+            ("GET", "/api/usage", Perm::Admin),
             // The onboarding wizard (ADR 0034): what the server has set up, and its progress.
             ("GET", "/api/setup", Perm::Admin),
             ("PATCH", "/api/setup", Perm::Admin),

@@ -3,6 +3,7 @@ import { ActivityIndicator, Pressable, StyleSheet, Text, TextInput, View } from 
 import type { SuperBotApi } from "../src/api";
 import { confirmAsync } from "../src/dialogs";
 import { CODE_TTLS, formatExpiry, relativeTime, ROLES, signInMethod } from "../src/invite";
+import { overLimits, planUsageLines } from "../src/plan";
 import type { SsoProvider } from "../src/sso";
 import { colors } from "../src/theme";
 import type { AdminUser, LoginCode, Role, SessionView, UserBots, UserIdentity } from "../src/types";
@@ -166,6 +167,20 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
           <Text style={styles.faint}>{user.breakGlass ? "The owner stays an active admin: it's the way back in." : "Another admin changes your own role and status."}</Text>
         ) : null}
       </Section>
+
+      {user.plan ? (
+        <Section title="Plan and usage">
+          <Text style={styles.text}>{user.plan.label}</Text>
+          {planUsageLines(user.plan).map((line) => (
+            <Text key={line} style={styles.dim}>
+              {line}
+            </Text>
+          ))}
+          {overLimits(user.plan).length ? (
+            <Text style={styles.error}>Over the plan&apos;s limit for {overLimits(user.plan).join(", ")}: new ones are refused until they&apos;re under it.</Text>
+          ) : null}
+        </Section>
+      ) : null}
 
       <Section title="Status">
         <View style={styles.row}>
