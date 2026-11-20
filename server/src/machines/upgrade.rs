@@ -69,9 +69,29 @@ pub struct Upgrader {
     current: Mutex<Option<UpgradeReport>>,
 }
 
+/// `p`, if it is absolute with no `..` in it. The upgrader touches no other path:
+/// each one is the agent's own binary or state dir with a fixed name or suffix.
+fn plain(p: &Path) -> Result<PathBuf, String> {
+    let s = p.to_str().ok_or_else(|| format!("{} isn't UTF-8", p.display()))?;
+    if s.contains("..") {
+        return Err(format!("{s} has \"..\" in it"));
+    }
+    if !p.is_absolute() {
+        return Err(format!("{s} isn't absolute"));
+    }
+    Ok(PathBuf::from(s))
+}
+
+fn remove(p: &Path) {
+    if let Ok(p) = plain(p) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 /// A whole file, written to `path` and synced, with `mode`.
 fn write_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
-    let _ = std::fs::remove_file(path);
+    let path = &plain(path)?;
+    remove(path);
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -86,17 +106,18 @@ fn write_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
 fn write_json<T: Serialize>(path: &Path, v: &T) -> Result<(), String> {
     let tmp = suffixed(path, ".tmp");
     write_file(&tmp, &serde_json::to_vec_pretty(v).unwrap_or_default(), 0o600)?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+    std::fs::rename(plain(&tmp)?, plain(path)?).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
-    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    serde_json::from_slice(&std::fs::read(plain(path).ok()?).ok()?).ok()
 }
 
 /// Keeps `path` as `path.prev` and puts `path.new` in its place, in one rename.
 fn swap(path: &Path) -> Result<(), String> {
-    let (new, prev) = (suffixed(path, ".new"), suffixed(path, ".prev"));
-    let _ = std::fs::remove_file(&prev);
+    let path = &plain(path)?;
+    let (new, prev) = (plain(&suffixed(path, ".new"))?, plain(&suffixed(path, ".prev"))?);
+    remove(&prev);
     std::fs::hard_link(path, &prev)
         .or_else(|_| std::fs::copy(path, &prev).map(|_| ()))
         .map_err(|e| format!("keeping {}: {e}", path.display()))?;
@@ -105,7 +126,8 @@ fn swap(path: &Path) -> Result<(), String> {
 
 /// Puts `path.prev` back, if it is there.
 fn restore(path: &Path) -> Result<bool, String> {
-    let prev = suffixed(path, ".prev");
+    let path = &plain(path)?;
+    let prev = plain(&suffixed(path, ".prev"))?;
     if !prev.exists() {
         return Ok(false);
     }
@@ -118,7 +140,7 @@ impl Upgrader {
     /// for another build means the old agent is back (the guard put it back), so that
     /// upgrade rolled back.
     pub fn new(exe: PathBuf, state_dir: PathBuf, version: &str) -> Upgrader {
-        let build = std::fs::read(&exe).ok().map(|b| sha256_hex(&b));
+        let build = plain(&exe).and_then(|p| std::fs::read(p).map_err(|e| e.to_string())).ok().map(|b| sha256_hex(&b));
         let botctl = exe.with_file_name("botctl");
         let u = Upgrader {
             exe,
@@ -141,8 +163,8 @@ impl Upgrader {
                 // the swaps): either way botctl goes back too.
                 let res = restore(&u.botctl);
                 for p in [&u.exe, &u.botctl] {
-                    let _ = std::fs::remove_file(suffixed(p, ".prev"));
-                    let _ = std::fs::remove_file(suffixed(p, ".new"));
+                    remove(&suffixed(p, ".prev"));
+                    remove(&suffixed(p, ".new"));
                 }
                 let mut why = "the new agent didn't start, so the old one was put back".to_string();
                 if let Err(e) = res {
@@ -160,8 +182,8 @@ impl Upgrader {
         r.reason = reason;
         r.at = now_ms();
         let _ = write_json(&self.state_dir.join(LAST_FILE), &r);
-        let _ = std::fs::remove_file(self.state_dir.join(TRIAL_FILE));
-        let _ = std::fs::remove_file(self.state_dir.join(STARTS_FILE));
+        remove(&self.state_dir.join(TRIAL_FILE));
+        remove(&self.state_dir.join(STARTS_FILE));
     }
 
     pub fn staging(&self) -> bool {
@@ -190,7 +212,7 @@ impl Upgrader {
             return false;
         };
         for p in [&self.exe, &self.botctl] {
-            let _ = std::fs::remove_file(suffixed(p, ".prev"));
+            remove(&suffixed(p, ".prev"));
         }
         self.end(r, wire::UPGRADE_DONE, None);
         true
@@ -270,7 +292,7 @@ impl Upgrader {
         if let Err(e) = &res {
             let report = self.current.lock().unwrap().take();
             for p in [&self.exe, &self.botctl] {
-                let _ = std::fs::remove_file(suffixed(p, ".new"));
+                remove(&suffixed(p, ".new"));
             }
             if let Some(r) = report {
                 self.end(r, wire::UPGRADE_FAILED, Some(e.clone()));
@@ -287,7 +309,7 @@ impl Upgrader {
     {
         let mut files = vec![(self.exe.clone(), "/v1/agent", req.sha256.clone())];
         if let Some(sha) = &req.botctl_sha256
-            && self.botctl.is_file()
+            && plain(&self.botctl).is_ok_and(|p| p.is_file())
         {
             files.push((self.botctl.clone(), "/v1/botctl", sha.clone()));
         }
@@ -307,7 +329,7 @@ impl Upgrader {
         let mut report = self.current.lock().unwrap().clone().unwrap_or_default();
         report.state = wire::UPGRADE_TRIAL.into();
         report.at = now_ms();
-        let _ = std::fs::remove_file(self.state_dir.join(STARTS_FILE));
+        remove(&self.state_dir.join(STARTS_FILE));
         write_json(&self.state_dir.join(TRIAL_FILE), &TrialFile { report, trial_secs: req.trial_secs })?;
         // botctl first: if the agent's swap fails, botctl goes back too.
         let mut done: Vec<&PathBuf> = Vec::new();
@@ -316,7 +338,7 @@ impl Upgrader {
                 for p in done {
                     let _ = restore(p);
                 }
-                let _ = std::fs::remove_file(self.state_dir.join(TRIAL_FILE));
+                remove(&self.state_dir.join(TRIAL_FILE));
                 return Err(e);
             }
             done.push(path);
@@ -473,5 +495,17 @@ mod tests {
         let none = Upgrader::new(PathBuf::from("/nonexistent/superbot-machine"), std::env::temp_dir(), "0.1.0");
         assert_eq!(none.build, None);
         assert_eq!(none.refuse(&req(NEW), 0).map(|(c, _)| c), Some(409));
+    }
+
+    #[test]
+    fn only_plain_absolute_paths_are_touched() {
+        let (u, _) = upgrader("plain", b"old agent");
+        let dotted = u.exe.parent().unwrap().join("..").join(u.exe.strip_prefix("/").unwrap());
+        assert!(plain(&dotted).is_err() && plain(Path::new("superbot-machine")).is_err());
+        assert_eq!(plain(&u.exe).unwrap(), u.exe);
+        let odd = Upgrader::new(dotted.clone(), std::env::temp_dir(), "0.1.0");
+        assert_eq!(odd.build, None, "it won't replace a binary it reached through ..");
+        assert!(write_file(&dotted, b"x", 0o600).is_err() && read_json::<TrialFile>(&dotted).is_none());
+        assert_eq!(std::fs::read(&u.exe).unwrap(), b"old agent");
     }
 }
