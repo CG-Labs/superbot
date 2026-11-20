@@ -8,6 +8,7 @@ import {
   Text,
   TextInput,
   View,
+  type TextInputInstance,
 } from "react-native";
 import Markdown from "react-native-markdown-display";
 import { copyText, COPY_LABEL } from "../src/clipboard";
@@ -27,6 +28,10 @@ interface Props {
   /** Opens the Bot's live screen; `takeOver` starts with control (from a handoff). */
   onToggleScreen: (takeOver?: boolean) => void;
   screenOpen?: boolean;
+  /** Text to put in the message box, e.g. a suggested starter (ADR 0054). */
+  prefill?: string | null;
+  /** Called once `prefill` is in the box, so it isn't put there again. */
+  onPrefilled?: () => void;
 }
 
 /** Who a Bot-to-Bot message came from. */
@@ -40,7 +45,7 @@ function formatTime(ts: number): string {
   return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 }
 
-export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen }: Props) {
+export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, prefill, onPrefilled }: Props) {
   const {
     bots,
     activeId,
@@ -59,6 +64,7 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen }: 
   const [text, setText] = useState("");
   const [loading, setLoading] = useState(false);
   const listRef = useRef<FlatList>(null);
+  const inputRef = useRef<TextInputInstance>(null);
 
   const bot = bots.find((b) => b.id === activeId);
   const canOperate = canOnBot(bot, "operate");
@@ -68,6 +74,14 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen }: 
     setLoading(true);
     void loadMessages(activeId).finally(() => setLoading(false));
   }, [activeId, loadMessages]);
+
+  useEffect(() => {
+    if (prefill == null) return;
+    setText(prefill);
+    inputRef.current?.focus();
+    onPrefilled?.();
+    // onPrefilled is a new function on every parent render; only a new prefill matters.
+  }, [prefill]);
 
   if (!bot) {
     return (
@@ -239,6 +253,8 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen }: 
       {canOperate ? (
       <View style={styles.composer}>
         <TextInput
+          ref={inputRef}
+          aria-label={`Message ${bot.name}`}
           style={styles.input}
           placeholder={`Message ${bot.name}`}
           placeholderTextColor={colors.textFaint}

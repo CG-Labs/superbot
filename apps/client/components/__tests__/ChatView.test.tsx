@@ -70,6 +70,21 @@ describe("ChatView", () => {
     expect(screen.getByText("Model picker")).toBeOnTheScreen();
   });
 
+  it("puts a suggested starter in the message box once", async () => {
+    const onPrefilled = jest.fn();
+    const view = await render(
+      <ChatView onOpenDetails={jest.fn()} onToggleScreen={jest.fn()} prefill="Set up a routine to " onPrefilled={onPrefilled} />,
+    );
+    const box = screen.getByLabelText("Message Bob");
+    expect(box).toHaveDisplayValue("Set up a routine to ");
+    expect(onPrefilled).toHaveBeenCalledTimes(1);
+
+    await act(async () => fireEvent.changeText(box, "Set up a routine to water the plants"));
+    await view.rerender(<ChatView onOpenDetails={jest.fn()} onToggleScreen={jest.fn()} prefill={null} onPrefilled={onPrefilled} />);
+    expect(box).toHaveDisplayValue("Set up a routine to water the plants");
+    expect(onPrefilled).toHaveBeenCalledTimes(1);
+  });
+
   it("says which Bot sent a Bot-to-Bot message", () => {
     expect(peerLabel(list[1], [bot("a", "Ada")])).toBe("From Ada");
     expect(peerLabel(list[2], [bot("a", "Ada")])).toBe("Reply from another Bot");

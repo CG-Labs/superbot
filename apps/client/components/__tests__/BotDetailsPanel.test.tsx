@@ -165,11 +165,49 @@ describe("BotDetailsPanel", () => {
     confirm.mockRestore();
   });
 
+  it("starts a chat from a suggested prompt and closes", async () => {
+    const onUsePrompt = jest.fn();
+    const onClose = jest.fn();
+    Object.assign(mockCtx, { bots: [{ ...bot("b", "Bob"), prompts: ["Check the build"] }], activeId: "b", fetchRoutines: jest.fn(async () => []) });
+    await render(<BotDetailsPanel visible onClose={onClose} onOpenScreen={jest.fn()} onUsePrompt={onUsePrompt} />);
+
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Ask Bob: Check the build" })));
+    expect(onUsePrompt).toHaveBeenCalledWith("Check the build");
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it("shows the default prompts when the Bot has none saved", async () => {
+    Object.assign(mockCtx, { bots: [bot("b", "Bob")], activeId: "b", fetchRoutines: jest.fn(async () => []) });
+    await render(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} onUsePrompt={jest.fn()} />);
+    expect(screen.getByRole("button", { name: "Start a message: Set up a routine to…" })).toBeOnTheScreen();
+  });
+
+  it("lets those who manage the Bot edit its prompts", async () => {
+    const patchBot = jest.fn(async () => {});
+    Object.assign(mockCtx, { bots: [{ ...bot("b", "Bob"), prompts: ["Old"] }], activeId: "b", fetchRoutines: jest.fn(async () => []), patchBot });
+    await render(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} onUsePrompt={jest.fn()} />);
+
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Edit suggested prompts" })));
+    await act(async () => fireEvent.changeText(screen.getByLabelText("Prompt 1"), "New"));
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Save prompts" })));
+    expect(patchBot).toHaveBeenCalledWith("b", { prompts: ["New"] });
+    expect(screen.queryByText("Suggested prompts")).not.toBeOnTheScreen();
+  });
+
+  it("lets operators use prompts but not edit them", async () => {
+    Object.assign(mockCtx, { bots: [{ ...shared("operate"), prompts: ["Check the build"] }], activeId: "b", fetchRoutines: jest.fn(async () => []) });
+    await render(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} onUsePrompt={jest.fn()} />);
+
+    expect(screen.getByRole("button", { name: "Ask Bob: Check the build" })).toBeOnTheScreen();
+    expect(screen.queryByRole("button", { name: "Edit suggested prompts" })).not.toBeOnTheScreen();
+  });
+
   it("lets a viewer look but not run the Bot", async () => {
     Object.assign(mockCtx, { bots: [shared("view")], activeId: "b", fetchRoutines: jest.fn(async () => [routine("rb", "b", "Mine")]) });
-    await render(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} />);
+    await render(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} onUsePrompt={jest.fn()} />);
 
     expect(await screen.findByText("Mine")).toBeOnTheScreen();
+    expect(screen.queryByText("Suggested")).not.toBeOnTheScreen();
     expect(screen.queryByText("+ New routine")).not.toBeOnTheScreen();
     expect(screen.queryByText("Open screen")).not.toBeOnTheScreen();
     expect(screen.getByLabelText("Pause Mine").props.disabled).toBe(true);
