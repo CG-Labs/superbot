@@ -116,11 +116,12 @@ Fresh installs start in `ask`. Installs from before approvals keep `bypass` unti
 SUPERBOT_PASSWORD=<your AUTH_PASSWORD> botctl policy set global mode=ask
 ```
 
-Or use **Settings → Risky actions** in the admin console (`/console/#settings`). More operator commands: `botctl admin`. botctl only sends the password to a server on the same machine (loopback), since it speaks plain http; from elsewhere, use an SSH tunnel.
+Or use the app: **Approvals → Edit risky actions, timeout, and rules** for all Bots, or a Bot's details for that Bot ([ADR 0048](adr/0048-policy-editor-in-the-apps.md)). Admins also have **Settings → Risky actions** in the admin console (`/console/#settings`) for all Bots. More operator commands: `botctl admin`. botctl only sends the password to a server on the same machine (loopback), since it speaks plain http; from elsewhere, use an SSH tunnel.
 
 ```sh
 botctl policy set global timeout=15 git_push=deny   # never push, ask longer
 botctl policy set <bot-id> mode=bypass              # one dev Bot runs freely
+botctl policy set <bot-id> git_push=inherit         # back to the global action
 botctl rule add deny "rm -rf /srv/*"                # deny list
 botctl rule add allow "npm install*" --bot <bot-id> # this Bot may install npm packages
 botctl approvals | botctl approve <id> [--remember] | botctl deny <id>
@@ -331,8 +332,8 @@ Per-user machines ([ADR 0025](adr/0025-control-plane-linode.md)). 503 when the c
 Approvals, policy, and audit. Writes, decisions, the approvals list, and the audit log need a person (403 for the Bot token):
 
 - `GET /api/policy`: global policy, class names, global rules. `PUT /api/policy` `{mode?, timeoutMinutes?, classes?: {<class>: allow|ask|deny}}`
-- `GET /api/bots/:id/policy`: effective policy, override, rules. `PUT` (same body, merged into the override), `DELETE` (drop the override)
-- `GET /api/policy/rules?bot=<id>`, `POST /api/policy/rules` `{action: allow|deny, pattern, tool?, botId?, note?}`, `DELETE /api/policy/rules/:id`
+- `GET /api/bots/:id/policy`: effective policy, override, rules. `PUT` (same body, merged into the override; `null` for `mode`, `timeoutMinutes`, or a class puts it back to the global value), `DELETE` (drop the override)
+- `GET /api/policy/rules?bot=<id>`, `POST /api/policy/rules` `{action: allow|deny, pattern, tool?, botId?, note?}` (pattern up to 8000 characters, tool up to 200 with no spaces, note up to 500), `DELETE /api/policy/rules/:id`
 - `GET /api/approvals?status=pending|approved|denied|expired|cancelled|all&bot=<id>&limit=`
 - `POST /api/approvals/:id/approve`, `POST /api/approvals/:id/deny` `{remember?: "bot"|"global", note?}`. Remember needs an admin. 409 if already decided
 - `POST /api/approvals/check` `{from, harness, event}`: the hook's call. Waits for a decision. Replies `allow` or `deny`, then the reason, as plain text
