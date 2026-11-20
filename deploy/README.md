@@ -290,11 +290,17 @@ Every refusal is in the audit log (`bot.create_refused`, `routine.run_refused`, 
 
 ### Stripe (optional)
 
-Off unless `STRIPE_WEBHOOK_SECRET` is set; `/billing/stripe/webhook` answers 404 until then. botd never calls Stripe: it only receives signed events.
+Off unless `STRIPE_WEBHOOK_SECRET` is set; `/billing/stripe/webhook` answers 404 until then. With only the webhook, botd never calls Stripe: it only receives signed events. Add `STRIPE_SECRET_KEY` to sell plans in the app ([ADR 0041](../docs/adr/0041-billing-checkout-portal-customers.md)). Use test-mode keys until you're ready to charge.
 
-1. In each tier, list its Stripe price ids in `stripePrices` (see [`tiers.example.json`](tiers.example.json)). A price may belong to one tier only.
-2. In Stripe, add a webhook endpoint at `https://<your-host>/billing/stripe/webhook` for `customer.subscription.created`, `.updated`, and `.deleted`, and put its signing secret (`whsec_…`) in `STRIPE_WEBHOOK_SECRET` (or `STRIPE_WEBHOOK_SECRET_FILE`). Restart `botd`.
-3. Create each subscription with `metadata.superbot_user_id` set to the user's id (from `botctl users`).
+1. In each tier, list its Stripe price ids in `stripePrices` (see [`tiers.example.json`](tiers.example.json)). A price may belong to one tier only. Checkout sells a tier's first price; tiers without one can't be bought.
+2. In Stripe, add a webhook endpoint at `https://<your-host>/billing/stripe/webhook` for `customer.subscription.created`, `.updated`, `.deleted`, `checkout.session.completed`, and `customer.deleted`, and put its signing secret (`whsec_…`) in `STRIPE_WEBHOOK_SECRET` (or `STRIPE_WEBHOOK_SECRET_FILE`).
+3. For checkout and the customer portal, put a secret key in `STRIPE_SECRET_KEY` (or `STRIPE_SECRET_KEY_FILE`). A restricted key (`rk_…`) with write access to Checkout Sessions and Customer portal is enough. Stripe sends people back to `PUBLIC_URL` (default: `SSO_PUBLIC_URL`, else `https://` and the first `ALLOWED_HOSTS` entry) at `/app/plan`.
+4. In Stripe's dashboard, turn on the customer portal (Settings → Billing → Customer portal) and choose what people may do there: update their card, see invoices, switch between your plans' prices, cancel.
+5. Restart `botd`. Its startup line says whether the webhook and checkout are on.
+
+Everyone then sees **Plan** in the client's sidebar: their plan and use against its limits, **Upgrade** buttons for each plan with a price, and **Manage billing** once they have a Stripe customer. Read-only people see their plan but can't buy one. Someone who already pays is sent to the portal instead of a second checkout. Without `STRIPE_SECRET_KEY`, subscriptions you create in Stripe still set tiers if they carry `metadata.superbot_user_id` (the user's id from `botctl users`) or belong to a customer botd has linked.
+
+Each Stripe customer is linked to one user, from a completed checkout or the first subscription event botd can place; the first link stands, and deleting the customer in Stripe removes it. Users are never matched by email. `botctl usage` shows each user's customer.
 
 An active, trialing, or past-due subscription puts the user on its price's tier; a canceled, unpaid, or paused one moves them back to the default tier. Events are checked against their signature and a 5-minute clock window, applied once, and in order. Every change is audited (`user.tier_changed` with `source: stripe`, `billing.subscription_synced`); events botd can't place are audited as `billing.event_ignored`. A subscription event replaces a tier an admin set by hand.
 
