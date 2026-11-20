@@ -31,7 +31,7 @@ async fn a_fresh_install_reports_what_it_lacks() {
     let d = &s["domain"];
     assert_eq!((d["publicUrl"].clone(), d["scheme"].as_str(), d["ok"].as_bool()), (Value::Null, Some("direct"), Some(false)));
     let commands = d["instructions"].to_string();
-    assert!(commands.contains("install.sh | sudo bash -s -- --upgrade --domain <your-domain>") && commands.contains("./init.sh --domain <your-domain>"), "{commands}");
+    assert!(commands.contains("install.sh | sudo bash -s -- --upgrade --domain '<your-domain>' --tz ") && commands.contains("./init.sh --domain <your-domain>"), "{commands}");
     // No SSO: codes work, so nothing is waiting; templates cover every provider type.
     let si = &s["signIn"];
     assert_eq!((si["providers"].as_array().map(Vec::len), si["ok"].as_bool(), si["breakGlass"].as_bool()), (Some(0), Some(true), Some(true)));
@@ -111,7 +111,7 @@ async fn the_domain_counts_once_https_reaches_botd_through_its_proxy() {
     let (port, _, admin, _) = serve_app_with(|a| a.hosts.push("bots.example.com".into())).await;
     let d = get(port, &admin, "X-Forwarded-Proto: https\r\n").await["domain"].clone();
     assert_eq!((d["publicUrl"].as_str(), d["scheme"].as_str(), d["ok"].as_bool()), (Some("https://bots.example.com"), Some("https"), Some(true)));
-    assert!(d["instructions"].to_string().contains("install.sh | sudo bash -s -- --upgrade --domain bots.example.com"));
+    assert!(d["instructions"].to_string().contains("install.sh | sudo bash -s -- --upgrade --domain bots.example.com --tz "));
     let d = get(port, &admin, "X-Forwarded-Proto: http\r\n").await["domain"].clone();
     assert_eq!((d["scheme"].as_str(), d["ok"].as_bool()), (Some("http"), Some(false)));
     assert!(d["detail"].as_str().unwrap().contains("plain HTTP") && d["httpsChecked"] == true, "{d}");

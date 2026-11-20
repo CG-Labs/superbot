@@ -95,6 +95,28 @@ fn step(title: &str, text: impl Into<String>, commands: &[String]) -> Value {
     json!({ "title": title, "text": text.into(), "commands": commands })
 }
 
+/// The one-command installer, which needs no checkout. Re-running it resets TZ and
+/// USER_NAME to the flags given (else UTC and Owner), so it passes botd's own.
+fn installer_command(domain: &str) -> String {
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    let tz = env("TZ").unwrap_or_else(|| "UTC".into());
+    let name = env("USER_NAME").unwrap_or_else(|| "Owner".into());
+    format!(
+        "curl -fsSL https://raw.githubusercontent.com/CG-Labs/superbot/main/deploy/install.sh | sudo bash -s -- --upgrade --domain {} --tz {} --user-name {}",
+        sh_quote(domain),
+        sh_quote(&tz),
+        sh_quote(&name)
+    )
+}
+
+fn sh_quote(s: &str) -> String {
+    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "._-/:+@".contains(c)) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
 /// Restarting botd, for settings it reads only at startup.
 fn restart() -> Vec<Value> {
     vec![
@@ -124,8 +146,8 @@ fn domain_view(a: &Auth, host: &str, scheme: &str, on_this_machine: bool) -> Val
         step("DNS", format!("Point an A (and AAAA) record for {shown} at this server, and open ports 80 and 443."), &[]),
         step(
             "Bash installer",
-            "Re-run the installer with the domain. It pulls the latest main and rebuilds, sets ALLOWED_HOSTS and CORS_ORIGINS in .env, writes Caddy's config, and restarts botd. Caddy gets the certificate.",
-            &[format!("curl -fsSL https://raw.githubusercontent.com/CG-Labs/superbot/main/deploy/install.sh | sudo bash -s -- --upgrade --domain {shown}")],
+            "Re-run the installer with the domain. It pulls the latest main and rebuilds, sets ALLOWED_HOSTS and CORS_ORIGINS in .env, writes Caddy's config, and restarts botd. Caddy gets the certificate. It also resets TZ and USER_NAME, so this passes botd's current ones.",
+            &[installer_command(&shown)],
         ),
         step(
             "Docker Compose",
@@ -443,6 +465,16 @@ mod tests {
     }
 
     /// The `.env` lines the wizard hands out start botd once the placeholders are filled in.
+    #[test]
+    fn installer_flags_are_shell_quoted() {
+        assert_eq!(sh_quote("bots.example.com"), "bots.example.com");
+        assert_eq!(sh_quote("Europe/Jersey"), "Europe/Jersey");
+        assert_eq!(sh_quote("<your-domain>"), "'<your-domain>'");
+        assert_eq!(sh_quote("Alex O'Neil"), r"'Alex O'\''Neil'");
+        assert_eq!(sh_quote("$(id)"), "'$(id)'");
+        assert_eq!(sh_quote(""), "''");
+    }
+
     #[test]
     fn provider_templates_are_valid_settings() {
         let fill = [
