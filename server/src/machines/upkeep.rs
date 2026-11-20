@@ -21,13 +21,12 @@ use crate::audit::{Outcome, Who};
 use crate::db::{Machine, now};
 use crate::runner::App;
 use crate::users::need_user_key;
-use crate::{ApiError, AppState, Auth, Res};
+use crate::{ApiError, AppState, Res};
 use axum::Json;
 use axum::extract::{Extension, Path, State as AppS};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 /// botd's version, and so that of the agent it ships.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -358,6 +357,11 @@ fn view(e: &Enrollment, m: &Machine) -> Value {
     })
 }
 
+/// The control plane from botd's own state, never from the request.
+fn control_plane(app: &App) -> Res<&ControlPlane> {
+    app.control_plane.get().map(|cp| &**cp).ok_or_else(|| ApiError(StatusCode::SERVICE_UNAVAILABLE, super::NOT_CONFIGURED.into()))
+}
+
 fn need_machine(app: &AppState, key: &str) -> Res<Machine> {
     let u = need_user_key(app, key)?;
     app.db.user_machine(&u.id).ok_or_else(|| crate::not_found("Machine"))
@@ -375,8 +379,8 @@ async fn fresh(app: &App, e: &Enrollment, m: &Machine) -> Res<Heartbeat> {
 
 /// `GET /api/users/{key}/machine/agent`: its agent's build, harnesses and upgrades,
 /// as last heard, against botd's.
-pub async fn get(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>, Path(key): Path<String>) -> Res {
-    let e = enroll::need(&a.machines)?;
+pub async fn get(AppS(app): AppS<AppState>, Path(key): Path<String>) -> Res {
+    let e = enroll::need(control_plane(&app)?)?;
     let m = need_machine(&app, &key)?;
     Ok(Json(view(e, &m)))
 }
@@ -385,14 +389,14 @@ pub async fn get(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>, 
 /// now, even one that failed before. 202; the audit log and `GET` say how it went.
 pub async fn upgrade_now(
     AppS(app): AppS<AppState>,
-    Extension(a): Extension<Arc<Auth>>,
     Extension(by): Extension<Who>,
     Path(key): Path<String>,
 ) -> Res<(StatusCode, Json<Value>)> {
-    let e = enroll::need(&a.machines)?;
+    let cp = control_plane(&app)?;
+    let e = enroll::need(cp)?;
     let m = need_machine(&app, &key)?;
     let hb = fresh(&app, e, &m).await?;
-    upgrade(&app, &a.machines, e, &m, &hb, Some(&by)).await?;
+    upgrade(&app, cp, e, &m, &hb, Some(&by)).await?;
     let m = app.db.machine(&m.id).unwrap_or(m);
     Ok((StatusCode::ACCEPTED, Json(view(e, &m))))
 }
@@ -400,11 +404,10 @@ pub async fn upgrade_now(
 /// `PUT /api/users/{key}/machine/agent/hold`: nothing upgrades its agent until released.
 pub async fn hold(
     AppS(app): AppS<AppState>,
-    Extension(a): Extension<Arc<Auth>>,
     Extension(by): Extension<Who>,
     Path(key): Path<String>,
 ) -> Res {
-    let e = enroll::need(&a.machines)?;
+    let e = enroll::need(control_plane(&app)?)?;
     let m = need_machine(&app, &key)?;
     if app.db.machine_upgrade_hold(&m.id, Some(by.actor.id.as_deref())) {
         app.db.record(&event(&by, "machine.agent_upgrade_held", &m, json!({ "build": m.agent_upkeep.as_ref().map(|u| u["build"].clone()) })));
@@ -416,11 +419,10 @@ pub async fn hold(
 /// a build that failed before may be tried again.
 pub async fn release(
     AppS(app): AppS<AppState>,
-    Extension(a): Extension<Arc<Auth>>,
     Extension(by): Extension<Who>,
     Path(key): Path<String>,
 ) -> Res {
-    let e = enroll::need(&a.machines)?;
+    let e = enroll::need(control_plane(&app)?)?;
     let m = need_machine(&app, &key)?;
     if app.db.machine_upgrade_hold(&m.id, None) {
         app.db.machine_upgrade_forget_failure(&m.id);
@@ -433,11 +435,10 @@ pub async fn release(
 /// harnesses that failed are tried again.
 pub async fn harnesses_now(
     AppS(app): AppS<AppState>,
-    Extension(a): Extension<Arc<Auth>>,
     Extension(by): Extension<Who>,
     Path(key): Path<String>,
 ) -> Res<(StatusCode, Json<Value>)> {
-    let e = enroll::need(&a.machines)?;
+    let e = enroll::need(control_plane(&app)?)?;
     let plan = e
         .upkeep
         .plan
