@@ -146,7 +146,7 @@ pub struct ControlPlane {
     pub label_prefix: String,
     pub authorized_keys: Vec<String>,
     pub reconcile_every: Duration,
-    /// MACHINE_ROUTING (ADR 0029, ADR 0034): off, the default, runs every Bot on this
+    /// MACHINE_ROUTING (ADR 0029, ADR 0036): off, the default, runs every Bot on this
     /// server; `assigned` runs assigned users' Bots on their machine and others' here;
     /// `on` runs Bots only on their owner's assigned machine.
     pub routing: route::Routing,
@@ -1206,7 +1206,7 @@ pub async fn mine(
     Ok(Json(own_view(&m)))
 }
 
-// Placement (ADR 0034): which users' Bots run on their machine.
+// Placement (ADR 0036): which users' Bots run on their machine.
 
 /// Where a user's Bots run now, and why, as admins see it.
 fn placement_view(app: &App, cp: &ControlPlane, user_id: &str) -> Value {

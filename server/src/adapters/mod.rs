@@ -1,7 +1,7 @@
 //! The only contract between the server and a harness (Claude Code, Codex, Pi, Hermes).
 //! Each adapter builds a command line (with the files it needs and how to stop what it
 //! leaves running) and maps the harness's JSON lines to `AgentEvent`s. The command
-//! runs here or on the Bot owner's machine (`machines::job`, ADR 0034); either way the
+//! runs here or on the Bot owner's machine (`machines::job`, ADR 0036); either way the
 //! lines come back here, so adapters never run anywhere but botd.
 
 mod claude;

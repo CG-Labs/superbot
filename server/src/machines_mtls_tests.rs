@@ -1,6 +1,6 @@
 //! Enrollment and mutual TLS between botd and a machine agent (ADR 0031), end to end on
 //! loopback: the real router, botd's machine port, and the real agent, with the
-//! in-memory provider. Nothing here talks to Linode. Bot runs on a machine (ADR 0034)
+//! in-memory provider. Nothing here talks to Linode. Bot runs on a machine (ADR 0036)
 //! go through the real agent too, with a stand-in harness on its PATH.
 
 use crate::machines::agent::{self, Agent, Config, Identity};

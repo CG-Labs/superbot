@@ -1,4 +1,4 @@
-//! The machine agent (`superbot-machine`, ADR 0031, ADR 0034): it enrolls with the
+//! The machine agent (`superbot-machine`, ADR 0031, ADR 0036): it enrolls with the
 //! control plane, keeps its certificate fresh, and answers botd over mutual TLS: a
 //! heartbeat, and jobs, each one harness run for one of its user's Bots, streamed
 //! back as it happens. It knows nothing of harnesses: botd builds each command. Bots

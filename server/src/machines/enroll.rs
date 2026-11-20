@@ -1024,7 +1024,7 @@ async fn read_capped(r: &mut reqwest::Response, max: usize) -> Option<Vec<u8>> {
 }
 
 /// Hands jobs to a user's machine over mutual TLS, to that machine's own pinned
-/// certificate only, and streams back what happens (ADR 0034).
+/// certificate only, and streams back what happens (ADR 0036).
 pub struct Mtls(pub Arc<Enrollment>);
 
 impl Mtls {

@@ -46,7 +46,7 @@ impl App {
     /// The Bot's workspace is its owner's folder, so deleting in another user's folder
     /// counts as outside it (ADR 0029).
     pub fn policy_ctx(&self, bot: &Bot) -> Ctx {
-        // A run on the owner's machine is judged by that machine's folders (ADR 0034).
+        // A run on the owner's machine is judged by that machine's folders (ADR 0036).
         if let Some(ctx) = self.run_ctx(&bot.id) {
             return ctx;
         }

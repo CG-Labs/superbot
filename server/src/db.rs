@@ -372,7 +372,7 @@ pub struct Machine {
     pub agent_seen_at: Option<i64>,
     pub agent_version: Option<String>,
     pub agent_error: Option<String>,
-    /// When an admin assigned it to its user, so their Bots run on it (ADR 0034).
+    /// When an admin assigned it to its user, so their Bots run on it (ADR 0036).
     pub assigned_at: Option<i64>,
     pub assigned_by: Option<String>,
 }
@@ -868,7 +868,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 13] = [
     migrate_machine_enrollment,
     migrate_machine_placement,
 ];
-/// Placement (ADR 0034): an admin assigns a user's machine to them, and then that
+/// Placement (ADR 0036): an admin assigns a user's machine to them, and then that
 /// user's Bots run there. Kept on the machine row, so a user can only be placed on
 /// their own machine, and destroying it ends the placement.
 fn migrate_machine_placement(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
@@ -2816,7 +2816,7 @@ impl Db {
         }
     }
 
-    /// Places the machine's user on it: their Bots run there (ADR 0034). Only a live
+    /// Places the machine's user on it: their Bots run there (ADR 0036). Only a live
     /// machine. Returns whether it changed.
     pub fn assign_machine(&self, machine_id: &str, by: Option<&str>) -> bool {
         self.c()

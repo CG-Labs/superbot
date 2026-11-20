@@ -136,7 +136,7 @@ botctl machine placement [<user>]  # where each user's Bots run, and why
 botctl machine unassign <user>     # back to this server (with MACHINE_ROUTING=assigned)
 ```
 
-An assigned user's Bots run only on their machine. If it is down, suspended, outdated, or missing the Bot's harness, the Bot says so and nothing runs here instead. New machines download `botctl` from botd as well as the agent, so keep `botctl` next to `botd` (the installer and image do). On the machine, Bots reach botd through the agent on `127.0.0.1:7444` (loopback only; no new firewall rule). The harness CLIs themselves aren't installed on machines yet. Design: [ADR 0034](../docs/adr/0034-bots-on-the-users-machine.md).
+An assigned user's Bots run only on their machine. If it is down, suspended, outdated, or missing the Bot's harness, the Bot says so and nothing runs here instead. New machines download `botctl` from botd as well as the agent, so keep `botctl` next to `botd` (the installer and image do). On the machine, Bots reach botd through the agent on `127.0.0.1:7444` (loopback only; no new firewall rule). The harness CLIs themselves aren't installed on machines yet. Design: [ADR 0036](../docs/adr/0036-bots-on-the-users-machine.md).
 
 ## Approvals after an upgrade
 

@@ -1,4 +1,4 @@
-//! What the control plane and a machine agent send each other (ADR 0031, ADR 0034).
+//! What the control plane and a machine agent send each other (ADR 0031, ADR 0036).
 //! Shared by botd and `superbot-machine`.
 //!
 //! botd's machine port (MACHINE_CONTROL_URL):

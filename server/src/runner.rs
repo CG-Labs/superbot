@@ -50,7 +50,7 @@ struct Run {
     ctx: Option<Ctx>,
 }
 
-/// Where a run happens: here, or on its owner's machine (ADR 0034).
+/// Where a run happens: here, or on its owner's machine (ADR 0036).
 enum Place {
     Here,
     There(Box<(Assigned, wire::Layout)>),

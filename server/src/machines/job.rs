@@ -1,4 +1,4 @@
-//! Runs one harness job (ADR 0034): stops what the harness left running, writes its
+//! Runs one harness job (ADR 0036): stops what the harness left running, writes its
 //! files, starts it, and reports what happens as `JobEvent`s. botd runs Bots on this
 //! server with it, and the machine agent runs them on a user's machine, so both
 //! behave the same. Shared by both binaries, so it uses nothing of botd's but `wire`.

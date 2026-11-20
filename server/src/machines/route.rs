@@ -1,4 +1,4 @@
-//! Where a Bot's work runs (ADR 0029, ADR 0034). Each user has one computer, and all of
+//! Where a Bot's work runs (ADR 0029, ADR 0036). Each user has one computer, and all of
 //! their Bots share it. `MACHINE_ROUTING` picks:
 //! - `off` (the default, and self-hosting): every Bot runs on this server, in its
 //!   owner's folders.
