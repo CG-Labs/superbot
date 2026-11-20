@@ -1,5 +1,5 @@
 import React from "react";
-import { render, screen, userEvent } from "@testing-library/react-native";
+import { act, render, screen, userEvent } from "@testing-library/react-native";
 import { SecretsView } from "../SecretsView";
 import SecretsScreen from "../../app/secrets";
 import { ApiError } from "../../src/api";
@@ -132,6 +132,28 @@ describe("SecretsView (ADR 0044)", () => {
     await user.type(screen.getByLabelText("Secret value"), "v");
     await user.press(screen.getByRole("button", { name: "Save secret" }));
     expect(await screen.findByText("OPENAI_API_KEY is SuperBot's own; no Bot gets it.")).toBeOnTheScreen();
+    expect(screen.getByLabelText("Secret value").props.value).toBe("");
+    expect(screen.getByLabelText("Secret name").props.value).toBe("OPENAI_API_KEY");
+  });
+
+  it("clears the value as it is sent and locks the form until the server answers", async () => {
+    const api = fakeApi();
+    let answer: () => void = () => {};
+    api.setMySecret.mockImplementationOnce(
+      (name: string) => new Promise((resolve) => (answer = () => resolve({ name, createdAt: NOV20, updatedAt: NOV20, overrides: false }))),
+    );
+    const user = userEvent.setup();
+    await render(<SecretsView api={api} onBack={jest.fn()} canWrite />);
+    await user.type(await screen.findByLabelText("Secret name"), "GITHUB_TOKEN");
+    await user.type(screen.getByLabelText("Secret value"), "ghp-123");
+    await user.press(screen.getByRole("button", { name: "Save secret" }));
+    expect(api.setMySecret).toHaveBeenCalledWith("GITHUB_TOKEN", "ghp-123");
+    expect(screen.getByLabelText("Secret value").props.value).toBe("");
+    expect(screen.getByLabelText("Secret value").props.editable).toBe(false);
+    expect(screen.getByLabelText("Secret name").props.editable).toBe(false);
+    await act(async () => answer());
+    expect(await screen.findByText(/Saved GITHUB_TOKEN/)).toBeOnTheScreen();
+    expect(screen.getByLabelText("Secret name").props.editable).toBe(true);
   });
 
   it("says so when the list can't load", async () => {

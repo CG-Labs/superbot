@@ -58,11 +58,15 @@ export function SecretsView({ api, onBack, canWrite, confirm = confirmAsync }: P
       setError(bad);
       return;
     }
+    // The value leaves the screen as it is sent, whatever the server answers; a refused
+    // one is pasted again. The form is locked until then, so no newer draft is lost.
+    const sent = value;
+    setValue("");
     setBusy("save");
     setError(null);
     setNotice(null);
     try {
-      const saved = await api.setMySecret(target, value);
+      const saved = await api.setMySecret(target, sent);
       resetForm();
       setNotice(exists ? `Replaced ${saved.name}. Your Bots get the new value on their next run.` : `Saved ${saved.name}. Your Bots get it on their next run.`);
       await load();
@@ -179,6 +183,7 @@ export function SecretsView({ api, onBack, canWrite, confirm = confirmAsync }: P
                 onChangeText={setName}
                 onBlur={() => setName((n) => normalizeSecretName(n))}
                 autoCapitalize="characters"
+                editable={!busy}
                 autoCorrect={false}
                 accessibilityLabel="Secret name"
               />
@@ -190,6 +195,7 @@ export function SecretsView({ api, onBack, canWrite, confirm = confirmAsync }: P
               value={value}
               onChangeText={setValue}
               secureTextEntry
+              editable={!busy}
               autoCapitalize="none"
               autoCorrect={false}
               autoComplete="off"
@@ -209,7 +215,7 @@ export function SecretsView({ api, onBack, canWrite, confirm = confirmAsync }: P
                 <Text style={styles.primaryText}>{busy === "save" ? "Saving…" : exists ? "Replace" : "Save"}</Text>
               </Pressable>
               {replacing ? (
-                <Pressable style={styles.btn} onPress={resetForm} accessibilityRole="button">
+                <Pressable style={[styles.btn, !!busy && styles.busy]} disabled={!!busy} onPress={resetForm} accessibilityRole="button">
                   <Text style={styles.btnText}>Cancel</Text>
                 </Pressable>
               ) : null}

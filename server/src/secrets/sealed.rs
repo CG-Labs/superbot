@@ -383,16 +383,21 @@ impl UserSecrets {
         s.query_map([user_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(store_err)?.collect::<rusqlite::Result<_>>().map_err(store_err)
     }
 
-    pub fn put(&self, user_id: &str, name: &str, value: &str) -> Result<(), Error> {
+    /// True if it replaced a value the user already had. Checked and written under one
+    /// lock and transaction, so two first saves can't both say they were first.
+    pub fn put(&self, user_id: &str, name: &str, value: &str) -> Result<bool, Error> {
         let sealed = self.cipher.seal(&user_context(user_id, name), value.as_bytes());
-        self.c()
-            .execute(
-                "INSERT INTO user_secrets (user_id, name, value, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)
-                 ON CONFLICT(user_id, name) DO UPDATE SET value = ?3, updated_at = ?4",
-                params![user_id, name, sealed, crate::db::now()],
-            )
-            .map_err(store_err)?;
-        Ok(())
+        let mut c = self.c();
+        let tx = c.transaction().map_err(store_err)?;
+        let existed = tx.query_row("SELECT 1 FROM user_secrets WHERE user_id = ? AND name = ?", [user_id, name], |_| Ok(())).optional().map_err(store_err)?.is_some();
+        tx.execute(
+            "INSERT INTO user_secrets (user_id, name, value, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(user_id, name) DO UPDATE SET value = ?3, updated_at = ?4",
+            params![user_id, name, sealed, crate::db::now()],
+        )
+        .map_err(store_err)?;
+        tx.commit().map_err(store_err)?;
+        Ok(existed)
     }
 
     /// True if the user had it.
@@ -485,7 +490,9 @@ mod tests {
         assert_eq!(s.names("ua").unwrap().into_iter().map(|(n, ..)| n).collect::<Vec<_>>(), ["ANTHROPIC_API_KEY"]);
         // Replacing a value keeps when it was first saved.
         s.c().execute("UPDATE user_secrets SET created_at = 1, updated_at = 1 WHERE user_id = 'ub' AND name = 'OPENAI_API_KEY'", []).unwrap();
-        s.put("ub", "OPENAI_API_KEY", "b-openai-2").unwrap();
+        assert!(s.put("ub", "OPENAI_API_KEY", "b-openai-2").unwrap(), "says it replaced one");
+        assert!(!s.put("ua", "OPENAI_API_KEY", "a-openai").unwrap(), "B's isn't A's to replace");
+        assert!(s.delete("ua", "OPENAI_API_KEY").unwrap());
         let (_, created, updated) = s.names("ub").unwrap().into_iter().find(|(n, ..)| n == "OPENAI_API_KEY").unwrap();
         assert!(created == 1 && updated > 1, "{created} {updated}");
         assert_eq!(s.get("ub", "OPENAI_API_KEY").unwrap().unwrap().expose(), "b-openai-2");

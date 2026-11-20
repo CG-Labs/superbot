@@ -201,20 +201,21 @@ impl Secrets {
             .collect())
     }
 
-    /// Whether `user_id` already saved `name`.
-    pub fn user_has(&self, user_id: &str, name: &str) -> Result<bool, Error> {
-        Ok(self.users()?.names(user_id)?.iter().any(|(n, ..)| n == name))
+    #[cfg(test)]
+    pub fn user_put(&self, user_id: &str, name: &str, value: &str) -> Result<UserListed, Error> {
+        Ok(self.user_save(user_id, name, value)?.0)
     }
 
     /// Saves a secret that reaches only `user_id`'s Bots, over a server-wide one of the
-    /// same name. botd's own secrets can't be saved here: no Bot may get them.
-    pub fn user_put(&self, user_id: &str, name: &str, value: &str) -> Result<UserListed, Error> {
+    /// same name, and says whether it replaced one the user had. botd's own secrets
+    /// can't be saved here: no Bot may get them.
+    pub fn user_save(&self, user_id: &str, name: &str, value: &str) -> Result<(UserListed, bool), Error> {
         check_user_name(name)?;
         check_value(value)?;
         redact::register_for(user_id, value);
-        let users = self.users()?;
-        users.put(user_id, name, value)?;
-        self.user_list(user_id)?.into_iter().find(|l| l.name == name).ok_or_else(|| Error::Store(format!("{name} was not saved")))
+        let replaced = self.users()?.put(user_id, name, value)?;
+        let listed = self.user_list(user_id)?.into_iter().find(|l| l.name == name).ok_or_else(|| Error::Store(format!("{name} was not saved")))?;
+        Ok((listed, replaced))
     }
 
     pub fn user_delete(&self, user_id: &str, name: &str) -> Result<bool, Error> {
