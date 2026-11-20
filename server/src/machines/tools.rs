@@ -77,7 +77,7 @@ impl Drop for JobPermit {
 }
 
 /// An install's hold on the tools: no job starts until it is dropped.
-struct Replacing<'a>(&'a Tools);
+pub(crate) struct Replacing<'a>(&'a Tools);
 
 impl Drop for Replacing<'_> {
     fn drop(&mut self) {
@@ -264,7 +264,7 @@ impl Tools {
     }
 
     /// Waits until no job is running, then keeps new ones from starting.
-    async fn replacing(&self) -> Replacing<'_> {
+    pub(crate) async fn replacing(&self) -> Replacing<'_> {
         loop {
             let open = self.gate_open.notified();
             tokio::pin!(open);

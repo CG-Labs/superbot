@@ -788,14 +788,22 @@ fn ndjson(e: &wire::JobEvent) -> Bytes {
     Bytes::from(line)
 }
 
-/// Ends a job's registration, and the job, however its stream ends. Holds the tools
-/// it may be using until then.
-struct Running(Arc<Agent>, String, watch::Sender<bool>, #[allow(dead_code)] super::tools::JobPermit);
+/// A job's registration and its hold on the tools, kept until the harness has exited
+/// and its cleanup has run, however the job ends.
+struct Running(Arc<Agent>, String, #[allow(dead_code)] super::tools::JobPermit);
 
 impl Drop for Running {
     fn drop(&mut self) {
-        let _ = self.2.send(true);
         self.0.jobs().remove(&self.1);
+    }
+}
+
+/// Stops the job when its stream ends.
+struct StopOnDrop(watch::Sender<bool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
     }
 }
 
@@ -836,7 +844,8 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
         jobs.insert(j.job_id.clone(), stop_tx.clone());
         permit
     };
-    let running = Running(a.clone(), j.job_id.clone(), stop_tx, permit);
+    let running = Running(a.clone(), j.job_id.clone(), permit);
+    let stop = StopOnDrop(stop_tx);
     for dir in [a.cfg.home.join("work"), a.cfg.home.join("bots")] {
         let _ = std::fs::DirBuilder::new()
             .recursive(true)
@@ -846,6 +855,7 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
     let (ev_tx, mut ev_rx) = mpsc::channel::<wire::JobEvent>(256);
     let host = a.cfg.host();
     tokio::spawn(async move {
+        let _running = running;
         let abort = async move {
             let _ = stop_rx.wait_for(|s| *s).await;
         };
@@ -854,7 +864,7 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
     let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     tokio::spawn(async move {
         // Held until the stream ends: dropping it stops the job.
-        let _running = running;
+        let _stop = stop;
         loop {
             let next = tokio::time::timeout(PING_EVERY, ev_rx.recv()).await;
             let line = match next {

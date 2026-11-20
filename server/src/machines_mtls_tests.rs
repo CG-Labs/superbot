@@ -1447,6 +1447,69 @@ async fn stopping_a_bot_ends_its_run_on_the_machine() {
     assert_eq!(finished["details"]["result"], "stopped", "{finished}");
 }
 
+/// A harness that streams until it's stopped, takes a second to stop, and whose
+/// `cleanup` takes another.
+const CHATTY: &str = r#"#!/bin/sh
+if [ "$1" = cleanup ]; then sleep 1; touch "$HOME/cleaned"; exit 0; fi
+trap 'sleep 1; touch "$HOME/stopped"; exit 0' TERM
+echo $$ > "$HOME/harness.pid"
+touch "$HOME/run.env"
+while :; do echo '{}'; sleep 0.05; done
+"#;
+
+fn alive(pid: &str) -> bool {
+    std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
+        .is_ok_and(|s| s.rsplit(')').next().is_some_and(|r| !r.trim_start().starts_with('Z')))
+}
+
+#[tokio::test]
+async fn an_install_waits_until_a_stopped_job_has_exited_and_cleaned_up() {
+    let mut env = serve().await;
+    let (uid, mid, token) = machine_for(&env, "ada@example.com").await;
+    let m = agent_with(&mut env, &mid, &token, CHATTY).await;
+    let Ok(Target::Machine(to)) = env.cp.route(&env.app.db, &uid) else {
+        panic!("Ada's machine")
+    };
+    // botd goes away mid-run, so its stream to the agent drops; or a Bot is stopped.
+    for dropped in [true, false] {
+        for f in ["harness.pid", "run.env", "stopped", "cleaned"] {
+            let _ = std::fs::remove_file(m.home.join(f));
+        }
+        let job: wire::JobRequest = serde_json::from_value(json!({
+            "protocol": wire::PROTOCOL, "jobId": format!("j-{dropped}"), "botId": "b1", "ownerId": uid,
+            "messageId": 1, "bin": "claude", "args": [], "env": {}, "cwd": m.home.join("work"),
+            "stdin": null, "files": [],
+            "cleanup": { "whenExists": m.home.join("run.env"), "bin": "claude", "args": ["cleanup"],
+                         "env": {}, "cwd": m.home.join("work"), "timeoutSecs": 10 },
+            "collect": []
+        }))
+        .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let (abort_tx, abort) = tokio::sync::watch::channel(None);
+        let (link, to) = (env.cp.link.clone(), to.clone());
+        let stream = tokio::spawn(async move { link.run(&to, job, abort, tx).await });
+        let pid = wait_for_file(&m.home.join("harness.pid")).await;
+        assert_eq!(m.agent.running(), 1);
+        if dropped {
+            stream.abort();
+        } else {
+            abort_tx.send(Some("stopped")).unwrap();
+        }
+        let (tools, home) = (m.agent.tools.clone(), m.home.clone());
+        let install = tokio::spawn(async move {
+            let _r = tools.replacing().await;
+            ["stopped", "cleaned"].map(|f| home.join(f).exists()) == [true, true] && !alive(&pid)
+        });
+        let waited = tokio::time::timeout(Duration::from_secs(20), install)
+            .await
+            .expect("the install got its turn")
+            .unwrap();
+        assert!(waited, "dropped {dropped}: the install waited for the harness to exit and its cleanup");
+        assert_eq!(m.agent.running(), 0);
+    }
+}
+
 #[tokio::test]
 async fn botd_stops_listening_to_a_machine_that_floods_it() {
     let mut env = serve().await;
