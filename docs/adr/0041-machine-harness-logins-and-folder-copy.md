@@ -39,6 +39,8 @@ How a login runs:
 5. Lines the person types go to `POST .../harness-login/{id}/input`, then to the agent, then into the terminal. botd never stores them. The audit records only how many characters were sent.
 6. When the CLI exits, or the timeout passes, or someone stops it (`DELETE .../harness-login/{id}`), the agent ends the whole process group. It then reports whether the credential file now exists. If the caller goes away, botd stops the login on the machine.
 
+A running login counts like a job: the agent refuses an upgrade while one runs, the heartbeat's `jobs` count includes it (so botd doesn't send one), and it holds off harness updates. No login starts while an upgrade is being staged.
+
 The heartbeat says whether each login exists. botd sends `cred=<harness>:<file>` in the heartbeat query, and the agent answers `logins: {harness: {state, since}}`:
 
 - `state` is `logged_in` (a non-empty regular file, not a link), `logged_out`, or `logging_in`;
@@ -68,15 +70,15 @@ When it runs:
 
 How a copy runs, over the pinned mutual-TLS channel:
 
-1. botd checks the agent `can` do `sync`. It lists the files, opening each without following links, and hashes each one with SHA-256.
+1. botd checks the agent `can` do `sync`. It lists the files and hashes each one with SHA-256. It never follows a link: not at the folder itself, not at any folder below it, and not at a file. It opens each folder and file by name inside the folder it already opened (`openat` with `O_NOFOLLOW`), and opens files non-blocking so a FIFO can't stall it. It notes each file's device and inode. With per-user accounts (`ISOLATION=users`) the user's own processes can change their folder during a copy, so this keeps a swapped-in link from sending a server file.
 2. botd sends `POST /v1/sync` with the manifest (path, size, SHA-256, executable bit, whether it is a seed). The agent checks every path is under `work/`, or is `USER.md` or `bots/<id>/MEMORY.md`. It then answers which contents it still needs, and how many bytes of each it already holds.
-3. botd sends those contents in 4 MiB chunks: `PUT /v1/sync/{id}/blobs/{sha256}?offset=`. The agent stores them under its state folder, by hash. A chunk at the wrong offset gets 409 with the right one. Once a content is whole, it is checked against its SHA-256; a mismatch gets 422 and is dropped. So a copy that is cut short picks up where it stopped. Leftover chunks are dropped after a week.
-4. botd sends `POST /v1/sync/{id}/finish`. The agent places each file: it writes a temporary file (owner-only, never through a link), checks it against the SHA-256 again, then renames it into place. The agent records in `synced.json` what it wrote.
+3. botd sends those contents in 4 MiB chunks: `PUT /v1/sync/{id}/blobs/{sha256}?offset=`. It opens each file again the same way and sends it only if it is the same device and inode; otherwise the copy fails with `source_changed`. An empty content, or one the agent already holds whole, is sent as one empty chunk, so the agent checks and keeps it. The agent stores them under its state folder, by hash. A chunk at the wrong offset gets 409 with the right one. Once a content is whole, it is checked against its SHA-256; a mismatch gets 422 and is dropped. So a copy that is cut short picks up where it stopped. Leftover chunks are dropped after a week.
+4. botd sends `POST /v1/sync/{id}/finish`. The agent places each file: it writes a temporary file with a new random name (owner-only, created new, never through a link, and never removing anything already there), checks it against the SHA-256 again, then renames it into place. Just before the rename, it checks the file there is still the one it looked at (inode, size, mode, change times). If nothing was there, the rename refuses to replace a file made meanwhile (`RENAME_NOREPLACE`). Either way, an edit made while the copy runs is kept and listed as a conflict. The agent records in `synced.json` the hash and exec bit of what it wrote.
 5. The rules for each file:
    - Missing on the machine: written.
    - Already the same: left alone (`unchanged`).
-   - Unchanged since the last copy: replaced.
-   - Changed on the machine since the last copy: kept, and listed as a conflict.
+   - Unchanged since the last copy: replaced. If only the exec bit changed on the server, only that bit is changed there.
+   - Changed on the machine since the last copy, content or exec bit: kept, and listed as a conflict.
    - A seed the machine already has: kept.
    - Nothing on the machine is ever deleted.
 6. The agent returns a report: copied, unchanged, seeded, kept, conflicts (the first 50), and bytes. botd stores the status in its settings table (`machine_folder_sync:<machine id>`). `GET .../folder-sync` (`botctl machine folder <user>`) shows it.
@@ -114,18 +116,19 @@ botd stays the source of truth for memory and facts. Jobs still carry `MEMORY.md
 - A user's own Claude Code or Codex subscription works on their machine. The credentials stay there: on the machine's disk, and in its Linode backups (`MACHINE_BACKUPS`).
 - Turning logins on refuses routed `claude` and `codex` runs of users who have neither a login there nor a key. Turn it on once those users can log in.
 - The agent runs as root and so do Bots there (ADR 0036). The link and path checks on landing files are a guard against mistakes, not a security boundary against a Bot on that same machine.
+- The check before a rename and the rename are two steps, so an edit landing in that instant can still be replaced. Writes into a file someone holds open are not caught either. Both are far narrower than a whole copy, and the next copy lists the file as a conflict if it differs.
 - Codex's device-code login may need device sign-in turned on in the person's ChatGPT security settings.
 - Tests run the real agent over real mutual TLS on loopback, with a stand-in `claude` whose login reads a code in its terminal. They cover:
   - a run refused before the login, the login through the API with typed input, the run going ahead after, then logout and refusal again;
   - a key in the user's secrets being enough;
   - the code and the credentials never reaching botd's audit or database;
-  - stopping a login, and harnesses with no login;
-  - the copy on assign: files, the exec bit, skipped links, seeds;
+  - stopping a login, a login counting as busy for upgrades, and harnesses with no login;
+  - the copy on assign: files (an empty one too), the exec bit, skipped links, seeds;
   - a second copy that sends nothing, a conflict kept on the machine, and a too-big folder;
   - an offline machine that is retried;
   - everything being off by default.
 
-  Agent unit tests cover the terminal (no echo), resuming chunks, hash mismatches, and refusing paths outside the allowed ones or through links.
+  Agent unit tests cover the terminal (no echo), resuming chunks, hash mismatches, empty files, exec bit changes, an edit made while placing being kept, temporary names that never remove what's there, and refusing paths outside the allowed ones or through links. botd unit tests cover listing without following links, and refusing a file swapped for a link or another file before it is sent.
 
 ## Not in this slice
 

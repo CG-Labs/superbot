@@ -241,7 +241,7 @@ botctl machine sync <user>                  # copy their folder again now
 
 The login runs on the machine. Its sign-in link or code shows in your terminal, and the credentials stay on the machine. With logins on, a Bot whose harness isn't logged in there, and whose owner has no API key for it, says so and doesn't run. Pi and Hermes keep using API keys.
 
-The folder copy sends only what the machine doesn't have. Each file is checked by SHA-256, and a copy cut short picks up where it stopped. Files changed on the machine are kept, and nothing there is deleted. Bots wait for the first copy. Each step is audited as `machine.harness_login*` and `machine.folder_sync_*`. Design: [ADR 0041](../docs/adr/0041-machine-harness-logins-and-folder-copy.md).
+The folder copy sends only what the machine doesn't have. Each file is checked by SHA-256, and a copy cut short picks up where it stopped. Links are never followed. Files changed on the machine, even during the copy, are kept, and nothing there is deleted. Bots wait for the first copy, and agent upgrades wait for a running login. Each step is audited as `machine.harness_login*` and `machine.folder_sync_*`. Design: [ADR 0041](../docs/adr/0041-machine-harness-logins-and-folder-copy.md).
 
 ## Approvals after an upgrade
 
