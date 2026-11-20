@@ -26,7 +26,7 @@ CLIENT_DIR=${CLIENT_DIR:-/var/www/superbot-app}
 SITE_DIR=${SITE_DIR:-/var/www/superbot-site}
 CLIENT_BASE_URL=/app
 BUILD_CLIENT=true
-DEPLOY_FILES=(superbot.service superbot-backup.sh superbot-backup.service superbot-backup.timer)
+DEPLOY_FILES=(superbot.service superbot-backup.sh superbot-restore.sh superbot-backup.service superbot-backup.timer)
 
 log() { printf '==> %s\n' "$*"; }
 warn() { printf '!! %s\n' "$*" >&2; }
@@ -237,6 +237,8 @@ install_packages() {
   run apt-get install -y -qq \
     build-essential pkg-config libssl-dev git curl sqlite3 ca-certificates \
     debian-keyring debian-archive-keyring apt-transport-https rsync gnupg openssl
+  # Optional: encrypts backups when SUPERBOT_BACKUP_AGE_RECIPIENTS is set (Ubuntu universe).
+  run apt-get install -y -qq age || warn "Could not install age: encrypted backups are unavailable"
 }
 
 install_node() {
@@ -608,7 +610,7 @@ backup_unit_fixed() {
   local home=$1
   printf '%s\n' "User=$SUPERBOT_USER" "Group=$SUPERBOT_USER" \
     "EnvironmentFile=-$home/superbot/.env" \
-    "ExecStart=$BIN_DIR/superbot-backup $home"
+    "ExecStart=$BIN_DIR/superbot-backup --home $home"
 }
 
 install_systemd() {
@@ -632,11 +634,12 @@ install_backup() {
   home=$(user_home)
   deploy=$(trusted_deploy_dir)
   run install -m 0755 -o root -g root "$deploy/superbot-backup.sh" "$BIN_DIR/superbot-backup"
+  run install -m 0755 -o root -g root "$deploy/superbot-restore.sh" "$BIN_DIR/superbot-restore"
   if [[ "$ENABLE_BACKUP" != true ]]; then
     return
   fi
   if [[ "$DRY_RUN" == true ]]; then
-    log "[dry-run] would render $SYSTEMD_DIR/superbot-backup.{service,timer} from $deploy (User=$SUPERBOT_USER, ExecStart=$BIN_DIR/superbot-backup $home)"
+    log "[dry-run] would render $SYSTEMD_DIR/superbot-backup.{service,timer} from $deploy (User=$SUPERBOT_USER, ExecStart=$BIN_DIR/superbot-backup --home $home)"
     return
   fi
   log "Enabling daily backup timer from $deploy"
