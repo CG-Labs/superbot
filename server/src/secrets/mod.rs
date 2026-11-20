@@ -280,6 +280,16 @@ impl Secrets {
     /// those the harness already inherits (plain environment variables). So `NAME_FILE`
     /// arrives as `NAME`, and saved secrets arrive unless the environment sets the name.
     pub fn harness_env(&self) -> Vec<(String, Secret)> {
+        self.harness_env_where(false)
+    }
+
+    /// What `harness_env` leaves out because local children inherit it from botd's own
+    /// environment. A run elsewhere doesn't inherit anything, so it gets these too.
+    pub fn inherited_harness_env(&self) -> Vec<(String, Secret)> {
+        self.harness_env_where(true)
+    }
+
+    fn harness_env_where(&self, inherited: bool) -> Vec<(String, Secret)> {
         let mut seen: Vec<String> = Vec::new();
         let mut out = Vec::new();
         for s in &self.stores {
@@ -292,7 +302,7 @@ impl Secrets {
                     Ok(Some((v, from))) => {
                         // Files can change after startup, so learn the value as it is now.
                         self.learn(from, &v);
-                        if !from.inherited(&name) {
+                        if from.inherited(&name) == inherited {
                             out.push((name, v));
                         }
                     }
@@ -501,6 +511,9 @@ mod tests {
             [("NPM_TOKEN".to_string(), "npm-from-file".to_string()), ("OPENAI_API_KEY".to_string(), stored.clone())],
             "files arrive under their base name; inherited and shadowed values aren't repeated"
         );
+        let inherited: Vec<String> = s.inherited_harness_env().into_iter().map(|(k, _)| k).collect();
+        assert!(inherited.contains(&"GITHUB_TOKEN".to_string()) && !inherited.contains(&"OPENAI_API_KEY".to_string()), "{inherited:?}");
+        assert!(!inherited.iter().any(|k| k == "AUTH_PASSWORD" || k.starts_with("SUPERBOT_")), "never server secrets: {inherited:?}");
         assert_eq!(redact::text(&stored), redact::MARK, "a saved value is redacted from then on");
         let rotated = format!("npm_{}", crate::random_hex(12));
         std::fs::write(&npm, &rotated).unwrap();

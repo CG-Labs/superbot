@@ -3,14 +3,23 @@
 
 use super::{describe, new_uuid, output, str_of, Adapter, AgentEvent, ModelOption, RunInput};
 use serde_json::Value;
+use std::path::PathBuf;
 
 pub struct Pi;
 
 const GUARD_EXTENSION: &str = include_str!("pi_guard.ts");
 
+fn guard_file(input: &RunInput) -> PathBuf {
+    input.state_dir.join("superbot-guard.ts")
+}
+
 impl Adapter for Pi {
     fn bin(&self) -> &'static str {
         "pi"
+    }
+
+    fn files(&self, input: &RunInput) -> Vec<(PathBuf, String)> {
+        input.guard.iter().map(|_| (guard_file(input), GUARD_EXTENSION.to_string())).collect()
     }
 
     fn args(&mut self, input: &RunInput, out: &mut Vec<AgentEvent>) -> Vec<String> {
@@ -30,11 +39,7 @@ impl Adapter for Pi {
         }
         // Pi has no hook config, only TypeScript extensions: load a thin one that runs the gate.
         if input.guard.is_some() {
-            let path = input.state_dir.join("superbot-guard.ts");
-            if std::fs::create_dir_all(&input.state_dir).and_then(|_| std::fs::write(&path, GUARD_EXTENSION)).is_err() {
-                out.push(AgentEvent::Error("Couldn't write the approval gate for Pi.".into()));
-            }
-            a.extend(["--extension".into(), path.display().to_string()]);
+            a.extend(["--extension".into(), guard_file(input).display().to_string()]);
         }
         // A leading "@" would make pi read a file, so pad it.
         let p = &input.prompt;

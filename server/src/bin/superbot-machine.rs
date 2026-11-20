@@ -9,6 +9,8 @@
 
 #[path = "../machines/agent.rs"]
 mod agent;
+#[path = "../machines/job.rs"]
+mod job;
 #[path = "../machines/pki.rs"]
 mod pki;
 #[path = "../machines/wire.rs"]

@@ -1,19 +1,22 @@
 //! The only contract between the server and a harness (Claude Code, Codex, Pi, Hermes).
-//! Each adapter builds a command line and maps the harness's JSON lines to `AgentEvent`s.
-//! Spawning, streaming, stopping, and exit handling are shared here.
+//! Each adapter builds a command line (with the files it needs and how to stop what it
+//! leaves running) and maps the harness's JSON lines to `AgentEvent`s. The command
+//! runs here or on the Bot owner's machine (`machines::job`, ADR 0036); either way the
+//! lines come back here, so adapters never run anywhere but botd.
 
 mod claude;
 mod codex;
 mod hermes;
 mod pi;
 
+use crate::machines::job;
+use crate::machines::wire::{JobCleanup, JobEvent, JobFile, JobRequest};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::process::Command;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 pub enum AgentEvent {
     /// Harness session to resume next time.
@@ -44,7 +47,8 @@ pub struct RunInput {
     pub state_dir: PathBuf,
     /// Set in ask mode: the harness must run `command` before every tool call.
     pub guard: Option<Guard>,
-    /// With per-user accounts (ADR 0037): the account the harness runs as. None: botd's.
+    /// With per-user accounts (ADR 0037): the account the harness runs as on this
+    /// server. None: botd's. Runs on the owner's machine never use it.
     pub run_as: Option<crate::accounts::RunAs>,
 }
 
@@ -68,19 +72,24 @@ pub(crate) const SECRET_ENV: [&str; 6] =
 
 /// `SECRET_ENV`, `secrets::SERVER_SECRETS` (and their `_FILE`), and every `SSO_*`
 /// setting: sign-in config, including client secrets (ADR 0014).
-pub(crate) fn strip_secret_env(cmd: &mut std::process::Command) {
-    for k in SECRET_ENV {
-        cmd.env_remove(k);
-    }
+pub(crate) fn secret_env() -> Vec<String> {
+    let mut names: Vec<String> = SECRET_ENV.map(String::from).into();
     for k in crate::secrets::SERVER_SECRETS {
+        names.extend([k.to_string(), format!("{k}_FILE")]);
+    }
+    names.extend(std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()).filter(|k| k.starts_with("SSO_")));
+    names
+}
+
+pub(crate) fn strip_secret_env(cmd: &mut std::process::Command) {
+    for k in secret_env() {
         cmd.env_remove(k);
-        cmd.env_remove(format!("{k}_FILE"));
     }
-    for (k, _) in std::env::vars_os() {
-        if k.to_str().is_some_and(|k| k.starts_with("SSO_")) {
-            cmd.env_remove(k);
-        }
-    }
+}
+
+/// How jobs start on this server: botd's environment, without its secrets.
+pub fn local_host() -> job::Host {
+    job::Host { clear_env: false, remove: secret_env(), env: BTreeMap::new() }
 }
 
 pub trait Adapter: Send {
@@ -103,10 +112,19 @@ pub trait Adapter: Send {
     fn stdin(&self, _input: &RunInput) -> Option<String> {
         None
     }
+    /// Files the harness needs before it starts (its settings, the approval gate),
+    /// written private where the run happens. Paths are inside `input.state_dir`.
+    fn files(&self, _input: &RunInput) -> Vec<(PathBuf, String)> {
+        Vec::new()
+    }
     /// Stops harness processes that outlive the CLI (e.g. a daemon it started), so a
-    /// stopped run really stops. Runs before and after every run. Blocking.
-    fn stop_leftovers(&self, _input: &RunInput) -> Result<(), String> {
-        Ok(())
+    /// stopped run really stops. Runs before and after every run.
+    fn cleanup(&self, _input: &RunInput) -> Option<JobCleanup> {
+        None
+    }
+    /// What to tell the user when `cleanup` failed, and why.
+    fn cleanup_failed(&self, _input: &RunInput, why: &str) -> String {
+        why.to_string()
     }
     /// The tool name its events use for shell commands. Ask mode stops a run that uses it
     /// without calling the hook, since that harness isn't enforcing approvals.
@@ -202,128 +220,106 @@ fn find_installed() -> Vec<&'static str> {
 /// Why a run was cut short.
 pub type AbortReason = Option<&'static str>;
 
-/// Runs the harness, calling `emit` for every event, until it exits or `abort` fires.
-pub async fn run(adapter: Box<dyn Adapter>, input: RunInput, mut abort: watch::Receiver<AbortReason>, mut emit: impl FnMut(AgentEvent)) {
-    // A turn left running from before would keep going beside this one.
-    let (mut adapter, input, before) = stop_leftovers(adapter, input).await;
-    if let Err(e) = before {
-        return emit(AgentEvent::Error(e));
-    }
-    run_child(adapter.as_mut(), &input, &mut abort, &mut emit).await;
-    if let (_, _, Err(e)) = stop_leftovers(adapter, input).await {
-        emit(AgentEvent::Error(e));
+/// Resolves once `abort` fires; never if its sender is gone without firing.
+pub async fn aborted(mut abort: watch::Receiver<AbortReason>) {
+    if abort.wait_for(|r| r.is_some()).await.is_err() {
+        std::future::pending::<()>().await;
     }
 }
 
-async fn stop_leftovers(adapter: Box<dyn Adapter>, input: RunInput) -> (Box<dyn Adapter>, RunInput, Result<(), String>) {
-    let task = tokio::task::spawn_blocking(move || {
-        let done = adapter.stop_leftovers(&input);
-        (adapter, input, done)
-    });
-    task.await.expect("stop_leftovers panicked")
+/// The command for one run: what the adapter asks for, with no ids yet. Paths are as
+/// `input` names them. Events the adapter emits up front go to `out`.
+pub fn job_for(adapter: &mut dyn Adapter, input: &RunInput, out: &mut Vec<AgentEvent>) -> JobRequest {
+    let args = adapter.args(input, out);
+    let mut env: BTreeMap<String, String> = input.env.clone().into_iter().collect();
+    env.extend(adapter.env(input));
+    let path = |p: &std::path::Path| p.display().to_string();
+    JobRequest {
+        protocol: crate::machines::wire::PROTOCOL,
+        job_id: String::new(),
+        bot_id: String::new(),
+        owner_id: String::new(),
+        message_id: 0,
+        bin: adapter.bin().into(),
+        args,
+        env,
+        cwd: path(&input.cwd),
+        stdin: adapter.stdin(input),
+        files: adapter.files(input).into_iter().map(|(p, body)| JobFile { path: path(&p), body }).collect(),
+        cleanup: adapter.cleanup(input),
+        collect: Vec::new(),
+    }
 }
 
-async fn run_child(adapter: &mut dyn Adapter, input: &RunInput, abort: &mut watch::Receiver<AbortReason>, mut emit: impl FnMut(AgentEvent)) {
+/// Runs the harness on this server, calling `emit` for every event, until it exits or
+/// `abort` fires. With `input.run_as`, it starts as that account.
+pub async fn run(adapter: Box<dyn Adapter>, input: RunInput, abort: watch::Receiver<AbortReason>, emit: impl FnMut(AgentEvent)) {
+    let host = local_host();
+    let stop = abort.clone();
+    let run_as = input.run_as.clone();
+    run_on(adapter, input, abort, emit, |job, tx| async move {
+        let job = match &run_as {
+            Some(r) => r.wrap(job),
+            None => job,
+        };
+        job::run(&host, &job, aborted(stop), &tx).await
+    })
+    .await
+}
+
+/// Runs the harness wherever `exec` runs a job, and turns what comes back into events.
+/// `exec` sends the job's events to its sender and returns when the job is over.
+pub async fn run_on<F, Fut>(mut adapter: Box<dyn Adapter>, input: RunInput, abort: watch::Receiver<AbortReason>, mut emit: impl FnMut(AgentEvent), exec: F)
+where
+    F: FnOnce(JobRequest, mpsc::Sender<JobEvent>) -> Fut,
+    Fut: Future<Output = ()>,
+{
     let mut out = Vec::new();
-    let args = adapter.args(input, &mut out);
-    // An adapter that couldn't set up (e.g. write its approval gate) must not run.
+    let job = job_for(adapter.as_mut(), &input, &mut out);
+    // An adapter that couldn't set up must not run.
     let failed = out.iter().any(|e| matches!(e, AgentEvent::Error(_)));
     out.drain(..).for_each(&mut emit);
     if failed {
         return;
     }
-    let stdin = adapter.stdin(input);
-
-    let argv: Vec<std::ffi::OsString> = match &input.run_as {
-        Some(r) => r.argv(adapter.bin(), args),
-        None => std::iter::once(adapter.bin().into()).chain(args.into_iter().map(Into::into)).collect(),
-    };
-    let mut cmd = Command::new(&argv[0]);
-    strip_secret_env(cmd.as_std_mut());
-    // sudo resets PATH; superbot-run puts this one back.
-    if input.run_as.is_some()
-        && let Some(path) = input.env.get("PATH")
-    {
-        cmd.env("SUPERBOT_PATH", path);
-    }
-    let mut child = match cmd
-        .args(&argv[1..])
-        .current_dir(&input.cwd)
-        .envs(&input.env)
-        .envs(adapter.env(input))
-        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0) // own group, so stop kills the whole tree
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => return emit(AgentEvent::Error(format!("Couldn't start {}: {e}", adapter.bin()))),
-    };
-    let pid = child.id();
-    if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
-        tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
-            let _ = pipe.write_all(text.as_bytes()).await;
-        });
-    }
-
-    let mut stderr = child.stderr.take().unwrap();
-    let stderr_task = tokio::spawn(async move {
-        let mut s = String::new();
-        let _ = stderr.read_to_string(&mut s).await;
-        s
-    });
-
-    // JSON lines. Split only on "\n": some harnesses put U+2028 inside JSON strings.
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).split(b'\n');
-    let mut saw_error = false;
-    let mut aborted = false;
-    loop {
-        tokio::select! {
-            line = lines.next_segment() => match line {
-                Ok(Some(bytes)) => {
-                    let Ok(v) = serde_json::from_slice::<Value>(&bytes) else { continue };
+    let bin = job.bin.clone();
+    let (tx, mut rx) = mpsc::channel(256);
+    let consume = async {
+        let mut saw_error = false;
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                JobEvent::Line { line } => {
+                    let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
                     adapter.on_event(&v, &mut out);
                     for e in out.drain(..) {
                         saw_error |= matches!(e, AgentEvent::Error(_));
                         emit(e);
                     }
                 }
-                _ => break,
-            },
-            _ = abort.wait_for(|r| r.is_some()), if !aborted => {
-                aborted = true;
-                if let Some(pid) = pid {
-                    kill_group(pid, "TERM");
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        kill_group(pid, "KILL");
-                    });
+                JobEvent::Cleanup { why } => emit(AgentEvent::Error(adapter.cleanup_failed(&input, &why))),
+                JobEvent::Error { message } => {
+                    saw_error = true;
+                    emit(AgentEvent::Error(message));
                 }
+                JobEvent::Exit { success, status, stderr, .. } => {
+                    if !success && !saw_error && abort.borrow().is_none() {
+                        emit(AgentEvent::Error(if stderr.is_empty() { format!("{bin} exited with {status}") } else { stderr }));
+                    }
+                }
+                JobEvent::Started | JobEvent::Ping => {}
             }
         }
-    }
-    let status = child.wait().await;
-    let stderr = stderr_task.await.unwrap_or_default();
-    let ok = status.as_ref().is_ok_and(|s| s.success());
-    if !ok && !saw_error && !aborted {
-        let tail: Vec<&str> = stderr.trim().lines().rev().take(3).collect();
-        let msg = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
-        emit(AgentEvent::Error(if msg.is_empty() {
-            format!("{} exited with {}", adapter.bin(), status.map(|s| s.to_string()).unwrap_or_default())
-        } else {
-            msg
-        }));
-    }
+    };
+    tokio::join!(exec(job, tx), consume);
 }
 
-fn kill_group(pid: u32, signal: &str) {
-    let _ = std::process::Command::new("kill")
-        .args([format!("-{signal}"), "--".into(), format!("-{pid}")])
-        .stderr(Stdio::null())
-        .status();
+/// Runs the adapter's cleanup here now, as a run would before it starts.
+#[cfg(test)]
+pub async fn stop_leftovers(adapter: &dyn Adapter, input: &RunInput) -> Result<(), String> {
+    match adapter.cleanup(input) {
+        None => Ok(()),
+        Some(c) => job::cleanup(&local_host(), &c).await.map_err(|why| adapter.cleanup_failed(input, &why)),
+    }
 }
 
 /// One short line describing a tool call, for the "working" status.
@@ -357,6 +353,81 @@ pub fn new_uuid() -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn input(dir: &std::path::Path, run_as: Option<crate::accounts::RunAs>) -> RunInput {
+        RunInput {
+            prompt: "hi".into(),
+            system: "You are Ada.".into(),
+            session_id: None,
+            cwd: dir.to_path_buf(),
+            provider: None,
+            model: None,
+            effort: None,
+            env: HashMap::from([("PATH".into(), "/opt/superbot/bin:/usr/bin:/bin".into())]),
+            state_dir: dir.join("state"),
+            guard: Some(Guard { command: "'/opt/bin/botctl' hook x".into(), timeout_secs: 300, wait: std::time::Duration::from_secs(240) }),
+            run_as,
+        }
+    }
+
+    fn run_as(sudo: &str) -> crate::accounts::RunAs {
+        crate::accounts::RunAs { sudo: sudo.into(), runner: "/opt/superbot/bin/superbot-run".into(), account: "sb-u-u1".into() }
+    }
+
+    #[test]
+    fn isolated_harnesses_need_nothing_botd_writes() {
+        // botd writes job files and runs cleanups as itself, where a per-user account can't follow.
+        let dir = std::env::temp_dir();
+        for name in crate::accounts::HARNESSES {
+            let job = job_for(get(name).unwrap().as_mut(), &input(&dir, None), &mut Vec::new());
+            assert!(job.files.is_empty() && job.cleanup.is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn jobs_for_a_machine_never_go_through_this_servers_accounts() {
+        let dir = std::env::temp_dir();
+        let job = job_for(get("claude").unwrap().as_mut(), &input(&dir, Some(run_as("/usr/bin/sudo"))), &mut Vec::new());
+        assert_eq!(job.bin, "claude");
+        assert!(!job.args.iter().any(|a| a.contains("sudo") || a.contains("sb-u-")), "{:?}", job.args);
+        assert!(!job.env.contains_key("SUPERBOT_PATH"));
+    }
+
+    #[tokio::test]
+    async fn local_runs_start_as_the_owners_account() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::db::temp_path("run-as");
+        let sudo = dir.join("sudo");
+        let seen = dir.join("seen");
+        let script = format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho \"PATH=$SUPERBOT_PATH\" >> '{0}'\n", seen.display());
+        std::fs::write(&sudo, script).unwrap();
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (_tx, abort) = watch::channel(None);
+        let mut errors = Vec::new();
+        let input = input(&dir, Some(run_as(sudo.to_str().unwrap())));
+        run(get("claude").unwrap(), input, abort, |e| {
+            if let AgentEvent::Error(m) = e {
+                errors.push(m)
+            }
+        })
+        .await;
+        assert!(errors.is_empty(), "{errors:?}");
+        let seen = std::fs::read_to_string(&seen).unwrap();
+        let lines: Vec<&str> = seen.lines().collect();
+        assert_eq!(lines[..7], ["-n", "-E", "-u", "sb-u-u1", "--", "/opt/superbot/bin/superbot-run", "claude"], "{seen}");
+        assert!(lines.contains(&"--settings"), "the approval gate goes through: {seen}");
+        assert_eq!(lines.last(), Some(&"PATH=/opt/superbot/bin:/usr/bin:/bin"));
+    }
+
+    #[test]
+    fn machines_know_every_harness() {
+        for name in super::NAMES {
+            let bin = super::get(name).unwrap().bin();
+            assert_eq!(crate::machines::wire::harness_bin(bin), Some(bin), "{name}");
+        }
+    }
+
     #[test]
     fn server_secrets_are_stripped_from_harnesses() {
         let mut cmd = std::process::Command::new("true");
