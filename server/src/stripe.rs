@@ -46,9 +46,11 @@ impl std::fmt::Display for Error {
 }
 
 impl Stripe {
-    /// `base` is Stripe's API; tests point it at a fake.
+    /// `base` is Stripe's API; tests point it at a fake on loopback, the only place the
+    /// key may go without TLS.
     pub fn new(key: &str, base: &str) -> Stripe {
-        let http = reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT).timeout(TIMEOUT).build().expect("HTTP client");
+        let loopback = url::Url::parse(base).ok().is_some_and(|u| matches!(u.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")));
+        let http = reqwest::Client::builder().https_only(!loopback).connect_timeout(CONNECT_TIMEOUT).timeout(TIMEOUT).build().expect("HTTP client");
         Stripe { key: key.into(), base: base.trim_end_matches('/').into(), http }
     }
 
@@ -137,6 +139,16 @@ mod tests {
         assert_ne!(k, idempotency_key("portal", "u1", &form(&[("customer", "cus_2")]), t));
         // Field boundaries count: ("ab", "c") isn't ("a", "bc").
         assert_ne!(idempotency_key("x", "u", &form(&[("ab", "c")]), t), idempotency_key("x", "u", &form(&[("a", "bc")]), t));
+    }
+
+    #[tokio::test]
+    async fn the_key_goes_over_plain_http_only_to_loopback() {
+        // Nothing listens on 192.0.2.1 (TEST-NET-1): refused before connecting, so this
+        // doesn't wait for a connect timeout.
+        let s = Stripe::new("sk_test_x", "http://192.0.2.1");
+        let started = std::time::Instant::now();
+        assert_eq!(s.get("/v1/checkout/sessions/cs_1").await, Err(Error::Unreachable));
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
     }
 
     #[test]
