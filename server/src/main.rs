@@ -1505,9 +1505,9 @@ async fn update_access(State(app): State<AppState>, Extension(c): Extension<Call
             return Err(full());
         }
         // Work started for the old owner runs in their folder with their keys; it
-        // ends here, and its token stops working (it names the old owner).
-        app.stop(&id);
-        if !app.db.set_bot_owner_capped(&id, &u.id, max) {
+        // ends here, and its token stops working (it names the old owner). A refused
+        // transfer (another request took the last slot) leaves that work running.
+        if !app.stop_if(&id, || app.db.set_bot_owner_capped(&id, &u.id, max)) {
             return Err(full());
         }
         // The new owner manages it anyway; a leftover grant would only confuse.

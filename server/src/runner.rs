@@ -619,8 +619,18 @@ impl App {
 
     /// Stops the current task and drops queued ones.
     pub fn stop(&self, bot_id: &str) {
+        self.stop_if(bot_id, || true);
+    }
+
+    /// Like `stop`, but only once `first` returns true. It runs under the lock that
+    /// queues work, so nothing is queued between it and the stop, and a false leaves
+    /// the Bot's work untouched.
+    pub fn stop_if(&self, bot_id: &str, first: impl FnOnce() -> bool) -> bool {
         {
             let mut st = self.state();
+            if !first() {
+                return false;
+            }
             if let Some(s) = st.get_mut(bot_id) {
                 for m in s.queue.drain(..) {
                     self.db.set_status(m.id, "done");
@@ -631,6 +641,7 @@ impl App {
             }
         }
         self.cancel_approvals(bot_id, "The Bot was stopped");
+        true
     }
 
     /// After a policy change: a run that started in bypass has no approval hook, so
@@ -848,6 +859,21 @@ mod tests {
         let g = guard(Path::new("/opt"), "hermes", 1);
         assert_eq!((g.wait, g.timeout_secs), (Duration::from_secs(120), 180));
         assert_eq!(tool_label("terminal", "ls"), "Running: ls");
+    }
+
+    #[test]
+    fn a_refused_stop_if_leaves_queued_work() {
+        let app = test_app();
+        let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
+        let m = app.db.add_message(&bot.id, "user", "hi", None, false, Some("queued"));
+        app.state().entry(bot.id.clone()).or_default().queue.push_back(m.clone());
+        let status = || app.db.message(m.id).unwrap().status;
+        assert!(!app.stop_if(&bot.id, || false));
+        assert_eq!(app.state()[&bot.id].queue.len(), 1);
+        assert_eq!(status().as_deref(), Some("queued"));
+        assert!(app.stop_if(&bot.id, || true));
+        assert!(app.state()[&bot.id].queue.is_empty());
+        assert_eq!(status().as_deref(), Some("done"));
     }
 
     #[test]
