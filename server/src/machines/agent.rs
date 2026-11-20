@@ -405,6 +405,18 @@ impl Agent {
         Ok(())
     }
 
+    /// Takes up the saved identity if it isn't the one in use, as after
+    /// `superbot-machine enroll` by hand, which revokes the old certificate. Returns
+    /// whether it did.
+    pub fn reload_if_changed(&self) -> bool {
+        match load(&self.cfg) {
+            Some(saved) if saved.fingerprint != self.identity().fingerprint => {
+                self.replace(saved).is_ok()
+            }
+            _ => false,
+        }
+    }
+
     /// Rotates when due. Returns whether it did.
     pub async fn rotate_if_due(&self) -> Result<bool, Failed> {
         let id = self.identity();
@@ -497,15 +509,29 @@ pub async fn run(cfg: Config) -> Result<(), String> {
     let agent = Agent::new(cfg, id)?;
     let rotating = agent.clone();
     tokio::spawn(async move {
+        // Checks at once, so a machine restarted near its certificate's end renews it
+        // while it still can.
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
         loop {
-            tokio::time::sleep(Duration::from_secs(3600)).await;
+            tick.tick().await;
+            if rotating.reload_if_changed() {
+                println!(
+                    "Using the certificate {} saved by enroll.",
+                    &rotating.identity().fingerprint[..16]
+                );
+            }
             match rotating.rotate_if_due().await {
                 Ok(true) => println!(
                     "New certificate {}.",
                     &rotating.identity().fingerprint[..16]
                 ),
                 Ok(false) => {}
-                Err(f) => eprintln!("Rotating: {}", f.message),
+                Err(f) => {
+                    eprintln!("Rotating: {}", f.message);
+                    if f.permanent {
+                        tokio::time::sleep(Duration::from_secs(600)).await;
+                    }
+                }
             }
         }
     });

@@ -321,6 +321,41 @@ async fn wait_for_heartbeat(env: &Env) {
 }
 
 #[tokio::test]
+async fn a_running_agent_takes_up_a_certificate_enrolled_by_hand() {
+    let env = serve().await;
+    let (_, mid, token) = machine_for(&env, "ada@example.com").await;
+    let cfg = config(&env, &mid, Some(&token));
+    let agent = Agent::new(cfg.clone(), agent::enroll(&cfg).await.unwrap()).unwrap();
+    assert!(!agent.reload_if_changed(), "nothing new on disk");
+
+    let (_, t) = json_call(
+        &env,
+        "POST",
+        "/api/users/ada@example.com/machine/enrollment",
+        "",
+    )
+    .await;
+    let mut same_disk = cfg.clone();
+    same_disk.token = t["token"].as_str().map(|t| Zeroizing::new(t.to_string()));
+    let by_hand = agent::enroll(&same_disk).await.unwrap();
+    assert!(agent.reload_if_changed());
+    assert_eq!(agent.identity().fingerprint, by_hand.fingerprint);
+    let (code, _) = raw(
+        &env,
+        Some(&agent.identity()),
+        "GET",
+        &format!("/v1/machines/{mid}"),
+        Value::Null,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        code, 200,
+        "the running agent signs in with the new certificate"
+    );
+}
+
+#[tokio::test]
 async fn new_machines_download_the_agent_botd_hashed() {
     let env = serve().await;
     let (_, mid, _) = machine_for(&env, "ada@example.com").await;

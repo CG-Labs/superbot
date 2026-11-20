@@ -57,7 +57,7 @@ Routing (`MACHINE_ROUTING=on`) now refuses a running machine with no usable cert
 
 ### Rotation, hold, revocation
 
-- **Rotation.** The agent asks for a new certificate (`POST /v1/machines/{id}/certificate`) with a third of its life left, signing in with the current one. The new one is recorded only if the current one is still active in the same transaction, so a rotation racing a hold or revocation can't undo it. The old one keeps working until the new one is first used; then the older ones are revoked (`rotated`). A machine that never got the answer isn't locked out: it asks again, and the unused one is revoked (`superseded`).
+- **Rotation.** The agent asks for a new certificate (`POST /v1/machines/{id}/certificate`) with a third of its life left, signing in with the current one. It checks at start and every minute, and takes up a certificate that `superbot-machine enroll` saved by hand. The new one is recorded only if the current one is still active in the same transaction, so a rotation racing a hold or revocation can't undo it. The old one keeps working until the new one is first used; then the older ones are revoked (`rotated`). A machine that never got the answer isn't locked out: it asks again, and the unused one is revoked (`superseded`).
 - **Suspend** holds the machine's certificates; **resume** releases them. A stopped machine can't receive a new token, so it keeps its key.
 - **Destroy**, a machine **lost** at the provider, or an admin (`DELETE /api/users/{user}/machine/certificates`) revokes every certificate and unused token. Re-enrolling needs a new token.
 
