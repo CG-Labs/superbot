@@ -708,6 +708,16 @@ async fn rotate(
         Err(e) => return reply(StatusCode::BAD_REQUEST, &e),
     };
     let Some(superseded) = p.app.db.add_rotated_cert(&c, &issued) else {
+        if p.app
+            .db
+            .machine_cert(&c.fingerprint)
+            .is_some_and(|now| now.status != "active")
+        {
+            return reply(
+                StatusCode::UNAUTHORIZED,
+                "This certificate was held or revoked meanwhile.",
+            );
+        }
         return reply(
             StatusCode::INTERNAL_SERVER_ERROR,
             "The new certificate wasn't saved.",
@@ -904,7 +914,7 @@ pub async fn issue_token(
         "expiresAt": expires_at,
         "controlUrl": e.url,
         "ca": e.ca_pem(),
-        "howTo": "On the machine: save the CA to /etc/superbot/ca.pem and the token to /etc/superbot/enroll-token (chmod 600), then run SUPERBOT_CONTROL_URL=<controlUrl> SUPERBOT_MACHINE_ID=<machineId> superbot-machine enroll. The token works once, for this machine, within the hour.",
+        "howTo": "On the machine: save the CA to /etc/superbot/ca.pem and the token to /etc/superbot/enroll-token (chmod 600), then run SUPERBOT_CONTROL_URL=<controlUrl> SUPERBOT_MACHINE_ID=<machineId> SUPERBOT_ENROLL_TOKEN_FILE=/etc/superbot/enroll-token superbot-machine enroll. The token works once, for this machine, within the hour.",
     })))
 }
 

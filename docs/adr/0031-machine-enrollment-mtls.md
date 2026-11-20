@@ -57,17 +57,17 @@ Routing (`MACHINE_ROUTING=on`) now refuses a running machine with no usable cert
 
 ### Rotation, hold, revocation
 
-- **Rotation.** The agent asks for a new certificate (`POST /v1/machines/{id}/certificate`) with a third of its life left, signing in with the current one. The old one keeps working until the new one is first used; then the older ones are revoked (`rotated`). A machine that never got the answer isn't locked out: it asks again, and the unused one is revoked (`superseded`).
+- **Rotation.** The agent asks for a new certificate (`POST /v1/machines/{id}/certificate`) with a third of its life left, signing in with the current one. The new one is recorded only if the current one is still active in the same transaction, so a rotation racing a hold or revocation can't undo it. The old one keeps working until the new one is first used; then the older ones are revoked (`rotated`). A machine that never got the answer isn't locked out: it asks again, and the unused one is revoked (`superseded`).
 - **Suspend** holds the machine's certificates; **resume** releases them. A stopped machine can't receive a new token, so it keeps its key.
 - **Destroy**, a machine **lost** at the provider, or an admin (`DELETE /api/users/{user}/machine/certificates`) revokes every certificate and unused token. Re-enrolling needs a new token.
 
 Revocation is botd's database, checked on every call and every pin: there is no CRL or OCSP to fetch, and short lives bound a certificate that escapes.
 
-`machines.enrollment` shows the result: `none`, `enrolled`, `held`, or `revoked`. `agent_seen_at`, `agent_version` and `agent_error` show the last heartbeat; the reconciler asks every enrolled running machine on each pass. Users see `enrollment` and `agentSeenAt` for their own machine.
+`machines.enrollment` shows the result: `none`, `enrolled`, `held`, or `revoked`. `agent_seen_at`, `agent_version` and `agent_error` show the last heartbeat; botd asks every enrolled running machine on each reconcile interval, a few at a time and in a loop of its own, so agents that don't answer can't hold up provider checks. Users see `enrollment` and `agentSeenAt` for their own machine.
 
 ### The agent
 
-`superbot-machine` is a small Rust binary in this repo (`server/src/bin/superbot-machine.rs`), sharing botd's `pki` and `wire` modules and nothing else. It enrolls (retrying; slowly when the token was refused), keeps its key and certificate in its state directory (key `0600`), deletes the token file once used, rotates, and answers `GET /v1/heartbeat`. `POST /v1/jobs` answers 501: it is connected, but it can't run Bots yet. `superbot-machine enroll` and `superbot-machine status` help an operator check one by hand.
+`superbot-machine` is a small Rust binary in this repo (`server/src/bin/superbot-machine.rs`), sharing botd's `pki` and `wire` modules and nothing else. It enrolls (retrying; slowly when the token was refused), keeps its key and certificate together in one file in its state directory (`0600`, replaced in one rename, and refused on load unless the key is the certificate's), deletes the token file once used, rotates, and answers `GET /v1/heartbeat`. `POST /v1/jobs` answers 501: it is connected, but it can't run Bots yet. `superbot-machine enroll` and `superbot-machine status` help an operator check one by hand.
 
 ### Audit
 

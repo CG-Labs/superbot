@@ -40,6 +40,8 @@ pub const NOT_CONFIGURED: &str = "The control plane is not configured on this se
 pub const DEFAULT_TIERS: &str = "starter=g6-standard-1,pro=g6-standard-2,max=g6-standard-4";
 pub const DEFAULT_IMAGE: &str = "linode/ubuntu24.04";
 const DEFAULT_RECONCILE_SECONDS: u64 = 60;
+/// Heartbeats in flight at once; each gives up after 10 seconds.
+const HEARTBEATS_AT_ONCE: usize = 16;
 /// How long after a create that went unanswered a machine may still turn up at the
 /// provider. Linode creates synchronously, so this is generous.
 pub const CREATE_SETTLE_MS: i64 = 15 * 60 * 1000;
@@ -455,7 +457,10 @@ async fn provision(
     let user_data = match &cp.enrollment {
         None => None,
         Some(e) => match e.mint_token(app, &m.id, by.actor.id.as_deref()) {
-            Ok((token, _)) => Some(e.user_data(&m, &token)),
+            Ok((token, expires_at)) => {
+                app.db.record(&event(by, "machine.enroll_token_issued", &m, json!({ "expiresAt": expires_at, "via": "create" })));
+                Some(e.user_data(&m, &token))
+            }
             Err(err) => {
                 m.last_error = Some(format!("couldn't make an enrollment token: {err}"));
                 app.db.save_machine(&m, m.state);
@@ -686,18 +691,23 @@ pub async fn reconcile(app: &App, cp: &ControlPlane) -> Value {
         let _g = cp.ops.lock().await;
         changed += reconcile_one(app, cp, p, id).await as usize;
     }
-    // Heartbeats change only the agent columns, so they don't take the lock.
-    let mut out = json!({ "checked": ids.len(), "changed": changed });
-    if let Some(e) = &cp.enrollment {
-        let mut answered = 0;
-        for m in app.db.machines(Some(State::Running)) {
-            if m.enrollment == "enrolled" {
-                answered += enroll::heartbeat(app, e, &m).await.is_ok() as usize;
-            }
-        }
-        out["heartbeats"] = answered.into();
-    }
-    out
+    json!({ "checked": ids.len(), "changed": changed })
+}
+
+/// Asks every enrolled running machine's agent how it is, a few at a time, and
+/// returns how many answered. None when enrollment is off. Heartbeats change only the
+/// agent columns, so they don't take the lock.
+pub async fn heartbeats(app: &App, cp: &ControlPlane) -> Option<usize> {
+    use futures_util::StreamExt;
+    let e = cp.enrollment.as_ref()?;
+    let enrolled = app.db.machines(Some(State::Running)).into_iter().filter(|m| m.enrollment == "enrolled");
+    let answered = futures_util::stream::iter(enrolled)
+        .map(|m| async move { enroll::heartbeat(app, e, &m).await.is_ok() })
+        .buffer_unordered(HEARTBEATS_AT_ONCE)
+        .filter(|ok| std::future::ready(*ok))
+        .count()
+        .await;
+    Some(answered)
 }
 
 /// Reconciles every MACHINE_RECONCILE_SECONDS, from startup, when the control plane is on.
@@ -705,12 +715,25 @@ pub fn start(app: AppState, cp: Arc<ControlPlane>) {
     if !cp.enabled() {
         return;
     }
+    let (a, c) = (app.clone(), cp.clone());
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(c.reconcile_every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            reconcile(&a, &c).await;
+        }
+    });
+    if cp.enrollment.is_none() {
+        return;
+    }
+    // Apart from reconciling, so agents that don't answer can't hold up provider checks.
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(cp.reconcile_every);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            reconcile(&app, &cp).await;
+            heartbeats(&app, &cp).await;
         }
     });
 }
@@ -1155,7 +1178,11 @@ pub async fn destroy(
 /// `POST /api/machines/reconcile`: one pass now, instead of waiting for the timer.
 pub async fn reconcile_now(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>) -> Res {
     a.machines.need()?;
-    Ok(Json(reconcile(&app, &a.machines).await))
+    let mut out = reconcile(&app, &a.machines).await;
+    if let Some(n) = heartbeats(&app, &a.machines).await {
+        out["heartbeats"] = n.into();
+    }
+    Ok(Json(out))
 }
 
 /// `GET /api/machine`: the caller's own machine, and only theirs.

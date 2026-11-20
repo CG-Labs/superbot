@@ -176,7 +176,7 @@ async fn a_machine_enrolls_once_then_answers_over_mutual_tls() {
         (uid.as_str(), mid.as_str())
     );
     assert!(
-        cfg.state_dir.join("key.pem").exists() && agent::load(&cfg).is_some(),
+        cfg.state_dir.join("identity.pem").exists() && agent::load(&cfg).is_some(),
         "the key never left the machine"
     );
     let m = env.app.db.machine(&mid).unwrap();
@@ -408,11 +408,23 @@ async fn tokens_are_single_use_bound_to_one_machine_and_short_lived() {
         )
     );
     let issued_ev = events(&env, "machine.enroll_token_issued").await;
-    assert_eq!(issued_ev.len(), 1);
-    assert!(
-        !issued_ev[0].to_string().contains(&t2),
-        "the token is shown once and never recorded"
+    assert_eq!(
+        issued_ev
+            .iter()
+            .filter(|e| e["details"]["via"] == "create")
+            .count(),
+        2,
+        "one per machine created"
     );
+    assert_eq!(issued_ev.len(), 3);
+    for t in [&ta, &tb, &t2] {
+        assert!(
+            !Value::Array(issued_ev.clone())
+                .to_string()
+                .contains(t.as_str()),
+            "tokens are shown once and never recorded"
+        );
+    }
 
     let (a1, a2) = (config(&env, &ma, Some(&ta)), config(&env, &ma, Some(&ta)));
     let (r1, r2) = tokio::join!(agent::enroll(&a1), agent::enroll(&a2));
@@ -491,6 +503,21 @@ async fn unenrolled_rotated_and_revoked_certificates_are_refused() {
 
     let id2 = agent::rotate(&cfg, &id1).await.unwrap();
     assert_eq!(
+        agent::load(&cfg).unwrap().fingerprint,
+        id2.fingerprint,
+        "the new pair replaced the old one"
+    );
+    let (stray, _) = pki::new_request(&mid).unwrap();
+    assert!(
+        Identity::new(
+            id2.cert_pem.clone(),
+            Zeroizing::new(stray.serialize_pem()),
+            &mid
+        )
+        .is_err(),
+        "a key that isn't the certificate's is refused"
+    );
+    assert_eq!(
         env.app.db.machine_pins(&mid).len(),
         2,
         "the old one works until the new one is used"
@@ -564,6 +591,15 @@ async fn unenrolled_rotated_and_revoked_certificates_are_refused() {
         .await
         .unwrap();
     assert_eq!(code, 401);
+    // A rotation that passed its check just before the revocation can't bring it back.
+    let (_, csr) = pki::new_request(&mid).unwrap();
+    let late = env.e.issue_unrecorded(&csr, &uid, &mid);
+    let revoked3 = env.app.db.machine_cert(&id3.fingerprint).unwrap();
+    assert_eq!(env.app.db.add_rotated_cert(&revoked3, &late), None);
+    assert!(
+        env.app.db.machine_cert(&late.fingerprint).is_none()
+            && env.app.db.machine_pins(&mid).is_empty()
+    );
     assert!(reason_count(&events(&env, "access.denied").await, "revoked") >= 2);
     assert_eq!(env.app.db.machine(&mid).unwrap().enrollment, "revoked");
     assert_eq!(env.cp.route(&env.app.db, &uid), Err(Refusal::NotEnrolled));

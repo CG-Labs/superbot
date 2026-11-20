@@ -146,6 +146,10 @@ impl Identity {
             ));
         }
         pki::key_der(&key_pem)?;
+        let key = rcgen::KeyPair::from_pem(&key_pem).map_err(|_| "the key doesn't parse")?;
+        if rcgen::PublicKeyData::subject_public_key_info(&key) != f.spki {
+            return Err("the key isn't the certificate's".into());
+        }
         Ok(Identity {
             user_id: user_id.clone(),
             machine_id: m.clone(),
@@ -190,23 +194,37 @@ fn write_private(path: &Path, text: &str, mode: u32) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// The key first, so a crash between the two leaves a key without its certificate
-/// (enroll again) rather than a certificate for a key that is gone.
+const IDENTITY_FILE: &str = "identity.pem";
+const END_CERT: &str = "-----END CERTIFICATE-----";
+
+/// The certificate and its key in one file, replaced in one rename, so a crash leaves
+/// either the old pair or the new one, never a key beside another key's certificate.
 fn save(dir: &Path, id: &Identity) -> Result<(), String> {
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(dir)
         .map_err(|e| format!("{}: {e}", dir.display()))?;
-    write_private(&dir.join("key.pem"), &id.key_pem, 0o600)?;
-    write_private(&dir.join("cert.pem"), &id.cert_pem, 0o644)
+    let both = Zeroizing::new(format!(
+        "{}\n{}",
+        id.cert_pem.trim_end(),
+        id.key_pem.as_str()
+    ));
+    write_private(&dir.join(IDENTITY_FILE), &both, 0o600)
 }
 
-/// The saved identity, if there is one and it is for this machine.
+/// The saved identity, if there is one, its key is its certificate's, and it is for
+/// this machine.
 pub fn load(cfg: &Config) -> Option<Identity> {
-    let cert = std::fs::read_to_string(cfg.state_dir.join("cert.pem")).ok()?;
-    let key = Zeroizing::new(std::fs::read_to_string(cfg.state_dir.join("key.pem")).ok()?);
-    Identity::new(cert, key, &cfg.machine_id).ok()
+    let both = Zeroizing::new(std::fs::read_to_string(cfg.state_dir.join(IDENTITY_FILE)).ok()?);
+    let at = both.find(END_CERT)? + END_CERT.len();
+    let (cert, key) = both.split_at(at);
+    Identity::new(
+        format!("{cert}\n"),
+        Zeroizing::new(key.trim_start().to_string()),
+        &cfg.machine_id,
+    )
+    .ok()
 }
 
 fn client(cfg: &Config, id: Option<&Identity>) -> Result<reqwest::Client, String> {
@@ -467,9 +485,8 @@ pub async fn run(cfg: Config) -> Result<(), String> {
         },
     };
     println!(
-        "Machine {} of user {}, certificate {} until {}.",
+        "Machine {}, certificate {} until {}.",
         id.machine_id,
-        id.user_id,
         &id.fingerprint[..16],
         id.not_after
     );

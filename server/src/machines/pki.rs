@@ -69,6 +69,8 @@ pub struct Facts {
     pub serial: String,
     pub not_before: i64,
     pub not_after: i64,
+    /// The certified public key (SubjectPublicKeyInfo, DER).
+    pub spki: Vec<u8>,
 }
 
 pub fn facts(der: &[u8]) -> Option<Facts> {
@@ -94,6 +96,7 @@ pub fn facts(der: &[u8]) -> Option<Facts> {
         serial: c.raw_serial().iter().map(|b| format!("{b:02x}")).collect(),
         not_before: c.validity().not_before.timestamp() * 1000,
         not_after: c.validity().not_after.timestamp() * 1000,
+        spki: c.public_key().raw.to_vec(),
     })
 }
 

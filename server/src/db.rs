@@ -2594,6 +2594,7 @@ impl Db {
     /// Records `new`, issued to replace `old`. `old` stays usable until `new` is first
     /// used, so a machine that never got the answer isn't locked out. A replacement
     /// issued earlier that was never used is revoked (`superseded`); returns those.
+    /// None if `old` was held or revoked meanwhile: a rotation can't undo that.
     pub fn add_rotated_cert(
         &self,
         old: &MachineCert,
@@ -2603,7 +2604,7 @@ impl Db {
         let tx = c.unchecked_transaction().ok()?;
         let old_id: i64 = tx
             .query_row(
-                "SELECT id FROM machine_certs WHERE fingerprint = ?",
+                "SELECT id FROM machine_certs WHERE fingerprint = ? AND status = 'active'",
                 [&old.fingerprint],
                 |r| r.get(0),
             )

@@ -34,9 +34,8 @@ async fn main() {
     match cmd.as_str() {
         "enroll" => match agent::enroll(&cfg).await {
             Ok(id) => println!(
-                "Enrolled machine {} of user {}; certificate {} saved in {}.",
+                "Enrolled machine {}; certificate {} saved in {}.",
                 id.machine_id,
-                id.user_id,
                 &id.fingerprint[..16],
                 cfg.state_dir.display()
             ),
