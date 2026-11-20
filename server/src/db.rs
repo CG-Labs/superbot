@@ -2547,6 +2547,17 @@ impl Db {
         s.query_map(rusqlite::params_from_iter(args), audit_row).unwrap().filter_map(Result::ok).collect()
     }
 
+    /// Whether per-user accounts were on, with their copies in order, when last saved (ADR 0037).
+    pub fn isolation_was_on(&self) -> bool {
+        let v: Option<String> = self.c().query_row("SELECT value FROM settings WHERE key = 'isolation'", [], |r| r.get(0)).optional().ok().flatten();
+        v.as_deref() == Some("users")
+    }
+
+    pub fn save_isolation(&self, on: bool) {
+        let now = if on { "users" } else { "off" };
+        self.c().execute("INSERT INTO settings (key, value) VALUES ('isolation', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1", [now]).unwrap();
+    }
+
     /// Days of audit history to keep. None = forever.
     pub fn audit_retention(&self) -> Option<u32> {
         let v: Option<String> = self.c().query_row("SELECT value FROM settings WHERE key = 'audit_retention_days'", [], |r| r.get(0)).optional().ok().flatten();

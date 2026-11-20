@@ -1,6 +1,11 @@
 //! botd: the server. Owns Bots, chats, memory files, and routines; runs each Bot
 //! on its harness (Claude Code, Codex, Pi, or Hermes Agent); serves the web app and its API.
 
+mod accounts;
+#[cfg(test)]
+mod accounts_http_tests;
+#[cfg(test)]
+mod accounts_os_tests;
 mod acl;
 #[cfg(test)]
 mod acl_http_tests;
@@ -25,6 +30,7 @@ mod machines_http_tests;
 mod machines_lockdown_tests;
 #[cfg(test)]
 mod machines_mtls_tests;
+mod passwd;
 mod paths;
 mod policy;
 mod rbac;
@@ -178,7 +184,9 @@ async fn main() {
         .unwrap_or_else(|e| exit(format!("Machine enrollment: {e}")))
         .map(|e| control_plane.enroll_with(e).unwrap_or_else(|e| exit(format!("Machine enrollment: {e}"))));
 
-    let screens = paths::child(&data_dir, "screens").and_then(screen::Screens::from_env);
+    let isolation = accounts::Isolation::from_env(|k| env(k, ""), &bin_dir, &data_dir).unwrap_or_else(|e| exit(format!("Isolation: {e}")));
+    // Screens are X displays botd's account runs; any local account could open them.
+    let screens = if isolation.is_some() { None } else { paths::child(&data_dir, "screens").and_then(screen::Screens::from_env) };
     let app = App::new(db, Config {
         data_dir,
         workspace,
@@ -192,6 +200,22 @@ async fn main() {
     }, screens);
     let _ = app.tiers.set(Arc::new(tiers));
     println!("Tiers: {}.", app.tiers().describe());
+    match isolation {
+        Some(iso) => {
+            println!(
+                "Isolation: each user's Bots run as their own account ({}<user id>), in {}/<user id>; harnesses: {}.",
+                accounts::PREFIX,
+                iso.root.display(),
+                accounts::HARNESSES.join(", ")
+            );
+            if accounts::others_visible() {
+                eprintln!("WARNING: other accounts' processes are visible in /proc, so Bots can read each other's command lines. Run botd with ProtectProc=invisible (deploy/install.sh --isolation sets it).");
+            }
+            let _ = app.isolation.set(Arc::new(iso));
+        }
+        None => println!("Isolation: off (all Bots run as this account; ISOLATION=users gives each user their own)."),
+    }
+    app.start_isolation();
     for t in app.db.assigned_tiers().into_iter().filter(|t| app.tiers().get(t).is_none()) {
         eprintln!("WARNING: some users have tier \"{t}\", which TIERS_FILE no longer lists. They get the default tier ({}) until an admin picks another.", app.tiers().default_tier().name);
     }
@@ -270,6 +294,7 @@ async fn main() {
         "sessionMaxMinutes": sessions.max_ms / 60_000,
         "auditRetentionDays": retention,
         "screens": app.screens.is_some(),
+        "isolation": if app.isolation().is_some() { "users" } else { "off" },
         "sso": sso_ids,
         "controlPlane": control_plane.enabled(),
         "scim": auth_state_scim,
@@ -308,7 +333,14 @@ async fn main() {
         tokio::spawn(machines::enroll::serve(machine_listener, app.clone(), e, Some(api)));
     }
     println!("Harnesses on PATH: {}. Default: {}.", adapters::installed().join(", "), app.cfg.default_harness);
-    println!("Screens: {}.", if app.screens.is_some() { "on" } else { "off (install Xvfb and openbox to turn them on)" });
+    println!(
+        "Screens: {}.",
+        match (app.screens.is_some(), app.isolation().is_some()) {
+            (true, _) => "on",
+            (false, true) => "off (per-user screens don't exist yet, so ISOLATION=users turns them off)",
+            (false, false) => "off (install Xvfb and openbox to turn them on)",
+        }
+    );
 
     // On SIGTERM/SIGINT: stop agents (queued work runs after restart), then exit.
     let shutdown_app = app.clone();
@@ -376,6 +408,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/sessions", delete(users::revoke_user_sessions))
         .route("/users/{key}/bots", get(users::user_bots))
         .route("/users/{key}/secrets", get(list_user_secrets).delete(delete_user_secrets))
+        .route("/users/{key}/isolation", get(accounts::http::get).post(accounts::http::ensure))
+        .route("/users/{key}/harness-login", post(accounts::http::harness_login))
         .route("/users/{key}/identities", get(sso::list_identities).post(sso::link_identity))
         .route("/users/{key}/identities/{id}", delete(sso::unlink_identity))
         .route("/users/{key}/machine", get(machines::get).post(machines::request).delete(machines::destroy))
@@ -1541,6 +1575,7 @@ async fn update_access(State(app): State<AppState>, Extension(c): Extension<Call
         }
         // The new owner manages it anyway; a leftover grant would only confuse.
         app.db.remove_grant(&id, &u.id);
+        app.hand_over_memory(&id, &bot.owner_id, &u.id);
         app.db.record(&by.event("bot.owner_changed").target("bot", &id).bot(&id).details(json!({ "from": bot.owner_id, "to": u.id })));
         narrowed = true;
     }
