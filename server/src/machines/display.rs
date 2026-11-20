@@ -540,9 +540,14 @@ mod tests {
             "voxl",
             "#!/usr/bin/env python3\nimport socket, sys, time\nport = int(sys.argv[sys.argv.index('--port') + 1])\ns = socket.socket()\ns.bind(('127.0.0.1', port))\ns.listen()\ntime.sleep(60)\n",
         );
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let free = probe.local_addr().unwrap().port();
-        drop(probe);
+        // Both slots' ports must be free, or tests running alongside take the second one.
+        let free = loop {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = probe.local_addr().unwrap().port();
+            if port < u16::MAX && std::net::TcpListener::bind(("127.0.0.1", port + 1)).is_ok() {
+                break port;
+            }
+        };
         let s = Settings { path: format!("{}:/usr/bin:/bin", bin.display()), tmp, display_base: 100, port_base: free - 1, max: 2 };
         (Arc::new(Screens::new(s, home, runas::current_user().unwrap())), root)
     }

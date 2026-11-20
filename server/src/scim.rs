@@ -736,6 +736,7 @@ async fn changed(app: &AppState, a: &Auth, c: &Caller, before_user: &User, befor
                 screens.rotate_all().await;
             }
             crate::machines::screens::rotate_all(app).await;
+            crate::machines::offboard::left(app, by, &after.user.id, crate::machines::offboard::DEPROVISIONED);
         }
         None => {}
     }
@@ -922,6 +923,7 @@ pub async fn delete_user(State(app): State<AppState>, Extension(a): Extension<Ar
     if before.user.active() {
         crate::machines::screens::rotate_all(&app).await;
     }
+    crate::machines::offboard::left(&app, &c.who, &id, crate::machines::offboard::DEPROVISIONED);
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 

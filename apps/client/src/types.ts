@@ -57,6 +57,8 @@ export interface BotView {
   route?: { harness: string; provider?: string; model?: string | null; effort?: string };
   /** Admins only: the harnesses the owner's plan allows, for editing someone else's Bot. */
   harnesses?: string[];
+  /** Suggested prompts in its details (ADR 0054). Null or absent: the defaults. */
+  prompts?: string[] | null;
 }
 
 export interface TierBadge {

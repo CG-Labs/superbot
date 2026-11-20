@@ -603,6 +603,8 @@ pub async fn update_user(State(app): State<AppState>, Extension(a): Extension<Ar
     }
     if lost {
         crate::machines::screens::rotate_all(&app).await;
+        let reason = if after.active() { crate::machines::offboard::ACCESS_LOST } else { crate::machines::offboard::DISABLED };
+        crate::machines::offboard::left(&app, &by, &after.id, reason);
     }
     Ok(Json(user_view(&after)))
 }

@@ -293,6 +293,11 @@ For CG-Labs managed hosting: botd can rent one Linode per user and track it. **O
   - Refusals: `agent_outdated` (no `can: teammates`), `teammate_user_failed`, `teammate_no_key` (Claude Code or Codex with no server-wide key).
   - Screens are per person. `GET /api/bots/:id/screen` gives the caller their own (`?for=<user>` for admins). Every display takes an X cookie, and a teammate who loses the Bot loses their screen (`access_lost`).
   - Audited as `machine.teammate_user_created`, with `teammateUser` on `bot.run_routed` and `harness.invoked`, and `forUser` on `machine.screen_*`.
+- **Teammates leaving machines** ([ADR 0052](adr/0052-teammate-offboarding-on-machines.md)), whenever machines are on: a teammate who is disabled, deprovisioned by SCIM, or can no longer operate any of the owner's Bots (grant revoked, Bot made private, given away or deleted) loses their user on the owner's machine.
+  - botd queues a removal per machine (`teammate_cleanups`) and asks the agent with `POST /v1/teammates/{user}/remove`. The agent stops their jobs, screens and processes, deletes their home, temp files and user, and never touches the machine's own user or other teammates. Heartbeats list `teammates`, so ones missed are found too.
+  - Removals run in the background, four at a time. Offline or outdated agents are asked again after each round of heartbeats until done; access coming back cancels one the agent was never asked for, and finishes one it was.
+  - Work: `MACHINE_TEAMMATE_FILES=archive` (default) moves it to the owner's `work/from-teammates/`; `delete` holds it, then purges it after `MACHINE_TEAMMATE_FILES_DAYS` (default 7).
+  - `GET /api/machines/teammate-removals?state=`, `GET /api/users/{key}/machine/teammates` and `POST .../machine/teammates/{teammate}/remove` (admin). Audited as `machine.teammate_removal_queued`, `machine.teammate_removed`, `machine.teammate_removal_failed`, `machine.teammate_removal_cancelled`, `machine.teammate_removal_forced` and `machine.teammate_files_purged`.
 - **Not yet**: tying tiers to billing.
 
 ## API
@@ -302,7 +307,7 @@ All JSON. Auth: a session cookie (sign-in page and console) or `Authorization: B
 - `GET /api/state`: user name, installed harnesses, the Bots you can see, global policy, pending approvals on those Bots. Each Bot's `handoff` is the id of its unanswered handoff card, or null; `owner` is `{id, name}`, `visibility` is `private` or `shared`, and `access` is yours: `view`, `operate`, or `manage`.
 - `GET /api/events`: SSE stream (`message`, `draft`, `status`, `bot`, `botDeleted`, `approval`, `policy`, `resync`), only about Bots you can see
 - `POST /api/bots` `{name, harness?, model?, color?, shape?, visibility?}`: you own it; shared unless `visibility` is `private`. 403 outside your tier's routes or past its `maxBots`. Each Bot has `tier: {name, label, managed}`; on a managed tier `model` and `effort` go to admins only, with `route` and `harnesses` (the owner's tier's)
-- `PATCH /api/bots/:id` `{name?, hidden?, harness?, model?, effort?}`, `DELETE /api/bots/:id`: owner or admin
+- `PATCH /api/bots/:id` `{name?, hidden?, harness?, model?, effort?, prompts?}`, `DELETE /api/bots/:id`: owner or admin. `prompts` is the Bot's suggested prompts: up to 6 strings of up to 200 characters (trimmed, blanks and repeats dropped), `[]` for none, or `null` for the client's defaults. Every Bot view has `prompts` (null until set) ([ADR 0054](adr/0054-suggested-prompts.md))
 - `GET /api/bots/:id/access` → `{botId, owner, visibility, access, grants?}` (grants for the owner and admins). `PATCH` `{visibility?, owner?}` (owner: admins only)
 - `PUT /api/bots/:id/grants/:user` `{level: viewer|operator}`, `DELETE /api/bots/:id/grants/:user`: owner or admin; `:user` is an id or email
 - `GET /api/harnesses/:name/models`: models and reasoning efforts the harness offers (Claude Code: aliases; Codex: `codex debug models`; Pi: `pi --list-models`; Hermes Agent: one entry with an empty `id`, meaning any model name, with its efforts). 403 for non-admins on a managed tier; `?tier=<name>` (admins): only that tier's models
@@ -354,6 +359,9 @@ Per-user machines ([ADR 0025](adr/0025-control-plane-linode.md)). 503 when the c
 - `POST /api/users/:id-or-email/machine/suspend`, `/resume`, `/resize` `{tier}`: 200 with the machine (Linode is checked first, so a repeat, or a change already made there, calls nothing; resizing to the same tier applies a changed plan), 409 from the wrong state, 502 `{error, machine}` if Linode refused
 - `DELETE /api/users/:id-or-email/machine`: 200 once deleted at Linode, 202 while it retries
 - `POST /api/machines/reconcile` → `{checked, changed}`: one reconciler pass now
+- `GET /api/machines/teammate-removals?state=pending|held|done|cancelled|open|all` → `{files, graceDays, removals, openByMachine}`: leaving teammates' removals ([ADR 0052](adr/0052-teammate-offboarding-on-machines.md)), newest first
+- `GET /api/users/:id-or-email/machine/teammates` → `{machineId, canRemove, teammates, removals}`: teammates with a user on it, and whether each still should
+- `POST /api/users/:id-or-email/machine/teammates/:teammate/remove`: remove that teammate's user now; 200 when done, 202 `{removal, error?}` while it's pending
 
 Approvals, policy, and audit. Writes, decisions, the approvals list, and the audit log need a person (403 for the Bot token):
 
