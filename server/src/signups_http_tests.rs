@@ -50,7 +50,7 @@ async fn the_site_is_public_and_the_console_moved_to_its_own_path() {
     assert_eq!((code, header(&head, "location").as_deref()), (303, Some("/login")));
     let (code, head, _) = call_with(port, "GET", "/console", &admin, "", "").await;
     assert_eq!((code, header(&head, "location").as_deref()), (308, Some("/console/")));
-    for (path, has) in [("/console/", "app.js"), ("/console/app.js", "/api/state"), ("/console/styles.css", "{")] {
+    for (path, has) in [("/console/", "app.js"), ("/console/app.js", "/api/signups"), ("/console/styles.css", "{")] {
         let (code, body) = call(port, "GET", path, &admin, "").await;
         assert!(code == 200 && body.contains(has), "{path}: {code}");
     }

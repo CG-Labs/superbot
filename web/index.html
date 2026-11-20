@@ -3,146 +3,96 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>SuperBot</title>
+  <title>SuperBot admin</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2264%22%20height%3D%2264%22%20viewBox%3D%220%200%2064%2064%22%3E%3Crect%20width%3D%2264%22%20height%3D%2264%22%20rx%3D%2214.08%22%20fill%3D%22%23171717%22%2F%3E%3Csvg%20x%3D%223%22%20y%3D%223%22%20width%3D%2258%22%20height%3D%2258%22%20viewBox%3D%220%200%20100%20100%22%3E%0A%20%20%3Cpath%20fill%3D%22%234b8df8%22%20d%3D%22M50%208%20L52.8%2015.2%20L60%2018%20L52.8%2020.8%20L50%2028%20L47.2%2020.8%20L40%2018%20L47.2%2015.2%20Z%22%2F%3E%0A%20%20%3Crect%20x%3D%2247%22%20y%3D%2224%22%20width%3D%226%22%20height%3D%2210%22%20fill%3D%22%234b8df8%22%2F%3E%0A%20%20%3Crect%20x%3D%2214%22%20y%3D%2232%22%20width%3D%2272%22%20height%3D%2260%22%20rx%3D%2218%22%20fill%3D%22%232f72e4%22%2F%3E%0A%20%20%3Crect%20x%3D%2224%22%20y%3D%2245%22%20width%3D%2252%22%20height%3D%2232%22%20rx%3D%2216%22%20fill%3D%22%23171717%22%2F%3E%0A%20%20%3Crect%20x%3D%2236%22%20y%3D%2253%22%20width%3D%228%22%20height%3D%2216%22%20rx%3D%224%22%20fill%3D%22%23ececec%22%2F%3E%0A%20%20%3Crect%20x%3D%2256%22%20y%3D%2253%22%20width%3D%228%22%20height%3D%2216%22%20rx%3D%224%22%20fill%3D%22%23ececec%22%2F%3E%0A%3C%2Fsvg%3E%3C%2Fsvg%3E" /><!-- brand:favicon -->
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <div class="app">
-    <aside class="sidebar">
-      <div class="sidebar-top">
-        <button class="icon-btn" id="search-btn" title="Search">
-          <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.2-4.2"/></svg>
-        </button>
-        <button class="icon-btn" id="new-btn" title="New Bot">
-          <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
-        </button>
-      </div>
-      <input class="search" id="search" placeholder="Search Bots" hidden />
-
-      <button class="primary-bot" id="primary-bot"></button>
-
-      <nav class="bot-list" id="bot-list"></nav>
-
-      <button class="hidden-bots" id="hidden-btn">
-        <span id="hidden-label">Hidden Bots</span><span id="hidden-count"></span>
-      </button>
-      <button class="hidden-bots approvals-btn" id="approvals-btn">
-        <span>Approvals</span><span class="count" id="approvals-count"></span>
-      </button>
-      <button class="hidden-bots" id="audit-btn"><span>Audit log</span></button>
-      <button class="hidden-bots" id="signout-btn" hidden><span>Sign out</span></button>
-
-      <div class="sidebar-bottom">
-        <div class="me">
-          <div class="me-avatar" id="me-avatar"></div>
-          <span id="me-name"></span>
-        </div>
-        <button class="icon-btn" title="Apps">
-          <svg viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><path d="M17 14v6M14 17h6"/></svg>
-        </button>
-      </div>
-    </aside>
-
-    <main class="chat">
-      <header class="chat-header">
-        <div class="bot-pill" id="bot-pill"></div>
-        <button class="share-btn screen-btn" id="screen-btn" title="Watch this Bot's screen">Screen</button>
-        <button class="share-btn">Share</button>
-      </header>
-
-      <section class="messages" id="messages"></section>
-
-      <button class="scroll-down" id="scroll-down" title="Scroll to bottom">
-        <svg viewBox="0 0 24 24"><path d="M12 5v14M6 13l6 6 6-6"/></svg>
-      </button>
-
-      <form class="composer" id="composer">
-        <button type="button" class="composer-plus" title="Attach">
-          <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
-        </button>
-        <input id="input" autocomplete="off" />
-        <button type="button" class="composer-mic" title="Voice note">
-          <svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg>
-        </button>
-        <button type="submit" class="composer-voice" title="Send">
-          <svg viewBox="0 0 24 24"><path d="M4 10v4M8 7v10M12 4v16M16 7v10M20 10v4"/></svg>
-        </button>
-      </form>
-      <div class="footnote"><b>SuperBot</b> · open source, self-hosted</div>
-
-      <div class="model-bar" id="model-bar" hidden>
-        <select id="model-select" title="Model"></select>
-        <select id="effort-select" title="Reasoning effort"></select>
-      </div>
-    </main>
-
-    <aside class="details" id="details" hidden></aside>
-
-    <aside class="screen" id="screen" hidden>
-      <div class="screen-bar">
-        <span id="screen-title"></span>
-        <button class="screen-take" id="screen-take">Take over</button>
-        <button class="icon-btn" id="screen-close" title="Close">
-          <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
-        </button>
-      </div>
-      <div class="screen-view">
-        <iframe id="screen-frame" title="Bot screen" allow="clipboard-read; clipboard-write"></iframe>
-        <div class="screen-shield" id="screen-shield" title="Click Take over to use this screen"></div>
-        <div class="screen-msg" id="screen-msg" hidden></div>
-      </div>
-    </aside>
-  </div>
-  <div class="modal-backdrop" id="nb" hidden>
-    <form class="modal" id="nb-form" autocomplete="off">
-      <div class="modal-head">
-        <h3>Create New Bot</h3>
-        <button type="button" class="modal-close" id="nb-close" title="Close">
-          <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
-        </button>
-      </div>
-      <div class="modal-body">
-        <div class="nb-preview" id="nb-preview"></div>
-        <input class="nb-input" id="nb-name" maxlength="60" placeholder="Name your Bot" />
-        <div class="nb-shapes" id="nb-shapes"></div>
-        <div class="nb-colors" id="nb-colors"></div>
-        <div class="nb-error" id="nb-error" hidden></div>
-      </div>
-      <div class="modal-foot">
-        <label class="nb-runs">Runs on <select id="nb-harness"></select></label>
-        <button type="button" class="nb-btn" id="nb-cancel">Cancel</button>
-        <button type="submit" class="nb-btn primary" id="nb-create">Create</button>
-      </div>
-    </form>
-  </div>
-  <div class="modal-backdrop" id="ap" hidden>
-    <div class="modal ap-modal">
-      <div class="modal-head">
-        <h3>Approvals</h3>
-        <button type="button" class="modal-close" id="ap-close" title="Close">
-          <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
-        </button>
-      </div>
-      <div class="modal-body ap-body" id="ap-list"></div>
-      <div class="modal-foot">
-        <label class="nb-runs">All Bots <select id="ap-mode">
-          <option value="ask">Ask before risky actions</option>
-          <option value="bypass">Bypass (dev only)</option>
-        </select></label>
-      </div>
+  <header class="top">
+    <a class="brand" href="/console/"><b>SuperBot</b> admin</a>
+    <nav class="tabs" id="tabs" aria-label="Admin sections">
+      <a href="#users" data-tab="users">Users</a>
+      <a href="#requests" data-tab="requests">Requests <span class="count" id="requests-count"></span></a>
+      <a href="#machines" data-tab="machines">Machines</a>
+      <a href="#audit" data-tab="audit">Audit log</a>
+      <a href="#settings" data-tab="settings">Settings</a>
+    </nav>
+    <div class="me">
+      <a class="btn" href="/app/" target="_blank" rel="noopener" title="Chat, Bots, approvals and screens are in the app">Open the app ↗</a>
+      <span id="me-name"></span>
+      <button type="button" class="btn" id="signout-btn">Sign out</button>
     </div>
-  </div>
-  <div class="modal-backdrop" id="au" hidden>
-    <div class="modal au-modal">
-      <div class="modal-head">
-        <h3>Audit log</h3>
-        <button type="button" class="modal-close" id="au-close" title="Close">
-          <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
-        </button>
+  </header>
+
+  <main>
+    <p class="note">This page is for admins: people, requests for access, machines, the audit log, and server settings. Chat, Bots, approvals of Bot actions, and screens are in <a href="/app/" target="_blank" rel="noopener">the app</a>.</p>
+    <div class="error" id="error" role="alert" hidden></div>
+
+    <section id="tab-users" hidden>
+      <form class="bar" id="add-user" autocomplete="off">
+        <input id="add-email" type="email" placeholder="Email" required spellcheck="false" />
+        <input id="add-name" placeholder="Name (optional)" maxlength="100" />
+        <select id="add-role" title="Role">
+          <option value="member">Member</option>
+          <option value="readonly">Read-only</option>
+          <option value="admin">Admin</option>
+        </select>
+        <button type="submit" class="btn primary">Add user</button>
+        <label class="push">Sign-in codes last
+          <select id="code-ttl">
+            <option value="60">1 hour</option>
+            <option value="1440" selected>24 hours</option>
+            <option value="10080">7 days</option>
+          </select>
+        </label>
+      </form>
+      <table class="grid">
+        <thead><tr><th>Person</th><th>Role</th><th>Status</th><th>Last sign-in</th><th>Code</th><th></th></tr></thead>
+        <tbody id="users-rows"></tbody>
+      </table>
+      <div class="empty" id="users-empty" hidden></div>
+    </section>
+
+    <section id="tab-requests" hidden>
+      <div class="bar">
+        <select id="requests-status" title="Show">
+          <option value="pending">Waiting</option>
+          <option value="approved">Approved</option>
+          <option value="rejected">Rejected</option>
+          <option value="all">All</option>
+        </select>
+        <label class="push">Codes for approved people last
+          <select id="request-ttl">
+            <option value="1440">24 hours</option>
+            <option value="4320" selected>3 days</option>
+            <option value="10080">7 days</option>
+          </select>
+        </label>
       </div>
-      <form class="au-filters" id="au-filters" autocomplete="off">
-        <input id="au-action" placeholder="Action, e.g. bot.* or auth.login_failed" spellcheck="false" />
+      <div id="requests-list"></div>
+      <div class="empty" id="requests-empty" hidden></div>
+      <p class="hint" id="requests-capped" hidden></p>
+    </section>
+
+    <section id="tab-machines" hidden>
+      <form class="bar" id="give-machine" autocomplete="off">
+        <input id="machine-user" placeholder="User email or id" required spellcheck="false" />
+        <input id="machine-tier" placeholder="Tier (default)" spellcheck="false" />
+        <input id="machine-region" placeholder="Region (default)" spellcheck="false" />
+        <button type="submit" class="btn primary">Give a machine</button>
+        <label class="push"><input type="checkbox" id="machines-destroyed" /> Show destroyed</label>
+        <button type="button" class="btn" id="machines-reconcile">Reconcile now</button>
+      </form>
+      <table class="grid">
+        <thead><tr><th>User</th><th>State</th><th>Tier</th><th>Region</th><th>Address</th><th>Updated</th><th></th></tr></thead>
+        <tbody id="machines-rows"></tbody>
+      </table>
+      <div class="empty" id="machines-empty" hidden></div>
+    </section>
+
+    <section id="tab-audit" hidden>
+      <form class="bar au-filters" id="au-filters" autocomplete="off">
+        <input id="au-action" placeholder="Action, e.g. user.* or auth.login_failed" spellcheck="false" />
         <select id="au-actor" title="Who">
           <option value="">Everyone</option>
           <option value="user">People</option>
@@ -160,18 +110,69 @@
         </select>
         <label>From <input type="date" id="au-from" /></label>
         <label>To <input type="date" id="au-to" /></label>
+        <a class="btn primary push" id="au-export" href="/api/audit/export.csv" download>Export CSV</a>
       </form>
-      <div class="modal-body au-body">
-        <table class="au-table">
-          <thead><tr><th>Time</th><th>Who</th><th>Action</th><th>Target</th><th>Outcome</th><th>IP</th><th>Details</th></tr></thead>
-          <tbody id="au-rows"></tbody>
-        </table>
-        <div class="empty" id="au-empty" hidden></div>
-        <button type="button" class="nb-btn au-more" id="au-more" hidden>Load more</button>
+      <table class="grid au-table">
+        <thead><tr><th>Time</th><th>Who</th><th>Action</th><th>Target</th><th>Outcome</th><th>IP</th><th>Details</th></tr></thead>
+        <tbody id="au-rows"></tbody>
+      </table>
+      <div class="empty" id="au-empty" hidden></div>
+      <button type="button" class="btn more" id="au-more" hidden>Load more</button>
+      <p class="hint">Append-only. Export uses these filters.</p>
+    </section>
+
+    <section id="tab-settings" hidden>
+      <h2>Risky actions</h2>
+      <div class="bar">
+        <label>All Bots
+          <select id="policy-mode">
+            <option value="ask">Ask before risky actions</option>
+            <option value="bypass">Bypass (dev only)</option>
+          </select>
+        </label>
       </div>
+
+      <h2>Sign-in</h2>
+      <p class="hint" id="signin-info"></p>
+
+      <h2>Server secrets</h2>
+      <p class="hint">Server-wide API keys and logins. Values are never shown; a person's own secret of the same name wins for their Bots.</p>
+      <form class="bar" id="secret-form" autocomplete="off">
+        <input id="secret-name" placeholder="NAME" required spellcheck="false" />
+        <textarea id="secret-value" rows="1" placeholder="Value (multi-line keys are fine)" required spellcheck="false" autocomplete="off"></textarea>
+        <button type="submit" class="btn primary">Save</button>
+      </form>
+      <table class="grid">
+        <thead><tr><th>Name</th><th>Store</th><th>Notes</th><th></th></tr></thead>
+        <tbody id="secrets-rows"></tbody>
+      </table>
+      <div class="empty" id="secrets-empty" hidden></div>
+
+      <h2>SCIM provisioning</h2>
+      <p class="hint" id="scim-info"></p>
+      <form class="bar" id="scim-form" autocomplete="off">
+        <input id="scim-tenant" placeholder="Tenant, e.g. entra" required spellcheck="false" />
+        <input id="scim-label" placeholder="Label (optional)" />
+        <input id="scim-sso" placeholder="SSO provider id (optional)" spellcheck="false" />
+        <button type="submit" class="btn primary">New token</button>
+      </form>
+      <table class="grid">
+        <thead><tr><th>Tenant</th><th>Label</th><th>SSO</th><th>Created</th><th>Last used</th><th></th></tr></thead>
+        <tbody id="scim-rows"></tbody>
+      </table>
+      <div class="empty" id="scim-empty" hidden></div>
+    </section>
+  </main>
+
+  <div class="modal-backdrop" id="once" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="once-title">
+      <h3 id="once-title"></h3>
+      <p class="hint" id="once-note"></p>
+      <code class="secret" id="once-value"></code>
       <div class="modal-foot">
-        <span class="au-note">Append-only. Export uses these filters.</span>
-        <a class="nb-btn primary" id="au-export" href="/api/audit/export.csv" download>Export CSV</a>
+        <button type="button" class="btn" id="once-copy">Copy</button>
+        <button type="button" class="btn" id="once-copy-link" hidden>Copy invite link</button>
+        <button type="button" class="btn primary" id="once-close">Done</button>
       </div>
     </div>
   </div>
