@@ -77,6 +77,12 @@ pub fn user_disabled(app: &App, by: &Who, user: &str) -> usize {
     on_behalf_of(app, user).into_iter().filter(|(r, _)| r.enabled).filter(|(r, reason)| pause(app, by, r, reason, user)).count()
 }
 
+/// Pauses the routines of users who were disabled before botd paused routines on
+/// disable (an upgrade), so re-enabling them later can't restart those unasked.
+pub fn pause_already_disabled(app: &App, by: &Who) -> usize {
+    app.db.users().into_iter().filter(|u| !u.active()).map(|u| user_disabled(app, by, &u.id)).sum()
+}
+
 /// `user` was just enabled: their paused routines stay paused unless the server says
 /// otherwise. Returns how many were resumed.
 pub fn user_enabled(app: &App, by: &Who, user: &str) -> usize {
@@ -99,7 +105,7 @@ fn resume(app: &App, by: &Who, routines: Vec<Routine>, why: &str) -> Vec<Routine
         if app.db.resume_routine(&r.id) {
             let details = json!({ "name": r.name, "reason": why, "pausedFor": r.paused_for, "pausedReason": r.paused_reason });
             app.db.record(&by.event("routine.resumed").target("routine", &r.id).bot(&r.bot_id).details(details));
-            out.push(r);
+            out.extend(app.db.routine(&r.id));
         }
     }
     out
@@ -166,11 +172,13 @@ pub async fn handover(State(app): State<AppState>, Extension(by): Extension<Who>
             ));
         }
     }
-    let mut moved = Vec::new();
+    // A refusal midway (someone took a slot meanwhile) still moves the routines of the
+    // Bots already given, so none is left with the new owner but held for the old.
+    let (mut moved, mut refused) = (Vec::new(), None);
     for b in &bots {
         if let Err(e) = crate::give_bot(&app, &by, b, &to).await {
-            record(&app, &by, &from, &to, &moved, &[], &[], &[]);
-            return Err(e);
+            refused = Some(e);
+            break;
         }
         moved.push(b.id.clone());
     }
@@ -186,6 +194,10 @@ pub async fn handover(State(app): State<AppState>, Extension(by): Extension<Who>
         let details = json!({ "name": r.name, "from": from.id, "to": to.id, "paused": !r.enabled && r.paused_reason.is_some() });
         app.db.record(&by.event("routine.handed_over").target("routine", &r.id).bot(&r.bot_id).details(details));
         routines.push(r.id);
+    }
+    if let Some(e) = refused {
+        record(&app, &by, &from, &to, &moved, &routines, &skipped, &[]);
+        return Err(e);
     }
     let resumed: Vec<String> = if resume_now {
         let paused = routines.iter().filter_map(|id| app.db.routine(id)).filter(|r| r.paused_for.as_deref() == Some(&to.id)).collect();

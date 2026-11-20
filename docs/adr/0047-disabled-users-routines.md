@@ -26,7 +26,7 @@ When a user is disabled, by any path, botd pauses every **enabled** routine that
 
 Pausing turns the routine off (`enabled = false`) and records `paused_reason`, `paused_for` (the disabled user) and `paused_at` (migration 19). A routine that was already off stays as it was, unmarked, so it's never turned on by a later resume. Turning a routine on or off by hand clears the marks.
 
-One path does it: `handover::user_disabled`, called from the admin `PATCH /api/users/:id` (which `botctl` and the portal use), SCIM's `active: false`, and SCIM's `DELETE`.
+One path does it: `handover::user_disabled`, called from the admin `PATCH /api/users/:id` (which `botctl` and the portal use), SCIM's `active: false`, and SCIM's `DELETE`. At every start botd also runs it for each user who is disabled, so routines of people disabled before this change (an upgrade) are paused before anyone can re-enable them; the actor is `system` `bootstrap`, and it does nothing once they are paused.
 
 ### Refused at fire and run time (defence in depth)
 
@@ -51,6 +51,7 @@ Resuming re-checks each routine: one whose owner or author is still disabled sta
 - **From** a disabled user only (409 if active: give one Bot away from its access settings instead). **To** an active user who isn't them and isn't read-only (400).
 - **Bots**: every Bot they own goes to `to`, the same way an admin gives one Bot away (ADR 0017): work in progress stops, its memory follows, `to`'s grant on it is dropped, `bot.owner_changed`. The whole set must fit `to`'s plan's Bot limit, checked first (403, `user.handover_refused`).
 - **Routines**: those they wrote become `to`'s (`author_id`), and pauses held for them move to `to`, on every Bot `to` can operate. A routine on a Bot `to` can't operate (someone else's private Bot) is left as it was, paused for the disabled user, and listed in `skipped`, so nobody's routine starts running on a Bot they can't use.
+- If a Bot can't be given midway (someone took one of `to`'s slots meanwhile), the hand-over stops there with a 403, but the routines are still moved for the Bots already given, so none is left with `to` but held for the disabled user. `user.handed_over` records what moved. Running it again moves the rest.
 - They **stay paused** unless `resumeRoutines: true`, which resumes the ones just handed over. Otherwise resume them later for `to`.
 
 ### Audit

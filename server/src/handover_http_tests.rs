@@ -107,7 +107,9 @@ async fn a_disabled_users_routines_are_paused_and_never_fire() {
     assert_eq!(events(port, &admin, "action=user.enabled").await[0]["details"]["routinesResumed"], 0);
     let (code, res) = call(port, "POST", &format!("/api/users/{ada}/routines/resume"), &admin, "").await;
     assert_eq!(code, 200, "{res}");
-    assert_eq!(parse(&res)["resumed"].as_array().unwrap().len(), 4, "{res}");
+    let listed = parse(&res)["resumed"].as_array().unwrap().clone();
+    assert_eq!(listed.len(), 4, "{res}");
+    assert!(listed.iter().all(|r| r["enabled"] == true && r["pausedReason"].is_null() && r["pausedFor"].is_null()), "the saved state: {res}");
     assert!(r(&own).enabled && r(&written).enabled && r(&own).paused_reason.is_none());
     assert!(!r(&off).enabled, "the one she'd turned off stays off");
     let resumed = events(port, &admin, "action=routine.resumed").await;
@@ -220,4 +222,22 @@ async fn a_handover_can_resume_routines_at_once() {
     assert_eq!(events(port, &admin, "action=routine.resumed").await[0]["details"]["reason"], "handover");
     let (code, _) = call(port, "POST", &format!("/api/users/{ada}/handover"), &admin, r#"{"to":"cal@example.com","resumeRoutines":"yes"}"#).await;
     assert_eq!(code, 400);
+}
+
+#[tokio::test]
+async fn users_disabled_before_the_upgrade_get_their_routines_paused_at_start() {
+    let (port, app, admin, _) = serve_app().await;
+    let (ada, a) = user_with(port, &admin, "ada@example.com", "member").await;
+    let adas = bot(&app, "Ada's", &ada);
+    let own = routine(port, &a, &adas.id, "Own").await;
+    // As an older botd left it: disabled, routines still on.
+    app.db.update_user(&ada, db::UserPatch { status: Some("disabled"), ..Default::default() }).unwrap();
+    assert!(app.db.routine(&own).unwrap().enabled);
+    let by = audit::Who { actor: audit::Actor::system("bootstrap"), source: Default::default() };
+    assert_eq!(handover::pause_already_disabled(&app, &by), 1);
+    assert_eq!(handover::pause_already_disabled(&app, &by), 0, "once");
+    app.db.update_user(&ada, db::UserPatch { status: Some("active"), ..Default::default() }).unwrap();
+    let r = app.db.routine(&own).unwrap();
+    assert_eq!((r.enabled, r.paused_reason.as_deref()), (false, Some("owner_disabled")), "an admin resumes it");
+    assert_eq!(events(port, &admin, "action=routine.paused").await[0]["actorId"], "bootstrap");
 }

@@ -258,6 +258,10 @@ async fn main() {
         None => println!("Isolation: off (all Bots run as this account; ISOLATION=users gives each user their own)."),
     }
     app.start_isolation();
+    let paused = handover::pause_already_disabled(&app, &Who { actor: Actor::system("bootstrap"), source: Source::default() });
+    if paused > 0 {
+        println!("Routines: paused {paused} that ran for disabled users (ADR 0047).");
+    }
     for t in app.db.assigned_tiers().into_iter().filter(|t| app.tiers().get(t).is_none()) {
         eprintln!("WARNING: some users have tier \"{t}\", which TIERS_FILE no longer lists. They get the default tier ({}) until an admin picks another.", app.tiers().default_tier().name);
     }
