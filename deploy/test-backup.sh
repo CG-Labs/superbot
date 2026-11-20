@@ -76,6 +76,23 @@ refuses "age recipients are set but age is not installed" \
   env PATH="$T/noage" DATA_DIR="$D" SUPERBOT_BACKUP_AGE_RECIPIENTS="$RECIPIENT" "$BACKUP" -
 ok "encryption asked for but unavailable fails instead of writing plaintext"
 
+# A tar that reports exit code $FAKE_TAR_EXIT after doing its work, as GNU tar does (1) when a Bot
+# writes a file mid-read, or (2) on a fatal error.
+mkdir "$T/faketar"
+printf '#!/bin/sh\n%s "$@" || exit $?\nexit "$FAKE_TAR_EXIT"\n' "$(command -v tar)" >"$T/faketar/tar"
+chmod +x "$T/faketar/tar"
+B="$T/busy-backups"
+PATH="$T/faketar:$PATH" FAKE_TAR_EXIT=1 DATA_DIR=$D BACKUP_DIR=$B "$BACKUP" 2>"$T/out"
+PATH="$T/faketar:$PATH" FAKE_TAR_EXIT=1 DATA_DIR=$D BACKUP_DIR=$B SUPERBOT_BACKUP_AGE_RECIPIENTS=$RECIPIENT "$BACKUP" 2>>"$T/out"
+grep -q "changed while they were read" "$T/out" || fail "no warning for files changed mid-read"
+[[ $(find "$B" -name 'superbot-*.tar.gz' | wc -l) == 1 && $(find "$B" -name 'superbot-*.tar.gz.age' | wc -l) == 1 ]] ||
+  fail "a file changing mid-read discarded the archive"
+tar -tzf "$(find "$B" -name 'superbot-*.tar.gz')" | grep -qx app.sqlite || fail "the kept archive is unreadable"
+rm -rf "$B"
+refuses "backup failed" env PATH="$T/faketar:$PATH" FAKE_TAR_EXIT=2 DATA_DIR="$D" BACKUP_DIR="$B" "$BACKUP"
+[[ -z $(find "$B" -type f ! -name .lock) ]] || fail "a fatal tar error left an archive or partial file"
+ok "files changing mid-read keep the archive; fatal tar errors leave nothing"
+
 refuses "give the age identity" "$RESTORE" --check "$T/enc.age"
 refuses "could not decrypt" "$RESTORE" --check --identity "$T/other.txt" "$T/enc.age"
 "$RESTORE" --check --identity "$T/id.txt" - <"$T/enc.age" >"$T/check" 2>&1

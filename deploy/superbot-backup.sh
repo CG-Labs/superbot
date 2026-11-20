@@ -89,14 +89,28 @@ archive() {
     members+=(-C "$tmp" app.sqlite)
   fi
   if [[ $status -eq 0 ]]; then
+    local tar_status=0 age_status=0 codes=()
     if [[ ${#recipients[@]} -gt 0 ]]; then
-      { tar -czf - "${excludes[@]}" "${members[@]}" | age "${recipients[@]}"; } || status=$?
+      { tar_files | age "${recipients[@]}"; codes=("${PIPESTATUS[@]}"); } || true
+      tar_status=${codes[0]} age_status=${codes[1]}
     else
-      tar -czf - "${excludes[@]}" "${members[@]}" || status=$?
+      tar_files || tar_status=$?
     fi
+    # GNU tar exits 1 when a file changed or vanished while it was read (a Bot writing its
+    # session). The archive is still complete and readable, with that file as it was mid-write.
+    if [[ $tar_status -eq 1 ]]; then
+      log "some files changed while they were read; kept the archive (app.sqlite is a consistent copy)"
+      tar_status=0
+    fi
+    [[ $tar_status -eq 0 ]] || status=$tar_status
+    [[ $age_status -eq 0 ]] || status=$age_status
   fi
   rm -rf "$tmp"
   return "$status"
+}
+tar_files() {
+  tar -czf - --warning=no-file-changed --warning=no-file-removed --ignore-failed-read \
+    "${excludes[@]}" "${members[@]}"
 }
 excludes=(--anchored --exclude=./app.sqlite --exclude='./app.sqlite-*' --exclude=./screens
   --exclude=./.superbot-backup --exclude='./.restore-*' --exclude='./.pre-restore-*')
@@ -115,7 +129,7 @@ backup_to_dir() {
       n=$((n + 1))
     done
     partial=$(mktemp "$BACKUP_DIR/.partial-XXXXXXXX") || exit 1
-    archive >"$partial" || { rm -f "$partial"; exit 1; }
+    archive >"$partial" || { rm -f "$partial"; log "backup failed; no archive written"; exit 1; }
     mv "$partial" "$dest" || exit 1
     # Folders named <stamp> are snapshots from the installer's script before ADR 0030.
     find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 \
