@@ -2547,6 +2547,16 @@ impl Db {
         s.query_map(rusqlite::params_from_iter(args), audit_row).unwrap().filter_map(Result::ok).collect()
     }
 
+    /// Saves whether per-user accounts are on at this start (ADR 0037), and returns
+    /// whether they were at the last one.
+    pub fn swap_isolation(&self, on: bool) -> bool {
+        let c = self.c();
+        let was: Option<String> = c.query_row("SELECT value FROM settings WHERE key = 'isolation'", [], |r| r.get(0)).optional().ok().flatten();
+        let now = if on { "users" } else { "off" };
+        c.execute("INSERT INTO settings (key, value) VALUES ('isolation', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1", [now]).unwrap();
+        was.as_deref() == Some("users")
+    }
+
     /// Days of audit history to keep. None = forever.
     pub fn audit_retention(&self) -> Option<u32> {
         let v: Option<String> = self.c().query_row("SELECT value FROM settings WHERE key = 'audit_retention_days'", [], |r| r.get(0)).optional().ok().flatten();

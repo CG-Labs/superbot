@@ -303,10 +303,29 @@ impl App {
                 (iso.user_file(&bot.owner_id), self.data_user_file(&bot.owner_id)),
             ];
             for (copy, kept) in pairs {
-                if let (Some(copy), Some(kept)) = (copy, kept) {
-                    let _ = accounts::seed_from(&copy, &kept);
+                if let (Some(copy), Some(text)) = (copy, kept.and_then(|p| std::fs::read_to_string(p).ok())) {
+                    let _ = accounts::seed(&copy, &text);
                 }
             }
+        }
+    }
+
+    /// At startup, before any run. Per-user accounts turned back on: the copies left in
+    /// users' folders from the last time may be older than botd's originals, which
+    /// runs changed meanwhile, so they're dropped and made again at each Bot's next run.
+    /// While accounts stay on, a copy is never replaced: it may hold a running Bot's edits.
+    pub fn start_isolation(&self) {
+        let Some(iso) = self.isolation() else {
+            self.db.swap_isolation(false);
+            return;
+        };
+        if self.db.swap_isolation(true) {
+            return;
+        }
+        let bots = self.db.bots().into_iter().filter_map(|b| iso.memory_file(&b.owner_id, &b.id));
+        let users = self.db.users().into_iter().filter_map(|u| iso.user_file(&u.id));
+        for copy in bots.chain(users) {
+            accounts::remove(&copy);
         }
     }
 
@@ -1302,7 +1321,7 @@ mod tests {
     }
 
     #[test]
-    fn isolated_copies_keep_cleared_memory_and_follow_newer_originals() {
+    fn isolated_copies_keep_cleared_memory_and_are_remade_after_isolation_was_off() {
         use crate::acl::Visibility;
         use crate::rbac::Role;
         let (app, root) = isolated_app("/bin/false");
@@ -1318,20 +1337,29 @@ mod tests {
         app.keep_memory(&a);
         assert_eq!(read(&kept), "");
 
-        // botd's original changed after the copy, as while isolation was off: the next run
-        // here starts from the original, and doesn't copy the old text back over it.
+        // While accounts stay on, a copy is never replaced, even when botd's original was
+        // written after it: another Bot's run may have saved an older snapshot meanwhile.
+        let facts = app.user_file(&ada.id).unwrap();
+        std::fs::write(&facts, "# About the user\n- edited by B1, still running\n").unwrap();
+        std::fs::write(app.data_user_file(&ada.id).unwrap(), "# About the user\n- A1's older snapshot\n").unwrap();
+        app.init_bot_files(&a);
+        assert_eq!(read(&facts), "# About the user\n- edited by B1, still running\n");
+
+        // Turned off, then on again: runs changed the originals meanwhile, so the old copies
+        // are dropped at startup and made again, never copied back over the originals.
+        assert!(!app.db.swap_isolation(false));
         std::fs::write(&mem, "# A1\n- from before\n").unwrap();
-        let earlier = std::time::SystemTime::now() - Duration::from_secs(60);
-        std::fs::File::options().write(true).open(&mem).unwrap().set_modified(earlier).unwrap();
         std::fs::write(&kept, "# A1\n- learned while off\n").unwrap();
+        app.start_isolation();
+        assert!(!mem.exists() && !facts.exists());
         app.init_bot_files(&a);
         assert_eq!(read(&mem), "# A1\n- learned while off\n");
         app.keep_memory(&a);
         assert_eq!(read(&kept), "# A1\n- learned while off\n");
 
-        // A copy changed after the original is the newest, and stays.
+        // The next start, still on, keeps what runs left.
         std::fs::write(&mem, "# A1\n- learned just now\n").unwrap();
-        app.init_bot_files(&a);
+        app.start_isolation();
         assert_eq!(read(&mem), "# A1\n- learned just now\n");
     }
 

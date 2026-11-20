@@ -238,20 +238,6 @@ pub fn seed(path: &Path, text: &str) -> io::Result<bool> {
     }
 }
 
-/// Makes `copy` from botd's `original` if it's missing, or replaces it if it's out of
-/// date: older than the original and different, as when the original changed while
-/// isolation was off. Never follows a link. Ok(true) if it wrote.
-pub fn seed_from(copy: &Path, original: &Path) -> io::Result<bool> {
-    let text = std::fs::read_to_string(original)?;
-    let changed = std::fs::metadata(original)?.modified().ok();
-    let stale = std::fs::symlink_metadata(copy)
-        .is_ok_and(|m| m.is_file() && m.modified().ok() < changed && read_plain(copy, MAX_FILE).as_deref() != Some(text.as_str()));
-    if stale {
-        remove(copy);
-    }
-    seed(copy, &text)
-}
-
 /// Removes the entry at `path` (a link is removed, never followed) in a trusted folder.
 pub fn remove(path: &Path) {
     if path.parent().is_some_and(trusted_dir) {
