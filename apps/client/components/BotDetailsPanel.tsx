@@ -9,7 +9,7 @@ import {
   TextInput,
   View,
 } from "react-native";
-import { sharingLabel } from "../src/access";
+import { sharingLabel, whereItRuns, whoseKeys } from "../src/access";
 import { confirmAsync, showError } from "../src/dialogs";
 import { cronLabel } from "../src/routines";
 import { useSuperBot } from "../src/SuperBotContext";
@@ -224,6 +224,11 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen }: Props) {
               <View style={styles.row}>
                 <Text style={styles.dim}>{sharingLabel(bot, me.id)}</Text>
               </View>
+              {[whereItRuns(bot, me.id), whoseKeys(bot, me.id)].filter(Boolean).map((line) => (
+                <View key={line} style={styles.row}>
+                  <Text style={styles.dim}>{line}</Text>
+                </View>
+              ))}
               <View style={styles.row}>
                 <Text style={styles.dim}>Shared with everyone</Text>
                 <Switch

@@ -63,6 +63,11 @@ pub struct Actor {
     pub session: Option<String>,
     #[serde(default)]
     pub on_behalf_of: Option<String>,
+    /// The person a Bot's run is for when it isn't plain from the actor (ADR 0046): the
+    /// person behind a Bot that asks, or a routine's author. Kept with queued messages
+    /// only; run events carry it as `forUser`, and it is no audit column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asker: Option<String>,
 }
 
 impl Actor {

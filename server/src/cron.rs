@@ -80,6 +80,7 @@ pub(crate) fn fire(app: &Arc<App>, r: &Routine, at_ms: i64) {
     app.db.routine_ran(&r.id, at_ms);
     let mut scheduler = Actor::system("scheduler");
     scheduler.on_behalf_of = app.db.bot(&r.bot_id).map(|b| b.owner_id);
+    scheduler.asker = r.author_id.clone();
     let by = Who { actor: scheduler, source: Default::default() };
     if let Some(owner) = by.actor.on_behalf_of.as_deref()
         && !take_routine_run(app, r, owner, &by, at_ms)

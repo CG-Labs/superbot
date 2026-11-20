@@ -78,6 +78,9 @@ pub struct Routine {
     pub enabled: bool,
     pub last_run_at: Option<i64>,
     pub created_at: i64,
+    /// Who last wrote its instruction (ADR 0046); its runs are for them. None: from
+    /// before, so its Bot's owner.
+    pub author_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -264,6 +267,7 @@ fn routine_row(r: &Row) -> rusqlite::Result<Routine> {
         enabled: r.get("enabled")?,
         last_run_at: r.get("last_run_at")?,
         created_at: r.get("created_at")?,
+        author_id: r.get("author_id")?,
     })
 }
 
@@ -1023,7 +1027,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 17] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 18] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1041,7 +1045,19 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 17] = [
     migrate_machine_upkeep,
     migrate_billing,
     migrate_billing_customers,
+    migrate_routine_authors,
 ];
+
+/// Who wrote each routine's instruction, so its runs are for them (ADR 0046). Routines
+/// from before have none, and run for their Bot's owner as they did.
+fn migrate_routine_authors(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('routines') WHERE name = 'author_id'", [], |r| r.get(0))?;
+    if !has {
+        c.execute_batch("ALTER TABLE routines ADD COLUMN author_id TEXT;")?;
+    }
+    Ok(())
+}
+
 /// Users linked to their payment-provider customer (ADR 0042), at most one each way;
 /// customers the provider deleted, which are never linked again; and each user's open
 /// checkout, closed before another is opened so only one can be paid. Subscribers from
@@ -1904,25 +1920,39 @@ impl Db {
         self.c().query_row("SELECT * FROM routines WHERE id = ?", [id], routine_row).optional().ok().flatten()
     }
 
+    #[cfg(test)]
     pub fn add_routine(&self, bot_id: &str, name: &str, cron: &str, instruction: &str) -> Routine {
+        self.add_routine_by(bot_id, name, cron, instruction, true, None)
+    }
+
+    /// A routine whose runs are for `author` (ADR 0046), written whole so the scheduler
+    /// never sees it without its author.
+    pub fn add_routine_by(&self, bot_id: &str, name: &str, cron: &str, instruction: &str, enabled: bool, author: Option<&str>) -> Routine {
         let id = crate::short_id();
         self.c()
             .execute(
-                "INSERT INTO routines (id, bot_id, name, cron, instruction, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                params![id, bot_id, name, cron, instruction, now()],
+                "INSERT INTO routines (id, bot_id, name, cron, instruction, enabled, author_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                params![id, bot_id, name, cron, instruction, enabled, author, now()],
             )
             .unwrap();
         self.routine(&id).unwrap()
     }
 
-    pub fn update_routine(&self, id: &str, name: Option<&str>, cron: Option<&str>, instruction: Option<&str>, enabled: Option<bool>) {
+    /// `author`: whom its runs are for once `instruction` changes it (ADR 0046). Both
+    /// change under one lock, so the scheduler never reads one without the other.
+    pub fn update_routine(&self, id: &str, name: Option<&str>, cron: Option<&str>, instruction: Option<&str>, enabled: Option<bool>, author: Option<&str>) {
         let c = self.c();
         let set = |col: &str, v: &dyn rusqlite::ToSql| {
             c.execute(&format!("UPDATE routines SET {col} = ? WHERE id = ?"), params![v, id]).unwrap();
         };
         if let Some(v) = name { set("name", &v) }
         if let Some(v) = cron { set("cron", &v) }
-        if let Some(v) = instruction { set("instruction", &v) }
+        if let Some(v) = instruction {
+            if let Some(a) = author {
+                c.execute("UPDATE routines SET author_id = ? WHERE id = ? AND instruction != ?", params![a, id, v]).unwrap();
+            }
+            set("instruction", &v)
+        }
         if let Some(v) = enabled { set("enabled", &v) }
     }
 
