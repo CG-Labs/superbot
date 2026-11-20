@@ -5,7 +5,7 @@ One Rust binary, `botd`. It serves the landing page (`/`), the admin console (`/
 ## Pages
 
 - `/` and `/get-started`: the public landing page and the request-access form, from `site/`. Same page for everyone, no trackers or external assets ([ADR 0022](adr/0022-landing-and-signups.md)).
-- `/console/`: the built-in admin page (`web/`), for admins only. Members and read-only users go to `/app/`; signed-out visitors go to `/login`. `/console` redirects here ([ADR 0027](adr/0027-expo-primary-hermes-default.md)).
+- `/console/`: the built-in admin and break-glass page (`web/`), for admins only: **Users** (add, roles, disable, sign-in codes, sign out everywhere), sign-up **Requests**, **Machines** (per-user machines from the control plane), the **Audit log**, and **Settings** (approval mode for all Bots, sign-in options, server secrets, SCIM tokens). It has no chat, Bots, or screens; those are in the app. It runs under a strict Content-Security-Policy. Members and read-only users go to `/app/`; signed-out visitors go to `/login`. `/console` redirects here ([ADR 0027](adr/0027-expo-primary-hermes-default.md), [ADR 0032](adr/0032-console-admin-only.md)).
 - `/login`: the sign-in page, also for break-glass. Sign-in lands admins on `/console/` and everyone else on `/app/` (`landing` in `GET /api/auth/me`). Web SSO sign-ins land the same way.
 - `/app/`: the client, the interface for everyone, when Caddy serves it. It picks up a session the sign-in page left in the browser. Without Caddy's client, botd sends admins to `/console/` and shows everyone else a "web app isn't installed" page.
 
@@ -23,7 +23,7 @@ botd embeds `site/` and `web/`. Set `SITE_DIR` or `WEB_DIR` to serve them from d
 - **The computer** is one per user: `WORKSPACE_DIR/users/<owner>/`, shared by that user's Bots. Each Bot gets its own API token and its owner's saved secrets. See [ADR 0029](adr/0029-per-user-isolation.md).
 - **Routines** are cron schedules. Bots create them with the `botctl` CLI, which works from any harness's shell.
 - **Bot to Bot**: a Bot runs `botctl ask "<Bot>" "<message>"`. The other Bot answers in its own chat and the reply prints back. If it takes over 9 minutes, the reply arrives later as a new message.
-- **Model and effort** are saved per Bot. The web app shows a faint picker above the input. Unset means the harness default.
+- **Model and effort** are saved per Bot. The app shows a picker in the chat. Unset means the harness default.
 - **Choice cards**: a reply ending in a ` ```question ` JSON block becomes a multiple-choice card.
 - **Approvals**: in `ask` mode, risky tool calls wait for a person. See [Approvals](#approvals).
 - **Audit log**: admin actions go into an append-only table. See [Audit log](#audit-log).
@@ -116,7 +116,7 @@ Fresh installs start in `ask`. Installs from before approvals keep `bypass` unti
 SUPERBOT_PASSWORD=<your AUTH_PASSWORD> botctl policy set global mode=ask
 ```
 
-Or use the switch at the bottom of the web app's Approvals window. More operator commands: `botctl admin`. botctl only sends the password to a server on the same machine (loopback), since it speaks plain http; from elsewhere, use an SSH tunnel.
+Or use **Settings → Risky actions** in the admin console (`/console/#settings`). More operator commands: `botctl admin`. botctl only sends the password to a server on the same machine (loopback), since it speaks plain http; from elsewhere, use an SSH tunnel.
 
 ```sh
 botctl policy set global timeout=15 git_push=deny   # never push, ask longer
@@ -149,7 +149,7 @@ Admin actions are recorded in `audit_events` in `app.sqlite`: who (person, Bot, 
 - **No secrets**: passwords, tokens, message bodies, and routine instructions are never recorded. Details are scrubbed and clipped anyway.
 - **Retention**: `AUDIT_RETENTION_DAYS` (unset or `0` = keep forever, the default). Pruning runs every 6 hours and is itself logged. Backups copy the table with the rest of `app.sqlite`.
 - **Source IP**: the peer, or the last `X-Forwarded-For` entry when the proxy is on loopback. Set `TRUST_FORWARDED_FOR=1` only when `botd` is reachable solely through your proxy (Compose sets it).
-- **Read it**: the web app's Audit log (filters and Export CSV), or:
+- **Read it**: the Audit log in the app or the admin console (filters and Export CSV), or:
 
 ```sh
 export SUPERBOT_PASSWORD=<your AUTH_PASSWORD>
@@ -169,7 +169,7 @@ People are users with a role: **admin** (everything), **member** (use and manage
 - **Owner**: made on first start as admin `operator` (name `USER_NAME`, email `OWNER_EMAIL`). `AUTH_PASSWORD` signs in as the owner (break-glass) while `AUTH_BREAK_GLASS` is on, the default. Set `AUTH_BREAK_GLASS=0` to ignore the password once admins sign in another way.
 - **Everyone else**: signs in with Microsoft Entra ID, Google, GitHub, Apple, any OpenID Connect IdP (Okta, Keycloak, Auth0, …), or a SAML IdP (ADFS, Okta, …) through a Keycloak bridge when set up, several at once if you like ([Entra](sso/entra.md), [Google](sso/google.md), [GitHub](sso/github.md), [Apple](sso/apple.md), [OIDC](sso/oidc.md), [SAML](sso/saml.md), [ADR 0014](adr/0014-oidc-sso-entra.md), [ADR 0016](adr/0016-sso-multi-provider.md), [ADR 0018](adr/0018-sso-github-apple.md), [ADR 0020](adr/0020-saml-bridge.md)): an admin links their account at each IdP to a user (`botctl user link`), or just-in-time sign-up makes one. Email never links accounts. Or an admin gives them a one-time sign-in code, which they enter in the web app or client. Codes are single use and expire (default 1 hour).
 - **Admin portal**: admins manage all of this in the app too (`/app/`, **Users** in the sidebar): approve or reject [requests for access](#sign-ups), add people, give them a one-time code (1 hour, 24 hours, or 7 days) with a ready-to-send invite and link, change roles, disable, sign out everywhere, link SSO accounts, and see each person's last sign-in and Bot access. Design: [ADR 0021](adr/0021-admin-portal.md).
-- **Sessions**: the web app gets an HttpOnly cookie, the client and `botctl` a bearer token. They end after `SESSION_IDLE_TIMEOUT` without use (default `7d`) or `SESSION_MAX_AGE` after sign-in (default `30d`), on logout, or when an admin revokes them or disables the user. Only hashes are stored.
+- **Sessions**: the sign-in page and the console get an HttpOnly cookie, the client and `botctl` a bearer token. They end after `SESSION_IDLE_TIMEOUT` without use (default `7d`) or `SESSION_MAX_AGE` after sign-in (default `30d`), on logout, or when an admin revokes them or disables the user. Only hashes are stored.
 
 ```sh
 export SUPERBOT_PASSWORD=<your AUTH_PASSWORD>      # or: botctl login <code>, then export SUPERBOT_TOKEN=...
@@ -239,7 +239,7 @@ For CG-Labs managed hosting: botd can rent one Linode per user and track it. **O
 
 ## API
 
-All JSON. Auth: a session cookie (web app) or `Authorization: Bearer <session token>` (client, `botctl`), or HTTP Basic with `AUTH_PASSWORD` while break-glass is on. Empty password requires `ALLOW_NO_AUTH=1` on loopback only. Each route needs a role permission (above); 401 without valid credentials, 403 when the role doesn't allow it. Bot routes also need access to that Bot: 404 for a Bot you can't see, 403 when you can see it but not do this.
+All JSON. Auth: a session cookie (sign-in page and console) or `Authorization: Bearer <session token>` (client, `botctl`), or HTTP Basic with `AUTH_PASSWORD` while break-glass is on. Empty password requires `ALLOW_NO_AUTH=1` on loopback only. Each route needs a role permission (above); 401 without valid credentials, 403 when the role doesn't allow it. Bot routes also need access to that Bot: 404 for a Bot you can't see, 403 when you can see it but not do this.
 
 - `GET /api/state`: user name, installed harnesses, the Bots you can see, global policy, pending approvals on those Bots. Each Bot's `handoff` is the id of its unanswered handoff card, or null; `owner` is `{id, name}`, `visibility` is `private` or `shared`, and `access` is yours: `view`, `operate`, or `manage`.
 - `GET /api/events`: SSE stream (`message`, `draft`, `status`, `bot`, `botDeleted`, `approval`, `policy`, `resync`), only about Bots you can see
