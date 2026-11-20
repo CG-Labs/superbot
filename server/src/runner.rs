@@ -2,8 +2,9 @@
 //! (identity, rules, memory), streams harness events to the web app, and saves replies.
 
 use crate::accounts::{self, Isolation, RunAs};
+use crate::acl::{Access, SharedBots, Viewer, Visibility};
 use crate::adapters::{self, AbortReason, AgentEvent, Guard, RunInput};
-use crate::audit::{Actor, Event, Outcome, Who};
+use crate::audit::{Actor, ActorKind, Event, Outcome, Who};
 use crate::db::{Bot, BotPatch, Db, Message};
 use crate::machines::ControlPlane;
 use crate::machines::route::{self, Assigned, Refusal, Target};
@@ -71,6 +72,9 @@ struct Spot {
     env: HashMap<String, String>,
     screens: bool,
     ctx: Option<Ctx>,
+    /// The person the run is for, when that isn't the Bot's owner and shared Bots are
+    /// isolated (ADR 0046): the run gets neither the owner's own keys nor their facts.
+    for_other: Option<String>,
 }
 
 #[derive(Default)]
@@ -103,6 +107,14 @@ pub struct App {
     pub isolation: OnceLock<Arc<Isolation>>,
     /// Runs on each user's machine now, by user.
     on_machines: Mutex<HashMap<String, u32>>,
+    /// SHARED_BOTS (ADR 0046). Unset: isolated when MACHINE_ROUTING isn't off.
+    pub shared_bots: OnceLock<SharedBots>,
+    /// With isolated shared Bots: whom each Bot's latest run is for, by Bot. Kept after
+    /// the run ends, so whatever it left running stays capped until the next run.
+    askers: Mutex<HashMap<String, String>>,
+    /// ROUTINES_ON_ENABLE=resume (ADR 0047): re-enabling a user resumes the routines
+    /// paused when they were disabled. Unset: they stay paused until an admin resumes them.
+    pub resume_routines_on_enable: OnceLock<bool>,
     closing: AtomicBool,
 }
 
@@ -124,6 +136,9 @@ impl App {
             tiers: OnceLock::new(),
             isolation: OnceLock::new(),
             on_machines: Mutex::default(),
+            shared_bots: OnceLock::new(),
+            askers: Mutex::default(),
+            resume_routines_on_enable: OnceLock::new(),
             closing: AtomicBool::new(false),
         })
     }
@@ -145,6 +160,52 @@ impl App {
         if self.with_run(bot_id, |r| { r.status = status.into(); true }) {
             self.send(json!({ "type": "status", "botId": bot_id, "working": true, "status": status }));
         }
+    }
+
+    /// How shared Bots behave for people other than their owner (ADR 0046).
+    pub fn shared_bots(&self) -> SharedBots {
+        self.shared_bots.get().copied().unwrap_or_else(|| match self.control_plane.get() {
+            Some(cp) if cp.routing != route::Routing::Off => SharedBots::Isolated,
+            _ => SharedBots::Open,
+        })
+    }
+
+    /// The access a Bot acts with toward other Bots: its owner's (ADR 0017), and with
+    /// isolated shared Bots no more than that of the person its latest run is for.
+    pub fn bot_viewer(&self, bot: &Bot) -> Viewer {
+        let owner = Viewer::owner_of(&self.db, bot);
+        match self.askers.lock().unwrap_or_else(|e| e.into_inner()).get(&bot.id) {
+            Some(a) if *a != bot.owner_id => owner.within(Viewer::person(&self.db, a)),
+            _ => owner,
+        }
+    }
+
+    /// Whom a Bot acts for now: the person its latest run is for, else its owner.
+    pub fn acting_for(&self, bot: &Bot) -> String {
+        self.askers.lock().unwrap_or_else(|e| e.into_inner()).get(&bot.id).cloned().unwrap_or_else(|| bot.owner_id.clone())
+    }
+
+    /// Whom a run is for (ADR 0046): the person who asked, through any number of Bots,
+    /// or a routine's author; else the Bot's owner.
+    fn asker_of(bot: &Bot, by: &Who) -> String {
+        let a = &by.actor;
+        let person = match a.kind {
+            ActorKind::User => a.id.clone(),
+            ActorKind::Bot => a.on_behalf_of.clone(),
+            ActorKind::System => None,
+        };
+        a.asker.clone().or(person).unwrap_or_else(|| bot.owner_id.clone())
+    }
+
+    /// Where a Bot's runs go now, as anyone who can see it may know (ADR 0046): `server`,
+    /// `machine` (its owner's) or `nowhere`. None while routing is off: always here.
+    pub fn runs_on(&self, bot: &Bot) -> Option<&'static str> {
+        let cp = self.control_plane.get().filter(|cp| cp.routing != route::Routing::Off)?;
+        Some(match cp.route(&self.db, &bot.owner_id) {
+            Ok(Target::Local) => "server",
+            Ok(Target::Machine(_)) => "machine",
+            Err(_) => "nowhere",
+        })
     }
 
     pub fn tiers(&self) -> &Tiers {
@@ -199,6 +260,12 @@ impl App {
             "owner": self.db.user(&b.owner_id).map(|u| json!({ "id": u.id, "name": u.name })),
             "visibility": b.visibility,
         });
+        if let Some(on) = self.runs_on(b) {
+            v["runsOn"] = json!(on);
+        }
+        if self.shared_bots() == SharedBots::Isolated {
+            v["sharedBots"] = json!(SharedBots::Isolated);
+        }
         // Users pick a tier, not a model: on a managed tier the model isn't theirs to see.
         let tier = self.tier_of(&b.owner_id);
         v["tier"] = json!({ "name": tier.name, "label": tier.label, "managed": tier.managed() });
@@ -412,10 +479,18 @@ impl App {
     /// Where a Bot's run happens and what it gets: its owner's working folder, and
     /// the server-wide secrets plus its owner's, never another user's. `BOT_TOKEN`
     /// proves to botd which Bot is calling, so it can only act as itself.
+    #[cfg(test)]
     pub(crate) fn run_space(&self, bot: &Bot) -> Option<(PathBuf, HashMap<String, String>)> {
+        self.run_space_with(bot, true)
+    }
+
+    /// `run_space`, with the owner's own secrets only if `owner_keys`: a run for someone
+    /// else under isolated shared Bots gets the server-wide ones alone (ADR 0046).
+    fn run_space_with(&self, bot: &Bot, owner_keys: bool) -> Option<(PathBuf, HashMap<String, String>)> {
         let cwd = self.workspace_for(&bot.owner_id)?;
-        let mut env: HashMap<String, String> =
-            crate::secrets::global().harness_env_for(&bot.owner_id).into_iter().map(|(k, v)| (k, v.expose().to_string())).collect();
+        let s = crate::secrets::global();
+        let keys = if owner_keys { s.harness_env_for(&bot.owner_id) } else { s.harness_env() };
+        let mut env: HashMap<String, String> = keys.into_iter().map(|(k, v)| (k, v.expose().to_string())).collect();
         let token = isolation::bot_token(&self.cfg.bot_key, &bot.id, &bot.owner_id);
         crate::secrets::redact::register(&token);
         env.extend([
@@ -481,14 +556,44 @@ impl App {
         let Some(bot_dir) = self.bot_dir(&bot.id) else {
             return cant_run("This Bot's id isn't a safe folder name, so it can't run.");
         };
-        let Some(space) = self.run_space(&bot) else {
+        let by = self.requester(&bot, msg);
+        // A routine queued before its owner or author was disabled doesn't run (ADR 0047).
+        if msg.role == "routine"
+            && let Some((reason, user)) = crate::handover::blocked(&self.db, &bot.owner_id, by.actor.asker.as_deref())
+        {
+            self.give_back_routine(&bot, msg);
+            let e = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied);
+            self.db.record(&e.details(json!({ "reason": reason, "owner": bot.owner_id, "forUser": user, "messageId": msg.id })));
+            return;
+        }
+        let isolated = self.shared_bots() == SharedBots::Isolated;
+        let for_other = Some(Self::asker_of(&bot, &by)).filter(|a| isolated && *a != bot.owner_id);
+        if isolated && let Some((reason, text)) = self.wont_run(&bot, for_other.as_deref()) {
+            self.give_back_routine(&bot, msg);
+            let e = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied);
+            self.db.record(&e.details(json!({ "reason": reason, "owner": bot.owner_id, "forUser": for_other, "messageId": msg.id })));
+            // A routine of a disabled owner keeps firing; one bubble says it.
+            if self.db.last_message(&bot.id).is_none_or(|m| m.text != text) {
+                self.say(&bot.id, &text, true);
+            }
+            return;
+        }
+        let Some(space) = self.run_space_with(&bot, for_other.is_none()) else {
             return cant_run("This Bot's owner id isn't a safe folder name, so it can't run.");
         };
-        let by = self.requester(&bot, msg);
+        if isolated {
+            let asker = for_other.clone().unwrap_or_else(|| bot.owner_id.clone());
+            self.askers.lock().unwrap_or_else(|e| e.into_inner()).insert(bot.id.clone(), asker);
+        }
+        // The owner's session holds their conversation, and some harnesses keep its first
+        // instructions: a run for someone else starts fresh and keeps nothing.
+        if for_other.is_some() {
+            bot.session_id = None;
+        }
         let period = tiers::period(crate::db::now());
         let Some((tier, route)) = self.tier_route(&bot, msg, &by, &period) else { return };
         let placed_at = self.db.placed_at(&bot.owner_id);
-        let Some(place) = self.place(&bot, msg, &by, &period, bin).await else { return };
+        let Some(place) = self.place(&bot, msg, &by, &period, bin, for_other.as_deref()).await else { return };
         // The owner's own machine runs only their Bots, so only runs here need their account.
         let run_as = match place {
             Place::Here => match self.isolate(&bot, msg, &by, &period).await {
@@ -498,6 +603,7 @@ impl App {
             Place::There(_) => None,
         };
         let mut spot = self.spot(&bot, bot_dir.clone(), space, place);
+        spot.for_other = for_other.clone();
         if let Some(to) = spot.machine.clone()
             && let Some(env) = crate::machines::screens::for_run(self, &bot, &to, &spot.state_dir).await
         {
@@ -559,6 +665,9 @@ impl App {
             if let Some(r) = &run_as {
                 invoked["runAs"] = json!(r.account);
             }
+            if let Some(u) = &for_other {
+                invoked["forUser"] = json!(u);
+            }
             self.db.record(&by.event("harness.invoked").target("message", &msg.id.to_string()).bot(&bot.id).details(invoked));
             let input = RunInput {
                 prompt: prompt.clone(),
@@ -581,7 +690,9 @@ impl App {
             let mut saw_shell = false;
             let emit = |e| match e {
                 AgentEvent::Session(s) => {
-                    self.db.keep_session(&id, &s, placed_at);
+                    if for_other.is_none() {
+                        self.db.keep_session(&id, &s, placed_at);
+                    }
                 }
                 AgentEvent::TextDelta(t) => {
                     let draft = self.with_run(&id, |r| { r.draft.push_str(&t); r.draft.clone() });
@@ -693,16 +804,36 @@ impl App {
         }
     }
 
+    /// Why a Bot won't run now under isolated shared Bots (ADR 0046): its owner is
+    /// disabled, or the person the run is for (`for_other`) can no longer operate it.
+    fn wont_run(&self, bot: &Bot, for_other: Option<&str>) -> Option<(&'static str, String)> {
+        if !self.db.user(&bot.owner_id).is_some_and(|u| u.active()) {
+            let text = "My owner's account is turned off, so I don't run. An admin can turn it back on, or give me to someone else.";
+            return Some(("owner_disabled", text.into()));
+        }
+        let asker = for_other?;
+        (Viewer::person(&self.db, asker).access(&self.db, bot) < Access::Operate)
+            .then(|| ("asker_lost_access", "The person this task was for can no longer use me, so I didn't run it.".into()))
+    }
+
     /// Where the Bot runs: here, or its owner's machine once that machine answered a
     /// check and can run it. None: refused (the run is given back), and the Bot said
     /// why. Never another user's machine, and never here instead of an assigned one.
-    async fn place(&self, bot: &Bot, msg: &Message, by: &Who, period: &str, bin: &str) -> Option<Place> {
+    /// `for_other`: the run is for someone else, so it can't count on the owner's keys.
+    async fn place(&self, bot: &Bot, msg: &Message, by: &Who, period: &str, bin: &str, for_other: Option<&str>) -> Option<Place> {
         let Some(cp) = self.control_plane.get() else { return Some(Place::Here) };
+        // Others read a shared Bot's chat: they learn whose computer it is, not its insides.
+        let team = bot.visibility == Visibility::Shared || !self.db.grants(&bot.id).is_empty();
+        let owner_name = self.db.user(&bot.owner_id).map(|u| u.name);
         let refused = |r: Refusal, machine: Option<&str>| {
             self.give_back(bot, msg, period);
             let e = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied);
-            self.db.record(&e.details(json!({ "reason": r.reason(), "owner": bot.owner_id, "machine": machine, "messageId": msg.id })));
-            self.say(&bot.id, &r.message(), true);
+            let detail = json!({
+                "reason": r.reason(), "detail": r.detail(), "owner": bot.owner_id, "machine": machine, "forUser": for_other, "messageId": msg.id,
+            });
+            self.db.record(&e.details(detail));
+            let text = if for_other.is_some() { r.message_for(owner_name.as_deref()) } else { r.message_in(!team) };
+            self.say(&bot.id, &text, true);
             None
         };
         let to = match cp.route(&self.db, &bot.owner_id) {
@@ -713,14 +844,16 @@ impl App {
         let checked = cp.link.check(self, &to, &[bin]).await.map_err(Refusal::Offline);
         let ready = checked.and_then(|hb| {
             let layout = route::fit(&hb, bin)?;
-            cp.ready(self, &hb, &bot.owner_id, &to.machine_id, bin)?;
+            let keys = if for_other.is_some() { None } else { Some(bot.owner_id.as_str()) };
+            cp.ready(self, &hb, keys, &to.machine_id, bin)?;
             Ok((layout, hb.version))
         });
         match ready {
             Err(r) => refused(r, Some(&to.machine_id)),
             Ok((layout, version)) => {
                 let e = by.event("bot.run_routed").target("message", &msg.id.to_string()).bot(&bot.id);
-                self.db.record(&e.details(json!({ "owner": bot.owner_id, "machine": to.machine_id, "link": cp.link.name(), "agentVersion": version, "messageId": msg.id })));
+                let detail = json!({ "owner": bot.owner_id, "machine": to.machine_id, "link": cp.link.name(), "agentVersion": version, "forUser": for_other, "messageId": msg.id });
+                self.db.record(&e.details(detail));
                 Some(Place::There(Box::new((to, layout))))
             }
         }
@@ -742,6 +875,7 @@ impl App {
                 env,
                 screens: self.screens.is_some(),
                 ctx: None,
+                for_other: None,
             },
             Place::There(there) => {
                 let (to, layout) = *there;
@@ -764,6 +898,7 @@ impl App {
                     env,
                     screens: false,
                     ctx: Some(Ctx { workspace: PathBuf::from(&layout.workspace), home: PathBuf::from(&layout.home) }),
+                    for_other: None,
                 }
             }
         }
@@ -772,14 +907,16 @@ impl App {
     /// Runs the harness on the owner's machine. botd keeps the Bot's memory and its
     /// owner's facts: they go with the job and come back changed. The owner's facts
     /// are sent only when none of their other Bots is running there, so one Bot's run
-    /// can't undo another's edits. With per-user accounts on this server, the copies in
-    /// the owner's folder there are dropped when these change, and made again from
-    /// botd's at the next run here.
+    /// can't undo another's edits, and never for a run that's for someone else (ADR 0046).
+    /// With per-user accounts on this server, the copies in the owner's folder there are
+    /// dropped when these change, and made again from botd's at the next run here.
     #[allow(clippy::too_many_arguments)]
     async fn run_there(&self, bot: &Bot, msg: &Message, spot: &Spot, to: &Assigned, adapter: Box<dyn adapters::Adapter>, input: RunInput, abort: watch::Receiver<AbortReason>, emit: impl FnMut(AgentEvent)) {
         let Some(cp) = self.control_plane.get() else { return };
         let read = |p: Option<PathBuf>| p.and_then(|p| std::fs::read_to_string(p).ok());
-        let (memory, facts) = (read(self.data_memory_file(&bot.id)), read(self.data_user_file(&bot.owner_id)));
+        let own = spot.for_other.is_none();
+        let memory = read(self.data_memory_file(&bot.id));
+        let facts = if own { read(self.data_user_file(&bot.owner_id)) } else { None };
         let alone = {
             let mut on = self.on_machines.lock().unwrap_or_else(|e| e.into_inner());
             let n = on.entry(bot.owner_id.clone()).or_default();
@@ -797,7 +934,7 @@ impl App {
             job.message_id = msg.id;
             let files = [(memory_at.clone(), memory), (user_at.clone(), facts.filter(|_| alone))];
             job.files.extend(files.into_iter().filter_map(|(path, body)| Some(wire::JobFile { path, body: body? })));
-            job.collect = vec![memory_at.clone(), user_at.clone()];
+            job.collect = if own { vec![memory_at.clone(), user_at.clone()] } else { vec![memory_at.clone()] };
             async move {
                 let (mid_tx, mut mid_rx) = tokio::sync::mpsc::channel::<JobEvent>(64);
                 let forward = async {
@@ -994,7 +1131,15 @@ impl App {
         };
         if let Some(reply) = unsent {
             let Some(asker) = msg.from_bot.as_deref().filter(|id| self.db.bot(id).is_some()) else { return };
-            let m = self.db.add_message_from(asker, "reply", &reply, None, false, Some("queued"), Some(&msg.bot_id));
+            let mut m = self.db.add_message_from(asker, "reply", &reply, None, false, Some("queued"), Some(&msg.bot_id));
+            // The reply runs for whoever the question was for, not the answering Bot's owner.
+            if let (Some(answered), Some(asking)) = (self.db.bot(&msg.bot_id), self.db.bot(asker)) {
+                let mut actor = Actor::for_bot(&answered);
+                actor.asker = Some(msg.requested_by.as_ref().map_or(asking.owner_id.clone(), |by| Self::asker_of(&asking, by)));
+                let by = Who { actor, source: Default::default() };
+                self.db.set_requested_by(m.id, &by);
+                m.requested_by = Some(by);
+            }
             self.push_message(&m);
             self.enqueue(m);
         }
@@ -1100,8 +1245,9 @@ impl App {
             None => (self.memory_file(bot), self.user_file(&bot.owner_id)),
             Some(_) => (self.data_memory_file(&bot.id), self.data_user_file(&bot.owner_id)),
         };
-        // Only the Bots its owner can see: a Bot acts for its owner (ADR 0017).
-        let others: Vec<String> = crate::acl::Viewer::owner_of(&self.db, bot)
+        // Only the Bots its owner can see (ADR 0017), and that whoever it runs for can (ADR 0046).
+        let others: Vec<String> = self
+            .bot_viewer(bot)
             .bots(&self.db)
             .into_iter()
             .filter(|(b, _)| b.id != bot.id)
@@ -1112,6 +1258,24 @@ impl App {
         } else {
             ""
         };
+        let user = self.owner_name(bot);
+        let asker = spot.for_other.as_deref().map(|id| self.db.user(id).map(|u| u.name).unwrap_or_else(|| "a teammate".into()));
+        let (facts_line, facts, asking) = match &asker {
+            None => (
+                format!("\n- Facts about {user}, shared by all of their Bots: {}. Name, time zone, and similar.", spot.user_file.display()),
+                format!("\n<user>\n{}\n</user>", read(&user_file)),
+                String::new(),
+            ),
+            Some(a) => (
+                String::new(),
+                String::new(),
+                format!(
+                    "\n## Who's asking\n- This task is for {a}, a teammate {user} shares you with, not for {user}. Help {a} with it.\n\
+                     - Don't open or pass on {user}'s private files, notes, keys, or their other Bots' folders. Ask {user} first if the task needs them.\n\
+                     - Everyone who uses you sees what you write in your memory file: keep anyone's private details out of it.\n"
+                ),
+            ),
+        };
         format!(
             r#"You are {name}, an AI teammate of {user}.{primary}
 They talk to you in a chat app, like messaging a coworker. Finish work end to end.
@@ -1121,17 +1285,13 @@ They talk to you in a chat app, like messaging a coworker. Finish work end to en
 - Keep {user}'s work inside it, in clear project folders. Other people's folders on this computer aren't yours to open.
 
 ## Memory
-- Your memory file: {mem_path}. It holds your job, the user's rules and preferences for you, and a short dated log of important work.
-- Facts about {user}, shared by all of their Bots: {user_path}. Name, time zone, and similar.
+- Your memory file: {mem_path}. It holds your job, the user's rules and preferences for you, and a short dated log of important work.{facts_line}
 - Update these files yourself when you learn something lasting, without asking. Keep them short. Never store passwords, keys, or card numbers.
 - Current contents:
 <memory>
 {mem}
-</memory>
-<user>
-{user_facts}
-</user>
-
+</memory>{facts}
+{asking}
 ## Routines
 - For recurring or scheduled work, use `{botctl}`. Run `{botctl} help` to see how.
 {screen}
@@ -1158,8 +1318,7 @@ Current time: {now}."#,
                 (true, false) if self.screens.is_some() => screen_prompt(&spot.botctl.display().to_string()),
                 _ => String::new(),
             },
-            own = if spot.machine.is_some() { format!(" It is {user}'s own computer: only their Bots run on it.", user = self.owner_name(bot)) } else { String::new() },
-            user = self.owner_name(bot),
+            own = if spot.machine.is_some() { format!(" It is {user}'s own computer: only their Bots run on it.") } else { String::new() },
             approvals = if self.db.effective_policy(&bot.id).mode == Mode::Ask {
                 "\n- Risky actions (destructive commands, deleting outside your folder, sending messages, installing software, git push) \
                  pause until the user approves them in the app. If one is denied, don't try another way to do it; tell the user what you wanted to do."
@@ -1168,9 +1327,7 @@ Current time: {now}."#,
             },
             ws = spot.cwd.display(),
             mem_path = spot.memory.display(),
-            user_path = spot.user_file.display(),
             mem = read(&mem_file),
-            user_facts = read(&user_file),
             others = if others.is_empty() { "None yet.".into() } else { others.join("\n") },
             now = chrono::Local::now().format("%A, %B %-d, %Y, %H:%M (UTC%:z)"),
         )

@@ -47,6 +47,8 @@ A run gets the server-wide secrets with **its Bot's owner's** own secrets laid o
 | Bea's Bot, through `ask` | Ada's shared Bot | Server-wide, then Ada's |
 | A routine | Ada's Bot | Server-wide, then Ada's |
 
+With `SHARED_BOTS=isolated` ([ADR 0046](0046-shared-bots-under-isolation.md)), Bea's rows get server-wide secrets only, and a routine gets its author's row.
+
 Why the owner and not the asker:
 
 - **It follows ADR 0029.** A shared Bot runs where its owner's computer is, in the owner's folder, as the owner's Unix account (ADR 0037). Sharing means others may use it, not move it (ADR 0017). The keys go with the folder.

@@ -1,4 +1,4 @@
-import { botAccess, hasAccess, sharingLabel } from "../access";
+import { botAccess, hasAccess, sharingLabel, whereItRuns, whoseKeys } from "../access";
 
 describe("Bot access", () => {
   it("follows what the server says", () => {
@@ -24,5 +24,26 @@ describe("Bot access", () => {
     expect(sharingLabel({ visibility: "shared", owner: { id: "u1", name: "Ada" } }, "u1")).toBe("Shared with everyone · owned by you");
     expect(sharingLabel({ visibility: "private", owner: { id: "u2", name: "Grace" } }, "u1")).toBe("Private · owned by Grace");
     expect(sharingLabel({ visibility: "private", owner: null })).toBe("Private");
+  });
+
+  it("says where a Bot runs, when the server says", () => {
+    const ada = { id: "u1", name: "Ada" };
+    expect(whereItRuns({ owner: ada }, "u2")).toBeNull();
+    expect(whereItRuns({ runsOn: "machine", owner: ada }, "u2")).toBe("Runs on Ada's computer");
+    expect(whereItRuns({ runsOn: "machine", owner: ada }, "u1")).toBe("Runs on your computer");
+    expect(whereItRuns({ runsOn: "server", owner: ada }, "u2")).toBe("Runs on this server, in Ada's folder");
+    expect(whereItRuns({ runsOn: "nowhere", owner: null })).toBe("Can't run yet: its owner's computer isn't set up");
+  });
+
+  it("says whose keys a teammate's run uses", () => {
+    const ada = { id: "u1", name: "Ada" };
+    expect(whoseKeys({ visibility: "shared", owner: ada }, "u2")).toBeNull();
+    expect(whoseKeys({ sharedBots: "isolated", visibility: "shared", owner: ada }, "u2")).toBe(
+      "For you it uses the server's keys and your access, never Ada's own",
+    );
+    expect(whoseKeys({ sharedBots: "isolated", visibility: "shared", owner: ada }, "u1")).toBe(
+      "Others' runs use the server's keys and their access, never your own",
+    );
+    expect(whoseKeys({ sharedBots: "isolated", visibility: "private", owner: ada }, "u1")).toBeNull();
   });
 });

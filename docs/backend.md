@@ -116,7 +116,7 @@ Fresh installs start in `ask`. Installs from before approvals keep `bypass` unti
 SUPERBOT_PASSWORD=<your AUTH_PASSWORD> botctl policy set global mode=ask
 ```
 
-Or use the app: **Approvals → Edit risky actions, timeout, and rules** for all Bots, or a Bot's details for that Bot ([ADR 0048](adr/0048-policy-editor-in-the-apps.md)). Admins also have **Settings → Risky actions** in the admin console (`/console/#settings`) for all Bots. More operator commands: `botctl admin`. botctl only sends the password to a server on the same machine (loopback), since it speaks plain http; from elsewhere, use an SSH tunnel.
+Or use the app: **Approvals → Edit risky actions, timeout, and rules** for all Bots, or a Bot's details for that Bot ([ADR 0049](adr/0049-policy-editor-in-the-apps.md)). Admins also have **Settings → Risky actions** in the admin console (`/console/#settings`) for all Bots. More operator commands: `botctl admin`. botctl only sends the password to a server on the same machine (loopback), since it speaks plain http; from elsewhere, use an SSH tunnel.
 
 ```sh
 botctl policy set global timeout=15 git_push=deny   # never push, ask longer
@@ -170,6 +170,7 @@ People are users with a role: **admin** (everything), **member** (use and manage
 - **Owner**: made on first start as admin `operator` (name `USER_NAME`, email `OWNER_EMAIL`). `AUTH_PASSWORD` signs in as the owner (break-glass) while `AUTH_BREAK_GLASS` is on, the default. Set `AUTH_BREAK_GLASS=0` to ignore the password once admins sign in another way.
 - **Everyone else**: signs in with Microsoft Entra ID, Google, GitHub, Apple, any OpenID Connect IdP (Okta, Keycloak, Auth0, …), or a SAML IdP (ADFS, Okta, …) through a Keycloak bridge when set up, several at once if you like ([Entra](sso/entra.md), [Google](sso/google.md), [GitHub](sso/github.md), [Apple](sso/apple.md), [OIDC](sso/oidc.md), [SAML](sso/saml.md), [ADR 0014](adr/0014-oidc-sso-entra.md), [ADR 0016](adr/0016-sso-multi-provider.md), [ADR 0018](adr/0018-sso-github-apple.md), [ADR 0020](adr/0020-saml-bridge.md)): an admin links their account at each IdP to a user (`botctl user link`), or just-in-time sign-up makes one. Email never links accounts. Or an admin gives them a one-time sign-in code, which they enter in the web app or client. Codes are single use and expire (default 1 hour).
 - **Admin portal**: admins manage all of this in the app too (`/app/`, **Users** in the sidebar): approve or reject [requests for access](#sign-ups), add people, give them a one-time code (1 hour, 24 hours, or 7 days) with a ready-to-send invite and link, change roles, disable, sign out everywhere, link SSO accounts, and see each person's last sign-in and Bot access. Design: [ADR 0021](adr/0021-admin-portal.md).
+- **Disabled users' routines** ([ADR 0047](adr/0047-disabled-users-routines.md)): disabling someone (portal, API, `botctl`, or SCIM) pauses every routine that runs for them: on their Bots (`owner_disabled`) or written by them on others' (`author_disabled`). The scheduler and runner refuse any routine whose owner or author is disabled anyway, and it can't be turned back on (409). Re-enabling leaves them paused until an admin resumes them (`botctl user resume-routines`), unless `ROUTINES_ON_ENABLE=resume`. An admin can hand a disabled user's Bots and routines to someone else (`botctl user handover <user> <to> [--resume]`); routines on Bots the new person can't use stay paused.
 - **Sessions**: the sign-in page and the console get an HttpOnly cookie, the client and `botctl` a bearer token. They end after `SESSION_IDLE_TIMEOUT` without use (default `7d`) or `SESSION_MAX_AGE` after sign-in (default `30d`), on logout, or when an admin revokes them or disables the user. Only hashes are stored.
 
 ```sh
@@ -179,6 +180,8 @@ botctl user code alex@example.com                   # one-time code for Alex
 botctl users | botctl sessions alex@example.com
 botctl user role alex@example.com readonly | botctl user disable alex@example.com
 botctl session revoke <id> | botctl session revoke-all alex@example.com
+botctl user routines alex@example.com | botctl user resume-routines alex@example.com
+botctl user handover alex@example.com sam@example.com --resume
 botctl user link alex@example.com entra <object-id> | botctl user identities alex@example.com
 ```
 
@@ -249,6 +252,10 @@ With `ISOLATION=users` (`deploy/install.sh --isolation`), each user's Bots run a
 - **Turning it on or off** doesn't move files: work starts in the new folder, and the old one stays. Memory and `USER.md` carry over; harness sessions start fresh. To move files, see [deploy/README.md](../deploy/README.md#one-unix-account-per-user).
 - **Audit**: `isolation.account_created`, `isolation.account_failed`, `harness.login_started`; `harness.invoked` adds `runAs`; refusals are `bot.run_refused` with reason `isolation_harness` or `no_account`.
 
+### Shared Bots
+
+A shared Bot always runs on its owner's computer ([ADR 0046](adr/0046-shared-bots-under-isolation.md)). `SHARED_BOTS=open` (the default with `MACHINE_ROUTING=off`) keeps the old rule: it acts as its owner for everyone. `SHARED_BOTS=isolated` (the default, and the only choice, otherwise): a run for anyone but the owner (the sender, the person behind an asking Bot, or a routine's author) gets the lesser of the owner's and that person's access to other Bots, server-wide keys only, and none of the owner's `USER.md`; it can't make Bots; a disabled owner's Bots don't run; new Bots are private. Bot views add `runsOn` and `sharedBots`. Audit: `forUser` on `harness.invoked`, `bot.run_routed` and `bot.run_refused`; refusals `owner_disabled`, `asker_lost_access`; `access.denied` with reason `asker_acl`; routines' `author`. A disabled user's routines are paused on every server, open or isolated ([ADR 0047](adr/0047-disabled-users-routines.md)).
+
 ### Per-user machines (managed hosting)
 
 For CG-Labs managed hosting: botd can rent one Linode per user and track it. **Off by default**: without `LINODE_TOKEN` the machine endpoints answer 503 "control plane not configured", and nothing else changes. Self-hosted servers don't need it. Design: [ADR 0025](adr/0025-control-plane-linode.md).
@@ -288,7 +295,7 @@ All JSON. Auth: a session cookie (sign-in page and console) or `Authorization: B
 - `GET|POST /api/bots/:id/messages` `{text, answer?: {messageId, option}}`
 - `POST /api/bots/:id/read`, `POST /api/bots/:id/stop`
 - `GET|POST /api/bots/:id/routines` `{name, cron, instruction}`
-- `PATCH|DELETE /api/routines/:id` `{enabled?, name?, cron?, instruction?}`. Text fields are trimmed and can't be empty; cron must parse.
+- `PATCH|DELETE /api/routines/:id` `{enabled?, name?, cron?, instruction?}`. Text fields are trimmed and can't be empty; cron must parse. Turning one on (or creating it on) while its Bot's owner or its author is disabled is a 409. Routines carry `paused_reason` (`owner_disabled` | `author_disabled`), `paused_for` and `paused_at` when botd paused them ([ADR 0047](adr/0047-disabled-users-routines.md)); turning one on or off by hand clears them
 - `GET /api/bots/:id/screen`: starts the Bot's screen and returns its live view URL. 503 while voxl isn't listening yet, or when all screens are in use
 - `POST /api/handoff` `{from, text}`: `botctl handoff`; waits for the user's answer
 
@@ -302,6 +309,7 @@ Sign-in, users, and sessions ([ADR 0012](adr/0012-users-sessions-rbac.md)). User
 - `POST /api/users/:id/login-codes` `{ttlMinutes?, replace?}` → `{code, expiresAt}`, `Cache-Control: no-store`. `replace: true` drops the user's unused codes first
 - `GET /api/users/:id-or-email/bots` → `{user, active, bots: [{bot, owner, visibility, access, grant}]}`: the Bots that user can reach now and how ([ADR 0017](adr/0017-bot-acls.md))
 - `GET /api/sessions?user=`, `DELETE /api/sessions/:id`, `DELETE /api/users/:id/sessions`
+- `GET /api/users/:id-or-email/routines` → `{user, routines: [{id, name, cron, enabled, bot, authorId, pausedReason, pausedFor, pausedAt}]}`: routines that run for that user, and those paused for them. `POST /api/users/:id-or-email/routines/resume` → `{resumed, stillPaused}` turns back on the routines paused for them (409 while they're disabled); one whose owner or author is still disabled stays paused. `POST /api/users/:id-or-email/handover` `{to, resumeRoutines?}` → `{from, to, bots, routines, skipped, resumed}`: gives a disabled user's Bots to `to` and moves their routines (authorship and pauses) where `to` can operate the Bot; 409 if the user is active, 400 if `to` is them, disabled or read-only, 403 over `to`'s Bot limit ([ADR 0047](adr/0047-disabled-users-routines.md))
 - `GET /api/users/:id-or-email/isolation` → `{isolation: "off"}`, or `{isolation: "users", account, root, home, workspace, memory, ready, harnesses}`; `POST` makes the account and its folders now (409 when off, 502 when that fails). `POST /api/users/:id-or-email/harness-login` `{harness: claude|codex, args?: [string]}` → `{account, home, command}`: the command `botctl user harness-login` runs ([ADR 0037](adr/0037-per-user-unix-accounts.md))
 
 Sign-ups ([ADR 0022](adr/0022-landing-and-signups.md)). Submitting and the config are public; the rest is admin only:

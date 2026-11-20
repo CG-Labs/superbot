@@ -1,4 +1,4 @@
-//! HTTP tests for the policy editor's API (ADR 0048): class actions, the timeout, a Bot's
+//! HTTP tests for the policy editor's API (ADR 0049): class actions, the timeout, a Bot's
 //! fields put back to inheriting, and the rule list, with who may change each and the audit trail.
 
 use crate::tests::{audit_list, call, serve_app};

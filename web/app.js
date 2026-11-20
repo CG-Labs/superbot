@@ -530,7 +530,7 @@ $("license-box").addEventListener("click", async (e) => {
   loadLicense();
 });
 
-// The global approval policy (ADR 0007, 0048): mode, an action per risky class, the timeout,
+// The global approval policy (ADR 0007, 0049): mode, an action per risky class, the timeout,
 // and rules for all Bots. Each Bot's own settings and rules are edited in the app.
 
 const ACTIONS = { allow: "Allow", ask: "Ask", deny: "Deny" };

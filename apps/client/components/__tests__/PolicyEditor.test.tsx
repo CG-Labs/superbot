@@ -73,7 +73,7 @@ function fakeApi() {
 
 const yes = jest.fn(async () => true);
 
-describe("PolicyEditor (ADR 0048)", () => {
+describe("PolicyEditor (ADR 0049)", () => {
   beforeEach(() => yes.mockClear());
 
   it("lets an admin set class actions and the timeout for all Bots", async () => {

@@ -1133,17 +1133,13 @@ pub(crate) async fn reply_after(env: &Env, bot: &str, before: i64) -> String {
     panic!("no reply from {bot}");
 }
 
+/// Sends as the Bot's owner, so the run is theirs (ADR 0046); as the admin if they can't sign in.
 pub(crate) async fn send(env: &Env, bot: &str, text: &str) -> i64 {
+    let owner = env.app.db.bot(bot).map(|b| b.owner_id).unwrap_or_default();
+    let auth = crate::users_http_tests::signed_in(env.port, &env.admin, &owner).await.unwrap_or_else(|| env.admin.clone());
     let before = env.app.db.last_id();
     let body = json!({ "text": text }).to_string();
-    let (code, m) = call(
-        env.port,
-        "POST",
-        &format!("/api/bots/{bot}/messages"),
-        &env.admin,
-        &body,
-    )
-    .await;
+    let (code, m) = call(env.port, "POST", &format!("/api/bots/{bot}/messages"), &auth, &body).await;
     assert_eq!(code, 202, "{m}");
     before
 }

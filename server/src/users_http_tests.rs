@@ -44,10 +44,19 @@ pub(super) async fn user_with(port: u16, admin: &str, email: &str, role: &str) -
     let (code, u) = call(port, "POST", "/api/users", admin, &json!({ "email": email, "role": role }).to_string()).await;
     assert_eq!(code, 201, "{u}");
     let id = parse(&u)["id"].as_str().unwrap().to_string();
+    let auth = signed_in(port, admin, &id).await.unwrap();
+    (id, auth)
+}
+
+/// An Authorization for user `id`, signed in with a one-time code an admin made. None
+/// if they can't sign in (disabled, or the owner account).
+pub(super) async fn signed_in(port: u16, admin: &str, id: &str) -> Option<String> {
     let (code, c) = call(port, "POST", &format!("/api/users/{id}/login-codes"), admin, "").await;
-    assert_eq!(code, 200, "{c}");
+    if code != 200 {
+        return None;
+    }
     let token = token_for(port, json!({ "code": parse(&c)["code"] })).await;
-    (id, bearer(&token))
+    Some(bearer(&token))
 }
 
 fn origin(port: u16) -> String {

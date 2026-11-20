@@ -6,7 +6,7 @@ import { PolicyEditor } from "../components/PolicyEditor";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
 
-/** The approval policy (ADR 0048): `/policy` for all Bots, `/policy?bot=<id>` for one. */
+/** The approval policy (ADR 0049): `/policy` for all Bots, `/policy?bot=<id>` for one. */
 export default function PolicyScreen() {
   const { ready, api, bots, can } = useSuperBot();
   const { bot: botId } = useLocalSearchParams<{ bot?: string }>();

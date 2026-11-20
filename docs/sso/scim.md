@@ -77,9 +77,9 @@ Google has no generic SCIM client for custom apps. Put Entra ID or Okta in front
 |----------|---------------|
 | Creates a user | A new user with `SCIM_DEFAULT_ROLE`. With `--sso`, its SSO identity too. If an admin already linked that identity to a user, that user is taken on instead |
 | Updates name, email, `userName` | Updates the user. Roles never change |
-| Sets `active: false` | Disables the user, ends all sessions, closes open screens. Still listed, so the IdP can reactivate |
-| Sets `active: true` | Enables the user |
-| Deletes (`DELETE`) | Disables the user and ends sessions; the tenant no longer sees it. Nothing is destroyed. Provisioning the same `externalId` again brings back the same user |
+| Sets `active: false` | Disables the user, ends all sessions, closes open screens, and pauses the routines that run for them ([ADR 0047](../adr/0047-disabled-users-routines.md)). Still listed, so the IdP can reactivate |
+| Sets `active: true` | Enables the user. Their paused routines stay paused until an admin resumes them (`botctl user resume-routines`) or hands them over (`botctl user handover`), unless `ROUTINES_ON_ENABLE=resume` |
+| Deletes (`DELETE`) | Disables the user, ends sessions, and pauses their routines; the tenant no longer sees it. Nothing is destroyed. Provisioning the same `externalId` again brings back the same user |
 | Sends groups, roles, a password | Ignored |
 
 **The IdP is in charge.** For users it provisioned, the IdP decides name, email, and `active`: an admin can disable one in SuperBot, but the IdP's next update can enable them again. Remove people in the IdP.

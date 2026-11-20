@@ -26,7 +26,7 @@ function message(e: unknown): string {
 }
 
 /**
- * The approval policy (ADR 0007, 0048): the mode, an action per risky class, how long an
+ * The approval policy (ADR 0007, 0049): the mode, an action per risky class, how long an
  * approval waits, and the allow/deny rules. Global, or one Bot's on top of it.
  */
 export function PolicyEditor({ api, bot, canEdit, onBack, confirm = confirmAsync }: Props) {

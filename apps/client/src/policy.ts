@@ -1,6 +1,6 @@
 import type { NewPolicyRule, PolicyAction, PolicyOverride, PolicyRule } from "./types";
 
-/** The server's limits (ADR 0007, 0048): the server still checks every save. */
+/** The server's limits (ADR 0007, 0049): the server still checks every save. */
 export const MAX_TIMEOUT_MINUTES = 24 * 60;
 export const RULE_PATTERN_MAX = 8000;
 export const RULE_TOOL_MAX = 200;

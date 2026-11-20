@@ -238,6 +238,7 @@ pub fn actor(a: &Auth, u: &User, s: Option<&Session>, method: &str) -> Actor {
         idp_provider: provider,
         session: s.map(|s| s.id.clone()),
         on_behalf_of: None,
+        asker: None,
     }
 }
 
@@ -583,11 +584,13 @@ pub async fn update_user(State(app): State<AppState>, Extension(a): Extension<Ar
     }
     if before.status != after.status {
         if after.active() {
-            app.db.record(&ev("user.enabled"));
+            let resumed = crate::handover::user_enabled(&app, &by, &after.id);
+            app.db.record(&ev("user.enabled").details(json!({ "routinesResumed": resumed })));
         } else {
             a.sso.forget_user(&after.id);
             let n = app.db.revoke_user_sessions(&after.id, by.actor.id.as_deref().unwrap_or(""), "user disabled");
-            app.db.record(&ev("user.disabled").details(json!({ "sessionsRevoked": n })));
+            let paused = crate::handover::user_disabled(&app, &by, &after.id);
+            app.db.record(&ev("user.disabled").details(json!({ "sessionsRevoked": n, "routinesPaused": paused })));
         }
     }
     // Screen links don't know who opened them, so anyone losing access closes them all.

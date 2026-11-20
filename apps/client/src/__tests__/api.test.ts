@@ -153,7 +153,7 @@ describe("personal secrets (ADR 0029, 0044)", () => {
   });
 });
 
-describe("SuperBotApi policy editor (ADR 0048)", () => {
+describe("SuperBotApi policy editor (ADR 0049)", () => {
   const realFetch = globalThis.fetch;
   afterEach(() => {
     globalThis.fetch = realFetch;

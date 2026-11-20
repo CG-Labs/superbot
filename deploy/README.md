@@ -199,6 +199,8 @@ botctl machine unassign <user>     # back to this server (with MACHINE_ROUTING=a
 
 An assigned user's Bots run only on their machine. If it is down, suspended, outdated, or missing the Bot's harness, the Bot says so and nothing runs here instead. New machines download `botctl` from botd as well as the agent, so keep `botctl` next to `botd` (the installer and image do). On the machine, Bots reach botd through the agent on `127.0.0.1:7444` (loopback only; no new firewall rule). Design: [ADR 0036](../docs/adr/0036-bots-on-the-users-machine.md).
 
+A shared Bot runs on its owner's machine for everyone who uses it. With routing on or assigned, shared Bots are isolated (`SHARED_BOTS=isolated`, the only choice then): a teammate's run gets their own access to other Bots and the server-wide keys only, never the owner's own keys or `USER.md`. So for teammates to use a shared Bot, log its harness in on the owner's machine or save a server-wide key. Design: [ADR 0046](../docs/adr/0046-shared-bots-under-isolation.md).
+
 ### Harness CLIs and agent upgrades on machines
 
 To have each machine's agent install harness CLIs by itself once it enrolls, add:

@@ -9,7 +9,7 @@ import {
   TextInput,
   View,
 } from "react-native";
-import { sharingLabel } from "../src/access";
+import { sharingLabel, whereItRuns, whoseKeys } from "../src/access";
 import { confirmAsync, showError } from "../src/dialogs";
 import { cronLabel } from "../src/routines";
 import { useSuperBot } from "../src/SuperBotContext";
@@ -23,7 +23,7 @@ interface Props {
   visible: boolean;
   onClose: () => void;
   onOpenScreen: () => void;
-  /** Opens this Bot's policy editor (ADR 0048). */
+  /** Opens this Bot's policy editor (ADR 0049). */
   onOpenPolicy?: (botId: string) => void;
 }
 
@@ -231,6 +231,11 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy }
               <View style={styles.row}>
                 <Text style={styles.dim}>{sharingLabel(bot, me.id)}</Text>
               </View>
+              {[whereItRuns(bot, me.id), whoseKeys(bot, me.id)].filter(Boolean).map((line) => (
+                <View key={line} style={styles.row}>
+                  <Text style={styles.dim}>{line}</Text>
+                </View>
+              ))}
               <View style={styles.row}>
                 <Text style={styles.dim}>Shared with everyone</Text>
                 <Switch

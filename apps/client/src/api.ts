@@ -241,7 +241,7 @@ export class SuperBotApi {
     else await this.resetBotPolicy(botId);
   }
 
-  // The policy editor (ADR 0048). Anyone signed in reads; only admins change it.
+  // The policy editor (ADR 0049). Anyone signed in reads; only admins change it.
 
   /** The global policy with its rules, or one Bot's (which needs view access to it). */
   async policyView(botId?: string): Promise<PolicyView> {

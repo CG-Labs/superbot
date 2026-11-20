@@ -19,6 +19,9 @@ mod auth_review_http_tests;
 #[cfg(test)]
 mod interface_http_tests;
 mod cron;
+mod handover;
+#[cfg(test)]
+mod handover_http_tests;
 mod isolation;
 #[cfg(test)]
 mod isolation_http_tests;
@@ -56,6 +59,8 @@ mod secrets;
 mod setup;
 #[cfg(test)]
 mod setup_http_tests;
+#[cfg(test)]
+mod shared_bots_http_tests;
 mod shell;
 mod signups;
 #[cfg(test)]
@@ -155,6 +160,9 @@ async fn main() {
         .unwrap_or_else(|e| exit(format!("Sign-ups: {e}")));
     let mut control_plane = machines::ControlPlane::from_env(&secrets::env::EnvStore::process(), |k| env(k, ""))
         .unwrap_or_else(|e| exit(format!("Control plane: {e}")));
+    let shared_bots = acl::SharedBots::parse(&env("SHARED_BOTS", ""), control_plane.routing != machines::route::Routing::Off)
+        .unwrap_or_else(|e| exit(format!("Shared Bots: {e}")));
+    let resume_routines = handover::resume_on_enable(&env("ROUTINES_ON_ENABLE", "")).unwrap_or_else(|e| exit(e));
     let scim = scim::Scim::from_env(&env("SCIM", ""), &env("SCIM_DEFAULT_ROLE", "")).unwrap_or_else(|e| exit(format!("SCIM: {e}")));
     let tiers = tiers::Tiers::from_env(|k| env(k, "")).unwrap_or_else(|e| exit(format!("Tiers: {e}")));
     let payments = billing::Billing::from_env(&secrets::env::EnvStore::process(), &|k| env(k, "")).unwrap_or_else(|e| exit(format!("Billing: {e}")));
@@ -227,6 +235,15 @@ async fn main() {
     }, screens);
     let _ = app.tiers.set(Arc::new(tiers));
     println!("Tiers: {}.", app.tiers().describe());
+    let _ = app.shared_bots.set(shared_bots);
+    let _ = app.resume_routines_on_enable.set(resume_routines);
+    println!(
+        "Shared Bots: {}.",
+        match shared_bots {
+            acl::SharedBots::Open => "open (a Bot acts with its owner's access and keys for everyone who uses it; SHARED_BOTS=isolated limits that)",
+            acl::SharedBots::Isolated => "isolated (a run for someone other than its owner gets their access at most and only server-wide keys; new Bots are private)",
+        }
+    );
     match isolation {
         Some(iso) => {
             println!(
@@ -243,6 +260,10 @@ async fn main() {
         None => println!("Isolation: off (all Bots run as this account; ISOLATION=users gives each user their own)."),
     }
     app.start_isolation();
+    let paused = handover::pause_already_disabled(&app, &Who { actor: Actor::system("bootstrap"), source: Source::default() });
+    if paused > 0 {
+        println!("Routines: paused {paused} that ran for disabled users (ADR 0047).");
+    }
     for t in app.db.assigned_tiers().into_iter().filter(|t| app.tiers().get(t).is_none()) {
         eprintln!("WARNING: some users have tier \"{t}\", which TIERS_FILE no longer lists. They get the default tier ({}) until an admin picks another.", app.tiers().default_tier().name);
     }
@@ -333,6 +354,7 @@ async fn main() {
         "auditRetentionDays": retention,
         "screens": app.screens.is_some(),
         "isolation": if app.isolation().is_some() { "users" } else { "off" },
+        "sharedBots": app.shared_bots(),
         "sso": sso_ids,
         "controlPlane": control_plane.enabled(),
         "scim": auth_state_scim,
@@ -454,6 +476,9 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/login-codes", post(users::create_login_code))
         .route("/users/{key}/sessions", delete(users::revoke_user_sessions))
         .route("/users/{key}/bots", get(users::user_bots))
+        .route("/users/{key}/routines", get(handover::list))
+        .route("/users/{key}/routines/resume", post(handover::resume_for))
+        .route("/users/{key}/handover", post(handover::handover))
         .route("/users/{key}/secrets", get(list_user_secrets).delete(delete_user_secrets))
         .route("/users/{key}/isolation", get(accounts::http::get).post(accounts::http::ensure))
         .route("/users/{key}/harness-login", post(accounts::http::harness_login))
@@ -696,10 +721,12 @@ impl Auth {
         Some(found)
     }
 
-    /// The Bot a token was issued to, acting for its owner.
+    /// The Bot a token was issued to, acting for its owner, and for whomever its run is
+    /// for (ADR 0046), so what it queues runs for them too.
     fn bot_actor(&self, bot_id: Option<&str>) -> Actor {
-        match bot_id.and_then(|id| self.app.as_ref()?.db.bot(id)) {
-            Some(b) => Actor::for_bot(&b),
+        let app = self.app.as_ref();
+        match bot_id.and_then(|id| app?.db.bot(id)) {
+            Some(b) => Actor { asker: app.map(|a| a.acting_for(&b)).filter(|a| *a != b.owner_id), ..Actor::for_bot(&b) },
             None => Actor::bot(bot_id, None),
         }
         .method("bot_token")
@@ -1187,7 +1214,7 @@ async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>,
                 _ = check.tick(), if session.is_some() || bot.is_some() => {
                     let now = if let Some(id) = bot.as_deref() {
                         match app.db.bot(id) {
-                            Some(b) if Some(&b.owner_id) == bot_owner.as_ref() => match Viewer::owner_of(&app.db, &b) {
+                            Some(b) if Some(&b.owner_id) == bot_owner.as_ref() => match app.bot_viewer(&b) {
                                 Viewer::Nobody => break,
                                 v => v,
                             },
@@ -1398,10 +1425,11 @@ fn need_bot(app: &App, id: &str) -> Res<db::Bot> {
 }
 
 /// Whose Bot access a request has. A Bot acts with its owner's: its token names it,
-/// so it can't borrow another user's (ADR 0029).
+/// so it can't borrow another user's (ADR 0029). With isolated shared Bots, no more
+/// than that of the person its run is for (ADR 0046).
 fn viewer(app: &App, c: &Caller, _by: &Who) -> Viewer {
     match (c.principal, c.bot.as_deref().and_then(|id| app.db.bot(id))) {
-        (Principal::Bot, Some(b)) => Viewer::owner_of(&app.db, &b),
+        (Principal::Bot, Some(b)) => app.bot_viewer(&b),
         (Principal::Bot, None) => Viewer::Nobody,
         _ => Viewer::of(c),
     }
@@ -1434,8 +1462,12 @@ fn need_bot_access(app: &App, c: &Caller, by: &Who, id: &str, need: Access) -> R
     if has >= need {
         return Ok((bot, has));
     }
-    // The auth middleware already records every 403 a Bot gets.
-    if c.principal != Principal::Bot || has == Access::None {
+    // Its owner could, but the person it runs for can't: always worth a record.
+    if let Some(for_user) = capped_by_asker(app, c, |owner| owner.access(&app.db, &bot) >= need) {
+        let details = json!({ "reason": "asker_acl", "need": need, "has": has, "forUser": for_user });
+        app.db.record(&by.event("access.denied").target("bot", id).bot(id).outcome(Outcome::Denied).details(details));
+    } else if c.principal != Principal::Bot || has == Access::None {
+        // The auth middleware already records every 403 a Bot gets.
         let details = json!({ "reason": "bot_acl", "need": need, "has": has });
         app.db.record(&by.event("access.denied").target("bot", id).bot(id).outcome(Outcome::Denied).details(details));
     }
@@ -1445,6 +1477,14 @@ fn need_bot_access(app: &App, c: &Caller, by: &Who, id: &str, need: Access) -> R
         (_, _) if need == Access::Manage => ApiError(StatusCode::FORBIDDEN, "Only this Bot's owner or an admin can do this.".into()),
         _ => ApiError(StatusCode::FORBIDDEN, "You can view this Bot but not use it. Ask its owner for operator access.".into()),
     })
+}
+
+/// When the caller is a Bot running for someone other than its owner (ADR 0046) and
+/// `owner_could` holds for its owner's own access: whom it runs for.
+fn capped_by_asker(app: &App, c: &Caller, owner_could: impl FnOnce(&Viewer) -> bool) -> Option<String> {
+    let b = c.bot.as_deref().filter(|_| c.principal == Principal::Bot).and_then(|id| app.db.bot(id))?;
+    let for_user = app.acting_for(&b);
+    (for_user != b.owner_id && owner_could(&Viewer::owner_of(&app.db, &b))).then_some(for_user)
 }
 
 /// Newest approvals for Bots the caller can see; `bot` narrows to one they can see.
@@ -1514,8 +1554,19 @@ fn visibility_field(v: &Value) -> Res<Option<Visibility>> {
 async fn create_bot(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
     let p = bot_patch(&v)?;
     let name = p.name.ok_or_else(|| bad("Name is required"))?;
-    // Shared unless asked otherwise, as every Bot was before ACLs.
-    let visibility = visibility_field(&v)?.unwrap_or(Visibility::Shared);
+    // Shared unless asked otherwise, as every Bot was before ACLs; private with
+    // isolated shared Bots, so sharing one is a choice (ADR 0046).
+    let visibility = visibility_field(&v)?.unwrap_or(match app.shared_bots() {
+        acl::SharedBots::Open => Visibility::Shared,
+        acl::SharedBots::Isolated => Visibility::Private,
+    });
+    // A Bot running for a teammate can't add Bots to its owner's account.
+    if let Some(for_user) = capped_by_asker(&app, &c, |_| true) {
+        let details = json!({ "reason": "asker_acl", "action": "bot.create", "forUser": for_user });
+        let id = c.bot.as_deref().unwrap_or_default();
+        app.db.record(&by.event("access.denied").target("bot", id).bot(id).outcome(Outcome::Denied).details(details));
+        return Err(ApiError(StatusCode::FORBIDDEN, "A Bot working for a teammate can't make new Bots. Ask its owner.".into()));
+    }
     // A person owns what they make. A Bot's new Bot belongs to that Bot's owner.
     let owner = match (&c.user, c.principal) {
         (Some(u), _) => u.id.clone(),
@@ -1662,6 +1713,32 @@ async fn acl_changed(app: &App, id: &str, narrowed: bool) {
     }
 }
 
+/// Gives `bot` to `to` (an admin's choice): it takes one of their Bot slots, work
+/// started for the old owner ends, and its memory follows it. Its harness and model
+/// they can change after.
+pub(crate) async fn give_bot(app: &App, by: &Who, bot: &db::Bot, to: &db::User) -> Res<()> {
+    if to.id == bot.owner_id {
+        return Ok(());
+    }
+    let id = &bot.id;
+    let tier = app.tier_of(&to.id);
+    let max = tier.limits.max_bots;
+    // Work started for the old owner runs in their folder with their keys; it
+    // ends here, and its token stops working (it names the old owner). A refused
+    // transfer (another request took the last slot) leaves that work running.
+    if !app.stop_if(id, || app.db.set_bot_owner_capped(id, &to.id, max)) {
+        let details = json!({ "reason": "tier_bot_limit", "from": bot.owner_id, "to": to.id, "tier": tier.name, "limit": max });
+        app.db.record(&by.event("bot.transfer_refused").target("bot", id).bot(id).outcome(Outcome::Denied).details(details));
+        return Err(ApiError(StatusCode::FORBIDDEN, format!("{}'s plan ({}) allows {} Bots, and they're all in use.", to.name, tier.label, max.unwrap_or(0))));
+    }
+    // The new owner manages it anyway; a leftover grant would only confuse.
+    app.db.remove_grant(id, &to.id);
+    app.hand_over_memory(id, &bot.owner_id, &to.id);
+    app.db.record(&by.event("bot.owner_changed").target("bot", id).bot(id).details(json!({ "from": bot.owner_id, "to": to.id })));
+    acl_changed(app, id, true).await;
+    Ok(())
+}
+
 async fn get_access(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     let (bot, access) = need_bot_access(&app, &c, &by, &id, Access::View)?;
     Ok(Json(access_view(&app, &bot, access)))
@@ -1693,21 +1770,7 @@ async fn update_access(State(app): State<AppState>, Extension(c): Extension<Call
     let mut narrowed = false;
     // The owner first: it can be refused for the new owner's Bot limit.
     if let Some(u) = owner.filter(|u| u.id != bot.owner_id) {
-        // It takes one of the new owner's Bot slots; its harness and model they can change after.
-        let tier = app.tier_of(&u.id);
-        let max = tier.limits.max_bots;
-        // Work started for the old owner runs in their folder with their keys; it
-        // ends here, and its token stops working (it names the old owner). A refused
-        // transfer (another request took the last slot) leaves that work running.
-        if !app.stop_if(&id, || app.db.set_bot_owner_capped(&id, &u.id, max)) {
-            let details = json!({ "reason": "tier_bot_limit", "from": bot.owner_id, "to": u.id, "tier": tier.name, "limit": max });
-            app.db.record(&by.event("bot.transfer_refused").target("bot", &id).bot(&id).outcome(Outcome::Denied).details(details));
-            return Err(ApiError(StatusCode::FORBIDDEN, format!("{}'s plan ({}) allows {} Bots, and they're all in use.", u.name, tier.label, max.unwrap_or(0))));
-        }
-        // The new owner manages it anyway; a leftover grant would only confuse.
-        app.db.remove_grant(&id, &u.id);
-        app.hand_over_memory(&id, &bot.owner_id, &u.id);
-        app.db.record(&by.event("bot.owner_changed").target("bot", &id).bot(&id).details(json!({ "from": bot.owner_id, "to": u.id })));
+        give_bot(&app, &by, &bot, &u).await?;
         narrowed = true;
     }
     if let Some(to) = visibility.filter(|to| *to != bot.visibility) {
@@ -1815,18 +1878,29 @@ async fn ask(State(app): State<AppState>, Extension(c): Extension<Caller>, Exten
     let viewer = viewer(&app, &c, &by);
     let to_key = v["to"].as_str().map(str::trim).unwrap_or("");
     let bots: Vec<db::Bot> = viewer.bots(&app.db).into_iter().filter(|(_, a)| *a >= Access::Operate).map(|(b, _)| b).collect();
-    let to = bots
-        .iter()
-        .find(|b| b.id == to_key)
-        .or_else(|| bots.iter().find(|b| b.name.eq_ignore_ascii_case(to_key)))
-        .ok_or_else(|| bad(format!("No Bot named \"{to_key}\". Run `botctl bots` to list them.")))?;
+    let find = |bots: &[db::Bot]| bots.iter().find(|b| b.id == to_key).or_else(|| bots.iter().find(|b| b.name.eq_ignore_ascii_case(to_key))).cloned();
+    let Some(to) = find(&bots) else {
+        // Hidden only because of whom it runs for (ADR 0046): the same answer, and a record.
+        let owners = |o: &Viewer| find(&o.bots(&app.db).into_iter().filter(|(_, a)| *a >= Access::Operate).map(|(b, _)| b).collect::<Vec<_>>());
+        if let Some(for_user) = capped_by_asker(&app, &c, |o| owners(o).is_some()) {
+            let hidden = owners(&Viewer::owner_of(&app.db, &from)).map(|b| b.id).unwrap_or_default();
+            let details = json!({ "reason": "asker_acl", "need": Access::Operate, "forUser": for_user });
+            app.db.record(&by.event("access.denied").target("bot", &hidden).bot(&from.id).outcome(Outcome::Denied).details(details));
+        }
+        return Err(bad(format!("No Bot named \"{to_key}\". Run `botctl bots` to list them.")));
+    };
+    let to = &to;
     if to.id == from.id {
         return Err(bad("You can't ask yourself"));
     }
     let text = v["text"].as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| bad("Message is required"))?;
-    // A Bot asks as itself, for its owner; a person as themselves.
+    // A Bot asks as itself, for its owner, and on for whomever its run is for; a person as themselves.
     let by = match c.principal {
-        Principal::Bot => Who { actor: Actor::for_bot(&from).method("bot_token"), source: by.source.clone() },
+        Principal::Bot => {
+            let mut actor = Actor::for_bot(&from).method("bot_token");
+            actor.asker = Some(app.acting_for(&from)).filter(|a| *a != from.owner_id);
+            Who { actor, source: by.source.clone() }
+        }
         Principal::User(_) => by,
     };
     app.db.record(&by.event("bot.asked").target("bot", &to.id).bot(&from.id).details(json!({ "to": to.name })));
@@ -1941,13 +2015,36 @@ async fn create_routine(State(app): State<AppState>, Extension(c): Extension<Cal
     let (Some(name), Some(cron_expr), Some(instruction)) = (f.name, f.cron, f.instruction) else {
         return Err(bad("name, cron, and instruction are required"));
     };
-    let r = app.db.add_routine(&id, &name, &cron_expr, &instruction);
-    if f.enabled == Some(false) {
-        app.db.update_routine(&r.id, None, None, None, Some(false));
+    let author = routine_author(&app, &c);
+    if f.enabled != Some(false) {
+        need_unblocked(&app, &id, author.as_deref())?;
     }
-    let r = app.db.routine(&r.id).ok_or_else(|| not_found("Routine"))?;
-    app.db.record(&by.event("routine.created").target("routine", &r.id).bot(&id).details(json!({ "name": r.name, "cron": r.cron, "enabled": r.enabled })));
+    let r = app.db.add_routine_by(&id, &name, &cron_expr, &instruction, f.enabled != Some(false), author.as_deref());
+    let details = json!({ "name": r.name, "cron": r.cron, "enabled": r.enabled, "author": r.author_id });
+    app.db.record(&by.event("routine.created").target("routine", &r.id).bot(&id).details(details));
     Ok((StatusCode::CREATED, Json(json!(r))))
+}
+
+/// Whom a routine's runs are for once the caller writes its instruction (ADR 0046): a
+/// person, or the person a Bot's run is for. None: its Bot's owner.
+fn routine_author(app: &App, c: &Caller) -> Option<String> {
+    match (&c.user, c.principal) {
+        (Some(u), _) => Some(u.id.clone()),
+        (None, Principal::Bot) => c.bot.as_deref().and_then(|id| app.db.bot(id)).map(|b| app.acting_for(&b)),
+        _ => None,
+    }
+}
+
+/// A routine can't be turned on while its Bot's owner or its author is disabled (ADR 0047).
+fn need_unblocked(app: &App, bot_id: &str, author: Option<&str>) -> Res<()> {
+    let Some(owner) = app.db.bot_owner(bot_id) else { return Err(not_found("Bot")) };
+    match handover::blocked(&app.db, &owner, author) {
+        None => Ok(()),
+        Some((reason, _)) => {
+            let whose = if reason == handover::OWNER_DISABLED { "this Bot's owner" } else { "whoever wrote it" };
+            Err(ApiError(StatusCode::CONFLICT, format!("This routine runs for {whose}, whose account is turned off. An admin can hand their Bots and routines to someone else.")))
+        }
+    }
 }
 
 /// Logs `routine.enabled`/`routine.disabled`, and `routine.updated` for other changes.
@@ -1969,6 +2066,9 @@ fn routine_events(by: &Who, before: &db::Routine, after: &db::Routine) -> Vec<Ev
     if before.instruction != after.instruction {
         changes.insert("instruction".into(), json!("changed"));
     }
+    if before.author_id != after.author_id {
+        changes.insert("author".into(), json!({ "from": before.author_id, "to": after.author_id }));
+    }
     if !changes.is_empty() {
         out.push(ev("routine.updated").details(json!({ "name": after.name, "changes": changes })));
     }
@@ -1985,7 +2085,14 @@ fn need_routine(app: &App, c: &Caller, by: &Who, id: &str) -> Res<db::Routine> {
 async fn update_routine(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
     let before = need_routine(&app, &c, &by, &id)?;
     let f = routine_fields(&v)?;
-    app.db.update_routine(&id, f.name.as_deref(), f.cron.as_deref(), f.instruction.as_deref(), f.enabled);
+    // Whoever writes the instruction is whom it runs for.
+    let author = routine_author(&app, &c);
+    if f.enabled == Some(true) {
+        let rewrites = f.instruction.as_deref().is_some_and(|i| i != before.instruction);
+        let author_after = if rewrites && author.is_some() { author.clone() } else { before.author_id.clone() };
+        need_unblocked(&app, &before.bot_id, author_after.as_deref())?;
+    }
+    app.db.update_routine(&id, f.name.as_deref(), f.cron.as_deref(), f.instruction.as_deref(), f.enabled, author.as_deref());
     let after = app.db.routine(&id).ok_or_else(|| not_found("Routine"))?;
     for e in routine_events(&by, &before, &after) {
         app.db.record(&e);
@@ -2833,6 +2940,7 @@ mod tests {
             run_timeout: Duration::from_secs(60),
             default_harness: "claude".into(),
         }, None);
+        users::ensure_operator(&app.db, "Owner", None);
         let bot = app.db.create_bot("Tester", "#f5f5f5", "waddle", "claude", None, true);
         let router = Router::new()
             .route("/api/bots/{id}/routines", get(list_routines).post(create_routine))

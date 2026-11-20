@@ -8,7 +8,7 @@ import { BotAvatar } from "./BotAvatar";
 interface Props {
   visible: boolean;
   onClose: () => void;
-  /** Opens the policy editor for all Bots (ADR 0048). */
+  /** Opens the policy editor for all Bots (ADR 0049). */
   onOpenPolicy?: () => void;
 }
 

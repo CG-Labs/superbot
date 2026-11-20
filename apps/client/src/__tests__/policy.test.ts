@@ -1,7 +1,7 @@
 import { classChoice, minutesLabel, newRule, parseTimeout, ruleProblem, RULE_NOTE_MAX, RULE_PATTERN_MAX, sortRules, toolLabel } from "../policy";
 import type { PolicyRule } from "../types";
 
-describe("policy helpers (ADR 0048)", () => {
+describe("policy helpers (ADR 0049)", () => {
   it("reads minutes from 1 to 24 hours", () => {
     expect(parseTimeout(" 15 ")).toEqual({ minutes: 15 });
     expect(parseTimeout("1440")).toEqual({ minutes: 1440 });

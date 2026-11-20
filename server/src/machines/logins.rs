@@ -80,17 +80,20 @@ pub fn cred_query() -> Vec<String> {
         .collect()
 }
 
-/// Whether `owner`'s runs get one of the login's keys, so they need no login.
-fn keyed(owner: &str, r: &MachineLogin) -> bool {
+/// Whether runs get one of the login's keys, so they need no login: the server-wide
+/// ones, and `owner`'s own if given (a run for someone else gets none, ADR 0046).
+fn keyed(owner: Option<&str>, r: &MachineLogin) -> bool {
     let s = crate::secrets::global();
-    s.harness_env_for(owner)
+    owner
+        .map_or_else(|| s.harness_env(), |o| s.harness_env_for(o))
         .into_iter()
         .chain(s.inherited_harness_env())
         .any(|(k, v)| r.keys.contains(&k.as_str()) && !v.expose().trim().is_empty())
 }
 
-/// Whether a run of `bin` for `owner` may start on their machine, as far as logins go.
-pub fn check_run(e: &Enrollment, hb: &Heartbeat, owner: &str, bin: &str) -> Result<(), Refusal> {
+/// Whether a run of `bin` may start on its owner's machine, as far as logins go.
+/// `owner`: whose own keys the run gets, if anyone's.
+pub fn check_run(e: &Enrollment, hb: &Heartbeat, owner: Option<&str>, bin: &str) -> Result<(), Refusal> {
     match recipe(bin) {
         Some(r) if e.logins => route::logged_in(hb, bin, keyed(owner, &r)),
         _ => Ok(()),
@@ -157,7 +160,7 @@ fn view(e: &Enrollment, m: &Machine, hb: &Heartbeat) -> Value {
         .filter(|n| recipe(n).is_some())
         .map(|n| {
             let st = hb.logins.get(*n).cloned().unwrap_or_default();
-            let keyed = recipe(n).is_some_and(|r| keyed(&m.user_id, &r));
+            let keyed = recipe(n).is_some_and(|r| keyed(Some(&m.user_id), &r));
             (
                 n.to_string(),
                 json!({ "state": if st.state.is_empty() { wire::LOGGED_OUT } else { st.state.as_str() }, "since": st.since, "keyInSecrets": keyed }),
