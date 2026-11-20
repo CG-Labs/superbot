@@ -51,6 +51,8 @@ mod paths;
 mod policy;
 #[cfg(test)]
 mod policy_http_tests;
+#[cfg(test)]
+mod prompts_http_tests;
 mod rbac;
 #[cfg(test)]
 mod run_grants_http_tests;
@@ -1564,7 +1566,36 @@ fn bot_patch(v: &Value) -> Res<BotPatch> {
         let h = h.ok_or_else(|| bad(format!("Harness must be one of: {}", adapters::NAMES.join(", "))))?;
         p.harness = Some(h.into());
     }
+    if let Some(list) = v.get("prompts") {
+        p.prompts = Some(prompts_field(list)?);
+    }
     Ok(p)
+}
+
+/// Most suggested prompts a Bot shows (ADR 0054), and the longest one, in characters.
+const MAX_PROMPTS: usize = 6;
+const MAX_PROMPT_CHARS: usize = 200;
+
+/// Suggested prompts: null for the defaults, or a list of non-blank strings, trimmed
+/// and without repeats. An empty list shows none.
+fn prompts_field(v: &Value) -> Res<Option<Vec<String>>> {
+    let Some(items) = v.as_array() else {
+        return if v.is_null() { Ok(None) } else { Err(bad("Prompts must be a list of text, or null for the defaults")) };
+    };
+    let mut out: Vec<String> = Vec::new();
+    for item in items {
+        let t = item.as_str().ok_or_else(|| bad("Prompts must be a list of text, or null for the defaults"))?.trim();
+        if t.chars().count() > MAX_PROMPT_CHARS {
+            return Err(bad(format!("A prompt can be at most {MAX_PROMPT_CHARS} characters")));
+        }
+        if !t.is_empty() && !out.iter().any(|o| o == t) {
+            out.push(t.to_string());
+        }
+    }
+    if out.len() > MAX_PROMPTS {
+        return Err(bad(format!("A Bot can have at most {MAX_PROMPTS} suggested prompts")));
+    }
+    Ok(Some(out))
 }
 
 fn visibility_field(v: &Value) -> Res<Option<Visibility>> {
@@ -1641,6 +1672,7 @@ fn bot_changes(before: &db::Bot, after: &db::Bot) -> serde_json::Map<String, Val
     diff("model", json!(before.model), json!(after.model));
     diff("effort", json!(before.effort), json!(after.effort));
     diff("hidden", json!(before.hidden), json!(after.hidden));
+    diff("prompts", json!(before.prompts), json!(after.prompts));
     m
 }
 
