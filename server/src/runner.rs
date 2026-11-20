@@ -560,8 +560,11 @@ impl App {
             Place::There(there) => {
                 let (to, layout) = *there;
                 let botctl = PathBuf::from(layout.botctl.clone().unwrap_or_default());
-                // HOME and PATH are the machine's own.
+                // HOME and PATH are the machine's own; it inherits nothing of botd's.
                 env.remove("PATH");
+                for (k, v) in crate::secrets::global().inherited_harness_env() {
+                    env.entry(k).or_insert_with(|| v.expose().to_string());
+                }
                 env.insert("BOT_API".into(), layout.api.clone());
                 env.insert("SUPERBOT_BOTCTL".into(), botctl.display().to_string());
                 let state_dir = PathBuf::from(&layout.bots).join(&bot.id);
