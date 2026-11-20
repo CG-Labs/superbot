@@ -192,3 +192,25 @@ describe("SuperBotApi policy editor (ADR 0049)", () => {
     call("/api/policy/rules/r%2F1", "DELETE");
   });
 });
+
+describe("SuperBotApi approvals (ADR 0051)", () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  it("approves once, for the rest of the run, or denies", async () => {
+    const fetchMock = jest.fn(async () => ({ ok: true, status: 200, json: async () => ({ id: "a1", status: "approved" }) }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const api = new SuperBotApi({ baseUrl: BASE, token: "sbs_" + "a".repeat(64) });
+    const call = (url: string, body: unknown) =>
+      expect(fetchMock).toHaveBeenLastCalledWith(`${BASE}${url}`, expect.objectContaining({ method: "POST", body: JSON.stringify(body) }));
+
+    await api.decideApproval("a1", true, false, "run");
+    call("/api/approvals/a1/approve", { remember: null, scope: "run" });
+    await api.decideApproval("a1", true, true);
+    call("/api/approvals/a1/approve", { remember: "bot", scope: "once" });
+    await api.decideApproval("a1", false, false);
+    call("/api/approvals/a1/deny", { remember: null, scope: "once" });
+  });
+});

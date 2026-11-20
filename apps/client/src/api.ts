@@ -3,6 +3,7 @@ import type {
   AdminUser,
   AppState,
   Approval,
+  ApprovalScope,
   AuditPage,
   BillingView,
   BotAccessView,
@@ -226,9 +227,11 @@ export class SuperBotApi {
     return this.request<{ url: string }>("GET", `/api/bots/${botId}/screen`);
   }
 
-  async decideApproval(id: string, approve: boolean, remember: boolean): Promise<Approval> {
+  /** scope "run" also approves calls of the same kind for the rest of the run (ADR 0051). */
+  async decideApproval(id: string, approve: boolean, remember: boolean, scope: ApprovalScope = "once"): Promise<Approval> {
     return this.request<Approval>("POST", `/api/approvals/${id}/${approve ? "approve" : "deny"}`, {
       remember: remember ? "bot" : null,
+      scope,
     });
   }
 
