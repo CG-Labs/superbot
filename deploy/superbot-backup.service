@@ -1,8 +1,10 @@
 [Unit]
-Description=SuperBot SQLite backup
+Description=SuperBot backup (DATA_DIR archive, docs/ops/backup-restore.md)
 
 [Service]
 Type=oneshot
 User=superbot
 EnvironmentFile=-/home/superbot/superbot/.env
-ExecStart=/usr/local/bin/superbot-backup /home/superbot
+ExecStart=/usr/local/bin/superbot-backup --home /home/superbot
+NoNewPrivileges=true
+PrivateTmp=true
