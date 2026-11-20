@@ -228,7 +228,7 @@ botctl bot owner <bot-id> alex@example.com          # admins only
 
 ### Tiers and model routing
 
-Each user is on a **tier** (a plan). A tier lists the harness and model **routes** its users' Bots may run on, and limits per user: `maxBots`, `monthlyRuns` (UTC calendar month), and `monthlyTokens` (shown, not enforced yet). Design: [ADR 0032](adr/0032-tiers-model-routing.md).
+Each user is on a **tier** (a plan). A tier lists the harness and model **routes** its users' Bots may run on, and limits per user: `maxBots`, `monthlyRuns` (UTC calendar month), and `monthlyTokens` (shown, not enforced yet). Design: [ADR 0033](adr/0033-tiers-model-routing.md).
 
 - **Default: nothing changes.** Without `TIERS_FILE` there is one tier, `self-host`: any harness and model, no limits.
 - **Turn on**: copy [`deploy/tiers.example.json`](../deploy/tiers.example.json), edit it, set `TIERS_FILE` to its path, and restart. `DEFAULT_TIER` (or the file's `default`, else its first tier) is the tier for users without one. botd refuses to start on a bad file.
@@ -258,7 +258,7 @@ All JSON. Auth: a session cookie (web app) or `Authorization: Bearer <session to
 - `GET /api/bots/:id/access` → `{botId, owner, visibility, access, grants?}` (grants for the owner and admins). `PATCH` `{visibility?, owner?}` (owner: admins only)
 - `PUT /api/bots/:id/grants/:user` `{level: viewer|operator}`, `DELETE /api/bots/:id/grants/:user`: owner or admin; `:user` is an id or email
 - `GET /api/harnesses/:name/models`: models and reasoning efforts the harness offers (Claude Code: aliases; Codex: `codex debug models`; Pi: `pi --list-models`; Hermes Agent: one entry with an empty `id`, meaning any model name, with its efforts). 403 for non-admins on a managed tier; `?tier=<name>` (admins): only that tier's models
-- `GET /api/me/tier` → `{name, label, managed, limits: {maxBots, monthlyRuns, monthlyTokens}, usage: {period, runs, bots}}`: your plan, no model names. People only ([ADR 0032](adr/0032-tiers-model-routing.md))
+- `GET /api/me/tier` → `{name, label, managed, limits: {maxBots, monthlyRuns, monthlyTokens}, usage: {period, runs, bots}}`: your plan, no model names. People only ([ADR 0033](adr/0033-tiers-model-routing.md))
 - `GET /api/tiers` → `{default, source, tiers: [{name, label, managed, limits, routes: "any" | [{harness, provider?, model, effort?}]}]}`: admins only
 - `GET|POST /api/bots/:id/messages` `{text, answer?: {messageId, option}}`
 - `POST /api/bots/:id/read`, `POST /api/bots/:id/stop`
@@ -317,6 +317,6 @@ Approvals, policy, and audit. Writes, decisions, the approvals list, and the aud
 
 ## Not built yet
 
-Sign-up emails, self-serve SSO linking, and sign-up retention ([ADR 0022](adr/0022-landing-and-signups.md)). SCIM groups, group-to-role mapping, and bulk ([ADR 0023](adr/0023-scim.md)). Enrollment and mTLS with per-user machines, moving a user's Bots onto theirs, and `botctl machine` commands ([ADR 0025](adr/0025-control-plane-linode.md)). Billing (payment provider, subscriptions), token metering, and machine size following the user's tier ([ADR 0032](adr/0032-tiers-model-routing.md)). Vault/Key Vault/Secret Manager stores and master-key rotation (the `SecretStore` trait is ready for them), per-Bot resource limits, Slack. Approvals follow-ups are in [approvals-followups.md](approvals-followups.md).
+Sign-up emails, self-serve SSO linking, and sign-up retention ([ADR 0022](adr/0022-landing-and-signups.md)). SCIM groups, group-to-role mapping, and bulk ([ADR 0023](adr/0023-scim.md)). Enrollment and mTLS with per-user machines, moving a user's Bots onto theirs, and `botctl machine` commands ([ADR 0025](adr/0025-control-plane-linode.md)). Billing (payment provider, subscriptions), token metering, and machine size following the user's tier ([ADR 0033](adr/0033-tiers-model-routing.md)). Vault/Key Vault/Secret Manager stores and master-key rotation (the `SecretStore` trait is ready for them), per-Bot resource limits, Slack. Approvals follow-ups are in [approvals-followups.md](approvals-followups.md).
 
 Computer use (each Bot's screen, browser, and live view) is in [computer.md](computer.md).

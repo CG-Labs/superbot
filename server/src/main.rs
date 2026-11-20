@@ -1115,7 +1115,7 @@ async fn state(State(app): State<AppState>, Extension(c): Extension<Caller>, Ext
 }
 
 /// Models and reasoning efforts the harness offers on this server. On a managed tier
-/// the plan picks the model, so only admins may list them (ADR 0032). `?tier=` (admins):
+/// the plan picks the model, so only admins may list them (ADR 0033). `?tier=` (admins):
 /// only that tier's models for the harness, for picking one for a Bot on that tier.
 async fn list_models(State(app): State<AppState>, Extension(c): Extension<Caller>, Path(name): Path<String>, Query(q): Query<HashMap<String, String>>) -> Res {
     if adapters::get(&name).is_none() {
@@ -1179,7 +1179,7 @@ async fn list_tiers(State(app): State<AppState>) -> Json<Value> {
 }
 
 /// The Bot settings must fit the owner's tier: harness, model, and effort, and on
-/// create a free Bot slot (ADR 0032). Admins too: the tier is the routing table.
+/// create a free Bot slot (ADR 0033). Admins too: the tier is the routing table.
 fn check_tier(app: &App, owner_id: &str, harness: &str, model: Option<&str>, effort: Option<&str>, new_bot: bool) -> Res<()> {
     let tier = app.tier_of(owner_id);
     tier.check(harness, model, effort).map_err(|e| ApiError(StatusCode::FORBIDDEN, e))?;

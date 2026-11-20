@@ -149,7 +149,7 @@ Admin actions (logins, Bot and routine changes, approvals, policy, handoffs) are
 
 ## Tiers (plans)
 
-Off unless you set `TIERS_FILE`: without it every user is on one open `self-host` tier and Bots run on whatever model they're set to, as before. To sell plans that pick the model ([ADR 0032](../docs/adr/0032-tiers-model-routing.md)):
+Off unless you set `TIERS_FILE`: without it every user is on one open `self-host` tier and Bots run on whatever model they're set to, as before. To sell plans that pick the model ([ADR 0033](../docs/adr/0033-tiers-model-routing.md)):
 
 - Copy [`tiers.example.json`](tiers.example.json) next to `.env`, edit the routes and limits, and set `TIERS_FILE` to its path (and `DEFAULT_TIER` if you like). Restart `botd`; it refuses to start on a bad file.
 - Assign users: `botctl user tier alex@example.com pro`, or `default`. `botctl tiers` lists them with their routes.
@@ -212,7 +212,7 @@ Without a domain, `./init.sh` gives plain HTTP at `http://localhost`, published 
 
 Secure by default: Compose refuses to start without `AUTH_PASSWORD`; the image sets `HOST=0.0.0.0`, so `botd` itself also refuses to run without it, and `ALLOW_NO_AUTH` is forced off. `ALLOWED_HOSTS` always includes `SUPERBOT_DOMAIN` (or `localhost`); add other names, such as `localhost:8080` when you change `SUPERBOT_HTTP_PORT`, in `.env`.
 
-Every other `botd` setting (`TZ`, `USER_NAME`, `DEFAULT_HARNESS`, `CORS_ORIGINS`, `RUN_TIMEOUT_MINUTES`, …) goes in `.env`; apply changes with `docker compose up -d`. For tiers ([ADR 0032](../docs/adr/0032-tiers-model-routing.md)), copy the file into the data volume (`docker compose cp tiers.json botd:/data/tiers.json`) and set `TIERS_FILE=/data/tiers.json`; without it every user is on the open `self-host` tier, as before. `HOST`, `PORT`, `DATA_DIR`, and `WORKSPACE_DIR` are fixed by the image.
+Every other `botd` setting (`TZ`, `USER_NAME`, `DEFAULT_HARNESS`, `CORS_ORIGINS`, `RUN_TIMEOUT_MINUTES`, …) goes in `.env`; apply changes with `docker compose up -d`. For tiers ([ADR 0033](../docs/adr/0033-tiers-model-routing.md)), copy the file into the data volume (`docker compose cp tiers.json botd:/data/tiers.json`) and set `TIERS_FILE=/data/tiers.json`; without it every user is on the open `self-host` tier, as before. `HOST`, `PORT`, `DATA_DIR`, and `WORKSPACE_DIR` are fixed by the image.
 
 ### Harness CLIs and logins
 

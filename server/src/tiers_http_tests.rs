@@ -1,4 +1,4 @@
-//! Tiers and hidden model routing (ADR 0032), on the real router: without a tiers file
+//! Tiers and hidden model routing (ADR 0033), on the real router: without a tiers file
 //! nothing changes; on a managed tier nobody can set a Bot to a model outside it, only
 //! admins see models, every run takes the route the Bot owner's tier picks, and the
 //! tier's limits hold, counted per user. Only admins assign tiers, and it's audited.

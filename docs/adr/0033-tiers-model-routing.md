@@ -1,4 +1,4 @@
-# 0032: Tiers and model routing hidden behind them
+# 0033: Tiers and model routing hidden behind them
 
 ## Status
 

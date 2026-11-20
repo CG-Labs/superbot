@@ -44,7 +44,7 @@ export interface BotView {
   visibility?: Visibility;
   /** What you may do with it. */
   access?: BotAccess;
-  /** The owner's plan (ADR 0032). On a managed plan the server picks the model and
+  /** The owner's plan (ADR 0033). On a managed plan the server picks the model and
    *  sends `model` and `effort` only to admins. */
   tier?: TierBadge;
   /** Admins only: the route this Bot's runs take. */

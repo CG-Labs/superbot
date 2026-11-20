@@ -14,7 +14,7 @@ interface Props {
   tier?: string;
 }
 
-/** On a managed plan the plan picks the model (ADR 0032): people see the plan, not models. */
+/** On a managed plan the plan picks the model (ADR 0033): people see the plan, not models. */
 export function PlanBar({ label }: { label: string }) {
   return (
     <View style={styles.row}>

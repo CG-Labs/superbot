@@ -1,4 +1,4 @@
-//! Tiers (ADR 0032): what a user's plan allows. A tier lists the harness and model
+//! Tiers (ADR 0033): what a user's plan allows. A tier lists the harness and model
 //! routes its users' Bots may run on, and simple limits. Users pick a tier, not a model:
 //! a tier with routes is *managed*, so the server picks each run's model from the Bot
 //! owner's tier, nobody can set a Bot to a model outside it, and only admins see model

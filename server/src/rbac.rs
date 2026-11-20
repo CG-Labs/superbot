@@ -113,7 +113,7 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         ("GET", ["machine"]) => Account,
         // Your own secrets (ADR 0029). Handlers refuse Bots; anyone else's are under `users`.
         ("GET", ["me", "secrets"]) => Read,
-        // Your own plan (ADR 0032). Every tier with its models is `tiers`, for admins.
+        // Your own plan (ADR 0033). Every tier with its models is `tiers`, for admins.
         ("GET", ["me", "tier"]) => Read,
         ("PUT" | "DELETE", ["me", "secrets", _]) => Write,
 

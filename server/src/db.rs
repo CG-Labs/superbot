@@ -250,7 +250,7 @@ pub struct User {
     pub last_login_at: Option<i64>,
     pub last_login_method: Option<String>,
     pub last_login_idp_provider: Option<String>,
-    /// The tier an admin (later, billing) gave them. None: the default tier (ADR 0032).
+    /// The tier an admin (later, billing) gave them. None: the default tier (ADR 0033).
     pub tier: Option<String>,
 }
 
@@ -765,7 +765,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 11] = [
     migrate_tiers,
 ];
 
-/// Tiers (ADR 0032): each user's assigned tier (NULL: the configured default) and runs
+/// Tiers (ADR 0033): each user's assigned tier (NULL: the configured default) and runs
 /// counted per user and UTC month, for the tier's monthly limit. Keyed by user, so
 /// every query names one.
 fn migrate_tiers(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
@@ -1668,7 +1668,7 @@ impl Db {
         }
     }
 
-    // Tiers and usage (ADR 0032). Every query names the user.
+    // Tiers and usage (ADR 0033). Every query names the user.
 
     /// Tiers assigned to users, each once.
     pub fn assigned_tiers(&self) -> Vec<String> {

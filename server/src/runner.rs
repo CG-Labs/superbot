@@ -68,7 +68,7 @@ pub struct App {
     pub approval_waiters: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     /// Picks where each Bot runs: its owner's machine, or here (ADR 0029). Unset: here.
     pub control_plane: OnceLock<Arc<ControlPlane>>,
-    /// Each user's plan and the models it routes to (ADR 0032). Unset: self-host only.
+    /// Each user's plan and the models it routes to (ADR 0033). Unset: self-host only.
     pub tiers: OnceLock<Arc<Tiers>>,
     closing: AtomicBool,
 }
@@ -502,7 +502,7 @@ impl App {
     }
 
     /// The tier this run is on and the route it takes: the Bot owner's tier picks the
-    /// model, never the Bot's settings alone (ADR 0032). The run is counted for the
+    /// model, never the Bot's settings alone (ADR 0033). The run is counted for the
     /// owner, within the tier's monthly limit. None: refused, and the Bot said why.
     fn tier_route(&self, bot: &Bot, msg: &Message, by: &Who, period: &str) -> Option<(String, Route)> {
         let tier = self.tier_of(&bot.owner_id);
