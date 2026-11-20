@@ -57,6 +57,7 @@ const DETAIL_MAX: usize = 60;
 
 impl Level<'_> {
     pub fn classify(&self, w: &mut Walk, out: &mut Out) {
+        self.note_changes(w, out);
         for (k, (c, eval)) in self.s.cmds.iter().zip(&self.s.evals).enumerate() {
             let (words, xargs) = strip_wrappers(&c.argv, out);
             let Some(first) = words.first() else { continue };
@@ -157,6 +158,38 @@ impl Level<'_> {
         }
     }
 
+    /// Notes, for the whole call, the files this level may change: what it writes to and
+    /// what other programs name. Scripts read later that it names ask, and so does naming a
+    /// script already read, since one script may rewrite another before it runs.
+    fn note_changes(&self, w: &mut Walk, out: &mut Out) {
+        const RUNS_OTHERS: [&str; 5] = ["find", "watch", "flock", "script", "make"];
+        let base = |t: &str| t.rsplit('/').next().unwrap_or(t).to_string();
+        let mut named = Vec::new();
+        for c in &self.s.cmds {
+            for target in &c.writes {
+                match target.dynamic {
+                    true => w.wild_writes = true,
+                    false => named.push(base(&target.text)),
+                }
+            }
+            let words = strip_wrappers(&c.argv, &mut Vec::new()).0;
+            let Some(first) = words.first().filter(|f| !f.dynamic && !f.text.contains('/')) else { continue };
+            let prog = program(&first.text);
+            if READS_ONLY.contains(&prog.as_str()) || RUNS_OTHERS.contains(&prog.as_str()) || Lang::of(&prog).is_some() || ["source", ".", "cd"].contains(&prog.as_str()) {
+                continue;
+            }
+            named.extend(words[1..].iter().filter(|a| !a.dynamic && !a.text.starts_with('-')).map(|a| base(&a.text)));
+        }
+        for n in named.into_iter().filter(|n| !n.is_empty()) {
+            if w.ran.contains(&n) {
+                out.push(("shell_destructive", format!("May change {n}, which this call also runs, so SuperBot can't check what will run")));
+            }
+            if !w.changed.contains(&n) {
+                w.changed.push(n);
+            }
+        }
+    }
+
     /// Whether this command's standard input may carry code from outside the command line.
     fn fed(&self, c: &Command) -> bool {
         self.input || c.pipe_from.is_some() || c.stdin.is_some()
@@ -203,11 +236,13 @@ impl Level<'_> {
             classify_shell(code, self.cwds, self.ctx, self.depth + 1, w, fed, &mut found);
         } else {
             let f = scripts::scan(lang, code, label);
+            let moved = Cwds { dirs: self.cwds.dirs.clone(), unknown: true };
+            let cwds = if f.moves { &moved } else { self.cwds };
             for cmd in &f.commands {
-                classify_shell(cmd, self.cwds, self.ctx, self.depth + 1, w, false, &mut found);
+                classify_shell(cmd, cwds, self.ctx, self.depth + 1, w, false, &mut found);
             }
             for p in &f.deletes {
-                deletion(self.ctx, self.cwds, p, &mut |c, why| found.push((c, why)));
+                deletion(self.ctx, cwds, p, &mut |c, why| found.push((c, why)));
             }
             for host in MESSAGING_HOSTS.iter().filter(|h| f.strings.iter().any(|s| s.to_ascii_lowercase().contains(*h))) {
                 found.push(("outbound_message", format!("Sends a message through {}", host.trim_end_matches("://"))));
@@ -262,7 +297,8 @@ impl Level<'_> {
                 ask(out, format!("Runs {name} on the Bot's machine, where SuperBot can't read it"));
                 continue;
             }
-            if self.changes(k, name) {
+            let base = name.rsplit('/').next().unwrap_or(name).to_string();
+            if self.changes(k, name) || w.wild_writes || w.changed.contains(&base) {
                 ask(out, format!("Runs {name} after this same command may change it, so SuperBot can't check what will run"));
                 continue;
             }
@@ -277,6 +313,9 @@ impl Level<'_> {
                 continue;
             }
             w.reads += 1;
+            if !w.ran.contains(&base) {
+                w.ran.push(base.clone());
+            }
             let source = scripts::read(&self.ctx.workspace, &place);
             missing |= matches!(source, Source::Missing);
             found |= !matches!(source, Source::Missing);

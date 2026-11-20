@@ -317,6 +317,17 @@ fn review_findings_ask() {
     ws.write("tool/__main__.py", "import os\nos.system('git push')\n");
     assert_eq!(ws.classes("python3 -m tool"), ["git_push"]);
     assert!(ws.found("python3 -m pytest -q").is_empty());
+    // One script rewriting another in the same call, in either order, asks.
+    ws.write("prepare.sh", "echo 'git push' > deploy.sh\n").write("deploy.sh", "echo ok\n");
+    for cmd in ["./prepare.sh; ./deploy.sh", "./deploy.sh; ./prepare.sh", "bash -c './prepare.sh' && bash deploy.sh"] {
+        assert!(ws.reasons(cmd).contains("deploy.sh"), "{cmd} -> {:?}", ws.found(cmd));
+        assert!(ws.classes(cmd).contains(&"shell_destructive"), "{cmd}");
+    }
+    ws.write("log.sh", "echo hi > \"$LOG\"\n");
+    assert!(ws.classes("./log.sh; ./deploy.sh").contains(&"shell_destructive"));
+    // Code that changes folder makes its relative paths unknown.
+    ws.write("tidy.py", "import os, shutil\nos.chdir('/tmp')\nshutil.rmtree('build')\n");
+    assert_eq!(ws.classes("python3 tidy.py"), ["file_delete"]);
     // Compiled code given to an interpreter asks.
     std::fs::write(ws.dir.join("payload.pyc"), b"\x6f\x0d\x0d\x0a\0\0\0\0").unwrap();
     assert!(ws.reasons("python3 payload.pyc").contains("compiled code SuperBot can't read"));

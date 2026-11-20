@@ -158,6 +158,18 @@ pub struct Found {
     pub asks: Vec<(&'static str, String)>,
     /// Its plain strings, for the caller's own checks (messaging hosts).
     pub strings: Vec<String>,
+    /// It may change folder, so relative paths and commands are from a folder SuperBot can't tell.
+    pub moves: bool,
+}
+
+/// Tokens the scan of one file may visit. A hostile file hits it and asks.
+const MAX_SCAN_WORK: usize = 4_000_000;
+
+/// Takes one step of `work`; false once it is used up.
+fn step(work: &std::cell::Cell<usize>) -> bool {
+    let left = work.get();
+    work.set(left.saturating_sub(1));
+    left > 0
 }
 
 /// One kind of call: its name and, when the name alone is too common, words that must
@@ -323,11 +335,14 @@ pub fn scan(lang: Lang, code: &str, name: &str) -> Found {
     };
     let toks = tokens(lang, code);
     let mut f = Found::default();
+    let work = std::cell::Cell::new(MAX_SCAN_WORK);
+    // Relative paths and commands may be from another folder (`os.chdir('/tmp')`).
+    f.moves = code.contains("chdir");
     let gated = |spec: &Spec| spec.1.is_empty() || spec.1.iter().any(|g| code.contains(g));
     let unknown_cmd = |api: &str| ("shell_destructive", format!("Runs commands only known when it runs ({api} in {name})"));
 
     for spec in apis.spawn.iter().filter(|s| gated(s)) {
-        let sites = call_sites(&toks, spec.0, apis.bare_calls);
+        let sites = call_sites(&toks, spec.0, apis.bare_calls, &work);
         let mut unknown = false;
         // `platform.system()`: a call with nothing to run is another API of the same name.
         for args in sites.iter().filter(|a| !a.is_empty()) {
@@ -348,7 +363,7 @@ pub fn scan(lang: Lang, code: &str, name: &str) -> Found {
     // A risky API under another name (`from subprocess import run as r`, `f = os.system`,
     // `getattr(os, 'system')`) can't be followed to its calls.
     for spec in apis.spawn.iter().chain(apis.spawn_opaque).chain(apis.delete).filter(|s| gated(s)) {
-        if let Some(how) = renamed(&toks, spec.0, apis.bare_calls) {
+        if let Some(how) = renamed(&toks, spec.0, apis.bare_calls, &work) {
             f.asks.push(("shell_destructive", format!("Uses {} {how}, so SuperBot can't follow what it runs ({} in {name})", spec.0, spec.0)));
         }
     }
@@ -387,7 +402,7 @@ pub fn scan(lang: Lang, code: &str, name: &str) -> Found {
         }
     }
     for l in apis.load {
-        let sites = call_sites(&toks, l, false);
+        let sites = call_sites(&toks, l, false, &work);
         let fixed = sites.iter().filter(|a| matches!(a.as_slice(), [Arg::Lit(_)])).count();
         if raw_calls(code, l, false, true) > fixed {
             f.asks.push(("shell_destructive", format!("Loads code chosen when it runs ({l} in {name})")));
@@ -395,7 +410,7 @@ pub fn scan(lang: Lang, code: &str, name: &str) -> Found {
     }
 
     for spec in apis.delete.iter().filter(|s| gated(s)) {
-        let sites = call_sites(&toks, spec.0, apis.bare_calls);
+        let sites = call_sites(&toks, spec.0, apis.bare_calls, &work);
         let mut unknown = false;
         for args in &sites {
             if args.iter().all(|a| matches!(a, Arg::Opt(_))) {
@@ -417,6 +432,9 @@ pub fn scan(lang: Lang, code: &str, name: &str) -> Found {
     }
     if let Some(m) = apis.mail.iter().find(|m| code.contains(*m)) {
         f.asks.push(("outbound_message", format!("Sends email ({} in {name})", m.trim_end_matches('('))));
+    }
+    if work.get() == 0 {
+        f.asks.push(("shell_destructive", format!("Is too complex for SuperBot to check fully ({name})")));
     }
     f.strings = toks.into_iter().filter_map(|t| if let Tok::Str { text, dynamic: false, .. } = t { Some(text) } else { None }).collect();
     f
@@ -522,7 +540,7 @@ fn tokens(lang: Lang, code: &str) -> Vec<Tok> {
 
 /// How `name` is used other than by calling it: renamed on import, assigned, passed
 /// along, or named in a string. Importing it under its own name is fine.
-fn renamed(toks: &[Tok], name: &str, bare: bool) -> Option<&'static str> {
+fn renamed(toks: &[Tok], name: &str, bare: bool, work: &std::cell::Cell<usize>) -> Option<&'static str> {
     // Names too common as plain words to count in strings.
     const COMMON: [&str; 6] = ["run", "call", "remove", "delete", "rm", "spawn"];
     for (k, t) in toks.iter().enumerate() {
@@ -544,8 +562,9 @@ fn renamed(toks: &[Tok], name: &str, bare: bool) -> Option<&'static str> {
             return Some("under another name");
         }
         // The statement it is in: an import or require naming it as itself is fine.
-        let start = toks[..k].iter().rposition(|t| matches!(t, Tok::Punct('\n' | ';'))).map_or(0, |p| p + 1);
-        let end = toks[k..].iter().position(|t| matches!(t, Tok::Punct('\n' | ';'))).map_or(toks.len(), |p| k + p);
+        let boundary = |t: &Tok| !step(work) || matches!(t, Tok::Punct('\n' | ';'));
+        let start = toks[..k].iter().rposition(boundary).map_or(0, |p| p + 1);
+        let end = toks[k..].iter().position(boundary).map_or(toks.len(), |p| k + p);
         let import = toks[start..end].iter().any(|t| matches!(t, Tok::Ident(w) if ["import", "require", "use"].contains(&w.as_str())));
         if import {
             continue;
@@ -571,7 +590,7 @@ enum Arg {
 
 /// The arguments of each call of `name` in `toks`: `name(…)`, or with `bare`,
 /// `name "…"` up to the end of the line.
-fn call_sites(toks: &[Tok], name: &str, bare: bool) -> Vec<Vec<Arg>> {
+fn call_sites(toks: &[Tok], name: &str, bare: bool, work: &std::cell::Cell<usize>) -> Vec<Vec<Arg>> {
     let mut out = Vec::new();
     for (k, t) in toks.iter().enumerate() {
         if *t != Tok::Ident(name.into()) {
@@ -585,6 +604,9 @@ fn call_sites(toks: &[Tok], name: &str, bare: bool) -> Vec<Vec<Arg>> {
         let mut depth = 0usize;
         let mut args = vec![Vec::new()];
         for t in &toks[start..] {
+            if !step(work) {
+                break;
+            }
             match t {
                 Tok::Punct('(' | '[' | '{') => depth += 1,
                 Tok::Punct(')') if depth == 0 && paren => break,
@@ -783,6 +805,19 @@ mod tests {
             let a = asks(lang, code);
             assert!(a.iter().any(|w| w.starts_with("Runs commands only known when it runs")), "{code}: {a:?}");
         }
+    }
+
+    #[test]
+    fn hostile_files_are_bounded() {
+        let code = "import os\n".to_string() + &"os.system(".repeat(60_000);
+        let t = std::time::Instant::now();
+        let f = scan(Lang::Python, &code, "x");
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+        assert!(!f.asks.is_empty());
+        let one_line = "from os import ".to_string() + &"system, ".repeat(30_000);
+        let t = std::time::Instant::now();
+        scan(Lang::Python, &one_line, "x");
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
     }
 
     #[test]

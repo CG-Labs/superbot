@@ -632,11 +632,17 @@ struct Walk {
     files: Vec<PathBuf>,
     /// Script files read so far, counting the same file read again.
     reads: usize,
+    /// Names of the script files read so far.
+    ran: Vec<String>,
+    /// Names of files something in the call may change, and whether it writes to a path
+    /// only known when it runs.
+    changed: Vec<String>,
+    wild_writes: bool,
 }
 
 impl Walk {
     fn new() -> Walk {
-        Walk { budget: shell::MAX_TOTAL, files: Vec::new(), reads: 0 }
+        Walk { budget: shell::MAX_TOTAL, files: Vec::new(), reads: 0, ran: Vec::new(), changed: Vec::new(), wild_writes: false }
     }
 }
 
