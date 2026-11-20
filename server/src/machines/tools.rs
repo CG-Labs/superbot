@@ -47,6 +47,9 @@ struct Saved {
     node: Option<String>,
     /// What is installed, by harness name.
     installed: BTreeMap<String, String>,
+    /// The recipe each was installed from, so a new pin for the same version is checked.
+    #[serde(default)]
+    recipes: BTreeMap<String, HarnessInstall>,
     status: BTreeMap<String, HarnessStatus>,
 }
 
@@ -305,8 +308,9 @@ impl Tools {
         (s.plan.as_ref().map(HarnessPlan::id), s.status.clone())
     }
 
-    /// Takes `plan` as the one to install. A harness already at its version is left
-    /// alone; one that failed is tried again, and npm harnesses are installed again
+    /// Takes `plan` as the one to install. A harness installed from the same recipe is
+    /// left alone (a new checksum for its version is checked by installing it again);
+    /// one that failed is tried again, and npm harnesses are installed again
     /// on a new Node.js. Harnesses no longer planned stay installed, since a Bot may be
     /// using one.
     pub fn set_plan(&self, plan: HarnessPlan) -> Result<(), String> {
@@ -321,7 +325,8 @@ impl Tools {
             // Only the very same recipe carries on; a corrected one is installed again.
             let same = s.plan.as_ref().is_some_and(|p| p.harnesses.contains(h));
             let npm = matches!(h.source, InstallSource::Npm { .. });
-            let st = if have.as_deref() == Some(&h.version) && !(npm && new_node) && runnable(&self.bin_dir().join(&h.name)) {
+            let kept = have.as_deref() == Some(&h.version) && s.recipes.get(&h.name) == Some(h);
+            let st = if kept && !(npm && new_node) && runnable(&self.bin_dir().join(&h.name)) {
                 HarnessStatus { version: have, wanted: Some(h.version.clone()), state: wire::HARNESS_INSTALLED.into(), error: None, at: old.map_or(at, |o| o.at) }
             } else if same && old.is_some_and(|o| o.state == wire::HARNESS_INSTALLING) {
                 old.cloned().unwrap_or_default()
@@ -369,6 +374,7 @@ impl Tools {
         let still = s.plan.as_ref().is_some_and(|p| p.harnesses.contains(h));
         if let Ok(v) = &res {
             s.installed.insert(h.name.clone(), v.clone());
+            s.recipes.insert(h.name.clone(), h.clone());
         }
         let version = s.installed.get(&h.name).cloned();
         let Some(st) = s.status.get_mut(&h.name) else { return };
@@ -696,6 +702,7 @@ mod tests {
             let mut s = t.lock();
             s.node = Some("24.22.3".into());
             s.installed.insert("claude".into(), "2.1.329".into());
+            s.recipes.insert("claude".into(), npm("claude", "@anthropic-ai/claude-code", "2.1.329"));
         }
         let on = |version: &str| HarnessPlan {
             node: Some(NodeRuntime {
@@ -710,6 +717,34 @@ mod tests {
         assert_eq!(t.report().1["claude"].state, wire::HARNESS_QUEUED, "a plan that only moves Node.js is applied");
         let (h, node) = t.next().unwrap();
         assert!(t.replaces(&h, node.as_ref()), "running Bots use the old Node.js");
+    }
+
+    #[test]
+    fn a_new_pin_for_an_installed_version_is_checked() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("superbot-tools-pin-{}", now_ms()));
+        let t = Tools::new(dir, None).unwrap();
+        let claude = t.bin_dir().join("claude");
+        std::fs::write(&claude, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let node = NodeRuntime {
+            version: "24.22.3".into(),
+            downloads: BTreeMap::from([("x86_64".into(), wire::Download { url: "https://nodejs.org/n.tar.xz".into(), sha256: "a".repeat(64) })]),
+        };
+        let unpinned = npm("claude", "@anthropic-ai/claude-code", "2.1.329");
+        let plan = |h: HarnessInstall| HarnessPlan { node: Some(node.clone()), harnesses: vec![h] };
+        t.set_plan(plan(unpinned.clone())).unwrap();
+        let (h, _) = t.next().unwrap();
+        t.finish(&h, Ok(h.version.clone()));
+        t.lock().node = Some(node.version.clone());
+        t.set_plan(plan(unpinned.clone())).unwrap();
+        assert_eq!(t.report().1["claude"].state, wire::HARNESS_INSTALLED, "the same recipe is left alone");
+
+        let pin = format!("sha512-{}", base64::engine::general_purpose::STANDARD.encode([9u8; 64]));
+        let pinned = HarnessInstall { source: InstallSource::Npm { package: "@anthropic-ai/claude-code".into(), integrity: Some(pin) }, ..unpinned };
+        t.set_plan(plan(pinned.clone())).unwrap();
+        assert_eq!(t.report().1["claude"].state, wire::HARNESS_QUEUED, "a new pin is checked by installing again");
+        assert_eq!(t.next().unwrap().0, pinned);
     }
 
     #[tokio::test]
