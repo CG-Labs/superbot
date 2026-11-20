@@ -219,6 +219,16 @@ async fn the_reconciler_puts_machines_and_rules_back() {
     assert_eq!(events(&env, "machine.firewall_updated").await.len(), 1);
     assert_eq!(events(&env, "machine.firewall_attached").await.len(), 1);
 
+    env.fake.set_firewall(&fw, |f| f.enabled = false);
+    reconcile(&env).await;
+    assert!(env.fake.firewalls()[0].enabled, "turned back on");
+    let updated = events(&env, "machine.firewall_updated").await;
+    assert_eq!(updated.len(), 2);
+    assert_eq!(updated[0]["details"]["was"], "disabled", "{updated:?}");
+    env.fake.set_firewall(&fw, |f| f.enabled = false);
+    request(&env, "bea@example.com").await;
+    assert!(env.fake.firewalls()[0].enabled, "no new machine behind a disabled firewall");
+
     env.fake.delete_firewall(&fw).await.unwrap();
     reconcile(&env).await;
     let now = env.fake.firewalls();
@@ -307,7 +317,14 @@ async fn the_last_machine_out_deletes_the_firewall() {
     let (uc, _, c) = request(&env, "cy@example.com").await;
     assert_eq!(machine(&env, &c).firewall_id.as_deref(), Some(fw.as_str()), "reused");
     assert_eq!(env.fake.calls("create_firewall"), 1);
+    env.fake.set_firewall(&fw, |f| f.others = 1);
     assert_eq!(del(uc).await, 200);
+    assert_eq!(env.fake.firewalls().len(), 1, "it still covers someone's NodeBalancer");
+    assert!(events(&env, "machine.firewall_deleted").await.is_empty());
+
+    env.fake.set_firewall(&fw, |f| f.others = 0);
+    let (ud, _, _) = request(&env, "di@example.com").await;
+    assert_eq!(del(ud).await, 200);
     assert!(env.fake.firewalls().is_empty());
     let deleted = events(&env, "machine.firewall_deleted").await;
     assert_eq!(

@@ -59,6 +59,16 @@ pub struct ProviderFirewall {
     pub id: String,
     pub label: String,
     pub rules: Option<Vec<FirewallRule>>,
+    /// A disabled firewall filters nothing.
+    pub enabled: bool,
+}
+
+/// What a firewall covers: our machines by id, and how many other devices
+/// (NodeBalancers, interfaces) someone else put behind it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FirewallDevices {
+    pub machines: Vec<String>,
+    pub others: usize,
 }
 
 /// A machine as the provider sees it. `status` is the provider's own word for it
@@ -139,8 +149,8 @@ pub trait MachineProvider: Send + Sync {
         rules: &'a [FirewallRule],
     ) -> Fut<'a, ProviderFirewall>;
     fn set_firewall_rules<'a>(&'a self, id: &'a str, rules: &'a [FirewallRule]) -> Fut<'a, ()>;
-    /// The ids of the machines it covers.
-    fn firewall_machines<'a>(&'a self, id: &'a str) -> Fut<'a, Vec<String>>;
+    fn enable_firewall<'a>(&'a self, id: &'a str) -> Fut<'a, ()>;
+    fn firewall_devices<'a>(&'a self, id: &'a str) -> Fut<'a, FirewallDevices>;
     fn attach_firewall<'a>(&'a self, id: &'a str, machine: &'a str) -> Fut<'a, ()>;
     /// Succeeds if the machine isn't behind it, or either is gone.
     fn detach_firewall<'a>(&'a self, id: &'a str, machine: &'a str) -> Fut<'a, ()>;

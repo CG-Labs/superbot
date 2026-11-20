@@ -40,7 +40,7 @@ All machines share the rules, so one firewall does the job. It stays within Lino
 **When a machine is created:**
 
 1. botd finds the firewall by label, or creates it. If the create races another, or its answer was lost, botd finds it again.
-2. If the rules differ from what botd configured, botd sets them back.
+2. If the rules differ from what botd configured, botd sets them back. If someone disabled the firewall, botd enables it again, since a disabled firewall filters nothing.
 3. botd passes the firewall's id in the Linode create (`firewall_id`), so the machine is behind it from its first packet. There is no window between boot and attach.
 
 If botd can't get the firewall, it creates no machine and mints no token:
@@ -48,11 +48,11 @@ If botd can't get the firewall, it creates no machine and mints no token:
 - On a transient error (rate limit, network), the machine stays pending and the next pass retries.
 - On a refusal (for example, a token without Firewalls scope), the machine moves to `error`.
 
-**Each reconcile pass** keeps things right while any machine exists. It restores changed rules, re-creates a deleted firewall, and reattaches machines that are off it. These are machines taken off at the provider, adopted after a lost create, or made before the firewall was turned on. A machine botd can't attach (Linode allows one firewall per Linode) is audited once per distinct error, not on every pass.
+**Each reconcile pass** keeps things right while any machine exists. It restores changed rules, re-enables a disabled firewall, re-creates a deleted one, and reattaches machines that are off it. These are machines taken off at the provider, adopted after a lost create, or made before the firewall was turned on. A machine botd can't attach (Linode allows one firewall per Linode) is audited once per distinct error, not on every pass.
 
-**When a machine is destroyed,** botd takes it off the firewall. Linode does this on delete too, so it is idempotent. When no live machine of ours uses the firewall and Linode reports no devices on it, botd deletes it. It never deletes a firewall that still covers something botd doesn't know. If the delete fails, the empty firewall costs nothing and the next machine reuses it.
+**When a machine is destroyed,** botd takes it off the firewall. Linode does this on delete too, so it is idempotent. When no live machine of ours uses the firewall and Linode reports no devices of any kind on it, botd deletes it. It never deletes a firewall that still covers something botd doesn't know, such as a NodeBalancer someone attached. If the delete fails, the empty firewall costs nothing and the next machine reuses it.
 
-The provider trait has the firewall operations: find, create, set rules, list, attach, detach, delete. So the in-memory fake covers all of it in tests, and only the Linode adapter knows Linode's API.
+The provider trait has the firewall operations: find, create, set rules, enable, list devices, attach, detach, delete. So the in-memory fake covers all of it in tests, and only the Linode adapter knows Linode's API.
 
 ### First boot installs and enrolls
 
@@ -100,7 +100,7 @@ A late enrollment still counts and clears the flag. A new token from an admin re
 
 | Action | When |
 |--------|------|
-| `machine.firewall_created` / `_updated` / `_deleted` | The firewall itself (target `firewall`); `_updated` records the rules it replaced. |
+| `machine.firewall_created` / `_updated` / `_deleted` | The firewall itself (target `firewall`); `_updated` records the rules it replaced, or that it was disabled. |
 | `machine.firewall_attached` / `_detached` | A machine put back behind it, or taken off at destroy. |
 | `machine.firewall_failed` | Attach, detach or delete failed (`step`). |
 | `machine.create_failed` | Now with `step`: `firewall` or `create`. |

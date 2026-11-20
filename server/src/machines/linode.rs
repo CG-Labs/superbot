@@ -3,7 +3,7 @@
 //! Authorization header and nowhere else: not in errors, logs, or `Debug`.
 
 use super::provider::{
-    CreateSpec, FirewallRule, Fut, MachineProvider, ProviderError, ProviderFirewall,
+    CreateSpec, FirewallDevices, FirewallRule, Fut, MachineProvider, ProviderError, ProviderFirewall,
     ProviderMachine,
 };
 use base64::Engine;
@@ -101,14 +101,23 @@ impl Linode {
     }
 
     /// The firewall's devices that are Linodes, as (device id, Linode id).
-    async fn linode_devices(&self, id: &str) -> Result<Vec<(u64, String)>, ProviderError> {
+    /// Every device behind the firewall: `(device id, Linode id)` for Linodes, None
+    /// for anything else.
+    async fn devices(&self, id: &str) -> Result<Vec<Option<(u64, String)>>, ProviderError> {
         Ok(self
             .all(&format!("/networking/firewalls/{}/devices", path_id(id)?), None)
             .await?
             .iter()
-            .filter(|d| d["entity"]["type"] == "linode")
-            .filter_map(|d| Some((d["id"].as_u64()?, d["entity"]["id"].as_u64()?.to_string())))
+            .map(|d| {
+                (d["entity"]["type"] == "linode")
+                    .then(|| Some((d["id"].as_u64()?, d["entity"]["id"].as_u64()?.to_string())))
+                    .flatten()
+            })
             .collect())
+    }
+
+    async fn linode_devices(&self, id: &str) -> Result<Vec<(u64, String)>, ProviderError> {
+        Ok(self.devices(id).await?.into_iter().flatten().collect())
     }
 }
 
@@ -172,6 +181,7 @@ fn firewall(v: &Value) -> Result<ProviderFirewall, ProviderError> {
         id: id.to_string(),
         label: v["label"].as_str().unwrap_or_default().into(),
         rules: our_rules(&v["rules"]),
+        enabled: v["status"] == "enabled",
     })
 }
 
@@ -437,14 +447,29 @@ impl MachineProvider for Linode {
         })
     }
 
-    fn firewall_machines<'a>(&'a self, id: &'a str) -> Fut<'a, Vec<String>> {
+    fn enable_firewall<'a>(&'a self, id: &'a str) -> Fut<'a, ()> {
         Box::pin(async move {
-            Ok(self
-                .linode_devices(id)
-                .await?
-                .into_iter()
-                .map(|(_, linode)| linode)
-                .collect())
+            self.call(
+                Method::PUT,
+                &format!("/networking/firewalls/{}", path_id(id)?),
+                None,
+                Some(&json!({ "status": "enabled" })),
+            )
+            .await
+            .map(drop)
+        })
+    }
+
+    fn firewall_devices<'a>(&'a self, id: &'a str) -> Fut<'a, FirewallDevices> {
+        Box::pin(async move {
+            let mut out = FirewallDevices::default();
+            for d in self.devices(id).await? {
+                match d {
+                    Some((_, linode)) => out.machines.push(linode),
+                    None => out.others += 1,
+                }
+            }
+            Ok(out)
         })
     }
 
@@ -620,11 +645,11 @@ mod tests {
                     record(&s, "GET", format!("/networking/firewalls?page={}&page_size={}", q["page"], q["page_size"]), &h, Value::Null);
                     // As Linode answers: its own spellings of addresses and ports, and
                     // a near-namesake the filter would have matched as a prefix.
-                    let ours = json!({ "id": 77, "label": "superbot-fw", "rules": {
+                    let ours = json!({ "id": 77, "label": "superbot-fw", "status": "disabled", "rules": {
                         "inbound_policy": "DROP", "outbound_policy": "ACCEPT", "outbound": [], "version": 3,
                         "inbound": [{ "label": "agent-from-control-plane", "action": "ACCEPT", "protocol": "TCP", "ports": "7443",
                             "addresses": { "ipv4": ["192.0.2.1/32"], "ipv6": ["2001:DB8::1/128"] } }] } });
-                    let other = json!({ "id": 78, "label": "superbot-fw-old", "rules": { "inbound_policy": "ACCEPT", "outbound_policy": "ACCEPT", "inbound": [], "outbound": [] } });
+                    let other = json!({ "id": 78, "label": "superbot-fw-old", "status": "enabled", "rules": { "inbound_policy": "ACCEPT", "outbound_policy": "ACCEPT", "inbound": [], "outbound": [] } });
                     (StatusCode::OK, Json(json!({ "data": [other, ours], "page": 1, "pages": 1, "results": 2 })))
                 }),
             )
@@ -636,6 +661,10 @@ mod tests {
                         77 => (StatusCode::OK, Json(json!({}))),
                         _ => (StatusCode::NOT_FOUND, Json(json!({ "errors": [{ "reason": "Not found" }] }))),
                     }
+                })
+                .put(move |State(s): State<Seen>, h: HeaderMap, Path(id): Path<u64>, Json(b): Json<Value>| async move {
+                    record(&s, "PUT", format!("/networking/firewalls/{id}"), &h, b);
+                    (StatusCode::OK, Json(json!({})))
                 }),
             )
             .route(
@@ -843,6 +872,7 @@ mod tests {
         );
         let found = api.find_firewall("superbot-fw").await.unwrap().unwrap();
         assert_eq!(found.id, "77", "the exact label, not a namesake");
+        assert!(made.enabled && !found.enabled, "a disabled one is told apart");
         assert_eq!(
             found.rules,
             Some(vec![rules[0].clone()]),
@@ -850,7 +880,15 @@ mod tests {
         );
         assert_eq!(api.find_firewall("superbot-fw-x").await.unwrap(), None);
         api.set_firewall_rules("77", &rules[..1]).await.unwrap();
-        assert_eq!(api.firewall_machines("77").await.unwrap(), ["7"], "Linodes only");
+        api.enable_firewall("77").await.unwrap();
+        assert_eq!(
+            api.firewall_devices("77").await.unwrap(),
+            FirewallDevices {
+                machines: vec!["7".into()],
+                others: 1
+            },
+            "Linodes by id; anything else counted"
+        );
         api.attach_firewall("77", "8").await.unwrap();
         api.detach_firewall("77", "7").await.unwrap();
         api.detach_firewall("77", "8").await.unwrap();
@@ -877,6 +915,7 @@ mod tests {
                 ("GET", "/networking/firewalls?page=1&page_size=500"),
                 ("GET", "/networking/firewalls?page=1&page_size=500"),
                 ("PUT", "/networking/firewalls/77/rules"),
+                ("PUT", "/networking/firewalls/77"),
                 ("GET", "/networking/firewalls/77/devices"),
                 ("POST", "/networking/firewalls/77/devices"),
                 ("GET", "/networking/firewalls/77/devices"),
@@ -902,8 +941,9 @@ mod tests {
         );
         assert_eq!(seen[2].2.as_deref(), Some(r#"{"label":"superbot-fw"}"#));
         assert_eq!(seen[4].3["inbound"].as_array().unwrap().len(), 1);
-        assert_eq!(seen[6].3, json!({ "id": 8, "type": "linode" }));
-        assert_eq!(seen[13].3["firewall_id"], json!(77), "behind it from the first boot");
+        assert_eq!(seen[5].3, json!({ "status": "enabled" }));
+        assert_eq!(seen[7].3, json!({ "id": 8, "type": "linode" }));
+        assert_eq!(seen[14].3["firewall_id"], json!(77), "behind it from the first boot");
     }
 
     #[test]

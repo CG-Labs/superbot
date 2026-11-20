@@ -174,7 +174,8 @@ fn record(app: &App, by: &Who, action: &str, id: &str, outcome: Outcome, details
     );
 }
 
-/// The firewall's id, made if there is none and its rules set back if they differ.
+/// The firewall's id, made if there is none, its rules set back if they differ, and
+/// enabled again if it was turned off.
 pub async fn ensure(
     app: &App,
     fw: &Firewall,
@@ -212,6 +213,17 @@ pub async fn ensure(
             &found.id,
             Outcome::Success,
             json!({ "label": fw.label, "rules": rules_json(&fw.rules), "was": found.rules.as_deref().map(rules_json) }),
+        );
+    }
+    if !found.enabled {
+        p.enable_firewall(&found.id).await?;
+        record(
+            app,
+            by,
+            "machine.firewall_updated",
+            &found.id,
+            Outcome::Success,
+            json!({ "label": fw.label, "status": "enabled", "was": "disabled" }),
         );
     }
     Ok(found.id)
@@ -253,8 +265,8 @@ pub async fn sync(app: &App, fw: &Firewall, p: &dyn MachineProvider) -> usize {
             return 0;
         }
     };
-    let covered = match p.firewall_machines(&id).await {
-        Ok(c) => c,
+    let covered = match p.firewall_devices(&id).await {
+        Ok(c) => c.machines,
         Err(e) => {
             eprintln!("Machine firewall: {e}");
             return 0;
@@ -319,9 +331,9 @@ pub async fn release(app: &App, p: &dyn MachineProvider, m: &Machine, by: &Who) 
     if app.db.machines_on_firewall(fw, &m.id) > 0 {
         return;
     }
-    match p.firewall_machines(fw).await {
-        Ok(left) if left.is_empty() => {}
-        // It covers machines this control plane doesn't know; leave it be.
+    match p.firewall_devices(fw).await {
+        Ok(left) if left.machines.is_empty() && left.others == 0 => {}
+        // It covers devices this control plane doesn't know; leave it be.
         Ok(_) | Err(ProviderError::NotFound) => return,
         Err(e) => return failed(app, by, m, fw, "delete", &e),
     }

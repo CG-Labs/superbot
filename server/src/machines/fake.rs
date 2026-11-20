@@ -6,7 +6,7 @@
 //! takes it off.
 
 use super::provider::{
-    CreateSpec, FirewallRule, Fut, MachineProvider, ProviderError, ProviderFirewall,
+    CreateSpec, FirewallDevices, FirewallRule, Fut, MachineProvider, ProviderError, ProviderFirewall,
     ProviderMachine,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -25,7 +25,10 @@ pub struct FakeFirewall {
     pub rules: Vec<FirewallRule>,
     /// Set behind the control plane's back: rules of a shape it doesn't make.
     pub foreign: bool,
+    pub enabled: bool,
     pub machines: BTreeSet<String>,
+    /// Devices that aren't machines, e.g. a NodeBalancer someone put behind it.
+    pub others: usize,
 }
 
 #[derive(Default)]
@@ -154,7 +157,9 @@ impl Fake {
                 tags: Vec::new(),
                 rules: Vec::new(),
                 foreign: true,
+                enabled: true,
                 machines: machines.iter().map(|m| m.to_string()).collect(),
+                others: 0,
             },
         );
         id
@@ -192,6 +197,7 @@ fn view(f: &FakeFirewall) -> ProviderFirewall {
         id: f.id.clone(),
         label: f.label.clone(),
         rules: (!f.foreign).then(|| f.rules.clone()),
+        enabled: f.enabled,
     }
 }
 
@@ -314,7 +320,9 @@ impl MachineProvider for Fake {
                     tags: tags.to_vec(),
                     rules: rules.to_vec(),
                     foreign: false,
+                    enabled: true,
                     machines: BTreeSet::new(),
+                    others: 0,
                 };
                 let v = view(&f);
                 s.firewalls.insert(id, f);
@@ -333,11 +341,23 @@ impl MachineProvider for Fake {
         })
     }
 
-    fn firewall_machines<'a>(&'a self, id: &'a str) -> Fut<'a, Vec<String>> {
+    fn enable_firewall<'a>(&'a self, id: &'a str) -> Fut<'a, ()> {
         Box::pin(async move {
-            self.with("firewall_machines", |s| {
+            self.with("enable_firewall", |s| {
+                s.firewalls.get_mut(id).ok_or(ProviderError::NotFound)?.enabled = true;
+                Ok(())
+            })
+        })
+    }
+
+    fn firewall_devices<'a>(&'a self, id: &'a str) -> Fut<'a, FirewallDevices> {
+        Box::pin(async move {
+            self.with("firewall_devices", |s| {
                 let f = s.firewalls.get(id).ok_or(ProviderError::NotFound)?;
-                Ok(f.machines.iter().cloned().collect())
+                Ok(FirewallDevices {
+                    machines: f.machines.iter().cloned().collect(),
+                    others: f.others,
+                })
             })
         })
     }
