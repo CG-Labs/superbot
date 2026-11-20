@@ -44,6 +44,12 @@ export interface BotView {
   visibility?: Visibility;
   /** What you may do with it. */
   access?: BotAccess;
+  /** Where its runs go now (ADR 0046): this server, its owner's machine, or nowhere
+   *  yet. Sent only when Bots can run on users' machines. */
+  runsOn?: "server" | "machine" | "nowhere";
+  /** "isolated": runs for anyone but its owner get their access and the server's keys,
+   *  never the owner's own. Absent: it acts as its owner for everyone. */
+  sharedBots?: "isolated";
   /** The owner's plan (ADR 0033). On a managed plan the server picks the model and
    *  sends `model` and `effort` only to admins. */
   tier?: TierBadge;

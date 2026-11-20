@@ -22,3 +22,19 @@ export function sharingLabel(bot: Pick<BotView, "visibility" | "owner">, meId?: 
   const who = bot.visibility === "private" ? "Private" : "Shared with everyone";
   return owner ? `${who} · owned by ${owner}` : who;
 }
+
+/** Where its runs happen (ADR 0046). Null when the server doesn't say: always on the server. */
+export function whereItRuns(bot: Pick<BotView, "runsOn" | "owner">, meId?: string | null): string | null {
+  if (!bot.runsOn) return null;
+  const whose = !bot.owner ? "its owner's" : bot.owner.id === meId ? "your" : `${bot.owner.name}'s`;
+  if (bot.runsOn === "machine") return `Runs on ${whose} computer`;
+  if (bot.runsOn === "server") return `Runs on this server, in ${whose} folder`;
+  return `Can't run yet: ${whose} computer isn't set up`;
+}
+
+/** What a run for someone other than its owner gets, when the server isolates them. */
+export function whoseKeys(bot: Pick<BotView, "sharedBots" | "owner" | "visibility">, meId?: string | null): string | null {
+  if (bot.sharedBots !== "isolated" || !bot.owner) return null;
+  if (bot.owner.id !== meId) return `For you it uses the server's keys and your access, never ${bot.owner.name}'s own`;
+  return bot.visibility === "shared" ? "Others' runs use the server's keys and their access, never your own" : null;
+}
