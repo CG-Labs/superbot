@@ -129,7 +129,7 @@ impl Refusal {
             Refusal::HarnessInstalling(h) => format!("I didn't run: {h} is still being installed on your computer. Try again in a few minutes."),
             Refusal::Upgrading => "I didn't run: your computer's agent is updating itself. Try again in a minute.".into(),
             Refusal::NoBotctl => "I didn't run: botctl isn't installed on your computer, so I couldn't ask you before risky steps. Ask an admin to install it.".into(),
-            Refusal::NotLoggedIn(h) => format!("I didn't run: {h} isn't logged in on your computer. Log it in there with `botctl machine harness-login me {h}` (or ask an admin), or save an API key for it in your secrets."),
+            Refusal::NotLoggedIn(h) => format!("I didn't run: {h} isn't logged in on your computer. Ask an admin to log it in there (`botctl machine harness-login <your email> {h}`), or save an API key for it in your secrets."),
             Refusal::FolderCopying => "I didn't run: your files are still being copied to your computer. Try again in a few minutes.".into(),
         }
     }
@@ -430,7 +430,7 @@ mod tests {
             assert_eq!(logged_in(&hb, "claude", false).is_ok(), ok, "{state}");
         }
         assert_eq!(Refusal::NotLoggedIn("claude".into()).reason(), "harness_not_logged_in");
-        assert!(Refusal::NotLoggedIn("codex".into()).message().contains("botctl machine harness-login me codex"));
+        assert!(Refusal::NotLoggedIn("codex".into()).message().contains("botctl machine harness-login <your email> codex"));
         assert_eq!(Refusal::FolderCopying.reason(), "folder_copying");
     }
 }
