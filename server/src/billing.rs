@@ -32,6 +32,9 @@ pub const USER_KEY: &str = "superbot_user_id";
 const PAYING: [&str; 3] = ["active", "trialing", "past_due"];
 /// Statuses that end it: the user goes back to the default tier.
 pub const ENDED: [&str; 4] = ["canceled", "unpaid", "incomplete_expired", "paused"];
+/// Ended for good: Stripe never moves a subscription out of these, so no later event,
+/// even one from the same second, makes it pay again.
+pub const FINAL: [&str; 2] = ["canceled", "incomplete_expired"];
 
 #[derive(Default)]
 pub struct Billing {

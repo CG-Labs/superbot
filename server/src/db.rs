@@ -2232,7 +2232,9 @@ impl Db {
 
     /// Applies one payment-provider event, in one transaction: records the event id (a
     /// redelivery is `Duplicate`), skips events older than the last one applied to the
-    /// same subscription (`Stale`), and keeps the subscription's latest state. The
+    /// same subscription, or that would revive one cancelled for good (`Stale`; Stripe
+    /// times events to the second, so an update can tie with the cancellation after
+    /// it), and keeps the subscription's latest state. The
     /// user's tier is then that of their paying subscription started last (None, the
     /// default tier, when nothing pays); `users.tier` is set to it when this event
     /// changed which one that is, or is for that one. An event for any other
@@ -2252,7 +2254,10 @@ impl Db {
         let by_id = tx.query_row("SELECT * FROM subscriptions WHERE subscription_id = ?", [&sub.subscription_id], subscription_row).optional().map_err(|e| e.to_string())?;
         let outcome = if by_id.as_ref().is_some_and(|s| s.user_id != sub.user_id) {
             Applied::OtherUser
-        } else if by_id.as_ref().is_some_and(|s| sub.event_created < s.event_created) {
+        } else if by_id.as_ref().is_some_and(|s| {
+            let fin = |status: &str| crate::billing::FINAL.contains(&status);
+            sub.event_created < s.event_created || (fin(&s.status) && !fin(&sub.status))
+        }) {
             Applied::Stale
         } else {
             let paying_id = |s: &Option<Subscription>| s.as_ref().map(|s| s.subscription_id.clone());
@@ -3450,9 +3455,18 @@ mod tests {
         }
         let db = Db::open(&temp_path("sub-order").join("app.sqlite")).unwrap();
         // Plan A (pro) started at 10, was updated at 25 and cancelled at 30. Plan B
-        // (starter) started at 20, replacing it, and was cancelled at 40.
-        let events = [("a", "active", Some("pro"), 10, 10), ("b", "active", Some("starter"), 20, 20), ("a", "active", Some("pro"), 10, 25), ("a", "canceled", None, 10, 30), ("b", "canceled", None, 20, 40)];
-        for (picked, want) in [(&[0, 1, 2, 3][..], Some("starter")), (&[0, 1, 2, 3, 4][..], None), (&[0, 1, 2, 4][..], Some("pro"))] {
+        // (starter) started at 20, replacing it, and was cancelled at 40. Or A was
+        // cancelled in the same second it started.
+        let events = [
+            ("a", "active", Some("pro"), 10, 10),
+            ("b", "active", Some("starter"), 20, 20),
+            ("a", "active", Some("pro"), 10, 25),
+            ("a", "canceled", None, 10, 30),
+            ("b", "canceled", None, 20, 40),
+            ("a", "canceled", None, 10, 10),
+        ];
+        let cases = [(&[0, 1, 2, 3][..], Some("starter")), (&[0, 1, 2, 3, 4][..], None), (&[0, 1, 2, 4][..], Some("pro")), (&[0, 5][..], None)];
+        for (picked, want) in cases {
             for order in orders(picked.len()) {
                 let u = db.create_user(None, None, "Payer", Role::Member).unwrap();
                 for (n, &i) in order.iter().enumerate() {
