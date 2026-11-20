@@ -39,6 +39,7 @@ A new `billing_customers` table holds at most one Stripe customer per user and o
 - **`checkout.session.completed`** links the session's customer to the user in `metadata.superbot_user_id` or `client_reference_id`; if both are set and differ, nothing is linked (`user_mismatch`).
 - **`customer.subscription.*`** links the subscription's customer to its user, once the event has placed it (ADR 0040), so subscriptions made outside Checkout link too. Its user is found from its metadata, then the subscription id botd already knows, then the linked customer, so a subscription made in the dashboard or portal without metadata still lands on its customer's user. A subscription whose customer is linked to someone else is ignored (`customer_of_another_user`) and changes no tier.
 - **`customer.deleted`** removes the link, so the user's next checkout makes a new customer, and remembers the customer (`billing_deleted_customers`) so no later event, such as its subscription's cancellation arriving afterwards, links it again (`customer_deleted`). Stripe ends the customer's subscriptions with their own events, which still set the tier.
+- **Upgrading.** Subscribers from before this change are linked at migration when their subscriptions name one customer that no other user's do, so they can open the portal at once; anyone else is linked by their next event.
 - No email address is ever used to find a user.
 - Each event applies once, as before (`billing_events`). Add `checkout.session.completed` and `customer.deleted` to the webhook endpoint in Stripe.
 
