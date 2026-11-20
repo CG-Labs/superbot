@@ -45,7 +45,7 @@ Heartbeats now carry `teammates`: the ids in the agent's `teammates.json`. botd 
 5. Deletes the OS user (`userdel`).
 6. Deals with their work (below), drops them from `teammates.json` last, and answers what it did.
 
-The steps never follow links, and the user is touched only if it's the uid and gid the agent recorded: a different user by that name is left alone. The machine's own user, the Bots' user, and other teammates are never touched. Each step can be re-run: a removal that stopped halfway finishes on the next try, and one that's done answers `alreadyGone`.
+The steps never follow links, and the user is touched only if it's the uid and gid the agent recorded: a different user by that name is left alone. The machine's own user, the Bots' user, and other teammates are never touched. Each step can be re-run: a removal that stopped halfway finishes on the next try. One that's done is kept by its cleanup id (`teammates-removed.json`, the last 1000), so asking again repeats its answer with `alreadyGone` and never touches a user made for the teammate since. A run or screen that was waiting while a removal ran checks again once it has the lock, so it can't make the user again halfway through. A recorded user that's gone with no home left (a removal that stopped just before dropping the record) is made afresh on the teammate's next run.
 
 Credentials: a teammate's harness state and anything else they kept on the machine live in their home, so deleting it drops them. ADR 0048 gives teammates no machine logins of their own. botd holds no per-teammate credentials for machines; their sessions and tokens are already ended by disabling them, and a teammate token stops working once someone else runs the Bot (ADR 0048).
 
@@ -60,7 +60,9 @@ The rest of the home (dotfiles, caches, harness state) is always deleted.
 
 ### Retries
 
-An agent that's offline, outdated, or doesn't answer leaves the removal pending. botd asks again after every round of heartbeats until it's done. An agent that says nothing of `teammate_removal` in its heartbeat isn't asked: the removal waits until it's upgraded (ADR 0039). A removal is cancelled if the machine is destroyed, or if the teammate gets access back before it's done (unless an admin asked for it).
+An agent that's offline, outdated, or doesn't answer leaves the removal pending. botd asks again after every round of heartbeats until it's done. Removals run in the background, four at a time, so a slow agent never holds up heartbeats; one pass runs at a time, and an event during it runs another after. An agent that says nothing of `teammate_removal` in its heartbeat isn't asked: the removal waits until it's upgraded (ADR 0039).
+
+A removal is cancelled if the machine is destroyed. It's also cancelled if the teammate gets access back before the agent was ever asked (and an admin didn't ask for it). Once the agent has been asked, it may have done part of it, such as deleting the user but not yet moving the work, so botd finishes it instead; the teammate's next run makes them a new user.
 
 ### Admin view
 
@@ -104,7 +106,8 @@ All admin only.
 - Tests:
   - The agent's removal with fake accounts: only the leaving user is removed, their processes stopped, their work archived, and nothing of the owner's or other teammates' touched (`machines::teammates`).
   - Moves that never follow links or replace (`runas`).
-  - End to end over mTLS with the real agent (`machines_offboard_tests.rs`): disable, SCIM deactivate and delete, a revoked grant and a deleted Bot each remove the user; asking again changes nothing; an offline machine is retried and logged once; access coming back cancels; delete mode holds then purges; the admin API.
+  - A retry of a finished removal after the teammate came back leaves their new home alone, and a stale record doesn't block their next run (`machines::teammates`).
+  - End to end over mTLS with the real agent (`machines_offboard_tests.rs`): disable, SCIM deactivate and delete, a revoked grant and a deleted Bot each remove the user; asking again changes nothing; an offline machine is retried and logged once; access coming back finishes a removal the agent was asked for, and cancels one it wasn't (an outdated agent); delete mode holds then purges; the admin API.
   - As root in CI's isolation job: a real user, its processes and temp files are removed, the archive goes to the Bots' user, and the other teammate and the Bots' user are untouched.
 
 ## Limits and follow-ups
