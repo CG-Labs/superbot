@@ -444,12 +444,19 @@ install_site() {
   install_release "$SITE_DIR" "$src" "landing page" || warn "Landing page not installed: botd serves its built-in copy"
 }
 
+# Values are written as given: `&`, `|` and `\` are not sed syntax here.
 set_env_var() {
-  local file=$1 key=$2 value=$3
+  local file=$1 key=$2 value=$3 tmp
+  [[ "$value" != *$'\n'* ]] || die "Refusing a multi-line value for $key"
   if grep -q "^${key}=" "$file"; then
-    sed -i "s|^${key}=.*|${key}=${value}|" "$file"
+    tmp=$(mktemp)
+    K=$key V=$value awk 'index($0, ENVIRON["K"] "=") == 1 { print ENVIRON["K"] "=" ENVIRON["V"]; next } { print }' "$file" >"$tmp" \
+      && cat "$tmp" >"$file"
+    local rc=$?
+    rm -f "$tmp"
+    return "$rc"
   else
-    echo "${key}=${value}" >>"$file"
+    printf '%s=%s\n' "$key" "$value" >>"$file"
   fi
 }
 

@@ -261,6 +261,7 @@ All JSON. Auth: a session cookie (sign-in page and console) or `Authorization: B
 - `GET /api/harnesses/:name/models`: models and reasoning efforts the harness offers (Claude Code: aliases; Codex: `codex debug models`; Pi: `pi --list-models`; Hermes Agent: one entry with an empty `id`, meaning any model name, with its efforts). 403 for non-admins on a managed tier; `?tier=<name>` (admins): only that tier's models
 - `GET /api/me/tier` → `{name, label, managed, limits: {maxBots, monthlyRuns, monthlyTokens}, usage: {period, runs, bots}}`: your plan, no model names. People only ([ADR 0033](adr/0033-tiers-model-routing.md))
 - `GET /api/tiers` → `{default, source, tiers: [{name, label, managed, limits, routes: "any" | [{harness, provider?, model, effort?}]}]}`: admins only
+- `GET /api/setup` → `{progress: {step, dismissed, completedAt, completedBy, show}, steps, domain, signIn, tiers, approvals, checklist: [{id, label, done, detail}], done, total}`: the onboarding wizard's report, with commands and `.env` lines for what botd reads at startup; never secret values or models. `PATCH /api/setup` `{step?: domain|signin|tiers|finish, dismissed?, completed?}`; finishing, reopening, hiding, and showing again are audited as `setup.*`. Admins only ([ADR 0034](adr/0034-onboarding-wizard.md))
 - `GET|POST /api/bots/:id/messages` `{text, answer?: {messageId, option}}`
 - `POST /api/bots/:id/read`, `POST /api/bots/:id/stop`
 - `GET|POST /api/bots/:id/routines` `{name, cron, instruction}`

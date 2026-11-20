@@ -250,6 +250,16 @@ impl Sso {
         format!("{}/api/auth/sso/{id}/callback", self.public_url)
     }
 
+    /// SSO_PUBLIC_URL, when SSO is on.
+    pub fn public_url(&self) -> Option<&str> {
+        Some(self.public_url.as_str()).filter(|u| !u.is_empty())
+    }
+
+    /// The redirect URI to register at the IdP for provider `id`.
+    pub fn callback_url(&self, id: &str) -> String {
+        self.redirect_uri(id)
+    }
+
     /// Remembers a sign-in in progress. False when there are too many.
     fn hold(&self, state: &str, p: Pending, at: i64) -> bool {
         let mut m = self.pending.lock().unwrap_or_else(|e| e.into_inner());
