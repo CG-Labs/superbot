@@ -109,7 +109,7 @@ archive() {
   return "$status"
 }
 tar_files() {
-  tar -czf - --warning=no-file-changed --warning=no-file-removed --ignore-failed-read \
+  tar -czf - --warning=no-file-changed --warning=no-file-removed \
     "${excludes[@]}" "${members[@]}"
 }
 excludes=(--anchored --exclude=./app.sqlite --exclude='./app.sqlite-*' --exclude=./screens

@@ -93,6 +93,15 @@ refuses "backup failed" env PATH="$T/faketar:$PATH" FAKE_TAR_EXIT=2 DATA_DIR="$D
 [[ -z $(find "$B" -type f ! -name .lock) ]] || fail "a fatal tar error left an archive or partial file"
 ok "files changing mid-read keep the archive; fatal tar errors leave nothing"
 
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo private >"$D/bots/b1/unreadable"
+  chmod 000 "$D/bots/b1/unreadable"
+  refuses "backup failed" env DATA_DIR="$D" BACKUP_DIR="$B" "$BACKUP"
+  [[ -z $(find "$B" -type f ! -name .lock) ]] || fail "a backup that could not read a file was kept"
+  rm -f "$D/bots/b1/unreadable"
+  ok "a file the backup can't read fails the run instead of being left out"
+fi
+
 refuses "give the age identity" "$RESTORE" --check "$T/enc.age"
 refuses "could not decrypt" "$RESTORE" --check --identity "$T/other.txt" "$T/enc.age"
 "$RESTORE" --check --identity "$T/id.txt" - <"$T/enc.age" >"$T/check" 2>&1
