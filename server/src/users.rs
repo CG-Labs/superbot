@@ -4,7 +4,7 @@
 //! Design: docs/adr/0012-users-sessions-rbac.md.
 
 use crate::audit::{Actor, ActorKind, Event, Source, Who};
-use crate::db::{self, NewSession, Session, User, UserPatch};
+use crate::db::{self, NewSession, Session, User, UserError, UserPatch};
 use crate::rbac::{self, Principal, Role};
 use crate::{bad, not_found, ApiError, AppState, Auth, Res};
 use axum::extract::{Extension, Path, Query, State};
@@ -499,9 +499,17 @@ pub async fn create_user(State(app): State<AppState>, Extension(by): Extension<W
         Value::Null => Role::Member,
         r => r.as_str().and_then(Role::parse).ok_or_else(|| bad("role must be admin, member, or readonly"))?,
     };
-    let u = app.db.create_user(None, Some(email), &name, role).map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    let u = app.db.create_user(None, Some(email), &name, role).map_err(|e| user_error(&app, &by, e, None, Some(email)))?;
     record_created(&app, &by, &u, None);
     Ok((StatusCode::CREATED, Json(user_view(&u))))
+}
+
+fn user_error(app: &AppState, by: &Who, e: UserError, id: Option<&str>, email: Option<&str>) -> ApiError {
+    match e {
+        UserError::EmailTaken => ApiError(StatusCode::CONFLICT, e.to_string()),
+        UserError::NoSeat => ApiError(StatusCode::FORBIDDEN, crate::license::refuse_seat(app, by, if id.is_some() { "enable" } else { "admin" }, id, email)),
+        UserError::Db(e) => ApiError(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
 }
 
 /// `user.created`, as every way of adding a user logs it. `reason` says why, when it isn't an admin's form.
@@ -550,7 +558,7 @@ pub async fn update_user(State(app): State<AppState>, Extension(a): Extension<Ar
     if demotes && by.actor.id.as_deref() == Some(before.id.as_str()) {
         return Err(ApiError(StatusCode::CONFLICT, "You can't demote or disable yourself. Ask another admin.".into()));
     }
-    app.db.update_user(&before.id, p).map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    app.db.update_user(&before.id, p).map_err(|e| user_error(&app, &by, e, Some(&before.id), before.email.as_deref()))?;
     let after = need_user_key(&app, &before.id)?;
     let ev = |action: &str| by.event(action).target("user", &after.id);
     let mut changes = serde_json::Map::new();

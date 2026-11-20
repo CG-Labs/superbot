@@ -60,7 +60,7 @@ fn concrete(path: &str) -> String {
 fn the_route_list_is_read_whole() {
     let r = routes();
     assert!(r.len() >= 60, "{} routes: the parser no longer understands fn router", r.len());
-    for (m, p) in [("GET", "/api/state"), ("DELETE", "/api/users/{key}/sessions"), ("POST", "/api/signups/{id}/reject"), ("POST", "/api/auth/sso/{id}/callback"), ("GET", "/healthz"), ("POST", "/api/scim/tokens"), ("PATCH", "/scim/v2/Users/{id}"), ("GET", "/api/setup"), ("PATCH", "/api/setup")] {
+    for (m, p) in [("GET", "/api/state"), ("DELETE", "/api/users/{key}/sessions"), ("POST", "/api/signups/{id}/reject"), ("POST", "/api/auth/sso/{id}/callback"), ("GET", "/healthz"), ("POST", "/api/scim/tokens"), ("PATCH", "/scim/v2/Users/{id}"), ("GET", "/api/setup"), ("PATCH", "/api/setup"), ("PUT", "/api/license")] {
         assert!(r.contains(&(m.into(), p.into())), "{m} {p} missing from {r:?}");
     }
     for (m, p) in PUBLIC {
@@ -129,8 +129,8 @@ async fn every_route_but_the_public_ones_needs_credentials_and_the_right_role() 
         if m != "GET" && p != "/api/auth/logout" {
             assert!(!rbac::allows(Principal::User(Role::Readonly), need), "readonly could {m} {p}");
         }
-        // The admin portal, the audit log, secrets, signups, and the setup wizard are admin-only.
-        if ["/api/users", "/api/sessions", "/api/audit", "/api/secrets", "/api/signups", "/api/policy", "/api/setup"].iter().any(|s| p.starts_with(s)) && !(m == "GET" && p.starts_with("/api/policy")) {
+        // The admin portal, the audit log, secrets, signups, the setup wizard, and the license are admin-only.
+        if ["/api/users", "/api/sessions", "/api/audit", "/api/secrets", "/api/signups", "/api/policy", "/api/setup", "/api/license"].iter().any(|s| p.starts_with(s)) && !(m == "GET" && p.starts_with("/api/policy")) {
             assert_eq!(need, rbac::Perm::Admin, "{m} {p}");
         }
         checked += 1;

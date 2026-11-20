@@ -333,6 +333,7 @@ fn decide_error(e: SignupError) -> ApiError {
             StatusCode::CONFLICT,
             "A user with this email exists already. Reject the request, or give them a sign-in code (botctl user code).".into(),
         ),
+        SignupError::NoSeat => ApiError(StatusCode::FORBIDDEN, "No seats left.".into()),
         SignupError::Db(e) => ApiError(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
@@ -353,7 +354,14 @@ pub async fn approve(
         r => r.as_str().and_then(Role::parse).ok_or_else(|| bad("role must be admin, member, or readonly"))?,
     };
     let ttl = users::code_ttl(&v["ttlMinutes"], APPROVAL_CODE_MINUTES)?;
-    let (su, user) = app.db.approve_signup(&id, role, by.actor.id.as_deref().unwrap_or("")).map_err(decide_error)?;
+    let (su, user) = match app.db.approve_signup(&id, role, by.actor.id.as_deref().unwrap_or("")) {
+        Ok(done) => done,
+        Err(SignupError::NoSeat) => {
+            let email = app.db.signup(&id).map(|s| s.email);
+            return Err(ApiError(StatusCode::FORBIDDEN, crate::license::refuse_seat(&app, &by, "signup", None, email.as_deref())));
+        }
+        Err(e) => return Err(decide_error(e)),
+    };
     users::record_created(&app, &by, &user, Some(&format!("sign-up {}", su.id)));
     let (code, expires) = users::issue_code(&app, &by, &user, ttl, false);
     app.db.record(&by.event("signup.approved").target("signup", &su.id).details(json!({ "userId": user.id, "email": su.email, "role": role })));

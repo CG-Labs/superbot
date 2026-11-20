@@ -16,6 +16,10 @@ path = "src/bin/botctl.rs"
 name = "superbot-machine"
 path = "src/bin/superbot-machine.rs"
 
+[[bin]]
+name = "superbot-license"
+path = "src/bin/superbot-license.rs"
+
 [dependencies]
 aws-lc-rs = "1"
 axum = "0.8.9"

@@ -95,6 +95,8 @@ pub struct App {
     pub control_plane: OnceLock<Arc<ControlPlane>>,
     /// Each user's plan and the models it routes to (ADR 0033). Unset: self-host only.
     pub tiers: OnceLock<Arc<Tiers>>,
+    /// The self-host license, and the seats it allows (ADR 0038).
+    pub license: Arc<crate::license::Licensing>,
     /// Runs on each user's machine now, by user.
     on_machines: Mutex<HashMap<String, u32>>,
     closing: AtomicBool,
@@ -102,7 +104,11 @@ pub struct App {
 
 impl App {
     pub fn new(db: Db, cfg: Config, screens: Option<Screens>) -> Arc<App> {
+        let license = Arc::new(crate::license::Licensing::new(crate::license::trusted(), &cfg.data_dir));
+        let seats = license.clone();
+        db.set_seat_cap(Box::new(move || seats.seat_cap()));
         Arc::new(App {
+            license,
             db,
             cfg,
             tx: broadcast::channel(1024).0,

@@ -147,7 +147,7 @@ async fn the_console_is_an_admin_page_without_chat_bots_or_screens() {
         assert!(!CONSOLE_JS.contains(gone) && !html.contains(gone), "{gone} is still in the console");
     }
     let calls = api_calls(CONSOLE_JS);
-    for want in ["/api/users", "/api/signups/x/approve", "/api/machines", "/api/users/x/machine/suspend", "/api/audit", "/api/audit/export.csv", "/api/policy", "/api/secrets/x", "/api/scim/tokens", "/api/setup"] {
+    for want in ["/api/users", "/api/signups/x/approve", "/api/machines", "/api/users/x/machine/suspend", "/api/audit", "/api/audit/export.csv", "/api/policy", "/api/secrets/x", "/api/scim/tokens", "/api/setup", "/api/license"] {
         assert!(calls.iter().any(|(_, p)| p == want) || html.contains(want), "the console lost {want}: {calls:?}");
     }
 }
