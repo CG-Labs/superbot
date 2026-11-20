@@ -42,7 +42,7 @@ If flags are omitted, the script prompts on a TTY. The checkout must not be owne
 7. **systemd** `superbot.service` (hardened, runs as the service user)
 8. **Caddy** automatic HTTPS when `--domain` is set: the [landing page](#landing-page-and-sign-ups) at `/`, the web client at `/app/`, everything else to `botd` (`flush_interval -1` for SSE)
 9. Optional **UFW** (`--ufw`): allow 22, 80, 443
-10. Daily **backup** timer (on by default; `--no-backup` to skip)
+10. Daily **backup** timer (on by default; `--no-backup` to skip), plus `superbot-restore`: see [Backups and restore](#backups-and-restore)
 11. With `--with-hermes`: [Hermes Agent](#hermes-agent) for the service user
 
 Admin password file: `~superbot/.superbot-admin-password` (mode `0600`).
@@ -120,6 +120,20 @@ sudo -u superbot env SUPERBOT_PASSWORD="$(sudo grep -oP '^AUTH_PASSWORD=\K.*' ~s
 - **Restoring on a new server**: restore the backup, then put the key back at the same path (owner `superbot`, mode `0600`) before starting botd. With a missing or wrong key, botd logs why and refuses to start; the installer refuses too rather than make a new key over sealed data.
 - **Key lost for good**: add `SUPERBOT_FORGET_SEALED=1` to `.env` and restart. Saved secrets and old approval inputs are dropped, everything else is kept, and a new key is made. It only drops what the current key can't open, but remove the line afterwards.
 - **Your own key**: set `SUPERBOT_MASTER_KEY` (64 hex chars, `openssl rand -hex 32`) in `.env` instead of the file, or point `SUPERBOT_MASTER_KEY_FILE` elsewhere. Not both.
+
+## Backups and restore
+
+`superbot-backup.timer` archives `DATA_DIR` daily at 03:15 into `~superbot/superbot/backups/superbot-<UTC stamp>.tar.gz` (an online SQLite copy, so safe while Bots run) and keeps `SUPERBOT_BACKUP_RETENTION_DAYS` (default 14). Set `SUPERBOT_BACKUP_AGE_RECIPIENTS` in `.env` to encrypt them with age. Same tool and format as Compose.
+
+```sh
+sudo systemctl start superbot-backup.service                     # back up now
+sudo -u superbot superbot-restore --check <archive>              # verify an archive without touching live data
+sudo systemctl stop superbot superbot-backup.timer               # restore
+sudo -u superbot superbot-restore --home /home/superbot - < <archive>
+sudo systemctl start superbot superbot-backup.timer
+```
+
+Copy archives, the master key, and `.env` off the server: the default RPO is 24 hours, and only for copies that survive the host. Full procedure (new host, hourly schedule, encryption, the drills CI runs, RPO/RTO targets): [docs/ops/backup-restore.md](../docs/ops/backup-restore.md).
 
 ## Computer / screens
 
@@ -243,6 +257,8 @@ docker compose run --rm --no-deps -T botd superbot-restore - < superbot-20261119
 docker compose up -d
 ```
 
+To encrypt archives, set `SUPERBOT_BACKUP_AGE_RECIPIENTS` in `.env` and `docker compose up -d`; restoring then needs the identity (`--identity`). Check an archive without touching live data with `superbot-restore --check`. New host, schedule, and the restore drill: [docs/ops/backup-restore.md](../docs/ops/backup-restore.md).
+
 Archives include the audit log (`audit_events` lives in `app.sqlite`). See [Audit log retention](#audit-log-retention).
 
 `superbot-restore` checks the archive with `PRAGMA integrity_check` before it swaps anything, and refuses to run while `botd` is up.
@@ -260,12 +276,11 @@ docker run --rm -v superbot_workspace:/v:ro -v "$PWD":/out debian:trixie-slim \
 
 ### Moving from the bash installer
 
-The two installs are independent; do not run both on one host (both want ports 80/443). The bash backup layout (`app.sqlite`, `bots/`, `USER.md`) matches the archive format, so:
+The two installs are independent; do not run both on one host (both want ports 80/443). Both use the same `superbot-backup` archive format, so:
 
 ```sh
 sudo systemctl disable --now superbot superbot-backup.timer caddy
-sudo -u superbot superbot-backup /home/superbot
-sudo tar -czf superbot-migrate.tar.gz -C /home/superbot/superbot/backups/<stamp> .
+sudo -u superbot superbot-backup --home /home/superbot - > superbot-migrate.tar.gz
 cd superbot/deploy/docker && ./init.sh --domain bots.example.com   # reuse AUTH_PASSWORD from ~superbot/superbot/.env if you like
 # Carry the master key over (replacing the one init.sh made), or saved secrets won't open:
 key=$(sudo cat ~superbot/.config/superbot/master.key) && sed -i "s|^SUPERBOT_MASTER_KEY=.*|SUPERBOT_MASTER_KEY='$key'|" .env
