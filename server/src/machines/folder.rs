@@ -34,6 +34,9 @@ pub const DEFAULT_MAX_MB: u64 = 2048;
 /// The most files a copy lists.
 pub const MAX_FILES: usize = 100_000;
 const CHUNK: usize = 4 << 20;
+/// How long a chunk, and putting every file in place, may take there.
+const CHUNK_SECS: u64 = 300;
+const FINISH_SECS: u64 = 1800;
 /// A copy that failed or was cut short is tried again this long after, this many times.
 const RETRY_MS: i64 = 15 * 60_000;
 const MAX_ATTEMPTS: u32 = 5;
@@ -335,19 +338,15 @@ async fn copy(app: &AppState, e: &Enrollment, m: &Machine, max_bytes: u64, statu
         sync_id: format!("s{}", crate::random_hex(8)),
         files: listing.files.iter().map(|(f, _)| f.clone()).collect(),
     };
-    let agent_err = |code: u16, reply: &Value| {
-        failed("agent_error", format!("Its agent refused ({code}): {}", reply["error"].as_str().unwrap_or("no reason given")))
-    };
-    let (code, reply) = e
-        .call_agent(app, m, reqwest::Method::POST, "/v1/sync", &manifest)
-        .await
-        .map_err(|why| failed("offline", format!("Its agent didn't answer: {why}")))?;
-    if code != 200 {
-        return Err(agent_err(code, &reply));
+    let body = serde_json::to_vec(&manifest).map_err(|e| failed("agent_error", e.to_string()))?;
+    if body.len() > wire::MAX_MANIFEST {
+        return Err(failed("too_big", "The folder's list of files is too long to send."));
     }
-    let plan: SyncPlan = serde_json::from_value(reply).map_err(|_| failed("agent_error", "Its agent's answer wasn't a plan."))?;
     let address = m.ipv4.clone().ok_or_else(|| failed("offline", "The machine has no address."))?;
-    let client = e.upload_client(app.db.machine_pins(&m.id)).map_err(|why| failed("offline", why))?;
+    let pins = app.db.machine_pins(&m.id);
+    let client = e.upload_client(pins.clone(), CHUNK_SECS).map_err(|why| failed("offline", why))?;
+    let reply = post(&client, e.agent_url(&address, "/v1/sync"), body).await?;
+    let plan: SyncPlan = serde_json::from_value(reply).map_err(|_| failed("agent_error", "Its agent's answer wasn't a plan."))?;
     for need in &plan.need {
         let Some((_, on_disk)) = listing.files.iter().find(|(f, _)| f.sha256 == need.sha256) else {
             return Err(failed("agent_error", "Its agent asked for content that isn't in the folder."));
@@ -355,14 +354,26 @@ async fn copy(app: &AppState, e: &Enrollment, m: &Machine, max_bytes: u64, statu
         let url = e.agent_url(&address, &format!("/v1/sync/{}/blobs/{}", manifest.sync_id, need.sha256));
         send(&client, &url, on_disk, need.have, need.size, &mut status.sent).await?;
     }
-    let (code, reply) = e
-        .call_agent(app, m, reqwest::Method::POST, &format!("/v1/sync/{}/finish", manifest.sync_id), &json!({}))
-        .await
-        .map_err(|why| failed("offline", format!("Its agent didn't answer: {why}")))?;
-    if code != 200 {
-        return Err(agent_err(code, &reply));
-    }
+    let finishing = e.upload_client(pins, FINISH_SECS).map_err(|why| failed("offline", why))?;
+    let reply = post(&finishing, e.agent_url(&address, &format!("/v1/sync/{}/finish", manifest.sync_id)), b"{}".to_vec()).await?;
     serde_json::from_value(reply).map_err(|_| failed("agent_error", "Its agent's answer wasn't a report."))
+}
+
+/// A JSON request to the agent, and its answer if it took it.
+async fn post(client: &reqwest::Client, url: String, body: Vec<u8>) -> Result<Value, Failed> {
+    let mut r = client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| failed("offline", format!("Its agent didn't answer: {}", enroll::without_url(e))))?;
+    let code = r.status().as_u16();
+    let reply = enroll::read_capped(&mut r, wire::MAX_MANIFEST).await.and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+    if code != 200 {
+        return Err(failed("agent_error", format!("Its agent refused ({code}): {}", reply["error"].as_str().unwrap_or("no reason given"))));
+    }
+    Ok(reply)
 }
 
 /// Copies the user's folder to `m` in the background, unless a copy is running.

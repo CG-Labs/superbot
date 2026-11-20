@@ -253,6 +253,10 @@ pub struct SyncPlan {
     pub need: Vec<SyncNeed>,
 }
 
+/// The largest manifest botd sends, and plan or report it reads back. The agent takes
+/// request bodies up to 32 MiB.
+pub const MAX_MANIFEST: usize = 24 << 20;
+
 /// A chunk was taken (or, on 409, refused): the bytes of that blob the agent holds.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

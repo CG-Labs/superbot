@@ -456,14 +456,14 @@ impl Enrollment {
             .map_err(|e| e.to_string())
     }
 
-    /// Like `pinned`, for sending a folder's contents: each chunk gets minutes.
-    pub(super) fn upload_client(&self, pins: Vec<String>) -> Result<reqwest::Client, String> {
+    /// Like `pinned`, for copying a folder: each request gets up to `secs`.
+    pub(super) fn upload_client(&self, pins: Vec<String>, secs: u64) -> Result<reqwest::Client, String> {
         let c = self.control();
         let (config, _) = pki::pinned_client_config(pins, c.chain.clone(), c.key.clone_key())?;
         reqwest::Client::builder()
             .tls_backend_preconfigured(config)
             .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(300))
+            .timeout(Duration::from_secs(secs))
             .build()
             .map_err(|e| e.to_string())
     }
