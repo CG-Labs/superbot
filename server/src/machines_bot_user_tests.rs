@@ -173,6 +173,27 @@ async fn bots_run_as_their_own_user_once_their_machine_has_set_it_up() {
     let st = broken.bot_user().unwrap();
     assert_eq!(st.state, wire::BOT_USER_FAILED);
     assert!(st.error.unwrap().contains("superbot-no-such-user"));
+
+    // A set-up cut short after saving picks up where it stopped; an unreadable record
+    // runs nothing rather than running as root.
+    let saved = cfg.state_dir.join("bot-user.json");
+    let whole = std::fs::read_to_string(&saved).unwrap();
+    assert!(whole.contains(r#""handed":true"#), "{whole}");
+    write(
+        &saved,
+        &whole.replace(r#""handed":true"#, r#""handed":false"#),
+    );
+    let resumed = Agent::new(cfg.clone(), id()).unwrap();
+    assert_eq!(resumed.bot_user().unwrap().state, wire::BOT_USER_READY);
+    assert!(
+        std::fs::read_to_string(&saved)
+            .unwrap()
+            .contains(r#""handed":true"#)
+    );
+    write(&saved, "{not json");
+    let unreadable = Agent::new(cfg.clone(), id()).unwrap();
+    assert_eq!(unreadable.bot_user().unwrap().state, wire::BOT_USER_FAILED);
+    write(&saved, &whole);
 }
 
 #[tokio::test]
@@ -339,6 +360,14 @@ async fn as_root_bots_get_their_own_os_user_and_cant_reach_the_agents_files() {
             .trim(),
         ids.uid.to_string()
     );
+
+    // A home that is the Bots' with no record of it (lost, or never saved) runs nothing.
+    let cfg = &m.agent.cfg;
+    std::fs::remove_file(cfg.state_dir.join("bot-user.json")).unwrap();
+    let lost = Agent::new(cfg.clone(), agent::load(cfg).unwrap()).unwrap();
+    let st = lost.bot_user().unwrap();
+    assert_eq!(st.state, wire::BOT_USER_FAILED, "{st:?}");
+    assert!(st.error.unwrap().contains("belongs to another user"));
 
     let _ = std::process::Command::new("userdel").arg(USER).status();
 }

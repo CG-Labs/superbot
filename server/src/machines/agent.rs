@@ -594,12 +594,26 @@ struct Bot {
 
 const BOT_USER_FILE: &str = "bot-user.json";
 
-/// The Bots' user, saved once it owns the home.
+/// The Bots' user, saved before it's handed the home, so a restart part-way picks up
+/// where it stopped rather than running as root in a home that may already be its.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SavedBotUser {
     user: String,
     uid: u32,
     gid: u32,
+    /// The whole home is its.
+    #[serde(default)]
+    handed: bool,
+}
+
+fn save_bot_user(cfg: &Config, ids: Ids, handed: bool) -> Result<(), String> {
+    let saved = SavedBotUser { user: cfg.bot_user.clone(), uid: ids.uid, gid: ids.gid, handed };
+    write_private(&cfg.state_dir.join(BOT_USER_FILE), &serde_json::to_string(&saved).unwrap_or_default(), 0o600)
+}
+
+fn bot_failed(user: &str, e: String) -> Bot {
+    eprintln!("Bots' user: {e}");
+    Bot { status: Some(bot_status(wire::BOT_USER_FAILED, user, None, Some(e))), ids: None }
 }
 
 fn bot_status(state: &str, user: &str, uid: Option<u32>, error: Option<String>) -> wire::BotUserStatus {
@@ -614,11 +628,25 @@ fn bot_status(state: &str, user: &str, uid: Option<u32>, error: Option<String>) 
 
 /// The saved Bots' user, checked: still there, with the same ids, owning the home.
 fn load_bot_user(cfg: &Config, tools: &Tools) -> Bot {
-    let Some(saved) = std::fs::read(cfg.state_dir.join(BOT_USER_FILE))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<SavedBotUser>(&b).ok())
-    else {
-        return Bot::default();
+    use std::os::unix::fs::MetadataExt;
+    let path = cfg.state_dir.join(BOT_USER_FILE);
+    let saved = match std::fs::read(&path) {
+        Ok(b) => match serde_json::from_slice::<SavedBotUser>(&b) {
+            Ok(s) => s,
+            Err(e) => return bot_failed(&cfg.bot_user, format!("{}: {e}", path.display())),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // SAFETY: no arguments.
+            let me = unsafe { libc::geteuid() };
+            return match std::fs::symlink_metadata(&cfg.home) {
+                Ok(m) if m.uid() != me => bot_failed(
+                    &cfg.bot_user,
+                    format!("{} belongs to another user, but no Bots' user is saved.", cfg.home.display()),
+                ),
+                _ => Bot::default(),
+            };
+        }
+        Err(e) => return bot_failed(&cfg.bot_user, format!("{}: {e}", path.display())),
     };
     let want = Ids { uid: saved.uid, gid: saved.gid };
     let checked = (|| {
@@ -627,29 +655,26 @@ fn load_bot_user(cfg: &Config, tools: &Tools) -> Bot {
         }
         match runas::lookup(&saved.user) {
             Some((ids, _)) if ids == want => {}
-            Some(_) => return Err(format!("{} isn't the user it was (uid {}).", saved.user, saved.uid)),
+            Some(_) => return Err(format!("{} isn't the user it was.", saved.user)),
             None => return Err(format!("{} is gone.", saved.user)),
         }
         cfg.check_bot_ids(want)?;
-        use std::os::unix::fs::MetadataExt;
         let owned = std::fs::symlink_metadata(&cfg.home).is_ok_and(|m| m.is_dir() && m.uid() == want.uid);
-        if !owned {
+        if !saved.handed || !owned {
             runas::hand_over(&cfg.home, want).map_err(|e| format!("{}: {e}", cfg.home.display()))?;
         }
-        cfg.open_paths(tools)
+        cfg.open_paths(tools)?;
+        if !saved.handed {
+            save_bot_user(cfg, want, true)?;
+        }
+        Ok(())
     })();
     match checked {
         Ok(()) => Bot {
             status: Some(bot_status(wire::BOT_USER_READY, &saved.user, Some(want.uid), None)),
             ids: Some(want),
         },
-        Err(e) => {
-            eprintln!("Bots' user: {e}");
-            Bot {
-                status: Some(bot_status(wire::BOT_USER_FAILED, &saved.user, Some(want.uid), Some(e))),
-                ids: None,
-            }
-        }
+        Err(e) => bot_failed(&saved.user, e),
     }
 }
 
@@ -773,19 +798,17 @@ impl Agent {
         let ids = runas::ensure_user(&cfg.bot_user, &cfg.home)?;
         cfg.check_bot_ids(ids)?;
         let _copies = self.landing.hold();
+        // Saved, and copies switched, before anything is the Bots' user's: whatever fails
+        // after this, or a restart, never has root writing in its home.
+        save_bot_user(cfg, ids, false)?;
+        self.landing.set_user(ids);
         let handed = runas::hand_over(&cfg.home, ids).map_err(|e| format!("{}: {e}", cfg.home.display()))?;
         cfg.open_paths(&self.tools)?;
         work_dirs(cfg, Some(ids))?;
-        let saved = SavedBotUser { user: cfg.bot_user.clone(), uid: ids.uid, gid: ids.gid };
-        write_private(
-            &cfg.state_dir.join(BOT_USER_FILE),
-            &serde_json::to_string(&saved).unwrap_or_default(),
-            0o600,
-        )?;
-        self.landing.set_user(ids);
+        save_bot_user(cfg, ids, true)?;
         println!(
-            "Bots now run as {} (uid {}): handed it {} files, left {} as they were.",
-            cfg.bot_user, ids.uid, handed.changed, handed.skipped
+            "Bots now run as {}: handed it {} files, left {} as they were.",
+            cfg.bot_user, handed.changed, handed.skipped
         );
         Ok(ids)
     }
@@ -1268,6 +1291,9 @@ async fn sync_blob(
 }
 
 async fn sync_finish(State(a): State<Arc<Agent>>, UrlPath(id): UrlPath<String>) -> Response {
+    if let Err(r) = a.job_user() {
+        return r;
+    }
     let landing = a.landing.clone();
     landed(tokio::task::spawn_blocking(move || landing.finish(&id)).await)
 }
@@ -1382,13 +1408,7 @@ async fn set_bot_user(State(a): State<Arc<Agent>>, Json(_r): Json<wire::BotUserR
                 status: Some(bot_status(wire::BOT_USER_READY, &user, Some(ids.uid), None)),
                 ids: Some(ids),
             },
-            Err(e) => {
-                eprintln!("Bots' user: {e}");
-                Bot {
-                    status: Some(bot_status(wire::BOT_USER_FAILED, &user, None, Some(e))),
-                    ids: None,
-                }
-            }
+            Err(e) => bot_failed(&user, e),
         };
         up.set_bot(b);
     });
