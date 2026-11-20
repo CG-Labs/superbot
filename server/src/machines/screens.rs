@@ -290,8 +290,8 @@ pub async fn target(app: &App, bot: &Bot) -> Result<Option<(Arc<Enrollment>, Set
 /// `GET /api/bots/:id/screen` for a Bot on its owner's machine: its screen there,
 /// started if need be, as a `/screen/<port>/?token=` link. `Ok(None)`: the Bot runs on
 /// this server, which shows it as before. The caller has checked access to the Bot;
-/// `still` checks it again once the screen is this request's to hand out, since a new
-/// token made meanwhile must not reach someone who just lost access.
+/// `still` checks it again once no new token for it is under way, before anything starts:
+/// a revocation that finished meanwhile must not hand out the new token.
 pub async fn open(app: &AppState, by: &Who, bot: &Bot, still: impl Fn() -> Res<()>) -> Res<Option<String>> {
     let refused = |machine: Option<&str>, w: Why| {
         let d = json!({ "reason": w.reason(), "owner": bot.owner_id, "machine": machine });
@@ -308,10 +308,10 @@ pub async fn open(app: &AppState, by: &Who, bot: &Bot, still: impl Fn() -> Res<(
         Err(w) => return Err(refused(None, w)),
     };
     let _one = e.shown.one_at_a_time(&bot.id).await;
+    still()?;
     let hb = super::enroll::check(app, &e, &to).await.map_err(|m| refused(Some(&to.machine_id), Why::Route(Refusal::Offline(m))))?;
     fit(&e, &hb).map_err(|w| refused(Some(&to.machine_id), w))?;
     let (reply, token) = ensure(app, &e, &s, by, bot, &to, "viewer").await.map_err(|w| refused(Some(&to.machine_id), w))?;
-    still()?;
     let viewer = by.actor.id.clone().unwrap_or_default();
     let (port, first) = listen(app, &e, &s, &bot.id, &viewer).map_err(|w| refused(Some(&to.machine_id), w))?;
     if first {
@@ -403,6 +403,12 @@ async fn tunnel(app: &AppState, bot: &str, mut tcp: TcpStream) -> Result<(), Str
         o.used = now();
     }
     Ok(())
+}
+
+/// Holds `bot`'s lock as a start or new token would, until dropped.
+#[cfg(test)]
+pub async fn hold_for_tests(e: &Enrollment, bot: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    e.shown.one_at_a_time(bot).await
 }
 
 /// The screen's environment for a run of `bot` on `to`, starting it there if need be.

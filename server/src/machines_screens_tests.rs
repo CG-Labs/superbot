@@ -349,6 +349,28 @@ async fn revoking_someones_sessions_or_disabling_them_changes_every_machine_scre
 }
 
 #[tokio::test]
+async fn a_screen_request_waiting_out_a_revocation_gets_no_link() {
+    let mut env = serve_with(|e| e.with_screens(ports())).await;
+    let (uid, m) = ready_machine(&mut env, "ada@example.com", fake_stack()).await;
+    let bot = owned_bot(&env, &uid);
+    until_ready(&env, &m.agent).await;
+    let (bob_id, bob) = user_with(env.port, &env.admin, "bob@example.com", "member").await;
+
+    // Bob's request passes its first check, then waits as if a new token were under way.
+    let held = crate::machines::screens::hold_for_tests(&env.e, &bot).await;
+    let (port, path) = (env.port, format!("/api/bots/{bot}/screen"));
+    let pending = tokio::spawn(async move { call(port, "GET", &path, &bob, "").await });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!pending.is_finished(), "waiting on the Bot's lock");
+    let (code, v) = json_call(&env, "DELETE", &format!("/api/users/{bob_id}/sessions"), "").await;
+    assert_eq!(code, 200, "{v}");
+    drop(held);
+    let (code, body) = pending.await.unwrap();
+    assert_eq!(code, 401, "{body}");
+    assert!(m.agent.screens.report().running.is_empty(), "nothing started for it");
+}
+
+#[tokio::test]
 async fn a_viewer_who_lost_access_while_waiting_gets_no_link() {
     let mut env = serve_with(|e| e.with_screens(ports())).await;
     let (uid, m) = ready_machine(&mut env, "ada@example.com", fake_stack()).await;
