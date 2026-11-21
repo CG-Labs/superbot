@@ -848,7 +848,7 @@ pub enum PushPut {
 
 /// Each person keeps at most this many devices; registering more drops the oldest.
 pub const MAX_PUSH_DEVICES: usize = 20;
-const PUSH_TOKEN_CONTEXT: &str = "push_devices.token";
+pub(crate) const PUSH_TOKEN_CONTEXT: &str = "push_devices.token";
 
 pub struct NewSession<'a> {
     pub user_id: &'a str,
@@ -3975,8 +3975,10 @@ impl Db {
             _ => PushPut::Added,
         };
         tx.execute("DELETE FROM push_devices WHERE token_hash = ? AND session_id <> ?", params![token_hash, session_id]).unwrap();
-        let id = mine.as_ref().map_or_else(|| format!("pd{}", crate::random_hex(8)), |d| d.id.clone());
-        let created = mine.as_ref().map_or(at, |d| d.created_at);
+        // Read raw, so a row whose token no longer opens still keeps its id (ON CONFLICT does).
+        let stored: Option<(String, i64)> =
+            tx.query_row("SELECT id, created_at FROM push_devices WHERE session_id = ?", [session_id], |r| Ok((r.get(0)?, r.get(1)?))).optional().unwrap();
+        let (id, created) = stored.unwrap_or_else(|| (format!("pd{}", crate::random_hex(8)), at));
         tx.execute(
             "INSERT INTO push_devices (id, user_id, session_id, provider, token_hash, token, platform, approvals, routines, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
@@ -5370,6 +5372,12 @@ mod tests {
         assert_eq!((change, d2.id == d.id), (PushPut::Added, true), "a new token for the session replaces the old one");
         assert_eq!(db.put_push_device(&u.id, &s1, "expo", "ExponentPushToken[t-2]", "ios", true, true).1, PushPut::Unchanged);
         assert_eq!(db.put_push_device(&u.id, &s1, "expo", "ExponentPushToken[t-2]", "ios", false, true).1, PushPut::Updated);
+        // A token sealed under a lost key doesn't open; registering again still works and keeps the row.
+        let lost = crate::secrets::sealed::Cipher::new(&crate::secrets::key::MasterKey::generate()).seal(PUSH_TOKEN_CONTEXT, b"ExponentPushToken[t-2]");
+        db.c().execute("UPDATE push_devices SET token = ? WHERE session_id = ?", params![lost, s1]).unwrap();
+        assert!(db.session_push_device(&s1).is_none());
+        let (d3, change) = db.put_push_device(&u.id, &s1, "expo", "ExponentPushToken[t-2]", "ios", true, true);
+        assert_eq!((change, d3.id == d.id, d3.token.as_str()), (PushPut::Added, true, "ExponentPushToken[t-2]"));
         let s2 = session(&other.id);
         assert_eq!(db.put_push_device(&other.id, &s2, "expo", "ExponentPushToken[t-2]", "android", true, true).1, PushPut::Moved);
         assert!(db.session_push_device(&s1).is_none(), "a token lives on one session only");
