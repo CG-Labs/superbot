@@ -1,0 +1,29 @@
+name: docs
+
+# Links in the security pack (docs/security/) point at ADRs and other docs, so any docs
+# change can break one. Changes to server/, deploy/ and apps/client/ run the same test
+# in the server workflow's `cargo test`.
+on:
+  push:
+    paths:
+      - 'docs/**'
+      - 'server/tests/security_docs_links.rs'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'server/tests/security_docs_links.rs'
+      - '.github/workflows/docs.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  security-pack-links:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --test security_docs_links
