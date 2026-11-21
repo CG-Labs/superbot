@@ -197,7 +197,7 @@ fn hermes_hook_timeout_blocks() {
         println!("SKIP hermes: the hook timeout test needs the fake model");
         return;
     }
-    let hang = format!("cat >/dev/null; echo $$ >>\"$(dirname \"$0\")/../proof/hook-pids\"; sleep {HANG_SECS}; exit 0");
+    let hang = format!("cat >/dev/null; echo $$ >>\"$(dirname \"$0\")/../proof/hook-pids\"; exec sleep {HANG_SECS}");
     let b = start_with("hermes", Some(&hang), &[("SUPERBOT_TEST_HOOK_TIMEOUT_SECS", &HOOK_SECS.to_string())]);
     let id = call(&b, "GET", "/api/bots", Value::Null)[0]["id"].as_str().unwrap().to_string();
     call(&b, "PUT", "/api/policy", json!({ "sandbox": false }));
