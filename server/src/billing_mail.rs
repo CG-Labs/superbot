@@ -380,12 +380,13 @@ impl BillingMail {
         let plan_link = public_url.map(|b| format!("{}{}", b.trim_end_matches('/'), crate::billing::RETURN_PATH));
         BillingMail { mailer, plan_link, wake: tokio::sync::Notify::new(), busy: tokio::sync::Mutex::new(()) }
     }
+}
 
-    pub fn describe(&self) -> String {
-        let links = if self.plan_link.is_some() { "" } else { "; without links (set PUBLIC_URL)" };
-        // Nothing from the SMTP settings: they hold the sign-in name.
-        format!("on, through the notification mail server (SMTP_HOST){links}")
-    }
+/// The start-up line while on. Built apart from the mailer, so nothing from the SMTP
+/// settings (which hold the sign-in name) can reach the log.
+fn said_on(links: bool) -> String {
+    let links = if links { "" } else { "; without links (set PUBLIC_URL)" };
+    format!("on, through the notification mail server (SMTP_HOST){links}")
 }
 
 /// `BILLING_EMAILS` with billing and SMTP as configured. None: off, with why.
@@ -409,9 +410,7 @@ pub fn configured(var: &dyn Fn(&str) -> String, billing: bool, smtp: Option<&smt
         }
         return Ok((None, "off (set SMTP_HOST and SMTP_FROM to send them)".into()));
     };
-    let m = BillingMail::new(Arc::new(s.clone()), public_url);
-    let said = m.describe();
-    Ok((Some(m), said))
+    Ok((Some(BillingMail::new(Arc::new(s.clone()), public_url)), said_on(public_url.is_some())))
 }
 
 fn system(user: &str) -> Who {
