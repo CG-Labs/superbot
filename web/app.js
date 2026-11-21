@@ -291,15 +291,33 @@ function machineActions(m) {
   }
 }
 
+// Against its tier's RPO and RTO (ADR 0073), when off-host backups are on.
+function recoveryCell(m) {
+  const r = m.recovery;
+  if (!r) return "";
+  const hours = (ms) => (ms < 3600000 ? `${Math.floor(ms / 60000)} min` : `${(ms / 3600000).toFixed(1)} h`);
+  const age = r.lastBackupAt ? `${hours(Date.now() - r.lastBackupAt)} ago` : "None yet";
+  const rpo = `<div class="sub">RPO ${r.rpoHours} h · RTO ${r.rtoMinutes} min</div>`;
+  const late = r.breach ? `<div class="sub bad">Past its RPO since ${esc(fmt(r.breachedAt || r.coveredSince + r.rpoHours * 3600000))}</div>` : "";
+  const restore = r.lastRestore && r.lastRestore.withinRto === false ? `<div class="sub bad">Last restore took longer than its RTO</div>` : "";
+  return `${esc(age)}${rpo}${late}${restore}`;
+}
+
 function renderMachines() {
   const list = $("machines-destroyed").checked ? machines : machines.filter((m) => m.state !== "destroyed");
   $("machines-empty").hidden = list.length > 0;
+  const late = machines.filter((m) => m.recovery && m.recovery.breach);
+  $("machines-rpo").hidden = late.length === 0;
+  $("machines-rpo").textContent = late.length
+    ? `${late.length} machine${late.length === 1 ? " has" : "s have"} no off-host backup within ${late.length === 1 ? "its" : "their"} RPO: ${late.map((m) => m.userEmail || m.userId).join(", ")}. The audit log says why (machine.rpo_breached).`
+    : "";
   $("machines-rows").innerHTML = list.map((m) => `<tr data-machine="${esc(m.id)}">
       <td>${esc(m.userEmail || m.userId)}</td>
       <td>${esc(m.state)}${m.providerStatus ? `<div class="sub">${esc(m.providerStatus)}</div>` : ""}${m.lastError ? `<div class="sub bad">${esc(m.lastError)}</div>` : ""}${m.enrollOverdueAt && m.enrollment !== "enrolled" ? `<div class="sub bad">Didn't enroll in time (since ${esc(fmt(m.enrollOverdueAt))})</div>` : ""}</td>
       <td>${esc(m.tier)}<div class="sub">${esc(m.plan)} · ${esc(m.provider)}</div></td>
       <td>${esc(m.region)}</td>
       <td>${esc(m.ipv4 || "")}</td>
+      <td>${recoveryCell(m)}</td>
       <td>${esc(fmt(m.updatedAt))}</td>
       <td class="actions">${machineActions(m)}</td>
     </tr>`).join("");

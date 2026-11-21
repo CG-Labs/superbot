@@ -535,6 +535,25 @@ async fn backup_and_restore(env: &Env, uid: &str, m: &crate::db::Machine, other:
     }
     env.say(&format!("restored container enrolled anew ({}s)", t.elapsed().as_secs()));
 
+    // The restore drill (ADR 0073): timed from the request to enrollment, within the tier's RTO.
+    let r = env.app.db.machine_restore(&rid).unwrap();
+    let (took, rto) = (r.duration_ms.expect("a finished restore is timed"), r.rto_ms.unwrap());
+    let drill = json!({
+        "restoreId": r.id, "tier": r.tier, "durationMs": took, "rtoMs": rto, "withinRto": took <= rto,
+        "backupBytes": b.size, "replacedAfterMs": replaced - r.created_at, "incus": std::env::var("INCUS_SOURCE").ok(),
+    });
+    env.say(&format!("restore drill: {}s of an RTO of {} minutes ({drill})", took / 1000, rto / 60_000));
+    if let Ok(out) = std::env::var("SUPERBOT_INCUS_E2E_DRILL_OUT") {
+        std::fs::write(&out, serde_json::to_vec_pretty(&drill).unwrap()).unwrap();
+    }
+    assert!(took <= rto, "the restore took {took} ms, past its RTO of {rto} ms");
+    let restored = events(env, "machine.restored").await;
+    assert_eq!(restored[0]["details"]["withinRto"].as_bool(), Some(true), "{restored:?}");
+    let (code, rec) = json_call(env, "GET", "/api/machines/recovery", "").await;
+    assert_eq!(code, 200, "{rec}");
+    let row = rec["machines"].as_array().unwrap().iter().find(|v| v["machineId"] == m.id.as_str()).cloned().unwrap();
+    assert_eq!((row["tracked"].as_bool(), row["breach"].as_bool(), row["lastRestore"]["withinRto"].as_bool()), (Some(true), Some(false), Some(true)), "{row}");
+
     let (code, marker) = sh(env, n, "cat /root/marker").await;
     assert_eq!((code, marker.trim()), (0, "before"), "the backup's files");
     let (code, new_identity) = sh(env, n, id_sum).await;
