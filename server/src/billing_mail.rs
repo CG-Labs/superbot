@@ -1,4 +1,4 @@
-//! Billing emails (ADR 0090): plain-text emails to the person a plan is for when Stripe
+//! Billing emails (ADR 0089): plain-text emails to the person a plan is for when Stripe
 //! changes it, a payment fails, a plan is set to end or ends, a plan change leaves
 //! their computer waiting on them or failing to resize, and, unless they turn these
 //! off, when they near or reach their plan's model tokens or storage.
@@ -383,7 +383,8 @@ impl BillingMail {
 
     pub fn describe(&self) -> String {
         let links = if self.plan_link.is_some() { "" } else { "; without links (set PUBLIC_URL)" };
-        format!("on, through the SMTP server{links}")
+        // Nothing from the SMTP settings: they hold the sign-in name.
+        format!("on, through the notification mail server (SMTP_HOST){links}")
     }
 }
 
@@ -525,7 +526,7 @@ pub async fn send_due(app: &App) -> usize {
             Ok(went) => sent += usize::from(went),
             // Without saving outcomes, sending more could send them again.
             Err(e) => {
-                crate::obs::log::log_warn!("billing: stopped sending billing emails: couldn't save one's outcome: {e}");
+                eprintln!("billing: stopped sending billing emails: couldn't save one's outcome: {e}");
                 break;
             }
         }
@@ -573,7 +574,7 @@ async fn send_one(app: &App, m: &BillingMail, q: &Queued) -> Result<bool, String
             let retry = attempts < MAX_ATTEMPTS;
             let saved = app.db.billing_email_result(q.id, if retry { "pending" } else { "failed" }, Some(&e));
             // SMTP errors can name the recipient: the details go to the audit event only.
-            crate::obs::log::log_warn!("billing: a billing email failed; see billing.email_failed in the audit log");
+            eprintln!("billing: a billing email failed; see billing.email_failed in the audit log");
             d["error"] = json!(e);
             d["retrying"] = json!(retry);
             app.db.record(&by.event("billing.email_failed").target("user", &q.user_id).outcome(Outcome::Failure).details(d));
@@ -631,7 +632,7 @@ pub async fn put_mine(State(app): State<AppState>, Extension(c): Extension<Calle
     let before = app.db.usage_emails(&u.id);
     if before != on {
         app.db.set_usage_emails(&u.id, on).map_err(|e| {
-            crate::obs::log::log_warn!("botd: couldn't save someone's email settings: {e}");
+            eprintln!("botd: couldn't save someone's email settings: {e}");
             ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Couldn't save your email settings; see the server log.".into())
         })?;
         app.db.record(&by.event("billing.email_settings_updated").target("user", &u.id).details(json!({ "usage": { "from": before, "to": on } })));
