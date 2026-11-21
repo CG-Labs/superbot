@@ -135,6 +135,28 @@ botctl machine restore <user> status
 
 A restore replaces the machine with the backup. Everything on it since the backup is lost. botd imports the backup beside the container and gives it today's size, security settings and firewall. It removes the agent's old identity, writes a fresh one-time enrollment token as a root-only file, swaps the copy into place, revokes the machine's old certificates and tokens, and then starts it. Bots on it are refused (`machine_restoring`) until its agent enrolls again, normally within a minute of starting. A wrong key or a damaged object fails before anything changes. The audit log has `machine.backup_created`, `machine.backup_failed`, `machine.backup_deleted`, `machine.restore_requested`, `machine.restored` and `machine.restore_failed`.
 
+### Several hosts
+
+A backup can only bring a machine back if there is somewhere to restore it. To cover losing a whole host, give botd a second Incus host set up the same way (steps 1 to 4 and `restricted.backups=allow`), trusting the same client certificate ([ADR 0076](../adr/0076-restoring-onto-another-incus-host.md)):
+
+```bash
+INCUS_HOST_NAME=main                              # names the INCUS_URL host; the default
+INCUS_HOSTS=spare=https://<second-incus-host-private-ip>:8443
+INCUS_SERVER_CERT_SPARE_FILE=/etc/superbot/incus/spare-server.crt
+# INCUS_PROJECT_SPARE, INCUS_NETWORK_SPARE, INCUS_STORAGE_POOL_SPARE if they differ
+# INCUS_HOST_DOWN_MINUTES=10                      # silent this long: down, alerted
+```
+
+Use IP addresses, as for `INCUS_URL`: every host's address is denied to every container. botd needs a route to each host's bridge subnet; give each host its own subnet (`10.150.1.0/24`, ...). New machines go on the first host that is up. botd records each host's certificate the first time; if a name's certificate changes, botd won't start, so give a replacement host a new name. `botctl machine substrate check` checks every host.
+
+```bash
+botctl machine hosts check                        # each host: up, down or lost, and its machines
+botctl machine host recover <name> --yes          # a lost host's machines, onto another from their backups
+botctl machine restore <user> <backup-id> --host <name> --yes   # move one machine
+```
+
+When to recover and what it does: [machine recovery](machine-recovery.md#losing-a-whole-incus-host).
+
 ## Testing against a real host
 
 An end-to-end test runs botd's Incus provider against a real Incus host ([ADR 0069](../adr/0069-validating-incus-containers-on-a-real-host.md)). The `incus-e2e` CI job runs it on GitHub's runners. To run it yourself, use a throwaway Ubuntu 24.04 VM, because the script reconfigures Incus on the host it runs on:
@@ -147,13 +169,20 @@ cargo test --bin botd -- --ignored --exact --nocapture \
   machines_incus_e2e_tests::real_incus_containers_enroll_stay_apart_and_follow_the_lifecycle
 ```
 
-The test makes and destroys two containers. It checks enrollment, that the token is gone, sizing, isolation between them and from the host, suspend, resume, resize, the reconciler, rebuild and destroy. With `SUPERBOT_INCUS_E2E_S3_ENDPOINT` and the `MACHINE_BACKUP_S3_*` keys pointing at a scratch store (CI runs versitygw on loopback), it also backs a container up, encrypted, and restores it. It cleans up containers and ACLs left by an earlier run. It needs nftables' bridge family. The script makes a btrfs pool; with `POOL_DRIVER=dir` the test still runs and expects the preflight warning about disk sizes.
+The test makes and destroys two containers. It checks enrollment, that the token is gone, sizing, isolation between them and from the host, suspend, resume, resize, the reconciler, rebuild and destroy. With `SUPERBOT_INCUS_E2E_S3_ENDPOINT` and the `MACHINE_BACKUP_S3_*` keys pointing at a scratch store (CI runs versitygw on loopback), it also backs a container up, encrypted, and restores it. A second test drills losing a host, with the script's second project (`superbot-b`) as the other host:
+
+```bash
+cargo test --bin botd -- --ignored --exact --nocapture \
+  machines_incus_e2e_tests::real_incus_host_loss_restores_onto_another_host
+```
+
+It cleans up containers and ACLs left by an earlier run. It needs nftables' bridge family. The script makes a btrfs pool; with `POOL_DRIVER=dir` the test still runs and expects the preflight warning about disk sizes.
 
 ## Limits to know
 
 - Containers share the host's kernel. A kernel escape crosses every boundary. Use VMs for tiers that need their own kernel.
 - Containers can't reach each other at all, ping included. They can ping the gateway. The host itself reaches only their agent port.
 - Snapshots (daily, kept 7 days) stay on the same pool. They don't protect against losing the host; off-host backups (step 7) do.
-- A backup restores only to the same machine. Exports are full each time, so storage grows with disk size times retention.
+- A backup restores only to the same machine, on its host or another. Exports are full each time, so storage grows with disk size times retention.
 - A container's config holds its live enrollment token from its create (or rebuild) until it enrolls or misses its deadline. Anyone who can read the Incus project can read it during that window. A container that never starts keeps it in its config, but the token expires an hour after it was issued.
 - Switching `MACHINE_PROVIDER` leaves machines made by the other provider as they are. botd reaches their agents but won't change them until you switch back.
