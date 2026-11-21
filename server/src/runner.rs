@@ -989,6 +989,15 @@ impl App {
                     if attempt == 0 {
                         self.give_back(&bot, msg, &period.key);
                     }
+                    self.db.metrics().run_finished(&bot.harness, "stopped", started.elapsed().as_secs_f64());
+                    crate::obs::log::event(
+                        crate::obs::log::Level::Warn,
+                        "run.finished",
+                        json!({
+                            "runId": run_id, "messageId": msg.id, "botId": bot.id, "harness": bot.harness, "trigger": msg.role, "host": host["host"],
+                            "result": "stopped", "durationMs": started.elapsed().as_millis() as u64, "attempts": attempt,
+                        }),
+                    );
                     self.say(&bot.id, "Stopped.", true);
                     return;
                 }
