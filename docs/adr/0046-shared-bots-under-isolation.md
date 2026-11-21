@@ -93,7 +93,7 @@ Bot views add `runsOn` (`server`, `machine` or `nowhere`, when routing isn't off
 ## Limits and follow-ups
 
 - **One trust domain on the owner's computer.** A teammate's run is still a shell on the owner's computer, as the owner's Bots' user (ADR 0043). Its tools can still open the owner's folder, other Bots' files and the harness logins there; botd only keeps the owner's keys and facts out of it and tells it not to. A separate OS user and home for teammates' runs on the machine, with their own logins, is the follow-up. Done, without the logins, behind `MACHINE_TEAMMATE_USERS=on` in [ADR 0048](0048-teammates-own-os-user-on-machines.md), which also binds those runs' tokens to the teammate and gives each person their own screen.
-- **Team accounts and team machines** as first-class things, not a convention.
+- **Team accounts and team machines** as first-class things, not a convention. Done in [ADR 0087](0087-team-accounts-and-machines.md): sharing now stops at the owner's team.
 - **Per-run tokens**, so a token names the run's person, not only the Bot, and the cap needs no saved state. Per-run tokens are done ([ADR 0083](0083-per-run-tokens.md)); the cap still reads the saved asker, which is exact while a token is live.
 - **A session per person**, so a teammate's chat with a shared Bot carries on between messages; today each teammate's run starts fresh.
 - **Owner approval for risky steps in teammates' runs**, whatever the Bot's approval mode.
