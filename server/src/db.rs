@@ -3300,6 +3300,17 @@ impl Db {
         );
     }
 
+    /// Whether `action` was audited about this target at or after `since` (ms).
+    pub fn audited_since(&self, action: &str, target_type: &str, target_id: &str, since: i64) -> bool {
+        self.c()
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM audit_events WHERE action = ?1 AND target_type = ?2 AND target_id = ?3 AND at >= ?4)",
+                params![action, target_type, target_id, since],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap_or(false)
+    }
+
     pub fn routine_refused(&self, user_id: &str, day: &str) -> bool {
         self.c()
             .query_row(
