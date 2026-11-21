@@ -144,6 +144,9 @@ mod teammate_logins;
 mod teammate_removals;
 #[cfg(test)]
 mod teammate_removals_http_tests;
+mod team_billing;
+#[cfg(test)]
+mod team_billing_http_tests;
 mod teams;
 #[cfg(test)]
 mod teams_http_tests;
@@ -484,6 +487,9 @@ async fn main() {
     if let Some(m) = auth_state.payments.meter() {
         let _ = app.meter.set(m);
     }
+    if let Some(s) = auth_state.payments.seats() {
+        let _ = app.team_seats.set(s);
+    }
     let notifications = notify::load(&app.db);
     log_info!("Notifications: {}.", notifier.describe(&notifications));
     let notify_summary = json!({
@@ -591,6 +597,7 @@ async fn main() {
     cron::start(app.clone());
     billing::start_metering(app.clone());
     billing_mail::start(app.clone());
+    team_billing::start(app.clone());
     if app.screens.is_some() {
         let app = app.clone();
         tokio::spawn(async move {
@@ -769,6 +776,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/teams/{id}/members/{user}", put(teams::put_member).delete(teams::delete_member))
         .route("/team", get(teams::mine))
         .route("/team/leave", post(teams::leave_mine))
+        .route("/team/billing/checkout", post(team_billing::checkout))
+        .route("/team/billing/portal", post(team_billing::portal))
         .route("/team/invites", post(teams::invite))
         .route("/team/invites/{id}", delete(teams::uninvite))
         .route("/team/members/{user}", patch(teams::set_role).delete(teams::remove))

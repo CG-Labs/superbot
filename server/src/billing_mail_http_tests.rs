@@ -277,7 +277,7 @@ async fn token_emails_follow_the_saved_total_not_just_this_runs_share() {
         cache_read: 0,
         cache_write: 0,
         at: crate::db::now(),
-        meter: false,
+        meter: None,
     };
     app.db.record_tokens(&[row]).unwrap();
     fake_claude_tokens(app, 1000);

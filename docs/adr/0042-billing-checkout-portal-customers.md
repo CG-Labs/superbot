@@ -66,6 +66,6 @@ The server tests run a fake Stripe on loopback that checks the bearer key, the i
 ## Consequences
 
 - Self-hosted servers without the key are unchanged; a server with only the webhook secret behaves as in ADR 0040.
-- Managed servers hold a Stripe secret key. A restricted key with write access to Checkout Sessions and Billing Portal sessions (and nothing else) is enough and limits the damage if it leaks.
+- Managed servers hold a Stripe secret key. A restricted key with write access to Checkout Sessions and Billing Portal sessions (and nothing else) is enough and limits the damage if it leaks. (Team billing, [ADR 0093](0093-team-billing.md), adds write access to Subscriptions, for the seat count.)
 - A plan can't be bought twice from the app, but an admin can still create a second subscription in Stripe's dashboard; ADR 0040's rule (the newest paying subscription sets the tier) still applies.
 - Moving a person to another Stripe customer needs `customer.deleted` (deleting the old customer) first, since the first link stands.

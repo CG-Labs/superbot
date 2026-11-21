@@ -1,7 +1,9 @@
 //! The Stripe API calls botd makes (ADR 0042): opening, reading, and expiring a Checkout
 //! Session, and opening a Billing Portal session, with the secret key, an idempotency key
 //! on every POST, and a timeout. Nothing here spends money: Stripe charges only when the
-//! person completes the page it returns.
+//! person completes the page it returns. The one exception is a team subscription's
+//! seat count (ADR 0093), set to its member count, which the team already agreed to pay
+//! per seat; Stripe prorates it onto the team's next invoice.
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};

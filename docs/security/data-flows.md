@@ -17,7 +17,7 @@ botd keeps the organisation's data in one SQLite database, `DATA_DIR/app.sqlite`
 | Secrets: server-wide (the "Vault") and each person's own | Sealed ([ADR 0010](../adr/0010-secrets.md), [ADR 0044](../adr/0044-client-personal-secrets.md)). Values are never returned by the API, only names. |
 | Push device tokens | Sealed, plus a hash for lookups ([ADR 0080](../adr/0080-client-push-notifications.md)). |
 | Audit log | Append-only rows ([ADR 0009](../adr/0009-audit-events.md)). |
-| Billing: Stripe customer IDs, subscriptions, usage and token counts | Rows. No card data ([ADR 0040](../adr/0040-billing-v0-tier-limits.md), [ADR 0042](../adr/0042-billing-checkout-portal-customers.md), [ADR 0050](../adr/0050-billing-period-token-usage.md)). |
+| Billing: Stripe customer IDs, subscriptions, usage and token counts | Rows. No card data ([ADR 0040](../adr/0040-billing-v0-tier-limits.md), [ADR 0042](../adr/0042-billing-checkout-portal-customers.md), [ADR 0050](../adr/0050-billing-period-token-usage.md)); a team's customer, subscription and seat count ([ADR 0093](../adr/0093-team-billing.md)). |
 | Machine records, certificates, backup and restore records | Rows ([ADR 0031](../adr/0031-machine-enrollment-mtls.md), [ADR 0071](../adr/0071-off-host-machine-backups.md)). |
 | Each user's facts and Bots' memory | Files: `DATA_DIR/users/<id>/USER.md`, `DATA_DIR/bots/<id>/`, kept for every run, here or on a machine. A run on a machine sends the changed files back and botd writes them here (up to 1 MiB each). With per-user accounts, runs here work on a copy in the user's folder, which botd copies back. |
 | Each user's working folder, when runs are on this server | Files: `WORKSPACE_DIR/users/<id>/`, owned by that user's Unix account ([ADR 0058](../adr/0058-harness-os-user-by-default.md)). |
@@ -125,7 +125,7 @@ Off until an admin turns a channel on ([ADR 0061](../adr/0061-approval-notificat
 
 ### Billing (Stripe)
 
-Off until `BILLING=on` and `STRIPE_WEBHOOK_SECRET` are set, and never in testing mode ([ADR 0040](../adr/0040-billing-v0-tier-limits.md), [ADR 0042](../adr/0042-billing-checkout-portal-customers.md), [ADR 0050](../adr/0050-billing-period-token-usage.md)).
+Off until `BILLING=on` and `STRIPE_WEBHOOK_SECRET` are set, and never in testing mode ([ADR 0040](../adr/0040-billing-v0-tier-limits.md), [ADR 0042](../adr/0042-billing-checkout-portal-customers.md), [ADR 0050](../adr/0050-billing-period-token-usage.md), [ADR 0093](../adr/0093-team-billing.md)).
 
 ```mermaid
 sequenceDiagram
@@ -140,11 +140,13 @@ sequenceDiagram
   P->>B: manage billing
   B->>S: create Billing Portal session (customer ID)
   B->>S: meter events: customer ID and token count (only with STRIPE_METER_EVENT)
+  B->>S: a team's seat count (subscription item ID and quantity, when people join or leave)
 ```
 
 - Card details are entered on Stripe's pages and never reach botd.
 - The signed webhook is the only way a plan changes. Unsigned, mis-signed or stale events are refused.
-- Billing emails go through the operator's SMTP server to the person the plan is for, as plain text: their plan name and dates, what their computer is doing about a plan change, and how close they are to their tier's tokens and storage. Never a Stripe id, price, amount, card detail, portal link or secret. Off unless billing and SMTP are on ([ADR 0091](../adr/0091-billing-emails.md)).
+- A team's plan is bought by its owners and admins for everyone on it. Stripe gets the team's ID, the buyer's user ID and email (for a new customer), and the number of members, never their names or emails. The team's Stripe customer is never a person's.
+- Billing emails go through the operator's SMTP server to the person the plan is for, as plain text: their plan name and dates, what their computer is doing about a plan change, and how close they are to their tier's tokens and storage. Never a Stripe id, price, amount, card detail, portal link or secret. Off unless billing and SMTP are on ([ADR 0091](../adr/0091-billing-emails.md)). A team plan's emails go to the team's owners and admins ([ADR 0093](../adr/0093-team-billing.md)).
 
 ### Machines and backups
 

@@ -178,6 +178,8 @@ export interface BillingView {
   canChange: boolean;
   /** Billing emails (ADR 0091). Missing from older servers. */
   emails?: BillingEmails;
+  /** Your team pays for your plan (ADR 0093): then it's the team's, changed on the Team screen. */
+  teamPlan?: { id: string; name: string | null; tier: string | null; periodEnd: number | null } | null;
 }
 
 /** `/api/me/emails`: whether this server sends billing emails, and whether you get the usage ones. */
@@ -776,6 +778,23 @@ export interface Team {
   invites?: TeamInvite[];
   /** Owners and admins only: how long a leaver's team machine is kept suspended. */
   machineDays?: number;
+  /** The team's plan (ADR 0093), while this server sells them. */
+  billing?: TeamBilling;
+}
+
+/** A team's plan, paid for by the team for everyone on it (ADR 0093). Never a Stripe id. */
+export interface TeamBilling {
+  /** The plan the team pays for; null while it pays for none. */
+  plan: { name: string; label: string } | null;
+  /** Owners and admins only, from here down. */
+  subscription?: { status: string; tier: string | null; periodEnd: number | null; cancelAt: number | null } | null;
+  /** Seats Stripe bills, against the people on the team; null while nothing pays. */
+  seats?: { members: number; billed: number | null; syncing: boolean; error: string | null } | null;
+  /** The team has a Stripe customer, so "Manage billing" works. */
+  portal?: boolean;
+  plans?: TierView[];
+  /** You manage the team and may change its plan. */
+  canChange?: boolean;
 }
 
 /** An invite waiting for you, from `GET /api/me/team-invites`. */

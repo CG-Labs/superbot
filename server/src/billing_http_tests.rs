@@ -40,6 +40,7 @@ pub(crate) async fn world(stripe: bool) -> World {
 pub(crate) async fn world_with(payments: Option<Billing>) -> World {
     let p: Arc<dyn MachineProvider> = Arc::new(Fake::default());
     let meter = payments.as_ref().and_then(Billing::meter);
+    let seats = payments.as_ref().and_then(Billing::seats);
     let (port, app, admin, bots) = serve_app_with(|a| {
         a.machines = Arc::new(ControlPlane::for_tests(p));
         if let Some(b) = payments {
@@ -50,6 +51,9 @@ pub(crate) async fn world_with(payments: Option<Billing>) -> World {
     app.tiers.set(Arc::new(Tiers::parse(EXAMPLE, None).unwrap())).unwrap();
     if let Some(m) = meter {
         let _ = app.meter.set(m);
+    }
+    if let Some(s) = seats {
+        let _ = app.team_seats.set(s);
     }
     let (a_id, a) = user_with(port, &admin, "ada@example.com", "member").await;
     let (b_id, b) = user_with(port, &admin, "bea@example.com", "member").await;
@@ -510,8 +514,8 @@ async fn signed_subscription_events_set_the_users_tier() {
 
 pub(crate) const KEY: &str = "sk_test_not_a_real_key_for_tests";
 pub(crate) const PUBLIC: &str = "https://bots.example.com";
-const CHECKOUT_DONE: &str = include_str!("../tests/fixtures/stripe/checkout.session.completed.json");
-const CUSTOMER_DELETED: &str = include_str!("../tests/fixtures/stripe/customer.deleted.json");
+pub(crate) const CHECKOUT_DONE: &str = include_str!("../tests/fixtures/stripe/checkout.session.completed.json");
+pub(crate) const CUSTOMER_DELETED: &str = include_str!("../tests/fixtures/stripe/customer.deleted.json");
 
 /// One request the fake Stripe got.
 #[derive(Clone, Debug)]
@@ -547,7 +551,7 @@ impl FakeStripe {
     pub fn reply(&self, status: u16, body: Value) {
         self.replies.lock().unwrap().push_back((status, body));
     }
-    fn pay(&self, session: &str) {
+    pub(crate) fn pay(&self, session: &str) {
         self.paid.lock().unwrap().insert(session.into());
     }
     fn created(&self) -> Vec<Seen> {
@@ -571,6 +575,10 @@ pub(crate) async fn fake_stripe() -> (String, FakeStripe) {
         let paid = session.as_ref().is_some_and(|id| f.paid.lock().unwrap().contains(id));
         let (code, v) = f.replies.lock().unwrap().pop_front().unwrap_or_else(|| match (seen.path.as_str(), session) {
             ("/v1/billing/meter_events", _) => (200, json!({ "object": "billing.meter_event", "identifier": seen.get("identifier"), "event_name": seen.get("event_name") })),
+            (p, _) if p.starts_with("/v1/subscription_items/") => {
+                let quantity = seen.get("quantity").and_then(|q| q.parse::<i64>().ok());
+                (200, json!({ "id": p.trim_start_matches("/v1/subscription_items/"), "object": "subscription_item", "quantity": quantity }))
+            }
             ("/v1/checkout/sessions", _) => (200, json!({ "id": format!("cs_test_{n}"), "object": "checkout.session", "url": format!("https://checkout.stripe.com/c/pay/cs_test_{n}") })),
             (p, Some(_)) if p.ends_with("/expire") && paid => (400, json!({ "error": { "type": "invalid_request_error", "message": "Only Checkout Sessions with a status of open can be expired." } })),
             (_, Some(id)) => (200, json!({ "id": id, "object": "checkout.session", "status": if paid { "complete" } else { "expired" } })),
