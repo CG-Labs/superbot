@@ -658,12 +658,13 @@ fn fail_restore(app: &App, by: &Who, m: &Machine, r: &MachineRestore, from: &[&s
 /// Restores whose machine enrolled again are done; ones that didn't in time failed.
 pub async fn follow_up(app: &AppState, cp: &ControlPlane) {
     let Some(e) = cp.enrollment.as_deref() else { return };
-    let at = now();
     for r in app.db.machine_restores_in("enrolling") {
+        // A restore boots its machine under the lock, so what's read before it is stale.
+        let _g = cp.ops.lock().await;
+        let Some(r) = app.db.machine_restore(&r.id).filter(|r| r.state == "enrolling") else { continue };
         let Some(m) = app.db.machine(&r.machine_id) else { continue };
         let since = r.replaced_at.unwrap_or(r.created_at);
         if m.enrollment == "enrolled" && m.enrolled_at.is_some_and(|t| t >= since) {
-            let _g = cp.ops.lock().await;
             if app.db.machine_restore_move(&r.id, &["enrolling"], "done", None) {
                 let by = system(&m);
                 app.db.record(&event(&by, "machine.restored", &m, json!({ "restoreId": r.id, "backupId": r.backup_id, "by": r.created_by })));
@@ -671,13 +672,12 @@ pub async fn follow_up(app: &AppState, cp: &ControlPlane) {
                     super::folder::assigned(app, cp, &m, &by);
                 }
             }
-        } else if !matches!(m.state, State::Running) || at > since + e.enroll_timeout_ms + BOOT_SLACK_MS {
+        } else if !matches!(m.state, State::Running) || now() > since + e.enroll_timeout_ms + BOOT_SLACK_MS {
             let why = if m.state == State::Running {
                 format!("It didn't enroll again within {} minutes of the restore.", (e.enroll_timeout_ms + BOOT_SLACK_MS) / 60_000)
             } else {
                 format!("The machine is {}.", m.state.as_str())
             };
-            let _g = cp.ops.lock().await;
             fail_restore(app, &system(&m), &m, &r, &["enrolling"], &why);
         }
     }
