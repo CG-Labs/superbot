@@ -2157,10 +2157,22 @@ async fn send_message(State(app): State<AppState>, Extension(c): Extension<Calle
     need_bot_access(&app, &c, &by, &id, Access::Operate)?;
     let text = v["text"].as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| bad("Text is required"))?;
     let text: String = text.chars().take(100_000).collect();
-    // Answering a choice card: remember which option was picked.
-    let mut handoff = None;
     let answered = v["answer"]["messageId"].as_i64().and_then(|mid| app.db.message(mid)).filter(|m| m.bot_id == id);
     let answered_id = answered.as_ref().map(|m| m.id);
+    let waiter = answered_id.and_then(|mid| app.take_handoff(mid));
+    // Storage full (ADR 0082): nothing new is taken in for the owner until files go. A
+    // Bot still waiting on a handoff gets its answer, and a refused answer leaves its card open.
+    if waiter.is_none()
+        && let Some(bot) = app.db.bot(&id)
+        && let Some((m, limit, storage::State::Over)) = storage::check(&app, &bot.owner_id).await
+    {
+        let tier = app.tier_of(&bot.owner_id);
+        let details = json!({ "reason": "storage_limit", "owner": bot.owner_id, "tier": tier.name, "limit": limit, "used": m.used(), "partial": m.partial });
+        app.db.record(&by.event("bot.message_refused").bot(&id).outcome(Outcome::Denied).details(details));
+        return Err(ApiError(StatusCode::FORBIDDEN, storage::refusal_text(&tier.label, m.used(), limit)));
+    }
+    // Answering a choice card: remember which option was picked.
+    let mut handoff = None;
     if let (Some(mid), Some(opt)) = (answered_id, v["answer"]["option"].as_u64())
         && let Some(mut q) = answered.and_then(|m| m.question)
     {
@@ -2170,7 +2182,6 @@ async fn send_message(State(app): State<AppState>, Extension(c): Extension<Calle
         q["picked"] = json!(opt);
         app.db.set_question(mid, &q);
     }
-    let waiter = answered_id.and_then(|mid| app.take_handoff(mid));
     if let Some((mid, option)) = handoff {
         let details = json!({ "option": option, "botWasWaiting": waiter.is_some() });
         app.db.record(&by.event("handoff.answered").target("handoff", &mid.to_string()).bot(&id).details(details));
@@ -2181,15 +2192,6 @@ async fn send_message(State(app): State<AppState>, Extension(c): Extension<Calle
         app.push_message(&msg);
         let _ = tx.send(text);
         return Ok((StatusCode::ACCEPTED, Json(json!(msg))));
-    }
-    // Storage full (ADR 0082): nothing new is taken in for the owner until files go.
-    if let Some(bot) = app.db.bot(&id)
-        && let Some((m, limit, storage::State::Over)) = storage::check(&app, &bot.owner_id).await
-    {
-        let tier = app.tier_of(&bot.owner_id);
-        let details = json!({ "reason": "storage_limit", "owner": bot.owner_id, "tier": tier.name, "limit": limit, "used": m.used(), "partial": m.partial });
-        app.db.record(&by.event("bot.message_refused").bot(&id).outcome(Outcome::Denied).details(details));
-        return Err(ApiError(StatusCode::FORBIDDEN, storage::refusal_text(&tier.label, m.used(), limit)));
     }
     let mut msg = app.db.add_message(&id, "user", &text, None, false, Some("queued"));
     app.db.set_requested_by(msg.id, &by);

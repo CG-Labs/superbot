@@ -179,8 +179,8 @@ async fn a_run_that_waited_is_checked_again_when_its_turn_comes() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert!(app.slots.waiting(&y).is_some(), "Y didn't queue");
-    // X fills Ada's storage while Y waits.
-    fill(app, &w.a_id, "big.bin", 1_200_000);
+    // X fills Ada's storage while Y waits, as a run would: nothing tells the cache.
+    std::fs::write(app.workspace_for(&w.a_id).unwrap().join("big.bin"), vec![b'x'; 1_200_000]).unwrap();
     std::fs::write(dir.join(format!("go-{x}")), "").unwrap();
     wait_run(&w, &y, before).await;
     let refused = audit(w.port, &w.admin, &format!("action=bot.run_refused&bot={y}")).await;
@@ -212,6 +212,13 @@ async fn full_storage_refuses_messages_and_runs_in_plain_words() {
     assert_eq!((d["reason"].as_str(), d["owner"].as_str(), d["limit"].as_u64(), d["tier"].as_str()), (Some("storage_limit"), Some(w.a_id.as_str()), Some(1_000_000), Some("small")), "{d}");
     assert!(d["used"].as_u64().unwrap() >= 1_200_000);
     assert_eq!((refused[0]["outcome"].as_str(), refused[0]["actorId"].as_str()), (Some("denied"), Some(w.a_id.as_str())));
+
+    // A refused answer to a choice card leaves the card open, to answer later.
+    let card = app.db.add_message(&bot.id, "bot", "Which?", Some(&json!({ "options": ["A", "B"] })), false, None);
+    let answer = json!({ "text": "A", "answer": { "messageId": card.id, "option": 0 } }).to_string();
+    let (code, body) = call(w.port, "POST", &format!("/api/bots/{}/messages", bot.id), &w.a, &answer).await;
+    assert_eq!(code, 403, "{body}");
+    assert!(app.db.message(card.id).unwrap().question.unwrap()["picked"].is_null());
 
     // A routine firing is refused at the run, audited, and the Bot says why.
     let r = app.db.add_routine(&bot.id, "Digest", "0 9 * * *", "Sum up my email");
