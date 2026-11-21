@@ -326,3 +326,39 @@ async fn someone_disabled_joins_without_a_machine_and_gets_it_once_enabled() {
     let m = w.app.db.user_machine(&cy).expect("enabled, Cy gets the team's machine");
     assert!(w.app.db.team_machine(&m.id).is_some_and(|t| t.team_id == g["id"].as_str().unwrap()));
 }
+
+#[tokio::test]
+async fn a_returning_member_takes_back_the_machine_a_former_team_released() {
+    let w = world(true).await;
+    let cy = person(&w, &w.entra, "cy@example.com", true).await;
+    let (_, _, eng) = scim(w.port, &w.entra, "POST", GROUPS, json!({ "displayName": "Eng", "members": [{ "value": cy }] })).await;
+    let m = w.app.db.user_machine(&cy).unwrap();
+    scim(w.port, &w.entra, "PATCH", &format!("{GROUPS}/{}", eng["id"].as_str().unwrap()), remove(&cy)).await;
+    assert!(w.app.db.team_machine(&m.id).is_some_and(|t| t.released_at.is_some()));
+    let off = json!({ "Operations": [{ "op": "replace", "path": "active", "value": false }] });
+    assert_eq!(scim(w.port, &w.entra, "PATCH", &format!("/scim/v2/Users/{cy}"), off).await.0, 200);
+    let (_, _, ops) = scim(w.port, &w.entra, "POST", GROUPS, json!({ "displayName": "Ops", "members": [{ "value": cy }] })).await;
+    let ops = ops["id"].as_str().unwrap().to_string();
+    assert!(w.app.db.team_machine(&m.id).is_some_and(|t| t.released_at.is_some()), "disabled, the machine stays released");
+    let on = json!({ "Operations": [{ "op": "replace", "path": "active", "value": true }] });
+    assert_eq!(scim(w.port, &w.entra, "PATCH", &format!("/scim/v2/Users/{cy}"), on).await.0, 200);
+    let tm = w.app.db.team_machine(&m.id).expect("still a team machine");
+    assert_eq!((tm.team_id.as_str(), tm.released_at, tm.release_at), (ops.as_str(), None, None), "Ops took it back, so the sweep won't destroy it");
+    assert_eq!(w.app.db.user_machine(&cy).unwrap().id, m.id);
+}
+
+#[tokio::test]
+async fn new_members_join_all_together_or_not_at_all() {
+    let w = world(true).await;
+    let (ada, bea) = (person(&w, &w.entra, "ada@example.com", true).await, person(&w, &w.entra, "bea@example.com", true).await);
+    let (_, _, g) = scim(w.port, &w.entra, "POST", GROUPS, json!({ "displayName": "Eng" })).await;
+    let team = w.app.db.team(g["id"].as_str().unwrap()).unwrap();
+    let other = w.app.db.create_team("Other", None);
+    // Bea joins another team after the request was checked, before it's applied.
+    assert!(w.app.db.add_team_member(&other.id, &bea, "member", None));
+    let users = [w.app.db.user(&ada).unwrap(), w.app.db.user(&bea).unwrap()];
+    let who = crate::audit::Who::system("test");
+    assert_eq!(crate::teams::scim_reserve(&w.app, &who, &team, &users).unwrap_err().0, StatusCode::CONFLICT);
+    assert!(w.app.db.team_member(&ada).is_none(), "Ada's place was given back");
+    assert_eq!(w.app.db.team_id_of(&bea).as_deref(), Some(other.id.as_str()));
+}

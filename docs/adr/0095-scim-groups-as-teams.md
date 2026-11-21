@@ -32,7 +32,8 @@ Groups as teams is a separate switch from `SCIM`. Off, groups behave exactly as 
 
 - A member's `value` is the SCIM id of a user **the same tenant** provisioned and hasn't deleted. Anyone else (a hand-made user, another tenant's) is 400 `invalidValue`. Email or `display` never identifies a member.
 - One team per user still holds. Adding someone who is on another team, SCIM or not, is 409 `uniqueness`, with a hint to assign SuperBot only the groups that are teams. Overlapping groups (say, "All staff" and "Engineering") would otherwise make the second one win at random.
-- A request is checked whole before anything changes: one bad member and nobody is added, removed or renamed.
+- A request is checked whole before anything changes: one bad member and nobody is added, removed or renamed. The new members' places on the team are then taken together in the database, before the rename, the removals or any machine call; if one has joined another team meanwhile (an invite accepted, say), the others' places are given back and the request is a 409 that changed nothing.
+- Someone SCIM enables gets their team's machine as any joiner would: a new one, or the one a former team released, taken back so the sweep doesn't destroy it.
 
 ### Adding and removing reuse joining and leaving
 

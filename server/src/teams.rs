@@ -265,6 +265,11 @@ async fn join(app: &AppState, by: &Who, team: &Team, user: &User, role: &str, vi
             _ => conflict("They're on another team. They have to leave it first."),
         });
     }
+    joined(app, by, team, user, role, via, &tier).await
+}
+
+/// The rest of [`join`], once `user` is on `team`: `tier` is theirs from before.
+async fn joined(app: &AppState, by: &Who, team: &Team, user: &User, role: &str, via: &str, tier: &str) -> Res<Value> {
     if let Some(email) = &user.email {
         app.db.delete_team_invites_for(&team.id, email);
     }
@@ -288,7 +293,7 @@ async fn join(app: &AppState, by: &Who, team: &Team, user: &User, role: &str, vi
     }
     app.send(json!({ "type": "resync" }));
     let machine = if user.active() { provide(app, by, team, user).await } else { json!("disabled") };
-    crate::team_billing::member_changed(app, &team.id, &user.id, &tier, "joined");
+    crate::team_billing::member_changed(app, &team.id, &user.id, tier, "joined");
     let member = app.db.team_member(&user.id).ok_or_else(|| not_found("Member"))?;
     let mut v = member_view(app, &member, true);
     v["provisioned"] = machine;
@@ -444,16 +449,42 @@ pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
 
 // SCIM groups (ADR 0095): a tenant's group is a team whose members only the IdP changes.
 
-/// Adds `user` to a SCIM group's team as a member. SCIM never sets team roles.
-pub(crate) async fn scim_join(app: &AppState, by: &Who, team: &Team, user: &User) -> Res<Value> {
-    join(app, by, team, user, MEMBER, SCIM).await
+/// A SCIM group's new members, put on `team` all at once before anything else changes:
+/// if one is on another team by now, none are, and nothing's changed. Their tiers from
+/// before, for [`scim_join`]. SCIM never sets team roles.
+pub(crate) fn scim_reserve(app: &AppState, by: &Who, team: &Team, users: &[User]) -> Res<Vec<String>> {
+    let mut tiers = Vec::new();
+    for (i, u) in users.iter().enumerate() {
+        let tier = app.tier_of(&u.id).name.clone();
+        if !app.db.add_team_member(&team.id, &u.id, MEMBER, by.actor.id.as_deref()) {
+            for v in &users[..i] {
+                app.db.remove_team_member(&team.id, &v.id, false);
+            }
+            return Err(conflict(format!("{} is on another team. A person is on one team at most.", u.id)));
+        }
+        tiers.push(tier);
+    }
+    Ok(tiers)
 }
 
-/// After SCIM enables someone a group added while they were disabled: their team's machine.
+/// Undoes [`scim_reserve`] when the request fails after it.
+pub(crate) fn scim_unreserve(app: &AppState, team: &Team, users: &[User]) {
+    for u in users {
+        app.db.remove_team_member(&team.id, &u.id, false);
+    }
+}
+
+/// The rest of joining for someone [`scim_reserve`] put on `team`.
+pub(crate) async fn scim_join(app: &AppState, by: &Who, team: &Team, user: &User, tier: &str) -> Res<Value> {
+    joined(app, by, team, user, MEMBER, SCIM, tier).await
+}
+
+/// After SCIM enables someone a group added while they were disabled: their team's
+/// machine, or the one a former team released back on, as [`provide`] decides.
 pub(crate) async fn scim_enabled(app: &AppState, by: &Who, user_id: &str) {
     let (Some(m), Some(user)) = (app.db.team_member(user_id), app.db.user(user_id)) else { return };
     let Some(team) = app.db.team(&m.team_id) else { return };
-    if user.active() && app.db.user_machine(user_id).is_none_or(|x| x.state == MachineState::Destroyed) {
+    if user.active() {
         provide(app, by, &team, &user).await;
     }
 }

@@ -264,15 +264,22 @@ fn plan(app: &AppState, c: &Caller, team_id: Option<&str>, want: &Want) -> ScimR
     Ok((add, remove))
 }
 
-/// Takes `remove` off the team and adds `add`, as the IdP's group says.
-async fn apply_members(app: &AppState, c: &Caller, team: &db::Team, add: &[db::User], remove: &[String]) -> ScimRes<()> {
+/// Puts `add` on the team together, or none of them if one joined another team since
+/// [`plan`]: run before any other change, so a refused request changes nothing.
+fn reserve(app: &AppState, c: &Caller, team: &db::Team, add: &[db::User]) -> ScimRes<Vec<String>> {
+    crate::teams::scim_reserve(app, &c.who, team, add).map_err(from_api)
+}
+
+/// Takes `remove` off the team and finishes joining `add`, already [`reserve`]d.
+async fn apply_members(app: &AppState, c: &Caller, team: &db::Team, add: &[db::User], tiers: &[String], remove: &[String]) {
     for id in remove {
         crate::teams::leave_as(app, &c.who, &team.id, id, REMOVED, false).await;
     }
-    for u in add {
-        crate::teams::scim_join(app, &c.who, team, u).await.map_err(from_api)?;
+    for (u, tier) in add.iter().zip(tiers) {
+        if let Err(e) = crate::teams::scim_join(app, &c.who, team, u, tier).await {
+            crate::obs::log::log_warn!("scim: {} joined team {} without finishing: {}", u.id, team.id, e.1);
+        }
     }
-    Ok(())
 }
 
 fn need(app: &AppState, c: &Caller, id: &str) -> ScimRes<ScimGroup> {
@@ -288,8 +295,12 @@ async fn update(app: &AppState, c: &Caller, g: &ScimGroup, want: &Want) -> ScimR
         return Err(ScimError::new(StatusCode::BAD_REQUEST, Some("mutability"), "externalId can't change once set. Delete the group and provision it again."));
     }
     let (add, remove) = plan(app, c, Some(&g.team.id), want)?;
+    let tiers = reserve(app, c, &g.team, &add)?;
     if want.display_name != g.display_name || want.external_id != g.external_id {
-        app.db.save_scim_group(&c.token.tenant, &g.team.id, &want.display_name, want.external_id.as_deref()).map_err(conflict)?;
+        if let Err(e) = app.db.save_scim_group(&c.token.tenant, &g.team.id, &want.display_name, want.external_id.as_deref()) {
+            crate::teams::scim_unreserve(app, &g.team, &add);
+            return Err(conflict(e));
+        }
         let mut changes = serde_json::Map::new();
         if want.display_name != g.display_name {
             changes.insert("displayName".into(), json!({ "from": g.display_name, "to": want.display_name }));
@@ -299,7 +310,7 @@ async fn update(app: &AppState, c: &Caller, g: &ScimGroup, want: &Want) -> ScimR
         }
         app.db.record(&group_event(c, "scim.group_updated", &g.team.id, json!({ "changes": changes })));
     }
-    apply_members(app, c, &g.team, &add, &remove).await?;
+    apply_members(app, c, &g.team, &add, &tiers, &remove).await;
     need(app, c, &g.team.id)
 }
 
@@ -363,9 +374,17 @@ pub async fn create_group(State(app): State<AppState>, Extension(a): Extension<A
     }
     let (add, _) = plan(&app, &c, None, &want)?;
     let team = app.db.create_scim_team(tenant, &want.display_name, want.external_id.as_deref(), c.who.actor.id.as_deref()).map_err(conflict)?;
+    let tiers = match reserve(&app, &c, &team, &add) {
+        Ok(t) => t,
+        Err(e) => {
+            app.db.unlink_scim_group(tenant, &team.id);
+            app.db.delete_team(&team.id);
+            return Err(e);
+        }
+    };
     app.db.record(&group_event(&c, "team.created", &team.id, json!({ "name": team.name, "machines": team.machines, "via": crate::teams::SCIM })));
     app.db.record(&group_event(&c, "scim.group_created", &team.id, json!({ "displayName": want.display_name, "externalId": want.external_id, "members": add.len() })));
-    apply_members(&app, &c, &team, &add, &[]).await?;
+    apply_members(&app, &c, &team, &add, &tiers, &[]).await;
     let body = resource(&app, &base_url(&headers), &need(&app, &c, &team.id)?, true);
     let mut r = scim_json(StatusCode::CREATED, body.clone());
     if let Some(Ok(at)) = body["meta"]["location"].as_str().map(HeaderValue::from_str) {
