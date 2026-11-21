@@ -182,6 +182,65 @@ fn unhooked_runs_stop(harness: &str, bin: &str) {
     }
 }
 
+/// Fail-closed on a hook timeout, through the real Hermes (ADR 0011's gate, ADR 0075).
+/// `botctl hook` hangs far past its timeout and would then allow the call, so only
+/// Hermes killing it and failing closed (`fail_closed: true` in the managed config)
+/// keeps the call from running. botd shortens every hook timeout to `HOOK_SECS` with
+/// `SUPERBOT_TEST_HOOK_TIMEOUT_SECS` (testing mode only), so this takes seconds.
+fn hermes_hook_timeout_blocks() {
+    const HOOK_SECS: u64 = 3;
+    const HANG_SECS: u64 = 90;
+    if !wanted("hermes", "hermes") {
+        return;
+    }
+    if real() {
+        println!("SKIP hermes: the hook timeout test needs the fake model");
+        return;
+    }
+    let hang = format!("cat >/dev/null; echo $$ >>\"$(dirname \"$0\")/../proof/hook-pids\"; sleep {HANG_SECS}; exit 0");
+    let b = start_with("hermes", Some(&hang), &[("SUPERBOT_TEST_HOOK_TIMEOUT_SECS", &HOOK_SECS.to_string())]);
+    let id = call(&b, "GET", "/api/bots", Value::Null)[0]["id"].as_str().unwrap().to_string();
+    call(&b, "PUT", "/api/policy", json!({ "sandbox": false }));
+    call(&b, "PATCH", &format!("/api/bots/{id}"), json!({ "model": MODEL }));
+    let proof = std::fs::canonicalize(b.dir.join("proof")).unwrap();
+    let pids = proof.join("hook-pids");
+    let pass = |what: &str| println!("PASS hermes: {what}");
+
+    let asks = [("terminal".to_string(), prompt(&format!("touch {}", proof.join("timeout-terminal.txt").display())))]
+        .into_iter()
+        .chain(other_tools("hermes").into_iter().map(|(tool, _)| {
+            let made = proof.join(format!("timeout-{tool}.txt"));
+            (tool.to_string(), format!("{}{tool}{}<<{}>>", TOOL.0, TOOL.1, other_tool_args(tool, &made)))
+        }));
+    for (n, (tool, ask)) in asks.enumerate() {
+        let started = std::time::Instant::now();
+        let r = run(&b, &id, &ask, None, &|| {});
+        let took = started.elapsed();
+        let made = proof.join(format!("timeout-{tool}.txt"));
+        assert!(!made.exists(), "hermes: a {tool} call whose hook timed out ran (result {}): {}", r.result, r.text);
+        let hooked = read(&pids);
+        let pid = hooked.lines().nth(n).unwrap_or_else(|| panic!("hermes never ran the hook for {tool} (result {}): {}", r.result, r.text));
+        assert!(took < std::time::Duration::from_secs(HANG_SECS), "hermes: {tool} waited {took:?}, so the hook wasn't timed out");
+        assert_ne!(r.result, "unguarded", "hermes: {tool} looked unhooked: {}", r.text);
+        let told = r.text.contains(DONE) && r.text.contains("failed closed") && r.text.contains(&format!("timed out after {HOOK_SECS}s"));
+        assert!(told, "hermes: the agent wasn't told the hook timed out: {}", r.text);
+        // Hermes kills the hung hook rather than leaving it behind.
+        wait_for("the timed-out hook to be killed", std::time::Duration::from_secs(10), || {
+            let stat = read(Path::new(&format!("/proc/{pid}/stat")));
+            (stat.is_empty() || stat.rsplit_once(')').is_some_and(|(_, s)| s.trim_start().starts_with('Z'))).then_some(())
+        });
+        pass(&format!("{tool}: a hook that times out blocks the call ({took:.1?})"));
+    }
+
+    // The managed config botd wrote: the short timeout, failing closed as always.
+    let config = find(&b.dir, "config.yaml", 10).into_iter().find(|p| p.parent().is_some_and(|d| d.ends_with("hermes-managed")));
+    let config: Value = serde_json::from_str(&read(&config.expect("botd wrote no Hermes managed config"))).unwrap();
+    let hook = &config["hooks"]["pre_tool_call"][0];
+    assert_eq!((hook["timeout"].as_u64(), hook["fail_closed"].as_bool()), (Some(HOOK_SECS), Some(true)), "{config}");
+    assert_eq!(config["hooks_auto_accept"], true);
+    pass("the managed config fails closed with the short timeout");
+}
+
 /// Tools other than the shell that each harness reports through its hook and that the
 /// canary counts, with the Bot model that makes the CLI offer it (ADR 0063).
 fn other_tools(harness: &str) -> Vec<(&'static str, Option<&'static str>)> {
@@ -233,6 +292,12 @@ fn pi_hooks_hold() {
 fn hermes_hooks_hold() {
     approvals_hold("hermes", "hermes");
     unhooked_runs_stop("hermes", "hermes");
+}
+
+#[test]
+#[ignore = "needs the Hermes Agent CLI; see the harness-e2e workflow"]
+fn hermes_hook_timeout_fails_closed() {
+    hermes_hook_timeout_blocks();
 }
 
 #[test]

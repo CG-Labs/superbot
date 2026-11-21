@@ -476,22 +476,31 @@ pub const REAL_ENV_PREFIXES: [&str; 16] = [
 ];
 pub const REAL_ENV: [&str; 11] = ["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "SHELL"];
 
-/// `unhooked`: botd's own `botctl hook` allows every call without asking botd, as a
-/// hook that doesn't reach the gate would; the rest of `botctl` is the real one.
+/// A `botctl hook` that allows every call without asking botd, as a hook that doesn't
+/// reach the gate would.
+pub const UNHOOKED: &str = "cat >/dev/null; exit 0";
+
+/// `unhooked`: botd's own `botctl hook` is `UNHOOKED`; the rest of `botctl` is the real one.
 pub fn start(harness: &str, unhooked: bool) -> Botd {
+    start_with(harness, unhooked.then_some(UNHOOKED), &[])
+}
+
+/// `hook`: shell that stands in for `botctl hook`, run from `<dir>/bin` (so
+/// `"$(dirname "$0")/../proof"` is the test's proof folder). `env`: more of botd's env.
+pub fn start_with(harness: &str, hook: Option<&str>, env: &[(&str, &str)]) -> Botd {
     let dir = std::env::temp_dir().join(format!("botd-harness-e2e-{harness}-{}-{}", std::process::id(), free_port()));
     for d in ["data", "workspace", "home", "proof"] {
         std::fs::create_dir_all(dir.join(d)).unwrap();
     }
     let port = free_port();
     // botd runs the `botctl` next to it.
-    let botd = if unhooked {
+    let botd = if let Some(hook) = hook {
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         for (from, to) in [(env!("CARGO_BIN_EXE_botd"), "botd"), (env!("CARGO_BIN_EXE_botctl"), "botctl.real"), (env!("CARGO_BIN_EXE_superbot-run"), "superbot-run")] {
             std::fs::copy(from, bin.join(to)).unwrap();
         }
-        let stub = "#!/bin/sh\nif [ \"$1\" = hook ]; then cat >/dev/null; exit 0; fi\nexec \"$(dirname \"$0\")/botctl.real\" \"$@\"\n";
+        let stub = format!("#!/bin/sh\nif [ \"$1\" = hook ]; then {hook}; fi\nexec \"$(dirname \"$0\")/botctl.real\" \"$@\"\n");
         std::fs::write(bin.join("botctl"), stub).unwrap();
         std::fs::set_permissions(bin.join("botctl"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         bin.join("botd")
@@ -500,6 +509,7 @@ pub fn start(harness: &str, unhooked: bool) -> Botd {
     };
     let mut cmd = Command::new(botd);
     cmd.env_clear().current_dir(&dir).env("PATH", std::env::var("PATH").unwrap_or_default());
+    cmd.envs(env.iter().copied());
     let model = if real() {
         for (k, v) in std::env::vars() {
             if REAL_ENV.contains(&k.as_str()) || REAL_ENV_PREFIXES.iter().any(|p| k.starts_with(p)) {
