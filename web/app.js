@@ -1307,10 +1307,10 @@ $("inc-new").addEventListener("submit", async (e) => {
     $("inc-new").reset();
     for (const i of document.querySelectorAll("#inc-components input")) i.checked = false;
     notice("Posted. It's on the status page now.", false);
+    loadStatus();
   } catch (err) {
     fail(err);
   }
-  loadStatus();
 });
 
 $("incidents-list").addEventListener("submit", async (e) => {
@@ -1319,14 +1319,20 @@ $("incidents-list").addEventListener("submit", async (e) => {
   e.preventDefault();
   const id = f.closest("[data-incident]").dataset.incident;
   const current = incidents.incidents.find((i) => i.id === id);
+  // A failed post keeps the form as typed, so no reload then. A saved impact change is
+  // remembered so a retry doesn't send it again.
   try {
-    if (current && f.impact.value !== current.impact) await api("PATCH", `/api/status/incidents/${key(id)}`, { impact: f.impact.value });
+    if (current && f.impact.value !== current.impact) {
+      await api("PATCH", `/api/status/incidents/${key(id)}`, { impact: f.impact.value });
+      current.impact = f.impact.value;
+    }
     await api("POST", `/api/status/incidents/${key(id)}/updates`, { state: f.state.value, body: f.body.value });
     notice("Update posted.", false);
+    loadStatus();
   } catch (err) {
     fail(err);
+    if (err.status === 404) loadStatus();
   }
-  loadStatus();
 });
 
 $("incidents-list").addEventListener("click", async (e) => {
@@ -1336,10 +1342,11 @@ $("incidents-list").addEventListener("click", async (e) => {
   if (!confirm("Delete this incident and its updates from the status page? Resolve it instead if it really happened.")) return;
   try {
     await api("DELETE", `/api/status/incidents/${key(id)}`);
+    loadStatus();
   } catch (err) {
     fail(err);
+    if (err.status === 404) loadStatus();
   }
-  loadStatus();
 });
 
 // Tabs, from the address bar's #fragment so a reload keeps your place.
