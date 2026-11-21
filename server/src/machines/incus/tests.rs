@@ -74,7 +74,7 @@ fn egress_keeps_containers_off_private_and_host_addresses() {
     assert_eq!(span("fe80::/10").map(|s| s.0), Some(true));
     let edge = egress(&["10.0.0.0/8".into()], Some(("10.0.0.0".parse().unwrap(), 1)));
     assert_eq!(edge[0].destination, "10.0.0.1-10.255.255.255");
-    assert_eq!(edge.iter().find(|r| r.destination_port != "").unwrap().destination_port, "2-65535");
+    assert_eq!(edge.iter().find(|r| !r.destination_port.is_empty()).unwrap().destination_port, "2-65535");
 }
 
 #[test]

@@ -614,9 +614,11 @@ fn machine_request(args: &[&str]) -> Result<(&'static str, String), String> {
     })
 }
 
+type Request = (&'static str, String, Option<String>);
+
 /// `botctl machine list|show|request|suspend|resume|resize|destroy|substrate|reconcile`:
 /// the machine itself (ADR 0025, ADR 0065). None: not one of these.
-fn lifecycle_request(args: &[&str]) -> Option<Result<(&'static str, String, Option<String>), String>> {
+fn lifecycle_request(args: &[&str]) -> Option<Result<Request, String>> {
     let at = |user: &str, rest: &str| format!("/api/users/{}/machine{rest}", encode(user));
     Some(Ok(match args {
         ["list"] => ("GET", "/api/machines".into(), None),
