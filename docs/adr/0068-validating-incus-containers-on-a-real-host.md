@@ -21,7 +21,7 @@ The test runs on free GitHub-hosted runners and needs no secrets or paid service
 
 - `deploy/incus-e2e-host.sh` turns a throwaway Ubuntu host into an Incus host as the operator guide describes: Incus from Zabbly or Ubuntu's own package, a btrfs pool (so disk sizes are enforced), the `superbot0` bridge, the restricted `superbot` project, the API on the bridge's address, and a trusted client certificate. It writes the `INCUS_*` settings to an env file. It refuses to run unless `SUPERBOT_INCUS_E2E_THROWAWAY=1`.
 - `machines_incus_e2e_tests` is one ignored test. It runs only with `SUPERBOT_INCUS_E2E=1`. It builds botd's control plane from those settings, the same way `main` does, and drives the real Incus provider, the reconciler and the real `superbot-machine` agent.
-- The `incus-e2e` workflow runs it against Zabbly's stable Incus and Ubuntu 24.04's Incus 6.0 LTS. It runs when the machines code changes, weekly, and by hand. Failures dump the instances (without their user data), cloud-init's and the agent's logs, the ACLs and Incus's journal.
+- The `incus-e2e` workflow runs it against Zabbly's stable Incus and Zabbly's 6.0 LTS. Against Ubuntu 24.04's own Incus 6.0.0, it checks that the preflight check refuses the host and names why. It runs when the machines code changes, weekly, and by hand. Failures dump the instances (without their user data), cloud-init's and the agent's logs, the ACLs and Incus's journal.
 
 The test sends the same calls to Incus that botd does. It also uses a test-only `exec` to look inside containers, which botd never does.
 
@@ -41,12 +41,12 @@ For two users' containers, A and B:
 ### What the real host showed
 
 1. **Every create was refused.** A restricted project treats `limits.memory.swap` as a low-level option (`restricted.containers.lowlevel=block`), so Incus refused every container. botd no longer sets it. The stand-in now refuses low-level keys as Incus does. Memory stays hard-limited (`limits.memory.enforce=hard`). Whether containers swap is the host's choice: give the host no swap, or accept that a container at its limit can swap.
-2. **The token was left inside the container.** The first boot deleted `user-data.txt` and its `.i` copy and the NoCloud seed. cloud-init also writes the merged config to `/var/lib/cloud/instance/cloud-config.txt` and caches it in `obj.pkl`, and both held the token. The first boot now deletes them too, on Incus and Linode. On later boots cloud-init finds no seed and stays disabled, and the agent keeps running. This removes the `obj.pkl` residue [ADR 0035](0035-machine-firewall-auto-enroll.md) recorded.
-3. **Host-to-container traffic is filtered.** ADR 0065 left this unverified. The ACL's default inbound drop also applies to traffic that starts on the host: the host reaches only the agent port from the gateway.
-4. **Neighbours can't ping each other.** ADR 0065 said ICMP isn't filtered. Port isolation blocks all traffic between containers, ICMP included. Containers can still ping the gateway and the internet.
-5. **Everything else matched the stand-in:**
-   - the API extensions the preflight check expects;
-   - the NoCloud seed working with `security.guestapi=false`;
+2. **The preflight check passed a host that can't make containers.** Ubuntu 24.04's own Incus is 6.0.0. It has every extension the check asked for but refuses `security.acls.default.*` on a container's NIC, so every create fails. Those keys need the `network_bridge_acl_devices` extension: Incus 6.9, or 6.0.4 on the 6.0 LTS. The check now requires it and names it when it is missing. The guide says to install Incus from Zabbly, not Ubuntu's archive.
+3. **The token was left inside the container.** The first boot deleted `user-data.txt` and its `.i` copy and the NoCloud seed. cloud-init also writes the merged config to `/var/lib/cloud/instance/cloud-config.txt` and caches it in `obj.pkl`, and both held the token. The first boot now deletes them too, on Incus and Linode. On later boots cloud-init finds no seed and stays disabled, and the agent keeps running. This removes the `obj.pkl` residue [ADR 0035](0035-machine-firewall-auto-enroll.md) recorded.
+4. **Host-to-container traffic is filtered.** ADR 0065 left this unverified. The ACL's default inbound drop also applies to traffic that starts on the host: the host reaches only the agent port from the gateway.
+5. **Neighbours can't ping each other.** ADR 0065 said ICMP isn't filtered. Port isolation blocks all traffic between containers, ICMP included. Containers can still ping the gateway and the internet.
+6. **Everything else matched the stand-in:**
+      - the NoCloud seed working with `security.guestapi=false`;
    - DHCP and DNS on the bridge despite the private-range deny;
    - live resize of a running container on btrfs;
    - ETag'd PUTs and PATCHes;

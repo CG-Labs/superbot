@@ -6,7 +6,7 @@ These steps change only the Incus host you run them on. Placeholders look like `
 
 ## 1. The host
 
-Use a dedicated Linux host for SuperBot containers, with a current kernel and Incus 6 or later. Choose a storage pool driver that enforces disk sizes: zfs, btrfs or lvm. `dir` does not enforce sizes, and the preflight check flags it.
+Use a dedicated Linux host for SuperBot containers, with a current kernel and Incus 6.9 or later, or 6.0.4 or later on the 6.0 LTS. Older releases can't put network ACLs on a container's NIC, and the preflight check says so. Ubuntu 24.04's own `incus` package is 6.0.0, so install Incus from [Zabbly](https://github.com/zabbly/incus) (stable, or an LTS channel) instead. Choose a storage pool driver that enforces disk sizes: zfs, btrfs or lvm. `dir` does not enforce sizes, and the preflight check flags it.
 
 The kernel needs nftables' bridge family. Without it, Incus can't apply network ACLs or NIC filters, and creates fail. Check with `sudo nft add table bridge sbcheck && sudo nft delete table bridge sbcheck`. Stock Ubuntu has it. Some minimal or nested kernels don't.
 
@@ -107,7 +107,7 @@ Once it has enrolled, the next reconcile removes its enrollment user data from t
 An end-to-end test runs botd's Incus provider against a real Incus host ([ADR 0068](../adr/0068-validating-incus-containers-on-a-real-host.md)). The `incus-e2e` CI job runs it on GitHub's runners. To run it yourself, use a throwaway Ubuntu 24.04 VM, because the script reconfigures Incus on the host it runs on:
 
 ```bash
-sudo SUPERBOT_INCUS_E2E_THROWAWAY=1 deploy/incus-e2e-host.sh /tmp/incus-e2e   # INCUS_SOURCE=ubuntu for Ubuntu's own package
+sudo SUPERBOT_INCUS_E2E_THROWAWAY=1 deploy/incus-e2e-host.sh /tmp/incus-e2e   # INCUS_SOURCE=zabbly-lts-6.0 for the LTS
 cargo build --bin superbot-machine
 set -a; . /tmp/incus-e2e/incus-e2e.env; set +a
 cargo test --bin botd -- --ignored --exact --nocapture \

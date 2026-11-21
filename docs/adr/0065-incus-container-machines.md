@@ -134,7 +134,7 @@ There is no migration between substrates in this slice.
 
 `GET /api/machines/substrate` (admin) shows the provider, the substrate, each tier's plan with its CPUs, memory, disk and process limit, the regions, the firewall, and the provider's settings. For Incus, the settings include the pinned certificate fingerprint, the denied ranges, the exact outbound rules and the isolation summary. `?check=true` asks the host:
 
-- that botd is trusted, with the API extensions it needs;
+- that botd is trusted, with the API extensions it needs (including `network_bridge_acl_devices`: Incus 6.9, or 6.0.4 on the LTS, [ADR 0068](0068-validating-incus-containers-on-a-real-host.md));
 - that the project is restricted;
 - that the network is a managed bridge;
 - that the storage pool enforces sizes.
