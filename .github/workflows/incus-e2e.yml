@@ -2,14 +2,16 @@ name: incus-e2e
 
 # Per-user containers (ADR 0065, 0067) on a real Incus host, not the stand-in: the
 # runner becomes the Incus host and botd's tests make, enroll, isolate, suspend,
-# resume, resize, rebuild and destroy real containers (ADR 0069). Runs when the
-# machines code changes, weekly, and by hand.
+# resume, resize, rebuild and destroy real containers (ADR 0069), and back one up to
+# MinIO on loopback and restore it (ADR 0070). Runs when the machines code changes,
+# weekly, and by hand.
 
 on:
   pull_request:
     paths:
       - 'server/src/machines/**'
       - 'server/src/machines_incus_e2e_tests.rs'
+      - 'server/src/machines_backup_tests.rs'
       - 'server/src/bin/superbot-machine.rs'
       - 'deploy/incus-e2e-host.sh'
       - 'Cargo.lock'
@@ -19,6 +21,7 @@ on:
     paths:
       - 'server/src/machines/**'
       - 'server/src/machines_incus_e2e_tests.rs'
+      - 'server/src/machines_backup_tests.rs'
       - 'server/src/bin/superbot-machine.rs'
       - 'deploy/incus-e2e-host.sh'
       - 'Cargo.lock'
@@ -41,7 +44,7 @@ jobs:
   containers:
     name: Containers on Incus (${{ matrix.incus }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -69,7 +72,28 @@ jobs:
           test -x "$(cat /tmp/test-bin)"
       - name: Make the runner an Incus host
         run: sudo SUPERBOT_INCUS_E2E_THROWAWAY=1 INCUS_SOURCE=${{ matrix.incus }} deploy/incus-e2e-host.sh "$RUNNER_TEMP/incus-e2e"
-      - name: Containers enroll, stay apart, and follow the lifecycle
+      # Docker Hub's minio/minio was withdrawn; quay.io still serves the pinned release.
+      - name: An S3-compatible store on loopback (MinIO), for backups
+        if: matrix.expect != 'too-old'
+        run: |
+          set -euo pipefail
+          key="e2e$(openssl rand -hex 8)"; secret="$(openssl rand -hex 24)"
+          echo "::add-mask::$secret"
+          docker run -d --name minio --network host \
+            -e MINIO_ROOT_USER="$key" -e MINIO_ROOT_PASSWORD="$secret" \
+            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data --address 127.0.0.1:9000
+          for _ in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:9000/minio/health/ready >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:9000/minio/health/ready
+          {
+            echo "SUPERBOT_INCUS_E2E_S3_ENDPOINT=http://127.0.0.1:9000"
+            echo "SUPERBOT_INCUS_E2E_S3_BUCKET=superbot-e2e"
+            echo "MACHINE_BACKUP_S3_ACCESS_KEY_ID=$key"
+            echo "MACHINE_BACKUP_S3_SECRET_ACCESS_KEY=$secret"
+          } >>"$GITHUB_ENV"
+      - name: Containers enroll, stay apart, follow the lifecycle, and are backed up and restored
         env:
           SUPERBOT_INCUS_E2E_EXPECT: ${{ matrix.expect }}
         run: |
@@ -91,3 +115,4 @@ jobs:
           done
           sudo incus network acl list --project superbot || true
           sudo journalctl -u incus --no-pager | tail -60 || true
+          docker logs minio 2>&1 | tail -40 || true
