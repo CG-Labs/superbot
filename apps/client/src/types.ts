@@ -93,7 +93,27 @@ export interface TierView extends TierBadge {
     machineType?: string | null;
     /** Bot runs at once on this plan's machines; more wait their turn (ADR 0073). */
     concurrentRuns?: number | null;
+    /** Storage for one user's files, in MB of 1,000,000 bytes (ADR 0082). */
+    maxStorageMb?: number | null;
   };
+}
+
+/** A user's storage against their plan's cap (ADR 0082). Sizes in bytes; null until measured. */
+export interface StorageUsage {
+  used: number | null;
+  files?: number | null;
+  data?: number | null;
+  limit: number | null;
+  limitMb?: number | null;
+  percent: number | null;
+  state: "ok" | "warning" | "over" | null;
+  /** The percentage from which people are warned. */
+  warnAt: number;
+  /** Some folders couldn't be read: the number is a lower bound. */
+  partial: boolean;
+  measuredAt: number | null;
+  /** Their Bots run on their own machine, whose disk this doesn't count. */
+  onMachine?: boolean;
 }
 
 /** A plan with what the user has used of it (`/api/me/tier`, and admins' user views). */
@@ -109,6 +129,8 @@ export interface PlanUsage extends TierView {
     periodStart?: number;
     periodEnd?: number;
     periodSource?: "subscription" | "calendar";
+    /** Missing from servers before ADR 0082. */
+    storage?: StorageUsage;
   };
 }
 /** Model tokens over some runs, as harnesses report them (ADR 0050). */
@@ -130,6 +152,8 @@ export interface MyUsage {
   period: { key: string; start: number; end: number; source: "subscription" | "calendar" };
   tokens: TokenTotals & { limit: number | null };
   runs: { used: number; limit: number | null };
+  /** Missing from servers before ADR 0082. */
+  storage?: StorageUsage;
   /** `name` is null for a Bot that was deleted, or that you no longer own. */
   byBot: (TokenTotals & { bot: string; name: string | null })[];
   /** Only when your plan lets you pick models (ADR 0033), or for admins. */

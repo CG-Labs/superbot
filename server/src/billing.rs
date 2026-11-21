@@ -564,6 +564,7 @@ pub async fn info(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>
         Ok(u) => u,
         Err(r) => return r,
     };
+    crate::storage::warm(&app, std::slice::from_ref(&u.id)).await;
     let current = app.tier_of(&u.id).name.clone();
     let plans: Vec<Value> = app
         .tiers()

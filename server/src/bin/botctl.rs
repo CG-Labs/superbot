@@ -943,6 +943,9 @@ fn period_summary(v: &Value) -> String {
         out += &format!("; {} reported no tokens", n(&t["unreportedRuns"]));
     }
     out.push('\n');
+    if let Some(s) = storage_text(&v["storage"]) {
+        out += &format!("Storage {s}\n");
+    }
     for b in v["byBot"].as_array().into_iter().flatten() {
         let name = b["name"].as_str().unwrap_or("(deleted or not yours now)");
         out += &format!("  Bot {name} ({}): {} tokens in {} runs\n", b["bot"].as_str().unwrap_or_default(), n(&b["total"]), n(&b["runs"]));
@@ -951,6 +954,23 @@ fn period_summary(v: &Value) -> String {
         out += &format!("  Model {}: {} tokens in {} runs\n", m["model"].as_str().unwrap_or("(not named)"), n(&m["total"]), n(&m["runs"]));
     }
     out
+}
+
+/// Storage used against the plan's cap in MB (ADR 0082), or None when not measured.
+fn storage_text(s: &Value) -> Option<String> {
+    let used = s["used"].as_u64()?;
+    let mb = |b: u64| format!("{:.1}", b as f64 / 1_000_000.0);
+    let limit = s["limitMb"].as_u64().map_or("unlimited".to_string(), |l| format!("{l} MB"));
+    let mut out = format!("{} MB/{limit}", mb(used));
+    match s["state"].as_str() {
+        Some("warning") => out += " (nearly full)",
+        Some("over") => out += " (full)",
+        _ => {}
+    }
+    if s["partial"] == true {
+        out += " (at least: some folders couldn't be read)";
+    }
+    Some(out)
 }
 
 fn usage_summary(v: &Value) -> String {
@@ -977,6 +997,9 @@ fn usage_summary(v: &Value) -> String {
             of(&use_["routineRuns"], &p["limits"]["dailyRoutineRuns"]),
             use_["day"].as_str().unwrap_or_default(),
         );
+        if let Some(s) = storage_text(&use_["storage"]) {
+            line += &format!("; storage {s}");
+        }
         let allowed = p["limits"]["machineType"].as_str();
         match (&u["machine"], allowed) {
             (Value::Null, Some(t)) => line += &format!("; machine size {t}, none yet"),
@@ -1508,6 +1531,14 @@ mod tests {
         assert!(out.contains("ada@example.com: Starter plan; Bots 3/2; runs 12/300 and tokens 4500/unlimited in 2026-11; routine runs 4/24 on 2026-11-20; machine g6-standard-2 (running), plan size g6-standard-1; Stripe active; customer cus_123; OVER: bots, machineType\n"), "{out}");
         assert!(usage_summary(&json!({ "billing": true, "users": [] })).starts_with("Billing: Stripe webhook on, checkout off.\n"));
         assert!(out.contains("Owner: Self-host plan; Bots 1/unlimited; runs 0/unlimited and tokens 0/unlimited in 2026-11; routine runs 0/unlimited on 2026-11-20\n"), "{out}");
+    }
+
+    #[test]
+    fn storage_shows_against_the_plan() {
+        assert_eq!(storage_text(&json!({ "used": null, "limitMb": 5 })), None);
+        assert_eq!(storage_text(&json!({ "used": 940_000, "limitMb": 1, "state": "warning" })).unwrap(), "0.9 MB/1 MB (nearly full)");
+        assert_eq!(storage_text(&json!({ "used": 12_345_678, "limitMb": null, "state": "ok" })).unwrap(), "12.3 MB/unlimited");
+        assert_eq!(storage_text(&json!({ "used": 2_000_000, "limitMb": 1, "state": "over", "partial": true })).unwrap(), "2.0 MB/1 MB (full) (at least: some folders couldn't be read)");
     }
 
     #[test]

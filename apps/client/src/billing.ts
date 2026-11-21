@@ -1,5 +1,6 @@
 import { Linking, Platform } from "react-native";
 import type { SuperBotApi } from "./api";
+import { size } from "./plan";
 import type { BillingView, TierView } from "./types";
 
 /** What the Plan screen says while billing is off: SuperBot is in testing (ADR 0068). */
@@ -36,6 +37,7 @@ export function limitSummary(limits: TierView["limits"]): string[] {
   if (limits.monthlyTokens != null) lines.splice(2, 0, n(limits.monthlyTokens, "model token a month", "model tokens a month", ""));
   if (limits.machineType) lines.push(`Machine: ${limits.machineType}`);
   if (limits.concurrentRuns != null) lines.push(n(limits.concurrentRuns, "task at once", "tasks at once", ""));
+  if (limits.maxStorageMb != null) lines.push(`${size(limits.maxStorageMb * 1e6)} of storage`);
   return lines;
 }
 
