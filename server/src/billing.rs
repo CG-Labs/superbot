@@ -8,7 +8,9 @@
 //! names its user in its metadata (`superbot_user_id`, set by the checkout), or through
 //! its customer, linked to the user when their checkout completes. With
 //! `STRIPE_METER_EVENT` too (off by default), botd reports each run's model tokens to
-//! that Stripe meter (ADR 0050); it never does without it.
+//! that Stripe meter (ADR 0050); it never does without it. A team's plan, paid for by
+//! the team for everyone on it, lives in `team_billing` (ADR 0093); events for it pass
+//! through here first, and a team plan overrides its members' own.
 
 use crate::audit::{Actor, Outcome, Who};
 use crate::db::{Applied, Linked, Subscription};

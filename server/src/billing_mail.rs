@@ -11,7 +11,9 @@
 //! emails are queued in the same transaction that records the event. A sender sends
 //! what's queued, tries a failed send again with a backoff, and audits every send,
 //! skip and failure. Emails say what changed and link to the Plan screen. They never
-//! carry a Stripe id, a price, a portal link or anything else from the provider.
+//! carry a Stripe id, a price, a portal link or anything else from the provider. A
+//! team plan's emails (ADR 0093) go to each of the team's owners and admins instead,
+//! and link to the Team screen.
 
 use crate::audit::{Actor, Outcome, Who};
 use crate::db::{Applied, Change, Subscription};

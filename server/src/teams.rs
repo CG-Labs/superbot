@@ -9,7 +9,9 @@
 //! What a team changes: sharing. A shared Bot, and a grant, reach only its owner's team
 //! (`acl::reaches`); with TEAMS=on, people in no team share with nobody. So leaving a
 //! team is losing access, and ADR 0052's and 0066's offboarding removes the leaver from
-//! teammates' machines and accounts as it does for any other loss of access.
+//! teammates' machines and accounts as it does for any other loss of access. While a
+//! team pays for a plan (ADR 0093, `team_billing`), joining or leaving also moves the
+//! member's tier and Stripe's seat count, and the team can't be emptied or deleted.
 //!
 //! Team owners and admins see each teammate's machine (its state, size, enrollment and
 //! placement) and give them one, suspend or resume it. That is all: they get no Bot,
