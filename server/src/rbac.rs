@@ -115,6 +115,11 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         ("GET", ["machine", "harness-logins"]) => Account,
         ("POST", ["machine", "harness-login"] | ["machine", "harness-login", _, "input"]) => Write,
         ("DELETE", ["machine", "harness-login" | "harness-logins", _]) => Write,
+        // Your own logins on a teammate's machine (ADR 0062). Handlers refuse Bots and
+        // anyone who isn't the owner's teammate.
+        ("GET", ["machine", "teammate", _, "harness-logins"]) => Account,
+        ("POST", ["machine", "teammate", _, "harness-login"] | ["machine", "teammate", _, "harness-login", _, "input"]) => Write,
+        ("DELETE", ["machine", "teammate", _, "harness-login" | "harness-logins", _]) => Write,
         // Your own secrets (ADR 0029). Handlers refuse Bots; anyone else's are under `users`.
         ("GET", ["me", "secrets"]) => Read,
         // Your own plan (ADR 0033). Every tier with its models is `tiers`, for admins.
@@ -305,6 +310,8 @@ mod tests {
             ("DELETE", "/api/users/u1/machine/harness-login/l1", Perm::Admin),
             ("GET", "/api/users/u1/machine/harness-logins", Perm::Admin),
             ("DELETE", "/api/users/u1/machine/harness-logins/claude", Perm::Admin),
+            ("GET", "/api/users/u1/machine/teammates/u2/harness-logins", Perm::Admin),
+            ("DELETE", "/api/users/u1/machine/teammates/u2/harness-logins/claude", Perm::Admin),
             ("GET", "/api/users/u1/machine/folder-sync", Perm::Admin),
             ("POST", "/api/users/u1/machine/folder-sync", Perm::Admin),
             ("GET", "/api/users/u1/machine/teammates", Perm::Admin),
@@ -316,6 +323,14 @@ mod tests {
             ("DELETE", "/api/machine/harness-login/l1", Perm::Write),
             ("DELETE", "/api/machine/harness-logins/claude", Perm::Write),
             ("PUT", "/api/machine/harness-login", Perm::Admin),
+            ("GET", "/api/machine/teammate/u1/harness-logins", Perm::Account),
+            ("POST", "/api/machine/teammate/u1/harness-login", Perm::Write),
+            ("POST", "/api/machine/teammate/u1/harness-login/l1/input", Perm::Write),
+            ("DELETE", "/api/machine/teammate/u1/harness-login/l1", Perm::Write),
+            ("DELETE", "/api/machine/teammate/u1/harness-logins/claude", Perm::Write),
+            ("PUT", "/api/machine/teammate/u1/harness-login", Perm::Admin),
+            ("GET", "/api/machine/teammate/u1", Perm::Admin),
+            ("GET", "/api/machine/teammate//harness-logins", Perm::Admin),
             ("POST", "/api/machine/folder-sync", Perm::Admin),
             ("POST", "/api/auth/logout", Perm::Account),
             ("GET", "/", Perm::Read),

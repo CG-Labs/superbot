@@ -50,6 +50,9 @@ export interface BotView {
   /** "isolated": runs for anyone but its owner get their access and the server's keys,
    *  never the owner's own. Absent: it acts as its owner for everyone. */
   sharedBots?: "isolated";
+  /** True when teammates log in its harness with their own account on its owner's
+   *  machine (ADR 0062): their runs there never use the owner's login. */
+  teammateLogins?: boolean;
   /** The owner's plan (ADR 0033). On a managed plan the server picks the model and
    *  sends `model` and `effort` only to admins. */
   tier?: TierBadge;
@@ -540,3 +543,32 @@ export interface ServerConfig {
   password?: string;
   cookie?: boolean;
 }
+/** A harness login, as one person's runs on a machine see it (ADR 0041, 0062). */
+export type HarnessLoginState = "logged_in" | "logged_out" | "logging_in";
+
+export interface TeammateHarnessLogin {
+  state: HarnessLoginState;
+  /** When the login was saved (Unix ms), if there is one. */
+  since?: number | null;
+  /** A server-wide key logs your runs in without a login of your own. */
+  serverKey: boolean;
+}
+
+/** Your own harness logins on a teammate's machine (ADR 0062). */
+export interface TeammateLoginsView {
+  machineId: string;
+  owner: { id: string; name: string | null } | null;
+  forUser: string;
+  logins: "on";
+  /** You have your own user on the machine yet. */
+  hasUser: boolean;
+  harnesses: Record<string, TeammateHarnessLogin>;
+}
+
+/** What a running login sends, one per line. */
+export type LoginEvent =
+  | { type: "started"; loginId: string }
+  | { type: "output"; text: string }
+  | { type: "ping" }
+  | { type: "exit"; success: boolean; status: string; loggedIn: boolean }
+  | { type: "error"; message: string };

@@ -8,10 +8,16 @@
 //!
 //! Only harnesses with a `machine_login` (Claude Code, Codex) have one. Pi and Hermes
 //! keep using API keys from secrets, as on this server.
+//!
+//! With teammates' own users on (MACHINE_TEAMMATE_USERS, ADR 0048), a teammate who can
+//! run one of the owner's Bots logs in with their own account too (ADR 0062): the agent
+//! runs the login as the teammate's OS user, so it lands in their home there, which
+//! neither the owner's Bots nor other teammates can open. Their runs use it; the owner's
+//! never do, and a teammate's run never uses the owner's.
 
 use super::enroll::{self, Enrollment, take_lines};
 use super::route::{self, Refusal};
-use super::wire::{self, Heartbeat, LoginEvent, LoginRequest};
+use super::wire::{self, Heartbeat, LoginEvent, LoginRequest, TeammateReply};
 use super::{ControlPlane, State, event};
 use crate::adapters::MachineLogin;
 use crate::audit::{Outcome, Who};
@@ -38,9 +44,12 @@ pub const OFF: &str = "Harness logins on machines are off. Set MACHINE_HARNESS_L
 /// A login running on a machine, by its id.
 #[derive(Clone, Debug)]
 pub struct Session {
+    /// The machine's owner.
     pub user_id: String,
     pub machine_id: String,
     pub harness: String,
+    /// The teammate whose own login it is (ADR 0062); None: the owner's.
+    pub for_user: Option<String>,
 }
 
 #[derive(Default)]
@@ -51,8 +60,13 @@ impl Sessions {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn get(&self, id: &str, user_id: &str) -> Option<Session> {
-        self.lock().get(id).filter(|s| s.user_id == user_id).cloned()
+    /// The login `id`, only if it's on `user_id`'s machine and for `for_user` (None: the
+    /// owner): nobody types into, or stops, someone else's.
+    fn get(&self, id: &str, user_id: &str, for_user: Option<&str>) -> Option<Session> {
+        self.lock()
+            .get(id)
+            .filter(|s| s.user_id == user_id && s.for_user.as_deref() == for_user)
+            .cloned()
     }
 }
 
@@ -100,11 +114,28 @@ pub fn check_run(e: &Enrollment, hb: &Heartbeat, owner: Option<&str>, bin: &str)
     }
 }
 
+/// Whether the agent can keep teammates' own logins (ADR 0062).
+fn keeps_teammate_logins(hb: &Heartbeat) -> bool {
+    hb.can.iter().any(|c| c == wire::CAN_TEAMMATE_LOGINS)
+}
+
 /// The same, for a teammate's run as their own user (ADR 0048): the machine's logins
-/// live in the Bots' home, which that user can't read, so only a server-wide key does.
-pub fn check_teammate_run(bin: &str) -> Result<(), Refusal> {
+/// live in the Bots' home, which that user can't read. A server-wide key does. So does
+/// the teammate's own login in their home there (ADR 0062), when logins are on and the
+/// agent can keep one: `check_teammate_login` checks it once their user answers.
+pub fn check_teammate_run(e: &Enrollment, hb: &Heartbeat, bin: &str) -> Result<(), Refusal> {
     match recipe(bin) {
-        Some(r) if !keyed(None, &r) => Err(Refusal::NoTeammateKey(bin.into())),
+        Some(r) if !keyed(None, &r) && !(e.logins && keeps_teammate_logins(hb)) => Err(Refusal::NoTeammateKey(bin.into())),
+        _ => Ok(()),
+    }
+}
+
+/// Whether a teammate's run of `bin` may start, from their user's answer: a server-wide
+/// key, or their own login there. The owner's login never counts.
+pub fn check_teammate_login(bin: &str, reply: &TeammateReply) -> Result<(), Refusal> {
+    let theirs = reply.logins.get(bin).is_some_and(|l| l.state == wire::LOGGED_IN);
+    match recipe(bin) {
+        Some(r) if !keyed(None, &r) && !theirs => Err(Refusal::TeammateNotLoggedIn(bin.into())),
         _ => Ok(()),
     }
 }
@@ -207,13 +238,18 @@ pub struct StartBody {
 /// Starts the login on the user's machine and streams what it shows back as JSON
 /// lines (`LoginEvent`s), the first naming the login for `input`. If the caller goes
 /// away, the login there is stopped.
-async fn start(app: AppState, by: Who, u: User, harness: String) -> Res<Response> {
+async fn start(app: AppState, by: Who, u: User, teammate: Option<String>, harness: String) -> Res<Response> {
     let e = need_on(&app)?;
     let r = need_recipe(&harness)?;
     let m = ready_machine(&app, &u)?;
     let hb = heartbeat(&app, &e, &m).await?;
-    if hb.logins.get(&harness).is_some_and(|l| l.state == wire::LOGGING_IN) {
-        return Err(conflict(format!("A {harness} login is already running there.")));
+    match &teammate {
+        // The agent refuses a second login of theirs for the same harness.
+        Some(_) => need_teammate_logins(&e, &hb)?,
+        None if hb.logins.get(&harness).is_some_and(|l| l.state == wire::LOGGING_IN) => {
+            return Err(conflict(format!("A {harness} login is already running there.")));
+        }
+        None => {}
     }
     let address = m.ipv4.clone().ok_or_else(|| conflict("The machine has no address yet."))?;
     let id = format!("l{}", crate::random_hex(8));
@@ -223,12 +259,14 @@ async fn start(app: AppState, by: Who, u: User, harness: String) -> Res<Response
         args: r.args.iter().map(|a| a.to_string()).collect(),
         files: r.files.iter().map(|f| f.to_string()).collect(),
         timeout_secs: LOGIN_SECS,
+        for_user: teammate.clone(),
     };
     let details = {
-        let (harness, id) = (harness.clone(), id.clone());
+        let (harness, id, whose) = (harness.clone(), id.clone(), whose(teammate.as_deref()));
         move |extra: Value| {
             let mut d = json!({ "harness": harness, "loginId": id });
-            if let (Some(d), Value::Object(x)) = (d.as_object_mut(), extra) {
+            if let (Some(d), Value::Object(w), Value::Object(x)) = (d.as_object_mut(), whose.clone(), extra) {
+                d.extend(w);
                 d.extend(x);
             }
             d
@@ -240,6 +278,7 @@ async fn start(app: AppState, by: Who, u: User, harness: String) -> Res<Response
             user_id: u.id.clone(),
             machine_id: m.id.clone(),
             harness: harness.clone(),
+            for_user: teammate.clone(),
         },
     );
     app.db.record(&event(&by, "machine.harness_login_started", &m, details(json!({}))));
@@ -340,9 +379,9 @@ pub struct InputBody {
 }
 
 /// Types a line into a running login. What was typed is never kept or audited.
-async fn input(app: AppState, by: Who, u: User, id: String, text: String) -> Res<StatusCode> {
+async fn input(app: AppState, by: Who, u: User, teammate: Option<String>, id: String, text: String) -> Res<StatusCode> {
     let e = need_on(&app)?;
-    let s = e.sessions.get(&id, &u.id).ok_or_else(|| crate::not_found("Login"))?;
+    let s = e.sessions.get(&id, &u.id, teammate.as_deref()).ok_or_else(|| crate::not_found("Login"))?;
     let m = app.db.machine(&s.machine_id).ok_or_else(|| crate::not_found("Machine"))?;
     let path = format!("/v1/logins/{id}/input");
     let (code, reply) = e
@@ -352,13 +391,14 @@ async fn input(app: AppState, by: Who, u: User, id: String, text: String) -> Res
     if !(200..300).contains(&code) {
         return Err(agent_error(code, &reply));
     }
-    app.db.record(&event(&by, "machine.harness_login_input", &m, json!({ "harness": s.harness, "loginId": id, "chars": text.chars().count() })));
+    let d = with_whose(json!({ "harness": s.harness, "loginId": id, "chars": text.chars().count() }), teammate.as_deref());
+    app.db.record(&event(&by, "machine.harness_login_input", &m, d));
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn abort(app: AppState, by: Who, u: User, id: String) -> Res<StatusCode> {
+async fn abort(app: AppState, by: Who, u: User, teammate: Option<String>, id: String) -> Res<StatusCode> {
     let e = need_on(&app)?;
-    let s = e.sessions.get(&id, &u.id).ok_or_else(|| crate::not_found("Login"))?;
+    let s = e.sessions.get(&id, &u.id, teammate.as_deref()).ok_or_else(|| crate::not_found("Login"))?;
     let m = app.db.machine(&s.machine_id).ok_or_else(|| crate::not_found("Machine"))?;
     let (code, reply) = e
         .call_agent(&app, &m, reqwest::Method::POST, &format!("/v1/logins/{id}/abort"), &json!({}))
@@ -367,26 +407,38 @@ async fn abort(app: AppState, by: Who, u: User, id: String) -> Res<StatusCode> {
     if !(200..300).contains(&code) {
         return Err(agent_error(code, &reply));
     }
-    app.db.record(&event(&by, "machine.harness_login_aborted", &m, json!({ "harness": s.harness, "loginId": id, "reason": "asked" })));
+    let d = with_whose(json!({ "harness": s.harness, "loginId": id, "reason": "asked" }), teammate.as_deref());
+    app.db.record(&event(&by, "machine.harness_login_aborted", &m, d));
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn status(app: AppState, u: User) -> Res {
+async fn status(app: AppState, u: User, teammate: Option<String>) -> Res {
     let e = need_on(&app)?;
     let m = ready_machine(&app, &u)?;
     let hb = heartbeat(&app, &e, &m).await?;
-    Ok(Json(view(&e, &m, &hb)))
+    match teammate {
+        None => Ok(Json(view(&e, &m, &hb))),
+        Some(t) => {
+            need_teammate_logins(&e, &hb)?;
+            Ok(Json(teammate_view(&app, &e, &m, &t).await?))
+        }
+    }
 }
 
-/// Logs the harness out there: its credential files are removed.
-async fn logout(app: AppState, by: Who, u: User, harness: String) -> Res {
+/// Logs the harness out there: its credential files are removed, from the Bots' home
+/// for the owner, or from the teammate's own home (ADR 0062).
+async fn logout(app: AppState, by: Who, u: User, teammate: Option<String>, harness: String) -> Res {
     let e = need_on(&app)?;
     let r = need_recipe(&harness)?;
     let m = ready_machine(&app, &u)?;
-    heartbeat(&app, &e, &m).await?;
+    let hb = heartbeat(&app, &e, &m).await?;
+    if teammate.is_some() {
+        need_teammate_logins(&e, &hb)?;
+    }
     let body = wire::ForgetRequest {
         harness: harness.clone(),
         files: r.files.iter().map(|f| f.to_string()).collect(),
+        for_user: teammate.clone(),
     };
     let (code, reply) = e
         .call_agent(&app, &m, reqwest::Method::POST, "/v1/logins/forget", &body)
@@ -395,11 +447,68 @@ async fn logout(app: AppState, by: Who, u: User, harness: String) -> Res {
     if !(200..300).contains(&code) {
         return Err(agent_error(code, &reply));
     }
-    app.db.record(&event(&by, "machine.harness_logged_out", &m, json!({ "harness": harness, "removed": reply["removed"] })));
-    let hb = heartbeat(&app, &e, &m).await?;
-    let mut v = view(&e, &m, &hb);
+    let d = with_whose(json!({ "harness": harness, "removed": reply["removed"] }), teammate.as_deref());
+    app.db.record(&event(&by, "machine.harness_logged_out", &m, d));
+    let mut v = match &teammate {
+        None => view(&e, &m, &heartbeat(&app, &e, &m).await?),
+        Some(t) => teammate_view(&app, &e, &m, t).await?,
+    };
     v["removed"] = reply["removed"].clone();
     Ok(Json(v))
+}
+
+/// Who a teammate's login is for, in its audit events: their id and their OS user there.
+fn whose(teammate: Option<&str>) -> Value {
+    match teammate {
+        Some(t) => json!({ "forUser": t, "teammateUser": wire::teammate_user(t) }),
+        None => json!({}),
+    }
+}
+
+fn with_whose(mut d: Value, teammate: Option<&str>) -> Value {
+    if let (Some(d), Value::Object(w)) = (d.as_object_mut(), whose(teammate)) {
+        d.extend(w);
+    }
+    d
+}
+
+/// Teammates log in with their own account only when they run as their own user there
+/// (ADR 0048), and on an agent that keeps their logins apart (ADR 0062).
+fn need_teammate_logins(e: &Enrollment, hb: &Heartbeat) -> Res<()> {
+    if !e.teammate_users {
+        return Err(conflict("Teammates have their own logins on a machine only with MACHINE_TEAMMATE_USERS=on."));
+    }
+    if !keeps_teammate_logins(hb) {
+        return Err(conflict("Its agent can't keep teammates' own logins: it is older than ADR 0062. Upgrade it."));
+    }
+    Ok(())
+}
+
+/// A teammate's own logins on the owner's machine. Asking never makes their user.
+/// `serverKey`: a server-wide key logs their runs in without one.
+async fn teammate_view(app: &App, e: &Enrollment, m: &Machine, teammate: &str) -> Res<Value> {
+    let path = format!("/v1/teammates/{teammate}/logins?{}", cred_query().join("&"));
+    let (code, reply) = e
+        .call_agent(app, m, reqwest::Method::GET, &path, &json!({}))
+        .await
+        .map_err(|why| ApiError(StatusCode::BAD_GATEWAY, format!("Its agent didn't answer: {why}")))?;
+    if !(200..300).contains(&code) {
+        return Err(agent_error(code, &reply));
+    }
+    let said: wire::TeammateLogins = serde_json::from_value(reply).map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "Its agent's answer didn't parse.".into()))?;
+    let harnesses: serde_json::Map<String, Value> = crate::adapters::NAMES
+        .iter()
+        .filter_map(|n| Some((n, recipe(n)?)))
+        .map(|(n, r)| {
+            let st = said.logins.get(*n).cloned().unwrap_or_default();
+            let state = if st.state.is_empty() { wire::LOGGED_OUT } else { st.state.as_str() };
+            (n.to_string(), json!({ "state": state, "since": st.since, "serverKey": keyed(None, &r) }))
+        })
+        .collect();
+    let owner = app.db.user(&m.user_id).map(|o| json!({ "id": o.id, "name": o.name }));
+    Ok(json!({
+        "machineId": m.id, "owner": owner, "forUser": teammate, "logins": "on", "hasUser": said.known, "harnesses": harnesses,
+    }))
 }
 
 // Admin API, under `/api/users/{key}/machine` (admin only, rbac::classify).
@@ -412,7 +521,7 @@ pub async fn admin_start(
     Json(b): Json<StartBody>,
 ) -> Res<Response> {
     let u = need_user_key(&app, &key)?;
-    start(app, by, u, b.harness).await
+    start(app, by, u, None, b.harness).await
 }
 
 /// `POST /api/users/{key}/machine/harness-login/{id}/input` `{text}`.
@@ -423,7 +532,7 @@ pub async fn admin_input(
     Json(b): Json<InputBody>,
 ) -> Res<StatusCode> {
     let u = need_user_key(&app, &key)?;
-    input(app, by, u, id, b.text).await
+    input(app, by, u, None, id, b.text).await
 }
 
 /// `DELETE /api/users/{key}/machine/harness-login/{id}`: stops it.
@@ -433,13 +542,13 @@ pub async fn admin_abort(
     Path((key, id)): Path<(String, String)>,
 ) -> Res<StatusCode> {
     let u = need_user_key(&app, &key)?;
-    abort(app, by, u, id).await
+    abort(app, by, u, None, id).await
 }
 
 /// `GET /api/users/{key}/machine/harness-logins`: whether each harness is logged in there.
 pub async fn admin_status(AppS(app): AppS<AppState>, Path(key): Path<String>) -> Res {
     let u = need_user_key(&app, &key)?;
-    status(app, u).await
+    status(app, u, None).await
 }
 
 /// `DELETE /api/users/{key}/machine/harness-logins/{harness}`: logs it out there.
@@ -449,7 +558,7 @@ pub async fn admin_logout(
     Path((key, harness)): Path<(String, String)>,
 ) -> Res {
     let u = need_user_key(&app, &key)?;
-    logout(app, by, u, harness).await
+    logout(app, by, u, None, harness).await
 }
 
 // The same for the caller's own machine, under `/api/machine` (signed-in people).
@@ -461,7 +570,7 @@ pub async fn my_start(
     Json(b): Json<StartBody>,
 ) -> Res<Response> {
     let u = me(&c)?;
-    start(app, by, u, b.harness).await
+    start(app, by, u, None, b.harness).await
 }
 
 pub async fn my_input(
@@ -472,7 +581,7 @@ pub async fn my_input(
     Json(b): Json<InputBody>,
 ) -> Res<StatusCode> {
     let u = me(&c)?;
-    input(app, by, u, id, b.text).await
+    input(app, by, u, None, id, b.text).await
 }
 
 pub async fn my_abort(
@@ -482,12 +591,12 @@ pub async fn my_abort(
     Path(id): Path<String>,
 ) -> Res<StatusCode> {
     let u = me(&c)?;
-    abort(app, by, u, id).await
+    abort(app, by, u, None, id).await
 }
 
 pub async fn my_status(AppS(app): AppS<AppState>, Extension(c): Extension<Caller>) -> Res {
     let u = me(&c)?;
-    status(app, u).await
+    status(app, u, None).await
 }
 
 pub async fn my_logout(
@@ -497,7 +606,106 @@ pub async fn my_logout(
     Path(harness): Path<String>,
 ) -> Res {
     let u = me(&c)?;
-    logout(app, by, u, harness).await
+    logout(app, by, u, None, harness).await
+}
+
+// A teammate's own logins on the owner's machine (ADR 0062), under
+// `/api/machine/teammate/{owner}` for the teammate themselves.
+
+/// The machine's owner, if the caller is their teammate there: a person (never a Bot),
+/// not the owner, who can still run one of the owner's Bots, while their runs there go
+/// as their own user. Anyone else learns nothing, not even whether the owner exists.
+fn teammate_of(app: &App, c: &Caller, owner_id: &str) -> Res<(User, String)> {
+    let me = me(c)?;
+    let hidden = || crate::not_found("Machine");
+    let owner = app.db.user(owner_id).ok_or_else(hidden)?;
+    let on = app.control_plane.get().is_some_and(|cp| cp.teammate_users());
+    if !on || !super::offboard::wanted(app, &owner.id, &me.id) {
+        return Err(hidden());
+    }
+    Ok((owner, me.id))
+}
+
+/// `POST /api/machine/teammate/{owner}/harness-login` `{harness}`: a stream of `LoginEvent`s.
+pub async fn teammate_start(
+    AppS(app): AppS<AppState>,
+    Extension(by): Extension<Who>,
+    Extension(c): Extension<Caller>,
+    Path(owner): Path<String>,
+    Json(b): Json<StartBody>,
+) -> Res<Response> {
+    let (u, me) = teammate_of(&app, &c, &owner)?;
+    start(app, by, u, Some(me), b.harness).await
+}
+
+/// `POST /api/machine/teammate/{owner}/harness-login/{id}/input` `{text}`.
+pub async fn teammate_input(
+    AppS(app): AppS<AppState>,
+    Extension(by): Extension<Who>,
+    Extension(c): Extension<Caller>,
+    Path((owner, id)): Path<(String, String)>,
+    Json(b): Json<InputBody>,
+) -> Res<StatusCode> {
+    let (u, me) = teammate_of(&app, &c, &owner)?;
+    input(app, by, u, Some(me), id, b.text).await
+}
+
+/// `DELETE /api/machine/teammate/{owner}/harness-login/{id}`: stops it.
+pub async fn teammate_abort(
+    AppS(app): AppS<AppState>,
+    Extension(by): Extension<Who>,
+    Extension(c): Extension<Caller>,
+    Path((owner, id)): Path<(String, String)>,
+) -> Res<StatusCode> {
+    let (u, me) = teammate_of(&app, &c, &owner)?;
+    abort(app, by, u, Some(me), id).await
+}
+
+/// `GET /api/machine/teammate/{owner}/harness-logins`: whether each harness is logged in
+/// for the caller there.
+pub async fn teammate_status(AppS(app): AppS<AppState>, Extension(c): Extension<Caller>, Path(owner): Path<String>) -> Res {
+    let (u, me) = teammate_of(&app, &c, &owner)?;
+    status(app, u, Some(me)).await
+}
+
+/// `DELETE /api/machine/teammate/{owner}/harness-logins/{harness}`: logs it out for the
+/// caller there.
+pub async fn teammate_logout(
+    AppS(app): AppS<AppState>,
+    Extension(by): Extension<Who>,
+    Extension(c): Extension<Caller>,
+    Path((owner, harness)): Path<(String, String)>,
+) -> Res {
+    let (u, me) = teammate_of(&app, &c, &owner)?;
+    logout(app, by, u, Some(me), harness).await
+}
+
+// For admins, under `/api/users/{key}/machine/teammates/{teammate}`: see and log out a
+// teammate's logins. Only the teammate logs in as themselves.
+
+fn admin_teammate(app: &AppState, key: &str, teammate: &str) -> Res<(User, String)> {
+    let u = need_user_key(app, key)?;
+    let t = need_user_key(app, teammate)?;
+    if t.id == u.id {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "That's the machine's owner: use /machine/harness-logins.".into()));
+    }
+    Ok((u, t.id))
+}
+
+/// `GET /api/users/{key}/machine/teammates/{teammate}/harness-logins`.
+pub async fn admin_teammate_status(AppS(app): AppS<AppState>, Path((key, teammate)): Path<(String, String)>) -> Res {
+    let (u, t) = admin_teammate(&app, &key, &teammate)?;
+    status(app, u, Some(t)).await
+}
+
+/// `DELETE /api/users/{key}/machine/teammates/{teammate}/harness-logins/{harness}`.
+pub async fn admin_teammate_logout(
+    AppS(app): AppS<AppState>,
+    Extension(by): Extension<Who>,
+    Path((key, teammate, harness)): Path<(String, String, String)>,
+) -> Res {
+    let (u, t) = admin_teammate(&app, &key, &teammate)?;
+    logout(app, by, u, Some(t), harness).await
 }
 
 #[cfg(test)]

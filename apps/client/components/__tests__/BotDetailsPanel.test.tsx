@@ -238,4 +238,23 @@ describe("BotDetailsPanel", () => {
     expect(screen.getByLabelText("Pause Mine").props.disabled).toBe(true);
     expect(screen.getByLabelText("Make private").props.disabled).toBe(true);
   });
+  it("lets teammates log in with their own account on the owner's computer, and nobody else", async () => {
+    const api = { teammateLogins: jest.fn(async () => ({ harnesses: { claude: { state: "logged_out", serverKey: false } } })) };
+    const team = { ...shared("operate"), runsOn: "machine" as const, sharedBots: "isolated" as const, teammateLogins: true };
+    Object.assign(mockCtx, { bots: [team], activeId: "b", fetchRoutines: jest.fn(async () => []), api, me: { name: "Bea", id: "u2" } });
+    const ui = await render(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} />);
+    expect(await screen.findByText("Your Claude Code login")).toBeOnTheScreen();
+    expect(api.teammateLogins).toHaveBeenCalledWith("u1");
+    expect(screen.getByText(/your own login or the server's keys/)).toBeOnTheScreen();
+
+    // Not for the owner, whose login is the machine's own, nor for a Bot without one.
+    mockCtx.me = { name: "Ada", id: "u1" };
+    await ui.rerender(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} />);
+    expect(screen.queryByText("Your Claude Code login")).not.toBeOnTheScreen();
+    mockCtx.me = { name: "Bea", id: "u2" };
+    mockCtx.bots = [{ ...team, teammateLogins: undefined }];
+    await ui.rerender(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} />);
+    expect(screen.queryByText("Your Claude Code login")).not.toBeOnTheScreen();
+    Object.assign(mockCtx, { api: undefined, me: { name: "Ada", id: "u1" } });
+  });
 });

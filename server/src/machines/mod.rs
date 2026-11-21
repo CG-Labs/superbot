@@ -393,18 +393,28 @@ impl ControlPlane {
     /// own user is ready there (ADR 0043), their first folder copy is done and the harness
     /// is logged in there (ADR 0041) or keyed. `keys`: whose own keys the run gets, if any.
     /// `teammate`: the run is a teammate's, as their own user (ADR 0048), which the
-    /// agent must be able to do, and which only a server-wide key logs in.
+    /// agent must be able to do, and which a server-wide key logs in, or their own
+    /// login there (ADR 0062), checked once their user answers (`teammate_logged_in`).
     pub fn ready(&self, app: &App, hb: &wire::Heartbeat, keys: Option<&str>, machine_id: &str, bin: &str, teammate: bool) -> Result<(), route::Refusal> {
         let Some(e) = &self.enrollment else { return Ok(()) };
         botuser::check_run(e, hb)?;
         if teammate {
             teammate::fit(hb)?;
-            return logins::check_teammate_run(bin);
+            return logins::check_teammate_run(e, hb, bin);
         }
         if folder::first_copy_running(app, e, machine_id) {
             return Err(route::Refusal::FolderCopying);
         }
         logins::check_run(e, hb, keys, bin)
+    }
+
+    /// Whether a teammate's run of `bin` may start, from their own user's answer
+    /// (`reply`): a server-wide key, or their own login in their home there (ADR 0062).
+    pub fn teammate_logged_in(&self, bin: &str, reply: &wire::TeammateReply) -> Result<(), route::Refusal> {
+        match &self.enrollment {
+            Some(_) => logins::check_teammate_login(bin, reply),
+            None => Ok(()),
+        }
     }
 
     #[cfg(test)]

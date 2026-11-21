@@ -84,9 +84,19 @@ pub(crate) async fn world_with(
     auth: impl FnOnce(&mut crate::Auth) + Send + 'static,
     f: impl FnOnce(agent::Config) -> agent::Config,
 ) -> World {
+    world_claude(ef, auth, "#!/bin/sh\nexit 3\n", f).await
+}
+
+/// `world_with`, with `claude` as the stand-in Claude there.
+pub(crate) async fn world_claude(
+    ef: impl FnOnce(crate::machines::enroll::Enrollment) -> crate::machines::enroll::Enrollment,
+    auth: impl FnOnce(&mut crate::Auth) + Send + 'static,
+    claude: &str,
+    f: impl FnOnce(agent::Config) -> agent::Config,
+) -> World {
     let mut env = crate::machines_mtls_tests::serve_with_auth(|e| ef(e.with_teammate_users()), auth).await;
     let (ada, mid, token) = machine_for(&env, "ada@example.com").await;
-    let m = agent_with_config(&mut env, &mid, &token, "#!/bin/sh\nexit 3\n", |c| {
+    let m = agent_with_config(&mut env, &mid, &token, claude, |c| {
         with_pi(f(c))
     })
     .await;
@@ -308,6 +318,128 @@ async fn an_agent_refuses_to_make_a_teammate_its_own_or_the_bots_user() {
     );
 }
 
+/// A stand-in Claude: `claude auth login` saves a login made from the code typed into
+/// its terminal, in `$HOME`; a run says where it ran.
+const LOGIN_CLAUDE: &str = r#"#!/bin/sh
+if [ "$1 $2" = "auth login" ]; then
+  printf 'Paste the code here: '
+  read code
+  mkdir -p "$HOME/.claude"
+  printf '{"token":"%s-saved"}' "$code" > "$HOME/.claude/.credentials.json"
+  echo "Logged in."
+  exit 0
+fi
+printf '{"type":"assistant","message":{"content":[{"type":"text","text":"ran home=%s"}]}}\n' "$HOME"
+"#;
+
+fn shared_claude(w: &World) -> String {
+    w.env.app.db.create_bot_owned("Team", "#fff", "waddle", "claude", None, false, &w.ada, Visibility::Shared).id
+}
+
+async fn get(w: &World, path: &str, auth: &str) -> (u16, Value) {
+    let (code, body) = call(w.env.port, "GET", path, auth, "").await;
+    (code, serde_json::from_str(&body).unwrap_or(Value::Null))
+}
+
+async fn send_as(w: &World, method: &str, path: &str, auth: &str, body: &str) -> (u16, Value) {
+    let (code, body) = call(w.env.port, method, path, auth, body).await;
+    (code, serde_json::from_str(&body).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn a_teammate_logs_in_with_their_own_account_and_only_their_runs_use_it() {
+    let me = runas::current_user().unwrap();
+    let w = world_claude(|e| e.with_logins(), |_| {}, LOGIN_CLAUDE, |c| agent::Config {
+        teammate_stand_in: Some(me.clone()),
+        ..c
+    })
+    .await;
+    let (cy_id, cy) = user_with(w.env.port, &w.env.admin, "cy@example.com", "member").await;
+    let ada = ada_auth(&w).await;
+    let base = format!("/api/machine/teammate/{}", w.ada);
+    let (bots_home, bea_home, cy_home) = (w.m.agent.cfg.home.clone(), w.m.agent.teammates.home_of(&w.bea_id), w.m.agent.teammates.home_of(&cy_id));
+
+    // Until Ada shares a Bot, Bea is nobody's teammate there; nor is Ada her own; and
+    // an owner who doesn't exist looks the same.
+    assert_eq!(get(&w, &format!("{base}/harness-logins"), &w.bea).await.0, 404);
+    assert_eq!(get(&w, &format!("{base}/harness-logins"), &ada).await.0, 404);
+    assert_eq!(get(&w, "/api/machine/teammate/nobody/harness-logins", &w.bea).await.0, 404);
+    let team = shared_claude(&w);
+
+    // Ada is logged in on her machine (her login is in the Bots' home). Not Bea.
+    let first = run(&w, &w.bea, &team, "go").await;
+    assert!(first.contains("isn't logged in for you"), "{first}");
+    let (code, v) = get(&w, &format!("{base}/harness-logins"), &w.bea).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!((v["forUser"].as_str(), v["harnesses"]["claude"]["state"].as_str()), (Some(w.bea_id.as_str()), Some("logged_out")), "{v}");
+    assert_eq!((v["harnesses"]["claude"]["serverKey"].as_bool(), v["owner"]["id"].as_str()), (Some(false), Some(w.ada.as_str())), "{v}");
+    assert!(v["harnesses"]["pi"].is_null(), "{v}");
+
+    // Bea logs in with her own account; it runs as her user, in her home.
+    let mut login = crate::machines_logins_tests::Login::open(&w.env, &format!("{base}/harness-login"), &w.bea, "claude").await;
+    let (started, _) = login.until("started").await;
+    let id = started["loginId"].as_str().unwrap().to_string();
+    login.until_shown("Paste the code here").await;
+    // Nobody else types into it or stops it: not Ada through her own logins, not an
+    // admin through Ada's, not Cy through his.
+    let typed = r#"{"text":"stolen"}"#;
+    assert_eq!(send_as(&w, "POST", &format!("/api/machine/harness-login/{id}/input"), &ada, typed).await.0, 404);
+    assert_eq!(send_as(&w, "DELETE", &format!("/api/machine/harness-login/{id}"), &ada, "").await.0, 404);
+    assert_eq!(send_as(&w, "POST", &format!("/api/users/{}/machine/harness-login/{id}/input", w.ada), &w.env.admin, typed).await.0, 404);
+    assert_eq!(send_as(&w, "POST", &format!("{base}/harness-login/{id}/input"), &cy, typed).await.0, 404);
+    assert_eq!(send_as(&w, "DELETE", &format!("{base}/harness-login/{id}"), &cy, "").await.0, 404);
+    let (code, v) = send_as(&w, "POST", &format!("{base}/harness-login/{id}/input"), &w.bea, r#"{"text":"bea-7c1d"}"#).await;
+    assert_eq!(code, 204, "{v}");
+    let (exit, out) = login.until("exit").await;
+    assert_eq!(exit["loggedIn"], true, "{exit} {out}");
+
+    // Saved in Bea's home only. Ada's login is untouched, and Cy has nothing.
+    let creds = ".claude/.credentials.json";
+    assert_eq!(std::fs::read_to_string(bea_home.join(creds)).unwrap(), r#"{"token":"bea-7c1d-saved"}"#);
+    assert_eq!(std::fs::read_to_string(bots_home.join(creds)).unwrap(), "ada's login");
+    let (_, v) = get(&w, &format!("{base}/harness-logins"), &w.bea).await;
+    assert_eq!(v["harnesses"]["claude"]["state"], "logged_in", "{v}");
+    let (_, v) = get(&w, &format!("{base}/harness-logins"), &cy).await;
+    assert_eq!((v["harnesses"]["claude"]["state"].as_str(), v["hasUser"].as_bool()), (Some("logged_out"), Some(false)), "{v}");
+    assert!(!cy_home.exists(), "asking never makes his user");
+    let (_, v) = get(&w, "/api/machine/harness-logins", &ada).await;
+    assert_eq!(v["harnesses"]["claude"]["state"], "logged_in", "Ada's own: {v}");
+    let (_, v) = get(&w, &format!("/api/users/{}/machine/teammates/{}/harness-logins", w.ada, w.bea_id), &w.env.admin).await;
+    assert_eq!(v["harnesses"]["claude"]["state"], "logged_in", "admins see it: {v}");
+
+    // Bea's run goes ahead in her home; Cy's is refused; Ada's runs in the Bots' home.
+    let theirs = run(&w, &w.bea, &team, "go").await;
+    assert_eq!(said(&theirs, "home"), bea_home.display().to_string(), "{theirs}");
+    let his = run(&w, &cy, &team, "go").await;
+    assert!(his.contains("isn't logged in for you"), "{his}");
+    let mine = run(&w, &ada, &team, "go").await;
+    assert_eq!(said(&mine, "home"), bots_home.display().to_string(), "{mine}");
+    let refused = events(&w.env, "bot.run_refused").await;
+    let not_in = |who: &str| refused.iter().filter(|e| e["details"]["reason"] == "teammate_not_logged_in" && e["details"]["forUser"] == who).count();
+    assert_eq!((not_in(&w.bea_id), not_in(&cy_id)), (1, 1), "{refused:?}");
+
+    // Audited as Bea's, with her user there; what she typed never reaches botd.
+    let started = events(&w.env, "machine.harness_login_started").await;
+    assert_eq!((started[0]["details"]["forUser"].as_str(), started[0]["details"]["teammateUser"].as_str()), (Some(w.bea_id.as_str()), Some(wire::teammate_user(&w.bea_id).as_str())), "{started:?}");
+    let (_, all) = call(w.env.port, "GET", "/api/audit?limit=500", &w.env.admin, "").await;
+    assert!(!all.contains("bea-7c1d") && !all.contains("stolen"), "{all}");
+
+    // Cy logging out removes nothing of Bea's; Bea logging out removes hers, not Ada's.
+    let (code, v) = send_as(&w, "DELETE", &format!("{base}/harness-logins/claude"), &cy, "").await;
+    assert_eq!((code, v["removed"].as_u64()), (200, Some(0)), "{v}");
+    assert!(bea_home.join(creds).exists());
+    let (code, v) = send_as(&w, "DELETE", &format!("{base}/harness-logins/claude"), &w.bea, "").await;
+    assert_eq!((code, v["removed"].as_u64(), v["harnesses"]["claude"]["state"].as_str()), (200, Some(1), Some("logged_out")), "{v}");
+    assert!(!bea_home.join(creds).exists() && bots_home.join(creds).exists());
+    let logged_out = events(&w.env, "machine.harness_logged_out").await;
+    assert_eq!(logged_out[0]["details"]["forUser"], w.bea_id.as_str(), "{logged_out:?}");
+    let again = run(&w, &w.bea, &team, "again").await;
+    assert!(again.contains("isn't logged in for you"), "{again}");
+    // A Bot can't log in as anyone.
+    let token = format!("Bearer {}", crate::isolation::bot_token(&w.env.app.cfg.bot_key, &team, &w.ada));
+    assert_eq!(get(&w, &format!("{base}/harness-logins"), &token).await.0, 403);
+}
+
 #[tokio::test]
 async fn teammates_runs_stay_as_before_unless_asked() {
     let mut env = serve_with(|e| e.with_bot_user()).await;
@@ -448,4 +580,94 @@ async fn as_root_a_teammates_run_gets_their_own_os_user_and_cant_read_the_owners
         .arg(&teammate)
         .status();
     let _ = std::process::Command::new("userdel").arg(USER).status();
+}
+
+/// As root, on a host CI throws away: a teammate's own login (ADR 0062) is theirs
+/// alone. Another teammate's user and the Bots' user can't read it, and a link to it
+/// that another teammate plants counts for nothing and is never followed.
+#[tokio::test]
+#[ignore = "needs root: SUPERBOT_MACHINE_BOT_USER_TEST=1, as CI's isolation job runs it"]
+async fn as_root_a_teammates_login_is_theirs_alone() {
+    if std::env::var("SUPERBOT_MACHINE_BOT_USER_TEST").as_deref() != Ok("1") || !runas::is_root() {
+        eprintln!("skipped: needs root and SUPERBOT_MACHINE_BOT_USER_TEST=1");
+        return;
+    }
+    const USER: &str = "superbot-bots-tl";
+    let userdel = |u: &str| {
+        let _ = std::process::Command::new("userdel").arg(u).status();
+    };
+    userdel(USER);
+    let state = crate::db::temp_path("agent-root-tl");
+    // The stand-in Claude in the tools folder too: teammates can't open the Bots' home.
+    let w = world_claude(|e| e.with_logins(), |_| {}, LOGIN_CLAUDE, |c| {
+        install(&c.tools.join("bin"), "claude", LOGIN_CLAUDE);
+        agent::Config {
+            state_dir: state.clone(),
+            bot_user: USER.into(),
+            allow_own_user: false,
+            teammates: state.join("teammates"),
+            ..c
+        }
+    })
+    .await;
+    let (cy_id, cy) = user_with(w.env.port, &w.env.admin, "cy@example.com", "member").await;
+    let (bea_user, cy_user) = (wire::teammate_user(&w.bea_id), wire::teammate_user(&cy_id));
+    userdel(&bea_user);
+    userdel(&cy_user);
+    let team = shared_pi(&w);
+    run(&w, &w.bea, &team, "go").await;
+    run(&w, &cy, &team, "go").await;
+    let (bea_ids, _) = runas::lookup(&bea_user).expect("the agent made Bea's user");
+    let (cy_ids, _) = runas::lookup(&cy_user).expect("the agent made Cy's user");
+    let (bea_home, cy_home) = (w.m.agent.teammates.home_of(&w.bea_id), w.m.agent.teammates.home_of(&cy_id));
+
+    // Bea logs in through botd: the login runs as her user, in a terminal she owns, and
+    // what it saves is hers, in her own home.
+    let base = format!("/api/machine/teammate/{}", w.ada);
+    let mut login = crate::machines_logins_tests::Login::open(&w.env, &format!("{base}/harness-login"), &w.bea, "claude").await;
+    let (started, _) = login.until("started").await;
+    let id = started["loginId"].as_str().unwrap().to_string();
+    login.until_shown("Paste the code here").await;
+    let (code, body) = call(w.env.port, "POST", &format!("{base}/harness-login/{id}/input"), &w.bea, r#"{"text":"bea"}"#).await;
+    assert_eq!(code, 204, "{body}");
+    let (exit, out) = login.until("exit").await;
+    assert_eq!(exit["loggedIn"], true, "{exit} {out}");
+    let creds = ".claude/.credentials.json";
+    let file = bea_home.join(creds);
+    for p in [file.parent().unwrap(), file.as_path()] {
+        let m = std::fs::symlink_metadata(p).unwrap();
+        assert_eq!((m.uid(), m.gid()), (bea_ids.uid, bea_ids.gid), "{} is Bea's", p.display());
+    }
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), r#"{"token":"bea-saved"}"#);
+    assert_eq!(std::fs::read_to_string(&w.secret).unwrap(), "ada's login", "not in the Bots' home");
+    let state_of = async |auth: &str| {
+        let (code, body) = call(w.env.port, "GET", &format!("{base}/harness-logins"), auth, "").await;
+        assert_eq!(code, 200, "{body}");
+        serde_json::from_str::<Value>(&body).unwrap()["harnesses"]["claude"]["state"].as_str().unwrap().to_string()
+    };
+    assert_eq!(state_of(&w.bea).await, "logged_in");
+    assert_eq!(state_of(&cy).await, "logged_out");
+
+    // Neither Cy's user nor the Bots' can read it.
+    for u in [cy_user.as_str(), USER] {
+        let peek = std::process::Command::new("runuser").args(["-u", u, "--", "cat", &file.display().to_string()]).output().unwrap();
+        assert!(!peek.status.success() && !String::from_utf8_lossy(&peek.stdout).contains("bea-saved"), "{u} read Bea's login");
+    }
+
+    // A link Cy plants to it isn't a login of his, and logging out removes only the link.
+    let link = cy_home.join(creds);
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::chown(link.parent().unwrap(), Some(cy_ids.uid), Some(cy_ids.gid)).unwrap();
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    std::os::unix::fs::lchown(&link, Some(cy_ids.uid), Some(cy_ids.gid)).unwrap();
+    assert_eq!(state_of(&cy).await, "logged_out");
+    let (code, _) = call(w.env.port, "DELETE", &format!("{base}/harness-logins/claude"), &cy, "").await;
+    assert_eq!(code, 200);
+    assert!(std::fs::symlink_metadata(&link).is_err(), "his link is gone");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), r#"{"token":"bea-saved"}"#, "Bea's login stays");
+    assert_eq!(state_of(&w.bea).await, "logged_in");
+
+    userdel(&bea_user);
+    userdel(&cy_user);
+    userdel(USER);
 }

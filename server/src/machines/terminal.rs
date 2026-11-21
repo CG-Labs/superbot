@@ -24,12 +24,14 @@ pub const MAX_INPUT: usize = 4096;
 /// How long a login may wait for its user, at most and at least.
 pub const MAX_SECS: u64 = 1800;
 pub const MIN_SECS: u64 = 30;
-/// Logins at once; one per harness.
-const MAX_LOGINS: usize = 2;
+/// Logins at once; one per harness for each person (the owner, and each teammate).
+const MAX_LOGINS: usize = 4;
 const GRACE: Duration = Duration::from_secs(3);
 
 struct Session {
     harness: String,
+    /// The teammate it's for (ADR 0062); None: the owner.
+    for_user: Option<String>,
     /// The terminal's controlling side, for typing into it.
     input: Arc<Mutex<std::fs::File>>,
     stop: watch::Sender<bool>,
@@ -200,14 +202,33 @@ impl Logins {
         self.sessions.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The harnesses logging in now.
+    /// The harnesses logging in now, for anyone.
     pub fn running(&self) -> Vec<String> {
         self.sessions().values().map(|s| s.harness.clone()).collect()
     }
 
+    /// The harnesses logging in now for `for_user` (None: the owner) only.
+    pub fn running_for(&self, for_user: Option<&str>) -> Vec<String> {
+        self.sessions()
+            .values()
+            .filter(|s| s.for_user.as_deref() == for_user)
+            .map(|s| s.harness.clone())
+            .collect()
+    }
+
+    /// Stops every login of teammate `user_id`. How many there were.
+    pub fn abort_for(&self, user_id: &str) -> u32 {
+        let s = self.sessions();
+        let theirs: Vec<&Session> = s.values().filter(|s| s.for_user.as_deref() == Some(user_id)).collect();
+        for t in &theirs {
+            let _ = t.stop.send(true);
+        }
+        theirs.len() as u32
+    }
+
     /// Starts the login, `run` (from `check`) in `home` with exactly `env`, as `user`
-    /// if one is given (ADR 0043). Its events come on the receiver, which ends after
-    /// `Exit` or `Error`; `stop` (or `abort`) ends it early.
+    /// if one is given (ADR 0043; a teammate's own, ADR 0062). Its events come on the
+    /// receiver, which ends after `Exit` or `Error`; `stop` (or `abort`) ends it early.
     pub fn start(
         self: &Arc<Self>,
         r: &LoginRequest,
@@ -229,7 +250,7 @@ impl Logins {
         let (stop_tx, mut stop_rx) = watch::channel(false);
         {
             let mut s = self.sessions();
-            if s.values().any(|s| s.harness == r.harness) {
+            if s.values().any(|s| s.harness == r.harness && s.for_user == r.for_user) {
                 return Err((409, format!("A {} login is already running here.", r.harness)));
             }
             if s.len() >= MAX_LOGINS || s.contains_key(&r.login_id) {
@@ -239,6 +260,7 @@ impl Logins {
                 r.login_id.clone(),
                 Session {
                     harness: r.harness.clone(),
+                    for_user: r.for_user.clone(),
                     input: Arc::new(Mutex::new(input)),
                     stop: stop_tx.clone(),
                 },
@@ -387,6 +409,7 @@ mod tests {
             args: vec!["auth".into(), "login".into()],
             files: files.iter().map(|f| f.to_string()).collect(),
             timeout_secs: 60,
+            for_user: None,
         }
     }
 
@@ -502,5 +525,37 @@ mod tests {
             }
         };
         assert!(matches!(exit, LoginEvent::Exit { success: false, logged_in: false, .. }));
+    }
+
+    #[tokio::test]
+    async fn each_person_has_their_own_login_per_harness_and_a_leaving_teammates_stop() {
+        let home = scratch("people");
+        let bin = home.join("slow-login");
+        std::fs::write(&bin, "#!/bin/sh\necho waiting\nsleep 60\n").unwrap();
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let logins = Arc::new(Logins::default());
+        let env = BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        let for_user = |id: &str, who: Option<&str>| LoginRequest { login_id: id.into(), for_user: who.map(String::from), ..req(&[".claude/.credentials.json"]) };
+        let (mut owner, _s1) = logins.start(&for_user("l1", None), &fake(&bin), &home, &env, None).unwrap();
+        let (mut bea, _s2) = logins.start(&for_user("l2", Some("u-bea")), &fake(&bin), &home, &env, None).unwrap();
+        let (_cy, _s3) = logins.start(&for_user("l3", Some("u-cy")), &fake(&bin), &home, &env, None).unwrap();
+        assert_eq!(logins.start(&for_user("l4", Some("u-bea")), &fake(&bin), &home, &env, None).unwrap_err().0, 409, "one each");
+        assert_eq!(logins.running_for(None), ["claude"], "the owner's own only");
+        assert_eq!(logins.running_for(Some("u-bea")), ["claude"]);
+        assert!(logins.running_for(Some("u-dan")).is_empty());
+
+        assert_eq!(logins.abort_for("u-bea"), 1);
+        let ended = async |rx: &mut mpsc::Receiver<LoginEvent>| loop {
+            match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap() {
+                Some(LoginEvent::Exit { .. }) | None => break true,
+                _ => {}
+            }
+        };
+        assert!(ended(&mut bea).await);
+        assert!(logins.running_for(Some("u-bea")).is_empty());
+        assert_eq!(logins.running_for(Some("u-cy")), ["claude"], "Cy's goes on");
+        assert_eq!(logins.running_for(None), ["claude"], "and the owner's");
+        assert!(logins.abort("l1"));
+        assert!(ended(&mut owner).await);
     }
 }
