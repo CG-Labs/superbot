@@ -44,11 +44,11 @@ pub const OFF_DETAIL: &str = "Billing is off during testing: SuperBot makes no S
 const STRIPE_VARS: [&str; 3] = ["STRIPE_WEBHOOK_SECRET", "STRIPE_SECRET_KEY", "STRIPE_METER_EVENT"];
 /// How long a checkout page stays payable, in minutes past the current one. Stripe's
 /// shortest is 30 minutes from creation; whole minutes keep a retried request identical.
-const CHECKOUT_MINUTES: i64 = 31;
+pub(crate) const CHECKOUT_MINUTES: i64 = 31;
 
 /// Statuses that pay for the subscription's tier. `past_due` keeps it while Stripe
 /// retries the card; Stripe moves it to `canceled` or `unpaid` when it gives up.
-const PAYING: [&str; 3] = ["active", "trialing", "past_due"];
+pub(crate) const PAYING: [&str; 3] = ["active", "trialing", "past_due"];
 /// Statuses that end it: the user goes back to the default tier.
 pub const ENDED: [&str; 4] = ["canceled", "unpaid", "incomplete_expired", "paused"];
 /// Ended for good: Stripe never moves a subscription out of these, so no later event,
@@ -65,6 +65,8 @@ pub struct Billing {
     checkout: Option<Checkout>,
     /// Token metering (ADR 0050). None without `STRIPE_METER_EVENT`: the default.
     meter: Option<Arc<Meter>>,
+    /// Team seats (ADR 0093): on with checkout.
+    seats: Option<Arc<crate::team_billing::Seats>>,
 }
 
 /// Reports each run's tokens to a Stripe meter as meter events (ADR 0050).
@@ -82,9 +84,9 @@ const METER_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// What botd needs to send people to Stripe's pages and back.
 pub struct Checkout {
-    stripe: Stripe,
+    pub(crate) stripe: Stripe,
     /// The https address people open SuperBot at, with no trailing slash.
-    public_url: String,
+    pub(crate) public_url: String,
     starts: crate::users::Limiter,
     /// One checkout at a time per person, so two can't both be opened and paid.
     busy: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -144,13 +146,23 @@ impl Billing {
             crate::secrets::redact::register(&key);
             let public = public_url(var)?;
             b.checkout = Some(Checkout::new(&key, stripe::API, &public));
+            b.seats = Some(Arc::new(crate::team_billing::Seats::new(Stripe::new(&key, stripe::API))));
             b.meter = meter.map(|event| Arc::new(Meter { stripe: Stripe::new(&key, stripe::API), event }));
         }
         Ok(b)
     }
 
     pub fn with_secret(secret: &str) -> Billing {
-        Billing { secret: Some(secret.into()), refusals: crate::users::Limiter::new(20, 60_000), checkout: None, meter: None }
+        Billing { secret: Some(secret.into()), refusals: crate::users::Limiter::new(20, 60_000), checkout: None, meter: None, seats: None }
+    }
+
+    /// Team seat sync, while checkout is on.
+    pub fn seats(&self) -> Option<Arc<crate::team_billing::Seats>> {
+        self.seats.clone()
+    }
+
+    pub(crate) fn checkout(&self) -> Option<&Checkout> {
+        self.checkout.as_ref()
     }
 
     /// `with_checkout`, reporting tokens to the meter `event` through the API at `api`.
@@ -167,7 +179,11 @@ impl Billing {
     /// `with_secret`, with checkout through the Stripe API at `api` (a fake, in tests).
     #[cfg(test)]
     pub fn with_checkout(secret: &str, key: &str, api: &str, public_url: &str) -> Billing {
-        Billing { checkout: Some(Checkout::new(key, api, public_url)), ..Billing::with_secret(secret) }
+        Billing {
+            checkout: Some(Checkout::new(key, api, public_url)),
+            seats: Some(Arc::new(crate::team_billing::Seats::new(Stripe::new(key, api)))),
+            ..Billing::with_secret(secret)
+        }
     }
 
     pub fn enabled(&self) -> bool {
@@ -197,7 +213,7 @@ impl Checkout {
         }
     }
 
-    fn lock(&self, user: &str) -> Arc<tokio::sync::Mutex<()>> {
+    pub(crate) fn lock(&self, user: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.busy.lock().unwrap_or_else(|e| e.into_inner()).entry(user.to_string()).or_default().clone()
     }
 }
@@ -296,11 +312,11 @@ pub fn sign(secret: &str, body: &[u8], t: i64) -> String {
     format!("t={t},v1={}", tag.as_ref().iter().map(|b| format!("{b:02x}")).collect::<String>())
 }
 
-fn reply(code: StatusCode, v: Value) -> Response {
+pub(crate) fn reply(code: StatusCode, v: Value) -> Response {
     (code, Json(v)).into_response()
 }
 
-fn system(on_behalf_of: Option<&str>) -> Who {
+pub(crate) fn system(on_behalf_of: Option<&str>) -> Who {
     let mut actor = Actor::system("billing");
     actor.on_behalf_of = on_behalf_of.map(String::from);
     Who { actor, source: Default::default() }
@@ -353,18 +369,18 @@ fn refused(app: &App, b: &Billing, reason: &str) {
 }
 
 /// The parts of a Stripe subscription object botd reads.
-struct Sub<'a> {
-    id: &'a str,
-    customer: Option<&'a str>,
-    status: &'a str,
-    user: Option<&'a str>,
-    prices: Vec<&'a str>,
-    period_start: Option<i64>,
-    period_end: Option<i64>,
-    created: Option<i64>,
+pub(crate) struct Sub<'a> {
+    pub id: &'a str,
+    pub customer: Option<&'a str>,
+    pub status: &'a str,
+    pub user: Option<&'a str>,
+    pub prices: Vec<&'a str>,
+    pub period_start: Option<i64>,
+    pub period_end: Option<i64>,
+    pub created: Option<i64>,
     /// When Stripe will end it, Unix seconds (ADR 0091): `cancel_at`, or the period's
     /// end while `cancel_at_period_end`.
-    cancel_at: Option<i64>,
+    pub cancel_at: Option<i64>,
 }
 
 fn read_sub(o: &Value) -> Option<Sub<'_>> {
@@ -406,8 +422,41 @@ fn record_linked(app: &App, user: &str, customer: &str, via: &str, event_id: &st
     app.db.record(&system(Some(user)).event("billing.customer_linked").target("user", user).details(d));
 }
 
-fn customer_of(o: &Value) -> Option<&str> {
+pub(crate) fn customer_of(o: &Value) -> Option<&str> {
     o["customer"].as_str().or_else(|| o["customer"]["id"].as_str()).filter(|c| !c.is_empty())
+}
+
+/// What a subscription event says the subscription pays for.
+pub(crate) struct Plan {
+    /// The tier while it pays; None once it ends.
+    pub tier: Option<String>,
+    /// False while its first payment hasn't gone through (`incomplete`): nothing changes yet.
+    pub set_tier: bool,
+    pub ending: bool,
+    pub status: String,
+    /// The price that sets the tier, else its first.
+    pub price: Option<String>,
+}
+
+/// The plan an event's subscription pays for. None: it pays, but for no tier's price.
+pub(crate) fn plan_of(app: &App, kind: &str, sub: &Sub) -> Option<Plan> {
+    let tiers = app.tiers();
+    let priced = sub.prices.iter().find_map(|p| tiers.by_stripe_price(p).map(|t| (*p, t)));
+    let ending = kind == "customer.subscription.deleted" || ENDED.contains(&sub.status);
+    let (tier, set_tier) = if ending {
+        (None, true)
+    } else if PAYING.contains(&sub.status) {
+        (Some(priced?.1.name.clone()), true)
+    } else {
+        (None, false)
+    };
+    Some(Plan {
+        tier,
+        set_tier,
+        ending,
+        status: if kind == "customer.subscription.deleted" { "canceled".into() } else { sub.status.into() },
+        price: priced.map(|(p, _)| p.to_string()).or_else(|| sub.prices.first().map(|p| p.to_string())),
+    })
 }
 
 fn subscription_event(app: &App, event_id: &str, kind: &str, event: &Value) -> Result<&'static str, String> {
@@ -415,6 +464,9 @@ fn subscription_event(app: &App, event_id: &str, kind: &str, event: &Value) -> R
     let Some(sub) = read_sub(&event["data"]["object"]) else {
         return ignore("not_a_subscription", None, json!({}));
     };
+    if let Some(done) = crate::team_billing::subscription_event(app, event_id, kind, event, &sub) {
+        return done;
+    }
     // The metadata names the user; later events for the same subscription may not carry
     // it, so the subscription we already know names them too, and so does a customer
     // linked to them (ADR 0042), for subscriptions started outside SuperBot's checkout.
@@ -429,27 +481,18 @@ fn subscription_event(app: &App, event_id: &str, kind: &str, event: &Value) -> R
         other => return ignore("unknown_user", None, json!({ "subscription": sub.id, "user": other })),
     };
     let tiers = app.tiers();
-    let priced = sub.prices.iter().find_map(|p| tiers.by_stripe_price(p).map(|t| (*p, t)));
-    let ending = kind == "customer.subscription.deleted" || ENDED.contains(&sub.status);
-    let (tier, set_tier) = if ending {
-        (None, true)
-    } else if PAYING.contains(&sub.status) {
-        match priced {
-            Some((_, t)) => (Some(t.name.clone()), true),
-            None => return ignore("unknown_price", Some(&user), json!({ "subscription": sub.id, "prices": sub.prices })),
-        }
-    } else {
-        // `incomplete`: the first payment hasn't gone through. Nothing changes yet.
-        (None, false)
+    let Some(plan) = plan_of(app, kind, &sub) else {
+        return ignore("unknown_price", Some(&user), json!({ "subscription": sub.id, "prices": sub.prices }));
     };
+    let (tier, set_tier, ending) = (plan.tier.clone(), plan.set_tier, plan.ending);
     let created = event["created"].as_i64().unwrap_or(0);
     let row = Subscription {
         user_id: user.clone(),
         provider: "stripe".into(),
         customer_id: sub.customer.map(String::from),
         subscription_id: sub.id.into(),
-        status: if kind == "customer.subscription.deleted" { "canceled".into() } else { sub.status.into() },
-        price_id: priced.map(|(p, _)| p.to_string()).or_else(|| sub.prices.first().map(|p| p.to_string())),
+        status: plan.status.clone(),
+        price_id: plan.price.clone(),
         tier: tier.clone(),
         period_start: sub.period_start,
         period_end: sub.period_end,
@@ -477,7 +520,9 @@ fn subscription_event(app: &App, event_id: &str, kind: &str, event: &Value) -> R
         Applied::CustomerOfAnotherUser => return ignore("customer_of_another_user", Some(&user), json!({ "subscription": sub.id, "customer": sub.customer })),
         Applied::Unchanged => "unchanged",
         Applied::Changed { from, to } => {
-            let effective = |t: &Option<String>| tiers.of(t.as_deref()).name.clone();
+            // While their team pays (ADR 0093), its plan is theirs whatever their own says.
+            let team = app.db.team_plan_of(&user).and_then(|s| s.tier);
+            let effective = |t: &Option<String>| tiers.of(team.as_deref().or(t.as_deref())).name.clone();
             let mut d = json!({ "from": from, "to": to, "effectiveFrom": effective(&from), "effectiveTo": effective(&to), "source": "stripe" });
             if let (Some(d), Value::Object(x)) = (d.as_object_mut(), details.clone()) {
                 d.extend(x);
@@ -506,6 +551,9 @@ fn checkout_completed(app: &App, event_id: &str, kind: &str, event: &Value) -> R
     let o = &event["data"]["object"];
     let field = |v: &Value| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
     let session = o["id"].as_str().unwrap_or_default();
+    if let Some(done) = crate::team_billing::checkout_completed(app, event_id, kind, o) {
+        return done;
+    }
     let (meta, reference) = (field(&o["metadata"][USER_KEY]), field(&o["client_reference_id"]));
     if let (Some(m), Some(r)) = (&meta, &reference)
         && m != r
@@ -534,33 +582,33 @@ fn checkout_completed(app: &App, event_id: &str, kind: &str, event: &Value) -> R
     Ok(outcome)
 }
 
-/// `customer.deleted`: the user it was linked to has no customer any more, so their
-/// next checkout makes a new one. Stripe cancels the customer's subscriptions itself,
-/// and sends their own events.
+/// `customer.deleted`: the user or team (ADR 0093) it was linked to has no customer any
+/// more, so their next checkout makes a new one. Stripe cancels the customer's
+/// subscriptions itself, and sends their own events.
 fn customer_deleted(app: &App, event_id: &str, kind: &str, event: &Value) -> Result<&'static str, String> {
     let Some(cus) = event["data"]["object"]["id"].as_str().filter(|c| !c.is_empty()) else {
         return ignored(app, event_id, kind, "not_a_customer", None, json!({}));
     };
-    Ok(match app.db.unlink_customer(event_id, kind, cus)? {
-        None => "duplicate",
-        Some(None) => "unchanged",
-        Some(Some(user)) => {
-            let d = json!({ "customer": cus, "eventId": event_id });
-            app.db.record(&system(Some(&user)).event("billing.customer_unlinked").target("user", &user).details(d));
-            "customer_unlinked"
-        }
-    })
+    let Some(gone) = app.db.unlink_customer(event_id, kind, cus)? else { return Ok("duplicate") };
+    let d = json!({ "customer": cus, "eventId": event_id });
+    if let Some(user) = &gone.user {
+        app.db.record(&system(Some(user)).event("billing.customer_unlinked").target("user", user).details(d.clone()));
+    }
+    if let Some(team) = &gone.team {
+        app.db.record(&system(None).event("billing.customer_unlinked").target("team", team).details(d));
+    }
+    Ok(if gone == crate::db::Unlinked::default() { "unchanged" } else { "customer_unlinked" })
 }
 
 // Checkout and the customer portal (ADR 0042)
 
-fn off() -> Response {
+pub(crate) fn off() -> Response {
     reply(StatusCode::NOT_FOUND, json!({ "error": OFF }))
 }
 
 /// The person asking, never a Bot. Break-glass and loopback dev act as the owner account.
 #[allow(clippy::result_large_err)]
-fn person(app: &App, c: &Caller) -> Result<crate::db::User, Response> {
+pub(crate) fn person(app: &App, c: &Caller) -> Result<crate::db::User, Response> {
     crate::need_user(c.principal).map_err(IntoResponse::into_response)?;
     let id = c.user.as_ref().map_or(crate::users::OPERATOR, |u| u.id.as_str());
     app.db.user(id).ok_or_else(|| reply(StatusCode::NOT_FOUND, json!({ "error": "user not found" })))
@@ -596,12 +644,17 @@ pub async fn info(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>
         })
         .collect();
     let sub = paying(&app, &u.id);
+    let team = app.db.team_plan_of(&u.id).map(|s| {
+        let name = app.db.team(&s.team_id).map(|t| t.name);
+        json!({ "id": s.team_id, "name": name, "tier": s.tier, "periodEnd": s.period_end })
+    });
     reply(
         StatusCode::OK,
         json!({
             "plan": crate::tier_usage(&app, &u.id),
             "plans": plans,
             "subscription": sub.map(|s| json!({ "status": s.status, "tier": s.tier, "periodEnd": s.period_end })),
+            "teamPlan": team,
             "portal": app.db.customer_of(&u.id).is_some(),
             "canChange": crate::rbac::allows(c.principal, crate::rbac::Perm::Write),
             "emails": crate::billing_mail::view(&app, &u.id),
@@ -610,12 +663,12 @@ pub async fn info(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>
 }
 
 /// Counts a start for `user`; false once they've started too many this minute.
-fn may_start(co: &Checkout, user: &str) -> bool {
+pub(crate) fn may_start(co: &Checkout, user: &str) -> bool {
     co.starts.hit(user, crate::db::now()).is_none()
 }
 
 /// What became of the person's last checkout page.
-enum Last {
+pub(crate) enum Last {
     /// None open, or expired now: a new one may open.
     Closed,
     /// Paid: its subscription is on the way.
@@ -623,15 +676,46 @@ enum Last {
     Unknown(stripe::Error),
 }
 
-/// Expires the person's open checkout page, if any, so it can't be paid as well as the
+/// Who a checkout page is for: a person, or a team (ADR 0093).
+#[derive(Clone, Copy)]
+pub(crate) enum Payer<'a> {
+    User(&'a str),
+    Team(&'a str),
+}
+
+impl Payer<'_> {
+    pub(crate) fn open_checkout(self, app: &App) -> Option<String> {
+        match self {
+            Payer::User(u) => app.db.open_checkout(u),
+            Payer::Team(t) => app.db.team_open_checkout(t),
+        }
+    }
+
+    fn close_checkout(self, app: &App, session: &str) {
+        match self {
+            Payer::User(u) => app.db.close_checkout(u, session),
+            Payer::Team(t) => app.db.close_team_checkout(t, session),
+        }
+    }
+
+    /// Their part of an idempotency key: a team's can't be mistaken for a person's.
+    pub(crate) fn key(self) -> String {
+        match self {
+            Payer::User(u) => u.to_string(),
+            Payer::Team(t) => format!("team:{t}"),
+        }
+    }
+}
+
+/// Expires the payer's open checkout page, if any, so it can't be paid as well as the
 /// next. Stripe refuses to expire a page that isn't open; then its status says why.
-async fn close_last(app: &App, co: &Checkout, user: &str) -> Last {
-    let Some(id) = app.db.open_checkout(user) else { return Last::Closed };
+pub(crate) async fn close_last(app: &App, co: &Checkout, payer: Payer<'_>) -> Last {
+    let Some(id) = payer.open_checkout(app) else { return Last::Closed };
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        app.db.close_checkout(user, &id);
+        payer.close_checkout(app, &id);
         return Last::Closed;
     }
-    let key = stripe::idempotency_key("expire", user, &[("session".into(), id.clone())], crate::db::now());
+    let key = stripe::idempotency_key("expire", &payer.key(), &[("session".into(), id.clone())], crate::db::now());
     let status = match co.stripe.post(&format!("/v1/checkout/sessions/{id}/expire"), &[], &key).await {
         Ok(v) => v["status"].as_str().map(String::from),
         Err(stripe::Error::Refused { status, .. }) if status < 500 => match co.stripe.get(&format!("/v1/checkout/sessions/{id}")).await {
@@ -643,7 +727,7 @@ async fn close_last(app: &App, co: &Checkout, user: &str) -> Last {
     };
     match status.as_deref() {
         Some("expired") => {
-            app.db.close_checkout(user, &id);
+            payer.close_checkout(app, &id);
             Last::Closed
         }
         Some("complete") => Last::Paid,
@@ -654,7 +738,7 @@ async fn close_last(app: &App, co: &Checkout, user: &str) -> Last {
 /// Stripe's answer: the session's id and link, or a 502 that says only that Stripe
 /// didn't make one. The server log gets the status and Stripe's error type and code.
 #[allow(clippy::result_large_err)]
-fn session(what: &str, user: &str, res: Result<Value, stripe::Error>) -> Result<(String, String), (Response, String)> {
+pub(crate) fn session(what: &str, user: &str, res: Result<Value, stripe::Error>) -> Result<(String, String), (Response, String)> {
     let got = res.and_then(|v| match (v["id"].as_str(), v["url"].as_str()) {
         (Some(id), Some(url)) if url.starts_with("https://") => Ok((id.to_string(), url.to_string())),
         _ => Err(stripe::Error::Unreachable),
@@ -694,13 +778,17 @@ pub async fn checkout(State(app): State<AppState>, Extension(a): Extension<Arc<A
         app.db.record(&event(Outcome::Denied, json!({ "tier": tier.name, "reason": "already_subscribed", "subscription": s.subscription_id })));
         return reply(StatusCode::CONFLICT, json!({ "error": "You already pay for a plan. Change it under Manage billing.", "portal": true }));
     }
+    if let Some(s) = app.db.team_plan_of(&u.id) {
+        app.db.record(&event(Outcome::Denied, json!({ "tier": tier.name, "reason": "team_pays", "team": s.team_id })));
+        return reply(StatusCode::CONFLICT, json!({ "error": "Your team pays for your plan. Its owners and admins change it on the Team screen.", "teamPays": true }));
+    }
     if !may_start(co, &u.id) {
         return bad(StatusCode::TOO_MANY_REQUESTS, "Too many checkouts at once. Try again in a minute.".into());
     }
     let lock = co.lock(&u.id);
     let _one_at_a_time = lock.lock().await;
     let last = app.db.open_checkout(&u.id);
-    match close_last(&app, co, &u.id).await {
+    match close_last(&app, co, Payer::User(&u.id)).await {
         Last::Closed => {}
         Last::Paid => {
             app.db.record(&event(Outcome::Denied, json!({ "tier": tier.name, "reason": "checkout_completed", "session": last })));

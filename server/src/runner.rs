@@ -218,6 +218,8 @@ pub struct App {
     pub notifier: OnceLock<Arc<crate::notify::Notifier>>,
     /// Billing emails (ADR 0091). Unset: off, and nothing is queued.
     pub billing_mail: OnceLock<Arc<crate::billing_mail::BillingMail>>,
+    /// Team billing's seat sync (ADR 0093). Unset without Stripe checkout: off.
+    pub team_seats: OnceLock<Arc<crate::team_billing::Seats>>,
     /// Teammates' own harness logins for owners' shared Bots here (ADR 0064).
     pub teammate_logins: crate::teammate_logins::Local,
     /// Removals of leaving teammates' accounts here being tried now (ADR 0066).
@@ -265,6 +267,7 @@ impl App {
             meter: OnceLock::new(),
             notifier: OnceLock::new(),
             billing_mail: OnceLock::new(),
+            team_seats: OnceLock::new(),
             teammate_logins: Default::default(),
             account_removals: Default::default(),
             teammate_gate: Default::default(),
@@ -377,16 +380,22 @@ impl App {
         self.tiers.get().map_or_else(|| SELF_HOST.get_or_init(Tiers::self_host), |t| t.as_ref())
     }
 
-    /// The billing period `at` (Unix ms) falls in for a user (ADR 0050): their paid
-    /// subscription's month, else the calendar month.
+    /// The billing period `at` (Unix ms) falls in for a user (ADR 0050): the month of
+    /// the subscription that pays for their plan (their team's, ADR 0093, else their
+    /// own), else the calendar month.
     pub fn billing_period(&self, user_id: &str, at: i64) -> usage::Period {
-        let sub = self.db.subscription(user_id).filter(|s| s.tier.is_some());
-        usage::period_at(sub.map(|s| (s.period_start, s.period_end)), at)
+        let period = match self.db.team_plan_of(user_id) {
+            Some(t) => Some((t.period_start, t.period_end)),
+            None => self.db.subscription(user_id).filter(|s| s.tier.is_some()).map(|s| (s.period_start, s.period_end)),
+        };
+        usage::period_at(period, at)
     }
 
-    /// The tier a user is on: theirs, else the default.
+    /// The tier a user is on: the one their team pays for (ADR 0093), else theirs, else
+    /// the default.
     pub fn tier_of(&self, user_id: &str) -> &Tier {
-        self.tiers().of(self.db.user(user_id).and_then(|u| u.tier).as_deref())
+        let team = self.db.team_plan_of(user_id).and_then(|s| s.tier);
+        self.tiers().of(team.or_else(|| self.db.user(user_id).and_then(|u| u.tier)).as_deref())
     }
 
     /// What only admins see of a Bot: the model it's set to and the route it runs on.

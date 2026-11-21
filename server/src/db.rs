@@ -301,6 +301,91 @@ pub struct Change<'a> {
     pub other_paying: Option<&'a Subscription>,
 }
 
+/// Whom a deleted payment-provider customer was linked to.
+#[derive(Debug, Default, PartialEq)]
+pub struct Unlinked {
+    pub user: Option<String>,
+    pub team: Option<String>,
+}
+
+/// A team's subscription (ADR 0093), kept like a user's: its latest state, the seats
+/// the provider bills (`quantity`) and where bringing them in line with the team stands.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamSubscription {
+    pub team_id: String,
+    pub provider: String,
+    pub customer_id: Option<String>,
+    pub subscription_id: String,
+    pub status: String,
+    pub price_id: Option<String>,
+    /// The tier it pays for while it pays; None otherwise.
+    pub tier: Option<String>,
+    /// The subscription item whose quantity is the seats.
+    pub item_id: Option<String>,
+    pub quantity: Option<i64>,
+    pub period_start: Option<i64>,
+    pub period_end: Option<i64>,
+    /// When the provider will end it, Unix seconds.
+    pub cancel_at: Option<i64>,
+    pub started: i64,
+    pub event_created: i64,
+    pub updated_at: i64,
+    /// Who opened the checkout that made it, from its metadata.
+    pub paid_by: Option<String>,
+    /// Seat updates sent to the provider, ever: part of each one's idempotency key.
+    pub seat_tries: i64,
+    /// Seat updates that failed in a row, for the backoff.
+    pub seat_failures: i64,
+    pub seat_next_at: i64,
+    pub seat_error: Option<String>,
+}
+
+fn team_subscription_row(r: &Row) -> rusqlite::Result<TeamSubscription> {
+    Ok(TeamSubscription {
+        team_id: r.get("team_id")?,
+        provider: r.get("provider")?,
+        customer_id: r.get("customer_id")?,
+        subscription_id: r.get("subscription_id")?,
+        status: r.get("status")?,
+        price_id: r.get("price_id")?,
+        tier: r.get("tier")?,
+        item_id: r.get("item_id")?,
+        quantity: r.get("quantity")?,
+        period_start: r.get("period_start")?,
+        period_end: r.get("period_end")?,
+        cancel_at: r.get("cancel_at")?,
+        started: r.get("started")?,
+        event_created: r.get("event_created")?,
+        updated_at: r.get("updated_at")?,
+        paid_by: r.get("paid_by")?,
+        seat_tries: r.get("seat_tries")?,
+        seat_failures: r.get("seat_failures")?,
+        seat_next_at: r.get("seat_next_at")?,
+        seat_error: r.get("seat_error")?,
+    })
+}
+
+/// The team's paying subscription started last: the one that sets its plan.
+fn team_paying_in(c: &Connection, team_id: &str) -> rusqlite::Result<Option<TeamSubscription>> {
+    c.query_row(
+        "SELECT * FROM team_subscriptions WHERE team_id = ? AND tier IS NOT NULL ORDER BY started DESC, subscription_id DESC LIMIT 1",
+        [team_id],
+        team_subscription_row,
+    )
+    .optional()
+}
+
+/// What a team subscription event changed (`Db::apply_team_subscription`), for the
+/// billing emails it queues in the same transaction.
+pub struct TeamChange<'a> {
+    pub applied: &'a Applied,
+    pub before: Option<&'a TeamSubscription>,
+    pub paying_before: Option<&'a TeamSubscription>,
+    pub paying_after: Option<&'a TeamSubscription>,
+    pub other_paying: Option<&'a TeamSubscription>,
+}
+
 /// What linking a payment-provider customer to a user did (ADR 0042). A user has at most
 /// one customer and a customer pays for one user; the first link stands.
 #[derive(Debug, PartialEq)]
@@ -324,6 +409,10 @@ fn link_in(c: &Connection, user_id: &str, provider: &str, customer_id: &str, via
     if let Some(u) = by_customer {
         return Ok(if u == user_id { Linked::Already } else { Linked::OfAnotherUser(u) });
     }
+    // A team's customer (ADR 0093) pays for the team, never for one person.
+    if let Some(t) = customer_team_in(c, customer_id)? {
+        return Ok(Linked::OfAnotherUser(format!("team:{t}")));
+    }
     let by_user: Option<String> = c.query_row("SELECT customer_id FROM billing_customers WHERE user_id = ?", [user_id], |r| r.get(0)).optional()?;
     if let Some(other) = by_user {
         return Ok(Linked::UserHasAnother(other));
@@ -331,6 +420,35 @@ fn link_in(c: &Connection, user_id: &str, provider: &str, customer_id: &str, via
     c.execute(
         "INSERT INTO billing_customers (user_id, provider, customer_id, linked_at, linked_via) VALUES (?, ?, ?, ?, ?)",
         params![user_id, provider, customer_id, now(), via],
+    )?;
+    Ok(Linked::New)
+}
+
+fn customer_team_in(c: &Connection, customer_id: &str) -> rusqlite::Result<Option<String>> {
+    c.query_row("SELECT team_id FROM team_customers WHERE customer_id = ?", [customer_id], |r| r.get(0)).optional()
+}
+
+/// Links a payment-provider customer to a team (ADR 0093), as `link_in` does to a user:
+/// one customer per team, one team per customer, never a user's, and the first link stands.
+fn link_team_in(c: &Connection, team_id: &str, provider: &str, customer_id: &str, via: &str) -> rusqlite::Result<Linked> {
+    let deleted: bool = c.query_row("SELECT COUNT(*) FROM billing_deleted_customers WHERE customer_id = ?", [customer_id], |r| r.get(0))?;
+    if deleted {
+        return Ok(Linked::Deleted);
+    }
+    if let Some(t) = customer_team_in(c, customer_id)? {
+        return Ok(if t == team_id { Linked::Already } else { Linked::OfAnotherUser(format!("team:{t}")) });
+    }
+    let user: Option<String> = c.query_row("SELECT user_id FROM billing_customers WHERE customer_id = ?", [customer_id], |r| r.get(0)).optional()?;
+    if let Some(u) = user {
+        return Ok(Linked::OfAnotherUser(u));
+    }
+    let by_team: Option<String> = c.query_row("SELECT customer_id FROM team_customers WHERE team_id = ?", [team_id], |r| r.get(0)).optional()?;
+    if let Some(other) = by_team {
+        return Ok(Linked::UserHasAnother(other));
+    }
+    c.execute(
+        "INSERT INTO team_customers (team_id, provider, customer_id, linked_at, linked_via) VALUES (?, ?, ?, ?, ?)",
+        params![team_id, provider, customer_id, now(), via],
     )?;
     Ok(Linked::New)
 }
@@ -1312,7 +1430,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 37] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 38] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1350,7 +1468,52 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 37] = [
     migrate_machine_suspended_at,
     migrate_status_incidents,
     migrate_billing_emails,
+    migrate_team_billing,
 ];
+
+/// Team billing (ADR 0093): a team's own Stripe customer, its subscriptions (kept like
+/// a user's, with the seats Stripe bills and where syncing them stands), and its open
+/// checkout page. Subscriptions outlive a deleted team, so a late event for one is still
+/// placed, and ignored.
+fn migrate_team_billing(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS team_customers (
+          team_id TEXT PRIMARY KEY REFERENCES teams(id) ON DELETE CASCADE,
+          provider TEXT NOT NULL,
+          customer_id TEXT NOT NULL UNIQUE,
+          linked_at INTEGER NOT NULL,
+          linked_via TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS team_subscriptions (
+          subscription_id TEXT PRIMARY KEY,
+          team_id TEXT NOT NULL,
+          provider TEXT NOT NULL,
+          customer_id TEXT,
+          status TEXT NOT NULL,
+          price_id TEXT,
+          tier TEXT,
+          item_id TEXT,
+          quantity INTEGER,
+          period_start INTEGER,
+          period_end INTEGER,
+          cancel_at INTEGER,
+          started INTEGER NOT NULL,
+          event_created INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          paid_by TEXT,
+          seat_tries INTEGER NOT NULL DEFAULT 0,
+          seat_failures INTEGER NOT NULL DEFAULT 0,
+          seat_next_at INTEGER NOT NULL DEFAULT 0,
+          seat_error TEXT
+        );
+        CREATE INDEX IF NOT EXISTS team_subscriptions_team ON team_subscriptions(team_id, started);
+        CREATE TABLE IF NOT EXISTS team_checkouts (
+          team_id TEXT PRIMARY KEY REFERENCES teams(id) ON DELETE CASCADE,
+          session_id TEXT NOT NULL,
+          expires_at INTEGER NOT NULL
+        );",
+    )
+}
 
 /// Incident notes for the public status page (ADR 0090), written by admins. Each has a
 /// timeline of updates; the newest one's state is the incident's.
@@ -3735,10 +3898,13 @@ impl Db {
         let customer_user = |cus: &str| tx.query_row("SELECT user_id FROM billing_customers WHERE customer_id = ?", [cus], |r| r.get::<_, String>(0)).optional();
         let others_customer = match (&by_id, &sub.customer_id) {
             (Some(s), _) if s.user_id != sub.user_id => false,
-            (_, Some(cus)) => customer_user(cus).map_err(|e| e.to_string())?.is_some_and(|u| u != sub.user_id),
+            (_, Some(cus)) => {
+                customer_user(cus).map_err(|e| e.to_string())?.is_some_and(|u| u != sub.user_id) || customer_team_in(&tx, cus).map_err(|e| e.to_string())?.is_some()
+            }
             (_, None) => false,
         };
-        let outcome = if by_id.as_ref().is_some_and(|s| s.user_id != sub.user_id) {
+        let teams: bool = tx.query_row("SELECT COUNT(*) FROM team_subscriptions WHERE subscription_id = ?", [&sub.subscription_id], |r| r.get(0)).map_err(|e| e.to_string())?;
+        let outcome = if teams || by_id.as_ref().is_some_and(|s| s.user_id != sub.user_id) {
             Applied::OtherUser
         } else if others_customer {
             Applied::CustomerOfAnotherUser
@@ -3907,8 +4073,8 @@ impl Db {
     }
 
     /// Drops a customer the provider deleted, for one provider event. `Ok(None)`: the
-    /// event was applied already; `Ok(Some(None))`: no user had that customer.
-    pub fn unlink_customer(&self, event_id: &str, event_type: &str, customer_id: &str) -> Result<Option<Option<String>>, String> {
+    /// event was applied already; else the user or team (ADR 0093) that had it, if any.
+    pub fn unlink_customer(&self, event_id: &str, event_type: &str, customer_id: &str) -> Result<Option<Unlinked>, String> {
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
         if !first_delivery(&tx, event_id, event_type).map_err(|e| e.to_string())? {
@@ -3916,9 +4082,11 @@ impl Db {
         }
         let user: Option<String> =
             tx.query_row("DELETE FROM billing_customers WHERE customer_id = ? RETURNING user_id", [customer_id], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
+        let team: Option<String> =
+            tx.query_row("DELETE FROM team_customers WHERE customer_id = ? RETURNING team_id", [customer_id], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
         tx.execute("INSERT OR IGNORE INTO billing_deleted_customers (customer_id, deleted_at) VALUES (?, ?)", params![customer_id, now()]).map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(Some(user))
+        Ok(Some(Unlinked { user, team }))
     }
 
     /// The user's checkout session that may still be open (`expires_at` in seconds, as Stripe has it).
@@ -3938,6 +4106,249 @@ impl Db {
     /// Forgets the user's open checkout if it is `session_id` (closed, or paid).
     pub fn close_checkout(&self, user_id: &str, session_id: &str) {
         let _ = self.c().execute("DELETE FROM billing_checkouts WHERE user_id = ? AND session_id = ?", params![user_id, session_id]);
+    }
+
+    // Team billing (ADR 0093)
+
+    pub fn team_open_checkout(&self, team_id: &str) -> Option<String> {
+        let at = now() / 1000;
+        self.c().query_row("SELECT session_id FROM team_checkouts WHERE team_id = ? AND expires_at > ?", params![team_id, at], |r| r.get(0)).optional().ok().flatten()
+    }
+
+    pub fn set_team_open_checkout(&self, team_id: &str, session_id: &str, expires_at: i64) {
+        let _ = self.c().execute(
+            "INSERT INTO team_checkouts (team_id, session_id, expires_at) VALUES (?, ?, ?)
+             ON CONFLICT(team_id) DO UPDATE SET session_id = excluded.session_id, expires_at = excluded.expires_at",
+            params![team_id, session_id, expires_at],
+        );
+    }
+
+    pub fn close_team_checkout(&self, team_id: &str, session_id: &str) {
+        let _ = self.c().execute("DELETE FROM team_checkouts WHERE team_id = ? AND session_id = ?", params![team_id, session_id]);
+    }
+
+    /// The team's payment-provider customer.
+    pub fn team_customer(&self, team_id: &str) -> Option<String> {
+        self.c().query_row("SELECT customer_id FROM team_customers WHERE team_id = ?", [team_id], |r| r.get(0)).optional().ok().flatten()
+    }
+
+    /// The team a customer is linked to.
+    pub fn customer_team(&self, customer_id: &str) -> Option<String> {
+        customer_team_in(&self.c(), customer_id).ok().flatten()
+    }
+
+    /// Links a customer to a team for one provider event (a completed checkout). None:
+    /// the event was applied already.
+    pub fn link_team_customer(&self, event_id: &str, event_type: &str, team_id: &str, provider: &str, customer_id: &str) -> Result<Option<Linked>, String> {
+        let c = self.c();
+        let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
+        if !first_delivery(&tx, event_id, event_type).map_err(|e| e.to_string())? {
+            return Ok(None);
+        }
+        let linked = link_team_in(&tx, team_id, provider, customer_id, "checkout").map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(Some(linked))
+    }
+
+    /// The subscription that sets the team's plan, else the one with the latest event.
+    pub fn team_subscription(&self, team_id: &str) -> Option<TeamSubscription> {
+        let c = self.c();
+        team_paying_in(&c, team_id).ok().flatten().or_else(|| {
+            c.query_row("SELECT * FROM team_subscriptions WHERE team_id = ? ORDER BY event_created DESC, started DESC LIMIT 1", [team_id], team_subscription_row)
+                .optional()
+                .ok()
+                .flatten()
+        })
+    }
+
+    /// The subscription paying for the team's plan now, if one does.
+    pub fn team_paying(&self, team_id: &str) -> Option<TeamSubscription> {
+        team_paying_in(&self.c(), team_id).ok().flatten()
+    }
+
+    pub fn team_subscription_by_id(&self, subscription_id: &str) -> Option<TeamSubscription> {
+        self.c().query_row("SELECT * FROM team_subscriptions WHERE subscription_id = ?", [subscription_id], team_subscription_row).optional().ok().flatten()
+    }
+
+    /// The subscription paying for the plan of `user_id`'s team, if they're on one that
+    /// pays: then its plan is theirs (ADR 0093). One query, as every run asks.
+    pub fn team_plan_of(&self, user_id: &str) -> Option<TeamSubscription> {
+        self.c()
+            .query_row(
+                "SELECT s.* FROM team_members m JOIN team_subscriptions s ON s.team_id = m.team_id
+                 WHERE m.user_id = ? AND s.tier IS NOT NULL ORDER BY s.started DESC, s.subscription_id DESC LIMIT 1",
+                [user_id],
+                team_subscription_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Every team's paying subscription, for syncing seats.
+    pub fn teams_paying(&self) -> Vec<TeamSubscription> {
+        let c = self.c();
+        let Ok(mut s) = c.prepare(
+            "SELECT * FROM team_subscriptions s WHERE tier IS NOT NULL AND NOT EXISTS (
+               SELECT 1 FROM team_subscriptions o WHERE o.team_id = s.team_id AND o.tier IS NOT NULL
+               AND (o.started > s.started OR (o.started = s.started AND o.subscription_id > s.subscription_id)))
+             ORDER BY team_id",
+        ) else {
+            return Vec::new();
+        };
+        s.query_map([], team_subscription_row).map(|rows| rows.filter_map(Result::ok).collect()).unwrap_or_default()
+    }
+
+    pub fn team_member_count(&self, team_id: &str) -> i64 {
+        self.c().query_row("SELECT COUNT(*) FROM team_members WHERE team_id = ?", [team_id], |r| r.get(0)).unwrap_or(0)
+    }
+
+    /// Counts a seat update about to be sent, and returns how many have been, this one included.
+    pub fn team_seat_try(&self, subscription_id: &str) -> Result<i64, String> {
+        self.c()
+            .query_row("UPDATE team_subscriptions SET seat_tries = seat_tries + 1 WHERE subscription_id = ? RETURNING seat_tries", [subscription_id], |r| r.get(0))
+            .map_err(|e| e.to_string())
+    }
+
+    /// The provider now bills `quantity` seats.
+    pub fn team_seats_synced(&self, subscription_id: &str, quantity: i64) {
+        let _ = self.c().execute(
+            "UPDATE team_subscriptions SET quantity = ?, seat_failures = 0, seat_next_at = 0, seat_error = NULL, updated_at = ? WHERE subscription_id = ?",
+            params![quantity, now(), subscription_id],
+        );
+    }
+
+    /// A seat update failed: tried again at `next_at`.
+    pub fn team_seats_failed(&self, subscription_id: &str, error: &str, next_at: i64) -> i64 {
+        self.c()
+            .query_row(
+                "UPDATE team_subscriptions SET seat_failures = seat_failures + 1, seat_next_at = ?, seat_error = ? WHERE subscription_id = ? RETURNING seat_failures",
+                params![next_at, error, subscription_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+    }
+
+    /// Seats match the team again with no update of ours (the provider's own event said so).
+    pub fn team_seats_clear(&self, subscription_id: &str) {
+        let _ = self.c().execute("UPDATE team_subscriptions SET seat_failures = 0, seat_next_at = 0, seat_error = NULL WHERE subscription_id = ?", [subscription_id]);
+    }
+
+    /// Applies one team subscription event (ADR 0093) as `apply_subscription` does a
+    /// user's: once (`Duplicate`), in order (`Stale`), only to its own team (`OtherUser`:
+    /// another team's subscription), never through a customer someone else has
+    /// (`CustomerOfAnotherUser`: a user's or another team's), and the team's plan is its
+    /// paying subscription started last, so the order events arrive in doesn't matter.
+    /// `Changed` holds the team's plan before and after. The team is linked to the
+    /// subscription's customer if it has none, and `mail` queues the event's emails in
+    /// the same transaction.
+    pub fn apply_team_subscription(
+        &self,
+        event_id: &str,
+        event_type: &str,
+        sub: &TeamSubscription,
+        set_tier: bool,
+        mail: &dyn Fn(&TeamChange) -> Vec<crate::billing_mail::NewEmail>,
+    ) -> Result<(Applied, Option<Linked>, usize), String> {
+        let c = self.c();
+        let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
+        if !first_delivery(&tx, event_id, event_type).map_err(|e| e.to_string())? {
+            return Ok((Applied::Duplicate, None, 0));
+        }
+        let e = |e: rusqlite::Error| e.to_string();
+        let by_id = tx.query_row("SELECT * FROM team_subscriptions WHERE subscription_id = ?", [&sub.subscription_id], team_subscription_row).optional().map_err(e)?;
+        let personal: bool = tx.query_row("SELECT COUNT(*) FROM subscriptions WHERE subscription_id = ?", [&sub.subscription_id], |r| r.get(0)).map_err(e)?;
+        let others_customer = match &sub.customer_id {
+            Some(cus) => {
+                let user: Option<String> = tx.query_row("SELECT user_id FROM billing_customers WHERE customer_id = ?", [cus], |r| r.get(0)).optional().map_err(e)?;
+                user.is_some() || customer_team_in(&tx, cus).map_err(e)?.is_some_and(|t| t != sub.team_id)
+            }
+            None => false,
+        };
+        let (mut paying_before, mut paying_after, mut other_paying) = (None, None, None);
+        let outcome = if personal || by_id.as_ref().is_some_and(|s| s.team_id != sub.team_id) {
+            Applied::OtherUser
+        } else if others_customer {
+            Applied::CustomerOfAnotherUser
+        } else if by_id.as_ref().is_some_and(|s| {
+            let fin = |status: &str| crate::billing::FINAL.contains(&status);
+            let ended = |status: &str| crate::billing::ENDED.contains(&status);
+            sub.event_created < s.event_created
+                || (fin(&s.status) && !fin(&sub.status))
+                || (sub.event_created == s.event_created && ended(&s.status) && !ended(&sub.status))
+        }) {
+            Applied::Stale
+        } else {
+            let before = team_paying_in(&tx, &sub.team_id).map_err(e)?;
+            let tier = if set_tier { sub.tier.clone() } else { by_id.as_ref().and_then(|s| s.tier.clone()) };
+            tx.execute(
+                "INSERT INTO team_subscriptions (subscription_id, team_id, provider, customer_id, status, price_id, tier, item_id, quantity,
+                   period_start, period_end, cancel_at, started, event_created, updated_at, paid_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                 ON CONFLICT (subscription_id) DO UPDATE SET provider = ?3, customer_id = ?4, status = ?5, price_id = ?6, tier = ?7,
+                   item_id = COALESCE(?8, item_id), quantity = COALESCE(?9, quantity), period_start = ?10, period_end = ?11, cancel_at = ?12,
+                   event_created = ?14, updated_at = ?15, paid_by = COALESCE(paid_by, ?16)",
+                params![
+                    sub.subscription_id,
+                    sub.team_id,
+                    sub.provider,
+                    sub.customer_id,
+                    sub.status,
+                    sub.price_id,
+                    tier,
+                    sub.item_id,
+                    sub.quantity,
+                    sub.period_start,
+                    sub.period_end,
+                    sub.cancel_at,
+                    sub.started,
+                    sub.event_created,
+                    now(),
+                    sub.paid_by
+                ],
+            )
+            .map_err(e)?;
+            let after = team_paying_in(&tx, &sub.team_id).map_err(e)?;
+            other_paying = tx
+                .query_row(
+                    "SELECT * FROM team_subscriptions WHERE team_id = ? AND tier IS NOT NULL AND subscription_id != ? ORDER BY started DESC, subscription_id DESC LIMIT 1",
+                    [&sub.team_id, &sub.subscription_id],
+                    team_subscription_row,
+                )
+                .optional()
+                .map_err(e)?;
+            let id = |s: &Option<TeamSubscription>| s.as_ref().map(|s| s.subscription_id.clone());
+            let moved = id(&before) != id(&after);
+            let (from, to) = (before.as_ref().and_then(|s| s.tier.clone()), after.as_ref().and_then(|s| s.tier.clone()));
+            let outcome = if after.as_ref().is_some_and(|s| s.subscription_id != sub.subscription_id) && !moved {
+                Applied::Superseded
+            } else if from != to {
+                Applied::Changed { from, to }
+            } else {
+                Applied::Unchanged
+            };
+            paying_before = before;
+            paying_after = after;
+            outcome
+        };
+        let linked = match (&outcome, &sub.customer_id) {
+            (Applied::OtherUser | Applied::CustomerOfAnotherUser, _) | (_, None) => None,
+            (_, Some(cus)) => Some(link_team_in(&tx, &sub.team_id, &sub.provider, cus, "subscription").map_err(e)?),
+        };
+        let emails = mail(&TeamChange {
+            applied: &outcome,
+            before: by_id.as_ref(),
+            paying_before: paying_before.as_ref(),
+            paying_after: paying_after.as_ref(),
+            other_paying: other_paying.as_ref(),
+        });
+        let due = now() + crate::billing_mail::HOLD_MS;
+        let mut queued = 0;
+        for m in &emails {
+            queued += usize::from(queue_email(&tx, m, due).map_err(e)?);
+        }
+        tx.commit().map_err(e)?;
+        Ok((outcome, linked, queued))
     }
 
     // SSO identities (ADR 0014)
