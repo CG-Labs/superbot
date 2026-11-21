@@ -31,7 +31,9 @@ import type {
   SetupStatus,
   SignupApproval,
   SignupRequest,
+  TeammateAccounts,
   TeammateLoginsView,
+  TeammateRemoval,
   UserBots,
   UserIdentity,
   Visibility,
@@ -342,6 +344,21 @@ export class SuperBotApi {
 
   async userBots(id: string): Promise<UserBots> {
     return this.request<UserBots>("GET", `/api/users/${encodeURIComponent(id)}/bots`);
+  }
+
+  /** Teammates' own accounts on this server around the user (ADR 0066). null when teammates have none here. */
+  async teammateAccounts(id: string): Promise<TeammateAccounts | null> {
+    try {
+      return await this.request<TeammateAccounts>("GET", `/api/users/${encodeURIComponent(id)}/teammate-accounts`);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 409) return null;
+      throw err;
+    }
+  }
+
+  /** Removes `teammate`'s account for `owner`'s Bots now; `error` says why when it's still pending. */
+  async removeTeammateAccount(owner: string, teammate: string): Promise<{ removal: TeammateRemoval | null; error?: string }> {
+    return this.request("POST", `/api/users/${encodeURIComponent(owner)}/teammate-accounts/${encodeURIComponent(teammate)}/remove`);
   }
 
   /** The onboarding wizard's progress and checklist: admins only (ADR 0034). The wizard is in the console. */

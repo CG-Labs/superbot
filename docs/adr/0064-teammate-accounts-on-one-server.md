@@ -74,7 +74,7 @@ The Bot's memory is the Bot's (ADR 0046), and its original stays in `DATA_DIR`. 
 
 ## Limits and follow-ups
 
-- **Removing pair accounts when a teammate leaves.** ADR 0052 does this on machines. On a server, `superbot-userctl` has no `remove` yet, so a leaver's pair account and its login stay until removed by hand. They are no longer used: the person can't ask for runs or log in there.
+- **Removing pair accounts when a teammate leaves.** ADR 0052 does this on machines. On one server, [ADR 0066](0066-removing-teammate-accounts-on-one-server.md) does it.
 - **The network is shared**, as for every account on one server (ADR 0037). Egress limits are M5.
 - **Pi and Hermes** use API keys. There is nothing to log in.
 - **Team accounts and team machines** remain open on #30.

@@ -747,11 +747,12 @@ isolation_sudoers() {
   cat <<EOF
 # SuperBot per-user accounts (docs/adr/0037-per-user-unix-accounts.md). Written by
 # deploy/install.sh --isolation; --no-isolation removes it. botd's account may start
-# superbot-run (which runs a harness) as a per-user account, keeping the run's env, and
-# make a user's account with the root helper. Nothing else, and no one else.
+# superbot-run (which runs a harness) as a per-user account, keeping the run's env, make a
+# user's account with the root helper, and remove a leaving teammate's account
+# (docs/adr/0066-removing-teammate-accounts-on-one-server.md). Nothing else, and no one else.
 Defaults!$BIN_DIR/superbot-run !syslog
 $SUPERBOT_USER ALL=(%$ISOLATION_GROUP) NOPASSWD:SETENV: $BIN_DIR/superbot-run
-$SUPERBOT_USER ALL=(root) NOPASSWD: $USERCTL_BIN ensure *
+$SUPERBOT_USER ALL=(root) NOPASSWD: $USERCTL_BIN ensure *, $USERCTL_BIN remove *, $USERCTL_BIN purge *
 EOF
 }
 
