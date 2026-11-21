@@ -5,7 +5,8 @@
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::aead::rand_core::RngCore;
+use chacha20poly1305::aead::{Aead, KeyInit, OsRng, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -29,6 +30,12 @@ impl Drop for Botd {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+fn random_key() -> [u8; 32] {
+    let mut k = [0u8; 32];
+    OsRng.fill_bytes(&mut k);
+    k
 }
 
 fn free_port() -> u16 {
@@ -126,7 +133,7 @@ fn botd_rotates_its_master_key_from_a_previous_key_file() {
     for d in ["data", "workspace", "home", "keys"] {
         std::fs::create_dir_all(dir.join(d)).unwrap();
     }
-    let (a, b) = ([0x11u8; 32], [0x22u8; 32]);
+    let (a, b) = (random_key(), random_key());
     let key = dir.join("keys/master.key");
     let previous = dir.join("keys/master.key.previous");
     write_key(&key, a);
