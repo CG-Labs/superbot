@@ -364,7 +364,7 @@ pub(super) async fn step(app: &App, cp: &ControlPlane, e: &Enrollment, machine_i
                 && let Err(err) = p.boot(pid).await
                 && !transient(&err)
             {
-                eprintln!("Machine rebuild: starting {} after its rebuild: {err}", m.id);
+                crate::obs::log::log_warn!("Machine rebuild: starting {} after its rebuild: {err}", m.id);
             }
             if at > deadline {
                 let why = format!("It didn't enroll again within {} minutes of the rebuild.", (deadline - sent) / 60_000);

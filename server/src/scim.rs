@@ -152,7 +152,7 @@ fn conflict(e: ScimConflict) -> ScimError {
         ScimConflict::Gone => missing("User"),
         ScimConflict::NoSeat => ScimError::new(StatusCode::FORBIDDEN, None, "No seats left."),
         ScimConflict::Db(e) => {
-            eprintln!("scim: database error: {e}");
+            crate::obs::log::log_warn!("scim: database error: {e}");
             server_error("Database error")
         }
     }

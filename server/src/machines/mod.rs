@@ -1015,6 +1015,7 @@ pub async fn reconcile(app: &AppState, cp: &ControlPlane) -> Value {
     let Some(p) = cp.provider.as_deref() else {
         return json!({ "checked": 0, "changed": 0 });
     };
+    let started = std::time::Instant::now();
     let ids: Vec<String> = app
         .db
         .machines(None)
@@ -1038,6 +1039,7 @@ pub async fn reconcile(app: &AppState, cp: &ControlPlane) -> Value {
         let _g = cp.ops.lock().await;
         out["firewallAttached"] = firewall::sync(app, fw, p).await.into();
     }
+    app.db.metrics().reconciled(now(), started.elapsed().as_secs_f64());
     out
 }
 

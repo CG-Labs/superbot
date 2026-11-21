@@ -417,6 +417,57 @@ Admin actions (logins, Bot and routine changes, approvals, policy, handoffs) are
 - Both installs back it up: the bash timer and the Compose `backup` service take a SQLite `.backup` of `app.sqlite`, audit table included, and keep archives for `SUPERBOT_BACKUP_RETENTION_DAYS` (default 14). So a pruned event still exists in backups for that long; shorten it too if you must erase events.
 - Source IPs: the installer's Caddy is on loopback, so `botd` trusts its `X-Forwarded-For`. Compose sets `TRUST_FORWARDED_FOR=1`, since `botd` is reachable only through Caddy.
 
+## Metrics and logs
+
+Both are off by default, and the installer and Compose don't turn them on. Design and the full list of metrics: [ADR 0089](../docs/adr/0089-metrics-and-structured-logs.md).
+
+**Metrics.** `botd` serves Prometheus' text format at `/metrics` on a listener of its own, never on its main port, so Caddy never exposes it:
+
+| Setting in `.env` | Meaning |
+|---|---|
+| `METRICS_LISTEN` | `off` (default), `on` (`127.0.0.1:9464`), or an address and port such as `0.0.0.0:9464` |
+| `METRICS_TOKEN` or `METRICS_TOKEN_FILE` | A bearer token for scrapers, at least 24 characters. Required off loopback: `botd` won't start without it |
+
+The metrics cover requests (by route class, method and status class, with latency), Bot runs (by harness and result, with duration, plus runs underway, waiting and refused), approvals waiting and the oldest one's age, audit events worth alerting on (failed sign-ins, failed notifications, machine backups, RPO breaches, restores), and with managed machines, machines by state, the reconciler, and each tier's RPO status. Labels never hold ids, emails, names, paths or message text.
+
+On the installer's server, with a Prometheus (or Grafana Alloy, or an OpenTelemetry Collector) on the same host:
+
+```sh
+echo 'METRICS_LISTEN=on' | sudo tee -a ~superbot/superbot/.env
+sudo systemctl restart superbot
+curl -fsS http://127.0.0.1:9464/metrics | head
+```
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: superbot
+    static_configs:
+      - targets: ["127.0.0.1:9464"]
+```
+
+To scrape from another host, bind an address the scraper reaches, set a token, and let only the scraper through the firewall (`sudo ufw allow from <prometheus-ip> to any port 9464`):
+
+```sh
+openssl rand -hex 32 | sudo tee ~superbot/superbot/metrics-token >/dev/null
+sudo chown superbot: ~superbot/superbot/metrics-token && sudo chmod 600 ~superbot/superbot/metrics-token
+printf 'METRICS_LISTEN=0.0.0.0:9464\nMETRICS_TOKEN_FILE=%s\n' ~superbot/superbot/metrics-token | sudo tee -a ~superbot/superbot/.env
+sudo systemctl restart superbot
+```
+
+```yaml
+scrape_configs:
+  - job_name: superbot
+    authorization:
+      credentials_file: /etc/prometheus/superbot-token   # the same token
+    static_configs:
+      - targets: ["<server-ip>:9464"]
+```
+
+With Docker Compose, `botd` must listen beyond the container's loopback for a scraper to reach it, so a token is needed. In `deploy/docker/.env`, set `METRICS_LISTEN=0.0.0.0:9464` and `METRICS_TOKEN=<openssl rand -hex 32>`. The port isn't published: put the scraper on the `superbot_default` network and scrape `botd:9464`, or add `ports: ["127.0.0.1:9464:9464"]` to `botd` in a `docker-compose.override.yml` to scrape from the host.
+
+**Structured logs.** `LOG_FORMAT=json` (default `text`) makes `botd` print one JSON object per line, on stdout and stderr as before, for journald, Docker's logging drivers, or a shipper such as Vector or Promtail. Each has `ts` (UTC), `level` and `msg`. On top of `botd`'s own lines, it logs every request (`http.request`: request id, method, route template, route class, status, duration) and every run (`message.queued`, `run.started`, `run.finished`: run, message and Bot ids, harness, result, duration). No emails, names, IP addresses, message text, paths as sent or tokens; those stay in the [audit log](#audit-log-retention). Every response has an `X-Request-Id` header, the same id as its log line. An id sent in by a proxy is kept if it's plain (letters, digits, `-`, `_`, `.`, up to 64). `journalctl -u superbot -o cat | jq 'select(.msg == "run.finished")'` lists finished runs.
+
 ## Approval notifications
 
 A pending approval can reach people by email and a webhook when no app is open ([ADR 0061](../docs/adr/0061-approval-notifications.md)). Both are off until an admin turns them on; neither needs a paid service.

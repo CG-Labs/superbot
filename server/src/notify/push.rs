@@ -376,7 +376,7 @@ async fn send_routines(app: &App, push: &Push, bot_id: &str, person: &str, count
     if !ok {
         d["failed"] = json!(s.failed);
         d["error"] = json!(s.error.map(|e| crate::secrets::redact::text(&e).into_owned()));
-        eprintln!("Notification by push failed: {}", d["error"].as_str().unwrap_or("see the audit log"));
+        crate::obs::log::log_warn!("Notification by push failed: {}", d["error"].as_str().unwrap_or("see the audit log"));
     }
     let e = Event::new(Actor::system("notifications"), if ok { "notification.sent" } else { "notification.failed" })
         .outcome(if ok { Outcome::Success } else { Outcome::Failure })

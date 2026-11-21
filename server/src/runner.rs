@@ -611,7 +611,7 @@ impl App {
             .collect();
         match left.first() {
             None => self.db.save_isolation(true),
-            Some(p) => eprintln!("WARNING: couldn't remove {} old memory copies (e.g. {}); botd tries again at its next start.", left.len(), p.display()),
+            Some(p) => crate::obs::log::log_warn!("WARNING: couldn't remove {} old memory copies (e.g. {}); botd tries again at its next start.", left.len(), p.display()),
         }
     }
 
@@ -690,7 +690,7 @@ impl App {
                 Ok(run_as)
             }
             Err(e) => {
-                eprintln!("Isolation: couldn't set up a user's account (see isolation.account_failed in the audit log): {e}");
+                crate::obs::log::log_warn!("Isolation: couldn't set up a user's account (see isolation.account_failed in the audit log): {e}");
                 details["error"] = json!(e);
                 self.db.record(&event("isolation.account_failed").outcome(Outcome::Failure).details(details));
                 Err(e)
@@ -732,6 +732,12 @@ impl App {
 
     pub fn enqueue(self: &Arc<Self>, msg: Message) {
         let bot_id = msg.bot_id.clone();
+        // Ties the request that queued it (if any) to the run's lines, by message id.
+        crate::obs::log::event(
+            crate::obs::log::Level::Info,
+            "message.queued",
+            json!({ "requestId": crate::obs::request_id(), "messageId": msg.id, "botId": bot_id, "trigger": msg.role }),
+        );
         let mut st = self.state();
         let s = st.entry(bot_id.clone()).or_default();
         s.queue.push_back(msg);
@@ -944,6 +950,7 @@ impl App {
         self.init_bot_files(&bot);
         self.db.set_status(msg.id, "running");
         let started = Instant::now();
+        let _active = self.db.metrics().run_started(&bot.harness);
         let from = || msg.from_bot.as_deref().and_then(|id| self.db.bot(id)).map(|b| format!("{} (id {})", b.name, b.id)).unwrap_or("another Bot".into());
         let prompt = match msg.role.as_str() {
             "routine" => format!("(Scheduled routine) {}", msg.text),
@@ -953,6 +960,11 @@ impl App {
         };
         let host = json!({ "host": if spot.machine.is_some() { "machine" } else { "server" }, "machine": spot.machine.as_ref().map(|m| &m.machine_id) });
         let run_id = format!("r{}", crate::random_hex(8));
+        crate::obs::log::event(
+            crate::obs::log::Level::Info,
+            "run.started",
+            json!({ "runId": run_id, "messageId": msg.id, "botId": bot.id, "harness": bot.harness, "trigger": msg.role, "host": host["host"] }),
+        );
         // Tokens every attempt reported: a retried attempt spent them too.
         let mut used: Vec<Usage> = Vec::new();
         // A retried attempt is the same task, so what was approved for it still holds.
@@ -980,6 +992,15 @@ impl App {
                     if attempt == 0 {
                         self.give_back(&bot, msg, &period.key);
                     }
+                    self.db.metrics().run_finished(&bot.harness, "stopped", started.elapsed().as_secs_f64());
+                    crate::obs::log::event(
+                        crate::obs::log::Level::Warn,
+                        "run.finished",
+                        json!({
+                            "runId": run_id, "messageId": msg.id, "botId": bot.id, "harness": bot.harness, "trigger": msg.role, "host": host["host"],
+                            "result": "stopped", "durationMs": started.elapsed().as_millis() as u64, "attempts": attempt,
+                        }),
+                    );
                     self.say(&bot.id, "Stopped.", true);
                     return;
                 }
@@ -1183,6 +1204,15 @@ impl App {
                 finished["runGrants"] = json!(grants.iter().map(|g| &g.approval_id).collect::<Vec<_>>());
             }
             self.db.record(&by.event("bot.run_finished").target("message", &msg.id.to_string()).bot(&bot.id).outcome(outcome).details(finished));
+            self.db.metrics().run_finished(&bot.harness, result, started.elapsed().as_secs_f64());
+            crate::obs::log::event(
+                if outcome == Outcome::Success { crate::obs::log::Level::Info } else { crate::obs::log::Level::Warn },
+                "run.finished",
+                json!({
+                    "runId": run_id, "messageId": msg.id, "botId": bot.id, "harness": bot.harness, "trigger": msg.role, "host": host["host"],
+                    "result": result, "durationMs": started.elapsed().as_millis() as u64, "attempts": attempt + 1,
+                }),
+            );
             match reason {
                 Some("shutdown") => {}
                 Some("stopped") => self.say(&id, "Stopped.", true),
@@ -1716,7 +1746,7 @@ impl App {
             return refused("no_account", &format!("I couldn't set up {whose} on this server, so I didn't run. An admin can check the server log."), json!({}));
         };
         if let Err(e) = iso.make_bot_dirs_in(space, &bot.id) {
-            eprintln!("Isolation: couldn't make a Bot's folders in its account's folder: {e}");
+            crate::obs::log::log_warn!("Isolation: couldn't make a Bot's folders in its account's folder: {e}");
             return refused("no_account", &format!("I couldn't set up my folders in {whose} on this server, so I didn't run. An admin can check the server log."), json!({}));
         }
         if teammate.is_some()
@@ -1773,7 +1803,7 @@ impl App {
             Err(why) => {
                 let aside = copy.with_extension("md.unsaved");
                 let kept = copy.parent().is_some_and(accounts::trusted_dir) && std::fs::rename(copy, &aside).is_ok();
-                eprintln!("WARNING: couldn't save a teammate's run's memory for a Bot ({why}); see bot.memory_unsaved in the audit log.");
+                crate::obs::log::log_warn!("WARNING: couldn't save a teammate's run's memory for a Bot ({why}); see bot.memory_unsaved in the audit log.");
                 let details = json!({ "reason": why, "owner": bot.owner_id, "keptAt": kept.then(|| aside.display().to_string()) });
                 self.db.record(&by.event("bot.memory_unsaved").bot(&bot.id).outcome(Outcome::Failure).details(details));
             }
@@ -1933,7 +1963,7 @@ impl App {
         let period = self.billing_period(&bot.owner_id, at);
         let before = tier.limits.monthly_tokens.map(|_| self.db.tokens_used(&bot.owner_id, period.start, period.end));
         if let Err(e) = self.db.record_tokens(&rows) {
-            eprintln!("botd: couldn't record run {run_id}'s tokens: {e}");
+            crate::obs::log::log_warn!("botd: couldn't record run {run_id}'s tokens: {e}");
         }
         if let (Some(limit), Some(before)) = (tier.limits.monthly_tokens, before)
             && before < limit

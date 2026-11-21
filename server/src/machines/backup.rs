@@ -584,7 +584,7 @@ async fn run(app: &App, cp: &ControlPlane, off: &Offsite, m: &Machine, b: &Machi
             Err(e) => Err(e.to_string()),
         };
         if let Err(e) = p.delete_backup(&pid, &name).await {
-            eprintln!("Machine backups: deleting {name} at the provider: {e} (it expires by itself)");
+            crate::obs::log::log_warn!("Machine backups: deleting {name} at the provider: {e} (it expires by itself)");
         }
         let (size, sha) = sent?;
         let manifest = json!({
@@ -653,7 +653,7 @@ pub async fn prune(app: &App, off: &Offsite) -> usize {
                 }
             }
             Ok(()) => {}
-            Err(e) => eprintln!("Machine backups: deleting {} past its retention: {e}", b.id),
+            Err(e) => crate::obs::log::log_warn!("Machine backups: deleting {} past its retention: {e}", b.id),
         }
     }
     gone
@@ -730,11 +730,11 @@ async fn clean_up(app: &App, cp: &ControlPlane, mut left: Vec<MachineRestore>) {
             // Stopped between deleting the old container and renaming the copy, the copy
             // is all that's left of the machine.
             if r.state == "replacing" && p.get(&provider_id(&m)).await.is_err() {
-                eprintln!("Machine backups: kept {}'s restore copy: its container is gone", m.id);
+                crate::obs::log::log_warn!("Machine backups: kept {}'s restore copy: its container is gone", m.id);
                 continue;
             }
             if let Err(e) = p.delete(&staging(p, &m, &r)).await {
-                eprintln!("Machine backups: deleting {}'s interrupted restore copy: {e}", m.id);
+                crate::obs::log::log_warn!("Machine backups: deleting {}'s interrupted restore copy: {e}", m.id);
                 again.push(r);
             }
         }

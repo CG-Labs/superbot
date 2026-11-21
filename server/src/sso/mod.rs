@@ -562,7 +562,7 @@ pub async fn start(
     let endpoint = match p.authorization_endpoint(sso.http(), sso.refresh_gap).await {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("SSO {id}: discovery failed: {e}");
+            crate::obs::log::log_warn!("SSO {id}: discovery failed: {e}");
             return no_store(ret.fail("sso_failed"));
         }
     };

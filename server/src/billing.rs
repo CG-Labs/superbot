@@ -338,7 +338,7 @@ pub async fn webhook(State(app): State<AppState>, Extension(a): Extension<Arc<Au
         Ok(outcome) => reply(StatusCode::OK, json!({ "received": true, "outcome": outcome })),
         // Stripe retries a 500, which is right for a database hiccup.
         Err(e) => {
-            eprintln!("billing: Stripe event {id}: {e}");
+            crate::obs::log::log_warn!("billing: Stripe event {id}: {e}");
             reply(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": "Couldn't save the event; Stripe will retry." }))
         }
     }
@@ -660,7 +660,7 @@ fn session(what: &str, user: &str, res: Result<Value, stripe::Error>) -> Result<
         _ => Err(stripe::Error::Unreachable),
     });
     got.map_err(|e| {
-        eprintln!("billing: Stripe {what} session for {user}: {e}");
+        crate::obs::log::log_warn!("billing: Stripe {what} session for {user}: {e}");
         let msg = format!("Stripe couldn't open the {what} just now. Try again in a minute; if it keeps happening, an admin can see why in the server log.");
         (reply(StatusCode::BAD_GATEWAY, json!({ "error": msg })), e.to_string())
     })
@@ -707,7 +707,7 @@ pub async fn checkout(State(app): State<AppState>, Extension(a): Extension<Arc<A
             return reply(StatusCode::CONFLICT, json!({ "error": "Your last checkout went through. Your plan changes as soon as Stripe confirms the payment." }));
         }
         Last::Unknown(e) => {
-            eprintln!("billing: closing {}'s last Stripe checkout: {e}", u.id);
+            crate::obs::log::log_warn!("billing: closing {}'s last Stripe checkout: {e}", u.id);
             app.db.record(&event(Outcome::Failure, json!({ "tier": tier.name, "reason": format!("last checkout: {e}"), "session": last })));
             return bad(StatusCode::BAD_GATEWAY, "Stripe couldn't open the checkout just now. Try again in a minute; if it keeps happening, an admin can see why in the server log.".into());
         }
@@ -823,7 +823,7 @@ pub async fn send_meter_events(app: &App, m: &Meter) -> usize {
             Err(e) => {
                 app.db.meter_result(row.id, None);
                 // Stripe is down or busy: try the rest next pass.
-                eprintln!("botd: Stripe meter: {e}; trying again in a minute");
+                crate::obs::log::log_warn!("botd: Stripe meter: {e}; trying again in a minute");
                 break;
             }
         }

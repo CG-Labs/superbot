@@ -111,7 +111,7 @@ pub type SeatCap = Box<dyn Fn() -> Option<u32> + Send + Sync>;
 /// The connection, and the seat limit every way of adding or re-enabling a user checks
 /// under the same lock. Unset (as in most tests): no limit.
 /// `.2`: TEAMS=on (ADR 0087), so people in no team share Bots with nobody.
-pub struct Db(Mutex<Connection>, std::sync::OnceLock<SeatCap>, std::sync::atomic::AtomicBool);
+pub struct Db(Mutex<Connection>, std::sync::OnceLock<SeatCap>, std::sync::atomic::AtomicBool, crate::obs::Metrics);
 
 pub fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -2727,7 +2727,7 @@ impl Db {
             tx.pragma_update(None, "user_version", i as i64 + 1)?;
             tx.commit()?;
         }
-        Ok(Db(Mutex::new(c), std::sync::OnceLock::new(), std::sync::atomic::AtomicBool::new(false)))
+        Ok(Db(Mutex::new(c), std::sync::OnceLock::new(), std::sync::atomic::AtomicBool::new(false), crate::obs::Metrics::default()))
     }
 
     fn c(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -2741,6 +2741,11 @@ impl Db {
 
     fn seat_cap(&self) -> Option<u32> {
         self.1.get().and_then(|f| f())
+    }
+
+    /// This server's counters for `/metrics` (ADR 0089).
+    pub fn metrics(&self) -> &crate::obs::Metrics {
+        &self.3
     }
 
     // Generic settings, for small values that need no table of their own.
@@ -3232,6 +3237,13 @@ impl Db {
             .prepare("SELECT * FROM approvals WHERE (?1 IS NULL OR status = ?1) AND (?2 IS NULL OR bot_id = ?2) ORDER BY created_at DESC, rowid DESC LIMIT ?3")
             .unwrap();
         s.query_map(params![status, bot_id, limit], approval_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// How many approvals are pending, and when the oldest was asked for.
+    pub fn approvals_pending(&self) -> (i64, Option<i64>) {
+        self.c()
+            .query_row("SELECT COUNT(*), MIN(created_at) FROM approvals WHERE status = 'pending'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap_or((0, None))
     }
 
     /// Like `approvals`, but only for these Bots, so `limit` counts only their rows.
@@ -4472,8 +4484,9 @@ impl Db {
             ],
         );
         if let Err(err) = res {
-            eprintln!("audit: could not record {}: {err}", e.action);
+            crate::obs::log::log_warn!("audit: could not record {}: {err}", e.action);
         }
+        self.metrics().audited(&e.action, e.outcome.as_str(), e.details.get("reason").and_then(|r| r.as_str()));
     }
 
     /// Newest first (or oldest first with `oldest_first`), filtered, at most `limit`.

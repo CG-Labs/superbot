@@ -825,7 +825,7 @@ impl Notifier {
                 e = e.bot(&n.bot_id);
             }
             if !ok {
-                eprintln!("Notification by {} failed: {}", ch.name(), d["error"].as_str().unwrap_or("see the audit log"));
+                crate::obs::log::log_warn!("Notification by {} failed: {}", ch.name(), d["error"].as_str().unwrap_or("see the audit log"));
             }
             out.push(json!({ "channel": ch.name(), "ok": ok, "delivered": d["delivered"], "error": d["error"] }));
             app.db.record(&e.details(d));
