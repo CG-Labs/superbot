@@ -118,7 +118,7 @@ If any check fails, botd makes nothing, and the machine shows the reason. Incus 
 
 ### Placement and routing are unchanged
 
-A container is a machine with `provider: incus`, an id equal to its name, and its bridge address as `ipv4`. botd dials the agent there, so botd needs a route to the bridge. On the same host that is direct. From another host, route the bridge's subnet to the Incus host. Everything after enrollment is the same code path as Linode.
+A container is a machine with `provider: incus`, an id equal to its name (`<host>/<name>` since botd can have several hosts, [ADR 0076](0076-restoring-onto-another-incus-host.md)), and its bridge address as `ipv4`. botd dials the agent there, so botd needs a route to the bridge. On the same host that is direct. From another host, route the bridge's subnet to the Incus host. Everything after enrollment is the same code path as Linode.
 
 ### Switching providers
 

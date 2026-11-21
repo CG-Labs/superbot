@@ -1139,7 +1139,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 28] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 29] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1168,7 +1168,73 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 28] = [
     migrate_account_removals,
     migrate_machine_backups,
     migrate_machine_recovery,
+    migrate_machine_hosts,
 ];
+
+/// The hosts machines are on (ADR 0076): the certificate each was first seen with, so
+/// one can't be swapped for another under the same name, and what botd last found.
+/// Restores say which host they moved a machine from and to, and why.
+fn migrate_machine_hosts(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS machine_hosts (
+          name TEXT PRIMARY KEY,
+          url TEXT NOT NULL,
+          fingerprint TEXT NOT NULL,
+          state TEXT NOT NULL DEFAULT 'up' CHECK (state IN ('up', 'down', 'lost')),
+          failing_since INTEGER,
+          checked_at INTEGER,
+          last_error TEXT,
+          down_at INTEGER,
+          lost_at INTEGER,
+          lost_by TEXT,
+          created_at INTEGER NOT NULL
+        );",
+    )?;
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machine_restores') WHERE name = 'to_host'", [], |r| r.get(0))?;
+    if !has {
+        c.execute_batch(
+            "ALTER TABLE machine_restores ADD COLUMN from_host TEXT;
+            ALTER TABLE machine_restores ADD COLUMN to_host TEXT;
+            ALTER TABLE machine_restores ADD COLUMN reason TEXT;",
+        )?;
+    }
+    Ok(())
+}
+
+/// An Incus host machines are on (ADR 0076). `state`: `up`, `down` (it hasn't answered
+/// since `failing_since`, for longer than the host-down time), or `lost` (an admin
+/// said so; never called again).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineHost {
+    pub name: String,
+    pub url: String,
+    pub fingerprint: String,
+    pub state: String,
+    pub failing_since: Option<i64>,
+    pub checked_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub down_at: Option<i64>,
+    pub lost_at: Option<i64>,
+    pub lost_by: Option<String>,
+    pub created_at: i64,
+}
+
+fn machine_host_row(r: &Row) -> rusqlite::Result<MachineHost> {
+    Ok(MachineHost {
+        name: r.get("name")?,
+        url: r.get("url")?,
+        fingerprint: r.get("fingerprint")?,
+        state: r.get("state")?,
+        failing_since: r.get("failing_since")?,
+        checked_at: r.get("checked_at")?,
+        last_error: r.get("last_error")?,
+        down_at: r.get("down_at")?,
+        lost_at: r.get("lost_at")?,
+        lost_by: r.get("lost_by")?,
+        created_at: r.get("created_at")?,
+    })
+}
 
 /// Off-host backups of machines and restores from them (ADR 0071). At most one backup
 /// running and one restore underway per machine.
@@ -1341,6 +1407,11 @@ pub struct MachineRestore {
     pub duration_ms: Option<i64>,
     /// When it was seen to take longer than `rto_ms`.
     pub rto_exceeded_at: Option<i64>,
+    /// The hosts it was restored from and onto, where the provider has several (ADR 0076).
+    pub from_host: Option<String>,
+    pub to_host: Option<String>,
+    /// `host_lost` when its host was declared lost; None when an admin asked.
+    pub reason: Option<String>,
 }
 
 fn machine_restore_row(r: &Row) -> rusqlite::Result<MachineRestore> {
@@ -1358,6 +1429,9 @@ fn machine_restore_row(r: &Row) -> rusqlite::Result<MachineRestore> {
         rto_ms: r.get("rto_ms")?,
         duration_ms: r.get("duration_ms")?,
         rto_exceeded_at: r.get("rto_exceeded_at")?,
+        from_host: r.get("from_host")?,
+        to_host: r.get("to_host")?,
+        reason: r.get("reason")?,
     })
 }
 
@@ -1368,6 +1442,18 @@ pub struct NewMachineBackup<'a> {
     pub object_key: &'a str,
     pub encrypted: bool,
     pub created_by: Option<&'a str>,
+}
+
+/// A restore to start: `machine_restore_start`.
+pub struct NewMachineRestore<'a> {
+    pub id: &'a str,
+    pub machine: &'a Machine,
+    pub backup_id: &'a str,
+    pub by: Option<&'a str>,
+    pub rto_ms: Option<i64>,
+    pub from_host: Option<&'a str>,
+    pub to_host: Option<&'a str>,
+    pub reason: Option<&'a str>,
 }
 
 /// Rebuilding machines enrolled before ADR 0039 with today's agent (ADR 0056).
@@ -4769,18 +4855,101 @@ impl Db {
             == 1
     }
 
-    /// Starts a restore of the machine from `backup_id`, unless one is underway.
-    pub fn machine_restore_start(&self, id: &str, m: &Machine, backup_id: &str, by: Option<&str>, rto_ms: Option<i64>) -> Option<MachineRestore> {
+    /// Starts a restore of the machine, unless one is underway.
+    pub fn machine_restore_start(&self, n: &NewMachineRestore) -> Option<MachineRestore> {
         let made = self
             .c()
             .execute(
-                "INSERT OR IGNORE INTO machine_restores (id, machine_id, backup_id, state, created_by, created_at, tier, rto_ms)
-                 VALUES (?, ?, ?, 'importing', ?, ?, ?, ?)",
-                params![id, m.id, backup_id, by, now(), m.tier, rto_ms],
+                "INSERT OR IGNORE INTO machine_restores (id, machine_id, backup_id, state, created_by, created_at, tier, rto_ms, from_host, to_host, reason)
+                 VALUES (?, ?, ?, 'importing', ?, ?, ?, ?, ?, ?, ?)",
+                params![n.id, n.machine.id, n.backup_id, n.by, now(), n.machine.tier, n.rto_ms, n.from_host, n.to_host, n.reason],
             )
             .unwrap_or(0)
             == 1;
-        if made { self.machine_restore(id) } else { None }
+        if made { self.machine_restore(n.id) } else { None }
+    }
+
+    // Hosts (ADR 0076)
+
+    pub fn machine_hosts(&self) -> Vec<MachineHost> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM machine_hosts ORDER BY created_at, name").unwrap();
+        s.query_map([], machine_host_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    pub fn machine_host(&self, name: &str) -> Option<MachineHost> {
+        self.c().query_row("SELECT * FROM machine_hosts WHERE name = ?", [name], machine_host_row).optional().ok().flatten()
+    }
+
+    /// Records a host the first time it is configured; its address may change later,
+    /// its certificate may not.
+    pub fn machine_host_add(&self, name: &str, url: &str, fingerprint: &str) -> MachineHost {
+        let c = self.c();
+        c.execute(
+            "INSERT INTO machine_hosts (name, url, fingerprint, created_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(name) DO UPDATE SET url = ?2",
+            params![name, url, fingerprint, now()],
+        )
+        .unwrap();
+        c.query_row("SELECT * FROM machine_hosts WHERE name = ?", [name], machine_host_row).unwrap()
+    }
+
+    /// It answered: up again, if it was down. Returns whether it was down.
+    pub fn machine_host_answered(&self, name: &str) -> bool {
+        let c = self.c();
+        let was_down = c
+            .query_row("SELECT state = 'down' FROM machine_hosts WHERE name = ?", [name], |r| r.get::<_, bool>(0))
+            .unwrap_or(false);
+        c.execute(
+            "UPDATE machine_hosts SET state = 'up', failing_since = NULL, last_error = NULL, down_at = NULL, checked_at = ?1
+             WHERE name = ?2 AND state != 'lost'",
+            params![now(), name],
+        )
+        .unwrap();
+        was_down
+    }
+
+    /// It didn't answer: since when it hasn't.
+    pub fn machine_host_failed(&self, name: &str, error: &str) -> Option<i64> {
+        let c = self.c();
+        c.execute(
+            "UPDATE machine_hosts SET failing_since = COALESCE(failing_since, ?1), last_error = ?2, checked_at = ?1
+             WHERE name = ?3 AND state != 'lost'",
+            params![now(), crate::audit::clip(error, 300), name],
+        )
+        .unwrap();
+        c.query_row("SELECT failing_since FROM machine_hosts WHERE name = ?", [name], |r| r.get(0)).ok().flatten()
+    }
+
+    /// Up to down, once. Returns whether this call did it.
+    pub fn machine_host_down(&self, name: &str) -> bool {
+        self.c()
+            .execute("UPDATE machine_hosts SET state = 'down', down_at = ? WHERE name = ? AND state = 'up' AND failing_since IS NOT NULL", params![now(), name])
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Declared lost, once. Returns whether this call did it.
+    pub fn machine_host_lost(&self, name: &str, by: Option<&str>) -> bool {
+        self.c()
+            .execute("UPDATE machine_hosts SET state = 'lost', lost_at = ?, lost_by = ? WHERE name = ? AND state != 'lost'", params![now(), by, name])
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Gives a machine its new provider id, as after a move to another host.
+    pub fn set_machine_provider_id(&self, machine_id: &str, provider_id: &str) {
+        self.c().execute("UPDATE machines SET provider_id = ?, updated_at = ? WHERE id = ?", params![provider_id, now(), machine_id]).unwrap();
+    }
+
+    /// The firewall a machine is behind now, as after a move to a host that has only today's.
+    pub fn set_machine_firewall_id(&self, machine_id: &str, firewall_id: Option<&str>) {
+        self.c().execute("UPDATE machines SET firewall_id = ?, updated_at = ? WHERE id = ?", params![firewall_id, now(), machine_id]).unwrap();
+    }
+
+    #[cfg(test)]
+    pub fn machine_host_failing_backdate(&self, name: &str, ms: i64) {
+        self.c().execute("UPDATE machine_hosts SET failing_since = failing_since - ?1 WHERE name = ?2", params![ms, name]).unwrap();
     }
 
     pub fn machine_restore(&self, id: &str) -> Option<MachineRestore> {

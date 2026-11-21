@@ -79,6 +79,8 @@ pub struct World {
     pub version: Option<String>,
     /// Instance backups by instance and name: the export file's bytes.
     pub backups: BTreeMap<(String, String), Vec<u8>>,
+    /// Every request fails as from a host that is gone, and isn't recorded.
+    pub down: bool,
     ops: BTreeMap<String, Op>,
     trusted: Vec<String>,
     next_ip: u8,
@@ -457,6 +459,9 @@ async fn handle(
     body: Bytes,
 ) -> Response {
     let mut w = world.lock().unwrap();
+    if w.down {
+        return err(503, "the host is down");
+    }
     let trusted = peer
         .cert
         .as_ref()

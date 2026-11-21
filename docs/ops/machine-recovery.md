@@ -30,6 +30,9 @@ botd checks every machine each reconcile interval (`MACHINE_RECONCILE_SECONDS`, 
 | Back within its RPO | `machine.rpo_recovered` | A backup lands. The breach also ends, silently, when the RPO is raised past its age or the machine stops counting (suspended, destroyed, restoring). |
 | Restore past its RTO | `machine.restore_rto_exceeded` (failure) | A restore still underway past the RTO (`underway: true`), or one that took longer (`underway: false`). Once per restore. |
 | Restore failed | `machine.restore_failed` (failure) | As before (ADR 0071); now alerted too. |
+| Incus host down | `machine.host_down` (failure, target type `host`) | A host hasn't answered for `INCUS_HOST_DOWN_MINUTES` (10). Once each time ([ADR 0076](../adr/0076-restoring-onto-another-incus-host.md)). |
+| Incus host up again | `machine.host_up` | A down host answers again. |
+| Incus host declared lost | `machine.host_lost` (failure) | An admin recovered it (below). Once. |
 
 `machine.restored` carries `durationMs`, `rtoMs` and `withinRto`.
 
@@ -51,7 +54,7 @@ The console's Machines page shows an off-host backup column (age, the tier's RPO
 
 ### In CI, on a real Incus host
 
-The `incus-e2e` workflow ([ADR 0069](../adr/0069-validating-incus-containers-on-a-real-host.md)) backs a real container up, changes it, restores it, and fails if the restore took longer than the tier's RTO. The timing is in the job summary and in the `restore-drill-<incus>` artifact (`durationMs`, `rtoMs`, `backupBytes`). It runs on changes to the machine code, weekly, and by hand. The CI container's disk is small, so this proves the path and the clock, not how long a full 80 GB disk takes. On the runner a 253 MB backup restores in about a minute, roughly 5 MB/s of import; drill a large machine on your own hardware before you promise 60 minutes for one.
+The `incus-e2e` workflow ([ADR 0069](../adr/0069-validating-incus-containers-on-a-real-host.md)) backs a real container up, changes it, restores it, and fails if the restore took longer than the tier's RTO. The timing is in the job summary and in the `restore-drill-<incus>` artifact (`durationMs`, `rtoMs`, `backupBytes`). It runs on changes to the machine code, weekly, and by hand. It drills losing a whole host too: one Incus with a second project stands in for a second host, the first "host" stops answering and its container is deleted, and the test declares it lost, restores the container into the second project and fails past the RTO (artifact `host-drill-<incus>`, with `fromHost` and `toHost`). The CI container's disk is small, so this proves the path and the clock, not how long a full 80 GB disk takes. On the runner a 253 MB backup restores in about a minute, roughly 5 MB/s of import; drill a large machine on your own hardware before you promise 60 minutes for one.
 
 ### By hand, on your server
 
@@ -72,4 +75,24 @@ Keep each run's last line (the JSON with `durationMs` and `rtoMs`) with your dri
 
 - Noticing the loss and deciding to restore.
 - Bringing back botd itself, if it was lost too ([backup and restore](backup-restore.md), RTO 1 hour).
-- Rebuilding a lost Incus host. Restores go to the host the machine is on; restoring onto a replacement host isn't tested yet.
+- Noticing that a whole Incus host is gone: up to `INCUS_HOST_DOWN_MINUTES` before it is down and you are alerted, and then your decision that it isn't coming back.
+- Setting up a replacement host, if you had no spare one in `INCUS_HOSTS`.
+
+## Losing a whole Incus host
+
+With more than one host in `INCUS_HOSTS` ([setup](incus-containers.md#several-hosts), [ADR 0076](../adr/0076-restoring-onto-another-incus-host.md)), a host that is gone can have its machines made again on another, from their newest off-host backups.
+
+1. botd alerts **Incus host `<name>` isn't answering** after `INCUS_HOST_DOWN_MINUTES`. Its machines are left as they are, and new ones go elsewhere. `botctl machine hosts check` shows every host.
+2. Find out whether it is coming back. If it might, wait: restoring elsewhere first would leave two copies of each machine. botd never decides this for you.
+3. If it isn't, power it off at your hosting provider if you can, then:
+
+```bash
+botctl machine host recover <name> --yes                       # onto the first other host that is up
+botctl machine host recover <name> --to <host> --identity backup-identity.txt --yes
+```
+
+It declares the host lost (for good; a replacement gets a new name), revokes its machines' certificates and tokens, and restores each from its newest off-host backup onto the other host, two at a time. Each enrolls anew. A machine with no backup goes to error: destroy it and request a new one for that user. The answer lists what is restoring, what can't be, and what was skipped; run it again to retry the skipped ones. `botctl machine recovery` shows each restore's time against the RTO.
+
+The data lost is everything on each machine since its newest backup. A whole host's restores take about machines ÷ 2 × one restore's time.
+
+To empty a host that still works (to retire it), move its machines one at a time: `botctl machine restore <user> <backup-id> --host <other> --yes`. That deletes the old container once the new one is ready.

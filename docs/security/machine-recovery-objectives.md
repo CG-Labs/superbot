@@ -39,7 +39,7 @@ This covers machines that run as Incus containers with off-host backups turned o
 
 1. **Time before a restore starts.** The RTO starts when the Provider starts the restore, not when a problem happens or is reported. Restores are started by the Provider's operators, not automatically.
 2. **Loss of the SuperBot server itself.** If the server that manages machines must be restored too, that time (target: 1 hour) comes before a machine restore can start.
-3. **Loss of a machine's host.** Restores are made onto the host the machine runs on. If that host is lost, the Provider must first replace it; that time is not part of the RTO.
+3. **Detecting a lost host.** If the host a machine runs on is lost, its machines are restored onto another host from their latest backups, and each restore is held to the RTO from when it starts. The time before that is not part of the RTO: the server alerts the Provider's operators when a host has not answered for 10 minutes (by default), and the operators then decide the host is lost and start the restores. If no other host is ready, the time to set one up is not part of the RTO either. A host's machines are restored a few at a time.
 4. **Suspended machines.** A suspended machine isn't backed up or held to the RPO, since its disk doesn't change. It is held to it again once resumed.
 5. **Changes since the last backup.** A restore brings back the machine as of a backup. Anything written after that backup is lost.
 6. **Credentials.** A restored machine connects to SuperBot afresh. Its previous connection is revoked, and the customer's Bots may need to sign in to outside services again.
