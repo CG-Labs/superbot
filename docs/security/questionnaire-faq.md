@@ -12,7 +12,7 @@ The operator chooses Linode regions (`MACHINE_REGIONS`) or where Incus hosts run
 Yes. HTTPS to the server, mutual TLS 1.3 between the server and machines, HTTPS to every outside service, and STARTTLS or TLS for email. See [encryption in transit](data-flows.md#in-transit).
 
 **Is data encrypted at rest?**
-Secrets, approval inputs and push tokens are encrypted field by field (XChaCha20-Poly1305) with a master key kept outside the data folder. The rest of the database, and machine disks, rely on the host's disk encryption. Backups are encrypted with age when the operator sets recipients. See [encryption at rest](data-flows.md#at-rest).
+Secrets, approval inputs and push tokens are encrypted field by field (XChaCha20-Poly1305) with a master key kept outside the data folder. The rest of the database, and machine disks, rely on the host's disk encryption. Backups are encrypted with age when the operator sets recipients, and are otherwise plain; machine backups include harness logins. See [encryption at rest](data-flows.md#at-rest).
 
 **Do you support SSO and SCIM?**
 Yes: Microsoft Entra ID, Google, Apple, GitHub, any OIDC provider, and SAML through a Keycloak broker. SCIM 2.0 user provisioning and deprovisioning. Native SAML is planned (M5). See [authentication](access-control.md#authentication).
@@ -21,7 +21,7 @@ Yes: Microsoft Entra ID, Google, Apple, GitHub, any OIDC provider, and SAML thro
 Not in SuperBot itself. Use SSO and enforce MFA at your IdP.
 
 **How are users kept apart?**
-Each user's Bots run as that user's own Unix account on one server, or on that user's own machine when managed. A Bot can do no more than its owner. See [isolation](access-control.md#isolation-between-users).
+Each user's Bots run as that user's own Unix account on one server, or on that user's own machine when managed. A Bot can do no more than its owner. On machines, running Bots as an unprivileged user (`MACHINE_BOT_USER`) and teammates as their own OS users (`MACHINE_TEAMMATE_USERS`) are off by default and must be turned on, as must the Linode firewall (`MACHINE_FIREWALL`). See [isolation](access-control.md#isolation-between-users).
 
 **Can an AI agent take destructive actions on its own?**
 Destructive commands, file deletes, outbound messages, network installs and `git push` wait for a person's approval by default. If the approval check can't be made, the action is refused. See [authorization](access-control.md#authorization).
