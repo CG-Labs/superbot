@@ -1,6 +1,7 @@
-//! The seam between the control plane and whoever rents out the machines. Linode
-//! today (ADR 0025); anything that can create, size, stop, start, back up, and delete
-//! a VM by a unique label fits behind it.
+//! The seam between the control plane and whoever rents out the machines: Linode VMs
+//! (ADR 0025) or system containers on an Incus host (ADR 0065). Anything that can
+//! create, size, stop, start, back up, and delete a machine by a unique label fits
+//! behind it.
 
 use std::fmt;
 use std::future::Future;
@@ -143,6 +144,35 @@ impl fmt::Display for ProviderError {
 pub trait MachineProvider: Send + Sync {
     /// Stored with each machine, e.g. `linode`.
     fn name(&self) -> &'static str;
+    /// What a machine is: `vm` (its own kernel) or `container` (shares the host's).
+    fn substrate(&self) -> &'static str {
+        "vm"
+    }
+    /// MACHINE_TIERS when it isn't set.
+    fn default_tiers(&self) -> &'static str {
+        super::DEFAULT_TIERS
+    }
+    /// MACHINE_IMAGE when it isn't set.
+    fn default_image(&self) -> &'static str {
+        super::DEFAULT_IMAGE
+    }
+    /// Whether `plan` means something to this provider, checked at startup.
+    fn check_plan(&self, _plan: &str) -> Result<(), String> {
+        Ok(())
+    }
+    /// What `plan` gives a machine, for admins, if the provider knows.
+    fn plan_view(&self, _plan: &str) -> Option<serde_json::Value> {
+        None
+    }
+    /// The provider's own settings for admins. Never a credential.
+    fn settings(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+    /// Asks the provider whether it is set up as the control plane needs: a list of
+    /// `{check, ok, detail}`.
+    fn preflight<'a>(&'a self) -> Fut<'a, Vec<serde_json::Value>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
     /// Creates and boots a machine.
     fn create<'a>(&'a self, spec: &'a CreateSpec) -> Fut<'a, ProviderMachine>;
     fn get<'a>(&'a self, id: &'a str) -> Fut<'a, ProviderMachine>;

@@ -1,8 +1,9 @@
-//! The control plane: one machine per user, rented from a provider (Linode). Off
-//! unless LINODE_TOKEN is set, so self-hosted servers never see it. Admins request,
-//! suspend, resume, resize, and destroy a user's machine; a reconciler follows each
-//! one to where it should be. Every change is audited.
-//! Design: docs/adr/0025-control-plane-linode.md.
+//! The control plane: one machine per user, from a provider: a Linode VM, or a system
+//! container on an Incus host (MACHINE_PROVIDER=incus). Off unless one is configured,
+//! so self-hosted servers never see it. Admins request, suspend, resume, resize, and
+//! destroy a user's machine; a reconciler follows each one to where it should be.
+//! Every change is audited.
+//! Design: docs/adr/0025-control-plane-linode.md, docs/adr/0065-incus-container-machines.md.
 // The agent binary's code; botd only runs it in tests, and not all of it.
 #[cfg(test)]
 #[allow(dead_code)]
@@ -16,6 +17,9 @@ pub mod enroll;
 pub mod fake;
 pub mod firewall;
 pub mod folder;
+pub mod incus;
+#[cfg(test)]
+pub mod incus_standin;
 pub mod job;
 #[cfg(test)]
 pub mod landing;
@@ -57,7 +61,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub const NOT_CONFIGURED: &str = "The control plane is not configured on this server, so per-user machines are off. Set LINODE_TOKEN and MACHINE_REGIONS to turn it on.";
+pub const NOT_CONFIGURED: &str = "The control plane is not configured on this server, so per-user machines are off. Set LINODE_TOKEN and MACHINE_REGIONS for Linode machines, or MACHINE_PROVIDER=incus for containers on an Incus host, to turn it on.";
+/// What the settings that need the control plane say when it is off.
+const NEEDS_IT: &str = "set LINODE_TOKEN and MACHINE_REGIONS, or MACHINE_PROVIDER=incus";
 pub const DEFAULT_TIERS: &str = "starter=g6-standard-1,pro=g6-standard-2,max=g6-standard-4";
 pub const DEFAULT_IMAGE: &str = "linode/ubuntu24.04";
 const DEFAULT_RECONCILE_SECONDS: u64 = 60;
@@ -249,20 +255,31 @@ pub fn parse_tiers(raw: &str) -> Result<Vec<(String, String)>, String> {
 }
 
 impl ControlPlane {
-    /// LINODE_TOKEN (or _FILE) turns it on and then needs MACHINE_REGIONS. The rest
-    /// have defaults: MACHINE_TIERS, MACHINE_IMAGE, MACHINE_BACKUPS (on),
+    /// LINODE_TOKEN (or _FILE) turns it on with Linode and then needs MACHINE_REGIONS;
+    /// MACHINE_PROVIDER=incus turns it on with an Incus host (`incus_from_env`). The
+    /// rest have defaults: MACHINE_TIERS, MACHINE_IMAGE, MACHINE_BACKUPS (on),
     /// MACHINE_LABEL_PREFIX, MACHINE_AUTHORIZED_KEYS, MACHINE_RECONCILE_SECONDS.
     pub fn from_env(
         store: &dyn SecretStore,
         var: impl Fn(&str) -> String,
     ) -> Result<ControlPlane, String> {
+        match var("MACHINE_PROVIDER").trim().to_ascii_lowercase().as_str() {
+            "" | "linode" => {}
+            "incus" => return ControlPlane::incus_from_env(store, &var),
+            v => {
+                return Err(format!(
+                    "MACHINE_PROVIDER must be linode or incus, not \"{}\"",
+                    crate::audit::clip(v, 20)
+                ));
+            }
+        }
         let Some(token) = store.get("LINODE_TOKEN").map_err(|e| e.to_string())? else {
             let routing = route::Routing::parse(&var("MACHINE_ROUTING"))?;
             if routing != route::Routing::Off {
-                return Err(format!("MACHINE_ROUTING={} needs the control plane: set LINODE_TOKEN and MACHINE_REGIONS", routing.as_str()));
+                return Err(format!("MACHINE_ROUTING={} needs the control plane: {NEEDS_IT}", routing.as_str()));
             }
             if firewall::Settings::from_env(&var)?.is_some() {
-                return Err("MACHINE_FIREWALL=on needs the control plane: set LINODE_TOKEN and MACHINE_REGIONS".into());
+                return Err(format!("MACHINE_FIREWALL=on needs the control plane: {NEEDS_IT}"));
             }
             return Ok(ControlPlane::default());
         };
@@ -283,6 +300,33 @@ impl ControlPlane {
         Ok(cp)
     }
 
+    /// Machines as system containers on an Incus host (ADR 0065): INCUS_URL and the
+    /// INCUS_* certificates are needed, and so are MACHINE_CONTROL_URL and
+    /// MACHINE_FIREWALL=on, since the firewall is what keeps a container off its
+    /// neighbours and private addresses. MACHINE_REGIONS is optional: `local` for a
+    /// lone host, cluster member names otherwise.
+    fn incus_from_env(store: &dyn SecretStore, var: &dyn Fn(&str) -> String) -> Result<ControlPlane, String> {
+        if store.get("LINODE_TOKEN").map_err(|e| e.to_string())?.is_some() {
+            return Err("MACHINE_PROVIDER=incus and LINODE_TOKEN are both set; a control plane uses one provider".into());
+        }
+        if var("MACHINE_CONTROL_URL").trim().is_empty() {
+            return Err("MACHINE_PROVIDER=incus needs MACHINE_CONTROL_URL: containers enroll and are reached like any machine".into());
+        }
+        if firewall::Settings::from_env(var)?.is_none() {
+            return Err("MACHINE_PROVIDER=incus needs MACHINE_FIREWALL=on: the firewall is what keeps containers off each other, the host, and private addresses".into());
+        }
+        let p = incus::Incus::new(incus::Settings::from_env(var)?, incus::Credentials::from_store(store)?)?;
+        let mut cp = ControlPlane::configured(Arc::new(p), var)?;
+        cp.regions = list(&var("MACHINE_REGIONS"));
+        if cp.regions.is_empty() {
+            cp.regions = vec![incus::LOCAL.into()];
+        }
+        if let Some(r) = cp.regions.iter().find(|r| !slug(r, 32)) {
+            return Err(format!("MACHINE_REGIONS: \"{r}\" isn't a cluster member name"));
+        }
+        Ok(cp)
+    }
+
     fn configured(
         provider: Arc<dyn MachineProvider>,
         var: &dyn Fn(&str) -> String,
@@ -293,7 +337,7 @@ impl ControlPlane {
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| d.into())
         };
-        let image = or("MACHINE_IMAGE", DEFAULT_IMAGE);
+        let image = or("MACHINE_IMAGE", provider.default_image());
         if image.len() > 100
             || !image
                 .bytes()
@@ -329,10 +373,16 @@ impl ControlPlane {
             .ok()
             .filter(|s| (10..=3600).contains(s))
             .ok_or("MACHINE_RECONCILE_SECONDS must be 10 to 3600")?;
+        let tiers = parse_tiers(&or("MACHINE_TIERS", provider.default_tiers()))?;
+        for (tier, plan) in &tiers {
+            provider
+                .check_plan(plan)
+                .map_err(|e| format!("MACHINE_TIERS: {tier}: {e}"))?;
+        }
         Ok(ControlPlane {
             provider: Some(provider),
             routing: route::Routing::parse(&var("MACHINE_ROUTING"))?,
-            tiers: parse_tiers(&or("MACHINE_TIERS", DEFAULT_TIERS))?,
+            tiers,
             image,
             backups,
             label_prefix,
@@ -347,7 +397,7 @@ impl ControlPlane {
     /// them over mutual TLS. Needs the control plane.
     pub fn enroll_with(&mut self, e: enroll::Enrollment) -> Result<Arc<enroll::Enrollment>, String> {
         if !self.enabled() {
-            return Err("MACHINE_CONTROL_URL needs the control plane: set LINODE_TOKEN and MACHINE_REGIONS".into());
+            return Err(format!("MACHINE_CONTROL_URL needs the control plane: {NEEDS_IT}"));
         }
         if let Some(s) = &self.firewall_settings {
             self.firewall = Some(firewall::Firewall::new(
@@ -428,13 +478,44 @@ impl ControlPlane {
         self.provider.is_some()
     }
 
+    /// Whether `m` was made by this server's provider. One made by another (after
+    /// MACHINE_PROVIDER changed) is left as it is: its provider id means nothing to
+    /// this one. Its agent is still reached as before.
+    pub fn owns(&self, m: &Machine) -> bool {
+        self.provider.as_ref().is_some_and(|p| p.name() == m.provider)
+    }
+
+    fn need_own(&self, m: &Machine) -> Res<()> {
+        match &self.provider {
+            Some(p) if p.name() != m.provider => Err(conflict(format!(
+                "This machine is at {}, and this server now makes machines at {}. Set MACHINE_PROVIDER back to manage it.",
+                m.provider,
+                p.name()
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// Refuses a plan the provider can't make, e.g. a user plan's machine size
+    /// (ADR 0040) written for another provider.
+    fn need_plan(&self, plan: &str) -> Res<()> {
+        let p = self.need()?;
+        p.check_plan(plan).map_err(|e| {
+            bad(format!(
+                "{e}. This server makes {} machines; set the user's plan's machine size to one of MACHINE_TIERS.",
+                p.name()
+            ))
+        })
+    }
+
     /// What startup prints.
     pub fn describe(&self) -> String {
         match &self.provider {
-            None => "off (set LINODE_TOKEN and MACHINE_REGIONS for one machine per user)".into(),
+            None => format!("off ({NEEDS_IT} for one machine per user)"),
             Some(p) => format!(
-                "{}, regions {}, tiers {}, backups {}, routing {}, enrollment {}, firewall {}",
+                "{} ({}s), regions {}, tiers {}, backups {}, routing {}, enrollment {}, firewall {}",
                 p.name(),
+                p.substrate(),
                 self.regions.join(", "),
                 self.tiers
                     .iter()
@@ -802,7 +883,7 @@ pub async fn reconcile(app: &App, cp: &ControlPlane) -> Value {
         .db
         .machines(None)
         .into_iter()
-        .filter(|m| !matches!(m.state, State::Destroyed | State::Error))
+        .filter(|m| !matches!(m.state, State::Destroyed | State::Error) && cp.owns(m))
         .map(|m| m.id)
         .collect();
     let mut changed = 0;
@@ -1072,7 +1153,9 @@ pub async fn request(
     let _g = cp.ops.lock().await;
     let m = match app.db.user_machine(&u.id) {
         Some(mut m) if m.state == State::Error => {
+            cp.need_own(&m)?;
             let (tier, plan, region) = settings(&m.tier, &m.plan, &m.region);
+            cp.need_plan(&plan)?;
             // The label stays, so a machine made by an earlier create would be adopted
             // as it is. Only change what's asked for when there's none.
             if (&tier, &region) != (&m.tier, &m.region) {
@@ -1125,6 +1208,7 @@ pub async fn request(
         None => {
             let (default_tier, default_plan) = &cp.tiers[0];
             let (tier, plan, region) = settings(default_tier, default_plan, &cp.regions[0]);
+            cp.need_plan(&plan)?;
             let new = NewMachine {
                 user_id: &u.id,
                 provider: p.name(),
@@ -1173,6 +1257,7 @@ async fn act(
     let u = need_user_key(app, key)?;
     let _g = cp.ops.lock().await;
     let mut m = need_machine(app, &u.id)?;
+    cp.need_own(&m)?;
     if step == Step::Resize && target.is_none() {
         return Err(bad("Unknown tier"));
     }
@@ -1301,6 +1386,7 @@ pub async fn resize(
     if let Some(allowed) = size.as_ref().filter(|(_, p)| *p != plan) {
         return Err(refuse_size(&app, &by, &u, allowed, &tier, &plan, "resize"));
     }
+    cp.need_plan(&plan)?;
     act(&app, cp, &by, &key, Step::Resize, Some((tier, plan))).await
 }
 
@@ -1317,6 +1403,7 @@ pub async fn destroy(
     let u = need_user_key(&app, &key)?;
     let _g = cp.ops.lock().await;
     let mut m = need_machine(&app, &u.id)?;
+    cp.need_own(&m)?;
     if m.state != State::Destroying {
         let from = m.state;
         m.state = next(from, Step::Destroy).ok_or_else(|| {
@@ -1357,6 +1444,37 @@ pub async fn reconcile_now(AppS(app): AppS<AppState>, Extension(a): Extension<Ar
         out["heartbeats"] = n.into();
     }
     Ok(Json(out))
+}
+
+/// `GET /api/machines/substrate?check=true`: what this server makes machines on, what
+/// each tier gets, and how they are kept apart. `check` asks the provider whether it
+/// is set up as the control plane needs.
+pub async fn substrate(Extension(a): Extension<Arc<Auth>>, Query(q): Query<HashMap<String, String>>) -> Res {
+    let cp = &a.machines;
+    let p = cp.need()?;
+    let tiers: Vec<Value> = cp
+        .tiers
+        .iter()
+        .map(|(t, plan)| json!({ "tier": t, "plan": plan, "resources": p.plan_view(plan) }))
+        .collect();
+    let mut v = json!({
+        "provider": p.name(),
+        "substrate": p.substrate(),
+        "tiers": tiers,
+        "regions": cp.regions,
+        "image": cp.image,
+        "backups": cp.backups,
+        "enrollment": cp.enrollment.is_some(),
+        "firewall": cp.firewall.as_ref().map(|f| json!({ "label": f.label, "rules": firewall::rules_json(&f.rules) })),
+        "settings": p.settings(),
+    });
+    if q.get("check").is_some_and(|c| matches!(c.as_str(), "1" | "true" | "yes")) {
+        v["checks"] = match p.preflight().await {
+            Ok(c) => json!(c),
+            Err(e) => json!([{ "check": "provider", "ok": false, "detail": e.to_string() }]),
+        };
+    }
+    Ok(Json(v))
 }
 
 /// `GET /api/machine`: the caller's own machine, and only theirs.
@@ -1564,6 +1682,63 @@ mod tests {
             cp.need().err().map(|e| (e.0, e.1)),
             Some((StatusCode::SERVICE_UNAVAILABLE, NOT_CONFIGURED.to_string()))
         );
+    }
+
+    #[test]
+    fn incus_settings() {
+        let (cert, key) = incus_standin::self_signed("botd.test");
+        let (server, _) = incus_standin::self_signed("incus.test");
+        let certs = EnvStore::fixed(&[("INCUS_CLIENT_CERT", &cert), ("INCUS_CLIENT_KEY", &key), ("INCUS_SERVER_CERT", &server)]);
+        let base: &[(&str, &str)] = &[
+            ("MACHINE_PROVIDER", "incus"),
+            ("INCUS_URL", "https://192.0.2.40:8443"),
+            ("MACHINE_CONTROL_URL", "https://192.0.2.1:8444"),
+            ("MACHINE_FIREWALL", "on"),
+        ];
+        let with = |store: &EnvStore, extra: &[(&str, &str)]| {
+            let vars: Vec<(String, String)> = base
+                .iter()
+                .filter(|(k, _)| !extra.iter().any(|(e, _)| e == k))
+                .chain(extra)
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            ControlPlane::from_env(store, move |k| {
+                vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default()
+            })
+        };
+        let cp = with(&certs, &[]).unwrap();
+        assert_eq!(cp.need().unwrap().name(), "incus");
+        assert_eq!(cp.regions, ["local"], "a lone host needs no region");
+        assert_eq!(cp.image, incus::DEFAULT_IMAGE);
+        assert_eq!(cp.tiers, parse_tiers(incus::DEFAULT_TIERS).unwrap());
+        assert!(cp.describe().starts_with("incus (containers)"), "{}", cp.describe());
+        assert!(!cp.describe().contains("PRIVATE KEY"));
+        assert!(cp.need_plan("c2-m4-d40").is_ok());
+        let e = cp.need_plan("g6-standard-1").err().unwrap();
+        assert!(e.0 == StatusCode::BAD_REQUEST && e.1.contains("incus machines"), "{}", e.1);
+        let cp = with(&certs, &[("MACHINE_REGIONS", "node1,node2"), ("MACHINE_TIERS", "solo=c1-m1-d10")]).unwrap();
+        assert_eq!((cp.regions.len(), cp.tiers.len()), (2, 1));
+
+        for (store, extra, want) in [
+            (&certs, &[("MACHINE_FIREWALL", "")][..], "MACHINE_FIREWALL=on"),
+            (&certs, &[("MACHINE_CONTROL_URL", ""), ("MACHINE_FIREWALL", "")][..], "MACHINE_CONTROL_URL"),
+            (&certs, &[("INCUS_URL", "")][..], "INCUS_URL"),
+            (&certs, &[("MACHINE_TIERS", "starter=g6-standard-1")][..], "isn't an Incus plan"),
+            (&certs, &[("MACHINE_REGIONS", "Node 1")][..], "MACHINE_REGIONS"),
+            (&certs, &[("MACHINE_PROVIDER", "docker")][..], "linode or incus"),
+            (&EnvStore::fixed(&[("INCUS_CLIENT_CERT", &cert), ("INCUS_SERVER_CERT", &server)]), &[][..], "INCUS_CLIENT_KEY"),
+            (&EnvStore::fixed(&[("INCUS_CLIENT_CERT", &cert), ("INCUS_CLIENT_KEY", "nope"), ("INCUS_SERVER_CERT", &server)]), &[][..], "INCUS_CLIENT_KEY"),
+            (
+                &EnvStore::fixed(&[("INCUS_CLIENT_CERT", &cert), ("INCUS_CLIENT_KEY", &key), ("INCUS_SERVER_CERT", &server), ("LINODE_TOKEN", "tok-1234567890")]),
+                &[][..],
+                "one provider",
+            ),
+        ] {
+            let e = with(store, extra).err().unwrap_or_else(|| panic!("{extra:?} should fail"));
+            assert!(e.contains(want), "{extra:?}: {e}");
+        }
+        let off = with(&EnvStore::fixed(&[]), &[("MACHINE_PROVIDER", ""), ("MACHINE_FIREWALL", "on")]).err().unwrap();
+        assert!(off.contains("MACHINE_PROVIDER=incus"), "the message names both providers: {off}");
     }
 
     #[test]
