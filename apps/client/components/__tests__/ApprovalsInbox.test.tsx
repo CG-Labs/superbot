@@ -89,7 +89,7 @@ describe("ApprovalCard: approve for this run (ADR 0051)", () => {
     expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
   });
 
-  it("shows the approval a notification linked to first, or says it's gone (ADR 0059)", async () => {
+  it("shows the approval a notification linked to first, or says it's gone (ADR 0060)", async () => {
     as("member");
     const other = { ...PUSH, id: "a0", subject: "rm -rf build" };
     Object.assign(mockCtx, { approvals: [other, PUSH], policy: { mode: "ask" } });

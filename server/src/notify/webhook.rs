@@ -1,4 +1,4 @@
-//! Outgoing webhooks for notifications (ADR 0059): a Slack-compatible incoming-webhook
+//! Outgoing webhooks for notifications (ADR 0060): a Slack-compatible incoming-webhook
 //! body (`{"text": …}`, which Slack, Mattermost, Rocket.Chat, and Discord's `/slack`
 //! endpoint take), or SuperBot's own JSON for anything else, optionally signed. The URL
 //! is a secret (`NOTIFY_WEBHOOK_URL`, a Bot's `NOTIFY_WEBHOOK_URL_BOT_<ID>`): Slack's

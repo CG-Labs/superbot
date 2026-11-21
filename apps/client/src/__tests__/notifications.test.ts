@@ -3,7 +3,7 @@ import type { Approval } from "../types";
 
 const approval = (id: string) => ({ id, botId: "b1", tool: "Bash", subject: "git push", reason: "Pushes", status: "pending", expiresAt: 0 }) as unknown as Approval;
 
-describe("notification helpers (ADR 0059)", () => {
+describe("notification helpers (ADR 0060)", () => {
   it("reads addresses split any way, once each", () => {
     expect(parseRecipients(" a@example.com,B@example.com\nb@example.com ; ")).toEqual({ to: ["a@example.com", "B@example.com"] });
     expect(parseRecipients("")).toEqual({ to: [] });

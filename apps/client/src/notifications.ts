@@ -1,6 +1,6 @@
 import type { Approval, NotifyFormat, NotifyTestResult } from "./types";
 
-/** The server's limits (ADR 0059): the server still checks every save. */
+/** The server's limits (ADR 0060): the server still checks every save. */
 export const MAX_RECIPIENTS = 20;
 export const MAX_DELAY_SECONDS = 600;
 export const MAX_THROTTLE_SECONDS = 3600;

@@ -1,4 +1,4 @@
-//! HTTP tests for approval notifications (ADR 0059): admin-only settings, webhook URLs
+//! HTTP tests for approval notifications (ADR 0060): admin-only settings, webhook URLs
 //! kept as secrets, tests on demand, and a pending approval reaching a webhook through
 //! the hook, then findable in the audit log by its target.
 

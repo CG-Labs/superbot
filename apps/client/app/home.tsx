@@ -28,7 +28,7 @@ export default function HomeScreen() {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [screen, setScreen] = useState<ScreenState>(null);
   const [approvalsOpen, setApprovalsOpen] = useState(false);
-  // A notification's link, `/home?approval=<id>` (ADR 0059), opens the inbox on it.
+  // A notification's link, `/home?approval=<id>` (ADR 0060), opens the inbox on it.
   const linked = approvalParam(useLocalSearchParams<{ approval?: string }>().approval);
   const [focusId, setFocusId] = useState<string | null>(null);
   const [setupWaiting, setSetupWaiting] = useState(false);

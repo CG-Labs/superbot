@@ -173,7 +173,7 @@ pub struct App {
     pub resume_routines_on_enable: OnceLock<bool>,
     /// STRIPE_METER_EVENT (ADR 0050): reports each run's tokens to a Stripe meter. Unset: off.
     pub meter: OnceLock<Arc<crate::billing::Meter>>,
-    /// Email and webhook notices for pending approvals (ADR 0059). Unset: none.
+    /// Email and webhook notices for pending approvals (ADR 0060). Unset: none.
     pub notifier: OnceLock<Arc<crate::notify::Notifier>>,
     closing: AtomicBool,
 }
