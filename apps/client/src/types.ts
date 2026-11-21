@@ -741,6 +741,11 @@ export interface MyTeamInvite {
   expiresAt: number;
 }
 
+export interface WorkPolicy {
+  files: "archive" | "delete";
+  graceDays: number;
+}
+
 /** What taking a teammate off the team would do, from `GET /api/team/members/{user}/offboarding`. */
 export interface OffboardingPreview {
   user: { id: string; name: string | null };
@@ -750,6 +755,6 @@ export interface OffboardingPreview {
   /** Grants between them and teammates that end. */
   grants: number;
   machine: { fate: "suspend" | "destroy" | "kept" | "none"; days?: number };
-  /** What becomes of their work on teammates' machines and accounts; null when they have none there. */
-  work: { files: "archive" | "delete"; graceDays: number } | null;
+  /** What becomes of their work: on teammates' machines, and on their accounts on this server. Each null when that cleanup is off. */
+  work: { machines: WorkPolicy | null; accounts: WorkPolicy | null };
 }

@@ -30,11 +30,16 @@ struct World {
 }
 
 async fn serve(routing: Routing, teams: crate::teams::Settings) -> World {
+    serve_with(routing, teams, |_| {}).await
+}
+
+async fn serve_with(routing: Routing, teams: crate::teams::Settings, hook: impl FnOnce(&mut ControlPlane) + Send + 'static) -> World {
     let fake = Arc::new(Fake::default());
     let p: Arc<dyn MachineProvider> = fake.clone();
     let (port, app, owner, _) = serve_app_with(move |a| {
         let mut cp = ControlPlane::for_tests(p);
         cp.routing = routing;
+        hook(&mut cp);
         a.machines = Arc::new(cp);
     })
     .await;
@@ -401,7 +406,7 @@ async fn the_offboarding_preview_says_what_goes_only_to_the_teams_own_admins() {
     assert_eq!(code, 200, "{v}");
     assert_eq!((v["allowed"].as_bool(), v["grants"].as_u64(), v["role"].as_str()), (Some(true), Some(2), Some("member")), "{v}");
     assert_eq!((v["machine"]["fate"].as_str(), v["machine"]["days"].as_u64()), (Some("suspend"), Some(7)), "{v}");
-    assert!(v["work"]["files"].is_string() || v["work"].is_null(), "{v}");
+    assert_eq!((v["work"]["machines"].clone(), v["work"]["accounts"].clone()), (Value::Null, Value::Null), "{v}");
     for hidden in [ops.as_str(), notes.as_str(), "Ops", "Notes", "192.0.2.", "@example.com"] {
         assert!(!v.to_string().contains(hidden), "{hidden} in {v}");
     }
@@ -435,6 +440,29 @@ async fn the_offboarding_preview_says_what_goes_only_to_the_teams_own_admins() {
     json_call(w.port, "PUT", &format!("/api/teams/{}/members/{dee_id}", w.alpha), &w.admin, "{}").await;
     let (_, v) = json_call(w.port, "GET", &format!("/api/team/members/{dee_id}/offboarding"), &w.ada, "").await;
     assert_eq!((v["machine"]["fate"].as_str(), v["grants"].as_u64()), (Some("kept"), Some(0)), "{v}");
+}
+
+#[tokio::test]
+async fn the_preview_and_the_console_say_what_each_cleanup_does_with_work() {
+    use crate::machines::offboard::{Files, Settings as Offboard};
+    let w = serve_with(Routing::Off, Default::default(), |cp| {
+        let mut e = crate::machines::enroll::Enrollment::for_tests(43, 1, 1);
+        e.offboard = Offboard { files: Files::Archive, grace_days: 7 };
+        cp.enrollment = Some(Arc::new(e));
+    })
+    .await;
+    let root = w.app.cfg.data_dir.parent().unwrap().join(format!("iso-{}", short_id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let mut iso = crate::accounts::for_tests(&root, "/bin/false");
+    iso.teammates = true;
+    iso.offboard = Offboard { files: Files::Delete, grace_days: 3 };
+    let _ = w.app.isolation.set(Arc::new(iso));
+    let want = json!({ "machines": { "files": "archive", "graceDays": 7 }, "accounts": { "files": "delete", "graceDays": 3 } });
+
+    let (code, v) = json_call(w.port, "GET", &format!("/api/team/members/{}/offboarding", w.al_id), &w.ada, "").await;
+    assert_eq!((code, &v["work"]), (200, &want), "{v}");
+    let (code, v) = json_call(w.port, "GET", "/api/teams", &w.admin, "").await;
+    assert_eq!((code, &v["settings"]["work"]), (200, &want), "{v}");
 }
 
 #[tokio::test]

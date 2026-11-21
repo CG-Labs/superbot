@@ -15,7 +15,7 @@ import { approvalParam } from "../src/notifications";
 import { botParam } from "../src/push";
 import { isStarter, starterText } from "../src/prompts";
 import { useSuperBot } from "../src/SuperBotContext";
-import { teamLinkWanted } from "../src/team";
+import { watchTeamLink } from "../src/team";
 import { colors } from "../src/theme";
 
 /** Open screen viewer. `takeOver` tracks whether the user has control; `n` remounts it, e.g. to take over from a handoff card. */
@@ -42,6 +42,7 @@ export default function HomeScreen() {
   const [prefill, setPrefill] = useState<string | null>(null);
 
   useEffect(() => (api ? watchSetup(api, me, setSetupWaiting) : undefined), [api, me]);
+  useEffect(() => (api ? watchTeamLink(api, setTeamLink) : undefined), [api]);
   useEffect(() => {
     if (!api || !linked) return;
     setFocusId(linked);
@@ -60,7 +61,6 @@ export default function HomeScreen() {
     if (!api) return;
     let live = true;
     void planAvailable(api).then((on) => live && setBilling(on));
-    void teamLinkWanted(api).then((on) => live && setTeamLink(on));
     return () => {
       live = false;
     };

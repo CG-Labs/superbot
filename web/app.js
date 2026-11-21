@@ -431,7 +431,15 @@ function renderTeams() {
 function offboardNote(name, team) {
   const days = teams.settings?.machineDays;
   const machine = days ? `suspended now and deleted after ${days} days unless they join a team again` : "deleted now, with its disks";
-  return `Take ${name} off ${team}?\n\nThey lose access to teammates' shared Bots and teammates lose access to theirs; grants between them are revoked and runs between them stop. Their user and home on teammates' machines and accounts are removed (their work goes as the server's teammate-files setting says). A machine the team gave them is ${machine}. Their own Bots, chats and secrets stay theirs.`;
+  const work = teams.settings?.work || {};
+  const files = [workNote("teammates' machines", work.machines), workNote("their accounts on this server", work.accounts)].filter(Boolean).join(" ");
+  return `Take ${name} off ${team}?\n\nThey lose access to teammates' shared Bots and teammates lose access to theirs; grants between them are revoked and runs between them stop.${files ? ` ${files}` : ""} A machine the team gave them is ${machine}. Their own Bots, chats and secrets stay theirs.`;
+}
+
+function workNote(where, w) {
+  if (!w) return "";
+  const files = w.files === "archive" ? "their work there goes to the Bots' owner" : w.graceDays > 0 ? `their work there is deleted for good after ${w.graceDays} day${w.graceDays === 1 ? "" : "s"}` : "their work there is deleted for good";
+  return `Their users on ${where} are removed, and ${files}.`;
 }
 
 const teamOf = (el) => teams.teams.find((t) => t.id === el.closest("[data-team]").dataset.team);

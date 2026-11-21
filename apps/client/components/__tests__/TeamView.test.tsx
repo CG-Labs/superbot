@@ -43,7 +43,7 @@ const preview: OffboardingPreview = {
   blocked: null,
   grants: 2,
   machine: { fate: "suspend", days: 7 },
-  work: { files: "archive", graceDays: 7 },
+  work: { machines: { files: "archive", graceDays: 7 }, accounts: null },
 };
 
 function fakeApi(team: Team | null, invites: MyTeamInvite[] = []) {
@@ -103,6 +103,12 @@ describe("TeamView", () => {
     expect(screen.queryByText("Invite a teammate")).toBeNull();
     expect(screen.queryByText("Remove from team")).toBeNull();
     expect(screen.queryByText("Leave team")).toBeNull();
+  });
+
+  it("gives a read-only owner no Remove, even for others", async () => {
+    await open(teamAs("owner"), { canWrite: false });
+    expect(screen.queryByLabelText("Remove Al")).toBeNull();
+    expect(screen.queryAllByRole("radio")).toHaveLength(0);
   });
 
   it("doesn't offer an admin the owner's role or removal", async () => {

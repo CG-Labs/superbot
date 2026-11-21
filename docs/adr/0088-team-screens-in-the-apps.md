@@ -14,7 +14,7 @@ ADR 0087 shipped the team API with no screens. Team owners and admins need to se
 
 ### The client has a Team screen
 
-- **Where it is.** `/team`, linked from the sidebar. The link only shows if you're on a team or have an invite, so self-hosted servers without teams look the same as before.
+- **Where it is.** `/team`, linked from the sidebar. The link only shows if you're on a team or have an invite, so self-hosted servers without teams look the same as before. It's checked again whenever the app comes to the front and every two minutes, so a new invite shows up without signing in again.
 - **What members see.** The team, its people and their roles. This view is read-only. Read-only users ([ADR 0012](0012-users-sessions-rbac.md)) get the same view even when they're a team admin, because the server refuses their changes anyway.
 - **What owners and admins see.** Each teammate's machine state (running, setting up, suspended, being built, couldn't be built, released). They can also:
   - invite people by email as member or admin;
@@ -32,13 +32,13 @@ There is a new route, `GET /api/team/members/{user}/offboarding`. It changes not
 - `allowed` and `blocked`: `self` (use leave) or `owner` (only owners remove owners);
 - `grants`: how many grants between them and teammates end;
 - `machine.fate`: `suspend` (with `days`), `destroy`, `kept` (a machine of their own) or `none`;
-- `work`: what becomes of their work on teammates' machines and accounts (`archive` or `delete`, with grace days), or null when neither is on.
+- `work.machines` and `work.accounts`: what becomes of their work on teammates' machines (ADR 0052, `MACHINE_TEAMMATE_FILES`) and on their accounts on this server (ADR 0066, `ISOLATION_TEAMMATE_FILES`). Each is `archive` or `delete` with grace days, or null when that cleanup is off. They're separate settings and can differ, so the confirmation states each one.
 
 The client calls it when you press Remove, and builds the confirmation from the answer. Like the rest of `/api/team`, someone on another team gets 404, and so does anyone who isn't on the caller's team. The answer holds counts and settings only: no Bot names or ids, emails, addresses, files or logins. A grant count was the one thing considered and kept. Team admins can already see who is on the team, and the count is what makes "N grants are revoked" true rather than vague.
 
 ### The console has a Teams tab
 
-Server admins get a minimal Teams tab on the existing `/api/teams` routes. It shows each team's people, roles and machine states. From it they can make a team, add someone (no invite needed), change a role, take someone off the team, and delete a team. The removal confirmation spells out the same offboarding from the server's settings. Team owners and admins use the client; the console is for server admins only, as before.
+Server admins get a minimal Teams tab on the existing `/api/teams` routes. It shows each team's people, roles and machine states. From it they can make a team, add someone (no invite needed), change a role, take someone off the team, and delete a team. `GET /api/teams` returns the same `work` policies under `settings`, so the removal and team-deletion confirmations spell out the same offboarding. Team owners and admins use the client; the console is for server admins only, as before.
 
 ## Alternatives considered
 

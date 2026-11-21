@@ -81,7 +81,7 @@ function MemberRow({
           onChange={(r) => r !== m.role && onRole(m, r)}
         />
       ) : null}
-      {canRemove(team.role, m, meId) ? (
+      {manage && canRemove(team.role, m, meId) ? (
         <Pressable style={styles.dangerBtn} disabled={busy} onPress={() => onRemove(m)} accessibilityRole="button" accessibilityLabel={`Remove ${m.name ?? m.email ?? m.id}`}>
           <Text style={styles.dangerText}>Remove from team</Text>
         </Pressable>

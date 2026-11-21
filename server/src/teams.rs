@@ -539,6 +539,15 @@ pub async fn remove(State(app): State<AppState>, Extension(c): Extension<Caller>
     Ok(Json(json!({ "ok": true })))
 }
 
+/// What offboarding does with a leaver's work: on teammates' machines (ADR 0052) and on
+/// their accounts on this server (ADR 0066). Each has its own setting; null when off.
+fn work_policies(app: &AppState) -> Value {
+    let view = |o: &crate::machines::offboard::Settings| json!({ "files": o.files.as_str(), "graceDays": o.grace_days });
+    let machines = app.control_plane.get().and_then(|cp| cp.enrollment.as_ref()).map(|e| view(&e.offboard));
+    let accounts = app.isolation.get().filter(|i| i.teammates).map(|i| view(&i.offboard));
+    json!({ "machines": machines, "accounts": accounts })
+}
+
 /// `GET /api/team/members/{user}/offboarding`: what taking a teammate off the team
 /// would do, for the apps to say before they ask (ADR 0088): whether you may, how many
 /// grants between them and teammates end, what becomes of their machine, and of their
@@ -569,12 +578,7 @@ pub async fn offboarding(State(app): State<AppState>, Extension(c): Extension<Ca
         Some(x) if ours(&app, &t.id, &x) => json!({ "fate": if days == 0 { "destroy" } else { "suspend" }, "days": days }),
         Some(_) => json!({ "fate": "kept" }),
     };
-    let work = app
-        .control_plane
-        .get()
-        .and_then(|cp| cp.enrollment.as_ref().map(|e| e.offboard.clone()))
-        .or_else(|| app.isolation.get().filter(|i| i.teammates).map(|i| i.offboard.clone()))
-        .map(|o| json!({ "files": o.files.as_str(), "graceDays": o.grace_days }));
+    let work = work_policies(&app);
     Ok(Json(json!({
         "user": { "id": u.id, "name": u.name },
         "role": m.role,
@@ -723,7 +727,7 @@ fn need_team(app: &AppState, id: &str) -> Res<Team> {
 /// `GET /api/teams`: every team, with its members.
 pub async fn list(State(app): State<AppState>) -> Res {
     let list: Vec<Value> = app.db.teams().iter().map(|t| team_view(&app, t, None, true)).collect();
-    Ok(Json(json!({ "teams": list, "settings": { "strict": settings(&app).strict, "machineDays": settings(&app).machine_days } })))
+    Ok(Json(json!({ "teams": list, "settings": { "strict": settings(&app).strict, "machineDays": settings(&app).machine_days, "work": work_policies(&app) } })))
 }
 
 /// `POST /api/teams` `{name, owner}`: makes a team with its first owner.

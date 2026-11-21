@@ -1,6 +1,7 @@
+import { AppState } from "react-native";
 import type { SuperBotApi } from "./api";
 import { relativeTime } from "./invite";
-import type { OffboardingPreview, Team, TeamMachine, TeamMember, TeamRole } from "./types";
+import type { OffboardingPreview, Team, TeamMachine, TeamMember, TeamRole, WorkPolicy } from "./types";
 
 /**
  * The team screen's rules (ADR 0088). They mirror the server's (ADR 0087) so the screen
@@ -84,6 +85,17 @@ export function blockedReason(p: Pick<OffboardingPreview, "blocked">): string | 
   return null;
 }
 
+/** One cleanup's outcome for a leaver's work, from its own setting. */
+export function workLine(where: string, w: WorkPolicy): string {
+  const files =
+    w.files === "archive"
+      ? "their work there goes to the Bots' owner"
+      : w.graceDays > 0
+        ? `their work there is deleted for good after ${plural(w.graceDays, "day")}`
+        : "their work there is deleted for good";
+  return `Their users on ${where} are removed, and ${files}.`;
+}
+
 /** What removing them does, from the server's preview: the confirmation's body. */
 export function offboardingMessage(p: OffboardingPreview, teamName: string): string {
   const name = p.user.name || "They";
@@ -91,15 +103,10 @@ export function offboardingMessage(p: OffboardingPreview, teamName: string): str
     `${name} leaves ${teamName}. They lose access to teammates' shared Bots, and teammates lose access to theirs. Runs between them stop.`,
   ];
   if (p.grants > 0) lines.push(`${plural(p.grants, "grant")} between them and teammates ${p.grants === 1 ? "is" : "are"} revoked.`);
-  if (p.work) {
-    const files =
-      p.work.files === "archive"
-        ? "their work there goes to the Bots' owner"
-        : p.work.graceDays > 0
-          ? `their work there is deleted for good after ${plural(p.work.graceDays, "day")}`
-          : "their work there is deleted for good";
-    lines.push(`Their user and home on teammates' machines and accounts are removed, and ${files}.`);
-  }
+  const machines = p.work.machines && workLine("teammates' machines", p.work.machines);
+  const accounts = p.work.accounts && workLine("their accounts on this server", p.work.accounts);
+  if (machines) lines.push(machines);
+  if (accounts) lines.push(accounts);
   if (p.machine.fate === "suspend") {
     lines.push(`The machine the team gave them is suspended now and deleted after ${plural(p.machine.days ?? 0, "day")}, unless they join a team again first.`);
   } else if (p.machine.fate === "destroy") {
@@ -113,6 +120,28 @@ export function offboardingMessage(p: OffboardingPreview, teamName: string): str
 
 export function looksLikeEmail(s: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s.trim()) && s.trim().length <= 254;
+}
+
+/** How often the Team link is checked again while the app is open, so a new invite shows up. */
+export const TEAM_LINK_EVERY_MS = 2 * 60_000;
+
+/**
+ * Calls `onChange` with `teamLinkWanted` now, each time the app comes back to the front,
+ * and every TEAM_LINK_EVERY_MS. Returns a function that stops watching.
+ */
+export function watchTeamLink(api: Pick<SuperBotApi, "team" | "myTeamInvites">, onChange: (wanted: boolean) => void): () => void {
+  let live = true;
+  const check = () => void teamLinkWanted(api).then((v) => live && onChange(v));
+  check();
+  const sub = AppState.addEventListener("change", (s) => {
+    if (s === "active") check();
+  });
+  const timer = setInterval(check, TEAM_LINK_EVERY_MS);
+  return () => {
+    live = false;
+    sub.remove();
+    clearInterval(timer);
+  };
 }
 
 /** Whether to show the Team link: you're on a team, or one has invited you. */

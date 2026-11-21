@@ -8,8 +8,11 @@ import {
   machineStatus,
   managesTeam,
   offboardingMessage,
+  TEAM_LINK_EVERY_MS,
   teamLinkWanted,
+  watchTeamLink,
 } from "../team";
+import { AppState } from "react-native";
 import type { OffboardingPreview, TeamMachine, TeamMember } from "../types";
 
 const member = (id: string, role: TeamMember["role"]): TeamMember => ({ id, role, name: id, email: `${id}@example.com`, joinedAt: 1, active: true });
@@ -35,7 +38,7 @@ const preview = (p: Partial<OffboardingPreview> = {}): OffboardingPreview => ({
   blocked: null,
   grants: 0,
   machine: { fate: "none" },
-  work: null,
+  work: { machines: null, accounts: null },
   ...p,
 });
 
@@ -81,24 +84,25 @@ describe("team rules (mirroring the server's, ADR 0087)", () => {
 
   it("says what offboarding removes, from the server's preview", () => {
     const text = offboardingMessage(
-      preview({ grants: 2, machine: { fate: "suspend", days: 7 }, work: { files: "archive", graceDays: 7 } }),
+      preview({ grants: 2, machine: { fate: "suspend", days: 7 }, work: { machines: { files: "archive", graceDays: 7 }, accounts: { files: "delete", graceDays: 3 } } }),
       "Alpha",
     );
     expect(text).toContain("Al leaves Alpha");
     expect(text).toContain("lose access to teammates' shared Bots");
     expect(text).toContain("2 grants between them and teammates are revoked");
-    expect(text).toContain("their work there goes to the Bots' owner");
+    expect(text).toContain("Their users on teammates' machines are removed, and their work there goes to the Bots' owner");
+    expect(text).toContain("Their users on their accounts on this server are removed, and their work there is deleted for good after 3 days");
     expect(text).toContain("suspended now and deleted after 7 days");
     expect(text).toContain("Their own Bots, chats and secrets stay theirs");
 
-    const gone = offboardingMessage(preview({ grants: 1, machine: { fate: "destroy", days: 0 }, work: { files: "delete", graceDays: 0 } }), "Alpha");
+    const gone = offboardingMessage(preview({ grants: 1, machine: { fate: "destroy", days: 0 }, work: { machines: { files: "delete", graceDays: 0 }, accounts: null } }), "Alpha");
     expect(gone).toContain("1 grant between them and teammates is revoked");
     expect(gone).toContain("deleted for good.");
     expect(gone).toContain("deleted now, with its disks");
-    expect(offboardingMessage(preview({ work: { files: "delete", graceDays: 3 } }), "A")).toContain("deleted for good after 3 days");
+    expect(offboardingMessage(preview({ work: { machines: null, accounts: { files: "delete", graceDays: 1 } } }), "A")).toContain("deleted for good after 1 day.");
     expect(offboardingMessage(preview({ machine: { fate: "kept" } }), "A")).toContain("Their own machine stays theirs");
     const bare = offboardingMessage(preview(), "A");
-    expect(bare).not.toMatch(/grant|machine/);
+    expect(bare).not.toMatch(/grant|machine|Their users/);
   });
 
   it("explains a refused removal", () => {
@@ -155,5 +159,32 @@ describe("team API", () => {
     expect(await teamLinkWanted(fake({ id: "t1" }, []))).toBe(true);
     expect(await teamLinkWanted(fake(null, [{ id: "i1" }]))).toBe(true);
     expect(await teamLinkWanted({ team: async () => Promise.reject(new Error("down")), myTeamInvites: async () => [] } as never)).toBe(false);
+  });
+
+  it("checks the Team link again in the foreground and on a timer, so a new invite shows up", async () => {
+    jest.useFakeTimers();
+    let changed: ((s: string) => void) | undefined;
+    const remove = jest.fn();
+    const spy = jest.spyOn(AppState, "addEventListener").mockImplementation(((_: string, fn: (s: string) => void) => {
+      changed = fn;
+      return { remove };
+    }) as never);
+    let invites: unknown[] = [];
+    const api = { team: jest.fn(async () => null), myTeamInvites: jest.fn(async () => invites) } as never;
+    const seen: boolean[] = [];
+    const stop = watchTeamLink(api, (v) => seen.push(v));
+    await jest.advanceTimersByTimeAsync(0);
+    invites = [{ id: "i1" }];
+    changed?.("active");
+    await jest.advanceTimersByTimeAsync(0);
+    invites = [];
+    await jest.advanceTimersByTimeAsync(TEAM_LINK_EVERY_MS);
+    expect(seen).toEqual([false, true, false]);
+    stop();
+    await jest.advanceTimersByTimeAsync(TEAM_LINK_EVERY_MS);
+    expect(seen).toHaveLength(3);
+    expect(remove).toHaveBeenCalled();
+    spy.mockRestore();
+    jest.useRealTimers();
   });
 });
