@@ -19,6 +19,8 @@ DRY_RUN=false
 INTERACTIVE=true
 WITH_HERMES=false
 LICENSE_FILE=""
+# --testing-mode: run unlicensed with billing off (TESTING_MODE=on; docs/adr/0068-no-free-tier.md).
+TESTING_MODE_ON=false
 # Hermes Agent release --with-hermes installs: the commit of tag v0.23.2 (NousResearch/hermes-agent).
 HERMES_COMMIT=${HERMES_COMMIT:-ae2a81ccc00e9b7c06301523e5bb09608397149c}
 SHARE_DIR=${SHARE_DIR:-/usr/local/share/superbot}
@@ -60,7 +62,9 @@ Usage: install.sh [options]
   --ufw               Enable UFW (allow 22, 80, 443)
   --no-backup         Skip daily DATA_DIR backup timer
   --with-hermes       Also install the Hermes Agent CLI (about 2.5 GB; HERMES_COMMIT pins it)
-  --license-file PATH Install the license key CG-Labs sent (without one: community edition)
+  --license-file PATH Install the license key CG-Labs sent. SuperBot has no free tier: without a
+                      license, Bots don't run unless testing mode is on
+  --testing-mode      Set TESTING_MODE=on: no license, billing off, for test servers only
   --isolation         Run each user's Bots as their own Unix account (ISOLATION=users; ADR 0037),
                       which can't read .env, the database or the master key. On by default for
                       new installs (ADR 0058); an upgrade keeps what it had. ISOLATION_DIR sets
@@ -90,6 +94,7 @@ parse_args() {
       --no-backup) ENABLE_BACKUP=false; shift ;;
       --with-hermes) WITH_HERMES=true; shift ;;
       --license-file) LICENSE_FILE=$2; shift 2 ;;
+      --testing-mode) TESTING_MODE_ON=true; shift ;;
       --isolation) ISOLATION_MODE=users; shift ;;
       --no-isolation) ISOLATION_MODE=off; shift ;;
       --no-client) BUILD_CLIENT=false; shift ;;
@@ -502,7 +507,9 @@ configure_env() {
   USER_NAME_VALUE=${USER_NAME_VALUE:-Owner}
 
   if [[ "$DRY_RUN" == true ]]; then
-    log "[dry-run] configure $env_file"
+    local testing=""
+    [[ "$TESTING_MODE_ON" != true ]] || testing=" (TESTING_MODE=on: no license, billing off)"
+    log "[dry-run] configure $env_file$testing"
     return
   fi
 
@@ -520,6 +527,10 @@ configure_env() {
   set_env_var "$env_file" USER_NAME "$USER_NAME_VALUE"
   set_env_var "$env_file" DATA_DIR "$repo_path/data"
   set_env_var "$env_file" WORKSPACE_DIR "$repo_path/workspace"
+
+  if [[ "$TESTING_MODE_ON" == true ]]; then
+    set_env_var "$env_file" TESTING_MODE on
+  fi
 
   if [[ -n "$DOMAIN" ]]; then
     set_env_var "$env_file" ALLOWED_HOSTS "$DOMAIN"
@@ -1020,7 +1031,7 @@ SuperBot is installed.
   Password: stored in $pass_file (also in $repo_path/.env as AUTH_PASSWORD)
   Key:      $(master_key_default "$home") encrypts saved secrets. Back it up apart from
             the database: without it they can't be read (deploy/README.md).
-  License:  botctl license (none: the community edition, free for up to 10 active people)
+  License:  botctl license (no free tier: without a license, Bots run only with TESTING_MODE=on)
   Logs:     journalctl -u superbot -f
   Upgrade:  sudo bash -s -- --upgrade < <(curl -fsSL https://raw.githubusercontent.com/CG-Labs/superbot/main/deploy/install.sh)
 

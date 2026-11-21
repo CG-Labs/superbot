@@ -120,4 +120,17 @@ quiet
 grep -q 'Skipping the web client (--no-client)' "$T/out" || fail "--no-client did not skip the web client"
 ok "no Node or --no-client still exits 0"
 
+# No free tier (ADR 0068): only --testing-mode writes TESTING_MODE=on, and the summary says so.
+user_home() { echo "$T/home"; }
+mkdir -p "$T/home/superbot"
+cp "$DIR/../.env.example" "$T/home/superbot/.env.example"
+SUPERBOT_USER=$(id -un) DRY_RUN=false TESTING_MODE_ON=false configure_env >/dev/null
+if grep -q '^TESTING_MODE=' "$T/home/superbot/.env"; then fail "testing mode was turned on without --testing-mode"; fi
+parse_args --testing-mode
+[[ "$TESTING_MODE_ON" == true ]] || fail "--testing-mode was not read"
+SUPERBOT_USER=$(id -un) DRY_RUN=false configure_env >/dev/null
+grep -qx 'TESTING_MODE=on' "$T/home/superbot/.env" || fail "--testing-mode did not set TESTING_MODE=on"
+grep -q 'no free tier' <<<"$(usage)" || fail "the help doesn't say there's no free tier"
+ok "--testing-mode, and only it, turns testing mode on"
+
 echo "all install checks passed"

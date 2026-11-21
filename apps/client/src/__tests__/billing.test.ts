@@ -15,7 +15,7 @@ describe("billing API (ADR 0042)", () => {
 
   it("reads a server without billing, or from before it, as no billing", async () => {
     for (const status of [404, 403, 405]) {
-      answer(status, { error: "Billing isn't set up on this server." });
+      answer(status, { error: "Billing is off while SuperBot is in testing: nothing is charged." });
       expect(await api().billing()).toBeNull();
       expect(await billingAvailable(api())).toBe(false);
     }
