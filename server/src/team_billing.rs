@@ -18,7 +18,8 @@ use crate::runner::App;
 use crate::stripe::{self, Stripe};
 use crate::users::Caller;
 use crate::{AppState, Auth};
-use axum::body::Bytes;
+use axum::Json;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -441,22 +442,35 @@ fn managed(app: &AppState, c: &Caller) -> Result<(crate::db::User, Team), Respon
     Ok((u, t))
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Buy {
+    tier: String,
+}
+
 /// `POST /api/team/billing/checkout {tier}`: a Stripe Checkout Session for the team's
 /// plan, a seat for each member; returns `{url}`. Owners and admins only. Refused for
 /// tiers without a price, and while a subscription already pays for the team's plan.
-pub async fn checkout(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, body: Bytes) -> Response {
-    let Some(co) = a.payments.checkout() else { return billing::off() };
+pub async fn checkout(
+    State(app): State<AppState>,
+    Extension(a): Extension<Arc<Auth>>,
+    Extension(c): Extension<Caller>,
+    Extension(by): Extension<Who>,
+    body: Result<Json<Buy>, JsonRejection>,
+) -> Response {
+    // Stripe calls go through the seat sync's client, set at startup, never one reached
+    // through the request.
+    let (Some(co), Some(sync)) = (a.payments.checkout(), app.team_seats.get()) else { return billing::off() };
     let (u, t) = match managed(&app, &c) {
         Ok(x) => x,
         Err(r) => return r,
     };
     let bad = |code: StatusCode, msg: String| reply(code, json!({ "error": msg }));
-    let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-    let Some(name) = v["tier"].as_str().map(str::trim).filter(|t| !t.is_empty()) else {
+    let Some(name) = body.ok().map(|Json(b)| b.tier).map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) else {
         return bad(StatusCode::BAD_REQUEST, "Say which plan: {\"tier\": \"<name>\"}.".into());
     };
     let tiers = app.tiers();
-    let Some(tier) = tiers.get(name) else {
+    let Some(tier) = tiers.get(&name) else {
         return bad(StatusCode::BAD_REQUEST, format!("There's no plan called \"{name}\"."));
     };
     let Some(price) = tier.stripe_prices.first() else {
@@ -466,8 +480,7 @@ pub async fn checkout(State(app): State<AppState>, Extension(a): Extension<Arc<A
     if !billing::may_start(co, &u.id) {
         return bad(StatusCode::TOO_MANY_REQUESTS, "Too many checkouts at once. Try again in a minute.".into());
     }
-    let Some(seats) = app.team_seats.get() else { return billing::off() };
-    let _one_at_a_time = seats.hold(&t.id).await;
+    let _one_at_a_time = sync.hold(&t.id).await;
     if app.db.team(&t.id).is_none() {
         return bad(StatusCode::NOT_FOUND, "You aren't on a team.".into());
     }
@@ -477,7 +490,7 @@ pub async fn checkout(State(app): State<AppState>, Extension(a): Extension<Arc<A
     }
     let payer = Payer::Team(&t.id);
     let last = payer.open_checkout(&app);
-    match billing::close_last(&app, &co.stripe, payer).await {
+    match billing::close_last(&app, &sync.stripe, payer).await {
         Last::Closed => {}
         Last::Paid => {
             app.db.record(&event(Outcome::Denied, json!({ "tier": tier.name, "reason": "checkout_completed", "session": last })));
@@ -518,7 +531,7 @@ pub async fn checkout(State(app): State<AppState>, Extension(a): Extension<Arc<A
     let mut keyed = form.clone();
     keyed.push(("request".into(), crate::random_hex(16)));
     let key = stripe::idempotency_key("checkout", &payer.key(), &keyed, now);
-    match billing::session("checkout", &payer.key(), co.stripe.post("/v1/checkout/sessions", &form, &key).await) {
+    match billing::session("checkout", &payer.key(), sync.stripe.post("/v1/checkout/sessions", &form, &key).await) {
         Ok((id, url)) => {
             app.db.set_team_open_checkout(&t.id, &id, expires_at);
             app.db.record(&event(Outcome::Success, json!({ "tier": tier.name, "price": price, "session": id, "customer": customer, "seats": seats })));
@@ -534,7 +547,7 @@ pub async fn checkout(State(app): State<AppState>, Extension(a): Extension<Arc<A
 /// `POST /api/team/billing/portal`: a Stripe Billing Portal session for the team's
 /// customer; returns `{url}`. Owners and admins only; 409 until the team has one.
 pub async fn portal(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>) -> Response {
-    let Some(co) = a.payments.checkout() else { return billing::off() };
+    let (Some(co), Some(sync)) = (a.payments.checkout(), app.team_seats.get()) else { return billing::off() };
     let (u, t) = match managed(&app, &c) {
         Ok(x) => x,
         Err(r) => return r,
@@ -549,7 +562,7 @@ pub async fn portal(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
     let form = vec![("customer".to_string(), cus.clone()), ("return_url".to_string(), format!("{}{RETURN_PATH}", co.public_url))];
     let key = stripe::idempotency_key("portal", &payer, &form, crate::db::now());
     let event = |outcome: Outcome, d: Value| team_event(&by, "billing.portal_created", &t.id, d).outcome(outcome);
-    match billing::session("billing portal", &payer, co.stripe.post("/v1/billing_portal/sessions", &form, &key).await) {
+    match billing::session("billing portal", &payer, sync.stripe.post("/v1/billing_portal/sessions", &form, &key).await) {
         // The link signs whoever has it in to the team's billing: never logged.
         Ok((id, url)) => {
             app.db.record(&event(Outcome::Success, json!({ "customer": cus, "session": id })));

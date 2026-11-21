@@ -79,6 +79,10 @@ async fn a_team_buys_one_plan_for_everyone_on_it() {
     }
     let (code, v) = json_call(port, "POST", "/api/team/billing/checkout", &w.a, r#"{"tier":"max"}"#).await;
     assert_eq!(code, 400, "{v}");
+    for body in ["", "{}", r#"{"tier":" "}"#, r#"{"tier":"pro","customer":"cus_x"}"#, "not json"] {
+        let (code, v) = json_call(port, "POST", "/api/team/billing/checkout", &w.a, body).await;
+        assert_eq!((code, v["error"].as_str().is_some()), (400, true), "{body}: {v}");
+    }
     let (code, v) = json_call(port, "POST", "/api/team/billing/checkout", &w.a, r#"{"tier":"pro"}"#).await;
     assert_eq!(code, 200, "{v}");
     assert!(v["url"].as_str().unwrap().starts_with("https://checkout.stripe.com/"), "{v}");
