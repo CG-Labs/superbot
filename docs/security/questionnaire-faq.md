@@ -21,7 +21,7 @@ Yes: Microsoft Entra ID, Google, Apple, GitHub, any OIDC provider, and SAML thro
 Not in SuperBot itself. Use SSO and enforce MFA at your IdP.
 
 **How are users kept apart?**
-Each user's Bots run as that user's own Unix account on one server, or on that user's own machine when managed. A Bot can do no more than its owner. See [isolation](access-control.md#isolation-between-users).
+Each user's Bots run as that user's own Unix account on one server, or on that user's own machine when managed. On machines, separate OS users for Bots and teammates, and the Linode firewall, are settings the operator turns on. A Bot can do no more than its owner. See [isolation](access-control.md#isolation-between-users).
 
 **Can an AI agent take destructive actions on its own?**
 Destructive commands, file deletes, outbound messages, network installs and `git push` wait for a person's approval by default. If the approval check can't be made, the action is refused. See [authorization](access-control.md#authorization).

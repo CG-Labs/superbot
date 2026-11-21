@@ -9,7 +9,7 @@ Part of the [security pack](README.md). Data stored by each part: [data flows](d
 | Component | What it is | Where it runs |
 |-----------|-----------|---------------|
 | **botd** | The server (Rust, one binary). Users, sign-in, Bots, chats, routines, approvals, policy, secrets, audit log, billing, and, when on, the control plane for managed machines. Stores its data in SQLite. | The operator's server. |
-| **Caddy** | Reverse proxy. Terminates HTTPS, serves the web client at `/app/` and the landing page, and forwards everything else to botd, which listens only on `127.0.0.1:3000` ([ADR 0013](../adr/0013-serve-web-client.md)). | Same server, in front of botd ([`deploy/install.sh`](../../deploy/install.sh), [`deploy/docker/`](../../deploy/docker/)). |
+| **Caddy** | Reverse proxy. Terminates HTTPS, serves the web client at `/app/` and the landing page, and forwards everything else to botd. With the installer, botd listens only on `127.0.0.1:3000`; with Docker Compose it listens inside the container network, and port 3000 isn't published, so only Caddy reaches it ([ADR 0013](../adr/0013-serve-web-client.md), [ADR 0006](../adr/0006-docker-compose.md)). | Same server, in front of botd ([`deploy/install.sh`](../../deploy/install.sh), [`deploy/docker/`](../../deploy/docker/)). |
 | **Client app** | Expo app for iOS, Android, web and desktop (Electron). Chat, approvals, Bot screens, settings, admin views. Talks to botd only, over HTTPS (REST plus server-sent events) ([ADR 0004](../adr/0004-client-expo.md), [ADR 0027](../adr/0027-expo-primary-hermes-default.md)). | The person's device. |
 | **Admin console** | A minimal admin page served by botd at `/console/`, for admins only ([ADR 0032](../adr/0032-console-admin-only.md)). | Browser. |
 | **Harnesses** | The agent CLIs a Bot runs: Claude Code, Codex, Pi and Hermes Agent. One adapter each in botd ([`server/src/adapters/`](../../server/src/adapters/)); nothing else in SuperBot knows which harness runs. Hermes Agent is the default on managed plans ([ADR 0079](../adr/0079-hermes-default-for-managed-tiers.md)). | Wherever the Bot's owner's runs go: the botd server, or the owner's machine. |
@@ -33,7 +33,7 @@ flowchart LR
   end
   subgraph Server["Operator's server"]
     Caddy["Caddy<br/>HTTPS :443"]
-    Botd["botd<br/>127.0.0.1:3000"]
+    Botd["botd :3000<br/>not public"]
     DB[("SQLite<br/>DATA_DIR")]
     WS[("Workspace<br/>WORKSPACE_DIR/users/&lt;id&gt;")]
     H["Harness processes<br/>as sb-u-&lt;user id&gt;"]
@@ -66,7 +66,7 @@ flowchart LR
   end
   subgraph MA["Ada's machine (Linode VM or Incus container)"]
     AgentA["superbot-machine<br/>:7443 mTLS"]
-    HA["Harness runs<br/>as superbot-bots"]
+    HA["Harness runs<br/>(as superbot-bots with MACHINE_BOT_USER=on)"]
     DA[("Work folder, Bot memory,<br/>harness logins")]
     SA["Screens"]
   end
@@ -90,7 +90,7 @@ Key points:
 
 - **The control plane decides; the machine does.** Who may see or run a Bot, approvals, policy, secrets, billing and the audit log stay in botd. A compromised machine can harm only its own user ([ADR 0029](../adr/0029-per-user-isolation.md)).
 - **botd dials the agent.** Jobs, heartbeats, logins and screens go from botd to the agent's port (default 7443). The agent calls botd only to enroll, to rotate its certificate, and to relay a running Bot's own API calls.
-- **Runs never as root.** With `MACHINE_BOT_USER=on`, the agent runs every harness as the unprivileged `superbot-bots` user, and a teammate's runs of a shared Bot as that teammate's own OS user ([ADR 0043](../adr/0043-bots-own-os-user-on-machines.md), [ADR 0048](../adr/0048-teammates-own-os-user-on-machines.md)). Screens need it on.
+- **Bots' own OS users (off by default).** With `MACHINE_BOT_USER=on`, the agent runs every harness as the unprivileged `superbot-bots` user instead of its own account ([ADR 0043](../adr/0043-bots-own-os-user-on-machines.md)); screens need it on. With `MACHINE_TEAMMATE_USERS=on` as well, a teammate's runs of a shared Bot get that teammate's own OS user ([ADR 0048](../adr/0048-teammates-own-os-user-on-machines.md)).
 - **No harness code on the agent.** botd's adapters build each run's command and send it as data; the agent runs it ([ADR 0036](../adr/0036-bots-on-the-users-machine.md)).
 
 ## Trust boundaries
@@ -125,7 +125,7 @@ flowchart TB
 | Server to a run | A run's command, environment and secrets | One server: the run is the user's own Unix account, started through `sudo superbot-run`. Machines: mutual TLS with pinned certificates from botd's own CA. |
 | A run back to the server | A Bot's API calls (botctl, approval checks) | A token for that run only, revoked when the run ends; a Bot can do no more than its owner ([ADR 0083](../adr/0083-per-run-tokens.md)). |
 | User to user | Nothing | Separate folders, Unix accounts or machines; ACL checks in botd; isolation tests in CI ([`deploy/test-isolation.sh`](../../deploy/test-isolation.sh)). |
-| Machine to network | Outbound traffic | Linode: Cloud Firewall drops all inbound except botd to the agent port (SSH only if the operator lists sources) ([ADR 0035](../adr/0035-machine-firewall-auto-enroll.md)). Incus: containers can't reach each other, the host, or private and link-local ranges ([ADR 0065](../adr/0065-incus-container-machines.md)). |
+| Machine to network | Inbound and outbound traffic | Linode, with `MACHINE_FIREWALL=on` (off by default): Cloud Firewall drops all inbound except botd to the agent port (SSH only if the operator lists sources) ([ADR 0035](../adr/0035-machine-firewall-auto-enroll.md)). Without it, the machine has no SuperBot firewall. Incus: the firewall is required, and containers can't reach each other, the host, or private and link-local ranges ([ADR 0065](../adr/0065-incus-container-machines.md)). |
 | Server to outside services | API calls | HTTPS with certificate checks; each service is off until its setting is set ([subprocessors](subprocessors.md)). |
 
 ## Planned
