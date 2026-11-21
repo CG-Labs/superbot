@@ -8,6 +8,10 @@ These steps change only the Incus host you run them on. Placeholders look like `
 
 Use a dedicated Linux host for SuperBot containers, with a current kernel and Incus 6 or later. Choose a storage pool driver that enforces disk sizes: zfs, btrfs or lvm. `dir` does not enforce sizes, and the preflight check flags it.
 
+The kernel needs nftables' bridge family. Without it, Incus can't apply network ACLs or NIC filters, and creates fail. Check with `sudo nft add table bridge sbcheck && sudo nft delete table bridge sbcheck`. Stock Ubuntu has it. Some minimal or nested kernels don't.
+
+Memory is hard-limited per container, but swap isn't: a restricted project refuses `limits.memory.swap`. If containers mustn't swap, give the host no swap.
+
 ```bash
 incus admin init            # pick zfs, btrfs or lvm for the pool
 ```
@@ -98,9 +102,24 @@ botctl machine show <user>        # state running, enrollment enrolled, agentSee
 
 Once it has enrolled, the next reconcile removes its enrollment user data from the container's config ([ADR 0067](../adr/0067-clearing-enrollment-data-from-containers.md)). It does this in place, without restarting the container, and turns on daily snapshots only after that. `incus config show <name> --project superbot` should then show no `cloud-init.user-data`, and the audit log has `machine.user_data_cleared`. If the container misses its enrollment deadline while running, the user data is removed too. A `machine.user_data_clear_failed` event says why it couldn't be removed, and the next pass tries again.
 
+## Testing against a real host
+
+An end-to-end test runs botd's Incus provider against a real Incus host ([ADR 0068](../adr/0068-validating-incus-containers-on-a-real-host.md)). The `incus-e2e` CI job runs it on GitHub's runners. To run it yourself, use a throwaway Ubuntu 24.04 VM, because the script reconfigures Incus on the host it runs on:
+
+```bash
+sudo SUPERBOT_INCUS_E2E_THROWAWAY=1 deploy/incus-e2e-host.sh /tmp/incus-e2e   # INCUS_SOURCE=ubuntu for Ubuntu's own package
+cargo build --bin superbot-machine
+set -a; . /tmp/incus-e2e/incus-e2e.env; set +a
+cargo test --bin botd -- --ignored --exact --nocapture \
+  machines_incus_e2e_tests::real_incus_containers_enroll_stay_apart_and_follow_the_lifecycle
+```
+
+The test makes and destroys two containers. It checks enrollment, that the token is gone, sizing, isolation between them and from the host, suspend, resume, resize, the reconciler, rebuild and destroy. It cleans up containers and ACLs left by an earlier run. It needs nftables' bridge family. The script makes a btrfs pool; with `POOL_DRIVER=dir` the test still runs and expects the preflight warning about disk sizes.
+
 ## Limits to know
 
 - Containers share the host's kernel. A kernel escape crosses every boundary. Use VMs for tiers that need their own kernel.
+- Containers can't reach each other at all, ping included. They can ping the gateway. The host itself reaches only their agent port.
 - Snapshots (daily, kept 7 days) stay on the same pool. They don't protect against losing the host.
 - A container's config holds its live enrollment token from its create (or rebuild) until it enrolls or misses its deadline. Anyone who can read the Incus project can read it during that window. A container that never starts keeps it in its config, but the token expires an hour after it was issued.
 - Switching `MACHINE_PROVIDER` leaves machines made by the other provider as they are. botd reaches their agents but won't change them until you switch back.
