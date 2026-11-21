@@ -6,7 +6,8 @@
 //! old. Only a version that passed is remembered, for `PASS_FOR`, so a refused run
 //! that an admin fixes goes through on the next try.
 
-use crate::machines::wire::JobEvent;
+use crate::accounts::RunAs;
+use crate::machines::wire::{JobEvent, JobRequest};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -191,18 +192,42 @@ pub fn key_here(bin: &str, real: &Path) -> String {
     format!("here:{bin}:{}:{}:{}", real.display(), m.map_or(0, |m| m.len()), changed.map_or(0, |d| d.as_nanos()))
 }
 
-/// `<real> --version` on this server, in `cwd`, without botd's secrets: its stdout, or why not.
-pub async fn read_here(real: &Path, path: &str, cwd: &Path) -> Result<String, String> {
-    let mut cmd = tokio::process::Command::new(real);
-    cmd.arg("--version").env("PATH", path).current_dir(cwd).stdin(std::process::Stdio::null()).kill_on_drop(true);
-    for k in super::secret_env() {
-        cmd.env_remove(k);
-    }
-    match tokio::time::timeout(PROBE_TIMEOUT, cmd.output()).await {
+/// The cache key for `bin` on a machine. Who the run is there and where it starts
+/// pick which `bin` it finds, so a pass is for that alone.
+pub fn key_there(bin: &str, machine: &str, user: &str, cwd: &str) -> String {
+    format!("machine:{bin}:{machine}:{user}:{cwd}")
+}
+
+/// `<real> --version` on this server, started as the run is: in `cwd`, as `run_as`'s
+/// account when there is one (a Bot can write to `cwd`, so what it finds there never
+/// runs as botd), without botd's secrets. Its stdout, or why not.
+pub async fn read_here(real: &Path, path: &str, cwd: &Path, run_as: Option<&RunAs>) -> Result<String, String> {
+    let job = JobRequest {
+        protocol: crate::machines::wire::PROTOCOL,
+        job_id: String::new(),
+        bot_id: String::new(),
+        owner_id: String::new(),
+        for_user: None,
+        message_id: 0,
+        bin: real.display().to_string(),
+        args: vec!["--version".into()],
+        env: [("PATH".to_string(), path.to_string())].into(),
+        cwd: cwd.display().to_string(),
+        stdin: None,
+        files: vec![],
+        cleanup: None,
+        collect: vec![],
+    };
+    let job = match run_as {
+        Some(r) => r.prepare(job)?,
+        None => job,
+    };
+    let (tx, rx) = mpsc::channel(64);
+    let host = super::local_host();
+    let run = async move { crate::machines::job::run(&host, &job, std::future::pending(), &tx).await };
+    match tokio::time::timeout(PROBE_TIMEOUT, async { tokio::join!(run, read_job(rx)).1 }).await {
         Err(_) => Err(format!("{} --version didn't answer in {} seconds", real.display(), PROBE_TIMEOUT.as_secs())),
-        Ok(Err(e)) => Err(format!("{} --version: {e}", real.display())),
-        Ok(Ok(o)) if !o.status.success() => Err(failed(&o.status.to_string(), &String::from_utf8_lossy(&o.stderr))),
-        Ok(Ok(o)) => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
+        Ok(said) => said,
     }
 }
 
@@ -312,7 +337,7 @@ mod tests {
         assert_eq!(resolve("codex", "/nonexistent:/also-not", &elsewhere), None);
         write("echo 'codex-cli 0.140.0'");
         let real = resolve("codex", &path, &elsewhere).unwrap();
-        assert_eq!(read_here(&real, &path, &elsewhere).await.as_deref(), Ok("codex-cli 0.140.0\n"));
+        assert_eq!(read_here(&real, &path, &elsewhere, None).await.as_deref(), Ok("codex-cli 0.140.0\n"));
         // Relative and empty entries are from the run's folder, as its harness finds them.
         let parent = dir.parent().unwrap();
         let name = dir.file_name().unwrap().to_str().unwrap();
@@ -327,10 +352,36 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         write("echo 'boom' >&2; exit 3");
         assert_ne!(key_here("codex", &real), key, "an update is a new key");
-        let err = read_here(&real, &path, &elsewhere).await.unwrap_err();
+        let err = read_here(&real, &path, &elsewhere, None).await.unwrap_err();
         assert!(err.contains("exit status: 3") && err.ends_with("boom"), "{err}");
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(resolve("codex", &path, &elsewhere), None, "not executable");
+    }
+
+    #[tokio::test]
+    async fn with_a_per_user_account_the_check_runs_as_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::db::temp_path("version-run-as");
+        let (sudo, seen) = (dir.join("sudo"), dir.join("seen"));
+        let fake = sudo.clone();
+        let script = format!("#!/bin/sh\nprintf '%s\\n' \"$@\" \"PATH=$SUPERBOT_PATH\" \"PWD=$(pwd)\" > '{}'\necho 'codex-cli 0.150.0'\n", seen.display());
+        std::fs::write(&fake, script).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let r = RunAs { sudo, runner: "/opt/superbot/bin/superbot-run".into(), account: "sb-u-u1".into(), settings: dir.join("settings") };
+        let real = dir.join("codex");
+        assert_eq!(read_here(&real, ":/usr/bin", &dir, Some(&r)).await.as_deref(), Ok("codex-cli 0.150.0\n"));
+        let seen = std::fs::read_to_string(&seen).unwrap();
+        let want = ["-n", "-E", "-u", "sb-u-u1", "--", "/opt/superbot/bin/superbot-run", &real.display().to_string(), "--version", "PATH=:/usr/bin", &format!("PWD={}", dir.display())];
+        assert_eq!(seen.lines().collect::<Vec<_>>(), want, "as the account, never as botd");
+    }
+
+    #[test]
+    fn a_pass_on_a_machine_is_for_one_user_and_folder() {
+        let k = key_there("codex", "m1", "u-ada", "/home/bots/work");
+        assert_eq!(k, key_there("codex", "m1", "u-ada", "/home/bots/work"));
+        assert_ne!(k, key_there("codex", "m1", "u-bea", "/home/bots/work"), "a teammate's own user");
+        assert_ne!(k, key_there("codex", "m1", "u-ada", "/home/superbot-t-bea/work"), "another folder");
+        assert_ne!(k, key_there("codex", "m2", "u-ada", "/home/bots/work"));
     }
 
     #[tokio::test]

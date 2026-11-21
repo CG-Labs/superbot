@@ -702,7 +702,7 @@ impl App {
         {
             (spot.state_dir, spot.config_dir) = (state, settings);
         }
-        if self.hooks_refused(&bot, msg, &by, &period.key, &spot).await {
+        if self.hooks_refused(&bot, msg, &by, &period.key, &spot, run_as.as_ref()).await {
             return;
         }
         // Caches are made as the run's user: by botd when it is that user, by
@@ -1035,7 +1035,7 @@ impl App {
     /// (ADR 0059). A refused run is given back and audited, and the Bot says how to fix
     /// it. Unguarded runs aren't checked. The canary still stops a harness that skips
     /// the hook anyway.
-    async fn hooks_refused(&self, bot: &Bot, msg: &Message, by: &Who, period: &str, spot: &Spot) -> bool {
+    async fn hooks_refused(&self, bot: &Bot, msg: &Message, by: &Who, period: &str, spot: &Spot, run_as: Option<&RunAs>) -> bool {
         use adapters::version::{self, Short};
         let Some(min) = adapters::get(&bot.harness).and_then(|a| a.hooks_since()) else { return false };
         if self.db.effective_policy(&bot.id).mode != Mode::Ask {
@@ -1052,12 +1052,13 @@ impl App {
                         if version::passed(&key) {
                             return false;
                         }
-                        (Some(key), version::read_here(&real, &path, &spot.cwd).await)
+                        (Some(key), version::read_here(&real, &path, &spot.cwd, run_as).await)
                     }
                 }
             }
             Some(to) => {
-                let key = format!("machine:{bin}:{}", to.machine_id);
+                let user = spot.teammate_user.as_ref().and(spot.for_other.as_deref()).unwrap_or(bot.owner_id.as_str());
+                let key = version::key_there(bin, &to.machine_id, user, &spot.cwd.display().to_string());
                 if version::passed(&key) {
                     return false;
                 }
