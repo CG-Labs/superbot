@@ -1237,6 +1237,65 @@ pub struct ScimFields<'a> {
     pub active: Option<bool>,
 }
 
+/// A team a SCIM tenant provisioned as a Group (ADR 0095). The SCIM id is the team's.
+#[derive(Clone, Debug)]
+pub struct ScimGroup {
+    pub team: Team,
+    pub tenant: String,
+    /// As the IdP sent it; the team's name is its first 100 characters.
+    pub display_name: String,
+    pub external_id: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+const SCIM_GROUP_SELECT: &str = "SELECT t.*, g.tenant AS scim_tenant, g.display_name AS scim_display_name, g.external_id AS scim_external_id,
+  g.created_at AS scim_created_at, g.updated_at AS scim_updated_at
+  FROM scim_groups g JOIN teams t ON t.id = g.team_id";
+
+fn scim_group_row(r: &Row) -> rusqlite::Result<ScimGroup> {
+    Ok(ScimGroup {
+        team: team_row(r)?,
+        tenant: r.get("scim_tenant")?,
+        display_name: r.get("scim_display_name")?,
+        external_id: r.get("scim_external_id")?,
+        created_at: r.get("scim_created_at")?,
+        updated_at: r.get("scim_updated_at")?,
+    })
+}
+
+/// How a SCIM tenant looks groups up: `displayName` (any case) or `externalId` (exactly).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScimGroupKey {
+    DisplayName(String),
+    ExternalId(String),
+}
+
+/// Why a SCIM group write was refused.
+#[derive(Debug, PartialEq)]
+pub enum ScimGroupConflict {
+    DisplayName,
+    ExternalId,
+    /// Deleted, or never this tenant's, by the time the write ran.
+    Gone,
+    Db(String),
+}
+
+fn scim_group_conflict(e: rusqlite::Error) -> ScimGroupConflict {
+    let msg = e.to_string();
+    match () {
+        _ if !constraint(&e) => ScimGroupConflict::Db(msg),
+        _ if msg.contains("external_id") => ScimGroupConflict::ExternalId,
+        _ if msg.contains("display_name") => ScimGroupConflict::DisplayName,
+        _ => ScimGroupConflict::Db(msg),
+    }
+}
+
+/// The team name for a group's `displayName`: teams' names are at most 100 characters.
+pub fn team_name_for(display_name: &str) -> String {
+    display_name.chars().take(100).collect()
+}
+
 /// Why a SCIM write was refused: something unique is someone else's already.
 #[derive(Debug, PartialEq)]
 pub enum ScimConflict {
@@ -1433,7 +1492,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 38] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 39] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1472,7 +1531,25 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 38] = [
     migrate_status_incidents,
     migrate_billing_emails,
     migrate_team_billing,
+    migrate_scim_groups,
 ];
+
+/// SCIM groups as teams (ADR 0095): which teams a SCIM tenant provisioned, with the
+/// group's own name and `externalId`. A team goes, so does its row.
+fn migrate_scim_groups(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS scim_groups (
+          team_id TEXT PRIMARY KEY REFERENCES teams(id) ON DELETE CASCADE,
+          tenant TEXT NOT NULL,
+          display_name TEXT NOT NULL COLLATE NOCASE,
+          external_id TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS scim_groups_external_id ON scim_groups(tenant, external_id) WHERE external_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS scim_groups_display_name ON scim_groups(tenant, display_name);",
+    )
+}
 
 /// Team billing (ADR 0093): a team's own Stripe customer, its subscriptions (kept like
 /// a user's, with the seats Stripe bills and where syncing them stands), and its open
@@ -4864,6 +4941,86 @@ impl Db {
         let n = tx.execute("UPDATE scim_users SET deleted_at = ?, updated_at = ? WHERE tenant = ? AND user_id = ? AND deleted_at IS NULL", params![at, at, tenant, user_id]).unwrap_or(0);
         let ok = n == 1 && tx.execute("UPDATE users SET status = 'disabled', updated_at = ? WHERE id = ?", params![at, user_id]).is_ok();
         ok && tx.commit().is_ok()
+    }
+
+    /// A new team for a SCIM tenant's group, and the row that makes it the tenant's. All
+    /// of it or none.
+    pub fn create_scim_team(&self, tenant: &str, display_name: &str, external_id: Option<&str>, by: Option<&str>) -> Result<Team, ScimGroupConflict> {
+        let id = format!("t{}", crate::random_hex(5));
+        let at = now();
+        {
+            let c = self.c();
+            let tx = c.unchecked_transaction().map_err(scim_group_conflict)?;
+            tx.execute(
+                "INSERT INTO teams (id, name, machines, created_at, created_by, updated_at) VALUES (?1, ?2, 1, ?3, ?4, ?3)",
+                params![id, team_name_for(display_name), at, by],
+            )
+            .map_err(scim_group_conflict)?;
+            tx.execute(
+                "INSERT INTO scim_groups (team_id, tenant, display_name, external_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                params![id, tenant, display_name, external_id, at],
+            )
+            .map_err(scim_group_conflict)?;
+            tx.commit().map_err(scim_group_conflict)?;
+        }
+        self.team(&id).ok_or_else(|| ScimGroupConflict::Db("team not saved".into()))
+    }
+
+    /// The tenant's group, by its team's id.
+    pub fn scim_group(&self, tenant: &str, team_id: &str) -> Option<ScimGroup> {
+        self.c().query_row(&format!("{SCIM_GROUP_SELECT} WHERE g.tenant = ? AND g.team_id = ?"), [tenant, team_id], scim_group_row).optional().ok().flatten()
+    }
+
+    /// Which tenant's group a team is, if any.
+    pub fn scim_group_of(&self, team_id: &str) -> Option<ScimGroup> {
+        self.c().query_row(&format!("{SCIM_GROUP_SELECT} WHERE g.team_id = ?"), [team_id], scim_group_row).optional().ok().flatten()
+    }
+
+    pub fn scim_group_find(&self, tenant: &str, key: &ScimGroupKey) -> Option<ScimGroup> {
+        let (clause, v) = match key {
+            ScimGroupKey::ExternalId(v) => ("g.external_id = ?2", v),
+            ScimGroupKey::DisplayName(v) => ("g.display_name = ?2", v),
+        };
+        self.c().query_row(&format!("{SCIM_GROUP_SELECT} WHERE g.tenant = ?1 AND {clause}"), params![tenant, v], scim_group_row).optional().ok().flatten()
+    }
+
+    /// A page of the tenant's groups, oldest first, and how many match in all.
+    pub fn scim_groups(&self, tenant: &str, key: Option<&ScimGroupKey>, offset: i64, limit: i64) -> (i64, Vec<ScimGroup>) {
+        let (col, v) = match key {
+            None => ("g.display_name", None),
+            Some(ScimGroupKey::DisplayName(v)) => ("g.display_name", Some(v)),
+            Some(ScimGroupKey::ExternalId(v)) => ("g.external_id", Some(v)),
+        };
+        let c = self.c();
+        let filter = format!("WHERE g.tenant = ?1 AND (?2 IS NULL OR {col} = ?2)");
+        let total: i64 = c.query_row(&format!("SELECT count(*) FROM scim_groups g {filter}"), params![tenant, v], |r| r.get(0)).unwrap_or(0);
+        let mut s = c.prepare(&format!("{SCIM_GROUP_SELECT} {filter} ORDER BY g.created_at, g.team_id LIMIT ?3 OFFSET ?4")).unwrap();
+        let list = s.query_map(params![tenant, v, limit, offset], scim_group_row).unwrap().filter_map(Result::ok).collect();
+        (total, list)
+    }
+
+    /// Sets a group's name and `externalId`, and the team's name with it, if the group is
+    /// still the tenant's when the write runs.
+    pub fn save_scim_group(&self, tenant: &str, team_id: &str, display_name: &str, external_id: Option<&str>) -> Result<(), ScimGroupConflict> {
+        let c = self.c();
+        let tx = c.unchecked_transaction().map_err(scim_group_conflict)?;
+        let at = now();
+        let n = tx
+            .execute(
+                "UPDATE scim_groups SET display_name = ?1, external_id = ?2, updated_at = ?3 WHERE tenant = ?4 AND team_id = ?5",
+                params![display_name, external_id, at, tenant, team_id],
+            )
+            .map_err(scim_group_conflict)?;
+        if n == 0 {
+            return Err(ScimGroupConflict::Gone);
+        }
+        tx.execute("UPDATE teams SET name = ?1, updated_at = ?2 WHERE id = ?3", params![team_name_for(display_name), at, team_id]).map_err(scim_group_conflict)?;
+        tx.commit().map_err(scim_group_conflict)
+    }
+
+    /// The team is no longer the tenant's group. The team itself stays.
+    pub fn unlink_scim_group(&self, tenant: &str, team_id: &str) -> bool {
+        self.c().execute("DELETE FROM scim_groups WHERE tenant = ? AND team_id = ?", [tenant, team_id]).unwrap_or(0) > 0
     }
 
     /// Spends a sign-in code: once, before it expires, for an active user. Returns the user.

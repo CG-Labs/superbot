@@ -89,6 +89,9 @@ mod run_tokens_http_tests;
 mod runner;
 mod sandbox;
 mod scim;
+mod scim_groups;
+#[cfg(test)]
+mod scim_groups_http_tests;
 #[cfg(test)]
 mod scim_http_tests;
 mod screen;
@@ -235,7 +238,7 @@ async fn main() {
         .unwrap_or_else(|e| exit(format!("Shared Bots: {e}")));
     let teams = teams::Settings::from_env(&|k| env(k, "")).unwrap_or_else(|e| exit(format!("Teams: {e}")));
     let resume_routines = handover::resume_on_enable(&env("ROUTINES_ON_ENABLE", "")).unwrap_or_else(|e| exit(e));
-    let scim = scim::Scim::from_env(&env("SCIM", ""), &env("SCIM_DEFAULT_ROLE", "")).unwrap_or_else(|e| exit(format!("SCIM: {e}")));
+    let scim = scim::Scim::from_env(&env("SCIM", ""), &env("SCIM_DEFAULT_ROLE", ""), &env("SCIM_GROUPS", "")).unwrap_or_else(|e| exit(format!("SCIM: {e}")));
     let tiers = tiers::Tiers::from_env(|k| env(k, "")).unwrap_or_else(|e| exit(format!("Tiers: {e}")));
     let testing = license::testing_flag(&env("TESTING_MODE", "")).unwrap_or_else(|e| exit(e));
     let (payments, ignored_stripe) =
@@ -503,7 +506,11 @@ async fn main() {
         let _ = app.billing_mail.set(Arc::new(m));
     }
     match auth_state.scim.enabled {
-        true => log_info!("SCIM: on at /scim/v2; new users get the {} role.", auth_state.scim.default_role.as_str()),
+        true => log_info!(
+            "SCIM: on at /scim/v2; new users get the {} role; {} (ADR 0095).",
+            auth_state.scim.default_role.as_str(),
+            if auth_state.scim.groups { "groups are teams" } else { "groups aren't provisioned (SCIM_GROUPS=off)" }
+        ),
         false => log_info!("SCIM: off (SCIM=off)."),
     }
     log_info!(
@@ -806,8 +813,11 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/scim/v2/Schemas/{id}", get(scim::schema))
         .route("/scim/v2/Users", get(scim::list_users).post(scim::create_user))
         .route("/scim/v2/Users/{id}", get(scim::get_user).put(scim::replace_user).patch(scim::patch_user).delete(scim::delete_user))
-        .route("/scim/v2/Groups", get(scim::list_groups).post(scim::groups_unsupported))
-        .route("/scim/v2/Groups/{id}", get(scim::get_group).put(scim::groups_unsupported).patch(scim::groups_unsupported).delete(scim::groups_unsupported))
+        .route("/scim/v2/Groups", get(scim_groups::list_groups).post(scim_groups::create_group))
+        .route(
+            "/scim/v2/Groups/{id}",
+            get(scim_groups::get_group).put(scim_groups::replace_group).patch(scim_groups::patch_group).delete(scim_groups::delete_group),
+        )
         .route("/scim/v2", any(scim::unknown))
         .route("/scim/v2/{*rest}", any(scim::unknown))
         .route_layer(middleware::from_fn(obs::note_route))

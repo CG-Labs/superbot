@@ -38,6 +38,8 @@ pub const MEMBER: &str = "member";
 pub const LEFT_TEAM: &str = "left_team";
 /// Why someone lost access to Bots outside the team they joined.
 pub const JOINED_TEAM: &str = "joined_team";
+/// How a SCIM tenant's group changes its team (ADR 0095): `via` when it adds someone.
+pub const SCIM: &str = "scim";
 
 const DAY_MS: i64 = 86_400_000;
 const INVITE_DAYS: i64 = 7;
@@ -155,6 +157,9 @@ fn team_view(app: &AppState, t: &Team, me: Option<&TeamMember>, manager: bool) -
     if let Some(me) = me {
         v["role"] = json!(me.role);
     }
+    if let Some(g) = app.db.scim_group_of(&t.id) {
+        v["scimTenant"] = json!(g.tenant);
+    }
     if manager {
         v["invites"] = json!(app.db.team_invites(&t.id));
         v["machineDays"] = json!(settings(app).machine_days);
@@ -247,9 +252,10 @@ fn ours(app: &AppState, team_id: &str, m: &crate::db::Machine) -> bool {
     app.db.team_machine(&m.id).is_some_and(|t| t.team_id == team_id && t.released_at.is_none())
 }
 
-/// Adds `user` to `team` with `role`, and gives them their machine.
+/// Adds `user` to `team` with `role`, and gives them their machine. Only SCIM adds
+/// someone disabled, as the IdP's group says; they get their machine once enabled.
 async fn join(app: &AppState, by: &Who, team: &Team, user: &User, role: &str, via: &str) -> Res<Value> {
-    if !user.active() {
+    if !user.active() && via != SCIM {
         return Err(conflict("This person is disabled. Enable them first."));
     }
     let tier = app.tier_of(&user.id).name.clone();
@@ -281,7 +287,7 @@ async fn join(app: &AppState, by: &Who, team: &Team, user: &User, role: &str, vi
         crate::acl_changed(app, by, &bot.id, true).await;
     }
     app.send(json!({ "type": "resync" }));
-    let machine = provide(app, by, team, user).await;
+    let machine = if user.active() { provide(app, by, team, user).await } else { json!("disabled") };
     crate::team_billing::member_changed(app, &team.id, &user.id, &tier, "joined");
     let member = app.db.team_member(&user.id).ok_or_else(|| not_found("Member"))?;
     let mut v = member_view(app, &member, true);
@@ -294,9 +300,15 @@ async fn join(app: &AppState, by: &Who, team: &Team, user: &User, role: &str, vi
 /// and accounts (and teammates from theirs), and the machine the team gave them is
 /// suspended and, after TEAM_MACHINE_DAYS, destroyed.
 pub async fn leave(app: &AppState, by: &Who, team_id: &str, user_id: &str, reason: &str) -> bool {
+    leave_as(app, by, team_id, user_id, reason, reason != "team_deleted").await
+}
+
+/// [`leave`]. With `keep_owner`, not the team's last owner while others are on it; a
+/// SCIM tenant's removal goes through regardless, as the IdP decides who's on its team.
+pub(crate) async fn leave_as(app: &AppState, by: &Who, team_id: &str, user_id: &str, reason: &str, keep_owner: bool) -> bool {
     let Some(member) = app.db.team_member(user_id).filter(|m| m.team_id == team_id) else { return false };
     let tier = app.tier_of(user_id).name.clone();
-    if !app.db.remove_team_member(team_id, user_id, reason != "team_deleted") {
+    if !app.db.remove_team_member(team_id, user_id, keep_owner) {
         return false;
     }
     let mates: HashSet<String> = app.db.team_members(team_id).into_iter().map(|m| m.user_id).collect();
@@ -430,6 +442,30 @@ pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
     out
 }
 
+// SCIM groups (ADR 0095): a tenant's group is a team whose members only the IdP changes.
+
+/// Adds `user` to a SCIM group's team as a member. SCIM never sets team roles.
+pub(crate) async fn scim_join(app: &AppState, by: &Who, team: &Team, user: &User) -> Res<Value> {
+    join(app, by, team, user, MEMBER, SCIM).await
+}
+
+/// After SCIM enables someone a group added while they were disabled: their team's machine.
+pub(crate) async fn scim_enabled(app: &AppState, by: &Who, user_id: &str) {
+    let (Some(m), Some(user)) = (app.db.team_member(user_id), app.db.user(user_id)) else { return };
+    let Some(team) = app.db.team(&m.team_id) else { return };
+    if user.active() && app.db.user_machine(user_id).is_none_or(|x| x.state == MachineState::Destroyed) {
+        provide(app, by, &team, &user).await;
+    }
+}
+
+/// Refuses a change to who's on a SCIM tenant's team: its IdP decides, and would undo it.
+fn not_scim(app: &AppState, team_id: &str) -> Res<()> {
+    match app.db.scim_group_of(team_id) {
+        Some(g) => Err(conflict(format!("This team's members come from SCIM (tenant {}). Change them in the identity provider.", g.tenant))),
+        None => Ok(()),
+    }
+}
+
 // The caller's own team: `/api/team` and `/api/me/team-invites`.
 
 fn me(c: &Caller) -> Res<User> {
@@ -478,6 +514,7 @@ pub async fn mine(State(app): State<AppState>, Extension(c): Extension<Caller>) 
 /// `POST /api/team/leave`: off your team. Its last owner can't while others are on it.
 pub async fn leave_mine(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>) -> Res {
     let (u, m, t) = my_team(&app, &c)?;
+    not_scim(&app, &t.id)?;
     let others = app.db.team_members(&t.id).len() > 1;
     if m.role == OWNER && others && owners(&app, &t.id) == 1 {
         return Err(conflict("You're the team's only owner. Make someone else an owner first."));
@@ -495,6 +532,7 @@ pub async fn leave_mine(State(app): State<AppState>, Extension(c): Extension<Cal
 /// `POST /api/team/invites` `{email, role?}`: invites someone. They join when they accept.
 pub async fn invite(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
     let (_, _, t) = my_managed_team(&app, &c)?;
+    not_scim(&app, &t.id)?;
     let email = v["email"].as_str().map(|e| e.trim().to_ascii_lowercase()).filter(|e| e.contains('@') && e.len() <= 254).ok_or_else(|| bad("Send an email address."))?;
     let role = parse_role(&v, &[ADMIN, MEMBER])?;
     if app.db.find_user(&email).is_some_and(|u| app.db.team_id_of(&u.id).as_deref() == Some(t.id.as_str())) {
@@ -541,6 +579,7 @@ pub async fn set_role(State(app): State<AppState>, Extension(c): Extension<Calle
 pub async fn remove(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(key): Path<String>) -> Res {
     let (me_user, me, t) = my_managed_team(&app, &c)?;
     let (u, m) = teammate(&app, &t.id, &key)?;
+    not_scim(&app, &t.id)?;
     if u.id == me_user.id {
         return Err(conflict("To leave the team yourself, use leave."));
     }
@@ -570,7 +609,9 @@ fn work_policies(app: &AppState) -> Value {
 pub async fn offboarding(State(app): State<AppState>, Extension(c): Extension<Caller>, Path(key): Path<String>) -> Res {
     let (me_user, me, t) = my_managed_team(&app, &c)?;
     let (u, m) = teammate(&app, &t.id, &key)?;
-    let blocked = if u.id == me_user.id {
+    let blocked = if app.db.scim_group_of(&t.id).is_some() {
+        Some("scim")
+    } else if u.id == me_user.id {
         Some("self")
     } else if m.role == OWNER && me.role != OWNER {
         Some("owner")
@@ -718,6 +759,7 @@ pub async fn accept(State(app): State<AppState>, Extension(c): Extension<Caller>
     let u = me(&c)?;
     let inv = my_invite(&app, &u, &id)?;
     let t = app.db.team(&inv.team_id).ok_or_else(|| not_found("Invite"))?;
+    not_scim(&app, &t.id)?;
     let v = join(&app, &by, &t, &u, &inv.role, "invite").await?;
     app.db.delete_team_invite(&inv.id);
     Ok(Json(v))
@@ -781,6 +823,9 @@ pub async fn update(State(app): State<AppState>, Extension(by): Extension<Who>, 
         None => None,
         Some(m) => Some(m.as_bool().ok_or_else(|| bad("machines must be true or false"))?),
     };
+    if name.is_some() {
+        not_scim(&app, &t.id)?;
+    }
     app.db.update_team(&t.id, name, machines);
     app.db.record(&team_event(&by, "team.updated", &t.id, json!({ "name": name, "machines": machines })));
     Ok(Json(team_view(&app, &need_team(&app, &id)?, None, true)))
@@ -789,6 +834,7 @@ pub async fn update(State(app): State<AppState>, Extension(by): Extension<Who>, 
 /// `DELETE /api/teams/{id}`: everyone leaves, as if each had, then the team goes.
 pub async fn delete(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     let t = need_team(&app, &id)?;
+    not_scim(&app, &t.id)?;
     let _billing = crate::team_billing::may_delete(&app, &by, &t.id, "admin").await?;
     for m in app.db.team_members(&t.id) {
         leave(&app, &by, &t.id, &m.user_id, "team_deleted").await;
@@ -818,7 +864,10 @@ pub async fn put_member(State(app): State<AppState>, Extension(by): Extension<Wh
             let m = app.db.team_member(&u.id).ok_or_else(|| not_found("Member"))?;
             Ok(Json(member_view(&app, &m, true)))
         }
-        _ => Ok(Json(join(&app, &by, &t, &u, &role, "admin").await?)),
+        _ => {
+            not_scim(&app, &t.id)?;
+            Ok(Json(join(&app, &by, &t, &u, &role, "admin").await?))
+        }
     }
 }
 
@@ -827,6 +876,7 @@ pub async fn delete_member(State(app): State<AppState>, Extension(by): Extension
     let t = need_team(&app, &id)?;
     let u = app.db.find_user(&key).ok_or_else(|| not_found("User"))?;
     let m = app.db.team_member(&u.id).filter(|m| m.team_id == t.id).ok_or_else(|| not_found("Member"))?;
+    not_scim(&app, &t.id)?;
     let others = app.db.team_members(&t.id).len() > 1;
     if m.role == OWNER && others && owners(&app, &t.id) == 1 {
         return Err(conflict("They're the team's only owner. Make someone else an owner first, or delete the team."));
