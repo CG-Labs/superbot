@@ -14,6 +14,7 @@ For buyers, security reviewers and procurement. It describes SuperBot as the cod
 | [Subprocessors](subprocessors.md) | Every outside service the code can talk to, what it receives, and the setting that turns it on. |
 | [Security questionnaire FAQ](questionnaire-faq.md) | Short answers to common questionnaire questions. |
 | [Machine recovery objectives](machine-recovery-objectives.md) | Backup schedule, RPO and RTO per plan for managed machines, as text for an SLA or DPA. |
+| [SOC 2 control mapping](soc2-control-mapping.md) | Each SOC 2 Security, Availability and Confidentiality criterion: what the product does, what the operator or customer must do, and the gaps. A self-assessment, not a certification. |
 
 Earlier reviews: [auth review, November 2026](auth-review-2026-11.md) and its [SCIM follow-up](auth-review-2026-11-scim.md).
 
@@ -25,6 +26,6 @@ Earlier reviews: [auth review, November 2026](auth-review-2026-11.md) and its [S
 
 ## Not in this pack yet (Planned)
 
-- A SOC 2 control mapping (M3), and SOC 2 Type II (M5) ([roadmap](../ROADMAP.md)).
+- A SOC 2 readiness checklist (M4), built from the gaps in the [control mapping](soc2-control-mapping.md#gaps-for-the-soc-2-readiness-checklist-m4), and SOC 2 Type II (M5) ([roadmap](../ROADMAP.md)). SuperBot is not SOC 2 certified.
 - An external penetration test before M3 general availability ([roadmap risks](../ROADMAP.md)).
 - A privacy policy, a DPA, a published subprocessor list and erasure for managed users (M4, GDPR row of the [roadmap](../ROADMAP.md)).
