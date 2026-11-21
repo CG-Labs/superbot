@@ -30,11 +30,16 @@ struct World {
 }
 
 async fn serve(routing: Routing, teams: crate::teams::Settings) -> World {
+    serve_with(routing, teams, |_| {}).await
+}
+
+async fn serve_with(routing: Routing, teams: crate::teams::Settings, hook: impl FnOnce(&mut ControlPlane) + Send + 'static) -> World {
     let fake = Arc::new(Fake::default());
     let p: Arc<dyn MachineProvider> = fake.clone();
     let (port, app, owner, _) = serve_app_with(move |a| {
         let mut cp = ControlPlane::for_tests(p);
         cp.routing = routing;
+        hook(&mut cp);
         a.machines = Arc::new(cp);
     })
     .await;
@@ -383,6 +388,89 @@ async fn by_default_people_in_no_team_share_as_before_and_teams_on_stops_that() 
         assert!(!cy_sees.contains(&alpha_bot), "never a team's Bot");
         assert!(!bot_ids(&w, &w.ada).await.contains(&open), "nor the other way");
     }
+}
+
+#[tokio::test]
+async fn the_offboarding_preview_says_what_goes_only_to_the_teams_own_admins() {
+    let w = world().await;
+    reconcile(&w).await;
+    let ops = bot(&w, "Ops", &w.ada_id, Visibility::Private);
+    let notes = bot(&w, "Notes", &w.al_id, Visibility::Private);
+    w.app.db.set_grant(&ops, &w.al_id, crate::acl::Grant::Operator, &w.ada_id);
+    w.app.db.set_grant(&notes, &w.ada_id, crate::acl::Grant::Viewer, &w.al_id);
+    // A grant across teams, as from before teams, isn't one of Alpha's to count.
+    w.app.db.set_grant(&notes, &w.bea_id, crate::acl::Grant::Viewer, &w.al_id);
+    let al_path = format!("/api/team/members/{}/offboarding", w.al_id);
+
+    let (code, v) = json_call(w.port, "GET", &al_path, &w.ada, "").await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!((v["allowed"].as_bool(), v["grants"].as_u64(), v["role"].as_str()), (Some(true), Some(2), Some("member")), "{v}");
+    assert_eq!((v["machine"]["fate"].as_str(), v["machine"]["days"].as_u64()), (Some("suspend"), Some(7)), "{v}");
+    assert_eq!((v["work"]["machines"].clone(), v["work"]["accounts"].clone()), (Value::Null, Value::Null), "{v}");
+    for hidden in [ops.as_str(), notes.as_str(), "Ops", "Notes", "192.0.2.", "@example.com"] {
+        assert!(!v.to_string().contains(hidden), "{hidden} in {v}");
+    }
+    // Asking changes nothing.
+    assert_eq!(w.app.db.team_id_of(&w.al_id).as_deref(), Some(w.alpha.as_str()));
+    assert!(w.app.db.grant(&ops, &w.al_id).is_some());
+
+    // Nobody removes themselves this way, and an admin can't remove an owner.
+    let (_, v) = json_call(w.port, "GET", &format!("/api/team/members/{}/offboarding", w.ada_id), &w.ada, "").await;
+    assert_eq!((v["allowed"].as_bool(), v["blocked"].as_str()), (Some(false), Some("self")), "{v}");
+    json_call(w.port, "PATCH", &format!("/api/team/members/{}", w.al_id), &w.ada, r#"{"role":"admin"}"#).await;
+    let (_, v) = json_call(w.port, "GET", &format!("/api/team/members/{}/offboarding", w.ada_id), &w.al, "").await;
+    assert_eq!((v["allowed"].as_bool(), v["blocked"].as_str()), (Some(false), Some("owner")), "{v}");
+    json_call(w.port, "PATCH", &format!("/api/team/members/{}", w.al_id), &w.ada, r#"{"role":"member"}"#).await;
+
+    // A member sees no preview; Beta's owner gets plain not found for Alpha's people, and
+    // sees only Beta in her team.
+    assert_eq!(call(w.port, "GET", &format!("/api/team/members/{}/offboarding", w.ada_id), &w.al, "").await.0, 403);
+    for who in [&w.al_id, &w.ada_id] {
+        let (code, res) = call(w.port, "GET", &format!("/api/team/members/{who}/offboarding"), &w.bea, "").await;
+        assert_eq!(code, 404, "{who}: {res}");
+    }
+    assert_eq!(call(w.port, "GET", "/api/team/members/al@example.com/offboarding", &w.bea, "").await.0, 404);
+    let (_, beta) = json_call(w.port, "GET", "/api/team", &w.bea, "").await;
+    assert_eq!(beta["id"], w.beta.as_str());
+    assert!(!beta.to_string().contains(&w.al_id) && !beta.to_string().contains(&w.ada_id), "{beta}");
+
+    // A machine of their own stays theirs, and says so.
+    let (dee_id, _) = user_with(w.port, &w.admin, "dee@example.com", "member").await;
+    call(w.port, "POST", &format!("/api/users/{dee_id}/machine"), &w.admin, "{}").await;
+    json_call(w.port, "PUT", &format!("/api/teams/{}/members/{dee_id}", w.alpha), &w.admin, "{}").await;
+    let (_, v) = json_call(w.port, "GET", &format!("/api/team/members/{dee_id}/offboarding"), &w.ada, "").await;
+    assert_eq!((v["machine"]["fate"].as_str(), v["grants"].as_u64()), (Some("kept"), Some(0)), "{v}");
+}
+
+#[tokio::test]
+async fn the_preview_and_the_console_say_what_each_cleanup_does_with_work() {
+    use crate::machines::offboard::{Files, Settings as Offboard};
+    let w = serve_with(Routing::Off, Default::default(), |cp| {
+        let mut e = crate::machines::enroll::Enrollment::for_tests(43, 1, 1);
+        e.offboard = Offboard { files: Files::Archive, grace_days: 7 };
+        cp.enrollment = Some(Arc::new(e));
+    })
+    .await;
+    let root = w.app.cfg.data_dir.parent().unwrap().join(format!("iso-{}", short_id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let mut iso = crate::accounts::for_tests(&root, "/bin/false");
+    iso.teammates = true;
+    iso.offboard = Offboard { files: Files::Delete, grace_days: 3 };
+    let _ = w.app.isolation.set(Arc::new(iso));
+    let want = json!({ "machines": { "files": "archive", "graceDays": 7 }, "accounts": { "files": "delete", "graceDays": 3 } });
+
+    let (code, v) = json_call(w.port, "GET", &format!("/api/team/members/{}/offboarding", w.al_id), &w.ada, "").await;
+    assert_eq!((code, &v["work"]), (200, &want), "{v}");
+    let (code, v) = json_call(w.port, "GET", "/api/teams", &w.admin, "").await;
+    assert_eq!((code, &v["settings"]["work"]), (200, &want), "{v}");
+}
+
+#[tokio::test]
+async fn with_no_days_the_preview_says_the_machine_goes_at_once() {
+    let w = serve(Routing::Off, crate::teams::Settings { strict: false, machine_days: 0 }).await;
+    reconcile(&w).await;
+    let (_, v) = json_call(w.port, "GET", &format!("/api/team/members/{}/offboarding", w.al_id), &w.ada, "").await;
+    assert_eq!((v["machine"]["fate"].as_str(), v["machine"]["days"].as_u64()), (Some("destroy"), Some(0)), "{v}");
 }
 
 #[tokio::test]

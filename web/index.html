@@ -14,6 +14,7 @@
       <a href="#users" data-tab="users">Users</a>
       <a href="#requests" data-tab="requests">Requests <span class="count" id="requests-count"></span></a>
       <a href="#machines" data-tab="machines">Machines</a>
+      <a href="#teams" data-tab="teams">Teams</a>
       <a href="#audit" data-tab="audit">Audit log</a>
       <a href="#settings" data-tab="settings">Settings</a>
       <a href="#setup" data-tab="setup">Setup <span class="count" id="setup-count"></span></a>
@@ -26,7 +27,7 @@
   </header>
 
   <main>
-    <p class="note">This page is for admins: people, requests for access, machines, the audit log, and server settings. Chat, Bots, approvals of Bot actions, and screens are in <a href="/app/" target="_blank" rel="noopener">the app</a>.</p>
+    <p class="note">This page is for admins: people, requests for access, machines, teams, the audit log, and server settings. Chat, Bots, approvals of Bot actions, and screens are in <a href="/app/" target="_blank" rel="noopener">the app</a>.</p>
     <div class="error" id="error" role="alert" hidden></div>
 
     <section id="tab-users" hidden>
@@ -90,6 +91,17 @@
         <tbody id="machines-rows"></tbody>
       </table>
       <div class="empty" id="machines-empty" hidden></div>
+    </section>
+
+    <section id="tab-teams" hidden>
+      <form class="bar" id="add-team" autocomplete="off">
+        <input id="team-name" placeholder="Team name" required maxlength="100" />
+        <input id="team-owner" placeholder="Owner's email or id" required spellcheck="false" />
+        <button type="submit" class="btn primary">Make a team</button>
+      </form>
+      <p class="hint" id="teams-settings"></p>
+      <div id="teams-list"></div>
+      <div class="empty" id="teams-empty" hidden></div>
     </section>
 
     <section id="tab-audit" hidden>

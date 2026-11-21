@@ -15,6 +15,8 @@ interface Props {
   onOpenPlan?: () => void;
   /** Everyone's own secrets for their Bots (ADR 0044). */
   onOpenSecrets?: () => void;
+  /** Your team (ADR 0088); set when you're on one or have been invited. */
+  onOpenTeam?: () => void;
   /** This device's settings, like App lock (ADR 0078). */
   onOpenSettings?: () => void;
   /** These three are shown to admins only; the server refuses the admin API and console to everyone else. */
@@ -27,7 +29,7 @@ interface Props {
   compact?: boolean;
 }
 
-export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOpenPlan, onOpenSecrets, onOpenSettings, onOpenUsers, onOpenAudit, onOpenConsole, onOpenSetup, compact }: Props) {
+export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOpenPlan, onOpenSecrets, onOpenTeam, onOpenSettings, onOpenUsers, onOpenAudit, onOpenConsole, onOpenSetup, compact }: Props) {
   const {
     bots,
     activeId,
@@ -125,6 +127,11 @@ export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOp
       {onOpenSecrets ? (
         <Pressable style={styles.approvalsBtn} onPress={onOpenSecrets} accessibilityRole="button">
           <Text style={styles.hiddenText}>Your secrets</Text>
+        </Pressable>
+      ) : null}
+      {onOpenTeam ? (
+        <Pressable style={styles.approvalsBtn} onPress={onOpenTeam} accessibilityRole="button">
+          <Text style={styles.hiddenText}>Team</Text>
         </Pressable>
       ) : null}
       {onOpenSettings ? (
