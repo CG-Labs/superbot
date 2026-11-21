@@ -120,9 +120,9 @@ async fn settled(w: &World) {
 /// Ada's own account and Cy's for her Bots, with their work, are as they were.
 fn others_untouched(w: &World) {
     let p = passwd(w);
-    assert!(p.contains(&format!("sb-u-{}:", w.a_id)), "{p}");
-    assert!(p.contains(&accounts::teammate_account(&w.a_id, &w.c_id).unwrap()), "{p}");
-    assert!(p.contains("sb-t-ffffffffffffffffffffffff"), "{p}");
+    assert!(p.contains(&format!("sb-u-{}:", w.a_id)), "Ada's own account is gone");
+    assert!(p.contains(&accounts::teammate_account(&w.a_id, &w.c_id).unwrap()), "Cy's account is gone");
+    assert!(p.contains("sb-t-ffffffffffffffffffffffff"), "the forged entry is gone");
     assert_eq!(std::fs::read_to_string(w.root.join(format!("{}/workspace/mine.txt", w.a_id))).unwrap(), "ada's");
     assert_eq!(std::fs::read_to_string(w.root.join(format!("{}-{}/workspace/notes.txt", w.a_id, w.c_id))).unwrap(), format!("{}'s notes", w.c_id));
     for c in calls(w) {
