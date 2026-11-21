@@ -115,12 +115,13 @@ impl Size {
         (self.memory_gib * 1024).max(2048)
     }
 
-    fn limits(&self) -> [(&'static str, String); 5] {
+    /// No `limits.memory.swap`: a restricted project counts it as a low-level option
+    /// and refuses the container. Whether containers swap is the host's choice.
+    fn limits(&self) -> [(&'static str, String); 4] {
         [
             ("limits.cpu", self.cpus.to_string()),
             ("limits.memory", format!("{}GiB", self.memory_gib)),
             ("limits.memory.enforce", "hard".into()),
-            ("limits.memory.swap", "false".into()),
             ("limits.processes", self.processes().to_string()),
         ]
     }
@@ -1369,6 +1370,53 @@ impl MachineProvider for Incus {
                 Err(e) => Err(e),
             }
         })
+    }
+}
+
+/// For the end-to-end test against a real Incus host (ADR 0068): what botd never does
+/// itself, such as looking inside a container.
+#[cfg(test)]
+impl Incus {
+    /// A call to the API, waiting up to `secs` for any operation it starts. The
+    /// metadata, or the operation's once it is done.
+    pub async fn raw(&self, method: Method, path: &str, body: Option<&Value>, secs: u64) -> Result<Value, ProviderError> {
+        let (path, query) = path.split_once('?').unwrap_or((path, ""));
+        let query: Vec<(&str, &str)> = query.split('&').filter_map(|kv| kv.split_once('=')).collect();
+        let r = self.call(method, path, &query, body, None).await?;
+        let Some(op) = r.operation else { return Ok(r.metadata) };
+        let id = operation_id(&op)?.to_string();
+        let done = self
+            .call(Method::GET, &format!("/1.0/operations/{id}/wait"), &[("timeout", &secs.to_string())], None, None)
+            .await?
+            .metadata;
+        match done["status"].as_str() {
+            Some("Success") => Ok(done),
+            _ => Err(api(400, format!("{}: {}", done["status"], done["err"]))),
+        }
+    }
+
+    /// Runs `cmd` in container `n` as root: its exit code, stdout and stderr.
+    pub async fn exec(&self, n: &str, cmd: &[&str]) -> Result<(i64, String, String), ProviderError> {
+        let body = json!({
+            "command": cmd,
+            "interactive": false,
+            "wait-for-websocket": false,
+            "record-output": true,
+            "environment": { "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" },
+        });
+        let op = self.raw(Method::POST, &format!("/1.0/instances/{}/exec", name(n)?), Some(&body), 120).await?;
+        let code = op["metadata"]["return"].as_i64().unwrap_or(-1);
+        let mut out = [String::new(), String::new()];
+        for (i, fd) in ["1", "2"].iter().enumerate() {
+            if let Some(log) = op["metadata"]["output"][fd].as_str() {
+                let url = format!("{}{}?project={}", self.s.url, log, self.s.project);
+                let res = self.http.get(url).send().await.map_err(|e| ProviderError::Transport(e.to_string()))?;
+                out[i] = res.text().await.map_err(|e| ProviderError::Transport(e.to_string()))?;
+                let _ = self.http.delete(format!("{}{}?project={}", self.s.url, log, self.s.project)).send().await;
+            }
+        }
+        let [stdout, stderr] = out;
+        Ok((code, stdout, stderr))
     }
 }
 
