@@ -78,6 +78,12 @@ botctl user link ada@example.com okta <subject>
 
 **Or just in time.** With `SSO_OKTA_JIT_ROLE=member`, anyone the IdP signs in to this app becomes a member. Limit who that is at the IdP (Okta: assign the app to groups; Keycloak: a realm just for your team, or a client role check; Auth0: only enable your company connection) and, to be sure, with `SSO_OKTA_ALLOWED_DOMAINS`. An IdP that lets anyone sign up (Auth0 with a database or social connection, for example) plus just in time means anyone can get in: don't combine them without `ALLOWED_DOMAINS`. If someone's email already belongs to another SuperBot user, sign-in is refused until an admin links them.
 
+## Require MFA at the IdP
+
+SuperBot doesn't ask single sign-on sign-ins for its own second factor: the IdP's MFA is that factor, so require it there. Sign-in codes and the owner's password get SuperBot's own two-factor authentication instead ([ADR 0094](../adr/0094-totp-second-factor.md)). Requiring MFA at your IdP is your control as the customer (CC6.1-2 in the [SOC 2 readiness checklist](../security/soc2-readiness-checklist.md)).
+
+At the IdP, require MFA for the SuperBot app: in Okta, an **authentication policy** with **Possession factor** required, assigned to the app; in Keycloak, an authentication flow with OTP or WebAuthn **Required** (or **Conditional OTP**) bound to the client or realm; in Auth0, **Security → Multi-factor Auth** set to **Always**.
+
 ## Troubleshooting
 
 Each failed sign-in is in the audit log with a reason (`botctl audit --action auth.login_failed`):

@@ -50,7 +50,7 @@
         </label>
       </form>
       <table class="grid">
-        <thead><tr><th>Person</th><th>Role</th><th>Status</th><th>Last sign-in</th><th>Code</th><th></th></tr></thead>
+        <thead><tr><th>Person</th><th>Role</th><th>Status</th><th>Last sign-in</th><th>Code</th><th>2FA</th><th></th></tr></thead>
         <tbody id="users-rows"></tbody>
       </table>
       <div class="empty" id="users-empty" hidden></div>
@@ -246,6 +246,32 @@
 
       <h2>Sign-in</h2>
       <p class="hint" id="signin-info"></p>
+      <!-- Two-factor authentication for password and sign-in code sign-ins (docs/adr/0094-totp-second-factor.md). -->
+      <div class="bar">
+        <label>Two-factor authentication required for
+          <select id="mfa-policy">
+            <option value="off">no one</option>
+            <option value="admins">admins and the owner</option>
+            <option value="all">everyone</option>
+          </select>
+        </label>
+      </div>
+      <p class="hint" id="mfa-policy-note"></p>
+      <div class="bar">
+        <span id="mfa-mine-state"></span>
+        <button type="button" class="btn" id="mfa-on">Turn on for me</button>
+        <button type="button" class="btn" id="mfa-codes" hidden>New recovery codes</button>
+        <button type="button" class="btn" id="mfa-off" hidden>Turn off for me</button>
+      </div>
+      <div id="mfa-setup" hidden>
+        <p class="hint">Scan this with an authenticator app, or enter the key <code id="mfa-key"></code>, then enter the code it shows.</p>
+        <img id="mfa-qr" alt="QR code to add SuperBot to an authenticator app" />
+        <form class="bar" id="mfa-confirm" autocomplete="off">
+          <input id="mfa-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="6-digit code" required />
+          <button type="submit" class="btn primary">Turn on</button>
+          <button type="button" class="btn" id="mfa-cancel">Cancel</button>
+        </form>
+      </div>
 
       <h2>Server secrets</h2>
       <p class="hint">Server-wide API keys and logins. Values are never shown; a person's own secret of the same name wins for their Bots.</p>

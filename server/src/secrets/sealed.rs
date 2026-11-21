@@ -102,6 +102,11 @@ pub fn install(c: Cipher) -> Result<Arc<Cipher>, String> {
     Ok(cipher())
 }
 
+/// Where a user's TOTP secret is sealed (ADR 0094).
+pub fn mfa_context(user_id: &str) -> String {
+    format!("user_mfa.secret/{user_id}")
+}
+
 pub fn approval_context(id: &str) -> String {
     format!("approvals.input/{id}")
 }
@@ -184,13 +189,19 @@ fn any_sealed(c: &Connection) -> rusqlite::Result<Option<(String, String)>> {
     if mine.is_some() {
         return Ok(mine);
     }
+    let mfa = c.query_row("SELECT user_id, secret FROM user_mfa LIMIT 1", [], |r| Ok((mfa_context(&r.get::<_, String>(0)?), r.get(1)?))).optional()?;
+    if mfa.is_some() {
+        return Ok(mfa);
+    }
     c.query_row("SELECT id, input FROM approvals WHERE input LIKE 'sb1:%' LIMIT 1", [], |r| Ok((approval_context(&r.get::<_, String>(0)?), r.get(1)?)))
         .optional()
 }
 
 /// Drops the sealed values `keep` can't open (all of them without a key) and the key
 /// check. Approval inputs keep a marker; everything else about them stays. Push devices
-/// go, so their phones can register again.
+/// go, so their phones can register again. A second factor goes with its recovery codes,
+/// whose keyed hashes no longer match either; if the policy requires one, its user sets
+/// it up again at their next sign-in (ADR 0094).
 fn discard(c: &Connection, keep: Option<&Cipher>) -> rusqlite::Result<usize> {
     let opens = |context: &str, v: &str| keep.is_some_and(|k| k.open(context, v).is_ok());
     let tx = c.unchecked_transaction()?;
@@ -213,6 +224,10 @@ fn discard(c: &Connection, keep: Option<&Cipher>) -> rusqlite::Result<usize> {
     }
     for (id, v) in pairs("SELECT id, token FROM push_devices WHERE token LIKE 'sb1:%'")?.iter().filter(|(_, v)| !opens(crate::db::PUSH_TOKEN_CONTEXT, v)) {
         n += tx.execute("DELETE FROM push_devices WHERE id = ? AND token = ?", params![id, v])?;
+    }
+    for (user, v) in pairs("SELECT user_id, secret FROM user_mfa")?.iter().filter(|(u, v)| !opens(&mfa_context(u), v)) {
+        n += tx.execute("DELETE FROM user_mfa WHERE user_id = ? AND secret = ?", params![user, v])?;
+        tx.execute("DELETE FROM mfa_recovery_codes WHERE user_id = ?", [user])?;
     }
     for (id, _) in approvals.iter().filter(|(id, v)| !opens(&approval_context(id), v)) {
         n += tx.execute("UPDATE approvals SET input = '{\"sealed\":\"discarded\"}' WHERE id = ?", [id])?;
@@ -286,6 +301,11 @@ fn sealed_rows(c: &Connection) -> rusqlite::Result<Vec<(&'static str, i64, Strin
         let (id, v) = r?;
         out.push(("UPDATE push_devices SET token = ? WHERE rowid = ?", id, crate::db::PUSH_TOKEN_CONTEXT.to_string(), v));
     }
+    let mut s = c.prepare("SELECT rowid, user_id, secret FROM user_mfa")?;
+    for r in s.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
+        let (id, user, v) = r?;
+        out.push(("UPDATE user_mfa SET secret = ? WHERE rowid = ?", id, mfa_context(&user), v));
+    }
     Ok(out)
 }
 
@@ -294,6 +314,8 @@ fn sealed_rows(c: &Connection) -> rusqlite::Result<Vec<(&'static str, i64, Strin
 /// The key check is sealed again. The derived-key root `old` used is kept, sealed under
 /// `new`, so the machine CA and other derived keys don't change, unless `new_derived_keys`.
 /// Values `new` already opens are left alone, so running it again changes nothing.
+/// MFA recovery codes are stored as keyed hashes under a derived key, so new derived keys
+/// drop them: each user keeps their authenticator and makes new codes (ADR 0094).
 fn rotate(c: &Connection, old: &Cipher, new: &Cipher, new_derived_keys: bool) -> rusqlite::Result<Rotation> {
     let tx = rusqlite::Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
     let mut done = Rotation::default();
@@ -311,12 +333,20 @@ fn rotate(c: &Connection, old: &Cipher, new: &Cipher, new_derived_keys: bool) ->
     }
     let set = "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2";
     tx.execute(set, params![KEY_CHECK, new.seal("key-check", KEY_CHECK_PLAIN)])?;
+    let mut recovery_codes_dropped = 0;
     if new_derived_keys {
         tx.execute("DELETE FROM settings WHERE key = ?", [DERIVE_ROOT])?;
+        recovery_codes_dropped = tx.execute("DELETE FROM mfa_recovery_codes", [])?;
     } else {
         tx.execute(set, params![DERIVE_ROOT, new.seal(DERIVE_ROOT_CONTEXT, &old.1[..])])?;
     }
-    let details = serde_json::json!({ "resealed": done.resealed, "current": done.current, "unreadable": done.unreadable, "derivedKeysKept": !new_derived_keys });
+    let details = serde_json::json!({
+        "resealed": done.resealed,
+        "current": done.current,
+        "unreadable": done.unreadable,
+        "derivedKeysKept": !new_derived_keys,
+        "recoveryCodesDropped": recovery_codes_dropped,
+    });
     tx.execute(
         "INSERT INTO audit_events (at, actor_kind, actor_id, action, target_type, target_id, outcome, details)
          VALUES (?, 'system', 'secrets', 'secret.master_key_rotated', 'secret', 'master-key', 'success', ?)",
@@ -798,7 +828,7 @@ mod tests {
         let (cipher, _) = bootstrap(&c, Some(key), None, no_key, false).unwrap();
         let push = |cipher: &Cipher, n: u8| {
             let u = db.create_user(None, Some(&format!("p{n}@example.com")), "P", crate::rbac::Role::Member).unwrap();
-            let s = crate::db::NewSession { user_id: &u.id, token_hash: &crate::random_hex(16), kind: "token", method: "code", idp_subject: None, idp_provider: None, label: None, ip: None, user_agent: None, expires_at: crate::db::now() + 60_000 };
+            let s = crate::db::NewSession { user_id: &u.id, token_hash: &crate::random_hex(16), kind: "token", method: "code", idp_subject: None, idp_provider: None, label: None, ip: None, user_agent: None, expires_at: crate::db::now() + 60_000, mfa: None };
             let s = db.create_session(&s).id;
             let token = cipher.seal(crate::db::PUSH_TOKEN_CONTEXT, format!("ExponentPushToken[{n}]").as_bytes());
             c.execute(
@@ -808,17 +838,26 @@ mod tests {
             .unwrap();
         };
         push(&cipher, 1);
+        let mfa = |cipher: &Cipher, n: u8| {
+            let u = db.create_user(None, Some(&format!("m{n}@example.com")), "M", crate::rbac::Role::Member).unwrap();
+            assert!(db.mfa_enable(&u.id, &cipher.seal(&mfa_context(&u.id), b"12345678901234567890"), 1, &[format!("hash{n}")]));
+            u.id
+        };
+        let kept_mfa = mfa(&cipher, 1);
         SealedStore::new(connect_again(&c), Arc::new(cipher)).put("KEEP_TOKEN", "kept").unwrap();
         // A value and a key check sealed with another key, e.g. after the key file was swapped.
         let other = Cipher::new(&MasterKey::generate());
         c.execute("INSERT INTO secrets (name, value, created_at, updated_at) VALUES ('LOST_TOKEN', ?, 0, 0)", [other.seal(&context("LOST_TOKEN"), b"lost")]).unwrap();
         push(&other, 2);
+        let lost_mfa = mfa(&other, 2);
         c.execute("UPDATE settings SET value = ? WHERE key = ?", params![other.seal("key-check", KEY_CHECK_PLAIN), KEY_CHECK]).unwrap();
 
         let (cipher, b) = bootstrap(&c, Some(same_key), None, no_key, true).unwrap();
-        assert_eq!(b.discarded, 2, "only the values this key can't open are dropped");
+        assert_eq!(b.discarded, 3, "only the values this key can't open are dropped");
         let left: Vec<String> = c.prepare("SELECT id FROM push_devices").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
         assert_eq!(left, ["pd1"], "an unreadable push device goes, so its phone can register again");
+        assert!(db.mfa(&kept_mfa).is_some() && db.mfa_recovery_left(&kept_mfa) == 1);
+        assert!(db.mfa(&lost_mfa).is_none() && db.mfa_recovery_left(&lost_mfa) == 0, "an unreadable second factor goes with its recovery codes");
         let store = SealedStore::new(connect_again(&c), Arc::new(cipher));
         assert_eq!(store.get("KEEP_TOKEN").unwrap().unwrap().expose(), "kept");
         assert_eq!(store.names().unwrap(), ["KEEP_TOKEN"]);
@@ -828,8 +867,8 @@ mod tests {
         MasterKey::parse(&k.base64()).unwrap()
     }
 
-    /// One sealed value of each kind: a saved secret, a user's secret, an approval input
-    /// and a push token. Returns how many.
+    /// One sealed value of each kind: a saved secret, a user's secret, an approval input,
+    /// a push token and a second factor with one recovery code. Returns how many.
     fn seal_one_of_each(db: &Db, c: &Connection, cipher: &Arc<Cipher>) -> usize {
         SealedStore::new(connect_again(c), cipher.clone()).put("OPENAI_API_KEY", "sk-saved").unwrap();
         UserSecrets::new(connect_again(c), cipher.clone()).put("ua", "GITHUB_TOKEN", "ghp-mine").unwrap();
@@ -841,14 +880,15 @@ mod tests {
         )
         .unwrap();
         let u = db.create_user(None, Some("rot@example.com"), "R", crate::rbac::Role::Member).unwrap();
-        let s = crate::db::NewSession { user_id: &u.id, token_hash: &crate::random_hex(16), kind: "token", method: "code", idp_subject: None, idp_provider: None, label: None, ip: None, user_agent: None, expires_at: now() + 60_000 };
+        let s = crate::db::NewSession { user_id: &u.id, token_hash: &crate::random_hex(16), kind: "token", method: "code", idp_subject: None, idp_provider: None, label: None, ip: None, user_agent: None, expires_at: now() + 60_000, mfa: None };
         let s = db.create_session(&s).id;
         c.execute(
             "INSERT INTO push_devices (id, user_id, session_id, provider, token_hash, token, platform, created_at, updated_at) VALUES ('pd1', ?1, ?2, 'expo', 'pd1', ?3, 'ios', 0, 0)",
             params![u.id, s, cipher.seal(crate::db::PUSH_TOKEN_CONTEXT, b"ExponentPushToken[r]")],
         )
         .unwrap();
-        4
+        assert!(db.mfa_enable(&u.id, &cipher.seal(&mfa_context(&u.id), b"12345678901234567890"), 1, &["hash".into()]));
+        5
     }
 
     /// Whether every value `seal_one_of_each` wrote opens with `cipher`, as it was written.
@@ -859,6 +899,11 @@ mod tests {
             && is(&user_context("ua", "GITHUB_TOKEN"), one("SELECT value FROM user_secrets"), b"ghp-mine")
             && is(&approval_context("a1"), one("SELECT input FROM approvals WHERE id = 'a1'"), br#"{"command":"ls"}"#)
             && is(crate::db::PUSH_TOKEN_CONTEXT, one("SELECT token FROM push_devices"), b"ExponentPushToken[r]")
+            && is(&mfa_context(&one("SELECT user_id FROM user_mfa")), one("SELECT secret FROM user_mfa"), b"12345678901234567890")
+    }
+
+    fn recovery_codes(c: &Connection) -> i64 {
+        c.query_row("SELECT COUNT(*) FROM mfa_recovery_codes", [], |r| r.get(0)).unwrap()
     }
 
     fn rotations(c: &Connection) -> Vec<serde_json::Value> {
@@ -886,6 +931,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["resealed"], n);
         assert_eq!(events[0]["derivedKeysKept"], true);
+        assert_eq!(recovery_codes(&c), 1, "recovery codes still match: their key is derived");
         let audit: String = c.query_row("SELECT actor_kind || '/' || actor_id || '/' || target_id FROM audit_events WHERE action = 'secret.master_key_rotated'", [], |r| r.get(0)).unwrap();
         assert_eq!(audit, "system/secrets/master-key");
 
@@ -919,6 +965,8 @@ mod tests {
         assert_eq!(cipher_3.derive("machine-ca"), Cipher::new(&k3).derive("machine-ca"), "derived from the new key alone");
         assert_ne!(cipher_3.derive("machine-ca"), Cipher::new(&a).derive("machine-ca"));
         assert_eq!(rotations(&c)[1]["derivedKeysKept"], false);
+        assert_eq!(rotations(&c)[1]["recoveryCodesDropped"], 1);
+        assert_eq!(recovery_codes(&c), 0, "recovery codes hashed under the old derived key go");
         let (again, _) = bootstrap(&c, Some(k3), None, no_key, false).unwrap();
         assert_eq!(again.derive("machine-ca"), cipher_3.derive("machine-ca"));
     }
@@ -1011,12 +1059,12 @@ mod tests {
         let (_, db, c) = fresh();
         let a = MasterKey::generate();
         let (cipher_a, _) = bootstrap(&c, Some(copy(&a)), None, no_key, false).unwrap();
-        seal_one_of_each(&db, &c, &Arc::new(cipher_a));
+        let n = seal_one_of_each(&db, &c, &Arc::new(cipher_a));
         bootstrap(&c, Some(MasterKey::generate()), Some(copy(&a).into()), no_key, false).unwrap();
         // The rotated key is lost: a new one starts over, with new derived keys.
         let fresh_key = MasterKey::generate();
         let (cipher, boot) = bootstrap(&c, Some(copy(&fresh_key)), None, no_key, true).unwrap();
-        assert_eq!(boot.discarded, 4);
+        assert_eq!(boot.discarded, n);
         assert_eq!(cipher.derive("machine-ca"), Cipher::new(&fresh_key).derive("machine-ca"));
         assert!(bootstrap(&c, Some(fresh_key), None, no_key, false).is_ok());
     }

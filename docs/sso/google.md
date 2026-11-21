@@ -90,6 +90,12 @@ A person can have Google and Microsoft (or any other provider) identities linked
 
 Same as Entra: the iOS and Android apps open Google's page in the system browser and come back on `superbot://auth`; the web client returns to `{SSO_PUBLIC_URL}/app/auth`. Nothing extra to register at Google: Google only talks to botd. Desktop (Electron) can't do SSO yet; use a sign-in code.
 
+## Require MFA at the IdP
+
+SuperBot doesn't ask single sign-on sign-ins for its own second factor: the IdP's MFA is that factor, so require it there. Sign-in codes and the owner's password get SuperBot's own two-factor authentication instead ([ADR 0094](../adr/0094-totp-second-factor.md)). Requiring MFA at your IdP is your control as the customer (CC6.1-2 in the [SOC 2 readiness checklist](../security/soc2-readiness-checklist.md)).
+
+In the Google Admin console, **Security → Authentication → 2-Step Verification**: allow it, then set **Enforcement** to **On** for the organizational units whose people use SuperBot. People signing in with personal Google accounts manage their own 2-Step Verification; link only accounts you manage if you need it enforced.
+
 ## Troubleshooting
 
 Each failed sign-in is in the audit log with a reason (`botctl audit --action auth.login_failed`):
