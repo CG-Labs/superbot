@@ -78,6 +78,8 @@ if ! incus project show "$project" >/dev/null 2>&1; then
   say "Restricted project $project"
   incus project create "$project" -c restricted=true -c restricted.networks.access="$network"
 fi
+# Off-host backups export containers (ADR 0071); a restricted project blocks that otherwise.
+incus project set "$project" restricted.backups=allow
 
 say "API on $gateway:8443"
 incus config set core.https_address="$gateway:8443"

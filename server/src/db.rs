@@ -1139,7 +1139,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 26] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 27] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1166,7 +1166,133 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 26] = [
     migrate_sandbox,
     migrate_machine_rebuild,
     migrate_account_removals,
+    migrate_machine_backups,
 ];
+
+/// Off-host backups of machines and restores from them (ADR 0071). At most one backup
+/// running and one restore underway per machine.
+fn migrate_machine_backups(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS machine_backups (
+          id TEXT PRIMARY KEY,
+          machine_id TEXT NOT NULL,
+          user_id TEXT NOT NULL,
+          tier TEXT NOT NULL,
+          plan TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('running', 'done', 'failed', 'deleted')),
+          object_key TEXT NOT NULL,
+          encrypted INTEGER NOT NULL DEFAULT 0,
+          size INTEGER,
+          sha256 TEXT,
+          created_by TEXT,
+          error TEXT,
+          created_at INTEGER NOT NULL,
+          finished_at INTEGER,
+          expires_at INTEGER,
+          deleted_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS machine_backups_machine ON machine_backups(machine_id, created_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS machine_backups_running ON machine_backups(machine_id) WHERE state = 'running';
+        CREATE TABLE IF NOT EXISTS machine_restores (
+          id TEXT PRIMARY KEY,
+          machine_id TEXT NOT NULL,
+          backup_id TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('importing', 'replacing', 'enrolling', 'done', 'failed')),
+          created_by TEXT,
+          error TEXT,
+          created_at INTEGER NOT NULL,
+          replaced_at INTEGER,
+          finished_at INTEGER
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS machine_restores_underway ON machine_restores(machine_id)
+          WHERE state IN ('importing', 'replacing', 'enrolling');",
+    )
+}
+
+/// One off-host backup of a machine (ADR 0071).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineBackup {
+    pub id: String,
+    pub machine_id: String,
+    pub user_id: String,
+    pub tier: String,
+    pub plan: String,
+    /// `running`, `done`, `failed`, or `deleted` (past its retention).
+    pub state: String,
+    pub object_key: String,
+    pub encrypted: bool,
+    pub size: Option<i64>,
+    pub sha256: Option<String>,
+    /// `schedule`, or the admin who asked.
+    pub created_by: Option<String>,
+    pub error: Option<String>,
+    pub created_at: i64,
+    pub finished_at: Option<i64>,
+    pub expires_at: Option<i64>,
+    pub deleted_at: Option<i64>,
+}
+
+fn machine_backup_row(r: &Row) -> rusqlite::Result<MachineBackup> {
+    Ok(MachineBackup {
+        id: r.get("id")?,
+        machine_id: r.get("machine_id")?,
+        user_id: r.get("user_id")?,
+        tier: r.get("tier")?,
+        plan: r.get("plan")?,
+        state: r.get("state")?,
+        object_key: r.get("object_key")?,
+        encrypted: r.get("encrypted")?,
+        size: r.get("size")?,
+        sha256: r.get("sha256")?,
+        created_by: r.get("created_by")?,
+        error: r.get("error")?,
+        created_at: r.get("created_at")?,
+        finished_at: r.get("finished_at")?,
+        expires_at: r.get("expires_at")?,
+        deleted_at: r.get("deleted_at")?,
+    })
+}
+
+/// One restore of a machine from a backup (ADR 0071).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineRestore {
+    pub id: String,
+    pub machine_id: String,
+    pub backup_id: String,
+    /// `importing`, `replacing`, `enrolling`, `done`, or `failed`.
+    pub state: String,
+    pub created_by: Option<String>,
+    pub error: Option<String>,
+    pub created_at: i64,
+    /// When the restored disk took the old one's place.
+    pub replaced_at: Option<i64>,
+    pub finished_at: Option<i64>,
+}
+
+fn machine_restore_row(r: &Row) -> rusqlite::Result<MachineRestore> {
+    Ok(MachineRestore {
+        id: r.get("id")?,
+        machine_id: r.get("machine_id")?,
+        backup_id: r.get("backup_id")?,
+        state: r.get("state")?,
+        created_by: r.get("created_by")?,
+        error: r.get("error")?,
+        created_at: r.get("created_at")?,
+        replaced_at: r.get("replaced_at")?,
+        finished_at: r.get("finished_at")?,
+    })
+}
+
+/// A backup to start: `machine_backup_start`.
+pub struct NewMachineBackup<'a> {
+    pub id: &'a str,
+    pub machine: &'a Machine,
+    pub object_key: &'a str,
+    pub encrypted: bool,
+    pub created_by: Option<&'a str>,
+}
 
 /// Rebuilding machines enrolled before ADR 0039 with today's agent (ADR 0056).
 fn migrate_machine_rebuild(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
@@ -3834,6 +3960,15 @@ impl Db {
         tx.commit()
     }
 
+    /// Puts back the enrollment deadline and overdue mark a token replaced, when the
+    /// machine it was for never got it (a restore that failed before the swap).
+    pub fn restore_enroll_by(&self, machine_id: &str, enroll_by: Option<i64>, overdue_at: Option<i64>) {
+        let _ = self.c().execute(
+            "UPDATE machines SET enroll_by = ?, enroll_overdue_at = ? WHERE id = ?",
+            params![enroll_by, overdue_at, machine_id],
+        );
+    }
+
     /// Marks the machine overdue if it had to enroll by now and hasn't (ADR 0035).
     /// Returns whether this call marked it, so it is reported once.
     pub fn mark_enroll_overdue(&self, machine_id: &str) -> bool {
@@ -4487,6 +4622,145 @@ impl Db {
         );
     }
 
+    // Off-host machine backups (ADR 0071)
+
+    /// Records a backup as running, unless one of the machine's is running already.
+    pub fn machine_backup_start(&self, n: &NewMachineBackup) -> Option<MachineBackup> {
+        let m = n.machine;
+        let made = self
+            .c()
+            .execute(
+                "INSERT OR IGNORE INTO machine_backups (id, machine_id, user_id, tier, plan, state, object_key, encrypted, created_by, created_at)
+                 VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)",
+                params![n.id, m.id, m.user_id, m.tier, m.plan, n.object_key, n.encrypted, n.created_by, now()],
+            )
+            .unwrap_or(0)
+            == 1;
+        if made { self.machine_backup(n.id) } else { None }
+    }
+
+    pub fn machine_backup(&self, id: &str) -> Option<MachineBackup> {
+        self.c().query_row("SELECT * FROM machine_backups WHERE id = ?", [id], machine_backup_row).optional().ok().flatten()
+    }
+
+    /// The machine's backups, newest first, deleted ones too.
+    pub fn machine_backups(&self, machine_id: &str) -> Vec<MachineBackup> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM machine_backups WHERE machine_id = ? ORDER BY created_at DESC, id DESC").unwrap();
+        s.query_map([machine_id], machine_backup_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Every backup in `state`, oldest first.
+    pub fn machine_backups_in(&self, state: &str) -> Vec<MachineBackup> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM machine_backups WHERE state = ? ORDER BY created_at, id").unwrap();
+        s.query_map([state], machine_backup_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// The machine's newest backup that finished.
+    pub fn machine_last_backup(&self, machine_id: &str) -> Option<MachineBackup> {
+        self.c()
+            .query_row(
+                "SELECT * FROM machine_backups WHERE machine_id = ? AND state = 'done' ORDER BY created_at DESC, id DESC LIMIT 1",
+                [machine_id],
+                machine_backup_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Ends a running backup as `done` (with its size, hash and expiry) or `failed`.
+    pub fn machine_backup_end(&self, id: &str, done: Option<(i64, &str, i64)>, error: Option<&str>) -> bool {
+        let (state, size, sha, expires) = match done {
+            Some((size, sha, expires)) => ("done", Some(size), Some(sha), Some(expires)),
+            None => ("failed", None, None, None),
+        };
+        self.c()
+            .execute(
+                "UPDATE machine_backups SET state = ?, size = ?, sha256 = ?, expires_at = ?, error = ?, finished_at = ? WHERE id = ? AND state = 'running'",
+                params![state, size, sha, expires, error.map(|e| crate::audit::clip(e, 500)), now(), id],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// A finished backup whose objects are gone from the store.
+    pub fn machine_backup_deleted(&self, id: &str) -> bool {
+        self.c()
+            .execute("UPDATE machine_backups SET state = 'deleted', deleted_at = ? WHERE id = ? AND state IN ('done', 'failed')", params![now(), id])
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Starts a restore of the machine from `backup_id`, unless one is underway.
+    pub fn machine_restore_start(&self, id: &str, machine_id: &str, backup_id: &str, by: Option<&str>) -> Option<MachineRestore> {
+        let made = self
+            .c()
+            .execute(
+                "INSERT OR IGNORE INTO machine_restores (id, machine_id, backup_id, state, created_by, created_at) VALUES (?, ?, ?, 'importing', ?, ?)",
+                params![id, machine_id, backup_id, by, now()],
+            )
+            .unwrap_or(0)
+            == 1;
+        if made { self.machine_restore(id) } else { None }
+    }
+
+    pub fn machine_restore(&self, id: &str) -> Option<MachineRestore> {
+        self.c().query_row("SELECT * FROM machine_restores WHERE id = ?", [id], machine_restore_row).optional().ok().flatten()
+    }
+
+    /// The machine's restore underway, if any.
+    pub fn machine_restoring(&self, machine_id: &str) -> Option<MachineRestore> {
+        self.c()
+            .query_row(
+                "SELECT * FROM machine_restores WHERE machine_id = ? AND state IN ('importing', 'replacing', 'enrolling')",
+                [machine_id],
+                machine_restore_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// The machine's newest restore.
+    pub fn machine_last_restore(&self, machine_id: &str) -> Option<MachineRestore> {
+        self.c()
+            .query_row(
+                "SELECT * FROM machine_restores WHERE machine_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                [machine_id],
+                machine_restore_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Every restore in `state`.
+    pub fn machine_restores_in(&self, state: &str) -> Vec<MachineRestore> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM machine_restores WHERE state = ? ORDER BY created_at, id").unwrap();
+        s.query_map([state], machine_restore_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Moves a restore from one of `from` to `to`. Returns whether it moved.
+    pub fn machine_restore_move(&self, id: &str, from: &[&str], to: &str, error: Option<&str>) -> bool {
+        let at = now();
+        let states = from.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(", ");
+        self.c()
+            .execute(
+                &format!(
+                    "UPDATE machine_restores SET state = ?1, error = COALESCE(?2, error),
+                     replaced_at = CASE WHEN ?1 = 'enrolling' THEN ?3 ELSE replaced_at END,
+                     finished_at = CASE WHEN ?1 IN ('done', 'failed') THEN ?3 ELSE finished_at END
+                     WHERE id = ?4 AND state IN ({states})"
+                ),
+                params![to, error.map(|e| crate::audit::clip(e, 500)), at, id],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
     /// Whether files that exist only on the machine may be lost if it is wiped: it is
     /// assigned, or ever was, or a Bot ever ran there (from the audit log).
     pub fn machine_may_hold_work(&self, machine_id: &str) -> bool {
@@ -4521,6 +4795,13 @@ impl Db {
                  enrolled_at = enrolled_at - ?1 WHERE id = ?2",
                 params![ms, machine_id],
             )
+            .unwrap();
+    }
+
+    #[cfg(test)]
+    pub fn machine_backup_backdate(&self, id: &str, ms: i64) {
+        self.c()
+            .execute("UPDATE machine_backups SET created_at = created_at - ?1, expires_at = expires_at - ?1 WHERE id = ?2", params![ms, id])
             .unwrap();
     }
 

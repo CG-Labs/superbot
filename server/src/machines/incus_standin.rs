@@ -42,6 +42,8 @@ pub struct Instance {
     pub rebuilt: usize,
     /// Times it was started: by its create, or a start.
     pub boots: usize,
+    /// Its disk: path to content and mode. Copied by backups.
+    pub files: BTreeMap<String, (Vec<u8>, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +77,8 @@ pub struct World {
     pub missing_extensions: Vec<String>,
     /// The `server_version` it reports, if not the stand-in's own.
     pub version: Option<String>,
+    /// Instance backups by instance and name: the export file's bytes.
+    pub backups: BTreeMap<(String, String), Vec<u8>>,
     ops: BTreeMap<String, Op>,
     trusted: Vec<String>,
     next_ip: u8,
@@ -465,17 +469,62 @@ async fn handle(
         .collect();
     let project = query.get("project").cloned().unwrap_or("default".into());
     let recursion = query.get("recursion").cloned().unwrap_or_default();
-    let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let header = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).map(String::from);
+    let raw = header("content-type").is_some_and(|c| c == "application/octet-stream");
+    let bytes = body;
+    let body: Value = if raw { json!({ "bytes": bytes.len() }) } else { serde_json::from_slice(&bytes).unwrap_or(Value::Null) };
     w.calls.push(Call {
         method: method.to_string(),
         path: uri.path().to_string(),
         query: uri.query().unwrap_or_default().to_string(),
         body: body.clone(),
-        if_match: headers.get("if-match").and_then(|v| v.to_str().ok()).map(String::from),
+        if_match: header("if-match"),
     });
-    let if_match = headers.get("if-match").and_then(|v| v.to_str().ok()).map(String::from);
+    let if_match = header("if-match");
     let parts: Vec<&str> = uri.path().trim_start_matches('/').split('/').collect();
     match (method.as_str(), &parts[..]) {
+        ("POST", ["1.0", "instances"]) if raw => {
+            let Some(n) = header("x-incus-name") else {
+                return err(400, "No name provided");
+            };
+            if w.instances.contains_key(&n) {
+                return err(500, &format!("Instance {n:?} already exists"));
+            }
+            let Ok(saved) = serde_json::from_slice::<Value>(&bytes) else {
+                return err(400, "Failed to read the backup file");
+            };
+            let mut kept = saved["body"].clone();
+            if let Some(pool) = header("x-incus-pool") {
+                kept["devices"]["root"]["pool"] = json!(pool);
+            }
+            if let Some(why) = w.refused(&project, &kept).or_else(|| w.acls_exist(&kept)) {
+                return err(400, &why);
+            }
+            let files = saved["files"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(p, f)| (p.clone(), (f[0].as_str().unwrap_or_default().as_bytes().to_vec(), f[1].as_str().unwrap_or_default().to_string())))
+                .collect();
+            w.next_ip += 1;
+            let ip = w.addresses.get(&n).cloned().unwrap_or(format!("10.20.0.{}", w.next_ip));
+            let i = Instance {
+                project: project.clone(),
+                body: kept,
+                status: "Stopped".into(),
+                ip,
+                location: "none".into(),
+                source: json!({ "type": "backup" }),
+                rebuilt: 0,
+                boots: 0,
+                files,
+            };
+            let (r, done) = w.op(vec![instance_url(&n, &project)], None);
+            if done {
+                w.instances.insert(n, i);
+            }
+            r
+        }
         ("GET", ["1.0"]) => sync(json!({
             "auth": "trusted",
             "api_extensions": extensions(&w.missing_extensions),
@@ -534,6 +583,7 @@ async fn handle(
                 source: body["source"].clone(),
                 rebuilt: 0,
                 boots: (body["start"] == true) as usize,
+                files: BTreeMap::new(),
             };
             let (r, done) = w.op(vec![instance_url(&n, &project)], Some((n.clone(), i.clone())));
             if done {
@@ -609,6 +659,77 @@ async fn handle(
                         i.status = status.into();
                     }
                     r
+                }
+                ("POST", []) => {
+                    let Some(to) = body["name"].as_str().map(String::from) else {
+                        return err(400, "No name provided");
+                    };
+                    if i.status != "Stopped" {
+                        return err(400, "Renaming of running instance not allowed");
+                    }
+                    if w.instances.contains_key(&to) {
+                        return err(409, &format!("Instance {to:?} already exists"));
+                    }
+                    let (r, done) = w.op(vec![instance_url(&n, &project)], None);
+                    if done {
+                        let i = w.instances.remove(&n).unwrap();
+                        w.instances.insert(to, i);
+                    }
+                    r
+                }
+                ("POST", ["backups"]) => {
+                    let Some(b) = body["name"].as_str().map(String::from) else {
+                        return err(400, "No name provided");
+                    };
+                    if w.backups.contains_key(&(n.clone(), b.clone())) {
+                        return err(409, "Backup already exists");
+                    }
+                    let pc = w.projects.get(&project).cloned().unwrap_or_default();
+                    if pc["restricted"] == "true" && pc["restricted.backups"] != "allow" {
+                        return err(500, &format!("Project {project:?} doesn't allow for backup creation"));
+                    }
+                    let files: serde_json::Map<String, Value> = i
+                        .files
+                        .iter()
+                        .map(|(p, (c, m))| (p.clone(), json!([String::from_utf8_lossy(c), m])))
+                        .collect();
+                    let saved = json!({ "body": i.body, "files": files, "instanceOnly": body["instance_only"] });
+                    let (r, done) = w.op(vec![instance_url(&n, &project)], None);
+                    if done {
+                        w.backups.insert((n.clone(), b), saved.to_string().into_bytes());
+                    }
+                    r
+                }
+                ("GET", ["backups", b, "export"]) => match w.backups.get(&(n.clone(), b.to_string())) {
+                    Some(bytes) => (StatusCode::OK, [("content-type", "application/octet-stream")], bytes.clone()).into_response(),
+                    None => err(404, "Backup not found"),
+                },
+                ("DELETE", ["backups", b]) => {
+                    if w.backups.remove(&(n.clone(), b.to_string())).is_none() {
+                        return err(404, "Backup not found");
+                    }
+                    w.op(vec![instance_url(&n, &project)], None).0
+                }
+                (m @ ("POST" | "GET" | "DELETE"), ["files"]) => {
+                    let Some(path) = query.get("path").cloned() else {
+                        return err(400, "Missing path argument");
+                    };
+                    let i = w.instances.get_mut(&n).unwrap();
+                    match m {
+                        "POST" => {
+                            let mode = header("x-incus-mode").unwrap_or("0644".into());
+                            i.files.insert(path, (bytes.to_vec(), mode));
+                            sync(json!({}))
+                        }
+                        "GET" => match i.files.get(&path) {
+                            Some((c, _)) => (StatusCode::OK, c.clone()).into_response(),
+                            None => err(404, "Not found"),
+                        },
+                        _ => match i.files.remove(&path) {
+                            Some(_) => sync(json!({})),
+                            None => err(404, "Not found"),
+                        },
+                    }
                 }
                 ("POST", ["rebuild"]) => {
                     if i.status != "Stopped" {

@@ -11,6 +11,10 @@
 //! set -a; . <out-dir>/incus-e2e.env; set +a
 //! cargo test machines_incus_e2e_tests -- --ignored --nocapture
 //! ```
+//!
+//! With SUPERBOT_INCUS_E2E_S3_ENDPOINT and _BUCKET (and MACHINE_BACKUP_S3_ACCESS_KEY_ID
+//! and _SECRET_ACCESS_KEY), a container is also backed up to that store, encrypted, and
+//! restored from it (ADR 0071); CI runs versitygw on loopback for it.
 
 use crate::machines::State;
 use crate::machines::enroll::{self, Enrollment};
@@ -46,6 +50,8 @@ struct Env {
     decoy_port: u16,
     decoy_hits: Arc<AtomicUsize>,
     started: Instant,
+    /// Off-host backups are on, encrypted to this.
+    backup_identity: Option<age::x25519::Identity>,
 }
 
 impl Env {
@@ -138,6 +144,15 @@ async fn serve() -> Env {
         ("MACHINE_TIERS", tiers),
         ("MACHINE_LABEL_PREFIX", PREFIX.into()),
     ]);
+    let mut fixed = fixed;
+    let s3 = std::env::var("SUPERBOT_INCUS_E2E_S3_ENDPOINT").unwrap_or_default();
+    let backup_identity = (!s3.is_empty()).then(age::x25519::Identity::generate);
+    if let Some(id) = &backup_identity {
+        fixed.insert("MACHINE_BACKUP_S3_ENDPOINT", s3);
+        fixed.insert("MACHINE_BACKUP_S3_BUCKET", std::env::var("SUPERBOT_INCUS_E2E_S3_BUCKET").unwrap_or("superbot-e2e".into()));
+        fixed.insert("MACHINE_BACKUP_S3_PREFIX", format!("{PREFIX}/"));
+        fixed.insert("MACHINE_BACKUP_AGE_RECIPIENTS", id.to_public().to_string());
+    }
     let var = settings(&fixed);
     let mut cp = crate::machines::ControlPlane::from_env(&EnvStore::process(), var.clone()).unwrap();
     let e = Enrollment::from_env(&var, &crate::secrets::sealed::cipher(), &bin_dir()).unwrap().unwrap();
@@ -147,11 +162,14 @@ async fn serve() -> Env {
         bin_dir().display()
     );
     let e = cp.enroll_with(e).unwrap();
+    if let Some(off) = &cp.offsite {
+        off.s3.create_bucket().await.unwrap();
+    }
     let cp = Arc::new(cp);
     let (port, app, owner, _) = crate::tests::serve_app_with(move |a| a.machines = cp).await;
     tokio::spawn(enroll::serve(machine_listener, app.clone(), e, None));
     let (_, admin) = user_with(port, &owner, "ops@example.com", "admin").await;
-    Env { port, app, admin, incus, gateway, machine_port, decoy_port, decoy_hits, started }
+    Env { port, app, admin, incus, gateway, machine_port, decoy_port, decoy_hits, started, backup_identity }
 }
 
 async fn json_call(env: &Env, method: &str, path: &str, body: &str) -> (u16, Value) {
@@ -424,6 +442,10 @@ async fn real_incus_containers_enroll_stay_apart_and_follow_the_lifecycle() {
     assert!(!reaches(&env, &a, &b4, B_PORT).await, "still apart after the repairs");
     env.say("reconciler converged");
 
+    if env.backup_identity.is_some() {
+        backup_and_restore(&env, &users[1].0, &users[1].1, &a).await;
+    }
+
     // A rebuild (ADR 0056) wipes the container in place and seeds cloud-init again
     // from the new user data. The API rebuilds only pre-0039 agents, so the provider
     // is asked directly, with user data that leaves a mark.
@@ -450,4 +472,83 @@ async fn real_incus_containers_enroll_stay_apart_and_follow_the_lifecycle() {
     assert!(env.incus.find_firewall(&fw).await.unwrap().is_none(), "the ACL went with the last machine");
     assert_eq!(events(&env, "machine.firewall_deleted").await.len(), 1);
     env.say("destroyed both");
+}
+
+/// Polls `f` every two seconds until it gives something, for up to `within`.
+async fn wait<T>(env: &Env, what: &str, within: Duration, mut f: impl FnMut() -> Option<T>) -> T {
+    let t = Instant::now();
+    loop {
+        if let Some(v) = f() {
+            env.say(&format!("{what} ({}s)", t.elapsed().as_secs()));
+            return v;
+        }
+        assert!(t.elapsed() < within, "{what}: not within {}s", within.as_secs());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Off-host backup and restore (ADR 0071): `m`'s container is exported, encrypted, sent
+/// to the store, changed, then made again from the backup. It comes back with the
+/// backup's files, today's firewall and settings, and a new identity it enrolled for;
+/// the old one and any token stay gone. `other` still can't reach it.
+async fn backup_and_restore(env: &Env, uid: &str, m: &crate::db::Machine, other: &str) {
+    use age::secrecy::ExposeSecret;
+    let cp = env.app.control_plane.get().unwrap().clone();
+    let off = cp.offsite.clone().unwrap();
+    let n = m.label.as_str();
+    let id_sum = "sha256sum /var/lib/superbot-machine/identity.pem | cut -d' ' -f1";
+    let (code, old_identity) = sh(env, n, &format!("echo before > /root/marker && sync && {id_sum}")).await;
+    assert_eq!(code, 0, "{old_identity}");
+
+    let (code, b) = json_call(env, "POST", &format!("/api/users/{uid}/machine/backups"), "").await;
+    assert_eq!(code, 202, "{b}");
+    let bid = b["id"].as_str().unwrap().to_string();
+    let b = wait(env, "backed up to the store", Duration::from_secs(900), || env.app.db.machine_backup(&bid).filter(|b| b.state != "running")).await;
+    assert_eq!((b.state.as_str(), b.encrypted), ("done", true), "{:?}", b.error);
+    let keys = off.s3.list(&format!("{PREFIX}/machines/{}/", m.id)).await.unwrap();
+    assert!(keys.contains(&b.object_key) && keys.iter().any(|k| k.ends_with(&format!("{bid}.json"))), "{keys:?}");
+    env.say(&format!("backup {bid}: {} MB, encrypted", b.size.unwrap_or(0) >> 20));
+    let backups = env.incus.raw(Method::GET, &format!("/1.0/instances/{n}/backups"), None, 10).await.unwrap();
+    assert_eq!(backups.as_array().map(Vec::len), Some(0), "the provider's copy is deleted: {backups}");
+
+    let (code, _) = sh(env, n, "echo after > /root/marker").await;
+    assert_eq!(code, 0);
+    let identity = env.backup_identity.as_ref().unwrap().to_string().expose_secret().to_string();
+    let (code, r) = json_call(env, "POST", &format!("/api/users/{uid}/machine/restore"), &json!({ "backupId": bid, "identity": identity }).to_string()).await;
+    assert_eq!(code, 202, "{r}");
+    let rid = r["restore"]["id"].as_str().unwrap().to_string();
+    let r = wait(env, "restored in its place", Duration::from_secs(900), || env.app.db.machine_restore(&rid).filter(|r| !matches!(r.state.as_str(), "importing" | "replacing"))).await;
+    assert_eq!(r.state, "enrolling", "{:?}", r.error);
+    let replaced = r.replaced_at.unwrap();
+    let t = Instant::now();
+    loop {
+        reconcile(env).await;
+        crate::machines::backup::follow_up(&env.app, &cp).await;
+        let r = env.app.db.machine_restore(&rid).unwrap();
+        let row = env.app.db.machine(&m.id).unwrap();
+        if r.state == "done" && row.agent_seen_at.is_some_and(|s| s >= replaced) {
+            break;
+        }
+        assert!(r.state == "enrolling" || r.state == "done", "{:?}", r.error);
+        assert!(t.elapsed() < ENROLL_WITHIN, "the restored container didn't enroll: {row:?}");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    env.say(&format!("restored container enrolled anew ({}s)", t.elapsed().as_secs()));
+
+    let (code, marker) = sh(env, n, "cat /root/marker").await;
+    assert_eq!((code, marker.trim()), (0, "before"), "the backup's files");
+    let (code, new_identity) = sh(env, n, id_sum).await;
+    assert!(code == 0 && new_identity.trim().len() == 64 && new_identity != old_identity, "a new identity: {new_identity}");
+    let (code, out) = sh(env, n, "test ! -e /etc/superbot/enroll-token && ! grep -rls sbe_ /etc/superbot /var/lib/cloud && systemctl is-active superbot-machine").await;
+    assert_eq!(code, 0, "the token is spent and gone: {out}");
+    let i = instance(env, n).await;
+    assert!(!i["config"].to_string().contains("sbe_") && i["config"].get("cloud-init.user-data").is_none(), "{}", i["config"]);
+    assert_eq!(i["devices"]["eth0"]["security.acls"].as_str(), m.firewall_id.as_deref(), "today's firewall");
+    assert_eq!(i["config"]["security.idmap.isolated"], "true");
+    let pins = env.app.db.machine_pins(&m.id);
+    assert_eq!(pins.len(), 1, "only the new certificate: {pins:?}");
+    assert_eq!(events(env, "machine.restored").await.len(), 1);
+    let b4 = address(&i, "inet");
+    assert!(!reaches(env, other, &b4, crate::machines::enroll::DEFAULT_AGENT_PORT).await, "still apart after the restore");
+    until(env, "snapshots on again once enrolled", &[m.id.as_str()], Duration::from_secs(60), |m| m.backups).await;
 }

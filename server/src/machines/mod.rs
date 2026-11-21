@@ -8,6 +8,7 @@
 #[cfg(test)]
 #[allow(dead_code)]
 pub mod agent;
+pub mod backup;
 pub mod botuser;
 #[cfg(test)]
 pub mod display;
@@ -31,6 +32,9 @@ pub mod provider;
 pub mod rebuild;
 pub mod route;
 pub mod runas;
+pub mod s3;
+#[cfg(test)]
+pub mod s3_standin;
 pub mod screens;
 pub mod teammate;
 #[cfg(test)]
@@ -138,6 +142,8 @@ pub enum Step {
     Fail,
     /// An admin asks again after an error.
     Retry,
+    /// Made again from an off-host backup and started (ADR 0071).
+    Restored,
 }
 
 pub fn next(from: State, step: Step) -> Option<State> {
@@ -153,6 +159,7 @@ pub fn next(from: State, step: Step) -> Option<State> {
         (Destroying, Gone) => Some(Destroyed),
         (Pending | Provisioning | Running | Suspended, Fail) => Some(Error),
         (Error, Retry) => Some(Pending),
+        (Running | Suspended | Error, Restored) => Some(Running),
         _ => None,
     }
 }
@@ -186,6 +193,9 @@ pub struct ControlPlane {
     /// port to open.
     pub firewall: Option<firewall::Firewall>,
     firewall_settings: Option<firewall::Settings>,
+    /// Off-host backups of machines to object storage (ADR 0071). None: off
+    /// (MACHINE_BACKUP_S3_BUCKET).
+    pub offsite: Option<Arc<backup::Offsite>>,
     /// One change at a time, from handlers and the reconciler alike, so two can't
     /// race on one machine. Changes are rare and admin-driven; this is cheap.
     ops: tokio::sync::Mutex<()>,
@@ -207,6 +217,7 @@ impl Default for ControlPlane {
             enrollment: None,
             firewall: None,
             firewall_settings: None,
+            offsite: None,
             ops: tokio::sync::Mutex::new(()),
         }
     }
@@ -259,7 +270,27 @@ impl ControlPlane {
     /// MACHINE_PROVIDER=incus turns it on with an Incus host (`incus_from_env`). The
     /// rest have defaults: MACHINE_TIERS, MACHINE_IMAGE, MACHINE_BACKUPS (on),
     /// MACHINE_LABEL_PREFIX, MACHINE_AUTHORIZED_KEYS, MACHINE_RECONCILE_SECONDS.
+    /// MACHINE_BACKUP_S3_BUCKET turns on off-host backups (`backup::Settings`, ADR 0071),
+    /// for providers that can export machines.
     pub fn from_env(
+        store: &dyn SecretStore,
+        var: impl Fn(&str) -> String,
+    ) -> Result<ControlPlane, String> {
+        let mut cp = ControlPlane::provider_from_env(store, &var)?;
+        if let Some(s) = backup::Settings::from_env(store, &var)? {
+            let p = cp.provider.as_deref().ok_or(format!("MACHINE_BACKUP_S3_BUCKET needs the control plane: {NEEDS_IT}"))?;
+            if !p.exports() {
+                return Err(format!(
+                    "MACHINE_BACKUP_S3_BUCKET: {} machines can't be exported; off-host backups are for Incus containers (Linode has MACHINE_BACKUPS)",
+                    p.name()
+                ));
+            }
+            cp.offsite = Some(Arc::new(backup::Offsite::new(s)?));
+        }
+        Ok(cp)
+    }
+
+    fn provider_from_env(
         store: &dyn SecretStore,
         var: impl Fn(&str) -> String,
     ) -> Result<ControlPlane, String> {
@@ -513,7 +544,7 @@ impl ControlPlane {
         match &self.provider {
             None => format!("off ({NEEDS_IT} for one machine per user)"),
             Some(p) => format!(
-                "{} ({}s), regions {}, tiers {}, backups {}, routing {}, enrollment {}, firewall {}",
+                "{} ({}s), regions {}, tiers {}, backups {}, off-host backups {}, routing {}, enrollment {}, firewall {}",
                 p.name(),
                 p.substrate(),
                 self.regions.join(", "),
@@ -523,6 +554,7 @@ impl ControlPlane {
                     .collect::<Vec<_>>()
                     .join(", "),
                 if self.backups { "on" } else { "off" },
+                self.offsite.as_ref().map_or("off (set MACHINE_BACKUP_S3_BUCKET)".into(), |o| o.describe()),
                 match self.routing {
                     route::Routing::Off => "off (Bots run on this server)".into(),
                     r => format!("{} via {}", r.as_str(), self.link.name()),
@@ -856,8 +888,9 @@ async fn reconcile_one(app: &App, cp: &ControlPlane, p: &dyn MachineProvider, id
                     }
                 }
             }
-            // Not before: a snapshot would keep a copy of the token in its config.
-            if cp.backups && !pm.backups && m.state != State::Provisioning && !user_data {
+            // Not before: a snapshot would keep a copy of the token in its config, or
+            // on its disk while a restored machine enrolls (ADR 0071).
+            if cp.backups && !pm.backups && m.state != State::Provisioning && !user_data && app.db.machine_restoring(&m.id).is_none() {
                 match p.enable_backups(&pid).await {
                     Ok(()) => {
                         m.backups = true;
@@ -969,6 +1002,7 @@ pub fn start(app: AppState, cp: Arc<ControlPlane>) {
     if !cp.enabled() {
         return;
     }
+    backup::start(app.clone(), cp.clone());
     let (a, c) = (app.clone(), cp.clone());
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(c.reconcile_every);
@@ -998,16 +1032,18 @@ pub fn start(app: AppState, cp: Arc<ControlPlane>) {
 fn admin_view(app: &App, m: &Machine) -> Value {
     let mut v = serde_json::to_value(m).unwrap_or_default();
     v["userEmail"] = json!(app.db.user(&m.user_id).and_then(|u| u.email));
+    v["lastBackup"] = backup::last(app, &m.id);
     v
 }
 
 /// What a person sees of their own machine.
-fn own_view(m: &Machine) -> Value {
+fn own_view(app: &App, m: &Machine) -> Value {
     json!({
         "id": m.id, "tier": m.tier, "region": m.region, "state": m.state, "providerStatus": m.provider_status,
         "ipv4": m.ipv4, "backups": m.backups, "createdAt": m.created_at, "updatedAt": m.updated_at,
         "enrollment": m.enrollment, "agentSeenAt": m.agent_seen_at, "enrollOverdueAt": m.enroll_overdue_at,
         "assigned": m.assigned_at.is_some(),
+        "lastBackupAt": app.db.machine_last_backup(&m.id).map(|b| b.created_at),
     })
 }
 
@@ -1531,7 +1567,7 @@ pub async fn mine(
             "You don't have a machine yet.".into(),
         )
     })?;
-    Ok(Json(own_view(&m)))
+    Ok(Json(own_view(&app, &m)))
 }
 
 // Placement (ADR 0036): which users' Bots run on their machine.
@@ -1645,7 +1681,7 @@ mod tests {
         use State::*;
         use Step::*;
         let steps = [
-            Created, Ready, Suspend, Resume, Resize, Destroy, Gone, Fail, Retry,
+            Created, Ready, Suspend, Resume, Resize, Destroy, Gone, Fail, Retry, Restored,
         ];
         let allowed = [
             (Pending, Created, Provisioning),
@@ -1665,6 +1701,9 @@ mod tests {
             (Destroying, Gone, Destroyed),
             (Error, Destroy, Destroying),
             (Error, Retry, Pending),
+            (Running, Restored, Running),
+            (Suspended, Restored, Running),
+            (Error, Restored, Running),
         ];
         for from in STATES {
             for step in steps {
