@@ -23,7 +23,7 @@ To the person the plan is for (the user the subscription is linked to, never a S
 | Plan started | A user's first paying subscription starts, even for a tier an admin already gave them. Says when it renews. | Essential |
 | Plan changed | A Stripe event moves a paying user to another tier. | Essential |
 | Payment failed | A subscription that sets the plan moves into `past_due`. Says the plan stays while Stripe retries, and to update the card with **Manage billing**. | Essential |
-| Plan ending | A subscription is set to cancel (`cancel_at`, or `cancel_at_period_end`). Says the date and the plan that follows. | Essential |
+| Plan ending | A subscription is set to cancel (`cancel_at`, or `cancel_at_period_end`). Says the date and the plan that follows: another paid subscription the user still has, or else the default. | Essential |
 | Plan ended | A Stripe event takes the user off the paid tier (deleted, canceled, unpaid). Says whether it ended because payments failed. | Essential |
 | Computer waiting | A Stripe plan change's resize waits on the user: storage over the new plan (`storage_over`) or files that won't fit the smaller disk (`disk_too_full`). Uses the wait message the app shows. | Essential |
 | Computer couldn't resize | A Stripe plan change's resize failed. Says the plan applies anyway and an admin was told. | Essential |

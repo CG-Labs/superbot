@@ -192,6 +192,26 @@ describe("PlanView (ADR 0042)", () => {
     expect((await screen.findByLabelText("Usage emails")).props.value).toBe(false);
   });
 
+  it("keeps a saved usage email setting when a refresh from before the save lands after it", async () => {
+    jest.useFakeTimers();
+    try {
+      const api = fakeApi(billing(), null, { on: true, usage: true, canChange: true });
+      await render(<PlanView api={api} onBack={jest.fn()} checkout="success" />);
+      expect((await screen.findByLabelText("Usage emails")).props.value).toBe(true);
+      let land: (v: BillingEmails) => void = () => {};
+      api.billingEmails.mockImplementationOnce(() => new Promise<BillingEmails>((r) => (land = r)));
+      await act(async () => {
+        jest.advanceTimersByTime(CONFIRM_EVERY_MS);
+      });
+      await act(async () => fireEvent(screen.getByLabelText("Usage emails"), "valueChange", false));
+      expect(screen.getByLabelText("Usage emails").props.value).toBe(false);
+      await act(async () => land({ on: true, usage: true, canChange: true }));
+      expect(screen.getByLabelText("Usage emails").props.value).toBe(false);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it("takes /api/me/emails over the billing view, read-only included", async () => {
     await render(<PlanView api={fakeApi(billing({ emails: { on: true, usage: true } }), null, { on: true, usage: false, canChange: false })} onBack={jest.fn()} />);
     const toggle = await screen.findByLabelText("Usage emails");

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, AppState, Pressable, ScrollView, StyleSheet, Switch, Text, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
 import { BILLING_OFF, checkoutNotice, limitSummary, openBillingPage, subscriptionLine } from "../src/billing";
@@ -61,14 +61,17 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const notice = checkoutNotice(checkout);
+  // Bumped by each email setting save: a refresh started before one doesn't undo it.
+  const saves = useRef(0);
 
   const load = useCallback(async () => {
+    const at = saves.current;
     try {
       // Usage and emails are extra: the plan still shows if they can't load.
       const [b, u, m] = await Promise.all([api.billing(), api.myUsage().catch(() => null), api.billingEmails().catch(() => null)]);
       setView(b);
       setUsage(u);
-      setEmails(m);
+      if (saves.current === at) setEmails(m);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -99,6 +102,7 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
   const setUsageEmails = async (usage: boolean) => {
     setBusy("emails");
     setError(null);
+    saves.current += 1;
     try {
       setEmails(await api.setUsageEmails(usage));
     } catch (e) {

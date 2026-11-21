@@ -345,7 +345,8 @@ pub fn for_subscription(ev: &SubEvent, c: &Change, tiers: &Tiers) -> Vec<NewEmai
     if let Some(at) = ev.cancel_at.filter(|_| sets_plan && !ev.ending) {
         // Once per subscription and end date, whichever of Stripe's events says it first.
         let key = format!("stripe:{}:plan_ending:{at}", ev.row.subscription_id);
-        out.push(email(Kind::PlanEnding, key, Facts { plan: Some(label(ev.row.tier.as_deref())), next_plan: Some(label(None)), until: Some(at * 1000), ..Default::default() }));
+        let next = c.other_paying.and_then(|s| s.tier.as_deref());
+        out.push(email(Kind::PlanEnding, key, Facts { plan: Some(label(ev.row.tier.as_deref())), next_plan: Some(label(next)), until: Some(at * 1000), ..Default::default() }));
     }
     out
 }

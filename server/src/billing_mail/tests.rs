@@ -27,10 +27,14 @@ fn sub(status: &str, tier: Option<&str>) -> Subscription {
 }
 
 fn emails(row: &Subscription, applied: Applied, before: Option<&Subscription>, paying_before: Option<&Subscription>, cancel_at: Option<i64>, ending: bool) -> Vec<NewEmail> {
+    emails_with(row, applied, before, paying_before, None, cancel_at, ending)
+}
+
+fn emails_with(row: &Subscription, applied: Applied, before: Option<&Subscription>, paying_before: Option<&Subscription>, other_paying: Option<&Subscription>, cancel_at: Option<i64>, ending: bool) -> Vec<NewEmail> {
     let ev = SubEvent { event_id: "evt_1", row, cancel_at, ending };
     // As botd finds it: this subscription pays once it sets a plan, unless another does.
     let paying_after = if matches!(applied, Applied::Superseded) { paying_before } else { row.tier.is_some().then_some(row) };
-    for_subscription(&ev, &Change { applied: &applied, before, paying_before, paying_after }, &tiers())
+    for_subscription(&ev, &Change { applied: &applied, before, paying_before, paying_after, other_paying }, &tiers())
 }
 
 fn kinds(e: &[NewEmail]) -> Vec<Kind> {
@@ -120,6 +124,10 @@ fn a_scheduled_cancellation_is_said_once_per_subscription_and_date() {
     // The ending itself, or a subscription that isn't the plan, isn't "ending".
     assert!(emails(&sub("canceled", None), changed(Some("pro"), None), Some(&pro), Some(&pro), Some(1_797_582_000), true).iter().all(|e| e.kind != Kind::PlanEnding));
     assert!(emails(&pro, Applied::Superseded, Some(&pro), Some(&pro), Some(1_797_582_000), false).is_empty());
+    // Another subscription keeps paying once this one ends: that's the plan it moves to.
+    let older = Subscription { subscription_id: "sub_test_old".into(), started: 1, ..sub("active", Some("pro")) };
+    let e = emails_with(&pro, Applied::Unchanged, Some(&pro), Some(&pro), Some(&older), Some(1_797_582_000), false);
+    assert_eq!(e[0].facts.next_plan.as_deref(), Some("Pro"));
 }
 
 #[test]
