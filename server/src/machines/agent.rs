@@ -1475,9 +1475,10 @@ async fn login_forget(State(a): State<Arc<Agent>>, Json(f): Json<wire::ForgetReq
             }
         }
     };
+    let whose = if f.for_user.is_some() { "the teammate's" } else { "the Bots'" };
     match runas::as_user(user, || super::terminal::forget(&home, &f.files)) {
         Ok(removed) => Json(wire::ForgetReply { removed }).into_response(),
-        Err(e) => refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't act as the Bots' user: {e}")),
+        Err(e) => refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't act as {whose} user: {e}")),
     }
 }
 
