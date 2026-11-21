@@ -59,7 +59,7 @@ Running the test against older releases: 0.141.0 is the first that runs the hook
 - A harness release that stops running SuperBot's hook, changes its payload or ignores a block fails CI before the pin is bumped, for all four harnesses.
 - The fake model covers what a CLI does with a model's tool call, not whether a real model makes it. The manual script covers that, by hand, on a logged-in server.
 - The fake model speaks a subset of three APIs. A CLI that starts relying on more (a new required event or field) fails the test until the fake learns it; the failure says the run ended with an error, and the botd log is printed.
-- Codex older than 0.141.0 still starts, and its first command runs before the canary stops it. Refusing guarded runs on older Codex up front is left for later; machines install the pinned version.
+- Codex older than 0.141.0 still starts, and its first command runs before the canary stops it. Refusing guarded runs on older Codex up front is left for later; machines install the pinned version. Done in [ADR 0059](0059-refusing-guarded-runs-on-old-codex.md).
 - `hermes_e2e.rs` stays: it checks what the real Hermes can't show cheaply (no secret reaches the harness or `hermes gateway stop`, the managed config, the daemon stopped after a run).
 
 ## Alternatives considered

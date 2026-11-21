@@ -9,6 +9,7 @@ mod codex;
 mod hermes;
 mod pi;
 pub mod install;
+pub mod version;
 
 use crate::machines::job;
 use crate::machines::wire::{JobCleanup, JobEvent, JobFile, JobRequest};
@@ -201,6 +202,12 @@ pub trait Adapter: Send {
     }
     /// The longest hook timeout the harness accepts, if it caps it.
     fn max_hook_secs(&self) -> Option<u64> {
+        None
+    }
+    /// The oldest release that runs the hook as `args` installs it, as `--version`
+    /// names it. A guarded run on an older one (or one whose version can't be read) is
+    /// refused before it starts (ADR 0059). None: every release does.
+    fn hooks_since(&self) -> Option<&'static str> {
         None
     }
     /// What logs the harness in, run at a terminal as the account its runs use.
