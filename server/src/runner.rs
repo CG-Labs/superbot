@@ -223,6 +223,8 @@ pub struct App {
     pub storage: crate::storage::Cache,
     /// Each live run's own `BOT_TOKEN` (ADR 0083): issued when it starts, revoked when it ends.
     pub run_tokens: isolation::RunTokens,
+    /// TEAMS and TEAM_MACHINE_DAYS (ADR 0087). Unset: the defaults.
+    pub teams: OnceLock<crate::teams::Settings>,
     closing: AtomicBool,
 }
 
@@ -258,6 +260,7 @@ impl App {
             account_removals: Default::default(),
             teammate_gate: Default::default(),
             storage: Default::default(),
+            teams: OnceLock::new(),
             closing: AtomicBool::new(false),
         })
     }

@@ -84,14 +84,31 @@ impl Grant {
 }
 
 /// The whole model. Admins manage every Bot. Owners manage theirs. A shared Bot can be
-/// used by everyone; a grant adds its level. Read-only users never get past viewing.
-pub fn access(user_id: &str, role: Role, owner_id: &str, visibility: Visibility, grant: Option<Grant>) -> Access {
+/// used by everyone on its owner's team (`same_team`, ADR 0087); a grant adds its level
+/// there. Read-only users never get past viewing.
+pub fn access(user_id: &str, role: Role, owner_id: &str, visibility: Visibility, grant: Option<Grant>, same_team: bool) -> Access {
     if role == Role::Admin {
         return Access::Manage;
     }
     let shared = if visibility == Visibility::Shared { Access::Operate } else { Access::None };
-    let base = if owner_id == user_id { Access::Manage } else { shared.max(grant.map_or(Access::None, Grant::access)) };
+    let base = if owner_id == user_id {
+        Access::Manage
+    } else if same_team {
+        shared.max(grant.map_or(Access::None, Grant::access))
+    } else {
+        Access::None
+    };
     if role == Role::Readonly { base.min(Access::View) } else { base }
+}
+
+/// Whether sharing reaches across two people's teams (ADR 0087): the same team, or both
+/// in none unless `strict` (TEAMS=on), where no team is a team of one.
+pub fn reaches(strict: bool, a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a == b,
+        (None, None) => !strict,
+        _ => false,
+    }
 }
 
 /// How a shared Bot behaves when someone other than its owner uses it (ADR 0046).
@@ -174,7 +191,7 @@ impl Viewer {
         match self {
             Viewer::All => Access::Manage,
             Viewer::Nobody => Access::None,
-            Viewer::User { id, role } => access(id, *role, &bot.owner_id, bot.visibility, db.grant(&bot.id, id)),
+            Viewer::User { id, role } => access(id, *role, &bot.owner_id, bot.visibility, db.grant(&bot.id, id), db.same_team(&bot.owner_id, id)),
             Viewer::Within(a, b) => a.access(db, bot).min(b.access(db, bot)),
         }
     }
@@ -191,17 +208,21 @@ impl Viewer {
                 })
                 .collect();
         }
-        let grants = match self {
-            Viewer::User { id, .. } => db.user_grants(id),
-            _ => HashMap::new(),
+        let (grants, teams) = match self {
+            Viewer::User { id, .. } => (db.user_grants(id), db.team_ids()),
+            _ => (HashMap::new(), HashMap::new()),
         };
+        let strict = db.teams_strict();
         db.bots()
             .into_iter()
             .filter_map(|b| {
                 let a = match self {
                     Viewer::All => Access::Manage,
                     Viewer::Nobody | Viewer::Within(..) => Access::None,
-                    Viewer::User { id, role } => access(id, *role, &b.owner_id, b.visibility, grants.get(&b.id).copied()),
+                    Viewer::User { id, role } => {
+                        let same = b.owner_id == *id || reaches(strict, teams.get(&b.owner_id).map(String::as_str), teams.get(id).map(String::as_str));
+                        access(id, *role, &b.owner_id, b.visibility, grants.get(&b.id).copied(), same)
+                    }
                 };
                 (a > Access::None).then_some((b, a))
             })
@@ -297,9 +318,25 @@ mod tests {
         ];
         for (role, owner, vis, grant, want) in table {
             let owner_id = if owner { "u1" } else { "someone" };
-            assert_eq!(access("u1", role, owner_id, vis, grant), want, "{role:?} owner={owner} {vis:?} {grant:?}");
+            assert_eq!(access("u1", role, owner_id, vis, grant, true), want, "{role:?} owner={owner} {vis:?} {grant:?}");
         }
         assert!(HIDDEN < View && View < Operate && Operate < Manage);
+
+        // Another team's Bot (ADR 0087): neither sharing nor a grant reaches across.
+        for (role, vis, grant, want) in [(M, S, n, HIDDEN), (M, P, o, HIDDEN), (M, S, o, HIDDEN), (R, S, v, HIDDEN), (A, P, n, Manage)] {
+            assert_eq!(access("u1", role, "someone", vis, grant, false), want, "{role:?} {vis:?} {grant:?} across teams");
+        }
+        assert_eq!(access("u1", M, "u1", P, n, false), Manage, "an owner is on their own team");
+    }
+
+    #[test]
+    fn sharing_reaches_only_the_same_team() {
+        assert!(reaches(false, Some("t1"), Some("t1")));
+        assert!(!reaches(false, Some("t1"), Some("t2")));
+        assert!(!reaches(false, Some("t1"), None) && !reaches(false, None, Some("t1")));
+        assert!(reaches(false, None, None), "one org, as before");
+        assert!(!reaches(true, None, None), "TEAMS=on: no team is a team of one");
+        assert!(reaches(true, Some("t1"), Some("t1")));
     }
 
     #[test]
