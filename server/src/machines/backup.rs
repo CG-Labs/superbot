@@ -24,7 +24,7 @@ use super::provider::{ByteStream, MachineProvider, RestoreSpec};
 use super::s3::{self, S3};
 use super::{ControlPlane, State, Step, conflict, event, next, observe, system};
 use crate::audit::{Outcome, Who};
-use crate::db::{Machine, MachineBackup, MachineRestore, NewMachineBackup, now};
+use crate::db::{Machine, MachineBackup, MachineRestore, NewMachineBackup, NewMachineRestore, now};
 use crate::runner::App;
 use crate::secrets::SecretStore;
 use crate::users::need_user_key;
@@ -362,9 +362,14 @@ fn provider_name(b: &MachineBackup) -> String {
     format!("superbot-{}", b.id)
 }
 
-/// The imported copy's name while it is set up beside the machine.
-fn staging(m: &Machine) -> String {
-    format!("{}-restore", m.label)
+/// The imported copy's id while it is set up beside the machine: on the host the
+/// restore is onto, where the provider has several (ADR 0076).
+fn staging(p: &dyn MachineProvider, m: &Machine, r: &MachineRestore) -> String {
+    let name = format!("{}-restore", m.label);
+    match (p.hosts(), r.to_host.as_deref()) {
+        (Some(h), Some(to)) => h.id_on(to, &name),
+        _ => name,
+    }
 }
 
 fn provider_id(m: &Machine) -> String {
@@ -538,6 +543,9 @@ fn unable(app: &App, cp: &ControlPlane, m: &Machine) -> Option<String> {
     }
     if app.db.machine_restoring(&m.id).is_some() {
         return Some("A restore is underway.".into());
+    }
+    if let Some(why) = super::hosts::unreachable(cp, m) {
+        return Some(why);
     }
     None
 }
@@ -725,7 +733,7 @@ async fn clean_up(app: &App, cp: &ControlPlane, mut left: Vec<MachineRestore>) {
                 eprintln!("Machine backups: kept {}'s restore copy: its container is gone", m.id);
                 continue;
             }
-            if let Err(e) = p.delete(&staging(&m)).await {
+            if let Err(e) = p.delete(&staging(p, &m, &r)).await {
                 eprintln!("Machine backups: deleting {}'s interrupted restore copy: {e}", m.id);
                 again.push(r);
             }
@@ -797,6 +805,9 @@ pub async fn follow_up(app: &AppState, cp: &ControlPlane) {
                 d["restoreId"] = json!(r.id);
                 d["backupId"] = json!(r.backup_id);
                 d["by"] = json!(r.created_by);
+                if r.to_host.is_some() {
+                    (d["fromHost"], d["toHost"], d["reason"]) = (json!(r.from_host), json!(r.to_host), json!(r.reason));
+                }
                 app.db.record(&event(&by, "machine.restored", &m, d));
                 if m.assigned_at.is_some() {
                     super::folder::assigned(app, cp, &m, &by);
@@ -814,8 +825,8 @@ pub async fn follow_up(app: &AppState, cp: &ControlPlane) {
 }
 
 /// Copies the backup from the store into the provider beside the machine.
-async fn import(off: &Offsite, p: &dyn MachineProvider, m: &Machine, b: &MachineBackup, ids: Vec<age::x25519::Identity>) -> Result<(), String> {
-    let name = staging(m);
+async fn import(off: &Offsite, p: &dyn MachineProvider, m: &Machine, r: &MachineRestore, b: &MachineBackup, ids: Vec<age::x25519::Identity>) -> Result<(), String> {
+    let name = staging(p, m, r);
     p.delete(&name).await.map_err(|e| format!("clearing an earlier restore's copy: {e}"))?;
     let res = off.s3.get(&b.object_key).await?;
     let data = checked(res.bytes_stream(), b.sha256.clone().unwrap_or_default(), b.size.unwrap_or(-1));
@@ -850,18 +861,43 @@ async fn replace(app: &App, cp: &ControlPlane, e: &Enrollment, r: &MachineRestor
     let prior = (m.enroll_by, m.enroll_overdue_at);
     let (token, expires) = e.mint_token(app, &m.id, who)?;
     app.db.record(&event(by, "machine.enroll_token_issued", &m, json!({ "expiresAt": expires, "via": "restore", "restoreId": r.id })));
+    // Onto another host, today's firewall must be there before the copy is put behind it.
+    // An older one the machine kept (after a label prefix change) may not be.
+    let moving = r.to_host.is_some() && r.from_host != r.to_host;
+    let mut firewall_id = m.firewall_id.clone();
+    if moving && let Some(fw) = &cp.firewall {
+        match super::firewall::ensure(app, fw, p, by).await {
+            Ok(id) => firewall_id = Some(id),
+            Err(err) => {
+                app.db.restore_enroll_by(&m.id, prior.0, prior.1);
+                return Err(format!("setting up the firewall on host {}: {err}", r.to_host.as_deref().unwrap_or_default()));
+            }
+        }
+    }
     let spec = RestoreSpec {
         plan: m.plan.clone(),
         tags: cp.spec(&m, None).tags,
         authorized_keys: cp.authorized_keys.clone(),
-        firewall_id: m.firewall_id.clone(),
+        firewall_id: firewall_id.clone(),
         files: e.restore_files(&m, &token),
         remove: vec![IDENTITY_PATH.into()],
     };
-    let pid = provider_id(&m);
-    if let Err(err) = p.replace_with(&pid, &staging(&m), &spec).await {
-        app.db.restore_enroll_by(&m.id, prior.0, prior.1);
-        return Err(err.to_string());
+    let pm = match p.replace_with(&provider_id(&m), &staging(p, &m, r), &spec).await {
+        Ok(pm) => pm,
+        Err(err) => {
+            app.db.restore_enroll_by(&m.id, prior.0, prior.1);
+            return Err(err.to_string());
+        }
+    };
+    // On another host it has another id from now on, whatever happens next.
+    let pid = pm.id.clone();
+    if m.provider_id.as_deref() != Some(pid.as_str()) {
+        app.db.set_machine_provider_id(&m.id, &pid);
+        m.provider_id = Some(pid.clone());
+    }
+    if m.firewall_id != firewall_id {
+        app.db.set_machine_firewall_id(&m.id, firewall_id.as_deref());
+        m.firewall_id = firewall_id;
     }
     // What the old disk's agent said and held is gone with it, as after a rebuild. All
     // of it, and the time enrollment counts from, before it boots: enrollment doesn't
@@ -898,16 +934,16 @@ async fn replace(app: &App, cp: &ControlPlane, e: &Enrollment, r: &MachineRestor
 }
 
 /// The whole restore after it was asked for: import, then replace under the lock.
-async fn restore(app: AppState, cp: Arc<ControlPlane>, r: MachineRestore, b: MachineBackup, ids: Vec<age::x25519::Identity>, by: Who) {
+pub(super) async fn restore(app: AppState, cp: Arc<ControlPlane>, r: MachineRestore, b: MachineBackup, ids: Vec<age::x25519::Identity>, by: Who) {
     let (Some(off), Some(p), Some(e)) = (cp.offsite.as_deref(), cp.provider.as_deref(), cp.enrollment.as_deref()) else { return };
     let Some(m) = app.db.machine(&r.machine_id) else { return };
-    if let Err(why) = import(off, p, &m, &b, ids).await {
+    if let Err(why) = import(off, p, &m, &r, &b, ids).await {
         let _g = cp.ops.lock().await;
         return fail_restore(&app, &by, &m, &r, &["importing"], &why);
     }
     let _g = cp.ops.lock().await;
     if let Err(why) = replace(&app, &cp, e, &r, &by).await {
-        let _ = p.delete(&staging(&m)).await;
+        let _ = p.delete(&staging(p, &m, &r)).await;
         let m = app.db.machine(&m.id).unwrap_or(m);
         fail_restore(&app, &by, &m, &r, &["importing", "replacing", "enrolling"], &why);
     }
@@ -981,14 +1017,17 @@ pub async fn create(
     Ok((StatusCode::ACCEPTED, Json(json!(b))))
 }
 
-/// `{backupId, identity?}`: `identity` is the age secret key for an encrypted backup.
-/// Used for this restore only, never stored or logged.
+/// `{backupId, identity?, host?}`: `identity` is the age secret key for an encrypted
+/// backup, used for this restore only, never stored or logged. `host`: the Incus host
+/// to restore onto, where there are several (ADR 0076); its own host by default.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RestoreBody {
     backup_id: String,
     #[serde(default)]
     identity: Option<String>,
+    #[serde(default)]
+    host: Option<String>,
 }
 
 /// `GET /api/users/{key}/machine/restore`: its latest restore.
@@ -998,9 +1037,59 @@ pub async fn restore_status(AppS(app): AppS<AppState>, Extension(a): Extension<A
     Ok(Json(json!({ "machineId": m.id, "restore": app.db.machine_last_restore(&m.id) })))
 }
 
-/// `POST /api/users/{key}/machine/restore` `{backupId, identity?}`: makes the machine
-/// again from one of its own backups. Everything on it since is lost. 202; the audit
-/// log and `GET` say how it went.
+/// Why `m` can't be restored now, if it can't.
+pub(super) fn cannot_restore(app: &App, m: &Machine) -> Option<String> {
+    if !matches!(m.state, State::Running | State::Suspended | State::Error) {
+        return Some(format!("The machine is {}; it can be restored when it's running, suspended or in error.", m.state.as_str()));
+    }
+    if super::rebuild::underway(m) {
+        return Some("A rebuild is underway.".into());
+    }
+    if let Some(r) = app.db.machine_restoring(&m.id) {
+        return Some(format!("A restore is {} already.", r.state));
+    }
+    if app.db.machine_backups(&m.id).iter().any(|b| b.state == "running") {
+        return Some("A backup of it is running; restore once it's done.".into());
+    }
+    None
+}
+
+/// Where a restore takes a machine, when the provider has several hosts (ADR 0076).
+#[derive(Clone, Debug, Default)]
+pub(super) struct Move {
+    pub from: Option<String>,
+    pub to: Option<String>,
+    /// `host_lost`, or None when an admin asked for this machine.
+    pub reason: Option<&'static str>,
+}
+
+/// Records a restore of `m` from `b`, for the caller to run (`restore`). The caller
+/// holds the lock and checked `cannot_restore`. None if one began meanwhile.
+pub(super) fn begin_restore(app: &App, cp: &ControlPlane, m: &Machine, b: &MachineBackup, by: &Who, mv: &Move) -> Option<MachineRestore> {
+    let off = cp.offsite.as_deref()?;
+    let id = format!("r{}", crate::random_hex(8));
+    let n = NewMachineRestore {
+        id: &id,
+        machine: m,
+        backup_id: &b.id,
+        by: by.actor.id.as_deref(),
+        rto_ms: Some(off.s.rto_ms(&m.tier)),
+        from_host: mv.from.as_deref(),
+        to_host: mv.to.as_deref(),
+        reason: mv.reason,
+    };
+    let r = app.db.machine_restore_start(&n)?;
+    let mut d = json!({ "restoreId": r.id, "backupId": b.id, "backupCreatedAt": b.created_at, "encrypted": b.encrypted, "was": m.state, "rtoMs": r.rto_ms });
+    if mv.to.is_some() {
+        (d["fromHost"], d["toHost"], d["reason"]) = (json!(mv.from), json!(mv.to), json!(mv.reason));
+    }
+    app.db.record(&event(by, "machine.restore_requested", m, d));
+    Some(r)
+}
+
+/// `POST /api/users/{key}/machine/restore` `{backupId, identity?, host?}`: makes the
+/// machine again from one of its own backups. Everything on it since is lost. 202; the
+/// audit log and `GET` say how it went.
 pub async fn restore_request(
     AppS(app): AppS<AppState>,
     Extension(a): Extension<Arc<Auth>>,
@@ -1008,7 +1097,7 @@ pub async fn restore_request(
     Path(key): Path<String>,
     Json(req): Json<RestoreBody>,
 ) -> Res<(StatusCode, Json<Value>)> {
-    let (cp, off) = need(&a)?;
+    let (cp, _) = need(&a)?;
     if cp.enrollment.is_none() {
         return Err(conflict("A restored machine enrolls again, so it needs enrollment on (MACHINE_CONTROL_URL).".into()));
     }
@@ -1024,30 +1113,16 @@ pub async fn restore_request(
     if b.state != "done" {
         return Err(conflict(format!("That backup is {}; only finished ones can be restored.", b.state)));
     }
-    if !matches!(m.state, State::Running | State::Suspended | State::Error) {
-        return Err(conflict(format!("The machine is {}; it can be restored when it's running, suspended or in error.", m.state.as_str())));
+    if let Some(why) = cannot_restore(&app, &m) {
+        return Err(conflict(why));
     }
-    if super::rebuild::underway(&m) {
-        return Err(conflict("A rebuild is underway.".into()));
-    }
-    if let Some(r) = app.db.machine_restoring(&m.id) {
-        return Err(conflict(format!("A restore is {} already.", r.state)));
-    }
-    if app.db.machine_backups(&m.id).iter().any(|b| b.state == "running") {
-        return Err(conflict("A backup of it is running; restore once it's done.".into()));
-    }
+    let mv = super::hosts::restore_move(cp, &m, req.host.as_deref().map(str::trim).filter(|h| !h.is_empty()))?;
     let ids = match (b.encrypted, req.identity.as_deref().filter(|i| !i.trim().is_empty())) {
         (true, None) => return Err(bad("That backup is encrypted: send its age identity as \"identity\" (botctl machine restore ... --identity <file>).")),
         (true, Some(raw)) => identities(raw).map_err(bad)?,
         (false, _) => Vec::new(),
     };
-    let id = format!("r{}", crate::random_hex(8));
-    let r = app
-        .db
-        .machine_restore_start(&id, &m, &b.id, by.actor.id.as_deref(), Some(off.s.rto_ms(&m.tier)))
-        .ok_or_else(|| conflict("A restore is underway already.".into()))?;
-    let d = json!({ "restoreId": r.id, "backupId": b.id, "backupCreatedAt": b.created_at, "encrypted": b.encrypted, "was": m.state, "rtoMs": r.rto_ms });
-    app.db.record(&event(&by, "machine.restore_requested", &m, d));
+    let r = begin_restore(&app, cp, &m, &b, &by, &mv).ok_or_else(|| conflict("A restore is underway already.".into()))?;
     tokio::spawn(restore(app.clone(), a.machines.clone(), r.clone(), b, ids, by));
     Ok((StatusCode::ACCEPTED, Json(json!({ "machineId": m.id, "restore": r }))))
 }

@@ -2,7 +2,8 @@
 # Makes a throwaway Ubuntu host into an Incus host for the real-Incus end-to-end test
 # (server/src/machines_incus_e2e_tests.rs, ADR 0069), the way docs/ops/incus-containers.md
 # sets one up: a storage pool, a SuperBot-only bridge, a restricted project, the API on
-# the bridge's address, and a trusted client certificate for botd.
+# the bridge's address, and a trusted client certificate for botd. A second restricted
+# project stands in for a second Incus host, for the host-loss drill (ADR 0076).
 #
 # Usage: sudo SUPERBOT_INCUS_E2E_THROWAWAY=1 deploy/incus-e2e-host.sh <out-dir>
 #
@@ -28,6 +29,8 @@ driver=${POOL_DRIVER:-btrfs}
 gateway=10.150.0.1
 network=superbot0
 project=superbot
+# The second "host": the same Incus, another project.
+project_b=superbot-b
 
 say() { printf '==> %s\n' "$*"; }
 
@@ -74,12 +77,14 @@ if ! incus network show "$network" >/dev/null 2>&1; then
   incus network create "$network" ipv4.address="$gateway/24" ipv4.nat=true
 fi
 
-if ! incus project show "$project" >/dev/null 2>&1; then
-  say "Restricted project $project"
-  incus project create "$project" -c restricted=true -c restricted.networks.access="$network"
-fi
-# Off-host backups export containers (ADR 0071); a restricted project blocks that otherwise.
-incus project set "$project" restricted.backups=allow
+for p in "$project" "$project_b"; do
+  if ! incus project show "$p" >/dev/null 2>&1; then
+    say "Restricted project $p"
+    incus project create "$p" -c restricted=true -c restricted.networks.access="$network"
+  fi
+  # Off-host backups export containers (ADR 0071); a restricted project blocks that otherwise.
+  incus project set "$p" restricted.backups=allow
+done
 
 say "API on $gateway:8443"
 incus config set core.https_address="$gateway:8443"
@@ -109,6 +114,8 @@ INCUS_SERVER_CERT_FILE=$out/server.crt
 INCUS_PROJECT=$project
 INCUS_NETWORK=$network
 INCUS_STORAGE_POOL=default
+SUPERBOT_INCUS_E2E_PROJECT_B=$project_b
+INCUS_SERVER_CERT_B_FILE=$out/server.crt
 EOF
 if [[ -n ${SUDO_USER:-} ]]; then
   chown -R "$SUDO_USER:" "$out"

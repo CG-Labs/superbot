@@ -14,7 +14,9 @@
 //!
 //! With SUPERBOT_INCUS_E2E_S3_ENDPOINT and _BUCKET (and MACHINE_BACKUP_S3_ACCESS_KEY_ID
 //! and _SECRET_ACCESS_KEY), a container is also backed up to that store, encrypted, and
-//! restored from it (ADR 0071); CI runs versitygw on loopback for it.
+//! restored from it (ADR 0071); CI runs versitygw on loopback for it. With those and
+//! SUPERBOT_INCUS_E2E_PROJECT_B (a second project the host script makes), losing a
+//! whole host is drilled too (ADR 0076): two hosts on the one Incus, one of them lost.
 
 use crate::machines::State;
 use crate::machines::enroll::{self, Enrollment};
@@ -96,8 +98,8 @@ async fn gateway(incus: &Incus) -> IpAddr {
     cidr.split('/').next().unwrap().parse().unwrap()
 }
 
-/// What an earlier, failed run left behind.
-async fn clean(incus: &Incus) {
+/// Containers an earlier, failed run left behind.
+async fn clean_instances(incus: &Incus) {
     let list = incus.raw(Method::GET, "/1.0/instances", None, 10).await.unwrap();
     for url in list.as_array().into_iter().flatten().filter_map(Value::as_str) {
         let n = url.trim_start_matches("/1.0/instances/").split('?').next().unwrap();
@@ -105,6 +107,11 @@ async fn clean(incus: &Incus) {
             incus.delete(n).await.unwrap();
         }
     }
+}
+
+/// What an earlier, failed run left behind.
+async fn clean(incus: &Incus) {
+    clean_instances(incus).await;
     let acls = incus.raw(Method::GET, "/1.0/network-acls", None, 10).await.unwrap();
     for url in acls.as_array().into_iter().flatten().filter_map(Value::as_str) {
         let n = url.trim_start_matches("/1.0/network-acls/").split('?').next().unwrap();
@@ -115,6 +122,11 @@ async fn clean(incus: &Incus) {
 }
 
 async fn serve() -> Env {
+    serve_with(Vec::new()).await
+}
+
+/// `serve`, with more settings (or others in place of the host script's).
+async fn serve_with(extra: Vec<(&'static str, String)>) -> Env {
     let started = Instant::now();
     let incus = incus_from_env().await;
     clean(&incus).await;
@@ -145,6 +157,7 @@ async fn serve() -> Env {
         ("MACHINE_LABEL_PREFIX", PREFIX.into()),
     ]);
     let mut fixed = fixed;
+    fixed.extend(extra);
     let s3 = std::env::var("SUPERBOT_INCUS_E2E_S3_ENDPOINT").unwrap_or_default();
     let backup_identity = (!s3.is_empty()).then(age::x25519::Identity::generate);
     if let Some(id) = &backup_identity {
@@ -166,7 +179,9 @@ async fn serve() -> Env {
         off.s3.create_bucket().await.unwrap();
     }
     let cp = Arc::new(cp);
-    let (port, app, owner, _) = crate::tests::serve_app_with(move |a| a.machines = cp).await;
+    let c = cp.clone();
+    let (port, app, owner, _) = crate::tests::serve_app_with(move |a| a.machines = c).await;
+    crate::machines::hosts::load(&app, &cp).unwrap();
     tokio::spawn(enroll::serve(machine_listener, app.clone(), e, None));
     let (_, admin) = user_with(port, &owner, "ops@example.com", "admin").await;
     Env { port, app, admin, incus, gateway, machine_port, decoy_port, decoy_hits, started, backup_identity }
@@ -570,4 +585,160 @@ async fn backup_and_restore(env: &Env, uid: &str, m: &crate::db::Machine, other:
     let b4 = address(&i, "inet");
     assert!(!reaches(env, other, &b4, crate::machines::enroll::DEFAULT_AGENT_PORT).await, "still apart after the restore");
     until(env, "snapshots on again once enrolled", &[m.id.as_str()], Duration::from_secs(60), |m| m.backups).await;
+}
+
+/// A TCP forwarder on loopback to `to`: an Incus host botd reaches at another address,
+/// which the test can take away. Dropping it closes the port and every connection.
+struct Forwarder {
+    port: u16,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Forwarder {
+    async fn start(to: std::net::SocketAddr) -> Forwarder {
+        let l = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let mut conns = tokio::task::JoinSet::new();
+            while let Ok((mut c, _)) = l.accept().await {
+                conns.spawn(async move {
+                    if let Ok(mut up) = tokio::net::TcpStream::connect(to).await {
+                        let _ = tokio::io::copy_bidirectional(&mut c, &mut up).await;
+                    }
+                });
+            }
+        });
+        Forwarder { port, task }
+    }
+
+    fn stop(&self) {
+        self.task.abort();
+    }
+}
+
+/// Losing a whole host (ADR 0076), on one real Incus: host `a` is the `superbot`
+/// project, reached through a forwarder on loopback; host `b` is the second project.
+/// A container on `a` is backed up off-host, then `a` is gone: the forwarder closes and
+/// its container is deleted, as with a host that burned down. botd finds `a` down, an
+/// admin declares it lost, and the container is made again on `b` from the backup,
+/// enrolls anew, and is behind the firewall there, within its tier's RTO.
+#[tokio::test]
+#[ignore = "needs a real Incus host with a second project: SUPERBOT_INCUS_E2E=1, SUPERBOT_INCUS_E2E_PROJECT_B, an S3 store, and INCUS_* (deploy/incus-e2e-host.sh), as CI's incus-e2e job runs it"]
+async fn real_incus_host_loss_restores_onto_another_host() {
+    use age::secrecy::ExposeSecret;
+    let project_b = std::env::var("SUPERBOT_INCUS_E2E_PROJECT_B").unwrap_or_default();
+    if std::env::var("SUPERBOT_INCUS_E2E").as_deref() != Ok("1") || project_b.is_empty() || std::env::var("SUPERBOT_INCUS_E2E_S3_ENDPOINT").is_err() {
+        eprintln!("skipped: needs SUPERBOT_INCUS_E2E=1, SUPERBOT_INCUS_E2E_PROJECT_B, an S3 store and a real Incus host");
+        return;
+    }
+    let url = std::env::var("INCUS_URL").unwrap();
+    let real: std::net::SocketAddr = url.trim_start_matches("https://").parse().expect("INCUS_URL is https://<ip>:<port>");
+    let fixed = HashMap::new();
+    let var = settings(&fixed);
+    let in_b = |k: &str| if k == "INCUS_PROJECT" { project_b.clone() } else { var(k) };
+    let b = Incus::new(Settings::from_env(&in_b).unwrap(), Credentials::from_store(&EnvStore::process()).unwrap()).unwrap();
+    // Before `serve` cleans the first project's: both projects' containers use one ACL.
+    clean_instances(&b).await;
+    let fwd = Forwarder::start(real).await;
+    let env = serve_with(vec![
+        ("INCUS_URL", format!("https://127.0.0.1:{}", fwd.port)),
+        ("INCUS_HOST_NAME", "a".into()),
+        ("INCUS_HOSTS", format!("b={url}")),
+        ("INCUS_PROJECT_B", project_b.clone()),
+    ])
+    .await;
+    let cp = env.app.control_plane.get().unwrap().clone();
+    let (code, h) = json_call(&env, "GET", "/api/machines/hosts?check=true", "").await;
+    assert_eq!(code, 200, "{h}");
+    assert_eq!((h["hosts"][0]["state"].as_str(), h["hosts"][1]["state"].as_str(), h["placement"].as_str()), (Some("up"), Some("up"), Some("a")), "{h}");
+    let (code, s) = json_call(&env, "GET", "/api/machines/substrate?check=true", "").await;
+    assert_eq!(code, 200, "{s}");
+    for c in s["checks"].as_array().unwrap() {
+        assert!(c["ok"] == true || c["check"] == "storage pool", "{c}");
+    }
+    env.say("two hosts: a through a forwarder, b as a second project");
+
+    let (uid, _) = user_with(env.port, &env.admin, "ada@example.com", "member").await;
+    let (code, m) = json_call(&env, "POST", &format!("/api/users/{uid}/machine"), "").await;
+    assert_eq!(code, 202, "{m}");
+    let m = env.app.db.machine(m["id"].as_str().unwrap()).unwrap();
+    assert_eq!(m.provider_id.as_deref(), Some(format!("a/{}", m.label).as_str()));
+    until(&env, "enrolled and heartbeating on a", &[m.id.as_str()], ENROLL_WITHIN, |m| {
+        m.state == State::Running && m.enrollment == "enrolled" && m.agent_seen_at.is_some() && m.backups
+    })
+    .await;
+    let n = m.label.as_str();
+    let id_sum = "sha256sum /var/lib/superbot-machine/identity.pem | cut -d' ' -f1";
+    let (code, old_identity) = sh(&env, n, &format!("echo before > /root/marker && sync && {id_sum}")).await;
+    assert_eq!(code, 0, "{old_identity}");
+    let (code, bk) = json_call(&env, "POST", &format!("/api/users/{uid}/machine/backups"), "").await;
+    assert_eq!(code, 202, "{bk}");
+    let bid = bk["id"].as_str().unwrap().to_string();
+    let bk = wait(&env, "backed up to the store", Duration::from_secs(900), || env.app.db.machine_backup(&bid).filter(|b| b.state != "running")).await;
+    assert_eq!(bk.state, "done", "{:?}", bk.error);
+
+    // Host a is gone, with its container.
+    fwd.stop();
+    env.incus.delete(n).await.unwrap();
+    let r = reconcile(&env).await;
+    assert_eq!(r["hostsDown"].as_u64(), Some(0), "{r}");
+    env.app.db.machine_host_failing_backdate("a", 3_600_000);
+    let r = reconcile(&env).await;
+    assert_eq!(r["hostsDown"].as_u64(), Some(1), "{r}");
+    assert_eq!(env.app.db.machine(&m.id).unwrap().state, State::Running, "down isn't lost");
+    assert!(events(&env, "machine.lost").await.is_empty());
+    assert_eq!(events(&env, "machine.host_down").await.len(), 1);
+    env.say("host a found down");
+
+    let identity = env.backup_identity.as_ref().unwrap().to_string().expose_secret().to_string();
+    let (code, out) = json_call(&env, "POST", "/api/machines/hosts/a/recover", &json!({ "identity": identity }).to_string()).await;
+    assert_eq!(code, 202, "{out}");
+    assert_eq!((out["to"].as_str(), out["restoring"].as_array().map(Vec::len)), (Some("b"), Some(1)), "{out}");
+    let rid = out["restoring"][0]["restore"]["id"].as_str().unwrap().to_string();
+    let r = wait(&env, "restored onto b", Duration::from_secs(900), || env.app.db.machine_restore(&rid).filter(|r| !matches!(r.state.as_str(), "importing" | "replacing"))).await;
+    assert_eq!(r.state, "enrolling", "{:?}", r.error);
+    let replaced = r.replaced_at.unwrap();
+    let t = Instant::now();
+    loop {
+        reconcile(&env).await;
+        crate::machines::backup::follow_up(&env.app, &cp).await;
+        let r = env.app.db.machine_restore(&rid).unwrap();
+        let row = env.app.db.machine(&m.id).unwrap();
+        if r.state == "done" && row.agent_seen_at.is_some_and(|s| s >= replaced) {
+            break;
+        }
+        assert!(r.state == "enrolling" || r.state == "done", "{:?}", r.error);
+        assert!(t.elapsed() < ENROLL_WITHIN, "the restored container didn't enroll: {row:?}");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    env.say(&format!("restored onto b and enrolled anew ({}s)", t.elapsed().as_secs()));
+
+    let r = env.app.db.machine_restore(&rid).unwrap();
+    let (took, rto) = (r.duration_ms.expect("a finished restore is timed"), r.rto_ms.unwrap());
+    let drill = json!({
+        "restoreId": r.id, "tier": r.tier, "durationMs": took, "rtoMs": rto, "withinRto": took <= rto, "fromHost": r.from_host,
+        "toHost": r.to_host, "backupBytes": bk.size, "replacedAfterMs": replaced - r.created_at, "incus": std::env::var("INCUS_SOURCE").ok(),
+    });
+    env.say(&format!("host-loss drill: {}s of an RTO of {} minutes ({drill})", took / 1000, rto / 60_000));
+    if let Ok(out) = std::env::var("SUPERBOT_INCUS_E2E_HOST_DRILL_OUT") {
+        std::fs::write(&out, serde_json::to_vec_pretty(&drill).unwrap()).unwrap();
+    }
+    assert!(took <= rto, "the restore took {took} ms, past its RTO of {rto} ms");
+    let row = env.app.db.machine(&m.id).unwrap();
+    assert_eq!(row.provider_id.as_deref(), Some(format!("b/{n}").as_str()));
+    let (code, marker, _) = b.exec(n, &["cat", "/root/marker"]).await.unwrap();
+    assert_eq!((code, marker.trim()), (0, "before"), "the backup's files");
+    let (code, new_identity, _) = b.exec(n, &["sh", "-c", id_sum]).await.unwrap();
+    assert!(code == 0 && new_identity.trim().len() == 64 && new_identity != old_identity, "a new identity: {new_identity}");
+    let i = b.raw(Method::GET, &format!("/1.0/instances/{n}?recursion=1"), None, 10).await.unwrap();
+    assert_eq!(i["devices"]["eth0"]["security.acls"].as_str(), row.firewall_id.as_deref(), "behind the firewall on b");
+    assert!(!i["config"].to_string().contains("sbe_"));
+    assert_eq!(env.app.db.machine_pins(&m.id).len(), 1, "only the new certificate");
+    let restored = events(&env, "machine.restored").await;
+    assert_eq!((restored[0]["details"]["toHost"].as_str(), restored[0]["details"]["withinRto"].as_bool()), (Some("b"), Some(true)), "{restored:?}");
+
+    let (code, d) = json_call(&env, "DELETE", &format!("/api/users/{uid}/machine"), "").await;
+    assert_eq!((code, d["state"].as_str()), (200, Some("destroyed")), "{d}");
+    assert_eq!(b.get(n).await, Err(crate::machines::provider::ProviderError::NotFound));
+    env.say("destroyed on b");
 }

@@ -80,6 +80,7 @@ pub fn view(app: &App, cp: &ControlPlane, off: &Offsite, m: &Machine) -> Value {
     let open = app.db.machine_rpo_breach_open(&m.id);
     json!({
         "machineId": m.id,
+        "host": super::hosts::of(cp, m),
         "userId": m.user_id,
         "tier": m.tier,
         "state": m.state,
@@ -95,7 +96,8 @@ pub fn view(app: &App, cp: &ControlPlane, off: &Offsite, m: &Machine) -> Value {
         "breachedAt": open.map(|b| b.breached_at),
         "lastRestore": restore.map(|r| json!({
             "id": r.id, "state": r.state, "createdAt": r.created_at, "durationMs": r.duration_ms,
-            "rtoMs": r.rto_ms, "withinRto": within(&r),
+            "rtoMs": r.rto_ms, "withinRto": within(&r), "fromHost": r.from_host, "toHost": r.to_host,
+            "reason": r.reason,
         })),
     })
 }
@@ -274,12 +276,16 @@ pub async fn get(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>) 
             v
         })
         .collect();
-    Ok(Json(json!({
+    let mut out = json!({
         "objectives": off.s.objectives(&tiers),
         "tracked": tracked,
         "breaching": breaching,
         "machines": machines,
         "breaches": app.db.machine_rpo_breaches(100),
         "restores": restores,
-    })))
+    });
+    if let Some(h) = super::hosts::view(&app, cp) {
+        out["hosts"] = h["hosts"].clone();
+    }
+    Ok(Json(out))
 }
