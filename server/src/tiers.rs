@@ -579,6 +579,10 @@ mod tests {
         let shipped = Tiers::parse(include_str!("../../deploy/tiers.example.json"), None).unwrap();
         assert_eq!(shipped.default_tier().name, "starter");
         assert!(shipped.all().iter().any(|t| !t.managed()));
+        assert_eq!(shipped.providers().iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["anthropic-api", "openai-api"]);
+        let max = shipped.get("max").unwrap().route("hermes", None, None).unwrap();
+        let w = shipped.wiring(&max, true, |_| false).unwrap();
+        assert_eq!((w.fallback, w.skipped.len()), (Some(Vec::new()), 2), "unsaved fallback keys leave the route as it was");
         let missing = Tiers::from_env(|k| if k == "TIERS_FILE" { "/nonexistent/tiers.json".into() } else { String::new() }).unwrap_err();
         assert!(missing.starts_with("TIERS_FILE /nonexistent/tiers.json"), "{missing}");
 

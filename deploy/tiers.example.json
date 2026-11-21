@@ -1,5 +1,9 @@
 {
   "default": "starter",
+  "providers": {
+    "anthropic-api": { "protocol": "anthropic-messages", "baseUrl": "https://api.anthropic.com", "keySecret": "TIER_ANTHROPIC_KEY" },
+    "openai-api": { "protocol": "openai-chat", "baseUrl": "https://api.openai.com/v1", "keySecret": "TIER_OPENAI_KEY" }
+  },
   "tiers": [
     {
       "name": "starter",
@@ -14,7 +18,8 @@
       "name": "pro",
       "label": "Pro",
       "routes": [
-        { "harness": "hermes", "provider": "openrouter", "model": "anthropic/claude-sonnet-4.5" },
+        { "harness": "hermes", "provider": "openrouter", "model": "anthropic/claude-sonnet-4.5",
+          "fallback": [{ "provider": "anthropic-api", "model": "claude-sonnet-4-5" }] },
         { "harness": "claude", "model": "claude-sonnet-4-5", "effort": "high" }
       ],
       "limits": { "maxBots": 10, "monthlyRuns": 3000, "monthlyTokens": 20000000, "dailyRoutineRuns": 200, "machineType": "g6-standard-2", "concurrentRuns": 8 },
@@ -24,7 +29,8 @@
       "name": "max",
       "label": "Max",
       "routes": [
-        { "harness": "hermes", "provider": "openrouter", "model": "anthropic/claude-opus-4.1" },
+        { "harness": "hermes", "provider": "openrouter", "model": "anthropic/claude-opus-4.1",
+          "fallback": [{ "provider": "anthropic-api", "model": "claude-opus-4-1" }, { "provider": "openai-api", "model": "gpt-5" }] },
         { "harness": "hermes", "provider": "openrouter", "model": "anthropic/claude-sonnet-4.5" },
         { "harness": "claude", "model": "claude-opus-4-1", "effort": "high" },
         { "harness": "codex", "model": "gpt-5-codex" }
