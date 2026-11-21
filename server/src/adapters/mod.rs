@@ -500,7 +500,7 @@ mod tests {
     }
 
     fn run_as(sudo: &str) -> crate::accounts::RunAs {
-        crate::accounts::RunAs { sudo: sudo.into(), runner: "/opt/superbot/bin/superbot-run".into(), account: "sb-u-u1".into(), settings: "/srv/superbot/users/u1/settings".into() }
+        crate::accounts::RunAs { sudo: sudo.into(), runner: "/opt/superbot/bin/superbot-run".into(), account: "sb-u-u1".into(), settings: "/srv/superbot/users/u1/settings".into(), teammate: None }
     }
 
     #[test]

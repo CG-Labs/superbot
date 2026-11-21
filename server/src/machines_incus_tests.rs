@@ -1,4 +1,4 @@
-//! Machines as Incus system containers (ADR 0064), end to end on loopback: the real
+//! Machines as Incus system containers (ADR 0065), end to end on loopback: the real
 //! router, botd's machine port, the real agent, and the Incus provider talking mutual
 //! TLS to a stand-in for the Incus API. Nothing here talks to a real Incus host.
 

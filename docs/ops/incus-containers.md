@@ -1,6 +1,6 @@
 # Per-user containers on an Incus host
 
-This guide covers running each user's machine as an unprivileged system container on an Incus host instead of a Linode VM ([ADR 0064](../adr/0064-incus-container-machines.md)). Everything else is unchanged: enrollment, Bots, harness logins, the user's folder, the Bots' own OS user and screens. Read the isolation boundary in the ADR before you choose containers over VMs.
+This guide covers running each user's machine as an unprivileged system container on an Incus host instead of a Linode VM ([ADR 0065](../adr/0065-incus-container-machines.md)). Everything else is unchanged: enrollment, Bots, harness logins, the user's folder, the Bots' own OS user and screens. Read the isolation boundary in the ADR before you choose containers over VMs.
 
 These steps change only the Incus host you run them on. Placeholders look like `<incus-host-ip>`.
 

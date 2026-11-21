@@ -135,7 +135,7 @@ pub fn server_secret(name: &str) -> bool {
 
 /// The Turnstile secret (ADR 0022), the Linode token, which can rent and delete every
 /// user's machine (ADR 0025), botd's Incus client key, which can do the same to every
-/// container and administers the Incus host (ADR 0064), and the notifier's SMTP
+/// container and administers the Incus host (ADR 0065), and the notifier's SMTP
 /// password, webhook URL, and webhook signing key (ADR 0061).
 pub const SERVER_SECRETS: [&str; 6] = ["TURNSTILE_SECRET", "LINODE_TOKEN", "INCUS_CLIENT_KEY", "SMTP_PASSWORD", "NOTIFY_WEBHOOK_URL", "NOTIFY_WEBHOOK_SECRET"];
 

@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # Root helper for per-user accounts (docs/adr/0037-per-user-unix-accounts.md). Installed as
 # /usr/local/sbin/superbot-userctl by deploy/install.sh --isolation. botd's service account may
-# run exactly `superbot-userctl ensure <user id>` as root (sudoers), and nothing else.
+# run exactly `superbot-userctl ensure ...` as root (sudoers), and nothing else.
 #
 #   superbot-userctl ensure <user id>
+#   superbot-userctl ensure <owner id> <teammate id>
+#
+# The second is a teammate's account for one owner's shared Bots
+# (docs/adr/0064-teammate-accounts-on-one-server.md): sb-t-<first 24 hex of
+# sha256("<owner>:<teammate>")>, with the same folders under <dir>/<owner>-<teammate>/. Only
+# that account may enter them: not the owner's, not the teammate's own.
 #
 # Makes, if missing, and then fixes:
 #   account  sb-u-<id>: a locked system account with no login shell, in its own group plus
@@ -26,6 +32,7 @@ export LC_ALL=C
 
 CONF=${SUPERBOT_USERCTL_CONF:-/etc/superbot/isolation.conf}
 PREFIX=sb-u-
+TEAMMATE_PREFIX=sb-t-
 RUN_GROUP=superbot-users
 
 die() { printf 'superbot-userctl: %s\n' "$*" >&2; exit 2; }
@@ -110,12 +117,15 @@ account_uid() {
   fi
 }
 
+valid_id() {
+  [[ "$1" =~ ^[a-z0-9]{1,27}$ ]] || die "user id must be 1 to 27 lowercase letters and digits"
+}
+
+# ensure <folder name under ISOLATION_DIR> <account> <comment>
 ensure() {
-  local id=$1 account root uid home
-  [[ "$id" =~ ^[a-z0-9]{1,27}$ ]] || die "user id must be 1 to 27 lowercase letters and digits"
-  account="$PREFIX$id"
+  local dir=$1 account=$2 comment=$3 root uid home
   trusted_path "$ISOLATION_DIR"
-  root="$ISOLATION_DIR/$id"
+  root="$ISOLATION_DIR/$dir"
   home="$root/home"
 
   if getent passwd "$account" >/dev/null; then
@@ -129,7 +139,7 @@ ensure() {
     uid=$(account_uid "$home")
     getent group "$account" >/dev/null || groupadd --system --gid "$uid" "$account"
     useradd --system --uid "$uid" --gid "$account" --groups "$RUN_GROUP" --home-dir "$home" --no-create-home \
-      --shell /usr/sbin/nologin --comment "SuperBot user $id" "$account"
+      --shell /usr/sbin/nologin --comment "$comment" "$account"
   fi
   usermod --append --groups "$RUN_GROUP" "$account"
   passwd --lock "$account" >/dev/null
@@ -157,12 +167,23 @@ ensure() {
   printf '%s %s\n' "$account" "$home"
 }
 
+usage="usage: superbot-userctl ensure <user id> | ensure <owner id> <teammate id>"
 case "${1:-}" in
   ensure)
-    [[ $# == 2 ]] || die "usage: superbot-userctl ensure <user id>"
-    ensure "$2"
+    if [[ $# == 2 ]]; then
+      valid_id "$2"
+      ensure "$2" "$PREFIX$2" "SuperBot user $2"
+    elif [[ $# == 3 ]]; then
+      valid_id "$2"
+      valid_id "$3"
+      [[ "$2" != "$3" ]] || die "owner and teammate must differ"
+      hash=$(printf '%s:%s' "$2" "$3" | sha256sum | cut -c1-24)
+      ensure "$2-$3" "$TEAMMATE_PREFIX$hash" "SuperBot teammate of a shared Bot's owner"
+    else
+      die "$usage"
+    fi
     ;;
   *)
-    die "usage: superbot-userctl ensure <user id>"
+    die "$usage"
     ;;
 esac
