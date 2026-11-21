@@ -531,7 +531,7 @@ pub async fn send_due(app: &App) -> usize {
             Ok(went) => sent += usize::from(went),
             // Without saving outcomes, sending more could send them again.
             Err(e) => {
-                eprintln!("billing: stopped sending billing emails: couldn't save one's outcome: {e}");
+                crate::obs::log::log_warn!("billing: stopped sending billing emails: couldn't save one's outcome: {e}");
                 break;
             }
         }
@@ -579,7 +579,7 @@ async fn send_one(app: &App, m: &BillingMail, q: &Queued) -> Result<bool, String
             let retry = attempts < MAX_ATTEMPTS;
             let saved = app.db.billing_email_result(q.id, if retry { "pending" } else { "failed" }, Some(&e));
             // SMTP errors can name the recipient: the details go to the audit event only.
-            eprintln!("billing: a billing email failed; see billing.email_failed in the audit log");
+            crate::obs::log::log_warn!("billing: a billing email failed; see billing.email_failed in the audit log");
             d["error"] = json!(e);
             d["retrying"] = json!(retry);
             app.db.record(&by.event("billing.email_failed").target("user", &q.user_id).outcome(Outcome::Failure).details(d));
@@ -637,7 +637,7 @@ pub async fn put_mine(State(app): State<AppState>, Extension(c): Extension<Calle
     let before = app.db.usage_emails(&u.id);
     if before != on {
         app.db.set_usage_emails(&u.id, on).map_err(|e| {
-            eprintln!("botd: couldn't save someone's email settings: {e}");
+            crate::obs::log::log_warn!("botd: couldn't save someone's email settings: {e}");
             ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Couldn't save your email settings; see the server log.".into())
         })?;
         app.db.record(&by.event("billing.email_settings_updated").target("user", &u.id).details(json!({ "usage": { "from": before, "to": on } })));

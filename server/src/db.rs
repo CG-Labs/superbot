@@ -3730,7 +3730,7 @@ impl Db {
     /// True when this queued it.
     pub fn queue_billing_email(&self, e: &crate::billing_mail::NewEmail) -> bool {
         queue_email(&self.c(), e, now()).unwrap_or_else(|err| {
-            eprintln!("botd: couldn't queue a billing email: {err}");
+            crate::obs::log::log_warn!("botd: couldn't queue a billing email: {err}");
             false
         })
     }
@@ -3757,7 +3757,7 @@ impl Db {
             "UPDATE billing_emails SET next_at = ? WHERE event_id = ? AND state = 'pending' AND attempts = 0 AND next_at > ?",
             params![at, event_id, at],
         ) {
-            eprintln!("botd: couldn't release billing emails for {event_id}: {e}");
+            crate::obs::log::log_warn!("botd: couldn't release billing emails for {event_id}: {e}");
         }
     }
 
