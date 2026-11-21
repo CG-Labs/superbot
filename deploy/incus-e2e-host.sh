@@ -9,8 +9,8 @@
 # It writes <out-dir>/incus-e2e.env with the settings the test reads, and botd's
 # certificate and key beside it, owned by the user who ran sudo.
 #
-# INCUS_SOURCE: zabbly (default, the current stable release), zabbly-lts-6.0 (or another
-# Zabbly LTS channel), or ubuntu (the distro's; 24.04's 6.0.0 is too old for botd).
+# INCUS_SOURCE: zabbly (default, the current stable release), zabbly-lts-7.0 (or another
+# Zabbly LTS channel), or ubuntu (the distro's). 6.0 is too old for botd (ADR 0068).
 # POOL_DRIVER: btrfs (default, on a loop file; it enforces disk sizes) or dir.
 set -euo pipefail
 
@@ -57,9 +57,6 @@ install_incus() {
 }
 
 install_incus
-# Incus 6.0's IPv6 filter on a container's NIC needs bridge netfilter; later releases don't.
-modprobe br_netfilter
-echo br_netfilter >/etc/modules-load.d/superbot-incus.conf
 incus admin waitready --timeout=120
 say "Incus $(incus version | sed -n 's/^Server version: //p')"
 
