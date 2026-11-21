@@ -349,7 +349,7 @@ async fn main() {
     adapters::withhold(app.tiers().providers().iter().map(|p| p.key_secret.clone()));
     let saved = |k: &str| secrets::global().get(k).ok().flatten().is_some_and(|v| !v.expose().trim().is_empty());
     for p in app.tiers().providers().iter().filter(|p| !saved(&p.key_secret)) {
-        eprintln!("WARNING: TIERS_FILE provider \"{}\" uses the secret {}, which isn't saved or set in botd's environment. Runs routed to it are refused until it is: botctl secret set {}", p.name, p.key_secret, p.key_secret);
+        eprintln!("WARNING: TIERS_FILE provider \"{}\" has no key: the secret its keySecret names isn't saved or set in botd's environment. Runs routed to it are refused until it is (botctl secret set).", p.name);
     }
     secrets::redact::register(env("LICENSE_KEY", "").trim());
     app.license.set_testing(testing);
