@@ -1,0 +1,58 @@
+name: dependency-audit
+
+# Known vulnerabilities in the locked dependencies (ADR 0092). Runs when a lockfile or
+# this config changes, and weekly, since new advisories arrive without any change here.
+on:
+  push:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/audit.toml'
+      - 'apps/client/package.json'
+      - 'apps/client/package-lock.json'
+      - '.github/workflows/dependency-audit.yml'
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/audit.toml'
+      - 'apps/client/package.json'
+      - 'apps/client/package-lock.json'
+      - '.github/workflows/dependency-audit.yml'
+  schedule:
+    - cron: '41 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Fails on any RustSec vulnerability not ignored, with its reason, in .cargo/audit.toml.
+      # Unmaintained-crate warnings are reported, not fatal.
+      - run: cargo audit
+
+  npm-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: apps/client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Report every advisory in the app's runtime dependencies
+        run: npm audit --package-lock-only --omit=dev || true
+      # Critical only: markdown-it (via react-native-markdown-display, no fixed release) is
+      # High and tracked in the SOC 2 readiness checklist (CC7.1-2) until it's replaced.
+      - name: Fail on critical advisories
+        run: npm audit --package-lock-only --omit=dev --audit-level=critical

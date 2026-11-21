@@ -1,0 +1,10 @@
+# `cargo audit` settings for the dependency-audit workflow (ADR 0092). Every ignored
+# advisory names why it can't reach botd and what lifts it; the SOC 2 readiness
+# checklist (docs/security/soc2-readiness-checklist.md, CC7.1-2) tracks each one.
+[advisories]
+ignore = [
+    # crypto-bigint 0.5 timing variability, via age 0.12 -> p256 -> elliptic-curve.
+    # botd hands age only X25519 recipients and identities (server/src/machines/backup.rs),
+    # so the P-256 code is never called. Lift when age moves to a patched elliptic-curve.
+    "RUSTSEC-2026-0387",
+]
