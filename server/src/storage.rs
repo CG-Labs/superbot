@@ -284,6 +284,14 @@ pub fn measure(f: &Folders) -> Measured {
     Measured { files, data, partial: w.partial, at: crate::db::now() }
 }
 
+pub struct Forget<'a>(&'a Cache, &'a str);
+
+impl Drop for Forget<'_> {
+    fn drop(&mut self) {
+        self.0.forget(self.1);
+    }
+}
+
 /// Recent measurements by user, and the day each user was last warned.
 #[derive(Default)]
 pub struct Cache {
@@ -327,6 +335,12 @@ impl Cache {
         let mut gens = self.generation.lock().unwrap_or_else(|e| e.into_inner());
         *gens.entry(user_id.to_string()).or_default() += 1;
         self.measured.lock().unwrap_or_else(|e| e.into_inner()).remove(user_id);
+    }
+
+    /// Forgets the user when dropped. Declared after a run's slot, it drops first: a Bot
+    /// let in by that slot can't pass on a measurement from before the run.
+    pub fn forget_on_drop<'a>(&'a self, user_id: &'a str) -> Forget<'a> {
+        Forget(self, user_id)
     }
 
     /// True the first time it's asked for this user on the UTC day of `now` (ms). The

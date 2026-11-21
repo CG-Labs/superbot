@@ -740,10 +740,7 @@ impl App {
             let Some(msg) = next else { break };
             let before = self.db.last_id();
             if let Some(bot) = self.db.bot(&bot_id) {
-                let owner = bot.owner_id.clone();
                 self.run_one(bot, &msg).await;
-                // The run may have written files: the next check measures again.
-                self.storage.forget(&owner);
             }
             if self.closing.load(Ordering::SeqCst) {
                 return; // left "running": the next start reports it
@@ -813,6 +810,9 @@ impl App {
         let Some(place) = self.place(&bot, msg, &by, &period.key, bin, for_other.as_deref()).await else { return };
         // Held until the run ends, however it ends: dropping it lets the next run in.
         let Some((_slot, waited)) = self.slot_for(&bot, msg, &by, &period.key, &place).await else { return };
+        // The run may write files: the next check measures again.
+        let owner = bot.owner_id.clone();
+        let _measure_again = self.storage.forget_on_drop(&owner);
         // The owner, a routine's author or the asker may have been turned off meanwhile.
         if waited && let Some((reason, user, text)) = self.refused_after_wait(&bot, msg, &by, for_other.as_deref()) {
             self.give_back(&bot, msg, &period.key);
