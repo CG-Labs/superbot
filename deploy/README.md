@@ -223,7 +223,7 @@ MACHINE_HARNESSES=claude,codex,pi   # pinned versions, checked by hash; name@ver
 MACHINE_AGENT_UPGRADES=manual       # manual (default): only when you ask; auto: every idle agent, once per build
 ```
 
-Until a Bot's harness is installed, its runs are refused with "still being installed". With approvals on, a Codex Bot needs Codex 0.141.0 or newer, here or on its machine: an older one, or one whose version can't be read, is refused before it runs (keep `codex` at its pin, or `codex@<version>` 0.141.0 or newer; on this server, `npm install -g @openai/codex@<version>`) ([ADR 0059](../docs/adr/0059-refusing-guarded-runs-on-old-codex.md)). Agents upgrade themselves to the `superbot-machine` next to `botd`: they download it from botd over the pinned channel, check its SHA-256, swap it in, and restart. If botd can't reach the new agent, the old one is put back. On the server:
+Left unset with a tiers file, machines install the managed tiers' default harnesses (Hermes on the shipped plans); `MACHINE_HARNESSES=none` installs nothing ([ADR 0079](../docs/adr/0079-hermes-default-for-managed-tiers.md)). Until a Bot's harness is installed, its runs are refused with "still being installed". With approvals on, a Codex Bot needs Codex 0.141.0 or newer, here or on its machine: an older one, or one whose version can't be read, is refused before it runs (keep `codex` at its pin, or `codex@<version>` 0.141.0 or newer; on this server, `npm install -g @openai/codex@<version>`) ([ADR 0059](../docs/adr/0059-refusing-guarded-runs-on-old-codex.md)). Agents upgrade themselves to the `superbot-machine` next to `botd`: they download it from botd over the pinned channel, check its SHA-256, swap it in, and restart. If botd can't reach the new agent, the old one is put back. On the server:
 
 ```sh
 botctl machine agent <user>               # its build, harnesses and upgrade, against botd's
@@ -435,6 +435,13 @@ Off unless you set `TIERS_FILE`: without it every user is on one open `self-host
 - Copy [`tiers.example.json`](tiers.example.json) next to `.env`, edit the routes and limits, and set `TIERS_FILE` to its path (and `DEFAULT_TIER` if you like). Restart `botd`; it refuses to start on a bad file.
 - Assign users: `botctl user tier alex@example.com pro`, or `default`. `botctl tiers` lists them with their routes.
 - Hermes routes can use model endpoints the file names under `providers`, with a `fallback` chain per route ([ADR 0077](../docs/adr/0077-two-providers-through-tier-routing.md)). Save each endpoint's key as the secret its `keySecret` names, e.g. `botctl secret set TIER_ANTHROPIC_KEY < key.txt`. Until then, runs routed to it are refused, fallbacks to it are skipped, and botd warns at startup.
+- New Bots on a managed tier get its `defaultHarness` (else its first route's harness): Hermes on every shipped plan. `DEFAULT_HARNESS` applies only on open tiers like `self-host`. botd's startup line says which, and warns if a default isn't installed where the runs happen; a run on a harness that isn't installed here is refused, with how to install it (`deploy/install.sh --with-hermes`, or `hermes` in `SUPERBOT_HARNESSES` for Docker) ([ADR 0079](../docs/adr/0079-hermes-default-for-managed-tiers.md)).
+- Bots made before keep their harness. To move a managed tier's Bots onto its default, list them first, then move them (Bots mid-run are skipped; run it again later). Each move is audited (`bot.updated` with `via: tier_default`, and `tier.bots_moved`), and starts a fresh session:
+
+  ```sh
+  botctl tiers move-bots pro --dry-run
+  botctl tiers move-bots pro                       # or one user: --user alex@example.com
+  ```
 - Upgrading needs no config change. The first start adds the `users.tier` column and the `usage_monthly` table.
 
 Each tier's `limits` ([ADR 0040](../docs/adr/0040-billing-v0-tier-limits.md)) are checked on the server, and a limit left out is unlimited:
