@@ -48,6 +48,10 @@ pub struct Limits {
     /// get, and the only one the control plane gives them (ADR 0040). Unset: any.
     #[serde(default)]
     pub machine_type: Option<String>,
+    /// Bot runs at once on one of this tier's users' machines (ADR 0073); more wait their
+    /// turn. Unset: `MAX_CONCURRENT_RUNS`. Runs on this server share its own cap instead.
+    #[serde(default)]
+    pub concurrent_runs: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -256,6 +260,9 @@ impl Tiers {
                 }
                 limits.machine_type = Some(m);
             }
+            if limits.concurrent_runs == Some(0) {
+                return Err(format!("tier \"{name}\": concurrentRuns must be at least 1 (leave it out for the server's default)"));
+            }
             let mut prices = Vec::new();
             for p in t.stripe_prices {
                 let p = p.trim().to_string();
@@ -352,7 +359,7 @@ pub(crate) const EXAMPLE: &str = r#"{
   "tiers": [
     { "name": "starter", "label": "Starter",
       "routes": [{ "harness": "claude", "model": "claude-haiku-4-5", "effort": "low" }],
-      "limits": { "maxBots": 2, "monthlyRuns": 3, "dailyRoutineRuns": 2, "machineType": "g6-standard-1" },
+      "limits": { "maxBots": 2, "monthlyRuns": 3, "dailyRoutineRuns": 2, "machineType": "g6-standard-1", "concurrentRuns": 3 },
       "stripePrices": ["price_starter_monthly"] },
     { "name": "pro", "label": "Pro",
       "stripePrices": ["price_pro_monthly", "price_pro_yearly"],
@@ -431,6 +438,7 @@ mod tests {
         assert!(bad(&one(r#"{"name":"a","routes":"any","limits":{"maxBot":1}}"#)).contains("unknown field"));
         assert!(bad(&format!(r#"{{"default":"gold","tiers":[{}]}}"#, r#"{"name":"a","routes":"any"}"#)).contains("\"gold\" isn't listed"));
         assert!(bad(&one(r#"{"name":"a","routes":"any","limits":{"machineType":"G6 Standard"}}"#)).contains("machineType"));
+        assert!(bad(&one(r#"{"name":"a","routes":"any","limits":{"concurrentRuns":0}}"#)).contains("concurrentRuns must be at least 1"));
         assert!(bad(&one(r#"{"name":"a","routes":"any","stripePrices":["prod_123"]}"#)).contains("isn't a Stripe price id"));
         assert!(bad(&one(r#"{"name":"a","routes":"any","stripePrices":["price_1","price_1"]}"#)).contains("twice"));
         assert!(bad(r#"{"tiers":[{"name":"a","routes":"any","stripePrices":["price_1"]},{"name":"b","routes":"any","stripePrices":["price_1"]}]}"#).contains("twice"));
@@ -454,6 +462,18 @@ mod tests {
         let open = Tiers::self_host();
         let l = &open.default_tier().limits;
         assert_eq!((l.daily_routine_runs, l.machine_type.as_deref(), open.by_stripe_price("price_x").is_none()), (None, None, true));
+        assert_eq!(l.concurrent_runs, None);
+    }
+
+    #[test]
+    fn concurrent_runs_per_tier_follow_the_footprint() {
+        assert_eq!(tiers().get("starter").unwrap().limits.concurrent_runs, Some(3));
+        assert_eq!(tiers().get("pro").unwrap().limits.concurrent_runs, None);
+        assert_eq!(tiers().get("starter").unwrap().view()["limits"]["concurrentRuns"], 3);
+        // The shipped plans: Hermes Agent's measured fit (ADR 0070), less one run's room.
+        let shipped = Tiers::parse(include_str!("../../deploy/tiers.example.json"), None).unwrap();
+        let cap = |n: &str| shipped.get(n).unwrap().limits.concurrent_runs;
+        assert_eq!((cap("starter"), cap("pro"), cap("max"), cap("self-host")), (Some(3), Some(8), Some(16), None));
     }
 
     #[test]

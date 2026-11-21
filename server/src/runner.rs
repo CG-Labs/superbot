@@ -14,13 +14,14 @@ use crate::{isolation, paths, usage};
 use crate::approvals::RunGrant;
 use crate::policy::{Ctx, Mode, RunScope};
 use crate::screen::{self, Screens};
+use crate::slots::{self, Slot, Slots, Turn};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, oneshot, watch};
+use tokio::sync::{broadcast, oneshot, watch, Notify};
 
 /// How long after a guarded run's first shell tool the approval hook must have
 /// called in. If it hasn't, the harness ignored the hook and the run is stopped.
@@ -137,9 +138,11 @@ struct BotState {
     queue: VecDeque<Message>,
     draining: bool,
     run: Option<Run>,
-    /// Stopped while the message it took was still starting (being placed, or its
-    /// harness checked), before it had a `run` to abort.
+    /// Stopped while the message it took was still starting (being placed, waiting for
+    /// a slot, or its harness checked), before it had a `run` to abort.
     stopped: bool,
+    /// Wakes its run while it waits for a slot (ADR 0073), to see `stopped`.
+    wake: Option<Arc<Notify>>,
 }
 
 pub struct App {
@@ -165,6 +168,11 @@ pub struct App {
     pub isolation: OnceLock<Arc<Isolation>>,
     /// Runs on each user's machine now, by user.
     on_machines: Mutex<HashMap<String, u32>>,
+    /// Runs at once on each computer, and the runs waiting their turn (ADR 0073).
+    pub slots: Arc<Slots>,
+    /// MAX_CONCURRENT_RUNS: runs at once on this server, and on a machine whose owner's
+    /// tier sets none. None: no cap. Unset: `slots::DEFAULT_CAP`.
+    pub run_cap: OnceLock<Option<u32>>,
     /// SHARED_BOTS (ADR 0046). Unset: isolated when MACHINE_ROUTING isn't off.
     pub shared_bots: OnceLock<SharedBots>,
     /// With isolated shared Bots: whom each Bot's latest run is for, by Bot. Kept after
@@ -204,6 +212,8 @@ impl App {
             tiers: OnceLock::new(),
             isolation: OnceLock::new(),
             on_machines: Mutex::default(),
+            slots: Arc::default(),
+            run_cap: OnceLock::new(),
             shared_bots: OnceLock::new(),
             askers: Mutex::default(),
             resume_routines_on_enable: OnceLock::new(),
@@ -395,6 +405,10 @@ impl App {
             let owner = [b.owner_id.as_str()];
             v["status"] = json!(crate::secrets::redact::text_for(&owner, &run.status));
             v["draft"] = json!(crate::secrets::redact::text_for(&owner, &run.draft));
+        } else if let Some((pool, turn)) = self.slots.waiting(&b.id) {
+            v["working"] = json!(true);
+            v["status"] = json!(waiting_status(&pool, turn));
+            v["queued"] = queue_view(&pool, turn);
         }
         v
     }
@@ -737,6 +751,8 @@ impl App {
         let Some((tier, route)) = self.tier_route(&bot, msg, &by, &period) else { return };
         let placed_at = self.db.placed_at(&bot.owner_id);
         let Some(place) = self.place(&bot, msg, &by, &period.key, bin, for_other.as_deref()).await else { return };
+        // Held until the run ends, however it ends: dropping it lets the next run in.
+        let Some(_slot) = self.slot_for(&bot, msg, &by, &period.key, &place).await else { return };
         // A teammate's run here gets an account of its own (ADR 0064), never the owner's.
         let teammate = for_other.as_deref().filter(|_| matches!(place, Place::Here) && self.teammate_accounts());
         let run_space = Space::of(&bot.owner_id, teammate);
@@ -1047,6 +1063,83 @@ impl App {
                 _ => {}
             }
             return;
+        }
+    }
+
+    /// This server's cap on runs at once (ADR 0073). None: no cap.
+    pub fn server_cap(&self) -> Option<u32> {
+        self.run_cap.get().copied().unwrap_or(Some(slots::DEFAULT_CAP))
+    }
+
+    /// The cap on runs at once on `owner_id`'s machine: their tier's, else the server's.
+    pub fn machine_cap(&self, owner_id: &str) -> Option<u32> {
+        self.tier_of(owner_id).limits.concurrent_runs.or_else(|| self.server_cap())
+    }
+
+    /// A slot on the computer the run happens on (ADR 0073): at once, or once the runs
+    /// ahead of it there are done. Waiting is shown on the Bot and audited. None: it was
+    /// stopped or botd shut down while it waited; the run is given back.
+    async fn slot_for(&self, bot: &Bot, msg: &Message, by: &Who, period: &str, place: &Place) -> Option<Slot> {
+        let (pool, cap, machine) = match place {
+            Place::Here => (slots::SERVER.to_string(), self.server_cap(), None),
+            Place::There(t) => (t.0.machine_id.clone(), self.machine_cap(&bot.owner_id), Some(t.0.machine_id.clone())),
+        };
+        // A Bot asked by another that waits for it in this pool would wait on its asker's slot.
+        let lend = msg.role == "peer" && msg.from_bot.as_deref().is_some_and(|asker| self.slots.holds(&pool, asker));
+        let mut queued = match self.slots.take(&pool, cap, &bot.id, lend) {
+            Ok(slot) => return Some(slot),
+            Err(q) => q,
+        };
+        let wake = Arc::new(Notify::new());
+        self.state().entry(bot.id.clone()).or_default().wake = Some(wake.clone());
+        let host = if machine.is_some() { "machine" } else { "server" };
+        let since = Instant::now();
+        let mut queued_at = json!({ "host": host, "machine": machine, "trigger": msg.role, "messageId": msg.id, "owner": bot.owner_id });
+        merge(&mut queued_at, &queue_view(&pool, queued.turn()));
+        self.db.record(&by.event("bot.run_queued").target("message", &msg.id.to_string()).bot(&bot.id).details(queued_at));
+        let result = loop {
+            {
+                let mut st = self.state();
+                let s = st.entry(bot.id.clone()).or_default();
+                if self.closing.load(Ordering::SeqCst) {
+                    break "shutdown";
+                }
+                if std::mem::take(&mut s.stopped) {
+                    break "stopped";
+                }
+            }
+            let turn = queued.turn();
+            if turn == Turn::Go {
+                break "started";
+            }
+            self.send(json!({ "type": "status", "botId": bot.id, "working": true, "status": waiting_status(&pool, turn), "queued": queue_view(&pool, turn) }));
+            tokio::select! {
+                _ = queued.changed() => {}
+                _ = wake.notified() => {}
+            }
+        };
+        if let Some(s) = self.state().get_mut(&bot.id) {
+            s.wake = None;
+        }
+        let waited = json!({
+            "result": result, "waitedMs": since.elapsed().as_millis() as u64, "host": host, "machine": machine,
+            "trigger": msg.role, "messageId": msg.id, "owner": bot.owner_id,
+        });
+        let outcome = if result == "started" { Outcome::Success } else { Outcome::Failure };
+        self.db.record(&by.event("bot.run_dequeued").target("message", &msg.id.to_string()).bot(&bot.id).outcome(outcome).details(waited));
+        match result {
+            "started" => queued.slot(),
+            "stopped" => {
+                drop(queued);
+                self.give_back(bot, msg, period);
+                self.say(&bot.id, "Stopped.", true);
+                None
+            }
+            // Still queued in the database, so it runs after the restart, and counts then.
+            _ => {
+                self.db.give_back_run(&bot.owner_id, period);
+                None
+            }
         }
     }
 
@@ -1758,7 +1851,12 @@ impl App {
                     Some(r) => {
                         r.abort.send_if_modified(|v| v.get_or_insert("stopped") == &"stopped");
                     }
-                    None => s.stopped = true,
+                    None => {
+                        s.stopped = true;
+                        if let Some(w) = &s.wake {
+                            w.notify_one();
+                        }
+                    }
                 }
             }
         }
@@ -1801,6 +1899,9 @@ impl App {
         for s in self.state().values() {
             if let Some(r) = &s.run {
                 r.abort.send_if_modified(|v| v.get_or_insert("shutdown") == &"shutdown");
+            }
+            if let Some(w) = &s.wake {
+                w.notify_one();
             }
         }
     }
@@ -1945,6 +2046,28 @@ fn guard(botctl: &Path, harness: &str, timeout_minutes: u32) -> Guard {
     Guard { command: format!("{} hook {harness}", shell_quote(&botctl)), timeout_secs: wait.as_secs() + 60, wait }
 }
 
+/// What a run waiting for a slot shows (ADR 0073).
+fn queue_view(pool: &str, turn: Turn) -> Value {
+    let host = if pool == slots::SERVER { "server" } else { "machine" };
+    match turn {
+        Turn::Waiting { position, running, limit } => {
+            json!({ "reason": "at_capacity", "host": host, "position": position, "running": running, "limit": limit })
+        }
+        Turn::Go => json!({ "reason": "starting", "host": host }),
+    }
+}
+
+/// The Bot's status line while it waits for a slot.
+fn waiting_status(pool: &str, turn: Turn) -> String {
+    let place = if pool == slots::SERVER { "this server" } else { "its computer" };
+    let Turn::Waiting { position, limit, .. } = turn else { return "Starting".into() };
+    let at_once = format!("{place} runs {limit} task{} at once", if limit == 1 { "" } else { "s" });
+    match position {
+        1 => format!("Queued, next in line: {at_once}"),
+        n => format!("Queued, #{n} in line: {at_once}"),
+    }
+}
+
 /// Adds `extra`'s fields to the object `v`.
 fn merge(v: &mut Value, extra: &Value) {
     if let (Some(v), Some(x)) = (v.as_object_mut(), extra.as_object()) {
@@ -1981,7 +2104,13 @@ impl App {
 
 #[cfg(test)]
 pub fn test_app() -> Arc<App> {
-    let dir = crate::db::temp_path("app");
+    test_app_in(crate::db::temp_path("app"))
+}
+
+/// `test_app` on the database and folders in `dir`: a second one on the same `dir`
+/// is the server after a restart.
+#[cfg(test)]
+pub fn test_app_in(dir: PathBuf) -> Arc<App> {
     let db = Db::open(&dir.join("app.sqlite")).unwrap();
     let workspace = dir.join("ws");
     std::fs::create_dir_all(&workspace).unwrap();
