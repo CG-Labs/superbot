@@ -1361,7 +1361,19 @@ fn migrate_account_removals(c: &Connection, _fresh: bool) -> rusqlite::Result<()
           made_at INTEGER NOT NULL,
           PRIMARY KEY (owner_id, user_id)
         );",
-    )
+    )?;
+    // Pairs made before this table, whose accounts a recreated container may have lost
+    // while keeping their folders: the audit log is the only record of them. Once only,
+    // so a pair removed since is never found again.
+    c.execute(
+        "INSERT OR IGNORE INTO teammate_spaces (owner_id, user_id, made_at)
+         SELECT target_id, json_extract(details, '$.forUser'), MIN(at) FROM audit_events
+         WHERE action = 'isolation.account_created' AND target_type = 'user' AND outcome = 'success'
+           AND target_id IS NOT NULL AND json_extract(details, '$.forUser') IS NOT NULL
+         GROUP BY 1, 2",
+        [],
+    )?;
+    Ok(())
 }
 
 /// One teammate's account for one owner's Bots on this server, being removed (ADR 0066).
@@ -4533,6 +4545,19 @@ mod tests {
 
     fn all_events(db: &Db) -> Vec<AuditEvent> {
         db.audit_events(&audit::Filter::default(), 1000, false)
+    }
+
+    #[test]
+    fn teammate_accounts_made_before_their_table_are_remembered_from_the_audit_log() {
+        let db = Db::open(&temp_path("spaces").join("app.sqlite")).unwrap();
+        let made = |owner: &str, d: Value| audit::Who::system("isolation").event("isolation.account_created").target("user", owner).details(d);
+        db.record(&made("u1", json!({ "account": "sb-t-1", "forUser": "u2" })));
+        db.record(&made("u1", json!({ "account": "sb-t-1", "forUser": "u2" })));
+        db.record(&made("u1", json!({ "account": "sb-u-u1" })));
+        db.record(&made("u3", json!({ "account": "sb-t-2", "forUser": "u4" })).outcome(audit::Outcome::Failure));
+        db.c().execute("DELETE FROM teammate_spaces", []).unwrap();
+        migrate_account_removals(&db.c(), false).unwrap();
+        assert_eq!(db.teammate_spaces(), [("u1".to_string(), "u2".to_string())]);
     }
 
     #[test]
