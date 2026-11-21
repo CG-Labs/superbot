@@ -281,6 +281,16 @@ Each run's model tokens are recorded for its Bot's **owner**, the same person it
 - **See it**: `GET /api/me/usage` and `botctl usage me` (yours), the client's Plan screen (offered with or without billing); a Bot you no longer own shows no name; `GET /api/users/{key}/usage` and `botctl usage user <user>` (admins); `GET /api/usage` and `botctl usage` add tokens per user.
 - **Stripe meter** (off by default): set `STRIPE_METER_EVENT` to a Stripe meter's event name, with `STRIPE_SECRET_KEY`, and botd sends each run's tokens (for a user with a Stripe customer) as a meter event every minute, at most once each. A meter event Stripe refuses, or that can't reach it after five tries, is marked failed and audited as `billing.meter_failed`.
 
+### Billing emails
+
+While billing is on and botd has an SMTP server ([ADR 0061](adr/0061-approval-notifications.md)), the person a plan is for gets plain-text emails ([ADR 0089](adr/0089-billing-emails.md)). `BILLING_EMAILS=off` stops them; without billing or SMTP nothing is queued or sent.
+
+- **Plan and payment** (always sent): Stripe started, changed, set to end, or ended their plan (with what their computer is doing about it); a payment failed (update the card with **Manage billing**); a Stripe plan change's resize waits on their files or failed.
+- **Usage** (on by default, off from the Plan screen or `PUT /api/me/emails`): tokens at 80% and 100% of `monthlyTokens`, storage at ADR 0082's warning and full. Once per billing period and tier.
+- **Once**: each email has a key (the Stripe event, the subscription's end date, the period, or the resize request). A Stripe event's emails are queued in the transaction that records the event, so redeliveries send nothing.
+- **Content**: the plan's label, dates, counts, and a link to `{PUBLIC_URL}/app/plan`. Never Stripe ids, prices, portal links, provider details or secrets.
+- **Sending**: one message each, retried after 1, 4, 16 and 64 minutes, then given up. Audited as `billing.email_sent`, `billing.email_skipped` (`no_user`, `no_address`, `opted_out`, `inactive`) and `billing.email_failed`.
+
 ### One Unix account per user
 
 With `ISOLATION=users`, each user's Bots run as that user's own Unix account, `sb-u-<user id>`, so one user's Bots can't read or write another's folder or harness logins, or botd's `DATA_DIR`, database, `.env`, and master key. **On for new installs** (`deploy/install.sh` and Docker Compose); an install from before keeps it off (unset or `off`), and botd's startup log says how to opt in: `deploy/install.sh --isolation`, or `ISOLATION=users` in Docker Compose's `.env`. Design: [ADR 0037](adr/0037-per-user-unix-accounts.md), [ADR 0058](adr/0058-harness-os-user-by-default.md).
@@ -358,6 +368,7 @@ All JSON. Auth: a session cookie (sign-in page and console) or `Authorization: B
 - `GET /api/harnesses/:name/models`: models and reasoning efforts the harness offers (Claude Code: aliases; Codex: `codex debug models`; Pi: `pi --list-models`; Hermes Agent: one entry with an empty `id`, meaning any model name, with its efforts). 403 for non-admins on a managed tier; `?tier=<name>` (admins): only that tier's models
 - `GET /api/me/tier` → `{name, label, managed, limits: {maxBots, monthlyRuns, monthlyTokens}, usage: {period, runs, bots, tokens, periodStart, periodEnd, periodSource}}`: your plan, no model names. People only ([ADR 0033](adr/0033-tiers-model-routing.md))
 - `GET /api/me/usage` → `{user, tier, period: {key, start, end, source}, tokens: {input, output, cacheRead, cacheWrite, total, runs, unreportedRuns, limit}, runs: {used, limit}, byBot: [...], byModel?: [...]}`: your own usage this billing period. People only; `byModel` only for admins or on a tier that lets you pick models. `GET /api/users/{key}/usage`: the same for anyone, admins only ([ADR 0050](adr/0050-billing-period-token-usage.md))
+- `GET /api/me/emails` → `{on, usage}`: whether this server sends billing emails, and whether you get the usage ones. `PUT` `{usage}` (write access; audited as `billing.email_settings_updated`). People only ([ADR 0089](adr/0089-billing-emails.md))
 - `GET /api/tiers` → `{default, source, tiers: [{name, label, managed, limits, defaultHarness, routes: "any" | [{harness, provider?, model, effort?}]}]}`: admins only
 - `GET /api/setup` → `{progress: {step, dismissed, completedAt, completedBy, show}, steps, domain, signIn, tiers, approvals, checklist: [{id, label, done, detail}], done, total}`: the onboarding wizard's report, with commands and `.env` lines for what botd reads at startup; never secret values or models. `PATCH /api/setup` `{step?: domain|signin|tiers|finish, dismissed?, completed?}`; finishing, reopening, hiding, and showing again are audited as `setup.*`. Admins only ([ADR 0034](adr/0034-onboarding-wizard.md))
 - `GET|POST /api/bots/:id/messages` `{text, answer?: {messageId, option}}`
@@ -431,6 +442,6 @@ Approvals, policy, and audit. Writes, decisions, the approvals list, and the aud
 
 ## Not built yet
 
-Sign-up emails, self-serve SSO linking, and sign-up retention ([ADR 0022](adr/0022-landing-and-signups.md)). SCIM groups, group-to-role mapping, and bulk ([ADR 0023](adr/0023-scim.md)). Enrollment and mTLS with per-user machines, moving a user's Bots onto theirs, and `botctl machine` commands ([ADR 0025](adr/0025-control-plane-linode.md)). Storage limits, resizing a user's machine when their tier changes, and billing emails ([#31](https://github.com/CG-Labs/superbot/issues/31)). Vault/Key Vault/Secret Manager stores and master-key rotation (the `SecretStore` trait is ready for them), per-Bot resource limits, Slack. Approvals follow-ups are in [approvals-followups.md](approvals-followups.md).
+Sign-up emails, self-serve SSO linking, and sign-up retention ([ADR 0022](adr/0022-landing-and-signups.md)). SCIM groups, group-to-role mapping, and bulk ([ADR 0023](adr/0023-scim.md)). Enrollment and mTLS with per-user machines, moving a user's Bots onto theirs, and `botctl machine` commands ([ADR 0025](adr/0025-control-plane-linode.md)). Yearly prices at checkout ([#31](https://github.com/CG-Labs/superbot/issues/31)). Vault/Key Vault/Secret Manager stores and master-key rotation (the `SecretStore` trait is ready for them), per-Bot resource limits, Slack. Approvals follow-ups are in [approvals-followups.md](approvals-followups.md).
 
 Computer use (each Bot's screen, browser, and live view) is in [computer.md](computer.md).
