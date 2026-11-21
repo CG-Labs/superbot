@@ -14,7 +14,7 @@ Email and webhooks (ADR 0061) reach people about pending approvals when no app i
 
 - `PUSH_PROVIDER=expo` in botd's environment turns push on. Unset (or `off`), the server sends nothing, `/api/me/push` answers that push is off, and the app says so. Any other value stops botd at start.
 - The provider is **[Expo push](https://docs.expo.dev/push-notifications/sending-notifications/)**: one HTTPS endpoint for both platforms, free, and no Apple or Google keys on the server. botd posts at most 100 messages a request and keeps only Expo's error codes, since its messages quote the token.
-- `EXPO_ACCESS_TOKEN` is optional: set it (in `.env` or with `botctl secret set`) only if the Expo project turns on "enhanced push security". No Bot gets it.
+- `EXPO_ACCESS_TOKEN` is optional: set it (in `.env` or with `botctl secret set`) only if the Expo project turns on "enhanced push security". It is a server-only secret: no Bot or run gets it, and no one can save it as a personal secret.
 - Providers sit behind one `Provider` trait (`server/src/notify/push.rs`). Direct APNs or FCM would be another one later.
 
 ### One phone per session
@@ -30,12 +30,13 @@ Email and webhooks (ADR 0061) reach people about pending approvals when no app i
 - **Routines:** when a routine's run finishes, the person it ran for hears of it: the routine's author, else the Bot's owner. Only runs that actually started count, since refusals already say why in chat. Access is checked again at send time. Several finishes of one Bot within 10 minutes go as one push ("Ledger finished 3 scheduled routines.").
 - **Nothing sensitive:** a push says only "Approval needed / *Bot* is waiting for your approval." or "Routine finished / *Bot* finished a scheduled routine." No command, tool, reason, routine name or output. Its data carries only ids and the in-app path (`/home?approval=<id>` or `/home?bot=<id>`). The app fetches the rest after sign-in and App lock.
 - **Limits:** at most 30 pushes per person per hour, across both kinds. Each person can turn either kind off on their phone.
-- **Audit:** `push.registered` (with `moved`), `push.updated`, `push.unregistered` (`reason`: `user` or `provider_gone`), and each send as `notification.sent` / `notification.failed` with `channel: push`. Tokens never appear. A token Expo says is gone (`DeviceNotRegistered`) is deleted.
+- **Audit:** `push.registered` (with `moved`), `push.updated`, `push.unregistered` (`reason`: `user` or `provider_gone`), and each send as `notification.sent` / `notification.failed` with `channel: push`. Tokens never appear. A token Expo says is gone (`DeviceNotRegistered`) is deleted, but only if the device still has that token: a phone that registered a new one while the answer was on its way keeps it.
 
 ### In the app
 
 - A **Push notifications** card in Settings. Off by default. Turning it on asks the phone for permission (Android gets its `default` channel first, as Android 13+ requires), gets the Expo push token for the build's EAS project, and registers it. Two switches choose approvals and routines.
 - **Tapping a push** opens the inbox on the approval, or the Bot's chat. Only those two places, built from the ids; the payload's URL is never followed, and pushes that aren't SuperBot's are ignored. A tap that opens the app works too. Sign-in keeps the link (as ADR 0061 did for `?approval=`), and App lock still comes first.
+- If an operator turns push off, saved phones stay (and get pushes again if it comes back on). The card says so and still lets each person remove theirs; only adding is refused.
 - **Web and the desktop app** get no push: the card says to use the phone app, and `src/pushDevice.web.ts` never loads the native module. Web Push is left for later.
 
 ## What an operator adds

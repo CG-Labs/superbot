@@ -85,11 +85,14 @@ export function PushCard({ api, device = pushDevice }: Props) {
 
   const unavailable = pushUnavailable(view, supported);
   const body = () => {
-    if (unavailable) return <Text style={styles.dim}>{unavailable}</Text>;
+    if (!supported) return <Text style={styles.dim}>{unavailable}</Text>;
     if (!view) return error ? null : <ActivityIndicator color={colors.textDim} />;
     const d = view.device;
+    // With push paused on the server, a saved phone can still be removed, not added.
+    if (!view.available && !d) return <Text style={styles.dim}>{unavailable}</Text>;
     return (
       <>
+        {unavailable ? <Text style={styles.dim}>{`${unavailable} This phone is still saved, and would get them again if it's turned back on.`}</Text> : null}
         <View style={styles.field} accessibilityLabel="Push notifications on or off">
           <Text style={styles.label}>On this phone</Text>
           <Chips
@@ -102,19 +105,29 @@ export function PushCard({ api, device = pushDevice }: Props) {
             disabled={busy}
           />
         </View>
-        {d ? (
+        {d && view.available ? (
           <>
             <View style={styles.field} accessibilityLabel="Approvals">
               <Text style={styles.label}>An approval is waiting for you</Text>
-              <Chips options={ON_OFF} value={d.approvals ? "on" : "off"} onChange={(v) => {
+              <Chips
+                options={ON_OFF}
+                value={d.approvals ? "on" : "off"}
+                onChange={(v) => {
                   if ((v === "on") !== d.approvals) void kind("approvals", v === "on");
-                }} disabled={busy} />
+                }}
+                disabled={busy}
+              />
             </View>
             <View style={styles.field} accessibilityLabel="Routines">
               <Text style={styles.label}>A routine you set up finished</Text>
-              <Chips options={ON_OFF} value={d.routines ? "on" : "off"} onChange={(v) => {
+              <Chips
+                options={ON_OFF}
+                value={d.routines ? "on" : "off"}
+                onChange={(v) => {
                   if ((v === "on") !== d.routines) void kind("routines", v === "on");
-                }} disabled={busy} />
+                }}
+                disabled={busy}
+              />
             </View>
           </>
         ) : null}

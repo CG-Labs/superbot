@@ -109,3 +109,15 @@ it("shows the server's reason, like a session that can't have a phone", async ()
   await render(<PushCard api={api} device={fakeDevice()} />);
   expect(await screen.findByText(/need a signed-in session/)).toBeTruthy();
 });
+
+it("still lets you remove a saved phone while the server has push paused", async () => {
+  const user = userEvent.setup();
+  const api = fakeApi({ available: false, provider: null, device: { id: "pd1", platform: "ios", approvals: true, routines: true, createdAt: 1, updatedAt: 2 } });
+  await render(<PushCard api={api} device={fakeDevice()} />);
+  expect(await screen.findByText(/still saved/)).toBeTruthy();
+  expect(screen.queryByLabelText("Approvals")).toBeNull();
+  await user.press(chip("Push notifications on or off", "Off"));
+  expect(await screen.findByText("Push notifications are off for this phone.")).toBeTruthy();
+  expect(api.unregisterPush).toHaveBeenCalledTimes(1);
+  expect(screen.queryByLabelText("Push notifications on or off")).toBeNull();
+});
