@@ -102,6 +102,33 @@ botctl machine show <user>        # state running, enrollment enrolled, agentSee
 
 Once it has enrolled, the next reconcile removes its enrollment user data from the container's config ([ADR 0067](../adr/0067-clearing-enrollment-data-from-containers.md)). It does this in place, without restarting the container, and turns on daily snapshots only after that. `incus config show <name> --project superbot` should then show no `cloud-init.user-data`, and the audit log has `machine.user_data_cleared`. If the container misses its enrollment deadline while running, the user data is removed too. A `machine.user_data_clear_failed` event says why it couldn't be removed, and the next pass tries again.
 
+## 7. Off-host backups (optional)
+
+Snapshots stay on the host's pool. To survive losing the host, botd can export each container to S3-compatible storage (AWS S3, R2, B2, MinIO, or the customer's own bucket) and restore it from there ([ADR 0070](../adr/0070-off-host-machine-backups.md)). It's off unless the bucket is set. In botd's `.env`:
+
+```bash
+MACHINE_BACKUP_S3_BUCKET=<bucket>
+MACHINE_BACKUP_S3_ENDPOINT=https://<s3-endpoint>
+MACHINE_BACKUP_S3_ACCESS_KEY_ID_FILE=/etc/superbot/backup-s3-key-id
+MACHINE_BACKUP_S3_SECRET_ACCESS_KEY_FILE=/etc/superbot/backup-s3-secret
+MACHINE_BACKUP_AGE_RECIPIENTS=age1...      # recommended; keep the identity off this server
+MACHINE_BACKUP_RETENTION=7,pro=30          # days; the bare number is every other tier's
+```
+
+Optional: `MACHINE_BACKUP_S3_REGION` (`us-east-1`), `MACHINE_BACKUP_S3_PREFIX` (`superbot/`), `MACHINE_BACKUP_INTERVAL_HOURS` (24). Give the key only `PutObject`, `GetObject`, `DeleteObject`, `ListBucket` and the multipart actions on that bucket or prefix.
+
+Each running container whose agent has enrolled, and whose config holds no enrollment token, is exported without its snapshots, encrypted if recipients are set, and streamed to `<prefix>machines/<machine-id>/<backup-id>.incus[.age]` with a JSON manifest beside it. Backups older than their tier's retention are deleted, but never a live machine's newest.
+
+```bash
+botctl machine backups                   # settings and every backup
+botctl machine backups <user>            # theirs, and their last restore
+botctl machine backup <user>             # one now
+botctl machine restore <user> <backup-id> --identity age-identity.txt --yes
+botctl machine restore <user> status
+```
+
+A restore replaces the machine with the backup. Everything on it since the backup is lost. botd imports the backup beside the container and gives it today's size, security settings and firewall. It removes the agent's old identity, writes a fresh one-time enrollment token as a root-only file, swaps the copy into place and starts it. The machine's old certificates and tokens are revoked. Bots on it are refused (`machine_restoring`) until its agent enrolls again, normally within a minute of starting. A wrong key or a damaged object fails before anything changes. The audit log has `machine.backup_created`, `machine.backup_failed`, `machine.backup_deleted`, `machine.restore_requested`, `machine.restored` and `machine.restore_failed`.
+
 ## Testing against a real host
 
 An end-to-end test runs botd's Incus provider against a real Incus host ([ADR 0069](../adr/0069-validating-incus-containers-on-a-real-host.md)). The `incus-e2e` CI job runs it on GitHub's runners. To run it yourself, use a throwaway Ubuntu 24.04 VM, because the script reconfigures Incus on the host it runs on:
@@ -114,12 +141,13 @@ cargo test --bin botd -- --ignored --exact --nocapture \
   machines_incus_e2e_tests::real_incus_containers_enroll_stay_apart_and_follow_the_lifecycle
 ```
 
-The test makes and destroys two containers. It checks enrollment, that the token is gone, sizing, isolation between them and from the host, suspend, resume, resize, the reconciler, rebuild and destroy. It cleans up containers and ACLs left by an earlier run. It needs nftables' bridge family. The script makes a btrfs pool; with `POOL_DRIVER=dir` the test still runs and expects the preflight warning about disk sizes.
+The test makes and destroys two containers. It checks enrollment, that the token is gone, sizing, isolation between them and from the host, suspend, resume, resize, the reconciler, rebuild and destroy. With `SUPERBOT_INCUS_E2E_S3_ENDPOINT` and the `MACHINE_BACKUP_S3_*` keys pointing at a scratch store (CI runs MinIO on loopback), it also backs a container up, encrypted, and restores it. It cleans up containers and ACLs left by an earlier run. It needs nftables' bridge family. The script makes a btrfs pool; with `POOL_DRIVER=dir` the test still runs and expects the preflight warning about disk sizes.
 
 ## Limits to know
 
 - Containers share the host's kernel. A kernel escape crosses every boundary. Use VMs for tiers that need their own kernel.
 - Containers can't reach each other at all, ping included. They can ping the gateway. The host itself reaches only their agent port.
-- Snapshots (daily, kept 7 days) stay on the same pool. They don't protect against losing the host.
+- Snapshots (daily, kept 7 days) stay on the same pool. They don't protect against losing the host; off-host backups (step 7) do.
+- A backup restores only to the same machine. Exports are full each time, so storage grows with disk size times retention.
 - A container's config holds its live enrollment token from its create (or rebuild) until it enrolls or misses its deadline. Anyone who can read the Incus project can read it during that window. A container that never starts keeps it in its config, but the token expires an hour after it was issued.
 - Switching `MACHINE_PROVIDER` leaves machines made by the other provider as they are. botd reaches their agents but won't change them until you switch back.

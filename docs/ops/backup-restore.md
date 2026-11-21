@@ -171,8 +171,19 @@ sudo SUPERBOT_DRILL_THROWAWAY=1 deploy/backup-drill.sh target/release
 
 Don't run a restored copy next to the live server to "test" it: botd would run the same routines and could act twice.
 
+## Per-user machines (managed hosting)
+
+This guide covers botd's own data. Users' machines ([ADR 0025](../adr/0025-control-plane-linode.md)) are backed up separately:
+
+- **Incus containers**: off-host backups to S3-compatible storage, age-encrypted, kept per tier, with an admin restore that makes the machine enroll anew ([ADR 0070](../adr/0070-off-host-machine-backups.md), [setup](incus-containers.md#7-off-host-backups-optional)). Off unless `MACHINE_BACKUP_S3_BUCKET` is set. RPO is `MACHINE_BACKUP_INTERVAL_HOURS` (24 by default). A restore takes about the import time plus a minute to enroll.
+- **Linode VMs**: Linode's own backups (`MACHINE_BACKUPS=on`, the default), restored from Linode's console.
+
+Keep the age identity for machine backups off botd's host too, like the one for server archives. Without it, encrypted machine backups can't be restored.
+
+A restored botd database still knows every backup's object key, so after a server restore, `botctl machine backups` lists them and machine restores work as before. Each object has a JSON manifest beside it, so the bucket can still be read without the database.
+
 ## Not covered yet
 
-- **Managed hosting** (one machine per user, [ADR 0025](../adr/0025-control-plane-linode.md)): provider backups are on by default (`MACHINE_BACKUPS=on`); per-user archives to customer S3 and a contractual RPO and RTO are follow-ups on [#40](https://github.com/CG-Labs/superbot/issues/40).
+- **Managed hosting**: a contractual RPO and RTO for machines, and exporting Linode machines to customer storage, are follow-ups on [#40](https://github.com/CG-Labs/superbot/issues/40).
 - The workspace and harness logins: copy the volumes or folders yourself if you need them ([Compose example](../../deploy/README.md#backup-and-restore)).
 - Point-in-time recovery between archives (SQLite WAL shipping, e.g. Litestream) would take the RPO under an hour; not planned for M3.
