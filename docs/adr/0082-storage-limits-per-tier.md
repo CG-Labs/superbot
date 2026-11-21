@@ -20,7 +20,7 @@ Managed tiers already cap Bots, runs, routine runs, tokens and machine size. Not
 - **The user's files:** their workspace folder, `WORKSPACE_DIR/users/<id>`, or their isolation folder under `ISOLATION=users` ([ADR 0029](0029-per-user-isolation.md)).
 - **botd's data for them:** `DATA_DIR/users/<id>` and the data folder of each Bot they own (harness sessions, logs, screens).
 - **Not counted:** chat history (people can't delete messages, only Bots, so counting it would leave no way back under the cap); teammates' shared spaces; the database itself.
-- The walk never follows links (a link counts as itself), counts each file once across both folders (hard links and overlapping roots included), and stops after 500,000 entries.
+- The walk never follows links (a link counts as itself), counts each file once across both folders (hard links and overlapping roots included), and stops after 500,000 entries. Bots can change their folders during a walk, so each folder is opened from its already-open parent, one name at a time, refusing links (`openat` with `O_NOFOLLOW`): a folder swapped for a link after it was listed can't lead botd's wider access outside.
 - A folder botd can't read (for example another OS user's under isolation), or a walk that hit the entry cap, marks the number **partial**: a lower bound, shown as "at least". Enforcement uses it as is.
 
 ### Machines: a known gap
@@ -29,14 +29,14 @@ Managed tiers already cap Bots, runs, routine runs, tokens and machine size. Not
 
 ### Warning and refusal
 
-- **Warning from 90%.** The first run of each UTC day past 90% still runs; the Bot says "Storage is N% full: X used of the Plan's Y…" in the chat, and `usage.storage_warning` is audited (actor `billing`, on behalf of the owner). The Plan screen shows the same warning whenever it applies.
-- **Refused at 100%.** Sending a message to a Bot whose owner is full answers `403` with "Storage is full: X used of the Plan's Y. Delete files from the workspace, or move to a bigger plan, before sending more." and audits `bot.message_refused` (reason `storage_limit`). Runs that start any other way (routines, handoffs, queued messages) are refused like other tier limits: `bot.run_refused` with reason `storage_limit` and one chat bubble. The limit follows the Bot's owner, so teammates using a shared Bot are refused when its owner is full.
+- **Warning from 90%.** The first run of each UTC day past 90% still runs; the Bot says "Storage is N% full: X used of the Plan's Y…" in the chat, and `usage.storage_warning` is audited (actor `billing`, on behalf of the owner). That audit event is what "already warned today" checks, so a restart doesn't warn again; no new table is needed. The Plan screen shows the same warning whenever it applies.
+- **Refused at 100%.** Sending a message to a Bot whose owner is full answers `403` with "Storage is full: X used of the Plan's Y. Delete files from the workspace, or move to a bigger plan, before sending more." and audits `bot.message_refused` (reason `storage_limit`). Runs that start any other way (routines, handoffs, queued messages) are refused like other tier limits: `bot.run_refused` with reason `storage_limit` and one chat bubble. A run that waited for a slot ([ADR 0073](0073-concurrent-runs-per-machine.md)) is checked again when its turn comes, since another of the owner's Bots may have filled it meanwhile; its run counts are given back. The limit follows the Bot's owner, so teammates using a shared Bot are refused when its owner is full.
 - Texts name the plan, the sizes and what to do. They never name a model, a path or another user.
 - There is no upload route yet; when one lands it should use the same check.
 
 ### Cost of measuring
 
-- Measurements are cached per user: up to 10 seconds old for enforcement, 60 seconds for views, and dropped after each run so the next check sees what the run wrote. Walking happens off the async runtime.
+- Measurements are cached per user: up to 10 seconds old for enforcement, 60 seconds for views, and dropped after each run so the next check sees what the run wrote. Walking happens off the async runtime, one walk per user at a time: callers that arrive meanwhile wait and get its result. A walk that began before a run dropped the cache doesn't put its older result back.
 - A run can still write past the cap: the check is before a run, not during it. The next one is refused.
 
 ### Where it shows
