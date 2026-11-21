@@ -156,8 +156,9 @@ impl Dir {
         Ok(Dir(unsafe { OwnedFd::from_raw_fd(fd) }))
     }
 
-    /// Each name here (not `.` or `..`) with its `lstat`, or None where that failed.
-    fn entries(&self) -> std::io::Result<Vec<(std::ffi::CString, Option<libc::stat>)>> {
+    /// Each name here (not `.` or `..`) with its `lstat`, or None where that failed; at
+    /// most `limit` of them, so a folder of millions is never read whole.
+    fn entries(&self, limit: u64) -> std::io::Result<Vec<(std::ffi::CString, Option<libc::stat>)>> {
         use std::os::fd::{AsRawFd, IntoRawFd};
         let dup = self.0.try_clone()?.into_raw_fd();
         // SAFETY: `dup` is an open folder that the stream now owns and closes.
@@ -168,8 +169,11 @@ impl Dir {
             unsafe { libc::close(dup) };
             return Err(e);
         }
+        // The copy shares the folder's read position: start from the top.
+        // SAFETY: `stream` is open.
+        unsafe { libc::rewinddir(stream) };
         let mut out = Vec::new();
-        loop {
+        while (out.len() as u64) < limit {
             // SAFETY: `stream` is open; the entry is read before the next call.
             let e = unsafe { libc::readdir(stream) };
             if e.is_null() {
@@ -236,7 +240,8 @@ impl Walker {
                     None => break,
                 },
             };
-            let Ok(entries) = dir.entries() else {
+            // One past what's left, so going over the cap is noticed below.
+            let Ok(entries) = dir.entries(self.max.saturating_sub(self.seen).saturating_add(1)) else {
                 self.partial = true;
                 continue;
             };
@@ -477,6 +482,10 @@ mod tests {
         // Too much to walk: a lower bound, said to be one.
         let (some, partial) = walk(std::slice::from_ref(&mine), 2);
         assert!(partial && some <= n);
+        // A folder bigger than what's left is read only that far.
+        let dir = Dir::open(&mine).unwrap();
+        assert_eq!(dir.entries(2).unwrap().len(), 2);
+        assert_eq!(dir.entries(100).unwrap().len(), 4);
     }
 
     #[test]
