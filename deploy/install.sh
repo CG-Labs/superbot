@@ -955,7 +955,7 @@ install_backup() {
 
 # Caddyfile for SITE: the landing page at / and /get-started when SITE_ROOT is set, the web
 # client at /app/ when CLIENT_ROOT is set; everything else (/console/, /login, /api, the
-# /api/events SSE stream, /healthz) goes to botd, which also has the landing built in.
+# /api/events SSE stream, /healthz, the /status page) goes to botd, which also has the landing built in.
 render_caddyfile() {
   local site=$1 upstream=$2 client_root=${3:-} site_root=${4:-}
   printf '%s {\n\tencode gzip\n' "$site"

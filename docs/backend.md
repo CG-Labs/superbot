@@ -86,6 +86,7 @@ Settings are in [.env.example](../.env.example). Keep `botctl` next to `botd`: t
 - Back up `DATA_DIR`. `WORKSPACE_DIR/users/<id>/` is each user's scratch and files.
 - Sign-ups are on by default: anyone can ask for access at `/get-started`, and nothing happens until an admin approves. See [Sign-ups](#sign-ups).
 - `GET /healthz` returns `{"ok":true}` without auth.
+- `GET /status` and `GET /status.json` are the public status page: component health from botd's own checks and recent metrics, and incident notes admins post in the console or at `/api/status/incidents`. No tenant data. `STATUS_PAGE=off` turns it off ([ADR 0090](adr/0090-status-page-and-uptime-slo.md), [SLO](slo.md)).
 - Every response carries `X-Request-Id`. `/metrics` (Prometheus) is on its own listener, off unless `METRICS_LISTEN` is set, and `LOG_FORMAT=json` makes logs structured ([ADR 0089](adr/0089-metrics-and-structured-logs.md), [deploy/README.md](../deploy/README.md#metrics-and-logs)).
 
 ## Approvals
