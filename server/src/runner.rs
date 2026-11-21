@@ -861,7 +861,11 @@ impl App {
             // stays above our wait, so the hook is never killed into failing open. A harness
             // that caps hook timeouts gets a shorter wait instead.
             let policy = self.db.effective_policy(&bot.id);
-            let guard = (policy.mode == Mode::Ask).then(|| guard(&spot.botctl, &bot.harness, policy.timeout_minutes));
+            let test_secs = match self.license.status().testing() {
+                true => test_hook_secs(&std::env::var(TEST_HOOK_TIMEOUT).unwrap_or_default()).unwrap_or_default(),
+                false => None,
+            };
+            let guard = (policy.mode == Mode::Ask).then(|| guard(&spot.botctl, &bot.harness, policy.timeout_minutes, test_secs));
             let (sandbox, sandboxed) = spot.sandbox(policy.sandbox, has_sandbox, sandbox_needs);
             let hooks = Arc::new(AtomicU32::new(0));
             {
@@ -2072,14 +2076,32 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Shortens every run's hook timeout to this many seconds, so a test can make a real
+/// harness time its hook out in seconds, not minutes (ADR 0075). Only in testing mode:
+/// a licensed server ignores it.
+pub const TEST_HOOK_TIMEOUT: &str = "SUPERBOT_TEST_HOOK_TIMEOUT_SECS";
+
+/// `TEST_HOOK_TIMEOUT`'s value: unset, or whole seconds, at least 2.
+pub fn test_hook_secs(raw: &str) -> Result<Option<u64>, String> {
+    match raw.trim() {
+        "" => Ok(None),
+        s => s.parse().ok().filter(|n| *n >= 2).map(Some).ok_or(format!("{TEST_HOOK_TIMEOUT} must be whole seconds, at least 2, not \"{s}\"")),
+    }
+}
+
 /// The approval gate for one run. The hook timeout stays a minute above the wait.
-fn guard(botctl: &Path, harness: &str, timeout_minutes: u32) -> Guard {
+/// `test_secs` (`TEST_HOOK_TIMEOUT`) only ever shortens it, and the wait stays under it.
+fn guard(botctl: &Path, harness: &str, timeout_minutes: u32, test_secs: Option<u64>) -> Guard {
     let mut wait = Duration::from_secs(timeout_minutes as u64 * 60 + 60);
     if let Some(cap) = adapters::get(harness).and_then(|a| a.max_hook_secs()) {
         wait = wait.min(Duration::from_secs(cap.saturating_sub(60).max(1)));
     }
+    let mut timeout_secs = wait.as_secs() + 60;
+    if let Some(s) = test_secs.filter(|s| *s < timeout_secs) {
+        (timeout_secs, wait) = (s, Duration::from_secs(s / 2));
+    }
     let botctl = botctl.display().to_string();
-    Guard { command: format!("{} hook {harness}", shell_quote(&botctl)), timeout_secs: wait.as_secs() + 60, wait }
+    Guard { command: format!("{} hook {harness}", shell_quote(&botctl)), timeout_secs, wait }
 }
 
 /// An ask waiting on a Bot, for as long as the asker waits (ADR 0073). A run of the
@@ -2266,14 +2288,24 @@ mod tests {
 
     #[test]
     fn the_approval_wait_fits_the_harness_hook_limit() {
-        let g = guard(Path::new("/opt/it's/botctl"), "claude", 10);
+        let g = guard(Path::new("/opt/it's/botctl"), "claude", 10, None);
         assert_eq!(g.command, r"'/opt/it'\''s/botctl' hook claude");
         assert_eq!((g.wait, g.timeout_secs), (Duration::from_secs(660), 720));
         // Hermes kills hooks after 300 seconds, so its wait stays under that.
-        let g = guard(Path::new("/opt/botctl"), "hermes", 10);
+        let g = guard(Path::new("/opt/botctl"), "hermes", 10, None);
         assert_eq!((g.wait, g.timeout_secs), (Duration::from_secs(240), 300));
-        let g = guard(Path::new("/opt/botctl"), "hermes", 1);
+        let g = guard(Path::new("/opt/botctl"), "hermes", 1, None);
         assert_eq!((g.wait, g.timeout_secs), (Duration::from_secs(120), 180));
+        // A test's short hook timeout: the wait stays under it, and it never lengthens one.
+        let g = guard(Path::new("/opt/botctl"), "hermes", 10, Some(4));
+        assert_eq!((g.wait, g.timeout_secs), (Duration::from_secs(2), 4));
+        let g = guard(Path::new("/opt/botctl"), "hermes", 1, Some(900));
+        assert_eq!((g.wait, g.timeout_secs), (Duration::from_secs(120), 180));
+        assert_eq!(test_hook_secs(""), Ok(None));
+        assert_eq!(test_hook_secs(" 5 "), Ok(Some(5)));
+        for bad in ["1", "0", "-3", "5s", "x"] {
+            assert!(test_hook_secs(bad).unwrap_err().contains(TEST_HOOK_TIMEOUT), "{bad}");
+        }
         assert_eq!(tool_label("terminal", "ls"), "Running: ls");
     }
 

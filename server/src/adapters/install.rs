@@ -13,7 +13,9 @@ enum Source {
     /// the registry's hashes.
     Npm { package: &'static str, integrity: &'static str },
     /// Hermes Agent's own installer at `version` (a commit), checked against `sha256`.
-    Hermes { sha256: &'static str },
+    /// `tag` is the stable release that commit is; `deploy/hermes-pin.sh` checks it
+    /// upstream and moves all three together (ADR 0075).
+    Hermes { tag: &'static str, sha256: &'static str },
 }
 
 struct Pin {
@@ -47,11 +49,12 @@ const PINS: [Pin; 4] = [
             integrity: "sha512-mUWI04rqF1Vd/m1q+Ps1XeWsTXEVvRUnsmRa83I3Dzua0Tx5bYS93imeqtIfrXf7PkkaR6ERz+AuQhIJlom5yA==",
         },
     },
-    // The commit of tag v0.23.2, as the Dockerfile and install.sh pin it.
+    // The Dockerfile and install.sh pin the same commit; change all three with
+    // `deploy/hermes-pin.sh bump` (ADR 0075).
     Pin {
         bin: "hermes",
-        version: "ae2a81ccc00e9b7c06301523e5bb09608397149c",
-        source: Source::Hermes { sha256: "c73dad4dcf7c9ecadb98578e28cc763d23d7be3fa1b513545319038795493214" },
+        version: "caafe5389ae585ef77387a962aee05b1bcf17029",
+        source: Source::Hermes { tag: "v0.23.3", sha256: "c73dad4dcf7c9ecadb98578e28cc763d23d7be3fa1b513545319038795493214" },
     },
 ];
 
@@ -123,9 +126,9 @@ pub fn install(bin: &str, version: Option<&str>, checksum: Option<&str>) -> Resu
             };
             InstallSource::Npm { package: package.to_string(), integrity }
         }
-        Source::Hermes { sha256 } => {
+        Source::Hermes { tag, sha256 } => {
             if version.len() != 40 || !version.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-                return Err(format!("{bin}@{version}: give a full commit, like {}", pin.version));
+                return Err(format!("{bin}@{version}: give a full commit, like {} (release {tag})", pin.version));
             }
             let sha256 = match checksum {
                 Some(c) => c.to_string(),
@@ -214,6 +217,7 @@ mod tests {
         assert!(install("claude", Some("2.2.0-beta.1"), None).is_ok());
         let h = install("hermes", None, None).unwrap();
         assert!(matches!(&h.source, InstallSource::Script { url, args, .. } if url.contains(&h.version) && args.contains(&h.version)));
+        assert!(install("hermes", Some("main"), None).unwrap_err().contains(" (release v"), "names the pinned release");
         assert!(install("hermes", Some(&"b".repeat(40)), None).is_err(), "a new commit needs its installer's hash");
         assert!(install("hermes", Some(&"b".repeat(40)), Some(&"c".repeat(64))).is_ok());
         let p = plan(vec![c, h.clone()]);
@@ -323,6 +327,24 @@ mod tests {
             mode(s, 0o755);
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The Dockerfile and deploy/install.sh install the Hermes commit machines do, and
+    /// name the same stable tag (ADR 0075). `deploy/hermes-pin.sh verify` checks the
+    /// tag against upstream.
+    #[test]
+    fn hermes_is_pinned_to_one_stable_release_everywhere() {
+        let pin = PINS.iter().find(|p| p.bin == "hermes").unwrap();
+        let Source::Hermes { tag, .. } = pin.source else { unreachable!() };
+        let core = tag.strip_prefix('v').unwrap_or_default();
+        assert!(exact(core) && !core.contains('-'), "{tag}: a stable vMAJOR.MINOR.PATCH tag, never a canary");
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        for (file, line) in [("Dockerfile", "ARG HERMES_COMMIT="), ("deploy/install.sh", "HERMES_COMMIT=${HERMES_COMMIT:-")] {
+            let text = std::fs::read_to_string(repo.join(file)).unwrap();
+            let commit = text.lines().find_map(|l| l.strip_prefix(line)).unwrap_or_else(|| panic!("{file}: no {line}"));
+            assert_eq!(commit.trim_end_matches('}'), pin.version, "{file}");
+            assert!(text.contains(&format!("the commit of tag {tag} ")), "{file} names another tag than {tag}");
+        }
     }
 
     #[test]

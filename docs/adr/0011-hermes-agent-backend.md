@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (19 Nov 2026). The product owner, David Kennedy, accepted it on 19 Nov 2026: Hermes Agent is the default harness for managed tiers and the harness that carries the Enterprise SLA; Claude Code and other harnesses stay available as best-effort. The gate below becomes the release checklist for managed tiers. Details: [ADR 0027](0027-expo-primary-hermes-default.md). Option (a), the adapter, is built ([ADR 0015](0015-hermes-adapter.md)). The gate's status is under [Recommendation](#recommendation); per-Bot footprint measured in [ADR 0070](0070-hermes-per-bot-footprint.md).
+Accepted (19 Nov 2026). The product owner, David Kennedy, accepted it on 19 Nov 2026: Hermes Agent is the default harness for managed tiers and the harness that carries the Enterprise SLA; Claude Code and other harnesses stay available as best-effort. The gate below becomes the release checklist for managed tiers. Details: [ADR 0027](0027-expo-primary-hermes-default.md). Option (a), the adapter, is built ([ADR 0015](0015-hermes-adapter.md)). The gate's status is under [Recommendation](#recommendation); per-Bot footprint measured in [ADR 0070](0070-hermes-per-bot-footprint.md); upgrades and the hook timeout test in [ADR 0075](0075-hermes-upgrades.md).
 
 Was: Proposed (19 Nov 2026), as an assessment for the owner.
 
@@ -89,10 +89,10 @@ Hermes's gateway, cron, memory, Bot Mode, and approvals become the back end. bot
    - one upstream upgrade has been taken through the test suite without adapter changes, or with small ones;
    - tier-to-model routing works with at least two providers.
 
-   **Gate status (21 Nov 2026): not passed**, so Hermes is not the managed default yet ([ADR 0070](0070-hermes-per-bot-footprint.md), [ADR 0072](0072-one-hermes-environment-per-computer.md), [ADR 0073](0073-concurrent-runs-per-machine.md), [#33](https://github.com/CG-Labs/superbot/issues/33)).
-   - Approvals end to end: **mostly passes.** The canary stops a run whose hook was skipped, against the real Hermes ([ADR 0057](0057-harness-hook-e2e-tests.md), [ADR 0063](0063-canary-covers-every-hooked-tool.md)). Fail-closed on hook timeout is configured and checked in the managed config, but no test makes the real Hermes time a hook out.
+   **Gate status (21 Nov 2026): not passed**, so Hermes is not the managed default yet; two providers is the only item left ([ADR 0070](0070-hermes-per-bot-footprint.md), [ADR 0072](0072-one-hermes-environment-per-computer.md), [ADR 0073](0073-concurrent-runs-per-machine.md), [ADR 0075](0075-hermes-upgrades.md), [#33](https://github.com/CG-Labs/superbot/issues/33)).
+   - Approvals end to end: **passes.** The canary stops a run whose hook was skipped, against the real Hermes ([ADR 0057](0057-harness-hook-e2e-tests.md), [ADR 0063](0063-canary-covers-every-hooked-tool.md)). A hook that times out fails closed in the real Hermes: the call is blocked and the agent is told, with the managed config's `fail_closed: true`, and the test fails if that is turned off ([ADR 0075](0075-hermes-upgrades.md)).
    - Footprint: **measured; passes with conditions** ([ADR 0070](0070-hermes-per-bot-footprint.md)). About 330–370 MiB PSS and 5 CPU-seconds per run, nothing while idle, a 2.6 GiB install. A Starter (1 vCPU, 2 GiB) fits 4 runs at once for its 3 Bots. Conditions: share one dependency environment across Bots (done: a new Bot now takes 4.7 MiB, not 487 MiB, and under a CPU-second more than its next run, [ADR 0072](0072-one-hermes-environment-per-computer.md)), and cap concurrent runs per machine by tier (done: 3 on Starter, 8 on Pro, 16 on Max, with more runs queued, [ADR 0073](0073-concurrent-runs-per-machine.md)). Both conditions are met.
-   - Upstream upgrade: **not done.** The pin hasn't moved since it was set.
+   - Upstream upgrade: **done.** v0.23.2 to v0.23.3 went through the suite (approvals, canary, hook timeout, footprint) with no adapter changes. The supported-version policy is now code: a test keeps the pins together, `deploy/hermes-pin.sh verify` checks in CI that the pin is a stable release's commit, and `deploy/hermes-pin.sh bump` moves it ([ADR 0075](0075-hermes-upgrades.md)).
    - Two providers: **built, not shown.** Tier routes pass a provider to Hermes ([ADR 0033](0033-tiers-model-routing.md)); no run has gone through two real providers yet.
 3. Reject (c). It throws away the approval, audit, and multi-user work, and the harness-agnostic, Rust-first design, for features botd already has.
 

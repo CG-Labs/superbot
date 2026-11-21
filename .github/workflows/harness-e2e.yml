@@ -2,14 +2,16 @@ name: harness-e2e
 
 # Approvals end to end through the real harness CLIs, at the versions SuperBot pins
 # (server/src/adapters/install.rs), with a fake model (ADR 0057), and each CLI's per-Bot
-# footprint, uploaded as a report (ADR 0070). Runs when the code between a harness and a
-# decision changes, weekly, and by hand.
+# footprint, uploaded as a report (ADR 0070). The Hermes job also checks that its pin is a
+# stable upstream release and that a hook timeout fails closed (ADR 0075). Runs when the
+# code between a harness and a decision changes, weekly, and by hand.
 
 on:
   pull_request:
     paths:
       - 'server/src/adapters/**'
       - 'deploy/hermes-share.sh'
+      - 'deploy/hermes-pin.sh'
       - 'server/src/approvals.rs'
       - 'server/src/main.rs'
       - 'server/src/policy.rs'
@@ -32,6 +34,7 @@ on:
     paths:
       - 'server/src/adapters/**'
       - 'deploy/hermes-share.sh'
+      - 'deploy/hermes-pin.sh'
       - 'server/src/approvals.rs'
       - 'server/src/main.rs'
       - 'server/src/policy.rs'
@@ -106,6 +109,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: The pin is a stable Hermes Agent release, as upstream tags it
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: deploy/hermes-pin.sh verify
       - name: Build botd and the test
         run: cargo test --test harness_e2e --no-run
       - name: Install the pinned Hermes Agent
@@ -114,7 +121,9 @@ jobs:
           deploy/install-harness-clis.sh "$RUNNER_TEMP/clis" hermes | tee /tmp/install.log
           grep '^/' /tmp/install.log >>"$GITHUB_PATH"
       - name: Approvals through Hermes Agent
-        run: SUPERBOT_E2E_HARNESSES=hermes cargo test --test harness_e2e -- --ignored --nocapture
+        run: SUPERBOT_E2E_HARNESSES=hermes cargo test --test harness_e2e -- --ignored --nocapture hermes_hooks_hold
+      - name: A hook that times out fails closed in Hermes Agent
+        run: SUPERBOT_E2E_HARNESSES=hermes cargo test --test harness_e2e -- --ignored --nocapture hermes_hook_timeout_fails_closed
 
   # Numbers, not a gate: only ceilings far above what the pinned CLIs use are asserted.
   footprint:

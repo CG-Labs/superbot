@@ -360,6 +360,12 @@ async fn main() {
     if license.testing() {
         eprintln!("WARNING: testing mode is on (TESTING_MODE). No license, billing off; not for production.");
     }
+    match runner::test_hook_secs(&env(runner::TEST_HOOK_TIMEOUT, "")) {
+        Err(e) => exit(e),
+        Ok(Some(s)) if license.testing() => eprintln!("WARNING: {} is set: every approval hook times out after {s} seconds.", runner::TEST_HOOK_TIMEOUT),
+        Ok(Some(_)) => eprintln!("WARNING: {} is ignored: it only applies in testing mode.", runner::TEST_HOOK_TIMEOUT),
+        Ok(None) => {}
+    }
 
     // Each user's Bots work in that user's folders (ADR 0029). Files from before were
     // the owner account's.
