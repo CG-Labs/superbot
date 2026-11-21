@@ -27,7 +27,6 @@ use crate::notify::{self, Alert};
 use crate::runner::App;
 use crate::{AppState, Auth, Res, bad, not_found};
 use axum::Json;
-use axum::body::Bytes;
 use axum::extract::{Extension, Path, Query, State as AppS};
 use axum::http::StatusCode;
 use serde::Deserialize;
@@ -254,7 +253,7 @@ pub async fn list(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>,
 
 /// `{to?, identity?}`: the host to restore onto (the first other host that is up by
 /// default), and the age identity for encrypted backups, used for these restores only.
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RecoverBody {
     #[serde(default)]
@@ -271,17 +270,13 @@ pub async fn recover(
     Extension(a): Extension<Arc<Auth>>,
     Extension(by): Extension<Who>,
     Path(name): Path<String>,
-    body: Bytes,
+    Json(req): Json<RecoverBody>,
 ) -> Res<(StatusCode, Json<Value>)> {
     let cp = need_hosts(&a)?;
     backup::need(&a)?;
     if cp.enrollment.is_none() {
         return Err(conflict("Restored machines enroll again, so they need enrollment on (MACHINE_CONTROL_URL).".into()));
     }
-    let req: RecoverBody = match body.iter().all(u8::is_ascii_whitespace) {
-        true => RecoverBody::default(),
-        false => serde_json::from_slice(&body).map_err(|e| bad(format!("Invalid JSON: {e}")))?,
-    };
     let h = cp.hosts().ok_or_else(|| not_found("Incus host"))?;
     let name = name.trim().to_string();
     let row = app.db.machine_host(&name).ok_or_else(|| not_found("Incus host"))?;

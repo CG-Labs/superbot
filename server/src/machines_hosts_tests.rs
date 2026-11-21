@@ -260,13 +260,15 @@ async fn a_lost_hosts_machines_are_restored_onto_another_host_and_enroll_anew() 
     assert!(code == 409 && e["error"].as_str().unwrap().contains("is down"), "{e}");
     let (code, e) = json_call(&env, "POST", "/api/machines/hosts/a/recover", &json!({ "to": "a" }).to_string()).await;
     assert_eq!(code, 400, "{e}");
-    let (code, e) = json_call(&env, "POST", "/api/machines/hosts/nope/recover", "").await;
+    let (code, _) = json_call(&env, "POST", "/api/machines/hosts/a/recover", &json!({ "force": true }).to_string()).await;
+    assert!((400..500).contains(&code), "unknown fields are refused: {code}");
+    let (code, e) = json_call(&env, "POST", "/api/machines/hosts/nope/recover", "{}").await;
     assert_eq!(code, 404, "{e}");
 
     // Declared lost: certificates revoked, ada's machine restored onto b, bea's (no
     // backup) in error.
     env.b.w().addresses.insert(format!("{}-restore", m.label), "127.0.0.1".into());
-    let (code, out) = json_call(&env, "POST", "/api/machines/hosts/a/recover", "").await;
+    let (code, out) = json_call(&env, "POST", "/api/machines/hosts/a/recover", "{}").await;
     assert_eq!(code, 202, "{out}");
     assert_eq!((out["to"].as_str(), out["declaredLost"].as_bool()), (Some("b"), Some(true)), "{out}");
     assert_eq!((out["restoring"].as_array().unwrap().len(), out["unrestorable"][0]["userId"].as_str()), (1, Some(bea.as_str())), "{out}");
@@ -335,7 +337,7 @@ async fn a_lost_hosts_machines_are_restored_onto_another_host_and_enroll_anew() 
     assert!(events(&env, "machine.host_up").await.is_empty());
 
     // Again: nothing left to do, and nothing announced twice.
-    let (code, out) = json_call(&env, "POST", "/api/machines/hosts/a/recover", "").await;
+    let (code, out) = json_call(&env, "POST", "/api/machines/hosts/a/recover", "{}").await;
     assert_eq!((code, out["declaredLost"].as_bool(), out["restoring"].as_array().map(Vec::len)), (202, Some(false), Some(0)), "{out}");
     assert_eq!(events(&env, "machine.host_lost").await.len(), 1);
 }
@@ -355,7 +357,7 @@ async fn a_host_that_comes_back_is_up_and_machines_move_between_hosts_that_are_u
     assert_eq!(r["hostsDown"].as_u64(), Some(0), "{r}");
     let up = events(&env, "machine.host_up").await;
     assert_eq!((up.len(), up[0]["targetId"].as_str()), (1, Some("a")), "{up:?}");
-    let (code, e) = json_call(&env, "POST", "/api/machines/hosts/a/recover", "").await;
+    let (code, e) = json_call(&env, "POST", "/api/machines/hosts/a/recover", "{}").await;
     assert!(code == 409 && e["error"].as_str().unwrap().contains("answers"), "{e}");
     assert_eq!(env.app.db.machine_host("a").unwrap().state, "up");
 
