@@ -7,7 +7,8 @@ const SERVER_KEY = "superbot.server";
 const PASSWORD_KEY = "superbot.password";
 const TOKEN_KEY = "superbot.token";
 
-async function storeSet(key: string, value: string): Promise<void> {
+/** The keychain / keystore on phones; `localStorage` on web and Electron. */
+export async function storeSet(key: string, value: string): Promise<void> {
   if (Platform.OS === "web") {
     if (typeof localStorage !== "undefined") localStorage.setItem(key, value);
     return;
@@ -15,7 +16,7 @@ async function storeSet(key: string, value: string): Promise<void> {
   await SecureStore.setItemAsync(key, value);
 }
 
-async function storeGet(key: string): Promise<string | null> {
+export async function storeGet(key: string): Promise<string | null> {
   if (Platform.OS === "web") {
     if (typeof localStorage === "undefined") return null;
     return localStorage.getItem(key);
@@ -23,7 +24,7 @@ async function storeGet(key: string): Promise<string | null> {
   return SecureStore.getItemAsync(key);
 }
 
-async function storeDelete(key: string): Promise<void> {
+export async function storeDelete(key: string): Promise<void> {
   if (Platform.OS === "web") {
     if (typeof localStorage !== "undefined") localStorage.removeItem(key);
     return;
