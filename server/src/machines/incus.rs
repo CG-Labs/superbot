@@ -71,6 +71,10 @@ const STOP_WAIT: u64 = 30;
 const FORCE_WAIT: u64 = 20;
 const EDIT_WAIT: u64 = 30;
 const REBUILD_WAIT: u64 = 60;
+/// Where the enrollment user data goes. The image renders it into the container's
+/// NoCloud seed when the container is first started after a create or rebuild, so
+/// removing it later changes nothing inside a container that has started.
+const USER_DATA: &str = "cloud-init.user-data";
 
 /// What a plan gives a container.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -589,6 +593,7 @@ fn machine(v: &Value) -> Result<ProviderMachine, ProviderError> {
             .filter(|t| !t.is_empty())
             .map(String::from)
             .collect(),
+        user_data: !text(USER_DATA).is_empty(),
     })
 }
 
@@ -603,6 +608,7 @@ fn provisioning(n: &str) -> ProviderMachine {
         ipv4: None,
         backups: false,
         tags: Vec::new(),
+        user_data: false,
     }
 }
 
@@ -1073,7 +1079,7 @@ impl MachineProvider for Incus {
             config.insert("user.superbot.tags".into(), json!(spec.tags.join(",")));
             config.insert("user.superbot.plan".into(), json!(spec.plan));
             if let Some(ud) = &spec.user_data {
-                config.insert("cloud-init.user-data".into(), json!(ud));
+                config.insert(USER_DATA.into(), json!(ud));
             }
             if !spec.authorized_keys.is_empty() {
                 config.insert("cloud-init.vendor-data".into(), json!(vendor_data(&spec.authorized_keys)));
@@ -1189,7 +1195,7 @@ impl MachineProvider for Incus {
         Box::pin(async move {
             self.stop(id, true).await?;
             self.edit(id, |put| {
-                put["config"]["cloud-init.user-data"] = json!(spec.user_data);
+                put["config"][USER_DATA] = json!(spec.user_data);
                 if spec.authorized_keys.is_empty() {
                     if let Some(c) = put["config"].as_object_mut() {
                         c.remove("cloud-init.vendor-data");
@@ -1212,6 +1218,26 @@ impl MachineProvider for Incus {
             // Incus is done, if it's still meant to be running.
             self.finish(r, REBUILD_WAIT, "rebuilding the container").await?;
             self.start(id).await
+        })
+    }
+
+    /// Drops the key with a GET and an If-Match PUT of the rest, as `incus config
+    /// unset` does; a PATCH with an empty value only usually unsets a key. Incus
+    /// applies it to a running container in place, and a change made meanwhile
+    /// fails the If-Match, so it is read again and kept.
+    fn clear_user_data<'a>(&'a self, id: &'a str) -> Fut<'a, ()> {
+        Box::pin(async move {
+            let res = self
+                .edit(id, |put| {
+                    if let Some(c) = put["config"].as_object_mut() {
+                        c.remove(USER_DATA);
+                    }
+                })
+                .await;
+            match res {
+                Ok(()) | Err(ProviderError::NotFound) => Ok(()),
+                Err(e) => Err(e),
+            }
         })
     }
 

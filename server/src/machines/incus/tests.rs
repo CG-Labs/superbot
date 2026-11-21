@@ -314,6 +314,111 @@ async fn a_slow_rebuild_is_left_stopped_and_starts_only_once_incus_is_done() {
     assert_eq!(i.source["alias"], "ubuntu/26.04/cloud");
 }
 
+fn edits(s: &StandIn, n: &str) -> Vec<crate::machines::incus_standin::Call> {
+    let path = format!("/1.0/instances/{n}");
+    s.calls("PUT", &path).into_iter().filter(|c| c.path == path).collect()
+}
+
+#[tokio::test]
+async fn spent_user_data_is_cleared_in_place_and_nothing_else_changes() {
+    let s = StandIn::start().await;
+    let p = incus(&s);
+    p.create_firewall("superbot-fw", &["superbot".into()], &[agent_rule()]).await.unwrap();
+    assert!(p.create(&spec("superbot-m1", "c1-m2-d20")).await.unwrap().user_data, "made with it");
+    let before = s.instance("superbot-m1").unwrap();
+    assert_eq!((before.status.as_str(), before.boots), ("Running", 1));
+
+    p.clear_user_data("superbot-m1").await.unwrap();
+    let after = s.instance("superbot-m1").unwrap();
+    assert!(after.body["config"].get(USER_DATA).is_none(), "{:?}", after.body["config"]);
+    let mut want = before.body.clone();
+    want["config"].as_object_mut().unwrap().remove(USER_DATA);
+    assert_eq!(after.body, want, "everything else is as it was, the SSH keys' vendor data too");
+    assert_eq!((after.status.as_str(), after.boots), ("Running", 1), "not restarted");
+    assert!(s.calls("PUT", "/1.0/instances/superbot-m1/state").is_empty(), "never stopped or started");
+    let put = edits(&s, "superbot-m1");
+    assert_eq!(put.len(), 1);
+    assert!(put[0].if_match.as_deref().is_some_and(|e| e.starts_with('"')), "sent with the ETag it read: {:?}", put[0].if_match);
+    assert!(!p.get("superbot-m1").await.unwrap().user_data);
+    assert!(!p.list("superbot").await.unwrap()[0].user_data);
+
+    // Again, or on a container that's gone, it's done already.
+    p.clear_user_data("superbot-m1").await.unwrap();
+    assert_eq!(s.instance("superbot-m1").unwrap().body, want);
+    p.clear_user_data("superbot-m9").await.unwrap();
+
+    // A stopped one stays stopped; a rebuild brings fresh user data, cleared in turn.
+    p.shutdown("superbot-m1").await.unwrap();
+    let rb = RebuildSpec { image: DEFAULT_IMAGE.into(), authorized_keys: Vec::new(), user_data: "#cloud-config\n# again\n".into() };
+    p.rebuild("superbot-m1", &rb).await.unwrap();
+    assert!(p.get("superbot-m1").await.unwrap().user_data);
+    p.shutdown("superbot-m1").await.unwrap();
+    p.clear_user_data("superbot-m1").await.unwrap();
+    let i = s.instance("superbot-m1").unwrap();
+    assert_eq!((i.status.as_str(), i.body["config"].get(USER_DATA)), ("Stopped", None));
+}
+
+#[tokio::test]
+async fn a_change_made_meanwhile_is_kept_not_overwritten() {
+    let s = StandIn::start().await;
+    let p = incus(&s);
+    p.create_firewall("superbot-fw", &["superbot".into()], &[agent_rule()]).await.unwrap();
+    p.create(&spec("superbot-m1", "c1-m2-d20")).await.unwrap();
+
+    s.w().races = 1;
+    p.clear_user_data("superbot-m1").await.unwrap();
+    let c = s.instance("superbot-m1").unwrap().body["config"].clone();
+    assert_eq!((c.get(USER_DATA), c["user.other-client"].as_str()), (None, Some("change 1")), "read again and kept: {c}");
+    let put = edits(&s, "superbot-m1");
+    assert_eq!(put.len(), 2, "the first was refused (412)");
+    assert_ne!(put[0].if_match, put[1].if_match);
+
+    // One that keeps changing is left for the reconciler, untouched.
+    p.create(&spec("superbot-m2", "c1-m2-d20")).await.unwrap();
+    s.w().races = 3;
+    match p.clear_user_data("superbot-m2").await {
+        Err(ProviderError::Transport(m)) => assert!(m.contains("kept changing"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(p.get("superbot-m2").await.unwrap().user_data);
+}
+
+#[tokio::test]
+async fn the_stand_in_puts_and_patches_instances_as_incus_does() {
+    let s = StandIn::start().await;
+    let p = incus(&s);
+    p.create_firewall("superbot-fw", &["superbot".into()], &[agent_rule()]).await.unwrap();
+    p.create(&spec("superbot-m1", "c1-m2-d20")).await.unwrap();
+    let path = "/1.0/instances/superbot-m1";
+    let r = p.call(Method::GET, path, &[], None, None).await.unwrap();
+    let tag = r.etag.clone().unwrap();
+
+    // PATCH merges; an empty value unsets; a stale ETag is refused.
+    let patch = json!({ "config": { "user.a": "1", "cloud-init.vendor-data": "" } });
+    p.call(Method::PATCH, path, &[], Some(&patch), Some(&tag)).await.unwrap();
+    let c = s.instance("superbot-m1").unwrap().body["config"].clone();
+    assert_eq!((c["user.a"].as_str(), c.get("cloud-init.vendor-data")), (Some("1"), None));
+    assert_eq!(c["limits.cpu"], "1", "the rest is kept");
+    assert!(matches!(
+        p.call(Method::PATCH, path, &[], Some(&patch), Some(&tag)).await,
+        Err(ProviderError::Api { status: 412, .. })
+    ));
+    let nested = json!({ "config": { "security.nesting": "true" } });
+    assert!(matches!(p.call(Method::PATCH, path, &[], Some(&nested), None).await, Err(ProviderError::Api { status: 400, .. })));
+
+    // PUT replaces the writable fields: a key left out is gone, read-only ones ignored.
+    let r = p.call(Method::GET, path, &[], None, None).await.unwrap();
+    let mut put = r.metadata.clone();
+    put["config"].as_object_mut().unwrap().remove("user.a");
+    put["status"] = json!("Frozen");
+    let op = p.call(Method::PUT, path, &[], Some(&put), r.etag.as_deref()).await.unwrap();
+    p.finish(op, 5, "changing it").await.unwrap();
+    let i = s.instance("superbot-m1").unwrap();
+    assert!(i.body["config"].get("user.a").is_none());
+    assert!(i.body.get("status").is_none() && i.body.get("name").is_none(), "{}", i.body);
+    assert_eq!((i.status.as_str(), i.boots), ("Running", 1), "edits never restart it");
+}
+
 #[tokio::test]
 async fn a_create_still_running_is_provisioning_and_a_failed_one_is_a_refusal() {
     let s = StandIn::start().await;

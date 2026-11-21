@@ -769,8 +769,25 @@ async fn finish_destroy(app: &App, p: &dyn MachineProvider, mut m: Machine, by: 
     m
 }
 
+/// Why the provider may drop the machine's cloud-init user data now (ADR 0067), if it
+/// may: it enrolled with the token since it was last issued, or it missed its deadline
+/// while running (so it has its own copy of the seed already) with no rebuild waiting
+/// on it. A machine that never started keeps it until it does or is rebuilt.
+fn user_data_spent(m: &Machine, pm: &ProviderMachine) -> Option<&'static str> {
+    if !pm.user_data {
+        None
+    } else if m.enrolled_at.is_some() && m.enroll_by.is_none() {
+        Some("enrolled")
+    } else if m.enroll_overdue_at.is_some() && pm.running() && !rebuild::underway(m) {
+        Some("enroll_timeout")
+    } else {
+        None
+    }
+}
+
 /// Brings one machine a step closer to its state: sends pending ones, notices when
-/// they run or vanish, turns on backups, and finishes deletes. It never boots or
+/// they run or vanish, clears spent enrollment data, turns on backups, and finishes
+/// deletes. It never boots or
 /// stops a machine to undo a change made at the provider; it records what it sees.
 /// Returns whether the machine's state changed.
 async fn reconcile_one(app: &App, cp: &ControlPlane, p: &dyn MachineProvider, id: &str) -> bool {
@@ -823,7 +840,24 @@ async fn reconcile_one(app: &App, cp: &ControlPlane, p: &dyn MachineProvider, id
                     json!({ "providerId": pid, "ipv4": m.ipv4 }),
                 ));
             }
-            if cp.backups && !pm.backups && m.state != State::Provisioning {
+            let mut user_data = pm.user_data;
+            if let Some(reason) = user_data_spent(&m, &pm) {
+                let d = json!({ "providerId": pid, "reason": reason });
+                match p.clear_user_data(&pid).await {
+                    Ok(()) => {
+                        user_data = false;
+                        app.db.record(&event(&by, "machine.user_data_cleared", &m, d));
+                    }
+                    Err(e) => {
+                        m.last_error = Some(e.to_string());
+                        let mut d = d;
+                        d["error"] = json!(e.to_string());
+                        app.db.record(&event(&by, "machine.user_data_clear_failed", &m, d).outcome(Outcome::Failure));
+                    }
+                }
+            }
+            // Not before: a snapshot would keep a copy of the token in its config.
+            if cp.backups && !pm.backups && m.state != State::Provisioning && !user_data {
                 match p.enable_backups(&pid).await {
                     Ok(()) => {
                         m.backups = true;

@@ -111,6 +111,7 @@ impl Fake {
             ipv4: Some(format!("192.0.2.{}", s.next)),
             backups: false,
             tags: tags.iter().map(|t| t.to_string()).collect(),
+            user_data: false,
         };
         s.machines.insert(id.clone(), m);
         id
@@ -242,6 +243,7 @@ impl MachineProvider for Fake {
                     ipv4: Some(format!("192.0.2.{}", s.next)),
                     backups: false,
                     tags: spec.tags.clone(),
+                    user_data: false,
                 };
                 if let Some(fw) = &spec.firewall_id {
                     s.firewalls.get_mut(fw).unwrap().machines.insert(id.clone());

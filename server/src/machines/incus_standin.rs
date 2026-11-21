@@ -2,6 +2,10 @@
 //! (any client certificate gets through the handshake; only trusted ones get answers),
 //! sync and async replies, operations to wait on, ETags, and Incus's errors. It keeps
 //! instances, network ACLs, and projects in memory and records every call.
+//!
+//! An instance's PUT replaces its writable fields and ignores the rest; a PATCH merges
+//! config and devices into them, an empty config value unsetting the key. Both honour
+//! `If-Match`, apply to a running container in place, and never restart it.
 
 use super::incus::{Credentials, PRIVATE, Settings};
 use super::pki;
@@ -23,6 +27,7 @@ pub struct Call {
     pub path: String,
     pub query: String,
     pub body: Value,
+    pub if_match: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -35,6 +40,8 @@ pub struct Instance {
     pub location: String,
     pub source: Value,
     pub rebuilt: usize,
+    /// Times it was started: by its create, or a start.
+    pub boots: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -61,6 +68,9 @@ pub struct World {
     pub fail_op: Option<String>,
     /// Addresses to give containers by name, instead of 10.20.0.x.
     pub addresses: BTreeMap<String, String>,
+    /// The next this many instance PUTs and PATCHes find that another client changed
+    /// the instance (`user.other-client`) since it was read.
+    pub races: usize,
     ops: BTreeMap<String, Op>,
     trusted: Vec<String>,
     next_ip: u8,
@@ -256,6 +266,41 @@ fn etag(v: &Value) -> String {
     format!("\"{}\"", pki::fingerprint(v.to_string().as_bytes()))
 }
 
+/// What an instance PUT may change (Incus's `InstancePut`).
+const WRITABLE: [&str; 7] = ["architecture", "config", "devices", "ephemeral", "profiles", "stateful", "description"];
+
+fn writable(v: &Value) -> Value {
+    let mut out = json!({});
+    for k in WRITABLE {
+        if let Some(x) = v.get(k) {
+            out[k] = x.clone();
+        }
+    }
+    out
+}
+
+/// A PATCH merged into an instance: config keys set (an empty value unsets one),
+/// devices replaced by name, other writable fields replaced.
+fn patched(cur: &Value, patch: &Value) -> Value {
+    let mut out = cur.clone();
+    for k in WRITABLE {
+        let Some(x) = patch.get(k) else { continue };
+        match (k, x.as_object(), out[k].as_object_mut()) {
+            ("config" | "devices", Some(add), Some(have)) => {
+                for (key, val) in add {
+                    if k == "config" && val.as_str() == Some("") {
+                        have.remove(key);
+                    } else {
+                        have.insert(key.clone(), val.clone());
+                    }
+                }
+            }
+            _ => out[k] = x.clone(),
+        }
+    }
+    out
+}
+
 fn instance_url(n: &str, project: &str) -> String {
     if project == "default" {
         format!("/1.0/instances/{n}")
@@ -398,6 +443,7 @@ async fn handle(
         path: uri.path().to_string(),
         query: uri.query().unwrap_or_default().to_string(),
         body: body.clone(),
+        if_match: headers.get("if-match").and_then(|v| v.to_str().ok()).map(String::from),
     });
     let if_match = headers.get("if-match").and_then(|v| v.to_str().ok()).map(String::from);
     let parts: Vec<&str> = uri.path().trim_start_matches('/').split('/').collect();
@@ -459,6 +505,7 @@ async fn handle(
                 location: query.get("target").cloned().unwrap_or("none".into()),
                 source: body["source"].clone(),
                 rebuilt: 0,
+                boots: (body["start"] == true) as usize,
             };
             let (r, done) = w.op(vec![instance_url(&n, &project)], Some((n.clone(), i.clone())));
             if done {
@@ -468,9 +515,16 @@ async fn handle(
         }
         (m, ["1.0", "instances", n, rest @ ..]) => {
             let n = n.to_string();
-            let Some(i) = w.instances.get(&n).filter(|i| i.project == project).cloned() else {
+            let Some(mut i) = w.instances.get(&n).filter(|i| i.project == project).cloned() else {
                 return err(404, "Instance not found");
             };
+            if matches!(m, "PUT" | "PATCH") && rest.is_empty() && w.races > 0 {
+                w.races -= 1;
+                let change = format!("change {}", w.races + 1);
+                let other = w.instances.get_mut(&n).unwrap();
+                other.body["config"]["user.other-client"] = json!(change);
+                i = other.clone();
+            }
             let tag = etag(&i.body);
             match (m, rest) {
                 ("GET", []) => reply(
@@ -487,9 +541,20 @@ async fn handle(
                     }
                     let (r, done) = w.op(vec![instance_url(&n, &project)], None);
                     if done {
-                        w.instances.get_mut(&n).unwrap().body = body;
+                        w.instances.get_mut(&n).unwrap().body = writable(&body);
                     }
                     r
+                }
+                ("PATCH", []) => {
+                    if if_match.as_ref().is_some_and(|e| *e != tag) {
+                        return err(412, "ETag doesn't match");
+                    }
+                    let next = patched(&i.body, &body);
+                    if let Some(why) = w.refused(&project, &next).or_else(|| w.acls_exist(&next)) {
+                        return err(400, &why);
+                    }
+                    w.instances.get_mut(&n).unwrap().body = next;
+                    sync(json!({}))
                 }
                 ("DELETE", []) => {
                     if i.status != "Stopped" {
@@ -511,7 +576,9 @@ async fn handle(
                     };
                     let (r, done) = w.op(vec![instance_url(&n, &project)], None);
                     if done {
-                        w.instances.get_mut(&n).unwrap().status = status.into();
+                        let i = w.instances.get_mut(&n).unwrap();
+                        i.boots += (status == "Running") as usize;
+                        i.status = status.into();
                     }
                     r
                 }

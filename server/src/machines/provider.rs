@@ -103,6 +103,10 @@ pub struct ProviderMachine {
     pub ipv4: Option<String>,
     pub backups: bool,
     pub tags: Vec<String>,
+    /// Its cloud-init user data (with the enrollment token) is still in its config at
+    /// the provider, and `clear_user_data` removes it (ADR 0067). False where the
+    /// provider can't: Linode keeps it in its metadata service (ADR 0035).
+    pub user_data: bool,
 }
 
 impl ProviderMachine {
@@ -189,6 +193,12 @@ pub trait MachineProvider: Send + Sync {
     /// Wipes the machine's disks and reinstalls it from `spec`, then boots it. It keeps
     /// its id, IP and firewall. Everything on its disks is lost.
     fn rebuild<'a>(&'a self, id: &'a str, spec: &'a RebuildSpec) -> Fut<'a, ()>;
+    /// Removes the machine's cloud-init user data from its config without restarting
+    /// it, once it is spent (ADR 0067). Succeeds if there is none, or the machine is
+    /// gone. Nothing to do where `ProviderMachine::user_data` is never set.
+    fn clear_user_data<'a>(&'a self, _id: &'a str) -> Fut<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
 
     // Firewalls (ADR 0035). Labels are unique per account, as machines' are.
 

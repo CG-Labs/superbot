@@ -428,6 +428,7 @@ async fn machines_that_dont_enroll_in_time_are_reported() {
     );
     reconcile(&env).await;
     assert_eq!(events(&env, "machine.enroll_timeout").await.len(), 1);
+    assert!(events(&env, "machine.user_data_cleared").await.is_empty(), "Linode's metadata keeps it (ADR 0035)");
 
     let (ub, _, b) = request(&env, "bea@example.com").await;
     reconcile(&env).await;

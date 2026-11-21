@@ -142,8 +142,9 @@ async fn a_users_machine_is_a_container_enrolled_and_reached_like_any_other() {
     reconcile(&env).await;
     let row = env.app.db.machine(&m.id).unwrap();
     assert_eq!((row.state, row.ipv4.as_deref(), row.provider_status.as_deref()), (State::Running, Some("127.0.0.1"), Some("running")));
-    assert!(row.backups, "daily snapshots turned on");
-    assert_eq!(env.incus.instance(&m.label).unwrap().body["config"]["snapshots.schedule"], "@daily");
+    let i = env.incus.instance(&m.label).unwrap();
+    assert_eq!(i.body["config"]["cloud-init.user-data"], user_data.as_str(), "kept until it has enrolled");
+    assert!(!row.backups && i.body["config"].get("snapshots.schedule").is_none(), "no snapshot of a live token");
     let cfg = config(&env, &m.id, &token_in(&user_data));
     let id = agent::enroll(&cfg).await.unwrap();
     let agent = Agent::new(cfg, id).unwrap();
@@ -152,6 +153,22 @@ async fn a_users_machine_is_a_container_enrolled_and_reached_like_any_other() {
     assert_eq!(r["heartbeats"], 1, "{r}");
     let row = env.app.db.machine(&m.id).unwrap();
     assert_eq!((row.enrollment.as_str(), row.agent_version.as_deref()), ("enrolled", Some(agent::VERSION)));
+
+    // Enrolled, its token is spent: it leaves the container's config in place, and
+    // daily snapshots start.
+    let i = env.incus.instance(&m.label).unwrap();
+    assert!(i.body["config"].get("cloud-init.user-data").is_none(), "{}", i.body["config"]);
+    assert!(i.body["config"]["cloud-init.vendor-data"].as_str().is_none_or(|v| !v.contains("sbe_")));
+    assert_eq!((i.status.as_str(), i.boots), ("Running", 1), "not restarted");
+    assert_eq!(i.body["config"]["snapshots.schedule"], "@daily");
+    assert!(row.backups, "daily snapshots turned on");
+    let cleared = events(&env, "machine.user_data_cleared").await;
+    assert_eq!(cleared.len(), 1, "{cleared:?}");
+    assert_eq!((cleared[0]["details"]["reason"].as_str(), cleared[0]["details"]["providerId"].as_str()), (Some("enrolled"), Some(m.label.as_str())));
+    let puts = env.incus.calls("PUT", &format!("/1.0/instances/{}", m.label)).len();
+    reconcile(&env).await;
+    assert_eq!(events(&env, "machine.user_data_cleared").await.len(), 1, "once");
+    assert_eq!(env.incus.calls("PUT", &format!("/1.0/instances/{}", m.label)).len(), puts, "nothing more asked of Incus");
 
     // Suspend, resume, and resize are container stops, starts, and limits.
     let (code, s) = json_call(&env, "POST", &format!("/api/users/{uid}/machine/suspend"), "").await;
@@ -172,6 +189,70 @@ async fn a_users_machine_is_a_container_enrolled_and_reached_like_any_other() {
     assert!(env.incus.instance(&m.label).is_none());
     assert!(env.incus.w().acls.is_empty(), "the firewall went with the last machine");
     assert_eq!(events(&env, "machine.firewall_deleted").await.len(), 1);
+}
+
+#[tokio::test]
+async fn enrollment_data_goes_once_the_deadline_passes_but_not_mid_rebuild_or_before_first_boot() {
+    let env = serve().await;
+    let (uid, m) = request(&env, "ada@example.com").await;
+    let (_, never) = request(&env, "bea@example.com").await;
+    let user_data = env.incus.instance(&m.label).unwrap().body["config"]["cloud-init.user-data"].as_str().unwrap().to_string();
+    env.incus.w().instances.get_mut(&never.label).unwrap().status = "Stopped".into();
+    reconcile(&env).await;
+    assert_eq!(env.app.db.machine(&m.id).unwrap().state, State::Running);
+
+    // Late, with a rebuild queued: the rebuild may still need it.
+    assert!(env.app.db.machine_rebuild_queue(&m.id, "rb1", "admin", true, None));
+    for id in [&m.id, &never.id] {
+        env.app.db.machine_rebuild_backdate(id, 3_600_000);
+    }
+    reconcile(&env).await;
+    reconcile(&env).await;
+    assert_eq!(events(&env, "machine.enroll_timeout").await.len(), 2);
+    assert!(events(&env, "machine.user_data_cleared").await.is_empty());
+    assert!(env.incus.instance(&m.label).unwrap().body["config"].get("cloud-init.user-data").is_some());
+
+    // Without one, it goes from the running container; the one that never started
+    // keeps it, since its seed isn't rendered yet.
+    let (code, r) = json_call(&env, "DELETE", &format!("/api/users/{uid}/machine/rebuild"), "").await;
+    assert_eq!(code, 200, "{r}");
+    reconcile(&env).await;
+    let cleared = events(&env, "machine.user_data_cleared").await;
+    assert_eq!(cleared.len(), 1, "{cleared:?}");
+    assert_eq!((cleared[0]["targetId"].as_str(), cleared[0]["details"]["reason"].as_str()), (Some(m.id.as_str()), Some("enroll_timeout")));
+    let i = env.incus.instance(&m.label).unwrap();
+    assert!(i.body["config"].get("cloud-init.user-data").is_none());
+    assert_eq!((i.status.as_str(), i.boots), ("Running", 1));
+    assert!(env.incus.instance(&never.label).unwrap().body["config"].get("cloud-init.user-data").is_some());
+    assert!(!env.app.db.machine(&never.id).unwrap().backups);
+
+    // The container has its own copy, so a late enrollment still works.
+    agent::enroll(&config(&env, &m.id, &token_in(&user_data))).await.unwrap();
+    assert_eq!(env.app.db.machine(&m.id).unwrap().enrollment, "enrolled");
+    reconcile(&env).await;
+    assert_eq!(events(&env, "machine.user_data_cleared").await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_failed_clear_is_audited_and_tried_again() {
+    let env = serve().await;
+    let (_, m) = request(&env, "ada@example.com").await;
+    let user_data = env.incus.instance(&m.label).unwrap().body["config"]["cloud-init.user-data"].as_str().unwrap().to_string();
+    reconcile(&env).await;
+    agent::enroll(&config(&env, &m.id, &token_in(&user_data))).await.unwrap();
+
+    env.incus.w().races = 3;
+    reconcile(&env).await;
+    let failed = events(&env, "machine.user_data_clear_failed").await;
+    assert_eq!((failed.len(), failed[0]["outcome"].as_str()), (1, Some("failure")), "{failed:?}");
+    assert!(failed[0]["details"]["error"].as_str().unwrap().contains("kept changing"), "{failed:?}");
+    assert!(!env.app.db.machine(&m.id).unwrap().backups, "no snapshots yet");
+
+    reconcile(&env).await;
+    assert_eq!(events(&env, "machine.user_data_cleared").await.len(), 1);
+    let c = env.incus.instance(&m.label).unwrap().body["config"].clone();
+    assert!(c.get("cloud-init.user-data").is_none() && c["user.other-client"].is_string(), "{c}");
+    assert!(env.app.db.machine(&m.id).unwrap().backups);
 }
 
 #[tokio::test]
