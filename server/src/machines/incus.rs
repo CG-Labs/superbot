@@ -1345,6 +1345,17 @@ impl MachineProvider for Incus {
     /// should botd stop before deleting it.
     fn create_backup<'a>(&'a self, id: &'a str, backup: &'a str) -> Fut<'a, ()> {
         Box::pin(async move {
+            let p = self
+                .call(Method::GET, &format!("/1.0/projects/{}", self.s.project), &[], None, None)
+                .await?
+                .metadata;
+            if p["config"]["restricted"] == "true" && p["config"]["restricted.backups"] != "allow" {
+                let pr = &self.s.project;
+                return Err(api(
+                    409,
+                    format!("Incus project {pr} blocks backups: run `incus project set {pr} restricted.backups=allow` (docs/ops/incus-containers.md)"),
+                ));
+            }
             let expires = chrono::Utc::now() + chrono::Duration::hours(BACKUP_EXPIRY_HOURS);
             let body = json!({
                 "name": name(backup)?,

@@ -684,6 +684,10 @@ async fn handle(
                     if w.backups.contains_key(&(n.clone(), b.clone())) {
                         return err(409, "Backup already exists");
                     }
+                    let pc = w.projects.get(&project).cloned().unwrap_or_default();
+                    if pc["restricted"] == "true" && pc["restricted.backups"] != "allow" {
+                        return err(500, &format!("Project {project:?} doesn't allow for backup creation"));
+                    }
                     let files: serde_json::Map<String, Value> = i
                         .files
                         .iter()

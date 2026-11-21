@@ -129,5 +129,6 @@ Admins see the machine's `lastBackup` in its view. The owner sees `lastBackupAt`
 - Everything on the machine since the backup is lost on restore, and the API and botctl say so. Restore takes the machine offline from the swap until it enrolls.
 - Between deleting the old container and renaming the copy, a crash leaves the machine without a container. The restore then fails, and the backup is still in the store to try again.
 - A backup can only be restored to the same machine, on a host that runs this provider. Moving machines between hosts or substrates is still to come (ADR 0065).
+- The restricted project must allow backups (`restricted.backups=allow`); Incus blocks them otherwise. This lets a client of the project export its containers, which botd's certificate can do anyway. It loosens none of the isolation in ADR 0065, and botd's checks before each create still refuse every setting that would. botd reports the command to run if backups are blocked.
 - Exports are full each time, with no deduplication or incrementals. Storage costs scale with disk size times retention.
 - Linode machines keep Linode's own backups (`MACHINE_BACKUPS`). Exporting them is out of scope.

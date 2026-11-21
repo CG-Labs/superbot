@@ -32,7 +32,7 @@ incus project create superbot \
   -c restricted.networks.access=superbot0
 ```
 
-`restricted=true` makes Incus refuse privileged containers, nesting, host paths, raw id maps and unmanaged devices in this project, for every client. Don't set any `restricted.*` option to `allow`. botd checks the project before every create and refuses if it is loosened.
+`restricted=true` makes Incus refuse privileged containers, nesting, host paths, raw id maps and unmanaged devices in this project, for every client. Don't set any `restricted.*` option to `allow`, except `restricted.backups` for off-host backups (step 7). botd checks the project before every create and refuses if it is loosened.
 
 ## 4. botd's certificate
 
@@ -113,6 +113,12 @@ MACHINE_BACKUP_S3_ACCESS_KEY_ID_FILE=/etc/superbot/backup-s3-key-id
 MACHINE_BACKUP_S3_SECRET_ACCESS_KEY_FILE=/etc/superbot/backup-s3-secret
 MACHINE_BACKUP_AGE_RECIPIENTS=age1...      # recommended; keep the identity off this server
 MACHINE_BACKUP_RETENTION=7,pro=30          # days; the bare number is every other tier's
+```
+
+A restricted project blocks backups, so allow just those. botd's backups fail with this command in the error until you do:
+
+```bash
+incus project set superbot restricted.backups=allow
 ```
 
 Optional: `MACHINE_BACKUP_S3_REGION` (`us-east-1`), `MACHINE_BACKUP_S3_PREFIX` (`superbot/`), `MACHINE_BACKUP_INTERVAL_HOURS` (24). Give the key only `PutObject`, `GetObject`, `DeleteObject`, `ListBucket` and the multipart actions on that bucket or prefix.

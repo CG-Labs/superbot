@@ -37,6 +37,7 @@ async fn serve(recipients: Vec<age::x25519::Recipient>) -> Env {
     let agent_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let (mport, aport) = (machine_listener.local_addr().unwrap().port(), agent_listener.local_addr().unwrap().port());
     let incus = StandIn::start().await;
+    incus.w().projects.insert("superbot".into(), json!({ "restricted": "true", "restricted.backups": "allow" }));
     let s3 = s3_standin::StandIn::start().await;
     let p = Incus::new(incus.settings(Some(("127.0.0.1".parse().unwrap(), mport))), incus.credentials()).unwrap();
     let mut cp = ControlPlane::for_tests(Arc::new(p));
@@ -322,6 +323,14 @@ async fn the_schedule_backs_up_only_enrolled_machines_and_keeps_the_newest() {
     let (code, e) = json_call(&env, "POST", &format!("/api/users/{other}/machine/backups"), "").await;
     assert_eq!(code, 409, "{e}");
 
+    // A restricted project blocks backups unless they're allowed; botd says how.
+    env.incus.w().projects.insert("superbot".into(), json!({ "restricted": "true" }));
+    let blocked = back_up(&env, &uid).await;
+    assert!(blocked.state == "failed" && blocked.error.as_deref().is_some_and(|e| e.contains("restricted.backups=allow")), "{:?}", blocked.error);
+    assert!(env.incus.w().backups.is_empty());
+    env.incus.w().projects.insert("superbot".into(), json!({ "restricted": "true", "restricted.backups": "allow" }));
+    env.app.db.machine_backup_backdate(&blocked.id, DAY_MS);
+
     assert_eq!(backup::pass(&env.app, &env.cp).await, 1, "only the enrolled one");
     assert_eq!(backup::pass(&env.app, &env.cp).await, 0, "not due again yet");
     let first = env.app.db.machine_last_backup(&m.id).unwrap();
@@ -332,7 +341,7 @@ async fn the_schedule_backs_up_only_enrolled_machines_and_keeps_the_newest() {
     env.s3.w().fail = Some(("PUT".into(), 503));
     assert_eq!(backup::pass(&env.app, &env.cp).await, 0);
     let failed = env.app.db.machine_backups(&m.id).into_iter().find(|b| b.state == "failed").unwrap();
-    assert_eq!(events(&env, "machine.backup_failed").await.len(), 1);
+    assert_eq!(events(&env, "machine.backup_failed").await.len(), 2, "the blocked one, then this");
     assert!(env.incus.w().backups.is_empty(), "the provider's copy is deleted anyway");
     assert_eq!(backup::pass(&env.app, &env.cp).await, 0, "not straight away");
     env.app.db.machine_backup_backdate(&failed.id, 3_600_000);
