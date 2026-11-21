@@ -234,7 +234,7 @@ async fn main() {
     let (payments, ignored_stripe) =
         billing::Billing::configured(&secrets::env::EnvStore::process(), &|k| env(k, ""), testing).unwrap_or_else(|e| exit(format!("Billing: {e}")));
     let notifier = notify::Notifier::from_env(&|k| env(k, ""), sessions).unwrap_or_else(|e| exit(format!("Notifications: {e}")));
-    let (billing_mail, billing_mail_said) = billing_mail::configured(&|k| env(k, ""), payments.enabled(), notifier.smtp.as_ref(), notifier.links.base.as_deref())
+    let (billing_mail, plan_mail_said) = billing_mail::configured(&|k| env(k, ""), payments.enabled(), notifier.smtp.as_ref(), notifier.links.base.as_deref())
         .unwrap_or_else(|e| exit(format!("Billing emails: {e}")));
     let allow_no_auth = auth_startup(&host, &password, break_glass);
     secrets::redact::register(&password);
@@ -486,7 +486,7 @@ async fn main() {
         log_warn!("WARNING: {w}");
     }
     log_info!("Billing: {}.", billing::describe(auth_state.payments.enabled(), auth_state.payments.checkout_enabled(), app.meter.get().is_some(), app.tiers()));
-    log_info!("Billing emails: {billing_mail_said}.");
+    log_info!("Billing emails: {plan_mail_said}.");
     if let Some(m) = billing_mail {
         let _ = app.billing_mail.set(Arc::new(m));
     }
