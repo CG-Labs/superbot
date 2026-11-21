@@ -257,6 +257,8 @@ mod tests {
             ("GET", "/api/me/secrets", Perm::Read),
             ("GET", "/api/me/tier", Perm::Read),
             ("GET", "/api/tiers", Perm::Admin),
+            // Moving a managed tier's Bots onto its default harness (ADR 0079).
+            ("POST", "/api/tiers/pro/move-bots", Perm::Admin),
             // Everyone's plan and use, against their limits (ADR 0040).
             ("GET", "/api/usage", Perm::Admin),
             // Your own usage this billing period; anyone's is for admins (ADR 0050).

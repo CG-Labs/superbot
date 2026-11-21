@@ -95,6 +95,15 @@ pub fn server_update(bin: &str) -> Option<String> {
     }
 }
 
+/// How an admin installs `bin` on this server, for a Bot that says it isn't there.
+pub fn server_hint(bin: &str) -> String {
+    match PINS.iter().find(|p| p.bin == bin).map(|p| &p.source) {
+        Some(Source::Hermes { .. }) => "`deploy/install.sh --with-hermes`, or hermes in SUPERBOT_HARNESSES for Docker".into(),
+        Some(Source::Npm { .. }) => server_update(bin).map(|c| format!("`{c}`")).unwrap_or_default(),
+        None => format!("put {bin} on botd's PATH"),
+    }
+}
+
 /// Whether `v` is an exact semver version, not a tag or range.
 fn exact(v: &str) -> bool {
     let (core, pre) = v.split_once('-').map_or((v, None), |(c, p)| (c, Some(p)));

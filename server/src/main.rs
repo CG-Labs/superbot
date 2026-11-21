@@ -248,9 +248,14 @@ async fn main() {
     }
     // Machine enrollment's CA key is derived from the master key (ADR 0031).
     let bin_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+    // Users' machines get the managed tiers' default harnesses unless told otherwise (ADR 0079).
+    let managed_bins: Vec<&str> = tiers.managed_defaults().into_iter().filter_map(|h| adapters::get(h).map(|a| a.bin())).collect();
     let enrollment = machines::enroll::Enrollment::from_env(&|k| env(k, ""), &secrets::sealed::cipher(), &bin_dir)
         .unwrap_or_else(|e| exit(format!("Machine enrollment: {e}")))
-        .map(|e| control_plane.enroll_with(e).unwrap_or_else(|e| exit(format!("Machine enrollment: {e}"))));
+        .map(|mut e| {
+            e.upkeep.default_to(&managed_bins).unwrap_or_else(|err| exit(format!("Machine enrollment: {err}")));
+            control_plane.enroll_with(e).unwrap_or_else(|e| exit(format!("Machine enrollment: {e}")))
+        });
 
     let mut isolation = accounts::Isolation::from_env(|k| env(k, ""), &bin_dir, &data_dir).unwrap_or_else(|e| exit(format!("Isolation: {e}")));
     let teammate_accounts = accounts::teammates_flag(&env("ISOLATION_TEAMMATES", ""), isolation.is_some(), shared_bots == acl::SharedBots::Isolated)
@@ -352,6 +357,23 @@ async fn main() {
     let saved = |k: &str| secrets::global().get(k).ok().flatten().is_some_and(|v| !v.expose().trim().is_empty());
     for p in app.tiers().providers().iter().filter(|p| !saved(&p.key_secret)) {
         eprintln!("WARNING: TIERS_FILE provider \"{}\" has no key: the secret its keySecret names isn't saved or set in botd's environment. Runs routed to it are refused until it is (botctl secret set).", p.name);
+    }
+    {
+        let installed = adapters::installed();
+        let here = (control_plane.routing != machines::route::Routing::On).then_some(installed.as_slice());
+        let upkeep = control_plane.enrollment.as_ref().map(|e| &e.upkeep).filter(|_| control_plane.routing != machines::route::Routing::Off);
+        let on_machines: Option<Vec<&str>> = upkeep.map(|u| {
+            let defaults = app.tiers().managed_defaults();
+            let lacking = u.lacks(&defaults.iter().filter_map(|h| adapters::get(h).map(|a| a.bin())).collect::<Vec<_>>());
+            defaults.into_iter().filter(|h| adapters::get(h).is_some_and(|a| !lacking.contains(&a.bin()))).collect()
+        });
+        let (line, warnings) = app.tiers().default_harness_notes(&app.cfg.default_harness, here, on_machines.as_deref());
+        if let Some(line) = line {
+            println!("{line}");
+        }
+        for w in warnings {
+            eprintln!("WARNING: {w}");
+        }
     }
     secrets::redact::register(env("LICENSE_KEY", "").trim());
     app.license.set_testing(testing);
@@ -476,6 +498,7 @@ async fn main() {
         "notifications": notify_summary,
         "tiers": app.tiers().all().iter().map(|t| &t.name).collect::<Vec<_>>(),
         "defaultTier": app.tiers().default_tier().name,
+        "tierHarnesses": app.tiers().all().iter().filter_map(|t| Some((t.name.clone(), json!(t.default_harness.as_ref()?)))).collect::<serde_json::Map<_, _>>(),
         "license": license.summary(),
     })));
     license::start(app.clone());
@@ -588,6 +611,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/me/tier", get(my_tier))
         .route("/me/usage", get(usage::mine))
         .route("/tiers", get(list_tiers))
+        .route("/tiers/{name}/move-bots", post(move_bots))
         .route("/usage", get(admin_usage))
         .route("/billing", get(billing::info))
         .route("/billing/checkout", post(billing::checkout))
@@ -1497,14 +1521,10 @@ async fn list_models(State(app): State<AppState>, Extension(c): Extension<Caller
     Ok(Json(json!(picked)))
 }
 
-/// The harness new Bots of this user get: `DEFAULT_HARNESS`, unless their tier has
-/// no route for it; then the tier's first.
+/// The harness new Bots of this user get when none is asked for: their plan's on a
+/// managed tier (ADR 0079), `DEFAULT_HARNESS` on an open one.
 fn default_harness_for(app: &App, user_id: &str) -> String {
-    let tier = app.tier_of(user_id);
-    match tier.harnesses() {
-        Some(h) if !h.contains(&app.cfg.default_harness.as_str()) => h[0].to_string(),
-        _ => app.cfg.default_harness.clone(),
-    }
+    app.tier_of(user_id).new_bot_harness(&app.cfg.default_harness).to_string()
 }
 
 /// `GET /api/me/tier`: your plan, its limits, and what you've used this month. No
@@ -1574,6 +1594,53 @@ async fn admin_usage(State(app): State<AppState>, Extension(a): Extension<Arc<Au
 /// `GET /api/tiers` (admins): every tier with its routes, and the default.
 async fn list_tiers(State(app): State<AppState>) -> Json<Value> {
     Json(app.tiers().admin_view())
+}
+
+/// `POST /api/tiers/{name}/move-bots` (admins) `{user?, dryRun?}`: moves the Bots of a
+/// managed tier's users (or one of them) that run on another harness onto the tier's
+/// default (ADR 0079). Nothing moves on its own: a Bot keeps its harness until an admin
+/// does this. As with any harness change, its session, model and effort are cleared.
+/// A Bot that is running or has work waiting is skipped, so a run never changes under it.
+async fn move_bots(State(app): State<AppState>, Extension(by): Extension<Who>, Path(name): Path<String>, Json(v): Json<Value>) -> Res {
+    let tier = app.tiers().get(&name).cloned().ok_or_else(|| not_found("Tier"))?;
+    let Some(to) = tier.default_harness.clone() else {
+        return Err(bad(format!("The {} tier is open: its Bots run on whatever harness they're set to, and new ones get DEFAULT_HARNESS.", tier.label)));
+    };
+    let dry_run = v["dryRun"].as_bool().unwrap_or(false);
+    let user = match v["user"].as_str().map(str::trim).filter(|u| !u.is_empty()) {
+        None => None,
+        Some(key) => {
+            let u = users::need_user_key(&app, key)?;
+            let on = app.tier_of(&u.id);
+            if on.name != tier.name {
+                return Err(ApiError(StatusCode::CONFLICT, format!("{} is on the {} plan, not {}.", u.email.as_deref().unwrap_or(&u.name), on.label, tier.label)));
+            }
+            Some(u.id)
+        }
+    };
+    let (mut moved, mut skipped) = (Vec::new(), Vec::new());
+    let bots = app.db.bots().into_iter().filter(|b| b.harness != to && user.as_ref().is_none_or(|u| *u == b.owner_id) && app.tier_of(&b.owner_id).name == tier.name);
+    for b in bots {
+        if app.is_busy(&b.id) {
+            skipped.push(json!({ "id": b.id, "name": b.name, "owner": b.owner_id, "from": b.harness, "reason": "busy" }));
+            continue;
+        }
+        let item = json!({ "id": b.id, "name": b.name, "owner": b.owner_id, "from": b.harness });
+        if !dry_run {
+            let patch = BotPatch { harness: Some(to.clone()), session_id: Some(None), model: Some(None), effort: Some(None), ..Default::default() };
+            app.db.update_bot(&b.id, patch);
+            app.push_bot(&b.id);
+            let after = need_bot(&app, &b.id)?;
+            let details = json!({ "changes": bot_changes(&b, &after), "via": "tier_default", "tier": tier.name });
+            app.db.record(&by.event("bot.updated").target("bot", &b.id).bot(&b.id).details(details));
+        }
+        moved.push(item);
+    }
+    if !dry_run && !moved.is_empty() {
+        let details = json!({ "to": to, "moved": moved.len(), "skipped": skipped.len(), "user": user });
+        app.db.record(&by.event("tier.bots_moved").target("tier", &tier.name).details(details));
+    }
+    Ok(Json(json!({ "tier": tier.name, "to": to, "dryRun": dry_run, "moved": moved, "skipped": skipped })))
 }
 
 /// The Bot settings must fit the owner's tier: harness, model, and effort, and on
@@ -1771,9 +1838,12 @@ async fn create_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
         (None, Principal::Bot) => acting_bot(&app, &c, &by, None)?.owner_id,
         (None, _) => users::OPERATOR.into(),
     };
-    let harness = p.harness.unwrap_or_else(|| default_harness_for(&app, &owner));
-    check_tier(&app, &owner, &harness, p.model.clone().flatten().as_deref(), p.effort.clone().flatten().as_deref(), None)?;
     let tier = app.tier_of(&owner);
+    let (harness, harness_from) = match p.harness {
+        Some(h) => (h, "chosen"),
+        None => (default_harness_for(&app, &owner), if tier.managed() { "plan" } else { "server" }),
+    };
+    check_tier(&app, &owner, &harness, p.model.clone().flatten().as_deref(), p.effort.clone().flatten().as_deref(), None)?;
     let max = tier.limits.max_bots;
     let bot = app
         .db
@@ -1795,7 +1865,9 @@ async fn create_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
         })?;
     app.init_bot_files(&bot);
     app.push_bot(&bot.id);
-    let details = json!({ "name": bot.name, "harness": bot.harness, "model": bot.model, "owner": bot.owner_id, "visibility": bot.visibility });
+    let details = json!({
+        "name": bot.name, "harness": bot.harness, "harnessFrom": harness_from, "tier": tier.name, "model": bot.model, "owner": bot.owner_id, "visibility": bot.visibility,
+    });
     app.db.record(&by.event("bot.created").target("bot", &bot.id).bot(&bot.id).details(details));
     let access = viewer(&app, &c, &by).access(&app.db, &bot);
     Ok((StatusCode::CREATED, Json(bot_view_for(&app, &c, &bot, access))))

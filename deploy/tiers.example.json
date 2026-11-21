@@ -8,6 +8,7 @@
     {
       "name": "starter",
       "label": "Starter",
+      "defaultHarness": "hermes",
       "routes": [
         { "harness": "hermes", "provider": "openrouter", "model": "anthropic/claude-haiku-4.5" }
       ],
@@ -17,6 +18,7 @@
     {
       "name": "pro",
       "label": "Pro",
+      "defaultHarness": "hermes",
       "routes": [
         { "harness": "hermes", "provider": "openrouter", "model": "anthropic/claude-sonnet-4.5",
           "fallback": [{ "provider": "anthropic-api", "model": "claude-sonnet-4-5" }] },
@@ -28,6 +30,7 @@
     {
       "name": "max",
       "label": "Max",
+      "defaultHarness": "hermes",
       "routes": [
         { "harness": "hermes", "provider": "openrouter", "model": "anthropic/claude-opus-4.1",
           "fallback": [{ "provider": "anthropic-api", "model": "claude-opus-4-1" }, { "provider": "openai-api", "model": "gpt-5" }] },

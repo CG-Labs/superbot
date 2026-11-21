@@ -62,10 +62,18 @@ pub struct Upkeep {
     pub upgrades: Upgrades,
     /// MACHINE_LEGACY_REBUILDS (ADR 0056).
     pub rebuilds: super::rebuild::Rebuilds,
+    /// MACHINE_HARNESSES was left unset, so the managed tiers' defaults may fill it in.
+    pub unset: bool,
+    /// The plan is the managed tiers' default harnesses, not MACHINE_HARNESSES (ADR 0079).
+    pub defaulted: bool,
 }
 
-/// `claude,codex@0.172.0,hermes@<commit>=<sha256>`: commas or spaces between.
+/// `claude,codex@0.172.0,hermes@<commit>=<sha256>`: commas or spaces between. `none`:
+/// nothing.
 pub fn parse_harnesses(raw: &str) -> Result<Option<HarnessPlan>, String> {
+    if raw.trim().eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
     let mut list = Vec::new();
     for item in raw.split([',', ' ', '\t', '\n']).map(str::trim).filter(|s| !s.is_empty()) {
         let (spec, checksum) = item.split_once('=').map_or((item, None), |(s, c)| (s, Some(c)));
@@ -93,11 +101,30 @@ impl Upkeep {
             v => return Err(format!("MACHINE_AGENT_UPGRADES must be manual or auto, not \"{v}\"")),
         };
         let rebuilds = super::rebuild::Rebuilds::parse(&var("MACHINE_LEGACY_REBUILDS"))?;
-        Ok(Upkeep { plan: parse_harnesses(&var("MACHINE_HARNESSES"))?, upgrades, rebuilds })
+        let raw = var("MACHINE_HARNESSES");
+        Ok(Upkeep { plan: parse_harnesses(&raw)?, upgrades, rebuilds, unset: raw.trim().is_empty(), defaulted: false })
+    }
+
+    /// With MACHINE_HARNESSES unset, every machine gets the managed tiers' default
+    /// harnesses at their pins, so a new Bot on a managed plan can run on its owner's
+    /// machine (ADR 0079). `MACHINE_HARNESSES=none` keeps machines bare.
+    pub fn default_to(&mut self, harnesses: &[&str]) -> Result<(), String> {
+        if !self.unset || self.plan.is_some() || harnesses.is_empty() {
+            return Ok(());
+        }
+        self.plan = parse_harnesses(&harnesses.join(",")).map_err(|e| format!("the managed tiers' default harnesses: {e}"))?;
+        self.defaulted = self.plan.is_some();
+        Ok(())
+    }
+
+    /// Harnesses in `wanted` that machines won't get from botd.
+    pub fn lacks<'a>(&self, wanted: &[&'a str]) -> Vec<&'a str> {
+        wanted.iter().copied().filter(|h| self.plan.as_ref().is_none_or(|p| !p.harnesses.iter().any(|i| i.name == *h))).collect()
     }
 
     pub fn describe(&self) -> String {
         let harnesses = self.plan.as_ref().map_or("none".into(), |p| names(p).join(", "));
+        let harnesses = if self.defaulted { format!("{harnesses} (the managed tiers' default; MACHINE_HARNESSES=none for none)") } else { harnesses };
         format!(
             "harnesses on machines: {harnesses}; agent upgrades: {}; rebuilds of old machines: {}",
             self.upgrades.as_str(),
@@ -535,6 +562,32 @@ mod tests {
             let bad = |key: &str| if key == k { v.to_string() } else { String::new() };
             assert!(Upkeep::from_env(&bad).is_err(), "{k}={v}");
         }
+    }
+
+    #[test]
+    fn machines_get_the_managed_default_unless_told_otherwise() {
+        let with = |v: &'static str| move |k: &str| if k == "MACHINE_HARNESSES" { v.to_string() } else { String::new() };
+        // Unset: the managed tiers' default, at its pin.
+        let mut u = Upkeep::from_env(&with("")).unwrap();
+        assert!(u.unset && !u.defaulted);
+        assert_eq!(u.lacks(&["hermes"]), ["hermes"]);
+        u.default_to(&["hermes"]).unwrap();
+        assert_eq!(u.plan.as_ref().map(names).unwrap().len(), 1);
+        assert!(names(u.plan.as_ref().unwrap())[0].starts_with("hermes@"));
+        assert!(u.defaulted && u.describe().contains("the managed tiers' default"), "{}", u.describe());
+        assert!(u.lacks(&["hermes"]).is_empty());
+        // No managed tiers (self-host): still nothing.
+        let mut open = Upkeep::from_env(&with("")).unwrap();
+        open.default_to(&[]).unwrap();
+        assert!(open.plan.is_none() && !open.defaulted);
+        // `none`, or a list of its own, is what machines get.
+        let mut none = Upkeep::from_env(&with("none")).unwrap();
+        none.default_to(&["hermes"]).unwrap();
+        assert!(none.plan.is_none() && !none.unset && none.describe().contains("harnesses on machines: none"));
+        let mut own = Upkeep::from_env(&with("claude")).unwrap();
+        own.default_to(&["hermes"]).unwrap();
+        assert_eq!(names(own.plan.as_ref().unwrap()), ["claude@2.1.329"]);
+        assert_eq!(own.lacks(&["hermes", "claude"]), ["hermes"]);
     }
 
     #[test]
