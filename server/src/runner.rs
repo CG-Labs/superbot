@@ -230,6 +230,8 @@ pub struct App {
     pub run_tokens: isolation::RunTokens,
     /// TEAMS and TEAM_MACHINE_DAYS (ADR 0087). Unset: the defaults.
     pub teams: OnceLock<crate::teams::Settings>,
+    /// STATUS_PAGE, and the public status page's shared snapshot (ADR 0090).
+    pub status: crate::status::Page,
     closing: AtomicBool,
 }
 
@@ -268,6 +270,7 @@ impl App {
             teammate_gate: Default::default(),
             storage: Default::default(),
             teams: OnceLock::new(),
+            status: Default::default(),
             closing: AtomicBool::new(false),
         })
     }
