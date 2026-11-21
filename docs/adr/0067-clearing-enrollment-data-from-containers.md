@@ -67,7 +67,7 @@ The reconciler turns on a machine's daily snapshots only once its config holds n
 ## Consequences
 
 - An Incus container's config holds a live enrollment token only between its create (or rebuild) and its enrollment, or its deadline. After that, `incus config show` no longer shows the enrollment data.
-- Daily snapshots of a new container start once it has enrolled, normally a few minutes later. A container that never starts or never enrolls gets none.
+- Daily snapshots of a new container start once its user data is cleared: normally a few minutes after it enrolls, or after it misses its deadline while running with no rebuild underway. A container that never starts keeps its user data and gets no snapshots.
 - Residue: a machine that already had snapshots turned on and is then rebuilt keeps the new user data until it enrolls again. A scheduled snapshot in that window copies it, and that copy is spent or expired within the hour. Snapshots expire after 7 days.
 - Linode is unchanged. Its metadata service keeps the user data (ADR 0035).
 
