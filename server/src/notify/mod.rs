@@ -10,16 +10,17 @@
 //! window has the rest folded into one digest at its end. Every send and failure is an
 //! audit event.
 //!
-//! Channels share one shape (`Channel`): mobile push (#36) is another one, reaching the
-//! same `Plan::deciders`.
+//! Channels share one shape (`Channel`): mobile push (ADR 0079, #36) is another one,
+//! reaching the devices of the same `Plan::deciders`.
 
 pub mod api;
+pub mod push;
 pub mod smtp;
 pub mod webhook;
 
 use crate::acl::{Access, Grant, Viewer};
 use crate::audit::{Actor, Event, Outcome};
-use crate::db::{Approval, Bot, Db, User};
+use crate::db::{Approval, Bot, Db, PushDevice, PushKind, User};
 use crate::rbac::{self, Perm, Principal};
 use crate::runner::App;
 use crate::secrets;
@@ -262,16 +263,19 @@ pub fn deciders(db: &Db, bot: &Bot) -> Vec<User> {
 /// Where one notice goes, worked out for one Bot (or for no Bot: a test of the global settings).
 #[derive(Clone, Debug, Default)]
 pub struct Plan {
-    /// Who can answer. Email reaches them when `email.deciders` is on; push (#36) will too.
+    /// Who can answer. Email reaches them when `email.deciders` is on; push reaches
+    /// their phones that opted in.
     pub deciders: Vec<User>,
     pub email: Vec<String>,
     /// The secret holding the URL, and the format.
     pub webhook: Option<(String, Format)>,
+    /// The deciders' live devices that want approvals (ADR 0079).
+    pub push: Vec<PushDevice>,
 }
 
 impl Plan {
     pub fn is_empty(&self) -> bool {
-        self.email.is_empty() && self.webhook.is_none()
+        self.email.is_empty() && self.webhook.is_none() && self.push.is_empty()
     }
 }
 
@@ -451,11 +455,13 @@ pub struct Sent {
     pub error: Option<String>,
     /// For the audit log: recipients, the webhook's host.
     pub detail: Value,
+    /// Push devices the provider says are gone, as (device, user), to forget.
+    pub gone: Vec<(String, String)>,
 }
 
 /// One way notices reach people. `send` returns None when the plan leaves this channel
-/// off. Email and webhooks today; mobile push (#36) is another, sending to the devices of
-/// `plan.deciders`.
+/// off. Email, webhooks, and mobile push (`push::PushChannel`, to the devices of
+/// `plan.deciders`).
 pub trait Channel: Send + Sync {
     fn name(&self) -> &'static str;
     fn send<'a>(&'a self, notice: &'a Notice, plan: &'a Plan, links: &'a Links) -> BoxFuture<'a, Option<Result<Sent, String>>>;
@@ -485,6 +491,7 @@ impl Channel for Email {
                     failed: failed.len(),
                     error: failed.first().map(|(to, e)| format!("{to}: {e}")),
                     detail: json!({ "to": plan.email, "refused": failed.iter().map(|(to, _)| to).collect::<Vec<_>>() }),
+                    gone: Vec::new(),
                 }
             }))
         })
@@ -588,6 +595,8 @@ impl Throttle {
 
 pub struct Notifier {
     pub smtp: Option<smtp::Smtp>,
+    /// Set when an operator turns push on (`PUSH_PROVIDER`).
+    pub push: Option<Arc<push::Push>>,
     pub links: Links,
     channels: Vec<Box<dyn Channel>>,
     throttle: Mutex<Throttle>,
@@ -600,14 +609,28 @@ impl Notifier {
             channels.push(Box::new(Email { smtp: s.clone() }));
         }
         channels.push(Box::new(Webhook { http: webhook::client() }));
-        Notifier { smtp, links: Links { base: public_url }, channels, throttle: Mutex::default() }
+        Notifier { smtp, push: None, links: Links { base: public_url }, channels, throttle: Mutex::default() }
     }
 
-    /// SMTP from the environment (`smtp::Smtp::from_env`); links from PUBLIC_URL,
+    /// Adds push as a channel for approvals, and for routines (`push::routine_done`).
+    pub fn with_push(mut self, p: push::Push) -> Notifier {
+        let p = Arc::new(p);
+        self.channels.push(Box::new(push::PushChannel(p.clone())));
+        self.push = Some(p);
+        self
+    }
+
+    /// SMTP from the environment (`smtp::Smtp::from_env`); push from PUSH_PROVIDER, its
+    /// devices live while their sessions are by `sessions`; links from PUBLIC_URL,
     /// SSO_PUBLIC_URL, or the first ALLOWED_HOSTS name.
-    pub fn from_env(var: &dyn Fn(&str) -> String) -> Result<Notifier, String> {
+    pub fn from_env(var: &dyn Fn(&str) -> String, sessions: crate::users::SessionConfig) -> Result<Notifier, String> {
         let smtp = smtp::Smtp::from_env(var)?;
-        Ok(Notifier::new(smtp, crate::billing::public_url(var).ok()))
+        let push = push::Push::from_env(var, sessions)?;
+        let n = Notifier::new(smtp, crate::billing::public_url(var).ok());
+        Ok(match push {
+            Some(p) => n.with_push(p),
+            None => n,
+        })
     }
 
     /// What startup prints.
@@ -621,8 +644,12 @@ impl Notifier {
             (true, false) => "webhook set, off",
             (false, _) => "no global webhook",
         };
+        let push = match &self.push {
+            Some(p) => format!("push through {}", p.provider()),
+            None => format!("push off (set {}=expo)", push::PROVIDER),
+        };
         let links = if self.links.base.is_some() { "" } else { "; links off (set PUBLIC_URL)" };
-        format!("{email}; {hook}{links}")
+        format!("{email}; {hook}; {push}{links}")
     }
 
     /// Where a notice for `bot` goes now. No Bot: the global settings alone.
@@ -647,7 +674,11 @@ impl Notifier {
         } else {
             None
         };
-        Plan { deciders, email, webhook }
+        let push = match (&self.push, bot) {
+            (Some(p), Some(_)) => p.devices(db, &deciders.iter().map(|u| u.id.clone()).collect::<Vec<_>>(), PushKind::Approvals),
+            _ => Vec::new(),
+        };
+        Plan { deciders, email, webhook, push }
     }
 
     fn item(&self, a: &Approval, owner: &str, detail: Detail) -> Item {
@@ -732,7 +763,7 @@ impl Notifier {
         let plan = self.plan(&app.db, bot, &s);
         if plan.is_empty() {
             return Err(match bot {
-                Some(b) => format!("Nothing would reach anyone for {}: turn on email or a webhook first", b.name),
+                Some(b) => format!("Nothing would reach anyone for {}: turn on email or a webhook, or have a decider turn on push in the app, first", b.name),
                 None => "Nothing would reach anyone: turn on email with an address, or set a webhook, first".into(),
             });
         }
@@ -763,6 +794,7 @@ impl Notifier {
             let Some(r) = r else { continue };
             let (ok, mut d) = match r {
                 Ok(s) => {
+                    push::forget_gone(&app.db, &s.gone);
                     let mut d = s.detail;
                     d["delivered"] = json!(s.delivered);
                     if s.failed > 0 {
@@ -827,6 +859,11 @@ pub fn alert(app: &Arc<App>, a: Alert, page: &'static str) {
             n.alert(&app, a, page).await;
         });
     }
+}
+
+/// A routine's run is over: the person it ran for hears of it on their phones (ADR 0079).
+pub fn routine_done(app: &Arc<App>, bot: &Bot, msg: &crate::db::Message) {
+    push::routine_done(app, bot, msg);
 }
 
 /// A deleted Bot's own settings and webhook URL go with it.

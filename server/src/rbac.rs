@@ -129,6 +129,8 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         ("GET", ["billing"]) => Read,
         ("POST", ["billing", "checkout" | "portal"]) => Write,
         ("PUT" | "DELETE", ["me", "secrets", _]) => Write,
+        // This session's phone for push notifications (ADR 0079). Handlers refuse Bots.
+        ("GET" | "PUT" | "DELETE", ["me", "push"]) => Account,
 
         ("GET", ["state" | "events" | "bots" | "policy"]) => Read,
         ("GET", ["harnesses", _, "models"]) => Read,
@@ -345,6 +347,10 @@ mod tests {
             ("GET", "/api/machine/teammate//harness-logins", Perm::Admin),
             ("POST", "/api/machine/folder-sync", Perm::Admin),
             ("POST", "/api/auth/logout", Perm::Account),
+            ("GET", "/api/me/push", Perm::Account),
+            ("PUT", "/api/me/push", Perm::Account),
+            ("DELETE", "/api/me/push", Perm::Account),
+            ("POST", "/api/me/push", Perm::Admin),
             ("GET", "/", Perm::Read),
             ("GET", "/app.js", Perm::Read),
             ("HEAD", "/api/state", Perm::Read),

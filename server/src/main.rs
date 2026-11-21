@@ -66,6 +66,8 @@ mod passwd;
 mod notify;
 #[cfg(test)]
 mod notify_http_tests;
+#[cfg(test)]
+mod push_http_tests;
 mod paths;
 mod policy;
 #[cfg(test)]
@@ -207,7 +209,7 @@ async fn main() {
     let testing = license::testing_flag(&env("TESTING_MODE", "")).unwrap_or_else(|e| exit(e));
     let (payments, ignored_stripe) =
         billing::Billing::configured(&secrets::env::EnvStore::process(), &|k| env(k, ""), testing).unwrap_or_else(|e| exit(format!("Billing: {e}")));
-    let notifier = notify::Notifier::from_env(&|k| env(k, "")).unwrap_or_else(|e| exit(format!("Notifications: {e}")));
+    let notifier = notify::Notifier::from_env(&|k| env(k, ""), sessions).unwrap_or_else(|e| exit(format!("Notifications: {e}")));
     let allow_no_auth = auth_startup(&host, &password, break_glass);
     secrets::redact::register(&password);
     if adapters::get(&default_harness).is_none() {
@@ -419,7 +421,12 @@ async fn main() {
     }
     let notifications = notify::load(&app.db);
     println!("Notifications: {}.", notifier.describe(&notifications));
-    let notify_summary = json!({ "email": notifier.smtp.is_some() && notifications.email.enabled, "webhook": notifications.webhook.enabled, "bots": notifications.bots.len() });
+    let notify_summary = json!({
+        "email": notifier.smtp.is_some() && notifications.email.enabled,
+        "webhook": notifications.webhook.enabled,
+        "push": notifier.push.as_ref().map(|p| p.provider()),
+        "bots": notifications.bots.len(),
+    });
     let _ = app.notifier.set(Arc::new(notifier));
     if let Some(w) = &ignored_stripe {
         eprintln!("WARNING: {w}");
@@ -594,6 +601,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/billing/portal", post(billing::portal))
         .route("/setup", get(setup::status).patch(setup::update))
         .route("/license", get(license::get).put(license::put).delete(license::delete))
+        .route("/me/push", get(notify::push::get_mine).put(notify::push::put_mine).delete(notify::push::delete_mine))
         .route("/me/secrets", get(list_my_secrets))
         .route("/me/secrets/{name}", put(put_my_secret).delete(delete_my_secret))
         .route("/ask", post(ask))
