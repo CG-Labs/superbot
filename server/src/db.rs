@@ -1548,8 +1548,8 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 40] = [
 /// SCIM groups as teams (ADR 0095): which team each of a tenant's groups is. A team is
 /// one tenant's group at most. `origin` says who made the link: a SCIM `POST` that made
 /// the team (`scim`), or an admin linking a team that already existed (`admin`).
-/// `provisioned_at` is when the IdP first created or took on the group; an admin's link
-/// waits for that. `displayName` is unique in a tenant in any case, as Entra ID needs.
+/// `provisioned_at` is when the IdP created or took on the group; an admin's link, and a
+/// `POST` that stopped partway, wait for that. `displayName` is unique in a tenant in any case, as Entra ID needs.
 fn migrate_scim_groups(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
     c.execute_batch(
         "CREATE TABLE IF NOT EXISTS scim_groups (
@@ -5074,6 +5074,12 @@ impl Db {
         let g = tx.query_row("SELECT * FROM scim_groups WHERE team_id = ?", [team_id], scim_group_row).map_err(scim_group_conflict)?;
         tx.commit().map_err(scim_group_conflict)?;
         Ok(g)
+    }
+
+    /// A `POST` that made or took on the group stopped partway: it waits to be taken on
+    /// again, so the IdP's retry of that `POST` finishes it.
+    pub fn reopen_scim_group(&self, tenant: &str, team_id: &str) {
+        let _ = self.c().execute("UPDATE scim_groups SET provisioned_at = NULL, updated_at = ?1 WHERE tenant = ?2 AND team_id = ?3", params![now(), tenant, team_id]);
     }
 
     /// Ends a team's link to its group, and returns what it was. The team stays.

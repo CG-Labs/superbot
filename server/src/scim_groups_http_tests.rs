@@ -599,3 +599,39 @@ async fn seats_follow_the_group_and_a_paying_team_outlives_it() {
     assert_eq!((refused["details"]["reason"].as_str(), refused["details"]["via"].as_str()), (Some("team_pays"), Some("scim")));
     assert_eq!(scim(port, &t, "GET", &format!("{GROUPS}/{paid}"), Value::Null).await.0, 404);
 }
+
+#[tokio::test]
+async fn a_post_that_stopped_partway_is_finished_by_the_retry() {
+    let (port, app, admin) = serve().await;
+    let (t, _) = token(port, &admin, json!({ "tenant": "entra" })).await;
+    let al = person(port, &t, "al@example.com", "e1").await;
+    let cy = person(port, &t, "cy@example.com", "e2").await;
+    let body = json!({ "schemas": [GROUP_SCHEMA], "externalId": "8aa1-eng", "displayName": "Eng", "members": [{ "value": al }, { "value": cy }] });
+
+    // A POST whose second join lost a race to an admin: the group is saved with Al
+    // only, and waits for the IdP's retry.
+    let (code, _, g) = scim(port, &t, "POST", GROUPS, json!({ "displayName": "Eng", "externalId": "8aa1-eng", "members": [{ "value": al }] })).await;
+    assert_eq!(code, 201, "{g}");
+    let id = g["id"].as_str().unwrap().to_string();
+    app.db.reopen_scim_group("entra", &id);
+
+    // The retry finishes it on the same team, and the next is a 409 as usual.
+    let (code, _, again) = scim(port, &t, "POST", GROUPS, body.clone()).await;
+    assert_eq!((code, again["id"].as_str()), (201, Some(id.as_str())), "{again}");
+    assert_eq!(on_team(&app, &id).len(), 2);
+    assert_eq!(app.db.teams().len(), 1);
+    let resumed = &events(port, &admin, "action=scim.group_resumed").await[0];
+    assert_eq!(resumed["targetId"], id.as_str());
+    let upd = &events(port, &admin, "action=scim.group_updated").await[0];
+    assert_eq!(upd["details"]["added"], json!([cy]));
+    let (code, _, dup) = scim(port, &t, "POST", GROUPS, body).await;
+    assert_eq!((code, dup["scimType"].as_str()), (409, Some("uniqueness")), "{dup}");
+
+    // Okta sends no externalId: the retry finds it by name.
+    let (code, _, ops) = scim(port, &t, "POST", GROUPS, json!({ "displayName": "Ops" })).await;
+    assert_eq!(code, 201);
+    let ops = ops["id"].as_str().unwrap().to_string();
+    app.db.reopen_scim_group("entra", &ops);
+    let (code, _, again) = scim(port, &t, "POST", GROUPS, json!({ "displayName": "ops" })).await;
+    assert_eq!((code, again["id"].as_str()), (201, Some(ops.as_str())), "{again}");
+}

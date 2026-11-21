@@ -118,7 +118,7 @@ botctl scim group unlink <team id>                                            # 
 
 The IdP takes the team on when it pushes the group with that `externalId` (or, without one, that name), and then manages the tenant's people on it. Its owner and anyone else stay.
 
-**Audit.** `scim.group_created`, `scim.group_adopted`, `scim.group_updated` (with `added`, `removed`, `ownerless`), `scim.group_deleted` (with `teamFate`), `scim.group_member_refused`, `scim.group_linked`, `scim.group_unlinked`, and each join and leave as `team.member_joined` (via `scim`) and `team.member_left` (reason `scim`), with the token as the actor.
+**Audit.** `scim.group_created`, `scim.group_adopted`, `scim.group_resumed` (a retried `POST` that had stopped partway), `scim.group_updated` (with `added`, `removed`, `ownerless`), `scim.group_deleted` (with `teamFate`), `scim.group_member_refused`, `scim.group_linked`, `scim.group_unlinked`, and each join and leave as `team.member_joined` (via `scim`) and `team.member_left` (reason `scim`), with the token as the actor.
 
 ## Limits
 

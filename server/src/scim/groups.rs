@@ -478,7 +478,9 @@ pub async fn get(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>
 
 /// `POST /scim/v2/Groups`: a new team, with no owner and no machines until an admin
 /// gives them. Or an admin's link the IdP takes on: the one with this `externalId`, or,
-/// with none set, this `displayName`. A group the tenant has already is a 409.
+/// with none set, this `displayName`. A group the tenant has already is a 409. A `POST`
+/// whose joins stop partway (an admin put someone on another team meanwhile) leaves the
+/// group waiting to be taken on, so the IdP's retry finishes it.
 pub async fn create(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, headers: HeaderMap, body: Result<Bytes, BytesRejection>) -> ScimRes {
     if !a.scim.groups {
         return Err(off());
@@ -507,10 +509,11 @@ pub async fn create(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
             check_new(&app, &c, Some(&link.team_id), &joining)?;
             let g = app.db.save_scim_group(tenant, &link.team_id, d.external_id.as_deref(), &d.display_name, &team_name(&d.display_name), true).map_err(group_conflict)?;
             let team = app.db.team(&g.team_id).ok_or_else(|| missing("Group"))?;
-            app.db.record(&c.who.event("scim.group_adopted").target("team", &g.team_id).details(json!({
+            let action = if link.origin == "scim" { "scim.group_resumed" } else { "scim.group_adopted" };
+            app.db.record(&c.who.event(action).target("team", &g.team_id).details(json!({
                 "tenant": tenant, "team": g.team_id, "externalId": g.external_id, "displayName": g.display_name, "linkedBy": link.created_by,
             })));
-            let moved = change_members(&app, &c, &team, &gone, &joining).await?;
+            let moved = change_members(&app, &c, &team, &gone, &joining).await.inspect_err(|_| app.db.reopen_scim_group(tenant, &g.team_id))?;
             record_update(&app, &c, &link, &g, &moved);
             g
         }
@@ -522,7 +525,7 @@ pub async fn create(State(app): State<AppState>, Extension(a): Extension<Arc<Aut
             app.db.record(&c.who.event("scim.group_created").target("team", &team.id).details(json!({
                 "tenant": tenant, "team": team.id, "externalId": g.external_id, "displayName": g.display_name,
             })));
-            change_members(&app, &c, &team, &[], &new).await?;
+            change_members(&app, &c, &team, &[], &new).await.inspect_err(|_| app.db.reopen_scim_group(tenant, &g.team_id))?;
             g
         }
     };
