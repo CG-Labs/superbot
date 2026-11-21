@@ -233,7 +233,7 @@ impl Push {
         for (d, t) in to.iter().zip(tickets.iter().chain(std::iter::repeat(&Ticket::Failed("no ticket".into())))) {
             match t {
                 Ticket::Ok => s.delivered += 1,
-                Ticket::Gone => s.gone.push((d.id.clone(), d.user_id.clone())),
+                Ticket::Gone => s.gone.push(Gone { device: d.id.clone(), user: d.user_id.clone(), token_hash: crate::users::hash(&d.token) }),
                 Ticket::Failed(e) => {
                     s.failed += 1;
                     s.error.get_or_insert_with(|| e.clone());
@@ -252,15 +252,22 @@ impl Push {
     }
 }
 
-/// Forgets devices the provider says are gone, each audited.
-pub fn forget_gone(db: &Db, gone: &[(String, String)]) {
-    if gone.is_empty() {
-        return;
-    }
-    db.delete_push_devices(&gone.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>());
-    for (id, user) in gone {
-        let e = Event::new(Actor::system("notifications"), "push.unregistered").target("push_device", id);
-        db.record(&e.details(json!({ "userId": user, "reason": "provider_gone" })));
+/// A device the provider said is gone, and the token it said that about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Gone {
+    pub device: String,
+    pub user: String,
+    pub token_hash: String,
+}
+
+/// Forgets devices the provider says are gone, each audited. A device whose token was
+/// replaced while the answer was on its way keeps the new one.
+pub fn forget_gone(db: &Db, gone: &[Gone]) {
+    for g in gone {
+        if db.delete_push_device_with(&g.device, &g.token_hash) {
+            let e = Event::new(Actor::system("notifications"), "push.unregistered").target("push_device", &g.device);
+            db.record(&e.details(json!({ "userId": g.user, "reason": "provider_gone" })));
+        }
     }
 }
 

@@ -307,3 +307,20 @@ async fn a_device_the_provider_says_is_gone_is_forgotten() {
     .await;
     assert_eq!((e.actor_id.as_deref(), e.details["reason"].as_str(), e.details["userId"].as_str()), (Some("notifications"), Some("provider_gone"), Some(ada_id.as_str())));
 }
+
+#[tokio::test]
+async fn a_late_gone_answer_for_an_old_token_keeps_the_new_one() {
+    let (port, app, admin, _) = serve_app().await;
+    with_push(&app, push::ROUTINE_WINDOW);
+    let (ada_id, ada) = user_with(port, &admin, "push-late@example.com", "member").await;
+    let (_, v) = register(port, &ada, ADA, json!({})).await;
+    let device = v["device"]["id"].as_str().unwrap().to_string();
+    // The provider's answer about ADA arrives after the phone registered a new token.
+    let late = push::Gone { device: device.clone(), user: ada_id.clone(), token_hash: crate::users::hash(ADA) };
+    let (_, v) = register(port, &ada, BOB, json!({})).await;
+    assert_eq!(v["device"]["id"].as_str(), Some(device.as_str()), "the same device, a new token");
+    push::forget_gone(&app.db, std::slice::from_ref(&late));
+    let s = session_of(port, &ada).await;
+    assert_eq!(app.db.session_push_device(&s).map(|d| d.token).as_deref(), Some(BOB), "the new token stays");
+    assert!(events(port, &admin, "action=push.unregistered").await.is_empty(), "nothing was forgotten");
+}

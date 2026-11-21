@@ -4004,10 +4004,10 @@ impl Db {
         (self.c().execute("DELETE FROM push_devices WHERE id = ?", [&d.id]).unwrap_or(0) == 1).then_some(d)
     }
 
-    /// Removes devices the provider says are gone. Returns how many.
-    pub fn delete_push_devices(&self, ids: &[String]) -> usize {
-        let c = self.c();
-        ids.iter().map(|id| c.execute("DELETE FROM push_devices WHERE id = ?", [id]).unwrap_or(0)).sum()
+    /// Removes a device the provider says is gone, if it still has the token it said
+    /// that about. Returns whether it did.
+    pub fn delete_push_device_with(&self, id: &str, token_hash: &str) -> bool {
+        self.c().execute("DELETE FROM push_devices WHERE id = ? AND token_hash = ?", params![id, token_hash]).unwrap_or(0) == 1
     }
 
     /// `user_id`'s devices that want `kind`, while the session that registered each is

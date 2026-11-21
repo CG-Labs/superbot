@@ -455,8 +455,8 @@ pub struct Sent {
     pub error: Option<String>,
     /// For the audit log: recipients, the webhook's host.
     pub detail: Value,
-    /// Push devices the provider says are gone, as (device, user), to forget.
-    pub gone: Vec<(String, String)>,
+    /// Push devices the provider says are gone, to forget.
+    pub gone: Vec<push::Gone>,
 }
 
 /// One way notices reach people. `send` returns None when the plan leaves this channel
