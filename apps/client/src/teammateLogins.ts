@@ -1,8 +1,9 @@
 import type { LoginEvent, TeammateHarnessLogin } from "./types";
 
 /**
- * Your own harness logins on a teammate's computer (ADR 0062): when you run their shared
- * Bot there, Claude Code or Codex uses your account, never theirs.
+ * Your own harness logins on a teammate's computer (ADR 0062), or on this server for their
+ * Bots (ADR 0064): when you run their shared Bot, Claude Code or Codex uses your account,
+ * never theirs. The same path serves both; the server picks.
  */
 export function teammateLoginPath(ownerId: string, rest: string): string {
   return `/api/machine/teammate/${encodeURIComponent(ownerId)}/${rest}`;
@@ -43,12 +44,14 @@ export function lastLink(text: string): string | null {
   return all ? all[all.length - 1] : null;
 }
 
-/** What a harness's login state means for your runs on the owner's computer. */
-export function loginLine(h: TeammateHarnessLogin | undefined, owner: string): string {
-  if (h?.state === "logged_in") return `Logged in with your own account on ${owner}'s computer.`;
+/** What a harness's login state means for your runs of the owner's Bots: on their
+ *  computer, or on this server as your own account for their Bots (ADR 0064). */
+export function loginLine(h: TeammateHarnessLogin | undefined, owner: string, on: "machine" | "server" = "machine"): string {
+  const where = on === "server" ? `for ${owner}'s Bots on this server` : `on ${owner}'s computer`;
+  if (h?.state === "logged_in") return `Logged in with your own account ${where}.`;
   if (h?.state === "logging_in") return "A login is running.";
-  if (h?.serverKey) return `Not logged in. A server-wide key runs it for you on ${owner}'s computer.`;
-  return `Not logged in. Your runs on ${owner}'s computer are refused until you log in. ${owner}'s login is never used for you.`;
+  if (h?.serverKey) return `Not logged in. A server-wide key runs it for you ${where}.`;
+  return `Not logged in. Your runs ${where} are refused until you log in. ${owner}'s login is never used for you.`;
 }
 
 /** The parts of XMLHttpRequest a login stream uses, so tests can stand in for it. */

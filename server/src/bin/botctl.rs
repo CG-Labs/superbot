@@ -55,9 +55,11 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    and model (admins)
   botctl user isolation <user>                     With ISOLATION=users: the user's own account and folders
   botctl user isolate <user>                       Make that account and its folders now
-  botctl user harness-login <user> <claude|codex> [-- <args>...]
+  botctl user harness-login <user> <claude|codex> [--owner <owner>] [-- <args>...]
                                                    Log a harness in as that user's account, for their
-                                                   Bots only (as botd's service account, at a terminal)
+                                                   Bots only (as botd's service account, at a terminal).
+                                                   With --owner: the user's own login for that owner's
+                                                   shared Bots, in their teammate account (ADR 0064)
   botctl setup [status | json]                     What the server still needs: the onboarding checklist
   botctl setup done | reopen | hide | show         Finish the setup wizard, reopen it, or hide it from admins
   botctl license [json]                            The self-host license, its seats, and when it ends
@@ -272,12 +274,18 @@ fn machine_login(user: &str, harness: &str) -> Result<String, String> {
     Err("The server ended the login without saying how it went. See botctl machine harness-logins.".into())
 }
 
-/// The extra arguments of `botctl user harness-login`: none, or everything after `--`.
-fn login_extra<'a>(rest: &'a [&'a str]) -> Result<Option<&'a [&'a str]>, String> {
+/// The extra arguments of `botctl user harness-login`: the owner whose shared Bots the
+/// login is for (`--owner`, ADR 0064), if any, and everything after `--`, if anything.
+fn login_extra<'a>(rest: &'a [&'a str]) -> Result<(Option<&'a str>, Option<&'a [&'a str]>), String> {
+    let usage = || "Usage: botctl user harness-login <user> <claude|codex> [--owner <owner>] [-- <login arguments>...]".to_string();
+    let (owner, rest) = match rest {
+        ["--owner", o, rest @ ..] if !o.is_empty() && *o != "--" => (Some(*o), rest),
+        _ => (None, rest),
+    };
     match rest {
-        [] => Ok(None),
-        ["--", args @ ..] => Ok(Some(args)),
-        _ => Err("Usage: botctl user harness-login <user> <claude|codex> [-- <login arguments>...]".into()),
+        [] => Ok((owner, None)),
+        ["--", args @ ..] => Ok((owner, Some(args))),
+        _ => Err(usage()),
     }
 }
 
@@ -285,14 +293,18 @@ fn login_extra<'a>(rest: &'a [&'a str]) -> Result<Option<&'a [&'a str]>, String>
 /// start the harness's login as it; this runs that here, at the admin's terminal. Only
 /// botd's service account may switch to per-user accounts, so run it as that account.
 fn harness_login(key: &str, harness: &str, rest: &[&str]) -> Result<String, String> {
-    let body = json!({ "harness": harness, "args": login_extra(rest)? });
+    let (owner, args) = login_extra(rest)?;
+    let body = json!({ "harness": harness, "args": args, "owner": owner });
     let res = api(Cred::Operator, "POST", &format!("/api/users/{}/harness-login", encode(key)), Some(body.to_string()))?;
     let v: Value = serde_json::from_str(&res).map_err(|e| e.to_string())?;
     let argv: Vec<&str> = v["command"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
     let (Some((bin, args)), Some(home)) = (argv.split_first(), v["home"].as_str()) else {
         return Err(format!("Unexpected reply from the server: {res}"));
     };
-    eprintln!("Starting the {harness} login as the user's own account (HOME {home}). Only their Bots will use it.");
+    match owner {
+        None => eprintln!("Starting the {harness} login as the user's own account (HOME {home}). Only their Bots will use it."),
+        Some(o) => eprintln!("Starting the {harness} login as the user's account for {o}'s shared Bots (HOME {home}). Only their runs of those Bots will use it."),
+    }
     let mut cmd = std::process::Command::new(bin);
     cmd.args(args).current_dir(home).env_clear();
     for (k, val) in std::env::vars_os() {
@@ -306,7 +318,9 @@ fn harness_login(key: &str, harness: &str, rest: &[&str]) -> Result<String, Stri
         cmd.env("SUPERBOT_PATH", path);
     }
     let status = cmd.status().map_err(|e| format!("Couldn't start {bin}: {e}"))?;
-    if status.success() {
+    if status.success() && owner.is_some() {
+        Ok(format!("Done. The user's runs of those Bots now use this {harness} login."))
+    } else if status.success() {
         Ok(format!("Done. The user's Bots now use this {harness} login."))
     } else {
         Err(format!("The login exited with {status}. If sudo asked for a password, run botctl as botd's service account (sudo -iu <service user>)."))
@@ -1085,10 +1099,16 @@ mod tests {
 
     #[test]
     fn harness_login_takes_extra_arguments_only_after_a_double_dash() {
-        assert_eq!(login_extra(&[]), Ok(None));
-        assert_eq!(login_extra(&["--"]), Ok(Some(&[][..])));
-        assert_eq!(login_extra(&["--", "setup-token"]), Ok(Some(&["setup-token"][..])));
+        assert_eq!(login_extra(&[]), Ok((None, None)));
+        assert_eq!(login_extra(&["--"]), Ok((None, Some(&[][..]))));
+        assert_eq!(login_extra(&["--", "setup-token"]), Ok((None, Some(&["setup-token"][..]))));
         assert!(login_extra(&["setup-token"]).is_err());
+        assert_eq!(login_extra(&["--owner", "ada"]), Ok((Some("ada"), None)));
+        assert_eq!(login_extra(&["--owner", "ada", "--", "setup-token"]), Ok((Some("ada"), Some(&["setup-token"][..]))));
+        assert_eq!(login_extra(&["--", "--owner", "ada"]), Ok((None, Some(&["--owner", "ada"][..]))), "after -- it's the login's");
+        for bad in [&["--owner"][..], &["--owner", "--"], &["--owner", ""], &["ada", "--owner"]] {
+            assert!(login_extra(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

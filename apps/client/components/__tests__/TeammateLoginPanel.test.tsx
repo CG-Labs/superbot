@@ -89,7 +89,15 @@ describe("TeammateLoginPanel (ADR 0062)", () => {
     expect(screen.queryByLabelText("Log in to Claude Code")).not.toBeOnTheScreen();
   });
 
-  it("shows the server's words when it refuses", async () => {
+  it("says this server when the owner's Bots run here (ADR 0064)", async () => {
+    const api = fakeApi();
+    api.teammateLogins.mockResolvedValueOnce({ ...view("logged_out"), machineId: null, on: "server" });
+    await render(<TeammateLoginPanel api={api} ownerId="u1" ownerName="Ada" harness="claude" canWrite />);
+    expect(await screen.findByText(/Your runs for Ada's Bots on this server are refused until you log in/)).toBeOnTheScreen();
+    expect(screen.getByLabelText("Log in to Claude Code")).toBeOnTheScreen();
+  });
+
+    it("shows the server's words when it refuses", async () => {
     const api = fakeApi();
     api.teammateLogins.mockRejectedValueOnce(new Error("Machine not found"));
     await render(<TeammateLoginPanel api={api} ownerId="u1" ownerName="Ada" harness="claude" canWrite />);

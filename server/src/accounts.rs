@@ -15,6 +15,11 @@
 //! `superbot-userctl ensure <id>` as root, nothing else (deploy/install.sh). The
 //! installer and Compose turn it on for new installs (ADR 0058); unset, runs work as
 //! in ADR 0029.
+//!
+//! With isolated shared Bots, a teammate's run of an owner's Bot gets an account of its
+//! own, `sb-t-<hash>`, with the same folders under `ISOLATION_DIR/<owner>-<teammate>`
+//! (ADR 0064): its HOME holds the teammate's own harness logins for that owner's Bots,
+//! and neither the owner's account nor the teammate's own can open it.
 
 use crate::machines::wire::JobRequest;
 use crate::passwd;
@@ -26,6 +31,10 @@ use std::process::{Command, Stdio};
 
 /// Every per-user account's name starts with this.
 pub const PREFIX: &str = "sb-u-";
+/// Every teammate account's name starts with this (ADR 0064).
+pub const TEAMMATE_PREFIX: &str = "sb-t-";
+/// Hex digits of `sha256(<owner>:<teammate>)` in a teammate account's name.
+const TEAMMATE_HEX: usize = 24;
 /// Unix account names are at most 32 bytes.
 const MAX_ID: usize = 32 - PREFIX.len();
 /// Harnesses that run under an account: all of them.
@@ -36,6 +45,12 @@ pub const LOGINS: [&str; 2] = ["claude", "codex"];
 /// Checks a missing file as the run's account, then runs the cleanup: botd can't see into
 /// the run's state, and must not follow links the run left there.
 const CLEANUP_IF_EXISTS: &str = "[ -e \"$1\" ] || exit 0; shift; exec \"$@\"";
+/// Run as the account: when each credential file (relative to its HOME) last changed, if
+/// it's a plain, non-empty file. A link counts as none, and any it follows leads only
+/// where the account itself may read.
+const LOGIN_FILES: &str = "cd \"$HOME\" || exit 1; for f; do if [ -f \"$f\" ] && [ ! -h \"$f\" ] && [ -s \"$f\" ]; then stat -c %Y -- \"$f\"; fi; done";
+/// Run as the account: removes each credential file. A link goes, never what it points to.
+const FORGET_FILES: &str = "cd \"$HOME\" || exit 1; for f; do if [ -h \"$f\" ] || [ -f \"$f\" ]; then rm -f -- \"$f\" && echo gone; fi; done";
 pub const DEFAULT_DIR: &str = "/srv/superbot/users";
 const DEFAULT_SUDO: &str = "/usr/bin/sudo";
 const DEFAULT_USERCTL: &str = "/usr/local/sbin/superbot-userctl";
@@ -50,18 +65,76 @@ pub struct Isolation {
     /// `superbot-run`, next to botd.
     pub runner: PathBuf,
     pub userctl: PathBuf,
+    /// `ISOLATION_TEAMMATES` (ADR 0064): a teammate's run of a shared Bot uses an account
+    /// of its own, not the owner's. Set at startup by `teammates_flag`.
+    pub teammates: bool,
     /// One account setup at a time, so two first runs don't both run `useradd`.
     setup: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
-/// How one run starts as its owner's account.
+/// How one run starts as its owner's account, or as a teammate's for the owner's Bots.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunAs {
     pub sudo: PathBuf,
     pub runner: PathBuf,
     pub account: String,
-    /// `ISOLATION_DIR/<user id>/settings`: the only place a job's files are written.
+    /// `ISOLATION_DIR/<space>/settings`: the only place a job's files are written.
     pub settings: PathBuf,
+    /// The teammate whose account it is (ADR 0064); None: the owner's own.
+    pub teammate: Option<String>,
+}
+
+/// Whose account and folders on this server a run or a login uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Space<'a> {
+    /// A user's own (ADR 0037): their own Bots' runs.
+    User(&'a str),
+    /// A teammate's, for one owner's shared Bots (ADR 0064): their runs of that owner's
+    /// Bots, and their own harness logins for those runs.
+    Teammate { owner: &'a str, teammate: &'a str },
+}
+
+impl<'a> Space<'a> {
+    /// Where a run of `owner`'s Bot for `teammate` (None: the owner) happens.
+    pub fn of(owner: &'a str, teammate: Option<&'a str>) -> Space<'a> {
+        match teammate {
+            Some(t) if t != owner => Space::Teammate { owner, teammate: t },
+            _ => Space::User(owner),
+        }
+    }
+
+    /// `sb-u-<id>`, or `sb-t-<hash>` for a teammate. None when an id can't name one.
+    pub fn account(&self) -> Option<String> {
+        match *self {
+            Space::User(id) => account(id),
+            Space::Teammate { owner, teammate } => teammate_account(owner, teammate),
+        }
+    }
+
+    /// Its folder under `ISOLATION_DIR`: the user id, or `<owner>-<teammate>`. User ids
+    /// have no `-`, so no two spaces share a folder.
+    pub fn dir(&self) -> Option<String> {
+        self.account()?;
+        Some(match *self {
+            Space::User(id) => id.to_string(),
+            Space::Teammate { owner, teammate } => format!("{owner}-{teammate}"),
+        })
+    }
+
+    pub fn teammate(&self) -> Option<&'a str> {
+        match *self {
+            Space::User(_) => None,
+            Space::Teammate { teammate, .. } => Some(teammate),
+        }
+    }
+
+    /// What `superbot-userctl ensure` takes for it.
+    fn ids(&self) -> Vec<&'a str> {
+        match *self {
+            Space::User(id) => vec![id],
+            Space::Teammate { owner, teammate } => vec![owner, teammate],
+        }
+    }
 }
 
 impl RunAs {
@@ -76,11 +149,57 @@ impl RunAs {
         v
     }
 
-    fn argv_strings(&self, bin: &str, args: Vec<String>) -> (String, Vec<String>) {
+    pub fn argv_strings(&self, bin: &str, args: Vec<String>) -> (String, Vec<String>) {
         let mut argv = self.argv(bin, args).into_iter().map(|s| s.to_string_lossy().into_owned());
         (argv.next().unwrap_or_default(), argv.collect())
     }
 
+    /// Runs `script` with `args` as the account, from `home`, with nothing of botd's env.
+    /// Its output. Blocking.
+    fn shell(&self, home: &Path, script: &str, args: &[String]) -> Result<String, String> {
+        let mut all = vec!["-c".to_string(), script.into(), "sh".into()];
+        all.extend(args.iter().cloned());
+        let (bin, argv) = self.argv_strings("/bin/sh", all);
+        let out = Command::new(bin)
+            .args(argv)
+            .current_dir(home)
+            .env_clear()
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("couldn't start {}: {e}", self.sudo.display()))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            return Err(format!("{} as {} failed ({}): {}", script.split(';').next().unwrap_or_default(), self.account, out.status, err.trim()));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// When the newest of a login's credential `files` (relative to HOME) last changed,
+    /// in Unix ms, checked as the account itself: botd may not see into its HOME, and
+    /// must not follow links the account left there. None: not logged in. Blocking.
+    pub fn login_since(&self, home: &Path, files: &[String]) -> Result<Option<i64>, String> {
+        let files = home_files(files)?;
+        let out = self.shell(home, LOGIN_FILES, &files)?;
+        Ok(out.lines().filter_map(|l| l.trim().parse::<i64>().ok()).max().map(|s| s * 1000))
+    }
+
+    /// Logs a harness out: removes its credential `files` as the account. How many were
+    /// there. Blocking.
+    pub fn forget(&self, home: &Path, files: &[String]) -> Result<u32, String> {
+        let files = home_files(files)?;
+        Ok(self.shell(home, FORGET_FILES, &files)?.lines().count() as u32)
+    }
+}
+
+/// Credential files are plain paths inside HOME, as machines take them.
+fn home_files(files: &[String]) -> Result<Vec<String>, String> {
+    if files.is_empty() || files.iter().any(|f| f.contains("..") || !crate::machines::wire::home_path(f)) {
+        return Err("credential files must be paths inside HOME".into());
+    }
+    Ok(files.to_vec())
+}
+
+impl RunAs {
     /// The same job, started as this account. Only for jobs on this server. Its files
     /// are written now, by botd, into the user's `settings` folder, where the account
     /// can read them and not change them; a file anywhere else is refused. Its cleanup
@@ -152,8 +271,38 @@ fn own_dir(dir: &Path) -> io::Result<()> {
 /// `sb-u-<id>`, or None when the id can't be part of an account name: 1 to 27 lowercase
 /// letters and digits. Nothing else reaches sudo or `useradd`.
 pub fn account(user_id: &str) -> Option<String> {
-    let ok = !user_id.is_empty() && user_id.len() <= MAX_ID && user_id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
-    ok.then(|| format!("{PREFIX}{user_id}"))
+    plain_id(user_id).then(|| format!("{PREFIX}{user_id}"))
+}
+
+fn plain_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_ID && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// `sb-t-<24 hex of sha256("<owner>:<teammate>")>`: the account a teammate's runs of the
+/// owner's Bots use (ADR 0064). Stable, 29 bytes, and it never holds either id. None
+/// unless both ids could name an account and differ. `superbot-userctl` makes the same.
+pub fn teammate_account(owner: &str, teammate: &str) -> Option<String> {
+    use sha2::Digest;
+    if !plain_id(owner) || !plain_id(teammate) || owner == teammate {
+        return None;
+    }
+    let d = sha2::Sha256::digest(format!("{owner}:{teammate}").as_bytes());
+    let hex: String = d.iter().take(TEAMMATE_HEX / 2).map(|b| format!("{b:02x}")).collect();
+    Some(format!("{TEAMMATE_PREFIX}{hex}"))
+}
+
+/// `ISOLATION_TEAMMATES` (ADR 0064): whether a teammate's run of a shared Bot on this
+/// server uses an account of its own. Unset: on whenever per-user accounts are on and
+/// shared Bots are isolated; `off` keeps ADR 0046's (the owner's account); `on` needs both.
+pub fn teammates_flag(value: &str, accounts: bool, isolated: bool) -> Result<bool, String> {
+    match value.trim() {
+        "" => Ok(accounts && isolated),
+        "off" => Ok(false),
+        "on" if !accounts => Err("ISOLATION_TEAMMATES=on needs ISOLATION=users".into()),
+        "on" if !isolated => Err("ISOLATION_TEAMMATES=on needs SHARED_BOTS=isolated: with open shared Bots a teammate's run is the owner's".into()),
+        "on" => Ok(true),
+        v => Err(format!("ISOLATION_TEAMMATES must be on or off, not {v:?}")),
+    }
 }
 
 impl Isolation {
@@ -184,6 +333,7 @@ impl Isolation {
             sudo: or("ISOLATION_SUDO", DEFAULT_SUDO).into(),
             runner: bin_dir.join("superbot-run"),
             userctl: or("ISOLATION_USERCTL", DEFAULT_USERCTL).into(),
+            teammates: false,
             setup: Default::default(),
         };
         for (what, p) in [("sudo", &iso.sudo), ("superbot-run", &iso.runner), ("superbot-userctl", &iso.userctl)] {
@@ -194,19 +344,46 @@ impl Isolation {
         Ok(Some(iso))
     }
 
+    /// `ISOLATION_DIR/<id>`, or `ISOLATION_DIR/<owner>-<teammate>` for a teammate's
+    /// space. None when an id can't name an account.
+    pub fn space_root(&self, space: Space) -> Option<PathBuf> {
+        crate::paths::child(&self.root, &space.dir()?)
+    }
+    pub fn home_in(&self, space: Space) -> Option<PathBuf> {
+        Some(self.space_root(space)?.join("home"))
+    }
+    pub fn workspace_in(&self, space: Space) -> Option<PathBuf> {
+        Some(self.space_root(space)?.join("workspace"))
+    }
+    pub fn memory_dir_in(&self, space: Space) -> Option<PathBuf> {
+        Some(self.space_root(space)?.join("memory"))
+    }
+    /// `memory/<bot id>.md`: a copy of one Bot's memory for runs in that space.
+    pub fn memory_file_in(&self, space: Space, bot_id: &str) -> Option<PathBuf> {
+        crate::paths::child(&self.memory_dir_in(space)?, bot_id)?;
+        Some(self.memory_dir_in(space)?.join(format!("{bot_id}.md")))
+    }
+    /// `bots/<bot id>`: the Bot's harness state, which its runs there write.
+    pub fn bot_state_in(&self, space: Space, bot_id: &str) -> Option<PathBuf> {
+        crate::paths::child(&self.space_root(space)?.join("bots"), bot_id)
+    }
+    /// `settings/<bot id>`: what botd writes for the Bot's runs there, read-only to them.
+    pub fn bot_settings_in(&self, space: Space, bot_id: &str) -> Option<PathBuf> {
+        crate::paths::child(&self.space_root(space)?.join("settings"), bot_id)
+    }
+
     /// `ISOLATION_DIR/<id>`. None when the id can't name an account.
     pub fn user_root(&self, user_id: &str) -> Option<PathBuf> {
-        account(user_id)?;
-        crate::paths::child(&self.root, user_id)
+        self.space_root(Space::User(user_id))
     }
     pub fn home(&self, user_id: &str) -> Option<PathBuf> {
-        Some(self.user_root(user_id)?.join("home"))
+        self.home_in(Space::User(user_id))
     }
     pub fn workspace(&self, user_id: &str) -> Option<PathBuf> {
-        Some(self.user_root(user_id)?.join("workspace"))
+        self.workspace_in(Space::User(user_id))
     }
     pub fn memory_dir(&self, user_id: &str) -> Option<PathBuf> {
-        Some(self.user_root(user_id)?.join("memory"))
+        self.memory_dir_in(Space::User(user_id))
     }
     /// `memory/USER.md`: facts about the user, for their Bots.
     pub fn user_file(&self, user_id: &str) -> Option<PathBuf> {
@@ -214,26 +391,29 @@ impl Isolation {
     }
     /// `memory/<bot id>.md`: one Bot's memory, in its owner's folder.
     pub fn memory_file(&self, owner_id: &str, bot_id: &str) -> Option<PathBuf> {
-        crate::paths::child(&self.memory_dir(owner_id)?, bot_id)?;
-        Some(self.memory_dir(owner_id)?.join(format!("{bot_id}.md")))
+        self.memory_file_in(Space::User(owner_id), bot_id)
     }
-
-    /// `bots/<bot id>`: the Bot's harness state, which its runs write.
+    #[cfg(test)]
     pub fn bot_state(&self, owner_id: &str, bot_id: &str) -> Option<PathBuf> {
-        crate::paths::child(&self.user_root(owner_id)?.join("bots"), bot_id)
+        self.bot_state_in(Space::User(owner_id), bot_id)
     }
-    /// `settings/<bot id>`: what botd writes for the Bot's runs, read-only to them.
+    #[cfg(test)]
     pub fn bot_settings(&self, owner_id: &str, bot_id: &str) -> Option<PathBuf> {
-        crate::paths::child(&self.user_root(owner_id)?.join("settings"), bot_id)
+        self.bot_settings_in(Space::User(owner_id), bot_id)
     }
 
-    /// Makes the Bot's state and settings folders in its owner's folder, once the account
-    /// is there. The state folder is botd's, with the account's full access by the
-    /// parent's default ACL; anything else the account left in its place (a link, a file)
-    /// is removed first, so the run starts in a real folder. botd never writes in it.
+    #[cfg(test)]
     pub fn make_bot_dirs(&self, owner_id: &str, bot_id: &str) -> io::Result<()> {
-        let (Some(state), Some(settings)) = (self.bot_state(owner_id, bot_id), self.bot_settings(owner_id, bot_id)) else {
-            return Err(io::Error::other(format!("{owner_id:?} or {bot_id:?} can't name a folder")));
+        self.make_bot_dirs_in(Space::User(owner_id), bot_id)
+    }
+
+    /// Makes the Bot's state and settings folders in a space, once its account is there.
+    /// The state folder is botd's, with the account's full access by the parent's default
+    /// ACL; anything else the account left in its place (a link, a file) is removed first,
+    /// so the run starts in a real folder. botd never writes in it.
+    pub fn make_bot_dirs_in(&self, space: Space, bot_id: &str) -> io::Result<()> {
+        let (Some(state), Some(settings)) = (self.bot_state_in(space, bot_id), self.bot_settings_in(space, bot_id)) else {
+            return Err(io::Error::other(format!("{space:?} or {bot_id:?} can't name a folder")));
         };
         for p in [&state, &settings] {
             if !p.parent().is_some_and(trusted_dir) {
@@ -251,33 +431,55 @@ impl Isolation {
         own_dir(&settings)
     }
 
+    #[cfg(test)]
     pub fn run_as(&self, user_id: &str) -> Option<RunAs> {
-        Some(RunAs { sudo: self.sudo.clone(), runner: self.runner.clone(), account: account(user_id)?, settings: self.user_root(user_id)?.join("settings") })
+        self.run_as_in(Space::User(user_id))
+    }
+
+    pub fn run_as_in(&self, space: Space) -> Option<RunAs> {
+        Some(RunAs {
+            sudo: self.sudo.clone(),
+            runner: self.runner.clone(),
+            account: space.account()?,
+            settings: self.space_root(space)?.join("settings"),
+            teammate: space.teammate().map(String::from),
+        })
+    }
+
+    pub fn ready(&self, user_id: &str) -> bool {
+        self.ready_in(Space::User(user_id))
     }
 
     /// The account exists with the home `superbot-userctl` gives it, and its folders are
     /// there, made by root. An account made before a folder was added isn't ready, so
     /// the helper runs again and adds it.
-    pub fn ready(&self, user_id: &str) -> bool {
-        let (Some(name), Some(home), Some(root)) = (account(user_id), self.home(user_id), self.user_root(user_id)) else { return false };
+    pub fn ready_in(&self, space: Space) -> bool {
+        let (Some(name), Some(home), Some(root)) = (space.account(), self.home_in(space), self.space_root(space)) else { return false };
         let made_by_root = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir() && m.uid() == 0);
         passwd::by_name(&name).is_some_and(|a| a.uid != 0 && a.home == home)
             && made_by_root(&root)
             && ["memory", "bots", "settings"].iter().all(|d| trusted_dir(&root.join(d)))
     }
 
-    /// Makes the user's account and folders if they aren't there, with the root helper.
-    /// Ok(true): made now. Blocking.
+    #[cfg(test)]
     pub fn ensure(&self, user_id: &str) -> Result<bool, String> {
-        account(user_id).ok_or_else(|| format!("{user_id:?} can't be part of a Unix account name"))?;
+        self.ensure_in(Space::User(user_id))
+    }
+
+    /// Makes the space's account and folders if they aren't there, with the root helper
+    /// (`superbot-userctl ensure <id>`, or `ensure <owner> <teammate>`). Ok(true): made
+    /// now. Blocking.
+    pub fn ensure_in(&self, space: Space) -> Result<bool, String> {
+        space.account().ok_or_else(|| format!("{space:?} can't be part of a Unix account name"))?;
         let _one = self.setup.lock().unwrap_or_else(|e| e.into_inner());
-        if self.ready(user_id) {
+        if self.ready_in(space) {
             return Ok(false);
         }
         let out = Command::new(&self.sudo)
             .arg("-n")
             .arg(&self.userctl)
-            .args(["ensure", user_id])
+            .arg("ensure")
+            .args(space.ids())
             .stdin(Stdio::null())
             .output()
             .map_err(|e| format!("couldn't start {}: {e}", self.sudo.display()))?;
@@ -286,7 +488,7 @@ impl Isolation {
             let last = err.trim().lines().last().unwrap_or_default();
             return Err(format!("superbot-userctl ensure failed ({}){}", out.status, if last.is_empty() { String::new() } else { format!(": {last}") }));
         }
-        if !self.ready(user_id) {
+        if !self.ready_in(space) {
             return Err("superbot-userctl ran, but the account or its folders still aren't there".into());
         }
         Ok(true)
@@ -374,7 +576,7 @@ pub fn remove(path: &Path) {
 /// Admin API: a user's account, making it now, and logging a harness in as them
 /// (`botctl user isolation | isolate | harness-login`). Under `/api/users`, so admins only.
 pub mod http {
-    use super::{Isolation, HARNESSES, LOGINS, account};
+    use super::{Isolation, Space, HARNESSES, LOGINS, account};
     use crate::audit::Who;
     use crate::users::need_user_key;
     use crate::{ApiError, AppState, Res, bad};
@@ -423,10 +625,12 @@ pub mod http {
         Ok(Json(view(&iso, &u.id)))
     }
 
-    /// `POST /api/users/{key}/harness-login` `{harness, args?}`: makes the account if
-    /// needed and returns the command that runs the harness's login as it, for
+    /// `POST /api/users/{key}/harness-login` `{harness, args?, owner?}`: makes the
+    /// account if needed and returns the command that runs the harness's login as it, for
     /// `botctl user harness-login` to run at the admin's terminal on the server. The
-    /// login lands in that user's HOME, for their Bots only.
+    /// login lands in that user's HOME, for their Bots only. With `owner`, it's the
+    /// user's own login for that owner's shared Bots instead, in the account their runs
+    /// of those Bots use (ADR 0064); the owner's account never sees it.
     pub async fn harness_login(
         State(app): State<AppState>,
         Extension(by): Extension<Who>,
@@ -438,6 +642,29 @@ pub mod http {
         if !u.active() {
             return Err(bad("That user is disabled"));
         }
+        let owner = match v.get("owner") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(o)) => {
+                if !app.teammate_accounts() {
+                    return Err(ApiError(
+                        StatusCode::CONFLICT,
+                        "Teammate accounts are off: a teammate's run of a shared Bot uses its owner's account. They need ISOLATION=users and SHARED_BOTS=isolated (ISOLATION_TEAMMATES, ADR 0064).".into(),
+                    ));
+                }
+                let o = need_user_key(&app, o)?;
+                if o.id == u.id {
+                    return Err(bad("owner is the user themself: leave it out for their own login"));
+                }
+                if !o.active() {
+                    return Err(bad("That owner is disabled"));
+                }
+                if !crate::machines::offboard::wanted(&app, &o.id, &u.id) {
+                    return Err(bad(format!("{} can't run any of {}'s Bots", u.id, o.id)));
+                }
+                Some(o.id)
+            }
+            Some(_) => return Err(bad("owner must be a user id, email or name")),
+        };
         let harness = v["harness"].as_str().unwrap_or_default();
         let adapter = LOGINS.contains(&harness).then(|| crate::adapters::get(harness)).flatten();
         let (bin, default) = adapter
@@ -453,19 +680,37 @@ pub mod http {
                 .ok_or_else(|| bad("args must be up to 16 strings"))?,
             _ => return Err(bad("args must be up to 16 strings")),
         };
-        let run_as = app.ensure_account(&u.id, &by).await.map_err(|e| failed(&u.id, e))?;
+        let space = match &owner {
+            Some(o) => Space::Teammate { owner: o, teammate: &u.id },
+            None => Space::User(&u.id),
+        };
+        let run_as = app.ensure_space(space, &by).await.map_err(|e| failed(&u.id, e))?;
         // Not the arguments: they could hold a key.
-        let details = json!({ "harness": harness, "account": run_as.account, "customArgs": custom });
-        app.db.record(&by.event("harness.login_started").target("user", &u.id).details(details));
+        let mut details = json!({ "harness": harness, "account": run_as.account, "customArgs": custom });
+        let target = match &owner {
+            Some(o) => {
+                details["forUser"] = json!(u.id);
+                o
+            }
+            None => &u.id,
+        };
+        app.db.record(&by.event("harness.login_started").target("user", target).details(details));
         let command: Vec<String> = run_as.argv(bin, args).into_iter().map(|s| s.to_string_lossy().into_owned()).collect();
-        let home = iso.home(&u.id);
-        Ok(Json(json!({ "user": u.id, "account": run_as.account, "harness": harness, "home": home, "command": command })))
+        let home = iso.home_in(space);
+        Ok(Json(json!({ "user": u.id, "owner": owner, "account": run_as.account, "harness": harness, "home": home, "command": command })))
     }
 }
 
 #[cfg(test)]
 pub(crate) fn for_tests(root: &Path, sudo: &str) -> Isolation {
-    Isolation { root: root.to_path_buf(), sudo: sudo.into(), runner: "/usr/local/bin/superbot-run".into(), userctl: DEFAULT_USERCTL.into(), setup: Default::default() }
+    Isolation {
+        root: root.to_path_buf(),
+        sudo: sudo.into(),
+        runner: "/usr/local/bin/superbot-run".into(),
+        userctl: DEFAULT_USERCTL.into(),
+        teammates: false,
+        setup: Default::default(),
+    }
 }
 
 #[cfg(test)]
@@ -639,7 +884,7 @@ mod tests {
         let root = crate::db::temp_path("prepare");
         let settings = root.join("u1/settings");
         std::fs::create_dir_all(&settings).unwrap();
-        let run_as = RunAs { sudo: "/usr/bin/sudo".into(), runner: "/opt/superbot/bin/superbot-run".into(), account: "sb-u-u1".into(), settings: settings.clone() };
+        let run_as = RunAs { sudo: "/usr/bin/sudo".into(), runner: "/opt/superbot/bin/superbot-run".into(), account: "sb-u-u1".into(), settings: settings.clone(), teammate: None };
         let file = |p: &Path| JobFile { path: p.display().to_string(), body: "{}".into() };
         let state = root.join("u1/bots/b1");
         let job = JobRequest {
@@ -712,5 +957,110 @@ mod tests {
             assert!(r.join().unwrap().is_err());
         }
         assert_eq!(std::fs::read_to_string(&log).unwrap(), "start\nend\nstart\nend\n");
+    }
+
+    #[test]
+    fn a_teammate_account_is_one_per_owner_and_teammate_and_holds_neither_id() {
+        let a = teammate_account("u1", "u2").unwrap();
+        assert!(a.starts_with(TEAMMATE_PREFIX) && a.len() == 29);
+        assert!(a[5..].bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert_eq!(teammate_account("u1", "u2").unwrap(), a, "stable");
+        assert_ne!(teammate_account("u2", "u1").unwrap(), a, "each way round is its own");
+        assert_ne!(teammate_account("u1", "u3").unwrap(), a);
+        // superbot-userctl makes the same name.
+        let out = Command::new("/bin/sh").args(["-c", "printf '%s' 'u1:u2' | sha256sum | cut -c1-24"]).output().unwrap();
+        assert_eq!(&a[5..], String::from_utf8_lossy(&out.stdout).trim());
+        for (o, t) in [("u1", "u1"), ("", "u2"), ("u1", ""), ("U1", "u2"), ("u1", "a-b"), ("../u1", "u2"), (&"a".repeat(28), "u2")] {
+            assert_eq!(teammate_account(o, t), None, "{o:?} {t:?}");
+        }
+    }
+
+    #[test]
+    fn a_teammates_folders_are_their_own_never_the_owners() {
+        let iso = for_tests(Path::new("/srv/superbot/users"), DEFAULT_SUDO);
+        let pair = Space::of("u1", Some("u2"));
+        assert_eq!(pair, Space::Teammate { owner: "u1", teammate: "u2" });
+        assert_eq!(Space::of("u1", Some("u1")), Space::User("u1"), "the owner's own run is theirs");
+        assert_eq!(Space::of("u1", None), Space::User("u1"));
+        assert_eq!(iso.space_root(pair).unwrap(), Path::new("/srv/superbot/users/u1-u2"));
+        assert_eq!(iso.home_in(pair).unwrap(), Path::new("/srv/superbot/users/u1-u2/home"));
+        assert_eq!(iso.workspace_in(pair).unwrap(), Path::new("/srv/superbot/users/u1-u2/workspace"));
+        assert_eq!(iso.memory_file_in(pair, "b1").unwrap(), Path::new("/srv/superbot/users/u1-u2/memory/b1.md"));
+        assert_eq!(iso.bot_state_in(pair, "b1").unwrap(), Path::new("/srv/superbot/users/u1-u2/bots/b1"));
+        assert_eq!(iso.bot_settings_in(pair, "b1").unwrap(), Path::new("/srv/superbot/users/u1-u2/settings/b1"));
+        let r = iso.run_as_in(pair).unwrap();
+        assert_eq!((r.account.as_str(), r.teammate.as_deref()), (teammate_account("u1", "u2").unwrap().as_str(), Some("u2")));
+        assert_eq!(r.settings, Path::new("/srv/superbot/users/u1-u2/settings"));
+        assert_eq!(iso.run_as("u1").unwrap().teammate, None);
+        for bad in [Space::Teammate { owner: "u1", teammate: "u1" }, Space::Teammate { owner: "u1", teammate: "../u2" }, Space::Teammate { owner: "", teammate: "u2" }] {
+            assert_eq!(iso.space_root(bad), None, "{bad:?}");
+            assert_eq!(iso.run_as_in(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn teammate_accounts_follow_isolation_and_isolated_shared_bots() {
+        assert_eq!(teammates_flag("", true, true), Ok(true), "on by default with both");
+        assert_eq!(teammates_flag("", true, false), Ok(false), "open shared Bots: the owner's account, as before");
+        assert_eq!(teammates_flag("", false, true), Ok(false));
+        assert_eq!(teammates_flag(" off ", true, true), Ok(false));
+        assert_eq!(teammates_flag("on", true, true), Ok(true));
+        assert!(teammates_flag("on", false, true).unwrap_err().contains("ISOLATION=users"));
+        assert!(teammates_flag("on", true, false).unwrap_err().contains("SHARED_BOTS=isolated"));
+        assert!(teammates_flag("yes", true, true).unwrap_err().contains("on or off"));
+    }
+
+    /// A stand-in sudo that runs what follows `-- <superbot-run>` as this account, with
+    /// HOME the folder it starts in, as superbot-run would set it.
+    fn fake_sudo(dir: &Path) -> String {
+        let sudo = dir.join("sudo");
+        std::fs::write(&sudo, "#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift 2\nHOME=$PWD exec \"$@\"\n").unwrap();
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        sudo.display().to_string()
+    }
+
+    #[test]
+    fn logins_are_checked_and_removed_as_the_account_never_through_a_link() {
+        use std::os::unix::fs::symlink;
+        let dir = crate::db::temp_path("login-as");
+        let iso = for_tests(&dir, &fake_sudo(&dir));
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let r = iso.run_as_in(Space::of("u1", Some("u2"))).unwrap();
+        let files = vec![".claude/.credentials.json".to_string(), ".claude.json".to_string()];
+        assert_eq!(r.login_since(&home, &files), Ok(None));
+        std::fs::write(home.join(".claude/.credentials.json"), "").unwrap();
+        assert_eq!(r.login_since(&home, &files), Ok(None), "an empty file isn't a login");
+        let secret = dir.join("owner-creds");
+        std::fs::write(&secret, "{\"owner\":1}").unwrap();
+        std::fs::remove_file(home.join(".claude/.credentials.json")).unwrap();
+        symlink(&secret, home.join(".claude/.credentials.json")).unwrap();
+        assert_eq!(r.login_since(&home, &files), Ok(None), "a link to someone's login isn't one");
+        assert_eq!(r.forget(&home, &files), Ok(1));
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), "{\"owner\":1}", "removing drops the link, not its target");
+        std::fs::write(home.join(".claude/.credentials.json"), "{}").unwrap();
+        let since = r.login_since(&home, &files).unwrap().expect("logged in");
+        assert!(since > 1_600_000_000_000, "{since}");
+        assert_eq!(r.forget(&home, &files), Ok(1));
+        assert_eq!(r.login_since(&home, &files), Ok(None));
+        for bad in [vec![], vec!["../x".to_string()], vec!["/etc/shadow".to_string()], vec![".claude/../../x".to_string()]] {
+            assert!(r.login_since(&home, &bad).is_err(), "{bad:?}");
+            assert!(r.forget(&home, &bad).is_err(), "{bad:?}");
+        }
+        let failing = for_tests(&dir, "/bin/false").run_as("u1").unwrap();
+        assert!(failing.login_since(&home, &files).is_err(), "a check that can't run isn't a login");
+    }
+
+    #[test]
+    fn a_teammate_account_is_made_by_the_helper_with_both_ids() {
+        let dir = crate::db::temp_path("ensure-pair");
+        let log = dir.join("log");
+        let sudo = dir.join("sudo");
+        std::fs::write(&sudo, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\nexit 3\n", log.display())).unwrap();
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let iso = for_tests(&dir, sudo.to_str().unwrap());
+        assert!(iso.ensure_in(Space::of("u1", Some("u2"))).unwrap_err().contains("superbot-userctl ensure failed"));
+        assert!(iso.ensure_in(Space::Teammate { owner: "u1", teammate: "u1" }).is_err());
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), format!("-n {DEFAULT_USERCTL} ensure u1 u2\n"), "never for one person twice");
     }
 }

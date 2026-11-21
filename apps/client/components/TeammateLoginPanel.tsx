@@ -24,8 +24,9 @@ interface Running {
 }
 
 /**
- * Your own login for a shared Bot's harness on its owner's computer (ADR 0062). Your runs
- * there use it; the owner's login is never used for you, and nobody else can use yours.
+ * Your own login for a shared Bot's harness on its owner's computer (ADR 0062), or on this
+ * server for the owner's Bots (ADR 0064). Your runs there use it; the owner's login is never
+ * used for you, and nobody else can use yours.
  */
 export function TeammateLoginPanel({ api, ownerId, ownerName, harness, canWrite }: Props) {
   const [view, setView] = useState<TeammateLoginsView | null>(null);
@@ -124,7 +125,7 @@ export function TeammateLoginPanel({ api, ownerId, ownerName, harness, canWrite 
   return (
     <View style={styles.box}>
       <Text style={styles.title}>Your {name} login</Text>
-      <Text style={styles.dim}>{view ? loginLine(login, ownerName) : error ? "" : "Checking…"}</Text>
+      <Text style={styles.dim}>{view ? loginLine(login, ownerName, view.on ?? "machine") : error ? "" : "Checking…"}</Text>
       {running ? (
         <>
           <Text style={styles.terminal} selectable>

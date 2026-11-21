@@ -2,8 +2,9 @@
 //! a pseudo-terminal, since logins expect one, streams what it writes, and types the
 //! lines it is sent. What the login saves stays on the machine: the agent only checks
 //! whether a credential file exists, never reads one. It knows no harness: botd sends
-//! the command and where its credentials go. Shared by the agent binary and botd's
-//! tests, so it uses nothing of botd's but `wire`.
+//! the command and where its credentials go. Shared by the agent binary and botd, which
+//! runs teammates' logins on its own server with it (ADR 0064), so it uses nothing of
+//! botd's but `wire`.
 
 // Shared by two binaries, each of which uses only part of it.
 #![allow(dead_code)]
@@ -53,12 +54,13 @@ fn plain(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// A login this agent will run: the harness CLI and its arguments, each one of `wire`'s
-/// own words.
+/// A login to run: the harness CLI and its arguments. On a machine, each is one of
+/// `wire`'s own words (`check`); botd's own logins on its server start the CLI through
+/// `superbot-run` as a teammate's account (ADR 0064).
 #[derive(Debug, PartialEq)]
 pub struct Command {
-    pub bin: &'static str,
-    pub args: Vec<&'static str>,
+    pub bin: String,
+    pub args: Vec<String>,
 }
 
 /// Whether `r` is a login this agent will run, `has` saying which harnesses are installed.
@@ -79,7 +81,10 @@ pub fn check(r: &LoginRequest, has: impl Fn(&str) -> bool) -> Result<Command, Re
     if !has(bin) {
         return Err((422, format!("{bin} isn't installed on this machine.")));
     }
-    Ok(Command { bin, args })
+    Ok(Command {
+        bin: bin.into(),
+        args: args.into_iter().map(String::from).collect(),
+    })
 }
 
 /// `f` under `home`, if it is a plain relative path there.
@@ -271,7 +276,7 @@ impl Logins {
         let (Ok(i), Ok(o), Ok(e)) = (stdio(&slave), stdio(&slave), stdio(&slave)) else {
             return Err((500, "Couldn't set up the terminal.".into()));
         };
-        let mut cmd = tokio::process::Command::new(run.bin);
+        let mut cmd = tokio::process::Command::new(&run.bin);
         cmd.args(&run.args)
             .current_dir(home)
             .env_clear()
@@ -390,8 +395,8 @@ mod tests {
     // the script open for writing, and exec then fails with ETXTBSY.
     fn fake(path: &Path) -> Command {
         Command {
-            bin: "/bin/sh",
-            args: vec![Box::leak(path.to_str().unwrap().to_string().into_boxed_str()), "auth", "login"],
+            bin: "/bin/sh".into(),
+            args: vec![path.to_str().unwrap().into(), "auth".into(), "login".into()],
         }
     }
 
@@ -415,7 +420,7 @@ mod tests {
 
     #[test]
     fn only_plain_logins_of_installed_harnesses_run() {
-        assert_eq!(check(&req(&[".claude/.credentials.json"]), |_| true), Ok(Command { bin: "claude", args: vec!["auth", "login"] }));
+        assert_eq!(check(&req(&[".claude/.credentials.json"]), |_| true), Ok(Command { bin: "claude".into(), args: vec!["auth".into(), "login".into()] }));
         assert_eq!(check(&req(&[".claude/x"]), |_| false).unwrap_err().0, 422);
         for files in [&[][..], &["/etc/shadow"], &["../x"], &[".claude/../../x"]] {
             assert_eq!(check(&req(files), |_| true).unwrap_err().0, 400, "{files:?}");

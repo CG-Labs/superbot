@@ -31,7 +31,6 @@ pub mod screens;
 pub mod teammate;
 #[cfg(test)]
 pub mod teammates;
-#[cfg(test)]
 pub mod terminal;
 pub mod tools;
 #[cfg(test)]

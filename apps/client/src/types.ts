@@ -556,11 +556,14 @@ export interface TeammateHarnessLogin {
 
 /** Your own harness logins on a teammate's machine (ADR 0062). */
 export interface TeammateLoginsView {
-  machineId: string;
+  /** Null when the owner's Bots run on this server, as your own account there (ADR 0064). */
+  machineId: string | null;
+  /** Where your login is kept: the owner's computer, or this server. Unset: the computer. */
+  on?: "machine" | "server";
   owner: { id: string; name: string | null } | null;
   forUser: string;
   logins: "on";
-  /** You have your own user on the machine yet. */
+  /** You have your own user there (on this server, your account for the owner's Bots) yet. */
   hasUser: boolean;
   harnesses: Record<string, TeammateHarnessLogin>;
 }
