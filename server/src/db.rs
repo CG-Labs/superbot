@@ -3133,6 +3133,13 @@ impl Db {
         self.c().query_row("SELECT COUNT(*) FROM bots WHERE owner_id = ?", [owner_id], |r| r.get(0)).unwrap_or(0)
     }
 
+    /// The ids of the Bots a user owns.
+    pub fn owned_bot_ids(&self, owner_id: &str) -> Vec<String> {
+        let c = self.c();
+        let Ok(mut st) = c.prepare("SELECT id FROM bots WHERE owner_id = ? ORDER BY id") else { return Vec::new() };
+        st.query_map([owner_id], |r| r.get(0)).map(|rows| rows.flatten().collect()).unwrap_or_default()
+    }
+
     /// Runs counted for this user in `period` (`YYYY-MM`).
     pub fn runs_used(&self, user_id: &str, period: &str) -> u32 {
         self.c()

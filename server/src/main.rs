@@ -108,6 +108,9 @@ mod billing_http_tests;
 mod usage;
 #[cfg(test)]
 mod usage_http_tests;
+mod storage;
+#[cfg(test)]
+mod storage_http_tests;
 mod users;
 #[cfg(test)]
 mod users_http_tests;
@@ -1540,10 +1543,12 @@ fn default_harness_for(app: &App, user_id: &str) -> String {
 async fn my_tier(State(app): State<AppState>, Extension(c): Extension<Caller>) -> Res {
     need_user(c.principal)?;
     let id = c.user.as_ref().map_or(users::OPERATOR, |u| u.id.as_str());
+    storage::warm(&app, &[id.to_string()]).await;
     Ok(Json(tier_usage(&app, id)))
 }
 
-/// A user's tier and their use of it: runs this month, routine runs today (UTC), Bots.
+/// A user's tier and their use of it: runs this month, routine runs today (UTC), Bots,
+/// and storage as last measured (`storage::warm` first for a recent number, ADR 0082).
 pub(crate) fn tier_usage(app: &App, user_id: &str) -> Value {
     let at = db::now();
     let (period, day) = (app.billing_period(user_id, at), tiers::day(at));
@@ -1553,6 +1558,7 @@ pub(crate) fn tier_usage(app: &App, user_id: &str) -> Value {
         "day": day, "routineRuns": app.db.routine_runs_used(user_id, &day),
         "tokens": app.db.tokens_used(user_id, period.start, period.end),
         "periodStart": period.start, "periodEnd": period.end, "periodSource": period.source.as_str(),
+        "storage": storage::view(app, user_id),
     });
     v
 }
@@ -1561,9 +1567,9 @@ pub(crate) fn tier_usage(app: &App, user_id: &str) -> Value {
 /// the plan's size, and their subscription (ADR 0040). `over` names limits a user is
 /// past, which happens after a downgrade: nothing is deleted, new use is refused.
 async fn admin_usage(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>) -> Json<Value> {
-    let users: Vec<Value> = app
-        .db
-        .users()
+    let all = app.db.users();
+    storage::warm(&app, &all.iter().map(|u| u.id.clone()).collect::<Vec<_>>()).await;
+    let users: Vec<Value> = all
         .iter()
         .map(|u| {
             let plan = tier_usage(&app, &u.id);
@@ -1584,6 +1590,9 @@ async fn admin_usage(State(app): State<AppState>, Extension(a): Extension<Arc<Au
             }
             if machine.as_ref().is_some_and(|m| !fits(m)) {
                 over.push("machineType");
+            }
+            if plan["usage"]["storage"]["state"] == "over" {
+                over.push("maxStorageMb");
             }
             json!({
                 "user": { "id": u.id, "email": u.email, "name": u.name, "role": u.role, "status": u.status },
@@ -2169,6 +2178,15 @@ async fn send_message(State(app): State<AppState>, Extension(c): Extension<Calle
         app.push_message(&msg);
         let _ = tx.send(text);
         return Ok((StatusCode::ACCEPTED, Json(json!(msg))));
+    }
+    // Storage full (ADR 0082): nothing new is taken in for the owner until files go.
+    if let Some(bot) = app.db.bot(&id)
+        && let Some((m, limit, storage::State::Over)) = storage::check(&app, &bot.owner_id).await
+    {
+        let tier = app.tier_of(&bot.owner_id);
+        let details = json!({ "reason": "storage_limit", "owner": bot.owner_id, "tier": tier.name, "limit": limit, "used": m.used(), "partial": m.partial });
+        app.db.record(&by.event("bot.message_refused").bot(&id).outcome(Outcome::Denied).details(details));
+        return Err(ApiError(StatusCode::FORBIDDEN, storage::refusal_text(&tier.label, m.used(), limit)));
     }
     let mut msg = app.db.add_message(&id, "user", &text, None, false, Some("queued"));
     app.db.set_requested_by(msg.id, &by);

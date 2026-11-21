@@ -10,7 +10,7 @@ use crate::machines::ControlPlane;
 use crate::machines::route::{self, Assigned, Refusal, Target};
 use crate::machines::wire::{self, JobEvent};
 use crate::tiers::{self, Route, Tier, Tiers, Wiring};
-use crate::{isolation, paths, usage};
+use crate::{isolation, paths, storage, usage};
 use crate::approvals::RunGrant;
 use crate::policy::{Ctx, Mode, RunScope};
 use crate::screen::{self, Screens};
@@ -193,6 +193,8 @@ pub struct App {
     pub account_removals: crate::machines::offboard::Working,
     /// Teammate accounts here in use and being removed, kept apart (ADR 0066).
     pub teammate_gate: crate::teammate_removals::Gate,
+    /// Each user's storage, measured recently (ADR 0082).
+    pub storage: crate::storage::Cache,
     closing: AtomicBool,
 }
 
@@ -225,6 +227,7 @@ impl App {
             teammate_logins: Default::default(),
             account_removals: Default::default(),
             teammate_gate: Default::default(),
+            storage: Default::default(),
             closing: AtomicBool::new(false),
         })
     }
@@ -709,7 +712,10 @@ impl App {
             let Some(msg) = next else { break };
             let before = self.db.last_id();
             if let Some(bot) = self.db.bot(&bot_id) {
+                let owner = bot.owner_id.clone();
                 self.run_one(bot, &msg).await;
+                // The run may have written files: the next check measures again.
+                self.storage.forget(&owner);
             }
             if self.closing.load(Ordering::SeqCst) {
                 return; // left "running": the next start reports it
@@ -773,7 +779,8 @@ impl App {
             bot.session_id = None;
         }
         let period = self.billing_period(&bot.owner_id, crate::db::now());
-        let Some((tier, route, wiring)) = self.tier_route(&bot, msg, &by, &period, &space.1) else { return };
+        let storage = crate::storage::check(self, &bot.owner_id).await;
+        let Some((tier, route, wiring)) = self.tier_route(&bot, msg, &by, &period, &space.1, storage.as_ref()) else { return };
         let placed_at = self.db.placed_at(&bot.owner_id);
         let Some(place) = self.place(&bot, msg, &by, &period.key, bin, for_other.as_deref()).await else { return };
         // Held until the run ends, however it ends: dropping it lets the next run in.
@@ -1706,15 +1713,26 @@ impl App {
     /// model, never the Bot's settings alone (ADR 0033). The run is counted for the
     /// owner, within the tier's runs and tokens a billing period (ADR 0050). A route
     /// whose provider is one of the tiers file's endpoints needs that endpoint's key
-    /// (`tier_key`, ADR 0077). None: refused, and the Bot said why.
-    fn tier_route(&self, bot: &Bot, msg: &Message, by: &Who, period: &usage::Period, env: &HashMap<String, String>) -> Option<(String, Route, Wiring)> {
+    /// (`tier_key`, ADR 0077). The owner's storage must be under their tier's cap
+    /// (`storage`, measured by `storage::check`, ADR 0082). None: refused, and the Bot said why.
+    fn tier_route(
+        &self,
+        bot: &Bot,
+        msg: &Message,
+        by: &Who,
+        period: &usage::Period,
+        env: &HashMap<String, String>,
+        storage: Option<&(storage::Measured, u64, storage::State)>,
+    ) -> Option<(String, Route, Wiring)> {
         let tier = self.tier_of(&bot.owner_id);
         let refused = |reason: &str, text: String, limit: Option<u64>, used: Option<u64>, more: Value| {
             self.give_back_routine(bot, msg);
             let mut details = json!({ "reason": reason, "owner": bot.owner_id, "tier": tier.name, "limit": limit, "period": period.key, "messageId": msg.id });
             if let Some(n) = used {
                 details["used"] = json!(n);
-                details["periodEnd"] = json!(period.end);
+                if reason != "storage_limit" {
+                    details["periodEnd"] = json!(period.end);
+                }
             }
             if let (Some(d), Value::Object(more)) = (details.as_object_mut(), more) {
                 d.extend(more);
@@ -1742,6 +1760,10 @@ impl App {
                 return refused("provider_key_missing", text, None, None, json!({ "provider": e.name, "keyName": e.key_secret }));
             }
         };
+        if let Some((m, limit, storage::State::Over)) = storage {
+            let text = storage::full_text(&tier.label, m.used(), *limit);
+            return refused("storage_limit", text, Some(*limit), Some(m.used()), json!({ "partial": m.partial }));
+        }
         let (this, more) = match period.source {
             usage::Source::Calendar => ("month", "the 1st (UTC)".to_string()),
             usage::Source::Subscription => ("billing period", format!("{} (UTC)", period.end_day())),
@@ -1760,6 +1782,14 @@ impl App {
         if let Err(limit) = self.db.take_run(&bot.owner_id, &period.key, tier.limits.monthly_runs) {
             let text = format!("The {} plan allows {limit} runs a {this}, and this {this}'s are used up. More start on {more}.", tier.label);
             return refused("tier_limit", text, Some(u64::from(limit)), None, Value::Null);
+        }
+        if let Some((m, limit, storage::State::Warning)) = storage
+            && self.storage.first_warning(&bot.owner_id, &tiers::day(crate::db::now()))
+        {
+            let who = Who { actor: Actor::system("billing").on_behalf_of(&bot.owner_id), source: Default::default() };
+            let details = json!({ "owner": bot.owner_id, "tier": tier.name, "limit": limit, "used": m.used(), "warnAt": storage::WARN_PERCENT, "partial": m.partial });
+            self.db.record(&who.event("usage.storage_warning").target("user", &bot.owner_id).bot(&bot.id).details(details));
+            self.say(&bot.id, &storage::warning_text(&tier.label, m.used(), *limit), false);
         }
         Some((tier.name.clone(), route, wiring))
     }
