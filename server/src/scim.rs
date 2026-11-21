@@ -755,7 +755,8 @@ async fn changed(app: &AppState, a: &Auth, c: &Caller, before_user: &User, befor
     match active {
         Some(true) => {
             let resumed = crate::handover::user_enabled(app, by, &after.user.id);
-            app.db.record(&ev("user.enabled").details(json!({ "tenant": c.token.tenant, "routinesResumed": resumed })))
+            app.db.record(&ev("user.enabled").details(json!({ "tenant": c.token.tenant, "routinesResumed": resumed })));
+            crate::teams::user_enabled(app, by, &after.user.id).await;
         }
         Some(false) => {
             a.sso.forget_user(&after.user.id);

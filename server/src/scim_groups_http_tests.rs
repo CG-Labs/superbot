@@ -209,6 +209,16 @@ async fn entra_pushes_a_group_and_patches_its_members() {
         assert_eq!(scim(port, &t, m, &format!("{GROUPS}/{id}"), body).await.0, 404, "{m}");
     }
     assert_eq!(app.db.user(&ada).unwrap().role, rbac::Role::Member);
+
+    // Names fold ASCII case only, the same for uniqueness and filters: "Équipe" and
+    // "éQUIPE" are two groups, and each filter finds just its own.
+    let (_, _, upper) = scim(port, &t, "POST", GROUPS, json!({ "displayName": "Équipe" })).await;
+    let (code, _, lower) = scim(port, &t, "POST", GROUPS, json!({ "displayName": "éQUIPE" })).await;
+    assert_eq!(code, 201, "{lower}");
+    for (filter, want) in [("%C3%89quipe", &upper), ("%C3%A9quipe", &lower)] {
+        let (_, _, found) = scim(port, &t, "GET", &format!("{GROUPS}?filter=displayName%20eq%20%22{filter}%22"), Value::Null).await;
+        assert_eq!((found["totalResults"].clone(), &found["Resources"][0]["id"]), (json!(1), &want["id"]), "{filter}: {found}");
+    }
 }
 
 #[tokio::test]
@@ -435,6 +445,13 @@ async fn leaving_a_group_offboards_like_leaving_the_team() {
     let machine = app.db.user_machine(&al).expect("joining gave Al a machine");
     assert!(app.db.team_machine(&machine.id).is_some_and(|m| m.team_id == alpha));
     assert!(app.db.user_machine(&cy).is_none(), "no machine for a disabled person");
+    // Enabled, she gets the team's machine, as joining would have given her.
+    let on = json!({ "Operations": [{ "op": "replace", "value": { "active": true } }] });
+    assert_eq!(scim(port, &t, "PATCH", &format!("/scim/v2/Users/{cy}"), on).await.0, 200);
+    let cy_machine = app.db.user_machine(&cy).expect("enabling gave Cy the team's machine");
+    assert!(app.db.team_machine(&cy_machine.id).is_some_and(|m| m.team_id == alpha));
+    let asked = events(port, &admin, "action=team.machine_requested").await;
+    assert!(asked.iter().any(|e| e["details"]["user"] == cy.as_str()), "{asked:?}");
 
     // Sharing inside the team, both ways.
     let ledger = app.db.create_bot_owned("Ledger", "#fff", "waddle", "claude", None, false, &ada, Visibility::Private).id;
@@ -455,6 +472,10 @@ async fn leaving_a_group_offboards_like_leaving_the_team() {
     assert_eq!(app.db.machine(&machine.id).unwrap().state, crate::machines::State::Suspended);
     assert!(app.db.team_machine(&machine.id).unwrap().released_at.is_some());
     assert_eq!(on_team(&app, &alpha).len(), 2);
+    // Enabling someone who has a machine asks for no other.
+    let before = app.db.machines(None).len();
+    assert!(!crate::teams::user_enabled(&app, &crate::audit::Who::system("test"), &cy).await);
+    assert_eq!(app.db.machines(None).len(), before);
 }
 
 #[tokio::test]
@@ -500,12 +521,16 @@ async fn deleting_a_group_deletes_only_what_the_idp_made_and_owners_are_never_se
     assert_eq!(scim(port, &t, "DELETE", &format!("{GROUPS}/{own}"), Value::Null).await.0, 204);
     assert!(app.db.team(&own).is_none());
 
-    // A SCIM DELETE of a user takes them off their group's team too.
+    // A SCIM DELETE of a user takes them off their group's team too, logged like a
+    // removal from the group, the last owner's included.
     let hook = made("Hook", &[&u1, &u2]).await;
+    assert_eq!(call(port, "PUT", &format!("/api/teams/{hook}/members/{u1}"), &admin, r#"{"role":"owner"}"#).await.0, 200);
     assert_eq!(scim(port, &t, "DELETE", &format!("/scim/v2/Users/{u1}"), Value::Null).await.0, 204);
     assert_eq!(on_team(&app, &hook), vec![(u2.clone(), "member".to_string())]);
     let left = &events(port, &admin, "action=team.member_left").await[0];
     assert_eq!((left["details"]["user"].as_str(), left["details"]["reason"].as_str()), (Some(u1.as_str()), Some("scim")));
+    let upd = &events(port, &admin, "action=scim.group_updated").await[0];
+    assert_eq!((upd["targetId"].as_str(), upd["details"]["removed"].clone(), upd["details"]["ownerless"].clone()), (Some(hook.as_str()), json!([u1]), json!(true)));
     let (_, _, g) = scim(port, &t, "GET", &format!("{GROUPS}/{hook}"), Value::Null).await;
     assert_eq!(ids(&g["members"]), vec![u2.clone()]);
     // Nothing the IdP sends makes anyone an owner or admin.

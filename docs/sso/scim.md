@@ -97,7 +97,7 @@ With `SCIM_GROUPS=on`, each group the IdP pushes is a SuperBot [team](../adr/008
 | IdP does | SuperBot does |
 |----------|---------------|
 | Creates a group | A new team with that name, **no owner and no machines**. Give it an owner (`PUT /api/teams/<id>/members/<user> {"role":"owner"}`, or the console's Teams tab) and turn machines on (`PATCH /api/teams/<id> {"machines":true}`) |
-| Adds a member | They join as a plain member, exactly as a team admin's add: the team's machine, its plan, and the seat sync. Disabled people join too, without a machine |
+| Adds a member | They join as a plain member, exactly as a team admin's add: the team's machine, its plan, and the seat sync. Disabled people join too, without a machine, and get the team's when they're enabled |
 | Removes a member | They leave as a team admin's removal would: grants between teammates go, they're removed from teammates' machines and accounts, their team machine is suspended and destroyed after `TEAM_MACHINE_DAYS`, and the seat sync runs. Even the team's last owner (logged as `ownerless`) |
 | Renames the group | Renames the team |
 | Deletes the group | Its members leave, as above. A team the IdP made, left empty, is deleted, unless it pays for a plan; a team an admin linked, or one with people the IdP doesn't manage, stays, managed by hand again |
@@ -135,4 +135,4 @@ The IdP takes the team on when it pushes the group with that `externalId` (or, w
 - **Group errors (501)**: `SCIM_GROUPS=on` isn't set. Set it, or turn group provisioning off in the IdP.
 - **409 on adding a group member**: they're on another team. Take them out of that group (or team) first.
 - **400 "isn't a user this tenant provisioned"**: provision the user before the group, or check the IdP sends the user's SuperBot id (it does once it has provisioned them).
-- **409 creating a group**: this tenant already has a group with that name or `externalId`. Names are unique per tenant in any case.
+- **409 creating a group**: this tenant already has a group with that name or `externalId`. Names are unique per tenant in any ASCII case (`Eng` and `ENG` clash; `Équipe` and `éQUIPE` don't).

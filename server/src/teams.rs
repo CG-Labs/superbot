@@ -298,6 +298,22 @@ async fn join(app: &AppState, by: &Who, team: &Team, user: &User, role: &str, vi
     Ok(v)
 }
 
+/// `user_id` was just enabled. On a team that gives machines and with none of their own
+/// (the IdP put them in its group while disabled, ADR 0095), they get the team's now, as
+/// joining would have given them. Whether one was asked for.
+pub(crate) async fn user_enabled(app: &AppState, by: &Who, user_id: &str) -> bool {
+    let Some(m) = app.db.team_member(user_id) else { return false };
+    if app.db.user_machine(user_id).is_some() {
+        return false;
+    }
+    let (Some(team), Some(user)) = (app.db.team(&m.team_id), app.db.user(user_id)) else { return false };
+    if !team.machines || !user.active() {
+        return false;
+    }
+    let got = provide(app, by, &team, &user).await;
+    got == json!("requested")
+}
+
 /// The IdP put `user` in the group `team` is (ADR 0095). They join as a plain member:
 /// SCIM never gives a team role.
 pub(crate) async fn join_from_scim(app: &AppState, by: &Who, team: &Team, user: &User) -> Res<Value> {

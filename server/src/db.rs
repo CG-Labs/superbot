@@ -7853,8 +7853,12 @@ mod tests {
         // Another tenant may use the same name and externalId; this one may not, in any case.
         assert!(db.create_scim_group("entra", Some("00g1"), "Eng", "Eng", None).is_ok());
         assert_eq!(db.create_scim_group("okta", None, "ENG", "ENG", None).err(), Some(ScimGroupConflict::DisplayName));
+        // ASCII case only: the filter compares the same way.
+        assert!(db.create_scim_group("entra", None, "Équipe", "Équipe", None).is_ok());
+        assert!(db.create_scim_group("entra", None, "éQUIPE", "éQUIPE", None).is_ok());
+        assert!(db.scim_group_find("entra", None, Some("ÉQUIPE")).is_some_and(|g| g.display_name == "Équipe"));
         assert_eq!(db.create_scim_group("okta", Some("00g1"), "Other", "Other", None).err(), Some(ScimGroupConflict::ExternalId));
-        assert_eq!(db.teams().len(), 2, "a refused group leaves no team behind");
+        assert_eq!(db.teams().len(), 4, "a refused group leaves no team behind");
         assert_eq!(db.scim_group_find("okta", None, Some("eng")).map(|g| g.team_id), Some(eng.team_id.clone()));
         assert!(db.scim_group_find("okta", Some("00G1"), None).is_none(), "externalId is exact");
 

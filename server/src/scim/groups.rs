@@ -83,7 +83,7 @@ fn split_and(s: &str) -> Vec<&str> {
     parts
 }
 
-/// One or more `attr eq "value"` joined by `and`: `displayName` (any case),
+/// One or more `attr eq "value"` joined by `and`: `displayName` (any ASCII case),
 /// `externalId` and `id` (exactly), and a member as `members eq`, `members.value eq`,
 /// or `members[value eq "..."]`.
 pub fn parse_filter(s: &str) -> Result<Vec<Clause>, String> {
@@ -122,7 +122,8 @@ pub fn parse_filter(s: &str) -> Result<Vec<Clause>, String> {
 fn matches(app: &AppState, g: &ScimGroup, clauses: &[Clause]) -> bool {
     clauses.iter().all(|c| match c {
         Clause::Id(v) => g.team_id == *v,
-        Clause::DisplayName(v) => g.display_name.to_lowercase() == v.to_lowercase(),
+        // ASCII case only, as the database's NOCASE uniqueness and lookups compare.
+        Clause::DisplayName(v) => g.display_name.eq_ignore_ascii_case(v),
         Clause::ExternalId(v) => g.external_id.as_deref() == Some(v.as_str()),
         Clause::Member(v) => app.db.team_id_of(v).as_deref() == Some(g.team_id.as_str()) && app.db.scim_user(&g.tenant, v).is_some(),
     })
@@ -627,8 +628,10 @@ pub async fn user_deleted(app: &AppState, a: &Auth, c: &Caller, user_id: &str) {
     }
     let _writes = a.scim.group_writes.lock().await;
     let Some(team_id) = app.db.team_id_of(user_id) else { return };
-    if app.db.scim_group(&c.token.tenant, &team_id).is_some() {
-        teams::leave(app, &c.who, &team_id, user_id, teams::SCIM).await;
+    let Some(g) = app.db.scim_group(&c.token.tenant, &team_id) else { return };
+    let owner = app.db.team_member(user_id).is_some_and(|m| m.role == teams::OWNER);
+    if teams::leave(app, &c.who, &team_id, user_id, teams::SCIM).await {
+        record_update(app, c, &g, &g, &Moved { removed: vec![user_id.to_string()], owner_left: owner, ..Moved::default() });
     }
 }
 
