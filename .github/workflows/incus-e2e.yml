@@ -1,0 +1,83 @@
+name: incus-e2e
+
+# Per-user containers (ADR 0065, 0067) on a real Incus host, not the stand-in: the
+# runner becomes the Incus host and botd's tests make, enroll, isolate, suspend,
+# resume, resize, rebuild and destroy real containers (ADR 0068). Runs when the
+# machines code changes, weekly, and by hand.
+
+on:
+  pull_request:
+    paths:
+      - 'server/src/machines/**'
+      - 'server/src/machines_incus_e2e_tests.rs'
+      - 'server/src/bin/superbot-machine.rs'
+      - 'deploy/incus-e2e-host.sh'
+      - 'Cargo.lock'
+      - '.github/workflows/incus-e2e.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'server/src/machines/**'
+      - 'server/src/machines_incus_e2e_tests.rs'
+      - 'server/src/bin/superbot-machine.rs'
+      - 'deploy/incus-e2e-host.sh'
+      - 'Cargo.lock'
+      - '.github/workflows/incus-e2e.yml'
+  schedule:
+    - cron: '41 5 * * 2'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: incus-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  containers:
+    name: Containers on Incus (${{ matrix.incus }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # zabbly: the current stable release. ubuntu: Ubuntu 24.04's own package (6.0 LTS).
+        incus: [zabbly, ubuntu]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the agent and botd's tests
+        run: |
+          set -euo pipefail
+          cargo build --bin superbot-machine
+          cargo test --no-run --message-format=json >/tmp/build.json
+          jq -r 'select(.reason == "compiler-artifact" and .target.name == "botd" and .target.kind == ["bin"] and .profile.test) | .executable' \
+            /tmp/build.json >/tmp/test-bin
+          test -x "$(cat /tmp/test-bin)"
+      - name: Make the runner an Incus host
+        run: sudo SUPERBOT_INCUS_E2E_THROWAWAY=1 INCUS_SOURCE=${{ matrix.incus }} deploy/incus-e2e-host.sh "$RUNNER_TEMP/incus-e2e"
+      - name: Containers enroll, stay apart, and follow the lifecycle
+        run: |
+          set -euo pipefail
+          set -a; . "$RUNNER_TEMP/incus-e2e/incus-e2e.env"; set +a
+          SUPERBOT_INCUS_E2E_BIN_DIR="$GITHUB_WORKSPACE/target/debug" "$(cat /tmp/test-bin)" --ignored --exact --nocapture \
+            machines_incus_e2e_tests::real_incus_containers_enroll_stay_apart_and_follow_the_lifecycle
+      - name: What Incus saw
+        if: failure()
+        run: |
+          sudo incus version || true
+          sudo incus list --all-projects || true
+          for n in $(sudo incus list --project superbot -c n -f csv 2>/dev/null); do
+            echo "::group::$n"
+            sudo incus query "/1.0/instances/$n?project=superbot" | jq 'del(.config["cloud-init.user-data"])' || true
+            sudo incus info --show-log "$n" --project superbot | tail -40 || true
+            sudo incus exec "$n" --project superbot -- sh -c 'cloud-init status --long; tail -50 /var/log/cloud-init-output.log; journalctl -u superbot-machine --no-pager | tail -30' </dev/null || true
+            echo "::endgroup::"
+          done
+          sudo incus network acl list --project superbot || true
+          sudo journalctl -u incus --no-pager | tail -60 || true
