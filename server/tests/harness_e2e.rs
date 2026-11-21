@@ -2,7 +2,8 @@
 //! the real `botd` and `botctl` run Claude Code, Codex, Pi, and Hermes Agent with the hook
 //! each adapter installs, and four calls go through it: an allowed one runs, one a deny
 //! rule blocks never runs, and two `git push`es wait for a person, then run once approved
-//! or fail once denied.
+//! or fail once denied. Then each tool other than the shell that the canary counts for
+//! that harness (ADR 0063) runs once allowed and is blocked once denied.
 //!
 //! By default the model is a fake (`FakeModel`) that each CLI reaches through its own
 //! custom-endpoint setting, so everything but the model is real and no login is needed.
@@ -34,6 +35,9 @@ const MODEL: &str = "e2e-model";
 const KEY: &str = "e2e-key";
 /// How the prompt names the one command the fake model runs.
 const RUN: (&str, &str) = ("E2E-RUN<<", ">>");
+/// How the prompt names one tool and its arguments: `E2E-TOOL<<name>><<json>>`. A
+/// JSON string is a freeform tool's text; `namespace/tool` is a tool in a namespace.
+const TOOL: (&str, &str) = ("E2E-TOOL<<", ">>");
 /// The fake model's reply once the command's result is back.
 const DONE: &str = "E2E-DONE";
 
@@ -122,21 +126,28 @@ fn decide(turns: Vec<Turn>, tools: Vec<(String, Value)>) -> Reply {
     if tools.is_empty() {
         return Reply::Text("ok".into());
     }
-    let (mut cmd, mut result) = (None, None);
+    let (mut want, mut result) = (None, None);
     for t in turns {
         match t {
             Turn::User(s) => {
-                if let Some(c) = s.rfind(RUN.0).and_then(|i| s[i + RUN.0.len()..].split_once(RUN.1)).map(|(c, _)| c.to_string()) {
-                    (cmd, result) = (Some(c), None);
+                if let Some(w) = want_of(&s) {
+                    (want, result) = (Some(w), None);
                 }
             }
-            Turn::Result(r) if cmd.is_some() => result = Some(r),
+            Turn::Result(r) if want.is_some() => result = Some(r),
             Turn::Result(_) => {}
         }
     }
-    match (cmd, result) {
+    match (want, result) {
         (Some(_), Some(r)) => Reply::Text(format!("{DONE} {}", r.chars().take(600).collect::<String>())),
-        (Some(c), None) => {
+        (Some(Want::Tool(name, args)), None) => {
+            let offered = name.split('/').next().unwrap_or_default();
+            match tools.iter().any(|(n, _)| n == offered) {
+                true => Reply::Call { name, args },
+                false => Reply::Text(format!("E2E-NO-TOOL {name} among {:?}", tools.iter().map(|t| &t.0).collect::<Vec<_>>())),
+            }
+        }
+        (Some(Want::Run(c)), None) => {
             let shell = ["Bash", "exec_command", "bash", "terminal", "shell"].iter().find_map(|n| tools.iter().find(|(name, _)| name == n));
             match shell {
                 Some((name, params)) => {
@@ -154,6 +165,23 @@ fn decide(turns: Vec<Turn>, tools: Vec<(String, Value)>) -> Reply {
         }
         (None, _) => Reply::Text("E2E-NO-COMMAND".into()),
     }
+}
+
+/// What a prompt asks for: a shell command, or one named tool with its arguments.
+enum Want {
+    Run(String),
+    Tool(String, Value),
+}
+
+/// The last request in a prompt.
+fn want_of(s: &str) -> Option<Want> {
+    let after = |tag: &str| s.rfind(tag).map(|i| &s[i + tag.len()..]);
+    if s.rfind(TOOL.0) > s.rfind(RUN.0) {
+        let (name, rest) = after(TOOL.0)?.split_once(TOOL.1)?;
+        let args = rest.strip_prefix("<<")?.split_once(TOOL.1)?.0;
+        return Some(Want::Tool(name.into(), serde_json::from_str(args).ok()?));
+    }
+    after(RUN.0)?.split_once(RUN.1).map(|(c, _)| Want::Run(c.into()))
 }
 
 fn anthropic_turns(req: &Value) -> Vec<Turn> {
@@ -233,7 +261,18 @@ fn responses_tools(req: &Value) -> Vec<(String, Value)> {
 fn responses(reply: Reply, stream: bool, id: u64) -> Response {
     let item = match reply {
         Reply::Text(t) => json!({ "type": "message", "id": format!("msg_e2e{id}"), "role": "assistant", "status": "completed", "content": [{ "type": "output_text", "text": t, "annotations": [] }] }),
-        Reply::Call { name, args } => json!({ "type": "function_call", "id": format!("fc_e2e{id}"), "call_id": format!("call_e2e{id}"), "name": name, "arguments": args.to_string(), "status": "completed" }),
+        // Freeform tools (Codex's `apply_patch`) take text, not JSON.
+        Reply::Call { name, args: Value::String(input) } => {
+            json!({ "type": "custom_tool_call", "id": format!("ctc_e2e{id}"), "call_id": format!("call_e2e{id}"), "name": name, "input": input, "status": "completed" })
+        }
+        Reply::Call { name, args } => {
+            let mut call = json!({ "type": "function_call", "id": format!("fc_e2e{id}"), "call_id": format!("call_e2e{id}"), "name": name, "arguments": args.to_string(), "status": "completed" });
+            // Codex offers each MCP server's tools in a namespace.
+            if let Some((ns, tool)) = name.split_once('/') {
+                (call["namespace"], call["name"]) = (json!(ns), json!(tool));
+            }
+            call
+        }
     };
     let usage = json!({ "input_tokens": 10, "input_tokens_details": { "cached_tokens": 0 }, "output_tokens": 5, "output_tokens_details": { "reasoning_tokens": 0 }, "total_tokens": 15 });
     let done = json!({ "id": format!("resp_e2e{id}"), "object": "response", "status": "completed", "model": MODEL, "output": [item.clone()], "usage": usage });
@@ -501,6 +540,9 @@ fn fake_login(harness: &str, home: &Path, port: u16, cmd: &mut Command) {
             let config = format!(
                 "model = \"{MODEL}\"\nmodel_provider = \"e2e\"\n\n[model_providers.e2e]\nname = \"e2e\"\nbase_url = \"{base}/v1\"\nwire_api = \"responses\"\nenv_key = \"E2E_MODEL_KEY\"\nrequest_max_retries = 0\nstream_max_retries = 0\n"
             );
+            // An MCP server with one tool, so MCP calls go through the hook too.
+            std::fs::write(home.join("e2e-mcp.py"), MCP_SERVER).unwrap();
+            let config = format!("{config}\n[mcp_servers.e2e]\ncommand = \"python3\"\nargs = [{:?}]\n", home.join("e2e-mcp.py").display().to_string());
             std::fs::write(home.join(".codex/config.toml"), config).unwrap();
             cmd.env("E2E_MODEL_KEY", KEY);
         }
@@ -524,6 +566,29 @@ fn fake_login(harness: &str, home: &Path, port: u16, cmd: &mut Command) {
         h => panic!("no fake login for {h}"),
     }
 }
+
+/// A stdio MCP server whose one tool, `touch`, creates the file it's given.
+const MCP_SERVER: &str = r#"import json, pathlib, sys
+for line in sys.stdin:
+    try:
+        m = json.loads(line)
+    except ValueError:
+        continue
+    if "id" not in m:
+        continue
+    method, r = m.get("method"), {}
+    if method == "initialize":
+        r = {"protocolVersion": m["params"].get("protocolVersion", "2025-06-18"), "capabilities": {"tools": {}}, "serverInfo": {"name": "e2e", "version": "1"}}
+    elif method == "tools/list":
+        schema = {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+        r = {"tools": [{"name": "touch", "description": "Creates an empty file.", "inputSchema": schema}]}
+    elif method == "tools/call":
+        path = m["params"]["arguments"]["path"]
+        pathlib.Path(path).touch()
+        r = {"content": [{"type": "text", "text": "touched " + path}]}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": r}) + "\n")
+    sys.stdout.flush()
+"#;
 
 fn http(b: &Botd, method: &str, path: &str, body: &str) -> (u16, String) {
     let Ok(mut s) = TcpStream::connect(("127.0.0.1", b.port)) else { return (0, String::new()) };
@@ -644,7 +709,7 @@ fn approvals_hold(harness: &str, bin: &str) {
     // The sandbox (ADR 0055) is another layer and depends on the host; keep it out of
     // the way of the pushes to a folder outside the workspace.
     call(&b, "PUT", "/api/policy", json!({ "sandbox": false }));
-    call(&b, "POST", "/api/policy/rules", json!({ "action": "deny", "tool": "shell", "pattern": "*e2e-forbidden*" }));
+    call(&b, "POST", "/api/policy/rules", json!({ "action": "deny", "tool": "*", "pattern": "*e2e-forbidden*" }));
     // Hermes refuses a session without a model, and the fake endpoint has no default.
     let model = if real() { std::env::var("SUPERBOT_E2E_BOT_MODEL").ok().filter(|m| !m.is_empty()) } else { (harness == "hermes").then(|| MODEL.to_string()) };
     if let Some(m) = model {
@@ -711,6 +776,62 @@ fn approvals_hold(harness: &str, bin: &str) {
         assert!(r.text.contains(DONE) && r.text.to_lowercase().contains("denied"), "{harness}: the agent wasn't told: {}", r.text);
     }
     pass("a call that needs approval waits, and fails once denied");
+
+    // Calls other than shell commands (ADR 0063). Only the fake model calls an exact tool.
+    if real() {
+        println!("SKIP {harness}: other tools need the fake model");
+        return;
+    }
+    for (tool, model) in other_tools(harness) {
+        if let Some(m) = model {
+            call(&b, "PATCH", &format!("/api/bots/{id}"), json!({ "model": m }));
+        }
+        let file = |name: &str| proof.join(format!("{name}-{}.txt", tool.replace('/', "-")));
+        let ask = |path: &Path| format!("{}{tool}{}<<{}>>", TOOL.0, TOOL.1, other_tool_args(tool, path));
+
+        // Allowed: it runs, through the hook (the canary would stop one that skipped it).
+        let made = file("allowed");
+        let r = run(&b, &id, &ask(&made), None, &|| {});
+        assert!(r.approvals.is_empty(), "{harness}: an allowed {tool} call asked: {:?}", r.approvals);
+        assert_ne!(r.result, "unguarded", "{harness} ran {tool} without the hook: {}", r.text);
+        assert!(made.exists() && r.text.contains(DONE), "{harness}: the allowed {tool} call didn't run (result {}): {}", r.result, r.text);
+        pass(&format!("{tool}: an allowed call runs through the hook"));
+
+        // Blocked by policy: the hook sends it, and it never runs.
+        let forbidden = file("e2e-forbidden");
+        let r = run(&b, &id, &ask(&forbidden), None, &|| {});
+        assert!(!forbidden.exists(), "{harness}: a {tool} call the policy denies ran: {}", r.text);
+        let hooked = tool.replace('/', "__");
+        let denied = audit(&b, "policy.denied").into_iter().map(|e| details(&e)).any(|d| d["tool"].as_str().is_some_and(|t| t.eq_ignore_ascii_case(&hooked)));
+        assert!(denied, "{harness}: the hook never sent the {tool} call (result {}): {}", r.result, r.text);
+        assert!(r.text.contains(DONE) && r.text.contains("deny rule"), "{harness}: the agent wasn't told why: {}", r.text);
+        pass(&format!("{tool}: a call the policy denies is blocked"));
+    }
+}
+
+/// Tools other than the shell that each harness reports through its hook and that the
+/// canary counts, with the Bot model that makes the CLI offer it (ADR 0063).
+fn other_tools(harness: &str) -> Vec<(&'static str, Option<&'static str>)> {
+    match harness {
+        "claude" => vec![("Write", None)],
+        // Codex offers MCP tools as they are only to models it doesn't know, and
+        // `apply_patch` only to ones it does.
+        "codex" => vec![("mcp__e2e/touch", None), ("apply_patch", Some("gpt-5.5"))],
+        "pi" => vec![("write", None)],
+        "hermes" => vec![("write_file", None)],
+        h => panic!("no other tools for {h}"),
+    }
+}
+
+/// Arguments for a call of `tool` that creates `path`.
+fn other_tool_args(tool: &str, path: &Path) -> Value {
+    let p = path.display().to_string();
+    match tool {
+        "Write" => json!({ "file_path": p, "content": "e2e\n" }),
+        "apply_patch" => json!(format!("*** Begin Patch\n*** Add File: {p}\n+e2e\n*** End Patch\n")),
+        "mcp__e2e/touch" => json!({ "path": p }),
+        _ => json!({ "path": p, "content": "e2e\n" }),
+    }
 }
 
 #[test]
@@ -763,4 +884,16 @@ fn the_fake_model_reads_each_format() {
     assert!(matches!(responses_turns(&r).as_slice(), [Turn::User(u), Turn::Result(o)] if u.contains("E2E-RUN") && o == "out"));
     let c = json!({ "messages": [{ "role": "system", "content": "E2E-RUN<<no>>" }, { "role": "user", "content": "E2E-RUN<<ls>>" }, { "role": "tool", "content": "out" }] });
     assert!(matches!(chat_turns(&c).as_slice(), [Turn::User(_), Turn::Result(o)] if o == "out"));
+    // One named tool: offered, or not; a freeform one; one in a namespace.
+    let read = decide(vec![Turn::User(r#"E2E-RUN<<ls>> then E2E-TOOL<<Read>><<{"file_path":"/x"}>>"#.into())], tools());
+    assert_eq!(call_of(read), ("Read".into(), json!({ "file_path": "/x" })));
+    let Reply::Text(t) = decide(vec![Turn::User("E2E-TOOL<<Write>><<{}>>".into())], tools()) else { panic!() };
+    assert!(t.starts_with("E2E-NO-TOOL Write"), "{t}");
+    let freeform = match decide(vec![Turn::User(r#"E2E-TOOL<<apply_patch>><<"p">>"#.into())], vec![("apply_patch".into(), json!(null))]) {
+        Reply::Call { args, .. } => args,
+        Reply::Text(t) => panic!("{t}"),
+    };
+    assert_eq!(freeform, json!("p"));
+    let mcp = decide(vec![Turn::User(r#"E2E-TOOL<<mcp__e2e/touch>><<{"path":"/x"}>>"#.into())], vec![("mcp__e2e".into(), json!(null))]);
+    assert_eq!(call_of(mcp).0, "mcp__e2e/touch");
 }
