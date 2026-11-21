@@ -832,6 +832,38 @@ impl Incus {
     }
 
     /// Refuses to make containers unless the project keeps them in (module docs).
+    /// That Incus trusts botd and is new enough, with every API extension botd uses.
+    /// Checked before every create, so botd never makes a container it can't keep
+    /// behind its firewall.
+    async fn check_server(&self) -> Result<String, ProviderError> {
+        let v = self.call(Method::GET, "/1.0", &[], None, None).await?.metadata;
+        if v["auth"] != "trusted" {
+            return Err(api(403, "Incus doesn't trust botd's client certificate yet"));
+        }
+        let version = v["environment"]["server_version"].as_str().unwrap_or("?");
+        if too_old(version) {
+            return Err(api(
+                400,
+                format!("Incus {version} is too old: botd needs {MIN_VERSION} or later, which can change a network ACL that containers in a restricted project use"),
+            ));
+        }
+        let have = |x: &str| v["api_extensions"].as_array().is_some_and(|a| a.iter().any(|e| e == x));
+        let missing: Vec<&str> = [
+            "network_acl",
+            "network_bridge_acl_devices",
+            "instances_rebuild",
+            "instance_create_start",
+            "instance_get_full",
+        ]
+        .into_iter()
+        .filter(|x| !have(x))
+        .collect();
+        if !missing.is_empty() {
+            return Err(api(400, format!("Incus lacks API extensions: {}", missing.join(", "))));
+        }
+        Ok(format!("Incus {version} trusts botd"))
+    }
+
     async fn check_project(&self) -> Result<(), ProviderError> {
         let p = self
             .call(Method::GET, &format!("/1.0/projects/{}", self.s.project), &[], None, None)
@@ -1020,35 +1052,7 @@ impl MachineProvider for Incus {
     fn preflight<'a>(&'a self) -> Fut<'a, Vec<Value>> {
         Box::pin(async move {
             let mut out = vec![
-                self.check("server", async {
-                    let v = self.call(Method::GET, "/1.0", &[], None, None).await?.metadata;
-                    if v["auth"] != "trusted" {
-                        return Err(api(403, "Incus doesn't trust botd's client certificate yet"));
-                    }
-                    let version = v["environment"]["server_version"].as_str().unwrap_or("?");
-                    if too_old(version) {
-                        return Err(api(
-                            400,
-                            format!("Incus {version} is too old: botd needs {MIN_VERSION} or later, which can change a network ACL that containers in a restricted project use"),
-                        ));
-                    }
-                    let have = |x: &str| v["api_extensions"].as_array().is_some_and(|a| a.iter().any(|e| e == x));
-                    let missing: Vec<&str> = [
-                        "network_acl",
-                        "network_bridge_acl_devices",
-                        "instances_rebuild",
-                        "instance_create_start",
-                        "instance_get_full",
-                    ]
-                    .into_iter()
-                    .filter(|x| !have(x))
-                    .collect();
-                    if !missing.is_empty() {
-                        return Err(api(400, format!("Incus lacks API extensions: {}", missing.join(", "))));
-                    }
-                    Ok(format!("Incus {version} trusts botd"))
-                })
-                .await,
+                self.check("server", self.check_server()).await,
             ];
             out.push(
                 self.check("project", async {
@@ -1097,6 +1101,7 @@ impl MachineProvider for Incus {
                 .as_deref()
                 .ok_or_else(|| api(400, "containers are made behind the machines' firewall (MACHINE_FIREWALL=on)"))?;
             name(acl)?;
+            self.check_server().await?;
             self.check_project().await?;
             let mut config = Map::new();
             for (k, v) in [

@@ -616,3 +616,24 @@ fn incus_before_7_0_1_is_too_old() {
         assert!(!too_old(v), "{v}");
     }
 }
+
+#[tokio::test]
+async fn no_container_on_an_incus_too_old_or_missing_extensions() {
+    let s = StandIn::start().await;
+    let p = incus(&s);
+    p.create_firewall("superbot-fw", &["superbot".into()], &[agent_rule()]).await.unwrap();
+    s.w().version = Some("6.0.7".into());
+    match p.create(&spec("superbot-m1", "c1-m2-d20")).await {
+        Err(ProviderError::Api { status: 400, message }) => assert!(message.contains("botd needs 7.0.1"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+    s.w().version = None;
+    s.w().missing_extensions = vec!["network_bridge_acl_devices".into()];
+    match p.create(&spec("superbot-m1", "c1-m2-d20")).await {
+        Err(ProviderError::Api { status: 400, message }) => assert!(message.contains("network_bridge_acl_devices"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(s.calls("POST", "/1.0/instances").is_empty(), "nothing was asked for");
+    s.w().missing_extensions.clear();
+    p.create(&spec("superbot-m1", "c1-m2-d20")).await.unwrap();
+}

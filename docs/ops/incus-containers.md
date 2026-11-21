@@ -6,7 +6,7 @@ These steps change only the Incus host you run them on. Placeholders look like `
 
 ## 1. The host
 
-Use a dedicated Linux host for SuperBot containers, with a current kernel and Incus 7.0.1 or later. Earlier releases, including every 6.0 LTS, can't apply a change to a network ACL that containers in a restricted project use, and the preflight check refuses them. Ubuntu 24.04's own `incus` package is 6.0.0, so install Incus from [Zabbly](https://github.com/zabbly/incus), its stable or 7.0 LTS channel. Choose a storage pool driver that enforces disk sizes: zfs, btrfs or lvm. `dir` does not enforce sizes, and the preflight check flags it.
+Use a dedicated Linux host for SuperBot containers, with a current kernel and Incus 7.0.1 or later. Earlier releases, including every 6.0 LTS, can't apply a change to a network ACL that containers in a restricted project use. botd won't make containers on them, and the preflight check says why. Ubuntu 24.04's own `incus` package is 6.0.0, so install Incus from [Zabbly](https://github.com/zabbly/incus), its stable or 7.0 LTS channel. Choose a storage pool driver that enforces disk sizes: zfs, btrfs or lvm. `dir` does not enforce sizes, and the preflight check flags it.
 
 The kernel needs nftables' bridge family. Without it, Incus can't apply network ACLs or NIC filters, and creates fail. Check with `sudo nft add table bridge sbcheck && sudo nft delete table bridge sbcheck`. Stock Ubuntu has it. Some minimal or nested kernels don't.
 
