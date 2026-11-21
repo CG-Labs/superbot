@@ -638,3 +638,37 @@ async fn a_team_without_machines_retries_or_takes_back_a_members_released_machin
     assert_eq!((tm.team_id.as_str(), tm.released_at), (w.alpha.as_str(), None));
     assert_eq!(w.app.db.machine(&m.id).unwrap().state, crate::machines::State::Running);
 }
+
+#[tokio::test]
+async fn a_machine_being_deleted_is_never_taken_back_and_a_failed_resume_is_reported() {
+    use crate::machines::provider::ProviderError;
+    let w = world().await;
+    reconcile(&w).await;
+    let (dee_id, _) = user_with(w.port, &w.admin, "dee@example.com", "member").await;
+    json_call(w.port, "PUT", &format!("/api/teams/{}/members/{dee_id}", w.alpha), &w.admin, "{}").await;
+    reconcile(&w).await;
+    let dee_m = w.app.db.user_machine(&dee_id).unwrap();
+    let al_m = w.app.db.user_machine(&w.al_id).unwrap();
+    for id in [&dee_id, &w.al_id] {
+        assert_eq!(call(w.port, "DELETE", &format!("/api/team/members/{id}"), &w.ada, "").await.0, 200);
+    }
+    json_call(w.port, "PATCH", &format!("/api/teams/{}", w.beta), &w.admin, r#"{"machines":false}"#).await;
+
+    // Al's machine is due, and its delete fails at the provider: it stays Destroying.
+    w.app.db.team_machine_backdate(&al_m.id, 8 * 86_400_000);
+    w.fake.fail_next("delete", ProviderError::RateLimited);
+    reconcile(&w).await;
+    assert_eq!(w.app.db.machine(&al_m.id).unwrap().state, crate::machines::State::Destroying);
+    json_call(w.port, "PUT", &format!("/api/teams/{}/members/{}", w.beta, w.al_id), &w.admin, "{}").await;
+    let (code, res) = call(w.port, "POST", &format!("/api/team/members/{}/machine", w.al_id), &w.bea, "").await;
+    assert_eq!(code, 409, "{res}");
+    assert!(w.app.db.team_machine(&al_m.id).is_none_or(|t| t.team_id == w.alpha), "not Beta's");
+
+    // Dee's suspended machine is taken back, but the provider won't boot it: Beta's owner is told.
+    json_call(w.port, "PUT", &format!("/api/teams/{}/members/{dee_id}", w.beta), &w.admin, "{}").await;
+    assert_eq!(w.app.db.machine(&dee_m.id).unwrap().state, crate::machines::State::Suspended);
+    w.fake.fail_next("boot", ProviderError::RateLimited);
+    let (code, v) = json_call(w.port, "POST", &format!("/api/team/members/{dee_id}/machine"), &w.bea, "").await;
+    assert!(code >= 400, "{code} {v}");
+    assert_eq!(w.app.db.team_machine(&dee_m.id).unwrap().team_id, w.beta, "Beta's, to resume again");
+}

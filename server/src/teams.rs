@@ -216,13 +216,17 @@ async fn provide(app: &AppState, by: &Who, team: &Team, user: &User) -> Value {
 /// while: if they left the team meanwhile, it's released as their leaving would have.
 /// Their current team takes it, even one a former team released; a former team's late
 /// claim leaves alone a machine another team holds.
-pub(crate) async fn claim(app: &AppState, by: &Who, team_id: &str, user_id: &str, machine_id: &str) {
-    let Some(cp) = control_plane(app) else { return };
+/// A machine already going is never claimed. Whether the team holds it after.
+pub(crate) async fn claim(app: &AppState, by: &Who, team_id: &str, user_id: &str, machine_id: &str) -> bool {
+    let Some(cp) = control_plane(app) else { return false };
     let left = {
         let _g = cp.lock_ops().await;
+        if app.db.machine(machine_id).is_none_or(|m| matches!(m.state, MachineState::Destroying | MachineState::Destroyed)) {
+            return false;
+        }
         let left = app.db.team_id_of(user_id).as_deref() != Some(team_id);
         if left && app.db.team_machine(machine_id).is_some_and(|t| t.team_id != team_id) {
-            return;
+            return false;
         }
         app.db.team_machine_mark(machine_id, team_id, user_id);
         left
@@ -230,6 +234,7 @@ pub(crate) async fn claim(app: &AppState, by: &Who, team_id: &str, user_id: &str
     if left {
         release(app, by, team_id, user_id).await;
     }
+    !left
 }
 
 /// Whether `m` is a machine `team_id` gave and hasn't released: the team's to manage.
@@ -582,11 +587,14 @@ pub async fn give_machine(State(app): State<AppState>, Extension(c): Extension<C
         if m.state != MachineState::Error {
             // One a former team released is this team's now, and back on.
             if !ours(&app, &t.id, &m) {
-                claim(&app, &by, &t.id, &u.id, &m.id).await;
-                if m.state == MachineState::Suspended {
-                    let _ = crate::machines::act_if(&app, cp, &by, &u.id, Step::Resume, None, &|x| ours(&app, &t.id, x)).await;
+                if !claim(&app, &by, &t.id, &u.id, &m.id).await {
+                    return Err(conflict("Their machine is being deleted. Ask again once it's gone."));
                 }
                 app.db.record(&team_event(&by, "team.machine_kept", &t.id, json!({ "user": u.id, "machine": m.id, "via": "admin" })));
+                if app.db.machine(&m.id).is_some_and(|x| x.state == MachineState::Suspended) {
+                    let res = crate::machines::act_if(&app, cp, &by, &u.id, Step::Resume, None, &|x| ours(&app, &t.id, x)).await;
+                    return machine_answer(&app, &by, &t.id, &u.id, res).await;
+                }
             }
             return Ok((StatusCode::OK, Json(json!({ "machine": machine_view(&app, &t.id, &u.id) }))));
         }
