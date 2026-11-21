@@ -1,9 +1,13 @@
 //! SCIM 2.0 provisioning (RFC 7643, RFC 7644): an enterprise IdP (Entra ID, Okta, ...)
-//! creates, updates, deactivates, and deletes SuperBot users under `/scim/v2`. A stub:
-//! the core User schema only; Groups, Bulk, sorting, and ETags are not supported.
-//! Each IdP connection is a tenant with its own bearer tokens (`sbp_`, stored hashed),
-//! and sees only the users it provisioned. SCIM never sets roles.
-//! Design: docs/adr/0023-scim.md.
+//! creates, updates, deactivates, and deletes SuperBot users under `/scim/v2`, and with
+//! SCIM_GROUPS=on, pushes groups as teams (`groups`). The core User and Group schemas
+//! only; Bulk, sorting, and ETags are not supported. Each IdP connection is a tenant
+//! with its own bearer tokens (`sbp_`, stored hashed), and sees only the users it
+//! provisioned and the groups it made or an admin linked to it. SCIM never sets roles,
+//! org-wide or on a team.
+//! Design: docs/adr/0023-scim.md, docs/adr/0095-scim-groups-as-teams.md.
+
+pub mod groups;
 
 use crate::audit::{Actor, ActorKind, Outcome, Source, Who};
 use crate::db::{self, NewIdentity, ScimConflict, ScimFields, ScimKey, ScimToken, ScimUser, User};
@@ -47,22 +51,40 @@ pub struct Scim {
     pub limiter: Limiter,
     /// Bad tokens per client IP.
     pub failures: Limiter,
+    /// SCIM_GROUPS=on: groups are teams (ADR 0095). Off: `/Groups` lists none and
+    /// refuses the rest, as before.
+    pub groups: bool,
+    /// One group write at a time, so what a request checked still holds when it writes.
+    pub group_writes: tokio::sync::Mutex<()>,
 }
 
 impl Default for Scim {
     fn default() -> Scim {
-        Scim { enabled: false, default_role: Role::Member, limiter: Limiter::new(RATE_LIMIT, RATE_WINDOW_MS), failures: Limiter::new(FAIL_LIMIT, FAIL_WINDOW_MS) }
+        Scim {
+            enabled: false,
+            default_role: Role::Member,
+            limiter: Limiter::new(RATE_LIMIT, RATE_WINDOW_MS),
+            failures: Limiter::new(FAIL_LIMIT, FAIL_WINDOW_MS),
+            groups: false,
+            group_writes: tokio::sync::Mutex::new(()),
+        }
+    }
+}
+
+fn on_off(name: &str, v: &str) -> Result<bool, String> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "off" | "false" | "no" => Ok(false),
+        "1" | "on" | "true" | "yes" => Ok(true),
+        _ => Err(format!("{name} must be on or off, not \"{v}\"")),
     }
 }
 
 impl Scim {
-    /// SCIM (off unless on) and SCIM_DEFAULT_ROLE (member, the default, or readonly).
-    pub fn from_env(scim: &str, role: &str) -> Result<Scim, String> {
-        let enabled = match scim.trim().to_ascii_lowercase().as_str() {
-            "" | "0" | "off" | "false" | "no" => false,
-            "1" | "on" | "true" | "yes" => true,
-            _ => return Err(format!("SCIM must be on or off, not \"{scim}\"")),
-        };
+    /// SCIM (off unless on), SCIM_DEFAULT_ROLE (member, the default, or readonly), and
+    /// SCIM_GROUPS (off unless on; needs SCIM=on to do anything).
+    pub fn from_env(scim: &str, role: &str, groups: &str) -> Result<Scim, String> {
+        let enabled = on_off("SCIM", scim)?;
+        let groups = on_off("SCIM_GROUPS", groups)?;
         let default_role = match role.trim() {
             "" => Role::Member,
             r => match Role::parse(r) {
@@ -71,7 +93,7 @@ impl Scim {
                 None => return Err(format!("SCIM_DEFAULT_ROLE must be member or readonly, not \"{role}\"")),
             },
         };
-        Ok(Scim { enabled, default_role, ..Scim::default() })
+        Ok(Scim { enabled, default_role, groups, ..Scim::default() })
     }
 }
 
@@ -303,14 +325,19 @@ fn user_resource_type(base: &str) -> Value {
     })
 }
 
-pub async fn resource_types(headers: HeaderMap) -> Response {
-    list(vec![user_resource_type(&base_url(&headers))], 1, 1)
+pub async fn resource_types(Extension(a): Extension<Arc<Auth>>, headers: HeaderMap) -> Response {
+    let base = base_url(&headers);
+    let mut types = vec![user_resource_type(&base)];
+    types.extend(groups::resource_types(&a, &base));
+    let n = types.len() as i64;
+    list(types, n, 1)
 }
 
-pub async fn resource_type(headers: HeaderMap, Path(id): Path<String>) -> ScimRes {
+pub async fn resource_type(Extension(a): Extension<Arc<Auth>>, headers: HeaderMap, Path(id): Path<String>) -> ScimRes {
+    let base = base_url(&headers);
     match id.as_str() {
-        "User" => Ok(scim_json(StatusCode::OK, user_resource_type(&base_url(&headers)))),
-        _ => Err(missing("Resource type")),
+        "User" => Ok(scim_json(StatusCode::OK, user_resource_type(&base))),
+        _ => groups::resource_type(&a, &base, &id).map(|t| scim_json(StatusCode::OK, t)).ok_or_else(|| missing("Resource type")),
     }
 }
 
@@ -342,30 +369,20 @@ fn user_schema(base: &str) -> Value {
     })
 }
 
-pub async fn schemas(headers: HeaderMap) -> Response {
-    list(vec![user_schema(&base_url(&headers))], 1, 1)
+pub async fn schemas(Extension(a): Extension<Arc<Auth>>, headers: HeaderMap) -> Response {
+    let base = base_url(&headers);
+    let mut all = vec![user_schema(&base)];
+    all.extend(groups::schemas(&a, &base));
+    let n = all.len() as i64;
+    list(all, n, 1)
 }
 
-pub async fn schema(headers: HeaderMap, Path(id): Path<String>) -> ScimRes {
+pub async fn schema(Extension(a): Extension<Arc<Auth>>, headers: HeaderMap, Path(id): Path<String>) -> ScimRes {
+    let base = base_url(&headers);
     match id.as_str() {
-        USER_SCHEMA => Ok(scim_json(StatusCode::OK, user_schema(&base_url(&headers)))),
-        _ => Err(missing("Schema")),
+        USER_SCHEMA => Ok(scim_json(StatusCode::OK, user_schema(&base))),
+        _ => groups::schema(&a, &base, &id).map(|s| scim_json(StatusCode::OK, s)).ok_or_else(|| missing("Schema")),
     }
-}
-
-/// Groups are not provisioned (ADR 0023). Listing answers empty, so IdPs' connection
-/// tests pass; anything else says so.
-pub async fn list_groups(Query(q): Query<HashMap<String, String>>) -> ScimRes {
-    let (start, _) = page(&q)?;
-    Ok(list(vec![], 0, start))
-}
-
-pub async fn get_group() -> Response {
-    missing("Group").into_response()
-}
-
-pub async fn groups_unsupported() -> Response {
-    ScimError::new(StatusCode::NOT_IMPLEMENTED, None, "SuperBot doesn't provision groups yet. Turn group provisioning off for this app; provision users only.").into_response()
 }
 
 pub async fn unknown() -> Response {
@@ -375,25 +392,38 @@ pub async fn unknown() -> Response {
 // Filters (RFC 7644 section 3.4.2.2): only `userName eq "..."` and `externalId eq "..."`,
 // which are what Entra ID and Okta send to find a user.
 
-pub fn parse_filter(s: &str) -> Result<ScimKey, String> {
+/// `attr` with its schema's URN in front of it taken off, in any case.
+fn strip_schema<'a>(attr: &'a str, schema: &str) -> &'a str {
+    attr.get(..schema.len() + 1).filter(|p| p.eq_ignore_ascii_case(&format!("{schema}:"))).map_or(attr, |p| &attr[p.len()..])
+}
+
+/// `attr eq "value"`: the attribute as sent, and the value, a JSON string of 1 to 512
+/// characters that must be the whole rest. `Err(None)` is a filter of another shape;
+/// `Err(Some(_))` says what's wrong with the value.
+fn attr_eq(s: &str) -> Result<(&str, String), Option<String>> {
     let s = s.trim();
-    let unsupported = || format!("Unsupported filter: only userName eq \"...\" and externalId eq \"...\" are supported, not {}", s.chars().take(100).collect::<String>());
-    let (attr, rest) = s.split_once(char::is_whitespace).ok_or_else(unsupported)?;
-    let (op, value) = rest.trim_start().split_once(char::is_whitespace).ok_or_else(unsupported)?;
+    let (attr, rest) = s.split_once(char::is_whitespace).ok_or(None)?;
+    let (op, value) = rest.trim_start().split_once(char::is_whitespace).ok_or(None)?;
     if !op.eq_ignore_ascii_case("eq") {
-        return Err(unsupported());
+        return Err(None);
     }
     let value = value.trim();
     if !value.starts_with('"') {
-        return Err("The filter's value must be a quoted string".into());
+        return Err(Some("The filter's value must be a quoted string".into()));
     }
     // A JSON string: escapes are JSON's, and it must be the whole rest of the filter.
-    let v: String = serde_json::from_str(value).map_err(|_| unsupported())?;
+    let v: String = serde_json::from_str(value).map_err(|_| None)?;
     if v.is_empty() || v.chars().count() > 512 {
-        return Err("The filter's value must be 1 to 512 characters".into());
+        return Err(Some("The filter's value must be 1 to 512 characters".into()));
     }
-    let attr = attr.get(..USER_SCHEMA.len() + 1).filter(|p| p.eq_ignore_ascii_case(&format!("{USER_SCHEMA}:"))).map_or(attr, |p| &attr[p.len()..]);
-    match attr.to_ascii_lowercase().as_str() {
+    Ok((attr, v))
+}
+
+pub fn parse_filter(s: &str) -> Result<ScimKey, String> {
+    let s = s.trim();
+    let unsupported = || format!("Unsupported filter: only userName eq \"...\" and externalId eq \"...\" are supported, not {}", s.chars().take(100).collect::<String>());
+    let (attr, v) = attr_eq(s).map_err(|e| e.unwrap_or_else(unsupported))?;
+    match strip_schema(attr, USER_SCHEMA).to_ascii_lowercase().as_str() {
         "username" => Ok(ScimKey::UserName(v)),
         "externalid" => Ok(ScimKey::ExternalId(v)),
         _ => Err(unsupported()),
@@ -725,7 +755,8 @@ async fn changed(app: &AppState, a: &Auth, c: &Caller, before_user: &User, befor
     match active {
         Some(true) => {
             let resumed = crate::handover::user_enabled(app, by, &after.user.id);
-            app.db.record(&ev("user.enabled").details(json!({ "tenant": c.token.tenant, "routinesResumed": resumed })))
+            app.db.record(&ev("user.enabled").details(json!({ "tenant": c.token.tenant, "routinesResumed": resumed })));
+            crate::teams::user_enabled(app, by, &after.user.id).await;
         }
         Some(false) => {
             a.sso.forget_user(&after.user.id);
@@ -926,6 +957,7 @@ pub async fn delete_user(State(app): State<AppState>, Extension(a): Extension<Ar
         crate::machines::screens::rotate_all(&app).await;
     }
     crate::machines::offboard::left(&app, &c.who, &id, crate::machines::offboard::DEPROVISIONED);
+    groups::user_deleted(&app, &a, &c, &id).await;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -940,7 +972,7 @@ fn tenant_name(v: &Value) -> Res<String> {
 
 /// `GET /api/scim/tokens`: every token (never a value), and whether SCIM is on.
 pub async fn list_tokens(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>) -> Json<Value> {
-    Json(json!({ "enabled": a.scim.enabled, "defaultRole": a.scim.default_role, "tokens": app.db.scim_tokens() }))
+    Json(json!({ "enabled": a.scim.enabled, "defaultRole": a.scim.default_role, "groups": a.scim.groups, "tokens": app.db.scim_tokens() }))
 }
 
 /// `POST /api/scim/tokens {tenant, label?, sso?}`. `sso` names a configured SSO provider
@@ -989,22 +1021,27 @@ mod tests {
 
     #[test]
     fn settings_are_off_by_default_and_never_make_admins() {
-        let s = Scim::from_env("", "").unwrap();
-        assert!(!s.enabled);
+        let s = Scim::from_env("", "", "").unwrap();
+        assert!(!s.enabled && !s.groups);
         assert_eq!(s.default_role, Role::Member);
-        assert!(Scim::from_env("on", "").unwrap().enabled);
-        assert_eq!(Scim::from_env("on", "read-only").unwrap().default_role, Role::Readonly);
-        assert!(Scim::from_env("maybe", "").is_err());
-        assert!(Scim::from_env("on", "admin").is_err());
-        assert!(Scim::from_env("on", "owner").is_err());
+        assert!(Scim::from_env("on", "", "").unwrap().enabled);
+        assert!(!Scim::from_env("on", "", "").unwrap().groups, "groups need their own switch");
+        assert!(Scim::from_env("on", "", "on").unwrap().groups);
+        assert_eq!(Scim::from_env("on", "read-only", "").unwrap().default_role, Role::Readonly);
+        assert!(Scim::from_env("maybe", "", "").is_err());
+        assert!(Scim::from_env("on", "", "teams").is_err());
+        assert!(Scim::from_env("on", "admin", "").is_err());
+        assert!(Scim::from_env("on", "owner", "").is_err());
     }
 
     #[test]
     fn the_example_env_files_leave_scim_off() {
         for (name, text) in [(".env.example", include_str!("../../.env.example")), ("deploy/docker/.env.example", include_str!("../../deploy/docker/.env.example"))] {
             let vars: HashMap<&str, &str> = text.lines().filter(|l| !l.trim_start().starts_with('#')).filter_map(|l| l.split_once('=')).map(|(k, v)| (k.trim(), v.trim())).collect();
-            let s = Scim::from_env(vars.get("SCIM").copied().unwrap_or(""), vars.get("SCIM_DEFAULT_ROLE").copied().unwrap_or("")).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert!(!s.enabled && vars.contains_key("SCIM"), "{name}");
+            let get = |k: &str| vars.get(k).copied().unwrap_or("");
+            let s = Scim::from_env(get("SCIM"), get("SCIM_DEFAULT_ROLE"), get("SCIM_GROUPS")).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(!s.enabled && !s.groups && vars.contains_key("SCIM"), "{name}");
+            assert!(text.contains("SCIM_GROUPS"), "{name} documents SCIM_GROUPS");
         }
     }
 

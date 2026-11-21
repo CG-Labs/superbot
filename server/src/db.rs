@@ -1278,6 +1278,61 @@ fn scim_conflict(e: rusqlite::Error) -> ScimConflict {
     }
 }
 
+/// A SCIM tenant's group: the team it is (ADR 0095). Its SCIM `id` is the team's id.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScimGroup {
+    pub team_id: String,
+    pub tenant: String,
+    pub external_id: Option<String>,
+    /// As the IdP (or the admin who linked it) named it. The team's name follows it.
+    pub display_name: String,
+    /// `scim`: a SCIM `POST` made the team. `admin`: an admin linked a team that existed.
+    pub origin: String,
+    /// When the IdP created or took on the group. None: an admin's link it hasn't yet.
+    pub provisioned_at: Option<i64>,
+    pub created_at: i64,
+    pub created_by: Option<String>,
+    pub updated_at: i64,
+}
+
+fn scim_group_row(r: &Row) -> rusqlite::Result<ScimGroup> {
+    Ok(ScimGroup {
+        team_id: r.get("team_id")?,
+        tenant: r.get("tenant")?,
+        external_id: r.get("external_id")?,
+        display_name: r.get("display_name")?,
+        origin: r.get("origin")?,
+        provisioned_at: r.get("provisioned_at")?,
+        created_at: r.get("created_at")?,
+        created_by: r.get("created_by")?,
+        updated_at: r.get("updated_at")?,
+    })
+}
+
+/// Why a group link wasn't written: something unique in the tenant is another group's,
+/// or the team is a group already.
+#[derive(Debug, PartialEq)]
+pub enum ScimGroupConflict {
+    DisplayName,
+    ExternalId,
+    Team,
+    Gone,
+    Db(String),
+}
+
+fn scim_group_conflict(e: rusqlite::Error) -> ScimGroupConflict {
+    let msg = e.to_string();
+    match () {
+        _ if !constraint(&e) => ScimGroupConflict::Db(msg),
+        _ if msg.contains("FOREIGN KEY") => ScimGroupConflict::Gone,
+        _ if msg.contains("external_id") => ScimGroupConflict::ExternalId,
+        _ if msg.contains("display_name") => ScimGroupConflict::DisplayName,
+        _ if msg.contains("team_id") => ScimGroupConflict::Team,
+        _ => ScimGroupConflict::Db(msg),
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum JitError {
     /// Another user has this email. Never merged by email: ask an admin to link instead.
@@ -1447,7 +1502,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 39] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 40] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1487,7 +1542,31 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 39] = [
     migrate_billing_emails,
     migrate_team_billing,
     migrate_mfa,
+    migrate_scim_groups,
 ];
+
+/// SCIM groups as teams (ADR 0095): which team each of a tenant's groups is. A team is
+/// one tenant's group at most. `origin` says who made the link: a SCIM `POST` that made
+/// the team (`scim`), or an admin linking a team that already existed (`admin`).
+/// `provisioned_at` is when the IdP created or took on the group; an admin's link, and a
+/// `POST` that stopped partway, wait for that. `displayName` is unique in a tenant in any case, as Entra ID needs.
+fn migrate_scim_groups(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS scim_groups (
+          team_id TEXT PRIMARY KEY REFERENCES teams(id) ON DELETE CASCADE,
+          tenant TEXT NOT NULL,
+          external_id TEXT,
+          display_name TEXT NOT NULL COLLATE NOCASE,
+          origin TEXT NOT NULL CHECK (origin IN ('scim', 'admin')),
+          provisioned_at INTEGER,
+          created_at INTEGER NOT NULL,
+          created_by TEXT,
+          updated_at INTEGER NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS scim_groups_external_id ON scim_groups(tenant, external_id) WHERE external_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS scim_groups_display_name ON scim_groups(tenant, display_name);",
+    )
+}
 
 /// Team billing (ADR 0093): a team's own Stripe customer, its subscriptions (kept like
 /// a user's, with the seats Stripe bills and where syncing them stands), and its open
@@ -4909,6 +4988,118 @@ impl Db {
         ok && tx.commit().is_ok()
     }
 
+    // SCIM groups as teams (ADR 0095). Every query a SCIM request makes names its tenant.
+
+    /// A tenant's groups, oldest first.
+    pub fn scim_groups(&self, tenant: &str) -> Vec<ScimGroup> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM scim_groups WHERE tenant = ? ORDER BY created_at, team_id").unwrap();
+        s.query_map([tenant], scim_group_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Every tenant's groups, for admins.
+    pub fn all_scim_groups(&self) -> Vec<ScimGroup> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM scim_groups ORDER BY tenant, created_at, team_id").unwrap();
+        s.query_map([], scim_group_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    pub fn scim_group(&self, tenant: &str, team_id: &str) -> Option<ScimGroup> {
+        self.c().query_row("SELECT * FROM scim_groups WHERE tenant = ? AND team_id = ?", [tenant, team_id], scim_group_row).optional().ok().flatten()
+    }
+
+    /// The group a team is, whichever tenant's.
+    pub fn scim_group_of_team(&self, team_id: &str) -> Option<ScimGroup> {
+        self.c().query_row("SELECT * FROM scim_groups WHERE team_id = ?", [team_id], scim_group_row).optional().ok().flatten()
+    }
+
+    /// By `externalId` (exactly) or `displayName` (any case).
+    pub fn scim_group_find(&self, tenant: &str, external_id: Option<&str>, display_name: Option<&str>) -> Option<ScimGroup> {
+        let (col, v) = match (external_id, display_name) {
+            (Some(x), _) => ("external_id", x),
+            (None, Some(n)) => ("display_name", n),
+            (None, None) => return None,
+        };
+        self.c().query_row(&format!("SELECT * FROM scim_groups WHERE tenant = ? AND {col} = ?"), [tenant, v], scim_group_row).optional().ok().flatten()
+    }
+
+    /// A new team for a group a SCIM tenant created, linked to it: both or neither. A
+    /// team SCIM makes gives no machines until an admin turns that on.
+    pub fn create_scim_group(&self, tenant: &str, external_id: Option<&str>, display_name: &str, team_name: &str, by: Option<&str>) -> Result<ScimGroup, ScimGroupConflict> {
+        let id = format!("t{}", crate::random_hex(5));
+        let at = now();
+        let c = self.c();
+        let tx = c.unchecked_transaction().map_err(scim_group_conflict)?;
+        tx.execute("INSERT INTO teams (id, name, machines, created_at, created_by, updated_at) VALUES (?1, ?2, 0, ?3, ?4, ?3)", params![id, team_name, at, by])
+            .map_err(scim_group_conflict)?;
+        tx.execute(
+            "INSERT INTO scim_groups (team_id, tenant, external_id, display_name, origin, provisioned_at, created_at, created_by, updated_at) VALUES (?1, ?2, ?3, ?4, 'scim', ?5, ?5, ?6, ?5)",
+            params![id, tenant, external_id, display_name, at, by],
+        )
+        .map_err(scim_group_conflict)?;
+        let g = tx.query_row("SELECT * FROM scim_groups WHERE team_id = ?", [&id], scim_group_row).map_err(scim_group_conflict)?;
+        tx.commit().map_err(scim_group_conflict)?;
+        Ok(g)
+    }
+
+    /// An admin links a team that exists to a tenant's group, for the IdP to take on.
+    pub fn link_scim_group(&self, tenant: &str, team_id: &str, external_id: Option<&str>, display_name: &str, by: Option<&str>) -> Result<ScimGroup, ScimGroupConflict> {
+        let at = now();
+        let c = self.c();
+        c.execute(
+            "INSERT INTO scim_groups (team_id, tenant, external_id, display_name, origin, created_at, created_by, updated_at) VALUES (?1, ?2, ?3, ?4, 'admin', ?5, ?6, ?5)",
+            params![team_id, tenant, external_id, display_name, at, by],
+        )
+        .map_err(scim_group_conflict)?;
+        c.query_row("SELECT * FROM scim_groups WHERE team_id = ?", [team_id], scim_group_row).map_err(scim_group_conflict)
+    }
+
+    /// Sets a group's `displayName` and `externalId` and renames its team, while the
+    /// tenant still has it. `provision` marks an admin's link as taken on by the IdP.
+    pub fn save_scim_group(&self, tenant: &str, team_id: &str, external_id: Option<&str>, display_name: &str, team_name: &str, provision: bool) -> Result<ScimGroup, ScimGroupConflict> {
+        let at = now();
+        let c = self.c();
+        let tx = c.unchecked_transaction().map_err(scim_group_conflict)?;
+        let n = tx
+            .execute(
+                "UPDATE scim_groups SET external_id = ?1, display_name = ?2, updated_at = ?3, provisioned_at = CASE WHEN ?4 THEN coalesce(provisioned_at, ?3) ELSE provisioned_at END
+                 WHERE tenant = ?5 AND team_id = ?6",
+                params![external_id, display_name, at, provision, tenant, team_id],
+            )
+            .map_err(scim_group_conflict)?;
+        if n != 1 {
+            return Err(ScimGroupConflict::Gone);
+        }
+        tx.execute("UPDATE teams SET name = ?1, updated_at = ?2 WHERE id = ?3 AND name != ?1", params![team_name, at, team_id]).map_err(scim_group_conflict)?;
+        let g = tx.query_row("SELECT * FROM scim_groups WHERE team_id = ?", [team_id], scim_group_row).map_err(scim_group_conflict)?;
+        tx.commit().map_err(scim_group_conflict)?;
+        Ok(g)
+    }
+
+    /// A `POST` that made or took on the group stopped partway: it waits to be taken on
+    /// again, so the IdP's retry of that `POST` finishes it.
+    pub fn reopen_scim_group(&self, tenant: &str, team_id: &str) {
+        let _ = self.c().execute("UPDATE scim_groups SET provisioned_at = NULL, updated_at = ?1 WHERE tenant = ?2 AND team_id = ?3", params![now(), tenant, team_id]);
+    }
+
+    /// Ends a team's link to its group, and returns what it was. The team stays.
+    pub fn unlink_scim_group(&self, team_id: &str) -> Option<ScimGroup> {
+        self.c().query_row("DELETE FROM scim_groups WHERE team_id = ? RETURNING *", [team_id], scim_group_row).optional().ok().flatten()
+    }
+
+    /// The team's members `tenant` provisioned and hasn't deleted, oldest member first.
+    /// With `deleted`, the ones it deleted too: its group still owns their place there.
+    pub fn scim_group_members(&self, tenant: &str, team_id: &str, deleted: bool) -> Vec<User> {
+        let c = self.c();
+        let mut s = c
+            .prepare(
+                "SELECT u.* FROM team_members m JOIN scim_users l ON l.user_id = m.user_id JOIN users u ON u.id = m.user_id
+                 WHERE m.team_id = ?1 AND l.tenant = ?2 AND (?3 OR l.deleted_at IS NULL) ORDER BY m.joined_at, m.user_id",
+            )
+            .unwrap();
+        s.query_map(params![team_id, tenant, deleted], user_row).unwrap().filter_map(Result::ok).collect()
+    }
+
     /// Spends a sign-in code: once, before it expires, for an active user. Returns the user.
     pub fn use_login_code(&self, code_hash: &str, at: i64) -> Option<User> {
         let c = self.c();
@@ -7820,5 +8011,41 @@ mod tests {
         assert!(!db.finish_approval(&a.id, "denied", "user", None, None));
         assert_eq!(db.approval(&a.id).unwrap().status, "approved");
         assert!(db.approvals(Some("pending"), None, 10).is_empty());
+    }
+
+    #[test]
+    fn scim_groups_are_unique_per_tenant_and_go_with_their_team() {
+        let db = Db::open(&temp_path("scim-groups").join("app.sqlite")).unwrap();
+        let eng = db.create_scim_group("okta", Some("00g1"), "Eng", "Eng", Some("scim:st1")).unwrap();
+        assert_eq!((eng.origin.as_str(), eng.provisioned_at.is_some(), db.team(&eng.team_id).unwrap().machines), ("scim", true, false));
+        // Another tenant may use the same name and externalId; this one may not, in any case.
+        assert!(db.create_scim_group("entra", Some("00g1"), "Eng", "Eng", None).is_ok());
+        assert_eq!(db.create_scim_group("okta", None, "ENG", "ENG", None).err(), Some(ScimGroupConflict::DisplayName));
+        // ASCII case only: the filter compares the same way.
+        assert!(db.create_scim_group("entra", None, "Équipe", "Équipe", None).is_ok());
+        assert!(db.create_scim_group("entra", None, "éQUIPE", "éQUIPE", None).is_ok());
+        assert!(db.scim_group_find("entra", None, Some("ÉQUIPE")).is_some_and(|g| g.display_name == "Équipe"));
+        assert_eq!(db.create_scim_group("okta", Some("00g1"), "Other", "Other", None).err(), Some(ScimGroupConflict::ExternalId));
+        assert_eq!(db.teams().len(), 4, "a refused group leaves no team behind");
+        assert_eq!(db.scim_group_find("okta", None, Some("eng")).map(|g| g.team_id), Some(eng.team_id.clone()));
+        assert!(db.scim_group_find("okta", Some("00G1"), None).is_none(), "externalId is exact");
+
+        // A team made by hand, linked once, to one tenant.
+        let ops = db.create_team("Ops", None);
+        let l = db.link_scim_group("okta", &ops.id, None, "Ops", Some("u1")).unwrap();
+        assert_eq!((l.origin.as_str(), l.provisioned_at), ("admin", None));
+        assert_eq!(db.link_scim_group("entra", &ops.id, None, "Ops", None).err(), Some(ScimGroupConflict::Team));
+        assert_eq!(db.link_scim_group("okta", "t-none", None, "Gone", None).err(), Some(ScimGroupConflict::Gone));
+        let saved = db.save_scim_group("okta", &ops.id, Some("00g2"), "Operations", "Operations", true).unwrap();
+        assert!(saved.provisioned_at.is_some());
+        assert_eq!(db.team(&ops.id).unwrap().name, "Operations");
+        assert_eq!(db.save_scim_group("entra", &ops.id, None, "x", "x", true).err(), Some(ScimGroupConflict::Gone), "another tenant's");
+
+        // Unlinked, a stale write finds nothing; a deleted team takes its link with it.
+        assert_eq!(db.unlink_scim_group(&ops.id).map(|g| g.origin), Some("admin".into()));
+        assert_eq!(db.save_scim_group("okta", &ops.id, None, "x", "x", true).err(), Some(ScimGroupConflict::Gone));
+        assert!(db.team(&ops.id).is_some());
+        assert!(db.delete_team(&eng.team_id));
+        assert!(db.scim_group("okta", &eng.team_id).is_none() && db.scim_groups("okta").is_empty());
     }
 }

@@ -96,6 +96,12 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    <tenant> names the IdP connection (e.g. entra);
                                                    --sso: externalId is the person's subject there
   botctl scim token revoke <id>                    The IdP's users stay as they are
+  botctl scim groups                               SCIM groups and the teams they are (SCIM_GROUPS=on)
+  botctl scim group link <tenant> <team> [--external-id <id>] [--name "<group name>"]
+                                                   Lets <tenant>'s IdP take on a team made by hand
+                                                   when it pushes the group with that externalId
+                                                   (or, with none, that name; the team's by default)
+  botctl scim group unlink <team>                  The team is managed by hand again; everyone stays
   botctl sessions [<user>]                         Live sessions
   botctl session revoke <id>
   botctl session revoke-all <user>
@@ -851,16 +857,25 @@ fn signup_request(args: &[&str]) -> Result<(&'static str, String, Option<String>
     })
 }
 
-/// `botctl scim ...`: SCIM provisioning tokens (ADR 0023).
+/// `botctl scim ...`: SCIM provisioning tokens (ADR 0023), and links from SCIM groups to
+/// teams (ADR 0095).
 fn scim_request(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
     Ok(match args {
         [] | ["tokens"] | ["token", "list"] => ("GET", "/api/scim/tokens".into(), None),
+        ["groups"] | ["group", "list"] => ("GET", "/api/scim/groups".into(), None),
+        ["group", "link", tenant, team, rest @ ..] if !tenant.starts_with("--") && !team.starts_with("--") => {
+            let body = json!({ "tenant": tenant, "team": team, "externalId": flag(rest, "--external-id"), "displayName": flag(rest, "--name") });
+            ("POST", "/api/scim/groups".into(), Some(body.to_string()))
+        }
+        ["group", "unlink", team] => ("DELETE", format!("/api/scim/groups/{}", encode(team)), None),
         ["token", "create", tenant, rest @ ..] if !tenant.starts_with("--") => {
             let body = json!({ "tenant": tenant, "sso": flag(rest, "--sso"), "label": flag(rest, "--label") });
             ("POST", "/api/scim/tokens".into(), Some(body.to_string()))
         }
         ["token", "revoke", id] => ("DELETE", format!("/api/scim/tokens/{}", encode(id)), None),
-        _ => return Err("Usage: botctl scim tokens | token create <tenant> [--sso <provider>] [--label TEXT] | token revoke <id>".into()),
+        _ => {
+            return Err("Usage: botctl scim tokens | token create <tenant> [--sso <provider>] [--label TEXT] | token revoke <id> | groups | group link <tenant> <team> [--external-id ID] [--name NAME] | group unlink <team>".into());
+        }
     })
 }
 
@@ -1716,6 +1731,16 @@ mod tests {
         assert!(req(&["token", "create"]).is_err());
         assert!(req(&["token", "create", "--sso", "work"]).is_err());
         assert!(req(&["token", "revoke"]).is_err());
+        assert_eq!(req(&["groups"]), Ok(("GET", "/api/scim/groups".into(), None)));
+        assert_eq!(req(&["group", "link", "okta", "t1"]), Ok(("POST", "/api/scim/groups".into(), Some(json!({ "tenant": "okta", "team": "t1", "externalId": null, "displayName": null })))));
+        assert_eq!(
+            req(&["group", "link", "entra", "t1", "--external-id", "8aa1", "--name", "Platform Team"]),
+            Ok(("POST", "/api/scim/groups".into(), Some(json!({ "tenant": "entra", "team": "t1", "externalId": "8aa1", "displayName": "Platform Team" }))))
+        );
+        assert_eq!(req(&["group", "unlink", "t 1"]), Ok(("DELETE", "/api/scim/groups/t%201".into(), None)));
+        assert!(req(&["group", "link", "okta"]).is_err());
+        assert!(req(&["group", "link", "okta", "--name", "x"]).is_err());
+        assert!(req(&["group", "unlink"]).is_err());
 
         let res = json!({ "token": "sbp_x", "enabled": false, "scimToken": { "id": "st1", "tenant": "entra", "ssoProvider": "work" } });
         let out = scim_created(&res);

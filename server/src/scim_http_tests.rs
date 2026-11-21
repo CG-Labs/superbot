@@ -19,7 +19,7 @@ async fn serve(tweak: impl FnOnce(&mut Auth)) -> (u16, AppState, String) {
 }
 
 /// A new SCIM token. Returns its value and id.
-async fn token(port: u16, admin: &str, body: Value) -> (String, String) {
+pub(crate) async fn token(port: u16, admin: &str, body: Value) -> (String, String) {
     let (code, head, res) = call_with(port, "POST", "/api/scim/tokens", admin, "", &body.to_string()).await;
     assert_eq!(code, 201, "{res}");
     assert_eq!(header(&head, "cache-control").as_deref(), Some("no-store"));
@@ -28,20 +28,20 @@ async fn token(port: u16, admin: &str, body: Value) -> (String, String) {
 }
 
 /// A SCIM request with `token`. Returns the status, response head, and body.
-async fn scim(port: u16, token: &str, method: &str, path: &str, body: Value) -> (u16, String, Value) {
+pub(crate) async fn scim(port: u16, token: &str, method: &str, path: &str, body: Value) -> (u16, String, Value) {
     let body = if body.is_null() { String::new() } else { body.to_string() };
     let (code, head, res) = call_with(port, method, path, &format!("Bearer {token}"), "", &body).await;
     (code, head, parse(&res))
 }
 
-async fn events(port: u16, admin: &str, query: &str) -> Vec<Value> {
+pub(crate) async fn events(port: u16, admin: &str, query: &str) -> Vec<Value> {
     let (code, body) = call(port, "GET", &format!("/api/audit?{query}"), admin, "").await;
     assert_eq!(code, 200, "{body}");
     audit_list(&body)
 }
 
 /// A session for an existing user, from a one-time code.
-async fn session_for(port: u16, admin: &str, user: &str) -> String {
+pub(crate) async fn session_for(port: u16, admin: &str, user: &str) -> String {
     let (code, c) = call(port, "POST", &format!("/api/users/{user}/login-codes"), admin, "").await;
     assert_eq!(code, 200, "{c}");
     let (code, res) = call(port, "POST", "/api/auth/login", "", &json!({ "code": parse(&c)["code"] }).to_string()).await;
@@ -53,7 +53,7 @@ async fn me(port: u16, auth: &str) -> u16 {
     call(port, "GET", "/api/auth/me", auth, "").await.0
 }
 
-fn okta_user(user_name: &str, external_id: &str) -> Value {
+pub(crate) fn okta_user(user_name: &str, external_id: &str) -> Value {
     json!({
         "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
         "userName": user_name, "externalId": external_id,
@@ -64,7 +64,7 @@ fn okta_user(user_name: &str, external_id: &str) -> Value {
     })
 }
 
-fn is_scim_error(head: &str, body: &Value, status: u16) {
+pub(crate) fn is_scim_error(head: &str, body: &Value, status: u16) {
     assert_eq!(header(head, "content-type").as_deref(), Some("application/scim+json"), "{head}");
     assert_eq!(body["schemas"], json!(["urn:ietf:params:scim:api:messages:2.0:Error"]), "{body}");
     assert_eq!(body["status"], status.to_string(), "{body}");

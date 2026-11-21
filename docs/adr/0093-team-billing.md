@@ -62,5 +62,5 @@ No table is written and no route answers without billing; self-host is unchanged
 - Team-only prices (a tier sold only to teams, or per-seat prices that differ from a person's).
 - Telling members with a personal plan, by email, that they can cancel it once their team pays.
 - Yearly prices at checkout (as for people).
-- SCIM groups as teams, so seats follow the IdP.
+- SCIM groups as teams, so seats follow the IdP. (Done in [ADR 0095](0095-scim-groups-as-teams.md).)
 - Server admins changing a team's plan from the console.

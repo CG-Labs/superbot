@@ -37,12 +37,24 @@ pub(crate) fn routes() -> Vec<(String, String)> {
     let outer = body.find(".route(\"/healthz\"").expect("the outer router");
     let api = body.find("let api = Router::new()").expect("the API router");
     let api_end = body[api + 1..].find("\n    let ").map_or(outer, |j| (api + 1 + j).min(outer));
+    // `.route(` then the path, on the same line or, as rustfmt wraps long ones, the next.
+    let next = |from: usize| {
+        let mut k = from;
+        while let Some(i) = body[k..].find(".route(") {
+            let open = k + i + ".route(".len();
+            let rest = body[open..].trim_start();
+            if rest.starts_with('"') {
+                return Some((k + i, body.len() - rest.len() + 1));
+            }
+            k = open;
+        }
+        None
+    };
     let mut out = Vec::new();
     let mut at = 0;
-    while let Some(i) = body[at..].find(".route(\"") {
-        let start = at + i + ".route(\"".len();
+    while let Some((_, start)) = next(at) {
         let path = &body[start..start + body[start..].find('"').unwrap()];
-        let end = body[start..].find(".route(\"").map_or(body.len(), |j| start + j);
+        let end = next(start).map_or(body.len(), |(j, _)| j);
         let full = if (api..api_end).contains(&start) { format!("/api{path}") } else { path.to_string() };
         let chunk = &body[start..end];
         for m in ["get", "post", "put", "patch", "delete"] {
@@ -65,7 +77,7 @@ fn concrete(path: &str) -> String {
 fn the_route_list_is_read_whole() {
     let r = routes();
     assert!(r.len() >= 60, "{} routes: the parser no longer understands fn router", r.len());
-    for (m, p) in [("GET", "/api/state"), ("DELETE", "/api/users/{key}/sessions"), ("POST", "/api/signups/{id}/reject"), ("POST", "/api/auth/sso/{id}/callback"), ("GET", "/healthz"), ("POST", "/api/scim/tokens"), ("PATCH", "/scim/v2/Users/{id}"), ("GET", "/api/setup"), ("PATCH", "/api/setup"), ("PUT", "/api/license")] {
+    for (m, p) in [("GET", "/api/state"), ("DELETE", "/api/users/{key}/sessions"), ("POST", "/api/signups/{id}/reject"), ("POST", "/api/auth/sso/{id}/callback"), ("GET", "/healthz"), ("POST", "/api/scim/tokens"), ("PATCH", "/scim/v2/Users/{id}"), ("GET", "/api/setup"), ("PATCH", "/api/setup"), ("PUT", "/api/license"), ("PUT", "/scim/v2/Groups/{id}"), ("PATCH", "/scim/v2/Groups/{id}"), ("POST", "/scim/v2/Groups"), ("POST", "/api/scim/groups"), ("DELETE", "/api/scim/groups/{team}")] {
         assert!(r.contains(&(m.into(), p.into())), "{m} {p} missing from {r:?}");
     }
     for (m, p) in PUBLIC {
@@ -77,6 +89,7 @@ fn the_route_list_is_read_whole() {
 async fn every_route_but_the_public_ones_needs_credentials_and_the_right_role() {
     let (port, app, admin, key) = serve_app_with(|a| {
         a.scim.enabled = true;
+        a.scim.groups = true;
         a.scim.failures = users::Limiter::new(10_000, 60_000);
     })
     .await;
@@ -136,8 +149,8 @@ async fn every_route_but_the_public_ones_needs_credentials_and_the_right_role() 
         if m != "GET" && p != "/api/auth/logout" && !(m == "DELETE" && p == "/api/me/push") && !own_mfa {
             assert!(!rbac::allows(Principal::User(Role::Readonly), need), "readonly could {m} {p}");
         }
-        // The admin portal, the audit log, secrets, signups, the setup wizard, the license, and status incidents are admin-only.
-        if ["/api/users", "/api/sessions", "/api/audit", "/api/secrets", "/api/signups", "/api/policy", "/api/setup", "/api/license", "/api/usage", "/api/status"].iter().any(|s| p.starts_with(s)) && !(m == "GET" && p.starts_with("/api/policy")) {
+        // The admin portal, the audit log, secrets, signups, the setup wizard, the license, status incidents, and SCIM tokens and group links are admin-only.
+        if ["/api/users", "/api/sessions", "/api/audit", "/api/secrets", "/api/signups", "/api/policy", "/api/setup", "/api/license", "/api/usage", "/api/status", "/api/scim"].iter().any(|s| p.starts_with(s)) && !(m == "GET" && p.starts_with("/api/policy")) {
             assert_eq!(need, rbac::Perm::Admin, "{m} {p}");
         }
         checked += 1;

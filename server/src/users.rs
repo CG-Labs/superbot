@@ -621,6 +621,7 @@ pub async fn update_user(State(app): State<AppState>, Extension(a): Extension<Ar
         if after.active() {
             let resumed = crate::handover::user_enabled(&app, &by, &after.id);
             app.db.record(&ev("user.enabled").details(json!({ "routinesResumed": resumed })));
+            crate::teams::user_enabled(&app, &by, &after.id).await;
         } else {
             a.sso.forget_user(&after.id);
             a.mfa.forget_user(&after.id);

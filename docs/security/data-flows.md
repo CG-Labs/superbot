@@ -11,6 +11,7 @@ botd keeps the organisation's data in one SQLite database, `DATA_DIR/app.sqlite`
 | Data | Stored as |
 |------|-----------|
 | Users, roles, SSO identities, signup requests, SCIM users | Rows. Users are disabled, never deleted ([ADR 0012](../adr/0012-users-sessions-rbac.md), [ADR 0023](../adr/0023-scim.md)). |
+| Teams and their members; SCIM groups | Rows. A SCIM group is a team's link to one IdP tenant: the tenant's name, the IdP's group id (`externalId`) and name ([ADR 0087](../adr/0087-team-accounts-and-machines.md), [ADR 0095](../adr/0095-scim-groups-as-teams.md)). |
 | Sessions, one-time sign-in codes, SCIM tokens, machine enrollment tokens | SHA-256 hashes only. The token itself is never stored. |
 | Bot records: owner, visibility, grants, settings, policy rules | Rows. |
 | Chat history, routines, approvals | Rows. An approval's tool input is sealed (encrypted, below). Chat text is not sealed. |
@@ -147,6 +148,14 @@ sequenceDiagram
 - The signed webhook is the only way a plan changes. Unsigned, mis-signed or stale events are refused.
 - A team's plan is bought by its owners and admins for everyone on it. Stripe gets the team's ID, the buyer's user ID and email (for a new customer), and the number of members, never their names or emails. The team's Stripe customer is never a person's.
 - Billing emails go through the operator's SMTP server to the person the plan is for, as plain text: their plan name and dates, what their computer is doing about a plan change, and how close they are to their tier's tokens and storage. Never a Stripe id, price, amount, card detail, portal link or secret. Off unless billing and SMTP are on ([ADR 0091](../adr/0091-billing-emails.md)). A team plan's emails go to the team's owners and admins ([ADR 0093](../adr/0093-team-billing.md)).
+
+### Identity providers (SCIM, inbound)
+
+Off until `SCIM=on` ([ADR 0023](../adr/0023-scim.md), [ADR 0026](../adr/0026-scim-review-hardening.md)). The IdP calls botd at `/scim/v2` with a tenant's bearer token; botd never calls the IdP. It sends people's names, emails, the IdP's ids for them, and whether they're active, and with `SCIM_GROUPS=on`, group names, the IdP's group ids, and members ([ADR 0095](../adr/0095-scim-groups-as-teams.md)).
+
+- A tenant sees and changes only the users it provisioned and the groups it made or an admin linked to it. It never gets anyone else's data back: a group's `members` lists only the tenant's own people.
+- Group membership moves people onto and off teams, which changes who shares their Bots, which machines they get, and which plan they're on; leaving runs the same offboarding as a team admin's removal. SCIM never sets a role.
+- Everything it sends that SuperBot doesn't keep (roles, phone numbers, Okta's placeholder password) is dropped, never stored or logged. Every change is in the audit log with the token as the actor.
 
 ### Machines and backups
 

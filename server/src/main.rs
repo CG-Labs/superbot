@@ -93,6 +93,8 @@ mod runner;
 mod sandbox;
 mod scim;
 #[cfg(test)]
+mod scim_groups_http_tests;
+#[cfg(test)]
 mod scim_http_tests;
 mod screen;
 mod secrets;
@@ -239,7 +241,7 @@ async fn main() {
         .unwrap_or_else(|e| exit(format!("Shared Bots: {e}")));
     let teams = teams::Settings::from_env(&|k| env(k, "")).unwrap_or_else(|e| exit(format!("Teams: {e}")));
     let resume_routines = handover::resume_on_enable(&env("ROUTINES_ON_ENABLE", "")).unwrap_or_else(|e| exit(e));
-    let scim = scim::Scim::from_env(&env("SCIM", ""), &env("SCIM_DEFAULT_ROLE", "")).unwrap_or_else(|e| exit(format!("SCIM: {e}")));
+    let scim = scim::Scim::from_env(&env("SCIM", ""), &env("SCIM_DEFAULT_ROLE", ""), &env("SCIM_GROUPS", "")).unwrap_or_else(|e| exit(format!("SCIM: {e}")));
     let tiers = tiers::Tiers::from_env(|k| env(k, "")).unwrap_or_else(|e| exit(format!("Tiers: {e}")));
     let testing = license::testing_flag(&env("TESTING_MODE", "")).unwrap_or_else(|e| exit(e));
     let (payments, ignored_stripe) =
@@ -521,7 +523,11 @@ async fn main() {
         let _ = app.billing_mail.set(Arc::new(m));
     }
     match auth_state.scim.enabled {
-        true => log_info!("SCIM: on at /scim/v2; new users get the {} role.", auth_state.scim.default_role.as_str()),
+        true => log_info!(
+            "SCIM: on at /scim/v2; new users get the {} role; groups {}.",
+            auth_state.scim.default_role.as_str(),
+            if auth_state.scim.groups { "are teams (SCIM_GROUPS=on)" } else { "off (SCIM_GROUPS=off)" }
+        ),
         false => log_info!("SCIM: off (SCIM=off)."),
     }
     log_info!(
@@ -540,6 +546,7 @@ async fn main() {
     let control_plane = auth_state.machines.clone();
     let _ = app.control_plane.set(control_plane.clone());
     let auth_state_scim = auth_state.scim.enabled;
+    let auth_state_scim_groups = auth_state.scim.enabled && auth_state.scim.groups;
     let auth_state_billing = auth_state.payments.enabled();
     let auth_state_checkout = auth_state.payments.checkout_enabled();
     let mfa_policy = mfa::policy(&auth_state, &app.db);
@@ -569,6 +576,7 @@ async fn main() {
         "sso": sso_ids,
         "controlPlane": control_plane.enabled(),
         "scim": auth_state_scim,
+        "scimGroups": auth_state_scim_groups,
         "billing": auth_state_billing,
         "billingCheckout": auth_state_checkout,
         "billingEmails": app.billing_mail.get().is_some(),
@@ -821,6 +829,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/signups/{id}/reject", post(signups::reject))
         .route("/scim/tokens", get(scim::list_tokens).post(scim::create_token))
         .route("/scim/tokens/{id}", delete(scim::revoke_token))
+        .route("/scim/groups", get(scim::groups::list_links).post(scim::groups::link))
+        .route("/scim/groups/{team}", delete(scim::groups::unlink))
         .route("/status/incidents", get(status::list).post(status::create))
         .route("/status/incidents/{id}", patch(status::edit).delete(status::delete))
         .route("/status/incidents/{id}/updates", post(status::add_update))
@@ -834,8 +844,12 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/scim/v2/Schemas/{id}", get(scim::schema))
         .route("/scim/v2/Users", get(scim::list_users).post(scim::create_user))
         .route("/scim/v2/Users/{id}", get(scim::get_user).put(scim::replace_user).patch(scim::patch_user).delete(scim::delete_user))
-        .route("/scim/v2/Groups", get(scim::list_groups).post(scim::groups_unsupported))
-        .route("/scim/v2/Groups/{id}", get(scim::get_group).put(scim::groups_unsupported).patch(scim::groups_unsupported).delete(scim::groups_unsupported))
+        // An Okta PUT carries the whole member list (ADR 0095).
+        .route("/scim/v2/Groups", get(scim::groups::list).post(scim::groups::create).layer(DefaultBodyLimit::max(scim::groups::MAX_BODY)))
+        .route(
+            "/scim/v2/Groups/{id}",
+            get(scim::groups::get).put(scim::groups::replace).patch(scim::groups::patch).delete(scim::groups::delete).layer(DefaultBodyLimit::max(scim::groups::MAX_BODY)),
+        )
         .route("/scim/v2", any(scim::unknown))
         .route("/scim/v2/{*rest}", any(scim::unknown))
         .route_layer(middleware::from_fn(obs::note_route))

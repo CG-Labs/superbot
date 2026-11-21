@@ -38,6 +38,8 @@ pub const MEMBER: &str = "member";
 pub const LEFT_TEAM: &str = "left_team";
 /// Why someone lost access to Bots outside the team they joined.
 pub const JOINED_TEAM: &str = "joined_team";
+/// How someone joined or left a team its SCIM group put them on (ADR 0095).
+pub const SCIM: &str = "scim";
 
 const DAY_MS: i64 = 86_400_000;
 const INVITE_DAYS: i64 = 7;
@@ -110,7 +112,7 @@ fn system(user_id: &str) -> Who {
     Who { actor: Actor::system("teams").on_behalf_of(user_id), source: Source::default() }
 }
 
-fn team_event(by: &Who, action: &str, team: &str, details: Value) -> crate::audit::Event {
+pub(crate) fn team_event(by: &Who, action: &str, team: &str, details: Value) -> crate::audit::Event {
     let mut d = json!({ "team": team });
     if let (Some(d), Value::Object(x)) = (d.as_object_mut(), details) {
         d.extend(x);
@@ -158,6 +160,12 @@ fn team_view(app: &AppState, t: &Team, me: Option<&TeamMember>, manager: bool) -
     if manager {
         v["invites"] = json!(app.db.team_invites(&t.id));
         v["machineDays"] = json!(settings(app).machine_days);
+    }
+    // Server admins see which IdP group, if any, owns the team's membership (ADR 0095).
+    if me.is_none()
+        && let Some(g) = app.db.scim_group_of_team(&t.id)
+    {
+        v["scimGroup"] = json!({ "tenant": g.tenant, "displayName": g.display_name, "externalId": g.external_id, "origin": g.origin, "provisioned": g.provisioned_at.is_some() });
     }
     if let Some(b) = crate::team_billing::view(app, &t.id, manager) {
         v["billing"] = b;
@@ -247,9 +255,10 @@ fn ours(app: &AppState, team_id: &str, m: &crate::db::Machine) -> bool {
     app.db.team_machine(&m.id).is_some_and(|t| t.team_id == team_id && t.released_at.is_none())
 }
 
-/// Adds `user` to `team` with `role`, and gives them their machine.
+/// Adds `user` to `team` with `role`, and gives them their machine. The IdP may put a
+/// disabled person in a group (ADR 0095): they join, with no machine until they need one.
 async fn join(app: &AppState, by: &Who, team: &Team, user: &User, role: &str, via: &str) -> Res<Value> {
-    if !user.active() {
+    if !user.active() && via != SCIM {
         return Err(conflict("This person is disabled. Enable them first."));
     }
     let tier = app.tier_of(&user.id).name.clone();
@@ -281,7 +290,7 @@ async fn join(app: &AppState, by: &Who, team: &Team, user: &User, role: &str, vi
         crate::acl_changed(app, by, &bot.id, true).await;
     }
     app.send(json!({ "type": "resync" }));
-    let machine = provide(app, by, team, user).await;
+    let machine = if user.active() { provide(app, by, team, user).await } else { json!("disabled") };
     crate::team_billing::member_changed(app, &team.id, &user.id, &tier, "joined");
     let member = app.db.team_member(&user.id).ok_or_else(|| not_found("Member"))?;
     let mut v = member_view(app, &member, true);
@@ -289,14 +298,37 @@ async fn join(app: &AppState, by: &Who, team: &Team, user: &User, role: &str, vi
     Ok(v)
 }
 
+/// `user_id` was just enabled. On a team that gives machines and with none of their own
+/// (the IdP put them in its group while disabled, ADR 0095), they get the team's now, as
+/// joining would have given them. Whether one was asked for.
+pub(crate) async fn user_enabled(app: &AppState, by: &Who, user_id: &str) -> bool {
+    let Some(m) = app.db.team_member(user_id) else { return false };
+    if app.db.user_machine(user_id).is_some() {
+        return false;
+    }
+    let (Some(team), Some(user)) = (app.db.team(&m.team_id), app.db.user(user_id)) else { return false };
+    if !team.machines || !user.active() {
+        return false;
+    }
+    let got = provide(app, by, &team, &user).await;
+    got == json!("requested")
+}
+
+/// The IdP put `user` in the group `team` is (ADR 0095). They join as a plain member:
+/// SCIM never gives a team role.
+pub(crate) async fn join_from_scim(app: &AppState, by: &Who, team: &Team, user: &User) -> Res<Value> {
+    join(app, by, team, user, MEMBER, SCIM).await
+}
+
 /// Takes `user_id` off their team. Their grants to and from teammates go, runs between
 /// them stop, ADR 0052's and 0066's offboarding removes them from teammates' machines
 /// and accounts (and teammates from theirs), and the machine the team gave them is
-/// suspended and, after TEAM_MACHINE_DAYS, destroyed.
+/// suspended and, after TEAM_MACHINE_DAYS, destroyed. The IdP taking someone out of a
+/// group takes them off even as the last owner: deprovisioning can't wait for one.
 pub async fn leave(app: &AppState, by: &Who, team_id: &str, user_id: &str, reason: &str) -> bool {
     let Some(member) = app.db.team_member(user_id).filter(|m| m.team_id == team_id) else { return false };
     let tier = app.tier_of(user_id).name.clone();
-    if !app.db.remove_team_member(team_id, user_id, reason != "team_deleted") {
+    if !app.db.remove_team_member(team_id, user_id, reason != "team_deleted" && reason != SCIM) {
         return false;
     }
     let mates: HashSet<String> = app.db.team_members(team_id).into_iter().map(|m| m.user_id).collect();
