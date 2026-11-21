@@ -131,7 +131,7 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         ("PUT" | "DELETE", ["me", "secrets", _]) => Write,
         // Your own team (ADR 0087). Handlers refuse Bots, and leave managing it to the
         // team's owners and admins. Every team is under `teams`, for admins.
-        ("GET", ["team"] | ["me", "team-invites"]) => Account,
+        ("GET", ["team"] | ["me", "team-invites"] | ["team", "members", _, "offboarding"]) => Account,
         ("POST", ["team", "leave"] | ["team", "invites"] | ["me", "team-invites", _, "accept"]) => Write,
         ("DELETE", ["team", "invites", _] | ["me", "team-invites", _]) => Write,
         ("PATCH" | "DELETE", ["team", "members", _]) => Write,
@@ -372,6 +372,8 @@ mod tests {
             ("DELETE", "/api/team/invites/ti1", Perm::Write),
             ("PATCH", "/api/team/members/u1", Perm::Write),
             ("DELETE", "/api/team/members/u1", Perm::Write),
+            ("GET", "/api/team/members/u1/offboarding", Perm::Account),
+            ("POST", "/api/team/members/u1/offboarding", Perm::Admin),
             ("POST", "/api/team/members/u1/machine", Perm::Write),
             ("POST", "/api/team/members/u1/machine/suspend", Perm::Write),
             ("POST", "/api/team/members/u1/machine/resume", Perm::Write),

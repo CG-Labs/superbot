@@ -386,6 +386,66 @@ async fn by_default_people_in_no_team_share_as_before_and_teams_on_stops_that() 
 }
 
 #[tokio::test]
+async fn the_offboarding_preview_says_what_goes_only_to_the_teams_own_admins() {
+    let w = world().await;
+    reconcile(&w).await;
+    let ops = bot(&w, "Ops", &w.ada_id, Visibility::Private);
+    let notes = bot(&w, "Notes", &w.al_id, Visibility::Private);
+    w.app.db.set_grant(&ops, &w.al_id, crate::acl::Grant::Operator, &w.ada_id);
+    w.app.db.set_grant(&notes, &w.ada_id, crate::acl::Grant::Viewer, &w.al_id);
+    // A grant across teams, as from before teams, isn't one of Alpha's to count.
+    w.app.db.set_grant(&notes, &w.bea_id, crate::acl::Grant::Viewer, &w.al_id);
+    let al_path = format!("/api/team/members/{}/offboarding", w.al_id);
+
+    let (code, v) = json_call(w.port, "GET", &al_path, &w.ada, "").await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!((v["allowed"].as_bool(), v["grants"].as_u64(), v["role"].as_str()), (Some(true), Some(2), Some("member")), "{v}");
+    assert_eq!((v["machine"]["fate"].as_str(), v["machine"]["days"].as_u64()), (Some("suspend"), Some(7)), "{v}");
+    assert!(v["work"]["files"].is_string() || v["work"].is_null(), "{v}");
+    for hidden in [ops.as_str(), notes.as_str(), "Ops", "Notes", "192.0.2.", "@example.com"] {
+        assert!(!v.to_string().contains(hidden), "{hidden} in {v}");
+    }
+    // Asking changes nothing.
+    assert_eq!(w.app.db.team_id_of(&w.al_id).as_deref(), Some(w.alpha.as_str()));
+    assert!(w.app.db.grant(&ops, &w.al_id).is_some());
+
+    // Nobody removes themselves this way, and an admin can't remove an owner.
+    let (_, v) = json_call(w.port, "GET", &format!("/api/team/members/{}/offboarding", w.ada_id), &w.ada, "").await;
+    assert_eq!((v["allowed"].as_bool(), v["blocked"].as_str()), (Some(false), Some("self")), "{v}");
+    json_call(w.port, "PATCH", &format!("/api/team/members/{}", w.al_id), &w.ada, r#"{"role":"admin"}"#).await;
+    let (_, v) = json_call(w.port, "GET", &format!("/api/team/members/{}/offboarding", w.ada_id), &w.al, "").await;
+    assert_eq!((v["allowed"].as_bool(), v["blocked"].as_str()), (Some(false), Some("owner")), "{v}");
+    json_call(w.port, "PATCH", &format!("/api/team/members/{}", w.al_id), &w.ada, r#"{"role":"member"}"#).await;
+
+    // A member sees no preview; Beta's owner gets plain not found for Alpha's people, and
+    // sees only Beta in her team.
+    assert_eq!(call(w.port, "GET", &format!("/api/team/members/{}/offboarding", w.ada_id), &w.al, "").await.0, 403);
+    for who in [&w.al_id, &w.ada_id] {
+        let (code, res) = call(w.port, "GET", &format!("/api/team/members/{who}/offboarding"), &w.bea, "").await;
+        assert_eq!(code, 404, "{who}: {res}");
+    }
+    assert_eq!(call(w.port, "GET", "/api/team/members/al@example.com/offboarding", &w.bea, "").await.0, 404);
+    let (_, beta) = json_call(w.port, "GET", "/api/team", &w.bea, "").await;
+    assert_eq!(beta["id"], w.beta.as_str());
+    assert!(!beta.to_string().contains(&w.al_id) && !beta.to_string().contains(&w.ada_id), "{beta}");
+
+    // A machine of their own stays theirs, and says so.
+    let (dee_id, _) = user_with(w.port, &w.admin, "dee@example.com", "member").await;
+    call(w.port, "POST", &format!("/api/users/{dee_id}/machine"), &w.admin, "{}").await;
+    json_call(w.port, "PUT", &format!("/api/teams/{}/members/{dee_id}", w.alpha), &w.admin, "{}").await;
+    let (_, v) = json_call(w.port, "GET", &format!("/api/team/members/{dee_id}/offboarding"), &w.ada, "").await;
+    assert_eq!((v["machine"]["fate"].as_str(), v["grants"].as_u64()), (Some("kept"), Some(0)), "{v}");
+}
+
+#[tokio::test]
+async fn with_no_days_the_preview_says_the_machine_goes_at_once() {
+    let w = serve(Routing::Off, crate::teams::Settings { strict: false, machine_days: 0 }).await;
+    reconcile(&w).await;
+    let (_, v) = json_call(w.port, "GET", &format!("/api/team/members/{}/offboarding", w.al_id), &w.ada, "").await;
+    assert_eq!((v["machine"]["fate"].as_str(), v["machine"]["days"].as_u64()), (Some("destroy"), Some(0)), "{v}");
+}
+
+#[tokio::test]
 async fn bots_and_viewers_cannot_use_team_routes() {
     let (port, app, owner, key) = serve_app_with(|_| {}).await;
     let (_, admin) = user_with(port, &owner, "ops@example.com", "admin").await;

@@ -539,6 +539,53 @@ pub async fn remove(State(app): State<AppState>, Extension(c): Extension<Caller>
     Ok(Json(json!({ "ok": true })))
 }
 
+/// `GET /api/team/members/{user}/offboarding`: what taking a teammate off the team
+/// would do, for the apps to say before they ask (ADR 0088): whether you may, how many
+/// grants between them and teammates end, what becomes of their machine, and of their
+/// work on teammates' machines and accounts. Counts and settings only: no Bot, file,
+/// address or login of theirs. Changes nothing.
+pub async fn offboarding(State(app): State<AppState>, Extension(c): Extension<Caller>, Path(key): Path<String>) -> Res {
+    let (me_user, me, t) = my_managed_team(&app, &c)?;
+    let (u, m) = teammate(&app, &t.id, &key)?;
+    let blocked = if u.id == me_user.id {
+        Some("self")
+    } else if m.role == OWNER && me.role != OWNER {
+        Some("owner")
+    } else {
+        None
+    };
+    let mates: HashSet<String> = app.db.team_members(&t.id).into_iter().map(|m| m.user_id).filter(|id| *id != u.id).collect();
+    let mut grants = 0;
+    for bot in app.db.bots() {
+        let theirs = bot.owner_id == u.id;
+        if !theirs && !mates.contains(&bot.owner_id) {
+            continue;
+        }
+        grants += app.db.grants(&bot.id).iter().filter(|g| (theirs && mates.contains(&g.user_id)) || (!theirs && g.user_id == u.id)).count();
+    }
+    let days = settings(&app).machine_days;
+    let machine = match app.db.user_machine(&u.id).filter(|x| x.state != MachineState::Destroyed) {
+        None => json!({ "fate": "none" }),
+        Some(x) if ours(&app, &t.id, &x) => json!({ "fate": if days == 0 { "destroy" } else { "suspend" }, "days": days }),
+        Some(_) => json!({ "fate": "kept" }),
+    };
+    let work = app
+        .control_plane
+        .get()
+        .and_then(|cp| cp.enrollment.as_ref().map(|e| e.offboard.clone()))
+        .or_else(|| app.isolation.get().filter(|i| i.teammates).map(|i| i.offboard.clone()))
+        .map(|o| json!({ "files": o.files.as_str(), "graceDays": o.grace_days }));
+    Ok(Json(json!({
+        "user": { "id": u.id, "name": u.name },
+        "role": m.role,
+        "allowed": blocked.is_none(),
+        "blocked": blocked,
+        "grants": grants,
+        "machine": machine,
+        "work": work,
+    })))
+}
+
 /// The teammate's machine, if it's one the team gave them: only those are the team's
 /// to manage. A machine they pay for themselves is theirs.
 fn team_machine_of(app: &AppState, team_id: &str, user_id: &str) -> Res<()> {
