@@ -29,7 +29,7 @@ A machine is **legacy** when an answered heartbeat lacks `upgrade`. That is exac
 
 ### Never wipe work without an admin's say
 
-A rebuild erases the machine's disks. Bots' memory and the user's facts are kept on botd, but files Bots made in `work/` exist only there. A machine **may hold work** if it is assigned now, or the audit log shows it was assigned (`placement.assigned`) or a Bot ran there (`bot.run_routed`). Such a machine is rebuilt only when an admin asks with `discardWork: true`. Nothing does that by itself. Linode backups, when on, survive a rebuild, and the docs say so.
+A rebuild erases the machine's disks. Bots' memory and the user's facts are kept on botd, but files Bots made in `work/` exist only there. A machine **may hold work** if it is assigned now, or the audit log shows it was assigned (`placement.assigned`) or a Bot ran there (`bot.run_routed`). Such a machine is rebuilt only when an admin asks with `?discardWork=true`. Nothing does that by itself. Linode backups, when on, survive a rebuild, and the docs say so.
 
 ### Settings and control
 
@@ -43,7 +43,7 @@ Rebuilding also needs botd to ship `superbot-machine`. Otherwise a rebuilt machi
 
 The admin API:
 
-- `POST /api/users/{key}/machine/rebuild {discardWork?}` asks for a rebuild and answers 202. It answers 409 when the agent can upgrade itself, the agent is held (the ADR 0039 hold), a rebuild is already underway, or the machine may hold work and `discardWork` isn't true.
+- `POST /api/users/{key}/machine/rebuild[?discardWork=true]` asks for a rebuild and answers 202. It answers 409 when the agent can upgrade itself, the agent is held (the ADR 0039 hold), a rebuild is already underway, or the machine may hold work and `discardWork` isn't true.
 - `GET` returns `legacy`, what the agent `lacks`, `mayHoldWork`, and the `rebuild`.
 - `DELETE` cancels a rebuild that is still queued.
 - `GET /api/machines/legacy` lists legacy machines.

@@ -31,8 +31,10 @@ use crate::users::need_user_key;
 use crate::{ApiError, AppState, Res};
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::{Extension, Path, State as AppS};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{Extension, Path, Query, State as AppS};
 use axum::http::StatusCode;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 /// Rebuilds sent, and checks that failed, before it gives up.
@@ -474,21 +476,12 @@ fn conflict(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::CONFLICT, msg.into())
 }
 
-/// `{ "discardWork": true }`, or nothing.
-fn discard_work(body: &Bytes) -> Res<bool> {
-    if body.iter().all(u8::is_ascii_whitespace) {
-        return Ok(false);
-    }
-    let v: Value = serde_json::from_slice(body).map_err(|e| crate::bad(format!("Invalid JSON: {e}")))?;
-    let obj = v.as_object().ok_or_else(|| crate::bad("Send a JSON object."))?;
-    if let Some(k) = obj.keys().find(|k| *k != "discardWork") {
-        return Err(crate::bad(format!("Unknown field: {}", crate::audit::clip(k, 40))));
-    }
-    match obj.get("discardWork") {
-        None => Ok(false),
-        Some(Value::Bool(b)) => Ok(*b),
-        Some(_) => Err(crate::bad("discardWork must be true or false")),
-    }
+/// `?discardWork=true`, or nothing.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RebuildQuery {
+    #[serde(default)]
+    discard_work: bool,
 }
 
 /// `GET /api/users/{key}/machine/rebuild`: whether its agent is from before ADR 0039,
@@ -499,7 +492,7 @@ pub async fn get(AppS(app): AppS<AppState>, Path(key): Path<String>) -> Res {
     Ok(Json(view(&app, e, &m)))
 }
 
-/// `POST /api/users/{key}/machine/rebuild` `{discardWork?}`: rebuilds it with today's
+/// `POST /api/users/{key}/machine/rebuild[?discardWork=true]`: rebuilds it with today's
 /// agent. Its agent must answer and be from before ADR 0039, unless a rebuild sent
 /// before failed (it may have none left). 202; it is tried at once,
 /// then by the reconciler, and the audit log and `GET` say how it went.
@@ -507,11 +500,16 @@ pub async fn request(
     AppS(app): AppS<AppState>,
     Extension(by): Extension<Who>,
     Path(key): Path<String>,
+    q: Result<Query<RebuildQuery>, QueryRejection>,
     body: Bytes,
 ) -> Res<(StatusCode, Json<Value>)> {
     let cp = control_plane(&app)?;
     let e = enroll::need(cp)?;
-    let discard = discard_work(&body)?;
+    let Query(q) = q.map_err(|e| crate::bad(e.body_text()))?;
+    if !body.iter().all(u8::is_ascii_whitespace) {
+        return Err(crate::bad("It takes no body; pass ?discardWork=true to discard the machine's files."));
+    }
+    let discard = q.discard_work;
     if let Some(why) = unable(cp, e) {
         return Err(conflict(why));
     }
@@ -540,7 +538,7 @@ pub async fn request(
     if !discard && app.db.machine_may_hold_work(&m.id) {
         return Err(conflict(
             "A rebuild wipes its disks, and it is or was assigned, so the user's files may exist only there. \
-             Copy off what's needed, then ask again with discardWork: true (botctl machine rebuild <user> --discard-work).",
+             Copy off what's needed, then ask again with ?discardWork=true (botctl machine rebuild <user> --discard-work).",
         ));
     }
     let m = queue(&app, &m, hb.as_ref(), Some(&by), discard).ok_or_else(|| conflict("It changed meanwhile; try again."))?;

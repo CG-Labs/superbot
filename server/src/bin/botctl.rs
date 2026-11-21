@@ -591,7 +591,7 @@ fn rebuild_request(args: &[&str]) -> Result<(&'static str, String, Option<String
     let at = |user: &str| format!("/api/users/{}/machine/rebuild", encode(user));
     Ok(match args {
         [user] if !user.starts_with("--") => ("POST", at(user), None),
-        [user, "--discard-work"] => ("POST", at(user), Some(json!({ "discardWork": true }).to_string())),
+        [user, "--discard-work"] => ("POST", format!("{}?discardWork=true", at(user)), None),
         [user, "status"] => ("GET", at(user), None),
         [user, "cancel"] => ("DELETE", at(user), None),
         _ => return Err("Usage: botctl machine rebuild <user> [--discard-work] | rebuild <user> status|cancel".into()),
@@ -1116,7 +1116,7 @@ mod tests {
         assert_eq!(rebuild_request(&["a@example.com"]).unwrap(), ("POST", "/api/users/a%40example.com/machine/rebuild".into(), None));
         assert_eq!(
             rebuild_request(&["u1", "--discard-work"]).unwrap(),
-            ("POST", "/api/users/u1/machine/rebuild".into(), Some(r#"{"discardWork":true}"#.into()))
+            ("POST", "/api/users/u1/machine/rebuild?discardWork=true".into(), None)
         );
         assert_eq!(rebuild_request(&["u1", "status"]).unwrap(), ("GET", "/api/users/u1/machine/rebuild".into(), None));
         assert_eq!(rebuild_request(&["u1", "cancel"]).unwrap(), ("DELETE", "/api/users/u1/machine/rebuild".into(), None));

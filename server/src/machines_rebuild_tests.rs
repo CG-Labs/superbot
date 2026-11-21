@@ -95,15 +95,17 @@ async fn an_admin_rebuilds_an_old_machine_and_it_comes_back_up_to_date() {
     let (code, v) = json_call(&env, "POST", &path, "").await;
     assert_eq!(code, 409, "{v}");
     assert!(v["error"].as_str().unwrap().contains("discardWork"), "{v}");
-    let (code, _) = json_call(&env, "POST", &path, r#"{"discardWork":"yes"}"#).await;
+    let (code, _) = json_call(&env, "POST", &format!("{path}?discardWork=yes"), "").await;
     assert_eq!(code, 400);
-    let (code, _) = json_call(&env, "POST", &path, r#"{"wipe":true}"#).await;
+    let (code, _) = json_call(&env, "POST", &format!("{path}?wipe=true"), "").await;
     assert_eq!(code, 400);
+    let (code, v) = json_call(&env, "POST", &path, r#"{"discardWork":true}"#).await;
+    assert_eq!(code, 400, "a body is refused, never read as no: {v}");
 
     // Held at its build, it isn't rebuilt either.
     let (code, _) = json_call(&env, "PUT", &format!("/api/users/{uid}/machine/agent/hold"), "").await;
     assert_eq!(code, 200);
-    let (code, v) = json_call(&env, "POST", &path, r#"{"discardWork":true}"#).await;
+    let (code, v) = json_call(&env, "POST", &format!("{path}?discardWork=true"), "").await;
     assert_eq!(code, 409, "{v}");
     assert!(v["error"].as_str().unwrap().contains("held"), "{v}");
     let (code, _) = json_call(&env, "DELETE", &format!("/api/users/{uid}/machine/agent/hold"), "").await;
@@ -111,7 +113,7 @@ async fn an_admin_rebuilds_an_old_machine_and_it_comes_back_up_to_date() {
 
     // Busy: it waits without counting a try, and Bots don't start meanwhile.
     old.jobs.store(2, Ordering::SeqCst);
-    let (code, v) = json_call(&env, "POST", &path, r#"{"discardWork":true}"#).await;
+    let (code, v) = json_call(&env, "POST", &format!("{path}?discardWork=true"), "").await;
     assert_eq!(code, 202, "{v}");
     assert_eq!((v["rebuild"]["state"].as_str(), v["rebuild"]["attempts"].as_i64()), (Some("queued"), Some(0)), "{v}");
     assert!(v["rebuild"]["error"].as_str().unwrap().contains("2 jobs"), "{v}");
@@ -127,7 +129,7 @@ async fn an_admin_rebuilds_an_old_machine_and_it_comes_back_up_to_date() {
     let cancelled = events(&env, "machine.rebuild_cancelled").await;
     assert_eq!(cancelled[0]["details"]["reason"], "admin");
     old.jobs.store(0, Ordering::SeqCst);
-    let (code, v) = json_call(&env, "POST", &path, r#"{"discardWork":true}"#).await;
+    let (code, v) = json_call(&env, "POST", &format!("{path}?discardWork=true"), "").await;
     assert_eq!(code, 202, "{v}");
     assert_eq!((v["rebuild"]["state"].as_str(), v["rebuild"]["attempts"].as_i64()), (Some("rebuilding"), Some(1)), "sent at once: {v}");
     assert_eq!(env.fake.calls("rebuild"), 1);
@@ -154,7 +156,7 @@ async fn an_admin_rebuilds_an_old_machine_and_it_comes_back_up_to_date() {
     let (code, v) = json_call(&env, "DELETE", &path, "").await;
     assert_eq!(code, 409);
     assert!(v["error"].as_str().unwrap().contains("can't be called back"), "{v}");
-    let (code, v) = json_call(&env, "POST", &path, r#"{"discardWork":true}"#).await;
+    let (code, v) = json_call(&env, "POST", &format!("{path}?discardWork=true"), "").await;
     assert_eq!(code, 409);
     assert!(v["error"].as_str().unwrap().contains("already"), "{v}");
     reconcile(&env.app, &env.cp).await;
@@ -175,7 +177,7 @@ async fn an_admin_rebuilds_an_old_machine_and_it_comes_back_up_to_date() {
     assert!(list["machines"].as_array().unwrap().is_empty(), "{list}");
 
     // Its agent upgrades itself from now on, so it isn't rebuilt again.
-    let (code, v) = json_call(&env, "POST", &path, r#"{"discardWork":true}"#).await;
+    let (code, v) = json_call(&env, "POST", &format!("{path}?discardWork=true"), "").await;
     assert_eq!(code, 409);
     assert!(v["error"].as_str().unwrap().contains("botctl machine upgrade"), "{v}");
     heartbeats(&env.app, &env.cp).await;
@@ -314,7 +316,7 @@ async fn a_refused_rebuild_fails_and_auto_never_wipes_a_machine_that_may_hold_wo
     let bot = env.app.db.create_bot_owned("Cy's", "#fff", "waddle", "claude", None, false, &uid, crate::acl::Visibility::Shared);
     assert!(env.app.db.keep_session(&bot.id, "s1", env.app.db.placed_at(&uid)));
     env.fake.fail_next("rebuild", ProviderError::Api { status: 400, message: "image: Not found".into() });
-    let (code, v) = json_call(&env, "POST", &path, r#"{"discardWork":true}"#).await;
+    let (code, v) = json_call(&env, "POST", &format!("{path}?discardWork=true"), "").await;
     assert_eq!(code, 202, "{v}");
     assert_eq!(v["rebuild"]["state"], "failed", "{v}");
     assert!(v["rebuild"]["error"].as_str().unwrap().contains("image"), "{v}");
@@ -328,7 +330,7 @@ async fn a_refused_rebuild_fails_and_auto_never_wipes_a_machine_that_may_hold_wo
     assert_eq!(events(&env, "machine.rebuild_requested").await.len(), 1, "auto doesn't try again after a failure");
 
     // Asked again, it goes.
-    let (code, v) = json_call(&env, "POST", &path, r#"{"discardWork":true}"#).await;
+    let (code, v) = json_call(&env, "POST", &format!("{path}?discardWork=true"), "").await;
     assert_eq!((code, v["rebuild"]["state"].as_str()), (202, Some("rebuilding")), "{v}");
     drop(old);
 }
@@ -343,7 +345,7 @@ async fn rebuilds_can_be_turned_off() {
     let (uid, mid, token) = machine_for(&env, "di@example.com").await;
     let _old = old_agent(&mut env, &mid, &token).await;
     heartbeats(&env.app, &env.cp).await;
-    let (code, v) = json_call(&env, "POST", &format!("/api/users/{uid}/machine/rebuild"), r#"{"discardWork":true}"#).await;
+    let (code, v) = json_call(&env, "POST", &format!("/api/users/{uid}/machine/rebuild?discardWork=true"), "").await;
     assert_eq!(code, 409);
     assert!(v["error"].as_str().unwrap().contains("MACHINE_LEGACY_REBUILDS=off"), "{v}");
     assert_eq!(rebuild_view(&env, &uid).await["legacy"], true, "it still says which are old");

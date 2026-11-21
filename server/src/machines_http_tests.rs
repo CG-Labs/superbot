@@ -65,7 +65,7 @@ fn admin_routes(u: &str) -> Vec<(&'static str, String, &'static str)> {
         ("GET", format!("/api/users/{u}/machine/screens"), ""),
         ("DELETE", format!("/api/users/{u}/machine/screens/b1"), ""),
         ("GET", format!("/api/users/{u}/machine/rebuild"), ""),
-        ("POST", format!("/api/users/{u}/machine/rebuild"), r#"{"discardWork":true}"#),
+        ("POST", format!("/api/users/{u}/machine/rebuild?discardWork=true"), ""),
         ("DELETE", format!("/api/users/{u}/machine/rebuild"), ""),
         ("GET", "/api/machines/legacy".to_string(), ""),
     ]
