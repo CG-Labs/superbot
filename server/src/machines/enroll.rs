@@ -10,6 +10,7 @@
 //! and recorded, and when it calls a machine, only that machine's own.
 
 use super::pki::{self, Ca, Issued, Peer};
+use super::provider::RestoreFile;
 use super::route::{Assigned, Checked, MachineLink, Ran};
 use super::upkeep::Upkeep;
 use super::wire::{self, JobEvent, JobRequest};
@@ -534,6 +535,24 @@ impl Enrollment {
             ));
         }
         out
+    }
+
+    /// What a machine restored from a backup gets before it starts (ADR 0070): today's
+    /// CA, unit, guard and settings, and a fresh token, which the agent enrolls with
+    /// once its old identity is gone. Nothing of it goes in the provider's config.
+    pub fn restore_files(&self, m: &Machine, token: &str) -> Vec<RestoreFile> {
+        let file = |path: &str, mode: u32, content: String| RestoreFile { path: path.into(), mode, content };
+        vec![
+            file("/etc/superbot/ca.pem", 0o644, self.ca.pem().to_string()),
+            file(
+                "/etc/superbot/machine.env",
+                0o644,
+                format!("SUPERBOT_CONTROL_URL={}\nSUPERBOT_MACHINE_ID={}\nSUPERBOT_AGENT_LISTEN=0.0.0.0:{}\n", self.url, m.id, self.agent_port),
+            ),
+            file("/etc/systemd/system/superbot-machine.service", 0o644, self.unit()),
+            file(GUARD_PATH, 0o755, GUARD.to_string()),
+            file("/etc/superbot/enroll-token", 0o600, token.to_string()),
+        ]
     }
 
     /// The agent's unit. With MACHINE_BOT_USER, its state folder lets the Bots' user

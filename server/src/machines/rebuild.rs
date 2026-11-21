@@ -215,6 +215,10 @@ fn deadline(e: &Enrollment, sent: i64) -> i64 {
 /// Sends the rebuild from `from` (`queued` or `retrying`). Caller holds `ops`.
 async fn send(app: &App, cp: &ControlPlane, p: &dyn MachineProvider, e: &Enrollment, m: &Machine, from: &str) {
     let Some(id) = m.rebuild_id.clone() else { return };
+    // Tried again once the restore is over (ADR 0070).
+    if app.db.machine_restoring(&m.id).is_some() {
+        return;
+    }
     if m.rebuild_attempts >= MAX_ATTEMPTS {
         return fail(app, m, &[from], "attempts", "It was tried as many times as it may be.");
     }
@@ -530,6 +534,9 @@ pub async fn request(
     cp.need_own(&m)?;
     if underway(&m) {
         return Err(conflict(format!("A rebuild is {} already.", m.rebuild_state.as_deref().unwrap_or_default())));
+    }
+    if app.db.machine_restoring(&m.id).is_some() {
+        return Err(conflict("A restore from a backup is underway."));
     }
     if m.state != State::Running {
         return Err(conflict(format!("The machine is {}; it must be running.", m.state.as_str())));

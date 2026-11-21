@@ -35,6 +35,8 @@ mod license;
 mod license_http_tests;
 mod machines;
 #[cfg(test)]
+mod machines_backup_tests;
+#[cfg(test)]
 mod machines_bot_user_tests;
 #[cfg(test)]
 mod machines_http_tests;
@@ -606,6 +608,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
             "/users/{key}/machine/rebuild",
             get(machines::rebuild::get).post(machines::rebuild::request).delete(machines::rebuild::cancel_now),
         )
+        .route("/users/{key}/machine/backups", get(machines::backup::list).post(machines::backup::create))
+        .route("/users/{key}/machine/restore", get(machines::backup::restore_status).post(machines::backup::restore_request))
         .route("/users/{key}/machine/harnesses", post(machines::upkeep::harnesses_now))
         .route("/users/{key}/machine/bot-user", post(machines::botuser::now_for))
         .route("/users/{key}/machine/screens", get(machines::screens::list))
@@ -623,6 +627,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/placement", get(machines::placement).put(machines::assign).delete(machines::unassign))
         .route("/machines", get(machines::list_all))
         .route("/machines/placements", get(machines::placements))
+        .route("/machines/backups", get(machines::backup::list_all))
         .route("/machines/substrate", get(machines::substrate))
         .route("/machines/legacy", get(machines::rebuild::legacy_list))
         .route("/machines/reconcile", post(machines::reconcile_now))

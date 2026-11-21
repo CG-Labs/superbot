@@ -138,6 +138,10 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine legacy                            Machines whose agent is from before agent upgrades, and their rebuilds
   botctl machine rebuild <user> [--discard-work]   Wipe and reinstall it with today's agent (ADR 0056); same IP and firewall
   botctl machine rebuild <user> status|cancel      How its rebuild is going, or cancel one not yet sent
+  botctl machine backups [<user>]                  Off-host backups (ADR 0070): every one and the settings, or the user's and its last restore
+  botctl machine backup <user>                     Back it up to object storage now
+  botctl machine restore <user> <backup-id> [--identity <age-key-file>] --yes  Make it again from that backup; it enrolls anew
+  botctl machine restore <user> status             How its latest restore went
   botctl machine bot-user <user>                   Run its Bots as their own OS user now (MACHINE_BOT_USER), retrying a failure
   botctl machine harness-login <user|me> <claude|codex>  Log the harness in on the machine; the login stays there
   botctl machine harness-logins <user|me>          Which harnesses are logged in on it
@@ -677,6 +681,27 @@ fn rebuild_request(args: &[&str]) -> Result<(&'static str, String, Option<String
     })
 }
 
+/// `botctl machine backups|backup|restore ...` (ADR 0070): the request to send. The
+/// identity file is read here and sent for this restore only.
+fn backup_request(args: &[&str], read: impl Fn(&str) -> Result<String, String>) -> Result<(&'static str, String, Option<String>), String> {
+    let at = |user: &str, verb: &str| format!("/api/users/{}/machine/{verb}", encode(user));
+    Ok(match args {
+        ["backups"] => ("GET", "/api/machines/backups".into(), None),
+        ["backups", user] => ("GET", at(user, "backups"), None),
+        ["backup", user] => ("POST", at(user, "backups"), None),
+        ["restore", user, "status"] => ("GET", at(user, "restore"), None),
+        ["restore", user, id, rest @ ..] if !id.starts_with("--") && rest.contains(&"--yes") => {
+            let identity = match rest.iter().position(|a| *a == "--identity") {
+                Some(i) => Some(read(rest.get(i + 1).filter(|f| !f.starts_with("--")).ok_or("--identity needs a file")?)?),
+                None => None,
+            };
+            ("POST", at(user, "restore"), Some(json!({ "backupId": id, "identity": identity }).to_string()))
+        }
+        ["restore", _, _, ..] => return Err("Restoring replaces the machine and everything on it since the backup; add --yes".into()),
+        _ => return Err("Usage: botctl machine backups [<user>] | backup <user> | restore <user> <backup-id> [--identity <file>] --yes | restore <user> status".into()),
+    })
+}
+
 /// `botctl signup ...`: people who asked for access on the get-started page (ADR 0022).
 fn signup_request(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
     let at = |id: &str, verb: &str| format!("/api/signups/{}/{verb}", encode(id));
@@ -975,6 +1000,10 @@ fn run(args: &[String]) -> Result<String, String> {
         ["machine", "harness-logins", user] => op("GET", &format!("{}/harness-logins", login_base(user)), None),
         ["machine", "harness-logout", user, harness] => op("DELETE", &format!("{}/harness-logins/{}", login_base(user), encode(harness)), None),
         ["machine", "legacy"] => op("GET", "/api/machines/legacy", None),
+        ["machine", rest @ ..] if matches!(rest.first(), Some(&("backups" | "backup" | "restore"))) => {
+            let (method, path, body) = backup_request(rest, |f| std::fs::read_to_string(f).map_err(|e| format!("--identity {f}: {e}")))?;
+            op(method, &path, body)
+        }
         ["machine", "rebuild", rest @ ..] => {
             let (method, path, body) = rebuild_request(rest)?;
             op(method, &path, body)
@@ -1259,6 +1288,20 @@ mod tests {
         assert!(rebuild_request(&[]).is_err());
         assert!(rebuild_request(&["--discard-work"]).is_err());
         assert!(rebuild_request(&["u1", "--discard"]).is_err());
+        let read = |f: &str| if f == "key.txt" { Ok("AGE-SECRET-KEY-1X".to_string()) } else { Err(format!("{f}: missing")) };
+        assert_eq!(backup_request(&["backups"], read).unwrap(), ("GET", "/api/machines/backups".into(), None));
+        assert_eq!(backup_request(&["backups", "a@example.com"], read).unwrap(), ("GET", "/api/users/a%40example.com/machine/backups".into(), None));
+        assert_eq!(backup_request(&["backup", "u1"], read).unwrap(), ("POST", "/api/users/u1/machine/backups".into(), None));
+        assert_eq!(backup_request(&["restore", "u1", "status"], read).unwrap(), ("GET", "/api/users/u1/machine/restore".into(), None));
+        let (m, p, b) = backup_request(&["restore", "u1", "b1", "--identity", "key.txt", "--yes"], read).unwrap();
+        assert_eq!((m, p.as_str()), ("POST", "/api/users/u1/machine/restore"));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&b.unwrap()).unwrap(), json!({ "backupId": "b1", "identity": "AGE-SECRET-KEY-1X" }));
+        let (_, _, b) = backup_request(&["restore", "u1", "b1", "--yes"], read).unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&b.unwrap()).unwrap(), json!({ "backupId": "b1", "identity": null }));
+        assert!(backup_request(&["restore", "u1", "b1"], read).unwrap_err().contains("--yes"));
+        assert!(backup_request(&["restore", "u1", "b1", "--identity", "--yes"], read).is_err());
+        assert!(backup_request(&["restore", "u1", "b1", "--identity", "nope", "--yes"], read).is_err());
+        assert!(backup_request(&["backup"], read).is_err());
         assert_eq!(login_base("me"), "/api/machine");
         assert_eq!(login_base("a@example.com"), "/api/users/a%40example.com/machine");
     }
