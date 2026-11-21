@@ -66,7 +66,7 @@ for bin in "$@"; do
       mkdir -p "$prefix/$bin"
       retry npm install --prefix "$prefix/$bin" --no-audit --no-fund --no-save --loglevel=error "$package@$version" >/dev/null
       exe="$prefix/$bin/node_modules/.bin/$bin"
-      "$exe" --version | grep -Fq "$version" || die "$exe --version isn't $version"
+      grep -Fq "$version" <<<"$("$exe" --version)" || die "$exe --version isn't $version"
       paths+=("$prefix/$bin/node_modules/.bin")
       ;;
     hermes)

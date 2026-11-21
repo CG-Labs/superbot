@@ -71,7 +71,8 @@ fi
 for h in ${harnesses//,/ }; do
   case "$h" in claude|codex|pi|hermes) ;; *) die "unknown harness $h" ;; esac
   command -v "$h" >/dev/null || die "$h isn't on PATH"
-  printf '%-7s %s (%s)\n' "$h" "$(command -v "$h")" "$("$h" --version 2>&1 | head -n 1)"
+  version=$("$h" --version 2>&1 || true)
+  printf '%-7s %s (%s)\n' "$h" "$(command -v "$h")" "${version%%$'\n'*}"
 done
 
 printf 'Building botd and the test (release)...\n'
