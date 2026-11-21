@@ -32,7 +32,8 @@ COPY site site
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked \
-    && install -D -m 0755 -t /out target/release/botd target/release/botctl target/release/superbot-machine
+    && install -D -m 0755 -t /out target/release/botd target/release/botctl target/release/superbot-machine \
+        target/release/superbot-run
 
 # Harness CLIs are Node packages, so the runtime is Node's slim Debian image.
 FROM ${NODE_IMAGE} AS runtime
@@ -49,7 +50,7 @@ ARG SUPERBOT_UID=10001
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        age ca-certificates curl git procps sqlite3 tini tzdata \
+        acl age ca-certificates curl git procps sqlite3 sudo tini tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eu; pkgs=""; \
@@ -88,9 +89,30 @@ RUN set -eu; case " $HARNESSES " in *" hermes "*) ;; *) exit 0 ;; esac; \
     if find /opt/hermes \! -user superbot | grep -q .; then echo "root-owned files in /opt/hermes" >&2; exit 1; fi
 
 # botd prepends its own folder to each Bot's PATH, so it lives apart from the npm CLIs in /usr/local/bin.
-COPY --from=build /out/botd /out/botctl /out/superbot-machine /opt/superbot/bin/
+COPY --from=build /out/botd /out/botctl /out/superbot-machine /out/superbot-run /opt/superbot/bin/
 COPY --chmod=0755 deploy/superbot-backup.sh /usr/local/bin/superbot-backup
 COPY --chmod=0755 deploy/superbot-restore.sh /usr/local/bin/superbot-restore
+
+# Per-user accounts (ISOLATION=users; docs/adr/0037-per-user-unix-accounts.md and
+# docs/adr/0058-harness-os-user-by-default.md): the root helper, its config, and the two
+# sudo rules, written by the installer's own function. Each user's folders live in the
+# users volume at /srv/superbot/users (root, 0711). sudo is the only setuid program left.
+COPY --chmod=0755 deploy/superbot-userctl.sh /usr/local/sbin/superbot-userctl
+COPY deploy/install.sh /tmp/superbot-install.sh
+RUN set -eu; \
+    groupadd --system superbot-users; \
+    install -d -m 0711 -o root -g root /srv/superbot /srv/superbot/users; \
+    install -d -m 0755 -o root -g root /etc/superbot; \
+    printf '%s\n' "# Read by /usr/local/sbin/superbot-userctl. Written by the Dockerfile." \
+        "ISOLATION_DIR=/srv/superbot/users" "SERVICE_GROUP=superbot" >/etc/superbot/isolation.conf; \
+    chmod 0644 /etc/superbot/isolation.conf; \
+    SUPERBOT_INSTALL_NO_MAIN=1 bash -c 'source /tmp/superbot-install.sh; \
+        SUPERBOT_USER=superbot BIN_DIR=/opt/superbot/bin isolation_sudoers' >/tmp/superbot-sudoers; \
+    visudo -cqf /tmp/superbot-sudoers; \
+    install -m 0440 -o root -g root /tmp/superbot-sudoers /etc/sudoers.d/superbot-isolation; \
+    rm -f /tmp/superbot-sudoers /tmp/superbot-install.sh; \
+    find / -xdev -type f -perm /6000 ! -path /usr/bin/sudo -exec chmod ug-s {} +; \
+    chmod 0750 /home/superbot
 
 # HOST=0.0.0.0 makes botd refuse to start without AUTH_PASSWORD.
 # Harness CLIs installed at runtime (npm i -g) land in the persistent home volume and win on PATH.

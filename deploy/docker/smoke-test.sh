@@ -126,6 +126,27 @@ log "botd's folder (prepended to Bots' PATH) holds no harness CLI, so runtime np
 dc exec -T botd sh -c 'd=$(dirname "$(command -v botd)"); for h in claude codex pi hermes; do [ ! -e "$d/$h" ] || exit 1; done' \
   || fail "a harness CLI sits next to botd and would shadow ~/.local/bin for Bots"
 
+log "Per-user accounts (ADR 0058): on for a new .env, and an account can't read botd's data or env"
+grep -qx 'ISOLATION=users' "$SUPERBOT_ENV_FILE" || fail "a new .env doesn't turn per-user accounts on"
+grep -q 'Isolation: each user' <<<"$(dc logs --no-color botd)" || fail "botd didn't start with per-user accounts"
+probe=smokeprobe
+dc exec -T botd sudo -n /usr/local/sbin/superbot-userctl ensure "$probe" >/dev/null || fail "superbot-userctl couldn't make an account"
+as_account() { dc exec -T -w "/srv/superbot/users/$probe/home" botd sudo -n -u "sb-u-$probe" /opt/superbot/bin/superbot-run /bin/sh -c "$1"; }
+[[ $(as_account 'id -un') == "sb-u-$probe" ]] || fail "superbot-run didn't run as the account"
+for p in /data /data/app.sqlite /home/superbot /proc/1/environ; do
+  if as_account "if [ -d '$p' ]; then ls -A '$p'; else head -c 1 '$p'; fi" >/dev/null 2>&1; then fail "the account can read $p"; fi
+done
+environs=$(as_account 'cat /proc/[0-9]*/environ 2>/dev/null | tr "\0" "\n"' || true)
+if grep -qF -e "$MASTER_KEY" -e "$PASSWORD" <<<"$environs"; then
+  fail "the account can read botd's env"
+fi
+if as_account 'sudo -n true' >/dev/null 2>&1; then fail "the account can use sudo"; fi
+[[ $(dc exec -T -u 0 botd find / -xdev -type f -perm /6000) == /usr/bin/sudo ]] || fail "the image has setuid programs besides sudo"
+uid=$(dc exec -T botd stat -c %u "/srv/superbot/users/$probe/home")
+dc up -d --no-build --force-recreate --wait --wait-timeout 120 botd
+dc exec -T botd sudo -n /usr/local/sbin/superbot-userctl ensure "$probe" >/dev/null || fail "superbot-userctl couldn't remake the account"
+[[ $(dc exec -T botd id -u "sb-u-$probe") == "$uid" ]] || fail "a recreated container gave the account another uid"
+
 log "Backup service wrote an archive"
 for _ in $(seq 1 30); do
   dc exec -T backup sh -c 'ls /backups/superbot-*.tar.gz' >/dev/null 2>&1 && break

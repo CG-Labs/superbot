@@ -37,10 +37,18 @@ services:
       ALLOWED_HOSTS: ${SUPERBOT_DOMAIN:-localhost},${ALLOWED_HOSTS:-}
       # botd is reachable only through Caddy, so the audit log takes the client IP from X-Forwarded-For.
       TRUST_FORWARDED_FOR: "1"
+    # Per-user accounts (ISOLATION=users; docs/adr/0058-harness-os-user-by-default.md): sudo, the
+    # image's only setuid program, starts each run as its user's account, and the root helper
+    # superbot-userctl makes the account and its folders. Runs get none of these: they drop
+    # every capability when sudo switches to the account.
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, FSETID, SETUID, SETGID, AUDIT_WRITE]
+    security_opt: []
     volumes:
       - data:/data
       - workspace:/workspace
       - home:/home/superbot
+      # Each user's account folders: home (harness logins), workspace, memory, Bots' state.
+      - users:/srv/superbot/users
       # So `docker compose exec botd superbot-backup` archives outlive the container.
       - backups:/backups
     # Not published: reachable only through Caddy on the compose network.
@@ -97,6 +105,7 @@ volumes:
   data:
   workspace:
   home:
+  users:
   backups:
   caddy-data:
   caddy-config:

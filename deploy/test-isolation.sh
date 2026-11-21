@@ -43,10 +43,15 @@ home=$(getent passwd "$SVC" | cut -d: -f6)
 install -d -m 0755 "$LIB/bin" "$LIB/fake" "$LIB/share/deploy"
 install -m 0755 "$run_bin" "$LIB/bin/superbot-run"
 install -m 0755 "$test_bin" "$LIB/botd-tests"
-install -m 0755 "$repo/deploy/test-isolation-harness.sh" "$LIB/fake/claude"
+for h in claude pi hermes; do
+  install -m 0755 "$repo/deploy/test-isolation-harness.sh" "$LIB/fake/$h"
+done
 install -m 0644 "$repo/deploy/superbot-userctl.sh" "$LIB/share/deploy/superbot-userctl.sh"
 install -d -o "$SVC" -g "$SVC" -m 0700 "$home/superbot"
 install -o "$SVC" -g "$SVC" -m 0600 /dev/null "$home/superbot/.env"
+printf 'AUTH_PASSWORD=must-not-leak\n' >"$home/superbot/.env"
+install -d -o "$SVC" -g "$SVC" -m 0700 "$home/.config" "$home/.config/superbot"
+install -o "$SVC" -g "$SVC" -m 0600 /dev/null "$home/.config/superbot/master.key"
 
 # shellcheck source=deploy/install.sh
 SUPERBOT_INSTALL_NO_MAIN=1 source "$repo/deploy/install.sh"
@@ -65,6 +70,14 @@ grep -qx "ISOLATION_DIR=$TEST_DIR/users" /etc/superbot/isolation.conf || die "th
 grep -qx 'ProtectProc=invisible' "$LIB/systemd/superbot.service.d/isolation.conf" || die "no drop-in"
 [[ "$(stat -c '%a %U' "$TEST_DIR/users")" == "711 root" ]] || die "$TEST_DIR/users isn't root's 0711"
 [[ "$(stat -c '%a' "$home")" == 750 ]] || die "$home isn't 0750"
+# ADR 0058: a new install (no .env yet) gets accounts; an existing one keeps its setting.
+# shellcheck disable=SC2034 # read by default_isolation
+picked() { (ISOLATION_MODE="" UPGRADE=$1 SUPERBOT_USER=$SVC; default_isolation >/dev/null; printf '%s' "$ISOLATION_MODE"); }
+[[ -z "$(picked false)" ]] || die "an existing install was switched to per-user accounts"
+mv "$home/superbot/.env" "$home/superbot/.env.kept"
+[[ "$(picked false)" == users ]] || die "a new install didn't get per-user accounts"
+[[ -z "$(picked true)" ]] || die "an upgrade was switched to per-user accounts"
+mv "$home/superbot/.env.kept" "$home/superbot/.env"
 
 as_svc() { sudo -u "$SVC" -H -- "$@"; }
 refused() { if "$@" >/dev/null 2>&1; then die "allowed: $*"; fi; }
@@ -82,6 +95,16 @@ grep -q '^sb-u-' <<<"$(getent passwd)" && die "a refused call made an account"
 as_svc sudo -n /usr/local/sbin/superbot-userctl ensure t1 >/dev/null
 grep -qx "$SVC" <<<"$(id -nG sb-u-t1 | tr ' ' '\n')" && die "sb-u-t1 is in $SVC's group"
 [[ "$(getent passwd sb-u-t1 | cut -d: -f7)" == /usr/sbin/nologin ]] || die "sb-u-t1 can log in"
+for d in bots settings; do
+  [[ "$(stat -c '%a %U' "$TEST_DIR/users/t1/$d")" == "2770 root" ]] || die "t1/$d isn't root's 2770"
+done
+# A container's /etc/passwd starts over when it's recreated: the account comes back with
+# the uid that owns its files.
+uid=$(id -u sb-u-t1)
+userdel sb-u-t1
+groupdel sb-u-t1 2>/dev/null || true
+as_svc sudo -n /usr/local/sbin/superbot-userctl ensure t1 >/dev/null
+[[ "$(id -u sb-u-t1)" == "$uid" ]] || die "the re-made sb-u-t1 got another uid"
 (cd "$TEST_DIR/users/t1/workspace" && as_svc sudo -n -E -u sb-u-t1 -- "$LIB/bin/superbot-run" /usr/bin/true)
 # superbot-run refuses to start outside the account's folders, and as any other account.
 (cd "$TEST_DIR/users" && refused as_svc sudo -n -E -u sb-u-t1 -- "$LIB/bin/superbot-run" /usr/bin/true)
@@ -91,7 +114,8 @@ refused sudo -u sb-u-t1 sudo -n true
 
 log "botd's OS tests, as $SVC"
 envs=(SUPERBOT_ISOLATION_OS_TEST=1 ISOLATION_DIR="$TEST_DIR/users" SUPERBOT_RUN_DIR="$LIB/bin"
-  PATH="$LIB/fake:/usr/local/bin:/usr/bin:/bin" HOME="$home" AUTH_PASSWORD=must-not-leak)
+  PATH="$LIB/fake:/usr/local/bin:/usr/bin:/bin" HOME="$home" AUTH_PASSWORD=must-not-leak
+  SUPERBOT_OS_TEST_KEY_FILE="$home/.config/superbot/master.key")
 args=(--ignored --test-threads=1 --nocapture accounts_os_tests)
 if [[ -d /run/systemd/system ]]; then
   # The same sandboxing as superbot.service with its isolation drop-in.
