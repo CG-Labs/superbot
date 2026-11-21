@@ -404,7 +404,7 @@ async fn handle(
     match (method.as_str(), &parts[..]) {
         ("GET", ["1.0"]) => sync(json!({
             "auth": "trusted",
-            "api_extensions": ["network_acl", "instances_rebuild", "instance_create_start"],
+            "api_extensions": ["network_acl", "instances_rebuild", "instance_create_start", "instance_get_full"],
             "environment": { "server_version": "6.0-standin" },
         })),
         ("GET", ["1.0", "projects", p]) => match w.projects.get(*p) {

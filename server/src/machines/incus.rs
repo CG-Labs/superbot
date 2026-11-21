@@ -716,6 +716,8 @@ impl Incus {
         }
     }
 
+    /// The instance with its runtime state (addresses): `recursion=1` on one instance
+    /// is the `instance_get_full` API extension, which preflight checks for.
     async fn instance(&self, n: &str) -> Result<Value, ProviderError> {
         Ok(self
             .call(Method::GET, &format!("/1.0/instances/{}", name(n)?), &[("recursion", "1")], None, None)
@@ -996,7 +998,7 @@ impl MachineProvider for Incus {
                         return Err(api(403, "Incus doesn't trust botd's client certificate yet"));
                     }
                     let have = |x: &str| v["api_extensions"].as_array().is_some_and(|a| a.iter().any(|e| e == x));
-                    let missing: Vec<&str> = ["network_acl", "instances_rebuild", "instance_create_start"]
+                    let missing: Vec<&str> = ["network_acl", "instances_rebuild", "instance_create_start", "instance_get_full"]
                         .into_iter()
                         .filter(|x| !have(x))
                         .collect();
