@@ -39,6 +39,8 @@ mod machines_bot_user_tests;
 #[cfg(test)]
 mod machines_http_tests;
 #[cfg(test)]
+mod machines_incus_e2e_tests;
+#[cfg(test)]
 mod machines_incus_tests;
 #[cfg(test)]
 mod machines_lockdown_tests;

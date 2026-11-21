@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. The last item listed as remaining on [#29](https://github.com/CG-Labs/superbot/issues/29) (M3), after [ADR 0025](0025-control-plane-linode.md) (machines), [ADR 0031](0031-machine-enrollment-mtls.md) (enrollment and mTLS), [ADR 0035](0035-machine-firewall-auto-enroll.md) (firewall), [ADR 0036](0036-bots-on-the-users-machine.md) (Bots on machines) and [ADR 0056](0056-rebuilding-machines-enrolled-before-0039.md) (rebuilds). Built and tested against a stand-in for the Incus API only; not yet run against a real Incus host.
+Accepted. The last item listed as remaining on [#29](https://github.com/CG-Labs/superbot/issues/29) (M3), after [ADR 0025](0025-control-plane-linode.md) (machines), [ADR 0031](0031-machine-enrollment-mtls.md) (enrollment and mTLS), [ADR 0035](0035-machine-firewall-auto-enroll.md) (firewall), [ADR 0036](0036-bots-on-the-users-machine.md) (Bots on machines) and [ADR 0056](0056-rebuilding-machines-enrolled-before-0039.md) (rebuilds). Built and tested against a stand-in for the Incus API, then validated on a real Incus host in CI ([ADR 0069](0069-validating-incus-containers-on-a-real-host.md)).
 
 ## Context
 
@@ -61,7 +61,7 @@ The provider trait gained defaults so Linode is unchanged: `substrate()` (`vm` o
 Each tier's plan becomes:
 
 - `limits.cpu`
-- `limits.memory` with `limits.memory.enforce=hard` and no swap
+- `limits.memory` with `limits.memory.enforce=hard`. Swap isn't limited: a restricted project refuses `limits.memory.swap` ([ADR 0069](0069-validating-incus-containers-on-a-real-host.md)), so give the host no swap if containers mustn't use it.
 - `limits.processes` (1024 per GiB, at least 2048)
 - the root disk's `size`
 
@@ -109,9 +109,9 @@ If any check fails, botd makes nothing, and the machine shows the reason. Incus 
 
 - **A shared kernel.** A kernel or container-runtime escape crosses every boundary above. VMs (Linode, or Incus VMs later) are the stronger boundary. Use containers where that trade-off is accepted, keep the host patched, and dedicate the host to SuperBot containers.
 - **botd's certificate is effectively an Incus admin.** On a plain bridge (no OVN), Incus keeps network ACLs in the `default` project and checks permissions there, so a project-restricted client certificate can't manage them. botd therefore uses a trusted certificate. Anyone who has botd's key can change the project or make privileged containers. The pre-create check catches drift, not a compromised botd. Treat the key like `LINODE_TOKEN`, firewall the Incus API to botd's address, and run botd on a separate host where possible.
-- **ICMP is not filtered** to private ranges, so containers can ping. ARP and neighbour discovery are limited by port isolation and the filters.
+- **ICMP is not filtered** to private ranges, so containers can ping the gateway. Port isolation stops them pinging each other, as a real host showed ([ADR 0069](0069-validating-incus-containers-on-a-real-host.md)). ARP and neighbour discovery are limited by port isolation and the filters.
 - **Public addresses of the host** other than `INCUS_URL`'s are not denied unless listed in `INCUS_EGRESS_DENY`.
-- **Host-to-container traffic.** Whether the ACL's default inbound drop also filters traffic that starts on the Incus host itself depends on Incus's bridge firewall. This is unverified on a live host. Containers' inbound from other containers and from outside is covered either way.
+- **Host-to-container traffic** is filtered too: on a real host, the ACL's default inbound drop also applies to traffic that starts on the Incus host, which reaches only the agent port ([ADR 0069](0069-validating-incus-containers-on-a-real-host.md)).
 - **Disk sizes** are enforced only by pools whose driver supports quotas (zfs, btrfs, lvm). The `dir` driver doesn't, and the preflight check says so.
 - **Snapshots** are on the same pool and host, not off-host backups.
 - **The enrollment token** is in the instance's config (`cloud-init.user-data`), readable by Incus admins, until the container enrolls or misses its deadline; then botd removes it ([ADR 0067](0067-clearing-enrollment-data-from-containers.md)). It is single-use and expires in 60 minutes. The first boot also deletes the NoCloud seed copy inside the container.
@@ -134,7 +134,7 @@ There is no migration between substrates in this slice.
 
 `GET /api/machines/substrate` (admin) shows the provider, the substrate, each tier's plan with its CPUs, memory, disk and process limit, the regions, the firewall, and the provider's settings. For Incus, the settings include the pinned certificate fingerprint, the denied ranges, the exact outbound rules and the isolation summary. `?check=true` asks the host:
 
-- that botd is trusted, with the API extensions it needs;
+- that botd is trusted, with the API extensions it needs and Incus 7.0.1 or later ([ADR 0069](0069-validating-incus-containers-on-a-real-host.md));
 - that the project is restricted;
 - that the network is a managed bridge;
 - that the storage pool enforces sizes.
@@ -143,7 +143,7 @@ There is no migration between substrates in this slice.
 
 ### Tests
 
-There is a stateful stand-in for the Incus API (`machines/incus_standin.rs`). It speaks TLS 1.3. It lets any client certificate through the handshake but answers only trusted ones, as Incus does. It returns sync and async replies with operations to wait on, ETags with `If-Match`, Incus's error shapes, used-by lists on ACLs, and a restricted project that refuses privileged, nested or host-path containers.
+There is a stateful stand-in for the Incus API (`machines/incus_standin.rs`). It speaks TLS 1.3. It lets any client certificate through the handshake but answers only trusted ones, as Incus does. It returns sync and async replies with operations to wait on, ETags with `If-Match`, Incus's error shapes, used-by lists on ACLs, and a restricted project that refuses privileged, nested or host-path containers and low-level options. An end-to-end test also runs against a real Incus host in CI ([ADR 0069](0069-validating-incus-containers-on-a-real-host.md)).
 
 Unit tests cover:
 
@@ -164,7 +164,7 @@ Integration tests run botd end to end on loopback. A user's container is request
 
 ## Follow-ups
 
-- Validate against a real Incus host: host-to-container filtering, IPv6 filtering on bridges without IPv6, cloud-init and rebuild timings, and the extension names the preflight check expects.
+- Validate against a real Incus host (done, [ADR 0069](0069-validating-incus-containers-on-a-real-host.md)). Bridges without IPv6, zfs and lvm pools and clusters are still untested.
 - Off-host backups: export snapshots to customer S3 ([#40](https://github.com/CG-Labs/superbot/issues/40)).
 - Clear `cloud-init.user-data` from the instance's config once it has enrolled (done, [ADR 0067](0067-clearing-enrollment-data-from-containers.md)).
 - Per-container egress allowlists and DNS policy (M5).

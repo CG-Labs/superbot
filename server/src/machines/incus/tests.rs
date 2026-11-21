@@ -163,12 +163,12 @@ async fn a_container_is_unprivileged_isolated_and_sized_by_its_plan() {
         ("limits.cpu", "2"),
         ("limits.memory", "4GiB"),
         ("limits.memory.enforce", "hard"),
-        ("limits.memory.swap", "false"),
         ("limits.processes", "4096"),
         ("user.superbot.tag", "superbot"),
     ] {
         assert_eq!(c[k], v, "{k}");
     }
+    assert!(c.get("limits.memory.swap").is_none(), "a restricted project refuses it");
     assert!(c["cloud-init.user-data"].as_str().unwrap().starts_with("#cloud-config"));
     let vendor = c["cloud-init.vendor-data"].as_str().unwrap();
     assert!(vendor.contains("\"ssh-ed25519 AAAAC3Nza admin@example\"") && vendor.contains("disable_root: false"));
@@ -538,6 +538,22 @@ async fn only_the_pinned_host_and_a_trusted_certificate() {
     let checks = ok.preflight().await.unwrap();
     assert!(checks.iter().all(|c| c["ok"] == true), "{checks:?}");
 
+    // An Incus too old for ACLs on a bridged NIC, such as Ubuntu 24.04's 6.0.0, is named.
+    s.w().missing_extensions = vec!["network_bridge_acl_devices".into()];
+    let checks = ok.preflight().await.unwrap();
+    assert_eq!(checks[0]["ok"], false);
+    assert!(checks[0]["detail"].as_str().unwrap().contains("lacks API extensions: network_bridge_acl_devices"), "{checks:?}");
+    s.w().missing_extensions.clear();
+
+    // Every 6.0 LTS release breaks ACL updates for containers in a restricted project.
+    s.w().version = Some("6.0.7".into());
+    let checks = ok.preflight().await.unwrap();
+    assert_eq!(checks[0]["ok"], false);
+    assert!(checks[0]["detail"].as_str().unwrap().contains("Incus 6.0.7 is too old: botd needs 7.0.1"), "{checks:?}");
+    s.w().version = Some("7.0.1".into());
+    assert_eq!(ok.preflight().await.unwrap()[0]["ok"], true);
+    s.w().version = None;
+
     // Another server certificate: botd won't talk to it.
     let (other, _) = self_signed("incus.test");
     let mut c = s.credentials();
@@ -589,4 +605,35 @@ fn incus_answers_are_read_as_ours() {
         assert!(name(bad).is_err(), "{bad}");
     }
     assert!(name("superbot-m1a2b3c4d").is_ok());
+}
+
+#[test]
+fn incus_before_7_0_1_is_too_old() {
+    for v in ["6.0.0", "6.0.7", "6.9", "7.0", "7.0.0"] {
+        assert!(too_old(v), "{v}");
+    }
+    for v in ["7.0.1", "7.0.2", "7.1", "7.6", "10.0", "standin", "7.1-rc1", "?"] {
+        assert!(!too_old(v), "{v}");
+    }
+}
+
+#[tokio::test]
+async fn no_container_on_an_incus_too_old_or_missing_extensions() {
+    let s = StandIn::start().await;
+    let p = incus(&s);
+    p.create_firewall("superbot-fw", &["superbot".into()], &[agent_rule()]).await.unwrap();
+    s.w().version = Some("6.0.7".into());
+    match p.create(&spec("superbot-m1", "c1-m2-d20")).await {
+        Err(ProviderError::Api { status: 400, message }) => assert!(message.contains("botd needs 7.0.1"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+    s.w().version = None;
+    s.w().missing_extensions = vec!["network_bridge_acl_devices".into()];
+    match p.create(&spec("superbot-m1", "c1-m2-d20")).await {
+        Err(ProviderError::Api { status: 400, message }) => assert!(message.contains("network_bridge_acl_devices"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(s.calls("POST", "/1.0/instances").is_empty(), "nothing was asked for");
+    s.w().missing_extensions.clear();
+    p.create(&spec("superbot-m1", "c1-m2-d20")).await.unwrap();
 }
