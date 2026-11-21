@@ -795,6 +795,21 @@ impl App {
             }
             return;
         }
+        // Another of the owner's Bots may have filled their storage meanwhile (ADR 0082).
+        if waited && let Some((m, limit, storage::State::Over)) = storage::check(self, &bot.owner_id).await {
+            self.give_back(&bot, msg, &period.key);
+            let tier = self.tier_of(&bot.owner_id);
+            let text = storage::full_text(&tier.label, m.used(), limit);
+            let details = json!({
+                "reason": "storage_limit", "owner": bot.owner_id, "tier": tier.name, "limit": limit, "used": m.used(), "partial": m.partial,
+                "period": period.key, "messageId": msg.id,
+            });
+            self.db.record(&by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied).details(details));
+            if self.db.last_message(&bot.id).is_none_or(|m| m.text != text) {
+                self.say(&bot.id, &text, true);
+            }
+            return;
+        }
         // A teammate's run here gets an account of its own (ADR 0064), never the owner's.
         let teammate = for_other.as_deref().filter(|_| matches!(place, Place::Here) && self.teammate_accounts());
         let run_space = Space::of(&bot.owner_id, teammate);
@@ -1784,11 +1799,11 @@ impl App {
             return refused("tier_limit", text, Some(u64::from(limit)), None, Value::Null);
         }
         if let Some((m, limit, storage::State::Warning)) = storage
-            && self.storage.first_warning(&bot.owner_id, &tiers::day(crate::db::now()))
+            && self.storage.first_warning(&self.db, &bot.owner_id, crate::db::now())
         {
             let who = Who { actor: Actor::system("billing").on_behalf_of(&bot.owner_id), source: Default::default() };
             let details = json!({ "owner": bot.owner_id, "tier": tier.name, "limit": limit, "used": m.used(), "warnAt": storage::WARN_PERCENT, "partial": m.partial });
-            self.db.record(&who.event("usage.storage_warning").target("user", &bot.owner_id).bot(&bot.id).details(details));
+            self.db.record(&who.event(storage::WARNING_ACTION).target("user", &bot.owner_id).bot(&bot.id).details(details));
             self.say(&bot.id, &storage::warning_text(&tier.label, m.used(), *limit), false);
         }
         Some((tier.name.clone(), route, wiring))

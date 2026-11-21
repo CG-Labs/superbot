@@ -153,6 +153,43 @@ async fn nearly_full_storage_warns_once_a_day_and_still_runs() {
     assert_eq!(audit(w.port, &w.admin, &format!("action=bot.run_finished&bot={}", bot.id)).await.len(), 2);
     let (_, plan) = get(&w, "/api/me/tier", &w.a).await;
     assert_eq!(plan["usage"]["storage"]["state"], "warning");
+    // A restarted botd remembers from the audit log: still not again today.
+    let fresh = storage::Cache::default();
+    assert!(!fresh.first_warning(&app.db, &w.a_id, db::now()));
+    assert!(fresh.first_warning(&app.db, &w.b_id, db::now()));
+}
+
+#[tokio::test]
+async fn a_run_that_waited_is_checked_again_when_its_turn_comes() {
+    let w = world().await;
+    let app = &w.app;
+    app.run_cap.set(Some(1)).unwrap();
+    let dir = app.cfg.data_dir.join("gate");
+    crate::slots_http_tests::gated_claude(app, &dir);
+    let [x, y] = ["X", "Y"].map(|n| app.db.create_bot_owned(n, "#fff", "waddle", "claude", None, false, &w.a_id, Visibility::Private).id);
+    let before = audit(w.port, &w.admin, &format!("bot={y}")).await.len();
+    for b in [&x, &y] {
+        let (code, body) = call(w.port, "POST", &format!("/api/bots/{b}/messages"), &w.a, r#"{"text":"go"}"#).await;
+        assert_eq!(code, 202, "{body}");
+    }
+    for _ in 0..400 {
+        if app.slots.waiting(&y).is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(app.slots.waiting(&y).is_some(), "Y didn't queue");
+    // X fills Ada's storage while Y waits.
+    fill(app, &w.a_id, "big.bin", 1_200_000);
+    std::fs::write(dir.join(format!("go-{x}")), "").unwrap();
+    wait_run(&w, &y, before).await;
+    let refused = audit(w.port, &w.admin, &format!("action=bot.run_refused&bot={y}")).await;
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["details"]["reason"], "storage_limit", "{refused:?}");
+    assert!(std::fs::read_to_string(dir.join("order")).unwrap().lines().all(|l| l == x), "Y ran");
+    // Y's run is given back: only X's counts.
+    let (_, plan) = get(&w, "/api/me/tier", &w.a).await;
+    assert_eq!(plan["usage"]["runs"], 1, "{plan}");
 }
 
 #[tokio::test]
