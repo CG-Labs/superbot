@@ -76,6 +76,8 @@ struct Spot {
     machine: Option<Assigned>,
     cwd: PathBuf,
     state_dir: PathBuf,
+    /// Where botd writes the harness's files: `state_dir`, except with per-user accounts.
+    config_dir: PathBuf,
     memory: PathBuf,
     user_file: PathBuf,
     botctl: PathBuf,
@@ -686,6 +688,14 @@ impl App {
         };
         let mut spot = self.spot(&bot, bot_dir.clone(), space, place, for_other.as_deref());
         spot.for_other = for_other.clone();
+        // With per-user accounts the harness keeps its state in its owner's folder, and
+        // reads botd's files from one it can't change (`isolate` made both).
+        if run_as.is_some()
+            && let Some(iso) = self.isolation()
+            && let (Some(state), Some(settings)) = (iso.bot_state(&bot.owner_id, &bot.id), iso.bot_settings(&bot.owner_id, &bot.id))
+        {
+            (spot.state_dir, spot.config_dir) = (state, settings);
+        }
         // Caches are made as the run's user: by botd when it is that user, by
         // `superbot-run` for a per-user account, which botd can't make folders for.
         if spot.machine.is_none() {
@@ -792,6 +802,7 @@ impl App {
                 effort: route.effort.clone(),
                 env,
                 state_dir: spot.state_dir.clone(),
+                config_dir: spot.config_dir.clone(),
                 guard: guard.clone(),
                 run_as: run_as.clone(),
                 sandbox,
@@ -1010,6 +1021,7 @@ impl App {
                 cwd,
                 memory: local(self.memory_file(bot)),
                 user_file: local(self.user_file(&bot.owner_id)),
+                config_dir: bot_dir.clone(),
                 state_dir: bot_dir,
                 botctl: self.cfg.bin_dir.join("botctl"),
                 env,
@@ -1053,6 +1065,7 @@ impl App {
                     cwd: PathBuf::from(&layout.workspace),
                     memory: state_dir.join("MEMORY.md"),
                     user_file: PathBuf::from(&layout.user_file),
+                    config_dir: state_dir.clone(),
                     state_dir,
                     botctl,
                     env,
@@ -1162,16 +1175,19 @@ impl App {
             Err(())
         };
         if !accounts::HARNESSES.contains(&bot.harness.as_str()) {
-            let text = format!(
-                "This server runs each person's Bots under their own account, and {} can't run that way yet. Switch me to Claude Code or Codex in my settings.",
-                bot.harness
-            );
+            let text = format!("This server runs each person's Bots under their own account, and {} can't run that way. Switch me to another harness in my settings.", bot.harness);
             return refused("isolation_harness", &text);
         }
-        match self.ensure_account(&bot.owner_id, by).await {
-            Ok(r) => Ok(Some(r)),
-            Err(_) => refused("no_account", "I couldn't set up my owner's account on this server, so I didn't run. An admin can check the server log."),
+        let Ok(run_as) = self.ensure_account(&bot.owner_id, by).await else {
+            return refused("no_account", "I couldn't set up my owner's account on this server, so I didn't run. An admin can check the server log.");
+        };
+        if let Some(iso) = self.isolation()
+            && let Err(e) = iso.make_bot_dirs(&bot.owner_id, &bot.id)
+        {
+            eprintln!("Isolation: couldn't make a Bot's folders in its owner's folder: {e}");
+            return refused("no_account", "I couldn't set up my folders in my owner's account on this server, so I didn't run. An admin can check the server log.");
         }
+        Ok(Some(run_as))
     }
 
     /// The tier this run is on and the route it takes: the Bot owner's tier picks the
@@ -1731,6 +1747,7 @@ mod tests {
             machine: None,
             cwd: dir.join("ws"),
             state_dir: dir.join("bots/b1"),
+            config_dir: dir.join("bots/b1"),
             memory: dir.join("bots/b1/MEMORY.md"),
             user_file: dir.join("users/u1/USER.md"),
             botctl: dir.join("botctl"),
@@ -1936,27 +1953,27 @@ mod tests {
     async fn isolated_runs_never_fall_back_to_botds_account() {
         let (app, _) = isolated_app("/bin/false");
         let who = Who::system("test");
-        for harness in ["pi", "hermes"] {
-            let bot = app.db.create_bot("P", "#fff", "waddle", harness, None, true);
-            let msg = app.db.add_message(&bot.id, "user", "hi", None, false, Some("queued"));
-            assert_eq!(app.isolate(&bot, &msg, &who, "2026-11").await, Err(()), "{harness}");
-            let last = app.db.messages(&bot.id, 1).pop().unwrap();
-            assert!(last.error && last.text.contains("Claude Code or Codex"), "{}", last.text);
-        }
-        let refused = actions(&app, "bot.run_refused");
-        assert!(refused.iter().all(|e| e.details["reason"] == "isolation_harness"), "{refused:?}");
-        assert_eq!(refused.len(), 2);
-
-        // The account can't be made: refused, and the failure is audited.
-        let bot = app.db.create_bot("C", "#fff", "waddle", "claude", None, true);
+        // A harness botd doesn't know never runs as botd instead.
+        let bot = app.db.create_bot("X", "#fff", "waddle", "aider", None, true);
         let msg = app.db.add_message(&bot.id, "user", "hi", None, false, Some("queued"));
         assert_eq!(app.isolate(&bot, &msg, &who, "2026-11").await, Err(()));
-        let refused = actions(&app, "bot.run_refused");
-        assert_eq!(refused.last().unwrap().details["reason"], "no_account");
-        assert_eq!(refused.last().unwrap().details["account"], format!("sb-u-{}", bot.owner_id));
+        let last = app.db.messages(&bot.id, 1).pop().unwrap();
+        assert!(last.error && last.text.contains("another harness"), "{}", last.text);
+        assert_eq!(actions(&app, "bot.run_refused")[0].details["reason"], "isolation_harness");
+
+        // Every harness runs as its owner's account (ADR 0058). When the account can't be
+        // made, the run is refused, and the failure is audited.
+        for harness in crate::accounts::HARNESSES {
+            let bot = app.db.create_bot("C", "#fff", "waddle", harness, None, true);
+            let msg = app.db.add_message(&bot.id, "user", "hi", None, false, Some("queued"));
+            assert_eq!(app.isolate(&bot, &msg, &who, "2026-11").await, Err(()), "{harness}");
+            let refused = actions(&app, "bot.run_refused");
+            assert_eq!(refused.last().unwrap().details["reason"], "no_account", "{harness}");
+            assert_eq!(refused.last().unwrap().details["account"], format!("sb-u-{}", bot.owner_id));
+        }
         let failed = actions(&app, "isolation.account_failed");
-        assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0].outcome, "failure");
+        assert_eq!(failed.len(), crate::accounts::HARNESSES.len());
+        assert!(failed.iter().all(|e| e.outcome == "failure"));
         assert!(actions(&app, "harness.invoked").is_empty());
     }
 

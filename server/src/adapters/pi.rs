@@ -10,7 +10,7 @@ pub struct Pi;
 const GUARD_EXTENSION: &str = include_str!("pi_guard.ts");
 
 fn guard_file(input: &RunInput) -> PathBuf {
-    input.state_dir.join("superbot-guard.ts")
+    input.config_dir.join("superbot-guard.ts")
 }
 
 impl Adapter for Pi {

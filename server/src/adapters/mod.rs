@@ -70,8 +70,11 @@ pub struct RunInput {
     /// Reasoning effort, in the harness's own words (e.g. "high").
     pub effort: Option<String>,
     pub env: HashMap<String, String>,
-    /// A private folder for this Bot's harness files.
+    /// A private folder for this Bot's harness files, which the run writes.
     pub state_dir: PathBuf,
+    /// Where the files the adapter writes go (its settings, the approval gate). The same
+    /// as `state_dir`, except with per-user accounts, where the run can't change them.
+    pub config_dir: PathBuf,
     /// Set in ask mode: the harness must run `command` before every tool call.
     pub guard: Option<Guard>,
     /// With per-user accounts (ADR 0037): the account the harness runs as on this
@@ -172,7 +175,7 @@ pub trait Adapter: Send {
         None
     }
     /// Files the harness needs before it starts (its settings, the approval gate),
-    /// written private where the run happens. Paths are inside `input.state_dir`.
+    /// written private where the run happens. Paths are inside `input.config_dir`.
     fn files(&self, _input: &RunInput) -> Vec<(PathBuf, String)> {
         Vec::new()
     }
@@ -346,7 +349,13 @@ pub async fn run(adapter: Box<dyn Adapter>, input: RunInput, abort: watch::Recei
     let run_as = input.run_as.clone();
     run_on(adapter, input, abort, emit, |job, tx| async move {
         let job = match &run_as {
-            Some(r) => r.wrap(job),
+            Some(r) => match r.prepare(job) {
+                Ok(job) => job,
+                Err(message) => {
+                    let _ = tx.send(JobEvent::Error { message }).await;
+                    return;
+                }
+            },
             None => job,
         };
         job::run(&host, &job, aborted(stop), &tx).await
@@ -453,6 +462,7 @@ mod tests {
             effort: None,
             env: HashMap::from([("PATH".into(), "/opt/superbot/bin:/usr/bin:/bin".into())]),
             state_dir: dir.join("state"),
+            config_dir: dir.join("state"),
             guard: Some(Guard { command: "'/opt/bin/botctl' hook x".into(), timeout_secs: 300, wait: std::time::Duration::from_secs(240) }),
             run_as,
             sandbox: None,
@@ -460,16 +470,28 @@ mod tests {
     }
 
     fn run_as(sudo: &str) -> crate::accounts::RunAs {
-        crate::accounts::RunAs { sudo: sudo.into(), runner: "/opt/superbot/bin/superbot-run".into(), account: "sb-u-u1".into() }
+        crate::accounts::RunAs { sudo: sudo.into(), runner: "/opt/superbot/bin/superbot-run".into(), account: "sb-u-u1".into(), settings: "/srv/superbot/users/u1/settings".into() }
     }
 
     #[test]
-    fn isolated_harnesses_need_nothing_botd_writes() {
-        // botd writes job files and runs cleanups as itself, where a per-user account can't follow.
+    fn harness_files_go_only_where_botd_keeps_them() {
+        // With per-user accounts that's a folder the run reads and can't change.
         let dir = std::env::temp_dir();
+        let mut i = input(&dir, None);
+        i.config_dir = dir.join("settings/b1");
+        let mut wrote = Vec::new();
         for name in crate::accounts::HARNESSES {
-            let job = job_for(get(name).unwrap().as_mut(), &input(&dir, None), &mut Vec::new());
-            assert!(job.files.is_empty() && job.cleanup.is_none(), "{name}");
+            let job = job_for(get(name).unwrap().as_mut(), &i, &mut Vec::new());
+            for f in &job.files {
+                assert!(std::path::Path::new(&f.path).starts_with(&i.config_dir), "{name}: {}", f.path);
+                wrote.push(name);
+            }
+            if let Some(c) = &job.cleanup {
+                assert!(std::path::Path::new(&c.when_exists).starts_with(&i.state_dir), "{name}: the run's own state");
+            }
+        }
+        assert_eq!(wrote, ["pi", "hermes"], "Pi's approval gate and Hermes's managed config");
+        for name in crate::accounts::LOGINS {
             assert!(get(name).unwrap().login_args().is_some(), "an admin logs {name} in as each user");
         }
     }
