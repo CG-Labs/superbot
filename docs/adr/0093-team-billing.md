@@ -17,7 +17,7 @@ Everything ADR 0042 made safe for one person has to stay safe: Stripe redelivers
 ### Who pays, and for whom
 
 - **The team owns the subscription.** A team has at most one Stripe customer (`team_customers`), separate from people's: a customer is a person's or a team's, never both, and one linked to either is refused for the other (`customer_of_another_user`).
-- **Owners and admins pay.** `POST /api/team/billing/checkout {tier}` (write access, team owners and admins) opens Stripe Checkout for the team with a quantity of one seat per member; `POST /api/team/billing/portal` opens the team customer's portal. Returns go to `/app/team`. One open checkout per team, like a person's; a second while one pays is a 409.
+- **Owners and admins pay.** `POST /api/team/billing/checkout {tier}` (write access, team owners and admins) opens Stripe Checkout for the team with a quantity of one seat per member; `POST /api/team/billing/portal` opens the team customer's portal. Returns go to `/app/team`. One open checkout per team, like a person's; a second while one pays is a 409. A paid checkout stays the team's open one until its subscription is recorded (or Stripe's 3 days of webhook retries pass), so a delayed subscription event can't let a second checkout open; the check runs again under the team's lock.
 - **The team's plan is everyone's plan.** While a team pays (status `active`, `trialing` or `past_due`, as for a person), each member's tier, limits, machine size and billing period are the team plan's, read in one place (`tier_of`). It wins over a member's own tier, even a higher one, so a team gets what it pays for and nothing it doesn't.
 - **No double plans.** A member of a paying team can't start a personal checkout (409, `teamPays`; `billing.checkout_created` denied, reason `team_pays`). A personal subscription they already had is still recorded and still theirs to cancel in their portal; the Plan screen says their team pays.
 
@@ -30,11 +30,15 @@ A subscription event is the team's when its metadata names a team (`superbot_tea
 - **One seat per member**, at least one. Joining or leaving a team (invite accepted, removed, left, or an admin's change) wakes a seat sync; one also runs every minute.
 - **Absolute and prorated.** botd sets the subscription item's quantity (`POST /v1/subscription_items/{id}`, `proration_behavior=create_prorations`) to the member count, so a retry or a late sync can't double count, and Stripe charges or credits the part of the period. A quantity changed in Stripe's portal is set back on the next pass.
 - **Retries never give up.** Each try has its own idempotency key; failures back off 1, 4, 16, 64 minutes, then hourly, and show as "Stripe didn't take the new seat count yet" to the team's managers. Audited as `team.seats_synced` and `team.seats_sync_failed` (no Stripe error text in the app).
-- **A paying team can't vanish.** The last member can't leave, be removed or the team deleted (an admin included) while a subscription pays (409, `team.delete_refused`, reason `team_pays`), so nobody is billed for a team that no longer exists. Cancel first.
+- **A paying team can't vanish.** The last member can't leave, be removed or the team deleted (an admin included) while a subscription pays (409, `team.delete_refused`, reason `team_pays`), so nobody is billed for a team that no longer exists. Cancel first. An open checkout is expired first, under the same lock a checkout opens under; if it was already paid, or Stripe can't say, the team stays (`checkout_completed`, `checkout_unknown`).
 
 ### Members' machines
 
 A team plan change moves each member's tier the same way an admin's change does: `user.tier_changed` (source `team`) and a resize request per member (ADR 0085). Joining a paying team moves the newcomer onto its plan; leaving moves them back to their own. The resize cause is `team`, so members don't get ADR 0091's resize emails for a plan they didn't buy.
+
+### Metered tokens
+
+With `STRIPE_METER_EVENT` (ADR 0050), a run's tokens are reported to whoever pays for its owner's plan when the run ends: the team's customer while the team pays, else the owner's own. The customer is stored with the row, so a member who leaves afterwards doesn't move usage already recorded.
 
 ### Emails and screens
 

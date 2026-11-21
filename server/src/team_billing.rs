@@ -44,11 +44,18 @@ pub struct Seats {
     wake: tokio::sync::Notify,
     /// One pass at a time, so no update is sent by two.
     busy: tokio::sync::Mutex<()>,
+    /// Per team: a checkout opening, or the team going, one at a time.
+    teams: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Seats {
     pub fn new(stripe: Stripe) -> Seats {
-        Seats { stripe, wake: tokio::sync::Notify::new(), busy: tokio::sync::Mutex::new(()) }
+        Seats { stripe, wake: tokio::sync::Notify::new(), busy: tokio::sync::Mutex::new(()), teams: Default::default() }
+    }
+
+    async fn hold(&self, team_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = self.teams.lock().unwrap_or_else(|e| e.into_inner()).entry(team_id.to_string()).or_default().clone();
+        lock.lock_owned().await
     }
 }
 
@@ -127,10 +134,37 @@ pub fn member_changed(app: &App, team_id: &str, user_id: &str, before: &str, how
 
 /// Refuses to delete a team while a subscription pays for it: it'd go on charging for a
 /// team that's gone. Audits the refusal.
-pub fn may_delete(app: &App, by: &Who, team_id: &str, how: &str) -> crate::Res<()> {
-    let Some(s) = app.db.team_paying(team_id) else { return Ok(()) };
-    app.db.record(&team_event(by, "team.delete_refused", team_id, json!({ "reason": "team_pays", "via": how, "subscription": s.subscription_id })).outcome(Outcome::Denied));
-    Err(crate::ApiError(StatusCode::CONFLICT, "The team pays for a plan. Cancel it under Manage billing on the Team screen first; the team can go once it has ended.".into()))
+pub async fn may_delete(app: &App, by: &Who, team_id: &str, how: &str) -> crate::Res<Option<tokio::sync::OwnedMutexGuard<()>>> {
+    let refuse = |reason: &str, d: Value, msg: &str| {
+        let mut d = d;
+        d["reason"] = json!(reason);
+        d["via"] = json!(how);
+        app.db.record(&team_event(by, "team.delete_refused", team_id, d).outcome(Outcome::Denied));
+        Err(crate::ApiError(StatusCode::CONFLICT, msg.into()))
+    };
+    const PAYS: &str = "The team pays for a plan. Cancel it under Manage billing on the Team screen first; the team can go once it has ended.";
+    let held = match app.team_seats.get() {
+        Some(seats) => Some(seats.hold(team_id).await),
+        None => None,
+    };
+    if let Some(s) = app.db.team_paying(team_id) {
+        return refuse("team_pays", json!({ "subscription": s.subscription_id }), PAYS);
+    }
+    let Some(seats) = app.team_seats.get() else {
+        return match app.db.team_open_checkout(team_id) {
+            Some(session) => refuse("checkout_open", json!({ "session": session }), "The team has a checkout open. Try again once it has expired."),
+            None => Ok(held),
+        };
+    };
+    let session = app.db.team_open_checkout(team_id);
+    match billing::close_last(app, &seats.stripe, Payer::Team(team_id)).await {
+        Last::Closed => Ok(held),
+        Last::Paid => refuse("checkout_completed", json!({ "session": session }), PAYS),
+        Last::Unknown(e) => {
+            crate::obs::log::log_warn!("billing: closing team {team_id}'s last Stripe checkout before it goes: {e}");
+            refuse("checkout_unknown", json!({ "session": session, "error": e.to_string() }), "Stripe couldn't say whether the team's checkout was paid. Try again in a minute.")
+        }
+    }
 }
 
 // Stripe's events (`billing::webhook`)
@@ -207,6 +241,9 @@ fn apply(
         app.db.record(&team_event(&by, "billing.customer_linked", &team.id, json!({ "customer": cus, "via": "subscription", "eventId": event_id })));
     }
     let details = json!({ "eventId": event_id, "type": kind, "subscription": sub.id, "status": row.status, "price": row.price_id, "tier": row.tier, "quantity": row.quantity });
+    if !matches!(applied, Applied::OtherUser | Applied::CustomerOfAnotherUser) {
+        app.db.close_team_checkout_for(&team.id, sub.id);
+    }
     let outcome = match applied {
         Applied::Duplicate => {
             // As for a person's: a resize the first delivery didn't get to ask for is asked for now.
@@ -252,7 +289,7 @@ pub(crate) fn checkout_completed(app: &App, event_id: &str, kind: &str, o: &Valu
     let Some(team) = app.db.team(&id) else {
         return Some(ignore("unknown_team", None, json!({ "session": session, "team": id })));
     };
-    app.db.close_team_checkout(&team.id, session);
+    app.db.team_checkout_paid(&team.id, session, o["subscription"].as_str().or(o["subscription"]["id"].as_str()));
     let Some(cus) = billing::customer_of(o) else {
         return Some(ignore("no_customer", Some(&team.id), json!({ "session": session })));
     };
@@ -426,18 +463,21 @@ pub async fn checkout(State(app): State<AppState>, Extension(a): Extension<Arc<A
         return bad(StatusCode::BAD_REQUEST, format!("The {} plan can't be bought here.", tier.label));
     };
     let event = |outcome: Outcome, d: Value| team_event(&by, "billing.checkout_created", &t.id, d).outcome(outcome);
+    if !billing::may_start(co, &u.id) {
+        return bad(StatusCode::TOO_MANY_REQUESTS, "Too many checkouts at once. Try again in a minute.".into());
+    }
+    let Some(seats) = app.team_seats.get() else { return billing::off() };
+    let _one_at_a_time = seats.hold(&t.id).await;
+    if app.db.team(&t.id).is_none() {
+        return bad(StatusCode::NOT_FOUND, "You aren't on a team.".into());
+    }
     if let Some(s) = app.db.team_paying(&t.id) {
         app.db.record(&event(Outcome::Denied, json!({ "tier": tier.name, "reason": "already_subscribed", "subscription": s.subscription_id })));
         return reply(StatusCode::CONFLICT, json!({ "error": "The team already pays for a plan. Change it under Manage billing.", "portal": true }));
     }
-    if !billing::may_start(co, &u.id) {
-        return bad(StatusCode::TOO_MANY_REQUESTS, "Too many checkouts at once. Try again in a minute.".into());
-    }
     let payer = Payer::Team(&t.id);
-    let lock = co.lock(&payer.key());
-    let _one_at_a_time = lock.lock().await;
     let last = payer.open_checkout(&app);
-    match billing::close_last(&app, co, payer).await {
+    match billing::close_last(&app, &co.stripe, payer).await {
         Last::Closed => {}
         Last::Paid => {
             app.db.record(&event(Outcome::Denied, json!({ "tier": tier.name, "reason": "checkout_completed", "session": last })));

@@ -482,9 +482,7 @@ pub async fn leave_mine(State(app): State<AppState>, Extension(c): Extension<Cal
     if m.role == OWNER && others && owners(&app, &t.id) == 1 {
         return Err(conflict("You're the team's only owner. Make someone else an owner first."));
     }
-    if !others {
-        crate::team_billing::may_delete(&app, &by, &t.id, "last_member_left")?;
-    }
+    let _billing = if others { None } else { crate::team_billing::may_delete(&app, &by, &t.id, "last_member_left").await? };
     if !leave(&app, &by, &t.id, &u.id, "left").await {
         return Err(conflict("You're the team's only owner. Make someone else an owner first."));
     }
@@ -791,7 +789,7 @@ pub async fn update(State(app): State<AppState>, Extension(by): Extension<Who>, 
 /// `DELETE /api/teams/{id}`: everyone leaves, as if each had, then the team goes.
 pub async fn delete(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     let t = need_team(&app, &id)?;
-    crate::team_billing::may_delete(&app, &by, &t.id, "admin")?;
+    let _billing = crate::team_billing::may_delete(&app, &by, &t.id, "admin").await?;
     for m in app.db.team_members(&t.id) {
         leave(&app, &by, &t.id, &m.user_id, "team_deleted").await;
     }
@@ -833,9 +831,7 @@ pub async fn delete_member(State(app): State<AppState>, Extension(by): Extension
     if m.role == OWNER && others && owners(&app, &t.id) == 1 {
         return Err(conflict("They're the team's only owner. Make someone else an owner first, or delete the team."));
     }
-    if !others {
-        crate::team_billing::may_delete(&app, &by, &t.id, "last_member_removed")?;
-    }
+    let _billing = if others { None } else { crate::team_billing::may_delete(&app, &by, &t.id, "last_member_removed").await? };
     if !leave(&app, &by, &t.id, &u.id, "removed").await {
         return Err(conflict("They're the team's only owner. Make someone else an owner first, or delete the team."));
     }

@@ -398,6 +398,15 @@ impl App {
         self.tiers().of(team.or_else(|| self.db.user(user_id).and_then(|u| u.tier)).as_deref())
     }
 
+    /// The Stripe customer a user's tokens are metered to: their team's while it pays
+    /// for their plan (ADR 0093), else their own.
+    pub fn meter_customer(&self, user_id: &str) -> Option<String> {
+        match self.db.team_plan_of(user_id) {
+            Some(t) => self.db.team_customer(&t.team_id),
+            None => self.db.customer_of(user_id),
+        }
+    }
+
     /// What only admins see of a Bot: the model it's set to and the route it runs on.
     pub fn bot_admin_fields(&self, b: &Bot, v: &mut Value) {
         v["model"] = json!(b.model);
@@ -1949,7 +1958,7 @@ impl App {
         }
         let at = crate::db::now();
         let total = models.iter().map(Usage::total).fold(0u64, u64::saturating_add);
-        let meter = self.meter.get().is_some() && self.db.customer_of(&bot.owner_id).is_some();
+        let meter = self.meter.get().and_then(|_| self.meter_customer(&bot.owner_id));
         let row = |u: Usage, reported: bool| TokenRow {
             user_id: bot.owner_id.clone(),
             bot_id: bot.id.clone(),
@@ -1957,7 +1966,7 @@ impl App {
             message_id: Some(msg.id),
             harness: bot.harness.clone(),
             reported,
-            meter: meter && reported && u.total() > 0,
+            meter: meter.clone().filter(|_| reported && u.total() > 0),
             model: u.model,
             input: u.input,
             output: u.output,

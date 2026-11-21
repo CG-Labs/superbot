@@ -711,16 +711,16 @@ impl Payer<'_> {
 
 /// Expires the payer's open checkout page, if any, so it can't be paid as well as the
 /// next. Stripe refuses to expire a page that isn't open; then its status says why.
-pub(crate) async fn close_last(app: &App, co: &Checkout, payer: Payer<'_>) -> Last {
+pub(crate) async fn close_last(app: &App, stripe: &Stripe, payer: Payer<'_>) -> Last {
     let Some(id) = payer.open_checkout(app) else { return Last::Closed };
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         payer.close_checkout(app, &id);
         return Last::Closed;
     }
     let key = stripe::idempotency_key("expire", &payer.key(), &[("session".into(), id.clone())], crate::db::now());
-    let status = match co.stripe.post(&format!("/v1/checkout/sessions/{id}/expire"), &[], &key).await {
+    let status = match stripe.post(&format!("/v1/checkout/sessions/{id}/expire"), &[], &key).await {
         Ok(v) => v["status"].as_str().map(String::from),
-        Err(stripe::Error::Refused { status, .. }) if status < 500 => match co.stripe.get(&format!("/v1/checkout/sessions/{id}")).await {
+        Err(stripe::Error::Refused { status, .. }) if status < 500 => match stripe.get(&format!("/v1/checkout/sessions/{id}")).await {
             Ok(v) => v["status"].as_str().map(String::from),
             Err(stripe::Error::Refused { status: 404, .. }) => Some("expired".into()),
             Err(e) => return Last::Unknown(e),
@@ -790,7 +790,7 @@ pub async fn checkout(State(app): State<AppState>, Extension(a): Extension<Arc<A
     let lock = co.lock(&u.id);
     let _one_at_a_time = lock.lock().await;
     let last = app.db.open_checkout(&u.id);
-    match close_last(&app, co, Payer::User(&u.id)).await {
+    match close_last(&app, &co.stripe, Payer::User(&u.id)).await {
         Last::Closed => {}
         Last::Paid => {
             app.db.record(&event(Outcome::Denied, json!({ "tier": tier.name, "reason": "checkout_completed", "session": last })));
@@ -888,7 +888,7 @@ pub async fn send_meter_events(app: &App, m: &Meter) -> usize {
             let details = json!({ "runId": row.run_id, "usage": row.tokens, "attempts": row.attempts + 1, "error": why });
             app.db.record(&system(Some(&row.user_id)).event("billing.meter_failed").target("user", &row.user_id).outcome(Outcome::Failure).details(details));
         };
-        let Some(customer) = app.db.customer_of(&row.user_id) else {
+        let Some(customer) = row.customer.clone().or_else(|| app.db.customer_of(&row.user_id)) else {
             failed("no Stripe customer".into());
             continue;
         };

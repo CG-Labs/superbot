@@ -301,7 +301,8 @@ With checkout on ([ADR 0042](adr/0042-billing-checkout-portal-customers.md)), a 
 - **Everyone's plan**: while the team pays, each member's tier, limits, machine size and billing period are the team plan's, over any tier of their own. Joining moves the newcomer onto it and leaving moves them back, each audited as `user.tier_changed` (source `team`) with a resize request. A member can't buy a personal plan meanwhile (409, `teamPays`).
 - **Seats**: one per member (at least one), set on the subscription item with prorations when people join or leave and checked every minute; failures retry after 1, 4, 16 and 64 minutes, then hourly. Audited as `team.seats_synced` and `team.seats_sync_failed`. A restricted Stripe key needs write access to Subscriptions.
 - **Webhook**: a subscription is the team's when its metadata has `superbot_team_id`, its id is the team's, or it names no user and its customer is the team's; one naming both a user and a team is ignored (`ambiguous_payer`). Plan changes are audited as `team.tier_changed`.
-- **Safety**: the last member can't leave, be removed, or the team be deleted while it pays (409, `team.delete_refused`).
+- **Safety**: the last member can't leave, be removed, or the team be deleted while it pays or its checkout was paid (409, `team.delete_refused`); an unpaid open checkout is expired first. A paid checkout blocks a second until its subscription is recorded.
+- **Meter**: with `STRIPE_METER_EVENT`, a member's tokens go to the team's customer while it pays, fixed when the run is recorded.
 - **See it**: `GET /api/team` adds `billing` (the plan for everyone; status, seats, plans and `portal` for managers); `GET /api/billing` adds `teamPlan`; `GET /api/teams` shows each team's for server admins. The Team screen, the Plan screen and the console's Teams tab use these.
 - **Emails**: ADR 0091's plan and payment emails for a team plan go to its owners and admins, linking to `/app/team`.
 

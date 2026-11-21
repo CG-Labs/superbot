@@ -395,3 +395,70 @@ async fn server_admins_see_each_teams_plan_and_seats() {
     let bea = usage["users"].as_array().unwrap().iter().find(|u| u["user"]["id"] == w.b_id.as_str()).unwrap().clone();
     assert_eq!((bea["plan"]["name"].as_str(), &bea["tier"], bea["plan"]["usage"]["periodSource"].as_str()), (Some("pro"), &Value::Null, Some("subscription")), "{bea}");
 }
+
+#[tokio::test]
+async fn a_paid_checkout_holds_the_team_until_its_subscription_arrives() {
+    let (w, stripe, alpha) = shop().await;
+    let port = w.port;
+    assert_eq!(json_call(port, "DELETE", &format!("/api/teams/{alpha}/members/{}", w.b_id), &w.admin, "").await.0, 200);
+
+    // Ada, alone on Alpha, pays a checkout and tries to leave before Stripe's events: refused.
+    assert_eq!(json_call(port, "POST", "/api/team/billing/checkout", &w.a, r#"{"tier":"pro"}"#).await.0, 200);
+    stripe.pay("cs_test_1");
+    let (code, v) = json_call(port, "POST", "/api/team/leave", &w.a, "").await;
+    assert_eq!(code, 409, "{v}");
+    let refused = audit(port, &w.admin, "action=team.delete_refused").await;
+    assert_eq!((refused[0]["details"]["reason"].as_str(), refused[0]["details"]["via"].as_str()), (Some("checkout_completed"), Some("last_member_left")), "{}", refused[0]);
+    assert_eq!(json_call(port, "DELETE", &format!("/api/teams/{alpha}"), &w.admin, "").await.0, 409);
+    assert!(w.app.db.team(&alpha).is_some());
+
+    // The checkout completes, its subscription not yet seen: no second checkout opens.
+    let done = event(CHECKOUT_DONE, "", "evt_h1", 1_795_000_000, |v| {
+        let o = &mut v["data"]["object"];
+        o["id"] = json!("cs_test_1");
+        o["customer"] = json!("cus_test_alpha");
+        o["subscription"] = json!("sub_test_alpha");
+        o["client_reference_id"] = Value::Null;
+        o["metadata"] = json!({ "superbot_team_id": alpha, "superbot_paid_by": w.a_id });
+    });
+    assert_eq!(deliver(port, &done, None).await.1["outcome"], "customer_linked");
+    let (code, v) = json_call(port, "POST", "/api/team/billing/checkout", &w.a, r#"{"tier":"starter"}"#).await;
+    assert_eq!(code, 409, "{v}");
+    assert_eq!(audit(port, &w.admin, "action=billing.checkout_created&outcome=denied").await[0]["details"]["reason"], "checkout_completed");
+    assert_eq!(stripe.seen().iter().filter(|s| s.path == "/v1/checkout/sessions").count(), 1);
+
+    // Its subscription arrives but never pays: the checkout is done with, and a new one may open.
+    let lapsed = team_event(&alpha, "evt_h2", 1_795_000_100, |v| v["data"]["object"]["status"] = json!("incomplete_expired"));
+    deliver(port, &lapsed, None).await;
+    assert_eq!(w.app.db.team_open_checkout(&alpha), None);
+    assert_eq!(json_call(port, "POST", "/api/team/billing/checkout", &w.a, r#"{"tier":"pro"}"#).await.0, 200);
+
+    // Leaving with an unpaid checkout open expires it first, then the team goes.
+    let open = w.app.db.team_open_checkout(&alpha).unwrap();
+    let (code, v) = json_call(port, "POST", "/api/team/leave", &w.a, "").await;
+    assert_eq!(code, 200, "{v}");
+    assert!(stripe.seen().iter().any(|s| s.path == format!("/v1/checkout/sessions/{open}/expire")));
+    assert!(w.app.db.team(&alpha).is_none());
+}
+
+#[tokio::test]
+async fn a_team_members_tokens_are_metered_to_the_team() {
+    use crate::usage_http_tests::{fake_claude_tokens, go};
+    let (url, _stripe) = fake_stripe().await;
+    let w = world_with(Some(Billing::with_metering(SECRET, KEY, &url, PUBLIC, "superbot_tokens"))).await;
+    let alpha = team(&w, "Alpha").await;
+    // Ada has a customer of her own; Bea none.
+    w.app.db.link_customer("evt_c1", "checkout.session.completed", &w.a_id, "stripe", "cus_test_ada", "checkout").unwrap();
+    assert_eq!((w.app.meter_customer(&w.a_id).as_deref(), w.app.meter_customer(&w.b_id)), (Some("cus_test_ada"), None));
+    assert_eq!(deliver(w.port, &team_event(&alpha, "evt_m1", 1_795_000_000, |_| {}), None).await.1["outcome"], "tier_changed");
+    assert_eq!((w.app.meter_customer(&w.a_id).as_deref(), w.app.meter_customer(&w.b_id).as_deref()), (Some("cus_test_alpha"), Some("cus_test_alpha")));
+
+    // Each run's tokens are queued for whoever pays when it ends, and stay theirs.
+    fake_claude_tokens(&w.app, 1000);
+    let hers = w.app.db.create_bot_owned("Hers", "#fff", "waddle", "claude", None, false, &w.b_id, crate::acl::Visibility::Private);
+    go(&w, &w.b, &hers.id).await;
+    let pending = w.app.db.pending_meter(100);
+    assert_eq!(pending.iter().map(|r| r.customer.as_deref()).collect::<Vec<_>>(), [Some("cus_test_alpha")], "{pending:?}");
+    assert_eq!(json_call(w.port, "DELETE", &format!("/api/teams/{alpha}/members/{}", w.b_id), &w.admin, "").await.0, 200);
+    assert_eq!(w.app.db.pending_meter(100)[0].customer.as_deref(), Some("cus_test_alpha"));
+}

@@ -551,7 +551,7 @@ impl FakeStripe {
     pub fn reply(&self, status: u16, body: Value) {
         self.replies.lock().unwrap().push_back((status, body));
     }
-    fn pay(&self, session: &str) {
+    pub(crate) fn pay(&self, session: &str) {
         self.paid.lock().unwrap().insert(session.into());
     }
     fn created(&self) -> Vec<Seen> {

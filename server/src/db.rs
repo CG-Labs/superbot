@@ -180,8 +180,9 @@ pub struct TokenRow {
     pub cache_read: u64,
     pub cache_write: u64,
     pub at: i64,
-    /// Queue it for Stripe's meter.
-    pub meter: bool,
+    /// Queue it for Stripe's meter, for this customer: whoever pays for the owner's plan
+    /// when the run ends (their team's, ADR 0093, or their own).
+    pub meter: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -217,6 +218,8 @@ pub struct MeterRow {
     pub tokens: u64,
     pub at: i64,
     pub attempts: i64,
+    /// Who it's billed to; None for rows from before ADR 0093, sent to the user's own.
+    pub customer: Option<String>,
 }
 
 /// A subscription at a payment provider (ADR 0040). Every one a user has had is kept,
@@ -1474,7 +1477,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 38] = [
 /// Team billing (ADR 0093): a team's own Stripe customer, its subscriptions (kept like
 /// a user's, with the seats Stripe bills and where syncing them stands), and its open
 /// checkout page. Subscriptions outlive a deleted team, so a late event for one is still
-/// placed, and ignored.
+/// placed, and ignored. Token rows also keep the customer they're metered to.
 fn migrate_team_billing(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
     c.execute_batch(
         "CREATE TABLE IF NOT EXISTS team_customers (
@@ -1510,9 +1513,15 @@ fn migrate_team_billing(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS team_checkouts (
           team_id TEXT PRIMARY KEY REFERENCES teams(id) ON DELETE CASCADE,
           session_id TEXT NOT NULL,
-          expires_at INTEGER NOT NULL
+          expires_at INTEGER NOT NULL,
+          subscription_id TEXT
         );",
-    )
+    )?;
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('token_usage') WHERE name = 'meter_customer'", [], |r| r.get(0))?;
+    if has {
+        return Ok(());
+    }
+    c.execute_batch("ALTER TABLE token_usage ADD COLUMN meter_customer TEXT;")
 }
 
 /// Incident notes for the public status page (ADR 0090), written by admins. Each has a
@@ -3737,8 +3746,8 @@ impl Db {
             let n = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
             tx.execute(
                 "INSERT INTO token_usage (user_id, bot_id, run_id, message_id, harness, model, reported,
-                   input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, at, meter_status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                   input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, at, meter_status, meter_customer)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     r.user_id,
                     r.bot_id,
@@ -3752,7 +3761,8 @@ impl Db {
                     n(r.cache_read),
                     n(r.cache_write),
                     r.at,
-                    r.meter.then_some("pending")
+                    r.meter.as_ref().map(|_| "pending"),
+                    r.meter
                 ],
             )?;
         }
@@ -3799,13 +3809,13 @@ impl Db {
     pub fn pending_meter(&self, limit: u32) -> Vec<MeterRow> {
         let c = self.c();
         let Ok(mut st) = c.prepare(
-            "SELECT id, user_id, run_id, input_tokens + output_tokens + cache_read_tokens + cache_write_tokens, at, meter_attempts
+            "SELECT id, user_id, run_id, input_tokens + output_tokens + cache_read_tokens + cache_write_tokens, at, meter_attempts, meter_customer
              FROM token_usage WHERE meter_status = 'pending' ORDER BY id LIMIT ?1",
         ) else {
             return Vec::new();
         };
         st.query_map([limit], |r| {
-            Ok(MeterRow { id: r.get(0)?, user_id: r.get(1)?, run_id: r.get(2)?, tokens: u64::try_from(r.get::<_, i64>(3)?).unwrap_or(0), at: r.get(4)?, attempts: r.get(5)? })
+            Ok(MeterRow { id: r.get(0)?, user_id: r.get(1)?, run_id: r.get(2)?, tokens: u64::try_from(r.get::<_, i64>(3)?).unwrap_or(0), at: r.get(4)?, attempts: r.get(5)?, customer: r.get(6)? })
         })
         .map(|rows| rows.filter_map(Result::ok).collect())
         .unwrap_or_default()
@@ -4110,15 +4120,41 @@ impl Db {
 
     // Team billing (ADR 0093)
 
+    /// The team's last checkout while it may still be paid, or is paid and its
+    /// subscription isn't recorded yet (kept for Stripe's 3 days of webhook retries).
     pub fn team_open_checkout(&self, team_id: &str) -> Option<String> {
         let at = now() / 1000;
-        self.c().query_row("SELECT session_id FROM team_checkouts WHERE team_id = ? AND expires_at > ?", params![team_id, at], |r| r.get(0)).optional().ok().flatten()
+        self.c()
+            .query_row(
+                "SELECT session_id FROM team_checkouts WHERE team_id = ?1 AND (expires_at > ?2 OR (subscription_id IS NOT NULL AND expires_at > ?2 - 3 * 86400))",
+                params![team_id, at],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// A team's checkout went through: keep it until its subscription is recorded, so
+    /// no second checkout opens meanwhile. Forgotten at once if it already is.
+    pub fn team_checkout_paid(&self, team_id: &str, session_id: &str, subscription_id: Option<&str>) {
+        match subscription_id {
+            Some(sub) if self.team_subscription_by_id(sub).is_none() => {
+                let _ = self.c().execute("UPDATE team_checkouts SET subscription_id = ? WHERE team_id = ? AND session_id = ?", params![sub, team_id, session_id]);
+            }
+            _ => self.close_team_checkout(team_id, session_id),
+        }
+    }
+
+    /// The team's paid checkout for `subscription_id` is done with: its subscription is recorded.
+    pub fn close_team_checkout_for(&self, team_id: &str, subscription_id: &str) {
+        let _ = self.c().execute("DELETE FROM team_checkouts WHERE team_id = ? AND subscription_id = ?", params![team_id, subscription_id]);
     }
 
     pub fn set_team_open_checkout(&self, team_id: &str, session_id: &str, expires_at: i64) {
         let _ = self.c().execute(
             "INSERT INTO team_checkouts (team_id, session_id, expires_at) VALUES (?, ?, ?)
-             ON CONFLICT(team_id) DO UPDATE SET session_id = excluded.session_id, expires_at = excluded.expires_at",
+             ON CONFLICT(team_id) DO UPDATE SET session_id = excluded.session_id, expires_at = excluded.expires_at, subscription_id = NULL",
             params![team_id, session_id, expires_at],
         );
     }
