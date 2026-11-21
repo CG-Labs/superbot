@@ -50,7 +50,7 @@ handle @screen {
 }
 ```
 
-Ports are `6800 + SCREEN_BASE + slot`: 6901, 6902, ... by default. voxl checks its own token, so the route needs no extra login.
+Ports are `6800 + SCREEN_BASE + slot`: 6901, 6902, ... by default. botd refuses to start if `SCREEN_BASE` and `MAX_SCREENS` put them outside this route's 6900-6999. voxl checks its own token, so the route needs no extra login.
 
 ## Sizing
 

@@ -14,6 +14,22 @@ use tokio::sync::Mutex;
 
 static LISTEN: OnceLock<IpAddr> = OnceLock::new();
 
+/// The ports the proxy's `/screen/<port>/` route serves (Caddyfiles in deploy/ and docs/computer.md).
+pub const PROXY_PORTS: std::ops::RangeInclusive<u16> = 6900..=6999;
+
+/// Viewer ports outside PROXY_PORTS would hand out links the proxy can't open.
+fn check_ports((first, last): (u16, u16)) -> Result<(), String> {
+    if PROXY_PORTS.contains(&first) && PROXY_PORTS.contains(&last) {
+        return Ok(());
+    }
+    Err(format!(
+        "screen ports {first}-{last} are outside 6900-6999, the proxy's /screen/ route; set SCREEN_BASE between {} and {} (with MAX_SCREENS={}), or SCREENS=off",
+        PROXY_PORTS.start() - 6801,
+        PROXY_PORTS.end() - 6800 - (last - first + 1),
+        last - first + 1
+    ))
+}
+
 /// SCREEN_ADDR: an IP address, or empty for loopback.
 pub(crate) fn parse_listen_addr(s: &str) -> Result<IpAddr, String> {
     match s.trim() {
@@ -151,6 +167,11 @@ impl Screens {
     /// The voxl ports these screens may use, first to last.
     pub fn ports(&self) -> (u16, u16) {
         (6800 + self.base + 1, 6800 + self.base + self.max)
+    }
+
+    /// Errs when the proxy's `/screen/` route can't reach these screens' ports.
+    pub fn check_ports(&self) -> Result<(), String> {
+        check_ports(self.ports())
     }
 
     fn bus_path(&self, n: u16) -> Option<PathBuf> {
@@ -377,6 +398,17 @@ mod tests {
         for bad in ["localhost", "0.0.0.0:6901", "botd", "127.0.0.1 --allowed-hosts"] {
             assert!(parse_listen_addr(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn screen_ports_stay_inside_the_proxy_route() {
+        for ok in [(6901, 6903), (6900, 6999), (6951, 6953)] {
+            assert!(check_ports(ok).is_ok(), "{ok:?}");
+        }
+        for bad in [(6801, 6803), (7001, 7003), (6990, 7002)] {
+            assert!(check_ports(bad).is_err(), "{bad:?}");
+        }
+        assert!(check_ports((7001, 7003)).unwrap_err().contains("between 99 and 196"));
     }
 
     #[test]

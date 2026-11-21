@@ -40,7 +40,7 @@ use zeroize::Zeroizing;
 pub const OFF: &str = "Screens on machines are off. Set MACHINE_SCREENS=on to turn them on.";
 /// botd's loopback ports for machine screens, inside the proxy's `/screen/69xx/` route.
 pub const DEFAULT_PORTS: (u16, u16) = (6960, 6999);
-const PORT_RANGE: std::ops::RangeInclusive<u16> = 6900..=6999;
+const PORT_RANGE: std::ops::RangeInclusive<u16> = crate::screen::PROXY_PORTS;
 /// How long a start may take on the machine: Xvfb, then voxl.
 const START_SECS: u64 = 30;
 
