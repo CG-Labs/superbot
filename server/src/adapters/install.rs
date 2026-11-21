@@ -2,6 +2,8 @@
 //! installer script, pinned to an exact version and, where the source has one, a
 //! checksum. The machine agent installs whatever botd sends and knows none of this.
 //! The Dockerfile and deploy/install.sh install the same CLIs on a server.
+//! The `harness-e2e` workflow tests approvals through exactly these pins
+//! (`deploy/install-harness-clis.sh` reads them from here, ADR 0057), so a bump runs it.
 
 use crate::machines::wire::{Download, HarnessInstall, HarnessPlan, InstallSource, NodeRuntime};
 

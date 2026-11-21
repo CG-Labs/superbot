@@ -2,6 +2,8 @@
 //! Limitation: Codex fixes its instructions when a session starts, so later memory
 //! changes reach it only through its memory file, not the system prompt.
 //! Approvals: an inline PreToolUse hook. Hosted tools such as web search skip hooks.
+//! `codex exec` runs it from 0.141.0 (tested end to end, ADR 0057); older releases
+//! skip it, and the canary stops their runs.
 //! Sandbox (ADR 0055): `workspace-write` with the network on, else none at all.
 
 use super::{output, short, str_of, Adapter, AgentEvent, ModelOption, RunInput, Usage};
