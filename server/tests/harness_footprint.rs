@@ -58,6 +58,9 @@ const TIERS: [(&str, &str, &str, u32, u64, u64, u32); 3] = [
 /// pinned CLIs measure, so they catch a runaway, not a slow runner.
 const MAX_COLD_START: Duration = Duration::from_secs(120);
 const MAX_RUN_PSS_MIB: f64 = 2048.0;
+/// A Bot's own state after its runs. Hermes Bots built a 470 MiB environment each until
+/// they shared the install's (ADR 0072); one that builds its own again breaks this.
+const MAX_BOT_STATE_MIB: f64 = 128.0;
 /// What processes left running `QUIESCE` after a run may use, all together: a stuck
 /// daemon or CLI breaks it, session helpers some CLIs start (12 MiB) don't.
 const MAX_IDLE_MIB: f64 = 128.0;
@@ -582,6 +585,9 @@ fn footprint(harness: &str, s: &Settings) -> (Value, Vec<String>) {
     }
     if per_run_pss > MAX_RUN_PSS_MIB {
         broke.push(format!("a run's peak PSS was {per_run_pss:.0} MiB, over {MAX_RUN_PSS_MIB} MiB"));
+    }
+    if per_bot_disk > MAX_BOT_STATE_MIB {
+        broke.push(format!("a Bot's own state is {per_bot_disk:.0} MiB, over {MAX_BOT_STATE_MIB} MiB"));
     }
     let mut commands: Vec<String> = runs.iter().chain([&together, &again]).flat_map(|m| m.usage.commands.iter().cloned()).collect::<HashSet<_>>().into_iter().collect();
     commands.sort();

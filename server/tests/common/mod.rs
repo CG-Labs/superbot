@@ -578,12 +578,6 @@ pub fn fake_login(harness: &str, home: &Path, port: u16, cmd: &mut Command) {
             cmd.env("PI_OFFLINE", "1").env("PI_SKIP_VERSION_CHECK", "1").env("PI_TELEMETRY", "0");
         }
         "hermes" => {
-            // Each Bot's Hermes builds its runtime from uv's cache; share the installer's.
-            if let Ok(cache) = std::env::var("UV_CACHE_DIR") {
-                cmd.env("UV_CACHE_DIR", cache);
-            } else if let Some(h) = std::env::var_os("HOME") {
-                cmd.env("UV_CACHE_DIR", PathBuf::from(h).join(".cache/uv"));
-            }
             cmd.env("SUPERBOT_HERMES_PROVIDER", "custom").env("SUPERBOT_HERMES_BASE_URL", format!("{base}/v1")).env("OPENAI_API_KEY", KEY);
         }
         h => panic!("no fake login for {h}"),

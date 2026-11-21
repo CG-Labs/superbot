@@ -91,8 +91,6 @@ if [[ -n "$clis" ]]; then
   done <"$clis.paths"
   export PATH
   harnesses=$list
-  # Each Bot's Hermes builds its environment from uv's cache: the installer's.
-  [[ -d "$clis/hermes" ]] && export UV_CACHE_DIR="$clis/hermes/.cache/uv"
 fi
 
 if [[ -z "$harnesses" ]]; then

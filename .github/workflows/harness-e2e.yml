@@ -22,6 +22,8 @@ on:
       - 'server/tests/harness_footprint.rs'
       - 'server/tests/common/**'
       - 'deploy/install-harness-clis.sh'
+      - 'deploy/hermes-shared.sh'
+      - 'deploy/hermes-seal.sh'
       - 'deploy/harness-e2e.sh'
       - 'deploy/harness-footprint.sh'
       - 'Cargo.lock'
@@ -43,6 +45,8 @@ on:
       - 'server/tests/harness_footprint.rs'
       - 'server/tests/common/**'
       - 'deploy/install-harness-clis.sh'
+      - 'deploy/hermes-shared.sh'
+      - 'deploy/hermes-seal.sh'
       - 'deploy/harness-e2e.sh'
       - 'deploy/harness-footprint.sh'
       - 'Cargo.lock'
@@ -111,8 +115,21 @@ jobs:
           set -euo pipefail
           deploy/install-harness-clis.sh "$RUNNER_TEMP/clis" hermes | tee /tmp/install.log
           grep '^/' /tmp/install.log >>"$GITHUB_PATH"
-          # Each Bot's Hermes builds its runtime from uv's cache: the installer's.
-          echo "UV_CACHE_DIR=$RUNNER_TEMP/clis/hermes/.cache/uv" >>"$GITHUB_ENV"
+      - name: Bots share the sealed install, as any OS user (ADR 0072)
+        run: |
+          set -euo pipefail
+          chmod -R go-w,o+rX "$RUNNER_TEMP/clis/hermes"
+          d="$RUNNER_TEMP/clis"
+          while [ "$d" != / ]; do sudo chmod o+x "$d"; d=$(dirname "$d"); done
+          probe=$(mktemp -d) && chmod 0777 "$probe"
+          for _ in 1 2; do
+            sudo -u nobody env -i PATH=/usr/bin:/bin HOME="$probe" HERMES_HOME="$probe/bot" \
+              "$RUNNER_TEMP/clis/hermes/current/.local/bin/hermes" config path
+          done
+          if sudo find "$probe/bot" -path '*/installs/*' \( -name environments -o -name facts.json \) | grep .; then
+            echo "a Bot built its own Hermes environment" >&2; exit 1
+          fi
+          sudo du -sh "$probe/bot"
       - name: Approvals through Hermes Agent
         run: SUPERBOT_E2E_HARNESSES=hermes cargo test --test harness_e2e -- --ignored --nocapture
 
