@@ -131,6 +131,8 @@ botctl approvals | botctl approve <id> [--run | --remember] | botctl deny <id>
 
 Limits: the parser sees commands and the scripts they run, not what compiled programs do inside, and its scan of languages other than shell is a heuristic, so this catches mistakes and prompt injection, not a determined attacker. Bots run as the same OS user as `botd`. See [ADR 0007](adr/0007-approvals.md).
 
+Each harness's hook is tested end to end against its real CLI at the pinned version (`server/tests/harness_e2e.rs`, the `harness-e2e` workflow), with a fake model; `deploy/harness-e2e.sh` runs the same checks with real models on a logged-in server. Codex runs hooks in `codex exec` from 0.141.0 ([ADR 0056](adr/0056-harness-hook-e2e-tests.md)).
+
 ### Harness sandboxes
 
 On top of approvals, the policy's `sandbox` turns on the harness's own sandbox ([ADR 0055](adr/0055-harness-sandbox-defaults.md)). It is separate from the mode, so it holds in `bypass` too.

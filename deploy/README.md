@@ -319,6 +319,17 @@ sudo -u superbot env SUPERBOT_PASSWORD="$(sudo grep -oP '^AUTH_PASSWORD=\K.*' ~s
 
 Or use the switch at the bottom of the web app's Approvals window. Don't put `SUPERBOT_PASSWORD` in `.env`: it's for your shell. See [docs/backend.md](../docs/backend.md#approvals).
 
+## Checking approvals through the harnesses
+
+`deploy/harness-e2e.sh` checks, for each logged-in harness CLI on the server, that its hook really goes through SuperBot's approvals with its real model: an allowed command runs, one a deny rule matches is blocked, and a `git push` to a local test repo waits, then runs once approved or fails once denied. It uses a throwaway botd (temp data, a free loopback port), never the running service, and makes a few short model calls per harness. Run it as the user with the logins, from a checkout:
+
+```sh
+sudo -u superbot -H bash -lc 'cd ~/superbot && deploy/harness-e2e.sh'
+sudo -u superbot -H bash -lc 'cd ~/superbot && deploy/harness-e2e.sh --harness hermes --env-file ~/superbot/.env --model <model>'
+```
+
+It ends with `PASS` or `FAIL` per harness and exits non-zero on any failure. Only harness and provider variables from `--env-file` reach the test's botd. `--fake` runs the CI version with a fake model instead (no login). CI runs that version on every change to the hook path, at the pinned CLI versions; bumping a pin is in [ADR 0056](../docs/adr/0056-harness-hook-e2e-tests.md#pinned-to-what-machines-install).
+
 ## Master key
 
 botd encrypts saved secrets (`botctl secret set`) and approvals' tool input with a master key: `~superbot/.config/superbot/master.key` (mode `0600`, folder `0700`). The installer creates it on first install and on the first `--upgrade` that needs it, before botd restarts, and never replaces it. It is outside `DATA_DIR`, so the daily backups don't include it: **copy it somewhere safe, apart from the backups.** Design and threat model: [ADR 0010](../docs/adr/0010-secrets.md).
