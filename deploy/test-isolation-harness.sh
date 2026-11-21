@@ -87,7 +87,7 @@ case "$prompt" in
     if [ -n "${AUTH_PASSWORD:-}${SUPERBOT_MASTER_KEY:-}" ]; then s=present; else s=absent; fi
     out="$out;server_secrets=$s"
     if [ -n "${BOT_TOKEN:-}" ]; then s=present; else s=absent; fi
-    out="$out;bot_token=$s"
+    out="$out;bot_token=$s;bot_token_bot=${BOT_TOKEN%%.*}"
     out="$out;harness=$harness"
     [ "$harness" != hermes ] || { mkdir -p "$HERMES_HOME" && : >"$HERMES_HOME/gateway.pid"; }
     ;;

@@ -133,6 +133,8 @@ async fn user_bs_run_cannot_reach_user_as_folder_or_logins() {
     }
     assert_eq!(got["server_secrets"], "absent", "{got:?}");
     assert_eq!(got["bot_token"], "present", "{got:?}");
+    assert_eq!(got["bot_token_bot"], format!("sbb_{}", b.id), "the run's token is its own Bot's: {got:?}");
+    assert_eq!(app.run_tokens.live_for(&b.id), 0, "and ended with the run (ADR 0083)");
 
     // B's writes left nothing behind; A's own did.
     let left = |dir: PathBuf, who: &str| dir.join(format!("probe-{who}")).exists();
@@ -227,6 +229,8 @@ async fn pi_and_hermes_runs_cannot_read_botds_files_or_change_their_settings() {
         assert_eq!((got[&format!("write_{k}")].as_str(), got[&format!("replace_{k}")].as_str()), ("denied", "denied"), "{got:?}");
         assert_eq!(got["write_state"], "wrote", "the Bot's own state is the account's: {got:?}");
         assert_eq!((got["server_secrets"].as_str(), got["bot_token"].as_str()), ("absent", "present"), "{got:?}");
+        assert_eq!(got["bot_token_bot"], format!("sbb_{}", bot.id), "{got:?}");
+        assert_eq!(app.run_tokens.live_for(&bot.id), 0, "{harness}: the token ended with the run");
         let m = std::fs::metadata(&botds).unwrap();
         // SAFETY: geteuid can't fail.
         assert_eq!((m.uid(), m.mode() & 0o777), (unsafe { libc::geteuid() }, 0o640), "{}", botds.display());
@@ -349,6 +353,9 @@ async fn a_teammates_run_of_a_shared_bot_is_their_own_account_and_login() {
         assert_eq!(got[k], "denied", "{k}: {got:?}");
     }
     assert_eq!((got["server_secrets"].as_str(), got["bot_token"].as_str()), ("absent", "present"), "{got:?}");
+    let issued = audited(&app, "bot.token_issued");
+    assert!(issued.iter().any(|d| d["forUser"] == bea.as_str()), "her run's token is bound to her: {issued:?}");
+    assert_eq!(audited(&app, "bot.token_revoked").len(), issued.len(), "and every one ended with its run");
     let invoked = audited(&app, "harness.invoked");
     assert!(invoked.iter().any(|d| d["forUser"] == bea.as_str() && d["runAs"] == bea_acct.as_str()), "{invoked:?}");
 

@@ -376,7 +376,7 @@ async fn routed_teammates() -> (World, Arc<Recording>) {
 }
 
 /// Opens the live stream as `auth` and waits for its headers.
-async fn open_stream(port: u16, auth: &str) -> tokio::net::TcpStream {
+pub(crate) async fn open_stream(port: u16, auth: &str) -> tokio::net::TcpStream {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     let req = format!("GET /api/events HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nAuthorization: {auth}\r\n\r\n");
@@ -387,7 +387,7 @@ async fn open_stream(port: u16, auth: &str) -> tokio::net::TcpStream {
     s
 }
 
-async fn closes(mut s: tokio::net::TcpStream) -> bool {
+pub(crate) async fn closes(mut s: tokio::net::TcpStream) -> bool {
     use tokio::io::AsyncReadExt;
     let mut rest = Vec::new();
     tokio::time::timeout(std::time::Duration::from_secs(3), s.read_to_end(&mut rest)).await.is_ok()
@@ -414,7 +414,6 @@ async fn with_teammate_users_a_teammates_run_is_their_own_user_in_their_own_home
     // Ada's own run: as before, the Bots' user in the Bots' home.
     assert_eq!(ada.for_user, None);
     assert!(ada.cwd.starts_with("/home/bots"), "{}", ada.cwd);
-    assert_eq!(isolation::token_for_user(&w.app.cfg.bot_key, &bot_token(ada)), None);
     // Bea's: her own user, nothing in Ada's home, and none of Ada's keys.
     assert_eq!(bea.for_user.as_deref(), Some(w.b_id.as_str()), "the agent runs it as Bea's user");
     assert!(sent.iter().all(|(to, job)| to.machine_id == machine.id && job.owner_id == w.a_id), "still Ada's machine");
@@ -437,22 +436,21 @@ async fn with_teammate_users_a_teammates_run_is_their_own_user_in_their_own_home
     let invoked = events(&w, &format!("action=harness.invoked&bot={}", team.id)).await;
     assert_eq!(invoked.iter().filter(|e| e["details"]["teammateUser"] == theirs.user.as_str()).count(), 2, "{invoked:?}");
 
-    // What Bea's run left behind carries a token bound to her: it works while the Bot's
-    // latest run is hers, and stops once Ada's run takes the Bot back.
+    // Each run's token is its own and bound to Bea for hers (ADR 0083), and what any
+    // run left behind can't act once it ended: not Bea's, and not Ada's either.
+    let issued = events(&w, &format!("action=bot.token_issued&bot={}", team.id)).await;
+    assert_eq!(issued.iter().filter(|e| e["details"]["forUser"] == w.b_id.as_str()).count(), 2, "{issued:?}");
+    assert_eq!(issued.iter().filter(|e| e["details"]["forUser"].is_null()).count(), 1, "{issued:?}");
     let bound = bot_token(&sent[2].1);
-    assert_eq!(isolation::token_for_user(&w.app.cfg.bot_key, &bound), Some(w.b_id.as_str()));
+    assert_ne!(bound, bot_token(&sent[1].1), "each of Bea's runs has its own");
     assert_ne!(bound, bot_token(ada), "not Ada's token");
-    let (code, list) = call(w.port, "GET", "/api/bots", &format!("Bearer {bound}"), "").await;
-    assert_eq!(code, 200, "{list}");
-    let stream = open_stream(w.port, &format!("Bearer {bound}")).await;
-    run(&w, &w.a, &team.id, "mine again").await;
-    assert!(closes(stream).await, "Bea's open stream would otherwise take Ada's access");
-    let (code, _) = call(w.port, "GET", "/api/bots", &format!("Bearer {bound}"), "").await;
-    assert_eq!(code, 401, "Bea's token doesn't get Ada's access back");
+    for t in [&bound, &bot_token(ada)] {
+        let (code, _) = call(w.port, "GET", "/api/bots", &format!("Bearer {t}"), "").await;
+        assert_eq!(code, 401, "a token outlives no run");
+    }
     let failed = events(&w, "action=auth.login_failed").await;
     assert!(failed.iter().any(|e| e["details"]["reason"] == "run_over"), "{failed:?}");
-    let (code, _) = call(w.port, "GET", "/api/bots", &format!("Bearer {}", bot_token(ada)), "").await;
-    assert_eq!(code, 200, "Ada's own token works as before");
+    assert_eq!(events(&w, &format!("action=bot.token_revoked&bot={}", team.id)).await.len(), 3);
 }
 
 #[tokio::test]
@@ -571,5 +569,6 @@ async fn teammate_users_are_off_unless_asked() {
     assert_eq!(sent[0].1.for_user, None, "as ADR 0046 has it");
     assert!(sent[0].1.cwd.starts_with("/home/bots"));
     assert!(link.teammates.lock().unwrap().is_empty());
-    assert_eq!(isolation::token_for_user(&w.app.cfg.bot_key, &bot_token(&sent[0].1)), None);
+    let issued = events(&w, &format!("action=bot.token_issued&bot={}", team.id)).await;
+    assert!(issued.len() == 1 && issued[0]["details"]["forUser"].is_null(), "{issued:?}");
 }

@@ -1,7 +1,8 @@
 //! Per-user isolation on one host (ADR 0029). A user's Bots share that user's folders
 //! and secrets, and nobody else's: `WORKSPACE_DIR/users/<user>` is their working folder,
 //! `DATA_DIR/users/<user>/USER.md` their facts. Each Bot run carries a token only that
-//! Bot has, so a Bot can't claim to be another user's Bot. On managed hosting the same
+//! run has, so a Bot can't claim to be another user's Bot, and nothing a run leaves
+//! behind can act once it ends (ADR 0083). On managed hosting the same
 //! split moves onto the user's own machine (`machines::route`).
 
 use crate::paths;
@@ -20,8 +21,8 @@ const DONE: &str = "per-user 1";
 /// Where an old shared workspace's files wait on their way to the owner's folder.
 const STAGING: &str = ".superbot-owner-files";
 
-fn signed(bot_id: &str, owner_id: &str) -> String {
-    format!("superbot-bot-token/{bot_id}/{owner_id}")
+fn signed(bot_id: &str, token_id: &str) -> String {
+    format!("superbot-run-token/v1/{bot_id}/{token_id}")
 }
 
 fn hex(b: &[u8]) -> String {
@@ -39,58 +40,120 @@ fn plain_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
-/// The token one Bot's runs carry: `sbb_<bot id>.<owner id>.<HMAC-SHA256>`. `key` is
-/// botd's, made fresh at each start, so every token dies with the process that issued
-/// it. The owner is signed in, so a token stops working when the Bot changes hands.
-pub fn bot_token(key: &str, bot_id: &str, owner_id: &str) -> String {
-    let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key.as_bytes()), signed(bot_id, owner_id).as_bytes());
-    format!("{BOT_TOKEN_PREFIX}{bot_id}.{owner_id}.{}", hex(tag.as_ref()))
+/// What botd knows of one live run token (ADR 0083). Only botd holds it: the token
+/// itself names the Bot and this entry's id, nothing it could widen.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunToken {
+    /// Names the entry in the token and the audit log (`jti`), never the secret.
+    pub id: String,
+    pub bot: String,
+    /// The Bot's owner when the run started. A token outlives no change of hands.
+    pub owner: String,
+    pub run: String,
+    /// The teammate a run of a shared Bot is for, in their own account or OS user
+    /// (ADR 0048, 0064): the token acts with no more than their access.
+    pub for_user: Option<String>,
+    pub issued_at: i64,
+    pub expires_at: i64,
 }
 
-fn signed_for(bot_id: &str, owner_id: &str, for_user: &str) -> String {
-    format!("superbot-bot-token/{bot_id}/{owner_id}/for/{for_user}")
+/// Why a Bot token was refused, as `auth.login_failed` gives it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// Forged, mangled, or signed by an earlier start of botd.
+    BadToken,
+    /// Its run is over: revoked when the run ended, or never issued by this start.
+    RunOver,
+    /// Past its expiry, though its run hadn't said it was over.
+    Expired,
 }
 
-/// The token a teammate's run of a shared Bot carries when it runs as the teammate's
-/// own OS user (ADR 0048): `sbb_<bot id>.<owner id>.<teammate id>.<HMAC-SHA256>`. It
-/// works only while the Bot's latest run is that teammate's, so what their run keeps
-/// can't act with the owner's access once the owner runs the Bot again.
-pub fn bot_token_for(key: &str, bot_id: &str, owner_id: &str, for_user: &str) -> String {
-    let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key.as_bytes()), signed_for(bot_id, owner_id, for_user).as_bytes());
-    format!("{BOT_TOKEN_PREFIX}{bot_id}.{owner_id}.{for_user}.{}", hex(tag.as_ref()))
-}
-
-/// The Bot a token was issued to, its owner then, and the teammate it's bound to if
-/// any, if botd issued it with this key. Constant time in the MAC.
-fn parse_token<'a>(key: &str, token: &'a str) -> Option<(&'a str, &'a str, Option<&'a str>)> {
-    let parts: Vec<&str> = token.strip_prefix(BOT_TOKEN_PREFIX)?.split('.').collect();
-    let (id, owner, for_user, tag) = match parts[..] {
-        [id, owner, tag] => (id, owner, None, tag),
-        [id, owner, u, tag] if plain_id(u) => (id, owner, Some(u), tag),
-        _ => return None,
-    };
-    if key.is_empty() || !plain_id(id) || !plain_id(owner) || tag.len() != 64 {
-        return None;
+impl Refused {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Refused::BadToken => "bad_token",
+            Refused::RunOver => "run_over",
+            Refused::Expired => "token_expired",
+        }
     }
-    let tag = unhex(tag)?;
-    let k = hmac::Key::new(hmac::HMAC_SHA256, key.as_bytes());
-    let msg = match for_user {
-        None => signed(id, owner),
-        Some(u) => signed_for(id, owner, u),
-    };
-    hmac::verify(&k, msg.as_bytes(), &tag).ok().map(|_| (id, owner, for_user))
 }
 
-/// The Bot a token was issued to and its owner then, if botd issued it with this key.
-/// Constant time in the MAC. The caller checks the Bot still exists and has that owner,
-/// and, for a token bound to a teammate (`token_for_user`), that its run is still theirs.
-pub fn token_bot<'a>(key: &str, token: &'a str) -> Option<(&'a str, &'a str)> {
-    parse_token(key, token).map(|(id, owner, _)| (id, owner))
+/// Every Bot token botd has issued and not yet revoked (ADR 0083). A run gets one when
+/// it starts and loses it when it ends, however it ends, and each lives no longer than
+/// the run may. Tokens are signed with botd's key, made fresh at each start, so none
+/// outlives the process either.
+pub struct RunTokens {
+    key: hmac::Key,
+    live: std::sync::Mutex<std::collections::HashMap<String, RunToken>>,
 }
 
-/// The teammate a valid token is bound to (`bot_token_for`), if any.
-pub fn token_for_user<'a>(key: &str, token: &'a str) -> Option<&'a str> {
-    parse_token(key, token).and_then(|(_, _, u)| u)
+impl RunTokens {
+    pub fn new(key: &str) -> RunTokens {
+        RunTokens { key: hmac::Key::new(hmac::HMAC_SHA256, key.as_bytes()), live: Default::default() }
+    }
+
+    fn live(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, RunToken>> {
+        self.live.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A new token for one run of `bot`: `sbb_<bot id>.<token id>.<HMAC-SHA256>`, live
+    /// from `now` (Unix ms) for `ttl_ms` or until `revoke`, whichever comes first.
+    pub fn issue(&self, bot: &str, owner: &str, run: &str, for_user: Option<&str>, now: i64, ttl_ms: i64) -> (String, RunToken) {
+        let id = crate::random_hex(16);
+        let tag = hmac::sign(&self.key, signed(bot, &id).as_bytes());
+        let token = format!("{BOT_TOKEN_PREFIX}{bot}.{id}.{}", hex(tag.as_ref()));
+        let entry = RunToken {
+            id: id.clone(),
+            bot: bot.into(),
+            owner: owner.into(),
+            run: run.into(),
+            for_user: for_user.map(String::from),
+            issued_at: now,
+            expires_at: now.saturating_add(ttl_ms.max(0)),
+        };
+        self.live().insert(id, entry.clone());
+        (token, entry)
+    }
+
+    /// The live entry a token was issued as. Constant time in the MAC, which is checked
+    /// before anything is looked up. The caller still checks the Bot exists, has the same
+    /// owner, and that the owner may act.
+    pub fn check(&self, token: &str, now: i64) -> Result<RunToken, Refused> {
+        let (bot, id) = self.verify(token).ok_or(Refused::BadToken)?;
+        let mut live = self.live();
+        let entry = live.get(id).filter(|e| e.bot == bot).cloned().ok_or(Refused::RunOver)?;
+        if now >= entry.expires_at {
+            live.remove(id);
+            return Err(Refused::Expired);
+        }
+        Ok(entry)
+    }
+
+    /// The Bot and token id a token names, if this start of botd signed it.
+    fn verify<'a>(&self, token: &'a str) -> Option<(&'a str, &'a str)> {
+        let parts: Vec<&str> = token.strip_prefix(BOT_TOKEN_PREFIX)?.split('.').collect();
+        let [bot, id, tag] = parts[..] else { return None };
+        if !plain_id(bot) || !plain_id(id) || tag.len() != 64 {
+            return None;
+        }
+        hmac::verify(&self.key, signed(bot, id).as_bytes(), &unhex(tag)?).ok().map(|_| (bot, id))
+    }
+
+    /// Ends a token now. The entry, if it was still live.
+    pub fn revoke(&self, id: &str) -> Option<RunToken> {
+        self.live().remove(id)
+    }
+
+    /// How many of a Bot's tokens are live, expired ones not yet seen included.
+    #[cfg(test)]
+    pub fn live_for(&self, bot: &str) -> usize {
+        self.live().values().filter(|e| e.bot == bot).count()
+    }
+
+    /// Whether a token id is still live at `now`.
+    pub fn is_live(&self, id: &str, now: i64) -> bool {
+        self.live().get(id).is_some_and(|e| now < e.expires_at)
+    }
 }
 
 /// `root/users/<user>`, created. None when the id isn't one plain folder name.
@@ -191,39 +254,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bot_tokens_name_their_bot_and_nothing_else() {
-        let key = crate::random_hex(24);
-        let t = bot_token(&key, "b1", "u1");
-        assert!(t.starts_with("sbb_b1.u1.") && t.len() == "sbb_b1.u1.".len() + 64, "{t}");
-        assert_eq!(token_bot(&key, &t), Some(("b1", "u1")));
-        assert_eq!(token_for_user(&key, &t), None);
-        let bound = bot_token_for(&key, "b1", "u1", "u2");
-        assert_eq!((token_bot(&key, &bound), token_for_user(&key, &bound)), (Some(("b1", "u1")), Some("u2")));
-        assert_ne!(bound, t);
-        let unbound = format!("sbb_b1.u1.{}", bound.rsplit('.').next().unwrap());
-        assert_eq!(token_bot(&key, &unbound), None, "a teammate's binding can't be dropped");
-        let moved = bound.replacen(".u2.", ".u3.", 1);
-        assert_eq!(token_bot(&key, &moved), None, "nor moved to someone else");
-        assert_eq!(bot_token(&key, "b1", "u1"), t, "the same for every run of a Bot until botd restarts");
-        assert_ne!(bot_token(&key, "b1", "u2"), t, "or until it changes hands");
-        assert_eq!(token_bot(&crate::random_hex(24), &t), None, "another start's key");
-        assert_eq!(token_bot("", &t), None);
+    fn run_tokens_name_one_run_of_one_bot_and_end_with_it() {
+        let tokens = RunTokens::new(&crate::random_hex(24));
+        let (t, e) = tokens.issue("b1", "u1", "r1", None, 1_000, 60_000);
+        let id = e.id.clone();
+        assert!(t.starts_with(&format!("sbb_b1.{id}.")) && t.len() == format!("sbb_b1.{id}.").len() + 64, "{t}");
+        assert_eq!(tokens.check(&t, 1_000), Ok(e.clone()));
+        assert_eq!((e.bot.as_str(), e.owner.as_str(), e.run.as_str(), e.for_user.as_deref()), ("b1", "u1", "r1", None));
+
+        let (again, e2) = tokens.issue("b1", "u1", "r2", None, 1_000, 60_000);
+        assert_ne!(again, t, "each run gets its own");
+        assert_ne!(e2.id, id);
+        let (bound, eb) = tokens.issue("b1", "u1", "r3", Some("u2"), 1_000, 60_000);
+        assert_eq!(tokens.check(&bound, 1_000).map(|e| e.for_user), Ok(Some("u2".into())));
+
+        assert_eq!(tokens.revoke(&id).map(|e| e.run), Some("r1".into()));
+        assert_eq!(tokens.check(&t, 1_000), Err(Refused::RunOver), "revoked when its run ends");
+        assert_eq!(tokens.revoke(&id), None);
+        assert!(tokens.check(&again, 1_000).is_ok(), "other runs' tokens are untouched");
+
+        assert_eq!(tokens.check(&again, 61_000), Err(Refused::Expired), "never past its expiry");
+        assert!(!tokens.is_live(&e2.id, 61_000));
+        assert_eq!(tokens.check(&again, 1_000), Err(Refused::RunOver), "and gone once seen expired");
+        tokens.revoke(&eb.id);
+
+        let other = RunTokens::new(&crate::random_hex(24));
+        let (theirs, _) = other.issue("b1", "u1", "r1", None, 1_000, 60_000);
+        assert_eq!(tokens.check(&theirs, 1_000), Err(Refused::BadToken), "another start's key");
+
+        let (t, e) = tokens.issue("b1", "u1", "r4", None, 1_000, 60_000);
         let mac = t.rsplit_once('.').unwrap().1;
+        let (b2, e_b2) = tokens.issue("b2", "u1", "r5", None, 1_000, 60_000);
+        let mac_b2 = b2.rsplit_once('.').unwrap().1;
         for forged in [
-            format!("sbb_b2.u1.{mac}"),
-            format!("sbb_b1.u2.{mac}"),
+            format!("sbb_b2.{}.{mac}", e.id),
+            format!("sbb_b1.{}.{mac_b2}", e_b2.id),
+            format!("sbb_b2.{}.{mac_b2}", e.id),
             format!("sbb_b1.{mac}"),
-            format!("sbb_b1.u1.{}", "0".repeat(64)),
-            format!("sbb_b1.u1.{}", &mac[..62]),
-            format!("sbb_b1.u1.{}x", &mac[..63]),
-            format!("sbb_b1/x.u1.{mac}"),
-            format!("sbb_b1.u1.x.{mac}"),
-            format!("sbb_.u1.{mac}"),
+            format!("sbb_b1.{}.{}", e.id, "0".repeat(64)),
+            format!("sbb_b1.{}.{}", e.id, &mac[..62]),
+            format!("sbb_b1.{}.{}x", e.id, &mac[..63]),
+            format!("sbb_b1/x.{}.{mac}", e.id),
+            format!("sbb_b1.u1.{}.{mac}", e.id),
+            format!("sbb_.{}.{mac}", e.id),
             t.replace("sbb_", "sbx_"),
             t.replace('.', ""),
         ] {
-            assert_eq!(token_bot(&key, &forged), None, "{forged}");
+            assert_eq!(tokens.check(&forged, 1_000), Err(Refused::BadToken), "{forged}");
         }
+        assert!(tokens.check(&t, 1_000).is_ok() && tokens.check(&b2, 1_000).is_ok());
     }
 
     #[test]

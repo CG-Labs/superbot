@@ -35,7 +35,7 @@ impl Role {
 }
 
 /// Who is calling: a signed-in person with a role, or a Bot (`botctl`, with the
-/// per-start BOT_TOKEN that every Bot run can read).
+/// BOT_TOKEN its run gets, live only while that run is, ADR 0083).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Principal {
     User(Role),

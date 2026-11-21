@@ -217,6 +217,8 @@ pub struct Caller {
     /// The teammate a Bot's token is bound to (ADR 0048): it acts only while the Bot's
     /// latest run is still theirs.
     pub bot_for: Option<String>,
+    /// The id of the run token a Bot's request came with (ADR 0083), live only while its run is.
+    pub bot_token: Option<String>,
 }
 
 /// The audit actor: the person, their email and role now, and how this request was
