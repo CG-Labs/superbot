@@ -463,8 +463,9 @@ Each tier's `limits` ([ADR 0040](../docs/adr/0040-billing-v0-tier-limits.md)) ar
 | `dailyRoutineRuns` | Routine runs per day (UTC) | Routine firings are skipped until midnight. The Bot says so once a day. |
 | `machineType` | The Linode plan (`g6-standard-2`, …) for the user's machine | Admins can't request or resize their machine to another size. Without one, `MACHINE_TIERS` decides as before. |
 | `concurrentRuns` | Bot runs at once on the user's machine ([ADR 0073](../docs/adr/0073-concurrent-runs-per-machine.md)) | More runs wait their turn, oldest first; the Bot shows it's queued and can be stopped. Without one, `MAX_CONCURRENT_RUNS` (default 8). Runs on this server share `MAX_CONCURRENT_RUNS` instead. |
+| `maxStorageMb` | Storage for a user's files, in MB (1 MB = 1,000,000 bytes): their folder and what botd keeps for them and their Bots ([ADR 0082](../docs/adr/0082-storage-limits-per-tier.md)) | From 90% the Bot warns once a day. At 100% new messages and runs are refused until files are deleted or the plan grows. A machine's own disk is capped by `machineType`, not this. |
 
-Every refusal is in the audit log (`bot.create_refused`, `routine.run_refused`, `machine.refused`, `bot.run_refused`). `botctl usage` (or `GET /api/usage`, admins) lists each person's use against their limits and flags anyone over, for example after moving to a smaller plan; the client shows the same on each user.
+Every refusal is in the audit log (`bot.create_refused`, `routine.run_refused`, `machine.refused`, `bot.run_refused`, `bot.message_refused`). `botctl usage` (or `GET /api/usage`, admins) lists each person's use against their limits and flags anyone over, for example after moving to a smaller plan; the client shows the same on each user.
 
 ### Stripe (optional)
 

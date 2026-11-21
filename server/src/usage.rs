@@ -149,6 +149,7 @@ pub fn view(app: &App, user_id: &str, models: bool, admin: bool) -> Value {
         "period": p.view(),
         "tokens": tokens,
         "runs": { "used": app.db.runs_used(user_id, &p.key), "limit": tier.limits.monthly_runs },
+        "storage": crate::storage::view(app, user_id),
         "byBot": bots,
     });
     if models {
@@ -170,12 +171,14 @@ pub async fn mine(State(app): State<AppState>, Extension(c): Extension<Caller>) 
     need_user(c.principal)?;
     let id = c.user.as_ref().map_or(crate::users::OPERATOR, |u| u.id.as_str());
     let admin = c.principal == Principal::User(Role::Admin);
+    crate::storage::warm(&app, &[id.to_string()]).await;
     Ok(Json(view(&app, id, admin || !app.tier_of(id).managed(), admin)))
 }
 
 /// `GET /api/users/{key}/usage` (admins): one user's usage this billing period.
 pub async fn of_user(State(app): State<AppState>, Path(key): Path<String>) -> Res {
     let u = need_user_key(&app, &key)?;
+    crate::storage::warm(&app, std::slice::from_ref(&u.id)).await;
     Ok(Json(view(&app, &u.id, true, true)))
 }
 

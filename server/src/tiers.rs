@@ -109,6 +109,10 @@ pub struct Limits {
     /// turn. Unset: `MAX_CONCURRENT_RUNS`. Runs on this server share its own cap instead.
     #[serde(default)]
     pub concurrent_runs: Option<u32>,
+    /// Storage one user's files may take, in MB (10^6 bytes): their folder and what botd
+    /// keeps for them and their Bots (ADR 0082). Past it, new runs are refused. Unset: any.
+    #[serde(default)]
+    pub max_storage_mb: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -383,6 +387,9 @@ impl Tiers {
             }
             if limits.concurrent_runs == Some(0) {
                 return Err(format!("tier \"{name}\": concurrentRuns must be at least 1 (leave it out for the server's default)"));
+            }
+            if limits.max_storage_mb.is_some_and(|m| m == 0 || m > crate::storage::MAX_MB) {
+                return Err(format!("tier \"{name}\": maxStorageMb must be 1 to {} (leave it out for no limit)", crate::storage::MAX_MB));
             }
             let mut prices = Vec::new();
             for p in t.stripe_prices {
@@ -675,6 +682,8 @@ mod tests {
         assert!(bad(&format!(r#"{{"default":"gold","tiers":[{}]}}"#, r#"{"name":"a","routes":"any"}"#)).contains("\"gold\" isn't listed"));
         assert!(bad(&one(r#"{"name":"a","routes":"any","limits":{"machineType":"G6 Standard"}}"#)).contains("machineType"));
         assert!(bad(&one(r#"{"name":"a","routes":"any","limits":{"concurrentRuns":0}}"#)).contains("concurrentRuns must be at least 1"));
+        assert!(bad(&one(r#"{"name":"a","routes":"any","limits":{"maxStorageMb":0}}"#)).contains("maxStorageMb must be 1 to"));
+        assert!(bad(&one(r#"{"name":"a","routes":"any","limits":{"maxStorageMb":1000000000000}}"#)).contains("maxStorageMb must be 1 to"));
         assert!(bad(&one(r#"{"name":"a","routes":"any","stripePrices":["prod_123"]}"#)).contains("isn't a Stripe price id"));
         assert!(bad(&one(r#"{"name":"a","routes":"any","stripePrices":["price_1","price_1"]}"#)).contains("twice"));
         assert!(bad(r#"{"tiers":[{"name":"a","routes":"any","stripePrices":["price_1"]},{"name":"b","routes":"any","stripePrices":["price_1"]}]}"#).contains("twice"));
@@ -698,7 +707,19 @@ mod tests {
         let open = Tiers::self_host();
         let l = &open.default_tier().limits;
         assert_eq!((l.daily_routine_runs, l.machine_type.as_deref(), open.by_stripe_price("price_x").is_none()), (None, None, true));
-        assert_eq!(l.concurrent_runs, None);
+        assert_eq!((l.concurrent_runs, l.max_storage_mb), (None, None));
+    }
+
+    #[test]
+    fn storage_caps_are_per_tier_and_optional() {
+        let raw = r#"{"tiers":[{"name":"small","routes":"any","limits":{"maxStorageMb":500}},{"name":"open","routes":"any"}]}"#;
+        let t = Tiers::parse(raw, None).unwrap();
+        assert_eq!(t.get("small").unwrap().limits.max_storage_mb, Some(500));
+        assert_eq!(t.get("small").unwrap().view()["limits"]["maxStorageMb"], 500);
+        assert_eq!(t.get("open").unwrap().limits.max_storage_mb, None);
+        let shipped = Tiers::parse(include_str!("../../deploy/tiers.example.json"), None).unwrap();
+        let cap = |n: &str| shipped.get(n).unwrap().limits.max_storage_mb;
+        assert_eq!((cap("starter"), cap("pro"), cap("max"), cap("self-host")), (Some(5_000), Some(25_000), Some(100_000), None));
     }
 
     #[test]

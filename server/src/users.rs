@@ -467,12 +467,15 @@ pub fn need_user_key(app: &AppState, key: &str) -> Res<User> {
 pub async fn list_users(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>) -> Json<Value> {
     let ids = app.db.all_identities();
     let codes = app.db.pending_codes(db::now());
-    let list: Vec<Value> = app.db.users().iter().map(|u| admin_view(&a, u, ids.get(&u.id).map_or(&[], Vec::as_slice), codes.get(&u.id))).collect();
+    let users = app.db.users();
+    crate::storage::warm(&app, &users.iter().map(|u| u.id.clone()).collect::<Vec<_>>()).await;
+    let list: Vec<Value> = users.iter().map(|u| admin_view(&a, u, ids.get(&u.id).map_or(&[], Vec::as_slice), codes.get(&u.id))).collect();
     Json(json!(list))
 }
 
 pub async fn get_user(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Path(key): Path<String>) -> Res {
     let u = need_user_key(&app, &key)?;
+    crate::storage::warm(&app, std::slice::from_ref(&u.id)).await;
     Ok(Json(admin_view(&a, &u, &app.db.identities(&u.id), app.db.pending_codes(db::now()).get(&u.id))))
 }
 

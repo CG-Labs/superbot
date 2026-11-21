@@ -13,7 +13,7 @@ use crate::*;
 
 /// A Claude Code stand-in that notes each run's Bot in `dir/order`, waits for
 /// `dir/go-<bot>`, and then replies, or fails if `dir/fail-<bot>` is there.
-fn gated_claude(app: &App, dir: &std::path::Path) {
+pub(crate) fn gated_claude(app: &App, dir: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(dir).unwrap();
     let script = format!(
