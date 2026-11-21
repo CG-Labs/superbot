@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (20 Nov 2026). Part of [#34](https://github.com/CG-Labs/superbot/issues/34) (M3, billing and licensing). Builds on users and RBAC ([ADR 0012](0012-users-sessions-rbac.md)), the audit log ([ADR 0009](0009-audit-events.md)), tiers ([ADR 0033](0033-tiers-model-routing.md)), and the setup wizard ([ADR 0034](0034-onboarding-wizard.md)).
+Accepted (20 Nov 2026); the community edition is replaced by [ADR 0068](0068-no-free-tier.md): there is no free tier, and a server without a license runs only in testing mode. Part of [#34](https://github.com/CG-Labs/superbot/issues/34) (M3, billing and licensing). Builds on users and RBAC ([ADR 0012](0012-users-sessions-rbac.md)), the audit log ([ADR 0009](0009-audit-events.md)), tiers ([ADR 0033](0033-tiers-model-routing.md)), and the setup wizard ([ADR 0034](0034-onboarding-wizard.md)).
 
 0037 is per-user Unix accounts ([ADR 0037](0037-per-user-unix-accounts.md), [PR #94](https://github.com/CG-Labs/superbot/pull/94)), so this is 0038.
 
@@ -48,15 +48,15 @@ In order of precedence: `LICENSE_KEY`, else `LICENSE_KEY_FILE` (both from botd's
 
 | Mode | When | Seats | Features |
 |------|------|-------|----------|
-| `community` | No license | 10 | none |
+| `unlicensed` (was `community`) | No license | 0, or no limit in testing mode ([ADR 0068](0068-no-free-tier.md)) | none |
 | `active` | Valid, not ended | the license's | the license's |
 | `grace` | Ended less than 14 days ago | the license's | the license's |
-| `expired` | Ended longer ago | 10 | none |
-| `invalid` | Set, but not a license this server accepts | 10 | none |
+| `expired` | Ended longer ago | 0 (testing mode: no limit) | none |
+| `invalid` | Set, but not a license this server accepts | 0 (testing mode: no limit) | none |
 
-A license never allows fewer than the community edition's 10. Admins are warned 30 days before it ends, in the console, the wizard, `botctl license`, and botd's start-up log.
+A license allows exactly the seats it names (before [ADR 0068](0068-no-free-tier.md), never fewer than a 10-seat community edition, now removed). Admins are warned 30 days before it ends, in the console, the wizard, `botctl license`, and botd's start-up log.
 
-**Nothing bricks.** botd never refuses to start over a license, and no mode disables a feature that works without one. A bad key is logged at start, shown with its reason, and the server runs as the community edition.
+**Nothing bricks.** botd never refuses to start over a license, and no mode disables a feature that works without one. A bad key is logged at start, shown with its reason, and the server is unlicensed: since [ADR 0068](0068-no-free-tier.md), Bots don't run without a license unless testing mode is on.
 
 ### Seats
 
@@ -66,7 +66,7 @@ Over the limit (a license removed or ended, or seats lowered), nobody is signed 
 
 With per-user Unix accounts on ([ADR 0037](0037-per-user-unix-accounts.md), `ISOLATION=users`), a seat is still a person, not an account: each active user has at most one `sb-u-<id>` account, and making it, or logging a harness in as it, takes no extra seat. A disabled user keeps their account and folders but holds no seat, so botd won't make their account or start a harness login as them (`400`), and their Bots can't run. Re-enabling them needs a seat as usual.
 
-The community limit is the default for a server without a license, including existing ones. That is the point of the license, but it means an upgraded server with more than 10 active people keeps everyone and can't add more until it has a license. The setup wizard's new checklist item, the console, and the start-up log say so.
+Since [ADR 0068](0068-no-free-tier.md) there is no community limit: a server without a license has no seats, and keeps everyone already active but can't add more, until it has a license or testing mode is on. The setup wizard's new checklist item, the console, and the start-up log say so.
 
 ### Audit
 
@@ -83,13 +83,13 @@ The routes fall into the RBAC default arm (admins only, never a Bot) and are lis
 ### Tests
 
 - `license::tests`: a signed license round trips; tampered payloads, another key under a trusted `kid`, unknown keys, `none`/`HS256`/`RS256`, `crit`, missing `kid`, junk and oversized tokens are refused; claims are checked before signing and after verifying; PEM keys round trip; the modes follow the clock (active, warned, grace, expired); bad settings never stop the server.
-- `license_http_tests.rs`: install and remove (admins only, file mode `0600`, key never returned, audited, read back on restart); invalid, tampered, foreign, unknown-key, and expired keys refused and audited; the seat limit on admin create and re-enable, sign-up approval, SCIM create and re-activation, and SSO just-in-time sign-up; the community limit and nobody locked out after a removal; grace from the environment (and the API refusing to change it); status changes audited once.
+- `license_http_tests.rs`: install and remove (admins only, file mode `0600`, key never returned, audited, read back on restart); invalid, tampered, foreign, unknown-key, and expired keys refused and audited; the seat limit on admin create and re-enable, sign-up approval, SCIM create and re-activation, and SSO just-in-time sign-up; no seats and nobody locked out after a removal (ADR 0068); grace from the environment (and the API refusing to change it); status changes audited once.
 - `superbot-license` tests: keygen, sign, and verify round trip; bad arguments refused; keys never overwritten.
 - CI: the installer's `--license-file` (dry run, refusal of a bad file, the real write as the service user).
 
 ## Consequences
 
-- CG-Labs must run `superbot-license keygen` offline, keep the private key safe, and commit its public half to `TRUSTED` before selling a license. Until then, release builds trust no keys and every server is the community edition.
+- CG-Labs must run `superbot-license keygen` offline, keep the private key safe, and commit its public half to `TRUSTED` before selling a license. Until then, release builds trust no keys, so every server is unlicensed and test servers run in testing mode ([ADR 0068](0068-no-free-tier.md)).
 - Seat limits are honest-user enforcement: the source is open, so anyone can build botd without them. The license is for organisations that want a supported, licensed install, not DRM.
-- The community limit applies to existing servers on upgrade. Nobody loses access, but large unlicensed installs can't add people until they have a license.
+- Superseded by [ADR 0068](0068-no-free-tier.md): unlicensed servers get no seats and no Bot runs unless testing mode is on. Nobody is signed out.
 - Paid modules can gate themselves on `features` later without a new license format.

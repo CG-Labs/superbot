@@ -548,9 +548,14 @@ $("notify-test").addEventListener("click", async () => {
   }
 });
 
-// The license (ADR 0038). botd checks the key; once saved it's never sent back.
+// The license (ADR 0038). botd checks the key; once saved it's never sent back. There is
+// no free tier (ADR 0068): no license means testing mode, or Bots don't run.
 
-const LICENSE_MODES = { community: "Community edition", active: "Licensed", grace: "Grace period", expired: "Ended", invalid: "Invalid key" };
+const LICENSE_MODES = { unlicensed: "No license", active: "Licensed", grace: "Grace period", expired: "Ended", invalid: "Invalid key" };
+
+function licenseMode(l) {
+  return l.testing ? "Testing mode" : LICENSE_MODES[l.mode] || l.mode;
+}
 
 function licenseView(l) {
   const lic = l.license;
@@ -567,7 +572,9 @@ function licenseView(l) {
         ${l.source === "file" ? '<button type="button" class="btn" data-act="license-remove">Remove</button>' : ""}
       </form>`
     : `<p class="hint">Set by <code>LICENSE_KEY</code> or <code>LICENSE_KEY_FILE</code> in botd's environment, which wins. To change it, edit .env and restart botd.</p>`;
-  return verdict(l.ok && !warnings.length, `${LICENSE_MODES[l.mode] || l.mode}. ${l.detail}`)
+  const billing = l.billing && !l.billing.enabled ? `<p class="warn" data-billing-off>${esc(l.billing.detail)}</p>` : "";
+  return verdict(l.ok && !warnings.length, `${licenseMode(l)}. ${l.detail}`)
+    + billing
     + facts
     + `<p class="hint">${esc(seats)} Active people other than the owner account take a seat; over the limit, nobody is signed out, but nobody new can be added.</p>`
     + warnings.map((w) => `<p class="warn">${esc(w)}</p>`).join("")
@@ -592,7 +599,7 @@ async function installLicense(form) {
 }
 
 async function removeLicense() {
-  if (!confirm("Remove the license? The server becomes the community edition, free for up to 10 active people. Nobody is signed out.")) return;
+  if (!confirm("Remove the license? SuperBot has no free tier: unless testing mode is on, Bots stop running and nobody new can be added. Nobody is signed out.")) return;
   try {
     await api("DELETE", "/api/license");
     notice("License removed.", false);
@@ -973,12 +980,12 @@ function setupTiers(t) {
     </tr>`).join("");
   return verdict(true, t.detail)
     + `<table class="grid"><thead><tr><th>Plan</th><th>Harnesses and models</th><th>Limits</th></tr></thead><tbody>${rows}</tbody></table>`
-    + `<h2>${t.fileLoaded ? "Change the plans" : "Sell plans or set limits"}</h2><p class="hint">botd reads the tiers file at startup. Skip this to keep the open self-host tier.</p>`
+    + `<h2>${t.fileLoaded ? "Change the plans" : "Sell plans or set limits"}</h2><p class="hint">botd reads the tiers file at startup. Skip this to keep the built-in self-host tier your license covers.</p>`
     + howto(t.instructions);
 }
 
 function setupLicense(l) {
-  return `<h2>License</h2><p class="hint">Without one, SuperBot is the community edition: every feature, for up to ${esc(l.seats.community)} active people. A license from CG-Labs sets your seats.</p>`
+  return `<h2>License</h2><p class="hint">SuperBot has no free tier. A license from CG-Labs sets your plan and seats. Without one, Bots don't run unless the operator turns on testing mode (<code>TESTING_MODE=on</code>), where billing is off.</p>`
     + licenseView(l)
     + howto(l.instructions);
 }

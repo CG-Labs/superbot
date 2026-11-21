@@ -3,6 +3,7 @@ import { act, render, screen, userEvent } from "@testing-library/react-native";
 import { CONFIRM_EVERY_MS, PlanView } from "../PlanView";
 import PlanScreen from "../../app/plan";
 import { ApiError } from "../../src/api";
+import { BILLING_OFF } from "../../src/billing";
 import type { BillingView, MyUsage } from "../../src/types";
 
 const mockCtx: Record<string, unknown> = {};
@@ -147,14 +148,16 @@ describe("PlanView (ADR 0042)", () => {
 
   it("shows usage on a server without billing", async () => {
     await render(<PlanView api={fakeApi(null, usage)} onBack={jest.fn()} />);
-    expect(await screen.findByText("Billing isn't set up on this server.")).toBeOnTheScreen();
+    expect(await screen.findByText(BILLING_OFF)).toBeOnTheScreen();
     expect(screen.getByText("Usage this period")).toBeOnTheScreen();
   });
 
-  it("says so on a server without billing", async () => {
+  it("says plainly that billing is off during testing", async () => {
     await render(<PlanView api={fakeApi(null)} onBack={jest.fn()} />);
-    expect(await screen.findByText("Billing isn't set up on this server.")).toBeOnTheScreen();
+    expect(await screen.findByText(BILLING_OFF)).toBeOnTheScreen();
+    expect(BILLING_OFF).toMatch(/^Billing is off during testing\. Nothing is charged/);
     expect(screen.queryByText("Plans")).toBeNull();
+    expect(screen.queryByText(/Upgrade to/)).toBeNull();
   });
 });
 

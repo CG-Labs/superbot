@@ -1,6 +1,6 @@
 //! Billing v0: Stripe subscriptions set each user's tier (ADR 0040), and people buy and
-//! manage them through Stripe's own pages (ADR 0042). Off unless `STRIPE_WEBHOOK_SECRET`
-//! is set; then Stripe's signed webhook at `/billing/stripe/webhook` is the only way a
+//! manage them through Stripe's own pages (ADR 0042). Off unless `BILLING=on` and
+//! `STRIPE_WEBHOOK_SECRET` are both set, and never in testing mode (ADR 0068); then Stripe's signed webhook at `/billing/stripe/webhook` is the only way a
 //! tier changes. With `STRIPE_SECRET_KEY` too, botd also asks Stripe for a Checkout
 //! Session (`POST /api/billing/checkout`) and a Billing Portal session
 //! (`POST /api/billing/portal`) and hands back their links; it creates nothing else at
@@ -37,7 +37,11 @@ pub const USER_KEY: &str = "superbot_user_id";
 pub const RETURN_PATH: &str = "/app/plan";
 /// Checkout and portal sessions one person may start a minute.
 const STARTS_PER_MINUTE: u32 = 10;
-const OFF: &str = "Billing isn't set up on this server.";
+const OFF: &str = "Billing is off while SuperBot is in testing: nothing is charged.";
+/// What people see while billing is off: we are in testing, so nothing calls Stripe.
+pub const OFF_DETAIL: &str = "Billing is off during testing: SuperBot makes no Stripe calls and charges nothing.";
+/// Stripe settings that do nothing while billing is off.
+const STRIPE_VARS: [&str; 3] = ["STRIPE_WEBHOOK_SECRET", "STRIPE_SECRET_KEY", "STRIPE_METER_EVENT"];
 /// How long a checkout page stays payable, in minutes past the current one. Stripe's
 /// shortest is 30 minutes from creation; whole minutes keep a retried request identical.
 const CHECKOUT_MINUTES: i64 = 31;
@@ -86,7 +90,33 @@ pub struct Checkout {
     busy: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
+/// `BILLING`: off unless set to on/1/true/yes.
+pub fn billing_flag(raw: &str) -> Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Ok(true),
+        "" | "0" | "false" | "off" | "no" => Ok(false),
+        _ => Err(format!("BILLING must be on or off, not \"{raw}\"")),
+    }
+}
+
 impl Billing {
+    /// Billing as configured: off (no Stripe client at all) unless `BILLING=on`, which
+    /// testing mode refuses. Also returns a warning when Stripe settings are present but
+    /// ignored, so an operator isn't surprised either way.
+    pub fn configured(store: &dyn SecretStore, var: &dyn Fn(&str) -> String, testing: bool) -> Result<(Billing, Option<String>), String> {
+        let on = billing_flag(&var("BILLING"))?;
+        if on && testing {
+            return Err("BILLING=on can't be used with TESTING_MODE=on: testing mode keeps billing off. Unset one of them".into());
+        }
+        if on {
+            return Billing::from_env(store, var).map(|b| (b, None));
+        }
+        // Only whether each is set: a secret (or its _FILE) is never read while billing is off.
+        let set: Vec<&str> = STRIPE_VARS.into_iter().filter(|k| [k.to_string(), format!("{k}_FILE")].iter().any(|n| !var(n).trim().is_empty())).collect();
+        let warning = (!set.is_empty()).then(|| format!("{} set, but billing is off (BILLING isn't on), so they're ignored and nothing calls Stripe.", set.join(", ")));
+        Ok((Billing::default(), warning))
+    }
+
     /// `STRIPE_WEBHOOK_SECRET` and `STRIPE_SECRET_KEY` (or their `_FILE`s), and for
     /// checkout, the public address from `var` (see `public_url`).
     pub fn from_env(store: &dyn SecretStore, var: &dyn Fn(&str) -> String) -> Result<Billing, String> {
@@ -147,6 +177,14 @@ impl Billing {
     pub fn checkout_enabled(&self) -> bool {
         self.checkout.is_some()
     }
+
+    /// Whether billing is on, in words people can read (ADR 0068).
+    pub fn status(&self) -> Value {
+        match self.enabled() {
+            true => json!({ "enabled": true, "checkout": self.checkout_enabled(), "detail": "Billing is on: Stripe subscriptions set people's plans." }),
+            false => json!({ "enabled": false, "checkout": false, "detail": OFF_DETAIL }),
+        }
+    }
 }
 
 impl Checkout {
@@ -198,7 +236,7 @@ pub fn meter_event(raw: &str) -> Result<Option<String>, String> {
 /// What startup prints. Takes only whether each part is on, so nothing secret can reach the log.
 pub fn describe(enabled: bool, checkout: bool, metering: bool, tiers: &crate::tiers::Tiers) -> String {
     if !enabled {
-        return "off (set STRIPE_WEBHOOK_SECRET to take Stripe subscriptions)".into();
+        return "off during testing: no Stripe calls and no charges (BILLING=on and STRIPE_WEBHOOK_SECRET turn it on)".into();
     }
     let pages = match metering {
         true => "; reporting run tokens to a Stripe meter",
@@ -816,6 +854,55 @@ mod tests {
         assert_eq!(verify(SECRET, &format!("t=soon,v1={v1}"), body, now), Err("bad_timestamp"));
         assert_eq!(verify(SECRET, &format!("t={now},v1=zz"), body, now), Err("no_signature"));
         assert_eq!(verify(SECRET, &format!("t={now},v1={}", &v1[..62]), body, now), Err("no_signature"));
+    }
+
+    /// A store that fails the test if anything reads a secret from it.
+    struct NeverRead;
+    impl SecretStore for NeverRead {
+        fn kind(&self) -> &'static str {
+            "never-read"
+        }
+        fn get(&self, _: &str) -> Result<Option<crate::secrets::Secret>, crate::secrets::Error> {
+            panic!("billing is off, yet a secret was read");
+        }
+        fn names(&self) -> Result<Vec<String>, crate::secrets::Error> {
+            panic!("billing is off, yet the store was listed");
+        }
+    }
+
+    #[test]
+    fn billing_is_off_unless_turned_on_and_never_in_testing_mode() {
+        use crate::secrets::env::EnvStore;
+        let vars = |billing: &'static str| {
+            move |k: &str| match k {
+                "BILLING" => billing.to_string(),
+                "STRIPE_WEBHOOK_SECRET" => SECRET.to_string(),
+                _ => String::new(),
+            }
+        };
+        let stripe = EnvStore::fixed(&[("STRIPE_WEBHOOK_SECRET", SECRET)]);
+        // Off by default, even with Stripe settings present: no Stripe client, and a warning.
+        let (b, warn) = Billing::configured(&NeverRead, &|_: &str| String::new(), false).unwrap();
+        assert!(!b.enabled() && warn.is_none());
+        let (b, warn) = Billing::configured(&NeverRead, &vars(""), false).unwrap();
+        assert!(!b.enabled() && !b.checkout_enabled() && b.meter().is_none());
+        let warn = warn.unwrap();
+        assert!(warn.contains("STRIPE_WEBHOOK_SECRET") && warn.contains("nothing calls Stripe") && !warn.contains(SECRET), "{warn}");
+        assert_eq!(b.status()["enabled"], json!(false));
+        assert_eq!(b.status()["detail"], json!(OFF_DETAIL));
+        // A secret given as a _FILE counts as set, and still isn't read.
+        let file = |k: &str| if k == "STRIPE_SECRET_KEY_FILE" { "/run/secrets/stripe".to_string() } else { String::new() };
+        assert!(Billing::configured(&NeverRead, &file, false).unwrap().1.unwrap().contains("STRIPE_SECRET_KEY"));
+        // Testing mode keeps it off, and refuses BILLING=on outright.
+        let (b, _) = Billing::configured(&NeverRead, &vars("off"), true).unwrap();
+        assert!(!b.enabled());
+        assert!(Billing::configured(&stripe, &vars("on"), true).err().unwrap().contains("TESTING_MODE"));
+        // Only BILLING=on, outside testing, reads the Stripe settings.
+        let (b, warn) = Billing::configured(&stripe, &vars("on"), false).unwrap();
+        assert!(b.enabled() && warn.is_none());
+        assert_eq!(b.status()["enabled"], json!(true));
+        assert!(Billing::configured(&stripe, &vars("maybe"), false).err().unwrap().contains("BILLING"));
+        assert!(describe(false, false, false, &crate::tiers::Tiers::default()).starts_with("off during testing"));
     }
 
     #[test]

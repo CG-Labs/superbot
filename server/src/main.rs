@@ -195,7 +195,9 @@ async fn main() {
     let resume_routines = handover::resume_on_enable(&env("ROUTINES_ON_ENABLE", "")).unwrap_or_else(|e| exit(e));
     let scim = scim::Scim::from_env(&env("SCIM", ""), &env("SCIM_DEFAULT_ROLE", "")).unwrap_or_else(|e| exit(format!("SCIM: {e}")));
     let tiers = tiers::Tiers::from_env(|k| env(k, "")).unwrap_or_else(|e| exit(format!("Tiers: {e}")));
-    let payments = billing::Billing::from_env(&secrets::env::EnvStore::process(), &|k| env(k, "")).unwrap_or_else(|e| exit(format!("Billing: {e}")));
+    let testing = license::testing_flag(&env("TESTING_MODE", "")).unwrap_or_else(|e| exit(e));
+    let (payments, ignored_stripe) =
+        billing::Billing::configured(&secrets::env::EnvStore::process(), &|k| env(k, ""), testing).unwrap_or_else(|e| exit(format!("Billing: {e}")));
     let notifier = notify::Notifier::from_env(&|k| env(k, "")).unwrap_or_else(|e| exit(format!("Notifications: {e}")));
     let allow_no_auth = auth_startup(&host, &password, break_glass);
     secrets::redact::register(&password);
@@ -332,11 +334,18 @@ async fn main() {
         eprintln!("WARNING: some users have tier \"{t}\", which TIERS_FILE no longer lists. They get the default tier ({}) until an admin picks another.", app.tiers().default_tier().name);
     }
     secrets::redact::register(env("LICENSE_KEY", "").trim());
+    app.license.set_testing(testing);
     app.license.load(|k| env(k, ""));
     let license = app.license.status();
     println!("License: {}", license.detail());
     for w in license.warnings(app.db.active_seats()).into_iter().filter(|w| *w != license.detail()) {
         eprintln!("WARNING: {w}");
+    }
+    if !license.usable() {
+        eprintln!("WARNING: {}", license.detail());
+    }
+    if license.testing() {
+        eprintln!("WARNING: testing mode is on (TESTING_MODE). No license, billing off; not for production.");
     }
 
     // Each user's Bots work in that user's folders (ADR 0029). Files from before were
@@ -386,6 +395,9 @@ async fn main() {
     println!("Notifications: {}.", notifier.describe(&notifications));
     let notify_summary = json!({ "email": notifier.smtp.is_some() && notifications.email.enabled, "webhook": notifications.webhook.enabled, "bots": notifications.bots.len() });
     let _ = app.notifier.set(Arc::new(notifier));
+    if let Some(w) = &ignored_stripe {
+        eprintln!("WARNING: {w}");
+    }
     println!("Billing: {}.", billing::describe(auth_state.payments.enabled(), auth_state.payments.checkout_enabled(), app.meter.get().is_some(), app.tiers()));
     match auth_state.scim.enabled {
         true => println!("SCIM: on at /scim/v2; new users get the {} role.", auth_state.scim.default_role.as_str()),
@@ -3198,6 +3210,7 @@ mod tests {
             sandbox_host: sandbox::Host { namespaces: true, programs: sandbox::PROGRAMS.map(String::from).into() },
             home: None,
         }, None);
+        app.license.set_testing(true);
         users::ensure_operator(&app.db, "Owner", None);
         let bot = app.db.create_bot("Tester", "#f5f5f5", "waddle", "claude", None, true);
         let router = Router::new()

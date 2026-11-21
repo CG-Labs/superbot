@@ -1,8 +1,10 @@
 //! The self-host license (ADR 0038) end to end: installing, refusing, and the seats it
-//! allows on every way a person is added, on the real router.
+//! allows on every way a person is added, on the real router. There is no free tier
+//! (ADR 0068): without a license nobody is added and Bots don't run, unless the operator
+//! turned on testing mode. Test servers start in testing mode, as the dogfood server runs.
 
 use crate::license::test_keys::{claims, mint, stranger, KID};
-use crate::license::{token, Mode, COMMUNITY_SEATS};
+use crate::license::{token, Mode};
 use crate::rbac::Role;
 use crate::sso_http_tests::{failures, header, mock_oidc, provider_vars, serve_vars, web_sign_in};
 use crate::tests::{audit_list, call, call_with, serve_app, serve_app_with};
@@ -43,10 +45,15 @@ async fn add(port: u16, admin: &str, email: &str) -> (u16, Value) {
 async fn admins_install_and_remove_a_license_and_never_see_the_key_again() {
     let (port, app, admin, _) = serve_app().await;
     let (_, member) = user_with(port, &admin, "m@example.com", "member").await;
+    app.license.set_testing(false);
     let fresh = license(port, &admin).await;
-    assert_eq!((fresh["mode"].as_str(), fresh["licensed"].as_bool(), fresh["edition"].as_str()), (Some("community"), Some(false), Some("community")));
-    assert_eq!((fresh["seats"]["limit"].as_u64(), fresh["seats"]["used"].as_u64()), (Some(COMMUNITY_SEATS as u64), Some(1)));
-    assert!(fresh["detail"].as_str().unwrap().contains("Every feature works"), "{fresh}");
+    assert_eq!((fresh["mode"].as_str(), fresh["licensed"].as_bool(), fresh["edition"].as_str()), (Some("unlicensed"), Some(false), Some("none")));
+    assert_eq!((fresh["testing"].as_bool(), fresh["usable"].as_bool(), fresh["ok"].as_bool()), (Some(false), Some(false), Some(false)));
+    assert_eq!((fresh["seats"]["limit"].as_u64(), fresh["seats"]["used"].as_u64()), (Some(0), Some(1)));
+    assert!(fresh["detail"].as_str().unwrap().contains("no free tier"), "{fresh}");
+    assert!(fresh["seats"].get("community").is_none(), "{fresh}");
+    assert_eq!(fresh["billing"]["enabled"], json!(false));
+    assert!(fresh["billing"]["detail"].as_str().unwrap().contains("off during testing"), "{fresh}");
     for (m, body) in [("GET", ""), ("PUT", r#"{"key":"x"}"#), ("DELETE", "")] {
         assert_eq!(call(port, m, "/api/license", &member, body).await.0, 403, "{m}");
     }
@@ -78,7 +85,7 @@ async fn admins_install_and_remove_a_license_and_never_see_the_key_again() {
     assert_eq!(again.status().mode, Mode::Active);
 
     let (code, body) = call(port, "DELETE", "/api/license", &admin, "").await;
-    assert_eq!((code, parse(&body)["mode"].as_str()), (200, Some("community")), "{body}");
+    assert_eq!((code, parse(&body)["mode"].as_str(), parse(&body)["usable"].as_bool()), (200, Some("unlicensed"), Some(false)), "{body}");
     assert!(!path.exists());
     let ev = &events(port, &admin, "license.removed").await[0];
     assert_eq!((ev["targetId"].as_str(), ev["details"]["from"]["licensee"].as_str()), (Some(c.jti.as_str()), Some("Acme Ltd")));
@@ -185,33 +192,62 @@ async fn per_user_accounts_take_no_seat_and_disabled_people_get_none() {
 }
 
 #[tokio::test]
-async fn without_a_license_the_community_edition_allows_ten_and_locks_nobody_out() {
+async fn without_a_license_or_testing_mode_nobody_is_added_and_nobody_is_locked_out() {
     let (port, app, admin, _) = serve_app().await;
-    fill(&app, COMMUNITY_SEATS);
+    let (_, ten) = user_with(port, &admin, "ten@example.com", "member").await;
+    app.license.set_testing(false);
+    // No free tier: not one seat, and a clear way out.
     let (code, v) = add(port, &admin, "eleven@example.com").await;
     assert_eq!(code, 403, "{v}");
-    assert!(v["error"].as_str().unwrap().contains("without a license, SuperBot is free for up to 10 active users"), "{v}");
-
-    // A license for more lifts the limit; removing it brings the limit back but signs nobody out.
-    assert_eq!(install(port, &admin, &mint(&claims(Some(15), 100))).await.0, 200);
-    let (_, eleven) = user_with(port, &admin, "eleven@example.com", "member").await;
-    fill(&app, 15);
-    assert_eq!(call(port, "DELETE", "/api/license", &admin, "").await.0, 200);
+    let msg = v["error"].as_str().unwrap();
+    assert!(msg.contains("no license, and SuperBot has no free tier") && msg.contains("TESTING_MODE"), "{msg}");
     let v = license(port, &admin).await;
-    assert_eq!((v["seats"]["used"].as_u64(), v["seats"]["limit"].as_u64(), v["seats"]["available"].as_u64()), (Some(15), Some(10), Some(0)));
-    assert!(v["warnings"][0].as_str().unwrap().contains("15 people are active, over the 10 seats allowed. Nobody is locked out"), "{v}");
-    assert_eq!(call(port, "GET", "/api/auth/me", &eleven, "").await.0, 200, "still signed in");
-    assert_eq!(app.db.active_seats(), 15, "nobody was disabled");
-    assert_eq!(add(port, &admin, "sixteen@example.com").await.0, 403);
+    assert_eq!((v["seats"]["used"].as_u64(), v["seats"]["limit"].as_u64(), v["seats"]["available"].as_u64()), (Some(1), Some(0), Some(0)));
+    assert!(v["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("no free tier")), "{v}");
+    // Nobody already here is signed out or disabled, and the owner account still works.
+    assert_eq!(call(port, "GET", "/api/auth/me", &ten, "").await.0, 200, "still signed in");
+    assert_eq!(call(port, "GET", "/api/auth/me", &admin, "").await.0, 200);
+    assert_eq!(app.db.active_seats(), 1);
     // The wizard says so.
     let s = parse(&call(port, "GET", "/api/setup", &admin, "").await.1);
     let item = s["checklist"].as_array().unwrap().iter().find(|i| i["id"] == "license").unwrap().clone();
     assert_eq!(item["done"], false, "{item}");
+
+    // A license sets the seats; testing mode, turned on by the operator, lifts the limit.
+    assert_eq!(install(port, &admin, &mint(&claims(Some(15), 100))).await.0, 200);
+    assert_eq!(add(port, &admin, "eleven@example.com").await.0, 201);
+    assert_eq!(call(port, "DELETE", "/api/license", &admin, "").await.0, 200);
+    assert_eq!(add(port, &admin, "twelve@example.com").await.0, 403);
+    app.license.set_testing(true);
+    let v = license(port, &admin).await;
+    assert_eq!((v["mode"].as_str(), v["edition"].as_str(), v["testing"].as_bool(), v["seats"]["limit"].as_u64()), (Some("unlicensed"), Some("testing"), Some(true), None));
+    assert!(v["detail"].as_str().unwrap().contains("billing is off"), "{v}");
+    assert_eq!(add(port, &admin, "twelve@example.com").await.0, 201);
+    let s = parse(&call(port, "GET", "/api/setup", &admin, "").await.1);
+    let item = s["checklist"].as_array().unwrap().iter().find(|i| i["id"] == "license").unwrap().clone();
+    assert_eq!(item["done"], true, "{item}");
 }
 
 #[tokio::test]
-async fn an_ended_license_keeps_its_seats_through_the_grace_period_then_becomes_community() {
+async fn bots_dont_run_without_a_license_or_testing_mode() {
+    let w = crate::billing_http_tests::world(false).await;
+    let bot = w.app.db.create_bot_owned("Mine", "#fff", "waddle", "claude", None, false, &w.a_id, crate::acl::Visibility::Private);
+    // Testing mode: runs, on the user's tier.
+    assert!(crate::tiers_http_tests::run(w.port, &w.app, &w.a, &bot.id).await.starts_with("model="));
+    w.app.license.set_testing(false);
+    let said = crate::tiers_http_tests::run(w.port, &w.app, &w.a, &bot.id).await;
+    assert!(said.contains("no SuperBot license") && said.contains("no free tier"), "{said}");
+    let refused = crate::billing_http_tests::audit(w.port, &w.admin, &format!("action=bot.run_refused&bot={}", bot.id)).await;
+    assert_eq!(refused[0]["details"]["reason"], "unlicensed", "{refused:?}");
+    // A license makes it run again.
+    assert_eq!(install(w.port, &w.admin, &mint(&claims(None, 100))).await.0, 200);
+    assert!(crate::tiers_http_tests::run(w.port, &w.app, &w.a, &bot.id).await.starts_with("model="));
+}
+
+#[tokio::test]
+async fn an_ended_license_keeps_its_seats_through_the_grace_period_then_allows_nobody_new() {
     let (port, app, admin, _) = serve_app().await;
+    app.license.set_testing(false);
     let c = claims(Some(30), -3);
     let key = mint(&c);
     // Set in the environment, which wins: the API can't change it.
@@ -228,20 +264,21 @@ async fn an_ended_license_keeps_its_seats_through_the_grace_period_then_becomes_
     assert_eq!(events(port, &admin, "license.refused").await[0]["details"]["reason"].as_str(), Some("set_in_env"));
     assert_eq!(call(port, "DELETE", "/api/license", &admin, "").await.0, 409);
 
-    // Past the grace period: the community edition. Nobody is locked out; nobody new gets in.
+    // Past the grace period: no free fallback. Nobody is locked out; nobody new gets in.
     let gone = app.license.status_at(c.exp * 1000 + (crate::license::GRACE_DAYS + 1) * 86_400_000);
-    assert_eq!((gone.mode, gone.seat_cap(), gone.licensed()), (Mode::Expired, Some(COMMUNITY_SEATS), false));
+    assert_eq!((gone.mode, gone.seat_cap(), gone.licensed(), gone.usable()), (Mode::Expired, Some(0), false, false));
     let ended = mint(&claims(Some(30), -(crate::license::GRACE_DAYS + 1)));
     app.license.load(|k| if k == "LICENSE_KEY" { ended.clone() } else { String::new() });
     let v = license(port, &admin).await;
-    assert_eq!((v["mode"].as_str(), v["edition"].as_str(), v["seats"]["limit"].as_u64()), (Some("expired"), Some("community"), Some(10)));
-    assert!(app.db.active_seats() > 10);
+    assert_eq!((v["mode"].as_str(), v["edition"].as_str(), v["seats"]["limit"].as_u64()), (Some("expired"), Some("none"), Some(0)));
+    assert!(app.db.active_seats() > 10, "nobody was disabled");
     assert_eq!(add(port, &admin, "late@example.com").await.0, 403);
 }
 
 #[tokio::test]
 async fn changes_nobody_made_through_the_api_are_logged_once() {
     let (port, app, admin, _) = serve_app().await;
+    app.license.set_testing(false);
     app.license.observe(&app.db);
     assert!(events(port, &admin, "license.status_changed").await.is_empty(), "a server that never had a license logs nothing");
     let c = claims(Some(30), -3);
@@ -269,10 +306,10 @@ async fn approving_a_sign_up_needs_a_seat() {
     assert_eq!(code, 202, "{body}");
     let (_, list) = call(port, "GET", "/api/signups?status=pending", &admin, "").await;
     let id = parse(&list)[0]["id"].as_str().unwrap().to_string();
-    fill(&app, COMMUNITY_SEATS);
+    app.license.set_testing(false);
     let (code, body) = call(port, "POST", &format!("/api/signups/{id}/approve"), &admin, "").await;
     assert_eq!(code, 403, "{body}");
-    assert!(body.contains("No seats left"), "{body}");
+    assert!(body.contains("No seats"), "{body}");
     assert_eq!(app.db.signup(&id).unwrap().status, "pending", "still waiting");
     assert!(app.db.find_user("ada@example.com").is_none());
     let ev = &events(port, &admin, "license.seat_refused").await[0];
@@ -294,10 +331,10 @@ async fn scim_creates_and_re_activations_need_a_seat_but_inactive_people_dont() 
                 "emails": [{ "primary": true, "value": format!("{n}@example.com") }] })
         .to_string()
     };
-    fill(&app, COMMUNITY_SEATS);
+    app.license.set_testing(false);
     let (code, body) = call(port, "POST", "/scim/v2/Users", &bearer, &person("ada", true)).await;
     assert_eq!(code, 403, "{body}");
-    assert!(parse(&body)["detail"].as_str().unwrap().contains("No seats left"), "{body}");
+    assert!(parse(&body)["detail"].as_str().unwrap().contains("No seats"), "{body}");
     assert!(app.db.find_user("ada@example.com").is_none());
     assert_eq!(events(port, &admin, "license.seat_refused").await[0]["details"]["via"].as_str(), Some("scim"));
     // Provisioned inactive: no seat needed, until they're turned on.
@@ -320,7 +357,7 @@ async fn just_in_time_sso_sign_up_needs_a_seat() {
     let id = format!("g{}", random_hex(4));
     let vars = provider_vars(&id, "google", &idp.issuer, &idp.secret, &[("HOSTED_DOMAINS", "example.com"), ("JIT_ROLE", "member")]);
     let (port, app, admin) = serve_vars(vars.into_iter().chain([("SSO_PROVIDERS".into(), id.clone())]).collect()).await;
-    fill(&app, COMMUNITY_SEATS);
+    app.license.set_testing(false);
     let (code, head) = web_sign_in(port, &id).await;
     assert_eq!((code, header(&head, "location").as_deref()), (303, Some("/login?error=sso_no_seat")));
     assert!(app.db.find_user("ada@example.com").is_none());

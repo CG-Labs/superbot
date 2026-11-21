@@ -2,6 +2,9 @@ import { Linking, Platform } from "react-native";
 import type { SuperBotApi } from "./api";
 import type { BillingView, TierView } from "./types";
 
+/** What the Plan screen says while billing is off: SuperBot is in testing (ADR 0068). */
+export const BILLING_OFF = "Billing is off during testing. Nothing is charged, and no payment details are taken.";
+
 /** Whether this server sells plans, so the app shows its Plan screen (ADR 0042). */
 export async function billingAvailable(api: Pick<SuperBotApi, "billing">): Promise<boolean> {
   try {

@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (20 Nov 2026). First slice of [#31](https://github.com/CG-Labs/superbot/issues/31) (M3, billing v0). Builds on tiers ([ADR 0033](0033-tiers-model-routing.md)), the control plane ([ADR 0025](0025-control-plane-linode.md), [ADR 0035](0035-machine-firewall-auto-enroll.md)), the audit log ([ADR 0009](0009-audit-events.md)), and the self-host license ([ADR 0038](0038-self-host-license-key.md)).
+Accepted (20 Nov 2026); since [ADR 0068](0068-no-free-tier.md), billing also needs `BILLING=on` and is never on in testing mode. First slice of [#31](https://github.com/CG-Labs/superbot/issues/31) (M3, billing v0). Builds on tiers ([ADR 0033](0033-tiers-model-routing.md)), the control plane ([ADR 0025](0025-control-plane-linode.md), [ADR 0035](0035-machine-firewall-auto-enroll.md)), the audit log ([ADR 0009](0009-audit-events.md)), and the self-host license ([ADR 0038](0038-self-host-license-key.md)).
 
 0039 is machine harnesses and agent upgrades ([PR #97](https://github.com/CG-Labs/superbot/pull/97)), so this is 0040.
 

@@ -1522,6 +1522,10 @@ impl App {
             }
             None
         };
+        let license = self.license.status();
+        if !license.usable() {
+            return refused("unlicensed", license.run_refusal(), None, None);
+        }
         let route = match tier.route(&bot.harness, bot.model.as_deref(), bot.effort.as_deref()) {
             Ok(r) => r,
             Err(e) => return refused("tier_harness", format!("{e} Switch me to one of those in my settings."), None, None),
@@ -1981,7 +1985,8 @@ pub fn test_app() -> Arc<App> {
     let db = Db::open(&dir.join("app.sqlite")).unwrap();
     let workspace = dir.join("ws");
     std::fs::create_dir_all(&workspace).unwrap();
-    App::new(
+    // Tests run as the dogfood server does: testing mode on (ADR 0068).
+    let app = App::new(
         db,
         Config {
             data_dir: dir.clone(),
@@ -1996,7 +2001,9 @@ pub fn test_app() -> Arc<App> {
             home: Some(dir.join("home")),
         },
         None,
-    )
+    );
+    app.license.set_testing(true);
+    app
 }
 
 /// Splits off a trailing ```question {json}``` block.

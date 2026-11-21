@@ -70,7 +70,7 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl setup done | reopen | hide | show         Finish the setup wizard, reopen it, or hide it from admins
   botctl license [json]                            The self-host license, its seats, and when it ends
   botctl license install [<file> | -] < key        Install the license key CG-Labs sent (stdin by default)
-  botctl license remove                            Back to the community edition (10 active people)
+  botctl license remove                            Remove it (no free tier: Bots stop unless TESTING_MODE=on)
   botctl user code <user> [--ttl <minutes>]        A one-time sign-in code (default 60 minutes)
   botctl user identities <user>                    The user's SSO identities
   botctl user link <user> <provider> <subject> [--tenant <tenant-id>]
