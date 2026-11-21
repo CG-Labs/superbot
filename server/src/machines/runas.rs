@@ -55,11 +55,18 @@ pub fn lookup(name: &str) -> Option<(Ids, std::path::PathBuf)> {
 
 /// The user this process runs as, by name: tests stand it in for the Bots' user.
 pub fn current_user() -> Option<String> {
-    // SAFETY: getpwuid returns static storage or null; it's read at once.
-    unsafe {
-        let pw = libc::getpwuid(libc::geteuid());
-        (!pw.is_null()).then(|| CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned())
+    // getpwuid's static storage is shared by every thread, so another lookup can change
+    // the name while it's read; the _r form reads into a buffer of our own.
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 16 << 10];
+    let mut out: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer is valid for the call; the result points into `buf`.
+    let r = unsafe { libc::getpwuid_r(libc::geteuid(), &mut pw, buf.as_mut_ptr(), buf.len(), &mut out) };
+    if r != 0 || out.is_null() {
+        return None;
     }
+    // SAFETY: getpwuid_r succeeded, so pw_name is a C string in `buf`.
+    Some(unsafe { CStr::from_ptr(pw.pw_name) }.to_string_lossy().into_owned())
 }
 
 pub fn is_root() -> bool {
