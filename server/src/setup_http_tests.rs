@@ -173,6 +173,8 @@ async fn a_tiers_file_and_bypass_show_up() {
     let t = &s["tiers"];
     assert_eq!((t["fileLoaded"].as_bool(), t["default"].as_str(), t["managed"].as_bool()), (Some(true), Some("starter"), Some(true)));
     assert_eq!(t["tiers"].as_array().map(Vec::len), Some(3));
+    let new_bots: Vec<&str> = t["tiers"].as_array().unwrap().iter().map(|x| x["newBots"].as_str().unwrap()).collect();
+    assert_eq!(new_bots, ["claude", "claude", "claude"], "starter's and pro's first routes, and DEFAULT_HARNESS on self-host (ADR 0079)");
     assert!(!t.to_string().contains("claude-haiku"), "the wizard names plans, not their models");
     assert_eq!((s["approvals"]["mode"].as_str(), check(&s, "approvals")["done"].as_bool()), (Some("bypass"), Some(false)));
 }

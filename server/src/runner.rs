@@ -354,6 +354,23 @@ impl App {
         self.state().get(bot_id).is_some_and(|s| s.run.is_some())
     }
 
+    /// Running, or with work queued or waiting for a slot: a run already holds its settings.
+    pub fn is_busy(&self, bot_id: &str) -> bool {
+        self.state().contains_key(bot_id)
+    }
+
+    /// Runs `f` only if the Bot is idle, holding its queue so no work can start (and read
+    /// the Bot's settings) until `f` returns. `f` must not touch the runner. None: busy.
+    pub fn while_idle<T>(&self, bot_id: &str, f: impl FnOnce() -> T) -> Option<T> {
+        let st = self.state();
+        if st.contains_key(bot_id) {
+            return None;
+        }
+        let out = f();
+        drop(st);
+        Some(out)
+    }
+
     pub fn send(&self, v: Value) {
         let bot = ["/botId", "/bot/id", "/message/botId", "/approval/botId"].iter().find_map(|p| v.pointer(p).and_then(Value::as_str));
         let owner = bot.and_then(|b| self.db.bot_owner(b));
@@ -814,6 +831,9 @@ impl App {
         }
         if let (Some(u), Some(iso)) = (teammate, self.isolation()) {
             self.in_teammate_space(&mut spot, iso, &bot, u);
+        }
+        if self.missing_here(&bot, msg, &by, &period.key, &spot, bin) {
+            return;
         }
         if self.hooks_refused(&bot, msg, &by, &period.key, &spot, run_as.as_ref()).await {
             return;
@@ -1284,6 +1304,27 @@ impl App {
         });
         self.db.record(&e.details(detail));
         Some(Place::There(Box::new((to, layout, user))))
+    }
+
+    /// Whether a run on this server is refused because its harness isn't installed here,
+    /// as a machine refuses one (`harness_missing`, ADR 0079): it is given back and
+    /// audited, nothing starts, and the Bot says how to fix it.
+    fn missing_here(&self, bot: &Bot, msg: &Message, by: &Who, period: &str, spot: &Spot, bin: &str) -> bool {
+        let path = spot.env.get("PATH").cloned().unwrap_or_default();
+        if spot.machine.is_some() || adapters::version::resolve(bin, &path, &spot.cwd).is_some() {
+            return false;
+        }
+        self.give_back(bot, msg, period);
+        let tier = self.tier_of(&bot.owner_id);
+        let e = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied);
+        self.db.record(&e.details(json!({
+            "reason": "harness_missing", "harness": bot.harness, "host": "server", "tier": tier.name,
+            "owner": bot.owner_id, "forUser": spot.for_other, "messageId": msg.id,
+        })));
+        let switch = if tier.harnesses().is_none_or(|h| h.len() > 1) { ", or switch me to another harness" } else { "" };
+        let hint = adapters::install::server_hint(bin);
+        self.say(&bot.id, &format!("I didn't run: {bin} isn't installed on this server. Ask an admin to install it ({hint}){switch}."), true);
+        true
     }
 
     /// Whether a guarded run is refused because its harness, where the run happens, is

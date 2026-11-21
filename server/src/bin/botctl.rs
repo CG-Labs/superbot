@@ -48,6 +48,9 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    --resume turns their paused routines back on
   botctl user tier <user> <tier|default>           Their plan: the models and limits they get
   botctl tiers                                     Every tier, its routes and limits, and the default
+  botctl tiers move-bots <tier> [--user <user>] [--dry-run]
+                                                   Move a managed tier's Bots (or one user's) that run on
+                                                   another harness onto the tier's default; --dry-run lists them
   botctl usage [json]                              Everyone's plan, use against its limits, machine size,
                                                    and subscription (admins)
   botctl usage me [json]                           Your own model tokens and runs this billing period
@@ -590,6 +593,19 @@ fn flag<'a>(rest: &[&'a str], name: &str) -> Option<&'a str> {
     rest.windows(2).find(|w| w[0] == name).map(|w| w[1])
 }
 
+/// `botctl tiers move-bots <tier> [--user <user>] [--dry-run]` (ADR 0079): the path and body.
+fn move_bots_request(args: &[&str]) -> Result<(String, String), String> {
+    const USE: &str = "usage: botctl tiers move-bots <tier> [--user <user>] [--dry-run]";
+    let (tier, rest) = args.split_first().filter(|(t, _)| !t.starts_with("--")).ok_or(USE)?;
+    let user = flag(rest, "--user");
+    let known = rest.iter().enumerate().all(|(i, a)| *a == "--dry-run" || *a == "--user" || (i > 0 && rest[i - 1] == "--user"));
+    if !known || (rest.contains(&"--user") && user.is_none_or(|u| u.starts_with("--"))) {
+        return Err(USE.into());
+    }
+    let body = json!({ "user": user, "dryRun": rest.contains(&"--dry-run") });
+    Ok((format!("/api/tiers/{}/move-bots", encode(tier)), body.to_string()))
+}
+
 /// `botctl bot ...`: who owns and can see a Bot (ADR 0017). The request to send.
 fn bot_access(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
     let access = |bot: &str| format!("/api/bots/{}/access", encode(bot));
@@ -1097,6 +1113,10 @@ fn run(args: &[String]) -> Result<String, String> {
             op(method, &path, None)
         }
         ["tiers"] => op("GET", "/api/tiers", None),
+        ["tiers", "move-bots", rest @ ..] => {
+            let (path, body) = move_bots_request(rest)?;
+            op("POST", &path, Some(body))
+        }
         ["usage"] => Ok(usage_summary(&serde_json::from_str(&api(Cred::Operator, "GET", "/api/usage", None)?).map_err(|e| e.to_string())?)),
         ["usage", "json"] => op("GET", "/api/usage", None),
         ["usage", "me"] => Ok(period_summary(&serde_json::from_str(&op("GET", "/api/me/usage", None)?).map_err(|e| e.to_string())?)),
@@ -1221,6 +1241,18 @@ mod tests {
         assert!(handover_request("u1", &[]).is_err());
         assert!(handover_request("u1", &["--resume"]).is_err());
         assert!(handover_request("u1", &["u2", "u3"]).is_err());
+    }
+
+    #[test]
+    fn move_bots_names_the_tier_and_maybe_one_user() {
+        let parse = |a: &[&str]| move_bots_request(a).map(|(p, b)| (p, serde_json::from_str::<Value>(&b).unwrap()));
+        assert_eq!(parse(&["pro"]).unwrap(), ("/api/tiers/pro/move-bots".into(), json!({ "user": null, "dryRun": false })));
+        assert_eq!(parse(&["pro", "--dry-run"]).unwrap().1, json!({ "user": null, "dryRun": true }));
+        assert_eq!(parse(&["pro", "--user", "ada@example.com", "--dry-run"]).unwrap().1, json!({ "user": "ada@example.com", "dryRun": true }));
+        assert_eq!(parse(&["pro", "--dry-run", "--user", "u1"]).unwrap().1["user"], "u1");
+        for bad in [&[][..], &["--dry-run"], &["pro", "--user"], &["pro", "--user", "--dry-run"], &["pro", "ada"], &["pro", "--apply"]] {
+            assert!(move_bots_request(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

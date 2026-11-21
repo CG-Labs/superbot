@@ -120,12 +120,22 @@ pub struct Tier {
     pub limits: Limits,
     /// Stripe price ids that pay for this tier (ADR 0040). Admins only see them.
     pub stripe_prices: Vec<String>,
+    /// The harness new Bots of this tier's users get when none is asked for (ADR 0079):
+    /// the file's `defaultHarness`, else the first route's. None on an open tier, whose
+    /// new Bots get `DEFAULT_HARNESS`.
+    pub default_harness: Option<String>,
 }
 
 impl Tier {
     /// Users of a managed tier get the tier's models and never pick or see one.
     pub fn managed(&self) -> bool {
         self.routes.is_some()
+    }
+
+    /// The harness a new Bot gets when none is asked for: the plan's on a managed tier,
+    /// `server` (`DEFAULT_HARNESS`) on an open one.
+    pub fn new_bot_harness<'a>(&'a self, server: &'a str) -> &'a str {
+        self.default_harness.as_deref().unwrap_or(server)
     }
 
     pub fn allows_harness(&self, harness: &str) -> bool {
@@ -188,6 +198,7 @@ impl Tier {
         let mut v = self.view();
         v["routes"] = self.routes.as_ref().map_or(json!("any"), |r| json!(r));
         v["stripePrices"] = json!(self.stripe_prices);
+        v["defaultHarness"] = json!(self.default_harness);
         v
     }
 }
@@ -260,6 +271,8 @@ struct TierCfg {
     limits: Limits,
     #[serde(default, rename = "stripePrices")]
     stripe_prices: Vec<String>,
+    #[serde(default, rename = "defaultHarness")]
+    default_harness: Option<String>,
 }
 
 fn slug(s: &str) -> bool {
@@ -290,7 +303,7 @@ fn word(what: &str, s: &Option<String>) -> Result<Option<String>, String> {
 impl Tiers {
     /// The built-in tier: any harness and model, no limits.
     pub fn self_host() -> Tiers {
-        let t = Tier { name: SELF_HOST.into(), label: "Self-host".into(), routes: None, limits: Limits::default(), stripe_prices: Vec::new() };
+        let t = Tier { name: SELF_HOST.into(), label: "Self-host".into(), routes: None, limits: Limits::default(), stripe_prices: Vec::new(), default_harness: None };
         Tiers { list: vec![t], default: 0, providers: Vec::new(), source: "built-in".into() }
     }
 
@@ -383,7 +396,16 @@ impl Tiers {
                 }
                 prices.push(p);
             }
-            list.push(Tier { label: label.unwrap_or_else(|| name.clone()), name, routes, limits, stripe_prices: prices });
+            let default_harness = match (&routes, t.default_harness.as_deref().map(str::trim)) {
+                (None, None) => None,
+                (None, Some(_)) => {
+                    return Err(format!("tier \"{name}\": defaultHarness is for tiers with routes; new Bots on an open tier get DEFAULT_HARNESS"));
+                }
+                (Some(r), None) => Some(r[0].harness.clone()),
+                (Some(r), Some(h)) if r.iter().any(|r| r.harness == h) => Some(h.to_string()),
+                (Some(_), Some(h)) => return Err(format!("tier \"{name}\": defaultHarness \"{h}\" must be one of the tier's routes' harnesses")),
+            };
+            list.push(Tier { label: label.unwrap_or_else(|| name.clone()), name, routes, limits, stripe_prices: prices, default_harness });
         }
         let default = match default.or(cfg.default.as_deref()).map(str::trim) {
             None => 0,
@@ -420,6 +442,50 @@ impl Tiers {
 
     pub fn default_tier(&self) -> &Tier {
         &self.list[self.default]
+    }
+
+    /// The managed tiers' default harnesses, once each, in the file's order.
+    pub fn managed_defaults(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for h in self.list.iter().filter_map(|t| t.default_harness.as_deref()) {
+            if !out.contains(&h) {
+                out.push(h);
+            }
+        }
+        out
+    }
+
+    /// What botd says at startup about the harness new Bots get (ADR 0079): one line when
+    /// any tier is managed, and a warning for each managed default that can't run where
+    /// its users' Bots run. `here`: the harnesses installed on this server, when some
+    /// Bots run here; `machines`: those users' machines get, when some run there.
+    pub fn default_harness_notes(&self, server: &str, here: Option<&[&str]>, machines: Option<&[&str]>) -> (Option<String>, Vec<String>) {
+        let defaults = self.managed_defaults();
+        if defaults.is_empty() {
+            return (None, Vec::new());
+        }
+        let plans = |h: &str| {
+            let names: Vec<&str> = self.list.iter().filter(|t| t.default_harness.as_deref() == Some(h)).map(|t| t.name.as_str()).collect();
+            format!("{} plan{}", names.join(", "), if names.len() == 1 { "" } else { "s" })
+        };
+        let mut said: Vec<String> = defaults.iter().map(|h| format!("{h} on the {}", plans(h))).collect();
+        if self.list.iter().any(|t| !t.managed()) {
+            said.push(format!("{server} on open tiers (DEFAULT_HARNESS)"));
+        }
+        let mut warnings = Vec::new();
+        for h in &defaults {
+            if here.is_some_and(|i| !i.contains(h)) {
+                let hint = crate::adapters::get(h).map(|a| crate::adapters::install::server_hint(a.bin())).unwrap_or_default();
+                warnings.push(format!("new Bots on the {} run on {h}, which isn't installed on this server, so their runs here are refused until it is ({hint}).", plans(h)));
+            }
+            if machines.is_some_and(|m| !m.contains(h)) {
+                warnings.push(format!(
+                    "new Bots on the {} run on {h}, which MACHINE_HARNESSES doesn't install on users' machines, so their runs there are refused until it is. Add {h} to MACHINE_HARNESSES, or leave it unset.",
+                    plans(h)
+                ));
+            }
+        }
+        (Some(format!("New Bots: {} (ADR 0079).", said.join("; "))), warnings)
     }
 
     /// The tier a Stripe price pays for.
@@ -776,6 +842,54 @@ mod tests {
         assert!(route(r#"{"harness":"hermes","fallback":[{"provider":"p","model":"m"},{"provider":"p","model":"m"}]}"#).contains("twice"));
         let four = r#"{"provider":"p","model":"a"},{"provider":"p","model":"b"},{"provider":"p","model":"c"},{"provider":"p","model":"d"}"#;
         assert!(route(&format!(r#"{{"harness":"hermes","fallback":[{four}]}}"#)).contains("at most 3"));
+    }
+
+    #[test]
+    fn new_bots_on_a_managed_tier_get_its_harness_not_the_servers() {
+        // The plan's first route's harness, whatever DEFAULT_HARNESS is; an open tier keeps it.
+        let t = tiers();
+        assert_eq!(t.get("pro").unwrap().default_harness.as_deref(), Some("claude"));
+        assert_eq!(t.get("pro").unwrap().new_bot_harness("hermes"), "claude");
+        assert_eq!(t.get("self-host").unwrap().default_harness, None);
+        assert_eq!(t.get("self-host").unwrap().new_bot_harness("codex"), "codex");
+        assert_eq!(Tiers::self_host().default_tier().new_bot_harness("claude"), "claude");
+        assert!(Tiers::self_host().managed_defaults().is_empty());
+        assert_eq!(t.get("pro").unwrap().admin_view()["defaultHarness"], "claude");
+        assert_eq!(t.get("self-host").unwrap().admin_view()["defaultHarness"], Value::Null);
+        assert!(t.get("pro").unwrap().view().get("defaultHarness").is_none());
+
+        // `defaultHarness` picks another of the tier's harnesses.
+        let one = |extra: &str| format!(r#"{{"tiers":[{{"name":"a","routes":[{{"harness":"claude"}},{{"harness":"hermes"}}]{extra}}},{{"name":"b","routes":"any"}}]}}"#);
+        let picked = Tiers::parse(&one(r#","defaultHarness":"hermes""#), None).unwrap();
+        assert_eq!(picked.get("a").unwrap().new_bot_harness("claude"), "hermes");
+        assert_eq!(picked.managed_defaults(), ["hermes"]);
+        let bad = |raw: &str| Tiers::parse(raw, None).unwrap_err();
+        assert!(bad(&one(r#","defaultHarness":"codex""#)).contains("must be one of the tier's routes' harnesses"));
+        assert!(bad(r#"{"tiers":[{"name":"a","routes":"any","defaultHarness":"hermes"}]}"#).contains("open tier get DEFAULT_HARNESS"));
+
+        // The shipped plans: Hermes Agent on every managed one (ADR 0027), the open one as the server says.
+        let shipped = Tiers::parse(include_str!("../../deploy/tiers.example.json"), None).unwrap();
+        for name in ["starter", "pro", "max"] {
+            assert_eq!(shipped.get(name).unwrap().new_bot_harness("claude"), "hermes", "{name}");
+        }
+        assert_eq!(shipped.get("self-host").unwrap().new_bot_harness("claude"), "claude");
+        assert_eq!(shipped.managed_defaults(), ["hermes"]);
+    }
+
+    #[test]
+    fn startup_says_which_harness_new_bots_get_and_warns_when_it_cant_run() {
+        let shipped = Tiers::parse(include_str!("../../deploy/tiers.example.json"), None).unwrap();
+        let (line, warnings) = shipped.default_harness_notes("claude", Some(&["claude", "hermes"]), Some(&["hermes"]));
+        assert_eq!(line.as_deref(), Some("New Bots: hermes on the starter, pro, max plans; claude on open tiers (DEFAULT_HARNESS) (ADR 0079)."));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let (_, warnings) = shipped.default_harness_notes("claude", Some(&["claude"]), Some(&[]));
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("isn't installed on this server") && warnings[0].contains("--with-hermes"), "{}", warnings[0]);
+        assert!(warnings[1].contains("MACHINE_HARNESSES doesn't install"), "{}", warnings[1]);
+        // Not checked where it doesn't apply: no local runs, no enrolled machines.
+        assert!(shipped.default_harness_notes("claude", None, None).1.is_empty());
+        // Self-host: nothing to say.
+        assert_eq!(Tiers::self_host().default_harness_notes("claude", Some(&[]), Some(&[])), (None, Vec::new()));
     }
 
     #[test]

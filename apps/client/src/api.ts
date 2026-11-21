@@ -172,7 +172,8 @@ export class SuperBotApi {
     name: string;
     color: string;
     shape: string;
-    harness: string;
+    /** Unset: the server's default for the owner's plan (ADR 0079). */
+    harness?: string;
   }): Promise<BotView> {
     return this.request<BotView>("POST", "/api/bots", body);
   }

@@ -994,10 +994,11 @@ function setupTiers(t) {
   const rows = t.tiers.map((x) => `<tr>
       <td>${esc(x.label)}<div class="sub">${esc(x.name)}${x.name === t.default ? " · default" : ""}</div></td>
       <td>${x.managed ? "Set harnesses and models" : "Any harness and model"}</td>
+      <td>${esc(HARNESS_NAMES[x.newBots] || x.newBots || "")}</td>
       <td>${esc(limitsText(x.limits))}</td>
     </tr>`).join("");
   return verdict(true, t.detail)
-    + `<table class="grid"><thead><tr><th>Plan</th><th>Harnesses and models</th><th>Limits</th></tr></thead><tbody>${rows}</tbody></table>`
+    + `<table class="grid"><thead><tr><th>Plan</th><th>Harnesses and models</th><th>New Bots get</th><th>Limits</th></tr></thead><tbody>${rows}</tbody></table>`
     + `<h2>${t.fileLoaded ? "Change the plans" : "Sell plans or set limits"}</h2><p class="hint">botd reads the tiers file at startup. Skip this to keep the built-in self-host tier your license covers.</p>`
     + howto(t.instructions);
 }

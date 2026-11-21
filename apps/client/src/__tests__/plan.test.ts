@@ -1,4 +1,4 @@
-import { overLimits, planUsageLines, usageLines } from "../plan";
+import { harnessChoices, overLimits, planUsageLines, usageLines } from "../plan";
 import type { MyUsage, PlanUsage } from "../types";
 
 const starter: PlanUsage = {
@@ -82,5 +82,28 @@ describe("usage this period (ADR 0050)", () => {
       "Runs: 2 (no limit)",
       "claude-sonnet-4-5: 1,500 tokens",
     ]);
+  });
+});
+
+describe("New Bot harnesses (ADR 0079)", () => {
+  const names = { claude: "Claude Code", hermes: "Hermes Agent", codex: "Codex" };
+
+  it("puts the plan's default first and says so", () => {
+    expect(harnessChoices("hermes", ["claude", "hermes"], true, names)).toEqual([
+      { harness: "hermes", isDefault: true, label: "Hermes Agent · your plan's default" },
+      { harness: "claude", isDefault: false, label: "Claude Code" },
+    ]);
+  });
+
+  it("offers the default even when it isn't installed here, so the server can say why it won't run", () => {
+    expect(harnessChoices("hermes", ["claude"], true, names).map((c) => c.harness)).toEqual(["hermes", "claude"]);
+  });
+
+  it("calls an open tier's default just the default", () => {
+    expect(harnessChoices("claude", ["claude", "codex"], false, names)[0].label).toBe("Claude Code · default");
+  });
+
+  it("falls back to every known harness when the server lists none", () => {
+    expect(harnessChoices("pi", [], false, names).map((c) => c.harness)).toEqual(["pi", "claude", "hermes", "codex"]);
   });
 });
