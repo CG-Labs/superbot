@@ -625,6 +625,7 @@ pub async fn user_deleted(app: &AppState, a: &Auth, c: &Caller, user_id: &str) {
     if !a.scim.groups {
         return;
     }
+    let _writes = a.scim.group_writes.lock().await;
     let Some(team_id) = app.db.team_id_of(user_id) else { return };
     if app.db.scim_group(&c.token.tenant, &team_id).is_some() {
         teams::leave(app, &c.who, &team_id, user_id, teams::SCIM).await;
