@@ -5615,12 +5615,32 @@ impl Db {
             > 0
     }
 
+    /// Changes a member's role, unless it would leave the team without an owner. One
+    /// statement, so two owners demoting themselves at once can't both succeed.
     pub fn set_team_role(&self, team_id: &str, user_id: &str, role: &str) -> bool {
-        self.c().execute("UPDATE team_members SET role = ?1 WHERE team_id = ?2 AND user_id = ?3", params![role, team_id, user_id]).unwrap() > 0
+        self.c()
+            .execute(
+                "UPDATE team_members SET role = ?1 WHERE team_id = ?2 AND user_id = ?3
+                 AND (?1 = 'owner' OR role != 'owner' OR (SELECT COUNT(*) FROM team_members WHERE team_id = ?2 AND role = 'owner') > 1)",
+                params![role, team_id, user_id],
+            )
+            .unwrap()
+            > 0
     }
 
-    pub fn remove_team_member(&self, team_id: &str, user_id: &str) -> bool {
-        self.c().execute("DELETE FROM team_members WHERE team_id = ?1 AND user_id = ?2", [team_id, user_id]).unwrap() > 0
+    /// Takes a member off a team. With `keep_owner`, not its last owner while others
+    /// remain, in the same statement.
+    pub fn remove_team_member(&self, team_id: &str, user_id: &str, keep_owner: bool) -> bool {
+        self.c()
+            .execute(
+                "DELETE FROM team_members WHERE team_id = ?1 AND user_id = ?2
+                 AND (NOT ?3 OR role != 'owner'
+                      OR (SELECT COUNT(*) FROM team_members WHERE team_id = ?1 AND role = 'owner') > 1
+                      OR (SELECT COUNT(*) FROM team_members WHERE team_id = ?1) = 1)",
+                params![team_id, user_id, keep_owner],
+            )
+            .unwrap()
+            > 0
     }
 
     /// Invites `email`, or renews a pending invite with the new role and expiry.

@@ -536,3 +536,49 @@ async fn a_server_admin_cannot_remove_a_teams_only_owner() {
     assert_eq!(call(w.port, "DELETE", &format!("/api/teams/{}/members/{}", w.alpha, w.ada_id), &w.admin, "").await.0, 200);
     assert!(w.app.db.team(&w.alpha).is_none());
 }
+
+#[tokio::test]
+async fn a_team_always_keeps_an_owner_even_when_owners_act_at_once() {
+    let w = world().await;
+    let db = &w.app.db;
+    assert!(db.set_team_role(&w.alpha, &w.al_id, "owner"));
+    // Both owners step down "at once": the second change finds one owner left and fails.
+    assert!(db.set_team_role(&w.alpha, &w.ada_id, "member"));
+    assert!(!db.set_team_role(&w.alpha, &w.al_id, "member"));
+    assert!(!db.remove_team_member(&w.alpha, &w.al_id, true), "nor can the last owner go while Ada's there");
+    assert_eq!(db.team_member(&w.al_id).unwrap().role, "owner");
+    // Over HTTP, the same refusal.
+    assert_eq!(call(w.port, "PATCH", &format!("/api/team/members/{}", w.al_id), &w.al, r#"{"role":"admin"}"#).await.0, 409);
+    assert_eq!(call(w.port, "POST", "/api/team/leave", &w.al, "").await.0, 409);
+    // Deleting the team takes everyone, owners included.
+    assert!(db.remove_team_member(&w.alpha, &w.al_id, false));
+}
+
+#[tokio::test]
+async fn a_machine_finished_after_its_owner_left_is_released() {
+    let w = world().await;
+    let (dee_id, _) = user_with(w.port, &w.admin, "dee@example.com", "member").await;
+    assert_eq!(call(w.port, "POST", &format!("/api/users/{dee_id}/machine"), &w.admin, "{}").await.0, 202);
+    reconcile(&w).await;
+    let m = w.app.db.user_machine(&dee_id).unwrap();
+    // Alpha asked for it, but Dee is no longer on Alpha by the time it's made.
+    crate::teams::claim(&w.app, &crate::audit::Who::system("test"), &w.alpha, &dee_id, &m.id).await;
+    let tm = w.app.db.team_machine(&m.id).unwrap();
+    assert!(tm.released_at.is_some() && tm.release_at.is_some(), "{tm:?}");
+    assert_eq!(w.app.db.machine(&m.id).unwrap().state, crate::machines::State::Suspended);
+    assert!(reconcile(&w).await["teams"].get("machinesAssigned").is_none());
+}
+
+#[tokio::test]
+async fn a_step_decided_before_a_machine_was_taken_back_is_refused() {
+    let w = world().await;
+    reconcile(&w).await;
+    let m = w.app.db.user_machine(&w.al_id).unwrap();
+    let cp = w.app.control_plane.get().unwrap().clone();
+    let by = crate::audit::Who::system("test");
+    // The sweep decided to power off a released machine, but it's the team's again.
+    let released = |x: &crate::db::Machine| w.app.db.team_machine(&x.id).is_some_and(|t| t.released_at.is_some());
+    let res = crate::machines::act_if(&w.app, &cp, &by, &w.al_id, crate::machines::Step::Suspend, None, &released).await;
+    assert_eq!(res.err().map(|e| e.0), Some(StatusCode::CONFLICT));
+    assert_eq!(w.app.db.machine(&m.id).unwrap().state, crate::machines::State::Running);
+}

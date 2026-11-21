@@ -1423,11 +1423,28 @@ pub(crate) async fn act(
     step: Step,
     target: Option<(String, String)>,
 ) -> Res<Response> {
+    act_if(app, cp, by, key, step, target, &|_| true).await
+}
+
+/// `act`, once `still` holds for the machine under the lock: a caller that decided
+/// earlier doesn't act on a machine that changed hands meanwhile.
+pub(crate) async fn act_if(
+    app: &AppState,
+    cp: &ControlPlane,
+    by: &Who,
+    key: &str,
+    step: Step,
+    target: Option<(String, String)>,
+    still: &(dyn Fn(&Machine) -> bool + Sync),
+) -> Res<Response> {
     let p = cp.need()?;
     let u = need_user_key(app, key)?;
     let _g = cp.ops.lock().await;
     let mut m = need_machine(app, &u.id)?;
     cp.need_own(&m)?;
+    if !still(&m) {
+        return Err(conflict("The machine changed meanwhile; try again.".into()));
+    }
     if step == Step::Resize && target.is_none() {
         return Err(bad("Unknown tier"));
     }

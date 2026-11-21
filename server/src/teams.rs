@@ -184,7 +184,7 @@ async fn provide(app: &AppState, by: &Who, team: &Team, user: &User) -> Value {
         app.db.team_machine_mark(&m.id, &team.id, &user.id);
         drop(guard);
         let resumed = match m.state {
-            MachineState::Suspended => crate::machines::act(app, cp, by, &user.id, Step::Resume, None).await.is_ok(),
+            MachineState::Suspended => crate::machines::act_if(app, cp, by, &user.id, Step::Resume, None, &|x| ours(app, &team.id, x)).await.is_ok(),
             _ => false,
         };
         app.db.record(&team_event(by, "team.machine_kept", &team.id, json!({ "user": user.id, "machine": m.id, "fromTeam": tm.team_id, "resumed": resumed })));
@@ -193,8 +193,8 @@ async fn provide(app: &AppState, by: &Who, team: &Team, user: &User) -> Value {
     match crate::machines::request_as(app, cp, by, &user.id, &Bytes::new()).await {
         Ok(res) if res.status().is_success() => {
             let Some(m) = app.db.user_machine(&user.id) else { return json!("failed") };
-            app.db.team_machine_mark(&m.id, &team.id, &user.id);
             app.db.record(&team_event(by, "team.machine_requested", &team.id, json!({ "user": user.id, "machine": m.id, "tier": m.tier })));
+            claim(app, by, &team.id, &user.id, &m.id).await;
             json!("requested")
         }
         res => {
@@ -203,13 +203,27 @@ async fn provide(app: &AppState, by: &Who, team: &Team, user: &User) -> Value {
                 Err(e) => e.1.clone(),
             };
             // A machine that failed at the provider is still the team's to retry.
-            if let Some(m) = app.db.user_machine(&user.id) {
-                app.db.team_machine_mark(&m.id, &team.id, &user.id);
-            }
             app.db.record(&team_event(by, "team.machine_failed", &team.id, json!({ "user": user.id, "error": error })).outcome(Outcome::Failure));
+            if let Some(m) = app.db.user_machine(&user.id) {
+                claim(app, by, &team.id, &user.id, &m.id).await;
+            }
             json!("failed")
         }
     }
+}
+
+/// Records a machine just made for `user_id` as `team_id`'s. Making it can take a
+/// while: if they left the team meanwhile, it's released as their leaving would have.
+pub(crate) async fn claim(app: &AppState, by: &Who, team_id: &str, user_id: &str, machine_id: &str) {
+    app.db.team_machine_mark(machine_id, team_id, user_id);
+    if app.db.team_id_of(user_id).as_deref() != Some(team_id) {
+        release(app, by, team_id, user_id).await;
+    }
+}
+
+/// Whether `m` is a machine `team_id` gave and hasn't released: the team's to manage.
+fn ours(app: &AppState, team_id: &str, m: &crate::db::Machine) -> bool {
+    app.db.team_machine(&m.id).is_some_and(|t| t.team_id == team_id && t.released_at.is_none())
 }
 
 /// Adds `user` to `team` with `role`, and gives them their machine.
@@ -258,7 +272,7 @@ async fn join(app: &AppState, by: &Who, team: &Team, user: &User, role: &str, vi
 /// suspended and, after TEAM_MACHINE_DAYS, destroyed.
 pub async fn leave(app: &AppState, by: &Who, team_id: &str, user_id: &str, reason: &str) -> bool {
     let Some(member) = app.db.team_member(user_id).filter(|m| m.team_id == team_id) else { return false };
-    if !app.db.remove_team_member(team_id, user_id) {
+    if !app.db.remove_team_member(team_id, user_id, reason != "team_deleted") {
         return false;
     }
     let mates: HashSet<String> = app.db.team_members(team_id).into_iter().map(|m| m.user_id).collect();
@@ -308,13 +322,18 @@ async fn release(app: &AppState, by: &Who, team_id: &str, user_id: &str) {
         return;
     }
     let suspended = match m.state {
-        MachineState::Running if days > 0 => crate::machines::act(app, cp, by, user_id, Step::Suspend, None).await.is_ok(),
+        MachineState::Running if days > 0 => crate::machines::act_if(app, cp, by, user_id, Step::Suspend, None, &|x| released(app, &m.id, x)).await.is_ok(),
         _ => false,
     };
     app.db.record(&team_event(by, "team.machine_released", team_id, json!({ "user": user_id, "machine": m.id, "releaseAt": due, "suspended": suspended })));
     if days == 0 {
         destroy(app, cp, team_id, &m.id, user_id).await;
     }
+}
+
+/// Whether `m` is still `machine_id`, released and not taken back.
+fn released(app: &AppState, machine_id: &str, m: &crate::db::Machine) -> bool {
+    m.id == machine_id && app.db.team_machine(machine_id).is_some_and(|t| t.released_at.is_some())
 }
 
 async fn destroy(app: &AppState, cp: &ControlPlane, team_id: &str, machine_id: &str, user_id: &str) -> bool {
@@ -359,7 +378,7 @@ pub async fn sweep(app: &AppState, cp: &ControlPlane) -> Value {
             // Released but not due: keep it off, including one that was still being built
             // or that didn't power off the first time.
             Some(_) if m.state == MachineState::Running => {
-                let _ = crate::machines::act(app, cp, &system(&m.user_id), &m.user_id, Step::Suspend, None).await;
+                let _ = crate::machines::act_if(app, cp, &system(&m.user_id), &m.user_id, Step::Suspend, None, &|x| released(app, &m.id, x)).await;
             }
             Some(_) => {}
             None if cp.routing != crate::machines::route::Routing::Off && m.assigned_at.is_none() => {
@@ -434,7 +453,9 @@ pub async fn leave_mine(State(app): State<AppState>, Extension(c): Extension<Cal
     if m.role == OWNER && others && owners(&app, &t.id) == 1 {
         return Err(conflict("You're the team's only owner. Make someone else an owner first."));
     }
-    leave(&app, &by, &t.id, &u.id, "left").await;
+    if !leave(&app, &by, &t.id, &u.id, "left").await {
+        return Err(conflict("You're the team's only owner. Make someone else an owner first."));
+    }
     if !others && app.db.delete_team(&t.id) {
         app.db.record(&team_event(&by, "team.deleted", &t.id, json!({ "name": t.name, "reason": "empty" })));
     }
@@ -476,7 +497,9 @@ pub async fn set_role(State(app): State<AppState>, Extension(c): Extension<Calle
         return Err(conflict("A team needs an owner. Make someone else an owner first."));
     }
     if role != m.role {
-        app.db.set_team_role(&t.id, &u.id, &role);
+        if !app.db.set_team_role(&t.id, &u.id, &role) {
+            return Err(conflict("A team needs an owner. Make someone else an owner first."));
+        }
         app.db.record(&team_event(&by, "team.role_changed", &t.id, json!({ "user": u.id, "from": m.role, "to": role })));
     }
     let m = app.db.team_member(&u.id).ok_or_else(|| not_found("Teammate"))?;
@@ -494,7 +517,9 @@ pub async fn remove(State(app): State<AppState>, Extension(c): Extension<Caller>
     if m.role == OWNER && me.role != OWNER {
         return Err(forbidden("Only the team's owners can take an owner off the team."));
     }
-    leave(&app, &by, &t.id, &u.id, "removed").await;
+    if !leave(&app, &by, &t.id, &u.id, "removed").await {
+        return Err(conflict("A team needs an owner. Make someone else an owner first."));
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -549,8 +574,8 @@ pub async fn give_machine(State(app): State<AppState>, Extension(c): Extension<C
     }
     let res = crate::machines::request_as(&app, cp, &by, &u.id, &Bytes::new()).await;
     if let Some(m) = app.db.user_machine(&u.id) {
-        app.db.team_machine_mark(&m.id, &t.id, &u.id);
         app.db.record(&team_event(&by, "team.machine_requested", &t.id, json!({ "user": u.id, "machine": m.id, "tier": m.tier })));
+        claim(&app, &by, &t.id, &u.id, &m.id).await;
     }
     machine_answer(&app, &by, &t.id, &u.id, res).await
 }
@@ -561,7 +586,7 @@ async fn machine_step(app: AppState, c: Caller, by: Who, key: String, step: Step
     let cp = control_plane(&app).ok_or_else(|| ApiError(StatusCode::SERVICE_UNAVAILABLE, crate::machines::NOT_CONFIGURED.into()))?;
     team_machine_of(&app, &t.id, &u.id)?;
     let by = Who { actor: by.actor.on_behalf_of(&u.id), source: by.source };
-    let res = crate::machines::act(&app, cp, &by, &u.id, step, None).await;
+    let res = crate::machines::act_if(&app, cp, &by, &u.id, step, None, &|m| ours(&app, &t.id, m)).await;
     machine_answer(&app, &by, &t.id, &u.id, res).await
 }
 
@@ -692,7 +717,9 @@ pub async fn put_member(State(app): State<AppState>, Extension(by): Extension<Wh
                 return Err(conflict("A team needs an owner. Make someone else an owner first."));
             }
             if role != m.role {
-                app.db.set_team_role(&t.id, &u.id, &role);
+                if !app.db.set_team_role(&t.id, &u.id, &role) {
+                    return Err(conflict("A team needs an owner. Make someone else an owner first."));
+                }
                 app.db.record(&team_event(&by, "team.role_changed", &t.id, json!({ "user": u.id, "from": m.role, "to": role })));
             }
             let m = app.db.team_member(&u.id).ok_or_else(|| not_found("Member"))?;
@@ -712,7 +739,7 @@ pub async fn delete_member(State(app): State<AppState>, Extension(by): Extension
         return Err(conflict("They're the team's only owner. Make someone else an owner first, or delete the team."));
     }
     if !leave(&app, &by, &t.id, &u.id, "removed").await {
-        return Err(not_found("Member"));
+        return Err(conflict("They're the team's only owner. Make someone else an owner first, or delete the team."));
     }
     if !others && app.db.delete_team(&t.id) {
         app.db.record(&team_event(&by, "team.deleted", &t.id, json!({ "name": t.name, "reason": "empty" })));
