@@ -16,7 +16,7 @@ Part of the [security pack](README.md). Data stored by each part: [data flows](d
 | **botctl** | CLI for operators and for Bots (routines, ask, handoff, approval checks). Talks to botd's API. | The server, and each machine. |
 | **superbot-run** | Small helper that starts a harness as the user's own Unix account on the server ([ADR 0037](../adr/0037-per-user-unix-accounts.md), [ADR 0058](../adr/0058-harness-os-user-by-default.md)). | The botd server. |
 | **Machine agent** (`superbot-machine`) | Runs on each user's managed machine. Enrolls once, then takes jobs from botd over mutual TLS: run a harness, install or upgrade harnesses, harness logins, folder copy, screens, teammates' OS users ([ADR 0031](../adr/0031-machine-enrollment-mtls.md), [ADR 0036](../adr/0036-bots-on-the-users-machine.md)). | Each user's machine. |
-| **Screens** | A Bot's own Linux desktop: Xvfb, Openbox and the voxl viewer, which listens on loopback only and needs a per-Bot token ([ADR 0003](../adr/0003-computer.md), [ADR 0008](../adr/0008-client-screen-auth.md), [ADR 0045](../adr/0045-screens-on-machines.md)). | The botd server, or the owner's machine (`MACHINE_SCREENS=on`). |
+| **Screens** | A Bot's own Linux desktop: Xvfb, Openbox and the voxl viewer, which needs a per-Bot token and listens on loopback (installer, machines) or on the Compose network with no published port (Docker Compose) ([ADR 0003](../adr/0003-computer.md), [ADR 0008](../adr/0008-client-screen-auth.md), [ADR 0045](../adr/0045-screens-on-machines.md)). | The botd server, or the owner's machine (`MACHINE_SCREENS=on`). |
 | **Per-user machines** | One computer per user: a Linode VM ([ADR 0025](../adr/0025-control-plane-linode.md)) or an unprivileged Incus system container ([ADR 0065](../adr/0065-incus-container-machines.md)), placed across several Incus hosts by load ([ADR 0081](../adr/0081-placing-machines-by-host-load.md)). | The operator's Linode account, or the operator's Incus hosts. |
 | **superbot-license** | Offline tool that signs self-host licence keys ([ADR 0038](../adr/0038-self-host-license-key.md)). | CG-Labs only. Never on a customer server. |
 
@@ -24,7 +24,7 @@ Part of the [security pack](README.md). Data stored by each part: [data flows](d
 
 ### One server (self-host)
 
-Everything runs on one Linux server, installed with [`deploy/install.sh`](../../deploy/install.sh) (systemd) or [Docker Compose](../../deploy/docker/). Each user's Bots run as that user's own Unix account (`sb-u-<user id>`), which can't read botd's files, the database or the master key ([ADR 0058](../adr/0058-harness-os-user-by-default.md); on by default for new installs).
+Everything runs on one Linux server, installed with [`deploy/install.sh`](../../deploy/install.sh) (systemd) or [Docker Compose](../../deploy/docker/). Compose pulls the published images (`ghcr.io/cg-labs/superbot` and `ghcr.io/cg-labs/superbot-caddy`, amd64 and arm64, with the Bots' computer built in) or builds them from the checkout ([ADR 0084](../adr/0084-published-image-with-computer-use.md)). There botd and the screen viewers listen on the Compose network (`HOST=0.0.0.0`, `SCREEN_ADDR=0.0.0.0`) and publish no port; only Caddy shares that network, and each viewer checks its own token. On both installs, screens are off under per-user accounts (`ISOLATION=users`, the default) until per-user screens exist. Each user's Bots run as that user's own Unix account (`sb-u-<user id>`), which can't read botd's files, the database or the master key ([ADR 0058](../adr/0058-harness-os-user-by-default.md); on by default for new installs).
 
 ```mermaid
 flowchart LR
@@ -37,7 +37,7 @@ flowchart LR
     DB[("SQLite<br/>DATA_DIR")]
     WS[("Workspace<br/>WORKSPACE_DIR/users/&lt;id&gt;")]
     H["Harness processes<br/>as sb-u-&lt;user id&gt;"]
-    Scr["Screens<br/>Xvfb + voxl on loopback"]
+    Scr["Screens<br/>Xvfb + voxl, token per Bot"]
   end
   Model["Model provider"]
   App -- "HTTPS: REST + SSE" --> Caddy --> Botd
@@ -90,7 +90,7 @@ Key points:
 
 - **The control plane decides; the machine does.** Who may see or run a Bot, approvals, policy, secrets, billing and the audit log stay in botd. A compromised machine can harm only its own user ([ADR 0029](../adr/0029-per-user-isolation.md)).
 - **botd dials the agent.** Jobs, heartbeats, logins and screens go from botd to the agent's port (default 7443). The agent calls botd only to enroll, to rotate its certificate, and to relay a running Bot's own API calls.
-- **Bots' own OS users (off by default).** With `MACHINE_BOT_USER=on`, the agent runs every harness as the unprivileged `superbot-bots` user instead of its own account ([ADR 0043](../adr/0043-bots-own-os-user-on-machines.md)); screens need it on. With `MACHINE_TEAMMATE_USERS=on` as well, a teammate's runs of a shared Bot get that teammate's own OS user ([ADR 0048](../adr/0048-teammates-own-os-user-on-machines.md)).
+- **Bots' own OS users (off by default).** With `MACHINE_BOT_USER=on`, the agent runs every harness as the unprivileged `superbot-bots` user; off, harness runs are root, like the agent ([ADR 0043](../adr/0043-bots-own-os-user-on-machines.md)); screens need it on. With `MACHINE_TEAMMATE_USERS=on` as well, a teammate's runs of a shared Bot get that teammate's own OS user ([ADR 0048](../adr/0048-teammates-own-os-user-on-machines.md)).
 - **No harness code on the agent.** botd's adapters build each run's command and send it as data; the agent runs it ([ADR 0036](../adr/0036-bots-on-the-users-machine.md)).
 
 ## Trust boundaries
