@@ -8,11 +8,60 @@ export interface AuditFilters {
   person: string;
   method: string;
   outcome: "" | "success" | "failure" | "denied";
+  /** A Bot id: events about that Bot, whoever acted. */
+  bot: string;
+  /** A session id: everything one sign-in did. */
+  session: string;
+  /** A user id or email: what Bots and routines did for that person. */
+  onBehalfOf: string;
   from: string;
   to: string;
 }
 
-export const NO_FILTERS: AuditFilters = { action: "", actor: "", person: "", method: "", outcome: "", from: "", to: "" };
+export const NO_FILTERS: AuditFilters = {
+  action: "",
+  actor: "",
+  person: "",
+  method: "",
+  outcome: "",
+  bot: "",
+  session: "",
+  onBehalfOf: "",
+  from: "",
+  to: "",
+};
+
+/** The filters a route can open the log with, e.g. `/audit?bot=<id>`. */
+export const LINK_FILTERS = ["action", "person", "bot", "session", "onBehalfOf"] as const;
+
+export function linkedFilters(params: Partial<Record<string, string | string[]>>): Partial<AuditFilters> {
+  const f: Partial<AuditFilters> = {};
+  for (const k of LINK_FILTERS) {
+    const v = params[k];
+    const s = Array.isArray(v) ? v[0] : v;
+    if (s?.trim()) f[k] = s.trim();
+  }
+  return f;
+}
+
+/** The approvals a person (or the timeout) settled. */
+export const DECISIONS = "approval.approved,approval.denied,approval.expired";
+
+/**
+ * Kinds of action, as `action` filters: picking one fills in the Action field, so the
+ * field always shows what is sent, and the server ORs a comma-separated list.
+ */
+export const KINDS: readonly { value: string; label: string }[] = [
+  { value: "", label: "Any action" },
+  { value: DECISIONS, label: "Approval decisions" },
+  { value: "approval.*,policy.*,rule.*", label: "Approvals and policy" },
+  { value: "auth.*,session.*", label: "Sign-ins" },
+  { value: "bot.*,harness.invoked", label: "Bots and runs" },
+  { value: "routine.*", label: "Routines" },
+  { value: "user.*,signup.*,scim.*", label: "Users and sign-ups" },
+  { value: "machine.*", label: "Machines" },
+  { value: "secret.*", label: "Secrets" },
+];
 
 export const ACTORS: readonly { value: AuditFilters["actor"]; label: string }[] = [
   { value: "", label: "Everyone" },
@@ -72,6 +121,10 @@ export function auditQuery(f: AuditFilters): string {
   else if (f.actor) p.push(["actor", f.actor]);
   if (f.method) p.push(["method", f.method]);
   if (f.outcome) p.push(["outcome", f.outcome]);
+  for (const k of ["bot", "session", "onBehalfOf"] as const) {
+    const v = f[k].trim();
+    if (v) p.push([k, v]);
+  }
   const from = localDay(f.from);
   const to = localDay(f.to, 1);
   if (from != null && to != null && from >= to) throw new Error("From is after To.");
@@ -107,6 +160,84 @@ export function detailsText(e: AuditEvent): string {
 /** A user's name from any loaded event, for "on behalf of". */
 export function nameFrom(events: AuditEvent[]): (userId: string) => string {
   return (id) => events.find((x) => x.actorKind === "user" && x.actorId === id && x.actorName)?.actorName || id;
+}
+
+type Names = { nameOf?: (userId: string) => string; botName?: (id: string) => string | undefined };
+
+const withId = (name: string | undefined, id: string) => (name && name !== id ? `${name} (${id})` : id);
+
+/** Every field an event has, labelled, in reading order. Empty fields are left out. */
+export function eventFields(e: AuditEvent, { nameOf = (id) => id, botName }: Names = {}): [string, string][] {
+  const idp = e.idp && e.idpProvider && e.idpProvider !== e.idp ? `${e.idp} (${e.idpProvider})` : e.idp || e.idpProvider;
+  const rows: [string, string | null | undefined][] = [
+    ["Time", new Date(e.at).toLocaleString()],
+    ["UTC", e.time],
+    ["Outcome", e.outcome],
+    ["Who", `${actorLabel(e, botName)} (${e.actorKind})`],
+    [e.actorKind === "bot" ? "Bot id" : e.actorKind === "user" ? "User id" : "Part", e.actorId],
+    ["Email", e.actorEmail],
+    ["Role", e.actorRole],
+    ["Sign-in", e.authMethod ? SIGN_IN[e.authMethod] ?? e.authMethod : null],
+    ["IdP", idp],
+    ["IdP subject", e.actorSubject],
+    ["Session", e.sessionId],
+    ["On behalf of", e.onBehalfOf ? withId(nameOf(e.onBehalfOf), e.onBehalfOf) : null],
+    ["About Bot", e.botId ? withId(botName?.(e.botId), e.botId) : null],
+    ["Target", targetLabel(e)],
+    ["IP", e.ip],
+    ["User agent", e.userAgent],
+    ["Event", String(e.id)],
+  ];
+  return rows.filter((r): r is [string, string] => !!r[1]);
+}
+
+const str = (v: unknown) => (typeof v === "string" && v ? v : null);
+/** A string, or a list of strings (the server sends `covers` as one per kind of call), as one line. */
+const text = (v: unknown) => (Array.isArray(v) ? str(v.filter((x) => typeof x === "string" && x).join("; ")) : str(v));
+
+/** What an approval decision was about and how it ended (ADR 0007, 0051). Null for other events. */
+export function decisionSummary(e: AuditEvent): { verdict: string; lines: [string, string][] } | null {
+  const d = e.details ?? {};
+  let verdict: string;
+  if (e.action === "approval.approved") verdict = str(d.runId) && text(d.covers) ? "Approved for the rest of the run" : "Approved";
+  else if (e.action === "approval.denied") verdict = "Denied";
+  else if (e.action === "approval.expired") verdict = "Expired: nobody answered, so it was denied";
+  else return null;
+  const rows: [string, string | null][] = [
+    ["Call", str(d.subject)],
+    ["Tool", str(d.tool)],
+    ["Kind", str(d.class)],
+    ["Note", str(d.note)],
+    ["Covers", text(d.covers)],
+    ["Saved as rule", str(d.rule)],
+  ];
+  return { verdict, lines: rows.filter((r): r is [string, string] => !!r[1]) };
+}
+
+/** Details as indented JSON, or "" when there are none. */
+export function detailsPretty(e: AuditEvent): string {
+  return detailsText(e) ? JSON.stringify(e.details, null, 2) : "";
+}
+
+/** The whole event as the API sent it, for Copy or Share. */
+export function eventText(e: AuditEvent): string {
+  return JSON.stringify(e, null, 2);
+}
+
+/**
+ * "Show everything like this" from one event. Each starts a fresh filter, so an
+ * investigation that follows a session or a Bot isn't narrowed by what was set before.
+ */
+export function pivotsFor(e: AuditEvent, { nameOf = (id) => id, botName }: Names = {}): { label: string; filters: AuditFilters }[] {
+  const out: { label: string; filters: AuditFilters }[] = [];
+  const add = (label: string, f: Partial<AuditFilters>) => out.push({ label, filters: { ...NO_FILTERS, ...f } });
+  add(`Only ${e.action}`, { action: e.action });
+  if (e.actorKind === "user" && e.actorId) add(`Everything by ${actorLabel(e)}`, { person: e.actorId });
+  const bots = [e.botId, e.actorKind === "bot" ? e.actorId : null].filter((b, i, all): b is string => !!b && all.indexOf(b) === i);
+  for (const b of bots) add(`Everything about ${botName?.(b) || b}`, { bot: b });
+  if (e.sessionId) add("Everything in this session", { session: e.sessionId });
+  if (e.onBehalfOf) add(`Everything done for ${nameOf(e.onBehalfOf)}`, { onBehalfOf: e.onBehalfOf });
+  return out;
 }
 
 /** As the server names its export: `superbot-audit-20261119-130000.csv`, in UTC. */

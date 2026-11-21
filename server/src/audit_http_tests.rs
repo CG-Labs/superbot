@@ -135,6 +135,62 @@ async fn bots_act_for_their_owner() {
     assert!(for_ada.iter().any(|e| e["action"] == "routine.created") && for_ada.iter().any(|e| e["action"] == "approval.requested"));
 }
 
+/// Has `bot` ask to run `cmd`, then `decide`s it ("approve" or "deny") as `who`, and waits for the hook's answer.
+async fn approval(port: u16, bot: &str, bot_auth: &str, who: &str, cmd: &str, decide: &str) {
+    let check = json!({ "from": bot, "harness": "claude", "event": { "tool_name": "Bash", "tool_input": { "command": cmd }, "cwd": "/tmp" } }).to_string();
+    let hook = tokio::spawn({
+        let bot_auth = bot_auth.to_string();
+        async move { call(port, "POST", "/api/approvals/check", &bot_auth, &check).await }
+    });
+    let id = loop {
+        let (_, list) = call(port, "GET", "/api/approvals?status=pending", who, "").await;
+        if let Some(a) = serde_json::from_str::<Vec<Value>>(&list).unwrap().into_iter().find(|a| a["botId"] == bot) {
+            break a["id"].as_str().unwrap().to_string();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(call(port, "POST", &format!("/api/approvals/{id}/{decide}"), who, "{}").await.0, 200);
+    hook.await.unwrap();
+}
+
+/// The client's "Approval decisions" kind with its Bot filter (ADR 0060): a comma-separated
+/// action list ANDed with `bot`, the same in the list and the CSV export, and admins only.
+#[tokio::test]
+async fn approval_decisions_for_one_bot() {
+    let (port, _, admin, key) = serve_app().await;
+    let (_, ada_auth) = user_with(port, &admin, "ada@example.com", "member").await;
+    let mk = |name: &'static str| {
+        let auth = ada_auth.clone();
+        async move {
+            let (_, b) = call(port, "POST", "/api/bots", &auth, &json!({ "name": name }).to_string()).await;
+            parse(&b)["id"].as_str().unwrap().to_string()
+        }
+    };
+    let (scout, helper) = (mk("Scout").await, mk("Helper").await);
+    approval(port, &scout, &key.auth(&scout), &ada_auth, "git push origin main", "deny").await;
+    approval(port, &helper, &key.auth(&helper), &ada_auth, "git push origin dev", "approve").await;
+
+    let decisions = "action=approval.approved,approval.denied,approval.expired";
+    let found = events(port, &admin, &format!("{decisions}&bot={scout}")).await;
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!((found[0]["action"].as_str(), found[0]["botId"].as_str()), (Some("approval.denied"), Some(scout.as_str())));
+    assert_eq!(found[0]["details"]["subject"], "git push origin main");
+    let all: Vec<_> = events(port, &admin, decisions).await.iter().map(|e| e["action"].as_str().unwrap().to_string()).collect();
+    assert_eq!(all, ["approval.approved", "approval.denied"]);
+
+    // The client sends the list URL-encoded, as `encodeURIComponent` does.
+    let query = format!("action={}&bot={scout}", decisions.trim_start_matches("action=").replace(',', "%2C"));
+    let (code, _, csv) = call_with(port, "GET", &format!("/api/audit/export.csv?{query}"), &admin, "", "").await;
+    assert_eq!(code, 200);
+    let rows: Vec<&str> = csv.trim_end().split("\r\n").skip(1).collect();
+    assert_eq!(rows.len(), 1, "{csv}");
+    assert!(rows[0].contains(",approval.denied,approval,") && rows[0].contains(&scout), "{}", rows[0]);
+
+    for path in [format!("/api/audit?{query}"), format!("/api/audit/export.csv?{query}")] {
+        assert_eq!(call(port, "GET", &path, &ada_auth, "").await.0, 403, "{path}");
+    }
+}
+
 /// A stand-in `claude` on the Bots' PATH that replies once and exits.
 fn fake_claude(app: &App) {
     use std::os::unix::fs::PermissionsExt;

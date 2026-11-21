@@ -216,6 +216,17 @@ describe("BotDetailsPanel", () => {
     expect(screen.queryByRole("button", { name: "Edit suggested prompts" })).not.toBeOnTheScreen();
   });
 
+  it("links admins to the Bot's audit log, and nobody else", async () => {
+    Object.assign(mockCtx, { bots: [bot("b", "Bob")], activeId: "b", fetchRoutines: jest.fn(async () => []) });
+    const onOpenAudit = jest.fn();
+    const ui = await render(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} onOpenAudit={onOpenAudit} />);
+    await act(async () => fireEvent.press(screen.getByRole("button", { name: "Audit log for this Bot" })));
+    expect(onOpenAudit).toHaveBeenCalledWith("b");
+
+    await ui.rerender(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} />);
+    expect(screen.queryByRole("button", { name: "Audit log for this Bot" })).not.toBeOnTheScreen();
+  });
+
   it("lets a viewer look but not run the Bot", async () => {
     Object.assign(mockCtx, { bots: [shared("view")], activeId: "b", fetchRoutines: jest.fn(async () => [routine("rb", "b", "Mine")]) });
     await render(<BotDetailsPanel visible onClose={jest.fn()} onOpenScreen={jest.fn()} onUsePrompt={jest.fn()} />);

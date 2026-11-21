@@ -8,7 +8,7 @@ import { ChatView } from "../components/ChatView";
 import { CreateBotModal } from "../components/CreateBotModal";
 import { ScreenViewer } from "../components/ScreenViewer";
 import { Sidebar } from "../components/Sidebar";
-import { openConsole, openSetup, watchSetup } from "../src/admin";
+import { isAdmin, openConsole, openSetup, watchSetup } from "../src/admin";
 import { planAvailable } from "../src/billing";
 import { showError } from "../src/dialogs";
 import { isStarter, starterText } from "../src/prompts";
@@ -142,6 +142,14 @@ export default function HomeScreen() {
           setDetailsOpen(false);
           router.push({ pathname: "/policy", params: { bot: id } });
         }}
+        onOpenAudit={
+          isAdmin(me)
+            ? (id) => {
+                setDetailsOpen(false);
+                router.push({ pathname: "/audit", params: { bot: id } });
+              }
+            : undefined
+        }
       />
       <ApprovalsInbox
         visible={approvalsOpen}

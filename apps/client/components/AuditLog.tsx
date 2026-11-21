@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { ActivityIndicator, FlatList, Pressable, StyleSheet, Text, TextInput, useWindowDimensions, View } from "react-native";
+import { ActivityIndicator, FlatList, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 import type { SuperBotApi } from "../src/api";
 import {
   ACTORS,
@@ -7,6 +8,7 @@ import {
   auditQuery,
   csvFileName,
   detailsText,
+  KINDS,
   METHODS,
   nameFrom,
   NO_FILTERS,
@@ -18,6 +20,7 @@ import {
 import { saveCsv } from "../src/saveCsv";
 import { colors } from "../src/theme";
 import type { AuditEvent } from "../src/types";
+import { AuditEventDetail } from "./AuditEventDetail";
 import { Chips } from "./Chips";
 
 interface Props {
@@ -25,6 +28,10 @@ interface Props {
   onBack: () => void;
   /** Names Bots the log only has an id for. */
   botName?: (id: string) => string | undefined;
+  /** The Bots to offer as a filter. */
+  bots?: readonly { id: string; name: string }[];
+  /** Filters to open with, e.g. from `/audit?bot=<id>`. */
+  initial?: Partial<AuditFilters>;
 }
 
 /** Typing waits this long before asking the server again. */
@@ -46,27 +53,17 @@ function Field({ label, value, onChange, placeholder, width }: { label: string; 
   );
 }
 
-function EventRow({ e, open, onPress, botName, nameOf }: { e: AuditEvent; open: boolean; onPress: () => void; botName?: Props["botName"]; nameOf: (id: string) => string }) {
+function EventRow({ e, selected, onPress, botName, nameOf }: { e: AuditEvent; selected: boolean; onPress: () => void; botName?: Props["botName"]; nameOf: (id: string) => string }) {
   const how = signInLabel(e, nameOf);
   const target = targetLabel(e);
   const details = detailsText(e);
-  const more = [
-    e.actorEmail && `Email ${e.actorEmail}`,
-    e.actorId && `Id ${e.actorId}`,
-    e.actorSubject && `IdP subject ${e.actorSubject}`,
-    e.sessionId && `Session ${e.sessionId}`,
-    e.onBehalfOf && `On behalf of ${e.onBehalfOf}`,
-    e.botId && `Bot ${e.botId}`,
-    e.userAgent && `User agent ${e.userAgent}`,
-    `Event ${e.id} · ${e.time}`,
-  ].filter((l): l is string => !!l);
   return (
     <Pressable
-      style={[styles.row, e.outcome !== "success" && styles.rowBad, open && styles.rowOpen]}
+      style={[styles.row, e.outcome !== "success" && styles.rowBad, selected && styles.rowOpen]}
       onPress={onPress}
       accessibilityRole="button"
       accessibilityLabel={`Audit event ${e.id}: ${e.action}`}
-      accessibilityState={{ expanded: open }}
+      accessibilityState={{ selected }}
     >
       <View style={styles.rowTop}>
         <Text style={styles.action} numberOfLines={1}>
@@ -75,7 +72,7 @@ function EventRow({ e, open, onPress, botName, nameOf }: { e: AuditEvent; open: 
         {e.outcome !== "success" ? <Text style={[styles.tag, styles.badTag]}>{e.outcome}</Text> : null}
         <Text style={styles.time}>{new Date(e.at).toLocaleString()}</Text>
       </View>
-      <Text style={styles.who} numberOfLines={open ? undefined : 1}>
+      <Text style={styles.who} numberOfLines={1}>
         {actorLabel(e, botName)}
         {how ? <Text style={styles.dim}> · {how}</Text> : null}
       </Text>
@@ -85,32 +82,27 @@ function EventRow({ e, open, onPress, botName, nameOf }: { e: AuditEvent; open: 
         </Text>
       ) : null}
       {details ? (
-        <Text style={styles.details} numberOfLines={open ? undefined : 1}>
+        <Text style={styles.details} numberOfLines={1}>
           {details}
         </Text>
       ) : null}
-      {open
-        ? more.map((line) => (
-            <Text key={line} style={styles.faint} selectable>
-              {line}
-            </Text>
-          ))
-        : null}
     </Pressable>
   );
 }
 
-/** The audit log for admins: filters, paging, and CSV export (ADR 0009, 0019, 0028). The server refuses it to everyone else. */
-export function AuditLog({ api, onBack, botName }: Props) {
+/** The audit log for admins: filters, paging, event detail, and CSV export (ADR 0009, 0019, 0028, 0060). The server refuses it to everyone else. */
+export function AuditLog({ api, onBack, botName, bots = [], initial }: Props) {
   const { width } = useWindowDimensions();
   const wide = width >= 900;
-  const [filters, setFilters] = useState<AuditFilters>(NO_FILTERS);
-  const [showFilters, setShowFilters] = useState(false);
+  const [filters, setFilters] = useState<AuditFilters>(() => ({ ...NO_FILTERS, ...initial }));
+  const [showFilters, setShowFilters] = useState(() => Object.values(initial ?? {}).some(Boolean));
   const [events, setEvents] = useState<AuditEvent[] | null>(null);
   const [next, setNext] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [openId, setOpenId] = useState<number | null>(null);
+  const [selected, setSelected] = useState<AuditEvent | null>(null);
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
   const seq = useRef(0);
@@ -130,6 +122,7 @@ export function AuditLog({ api, onBack, botName }: Props) {
     async (q: string, before?: number) => {
       const n = ++seq.current;
       if (before == null) setLoading(true);
+      setLoadingMore(before != null);
       try {
         const page = await api.audit(q, before);
         if (n !== seq.current) return;
@@ -146,7 +139,10 @@ export function AuditLog({ api, onBack, botName }: Props) {
           setNext(null);
         }
       } finally {
-        if (n === seq.current) setLoading(false);
+        if (n === seq.current) {
+          setLoading(false);
+          setLoadingMore(false);
+        }
       }
     },
     [api],
@@ -159,6 +155,16 @@ export function AuditLog({ api, onBack, botName }: Props) {
     const t = setTimeout(() => void load(query), delay);
     return () => clearTimeout(t);
   }, [query, filterError, load]);
+
+  // Reloads what the controls show, so it never brings back a filter that a newer load is replacing.
+  const refresh = async () => {
+    setRefreshing(true);
+    try {
+      await load(filterError ? shown.current : query);
+    } finally {
+      setRefreshing(false);
+    }
+  };
 
   const set = <K extends keyof AuditFilters>(k: K) => (v: AuditFilters[K]) => setFilters((f) => ({ ...f, [k]: v }));
   const active = Object.values(filters).filter(Boolean).length;
@@ -175,14 +181,34 @@ export function AuditLog({ api, onBack, botName }: Props) {
     }
   };
 
+  const pivot = (f: AuditFilters) => {
+    setFilters(f);
+    if (!wide) {
+      setSelected(null);
+      setShowFilters(true);
+    }
+  };
+
   const nameOf = nameFrom(events ?? []);
-  const filterPanel = (
-    <View style={styles.filters} testID="audit-filters">
+  const botOptions = [
+    { value: "", label: "Any Bot" },
+    ...[...bots].sort((a, b) => a.name.localeCompare(b.name)).map((b) => ({ value: b.id, label: b.name })),
+  ];
+  if (filters.bot && !botOptions.some((o) => o.value === filters.bot)) botOptions.push({ value: filters.bot, label: botName?.(filters.bot) ?? filters.bot });
+
+  const filterFields = (
+    <>
       <View style={styles.inputs}>
         <Field label="Action" value={filters.action} onChange={set("action")} placeholder="Action, e.g. bot.* or auth.login_failed" />
+      </View>
+      <Chips options={KINDS} value={filters.action.trim()} onChange={set("action")} />
+      <View style={styles.inputs}>
         <Field label="Person" value={filters.person} onChange={set("person")} placeholder="Person: email or id" />
+        <Field label="On behalf of" value={filters.onBehalfOf} onChange={set("onBehalfOf")} placeholder="Done for: email or id" />
+        <Field label="Session" value={filters.session} onChange={set("session")} placeholder="Session id" />
       </View>
       <Chips options={ACTORS} value={filters.actor} onChange={set("actor")} disabled={!!filters.person.trim()} />
+      {botOptions.length > 1 ? <Chips options={botOptions} value={filters.bot} onChange={set("bot")} /> : null}
       <Chips options={METHODS} value={filters.method} onChange={set("method")} />
       <Chips options={OUTCOMES} value={filters.outcome} onChange={set("outcome")} />
       <View style={styles.inputs}>
@@ -195,7 +221,59 @@ export function AuditLog({ api, onBack, botName }: Props) {
         ) : null}
       </View>
       {filterError ? <Text style={styles.error}>{filterError}</Text> : null}
+    </>
+  );
+  // Phones scroll the filters, so the list keeps some of the screen.
+  const filterPanel = wide ? (
+    <View style={styles.filters} testID="audit-filters">
+      {filterFields}
     </View>
+  ) : (
+    <ScrollView style={styles.filtersNarrow} contentContainerStyle={styles.filters} testID="audit-filters" keyboardShouldPersistTaps="handled">
+      {filterFields}
+    </ScrollView>
+  );
+
+  const detail = selected ? <AuditEventDetail key={selected.id} e={selected} botName={botName} nameOf={nameOf} onPivot={pivot} /> : null;
+
+  const list = (
+    <FlatList
+      style={styles.list}
+      data={events ?? []}
+      extraData={selected?.id}
+      keyExtractor={(e) => String(e.id)}
+      contentContainerStyle={styles.listContent}
+      refreshing={refreshing}
+      onRefresh={() => void refresh()}
+      testID="audit-list"
+      renderItem={({ item }) => (
+        <EventRow e={item} selected={selected?.id === item.id} onPress={() => setSelected(item)} botName={botName} nameOf={nameOf} />
+      )}
+      ListEmptyComponent={
+        loading ? (
+          <ActivityIndicator color={colors.textDim} style={{ marginTop: 20 }} />
+        ) : (
+          <Text style={error ? styles.error : styles.empty}>{error ?? "No events match."}</Text>
+        )
+      }
+      ListFooterComponent={
+        <View style={styles.footer}>
+          {events?.length && error ? <Text style={styles.error}>{error}</Text> : null}
+          {next != null && !loading ? (
+            <Pressable
+              style={[styles.moreBtn, loadingMore && styles.busy]}
+              onPress={() => void load(shown.current, next)}
+              disabled={loadingMore}
+              accessibilityRole="button"
+              accessibilityState={{ disabled: loadingMore, busy: loadingMore }}
+            >
+              <Text style={styles.moreText}>{loadingMore ? "Loading…" : "Load more"}</Text>
+            </Pressable>
+          ) : null}
+          <Text style={styles.faint}>Append-only. Export uses the filters the list shows.</Text>
+        </View>
+      }
+    />
   );
 
   return (
@@ -229,32 +307,26 @@ export function AuditLog({ api, onBack, botName }: Props) {
         </>
       )}
       {exportError ? <Text style={styles.error}>{exportError}</Text> : null}
-      <FlatList
-        data={events ?? []}
-        keyExtractor={(e) => String(e.id)}
-        contentContainerStyle={styles.list}
-        renderItem={({ item }) => (
-          <EventRow e={item} open={openId === item.id} onPress={() => setOpenId((id) => (id === item.id ? null : item.id))} botName={botName} nameOf={nameOf} />
-        )}
-        ListEmptyComponent={
-          loading ? (
-            <ActivityIndicator color={colors.textDim} style={{ marginTop: 20 }} />
-          ) : (
-            <Text style={error ? styles.error : styles.empty}>{error ?? "No events match."}</Text>
-          )
-        }
-        ListFooterComponent={
-          <View style={styles.footer}>
-            {events?.length && error ? <Text style={styles.error}>{error}</Text> : null}
-            {next != null && !loading ? (
-              <Pressable style={styles.moreBtn} onPress={() => void load(shown.current, next)} accessibilityRole="button">
-                <Text style={styles.moreText}>Load more</Text>
+      {wide ? (
+        <View style={styles.body}>
+          {list}
+          <ScrollView style={styles.detailPane} contentContainerStyle={{ padding: 20 }}>
+            {detail ?? <Text style={styles.empty}>Pick an event to see all of it.</Text>}
+          </ScrollView>
+        </View>
+      ) : (
+        <>
+          {list}
+          <Modal visible={!!selected} animationType="slide" onRequestClose={() => setSelected(null)}>
+            <SafeAreaView style={styles.modalRoot}>
+              <Pressable style={styles.modalHeader} onPress={() => setSelected(null)} accessibilityRole="button" accessibilityLabel="Back to the audit log">
+                <Text style={styles.back}>‹ Audit log</Text>
               </Pressable>
-            ) : null}
-            <Text style={styles.faint}>Append-only. Export uses the filters the list shows.</Text>
-          </View>
-        }
-      />
+              <ScrollView contentContainerStyle={{ padding: 16, paddingRight: 20 }}>{detail}</ScrollView>
+            </SafeAreaView>
+          </Modal>
+        </>
+      )}
     </View>
   );
 }
@@ -268,6 +340,7 @@ const styles = StyleSheet.create({
   primaryText: { color: "#111", fontSize: 15 },
   busy: { opacity: 0.6 },
   filterToggle: { paddingHorizontal: 16, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: colors.border },
+  filtersNarrow: { maxHeight: "55%", flexGrow: 0 },
   filters: { gap: 10, padding: 16, borderBottomWidth: 1, borderBottomColor: colors.border },
   inputs: { flexDirection: "row", flexWrap: "wrap", gap: 8, alignItems: "center" },
   input: {
@@ -279,10 +352,15 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     color: colors.text,
   },
-  grow: { flexGrow: 1, flexBasis: 240 },
+  grow: { flexGrow: 1, flexBasis: 200 },
   clear: { paddingHorizontal: 8, paddingVertical: 10 },
   link: { color: colors.blueDot },
-  list: { padding: 12, gap: 4 },
+  body: { flex: 1, flexDirection: "row" },
+  list: { flex: 1 },
+  listContent: { padding: 12, gap: 4 },
+  detailPane: { width: 440, flexGrow: 0, borderLeftWidth: 1, borderLeftColor: colors.border },
+  modalRoot: { flex: 1, backgroundColor: colors.bgMain },
+  modalHeader: { padding: 16, borderBottomWidth: 1, borderBottomColor: colors.border },
   row: { padding: 12, borderRadius: 14, gap: 3, backgroundColor: colors.bgSidebar },
   rowBad: { borderLeftWidth: 3, borderLeftColor: colors.danger },
   rowOpen: { backgroundColor: colors.bgActive },
