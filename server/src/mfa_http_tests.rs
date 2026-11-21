@@ -36,7 +36,7 @@ fn unbase32(s: &str) -> Vec<u8> {
         let v = match c {
             b'A'..=b'Z' => c - b'A',
             b'2'..=b'7' => c - b'2' + 26,
-            _ => panic!("not base32: {s}"),
+            _ => panic!("not base32"),
         };
         buf = (buf << 5) | v as u32;
         bits += 5;

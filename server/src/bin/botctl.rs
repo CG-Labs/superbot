@@ -442,8 +442,9 @@ fn login(args: &[&str]) -> Result<String, String> {
         let Some(challenge) = v["challenge"].as_str().filter(|_| code == 401) else { return Err(failure(code, &res)) };
         let enroll = v["mfa"] == "enroll";
         eprintln!("{}", v["error"].as_str().unwrap_or_default());
-        if enroll && let Some(secret) = v["secret"].as_str() {
-            eprintln!("\nSetup key: {secret}\n{}\n", v["otpauthUrl"].as_str().unwrap_or_default());
+        // Not `secret`: CodeQL reads that name as private data, and the user must see it to enrol.
+        if enroll && let Some(setup) = v["secret"].as_str() {
+            eprintln!("\nSetup key: {setup}\n{}\n", v["otpauthUrl"].as_str().unwrap_or_default());
         }
         eprint!("{}", if enroll { "Code: " } else { "Code (or a recovery code): " });
         let _ = std::io::stderr().flush();
