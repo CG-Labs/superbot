@@ -13,7 +13,9 @@ import type {
   LoginCode,
   Message,
   ModelOption,
+  MyTeamInvite,
   MyUsage,
+  OffboardingPreview,
   NewPolicyRule,
   NotificationsPatch,
   NotificationsView,
@@ -33,6 +35,10 @@ import type {
   SetupStatus,
   SignupApproval,
   SignupRequest,
+  Team,
+  TeamInvite,
+  TeamMember,
+  TeamRole,
   TeammateAccounts,
   TeammateLoginsView,
   TeammateRemoval,
@@ -461,6 +467,63 @@ export class SuperBotApi {
   /** Removes your login there. */
   async teammateLogout(ownerId: string, harness: string): Promise<TeammateLoginsView> {
     return this.request<TeammateLoginsView>("DELETE", teammateLoginPath(ownerId, `harness-logins/${encodeURIComponent(harness)}`));
+  }
+
+  // Your own team (ADR 0087, 0088). The server decides who may change what; owners and
+  // admins manage it, everyone on it can read it.
+
+  /** Your team; null when you aren't on one, or this server has no teams. */
+  async team(): Promise<Team | null> {
+    try {
+      return await this.request<Team>("GET", "/api/team");
+    } catch (e) {
+      if (e instanceof ApiError && [403, 404, 405].includes(e.status)) return null;
+      throw e;
+    }
+  }
+
+  /** Teams waiting for you to accept; empty on servers without teams. */
+  async myTeamInvites(): Promise<MyTeamInvite[]> {
+    try {
+      return await this.request<MyTeamInvite[]>("GET", "/api/me/team-invites");
+    } catch (e) {
+      if (e instanceof ApiError && [403, 404, 405].includes(e.status)) return [];
+      throw e;
+    }
+  }
+
+  async acceptTeamInvite(id: string): Promise<void> {
+    await this.request("POST", `/api/me/team-invites/${encodeURIComponent(id)}/accept`);
+  }
+
+  async declineTeamInvite(id: string): Promise<void> {
+    await this.request("DELETE", `/api/me/team-invites/${encodeURIComponent(id)}`);
+  }
+
+  async leaveTeam(): Promise<void> {
+    await this.request("POST", "/api/team/leave");
+  }
+
+  async inviteToTeam(email: string, role: Exclude<TeamRole, "owner">): Promise<TeamInvite> {
+    return this.request<TeamInvite>("POST", "/api/team/invites", { email, role });
+  }
+
+  async cancelTeamInvite(id: string): Promise<void> {
+    await this.request("DELETE", `/api/team/invites/${encodeURIComponent(id)}`);
+  }
+
+  async setTeamRole(userId: string, role: TeamRole): Promise<TeamMember> {
+    return this.request<TeamMember>("PATCH", `/api/team/members/${encodeURIComponent(userId)}`, { role });
+  }
+
+  /** What removing them would do, asked before removing; changes nothing. */
+  async offboardingPreview(userId: string): Promise<OffboardingPreview> {
+    return this.request<OffboardingPreview>("GET", `/api/team/members/${encodeURIComponent(userId)}/offboarding`);
+  }
+
+  /** Takes them off the team: ADR 0087's offboarding. */
+  async removeTeammate(userId: string): Promise<void> {
+    await this.request("DELETE", `/api/team/members/${encodeURIComponent(userId)}`);
   }
 
   // Requests for access from the landing page: admins only (ADR 0022).

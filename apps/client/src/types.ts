@@ -675,3 +675,81 @@ export type LoginEvent =
   | { type: "ping" }
   | { type: "exit"; success: boolean; status: string; loggedIn: boolean }
   | { type: "error"; message: string };
+
+// Team accounts (ADR 0087, 0088): your own team, from `GET /api/team`.
+
+export type TeamRole = "owner" | "admin" | "member";
+
+/** A teammate's machine as the team's owners and admins see it: its lifecycle, never its address, files, logins or screens. */
+export interface TeamMachine {
+  state: string;
+  tier: string;
+  region: string;
+  enrollment: string;
+  agentSeenAt: number | null;
+  assigned: boolean;
+  backups: boolean;
+  lastBackupAt: number | null;
+  createdAt: number;
+  /** The team gave it, so the team manages it; else it's the teammate's own. */
+  team: boolean;
+  /** Set once they've left: when the released machine is destroyed. */
+  releaseAt: number | null;
+}
+
+export interface TeamMember {
+  id: string;
+  name: string | null;
+  email: string | null;
+  role: TeamRole;
+  joinedAt: number;
+  active: boolean;
+  /** Only for the team's owners and admins; null when they have none. */
+  machine?: TeamMachine | null;
+}
+
+export interface TeamInvite {
+  id: string;
+  teamId: string;
+  email: string;
+  role: TeamRole;
+  createdAt: number;
+  createdBy: string | null;
+  expiresAt: number;
+}
+
+export interface Team {
+  id: string;
+  name: string;
+  /** Joining gives a machine. */
+  machines: boolean;
+  createdAt: number;
+  members: TeamMember[];
+  /** Your role in it. */
+  role?: TeamRole;
+  /** Owners and admins only. */
+  invites?: TeamInvite[];
+  /** Owners and admins only: how long a leaver's team machine is kept suspended. */
+  machineDays?: number;
+}
+
+/** An invite waiting for you, from `GET /api/me/team-invites`. */
+export interface MyTeamInvite {
+  id: string;
+  team: { id: string; name: string | null };
+  role: TeamRole;
+  expiresAt: number;
+}
+
+/** What taking a teammate off the team would do, from `GET /api/team/members/{user}/offboarding`. */
+export interface OffboardingPreview {
+  user: { id: string; name: string | null };
+  role: TeamRole;
+  allowed: boolean;
+  blocked: "self" | "owner" | null;
+  /** Grants between them and teammates that end. */
+  grants: number;
+  machine: { fate: "suspend" | "destroy" | "kept" | "none"; days?: number };
+  /** What becomes of their work on teammates' machines and accounts; null when they have none there. */
+  work: { files: "archive" | "delete"; graceDays: number } | null;
+}

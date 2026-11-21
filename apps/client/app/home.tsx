@@ -15,6 +15,7 @@ import { approvalParam } from "../src/notifications";
 import { botParam } from "../src/push";
 import { isStarter, starterText } from "../src/prompts";
 import { useSuperBot } from "../src/SuperBotContext";
+import { teamLinkWanted } from "../src/team";
 import { colors } from "../src/theme";
 
 /** Open screen viewer. `takeOver` tracks whether the user has control; `n` remounts it, e.g. to take over from a handoff card. */
@@ -37,6 +38,7 @@ export default function HomeScreen() {
   const [focusId, setFocusId] = useState<string | null>(null);
   const [setupWaiting, setSetupWaiting] = useState(false);
   const [billing, setBilling] = useState(false);
+  const [teamLink, setTeamLink] = useState(false);
   const [prefill, setPrefill] = useState<string | null>(null);
 
   useEffect(() => (api ? watchSetup(api, me, setSetupWaiting) : undefined), [api, me]);
@@ -58,6 +60,7 @@ export default function HomeScreen() {
     if (!api) return;
     let live = true;
     void planAvailable(api).then((on) => live && setBilling(on));
+    void teamLinkWanted(api).then((on) => live && setTeamLink(on));
     return () => {
       live = false;
     };
@@ -123,6 +126,7 @@ export default function HomeScreen() {
             onOpenApprovals={() => setApprovalsOpen(true)}
             onOpenPlan={billing ? () => router.push("/plan") : undefined}
             onOpenSecrets={() => router.push("/secrets")}
+            onOpenTeam={teamLink ? () => router.push("/team") : undefined}
             onOpenSettings={() => router.push("/settings")}
             onOpenUsers={() => router.push("/users")}
             onOpenAudit={() => router.push("/audit")}
