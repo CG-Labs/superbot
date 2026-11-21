@@ -1,7 +1,8 @@
 import { AppState } from "react-native";
 import type { SuperBotApi } from "./api";
+import { subscriptionLine } from "./billing";
 import { relativeTime } from "./invite";
-import type { OffboardingPreview, Team, TeamMachine, TeamMember, TeamRole, WorkPolicy } from "./types";
+import type { OffboardingPreview, Team, TeamBilling, TeamMachine, TeamMember, TeamRole, WorkPolicy } from "./types";
 
 /**
  * The team screen's rules (ADR 0088). They mirror the server's (ADR 0087) so the screen
@@ -43,9 +44,45 @@ export function ownerCount(team: Pick<Team, "members">): number {
   return team.members.filter((m) => m.role === "owner").length;
 }
 
-/** Whether you may leave: the last owner can't while others are on the team. */
-export function canLeave(team: Pick<Team, "members" | "role">): boolean {
-  return !(team.role === "owner" && team.members.length > 1 && ownerCount(team) === 1);
+/**
+ * Why you can't leave, or null when you may: the last owner can't while others are on
+ * the team, and the last person can't while the team pays for a plan (ADR 0093).
+ */
+export function leaveBlocked(team: Pick<Team, "members" | "role" | "billing">): string | null {
+  if (team.role === "owner" && team.members.length > 1 && ownerCount(team) === 1) return "You're the team's only owner. Make someone else an owner before you leave.";
+  if (team.members.length === 1 && team.billing?.plan) return "The team pays for a plan. Cancel it under Manage billing before you leave; the team goes when you do.";
+  return null;
+}
+
+export function canLeave(team: Pick<Team, "members" | "role" | "billing">): boolean {
+  return leaveBlocked(team) === null;
+}
+
+const day = (unixSeconds: number) => new Date(unixSeconds * 1000).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
+
+/** What everyone on the team reads about its plan (ADR 0093). */
+export function teamPlanLine(b: TeamBilling | undefined): string | null {
+  if (!b) return null;
+  if (!b.plan) return "The team doesn't pay for a plan: everyone is on their own.";
+  return `The team pays for the ${b.plan.label} plan for everyone on it.`;
+}
+
+/** How the team's subscription stands, for its owners and admins. */
+export function teamSubscriptionLine(b: TeamBilling | undefined): string | null {
+  const sub = b?.subscription;
+  if (!b?.plan || !sub) return null;
+  if (sub.cancelAt) return `Set to end ${day(sub.cancelAt)}`;
+  return subscriptionLine(sub);
+}
+
+/** The seats Stripe bills against the people on the team. */
+export function seatsLine(b: TeamBilling | undefined): { text: string; tone: Tone } | null {
+  const s = b?.seats;
+  if (!s) return null;
+  const people = `${s.members} ${s.members === 1 ? "person" : "people"}`;
+  if (s.error) return { text: `${people} on the team, ${s.billed ?? 0} billed. ${s.error}`, tone: "warn" };
+  if (s.syncing) return { text: `${people} on the team, ${s.billed ?? 0} billed: updating with Stripe…`, tone: "dim" };
+  return { text: `${s.billed ?? s.members} ${s.billed === 1 ? "seat" : "seats"}, one for each person on the team. Adding or removing someone changes it, prorated.`, tone: "ok" };
 }
 
 export type Tone = "ok" | "warn" | "bad" | "dim";

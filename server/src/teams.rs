@@ -9,7 +9,9 @@
 //! What a team changes: sharing. A shared Bot, and a grant, reach only its owner's team
 //! (`acl::reaches`); with TEAMS=on, people in no team share with nobody. So leaving a
 //! team is losing access, and ADR 0052's and 0066's offboarding removes the leaver from
-//! teammates' machines and accounts as it does for any other loss of access.
+//! teammates' machines and accounts as it does for any other loss of access. While a
+//! team pays for a plan (ADR 0093, `team_billing`), joining or leaving also moves the
+//! member's tier and Stripe's seat count, and the team can't be emptied or deleted.
 //!
 //! Team owners and admins see each teammate's machine (its state, size, enrollment and
 //! placement) and give them one, suspend or resume it. That is all: they get no Bot,
@@ -157,6 +159,9 @@ fn team_view(app: &AppState, t: &Team, me: Option<&TeamMember>, manager: bool) -
         v["invites"] = json!(app.db.team_invites(&t.id));
         v["machineDays"] = json!(settings(app).machine_days);
     }
+    if let Some(b) = crate::team_billing::view(app, &t.id, manager) {
+        v["billing"] = b;
+    }
     v
 }
 
@@ -247,6 +252,7 @@ async fn join(app: &AppState, by: &Who, team: &Team, user: &User, role: &str, vi
     if !user.active() {
         return Err(conflict("This person is disabled. Enable them first."));
     }
+    let tier = app.tier_of(&user.id).name.clone();
     if !app.db.add_team_member(&team.id, &user.id, role, by.actor.id.as_deref()) {
         return Err(match app.db.team_id_of(&user.id) {
             Some(t) if t == team.id => conflict("They're on this team already."),
@@ -276,6 +282,7 @@ async fn join(app: &AppState, by: &Who, team: &Team, user: &User, role: &str, vi
     }
     app.send(json!({ "type": "resync" }));
     let machine = provide(app, by, team, user).await;
+    crate::team_billing::member_changed(app, &team.id, &user.id, &tier, "joined");
     let member = app.db.team_member(&user.id).ok_or_else(|| not_found("Member"))?;
     let mut v = member_view(app, &member, true);
     v["provisioned"] = machine;
@@ -288,6 +295,7 @@ async fn join(app: &AppState, by: &Who, team: &Team, user: &User, role: &str, vi
 /// suspended and, after TEAM_MACHINE_DAYS, destroyed.
 pub async fn leave(app: &AppState, by: &Who, team_id: &str, user_id: &str, reason: &str) -> bool {
     let Some(member) = app.db.team_member(user_id).filter(|m| m.team_id == team_id) else { return false };
+    let tier = app.tier_of(user_id).name.clone();
     if !app.db.remove_team_member(team_id, user_id, reason != "team_deleted") {
         return false;
     }
@@ -321,6 +329,7 @@ pub async fn leave(app: &AppState, by: &Who, team_id: &str, user_id: &str, reaso
     }
     app.db.record(&team_event(by, "team.member_left", team_id, json!({ "user": user_id, "role": member.role, "reason": reason })));
     release(app, by, team_id, user_id).await;
+    crate::team_billing::member_changed(app, team_id, user_id, &tier, "left");
     app.send(json!({ "type": "resync" }));
     true
 }
@@ -435,7 +444,7 @@ fn my_team(app: &AppState, c: &Caller) -> Res<(User, TeamMember, Team)> {
     Ok((u, m, t))
 }
 
-fn my_managed_team(app: &AppState, c: &Caller) -> Res<(User, TeamMember, Team)> {
+pub(crate) fn my_managed_team(app: &AppState, c: &Caller) -> Res<(User, TeamMember, Team)> {
     let (u, m, t) = my_team(app, c)?;
     if !manages(&m.role) {
         return Err(forbidden("Only the team's owners and admins can do this."));
@@ -459,7 +468,11 @@ fn owners(app: &AppState, team_id: &str) -> usize {
 /// each teammate's machine and the invites waiting.
 pub async fn mine(State(app): State<AppState>, Extension(c): Extension<Caller>) -> Res {
     let (_, m, t) = my_team(&app, &c)?;
-    Ok(Json(team_view(&app, &t, Some(&m), manages(&m.role))))
+    let mut v = team_view(&app, &t, Some(&m), manages(&m.role));
+    if v.get("billing").is_some() {
+        v["billing"]["canChange"] = json!(manages(&m.role) && crate::rbac::allows(c.principal, crate::rbac::Perm::Write));
+    }
+    Ok(Json(v))
 }
 
 /// `POST /api/team/leave`: off your team. Its last owner can't while others are on it.
@@ -469,6 +482,7 @@ pub async fn leave_mine(State(app): State<AppState>, Extension(c): Extension<Cal
     if m.role == OWNER && others && owners(&app, &t.id) == 1 {
         return Err(conflict("You're the team's only owner. Make someone else an owner first."));
     }
+    let _billing = if others { None } else { crate::team_billing::may_delete(&app, &by, &t.id, "last_member_left").await? };
     if !leave(&app, &by, &t.id, &u.id, "left").await {
         return Err(conflict("You're the team's only owner. Make someone else an owner first."));
     }
@@ -775,6 +789,7 @@ pub async fn update(State(app): State<AppState>, Extension(by): Extension<Who>, 
 /// `DELETE /api/teams/{id}`: everyone leaves, as if each had, then the team goes.
 pub async fn delete(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     let t = need_team(&app, &id)?;
+    let _billing = crate::team_billing::may_delete(&app, &by, &t.id, "admin").await?;
     for m in app.db.team_members(&t.id) {
         leave(&app, &by, &t.id, &m.user_id, "team_deleted").await;
     }
@@ -816,6 +831,7 @@ pub async fn delete_member(State(app): State<AppState>, Extension(by): Extension
     if m.role == OWNER && others && owners(&app, &t.id) == 1 {
         return Err(conflict("They're the team's only owner. Make someone else an owner first, or delete the team."));
     }
+    let _billing = if others { None } else { crate::team_billing::may_delete(&app, &by, &t.id, "last_member_removed").await? };
     if !leave(&app, &by, &t.id, &u.id, "removed").await {
         return Err(conflict("They're the team's only owner. Make someone else an owner first, or delete the team."));
     }

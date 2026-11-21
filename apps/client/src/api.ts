@@ -595,6 +595,16 @@ export class SuperBotApi {
     }
   }
 
+  /** A Stripe Checkout page for the team's plan, a seat for each teammate (ADR 0093). Owners and admins only. */
+  async teamCheckout(tier: string): Promise<{ url: string }> {
+    return this.request<{ url: string }>("POST", "/api/team/billing/checkout", { tier });
+  }
+
+  /** The team's Stripe billing portal: change or cancel its plan, cards, invoices. */
+  async teamBillingPortal(): Promise<{ url: string }> {
+    return this.request<{ url: string }>("POST", "/api/team/billing/portal");
+  }
+
   /** Teams waiting for you to accept; empty on servers without teams. */
   async myTeamInvites(): Promise<MyTeamInvite[]> {
     try {

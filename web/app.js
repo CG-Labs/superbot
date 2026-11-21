@@ -386,7 +386,7 @@ $("machines-reconcile").addEventListener("click", async () => {
   loadMachines();
 });
 
-// Teams (ADR 0087, 0088): every team, its people, roles and machine states. Each team's
+// Teams (ADR 0087, 0088, 0093): every team, its people, roles, machine states and plan. Each team's
 // own owners and admins manage it in the app; this is the server admins' fallback.
 
 const TEAM_ROLES = { owner: "Owner", admin: "Admin", member: "Member" };
@@ -411,12 +411,21 @@ function teamMachine(m) {
   return `${esc(m.state)}<div class="sub">${esc(whose)} · ${esc(m.tier)} · ${esc(m.enrollment)}</div>${released}`;
 }
 
+// The team's plan and seats (ADR 0093), when this server sells plans. Changed in Stripe or by the team's managers.
+function teamPlan(b) {
+  if (!b) return "";
+  if (!b.plan) return " · no team plan";
+  const seats = b.seats ? ` · ${b.seats.billed ?? 0} of ${b.seats.members} seats billed${b.seats.error ? " (Stripe hasn't caught up; retrying)" : b.seats.syncing ? " (updating)" : ""}` : "";
+  const status = b.subscription ? ` (${b.subscription.status}${b.subscription.cancelAt ? `, ends ${fmt(b.subscription.cancelAt * 1000)}` : ""})` : "";
+  return ` · team pays for ${b.plan.label}${status}${seats}`;
+}
+
 function renderTeams() {
   const s = teams.settings || {};
   $("teams-settings").textContent = `${s.strict ? "TEAMS=on: people in no team share with nobody." : "People in no team share with each other (TEAMS=on stops that)."} A leaver's team machine is ${s.machineDays ? `suspended, then deleted after ${s.machineDays} days` : "deleted at once"}.`;
   $("teams-empty").hidden = teams.teams.length > 0;
   $("teams-list").innerHTML = teams.teams.map((t) => `<div class="card" data-team="${esc(t.id)}">
-      <div class="bar"><b>${esc(t.name)}</b> <span class="sub">${t.members.length} people · ${t.machines ? "joining gives a machine" : "no machines given"}</span>
+      <div class="bar"><b>${esc(t.name)}</b> <span class="sub">${t.members.length} people · ${t.machines ? "joining gives a machine" : "no machines given"}${esc(teamPlan(t.billing))}</span>
         <button type="button" class="btn push" data-act="delete-team">Delete team</button></div>
       <table class="grid">
         <thead><tr><th>Person</th><th>Role</th><th>Machine</th><th></th></tr></thead>

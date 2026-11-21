@@ -97,6 +97,13 @@ describe("PlanView (ADR 0042)", () => {
     expect(open).toHaveBeenCalledWith("https://billing.stripe.com/p/session/1");
   });
 
+  it("says the team pays, and offers no personal upgrade, while a team plan applies (ADR 0093)", async () => {
+    await render(<PlanView api={fakeApi(billing({ teamPlan: { id: "t1", name: "Alpha", tier: "pro", periodEnd: 1_797_582_000 } }))} onBack={jest.fn()} />);
+    expect(await screen.findByText("Alpha pays for this plan for everyone on it.")).toBeOnTheScreen();
+    expect(screen.queryByRole("link", { name: "Upgrade to Pro" })).toBeNull();
+    expect(screen.getByText("Your team's owners and admins change its plan on the Team screen.")).toBeOnTheScreen();
+  });
+
   it("shows read-only people their plan without buttons to change it", async () => {
     await render(<PlanView api={fakeApi(billing({ canChange: false, portal: true }))} onBack={jest.fn()} />);
     expect(await screen.findByText("Starter plan")).toBeOnTheScreen();

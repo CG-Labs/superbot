@@ -136,6 +136,7 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         // team's owners and admins. Every team is under `teams`, for admins.
         ("GET", ["team"] | ["me", "team-invites"] | ["team", "members", _, "offboarding"]) => Account,
         ("POST", ["team", "leave"] | ["team", "invites"] | ["me", "team-invites", _, "accept"]) => Write,
+        ("POST", ["team", "billing", "checkout" | "portal"]) => Write,
         ("DELETE", ["team", "invites", _] | ["me", "team-invites", _]) => Write,
         ("PATCH" | "DELETE", ["team", "members", _]) => Write,
         ("POST", ["team", "members", _, "machine"] | ["team", "members", _, "machine", "suspend" | "resume"]) => Write,
@@ -400,6 +401,11 @@ mod tests {
             ("POST", "/api/team/members/u1/machine/resize", Perm::Admin),
             ("GET", "/api/team/members/u1/machine", Perm::Admin),
             ("PATCH", "/api/team", Perm::Admin),
+            // The team's plan (ADR 0093); handlers allow only its owners and admins.
+            ("POST", "/api/team/billing/checkout", Perm::Write),
+            ("POST", "/api/team/billing/portal", Perm::Write),
+            ("GET", "/api/team/billing", Perm::Admin),
+            ("POST", "/api/team/billing", Perm::Admin),
             ("GET", "/api/me/team-invites", Perm::Account),
             ("POST", "/api/me/team-invites/ti1/accept", Perm::Write),
             ("DELETE", "/api/me/team-invites/ti1", Perm::Write),

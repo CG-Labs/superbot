@@ -11,7 +11,9 @@
 //! emails are queued in the same transaction that records the event. A sender sends
 //! what's queued, tries a failed send again with a backoff, and audits every send,
 //! skip and failure. Emails say what changed and link to the Plan screen. They never
-//! carry a Stripe id, a price, a portal link or anything else from the provider.
+//! carry a Stripe id, a price, a portal link or anything else from the provider. A
+//! team plan's emails (ADR 0093) go to each of the team's owners and admins instead,
+//! and link to the Team screen.
 
 use crate::audit::{Actor, Outcome, Who};
 use crate::db::{Applied, Change, Subscription};
@@ -128,6 +130,9 @@ pub struct Facts {
     /// A resize's wait, in the words the user sees in the app.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// The team whose plan it is (ADR 0093), by name: told to its owners and admins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
 }
 
 /// An email to queue.
@@ -179,6 +184,9 @@ fn percent(used: u64, limit: u64) -> u64 {
 /// An email's subject and body. Pure: `link` is the Plan screen (None without a public
 /// address), `computer` what the person's computer is doing about the change.
 pub fn render(kind: Kind, f: &Facts, link: Option<&str>, computer: Option<&str>) -> Rendered {
+    if let Some(team) = &f.team {
+        return render_team(kind, f, team, link);
+    }
     let plan = f.plan.as_deref().unwrap_or("your");
     let next = f.next_plan.as_deref().unwrap_or("default");
     let open = |what: &str| match link {
@@ -294,6 +302,60 @@ pub fn render(kind: Kind, f: &Facts, link: Option<&str>, computer: Option<&str>)
     Rendered { subject: format!("[SuperBot] {}", one_line(&subject)), body }
 }
 
+/// A team plan's email (ADR 0093), to the team's owners and admins; `link` is the Team
+/// screen. Only plan kinds are ever about a team.
+fn render_team(kind: Kind, f: &Facts, team: &str, link: Option<&str>) -> Rendered {
+    let plan = f.plan.as_deref().unwrap_or("its");
+    let next = f.next_plan.as_deref().unwrap_or("default");
+    let open = |what: &str| match link {
+        Some(l) => format!("{what}:\n  {l}\n"),
+        None => format!("{what}: open Team in SuperBot.\n"),
+    };
+    let until = f.until.map(day);
+    let mut body = String::new();
+    let subject = match kind {
+        Kind::PlanStarted => {
+            body.push_str(&format!("Thanks for subscribing. {team} is on the {plan} plan now: every teammate gets its limits from today, and you pay a seat for each.\n"));
+            if let Some(d) = &until {
+                body.push_str(&format!("It renews on {d}.\n"));
+            }
+            format!("{team}'s {plan} plan has started")
+        }
+        Kind::PlanChanged => {
+            let from = f.from_plan.as_deref().unwrap_or("its old");
+            body.push_str(&format!("{team}'s plan changed from {from} to {plan}. The {plan} plan's limits apply to every teammate now.\n"));
+            format!("{team}'s plan changed to {plan}")
+        }
+        Kind::PaymentFailed => {
+            body.push_str(&format!(
+                "The payment for {team}'s {plan} plan didn't go through. The team keeps the plan while it's tried again over the next few days; if it keeps failing, the plan ends for every teammate.\n\n"
+            ));
+            body.push_str(&open("To update the card, choose Manage billing on the team's plan"));
+            format!("{team}'s payment for the {plan} plan didn't go through")
+        }
+        Kind::PlanEnding => {
+            let d = until.as_deref().unwrap_or("the end of this billing period");
+            body.push_str(&format!("{team}'s {plan} plan is set to end on {d}. Nothing changes until then; after that teammates move to their own plans, or the {next} plan.\n\n"));
+            body.push_str(&open("To keep it, choose Manage billing on the team's plan"));
+            format!("{team}'s {plan} plan ends on {d}")
+        }
+        _ => {
+            match f.why.as_deref() {
+                Some("unpaid") => body.push_str(&format!("{team}'s {plan} plan has ended because its payment didn't go through. ")),
+                _ => body.push_str(&format!("{team}'s {plan} plan has ended. ")),
+            }
+            body.push_str("Teammates are on their own plans now, or the default plan, with its limits.\n");
+            format!("{team}'s {plan} plan has ended")
+        }
+    };
+    if !matches!(kind, Kind::PaymentFailed | Kind::PlanEnding) {
+        body.push('\n');
+        body.push_str(&open("See the team's plan and seats"));
+    }
+    body.push_str("\n--\nSuperBot sends this to a team's owners and admins when its plan or billing changes.\n");
+    Rendered { subject: format!("[SuperBot] {}", one_line(&subject)), body }
+}
+
 /// A header can't hold a line break, and plan labels come from the tiers file.
 fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -311,42 +373,120 @@ pub struct SubEvent<'a> {
     pub ending: bool,
 }
 
-/// The emails a subscription event asks for, given what applying it changed. Pure.
-pub fn for_subscription(ev: &SubEvent, c: &Change, tiers: &Tiers) -> Vec<NewEmail> {
+/// A subscription event as the plan emails read it, whoever pays: a person or a team.
+struct PlanEvent<'a> {
+    event_id: &'a str,
+    applied: &'a Applied,
+    subscription: &'a str,
+    /// The tier the subscription pays for as the event left it.
+    tier: Option<&'a str>,
+    status: &'a str,
+    period_end: Option<i64>,
+    cancel_at: Option<i64>,
+    ending: bool,
+    /// Whether a subscription paid for the plan before the event, and for which tier.
+    paid_before: bool,
+    paid_tier: Option<&'a str>,
+    /// This subscription pays for the plan after the event.
+    pays_after: bool,
+    /// Its status before the event; None: botd hadn't seen it.
+    status_before: Option<&'a str>,
+    /// The tier of what pays once this one ends.
+    next: Option<&'a str>,
+}
+
+/// Each email a subscription event asks for: its kind, key and facts. Pure.
+fn plan_emails(p: &PlanEvent, tiers: &Tiers) -> Vec<(Kind, String, Facts)> {
     let label = |t: Option<&str>| tiers.of(t).label.clone();
-    let user = &ev.row.user_id;
-    let email = |kind: Kind, key: String, facts: Facts| NewEmail { key, user_id: user.clone(), kind, facts, event_id: Some(ev.event_id.to_string()) };
-    let per_event = |kind: Kind| format!("stripe:{}:{}", ev.event_id, kind.as_str());
+    let per_event = |kind: Kind| format!("stripe:{}:{}", p.event_id, kind.as_str());
     let mut out = Vec::new();
-    match c.applied {
+    match p.applied {
         Applied::Duplicate | Applied::Stale | Applied::OtherUser | Applied::CustomerOfAnotherUser => return out,
         Applied::Changed { from, to: Some(to) } => {
-            let kind = if c.paying_before.is_none() { Kind::PlanStarted } else { Kind::PlanChanged };
-            let until = (ev.row.tier.as_deref() == Some(to.as_str())).then_some(ev.row.period_end).flatten().map(|s| s * 1000);
-            out.push(email(kind, per_event(kind), Facts { plan: Some(label(Some(to))), from_plan: Some(label(from.as_deref())), until, ..Default::default() }));
+            let kind = if p.paid_before { Kind::PlanChanged } else { Kind::PlanStarted };
+            let until = (p.tier == Some(to.as_str())).then_some(p.period_end).flatten().map(|s| s * 1000);
+            out.push((kind, per_event(kind), Facts { plan: Some(label(Some(to))), from_plan: Some(label(from.as_deref())), until, ..Default::default() }));
         }
         Applied::Changed { from, to: None } => {
-            let ended = c.paying_before.and_then(|s| s.tier.clone()).or_else(|| from.clone());
-            let why = (ev.row.status == "unpaid").then(|| "unpaid".to_string());
-            out.push(email(Kind::PlanEnded, per_event(Kind::PlanEnded), Facts { plan: Some(label(ended.as_deref())), next_plan: Some(label(None)), why, ..Default::default() }));
+            let ended = p.paid_tier.or(from.as_deref());
+            let why = (p.status == "unpaid").then(|| "unpaid".to_string());
+            out.push((Kind::PlanEnded, per_event(Kind::PlanEnded), Facts { plan: Some(label(ended)), next_plan: Some(label(None)), why, ..Default::default() }));
         }
         // Paying starts for a plan the user already had (an admin gave it): still a start.
-        Applied::Unchanged if c.paying_before.is_none() && c.paying_after.is_some_and(|s| s.subscription_id == ev.row.subscription_id) => {
-            let until = ev.row.period_end.map(|s| s * 1000);
-            out.push(email(Kind::PlanStarted, per_event(Kind::PlanStarted), Facts { plan: Some(label(ev.row.tier.as_deref())), until, ..Default::default() }));
+        Applied::Unchanged if !p.paid_before && p.pays_after => {
+            let until = p.period_end.map(|s| s * 1000);
+            out.push((Kind::PlanStarted, per_event(Kind::PlanStarted), Facts { plan: Some(label(p.tier)), until, ..Default::default() }));
         }
         Applied::Superseded | Applied::Unchanged => {}
     }
     // Only for the subscription that sets the plan: one replaced or not paid for yet changes nothing.
-    let sets_plan = !matches!(c.applied, Applied::Superseded) && ev.row.tier.is_some();
-    if sets_plan && ev.row.status == "past_due" && c.before.is_none_or(|b| b.status != "past_due") {
-        out.push(email(Kind::PaymentFailed, per_event(Kind::PaymentFailed), Facts { plan: Some(label(ev.row.tier.as_deref())), ..Default::default() }));
+    let sets_plan = !matches!(p.applied, Applied::Superseded) && p.tier.is_some();
+    if sets_plan && p.status == "past_due" && p.status_before != Some("past_due") {
+        out.push((Kind::PaymentFailed, per_event(Kind::PaymentFailed), Facts { plan: Some(label(p.tier)), ..Default::default() }));
     }
-    if let Some(at) = ev.cancel_at.filter(|_| sets_plan && !ev.ending) {
+    if let Some(at) = p.cancel_at.filter(|_| sets_plan && !p.ending) {
         // Once per subscription and end date, whichever of Stripe's events says it first.
-        let key = format!("stripe:{}:plan_ending:{at}", ev.row.subscription_id);
-        let next = c.other_paying.and_then(|s| s.tier.as_deref());
-        out.push(email(Kind::PlanEnding, key, Facts { plan: Some(label(ev.row.tier.as_deref())), next_plan: Some(label(next)), until: Some(at * 1000), ..Default::default() }));
+        let key = format!("stripe:{}:plan_ending:{at}", p.subscription);
+        out.push((Kind::PlanEnding, key, Facts { plan: Some(label(p.tier)), next_plan: Some(label(p.next)), until: Some(at * 1000), ..Default::default() }));
+    }
+    out
+}
+
+/// The emails a subscription event asks for, given what applying it changed. Pure.
+pub fn for_subscription(ev: &SubEvent, c: &Change, tiers: &Tiers) -> Vec<NewEmail> {
+    let p = PlanEvent {
+        event_id: ev.event_id,
+        applied: c.applied,
+        subscription: &ev.row.subscription_id,
+        tier: ev.row.tier.as_deref(),
+        status: &ev.row.status,
+        period_end: ev.row.period_end,
+        cancel_at: ev.cancel_at,
+        ending: ev.ending,
+        paid_before: c.paying_before.is_some(),
+        paid_tier: c.paying_before.and_then(|s| s.tier.as_deref()),
+        pays_after: c.paying_after.is_some_and(|s| s.subscription_id == ev.row.subscription_id),
+        status_before: c.before.map(|b| b.status.as_str()),
+        next: c.other_paying.and_then(|s| s.tier.as_deref()),
+    };
+    let event_id = Some(ev.event_id.to_string());
+    plan_emails(&p, tiers).into_iter().map(|(kind, key, facts)| NewEmail { key, user_id: ev.row.user_id.clone(), kind, facts, event_id: event_id.clone() }).collect()
+}
+
+/// A team's subscription event (ADR 0093), as the emails need it.
+pub struct TeamSubEvent<'a> {
+    pub event_id: &'a str,
+    pub row: &'a crate::db::TeamSubscription,
+    pub ending: bool,
+    /// The team's name, and who's told: its owners and admins.
+    pub team: &'a str,
+    pub to: &'a [String],
+}
+
+/// The emails a team subscription event asks for: the same as a person's, to each of
+/// the team's owners and admins, keyed per person. Pure.
+pub fn for_team_subscription(ev: &TeamSubEvent, c: &crate::db::TeamChange, tiers: &Tiers) -> Vec<NewEmail> {
+    let p = PlanEvent {
+        event_id: ev.event_id,
+        applied: c.applied,
+        subscription: &ev.row.subscription_id,
+        tier: ev.row.tier.as_deref(),
+        status: &ev.row.status,
+        period_end: ev.row.period_end,
+        cancel_at: ev.row.cancel_at,
+        ending: ev.ending,
+        paid_before: c.paying_before.is_some(),
+        paid_tier: c.paying_before.and_then(|s| s.tier.as_deref()),
+        pays_after: c.paying_after.is_some_and(|s| s.subscription_id == ev.row.subscription_id),
+        status_before: c.before.map(|b| b.status.as_str()),
+        next: c.other_paying.and_then(|s| s.tier.as_deref()),
+    };
+    let mut out = Vec::new();
+    for (kind, key, facts) in plan_emails(&p, tiers) {
+        let facts = Facts { team: Some(ev.team.to_string()), ..facts };
+        for user in ev.to {
+            out.push(NewEmail { key: format!("{key}:{user}"), user_id: user.clone(), kind, facts: facts.clone(), event_id: Some(ev.event_id.to_string()) });
+        }
     }
     out
 }
@@ -370,6 +510,8 @@ pub struct BillingMail {
     mailer: Arc<dyn Mailer>,
     /// `{PUBLIC_URL}/app/plan`. None: emails go without links.
     plan_link: Option<String>,
+    /// `{PUBLIC_URL}/app/team`, for a team's plan emails.
+    team_link: Option<String>,
     wake: tokio::sync::Notify,
     /// One pass at a time, so no email is sent by two.
     busy: tokio::sync::Mutex<()>,
@@ -377,8 +519,14 @@ pub struct BillingMail {
 
 impl BillingMail {
     pub fn new(mailer: Arc<dyn Mailer>, public_url: Option<&str>) -> BillingMail {
-        let plan_link = public_url.map(|b| format!("{}{}", b.trim_end_matches('/'), crate::billing::RETURN_PATH));
-        BillingMail { mailer, plan_link, wake: tokio::sync::Notify::new(), busy: tokio::sync::Mutex::new(()) }
+        let link = |path: &str| public_url.map(|b| format!("{}{path}", b.trim_end_matches('/')));
+        BillingMail {
+            mailer,
+            plan_link: link(crate::billing::RETURN_PATH),
+            team_link: link(crate::team_billing::RETURN_PATH),
+            wake: tokio::sync::Notify::new(),
+            busy: tokio::sync::Mutex::new(()),
+        }
     }
 }
 
@@ -441,6 +589,14 @@ pub fn subscription_emails(app: &App, ev: &SubEvent, c: &Change) -> Vec<NewEmail
         return Vec::new();
     }
     for_subscription(ev, c, app.tiers())
+}
+
+/// The emails a team subscription event asks for, when billing emails are on.
+pub fn team_subscription_emails(app: &App, ev: &TeamSubEvent, c: &crate::db::TeamChange) -> Vec<NewEmail> {
+    if app.billing_mail.get().is_none() {
+        return Vec::new();
+    }
+    for_team_subscription(ev, c, app.tiers())
 }
 
 /// A key part per tier and billing period, so each limit says so once a period.
@@ -568,7 +724,10 @@ async fn send_one(app: &App, m: &BillingMail, q: &Queued) -> Result<bool, String
     if !app.db.claim_billing_email(q.id, crate::db::now() + backoff_ms(attempts))? {
         return Ok(false);
     }
-    let r = render(kind, &q.facts, m.plan_link.as_deref(), computer(app, q, kind).as_deref());
+    let r = match q.facts.team {
+        Some(_) => render(kind, &q.facts, m.team_link.as_deref(), None),
+        None => render(kind, &q.facts, m.plan_link.as_deref(), computer(app, q, kind).as_deref()),
+    };
     let mail = smtp::Mail { to: to.clone(), subject: r.subject, body: r.body };
     d["to"] = json!(to);
     d["attempts"] = json!(attempts);

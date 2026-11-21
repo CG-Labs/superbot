@@ -1,21 +1,25 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
+import { checkoutNotice, limitSummary, openBillingPage } from "../src/billing";
 import { confirmAsync } from "../src/dialogs";
 import {
   assignableRoles,
   blockedReason,
-  canLeave,
   canRemove,
+  leaveBlocked,
   looksLikeEmail,
   machineStatus,
   managesTeam,
   offboardingMessage,
+  seatsLine,
   TEAM_ROLE_LABEL,
+  teamPlanLine,
+  teamSubscriptionLine,
   type Tone,
 } from "../src/team";
 import { colors } from "../src/theme";
-import type { MyTeamInvite, Team, TeamMember, TeamRole } from "../src/types";
+import type { MyTeamInvite, Team, TeamBilling, TeamMember, TeamRole } from "../src/types";
 import { Chips } from "./Chips";
 
 interface Props {
@@ -24,7 +28,15 @@ interface Props {
   /** Read-only people see their team and change nothing; the server refuses them anyway. */
   canWrite: boolean;
   onBack: () => void;
+  /** `?checkout=` from Stripe's return link, after buying the team's plan. */
+  checkout?: string | string[];
+  /** Opens a Stripe page; `openBillingPage` unless a test swaps it. */
+  open?: (url: string) => Promise<void>;
 }
+
+/** After a successful checkout, how often and how many times to look for Stripe's confirmation. */
+export const TEAM_CONFIRM_EVERY_MS = 3000;
+const CONFIRM_TRIES = 20;
 
 const message = (e: unknown, fallback: string) => (e instanceof Error ? e.message : fallback);
 
@@ -90,8 +102,44 @@ function MemberRow({
   );
 }
 
+/** The team's plan (ADR 0093): who pays for everyone's, and for owners and admins, its seats and Stripe's pages. */
+function TeamPlan({ b, manage, busy, onBuy, onPortal }: { b: TeamBilling; manage: boolean; busy: boolean; onBuy: (tier: string) => void; onPortal: () => void }) {
+  const status = teamSubscriptionLine(b);
+  const seats = seatsLine(b);
+  const change = manage && b.canChange !== false;
+  return (
+    <View style={styles.section} testID="team-plan">
+      <Text style={styles.sectionTitle}>Plan</Text>
+      <View style={styles.card}>
+        <Text style={styles.name}>{b.plan ? `${b.plan.label} plan` : "No team plan"}</Text>
+        <Text style={styles.dim}>{teamPlanLine(b)}</Text>
+        {status ? <Text style={styles.dim}>{status}</Text> : null}
+        {seats ? <Text style={[styles.status, TONE[seats.tone]]}>{seats.text}</Text> : null}
+        {change && b.portal ? (
+          <Pressable style={[styles.btn, styles.self]} disabled={busy} onPress={onPortal} accessibilityRole="link" accessibilityHint="Opens Stripe's billing page">
+            <Text style={styles.btnText}>Manage billing</Text>
+          </Pressable>
+        ) : null}
+      </View>
+      {change && !b.plan
+        ? b.plans?.map((p) => (
+            <View key={p.name} style={styles.card}>
+              <Text style={styles.name}>{p.label}</Text>
+              <Text style={styles.faint}>{limitSummary(p.limits).join(" · ")}</Text>
+              <Pressable style={[styles.primaryBtn, styles.self]} disabled={busy} onPress={() => onBuy(p.name)} accessibilityRole="link" accessibilityLabel={`Buy ${p.label} for the team`} accessibilityHint="Opens Stripe Checkout to pay">
+                <Text style={styles.primaryText}>Buy {p.label} for the team</Text>
+              </Pressable>
+            </View>
+          ))
+        : null}
+      {change && !b.plan && b.plans?.length ? <Text style={styles.faint}>A seat for each person on the team. Everyone gets the plan's limits and machine size.</Text> : null}
+      {!manage && b.plan ? <Text style={styles.faint}>Only the team's owners and admins can change the team's plan.</Text> : null}
+    </View>
+  );
+}
+
 /** Your team (ADR 0087, 0088): its people and, for owners and admins, their machines, invites, roles and offboarding. */
-export function TeamView({ api, meId, canWrite, onBack }: Props) {
+export function TeamView({ api, meId, canWrite, onBack, checkout, open = openBillingPage }: Props) {
   const [team, setTeam] = useState<Team | null | undefined>(undefined);
   const [invites, setInvites] = useState<MyTeamInvite[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -113,6 +161,19 @@ export function TeamView({ api, meId, canWrite, onBack }: Props) {
   useEffect(() => {
     void load();
   }, [load]);
+
+  const notice = checkoutNotice(checkout, true);
+  // Stripe can send people back before its webhook reaches the server: keep looking for a minute.
+  const waiting = notice?.good === true && !!team?.billing && !team.billing.plan;
+  useEffect(() => {
+    if (!waiting) return;
+    let tries = 0;
+    const timer = setInterval(() => {
+      if (++tries >= CONFIRM_TRIES) clearInterval(timer);
+      void load();
+    }, TEAM_CONFIRM_EVERY_MS);
+    return () => clearInterval(timer);
+  }, [waiting, load]);
 
   const run = async (fn: () => Promise<unknown>) => {
     setBusy(true);
@@ -146,6 +207,8 @@ export function TeamView({ api, meId, canWrite, onBack }: Props) {
       await api.removeTeammate(m.id);
     });
 
+  const pay = (start: () => Promise<{ url: string }>) => run(async () => open((await start()).url));
+
   const invite = () =>
     run(async () => {
       if (!looksLikeEmail(email)) throw new Error("Enter their email address.");
@@ -177,6 +240,11 @@ export function TeamView({ api, meId, canWrite, onBack }: Props) {
         {busy ? <ActivityIndicator color={colors.textDim} /> : null}
       </View>
       <ScrollView contentContainerStyle={styles.body}>
+        {notice ? (
+          <Text style={[styles.status, notice.good ? TONE.ok : TONE.dim]} accessibilityRole="alert">
+            {notice.text}
+          </Text>
+        ) : null}
         {error ? (
           <Text style={styles.error} accessibilityRole="alert">
             {error}
@@ -215,6 +283,10 @@ export function TeamView({ api, meId, canWrite, onBack }: Props) {
               You're {team.role ? `${TEAM_ROLE_LABEL[team.role].toLowerCase()}` : "on this team"} · {team.members.length} {team.members.length === 1 ? "person" : "people"}
             </Text>
             {!manage ? <Text style={styles.faint}>Only the team's owners and admins can change the team.</Text> : null}
+
+            {team.billing ? (
+              <TeamPlan b={team.billing} manage={manage} busy={busy} onBuy={(tier) => pay(() => api.teamCheckout(tier))} onPortal={() => pay(() => api.teamBillingPortal())} />
+            ) : null}
 
             {manage ? (
               <View style={styles.section}>
@@ -269,12 +341,12 @@ export function TeamView({ api, meId, canWrite, onBack }: Props) {
 
             {canWrite ? (
               <View style={styles.section}>
-                {canLeave(team) ? (
+                {leaveBlocked(team) === null ? (
                   <Pressable style={[styles.dangerBtn, styles.self]} disabled={busy} onPress={leave} accessibilityRole="button">
                     <Text style={styles.dangerText}>Leave team</Text>
                   </Pressable>
                 ) : (
-                  <Text style={styles.faint}>You're the team's only owner. Make someone else an owner before you leave.</Text>
+                  <Text style={styles.faint}>{leaveBlocked(team)}</Text>
                 )}
               </View>
             ) : null}
