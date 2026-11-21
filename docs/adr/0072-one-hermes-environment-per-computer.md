@@ -4,7 +4,7 @@
 
 Accepted (21 Nov 2026). Meets the first condition [ADR 0070](0070-hermes-per-bot-footprint.md) set on Hermes Agent becoming the managed default: share one dependency environment across a machine's Bots. Part of [#33](https://github.com/CG-Labs/superbot/issues/33) (M3), item 2 of the [ADR 0011 checklist](0011-hermes-agent-backend.md#recommendation).
 
-Since [ADR 0076](0076-two-providers-through-tier-routing.md), `deploy/hermes-share.sh` also adds Hermes's `anthropic` extra to the shared environment, since Bots can't install it. Its wrapper also gives a Bot with no `config.yaml` an empty one, since Hermes reads the fallback chain only from a data root that has one.
+Since [ADR 0077](0077-two-providers-through-tier-routing.md), `deploy/hermes-share.sh` also adds Hermes's `anthropic` extra to the shared environment, since Bots can't install it. Its wrapper also gives a Bot with no `config.yaml` an empty one, since Hermes reads the fallback chain only from a data root that has one.
 
 ## Context
 

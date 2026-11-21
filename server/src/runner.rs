@@ -1660,7 +1660,7 @@ impl App {
     /// model, never the Bot's settings alone (ADR 0033). The run is counted for the
     /// owner, within the tier's runs and tokens a billing period (ADR 0050). A route
     /// whose provider is one of the tiers file's endpoints needs that endpoint's key
-    /// (`tier_key`, ADR 0076). None: refused, and the Bot said why.
+    /// (`tier_key`, ADR 0077). None: refused, and the Bot said why.
     fn tier_route(&self, bot: &Bot, msg: &Message, by: &Who, period: &usage::Period, env: &HashMap<String, String>) -> Option<(String, Route, Wiring)> {
         let tier = self.tier_of(&bot.owner_id);
         let refused = |reason: &str, text: String, limit: Option<u64>, used: Option<u64>, more: Value| {

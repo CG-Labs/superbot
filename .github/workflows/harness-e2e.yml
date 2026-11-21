@@ -4,7 +4,7 @@ name: harness-e2e
 # (server/src/adapters/install.rs), with a fake model (ADR 0057), and each CLI's per-Bot
 # footprint, uploaded as a report (ADR 0070). The Hermes job also checks that its pin is a
 # stable upstream release, that a hook timeout fails closed (ADR 0075), and that tiers
-# route it to two fake providers, with fallback (ADR 0076). Runs when the code between a
+# route it to two fake providers, with fallback (ADR 0077). Runs when the code between a
 # harness and a decision changes, weekly, and by hand.
 
 on:

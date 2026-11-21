@@ -70,7 +70,7 @@ pub struct RunInput {
     pub cwd: PathBuf,
     /// The model provider, for harnesses that take one (`supports_provider`).
     pub provider: Option<String>,
-    /// The tiers file's endpoints that `provider` and `fallback` name (ADR 0076). Their
+    /// The tiers file's endpoints that `provider` and `fallback` name (ADR 0077). Their
     /// keys are in `env`, but reach the harness only through the adapter's `env`.
     pub endpoints: Vec<crate::tiers::Endpoint>,
     /// What to try, in order, when the provider fails. None: the harness's own
@@ -156,7 +156,7 @@ pub(crate) fn secret_env() -> Vec<String> {
 }
 
 /// Tier endpoints' key secrets, and their `_FILE`: a run gets one only when routed to
-/// its endpoint, and only as its adapter hands it over (ADR 0076).
+/// its endpoint, and only as its adapter hands it over (ADR 0077).
 static WITHHELD: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
 
 /// Keeps these secrets from everything botd starts, unless a run is given them.
@@ -391,7 +391,7 @@ pub async fn aborted(mut abort: watch::Receiver<AbortReason>) {
 pub fn job_for(adapter: &mut dyn Adapter, input: &RunInput, out: &mut Vec<AgentEvent>) -> JobRequest {
     let args = adapter.args(input, out);
     let mut env: BTreeMap<String, String> = input.env.clone().into_iter().collect();
-    // A tier endpoint's key reaches the harness only as its adapter hands it over (ADR 0076).
+    // A tier endpoint's key reaches the harness only as its adapter hands it over (ADR 0077).
     for e in &input.endpoints {
         env.remove(&e.key_secret);
     }
@@ -625,7 +625,7 @@ mod tests {
         }
     }
 
-    /// A tier endpoint's key reaches a run only as its adapter hands it over (ADR 0076),
+    /// A tier endpoint's key reaches a run only as its adapter hands it over (ADR 0077),
     /// so no child inherits it from botd's environment, under either name.
     #[test]
     fn tier_keys_are_never_inherited() {

@@ -75,7 +75,7 @@ pub fn fake_model() -> FakeModel {
     fake_provider(None)
 }
 
-/// The fake model behind one provider's endpoint (ADR 0076): `tag` starts each reply,
+/// The fake model behind one provider's endpoint (ADR 0077): `tag` starts each reply,
 /// so a test sees which provider answered.
 pub fn fake_provider(tag: Option<&'static str>) -> FakeModel {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

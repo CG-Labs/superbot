@@ -25,7 +25,7 @@ pub struct Route {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
     /// What the harness tries, in order, when the provider fails (rate limits, server
-    /// errors, auth, ...), for harnesses that take a provider (ADR 0076). Nothing else.
+    /// errors, auth, ...), for harnesses that take a provider (ADR 0077). Nothing else.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback: Vec<Fallback>,
 }
@@ -49,7 +49,7 @@ pub enum Protocol {
 }
 
 /// A model endpoint the tiers file names, which routes and fallbacks use as their
-/// provider (ADR 0076). The key stays in the secrets store; the file names its secret.
+/// provider (ADR 0077). The key stays in the secrets store; the file names its secret.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Endpoint {

@@ -1,10 +1,10 @@
-# 0076: Two providers through tier routing, with fallback
+# 0077: Two providers through tier routing, with fallback
 
 ## Status
 
 Accepted (21 Nov 2026). Closes the last item of the [ADR 0011 gate](0011-hermes-agent-backend.md#recommendation) for making Hermes Agent the managed default: tier-to-model routing works with at least two providers. With it, every item of the gate passes. Part of [#33](https://github.com/CG-Labs/superbot/issues/33) (M3). Extends [ADR 0033](0033-tiers-model-routing.md), which left fallback out of scope.
 
-0075 is the highest number on `main`, and no open PR holds 0076.
+0076 is the highest number on `main`, and no open PR holds 0077.
 
 ## Context
 

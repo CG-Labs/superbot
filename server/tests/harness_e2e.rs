@@ -241,7 +241,7 @@ fn hermes_hook_timeout_blocks() {
     pass("the managed config fails closed with the short timeout");
 }
 
-/// Two providers through tier routing (ADR 0076, the last item of ADR 0011's gate): two
+/// Two providers through tier routing (ADR 0077, the last item of ADR 0011's gate): two
 /// fake providers, one on Anthropic Messages and one on OpenAI Chat Completions, each
 /// behind its own tier in the tiers file. A route whose key isn't saved is refused
 /// before it runs. Each tier's runs reach only its provider, with that provider's key,

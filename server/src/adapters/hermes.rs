@@ -73,7 +73,7 @@ fn quote(s: &str) -> String {
 /// endpoint's URL, key, or switch from set, so the Bot's own `config.yaml` can't point
 /// them elsewhere; each key comes from `key_var`. On a managed tier the fallback chain is the route's (or none), the
 /// legacy `fallback_model` is emptied, since Hermes chains both, and subagents can't
-/// pick their own provider (ADR 0076).
+/// pick their own provider (ADR 0077).
 fn managed_config(input: &RunInput, secret_names: &[String]) -> Value {
     let inherited = secret_names.iter().filter(|n| crate::secrets::check_name(n).is_ok() && !super::withheld(n));
     let keys: Vec<&str> = input.endpoints.iter().map(|e| e.key_secret.as_str()).collect();
@@ -151,7 +151,7 @@ impl Adapter for Hermes {
         if let Some(e) = &input.effort {
             a.extend(["--reasoning".into(), e.clone()]);
         }
-        // A tier's route names the provider (ADR 0033, 0076); else the server's provider
+        // A tier's route names the provider (ADR 0033, 0077); else the server's provider
         // and endpoint. The server's endpoint is never sent with the route's provider.
         let env = |var: &str| std::env::var(var).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         let (provider, base_url) = match &input.provider {

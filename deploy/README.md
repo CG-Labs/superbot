@@ -434,7 +434,7 @@ Off unless you set `TIERS_FILE`: without it every user is on one open `self-host
 
 - Copy [`tiers.example.json`](tiers.example.json) next to `.env`, edit the routes and limits, and set `TIERS_FILE` to its path (and `DEFAULT_TIER` if you like). Restart `botd`; it refuses to start on a bad file.
 - Assign users: `botctl user tier alex@example.com pro`, or `default`. `botctl tiers` lists them with their routes.
-- Hermes routes can use model endpoints the file names under `providers`, with a `fallback` chain per route ([ADR 0076](../docs/adr/0076-two-providers-through-tier-routing.md)). Save each endpoint's key as the secret its `keySecret` names, e.g. `botctl secret set TIER_ANTHROPIC_KEY < key.txt`. Until then, runs routed to it are refused, fallbacks to it are skipped, and botd warns at startup.
+- Hermes routes can use model endpoints the file names under `providers`, with a `fallback` chain per route ([ADR 0077](../docs/adr/0077-two-providers-through-tier-routing.md)). Save each endpoint's key as the secret its `keySecret` names, e.g. `botctl secret set TIER_ANTHROPIC_KEY < key.txt`. Until then, runs routed to it are refused, fallbacks to it are skipped, and botd warns at startup.
 - Upgrading needs no config change. The first start adds the `users.tier` column and the `usage_monthly` table.
 
 Each tier's `limits` ([ADR 0040](../docs/adr/0040-billing-v0-tier-limits.md)) are checked on the server, and a limit left out is unlimited:

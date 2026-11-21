@@ -42,7 +42,7 @@ if [ -z "$key" ]; then
   case "$root" in *[\'\|\\\&]*) die "can't use an install path with quotes, |, & or \\: $root" ;; esac
   checkout=$(cd "$root/hermes-agent" 2>/dev/null && pwd -P) || die "no Hermes checkout in $root/hermes-agent"
   # A tier's endpoint may speak Anthropic Messages, whose client is an extra Hermes
-  # leaves out, and Bots can't add it (ADR 0076). Done already, this changes nothing.
+  # leaves out, and Bots can't add it (ADR 0077). Done already, this changes nothing.
   "$checkout/.hermes/bin/hermes" pm install --extra anthropic >&2 || die "couldn't add Hermes's anthropic extra"
   key=$(install_key "$checkout")
   state="$root/installs/$key"
@@ -90,7 +90,7 @@ if [ -n "$home" ] && [ -f "$shared/facts.json" ] && [ "$(cd "$home" 2>/dev/null 
     mv -f "$own/facts.json.new" "$own/facts.json"
   fi
   # Hermes reads the fallback chain only from a data root with a config.yaml of its
-  # own, even when the chain is in the managed one (ADR 0076). Empty is no settings.
+  # own, even when the chain is in the managed one (ADR 0077). Empty is no settings.
   if [ ! -e "$home/config.yaml" ]; then
     (umask 077 && : >>"$home/config.yaml")
   fi

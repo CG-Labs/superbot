@@ -51,7 +51,7 @@ A full example is [`deploy/tiers.example.json`](../../deploy/tiers.example.json)
 
 **Without `TIERS_FILE`** there is one built-in tier, `self-host`: `"any"`, no limits. Every Bot runs exactly as it's set, so existing installs change nothing. `DEFAULT_TIER` set to anything else without a file is a startup error.
 
-The file is not a secret: it holds model names, not keys. Provider keys stay in the secrets store ([ADR 0010](0010-secrets.md)). Since [ADR 0076](0076-two-providers-through-tier-routing.md) it can also name endpoints, with the name of the secret holding each one's key, and fallbacks per route.
+The file is not a secret: it holds model names, not keys. Provider keys stay in the secrets store ([ADR 0010](0010-secrets.md)). Since [ADR 0077](0077-two-providers-through-tier-routing.md) it can also name endpoints, with the name of the secret holding each one's key, and fallbacks per route.
 
 ### Per-user assignment
 
@@ -114,7 +114,7 @@ Nothing in this slice calls a payment provider or anything that costs money.
 - Routine-run limits separate from runs, storage limits, and per-tier machine sizes tied to `users.tier` (the machine API is unchanged here).
 - Changing tiers in the client's admin portal (the API and `botctl` do it).
 - Reloading the tiers file without a restart.
-- Fallback routes when a provider is down. (Since built: named endpoints and per-route fallbacks, [ADR 0076](0076-two-providers-through-tier-routing.md).)
+- Fallback routes when a provider is down. (Since built: named endpoints and per-route fallbacks, [ADR 0077](0077-two-providers-through-tier-routing.md).)
 
 ## Consequences
 
