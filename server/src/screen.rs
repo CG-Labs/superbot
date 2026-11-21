@@ -4,11 +4,62 @@
 //! A screen is a work surface, not a security boundary: every Bot runs as one user.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+
+static LISTEN: OnceLock<IpAddr> = OnceLock::new();
+
+/// The ports the proxy's `/screen/<port>/` route serves (Caddyfiles in deploy/ and docs/computer.md).
+pub const PROXY_PORTS: std::ops::RangeInclusive<u16> = 6900..=6999;
+
+/// Viewer ports outside PROXY_PORTS would hand out links the proxy can't open.
+fn check_ports((first, last): (u16, u16)) -> Result<(), String> {
+    if PROXY_PORTS.contains(&first) && PROXY_PORTS.contains(&last) {
+        return Ok(());
+    }
+    Err(format!(
+        "screen ports {first}-{last} are outside 6900-6999, the proxy's /screen/ route; set SCREEN_BASE between {} and {} (with MAX_SCREENS={}), or SCREENS=off",
+        PROXY_PORTS.start() - 6801,
+        PROXY_PORTS.end() - 6800 - (last - first + 1),
+        last - first + 1
+    ))
+}
+
+/// SCREEN_ADDR: an IP address, or empty for loopback.
+pub(crate) fn parse_listen_addr(s: &str) -> Result<IpAddr, String> {
+    match s.trim() {
+        "" => Ok(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        v => v.parse().map_err(|_| format!("SCREEN_ADDR must be an IP address such as 127.0.0.1 or 0.0.0.0, not \"{v}\"")),
+    }
+}
+
+/// Sets where screen viewers listen, once at startup.
+pub fn init_listen_addr(s: &str) -> Result<IpAddr, String> {
+    let addr = parse_listen_addr(s)?;
+    let _ = LISTEN.set(addr);
+    Ok(addr)
+}
+
+/// Where screen viewers (voxl, and botd's ports for machine screens) listen. Loopback unless
+/// SCREEN_ADDR moves them for a proxy on another host, such as Compose's Caddy container.
+/// Each viewer's token guards it either way.
+pub fn listen_addr() -> IpAddr {
+    LISTEN.get().copied().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
+
+/// The address botd dials to reach a viewer listening on `listen`.
+fn dial_addr(listen: IpAddr) -> IpAddr {
+    match listen {
+        IpAddr::V4(a) if a.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(a) if a.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        a => a,
+    }
+}
 
 pub struct Screens {
     max: u16,
@@ -49,7 +100,7 @@ fn spawn_viewer(display: &str, port: u16, token: &str) -> std::io::Result<Option
     }
     spawn(
         Command::new("voxl")
-            .args(["--addr", "127.0.0.1", "--port", &port.to_string(), "--allowed-hosts", "*"])
+            .args(["--addr", &listen_addr().to_string(), "--port", &port.to_string(), "--allowed-hosts", "*"])
             .args(["--audio-enabled", "false", "--file-transfers", "none", "--enable-clipboard", "true"])
             .env("DISPLAY", display)
             .env("VOXL_PASSWORD", token),
@@ -116,6 +167,11 @@ impl Screens {
     /// The voxl ports these screens may use, first to last.
     pub fn ports(&self) -> (u16, u16) {
         (6800 + self.base + 1, 6800 + self.base + self.max)
+    }
+
+    /// Errs when the proxy's `/screen/` route can't reach these screens' ports.
+    pub fn check_ports(&self) -> Result<(), String> {
+        check_ports(self.ports())
     }
 
     fn bus_path(&self, n: u16) -> Option<PathBuf> {
@@ -240,10 +296,11 @@ impl Screens {
     }
 }
 
-/// Polls a local port every 100 ms until it accepts a connection. False after `tries`.
+/// Polls a viewer's port every 100 ms until it accepts a connection. False after `tries`.
 pub async fn wait_for_port(port: u16, tries: u32) -> bool {
+    let addr = dial_addr(listen_addr());
     for _ in 0..tries {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+        if tokio::net::TcpStream::connect((addr, port)).await.is_ok() {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -331,6 +388,35 @@ mod tests {
         assert!(screens.live.lock().await.get_mut("b1").unwrap().alive(), "same display, not restarted");
         screens.rotate_token("nobody").await;
         screens.remove("b1").await;
+    }
+
+    #[test]
+    fn screen_addr_is_an_ip_or_loopback() {
+        assert_eq!(parse_listen_addr(""), Ok(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert_eq!(parse_listen_addr(" 0.0.0.0 "), Ok(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+        assert_eq!(parse_listen_addr("::"), Ok(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+        for bad in ["localhost", "0.0.0.0:6901", "botd", "127.0.0.1 --allowed-hosts"] {
+            assert!(parse_listen_addr(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn screen_ports_stay_inside_the_proxy_route() {
+        for ok in [(6901, 6903), (6900, 6999), (6951, 6953)] {
+            assert!(check_ports(ok).is_ok(), "{ok:?}");
+        }
+        for bad in [(6801, 6803), (7001, 7003), (6990, 7002)] {
+            assert!(check_ports(bad).is_err(), "{bad:?}");
+        }
+        assert!(check_ports((7001, 7003)).unwrap_err().contains("between 99 and 196"));
+    }
+
+    #[test]
+    fn botd_dials_a_wildcard_viewer_on_loopback() {
+        assert_eq!(dial_addr(IpAddr::V4(Ipv4Addr::UNSPECIFIED)), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(dial_addr(IpAddr::V6(Ipv6Addr::UNSPECIFIED)), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        let lan: IpAddr = "172.18.0.2".parse().unwrap();
+        assert_eq!(dial_addr(lan), lan);
     }
 
     #[test]

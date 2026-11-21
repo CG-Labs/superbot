@@ -40,7 +40,7 @@ use zeroize::Zeroizing;
 pub const OFF: &str = "Screens on machines are off. Set MACHINE_SCREENS=on to turn them on.";
 /// botd's loopback ports for machine screens, inside the proxy's `/screen/69xx/` route.
 pub const DEFAULT_PORTS: (u16, u16) = (6960, 6999);
-const PORT_RANGE: std::ops::RangeInclusive<u16> = 6900..=6999;
+const PORT_RANGE: std::ops::RangeInclusive<u16> = crate::screen::PROXY_PORTS;
 /// How long a start may take on the machine: Xvfb, then voxl.
 const START_SECS: u64 = 30;
 
@@ -368,8 +368,8 @@ pub async fn open(app: &AppState, by: &Who, bot: &Bot, for_user: Option<&str>, s
     Ok(Some(format!("/screen/{port}/?token={}", token.as_str())))
 }
 
-/// botd's loopback port for the open screen under `key`, listening from now if it
-/// wasn't; and whether `viewer` is new to it.
+/// botd's port (on SCREEN_ADDR, loopback by default) for the open screen under `key`,
+/// listening from now if it wasn't; and whether `viewer` is new to it.
 fn listen(app: &AppState, e: &Enrollment, s: &Settings, key: &str, viewer: &str) -> Result<(u16, bool), Why> {
     let mut open = e.shown.open();
     let taken: Vec<u16> = open.values().filter_map(|o| o.port.as_ref().map(|p| p.0)).collect();
@@ -378,7 +378,7 @@ fn listen(app: &AppState, e: &Enrollment, s: &Settings, key: &str, viewer: &str)
     if o.port.is_none() {
         let l = (s.ports.0..=s.ports.1)
             .filter(|p| !taken.contains(p))
-            .find_map(|p| std::net::TcpListener::bind(("127.0.0.1", p)).ok().map(|l| (p, l)));
+            .find_map(|p| std::net::TcpListener::bind((crate::screen::listen_addr(), p)).ok().map(|l| (p, l)));
         let (port, l) = l.ok_or(Why::NoPort)?;
         l.set_nonblocking(true).map_err(|err| Why::Failed(500, err.to_string()))?;
         let l = TcpListener::from_std(l).map_err(|err| Why::Failed(500, err.to_string()))?;

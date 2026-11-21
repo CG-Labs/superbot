@@ -71,7 +71,7 @@ Then open the web app and say hi to SuperBot. Install and log in to the agent CL
 
 **VPS (Ubuntu 22.04/24.04):** one-command install with HTTPS — [deploy/README.md](deploy/README.md). Manual steps: [Backend](docs/backend.md).
 
-**Docker Compose:** `botd` + Caddy HTTPS + daily backups on any Docker host — [Docker Compose (supported)](deploy/README.md#docker-compose-supported).
+**Docker Compose:** `botd` + Caddy HTTPS + daily backups on any Docker host (amd64 or arm64), from published images with the Bots' screens and browser built in — [Docker Compose (supported)](deploy/README.md#docker-compose-supported).
 
 **Mobile & desktop client:** cross-platform app in [`apps/client`](apps/client/) (Expo: iOS/Android via EAS, web at `/app/`, Electron for Windows/Linux). It is the single primary interface; the server's own pages are an admin fallback ([ADR 0027](docs/adr/0027-expo-primary-hermes-default.md)).
 

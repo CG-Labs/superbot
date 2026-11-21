@@ -1,12 +1,15 @@
 # syntax=docker/dockerfile:1
 # SuperBot server image: botd + botctl (and superbot-machine, the agent botd serves to managed machines),
-# with the harness CLIs baked in.
+# with the harness CLIs and the Bots' computer (screens, browser, live view) baked in.
+# Published to ghcr.io/cg-labs/superbot by .github/workflows/docker.yml.
 # Compose setup and docs: deploy/README.md ("Docker Compose (supported)").
 
 ARG DEBIAN_RELEASE=trixie
 ARG RUST_IMAGE=rust:1-${DEBIAN_RELEASE}
 ARG NODE_IMAGE=node:22-${DEBIAN_RELEASE}-slim
 ARG CADDY_IMAGE=caddy:2
+# on: the Bots' computer (screens, browser, live view) is in the image. off: about 1.2 GB smaller, no screens.
+ARG COMPUTER=on
 
 # The web client (apps/client), exported for the /app/ path.
 FROM ${NODE_IMAGE} AS client
@@ -22,6 +25,10 @@ RUN SUPERBOT_WEB_BASE_URL=/app npx expo export --platform web --output-dir /out/
 FROM ${CADDY_IMAGE} AS caddy
 COPY --from=client /out/app /srv/superbot-app
 COPY site /srv/superbot-site
+LABEL org.opencontainers.image.title="SuperBot Caddy" \
+      org.opencontainers.image.description="Caddy with the SuperBot web client and landing page" \
+      org.opencontainers.image.source="https://github.com/CG-Labs/superbot" \
+      org.opencontainers.image.licenses="MIT"
 
 FROM ${RUST_IMAGE} AS build
 WORKDIR /src
@@ -35,6 +42,22 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked \
     && install -D -m 0755 -t /out target/release/botd target/release/botctl target/release/superbot-machine \
         target/release/superbot-run
+
+# voxl streams each Bot's screen to the app (docs/computer.md), built from source as
+# deploy/install-computer.sh does. It links only x264, libyuv, opus and libjpeg.
+FROM ${RUST_IMAGE} AS voxl-on
+ARG VOXL_VERSION=0.3.5
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends clang esbuild libopus-dev libx264-dev libyuv-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo install --locked --version "$VOXL_VERSION" voxl-server --no-default-features --root /out \
+    && strip /out/bin/voxl
+
+FROM ${NODE_IMAGE} AS voxl-off
+RUN mkdir -p /out/bin
+
+FROM voxl-${COMPUTER} AS voxl
 
 # Harness CLIs are Node packages, so the runtime is Node's slim Debian image.
 FROM ${NODE_IMAGE} AS runtime
@@ -54,6 +77,47 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         acl age ca-certificates curl git procps sqlite3 sudo tini tzdata \
     && rm -rf /var/lib/apt/lists/*
+
+# The Bots' computer (docs/computer.md, docs/adr/0084-published-image-with-computer-use.md): the
+# same screen stack as deploy/install-computer.sh, with Debian's Chromium in place of Chrome for
+# Testing, which has no arm64 build. botd turns screens on when Xvfb and openbox are on PATH.
+ARG COMPUTER
+ARG TARGETARCH
+ARG AGENT_BROWSER_VERSION=v0.43.0
+ARG AGENT_BROWSER_SHA256_AMD64=8e69c9fb662514c9cf36e4911e94e913742ba066e55102486350e049dd847612
+ARG AGENT_BROWSER_SHA256_ARM64=34be55c2b92d8d199fb9d1d62a905ee5b6ac5b1f3e8c24e5b20597f370d905e5
+ARG AGENT_DESKTOP_VERSION=v1.3.1
+ARG AGENT_DESKTOP_SHA256_AMD64=ca77b6b75034eeb12e537dd8c0a4f2a3424119253f38b7e6bd79ba0d2fef1264
+ARG AGENT_DESKTOP_SHA256_ARM64=438990a703fbeb19775596c341c3701435e80adbfa1b2f64b82ff17567d5573b
+RUN set -eu; \
+    case "$COMPUTER" in on) ;; off) exit 0 ;; *) echo "COMPUTER must be on or off, not $COMPUTER" >&2; exit 1 ;; esac; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        xvfb openbox x11-utils dbus-x11 at-spi2-core fonts-noto-core fonts-noto-color-emoji chromium \
+        libjpeg62-turbo libopus0 libx264-164 libyuv0; \
+    rm -rf /var/lib/apt/lists/*; \
+    case "$TARGETARCH" in \
+        amd64) ab=x64; ad=x86_64; ab_sum=$AGENT_BROWSER_SHA256_AMD64; ad_sum=$AGENT_DESKTOP_SHA256_AMD64 ;; \
+        arm64) ab=arm64; ad=aarch64; ab_sum=$AGENT_BROWSER_SHA256_ARM64; ad_sum=$AGENT_DESKTOP_SHA256_ARM64 ;; \
+        *) echo "No computer-use build for $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /usr/local/bin/agent-browser \
+        "https://github.com/vercel-labs/agent-browser/releases/download/$AGENT_BROWSER_VERSION/agent-browser-linux-$ab"; \
+    echo "$ab_sum  /usr/local/bin/agent-browser" | sha256sum -c -; \
+    chmod 0755 /usr/local/bin/agent-browser; \
+    curl -fsSL -o /tmp/agent-desktop.tar.gz \
+        "https://github.com/vercel-labs/agent-desktop/releases/download/$AGENT_DESKTOP_VERSION/agent-desktop-$AGENT_DESKTOP_VERSION-$ad-unknown-linux-gnu.tar.gz"; \
+    echo "$ad_sum  /tmp/agent-desktop.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/agent-desktop.tar.gz -C /usr/local/bin agent-desktop agent-desktop-linux-clipboard-owner; \
+    rm -f /tmp/agent-desktop.tar.gz; \
+    git -c advice.detachedHead=false clone -q --depth 1 --branch "$AGENT_BROWSER_VERSION" --filter=blob:none --sparse \
+        https://github.com/vercel-labs/agent-browser.git /tmp/ab-src; \
+    git -C /tmp/ab-src sparse-checkout set skill-data; \
+    install -d /opt/computer/share; \
+    cp -r /tmp/ab-src/skill-data /opt/computer/share/agent-browser-skills; \
+    rm -rf /tmp/ab-src; \
+    install -d -m 1777 /tmp/.X11-unix
+COPY --from=voxl /out/bin/ /usr/local/bin/
 
 RUN set -eu; pkgs=""; \
     for h in $HARNESSES; do \
@@ -131,7 +195,9 @@ ENV HOME=/home/superbot \
     BACKUP_DIR=/backups \
     NPM_CONFIG_PREFIX=/home/superbot/.local \
     PATH=/opt/superbot/bin:/home/superbot/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    DISABLE_AUTOUPDATER=1
+    DISABLE_AUTOUPDATER=1 \
+    AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium \
+    AGENT_BROWSER_SKILLS_DIR=/opt/computer/share/agent-browser-skills
 
 USER superbot
 WORKDIR /workspace
@@ -141,7 +207,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null || exit 1
 
 LABEL org.opencontainers.image.title="SuperBot" \
-      org.opencontainers.image.description="SuperBot server (botd) with harness CLIs" \
+      org.opencontainers.image.description="SuperBot server (botd) with harness CLIs and the Bots' computer (screens, browser)" \
       org.opencontainers.image.source="https://github.com/CG-Labs/superbot" \
       org.opencontainers.image.licenses="MIT"
 
