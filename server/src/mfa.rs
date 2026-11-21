@@ -247,36 +247,6 @@ impl Mfa {
         challenge
     }
 
-    fn live(&self, challenge: &str, at: i64) -> Option<Pending> {
-        let mut m = self.lock();
-        let key = users::hash(challenge);
-        match m.get(&key) {
-            Some(p) if p.expires_at > at => Some(p.clone()),
-            Some(_) => {
-                m.remove(&key);
-                None
-            }
-            None => None,
-        }
-    }
-
-    /// Counts a wrong code. True when the challenge has no tries left (and is gone).
-    fn wrong(&self, challenge: &str) -> bool {
-        let mut m = self.lock();
-        let key = users::hash(challenge);
-        let Some(p) = m.get_mut(&key) else { return true };
-        p.tries += 1;
-        if p.tries >= CHALLENGE_TRIES {
-            m.remove(&key);
-            return true;
-        }
-        false
-    }
-
-    fn end(&self, challenge: &str) {
-        self.lock().remove(&users::hash(challenge));
-    }
-
     /// Ends every sign-in waiting on this user's second factor.
     pub fn forget_user(&self, user_id: &str) {
         self.lock().retain(|_, p| p.user_id != user_id);
@@ -422,50 +392,59 @@ pub fn finish(a: &Auth, source: Source, challenge: &str, v: &Value, cookie: bool
     let at = db::now();
     let ip = source.ip.clone().unwrap_or_default();
     let expired = || ApiError(StatusCode::UNAUTHORIZED, "That sign-in expired. Sign in again.".into()).into_response();
-    let Some(p) = a.mfa.live(challenge, at) else {
+    // Held until the session exists, so signing the user out everywhere either ends this
+    // sign-in first or revokes the session it makes. Taken out now; put back to retry.
+    let mut pending = a.mfa.lock();
+    let key = users::hash(challenge);
+    let Some(p) = pending.remove(&key).filter(|p| p.expires_at > at) else {
+        drop(pending);
         a.limiter.fail(&ip, at);
         a.login_failed(&source, "totp", Some("expired_challenge"));
         return expired();
     };
-    let Some(user) = app.db.user(&p.user_id).filter(User::active) else {
-        a.mfa.end(challenge);
-        return expired();
-    };
+    let Some(user) = app.db.user(&p.user_id).filter(User::active) else { return expired() };
     if let Some(retry) = a.mfa.limiter.blocked(&user.id, at) {
+        pending.insert(key, p);
         return users::too_many(retry);
     }
+    let method = p.method;
     let mode = if p.enroll.is_some() { "enroll" } else { "totp" };
-    let wrong = |kind: &str, reason: &str| {
-        failed(a, &source, &user, kind, p.method, reason);
-        if a.mfa.wrong(challenge) {
+    let wrong = |pending: &mut HashMap<String, Pending>, p: Pending, kind: &str, reason: &str| {
+        failed(a, &source, &user, kind, method, reason);
+        if p.tries + 1 >= CHALLENGE_TRIES {
             return ApiError(StatusCode::UNAUTHORIZED, "Too many wrong codes. Sign in again.".into()).into_response();
         }
+        pending.insert(key.clone(), Pending { tries: p.tries + 1, ..p });
         ask("That code is wrong. Try again.", mode, challenge, json!({}))
     };
-    let (kind, recovery) = match &p.enroll {
+    let (kind, recovery) = match p.enroll.clone() {
         Some(secret) => {
-            let Some(code) = v["totp"].as_str() else { return bad("Send the code your authenticator app shows (totp).").into_response() };
-            let Some(step) = matching_step(secret, code, at, i64::MIN) else { return wrong("totp", "wrong_code") };
+            let Some(code) = v["totp"].as_str() else {
+                pending.insert(key.clone(), p);
+                return bad("Send the code your authenticator app shows (totp).").into_response();
+            };
+            let Some(step) = matching_step(&secret, code, at, i64::MIN) else { return wrong(&mut pending, p, "totp", "wrong_code") };
             let codes = new_recovery_codes();
-            let sealed_secret = sealed::cipher().seal(&sealed::mfa_context(&user.id), secret);
-            a.mfa.end(challenge);
+            let sealed_secret = sealed::cipher().seal(&sealed::mfa_context(&user.id), &secret);
             if !app.db.mfa_enable(&user.id, &sealed_secret, step, &recovery_hashes(&user.id, &codes)) {
                 return ApiError(StatusCode::CONFLICT, "Two-factor authentication was already set up for this account. Sign in again.".into()).into_response();
             }
-            let who = Who { actor: users::actor(a, &user, None, p.method), source: source.clone() };
+            let who = Who { actor: users::actor(a, &user, None, method), source: source.clone() };
             a.record(who.event("user.mfa_enabled").target("user", &user.id).details(json!({ "via": "sign_in", "recoveryCodes": codes.len() })));
             ("totp", Some(codes))
         }
         None => match check(&app.db, &user.id, v, at) {
-            Check::Ok(kind) => {
-                a.mfa.end(challenge);
-                (kind, None)
+            Check::Ok(kind) => (kind, None),
+            Check::Wrong(kind, reason) => return wrong(&mut pending, p, kind, reason),
+            Check::Missing => {
+                pending.insert(key.clone(), p);
+                return bad("Send the code from your authenticator app (totp), or a recovery code (recoveryCode).").into_response();
             }
-            Check::Wrong(kind, reason) => return wrong(kind, reason),
-            Check::Missing => return bad("Send the code from your authenticator app (totp), or a recovery code (recoveryCode).").into_response(),
         },
     };
-    signed_in(a, &user, p.method, kind, cookie, label, source, recovery)
+    let res = signed_in(a, &user, method, kind, cookie, label, source, recovery);
+    drop(pending);
+    res
 }
 
 /// Starts the session for a sign-in that passed both factors, and audits it.
@@ -732,27 +711,17 @@ mod tests {
     }
 
     #[test]
-    fn challenges_expire_run_out_and_end() {
+    fn challenges_are_hashed_and_end_with_their_user() {
         let m = Mfa::default();
-        let at = db::now();
-        let p = |exp: i64| Pending { user_id: "u1".into(), method: "code", expires_at: exp, tries: 0, enroll: None };
-        let c = m.start(p(at + CHALLENGE_TTL_MS));
+        let p = Pending { user_id: "u1".into(), method: "code", expires_at: db::now() + CHALLENGE_TTL_MS, tries: 0, enroll: None };
+        let c = m.start(p);
         assert!(c.starts_with(CHALLENGE_PREFIX) && c.len() == 4 + 64);
-        assert!(m.live(&c, at).is_some());
-        assert!(m.live(&c.replace("sbm_", "sbs_"), at).is_none());
-        assert!(m.live(&c, at + CHALLENGE_TTL_MS).is_none(), "expired");
-        assert!(m.live(&c, at).is_none(), "and gone");
-        let c = m.start(p(at + CHALLENGE_TTL_MS));
-        for _ in 1..CHALLENGE_TRIES {
-            assert!(!m.wrong(&c));
-        }
-        assert!(m.wrong(&c), "the last try");
-        assert!(m.live(&c, at).is_none());
-        let c = m.start(p(at + CHALLENGE_TTL_MS));
+        let held = |c: &str| m.lock().contains_key(&users::hash(c));
+        assert!(held(&c) && !held(&c.replace("sbm_", "sbs_")));
         m.forget_user("u2");
-        assert!(m.live(&c, at).is_some());
+        assert!(held(&c));
         m.forget_user("u1");
-        assert!(m.live(&c, at).is_none());
+        assert!(!held(&c));
     }
 
     #[test]

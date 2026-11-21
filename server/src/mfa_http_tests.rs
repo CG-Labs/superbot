@@ -135,6 +135,14 @@ async fn the_owner_enrols_at_sign_in_once_admins_need_a_second_factor() {
     let (status, _, _) = login(port, "", json!({ "challenge": res["challenge"], "recoveryCode": recovery[1] })).await;
     assert_eq!(status, 401);
 
+    // Signing someone out everywhere ends their sign-ins still waiting on a code.
+    let (_, _, res) = login(port, "", json!({ "password": PW.as_str() })).await;
+    let waiting = res["challenge"].as_str().unwrap().to_string();
+    assert_eq!(call(port, "DELETE", "/api/users/operator/sessions", &other_admin, "").await.0, 200);
+    let (status, _, res) = login(port, "", json!({ "challenge": waiting, "recoveryCode": recovery[2] })).await;
+    assert_eq!((status, res["error"].as_str()), (401, Some("That sign-in expired. Sign in again.")), "{res}");
+    assert_eq!(call(port, "GET", "/api/auth/me", &owner, "").await.0, 401);
+
     // The audit log tells the story without a secret, code, or challenge in it.
     let (_, body) = call(port, "GET", "/api/audit?limit=1000", &other_admin, "").await;
     let ev = audit_list(&body);
@@ -145,7 +153,7 @@ async fn the_owner_enrols_at_sign_in_once_admins_need_a_second_factor() {
     assert!(failed.iter().any(|e| e["details"]["method"] == "totp" && e["details"]["reason"] == "wrong_code" && e["actorId"] == "operator"));
     assert!(failed.iter().any(|e| e["details"]["reason"] == "replayed"));
     assert!(failed.iter().any(|e| e["details"]["method"] == "password" && e["details"]["reason"] == "mfa_required"));
-    for (i, s) in [PW.as_str(), &secret, &first, &challenge].into_iter().chain(recovery.iter().map(String::as_str)).enumerate() {
+    for (i, s) in [PW.as_str(), &secret, &first, &challenge, &waiting].into_iter().chain(recovery.iter().map(String::as_str)).enumerate() {
         assert!(!body.contains(s), "audit leaks secret #{i}");
     }
     let stored = app.db.mfa(users::OPERATOR).unwrap().secret;
