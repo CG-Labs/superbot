@@ -38,7 +38,7 @@ install_key() {
 if [ -z "$key" ]; then
   [ -n "${HOME:-}" ] || die "HOME isn't set"
   root=$(cd "$HOME/.hermes" 2>/dev/null && pwd -P) || die "no Hermes install in $HOME/.hermes"
-  case "$root" in *[\'\|\\]*) die "can't use an install path with quotes, | or \\: $root" ;; esac
+  case "$root" in *[\'\|\\\&]*) die "can't use an install path with quotes, |, & or \\: $root" ;; esac
   checkout=$(cd "$root/hermes-agent" 2>/dev/null && pwd -P) || die "no Hermes checkout in $root/hermes-agent"
   key=$(install_key "$checkout")
   state="$root/installs/$key"
