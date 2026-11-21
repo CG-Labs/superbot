@@ -45,7 +45,7 @@ The runner asks before every run. A routed run hands a `Job { bot, owner, messag
 ### The trust boundary
 
 - **People** are checked by role (RBAC) and then by Bot ACL, as before.
-- **Bots** get their own token per run: `sbb_<bot id>.<owner id>.<HMAC-SHA256>` over both, with a key made fresh at each start. botd checks it in constant time. A made-up token, another Bot's id with this Bot's MAC, a token from an earlier start, a deleted Bot's token, or one from before the Bot changed hands is a 401.
+- **Bots** get their own token per run: `sbb_<bot id>.<owner id>.<HMAC-SHA256>` over both, with a key made fresh at each start. (Superseded by [ADR 0083](0083-per-run-tokens.md): that token was the same for every run of a Bot; each run now gets its own, revoked when it ends.) botd checks it in constant time. A made-up token, another Bot's id with this Bot's MAC, a token from an earlier start, a deleted Bot's token, or one from before the Bot changed hands is a 401.
 - **Handing a Bot over** stops its current and queued work: that work started in the old owner's folder with their keys. A Bot's live stream closes when the Bot is deleted, changes hands, or its owner is disabled, and follows its owner's role.
 - **A Bot is who its token says.** An `X-SuperBot-Bot` header naming a different Bot is a 403 (`bot_mismatch`). `from` in `ask`, `handoff` and `approvals/check` must be the Bot itself (left out, it means itself). A Bot asking for another Bot's approval check gets `deny`.
 - **A Bot can do no more than its owner.** Its role is capped by its owner's: a read-only user's Bot can't write (403, `owner_role`). A disabled owner's Bot can do nothing.
@@ -80,7 +80,7 @@ The approval policy counts the owner's folder as the workspace, so a delete in a
 - AUTH-07 is fixed: one Bot can't act as another or exceed its owner.
 - A user's Bots can't see another user's files, facts, keys, chat, screens or approvals through any route. A test walks every Bot, routine and approval route as another user, a read-only user and another user's Bot.
 - botctl stops sending `X-SuperBot-Bot`; its token says who it is.
-- Bot tokens die on restart. Runs don't outlive a restart anyway (they're reported as interrupted).
+- Bot tokens die on restart. Runs don't outlive a restart anyway (they're reported as interrupted). Since [ADR 0083](0083-per-run-tokens.md) each run's token also dies when that run ends.
 - New audit events: `bot.run_routed`, `bot.run_refused`; `secret.set` and `secret.deleted` carry `scope: "user"`; `access.denied` adds `bot_mismatch` and `owner_role`; `auth.login_failed` adds `bot_gone` and `bot_moved`.
 
 ## Deferred

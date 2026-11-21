@@ -77,7 +77,7 @@ With the setting on, each teammate who uses a shared Bot on a machine gets their
 - **Give teammates the owner's logins.** Copying `~/.claude` into the teammate's home hands Ada's subscription to Bea. Server-wide keys are ADR 0046's choice for exactly this reason.
 - **Run teammates' jobs on the teammate's own machine.** Rejected in ADR 0046: the Bot's memory, folder and session are the owner's.
 - **One shared screen with a cookie only.** A cookie stops other OS users connecting, but Bea and Ada would still watch and drive each other's work.
-- **Per-run tokens for everyone.** That would cover owners' runs too. Binding only teammate-user runs closes the gap this ADR opens without changing every token.
+- **Per-run tokens for everyone.** That would cover owners' runs too. Binding only teammate-user runs closes the gap this ADR opens without changing every token. Later done in [ADR 0083](0083-per-run-tokens.md), which replaces the bound token below with a per-run token that ends with its run.
 
 ## Consequences
 

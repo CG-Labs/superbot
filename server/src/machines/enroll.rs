@@ -1232,8 +1232,9 @@ const RELAYED: [header::HeaderName; 4] = [
 
 /// `ANY /v1/machines/{id}/api/{path}`: a call from a Bot on the machine (`botctl`, the
 /// approval hook) to botd's `/api/{path}`, relayed by its agent. The machine shows its
-/// certificate, and the call carries the Bot's own token, which must be for one of
-/// that machine's user's Bots: a machine speaks for its own user only. From there the
+/// certificate, and the call carries the Bot's run's own token, live only while that
+/// run is (ADR 0083), which must be for one of that machine's user's Bots: a machine
+/// speaks for its own user only. From there the
 /// API checks the token and the Bot's rights as for any Bot.
 async fn relay(
     AxState(p): AxState<Arc<Port>>,
@@ -1255,8 +1256,10 @@ async fn relay(
         .and_then(|h| h.strip_prefix("Bearer "))
         .map(str::trim)
         .filter(|t| t.starts_with(crate::isolation::BOT_TOKEN_PREFIX));
-    let bot = token.and_then(|t| crate::isolation::token_bot(&p.app.cfg.bot_key, t));
-    if !bot.is_some_and(|(_, owner)| owner == m.user_id) {
+    let bot = token
+        .and_then(|t| p.app.run_tokens.check(t, crate::db::now()).ok())
+        .map(|e| (e.bot, e.owner));
+    if !bot.as_ref().is_some_and(|(_, owner)| *owner == m.user_id) {
         record(
             &p.app,
             &agent_who(&m.user_id, &peer),

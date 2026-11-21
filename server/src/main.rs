@@ -77,6 +77,8 @@ mod prompts_http_tests;
 mod rbac;
 #[cfg(test)]
 mod run_grants_http_tests;
+#[cfg(test)]
+mod run_tokens_http_tests;
 mod runner;
 mod sandbox;
 mod scim;
@@ -426,7 +428,6 @@ async fn main() {
         password: password.clone(),
         break_glass,
         allow_no_auth,
-        bot_key,
         hosts: allowed_hosts(&host, port, &env("ALLOWED_HOSTS", "")),
         trust_forwarded: env("TRUST_FORWARDED_FOR", "") == "1",
         sessions,
@@ -814,8 +815,6 @@ struct Auth {
     break_glass: bool,
     /// Only when ALLOW_NO_AUTH=1 and loopback: empty password does not skip login on its own.
     allow_no_auth: bool,
-    /// Signs and checks each Bot's token (`isolation::bot_token`). The same as `Config::bot_key`.
-    bot_key: String,
     /// Host headers we answer to, lowercase.
     hosts: Vec<String>,
     /// TRUST_FORWARDED_FOR=1: take the client IP from X-Forwarded-For from any peer,
@@ -846,7 +845,6 @@ impl Auth {
             password: String::new(),
             break_glass: true,
             allow_no_auth: false,
-            bot_key: String::new(),
             hosts: Vec::new(),
             trust_forwarded: false,
             sessions: SessionConfig::default(),
@@ -1117,29 +1115,26 @@ fn sso_path(path: &str) -> Option<&str> {
 /// it also has good ones elsewhere.
 fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<Response>> {
     let h = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
-    let operator = |method: &'static str| Caller { principal: Principal::User(Role::Admin), user: a.operator(), session: None, method, bot: None, bot_for: None };
-    let from_session = |(s, u): (db::Session, db::User)| Caller { principal: Principal::User(u.role), user: Some(u), session: Some(s), method: "session", bot: None, bot_for: None };
+    let operator = |method: &'static str| Caller { principal: Principal::User(Role::Admin), user: a.operator(), session: None, method, bot: None, bot_for: None, bot_token: None };
+    let from_session = |(s, u): (db::Session, db::User)| Caller { principal: Principal::User(u.role), user: Some(u), session: Some(s), method: "session", bot: None, bot_for: None, bot_token: None };
     let fail = |method: &str, reason: Option<&str>, clear: bool| {
         a.login_failed(source, method, reason);
         Err(Box::new(unauthorized(a, req, clear)))
     };
     if let Some(t) = h.strip_prefix("Bearer ") {
         let t = t.trim();
-        // Each Bot's runs carry their own token (ADR 0029). A forged one, one from an
-        // earlier start, one for a Bot since deleted, or one from before the Bot changed
-        // hands is refused. One bound to a teammate (ADR 0048) works only while the
-        // Bot's latest run is still theirs.
+        // Each run carries its own token, live only while that run is (ADR 0029, 0083).
+        // A forged one, one from an earlier start or an ended run, one past its expiry,
+        // one for a Bot since deleted, or one from before the Bot changed hands is refused.
         if t.starts_with(isolation::BOT_TOKEN_PREFIX) {
-            let now = |id: &str| a.app.as_ref().map(|app| app.db.bot(id));
-            let run_over = |b: &db::Bot, u: &str| a.app.as_ref().is_some_and(|app| app.acting_for(b) != u);
-            return match isolation::token_bot(&a.bot_key, t) {
-                Some((id, owner)) => match now(id) {
-                    Some(None) => fail("bot_token", Some("bot_gone"), false),
-                    Some(Some(b)) if b.owner_id != owner => fail("bot_token", Some("bot_moved"), false),
-                    Some(Some(b)) if isolation::token_for_user(&a.bot_key, t).is_some_and(|u| run_over(&b, u)) => fail("bot_token", Some("run_over"), false),
-                    _ => Ok(Caller { principal: Principal::Bot, user: None, session: None, method: "bot_token", bot: Some(id.to_string()), bot_for: isolation::token_for_user(&a.bot_key, t).map(str::to_string) }),
+            let Some(app) = a.app.as_ref() else { return fail("bot_token", Some("bad_token"), false) };
+            return match app.run_tokens.check(t, db::now()) {
+                Ok(e) => match app.db.bot(&e.bot) {
+                    None => fail("bot_token", Some("bot_gone"), false),
+                    Some(b) if b.owner_id != e.owner => fail("bot_token", Some("bot_moved"), false),
+                    Some(_) => Ok(Caller { principal: Principal::Bot, user: None, session: None, method: "bot_token", bot: Some(e.bot), bot_for: e.for_user, bot_token: Some(e.id) }),
                 },
-                None => fail("bot_token", Some("bad_token"), false),
+                Err(r) => fail("bot_token", Some(r.reason()), false),
             };
         }
         return match a.session(t) {
@@ -1374,11 +1369,13 @@ async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>,
     let bot = c.bot.filter(|_| c.principal == Principal::Bot);
     let bot_owner = bot.as_deref().and_then(|id| app.db.bot_owner(id));
     let bot_for = c.bot_for.filter(|_| bot.is_some());
+    let bot_token = c.bot_token.filter(|_| bot.is_some());
     // The stream outlives the request that opened it, so it closes within seconds of
     // its session being revoked, expiring, or its user being disabled, and follows
-    // role changes. A Bot's closes when the Bot is deleted, changes hands, or its
-    // owner is disabled, and follows its owner's role. One bound to a teammate (ADR
-    // 0048) closes once the Bot's latest run isn't theirs, never taking the owner's access.
+    // role changes. A Bot's closes when its run ends (ADR 0083), the Bot is deleted,
+    // changes hands, or its owner is disabled, and follows its owner's role. One bound
+    // to a teammate (ADR 0048) closes once the Bot's latest run isn't theirs, never
+    // taking the owner's access.
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, Infallible>>(64);
     let mut sub = app.tx.subscribe();
     let cfg = a.sessions;
@@ -1409,6 +1406,9 @@ async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>,
                 }
                 _ = check.tick(), if session.is_some() || bot.is_some() => {
                     let now = if let Some(id) = bot.as_deref() {
+                        if !bot_token.as_deref().is_some_and(|t| app.run_tokens.is_live(t, db::now())) {
+                            break;
+                        }
                         match app.db.bot(id) {
                             Some(b) if bot_for.as_deref().is_some_and(|u| app.acting_for(&b) != u) => break,
                             Some(b) if Some(&b.owner_id) == bot_owner.as_ref() => match app.bot_viewer(&b) {
@@ -2829,16 +2829,15 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// Auth in front of a stub route. Returns the port and a Bot's bearer token.
+    /// Auth in front of a stub route, with no app. Returns the port and a Bot's bearer
+    /// token, which nothing here can check.
     async fn serve(password: &str, allow_no_auth: bool, extra_hosts: &str) -> (u16, String) {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let bot_key = random_hex(16);
-        let bot_token = isolation::bot_token(&bot_key, "b1", users::OPERATOR);
+        let bot_token = isolation::RunTokens::new(&random_hex(16)).issue("b1", users::OPERATOR, "r1", None, db::now(), 60_000).0;
         let state = Arc::new(Auth {
             password: password.into(),
             allow_no_auth,
-            bot_key,
             hosts: allowed_hosts("127.0.0.1", port, extra_hosts),
             ..Auth::new(None)
         });
@@ -2903,7 +2902,7 @@ mod tests {
         let host = format!("127.0.0.1:{port}");
         assert_eq!(status(port, &host, &basic(&pw)).await, 200);
         assert_eq!(status(port, &host, &basic(&random_hex(16))).await, 401);
-        assert_eq!(status(port, &host, &format!("Bearer {bot_token}")).await, 200);
+        assert_eq!(status(port, &host, &format!("Bearer {bot_token}")).await, 401, "no run is live without an app");
         assert_eq!(status(port, "bots.example.com", &basic(&pw)).await, 200);
     }
 
@@ -2925,8 +2924,9 @@ mod tests {
         assert_eq!(status(port, &host, "").await, 200);
     }
 
-    /// Mints the `Authorization` header a Bot's runs get (ADR 0029), for the Bot's
-    /// owner now (the owner account when there's no app or no such Bot).
+    /// Mints the `Authorization` header a Bot's run gets (ADR 0029, 0083), for the Bot's
+    /// owner now (the owner account when there's no app or no such Bot), as if a run of
+    /// it had just started. With no app, it's signed with key `.0` and never live here.
     #[derive(Clone)]
     pub(super) struct BotKey(pub String, pub Option<AppState>);
 
@@ -2937,7 +2937,17 @@ mod tests {
         }
 
         pub(super) fn auth_as(&self, bot_id: &str, owner: &str) -> String {
-            format!("Bearer {}", isolation::bot_token(&self.0, bot_id, owner))
+            self.auth_run(bot_id, owner, None).0
+        }
+
+        /// A run token for `bot_id` as `owner`'s, bound to `for_user` if any, and its id.
+        pub(super) fn auth_run(&self, bot_id: &str, owner: &str, for_user: Option<&str>) -> (String, String) {
+            let run = format!("r{}", random_hex(8));
+            let (t, e) = match &self.1 {
+                Some(app) => app.run_tokens.issue(bot_id, owner, &run, for_user, db::now(), 3_600_000),
+                None => isolation::RunTokens::new(&self.0).issue(bot_id, owner, &run, for_user, db::now(), 3_600_000),
+            };
+            (format!("Bearer {t}"), e.id)
         }
     }
 
@@ -2962,7 +2972,6 @@ mod tests {
         users::ensure_operator(&app.db, "Owner", None);
         let mut auth = Auth {
             password: password.clone(),
-            bot_key: app.cfg.bot_key.clone(),
             hosts: allowed_hosts("127.0.0.1", port, ""),
             ..Auth::new(Some(app.clone()))
         };
@@ -2970,7 +2979,7 @@ mod tests {
         let password = auth.password.clone();
         let _ = app.control_plane.set(auth.machines.clone());
         let auth = Arc::new(auth);
-        let bot = BotKey(auth.bot_key.clone(), Some(app.clone()));
+        let bot = BotKey(app.cfg.bot_key.clone(), Some(app.clone()));
         let r = router(app.clone(), auth);
         let served = r.clone();
         tokio::spawn(async move {
@@ -3351,7 +3360,7 @@ mod tests {
             .route("/api/bots/{id}/routines", get(list_routines).post(create_routine))
             .route("/api/routines/{id}", patch(update_routine).delete(delete_routine))
             .layer(Extension(Who { actor: Actor::operator(), source: Source::default() }))
-            .layer(Extension(Caller { principal: Principal::User(Role::Admin), user: None, session: None, method: "none", bot: None, bot_for: None }))
+            .layer(Extension(Caller { principal: Principal::User(Role::Admin), user: None, session: None, method: "none", bot: None, bot_for: None, bot_token: None }))
             .with_state(app.clone());
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
