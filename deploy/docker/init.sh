@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Create or update deploy/docker/.env for the Compose setup. Safe to re-run: never replaces
-# AUTH_PASSWORD or SUPERBOT_MASTER_KEY.
+# AUTH_PASSWORD or SUPERBOT_MASTER_KEY, except --rotate-master-key (docs/ops/master-key-rotation.md).
 #   ./init.sh                                   # http://localhost, random password
 #   ./init.sh --domain bots.example.com --tz Europe/Jersey --user-name Alex
 #   ./init.sh --from-source                     # build the images here instead of pulling them
@@ -9,7 +9,7 @@ set -euo pipefail
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ENV_FILE=${ENV_FILE:-"$DIR/.env"}
 DOMAIN="" TZ_VALUE="" USER_NAME_VALUE="" HARNESSES="" ISOLATION_VALUE="" SOURCE=""
-DOMAIN_SET=false HARNESSES_SET=false
+DOMAIN_SET=false HARNESSES_SET=false ROTATE_KEY=false
 BUILD_FILES=docker-compose.yml:docker-compose.build.yml
 
 die() { printf 'init.sh: %s\n' "$*" >&2; exit 1; }
@@ -28,6 +28,10 @@ Usage: init.sh [options]
   --no-isolation     Run every Bot as botd's account (ISOLATION=off); Bots' screens need this
   --from-source      Build the images from this checkout (docker-compose.build.yml) instead of pulling them
   --published        Pull the published images from ghcr.io (the default; clears --from-source)
+  --rotate-master-key
+                     Keep the current SUPERBOT_MASTER_KEY as SUPERBOT_MASTER_KEY_PREVIOUS and write a new
+                     one; the next `docker compose up -d` seals everything again under the new key
+                     (docs/ops/master-key-rotation.md). Refused while a rotation is still pending.
   -h, --help         Show this help
 EOF
 }
@@ -43,6 +47,7 @@ while [[ $# -gt 0 ]]; do
     --no-isolation) ISOLATION_VALUE=off; shift ;;
     --from-source) SOURCE=build; shift ;;
     --published) SOURCE=published; shift ;;
+    --rotate-master-key) ROTATE_KEY=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
@@ -85,7 +90,24 @@ if ! grep -Eq "^AUTH_PASSWORD=('[^']+'|[^'[:space:]]+)" "$ENV_FILE"; then
 fi
 
 new_key=false
-if ! grep -Eq "^SUPERBOT_MASTER_KEY=('[^']+'|[^'[:space:]]+)" "$ENV_FILE"; then
+if [[ "$ROTATE_KEY" == true ]]; then
+  if grep -Eq "^SUPERBOT_MASTER_KEY_PREVIOUS=('[^']+'|[^'[:space:]]+)" "$ENV_FILE"; then
+    die "SUPERBOT_MASTER_KEY_PREVIOUS is already set: a rotation is pending. Run docker compose up -d, check the log says \"Master key rotated\" (or \"nothing to rotate\"), remove SUPERBOT_MASTER_KEY_PREVIOUS from $ENV_FILE, then rotate again."
+  fi
+  current=$(sed -n -E "s/^SUPERBOT_MASTER_KEY=[[:space:]]*(.*[^[:space:]])[[:space:]]*$/\1/p" "$ENV_FILE" | tail -n 1)
+  if [[ "$current" =~ ^\'(.*)\'$ || "$current" =~ ^\"(.*)\"$ ]]; then current=${BASH_REMATCH[1]}; fi
+  [[ -n "$current" ]] || die "no SUPERBOT_MASTER_KEY in $ENV_FILE to rotate from"
+  # The forms botd accepts: 64 hex characters, or base64 of 32 bytes.
+  if [[ ! "$current" =~ ^[0-9A-Fa-f]{64}$ && ! "$current" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+    die "SUPERBOT_MASTER_KEY in $ENV_FILE is not 64 hex characters or base64 of 32 bytes; nothing was changed"
+  fi
+  # The previous key goes in first: a crash between the two writes leaves the old key in both.
+  set_env SUPERBOT_MASTER_KEY_PREVIOUS "$current"
+  set_env SUPERBOT_MASTER_KEY "$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
+  unset current
+  printf 'Rotating the master key: the old one is SUPERBOT_MASTER_KEY_PREVIOUS in %s, the new one SUPERBOT_MASTER_KEY.\n' "$ENV_FILE"
+  printf 'Run docker compose up -d, check the botd log says "Master key rotated", then remove SUPERBOT_MASTER_KEY_PREVIOUS and back up the new key.\n'
+elif ! grep -Eq "^SUPERBOT_MASTER_KEY=('[^']+'|[^'[:space:]]+)" "$ENV_FILE"; then
   set_env SUPERBOT_MASTER_KEY "$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
   new_key=true
 fi

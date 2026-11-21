@@ -1036,6 +1036,8 @@ pub struct Session {
     pub revoked_at: Option<i64>,
     pub revoked_by: Option<String>,
     pub revoke_reason: Option<String>,
+    /// The second factor the sign-in passed (ADR 0094), if any.
+    pub mfa: Option<String>,
 }
 
 /// A phone that gets push notifications (ADR 0080), registered by one session and
@@ -1094,6 +1096,17 @@ pub struct NewSession<'a> {
     pub ip: Option<&'a str>,
     pub user_agent: Option<&'a str>,
     pub expires_at: i64,
+    /// The second factor the sign-in passed (ADR 0094): "totp" or "recovery_code".
+    pub mfa: Option<&'a str>,
+}
+
+/// A user's second factor (ADR 0094). `secret` is sealed (`sb1:`); unconfirmed until
+/// a first code proves the authenticator app has it.
+pub struct MfaRow {
+    pub secret: String,
+    pub confirmed_at: Option<i64>,
+    /// The last TOTP time step used, so no code works twice.
+    pub last_step: i64,
 }
 
 /// An SSO identity linked to a user (ADR 0014). `(issuer, subject)` is the key; the
@@ -1390,6 +1403,7 @@ fn session_row(r: &Row) -> rusqlite::Result<Session> {
         revoked_at: r.get("revoked_at")?,
         revoked_by: r.get("revoked_by")?,
         revoke_reason: r.get("revoke_reason")?,
+        mfa: r.get("mfa")?,
     })
 }
 
@@ -1488,7 +1502,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 39] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 40] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1527,6 +1541,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 39] = [
     migrate_status_incidents,
     migrate_billing_emails,
     migrate_team_billing,
+    migrate_mfa,
     migrate_scim_groups,
 ];
 
@@ -1601,6 +1616,34 @@ fn migrate_team_billing(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
         return Ok(());
     }
     c.execute_batch("ALTER TABLE token_usage ADD COLUMN meter_customer TEXT;")
+}
+
+/// A second factor for local sign-ins (ADR 0094): each user's TOTP secret, sealed under
+/// the master key, its one-time recovery codes as keyed hashes, and which factor each
+/// session's sign-in passed.
+fn migrate_mfa(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS user_mfa (
+            user_id TEXT PRIMARY KEY,
+            secret TEXT NOT NULL,
+            confirmed_at INTEGER,
+            last_step INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS mfa_recovery_codes (
+            user_id TEXT NOT NULL,
+            code_hash TEXT NOT NULL,
+            used_at INTEGER,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (user_id, code_hash)
+        );",
+    )?;
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'mfa'", [], |r| r.get(0))?;
+    if !has {
+        c.execute_batch("ALTER TABLE sessions ADD COLUMN mfa TEXT;")?;
+    }
+    Ok(())
 }
 
 /// Incident notes for the public status page (ADR 0090), written by admins. Each has a
@@ -4581,9 +4624,9 @@ impl Db {
         {
             let c = self.c();
             c.execute(
-                "INSERT INTO sessions (id, token_hash, user_id, kind, method, idp_subject, idp_provider, label, ip, user_agent, created_at, last_seen_at, expires_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                params![id, s.token_hash, s.user_id, s.kind, s.method, s.idp_subject, s.idp_provider, s.label, s.ip, s.user_agent, at, at, s.expires_at],
+                "INSERT INTO sessions (id, token_hash, user_id, kind, method, idp_subject, idp_provider, label, ip, user_agent, created_at, last_seen_at, expires_at, mfa)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![id, s.token_hash, s.user_id, s.kind, s.method, s.idp_subject, s.idp_provider, s.label, s.ip, s.user_agent, at, at, s.expires_at, s.mfa],
             )
             .unwrap();
             let _ = c.execute(
@@ -5066,6 +5109,125 @@ impl Db {
             .ok()
             .flatten()?;
         c.query_row("SELECT * FROM users WHERE id = ?", [user_id], user_row).optional().ok().flatten()
+    }
+
+    // Second factor (ADR 0094). Secrets are sealed under the user's id; recovery codes
+    // are kept as keyed hashes only.
+
+    pub fn mfa(&self, user_id: &str) -> Option<MfaRow> {
+        self.c()
+            .query_row("SELECT secret, confirmed_at, last_step FROM user_mfa WHERE user_id = ?", [user_id], |r| {
+                Ok(MfaRow { secret: r.get(0)?, confirmed_at: r.get(1)?, last_step: r.get(2)? })
+            })
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Users with a confirmed second factor, and since when.
+    pub fn mfa_enabled(&self) -> HashMap<String, i64> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT user_id, confirmed_at FROM user_mfa WHERE confirmed_at IS NOT NULL").unwrap();
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Starts (or restarts) enrolment with a new sealed secret. False when the user
+    /// already has a confirmed one: that must be turned off first.
+    pub fn mfa_begin(&self, user_id: &str, sealed: &str) -> bool {
+        let at = now();
+        self.c()
+            .execute(
+                "INSERT INTO user_mfa (user_id, secret, confirmed_at, last_step, created_at, updated_at) VALUES (?1, ?2, NULL, 0, ?3, ?3)
+                 ON CONFLICT(user_id) DO UPDATE SET secret = ?2, last_step = 0, created_at = ?3, updated_at = ?3 WHERE confirmed_at IS NULL",
+                params![user_id, sealed, at],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Confirms the pending secret `sealed` with the step its first code was for, and
+    /// sets its recovery codes. False when there is no such pending secret (it was
+    /// replaced, removed, or already confirmed).
+    pub fn mfa_confirm(&self, user_id: &str, sealed: &str, step: i64, recovery: &[String]) -> bool {
+        let c = self.c();
+        let Ok(tx) = c.unchecked_transaction() else { return false };
+        let at = now();
+        let n = tx
+            .execute(
+                "UPDATE user_mfa SET confirmed_at = ?1, last_step = ?2, updated_at = ?1 WHERE user_id = ?3 AND secret = ?4 AND confirmed_at IS NULL",
+                params![at, step, user_id, sealed],
+            )
+            .unwrap_or(0);
+        n == 1 && Self::write_recovery(&tx, user_id, recovery, at).is_ok() && tx.commit().is_ok()
+    }
+
+    /// Enrols in one go, from a sign-in that had to enrol. False when the user already
+    /// has a confirmed second factor.
+    pub fn mfa_enable(&self, user_id: &str, sealed: &str, step: i64, recovery: &[String]) -> bool {
+        let c = self.c();
+        let Ok(tx) = c.unchecked_transaction() else { return false };
+        let at = now();
+        let n = tx
+            .execute(
+                "INSERT INTO user_mfa (user_id, secret, confirmed_at, last_step, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?3, ?3)
+                 ON CONFLICT(user_id) DO UPDATE SET secret = ?2, confirmed_at = ?3, last_step = ?4, created_at = ?3, updated_at = ?3 WHERE confirmed_at IS NULL",
+                params![user_id, sealed, at, step],
+            )
+            .unwrap_or(0);
+        n == 1 && Self::write_recovery(&tx, user_id, recovery, at).is_ok() && tx.commit().is_ok()
+    }
+
+    fn write_recovery(tx: &rusqlite::Transaction, user_id: &str, recovery: &[String], at: i64) -> rusqlite::Result<()> {
+        tx.execute("DELETE FROM mfa_recovery_codes WHERE user_id = ?", [user_id])?;
+        for h in recovery {
+            tx.execute("INSERT INTO mfa_recovery_codes (user_id, code_hash, used_at, created_at) VALUES (?, ?, NULL, ?)", params![user_id, h, at])?;
+        }
+        Ok(())
+    }
+
+    /// Replaces a confirmed user's recovery codes. False when they have no second factor.
+    pub fn mfa_replace_recovery(&self, user_id: &str, recovery: &[String]) -> bool {
+        let c = self.c();
+        let Ok(tx) = c.unchecked_transaction() else { return false };
+        let on: bool = tx.query_row("SELECT COUNT(*) FROM user_mfa WHERE user_id = ? AND confirmed_at IS NOT NULL", [user_id], |r| r.get(0)).unwrap_or(false);
+        on && Self::write_recovery(&tx, user_id, recovery, now()).is_ok() && tx.commit().is_ok()
+    }
+
+    /// Spends a TOTP step: only a step later than the last one used, so a code works once.
+    pub fn mfa_use_step(&self, user_id: &str, step: i64) -> bool {
+        self.c()
+            .execute(
+                "UPDATE user_mfa SET last_step = ?1, updated_at = ?2 WHERE user_id = ?3 AND confirmed_at IS NOT NULL AND last_step < ?1",
+                params![step, now(), user_id],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Spends a recovery code, once, for a user whose second factor is on.
+    pub fn mfa_use_recovery(&self, user_id: &str, code_hash: &str) -> bool {
+        self.c()
+            .execute(
+                "UPDATE mfa_recovery_codes SET used_at = ?1 WHERE user_id = ?2 AND code_hash = ?3 AND used_at IS NULL
+                   AND user_id IN (SELECT user_id FROM user_mfa WHERE confirmed_at IS NOT NULL)",
+                params![now(), user_id, code_hash],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    pub fn mfa_recovery_left(&self, user_id: &str) -> i64 {
+        self.c().query_row("SELECT COUNT(*) FROM mfa_recovery_codes WHERE user_id = ? AND used_at IS NULL", [user_id], |r| r.get(0)).unwrap_or(0)
+    }
+
+    /// Removes the user's second factor and recovery codes. True if they had a confirmed one.
+    pub fn mfa_delete(&self, user_id: &str) -> bool {
+        let c = self.c();
+        let Ok(tx) = c.unchecked_transaction() else { return false };
+        let confirmed = tx.execute("DELETE FROM user_mfa WHERE user_id = ? AND confirmed_at IS NOT NULL", [user_id]).unwrap_or(0) == 1;
+        let _ = tx.execute("DELETE FROM user_mfa WHERE user_id = ?", [user_id]);
+        let _ = tx.execute("DELETE FROM mfa_recovery_codes WHERE user_id = ?", [user_id]);
+        tx.commit().is_ok() && confirmed
     }
 
     // Push devices (ADR 0080). Tokens are sealed; the hash keeps each on one session.
@@ -7000,7 +7162,7 @@ mod tests {
         let other = db.create_user(None, Some("push2@example.com"), "Q", Role::Member).unwrap();
         let session = |user: &str| {
             let hash = crate::random_hex(16);
-            let s = NewSession { user_id: user, token_hash: &hash, kind: "token", method: "code", idp_subject: None, idp_provider: None, label: None, ip: None, user_agent: None, expires_at: now() + 60_000 };
+            let s = NewSession { user_id: user, token_hash: &hash, kind: "token", method: "code", idp_subject: None, idp_provider: None, label: None, ip: None, user_agent: None, expires_at: now() + 60_000, mfa: None };
             db.create_session(&s).id
         };
         let s1 = session(&u.id);
@@ -7515,7 +7677,7 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let seen = db.create_user(None, None, "Seen", Role::Member).unwrap();
         let never = db.create_user(None, None, "Never", Role::Member).unwrap();
-        let s = db.create_session(&NewSession { user_id: &seen.id, token_hash: "h", kind: "token", method: "sso", idp_subject: None, idp_provider: Some("work"), label: None, ip: None, user_agent: None, expires_at: now() + 1000 });
+        let s = db.create_session(&NewSession { user_id: &seen.id, token_hash: "h", kind: "token", method: "sso", idp_subject: None, idp_provider: Some("work"), label: None, ip: None, user_agent: None, expires_at: now() + 1000, mfa: None });
         assert_eq!(db.user(&seen.id).unwrap().last_login_at, Some(s.created_at), "a new session stamps it");
         db.c().execute_batch(&format!("{UNDO_LAST_LOGIN} PRAGMA user_version = 7;")).unwrap();
         drop(db);

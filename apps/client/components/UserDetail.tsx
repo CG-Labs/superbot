@@ -156,6 +156,11 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
     });
   };
 
+  const resetMfa = async () => {
+    if (!(await confirmAsync(`Reset ${user.name}'s two-factor authentication?`, "Use this if they lost their authenticator app. If it's required, they set it up again at their next sign-in.", "Reset"))) return;
+    void run(() => api.resetUserMfa(user.id));
+  };
+
   const unlink = async (id: string, what: string) => {
     if (!(await confirmAsync(`Unlink ${what}?`, "They can't sign in with it any more. Their current sessions stay until you sign them out.", "Unlink"))) return;
     void run(() => api.unlinkIdentity(user.id, id));
@@ -265,6 +270,16 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
             </View>
           </>
         )}
+      </Section>
+
+      <Section title="Two-factor authentication">
+        <View style={styles.row}>
+          <Text style={[styles.text, { flex: 1 }]}>
+            {user.mfa?.enabled ? `On since ${new Date(user.mfa.enabledAt ?? 0).toLocaleDateString()}` : "Off"}
+          </Text>
+          {user.mfa?.enabled && !self ? <Button label="Reset" danger disabled={busy} onPress={() => void resetMfa()} /> : null}
+        </View>
+        {user.mfa?.enabled && self ? <Text style={styles.faint}>Turn yours off in Settings. Another admin can reset it.</Text> : null}
       </Section>
 
       <Section title="Single sign-on">

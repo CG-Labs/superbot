@@ -11,12 +11,15 @@ How people and Bots sign in, what each may do, how one user is kept from another
 | **SAML** | Through an OIDC broker (Keycloak) that checks the IdP's signed assertion. botd never parses SAML itself and accepts only logins brokered by the named IdP ([ADR 0020](../adr/0020-saml-bridge.md)). |
 | **One-time sign-in codes** | An admin issues a code for a person; it expires (default 60 minutes). |
 | **Break-glass password** | `AUTH_PASSWORD`, for the owner account, for setup and recovery. Constant-time compare and rate-limited. |
+| **Two-factor authentication** | TOTP from any authenticator app, with ten one-time recovery codes, for sign-in codes and the password. An admin (or `AUTH_MFA`) requires it for admins, which includes the owner, or for everyone; anyone can turn on their own. Secrets are sealed under the master key; wrong codes are limited per IP and per user and audited. Once the owner needs it, the password works only at sign-in, not over HTTP Basic ([ADR 0094](../adr/0094-totp-second-factor.md)). |
 | **SCIM 2.0 provisioning** | Off by default (`SCIM=on`). Its own hashed bearer token, valid only on `/scim/v2`. Deprovisioning disables the user and ends their sessions ([ADR 0023](../adr/0023-scim.md), [ADR 0026](../adr/0026-scim-review-hardening.md)). |
 | **App lock** | Optional biometric unlock in the iOS and Android apps ([ADR 0078](../adr/0078-client-biometric-app-lock.md)). |
 
-Sign-in failures (password, codes, SSO) are limited to 10 per 10 minutes per IP address. Writes without a bearer token must come from botd's own origin, which blocks cross-site requests ([auth review](auth-review-2026-11.md)).
+Sign-in failures (password, codes, second factors, SSO) are limited to 10 per 10 minutes per IP address, and wrong second factors to 5 per 15 minutes per person. Writes without a bearer token must come from botd's own origin, which blocks cross-site requests ([auth review](auth-review-2026-11.md)).
 
-**Not built:** SuperBot has no multi-factor authentication of its own. Use SSO and the IdP's MFA. There are no long-lived personal API tokens.
+SSO sign-ins don't get SuperBot's second factor: they rely on the IdP's MFA, which the customer must require there (each [IdP guide](../sso/) says where).
+
+**Not built:** WebAuthn or passkeys, and long-lived personal API tokens.
 
 ## Authorization
 

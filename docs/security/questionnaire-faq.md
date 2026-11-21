@@ -12,13 +12,13 @@ The operator chooses Linode regions (`MACHINE_REGIONS`) or where Incus hosts run
 Yes, with one operator choice. HTTPS to the server, mutual TLS 1.3 between the server and machines, HTTPS to botd's outside services, and STARTTLS or TLS for email. Runs reach model providers at the `baseUrl` the operator sets in the plan routing file, which may be plain `http://`; use `https://` so prompts and keys are encrypted. See [encryption in transit](data-flows.md#in-transit).
 
 **Is data encrypted at rest?**
-Secrets, approval inputs and push tokens are encrypted field by field (XChaCha20-Poly1305) with a master key kept outside the data folder. The rest of the database, and machine disks, rely on the host's disk encryption. Backups are encrypted with age when the operator sets recipients, and are otherwise plain; machine backups include harness logins. See [encryption at rest](data-flows.md#at-rest).
+Secrets, approval inputs and push tokens are encrypted field by field (XChaCha20-Poly1305) with a master key kept outside the data folder, which the operator can rotate ([ADR 0096](../adr/0096-master-key-rotation.md)). The rest of the database, and machine disks, rely on the host's disk encryption. Backups are encrypted with age when the operator sets recipients, and are otherwise plain; machine backups include harness logins. See [encryption at rest](data-flows.md#at-rest).
 
 **Do you support SSO and SCIM?**
 Yes: Microsoft Entra ID, Google, Apple, GitHub, any OIDC provider, and SAML through a Keycloak broker. SCIM 2.0 user provisioning and deprovisioning. Native SAML is planned (M5). See [authentication](access-control.md#authentication).
 
 **Do you support MFA?**
-Not in SuperBot itself. Use SSO and enforce MFA at your IdP. This is a listed gap in the [SOC 2 control mapping](soc2-control-mapping.md#cc6-logical-and-physical-access).
+Yes. Sign-in codes and the owner's break-glass password can require a code from an authenticator app (TOTP), with one-time recovery codes. Admins require it for admins, which includes the owner, or for everyone ([ADR 0094](../adr/0094-totp-second-factor.md)). SSO sign-ins rely on your IdP's MFA: enforce it there ([IdP guides](../sso/)).
 
 **How are users kept apart?**
 Each user's Bots run as that user's own Unix account on one server, or on that user's own machine when managed. A Bot can do no more than its owner. On machines, running Bots as an unprivileged user (`MACHINE_BOT_USER`) and teammates as their own OS users (`MACHINE_TEAMMATE_USERS`) are off by default and must be turned on, as must the Linode firewall (`MACHINE_FIREWALL`). See [isolation](access-control.md#isolation-between-users).

@@ -108,6 +108,9 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         (_, ["users", ..] | ["sessions", ..]) => Admin,
 
         ("GET", ["auth", "me"]) | ("POST", ["auth", "logout"]) => Account,
+        // Your own second factor (ADR 0094). Handlers refuse Bots. The policy is for admins.
+        ("GET", ["auth", "mfa"]) => Account,
+        ("POST", ["auth", "mfa", "enroll" | "confirm" | "recovery-codes" | "disable"]) => Account,
         // Your own machine (ADR 0025). Everyone else's, and every change, is under
         // `users` above or `machines`, which fall through to Admin.
         ("GET", ["machine"]) => Account,
@@ -369,6 +372,16 @@ mod tests {
             ("GET", "/api/machine/teammate//harness-logins", Perm::Admin),
             ("POST", "/api/machine/folder-sync", Perm::Admin),
             ("POST", "/api/auth/logout", Perm::Account),
+            // Your own second factor; the policy and anyone else's are for admins (ADR 0094).
+            ("GET", "/api/auth/mfa", Perm::Account),
+            ("POST", "/api/auth/mfa/enroll", Perm::Account),
+            ("POST", "/api/auth/mfa/confirm", Perm::Account),
+            ("POST", "/api/auth/mfa/recovery-codes", Perm::Account),
+            ("POST", "/api/auth/mfa/disable", Perm::Account),
+            ("PUT", "/api/auth/mfa/policy", Perm::Admin),
+            ("GET", "/api/auth/mfa/policy", Perm::Admin),
+            ("DELETE", "/api/auth/mfa", Perm::Admin),
+            ("DELETE", "/api/users/u1/mfa", Perm::Admin),
             ("GET", "/api/me/emails", Perm::Account),
             ("PUT", "/api/me/emails", Perm::Write),
             ("POST", "/api/me/emails", Perm::Admin),

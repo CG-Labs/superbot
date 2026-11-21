@@ -22,7 +22,7 @@ botd keeps the organisation's data in one SQLite database, `DATA_DIR/app.sqlite`
 | Machine records, certificates, backup and restore records | Rows ([ADR 0031](../adr/0031-machine-enrollment-mtls.md), [ADR 0071](../adr/0071-off-host-machine-backups.md)). |
 | Each user's facts and Bots' memory | Files: `DATA_DIR/users/<id>/USER.md`, `DATA_DIR/bots/<id>/`, kept for every run, here or on a machine. A run on a machine sends the changed files back and botd writes them here (up to 1 MiB each). With per-user accounts, runs here work on a copy in the user's folder, which botd copies back. |
 | Each user's working folder, when runs are on this server | Files: `WORKSPACE_DIR/users/<id>/`, owned by that user's Unix account ([ADR 0058](../adr/0058-harness-os-user-by-default.md)). |
-| The master key | A file or environment variable **outside** `DATA_DIR` (`SUPERBOT_MASTER_KEY`, `SUPERBOT_MASTER_KEY_FILE`, or `~/.config/superbot/master.key`). Never in backups. |
+| The master key | A file or environment variable **outside** `DATA_DIR` (`SUPERBOT_MASTER_KEY`, `SUPERBOT_MASTER_KEY_FILE`, or `~/.config/superbot/master.key`). Never in backups. During a rotation, the old key too (`SUPERBOT_MASTER_KEY_PREVIOUS(_FILE)`), until it is removed ([ADR 0096](../adr/0096-master-key-rotation.md)). |
 
 ### On each user's machine (managed)
 

@@ -107,6 +107,12 @@ A person can have GitHub and other identities linked to the same user: link each
 
 Same as the other providers: the iOS and Android apps open GitHub's page in the system browser and come back on `superbot://auth`; the web client returns to `{SSO_PUBLIC_URL}/app/auth`. Nothing extra to register at GitHub. Desktop (Electron) can't do SSO yet; use a sign-in code.
 
+## Require MFA at the IdP
+
+SuperBot doesn't ask single sign-on sign-ins for its own second factor: the IdP's MFA is that factor, so require it there. Sign-in codes and the owner's password get SuperBot's own two-factor authentication instead ([ADR 0094](../adr/0094-totp-second-factor.md)). Requiring MFA at your IdP is your control as the customer (CC6.1-2 in the [SOC 2 readiness checklist](../security/soc2-readiness-checklist.md)).
+
+In each GitHub organization whose people use SuperBot, **Settings → Authentication security → Require two-factor authentication**. SuperBot sees only a GitHub account, not its organizations, so link only people from organizations that require it.
+
 ## Troubleshooting
 
 Each failed sign-in is in the audit log with a reason (`botctl audit --action auth.login_failed`):

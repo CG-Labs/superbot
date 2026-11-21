@@ -34,6 +34,9 @@ mod license;
 #[cfg(test)]
 mod license_http_tests;
 mod machines;
+mod mfa;
+#[cfg(test)]
+mod mfa_http_tests;
 #[cfg(test)]
 mod machines_backup_tests;
 #[cfg(test)]
@@ -227,6 +230,7 @@ async fn main() {
     obs::log::set_format(observe.log);
     let status_page = status::Page::parse(&env("STATUS_PAGE", "")).unwrap_or_else(|e| exit(e));
     let break_glass = users::break_glass_flag(&env("AUTH_BREAK_GLASS", "")).unwrap_or_else(|e| exit(e));
+    let mfa_pinned = mfa::policy_flag(&env("AUTH_MFA", "")).unwrap_or_else(|e| exit(e));
     let sessions = SessionConfig::from_env(&env("SESSION_IDLE_TIMEOUT", ""), &env("SESSION_MAX_AGE", "")).unwrap_or_else(|e| exit(e));
     let sso = sso::Sso::from_env().unwrap_or_else(|e| exit(format!("SSO: {e}")));
     let signups = signups::Signups::from_env(&secrets::env::EnvStore::process(), &env("SIGNUPS", ""), &env("TURNSTILE_SITE_KEY", ""))
@@ -277,6 +281,19 @@ async fn main() {
                 log_info!("Secrets: sealed {} saved tool inputs, redacted {} saved rows, discarded {} sealed values.", r.sealed, r.redacted, r.discarded);
             }
             log_info!("Stored secrets: {}.", r.stored);
+            if let Some((from, done)) = &r.rotated {
+                log_info!(
+                    "Master key rotated from {from}: sealed {} values again under the new key ({} already were). Remove the previous key now (docs/ops/master-key-rotation.md).",
+                    done.resealed,
+                    done.current
+                );
+                if done.unreadable > 0 {
+                    log_warn!("Master key rotation: {} sealed values open with neither key and were left as they were.", done.unreadable);
+                }
+            }
+            if let Some(from) = &r.previous_unused {
+                log_warn!("{from} is set, but the master key already opens everything, so there is nothing to rotate. Remove it.");
+            }
         }
         Err(e) => {
             log_warn!("Secrets: {e}");
@@ -376,7 +393,7 @@ async fn main() {
                 log_info!("Isolation: ISOLATION_TEAMMATES=off, so a teammate's run of a shared Bot uses its owner's account (ADR 0046).");
             }
             let mut own = vec![app.cfg.data_dir.clone(), PathBuf::from(".env")];
-            own.extend(std::env::var_os("SUPERBOT_MASTER_KEY_FILE").map(PathBuf::from));
+            own.extend(["SUPERBOT_MASTER_KEY_FILE", "SUPERBOT_MASTER_KEY_PREVIOUS_FILE"].iter().filter_map(|k| std::env::var_os(k).map(PathBuf::from)));
             for p in accounts::close_to_others(&own) {
                 log_warn!("WARNING: other accounts can read {p}, which botd couldn't change. Per-user accounts must not read botd's files: chmod o-rwx it.");
             }
@@ -478,6 +495,7 @@ async fn main() {
         machines: Arc::new(control_plane),
         scim,
         payments,
+        mfa: mfa::Mfa::with_policy(mfa_pinned),
         ..Auth::new(Some(app.clone()))
     });
     log_info!("Control plane: {}.", auth_state.machines.describe());
@@ -531,6 +549,8 @@ async fn main() {
     let auth_state_scim_groups = auth_state.scim.enabled && auth_state.scim.groups;
     let auth_state_billing = auth_state.payments.enabled();
     let auth_state_checkout = auth_state.payments.checkout_enabled();
+    let mfa_policy = mfa::policy(&auth_state, &app.db);
+    log_info!("Two-factor sign-in: required for {}{} (ADR 0094).", match mfa_policy { mfa::Policy::Off => "no one", mfa::Policy::Admins => "admins", mfa::Policy::All => "everyone" }, if mfa_pinned.is_some() { ", set by AUTH_MFA" } else { "" });
     let router = router(app.clone(), auth_state);
     let policy = app.db.global_policy();
     app.db.record(&Event::new(Actor::system("server"), "server.started").details(json!({
@@ -544,6 +564,7 @@ async fn main() {
             (true, true) => "none",
             (false, _) => "sessions",
         },
+        "mfaPolicy": mfa_policy.as_str(),
         "sessionIdleMinutes": sessions.idle_ms / 60_000,
         "sessionMaxMinutes": sessions.max_ms / 60_000,
         "auditRetentionDays": retention,
@@ -702,6 +723,12 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/auth/login", post(users::login))
         .route("/auth/logout", post(users::logout))
         .route("/auth/me", get(users::me))
+        .route("/auth/mfa", get(mfa::status))
+        .route("/auth/mfa/enroll", post(mfa::enroll))
+        .route("/auth/mfa/confirm", post(mfa::confirm))
+        .route("/auth/mfa/recovery-codes", post(mfa::new_recovery))
+        .route("/auth/mfa/disable", post(mfa::disable))
+        .route("/auth/mfa/policy", put(mfa::put_policy))
         .route("/auth/sso", get(sso::list))
         .route("/auth/sso/{id}/start", get(sso::start))
         .route("/auth/sso/{id}/callback", get(sso::callback).post(sso::callback_post))
@@ -709,6 +736,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}", get(users::get_user).patch(users::update_user))
         .route("/users/{key}/login-codes", post(users::create_login_code))
         .route("/users/{key}/sessions", delete(users::revoke_user_sessions))
+        .route("/users/{key}/mfa", delete(mfa::reset))
         .route("/users/{key}/bots", get(users::user_bots))
         .route("/users/{key}/usage", get(usage::of_user))
         .route("/users/{key}/routines", get(handover::list))
@@ -939,6 +967,8 @@ struct Auth {
     /// buy and manage them on Stripe's pages (ADR 0042). Off unless STRIPE_WEBHOOK_SECRET is set.
     // Not `billing`: CodeQL reads that name as private data and flags every Stripe call.
     payments: billing::Billing,
+    /// Second factors for password and code sign-ins (ADR 0094).
+    mfa: mfa::Mfa,
     /// The database: sessions and audit events. None in tests of auth alone.
     app: Option<AppState>,
 }
@@ -959,6 +989,7 @@ impl Auth {
             machines: Arc::default(),
             scim: scim::Scim::default(),
             payments: billing::Billing::default(),
+            mfa: mfa::Mfa::default(),
             app,
         }
     }
@@ -1273,6 +1304,20 @@ fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<
             a.limiter.fail(&ip, at);
             return fail("password", None, false);
         }
+        // The password can't carry a second factor (ADR 0094): once the owner needs one,
+        // it works only at sign-in, for a session.
+        if mfa::guards_password(a) {
+            if let Some(found) = users::cookie_token(req.headers()).and_then(|t| a.session(&t)) {
+                return Ok(from_session(found));
+            }
+            a.login_failed(source, "password", Some("mfa_required"));
+            let res = unauthorized(a, req, false);
+            if res.status() != StatusCode::UNAUTHORIZED {
+                return Err(Box::new(res));
+            }
+            let msg = "The owner account uses two-factor authentication, so the password works only at sign-in. Sign in at /login, or with botctl login, for a session.";
+            return Err(Box::new(ApiError(StatusCode::UNAUTHORIZED, msg.into()).into_response()));
+        }
         return Ok(operator("password"));
     }
     if !h.is_empty() {
@@ -1299,14 +1344,16 @@ fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<
 fn unauthorized(a: &Auth, req: &Request, clear_cookie: bool) -> Response {
     let h = req.headers();
     let page = !req.uri().path().starts_with("/api/") && matches!(*req.method(), Method::GET | Method::HEAD);
+    // HTTP Basic is offered only while the password alone can sign in (ADR 0094).
+    let basic = a.break_glass && !mfa::guards_password(a);
     // With break-glass on, a page sent with a wrong password gets the browser's password box again.
-    let mut res = if page && (!a.break_glass || !h.contains_key(header::AUTHORIZATION)) {
+    let mut res = if page && (!basic || !h.contains_key(header::AUTHORIZATION)) {
         (StatusCode::SEE_OTHER, [(header::LOCATION, "/login")]).into_response()
     } else {
         ApiError(StatusCode::UNAUTHORIZED, "Login required".into()).into_response()
     };
     let fetch = h.get("sec-fetch-mode").and_then(|v| v.to_str().ok()).is_some_and(|m| m != "navigate");
-    if res.status() == StatusCode::UNAUTHORIZED && a.break_glass && !fetch && users::cookie_token(h).is_none() {
+    if res.status() == StatusCode::UNAUTHORIZED && basic && !fetch && users::cookie_token(h).is_none() {
         res.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Basic realm=\"Bots\""));
     }
     if clear_cookie {

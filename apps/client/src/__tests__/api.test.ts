@@ -1,4 +1,4 @@
-import { cookieSession, SuperBotApi } from "../api";
+import { cookieSession, finishSignIn, MfaRequired, signIn, SuperBotApi } from "../api";
 
 const BASE = "https://bots.example.com";
 
@@ -212,5 +212,73 @@ describe("SuperBotApi approvals (ADR 0051)", () => {
     call("/api/approvals/a1/approve", { remember: "bot", scope: "once" });
     await api.decideApproval("a1", false, false);
     call("/api/approvals/a1/deny", { remember: null, scope: "once" });
+  });
+});
+
+describe("two-factor sign-in (ADR 0094)", () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+  const answer = (status: number, body: unknown) => {
+    const fetchMock = jest.fn(async () => ({ ok: status < 400, status, json: async () => body }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    return fetchMock;
+  };
+
+  it("turns the server's ask for a second factor into MfaRequired", async () => {
+    answer(401, { error: "Enter the code from your authenticator app, or a recovery code.", mfa: "totp", challenge: "sbm_x" });
+    const err = await signIn(BASE, "sbc_abc").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(MfaRequired);
+    expect((err as MfaRequired).challenge).toBe("sbm_x");
+    expect((err as MfaRequired).mode).toBe("totp");
+    expect((err as MfaRequired).setup).toBeNull();
+
+    answer(401, { error: "Set it up.", mfa: "enroll", challenge: "sbm_y", secret: "ABCD", otpauthUrl: "otpauth://totp/x", qrSvg: "<svg/>" });
+    const enrol = (await signIn(BASE, "pw").catch((e: unknown) => e)) as MfaRequired;
+    expect(enrol.mode).toBe("enroll");
+    expect(enrol.setup).toEqual({ secret: "ABCD", otpauthUrl: "otpauth://totp/x", qrSvg: "<svg/>" });
+
+    answer(401, { error: "Wrong password." });
+    await expect(signIn(BASE, "pw")).rejects.not.toBeInstanceOf(MfaRequired);
+  });
+
+  it("finishes with the challenge and a code, and passes recovery codes back", async () => {
+    const token = "sbs_" + "a".repeat(64);
+    const fetchMock = answer(200, { token, recoveryCodes: ["aaaaa-bbbbb"] });
+    const r = await finishSignIn(BASE, "sbm_x", { totp: "123456" });
+    expect(r).toEqual({ config: { baseUrl: BASE, token }, recoveryCodes: ["aaaaa-bbbbb"] });
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toEqual({ challenge: "sbm_x", totp: "123456", session: "token", label: "SuperBot app" });
+
+    answer(200, { token });
+    expect((await finishSignIn(BASE, "sbm_x", { recoveryCode: "aaaaa-bbbbb" })).recoveryCodes).toBeNull();
+
+    answer(401, { error: "That code is wrong. Try again.", mfa: "totp", challenge: "sbm_x" });
+    await expect(finishSignIn(BASE, "sbm_x", { totp: "000000" })).rejects.toBeInstanceOf(MfaRequired);
+    answer(401, { error: "Too many wrong codes. Sign in again." });
+    await expect(finishSignIn(BASE, "sbm_x", { totp: "000000" })).rejects.toThrow("Too many wrong codes");
+  });
+
+  it("manages your own second factor and resets someone else's", async () => {
+    const fetchMock = answer(200, {});
+    const api = new SuperBotApi({ baseUrl: BASE, token: "sbs_t" });
+    await api.mfaStatus();
+    await api.mfaEnroll();
+    await api.mfaConfirm("123456");
+    await api.mfaNewRecoveryCodes({ recoveryCode: "aaaaa-bbbbb" });
+    await api.mfaDisable({ totp: "654321" });
+    await api.setMfaPolicy("admins");
+    await api.resetUserMfa("u 1");
+    const calls = (fetchMock.mock.calls as unknown as [string, RequestInit][]).map(([url, init]) => [init.method, url.slice(BASE.length), init.body ? JSON.parse(String(init.body)) : undefined]);
+    expect(calls).toEqual([
+      ["GET", "/api/auth/mfa", undefined],
+      ["POST", "/api/auth/mfa/enroll", {}],
+      ["POST", "/api/auth/mfa/confirm", { totp: "123456" }],
+      ["POST", "/api/auth/mfa/recovery-codes", { recoveryCode: "aaaaa-bbbbb" }],
+      ["POST", "/api/auth/mfa/disable", { totp: "654321" }],
+      ["PUT", "/api/auth/mfa/policy", { require: "admins" }],
+      ["DELETE", "/api/users/u%201/mfa", undefined],
+    ]);
   });
 });

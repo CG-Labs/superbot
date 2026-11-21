@@ -180,6 +180,12 @@ SAML subjects are compared without case: Keycloak lowercases the NameID before p
 
 One person can sign in with several providers (SAML, Entra, Google, …) as one user: link each identity to the same user.
 
+## Require MFA at the IdP
+
+SuperBot doesn't ask single sign-on sign-ins for its own second factor: the IdP's MFA is that factor, so require it there. Sign-in codes and the owner's password get SuperBot's own two-factor authentication instead ([ADR 0094](../adr/0094-totp-second-factor.md)). Requiring MFA at your IdP is your control as the customer (CC6.1-2 in the [SOC 2 readiness checklist](../security/soc2-readiness-checklist.md)).
+
+Require MFA at your SAML IdP, where people actually sign in: in ADFS, an access control policy such as **Permit everyone and require MFA** on the Keycloak relying party; in Okta, an authentication policy with a possession factor on the SAML app. The Keycloak bridge passes the sign-in through and adds no factor of its own.
+
 ## Troubleshooting
 
 SAML problems show on Keycloak's error page and in its log (**Realm settings → Events** to keep them). SuperBot's are in its audit log with a reason (`botctl audit --action auth.login_failed`):

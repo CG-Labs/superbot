@@ -390,6 +390,7 @@ sudo -u superbot env SUPERBOT_PASSWORD="$(sudo grep -oP '^AUTH_PASSWORD=\K.*' ~s
 - **Restoring on a new server**: restore the backup, then put the key back at the same path (owner `superbot`, mode `0600`) before starting botd. With a missing or wrong key, botd logs why and refuses to start; the installer refuses too rather than make a new key over sealed data.
 - **Key lost for good**: add `SUPERBOT_FORGET_SEALED=1` to `.env` and restart. Saved secrets and old approval inputs are dropped, everything else is kept, and a new key is made. It only drops what the current key can't open, but remove the line afterwards.
 - **Your own key**: set `SUPERBOT_MASTER_KEY` (64 hex chars, `openssl rand -hex 32`) in `.env` instead of the file, or point `SUPERBOT_MASTER_KEY_FILE` elsewhere. Not both.
+- **Rotating the key**: keep the old key as `SUPERBOT_MASTER_KEY_PREVIOUS_FILE` (or `SUPERBOT_MASTER_KEY_PREVIOUS`), put a new one in its place, and restart: botd seals everything again under the new key in one transaction and records `secret.master_key_rotated`. Then remove the previous key. Compose: `./init.sh --rotate-master-key`. Steps, checks and recovery: [master key rotation](../docs/ops/master-key-rotation.md) ([ADR 0096](../docs/adr/0096-master-key-rotation.md)).
 
 ## Backups and restore
 
@@ -619,6 +620,7 @@ botd now has users, roles, and sessions ([ADR 0012](../docs/adr/0012-users-sessi
 - Sessions last `SESSION_IDLE_TIMEOUT` without use (default `7d`) and at most `SESSION_MAX_AGE` (default `30d`). Revoke with `botctl session revoke-all <user>`.
 - People can sign in with Microsoft Entra ID: register an app, set `SSO_PROVIDERS=entra` and the `SSO_*` settings in `.env`, and link people with `botctl user link`. Step by step: [docs/sso/entra.md](../docs/sso/entra.md). The first start after this upgrade adds the `user_identities` table. Google and any OIDC IdP (Okta, Keycloak, Auth0, …) work the same way, alone or next to Entra (`SSO_PROVIDERS=entra,google,okta`): [docs/sso/google.md](../docs/sso/google.md), [docs/sso/oidc.md](../docs/sso/oidc.md). SSO stays off until `SSO_PROVIDERS` is set; upgrading needs no new settings.
 - Once every admin can sign in without the password, set `AUTH_BREAK_GLASS=0` and restart: the password is then ignored. To get back in, set it to `1` and restart.
+- To require two-factor authentication for admins and the owner's password, set `AUTH_MFA=admins` (or `all`) and restart, or choose it in the console's Settings. Each admin sets up an authenticator app at their next code or password sign-in. The password then works only at `/login` or with `botctl login` (which asks for the code), not over HTTP Basic, so scripts that send `SUPERBOT_PASSWORD` need a `SUPERBOT_TOKEN` instead ([ADR 0094](../docs/adr/0094-totp-second-factor.md)).
 - After upgrading to a release with the [setup wizard](#setup-wizard), admins see it once in the console. Finish or hide it there, or run `botctl setup done`.
 - Downgrading: older botd ignores the new tables and keeps working with `AUTH_PASSWORD`.
 
@@ -655,7 +657,7 @@ Without a domain, `./init.sh` gives plain HTTP at `http://localhost`, published 
 | `users` | `/srv/superbot/users` | With [per-user accounts](#per-user-accounts-in-docker): each user's home (harness logins), workspace, memory copies, and Bots' harness state. |
 | `caddy-data`, `caddy-config` | Caddy | Certificates and ACME account. |
 
-`init.sh` also writes a random `SUPERBOT_MASTER_KEY` once, which encrypts saved secrets ([master key](#master-key)); Compose refuses to start without it. Save API keys for the Bots encrypted instead of in `.env` with `SUPERBOT_PASSWORD=<AUTH_PASSWORD> docker compose exec -T -e SUPERBOT_PASSWORD botd botctl secret set OPENAI_API_KEY < key.txt`.
+`init.sh` also writes a random `SUPERBOT_MASTER_KEY` once, which encrypts saved secrets ([master key](#master-key)); Compose refuses to start without it. To replace it, run `./init.sh --rotate-master-key` and follow [master key rotation](../docs/ops/master-key-rotation.md). Save API keys for the Bots encrypted instead of in `.env` with `SUPERBOT_PASSWORD=<AUTH_PASSWORD> docker compose exec -T -e SUPERBOT_PASSWORD botd botctl secret set OPENAI_API_KEY < key.txt`.
 
 Secure by default: Compose refuses to start without `AUTH_PASSWORD`; the image sets `HOST=0.0.0.0`, so `botd` itself also refuses to run without it, and `ALLOW_NO_AUTH` is forced off. `ALLOWED_HOSTS` always includes `SUPERBOT_DOMAIN` (or `localhost`); add other names, such as `localhost:8080` when you change `SUPERBOT_HTTP_PORT`, in `.env`.
 
