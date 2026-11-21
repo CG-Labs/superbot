@@ -237,6 +237,27 @@ async fn a_pending_approval_reaches_email_and_the_webhook_once_with_audit() {
 }
 
 #[tokio::test]
+async fn a_stalled_mail_server_does_not_hold_up_the_webhook() {
+    let r = rig(on(0, 0), None).await;
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = silent.local_addr().unwrap().port();
+    let held = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let keep = held.clone();
+    tokio::spawn(async move {
+        while let Ok((s, _)) = silent.accept().await {
+            keep.lock().unwrap().push(s);
+        }
+    });
+    let stalled = Arc::new(Notifier::new(Some(smtp::Smtp::for_test("127.0.0.1", port, smtp::Tls::None, None, None)), Some("https://bots.example.com".into())));
+    let a = approval(&r.app.db, &r.bot.id, "git push");
+    let (app, n) = (r.app.clone(), stalled.clone());
+    tokio::spawn(async move { n.send_pending(&app, &a.bot_id, std::slice::from_ref(&a.id)).await });
+    until("the webhook while email waits", || Some(r.hook.hits.lock().unwrap().len()).filter(|n| *n > 0)).await;
+    assert!(!held.lock().unwrap().is_empty() && events(&r.app.db, "notification.*").iter().all(|e| e.details["channel"] != "email"), "email is still waiting");
+    secrets::global().delete(&webhook::bot_secret(&r.bot.id)).unwrap();
+}
+
+#[tokio::test]
 async fn approvals_answered_during_the_delay_send_nothing() {
     let r = rig(on(1, 0), None).await;
     let a = approval(&r.app.db, &r.bot.id, "git push");

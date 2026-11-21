@@ -146,6 +146,9 @@ impl Smtp {
         if username.as_deref().is_some_and(|u| u.contains(['\r', '\n', '\0'])) {
             return Err("SMTP_USERNAME has a line break in it".into());
         }
+        if tls == Tls::None && username.is_some() {
+            return Err("SMTP_TLS=none can't sign in: botd never sends the SMTP password unencrypted; drop SMTP_USERNAME or use starttls or tls".into());
+        }
         Ok(Some(Smtp { host, port, tls, username, from, tls_config: platform_tls()? }))
     }
 
@@ -180,8 +183,8 @@ impl Smtp {
     }
 
     async fn session(&self, password: Option<&str>, mails: &[Mail]) -> Result<Vec<Result<(), String>>, String> {
-        let addr = format!("{}:{}", self.host.trim_start_matches('[').trim_end_matches(']'), self.port);
-        let tcp = step(TcpStream::connect(&addr)).await?.map_err(|e| format!("couldn't connect to {}:{}: {e}", self.host, self.port))?;
+        let host = self.host.trim_start_matches('[').trim_end_matches(']');
+        let tcp = step(TcpStream::connect((host, self.port))).await?.map_err(|e| format!("couldn't connect to {}:{}: {e}", self.host, self.port))?;
         match self.tls {
             Tls::Implicit => {
                 let tls = self.wrap(tcp).await?;
@@ -207,7 +210,7 @@ impl Smtp {
                 let mut c = Conn::new(tcp);
                 c.expect(220).await?;
                 c.ehlo(self.from.domain()).await?;
-                c.run(self, loopback(&self.host), password, mails).await
+                c.run(self, false, password, mails).await
             }
         }
     }
@@ -576,6 +579,7 @@ mod tests {
             (&[("SMTP_HOST", "smtp.example.com")][..], "SMTP_FROM"),
             (&[("SMTP_HOST", "smtp.example.com"), ("SMTP_FROM", "bots@example.com"), ("SMTP_TLS", "none")][..], "this machine"),
             (&[("SMTP_HOST", "smtp.example.com"), ("SMTP_FROM", "bots@example.com"), ("SMTP_TLS", "maybe")][..], "SMTP_TLS"),
+            (&[("SMTP_HOST", "127.0.0.1"), ("SMTP_FROM", "bots@example.com"), ("SMTP_TLS", "none"), ("SMTP_USERNAME", "bots")][..], "unencrypted"),
             (&[("SMTP_HOST", "smtp.example.com"), ("SMTP_FROM", "not an address")][..], "SMTP_FROM"),
             (&[("SMTP_HOST", "smtp.example.com"), ("SMTP_FROM", "bots@example.com"), ("SMTP_PORT", "0")][..], "SMTP_PORT"),
         ] {

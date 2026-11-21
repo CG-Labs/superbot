@@ -688,8 +688,10 @@ impl Notifier {
     async fn deliver(&self, app: &App, n: &Notice, plan: &Plan, test: bool) -> Vec<Value> {
         let mut out = Vec::new();
         let ids: Vec<&str> = n.items.iter().map(|i| i.approval_id.as_str()).collect();
-        for ch in &self.channels {
-            let Some(r) = ch.send(n, plan, &self.links).await else { continue };
+        // Channels go out together, so a slow mail server can't hold a webhook past the deadline.
+        let results = futures_util::future::join_all(self.channels.iter().map(|ch| ch.send(n, plan, &self.links))).await;
+        for (ch, r) in self.channels.iter().zip(results) {
+            let Some(r) = r else { continue };
             let (ok, mut d) = match r {
                 Ok(s) => {
                     let mut d = s.detail;
