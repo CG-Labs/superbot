@@ -29,10 +29,10 @@ botd keeps the organisation's data in one SQLite database, `DATA_DIR/app.sqlite`
 |------|-------|
 | The user's working folder (`work/`) | Copied once from the server when `MACHINE_FOLDER_SYNC=on`, then lives on the machine ([ADR 0041](../adr/0041-machine-harness-logins-and-folder-copy.md)). |
 | Bots' memory and the user's `USER.md` | Seeded from the server where the machine has none. |
-| Harness logins (`~/.claude/.credentials.json`, `~/.codex/auth.json`) | Written by the harness's own login on the machine. **They never leave it**: botd relays the login terminal and keeps none of it; the audit log records only how many characters were typed ([ADR 0041](../adr/0041-machine-harness-logins-and-folder-copy.md), [ADR 0062](../adr/0062-teammate-harness-logins.md)). |
+| Harness logins (`~/.claude/.credentials.json`, `~/.codex/auth.json`) | Written by the harness's own login on the machine. botd relays the login terminal and keeps none of it, never reads the files, and the audit log records only how many characters were typed ([ADR 0041](../adr/0041-machine-harness-logins-and-folder-copy.md), [ADR 0062](../adr/0062-teammate-harness-logins.md)). **Machine backups contain them**, like the rest of the disk: Incus backups go to S3-compatible storage, unencrypted unless `MACHINE_BACKUP_AGE_RECIPIENTS` is set ([ADR 0071](../adr/0071-off-host-machine-backups.md)). |
 | Harness sessions and the Hermes Agent environment | One shared Hermes install per machine, a home per Bot ([ADR 0072](../adr/0072-one-hermes-environment-per-computer.md)). |
 | Screens | Live X displays. Nothing is recorded ([ADR 0045](../adr/0045-screens-on-machines.md)). |
-| Teammates' homes for shared Bots | Each teammate's own OS user and home, removed when they leave ([ADR 0048](../adr/0048-teammates-own-os-user-on-machines.md), [ADR 0052](../adr/0052-teammate-offboarding-on-machines.md)). |
+| Teammates' homes for shared Bots | With `MACHINE_TEAMMATE_USERS=on` (off by default), each teammate's own OS user and home, removed when they leave ([ADR 0048](../adr/0048-teammates-own-os-user-on-machines.md), [ADR 0052](../adr/0052-teammate-offboarding-on-machines.md)). |
 | The agent's mTLS key and certificate | Issued by botd's CA at enrollment ([ADR 0031](../adr/0031-machine-enrollment-mtls.md)). |
 
 Chat history, approvals, policy, secrets and the audit log stay on the control plane even when runs are on machines.
@@ -51,7 +51,7 @@ Chat history, approvals, policy, secrets and the audit log stay on the control p
 
 | Link | Protection |
 |------|-----------|
-| Device to server | HTTPS, terminated by Caddy (certificates from Caddy's automatic ACME). botd itself listens only on loopback. Caddy sends a Content-Security-Policy, `X-Content-Type-Options` and `Referrer-Policy`. |
+| Device to server | HTTPS, terminated by Caddy (certificates from Caddy's automatic ACME). botd's own port isn't public: loopback with the installer, an unpublished container port with Docker Compose. Caddy sends a Content-Security-Policy, `X-Content-Type-Options` and `Referrer-Policy`. |
 | botd to machine agent, and back | Mutual TLS 1.3 (rustls), with certificates from botd's own Ed25519 CA, 30-day leaf certificates, rotated by the agent, and pinned per machine ([ADR 0031](../adr/0031-machine-enrollment-mtls.md)). Enrollment uses a one-time token. |
 | Screens on machines | Inside the same mTLS channel, then to the viewer on the machine's loopback, which checks a per-Bot token ([ADR 0045](../adr/0045-screens-on-machines.md)). |
 | botd to Incus | Mutual TLS, with the Incus host's certificate pinned by SHA-256 ([ADR 0065](../adr/0065-incus-container-machines.md)). |
@@ -66,7 +66,7 @@ Chat history, approvals, policy, secrets and the audit log stay on the control p
 | Secrets, approval inputs, push tokens | Sealed field by field with XChaCha20-Poly1305 under the master key. Each value is bound to where it lives (for example its user and name), so a copied row doesn't open elsewhere ([`server/src/secrets/sealed.rs`](../../server/src/secrets/sealed.rs), [ADR 0010](../adr/0010-secrets.md)). |
 | The rest of the database (chats, audit, users) | **Not encrypted by SuperBot.** Whole-database encryption was considered and rejected ([ADR 0010](../adr/0010-secrets.md)). Protect it with the host's disk encryption. |
 | Server backups | Encrypted with age when the operator sets `SUPERBOT_BACKUP_AGE_RECIPIENTS`; otherwise plain archives. The master key is never in them ([ADR 0030](../adr/0030-backup-restore-drill.md)). |
-| Machine backups (Incus) | Encrypted with age to `MACHINE_BACKUP_AGE_RECIPIENTS` as they leave the host; the server holds only public keys. Without recipients they are not encrypted ([ADR 0071](../adr/0071-off-host-machine-backups.md)). |
+| Machine backups (Incus) | botd takes the export from the Incus host over mutual TLS and encrypts it with age to `MACHINE_BACKUP_AGE_RECIPIENTS` as it streams it to object storage, so the store holds only ciphertext and botd needs only public keys. Without recipients the archive is not encrypted. To restore an encrypted backup, an admin hands botd the private age identity for that restore only; botd decrypts it and never stores it ([ADR 0071](../adr/0071-off-host-machine-backups.md)). |
 | Machine disks | Whatever the host provides (Linode, or the Incus host's storage). SuperBot adds no disk encryption. |
 | Device | OS keychain/keystore on iOS and Android. |
 
