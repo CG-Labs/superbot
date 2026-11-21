@@ -779,12 +779,14 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/scim/v2/Groups/{id}", get(scim::get_group).put(scim::groups_unsupported).patch(scim::groups_unsupported).delete(scim::groups_unsupported))
         .route("/scim/v2", any(scim::unknown))
         .route("/scim/v2/{*rest}", any(scim::unknown))
+        .route_layer(middleware::from_fn(obs::note_route))
         .layer(DefaultBodyLimit::max(scim::MAX_BODY))
         .layer(middleware::from_fn_with_state(auth_state.clone(), scim::guard))
         .layer(Extension(auth_state.clone()));
     // Stripe signs its webhook; there are no credentials to check (ADR 0040).
     let billing_routes = Router::new()
         .route("/billing/stripe/webhook", post(billing::webhook))
+        .route_layer(middleware::from_fn(obs::note_route))
         .layer(DefaultBodyLimit::max(billing::MAX_BODY))
         .layer(Extension(auth_state.clone()));
     Router::new()
@@ -795,6 +797,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
             Router::new()
                 .nest("/api", api)
                 .route("/login", get(login_page))
+                .route_layer(middleware::from_fn(obs::note_route))
                 .fallback(get(web))
                 .layer(middleware::from_fn_with_state(auth_state.clone(), auth))
                 .layer(Extension(auth_state)),

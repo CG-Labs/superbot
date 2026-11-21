@@ -57,7 +57,6 @@ pub struct Listen {
 impl Settings {
     pub fn from_env(get: &dyn Fn(&str) -> String, store: &dyn SecretStore) -> Result<Settings, String> {
         let log = log::Format::parse(&get("LOG_FORMAT"))?;
-        let token = store.get("METRICS_TOKEN").map_err(|e| e.to_string())?;
         let raw = get("METRICS_LISTEN");
         let addr = match raw.trim().to_ascii_lowercase().as_str() {
             "" | "off" => None,
@@ -67,6 +66,7 @@ impl Settings {
         let Some(addr) = addr else {
             return Ok(Settings { log, metrics: None });
         };
+        let token = store.get("METRICS_TOKEN").map_err(|e| e.to_string())?;
         if let Some(t) = &token {
             if t.expose().len() < MIN_TOKEN {
                 return Err(format!("METRICS_TOKEN must be at least {MIN_TOKEN} characters (openssl rand -hex 32 makes one)"));

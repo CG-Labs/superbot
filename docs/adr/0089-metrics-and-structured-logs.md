@@ -24,7 +24,7 @@ botd serves Prometheus' text exposition format (version 0.0.4) at `/metrics`. It
 | `METRICS_TOKEN` or `METRICS_TOKEN_FILE` | A bearer token scrapers must send; at least 24 characters | none |
 
 - **Its own listener, never the main port.** Caddy proxies botd's main port to the internet, and machines' Bots reach it through the machine port as if from loopback (ADR 0036). A check for loopback callers on the main port would let every Bot on a machine in. On its own listener, `/metrics` is reachable only where the operator binds it, and that listener serves nothing else.
-- **A token off loopback.** botd refuses to start with a `METRICS_LISTEN` off loopback and no `METRICS_TOKEN`. With a token set, every scrape must send `Authorization: Bearer <token>`, compared in constant time, on loopback too. The token is a secret like the others: from the environment or a `_FILE`, and redacted from what botd writes.
+- **A token off loopback.** botd refuses to start with a `METRICS_LISTEN` off loopback and no `METRICS_TOKEN`. With a token set, every scrape must send `Authorization: Bearer <token>`, compared in constant time, on loopback too. The token is one of botd's own secrets (`SERVER_SECRETS`): from the environment or a `_FILE`, redacted from what botd writes, and never given to a Bot's run. It's read only when metrics are on, so a leftover `METRICS_TOKEN_FILE` doesn't stop a server with metrics off from starting.
 - **Why Prometheus' format.** Every common monitoring system reads it: Prometheus, Grafana Agent and Alloy, VictoriaMetrics, Datadog, New Relic, the OpenTelemetry Collector's Prometheus receiver. It's plain text that needs no client library. botd writes it itself, a few hundred lines of Rust with no new dependency, so the label rules below are enforced by types, not by a library's conventions.
 
 ### What it shows
@@ -62,7 +62,7 @@ The roadmap's "RED metrics per user" isn't built: a label per user is unbounded 
 `LOG_FORMAT=json` (default `text`) prints one JSON object per line, on the same streams as before (information on stdout, warnings on stderr), for journald, Docker, or any shipper to parse:
 
 - **botd's own lines** become `{"ts", "level", "msg"}`. `ts` is UTC, RFC 3339, in milliseconds. A leading `WARNING: ` becomes `"level": "warn"`.
-- **Every request**: `http.request`, with `requestId`, `method`, `route` (the matched template, such as `/api/bots/{id}/messages`, never the path as sent), `routeClass`, `status` and `durationMs`. Successful `/healthz` checks aren't logged.
+- **Every request**: `http.request`, with `requestId`, `method`, `route` (the matched template, such as `/api/bots/{id}/messages`, never the path as sent; absent when a request was refused before routing, by sign-in or SCIM's guard, or matched nothing), `routeClass`, `status` and `durationMs`. Successful `/healthz` checks aren't logged.
 - **Every run**: `message.queued` (with the `requestId` that queued it, if any), then `run.started` and `run.finished`, with `runId` (the same `r…` id the audit log and run tokens use), `messageId`, `botId`, `harness`, `trigger`, `host`, and on finishing `result`, `durationMs` and `attempts`. The message id joins a request to the run it started.
 - **Request ids.** botd gives every request an id and returns it as `X-Request-Id`. One sent in (by Caddy, a load balancer or a client) is kept if it's 1 to 64 letters, digits, `-`, `_` or `.`. Otherwise botd makes a new one, so nothing else a caller sends is logged.
 

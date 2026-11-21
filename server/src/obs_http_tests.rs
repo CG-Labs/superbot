@@ -69,9 +69,22 @@ fn metrics_are_off_by_default_and_need_a_token_off_loopback() {
     let from_file = settings(&[("METRICS_LISTEN", "10.0.0.5:9464"), ("METRICS_TOKEN_FILE", file.to_str().unwrap())]).unwrap();
     assert_eq!(from_file.metrics.unwrap().token.map(|t| t.expose().to_string()), Some(token));
 
+    // With metrics off, a token setting left behind is never read.
+    let gone = dir.join("gone");
+    assert!(settings(&[("METRICS_LISTEN", "off"), ("METRICS_TOKEN_FILE", gone.to_str().unwrap())]).unwrap().metrics.is_none());
+    assert!(settings(&[("METRICS_TOKEN", "a"), ("METRICS_TOKEN_FILE", "b")]).unwrap().metrics.is_none());
+    assert!(settings(&[("METRICS_LISTEN", "on"), ("METRICS_TOKEN_FILE", gone.to_str().unwrap())]).is_err());
+
     assert!(settings(&[("METRICS_LISTEN", "everywhere")]).unwrap_err().contains("METRICS_LISTEN"));
     assert_eq!(settings(&[("LOG_FORMAT", "JSON")]).unwrap().log, obs::log::Format::Json);
     assert!(settings(&[("LOG_FORMAT", "xml")]).unwrap_err().contains("LOG_FORMAT"));
+}
+
+#[test]
+fn bots_never_get_the_metrics_token() {
+    assert!(secrets::server_secret("METRICS_TOKEN"));
+    let withheld = adapters::secret_env();
+    assert!(withheld.iter().any(|k| k == "METRICS_TOKEN") && withheld.iter().any(|k| k == "METRICS_TOKEN_FILE"), "{withheld:?}");
 }
 
 #[tokio::test]
@@ -140,6 +153,20 @@ async fn requests_are_counted_by_route_class_and_logged_with_an_id() {
     call_with(port, "GET", "/api/nothing/ada@example.com", &admin, &format!("X-Request-Id: {rid}\r\n"), "").await;
     let line = captured::with(&rid).into_iter().find(|l| l["msg"] == "http.request").expect("a request line");
     assert!(line.get("route").is_none() && line["routeClass"] == "api_other" && !line.to_string().contains("ada"), "{line}");
+
+    // Routes outside the API log their template too.
+    for (method, path, route) in [("GET", "/login", "/login"), ("POST", "/billing/stripe/webhook", "/billing/stripe/webhook"), ("GET", "/scim/v2/Users/u1", "/scim/v2/Users/{id}")] {
+        let rid = format!("t-{}", random_hex(8));
+        let auth = if path.starts_with("/scim") { "" } else { admin.as_str() };
+        call_with(port, method, path, auth, &format!("X-Request-Id: {rid}\r\n"), "{}").await;
+        let line = captured::with(&rid).into_iter().find(|l| l["msg"] == "http.request").expect("a request line");
+        if path.starts_with("/scim") {
+            // Refused by SCIM's own guard before routing: a class, no template.
+            assert_eq!(line["routeClass"], "scim", "{line}");
+        } else {
+            assert_eq!(line["route"].as_str(), Some(route), "{method} {path}: {line}");
+        }
+    }
 
     let m = obs::render(&app);
     assert_eq!(total(&m, r#"superbot_http_requests_total{route_class="healthz",method="GET",status_class="2xx"}"#), 1.0, "{m}");
