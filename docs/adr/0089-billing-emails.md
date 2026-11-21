@@ -89,7 +89,7 @@ Every outcome is audited by `billing` on behalf of the user:
 - They don't follow approval notifications' email switch ([ADR 0061](0061-approval-notifications.md)): a server can send billing emails without approval emails, and the other way round. Only the SMTP server is shared.
 - Off, nothing is queued and nothing is sent. The Plan screen has no **Emails** card. Self-hosted servers, which have no billing, are unchanged.
 - Without a public address (`PUBLIC_URL`, else `SSO_PUBLIC_URL`, else the first `ALLOWED_HOSTS`), emails go without links and say to open **Plan** in SuperBot.
-- The start-up log says whether billing emails are on and through which mail server (host, port and TLS; not the sign-in name). `server.started` adds `billingEmails`.
+- The start-up log says whether billing emails are on, and nothing from the SMTP settings. `server.started` adds `billingEmails`.
 
 ## Consequences
 
