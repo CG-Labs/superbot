@@ -68,6 +68,9 @@ pub struct World {
     pub hold_rebuilds: bool,
     /// The next operation fails with this.
     pub fail_op: Option<String>,
+    /// The next create is answered with this status and error at once, as for a
+    /// cluster member or image that isn't there (404).
+    pub fail_create: Option<(u16, String)>,
     /// Addresses to give containers by name, instead of 10.20.0.x.
     pub addresses: BTreeMap<String, String>,
     /// The next this many instance PUTs and PATCHes find that another client changed
@@ -561,6 +564,9 @@ async fn handle(
             sync(json!(list))
         }
         ("POST", ["1.0", "instances"]) => {
+            if let Some((status, why)) = w.fail_create.take() {
+                return err(status, &why);
+            }
             let Some(n) = body["name"].as_str().map(String::from) else {
                 return err(400, "No name provided");
             };
