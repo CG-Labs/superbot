@@ -784,8 +784,9 @@ fn refused(app: &App, mut m: Machine, by: &Who, e: ProviderError, step: &str) ->
         if step == "create" && matches!(e, ProviderError::Api { .. }) {
             // A refusal made nothing, so a delete needn't wait for it.
             m.create_sent_at = None;
-            m.placed_on = None;
         }
+        // Nor does it hold room: a retry once the cause is fixed mustn't count itself.
+        m.placed_on = None;
     }
     m.last_error = Some(match step {
         "firewall" => format!("The machine's firewall couldn't be set up: {e}"),

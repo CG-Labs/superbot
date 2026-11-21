@@ -274,3 +274,20 @@ async fn a_host_that_didnt_answer_doesnt_hold_up_creates_on_the_others() {
     assert_eq!(code, 202, "{d}");
     assert!(d["providerId"].as_str().is_some_and(|p| p.starts_with("a/")), "made on a, not left pending: {d}");
 }
+
+#[tokio::test]
+async fn a_refused_create_frees_its_room_for_its_retry() {
+    let env = serve_with(|a, _, _| Fleet::new(vec![Member { max_machines: Some(1), ..a }], DOWN_MS)).await;
+    let (uid, _) = user_with(env.port, &env.admin, "ada@example.com", "member").await;
+    env.a.w().fail_op = Some("Failed getting remote image info: not found".into());
+    let (code, d) = ask(&env, &uid).await;
+    assert_eq!(code, 202, "{d}");
+    let m = env.app.db.user_machine(&uid).unwrap();
+    assert_eq!((m.state, m.placed_on.as_deref()), (State::Error, None), "{m:?}");
+    let h = hosts(&env).await;
+    assert_eq!(on(&h, "a")["load"]["machines"].as_u64(), Some(0), "{h}");
+    // The image is back: the retry isn't refused for want of the room it held.
+    let (code, d) = ask(&env, &uid).await;
+    assert_eq!(code, 202, "{d}");
+    assert!(d["providerId"].as_str().is_some_and(|p| p.starts_with("a/")), "{d}");
+}
