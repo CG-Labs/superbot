@@ -962,7 +962,7 @@ mod tests {
     #[test]
     fn a_teammate_account_is_one_per_owner_and_teammate_and_holds_neither_id() {
         let a = teammate_account("u1", "u2").unwrap();
-        assert!(a.starts_with(TEAMMATE_PREFIX) && a.len() == 29, "{a}");
+        assert!(a.starts_with(TEAMMATE_PREFIX) && a.len() == 29);
         assert!(a[5..].bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
         assert_eq!(teammate_account("u1", "u2").unwrap(), a, "stable");
         assert_ne!(teammate_account("u2", "u1").unwrap(), a, "each way round is its own");
