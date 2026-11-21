@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 const PASSWORD: &str = "e2e-password";
 
 /// One `hermes` call per run. `$STUB/tool` is the command the "model" wants to run;
-/// `$STUB/skip-hook` makes it run the tool without the hook, like a Hermes that ignores hooks.
+/// `$STUB/skip-hook` makes it run the tool without the hook, like a Hermes that ignores hooks:
+/// the terminal, or the tool it names, which fails (before any hook) if `$STUB/skip-error` exists.
 const STUB: &str = r#"#!/bin/sh
 stub=$(dirname "$0")
 printf '%s|%s\n' "$*" "$HERMES_HOME" >>"$stub/calls.log"
@@ -28,7 +29,16 @@ tool=$(cat "$stub/tool")
 printf '{"type":"system","subtype":"init","model":"stub","session_id":""}\n'
 printf '{"type":"text","text":"On it."}\n'
 if [ -e "$stub/skip-hook" ]; then
-  printf '{"type":"tool_use","name":"terminal","input":{"command":"%s"}}\n' "$tool"
+  name=$(cat "$stub/skip-hook")
+  printf '{"type":"tool_use","name":"%s","tool_call_id":"c0","input":{"command":"%s"}}\n' "${name:-terminal}" "$tool"
+  if [ -n "$name" ]; then
+    error=false && [ -e "$stub/skip-error" ] && error=true
+    printf '{"type":"tool_result","name":"%s","tool_call_id":"c0","output":"x","is_error":%s}\n' "$name" "$error"
+    if [ "$error" = true ]; then
+      printf '{"type":"result","session_id":"local-stub1","exit_code":0,"text":"It failed."}\n'
+      exit 0
+    fi
+  fi
   sleep 30
   exit 0
 fi
@@ -249,4 +259,15 @@ fn hermes_runs_behind_the_approval_gate() {
     assert!(texts(&replies).contains("without checking SuperBot's approval gate"), "{}", texts(&replies));
     assert!(start.elapsed() < Duration::from_secs(20), "stopped by the canary, not the stub's sleep");
     assert!(read(&b.stub.join("calls.log")).trim_end().lines().last().unwrap().starts_with("gateway stop --yes|"));
+
+    // Any tool counts once it ran (ADR 0063), not one that failed before the hook.
+    std::fs::write(b.stub.join("skip-hook"), "read_file").unwrap();
+    std::fs::write(b.stub.join("skip-error"), "").unwrap();
+    let replies = ask(&b, &id, "read it", "It failed.", |a| panic!("no hook should have run: {a}"));
+    assert!(!texts(&replies).contains("approval gate"), "{}", texts(&replies));
+    std::fs::remove_file(b.stub.join("skip-error")).unwrap();
+    let start = Instant::now();
+    let replies = ask(&b, &id, "read it again", "approval gate", |a| panic!("no hook should have run: {a}"));
+    assert!(texts(&replies).contains("used a tool without checking SuperBot's approval gate"), "{}", texts(&replies));
+    assert!(start.elapsed() < Duration::from_secs(20), "stopped by the canary, not the stub's sleep");
 }

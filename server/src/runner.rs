@@ -682,7 +682,7 @@ impl App {
             self.give_back_routine(&bot, msg);
             self.say(&bot.id, text, true);
         };
-        let Some((shell_tool, bin, has_sandbox, sandbox_needs)) = adapters::get(&bot.harness).map(|a| (a.shell_tool(), a.bin(), a.has_sandbox(), a.sandbox_needs())) else {
+        let Some((bin, has_sandbox, sandbox_needs)) = adapters::get(&bot.harness).map(|a| (a.bin(), a.has_sandbox(), a.sandbox_needs())) else {
             return cant_run(&format!("Unknown harness \"{}\".", bot.harness));
         };
         let Some(bot_dir) = self.bot_dir(&bot.id) else {
@@ -886,41 +886,45 @@ impl App {
             let mut replies = 0;
             let id = bot.id.clone();
             let mut canary: Option<tokio::task::JoinHandle<()>> = None;
-            let mut saw_shell = false;
-            let emit = |e| match e {
-                AgentEvent::Session(s) => {
-                    if for_other.is_none() {
-                        self.db.keep_session(&id, &s, placed_at);
+            let mut saw_tool = false;
+            let gate = adapters::get(&bot.harness).unwrap();
+            let emit = |e| {
+                // Fail closed: a guarded harness that runs a tool its hook covers without
+                // ever calling the hook isn't enforcing approvals, so stop it.
+                if guard.is_some() && canary.is_none() && adapters::arms_canary(&*gate, &e) {
+                    saw_tool = true;
+                    let (hooks, abort) = (hooks.clone(), abort_tx.clone());
+                    canary = Some(tokio::spawn(async move {
+                        tokio::time::sleep(HOOK_GRACE).await;
+                        if hooks.load(Ordering::SeqCst) == 0 {
+                            abort.send_if_modified(|r| r.get_or_insert("unguarded") == &"unguarded");
+                        }
+                    }));
+                }
+                match e {
+                    AgentEvent::Session(s) => {
+                        if for_other.is_none() {
+                            self.db.keep_session(&id, &s, placed_at);
+                        }
                     }
-                }
-                AgentEvent::TextDelta(t) => {
-                    let draft = self.with_run(&id, |r| { r.draft.push_str(&t); r.draft.clone() });
-                    self.send(json!({ "type": "draft", "botId": id, "text": draft }));
-                }
-                AgentEvent::Text(t) => {
-                    self.with_run(&id, |r| r.draft.clear());
-                    replies += 1;
-                    self.say(&id, &t, false);
-                }
-                AgentEvent::Tool { name, detail } => {
-                    // Fail closed: a guarded harness that runs a shell tool without ever
-                    // calling the hook isn't enforcing approvals, so stop it.
-                    if guard.is_some() && canary.is_none() && name.eq_ignore_ascii_case(shell_tool) {
-                        saw_shell = true;
-                        let (hooks, abort) = (hooks.clone(), abort_tx.clone());
-                        canary = Some(tokio::spawn(async move {
-                            tokio::time::sleep(HOOK_GRACE).await;
-                            if hooks.load(Ordering::SeqCst) == 0 {
-                                abort.send_if_modified(|r| r.get_or_insert("unguarded") == &"unguarded");
-                            }
-                        }));
+                    AgentEvent::TextDelta(t) => {
+                        let draft = self.with_run(&id, |r| { r.draft.push_str(&t); r.draft.clone() });
+                        self.send(json!({ "type": "draft", "botId": id, "text": draft }));
                     }
-                    let status = tool_label(&name, &detail);
-                    self.with_run(&id, |r| r.status = status.clone());
-                    self.send(json!({ "type": "status", "botId": id, "working": true, "status": status }));
+                    AgentEvent::Text(t) => {
+                        self.with_run(&id, |r| r.draft.clear());
+                        replies += 1;
+                        self.say(&id, &t, false);
+                    }
+                    AgentEvent::Tool { name, detail } => {
+                        let status = tool_label(&name, &detail);
+                        self.with_run(&id, |r| r.status = status.clone());
+                        self.send(json!({ "type": "status", "botId": id, "working": true, "status": status }));
+                    }
+                    AgentEvent::ToolRan { .. } => {}
+                    AgentEvent::Error(m) => errors.push(m),
+                    AgentEvent::Usage(u) => used.push(u),
                 }
-                AgentEvent::Error(m) => errors.push(m),
-                AgentEvent::Usage(u) => used.push(u),
             };
             let adapter = adapters::get(&bot.harness).unwrap();
             match &spot.machine {
@@ -938,7 +942,7 @@ impl App {
                 c.abort();
             }
             // A run that ends before the canary fires still has to report a missing hook.
-            if saw_shell && hooks.load(Ordering::SeqCst) == 0 {
+            if saw_tool && hooks.load(Ordering::SeqCst) == 0 {
                 abort_tx.send_if_modified(|r| r.get_or_insert("unguarded") == &"unguarded");
             }
             self.cancel_approvals(&id, "The task ended");
@@ -989,7 +993,7 @@ impl App {
                 Some("unguarded") => self.say(
                     &id,
                     &format!(
-                        "I stopped: {} ran a command without checking SuperBot's approval gate, so approvals aren't enforced for me. \
+                        "I stopped: {} used a tool without checking SuperBot's approval gate, so approvals aren't enforced for me. \
                          Update the {} CLI, or set my approvals to bypass (dev only).",
                         bot.harness, bot.harness
                     ),
