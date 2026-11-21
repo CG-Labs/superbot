@@ -128,6 +128,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine request <user> [<tier>] [<region>]  Give the user a machine (a Linode VM or an Incus container)
   botctl machine suspend|resume <user>             Power it off (disk and address kept), or back on
   botctl machine resize <user> <tier>              Move it to the tier's plan
+  botctl machine resize <user> status              Its latest resize: a tier change's, and whether it waits, and why
+  botctl machine resizes                           Every resize a tier change asked for that isn't done yet
   botctl machine destroy <user> --yes              Delete it and its disk at the provider
   botctl machine substrate [check]                 What machines are made on, each tier's size, and isolation; check asks the host
   botctl machine reconcile                         Follow every machine to where it should be now
@@ -683,13 +685,15 @@ fn lifecycle_request(args: &[&str]) -> Option<Result<Request, String>> {
         }
         ["suspend", user] => ("POST", at(user, "/suspend"), None),
         ["resume", user] => ("POST", at(user, "/resume"), None),
+        ["resize", user, "status"] => ("GET", at(user, "/resize"), None),
         ["resize", user, tier] => ("POST", at(user, "/resize"), Some(json!({ "tier": tier }).to_string())),
+        ["resizes"] => ("GET", "/api/machines/resizes".into(), None),
         ["destroy", user, "--yes"] => ("DELETE", at(user, ""), None),
         ["substrate"] => ("GET", "/api/machines/substrate".into(), None),
         ["substrate", "check"] => ("GET", "/api/machines/substrate?check=true".into(), None),
         ["reconcile"] => ("POST", "/api/machines/reconcile".into(), None),
-        ["list" | "show" | "request" | "suspend" | "resume" | "resize" | "destroy" | "substrate" | "reconcile", ..] => {
-            return Some(Err("Usage: botctl machine list [<state>] | show <user> | request <user> [<tier>] [<region>] | suspend <user> | resume <user> | resize <user> <tier> | destroy <user> --yes | substrate [check] | reconcile".into()));
+        ["list" | "show" | "request" | "suspend" | "resume" | "resize" | "resizes" | "destroy" | "substrate" | "reconcile", ..] => {
+            return Some(Err("Usage: botctl machine list [<state>] | show <user> | request <user> [<tier>] [<region>] | suspend <user> | resume <user> | resize <user> <tier>|status | resizes | destroy <user> --yes | substrate [check] | reconcile".into()));
         }
         _ => return None,
     }))
@@ -1006,6 +1010,14 @@ fn usage_summary(v: &Value) -> String {
             (Value::Null, None) => {}
             (m, _) => line += &format!("; machine {} ({}){}", m["plan"].as_str().unwrap_or_default(), m["state"].as_str().unwrap_or_default(), allowed.map_or(String::new(), |t| format!(", plan size {t}"))),
         }
+        let r = &u["machine"]["resize"];
+        if let (Some(state @ ("pending" | "waiting" | "failed")), Some(to)) = (r["state"].as_str(), r["toPlan"].as_str()) {
+            line += &format!("; resizing to {to} ({state}");
+            if let Some(why) = r["message"].as_str() {
+                line += &format!(": {why}");
+            }
+            line += ")";
+        }
         if let Some(st) = u["subscription"]["status"].as_str() {
             line += &format!("; Stripe {st}");
         }
@@ -1311,11 +1323,13 @@ mod tests {
         assert_eq!(r(&["suspend", "u1"]), ("POST", "/api/users/u1/machine/suspend".into(), None));
         assert_eq!(r(&["resume", "u1"]), ("POST", "/api/users/u1/machine/resume".into(), None));
         assert_eq!(r(&["resize", "u1", "max"]), ("POST", "/api/users/u1/machine/resize".into(), Some(r#"{"tier":"max"}"#.into())));
+        assert_eq!(r(&["resize", "u1", "status"]), ("GET", "/api/users/u1/machine/resize".into(), None));
+        assert_eq!(r(&["resizes"]), ("GET", "/api/machines/resizes".into(), None));
         assert_eq!(r(&["destroy", "u1", "--yes"]), ("DELETE", "/api/users/u1/machine".into(), None));
         assert_eq!(r(&["substrate"]), ("GET", "/api/machines/substrate".into(), None));
         assert_eq!(r(&["substrate", "check"]), ("GET", "/api/machines/substrate?check=true".into(), None));
         assert_eq!(r(&["reconcile"]), ("POST", "/api/machines/reconcile".into(), None));
-        for bad in [&["destroy", "u1"][..], &["resize", "u1"], &["request", "u1", "pro", "node2", "x"], &["substrate", "now"], &["show"]] {
+        for bad in [&["destroy", "u1"][..], &["resize", "u1"], &["request", "u1", "pro", "node2", "x"], &["substrate", "now"], &["show"], &["resizes", "all"]] {
             assert!(lifecycle_request(bad).unwrap().is_err(), "{bad:?}");
         }
         assert!(lifecycle_request(&["placement"]).is_none(), "the rest are machine_request's");
@@ -1522,13 +1536,13 @@ mod tests {
             { "user": { "email": "ada@example.com" }, "over": ["bots", "machineType"],
               "plan": { "label": "Starter", "limits": { "maxBots": 2, "monthlyRuns": 300, "dailyRoutineRuns": 24, "machineType": "g6-standard-1" },
                         "usage": { "bots": 3, "runs": 12, "tokens": 4500, "period": "2026-11", "routineRuns": 4, "day": "2026-11-20" } },
-              "machine": { "plan": "g6-standard-2", "state": "running" }, "subscription": { "status": "active" }, "customer": "cus_123" },
+              "machine": { "plan": "g6-standard-2", "state": "running", "resize": { "state": "waiting", "toPlan": "g6-standard-1", "message": "Storage is 6 GB used of the Starter plan's 5 GB." } }, "subscription": { "status": "active" }, "customer": "cus_123" },
             { "user": { "name": "Owner" }, "over": [], "machine": null, "subscription": null,
               "plan": { "label": "Self-host", "limits": {}, "usage": { "bots": 1, "runs": 0, "period": "2026-11", "routineRuns": 0, "day": "2026-11-20" } } },
         ]});
         let out = usage_summary(&v);
         assert!(out.starts_with("Billing: Stripe webhook and checkout on.\n"), "{out}");
-        assert!(out.contains("ada@example.com: Starter plan; Bots 3/2; runs 12/300 and tokens 4500/unlimited in 2026-11; routine runs 4/24 on 2026-11-20; machine g6-standard-2 (running), plan size g6-standard-1; Stripe active; customer cus_123; OVER: bots, machineType\n"), "{out}");
+        assert!(out.contains("ada@example.com: Starter plan; Bots 3/2; runs 12/300 and tokens 4500/unlimited in 2026-11; routine runs 4/24 on 2026-11-20; machine g6-standard-2 (running), plan size g6-standard-1; resizing to g6-standard-1 (waiting: Storage is 6 GB used of the Starter plan's 5 GB.); Stripe active; customer cus_123; OVER: bots, machineType\n"), "{out}");
         assert!(usage_summary(&json!({ "billing": true, "users": [] })).starts_with("Billing: Stripe webhook on, checkout off.\n"));
         assert!(out.contains("Owner: Self-host plan; Bots 1/unlimited; runs 0/unlimited and tokens 0/unlimited in 2026-11; routine runs 0/unlimited on 2026-11-20\n"), "{out}");
     }

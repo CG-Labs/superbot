@@ -1396,6 +1396,9 @@ async fn probe(
     );
     if let Ok(hb) = &res {
         super::upkeep::observe(app, &to.machine_id, hb);
+        if let Some(d) = hb.disk {
+            app.db.machine_disk_seen(&to.machine_id, d.used, d.total);
+        }
     }
     res
 }

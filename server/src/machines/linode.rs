@@ -350,6 +350,17 @@ impl MachineProvider for Linode {
         })
     }
 
+    /// `GET /linode/types/{plan}`: its `disk`, in MiB. Reads only; costs nothing.
+    fn plan_disk<'a>(&'a self, plan: &'a str) -> Fut<'a, Option<u64>> {
+        Box::pin(async move {
+            if !super::slug(plan, 64) {
+                return Ok(None);
+            }
+            let v = self.call(Method::GET, &format!("/linode/types/{plan}"), None, None).await?;
+            Ok(v["disk"].as_u64().map(|mib| mib.saturating_mul(1 << 20)))
+        })
+    }
+
     fn shutdown<'a>(&'a self, id: &'a str) -> Fut<'a, ()> {
         Box::pin(async move {
             self.call(
@@ -667,6 +678,19 @@ mod tests {
                         7 => (StatusCode::OK, Json(json!({}))),
                         8 => (StatusCode::TOO_MANY_REQUESTS, Json(json!({ "errors": [{ "reason": "Too many requests" }] }))),
                         _ => (StatusCode::BAD_REQUEST, Json(json!({ "errors": [{ "reason": "Linode busy." }] }))),
+                    }
+                }),
+            )
+            .route(
+                "/v4/linode/types/{id}",
+                get(move |State(s): State<Seen>, h: HeaderMap, Path(id): Path<String>| async move {
+                    record(&s, "GET", format!("/linode/types/{id}"), &h, Value::Null);
+                    if !authed(&h) {
+                        return unauthorized();
+                    }
+                    match id.as_str() {
+                        "g6-standard-1" => (StatusCode::OK, Json(json!({ "id": id, "disk": 51200, "memory": 2048, "vcpus": 1 }))),
+                        _ => (StatusCode::NOT_FOUND, Json(json!({ "errors": [{ "reason": "Not found" }] }))),
                     }
                 }),
             )
@@ -1083,6 +1107,16 @@ mod tests {
             seen[3].3,
             json!({ "type": "g6-standard-2", "allow_auto_disk_resize": true, "migration_type": "cold" })
         );
+    }
+
+    #[tokio::test]
+    async fn a_plans_disk_is_read_from_its_type() {
+        let (api, seen) = fake_api().await;
+        assert_eq!(api.plan_disk("g6-standard-1").await.unwrap(), Some(50 << 30));
+        assert!(matches!(api.plan_disk("g6-nope").await, Err(ProviderError::NotFound)));
+        assert_eq!(api.plan_disk("../instances").await.unwrap(), None, "not a plan id: never sent");
+        let paths: Vec<String> = seen.lock().unwrap().iter().map(|s| s.1.clone()).collect();
+        assert_eq!(paths, ["/linode/types/g6-standard-1", "/linode/types/g6-nope"]);
     }
 
     #[tokio::test]
