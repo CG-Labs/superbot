@@ -71,6 +71,10 @@ pub struct World {
     /// The next this many instance PUTs and PATCHes find that another client changed
     /// the instance (`user.other-client`) since it was read.
     pub races: usize,
+    /// API extensions this Incus lacks, as an older release would.
+    pub missing_extensions: Vec<String>,
+    /// The `server_version` it reports, if not the stand-in's own.
+    pub version: Option<String>,
     ops: BTreeMap<String, Op>,
     trusted: Vec<String>,
     next_ip: u8,
@@ -250,6 +254,13 @@ fn reply(status: StatusCode, v: Value, etag: Option<String>) -> Response {
     r
 }
 
+fn extensions(missing: &[String]) -> Vec<&'static str> {
+    ["network_acl", "network_bridge_acl_devices", "instances_rebuild", "instance_create_start", "instance_get_full"]
+        .into_iter()
+        .filter(|x| !missing.iter().any(|m| m == x))
+        .collect()
+}
+
 fn sync(meta: Value) -> Response {
     reply(StatusCode::OK, json!({ "type": "sync", "status": "Success", "status_code": 200, "metadata": meta }), None)
 }
@@ -393,6 +404,23 @@ impl World {
         if c["security.nesting"] == "true" {
             return Some("Container nesting is forbidden".into());
         }
+        // Incus's low-level container options, refused unless
+        // restricted.containers.lowlevel=allow.
+        let lowlevel = [
+            "boot.host_shutdown_timeout",
+            "limits.memory.swap",
+            "linux.kernel_modules",
+            "raw.apparmor",
+            "raw.idmap",
+            "raw.lxc",
+            "raw.seccomp",
+            "security.guestapi.images",
+            "security.idmap.base",
+            "security.idmap.size",
+        ];
+        if let Some(k) = c.as_object().and_then(|c| c.keys().find(|k| lowlevel.contains(&k.as_str()))) {
+            return Some(format!("Use of low-level config \"{k}\" on container is forbidden"));
+        }
         let devices = body["devices"].as_object().cloned().unwrap_or_default();
         for d in devices.values() {
             if d["type"] == "disk" && d["path"] != "/" {
@@ -450,8 +478,8 @@ async fn handle(
     match (method.as_str(), &parts[..]) {
         ("GET", ["1.0"]) => sync(json!({
             "auth": "trusted",
-            "api_extensions": ["network_acl", "instances_rebuild", "instance_create_start", "instance_get_full"],
-            "environment": { "server_version": "6.0-standin" },
+            "api_extensions": extensions(&w.missing_extensions),
+            "environment": { "server_version": w.version.clone().unwrap_or("standin".into()) },
         })),
         ("GET", ["1.0", "projects", p]) => match w.projects.get(*p) {
             Some(c) => sync(json!({ "name": p, "config": c })),

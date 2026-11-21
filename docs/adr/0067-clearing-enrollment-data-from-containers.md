@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. A follow-up of [ADR 0065](0065-incus-container-machines.md) (Incus containers) on [#29](https://github.com/CG-Labs/superbot/issues/29) (M3). Built and tested against the Incus stand-in only.
+Accepted. A follow-up of [ADR 0065](0065-incus-container-machines.md) (Incus containers) on [#29](https://github.com/CG-Labs/superbot/issues/29) (M3). Built and tested against the Incus stand-in, then validated on a real Incus host in CI ([ADR 0069](0069-validating-incus-containers-on-a-real-host.md)).
 
 ## Context
 
