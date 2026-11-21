@@ -121,7 +121,7 @@ A restricted project blocks backups, so allow just those. botd's backups fail wi
 incus project set superbot restricted.backups=allow
 ```
 
-Optional: `MACHINE_BACKUP_S3_REGION` (`us-east-1`), `MACHINE_BACKUP_S3_PREFIX` (`superbot/`), `MACHINE_BACKUP_INTERVAL_HOURS` (24). Give the key only `PutObject`, `GetObject`, `DeleteObject`, `ListBucket` and the multipart actions on that bucket or prefix.
+Optional: `MACHINE_BACKUP_S3_REGION` (`us-east-1`), `MACHINE_BACKUP_S3_PREFIX` (`superbot/`), and the schedule and recovery objectives per tier: `MACHINE_BACKUP_INTERVAL_HOURS` (`24,pro=12,max=6`), `MACHINE_BACKUP_RPO_HOURS` (interval + 2) and `MACHINE_RESTORE_RTO_MINUTES` (60). botd alerts when a machine goes past its RPO or a restore past its RTO; see [machine recovery](machine-recovery.md) ([ADR 0073](../adr/0073-machine-rpo-and-rto.md)). Give the key only `PutObject`, `GetObject`, `DeleteObject`, `ListBucket` and the multipart actions on that bucket or prefix.
 
 Each running container whose agent has enrolled, and whose config holds no enrollment token, is exported without its snapshots, encrypted if recipients are set, and streamed to `<prefix>machines/<machine-id>/<backup-id>.incus[.age]` with a JSON manifest beside it. Backups older than their tier's retention are deleted, but never a live machine's newest.
 
