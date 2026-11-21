@@ -5702,11 +5702,12 @@ impl Db {
         s.query_map([], team_machine_row).unwrap().filter_map(Result::ok).collect()
     }
 
-    pub fn team_machine_release(&self, machine_id: &str, release_at: i64) -> bool {
+    /// Releases `machine_id` if `team_id` still holds it: another team may have taken it.
+    pub fn team_machine_release(&self, machine_id: &str, team_id: &str, release_at: i64) -> bool {
         self.c()
             .execute(
-                "UPDATE team_machines SET released_at = ?1, release_at = ?2 WHERE machine_id = ?3 AND released_at IS NULL",
-                params![now(), release_at, machine_id],
+                "UPDATE team_machines SET released_at = ?1, release_at = ?2 WHERE machine_id = ?3 AND team_id = ?4 AND released_at IS NULL",
+                params![now(), release_at, machine_id, team_id],
             )
             .unwrap()
             > 0

@@ -214,9 +214,18 @@ async fn provide(app: &AppState, by: &Who, team: &Team, user: &User) -> Value {
 
 /// Records a machine just made for `user_id` as `team_id`'s. Making it can take a
 /// while: if they left the team meanwhile, it's released as their leaving would have.
+/// A machine another team took back meanwhile is left alone.
 pub(crate) async fn claim(app: &AppState, by: &Who, team_id: &str, user_id: &str, machine_id: &str) {
-    app.db.team_machine_mark(machine_id, team_id, user_id);
-    if app.db.team_id_of(user_id).as_deref() != Some(team_id) {
+    let Some(cp) = control_plane(app) else { return };
+    let left = {
+        let _g = cp.lock_ops().await;
+        if app.db.team_machine(machine_id).is_some_and(|t| t.team_id != team_id) {
+            return;
+        }
+        app.db.team_machine_mark(machine_id, team_id, user_id);
+        app.db.team_id_of(user_id).as_deref() != Some(team_id)
+    };
+    if left {
         release(app, by, team_id, user_id).await;
     }
 }
@@ -318,7 +327,7 @@ async fn release(app: &AppState, by: &Who, team_id: &str, user_id: &str) {
     }
     let days = settings(app).machine_days;
     let due = now() + days as i64 * DAY_MS;
-    if !app.db.team_machine_release(&m.id, due) {
+    if !app.db.team_machine_release(&m.id, team_id, due) {
         return;
     }
     let suspended = match m.state {

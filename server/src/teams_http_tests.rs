@@ -582,3 +582,21 @@ async fn a_step_decided_before_a_machine_was_taken_back_is_refused() {
     assert_eq!(res.err().map(|e| e.0), Some(StatusCode::CONFLICT));
     assert_eq!(w.app.db.machine(&m.id).unwrap().state, crate::machines::State::Running);
 }
+
+#[tokio::test]
+async fn a_late_claim_leaves_a_machine_another_team_took_alone() {
+    let w = world().await;
+    reconcile(&w).await;
+    let m = w.app.db.user_machine(&w.al_id).unwrap();
+    // Al moves from Alpha to Beta, and Beta takes his machine back...
+    assert_eq!(call(w.port, "POST", "/api/team/leave", &w.al, "").await.0, 200);
+    let (code, v) = json_call(w.port, "PUT", &format!("/api/teams/{}/members/{}", w.beta, w.al_id), &w.admin, "{}").await;
+    assert_eq!((code, v["provisioned"].as_str()), (200, Some("kept")), "{v}");
+    // ...before Alpha's slow request for it finishes.
+    crate::teams::claim(&w.app, &crate::audit::Who::system("test"), &w.alpha, &w.al_id, &m.id).await;
+    let tm = w.app.db.team_machine(&m.id).unwrap();
+    assert_eq!((tm.team_id.as_str(), tm.released_at), (w.beta.as_str(), None));
+    // And Alpha can't release what Beta holds.
+    assert!(!w.app.db.team_machine_release(&m.id, &w.alpha, crate::db::now()));
+    assert!(matches!(w.app.db.machine(&m.id).unwrap().state, crate::machines::State::Running | crate::machines::State::Provisioning));
+}
