@@ -111,13 +111,8 @@ impl Billing {
         if on {
             return Billing::from_env(store, var).map(|b| (b, None));
         }
-        let set: Vec<&str> = STRIPE_VARS
-            .into_iter()
-            .filter(|k| match *k {
-                "STRIPE_METER_EVENT" => !var(k).trim().is_empty(),
-                _ => store.get(k).ok().flatten().is_some_and(|v| !v.expose().trim().is_empty()),
-            })
-            .collect();
+        // Only whether each is set: a secret (or its _FILE) is never read while billing is off.
+        let set: Vec<&str> = STRIPE_VARS.into_iter().filter(|k| [k.to_string(), format!("{k}_FILE")].iter().any(|n| !var(n).trim().is_empty())).collect();
         let warning = (!set.is_empty()).then(|| format!("{} set, but billing is off (BILLING isn't on), so they're ignored and nothing calls Stripe.", set.join(", ")));
         Ok((Billing::default(), warning))
     }
@@ -861,22 +856,45 @@ mod tests {
         assert_eq!(verify(SECRET, &format!("t={now},v1={}", &v1[..62]), body, now), Err("no_signature"));
     }
 
+    /// A store that fails the test if anything reads a secret from it.
+    struct NeverRead;
+    impl SecretStore for NeverRead {
+        fn kind(&self) -> &'static str {
+            "never-read"
+        }
+        fn get(&self, name: &str) -> Result<Option<crate::secrets::Secret>, crate::secrets::Error> {
+            panic!("billing is off, yet {name} was read");
+        }
+        fn names(&self) -> Result<Vec<String>, crate::secrets::Error> {
+            panic!("billing is off, yet the store was listed");
+        }
+    }
+
     #[test]
     fn billing_is_off_unless_turned_on_and_never_in_testing_mode() {
         use crate::secrets::env::EnvStore;
-        let vars = |billing: &'static str| move |k: &str| if k == "BILLING" { billing.to_string() } else { String::new() };
+        let vars = |billing: &'static str| {
+            move |k: &str| match k {
+                "BILLING" => billing.to_string(),
+                "STRIPE_WEBHOOK_SECRET" => SECRET.to_string(),
+                _ => String::new(),
+            }
+        };
         let stripe = EnvStore::fixed(&[("STRIPE_WEBHOOK_SECRET", SECRET)]);
         // Off by default, even with Stripe settings present: no Stripe client, and a warning.
-        let (b, warn) = Billing::configured(&EnvStore::fixed(&[]), &vars(""), false).unwrap();
+        let (b, warn) = Billing::configured(&NeverRead, &|_: &str| String::new(), false).unwrap();
         assert!(!b.enabled() && warn.is_none());
-        let (b, warn) = Billing::configured(&stripe, &vars(""), false).unwrap();
+        let (b, warn) = Billing::configured(&NeverRead, &vars(""), false).unwrap();
         assert!(!b.enabled() && !b.checkout_enabled() && b.meter().is_none());
         let warn = warn.unwrap();
         assert!(warn.contains("STRIPE_WEBHOOK_SECRET") && warn.contains("nothing calls Stripe") && !warn.contains(SECRET), "{warn}");
         assert_eq!(b.status()["enabled"], json!(false));
         assert_eq!(b.status()["detail"], json!(OFF_DETAIL));
+        // A secret given as a _FILE counts as set, and still isn't read.
+        let file = |k: &str| if k == "STRIPE_SECRET_KEY_FILE" { "/run/secrets/stripe".to_string() } else { String::new() };
+        assert!(Billing::configured(&NeverRead, &file, false).unwrap().1.unwrap().contains("STRIPE_SECRET_KEY"));
         // Testing mode keeps it off, and refuses BILLING=on outright.
-        let (b, _) = Billing::configured(&stripe, &vars("off"), true).unwrap();
+        let (b, _) = Billing::configured(&NeverRead, &vars("off"), true).unwrap();
         assert!(!b.enabled());
         assert!(Billing::configured(&stripe, &vars("on"), true).err().unwrap().contains("TESTING_MODE"));
         // Only BILLING=on, outside testing, reads the Stripe settings.
