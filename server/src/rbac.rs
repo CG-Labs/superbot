@@ -294,6 +294,8 @@ mod tests {
             ("GET", "/api/machines/substrate", Perm::Admin),
             ("GET", "/api/machines/hosts", Perm::Admin),
             ("POST", "/api/machines/hosts/main/recover", Perm::Admin),
+            ("PUT", "/api/machines/hosts/main/drain", Perm::Admin),
+            ("DELETE", "/api/machines/hosts/main/drain", Perm::Admin),
             ("GET", "/api/users/u1/placement", Perm::Admin),
             ("PUT", "/api/users/u1/placement", Perm::Admin),
             ("DELETE", "/api/users/u1/placement", Perm::Admin),

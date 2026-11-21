@@ -1200,7 +1200,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 30] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 31] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1231,6 +1231,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 30] = [
     migrate_machine_recovery,
     migrate_machine_hosts,
     migrate_push_devices,
+    migrate_machine_host_drain,
 ];
 
 /// Phones that get push notifications (ADR 0080): one per session at most, and a token
@@ -1253,6 +1254,20 @@ fn migrate_push_devices(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS push_devices_user ON push_devices(user_id, updated_at);",
     )
+}
+
+/// A host an admin drained (ADR 0081): nothing new is placed there, and machines on
+/// it stay until moved.
+fn migrate_machine_host_drain(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machine_hosts') WHERE name = 'drained_at'", [], |r| r.get(0))?;
+    if !has {
+        c.execute_batch(
+            "ALTER TABLE machine_hosts ADD COLUMN drained_at INTEGER;
+            ALTER TABLE machine_hosts ADD COLUMN drained_by TEXT;
+            ALTER TABLE machine_hosts ADD COLUMN drain_reason TEXT;",
+        )?;
+    }
+    Ok(())
 }
 
 /// The hosts machines are on (ADR 0076): the certificate each was first seen with, so
@@ -1301,6 +1316,9 @@ pub struct MachineHost {
     pub down_at: Option<i64>,
     pub lost_at: Option<i64>,
     pub lost_by: Option<String>,
+    pub drained_at: Option<i64>,
+    pub drained_by: Option<String>,
+    pub drain_reason: Option<String>,
     pub created_at: i64,
 }
 
@@ -1316,6 +1334,9 @@ fn machine_host_row(r: &Row) -> rusqlite::Result<MachineHost> {
         down_at: r.get("down_at")?,
         lost_at: r.get("lost_at")?,
         lost_by: r.get("lost_by")?,
+        drained_at: r.get("drained_at")?,
+        drained_by: r.get("drained_by")?,
+        drain_reason: r.get("drain_reason")?,
         created_at: r.get("created_at")?,
     })
 }
@@ -5093,6 +5114,25 @@ impl Db {
     pub fn machine_host_lost(&self, name: &str, by: Option<&str>) -> bool {
         self.c()
             .execute("UPDATE machine_hosts SET state = 'lost', lost_at = ?, lost_by = ? WHERE name = ? AND state != 'lost'", params![now(), by, name])
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Drained, once (ADR 0081). Returns whether this call did it.
+    pub fn machine_host_drain(&self, name: &str, by: Option<&str>, reason: Option<&str>) -> bool {
+        self.c()
+            .execute(
+                "UPDATE machine_hosts SET drained_at = ?, drained_by = ?, drain_reason = ? WHERE name = ? AND drained_at IS NULL",
+                params![now(), by, reason, name],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Open to new machines again. Returns whether it was drained.
+    pub fn machine_host_undrain(&self, name: &str) -> bool {
+        self.c()
+            .execute("UPDATE machine_hosts SET drained_at = NULL, drained_by = NULL, drain_reason = NULL WHERE name = ? AND drained_at IS NOT NULL", [name])
             .unwrap_or(0)
             == 1
     }

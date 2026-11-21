@@ -1116,7 +1116,7 @@ pub async fn restore_request(
     if let Some(why) = cannot_restore(&app, &m) {
         return Err(conflict(why));
     }
-    let mv = super::hosts::restore_move(cp, &m, req.host.as_deref().map(str::trim).filter(|h| !h.is_empty()))?;
+    let mv = super::hosts::restore_move(&app, cp, &m, req.host.as_deref().map(str::trim).filter(|h| !h.is_empty()))?;
     let ids = match (b.encrypted, req.identity.as_deref().filter(|i| !i.trim().is_empty())) {
         (true, None) => return Err(bad("That backup is encrypted: send its age identity as \"identity\" (botctl machine restore ... --identity <file>).")),
         (true, Some(raw)) => identities(raw).map_err(bad)?,

@@ -209,6 +209,10 @@ pub trait MachineProvider: Send + Sync {
     fn plan_view(&self, _plan: &str) -> Option<serde_json::Value> {
         None
     }
+    /// What `plan` takes from its host, where machines share hosts (ADR 0081).
+    fn plan_resources(&self, _plan: &str) -> Option<Resources> {
+        None
+    }
     /// The provider's own settings for admins. Never a credential.
     fn settings(&self) -> serde_json::Value {
         serde_json::json!({})
@@ -329,6 +333,43 @@ impl HostStatus {
     }
 }
 
+/// CPUs, memory and disk: what a plan gives a machine, or what a host has to give
+/// (ADR 0081).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Resources {
+    pub cpus: u64,
+    #[serde(rename = "memoryGiB")]
+    pub memory_gib: u64,
+    #[serde(rename = "diskGiB")]
+    pub disk_gib: u64,
+}
+
+impl Resources {
+    pub fn plus(self, o: Resources) -> Resources {
+        Resources { cpus: self.cpus + o.cpus, memory_gib: self.memory_gib + o.memory_gib, disk_gib: self.disk_gib + o.disk_gib }
+    }
+}
+
+/// How new machines are spread over hosts that have room (ADR 0081). `Spread`: the
+/// least loaded host. `Fill`: the first host in the order configured.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Policy {
+    #[default]
+    Spread,
+    Fill,
+}
+
+impl Policy {
+    pub fn parse(s: &str) -> Option<Policy> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "spread" => Some(Policy::Spread),
+            "fill" => Some(Policy::Fill),
+            _ => None,
+        }
+    }
+}
+
 /// A configured host. Never a credential.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HostInfo {
@@ -337,6 +378,10 @@ pub struct HostInfo {
     /// The SHA-256 of the certificate botd pins for it.
     pub fingerprint: String,
     pub status: HostStatus,
+    /// What its machines may be given in all, if set (INCUS_CAPACITY).
+    pub capacity: Option<Resources>,
+    /// How many machines it may have, if set (INCUS_MAX_MACHINES).
+    pub max_machines: Option<u64>,
 }
 
 /// Several hosts behind one provider: machine ids say which one each is on.
@@ -351,8 +396,15 @@ pub trait Hosts: Send + Sync {
     /// host taken out of the settings is still lost.
     fn set_status(&self, host: &str, status: HostStatus);
     fn status(&self, host: &str) -> Option<HostStatus>;
-    /// Where a new machine goes: the first configured host that is up.
+    /// The first configured host that is up. Placement by load (`placement::choose`)
+    /// picks the host the control plane makes a machine on; this is the fallback.
     fn placement(&self) -> Option<String>;
+    /// How new machines are spread over hosts with room (INCUS_PLACEMENT).
+    fn policy(&self) -> Policy {
+        Policy::Spread
+    }
+    /// Creates and boots a machine on `host`, which must be up.
+    fn create_on<'a>(&'a self, host: &'a str, spec: &'a CreateSpec) -> Fut<'a, ProviderMachine>;
     /// How long a host may fail to answer before it is down.
     fn down_after_ms(&self) -> i64;
     /// Asks `host` whether it answers and trusts botd: what it said.
