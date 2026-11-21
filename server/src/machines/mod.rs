@@ -30,6 +30,7 @@ pub mod offboard;
 pub mod pki;
 pub mod provider;
 pub mod rebuild;
+pub mod recovery;
 pub mod route;
 pub mod runas;
 pub mod s3;
@@ -277,7 +278,8 @@ impl ControlPlane {
         var: impl Fn(&str) -> String,
     ) -> Result<ControlPlane, String> {
         let mut cp = ControlPlane::provider_from_env(store, &var)?;
-        if let Some(s) = backup::Settings::from_env(store, &var)? {
+        let tiers: Vec<String> = cp.tiers.iter().map(|(t, _)| t.clone()).collect();
+        if let Some(s) = backup::Settings::from_env(store, &var, &tiers)? {
             let p = cp.provider.as_deref().ok_or(format!("MACHINE_BACKUP_S3_BUCKET needs the control plane: {NEEDS_IT}"))?;
             if !p.exports() {
                 return Err(format!(
@@ -1033,6 +1035,11 @@ fn admin_view(app: &App, m: &Machine) -> Value {
     let mut v = serde_json::to_value(m).unwrap_or_default();
     v["userEmail"] = json!(app.db.user(&m.user_id).and_then(|u| u.email));
     v["lastBackup"] = backup::last(app, &m.id);
+    if let Some(cp) = app.control_plane.get()
+        && let Some(off) = cp.offsite.as_deref()
+    {
+        v["recovery"] = recovery::view(app, cp, off, m);
+    }
     v
 }
 

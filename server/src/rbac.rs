@@ -309,6 +309,7 @@ mod tests {
             ("GET", "/api/users/u1/machine/restore", Perm::Admin),
             ("POST", "/api/users/u1/machine/restore", Perm::Admin),
             ("GET", "/api/machines/backups", Perm::Admin),
+            ("GET", "/api/machines/recovery", Perm::Admin),
             ("GET", "/api/machines/legacy", Perm::Admin),
             ("POST", "/api/users/u1/machine/bot-user", Perm::Admin),
             ("POST", "/api/users/u1/machine/harness-login", Perm::Admin),

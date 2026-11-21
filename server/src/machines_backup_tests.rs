@@ -45,13 +45,7 @@ async fn serve(recipients: Vec<age::x25519::Recipient>) -> Env {
     cp.routing = crate::machines::route::Routing::On;
     let e = cp.enroll_with(Enrollment::for_tests(9, mport, aport).with_agent(AGENT.as_bytes())).unwrap();
     cp.firewall_with(firewall::Settings { sources: Vec::new(), ssh: Vec::new() }).unwrap();
-    let s = Settings {
-        s3: s3.settings(),
-        prefix: "t/".into(),
-        recipients,
-        interval_ms: DAY_MS,
-        retention: Retention::parse("7,pro=30").unwrap(),
-    };
+    let s = Settings { retention: Retention::retention("7,pro=30").unwrap(), ..Settings::with(s3.settings(), "t/", recipients) };
     cp.offsite = Some(Arc::new(Offsite::new(s).unwrap()));
     let cp = Arc::new(cp);
     let c = cp.clone();

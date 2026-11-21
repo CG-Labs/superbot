@@ -43,9 +43,19 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const DEFAULT_INTERVAL_HOURS: i64 = 24;
+/// The schedule when MACHINE_BACKUP_INTERVAL_HOURS is unset (ADR 0073): the default
+/// tiers' targets. Any other tier gets the bare value.
+pub const DEFAULT_INTERVALS: &str = "24,pro=12,max=6";
 pub const DEFAULT_RETENTION_DAYS: i64 = 14;
+/// A tier's RPO when MACHINE_BACKUP_RPO_HOURS doesn't name one: its interval plus this,
+/// which covers one failed attempt and its retry an hour later, and the export itself.
+pub const RPO_HEADROOM_HOURS: i64 = 2;
+/// The least a set RPO may exceed its tier's interval by: the retry alone.
+pub const RPO_MIN_HEADROOM_HOURS: i64 = 1;
+pub const DEFAULT_RTO_MINUTES: i64 = 60;
+const HOUR_MS: i64 = 3_600_000;
 /// A failed backup is tried again after this long, or the interval if sooner.
-const RETRY_MS: i64 = 3_600_000;
+const RETRY_MS: i64 = HOUR_MS;
 /// How much longer than the enrollment timeout a restored machine has to enroll.
 const BOOT_SLACK_MS: i64 = 10 * 60_000;
 /// The agent's certificate and key on its disk, which a restore must not bring back.
@@ -54,51 +64,70 @@ pub const IDENTITY_PATH: &str = "/var/lib/superbot-machine/identity.pem";
 const FORMAT: &str = "superbot-machine-backup/1";
 const DAY_MS: i64 = 86_400_000;
 
-/// MACHINE_BACKUP_RETENTION: days, for every tier (`14`) or per tier
-/// (`7,pro=30,max=90`: 7 for the rest).
-#[derive(Clone, Debug, PartialEq)]
-pub struct Retention {
-    pub default: i64,
+/// A number for every tier (`14`) or per tier (`7,pro=30,max=90`: 7 for the rest), as
+/// MACHINE_BACKUP_RETENTION, MACHINE_BACKUP_INTERVAL_HOURS, MACHINE_BACKUP_RPO_HOURS and
+/// MACHINE_RESTORE_RTO_MINUTES take it. `default` None: the setting's own fallback.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PerTier {
+    pub default: Option<i64>,
     pub tiers: Vec<(String, i64)>,
 }
 
-impl Retention {
-    pub fn parse(raw: &str) -> Result<Retention, String> {
-        let days = |s: &str| {
-            s.trim()
-                .parse::<i64>()
-                .ok()
-                .filter(|d| (1..=3650).contains(d))
-                .ok_or(format!("MACHINE_BACKUP_RETENTION: \"{}\" isn't 1 to 3650 days", crate::audit::clip(s.trim(), 20)))
+impl PerTier {
+    pub fn parse(var: &str, raw: &str, range: std::ops::RangeInclusive<i64>, unit: &str) -> Result<PerTier, String> {
+        let value = |s: &str| {
+            s.trim().parse::<i64>().ok().filter(|d| range.contains(d)).ok_or(format!(
+                "{var}: \"{}\" isn't {} to {} {unit}",
+                crate::audit::clip(s.trim(), 20),
+                range.start(),
+                range.end()
+            ))
         };
-        let mut r = Retention { default: DEFAULT_RETENTION_DAYS, tiers: Vec::new() };
-        let mut bare = false;
+        let mut r = PerTier::default();
         for part in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             match part.split_once('=') {
-                None if bare => return Err("MACHINE_BACKUP_RETENTION has two defaults".into()),
-                None => {
-                    r.default = days(part)?;
-                    bare = true;
-                }
+                None if r.default.is_some() => return Err(format!("{var} has two defaults")),
+                None => r.default = Some(value(part)?),
                 Some((tier, d)) => {
                     let tier = tier.trim();
                     if !super::slug(tier, 32) || r.tiers.iter().any(|(t, _)| t == tier) {
-                        return Err(format!("MACHINE_BACKUP_RETENTION: \"{}\" isn't a tier, or is listed twice", crate::audit::clip(tier, 32)));
+                        return Err(format!("{var}: \"{}\" isn't a tier, or is listed twice", crate::audit::clip(tier, 32)));
                     }
-                    r.tiers.push((tier.into(), days(d)?));
+                    r.tiers.push((tier.into(), value(d)?));
                 }
             }
         }
         Ok(r)
     }
 
+    pub fn get(&self, tier: &str) -> Option<i64> {
+        self.tiers.iter().find(|(t, _)| t == tier).map(|(_, d)| *d).or(self.default)
+    }
+
+    pub fn or(&self, tier: &str, fallback: i64) -> i64 {
+        self.get(tier).unwrap_or(fallback)
+    }
+
+    fn names(&self) -> impl Iterator<Item = &str> {
+        self.tiers.iter().map(|(t, _)| t.as_str())
+    }
+}
+
+/// Retention in days (MACHINE_BACKUP_RETENTION), 14 for tiers it doesn't name.
+pub type Retention = PerTier;
+
+impl Retention {
+    pub fn retention(raw: &str) -> Result<Retention, String> {
+        PerTier::parse("MACHINE_BACKUP_RETENTION", raw, 1..=3650, "days")
+    }
+
     pub fn days(&self, tier: &str) -> i64 {
-        self.tiers.iter().find(|(t, _)| t == tier).map_or(self.default, |(_, d)| *d)
+        self.or(tier, DEFAULT_RETENTION_DAYS)
     }
 
     fn view(&self) -> Value {
         let tiers: serde_json::Map<String, Value> = self.tiers.iter().map(|(t, d)| (t.clone(), json!(d))).collect();
-        json!({ "defaultDays": self.default, "tiers": tiers })
+        json!({ "defaultDays": self.default.unwrap_or(DEFAULT_RETENTION_DAYS), "tiers": tiers })
     }
 }
 
@@ -136,22 +165,85 @@ pub struct Settings {
     /// Starts every key, ending in `/` unless empty.
     pub prefix: String,
     pub recipients: Vec<age::x25519::Recipient>,
-    pub interval_ms: i64,
+    /// Hours between a machine's backups (ADR 0073).
+    pub interval: PerTier,
+    /// Hours a machine may go without a newer backup before it breaches its RPO. Tiers
+    /// not named: their interval plus RPO_HEADROOM_HOURS.
+    pub rpo: PerTier,
+    /// Minutes a restore may take, from the request to the machine enrolling again.
+    pub rto: PerTier,
     pub retention: Retention,
 }
 
 impl Settings {
+    /// For tests: the default schedule, targets and retention.
+    #[cfg(test)]
+    pub fn with(s3: s3::Settings, prefix: &str, recipients: Vec<age::x25519::Recipient>) -> Settings {
+        Settings {
+            s3,
+            prefix: prefix.into(),
+            recipients,
+            interval: PerTier::parse("", DEFAULT_INTERVALS, 1..=720, "hours").unwrap(),
+            rpo: PerTier::default(),
+            rto: PerTier::default(),
+            retention: Retention::default(),
+        }
+    }
+
+    pub fn interval_ms(&self, tier: &str) -> i64 {
+        self.interval.or(tier, DEFAULT_INTERVAL_HOURS) * HOUR_MS
+    }
+
+    pub fn rpo_ms(&self, tier: &str) -> i64 {
+        self.rpo.get(tier).map_or(self.interval_ms(tier) + RPO_HEADROOM_HOURS * HOUR_MS, |h| h * HOUR_MS)
+    }
+
+    pub fn rto_ms(&self, tier: &str) -> i64 {
+        self.rto.or(tier, DEFAULT_RTO_MINUTES) * 60_000
+    }
+
+    /// Every tier the settings name, with "" standing for the rest.
+    fn named(&self) -> Vec<String> {
+        let mut out = vec![String::new()];
+        for t in self.interval.names().chain(self.rpo.names()).chain(self.rto.names()).chain(self.retention.names()) {
+            if !out.iter().any(|o| o == t) {
+                out.push(t.into());
+            }
+        }
+        out
+    }
+
+    /// Each tier's targets, for `tiers` and then the rest.
+    pub fn objectives(&self, tiers: &[String]) -> Value {
+        let row = |t: &str| {
+            json!({
+                "tier": if t.is_empty() { Value::Null } else { json!(t) },
+                "intervalHours": self.interval_ms(t) / HOUR_MS,
+                "rpoHours": self.rpo_ms(t) / HOUR_MS,
+                "rtoMinutes": self.rto_ms(t) / 60_000,
+                "retentionDays": self.retention.days(t),
+            })
+        };
+        let mut out: Vec<Value> = tiers.iter().map(|t| row(t)).collect();
+        out.push(row(""));
+        json!(out)
+    }
+
     /// MACHINE_BACKUP_S3_BUCKET turns it on and needs MACHINE_BACKUP_S3_ENDPOINT and the
     /// keys (`s3::Settings::from_env`); MACHINE_BACKUP_S3_PREFIX (`superbot/`),
-    /// MACHINE_BACKUP_AGE_RECIPIENTS (or `_FILE`), MACHINE_BACKUP_INTERVAL_HOURS (24)
-    /// and MACHINE_BACKUP_RETENTION (14 days) are optional. None: off.
-    pub fn from_env(store: &dyn SecretStore, var: &dyn Fn(&str) -> String) -> Result<Option<Settings>, String> {
+    /// MACHINE_BACKUP_AGE_RECIPIENTS (or `_FILE`), MACHINE_BACKUP_INTERVAL_HOURS
+    /// (DEFAULT_INTERVALS), MACHINE_BACKUP_RPO_HOURS (interval + 2), MACHINE_RESTORE_RTO_MINUTES
+    /// (60) and MACHINE_BACKUP_RETENTION (14 days) are optional. None: off. `tiers`: the
+    /// control plane's, which every tier these name must be one of (empty: unchecked).
+    pub fn from_env(store: &dyn SecretStore, var: &dyn Fn(&str) -> String, tiers: &[String]) -> Result<Option<Settings>, String> {
         if var("MACHINE_BACKUP_S3_BUCKET").trim().is_empty() {
             let stray = [
                 "MACHINE_BACKUP_S3_ENDPOINT",
                 "MACHINE_BACKUP_AGE_RECIPIENTS",
                 "MACHINE_BACKUP_AGE_RECIPIENTS_FILE",
                 "MACHINE_BACKUP_INTERVAL_HOURS",
+                "MACHINE_BACKUP_RPO_HOURS",
+                "MACHINE_RESTORE_RTO_MINUTES",
                 "MACHINE_BACKUP_RETENTION",
             ];
             if let Some(k) = stray.iter().find(|k| !var(k).trim().is_empty()) {
@@ -178,18 +270,34 @@ impl Settings {
             }
             raw = std::fs::read_to_string(file.trim()).map_err(|e| format!("MACHINE_BACKUP_AGE_RECIPIENTS_FILE: {e}"))?;
         }
-        let hours = Some(var("MACHINE_BACKUP_INTERVAL_HOURS"))
-            .filter(|h| !h.trim().is_empty())
-            .map_or(Ok(DEFAULT_INTERVAL_HOURS), |h| {
-                h.trim().parse::<i64>().ok().filter(|h| (1..=720).contains(h)).ok_or("MACHINE_BACKUP_INTERVAL_HOURS must be 1 to 720")
-            })?;
-        Ok(Some(Settings {
-            s3,
-            prefix,
-            recipients: recipients(&raw)?,
-            interval_ms: hours * 3_600_000,
-            retention: Retention::parse(&var("MACHINE_BACKUP_RETENTION"))?,
-        }))
+        let interval_raw = var("MACHINE_BACKUP_INTERVAL_HOURS");
+        let mut interval = PerTier::parse("MACHINE_BACKUP_INTERVAL_HOURS", &interval_raw, 1..=720, "hours")?;
+        let mut named = Vec::new();
+        if interval_raw.trim().is_empty() {
+            interval = PerTier::parse("MACHINE_BACKUP_INTERVAL_HOURS", DEFAULT_INTERVALS, 1..=720, "hours")?;
+        } else {
+            named.extend(interval.names().map(|t| ("MACHINE_BACKUP_INTERVAL_HOURS", t.to_string())));
+        }
+        let rpo = PerTier::parse("MACHINE_BACKUP_RPO_HOURS", &var("MACHINE_BACKUP_RPO_HOURS"), 2..=744, "hours")?;
+        let rto = PerTier::parse("MACHINE_RESTORE_RTO_MINUTES", &var("MACHINE_RESTORE_RTO_MINUTES"), 5..=1440, "minutes")?;
+        let retention = Retention::retention(&var("MACHINE_BACKUP_RETENTION"))?;
+        named.extend(rpo.names().map(|t| ("MACHINE_BACKUP_RPO_HOURS", t.to_string())));
+        named.extend(rto.names().map(|t| ("MACHINE_RESTORE_RTO_MINUTES", t.to_string())));
+        named.extend(retention.names().map(|t| ("MACHINE_BACKUP_RETENTION", t.to_string())));
+        if let Some((v, t)) = named.iter().find(|(_, t)| !tiers.is_empty() && !tiers.contains(t)) {
+            return Err(format!("{v}: \"{t}\" isn't one of the machine tiers ({})", tiers.join(", ")));
+        }
+        let s = Settings { s3, prefix, recipients: recipients(&raw)?, interval, rpo, rto, retention };
+        for t in s.named() {
+            let (every, rpo) = (s.interval_ms(&t) / HOUR_MS, s.rpo_ms(&t) / HOUR_MS);
+            if rpo < every + RPO_MIN_HEADROOM_HOURS {
+                let which = if t.is_empty() { "the default tier".to_string() } else { format!("tier {t}") };
+                return Err(format!(
+                    "MACHINE_BACKUP_RPO_HOURS: {which}'s RPO ({rpo}h) must be at least its backup interval ({every}h) plus {RPO_MIN_HEADROOM_HOURS}h, so one failed backup can be retried in time"
+                ));
+            }
+        }
+        Ok(Some(s))
     }
 }
 
@@ -205,19 +313,23 @@ impl Offsite {
     }
 
     pub fn describe(&self) -> String {
+        let per_tier = |p: &PerTier| if p.tiers.is_empty() { "" } else { " (some tiers differ)" };
         format!(
-            "to {}/{} every {}h, kept {} days{}, {}",
+            "to {}/{} every {}h{}, RPO {}h, RTO {}m, kept {} days{}, {}",
             self.s.s3.endpoint,
             self.s.s3.bucket,
-            self.s.interval_ms / 3_600_000,
-            self.s.retention.default,
-            if self.s.retention.tiers.is_empty() { "" } else { " (some tiers differ)" },
+            self.s.interval_ms("") / HOUR_MS,
+            per_tier(&self.s.interval),
+            self.s.rpo_ms("") / HOUR_MS,
+            self.s.rto_ms("") / 60_000,
+            self.s.retention.days(""),
+            per_tier(&self.s.retention),
             if self.s.recipients.is_empty() { "not encrypted".to_string() } else { format!("encrypted to {} age recipients", self.s.recipients.len()) }
         )
     }
 
-    /// For admins. No credentials.
-    pub fn view(&self) -> Value {
+    /// For admins. No credentials. `tiers`: the control plane's, for the objectives.
+    pub fn view(&self, tiers: &[String]) -> Value {
         json!({
             "endpoint": self.s.s3.endpoint,
             "bucket": self.s.s3.bucket,
@@ -225,8 +337,9 @@ impl Offsite {
             "prefix": self.s.prefix,
             "encrypted": !self.s.recipients.is_empty(),
             "recipients": self.s.recipients.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
-            "intervalHours": self.s.interval_ms / 3_600_000,
+            "intervalHours": self.s.interval_ms("") / HOUR_MS,
             "retention": self.s.retention.view(),
+            "objectives": self.s.objectives(tiers),
         })
     }
 
@@ -429,6 +542,11 @@ fn unable(app: &App, cp: &ControlPlane, m: &Machine) -> Option<String> {
     None
 }
 
+/// Why `m` can't be backed up now, for alerts.
+pub(super) fn unable_now(app: &App, cp: &ControlPlane, m: &Machine) -> Option<String> {
+    unable(app, cp, m)
+}
+
 /// Starts a backup of `m`: checked and recorded under the lock, so it can't race a
 /// restore or another backup. `who`: the admin, or None for the schedule.
 async fn begin(app: &App, cp: &ControlPlane, off: &Offsite, m: &Machine, who: Option<&str>) -> Result<MachineBackup, String> {
@@ -492,14 +610,14 @@ async fn run(app: &App, cp: &ControlPlane, off: &Offsite, m: &Machine, b: &Machi
     }
 }
 
-/// Whether `m` is due a scheduled backup.
+/// Whether `m` is due a scheduled backup, on its tier's interval.
 fn due(app: &App, off: &Offsite, m: &Machine) -> bool {
-    let at = now();
+    let (at, every) = (now(), off.s.interval_ms(&m.tier));
     match app.db.machine_backups(&m.id).into_iter().find(|b| b.state != "deleted") {
         None => true,
         Some(b) if b.state == "running" => false,
-        Some(b) if b.state == "failed" => at - b.created_at >= RETRY_MS.min(off.s.interval_ms),
-        Some(b) => at - b.created_at >= off.s.interval_ms,
+        Some(b) if b.state == "failed" => at - b.created_at >= RETRY_MS.min(every),
+        Some(b) => at - b.created_at >= every,
     }
 }
 
@@ -539,15 +657,17 @@ pub async fn pass(app: &AppState, cp: &ControlPlane) -> usize {
     let Some(off) = cp.offsite.as_deref() else { return 0 };
     prune(app, off).await;
     follow_up(app, cp).await;
-    let ids: Vec<String> = app
+    // Nearest its RPO first, so a long round spends its time where it's most needed.
+    let mut queue: Vec<(i64, String)> = app
         .db
         .machines(Some(State::Running))
         .into_iter()
         .filter(|m| unable(app, cp, m).is_none() && due(app, off, m))
-        .map(|m| m.id)
+        .map(|m| (super::recovery::covered_since(app, &m) + off.s.rpo_ms(&m.tier), m.id))
         .collect();
+    queue.sort();
     let mut made = 0;
-    for id in ids {
+    for (_, id) in queue {
         let started = {
             let _g = cp.ops.lock().await;
             match app.db.machine(&id).filter(|m| unable(app, cp, m).is_none() && due(app, off, m)) {
@@ -566,7 +686,7 @@ pub async fn pass(app: &AppState, cp: &ControlPlane) -> usize {
 /// What a botd that stopped mid-way left: backups running end as failed (the provider's
 /// copy expires by itself), and restores not yet started end as failed too. Returns
 /// those restores, whose imported copies `clean_up` deletes.
-fn interrupted(app: &App) -> Vec<MachineRestore> {
+fn interrupted(app: &AppState) -> Vec<MachineRestore> {
     let mut left = Vec::new();
     for b in app.db.machine_backups_in("running") {
         if app.db.machine_backup_end(&b.id, None, Some("botd stopped while it was running"))
@@ -635,29 +755,34 @@ pub fn start(app: AppState, cp: Arc<ControlPlane>) {
         }
     });
     // Apart from backups, which can take hours, so a restored machine is seen to be back.
+    // RPOs are checked here too, so a long backup round can't hide a breach.
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(cp.reconcile_every);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
             follow_up(&app, &cp).await;
+            super::recovery::watch(&app, &cp);
         }
     });
 }
 
 // Restores
 
-fn fail_restore(app: &App, by: &Who, m: &Machine, r: &MachineRestore, from: &[&str], error: &str) {
+fn fail_restore(app: &AppState, by: &Who, m: &Machine, r: &MachineRestore, from: &[&str], error: &str) {
     if app.db.machine_restore_move(&r.id, from, "failed", Some(error)) {
         app.db.revoke_machine_tokens(&m.id);
         let d = json!({ "restoreId": r.id, "backupId": r.backup_id, "error": error, "by": r.created_by });
         app.db.record(&event(by, "machine.restore_failed", m, d).outcome(Outcome::Failure));
+        super::recovery::restore_failed(app, m, r, error);
     }
 }
 
-/// Restores whose machine enrolled again are done; ones that didn't in time failed.
+/// Restores whose machine enrolled again are done, timed against their RTO; ones that
+/// didn't in time failed. Restores still underway past their RTO are reported.
 pub async fn follow_up(app: &AppState, cp: &ControlPlane) {
     let Some(e) = cp.enrollment.as_deref() else { return };
+    super::recovery::overdue(app);
     for r in app.db.machine_restores_in("enrolling") {
         // A restore boots its machine under the lock, so what's read before it is stale.
         let _g = cp.ops.lock().await;
@@ -667,7 +792,11 @@ pub async fn follow_up(app: &AppState, cp: &ControlPlane) {
         if m.enrollment == "enrolled" && m.enrolled_at.is_some_and(|t| t >= since) {
             if app.db.machine_restore_move(&r.id, &["enrolling"], "done", None) {
                 let by = system(&m);
-                app.db.record(&event(&by, "machine.restored", &m, json!({ "restoreId": r.id, "backupId": r.backup_id, "by": r.created_by })));
+                let mut d = super::recovery::restored(app, &m, &r);
+                d["restoreId"] = json!(r.id);
+                d["backupId"] = json!(r.backup_id);
+                d["by"] = json!(r.created_by);
+                app.db.record(&event(&by, "machine.restored", &m, d));
                 if m.assigned_at.is_some() {
                     super::folder::assigned(app, cp, &m, &by);
                 }
@@ -786,7 +915,7 @@ async fn restore(app: AppState, cp: Arc<ControlPlane>, r: MachineRestore, b: Mac
 // HTTP, under `/api/users/{key}/machine/backups|restore` and `/api/machines/backups`
 // (admin only, rbac::classify).
 
-fn need(a: &Auth) -> Res<(&ControlPlane, &Offsite)> {
+pub(super) fn need(a: &Auth) -> Res<(&ControlPlane, &Offsite)> {
     let cp = &*a.machines;
     cp.need()?;
     let off = cp.offsite.as_deref().ok_or_else(|| {
@@ -815,7 +944,8 @@ pub async fn list_all(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Aut
     let (_, off) = need(&a)?;
     let mut all: Vec<MachineBackup> = ["running", "done", "failed"].iter().flat_map(|s| app.db.machine_backups_in(s)).collect();
     all.sort_by(|x, y| (y.created_at, &y.id).cmp(&(x.created_at, &x.id)));
-    Ok(Json(json!({ "settings": off.view(), "backups": all })))
+    let tiers: Vec<String> = a.machines.tiers.iter().map(|(t, _)| t.clone()).collect();
+    Ok(Json(json!({ "settings": off.view(&tiers), "backups": all })))
 }
 
 /// `GET /api/users/{key}/machine/backups`: the machine's backups and latest restore.
@@ -877,7 +1007,7 @@ pub async fn restore_request(
     Path(key): Path<String>,
     Json(req): Json<RestoreBody>,
 ) -> Res<(StatusCode, Json<Value>)> {
-    let (cp, _) = need(&a)?;
+    let (cp, off) = need(&a)?;
     if cp.enrollment.is_none() {
         return Err(conflict("A restored machine enrolls again, so it needs enrollment on (MACHINE_CONTROL_URL).".into()));
     }
@@ -913,9 +1043,9 @@ pub async fn restore_request(
     let id = format!("r{}", crate::random_hex(8));
     let r = app
         .db
-        .machine_restore_start(&id, &m.id, &b.id, by.actor.id.as_deref())
+        .machine_restore_start(&id, &m, &b.id, by.actor.id.as_deref(), Some(off.s.rto_ms(&m.tier)))
         .ok_or_else(|| conflict("A restore is underway already.".into()))?;
-    let d = json!({ "restoreId": r.id, "backupId": b.id, "backupCreatedAt": b.created_at, "encrypted": b.encrypted, "was": m.state });
+    let d = json!({ "restoreId": r.id, "backupId": b.id, "backupCreatedAt": b.created_at, "encrypted": b.encrypted, "was": m.state, "rtoMs": r.rto_ms });
     app.db.record(&event(&by, "machine.restore_requested", &m, d));
     tokio::spawn(restore(app.clone(), a.machines.clone(), r.clone(), b, ids, by));
     Ok((StatusCode::ACCEPTED, Json(json!({ "machineId": m.id, "restore": r }))))
@@ -940,13 +1070,16 @@ mod tests {
 
     #[test]
     fn retention_per_tier() {
-        assert_eq!(Retention::parse("").unwrap(), Retention { default: 14, tiers: vec![] });
-        let r = Retention::parse("7, pro=30 ,max=90").unwrap();
+        assert_eq!(Retention::retention("").unwrap(), Retention { default: None, tiers: vec![] });
+        assert_eq!(Retention::retention("").unwrap().days("pro"), DEFAULT_RETENTION_DAYS);
+        let r = Retention::retention("7, pro=30 ,max=90").unwrap();
         assert_eq!((r.days("starter"), r.days("pro"), r.days("max")), (7, 30, 90));
-        assert_eq!(Retention::parse("pro=30").unwrap().days("starter"), DEFAULT_RETENTION_DAYS);
+        assert_eq!(Retention::retention("pro=30").unwrap().days("starter"), DEFAULT_RETENTION_DAYS);
         for bad in ["0", "7,8", "pro=0", "pro=30,pro=40", "Pro=3", "x", "pro=", "4000"] {
-            assert!(Retention::parse(bad).is_err(), "{bad}");
+            assert!(Retention::retention(bad).is_err(), "{bad}");
         }
+        let e = PerTier::parse("MACHINE_RESTORE_RTO_MINUTES", "2", 5..=1440, "minutes").unwrap_err();
+        assert_eq!(e, "MACHINE_RESTORE_RTO_MINUTES: \"2\" isn't 5 to 1440 minutes");
     }
 
     #[test]
@@ -960,20 +1093,20 @@ mod tests {
         let keys = EnvStore::fixed(&[("MACHINE_BACKUP_S3_ACCESS_KEY_ID", "AKID"), ("MACHINE_BACKUP_S3_SECRET_ACCESS_KEY", "s3cret-0123")]);
         let with = |vars: &[(&str, &str)]| {
             let vars: Vec<(String, String)> = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-            Settings::from_env(&keys, &move |k| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default())
+            Settings::from_env(&keys, &move |k| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default(), &[])
         };
         assert!(with(&[]).unwrap().is_none());
         let stray = with(&[("MACHINE_BACKUP_RETENTION", "7")]).err().unwrap();
         assert!(stray.contains("MACHINE_BACKUP_S3_BUCKET"), "{stray}");
         let base = [("MACHINE_BACKUP_S3_BUCKET", "backups"), ("MACHINE_BACKUP_S3_ENDPOINT", "https://s3.example.com")];
         let s = with(&base).unwrap().unwrap();
-        assert_eq!((s.prefix.as_str(), s.interval_ms, s.recipients.len()), ("superbot/", 24 * 3_600_000, 0));
+        assert_eq!((s.prefix.as_str(), s.interval_ms("starter"), s.recipients.len()), ("superbot/", 24 * HOUR_MS, 0));
         let id = age::x25519::Identity::generate();
         let public = id.to_public().to_string();
         let s = with(&[base[0], base[1], ("MACHINE_BACKUP_S3_PREFIX", "/acme/m"), ("MACHINE_BACKUP_AGE_RECIPIENTS", &format!("# ops\n{public}")), ("MACHINE_BACKUP_INTERVAL_HOURS", "6")])
             .unwrap()
             .unwrap();
-        assert_eq!((s.prefix.as_str(), s.interval_ms, s.recipients.len()), ("acme/m/", 6 * 3_600_000, 1));
+        assert_eq!((s.prefix.as_str(), s.interval_ms("pro"), s.recipients.len()), ("acme/m/", 6 * HOUR_MS, 1));
         for bad in [
             &[base[0]][..],
             &[base[0], base[1], ("MACHINE_BACKUP_AGE_RECIPIENTS", "age1nope")],
@@ -987,8 +1120,45 @@ mod tests {
             "MACHINE_BACKUP_S3_BUCKET" => "backups".into(),
             "MACHINE_BACKUP_S3_ENDPOINT" => "https://s3.example.com".into(),
             _ => String::new(),
-        });
+        }, &[]);
         assert!(no_keys.err().unwrap().contains("MACHINE_BACKUP_S3_"));
+    }
+
+    fn settings(vars: &[(&str, &str)], tiers: &[&str]) -> Result<Settings, String> {
+        let keys = EnvStore::fixed(&[("MACHINE_BACKUP_S3_ACCESS_KEY_ID", "AKID"), ("MACHINE_BACKUP_S3_SECRET_ACCESS_KEY", "s3cret-0123")]);
+        let mut all: Vec<(String, String)> = vec![("MACHINE_BACKUP_S3_BUCKET".into(), "backups".into()), ("MACHINE_BACKUP_S3_ENDPOINT".into(), "https://s3.example.com".into())];
+        all.extend(vars.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        let tiers: Vec<String> = tiers.iter().map(|t| t.to_string()).collect();
+        Settings::from_env(&keys, &move |k| all.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default(), &tiers).map(Option::unwrap)
+    }
+
+    #[test]
+    fn each_tier_has_a_schedule_rpo_and_rto() {
+        let tiers = ["starter", "pro", "max"];
+        // The defaults: the default tiers' targets, and the bare value for any other.
+        let s = settings(&[], &tiers).unwrap();
+        let row = |s: &Settings, t: &str| (s.interval_ms(t) / HOUR_MS, s.rpo_ms(t) / HOUR_MS, s.rto_ms(t) / 60_000);
+        assert_eq!([row(&s, "starter"), row(&s, "pro"), row(&s, "max"), row(&s, "team")], [(24, 26, 60), (12, 14, 60), (6, 8, 60), (24, 26, 60)]);
+        let o = s.objectives(&["starter".into(), "max".into()]);
+        assert_eq!((o[1]["tier"].as_str(), o[1]["rpoHours"].as_i64(), o[2]["tier"].is_null()), (Some("max"), Some(8), true), "{o}");
+
+        // Set, the schedule replaces the defaults entirely; unnamed RPOs follow it.
+        let s = settings(&[("MACHINE_BACKUP_INTERVAL_HOURS", "12,max=1"), ("MACHINE_BACKUP_RPO_HOURS", "pro=24"), ("MACHINE_RESTORE_RTO_MINUTES", "90,max=30")], &tiers).unwrap();
+        assert_eq!([row(&s, "starter"), row(&s, "pro"), row(&s, "max")], [(12, 14, 90), (12, 24, 90), (1, 3, 30)]);
+
+        // An RPO too tight for its schedule, or a tier botd doesn't have, is refused.
+        let e = settings(&[("MACHINE_BACKUP_RPO_HOURS", "max=6")], &tiers).err().unwrap();
+        assert!(e.contains("tier max's RPO (6h) must be at least its backup interval (6h) plus 1h"), "{e}");
+        let e = settings(&[("MACHINE_BACKUP_RPO_HOURS", "24")], &tiers).err().unwrap();
+        assert!(e.contains("the default tier's RPO (24h)"), "{e}");
+        assert!(settings(&[("MACHINE_BACKUP_INTERVAL_HOURS", "24"), ("MACHINE_BACKUP_RPO_HOURS", "25")], &tiers).is_ok(), "an hour's headroom is enough");
+        let e = settings(&[("MACHINE_BACKUP_INTERVAL_HOURS", "24,prro=6")], &tiers).err().unwrap();
+        assert!(e.contains("\"prro\" isn't one of the machine tiers (starter, pro, max)"), "{e}");
+        assert!(settings(&[("MACHINE_RESTORE_RTO_MINUTES", "team=30")], &tiers).is_err());
+        assert!(settings(&[], &["team"]).is_ok(), "the built-in schedule's tiers needn't exist");
+        for bad in [("MACHINE_BACKUP_RPO_HOURS", "1"), ("MACHINE_RESTORE_RTO_MINUTES", "0"), ("MACHINE_BACKUP_INTERVAL_HOURS", "721")] {
+            assert!(settings(&[bad], &tiers).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -1025,7 +1195,7 @@ mod tests {
         let other = age::x25519::Identity::generate();
         let input: ByteStream = Box::pin(futures_util::stream::iter(vec![Ok(Bytes::from(sealed))]));
         let mut s = decrypt(input, vec![other]);
-        let e = s.next().await.unwrap().unwrap_err();
+        let e = s.next().await.unwrap().err().unwrap();
         assert!(e.to_string().contains("decrypting"), "{e}");
     }
 }
