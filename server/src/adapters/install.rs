@@ -55,6 +55,10 @@ const PINS: [Pin; 4] = [
     },
 ];
 
+/// Run after Hermes's installer on a machine, as on a server: every Bot then shares the
+/// install's one dependency environment instead of building its own (ADR 0072).
+const HERMES_SEAL: &str = include_str!("../../../deploy/hermes-seal.sh");
+
 /// Node.js for the npm harnesses: the LTS line the server image uses, checked
 /// against nodejs.org's SHASUMS256.txt.
 const NODE: &str = "22.23.5";
@@ -139,6 +143,7 @@ pub fn install(bin: &str, version: Option<&str>, checksum: Option<&str>) -> Resu
                     .map(String::from)
                     .into(),
                 bin: ".hermes/hermes-agent/.hermes/bin/hermes".into(),
+                after: Some(HERMES_SEAL.into()),
             }
         }
     };
@@ -193,6 +198,23 @@ mod tests {
         assert!(crate::machines::tools::check(&p).is_ok(), "{:?}", crate::machines::tools::check(&p));
         assert!(p.node.is_some_and(|n| n.downloads.contains_key("x86_64") && n.downloads.contains_key("aarch64")));
         assert!(plan(vec![h]).node.is_none(), "Hermes alone needs no Node.js");
+    }
+
+    #[test]
+    fn hermes_is_sealed_after_install_where_the_agent_can() {
+        use crate::machines::wire;
+        let p = plan(vec![install("hermes", None, None).unwrap()]);
+        let after = |p: &HarnessPlan| match &p.harnesses[0].source {
+            InstallSource::Script { after, .. } => after.clone(),
+            _ => unreachable!(),
+        };
+        assert!(after(&p).is_some_and(|a| a.contains("updateMechanism")));
+        assert_eq!(after(&p.for_agent(&[wire::CAN_SCRIPT_AFTER.into()])), after(&p));
+        let old = p.for_agent(&[]);
+        assert_eq!(after(&old), None, "an older agent would refuse the field");
+        let json = serde_json::to_value(&old).unwrap();
+        assert!(json["harnesses"][0]["source"].get("after").is_none());
+        assert!(crate::machines::tools::check(&p).is_ok() && crate::machines::tools::check(&old).is_ok());
     }
 
     #[test]

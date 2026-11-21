@@ -112,6 +112,10 @@ pub const CAN_SCREENS: &str = "screens";
 pub const CAN_TEAMMATES: &str = "teammates";
 pub const CAN_TEAMMATE_REMOVAL: &str = "teammate_removal";
 pub const CAN_TEAMMATE_LOGINS: &str = "teammate_logins";
+/// Installs each version of an installer-script harness in a folder of its own, switches
+/// to it in one rename, and runs the recipe's `after` script (ADR 0072). Agents without
+/// it get plans without `after`.
+pub const CAN_SCRIPT_AFTER: &str = "script_after";
 
 /// The screen protocol this build speaks (ADR 0045). A request names it, an agent
 /// refuses any other, and botd treats an agent that reports another as outdated.
@@ -564,6 +568,20 @@ impl HarnessPlan {
         let d = sha2::Sha256::digest(serde_json::to_vec(self).unwrap_or_default());
         d.iter().take(8).map(|b| format!("{b:02x}")).collect()
     }
+
+    /// The plan as an agent that says `can` takes it: one without `CAN_SCRIPT_AFTER`
+    /// refuses an `after` it doesn't know, so it gets none.
+    pub fn for_agent(&self, can: &[String]) -> HarnessPlan {
+        let mut p = self.clone();
+        if !can.iter().any(|c| c == CAN_SCRIPT_AFTER) {
+            for h in &mut p.harnesses {
+                if let InstallSource::Script { after, .. } = &mut h.source {
+                    *after = None;
+                }
+            }
+        }
+        p
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -608,6 +626,11 @@ pub enum InstallSource {
         sha256: String,
         args: Vec<String>,
         bin: String,
+        /// A bash script run once the installer succeeds, with that folder as `$1` and
+        /// the installer's env: e.g. to let every Bot share what it installed (ADR 0072).
+        /// The install fails if it does. Only for agents that say `CAN_SCRIPT_AFTER`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
     },
 }
 

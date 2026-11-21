@@ -8,7 +8,10 @@
 //! - `bin/`: what's on the harness PATH: `node`, `npm`, `npx` and each harness.
 //! - `node-<version>/`: Node.js, from the plan's pinned, SHA-256-checked tarball.
 //! - `lib/node_modules/`: npm harnesses (`npm install -g --prefix <tools>`).
-//! - `scripts/<name>/`: HOME for a harness's own installer script.
+//! - `scripts/<name>/<version>-<recipe>/`: HOME for a harness's own installer script,
+//!   one per recipe, so a new one installs beside the one running Bots use and
+//!   `bin/<name>` switches to it in one rename (ADR 0072). The rest of `scripts/<name>/`
+//!   goes once no job is running.
 //! - `state.json`: the plan, and what is installed.
 
 // Shared by two binaries, each of which uses only part of it.
@@ -29,6 +32,8 @@ use tokio::io::AsyncWriteExt;
 const MAX_DOWNLOAD: u64 = 256 << 20;
 /// The largest installer script.
 const MAX_SCRIPT: u64 = 4 << 20;
+/// The largest `after` script a recipe carries.
+const MAX_AFTER: usize = 64 << 10;
 /// How long one install step may take. Hermes's installer builds a Python env.
 const STEP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const STATE_FILE: &str = "state.json";
@@ -169,12 +174,15 @@ pub fn check(plan: &HarnessPlan) -> Result<(), String> {
                     return Err(format!("{}: the integrity isn't sha512-<base64>.", h.name));
                 }
             }
-            InstallSource::Script { url, sha256, args, bin } => {
+            InstallSource::Script { url, sha256, args, bin, after } => {
                 if !https(url) || !hex64(sha256) || !relative(bin) {
                     return Err(format!("{}: the installer needs an https URL, its SHA-256 and a relative bin.", h.name));
                 }
                 if args.len() > 32 || args.iter().any(|a| a.len() > 256 || a.contains('\0')) {
                     return Err(format!("{}: too many or too long installer arguments.", h.name));
+                }
+                if after.as_ref().is_some_and(|a| a.len() > MAX_AFTER || a.contains('\0')) {
+                    return Err(format!("{}: the after script is over {} KiB.", h.name, MAX_AFTER >> 10));
                 }
             }
         }
@@ -217,6 +225,14 @@ fn symlink(target: &Path, link: &Path) -> Result<(), String> {
     std::os::unix::fs::symlink(target, &tmp)
         .and_then(|()| std::fs::rename(&tmp, link))
         .map_err(|e| format!("{}: {e}", link.display()))
+}
+
+/// The folder under `scripts/<name>/` an installer-script recipe installs in: its
+/// version, and the start of the recipe's SHA-256, so a changed recipe gets a new one.
+fn script_dir(h: &HarnessInstall) -> String {
+    let d = Sha256::digest(serde_json::to_vec(h).unwrap_or_default());
+    let recipe: String = d.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    format!("{}-{recipe}", &h.version[..h.version.len().min(12)])
 }
 
 /// The end of a program's output, for an error message.
@@ -299,12 +315,12 @@ impl Tools {
         }
     }
 
-    /// Whether installing `h` replaces files a running job may use: an installed
-    /// harness, or the Node.js npm harnesses run on.
+    /// Whether installing `h` replaces files a running job may use: an installed npm
+    /// harness, or the Node.js they run on. An installer script's goes in a new folder.
     fn replaces(&self, h: &HarnessInstall, node: Option<&NodeRuntime>) -> bool {
         let s = self.lock();
         let npm = matches!(h.source, InstallSource::Npm { .. });
-        s.installed.contains_key(&h.name) || (npm && s.node.is_some() && node.is_some_and(|n| !node_current(&s, n)))
+        npm && (s.installed.contains_key(&h.name) || (s.node.is_some() && node.is_some_and(|n| !node_current(&s, n))))
     }
 
     /// The plan's Node.js, if it isn't the one installed.
@@ -433,8 +449,13 @@ impl Tools {
                 } else {
                     println!("Installed {} {}.", h.name, h.version);
                 }
+                let installed = res.is_ok();
                 self.finish(&h, res);
                 self.open_up_if_open();
+                drop(_replacing);
+                if installed && matches!(h.source, InstallSource::Script { .. }) {
+                    self.prune_scripts(&h).await;
+                }
             }
             self.wake.notified().await;
         }
@@ -473,7 +494,10 @@ impl Tools {
                         self.node(node.ok_or("npm harnesses need Node.js")?).await?;
                         self.npm(package, &h.version, integrity.as_deref()).await
                     }
-                    InstallSource::Script { url, sha256, args, bin } => self.script(&h.name, url, sha256, args, bin).await,
+                    InstallSource::Script { url, sha256, args, bin, after } => {
+                        let file = self.download(url, sha256, MAX_SCRIPT).await?;
+                        self.script(h, &file, args, bin, after.as_deref()).await
+                    }
                 }
             })
             .await;
@@ -642,20 +666,61 @@ impl Tools {
         Ok(())
     }
 
-    async fn script(&self, name: &str, url: &str, sha256: &str, args: &[String], bin: &str) -> Result<(), String> {
-        let file = self.download(url, sha256, MAX_SCRIPT).await?;
-        let home = self.dir.join("scripts").join(name);
+    /// Runs the downloaded installer `file` with HOME set to `h`'s own folder, then its
+    /// `after` script, then points `bin/<name>` there. A folder left by an attempt that
+    /// failed is started again; what running Bots use is never touched.
+    async fn script(&self, h: &HarnessInstall, file: &Path, args: &[String], bin: &str, after: Option<&str>) -> Result<(), String> {
+        let home = self.dir.join("scripts").join(&h.name).join(script_dir(h));
+        let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
         let f = file.display().to_string();
         let mut argv: Vec<&str> = vec![&f];
         argv.extend(args.iter().map(String::as_str));
         let env = [("PATH", self.path()), ("HOME", home.display().to_string()), ("LANG", "C.UTF-8".into())];
         self.run("bash", &argv, &env, &home).await?;
+        if let Some(after) = after {
+            let dl = self.dir.join(".dl");
+            std::fs::create_dir_all(&dl).map_err(|e| e.to_string())?;
+            let script = dl.join("after.sh");
+            std::fs::write(&script, after).map_err(|e| e.to_string())?;
+            let (s, hm) = (script.display().to_string(), home.display().to_string());
+            self.run("bash", &[&s, &hm], &env, &home).await.map_err(|e| format!("after the installer: {e}"))?;
+        }
         let target = home.join(bin);
         if !runnable(&target) {
             return Err(format!("the installer left no program at {bin}"));
         }
-        symlink(&target, &self.bin_dir().join(name))
+        symlink(&target, &self.bin_dir().join(&h.name))
+    }
+
+    /// Once no job is running, removes `h`'s other folders under `scripts/<name>/`: older
+    /// versions, and the install before versions had folders (straight in it).
+    async fn prune_scripts(&self, h: &HarnessInstall) {
+        let parent = self.dir.join("scripts").join(&h.name);
+        let keep = script_dir(h);
+        let stale = || -> Vec<PathBuf> {
+            std::fs::read_dir(&parent)
+                .map(|d| d.filter_map(|e| e.ok()).filter(|e| e.file_name().to_str() != Some(keep.as_str())).map(|e| e.path()).collect())
+                .unwrap_or_default()
+        };
+        if stale().is_empty() {
+            return;
+        }
+        // Moved aside while no job runs, then removed while jobs run again.
+        let trash = self.dir.join(".trash");
+        {
+            let _replacing = self.replacing().await;
+            if self.lock().recipes.get(&h.name) != Some(h) {
+                return;
+            }
+            let _ = std::fs::create_dir_all(&trash);
+            for (i, p) in stale().into_iter().enumerate() {
+                if let Err(e) = std::fs::rename(&p, trash.join(format!("{}-{}-{i}", h.name, now_ms()))) {
+                    eprintln!("Removing {}: {e}", p.display());
+                }
+            }
+        }
+        let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(trash)).await;
     }
 }
 
@@ -702,7 +767,7 @@ mod tests {
         let script = |url: &str, sha: &str, bin: &str| HarnessInstall {
             name: "hermes".into(),
             version: "ae2a81cc".into(),
-            source: InstallSource::Script { url: url.into(), sha256: sha.into(), args: vec![], bin: bin.into() },
+            source: InstallSource::Script { url: url.into(), sha256: sha.into(), args: vec![], bin: bin.into(), after: None },
         };
         let sha = "c".repeat(64);
         assert!(check(&plan(vec![script("https://example.com/i.sh", &sha, ".hermes/bin/hermes")], None)).is_ok());
@@ -862,6 +927,82 @@ mod tests {
         let _ = done_tx.send(());
         install.await.unwrap();
         assert!(t.job_permit().is_some());
+    }
+
+    fn hermes(version: &str, after: Option<&str>) -> HarnessInstall {
+        HarnessInstall {
+            name: "hermes".into(),
+            version: version.into(),
+            source: InstallSource::Script {
+                url: "https://example.com/i.sh".into(),
+                sha256: "c".repeat(64),
+                args: vec![version.into()],
+                bin: "bin/hermes".into(),
+                after: after.map(Into::into),
+            },
+        }
+    }
+
+    async fn install_script(t: &Tools, h: &HarnessInstall) -> Result<(), String> {
+        let InstallSource::Script { args, bin, after, .. } = &h.source else { unreachable!() };
+        let file = t.dir.join("installer.sh");
+        std::fs::write(&file, "mkdir -p \"$HOME/bin\"; printf '#!/bin/sh\\necho %s\\n' \"$1\" > \"$HOME/bin/hermes\"; chmod +x \"$HOME/bin/hermes\"\n").unwrap();
+        t.script(h, &file, args, bin, after.as_deref()).await
+    }
+
+    #[tokio::test]
+    async fn each_script_version_gets_its_own_folder_and_old_ones_go_once_jobs_end() {
+        let dir = std::env::temp_dir().join(format!("superbot-tools-script-{}", now_ms()));
+        let t = Tools::new(dir.clone(), None).unwrap();
+        let link = t.bin_dir().join("hermes");
+        let runs = |p: &Path| String::from_utf8(std::process::Command::new(p).output().unwrap().stdout).unwrap();
+        let parent = dir.join("scripts/hermes");
+        // The layout before versions had folders.
+        std::fs::create_dir_all(parent.join(".hermes")).unwrap();
+
+        let a = hermes(&"a".repeat(40), Some("touch \"$1/sealed\""));
+        install_script(&t, &a).await.unwrap();
+        let a_dir = parent.join(script_dir(&a));
+        assert!(a_dir.join("sealed").exists(), "the after step runs in the install's folder");
+        assert_eq!(runs(&link).trim(), a.version);
+        t.finish(&a, Ok(a.version.clone()));
+
+        let b = hermes(&"b".repeat(40), Some("touch \"$1/sealed\""));
+        assert!(!t.replaces(&b, None), "a new version doesn't touch the one Bots run");
+        let job = t.job_permit().unwrap();
+        install_script(&t, &b).await.unwrap();
+        assert_eq!(runs(&link).trim(), b.version, "new Bots get the new version");
+        assert_eq!(runs(&a_dir.join("bin/hermes")).trim(), a.version, "a running Bot keeps its own");
+        t.finish(&b, Ok(b.version.clone()));
+
+        let t2 = t.clone();
+        let b2 = b.clone();
+        let prune = tokio::spawn(async move { t2.prune_scripts(&b2).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!prune.is_finished() && a_dir.exists(), "old versions stay while a job runs");
+        drop(job);
+        tokio::time::timeout(Duration::from_secs(5), prune).await.unwrap().unwrap();
+        let left: Vec<_> = std::fs::read_dir(&parent).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, [std::ffi::OsString::from(script_dir(&b))]);
+        assert!(!dir.join(".trash").exists());
+
+        let c = hermes(&"c".repeat(40), Some("exit 3"));
+        assert!(install_script(&t, &c).await.unwrap_err().contains("after the installer"));
+        assert_eq!(runs(&link).trim(), b.version, "a failed after step leaves the link alone");
+
+        let mut d = hermes(&"b".repeat(40), Some("true"));
+        assert_ne!(script_dir(&d), script_dir(&b), "a changed recipe gets a new folder");
+        d.version = "x".into();
+        assert!(script_dir(&d).starts_with("x-"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn after_steps_are_checked() {
+        let plan = |h| HarnessPlan { node: None, harnesses: vec![h] };
+        assert!(check(&plan(hermes(&"a".repeat(40), Some("true")))).is_ok());
+        assert!(check(&plan(hermes(&"a".repeat(40), Some("a\0b")))).is_err());
+        assert!(check(&plan(hermes(&"a".repeat(40), Some(&"#".repeat(MAX_AFTER + 1))))).is_err());
     }
 
     #[test]
