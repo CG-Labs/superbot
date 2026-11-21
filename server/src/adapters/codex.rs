@@ -3,7 +3,8 @@
 //! changes reach it only through its memory file, not the system prompt.
 //! Approvals: an inline PreToolUse hook. Hosted tools such as web search skip hooks.
 //! `codex exec` runs it from 0.141.0 (tested end to end, ADR 0057); older releases
-//! skip it, and the canary stops their runs.
+//! skip it, so guarded runs on them are refused up front (ADR 0059), and the canary
+//! stops any that get through.
 //! Sandbox (ADR 0055): `workspace-write` with the network on, else none at all.
 
 use super::{output, short, str_of, Adapter, AgentEvent, ModelOption, RunInput, Usage};
@@ -130,6 +131,11 @@ impl Adapter for Codex {
         true
     }
 
+    /// `CODEX_MIN_HOOKS` in the `harness-e2e` workflow tests exactly this release.
+    fn hooks_since(&self) -> Option<&'static str> {
+        Some("0.141.0")
+    }
+
     fn login_args(&self) -> Option<&'static [&'static str]> {
         Some(&["login"])
     }
@@ -198,6 +204,13 @@ mod tests {
         Codex::default().on_event(&serde_json::from_str(r#"{"type":"turn.completed","usage":{}}"#).unwrap(), &mut out);
         Codex::default().on_event(&serde_json::from_str(r#"{"type":"turn.completed"}"#).unwrap(), &mut out);
         assert!(out.is_empty(), "no counts: unknown");
+    }
+
+    #[test]
+    fn ci_tests_the_oldest_codex_runs_accept() {
+        let wf = include_str!("../../../.github/workflows/harness-e2e.yml");
+        let min = Codex::default().hooks_since().unwrap();
+        assert!(wf.contains(&format!("CODEX_MIN_HOOKS: '{min}'")), "CODEX_MIN_HOOKS in harness-e2e.yml is {min}");
     }
 
     #[test]
