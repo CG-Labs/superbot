@@ -257,7 +257,7 @@ mod tests {
         let hit = r.hits.lock().unwrap()[1].clone();
         let ts: i64 = hit.headers["x-superbot-timestamp"].to_str().unwrap().parse().unwrap();
         assert_eq!(hit.headers["x-superbot-signature"].to_str().unwrap(), signature("s3cret", ts, &hit.raw));
-        let gone = format!("http://127.0.0.1:1/services/T0/B0/token-9c1f");
+        let gone = "http://127.0.0.1:1/services/T0/B0/token-9c1f".to_string();
         let e = post(&client(), &gone, Format::Slack, &notice(), None).await.unwrap_err();
         assert!(!e.contains("token-9c1f"), "{e}");
     }

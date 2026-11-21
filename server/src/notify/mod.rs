@@ -506,10 +506,10 @@ impl Throttle {
             return Offer::Duplicate;
         }
         self.order.push_back(id.to_string());
-        if self.order.len() > SEEN {
-            if let Some(old) = self.order.pop_front() {
-                self.seen.remove(&old);
-            }
+        if self.order.len() > SEEN
+            && let Some(old) = self.order.pop_front()
+        {
+            self.seen.remove(&old);
         }
         match self.last.get(bot) {
             Some(t) if !window.is_zero() && now < *t + window => {

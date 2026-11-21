@@ -18,6 +18,7 @@ const MAX_LINE: u64 = 4096;
 const STEP: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum Tls {
     /// Plain connect, then `STARTTLS`, which the server must offer. Port 587 by default.
     StartTls,
@@ -55,7 +56,7 @@ impl Mailbox {
         if !address_ok(addr) {
             return Err(format!("\"{s}\" isn't an email address, like SuperBot <bots@example.com>"));
         }
-        let name = name.filter(|n| !n.is_empty()).map(|n| clean_header(n));
+        let name = name.filter(|n| !n.is_empty()).map(clean_header);
         Ok(Mailbox { name, addr: addr.to_string() })
     }
 
