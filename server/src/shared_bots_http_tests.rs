@@ -491,6 +491,77 @@ async fn with_teammate_users_a_teammates_run_is_refused_rather_than_run_as_the_b
     assert!(events(&w, "action=machine.teammate_user_created").await.is_empty());
 }
 
+/// `routed_teammates`, with harness logins on, Ada logged in there, and an agent that
+/// keeps teammates' own logins (ADR 0062).
+async fn routed_teammate_logins() -> (World, Arc<Recording>) {
+    let e = Enrollment::for_tests(41, 1, 1).with_teammate_users().with_logins();
+    let (w, link) = routed_with(|cp| cp.enrollment = Some(Arc::new(e))).await;
+    if let Ok(hb) = link.heartbeat.lock().unwrap().as_mut() {
+        hb.can = [wire::CAN_BOT_USER, wire::CAN_TEAMMATES, wire::CAN_LOGINS, wire::CAN_TEAMMATE_LOGINS].map(String::from).to_vec();
+        hb.bot_user = Some(wire::BotUserStatus { state: wire::BOT_USER_READY.into(), ..Default::default() });
+        hb.logins = [("claude".to_string(), login(wire::LOGGED_IN))].into();
+    }
+    (w, link)
+}
+
+fn login(state: &str) -> wire::LoginStatus {
+    wire::LoginStatus { state: state.into(), since: Some(1) }
+}
+
+#[tokio::test]
+async fn a_teammates_run_uses_their_own_login_never_the_owners_or_another_teammates() {
+    let (w, link) = routed_teammate_logins().await;
+    let (cy_id, cy) = user_with(w.port, &w.admin, "cy@example.com", "member").await;
+    let team = bot(&w, "Team", &w.a_id, Visibility::Shared);
+    let pi = w.app.db.create_bot_owned("Pi", "#fff", "waddle", "pi", None, false, &w.a_id, Visibility::Shared);
+    let refused = async |w: &World, who: &str| {
+        let all = events(w, "action=bot.run_refused").await;
+        all.into_iter().filter(|e| e["details"]["reason"] == "teammate_not_logged_in" && e["details"]["forUser"] == who).collect::<Vec<_>>()
+    };
+    let sent = || link.sent.lock().unwrap().clone();
+
+    // Ada is logged in on her machine. That never logs Bea in.
+    let said = run(&w, &w.b, &team.id, "go").await;
+    let ada_name = w.app.db.user(&w.a_id).unwrap().name;
+    assert!(said.contains(&format!("isn't logged in for you on {ada_name}'s computer")) && said.contains("never"), "{said}");
+    assert!(!said.contains("botctl") && !said.contains("superbot-t-") && !said.contains("your login"), "{said}");
+    let no = refused(&w, &w.b_id).await;
+    assert_eq!((no.len(), no[0]["details"]["detail"].as_str()), (1, Some("claude")), "{no:?}");
+    assert!(sent().is_empty(), "never run on Ada's login");
+    assert_eq!(*link.teammates.lock().unwrap(), std::slice::from_ref(&w.b_id), "her own user was asked");
+    run(&w, &w.a, &team.id, "go").await;
+    assert_eq!((sent().len(), sent()[0].1.for_user.clone()), (1, None), "Ada's own run goes as before");
+
+    // Bea logs in with her own account there: her runs go, as her user.
+    link.teammate_logins.lock().unwrap().insert(w.b_id.clone(), [("claude".to_string(), login(wire::LOGGED_IN))].into());
+    run(&w, &w.b, &team.id, "go").await;
+    assert_eq!((sent().len(), sent()[1].1.for_user.as_deref()), (2, Some(w.b_id.as_str())));
+
+    // Cy, with Ada and Bea both logged in, is still refused: theirs aren't his.
+    run(&w, &cy, &team.id, "go").await;
+    assert_eq!(refused(&w, &cy_id).await.len(), 1);
+    // A login still running isn't one.
+    link.teammate_logins.lock().unwrap().insert(cy_id.clone(), [("claude".to_string(), login(wire::LOGGING_IN))].into());
+    run(&w, &cy, &team.id, "go").await;
+    assert_eq!(refused(&w, &cy_id).await.len(), 2);
+    assert_eq!(sent().len(), 2, "none of Cy's ran");
+    // Pi has no login there, so his Pi runs go.
+    run(&w, &cy, &pi.id, "go").await;
+    assert_eq!((sent().len(), sent()[2].1.for_user.as_deref()), (3, Some(cy_id.as_str())));
+
+    // An agent that can't keep teammates' logins: the old refusal, never Ada's login.
+    link.heartbeat.lock().unwrap().as_mut().unwrap().can.retain(|c| c != wire::CAN_TEAMMATE_LOGINS);
+    run(&w, &w.b, &team.id, "go").await;
+    let old = events(&w, "action=bot.run_refused").await;
+    assert_eq!(old.iter().filter(|e| e["details"]["reason"] == "teammate_no_key").count(), 1, "{old:?}");
+    assert_eq!(sent().len(), 3);
+
+    // Teammates see they can log in for a Bot with a login on Ada's machine.
+    let (_, list) = call(w.port, "GET", "/api/bots", &w.b, "").await;
+    let view = |id: &str| parse(&list).as_array().unwrap().iter().find(|b| b["id"] == id).cloned().unwrap();
+    assert_eq!((view(&team.id)["teammateLogins"].as_bool(), view(&pi.id)["teammateLogins"].as_bool()), (Some(true), None), "{list}");
+}
+
 #[tokio::test]
 async fn teammate_users_are_off_unless_asked() {
     let (w, link) = routed().await;

@@ -526,4 +526,36 @@ mod tests {
         };
         assert!(matches!(exit, LoginEvent::Exit { success: false, logged_in: false, .. }));
     }
+
+    #[tokio::test]
+    async fn each_person_has_their_own_login_per_harness_and_a_leaving_teammates_stop() {
+        let home = scratch("people");
+        let bin = home.join("slow-login");
+        std::fs::write(&bin, "#!/bin/sh\necho waiting\nsleep 60\n").unwrap();
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let logins = Arc::new(Logins::default());
+        let env = BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        let for_user = |id: &str, who: Option<&str>| LoginRequest { login_id: id.into(), for_user: who.map(String::from), ..req(&[".claude/.credentials.json"]) };
+        let (mut owner, _s1) = logins.start(&for_user("l1", None), &fake(&bin), &home, &env, None).unwrap();
+        let (mut bea, _s2) = logins.start(&for_user("l2", Some("u-bea")), &fake(&bin), &home, &env, None).unwrap();
+        let (_cy, _s3) = logins.start(&for_user("l3", Some("u-cy")), &fake(&bin), &home, &env, None).unwrap();
+        assert_eq!(logins.start(&for_user("l4", Some("u-bea")), &fake(&bin), &home, &env, None).unwrap_err().0, 409, "one each");
+        assert_eq!(logins.running_for(None), ["claude"], "the owner's own only");
+        assert_eq!(logins.running_for(Some("u-bea")), ["claude"]);
+        assert!(logins.running_for(Some("u-dan")).is_empty());
+
+        assert_eq!(logins.abort_for("u-bea"), 1);
+        let ended = async |rx: &mut mpsc::Receiver<LoginEvent>| loop {
+            match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap() {
+                Some(LoginEvent::Exit { .. }) | None => break true,
+                _ => {}
+            }
+        };
+        assert!(ended(&mut bea).await);
+        assert!(logins.running_for(Some("u-bea")).is_empty());
+        assert_eq!(logins.running_for(Some("u-cy")), ["claude"], "Cy's goes on");
+        assert_eq!(logins.running_for(None), ["claude"], "and the owner's");
+        assert!(logins.abort("l1"));
+        assert!(ended(&mut owner).await);
+    }
 }

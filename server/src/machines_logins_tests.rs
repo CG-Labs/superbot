@@ -43,16 +43,21 @@ async fn wait_for_events(env: &Env, action: &str, n: usize) -> Vec<Value> {
 }
 
 /// A login started through botd's API, read line by line.
-struct Login {
+pub(crate) struct Login {
     res: reqwest::Response,
     buf: Vec<u8>,
 }
 
 impl Login {
     async fn start(env: &Env, user: &str, harness: &str) -> Login {
+        Login::open(env, &format!("/api/users/{user}/machine/harness-login"), &env.admin, harness).await
+    }
+
+    /// Starts one at `path`, as `auth`.
+    pub(crate) async fn open(env: &Env, path: &str, auth: &str, harness: &str) -> Login {
         let res = reqwest::Client::new()
-            .post(format!("http://127.0.0.1:{}/api/users/{user}/machine/harness-login", env.port))
-            .header("Authorization", &env.admin)
+            .post(format!("http://127.0.0.1:{}{path}", env.port))
+            .header("Authorization", auth)
             .json(&json!({ "harness": harness }))
             .send()
             .await
@@ -74,12 +79,12 @@ impl Login {
     }
 
     /// Reads up to the first event of `kind`, gathering the output on the way.
-    async fn until(&mut self, kind: &str) -> (Value, String) {
+    pub(crate) async fn until(&mut self, kind: &str) -> (Value, String) {
         self.reading(|ev, _| ev["type"] == kind).await
     }
 
     /// Reads until the output so far holds `text`.
-    async fn until_shown(&mut self, text: &str) -> String {
+    pub(crate) async fn until_shown(&mut self, text: &str) -> String {
         self.reading(|_, out| out.contains(text)).await.1
     }
 
