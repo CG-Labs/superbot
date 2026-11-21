@@ -186,6 +186,8 @@ export interface BillingEmails {
   on: boolean;
   /** You get the token and storage limit emails. Plan and payment emails always go. */
   usage: boolean;
+  /** False for read-only people. Only from `/api/me/emails`. */
+  canChange?: boolean;
 }
 
 /** One of your own secrets, as `/api/me/secrets` lists it (ADR 0029, 0044). Never the value. */

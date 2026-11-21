@@ -4,7 +4,7 @@ import { CONFIRM_EVERY_MS, PlanView } from "../PlanView";
 import PlanScreen from "../../app/plan";
 import { ApiError } from "../../src/api";
 import { BILLING_OFF } from "../../src/billing";
-import type { BillingView, MyUsage } from "../../src/types";
+import type { BillingEmails, BillingView, MyUsage } from "../../src/types";
 
 const mockCtx: Record<string, unknown> = {};
 const mockRedirect = jest.fn((_href: string) => null);
@@ -43,8 +43,9 @@ const usage: MyUsage = {
   byBot: [{ ...totals, bot: "b1", name: "Scout" }],
 };
 
-function fakeApi(view: BillingView | null, mine: MyUsage | null = null) {
+function fakeApi(view: BillingView | null, mine: MyUsage | null = null, emails: BillingEmails | null = null) {
   return {
+    billingEmails: jest.fn(async (): Promise<BillingEmails | null> => emails),
     billing: jest.fn(async (): Promise<BillingView | null> => view),
     myUsage: jest.fn(async (): Promise<MyUsage | null> => mine),
     checkout: jest.fn(async (tier: string) => ({ url: `https://checkout.stripe.com/c/pay/${tier}` })),
@@ -179,6 +180,23 @@ describe("PlanView (ADR 0042)", () => {
     expect(screen.queryByLabelText("Usage emails")).toBeNull();
     await rerender(<PlanView api={fakeApi(billing({ canChange: false, emails: { on: true, usage: true } }))} onBack={jest.fn()} />);
     expect((await screen.findByLabelText("Usage emails")).props.disabled).toBe(true);
+  });
+
+  it("offers the usage emails switch on a server that sends them without checkout", async () => {
+    const api = fakeApi(null, usage, { on: true, usage: true, canChange: true });
+    await render(<PlanView api={api} onBack={jest.fn()} />);
+    expect(await screen.findByText(BILLING_OFF)).toBeOnTheScreen();
+    const toggle = await screen.findByLabelText("Usage emails");
+    await act(async () => fireEvent(toggle, "valueChange", false));
+    expect(api.setUsageEmails).toHaveBeenCalledWith(false);
+    expect((await screen.findByLabelText("Usage emails")).props.value).toBe(false);
+  });
+
+  it("takes /api/me/emails over the billing view, read-only included", async () => {
+    await render(<PlanView api={fakeApi(billing({ emails: { on: true, usage: true } }), null, { on: true, usage: false, canChange: false })} onBack={jest.fn()} />);
+    const toggle = await screen.findByLabelText("Usage emails");
+    expect(toggle.props.disabled).toBe(true);
+    expect(toggle.props.value).toBe(false);
   });
 
   it("still shows the plan when usage can't load", async () => {
