@@ -442,8 +442,8 @@ fn login(args: &[&str]) -> Result<String, String> {
         let Some(challenge) = v["challenge"].as_str().filter(|_| code == 401) else { return Err(failure(code, &res)) };
         let enroll = v["mfa"] == "enroll";
         eprintln!("{}", v["error"].as_str().unwrap_or_default());
-        if enroll && let Some(secret) = v["secret"].as_str() {
-            eprintln!("\nSetup key: {secret}\n{}\n", v["otpauthUrl"].as_str().unwrap_or_default());
+        if enroll {
+            eprintln!("\nAdd this to your authenticator app:\n{}\n", setup_text(&v));
         }
         eprint!("{}", if enroll { "Code: " } else { "Code (or a recovery code): " });
         let _ = std::io::stderr().flush();
@@ -453,6 +453,12 @@ fn login(args: &[&str]) -> Result<String, String> {
         };
         (code, res) = exchange(Cred::Anonymous, "POST", "/api/auth/login", Some(factor_body(challenge, &typed, enroll)?.to_string()))?;
     }
+}
+
+/// What someone types or opens to add the account to an authenticator app.
+fn setup_text(v: &Value) -> String {
+    let field = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+    format!("  Setup key: {}\n  {}", field("secret"), field("otpauthUrl"))
 }
 
 /// The second step: six digits are an authenticator code, anything else a recovery code.
@@ -1559,6 +1565,7 @@ mod tests {
         assert_eq!(factor_body("sbm_x", "abcde-fghij", false).unwrap()["recoveryCode"], "abcde-fghij");
         assert_eq!(factor_body("sbm_x", "12345", true).unwrap()["totp"], "12345");
         assert!(factor_body("sbm_x", "  ", false).is_err());
+        assert_eq!(setup_text(&json!({ "secret": "ABCD", "otpauthUrl": "otpauth://totp/x" })), "  Setup key: ABCD\n  otpauth://totp/x");
         let done = signed_in(&json!({ "token": "sbt_t", "user": { "name": "Ana", "role": "admin" }, "recoveryCodes": ["aaaaa-bbbbb", "ccccc-ddddd"] }));
         assert!(done.contains("export SUPERBOT_TOKEN=sbt_t") && done.contains("  aaaaa-bbbbb\n  ccccc-ddddd"), "{done}");
         assert_eq!(role("read-only"), Ok("read-only"));
