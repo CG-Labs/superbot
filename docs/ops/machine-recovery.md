@@ -62,7 +62,7 @@ botctl login                      # as an admin
 deploy/machine-restore-drill.sh drill@<your-domain> --fresh --yes
 ```
 
-It shows the objectives, takes a backup with `--fresh` (otherwise uses the newest), restores from it, waits, and prints how long botd recorded against the RTO. It exits non-zero if the restore failed or ran past the RTO. It stops waiting once the RTO has passed; botd carries on with the restore. Add `--identity <age key file>` when the server doesn't hold the backups' age identity. Needs `botctl` and `jq`.
+It shows the objectives, takes a backup with `--fresh` (otherwise uses the newest), restores from it, waits, and prints how long botd recorded against the RTO. It exits non-zero if the restore failed or ran past the RTO. It stops waiting 3 minutes after the RTO (`SUPERBOT_DRILL_GRACE_SECONDS`), time for botd to record a restore that finished just in time; botd carries on with one that didn't. Pass or fail is from the time botd recorded. Add `--identity <age key file>` when the server doesn't hold the backups' age identity. Needs `botctl` and `jq`.
 
 Never point it at a customer's machine: everything on it since the backup is lost.
 

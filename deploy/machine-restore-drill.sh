@@ -37,6 +37,8 @@ $YES || {
 }
 BOTCTL=${BOTCTL:-botctl}
 POLL=${SUPERBOT_DRILL_POLL_SECONDS:-10}
+# How long past the RTO to wait for botd to record a restore it finished (MACHINE_RECONCILE_SECONDS is 60).
+GRACE=${SUPERBOT_DRILL_GRACE_SECONDS:-180}
 
 step() { printf '==> drill: %s\n' "$*"; }
 fail() {
@@ -77,7 +79,9 @@ while :; do
     DEADLINE=$(jq -r 'if (.restore.createdAt | type) == "number" and (.restore.rtoMs | type) == "number" then .restore.createdAt + .restore.rtoMs else empty end' <<<"$R")
     [[ "$DEADLINE" =~ ^[0-9]+$ ]] || fail "botd recorded no RTO for $RESTORE"
   fi
-  (($(date +%s%3N) <= DEADLINE)) || fail "restore $RESTORE is still $STATE past its RTO (botd carries on with it)"
+  # botd marks a restore done on its next reconcile after the agent enrolls, so give it time
+  # to; the pass or fail below is from the time botd recorded, not from this clock.
+  (($(date +%s%3N) <= DEADLINE + GRACE * 1000)) || fail "restore $RESTORE is still $STATE past its RTO (botd carries on with it)"
   printf '    %s\n' "$STATE"
   sleep "$POLL"
 done
