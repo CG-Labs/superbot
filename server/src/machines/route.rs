@@ -110,6 +110,8 @@ pub enum Refusal {
     TeammateNotLoggedIn(String),
     /// It is being rebuilt with today's agent, or is about to be (ADR 0056).
     Rebuilding,
+    /// It is being made again from an off-host backup (ADR 0071).
+    Restoring,
 }
 
 impl Refusal {
@@ -133,6 +135,7 @@ impl Refusal {
             Refusal::TeammateUserFailed(_) => "teammate_user_failed",
             Refusal::TeammateNotLoggedIn(_) => "teammate_not_logged_in",
             Refusal::Rebuilding => "machine_rebuilding",
+            Refusal::Restoring => "machine_restoring",
         }
     }
 
@@ -179,6 +182,7 @@ impl Refusal {
             Refusal::TeammateUserFailed(_) => "I didn't run: your computer couldn't set up a separate account for a teammate. Ask an admin to look at it (`botctl machine agent <your email>`).".into(),
             Refusal::TeammateNotLoggedIn(h) => format!("I didn't run: runs for your teammates use their own {h} login on your computer, never yours, and this one has none. They can log in from my details in the app, or an admin can save a server-wide key."),
             Refusal::Rebuilding => "I didn't run: your computer is being rebuilt with the latest setup. Try again in a few minutes.".into(),
+            Refusal::Restoring => "I didn't run: your computer is being restored from a backup. Try again once an admin says it's back.".into(),
         }
     }
 
@@ -208,7 +212,8 @@ impl Refusal {
             | Refusal::FolderCopying
             | Refusal::BotUserPending
             | Refusal::BotUserFailed
-            | Refusal::Rebuilding => {
+            | Refusal::Rebuilding
+            | Refusal::Restoring => {
                 "it isn't ready to run Bots"
             }
         };
@@ -238,6 +243,9 @@ pub fn target(db: &Db, cp: &ControlPlane, user_id: &str) -> Result<Target, Refus
     }
     if super::rebuild::underway(&m) {
         return Err(Refusal::Rebuilding);
+    }
+    if super::backup::restoring(db, &m.id) {
+        return Err(Refusal::Restoring);
     }
     let to = Assigned { machine_id: m.id.clone(), user_id: m.user_id.clone(), address: m.ipv4.clone(), pins: db.machine_pins(&m.id) };
     if to.pins.is_empty() {
@@ -456,6 +464,7 @@ mod tests {
             Refusal::TeammateUserFailed("useradd failed at 192.0.2.7".into()),
             Refusal::TeammateNotLoggedIn("claude".into()),
             Refusal::Rebuilding,
+            Refusal::Restoring,
         ];
         for r in &all {
             let m = r.message_for(Some("Ada"));
