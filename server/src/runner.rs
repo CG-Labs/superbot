@@ -216,7 +216,7 @@ pub struct App {
     pub meter: OnceLock<Arc<crate::billing::Meter>>,
     /// Email and webhook notices for pending approvals (ADR 0061). Unset: none.
     pub notifier: OnceLock<Arc<crate::notify::Notifier>>,
-    /// Billing emails (ADR 0090). Unset: off, and nothing is queued.
+    /// Billing emails (ADR 0091). Unset: off, and nothing is queued.
     pub billing_mail: OnceLock<Arc<crate::billing_mail::BillingMail>>,
     /// Teammates' own harness logins for owners' shared Bots here (ADR 0064).
     pub teammate_logins: crate::teammate_logins::Local,

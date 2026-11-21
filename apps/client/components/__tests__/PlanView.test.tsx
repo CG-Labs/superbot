@@ -151,7 +151,7 @@ describe("PlanView (ADR 0042)", () => {
     expect(screen.getByText("Scout: 1,500 tokens in 1 run")).toBeOnTheScreen();
   });
 
-  it("turns usage emails off and on, when the server sends billing emails (ADR 0090)", async () => {
+  it("turns usage emails off and on, when the server sends billing emails (ADR 0091)", async () => {
     const api = fakeApi(billing({ emails: { on: true, usage: true } }));
     await render(<PlanView api={api} onBack={jest.fn()} />);
     const toggle = await screen.findByLabelText("Usage emails");

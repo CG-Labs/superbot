@@ -285,7 +285,7 @@ Each run's model tokens are recorded for its Bot's **owner**, the same person it
 
 ### Billing emails
 
-While billing is on and botd has an SMTP server ([ADR 0061](adr/0061-approval-notifications.md)), the person a plan is for gets plain-text emails ([ADR 0090](adr/0090-billing-emails.md)). `BILLING_EMAILS=off` stops them; without billing or SMTP nothing is queued or sent.
+While billing is on and botd has an SMTP server ([ADR 0061](adr/0061-approval-notifications.md)), the person a plan is for gets plain-text emails ([ADR 0091](adr/0091-billing-emails.md)). `BILLING_EMAILS=off` stops them; without billing or SMTP nothing is queued or sent.
 
 - **Plan and payment** (always sent): Stripe started, changed, set to end, or ended their plan (with what their computer is doing about it); a payment failed (update the card with **Manage billing**); a Stripe plan change's resize waits on their files or failed.
 - **Usage** (on by default, off from the Plan screen or `PUT /api/me/emails`): tokens at 80% and 100% of `monthlyTokens`, storage at ADR 0082's warning and full. Once per billing period and tier.
@@ -370,7 +370,7 @@ All JSON. Auth: a session cookie (sign-in page and console) or `Authorization: B
 - `GET /api/harnesses/:name/models`: models and reasoning efforts the harness offers (Claude Code: aliases; Codex: `codex debug models`; Pi: `pi --list-models`; Hermes Agent: one entry with an empty `id`, meaning any model name, with its efforts). 403 for non-admins on a managed tier; `?tier=<name>` (admins): only that tier's models
 - `GET /api/me/tier` → `{name, label, managed, limits: {maxBots, monthlyRuns, monthlyTokens}, usage: {period, runs, bots, tokens, periodStart, periodEnd, periodSource}}`: your plan, no model names. People only ([ADR 0033](adr/0033-tiers-model-routing.md))
 - `GET /api/me/usage` → `{user, tier, period: {key, start, end, source}, tokens: {input, output, cacheRead, cacheWrite, total, runs, unreportedRuns, limit}, runs: {used, limit}, byBot: [...], byModel?: [...]}`: your own usage this billing period. People only; `byModel` only for admins or on a tier that lets you pick models. `GET /api/users/{key}/usage`: the same for anyone, admins only ([ADR 0050](adr/0050-billing-period-token-usage.md))
-- `GET /api/me/emails` → `{on, usage, canChange}`: whether this server sends billing emails, and whether you get the usage ones. `PUT` `{usage}` (write access; audited as `billing.email_settings_updated`). People only ([ADR 0090](adr/0090-billing-emails.md))
+- `GET /api/me/emails` → `{on, usage, canChange}`: whether this server sends billing emails, and whether you get the usage ones. `PUT` `{usage}` (write access; audited as `billing.email_settings_updated`). People only ([ADR 0091](adr/0091-billing-emails.md))
 - `GET /api/tiers` → `{default, source, tiers: [{name, label, managed, limits, defaultHarness, routes: "any" | [{harness, provider?, model, effort?}]}]}`: admins only
 - `GET /api/setup` → `{progress: {step, dismissed, completedAt, completedBy, show}, steps, domain, signIn, tiers, approvals, checklist: [{id, label, done, detail}], done, total}`: the onboarding wizard's report, with commands and `.env` lines for what botd reads at startup; never secret values or models. `PATCH /api/setup` `{step?: domain|signin|tiers|finish, dismissed?, completed?}`; finishing, reopening, hiding, and showing again are audited as `setup.*`. Admins only ([ADR 0034](adr/0034-onboarding-wizard.md))
 - `GET|POST /api/bots/:id/messages` `{text, answer?: {messageId, option}}`

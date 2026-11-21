@@ -1,4 +1,4 @@
-//! Billing emails (ADR 0089): plain-text emails to the person a plan is for when Stripe
+//! Billing emails (ADR 0091): plain-text emails to the person a plan is for when Stripe
 //! changes it, a payment fails, a plan is set to end or ends, a plan change leaves
 //! their computer waiting on them or failing to resize, and, unless they turn these
 //! off, when they near or reach their plan's model tokens or storage.

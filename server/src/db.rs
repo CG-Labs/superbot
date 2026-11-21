@@ -288,7 +288,7 @@ pub enum Applied {
 }
 
 /// What an event applied by `Db::apply_subscription` changed, for the billing emails it
-/// queues in the same transaction (ADR 0090).
+/// queues in the same transaction (ADR 0091).
 pub struct Change<'a> {
     pub applied: &'a Applied,
     /// This subscription as it was before the event. None: botd hadn't seen it.
@@ -1380,7 +1380,7 @@ fn migrate_status_incidents(c: &Connection, _fresh: bool) -> rusqlite::Result<()
     )
 }
 
-/// Billing emails (ADR 0090): one row per email, its `key` unique so a Stripe event,
+/// Billing emails (ADR 0091): one row per email, its `key` unique so a Stripe event,
 /// a billing period's limit or a resize asks for it once, kept after it's sent so a
 /// redelivery finds it. `email_prefs` holds each person's choice for usage emails.
 fn migrate_billing_emails(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
@@ -3712,7 +3712,7 @@ impl Db {
     /// (`CustomerOfAnotherUser`); a user with no customer yet is linked to it, and the
     /// second value says how.
     ///
-    /// `mail` gives the billing emails the event asks for (ADR 0090), queued in the same
+    /// `mail` gives the billing emails the event asks for (ADR 0091), queued in the same
     /// transaction, so an event is recorded exactly when its emails are: a redelivery
     /// (`Duplicate`) neither loses nor repeats them.
     pub fn apply_subscription(
@@ -3807,7 +3807,7 @@ impl Db {
         Ok((outcome, linked, queued))
     }
 
-    /// Queues a billing email (ADR 0090) unless one with its key was queued before.
+    /// Queues a billing email (ADR 0091) unless one with its key was queued before.
     /// True when this queued it.
     pub fn queue_billing_email(&self, e: &crate::billing_mail::NewEmail) -> bool {
         queue_email(&self.c(), e, now()).unwrap_or_else(|err| {
@@ -3867,7 +3867,7 @@ impl Db {
         self.c().execute("UPDATE billing_emails SET next_at = 0 WHERE state = 'pending'", []).unwrap();
     }
 
-    /// Whether the person wants usage emails (ADR 0090). On unless they turned them off.
+    /// Whether the person wants usage emails (ADR 0091). On unless they turned them off.
     pub fn usage_emails(&self, user_id: &str) -> bool {
         self.c().query_row("SELECT usage_emails FROM email_prefs WHERE user_id = ?", [user_id], |r| r.get(0)).optional().ok().flatten().unwrap_or(true)
     }
