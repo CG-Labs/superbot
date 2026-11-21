@@ -126,9 +126,9 @@ pub fn text(s: &str) -> Cow<'_, str> {
     Cow::Owned(strip_issued(&out))
 }
 
-/// Session tokens, sign-in codes, SSO handoff codes, and SCIM tokens botd issues. Only their hashes are kept, so they
+/// Session tokens, sign-in codes, SSO handoff codes, SCIM tokens, and second-factor challenges botd issues. Only their hashes are kept, so they
 /// can't be registered; they're recognized by shape: a prefix and 64 hex digits.
-const ISSUED: [&str; 4] = [crate::users::SESSION_PREFIX, crate::users::CODE_PREFIX, crate::sso::HANDOFF_PREFIX, crate::scim::TOKEN_PREFIX];
+const ISSUED: [&str; 5] = [crate::users::SESSION_PREFIX, crate::users::CODE_PREFIX, crate::sso::HANDOFF_PREFIX, crate::scim::TOKEN_PREFIX, crate::mfa::CHALLENGE_PREFIX];
 const ISSUED_HEX: usize = 64;
 
 /// Where the first issued token in `s` starts, and its length.

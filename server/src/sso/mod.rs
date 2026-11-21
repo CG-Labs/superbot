@@ -692,7 +692,7 @@ async fn finish(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, q: &Ha
     match ret {
         Return::Cookie { .. } => {
             let label = pending.label.as_deref().or(Some("Web"));
-            let (s, token) = users::start_session(a, &user, "sso", Some((id, &claims.key())), true, label, source);
+            let (s, token) = users::start_session(a, &user, "sso", Some((id, &claims.key())), None, true, label, source);
             signed_in(a, &user, &s, id, &claims, source);
             let mut res = Html(signed_in_page(user.role)).into_response();
             res.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&users::session_cookie(&token, a.sessions.max_ms)).unwrap());
@@ -774,7 +774,7 @@ pub fn redeem(a: &Auth, source: Source, code: &str, verifier: &str, cookie: bool
         return ApiError(StatusCode::UNAUTHORIZED, "That sign-in expired or was already used. Try again.".into()).into_response();
     };
     let label = label.or(h.label.as_deref());
-    let (s, token) = users::start_session(a, &user, "sso", Some((&h.provider, &h.claims.key())), cookie, label, &source);
+    let (s, token) = users::start_session(a, &user, "sso", Some((&h.provider, &h.claims.key())), None, cookie, label, &source);
     drop(handoffs);
     signed_in(a, &user, &s, &h.provider, &h.claims, &source);
     users::session_response(a, &user, &s, &token)
