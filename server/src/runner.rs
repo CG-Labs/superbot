@@ -931,7 +931,7 @@ impl App {
                 None => {
                     adapters::run(adapter, input, abort_rx.clone(), emit).await;
                     match teammate {
-                        Some(_) => self.keep_teammate_memory(&bot, &spot.memory),
+                        Some(_) => self.keep_teammate_memory(&bot, &spot.memory, &by),
                         None => self.keep_memory(&bot),
                     }
                 }
@@ -1430,19 +1430,42 @@ impl App {
 
     /// What a teammate's run left in its memory copy goes back to botd's, if the Bot is
     /// still its owner's. The owner's own copy is then dropped, so their next run starts
-    /// from it, and the teammate's copy goes.
-    fn keep_teammate_memory(&self, bot: &Bot, copy: &Path) {
-        let still = self.db.bot(&bot.id).is_some_and(|now| now.owner_id == bot.owner_id);
-        if still
-            && let (Some(text), Some(to)) = (accounts::read_plain(copy, accounts::MAX_FILE), self.data_memory_file(&bot.id))
-            && std::fs::read_to_string(&to).ok().as_deref() != Some(text.as_str())
-        {
-            let _ = std::fs::write(&to, text);
-            if let Some(own) = self.isolation().and_then(|i| i.memory_file(&bot.owner_id, &bot.id)) {
-                accounts::remove(&own);
+    /// from it, and the teammate's copy goes. A copy that couldn't be saved is set aside
+    /// as `<bot id>.md.unsaved` (the next run's copy replaces the other), never deleted.
+    fn keep_teammate_memory(&self, bot: &Bot, copy: &Path, by: &Who) {
+        if self.db.bot(&bot.id).is_none_or(|now| now.owner_id != bot.owner_id) {
+            accounts::remove(copy);
+            return;
+        }
+        match self.save_teammate_memory(bot, copy) {
+            Ok(()) => accounts::remove(copy),
+            Err(why) => {
+                let aside = copy.with_extension("md.unsaved");
+                let kept = copy.parent().is_some_and(accounts::trusted_dir) && std::fs::rename(copy, &aside).is_ok();
+                eprintln!("WARNING: couldn't save a teammate's run's memory for a Bot ({why}); see bot.memory_unsaved in the audit log.");
+                let details = json!({ "reason": why, "owner": bot.owner_id, "keptAt": kept.then(|| aside.display().to_string()) });
+                self.db.record(&by.event("bot.memory_unsaved").bot(&bot.id).outcome(Outcome::Failure).details(details));
             }
         }
-        accounts::remove(copy);
+    }
+
+    fn save_teammate_memory(&self, bot: &Bot, copy: &Path) -> Result<(), String> {
+        let Some(text) = accounts::read_plain(copy, accounts::MAX_FILE) else {
+            // Gone, a link or not a file: nothing of the Bot's memory to keep.
+            return match std::fs::symlink_metadata(copy) {
+                Ok(m) if m.is_file() => Err(format!("its memory file is over {} bytes or unreadable", accounts::MAX_FILE)),
+                _ => Ok(()),
+            };
+        };
+        let to = self.data_memory_file(&bot.id).ok_or("the Bot has no memory file")?;
+        if std::fs::read_to_string(&to).ok().as_deref() == Some(text.as_str()) {
+            return Ok(());
+        }
+        std::fs::write(&to, text).map_err(|e| format!("writing the Bot's memory: {e}"))?;
+        if let Some(own) = self.isolation().and_then(|i| i.memory_file(&bot.owner_id, &bot.id)) {
+            accounts::remove(&own);
+        }
+        Ok(())
     }
 
     /// The tier this run is on and the route it takes: the Bot owner's tier picks the
@@ -2155,6 +2178,51 @@ mod tests {
         app.init_bot_files(&b);
         assert!(std::fs::read_to_string(app.memory_file(&b).unwrap()).unwrap().contains("Learned a thing."));
         assert_eq!(app.memory_file(&b).unwrap().parent().unwrap(), root.join(&bea.id).join("memory"));
+    }
+
+    #[test]
+    fn a_teammates_memory_copy_is_saved_or_set_aside_never_lost() {
+        use crate::acl::Visibility;
+        use crate::rbac::Role;
+        let (app, root) = isolated_app("/bin/false");
+        let ada = app.db.create_user(None, Some("ada@example.com"), "Ada", Role::Member).unwrap();
+        let bea = app.db.create_user(None, Some("bea@example.com"), "Bea", Role::Member).unwrap();
+        let a = app.db.create_bot_owned("A1", "#fff", "waddle", "claude", None, false, &ada.id, Visibility::Shared);
+        let iso = app.isolation().unwrap();
+        let space = Space::Teammate { owner: &ada.id, teammate: &bea.id };
+        for d in [iso.memory_dir_in(space).unwrap(), root.join(&ada.id).join("memory")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        app.init_bot_files(&a);
+        let (copy, kept, own) = (iso.memory_file_in(space, &a.id).unwrap(), app.data_memory_file(&a.id).unwrap(), app.memory_file(&a).unwrap());
+        let by = Who { actor: Actor { kind: ActorKind::User, id: Some(bea.id.clone()), ..Default::default() }, source: Default::default() };
+        let read = |p: &Path| std::fs::read_to_string(p).unwrap();
+
+        // Saved: back to botd's, and the owner's copy goes so their next run starts from it.
+        app.seed_teammate_memory(&a, &copy);
+        std::fs::write(&copy, "# A1\n- learned for Bea\n").unwrap();
+        app.keep_teammate_memory(&a, &copy, &by);
+        assert_eq!(read(&kept), "# A1\n- learned for Bea\n");
+        assert!(!copy.exists() && !own.exists());
+
+        // Too big to save: set aside and audited, botd's left as it was.
+        app.seed_teammate_memory(&a, &copy);
+        std::fs::write(&copy, "x".repeat(accounts::MAX_FILE as usize + 1)).unwrap();
+        app.keep_teammate_memory(&a, &copy, &by);
+        assert_eq!(read(&kept), "# A1\n- learned for Bea\n");
+        let aside = copy.with_extension("md.unsaved");
+        assert_eq!(read(&aside).len(), accounts::MAX_FILE as usize + 1);
+        assert!(!copy.exists());
+        let ev = actions(&app, "bot.memory_unsaved");
+        assert_eq!(ev.len(), 1);
+
+        // A link in its place is nothing to keep: removed, never followed.
+        std::fs::write(root.join("secret.txt"), "not yours").unwrap();
+        std::os::unix::fs::symlink(root.join("secret.txt"), &copy).unwrap();
+        app.keep_teammate_memory(&a, &copy, &by);
+        assert!(std::fs::symlink_metadata(&copy).is_err());
+        assert_eq!(read(&kept), "# A1\n- learned for Bea\n");
+        assert_eq!(actions(&app, "bot.memory_unsaved").len(), 1);
     }
 
     #[test]

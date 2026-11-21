@@ -48,7 +48,7 @@ The apps already have ADR 0062's teammate login panel and `/api/machine/teammate
 
 ### Memory
 
-The Bot's memory is the Bot's (ADR 0046), and its original stays in `DATA_DIR`. A teammate's run gets a fresh copy in the pair's `memory` folder. After the run, what it wrote goes back to `DATA_DIR` if the Bot still has the same owner. Ada's own copy is then dropped, so her next run starts from the new memory. The pair's copy is removed. Ada's `USER.md` is never in the pair's folder.
+The Bot's memory is the Bot's (ADR 0046), and its original stays in `DATA_DIR`. A teammate's run gets a fresh copy in the pair's `memory` folder. After the run, what it wrote goes back to `DATA_DIR` if the Bot still has the same owner. Ada's own copy is then dropped, so her next run starts from the new memory. The pair's copy is removed. A copy that can't be saved (over the size limit, or the write fails) is never deleted: it is set aside as `<bot id>.md.unsaved` in the pair's `memory` folder and audited as `bot.memory_unsaved`, for an admin to recover. Ada's `USER.md` is never in the pair's folder.
 
 ### Audit
 
