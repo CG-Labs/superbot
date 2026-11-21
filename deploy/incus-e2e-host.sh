@@ -90,7 +90,7 @@ if command -v iptables >/dev/null 2>&1 && iptables -n -L DOCKER-USER >/dev/null 
 fi
 
 mkdir -p "$out"
-if ! incus config trust list --format csv | grep -q '^client,superbot-botd,'; then
+if [[ $(incus config trust list --format csv) != *client,superbot-botd,* ]]; then
   say "botd's client certificate, trusted"
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:secp384r1 -sha384 -nodes -days 30 \
     -subj "/CN=superbot-botd" -keyout "$out/botd-incus.key" -out "$out/botd-incus.crt" 2>/dev/null
