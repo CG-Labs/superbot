@@ -165,6 +165,8 @@ ws=$TEST_DIR/users/t1-t2/workspace
 sudo -u "$pair" sh -c "cd '$ws' && echo notes >notes.txt && : >tool && chmod 4755 tool && : >/tmp/sb-left-\$(id -u)"
 # And a run's memory copy it never got to save, beside the teammate's USER.md.
 sudo -u "$pair" sh -c "echo remembered >'$TEST_DIR/users/t1-t2/memory/b1.md' && echo me >'$TEST_DIR/users/t1-t2/memory/USER.md'"
+# A file of the same name already set aside is kept beside it, not in its place.
+sudo -u "$pair" sh -c "mkdir -p '$ws/unsaved-memory' && echo earlier >'$ws/unsaved-memory/b1.md'"
 [[ -e "/tmp/sb-left-$pair_uid" ]] || die "no temp file of $pair"
 sudo -u "$pair" setsid sh -c 'trap "" TERM; while :; do sleep 0.2; done' </dev/null >/dev/null 2>&1 &
 sleep 0.5
@@ -185,7 +187,8 @@ kill -0 "$owner_pid" 2>/dev/null || die "remove stopped someone else's process"
 [[ ! -e "/tmp/sb-left-$pair_uid" ]] || die "$pair's temp file is still there"
 [[ "$(stat -c '%U' "$to/notes.txt")" == sb-u-t1 && "$(cat "$to/notes.txt")" == notes ]] || die "the work isn't sb-u-t1's"
 [[ "$(stat -c '%a' "$to/tool")" == 755 ]] || die "a set-id bit was handed over"
-[[ "$(cat "$to/unsaved-memory/b1.md")" == remembered ]] || die "the unsaved memory copy was lost"
+[[ "$(cat "$to/unsaved-memory/b1-2.md")" == remembered ]] || die "the unsaved memory copy was lost"
+[[ "$(cat "$to/unsaved-memory/b1.md")" == earlier ]] || die "a memory copy already set aside was replaced"
 [[ ! -e "$to/unsaved-memory/USER.md" ]] || die "the teammate's USER.md was handed to the owner"
 for u in sb-u-t1 sb-u-t2; do getent passwd "$u" >/dev/null || die "remove took $u"; done
 [[ -d "$TEST_DIR/users/t1/home" && -d "$TEST_DIR/users/t2/home" ]] || die "remove took a user's own folder"

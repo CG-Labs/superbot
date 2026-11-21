@@ -221,11 +221,21 @@ valid_cleanup_id() {
 # their USER.md), a hard link to anyone else's file goes (the file stays theirs), a file of
 # theirs with other links gets a copy of its own, and no set-id bit is left.
 prepare_work() {
-  local root=$1 ws=$2 uid=$3 f tmp
+  local root=$1 ws=$2 uid=$3 f tmp base stem dest n
   for f in "$root"/memory/*.md.unsaved "$root"/memory/*.md; do
     [[ -f "$f" && ! -L "$f" && "${f##*/}" != USER.md ]] || continue
     [[ -d "$ws/unsaved-memory" && ! -L "$ws/unsaved-memory" ]] || { rm -f -- "$ws/unsaved-memory"; mkdir -- "$ws/unsaved-memory"; }
-    mv -n -- "$f" "$ws/unsaved-memory/"
+    # Never over a file already there (the teammate's own, or one an earlier try moved):
+    # the folder this comes from is deleted next.
+    base=${f##*/} stem=${f##*/}
+    stem=${stem%%.md*}
+    dest="$ws/unsaved-memory/$base" n=1
+    while [[ -e "$dest" || -L "$dest" ]]; do
+      n=$((n + 1))
+      dest="$ws/unsaved-memory/$stem-$n${base#"$stem"}"
+    done
+    mv -n -- "$f" "$dest"
+    [[ ! -e "$f" ]] || die "couldn't set aside $f"
   done
   find "$ws" -xdev ! -type d ! -uid "$uid" -links +1 -delete
   while IFS= read -r -d '' f; do
