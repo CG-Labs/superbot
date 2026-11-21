@@ -15,17 +15,18 @@ For buyers, security reviewers and procurement. It describes SuperBot as the cod
 | [Security questionnaire FAQ](questionnaire-faq.md) | Short answers to common questionnaire questions. |
 | [Machine recovery objectives](machine-recovery-objectives.md) | Backup schedule, RPO and RTO per plan for managed machines, as text for an SLA or DPA. |
 | [SOC 2 control mapping](soc2-control-mapping.md) | Each SOC 2 Security, Availability and Confidentiality criterion: what the product does, what the operator or customer must do, and the gaps. A self-assessment, not a certification. |
+| [SOC 2 readiness checklist](soc2-readiness-checklist.md) | Every gap in the mapping as a checklist item: owner, evidence to collect, product or process, and whether it is done, partial or a gap; what to do before engaging an auditor; Type I and Type II. A readiness path, not a certification. |
 
 Earlier reviews: [auth review, November 2026](auth-review-2026-11.md) and its [SCIM follow-up](auth-review-2026-11-scim.md).
 
 ## Keeping it accurate
 
 - Every statement here must match the code on `main`. When a change makes one wrong, the same PR fixes the page.
-- Links in this folder are checked by `cargo test` (`server/tests/security_docs_links.rs`), on every change to `docs/` or the code: each relative link must point at a file that exists, and each `#anchor` into a Markdown file at a heading that exists.
+- Links in this folder are checked by `cargo test` (`server/tests/security_docs_links.rs`), on every change to `docs/`, the workflows or the code: each relative link must point at a file that exists, each `#anchor` into a Markdown file at a heading that exists, each `ADR NNNN` at an ADR that exists, and each repository path in inline code at a file that exists. The readiness checklist's rows and summary are checked too.
 - Numbers (session lifetimes, backup schedules, limits) are SuperBot's defaults. An operator who changes them must restate them in their own copy.
 
 ## Not in this pack yet (Planned)
 
-- A SOC 2 readiness checklist (M4), built from the gaps in the [control mapping](soc2-control-mapping.md#gaps-for-the-soc-2-readiness-checklist-m4), and SOC 2 Type II (M5) ([roadmap](../ROADMAP.md)). SuperBot is not SOC 2 certified.
+- SOC 2 Type II (M5) ([roadmap](../ROADMAP.md)). The [readiness checklist](soc2-readiness-checklist.md) is the path to it. SuperBot is not SOC 2 certified.
 - An external penetration test before M3 general availability ([roadmap risks](../ROADMAP.md)).
 - A privacy policy, a DPA, a published subprocessor list and erasure for managed users (M4, GDPR row of the [roadmap](../ROADMAP.md)).
