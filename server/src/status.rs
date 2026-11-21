@@ -231,11 +231,9 @@ pub fn checks(app: &App, now_ms: i64) -> Vec<(&'static str, Health)> {
     out
 }
 
-/// A channel that sends: email with SMTP set up and turned on, the global webhook, or push.
+/// A channel that sends: push, or email or a webhook for the server or any Bot.
 fn notifications_on(app: &App) -> bool {
-    let Some(n) = app.notifier.get() else { return false };
-    let s = crate::notify::load(&app.db);
-    (n.smtp.is_some() && s.email.enabled) || s.webhook.enabled || n.push.is_some()
+    app.notifier.get().is_some_and(|n| n.any_channel(&app.db, &crate::notify::load(&app.db)))
 }
 
 fn name_of(id: &str) -> &'static str {

@@ -106,18 +106,27 @@ async fn machines_and_notifications_show_when_this_server_uses_them() {
     assert!(component(&s, "machines").is_some_and(|c| c["status"] == "operational" && c["name"] == "Machines and control plane"), "{s}");
     assert!(component(&s, "notifications").is_none(), "a notifier with no channel on isn't shown: {s}");
 
-    let mut on = notify::load(&app.db);
-    on.webhook.enabled = true;
-    notify::save(&app.db, &on);
+    let bot = app.db.create_bot("Hooked", "#fff", "waddle", "claude", None, false);
+    let own = notify::webhook::bot_secret(&bot.id);
+    secrets::global().put(&own, "https://hooks.example.com/own").unwrap();
     app.status.invalidate();
     let s = public(port).await;
-    assert!(component(&s, "notifications").is_some_and(|c| c["status"] == "operational"), "{s}");
+    assert!(component(&s, "notifications").is_some_and(|c| c["status"] == "operational"), "a Bot's own webhook counts: {s}");
+
+    let mut off = notify::load(&app.db);
+    off.bots.insert(bot.id.clone(), notify::BotSettings { webhook: Some(false), ..Default::default() });
+    notify::save(&app.db, &off);
+    app.status.invalidate();
+    assert!(component(&public(port).await, "notifications").is_none(), "turned off for that Bot");
+    notify::save(&app.db, &notify::Settings::default());
+    app.status.invalidate();
 
     for _ in 0..5 {
         app.db.metrics().audited("notification.failed", "failure", None);
     }
     app.status.invalidate();
     assert_eq!(component(&public(port).await, "notifications").unwrap()["status"], "partial_outage");
+    secrets::global().delete(&own).unwrap();
 }
 
 #[tokio::test]

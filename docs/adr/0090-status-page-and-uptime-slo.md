@@ -37,7 +37,7 @@ The page has to be public, so it must be safe to expose: no tenant data, no coun
 | Database | always | `SELECT 1` through the same connection lock as every query: an error is a major outage, slower than 500 ms degraded |
 | Machines and control plane | control plane on | hosts not answering (some: partial outage; all: major outage), the reconciler more than 3 intervals and a minute behind, 10% or more of live machines in error, or open RPO breaches (degraded) |
 | Harness runners | always | the failed share (error or timeout) of the last 15 minutes of finished runs (from 4): 25% degraded, 50% partial outage |
-| Notifications | a channel on: email with SMTP set up, the global webhook, or push | the last 15 minutes of `notification.failed` against `notification.sent`: 5 failures and no successes is a partial outage; at least 2 failures and half or more failing, degraded |
+| Notifications | a channel on: push, or email (with SMTP set up) or a webhook for the server or any Bot | the last 15 minutes of `notification.failed` against `notification.sent`: 5 failures and no successes is a partial outage; at least 2 failures and half or more failing, degraded |
 
 "The last minutes" come from a small per-minute window (15 minutes) kept beside ADR 0089's counters and fed by the same calls (except requests to `/healthz` and the status pages, so probes can't dilute the API's error share), so the page reacts to now rather than to totals since the last restart. Stopped, interrupted and policy-ended runs aren't failures. The thresholds are constants in `server/src/status.rs`, tested one by one.
 

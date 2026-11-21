@@ -652,6 +652,20 @@ impl Notifier {
         format!("{email}; {hook}; {push}{links}")
     }
 
+    /// Whether anything can be sent at all: push, or email or a webhook for the server or
+    /// for any Bot, by the same rules as `plan`.
+    pub fn any_channel(&self, db: &Db, s: &Settings) -> bool {
+        let global_hook = secret_set(webhook::URL);
+        if self.push.is_some() || (self.smtp.is_some() && s.email.enabled) || (global_hook && s.webhook.enabled) {
+            return true;
+        }
+        db.bots().iter().any(|b| {
+            let o = s.bots.get(&b.id).cloned().unwrap_or_default();
+            let own = secret_set(&webhook::bot_secret(&b.id));
+            (self.smtp.is_some() && o.email == Some(true)) || ((own || global_hook) && o.webhook.unwrap_or(own))
+        })
+    }
+
     /// Where a notice for `bot` goes now. No Bot: the global settings alone.
     pub fn plan(&self, db: &Db, bot: Option<&Bot>, s: &Settings) -> Plan {
         let o = bot.and_then(|b| s.bots.get(&b.id)).cloned().unwrap_or_default();
