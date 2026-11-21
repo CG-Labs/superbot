@@ -271,7 +271,7 @@ async fn send(app: &App, cp: &ControlPlane, p: &dyn MachineProvider, e: &Enrollm
 /// One step of `machine_id`'s rebuild, if one is underway. Caller holds `ops`.
 pub(super) async fn step(app: &App, cp: &ControlPlane, e: &Enrollment, machine_id: &str) {
     let Some(p) = cp.provider.as_deref() else { return };
-    let Some(m) = app.db.machine(machine_id) else { return };
+    let Some(m) = app.db.machine(machine_id).filter(|m| cp.owns(m)) else { return };
     let Some(st) = m.rebuild_state.clone().filter(|_| underway(&m)) else { return };
     let at = now();
     match m.state {
@@ -352,6 +352,16 @@ pub(super) async fn step(app: &App, cp: &ControlPlane, e: &Enrollment, machine_i
                 }
                 return;
             }
+            // A provider whose rebuild outlasted its answer leaves it stopped; start it
+            // here, under the lock, only while it's still meant to be running.
+            if let Some(pid) = &m.provider_id
+                && let Ok(pm) = p.get(pid).await
+                && matches!(pm.status.as_str(), "stopped" | "offline")
+                && let Err(err) = p.boot(pid).await
+                && !transient(&err)
+            {
+                eprintln!("Machine rebuild: starting {} after its rebuild: {err}", m.id);
+            }
             if at > deadline {
                 let why = format!("It didn't enroll again within {} minutes of the rebuild.", (deadline - sent) / 60_000);
                 app.db.revoke_machine_tokens(&m.id);
@@ -423,6 +433,7 @@ pub async fn follow_up(app: &AppState, cp: &ControlPlane, e: &Enrollment, machin
             }
         }
         None if e.upkeep.rebuilds == Rebuilds::Auto
+            && cp.owns(&m)
             && legacy(hb)
             && hb.jobs == 0
             && m.upgrade_hold_at.is_none()
@@ -516,6 +527,7 @@ pub async fn request(
     let m = need_machine(&app, &key)?;
     let _g = cp.ops.lock().await;
     let m = app.db.machine(&m.id).ok_or_else(|| crate::not_found("Machine"))?;
+    cp.need_own(&m)?;
     if underway(&m) {
         return Err(conflict(format!("A rebuild is {} already.", m.rebuild_state.as_deref().unwrap_or_default())));
     }

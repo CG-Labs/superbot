@@ -120,6 +120,14 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
              --idp <entra|google|oidc|github|apple|saml> --idp-provider <id> --subject <issuer|sub>
              --session <id> --on-behalf-of <user id|email> --outcome <success|failure|denied> --bot <id>
     times: YYYY-MM-DD (UTC), RFC 3339, or unix milliseconds
+  botctl machine list [<state>]                    Every user's machine (pending, running, suspended, error, ... or all)
+  botctl machine show <user>                       The user's machine: provider, plan, state, address, enrollment
+  botctl machine request <user> [<tier>] [<region>]  Give the user a machine (a Linode VM or an Incus container)
+  botctl machine suspend|resume <user>             Power it off (disk and address kept), or back on
+  botctl machine resize <user> <tier>              Move it to the tier's plan
+  botctl machine destroy <user> --yes              Delete it and its disk at the provider
+  botctl machine substrate [check]                 What machines are made on, each tier's size, and isolation; check asks the host
+  botctl machine reconcile                         Follow every machine to where it should be now
   botctl machine placement [<user>]                Where each user's Bots run: this server or their machine
   botctl machine assign <user>                     Run the user's Bots on their enrolled machine
   botctl machine unassign <user>                   Stop using it; with MACHINE_ROUTING=assigned they run here again
@@ -623,6 +631,40 @@ fn machine_request(args: &[&str]) -> Result<(&'static str, String), String> {
     })
 }
 
+type Request = (&'static str, String, Option<String>);
+
+/// `botctl machine list|show|request|suspend|resume|resize|destroy|substrate|reconcile`:
+/// the machine itself (ADR 0025, ADR 0065). None: not one of these.
+fn lifecycle_request(args: &[&str]) -> Option<Result<Request, String>> {
+    let at = |user: &str, rest: &str| format!("/api/users/{}/machine{rest}", encode(user));
+    Some(Ok(match args {
+        ["list"] => ("GET", "/api/machines".into(), None),
+        ["list", state] => ("GET", format!("/api/machines?state={}", encode(state)), None),
+        ["show", user] => ("GET", at(user, ""), None),
+        ["request", user, rest @ ..] if rest.len() <= 2 => {
+            let mut b = json!({});
+            if let Some(tier) = rest.first() {
+                b["tier"] = json!(tier);
+            }
+            if let Some(region) = rest.get(1) {
+                b["region"] = json!(region);
+            }
+            ("POST", at(user, ""), Some(b.to_string()))
+        }
+        ["suspend", user] => ("POST", at(user, "/suspend"), None),
+        ["resume", user] => ("POST", at(user, "/resume"), None),
+        ["resize", user, tier] => ("POST", at(user, "/resize"), Some(json!({ "tier": tier }).to_string())),
+        ["destroy", user, "--yes"] => ("DELETE", at(user, ""), None),
+        ["substrate"] => ("GET", "/api/machines/substrate".into(), None),
+        ["substrate", "check"] => ("GET", "/api/machines/substrate?check=true".into(), None),
+        ["reconcile"] => ("POST", "/api/machines/reconcile".into(), None),
+        ["list" | "show" | "request" | "suspend" | "resume" | "resize" | "destroy" | "substrate" | "reconcile", ..] => {
+            return Some(Err("Usage: botctl machine list [<state>] | show <user> | request <user> [<tier>] [<region>] | suspend <user> | resume <user> | resize <user> <tier> | destroy <user> --yes | substrate [check] | reconcile".into()));
+        }
+        _ => return None,
+    }))
+}
+
 /// `botctl machine rebuild ...` (ADR 0056): the request to send.
 fn rebuild_request(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
     let at = |user: &str| format!("/api/users/{}/machine/rebuild", encode(user));
@@ -937,6 +979,10 @@ fn run(args: &[String]) -> Result<String, String> {
             let (method, path, body) = rebuild_request(rest)?;
             op(method, &path, body)
         }
+        ["machine", rest @ ..] if lifecycle_request(rest).is_some() => {
+            let (method, path, body) = lifecycle_request(rest).unwrap()?;
+            op(method, &path, body)
+        }
         ["machine", rest @ ..] => {
             let (method, path) = machine_request(rest)?;
             let res = op(method, &path, None)?;
@@ -1132,6 +1178,28 @@ mod tests {
         for bad in [&["--owner"][..], &["--owner", "--"], &["--owner", ""], &["ada", "--owner"]] {
             assert!(login_extra(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn machine_lifecycle_commands() {
+        let r = |a: &[&str]| lifecycle_request(a).unwrap().unwrap();
+        assert_eq!(r(&["list"]), ("GET", "/api/machines".into(), None));
+        assert_eq!(r(&["list", "running"]), ("GET", "/api/machines?state=running".into(), None));
+        assert_eq!(r(&["show", "a@example.com"]), ("GET", "/api/users/a%40example.com/machine".into(), None));
+        assert_eq!(r(&["request", "u1"]), ("POST", "/api/users/u1/machine".into(), Some("{}".into())));
+        let (_, _, body) = r(&["request", "u1", "pro", "node2"]);
+        assert_eq!(serde_json::from_str::<Value>(&body.unwrap()).unwrap(), json!({ "tier": "pro", "region": "node2" }));
+        assert_eq!(r(&["suspend", "u1"]), ("POST", "/api/users/u1/machine/suspend".into(), None));
+        assert_eq!(r(&["resume", "u1"]), ("POST", "/api/users/u1/machine/resume".into(), None));
+        assert_eq!(r(&["resize", "u1", "max"]), ("POST", "/api/users/u1/machine/resize".into(), Some(r#"{"tier":"max"}"#.into())));
+        assert_eq!(r(&["destroy", "u1", "--yes"]), ("DELETE", "/api/users/u1/machine".into(), None));
+        assert_eq!(r(&["substrate"]), ("GET", "/api/machines/substrate".into(), None));
+        assert_eq!(r(&["substrate", "check"]), ("GET", "/api/machines/substrate?check=true".into(), None));
+        assert_eq!(r(&["reconcile"]), ("POST", "/api/machines/reconcile".into(), None));
+        for bad in [&["destroy", "u1"][..], &["resize", "u1"], &["request", "u1", "pro", "node2", "x"], &["substrate", "now"], &["show"]] {
+            assert!(lifecycle_request(bad).unwrap().is_err(), "{bad:?}");
+        }
+        assert!(lifecycle_request(&["placement"]).is_none(), "the rest are machine_request's");
     }
 
     #[test]

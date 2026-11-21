@@ -247,6 +247,7 @@ fn machine(v: &Value) -> Result<ProviderMachine, ProviderError> {
                     .collect()
             })
             .unwrap_or_default(),
+        user_data: false,
     })
 }
 

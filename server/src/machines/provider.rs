@@ -1,6 +1,7 @@
-//! The seam between the control plane and whoever rents out the machines. Linode
-//! today (ADR 0025); anything that can create, size, stop, start, back up, and delete
-//! a VM by a unique label fits behind it.
+//! The seam between the control plane and whoever rents out the machines: Linode VMs
+//! (ADR 0025) or system containers on an Incus host (ADR 0065). Anything that can
+//! create, size, stop, start, back up, and delete a machine by a unique label fits
+//! behind it.
 
 use std::fmt;
 use std::future::Future;
@@ -102,6 +103,10 @@ pub struct ProviderMachine {
     pub ipv4: Option<String>,
     pub backups: bool,
     pub tags: Vec<String>,
+    /// Its cloud-init user data (with the enrollment token) is still in its config at
+    /// the provider, and `clear_user_data` removes it (ADR 0067). False where the
+    /// provider can't: Linode keeps it in its metadata service (ADR 0035).
+    pub user_data: bool,
 }
 
 impl ProviderMachine {
@@ -143,6 +148,35 @@ impl fmt::Display for ProviderError {
 pub trait MachineProvider: Send + Sync {
     /// Stored with each machine, e.g. `linode`.
     fn name(&self) -> &'static str;
+    /// What a machine is: `vm` (its own kernel) or `container` (shares the host's).
+    fn substrate(&self) -> &'static str {
+        "vm"
+    }
+    /// MACHINE_TIERS when it isn't set.
+    fn default_tiers(&self) -> &'static str {
+        super::DEFAULT_TIERS
+    }
+    /// MACHINE_IMAGE when it isn't set.
+    fn default_image(&self) -> &'static str {
+        super::DEFAULT_IMAGE
+    }
+    /// Whether `plan` means something to this provider, checked at startup.
+    fn check_plan(&self, _plan: &str) -> Result<(), String> {
+        Ok(())
+    }
+    /// What `plan` gives a machine, for admins, if the provider knows.
+    fn plan_view(&self, _plan: &str) -> Option<serde_json::Value> {
+        None
+    }
+    /// The provider's own settings for admins. Never a credential.
+    fn settings(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+    /// Asks the provider whether it is set up as the control plane needs: a list of
+    /// `{check, ok, detail}`.
+    fn preflight<'a>(&'a self) -> Fut<'a, Vec<serde_json::Value>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
     /// Creates and boots a machine.
     fn create<'a>(&'a self, spec: &'a CreateSpec) -> Fut<'a, ProviderMachine>;
     fn get<'a>(&'a self, id: &'a str) -> Fut<'a, ProviderMachine>;
@@ -159,6 +193,12 @@ pub trait MachineProvider: Send + Sync {
     /// Wipes the machine's disks and reinstalls it from `spec`, then boots it. It keeps
     /// its id, IP and firewall. Everything on its disks is lost.
     fn rebuild<'a>(&'a self, id: &'a str, spec: &'a RebuildSpec) -> Fut<'a, ()>;
+    /// Removes the machine's cloud-init user data from its config without restarting
+    /// it, once it is spent (ADR 0067). Succeeds if there is none, or the machine is
+    /// gone. Nothing to do where `ProviderMachine::user_data` is never set.
+    fn clear_user_data<'a>(&'a self, _id: &'a str) -> Fut<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
 
     // Firewalls (ADR 0035). Labels are unique per account, as machines' are.
 

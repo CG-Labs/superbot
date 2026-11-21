@@ -167,7 +167,7 @@ Release binaries are installed system-wide in `/usr/local/bin` so `botctl` stays
 
 ## Managed machines: enrollment
 
-Managed hosting only (one Linode per user, [ADR 0025](../docs/adr/0025-control-plane-linode.md)). Self-hosted servers skip this. With `LINODE_TOKEN` set, add to `.env`:
+Managed hosting only (one Linode per user, [ADR 0025](../docs/adr/0025-control-plane-linode.md), or one Incus container per user on a shared host, [ADR 0065](../docs/adr/0065-incus-container-machines.md) and [its guide](../docs/ops/incus-containers.md)). Self-hosted servers skip this. With `LINODE_TOKEN` or `MACHINE_PROVIDER=incus` set, add to `.env`:
 
 ```sh
 MACHINE_CONTROL_URL=https://<server-ip>:8443   # how machines reach this server; turns enrollment on

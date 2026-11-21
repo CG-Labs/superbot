@@ -267,6 +267,7 @@ pub async fn sync(app: &App, fw: &Firewall, p: &dyn MachineProvider) -> usize {
         .filter(|m| {
             matches!(m.state, State::Provisioning | State::Running | State::Suspended)
                 && m.provider_id.is_some()
+                && m.provider == p.name()
         })
         .collect();
     if live.is_empty() {

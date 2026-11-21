@@ -377,3 +377,32 @@ async fn a_rebuild_whose_answer_was_lost_finishes_when_the_machine_comes_back() 
     reconcile(&env.app, &env.cp).await;
     assert_eq!(env.fake.calls("rebuild"), 1, "never sent twice");
 }
+
+#[tokio::test]
+async fn a_machine_left_stopped_by_a_slow_rebuild_is_started_unless_it_was_suspended() {
+    let mut env = serve_with(|e| e).await;
+    let (uid, mid, token) = machine_for(&env, "flo@example.com").await;
+    assert!(env.app.db.unassign_machine(&mid));
+    let _old = old_agent(&mut env, &mid, &token).await;
+    heartbeats(&env.app, &env.cp).await;
+    env.fake.lose_next("rebuild");
+    let (code, v) = json_call(&env, "POST", &format!("/api/users/{uid}/machine/rebuild"), "").await;
+    assert_eq!((code, v["rebuild"]["state"].as_str()), (202, Some("rebuilding")), "{v}");
+    let pid = env.app.db.machine(&mid).unwrap().provider_id.unwrap();
+
+    // Suspended meanwhile: it stays off.
+    env.fake.set(&pid, |m| m.status = "offline".into());
+    let mut m = env.app.db.machine(&mid).unwrap();
+    m.state = crate::machines::State::Suspended;
+    assert!(env.app.db.save_machine(&m, crate::machines::State::Running));
+    reconcile(&env.app, &env.cp).await;
+    assert_eq!(env.fake.calls("boot"), 0, "a suspended machine isn't started");
+
+    // Still meant to be running: started, under the lock, by the rebuild worker.
+    m.state = crate::machines::State::Running;
+    assert!(env.app.db.save_machine(&m, crate::machines::State::Suspended));
+    reconcile(&env.app, &env.cp).await;
+    assert_eq!(env.fake.calls("boot"), 1);
+    reconcile(&env.app, &env.cp).await;
+    assert_eq!(env.fake.calls("boot"), 1, "not again once it's up");
+}
