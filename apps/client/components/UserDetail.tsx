@@ -63,6 +63,15 @@ function removalStatus(r: TeammateRemoval): string {
   return r.archivedTo ? "Removed; work handed to the owner" : "Removed";
 }
 
+/** What happens to a teammate's work when their account here goes, as the server is set. */
+function workOutcome(t: TeammateAccounts | null): string {
+  if (t?.files === "delete") {
+    if (!t.graceDays) return "their work is deleted for good";
+    return `their work is held for ${t.graceDays} day${t.graceDays === 1 ? "" : "s"}, then deleted`;
+  }
+  return "their work goes to the Bots' owner";
+}
+
 function LoadFailed({ message, onRetry }: { message: string; onRetry: () => void }) {
   return (
     <View style={styles.row}>
@@ -82,6 +91,7 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
   const [sessionsError, setSessionsError] = useState<string | null>(null);
   const [botsError, setBotsError] = useState<string | null>(null);
   const [teammates, setTeammates] = useState<TeammateAccounts | null>(null);
+  const [teammatesError, setTeammatesError] = useState<string | null>(null);
   const [pickedProvider, setLinkProvider] = useState("");
   // Providers can arrive after this opens; until someone picks, link with the first.
   const linkProvider = providers.some((p) => p.id === pickedProvider) ? pickedProvider : (providers[0]?.id ?? "");
@@ -95,10 +105,11 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
     const failed = (err: unknown) => (err instanceof Error ? err.message : "Couldn't load");
     setSessionsError(null);
     setBotsError(null);
+    setTeammatesError(null);
     await Promise.all([
       api.userSessions(user.id).then(setSessions, (err) => setSessionsError(failed(err))),
       api.userBots(user.id).then(setBots, (err) => setBotsError(failed(err))),
-      api.teammateAccounts(user.id).then(setTeammates, () => setTeammates(null)),
+      api.teammateAccounts(user.id).then(setTeammates, (err) => setTeammatesError(failed(err))),
     ]);
   }, [api, user.id]);
 
@@ -158,7 +169,8 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
     });
 
   const removeTeammate = async (owner: string, teammate: string, who: string) => {
-    if (!(await confirmAsync(`Remove ${who}'s account here?`, "Their processes stop, their work goes to the Bots' owner, and their login is deleted. A later run makes a new one if they still have access.", "Remove"))) return;
+    const body = `Their processes stop, ${workOutcome(teammates)}, and their login is deleted. A later run makes a new one if they still have access.`;
+    if (!(await confirmAsync(`Remove ${who}'s account here?`, body, "Remove"))) return;
     void run(async () => {
       const res = await api.removeTeammateAccount(owner, teammate);
       if (res.error) throw new Error(`Still pending: ${res.error}`);
@@ -329,7 +341,11 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
         {!active && bots?.bots.length ? <Text style={styles.faint}>Applies once they're enabled again.</Text> : null}
       </Section>
 
-      {teammates && (teammates.accounts.length || teammates.removals.length) ? (
+      {teammatesError ? (
+        <Section title="Teammate accounts here">
+          <LoadFailed message={teammatesError} onRetry={() => void loadExtras()} />
+        </Section>
+      ) : teammates && (teammates.accounts.length || teammates.removals.length) ? (
         <Section title="Teammate accounts here">
           {teammates.accounts.map((a) => {
             const mine = a.owner.id === user.id;

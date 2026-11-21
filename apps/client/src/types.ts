@@ -468,6 +468,10 @@ export interface TeammateRemoval {
 /** `/api/users/{id}/teammate-accounts`: teammates' own accounts for the user's shared Bots here, and the user's for others' (ADR 0064, 0066). */
 export interface TeammateAccounts {
   userId: string;
+  /** `ISOLATION_TEAMMATE_FILES`: what becomes of a removed teammate's work. */
+  files: "archive" | "delete";
+  /** `ISOLATION_TEAMMATE_FILES_DAYS`: with `delete`, how long it's held first. */
+  graceDays: number;
   accounts: {
     owner: { id: string; name?: string | null; email?: string | null };
     teammate: { id: string; name?: string | null; email?: string | null };
