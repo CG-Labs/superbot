@@ -1,4 +1,4 @@
-// The admin console (ADR 0032): people, requests for access, machines, the audit log,
+// The admin console (ADR 0032): people, requests for access, machines, teams, the audit log,
 // and server settings. Chat, Bots, approvals of Bot actions, and screens are in the app
 // at /app/. The server decides what each role may do; this page only shows admin tools.
 
@@ -376,6 +376,125 @@ $("machines-reconcile").addEventListener("click", async () => {
     fail(err);
   }
   loadMachines();
+});
+
+// Teams (ADR 0087, 0088): every team, its people, roles and machine states. Each team's
+// own owners and admins manage it in the app; this is the server admins' fallback.
+
+const TEAM_ROLES = { owner: "Owner", admin: "Admin", member: "Member" };
+const teamRoleOptions = (current) => Object.entries(TEAM_ROLES).map(([v, l]) => `<option value="${v}" ${v === current ? "selected" : ""}>${l}</option>`).join("");
+let teams = { teams: [], settings: {} };
+
+async function loadTeams() {
+  try {
+    teams = await api("GET", "/api/teams");
+    $("teams-empty").textContent = "No teams yet.";
+  } catch (err) {
+    teams = { teams: [], settings: {} };
+    $("teams-empty").textContent = err.message;
+  }
+  renderTeams();
+}
+
+function teamMachine(m) {
+  if (!m) return '<span class="sub">No machine</span>';
+  const whose = m.team ? "team's" : "their own";
+  const released = m.releaseAt ? `<div class="sub bad">Released; deleted ${esc(fmt(m.releaseAt))}</div>` : "";
+  return `${esc(m.state)}<div class="sub">${esc(whose)} · ${esc(m.tier)} · ${esc(m.enrollment)}</div>${released}`;
+}
+
+function renderTeams() {
+  const s = teams.settings || {};
+  $("teams-settings").textContent = `${s.strict ? "TEAMS=on: people in no team share with nobody." : "People in no team share with each other (TEAMS=on stops that)."} A leaver's team machine is ${s.machineDays ? `suspended, then deleted after ${s.machineDays} days` : "deleted at once"}.`;
+  $("teams-empty").hidden = teams.teams.length > 0;
+  $("teams-list").innerHTML = teams.teams.map((t) => `<div class="card" data-team="${esc(t.id)}">
+      <div class="bar"><b>${esc(t.name)}</b> <span class="sub">${t.members.length} people · ${t.machines ? "joining gives a machine" : "no machines given"}</span>
+        <button type="button" class="btn push" data-act="delete-team">Delete team</button></div>
+      <table class="grid">
+        <thead><tr><th>Person</th><th>Role</th><th>Machine</th><th></th></tr></thead>
+        <tbody>${t.members.map((m) => `<tr data-user="${esc(m.id)}">
+          <td><div>${esc(m.name || m.id)}${m.active ? "" : ' <span class="bad">Disabled</span>'}</div><div class="sub">${esc(m.email || "")}</div></td>
+          <td><select data-act="team-role" title="Role">${teamRoleOptions(m.role)}</select></td>
+          <td>${teamMachine(m.machine)}</td>
+          <td class="actions"><button type="button" class="btn" data-act="remove-member">Remove</button></td>
+        </tr>`).join("")}</tbody>
+      </table>
+      ${(t.invites || []).length ? `<p class="sub">Invited: ${t.invites.map((i) => `${esc(i.email)} (${esc(TEAM_ROLES[i.role] || i.role)})`).join(", ")}</p>` : ""}
+      <form class="bar" data-act="add-member" autocomplete="off">
+        <input name="user" placeholder="Add someone: email or id" required spellcheck="false" />
+        <select name="role" title="Role">${teamRoleOptions("member")}</select>
+        <button type="submit" class="btn">Add to team</button>
+      </form>
+    </div>`).join("");
+}
+
+function offboardNote(name, team) {
+  const days = teams.settings?.machineDays;
+  const machine = days ? `suspended now and deleted after ${days} days unless they join a team again` : "deleted now, with its disks";
+  return `Take ${name} off ${team}?\n\nThey lose access to teammates' shared Bots and teammates lose access to theirs; grants between them are revoked and runs between them stop. Their user and home on teammates' machines and accounts are removed (their work goes as the server's teammate-files setting says). A machine the team gave them is ${machine}. Their own Bots, chats and secrets stay theirs.`;
+}
+
+const teamOf = (el) => teams.teams.find((t) => t.id === el.closest("[data-team]").dataset.team);
+
+$("teams-list").addEventListener("click", async (e) => {
+  const b = e.target.closest("button[data-act]");
+  if (!b) return;
+  const t = teamOf(b);
+  if (!t) return;
+  b.disabled = true;
+  try {
+    if (b.dataset.act === "remove-member") {
+      const m = t.members.find((x) => x.id === b.closest("tr").dataset.user);
+      if (!m || !confirm(offboardNote(m.name || m.email || m.id, t.name))) return;
+      await api("DELETE", `/api/teams/${key(t.id)}/members/${key(m.id)}`);
+    }
+    if (b.dataset.act === "delete-team") {
+      if (!confirm(`Delete ${t.name}? Everyone on it leaves, as if each had: ${offboardNote("each of them", t.name).split("\n\n")[1]}`)) return;
+      await api("DELETE", `/api/teams/${key(t.id)}`);
+    }
+  } catch (err) {
+    fail(err);
+  } finally {
+    b.disabled = false;
+    loadTeams();
+  }
+});
+
+$("teams-list").addEventListener("change", async (e) => {
+  if (e.target.dataset.act !== "team-role") return;
+  const t = teamOf(e.target);
+  try {
+    await api("PUT", `/api/teams/${key(t.id)}/members/${key(e.target.closest("tr").dataset.user)}`, { role: e.target.value });
+  } catch (err) {
+    fail(err);
+  }
+  loadTeams();
+});
+
+$("teams-list").addEventListener("submit", async (e) => {
+  const f = e.target.closest("form[data-act=add-member]");
+  if (!f) return;
+  e.preventDefault();
+  const t = teamOf(f);
+  try {
+    const r = await api("PUT", `/api/teams/${key(t.id)}/members/${key(f.user.value.trim())}`, { role: f.role.value });
+    if (r.provisioned === "failed") notice("Added, but their machine couldn't be made. The audit log says why (team.machine_failed).");
+  } catch (err) {
+    fail(err);
+  }
+  loadTeams();
+});
+
+$("add-team").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try {
+    await api("POST", "/api/teams", { name: $("team-name").value.trim(), owner: $("team-owner").value.trim() });
+    $("team-name").value = "";
+    $("team-owner").value = "";
+  } catch (err) {
+    fail(err);
+  }
+  loadTeams();
 });
 
 // Audit log: append-only record of sign-ins and admin actions (docs/adr/0009-audit-events.md),
@@ -1129,7 +1248,7 @@ $("setup-body").addEventListener("submit", async (e) => {
 
 // Tabs, from the address bar's #fragment so a reload keeps your place.
 
-const TABS = { users: loadUsers, requests: loadRequests, machines: loadMachines, audit: () => loadAudit(), settings: loadSettings, setup: loadSetup };
+const TABS = { users: loadUsers, requests: loadRequests, machines: loadMachines, teams: loadTeams, audit: () => loadAudit(), settings: loadSettings, setup: loadSetup };
 
 // `#audit?target=approval:<id>`: a notification's link to one approval's trail (ADR 0061).
 function showTab() {
