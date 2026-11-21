@@ -3,6 +3,7 @@ import { Redirect, router, useLocalSearchParams } from "expo-router";
 import { ActivityIndicator, View } from "react-native";
 import { LoginScreen } from "../components/LoginScreen";
 import { codeFromHash } from "../src/invite";
+import { approvalParam } from "../src/notifications";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
 
@@ -10,7 +11,10 @@ export default function Index() {
   const { ready, api, inviteCode, offerInviteCode } = useSuperBot();
   // An invite link's `#code=` (ADR 0021): the router keeps the fragment as a param and
   // writes it back to the address bar, so it is taken here and the URL replaced without it.
-  const hash = useLocalSearchParams<{ "#"?: string }>()["#"];
+  const params = useLocalSearchParams<{ "#"?: string; approval?: string }>();
+  const hash = params["#"];
+  // A notification's link to an approval, kept through sign-in (ADR 0059).
+  const approval = approvalParam(params.approval);
   useEffect(() => {
     if (!hash?.includes("code=")) return;
     const code = codeFromHash(hash);
@@ -30,5 +34,5 @@ export default function Index() {
     return <LoginScreen key={inviteCode ?? ""} inviteCode={inviteCode} />;
   }
 
-  return <Redirect href="/home" />;
+  return <Redirect href={approval ? { pathname: "/home", params: { approval } } : "/home"} />;
 }

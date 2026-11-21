@@ -1,6 +1,6 @@
 import React from "react";
 import { act, fireEvent, render, screen, userEvent } from "@testing-library/react-native";
-import { ApprovalCard, runScopeText } from "../ApprovalsInbox";
+import { ApprovalCard, ApprovalsInbox, runScopeText } from "../ApprovalsInbox";
 import type { Approval } from "../../src/types";
 
 const mockCtx: Record<string, unknown> = {};
@@ -87,6 +87,18 @@ describe("ApprovalCard: approve for this run (ADR 0051)", () => {
     await render(<ApprovalCard approval={PUSH} />);
     expect(screen.queryByRole("button", { name: "Approve for this run" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
+  });
+
+  it("shows the approval a notification linked to first, or says it's gone (ADR 0059)", async () => {
+    as("member");
+    const other = { ...PUSH, id: "a0", subject: "rm -rf build" };
+    Object.assign(mockCtx, { approvals: [other, PUSH], policy: { mode: "ask" } });
+    const { rerender } = await render(<ApprovalsInbox visible onClose={jest.fn()} focusId="a1" />);
+    const subjects = screen.getAllByText(/git push origin main|rm -rf build/).map((n) => n.props.children);
+    expect(subjects).toEqual(["git push origin main", "rm -rf build"]);
+    expect(screen.queryByText(/isn't waiting anymore/)).toBeNull();
+    await rerender(<ApprovalsInbox visible onClose={jest.fn()} focusId="gone" />);
+    expect(screen.getByText(/That approval isn't waiting anymore/)).toBeOnTheScreen();
   });
 
   it("says when only the exact call is covered", () => {

@@ -23,7 +23,7 @@ export default function PolicyScreen() {
   const back = () => (router.canGoBack() ? router.back() : router.replace("/home"));
   return (
     <SafeAreaView style={styles.root} edges={["top", "left", "right"]}>
-      <PolicyEditor key={botId ?? "global"} api={api} bot={bot} canEdit={can("admin")} onBack={back} />
+      <PolicyEditor key={botId ?? "global"} api={api} bot={bot} canEdit={can("admin")} notifications={api} onBack={back} />
     </SafeAreaView>
   );
 }

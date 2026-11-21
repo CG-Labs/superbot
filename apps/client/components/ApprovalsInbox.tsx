@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { Modal, Pressable, ScrollView, StyleSheet, Switch, Text, View } from "react-native";
+import { focusFirst } from "../src/notifications";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
 import type { Approval, ApprovalScope } from "../src/types";
@@ -10,6 +11,8 @@ interface Props {
   onClose: () => void;
   /** Opens the policy editor for all Bots (ADR 0049). */
   onOpenPolicy?: () => void;
+  /** The approval a notification linked to (ADR 0059): shown first, or noted as gone. */
+  focusId?: string | null;
 }
 
 function minutesLeft(a: Approval): string {
@@ -92,9 +95,10 @@ export function ApprovalCard({ approval: a }: { approval: Approval }) {
   );
 }
 
-export function ApprovalsInbox({ visible, onClose, onOpenPolicy }: Props) {
+export function ApprovalsInbox({ visible, onClose, onOpenPolicy, focusId }: Props) {
   const { approvals, policy, setGlobalPolicy, can } = useSuperBot();
   const ask = policy?.mode !== "bypass";
+  const { list, gone } = focusFirst(approvals, focusId);
 
   return (
     <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
@@ -106,9 +110,14 @@ export function ApprovalsInbox({ visible, onClose, onOpenPolicy }: Props) {
               <Text style={styles.close}>✕</Text>
             </Pressable>
           </View>
+          {gone ? (
+            <Text style={styles.faint} accessibilityRole="alert">
+              That approval isn't waiting anymore: someone answered it, or it timed out.
+            </Text>
+          ) : null}
           <ScrollView contentContainerStyle={{ gap: 12 }}>
-            {approvals.length ? (
-              approvals.map((a) => <ApprovalCard key={a.id} approval={a} />)
+            {list.length ? (
+              list.map((a) => <ApprovalCard key={a.id} approval={a} />)
             ) : (
               <Text style={styles.empty}>Nothing is waiting for you.</Text>
             )}
