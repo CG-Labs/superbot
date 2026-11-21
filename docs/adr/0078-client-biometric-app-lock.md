@@ -25,7 +25,7 @@ A phone that is unlocked and handed to someone, or left on a desk, opens straigh
 - The app's **own prompts are ignored**: Face ID moves the app to `inactive`, and Android's passcode screen is a separate activity that sends it to the background. While a prompt is open, app state changes don't lock or count.
 - The lock **prompts once** each time it comes to the front. After a cancel it waits for **Unlock**, so it never loops on a prompt the user dismissed.
 - Only a **signed-in** app locks: there's nothing to guard on the sign-in screen.
-- The screens stay mounted under the lock, so a draft or an open screen viewer survives it. The lock is a full-screen overlay that takes touches and hides the content from screen readers.
+- The screens stay mounted under the lock, so a draft or an open screen viewer survives it. The lock and the cover are a native full-screen `Modal`, presented last, so they also sit above the screens' own modals (the approvals inbox, the phone's screen viewer, Bot details): nothing under them can be read or tapped, and screen readers skip it. The setting changes on screen only once storage has saved it, so what Settings shows is what the next launch does.
 
 ### Hiding content in the app switcher
 

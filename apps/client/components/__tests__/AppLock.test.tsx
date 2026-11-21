@@ -1,6 +1,6 @@
 import React from "react";
 import { act, render, screen, userEvent, waitFor, within } from "@testing-library/react-native";
-import { AppState, Text } from "react-native";
+import { AppState, Modal, Text } from "react-native";
 import { AppLockProvider, type LockStore } from "../AppLock";
 import { AppLockCard } from "../SettingsView";
 import { AUTH_FACE, serializeLockSettings, type DeviceProbe } from "../../src/appLock";
@@ -44,6 +44,12 @@ async function changeAppState(s: string) {
   await act(async () => {
     for (const l of listeners) l(s);
   });
+}
+
+type Host = { type: unknown; parent: Host | null };
+function modalOf(el: Host): Host | null {
+  for (let n = el.parent; n; n = n.parent) if (n.type === "Modal") return n;
+  return null;
 }
 
 async function show(props: { auth: LocalAuth; store: LockStore; os?: string; now?: () => number }) {
@@ -102,6 +108,35 @@ describe("App lock (ADR 0078)", () => {
     await user.press(within(await screen.findByLabelText("App lock on or off")).getByRole("radio", { name: "On" }));
     expect(await screen.findByText("App lock stays off.")).toBeOnTheScreen();
     expect(store.set).not.toHaveBeenCalled();
+  });
+
+  it("stays off, on screen too, when saving the setting fails", async () => {
+    const auth = fakeAuth();
+    const store = fakeStore();
+    store.set.mockRejectedValueOnce(new Error("Keychain unavailable"));
+    const user = userEvent.setup();
+    await show({ auth, store });
+    await user.press(within(await screen.findByLabelText("App lock on or off")).getByRole("radio", { name: "On" }));
+    expect(await screen.findByText("Keychain unavailable")).toBeOnTheScreen();
+    expect(within(screen.getByLabelText("App lock on or off")).getByRole("radio", { name: "Off" })).toBeChecked();
+    expect(screen.queryByLabelText("Lock after")).toBeNull();
+  });
+
+  it("draws the lock in a native modal, above the screens' own modals", async () => {
+    const auth = fakeAuth();
+    auth.authenticate.mockImplementationOnce(() => new Promise(() => {}));
+    await render(
+      <AppLockProvider auth={auth} store={fakeStore(serializeLockSettings({ enabled: true, lockAfter: 0 }))} os="ios">
+        <Modal visible>
+          <Text>Approve</Text>
+        </Modal>
+      </AppLockProvider>,
+    );
+    const lock = await screen.findByText("SuperBot is locked");
+    const approve = screen.getByText("Approve", { includeHiddenElements: true });
+    expect(modalOf(lock)).not.toBeNull();
+    expect(modalOf(lock)).not.toBe(modalOf(approve));
+    expect(approve).not.toBeVisible();
   });
 
   it("locks on cold start and opens after Face ID", async () => {

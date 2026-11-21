@@ -1,5 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useReducer, useRef, useState } from "react";
-import { AppState, Image, Platform, Pressable, StyleSheet, Text, View } from "react-native";
+import { AppState, Image, Modal, Platform, Pressable, StyleSheet, Text, View } from "react-native";
 import {
   availabilityFrom,
   availabilityProblem,
@@ -127,11 +127,12 @@ export function AppLockProvider({ children, auth = deviceAuth, store = deviceSto
     return () => sub.remove();
   }, [now, refreshAvailability, supported]);
 
+  // Storage first, so the screen never shows a setting the next launch won't have.
   const save = useCallback(
     async (s: LockSettings) => {
-      setSettings(s);
       if (s.enabled) await store.set(serializeLockSettings(s));
       else await store.clear();
+      setSettings(s);
     },
     [store],
   );
@@ -149,8 +150,10 @@ export function AppLockProvider({ children, auth = deviceAuth, store = deviceSto
     dispatch({ type: "unlocked" });
     setMessage(null);
     setStuck(false);
-    if (settingsRef.current.enabled) void save({ ...settingsRef.current, enabled: false }).catch(() => {});
-  }, [api, save]);
+    if (!settingsRef.current.enabled) return;
+    setSettings({ ...settingsRef.current, enabled: false });
+    void store.clear().catch(() => {});
+  }, [api, store]);
 
   const unlock = useCallback(async () => {
     if (prompting.current) return;
@@ -232,11 +235,14 @@ export function AppLockProvider({ children, auth = deviceAuth, store = deviceSto
       <View style={styles.fill} importantForAccessibility={showLock || cover ? "no-hide-descendants" : "auto"} accessibilityElementsHidden={showLock || cover}>
         {children}
       </View>
-      {showLock ? (
-        <LockScreen label={availability?.kind === "available" || availability?.kind === "not-enrolled" ? availability.label : null} message={message} stuck={stuck} busy={busy} onUnlock={() => void unlock()} onSignOut={() => void signOut()} />
-      ) : cover ? (
-        <View style={[StyleSheet.absoluteFill, styles.cover]} testID="app-lock-cover" />
-      ) : null}
+      {/* A native modal, so it also covers the screens' own modals (approvals, the screen viewer). */}
+      <Modal visible={showLock || cover} animationType="none" statusBarTranslucent navigationBarTranslucent onRequestClose={() => {}}>
+        {showLock ? (
+          <LockScreen label={availability?.kind === "available" || availability?.kind === "not-enrolled" ? availability.label : null} message={message} stuck={stuck} busy={busy} onUnlock={() => void unlock()} onSignOut={() => void signOut()} />
+        ) : (
+          <View style={[styles.fill, styles.cover]} testID="app-lock-cover" />
+        )}
+      </Modal>
     </AppLockContext.Provider>
   );
 }
@@ -252,7 +258,7 @@ interface LockScreenProps {
 
 function LockScreen({ label, message, stuck, busy, onUnlock, onSignOut }: LockScreenProps) {
   return (
-    <View style={[StyleSheet.absoluteFill, styles.lock]} accessibilityViewIsModal accessibilityLabel="SuperBot is locked">
+    <View style={[styles.fill, styles.lock]} accessibilityViewIsModal accessibilityLabel="SuperBot is locked">
       <View style={styles.card}>
         <Image source={require("../assets/images/icon.png")} style={styles.mark} accessibilityIgnoresInvertColors />
         <Text style={styles.title}>SuperBot is locked</Text>
