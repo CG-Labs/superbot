@@ -297,7 +297,7 @@ function renderMachines() {
   $("machines-rows").innerHTML = list.map((m) => `<tr data-machine="${esc(m.id)}">
       <td>${esc(m.userEmail || m.userId)}</td>
       <td>${esc(m.state)}${m.providerStatus ? `<div class="sub">${esc(m.providerStatus)}</div>` : ""}${m.lastError ? `<div class="sub bad">${esc(m.lastError)}</div>` : ""}${m.enrollOverdueAt && m.enrollment !== "enrolled" ? `<div class="sub bad">Didn't enroll in time (since ${esc(fmt(m.enrollOverdueAt))})</div>` : ""}</td>
-      <td>${esc(m.tier)}<div class="sub">${esc(m.plan)}</div></td>
+      <td>${esc(m.tier)}<div class="sub">${esc(m.plan)} · ${esc(m.provider)}</div></td>
       <td>${esc(m.region)}</td>
       <td>${esc(m.ipv4 || "")}</td>
       <td>${esc(fmt(m.updatedAt))}</td>
