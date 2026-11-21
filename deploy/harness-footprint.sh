@@ -80,6 +80,8 @@ cargo=$(PATH="$PATH:$caller_path"; command -v cargo) || die "cargo isn't on PATH
 command -v git >/dev/null || die "git isn't on PATH"
 
 if [[ -n "$clis" ]]; then
+  mkdir -p "$clis"
+  clis=$(cd "$clis" && pwd)
   list=${harnesses:-hermes,claude,codex,pi}
   # shellcheck disable=SC2086 # one word per harness
   "$here/install-harness-clis.sh" "$clis" ${list//,/ } | tee "$clis.paths"
@@ -114,8 +116,14 @@ printf 'Building botd and the measurement (release)...\n'
 pin=()
 if [[ -n "$cpus" ]]; then
   command -v taskset >/dev/null || die "--cpus needs taskset (util-linux)"
-  (( cpus <= $(nproc) )) || die "--cpus $cpus: this machine has $(nproc)"
-  pin=(taskset -c "0-$(( cpus - 1 ))")
+  # The first N CPUs this process may use (a container's need not start at 0).
+  allowed=()
+  IFS=, read -ra ranges < <(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status)
+  for r in "${ranges[@]}"; do
+    mapfile -t -O "${#allowed[@]}" allowed < <(seq "${r%-*}" "${r#*-}")
+  done
+  (( cpus <= ${#allowed[@]} )) || die "--cpus $cpus: only ${#allowed[@]} CPUs available"
+  pin=(taskset -c "$(IFS=,; echo "${allowed[*]:0:cpus}")")
   export SUPERBOT_FOOTPRINT_CPUS=$cpus
 fi
 
