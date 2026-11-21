@@ -14,6 +14,7 @@ import Markdown from "react-native-markdown-display";
 import { copyText, COPY_LABEL } from "../src/clipboard";
 import { showError } from "../src/dialogs";
 import { isOpenHandoff } from "../src/handoff";
+import { isQueued, workingLabel } from "../src/runQueue";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
 import type { Message } from "../src/types";
@@ -187,10 +188,10 @@ export function ChatView({ onOpenDetails, onBack, onToggleScreen, screenOpen, pr
       {bot.working ? (
         <View style={styles.working}>
           <ActivityIndicator color={colors.blueDot} />
-          <Text style={styles.workingText}>{bot.status || "Working"}…</Text>
+          <Text style={styles.workingText}>{workingLabel(bot)}…</Text>
           {canOperate ? (
             <Pressable onPress={() => void stopBot(bot.id)}>
-              <Text style={styles.stop}>Stop</Text>
+              <Text style={styles.stop}>{isQueued(bot) ? "Cancel" : "Stop"}</Text>
             </Pressable>
           ) : null}
         </View>

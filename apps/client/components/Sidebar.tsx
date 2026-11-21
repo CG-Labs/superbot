@@ -1,6 +1,7 @@
 import React from "react";
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { isAdmin } from "../src/admin";
+import { workingLabel } from "../src/runQueue";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
 import { BotAvatar } from "./BotAvatar";
@@ -92,7 +93,7 @@ export function Sidebar({ onSelectBot, onNewBot, onLogout, onOpenApprovals, onOp
                 </Text>
               ) : (
                 <Text style={styles.preview} numberOfLines={1}>
-                  {b.working ? `${b.status || "Working"}…` : b.preview || ""}
+                  {b.working ? `${workingLabel(b)}…` : b.preview || ""}
                 </Text>
               )}
             </View>
