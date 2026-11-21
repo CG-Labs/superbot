@@ -150,6 +150,7 @@ impl Enrollment {
                 "MACHINE_ENROLL_TIMEOUT_MINUTES",
                 "MACHINE_HARNESSES",
                 "MACHINE_AGENT_UPGRADES",
+                "MACHINE_LEGACY_REBUILDS",
                 "MACHINE_HARNESS_LOGINS",
                 "MACHINE_FOLDER_SYNC",
                 "MACHINE_FOLDER_SYNC_MAX_MB",
@@ -845,6 +846,23 @@ pub fn revoke_all(app: &App, by: &Who, m: &Machine, reason: &str) -> usize {
             &m.id,
             Outcome::Success,
             json!({ "userId": m.user_id, "reason": reason, "certificates": fps, "pendingEnrollments": tokens }),
+        );
+    }
+    fps.len()
+}
+
+/// Rebuilt (ADR 0056): the old disks' certificates are revoked, but not the token the
+/// new disks enroll with.
+pub fn revoke_certs(app: &App, by: &Who, m: &Machine, reason: &str) -> usize {
+    let fps = app.db.set_machine_certs(&m.id, &["active", "held"], "revoked", Some(reason));
+    if !fps.is_empty() {
+        record(
+            app,
+            by,
+            "machine.cert_revoked",
+            &m.id,
+            Outcome::Success,
+            json!({ "userId": m.user_id, "reason": reason, "certificates": fps, "pendingEnrollments": 0 }),
         );
     }
     fps.len()
@@ -1673,6 +1691,7 @@ mod tests {
             "agent settings alone are a mistake"
         );
         assert!(with(&[("MACHINE_ENROLL_TIMEOUT_MINUTES", "20")]).is_err());
+        assert!(with(&[("MACHINE_LEGACY_REBUILDS", "auto")]).is_err(), "rebuilds need enrollment");
         assert!(with(&[("MACHINE_HARNESSES", "claude")]).is_err(), "harnesses need enrollment");
         assert!(with(&[("MACHINE_AGENT_UPGRADES", "auto")]).is_err());
         let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_HARNESSES", "pi")]).unwrap().unwrap();

@@ -105,6 +105,8 @@ pub enum Refusal {
     NoTeammateKey(String),
     /// Its agent couldn't set up the teammate's own user (ADR 0048): its words.
     TeammateUserFailed(String),
+    /// It is being rebuilt with today's agent, or is about to be (ADR 0056).
+    Rebuilding,
 }
 
 impl Refusal {
@@ -126,6 +128,7 @@ impl Refusal {
             Refusal::BotUserFailed => "bot_user_failed",
             Refusal::NoTeammateKey(_) => "teammate_no_key",
             Refusal::TeammateUserFailed(_) => "teammate_user_failed",
+            Refusal::Rebuilding => "machine_rebuilding",
         }
     }
 
@@ -168,6 +171,7 @@ impl Refusal {
             Refusal::BotUserFailed => "I didn't run: your computer couldn't set up a separate account for your Bots. Ask an admin to look at it (`botctl machine agent <your email>`).".into(),
             Refusal::NoTeammateKey(h) => format!("I didn't run: runs for your teammates use their own account on your computer, and {h} has no server-wide key for that. Ask an admin to save one."),
             Refusal::TeammateUserFailed(_) => "I didn't run: your computer couldn't set up a separate account for a teammate. Ask an admin to look at it (`botctl machine agent <your email>`).".into(),
+            Refusal::Rebuilding => "I didn't run: your computer is being rebuilt with the latest setup. Try again in a few minutes.".into(),
         }
     }
 
@@ -188,7 +192,13 @@ impl Refusal {
                 return format!("I didn't run: on {o}'s computer, runs for teammates use a separate account, and {h} has no server-wide key for that. An admin can save one.");
             }
             Refusal::TeammateUserFailed(_) => "it couldn't set up an account for you there",
-            Refusal::Outdated(_) | Refusal::Upgrading | Refusal::NoBotctl | Refusal::FolderCopying | Refusal::BotUserPending | Refusal::BotUserFailed => {
+            Refusal::Outdated(_)
+            | Refusal::Upgrading
+            | Refusal::NoBotctl
+            | Refusal::FolderCopying
+            | Refusal::BotUserPending
+            | Refusal::BotUserFailed
+            | Refusal::Rebuilding => {
                 "it isn't ready to run Bots"
             }
         };
@@ -215,6 +225,9 @@ pub fn target(db: &Db, cp: &ControlPlane, user_id: &str) -> Result<Target, Refus
     };
     if m.state != State::Running {
         return Err(Refusal::NotReady(m.state));
+    }
+    if super::rebuild::underway(&m) {
+        return Err(Refusal::Rebuilding);
     }
     let to = Assigned { machine_id: m.id.clone(), user_id: m.user_id.clone(), address: m.ipv4.clone(), pins: db.machine_pins(&m.id) };
     if to.pins.is_empty() {
@@ -424,6 +437,7 @@ mod tests {
             Refusal::BotUserFailed,
             Refusal::NoTeammateKey("claude".into()),
             Refusal::TeammateUserFailed("useradd failed at 192.0.2.7".into()),
+            Refusal::Rebuilding,
         ];
         for r in &all {
             let m = r.message_for(Some("Ada"));

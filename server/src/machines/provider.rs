@@ -41,6 +41,25 @@ impl fmt::Debug for CreateSpec {
     }
 }
 
+/// What to put on a machine that is wiped and reinstalled in place (ADR 0056): same
+/// id, IP and firewall, fresh disks booted from `image` with `user_data`.
+#[derive(Clone, PartialEq)]
+pub struct RebuildSpec {
+    pub image: String,
+    pub authorized_keys: Vec<String>,
+    pub user_data: String,
+}
+
+impl fmt::Debug for RebuildSpec {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("RebuildSpec")
+            .field("image", &self.image)
+            .field("authorized_keys", &self.authorized_keys.len())
+            .field("user_data", &"[redacted]")
+            .finish()
+    }
+}
+
 /// One inbound rule: accept TCP on `ports` from `sources` (canonical CIDRs, sorted).
 /// The control plane's firewalls drop every other inbound packet and let machines
 /// call out.
@@ -137,6 +156,9 @@ pub trait MachineProvider: Send + Sync {
     fn enable_backups<'a>(&'a self, id: &'a str) -> Fut<'a, ()>;
     /// Deletes the machine and its disks. Succeeds if it is already gone.
     fn delete<'a>(&'a self, id: &'a str) -> Fut<'a, ()>;
+    /// Wipes the machine's disks and reinstalls it from `spec`, then boots it. It keeps
+    /// its id, IP and firewall. Everything on its disks is lost.
+    fn rebuild<'a>(&'a self, id: &'a str, spec: &'a RebuildSpec) -> Fut<'a, ()>;
 
     // Firewalls (ADR 0035). Labels are unique per account, as machines' are.
 

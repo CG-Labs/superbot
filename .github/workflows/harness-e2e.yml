@@ -1,7 +1,7 @@
 name: harness-e2e
 
 # Approvals end to end through the real harness CLIs, at the versions SuperBot pins
-# (server/src/adapters/install.rs), with a fake model (ADR 0056). Runs when the code
+# (server/src/adapters/install.rs), with a fake model (ADR 0057). Runs when the code
 # between a harness and a decision changes, weekly, and by hand.
 
 on:

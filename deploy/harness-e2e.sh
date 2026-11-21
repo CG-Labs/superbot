@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Checks SuperBot's approvals end to end through each harness CLI on this server, with
-# the harnesses' own logins and real models (ADR 0056). CI runs the same test with a
+# the harnesses' own logins and real models (ADR 0057). CI runs the same test with a
 # fake model; this is the part only a logged-in server can do.
 #
 # It starts a throwaway botd (its own temp data, a free loopback port, a fresh policy

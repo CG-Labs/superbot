@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Installs harness CLIs at the versions SuperBot pins for machines
-# (server/src/adapters/install.rs), for the harness end-to-end tests (ADR 0056).
+# (server/src/adapters/install.rs), for the harness end-to-end tests (ADR 0057).
 #
 #   deploy/install-harness-clis.sh <prefix> [claude] [codex] [pi] [hermes]
 #

@@ -1,4 +1,4 @@
-//! Approvals end to end through each real harness CLI (approvals follow-up 1, ADR 0056):
+//! Approvals end to end through each real harness CLI (approvals follow-up 1, ADR 0057):
 //! the real `botd` and `botctl` run Claude Code, Codex, Pi, and Hermes Agent with the hook
 //! each adapter installs, and four calls go through it: an allowed one runs, one a deny
 //! rule blocks never runs, and two `git push`es wait for a person, then run once approved
