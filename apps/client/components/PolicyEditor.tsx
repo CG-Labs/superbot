@@ -14,7 +14,7 @@ interface Props {
   bot?: { id: string; name: string };
   /** Admins only: the server refuses everyone else's changes (ADR 0012). */
   canEdit: boolean;
-  /** Notification settings (ADR 0060), shown to admins when given. */
+  /** Notification settings (ADR 0061), shown to admins when given. */
   notifications?: NotificationsApi;
   onBack: () => void;
   /** Asks before risky changes; `confirmAsync` unless a test swaps it. */

@@ -2326,7 +2326,7 @@ async fn delete_bot_policy(State(app): State<AppState>, Extension(who): Extensio
     Ok(Json(bot_policy_view(&app, &id)))
 }
 
-// Approval notifications (ADR 0060). Admin-only (rbac::classify).
+// Approval notifications (ADR 0061). Admin-only (rbac::classify).
 
 async fn get_notifications(State(app): State<AppState>) -> Json<Value> {
     Json(notify::api::view(&app))

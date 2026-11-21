@@ -1,4 +1,4 @@
-//! A small SMTP client for notification email (ADR 0060): STARTTLS (the default),
+//! A small SMTP client for notification email (ADR 0061): STARTTLS (the default),
 //! implicit TLS, or plain text to a relay on this machine; AUTH PLAIN or LOGIN; one
 //! message per recipient so nobody sees the others' addresses. Settings come from
 //! botd's environment; the password from the secrets store (`SMTP_PASSWORD`, ADR 0010),

@@ -1,4 +1,22 @@
-import { actorLabel, auditQuery, csvFileName, detailsText, localDay, nameFrom, NO_FILTERS, signInLabel, targetLabel } from "../audit";
+import {
+  actorLabel,
+  auditQuery,
+  csvFileName,
+  DECISIONS,
+  decisionSummary,
+  detailsPretty,
+  detailsText,
+  eventFields,
+  eventText,
+  KINDS,
+  linkedFilters,
+  localDay,
+  nameFrom,
+  NO_FILTERS,
+  pivotsFor,
+  signInLabel,
+  targetLabel,
+} from "../audit";
 import type { AuditEvent } from "../types";
 
 const ev = (e: Partial<AuditEvent>): AuditEvent => ({
@@ -26,6 +44,22 @@ describe("auditQuery", () => {
     expect(auditQuery({ ...NO_FILTERS, person: "u42" })).toBe("actor=user%3Au42");
   });
 
+  it("sends the Bot, session, and on-behalf-of filters as the server names them", () => {
+    const q = auditQuery({ ...NO_FILTERS, outcome: "denied", bot: " b1 ", session: "s1", onBehalfOf: "ada@example.com" });
+    expect(q).toBe("outcome=denied&bot=b1&session=s1&onBehalfOf=ada%40example.com");
+  });
+
+  it("only offers kinds of action the server accepts", () => {
+    // The server's rule (audit.rs `Filter::from_query`): up to 20 names, lowercase, digits, `_` and `.`, optionally ending in `.*`.
+    for (const { value } of KINDS.filter((k) => k.value)) {
+      const names = value.split(",");
+      expect(names.length).toBeLessThanOrEqual(20);
+      for (const n of names) expect(n).toMatch(/^[a-z0-9_.]{1,64}$|^[a-z0-9_.]{1,64}\.\*$/);
+    }
+    expect(DECISIONS).toBe("approval.approved,approval.denied,approval.expired");
+    expect(new Set(KINDS.map((k) => k.label)).size).toBe(KINDS.length);
+  });
+
   it("sends whole local days, To included", () => {
     const q = auditQuery({ ...NO_FILTERS, from: "2026-11-01", to: "2026-11-19" });
     expect(q).toBe(`from=${new Date(2026, 10, 1).getTime()}&to=${new Date(2026, 10, 20).getTime()}`);
@@ -40,6 +74,16 @@ describe("auditQuery", () => {
     expect(() => auditQuery({ ...NO_FILTERS, from: "2026-11-20", to: "2026-11-19" })).toThrow("From is after To");
     expect(localDay("  ")).toBeNull();
     expect(localDay("2024-02-29")).toBe(new Date(2024, 1, 29).getTime());
+  });
+});
+
+describe("linkedFilters", () => {
+  it("takes the filters a link may set, trimmed, and nothing else", () => {
+    expect(linkedFilters({ bot: " b1 ", session: "", person: ["ada@example.com", "x"], outcome: "failure", from: "2026-01-01" })).toEqual({
+      bot: "b1",
+      person: "ada@example.com",
+    });
+    expect(linkedFilters({})).toEqual({});
   });
 });
 
@@ -67,6 +111,91 @@ describe("audit labels", () => {
     expect(targetLabel(ev({}))).toBe("");
     expect(detailsText(ev({ details: {} }))).toBe("");
     expect(detailsText(ev({ details: { name: "Scout" } }))).toBe('{"name":"Scout"}');
+  });
+
+  it("lists every field of an event, labelled, and leaves out empty ones", () => {
+    const e = ev({
+      id: 7,
+      actorId: "u1",
+      actorName: "Ada",
+      actorEmail: "ada@example.com",
+      actorRole: "member",
+      authMethod: "sso",
+      idp: "entra",
+      idpProvider: "work",
+      sessionId: "s1",
+      botId: "b1",
+      onBehalfOf: "u2",
+      targetType: "bot",
+      targetId: "b1",
+      ip: "192.0.2.1",
+    });
+    const fields = Object.fromEntries(eventFields(e, { nameOf: (id) => (id === "u2" ? "Bo" : id), botName: (id) => (id === "b1" ? "Scout" : undefined) }));
+    expect(fields).toMatchObject({
+      UTC: "1970-01-01T00:00:00.000Z",
+      Outcome: "success",
+      Who: "Ada (user)",
+      "User id": "u1",
+      Email: "ada@example.com",
+      Role: "member",
+      "Sign-in": "SSO",
+      IdP: "entra (work)",
+      Session: "s1",
+      "On behalf of": "Bo (u2)",
+      "About Bot": "Scout (b1)",
+      Target: "bot b1",
+      IP: "192.0.2.1",
+      Event: "7",
+    });
+    expect(fields).not.toHaveProperty("User agent");
+    expect(Object.fromEntries(eventFields(ev({ actorKind: "system", actorId: "scheduler", onBehalfOf: "u9", botId: "b9" })))).toMatchObject({
+      Part: "scheduler",
+      "On behalf of": "u9",
+      "About Bot": "b9",
+    });
+  });
+
+  it("sums up approval decisions, and only those", () => {
+    const d = { subject: "git push", tool: "Bash", class: "push", note: null, rule: "r1" };
+    expect(decisionSummary(ev({ action: "approval.denied", details: d }))).toEqual({
+      verdict: "Denied",
+      lines: [
+        ["Call", "git push"],
+        ["Tool", "Bash"],
+        ["Kind", "push"],
+        ["Saved as rule", "r1"],
+      ],
+    });
+    // As the server sends it (`RunScope::covers_text`): one reason per kind of call the run may repeat.
+    const forRun = decisionSummary(ev({ action: "approval.approved", details: { runId: "run1", covers: ["pushes to origin", "", "installs packages"] } }));
+    expect(forRun).toEqual({ verdict: "Approved for the rest of the run", lines: [["Covers", "pushes to origin; installs packages"]] });
+    expect(decisionSummary(ev({ action: "approval.approved", details: { runId: "run1", covers: [] } }))?.verdict).toBe("Approved");
+    expect(decisionSummary(ev({ action: "approval.approved", details: {} }))?.verdict).toBe("Approved");
+    expect(decisionSummary(ev({ action: "approval.expired", details: null }))).toEqual({ verdict: "Expired: nobody answered, so it was denied", lines: [] });
+    expect(decisionSummary(ev({ action: "approval.requested" }))).toBeNull();
+  });
+
+  it("offers fresh filters that follow an event's action, person, Bots, session, and on-behalf-of", () => {
+    const pivots = pivotsFor(ev({ actorId: "u1", actorName: "Ada", botId: "b1", sessionId: "s1", onBehalfOf: "u2" }), {
+      nameOf: (id) => (id === "u2" ? "Bo" : id),
+      botName: (id) => (id === "b1" ? "Scout" : undefined),
+    });
+    expect(pivots.map((p) => [p.label, auditQuery(p.filters)])).toEqual([
+      ["Only bot.created", "action=bot.created"],
+      ["Everything by Ada", "actor=user%3Au1"],
+      ["Everything about Scout", "bot=b1"],
+      ["Everything in this session", "session=s1"],
+      ["Everything done for Bo", "onBehalfOf=u2"],
+    ]);
+    const byBot = pivotsFor(ev({ actorKind: "bot", actorId: "b2", botId: "b1" }));
+    expect(byBot.map((p) => p.label)).toEqual(["Only bot.created", "Everything about b1", "Everything about b2"]);
+    expect(pivotsFor(ev({ actorKind: "bot", actorId: "b1", botId: "b1" })).map((p) => p.label)).toEqual(["Only bot.created", "Everything about b1"]);
+  });
+
+  it("pretty-prints details and the whole event", () => {
+    expect(detailsPretty(ev({ details: {} }))).toBe("");
+    expect(detailsPretty(ev({ details: { a: 1 } }))).toBe('{\n  "a": 1\n}');
+    expect(JSON.parse(eventText(ev({ id: 3 })))).toMatchObject({ id: 3, action: "bot.created" });
   });
 
   it("names the export as the server does", () => {

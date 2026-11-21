@@ -4,7 +4,7 @@ import { NotificationsCard, type NotificationsApi } from "../NotificationsCard";
 import type { BotNotificationsPatch, BotNotificationsView, BotNotifySettings, NotificationsPatch, NotificationsView } from "../../src/types";
 jest.setTimeout(20_000);
 
-/** A fake botd for ADR 0060: global settings, a webhook URL kept secret, and per-Bot settings where null inherits. */
+/** A fake botd for ADR 0061: global settings, a webhook URL kept secret, and per-Bot settings where null inherits. */
 function fakeApi(opts: { smtp?: boolean } = {}) {
   let url: string | null = null;
   const own = new Map<string, string>();
@@ -63,7 +63,7 @@ beforeAll(async () => {
 beforeEach(() => jest.useFakeTimers());
 afterEach(() => jest.useRealTimers());
 
-describe("NotificationsCard (ADR 0060)", () => {
+describe("NotificationsCard (ADR 0061)", () => {
   it("turns email on for a list of addresses and saves a webhook URL without showing it again", async () => {
     const api = fakeApi();
     const user = userEvent.setup();

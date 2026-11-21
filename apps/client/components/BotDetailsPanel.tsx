@@ -28,6 +28,8 @@ interface Props {
   onOpenScreen: () => void;
   /** Opens this Bot's policy editor (ADR 0049). */
   onOpenPolicy?: (botId: string) => void;
+  /** Admins only: opens the audit log filtered to this Bot (ADR 0060). */
+  onOpenAudit?: (botId: string) => void;
   /** Sends a suggested prompt to this Bot, or puts a starter in its message box (ADR 0054). */
   onUsePrompt?: (prompt: string) => void;
 }
@@ -35,7 +37,7 @@ interface Props {
 /** "new" or the routine being edited, or "prompts"; null shows the details. */
 type Editing = "new" | "prompts" | Routine | null;
 
-export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, onUsePrompt }: Props) {
+export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, onOpenAudit, onUsePrompt }: Props) {
   const {
     bots,
     activeId,
@@ -260,6 +262,11 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, 
           {onOpenPolicy ? (
             <Pressable style={styles.row} role="button" aria-label="Approval policy" onPress={() => onOpenPolicy(bot.id)}>
               <Text style={styles.policyLink}>{can("admin") ? "Edit risky actions, timeout, and rules ›" : "See risky actions, timeout, and rules ›"}</Text>
+            </Pressable>
+          ) : null}
+          {onOpenAudit ? (
+            <Pressable style={styles.row} role="button" aria-label="Audit log for this Bot" onPress={() => onOpenAudit(bot.id)}>
+              <Text style={styles.policyLink}>Approvals and changes in the audit log ›</Text>
             </Pressable>
           ) : null}
           {bot.visibility ? (

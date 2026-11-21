@@ -470,7 +470,7 @@ async function loadSettings() {
   loadScim();
 }
 
-// Approval notifications (ADR 0060): email through botd's SMTP settings and a webhook.
+// Approval notifications (ADR 0061): email through botd's SMTP settings and a webhook.
 // The webhook URL is a secret: botd keeps it sealed and shows only its host.
 
 function showNotifications(v) {
@@ -1105,7 +1105,7 @@ $("setup-body").addEventListener("submit", async (e) => {
 
 const TABS = { users: loadUsers, requests: loadRequests, machines: loadMachines, audit: () => loadAudit(), settings: loadSettings, setup: loadSetup };
 
-// `#audit?target=approval:<id>`: a notification's link to one approval's trail (ADR 0060).
+// `#audit?target=approval:<id>`: a notification's link to one approval's trail (ADR 0061).
 function showTab() {
   const [name, query] = location.hash.slice(1).split("?");
   const tab = name in TABS ? name : "users";

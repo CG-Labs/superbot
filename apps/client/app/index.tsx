@@ -13,7 +13,7 @@ export default function Index() {
   // writes it back to the address bar, so it is taken here and the URL replaced without it.
   const params = useLocalSearchParams<{ "#"?: string; approval?: string }>();
   const hash = params["#"];
-  // A notification's link to an approval, kept through sign-in (ADR 0060).
+  // A notification's link to an approval, kept through sign-in (ADR 0061).
   const approval = approvalParam(params.approval);
   useEffect(() => {
     if (!hash?.includes("code=")) return;

@@ -8,7 +8,7 @@ import { ChatView } from "../components/ChatView";
 import { CreateBotModal } from "../components/CreateBotModal";
 import { ScreenViewer } from "../components/ScreenViewer";
 import { Sidebar } from "../components/Sidebar";
-import { openConsole, openSetup, watchSetup } from "../src/admin";
+import { isAdmin, openConsole, openSetup, watchSetup } from "../src/admin";
 import { planAvailable } from "../src/billing";
 import { showError } from "../src/dialogs";
 import { approvalParam } from "../src/notifications";
@@ -28,7 +28,7 @@ export default function HomeScreen() {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [screen, setScreen] = useState<ScreenState>(null);
   const [approvalsOpen, setApprovalsOpen] = useState(false);
-  // A notification's link, `/home?approval=<id>` (ADR 0060), opens the inbox on it.
+  // A notification's link, `/home?approval=<id>` (ADR 0061), opens the inbox on it.
   const linked = approvalParam(useLocalSearchParams<{ approval?: string }>().approval);
   const [focusId, setFocusId] = useState<string | null>(null);
   const [setupWaiting, setSetupWaiting] = useState(false);
@@ -152,6 +152,14 @@ export default function HomeScreen() {
           setDetailsOpen(false);
           router.push({ pathname: "/policy", params: { bot: id } });
         }}
+        onOpenAudit={
+          isAdmin(me)
+            ? (id) => {
+                setDetailsOpen(false);
+                router.push({ pathname: "/audit", params: { bot: id } });
+              }
+            : undefined
+        }
       />
       <ApprovalsInbox
         visible={approvalsOpen}

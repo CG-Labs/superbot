@@ -27,7 +27,7 @@ function message(e: unknown): string {
 }
 
 /**
- * Who hears about a pending approval when no app is open (ADR 0060): email through the
+ * Who hears about a pending approval when no app is open (ADR 0061): email through the
  * server's SMTP settings and a webhook (Slack-compatible or signed JSON). Admins only.
  */
 export function NotificationsCard({ api, bot }: Props) {

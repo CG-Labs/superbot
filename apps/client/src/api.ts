@@ -278,7 +278,7 @@ export class SuperBotApi {
     await this.request("DELETE", `/api/policy/rules/${encodeURIComponent(id)}`);
   }
 
-  // Approval notifications (ADR 0060): admins only, enforced by the server.
+  // Approval notifications (ADR 0061): admins only, enforced by the server.
 
   async notifications(): Promise<NotificationsView> {
     return this.request<NotificationsView>("GET", "/api/notifications");

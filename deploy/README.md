@@ -392,7 +392,7 @@ Admin actions (logins, Bot and routine changes, approvals, policy, handoffs) are
 
 ## Approval notifications
 
-A pending approval can reach people by email and a webhook when no app is open ([ADR 0060](../docs/adr/0060-approval-notifications.md)). Both are off until an admin turns them on; neither needs a paid service.
+A pending approval can reach people by email and a webhook when no app is open ([ADR 0061](../docs/adr/0061-approval-notifications.md)). Both are off until an admin turns them on; neither needs a paid service.
 
 1. **Links.** Notices link to the approval at `<PUBLIC_URL>/app/home?approval=<id>` and to its audit trail in the console. `PUBLIC_URL` defaults to `SSO_PUBLIC_URL`, else `https://` and the first `ALLOWED_HOSTS` entry, which the installer and Compose set to your domain. Without any, notices go without links.
 2. **Email (optional).** Set `SMTP_HOST` and `SMTP_FROM` (like `SuperBot <bots@example.com>`) in `.env`, and if your server signs in, `SMTP_USERNAME` and the password: `SMTP_PASSWORD`, `SMTP_PASSWORD_FILE`, or `botctl secret set SMTP_PASSWORD` (or the console's Server secrets). `SMTP_TLS` is `starttls` (default, port 587), `tls` (port 465) or `none` (only to `127.0.0.1`, port 25); `SMTP_PORT` changes the port. botd refuses to send if STARTTLS isn't offered, and never signs in without TLS. Restart `botd`: its startup line says `Notifications: email ready…`.

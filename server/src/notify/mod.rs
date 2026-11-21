@@ -1,4 +1,4 @@
-//! Approval notifications (ADR 0060): a pending approval reaches the people who can
+//! Approval notifications (ADR 0061): a pending approval reaches the people who can
 //! answer it when no app is open. Email through the admin's SMTP server, and an outgoing
 //! webhook (Slack-compatible or SuperBot JSON), set globally and per Bot. Off until an
 //! admin turns a channel on; nothing here needs a paid service.

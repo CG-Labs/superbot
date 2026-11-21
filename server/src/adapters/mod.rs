@@ -135,7 +135,7 @@ pub(crate) const SECRET_ENV: [&str; 12] = [
 
 /// `SECRET_ENV`, `secrets::SERVER_SECRETS` (and their `_FILE`), every `SSO_*` setting:
 /// sign-in config, including client secrets (ADR 0014), and each Bot's own notification
-/// webhook URL (ADR 0060).
+/// webhook URL (ADR 0061).
 pub(crate) fn secret_env() -> Vec<String> {
     let mut names: Vec<String> = SECRET_ENV.map(String::from).into();
     for k in crate::secrets::SERVER_SECRETS {

@@ -232,7 +232,7 @@ export interface PolicyView {
   sandbox?: SandboxSupport;
 }
 
-// Approval notifications (ADR 0060): admins only.
+// Approval notifications (ADR 0061): admins only.
 
 export type NotifyFormat = "slack" | "json";
 export type NotifyDetail = "summary" | "minimal";

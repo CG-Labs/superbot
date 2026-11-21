@@ -11,7 +11,7 @@ interface Props {
   onClose: () => void;
   /** Opens the policy editor for all Bots (ADR 0049). */
   onOpenPolicy?: () => void;
-  /** The approval a notification linked to (ADR 0060): shown first, or noted as gone. */
+  /** The approval a notification linked to (ADR 0061): shown first, or noted as gone. */
   focusId?: string | null;
 }
 
