@@ -78,6 +78,9 @@ pub struct Wiring {
     pub fallback: Option<Vec<Fallback>>,
     /// Fallbacks left out because their endpoint's key isn't saved.
     pub skipped: Vec<Fallback>,
+    /// The keys of the file's other endpoints: kept out of the run, so each key goes
+    /// only to runs routed to its endpoint.
+    pub unused_keys: Vec<String>,
 }
 
 /// Unset is unlimited.
@@ -480,6 +483,11 @@ impl Tiers {
                 w.endpoints.push(e.clone());
             }
         }
+        for e in &self.providers {
+            if !w.endpoints.iter().any(|u| u.key_secret == e.key_secret) && !w.unused_keys.contains(&e.key_secret) {
+                w.unused_keys.push(e.key_secret.clone());
+            }
+        }
         w.fallback = managed.then_some(fallback);
         Ok(w)
     }
@@ -709,19 +717,22 @@ mod tests {
         let all = t.wiring(&basic, true, |_| true).unwrap();
         assert_eq!(all.endpoints.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["gpt-api", "claude-api"]);
         assert_eq!(all.fallback.as_deref(), Some(basic.fallback.as_slice()));
-        assert!(all.skipped.is_empty());
+        assert!(all.skipped.is_empty() && all.unused_keys.is_empty());
         // A fallback without its key is left out; the route's own provider without its key refuses.
         let no_claude = t.wiring(&basic, true, |k| k != "TIER_ANTHROPIC_KEY").unwrap();
         assert_eq!(no_claude.fallback.unwrap(), [Fallback { provider: "openrouter".into(), model: "x/y".into() }]);
         assert_eq!(no_claude.skipped[0].provider, "claude-api");
         assert_eq!(t.wiring(&basic, true, |k| k != "TIER_OPENAI_KEY").unwrap_err().name, "gpt-api");
         // No fallback listed: none on a managed tier; the harness's own on an open one.
+        // Keys of endpoints a route doesn't use stay out of its runs.
         let plus = t.get("plus").unwrap().route("hermes", None, None).unwrap();
-        assert_eq!(t.wiring(&plus, true, |_| true).unwrap().fallback, Some(Vec::new()));
+        let w = t.wiring(&plus, true, |_| true).unwrap();
+        assert_eq!((w.fallback, w.unused_keys), (Some(Vec::new()), vec!["TIER_OPENAI_KEY".to_string()]));
+        let both = ["TIER_ANTHROPIC_KEY", "TIER_OPENAI_KEY"].map(String::from).to_vec();
         let own = t.get("own").unwrap().route("hermes", None, None).unwrap();
-        assert_eq!(t.wiring(&own, true, |_| false).unwrap(), Wiring { fallback: Some(Vec::new()), ..Default::default() });
+        assert_eq!(t.wiring(&own, true, |_| false).unwrap(), Wiring { fallback: Some(Vec::new()), unused_keys: both.clone(), ..Default::default() });
         let open = t.get("open").unwrap().route("hermes", Some("m"), None).unwrap();
-        assert_eq!(t.wiring(&open, false, |_| false).unwrap(), Wiring::default());
+        assert_eq!(t.wiring(&open, false, |_| false).unwrap(), Wiring { unused_keys: both, ..Default::default() });
 
         // Admins see endpoints by name, with the key's secret name, never a key.
         let v = t.admin_view();

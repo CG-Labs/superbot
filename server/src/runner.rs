@@ -907,6 +907,7 @@ impl App {
                 self.seed_teammate_memory(&bot, &spot.memory);
             }
             let mut env = spot.env.clone();
+            env.retain(|k, _| !wiring.unused_keys.contains(k));
             env.insert("SUPERBOT_RUN_ID".into(), run_id.clone());
             if spot.screens
                 && spot.machine.is_none()
@@ -1027,8 +1028,12 @@ impl App {
                 self.say(&id, &draft, false);
             }
 
-            // The harness lost its session (e.g. its files were wiped): start fresh once.
+            // The harness lost its session (e.g. its files were wiped) or won't resume it
+            // on this route: start fresh once.
             let lost = errors.iter().any(|m| {
+                if gate.resume_refused(m) {
+                    return true;
+                }
                 let m = m.to_lowercase();
                 m.contains("no conversation found")
                     || m.contains("no session found")
@@ -1645,8 +1650,8 @@ impl App {
     /// The tier this run is on and the route it takes: the Bot owner's tier picks the
     /// model, never the Bot's settings alone (ADR 0033). The run is counted for the
     /// owner, within the tier's runs and tokens a billing period (ADR 0050). A route
-    /// whose provider is one of the tiers file's endpoints needs that endpoint's key in
-    /// `env` or botd's env (ADR 0076). None: refused, and the Bot said why.
+    /// whose provider is one of the tiers file's endpoints needs that endpoint's key
+    /// among the run's secrets, `env` (ADR 0076). None: refused, and the Bot said why.
     fn tier_route(&self, bot: &Bot, msg: &Message, by: &Who, period: &usage::Period, env: &HashMap<String, String>) -> Option<(String, Route, Wiring)> {
         let tier = self.tier_of(&bot.owner_id);
         let refused = |reason: &str, text: String, limit: Option<u64>, used: Option<u64>, more: Value| {
@@ -1674,12 +1679,12 @@ impl App {
             Ok(r) => r,
             Err(e) => return refused("tier_harness", format!("{e} Switch me to one of those in my settings."), None, None, Value::Null),
         };
-        let has_key = |k: &str| env.get(k).is_some_and(|v| !v.trim().is_empty()) || std::env::var(k).is_ok_and(|v| !v.trim().is_empty());
+        let has_key = |k: &str| env.get(k).is_some_and(|v| !v.trim().is_empty());
         let wiring = match self.tiers().wiring(&route, tier.managed(), has_key) {
             Ok(w) => w,
             Err(e) => {
                 let text = format!("The {} plan's model provider isn't set up on this server yet, so I didn't run. Ask an admin to save its key.", tier.label);
-                return refused("provider_key_missing", text, None, None, json!({ "provider": e.name, "keySecret": e.key_secret }));
+                return refused("provider_key_missing", text, None, None, json!({ "provider": e.name, "keyName": e.key_secret }));
             }
         };
         let (this, more) = match period.source {

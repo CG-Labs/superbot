@@ -70,7 +70,8 @@ pub struct RunInput {
     pub cwd: PathBuf,
     /// The model provider, for harnesses that take one (`supports_provider`).
     pub provider: Option<String>,
-    /// The tiers file's endpoints that `provider` and `fallback` name (ADR 0076).
+    /// The tiers file's endpoints that `provider` and `fallback` name (ADR 0076). Their
+    /// keys are in `env`, but reach the harness only through the adapter's `env`.
     pub endpoints: Vec<crate::tiers::Endpoint>,
     /// What to try, in order, when the provider fails. None: the harness's own
     /// settings. Some: exactly these, and no other provider.
@@ -175,6 +176,12 @@ pub trait Adapter: Send + Sync {
     fn models(&self) -> Vec<ModelOption>;
     /// Whether it uses `RunInput::provider`. Tiers may name a provider only for these.
     fn supports_provider(&self) -> bool {
+        false
+    }
+    /// Whether `error` says the harness won't resume its session with this run's
+    /// settings, as when the owner's tier moved the Bot to another route. The run then
+    /// starts a fresh session rather than run on the old route.
+    fn resume_refused(&self, _error: &str) -> bool {
         false
     }
     /// Environment the harness needs on top of `input.env`.
@@ -356,6 +363,10 @@ pub async fn aborted(mut abort: watch::Receiver<AbortReason>) {
 pub fn job_for(adapter: &mut dyn Adapter, input: &RunInput, out: &mut Vec<AgentEvent>) -> JobRequest {
     let args = adapter.args(input, out);
     let mut env: BTreeMap<String, String> = input.env.clone().into_iter().collect();
+    // A tier endpoint's key reaches the harness only as its adapter hands it over (ADR 0076).
+    for e in &input.endpoints {
+        env.remove(&e.key_secret);
+    }
     env.extend(adapter.env(input));
     let path = |p: &std::path::Path| p.display().to_string();
     JobRequest {

@@ -41,6 +41,12 @@ fn provider_id(name: &str) -> String {
     format!("superbot-{name}")
 }
 
+/// Where Hermes reads a tier endpoint's key from. Hermes strips `HERMES_PROVIDER_*_API_KEY`
+/// from everything it starts, whatever `env_passthrough` says, so the agent never sees it.
+fn key_var(name: &str) -> String {
+    format!("HERMES_PROVIDER_SUPERBOT_{}_API_KEY", name.to_ascii_uppercase().replace('-', "_"))
+}
+
 /// What Hermes calls a route's provider: the tier's endpoint of that name, else the
 /// name as given (a Hermes built-in, such as `openrouter`).
 fn hermes_provider(input: &RunInput, name: &str) -> String {
@@ -65,7 +71,7 @@ fn quote(s: &str) -> String {
 ///
 /// A tier's endpoints become `providers:` entries, with every field Hermes reads an
 /// endpoint's URL, key, or switch from set, so the Bot's own `config.yaml` can't point
-/// them elsewhere. On a managed tier the fallback chain is the route's (or none), the
+/// them elsewhere; each key comes from `key_var`. On a managed tier the fallback chain is the route's (or none), the
 /// legacy `fallback_model` is emptied, since Hermes chains both, and subagents can't
 /// pick their own provider (ADR 0076).
 fn managed_config(input: &RunInput, secret_names: &[String]) -> Value {
@@ -88,11 +94,11 @@ fn managed_config(input: &RunInput, secret_names: &[String]) -> Value {
                     Protocol::AnthropicMessages => "anthropic_messages",
                     Protocol::OpenaiChat => "chat_completions",
                 };
-                let id = provider_id(&e.name);
+                let (id, key) = (provider_id(&e.name), key_var(&e.name));
                 let entry = json!({
                     "name": id, "enabled": true, "transport": transport, "api_mode": transport,
                     "base_url": e.base_url, "api": e.base_url, "url": e.base_url,
-                    "key_env": e.key_secret, "api_key_env": e.key_secret,
+                    "key_env": key, "api_key_env": key,
                 });
                 (id, entry)
             })
@@ -164,13 +170,20 @@ impl Adapter for Hermes {
         true
     }
 
+    /// Hermes keeps a session on the provider and model it started with.
+    fn resume_refused(&self, error: &str) -> bool {
+        error.contains("creation overrides are unsupported on resume")
+    }
+
     fn env(&self, input: &RunInput) -> Vec<(String, String)> {
-        vec![
+        let mut env = vec![
             ("HERMES_HOME".into(), home(input).display().to_string()),
             ("HERMES_MANAGED_DIR".into(), managed_dir(input).display().to_string()),
             ("HERMES_ACCEPT_HOOKS".into(), "1".into()),
             ("HERMES_EPHEMERAL_SYSTEM_PROMPT".into(), input.system.clone()),
-        ]
+        ];
+        env.extend(input.endpoints.iter().filter_map(|e| Some((key_var(&e.name), input.env.get(&e.key_secret)?.clone()))));
+        env
     }
 
     fn stdin(&self, input: &RunInput) -> Option<String> {
@@ -439,12 +452,18 @@ mod tests {
         assert!(a.windows(2).any(|w| w == ["--provider", "superbot-gpt"]), "{a:?}");
         assert!(!a.contains(&"--base-url".to_string()), "{a:?}");
 
+        // Each key goes to Hermes under a name it keeps from everything it starts, and only
+        // as the adapter hands it over; one not saved isn't handed over at all.
+        let job = super::super::job_for(&mut Hermes::default(), &i, &mut Vec::new());
+        assert_eq!(job.env.get("HERMES_PROVIDER_SUPERBOT_GPT_API_KEY").map(String::as_str), Some("sk-o"));
+        assert!(!job.env.contains_key("TIER_OPENAI_KEY") && !job.env.contains_key("HERMES_PROVIDER_SUPERBOT_CLAUDE_API_KEY"), "{:?}", job.env.keys());
+
         let c = managed_config(&i, &["TIER_ANTHROPIC_KEY".to_string(), "NPM_TOKEN".to_string()]);
-        let url = "https://claude.example/v1";
+        let (url, key) = ("https://claude.example/v1", "HERMES_PROVIDER_SUPERBOT_CLAUDE_API_KEY");
         assert_eq!(
             c["providers"]["superbot-claude"],
             json!({ "name": "superbot-claude", "enabled": true, "transport": "anthropic_messages", "api_mode": "anthropic_messages",
-                    "base_url": url, "api": url, "url": url, "key_env": "TIER_ANTHROPIC_KEY", "api_key_env": "TIER_ANTHROPIC_KEY" })
+                    "base_url": url, "api": url, "url": url, "key_env": key, "api_key_env": key })
         );
         assert_eq!(c["providers"]["superbot-gpt"]["transport"], "chat_completions");
         // Exactly the route's chain: Hermes's legacy fallback emptied, subagents on the route.
@@ -525,6 +544,10 @@ mod tests {
         assert_eq!(events(&[r#"{"type": "result", "exit_code": 2, "text": ""}"#]), ["error Hermes failed (exit code 2)."]);
         let partial = events(&[r#"{"type": "text", "text": "Half"}"#, r#"{"type": "result", "session_id": "s", "exit_code": 3, "text": "Turn lost"}"#]);
         assert_eq!(partial, ["delta Half", "session s", "error Turn lost"]);
+        // A session started on another route (as v0.23.3 says it): the run starts fresh.
+        let moved = "Resume retains gateway session policy; creation overrides are unsupported on resume. -m/--model, --provider differ from this session's launch: resume without them and use /model after resuming to switch.";
+        assert!(Hermes::default().resume_refused(moved));
+        assert!(!Hermes::default().resume_refused("rate limited"));
     }
 
     #[tokio::test]
