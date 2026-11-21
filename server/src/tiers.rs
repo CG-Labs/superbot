@@ -24,6 +24,60 @@ pub struct Route {
     /// None: the harness's default effort.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// What the harness tries, in order, when the provider fails (rate limits, server
+    /// errors, auth, ...), for harnesses that take a provider (ADR 0076). Nothing else.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback: Vec<Fallback>,
+}
+
+/// One step of a route's fallback: another provider and model.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Fallback {
+    pub provider: String,
+    pub model: String,
+}
+
+/// The wire protocol a model endpoint speaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Protocol {
+    /// Anthropic's Messages API (`/v1/messages`).
+    AnthropicMessages,
+    /// OpenAI's Chat Completions API (`/chat/completions`).
+    OpenaiChat,
+}
+
+/// A model endpoint the tiers file names, which routes and fallbacks use as their
+/// provider (ADR 0076). The key stays in the secrets store; the file names its secret.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Endpoint {
+    #[serde(skip)]
+    pub name: String,
+    pub protocol: Protocol,
+    /// No trailing slash.
+    pub base_url: String,
+    pub key_secret: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct EndpointCfg {
+    protocol: Protocol,
+    base_url: String,
+    key_secret: String,
+}
+
+/// What a run on a route needs from the tiers file besides the route: the endpoints
+/// it and its fallbacks name, and the fallbacks it may take.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Wiring {
+    pub endpoints: Vec<Endpoint>,
+    /// None: the harness's own settings (an open tier). Some: exactly these.
+    pub fallback: Option<Vec<Fallback>>,
+    /// Fallbacks left out because their endpoint's key isn't saved.
+    pub skipped: Vec<Fallback>,
 }
 
 /// Unset is unlimited.
@@ -92,7 +146,7 @@ impl Tier {
     /// no route for the harness: the Bot can't run until it's moved to one that does.
     pub fn route(&self, harness: &str, model: Option<&str>, effort: Option<&str>) -> Result<Route, String> {
         let Some(routes) = &self.routes else {
-            return Ok(Route { harness: harness.into(), provider: None, model: model.map(String::from), effort: effort.map(String::from) });
+            return Ok(Route { harness: harness.into(), provider: None, model: model.map(String::from), effort: effort.map(String::from), fallback: Vec::new() });
         };
         let mut of = routes.iter().filter(|r| r.harness == harness);
         let first = of.clone().next().ok_or_else(|| self.harness_error(harness))?;
@@ -140,6 +194,8 @@ impl Tier {
 pub struct Tiers {
     list: Vec<Tier>,
     default: usize,
+    /// The file's named endpoints, by name.
+    providers: Vec<Endpoint>,
     /// "built-in", or the file they came from.
     pub source: String,
 }
@@ -155,7 +211,33 @@ impl Default for Tiers {
 struct FileCfg {
     #[serde(default)]
     default: Option<String>,
+    #[serde(default)]
+    providers: std::collections::BTreeMap<String, EndpointCfg>,
     tiers: Vec<TierCfg>,
+}
+
+const MAX_FALLBACKS: usize = 3;
+
+/// A named endpoint, checked: its URL is handed to the harness and its key secret is
+/// read from the secrets store, so neither may be anything else.
+fn endpoint(name: &str, e: EndpointCfg) -> Result<Endpoint, String> {
+    let at = |e: String| format!("provider \"{name}\": {e}");
+    if !slug(name) {
+        return Err(at("names are up to 32 lowercase letters, digits, and dashes".into()));
+    }
+    let url = e.base_url.trim().trim_end_matches('/').to_string();
+    let host = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")).unwrap_or_default();
+    let host = host.split(['/', '?', '#']).next().unwrap_or_default();
+    let ok = url.len() <= 200 && !host.is_empty() && !host.contains('@') && !url.chars().any(|c| c.is_whitespace() || c.is_control());
+    if !ok {
+        return Err(at(format!("baseUrl \"{url}\" must be an http(s) URL of up to 200 characters, without a user or password")));
+    }
+    let key = e.key_secret.trim().to_string();
+    crate::secrets::check_name(&key).map_err(|e| at(format!("keySecret: {e}")))?;
+    if crate::secrets::server_secret(&key) || crate::adapters::secret_env().contains(&key) {
+        return Err(at(format!("keySecret: {key} is one of botd's own secrets")));
+    }
+    Ok(Endpoint { name: name.into(), protocol: e.protocol, base_url: url, key_secret: key })
 }
 
 #[derive(Deserialize)]
@@ -200,16 +282,18 @@ impl Tiers {
     /// The built-in tier: any harness and model, no limits.
     pub fn self_host() -> Tiers {
         let t = Tier { name: SELF_HOST.into(), label: "Self-host".into(), routes: None, limits: Limits::default(), stripe_prices: Vec::new() };
-        Tiers { list: vec![t], default: 0, source: "built-in".into() }
+        Tiers { list: vec![t], default: 0, providers: Vec::new(), source: "built-in".into() }
     }
 
-    /// `{"default"?: name, "tiers": [{name, label?, routes: "any" | [route, ...], limits?}]}`.
-    /// `default` (here, or `DEFAULT_TIER` over it) else the first tier is the default.
+    /// `{"default"?: name, "providers"?: {name: endpoint}, "tiers": [{name, label?,
+    /// routes: "any" | [route, ...], limits?}]}`. `default` (here, or `DEFAULT_TIER`
+    /// over it) else the first tier is the default.
     pub fn parse(raw: &str, default: Option<&str>) -> Result<Tiers, String> {
         let cfg: FileCfg = serde_json::from_str(raw).map_err(|e| e.to_string())?;
         if cfg.tiers.is_empty() {
             return Err("list at least one tier".into());
         }
+        let providers = cfg.providers.into_iter().map(|(name, e)| endpoint(&name, e)).collect::<Result<Vec<_>, _>>()?;
         let mut list: Vec<Tier> = Vec::new();
         for t in cfg.tiers {
             let name = t.name.trim().to_string();
@@ -233,14 +317,29 @@ impl Tiers {
                         let Some(adapter) = crate::adapters::get(&harness) else {
                             return Err(at(format!("harness \"{harness}\" must be one of {}", crate::adapters::NAMES.join(", "))));
                         };
-                        let route = Route {
+                        let mut route = Route {
                             provider: word("provider", &r.provider).map_err(at)?,
                             model: word("model", &r.model).map_err(at)?,
                             effort: word("effort", &r.effort).map_err(at)?,
                             harness,
+                            fallback: Vec::new(),
                         };
-                        if route.provider.is_some() && !adapter.supports_provider() {
+                        if (route.provider.is_some() || !r.fallback.is_empty()) && !adapter.supports_provider() {
                             return Err(at(format!("the {} harness doesn't take a provider", route.harness)));
+                        }
+                        if r.fallback.len() > MAX_FALLBACKS {
+                            return Err(at(format!("a route has at most {MAX_FALLBACKS} fallbacks")));
+                        }
+                        for f in &r.fallback {
+                            let f = Fallback {
+                                provider: word("fallback provider", &Some(f.provider.clone())).map_err(at)?.unwrap_or_default(),
+                                model: word("fallback model", &Some(f.model.clone())).map_err(at)?.unwrap_or_default(),
+                            };
+                            let primary = route.provider.as_deref() == Some(f.provider.as_str()) && route.model.as_deref() == Some(f.model.as_str());
+                            if primary || route.fallback.contains(&f) {
+                                return Err(at(format!("fallback {} {} is listed twice", f.provider, f.model)));
+                            }
+                            route.fallback.push(f);
                         }
                         if routes.iter().any(|x| x.harness == route.harness && x.model == route.model) {
                             return Err(at(format!("{} {} is listed twice", route.harness, route.model.as_deref().unwrap_or("(default model)"))));
@@ -281,7 +380,7 @@ impl Tiers {
             None => 0,
             Some(d) => list.iter().position(|t| t.name == d).ok_or_else(|| format!("the default tier \"{d}\" isn't listed"))?,
         };
-        Ok(Tiers { list, default, source: "inline".into() })
+        Ok(Tiers { list, default, providers, source: "inline".into() })
     }
 
     /// `TIERS_FILE` (a JSON file as `parse` reads it) and `DEFAULT_TIER`.
@@ -335,11 +434,64 @@ impl Tiers {
                 format!("{} ({routes}{default})", t.name)
             })
             .collect();
-        format!("{} from {}", names.join(", "), self.source)
+        let providers = match self.providers.len() {
+            0 => String::new(),
+            1 => ", 1 provider".into(),
+            n => format!(", {n} providers"),
+        };
+        format!("{}{providers} from {}", names.join(", "), self.source)
+    }
+
+    pub fn providers(&self) -> &[Endpoint] {
+        &self.providers
+    }
+
+    fn endpoint(&self, name: &str) -> Option<&Endpoint> {
+        self.providers.iter().find(|e| e.name == name)
+    }
+
+    /// What a run on `route` gets, given which secrets it has. A provider this file
+    /// doesn't name is the harness's own (a built-in, keyed from the harness's usual
+    /// env). Err: the endpoint the route's own provider names, whose key isn't saved.
+    /// A fallback whose key isn't saved is left out. `managed`: pin the fallbacks to the
+    /// route's, so the harness's own settings can't add another provider.
+    pub fn wiring(&self, route: &Route, managed: bool, has_key: impl Fn(&str) -> bool) -> Result<Wiring, Endpoint> {
+        let mut w = Wiring::default();
+        let mut uses: Vec<&Endpoint> = Vec::new();
+        if let Some(e) = route.provider.as_deref().and_then(|p| self.endpoint(p)) {
+            if !has_key(&e.key_secret) {
+                return Err(e.clone());
+            }
+            uses.push(e);
+        }
+        let mut fallback = Vec::new();
+        for f in &route.fallback {
+            match self.endpoint(&f.provider) {
+                Some(e) if !has_key(&e.key_secret) => w.skipped.push(f.clone()),
+                Some(e) => {
+                    uses.push(e);
+                    fallback.push(f.clone());
+                }
+                None => fallback.push(f.clone()),
+            }
+        }
+        for e in uses {
+            if !w.endpoints.contains(e) {
+                w.endpoints.push(e.clone());
+            }
+        }
+        w.fallback = managed.then_some(fallback);
+        Ok(w)
     }
 
     pub fn admin_view(&self) -> Value {
-        json!({ "default": self.default_tier().name, "source": self.source, "tiers": self.list.iter().map(Tier::admin_view).collect::<Vec<_>>() })
+        let providers: serde_json::Map<String, Value> = self.providers.iter().map(|e| (e.name.clone(), json!(e))).collect();
+        json!({
+            "default": self.default_tier().name,
+            "source": self.source,
+            "providers": providers,
+            "tiers": self.list.iter().map(Tier::admin_view).collect::<Vec<_>>(),
+        })
     }
 }
 
@@ -391,7 +543,7 @@ mod tests {
         assert!(d.allows_harness("codex"));
         // Anything goes, exactly as the Bot is set: today's behaviour.
         let r = d.route("codex", Some("gpt-5-codex"), Some("high")).unwrap();
-        assert_eq!(r, Route { harness: "codex".into(), provider: None, model: Some("gpt-5-codex".into()), effort: Some("high".into()) });
+        assert_eq!(r, Route { harness: "codex".into(), provider: None, model: Some("gpt-5-codex".into()), effort: Some("high".into()), fallback: Vec::new() });
         assert!(d.check("pi", Some("anything/at-all"), Some("max"), None).is_ok());
         assert!(Tiers::from_env(|k| if k == "DEFAULT_TIER" { "self-host".into() } else { String::new() }).is_ok());
         let e = Tiers::from_env(|k| if k == "DEFAULT_TIER" { "pro".into() } else { String::new() }).unwrap_err();
@@ -528,6 +680,81 @@ mod tests {
         assert!(v.get("routes").is_none() && !v.to_string().contains("sonnet"), "{v}");
         assert!(t.get("pro").unwrap().admin_view()["routes"].to_string().contains("sonnet"));
         assert_eq!(t.get("self-host").unwrap().admin_view()["routes"], "any");
+    }
+
+    const TWO_PROVIDERS: &str = r#"{
+      "providers": {
+        "claude-api": { "protocol": "anthropic-messages", "baseUrl": "https://api.anthropic.example/", "keySecret": "TIER_ANTHROPIC_KEY" },
+        "gpt-api": { "protocol": "openai-chat", "baseUrl": "https://api.openai.example/v1", "keySecret": "TIER_OPENAI_KEY" }
+      },
+      "tiers": [
+        { "name": "basic", "routes": [{ "harness": "hermes", "provider": "gpt-api", "model": "gpt-5-mini",
+            "fallback": [{ "provider": "claude-api", "model": "claude-haiku-4-5" }, { "provider": "openrouter", "model": "x/y" }] }] },
+        { "name": "plus", "routes": [{ "harness": "hermes", "provider": "claude-api", "model": "claude-sonnet-4-5" }] },
+        { "name": "own", "routes": [{ "harness": "hermes" }] },
+        { "name": "open", "routes": "any" }
+      ]
+    }"#;
+
+    #[test]
+    fn routes_name_providers_and_fallbacks() {
+        let t = Tiers::parse(TWO_PROVIDERS, None).unwrap();
+        let claude = t.endpoint("claude-api").unwrap();
+        assert_eq!((claude.protocol, claude.base_url.as_str(), claude.key_secret.as_str()), (Protocol::AnthropicMessages, "https://api.anthropic.example", "TIER_ANTHROPIC_KEY"));
+        assert_eq!(t.endpoint("gpt-api").unwrap().protocol, Protocol::OpenaiChat);
+        let basic = t.get("basic").unwrap().route("hermes", None, None).unwrap();
+        assert_eq!(basic.fallback.len(), 2);
+
+        // Every key saved: the endpoints the route uses, once each, and its whole chain.
+        let all = t.wiring(&basic, true, |_| true).unwrap();
+        assert_eq!(all.endpoints.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["gpt-api", "claude-api"]);
+        assert_eq!(all.fallback.as_deref(), Some(basic.fallback.as_slice()));
+        assert!(all.skipped.is_empty());
+        // A fallback without its key is left out; the route's own provider without its key refuses.
+        let no_claude = t.wiring(&basic, true, |k| k != "TIER_ANTHROPIC_KEY").unwrap();
+        assert_eq!(no_claude.fallback.unwrap(), [Fallback { provider: "openrouter".into(), model: "x/y".into() }]);
+        assert_eq!(no_claude.skipped[0].provider, "claude-api");
+        assert_eq!(t.wiring(&basic, true, |k| k != "TIER_OPENAI_KEY").unwrap_err().name, "gpt-api");
+        // No fallback listed: none on a managed tier; the harness's own on an open one.
+        let plus = t.get("plus").unwrap().route("hermes", None, None).unwrap();
+        assert_eq!(t.wiring(&plus, true, |_| true).unwrap().fallback, Some(Vec::new()));
+        let own = t.get("own").unwrap().route("hermes", None, None).unwrap();
+        assert_eq!(t.wiring(&own, true, |_| false).unwrap(), Wiring { fallback: Some(Vec::new()), ..Default::default() });
+        let open = t.get("open").unwrap().route("hermes", Some("m"), None).unwrap();
+        assert_eq!(t.wiring(&open, false, |_| false).unwrap(), Wiring::default());
+
+        // Admins see endpoints by name, with the key's secret name, never a key.
+        let v = t.admin_view();
+        assert_eq!(v["providers"]["gpt-api"], json!({ "protocol": "openai-chat", "baseUrl": "https://api.openai.example/v1", "keySecret": "TIER_OPENAI_KEY" }));
+        assert_eq!(v["tiers"][0]["routes"][0]["fallback"][0], json!({ "provider": "claude-api", "model": "claude-haiku-4-5" }));
+        assert!(!t.get("basic").unwrap().view().to_string().contains("gpt-api"));
+        assert!(t.describe().contains("2 providers"), "{}", t.describe());
+        assert!(tiers().admin_view()["providers"].as_object().unwrap().is_empty());
+
+        let bad = |raw: String| Tiers::parse(&raw, None).unwrap_err();
+        let provider = |p: &str| bad(format!(r#"{{"providers":{{{p}}},"tiers":[{{"name":"a","routes":"any"}}]}}"#));
+        let endpoint = |name: &str, url: &str, key: &str| provider(&format!(r#""{name}":{{"protocol":"openai-chat","baseUrl":"{url}","keySecret":"{key}"}}"#));
+        assert!(endpoint("Gpt", "https://x.example", "K").contains("lowercase"));
+        for url in ["ftp://x.example", "https://", "https://me:pw@x.example", "https://x.example/a b", "x.example"] {
+            assert!(endpoint("p", url, "K").contains("baseUrl"), "{url}");
+        }
+        assert!(endpoint("p", &format!("https://x.example/{}", "a".repeat(200)), "K").contains("baseUrl"));
+        assert!(endpoint("p", "https://x.example", "lower").contains("keySecret"));
+        for own in ["SUPERBOT_MASTER_KEY", "BOT_TOKEN", "AUTH_PASSWORD", "SMTP_PASSWORD", "SSO_GITHUB_CLIENT_SECRET"] {
+            assert!(endpoint("p", "https://x.example", own).contains("keySecret"), "{own}");
+        }
+        assert!(provider(r#""p":{"protocol":"grpc","baseUrl":"https://x.example","keySecret":"K"}"#).contains("unknown variant"));
+        assert!(provider(r#""p":{"protocol":"openai-chat","baseUrl":"https://x.example","keySecret":"K","apiKey":"sk"}"#).contains("unknown field"));
+        assert!(provider(r#""p":{"protocol":"openai-chat","baseUrl":"https://x.example"}"#).contains("keySecret"));
+
+        let route = |r: &str| bad(format!(r#"{{"tiers":[{{"name":"a","routes":[{r}]}}]}}"#));
+        assert!(route(r#"{"harness":"claude","fallback":[{"provider":"p","model":"m"}]}"#).contains("doesn't take a provider"));
+        assert!(route(r#"{"harness":"hermes","fallback":[{"provider":"p"}]}"#).contains("model"));
+        assert!(route(r#"{"harness":"hermes","fallback":[{"provider":"p","model":"--yolo"}]}"#).contains("not starting with -"));
+        assert!(route(r#"{"harness":"hermes","provider":"p","model":"m","fallback":[{"provider":"p","model":"m"}]}"#).contains("twice"));
+        assert!(route(r#"{"harness":"hermes","fallback":[{"provider":"p","model":"m"},{"provider":"p","model":"m"}]}"#).contains("twice"));
+        let four = r#"{"provider":"p","model":"a"},{"provider":"p","model":"b"},{"provider":"p","model":"c"},{"provider":"p","model":"d"}"#;
+        assert!(route(&format!(r#"{{"harness":"hermes","fallback":[{four}]}}"#)).contains("at most 3"));
     }
 
     #[test]

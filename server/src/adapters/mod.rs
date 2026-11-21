@@ -70,6 +70,11 @@ pub struct RunInput {
     pub cwd: PathBuf,
     /// The model provider, for harnesses that take one (`supports_provider`).
     pub provider: Option<String>,
+    /// The tiers file's endpoints that `provider` and `fallback` name (ADR 0076).
+    pub endpoints: Vec<crate::tiers::Endpoint>,
+    /// What to try, in order, when the provider fails. None: the harness's own
+    /// settings. Some: exactly these, and no other provider.
+    pub fallback: Option<Vec<crate::tiers::Fallback>>,
     pub model: Option<String>,
     /// Reasoning effort, in the harness's own words (e.g. "high").
     pub effort: Option<String>,
@@ -488,6 +493,8 @@ mod tests {
             session_id: None,
             cwd: dir.to_path_buf(),
             provider: None,
+            endpoints: Vec::new(),
+            fallback: None,
             model: None,
             effort: None,
             env: HashMap::from([("PATH".into(), "/opt/superbot/bin:/usr/bin:/bin".into())]),

@@ -8,6 +8,7 @@
 
 use super::{describe, str_of, Adapter, AgentEvent, ModelOption, RunInput};
 use crate::machines::wire::JobCleanup;
+use crate::tiers::Protocol;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -35,6 +36,21 @@ fn managed_dir(input: &RunInput) -> PathBuf {
     input.config_dir.join("hermes-managed")
 }
 
+/// A tier endpoint's name in Hermes: prefixed, so it never shadows a Hermes built-in.
+fn provider_id(name: &str) -> String {
+    format!("superbot-{name}")
+}
+
+/// What Hermes calls a route's provider: the tier's endpoint of that name, else the
+/// name as given (a Hermes built-in, such as `openrouter`).
+fn hermes_provider(input: &RunInput, name: &str) -> String {
+    if input.endpoints.iter().any(|e| e.name == name) {
+        provider_id(name)
+    } else {
+        name.to_string()
+    }
+}
+
 fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -44,10 +60,18 @@ fn quote(s: &str) -> String {
 /// Tools only see secret-looking variables listed in `env_passthrough`, so every
 /// variable SuperBot sets for the run (BOT_TOKEN, saved secrets) is listed, plus
 /// `secret_names`: secrets Bots get by inheriting botd's env, which aren't in
-/// `input.env`. Hermes itself refuses its provider keys there. botd owns memory and routines.
+/// `input.env`. Hermes itself refuses its provider keys there, and botd leaves out the
+/// keys of the tier's endpoints. botd owns memory and routines.
+///
+/// A tier's endpoints become `providers:` entries, with every field Hermes reads an
+/// endpoint's URL, key, or switch from set, so the Bot's own `config.yaml` can't point
+/// them elsewhere. On a managed tier the fallback chain is the route's (or none), the
+/// legacy `fallback_model` is emptied, since Hermes chains both, and subagents can't
+/// pick their own provider (ADR 0076).
 fn managed_config(input: &RunInput, secret_names: &[String]) -> Value {
     let inherited = secret_names.iter().filter(|n| crate::secrets::check_name(n).is_ok());
-    let mut passthrough: Vec<&String> = input.env.keys().chain(inherited).collect();
+    let keys: Vec<&str> = input.endpoints.iter().map(|e| e.key_secret.as_str()).collect();
+    let mut passthrough: Vec<&String> = input.env.keys().chain(inherited).filter(|n| !keys.contains(&n.as_str())).collect();
     passthrough.sort();
     passthrough.dedup();
     let mut c = json!({
@@ -55,6 +79,33 @@ fn managed_config(input: &RunInput, secret_names: &[String]) -> Value {
         "memory": { "memory_enabled": false, "user_profile_enabled": false },
         "agent": { "disabled_toolsets": ["cronjob"] },
     });
+    if !input.endpoints.is_empty() {
+        let entries: serde_json::Map<String, Value> = input
+            .endpoints
+            .iter()
+            .map(|e| {
+                let transport = match e.protocol {
+                    Protocol::AnthropicMessages => "anthropic_messages",
+                    Protocol::OpenaiChat => "chat_completions",
+                };
+                let id = provider_id(&e.name);
+                let entry = json!({
+                    "name": id, "enabled": true, "transport": transport, "api_mode": transport,
+                    "base_url": e.base_url, "api": e.base_url, "url": e.base_url,
+                    "key_env": e.key_secret, "api_key_env": e.key_secret,
+                });
+                (id, entry)
+            })
+            .collect();
+        c["providers"] = Value::Object(entries);
+    }
+    if let Some(fallback) = &input.fallback {
+        let chain: Vec<Value> = fallback.iter().map(|f| json!({ "provider": hermes_provider(input, &f.provider), "model": f.model })).collect();
+        c["fallback_providers"] = json!(chain);
+        c["fallback_model"] = json!([]);
+        // Subagents inherit the route and its chain rather than picking their own.
+        c["delegation"] = json!({ "provider": "", "model": "", "base_url": "", "api_key": "", "api_mode": "", "fallback_providers": null });
+    }
     if let Some(g) = &input.guard {
         // The hook runs in the daemon's folder, not the Bot's, so name the real one.
         let command = format!("{} --cwd {}", g.command, quote(&input.cwd.display().to_string()));
@@ -94,9 +145,14 @@ impl Adapter for Hermes {
         if let Some(e) = &input.effort {
             a.extend(["--reasoning".into(), e.clone()]);
         }
-        // A tier's route names the provider (ADR 0033); else the server's setting.
+        // A tier's route names the provider (ADR 0033, 0076); else the server's provider
+        // and endpoint. The server's endpoint is never sent with the route's provider.
         let env = |var: &str| std::env::var(var).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
-        for (value, flag) in [(input.provider.clone().or_else(|| env("SUPERBOT_HERMES_PROVIDER")), "--provider"), (env("SUPERBOT_HERMES_BASE_URL"), "--base-url")] {
+        let (provider, base_url) = match &input.provider {
+            Some(p) => (Some(hermes_provider(input, p)), None),
+            None => (env("SUPERBOT_HERMES_PROVIDER"), env("SUPERBOT_HERMES_BASE_URL")),
+        };
+        for (value, flag) in [(provider, "--provider"), (base_url, "--base-url")] {
             if let Some(v) = value {
                 a.extend([flag.into(), v]);
             }
@@ -250,6 +306,8 @@ mod tests {
             session_id: None,
             cwd: "/srv/it's here".into(),
             provider: None,
+            endpoints: Vec::new(),
+            fallback: None,
             model: None,
             effort: None,
             env: HashMap::from([("BOT_TOKEN".into(), "t0k3n".into()), ("GITHUB_TOKEN".into(), "ghp_x".into())]),
@@ -359,6 +417,52 @@ mod tests {
         write_files(&bypass);
         let c: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(c.get("hooks").is_none(), "{c}");
+        let _ = std::fs::remove_dir_all(&i.state_dir);
+    }
+
+    fn endpoint(name: &str, protocol: Protocol, key: &str) -> crate::tiers::Endpoint {
+        crate::tiers::Endpoint { name: name.into(), protocol, base_url: format!("https://{name}.example/v1"), key_secret: key.into() }
+    }
+
+    #[test]
+    fn tier_endpoints_and_fallbacks() {
+        use crate::tiers::Fallback;
+        let mut i = input(false);
+        i.provider = Some("gpt".into());
+        i.endpoints = vec![endpoint("gpt", Protocol::OpenaiChat, "TIER_OPENAI_KEY"), endpoint("claude", Protocol::AnthropicMessages, "TIER_ANTHROPIC_KEY")];
+        i.fallback = Some(vec![Fallback { provider: "claude".into(), model: "claude-haiku-4-5".into() }, Fallback { provider: "openrouter".into(), model: "x/y".into() }]);
+        i.env.insert("TIER_OPENAI_KEY".into(), "sk-o".into());
+
+        // A tier endpoint is named so it can't shadow a Hermes built-in, and the server's
+        // own endpoint never goes with a route's provider.
+        let a = Hermes::default().args(&i, &mut Vec::new());
+        assert!(a.windows(2).any(|w| w == ["--provider", "superbot-gpt"]), "{a:?}");
+        assert!(!a.contains(&"--base-url".to_string()), "{a:?}");
+
+        let c = managed_config(&i, &["TIER_ANTHROPIC_KEY".to_string(), "NPM_TOKEN".to_string()]);
+        let url = "https://claude.example/v1";
+        assert_eq!(
+            c["providers"]["superbot-claude"],
+            json!({ "name": "superbot-claude", "enabled": true, "transport": "anthropic_messages", "api_mode": "anthropic_messages",
+                    "base_url": url, "api": url, "url": url, "key_env": "TIER_ANTHROPIC_KEY", "api_key_env": "TIER_ANTHROPIC_KEY" })
+        );
+        assert_eq!(c["providers"]["superbot-gpt"]["transport"], "chat_completions");
+        // Exactly the route's chain: Hermes's legacy fallback emptied, subagents on the route.
+        assert_eq!(c["fallback_providers"], json!([{ "provider": "superbot-claude", "model": "claude-haiku-4-5" }, { "provider": "openrouter", "model": "x/y" }]));
+        assert_eq!(c["fallback_model"], json!([]));
+        assert_eq!((c["delegation"]["provider"].as_str(), c["delegation"]["base_url"].as_str()), (Some(""), Some("")));
+        // The endpoints' keys never reach the agent's shell.
+        assert_eq!(c["terminal"]["env_passthrough"], json!(["BOT_TOKEN", "GITHUB_TOKEN", "NPM_TOKEN"]));
+        assert!(!c.to_string().contains("sk-o"));
+
+        // An open tier leaves fallbacks to the Bot's own Hermes settings.
+        i.fallback = None;
+        let c = managed_config(&i, &[]);
+        assert!(c.get("fallback_providers").is_none() && c.get("fallback_model").is_none() && c.get("delegation").is_none(), "{c}");
+        // A built-in provider is passed as is, with no endpoints written.
+        (i.provider, i.endpoints) = (Some("openrouter".into()), Vec::new());
+        assert!(Hermes::default().args(&i, &mut Vec::new()).windows(2).any(|w| w == ["--provider", "openrouter"]));
+        assert!(managed_config(&i, &[]).get("providers").is_none());
         let _ = std::fs::remove_dir_all(&i.state_dir);
     }
 
