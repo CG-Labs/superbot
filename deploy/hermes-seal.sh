@@ -27,7 +27,7 @@ data=$home/.hermes
 launcher=$data/hermes-agent/.hermes/bin/hermes
 [[ -x "$launcher" ]] || die "$launcher is missing"
 # The launcher execs Hermes's own Python: `exec <python> -I -c '...'`.
-python=$(sed -n 's/^exec \(\/[^ ]*python3[^ ]*\) .*/\1/p' "$launcher" | head -1)
+python=$(sed -n '/^exec \/[^ ]*python3/{s/^exec \(\/[^ ]*\) .*/\1/p;q;}' "$launcher")
 [[ -n "$python" && -x "$python" ]] || die "can't find the Python $launcher runs"
 
 "$python" -I - "$data" <<'PY'
@@ -89,7 +89,7 @@ for _ in 1 2; do
   out=$(env -i PATH=/usr/bin:/bin LANG=C.UTF-8 HOME="$probe/home" HERMES_HOME="$probe/hermes" \
     "$home/.local/bin/hermes" config path 2>&1) || die "a fresh data root can't start Hermes: $out"
 done
-if find "$probe/hermes" -path '*/installs/*' \( -name environments -o -name facts.json \) | grep -q .; then
+if [[ -n "$(find "$probe/hermes" -path '*/installs/*' \( -name environments -o -name facts.json \) -print -quit)" ]]; then
   die "a fresh data root still builds its own environment"
 fi
 [[ ! -e "$data/$venv/../.leases" ]] || die "a run wrote into the shared environment"
