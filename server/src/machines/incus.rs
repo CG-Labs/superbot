@@ -71,9 +71,6 @@ const STOP_WAIT: u64 = 30;
 const FORCE_WAIT: u64 = 20;
 const EDIT_WAIT: u64 = 30;
 const REBUILD_WAIT: u64 = 60;
-/// How long botd keeps watching a rebuild that outlasts REBUILD_WAIT, to start the
-/// container once it's done.
-const REBUILD_FINISH: u64 = 30 * 60;
 
 /// What a plan gives a container.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -490,7 +487,6 @@ impl Credentials {
     }
 }
 
-#[derive(Clone)]
 pub struct Incus {
     s: Settings,
     egress: Vec<Rule>,
@@ -727,8 +723,8 @@ impl Incus {
             .metadata)
     }
 
-    /// Whether a create of `n` is still running.
-    async fn creating(&self, n: &str) -> Result<bool, ProviderError> {
+    /// Whether an operation on `n` (its create, a rebuild) is still running.
+    async fn busy(&self, n: &str) -> Result<bool, ProviderError> {
         let ops = self.call(Method::GET, "/1.0/operations", &[("recursion", "1")], None, None).await?;
         let url = format!("/1.0/instances/{n}");
         Ok(ops
@@ -798,6 +794,9 @@ impl Incus {
     async fn start(&self, n: &str) -> Result<(), ProviderError> {
         if self.status(n).await? == "Running" {
             return Ok(());
+        }
+        if self.busy(n).await? {
+            return Err(ProviderError::Transport("Incus is still working on the container (a rebuild?)".into()));
         }
         self.set_state(n, "start", false, FORCE_WAIT).await
     }
@@ -871,33 +870,6 @@ impl Incus {
                 d.get("eth0") == Some(&self.nic(acl)) && d.iter().all(|(k, dev)| k == "eth0" || dev["type"] != "nic")
             })
     }
-
-    /// Starts `n` once its rebuild `op` succeeds, for a rebuild slower than
-    /// REBUILD_WAIT. Lost if botd restarts meanwhile; the rebuild worker then sends
-    /// the rebuild again when the machine doesn't enroll.
-    fn start_after(&self, op: String, n: String) {
-        let me = self.clone();
-        tokio::spawn(async move {
-            let until = tokio::time::Instant::now() + Duration::from_secs(REBUILD_FINISH);
-            while tokio::time::Instant::now() < until {
-                match me.wait(&op, 60).await {
-                    Ok(true) => {
-                        if let Err(e) = me.start(&n).await {
-                            eprintln!("Incus: starting {n} after its rebuild: {e}");
-                        }
-                        return;
-                    }
-                    Ok(false) | Err(ProviderError::Transport(_)) => tokio::time::sleep(Duration::from_secs(1)).await,
-                    Err(e) => {
-                        eprintln!("Incus: rebuilding {n}: {e}");
-                        return;
-                    }
-                }
-            }
-            eprintln!("Incus: {n} was still rebuilding after {} minutes; not starting it", REBUILD_FINISH / 60);
-        });
-    }
-
     fn root(&self, size: &Size) -> Value {
         json!({ "type": "disk", "path": "/", "pool": self.s.pool, "size": format!("{}GiB", size.disk_gib) })
     }
@@ -1131,7 +1103,7 @@ impl MachineProvider for Incus {
         Box::pin(async move {
             match self.instance(id).await {
                 Ok(v) => machine(&v),
-                Err(ProviderError::NotFound) if self.creating(id).await? => Ok(provisioning(id)),
+                Err(ProviderError::NotFound) if self.busy(id).await? => Ok(provisioning(id)),
                 Err(e) => Err(e),
             }
         })
@@ -1202,7 +1174,7 @@ impl MachineProvider for Incus {
             };
             match res {
                 Ok(r) => self.finish(r, FORCE_WAIT, "deleting the container").await,
-                Err(ProviderError::NotFound) if self.creating(id).await? => Err(ProviderError::Transport(
+                Err(ProviderError::NotFound) if self.busy(id).await? => Err(ProviderError::Transport(
                     "Incus is still creating the container; it's deleted once made".into(),
                 )),
                 Err(ProviderError::NotFound) => Ok(()),
@@ -1234,14 +1206,9 @@ impl MachineProvider for Incus {
                     None,
                 )
                 .await?;
-            if let Some(op) = r.operation
-                && !self.wait(&op, REBUILD_WAIT).await?
-            {
-                self.start_after(op, id.to_string());
-                return Err(ProviderError::Transport(
-                    "Incus is still rebuilding the container; botd starts it once that's done".into(),
-                ));
-            }
+            // Slower than that, it's left stopped: the rebuild worker starts it once
+            // Incus is done, if it's still meant to be running.
+            self.finish(r, REBUILD_WAIT, "rebuilding the container").await?;
             self.start(id).await
         })
     }

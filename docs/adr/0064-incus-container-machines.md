@@ -52,7 +52,7 @@ It also needs `MACHINE_CONTROL_URL` and `MACHINE_FIREWALL=on`. The firewall is w
 | resize | New `limits.*` and root disk size, applied to the running container. |
 | backups | `snapshots.schedule=@daily`, kept 7 days, on the container's own pool. |
 | destroy | Forced stop, then delete. A missing container counts as deleted only once no create of it is still running, so a create that finishes late can't leave one behind. |
-| rebuild ([ADR 0056](0056-rebuilding-machines-enrolled-before-0039.md)) | Forced stop, new cloud-init user data, `POST .../rebuild` from the image, start. Same name, address and firewall. A rebuild that outlasts 60 s is reported as maybe sent, and botd keeps watching it for up to 30 minutes to start the container once it's done. If botd restarts meanwhile, the rebuild worker sends it again when the machine doesn't enroll. |
+| rebuild ([ADR 0056](0056-rebuilding-machines-enrolled-before-0039.md)) | Forced stop, new cloud-init user data, `POST .../rebuild` from the image, start. Same name, address and firewall. A rebuild that outlasts 60 s is reported as maybe sent and left stopped. While it waits for the machine to enroll, the rebuild worker starts a stopped machine under the control plane's lock, only if it is still meant to be running (not suspended meanwhile). Incus refuses to start it while the rebuild still runs. |
 
 The provider trait gained defaults so Linode is unchanged: `substrate()` (`vm` or `container`), default tiers and image, `check_plan`, `plan_view`, `settings` and `preflight`.
 
@@ -151,7 +151,7 @@ Unit tests cover:
 - settings and credentials;
 - the exact create body;
 - refusal without the firewall or in a loosened project;
-- every lifecycle call, held and failed creates, deleting during a held create, a slow rebuild that still ends started, and the ACL round trip, including tampering and NICs loosened in place;
+- every lifecycle call, held and failed creates, deleting during a held create, a slow rebuild left stopped until Incus is done (and the rebuild worker starting it only if it wasn't suspended), and the ACL round trip, including tampering and NICs loosened in place;
 - the pin and trust checks.
 
 Integration tests run botd end to end on loopback. A user's container is requested over HTTP, made behind the ACL, enrolled by the real agent from its cloud-init user data, and heartbeats over mutual TLS. It is then suspended, resumed, resized, snapshotted and destroyed, and the ACL goes with the last machine. Two users' containers are isolated, the reconciler restores a container removed from the ACL and loosened outbound rules, the admin view and preflight work, and machines from another provider are left alone.

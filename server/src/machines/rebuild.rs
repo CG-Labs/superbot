@@ -352,6 +352,16 @@ pub(super) async fn step(app: &App, cp: &ControlPlane, e: &Enrollment, machine_i
                 }
                 return;
             }
+            // A provider whose rebuild outlasted its answer leaves it stopped; start it
+            // here, under the lock, only while it's still meant to be running.
+            if let Some(pid) = &m.provider_id
+                && let Ok(pm) = p.get(pid).await
+                && matches!(pm.status.as_str(), "stopped" | "offline")
+                && let Err(err) = p.boot(pid).await
+                && !transient(&err)
+            {
+                eprintln!("Machine rebuild: starting {} after its rebuild: {err}", m.id);
+            }
             if at > deadline {
                 let why = format!("It didn't enroll again within {} minutes of the rebuild.", (deadline - sent) / 60_000);
                 app.db.revoke_machine_tokens(&m.id);

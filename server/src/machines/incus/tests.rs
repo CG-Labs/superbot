@@ -290,7 +290,7 @@ async fn suspend_resume_resize_backups_rebuild_and_delete() {
 }
 
 #[tokio::test]
-async fn a_slow_rebuild_still_ends_with_the_container_started() {
+async fn a_slow_rebuild_is_left_stopped_and_starts_only_once_incus_is_done() {
     let s = StandIn::start().await;
     let p = incus(&s);
     p.create_firewall("superbot-fw", &["superbot".into()], &[agent_rule()]).await.unwrap();
@@ -301,19 +301,16 @@ async fn a_slow_rebuild_still_ends_with_the_container_started() {
         Err(ProviderError::Transport(m)) => assert!(m.contains("still rebuilding"), "{m}"),
         other => panic!("{other:?}"),
     }
-    assert_eq!(s.instance("superbot-m1").unwrap().status, "Stopped");
+    assert_eq!(s.instance("superbot-m1").unwrap().status, "Stopped", "nothing starts it behind the control plane");
+    match p.boot("superbot-m1").await {
+        Err(ProviderError::Transport(m)) => assert!(m.contains("still working"), "{m}"),
+        other => panic!("not started mid-rebuild: {other:?}"),
+    }
+    assert!(s.calls("PUT", "/1.0/instances/superbot-m1/state").iter().all(|c| c.body["action"] != "start"));
     s.release();
-    let started = async {
-        loop {
-            let i = s.instance("superbot-m1").unwrap();
-            if i.status == "Running" {
-                return i;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    };
-    let i = tokio::time::timeout(std::time::Duration::from_secs(10), started).await.expect("started once rebuilt");
-    assert_eq!(i.rebuilt, 1);
+    p.boot("superbot-m1").await.unwrap();
+    let i = s.instance("superbot-m1").unwrap();
+    assert_eq!((i.status.as_str(), i.rebuilt), ("Running", 1));
     assert_eq!(i.source["alias"], "ubuntu/26.04/cloud");
 }
 
