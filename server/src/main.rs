@@ -64,6 +64,8 @@ mod machines_teammates_tests;
 mod machines_offboard_tests;
 #[cfg(test)]
 mod machines_placement_tests;
+#[cfg(test)]
+mod machines_resize_tests;
 mod passwd;
 mod notify;
 #[cfg(test)]

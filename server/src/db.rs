@@ -5078,7 +5078,6 @@ impl Db {
 
     /// Asks for `machine_id` to become `(tier, plan)`, replacing any resize not yet done.
     /// Returns whether it was saved: not when the same one is open already.
-    #[allow(clippy::too_many_arguments)]
     pub fn machine_resize_queue(&self, machine_id: &str, tier: &str, plan: &str, from: (&str, &str), cause: &str, event: Option<&str>) -> bool {
         let at = now();
         self.c()
@@ -5135,6 +5134,15 @@ impl Db {
         let _ = self.c().execute(
             "UPDATE machines SET disk_used = ?, disk_total = ?, disk_seen_at = ? WHERE id = ?",
             params![b(used), b(total), now(), machine_id],
+        );
+    }
+
+    /// Forgets a machine's resize, as if none was ever asked for.
+    #[cfg(test)]
+    pub fn machine_resize_forget(&self, machine_id: &str) {
+        let _ = self.c().execute(
+            "UPDATE machines SET resize_state = NULL, resize_tier = NULL, resize_plan = NULL WHERE id = ?",
+            params![machine_id],
         );
     }
 
