@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (21 Nov 2026). Records the measurement for item 2 of the [ADR 0011 checklist](0011-hermes-agent-backend.md#recommendation), the release checklist for making Hermes Agent the default harness on managed tiers ([ADR 0027](0027-expo-primary-hermes-default.md)). Part of [#33](https://github.com/CG-Labs/superbot/issues/33) (M3).
+Accepted (21 Nov 2026). Records the measurement for item 2 of the [ADR 0011 checklist](0011-hermes-agent-backend.md#recommendation), the release checklist for making Hermes Agent the default harness on managed tiers ([ADR 0027](0027-expo-primary-hermes-default.md)). Part of [#33](https://github.com/CG-Labs/superbot/issues/33) (M3). The shared-environment condition and the update check are handled by [ADR 0072](0072-one-hermes-environment-per-host.md).
 
 ## Context
 
@@ -107,5 +107,5 @@ The fake model makes these numbers a floor. With a real model, contexts are larg
 - ADR 0011's checklist now records each item's status; item 2 is measured, with the conditions above.
 - `server/tests/harness_e2e.rs` shares its fake model and throwaway botd with the new test through `server/tests/common/`. The fake model can now hold each call for a set time and counts calls.
 - The `harness-e2e` workflow gains a Footprint job (about 10 minutes: four CLI installs, a release build, the runs) on the same triggers as the hook tests.
-- Follow-ups on [#33](https://github.com/CG-Labs/superbot/issues/33): a shared Hermes environment across Bots; a per-machine concurrent-run cap by tier; a test that a hook timeout blocks in the real Hermes; a Hermes pin bump through the suite; two providers through tier routing; why every third Hermes run is 10 s slower; turning Hermes's update check off for managed Bots.
+- Follow-ups on [#33](https://github.com/CG-Labs/superbot/issues/33): a shared Hermes environment across Bots (done, [ADR 0072](0072-one-hermes-environment-per-host.md)); a per-machine concurrent-run cap by tier; a test that a hook timeout blocks in the real Hermes; a Hermes pin bump through the suite; two providers through tier routing; why every third Hermes run is 10 s slower; turning Hermes's update check off for managed Bots (done, ADR 0072).
 - Not measured: the browser and computer use, screens (Xvfb and friends), per-user Unix accounts (`ISOLATION=users`), harness sandboxes (off here, as in the hook tests), and real model contexts.
