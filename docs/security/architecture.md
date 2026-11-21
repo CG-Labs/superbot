@@ -47,7 +47,7 @@ flowchart LR
   Botd -- "starts, per run" --> H
   H --> WS
   H -- "approval checks, botctl" --> Botd
-  H -- "HTTPS" --> Model
+  H -- "HTTPS (operator-set URL)" --> Model
   Caddy -- "/screen/…?token" --> Scr
 ```
 
@@ -83,7 +83,7 @@ flowchart LR
   AgentA -- "enroll, certificate rotation" --> MPort
   HA -- "Bot API calls with its run token" --> MPort
   AgentA --> HA --> DA
-  HA -- "HTTPS" --> Model
+  HA -- "HTTPS (operator-set URL)" --> Model
   AgentA --> SA
   Botd --> AgentB
 ```

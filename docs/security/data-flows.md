@@ -58,7 +58,7 @@ Chat history, approvals, policy, secrets and the audit log stay on the control p
 | botd to Incus | Mutual TLS, with the Incus host's certificate pinned by SHA-256 ([ADR 0065](../adr/0065-incus-container-machines.md)). |
 | botd to Stripe, Expo, Linode, S3, IdPs, webhooks | HTTPS with certificate checks. Webhook and S3 URLs must be HTTPS (plain HTTP only to loopback, for tests). |
 | botd to SMTP | STARTTLS by default, or implicit TLS. Plain text only to a relay on the same machine ([ADR 0061](../adr/0061-approval-notifications.md)). |
-| Harness to model provider | The harness's own HTTPS client. |
+| Harness to model provider | The harness's own client, to the provider's URL. A provider in the plan routing file (`TIERS_FILE`) may use `http://` to any host, and the harness then sends prompts and the key unencrypted. Use `https://`. |
 
 ### At rest
 
