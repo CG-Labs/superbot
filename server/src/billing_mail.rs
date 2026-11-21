@@ -578,7 +578,8 @@ async fn send_one(app: &App, m: &BillingMail, q: &Queued) -> Result<bool, String
             let e = crate::secrets::redact::text(&e).into_owned();
             let retry = attempts < MAX_ATTEMPTS;
             let saved = app.db.billing_email_result(q.id, if retry { "pending" } else { "failed" }, Some(&e));
-            eprintln!("billing: billing email {} ({}) failed (try {attempts}): {e}", q.id, q.kind);
+            // SMTP errors can name the recipient: the details go to the audit event only.
+            eprintln!("billing: a billing email failed (try {attempts}); see billing.email_failed in the audit log");
             d["error"] = json!(e);
             d["retrying"] = json!(retry);
             app.db.record(&by.event("billing.email_failed").target("user", &q.user_id).outcome(Outcome::Failure).details(d));
