@@ -15,8 +15,8 @@
 
 use super::{Credentials, DEFAULT_IMAGE, DEFAULT_TIERS, Incus, Settings, Size, host_cidr};
 use crate::machines::provider::{
-    ByteStream, CreateSpec, FirewallDevices, FirewallRule, Fut, HostInfo, HostStatus, Hosts, MachineProvider,
-    ProviderError, ProviderFirewall, ProviderMachine, RebuildSpec, RestoreSpec,
+    ByteStream, CreateSpec, FirewallDevices, FirewallRule, Fut, HostInfo, HostStatus, Hosts, MachineProvider, Policy,
+    ProviderError, ProviderFirewall, ProviderMachine, RebuildSpec, Resources, RestoreSpec,
 };
 use crate::secrets::SecretStore;
 use serde_json::{Value, json};
@@ -29,12 +29,40 @@ pub const DEFAULT_DOWN_MINUTES: i64 = 10;
 pub struct Member {
     pub name: String,
     pub incus: Incus,
+    /// What its machines may be given in all (ADR 0081). None: no limit.
+    pub capacity: Option<Resources>,
+    pub max_machines: Option<u64>,
+}
+
+impl Member {
+    pub fn new(name: &str, incus: Incus) -> Member {
+        Member { name: name.into(), incus, capacity: None, max_machines: None }
+    }
 }
 
 pub struct Fleet {
     members: Vec<Member>,
     status: Mutex<HashMap<String, HostStatus>>,
     down_after_ms: i64,
+    policy: Policy,
+}
+
+/// INCUS_CAPACITY: `c<cpus>-m<memory GiB>-d<disk GiB>`, as plans are, e.g. `c32-m128-d2000`.
+pub fn capacity(raw: &str) -> Result<Resources, String> {
+    let bad = || format!("\"{}\" isn't a capacity: c<cpus>-m<memory GiB>-d<disk GiB>, e.g. c32-m128-d2000", crate::audit::clip(raw, 40));
+    let num = |s: &str, prefix: char| {
+        s.strip_prefix(prefix)
+            .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && !n.starts_with('0'))
+            .and_then(|n| n.parse::<u64>().ok())
+            .filter(|n| *n <= 1 << 30)
+    };
+    let parts: Vec<&str> = raw.trim().split('-').collect();
+    let [c, m, d] = parts[..] else { return Err(bad()) };
+    Ok(Resources {
+        cpus: num(c, 'c').ok_or_else(bad)?,
+        memory_gib: num(m, 'm').ok_or_else(bad)?,
+        disk_gib: num(d, 'd').ok_or_else(bad)?,
+    })
 }
 
 /// Host names: as Incus names go, but short, so they read well in ids and settings.
@@ -83,11 +111,19 @@ fn merged(mut found: Vec<ProviderFirewall>) -> ProviderFirewall {
 impl Fleet {
     pub fn new(members: Vec<Member>, down_after_ms: i64) -> Fleet {
         let status = members.iter().map(|m| (m.name.clone(), HostStatus::Up)).collect();
-        Fleet { members, status: Mutex::new(status), down_after_ms }
+        Fleet { members, status: Mutex::new(status), down_after_ms, policy: Policy::default() }
+    }
+
+    pub fn with_policy(mut self, policy: Policy) -> Fleet {
+        self.policy = policy;
+        self
     }
 
     /// INCUS_URL and the INCUS_* settings for the first host, INCUS_HOSTS for the rest,
-    /// and INCUS_HOST_DOWN_MINUTES.
+    /// INCUS_HOST_DOWN_MINUTES, and placement (ADR 0081): INCUS_PLACEMENT, and each
+    /// host's INCUS_CAPACITY and INCUS_MAX_MACHINES (the first host's unless
+    /// `_<NAME>` sets its own). Capacity is set for every host or for none, so the
+    /// least loaded host is one measure across them all.
     pub fn from_env(store: &dyn SecretStore, var: &dyn Fn(&str) -> String) -> Result<Fleet, String> {
         let main = Some(var("INCUS_HOST_NAME").trim().to_string()).filter(|v| !v.is_empty()).unwrap_or(DEFAULT_HOST.into());
         if !host_name(&main) {
@@ -126,15 +162,39 @@ impl Fleet {
             }
             built.push((n.clone(), s, Credentials::for_host(store, sfx.as_deref())?));
         }
+        let policy = Policy::parse(&var("INCUS_PLACEMENT")).ok_or("INCUS_PLACEMENT must be spread or fill")?;
+        let own = |k: &str, n: &str, first: bool| -> (String, String) {
+            let key = if first { k.to_string() } else { format!("{k}_{}", suffix(n)) };
+            let v = var(&key);
+            match v.trim() {
+                "" if !first => (k.to_string(), var(k)),
+                _ => (key, v),
+            }
+        };
         let every: Vec<String> = built.iter().filter_map(|(_, s, _)| host_cidr(&s.url)).collect();
         let mut members = Vec::new();
-        for (name, mut s, c) in built {
+        for (i, (name, mut s, c)) in built.into_iter().enumerate() {
             s.deny.extend(every.iter().cloned());
             s.deny.sort();
             s.deny.dedup();
-            members.push(Member { name, incus: Incus::new(s, c)? });
+            let (key, raw) = own("INCUS_CAPACITY", &name, i == 0);
+            let cap = Some(raw.trim()).filter(|r| !r.is_empty()).map(capacity).transpose().map_err(|e| format!("{key}: {e}"))?;
+            let (key, raw) = own("INCUS_MAX_MACHINES", &name, i == 0);
+            let max = match raw.trim() {
+                "" => None,
+                v => Some(v.parse::<u64>().ok().filter(|n| (1..=100_000).contains(n)).ok_or(format!("{key} must be 1 to 100000"))?),
+            };
+            members.push(Member { capacity: cap, max_machines: max, ..Member::new(&name, Incus::new(s, c)?) });
         }
-        Ok(Fleet::new(members, down * 60_000))
+        if let Some(m) = members.iter().find(|m| m.capacity.is_none())
+            && members.iter().any(|m| m.capacity.is_some())
+        {
+            return Err(format!(
+                "INCUS_CAPACITY: set for every Incus host or none; host {} has none (INCUS_CAPACITY for all, INCUS_CAPACITY_<NAME> for one)",
+                m.name
+            ));
+        }
+        Ok(Fleet::new(members, down * 60_000).with_policy(policy))
     }
 
     fn member(&self, host: &str) -> Option<&Member> {
@@ -198,6 +258,10 @@ impl MachineProvider for Fleet {
         Size::parse(plan).ok().map(|s| s.view())
     }
 
+    fn plan_resources(&self, plan: &str) -> Option<Resources> {
+        Size::parse(plan).ok().map(|s| Resources { cpus: s.cpus.into(), memory_gib: s.memory_gib.into(), disk_gib: s.disk_gib.into() })
+    }
+
     /// The first host's settings, as with one host, and every host.
     fn settings(&self) -> Value {
         let mut v = self.members[0].incus.settings();
@@ -207,10 +271,14 @@ impl MachineProvider for Fleet {
             .zip(&self.members)
             .map(|(h, m)| {
                 let s = m.incus.base();
-                json!({ "name": h.name, "url": h.url, "serverCertificate": h.fingerprint, "project": s.project, "network": s.network, "storagePool": s.pool, "status": h.status })
+                json!({
+                    "name": h.name, "url": h.url, "serverCertificate": h.fingerprint, "project": s.project, "network": s.network,
+                    "storagePool": s.pool, "status": h.status, "capacity": h.capacity, "maxMachines": h.max_machines,
+                })
             })
             .collect::<Vec<_>>());
         v["hostDownMinutes"] = json!(self.down_after_ms / 60_000);
+        v["placement"] = json!(self.policy);
         v
     }
 
@@ -228,11 +296,12 @@ impl MachineProvider for Fleet {
         })
     }
 
+    /// On the first host that is up. The control plane places machines by load with
+    /// `create_on`.
     fn create<'a>(&'a self, spec: &'a CreateSpec) -> Fut<'a, ProviderMachine> {
         Box::pin(async move {
             let host = self.placement().ok_or_else(no_host)?;
-            let m = self.member(&host).ok_or_else(no_host)?;
-            m.incus.create(spec).await.map(|pm| prefixed(m, pm))
+            self.create_on(&host, spec).await
         })
     }
 
@@ -497,8 +566,24 @@ impl Hosts for Fleet {
                 url: m.incus.base().url.clone(),
                 fingerprint: m.incus.fingerprint().to_string(),
                 status: s.get(&m.name).copied().unwrap_or(HostStatus::Up),
+                capacity: m.capacity,
+                max_machines: m.max_machines,
             })
             .collect()
+    }
+
+    fn policy(&self) -> Policy {
+        self.policy
+    }
+
+    fn create_on<'a>(&'a self, host: &'a str, spec: &'a CreateSpec) -> Fut<'a, ProviderMachine> {
+        Box::pin(async move {
+            if !self.is(host, HostStatus::Up) {
+                return Err(ProviderError::Transport(format!("Incus host {host} isn't up")));
+            }
+            let m = self.member(host).ok_or_else(|| ProviderError::Transport(format!("Incus host {host} isn't configured (INCUS_HOSTS)")))?;
+            m.incus.create(spec).await.map(|pm| prefixed(m, pm))
+        })
     }
 
     fn host_of(&self, id: &str) -> String {
@@ -611,6 +696,45 @@ mod tests {
         assert!(Fleet::from_env(&s, &base(vec![("INCUS_HOSTS", "b=https://192.0.2.50".into()), ("INCUS_PROJECT_B", "superbot-b".into())])).is_ok());
     }
 
+    #[test]
+    fn capacity_and_placement_come_from_the_environment() {
+        let (other, _) = self_signed("incus-b.test");
+        let (s, _) = store(&[("INCUS_SERVER_CERT_B", &other)]);
+        let two = |extra: Vec<(&'static str, String)>| {
+            let mut v = vec![("INCUS_URL", "https://192.0.2.50".to_string()), ("INCUS_HOSTS", "b=https://198.51.100.7".to_string())];
+            v.extend(extra);
+            Fleet::from_env(&s, &vars(v))
+        };
+        let f = two(vec![]).unwrap();
+        assert_eq!((f.policy(), f.configured()[1].capacity, f.configured()[1].max_machines), (Policy::Spread, None, None), "no limits unless set");
+
+        // The first host's are every host's, unless a host sets its own.
+        let f = two(vec![
+            ("INCUS_CAPACITY", "c32-m128-d2000".into()),
+            ("INCUS_CAPACITY_B", "c8-m32-d500".into()),
+            ("INCUS_MAX_MACHINES", "40".into()),
+            ("INCUS_PLACEMENT", "Fill".into()),
+        ])
+        .unwrap();
+        let hosts = f.configured();
+        assert_eq!(hosts[0].capacity, Some(Resources { cpus: 32, memory_gib: 128, disk_gib: 2000 }));
+        assert_eq!(hosts[1].capacity, Some(Resources { cpus: 8, memory_gib: 32, disk_gib: 500 }));
+        assert_eq!((hosts[0].max_machines, hosts[1].max_machines, f.policy()), (Some(40), Some(40), Policy::Fill));
+        assert_eq!(f.settings()["hosts"][1]["capacity"]["memoryGiB"], 32);
+        assert_eq!(f.plan_resources("c2-m4-d40"), Some(Resources { cpus: 2, memory_gib: 4, disk_gib: 40 }));
+
+        for (extra, want) in [
+            (vec![("INCUS_CAPACITY_B", "c8-m32-d500".to_string())], "set for every Incus host or none; host main"),
+            (vec![("INCUS_CAPACITY", "32 cpus".to_string())], "INCUS_CAPACITY: \"32 cpus\" isn't a capacity"),
+            (vec![("INCUS_CAPACITY", "c32-m128-d2000".to_string()), ("INCUS_CAPACITY_B", "c0-m1-d1".to_string())], "INCUS_CAPACITY_B:"),
+            (vec![("INCUS_MAX_MACHINES_B", "0".to_string())], "INCUS_MAX_MACHINES_B must be 1 to 100000"),
+            (vec![("INCUS_PLACEMENT", "random".to_string())], "INCUS_PLACEMENT must be spread or fill"),
+        ] {
+            let e = two(extra.clone()).err().unwrap();
+            assert!(e.contains(want), "{extra:?}: {e}");
+        }
+    }
+
     #[tokio::test]
     async fn ids_name_their_host_and_a_lost_one_is_never_called() {
         let (other, _) = self_signed("incus-b.test");
@@ -625,6 +749,18 @@ mod tests {
 
         f.set_status("main", HostStatus::Down);
         assert_eq!(f.placement().as_deref(), Some("b"), "nothing new goes to a down host");
+        let spec = CreateSpec {
+            label: "superbot-m1".into(),
+            plan: "c1-m2-d20".into(),
+            region: "local".into(),
+            image: DEFAULT_IMAGE.into(),
+            tags: vec![],
+            authorized_keys: vec![],
+            user_data: None,
+            firewall_id: None,
+        };
+        assert!(matches!(f.create_on("main", &spec).await, Err(ProviderError::Transport(m)) if m.contains("isn't up")));
+        assert!(matches!(f.create_on("nowhere", &spec).await, Err(ProviderError::Transport(_))));
         f.set_status("b", HostStatus::Down);
         assert_eq!(f.placement(), None);
         assert!(matches!(f.find_firewall("superbot-fw").await, Err(ProviderError::Transport(m)) if m.contains("no Incus host is up")));

@@ -19,6 +19,7 @@
 
 use super::backup::{self, Move};
 use super::enroll;
+use super::placement;
 use super::provider::{HostStatus, Hosts};
 use super::{ControlPlane, SYSTEM, State, Step, conflict, event, next};
 use crate::audit::{Outcome, Who};
@@ -177,10 +178,10 @@ pub async fn watch(app: &AppState, cp: &ControlPlane) -> usize {
     down
 }
 
-/// Where a restore of `m` goes: `host` if given, else its own host, or the first host
-/// that is up when its own was lost. Onto another host, its own must be up (its old
-/// container is deleted) or lost.
-pub(super) fn restore_move(cp: &ControlPlane, m: &Machine, host: Option<&str>) -> Res<Move> {
+/// Where a restore of `m` goes: `host` if given, else its own host, or the host
+/// placement picks (ADR 0081) when its own was lost. Onto another host, its own must
+/// be up (its old container is deleted) or lost, and the new one open with room.
+pub(super) fn restore_move(app: &App, cp: &ControlPlane, m: &Machine, host: Option<&str>) -> Res<Move> {
     let Some(h) = cp.hosts() else {
         return match host {
             Some(_) => Err(bad("This server has one Incus host, so there's nowhere else to restore onto (INCUS_HOSTS, ADR 0076).")),
@@ -190,9 +191,8 @@ pub(super) fn restore_move(cp: &ControlPlane, m: &Machine, host: Option<&str>) -
     let from = machine_host(h, m).unwrap_or_else(|| h.host_of(&m.label));
     let to = match host {
         Some(t) => t.to_string(),
-        None if h.status(&from) == Some(HostStatus::Lost) => h
-            .placement()
-            .ok_or_else(|| conflict(format!("Its host {from} was declared lost, and no other host is up to restore onto.")))?,
+        None if h.status(&from) == Some(HostStatus::Lost) => placement::choose(app, cp, &m.plan, Some(&from))
+            .map_err(|why| conflict(format!("Its host {from} was declared lost, and there's nowhere to restore it. {why}")))?,
         None => from.clone(),
     };
     let names: Vec<String> = h.configured().into_iter().map(|c| c.name).collect();
@@ -207,6 +207,9 @@ pub(super) fn restore_move(cp: &ControlPlane, m: &Machine, host: Option<&str>) -
             "Its host {from} is down, so its container there can't be deleted. If that host is gone for good, declare it lost: botctl machine host recover {from}."
         )));
     }
+    if to != from {
+        placement::fits(app, cp, &m.plan, &to).map_err(conflict)?;
+    }
     Ok(Move { from: Some(from), to: Some(to), reason: None })
 }
 
@@ -217,22 +220,101 @@ fn row_view(app: &App, cp: &ControlPlane, h: &dyn Hosts, row: &MachineHost, conf
     v
 }
 
-/// Every host botd has known, configured ones first.
+/// Every host botd has known, configured ones first, with each configured one's load
+/// and where a new machine of the first tier would go now.
 pub fn view(app: &App, cp: &ControlPlane) -> Option<Value> {
     let h = cp.hosts()?;
     let rows: HashMap<String, MachineHost> = app.db.machine_hosts().into_iter().map(|r| (r.name.clone(), r)).collect();
     let configured = h.configured();
+    let loads = placement::loads(app, cp, h);
     let mut out: Vec<Value> = configured
         .iter()
-        .map(|c| match rows.get(&c.name) {
-            Some(r) => row_view(app, cp, h, r, true),
-            None => json!({ "name": c.name, "url": c.url, "fingerprint": c.fingerprint, "state": c.status, "configured": true, "machines": on(app, cp, h, &c.name).len() }),
+        .map(|c| {
+            let mut v = match rows.get(&c.name) {
+                Some(r) => row_view(app, cp, h, r, true),
+                None => json!({ "name": c.name, "url": c.url, "fingerprint": c.fingerprint, "state": c.status, "configured": true, "machines": on(app, cp, h, &c.name).len() }),
+            };
+            v["load"] = loads.iter().find(|l| l.name == c.name).map_or(Value::Null, |l| l.view());
+            v
         })
         .collect();
     let mut rest: Vec<&MachineHost> = rows.values().filter(|r| !configured.iter().any(|c| c.name == r.name)).collect();
     rest.sort_by_key(|r| (r.created_at, r.name.clone()));
     out.extend(rest.into_iter().map(|r| row_view(app, cp, h, r, false)));
-    Some(json!({ "hosts": out, "placement": h.placement(), "downMinutes": h.down_after_ms() / 60_000 }))
+    let mut v = json!({ "hosts": out, "policy": h.policy(), "downMinutes": h.down_after_ms() / 60_000 });
+    if let Some((tier, plan)) = cp.tiers.first() {
+        match placement::choose(app, cp, plan, None) {
+            Ok(host) => v["placement"] = json!(host),
+            Err(why) => (v["placement"], v["placementRefused"]) = (Value::Null, json!(why)),
+        }
+        v["placementFor"] = json!({ "tier": tier, "plan": plan });
+    }
+    Some(v)
+}
+
+/// `{reason?}`: why the host is drained, for whoever looks next.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DrainBody {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// The configured host `name` that isn't lost, for draining.
+fn drainable(app: &App, h: &dyn Hosts, name: &str) -> Res<MachineHost> {
+    let row = app.db.machine_host(name.trim()).ok_or_else(|| not_found("Incus host"))?;
+    if row.state == "lost" {
+        return Err(conflict(format!("Host {} was declared lost; nothing goes there anyway.", row.name)));
+    }
+    if !h.configured().iter().any(|c| c.name == row.name) {
+        return Err(conflict(format!("Host {} isn't in INCUS_HOSTS any more; nothing goes there anyway.", row.name)));
+    }
+    Ok(row)
+}
+
+fn host_view(app: &App, cp: &ControlPlane, name: &str) -> Value {
+    view(app, cp)
+        .and_then(|v| v["hosts"].as_array().and_then(|hs| hs.iter().find(|x| x["name"] == name).cloned()))
+        .unwrap_or_default()
+}
+
+/// `PUT /api/machines/hosts/{name}/drain` `{reason?}`: nothing new is placed on the
+/// host (ADR 0081): no new machines, and no restores onto it from elsewhere. Its
+/// machines stay; move them one at a time with a restore `--host`. Again, nothing
+/// changes.
+pub async fn drain(
+    AppS(app): AppS<AppState>,
+    Extension(a): Extension<Arc<Auth>>,
+    Extension(by): Extension<Who>,
+    Path(name): Path<String>,
+    Json(req): Json<DrainBody>,
+) -> Res {
+    let cp = need_hosts(&a)?;
+    let h = cp.hosts().ok_or_else(|| not_found("Incus host"))?;
+    let reason = req.reason.as_deref().map(str::trim).filter(|r| !r.is_empty()).map(|r| crate::audit::clip(r, 200).to_string());
+    if reason.as_deref().is_some_and(|r| r.chars().any(char::is_control)) {
+        return Err(bad("reason: one line of text"));
+    }
+    let _g = cp.ops.lock().await;
+    let row = drainable(&app, h, &name)?;
+    if app.db.machine_host_drain(&row.name, by.actor.id.as_deref(), reason.as_deref()) {
+        let n = on(&app, cp, h, &row.name).len();
+        record(&app, &by, "machine.host_drained", &row.name, Outcome::Success, json!({ "reason": reason, "machines": n }));
+    }
+    Ok(Json(host_view(&app, cp, &row.name)))
+}
+
+/// `DELETE /api/machines/hosts/{name}/drain`: new machines may go there again.
+pub async fn undrain(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Path(name): Path<String>) -> Res {
+    let cp = need_hosts(&a)?;
+    let h = cp.hosts().ok_or_else(|| not_found("Incus host"))?;
+    let _g = cp.ops.lock().await;
+    let row = drainable(&app, h, &name)?;
+    if app.db.machine_host_undrain(&row.name) {
+        let d = json!({ "drainedAt": row.drained_at, "drainedBy": row.drained_by, "reason": row.drain_reason });
+        record(&app, &by, "machine.host_undrained", &row.name, Outcome::Success, d);
+    }
+    Ok(Json(host_view(&app, cp, &row.name)))
 }
 
 fn need_hosts(a: &Auth) -> Res<&ControlPlane> {
@@ -280,28 +362,35 @@ pub async fn recover(
     let h = cp.hosts().ok_or_else(|| not_found("Incus host"))?;
     let name = name.trim().to_string();
     let row = app.db.machine_host(&name).ok_or_else(|| not_found("Incus host"))?;
-    let to = match req.to.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-        Some(t) => t.to_string(),
-        None => h
-            .configured()
-            .into_iter()
-            .find(|c| c.name != name && c.status == HostStatus::Up)
-            .map(|c| c.name)
-            .ok_or_else(|| conflict("No other Incus host is up to restore onto. Add one to INCUS_HOSTS and restart botd.".into()))?,
-    };
-    if to == name {
-        return Err(bad("A host's machines are restored onto another host."));
-    }
-    if !h.configured().iter().any(|c| c.name == to) {
-        return Err(bad(format!("There's no Incus host \"{}\".", crate::audit::clip(&to, 40))));
-    }
-    if let Some(s) = h.status(&to).filter(|s| *s != HostStatus::Up) {
-        return Err(conflict(format!("Host {to} is {}; restore onto a host that is up.", s.as_str())));
+    // Onto `to` if given, else each machine where placement puts it (ADR 0081).
+    let to = req.to.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(String::from);
+    match &to {
+        Some(t) if *t == name => return Err(bad("A host's machines are restored onto another host.")),
+        Some(t) if !h.configured().iter().any(|c| c.name == *t) => {
+            return Err(bad(format!("There's no Incus host \"{}\".", crate::audit::clip(t, 40))));
+        }
+        Some(t) => {
+            if let Some(s) = h.status(t).filter(|s| *s != HostStatus::Up) {
+                return Err(conflict(format!("Host {t} is {}; restore onto a host that is up.", s.as_str())));
+            }
+            if let Some(why) = placement::loads(&app, cp, h).iter().find(|l| l.name == *t).and_then(|l| l.closed()) {
+                return Err(conflict(format!("Host {why}; restore onto a host that is open.")));
+            }
+        }
+        None => {
+            let open: Vec<String> = placement::loads(&app, cp, h).into_iter().filter(|l| l.name != name && l.closed().is_none()).map(|l| l.name).collect();
+            if open.is_empty() {
+                return Err(conflict(
+                    "No other Incus host is up and open to restore onto. Add one to INCUS_HOSTS and restart botd, or undrain one (botctl machine host undrain <name>).".into(),
+                ));
+            }
+        }
     }
     if row.state != "lost" && h.configured().iter().any(|c| c.name == name) && h.probe(&name).await.is_ok() {
         if app.db.machine_host_answered(&name) {
             h.set_status(&name, HostStatus::Up);
         }
+        let to = to.as_deref().unwrap_or("<host>");
         return Err(conflict(format!(
             "Host {name} answers, so its containers are still there. Move its machines one at a time (botctl machine restore <user> <backup-id> --host {to}), which deletes each old container, or try again once it doesn't answer."
         )));
@@ -323,10 +412,11 @@ pub async fn recover(
     let declared = app.db.machine_host_lost(&name, by.actor.id.as_deref());
     h.set_status(&name, HostStatus::Lost);
     if declared {
-        record(&app, &by, "machine.host_lost", &name, Outcome::Failure, json!({ "url": row.url, "machines": machines.len(), "to": to }));
+        let d = json!({ "url": row.url, "machines": machines.len(), "to": to, "placement": h.policy() });
+        record(&app, &by, "machine.host_lost", &name, Outcome::Failure, d);
     }
-    let mv = Move { from: Some(name.clone()), to: Some(to.clone()), reason: Some(HOST_LOST) };
     let (mut restoring, mut unrestorable, mut skipped) = (Vec::new(), Vec::new(), Vec::new());
+    let mut onto: Vec<String> = Vec::new();
     let mut runs = Vec::new();
     for m in machines {
         // Nothing from that host's disks is trusted again, even while a restore is underway.
@@ -343,13 +433,31 @@ pub async fn recover(
             continue;
         }
         match app.db.machine_last_backup(&m.id) {
-            Some(b) => match backup::begin_restore(&app, cp, &m, &b, &by, &mv) {
-                Some(r) => {
-                    restoring.push(json!({ "machineId": m.id, "userId": m.user_id, "restore": r }));
-                    runs.push((r, b));
+            Some(b) => {
+                // Each placed with the ones before it counted, so a host isn't filled past its room.
+                let target = match &to {
+                    Some(t) => placement::fits(&app, cp, &m.plan, t).map(|()| t.clone()),
+                    None => placement::choose(&app, cp, &m.plan, Some(&name)),
+                };
+                let t = match target {
+                    Ok(t) => t,
+                    Err(why) => {
+                        skipped.push(json!({ "machineId": m.id, "userId": m.user_id, "reason": why }));
+                        continue;
+                    }
+                };
+                let mv = Move { from: Some(name.clone()), to: Some(t.clone()), reason: Some(HOST_LOST) };
+                match backup::begin_restore(&app, cp, &m, &b, &by, &mv) {
+                    Some(r) => {
+                        restoring.push(json!({ "machineId": m.id, "userId": m.user_id, "toHost": t, "restore": r }));
+                        runs.push((r, b));
+                        if !onto.contains(&t) {
+                            onto.push(t);
+                        }
+                    }
+                    None => skipped.push(json!({ "machineId": m.id, "userId": m.user_id, "reason": "A restore began meanwhile." })),
                 }
-                None => skipped.push(json!({ "machineId": m.id, "userId": m.user_id, "reason": "A restore began meanwhile." })),
-            },
+            }
             None => {
                 unrestorable.push(json!({ "machineId": m.id, "userId": m.user_id }));
                 let why = format!("Its host {name} was lost, and it has no off-host backup to restore. Destroy it and request a new one.");
@@ -367,7 +475,8 @@ pub async fn recover(
         }
     }
     if declared {
-        let mut lines = vec![format!("{} machines are being restored onto {to} from their newest off-host backups.", restoring.len())];
+        let where_to = if onto.is_empty() { to.clone().unwrap_or_else(|| "other hosts".into()) } else { onto.join(", ") };
+        let mut lines = vec![format!("{} machines are being restored onto {where_to} from their newest off-host backups.", restoring.len())];
         if !unrestorable.is_empty() {
             lines.push(format!("{} have no off-host backup and are in error: destroy them and request new ones.", unrestorable.len()));
         }
@@ -386,6 +495,9 @@ pub async fn recover(
     });
     Ok((
         StatusCode::ACCEPTED,
-        Json(json!({ "host": name, "to": to, "declaredLost": declared, "restoring": restoring, "unrestorable": unrestorable, "skipped": skipped })),
+        Json(json!({
+            "host": name, "to": to, "toHosts": onto, "placement": h.policy(), "declaredLost": declared,
+            "restoring": restoring, "unrestorable": unrestorable, "skipped": skipped,
+        })),
     ))
 }
