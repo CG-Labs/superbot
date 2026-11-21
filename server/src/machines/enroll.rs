@@ -679,9 +679,10 @@ if SUPERBOT_ENROLL_TOKEN_FILE=/etc/superbot/enroll-token SUPERBOT_STATE_DIR=/var
 else
   echo "superbot: enrolling failed; the agent will keep trying" >&2
 fi
-# cloud-init's copies of the user data hold the token, and so does the NoCloud seed an
-# Incus container is given (ADR 0065); only the agent's file is needed.
-rm -f /var/lib/cloud/instance/user-data.txt /var/lib/cloud/instance/user-data.txt.i /var/lib/cloud/seed/nocloud-net/user-data
+# cloud-init's copies of the user data hold the token: the raw and merged user data and
+# its cache (ADR 0068), and the NoCloud seed an Incus container is given (ADR 0065).
+# Only the agent's file is needed.
+rm -f /var/lib/cloud/instance/user-data.txt /var/lib/cloud/instance/user-data.txt.i /var/lib/cloud/instance/cloud-config.txt /var/lib/cloud/instance/obj.pkl /var/lib/cloud/seed/nocloud-net/user-data
 systemctl start superbot-machine
 {screens}
 "#;
@@ -1849,6 +1850,8 @@ mod tests {
             "SUPERBOT_ENROLL_TOKEN_FILE=/etc/superbot/enroll-token SUPERBOT_STATE_DIR=/var/lib/superbot-machine \"$bin\" enroll".into(),
             "systemctl enable superbot-machine".into(),
             "rm -f /var/lib/cloud/instance/user-data.txt".into(),
+            "/var/lib/cloud/instance/cloud-config.txt".into(),
+            "/var/lib/cloud/instance/obj.pkl".into(),
             "/var/lib/cloud/seed/nocloud-net/user-data".into(),
             "bin=$dir/superbot-machine".into(),
             "ln -sfn \"$bin\" /usr/local/bin/superbot-machine".into(),
