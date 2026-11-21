@@ -10,6 +10,13 @@ Use a dedicated Linux host for SuperBot containers, with a current kernel and In
 
 The kernel needs nftables' bridge family. Without it, Incus can't apply network ACLs or NIC filters, and creates fail. Check with `sudo nft add table bridge sbcheck && sudo nft delete table bridge sbcheck`. Stock Ubuntu has it. Some minimal or nested kernels don't.
 
+On the 6.0 LTS, also load `br_netfilter`, or containers fail to start (`security.ipv6_filtering requires bridge netfilter`). Later releases don't need it:
+
+```bash
+modprobe br_netfilter
+echo br_netfilter > /etc/modules-load.d/superbot-incus.conf
+```
+
 Memory is hard-limited per container, but swap isn't: a restricted project refuses `limits.memory.swap`. If containers mustn't swap, give the host no swap.
 
 ```bash

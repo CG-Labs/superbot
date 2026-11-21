@@ -57,6 +57,9 @@ install_incus() {
 }
 
 install_incus
+# Incus 6.0's IPv6 filter on a container's NIC needs bridge netfilter; later releases don't.
+modprobe br_netfilter
+echo br_netfilter >/etc/modules-load.d/superbot-incus.conf
 incus admin waitready --timeout=120
 say "Incus $(incus version | sed -n 's/^Server version: //p')"
 
