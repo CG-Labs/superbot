@@ -808,7 +808,7 @@ pub fn prune(app: &App, days: u32) {
     match app.db.prune_audit() {
         Ok(0) => {}
         Ok(n) => app.db.record(&Event::new(Actor::system("retention"), "audit.pruned").details(json!({ "deleted": n, "olderThan": cutoff, "retentionDays": days }))),
-        Err(e) => eprintln!("audit retention: {e}"),
+        Err(e) => crate::obs::log::log_warn!("audit retention: {e}"),
     }
 }
 

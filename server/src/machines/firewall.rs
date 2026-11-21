@@ -283,7 +283,7 @@ pub async fn sync(app: &App, fw: &Firewall, p: &dyn MachineProvider) -> usize {
     let id = match ensure(app, fw, p, &Who::system(SYSTEM)).await {
         Ok(id) => id,
         Err(e) => {
-            eprintln!("Machine firewall: {e}");
+            crate::obs::log::log_warn!("Machine firewall: {e}");
             return 0;
         }
     };
@@ -291,7 +291,7 @@ pub async fn sync(app: &App, fw: &Firewall, p: &dyn MachineProvider) -> usize {
     match p.firewall_devices(&id).await {
         Ok(c) => covers.insert(id.clone(), Some(c.machines)),
         Err(e) => {
-            eprintln!("Machine firewall: {e}");
+            crate::obs::log::log_warn!("Machine firewall: {e}");
             return 0;
         }
     };
@@ -313,7 +313,7 @@ pub async fn sync(app: &App, fw: &Firewall, p: &dyn MachineProvider) -> usize {
             // Gone: its machines join the current one.
             Err(ProviderError::NotFound) => {}
             Err(e) => {
-                eprintln!("Machine firewall {old}: {e}");
+                crate::obs::log::log_warn!("Machine firewall {old}: {e}");
                 covers.insert(old, None);
             }
         }

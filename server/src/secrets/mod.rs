@@ -137,8 +137,10 @@ pub fn server_secret(name: &str) -> bool {
 /// user's machine (ADR 0025), botd's Incus client key, which can do the same to every
 /// container and administers the Incus host (ADR 0065), the notifier's SMTP
 /// password, webhook URL, and webhook signing key (ADR 0061), and the Expo access
-/// token that lets botd push to every registered phone (ADR 0080).
-pub const SERVER_SECRETS: [&str; 7] = ["TURNSTILE_SECRET", "LINODE_TOKEN", "INCUS_CLIENT_KEY", "SMTP_PASSWORD", "NOTIFY_WEBHOOK_URL", "NOTIFY_WEBHOOK_SECRET", "EXPO_ACCESS_TOKEN"];
+/// token that lets botd push to every registered phone (ADR 0080), and the token
+/// scrapers send to `/metrics` (ADR 0089).
+pub const SERVER_SECRETS: [&str; 8] =
+    ["TURNSTILE_SECRET", "LINODE_TOKEN", "INCUS_CLIENT_KEY", "SMTP_PASSWORD", "NOTIFY_WEBHOOK_URL", "NOTIFY_WEBHOOK_SECRET", "EXPO_ACCESS_TOKEN", "METRICS_TOKEN"];
 
 /// Each Bot's own notification webhook URL: `NOTIFY_WEBHOOK_URL_BOT_<ID>` (ADR 0061).
 pub const BOT_WEBHOOK_PREFIX: &str = "NOTIFY_WEBHOOK_URL_BOT_";
@@ -256,7 +258,7 @@ impl Secrets {
                 }
                 Ok(None) => {}
                 // The error text can name the user, so only its kind is logged.
-                Err(e) => eprintln!("A user's secret {name} couldn't be read ({}).", e.kind()),
+                Err(e) => crate::obs::log::log_warn!("A user's secret {name} couldn't be read ({}).", e.kind()),
             }
         }
         out
@@ -345,7 +347,7 @@ impl Secrets {
                         }
                     }
                     Ok(None) => {}
-                    Err(e) => eprintln!("secret {name}: {e}"),
+                    Err(e) => crate::obs::log::log_warn!("secret {name}: {e}"),
                 }
             }
         }
@@ -441,7 +443,7 @@ pub fn init(db_path: &Path) -> Result<Report, String> {
         forget,
     )?;
     if forget && boot.discarded == 0 {
-        eprintln!("SUPERBOT_FORGET_SEALED=1 is set, but the master key works, so nothing was dropped. Remove the setting.");
+        crate::obs::log::log_warn!("SUPERBOT_FORGET_SEALED=1 is set, but the master key works, so nothing was dropped. Remove the setting.");
     }
     let cipher = sealed::install(cipher)?;
     let store = sealed::SealedStore::new(sealed::connect(db_path)?, Arc::clone(&cipher));

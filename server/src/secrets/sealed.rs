@@ -212,7 +212,7 @@ pub fn purge_old_pages(c: &Connection) -> rusqlite::Result<()> {
     c.execute_batch("VACUUM")?;
     let busy: i64 = c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
     if busy != 0 {
-        eprintln!("Secrets: the database was busy, so old pages may stay in the WAL until the next checkpoint.");
+        crate::obs::log::log_warn!("Secrets: the database was busy, so old pages may stay in the WAL until the next checkpoint.");
     }
     Ok(())
 }

@@ -213,7 +213,7 @@ impl Screens {
                 Some(info)
             }
             Err(e) => {
-                eprintln!("Screen {slot} failed to start: {e}");
+                crate::obs::log::log_warn!("Screen {slot} failed to start: {e}");
                 None
             }
         }
@@ -262,7 +262,7 @@ impl Screens {
         match spawn_viewer(&display, port, &s.token) {
             Ok(v) => s.viewer = v,
             Err(e) => {
-                eprintln!("Screen viewer for {bot_id} failed to restart: {e}");
+                crate::obs::log::log_warn!("Screen viewer for {bot_id} failed to restart: {e}");
                 let s = live.remove(bot_id).unwrap();
                 stop(bot_id, s).await;
             }

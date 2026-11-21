@@ -107,7 +107,7 @@ pub fn load(app: &App, cp: &ControlPlane) -> Result<usize, String> {
         } else if !configured.iter().any(|c| c.name == row.name) {
             let n = on(app, cp, h, &row.name).len();
             if n > 0 {
-                eprintln!("WARNING: Incus host {} isn't in INCUS_HOSTS any more, and {n} machines are on it. Put it back, or declare it lost to restore them elsewhere (botctl machine host recover {}).", row.name, row.name);
+                crate::obs::log::log_warn!("WARNING: Incus host {} isn't in INCUS_HOSTS any more, and {n} machines are on it. Put it back, or declare it lost to restore them elsewhere (botctl machine host recover {}).", row.name, row.name);
             }
         }
     }
@@ -120,7 +120,7 @@ pub fn load(app: &App, cp: &ControlPlane) -> Result<usize, String> {
         }
     }
     if moved > 0 {
-        println!("Incus hosts: {moved} machines from before there were several hosts are on {first} (INCUS_HOST_NAME).");
+        crate::obs::log::log_info!("Incus hosts: {moved} machines from before there were several hosts are on {first} (INCUS_HOST_NAME).");
     }
     Ok(moved)
 }

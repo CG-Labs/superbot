@@ -397,7 +397,7 @@ async fn accept(app: AppState, key: String, l: TcpListener) {
         let (app, key) = (app.clone(), key.clone());
         tokio::spawn(async move {
             if let Err(why) = tunnel(&app, &key, tcp).await {
-                eprintln!("Screen {key}: {why}");
+                crate::obs::log::log_warn!("Screen {key}: {why}");
             }
         });
     }
@@ -486,7 +486,7 @@ pub async fn for_run(app: &App, bot: &Bot, for_user: Option<&str>, to: &Assigned
             Some(env)
         }
         Err(w) => {
-            eprintln!("Screen of Bot {} on machine {}: {}", bot.id, to.machine_id, w.message());
+            crate::obs::log::log_warn!("Screen of Bot {} on machine {}: {}", bot.id, to.machine_id, w.message());
             None
         }
     }
