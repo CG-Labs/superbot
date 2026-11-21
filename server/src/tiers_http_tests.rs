@@ -449,6 +449,12 @@ async fn admins_move_a_plans_bots_onto_its_default_only_when_asked() {
     assert_eq!(code, 400, "an open tier has no default to move to: {res}");
     let (code, res) = mv("team", json!({ "user": "bea@example.com" })).await;
     assert_eq!(code, 409, "{res}");
+    // A malformed request is refused, never read as "everyone" or "for real".
+    for body in [json!({ "dryRun": "true" }), json!({ "user": 42 }), json!({ "user": " " }), json!({ "users": "ada@example.com" }), json!([])] {
+        let (code, res) = mv("team", body.clone()).await;
+        assert_eq!(code, 400, "{body}: {res}");
+    }
+    assert_eq!(harness(&one.id), "claude");
 
     // A dry run lists them and changes nothing.
     let (code, res) = mv("team", json!({ "user": "ada@example.com", "dryRun": true })).await;
@@ -502,4 +508,6 @@ async fn admins_move_a_plans_bots_onto_its_default_only_when_asked() {
     assert_eq!(harness(&hers.id), "claude", "self-host Bots are left alone");
     let (_, res) = mv("team", json!({})).await;
     assert!(ids(&res, "moved").is_empty(), "nothing left to move: {res}");
+    let summary = audit(port, &admin, "action=tier.bots_moved").await;
+    assert_eq!((summary.len(), summary[0]["details"]["moved"].as_u64()), (3, Some(0)), "every applied call is audited, even one that moved nothing");
 }

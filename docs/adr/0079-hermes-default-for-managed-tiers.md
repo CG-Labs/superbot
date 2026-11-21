@@ -34,9 +34,10 @@ A Bot keeps its harness when the default changes. Switching harness drops the se
 - **The endpoint.** `POST /api/tiers/{name}/move-bots` `{user?, dryRun?}` (admins only, `botctl tiers move-bots <tier> [--user <user>] [--dry-run]`) moves every Bot whose owner is on that managed tier and whose harness isn't its default. With `user`, it moves only that person's Bots. Its errors:
   - 400 on an open tier;
   - 404 on an unknown tier;
-  - 409 if the named user isn't on that tier.
+  - 409 if the named user isn't on that tier;
+  - 400 on a malformed request (a `dryRun` that isn't a boolean, a `user` that isn't a non-empty string, any other field), so a script's mistake never becomes a real or wider move.
 - **What a move changes.** A moved Bot gets the default harness and loses its session, model and effort, so the tier's route picks the model.
-- **Busy Bots.** A Bot that is running, has queued work, or is draining is skipped with `reason: busy`. Run the command again later.
+- **Busy Bots.** A Bot that is running, has queued work, or is draining is skipped with `reason: busy`. Run the command again later. The idle check and the change happen under the run queue's lock, so no run can start on the old harness in between and save its session afterwards.
 - **Dry runs.** `--dry-run` lists what would move and changes nothing.
 
 ### Machines install the managed default
@@ -58,7 +59,7 @@ The new-Bot dialog lists the default first. On a managed plan it's marked "your 
 Every state change is audited:
 
 - `bot.created` adds `harnessFrom` (`chosen`, `plan` or `server`) and `tier`.
-- Each move is `bot.updated` with `via: tier_default` and the tier. One `tier.bots_moved` (target the tier) records `{to, moved, skipped, user}`.
+- Each move is `bot.updated` with `via: tier_default` and the tier. Every call that isn't a dry run records one `tier.bots_moved` (target the tier) with `{to, moved, skipped, user}`, even when nothing moved.
 - A refused run is `bot.run_refused` with reason `harness_missing`.
 - `server.started` adds `tierHarnesses`, each managed tier's default.
 
@@ -83,7 +84,7 @@ Every state change is audited:
   - A chosen harness is kept, and self-host still gets `DEFAULT_HARNESS`.
   - `harnessFrom` is audited.
   - Without Hermes, a run is refused with `harness_missing` and isn't counted.
-  - `move-bots` covers admin-only access, 404, 400 on an open tier, 409 for the wrong user, a dry run, the busy skip and a later retry, a cleared session, both audit events, and self-host Bots left alone.
+  - `move-bots` covers admin-only access, 404, 400 on an open tier, 409 for the wrong user, 400 for malformed requests, a dry run, the busy skip and a later retry, a cleared session, both audit events, and self-host Bots left alone.
 - **HTTP test, in `harness_version_http_tests.rs`:** a guarded Codex run without Codex now reports `harness_missing`.
 - **End to end, in `server/tests/managed_default_harness.rs`, on the real `botd`:**
   - Without a tiers file, Bots get `DEFAULT_HARNESS` and nothing is printed.

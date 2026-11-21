@@ -359,6 +359,18 @@ impl App {
         self.state().contains_key(bot_id)
     }
 
+    /// Runs `f` only if the Bot is idle, holding its queue so no work can start (and read
+    /// the Bot's settings) until `f` returns. `f` must not touch the runner. None: busy.
+    pub fn while_idle<T>(&self, bot_id: &str, f: impl FnOnce() -> T) -> Option<T> {
+        let st = self.state();
+        if st.contains_key(bot_id) {
+            return None;
+        }
+        let out = f();
+        drop(st);
+        Some(out)
+    }
+
     pub fn send(&self, v: Value) {
         let bot = ["/botId", "/bot/id", "/message/botId", "/approval/botId"].iter().find_map(|p| v.pointer(p).and_then(Value::as_str));
         let owner = bot.and_then(|b| self.db.bot_owner(b));

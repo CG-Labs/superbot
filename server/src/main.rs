@@ -1606,8 +1606,22 @@ async fn move_bots(State(app): State<AppState>, Extension(by): Extension<Who>, P
     let Some(to) = tier.default_harness.clone() else {
         return Err(bad(format!("The {} tier is open: its Bots run on whatever harness they're set to, and new ones get DEFAULT_HARNESS.", tier.label)));
     };
-    let dry_run = v["dryRun"].as_bool().unwrap_or(false);
-    let user = match v["user"].as_str().map(str::trim).filter(|u| !u.is_empty()) {
+    // It clears sessions and models, so a malformed request is refused, never widened.
+    let Some(body) = v.as_object() else { return Err(bad("Send {\"user\"?: \"<user>\", \"dryRun\"?: true|false}.")) };
+    if let Some(k) = body.keys().find(|k| !matches!(k.as_str(), "user" | "dryRun")) {
+        return Err(bad(format!("Unknown field \"{k}\": send user and dryRun only.")));
+    }
+    let dry_run = match &v["dryRun"] {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        _ => return Err(bad("dryRun must be true or false.")),
+    };
+    let user = match &v["user"] {
+        Value::Null => None,
+        Value::String(key) if !key.trim().is_empty() => Some(key.trim()),
+        _ => return Err(bad("user must be a user's id or email.")),
+    };
+    let user = match user {
         None => None,
         Some(key) => {
             let u = users::need_user_key(&app, key)?;
@@ -1621,22 +1635,29 @@ async fn move_bots(State(app): State<AppState>, Extension(by): Extension<Who>, P
     let (mut moved, mut skipped) = (Vec::new(), Vec::new());
     let bots = app.db.bots().into_iter().filter(|b| b.harness != to && user.as_ref().is_none_or(|u| *u == b.owner_id) && app.tier_of(&b.owner_id).name == tier.name);
     for b in bots {
-        if app.is_busy(&b.id) {
-            skipped.push(json!({ "id": b.id, "name": b.name, "owner": b.owner_id, "from": b.harness, "reason": "busy" }));
+        let busy = || json!({ "id": b.id, "name": b.name, "owner": b.owner_id, "from": b.harness, "reason": "busy" });
+        let item = json!({ "id": b.id, "name": b.name, "owner": b.owner_id, "from": b.harness });
+        if dry_run {
+            if app.is_busy(&b.id) {
+                skipped.push(busy());
+            } else {
+                moved.push(item);
+            }
             continue;
         }
-        let item = json!({ "id": b.id, "name": b.name, "owner": b.owner_id, "from": b.harness });
-        if !dry_run {
-            let patch = BotPatch { harness: Some(to.clone()), session_id: Some(None), model: Some(None), effort: Some(None), ..Default::default() };
-            app.db.update_bot(&b.id, patch);
-            app.push_bot(&b.id);
-            let after = need_bot(&app, &b.id)?;
-            let details = json!({ "changes": bot_changes(&b, &after), "via": "tier_default", "tier": tier.name });
-            app.db.record(&by.event("bot.updated").target("bot", &b.id).bot(&b.id).details(details));
+        // Checked and changed under the queue's lock: no run can start on the old settings in between.
+        let patch = BotPatch { harness: Some(to.clone()), session_id: Some(None), model: Some(None), effort: Some(None), ..Default::default() };
+        if app.while_idle(&b.id, || app.db.update_bot(&b.id, patch)).is_none() {
+            skipped.push(busy());
+            continue;
         }
+        app.push_bot(&b.id);
+        let after = need_bot(&app, &b.id)?;
+        let details = json!({ "changes": bot_changes(&b, &after), "via": "tier_default", "tier": tier.name });
+        app.db.record(&by.event("bot.updated").target("bot", &b.id).bot(&b.id).details(details));
         moved.push(item);
     }
-    if !dry_run && !moved.is_empty() {
+    if !dry_run {
         let details = json!({ "to": to, "moved": moved.len(), "skipped": skipped.len(), "user": user });
         app.db.record(&by.event("tier.bots_moved").target("tier", &tier.name).details(details));
     }
