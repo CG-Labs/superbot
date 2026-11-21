@@ -6,8 +6,9 @@
 #
 # Each npm CLI goes to <prefix>/<bin>/node_modules/.bin, checked against the pinned
 # integrity (one prefix each: npm prunes what a prefix's package.json doesn't list).
-# Hermes Agent goes under <prefix>/hermes as its HOME (<prefix>/hermes/.local/bin),
-# from its installer at the pinned commit, checked against the pinned SHA-256.
+# Hermes Agent goes under <prefix>/hermes with deploy/hermes-shared.sh (sealed, so every
+# Bot shares one environment: <prefix>/hermes/current/.local/bin), from its installer at
+# the pinned commit, checked against the pinned SHA-256.
 # HARNESS_VERSION_<BIN> (e.g. HARNESS_VERSION_CODEX=0.141.0) installs another version;
 # npm still checks the registry's hashes, but there is no pin to compare with.
 # Prints the PATH entries to add, one per line, last.
@@ -70,19 +71,13 @@ for bin in "$@"; do
       paths+=("$prefix/$bin/node_modules/.bin")
       ;;
     hermes)
-      [[ "$version" =~ ^[0-9a-f]{40}$ ]] || die "Hermes takes a full commit, not $version"
-      home="$prefix/hermes"
-      mkdir -p "$home"
-      script="$prefix/hermes-install.sh"
-      retry curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/$version/scripts/install.sh" -o "$script"
-      if (( pinned )); then
-        printf '%s  %s\n' "$(pin hermes sha256)" "$script" | sha256sum -c --quiet - || die "Hermes's installer doesn't match the pinned SHA-256"
-      fi
+      # One sealed install every Bot shares, as on a server (ADR 0072).
+      sha=""
+      (( pinned )) && sha=$(pin hermes sha256)
       printf 'Installing Hermes Agent %s\n' "${version:0:12}"
-      retry env HOME="$home" bash "$script" --non-interactive --skip-browser --skip-computer-use --commit "$version" >"$prefix/hermes-install.log" 2>&1 \
-        || { tail -40 "$prefix/hermes-install.log" >&2; die "Hermes Agent didn't install"; }
-      HOME="$home" "$home/.local/bin/hermes" --version >/dev/null || die "hermes --version failed"
-      paths+=("$home/.local/bin")
+      launcher=$(retry "$here/hermes-shared.sh" "$prefix/hermes" "$version" ${sha:+"$sha"}) || die "Hermes Agent didn't install"
+      HOME="$prefix/hermes/current" "$launcher" --version >/dev/null || die "hermes --version failed"
+      paths+=("$(dirname "$launcher")")
       ;;
     *) die "unknown harness $bin: use claude, codex, pi or hermes" ;;
   esac

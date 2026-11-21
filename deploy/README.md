@@ -43,7 +43,7 @@ If flags are omitted, the script prompts on a TTY. The checkout must not be owne
 8. **Caddy** automatic HTTPS when `--domain` is set: the [landing page](#landing-page-and-sign-ups) at `/`, the web client at `/app/`, everything else to `botd` (`flush_interval -1` for SSE)
 9. Optional **UFW** (`--ufw`): allow 22, 80, 443
 10. Daily **backup** timer (on by default; `--no-backup` to skip), plus `superbot-restore`: see [Backups and restore](#backups-and-restore)
-11. With `--with-hermes`: [Hermes Agent](#hermes-agent) for the service user
+11. With `--with-hermes`: [Hermes Agent](#hermes-agent), one install every Bot shares
 12. On new installs (or with `--isolation`): [one Unix account per user](#one-unix-account-per-user)
 
 Admin password file: `~superbot/.superbot-admin-password` (mode `0600`).
@@ -102,7 +102,7 @@ The installer builds the Expo client (`apps/client`) from the same commit as `bo
 
 ## Hermes Agent
 
-Opt-in, because it is large (about 2.5 GB for the install, plus about 0.5 GB per Bot that uses it). `--with-hermes` runs Hermes's own installer as the service user, pinned to the commit of release v0.23.2 (override with `HERMES_COMMIT=<sha>`), and puts `~/.local/bin` on botd's `PATH` in `.env`. With [per-user accounts](#one-unix-account-per-user), which can't open the service user's home, it installs Hermes system-wide instead, as root in `/opt/hermes`, linked from `/usr/local/bin/hermes`. Hermes has no login: save a provider key, encrypted ([master key](#master-key)):
+Opt-in, because it is large (about 2.5 GB, once per server: every Bot shares it and keeps only its own state, a few MiB). `--with-hermes` runs Hermes's own installer as root in `/opt/hermes/<commit>`, pinned to the commit of release v0.23.2 (override with `HERMES_COMMIT=<sha>`), seals it so every Bot uses its one dependency environment, and links it from `/usr/local/bin/hermes`. Every account may run it, none may change it. Running it again with a new `HERMES_COMMIT` installs that commit beside the old one and switches to it in one rename: runs already going finish on the old version, which is kept until the next upgrade ([ADR 0072](../docs/adr/0072-one-hermes-environment-per-host.md)). Hermes has no login: save a provider key, encrypted ([master key](#master-key)):
 
 ```sh
 sudo -u superbot env SUPERBOT_PASSWORD="$(sudo grep -oP '^AUTH_PASSWORD=\K.*' ~superbot/superbot/.env)" botctl secret set OPENROUTER_API_KEY < /path/to/key.txt
@@ -553,7 +553,7 @@ Every other `botd` setting (`TZ`, `USER_NAME`, `DEFAULT_HARNESS`, `CORS_ORIGINS`
 
 The image bakes in Claude Code, Codex, and Pi (`npm i -g` at build time). Pick a subset with `SUPERBOT_HARNESSES` in `.env` (e.g. `claude`, or empty for none), then `docker compose build botd && docker compose up -d`. Pin versions with build args, e.g. `docker compose build --build-arg CLAUDE_CODE_VERSION=2.1.328 botd` (`CODEX_VERSION` and `PI_VERSION` too).
 
-Hermes Agent is opt-in: add it with `SUPERBOT_HARNESSES=claude codex pi hermes` (about 2.5 GB more in the image, plus about 0.5 GB per Bot in the `data` volume). The image installs it in `/opt/hermes`, pinned with `HERMES_COMMIT`. It has no login: save a provider key with `botctl secret set` (above) and, if needed, set `SUPERBOT_HERMES_PROVIDER` and `SUPERBOT_HERMES_BASE_URL` in `.env`. See [backend docs](../docs/backend.md#hermes-agent).
+Hermes Agent is opt-in: add it with `SUPERBOT_HARNESSES=claude codex pi hermes` (about 2.5 GB more in the image, shared by every Bot: each keeps only its own state, a few MiB, in the `data` volume). The image installs and seals it in `/opt/hermes`, pinned with `HERMES_COMMIT`. It has no login: save a provider key with `botctl secret set` (above) and, if needed, set `SUPERBOT_HERMES_PROVIDER` and `SUPERBOT_HERMES_BASE_URL` in `.env`. See [backend docs](../docs/backend.md#hermes-agent).
 
 Log in once inside the container, as the `superbot` user that runs the Bots. Logins are stored in the `home` volume and survive upgrades and container recreation:
 

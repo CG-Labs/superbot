@@ -32,7 +32,7 @@ BUILD_CLIENT=true
 # Exit status when everything else installed but this run's web client did not.
 CLIENT_NOT_INSTALLED_EXIT=3
 CLIENT_NOT_INSTALLED=""
-DEPLOY_FILES=(superbot.service superbot-backup.sh superbot-restore.sh superbot-backup.service superbot-backup.timer superbot-userctl.sh)
+DEPLOY_FILES=(superbot.service superbot-backup.sh superbot-restore.sh superbot-backup.service superbot-backup.timer superbot-userctl.sh hermes-shared.sh hermes-seal.sh)
 # Per-user accounts (docs/adr/0037-per-user-unix-accounts.md): "" keeps what root set up last.
 ISOLATION_MODE=""
 # Unset: the one in root's isolation.conf, else /srv/superbot/users (isolation_dir).
@@ -660,66 +660,39 @@ install_license() {
   fi
 }
 
-# Hermes's own installer, as the service user (Hermes refuses a checkout another user
-# owns). Its launcher lands in ~/.local/bin, which botd gets on PATH through .env. With
-# per-user accounts, which can't read botd's home, it goes system-wide instead.
-# shellcheck disable=SC2016
+# One sealed install of Hermes for every Bot (ADR 0072): root's, in
+# $HERMES_SHARED_DIR/<commit>, which every account may run but none may change. Each run
+# has its own HERMES_HOME (the Bot's folder), which then holds only that Bot's state.
+# An upgrade installs the new commit beside the old one and switches
+# $HERMES_SHARED_DIR/current in one rename, so a run already going finishes on its own.
 install_hermes() {
   [[ "$WITH_HERMES" == true ]] || return 0
   [[ "$HERMES_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "HERMES_COMMIT must be a full commit SHA"
-  local home env_file bin_path url
-  home=$(user_home)
-  env_file="$home/superbot/.env"
-  bin_path="$home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  local url home launcher probe
   url="https://raw.githubusercontent.com/NousResearch/hermes-agent/$HERMES_COMMIT/scripts/install.sh"
-  if [[ "$(isolation_mode)" == users ]]; then
-    install_hermes_shared "$url"
-    return
-  fi
-  if [[ "$DRY_RUN" == true ]]; then
-    log "[dry-run] would install Hermes Agent $HERMES_COMMIT for $SUPERBOT_USER from $url"
-    log "[dry-run] would set PATH=$bin_path in $env_file"
-    return
-  fi
-  log "Installing Hermes Agent ${HERMES_COMMIT:0:12} for $SUPERBOT_USER"
-  apt-get install -y -qq libatomic1 xz-utils
-  sudo -u "$SUPERBOT_USER" -H bash -c 'set -euo pipefail
-    tmp=$(mktemp)
-    trap '\''rm -f "$tmp"'\'' EXIT
-    curl -fsSL "$1" -o "$tmp"
-    bash "$tmp" --non-interactive --skip-browser --skip-computer-use --commit "$2"' _ "$url" "$HERMES_COMMIT"
-  sudo -u "$SUPERBOT_USER" -H "$home/.local/bin/hermes" --version >/dev/null || die "Hermes Agent did not install"
-  if ! grep -q '^PATH=' "$env_file"; then
-    set_env_var "$env_file" PATH "$bin_path"
-  elif ! grep -q "^PATH=.*$home/.local/bin" "$env_file"; then
-    warn "PATH in $env_file lacks $home/.local/bin, so botd won't find hermes"
-  fi
-}
-
-# Root's checkout in $HERMES_SHARED_DIR, which every account may run but none may change.
-# Each run has its own HERMES_HOME (the Bot's folder), so this holds only the program.
-# shellcheck disable=SC2016
-install_hermes_shared() {
-  local url=$1 probe
+  home=$(user_home)
   if [[ "$DRY_RUN" == true ]]; then
     log "[dry-run] would install Hermes Agent $HERMES_COMMIT system-wide in $HERMES_SHARED_DIR from $url, linked from /usr/local/bin/hermes"
     return
   fi
-  log "Installing Hermes Agent ${HERMES_COMMIT:0:12} system-wide in $HERMES_SHARED_DIR (per-user accounts run it)"
+  log "Installing Hermes Agent ${HERMES_COMMIT:0:12} system-wide in $HERMES_SHARED_DIR, shared by every Bot"
   apt-get install -y -qq libatomic1 xz-utils
   install -d -m 0755 -o root -g root "$HERMES_SHARED_DIR"
-  env HOME="$HERMES_SHARED_DIR" SHELL=/bin/bash bash -c 'set -euo pipefail
-    tmp=$(mktemp)
-    trap '\''rm -f "$tmp"'\'' EXIT
-    curl -fsSL "$1" -o "$tmp"
-    bash "$tmp" --non-interactive --skip-browser --skip-computer-use --commit "$2"' _ "$url" "$HERMES_COMMIT"
+  launcher=$(bash "$(trusted_deploy_dir)/hermes-shared.sh" "$HERMES_SHARED_DIR" "$HERMES_COMMIT") \
+    || die "Hermes Agent did not install"
   chmod -R go-w "$HERMES_SHARED_DIR"
-  ln -sfn "$HERMES_SHARED_DIR/.local/bin/hermes" /usr/local/bin/hermes
+  ln -sfn "$launcher" /usr/local/bin/hermes
   probe=$(mktemp -d)
   chmod 0777 "$probe"
   sudo -u nobody env HOME="$probe" HERMES_HOME="$probe/hermes" /usr/local/bin/hermes --version >/dev/null \
     || { rm -rf "$probe"; die "Hermes Agent did not install for other accounts"; }
   rm -rf "$probe"
+  # Installs before ADR 0072 put a launcher first on botd's PATH, from .env.
+  if [[ -e "$home/.local/bin/hermes" || -L "$home/.local/bin/hermes" ]]; then
+    sudo -u "$SUPERBOT_USER" ln -sfn /usr/local/bin/hermes "$home/.local/bin/hermes"
+    [[ -d "$home/.hermes/hermes-agent" ]] \
+      && log "Bots now share $HERMES_SHARED_DIR; once none runs, $home/.hermes/hermes-agent may be removed"
+  fi
 }
 
 service_unit_fixed() {

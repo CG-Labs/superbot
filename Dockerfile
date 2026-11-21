@@ -29,6 +29,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY server server
 COPY web web
 COPY site site
+COPY deploy/hermes-seal.sh deploy/hermes-seal.sh
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked \
@@ -39,7 +40,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM ${NODE_IMAGE} AS runtime
 
 # Space-separated subset of: claude codex pi hermes. Empty = none (install later into the home volume).
-# hermes (Hermes Agent) is opt-in: it adds about 2.5 GB, plus about 0.5 GB per Bot in /data.
+# hermes (Hermes Agent) is opt-in: it adds about 2.5 GB, shared by every Bot (a few MiB each in /data).
 ARG HARNESSES="claude codex pi"
 ARG CLAUDE_CODE_VERSION=latest
 ARG CODEX_VERSION=latest
@@ -73,20 +74,19 @@ RUN groupadd --system --gid "$SUPERBOT_UID" superbot \
         --home-dir /home/superbot --create-home --shell /bin/bash superbot \
     && install -d -o superbot -g superbot -m 0700 /data /workspace /backups
 
-# Hermes's own installer, outside the home volume. It runs as superbot because Hermes
-# refuses to use a checkout another user owns. Each Bot gets its own Hermes data root,
-# which shares the installed tools only while the checkout sits in the installer's
-# data root (.hermes/hermes-agent, the default layout).
+# Hermes's own installer, outside the home volume, once for every Bot: hermes-shared.sh
+# installs it in /opt/hermes/<commit> and seals it, so each Bot's Hermes data root holds
+# only its own state and every Bot shares one dependency environment (ADR 0072). Root's,
+# as on a server: every account may run it, none may change it.
+COPY --chmod=0755 deploy/hermes-shared.sh deploy/hermes-seal.sh /opt/superbot/deploy/
 RUN set -eu; case " $HARNESSES " in *" hermes "*) ;; *) exit 0 ;; esac; \
     apt-get update; apt-get install -y --no-install-recommends libatomic1 xz-utils; rm -rf /var/lib/apt/lists/*; \
-    install -d -o superbot -g superbot /opt/hermes; \
-    curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_COMMIT}/scripts/install.sh" -o /tmp/hermes-install.sh; \
-    runuser -u superbot -- env HOME=/opt/hermes bash /tmp/hermes-install.sh --non-interactive --skip-browser \
-        --skip-computer-use --commit "$HERMES_COMMIT"; \
-    rm -f /tmp/hermes-install.sh; \
-    ln -s /opt/hermes/.hermes/hermes-agent/.hermes/bin/hermes /usr/local/bin/hermes; \
-    runuser -u superbot -- env HOME=/opt/hermes hermes --version; \
-    if find /opt/hermes \! -user superbot | grep -q .; then echo "root-owned files in /opt/hermes" >&2; exit 1; fi
+    launcher=$(/opt/superbot/deploy/hermes-shared.sh /opt/hermes "$HERMES_COMMIT"); \
+    chmod -R go-w /opt/hermes; \
+    ln -s "$launcher" /usr/local/bin/hermes; \
+    probe=$(mktemp -d); chmod 0777 "$probe"; \
+    runuser -u nobody -- env HOME="$probe" HERMES_HOME="$probe/hermes" hermes --version; \
+    rm -rf "$probe"
 
 # botd prepends its own folder to each Bot's PATH, so it lives apart from the npm CLIs in /usr/local/bin.
 COPY --from=build /out/botd /out/botctl /out/superbot-machine /out/superbot-run /opt/superbot/bin/
