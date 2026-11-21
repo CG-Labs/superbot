@@ -121,7 +121,7 @@ groups:
           severity: page
         annotations:
           summary: The public status page isn't answering
-          description: "The outside-in probe of /status.json has failed for 2 minutes: users likely can't reach SuperBot. These minutes are the availability SLO's bad minutes (docs/slo.md)."
+          description: "The outside-in probe of /status.json has failed for 2 minutes (no answer, or a 503 for a major outage): users likely can't reach SuperBot. These minutes are the availability SLO's bad minutes (docs/slo.md)."
 
       - alert: SuperBotRunFailuresHigh
         expr: |

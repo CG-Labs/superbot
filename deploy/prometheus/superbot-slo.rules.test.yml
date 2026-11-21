@@ -88,3 +88,110 @@ tests:
             exp_annotations:
               summary: Many Bot runs are failing
               description: "25% of Bot runs in the last hour ended in error or timeout, above the 10% run objective (docs/slo.md). Check superbot_runs_total by harness and the model providers' status."
+
+  # Fast burn, short windows only: six healthy hours, then 5% fail for 30 minutes.
+  # The 1h and 5m pair pages while the 6h share stays low; ten minutes after it
+  # stops, the alert clears.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_http_requests_total{job="superbot",route_class="bots",method="GET",status_class="2xx"}'
+        values: '0+100x360 36095+95x29 38950+100x30'
+      - series: 'superbot_http_requests_total{job="superbot",route_class="bots",method="GET",status_class="5xx"}'
+        values: '0x360 5+5x29 150x30'
+    promql_expr_test:
+      - expr: superbot:http_request_errors:ratio_rate6h < bool 0.006
+        eval_time: 388m
+        exp_samples:
+          - labels: '{job="superbot"}'
+            value: 1
+      - expr: ALERTS{alertname="SuperBotErrorBudgetBurnFast",alertstate="firing"}
+        eval_time: 388m
+        exp_samples:
+          - labels: 'ALERTS{alertname="SuperBotErrorBudgetBurnFast",alertstate="firing",job="superbot",severity="page"}'
+            value: 1
+    alert_rule_test:
+      - eval_time: 400m
+        alertname: SuperBotErrorBudgetBurnFast
+        exp_alerts: []
+
+  # Fast burn, long windows only: 1% fail for hours, under the 1h line (1.44%) but
+  # over the 6h one (0.6%).
+  - interval: 1m
+    input_series:
+      - series: 'superbot_http_requests_total{job="superbot",route_class="bots",method="GET",status_class="2xx"}'
+        values: '0+99x120'
+      - series: 'superbot_http_requests_total{job="superbot",route_class="bots",method="GET",status_class="5xx"}'
+        values: '0+1x120'
+    promql_expr_test:
+      - expr: superbot:http_request_errors:ratio_rate1h
+        eval_time: 90m
+        exp_samples:
+          - labels: 'superbot:http_request_errors:ratio_rate1h{job="superbot"}'
+            value: 0.01
+      - expr: ALERTS{alertname="SuperBotErrorBudgetBurnFast",alertstate="firing"}
+        eval_time: 90m
+        exp_samples:
+          - labels: 'ALERTS{alertname="SuperBotErrorBudgetBurnFast",alertstate="firing",job="superbot",severity="page"}'
+            value: 1
+
+  # Slow burn: 0.5% fail, under both fast lines but over the 1d and 2h one (0.3%).
+  # The ticket opens after an hour; the page never does.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_http_requests_total{job="superbot",route_class="bots",method="GET",status_class="2xx"}'
+        values: '0+199x180'
+      - series: 'superbot_http_requests_total{job="superbot",route_class="bots",method="GET",status_class="5xx"}'
+        values: '0+1x180'
+    promql_expr_test:
+      - expr: ALERTS{alertname="SuperBotErrorBudgetBurnSlow",alertstate="pending"}
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="SuperBotErrorBudgetBurnSlow",alertstate="pending",job="superbot",severity="ticket"}'
+            value: 1
+      - expr: ALERTS{alertname="SuperBotErrorBudgetBurnSlow",alertstate="firing"}
+        eval_time: 2h
+        exp_samples:
+          - labels: 'ALERTS{alertname="SuperBotErrorBudgetBurnSlow",alertstate="firing",job="superbot",severity="ticket"}'
+            value: 1
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: SuperBotErrorBudgetBurnFast
+        exp_alerts: []
+
+  # Slow burn, 3d and 6h only: 0.2% fail, under the 1d line (0.3%) but over the
+  # budget's own rate (0.1%).
+  - interval: 1m
+    input_series:
+      - series: 'superbot_http_requests_total{job="superbot",route_class="bots",method="GET",status_class="2xx"}'
+        values: '0+499x180'
+      - series: 'superbot_http_requests_total{job="superbot",route_class="bots",method="GET",status_class="5xx"}'
+        values: '0+1x180'
+    promql_expr_test:
+      - expr: ALERTS{alertname="SuperBotErrorBudgetBurnSlow",alertstate="firing"}
+        eval_time: 2h
+        exp_samples:
+          - labels: 'ALERTS{alertname="SuperBotErrorBudgetBurnSlow",alertstate="firing",job="superbot",severity="ticket"}'
+            value: 1
+
+  # The outside probe fails for five minutes, then recovers.
+  - interval: 1m
+    input_series:
+      - series: 'probe_success{job="superbot-status",instance="https://<your-domain>/status.json"}'
+        values: '1x5 0x5 1x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: SuperBotStatusProbeFailing
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: SuperBotStatusProbeFailing
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              job: superbot-status
+              instance: https://<your-domain>/status.json
+            exp_annotations:
+              summary: The public status page isn't answering
+              description: "The outside-in probe of /status.json has failed for 2 minutes (no answer, or a 503 for a major outage): users likely can't reach SuperBot. These minutes are the availability SLO's bad minutes (docs/slo.md)."
+      - eval_time: 13m
+        alertname: SuperBotStatusProbeFailing
+        exp_alerts: []
