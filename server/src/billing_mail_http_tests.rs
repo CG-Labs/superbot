@@ -230,8 +230,10 @@ async fn token_emails_go_once_a_period_unless_turned_off() {
         v["data"]["object"]["status"] = json!("past_due");
     });
     deliver(w.port, &bea, None).await;
+    // Her first payment for the plan an admin gave her starts it, and failed.
     let got = sent(app, &mailer).await;
-    assert_eq!((got.len(), got[2].to.as_str(), got[2].subject.as_str()), (3, "bea@example.com", "[SuperBot] Your payment for the Pro plan didn't go through"));
+    let hers: Vec<(&str, &str)> = got[2..].iter().map(|m| (m.to.as_str(), m.subject.as_str())).collect();
+    assert_eq!(hers, [("bea@example.com", "[SuperBot] Your Pro plan has started"), ("bea@example.com", "[SuperBot] Your payment for the Pro plan didn't go through")]);
     // The Plan screen's view says so too.
     let (_, me) = call(w.port, "GET", "/api/me/emails", &w.b, "").await;
     assert_eq!(parse(&me)["usage"], false);

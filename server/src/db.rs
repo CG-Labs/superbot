@@ -295,6 +295,8 @@ pub struct Change<'a> {
     pub before: Option<&'a Subscription>,
     /// The user's paying subscription before the event, when the event was applied.
     pub paying_before: Option<&'a Subscription>,
+    /// And after it.
+    pub paying_after: Option<&'a Subscription>,
 }
 
 /// What linking a payment-provider customer to a user did (ADR 0042). A user has at most
@@ -3633,6 +3635,7 @@ impl Db {
         }
         let by_id = tx.query_row("SELECT * FROM subscriptions WHERE subscription_id = ?", [&sub.subscription_id], subscription_row).optional().map_err(|e| e.to_string())?;
         let mut paying_before: Option<Subscription> = None;
+        let mut paying_after: Option<Subscription> = None;
         let customer_user = |cus: &str| tx.query_row("SELECT user_id FROM billing_customers WHERE customer_id = ?", [cus], |r| r.get::<_, String>(0)).optional();
         let others_customer = match (&by_id, &sub.customer_id) {
             (Some(s), _) if s.user_id != sub.user_id => false,
@@ -3669,6 +3672,7 @@ impl Db {
             let moved = paying_id(&before) != paying_id(&after);
             let to = after.as_ref().and_then(|s| s.tier.clone());
             paying_before = before;
+            paying_after = after.clone();
             if after.as_ref().is_some_and(|s| s.subscription_id != sub.subscription_id) && !moved {
                 Applied::Superseded
             } else if !set_tier && !moved {
@@ -3687,7 +3691,7 @@ impl Db {
             (Applied::OtherUser | Applied::CustomerOfAnotherUser, _) | (_, None) => None,
             (_, Some(cus)) => Some(link_in(&tx, &sub.user_id, &sub.provider, cus, "subscription").map_err(|e| e.to_string())?),
         };
-        let emails = mail(&Change { applied: &outcome, before: by_id.as_ref(), paying_before: paying_before.as_ref() });
+        let emails = mail(&Change { applied: &outcome, before: by_id.as_ref(), paying_before: paying_before.as_ref(), paying_after: paying_after.as_ref() });
         // Held until the caller has followed the event (`release_billing_emails`), so a
         // plan email can say what the computer is doing; due anyway after the hold.
         let due = now() + crate::billing_mail::HOLD_MS;

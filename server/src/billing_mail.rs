@@ -330,6 +330,11 @@ pub fn for_subscription(ev: &SubEvent, c: &Change, tiers: &Tiers) -> Vec<NewEmai
             let why = (ev.row.status == "unpaid").then(|| "unpaid".to_string());
             out.push(email(Kind::PlanEnded, per_event(Kind::PlanEnded), Facts { plan: Some(label(ended.as_deref())), next_plan: Some(label(None)), why, ..Default::default() }));
         }
+        // Paying starts for a plan the user already had (an admin gave it): still a start.
+        Applied::Unchanged if c.paying_before.is_none() && c.paying_after.is_some_and(|s| s.subscription_id == ev.row.subscription_id) => {
+            let until = ev.row.period_end.map(|s| s * 1000);
+            out.push(email(Kind::PlanStarted, per_event(Kind::PlanStarted), Facts { plan: Some(label(ev.row.tier.as_deref())), until, ..Default::default() }));
+        }
         Applied::Superseded | Applied::Unchanged => {}
     }
     // Only for the subscription that sets the plan: one replaced or not paid for yet changes nothing.
@@ -360,8 +365,9 @@ impl Mailer for smtp::Smtp {
         })
     }
 
+    /// The server only: the sign-in name stays out of logs.
     fn describe(&self) -> String {
-        smtp::Smtp::describe(self)
+        format!("{}:{} ({})", self.host, self.port, self.tls.as_str())
     }
 }
 
@@ -571,7 +577,7 @@ async fn send_one(app: &App, m: &BillingMail, q: &Queued) -> Result<bool, String
             let e = crate::secrets::redact::text(&e).into_owned();
             let retry = attempts < MAX_ATTEMPTS;
             let saved = app.db.billing_email_result(q.id, if retry { "pending" } else { "failed" }, Some(&e));
-            eprintln!("billing: a {} email to {} failed (try {attempts}): {e}", q.kind, q.user_id);
+            eprintln!("billing: billing email {} ({}) failed (try {attempts}): {e}", q.id, q.kind);
             d["error"] = json!(e);
             d["retrying"] = json!(retry);
             app.db.record(&by.event("billing.email_failed").target("user", &q.user_id).outcome(Outcome::Failure).details(d));
@@ -629,7 +635,7 @@ pub async fn put_mine(State(app): State<AppState>, Extension(c): Extension<Calle
     let before = app.db.usage_emails(&u.id);
     if before != on {
         app.db.set_usage_emails(&u.id, on).map_err(|e| {
-            eprintln!("botd: couldn't save {}'s email settings: {e}", u.id);
+            eprintln!("botd: couldn't save someone's email settings: {e}");
             ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Couldn't save your email settings; see the server log.".into())
         })?;
         app.db.record(&by.event("billing.email_settings_updated").target("user", &u.id).details(json!({ "usage": { "from": before, "to": on } })));

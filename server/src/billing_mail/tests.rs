@@ -28,7 +28,9 @@ fn sub(status: &str, tier: Option<&str>) -> Subscription {
 
 fn emails(row: &Subscription, applied: Applied, before: Option<&Subscription>, paying_before: Option<&Subscription>, cancel_at: Option<i64>, ending: bool) -> Vec<NewEmail> {
     let ev = SubEvent { event_id: "evt_1", row, cancel_at, ending };
-    for_subscription(&ev, &Change { applied: &applied, before, paying_before }, &tiers())
+    // As botd finds it: this subscription pays once it sets a plan, unless another does.
+    let paying_after = if matches!(applied, Applied::Superseded) { paying_before } else { row.tier.is_some().then_some(row) };
+    for_subscription(&ev, &Change { applied: &applied, before, paying_before, paying_after }, &tiers())
 }
 
 fn kinds(e: &[NewEmail]) -> Vec<Kind> {
@@ -70,7 +72,12 @@ fn a_first_paying_subscription_starts_a_plan_and_a_second_changes_it() {
     let e = emails(&pro, changed(Some("starter"), Some("pro")), None, Some(&old), None, false);
     assert_eq!(kinds(&e), [Kind::PlanChanged]);
     assert_eq!((e[0].facts.from_plan.as_deref(), e[0].facts.plan.as_deref()), (Some("Starter"), Some("Pro")));
+    // Paying for the plan an admin already gave still starts it, once: later events don't.
+    let e = emails(&pro, Applied::Unchanged, None, None, None, false);
+    assert_eq!((kinds(&e), e[0].facts.until), (vec![Kind::PlanStarted], Some(1_797_582_000_000)));
+    assert!(emails(&pro, Applied::Unchanged, Some(&pro), Some(&pro), None, false).is_empty());
     // No facts carry a provider id.
+    let e = emails(&pro, changed(Some("starter"), Some("pro")), None, Some(&old), None, false);
     let facts = serde_json::to_string(&e[0].facts).unwrap();
     assert!(PROVIDER.iter().all(|p| !facts.contains(p)), "{facts}");
 }
@@ -121,7 +128,8 @@ fn events_that_did_nothing_send_nothing() {
     for a in [Applied::Duplicate, Applied::Stale, Applied::OtherUser, Applied::CustomerOfAnotherUser] {
         assert!(emails(&pro, a, None, None, Some(1_797_582_000), false).is_empty());
     }
-    assert!(emails(&sub("active", Some("pro")), Applied::Unchanged, Some(&sub("active", Some("pro"))), None, None, false).is_empty());
+    let active = sub("active", Some("pro"));
+    assert!(emails(&active, Applied::Unchanged, Some(&active), Some(&active), None, false).is_empty());
 }
 
 #[test]
