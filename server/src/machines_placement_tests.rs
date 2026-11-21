@@ -281,7 +281,7 @@ async fn a_refused_create_frees_its_room_for_its_retry() {
     let (uid, _) = user_with(env.port, &env.admin, "ada@example.com", "member").await;
     env.a.w().fail_op = Some("Failed getting remote image info: not found".into());
     let (code, d) = ask(&env, &uid).await;
-    assert_eq!(code, 202, "{d}");
+    assert_eq!(code, 502, "{d}");
     let m = env.app.db.user_machine(&uid).unwrap();
     assert_eq!((m.state, m.placed_on.as_deref()), (State::Error, None), "{m:?}");
     let h = hosts(&env).await;
