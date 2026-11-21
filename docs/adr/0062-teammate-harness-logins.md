@@ -65,6 +65,6 @@ The existing events gain who the login is for: `machine.harness_login_started|in
 
 ## Limits and follow-ups
 
-- **One server**: per-teammate logins under `ISOLATION=users` need per-teammate accounts for shared Bots there (see above).
+- **One server**: per-teammate logins under `ISOLATION=users` need per-teammate accounts for shared Bots there (see above). Done in [ADR 0064](0064-teammate-accounts-on-one-server.md).
 - **Pi and Hermes** still use API keys. There is nothing to log in.
 - **Team accounts and team machines** remain open on #30.
