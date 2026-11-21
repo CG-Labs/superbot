@@ -113,7 +113,7 @@ bump() {
   old_commit=$(pin version)
   old_sha=$(pin sha256)
   [[ "$to" != "$from" ]] || { say "already pinned to $from"; return 0; }
-  if [[ "$(printf '%s\n%s\n' "$from" "$to" | sort -V | head -1)" == "$to" ]]; then
+  if [[ "$(printf '%s\n%s\n' "$from" "$to" | sort -V | tail -1)" == "$from" ]]; then
     warn "$to is older than the pin, $from: rolling back"
   fi
   commit=$(commit_of "$to")
