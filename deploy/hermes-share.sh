@@ -5,15 +5,16 @@
 # and each Bot's HERMES_HOME is a data root of its own, so each new Bot built a 0.5 GB
 # environment of its own on its first run. This shares the install's one instead.
 #
-# Run as the install's owner, with HOME the folder Hermes's installer ran with, it makes
-# the committed environment usable read-only (Bots take no leases on it, so Hermes never
+# Run as the install's owner, with HOME the folder Hermes's installer ran with, it adds
+# Hermes's anthropic extra, makes the committed environment usable read-only (Bots take no leases on it, so Hermes never
 # collects it under them), removes environments left from earlier installs, and writes
 # itself with the install's paths filled in to $HOME/.hermes/superbot/hermes, which it
 # prints. Bots run that copy as `hermes`.
 #
 # That copy, run with a Bot's HERMES_HOME, gives the Bot's data root its own record of
-# the install: facts.json and the input stamps, and a link to the shared environments.
-# A launch then writes only in the Bot's own folder: its lock and its record. Bots never
+# the install: facts.json and the input stamps, and a link to the shared environments,
+# plus an empty config.yaml if it has none. A launch then writes only in the Bot's own
+# folder: its lock, its record, and that file. Bots never
 # install or update dependencies (HERMES_DISABLE_LAZY_INSTALLS); the installer does.
 # Without a HERMES_HOME, or with the install's own, it just runs Hermes.
 set -eu
@@ -40,6 +41,9 @@ if [ -z "$key" ]; then
   root=$(cd "$HOME/.hermes" 2>/dev/null && pwd -P) || die "no Hermes install in $HOME/.hermes"
   case "$root" in *[\'\|\\\&]*) die "can't use an install path with quotes, |, & or \\: $root" ;; esac
   checkout=$(cd "$root/hermes-agent" 2>/dev/null && pwd -P) || die "no Hermes checkout in $root/hermes-agent"
+  # A tier's endpoint may speak Anthropic Messages, whose client is an extra Hermes
+  # leaves out, and Bots can't add it (ADR 0076). Done already, this changes nothing.
+  "$checkout/.hermes/bin/hermes" pm install --extra anthropic >&2 || die "couldn't add Hermes's anthropic extra"
   key=$(install_key "$checkout")
   state="$root/installs/$key"
   [ -f "$state/facts.json" ] || die "Hermes committed no environment for $checkout"
@@ -84,6 +88,11 @@ if [ -n "$home" ] && [ -f "$shared/facts.json" ] && [ "$(cd "$home" 2>/dev/null 
     [ -L "$own/environments" ] || ln -s "$shared/environments" "$own/environments"
     cp -p "$shared/facts.json" "$own/facts.json.new"
     mv -f "$own/facts.json.new" "$own/facts.json"
+  fi
+  # Hermes reads the fallback chain only from a data root with a config.yaml of its
+  # own, even when the chain is in the managed one (ADR 0076). Empty is no settings.
+  if [ ! -e "$home/config.yaml" ]; then
+    (umask 077 && : >>"$home/config.yaml")
   fi
   HERMES_DISABLE_LAZY_INSTALLS=1
   export HERMES_DISABLE_LAZY_INSTALLS

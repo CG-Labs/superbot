@@ -262,7 +262,7 @@ mod tests {
         let home = dir.join("install");
         let root = home.join(".hermes");
         let launcher = root.join("hermes-agent/.hermes/bin/hermes");
-        write(&launcher, "#!/bin/sh\necho \"lazy=${HERMES_DISABLE_LAZY_INSTALLS:-} $*\"\n");
+        write(&launcher, "#!/bin/sh\n[ \"$1\" = pm ] && { echo \"$*\" >\"$0.pm\"; exit 0; }\necho \"lazy=${HERMES_DISABLE_LAZY_INSTALLS:-} $*\"\n");
         mode(&launcher, 0o755);
         let checkout = root.join("hermes-agent").display().to_string();
         let key: String = Sha256::digest(&checkout).iter().take(8).map(|b| format!("{b:02x}")).collect();
@@ -298,6 +298,8 @@ mod tests {
         assert!(state.join("environments/g2/venv").exists());
         assert!(!state.join("environments/g2/.lease-managed").exists(), "Bots take no leases, so Hermes never collects it");
         assert!(!state.join("environments/g2/.leases").exists());
+        let pm = std::fs::read_to_string(launcher.with_extension("pm")).unwrap_or_default();
+        assert_eq!(pm.trim(), "pm install --extra anthropic", "the installer adds what Anthropic Messages endpoints need");
 
         assert_eq!(run(&wrapper, &[], &["--version"]), "lazy= --version", "no Bot home: just Hermes");
         assert_eq!(run(&wrapper, &[("HERMES_HOME", &root)], &["x"]), "lazy= x", "the install's own home");
@@ -312,6 +314,11 @@ mod tests {
         assert_eq!(std::fs::read_link(own.join("environments")).unwrap(), state.join("environments"));
         assert_eq!(std::fs::read_to_string(own.join("inputs/uv.lock.stamp")).unwrap(), "a");
         assert_eq!(std::fs::metadata(&own).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::read_to_string(bot.join("config.yaml")).unwrap(), "", "Hermes reads fallbacks only with one");
+        assert_eq!(std::fs::metadata(bot.join("config.yaml")).unwrap().permissions().mode() & 0o777, 0o600);
+        write(&bot.join("config.yaml"), "model: x\n");
+        run(&wrapper, &[("HERMES_HOME", &bot)], &[]);
+        assert_eq!(std::fs::read_to_string(bot.join("config.yaml")).unwrap(), "model: x\n", "a Bot's own settings stay");
 
         let old = dir.join("bots/b/hermes");
         write(&old.join("installs").join(&key).join("environments/g0/venv/lib/big"), "x");
