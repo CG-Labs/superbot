@@ -10,7 +10,7 @@
 //! window has the rest folded into one digest at its end. Every send and failure is an
 //! audit event.
 //!
-//! Channels share one shape (`Channel`): mobile push (ADR 0079, #36) is another one,
+//! Channels share one shape (`Channel`): mobile push (ADR 0080, #36) is another one,
 //! reaching the devices of the same `Plan::deciders`.
 
 pub mod api;
@@ -269,7 +269,7 @@ pub struct Plan {
     pub email: Vec<String>,
     /// The secret holding the URL, and the format.
     pub webhook: Option<(String, Format)>,
-    /// The deciders' live devices that want approvals (ADR 0079).
+    /// The deciders' live devices that want approvals (ADR 0080).
     pub push: Vec<PushDevice>,
 }
 
@@ -861,7 +861,7 @@ pub fn alert(app: &Arc<App>, a: Alert, page: &'static str) {
     }
 }
 
-/// A routine's run is over: the person it ran for hears of it on their phones (ADR 0079).
+/// A routine's run is over: the person it ran for hears of it on their phones (ADR 0080).
 pub fn routine_done(app: &Arc<App>, bot: &Bot, msg: &crate::db::Message) {
     push::routine_done(app, bot, msg);
 }

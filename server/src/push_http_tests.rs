@@ -1,4 +1,4 @@
-//! HTTP tests for push notifications (ADR 0079) on the real router: a phone per
+//! HTTP tests for push notifications (ADR 0080) on the real router: a phone per
 //! session, never shown back and gone with the session; approvals that reach only their
 //! deciders' phones and routines only the phones of the person they ran for, with
 //! nothing a Bot asked to run in them. The provider is a fake that keeps what it got.
@@ -83,7 +83,10 @@ async fn push_is_off_until_an_operator_turns_it_on() {
 async fn a_phone_is_registered_per_session_and_its_token_never_comes_back() {
     let (port, app, admin, _) = serve_app().await;
     with_push(&app, push::ROUTINE_WINDOW);
-    let (ada_id, ada) = user_with(port, &admin, "push-reg@example.com", "readonly").await;
+    let (ada_id, ada) = user_with(port, &admin, "push-reg@example.com", "member").await;
+    let (_, rae) = user_with(port, &admin, "push-rae@example.com", "readonly").await;
+    assert_eq!(register(port, &rae, CY, json!({})).await.0, 403, "read-only people can't decide or run anything, so add no phone");
+    assert_eq!(call(port, "DELETE", "/api/me/push", &rae, "").await.0, 200, "but anyone can remove theirs");
 
     for (bad, why) in [
         (json!({ "token": "not-a-token", "platform": "ios" }), "token"),
@@ -165,7 +168,7 @@ async fn an_approval_reaches_only_its_deciders_phones_and_says_nothing_it_asked(
     let (bob_id, bob) = user_with(port, &admin, "push-bob@example.com", "member").await;
     let (cy_id, cy) = user_with(port, &admin, "push-cy@example.com", "member").await;
     let (_, dee) = user_with(port, &admin, "push-dee@example.com", "member").await;
-    let (eve_id, eve) = user_with(port, &admin, "push-eve@example.com", "readonly").await;
+    let (eve_id, eve) = user_with(port, &admin, "push-eve@example.com", "member").await;
     let bot = app.db.create_bot_owned("Ada's Ops", "#fff", "waddle", "claude", None, false, &ada_id, Visibility::Private);
     // Bob can answer; Cy can only look; Eve can't approve whatever she's granted; Dee can't see it.
     app.db.set_grant(&bot.id, &bob_id, Grant::Operator, "test");
@@ -174,6 +177,8 @@ async fn an_approval_reaches_only_its_deciders_phones_and_says_nothing_it_asked(
     for (auth, token) in [(&ada, ADA), (&bob, BOB), (&cy, CY), (&dee, DEE), (&eve, EVE)] {
         assert_eq!(register(port, auth, token, json!({})).await.0, 200);
     }
+    // Eve registered, then became read-only: her phone stays, but she decides nothing now.
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{eve_id}"), &admin, r#"{"role":"readonly"}"#).await.0, 200);
     call(port, "PUT", "/api/notifications", &admin, r#"{"delaySeconds":0}"#).await;
 
     let bot_auth = key.auth(&bot.id);

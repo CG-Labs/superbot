@@ -805,7 +805,7 @@ pub struct Session {
     pub revoke_reason: Option<String>,
 }
 
-/// A phone that gets push notifications (ADR 0079), registered by one session and
+/// A phone that gets push notifications (ADR 0080), registered by one session and
 /// removed with it. `token` is the provider's address for the device, sealed at rest
 /// and never shown: anyone holding it can send to the phone.
 #[derive(Clone)]
@@ -1233,7 +1233,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 30] = [
     migrate_push_devices,
 ];
 
-/// Phones that get push notifications (ADR 0079): one per session at most, and a token
+/// Phones that get push notifications (ADR 0080): one per session at most, and a token
 /// belongs to one session only, so a phone that changes hands stops reaching the last
 /// person. Ending the session removes it; so does deleting the session or the user.
 fn migrate_push_devices(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
@@ -3635,7 +3635,7 @@ impl Db {
     }
 
     /// False if it was already revoked or doesn't exist.
-    /// Its push device goes with it (ADR 0079), whatever ended it.
+    /// Its push device goes with it (ADR 0080), whatever ended it.
     pub fn revoke_session(&self, id: &str, by: &str, reason: &str) -> bool {
         let c = self.c();
         let _ = c.execute("DELETE FROM push_devices WHERE session_id = ?", [id]);
@@ -3954,7 +3954,7 @@ impl Db {
         c.query_row("SELECT * FROM users WHERE id = ?", [user_id], user_row).optional().ok().flatten()
     }
 
-    // Push devices (ADR 0079). Tokens are sealed; the hash keeps each on one session.
+    // Push devices (ADR 0080). Tokens are sealed; the hash keeps each on one session.
 
     /// Registers `token` for this session, in place of any it had. A token another
     /// session held moves here, so that session (and its person) stops getting it.
@@ -5986,7 +5986,7 @@ mod tests {
         let bot = db.create_bot("Kept", "#fff", "waddle", "claude", None, true);
         // As a database from before users: no user tables, user_version 2.
         db.c()
-            .execute_batch(&format!("{UNDO_BOT_ACLS} DROP TABLE user_identities; DROP TABLE login_codes; DROP TABLE sessions; DROP TABLE users; PRAGMA user_version = 2;"))
+            .execute_batch(&format!("{UNDO_BOT_ACLS} DROP TABLE push_devices; DROP TABLE user_identities; DROP TABLE login_codes; DROP TABLE sessions; DROP TABLE users; PRAGMA user_version = 2;"))
             .unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();

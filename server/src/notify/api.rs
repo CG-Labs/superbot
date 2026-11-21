@@ -40,7 +40,7 @@ pub fn view(app: &App) -> Value {
         },
         "webhook": webhook_view(webhook::URL),
         "signing": secret_set(webhook::SIGNING),
-        // Push is the operator's to turn on (ADR 0079); each person opts in per phone.
+        // Push is the operator's to turn on (ADR 0080); each person opts in per phone.
         "push": {
             "provider": app.notifier.get().and_then(|n| n.push.as_ref()).map(|p| p.provider()),
             "accessTokenSet": secret_set(super::push::EXPO_ACCESS_TOKEN),

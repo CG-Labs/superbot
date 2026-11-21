@@ -1,4 +1,4 @@
-//! Mobile push notifications (ADR 0079, #36): a pending approval reaches its deciders'
+//! Mobile push notifications (ADR 0080, #36): a pending approval reaches its deciders'
 //! phones, and a finished routine reaches the phones of the person it ran for. Off until
 //! an operator sets `PUSH_PROVIDER=expo`; then each person opts in per phone, in the
 //! app's Settings.
@@ -80,7 +80,7 @@ pub fn expo_token_ok(t: &str) -> bool {
 }
 
 /// Expo's push service, which hands each message to APNs or FCM. Free; the app's build
-/// carries the Apple and Google credentials (ADR 0079 lists them).
+/// carries the Apple and Google credentials (ADR 0080 lists them).
 pub struct Expo {
     http: reqwest::Client,
     url: String,

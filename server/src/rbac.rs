@@ -129,8 +129,11 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         ("GET", ["billing"]) => Read,
         ("POST", ["billing", "checkout" | "portal"]) => Write,
         ("PUT" | "DELETE", ["me", "secrets", _]) => Write,
-        // This session's phone for push notifications (ADR 0079). Handlers refuse Bots.
-        ("GET" | "PUT" | "DELETE", ["me", "push"]) => Account,
+        // This session's phone for push notifications (ADR 0080). Handlers refuse Bots.
+        // Read-only people can't decide approvals or run routines, so they don't add one;
+        // anyone may remove theirs, as anyone may sign out.
+        ("PUT", ["me", "push"]) => Write,
+        ("GET" | "DELETE", ["me", "push"]) => Account,
 
         ("GET", ["state" | "events" | "bots" | "policy"]) => Read,
         ("GET", ["harnesses", _, "models"]) => Read,
@@ -348,7 +351,7 @@ mod tests {
             ("POST", "/api/machine/folder-sync", Perm::Admin),
             ("POST", "/api/auth/logout", Perm::Account),
             ("GET", "/api/me/push", Perm::Account),
-            ("PUT", "/api/me/push", Perm::Account),
+            ("PUT", "/api/me/push", Perm::Write),
             ("DELETE", "/api/me/push", Perm::Account),
             ("POST", "/api/me/push", Perm::Admin),
             ("GET", "/", Perm::Read),
