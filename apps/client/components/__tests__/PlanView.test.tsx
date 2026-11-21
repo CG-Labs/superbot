@@ -1,5 +1,5 @@
 import React from "react";
-import { act, render, screen, userEvent } from "@testing-library/react-native";
+import { act, fireEvent, render, screen, userEvent } from "@testing-library/react-native";
 import { CONFIRM_EVERY_MS, PlanView } from "../PlanView";
 import PlanScreen from "../../app/plan";
 import { ApiError } from "../../src/api";
@@ -49,6 +49,7 @@ function fakeApi(view: BillingView | null, mine: MyUsage | null = null) {
     myUsage: jest.fn(async (): Promise<MyUsage | null> => mine),
     checkout: jest.fn(async (tier: string) => ({ url: `https://checkout.stripe.com/c/pay/${tier}` })),
     billingPortal: jest.fn(async () => ({ url: "https://billing.stripe.com/p/session/1" })),
+    setUsageEmails: jest.fn(async (on: boolean) => ({ on: true, usage: on })),
   };
 }
 
@@ -147,6 +148,37 @@ describe("PlanView (ADR 0042)", () => {
     expect(screen.getByText("This month: 2026-11-01 to 2026-12-01 (UTC)")).toBeOnTheScreen();
     expect(screen.getByText("Model tokens: 1,500 (no limit)")).toBeOnTheScreen();
     expect(screen.getByText("Scout: 1,500 tokens in 1 run")).toBeOnTheScreen();
+  });
+
+  it("turns usage emails off and on, when the server sends billing emails (ADR 0089)", async () => {
+    const api = fakeApi(billing({ emails: { on: true, usage: true } }));
+    await render(<PlanView api={api} onBack={jest.fn()} />);
+    const toggle = await screen.findByLabelText("Usage emails");
+    expect(toggle.props.value).toBe(true);
+    await act(async () => fireEvent(toggle, "valueChange", false));
+    expect(api.setUsageEmails).toHaveBeenCalledWith(false);
+    expect((await screen.findByLabelText("Usage emails")).props.value).toBe(false);
+  });
+
+  it("says why a usage email change didn't save", async () => {
+    const api = fakeApi(billing({ emails: { on: true, usage: true } }));
+    api.setUsageEmails.mockRejectedValueOnce(new ApiError("Server error", 500));
+    await render(<PlanView api={api} onBack={jest.fn()} />);
+    const toggle = await screen.findByLabelText("Usage emails");
+    await act(async () => fireEvent(toggle, "valueChange", false));
+    expect(await screen.findByText("Server error")).toBeOnTheScreen();
+    expect(screen.getByLabelText("Usage emails").props.value).toBe(true);
+  });
+
+  it("has no email settings when the server sends no billing emails, and read-only people can't change them", async () => {
+    const { rerender } = await render(<PlanView api={fakeApi(billing({ emails: { on: false, usage: true } }))} onBack={jest.fn()} />);
+    expect(await screen.findByText("Starter plan")).toBeOnTheScreen();
+    expect(screen.queryByText("Emails")).toBeNull();
+    await rerender(<PlanView api={fakeApi(billing())} onBack={jest.fn()} />);
+    expect(await screen.findByText("Starter plan")).toBeOnTheScreen();
+    expect(screen.queryByLabelText("Usage emails")).toBeNull();
+    await rerender(<PlanView api={fakeApi(billing({ canChange: false, emails: { on: true, usage: true } }))} onBack={jest.fn()} />);
+    expect((await screen.findByLabelText("Usage emails")).props.disabled).toBe(true);
   });
 
   it("still shows the plan when usage can't load", async () => {
