@@ -136,7 +136,8 @@ as_account() { dc exec -T -w "/srv/superbot/users/$probe/home" botd sudo -n -u "
 for p in /data /data/app.sqlite /home/superbot /proc/1/environ; do
   if as_account "if [ -d '$p' ]; then ls -A '$p'; else head -c 1 '$p'; fi" >/dev/null 2>&1; then fail "the account can read $p"; fi
 done
-if as_account 'cat /proc/[0-9]*/environ 2>/dev/null' | grep -qaF -e "$MASTER_KEY" -e "$PASSWORD"; then
+environs=$(as_account 'cat /proc/[0-9]*/environ 2>/dev/null | tr "\0" "\n"' || true)
+if grep -qF -e "$MASTER_KEY" -e "$PASSWORD" <<<"$environs"; then
   fail "the account can read botd's env"
 fi
 if as_account 'sudo -n true' >/dev/null 2>&1; then fail "the account can use sudo"; fi
