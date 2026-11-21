@@ -6,6 +6,11 @@ import { saveCsv } from "../../src/saveCsv";
 import type { AuditEvent, AuditPage } from "../../src/types";
 
 jest.mock("../../src/saveCsv", () => ({ saveCsv: jest.fn(async () => {}) }));
+let mockWidth = 400;
+jest.mock("react-native/Libraries/Utilities/useWindowDimensions", () => ({
+  __esModule: true,
+  default: () => ({ width: mockWidth, height: 800, scale: 1, fontScale: 1 }),
+}));
 
 const ev = (id: number, e: Partial<AuditEvent> = {}): AuditEvent => ({
   id,
@@ -44,7 +49,10 @@ async function open(pages: AuditPage[], botName?: (id: string) => string | undef
 
 const lastQuery = (api: ReturnType<typeof fakeApi>) => api.audit.mock.calls.at(-1)?.[0];
 
-beforeEach(() => jest.mocked(saveCsv).mockClear());
+beforeEach(() => {
+  jest.mocked(saveCsv).mockClear();
+  mockWidth = 400;
+});
 
 describe("AuditLog", () => {
   it("lists events with who acted, how they signed in, the target, and failures marked", async () => {
@@ -72,14 +80,95 @@ describe("AuditLog", () => {
     expect(sso.queryByText("failure")).toBeNull();
   });
 
-  it("opens an event to show its session, subject, and user agent", async () => {
+  it("opens an event to show all of it: session, subject, user agent, and details", async () => {
     const { user } = await open([{ events: [ev(1, { sessionId: "s1", actorSubject: "https://login.example/t1|oid-1", userAgent: "Firefox" })], nextBefore: null }]);
     const row = await screen.findByLabelText("Audit event 1: bot.created");
-    expect(screen.queryByText("Session s1")).toBeNull();
+    expect(screen.queryByTestId("audit-event-detail")).toBeNull();
     await user.press(row);
-    expect(screen.getByText("Session s1")).toBeOnTheScreen();
-    expect(screen.getByText("IdP subject https://login.example/t1|oid-1")).toBeOnTheScreen();
-    expect(screen.getByText("User agent Firefox")).toBeOnTheScreen();
+    const detail = within(screen.getByTestId("audit-event-detail"));
+    expect(detail.getByText("s1")).toBeOnTheScreen();
+    expect(detail.getByText("https://login.example/t1|oid-1")).toBeOnTheScreen();
+    expect(detail.getByText("Firefox")).toBeOnTheScreen();
+    expect(detail.getByText('{\n  "name": "Scout"\n}')).toBeOnTheScreen();
+    expect(detail.queryByText("Decision")).toBeNull();
+    await user.press(screen.getByLabelText("Back to the audit log"));
+    expect(screen.queryByTestId("audit-event-detail")).toBeNull();
+  });
+
+  it("says how an approval was decided, and what it was for", async () => {
+    const denied = ev(1, {
+      action: "approval.denied",
+      targetType: "approval",
+      targetId: "a1",
+      botId: "b9",
+      details: { subject: "git push origin main", tool: "Bash", class: "push", note: "not today", rule: null },
+    });
+    const { user } = await open([{ events: [denied], nextBefore: null }], (id) => (id === "b9" ? "Scout" : undefined));
+    await user.press(await screen.findByLabelText("Audit event 1: approval.denied"));
+    const detail = within(screen.getByTestId("audit-event-detail"));
+    expect(detail.getByText("Denied")).toBeOnTheScreen();
+    expect(detail.getByText("git push origin main")).toBeOnTheScreen();
+    expect(detail.getByText("not today")).toBeOnTheScreen();
+    expect(detail.getByText("Scout (b9)")).toBeOnTheScreen();
+  });
+
+  it("follows a session, a Bot, or a person from an event, starting a fresh filter", async () => {
+    const { api, user } = await open([], (id) => (id === "b9" ? "Scout" : undefined));
+    api.audit.mockImplementation(async () => ({ events: [ev(1, { sessionId: "s1", botId: "b9" })], nextBefore: null }));
+    await user.press(screen.getByText("Filters"));
+    await user.press(screen.getByRole("radio", { name: "Failure" }));
+    await act(() => new Promise((r) => setTimeout(r, 350)));
+    expect(lastQuery(api)).toBe("outcome=failure");
+    await user.press(await screen.findByLabelText("Audit event 1: bot.created"));
+    await user.press(screen.getByText("Everything in this session ›"));
+    expect(screen.queryByTestId("audit-event-detail")).toBeNull();
+    await act(() => new Promise((r) => setTimeout(r, 350)));
+    expect(lastQuery(api)).toBe("session=s1");
+    expect(screen.getByLabelText("Session").props.value).toBe("s1");
+
+    await user.press(await screen.findByLabelText("Audit event 1: bot.created"));
+    await user.press(screen.getByText("Everything about Scout ›"));
+    await act(() => new Promise((r) => setTimeout(r, 350)));
+    expect(lastQuery(api)).toBe("bot=b9");
+
+    await user.press(await screen.findByLabelText("Audit event 1: bot.created"));
+    await user.press(screen.getByText("Everything by Owner ›"));
+    await act(() => new Promise((r) => setTimeout(r, 350)));
+    expect(lastQuery(api)).toBe("actor=user%3Aoperator");
+  });
+
+  it("filters by kind of action, Bot, and whom a Bot acted for", async () => {
+    const api = fakeApi([{ events: [ev(1)], nextBefore: null }]);
+    const user = userEvent.setup();
+    const bots = [
+      { id: "b2", name: "Zed" },
+      { id: "b1", name: "Scout" },
+    ];
+    await render(<AuditLog api={api as unknown as SuperBotApi} onBack={jest.fn()} bots={bots} />);
+    await screen.findByLabelText("Audit event 1: bot.created");
+    await user.press(screen.getByText("Filters"));
+    expect(screen.getAllByText(/^(Any Bot|Scout|Zed)$/).map((t) => t.props.children)).toEqual(["Any Bot", "Scout", "Zed"]);
+    await user.press(screen.getByRole("radio", { name: "Approval decisions" }));
+    expect(screen.getByLabelText("Action").props.value).toBe("approval.approved,approval.denied,approval.expired");
+    await user.press(screen.getByRole("radio", { name: "Scout" }));
+    await user.type(screen.getByLabelText("On behalf of"), "ada@example.com");
+    await act(() => new Promise((r) => setTimeout(r, 350)));
+    expect(lastQuery(api)).toBe("action=approval.approved%2Capproval.denied%2Capproval.expired&bot=b1&onBehalfOf=ada%40example.com");
+    expect(screen.getByRole("radio", { name: "Approval decisions" })).toBeChecked();
+
+    await user.type(screen.getByLabelText("Action"), ",bot.*");
+    expect(screen.getByRole("radio", { name: "Approval decisions" })).not.toBeChecked();
+    await user.press(screen.getByRole("radio", { name: "Any action" }));
+    expect(screen.getByLabelText("Action").props.value).toBe("");
+  });
+
+  it("opens with the filters of a link, and shows them", async () => {
+    const api = fakeApi([{ events: [], nextBefore: null }]);
+    await render(<AuditLog api={api as unknown as SuperBotApi} onBack={jest.fn()} initial={{ bot: "gone" }} botName={() => undefined} />);
+    expect(await screen.findByText("No events match.")).toBeOnTheScreen();
+    expect(api.audit).toHaveBeenCalledWith("bot=gone", undefined);
+    expect(screen.getByText("Hide filters · 1")).toBeOnTheScreen();
+    expect(screen.getByRole("radio", { name: "gone" })).toBeChecked();
   });
 
   it("asks the server again as filters change", async () => {
@@ -132,6 +221,44 @@ describe("AuditLog", () => {
     expect(screen.getByLabelText("Audit event 3: bot.created")).toBeOnTheScreen();
     expect(api.audit).toHaveBeenLastCalledWith("", 2);
     expect(screen.queryByText("Load more")).toBeNull();
+  });
+
+  it("asks for one older page at a time", async () => {
+    const { api, user } = await open([{ events: [ev(3)], nextBefore: 3 }]);
+    await screen.findByLabelText("Audit event 3: bot.created");
+    let finish: (p: AuditPage) => void = () => {};
+    api.audit.mockImplementationOnce(() => new Promise<AuditPage>((r) => (finish = r)));
+    await user.press(screen.getByText("Load more"));
+    expect(screen.getByText("Loading…")).toBeOnTheScreen();
+    await user.press(screen.getByText("Loading…"));
+    expect(api.audit).toHaveBeenCalledTimes(2);
+    await act(async () => finish({ events: [ev(2)], nextBefore: null }));
+    expect(await screen.findByLabelText("Audit event 2: bot.created")).toBeOnTheScreen();
+  });
+
+  it("pulls to refresh with the filter on screen", async () => {
+    const { api } = await open([
+      { events: [ev(1)], nextBefore: null },
+      { events: [ev(2), ev(1)], nextBefore: null },
+    ]);
+    await screen.findByLabelText("Audit event 1: bot.created");
+    await fireEvent(screen.getByTestId("audit-list"), "refresh");
+    expect(await screen.findByLabelText("Audit event 2: bot.created")).toBeOnTheScreen();
+    expect(api.audit).toHaveBeenLastCalledWith("", undefined);
+  });
+
+  it("shows the event beside the list on a wide screen, and keeps it there after following it", async () => {
+    mockWidth = 1200;
+    const { api, user } = await open([{ events: [ev(1, { sessionId: "s1" })], nextBefore: null }]);
+    expect(await screen.findByText("Pick an event to see all of it.")).toBeOnTheScreen();
+    expect(screen.queryByText("Filters")).toBeNull();
+    await user.press(await screen.findByLabelText("Audit event 1: bot.created"));
+    expect(screen.getByTestId("audit-event-detail")).toBeOnTheScreen();
+    expect(screen.queryByLabelText("Back to the audit log")).toBeNull();
+    await user.press(screen.getByText("Only bot.created ›"));
+    await act(() => new Promise((r) => setTimeout(r, 350)));
+    expect(lastQuery(api)).toBe("action=bot.created");
+    expect(screen.getByTestId("audit-event-detail")).toBeOnTheScreen();
   });
 
   it("exports the shown filter as CSV and saves it under the server's name", async () => {
