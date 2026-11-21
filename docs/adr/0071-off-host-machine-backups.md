@@ -68,7 +68,7 @@ A failed backup is tried again after an hour, or after the interval if that is s
 
 A backup expires its tier's retention after it was taken. The newest finished backup of a machine that isn't destroyed is never deleted, however old it is, so a machine that stopped being eligible keeps its last good copy. When a machine is destroyed, its backups expire as usual. They are kept for the retention period, not deleted with the machine, so a mistaken destroy can still be undone by hand.
 
-If botd stops mid-backup, the backup is marked failed at startup. A restore that hadn't yet put its copy in place is also marked failed.
+If botd stops mid-backup, the backup is marked failed at startup. A restore that hadn't yet put its copy in place is also marked failed, and its imported copy is deleted, with retries. The copy is kept if the old container is already gone, since then the copy is all that is left. An upload that fails, even at its last step, is aborted, so no parts are left in the bucket.
 
 ### Restore
 
@@ -83,10 +83,13 @@ The backup must be one of this machine's own, finished. The machine must be runn
    - no snapshots until it enrolls;
    - today's CA, agent unit, guard, `machine.env` and the fresh token pushed into it as files, with the old identity file deleted.
 
-   botd then deletes the old container, renames the copy into its place, and starts it. After that:
+   botd then deletes the old container and renames the copy into its place. Before starting it:
    - all the machine's old certificates are revoked (`machine.cert_revoked`, reason `restored`);
    - what the old agent reported is forgotten, as after a rebuild (ADR 0056);
-   - its folder-sync state and the owner's sessions on it are dropped.
+   - its folder-sync state and the owner's sessions on it are dropped;
+   - the time enrollment must come after is recorded.
+
+   Enrollment doesn't take the lock, so all of this happens first. Otherwise the new agent's certificate could be revoked, or its enrollment missed. If the swap fails while the old container is still in place, the machine's earlier enrollment deadline is put back, so its backups go on.
 3. **Enroll.** Finding no identity, the agent enrolls with the token file and deletes it, as on first boot. Routing refuses the user's Bots (`machine_restoring`) until it has enrolled. Off-host backups, provider snapshots, rebuilds and another restore all wait too. Once it enrolls, the restore is done. If it doesn't enroll within the enrollment timeout plus ten minutes, the restore fails and the token is revoked.
 
 So nothing enrolled from the backup's disk is trusted again. The token lives only in a root-only file on the disk, never in the provider's config, and is spent on first use. The control-plane lock keeps the reconciler and other admin actions out while the copy is swapped in.

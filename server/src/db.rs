@@ -3960,6 +3960,15 @@ impl Db {
         tx.commit()
     }
 
+    /// Puts back the enrollment deadline and overdue mark a token replaced, when the
+    /// machine it was for never got it (a restore that failed before the swap).
+    pub fn restore_enroll_by(&self, machine_id: &str, enroll_by: Option<i64>, overdue_at: Option<i64>) {
+        let _ = self.c().execute(
+            "UPDATE machines SET enroll_by = ?, enroll_overdue_at = ? WHERE id = ?",
+            params![enroll_by, overdue_at, machine_id],
+        );
+    }
+
     /// Marks the machine overdue if it had to enroll by now and hasn't (ADR 0035).
     /// Returns whether this call marked it, so it is reported once.
     pub fn mark_enroll_overdue(&self, machine_id: &str) -> bool {

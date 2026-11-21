@@ -266,8 +266,8 @@ pub trait MachineProvider: Send + Sync {
         Box::pin(async { Err(unsupported()) })
     }
     /// Puts the imported machine `staging` in place of machine `id`: set up as `spec`
-    /// says while stopped, then the old one deleted, the new one given its name, and
-    /// started. Everything on the old one's disks is lost.
+    /// says while stopped, then the old one deleted and the new one given its name. It
+    /// stays stopped until `boot`. Everything on the old one's disks is lost.
     fn replace_with<'a>(&'a self, _id: &'a str, _staging: &'a str, _spec: &'a RestoreSpec) -> Fut<'a, ProviderMachine> {
         Box::pin(async { Err(unsupported()) })
     }

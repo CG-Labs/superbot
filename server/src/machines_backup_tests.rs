@@ -284,8 +284,25 @@ async fn encrypted_backups_need_the_identity_and_a_failed_restore_leaves_the_mac
     assert_eq!(failed.len(), 1, "{failed:?}");
     assert!(!json!(failed).to_string().contains(&wrong));
 
-    // The right one.
+    // A restore failing at the swap, after its token was minted, leaves the machine's
+    // enrollment deadline as it was, so its backups go on.
     let right = id.to_string().expose_secret().to_string();
+    let mut mm = env.app.db.machine(&m.id).unwrap();
+    let fw = mm.firewall_id.take();
+    env.app.db.save_machine(&mm, mm.state);
+    let r = restore_until(&env, &uid, json!({ "backupId": b.id, "identity": right }), "failed").await;
+    assert!(r.error.as_deref().is_some_and(|e| e.contains("firewall")), "{:?}", r.error);
+    let mm = env.app.db.machine(&m.id).unwrap();
+    assert_eq!((mm.enroll_by, mm.enroll_overdue_at), (None, None));
+    assert_eq!(env.app.db.machine_tokens_unused(&m.id), 0);
+    assert!(env.incus.instance(&format!("{}-restore", m.label)).is_none());
+    assert_eq!(read(&env, &m.label, "/home/user/notes.txt").as_deref(), Some("version 2"));
+    assert_eq!(back_up(&env, &uid).await.state, "done");
+    let mut mm = env.app.db.machine(&m.id).unwrap();
+    mm.firewall_id = fw;
+    env.app.db.save_machine(&mm, mm.state);
+
+    // The right one.
     restore_until(&env, &uid, json!({ "backupId": b.id, "identity": right }), "enrolling").await;
     assert_eq!(read(&env, &m.label, "/home/user/notes.txt").as_deref(), Some("version 1"));
     assert_eq!(read(&env, &m.label, IDENTITY_PATH), None);

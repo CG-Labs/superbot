@@ -127,7 +127,7 @@ botctl machine restore <user> <backup-id> --identity age-identity.txt --yes
 botctl machine restore <user> status
 ```
 
-A restore replaces the machine with the backup. Everything on it since the backup is lost. botd imports the backup beside the container and gives it today's size, security settings and firewall. It removes the agent's old identity, writes a fresh one-time enrollment token as a root-only file, swaps the copy into place and starts it. The machine's old certificates and tokens are revoked. Bots on it are refused (`machine_restoring`) until its agent enrolls again, normally within a minute of starting. A wrong key or a damaged object fails before anything changes. The audit log has `machine.backup_created`, `machine.backup_failed`, `machine.backup_deleted`, `machine.restore_requested`, `machine.restored` and `machine.restore_failed`.
+A restore replaces the machine with the backup. Everything on it since the backup is lost. botd imports the backup beside the container and gives it today's size, security settings and firewall. It removes the agent's old identity, writes a fresh one-time enrollment token as a root-only file, swaps the copy into place, revokes the machine's old certificates and tokens, and then starts it. Bots on it are refused (`machine_restoring`) until its agent enrolls again, normally within a minute of starting. A wrong key or a damaged object fails before anything changes. The audit log has `machine.backup_created`, `machine.backup_failed`, `machine.backup_deleted`, `machine.restore_requested`, `machine.restored` and `machine.restore_failed`.
 
 ## Testing against a real host
 

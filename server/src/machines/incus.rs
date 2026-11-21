@@ -1409,7 +1409,7 @@ impl MachineProvider for Incus {
 
     /// The restored container gets today's isolation, size, tags, and NIC behind the
     /// firewall, whatever its backup said, and none of its cloud-init user data. It is
-    /// started only once that and its files are in place.
+    /// left stopped for the caller to boot.
     fn replace_with<'a>(&'a self, id: &'a str, staging: &'a str, spec: &'a RestoreSpec) -> Fut<'a, ProviderMachine> {
         Box::pin(async move {
             let size = Size::parse(&spec.plan).map_err(|m| api(400, m))?;
@@ -1464,7 +1464,6 @@ impl MachineProvider for Incus {
                 .call(Method::POST, &format!("/1.0/instances/{staging}"), &[], Some(&json!({ "name": id })), None)
                 .await?;
             self.finish(r, EDIT_WAIT, "renaming the restored container").await?;
-            self.start(id).await?;
             self.get(id).await
         })
     }

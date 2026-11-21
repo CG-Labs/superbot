@@ -564,14 +564,16 @@ pub async fn pass(app: &AppState, cp: &ControlPlane) -> usize {
 }
 
 /// What a botd that stopped mid-way left: backups running end as failed (the provider's
-/// copy expires by itself), and restores not yet started end as failed too.
-fn interrupted(app: &App) {
+/// copy expires by itself), and restores not yet started end as failed too. Returns
+/// those restores, whose imported copies `clean_up` deletes.
+fn interrupted(app: &App) -> Vec<MachineRestore> {
+    let mut left = Vec::new();
     for b in app.db.machine_backups_in("running") {
-        if app.db.machine_backup_end(&b.id, None, Some("botd stopped while it was running")) {
-            if let Some(m) = app.db.machine(&b.machine_id) {
-                let d = json!({ "backupId": b.id, "error": "interrupted", "by": b.created_by });
-                app.db.record(&event(&system(&m), "machine.backup_failed", &m, d).outcome(Outcome::Failure));
-            }
+        if app.db.machine_backup_end(&b.id, None, Some("botd stopped while it was running"))
+            && let Some(m) = app.db.machine(&b.machine_id)
+        {
+            let d = json!({ "backupId": b.id, "error": "interrupted", "by": b.created_by });
+            app.db.record(&event(&system(&m), "machine.backup_failed", &m, d).outcome(Outcome::Failure));
         }
     }
     for st in ["importing", "replacing"] {
@@ -579,7 +581,40 @@ fn interrupted(app: &App) {
             if let Some(m) = app.db.machine(&r.machine_id) {
                 fail_restore(app, &system(&m), &m, &r, &[st], "botd stopped mid-restore; check the machine and restore again");
             }
+            left.push(r);
         }
+    }
+    left
+}
+
+/// Deletes the copies interrupted restores imported, trying again a few times while the
+/// provider is busy. A copy is left alone once a newer restore of its machine began.
+async fn clean_up(app: &App, cp: &ControlPlane, mut left: Vec<MachineRestore>) {
+    let Some(p) = cp.provider.as_deref() else { return };
+    for _ in 0..5 {
+        let mut again = Vec::new();
+        for r in left {
+            let Some(m) = app.db.machine(&r.machine_id) else { continue };
+            let _g = cp.ops.lock().await;
+            if app.db.machine_last_restore(&m.id).is_some_and(|l| l.id != r.id) {
+                continue;
+            }
+            // Stopped between deleting the old container and renaming the copy, the copy
+            // is all that's left of the machine.
+            if r.state == "replacing" && p.get(&provider_id(&m)).await.is_err() {
+                eprintln!("Machine backups: kept {}'s restore copy: its container is gone", m.id);
+                continue;
+            }
+            if let Err(e) = p.delete(&staging(&m)).await {
+                eprintln!("Machine backups: deleting {}'s interrupted restore copy: {e}", m.id);
+                again.push(r);
+            }
+        }
+        if again.is_empty() {
+            return;
+        }
+        left = again;
+        tokio::time::sleep(Duration::from_secs(60)).await;
     }
 }
 
@@ -588,9 +623,10 @@ pub fn start(app: AppState, cp: Arc<ControlPlane>) {
     if cp.offsite.is_none() || !cp.enabled() {
         return;
     }
-    interrupted(&app);
+    let left = interrupted(&app);
     let (a, c) = (app.clone(), cp.clone());
     tokio::spawn(async move {
+        clean_up(&a, &c, left).await;
         let mut tick = tokio::time::interval(c.reconcile_every.max(Duration::from_secs(60)));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -681,6 +717,7 @@ async fn replace(app: &App, cp: &ControlPlane, e: &Enrollment, r: &MachineRestor
     }
     app.db.revoke_machine_tokens(&m.id);
     let who = by.actor.id.as_deref();
+    let prior = (m.enroll_by, m.enroll_overdue_at);
     let (token, expires) = e.mint_token(app, &m.id, who)?;
     app.db.record(&event(by, "machine.enroll_token_issued", &m, json!({ "expiresAt": expires, "via": "restore", "restoreId": r.id })));
     let spec = RestoreSpec {
@@ -691,22 +728,43 @@ async fn replace(app: &App, cp: &ControlPlane, e: &Enrollment, r: &MachineRestor
         files: e.restore_files(&m, &token),
         remove: vec![IDENTITY_PATH.into()],
     };
-    let pm = p.replace_with(&provider_id(&m), &staging(&m), &spec).await.map_err(|e| e.to_string())?;
-    // What the old disk's agent said and held is gone with it, as after a rebuild.
+    let pid = provider_id(&m);
+    if let Err(err) = p.replace_with(&pid, &staging(&m), &spec).await {
+        app.db.restore_enroll_by(&m.id, prior.0, prior.1);
+        return Err(err.to_string());
+    }
+    // What the old disk's agent said and held is gone with it, as after a rebuild. All
+    // of it, and the time enrollment counts from, before it boots: enrollment doesn't
+    // take the lock, and the new agent mustn't lose its certificate to this.
     app.db.machine_rebuilt_reset(&m.id);
     app.db.forget_sessions_of(&m.user_id);
     super::folder::forget(app, &m.id);
     enroll::revoke_certs(app, by, &m, "restored");
-    let from = m.state;
-    observe(&mut m, &pm);
-    m.state = next(from, Step::Restored).unwrap_or(from);
-    m.last_error = None;
-    app.db.save_machine(&m, from);
-    if from == State::Suspended {
-        app.db.record(&event(by, "machine.resumed", &m, json!({ "via": "restore", "restoreId": r.id })));
-    }
     app.db.machine_restore_move(&r.id, &["replacing"], "enrolling", None);
-    Ok(())
+    let from = m.state;
+    let booted = match p.boot(&pid).await {
+        Ok(()) => p.get(&pid).await,
+        Err(e) => Err(e),
+    };
+    match booted {
+        Ok(pm) => {
+            observe(&mut m, &pm);
+            m.state = next(from, Step::Restored).unwrap_or(from);
+            m.last_error = None;
+            app.db.save_machine(&m, from);
+            if from == State::Suspended {
+                app.db.record(&event(by, "machine.resumed", &m, json!({ "via": "restore", "restoreId": r.id })));
+            }
+            Ok(())
+        }
+        Err(err) => {
+            let why = format!("starting the restored machine: {err}");
+            m.state = next(from, Step::Fail).unwrap_or(State::Error);
+            m.last_error = Some(why.clone());
+            app.db.save_machine(&m, from);
+            Err(why)
+        }
+    }
 }
 
 /// The whole restore after it was asked for: import, then replace under the lock.
@@ -721,14 +779,14 @@ async fn restore(app: AppState, cp: Arc<ControlPlane>, r: MachineRestore, b: Mac
     if let Err(why) = replace(&app, &cp, e, &r, &by).await {
         let _ = p.delete(&staging(&m)).await;
         let m = app.db.machine(&m.id).unwrap_or(m);
-        fail_restore(&app, &by, &m, &r, &["importing", "replacing"], &why);
+        fail_restore(&app, &by, &m, &r, &["importing", "replacing", "enrolling"], &why);
     }
 }
 
 // HTTP, under `/api/users/{key}/machine/backups|restore` and `/api/machines/backups`
 // (admin only, rbac::classify).
 
-fn need<'a>(a: &'a Auth) -> Res<(&'a ControlPlane, &'a Offsite)> {
+fn need(a: &Auth) -> Res<(&ControlPlane, &Offsite)> {
     let cp = &*a.machines;
     cp.need()?;
     let off = cp.offsite.as_deref().ok_or_else(|| {
@@ -817,13 +875,12 @@ pub async fn restore_request(
     Extension(a): Extension<Arc<Auth>>,
     Extension(by): Extension<Who>,
     Path(key): Path<String>,
-    body: Bytes,
+    Json(req): Json<RestoreBody>,
 ) -> Res<(StatusCode, Json<Value>)> {
     let (cp, _) = need(&a)?;
     if cp.enrollment.is_none() {
         return Err(conflict("A restored machine enrolls again, so it needs enrollment on (MACHINE_CONTROL_URL).".into()));
     }
-    let req: RestoreBody = serde_json::from_slice(&body).map_err(|e| bad(format!("Send {{\"backupId\": \"...\", \"identity\": \"AGE-SECRET-KEY-1...\"?}}: {e}")))?;
     let m = need_machine(&app, &key)?;
     let _g = cp.ops.lock().await;
     let m = app.db.machine(&m.id).ok_or_else(|| not_found("Machine"))?;
