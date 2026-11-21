@@ -1,4 +1,4 @@
-//! System containers on an Incus host behind `MachineProvider` (ADR 0064): a user's
+//! System containers on an Incus host behind `MachineProvider` (ADR 0065): a user's
 //! machine is an unprivileged container with its own systemd, cloud-init, and OS
 //! users, enrolled and reached exactly like a Linode. botd talks to the Incus REST API
 //! over mutual TLS, pinned to the host's certificate. The client key goes in the TLS

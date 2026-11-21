@@ -121,7 +121,7 @@ sudo bash deploy/install.sh --upgrade --isolation     # opt an existing install 
 What root sets up (and `--no-isolation` takes away again, keeping accounts and their folders):
 
 - `/usr/local/sbin/superbot-userctl` (makes one account and its folders, nothing else) and `/etc/superbot/isolation.conf` (where the folders go and botd's group).
-- `/etc/sudoers.d/superbot-isolation`: the service user may start `/usr/local/bin/superbot-run` as a member of `superbot-users`, keeping the run's env, and run `superbot-userctl ensure <id>` as root. Nothing else. Checked with `visudo -c` first.
+- `/etc/sudoers.d/superbot-isolation`: the service user may start `/usr/local/bin/superbot-run` as a member of `superbot-users`, keeping the run's env, and run `superbot-userctl ensure <id>` (or `ensure <owner> <teammate>`, a teammate's account for an owner's shared Bots) as root. Nothing else. Checked with `visudo -c` first.
 - `/etc/systemd/system/superbot.service.d/isolation.conf`: `NoNewPrivileges=false` (sudo is setuid) and `ProtectProc=invisible` (a run sees only its own account's processes).
 - `/srv/superbot/users` (root, `0711`; set `ISOLATION_DIR` to move it), the `superbot-users` group, the service home at `0750`, and `ISOLATION=users` in `.env`.
 
@@ -133,9 +133,12 @@ export SUPERBOT_PASSWORD=...                     # AUTH_PASSWORD from ~/superbot
 botctl user isolation alex@example.com           # the account and its folders
 botctl user harness-login alex@example.com claude   # claude auth login, as alex's account
 botctl user harness-login alex@example.com codex
+botctl user harness-login bea@example.com claude --owner alex@example.com   # bea's own login, for alex's shared Bots
 ```
 
 Accounts are made at a user's first run, or with `botctl user isolate <user>`. Install harness CLIs system-wide (`sudo npm install -g @anthropic-ai/claude-code @openai/codex`): per-user accounts can't open the service user's `~/.local`. Pi and Hermes Agent use provider keys (`botctl secret set`); their approval guard and settings are files botd writes, which the account can read but not change. Screens are off until they can run this way. To check it on a throwaway host: `deploy/test-isolation.sh` (CI runs it).
+
+With `SHARED_BOTS=isolated` too, a teammate's run of someone else's shared Bot runs as an account of its own for that owner's Bots (`sb-t-<hash>`, folders in `ISOLATION_DIR/<owner>-<teammate>/`), never as the owner's. Neither the owner's account nor the teammate's own can enter it. Claude Code and Codex Bots then need the teammate's own login there, or a server-wide key: teammates log in from the Bot's details in the app, and an admin can use `botctl user harness-login <teammate> <harness> --owner <owner>`. Without either, the Bot says so and doesn't run; it never uses the owner's login. `ISOLATION_TEAMMATES=off` in `.env` keeps the old behaviour (the owner's account). A leaver's teammate accounts stay until removed by hand. Design: [ADR 0064](../docs/adr/0064-teammate-accounts-on-one-server.md).
 
 Turning it on doesn't move files. Each user's work starts in a new, empty `ISOLATION_DIR/<id>/workspace`; their old folder, `WORKSPACE_DIR/users/<id>`, stays where it was. Bot memory and `USER.md` carry over by themselves (botd keeps the real copies). Harness sessions don't: each Bot's next run starts a fresh one, with its memory. To bring a user's files along, as root, after `botctl user isolate <user>`:
 
@@ -154,7 +157,7 @@ Release binaries are installed system-wide in `/usr/local/bin` so `botctl` stays
 
 ## Managed machines: enrollment
 
-Managed hosting only (one Linode per user, [ADR 0025](../docs/adr/0025-control-plane-linode.md), or one Incus container per user on a shared host, [ADR 0064](../docs/adr/0064-incus-container-machines.md) and [its guide](../docs/ops/incus-containers.md)). Self-hosted servers skip this. With `LINODE_TOKEN` or `MACHINE_PROVIDER=incus` set, add to `.env`:
+Managed hosting only (one Linode per user, [ADR 0025](../docs/adr/0025-control-plane-linode.md), or one Incus container per user on a shared host, [ADR 0065](../docs/adr/0065-incus-container-machines.md) and [its guide](../docs/ops/incus-containers.md)). Self-hosted servers skip this. With `LINODE_TOKEN` or `MACHINE_PROVIDER=incus` set, add to `.env`:
 
 ```sh
 MACHINE_CONTROL_URL=https://<server-ip>:8443   # how machines reach this server; turns enrollment on

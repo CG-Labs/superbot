@@ -6,12 +6,18 @@
 #   SLEEP                             keep a heartbeat in the workspace until stopped
 #   LEAVE                             answer and exit, leaving the heartbeat going
 #   PROBE <other account> <name:path>...  try to read (and write next to) each path
+# Run as `claude auth login` (a teammate's login, ADR 0064), it writes a login into $HOME.
 # As hermes, a probe also leaves a gateway.pid, so botd runs `hermes gateway stop` after.
 set -u
 harness=$(basename "$0")
 me=$(id -un)
 if [ "$harness" = hermes ] && [ "${1:-}" = gateway ]; then
   id -un >"$HERMES_HOME/stopped-by" && rm -f "$HERMES_HOME/gateway.pid"
+  exit
+fi
+if [ "$harness" = claude ] && [ "${1:-}" = auth ] && [ "${2:-}" = login ]; then
+  mkdir -p "$HOME/.claude" && printf 'LOGIN-%s\n' "$me" >"$HOME/.claude/.credentials.json"
+  echo "logged in as $me"
   exit
 fi
 if [ "$harness" = hermes ]; then

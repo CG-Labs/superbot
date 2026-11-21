@@ -106,6 +106,9 @@ mod sso_http_tests;
 mod sso_saml_http_tests;
 #[cfg(test)]
 mod sso_social_http_tests;
+#[cfg(test)]
+mod teammate_accounts_http_tests;
+mod teammate_logins;
 
 use acl::{Access, Viewer, Visibility};
 use approvals::{DecideError, Remember};
@@ -235,7 +238,12 @@ async fn main() {
         .unwrap_or_else(|e| exit(format!("Machine enrollment: {e}")))
         .map(|e| control_plane.enroll_with(e).unwrap_or_else(|e| exit(format!("Machine enrollment: {e}"))));
 
-    let isolation = accounts::Isolation::from_env(|k| env(k, ""), &bin_dir, &data_dir).unwrap_or_else(|e| exit(format!("Isolation: {e}")));
+    let mut isolation = accounts::Isolation::from_env(|k| env(k, ""), &bin_dir, &data_dir).unwrap_or_else(|e| exit(format!("Isolation: {e}")));
+    let teammate_accounts = accounts::teammates_flag(&env("ISOLATION_TEAMMATES", ""), isolation.is_some(), shared_bots == acl::SharedBots::Isolated)
+        .unwrap_or_else(|e| exit(format!("Isolation: {e}")));
+    if let Some(iso) = isolation.as_mut() {
+        iso.teammates = teammate_accounts;
+    }
     // Screens are X displays botd's account runs; any local account could open them.
     let screens = if isolation.is_some() { None } else { paths::child(&data_dir, "screens").and_then(screen::Screens::from_env) };
     if let (Some(local), Some(machine)) = (&screens, enrollment.as_ref().and_then(|e| e.screens.as_ref())) {
@@ -279,6 +287,15 @@ async fn main() {
                 iso.root.display(),
                 accounts::HARNESSES.join(", ")
             );
+            if iso.teammates {
+                println!(
+                    "Isolation: a teammate's run of a shared Bot uses its own account ({}<hash>), in {}/<owner>-<teammate>, with the teammate's own harness logins (ADR 0064).",
+                    accounts::TEAMMATE_PREFIX,
+                    iso.root.display()
+                );
+            } else if shared_bots == acl::SharedBots::Isolated {
+                println!("Isolation: ISOLATION_TEAMMATES=off, so a teammate's run of a shared Bot uses its owner's account (ADR 0046).");
+            }
             let mut own = vec![app.cfg.data_dir.clone(), PathBuf::from(".env")];
             own.extend(std::env::var_os("SUPERBOT_MASTER_KEY_FILE").map(PathBuf::from));
             for p in accounts::close_to_others(&own) {
@@ -398,6 +415,7 @@ async fn main() {
         "auditRetentionDays": retention,
         "screens": app.screens.is_some(),
         "isolation": if app.isolation().is_some() { "users" } else { "off" },
+        "isolationTeammates": app.teammate_accounts(),
         "sharedBots": app.shared_bots(),
         "sso": sso_ids,
         "controlPlane": control_plane.enabled(),

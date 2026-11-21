@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Per-user accounts on a real host (docs/adr/0037-per-user-unix-accounts.md). It sets them up
 # with the installer's own functions, checks the privileged surface, then runs botd's OS
-# tests: user B's Bot, through the real run path, against user A's folder and logins.
+# tests: user B's Bot, through the real run path, against user A's folder and logins, and
+# a teammate's run of an owner's shared Bot, as its own account with its own login
+# (docs/adr/0064-teammate-accounts-on-one-server.md).
 #
 # It adds accounts, a sudoers rule, and /srv/superbot-test, so run it only on a throwaway
 # host (CI does), as root:
@@ -111,6 +113,28 @@ as_svc sudo -n /usr/local/sbin/superbot-userctl ensure t1 >/dev/null
 (cd "$TEST_DIR/users/t1/workspace" && refused as_svc "$LIB/bin/superbot-run" /usr/bin/true)
 # A per-user account can't start anything elsewhere, nor sudo.
 refused sudo -u sb-u-t1 sudo -n true
+
+log "A teammate's account for an owner's shared Bots is its own (ADR 0064)"
+for bad in 't1 t1' 't1 ../x' 't1 U2' 't1 t2 t3' "t1 $(printf 'a%.0s' {1..28})"; do
+  # shellcheck disable=SC2086 # each is the arguments, on purpose
+  refused as_svc sudo -n /usr/local/sbin/superbot-userctl ensure $bad
+done
+grep -q '^sb-t-' <<<"$(getent passwd)" && die "a refused call made a teammate account"
+as_svc sudo -n /usr/local/sbin/superbot-userctl ensure t2 >/dev/null
+pair=sb-t-$(printf '%s' 't1:t2' | sha256sum | cut -c1-24)
+[[ "$(as_svc sudo -n /usr/local/sbin/superbot-userctl ensure t1 t2)" == "$pair $TEST_DIR/users/t1-t2/home" ]] || die "no $pair for t1's Bots and t2"
+grep -qx "$SVC" <<<"$(id -nG "$pair" | tr ' ' '\n')" && die "$pair is in $SVC's group"
+[[ "$(getent passwd "$pair" | cut -d: -f7)" == /usr/sbin/nologin ]] || die "$pair can log in"
+[[ "$(stat -c '%a %U' "$TEST_DIR/users/t1-t2/home")" == "2770 $pair" ]] || die "t1-t2/home isn't $pair's 2770"
+# Neither the owner's account nor the teammate's own may enter it, nor it theirs.
+for u in sb-u-t1 sb-u-t2; do
+  refused sudo -u "$u" ls "$TEST_DIR/users/t1-t2"
+  refused sudo -u "$pair" ls "$TEST_DIR/users/${u#sb-u-}"
+done
+(cd "$TEST_DIR/users/t1-t2/workspace" && as_svc sudo -n -E -u "$pair" -- "$LIB/bin/superbot-run" /usr/bin/true)
+(cd "$TEST_DIR/users/t1/workspace" && refused as_svc sudo -n -E -u "$pair" -- "$LIB/bin/superbot-run" /usr/bin/true)
+(cd "$TEST_DIR/users/t1-t2/workspace" && refused as_svc sudo -n -E -u sb-u-t1 -- "$LIB/bin/superbot-run" /usr/bin/true)
+refused sudo -u "$pair" sudo -n true
 
 log "botd's OS tests, as $SVC"
 envs=(SUPERBOT_ISOLATION_OS_TEST=1 ISOLATION_DIR="$TEST_DIR/users" SUPERBOT_RUN_DIR="$LIB/bin"

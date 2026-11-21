@@ -3,7 +3,7 @@
 //! so self-hosted servers never see it. Admins request, suspend, resume, resize, and
 //! destroy a user's machine; a reconciler follows each one to where it should be.
 //! Every change is audited.
-//! Design: docs/adr/0025-control-plane-linode.md, docs/adr/0064-incus-container-machines.md.
+//! Design: docs/adr/0025-control-plane-linode.md, docs/adr/0065-incus-container-machines.md.
 // The agent binary's code; botd only runs it in tests, and not all of it.
 #[cfg(test)]
 #[allow(dead_code)]
@@ -35,7 +35,6 @@ pub mod screens;
 pub mod teammate;
 #[cfg(test)]
 pub mod teammates;
-#[cfg(test)]
 pub mod terminal;
 pub mod tools;
 #[cfg(test)]
@@ -301,7 +300,7 @@ impl ControlPlane {
         Ok(cp)
     }
 
-    /// Machines as system containers on an Incus host (ADR 0064): INCUS_URL and the
+    /// Machines as system containers on an Incus host (ADR 0065): INCUS_URL and the
     /// INCUS_* certificates are needed, and so are MACHINE_CONTROL_URL and
     /// MACHINE_FIREWALL=on, since the firewall is what keeps a container off its
     /// neighbours and private addresses. MACHINE_REGIONS is optional: `local` for a

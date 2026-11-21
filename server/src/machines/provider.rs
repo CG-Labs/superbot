@@ -1,5 +1,5 @@
 //! The seam between the control plane and whoever rents out the machines: Linode VMs
-//! (ADR 0025) or system containers on an Incus host (ADR 0064). Anything that can
+//! (ADR 0025) or system containers on an Incus host (ADR 0065). Anything that can
 //! create, size, stop, start, back up, and delete a machine by a unique label fits
 //! behind it.
 

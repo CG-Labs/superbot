@@ -63,6 +63,14 @@ describe("teammates' own logins (ADR 0062)", () => {
     expect(loginLine(undefined, "Ada")).toMatch(/refused/);
   });
 
+  it("names this server when the owner's Bots run here (ADR 0064)", () => {
+    expect(loginLine({ state: "logged_in", serverKey: false }, "Ada", "server")).toBe("Logged in with your own account for Ada's Bots on this server.");
+    expect(loginLine({ state: "logged_out", serverKey: true }, "Ada", "server")).toBe("Not logged in. A server-wide key runs it for you for Ada's Bots on this server.");
+    const out = loginLine({ state: "logged_out", serverKey: false }, "Ada", "server");
+    expect(out).toMatch(/for Ada's Bots on this server are refused until you log in\. Ada's login is never used for you/);
+    expect(out).not.toMatch(/computer/);
+  });
+
   it("streams a login's events as they come, and stops when asked", async () => {
     const xhr = new FakeXhr();
     const seen: LoginEvent[] = [];

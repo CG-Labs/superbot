@@ -3,6 +3,8 @@
 //!
 //!   sudo -n -E -u sb-u-<user id> -- superbot-run <harness> [args...]
 //!
+//! or as a teammate's account for one owner's shared Bots, `sb-t-<hash>` (ADR 0064).
+//!
 //! It isn't privileged: it has only the rights of the account sudo switched to. It fixes
 //! what the run sees (HOME from the password database, never the caller's; a umask that
 //! keeps new files from other accounts; PATH from SUPERBOT_PATH, which sudo resets) and
@@ -21,6 +23,7 @@ use std::time::Duration;
 use tokio::signal::unix::{signal, SignalKind};
 
 const PREFIX: &str = "sb-u-";
+const TEAMMATE_PREFIX: &str = "sb-t-";
 /// How long a stopped run has to exit before KILL. Under botd's 5 seconds.
 const GRACE: Duration = Duration::from_secs(4);
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -32,15 +35,16 @@ fn fail(msg: &str) -> ExitCode {
     ExitCode::from(126)
 }
 
-/// Only per-user accounts run harnesses: never root, never botd's own account.
+/// Only per-user and teammate accounts run harnesses: never root, never botd's own account.
 fn account_ok(name: &str, uid: u32) -> bool {
-    uid != 0
-        && name
-            .strip_prefix(PREFIX)
-            .is_some_and(|id| !id.is_empty() && id.len() <= 27 && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
+    let user = name
+        .strip_prefix(PREFIX)
+        .is_some_and(|id| !id.is_empty() && id.len() <= 27 && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()));
+    let teammate = name.strip_prefix(TEAMMATE_PREFIX).is_some_and(|h| h.len() == 24 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    uid != 0 && (user || teammate)
 }
 
-/// A run starts inside the account's own folders: `ISOLATION_DIR/<user id>`, its HOME's parent.
+/// A run starts inside the account's own folders: `ISOLATION_DIR/<space>`, its HOME's parent.
 fn inside(home: &Path, cwd: &Path) -> bool {
     home.parent().is_some_and(|root| root.parent().is_some() && cwd.starts_with(root))
 }
@@ -61,7 +65,7 @@ async fn main() -> ExitCode {
     let uid = unsafe { libc::getuid() };
     let Some(me) = passwd::by_uid(uid) else { return fail("this uid has no account") };
     if !account_ok(&me.name, uid) {
-        return fail(&format!("refusing to run as this account: only per-user SuperBot accounts ({PREFIX}<user id>) run harnesses"));
+        return fail(&format!("refusing to run as this account: only per-user SuperBot accounts ({PREFIX}<user id>, {TEAMMATE_PREFIX}<hash>) run harnesses"));
     }
     let (Ok(home), Ok(cwd)) = (std::fs::canonicalize(&me.home), std::env::current_dir().and_then(std::fs::canonicalize)) else {
         return fail("the account's home or the working folder is missing");
@@ -181,6 +185,21 @@ mod tests {
     }
 
     #[test]
+    fn teammate_accounts_run_harnesses_too() {
+        assert!(account_ok("sb-t-0123456789abcdef01234567", 1003));
+        for (name, uid) in [
+            ("sb-t-0123456789abcdef01234567", 0),
+            ("sb-t-0123456789abcdef0123456", 1003),
+            ("sb-t-0123456789abcdef012345678", 1003),
+            ("sb-t-0123456789ABCDEF01234567", 1003),
+            ("sb-t-0123456789abcdeg01234567", 1003),
+            ("sb-t-", 1003),
+        ] {
+            assert!(!account_ok(name, uid), "{name}");
+        }
+    }
+
+    #[test]
     fn runs_start_only_in_the_accounts_own_folders() {
         let home = Path::new("/srv/superbot/users/u1/home");
         assert!(inside(home, Path::new("/srv/superbot/users/u1/workspace")));
@@ -190,5 +209,9 @@ mod tests {
         assert!(!inside(home, Path::new("/srv/superbot/users/u10")));
         assert!(!inside(home, Path::new("/home/superbot/superbot/data")));
         assert!(!inside(Path::new("/home"), Path::new("/etc")), "a home at the top has no folder of its own");
+        let pair = Path::new("/srv/superbot/users/u1-u2/home");
+        assert!(inside(pair, Path::new("/srv/superbot/users/u1-u2/workspace")));
+        assert!(!inside(pair, Path::new("/srv/superbot/users/u1/workspace")), "not the owner's folder");
+        assert!(!inside(pair, Path::new("/srv/superbot/users/u2/home")), "not the teammate's own");
     }
 }
