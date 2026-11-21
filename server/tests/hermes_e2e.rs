@@ -95,6 +95,7 @@ fn start() -> Botd {
         .env("WORKSPACE_DIR", dir.join("workspace"))
         .env("DEFAULT_HARNESS", "hermes")
         .env("SCREENS", "off")
+        .env("TESTING_MODE", "on")
         .env("E2E_INHERITED_TOKEN", "inherited-e2e-value")
         .env("SSO_ENTRA_CLIENT_SECRET", "sso-e2e-secret-value")
         .stdout(Stdio::null())
