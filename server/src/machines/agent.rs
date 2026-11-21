@@ -1170,6 +1170,7 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
             wire::CAN_TEAMMATES,
             wire::CAN_TEAMMATE_REMOVAL,
             wire::CAN_TEAMMATE_LOGINS,
+            wire::CAN_INSTALL_AFTER,
         ]
             .into_iter()
             .chain(a.upgrader.build.is_some().then_some(wire::CAN_UPGRADE))

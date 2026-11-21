@@ -89,9 +89,9 @@ Hermes's gateway, cron, memory, Bot Mode, and approvals become the back end. bot
    - one upstream upgrade has been taken through the test suite without adapter changes, or with small ones;
    - tier-to-model routing works with at least two providers.
 
-   **Gate status (21 Nov 2026): not passed**, so Hermes is not the managed default yet ([ADR 0070](0070-hermes-per-bot-footprint.md), [#33](https://github.com/CG-Labs/superbot/issues/33)).
+   **Gate status (21 Nov 2026): not passed**, so Hermes is not the managed default yet ([ADR 0070](0070-hermes-per-bot-footprint.md), [ADR 0072](0072-one-hermes-environment-per-computer.md), [#33](https://github.com/CG-Labs/superbot/issues/33)).
    - Approvals end to end: **mostly passes.** The canary stops a run whose hook was skipped, against the real Hermes ([ADR 0057](0057-harness-hook-e2e-tests.md), [ADR 0063](0063-canary-covers-every-hooked-tool.md)). Fail-closed on hook timeout is configured and checked in the managed config, but no test makes the real Hermes time a hook out.
-   - Footprint: **measured; passes with conditions** ([ADR 0070](0070-hermes-per-bot-footprint.md)). About 330–370 MiB PSS and 5 CPU-seconds per run, nothing while idle, 487 MiB of disk per Bot, a 2.6 GiB install. A Starter (1 vCPU, 2 GiB) fits 4 runs at once for its 3 Bots. Conditions: share one dependency environment across Bots, and cap concurrent runs per machine by tier.
+   - Footprint: **measured; passes with conditions** ([ADR 0070](0070-hermes-per-bot-footprint.md)). About 330–370 MiB PSS and 5 CPU-seconds per run, nothing while idle, a 2.6 GiB install. A Starter (1 vCPU, 2 GiB) fits 4 runs at once for its 3 Bots. Conditions: share one dependency environment across Bots (done: a new Bot now takes 4.7 MiB, not 487 MiB, and under a CPU-second more than its next run, [ADR 0072](0072-one-hermes-environment-per-computer.md)), and cap concurrent runs per machine by tier (open).
    - Upstream upgrade: **not done.** The pin hasn't moved since it was set.
    - Two providers: **built, not shown.** Tier routes pass a provider to Hermes ([ADR 0033](0033-tiers-model-routing.md)); no run has gone through two real providers yet.
 3. Reject (c). It throws away the approval, audit, and multi-user work, and the harness-agnostic, Rust-first design, for features botd already has.

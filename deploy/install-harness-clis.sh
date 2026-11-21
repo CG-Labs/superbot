@@ -6,8 +6,9 @@
 #
 # Each npm CLI goes to <prefix>/<bin>/node_modules/.bin, checked against the pinned
 # integrity (one prefix each: npm prunes what a prefix's package.json doesn't list).
-# Hermes Agent goes under <prefix>/hermes as its HOME (<prefix>/hermes/.local/bin),
-# from its installer at the pinned commit, checked against the pinned SHA-256.
+# Hermes Agent goes under <prefix>/hermes as its HOME, from its installer at the pinned
+# commit, checked against the pinned SHA-256; deploy/hermes-share.sh then makes its one
+# environment every Bot's and leaves the hermes they run in <prefix>/hermes/.hermes/superbot.
 # HARNESS_VERSION_<BIN> (e.g. HARNESS_VERSION_CODEX=0.141.0) installs another version;
 # npm still checks the registry's hashes, but there is no pin to compare with.
 # Prints the PATH entries to add, one per line, last.
@@ -81,8 +82,9 @@ for bin in "$@"; do
       printf 'Installing Hermes Agent %s\n' "${version:0:12}"
       retry env HOME="$home" bash "$script" --non-interactive --skip-browser --skip-computer-use --commit "$version" >"$prefix/hermes-install.log" 2>&1 \
         || { tail -40 "$prefix/hermes-install.log" >&2; die "Hermes Agent didn't install"; }
-      HOME="$home" "$home/.local/bin/hermes" --version >/dev/null || die "hermes --version failed"
-      paths+=("$home/.local/bin")
+      wrapper=$(HOME="$home" sh "$here/hermes-share.sh") || die "couldn't share Hermes Agent's environment"
+      HOME="$home" "$wrapper" --version >/dev/null || die "hermes --version failed"
+      paths+=("$(dirname "$wrapper")")
       ;;
     *) die "unknown harness $bin: use claude, codex, pi or hermes" ;;
   esac

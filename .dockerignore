@@ -11,6 +11,7 @@
 !deploy/superbot-restore.sh
 !deploy/superbot-userctl.sh
 !deploy/install.sh
+!deploy/hermes-share.sh
 !apps/client/
 apps/client/node_modules
 apps/client/dist

@@ -112,6 +112,8 @@ pub const CAN_SCREENS: &str = "screens";
 pub const CAN_TEAMMATES: &str = "teammates";
 pub const CAN_TEAMMATE_REMOVAL: &str = "teammate_removal";
 pub const CAN_TEAMMATE_LOGINS: &str = "teammate_logins";
+/// Runs an install's `after` script (`InstallSource::Script`, ADR 0072).
+pub const CAN_INSTALL_AFTER: &str = "install_after";
 
 /// The screen protocol this build speaks (ADR 0045). A request names it, an agent
 /// refuses any other, and botd treats an agent that reports another as outdated.
@@ -603,11 +605,15 @@ pub enum InstallSource {
     },
     /// An installer script, checked against `sha256`, run with `args` and HOME set to
     /// a folder of its own. `bin` is where it leaves the program, under that folder.
+    /// `after`: a script botd sends with it, run the same way once it succeeds; only an
+    /// agent that says `CAN_INSTALL_AFTER` is sent one.
     Script {
         url: String,
         sha256: String,
         args: Vec<String>,
         bin: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
     },
 }
 

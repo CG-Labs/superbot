@@ -3,6 +3,8 @@
 //! against the fake model from `harness_e2e`, and this measures, per harness:
 //!
 //! - disk for the install (the CLI and its runtime) and for one Bot's state;
+//! - what one more Bot costs: its state's disk, and the CPU of its first run against
+//!   its next (ADR 0072: Hermes's Bots share one environment);
 //! - cold start (a new Bot's first run of one model turn) and warm start (its next ones);
 //! - a typical run (a prompt, one shell command through the approval hook, a reply):
 //!   peak memory (RSS and PSS summed over every process of the run), process count, CPU;
@@ -62,6 +64,9 @@ const MAX_RUN_PSS_MIB: f64 = 2048.0;
 /// daemon or CLI breaks it, session helpers some CLIs start (12 MiB) don't.
 const MAX_IDLE_MIB: f64 = 128.0;
 const MAX_IDLE_CPU_S: f64 = 1.0;
+/// A new Bot's state after its first run: Hermes's Bots share its environment, so a Bot
+/// that built one of its own (about 470 MiB) breaks it.
+const MAX_NEW_BOT_DISK_MIB: f64 = 64.0;
 const QUIESCE: Duration = Duration::from_secs(30);
 
 fn env_num(name: &str, default: u64) -> u64 {
@@ -252,15 +257,18 @@ fn secs(d: Duration) -> f64 {
 /// Where `bin` is installed, and the runtime it needs, from the binary's real path:
 /// npm CLIs live in a `node_modules` folder and need Node.js; Hermes's installer puts
 /// its checkout and everything it runs on (Python, Node.js, uv, ffmpeg, caches) in one
-/// `.hermes` folder around its `hermes-agent` checkout, so that folder is the install.
+/// `.hermes` folder around its `hermes-agent` checkout, so that folder is the install
+/// (Bots run `.hermes/superbot/hermes` in it, ADR 0072).
 fn install_dirs(bin: &str) -> (Option<PathBuf>, Option<PathBuf>) {
     let over = std::env::var(format!("SUPERBOT_FOOTPRINT_INSTALL_{}", bin.to_uppercase())).ok().filter(|v| !v.is_empty());
     let exe = which(bin).and_then(|p| std::fs::canonicalize(p).ok()).map(unwrap_launcher);
     let ancestor = |p: &Path, name: &str| p.ancestors().find(|a| a.file_name().is_some_and(|n| n == name)).map(Path::to_path_buf);
     let install = over.map(PathBuf::from).or_else(|| {
         let exe = exe.as_deref()?;
-        let root = ancestor(exe, if bin == "hermes" { "hermes-agent" } else { "node_modules" })?;
-        root.parent().map(Path::to_path_buf)
+        if bin == "hermes" {
+            return exe.ancestors().find(|a| a.join("hermes-agent").is_dir()).map(Path::to_path_buf);
+        }
+        ancestor(exe, "node_modules")?.parent().map(Path::to_path_buf)
     });
     let runtime = match bin {
         "hermes" => None,
@@ -514,6 +522,9 @@ fn footprint(harness: &str, s: &Settings) -> (Value, Vec<String>) {
     }
     println!("{harness}: {} at once: {:.2}s, peak PSS {:.0} MiB", s.concurrency, together.wall.as_secs_f64(), kib_mib(together.usage.peak_pss_kib));
     let new_bot_state = extra.iter().map(|bot| disk_bytes(&b.dir.join("data/bots").join(bot))).max().unwrap_or(0);
+    if mib(new_bot_state) > MAX_NEW_BOT_DISK_MIB {
+        broke.push(format!("a new Bot's state took {:.0} MiB, over {MAX_NEW_BOT_DISK_MIB} MiB", mib(new_bot_state)));
+    }
     // The same Bots again: the steady state, once each has run before.
     let prompts: Vec<String> = extra.iter().map(|bot| typical(bot, 1)).collect();
     let again = measure(&b, &extra, &prompts);
@@ -554,6 +565,11 @@ fn footprint(harness: &str, s: &Settings) -> (Value, Vec<String>) {
     let share = |m: &Measured| kib_mib(m.usage.peak_pss_kib) / s.concurrency.max(1) as f64;
     let per_run_pss = max(runs.iter().map(|m| kib_mib(m.usage.peak_pss_kib)).chain([share(&together), share(&again)]));
     let per_run_cpu = median(runs.iter().map(|m| m.cpu_s).collect());
+    // One more Bot: its first run's CPU, and how much more that is than its next.
+    let bots = s.concurrency.max(1) as f64;
+    let round2 = |x: f64| (x * 100.0).round() / 100.0;
+    let new_bot_cpu = round2(together.cpu_s / bots);
+    let new_bot_setup_cpu = round2(((together.cpu_s - again.cpu_s) / bots).max(0.0));
     // The Bot's own state; what the CLI writes to its home is shared by the Bots of one OS user.
     let per_bot_disk = mib(bot_state.max(new_bot_state));
     let home_disk = mib(home_growth.unwrap_or(0));
@@ -633,6 +649,10 @@ fn footprint(harness: &str, s: &Settings) -> (Value, Vec<String>) {
             "installMiB": installed,
             "perBotDiskMiB": per_bot_disk,
             "homeDiskMiB": home_disk,
+            "coldStartCpuS": cold.cpu_s,
+            "newBotDiskMiB": mib(new_bot_state),
+            "newBotFirstRunCpuS": new_bot_cpu,
+            "newBotSetupCpuS": new_bot_setup_cpu,
         },
         "tiers": tiers,
         "processes": commands,
@@ -684,18 +704,20 @@ fn markdown(report: &Value) -> String {
         m["commit"].as_str().unwrap_or("?"), m["at"].as_str().unwrap_or("?"),
         s["model"].as_str().unwrap_or("?"), s["modelDelayMs"], s["runs"], s["concurrency"], s["reserveMiB"],
     ));
-    md.push_str("| Harness | Version | Install MiB | Per-Bot disk MiB | Home MiB | Cold start s | Warm start s | Run s | Peak PSS MiB/run | Peak RSS MiB/run | CPU s/run | Processes/run | Idle processes (MiB) |\n");
-    md.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    md.push_str("| Harness | Version | Install MiB | Per-Bot disk MiB | New Bot disk MiB | New Bot setup CPU s | Home MiB | Cold start s | Warm start s | Run s | Peak PSS MiB/run | Peak RSS MiB/run | CPU s/run | Processes/run | Idle processes (MiB) |\n");
+    md.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
     let harnesses = report["harnesses"].as_array().cloned().unwrap_or_default();
     for h in &harnesses {
         let x = &h["summary"];
         md.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} ({}) |\n",
-            h["harness"].as_str().unwrap_or("?"), h["version"].as_str().unwrap_or("?"), x["installMiB"], x["perBotDiskMiB"], x["homeDiskMiB"],
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} ({}) |\n",
+            h["harness"].as_str().unwrap_or("?"), h["version"].as_str().unwrap_or("?"), x["installMiB"], x["perBotDiskMiB"], x["newBotDiskMiB"],
+            x["newBotSetupCpuS"], x["homeDiskMiB"],
             x["coldStartS"], x["warmStartS"], x["runWallS"], x["perRunPeakPssMiB"], x["perRunPeakRssMiB"], x["perRunCpuS"],
             x["perRunPeakProcesses"], x["idleProcesses"], x["idleRssMiB"],
         ));
     }
+    md.push_str("\nNew Bot disk: a new Bot's state after its first run (the largest of the concurrent Bots'). New Bot setup CPU: how much more CPU a new Bot's first run took than its next, per Bot, from the concurrent runs.\n");
     md.push_str("\nConcurrent runs that fit each tier's machine by memory (machine memory less the reserve, over the peak PSS of one run):\n\n");
     md.push_str("| Harness |");
     for t in TIERS {

@@ -102,7 +102,7 @@ The installer builds the Expo client (`apps/client`) from the same commit as `bo
 
 ## Hermes Agent
 
-Opt-in, because it is large (about 2.5 GB for the install, plus about 0.5 GB per Bot that uses it). `--with-hermes` runs Hermes's own installer as the service user, pinned to the commit of release v0.23.2 (override with `HERMES_COMMIT=<sha>`), and puts `~/.local/bin` on botd's `PATH` in `.env`. With [per-user accounts](#one-unix-account-per-user), which can't open the service user's home, it installs Hermes system-wide instead, as root in `/opt/hermes`, linked from `/usr/local/bin/hermes`. Hermes has no login: save a provider key, encrypted ([master key](#master-key)):
+Opt-in, because it is large (about 2.5 GB for the install). `--with-hermes` runs Hermes's own installer as the service user, pinned to the commit of release v0.23.2 (override with `HERMES_COMMIT=<sha>`), then `deploy/hermes-share.sh`, which gives every Bot the install's one Python environment, read-only, while each Bot keeps its own Hermes folder ([ADR 0072](../docs/adr/0072-one-hermes-environment-per-computer.md)). It puts `~/.hermes/superbot` on botd's `PATH` in `.env`. With [per-user accounts](#one-unix-account-per-user), which can't open the service user's home, it installs Hermes system-wide instead, as root in `/opt/hermes`, linked from `/usr/local/bin/hermes`. Re-running the installer at a new `HERMES_COMMIT` stops botd while Hermes changes, so no running Bot loses its environment. Hermes has no login: save a provider key, encrypted ([master key](#master-key)):
 
 ```sh
 sudo -u superbot env SUPERBOT_PASSWORD="$(sudo grep -oP '^AUTH_PASSWORD=\K.*' ~superbot/superbot/.env)" botctl secret set OPENROUTER_API_KEY < /path/to/key.txt
@@ -367,7 +367,7 @@ It ends with `PASS` or `FAIL` per harness and exits non-zero on any failure. Onl
 
 ## Measuring a harness's footprint
 
-`deploy/harness-footprint.sh` measures what each harness costs per Bot on this machine: disk for the install and per Bot, cold and warm start, memory (RSS and PSS) and CPU per run, what's left running when idle, several Bots at once, and how many runs fit each tier's machine. It uses a throwaway botd and the fake model by default (no login, no cost), and writes `footprint.md` and `footprint.json`:
+`deploy/harness-footprint.sh` measures what each harness costs per Bot on this machine: disk for the install and per Bot, what one more Bot adds, cold and warm start, memory (RSS and PSS) and CPU per run, what's left running when idle, several Bots at once, and how many runs fit each tier's machine. It uses a throwaway botd and the fake model by default (no login, no cost), and writes `footprint.md` and `footprint.json`:
 
 ```sh
 deploy/harness-footprint.sh --install-clis /tmp/clis --out /tmp/footprint            # the pinned CLIs
@@ -375,7 +375,7 @@ deploy/harness-footprint.sh --harness hermes --cpus 1 --concurrency 3           
 deploy/harness-footprint.sh --harness hermes --real --env-file .env --model <model>   # real model (opt-in, costs)
 ```
 
-The `harness-e2e` workflow's Footprint job runs it on the pinned CLIs and uploads the report. Results and what they mean: [ADR 0070](../docs/adr/0070-hermes-per-bot-footprint.md).
+The `harness-e2e` workflow's Footprint job runs it on the pinned CLIs and uploads the report. Results and what they mean: [ADR 0070](../docs/adr/0070-hermes-per-bot-footprint.md), and for Hermes's shared environment, [ADR 0072](../docs/adr/0072-one-hermes-environment-per-computer.md).
 
 ## Master key
 
@@ -553,7 +553,7 @@ Every other `botd` setting (`TZ`, `USER_NAME`, `DEFAULT_HARNESS`, `CORS_ORIGINS`
 
 The image bakes in Claude Code, Codex, and Pi (`npm i -g` at build time). Pick a subset with `SUPERBOT_HARNESSES` in `.env` (e.g. `claude`, or empty for none), then `docker compose build botd && docker compose up -d`. Pin versions with build args, e.g. `docker compose build --build-arg CLAUDE_CODE_VERSION=2.1.328 botd` (`CODEX_VERSION` and `PI_VERSION` too).
 
-Hermes Agent is opt-in: add it with `SUPERBOT_HARNESSES=claude codex pi hermes` (about 2.5 GB more in the image, plus about 0.5 GB per Bot in the `data` volume). The image installs it in `/opt/hermes`, pinned with `HERMES_COMMIT`. It has no login: save a provider key with `botctl secret set` (above) and, if needed, set `SUPERBOT_HERMES_PROVIDER` and `SUPERBOT_HERMES_BASE_URL` in `.env`. See [backend docs](../docs/backend.md#hermes-agent).
+Hermes Agent is opt-in: add it with `SUPERBOT_HARNESSES=claude codex pi hermes` (about 2.5 GB more in the image). The image installs it in `/opt/hermes`, pinned with `HERMES_COMMIT`, and its Bots share its one environment ([ADR 0072](../docs/adr/0072-one-hermes-environment-per-computer.md)). It has no login: save a provider key with `botctl secret set` (above) and, if needed, set `SUPERBOT_HERMES_PROVIDER` and `SUPERBOT_HERMES_BASE_URL` in `.env`. See [backend docs](../docs/backend.md#hermes-agent).
 
 Log in once inside the container, as the `superbot` user that runs the Bots. Logins are stored in the `home` volume and survive upgrades and container recreation:
 

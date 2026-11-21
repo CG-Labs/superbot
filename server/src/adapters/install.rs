@@ -5,7 +5,7 @@
 //! The `harness-e2e` workflow tests approvals through exactly these pins
 //! (`deploy/install-harness-clis.sh` reads them from here, ADR 0057), so a bump runs it.
 
-use crate::machines::wire::{Download, HarnessInstall, HarnessPlan, InstallSource, NodeRuntime};
+use crate::machines::wire::{CAN_INSTALL_AFTER, Download, HarnessInstall, HarnessPlan, InstallSource, NodeRuntime};
 
 enum Source {
     /// `integrity`: the registry's SHA-512 of the package's own tarball. npm checks
@@ -138,11 +138,38 @@ pub fn install(bin: &str, version: Option<&str>, checksum: Option<&str>) -> Resu
                 args: ["--non-interactive", "--skip-browser", "--skip-computer-use", "--commit", version]
                     .map(String::from)
                     .into(),
-                bin: ".hermes/hermes-agent/.hermes/bin/hermes".into(),
+                bin: HERMES_SHARED_BIN.into(),
+                after: Some(HERMES_SHARE.into()),
             }
         }
     };
     Ok(HarnessInstall { name: bin.into(), version: version.into(), source })
+}
+
+/// Makes one Hermes install's environment every Bot's (ADR 0072). The Dockerfile,
+/// deploy/install.sh and deploy/install-harness-clis.sh run the same file.
+pub const HERMES_SHARE: &str = include_str!("../../../deploy/hermes-share.sh");
+/// Where `HERMES_SHARE` leaves the `hermes` Bots run, under the installer's HOME.
+const HERMES_SHARED_BIN: &str = ".hermes/superbot/hermes";
+/// Hermes's own launcher there, which runs a Bot's own environment.
+const HERMES_LAUNCHER: &str = ".hermes/hermes-agent/.hermes/bin/hermes";
+
+/// `plan` as an agent that says `can` takes it: one that can't run an `after` script
+/// installs Hermes with its own launcher, and each Bot builds its own environment.
+pub fn plan_for(plan: &HarnessPlan, can: &[String]) -> HarnessPlan {
+    let mut plan = plan.clone();
+    if can.iter().any(|c| c == CAN_INSTALL_AFTER) {
+        return plan;
+    }
+    for h in &mut plan.harnesses {
+        if let InstallSource::Script { bin, after, .. } = &mut h.source
+            && after.take().is_some()
+            && bin == HERMES_SHARED_BIN
+        {
+            *bin = HERMES_LAUNCHER.into();
+        }
+    }
+    plan
 }
 
 #[cfg(test)]
@@ -193,6 +220,109 @@ mod tests {
         assert!(crate::machines::tools::check(&p).is_ok(), "{:?}", crate::machines::tools::check(&p));
         assert!(p.node.is_some_and(|n| n.downloads.contains_key("x86_64") && n.downloads.contains_key("aarch64")));
         assert!(plan(vec![h]).node.is_none(), "Hermes alone needs no Node.js");
+    }
+
+    #[test]
+    fn agents_without_after_get_the_plan_they_always_did() {
+        let p = plan(vec![install("claude", None, None).unwrap(), install("hermes", None, None).unwrap()]);
+        let hermes = |p: &HarnessPlan| match &p.harnesses[1].source {
+            InstallSource::Script { bin, after, .. } => (bin.clone(), after.is_some()),
+            _ => unreachable!(),
+        };
+        assert_eq!(hermes(&p), (HERMES_SHARED_BIN.into(), true));
+        let can = vec![CAN_INSTALL_AFTER.to_string()];
+        assert_eq!(plan_for(&p, &can).id(), p.id());
+        let old = plan_for(&p, &[]);
+        assert_eq!(hermes(&old), (HERMES_LAUNCHER.into(), false));
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(!json.contains("\"after\""), "an old agent denies unknown fields: {json}");
+        assert_eq!(old.harnesses[0], p.harnesses[0]);
+        assert!(crate::machines::tools::check(&old).is_ok());
+    }
+
+    /// `HERMES_SHARE` against a fake install laid out as Hermes lays one out.
+    #[test]
+    fn bots_share_one_hermes_environment_and_keep_their_own_records() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::Path;
+        use std::process::Command;
+        let dir = crate::db::temp_path("hermes-share");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(dir).unwrap();
+        let write = |p: &Path, s: &str| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, s).unwrap();
+        };
+        let mode = |p: &Path, m: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        let home = dir.join("install");
+        let root = home.join(".hermes");
+        let launcher = root.join("hermes-agent/.hermes/bin/hermes");
+        write(&launcher, "#!/bin/sh\necho \"lazy=${HERMES_DISABLE_LAZY_INSTALLS:-} $*\"\n");
+        mode(&launcher, 0o755);
+        let checkout = root.join("hermes-agent").display().to_string();
+        let key: String = Sha256::digest(&checkout).iter().take(8).map(|b| format!("{b:02x}")).collect();
+        let state = root.join("installs").join(&key);
+        let facts = |g: &str| format!("{{\n  \"environment\": \"{}/environments/{g}/venv\",\n  \"python\": \"3.12\"\n}}\n", state.display());
+        write(&state.join("facts.json"), &facts("g2"));
+        write(&state.join("inputs/uv.lock.stamp"), "a");
+        write(&state.join("environments/g2/venv/bin/python"), "");
+        write(&state.join("environments/g2/.lease-managed"), "");
+        write(&state.join("environments/g2/.leases/old"), "");
+        write(&state.join("environments/g1/venv/bin/python"), "");
+        let script = dir.join("hermes-share.sh");
+        write(&script, HERMES_SHARE);
+        let run = |bin: &Path, env: &[(&str, &Path)], args: &[&str]| {
+            let out = Command::new("sh")
+                .arg(bin)
+                .args(args)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .envs(env.iter().map(|(k, v)| (*k, v.as_os_str())))
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        let wrapper = run(&script, &[("HOME", &home)], &[]);
+        assert_eq!(Path::new(&wrapper), root.join("superbot/hermes"));
+        assert_eq!(home.join(HERMES_SHARED_BIN), root.join("superbot/hermes"));
+        assert_eq!(home.join(HERMES_LAUNCHER), launcher);
+        let wrapper = Path::new(&wrapper).to_path_buf();
+        assert!(!state.join("environments/g1").exists(), "an earlier install's environment goes");
+        assert!(state.join("environments/g2/venv").exists());
+        assert!(!state.join("environments/g2/.lease-managed").exists(), "Bots take no leases, so Hermes never collects it");
+        assert!(!state.join("environments/g2/.leases").exists());
+
+        assert_eq!(run(&wrapper, &[], &["--version"]), "lazy= --version", "no Bot home: just Hermes");
+        assert_eq!(run(&wrapper, &[("HERMES_HOME", &root)], &["x"]), "lazy= x", "the install's own home");
+
+        for s in [&state, &state.join("environments"), &state.join("inputs")] {
+            mode(s, 0o555);
+        }
+        let bot = dir.join("bots/a/hermes");
+        assert_eq!(run(&wrapper, &[("HERMES_HOME", &bot)], &["chat"]), "lazy=1 chat");
+        let own = bot.join("installs").join(&key);
+        assert_eq!(std::fs::read_to_string(own.join("facts.json")).unwrap(), facts("g2"));
+        assert_eq!(std::fs::read_link(own.join("environments")).unwrap(), state.join("environments"));
+        assert_eq!(std::fs::read_to_string(own.join("inputs/uv.lock.stamp")).unwrap(), "a");
+        assert_eq!(std::fs::metadata(&own).unwrap().permissions().mode() & 0o777, 0o700);
+
+        let old = dir.join("bots/b/hermes");
+        write(&old.join("installs").join(&key).join("environments/g0/venv/lib/big"), "x");
+        run(&wrapper, &[("HERMES_HOME", &old)], &[]);
+        let link = old.join("installs").join(&key).join("environments");
+        assert_eq!(std::fs::read_link(link).unwrap(), state.join("environments"), "a Bot's own old environment goes");
+
+        mode(&state, 0o755);
+        write(&state.join("facts.json"), &facts("g3"));
+        run(&wrapper, &[("HERMES_HOME", &bot)], &[]);
+        assert_eq!(std::fs::read_to_string(own.join("facts.json")).unwrap(), facts("g3"), "a new install's record follows");
+        for s in [&state.join("environments"), &state.join("inputs")] {
+            mode(s, 0o755);
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

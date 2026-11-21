@@ -169,12 +169,15 @@ pub fn check(plan: &HarnessPlan) -> Result<(), String> {
                     return Err(format!("{}: the integrity isn't sha512-<base64>.", h.name));
                 }
             }
-            InstallSource::Script { url, sha256, args, bin } => {
+            InstallSource::Script { url, sha256, args, bin, after } => {
                 if !https(url) || !hex64(sha256) || !relative(bin) {
                     return Err(format!("{}: the installer needs an https URL, its SHA-256 and a relative bin.", h.name));
                 }
                 if args.len() > 32 || args.iter().any(|a| a.len() > 256 || a.contains('\0')) {
                     return Err(format!("{}: too many or too long installer arguments.", h.name));
+                }
+                if after.as_ref().is_some_and(|s| s.len() as u64 > MAX_SCRIPT || s.contains('\0')) {
+                    return Err(format!("{}: the script to run after its installer is too long.", h.name));
                 }
             }
         }
@@ -473,7 +476,7 @@ impl Tools {
                         self.node(node.ok_or("npm harnesses need Node.js")?).await?;
                         self.npm(package, &h.version, integrity.as_deref()).await
                     }
-                    InstallSource::Script { url, sha256, args, bin } => self.script(&h.name, url, sha256, args, bin).await,
+                    InstallSource::Script { url, sha256, args, bin, after } => self.script(&h.name, url, sha256, args, bin, after.as_deref()).await,
                 }
             })
             .await;
@@ -642,7 +645,7 @@ impl Tools {
         Ok(())
     }
 
-    async fn script(&self, name: &str, url: &str, sha256: &str, args: &[String], bin: &str) -> Result<(), String> {
+    async fn script(&self, name: &str, url: &str, sha256: &str, args: &[String], bin: &str, after: Option<&str>) -> Result<(), String> {
         let file = self.download(url, sha256, MAX_SCRIPT).await?;
         let home = self.dir.join("scripts").join(name);
         std::fs::create_dir_all(&home).map_err(|e| e.to_string())?;
@@ -651,6 +654,11 @@ impl Tools {
         argv.extend(args.iter().map(String::as_str));
         let env = [("PATH", self.path()), ("HOME", home.display().to_string()), ("LANG", "C.UTF-8".into())];
         self.run("bash", &argv, &env, &home).await?;
+        if let Some(body) = after {
+            let file = self.dir.join(".dl").join("after.sh");
+            std::fs::write(&file, body).map_err(|e| format!("{}: {e}", file.display()))?;
+            self.run("bash", &[&file.display().to_string()], &env, &home).await?;
+        }
         let target = home.join(bin);
         if !runnable(&target) {
             return Err(format!("the installer left no program at {bin}"));
@@ -702,10 +710,13 @@ mod tests {
         let script = |url: &str, sha: &str, bin: &str| HarnessInstall {
             name: "hermes".into(),
             version: "ae2a81cc".into(),
-            source: InstallSource::Script { url: url.into(), sha256: sha.into(), args: vec![], bin: bin.into() },
+            source: InstallSource::Script { url: url.into(), sha256: sha.into(), args: vec![], bin: bin.into(), after: None },
         };
         let sha = "c".repeat(64);
         assert!(check(&plan(vec![script("https://example.com/i.sh", &sha, ".hermes/bin/hermes")], None)).is_ok());
+        let mut nul = script("https://example.com/i.sh", &sha, ".hermes/bin/hermes");
+        nul.source = InstallSource::Script { url: "https://example.com/i.sh".into(), sha256: sha.clone(), args: vec![], bin: "b".into(), after: Some("a\0b".into()) };
+        assert!(check(&plan(vec![nul], None)).is_err(), "an after script with a NUL");
         for (s, why) in [
             (script("http://example.com/i.sh", &sha, "bin/hermes"), "plain http"),
             (script("https://example.com/i.sh", "abc", "bin/hermes"), "no checksum"),
@@ -717,6 +728,42 @@ mod tests {
         let mut n = node.clone().unwrap();
         n.downloads.insert("aarch64".into(), wire::Download { url: "https://nodejs.org/n.tar.xz".into(), sha256: "short".into() });
         assert!(check(&plan(vec![], Some(n))).is_err());
+    }
+
+    /// Serves `body` once over plain HTTP on 127.0.0.1, for a download test.
+    async fn serve_once(body: &'static str) -> String {
+        use tokio::io::AsyncReadExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/install.sh", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf).await;
+            let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+            s.write_all(head.as_bytes()).await.unwrap();
+            s.write_all(body.as_bytes()).await.unwrap();
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn a_script_install_runs_its_after_script_in_the_same_home() {
+        const INSTALLER: &str = "mkdir -p \"$HOME/app/bin\" && printf '#!/bin/sh\\necho own\\n' > \"$HOME/app/bin/tool\" && chmod +x \"$HOME/app/bin/tool\"\n";
+        const AFTER: &str = "mkdir -p \"$HOME/shared\" && printf '#!/bin/sh\\necho shared\\n' > \"$HOME/shared/tool\" && chmod +x \"$HOME/shared/tool\"\n";
+        let sha: String = Sha256::digest(INSTALLER).iter().map(|b| format!("{b:02x}")).collect();
+        let dir = std::env::temp_dir().join(format!("superbot-tools-after-{}", now_ms()));
+        let t = Tools::new(dir.clone(), None).unwrap();
+        let url = serve_once(INSTALLER).await;
+        t.in_dl(t.script("hermes", &url, &sha, &[], "shared/tool", Some(AFTER))).await.unwrap();
+        let out = std::process::Command::new(dir.join("bin/hermes")).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "shared");
+        assert!(dir.join("scripts/hermes/app/bin/tool").exists());
+        assert!(!dir.join(".dl").exists(), "the after script goes with the downloads");
+
+        let url = serve_once(INSTALLER).await;
+        let err = t.in_dl(t.script("hermes", &url, &sha, &[], "shared/tool", Some("exit 3\n"))).await.unwrap_err();
+        assert!(!err.is_empty(), "a failed after script fails the install");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

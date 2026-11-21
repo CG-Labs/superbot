@@ -17,6 +17,7 @@
 use super::enroll::{self, Enrollment};
 use super::wire::{self, HarnessPlan, HarnessStatus, Heartbeat, UpgradeRequest};
 use super::{ControlPlane, event, system};
+use crate::adapters::install;
 use crate::audit::{Outcome, Who};
 use crate::db::{Machine, now};
 use crate::runner::App;
@@ -363,10 +364,10 @@ pub async fn follow_up(app: &App, cp: &ControlPlane, e: &Enrollment, machine_id:
         let _ = upgrade(app, cp, e, &m, hb, None).await;
         return;
     }
-    if let Some(plan) = &e.upkeep.plan
-        && plan_due(plan, &m, hb, now())
+    if let Some(plan) = e.upkeep.plan.as_ref().map(|p| install::plan_for(p, &hb.can))
+        && plan_due(&plan, &m, hb, now())
     {
-        let _ = send_plan(app, e, &m, plan, &system(&m)).await;
+        let _ = send_plan(app, e, &m, &plan, &system(&m)).await;
     }
 }
 
@@ -498,7 +499,7 @@ pub async fn harnesses_now(
             "Its agent can't install harnesses: it was installed before ADR 0039. Rebuild it with today's agent: botctl machine rebuild <user> (ADR 0056).".into(),
         ));
     }
-    send_plan(&app, e, &m, plan, &by).await?;
+    send_plan(&app, e, &m, &install::plan_for(plan, &hb.can), &by).await?;
     let m = app.db.machine(&m.id).unwrap_or(m);
     Ok((StatusCode::ACCEPTED, Json(view(e, &m))))
 }
