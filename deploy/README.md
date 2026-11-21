@@ -365,6 +365,18 @@ sudo -u superbot -H bash -lc 'cd ~/superbot && deploy/harness-e2e.sh --harness h
 
 It ends with `PASS` or `FAIL` per harness and exits non-zero on any failure. Only harness and provider variables from `--env-file` reach the test's botd. `--fake` runs the CI version with a fake model instead (no login). CI runs that version on every change to the hook path, at the pinned CLI versions; bumping a pin is in [ADR 0057](../docs/adr/0057-harness-hook-e2e-tests.md#pinned-to-what-machines-install).
 
+## Measuring a harness's footprint
+
+`deploy/harness-footprint.sh` measures what each harness costs per Bot on this machine: disk for the install and per Bot, cold and warm start, memory (RSS and PSS) and CPU per run, what's left running when idle, several Bots at once, and how many runs fit each tier's machine. It uses a throwaway botd and the fake model by default (no login, no cost), and writes `footprint.md` and `footprint.json`:
+
+```sh
+deploy/harness-footprint.sh --install-clis /tmp/clis --out /tmp/footprint            # the pinned CLIs
+deploy/harness-footprint.sh --harness hermes --cpus 1 --concurrency 3                 # a Starter's single vCPU
+deploy/harness-footprint.sh --harness hermes --real --env-file .env --model <model>   # real model (opt-in, costs)
+```
+
+The `harness-e2e` workflow's Footprint job runs it on the pinned CLIs and uploads the report. Results and what they mean: [ADR 0070](../docs/adr/0070-hermes-per-bot-footprint.md).
+
 ## Master key
 
 botd encrypts saved secrets (`botctl secret set`) and approvals' tool input with a master key: `~superbot/.config/superbot/master.key` (mode `0600`, folder `0700`). The installer creates it on first install and on the first `--upgrade` that needs it, before botd restarts, and never replaces it. It is outside `DATA_DIR`, so the daily backups don't include it: **copy it somewhere safe, apart from the backups.** Design and threat model: [ADR 0010](../docs/adr/0010-secrets.md).
