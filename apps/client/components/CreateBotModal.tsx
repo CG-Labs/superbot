@@ -8,6 +8,7 @@ import {
   TextInput,
   View,
 } from "react-native";
+import { harnessChoices } from "../src/plan";
 import { useSuperBot } from "../src/SuperBotContext";
 import { botColors, botShapes, colors, HARNESS_NAMES } from "../src/theme";
 import { BotAvatar } from "./BotAvatar";
@@ -19,11 +20,12 @@ interface Props {
 }
 
 export function CreateBotModal({ visible, onClose, onCreated }: Props) {
-  const { createBot, harnesses, defaultHarness } = useSuperBot();
+  const { createBot, harnesses, defaultHarness, me } = useSuperBot();
   const [name, setName] = useState("");
   const [color, setColor] = useState(botColors[0]);
   const [shape, setShape] = useState(botShapes[0]);
-  const [harness, setHarness] = useState(defaultHarness);
+  // Null until the user picks one: the server then gives the plan's default.
+  const [picked, setPicked] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -33,8 +35,9 @@ export function CreateBotModal({ visible, onClose, onCreated }: Props) {
     setBusy(true);
     setError(null);
     try {
-      const b = await createBot({ name: n, color, shape, harness });
+      const b = await createBot({ name: n, color, shape, harness: picked ?? undefined });
       setName("");
+      setPicked(null);
       onCreated(b.id);
       onClose();
     } catch (err) {
@@ -44,7 +47,8 @@ export function CreateBotModal({ visible, onClose, onCreated }: Props) {
     }
   };
 
-  const list = harnesses.length ? harnesses : Object.keys(HARNESS_NAMES);
+  const choices = harnessChoices(defaultHarness, harnesses, !!me.tier?.managed, HARNESS_NAMES);
+  const harness = picked ?? defaultHarness;
 
   return (
     <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
@@ -75,13 +79,13 @@ export function CreateBotModal({ visible, onClose, onCreated }: Props) {
               />
             ))}
           </View>
-          {list.map((h) => (
+          {choices.map((c) => (
             <Pressable
-              key={h}
-              style={[styles.harnessRow, harness === h && styles.harnessOn]}
-              onPress={() => setHarness(h)}
+              key={c.harness}
+              style={[styles.harnessRow, harness === c.harness && styles.harnessOn]}
+              onPress={() => setPicked(c.isDefault ? null : c.harness)}
             >
-              <Text style={styles.harnessText}>{HARNESS_NAMES[h] || h}</Text>
+              <Text style={styles.harnessText}>{c.label}</Text>
             </Pressable>
           ))}
           {error ? <Text style={styles.error}>{error}</Text> : null}

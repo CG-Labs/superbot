@@ -54,3 +54,23 @@ export function usageLines(u: MyUsage): string[] {
   for (const m of u.byModel ?? []) lines.push(`${m.model ?? "Unnamed model"}: ${num(m.total)} tokens`);
   return lines;
 }
+
+export interface HarnessChoice {
+  harness: string;
+  label: string;
+  isDefault: boolean;
+}
+
+/**
+ * The harnesses a new Bot can take, the default first and marked (ADR 0079). On a managed
+ * plan the default is the plan's, so the user picks a plan and gets its harness.
+ */
+export function harnessChoices(defaultHarness: string, harnesses: string[], managed: boolean, names: Record<string, string>): HarnessChoice[] {
+  const list = harnesses.length ? harnesses : Object.keys(names);
+  const ordered = defaultHarness ? [defaultHarness, ...list.filter((h) => h !== defaultHarness)] : list;
+  return ordered.map((h) => {
+    const isDefault = h === defaultHarness;
+    const name = names[h] || h;
+    return { harness: h, isDefault, label: isDefault ? `${name} · ${managed ? "your plan's default" : "default"}` : name };
+  });
+}

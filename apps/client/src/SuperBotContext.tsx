@@ -87,7 +87,7 @@ interface SuperBotContextValue {
   sendText: (text: string, answer?: { messageId: number; option: number }) => Promise<void>;
   /** Answers a choice or handoff card on the card's own Bot. Rejects (and undoes) on failure. */
   answerQuestion: (message: Message, option: number) => Promise<void>;
-  createBot: (body: { name: string; color: string; shape: string; harness: string }) => Promise<BotView>;
+  createBot: (body: { name: string; color: string; shape: string; harness?: string }) => Promise<BotView>;
   patchBot: (id: string, body: Record<string, unknown>) => Promise<void>;
   /** Shares the Bot with everyone, or makes it private to its owner and grants. */
   setBotVisibility: (id: string, visibility: Visibility) => Promise<void>;
@@ -480,7 +480,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
-  const createBot = async (body: { name: string; color: string; shape: string; harness: string }) => {
+  const createBot = async (body: { name: string; color: string; shape: string; harness?: string }) => {
     if (!api) throw new Error("Not connected");
     const b = await api.createBot(body);
     setBots((bs) => upsertBot(bs, b));
