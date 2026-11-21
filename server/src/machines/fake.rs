@@ -7,7 +7,7 @@
 
 use super::provider::{
     CreateSpec, FirewallDevices, FirewallRule, Fut, MachineProvider, ProviderError, ProviderFirewall,
-    ProviderMachine,
+    ProviderMachine, RebuildSpec,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
@@ -38,8 +38,10 @@ struct State {
     firewalls: BTreeMap<String, FakeFirewall>,
     /// One-shot failures, by operation name (`create`, `get`, `shutdown`, ...).
     fail: HashMap<&'static str, ProviderError>,
+    /// One-shot lost answers: the operation is done, then fails with a transport error.
+    lost: BTreeSet<&'static str>,
     calls: Vec<String>,
-    /// The user data each create was sent, by label: what the machine boots with.
+    /// The user data each create or rebuild was sent, by label: what the machine boots with.
     user_data: HashMap<String, String>,
 }
 
@@ -67,7 +69,11 @@ impl Fake {
         if let Some(e) = s.fail.remove(op) {
             return Err(e);
         }
-        f(&mut s)
+        let out = f(&mut s);
+        if out.is_ok() && s.lost.remove(op) {
+            return Err(ProviderError::Transport("connection reset".into()));
+        }
+        out
     }
 
     fn update(
@@ -84,6 +90,11 @@ impl Fake {
     /// The next `op` fails with `e`.
     pub fn fail_next(&self, op: &'static str, e: ProviderError) {
         self.state.lock().unwrap().fail.insert(op, e);
+    }
+
+    /// The next `op` is done, but its answer is lost.
+    pub fn lose_next(&self, op: &'static str) {
+        self.state.lock().unwrap().lost.insert(op);
     }
 
     /// A machine made behind the control plane's back, e.g. by a create whose answer was lost.
@@ -165,7 +176,7 @@ impl Fake {
         id
     }
 
-    /// What the last create for `label` carried as cloud-init user data.
+    /// What the last create or rebuild for `label` carried as cloud-init user data.
     pub fn user_data(&self, label: &str) -> Option<String> {
         self.state.lock().unwrap().user_data.get(label).cloned()
     }
@@ -245,7 +256,7 @@ impl MachineProvider for Fake {
         Box::pin(async move {
             self.with("get", |s| {
                 let m = s.machines.get_mut(id).ok_or(ProviderError::NotFound)?;
-                if matches!(m.status.as_str(), "provisioning" | "booting") {
+                if matches!(m.status.as_str(), "provisioning" | "booting" | "rebuilding") {
                     m.status = "running".into();
                 }
                 Ok(m.clone())
@@ -288,6 +299,18 @@ impl MachineProvider for Fake {
                 for f in s.firewalls.values_mut() {
                     f.machines.remove(id);
                 }
+                Ok(())
+            })
+        })
+    }
+
+    fn rebuild<'a>(&'a self, id: &'a str, spec: &'a RebuildSpec) -> Fut<'a, ()> {
+        Box::pin(async move {
+            self.with("rebuild", |s| {
+                let m = s.machines.get_mut(id).ok_or(ProviderError::NotFound)?;
+                m.status = "rebuilding".into();
+                let label = m.label.clone();
+                s.user_data.insert(label, spec.user_data.clone());
                 Ok(())
             })
         })

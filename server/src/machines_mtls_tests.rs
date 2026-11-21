@@ -101,7 +101,7 @@ pub(crate) async fn events(env: &Env, action: &str) -> Vec<Value> {
     audit_list(&body)
 }
 
-fn token_in(user_data: &str) -> String {
+pub(crate) fn token_in(user_data: &str) -> String {
     let at = user_data
         .find("content: \"sbe_")
         .expect("a token in the user data")

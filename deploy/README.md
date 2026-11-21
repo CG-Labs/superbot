@@ -219,7 +219,27 @@ botctl machine upgrade <user> hold        # keep it at its build (release: let i
 botctl machine harnesses <user>           # install MACHINE_HARNESSES now, retrying failures
 ```
 
-Each step is audited as `machine.harness_*` and `machine.agent_upgrade*`. Machines enrolled before this change can't replace their own agent: reinstall them. Harnesses there need a login (below) or an API key in the user's secrets. Design: [ADR 0039](../docs/adr/0039-machine-harnesses-and-agent-upgrades.md).
+Each step is audited as `machine.harness_*` and `machine.agent_upgrade*`. Machines enrolled before this change can't replace their own agent: rebuild them (below). Harnesses there need a login (below) or an API key in the user's secrets. Design: [ADR 0039](../docs/adr/0039-machine-harnesses-and-agent-upgrades.md).
+
+### Rebuilding machines from before agent upgrades
+
+A machine enrolled before agent upgrades can't update itself. botd can rebuild it in place with today's agent: Linode wipes its disks and reinstalls it from `MACHINE_IMAGE` with today's first-boot setup and a new enrollment token. It keeps its Linode, IP address and firewall. It enrolls again by itself, then gets the harness CLIs, the Bots' own user, screens and the user's folder like a new machine. On the server:
+
+```sh
+botctl machine legacy                          # machines whose agent is too old to upgrade, and their rebuilds
+botctl machine rebuild <user>                  # rebuild it now (it waits until its agent is idle)
+botctl machine rebuild <user> --discard-work   # also when it may hold the user's files
+botctl machine rebuild <user> status           # queued, rebuilding, retrying, done, failed or cancelled
+botctl machine rebuild <user> cancel           # only before it is sent to Linode
+```
+
+A rebuild erases everything on the machine. Bots' memory and the user's facts are kept here, but files Bots made there are lost. So a machine that is or was assigned, or where a Bot ran, is only rebuilt with `--discard-work`: copy off what's needed first, or restore it later from Linode's backups (`MACHINE_BACKUPS`). While a rebuild is underway, that user's Bots say so and don't run. A held agent (`botctl machine upgrade <user> hold`) isn't rebuilt. If the machine doesn't enroll again in time, botd sends the rebuild again after a backoff (1, 2, 4, 8 minutes), up to 5 times, then marks it failed. To rebuild idle machines that never ran Bots by themselves, add:
+
+```sh
+MACHINE_LEGACY_REBUILDS=auto   # manual (default): only when you ask; off: never
+```
+
+Each step is audited as `machine.rebuild_*` and `machine.rebuilt`. Design: [ADR 0056](../docs/adr/0056-rebuilding-machines-enrolled-before-0039.md).
 
 ### Harness logins and the user's folder on machines
 
@@ -255,7 +275,7 @@ MACHINE_BOT_USER=on   # Bots, their harness CLIs, logins and the folder copy run
 
 After the next heartbeat, botd asks each idle agent to switch. The agent makes the `superbot-bots` user if it must, hands it the Bots' home (workspace, logins, folder copy) without following links, and from then on runs every harness, login and cleanup as it. The agent's key and the harness CLIs stay root's. Until the switch is done, a Bot says it's being set up and doesn't run; nothing runs on the server instead. New machines get the user at first boot.
 
-Machines already enrolled switch once their agent is botd's build (`MACHINE_AGENT_UPGRADES=auto`, or `botctl machine upgrade <user>`). Agents from before ADR 0039 can't upgrade: reinstall them. Turning the setting off later doesn't switch a machine back. On the server:
+Machines already enrolled switch once their agent is botd's build (`MACHINE_AGENT_UPGRADES=auto`, or `botctl machine upgrade <user>`). Agents from before ADR 0039 can't upgrade: rebuild them (`botctl machine rebuild <user>`). Turning the setting off later doesn't switch a machine back. On the server:
 
 ```sh
 botctl machine bot-user <user>   # ask its agent now, retrying a failure

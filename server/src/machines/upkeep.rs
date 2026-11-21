@@ -59,6 +59,8 @@ pub struct Upkeep {
     /// What MACHINE_HARNESSES asks for. None: no harness is installed by botd.
     pub plan: Option<HarnessPlan>,
     pub upgrades: Upgrades,
+    /// MACHINE_LEGACY_REBUILDS (ADR 0056).
+    pub rebuilds: super::rebuild::Rebuilds,
 }
 
 /// `claude,codex@0.172.0,hermes@<commit>=<sha256>`: commas or spaces between.
@@ -89,12 +91,17 @@ impl Upkeep {
             "auto" => Upgrades::Auto,
             v => return Err(format!("MACHINE_AGENT_UPGRADES must be manual or auto, not \"{v}\"")),
         };
-        Ok(Upkeep { plan: parse_harnesses(&var("MACHINE_HARNESSES"))?, upgrades })
+        let rebuilds = super::rebuild::Rebuilds::parse(&var("MACHINE_LEGACY_REBUILDS"))?;
+        Ok(Upkeep { plan: parse_harnesses(&var("MACHINE_HARNESSES"))?, upgrades, rebuilds })
     }
 
     pub fn describe(&self) -> String {
         let harnesses = self.plan.as_ref().map_or("none".into(), |p| names(p).join(", "));
-        format!("harnesses on machines: {harnesses}; agent upgrades: {}", self.upgrades.as_str())
+        format!(
+            "harnesses on machines: {harnesses}; agent upgrades: {}; rebuilds of old machines: {}",
+            self.upgrades.as_str(),
+            self.rebuilds.as_str()
+        )
     }
 }
 
@@ -220,7 +227,7 @@ fn blocker(e: &Enrollment, m: &Machine, hb: &Heartbeat) -> Option<String> {
         return Some("Its agent is botd's build already.".into());
     }
     if !hb.can.iter().any(|c| c == wire::CAN_UPGRADE) {
-        return Some("Its agent can't replace itself: it was installed before agent upgrades (ADR 0039). Reinstall it.".into());
+        return Some("Its agent can't replace itself: it was installed before agent upgrades (ADR 0039). Rebuild it with today's agent: botctl machine rebuild <user> (ADR 0056).".into());
     }
     if newer(&hb.version) {
         return Some(format!("Its agent ({}) is newer than botd ({VERSION}), and botd doesn't downgrade agents.", hb.version));
@@ -398,7 +405,7 @@ fn need_machine(app: &AppState, key: &str) -> Res<Machine> {
 }
 
 /// A heartbeat now, so what follows acts on how the agent is.
-async fn fresh(app: &App, e: &Enrollment, m: &Machine) -> Res<Heartbeat> {
+pub(super) async fn fresh(app: &App, e: &Enrollment, m: &Machine) -> Res<Heartbeat> {
     if m.enrollment != "enrolled" {
         return Err(ApiError(StatusCode::CONFLICT, "Its agent isn't enrolled.".into()));
     }
@@ -488,7 +495,7 @@ pub async fn harnesses_now(
     if !hb.can.iter().any(|c| c == wire::CAN_HARNESSES) {
         return Err(ApiError(
             StatusCode::CONFLICT,
-            "Its agent can't install harnesses: it was installed before ADR 0039. Upgrade or reinstall it.".into(),
+            "Its agent can't install harnesses: it was installed before ADR 0039. Rebuild it with today's agent: botctl machine rebuild <user> (ADR 0056).".into(),
         ));
     }
     send_plan(&app, e, &m, plan, &by).await?;
@@ -505,6 +512,7 @@ mod tests {
         let none = |_: &str| String::new();
         let u = Upkeep::from_env(&none).unwrap();
         assert!(u.plan.is_none() && u.upgrades == Upgrades::Manual, "off by default");
+        assert_eq!(u.rebuilds, super::super::rebuild::Rebuilds::Manual);
         let env = |k: &str| match k {
             "MACHINE_HARNESSES" => "claude, Codex@0.172.0 pi".into(),
             "MACHINE_AGENT_UPGRADES" => "AUTO".into(),
@@ -521,6 +529,7 @@ mod tests {
             ("MACHINE_HARNESSES", "cursor"),
             ("MACHINE_HARNESSES", "pi@1.5.2=sha512-short"),
             ("MACHINE_AGENT_UPGRADES", "always"),
+            ("MACHINE_LEGACY_REBUILDS", "yes"),
         ] {
             let bad = |key: &str| if key == k { v.to_string() } else { String::new() };
             assert!(Upkeep::from_env(&bad).is_err(), "{k}={v}");
