@@ -537,7 +537,7 @@ impl Enrollment {
         out
     }
 
-    /// What a machine restored from a backup gets before it starts (ADR 0070): today's
+    /// What a machine restored from a backup gets before it starts (ADR 0071): today's
     /// CA, unit, guard and settings, and a fresh token, which the agent enrolls with
     /// once its old identity is gone. Nothing of it goes in the provider's config.
     pub fn restore_files(&self, m: &Machine, token: &str) -> Vec<RestoreFile> {

@@ -14,7 +14,7 @@
 //!
 //! With SUPERBOT_INCUS_E2E_S3_ENDPOINT and _BUCKET (and MACHINE_BACKUP_S3_ACCESS_KEY_ID
 //! and _SECRET_ACCESS_KEY), a container is also backed up to that store, encrypted, and
-//! restored from it (ADR 0070); CI runs MinIO on loopback for it.
+//! restored from it (ADR 0071); CI runs MinIO on loopback for it.
 
 use crate::machines::State;
 use crate::machines::enroll::{self, Enrollment};
@@ -487,7 +487,7 @@ async fn wait<T>(env: &Env, what: &str, within: Duration, mut f: impl FnMut() ->
     }
 }
 
-/// Off-host backup and restore (ADR 0070): `m`'s container is exported, encrypted, sent
+/// Off-host backup and restore (ADR 0071): `m`'s container is exported, encrypted, sent
 /// to the store, changed, then made again from the backup. It comes back with the
 /// backup's files, today's firewall and settings, and a new identity it enrolled for;
 /// the old one and any token stay gone. `other` still can't reach it.

@@ -215,7 +215,7 @@ fn deadline(e: &Enrollment, sent: i64) -> i64 {
 /// Sends the rebuild from `from` (`queued` or `retrying`). Caller holds `ops`.
 async fn send(app: &App, cp: &ControlPlane, p: &dyn MachineProvider, e: &Enrollment, m: &Machine, from: &str) {
     let Some(id) = m.rebuild_id.clone() else { return };
-    // Tried again once the restore is over (ADR 0070).
+    // Tried again once the restore is over (ADR 0071).
     if app.db.machine_restoring(&m.id).is_some() {
         return;
     }

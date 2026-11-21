@@ -110,7 +110,7 @@ pub enum Refusal {
     TeammateNotLoggedIn(String),
     /// It is being rebuilt with today's agent, or is about to be (ADR 0056).
     Rebuilding,
-    /// It is being made again from an off-host backup (ADR 0070).
+    /// It is being made again from an off-host backup (ADR 0071).
     Restoring,
 }
 

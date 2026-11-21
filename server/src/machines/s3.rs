@@ -1,4 +1,4 @@
-//! A small S3 client for off-host machine backups (ADR 0070): path-style requests
+//! A small S3 client for off-host machine backups (ADR 0071): path-style requests
 //! signed with AWS Signature Version 4, which AWS S3, Cloudflare R2, Backblaze B2,
 //! MinIO and most S3-compatible stores accept. Only what backups need: multipart
 //! uploads, small puts, streaming gets, and deletes. The secret key signs requests and

@@ -104,7 +104,7 @@ Once it has enrolled, the next reconcile removes its enrollment user data from t
 
 ## 7. Off-host backups (optional)
 
-Snapshots stay on the host's pool. To survive losing the host, botd can export each container to S3-compatible storage (AWS S3, R2, B2, MinIO, or the customer's own bucket) and restore it from there ([ADR 0070](../adr/0070-off-host-machine-backups.md)). It's off unless the bucket is set. In botd's `.env`:
+Snapshots stay on the host's pool. To survive losing the host, botd can export each container to S3-compatible storage (AWS S3, R2, B2, MinIO, or the customer's own bucket) and restore it from there ([ADR 0071](../adr/0071-off-host-machine-backups.md)). It's off unless the bucket is set. In botd's `.env`:
 
 ```bash
 MACHINE_BACKUP_S3_BUCKET=<bucket>

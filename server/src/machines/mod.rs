@@ -142,7 +142,7 @@ pub enum Step {
     Fail,
     /// An admin asks again after an error.
     Retry,
-    /// Made again from an off-host backup and started (ADR 0070).
+    /// Made again from an off-host backup and started (ADR 0071).
     Restored,
 }
 
@@ -193,7 +193,7 @@ pub struct ControlPlane {
     /// port to open.
     pub firewall: Option<firewall::Firewall>,
     firewall_settings: Option<firewall::Settings>,
-    /// Off-host backups of machines to object storage (ADR 0070). None: off
+    /// Off-host backups of machines to object storage (ADR 0071). None: off
     /// (MACHINE_BACKUP_S3_BUCKET).
     pub offsite: Option<Arc<backup::Offsite>>,
     /// One change at a time, from handlers and the reconciler alike, so two can't
@@ -270,7 +270,7 @@ impl ControlPlane {
     /// MACHINE_PROVIDER=incus turns it on with an Incus host (`incus_from_env`). The
     /// rest have defaults: MACHINE_TIERS, MACHINE_IMAGE, MACHINE_BACKUPS (on),
     /// MACHINE_LABEL_PREFIX, MACHINE_AUTHORIZED_KEYS, MACHINE_RECONCILE_SECONDS.
-    /// MACHINE_BACKUP_S3_BUCKET turns on off-host backups (`backup::Settings`, ADR 0070),
+    /// MACHINE_BACKUP_S3_BUCKET turns on off-host backups (`backup::Settings`, ADR 0071),
     /// for providers that can export machines.
     pub fn from_env(
         store: &dyn SecretStore,
@@ -889,7 +889,7 @@ async fn reconcile_one(app: &App, cp: &ControlPlane, p: &dyn MachineProvider, id
                 }
             }
             // Not before: a snapshot would keep a copy of the token in its config, or
-            // on its disk while a restored machine enrolls (ADR 0070).
+            // on its disk while a restored machine enrolls (ADR 0071).
             if cp.backups && !pm.backups && m.state != State::Provisioning && !user_data && app.db.machine_restoring(&m.id).is_none() {
                 match p.enable_backups(&pid).await {
                     Ok(()) => {

@@ -1,4 +1,4 @@
-//! Off-host backups of machines (ADR 0070): each running, enrolled machine is exported
+//! Off-host backups of machines (ADR 0071): each running, enrolled machine is exported
 //! by its provider (an Incus backup of the container, without its snapshots) on a
 //! schedule and streamed to S3-compatible object storage, age-encrypted to public
 //! recipients when MACHINE_BACKUP_AGE_RECIPIENTS is set, as server backups are (ADR

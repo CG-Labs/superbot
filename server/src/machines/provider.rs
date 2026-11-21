@@ -8,7 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 pub type Fut<'a, T> = Pin<Box<dyn Future<Output = Result<T, ProviderError>> + Send + 'a>>;
-/// A backup's bytes on their way to or from the provider (ADR 0070).
+/// A backup's bytes on their way to or from the provider (ADR 0071).
 pub type ByteStream = Pin<Box<dyn futures_util::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send>>;
 
 /// A file put on a restored machine's disk before it first starts.
@@ -19,7 +19,7 @@ pub struct RestoreFile {
     pub content: String,
 }
 
-/// What a machine restored from a backup becomes (ADR 0070): today's size, tags,
+/// What a machine restored from a backup becomes (ADR 0071): today's size, tags,
 /// keys and firewall rather than the backup's, the files that make it enroll again,
 /// and the files that must go (its old identity).
 #[derive(Clone, PartialEq)]
@@ -241,7 +241,7 @@ pub trait MachineProvider: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
-    // Off-host backups (ADR 0070): a machine's whole disk exported as one file, and a
+    // Off-host backups (ADR 0071): a machine's whole disk exported as one file, and a
     // machine made again from one. Providers that can't say so.
 
     /// Whether this provider can export and import machines.

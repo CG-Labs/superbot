@@ -501,7 +501,7 @@ pub struct Incus {
     egress: Vec<Rule>,
     pin: String,
     http: reqwest::Client,
-    /// For backups' bytes (ADR 0070): no overall timeout, but not silent for long.
+    /// For backups' bytes (ADR 0071): no overall timeout, but not silent for long.
     stream: reqwest::Client,
 }
 

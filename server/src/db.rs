@@ -1169,7 +1169,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 27] = [
     migrate_machine_backups,
 ];
 
-/// Off-host backups of machines and restores from them (ADR 0070). At most one backup
+/// Off-host backups of machines and restores from them (ADR 0071). At most one backup
 /// running and one restore underway per machine.
 fn migrate_machine_backups(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
     c.execute_batch(
@@ -1209,7 +1209,7 @@ fn migrate_machine_backups(c: &Connection, _fresh: bool) -> rusqlite::Result<()>
     )
 }
 
-/// One off-host backup of a machine (ADR 0070).
+/// One off-host backup of a machine (ADR 0071).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MachineBackup {
@@ -1254,7 +1254,7 @@ fn machine_backup_row(r: &Row) -> rusqlite::Result<MachineBackup> {
     })
 }
 
-/// One restore of a machine from a backup (ADR 0070).
+/// One restore of a machine from a backup (ADR 0071).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MachineRestore {
@@ -4613,7 +4613,7 @@ impl Db {
         );
     }
 
-    // Off-host machine backups (ADR 0070)
+    // Off-host machine backups (ADR 0071)
 
     /// Records a backup as running, unless one of the machine's is running already.
     pub fn machine_backup_start(&self, n: &NewMachineBackup) -> Option<MachineBackup> {

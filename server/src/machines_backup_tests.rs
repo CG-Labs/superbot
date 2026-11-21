@@ -1,4 +1,4 @@
-//! Off-host machine backups and restores (ADR 0070), end to end on loopback: the real
+//! Off-host machine backups and restores (ADR 0071), end to end on loopback: the real
 //! router, botd's machine port, the real agent, the Incus provider talking mutual TLS
 //! to a stand-in for the Incus API, and a stand-in for an S3-compatible store.
 

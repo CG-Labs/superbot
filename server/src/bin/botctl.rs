@@ -138,7 +138,7 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine legacy                            Machines whose agent is from before agent upgrades, and their rebuilds
   botctl machine rebuild <user> [--discard-work]   Wipe and reinstall it with today's agent (ADR 0056); same IP and firewall
   botctl machine rebuild <user> status|cancel      How its rebuild is going, or cancel one not yet sent
-  botctl machine backups [<user>]                  Off-host backups (ADR 0070): every one and the settings, or the user's and its last restore
+  botctl machine backups [<user>]                  Off-host backups (ADR 0071): every one and the settings, or the user's and its last restore
   botctl machine backup <user>                     Back it up to object storage now
   botctl machine restore <user> <backup-id> [--identity <age-key-file>] --yes  Make it again from that backup; it enrolls anew
   botctl machine restore <user> status             How its latest restore went
@@ -681,7 +681,7 @@ fn rebuild_request(args: &[&str]) -> Result<(&'static str, String, Option<String
     })
 }
 
-/// `botctl machine backups|backup|restore ...` (ADR 0070): the request to send. The
+/// `botctl machine backups|backup|restore ...` (ADR 0071): the request to send. The
 /// identity file is read here and sent for this restore only.
 fn backup_request(args: &[&str], read: impl Fn(&str) -> Result<String, String>) -> Result<(&'static str, String, Option<String>), String> {
     let at = |user: &str, verb: &str| format!("/api/users/{}/machine/{verb}", encode(user));
