@@ -1002,7 +1002,7 @@ pub enum JitError {
 #[derive(Debug, PartialEq)]
 pub enum UserError {
     EmailTaken,
-    /// Every seat the license, or the community edition, allows is taken (ADR 0038).
+    /// Every seat the license allows is taken, or there is no license (ADR 0038, ADR 0068).
     NoSeat,
     Db(String),
 }
