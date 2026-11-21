@@ -24,6 +24,8 @@ mod cron;
 mod handover;
 #[cfg(test)]
 mod handover_http_tests;
+#[cfg(test)]
+mod harness_version_http_tests;
 mod isolation;
 #[cfg(test)]
 mod isolation_http_tests;

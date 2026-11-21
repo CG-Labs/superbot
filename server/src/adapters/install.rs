@@ -82,6 +82,16 @@ pub fn plan(harnesses: Vec<HarnessInstall>) -> HarnessPlan {
     HarnessPlan { node: npm.then(node), harnesses }
 }
 
+/// How an admin puts `bin` at its pin on a server, for an npm harness: what botd
+/// suggests when a guarded run's harness there is too old (ADR 0059).
+pub fn server_update(bin: &str) -> Option<String> {
+    let pin = PINS.iter().find(|p| p.bin == bin)?;
+    match pin.source {
+        Source::Npm { package, .. } => Some(format!("npm install -g {package}@{}", pin.version)),
+        Source::Hermes { .. } => None,
+    }
+}
+
 /// Whether `v` is an exact semver version, not a tag or range.
 fn exact(v: &str) -> bool {
     let (core, pre) = v.split_once('-').map_or((v, None), |(c, p)| (c, Some(p)));
@@ -183,6 +193,17 @@ mod tests {
         assert!(crate::machines::tools::check(&p).is_ok(), "{:?}", crate::machines::tools::check(&p));
         assert!(p.node.is_some_and(|n| n.downloads.contains_key("x86_64") && n.downloads.contains_key("aarch64")));
         assert!(plan(vec![h]).node.is_none(), "Hermes alone needs no Node.js");
+    }
+
+    #[test]
+    fn pins_run_the_hooks_their_adapters_need() {
+        for p in &PINS {
+            if let Some(min) = adapters::get(p.bin).unwrap().hooks_since() {
+                assert_eq!(adapters::version::assess(min, Ok(p.version.into())), Ok(()), "{}", p.bin);
+            }
+        }
+        assert_eq!(server_update("codex"), Some("npm install -g @openai/codex@0.171.0".into()));
+        assert_eq!(server_update("hermes"), None);
     }
 
     /// The pins, really installed: `cargo test -- --ignored real_harness_installs`.

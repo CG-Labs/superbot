@@ -135,6 +135,9 @@ struct BotState {
     queue: VecDeque<Message>,
     draining: bool,
     run: Option<Run>,
+    /// Stopped while the message it took was still starting (being placed, or its
+    /// harness checked), before it had a `run` to abort.
+    stopped: bool,
 }
 
 pub struct App {
@@ -610,7 +613,10 @@ impl App {
             // Pop and "queue is empty, stop draining" happen under one lock, so nothing is dropped.
             let next = {
                 let mut st = self.state();
-                let m = st.get_mut(&bot_id).and_then(|s| s.queue.pop_front());
+                let m = st.get_mut(&bot_id).and_then(|s| {
+                    s.stopped = false;
+                    s.queue.pop_front()
+                });
                 if m.is_none() {
                     st.remove(&bot_id);
                 }
@@ -699,6 +705,9 @@ impl App {
         {
             (spot.state_dir, spot.config_dir) = (state, settings);
         }
+        if self.hooks_refused(&bot, msg, &by, &period.key, &spot, run_as.as_ref()).await {
+            return;
+        }
         // Caches are made as the run's user: by botd when it is that user, by
         // `superbot-run` for a per-user account, which botd can't make folders for.
         if spot.machine.is_none() {
@@ -750,16 +759,29 @@ impl App {
             let guard = (policy.mode == Mode::Ask).then(|| guard(&spot.botctl, &bot.harness, policy.timeout_minutes));
             let (sandbox, sandboxed) = spot.sandbox(policy.sandbox, has_sandbox, sandbox_needs);
             let hooks = Arc::new(AtomicU32::new(0));
-            self.state().entry(bot.id.clone()).or_default().run = Some(Run {
-                id: run_id.clone(),
-                grants: std::mem::take(&mut grants),
-                abort: abort_tx.clone(),
-                status: "Thinking".into(),
-                draft: String::new(),
-                hooks: hooks.clone(),
-                hook_wait: guard.as_ref().map(|g| g.wait),
-                ctx: spot.ctx.clone(),
-            });
+            {
+                // Under the lock `stop_if` takes, so a stop lands here or on the run.
+                let mut st = self.state();
+                let s = st.entry(bot.id.clone()).or_default();
+                if std::mem::take(&mut s.stopped) {
+                    drop(st);
+                    if attempt == 0 {
+                        self.give_back(&bot, msg, &period.key);
+                    }
+                    self.say(&bot.id, "Stopped.", true);
+                    return;
+                }
+                s.run = Some(Run {
+                    id: run_id.clone(),
+                    grants: std::mem::take(&mut grants),
+                    abort: abort_tx.clone(),
+                    status: "Thinking".into(),
+                    draft: String::new(),
+                    hooks: hooks.clone(),
+                    hook_wait: guard.as_ref().map(|g| g.wait),
+                    ctx: spot.ctx.clone(),
+                });
+            }
             self.send(json!({ "type": "status", "botId": bot.id, "working": true, "status": "Thinking" }));
             let timeout = self.cfg.run_timeout;
             let timer = tokio::spawn({
@@ -1009,6 +1031,114 @@ impl App {
         });
         self.db.record(&e.details(detail));
         Some(Place::There(Box::new((to, layout, user))))
+    }
+
+    /// Whether a guarded run is refused because its harness, where the run happens, is
+    /// older than the release that runs SuperBot's hook, or its version can't be read
+    /// (ADR 0059). A refused run is given back and audited, and the Bot says how to fix
+    /// it. Unguarded runs aren't checked. The canary still stops a harness that skips
+    /// the hook anyway.
+    async fn hooks_refused(&self, bot: &Bot, msg: &Message, by: &Who, period: &str, spot: &Spot, run_as: Option<&RunAs>) -> bool {
+        use adapters::version::{self, Short};
+        let Some(min) = adapters::get(&bot.harness).and_then(|a| a.hooks_since()) else { return false };
+        if self.db.effective_policy(&bot.id).mode != Mode::Ask {
+            return false;
+        }
+        let bin = adapters::get(&bot.harness).map_or("", |a| a.bin());
+        let (key, said) = match &spot.machine {
+            None => {
+                let path = spot.env.get("PATH").cloned().unwrap_or_default();
+                match version::resolve(bin, &path, &spot.cwd) {
+                    None => (None, Err(format!("{bin} isn't on this server's PATH"))),
+                    Some(real) => {
+                        let key = version::key_here(bin, &real);
+                        if version::passed(&key) {
+                            return false;
+                        }
+                        (Some(key), version::read_here(&real, &path, &spot.cwd, run_as).await)
+                    }
+                }
+            }
+            Some(to) => {
+                let user = spot.teammate_user.as_ref().and(spot.for_other.as_deref()).unwrap_or(bot.owner_id.as_str());
+                let key = version::key_there(bin, &to.machine_id, user, &spot.cwd.display().to_string());
+                if version::passed(&key) {
+                    return false;
+                }
+                (Some(key), self.version_there(bot, spot, to, bin).await)
+            }
+        };
+        let short = match version::assess(min, said) {
+            Ok(()) => {
+                if let Some(k) = key {
+                    version::pass(k);
+                }
+                return false;
+            }
+            Err(s) => s,
+        };
+        let machine = spot.machine.as_ref().map(|m| m.machine_id.clone());
+        let place = match (&machine, &spot.for_other) {
+            (None, _) => "this server",
+            (Some(_), None) => "your computer",
+            (Some(_), Some(_)) => "my owner's computer",
+        };
+        // Others read a shared Bot's chat: a machine's own words stay in the audit log.
+        let team = bot.visibility == Visibility::Shared || !self.db.grants(&bot.id).is_empty();
+        let (reason, found, why) = match &short {
+            Short::Old(v) => ("harness_outdated", Some(v.as_str()), None),
+            Short::Unknown(w) => ("harness_version_unknown", None, Some(w.as_str())),
+        };
+        let has = match (found, why) {
+            (Some(v), _) => format!("{place} has {v}"),
+            (None, Some(w)) if machine.is_none() || !team => format!("I couldn't tell which version {place} has ({w})"),
+            _ => format!("I couldn't tell which version {place} has"),
+        };
+        let fix = match (&machine, adapters::install::server_update(bin)) {
+            (Some(_), _) => format!(
+                "An admin can update it: keep {bin} in MACHINE_HARNESSES at its pinned version (or {bin}@<version>, {min} or newer), then run `botctl machine harnesses <user>`."
+            ),
+            (None, Some(cmd)) => format!("An admin can update it on this server: `{cmd}`, or rebuild the Docker image."),
+            (None, None) => "An admin can update it on this server.".into(),
+        };
+        self.give_back(bot, msg, period);
+        let e = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied);
+        self.db.record(&e.details(json!({
+            "reason": reason, "harness": bot.harness, "version": found, "minimum": min, "detail": why,
+            "host": if machine.is_some() { "machine" } else { "server" }, "machine": machine,
+            "owner": bot.owner_id, "forUser": spot.for_other, "messageId": msg.id,
+        })));
+        let text = format!(
+            "I didn't run: approvals need the {bin} CLI {min} or newer to check my steps before I take them, and {has}. {fix} Or set my approvals to bypass (dev only)."
+        );
+        self.say(&bot.id, &text, true);
+        true
+    }
+
+    /// `bin --version` on the owner's machine, found as the run there would find it.
+    async fn version_there(&self, bot: &Bot, spot: &Spot, to: &Assigned, bin: &str) -> Result<String, String> {
+        let Some(cp) = self.control_plane.get() else { return Err("this server can't reach machines".into()) };
+        let job = wire::JobRequest {
+            protocol: wire::PROTOCOL,
+            job_id: format!("j{}", crate::random_hex(8)),
+            bot_id: bot.id.clone(),
+            owner_id: bot.owner_id.clone(),
+            for_user: spot.teammate_user.as_ref().and(spot.for_other.clone()),
+            message_id: 0,
+            bin: bin.into(),
+            args: vec!["--version".into()],
+            env: Default::default(),
+            cwd: spot.cwd.display().to_string(),
+            stdin: None,
+            files: vec![],
+            cleanup: None,
+            collect: vec![],
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let (_abort, abort_rx) = watch::channel(None);
+        let ran = async { tokio::join!(cp.link.run(to, job, abort_rx, tx), adapters::version::read_job(rx)).1 };
+        let secs = adapters::version::PROBE_TIMEOUT.as_secs();
+        tokio::time::timeout(adapters::version::PROBE_TIMEOUT, ran).await.unwrap_or_else(|_| Err(format!("{bin} --version didn't answer in {secs} seconds")))
     }
 
     /// The run's folders and environment where it happens. On a machine: the machine's
@@ -1441,8 +1571,11 @@ impl App {
                         self.give_back_routine_to(o, &m);
                     }
                 }
-                if let Some(r) = &s.run {
-                    r.abort.send_if_modified(|v| v.get_or_insert("stopped") == &"stopped");
+                match &s.run {
+                    Some(r) => {
+                        r.abort.send_if_modified(|v| v.get_or_insert("stopped") == &"stopped");
+                    }
+                    None => s.stopped = true,
                 }
             }
         }
