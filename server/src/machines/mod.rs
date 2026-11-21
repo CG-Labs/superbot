@@ -24,6 +24,7 @@ pub mod logins;
 pub mod offboard;
 pub mod pki;
 pub mod provider;
+pub mod rebuild;
 pub mod route;
 pub mod runas;
 pub mod screens;
@@ -800,6 +801,7 @@ pub async fn reconcile(app: &App, cp: &ControlPlane) -> Value {
         let _g = cp.ops.lock().await;
         changed += reconcile_one(app, cp, p, id).await as usize;
     }
+    rebuild::reconcile(app, cp).await;
     let mut out = json!({ "checked": ids.len(), "changed": changed });
     if let Some(fw) = &cp.firewall {
         let _g = cp.ops.lock().await;
@@ -823,6 +825,7 @@ pub async fn heartbeats(app: &AppState, cp: &ControlPlane) -> Option<usize> {
                 }
                 return false;
             };
+            rebuild::follow_up(app, cp, e, &m.id, &hb).await;
             upkeep::follow_up(app, cp, e, &m.id, &hb).await;
             botuser::follow_up(app, e, &m, &hb).await;
             folder::follow_up(app, e, &m, &hb);

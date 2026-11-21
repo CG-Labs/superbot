@@ -119,6 +119,9 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine upgrade <user>                    Upgrade its agent to botd's build now
   botctl machine upgrade <user> hold|release       Keep its agent at its build, or let it be upgraded again
   botctl machine harnesses <user>                  Install MACHINE_HARNESSES on it now, retrying failures
+  botctl machine legacy                            Machines whose agent is from before agent upgrades, and their rebuilds
+  botctl machine rebuild <user> [--discard-work]   Wipe and reinstall it with today's agent (ADR 0056); same IP and firewall
+  botctl machine rebuild <user> status|cancel      How its rebuild is going, or cancel one not yet sent
   botctl machine bot-user <user>                   Run its Bots as their own OS user now (MACHINE_BOT_USER), retrying a failure
   botctl machine harness-login <user|me> <claude|codex>  Log the harness in on the machine; the login stays there
   botctl machine harness-logins <user|me>          Which harnesses are logged in on it
@@ -578,8 +581,20 @@ fn machine_request(args: &[&str]) -> Result<(&'static str, String), String> {
         ["removals"] => ("GET", "/api/machines/teammate-removals?state=open".into()),
         ["removals", s @ ("pending" | "held" | "done" | "cancelled" | "open" | "all")] => ("GET", format!("/api/machines/teammate-removals?state={s}")),
         _ => {
-            return Err("Usage: botctl machine placement [<user>] | assign <user> | unassign <user> | agent <user> | upgrade <user> [hold|release] | harnesses <user> | bot-user <user> | harness-login <user|me> <claude|codex> | harness-logins <user|me> | harness-logout <user|me> <harness> | folder <user> | sync <user> | screens <user> [close <bot>] | teammates <user> [remove <teammate>] | removals [pending|held|done|cancelled|open|all]".into());
+            return Err("Usage: botctl machine placement [<user>] | assign <user> | unassign <user> | agent <user> | upgrade <user> [hold|release] | harnesses <user> | legacy | rebuild <user> [--discard-work|status|cancel] | bot-user <user> | harness-login <user|me> <claude|codex> | harness-logins <user|me> | harness-logout <user|me> <harness> | folder <user> | sync <user> | screens <user> [close <bot>] | teammates <user> [remove <teammate>] | removals [pending|held|done|cancelled|open|all]".into());
         }
+    })
+}
+
+/// `botctl machine rebuild ...` (ADR 0056): the request to send.
+fn rebuild_request(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
+    let at = |user: &str| format!("/api/users/{}/machine/rebuild", encode(user));
+    Ok(match args {
+        [user] if !user.starts_with("--") => ("POST", at(user), None),
+        [user, "--discard-work"] => ("POST", at(user), Some(json!({ "discardWork": true }).to_string())),
+        [user, "status"] => ("GET", at(user), None),
+        [user, "cancel"] => ("DELETE", at(user), None),
+        _ => return Err("Usage: botctl machine rebuild <user> [--discard-work] | rebuild <user> status|cancel".into()),
     })
 }
 
@@ -880,6 +895,11 @@ fn run(args: &[String]) -> Result<String, String> {
         ["machine", "harness-login", user, harness] => machine_login(user, harness),
         ["machine", "harness-logins", user] => op("GET", &format!("{}/harness-logins", login_base(user)), None),
         ["machine", "harness-logout", user, harness] => op("DELETE", &format!("{}/harness-logins/{}", login_base(user), encode(harness)), None),
+        ["machine", "legacy"] => op("GET", "/api/machines/legacy", None),
+        ["machine", "rebuild", rest @ ..] => {
+            let (method, path, body) = rebuild_request(rest)?;
+            op(method, &path, body)
+        }
         ["machine", rest @ ..] => {
             let (method, path) = machine_request(rest)?;
             let res = op(method, &path, None)?;
@@ -1093,6 +1113,16 @@ mod tests {
         assert_eq!(machine_request(&["removals", "held"]).unwrap(), ("GET", "/api/machines/teammate-removals?state=held".into()));
         assert!(machine_request(&["removals", "soon"]).is_err());
         assert!(machine_request(&["teammates", "u1", "remove"]).is_err());
+        assert_eq!(rebuild_request(&["a@example.com"]).unwrap(), ("POST", "/api/users/a%40example.com/machine/rebuild".into(), None));
+        assert_eq!(
+            rebuild_request(&["u1", "--discard-work"]).unwrap(),
+            ("POST", "/api/users/u1/machine/rebuild".into(), Some(r#"{"discardWork":true}"#.into()))
+        );
+        assert_eq!(rebuild_request(&["u1", "status"]).unwrap(), ("GET", "/api/users/u1/machine/rebuild".into(), None));
+        assert_eq!(rebuild_request(&["u1", "cancel"]).unwrap(), ("DELETE", "/api/users/u1/machine/rebuild".into(), None));
+        assert!(rebuild_request(&[]).is_err());
+        assert!(rebuild_request(&["--discard-work"]).is_err());
+        assert!(rebuild_request(&["u1", "--discard"]).is_err());
         assert_eq!(login_base("me"), "/api/machine");
         assert_eq!(login_base("a@example.com"), "/api/users/a%40example.com/machine");
     }

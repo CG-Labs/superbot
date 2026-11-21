@@ -138,6 +138,14 @@ fn save(app: &App, machine_id: &str, s: &Status) {
     app.db.set_setting(&format!("{KEY}{machine_id}"), &serde_json::to_string(s).unwrap_or_default());
 }
 
+/// The machine's disks were wiped (ADR 0056): no copy there counts any more, so the
+/// next assignment or rebuild copies the folder afresh.
+pub fn forget(app: &App, machine_id: &str) {
+    if load(app, machine_id).is_some() {
+        app.db.set_setting(&format!("{KEY}{machine_id}"), "");
+    }
+}
+
 /// Why a copy failed, in a word for the audit log, and what happened.
 #[derive(Debug)]
 pub struct Failed {

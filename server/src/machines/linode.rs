@@ -4,7 +4,7 @@
 
 use super::provider::{
     CreateSpec, FirewallDevices, FirewallRule, Fut, MachineProvider, ProviderError, ProviderFirewall,
-    ProviderMachine,
+    ProviderMachine, RebuildSpec,
 };
 use base64::Engine;
 use reqwest::{Method, StatusCode};
@@ -402,6 +402,29 @@ impl MachineProvider for Linode {
                 Ok(_) | Err(ProviderError::NotFound) => Ok(()),
                 Err(e) => Err(e),
             }
+        })
+    }
+
+    fn rebuild<'a>(&'a self, id: &'a str, spec: &'a RebuildSpec) -> Fut<'a, ()> {
+        Box::pin(async move {
+            let pass = root_pass();
+            let mut body = json!({
+                "image": spec.image,
+                "root_pass": pass.as_str(),
+                "booted": true,
+                "metadata": { "user_data": base64::engine::general_purpose::STANDARD.encode(&spec.user_data) },
+            });
+            if !spec.authorized_keys.is_empty() {
+                body["authorized_keys"] = json!(spec.authorized_keys);
+            }
+            self.call(
+                Method::POST,
+                &format!("/linode/instances/{}/rebuild", path_id(id)?),
+                None,
+                Some(&body),
+            )
+            .await
+            .map(drop)
         })
     }
 
@@ -1059,5 +1082,34 @@ mod tests {
             seen[3].3,
             json!({ "type": "g6-standard-2", "allow_auto_disk_resize": true, "migration_type": "cold" })
         );
+    }
+
+    #[tokio::test]
+    async fn rebuild_sends_user_data_and_a_fresh_root_password() {
+        let (api, seen) = fake_api().await;
+        let spec = RebuildSpec {
+            image: "linode/ubuntu24.04".into(),
+            authorized_keys: vec!["ssh-ed25519 AAAA operator".into()],
+            user_data: "#cloud-config\nsecret-token".into(),
+        };
+        assert!(!format!("{spec:?}").contains("secret-token"), "the token never reaches a log");
+        api.rebuild("7", &spec).await.unwrap();
+        api.rebuild("7", &spec).await.unwrap();
+        assert_eq!(api.rebuild("8", &spec).await, Err(ProviderError::RateLimited));
+        assert!(matches!(api.rebuild("9", &spec).await, Err(ProviderError::Api { status: 400, .. })));
+        assert!(api.rebuild("../7", &spec).await.is_err(), "ids are checked before they reach a path");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].1, "/linode/instances/7/rebuild");
+        let b = &seen[0].3;
+        assert_eq!(b["image"], "linode/ubuntu24.04");
+        assert_eq!(b["booted"], true);
+        assert_eq!(b["authorized_keys"], json!(["ssh-ed25519 AAAA operator"]));
+        let ud = base64::engine::general_purpose::STANDARD.decode(b["metadata"]["user_data"].as_str().unwrap()).unwrap();
+        assert_eq!(ud, b"#cloud-config\nsecret-token");
+        let pass = b["root_pass"].as_str().unwrap();
+        assert!(pass.len() >= 32);
+        assert_ne!(seen[1].3["root_pass"].as_str().unwrap(), pass, "a new root password each time");
+        assert_eq!(seen.len(), 4);
     }
 }

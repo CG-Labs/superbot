@@ -592,6 +592,25 @@ pub struct Machine {
     pub upgrade_by: Option<String>,
     /// A build that failed to upgrade it, so it isn't tried again by itself.
     pub upgrade_failed_build: Option<String>,
+    /// Its latest rebuild with today's agent (ADR 0056): `queued`, `retrying`,
+    /// `rebuilding`, `done`, `failed` or `cancelled`. None: never asked.
+    pub rebuild_state: Option<String>,
+    pub rebuild_id: Option<String>,
+    /// `auto` or the admin who asked.
+    pub rebuild_by: Option<String>,
+    /// The admin accepted that files only on the machine are lost.
+    pub rebuild_discard: bool,
+    /// Rebuilds sent and checks that failed, for the backoff and the limit.
+    pub rebuild_attempts: i64,
+    /// Not tried again before this.
+    pub rebuild_next_at: Option<i64>,
+    pub rebuild_requested_at: Option<i64>,
+    /// When it entered its state, and when the last rebuild was sent.
+    pub rebuild_at: Option<i64>,
+    pub rebuild_sent_at: Option<i64>,
+    pub rebuild_error: Option<String>,
+    /// Its agent's version when the rebuild was asked for.
+    pub rebuild_from: Option<String>,
 }
 
 /// A certificate the control plane issued a machine (ADR 0031). Looked up by
@@ -737,6 +756,17 @@ fn machine_row(r: &Row) -> rusqlite::Result<Machine> {
         upgrade_sent_at: r.get("upgrade_sent_at")?,
         upgrade_by: r.get("upgrade_by")?,
         upgrade_failed_build: r.get("upgrade_failed_build")?,
+        rebuild_state: r.get("rebuild_state")?,
+        rebuild_id: r.get("rebuild_id")?,
+        rebuild_by: r.get("rebuild_by")?,
+        rebuild_discard: r.get("rebuild_discard")?,
+        rebuild_attempts: r.get("rebuild_attempts")?,
+        rebuild_next_at: r.get("rebuild_next_at")?,
+        rebuild_requested_at: r.get("rebuild_requested_at")?,
+        rebuild_at: r.get("rebuild_at")?,
+        rebuild_sent_at: r.get("rebuild_sent_at")?,
+        rebuild_error: r.get("rebuild_error")?,
+        rebuild_from: r.get("rebuild_from")?,
     })
 }
 
@@ -1109,7 +1139,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 24] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 25] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1134,7 +1164,30 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 24] = [
     migrate_teammate_cleanups,
     migrate_bot_prompts,
     migrate_sandbox,
+    migrate_machine_rebuild,
 ];
+
+/// Rebuilding machines enrolled before ADR 0039 with today's agent (ADR 0056).
+fn migrate_machine_rebuild(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'rebuild_state'", [], |r| r.get(0))?;
+    if has {
+        return Ok(());
+    }
+    c.execute_batch(
+        "ALTER TABLE machines ADD COLUMN rebuild_state TEXT
+           CHECK (rebuild_state IN ('queued', 'retrying', 'rebuilding', 'done', 'failed', 'cancelled'));
+        ALTER TABLE machines ADD COLUMN rebuild_id TEXT;
+        ALTER TABLE machines ADD COLUMN rebuild_by TEXT;
+        ALTER TABLE machines ADD COLUMN rebuild_discard INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE machines ADD COLUMN rebuild_attempts INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE machines ADD COLUMN rebuild_next_at INTEGER;
+        ALTER TABLE machines ADD COLUMN rebuild_requested_at INTEGER;
+        ALTER TABLE machines ADD COLUMN rebuild_at INTEGER;
+        ALTER TABLE machines ADD COLUMN rebuild_sent_at INTEGER;
+        ALTER TABLE machines ADD COLUMN rebuild_error TEXT;
+        ALTER TABLE machines ADD COLUMN rebuild_from TEXT;",
+    )
+}
 
 /// Harness sandboxes (ADR 0055). New installs have them on (`Policy::new`); an install
 /// upgrading keeps running without, as before, until an admin turns them on. Bots'
@@ -4126,6 +4179,108 @@ impl Db {
             )
             .unwrap_or(0)
             == 1
+    }
+
+    // Rebuilds (ADR 0056). Each step names the rebuild and the states it may come
+    // from, so a stale step, or one racing an admin's cancel, changes nothing.
+
+    /// Queues rebuild `id`, unless the machine isn't running, its agent is held, or a
+    /// rebuild is underway. Returns whether this one is queued.
+    pub fn machine_rebuild_queue(&self, machine_id: &str, id: &str, by: &str, discard: bool, from: Option<&str>) -> bool {
+        let at = now();
+        self.c()
+            .execute(
+                "UPDATE machines SET rebuild_state = 'queued', rebuild_id = ?1, rebuild_by = ?2, rebuild_discard = ?3, rebuild_attempts = 0,
+                 rebuild_next_at = ?4, rebuild_requested_at = ?4, rebuild_at = ?4, rebuild_sent_at = NULL, rebuild_error = NULL, rebuild_from = ?5
+                 WHERE id = ?6 AND state = 'running' AND upgrade_hold_at IS NULL
+                 AND (rebuild_state IS NULL OR rebuild_state IN ('done', 'failed', 'cancelled'))",
+                params![id, by, discard, at, from, machine_id],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Moves rebuild `id` from one of `from` to `to`. `attempt` counts one more try;
+    /// `next_at` is when to try next. Returns whether it was in `from`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn machine_rebuild_move(
+        &self,
+        machine_id: &str,
+        id: &str,
+        from: &[&str],
+        to: &str,
+        attempt: bool,
+        next_at: Option<i64>,
+        error: Option<&str>,
+    ) -> bool {
+        let states = from.iter().map(|s| format!("'{}'", s.replace('\'', ""))).collect::<Vec<_>>().join(", ");
+        self.c()
+            .execute(
+                &format!(
+                    "UPDATE machines SET rebuild_state = ?1, rebuild_attempts = rebuild_attempts + ?2, rebuild_next_at = ?3, rebuild_error = ?4,
+                     rebuild_at = CASE WHEN rebuild_state = ?1 THEN rebuild_at ELSE ?5 END
+                     WHERE id = ?6 AND rebuild_id = ?7 AND rebuild_state IN ({states})"
+                ),
+                params![to, attempt as i64, next_at, error, now(), machine_id, id],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Records rebuild `id` as sent now, from one of `from`. Returns whether it was there.
+    pub fn machine_rebuild_sending(&self, machine_id: &str, id: &str, from: &[&str]) -> bool {
+        let at = now();
+        if !self.machine_rebuild_move(machine_id, id, from, "rebuilding", true, None, None) {
+            return false;
+        }
+        let _ = self.c().execute("UPDATE machines SET rebuild_sent_at = ?, rebuild_at = ? WHERE id = ?", params![at, at, machine_id]);
+        true
+    }
+
+    /// Forgets what the old agent said and was sent: a rebuilt machine starts afresh.
+    pub fn machine_rebuilt_reset(&self, machine_id: &str) {
+        let _ = self.c().execute(
+            "UPDATE machines SET agent_upkeep = NULL, harnesses_sent_at = NULL, harnesses_sent_plan = NULL, upgrade_id = NULL,
+             upgrade_build = NULL, upgrade_sent_at = NULL, upgrade_by = NULL, upgrade_failed_build = NULL WHERE id = ?",
+            [machine_id],
+        );
+    }
+
+    /// Whether files that exist only on the machine may be lost if it is wiped: it is
+    /// assigned, or ever was, or a Bot ever ran there (from the audit log).
+    pub fn machine_may_hold_work(&self, machine_id: &str) -> bool {
+        self.c()
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM machines WHERE id = ?1 AND assigned_at IS NOT NULL)
+                 OR EXISTS (SELECT 1 FROM audit_events WHERE action = 'placement.assigned' AND target_type = 'machine' AND target_id = ?1)
+                 OR EXISTS (SELECT 1 FROM audit_events WHERE action = 'bot.run_routed' AND json_extract(details, '$.machine') = ?1)",
+                [machine_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(true)
+    }
+
+    #[cfg(test)]
+    pub fn machine_tokens_unused(&self, machine_id: &str) -> i64 {
+        self.c()
+            .query_row("SELECT COUNT(*) FROM machine_tokens WHERE machine_id = ? AND used_at IS NULL AND revoked_at IS NULL", [machine_id], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[cfg(test)]
+    pub fn machine_rebuild_due_now(&self, machine_id: &str) {
+        self.c().execute("UPDATE machines SET rebuild_next_at = ? WHERE id = ?", params![now() - 1, machine_id]).unwrap();
+    }
+
+    #[cfg(test)]
+    pub fn machine_rebuild_backdate(&self, machine_id: &str, ms: i64) {
+        self.c()
+            .execute(
+                "UPDATE machines SET rebuild_sent_at = rebuild_sent_at - ?1, rebuild_at = rebuild_at - ?1, enroll_by = enroll_by - ?1,
+                 enrolled_at = enrolled_at - ?1 WHERE id = ?2",
+                params![ms, machine_id],
+            )
+            .unwrap();
     }
 
     #[cfg(test)]

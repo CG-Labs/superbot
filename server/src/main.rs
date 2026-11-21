@@ -45,6 +45,8 @@ mod machines_logins_tests;
 #[cfg(test)]
 mod machines_upkeep_tests;
 #[cfg(test)]
+mod machines_rebuild_tests;
+#[cfg(test)]
 mod machines_screens_tests;
 #[cfg(test)]
 mod machines_teammates_tests;
@@ -531,6 +533,10 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/machine/agent", get(machines::upkeep::get))
         .route("/users/{key}/machine/agent/upgrade", post(machines::upkeep::upgrade_now))
         .route("/users/{key}/machine/agent/hold", put(machines::upkeep::hold).delete(machines::upkeep::release))
+        .route(
+            "/users/{key}/machine/rebuild",
+            get(machines::rebuild::get).post(machines::rebuild::request).delete(machines::rebuild::cancel_now),
+        )
         .route("/users/{key}/machine/harnesses", post(machines::upkeep::harnesses_now))
         .route("/users/{key}/machine/bot-user", post(machines::botuser::now_for))
         .route("/users/{key}/machine/screens", get(machines::screens::list))
@@ -546,6 +552,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/placement", get(machines::placement).put(machines::assign).delete(machines::unassign))
         .route("/machines", get(machines::list_all))
         .route("/machines/placements", get(machines::placements))
+        .route("/machines/legacy", get(machines::rebuild::legacy_list))
         .route("/machines/reconcile", post(machines::reconcile_now))
         .route("/machines/teammate-removals", get(machines::offboard::list_all))
         .route("/machine", get(machines::mine))
