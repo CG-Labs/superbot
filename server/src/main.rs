@@ -346,9 +346,10 @@ async fn main() {
     for t in app.db.assigned_tiers().into_iter().filter(|t| app.tiers().get(t).is_none()) {
         eprintln!("WARNING: some users have tier \"{t}\", which TIERS_FILE no longer lists. They get the default tier ({}) until an admin picks another.", app.tiers().default_tier().name);
     }
-    let saved: Vec<String> = secrets::global().list().map(|l| l.into_iter().map(|s| s.name).collect()).unwrap_or_default();
-    for p in app.tiers().providers().iter().filter(|p| !saved.contains(&p.key_secret)) {
-        eprintln!("WARNING: TIERS_FILE provider \"{}\" uses the secret {}, which isn't saved. Runs routed to it are refused until it is: botctl secret set {}", p.name, p.key_secret, p.key_secret);
+    adapters::withhold(app.tiers().providers().iter().map(|p| p.key_secret.clone()));
+    let saved = |k: &str| secrets::global().get(k).ok().flatten().is_some_and(|v| !v.expose().trim().is_empty());
+    for p in app.tiers().providers().iter().filter(|p| !saved(&p.key_secret)) {
+        eprintln!("WARNING: TIERS_FILE provider \"{}\" uses the secret {}, which isn't saved or set in botd's environment. Runs routed to it are refused until it is: botctl secret set {}", p.name, p.key_secret, p.key_secret);
     }
     secrets::redact::register(env("LICENSE_KEY", "").trim());
     app.license.set_testing(testing);

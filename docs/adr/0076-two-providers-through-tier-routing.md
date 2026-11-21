@@ -41,7 +41,7 @@ What Hermes v0.23.3 offers, read from its source:
 - A route's **`fallback`** lists up to 3 `{provider, model}` to try in order, each a file endpoint or a built-in.
 - botd refuses to start on a mistake:
   - a name that isn't a slug;
-  - a URL that isn't http(s), is over 200 characters, or carries a user or password;
+  - a URL that doesn't parse as http(s) with a host, is over 200 characters, or carries a user, password, query or fragment;
   - a key secret name that isn't valid, or is one of botd's own secrets, which it keeps from every harness;
   - a provider or fallback on a harness that doesn't take one (only Hermes does);
   - more than 3 fallbacks, a fallback listed twice, or a fallback that is the route itself.
@@ -54,6 +54,7 @@ Before each run, botd works out what the route needs (`Tiers::wiring`):
 - **The route's own provider.** If it is a file endpoint whose key isn't saved, the run is refused before it starts, and before it counts against any limit. The Bot says the plan's model provider isn't set up yet and to ask an admin. `bot.run_refused` is audited with reason `provider_key_missing`, the provider, and the key's name.
 - **Fallbacks.** One whose key isn't saved is left out, and `harness.invoked` lists it as `fallbackSkipped`. The rest are in `fallback`.
 - **Other keys.** The keys of the file's endpoints that this route doesn't use are left out of the run. Each key goes only to runs routed to its endpoint.
+- **Where keys live.** A key is a saved secret or a variable in botd's own environment (`.env`), like other secrets. Either way, nothing botd starts inherits a tier endpoint's key, or its `_FILE`, from botd. A run routed to the endpoint is handed the key explicitly, and Hermes's `env_passthrough` never lists one.
 
 The Hermes adapter turns that into its managed config and arguments:
 
@@ -101,7 +102,7 @@ botd's rules on top:
 - **End to end with the real Hermes** (`hermes_routes_two_providers` in `server/tests/harness_e2e.rs`, run by the `harness-e2e` workflow's Hermes job). The real `botd` runs Hermes at the pin against two fake providers: one speaks Anthropic Messages, the other OpenAI Chat Completions. Each records the key of every call, tags its replies, and can fail on demand. No real key or paid service is used. Two tiers route to one provider each; one falls back to the other. The test checks:
   1. With no keys saved, a run is refused before it starts (`provider_key_missing`), and no provider is called.
   2. On the Anthropic tier, Hermes reaches only that provider, with its key. The agent's shell sees neither the saved key's name nor Hermes's.
-  3. After the owner moves to the OpenAI tier, the same Bot reaches only the OpenAI provider, with its own key, in a fresh session.
+  3. After the owner moves to the OpenAI tier, the same Bot reaches only the OpenAI provider, with its own key, in a fresh session. That key is set in botd's environment, not saved, and in step 2 the agent didn't see it either.
   4. With that provider failing (402), the run falls back to the Anthropic provider, with that provider's key.
   5. With both failing, the run ends in an error, and no other model is called.
 
@@ -122,7 +123,7 @@ On a 4-vCPU cloud VM, Hermes Agent v0.23.3 from the pin:
 The test found three problems before it passed, all fixed here:
 
 - Hermes needed its Anthropic extra.
-- The route's key reached the agent's shell under its saved name.
+- The route's key reached the agent's shell under its saved name. Review then found the same for a key set in botd's environment, which local runs inherited, and that such a key counted as missing. The test now sets one key that way.
 - Hermes ignored the fallback chain for a Bot with no `config.yaml` of its own.
 
 ## Known limits
@@ -144,4 +145,4 @@ The test found three problems before it passed, all fixed here:
   Hermes is cleared to be the managed default. New Bots on a managed tier already take its first route's harness, and the shipped tiers put Hermes first on every managed plan.
 - **Not done here.** Installing Hermes by default in the installer, the Compose image, and `MACHINE_HARNESSES` for managed machines is the next step of that rollout.
 - **Fallback is opt-in per route.** A route with no `fallback` fails as before, and an open tier keeps Hermes's own settings.
-- **Keys go only where routed.** A tier endpoint's key is a secret like any other, saved with `botctl secret set`. It goes only to runs routed to its endpoint.
+- **Keys go only where routed.** A tier endpoint's key is a secret like any other, saved with `botctl secret set` or set in `.env`. It goes only to runs routed to its endpoint.

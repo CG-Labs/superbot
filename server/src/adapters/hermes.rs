@@ -66,8 +66,8 @@ fn quote(s: &str) -> String {
 /// Tools only see secret-looking variables listed in `env_passthrough`, so every
 /// variable SuperBot sets for the run (BOT_TOKEN, saved secrets) is listed, plus
 /// `secret_names`: secrets Bots get by inheriting botd's env, which aren't in
-/// `input.env`. Hermes itself refuses its provider keys there, and botd leaves out the
-/// keys of the tier's endpoints. botd owns memory and routines.
+/// `input.env`. Hermes itself refuses its provider keys there, and botd leaves out
+/// every tier endpoint's key (`withheld`). botd owns memory and routines.
 ///
 /// A tier's endpoints become `providers:` entries, with every field Hermes reads an
 /// endpoint's URL, key, or switch from set, so the Bot's own `config.yaml` can't point
@@ -75,7 +75,7 @@ fn quote(s: &str) -> String {
 /// legacy `fallback_model` is emptied, since Hermes chains both, and subagents can't
 /// pick their own provider (ADR 0076).
 fn managed_config(input: &RunInput, secret_names: &[String]) -> Value {
-    let inherited = secret_names.iter().filter(|n| crate::secrets::check_name(n).is_ok());
+    let inherited = secret_names.iter().filter(|n| crate::secrets::check_name(n).is_ok() && !super::withheld(n));
     let keys: Vec<&str> = input.endpoints.iter().map(|e| e.key_secret.as_str()).collect();
     let mut passthrough: Vec<&String> = input.env.keys().chain(inherited).filter(|n| !keys.contains(&n.as_str())).collect();
     passthrough.sort();
@@ -458,7 +458,9 @@ mod tests {
         assert_eq!(job.env.get("HERMES_PROVIDER_SUPERBOT_GPT_API_KEY").map(String::as_str), Some("sk-o"));
         assert!(!job.env.contains_key("TIER_OPENAI_KEY") && !job.env.contains_key("HERMES_PROVIDER_SUPERBOT_CLAUDE_API_KEY"), "{:?}", job.env.keys());
 
-        let c = managed_config(&i, &["TIER_ANTHROPIC_KEY".to_string(), "NPM_TOKEN".to_string()]);
+        // Another tier endpoint's key, set in botd's environment: withheld, so never listed.
+        super::super::withhold(["TIER_OTHER_KEY".to_string()]);
+        let c = managed_config(&i, &["TIER_ANTHROPIC_KEY".to_string(), "NPM_TOKEN".to_string(), "TIER_OTHER_KEY".to_string()]);
         let (url, key) = ("https://claude.example/v1", "HERMES_PROVIDER_SUPERBOT_CLAUDE_API_KEY");
         assert_eq!(
             c["providers"]["superbot-claude"],

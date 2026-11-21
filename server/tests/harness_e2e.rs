@@ -272,7 +272,8 @@ fn hermes_two_providers() {
     });
     let file = std::env::temp_dir().join(format!("superbot-e2e-tiers-{}-{}.json", std::process::id(), free_port()));
     std::fs::write(&file, tiers.to_string()).unwrap();
-    let b = start_with("hermes", None, &[("TIERS_FILE", file.to_str().unwrap())]);
+    // One key saved later; the other set in botd's own environment, as `.env` would.
+    let b = start_with("hermes", None, &[("TIERS_FILE", file.to_str().unwrap()), ("E2E_GPT_KEY", "e2e-gpt-key")]);
     let _ = std::fs::remove_file(&file);
     let bot = call(&b, "GET", "/api/bots", Value::Null)[0].clone();
     let (id, owner) = (bot["id"].as_str().unwrap().to_string(), bot["owner"]["id"].as_str().unwrap().to_string());
@@ -301,11 +302,10 @@ fn hermes_two_providers() {
     assert!(audit(&b, "harness.invoked").is_empty() && n(&claude) + n(&gpt) + n(server) == 0);
     pass("a route whose provider key isn't saved is refused before it runs");
 
-    for (name, key) in [("E2E_CLAUDE_KEY", "e2e-claude-key"), ("E2E_GPT_KEY", "e2e-gpt-key")] {
-        call(&b, "PUT", &format!("/api/secrets/{name}"), json!({ "value": key }));
-    }
+    call(&b, "PUT", "/api/secrets/E2E_CLAUDE_KEY", json!({ "value": "e2e-claude-key" }));
 
-    // The Anthropic-compatible tier: its provider, with its key, and no key in the shell.
+    // The Anthropic-compatible tier: its provider, with its key, and no key in the shell,
+    // not even the other endpoint's, which Hermes would otherwise inherit from botd.
     let r = run(&b, &id, &ask, None, &|| {});
     assert!(r.text.contains(&format!("[claude-api] {DONE}")) && r.text.contains(hidden), "hermes on claude-plan (result {}): {}", r.result, r.text);
     assert!(!claude.keys().is_empty() && claude.keys().iter().all(|k| k == "e2e-claude-key"), "{:?}", claude.keys());
@@ -317,9 +317,11 @@ fn hermes_two_providers() {
     assert!(c["providers"].get("superbot-gpt-api").is_none(), "{c}");
     assert_eq!((&c["fallback_providers"], &c["fallback_model"]), (&json!([]), &json!([])));
     assert!(!c["terminal"]["env_passthrough"].as_array().unwrap().contains(&json!("E2E_CLAUDE_KEY")), "{c}");
+    assert!(!c["terminal"]["env_passthrough"].as_array().unwrap().contains(&json!("E2E_GPT_KEY")), "{c}");
     pass("an Anthropic Messages tier reaches only its provider, with its own key");
 
-    // The OpenAI-compatible tier, for the same Bot once its owner moves to it.
+    // The OpenAI-compatible tier, for the same Bot once its owner moves to it: its key,
+    // from botd's environment, counts as set up.
     call(&b, "PATCH", &format!("/api/users/{owner}"), json!({ "tier": "gpt-plan" }));
     let before = n(&claude);
     let r = run(&b, &id, &ask, None, &|| {});

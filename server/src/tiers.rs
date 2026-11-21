@@ -229,11 +229,17 @@ fn endpoint(name: &str, e: EndpointCfg) -> Result<Endpoint, String> {
         return Err(at("names are up to 32 lowercase letters, digits, and dashes".into()));
     }
     let url = e.base_url.trim().trim_end_matches('/').to_string();
-    let host = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")).unwrap_or_default();
-    let host = host.split(['/', '?', '#']).next().unwrap_or_default();
-    let ok = url.len() <= 200 && !host.is_empty() && !host.contains('@') && !url.chars().any(|c| c.is_whitespace() || c.is_control());
+    let parsed = url::Url::parse(&url).ok().filter(|u| {
+        matches!(u.scheme(), "http" | "https")
+            && u.host_str().is_some_and(|h| !h.is_empty())
+            && u.username().is_empty()
+            && u.password().is_none()
+            && u.query().is_none()
+            && u.fragment().is_none()
+    });
+    let ok = parsed.is_some() && url.len() <= 200 && !url.chars().any(|c| c.is_whitespace() || c.is_control());
     if !ok {
-        return Err(at(format!("baseUrl \"{url}\" must be an http(s) URL of up to 200 characters, without a user or password")));
+        return Err(at(format!("baseUrl \"{url}\" must be an http(s) URL with a host, of up to 200 characters, without a user, password, query or fragment")));
     }
     let key = e.key_secret.trim().to_string();
     crate::secrets::check_name(&key).map_err(|e| at(format!("keySecret: {e}")))?;
@@ -750,7 +756,7 @@ mod tests {
         let provider = |p: &str| bad(format!(r#"{{"providers":{{{p}}},"tiers":[{{"name":"a","routes":"any"}}]}}"#));
         let endpoint = |name: &str, url: &str, key: &str| provider(&format!(r#""{name}":{{"protocol":"openai-chat","baseUrl":"{url}","keySecret":"{key}"}}"#));
         assert!(endpoint("Gpt", "https://x.example", "K").contains("lowercase"));
-        for url in ["ftp://x.example", "https://", "https://me:pw@x.example", "https://x.example/a b", "x.example"] {
+        for url in ["ftp://x.example", "https://", "https://:443", "https://me:pw@x.example", "https://x.example/a b", "x.example", "https://x.example/v1?k=1", "https://x.example/#f"] {
             assert!(endpoint("p", url, "K").contains("baseUrl"), "{url}");
         }
         assert!(endpoint("p", &format!("https://x.example/{}", "a".repeat(200)), "K").contains("baseUrl"));

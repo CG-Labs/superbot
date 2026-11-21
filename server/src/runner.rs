@@ -907,7 +907,16 @@ impl App {
                 self.seed_teammate_memory(&bot, &spot.memory);
             }
             let mut env = spot.env.clone();
+            // Nothing botd starts inherits a tier endpoint's key, so a run routed to one
+            // is given it, and only it.
+            crate::adapters::withhold(self.tiers().providers().iter().map(|p| p.key_secret.clone()));
             env.retain(|k, _| !wiring.unused_keys.contains(k));
+            for e in &wiring.endpoints {
+                if let Some(v) = tier_key(&env, &e.key_secret) {
+                    crate::secrets::redact::register(&v);
+                    env.insert(e.key_secret.clone(), v);
+                }
+            }
             env.insert("SUPERBOT_RUN_ID".into(), run_id.clone());
             if spot.screens
                 && spot.machine.is_none()
@@ -1651,7 +1660,7 @@ impl App {
     /// model, never the Bot's settings alone (ADR 0033). The run is counted for the
     /// owner, within the tier's runs and tokens a billing period (ADR 0050). A route
     /// whose provider is one of the tiers file's endpoints needs that endpoint's key
-    /// among the run's secrets, `env` (ADR 0076). None: refused, and the Bot said why.
+    /// (`tier_key`, ADR 0076). None: refused, and the Bot said why.
     fn tier_route(&self, bot: &Bot, msg: &Message, by: &Who, period: &usage::Period, env: &HashMap<String, String>) -> Option<(String, Route, Wiring)> {
         let tier = self.tier_of(&bot.owner_id);
         let refused = |reason: &str, text: String, limit: Option<u64>, used: Option<u64>, more: Value| {
@@ -1679,7 +1688,7 @@ impl App {
             Ok(r) => r,
             Err(e) => return refused("tier_harness", format!("{e} Switch me to one of those in my settings."), None, None, Value::Null),
         };
-        let has_key = |k: &str| env.get(k).is_some_and(|v| !v.trim().is_empty());
+        let has_key = |k: &str| tier_key(env, k).is_some();
         let wiring = match self.tiers().wiring(&route, tier.managed(), has_key) {
             Ok(w) => w,
             Err(e) => {
@@ -2188,6 +2197,17 @@ fn merge(v: &mut Value, extra: &Value) {
     if let (Some(v), Some(x)) = (v.as_object_mut(), extra.as_object()) {
         v.extend(x.iter().map(|(k, x)| (k.clone(), x.clone())));
     }
+}
+
+/// A tier endpoint's key: the run's own secret of that name (its owner's, say), else
+/// the server's, wherever it is kept, `.env` included. Local runs don't get secrets
+/// from `.env` in `env`, since they would inherit them, but nothing inherits these.
+fn tier_key(env: &HashMap<String, String>, name: &str) -> Option<String> {
+    let set = |v: &String| !v.trim().is_empty();
+    env.get(name).filter(|v| set(v)).cloned().or_else(|| {
+        let v = crate::secrets::global().get(name).ok().flatten()?.expose().to_string();
+        set(&v).then_some(v)
+    })
 }
 
 #[cfg(test)]
