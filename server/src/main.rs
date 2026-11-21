@@ -39,6 +39,8 @@ mod machines_bot_user_tests;
 #[cfg(test)]
 mod machines_http_tests;
 #[cfg(test)]
+mod machines_incus_tests;
+#[cfg(test)]
 mod machines_lockdown_tests;
 #[cfg(test)]
 mod machines_mtls_tests;
@@ -576,6 +578,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/placement", get(machines::placement).put(machines::assign).delete(machines::unassign))
         .route("/machines", get(machines::list_all))
         .route("/machines/placements", get(machines::placements))
+        .route("/machines/substrate", get(machines::substrate))
         .route("/machines/legacy", get(machines::rebuild::legacy_list))
         .route("/machines/reconcile", post(machines::reconcile_now))
         .route("/machines/teammate-removals", get(machines::offboard::list_all))

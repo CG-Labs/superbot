@@ -134,9 +134,10 @@ pub fn server_secret(name: &str) -> bool {
 }
 
 /// The Turnstile secret (ADR 0022), the Linode token, which can rent and delete every
-/// user's machine (ADR 0025), and the notifier's SMTP password, webhook URL, and webhook
-/// signing key (ADR 0061).
-pub const SERVER_SECRETS: [&str; 5] = ["TURNSTILE_SECRET", "LINODE_TOKEN", "SMTP_PASSWORD", "NOTIFY_WEBHOOK_URL", "NOTIFY_WEBHOOK_SECRET"];
+/// user's machine (ADR 0025), botd's Incus client key, which can do the same to every
+/// container and administers the Incus host (ADR 0064), and the notifier's SMTP
+/// password, webhook URL, and webhook signing key (ADR 0061).
+pub const SERVER_SECRETS: [&str; 6] = ["TURNSTILE_SECRET", "LINODE_TOKEN", "INCUS_CLIENT_KEY", "SMTP_PASSWORD", "NOTIFY_WEBHOOK_URL", "NOTIFY_WEBHOOK_SECRET"];
 
 /// Each Bot's own notification webhook URL: `NOTIFY_WEBHOOK_URL_BOT_<ID>` (ADR 0061).
 pub const BOT_WEBHOOK_PREFIX: &str = "NOTIFY_WEBHOOK_URL_BOT_";
@@ -487,7 +488,7 @@ mod tests {
         assert_eq!(redact::text_for(&["ub"], "deploy to b-gh-value"), "deploy to [redacted]");
         assert_eq!(redact::text(&a), a.as_str(), "not from everyone's: any member can save any value");
         assert_eq!(redact::text_for(&["ub"], &a), a.as_str());
-        for bad in ["PATH", "BOT_TOKEN", "SSO_X_CLIENT_SECRET", "LINODE_TOKEN", "TURNSTILE_SECRET", "SMTP_PASSWORD", "NOTIFY_WEBHOOK_URL", "NOTIFY_WEBHOOK_URL_BOT_A1B2C3D4", "lower"] {
+        for bad in ["PATH", "BOT_TOKEN", "SSO_X_CLIENT_SECRET", "LINODE_TOKEN", "INCUS_CLIENT_KEY", "TURNSTILE_SECRET", "SMTP_PASSWORD", "NOTIFY_WEBHOOK_URL", "NOTIFY_WEBHOOK_URL_BOT_A1B2C3D4", "lower"] {
             assert!(matches!(s.user_put("ua", bad, "v"), Err(Error::Invalid(_))), "{bad}");
         }
         assert!(s.list().unwrap().iter().all(|l| l.name != "ANTHROPIC_API_KEY"), "not in the server-wide list");
