@@ -96,8 +96,11 @@ botctl machine reconcile
 botctl machine show <user>        # state running, enrollment enrolled, agentSeenAt set
 ```
 
+Once it has enrolled, the next reconcile removes its enrollment user data from the container's config ([ADR 0067](../adr/0067-clearing-enrollment-data-from-containers.md)). It does this in place, without restarting the container, and turns on daily snapshots only after that. `incus config show <name> --project superbot` should then show no `cloud-init.user-data`, and the audit log has `machine.user_data_cleared`. If the container misses its enrollment deadline while running, the user data is removed too. A `machine.user_data_clear_failed` event says why it couldn't be removed, and the next pass tries again.
+
 ## Limits to know
 
 - Containers share the host's kernel. A kernel escape crosses every boundary. Use VMs for tiers that need their own kernel.
 - Snapshots (daily, kept 7 days) stay on the same pool. They don't protect against losing the host.
+- A container's config holds its live enrollment token from its create (or rebuild) until it enrolls or misses its deadline. Anyone who can read the Incus project can read it during that window. A container that never starts keeps it in its config, but the token expires an hour after it was issued.
 - Switching `MACHINE_PROVIDER` leaves machines made by the other provider as they are. botd reaches their agents but won't change them until you switch back.
