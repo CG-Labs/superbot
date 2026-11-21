@@ -22,6 +22,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -312,8 +313,7 @@ struct Botd {
 
 impl Drop for Botd {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        stop(&mut self.child, &self.dir);
         if std::thread::panicking() {
             eprintln!("--- botd log ({}) ---\n{}", self.dir.display(), tail(&read(&self.dir.join("botd.log")), 80));
             eprintln!("(kept {} for a look)", self.dir.display());
@@ -321,6 +321,71 @@ impl Drop for Botd {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
+}
+
+/// Stops botd as a service manager would, so a test that fails mid-run leaves no agent
+/// running on the operator's login: on TERM botd stops each run's process group and
+/// Hermes's daemon. Whatever is left after that (botd itself, a run's group, a daemon it
+/// had no time to stop) is killed.
+fn stop(child: &mut Child, dir: &Path) {
+    let pid = child.id() as i32;
+    // SAFETY: signals the botd this test started.
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    exit_or_kill(child, Duration::from_secs(20));
+    // botd leads its own session (see `start`); runs get their own groups, not sessions.
+    for p in in_session(pid) {
+        // SAFETY: a process left in the session of the botd this test started.
+        unsafe { libc::kill(p, libc::SIGKILL) };
+    }
+    // Hermes's daemon starts its own session; ask it to stop as botd would.
+    for pidfile in find(dir, "gateway.pid", 8) {
+        let stopping = Command::new("hermes")
+            .args(["gateway", "stop", "--yes"])
+            .env("HERMES_HOME", pidfile.parent().unwrap())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if let Ok(mut c) = stopping {
+            exit_or_kill(&mut c, Duration::from_secs(30));
+        }
+    }
+}
+
+fn exit_or_kill(child: &mut Child, limit: Duration) {
+    let start = Instant::now();
+    while child.try_wait().ok().flatten().is_none() && start.elapsed() < limit {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Processes in session `sid`, from /proc (none where there is no /proc).
+fn in_session(sid: i32) -> Vec<i32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
+    entries
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|pid| {
+            // After the command's closing paren: state, ppid, pgrp, session.
+            let stat = read(&PathBuf::from(format!("/proc/{pid}/stat")));
+            stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(3)?.parse::<i32>().ok()) == Some(sid)
+        })
+        .collect()
+}
+
+/// Files named `name` under `dir`, at most `depth` folders down.
+fn find(dir: &Path, name: &str, depth: usize) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut found = Vec::new();
+    for e in entries.flatten() {
+        let (path, Ok(kind)) = (e.path(), e.file_type()) else { continue };
+        if kind.is_dir() && depth > 0 {
+            found.extend(find(&path, name, depth - 1));
+        } else if kind.is_file() && e.file_name() == name {
+            found.push(path);
+        }
+    }
+    found
 }
 
 fn tail(s: &str, n: usize) -> String {
@@ -394,6 +459,14 @@ fn start(harness: &str) -> Botd {
         Some(m)
     };
     let log = std::fs::File::create(dir.join("botd.log")).unwrap();
+    // Its own session, so `stop` can find what its runs leave behind.
+    // SAFETY: setsid is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
     let child = cmd
         .env("HOST", "127.0.0.1")
         .env("PORT", port.to_string())

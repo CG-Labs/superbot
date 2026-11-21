@@ -31,6 +31,7 @@ repo=$(cd "$here/.." && pwd)
 
 harnesses=""
 mode=real
+caller_path=$PATH
 usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'; exit 2; }
 die() { printf 'harness-e2e: %s\n' "$*" >&2; exit 2; }
 
@@ -57,7 +58,9 @@ while (( $# )); do
   esac
 done
 
-command -v cargo >/dev/null || die "cargo isn't on PATH (run as the user that builds SuperBot)"
+# --env-file may set the PATH the harnesses and the throwaway botd get (a server's .env
+# has no ~/.cargo/bin), so cargo is looked up on the PATH this was started with too.
+cargo=$(PATH="$PATH:$caller_path"; command -v cargo) || die "cargo isn't on PATH (run as the user that builds SuperBot)"
 command -v git >/dev/null || die "git isn't on PATH"
 
 if [[ -z "$harnesses" ]]; then
@@ -76,7 +79,7 @@ for h in ${harnesses//,/ }; do
 done
 
 printf 'Building botd and the test (release)...\n'
-(cd "$repo" && cargo test --release --test harness_e2e --no-run --quiet)
+(cd "$repo" && "$cargo" test --release --test harness_e2e --no-run --quiet)
 
 printf 'Checking %s against the %s model...\n\n' "$harnesses" "$mode"
 log=$(mktemp)
@@ -84,7 +87,7 @@ trap 'rm -f "$log"' EXIT
 status=0
 # One at a time, so each harness's output stays together.
 (cd "$repo" && SUPERBOT_E2E_MODEL=$mode SUPERBOT_E2E_HARNESSES=$harnesses SUPERBOT_E2E_REQUIRE=1 \
-  cargo test --release --test harness_e2e --quiet -- --ignored --nocapture --test-threads=1) 2>&1 | tee "$log" || status=1
+  "$cargo" test --release --test harness_e2e --quiet -- --ignored --nocapture --test-threads=1) 2>&1 | tee "$log" || status=1
 
 printf '\nSummary\n'
 for h in ${harnesses//,/ }; do
