@@ -155,6 +155,8 @@ pub struct App {
     bots: Mutex<HashMap<String, BotState>>,
     /// Bots waiting on `botctl ask` or `botctl handoff`, by the message's id.
     waiters: Mutex<HashMap<i64, oneshot::Sender<String>>>,
+    /// Asks waiting on a Bot: the asked Bot's id, then each asking Bot's (ADR 0073).
+    asks: Mutex<HashMap<String, Vec<String>>>,
     /// Tool calls waiting on the user, by approval id. true = approved.
     pub approval_waiters: Mutex<HashMap<String, crate::approvals::Waiter>>,
     /// Picks where each Bot runs: its owner's machine, or here (ADR 0029). Unset: here.
@@ -207,6 +209,7 @@ impl App {
             screens,
             bots: Mutex::default(),
             waiters: Mutex::default(),
+            asks: Mutex::default(),
             approval_waiters: Mutex::default(),
             control_plane: OnceLock::new(),
             tiers: OnceLock::new(),
@@ -752,7 +755,17 @@ impl App {
         let placed_at = self.db.placed_at(&bot.owner_id);
         let Some(place) = self.place(&bot, msg, &by, &period.key, bin, for_other.as_deref()).await else { return };
         // Held until the run ends, however it ends: dropping it lets the next run in.
-        let Some(_slot) = self.slot_for(&bot, msg, &by, &period.key, &place).await else { return };
+        let Some((_slot, waited)) = self.slot_for(&bot, msg, &by, &period.key, &place).await else { return };
+        // The owner, a routine's author or the asker may have been turned off meanwhile.
+        if waited && let Some((reason, user, text)) = self.refused_after_wait(&bot, msg, &by, for_other.as_deref()) {
+            self.give_back(&bot, msg, &period.key);
+            let e = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied);
+            self.db.record(&e.details(json!({ "reason": reason, "owner": bot.owner_id, "forUser": user, "messageId": msg.id })));
+            if let Some(text) = text {
+                self.say(&bot.id, &text, true);
+            }
+            return;
+        }
         // A teammate's run here gets an account of its own (ADR 0064), never the owner's.
         let teammate = for_other.as_deref().filter(|_| matches!(place, Place::Here) && self.teammate_accounts());
         let run_space = Space::of(&bot.owner_id, teammate);
@@ -1078,16 +1091,15 @@ impl App {
 
     /// A slot on the computer the run happens on (ADR 0073): at once, or once the runs
     /// ahead of it there are done. Waiting is shown on the Bot and audited. None: it was
-    /// stopped or botd shut down while it waited; the run is given back.
-    async fn slot_for(&self, bot: &Bot, msg: &Message, by: &Who, period: &str, place: &Place) -> Option<Slot> {
+    /// stopped or botd shut down while it waited; the run is given back. With the slot:
+    /// whether it waited for it.
+    async fn slot_for(&self, bot: &Bot, msg: &Message, by: &Who, period: &str, place: &Place) -> Option<(Slot, bool)> {
         let (pool, cap, machine) = match place {
             Place::Here => (slots::SERVER.to_string(), self.server_cap(), None),
             Place::There(t) => (t.0.machine_id.clone(), self.machine_cap(&bot.owner_id), Some(t.0.machine_id.clone())),
         };
-        // A Bot asked by another that waits for it in this pool would wait on its asker's slot.
-        let lend = msg.role == "peer" && msg.from_bot.as_deref().is_some_and(|asker| self.slots.holds(&pool, asker));
-        let mut queued = match self.slots.take(&pool, cap, &bot.id, lend) {
-            Ok(slot) => return Some(slot),
+        let mut queued = match self.slots.take(&pool, cap, &bot.id, self.lend(&bot.id, &pool)) {
+            Ok(slot) => return Some((slot, false)),
             Err(q) => q,
         };
         let wake = Arc::new(Notify::new());
@@ -1108,6 +1120,9 @@ impl App {
                     break "stopped";
                 }
             }
+            if self.lend(&bot.id, &pool) {
+                break "lent";
+            }
             let turn = queued.turn();
             if turn == Turn::Go {
                 break "started";
@@ -1125,10 +1140,14 @@ impl App {
             "result": result, "waitedMs": since.elapsed().as_millis() as u64, "host": host, "machine": machine,
             "trigger": msg.role, "messageId": msg.id, "owner": bot.owner_id,
         });
-        let outcome = if result == "started" { Outcome::Success } else { Outcome::Failure };
+        let outcome = if matches!(result, "started" | "lent") { Outcome::Success } else { Outcome::Failure };
         self.db.record(&by.event("bot.run_dequeued").target("message", &msg.id.to_string()).bot(&bot.id).outcome(outcome).details(waited));
         match result {
-            "started" => queued.slot(),
+            "started" => queued.slot().map(|s| (s, true)),
+            "lent" => {
+                drop(queued);
+                self.slots.take(&pool, cap, &bot.id, true).ok().map(|s| (s, true))
+            }
             "stopped" => {
                 drop(queued);
                 self.give_back(bot, msg, period);
@@ -1141,6 +1160,25 @@ impl App {
                 None
             }
         }
+    }
+
+    /// Whether the Bot may run past its computer's cap: a Bot that asked it something
+    /// holds a slot there and waits for the answer, so waiting would wait on that slot.
+    fn lend(&self, bot_id: &str, pool: &str) -> bool {
+        let asks = self.asks.lock().unwrap_or_else(|e| e.into_inner());
+        asks.get(bot_id).is_some_and(|askers| askers.iter().any(|a| self.slots.holds(pool, a)))
+    }
+
+    /// Why a run that waited for a slot no longer may (ADR 0073): its owner, a routine's
+    /// author or the person it is for lost access meanwhile. With who, and what to say.
+    fn refused_after_wait(&self, bot: &Bot, msg: &Message, by: &Who, for_other: Option<&str>) -> Option<(&'static str, String, Option<String>)> {
+        let author = by.actor.asker.as_deref().filter(|_| msg.role == "routine");
+        if let Some((reason, user)) = crate::handover::blocked(&self.db, &bot.owner_id, author) {
+            let text = (reason == crate::handover::OWNER_DISABLED).then(|| self.wont_run(bot, None).map(|(_, t)| t)).flatten();
+            return Some((reason, user, text));
+        }
+        let asker = for_other?;
+        self.wont_run(bot, Some(asker)).map(|(reason, text)| (reason, asker.to_string(), Some(text)))
     }
 
     /// Why a Bot won't run now under isolated shared Bots (ADR 0046): its owner is
@@ -1756,6 +1794,7 @@ impl App {
         msg.requested_by = Some(by.clone());
         let (tx, rx) = oneshot::channel();
         self.waiters.lock().unwrap().insert(msg.id, tx);
+        let _asking = Asking::new(self, &to.id, &from.id);
         self.push_message(&msg);
         self.enqueue(msg.clone());
         let reply = tokio::time::timeout(wait, rx).await.ok().and_then(Result::ok);
@@ -2044,6 +2083,38 @@ fn guard(botctl: &Path, harness: &str, timeout_minutes: u32) -> Guard {
     }
     let botctl = botctl.display().to_string();
     Guard { command: format!("{} hook {harness}", shell_quote(&botctl)), timeout_secs: wait.as_secs() + 60, wait }
+}
+
+/// An ask waiting on a Bot, for as long as the asker waits (ADR 0073). A run of the
+/// asked Bot waiting for a slot is woken so it can borrow its asker's.
+struct Asking<'a> {
+    app: &'a App,
+    to: String,
+    from: String,
+}
+
+impl<'a> Asking<'a> {
+    fn new(app: &'a App, to: &str, from: &str) -> Self {
+        app.asks.lock().unwrap_or_else(|e| e.into_inner()).entry(to.to_string()).or_default().push(from.to_string());
+        if let Some(wake) = app.state().get(to).and_then(|s| s.wake.clone()) {
+            wake.notify_one();
+        }
+        Asking { app, to: to.to_string(), from: from.to_string() }
+    }
+}
+
+impl Drop for Asking<'_> {
+    fn drop(&mut self) {
+        let mut asks = self.app.asks.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(askers) = asks.get_mut(&self.to) {
+            if let Some(i) = askers.iter().position(|a| *a == self.from) {
+                askers.remove(i);
+            }
+            if askers.is_empty() {
+                asks.remove(&self.to);
+            }
+        }
+    }
 }
 
 /// What a run waiting for a slot shows (ADR 0073).

@@ -285,6 +285,61 @@ async fn an_asked_bot_runs_even_when_its_asker_holds_the_last_slot() {
 }
 
 #[tokio::test]
+async fn an_ask_lets_the_asked_bots_waiting_run_borrow_its_askers_slot() {
+    let app = runner::test_app();
+    users::ensure_operator(&app.db, "Owner", None);
+    app.run_cap.set(Some(1)).unwrap();
+    let dir = app.cfg.data_dir.join("gate");
+    gated_claude(&app, &dir);
+    let (asker, asked) = (app.db.create_bot("Asker", "#fff", "waddle", "claude", None, false), app.db.create_bot("Asked", "#fff", "waddle", "claude", None, false));
+    app.enqueue(app.db.add_message(&asker.id, "user", "ask the other one", None, false, Some("queued")));
+    until("the asker to start", || order(&dir).len() == 1).await;
+    // The asked Bot already waits on its own run when the ask comes in behind it.
+    app.enqueue(app.db.add_message(&asked.id, "user", "earlier", None, false, Some("queued")));
+    until("the asked Bot to queue", || waiting(&app, &asked.id)).await;
+    let ask = {
+        let app = app.clone();
+        let (from, to) = (asker.clone(), asked.clone());
+        tokio::spawn(async move { app.ask(&from, &to, "what's up?", Duration::from_secs(20), &crate::audit::Who::system("test")).await })
+    };
+    until("the waiting run to borrow", || order(&dir).len() == 2).await;
+    go(&dir, &asked.id);
+    until("the ask to run", || order(&dir).len() == 3).await;
+    go(&dir, &asked.id);
+    assert_eq!(ask.await.unwrap().as_deref(), Some("done"));
+    let lent = app.db.audit_events(&crate::audit::Filter { actions: vec!["bot.run_dequeued".into()], ..Default::default() }, 10, true);
+    assert_eq!(lent[0].details["result"], "lent", "{:?}", lent[0]);
+    go(&dir, &asker.id);
+    until("both to finish", || !app.is_running(&asker.id) && !app.is_running(&asked.id)).await;
+    assert_eq!(app.slots.load(SERVER), (0, 0));
+}
+
+#[tokio::test]
+async fn a_run_whose_owner_is_turned_off_while_it_waits_never_starts() {
+    let (port, app, admin, _) = serve_app().await;
+    app.run_cap.set(Some(1)).unwrap();
+    let dir = app.cfg.data_dir.join("gate");
+    gated_claude(&app, &dir);
+    let ada = app.db.create_user(None, Some("ada@example.com"), "Ada", crate::rbac::Role::Member).unwrap();
+    let a = bot(&app, "Busy");
+    let b = app.db.create_bot_owned("Ada's", "#fff", "waddle", "claude", None, false, &ada.id, Visibility::Private).id;
+    say(port, &admin, &a, "busy").await;
+    until("A to start", || order(&dir).len() == 1).await;
+    app.enqueue(app.db.add_message(&b, "user", "later", None, false, Some("queued")));
+    until("Ada's run to queue", || waiting(&app, &b)).await;
+    app.db.update_user(&ada.id, db::UserPatch { status: Some("disabled"), ..Default::default() }).unwrap();
+    let before = app.db.last_id();
+    go(&dir, &a);
+    until("Ada's Bot to say why", || !waiting(&app, &b) && !app.db.replies_after(&b, before).is_empty()).await;
+    assert!(app.db.replies_after(&b, before)[0].text.contains("turned off"));
+    let refused = audit(port, &admin, &format!("action=bot.run_refused&bot={b}")).await;
+    assert_eq!(refused[0]["details"]["reason"], "owner_disabled", "{refused:?}");
+    until("A to finish", || !app.is_running(&a)).await;
+    assert_eq!(order(&dir), [a]);
+    assert_eq!(app.slots.load(SERVER), (0, 0));
+}
+
+#[tokio::test]
 async fn a_machines_cap_is_its_owners_tiers() {
     let mut env = serve_with(|e| e).await;
     let (uid, mid, token) = machine_for(&env, "ada@example.com").await;
