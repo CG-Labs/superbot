@@ -214,16 +214,18 @@ async fn provide(app: &AppState, by: &Who, team: &Team, user: &User) -> Value {
 
 /// Records a machine just made for `user_id` as `team_id`'s. Making it can take a
 /// while: if they left the team meanwhile, it's released as their leaving would have.
-/// A machine another team took back meanwhile is left alone.
+/// Their current team takes it, even one a former team released; a former team's late
+/// claim leaves alone a machine another team holds.
 pub(crate) async fn claim(app: &AppState, by: &Who, team_id: &str, user_id: &str, machine_id: &str) {
     let Some(cp) = control_plane(app) else { return };
     let left = {
         let _g = cp.lock_ops().await;
-        if app.db.team_machine(machine_id).is_some_and(|t| t.team_id != team_id) {
+        let left = app.db.team_id_of(user_id).as_deref() != Some(team_id);
+        if left && app.db.team_machine(machine_id).is_some_and(|t| t.team_id != team_id) {
             return;
         }
         app.db.team_machine_mark(machine_id, team_id, user_id);
-        app.db.team_id_of(user_id).as_deref() != Some(team_id)
+        left
     };
     if left {
         release(app, by, team_id, user_id).await;
@@ -578,6 +580,14 @@ pub async fn give_machine(State(app): State<AppState>, Extension(c): Extension<C
         }
         // A machine the provider failed to build goes through the request's retry.
         if m.state != MachineState::Error {
+            // One a former team released is this team's now, and back on.
+            if !ours(&app, &t.id, &m) {
+                claim(&app, &by, &t.id, &u.id, &m.id).await;
+                if m.state == MachineState::Suspended {
+                    let _ = crate::machines::act_if(&app, cp, &by, &u.id, Step::Resume, None, &|x| ours(&app, &t.id, x)).await;
+                }
+                app.db.record(&team_event(&by, "team.machine_kept", &t.id, json!({ "user": u.id, "machine": m.id, "via": "admin" })));
+            }
             return Ok((StatusCode::OK, Json(json!({ "machine": machine_view(&app, &t.id, &u.id) }))));
         }
     }

@@ -600,3 +600,41 @@ async fn a_late_claim_leaves_a_machine_another_team_took_alone() {
     assert!(!w.app.db.team_machine_release(&m.id, &w.alpha, crate::db::now()));
     assert!(matches!(w.app.db.machine(&m.id).unwrap().state, crate::machines::State::Running | crate::machines::State::Provisioning));
 }
+
+#[tokio::test]
+async fn a_team_without_machines_retries_or_takes_back_a_members_released_machine() {
+    let w = world().await;
+    let (dee_id, _) = user_with(w.port, &w.admin, "dee@example.com", "member").await;
+    // Dee's Alpha machine fails at the provider, then she leaves for Beta, which gives none.
+    w.fake.fail_next("create", crate::machines::provider::ProviderError::Api { status: 400, message: "full".into() });
+    json_call(w.port, "PUT", &format!("/api/teams/{}/members/{dee_id}", w.alpha), &w.admin, "{}").await;
+    let m = w.app.db.user_machine(&dee_id).unwrap();
+    assert_eq!(m.state, crate::machines::State::Error);
+    assert_eq!(call(w.port, "DELETE", &format!("/api/team/members/{dee_id}"), &w.ada, "").await.0, 200);
+    assert!(w.app.db.team_machine(&m.id).unwrap().released_at.is_some());
+    json_call(w.port, "PATCH", &format!("/api/teams/{}", w.beta), &w.admin, r#"{"machines":false}"#).await;
+    let (_, v) = json_call(w.port, "PUT", &format!("/api/teams/{}/members/{dee_id}", w.beta), &w.admin, "{}").await;
+    assert_eq!(v["provisioned"], "manual", "{v}");
+
+    // Beta's owner retries it: it's Beta's now, with no date to go.
+    let (code, v) = json_call(w.port, "POST", &format!("/api/team/members/{dee_id}/machine"), &w.bea, "").await;
+    assert!(code == 200 || code == 202, "{code} {v}");
+    let tm = w.app.db.team_machine(&m.id).unwrap();
+    assert_eq!((tm.team_id.as_str(), tm.released_at, tm.release_at), (w.beta.as_str(), None, None));
+    w.app.db.team_machine_backdate(&m.id, 30 * 86_400_000);
+    reconcile(&w).await;
+    reconcile(&w).await;
+    assert_eq!(w.app.db.machine(&m.id).unwrap().state, crate::machines::State::Running);
+
+    // Moved again, a suspended released machine is taken back and turned on.
+    assert_eq!(call(w.port, "POST", "/api/team/leave", &w.ada, "").await.0, 409, "Ada's the only owner of Alpha with Al there");
+    assert_eq!(call(w.port, "DELETE", &format!("/api/team/members/{dee_id}"), &w.bea, "").await.0, 200);
+    assert_eq!(w.app.db.machine(&m.id).unwrap().state, crate::machines::State::Suspended);
+    json_call(w.port, "PATCH", &format!("/api/teams/{}", w.alpha), &w.admin, r#"{"machines":false}"#).await;
+    json_call(w.port, "PUT", &format!("/api/teams/{}/members/{dee_id}", w.alpha), &w.admin, "{}").await;
+    let (code, v) = json_call(w.port, "POST", &format!("/api/team/members/{dee_id}/machine"), &w.ada, "").await;
+    assert_eq!(code, 200, "{v}");
+    let tm = w.app.db.team_machine(&m.id).unwrap();
+    assert_eq!((tm.team_id.as_str(), tm.released_at), (w.alpha.as_str(), None));
+    assert_eq!(w.app.db.machine(&m.id).unwrap().state, crate::machines::State::Running);
+}
