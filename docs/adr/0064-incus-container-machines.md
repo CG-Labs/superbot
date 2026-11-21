@@ -29,7 +29,7 @@ Docker was rejected. Application containers have no init, cloud-init or real OS 
 
 | Setting | Meaning |
 |---------|---------|
-| `INCUS_URL` | The Incus API, `https://host[:port]` (port 8443 by default). Needed. |
+| `INCUS_URL` | The Incus API, `https://<ip>[:port]` (port 8443 by default). Needed. It must be an IP address, so containers can be denied that address; a host name is refused. |
 | `INCUS_CLIENT_CERT`, `INCUS_CLIENT_KEY` | botd's client certificate and key (PEM, or `_FILE`). The key is a server secret: kept from Bots and harnesses, and redacted. |
 | `INCUS_SERVER_CERT` | The Incus host's certificate. botd pins it by SHA-256 and talks to nothing else. |
 | `INCUS_PROJECT` | Default `superbot`. Must be restricted (below). The `default` project is refused. |
@@ -51,8 +51,8 @@ It also needs `MACHINE_CONTROL_URL` and `MACHINE_FIREWALL=on`. The firewall is w
 | suspend / resume | A clean stop (30 s), then a forced stop if needed. Start. |
 | resize | New `limits.*` and root disk size, applied to the running container. |
 | backups | `snapshots.schedule=@daily`, kept 7 days, on the container's own pool. |
-| destroy | Forced stop, then delete. |
-| rebuild ([ADR 0056](0056-rebuilding-machines-enrolled-before-0039.md)) | Forced stop, new cloud-init user data, `POST .../rebuild` from the image, start. Same name, address and firewall. |
+| destroy | Forced stop, then delete. A missing container counts as deleted only once no create of it is still running, so a create that finishes late can't leave one behind. |
+| rebuild ([ADR 0056](0056-rebuilding-machines-enrolled-before-0039.md)) | Forced stop, new cloud-init user data, `POST .../rebuild` from the image, start. Same name, address and firewall. A rebuild that outlasts 60 s is reported as maybe sent, and botd keeps watching it for up to 30 minutes to start the container once it's done. If botd restarts meanwhile, the rebuild worker sends it again when the machine doesn't enroll. |
 
 The provider trait gained defaults so Linode is unchanged: `substrate()` (`vm` or `container`), default tiers and image, `check_plan`, `plan_view`, `settings` and `preflight`.
 
@@ -97,7 +97,7 @@ If any check fails, botd makes nothing, and the machine shows the reason. Incus 
     - `INCUS_EGRESS_DENY`.
 
     If `MACHINE_CONTROL_URL` is one of those addresses, it is carved out. Only TCP to botd's machine port stays open, for enrollment and the agent's calls to botd.
-- The reconciler keeps the ACL right. Changed inbound rules, loosened outbound rules, a disabled rule, or a container taken off the ACL are put back and audited, as with Linode.
+- The reconciler keeps the ACL right. Changed inbound rules, loosened outbound rules, a disabled rule, or a container taken off the ACL are put back and audited, as with Linode. A container counts as behind the ACL only if its network is exactly as attached: eth0 with every setting above, no other NIC and no profiles. One loosened in place, such as a default changed to `allow` or a filter turned off while it still names the ACL, is attached again.
 
 **botd's side.** These settings protect botd and the host:
 
@@ -151,7 +151,7 @@ Unit tests cover:
 - settings and credentials;
 - the exact create body;
 - refusal without the firewall or in a loosened project;
-- every lifecycle call, held and failed creates, and the ACL round trip, including tampering;
+- every lifecycle call, held and failed creates, deleting during a held create, a slow rebuild that still ends started, and the ACL round trip, including tampering and NICs loosened in place;
 - the pin and trust checks.
 
 Integration tests run botd end to end on loopback. A user's container is requested over HTTP, made behind the ACL, enrolled by the real agent from its cloud-init user data, and heartbeats over mutual TLS. It is then suspended, resumed, resized, snapshotted and destroyed, and the ACL goes with the last machine. Two users' containers are isolated, the reconciler restores a container removed from the ACL and loosened outbound rules, the admin view and preflight work, and machines from another provider are left alone.

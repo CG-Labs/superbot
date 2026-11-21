@@ -54,6 +54,8 @@ The host's certificate is `/var/lib/incus/server.crt` (`cluster.crt` on a cluste
 
 In botd's `.env`:
 
+`INCUS_URL` must use the host's IP address, not a name, so botd can deny containers that address.
+
 ```bash
 MACHINE_PROVIDER=incus
 INCUS_URL=https://<incus-host-private-ip>:8443

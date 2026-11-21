@@ -203,6 +203,12 @@ async fn containers_are_cut_off_from_each_other() {
     let nic = env.incus.instance(&b.label).unwrap().body["devices"]["eth0"].clone();
     assert_eq!((nic["security.acls"].as_str(), nic["security.port_isolation"].as_str()), (Some("superbot-fw"), Some("true")));
 
+    // So is one opened up in place while it still names the ACL.
+    env.incus.w().instances.get_mut(&a.label).unwrap().body["devices"]["eth0"]["security.acls.default.ingress.action"] = json!("allow");
+    let r = reconcile(&env).await;
+    assert_eq!(r["firewallAttached"], 1, "{r}");
+    assert_eq!(env.incus.instance(&a.label).unwrap().body["devices"]["eth0"]["security.acls.default.ingress.action"], "drop");
+
     // Loosened outbound rules are set back too.
     env.incus.w().acls.get_mut("superbot-fw").unwrap()["egress"] = json!([]);
     reconcile(&env).await;

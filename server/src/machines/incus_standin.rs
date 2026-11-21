@@ -43,6 +43,8 @@ struct Op {
     err: String,
     instances: Vec<String>,
     pending: Option<(String, Instance)>,
+    /// A held rebuild: the instance and its new source.
+    rebuild: Option<(String, Value)>,
 }
 
 #[derive(Default)]
@@ -53,6 +55,8 @@ pub struct World {
     pub calls: Vec<Call>,
     /// Creates stay running until `release`.
     pub hold_creates: bool,
+    /// Rebuilds stay running until `release`.
+    pub hold_rebuilds: bool,
     /// The next operation fails with this.
     pub fail_op: Option<String>,
     /// Addresses to give containers by name, instead of 10.20.0.x.
@@ -206,20 +210,24 @@ impl StandIn {
         self.w().instances.get(name).cloned()
     }
 
-    /// Finishes held creates.
+    /// Finishes held creates and rebuilds.
     pub fn release(&self) {
         let mut w = self.w();
-        let done: Vec<(String, Instance)> = w
-            .ops
-            .values_mut()
-            .filter(|o| o.status == "Running")
-            .filter_map(|o| {
-                o.status = "Success".into();
-                o.pending.take()
-            })
-            .collect();
-        for (n, i) in done {
+        let mut made = Vec::new();
+        let mut rebuilt = Vec::new();
+        for o in w.ops.values_mut().filter(|o| o.status == "Running") {
+            o.status = "Success".into();
+            made.extend(o.pending.take());
+            rebuilt.extend(o.rebuild.take());
+        }
+        for (n, i) in made {
             w.instances.insert(n, i);
+        }
+        for (n, source) in rebuilt {
+            if let Some(i) = w.instances.get_mut(&n) {
+                i.rebuilt += 1;
+                i.source = source;
+            }
         }
     }
 }
@@ -263,10 +271,20 @@ fn op_json(id: &str, o: &Op) -> Value {
 impl World {
     /// Starts an async operation on `instances`, done unless `pending` is held.
     fn op(&mut self, instances: Vec<String>, pending: Option<(String, Instance)>) -> (Response, bool) {
+        self.op_with(instances, pending, None)
+    }
+
+    fn op_with(
+        &mut self,
+        instances: Vec<String>,
+        pending: Option<(String, Instance)>,
+        rebuild: Option<(String, Value)>,
+    ) -> (Response, bool) {
         self.next_op += 1;
         let id = format!("00000000-0000-4000-8000-{:012x}", self.next_op);
         let failed = self.fail_op.take();
-        let held = pending.is_some() && self.hold_creates && failed.is_none();
+        let held = failed.is_none()
+            && ((pending.is_some() && self.hold_creates) || (rebuild.is_some() && self.hold_rebuilds));
         let o = Op {
             status: match (&failed, held) {
                 (Some(_), _) => "Failure".into(),
@@ -276,6 +294,7 @@ impl World {
             err: failed.clone().unwrap_or_default(),
             instances,
             pending: if held { pending } else { None },
+            rebuild: if held { rebuild } else { None },
         };
         let body = json!({ "type": "async", "status": "Operation created", "status_code": 100, "operation": format!("/1.0/operations/{id}"), "metadata": op_json(&id, &o) });
         self.ops.insert(id, o);
@@ -500,7 +519,8 @@ async fn handle(
                     if i.status != "Stopped" {
                         return err(400, "Instance must be stopped to be rebuilt");
                     }
-                    let (r, done) = w.op(vec![instance_url(&n, &project)], None);
+                    let (r, done) =
+                        w.op_with(vec![instance_url(&n, &project)], None, Some((n.clone(), body["source"].clone())));
                     if done {
                         let i = w.instances.get_mut(&n).unwrap();
                         i.rebuilt += 1;
