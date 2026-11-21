@@ -5,7 +5,6 @@
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use chacha20poly1305::aead::rand_core::RngCore;
 use chacha20poly1305::aead::{Aead, KeyInit, OsRng, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use serde_json::{json, Value};
@@ -33,9 +32,7 @@ impl Drop for Botd {
 }
 
 fn random_key() -> [u8; 32] {
-    let mut k = [0u8; 32];
-    OsRng.fill_bytes(&mut k);
-    k
+    XChaCha20Poly1305::generate_key(&mut OsRng).into()
 }
 
 fn free_port() -> u16 {
