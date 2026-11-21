@@ -1139,7 +1139,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 25] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 26] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1165,6 +1165,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 25] = [
     migrate_bot_prompts,
     migrate_sandbox,
     migrate_machine_rebuild,
+    migrate_account_removals,
 ];
 
 /// Rebuilding machines enrolled before ADR 0039 with today's agent (ADR 0056).
@@ -1320,6 +1321,116 @@ pub struct NewTeammateCleanup<'a> {
     pub owner_id: &'a str,
     pub user_id: &'a str,
     pub os_user: &'a str,
+    pub reason: &'a str,
+    pub files: &'a str,
+    pub grace_days: i64,
+    pub created_by: Option<&'a str>,
+}
+
+/// Removing leaving teammates' accounts on one server (ADR 0066): one row per removal of
+/// a teammate's account for one owner's Bots (`sb-t-`, ADR 0064), `pending` until the
+/// root helper has done it, then `done`, or `held` while their work waits to be purged;
+/// `cancelled` if they came back before it was tried. At most one pending per owner and
+/// teammate, so queueing again changes nothing.
+fn migrate_account_removals(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS account_removals (
+          id TEXT PRIMARY KEY,
+          owner_id TEXT NOT NULL,
+          user_id TEXT NOT NULL,
+          account TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          files TEXT NOT NULL CHECK (files IN ('archive', 'delete')),
+          grace_days INTEGER NOT NULL DEFAULT 0,
+          state TEXT NOT NULL CHECK (state IN ('pending', 'held', 'done', 'cancelled')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          tried_at INTEGER,
+          created_at INTEGER NOT NULL,
+          created_by TEXT,
+          removed_at INTEGER,
+          archived_to TEXT,
+          purge_at INTEGER,
+          done_at INTEGER
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS account_removals_pending ON account_removals(owner_id, user_id) WHERE state = 'pending';
+        CREATE INDEX IF NOT EXISTS account_removals_state ON account_removals(state);
+        CREATE TABLE IF NOT EXISTS teammate_spaces (
+          owner_id TEXT NOT NULL,
+          user_id TEXT NOT NULL,
+          made_at INTEGER NOT NULL,
+          PRIMARY KEY (owner_id, user_id)
+        );",
+    )?;
+    // Pairs made before this table, whose accounts a recreated container may have lost
+    // while keeping their folders: the audit log is the only record of them. Once only,
+    // so a pair removed since is never found again.
+    c.execute(
+        "INSERT OR IGNORE INTO teammate_spaces (owner_id, user_id, made_at)
+         SELECT target_id, json_extract(details, '$.forUser'), MIN(at) FROM audit_events
+         WHERE action = 'isolation.account_created' AND target_type = 'user' AND outcome = 'success'
+           AND target_id IS NOT NULL AND json_extract(details, '$.forUser') IS NOT NULL
+         GROUP BY 1, 2",
+        [],
+    )?;
+    Ok(())
+}
+
+/// One teammate's account for one owner's Bots on this server, being removed (ADR 0066).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountRemoval {
+    pub id: String,
+    /// Whose shared Bots the teammate ran.
+    pub owner_id: String,
+    /// The teammate.
+    pub user_id: String,
+    /// `sb-t-<hash>`.
+    pub account: String,
+    /// `disabled`, `deprovisioned`, `deleted`, `access_lost` or `admin`.
+    pub reason: String,
+    /// `archive` or `delete`: what becomes of their workspace.
+    pub files: String,
+    pub grace_days: i64,
+    pub state: String,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+    pub tried_at: Option<i64>,
+    pub created_at: i64,
+    pub created_by: Option<String>,
+    pub removed_at: Option<i64>,
+    pub archived_to: Option<String>,
+    pub purge_at: Option<i64>,
+    pub done_at: Option<i64>,
+}
+
+fn account_removal_row(r: &Row) -> rusqlite::Result<AccountRemoval> {
+    Ok(AccountRemoval {
+        id: r.get("id")?,
+        owner_id: r.get("owner_id")?,
+        user_id: r.get("user_id")?,
+        account: r.get("account")?,
+        reason: r.get("reason")?,
+        files: r.get("files")?,
+        grace_days: r.get("grace_days")?,
+        state: r.get("state")?,
+        attempts: r.get("attempts")?,
+        last_error: r.get("last_error")?,
+        tried_at: r.get("tried_at")?,
+        created_at: r.get("created_at")?,
+        created_by: r.get("created_by")?,
+        removed_at: r.get("removed_at")?,
+        archived_to: r.get("archived_to")?,
+        purge_at: r.get("purge_at")?,
+        done_at: r.get("done_at")?,
+    })
+}
+
+/// A removal to queue: `account_removal_queue`.
+pub struct NewAccountRemoval<'a> {
+    pub owner_id: &'a str,
+    pub user_id: &'a str,
+    pub account: &'a str,
     pub reason: &'a str,
     pub files: &'a str,
     pub grace_days: i64,
@@ -4120,6 +4231,134 @@ impl Db {
             == 1
     }
 
+    /// A teammate's account and folders for an owner's Bots are on this server (ADR 0066).
+    /// Kept with botd's data, so a recreated container, whose password database starts
+    /// afresh while the folders stay, still knows whose folders they are.
+    pub fn teammate_space_made(&self, owner_id: &str, user_id: &str) {
+        let _ = self.c().execute("INSERT OR IGNORE INTO teammate_spaces (owner_id, user_id, made_at) VALUES (?, ?, ?)", params![owner_id, user_id, now()]);
+    }
+
+    /// Every `(owner, teammate)` whose account and folders may be on this server.
+    pub fn teammate_spaces(&self) -> Vec<(String, String)> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT owner_id, user_id FROM teammate_spaces ORDER BY owner_id, user_id").unwrap();
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().filter_map(Result::ok).collect()
+    }
+
+    pub fn teammate_space_gone(&self, owner_id: &str, user_id: &str) {
+        let _ = self.c().execute("DELETE FROM teammate_spaces WHERE owner_id = ? AND user_id = ?", [owner_id, user_id]);
+    }
+
+    /// Queues the removal of a teammate's account for an owner's Bots, unless one is
+    /// pending: returns that one then, and whether this call made it.
+    pub fn account_removal_queue(&self, n: &NewAccountRemoval) -> Option<(AccountRemoval, bool)> {
+        let c = self.c();
+        let made = c
+            .execute(
+                "INSERT OR IGNORE INTO account_removals (id, owner_id, user_id, account, reason, files, grace_days, state, created_at, created_by)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                params![crate::random_hex(8), n.owner_id, n.user_id, n.account, n.reason, n.files, n.grace_days, now(), n.created_by],
+            )
+            .unwrap_or(0)
+            == 1;
+        c.query_row(
+            "SELECT * FROM account_removals WHERE owner_id = ? AND user_id = ? AND state = 'pending'",
+            [n.owner_id, n.user_id],
+            account_removal_row,
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .map(|r| (r, made))
+    }
+
+    pub fn account_removal(&self, id: &str) -> Option<AccountRemoval> {
+        self.c().query_row("SELECT * FROM account_removals WHERE id = ?", [id], account_removal_row).optional().ok().flatten()
+    }
+
+    /// Newest first, in `state` (any if None), where `user_id` (anyone if None) is the
+    /// owner or the teammate.
+    pub fn account_removals(&self, state: Option<&str>, user_id: Option<&str>) -> Vec<AccountRemoval> {
+        let c = self.c();
+        let mut s = c
+            .prepare(
+                "SELECT * FROM account_removals WHERE (?1 IS NULL OR state = ?1) AND (?2 IS NULL OR owner_id = ?2 OR user_id = ?2)
+                 ORDER BY created_at DESC, id",
+            )
+            .unwrap();
+        s.query_map(params![state, user_id], account_removal_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// The helper is about to run for a pending (or held, for a purge) removal: counted
+    /// before it starts, so one that stopped halfway is never taken for untried. Returns
+    /// whether it was still in `state`.
+    pub fn account_removal_tried(&self, id: &str, state: &str) -> bool {
+        self.c()
+            .execute("UPDATE account_removals SET attempts = attempts + 1, tried_at = ? WHERE id = ? AND state = ?", params![now(), id, state])
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// A try at a pending (or held, for a purge) removal failed. Returns whether it was
+    /// still in `state`.
+    pub fn account_removal_failed(&self, id: &str, state: &str, error: &str) -> bool {
+        self.c()
+            .execute("UPDATE account_removals SET last_error = ?, tried_at = ? WHERE id = ? AND state = ?", params![error, now(), id, state])
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// The helper removed the account: `held` while their work waits for `purge_at`,
+    /// else done. Returns whether it was still pending, so it's recorded once.
+    pub fn account_removal_removed(&self, id: &str, archived_to: Option<&str>, purge_at: Option<i64>) -> bool {
+        let at = now();
+        self.c()
+            .execute(
+                "UPDATE account_removals SET state = CASE WHEN ?1 IS NULL THEN 'done' ELSE 'held' END, purge_at = ?1, archived_to = ?2,
+                 removed_at = ?3, done_at = CASE WHEN ?1 IS NULL THEN ?3 ELSE NULL END, tried_at = ?3, last_error = NULL
+                 WHERE id = ?4 AND state = 'pending'",
+                params![purge_at, archived_to, at, id],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    #[cfg(test)]
+    pub fn account_removal_due_now(&self, id: &str) {
+        self.c().execute("UPDATE account_removals SET purge_at = ? WHERE id = ?", params![now() - 1, id]).unwrap();
+    }
+
+    /// Ends a removal in `from` as `to` (`done` or `cancelled`), with `note` as its last
+    /// word. Returns whether it was still in `from`.
+    pub fn account_removal_end(&self, id: &str, from: &str, to: &str, note: Option<&str>) -> bool {
+        self.c()
+            .execute("UPDATE account_removals SET state = ?, done_at = ?, last_error = ? WHERE id = ? AND state = ?", params![to, now(), note, id, from])
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// An admin asked for this pending removal: it's theirs now, so it's never cancelled
+    /// because the teammate is wanted again. Returns whether it changed.
+    pub fn account_removal_force(&self, id: &str) -> bool {
+        self.c()
+            .execute("UPDATE account_removals SET reason = 'admin' WHERE id = ? AND state = 'pending' AND reason <> 'admin'", [id])
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Cancels a pending removal with `note`, but only if no admin asked for it and the
+    /// helper was never started for it. Returns whether it did.
+    pub fn account_removal_cancel_unasked(&self, id: &str, note: &str) -> bool {
+        self.c()
+            .execute(
+                "UPDATE account_removals SET state = 'cancelled', done_at = ?, last_error = ?
+                 WHERE id = ? AND state = 'pending' AND reason <> 'admin' AND attempts = 0",
+                params![now(), note, id],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
     pub fn machine_harnesses_sent(&self, machine_id: &str, plan: &str) {
         let _ = self.c().execute(
             "UPDATE machines SET harnesses_sent_at = ?, harnesses_sent_plan = ? WHERE id = ?",
@@ -4306,6 +4545,19 @@ mod tests {
 
     fn all_events(db: &Db) -> Vec<AuditEvent> {
         db.audit_events(&audit::Filter::default(), 1000, false)
+    }
+
+    #[test]
+    fn teammate_accounts_made_before_their_table_are_remembered_from_the_audit_log() {
+        let db = Db::open(&temp_path("spaces").join("app.sqlite")).unwrap();
+        let made = |owner: &str, d: Value| audit::Who::system("isolation").event("isolation.account_created").target("user", owner).details(d);
+        db.record(&made("u1", json!({ "account": "sb-t-1", "forUser": "u2" })));
+        db.record(&made("u1", json!({ "account": "sb-t-1", "forUser": "u2" })));
+        db.record(&made("u1", json!({ "account": "sb-u-u1" })));
+        db.record(&made("u3", json!({ "account": "sb-t-2", "forUser": "u4" })).outcome(audit::Outcome::Failure));
+        db.c().execute("DELETE FROM teammate_spaces", []).unwrap();
+        migrate_account_removals(&db.c(), false).unwrap();
+        assert_eq!(db.teammate_spaces(), [("u1".to_string(), "u2".to_string())]);
     }
 
     #[test]
@@ -4516,7 +4768,8 @@ mod tests {
                  ALTER TABLE machines DROP COLUMN rebuild_from;",
             )
             .unwrap();
-        db.c().execute_batch(&format!("PRAGMA user_version = {};", MIGRATIONS.len() - 1)).unwrap();
+        let rebuild = MIGRATIONS.iter().position(|m| std::ptr::fn_addr_eq(*m, migrate_machine_rebuild as fn(&Connection, bool) -> rusqlite::Result<()>)).unwrap();
+        db.c().execute_batch(&format!("PRAGMA user_version = {rebuild};")).unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();
         let r = db.machine(&m.id).unwrap();

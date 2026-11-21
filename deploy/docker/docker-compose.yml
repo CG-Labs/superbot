@@ -39,7 +39,8 @@ services:
       TRUST_FORWARDED_FOR: "1"
     # Per-user accounts (ISOLATION=users; docs/adr/0058-harness-os-user-by-default.md): sudo, the
     # image's only setuid program, starts each run as its user's account, and the root helper
-    # superbot-userctl makes the account and its folders. Runs get none of these: they drop
+    # superbot-userctl makes the account and its folders, and removes a leaving teammate's
+    # (docs/adr/0066-removing-teammate-accounts-on-one-server.md). Runs get none of these: they drop
     # every capability when sudo switches to the account.
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, FSETID, SETUID, SETGID, AUDIT_WRITE]
     security_opt: []

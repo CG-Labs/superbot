@@ -120,8 +120,8 @@ sudo bash deploy/install.sh --upgrade --isolation     # opt an existing install 
 
 What root sets up (and `--no-isolation` takes away again, keeping accounts and their folders):
 
-- `/usr/local/sbin/superbot-userctl` (makes one account and its folders, nothing else) and `/etc/superbot/isolation.conf` (where the folders go and botd's group).
-- `/etc/sudoers.d/superbot-isolation`: the service user may start `/usr/local/bin/superbot-run` as a member of `superbot-users`, keeping the run's env, and run `superbot-userctl ensure <id>` (or `ensure <owner> <teammate>`, a teammate's account for an owner's shared Bots) as root. Nothing else. Checked with `visudo -c` first.
+- `/usr/local/sbin/superbot-userctl` (makes one account and its folders, and removes a leaving teammate's account, nothing else) and `/etc/superbot/isolation.conf` (where the folders go and botd's group).
+- `/etc/sudoers.d/superbot-isolation`: the service user may start `/usr/local/bin/superbot-run` as a member of `superbot-users`, keeping the run's env, and run `superbot-userctl ensure <id>` (or `ensure <owner> <teammate>`, a teammate's account for an owner's shared Bots), `remove <owner> <teammate> ...` and `purge <id>` (a leaving teammate's account and held work) as root. Nothing else. Installs from before the teammate removals: re-run `sudo bash deploy/install.sh --upgrade --isolation` to get `remove` and `purge`. Checked with `visudo -c` first.
 - `/etc/systemd/system/superbot.service.d/isolation.conf`: `NoNewPrivileges=false` (sudo is setuid) and `ProtectProc=invisible` (a run sees only its own account's processes).
 - `/srv/superbot/users` (root, `0711`; set `ISOLATION_DIR` to move it), the `superbot-users` group, the service home at `0750`, and `ISOLATION=users` in `.env`.
 
@@ -138,7 +138,17 @@ botctl user harness-login bea@example.com claude --owner alex@example.com   # be
 
 Accounts are made at a user's first run, or with `botctl user isolate <user>`. Install harness CLIs system-wide (`sudo npm install -g @anthropic-ai/claude-code @openai/codex`): per-user accounts can't open the service user's `~/.local`. Pi and Hermes Agent use provider keys (`botctl secret set`); their approval guard and settings are files botd writes, which the account can read but not change. Screens are off until they can run this way. To check it on a throwaway host: `deploy/test-isolation.sh` (CI runs it).
 
-With `SHARED_BOTS=isolated` too, a teammate's run of someone else's shared Bot runs as an account of its own for that owner's Bots (`sb-t-<hash>`, folders in `ISOLATION_DIR/<owner>-<teammate>/`), never as the owner's. Neither the owner's account nor the teammate's own can enter it. Claude Code and Codex Bots then need the teammate's own login there, or a server-wide key: teammates log in from the Bot's details in the app, and an admin can use `botctl user harness-login <teammate> <harness> --owner <owner>`. Without either, the Bot says so and doesn't run; it never uses the owner's login. `ISOLATION_TEAMMATES=off` in `.env` keeps the old behaviour (the owner's account). A leaver's teammate accounts stay until removed by hand. Design: [ADR 0064](../docs/adr/0064-teammate-accounts-on-one-server.md).
+With `SHARED_BOTS=isolated` too, a teammate's run of someone else's shared Bot runs as an account of its own for that owner's Bots (`sb-t-<hash>`, folders in `ISOLATION_DIR/<owner>-<teammate>/`), never as the owner's. Neither the owner's account nor the teammate's own can enter it. Claude Code and Codex Bots then need the teammate's own login there, or a server-wide key: teammates log in from the Bot's details in the app, and an admin can use `botctl user harness-login <teammate> <harness> --owner <owner>`. Without either, the Bot says so and doesn't run; it never uses the owner's login. `ISOLATION_TEAMMATES=off` in `.env` keeps the old behaviour (the owner's account). Design: [ADR 0064](../docs/adr/0064-teammate-accounts-on-one-server.md).
+
+When a teammate is disabled, deprovisioned or deleted, or loses the owner's Bots, their account for those Bots goes, within seconds: its processes are stopped, their work is handed to the owner's account (in `workspace/from-teammates/<name>-<date>`), and their folder, login, temp files and the account are deleted. A user's own account, the owner's and system accounts are never touched. `ISOLATION_TEAMMATE_FILES=delete` holds the work aside instead (`ISOLATION_DIR/.left/`, root's) and deletes it after `ISOLATION_TEAMMATE_FILES_DAYS` (default 7, `0` at once). A removal that fails is audited and retried every few minutes. Admins see and force them in the console's user detail, or:
+
+```sh
+botctl user teammates alex@example.com                       # teammates' accounts for alex's Bots, and alex's for others'
+botctl user teammates alex@example.com remove bea@example.com   # remove bea's account for alex's Bots now
+botctl user teammate-removals                                # open removals (pending, or work held)
+```
+
+Design: [ADR 0066](../docs/adr/0066-removing-teammate-accounts-on-one-server.md).
 
 Turning it on doesn't move files. Each user's work starts in a new, empty `ISOLATION_DIR/<id>/workspace`; their old folder, `WORKSPACE_DIR/users/<id>`, stays where it was. Bot memory and `USER.md` carry over by themselves (botd keeps the real copies). Harness sessions don't: each Bot's next run starts a fresh one, with its memory. To bring a user's files along, as root, after `botctl user isolate <user>`:
 
@@ -552,7 +562,7 @@ Keys in `.env` pass through to the Bots, like the bash install. Claude Code's se
 
 New `.env` files have `ISOLATION=users`: each user's Bots run as their own Unix account inside the container, which can't read the `data` volume, the database, the `home` volume or botd's env (where `.env`'s secrets are). An `.env` from before has no `ISOLATION` line and stays off; botd's log says so. Turn it on or off with `./init.sh --isolation` or `--no-isolation`, then `docker compose up -d`. Design: [ADR 0058](../docs/adr/0058-harness-os-user-by-default.md).
 
-How it works: the image has `sudo` (its only setuid program), `superbot-run`, and the root helper `superbot-userctl`, with the same two sudo rules as the [bash install](#one-unix-account-per-user). The `botd` service adds back `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `SETUID`, `SETGID` and `AUDIT_WRITE`, and turns `no-new-privileges` off, so `sudo` works; runs drop all of them. Accounts and their folders live in the `users` volume. A recreated container makes each account again, with the uid that owns its files.
+How it works: the image has `sudo` (its only setuid program), `superbot-run`, and the root helper `superbot-userctl`, with the same sudo rules as the [bash install](#one-unix-account-per-user). The `botd` service adds back `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `SETUID`, `SETGID` and `AUDIT_WRITE`, and turns `no-new-privileges` off, so `sudo` works; runs drop all of them. Accounts and their folders live in the `users` volume. A recreated container makes each account again, with the uid that owns its files.
 
 Harness CLIs must be in the image (`SUPERBOT_HARNESSES`): ones installed later with `npm i -g` land in the `home` volume, which accounts can't open. Runs see the container's other processes (but not their env); the bash install's systemd unit hides them. Turning it on doesn't move a user's files from the `workspace` volume: copy them into `/srv/superbot/users/<id>/workspace/` as with the [bash install](#one-unix-account-per-user).
 

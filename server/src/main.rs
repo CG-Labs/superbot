@@ -109,6 +109,9 @@ mod sso_social_http_tests;
 #[cfg(test)]
 mod teammate_accounts_http_tests;
 mod teammate_logins;
+mod teammate_removals;
+#[cfg(test)]
+mod teammate_removals_http_tests;
 
 use acl::{Access, Viewer, Visibility};
 use approvals::{DecideError, Remember};
@@ -295,6 +298,14 @@ async fn main() {
                     accounts::TEAMMATE_PREFIX,
                     iso.root.display()
                 );
+                println!(
+                    "Isolation: a teammate's account goes when they leave or lose the owner's Bots; their work is {} (ADR 0066).",
+                    match (iso.offboard.files, iso.offboard.grace_days) {
+                        (machines::offboard::Files::Archive, _) => "handed to the owner, in workspace/from-teammates (ISOLATION_TEAMMATE_FILES=delete deletes it)".to_string(),
+                        (_, 0) => "deleted at once".to_string(),
+                        (_, d) => format!("held aside and deleted after {d} days"),
+                    }
+                );
             } else if shared_bots == acl::SharedBots::Isolated {
                 println!("Isolation: ISOLATION_TEAMMATES=off, so a teammate's run of a shared Bot uses its owner's account (ADR 0046).");
             }
@@ -314,6 +325,7 @@ async fn main() {
         ),
     }
     app.start_isolation();
+    teammate_removals::start(&app);
     let paused = handover::pause_already_disabled(&app, &Who { actor: Actor::system("bootstrap"), source: Source::default() });
     if paused > 0 {
         println!("Routines: paused {paused} that ran for disabled users (ADR 0047).");
@@ -428,6 +440,7 @@ async fn main() {
         "screens": app.screens.is_some(),
         "isolation": if app.isolation().is_some() { "users" } else { "off" },
         "isolationTeammates": app.teammate_accounts(),
+        "isolationTeammateFiles": app.isolation().map(|i| i.offboard.files.as_str()),
         "sharedBots": app.shared_bots(),
         "sso": sso_ids,
         "controlPlane": control_plane.enabled(),
@@ -612,6 +625,9 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/machines/legacy", get(machines::rebuild::legacy_list))
         .route("/machines/reconcile", post(machines::reconcile_now))
         .route("/machines/teammate-removals", get(machines::offboard::list_all))
+        .route("/users/{key}/teammate-accounts", get(teammate_removals::of_user))
+        .route("/users/{key}/teammate-accounts/{teammate}/remove", post(teammate_removals::remove_now))
+        .route("/isolation/teammate-removals", get(teammate_removals::list_all))
         .route("/machine", get(machines::mine))
         .route("/machine/harness-login", post(machines::logins::my_start))
         .route("/machine/harness-login/{id}", delete(machines::logins::my_abort))

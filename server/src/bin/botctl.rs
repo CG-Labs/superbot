@@ -55,6 +55,12 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    and model (admins)
   botctl user isolation <user>                     With ISOLATION=users: the user's own account and folders
   botctl user isolate <user>                       Make that account and its folders now
+  botctl user teammates <user>                     Teammates' accounts for the user's shared Bots here, the
+                                                   user's for others', and removals (ADR 0066)
+  botctl user teammates <user> remove <teammate>   Remove that teammate's account for the user's Bots now:
+                                                   processes stopped, work to the user, login deleted
+  botctl user teammate-removals [pending|held|done|cancelled|open|all]
+                                                   Removals of leaving teammates' accounts here (default open)
   botctl user harness-login <user> <claude|codex> [--owner <owner>] [-- <args>...]
                                                    Log a harness in as that user's account, for their
                                                    Bots only (as botd's service account, at a terminal).
@@ -280,6 +286,17 @@ fn machine_login(user: &str, harness: &str) -> Result<String, String> {
         }
     }
     Err("The server ended the login without saying how it went. See botctl machine harness-logins.".into())
+}
+
+/// `botctl user teammates ...` and `botctl user teammate-removals ...` (ADR 0066).
+fn teammate_accounts_request(args: &[&str]) -> Result<(&'static str, String), String> {
+    Ok(match args {
+        ["teammates", user] => ("GET", format!("/api/users/{}/teammate-accounts", encode(user))),
+        ["teammates", user, "remove", teammate] => ("POST", format!("/api/users/{}/teammate-accounts/{}/remove", encode(user), encode(teammate))),
+        ["teammate-removals"] => ("GET", "/api/isolation/teammate-removals?state=open".into()),
+        ["teammate-removals", s @ ("pending" | "held" | "done" | "cancelled" | "open" | "all")] => ("GET", format!("/api/isolation/teammate-removals?state={s}")),
+        _ => return Err("Usage: botctl user teammates <user> [remove <teammate>] | teammate-removals [pending|held|done|cancelled|open|all]".into()),
+    })
 }
 
 /// The extra arguments of `botctl user harness-login`: the owner whose shared Bots the
@@ -1016,6 +1033,12 @@ fn run(args: &[String]) -> Result<String, String> {
         ["user", "isolation", key] => op("GET", &format!("/api/users/{}/isolation", encode(key)), None),
         ["user", "isolate", key] => op("POST", &format!("/api/users/{}/isolation", encode(key)), None),
         ["user", "harness-login", key, harness, rest @ ..] => harness_login(key, harness, rest),
+        ["user", sub @ ("teammates" | "teammate-removals"), rest @ ..] => {
+            let mut args = vec![*sub];
+            args.extend_from_slice(rest);
+            let (method, path) = teammate_accounts_request(&args)?;
+            op(method, &path, None)
+        }
         ["tiers"] => op("GET", "/api/tiers", None),
         ["usage"] => Ok(usage_summary(&serde_json::from_str(&api(Cred::Operator, "GET", "/api/usage", None)?).map_err(|e| e.to_string())?)),
         ["usage", "json"] => op("GET", "/api/usage", None),
@@ -1198,6 +1221,16 @@ mod tests {
         assert_eq!(machine_request(&["screens", "a@example.com"]).unwrap(), ("GET", "/api/users/a%40example.com/machine/screens".into()));
         assert_eq!(machine_request(&["screens", "u1", "close", "b 1"]).unwrap(), ("DELETE", "/api/users/u1/machine/screens/b%201".into()));
         assert!(machine_request(&["screens", "u1", "close"]).is_err());
+        assert_eq!(teammate_accounts_request(&["teammates", "u1"]).unwrap(), ("GET", "/api/users/u1/teammate-accounts".into()));
+        assert_eq!(
+            teammate_accounts_request(&["teammates", "a@example.com", "remove", "b@example.com"]).unwrap(),
+            ("POST", "/api/users/a%40example.com/teammate-accounts/b%40example.com/remove".into())
+        );
+        assert_eq!(teammate_accounts_request(&["teammate-removals"]).unwrap(), ("GET", "/api/isolation/teammate-removals?state=open".into()));
+        assert_eq!(teammate_accounts_request(&["teammate-removals", "held"]).unwrap(), ("GET", "/api/isolation/teammate-removals?state=held".into()));
+        for bad in [&["teammates", "u1", "remove"][..], &["teammates"], &["teammate-removals", "soon"], &["teammates", "u1", "purge", "u2"]] {
+            assert!(teammate_accounts_request(bad).is_err(), "{bad:?}");
+        }
         assert_eq!(machine_request(&["teammates", "u1"]).unwrap(), ("GET", "/api/users/u1/machine/teammates".into()));
         assert_eq!(
             machine_request(&["teammates", "u1", "remove", "b@example.com"]).unwrap(),
