@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 use axum::body::Bytes;
-use axum::http::{Method, StatusCode, Uri};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -13,8 +13,8 @@ use std::net::TcpStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const PASSWORD: &str = "e2e-password";
@@ -40,11 +40,23 @@ pub struct FakeModel {
     /// How long each model call takes, in milliseconds: 0 by default. A delay holds a run
     /// open the way a real model's latency does, so its processes can be measured.
     pub delay_ms: Arc<AtomicU64>,
+    /// The key each model call came with: `x-api-key`, else the bearer token.
+    pub keys: Arc<Mutex<Vec<String>>>,
+    /// The HTTP status every model call gets: 0 answers it.
+    pub fail: Arc<AtomicU16>,
 }
 
 impl FakeModel {
     pub fn set_delay(&self, d: Duration) {
         self.delay_ms.store(d.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    pub fn set_fail(&self, status: u16) {
+        self.fail.store(status, Ordering::SeqCst);
+    }
+
+    pub fn keys(&self) -> Vec<String> {
+        self.keys.lock().unwrap().clone()
     }
 }
 
@@ -60,41 +72,64 @@ pub enum Turn {
 }
 
 pub fn fake_model() -> FakeModel {
+    fake_provider(None)
+}
+
+/// The fake model behind one provider's endpoint (ADR 0077): `tag` starts each reply,
+/// so a test sees which provider answered.
+pub fn fake_provider(tag: Option<&'static str>) -> FakeModel {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     listener.set_nonblocking(true).unwrap();
     let ids = Arc::new(AtomicU64::new(1));
     let (calls, delay_ms) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
-    let (c, d) = (calls.clone(), delay_ms.clone());
+    let (keys, fail) = (Arc::new(Mutex::new(Vec::new())), Arc::new(AtomicU16::new(0)));
+    let (c, d, k, f) = (calls.clone(), delay_ms.clone(), keys.clone(), fail.clone());
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         rt.block_on(async move {
-            let app = axum::Router::new().fallback(move |m: Method, u: Uri, b: Bytes| {
-                let (ids, calls, delay) = (ids.clone(), c.clone(), d.clone());
+            let app = axum::Router::new().fallback(move |m: Method, u: Uri, h: HeaderMap, b: Bytes| {
+                let (ids, calls, delay, keys, fail) = (ids.clone(), c.clone(), d.clone(), k.clone(), f.clone());
                 async move {
                     if m == Method::POST {
                         calls.fetch_add(1, Ordering::SeqCst);
+                        let header = |n: &str| h.get(n).and_then(|v| v.to_str().ok()).map(String::from);
+                        let key = header("x-api-key").or_else(|| header("authorization").map(|a| a.trim_start_matches("Bearer ").to_string()));
+                        keys.lock().unwrap().push(key.unwrap_or_default());
+                        let status = fail.load(Ordering::SeqCst);
+                        if status != 0 {
+                            let error = json!({ "type": "error", "error": { "type": "api_error", "message": "e2e: this provider is down" } });
+                            return (StatusCode::from_u16(status).unwrap(), [("content-type", "application/json")], error.to_string()).into_response();
+                        }
                         tokio::time::sleep(Duration::from_millis(delay.load(Ordering::SeqCst))).await;
                     }
-                    serve(&m, u.path(), &b, &ids)
+                    serve_as(&m, u.path(), &b, &ids, tag)
                 }
             });
             axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app).await.unwrap();
         });
     });
-    FakeModel { port, calls, delay_ms }
+    FakeModel { port, calls, delay_ms, keys, fail }
 }
 
 pub fn serve(method: &Method, path: &str, body: &[u8], ids: &AtomicU64) -> Response {
+    serve_as(method, path, body, ids, None)
+}
+
+pub fn serve_as(method: &Method, path: &str, body: &[u8], ids: &AtomicU64, tag: Option<&str>) -> Response {
     let req: Value = serde_json::from_slice(body).unwrap_or_default();
     let id = ids.fetch_add(1, Ordering::SeqCst);
     let stream = req["stream"].as_bool() == Some(true);
+    let tagged = |r: Reply| match (r, tag) {
+        (Reply::Text(t), Some(tag)) => Reply::Text(format!("[{tag}] {t}")),
+        (r, _) => r,
+    };
     match (method.as_str(), path) {
         ("GET", p) if p.ends_with("/models") => json_response(json!({ "object": "list", "data": [{ "id": MODEL, "object": "model", "owned_by": "e2e" }] })),
         ("POST", p) if p.ends_with("/messages/count_tokens") => json_response(json!({ "input_tokens": 1 })),
-        ("POST", p) if p.ends_with("/messages") => anthropic(decide(anthropic_turns(&req), anthropic_tools(&req)), stream, id),
-        ("POST", p) if p.ends_with("/responses") => responses(decide(responses_turns(&req), responses_tools(&req)), stream, id),
-        ("POST", p) if p.ends_with("/chat/completions") => chat(decide(chat_turns(&req), chat_tools(&req)), stream, id),
+        ("POST", p) if p.ends_with("/messages") => anthropic(tagged(decide(anthropic_turns(&req), anthropic_tools(&req))), stream, id),
+        ("POST", p) if p.ends_with("/responses") => responses(tagged(decide(responses_turns(&req), responses_tools(&req))), stream, id),
+        ("POST", p) if p.ends_with("/chat/completions") => chat(tagged(decide(chat_turns(&req), chat_tools(&req))), stream, id),
         _ => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }

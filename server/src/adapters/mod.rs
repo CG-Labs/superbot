@@ -70,6 +70,12 @@ pub struct RunInput {
     pub cwd: PathBuf,
     /// The model provider, for harnesses that take one (`supports_provider`).
     pub provider: Option<String>,
+    /// The tiers file's endpoints that `provider` and `fallback` name (ADR 0077). Their
+    /// keys are in `env`, but reach the harness only through the adapter's `env`.
+    pub endpoints: Vec<crate::tiers::Endpoint>,
+    /// What to try, in order, when the provider fails. None: the harness's own
+    /// settings. Some: exactly these, and no other provider.
+    pub fallback: Option<Vec<crate::tiers::Fallback>>,
     pub model: Option<String>,
     /// Reasoning effort, in the harness's own words (e.g. "high").
     pub effort: Option<String>,
@@ -149,15 +155,43 @@ pub(crate) fn secret_env() -> Vec<String> {
     names
 }
 
+/// Tier endpoints' key secrets, and their `_FILE`: a run gets one only when routed to
+/// its endpoint, and only as its adapter hands it over (ADR 0077).
+static WITHHELD: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Keeps these secrets from everything botd starts, unless a run is given them.
+pub fn withhold(names: impl IntoIterator<Item = String>) {
+    let mut w = WITHHELD.write().unwrap_or_else(|e| e.into_inner());
+    for n in names {
+        for k in [format!("{n}_FILE"), n] {
+            if !w.contains(&k) {
+                w.push(k);
+            }
+        }
+    }
+}
+
+/// Whether `withhold` keeps this name from what botd starts.
+pub fn withheld(name: &str) -> bool {
+    WITHHELD.read().unwrap_or_else(|e| e.into_inner()).iter().any(|k| k == name)
+}
+
+/// What nothing botd starts may inherit from it: `secret_env` and `withhold`'s names.
+fn never_inherited() -> Vec<String> {
+    let mut names = secret_env();
+    names.extend(WITHHELD.read().unwrap_or_else(|e| e.into_inner()).iter().cloned());
+    names
+}
+
 pub(crate) fn strip_secret_env(cmd: &mut std::process::Command) {
-    for k in secret_env() {
+    for k in never_inherited() {
         cmd.env_remove(k);
     }
 }
 
 /// How jobs start on this server: botd's environment, without its secrets.
 pub fn local_host() -> job::Host {
-    job::Host { clear_env: false, remove: secret_env(), env: BTreeMap::new(), user: None }
+    job::Host { clear_env: false, remove: never_inherited(), env: BTreeMap::new(), user: None }
 }
 
 pub trait Adapter: Send + Sync {
@@ -170,6 +204,12 @@ pub trait Adapter: Send + Sync {
     fn models(&self) -> Vec<ModelOption>;
     /// Whether it uses `RunInput::provider`. Tiers may name a provider only for these.
     fn supports_provider(&self) -> bool {
+        false
+    }
+    /// Whether `error` says the harness won't resume its session with this run's
+    /// settings, as when the owner's tier moved the Bot to another route. The run then
+    /// starts a fresh session rather than run on the old route.
+    fn resume_refused(&self, _error: &str) -> bool {
         false
     }
     /// Environment the harness needs on top of `input.env`.
@@ -351,6 +391,10 @@ pub async fn aborted(mut abort: watch::Receiver<AbortReason>) {
 pub fn job_for(adapter: &mut dyn Adapter, input: &RunInput, out: &mut Vec<AgentEvent>) -> JobRequest {
     let args = adapter.args(input, out);
     let mut env: BTreeMap<String, String> = input.env.clone().into_iter().collect();
+    // A tier endpoint's key reaches the harness only as its adapter hands it over (ADR 0077).
+    for e in &input.endpoints {
+        env.remove(&e.key_secret);
+    }
     env.extend(adapter.env(input));
     let path = |p: &std::path::Path| p.display().to_string();
     JobRequest {
@@ -488,6 +532,8 @@ mod tests {
             session_id: None,
             cwd: dir.to_path_buf(),
             provider: None,
+            endpoints: Vec::new(),
+            fallback: None,
             model: None,
             effort: None,
             env: HashMap::from([("PATH".into(), "/opt/superbot/bin:/usr/bin:/bin".into())]),
@@ -577,6 +623,21 @@ mod tests {
         for k in ["AUTH_PASSWORD", "SUPERBOT_MASTER_KEY_FILE", "LINODE_TOKEN", "LINODE_TOKEN_FILE", "INCUS_CLIENT_KEY", "INCUS_CLIENT_KEY_FILE", "TURNSTILE_SECRET", "TURNSTILE_SECRET_FILE", "LICENSE_KEY", "LICENSE_KEY_FILE", "STRIPE_WEBHOOK_SECRET", "STRIPE_WEBHOOK_SECRET_FILE", "STRIPE_SECRET_KEY", "STRIPE_SECRET_KEY_FILE", "SMTP_PASSWORD", "SMTP_PASSWORD_FILE", "NOTIFY_WEBHOOK_URL", "NOTIFY_WEBHOOK_SECRET_FILE"] {
             assert!(removed.iter().any(|r| r == k), "{k}");
         }
+    }
+
+    /// A tier endpoint's key reaches a run only as its adapter hands it over (ADR 0077),
+    /// so no child inherits it from botd's environment, under either name.
+    #[test]
+    fn tier_keys_are_never_inherited() {
+        super::withhold(["E2E_WITHHELD_KEY".to_string()]);
+        super::withhold(["E2E_WITHHELD_KEY".to_string()]);
+        let remove = super::local_host().remove;
+        assert_eq!(remove.iter().filter(|k| k.starts_with("E2E_WITHHELD_KEY")).count(), 2);
+        assert!(remove.contains(&"E2E_WITHHELD_KEY_FILE".to_string()));
+        let mut cmd = std::process::Command::new("true");
+        super::strip_secret_env(&mut cmd);
+        assert!(cmd.get_envs().any(|(k, v)| k == "E2E_WITHHELD_KEY" && v.is_none()));
+        assert!(!super::secret_env().contains(&"E2E_WITHHELD_KEY".to_string()), "still a name a tiers file may use");
     }
 
     fn sandboxed(dir: &std::path::Path) -> RunInput {

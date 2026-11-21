@@ -9,7 +9,7 @@ use crate::db::{Bot, BotPatch, Db, Message, TokenRow};
 use crate::machines::ControlPlane;
 use crate::machines::route::{self, Assigned, Refusal, Target};
 use crate::machines::wire::{self, JobEvent};
-use crate::tiers::{self, Route, Tier, Tiers};
+use crate::tiers::{self, Route, Tier, Tiers, Wiring};
 use crate::{isolation, paths, usage};
 use crate::approvals::RunGrant;
 use crate::policy::{Ctx, Mode, RunScope};
@@ -751,7 +751,7 @@ impl App {
             bot.session_id = None;
         }
         let period = self.billing_period(&bot.owner_id, crate::db::now());
-        let Some((tier, route)) = self.tier_route(&bot, msg, &by, &period) else { return };
+        let Some((tier, route, wiring)) = self.tier_route(&bot, msg, &by, &period, &space.1) else { return };
         let placed_at = self.db.placed_at(&bot.owner_id);
         let Some(place) = self.place(&bot, msg, &by, &period.key, bin, for_other.as_deref()).await else { return };
         // Held until the run ends, however it ends: dropping it lets the next run in.
@@ -907,6 +907,16 @@ impl App {
                 self.seed_teammate_memory(&bot, &spot.memory);
             }
             let mut env = spot.env.clone();
+            // Nothing botd starts inherits a tier endpoint's key, so a run routed to one
+            // is given it, and only it.
+            crate::adapters::withhold(self.tiers().providers().iter().map(|p| p.key_secret.clone()));
+            env.retain(|k, _| !wiring.unused_keys.contains(k));
+            for e in &wiring.endpoints {
+                if let Some(v) = tier_key(&env, &e.key_secret) {
+                    crate::secrets::redact::register(&v);
+                    env.insert(e.key_secret.clone(), v);
+                }
+            }
             env.insert("SUPERBOT_RUN_ID".into(), run_id.clone());
             if spot.screens
                 && spot.machine.is_none()
@@ -921,6 +931,12 @@ impl App {
                 "trigger": msg.role, "messageId": msg.id, "runId": run_id,
             });
             merge(&mut invoked, &host);
+            if let Some(f) = &wiring.fallback {
+                invoked["fallback"] = json!(f);
+            }
+            if !wiring.skipped.is_empty() {
+                invoked["fallbackSkipped"] = json!(wiring.skipped);
+            }
             if let Some(r) = &run_as {
                 invoked["runAs"] = json!(r.account);
             }
@@ -937,6 +953,8 @@ impl App {
                 session_id: bot.session_id.clone(),
                 cwd: spot.cwd.clone(),
                 provider: route.provider.clone(),
+                endpoints: wiring.endpoints.clone(),
+                fallback: wiring.fallback.clone(),
                 model: route.model.clone(),
                 effort: route.effort.clone(),
                 env,
@@ -1019,8 +1037,12 @@ impl App {
                 self.say(&id, &draft, false);
             }
 
-            // The harness lost its session (e.g. its files were wiped): start fresh once.
+            // The harness lost its session (e.g. its files were wiped) or won't resume it
+            // on this route: start fresh once.
             let lost = errors.iter().any(|m| {
+                if gate.resume_refused(m) {
+                    return true;
+                }
                 let m = m.to_lowercase();
                 m.contains("no conversation found")
                     || m.contains("no session found")
@@ -1636,16 +1658,20 @@ impl App {
 
     /// The tier this run is on and the route it takes: the Bot owner's tier picks the
     /// model, never the Bot's settings alone (ADR 0033). The run is counted for the
-    /// owner, within the tier's runs and tokens a billing period (ADR 0050). None:
-    /// refused, and the Bot said why.
-    fn tier_route(&self, bot: &Bot, msg: &Message, by: &Who, period: &usage::Period) -> Option<(String, Route)> {
+    /// owner, within the tier's runs and tokens a billing period (ADR 0050). A route
+    /// whose provider is one of the tiers file's endpoints needs that endpoint's key
+    /// (`tier_key`, ADR 0077). None: refused, and the Bot said why.
+    fn tier_route(&self, bot: &Bot, msg: &Message, by: &Who, period: &usage::Period, env: &HashMap<String, String>) -> Option<(String, Route, Wiring)> {
         let tier = self.tier_of(&bot.owner_id);
-        let refused = |reason: &str, text: String, limit: Option<u64>, used: Option<u64>| {
+        let refused = |reason: &str, text: String, limit: Option<u64>, used: Option<u64>, more: Value| {
             self.give_back_routine(bot, msg);
             let mut details = json!({ "reason": reason, "owner": bot.owner_id, "tier": tier.name, "limit": limit, "period": period.key, "messageId": msg.id });
             if let Some(n) = used {
                 details["used"] = json!(n);
                 details["periodEnd"] = json!(period.end);
+            }
+            if let (Some(d), Value::Object(more)) = (details.as_object_mut(), more) {
+                d.extend(more);
             }
             self.db.record(&by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied).details(details));
             // A routine keeps firing into a used-up period; one bubble says it.
@@ -1656,11 +1682,19 @@ impl App {
         };
         let license = self.license.status();
         if !license.usable() {
-            return refused("unlicensed", license.run_refusal(), None, None);
+            return refused("unlicensed", license.run_refusal(), None, None, Value::Null);
         }
         let route = match tier.route(&bot.harness, bot.model.as_deref(), bot.effort.as_deref()) {
             Ok(r) => r,
-            Err(e) => return refused("tier_harness", format!("{e} Switch me to one of those in my settings."), None, None),
+            Err(e) => return refused("tier_harness", format!("{e} Switch me to one of those in my settings."), None, None, Value::Null),
+        };
+        let has_key = |k: &str| tier_key(env, k).is_some();
+        let wiring = match self.tiers().wiring(&route, tier.managed(), has_key) {
+            Ok(w) => w,
+            Err(e) => {
+                let text = format!("The {} plan's model provider isn't set up on this server yet, so I didn't run. Ask an admin to save its key.", tier.label);
+                return refused("provider_key_missing", text, None, None, json!({ "provider": e.name, "keyName": e.key_secret }));
+            }
         };
         let (this, more) = match period.source {
             usage::Source::Calendar => ("month", "the 1st (UTC)".to_string()),
@@ -1674,14 +1708,14 @@ impl App {
                     tier.label,
                     usage::thousands(limit)
                 );
-                return refused("tier_token_limit", text, Some(limit), Some(used));
+                return refused("tier_token_limit", text, Some(limit), Some(used), Value::Null);
             }
         }
         if let Err(limit) = self.db.take_run(&bot.owner_id, &period.key, tier.limits.monthly_runs) {
             let text = format!("The {} plan allows {limit} runs a {this}, and this {this}'s are used up. More start on {more}.", tier.label);
-            return refused("tier_limit", text, Some(u64::from(limit)), None);
+            return refused("tier_limit", text, Some(u64::from(limit)), None, Value::Null);
         }
-        Some((tier.name.clone(), route))
+        Some((tier.name.clone(), route, wiring))
     }
 
     /// Records the tokens a run used, one row per model, charged to the Bot's owner
@@ -2163,6 +2197,17 @@ fn merge(v: &mut Value, extra: &Value) {
     if let (Some(v), Some(x)) = (v.as_object_mut(), extra.as_object()) {
         v.extend(x.iter().map(|(k, x)| (k.clone(), x.clone())));
     }
+}
+
+/// A tier endpoint's key: the run's own secret of that name (its owner's, say), else
+/// the server's, wherever it is kept, `.env` included. Local runs don't get secrets
+/// from `.env` in `env`, since they would inherit them, but nothing inherits these.
+fn tier_key(env: &HashMap<String, String>, name: &str) -> Option<String> {
+    let set = |v: &String| !v.trim().is_empty();
+    env.get(name).filter(|v| set(v)).cloned().or_else(|| {
+        let v = crate::secrets::global().get(name).ok().flatten()?.expose().to_string();
+        set(&v).then_some(v)
+    })
 }
 
 #[cfg(test)]

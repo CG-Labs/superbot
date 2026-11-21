@@ -3,8 +3,9 @@ name: harness-e2e
 # Approvals end to end through the real harness CLIs, at the versions SuperBot pins
 # (server/src/adapters/install.rs), with a fake model (ADR 0057), and each CLI's per-Bot
 # footprint, uploaded as a report (ADR 0070). The Hermes job also checks that its pin is a
-# stable upstream release and that a hook timeout fails closed (ADR 0075). Runs when the
-# code between a harness and a decision changes, weekly, and by hand.
+# stable upstream release, that a hook timeout fails closed (ADR 0075), and that tiers
+# route it to two fake providers, with fallback (ADR 0077). Runs when the code between a
+# harness and a decision changes, weekly, and by hand.
 
 on:
   pull_request:
@@ -19,6 +20,7 @@ on:
       - 'server/src/shell.rs'
       - 'server/src/scripts.rs'
       - 'server/src/runner.rs'
+      - 'server/src/tiers.rs'
       - 'server/src/sandbox.rs'
       - 'server/src/bin/botctl.rs'
       - 'server/tests/harness_e2e.rs'
@@ -42,6 +44,7 @@ on:
       - 'server/src/shell.rs'
       - 'server/src/scripts.rs'
       - 'server/src/runner.rs'
+      - 'server/src/tiers.rs'
       - 'server/src/sandbox.rs'
       - 'server/src/bin/botctl.rs'
       - 'server/tests/harness_e2e.rs'
@@ -124,6 +127,8 @@ jobs:
         run: SUPERBOT_E2E_HARNESSES=hermes cargo test --test harness_e2e -- --ignored --nocapture hermes_hooks_hold
       - name: A hook that times out fails closed in Hermes Agent
         run: SUPERBOT_E2E_HARNESSES=hermes cargo test --test harness_e2e -- --ignored --nocapture hermes_hook_timeout_fails_closed
+      - name: Tiers route Hermes Agent through two providers, with fallback
+        run: SUPERBOT_E2E_HARNESSES=hermes cargo test --test harness_e2e -- --ignored --nocapture hermes_routes_two_providers
 
   # Numbers, not a gate: only ceilings far above what the pinned CLIs use are asserted.
   footprint:
