@@ -12,7 +12,7 @@ use crate::*;
 
 /// Claude Code as far as usage goes: names its model, answers, and reports the tokens
 /// in `bin/tokens` (input; plus 200 output and 300 cache reads), or none when it's 0.
-fn fake_claude_tokens(app: &App, input: u64) {
+pub(crate) fn fake_claude_tokens(app: &App, input: u64) {
     use std::os::unix::fs::PermissionsExt;
     let path = app.cfg.bin_dir.join("claude");
     let script = r#"#!/bin/sh
@@ -38,12 +38,12 @@ fi
     tokens(app, input);
 }
 
-fn tokens(app: &App, input: u64) {
+pub(crate) fn tokens(app: &App, input: u64) {
     std::fs::write(app.cfg.bin_dir.join("tokens"), input.to_string()).unwrap();
 }
 
 /// Sends "go" to `bot` as `who` and waits until its run is over and audited.
-async fn go(w: &World, who: &str, bot: &str) {
+pub(crate) async fn go(w: &World, who: &str, bot: &str) {
     let before = audit(w.port, &w.admin, &format!("bot={bot}")).await.len();
     let (code, body) = call(w.port, "POST", &format!("/api/bots/{bot}/messages"), who, r#"{"text":"go"}"#).await;
     assert_eq!(code, 202, "{body}");

@@ -275,6 +275,10 @@ fn wait(app: &AppState, m: &Machine, plan: &str, reason: &str, text: &str) {
     }
     // Said once per reason, not every pass.
     app.db.record(&event(&system(m), "machine.resize_waiting", m, details(m, json!({ "reason": reason, "error": text }))));
+    // Only these waits are the user's to end: they delete files (ADR 0089).
+    if matches!(reason, "storage_over" | "disk_too_full") {
+        crate::billing_mail::resize(app, m, crate::billing_mail::Kind::ResizeWaiting, Some(text));
+    }
     if reason == "no_room" {
         alert(app, m, "A machine can't grow on its host", text);
     }
@@ -286,6 +290,7 @@ fn fail(app: &AppState, m: &Machine, plan: &str, e: &ProviderError, count: bool)
         let m = app.db.machine(&m.id).unwrap_or_else(|| m.clone());
         app.db.record(&event(&system(&m), "machine.resize_failed", &m, details(&m, json!({ "error": e.to_string() }))).outcome(Outcome::Failure));
         alert(app, &m, "A machine couldn't be resized to its plan", &text);
+        crate::billing_mail::resize(app, &m, crate::billing_mail::Kind::ResizeFailed, None);
     }
 }
 

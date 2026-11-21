@@ -141,6 +141,9 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         // anyone may remove theirs, as anyone may sign out.
         ("PUT", ["me", "push"]) => Write,
         ("GET" | "DELETE", ["me", "push"]) => Account,
+        // Your own billing emails (ADR 0089). Handlers refuse Bots.
+        ("PUT", ["me", "emails"]) => Write,
+        ("GET", ["me", "emails"]) => Account,
 
         ("GET", ["state" | "events" | "bots" | "policy"]) => Read,
         ("GET", ["harnesses", _, "models"]) => Read,
@@ -361,6 +364,9 @@ mod tests {
             ("GET", "/api/machine/teammate//harness-logins", Perm::Admin),
             ("POST", "/api/machine/folder-sync", Perm::Admin),
             ("POST", "/api/auth/logout", Perm::Account),
+            ("GET", "/api/me/emails", Perm::Account),
+            ("PUT", "/api/me/emails", Perm::Write),
+            ("POST", "/api/me/emails", Perm::Admin),
             ("GET", "/api/me/push", Perm::Account),
             ("PUT", "/api/me/push", Perm::Write),
             ("DELETE", "/api/me/push", Perm::Account),

@@ -362,10 +362,15 @@ struct Sub<'a> {
     period_start: Option<i64>,
     period_end: Option<i64>,
     created: Option<i64>,
+    /// When Stripe will end it, Unix seconds (ADR 0089): `cancel_at`, or the period's
+    /// end while `cancel_at_period_end`.
+    cancel_at: Option<i64>,
 }
 
 fn read_sub(o: &Value) -> Option<Sub<'_>> {
     let items = o["items"]["data"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let period_end = o["current_period_end"].as_i64().or_else(|| items.iter().find_map(|i| i["current_period_end"].as_i64()));
+    let cancel_at = o["cancel_at"].as_i64().or_else(|| period_end.filter(|_| o["cancel_at_period_end"].as_bool() == Some(true)));
     Some(Sub {
         id: o["id"].as_str().filter(|s| !s.is_empty())?,
         customer: customer_of(o),
@@ -373,8 +378,9 @@ fn read_sub(o: &Value) -> Option<Sub<'_>> {
         user: o["metadata"][USER_KEY].as_str().map(str::trim).filter(|s| !s.is_empty()),
         prices: items.iter().filter_map(|i| i["price"]["id"].as_str()).collect(),
         period_start: o["current_period_start"].as_i64().or_else(|| items.iter().find_map(|i| i["current_period_start"].as_i64())),
-        period_end: o["current_period_end"].as_i64().or_else(|| items.iter().find_map(|i| i["current_period_end"].as_i64())),
+        period_end,
         created: o["created"].as_i64(),
+        cancel_at,
     })
 }
 
@@ -451,7 +457,8 @@ fn subscription_event(app: &App, event_id: &str, kind: &str, event: &Value) -> R
         event_created: created,
         updated_at: 0,
     };
-    let (applied, linked) = app.db.apply_subscription(event_id, kind, &row, set_tier)?;
+    let ev = crate::billing_mail::SubEvent { event_id, row: &row, cancel_at: sub.cancel_at, ending };
+    let (applied, linked, emails) = app.db.apply_subscription(event_id, kind, &row, set_tier, &|c| crate::billing_mail::subscription_emails(app, &ev, c))?;
     if let (Some(Linked::New), Some(cus)) = (&linked, sub.customer) {
         record_linked(app, &user, cus, "subscription", event_id);
     }
@@ -483,6 +490,10 @@ fn subscription_event(app: &App, event_id: &str, kind: &str, event: &Value) -> R
     let mut d = details;
     d["outcome"] = json!(outcome);
     app.db.record(&by.event("billing.subscription_synced").target("user", &user).details(d));
+    // After the resize is asked for, so the plan email can say what the computer is doing.
+    if emails > 0 {
+        crate::billing_mail::wake(app);
+    }
     Ok(outcome)
 }
 
@@ -592,6 +603,7 @@ pub async fn info(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>
             "subscription": sub.map(|s| json!({ "status": s.status, "tier": s.tier, "periodEnd": s.period_end })),
             "portal": app.db.customer_of(&u.id).is_some(),
             "canChange": crate::rbac::allows(c.principal, crate::rbac::Perm::Write),
+            "emails": crate::billing_mail::view(&app, &u.id),
         }),
     )
 }

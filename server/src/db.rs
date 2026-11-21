@@ -287,6 +287,16 @@ pub enum Applied {
     Changed { from: Option<String>, to: Option<String> },
 }
 
+/// What an event applied by `Db::apply_subscription` changed, for the billing emails it
+/// queues in the same transaction (ADR 0089).
+pub struct Change<'a> {
+    pub applied: &'a Applied,
+    /// This subscription as it was before the event. None: botd hadn't seen it.
+    pub before: Option<&'a Subscription>,
+    /// The user's paying subscription before the event, when the event was applied.
+    pub paying_before: Option<&'a Subscription>,
+}
+
 /// What linking a payment-provider customer to a user did (ADR 0042). A user has at most
 /// one customer and a customer pays for one user; the first link stands.
 #[derive(Debug, PartialEq)]
@@ -319,6 +329,33 @@ fn link_in(c: &Connection, user_id: &str, provider: &str, customer_id: &str, via
         params![user_id, provider, customer_id, now(), via],
     )?;
     Ok(Linked::New)
+}
+
+fn queue_email(c: &Connection, e: &crate::billing_mail::NewEmail) -> rusqlite::Result<bool> {
+    let facts = serde_json::to_string(&e.facts).unwrap_or_else(|_| "{}".into());
+    let at = now();
+    Ok(c.execute(
+        "INSERT OR IGNORE INTO billing_emails (key, user_id, kind, facts, event_id, next_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        params![e.key, e.user_id, e.kind.as_str(), facts, e.event_id, at, at],
+    )? == 1)
+}
+
+fn queued_email_row(r: &Row) -> rusqlite::Result<crate::billing_mail::Queued> {
+    let facts: String = r.get("facts")?;
+    Ok(crate::billing_mail::Queued {
+        id: r.get("id")?,
+        key: r.get("key")?,
+        user_id: r.get("user_id")?,
+        kind: r.get("kind")?,
+        facts: serde_json::from_str(&facts).unwrap_or_default(),
+        event_id: r.get("event_id")?,
+        state: r.get("state")?,
+        attempts: r.get("attempts")?,
+        next_at: r.get("next_at")?,
+        created_at: r.get("created_at")?,
+        done_at: r.get("done_at")?,
+        reason: r.get("reason")?,
+    })
 }
 
 /// Records a payment-provider event id. False when it was already applied.
@@ -1271,7 +1308,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 35] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 36] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1307,7 +1344,37 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 35] = [
     migrate_machine_tier_resize,
     migrate_machine_resize_sent,
     migrate_machine_suspended_at,
+    migrate_billing_emails,
 ];
+
+/// Billing emails (ADR 0089): one row per email, its `key` unique so a Stripe event,
+/// a billing period's limit or a resize asks for it once, kept after it's sent so a
+/// redelivery finds it. `email_prefs` holds each person's choice for usage emails.
+fn migrate_billing_emails(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS billing_emails (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key TEXT NOT NULL UNIQUE,
+            user_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            facts TEXT NOT NULL,
+            event_id TEXT,
+            state TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_at INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            done_at INTEGER,
+            reason TEXT
+        );
+        CREATE INDEX IF NOT EXISTS billing_emails_due ON billing_emails (state, next_at);
+        CREATE INDEX IF NOT EXISTS billing_emails_user ON billing_emails (user_id, id);
+        CREATE TABLE IF NOT EXISTS email_prefs (
+            user_id TEXT PRIMARY KEY,
+            usage_emails INTEGER NOT NULL DEFAULT 1,
+            updated_at INTEGER NOT NULL
+        );",
+    )
+}
 
 /// When a machine was suspended (ADR 0085): what its agent said of its disk before then
 /// still holds while it's off, and what it said long before doesn't.
@@ -3547,13 +3614,25 @@ impl Db {
     /// The subscription's customer (ADR 0042) must not be another user's
     /// (`CustomerOfAnotherUser`); a user with no customer yet is linked to it, and the
     /// second value says how.
-    pub fn apply_subscription(&self, event_id: &str, event_type: &str, sub: &Subscription, set_tier: bool) -> Result<(Applied, Option<Linked>), String> {
+    ///
+    /// `mail` gives the billing emails the event asks for (ADR 0089), queued in the same
+    /// transaction, so an event is recorded exactly when its emails are: a redelivery
+    /// (`Duplicate`) neither loses nor repeats them.
+    pub fn apply_subscription(
+        &self,
+        event_id: &str,
+        event_type: &str,
+        sub: &Subscription,
+        set_tier: bool,
+        mail: &dyn Fn(&Change) -> Vec<crate::billing_mail::NewEmail>,
+    ) -> Result<(Applied, Option<Linked>, usize), String> {
         let c = self.c();
         let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
         if !first_delivery(&tx, event_id, event_type).map_err(|e| e.to_string())? {
-            return Ok((Applied::Duplicate, None));
+            return Ok((Applied::Duplicate, None, 0));
         }
         let by_id = tx.query_row("SELECT * FROM subscriptions WHERE subscription_id = ?", [&sub.subscription_id], subscription_row).optional().map_err(|e| e.to_string())?;
+        let mut paying_before: Option<Subscription> = None;
         let customer_user = |cus: &str| tx.query_row("SELECT user_id FROM billing_customers WHERE customer_id = ?", [cus], |r| r.get::<_, String>(0)).optional();
         let others_customer = match (&by_id, &sub.customer_id) {
             (Some(s), _) if s.user_id != sub.user_id => false,
@@ -3577,7 +3656,7 @@ impl Db {
         } else {
             let paying_id = |s: &Option<Subscription>| s.as_ref().map(|s| s.subscription_id.clone());
             let before = paying_subscription(&tx, &sub.user_id).map_err(|e| e.to_string())?;
-            let tier = if set_tier { sub.tier.clone() } else { by_id.and_then(|s| s.tier) };
+            let tier = if set_tier { sub.tier.clone() } else { by_id.as_ref().and_then(|s| s.tier.clone()) };
             tx.execute(
                 "INSERT INTO subscriptions (subscription_id, user_id, provider, customer_id, status, price_id, tier, period_end, started, event_created, updated_at, period_start)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
@@ -3589,6 +3668,7 @@ impl Db {
             let after = paying_subscription(&tx, &sub.user_id).map_err(|e| e.to_string())?;
             let moved = paying_id(&before) != paying_id(&after);
             let to = after.as_ref().and_then(|s| s.tier.clone());
+            paying_before = before;
             if after.as_ref().is_some_and(|s| s.subscription_id != sub.subscription_id) && !moved {
                 Applied::Superseded
             } else if !set_tier && !moved {
@@ -3607,8 +3687,66 @@ impl Db {
             (Applied::OtherUser | Applied::CustomerOfAnotherUser, _) | (_, None) => None,
             (_, Some(cus)) => Some(link_in(&tx, &sub.user_id, &sub.provider, cus, "subscription").map_err(|e| e.to_string())?),
         };
+        let emails = mail(&Change { applied: &outcome, before: by_id.as_ref(), paying_before: paying_before.as_ref() });
+        let mut queued = 0;
+        for e in &emails {
+            queued += usize::from(queue_email(&tx, e).map_err(|e| e.to_string())?);
+        }
         tx.commit().map_err(|e| e.to_string())?;
-        Ok((outcome, linked))
+        Ok((outcome, linked, queued))
+    }
+
+    /// Queues a billing email (ADR 0089) unless one with its key was queued before.
+    /// True when this queued it.
+    pub fn queue_billing_email(&self, e: &crate::billing_mail::NewEmail) -> bool {
+        queue_email(&self.c(), e).unwrap_or_else(|err| {
+            eprintln!("botd: couldn't queue a billing email: {err}");
+            false
+        })
+    }
+
+    /// Billing emails due now, oldest first.
+    pub fn due_billing_emails(&self, now: i64, limit: u32) -> Vec<crate::billing_mail::Queued> {
+        let c = self.c();
+        let Ok(mut q) = c.prepare("SELECT * FROM billing_emails WHERE state = 'pending' AND next_at <= ? ORDER BY id LIMIT ?") else { return Vec::new() };
+        q.query_map(params![now, limit], queued_email_row).map(|rows| rows.flatten().collect()).unwrap_or_default()
+    }
+
+    /// A user's billing emails, newest first.
+    #[cfg(test)]
+    pub fn billing_emails_of(&self, user_id: &str, limit: u32) -> Vec<crate::billing_mail::Queued> {
+        let c = self.c();
+        let Ok(mut q) = c.prepare("SELECT * FROM billing_emails WHERE user_id = ? ORDER BY id DESC LIMIT ?") else { return Vec::new() };
+        q.query_map(params![user_id, limit], queued_email_row).map(|rows| rows.flatten().collect()).unwrap_or_default()
+    }
+
+    /// Settles a pending billing email: `sent`, `skipped` or `failed`, or `pending` again
+    /// at `next_at` after a failed try. A try that failed counts as an attempt.
+    pub fn billing_email_result(&self, id: i64, state: &str, reason: Option<&str>, attempted: bool, next_at: Option<i64>) {
+        let done = (state != "pending").then(now);
+        let _ = self.c().execute(
+            "UPDATE billing_emails SET state = ?, reason = ?, attempts = attempts + ?, next_at = COALESCE(?, next_at), done_at = ? WHERE id = ? AND state = 'pending'",
+            params![state, reason, i64::from(attempted), next_at, done, id],
+        );
+    }
+
+    /// Makes every pending billing email due now, as if its backoff had passed.
+    #[cfg(test)]
+    pub fn billing_emails_due_now(&self) {
+        self.c().execute("UPDATE billing_emails SET next_at = 0 WHERE state = 'pending'", []).unwrap();
+    }
+
+    /// Whether the person wants usage emails (ADR 0089). On unless they turned them off.
+    pub fn usage_emails(&self, user_id: &str) -> bool {
+        self.c().query_row("SELECT usage_emails FROM email_prefs WHERE user_id = ?", [user_id], |r| r.get(0)).optional().ok().flatten().unwrap_or(true)
+    }
+
+    pub fn set_usage_emails(&self, user_id: &str, on: bool) {
+        let _ = self.c().execute(
+            "INSERT INTO email_prefs (user_id, usage_emails, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT (user_id) DO UPDATE SET usage_emails = ?2, updated_at = ?3",
+            params![user_id, on, now()],
+        );
     }
 
     /// The user's payment-provider customer (ADR 0042).
@@ -6098,7 +6236,7 @@ mod tests {
                         event_created: at,
                         updated_at: 0,
                     };
-                    db.apply_subscription(&format!("{}-{n}", u.id), "customer.subscription.updated", &s, true).unwrap();
+                    db.apply_subscription(&format!("{}-{n}", u.id), "customer.subscription.updated", &s, true, &|_| Vec::new()).unwrap();
                 }
                 assert_eq!(db.user(&u.id).unwrap().tier.as_deref(), want, "events {picked:?} in order {order:?}");
             }
