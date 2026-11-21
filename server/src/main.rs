@@ -132,6 +132,11 @@ mod teammate_logins;
 mod teammate_removals;
 #[cfg(test)]
 mod teammate_removals_http_tests;
+mod teams;
+#[cfg(test)]
+mod teams_http_tests;
+#[cfg(test)]
+mod teams_offboard_tests;
 
 use acl::{Access, Viewer, Visibility};
 use approvals::{DecideError, Remember};
@@ -212,6 +217,7 @@ async fn main() {
         .unwrap_or_else(|e| exit(format!("Control plane: {e}")));
     let shared_bots = acl::SharedBots::parse(&env("SHARED_BOTS", ""), control_plane.routing != machines::route::Routing::Off)
         .unwrap_or_else(|e| exit(format!("Shared Bots: {e}")));
+    let teams = teams::Settings::from_env(&|k| env(k, "")).unwrap_or_else(|e| exit(format!("Teams: {e}")));
     let resume_routines = handover::resume_on_enable(&env("ROUTINES_ON_ENABLE", "")).unwrap_or_else(|e| exit(e));
     let scim = scim::Scim::from_env(&env("SCIM", ""), &env("SCIM_DEFAULT_ROLE", "")).unwrap_or_else(|e| exit(format!("SCIM: {e}")));
     let tiers = tiers::Tiers::from_env(|k| env(k, "")).unwrap_or_else(|e| exit(format!("Tiers: {e}")));
@@ -311,6 +317,9 @@ async fn main() {
         None => println!("Runs at once: no cap on this server (MAX_CONCURRENT_RUNS=off); machines follow their owner's tier's concurrentRuns."),
     }
     let _ = app.shared_bots.set(shared_bots);
+    app.db.set_teams_strict(teams.strict);
+    let _ = app.teams.set(teams);
+    println!("Teams: {} (ADR 0087).", teams.describe());
     let _ = app.resume_routines_on_enable.set(resume_routines);
     println!(
         "Shared Bots: {}.",
@@ -708,6 +717,20 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/teammate-accounts", get(teammate_removals::of_user))
         .route("/users/{key}/teammate-accounts/{teammate}/remove", post(teammate_removals::remove_now))
         .route("/isolation/teammate-removals", get(teammate_removals::list_all))
+        .route("/teams", get(teams::list).post(teams::create))
+        .route("/teams/{id}", get(teams::get).patch(teams::update).delete(teams::delete))
+        .route("/teams/{id}/members/{user}", put(teams::put_member).delete(teams::delete_member))
+        .route("/team", get(teams::mine))
+        .route("/team/leave", post(teams::leave_mine))
+        .route("/team/invites", post(teams::invite))
+        .route("/team/invites/{id}", delete(teams::uninvite))
+        .route("/team/members/{user}", patch(teams::set_role).delete(teams::remove))
+        .route("/team/members/{user}/machine", post(teams::give_machine))
+        .route("/team/members/{user}/machine/suspend", post(teams::suspend))
+        .route("/team/members/{user}/machine/resume", post(teams::resume))
+        .route("/me/team-invites", get(teams::my_invites))
+        .route("/me/team-invites/{id}", delete(teams::decline))
+        .route("/me/team-invites/{id}/accept", post(teams::accept))
         .route("/machine", get(machines::mine))
         .route("/machine/harness-login", post(machines::logins::my_start))
         .route("/machine/harness-login/{id}", delete(machines::logins::my_abort))
@@ -2121,6 +2144,15 @@ async fn put_grant(State(app): State<AppState>, Extension(c): Extension<Caller>,
     let u = app.db.find_user(&key).ok_or_else(|| not_found("User"))?;
     if u.id == bot.owner_id {
         return Err(ApiError(StatusCode::CONFLICT, "That user owns this Bot already.".into()));
+    }
+    // A grant reaches only the owner's team (ADR 0087). Only admins learn the person exists.
+    if !app.db.same_team(&bot.owner_id, &u.id) {
+        let details = json!({ "reason": "other_team", "user": u.id, "level": level });
+        app.db.record(&by.event("bot.access_refused").target("bot", &id).bot(&id).outcome(Outcome::Denied).details(details));
+        return Err(match c.principal {
+            Principal::User(Role::Admin) => ApiError(StatusCode::CONFLICT, "They aren't on this Bot's owner's team, so a grant wouldn't reach them.".into()),
+            _ => not_found("User"),
+        });
     }
     let by_id = c.user.as_ref().map_or(users::OPERATOR, |u| u.id.as_str());
     let before = app.db.set_grant(&id, &u.id, level, by_id);

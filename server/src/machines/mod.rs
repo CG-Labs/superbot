@@ -227,6 +227,13 @@ impl Default for ControlPlane {
     }
 }
 
+impl ControlPlane {
+    /// Serialises machine changes, as every request and reconcile step does.
+    pub(crate) async fn lock_ops(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.ops.lock().await
+    }
+}
+
 /// Lowercase letters, digits, and inner dashes, as Linode plans, regions, and tags are.
 fn slug(s: &str, max: usize) -> bool {
     !s.is_empty()
@@ -1022,7 +1029,11 @@ pub async fn reconcile(app: &AppState, cp: &ControlPlane) -> Value {
     }
     rebuild::reconcile(app, cp).await;
     resize::reconcile(app, cp).await;
+    let teams = crate::teams::sweep(app, cp).await;
     let mut out = json!({ "checked": ids.len(), "changed": changed });
+    if teams != json!({}) {
+        out["teams"] = teams;
+    }
     if let Some(fw) = &cp.firewall {
         let _g = cp.ops.lock().await;
         out["firewallAttached"] = firewall::sync(app, fw, p).await.into();
@@ -1255,10 +1266,15 @@ pub async fn request(
     Path(key): Path<String>,
     body: Bytes,
 ) -> Res<Response> {
-    let cp = &a.machines;
+    request_as(&app, &a.machines, &by, &key, &body).await
+}
+
+/// `request`, for whoever may ask: admins, and team admins for their team (ADR 0087).
+pub(crate) async fn request_as(app: &AppState, cp: &ControlPlane, by: &Who, key: &str, body: &Bytes) -> Res<Response> {
+    let (app, by) = (app.clone(), by.clone());
     let p = cp.need()?;
-    let f = fields(&body, &["tier", "region"])?;
-    let u = need_user_key(&app, &key)?;
+    let f = fields(body, &["tier", "region"])?;
+    let u = need_user_key(&app, key)?;
     if !u.active() {
         return Err(conflict(
             "This user is disabled. Enable them before giving them a machine.".into(),
@@ -1403,7 +1419,7 @@ pub async fn request(
 /// Suspend, resume, or resize. The provider is asked how the machine is first, so a
 /// call whose answer was lost, or a change made at the provider, is neither repeated
 /// nor taken as done when it isn't. Repeating one that is done changes nothing.
-async fn act(
+pub(crate) async fn act(
     app: &AppState,
     cp: &ControlPlane,
     by: &Who,
@@ -1411,11 +1427,28 @@ async fn act(
     step: Step,
     target: Option<(String, String)>,
 ) -> Res<Response> {
+    act_if(app, cp, by, key, step, target, &|_| true).await
+}
+
+/// `act`, once `still` holds for the machine under the lock: a caller that decided
+/// earlier doesn't act on a machine that changed hands meanwhile.
+pub(crate) async fn act_if(
+    app: &AppState,
+    cp: &ControlPlane,
+    by: &Who,
+    key: &str,
+    step: Step,
+    target: Option<(String, String)>,
+    still: &(dyn Fn(&Machine) -> bool + Sync),
+) -> Res<Response> {
     let p = cp.need()?;
     let u = need_user_key(app, key)?;
     let _g = cp.ops.lock().await;
     let mut m = need_machine(app, &u.id)?;
     cp.need_own(&m)?;
+    if !still(&m) {
+        return Err(conflict("The machine changed meanwhile; try again.".into()));
+    }
     if step == Step::Resize && target.is_none() {
         return Err(bad("Unknown tier"));
     }
@@ -1576,12 +1609,22 @@ pub async fn destroy(
     Extension(by): Extension<Who>,
     Path(key): Path<String>,
 ) -> Res<Response> {
-    let cp = &a.machines;
+    destroy_as(&app, &a.machines, &by, &key, &|_| true).await
+}
+
+/// `destroy`, for the control plane's own callers too (a team's machine given back, ADR 0087).
+/// `still` is checked under the lock before a machine starts going, so a caller that
+/// decided earlier can't destroy one that changed hands meanwhile.
+pub(crate) async fn destroy_as(app: &AppState, cp: &ControlPlane, by: &Who, key: &str, still: &(dyn Fn(&Machine) -> bool + Sync)) -> Res<Response> {
+    let (app, by) = (app.clone(), by.clone());
     let p = cp.need()?;
-    let u = need_user_key(&app, &key)?;
+    let u = need_user_key(&app, key)?;
     let _g = cp.ops.lock().await;
     let mut m = need_machine(&app, &u.id)?;
     cp.need_own(&m)?;
+    if m.state != State::Destroying && !still(&m) {
+        return Err(conflict("The machine changed meanwhile; it's kept.".into()));
+    }
     if m.state != State::Destroying {
         let from = m.state;
         m.state = next(from, Step::Destroy).ok_or_else(|| {
@@ -1757,13 +1800,24 @@ pub async fn assign(
                 if m.enrollment == "none" { "not enrolled" } else { m.enrollment.as_str() }
             )));
         }
-        if app.db.assign_machine(&m.id, by.actor.id.as_deref()) {
-            let forgot = app.db.forget_sessions_of(&u.id);
-            app.db.record(&event(&by, "placement.assigned", &m, json!({ "routing": cp.routing.as_str(), "userEmail": u.email, "sessionsReset": forgot })));
-            folder::assigned(&app, cp, &m, &by);
-        }
+        assign_now(&app, cp, &by, &m, json!({}));
     }
     Ok(Json(placement_view(&app, cp, &u.id)))
+}
+
+/// Assigns a running, enrolled machine to its user, under `cp.ops`. False if it was already.
+pub(crate) fn assign_now(app: &AppState, cp: &ControlPlane, by: &Who, m: &Machine, extra: Value) -> bool {
+    if !app.db.assign_machine(&m.id, by.actor.id.as_deref()) {
+        return false;
+    }
+    let forgot = app.db.forget_sessions_of(&m.user_id);
+    let mut d = json!({ "routing": cp.routing.as_str(), "userEmail": app.db.user(&m.user_id).and_then(|u| u.email), "sessionsReset": forgot });
+    if let (Some(d), Value::Object(x)) = (d.as_object_mut(), extra) {
+        d.extend(x);
+    }
+    app.db.record(&event(by, "placement.assigned", m, d));
+    folder::assigned(app, cp, m, by);
+    true
 }
 
 /// `DELETE /api/users/{key}/placement`: their Bots run where unassigned users' do.
