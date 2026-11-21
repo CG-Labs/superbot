@@ -196,7 +196,9 @@ export function AuditLog({ api, onBack, botName, bots = [], initial }: Props) {
 
   const filterFields = (
     <>
-      <Field label="Action" value={filters.action} onChange={set("action")} placeholder="Action, e.g. bot.* or auth.login_failed" />
+      <View style={styles.inputs}>
+        <Field label="Action" value={filters.action} onChange={set("action")} placeholder="Action, e.g. bot.* or auth.login_failed" />
+      </View>
       <Chips options={KINDS} value={filters.action.trim()} onChange={set("action")} />
       <View style={styles.inputs}>
         <Field label="Person" value={filters.person} onChange={set("person")} placeholder="Person: email or id" />
