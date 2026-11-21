@@ -16,7 +16,7 @@ An adapter may name the oldest release that runs its hook: `Adapter::hooks_since
 
 When the Bot's effective policy is `ask`, the runner checks after it knows where the run goes, before anything runs:
 
-- **On this server**: it finds `codex` on the run's own `PATH` (botd's bin folder first, as the run gets it) and runs `codex --version` there, without botd's secrets, for at most 15 seconds.
+- **On this server**: it finds `codex` on the run's own `PATH` (botd's bin folder first, as the run gets it), with relative and empty entries taken from the run's working folder as the harness would take them, and runs `codex --version` there, without botd's secrets, for at most 15 seconds.
 - **On the owner's machine**: it sends `codex --version` as a job, with the same `cwd` and user as the run. The agent finds the binary on its harness `PATH`, as it would for the run. The heartbeat's harness report isn't used: it only knows what the plan installed, not a Codex installed by hand or one earlier on a custom `SUPERBOT_HARNESS_PATH`. No agent change is needed, so every enrolled agent supports it.
 
 The version is the first `major.minor.patch` (with optional `v`, pre-release and build metadata) in what it prints (`codex-cli 0.141.0`). It is compared by semver precedence, so a pre-release comes before its release: `0.141.0-alpha.3` is refused, `0.142.0-alpha.1` passes. Build metadata is ignored.
@@ -41,6 +41,10 @@ A version that passed is remembered for 10 minutes, so most runs don't start a p
 - **On a machine**, keyed by the machine.
 
 A refusal is never remembered: once an admin updates Codex, the next run passes. A Codex downgraded within those 10 minutes runs guarded once more and the canary stops it at its first command, as before.
+
+### Stopping a task while it starts
+
+A task has nothing to abort until its run is registered, and the check (like placing it on a machine) happens before that. A stop in that window now marks the task, and the runner checks the mark under the same lock that registers the run: a stopped task says "Stopped." and never starts. The mark is cleared when the next message is taken, so it only ever stops the task that was starting.
 
 ### The canary stays
 
