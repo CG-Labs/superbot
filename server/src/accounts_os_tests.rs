@@ -365,3 +365,85 @@ async fn a_teammates_run_of_a_shared_bot_is_their_own_account_and_login() {
     assert!(again.contains("isn't logged in for you"), "{again}");
     assert!(std::fs::read_to_string(&ada_creds).unwrap().contains("A-SECRET"), "Ada's login is untouched");
 }
+
+/// ADR 0066: a leaving teammate's account goes: their running tool stopped, their work
+/// handed to the owner's account, their login and folder deleted. The owner's account,
+/// another teammate's, and the shared Bot keep working, and asking again changes nothing.
+#[tokio::test]
+#[ignore = "needs root's setup: deploy/test-isolation.sh"]
+async fn a_leaving_teammates_account_goes_and_the_shared_bot_keeps_working() {
+    let Some((app, iso)) = setup() else { return };
+    app.shared_bots.set(crate::acl::SharedBots::Isolated).unwrap();
+    let mk = |email: &str| app.db.create_user(None, Some(email), email, Role::Member).unwrap().id;
+    let (ada, bea, cy) = (mk("ada@example.com"), mk("bea@example.com"), mk("cy@example.com"));
+    let team = app.db.create_bot_owned("Team", "#fff", "waddle", "claude", None, false, &ada, Visibility::Shared);
+    let (bea_space, cy_space) = (Space::of(&ada, Some(&bea)), Space::of(&ada, Some(&cy)));
+    let (bea_acct, cy_acct) = (bea_space.account().unwrap(), cy_space.account().unwrap());
+    assert_eq!(run(&app, &team, "WRITE-CREDS").await, "wrote");
+    let ada_creds = iso.home(&ada).unwrap().join(".claude/.credentials.json");
+    for t in [&bea, &cy] {
+        assert!(log_in(&app, &ada, t).await.1);
+    }
+    let cy_creds = iso.home_in(cy_space).unwrap().join(".claude/.credentials.json");
+    assert!(iso.teammate_pairs().contains(&(ada.clone(), bea.clone())), "{:?}", iso.teammate_pairs());
+
+    // Bea's run is going, with a tool that ignores TERM, when she leaves.
+    let mut msg = app.db.add_message(&team.id, "user", "SLEEP", None, false, Some("queued"));
+    app.db.set_requested_by(msg.id, &person(&bea));
+    msg.requested_by = Some(person(&bea));
+    app.enqueue(msg.clone());
+    let beat = iso.workspace_in(bea_space).unwrap().join("heartbeat");
+    let start = Instant::now();
+    while !beat.exists() {
+        assert!(start.elapsed() < Duration::from_secs(30), "Bea's run never started");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    std::fs::write(iso.workspace_in(bea_space).unwrap().join("notes.txt"), "bea's notes").unwrap();
+
+    app.db.update_user(&bea, crate::db::UserPatch { status: Some("disabled"), ..Default::default() }).unwrap();
+    crate::teammate_removals::left(&app, &Who::system("test"), &bea, "disabled");
+    crate::teammate_removals::settled(&app).await;
+    let removed = audited(&app, "isolation.teammate_removed");
+    let d = removed.iter().find(|d| d["forUser"] == bea.as_str()).unwrap_or_else(|| panic!("{removed:?} {:?}", audited(&app, "isolation.teammate_removal_failed")));
+    eprintln!("Removed: {d}");
+    assert_eq!((d["account"].as_str(), d["work"].as_str(), d["accountRemoved"].as_bool()), (Some(bea_acct.as_str()), Some("archived"), Some(true)), "{d}");
+    assert!(d["processesStopped"].as_i64().unwrap() >= 1, "{d}");
+    assert!(crate::passwd::by_name(&bea_acct).is_none(), "the account is gone");
+    assert!(std::fs::symlink_metadata(iso.space_root(bea_space).unwrap()).is_err(), "the folder and login are gone");
+    let to = PathBuf::from(d["archivedTo"].as_str().unwrap());
+    assert!(to.starts_with(iso.workspace(&ada).unwrap().join("from-teammates")), "{}", to.display());
+    assert_eq!(std::fs::read_to_string(to.join("notes.txt")).unwrap(), "bea's notes");
+    assert!(!to.join(".claude").exists() && !to.join("home").exists(), "the login isn't handed over");
+
+    // The tool is dead, and the run is over.
+    let start = Instant::now();
+    while app.db.message(msg.id).unwrap().status.as_deref() != Some("done") {
+        assert!(start.elapsed() < Duration::from_secs(30), "Bea's run never ended");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let then = std::fs::read_to_string(to.join("heartbeat")).unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(std::fs::read_to_string(to.join("heartbeat")).unwrap(), then, "a process of Bea's is still going");
+
+    // Ada's login, Cy's account and login are untouched, and the Bot works for both.
+    assert!(std::fs::read_to_string(&ada_creds).unwrap().contains("A-SECRET"));
+    assert!(iso.ready_in(cy_space) && cy_creds.is_file());
+    assert_eq!(probes(&run(&app, &team, "PROBE nobody").await)["user"], accounts::account(&ada).unwrap());
+    assert_eq!(probes(&run_for(&app, &team, Some(&cy), "PROBE nobody").await)["user"], cy_acct);
+
+    // Again changes nothing.
+    crate::teammate_removals::left(&app, &Who::system("test"), &bea, "disabled");
+    crate::teammate_removals::follow_up(&app);
+    crate::teammate_removals::settled(&app).await;
+    assert_eq!(audited(&app, "isolation.teammate_removed").iter().filter(|d| d["forUser"] == bea.as_str()).count(), 1);
+    let again = iso.remove_teammate(&ada, &bea, "0123456789abcdef", &accounts::Work::Delete).unwrap();
+    assert_eq!((again.account_removed, again.work.as_str()), (false, "none"));
+    assert_eq!(std::fs::read_to_string(to.join("notes.txt")).unwrap(), "bea's notes");
+    assert!(iso.ready_in(cy_space) && crate::passwd::by_name(&accounts::account(&ada).unwrap()).is_some());
+
+    // Back again, Bea gets a new account; her old work stays Ada's.
+    app.db.update_user(&bea, crate::db::UserPatch { status: Some("active"), ..Default::default() }).unwrap();
+    assert!(log_in(&app, &ada, &bea).await.1);
+    assert!(iso.ready_in(bea_space));
+    assert!(!iso.workspace_in(bea_space).unwrap().join("notes.txt").exists());
+}

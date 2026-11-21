@@ -3,7 +3,8 @@
 # with the installer's own functions, checks the privileged surface, then runs botd's OS
 # tests: user B's Bot, through the real run path, against user A's folder and logins, and
 # a teammate's run of an owner's shared Bot, as its own account with its own login
-# (docs/adr/0064-teammate-accounts-on-one-server.md).
+# (docs/adr/0064-teammate-accounts-on-one-server.md), and that account's removal when the
+# teammate leaves (docs/adr/0066-removing-teammate-accounts-on-one-server.md).
 #
 # It adds accounts, a sudoers rule, and /srv/superbot-test, so run it only on a throwaway
 # host (CI does), as root:
@@ -84,7 +85,7 @@ mv "$home/superbot/.env.kept" "$home/superbot/.env"
 as_svc() { sudo -u "$SVC" -H -- "$@"; }
 refused() { if "$@" >/dev/null 2>&1; then die "allowed: $*"; fi; }
 
-log "The service account may do exactly two things as others, and nothing else"
+log "The service account may run superbot-run as per-user accounts and superbot-userctl, and nothing else"
 refused as_svc sudo -n true
 refused as_svc sudo -n -u root "$LIB/bin/superbot-run" true
 refused as_svc sudo -n -u "$SVC" "$LIB/bin/superbot-run" true
@@ -135,6 +136,72 @@ done
 (cd "$TEST_DIR/users/t1/workspace" && refused as_svc sudo -n -E -u "$pair" -- "$LIB/bin/superbot-run" /usr/bin/true)
 (cd "$TEST_DIR/users/t1-t2/workspace" && refused as_svc sudo -n -E -u sb-u-t1 -- "$LIB/bin/superbot-run" /usr/bin/true)
 refused sudo -u "$pair" sudo -n true
+
+log "A leaving teammate's account goes, and nothing else does (ADR 0066)"
+userctl() { as_svc sudo -n /usr/local/sbin/superbot-userctl "$@"; }
+id1=0123456789abcdef
+for bad in "t1 t1 $id1 delete" "t2 t2 $id1 hold" "t1 ../x $id1 delete" "t1 U2 $id1 delete" "t1 t2 XYZ delete" "t1 t2 ../$id1 delete" \
+  "t1 t2 $id1" "t1 t2 $id1 keep" "t1 t2 $id1 archive" "t1 t2 $id1 archive ../x" "t1 t2 $id1 archive .x" "t1 t2 $id1 hold x" "t1 t2 $id1 delete x"; do
+  # shellcheck disable=SC2086 # each is the arguments, on purpose
+  refused userctl remove $bad
+done
+for bad in "" ../x "$id1 x" XYZ; do
+  # shellcheck disable=SC2086 # each is the arguments, on purpose
+  refused userctl purge $bad
+done
+getent passwd "$pair" >/dev/null || die "a refused remove took $pair"
+for u in sb-u-t1 sb-u-t2; do getent passwd "$u" >/dev/null || die "a refused remove took $u"; done
+# An account with the name a pair would get, but not the home: never removed.
+forged=sb-t-$(printf '%s' 't1:t3' | sha256sum | cut -c1-24)
+useradd --system --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin "$forged"
+refused userctl remove t1 t3 "$id1" delete
+getent passwd "$forged" >/dev/null || die "remove took $forged, which isn't its account"
+userdel "$forged"
+groupdel "$forged" 2>/dev/null || true
+
+# The pair account has work, a set-id file, a temp file and a tool that ignores TERM.
+pair_uid=$(id -u "$pair")
+ws=$TEST_DIR/users/t1-t2/workspace
+sudo -u "$pair" sh -c "cd '$ws' && echo notes >notes.txt && : >tool && chmod 4755 tool && : >/tmp/sb-left-\$(id -u)"
+[[ -e "/tmp/sb-left-$pair_uid" ]] || die "no temp file of $pair"
+sudo -u "$pair" setsid sh -c 'trap "" TERM; while :; do sleep 0.2; done' </dev/null >/dev/null 2>&1 &
+sleep 0.5
+pgrep -u "$pair_uid" >/dev/null || die "no process of $pair"
+pgrep -u "$(id -u sb-u-t1)" >/dev/null && die "sb-u-t1 has processes already"
+sudo -u sb-u-t1 setsid sh -c 'trap "" TERM; while :; do sleep 0.2; done' </dev/null >/dev/null 2>&1 &
+owner_pid=$!
+out=$(userctl remove t1 t2 "$id1" archive t2-notes)
+grep -qx account=removed <<<"$out" || die "remove said: $out"
+grep -qx work=archived <<<"$out" || die "remove said: $out"
+to=$TEST_DIR/users/t1/workspace/from-teammates/t2-notes
+grep -qx "path=$to" <<<"$out" || die "remove said: $out"
+getent passwd "$pair" >/dev/null && die "$pair is still there"
+getent group "$pair" >/dev/null && die "$pair's group is still there"
+pgrep -u "$pair_uid" >/dev/null && die "a process of $pair is still going"
+kill -0 "$owner_pid" 2>/dev/null || die "remove stopped someone else's process"
+[[ ! -e "$TEST_DIR/users/t1-t2" ]] || die "t1-t2 is still there"
+[[ ! -e "/tmp/sb-left-$pair_uid" ]] || die "$pair's temp file is still there"
+[[ "$(stat -c '%U' "$to/notes.txt")" == sb-u-t1 && "$(cat "$to/notes.txt")" == notes ]] || die "the work isn't sb-u-t1's"
+[[ "$(stat -c '%a' "$to/tool")" == 755 ]] || die "a set-id bit was handed over"
+for u in sb-u-t1 sb-u-t2; do getent passwd "$u" >/dev/null || die "remove took $u"; done
+[[ -d "$TEST_DIR/users/t1/home" && -d "$TEST_DIR/users/t2/home" ]] || die "remove took a user's own folder"
+pkill -KILL -u sb-u-t1 || true
+# Again: nothing left to do, and the archived work stays.
+out=$(userctl remove t1 t2 "$id1" archive t2-notes)
+grep -qx account=absent <<<"$out" && grep -qx work=none <<<"$out" || die "remove again said: $out"
+[[ -f "$to/notes.txt" ]] || die "remove again touched the archive"
+
+# Held aside, root's alone, until purged.
+userctl ensure t1 t2 >/dev/null
+sudo -u "$pair" sh -c "echo held >'$ws/held.txt'"
+id2=fedcba9876543210
+out=$(userctl remove t1 t2 "$id2" hold)
+grep -qx work=held <<<"$out" || die "remove hold said: $out"
+[[ "$(stat -c '%a %U' "$TEST_DIR/users/.left")" == "700 root" ]] || die ".left isn't root's 0700"
+[[ "$(cat "$TEST_DIR/users/.left/$id2/held.txt")" == held ]] || die "the held work isn't there"
+[[ "$(userctl purge "$id2")" == purged=yes ]] || die "purge didn't"
+[[ ! -e "$TEST_DIR/users/.left/$id2" ]] || die "the held work is still there"
+[[ "$(userctl purge "$id2")" == purged=no ]] || die "purge again did something"
 
 log "botd's OS tests, as $SVC"
 envs=(SUPERBOT_ISOLATION_OS_TEST=1 ISOLATION_DIR="$TEST_DIR/users" SUPERBOT_RUN_DIR="$LIB/bin"
