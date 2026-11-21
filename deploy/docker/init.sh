@@ -94,8 +94,13 @@ if [[ "$ROTATE_KEY" == true ]]; then
   if grep -Eq "^SUPERBOT_MASTER_KEY_PREVIOUS=('[^']+'|[^'[:space:]]+)" "$ENV_FILE"; then
     die "SUPERBOT_MASTER_KEY_PREVIOUS is already set: a rotation is pending. Run docker compose up -d, check the log says \"Master key rotated\" (or \"nothing to rotate\"), remove SUPERBOT_MASTER_KEY_PREVIOUS from $ENV_FILE, then rotate again."
   fi
-  current=$(sed -n -E "s/^SUPERBOT_MASTER_KEY=('([^']+)'|([^'[:space:]]+))$/\2\3/p" "$ENV_FILE" | tail -n 1)
+  current=$(sed -n -E "s/^SUPERBOT_MASTER_KEY=[[:space:]]*(.*[^[:space:]])[[:space:]]*$/\1/p" "$ENV_FILE" | tail -n 1)
+  if [[ "$current" =~ ^\'(.*)\'$ || "$current" =~ ^\"(.*)\"$ ]]; then current=${BASH_REMATCH[1]}; fi
   [[ -n "$current" ]] || die "no SUPERBOT_MASTER_KEY in $ENV_FILE to rotate from"
+  # The forms botd accepts: 64 hex characters, or base64 of 32 bytes.
+  if [[ ! "$current" =~ ^[0-9A-Fa-f]{64}$ && ! "$current" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+    die "SUPERBOT_MASTER_KEY in $ENV_FILE is not 64 hex characters or base64 of 32 bytes; nothing was changed"
+  fi
   # The previous key goes in first: a crash between the two writes leaves the old key in both.
   set_env SUPERBOT_MASTER_KEY_PREVIOUS "$current"
   set_env SUPERBOT_MASTER_KEY "$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"

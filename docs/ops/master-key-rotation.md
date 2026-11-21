@@ -40,12 +40,18 @@ The installer keeps the key in a file, `~superbot/.config/superbot/master.key` u
 ```sh
 H=$(getent passwd superbot | cut -d: -f6)
 K=$H/.config/superbot/master.key        # or the SUPERBOT_MASTER_KEY_FILE in $H/superbot/.env
-sudo -u superbot cp -p "$K" "$K.previous"                     # the old key, still 0600
-sudo -u superbot sh -c 'umask 077 && openssl rand -base64 32 > "$1.new" && mv "$1.new" "$1"' sh "$K"
-echo "SUPERBOT_MASTER_KEY_PREVIOUS_FILE=$K.previous" | sudo tee -a "$H/superbot/.env" >/dev/null
+if sudo test -e "$K.previous" || sudo grep -q '^SUPERBOT_MASTER_KEY_PREVIOUS' "$H/superbot/.env"; then
+  echo "A rotation is pending: restart botd and check its log instead of repeating these steps."
+else
+  sudo -u superbot cp -p "$K" "$K.previous"                   # the old key, still 0600
+  sudo -u superbot sh -c 'umask 077 && openssl rand -base64 32 > "$1.new" && mv "$1.new" "$1"' sh "$K"
+  echo "SUPERBOT_MASTER_KEY_PREVIOUS_FILE=$K.previous" | sudo tee -a "$H/superbot/.env" >/dev/null
+fi
 sudo systemctl restart superbot
 journalctl -u superbot --since -5min | grep -E 'Master key rotated|nothing to rotate'
 ```
+
+Run the block once. If the restart fails before the log says `Master key rotated`, fix the cause and run `sudo systemctl restart superbot` again; don't repeat the block, or the old key would be overwritten. The check at the top refuses while `master.key.previous` or the `.env` line exists.
 
 Then copy the new key off the host, delete the `SUPERBOT_MASTER_KEY_PREVIOUS_FILE=` line from `.env`, run `sudo systemctl restart superbot`, and remove the old file with `sudo shred -u "$K.previous"` once its off-host copy is safe.
 
@@ -61,7 +67,7 @@ If `.env` holds the key itself (`SUPERBOT_MASTER_KEY=`), add `SUPERBOT_MASTER_KE
 
 | What you see | What it means | What to do |
 |--------------|---------------|------------|
-| botd stopped or crashed during the rotation | Nothing was committed; everything is still under the old key | Start again with both keys set |
+| botd stopped or crashed during the rotation | Nothing was committed; everything is still under the old key | Start again with both keys set. Don't run the rotation steps again: they would replace the old key |
 | `neither the master key nor SUPERBOT_MASTER_KEY_PREVIOUS opens this database` | The previous key is not the one the data is sealed with | Fix the previous key and start again. Nothing changed |
 | `SUPERBOT_MASTER_KEY_PREVIOUS is set but there is no new master key` | The new key is missing | Set it. botd never makes a key during a rotation |
 | `wrong key` after removing the previous key | The previous key was removed before botd rotated | Put it back and restart |
