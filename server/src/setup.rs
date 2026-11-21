@@ -305,8 +305,8 @@ fn tiers_view(app: &AppState) -> Value {
 }
 
 /// The license (ADR 0038), and how to install one. On the wizard's Plans step.
-fn license_view(app: &AppState) -> Value {
-    let mut v = app.license.status().view(app.db.active_seats());
+fn license_view(app: &AppState, a: &Auth) -> Value {
+    let mut v = crate::license::view(app, a);
     v["instructions"] = json!([
         step("Console", "Paste the key CG-Labs sent you below, or in Settings. It takes effect at once, no restart.", &[]),
         step("botctl", "On the server, as the superbot user.", &["botctl license install < license.key".into(), "botctl license".into()]),
@@ -328,7 +328,7 @@ fn report(app: &AppState, a: &Auth, headers: &HeaderMap, peer: Option<IpAddr>) -
     let domain = domain_view(a, host, scheme(headers, peer, a.trust_forwarded), on_this_machine);
     let sign_in = sign_in_view(app, a, domain["publicUrl"].as_str());
     let tiers = tiers_view(app);
-    let license = license_view(app);
+    let license = license_view(app, a);
     let mode = app.db.global_policy().mode;
     let ask = mode == crate::policy::Mode::Ask;
     let others = sign_in["admins"].as_array().map_or(0, Vec::len);
@@ -342,7 +342,7 @@ fn report(app: &AppState, a: &Auth, headers: &HeaderMap, peer: Option<IpAddr>) -
         item("signin", "Sign-in providers ready", sign_in["ok"] == true, sign_in["detail"].as_str().unwrap_or_default()),
         item("admin", "An admin besides the break-glass owner", others > 0, admin_detail),
         item("tiers", "Plans chosen", true, tiers["detail"].as_str().unwrap_or_default()),
-        // The community edition is a fine answer; an ended or broken license isn't.
+        // A license, or testing mode the operator turned on; never no license at all (ADR 0068).
         item("license", "License in order", license["ok"] == true && license["warnings"].as_array().is_none_or(Vec::is_empty), license["detail"].as_str().unwrap_or_default()),
         item(
             "approvals",
