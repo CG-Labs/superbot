@@ -428,6 +428,16 @@ A pending approval can reach people by email and a webhook when no app is open (
 
 Webhook URLs are secrets: botd keeps them in the sealed store (`NOTIFY_WEBHOOK_URL`, and `NOTIFY_WEBHOOK_URL_BOT_<ID>` per Bot) and shows only their host. Set in `.env` instead, they win and change only there. No Bot gets these, the SMTP password or the signing secret. Every send and failure is in the audit log (`notification.sent`, `notification.failed`), and settings changes are `notifications.updated`.
 
+### Push notifications (optional)
+
+The phone app can get a push for a waiting approval or a finished routine ([ADR 0080](../docs/adr/0080-client-push-notifications.md)). Off until you turn it on; no paid service and no app store.
+
+1. **Server.** Set `PUSH_PROVIDER=expo` in `.env` and restart `botd`: its startup line says `push through expo`. If your Expo project turns on enhanced push security, add `EXPO_ACCESS_TOKEN` (`.env` or `botctl secret set EXPO_ACCESS_TOKEN`).
+2. **App build.** Whoever builds the app with EAS (a free Expo account) puts the real project id in `apps/client/app.json` (`expo.extra.eas.projectId`) and gives EAS the push credentials it asks for: an FCM V1 key for Android, an APNs key for iOS. These stay with EAS, not botd.
+3. **People.** Each person turns it on in the app's Settings, per phone, and chooses approvals, routines, or both. Signing out, or an admin revoking the session, removes the phone.
+
+Pushes name only the Bot, never what it asked; tapping one opens the approval or the Bot's chat. Audited as `push.registered`, `push.updated`, `push.unregistered`, and `notification.sent` / `notification.failed` with `channel: push`.
+
 ## Tiers (plans)
 
 Off unless you set `TIERS_FILE`: without it every user is on one open `self-host` tier and Bots run on whatever model they're set to, as before. To sell plans that pick the model ([ADR 0033](../docs/adr/0033-tiers-model-routing.md)):

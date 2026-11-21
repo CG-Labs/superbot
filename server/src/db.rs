@@ -805,6 +805,51 @@ pub struct Session {
     pub revoke_reason: Option<String>,
 }
 
+/// A phone that gets push notifications (ADR 0080), registered by one session and
+/// removed with it. `token` is the provider's address for the device, sealed at rest
+/// and never shown: anyone holding it can send to the phone.
+#[derive(Clone)]
+pub struct PushDevice {
+    pub id: String,
+    pub user_id: String,
+    pub provider: String,
+    pub token: String,
+    pub platform: String,
+    pub approvals: bool,
+    pub routines: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl std::fmt::Debug for PushDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PushDevice").field("id", &self.id).field("user_id", &self.user_id).field("platform", &self.platform).finish_non_exhaustive()
+    }
+}
+
+/// What a push is about, and so which of a device's switches it needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PushKind {
+    Approvals,
+    Routines,
+}
+
+/// How `put_push_device` changed things.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PushPut {
+    /// A new device for this session (or a new token for it).
+    Added,
+    /// The token was another session's: it moved here, and that session lost it.
+    Moved,
+    /// Same token, switches changed.
+    Updated,
+    Unchanged,
+}
+
+/// Each person keeps at most this many devices; registering more drops the oldest.
+pub const MAX_PUSH_DEVICES: usize = 20;
+pub(crate) const PUSH_TOKEN_CONTEXT: &str = "push_devices.token";
+
 pub struct NewSession<'a> {
     pub user_id: &'a str,
     pub token_hash: &'a str,
@@ -1060,6 +1105,22 @@ fn session_row(r: &Row) -> rusqlite::Result<Session> {
     })
 }
 
+/// None when the sealed token doesn't open (another master key): such a device can't be reached.
+fn push_device_row(r: &Row) -> rusqlite::Result<Option<PushDevice>> {
+    let Some(token) = sealed::open_field(PUSH_TOKEN_CONTEXT, &r.get::<_, String>("token")?) else { return Ok(None) };
+    Ok(Some(PushDevice {
+        id: r.get("id")?,
+        user_id: r.get("user_id")?,
+        provider: r.get("provider")?,
+        token,
+        platform: r.get("platform")?,
+        approvals: r.get("approvals")?,
+        routines: r.get("routines")?,
+        created_at: r.get("created_at")?,
+        updated_at: r.get("updated_at")?,
+    }))
+}
+
 /// SQL for "this session still works": not revoked, before its absolute expiry
 /// (the stored one and `created_at + max`, so lowering the setting applies to
 /// existing sessions), and used within the idle window. Binds `?1` now, `?2` idle ms, `?3` max ms.
@@ -1139,7 +1200,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 30] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 31] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1169,8 +1230,31 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 30] = [
     migrate_machine_backups,
     migrate_machine_recovery,
     migrate_machine_hosts,
+    migrate_push_devices,
     migrate_machine_host_drain,
 ];
+
+/// Phones that get push notifications (ADR 0080): one per session at most, and a token
+/// belongs to one session only, so a phone that changes hands stops reaching the last
+/// person. Ending the session removes it; so does deleting the session or the user.
+fn migrate_push_devices(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS push_devices (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          session_id TEXT NOT NULL UNIQUE REFERENCES sessions(id) ON DELETE CASCADE,
+          provider TEXT NOT NULL,
+          token_hash TEXT NOT NULL UNIQUE,
+          token TEXT NOT NULL,
+          platform TEXT NOT NULL CHECK (platform IN ('ios', 'android')),
+          approvals INTEGER NOT NULL DEFAULT 1,
+          routines INTEGER NOT NULL DEFAULT 1,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS push_devices_user ON push_devices(user_id, updated_at);",
+    )
+}
 
 /// A host an admin drained (ADR 0081): nothing new is placed there, and machines on
 /// it stay until moved.
@@ -3572,19 +3656,20 @@ impl Db {
     }
 
     /// False if it was already revoked or doesn't exist.
+    /// Its push device goes with it (ADR 0080), whatever ended it.
     pub fn revoke_session(&self, id: &str, by: &str, reason: &str) -> bool {
-        self.c()
-            .execute(
-                "UPDATE sessions SET revoked_at = ?, revoked_by = ?, revoke_reason = ? WHERE id = ? AND revoked_at IS NULL",
-                params![now(), by, reason, id],
-            )
+        let c = self.c();
+        let _ = c.execute("DELETE FROM push_devices WHERE session_id = ?", [id]);
+        c.execute("UPDATE sessions SET revoked_at = ?, revoked_by = ?, revoke_reason = ? WHERE id = ? AND revoked_at IS NULL", params![now(), by, reason, id])
             .unwrap_or(0)
             == 1
     }
 
-    /// Revokes every session of a user and drops their unused sign-in codes. Returns how many sessions.
+    /// Revokes every session of a user and drops their unused sign-in codes and push
+    /// devices. Returns how many sessions.
     pub fn revoke_user_sessions(&self, user_id: &str, by: &str, reason: &str) -> usize {
         let c = self.c();
+        let _ = c.execute("DELETE FROM push_devices WHERE user_id = ?", [user_id]);
         let n = c
             .execute(
                 "UPDATE sessions SET revoked_at = ?, revoked_by = ?, revoke_reason = ? WHERE user_id = ? AND revoked_at IS NULL",
@@ -3888,6 +3973,81 @@ impl Db {
             .ok()
             .flatten()?;
         c.query_row("SELECT * FROM users WHERE id = ?", [user_id], user_row).optional().ok().flatten()
+    }
+
+    // Push devices (ADR 0080). Tokens are sealed; the hash keeps each on one session.
+
+    /// Registers `token` for this session, in place of any it had. A token another
+    /// session held moves here, so that session (and its person) stops getting it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_push_device(&self, user_id: &str, session_id: &str, provider: &str, token: &str, platform: &str, approvals: bool, routines: bool) -> (PushDevice, PushPut) {
+        let token_hash = crate::users::hash(token);
+        let at = now();
+        let mut c = self.c();
+        let tx = c.transaction().unwrap();
+        let mine = tx.query_row("SELECT * FROM push_devices WHERE session_id = ?", [session_id], push_device_row).optional().unwrap().flatten();
+        let theirs: Option<String> =
+            tx.query_row("SELECT session_id FROM push_devices WHERE token_hash = ? AND session_id <> ?", params![token_hash, session_id], |r| r.get(0)).optional().unwrap();
+        let change = match &mine {
+            Some(d) if d.token == token && d.provider == provider && d.platform == platform => {
+                if (d.approvals, d.routines) == (approvals, routines) { PushPut::Unchanged } else { PushPut::Updated }
+            }
+            _ if theirs.is_some() => PushPut::Moved,
+            _ => PushPut::Added,
+        };
+        tx.execute("DELETE FROM push_devices WHERE token_hash = ? AND session_id <> ?", params![token_hash, session_id]).unwrap();
+        // Read raw, so a row whose token no longer opens still keeps its id (ON CONFLICT does).
+        let stored: Option<(String, i64)> =
+            tx.query_row("SELECT id, created_at FROM push_devices WHERE session_id = ?", [session_id], |r| Ok((r.get(0)?, r.get(1)?))).optional().unwrap();
+        let (id, created) = stored.unwrap_or_else(|| (format!("pd{}", crate::random_hex(8)), at));
+        tx.execute(
+            "INSERT INTO push_devices (id, user_id, session_id, provider, token_hash, token, platform, approvals, routines, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(session_id) DO UPDATE SET provider = ?4, token_hash = ?5, token = ?6, platform = ?7, approvals = ?8, routines = ?9, updated_at = ?11",
+            params![id, user_id, session_id, provider, token_hash, sealed::seal_field(PUSH_TOKEN_CONTEXT, token), platform, approvals, routines, created, at],
+        )
+        .unwrap();
+        tx.execute(
+            "DELETE FROM push_devices WHERE user_id = ?1 AND id NOT IN (SELECT id FROM push_devices WHERE user_id = ?1 ORDER BY updated_at DESC, id LIMIT ?2)",
+            params![user_id, MAX_PUSH_DEVICES as i64],
+        )
+        .unwrap();
+        let d = tx.query_row("SELECT * FROM push_devices WHERE id = ?", [&id], push_device_row).unwrap().expect("just sealed");
+        tx.commit().unwrap();
+        (d, change)
+    }
+
+    pub fn session_push_device(&self, session_id: &str) -> Option<PushDevice> {
+        self.c().query_row("SELECT * FROM push_devices WHERE session_id = ?", [session_id], push_device_row).optional().ok().flatten().flatten()
+    }
+
+    /// The device this session registered, removed. None: it had none.
+    pub fn delete_session_push_device(&self, session_id: &str) -> Option<PushDevice> {
+        let d = self.session_push_device(session_id)?;
+        (self.c().execute("DELETE FROM push_devices WHERE id = ?", [&d.id]).unwrap_or(0) == 1).then_some(d)
+    }
+
+    /// Removes a device the provider says is gone, if it still has the token it said
+    /// that about. Returns whether it did.
+    pub fn delete_push_device_with(&self, id: &str, token_hash: &str) -> bool {
+        self.c().execute("DELETE FROM push_devices WHERE id = ? AND token_hash = ?", params![id, token_hash]).unwrap_or(0) == 1
+    }
+
+    /// `user_id`'s devices that want `kind`, while the session that registered each is
+    /// still live and theirs, and they are active. Binds the session lifetimes as
+    /// `live_session` does, so an idle or expired session's phone gets nothing.
+    pub fn live_push_devices(&self, user_id: &str, kind: PushKind, at: i64, idle_ms: i64, max_ms: i64) -> Vec<PushDevice> {
+        let want = match kind {
+            PushKind::Approvals => "d.approvals = 1",
+            PushKind::Routines => "d.routines = 1",
+        };
+        let sql = format!(
+            "SELECT d.* FROM push_devices d JOIN sessions s ON s.id = d.session_id JOIN users u ON u.id = d.user_id
+             WHERE d.user_id = ?4 AND s.user_id = d.user_id AND u.status = 'active' AND {want} AND {SESSION_LIVE} ORDER BY d.created_at, d.id"
+        );
+        let c = self.c();
+        let mut s = c.prepare(&sql).unwrap();
+        s.query_map(params![at, idle_ms, max_ms, user_id], push_device_row).unwrap().filter_map(|r| r.ok().flatten()).collect()
     }
 
     /// Deletes sessions and codes that stopped working before `before` (unix ms).
@@ -5234,6 +5394,44 @@ mod tests {
     }
 
     #[test]
+    fn push_tokens_are_sealed_one_per_session_and_capped_per_person() {
+        let db = Db::open(&temp_path("push").join("app.sqlite")).unwrap();
+        let u = db.create_user(None, Some("push@example.com"), "P", Role::Member).unwrap();
+        let other = db.create_user(None, Some("push2@example.com"), "Q", Role::Member).unwrap();
+        let session = |user: &str| {
+            let hash = crate::random_hex(16);
+            let s = NewSession { user_id: user, token_hash: &hash, kind: "token", method: "code", idp_subject: None, idp_provider: None, label: None, ip: None, user_agent: None, expires_at: now() + 60_000 };
+            db.create_session(&s).id
+        };
+        let s1 = session(&u.id);
+        let (d, change) = db.put_push_device(&u.id, &s1, "expo", "ExponentPushToken[t-1]", "ios", true, true);
+        assert_eq!((change, d.token.as_str()), (PushPut::Added, "ExponentPushToken[t-1]"));
+        let raw: String = db.c().query_row("SELECT token FROM push_devices", [], |r| r.get(0)).unwrap();
+        assert!(!raw.contains("t-1"), "sealed at rest: {raw}");
+        let (d2, change) = db.put_push_device(&u.id, &s1, "expo", "ExponentPushToken[t-2]", "ios", true, true);
+        assert_eq!((change, d2.id == d.id), (PushPut::Added, true), "a new token for the session replaces the old one");
+        assert_eq!(db.put_push_device(&u.id, &s1, "expo", "ExponentPushToken[t-2]", "ios", true, true).1, PushPut::Unchanged);
+        assert_eq!(db.put_push_device(&u.id, &s1, "expo", "ExponentPushToken[t-2]", "ios", false, true).1, PushPut::Updated);
+        // A token sealed under a lost key doesn't open; registering again still works and keeps the row.
+        let lost = crate::secrets::sealed::Cipher::new(&crate::secrets::key::MasterKey::generate()).seal(PUSH_TOKEN_CONTEXT, b"ExponentPushToken[t-2]");
+        db.c().execute("UPDATE push_devices SET token = ? WHERE session_id = ?", params![lost, s1]).unwrap();
+        assert!(db.session_push_device(&s1).is_none());
+        let (d3, change) = db.put_push_device(&u.id, &s1, "expo", "ExponentPushToken[t-2]", "ios", true, true);
+        assert_eq!((change, d3.id == d.id, d3.token.as_str()), (PushPut::Added, true, "ExponentPushToken[t-2]"));
+        let s2 = session(&other.id);
+        assert_eq!(db.put_push_device(&other.id, &s2, "expo", "ExponentPushToken[t-2]", "android", true, true).1, PushPut::Moved);
+        assert!(db.session_push_device(&s1).is_none(), "a token lives on one session only");
+        for i in 0..MAX_PUSH_DEVICES + 3 {
+            let s = session(&u.id);
+            db.put_push_device(&u.id, &s, "expo", &format!("ExponentPushToken[c-{i}]"), "ios", true, true);
+        }
+        let n: i64 = db.c().query_row("SELECT COUNT(*) FROM push_devices WHERE user_id = ?", [&u.id], |r| r.get(0)).unwrap();
+        assert_eq!(n as usize, MAX_PUSH_DEVICES, "the oldest go");
+        db.c().execute("DELETE FROM sessions WHERE id = ?", [&s2]).unwrap();
+        assert!(db.session_push_device(&s2).is_none(), "a pruned session takes its device");
+    }
+
+    #[test]
     fn the_bot_cap_holds_under_concurrent_requests() {
         let db = std::sync::Arc::new(Db::open(&temp_path("bot-cap").join("app.sqlite")).unwrap());
         let u = db.create_user(None, Some("cap@example.com"), "Cap", Role::Member).unwrap();
@@ -5836,7 +6034,7 @@ mod tests {
         let bot = db.create_bot("Kept", "#fff", "waddle", "claude", None, true);
         // As a database from before users: no user tables, user_version 2.
         db.c()
-            .execute_batch(&format!("{UNDO_BOT_ACLS} DROP TABLE user_identities; DROP TABLE login_codes; DROP TABLE sessions; DROP TABLE users; PRAGMA user_version = 2;"))
+            .execute_batch(&format!("{UNDO_BOT_ACLS} DROP TABLE push_devices; DROP TABLE user_identities; DROP TABLE login_codes; DROP TABLE sessions; DROP TABLE users; PRAGMA user_version = 2;"))
             .unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();

@@ -173,7 +173,8 @@ fn any_sealed(c: &Connection) -> rusqlite::Result<Option<(String, String)>> {
 }
 
 /// Drops the sealed values `keep` can't open (all of them without a key) and the key
-/// check. Approval inputs keep a marker; everything else about them stays.
+/// check. Approval inputs keep a marker; everything else about them stays. Push devices
+/// go, so their phones can register again.
 fn discard(c: &Connection, keep: Option<&Cipher>) -> rusqlite::Result<usize> {
     let opens = |context: &str, v: &str| keep.is_some_and(|k| k.open(context, v).is_ok());
     let tx = c.unchecked_transaction()?;
@@ -193,6 +194,9 @@ fn discard(c: &Connection, keep: Option<&Cipher>) -> rusqlite::Result<usize> {
     };
     for (user, name, v) in mine.iter().filter(|(u, name, v)| !opens(&user_context(u, name), v)) {
         n += tx.execute("DELETE FROM user_secrets WHERE user_id = ? AND name = ? AND value = ?", params![user, name, v])?;
+    }
+    for (id, v) in pairs("SELECT id, token FROM push_devices WHERE token LIKE 'sb1:%'")?.iter().filter(|(_, v)| !opens(crate::db::PUSH_TOKEN_CONTEXT, v)) {
+        n += tx.execute("DELETE FROM push_devices WHERE id = ? AND token = ?", params![id, v])?;
     }
     for (id, _) in approvals.iter().filter(|(id, v)| !opens(&approval_context(id), v)) {
         n += tx.execute("UPDATE approvals SET input = '{\"sealed\":\"discarded\"}' WHERE id = ?", [id])?;
@@ -655,18 +659,33 @@ mod tests {
 
     #[test]
     fn forgetting_keeps_what_the_key_still_opens() {
-        let (_, _db, c) = fresh();
+        let (_, db, c) = fresh();
         let key = MasterKey::generate();
         let same_key = MasterKey::parse(&key.base64()).unwrap();
         let (cipher, _) = bootstrap(&c, Some(key), no_key, false).unwrap();
+        let push = |cipher: &Cipher, n: u8| {
+            let u = db.create_user(None, Some(&format!("p{n}@example.com")), "P", crate::rbac::Role::Member).unwrap();
+            let s = crate::db::NewSession { user_id: &u.id, token_hash: &crate::random_hex(16), kind: "token", method: "code", idp_subject: None, idp_provider: None, label: None, ip: None, user_agent: None, expires_at: crate::db::now() + 60_000 };
+            let s = db.create_session(&s).id;
+            let token = cipher.seal(crate::db::PUSH_TOKEN_CONTEXT, format!("ExponentPushToken[{n}]").as_bytes());
+            c.execute(
+                "INSERT INTO push_devices (id, user_id, session_id, provider, token_hash, token, platform, created_at, updated_at) VALUES (?1, ?2, ?3, 'expo', ?1, ?4, 'ios', 0, 0)",
+                params![format!("pd{n}"), u.id, s, token],
+            )
+            .unwrap();
+        };
+        push(&cipher, 1);
         SealedStore::new(connect_again(&c), Arc::new(cipher)).put("KEEP_TOKEN", "kept").unwrap();
         // A value and a key check sealed with another key, e.g. after the key file was swapped.
         let other = Cipher::new(&MasterKey::generate());
         c.execute("INSERT INTO secrets (name, value, created_at, updated_at) VALUES ('LOST_TOKEN', ?, 0, 0)", [other.seal(&context("LOST_TOKEN"), b"lost")]).unwrap();
+        push(&other, 2);
         c.execute("UPDATE settings SET value = ? WHERE key = ?", params![other.seal("key-check", KEY_CHECK_PLAIN), KEY_CHECK]).unwrap();
 
         let (cipher, b) = bootstrap(&c, Some(same_key), no_key, true).unwrap();
-        assert_eq!(b.discarded, 1, "only the value this key can't open is dropped");
+        assert_eq!(b.discarded, 2, "only the values this key can't open are dropped");
+        let left: Vec<String> = c.prepare("SELECT id FROM push_devices").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        assert_eq!(left, ["pd1"], "an unreadable push device goes, so its phone can register again");
         let store = SealedStore::new(connect_again(&c), Arc::new(cipher));
         assert_eq!(store.get("KEEP_TOKEN").unwrap().unwrap().expose(), "kept");
         assert_eq!(store.names().unwrap(), ["KEEP_TOKEN"]);
