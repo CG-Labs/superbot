@@ -210,7 +210,7 @@ MACHINE_HARNESSES=claude,codex,pi   # pinned versions, checked by hash; name@ver
 MACHINE_AGENT_UPGRADES=manual       # manual (default): only when you ask; auto: every idle agent, once per build
 ```
 
-Until a Bot's harness is installed, its runs are refused with "still being installed". Agents upgrade themselves to the `superbot-machine` next to `botd`: they download it from botd over the pinned channel, check its SHA-256, swap it in, and restart. If botd can't reach the new agent, the old one is put back. On the server:
+Until a Bot's harness is installed, its runs are refused with "still being installed". With approvals on, a Codex Bot needs Codex 0.141.0 or newer, here or on its machine: an older one, or one whose version can't be read, is refused before it runs (keep `codex` at its pin, or `codex@<version>` 0.141.0 or newer; on this server, `npm install -g @openai/codex@<version>`) ([ADR 0059](../docs/adr/0059-refusing-guarded-runs-on-old-codex.md)). Agents upgrade themselves to the `superbot-machine` next to `botd`: they download it from botd over the pinned channel, check its SHA-256, swap it in, and restart. If botd can't reach the new agent, the old one is put back. On the server:
 
 ```sh
 botctl machine agent <user>               # its build, harnesses and upgrade, against botd's
