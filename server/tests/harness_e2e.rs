@@ -241,6 +241,118 @@ fn hermes_hook_timeout_blocks() {
     pass("the managed config fails closed with the short timeout");
 }
 
+/// Two providers through tier routing (ADR 0076, the last item of ADR 0011's gate): two
+/// fake providers, one on Anthropic Messages and one on OpenAI Chat Completions, each
+/// behind its own tier in the tiers file. A route whose key isn't saved is refused
+/// before it runs. Each tier's runs reach only its provider, with that provider's key,
+/// never the server's own endpoint. When the provider fails, the run falls back along
+/// the route's chain and nowhere else; with nothing left it ends in an error. No key
+/// reaches the agent's shell.
+fn hermes_two_providers() {
+    if !wanted("hermes", "hermes") {
+        return;
+    }
+    if real() {
+        println!("SKIP hermes: the two-providers test needs the fake models");
+        return;
+    }
+    let (claude, gpt) = (fake_provider(Some("claude-api")), fake_provider(Some("gpt-api")));
+    let tiers = json!({
+        "default": "claude-plan",
+        "providers": {
+            "claude-api": { "protocol": "anthropic-messages", "baseUrl": format!("http://127.0.0.1:{}", claude.port), "keySecret": "E2E_CLAUDE_KEY" },
+            "gpt-api": { "protocol": "openai-chat", "baseUrl": format!("http://127.0.0.1:{}/v1", gpt.port), "keySecret": "E2E_GPT_KEY" },
+        },
+        "tiers": [
+            { "name": "claude-plan", "routes": [{ "harness": "hermes", "provider": "claude-api", "model": "e2e-claude" }] },
+            { "name": "gpt-plan", "routes": [{ "harness": "hermes", "provider": "gpt-api", "model": "e2e-gpt",
+                "fallback": [{ "provider": "claude-api", "model": "e2e-claude" }] }] },
+            { "name": "self-host", "routes": "any" }
+        ]
+    });
+    let file = std::env::temp_dir().join(format!("superbot-e2e-tiers-{}-{}.json", std::process::id(), free_port()));
+    std::fs::write(&file, tiers.to_string()).unwrap();
+    let b = start_with("hermes", None, &[("TIERS_FILE", file.to_str().unwrap())]);
+    let _ = std::fs::remove_file(&file);
+    let bot = call(&b, "GET", "/api/bots", Value::Null)[0].clone();
+    let (id, owner) = (bot["id"].as_str().unwrap().to_string(), bot["owner"]["id"].as_str().unwrap().to_string());
+    call(&b, "PUT", "/api/policy", json!({ "sandbox": false }));
+    // The server's own endpoint (SUPERBOT_HERMES_BASE_URL): a tier route never uses it.
+    let server = b.model.as_ref().unwrap();
+    let pass = |what: &str| println!("PASS hermes: {what}");
+    let n = |m: &FakeModel| m.calls.load(std::sync::atomic::Ordering::SeqCst);
+    let ask = prompt("echo keys=${E2E_CLAUDE_KEY:-unset},${E2E_GPT_KEY:-unset},${HERMES_PROVIDER_SUPERBOT_CLAUDE_API_API_KEY:-unset},${HERMES_PROVIDER_SUPERBOT_GPT_API_API_KEY:-unset}");
+    let hidden = "keys=unset,unset,unset,unset";
+    let invoked = || details(&audit(&b, "harness.invoked")[0]);
+    let managed = || {
+        let config = find(&b.dir, "config.yaml", 10).into_iter().find(|p| p.parent().is_some_and(|d| d.ends_with("hermes-managed")));
+        serde_json::from_str::<Value>(&read(&config.expect("botd wrote no Hermes managed config"))).unwrap()
+    };
+
+    // No key saved: refused before it runs, nothing charged, no provider called.
+    let msg = call(&b, "POST", &format!("/api/bots/{id}/messages"), json!({ "text": ask }));
+    let limit = std::time::Duration::from_secs(30);
+    let refused = wait_for("the run to be refused", limit, || audit(&b, "bot.run_refused").into_iter().map(|e| details(&e)).find(|d| d["messageId"] == msg["id"]));
+    assert_eq!((refused["reason"].as_str(), refused["provider"].as_str(), refused["keyName"].as_str()), (Some("provider_key_missing"), Some("claude-api"), Some("E2E_CLAUDE_KEY")), "{refused}");
+    wait_for("the Bot to say why", limit, || {
+        let msgs = call(&b, "GET", &format!("/api/bots/{id}/messages"), Value::Null);
+        msgs.as_array().unwrap().iter().any(|m| m["role"] == "bot" && m["text"].as_str().unwrap_or_default().contains("isn't set up")).then_some(())
+    });
+    assert!(audit(&b, "harness.invoked").is_empty() && n(&claude) + n(&gpt) + n(server) == 0);
+    pass("a route whose provider key isn't saved is refused before it runs");
+
+    for (name, key) in [("E2E_CLAUDE_KEY", "e2e-claude-key"), ("E2E_GPT_KEY", "e2e-gpt-key")] {
+        call(&b, "PUT", &format!("/api/secrets/{name}"), json!({ "value": key }));
+    }
+
+    // The Anthropic-compatible tier: its provider, with its key, and no key in the shell.
+    let r = run(&b, &id, &ask, None, &|| {});
+    assert!(r.text.contains(&format!("[claude-api] {DONE}")) && r.text.contains(hidden), "hermes on claude-plan (result {}): {}", r.result, r.text);
+    assert!(!claude.keys().is_empty() && claude.keys().iter().all(|k| k == "e2e-claude-key"), "{:?}", claude.keys());
+    assert_eq!((n(&gpt), n(server)), (0, 0), "claude-plan reached another provider");
+    let d = invoked();
+    assert_eq!((d["tier"].as_str(), d["provider"].as_str(), d["model"].as_str(), &d["fallback"]), (Some("claude-plan"), Some("claude-api"), Some("e2e-claude"), &json!([])), "{d}");
+    let c = managed();
+    assert_eq!(c["providers"]["superbot-claude-api"]["transport"], "anthropic_messages", "{c}");
+    assert!(c["providers"].get("superbot-gpt-api").is_none(), "{c}");
+    assert_eq!((&c["fallback_providers"], &c["fallback_model"]), (&json!([]), &json!([])));
+    assert!(!c["terminal"]["env_passthrough"].as_array().unwrap().contains(&json!("E2E_CLAUDE_KEY")), "{c}");
+    pass("an Anthropic Messages tier reaches only its provider, with its own key");
+
+    // The OpenAI-compatible tier, for the same Bot once its owner moves to it.
+    call(&b, "PATCH", &format!("/api/users/{owner}"), json!({ "tier": "gpt-plan" }));
+    let before = n(&claude);
+    let r = run(&b, &id, &ask, None, &|| {});
+    assert!(r.text.contains(&format!("[gpt-api] {DONE}")) && r.text.contains(hidden), "hermes on gpt-plan (result {}): {}", r.result, r.text);
+    assert!(!gpt.keys().is_empty() && gpt.keys().iter().all(|k| k == "e2e-gpt-key"), "{:?}", gpt.keys());
+    assert_eq!((n(&claude), n(server)), (before, 0), "gpt-plan reached another provider");
+    let d = invoked();
+    assert_eq!((d["tier"].as_str(), d["provider"].as_str(), d["model"].as_str()), (Some("gpt-plan"), Some("gpt-api"), Some("e2e-gpt")), "{d}");
+    assert_eq!(d["fallback"], json!([{ "provider": "claude-api", "model": "e2e-claude" }]));
+    assert_eq!(managed()["fallback_providers"], json!([{ "provider": "superbot-claude-api", "model": "e2e-claude" }]));
+    pass("an OpenAI Chat Completions tier reaches only its provider, with its own key");
+
+    // Its provider out of credit (402, which Hermes falls back on at once): the route's
+    // fallback answers, with that provider's key.
+    gpt.set_fail(402);
+    let (before, keys) = (n(&gpt), claude.keys().len());
+    let started = std::time::Instant::now();
+    let r = run(&b, &id, &ask, None, &|| {});
+    assert!(r.text.contains(&format!("[claude-api] {DONE}")), "hermes didn't fall back (result {}): {}", r.result, r.text);
+    assert!(n(&gpt) > before, "the route's own provider wasn't tried first");
+    assert!(claude.keys()[keys..].iter().all(|k| k == "e2e-claude-key"), "{:?}", claude.keys());
+    assert_eq!(n(server), 0);
+    pass(&format!("a failing provider falls back along the route's chain ({:.1?})", started.elapsed()));
+
+    // Every provider down: the run ends in an error, and nothing else is tried.
+    claude.set_fail(402);
+    let r = run(&b, &id, &ask, None, &|| {});
+    assert_eq!(r.result, "error", "{}", r.text);
+    assert!(!r.text.contains(DONE), "{}", r.text);
+    assert_eq!(n(server), 0, "a run with no fallback left reached another provider");
+    pass("with no fallback left the run ends in an error");
+}
+
 /// Tools other than the shell that each harness reports through its hook and that the
 /// canary counts, with the Bot model that makes the CLI offer it (ADR 0063).
 fn other_tools(harness: &str) -> Vec<(&'static str, Option<&'static str>)> {
@@ -298,6 +410,12 @@ fn hermes_hooks_hold() {
 #[ignore = "needs the Hermes Agent CLI; see the harness-e2e workflow"]
 fn hermes_hook_timeout_fails_closed() {
     hermes_hook_timeout_blocks();
+}
+
+#[test]
+#[ignore = "needs the Hermes Agent CLI; see the harness-e2e workflow"]
+fn hermes_routes_two_providers() {
+    hermes_two_providers();
 }
 
 #[test]
