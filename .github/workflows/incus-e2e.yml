@@ -3,7 +3,7 @@ name: incus-e2e
 # Per-user containers (ADR 0065, 0067) on a real Incus host, not the stand-in: the
 # runner becomes the Incus host and botd's tests make, enroll, isolate, suspend,
 # resume, resize, rebuild and destroy real containers (ADR 0069), and back one up to
-# MinIO on loopback and restore it (ADR 0070). Runs when the machines code changes,
+# an S3-compatible store on loopback and restore it (ADR 0071). Runs when the machines code changes,
 # weekly, and by hand.
 
 on:
@@ -72,28 +72,28 @@ jobs:
           test -x "$(cat /tmp/test-bin)"
       - name: Make the runner an Incus host
         run: sudo SUPERBOT_INCUS_E2E_THROWAWAY=1 INCUS_SOURCE=${{ matrix.incus }} deploy/incus-e2e-host.sh "$RUNNER_TEMP/incus-e2e"
-      # Docker Hub's minio/minio was withdrawn; quay.io still serves the pinned release.
-      - name: An S3-compatible store on loopback (MinIO), for backups
+      # MinIO's images are no longer public, so the store is versitygw, run from its
+      # pinned release package (checked against its SHA-256) rather than a registry.
+      - name: An S3-compatible store on loopback (versitygw), for backups
         if: matrix.expect != 'too-old'
+        env:
+          VGW_DEB: versitygw_1.11.0_linux_amd64.deb
+          VGW_SHA256: 93210fa3fb055ef27a9d5910cba97d6eb8b5a409bbe59fb824ecc4a55242e9d3
         run: |
           set -euo pipefail
           key="e2e$(openssl rand -hex 8)"; secret="$(openssl rand -hex 24)"
           echo "::add-mask::$secret"
-          # quay.io sometimes refuses anonymous pulls for a moment.
-          image=quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
-          for i in 1 2 3 4 5; do
-            docker pull -q "$image" && break
-            [ "$i" = 5 ] && exit 1
-            sleep $((i * 10))
-          done
-          docker run -d --name minio --network host \
-            -e MINIO_ROOT_USER="$key" -e MINIO_ROOT_PASSWORD="$secret" \
-            "$image" server /data --address 127.0.0.1:9000
-          for _ in $(seq 1 60); do
-            curl -fsS http://127.0.0.1:9000/minio/health/ready >/dev/null 2>&1 && break
+          curl -fsSL --retry 5 -o "$RUNNER_TEMP/$VGW_DEB" "https://github.com/versity/versitygw/releases/download/v1.11.0/$VGW_DEB"
+          echo "$VGW_SHA256  $RUNNER_TEMP/$VGW_DEB" | sha256sum -c -
+          dpkg-deb -x "$RUNNER_TEMP/$VGW_DEB" "$RUNNER_TEMP/vgw"
+          mkdir -p "$RUNNER_TEMP/s3"
+          ROOT_ACCESS_KEY="$key" ROOT_SECRET_KEY="$secret" nohup "$RUNNER_TEMP/vgw/usr/bin/versitygw" \
+            --port 127.0.0.1:9000 posix "$RUNNER_TEMP/s3" >"$RUNNER_TEMP/s3.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/)" != 000 ] && break
             sleep 1
           done
-          curl -fsS http://127.0.0.1:9000/minio/health/ready
+          [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/)" != 000 ]
           {
             echo "SUPERBOT_INCUS_E2E_S3_ENDPOINT=http://127.0.0.1:9000"
             echo "SUPERBOT_INCUS_E2E_S3_BUCKET=superbot-e2e"
@@ -122,4 +122,4 @@ jobs:
           done
           sudo incus network acl list --project superbot || true
           sudo journalctl -u incus --no-pager | tail -60 || true
-          docker logs minio 2>&1 | tail -40 || true
+          tail -40 "$RUNNER_TEMP/s3.log" || true

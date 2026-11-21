@@ -14,7 +14,7 @@
 //!
 //! With SUPERBOT_INCUS_E2E_S3_ENDPOINT and _BUCKET (and MACHINE_BACKUP_S3_ACCESS_KEY_ID
 //! and _SECRET_ACCESS_KEY), a container is also backed up to that store, encrypted, and
-//! restored from it (ADR 0071); CI runs MinIO on loopback for it.
+//! restored from it (ADR 0071); CI runs versitygw on loopback for it.
 
 use crate::machines::State;
 use crate::machines::enroll::{self, Enrollment};

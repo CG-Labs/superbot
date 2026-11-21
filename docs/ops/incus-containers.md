@@ -141,7 +141,7 @@ cargo test --bin botd -- --ignored --exact --nocapture \
   machines_incus_e2e_tests::real_incus_containers_enroll_stay_apart_and_follow_the_lifecycle
 ```
 
-The test makes and destroys two containers. It checks enrollment, that the token is gone, sizing, isolation between them and from the host, suspend, resume, resize, the reconciler, rebuild and destroy. With `SUPERBOT_INCUS_E2E_S3_ENDPOINT` and the `MACHINE_BACKUP_S3_*` keys pointing at a scratch store (CI runs MinIO on loopback), it also backs a container up, encrypted, and restores it. It cleans up containers and ACLs left by an earlier run. It needs nftables' bridge family. The script makes a btrfs pool; with `POOL_DRIVER=dir` the test still runs and expects the preflight warning about disk sizes.
+The test makes and destroys two containers. It checks enrollment, that the token is gone, sizing, isolation between them and from the host, suspend, resume, resize, the reconciler, rebuild and destroy. With `SUPERBOT_INCUS_E2E_S3_ENDPOINT` and the `MACHINE_BACKUP_S3_*` keys pointing at a scratch store (CI runs versitygw on loopback), it also backs a container up, encrypted, and restores it. It cleans up containers and ACLs left by an earlier run. It needs nftables' bridge family. The script makes a btrfs pool; with `POOL_DRIVER=dir` the test still runs and expects the preflight warning about disk sizes.
 
 ## Limits to know
 

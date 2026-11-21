@@ -120,7 +120,7 @@ Admins see the machine's `lastBackup` in its view. The owner sees `lastBackupAt`
   - the schedule skipping machines whose token is still in their config;
   - retries after a store failure;
   - retention keeping the newest backup.
-- **On a real host.** The `incus-e2e` job (ADR 0069) also runs MinIO on loopback. It backs up a real container encrypted, changes it, and restores it. It checks that the backup's files are back, the agent enrolled with a new identity, no token is left, and the container is still isolated from its neighbour. MinIO's Docker Hub image was withdrawn, so CI uses a pinned release from quay.io.
+- **On a real host.** The `incus-e2e` job (ADR 0069) also runs an S3-compatible store on loopback (versitygw). It backs up a real container encrypted, changes it, and restores it. It checks that the backup's files are back, the agent enrolled with a new identity, no token is left, and the container is still isolated from its neighbour. MinIO no longer publishes public images, so CI installs versitygw's pinned release package, checked against its SHA-256.
 
 ## Consequences
 
