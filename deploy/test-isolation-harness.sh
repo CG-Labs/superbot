@@ -1,19 +1,37 @@
 #!/bin/sh
-# A fake `claude` for deploy/test-isolation.sh: botd runs it as a per-user account and it
-# reports, as one Claude Code reply, what that account could reach. The prompt says what to do:
+# A fake `claude`, `pi` and `hermes` for deploy/test-isolation.sh (installed under each
+# name): botd runs it as a per-user account and it reports, as one reply in that harness's
+# format, what that account could reach. The prompt says what to do:
 #   WRITE-CREDS                       write a fake login into $HOME
 #   SLEEP                             keep a heartbeat in the workspace until stopped
 #   LEAVE                             answer and exit, leaving the heartbeat going
 #   PROBE <other account> <name:path>...  try to read (and write next to) each path
+# As hermes, a probe also leaves a gateway.pid, so botd runs `hermes gateway stop` after.
 set -u
-for prompt; do :; done
+harness=$(basename "$0")
 me=$(id -un)
+if [ "$harness" = hermes ] && [ "${1:-}" = gateway ]; then
+  id -un >"$HERMES_HOME/stopped-by" && rm -f "$HERMES_HOME/gateway.pid"
+  exit
+fi
+if [ "$harness" = hermes ]; then
+  prompt=$(cat)
+else
+  for prompt; do :; done
+fi
 
 try_read() {
   if [ -d "$1" ]; then ls -A "$1" >/dev/null 2>&1; else head -c 1 "$1" >/dev/null 2>&1; fi && echo read || echo denied
 }
 try_write() {
   (: >"$1/probe-$me") 2>/dev/null && echo wrote || echo denied
+}
+# botd's files for the run: the account may read them, never change or replace them.
+try_change() {
+  (: >>"$1") 2>/dev/null && echo wrote || echo denied
+}
+try_replace() {
+  mv -f "$1" "$1.moved" 2>/dev/null && echo wrote || echo denied
 }
 verdict() {
   if "$@" >/dev/null 2>&1; then echo allowed; else echo denied; fi
@@ -47,6 +65,8 @@ case "$prompt" in
       case $k in
         a_workspace | all_users) out="$out;write_$k=$(try_write "$p")" ;;
         a_memory) out="$out;write_a_memory=$(try_write "$(dirname "$p")")" ;;
+        guard | managed) out="$out;write_$k=$(try_change "$p");replace_$k=$(try_replace "$p")" ;;
+        state) out="$out;write_state=$(try_write "$p")" ;;
       esac
     done
     out="$out;sudo_root=$(verdict sudo -n true)"
@@ -62,9 +82,15 @@ case "$prompt" in
     out="$out;server_secrets=$s"
     if [ -n "${BOT_TOKEN:-}" ]; then s=present; else s=absent; fi
     out="$out;bot_token=$s"
+    out="$out;harness=$harness"
+    [ "$harness" != hermes ] || { mkdir -p "$HERMES_HOME" && : >"$HERMES_HOME/gateway.pid"; }
     ;;
   *)
     out="unknown prompt"
     ;;
 esac
-printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}]}}\n' "$out"
+case "$harness" in
+  pi) printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"%s"}]}}\n' "$out" ;;
+  hermes) printf '{"type": "text", "text": "%s"}\n{"type": "result", "session_id": "local-1", "exit_code": 0}\n' "$out" ;;
+  *) printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}]}}\n' "$out" ;;
+esac

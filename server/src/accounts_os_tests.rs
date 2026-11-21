@@ -168,3 +168,60 @@ async fn a_finished_run_leaves_no_processes_behind() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(std::fs::read_to_string(&beat).unwrap(), then, "a process of the run is still going");
 }
+
+/// Pi and Hermes Agent (ADR 0058): botd's files for the run (Pi's guard, Hermes's managed
+/// config) are the account's to read, not to change; botd's own files aren't its to read.
+#[tokio::test]
+#[ignore = "needs root's setup: deploy/test-isolation.sh"]
+async fn pi_and_hermes_runs_cannot_read_botds_files_or_change_their_settings() {
+    use std::os::unix::fs::MetadataExt;
+    let Some((app, iso)) = setup() else { return };
+    app.db.set_global_policy(&crate::policy::Policy::new(crate::policy::Mode::Ask));
+    let home = PathBuf::from(std::env::var("HOME").unwrap());
+    let key = PathBuf::from(std::env::var("SUPERBOT_OS_TEST_KEY_FILE").expect("SUPERBOT_OS_TEST_KEY_FILE"));
+    for harness in ["pi", "hermes"] {
+        let email = format!("{harness}@example.com");
+        let u = app.db.create_user(None, Some(&email), &email, Role::Member).unwrap();
+        let bot = app.db.create_bot_owned(&email, "#fff", "waddle", harness, None, false, &u.id, Visibility::Private);
+        let (settings, state) = (iso.bot_settings(&u.id, &bot.id).unwrap(), iso.bot_state(&u.id, &bot.id).unwrap());
+        let (k, botds) = match harness {
+            "pi" => ("guard", settings.join("superbot-guard.ts")),
+            _ => ("managed", settings.join("hermes-managed/config.yaml")),
+        };
+        let targets = [
+            ("db", app.cfg.data_dir.join("app.sqlite")),
+            ("data", app.cfg.data_dir.clone()),
+            ("env", home.join("superbot/.env")),
+            ("key", key.clone()),
+            ("botd_home", home.clone()),
+            (k, botds.clone()),
+            ("state", state.clone()),
+        ];
+        let list: Vec<String> = targets.iter().map(|(k, p)| format!("{k}:{}", p.display())).collect();
+        let got = probes(&run(&app, &bot, &format!("PROBE nobody {}", list.join(" "))).await);
+        eprintln!("{harness}'s run saw: {got:?}");
+        assert!(!got.is_empty(), "{harness}: {:?}", app.db.messages(&bot.id, 20).into_iter().map(|m| (m.role, m.text)).collect::<Vec<_>>());
+        assert_eq!((got["harness"].as_str(), got["user"].as_str()), (harness, accounts::account(&u.id).unwrap().as_str()), "{got:?}");
+        for t in ["db", "data", "env", "key", "botd_home"] {
+            assert_eq!(got[t], "denied", "{harness} {t}: {got:?}");
+        }
+        assert_eq!(got[k], "read", "{got:?}");
+        assert_eq!((got[&format!("write_{k}")].as_str(), got[&format!("replace_{k}")].as_str()), ("denied", "denied"), "{got:?}");
+        assert_eq!(got["write_state"], "wrote", "the Bot's own state is the account's: {got:?}");
+        assert_eq!((got["server_secrets"].as_str(), got["bot_token"].as_str()), ("absent", "present"), "{got:?}");
+        let m = std::fs::metadata(&botds).unwrap();
+        // SAFETY: geteuid can't fail.
+        assert_eq!((m.uid(), m.mode() & 0o777), (unsafe { libc::geteuid() }, 0o640), "{}", botds.display());
+
+        if harness == "hermes" {
+            // The probe left a gateway.pid: botd stops the daemon as the account, not as itself.
+            let by = state.join("hermes/stopped-by");
+            let start = Instant::now();
+            while !by.exists() {
+                assert!(start.elapsed() < Duration::from_secs(20), "botd never ran hermes gateway stop");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert_eq!(std::fs::read_to_string(&by).unwrap().trim(), accounts::account(&u.id).unwrap());
+        }
+    }
+}
