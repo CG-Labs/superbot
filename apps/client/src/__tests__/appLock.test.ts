@@ -8,6 +8,7 @@ import {
   lockReducer,
   parseLockSettings,
   serializeLockSettings,
+  stricter,
   stuckBeforePrompt,
   timedOut,
   UNLOCKED,
@@ -45,6 +46,16 @@ describe("lock settings (ADR 0078)", () => {
     expect(parseLockSettings("not json")).toEqual(DEFAULT_LOCK_SETTINGS);
     expect(parseLockSettings('{"enabled":"yes"}').enabled).toBe(false);
     expect(parseLockSettings('{"enabled":true,"lockAfter":42}')).toEqual(on(0));
+  });
+});
+
+describe("a change being saved", () => {
+  it("is timed by the stricter of the saved and the new setting", () => {
+    expect(stricter(off, on(60))).toEqual(on(60));
+    expect(stricter(on(60), off)).toEqual(on(60));
+    expect(stricter(on(0), on(300))).toEqual(on(0));
+    expect(stricter(on(300), on(60))).toEqual(on(60));
+    expect(stricter(off, off)).toEqual(off);
   });
 });
 

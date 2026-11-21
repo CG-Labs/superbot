@@ -9,6 +9,7 @@ import {
   parseLockSettings,
   serializeLockSettings,
   STUCK_MESSAGE,
+  stricter,
   stuckBeforePrompt,
   unlockOutcome,
   UNLOCKED,
@@ -78,7 +79,7 @@ export function AppLockProvider({ children, auth = deviceAuth, store = deviceSto
   const [busy, setBusy] = useState(false);
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
-  /** A setting being written: leaving the app meanwhile is timed by it, not by the old one. */
+  /** A setting being written: until it commits, leaving the app is timed by it or the saved one, whichever is stricter. */
   const pending = useRef<LockSettings | null>(null);
   /** A system prompt (Face ID, or Android's passcode screen) moves the app out of the foreground; that is not leaving. */
   const prompting = useRef(false);
@@ -123,7 +124,7 @@ export function AppLockProvider({ children, auth = deviceAuth, store = deviceSto
     if (!supported) return;
     const sub = AppState.addEventListener("change", (s) => {
       if (prompting.current) return;
-      dispatch({ type: "appState", state: s, now: now(), settings: pending.current ?? settingsRef.current });
+      dispatch({ type: "appState", state: s, now: now(), settings: pending.current ? stricter(pending.current, settingsRef.current) : settingsRef.current });
       if (s === "active") void refreshAvailability();
     });
     return () => sub.remove();

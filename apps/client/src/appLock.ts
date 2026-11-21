@@ -37,6 +37,16 @@ export function serializeLockSettings(s: LockSettings): string {
   return JSON.stringify({ enabled: s.enabled, lockAfter: s.lockAfter });
 }
 
+/**
+ * While a change is being saved, either value may end up stored, so leaving the app is timed
+ * by the stricter: on if either is on, and the shorter timeout of those that are on.
+ */
+export function stricter(a: LockSettings, b: LockSettings): LockSettings {
+  if (!a.enabled) return b;
+  if (!b.enabled) return a;
+  return { enabled: true, lockAfter: Math.min(a.lockAfter, b.lockAfter) as LockAfter };
+}
+
 /** expo-local-authentication's `AuthenticationType` values. */
 export const AUTH_FINGERPRINT = 1;
 export const AUTH_FACE = 2;

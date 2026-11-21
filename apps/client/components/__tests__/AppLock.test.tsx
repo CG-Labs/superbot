@@ -140,6 +140,25 @@ describe("App lock (ADR 0078)", () => {
     expect(await screen.findByText("SuperBot is locked")).toBeOnTheScreen();
   });
 
+  it("still locks after leaving the app while turning it off fails to save", async () => {
+    let clock = 0;
+    let failed: (e: Error) => void = () => {};
+    const auth = fakeAuth();
+    auth.authenticate.mockResolvedValueOnce({ success: true }).mockImplementationOnce(() => new Promise(() => {}));
+    const store = fakeStore(serializeLockSettings({ enabled: true, lockAfter: 0 }));
+    store.clear.mockImplementationOnce(() => new Promise<void>((_, reject) => (failed = reject)));
+    const user = userEvent.setup();
+    await show({ auth, store, now: () => clock });
+    await waitFor(() => expect(screen.queryByText("SuperBot is locked")).toBeNull());
+    await user.press(within(screen.getByLabelText("App lock on or off")).getByRole("radio", { name: "Off" }));
+    await waitFor(() => expect(store.clear).toHaveBeenCalled());
+    await changeAppState("background");
+    await act(async () => failed(new Error("Keychain unavailable")));
+    clock = 1000;
+    await changeAppState("active");
+    expect(await screen.findByText("SuperBot is locked")).toBeOnTheScreen();
+  });
+
   it("draws the lock in a native modal, above the screens' own modals", async () => {
     const auth = fakeAuth();
     auth.authenticate.mockImplementationOnce(() => new Promise(() => {}));
