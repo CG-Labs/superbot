@@ -554,6 +554,16 @@ async fn send_one(app: &App, m: &BillingMail, q: &Queued) -> Result<bool, String
     if !kind.essential() && !u.active() {
         return skip("inactive", d);
     }
+    // Tries are counted when claimed, so one whose outcome was never saved (botd stopped
+    // mid-send) still counts towards the limit.
+    if q.attempts >= MAX_ATTEMPTS {
+        app.db.billing_email_result(q.id, "failed", Some("out_of_tries"))?;
+        d["error"] = json!("out_of_tries");
+        d["retrying"] = json!(false);
+        d["attempts"] = json!(q.attempts);
+        app.db.record(&by.event("billing.email_failed").target("user", &q.user_id).outcome(Outcome::Failure).details(d));
+        return Ok(false);
+    }
     let attempts = q.attempts + 1;
     if !app.db.claim_billing_email(q.id, crate::db::now() + backoff_ms(attempts))? {
         return Ok(false);

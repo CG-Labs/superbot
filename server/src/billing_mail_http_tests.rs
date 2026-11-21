@@ -181,6 +181,23 @@ async fn failed_sends_are_tried_again_then_given_up_and_audited() {
     let got = sent(app, &mailer).await;
     assert_eq!(got.len(), 1);
     assert_eq!(audit(w.port, &w.admin, "action=billing.email_sent").await[0]["details"]["attempts"], 2);
+
+    // A last try claimed but never settled (botd stopped mid-send) isn't tried a sixth time.
+    *mailer.fail.lock().unwrap() = Some("421 try later".into());
+    deliver(w.port, &ada(&w, "evt_3", 1_795_000_200, "canceled", |_| {}), None).await;
+    for _ in 1..billing_mail::MAX_ATTEMPTS {
+        app.db.billing_emails_due_now();
+        billing_mail::send_due(app).await;
+    }
+    let row = app.db.billing_emails_of(&w.a_id, 1)[0].clone();
+    assert_eq!((row.state.as_str(), row.attempts), ("pending", billing_mail::MAX_ATTEMPTS - 1), "{row:?}");
+    assert!(app.db.claim_billing_email(row.id, 0).unwrap());
+    *mailer.fail.lock().unwrap() = None;
+    app.db.billing_emails_due_now();
+    assert_eq!(sent(app, &mailer).await.len(), got.len(), "nothing more");
+    let row = &app.db.billing_emails_of(&w.a_id, 1)[0];
+    assert_eq!((row.state.as_str(), row.attempts, row.reason.as_deref()), ("failed", billing_mail::MAX_ATTEMPTS, Some("out_of_tries")));
+    assert_eq!(audit(w.port, &w.admin, "action=billing.email_failed").await[0]["details"]["error"], "out_of_tries");
 }
 
 #[tokio::test]

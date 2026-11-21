@@ -56,7 +56,7 @@ Plan started, changed and ended also say what the user's computer is doing about
 ### Sending
 
 - A sender task sends what's queued, oldest first, 20 at a time, woken when something is queued and every 30 seconds. It sends one email per SMTP message, through ADR 0061's transport and its settings (`SMTP_HOST`, `SMTP_PORT`, `SMTP_TLS`, `SMTP_FROM`, `SMTP_USERNAME`, `SMTP_PASSWORD`). There is no new provider.
-- Each try is counted, with the time of the next, before the email is sent. A failed send is tried again after 1, 4, 16 and 64 minutes, then given up on after 5 tries.
+- Each try is counted, with the time of the next, before the email is sent. A failed send is tried again after 1, 4, 16 and 64 minutes, then given up on after 5 tries. A try counts even if botd stopped before saving its outcome: an email with 5 tries already is marked failed (`out_of_tries`) instead of sent again.
 - If botd can't save an email's outcome (a full disk, say), it logs it and stops sending until the next pass, so it doesn't send emails it can't mark sent. That email waits its backoff before another try.
 - Just before sending, the sender skips an email whose user is gone (`no_user`) or has no email address (`no_address`), and a usage email for someone disabled (`inactive`) or opted out (`opted_out`). Essential emails go to disabled users: their plan and payment still matter.
 - Queued emails are kept with their state (`pending`, `sent`, `skipped`, `failed`), tries and reason. They're small, and they're what stops a resend.
