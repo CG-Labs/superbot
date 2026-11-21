@@ -408,6 +408,10 @@ pub struct Report {
     pub redacted: usize,
     pub discarded: usize,
     pub stored: usize,
+    /// Where the previous key came from and what re-sealing did, on the start that rotated.
+    pub rotated: Option<(String, sealed::Rotation)>,
+    /// SUPERBOT_MASTER_KEY_PREVIOUS(_FILE) is set but no longer needed.
+    pub previous_unused: Option<String>,
 }
 
 /// Startup: find or make the master key, check it, seal plaintext left by older
@@ -431,9 +435,18 @@ pub fn init(db_path: &Path) -> Result<Report, String> {
     if let Some(k) = &found {
         k.register_redactions();
     }
+    let (previous, previous_source) = match key::locate_previous(data_dir)? {
+        Some((k, source)) => {
+            k.register_redactions();
+            let new_derived_keys = std::env::var("SUPERBOT_ROTATE_DERIVED_KEYS").is_ok_and(|v| v == "1");
+            (Some(sealed::Previous { key: k, new_derived_keys }), Some(source))
+        }
+        None => (None, None),
+    };
     let (cipher, boot) = sealed::bootstrap(
         &c,
         found,
+        previous,
         || {
             let (k, source) = key::create(data_dir)?;
             k.register_redactions();
@@ -452,11 +465,14 @@ pub fn init(db_path: &Path) -> Result<Report, String> {
     let stored = secrets.stores[1].names().map_err(|e| e.to_string())?.len();
     secrets.register_all();
     let redacted = redact::scrub_rows(&c).map_err(|e| format!("database: {e}"))?;
-    if boot.sealed + redacted + boot.discarded > 0 {
+    // After a rotation too, so values sealed under the old key don't linger in free pages.
+    if boot.sealed + redacted + boot.discarded > 0 || boot.rotated.is_some() {
         sealed::purge_old_pages(&c).map_err(|e| format!("database: {e}"))?;
     }
     GLOBAL.set(secrets).map_err(|_| "secrets::init ran twice".to_string())?;
-    Ok(Report { key_source, created: boot.created, sealed: boot.sealed, redacted, discarded: boot.discarded, stored })
+    let previous_unused = previous_source.clone().filter(|_| boot.previous_unused);
+    let rotated = boot.rotated.map(|r| (previous_source.unwrap_or_default(), r));
+    Ok(Report { key_source, created: boot.created, sealed: boot.sealed, redacted, discarded: boot.discarded, stored, rotated, previous_unused })
 }
 
 #[cfg(test)]

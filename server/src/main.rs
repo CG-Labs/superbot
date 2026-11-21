@@ -279,6 +279,19 @@ async fn main() {
                 log_info!("Secrets: sealed {} saved tool inputs, redacted {} saved rows, discarded {} sealed values.", r.sealed, r.redacted, r.discarded);
             }
             log_info!("Stored secrets: {}.", r.stored);
+            if let Some((from, done)) = &r.rotated {
+                log_info!(
+                    "Master key rotated from {from}: sealed {} values again under the new key ({} already were). Remove the previous key now (docs/ops/master-key-rotation.md).",
+                    done.resealed,
+                    done.current
+                );
+                if done.unreadable > 0 {
+                    log_warn!("Master key rotation: {} sealed values open with neither key and were left as they were.", done.unreadable);
+                }
+            }
+            if let Some(from) = &r.previous_unused {
+                log_warn!("{from} is set, but the master key already opens everything, so there is nothing to rotate. Remove it.");
+            }
         }
         Err(e) => {
             log_warn!("Secrets: {e}");
@@ -378,7 +391,7 @@ async fn main() {
                 log_info!("Isolation: ISOLATION_TEAMMATES=off, so a teammate's run of a shared Bot uses its owner's account (ADR 0046).");
             }
             let mut own = vec![app.cfg.data_dir.clone(), PathBuf::from(".env")];
-            own.extend(std::env::var_os("SUPERBOT_MASTER_KEY_FILE").map(PathBuf::from));
+            own.extend(["SUPERBOT_MASTER_KEY_FILE", "SUPERBOT_MASTER_KEY_PREVIOUS_FILE"].iter().filter_map(|k| std::env::var_os(k).map(PathBuf::from)));
             for p in accounts::close_to_others(&own) {
                 log_warn!("WARNING: other accounts can read {p}, which botd couldn't change. Per-user accounts must not read botd's files: chmod o-rwx it.");
             }

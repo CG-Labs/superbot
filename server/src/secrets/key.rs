@@ -159,6 +159,26 @@ pub fn locate(data_dir: &Path) -> Result<Option<(MasterKey, String)>, String> {
     read_file(&path).map(|k| Some((k, path.display().to_string())))
 }
 
+/// The key being rotated away from (ADR 0096): `SUPERBOT_MASTER_KEY_PREVIOUS`, or the file
+/// named by `SUPERBOT_MASTER_KEY_PREVIOUS_FILE`. No default path: it is set only for a rotation.
+pub fn locate_previous(data_dir: &Path) -> Result<Option<(MasterKey, String)>, String> {
+    const ENV: &str = "SUPERBOT_MASTER_KEY_PREVIOUS";
+    const FILE: &str = "SUPERBOT_MASTER_KEY_PREVIOUS_FILE";
+    match (var(ENV), var(FILE)) {
+        (Some(_), Some(_)) => Err(format!("set {ENV} or {FILE}, not both")),
+        (Some(text), None) => {
+            let text = Zeroizing::new(text);
+            MasterKey::parse(&text).map(|k| Some((k, ENV.into()))).map_err(|e| format!("{ENV}: {e}"))
+        }
+        (None, Some(p)) => {
+            let path = PathBuf::from(p);
+            check_outside(&path, data_dir)?;
+            read_file(&path).map(|k| Some((k, path.display().to_string())))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
 /// A new key at SUPERBOT_MASTER_KEY_FILE, or the default path.
 pub fn create(data_dir: &Path) -> Result<(MasterKey, String), String> {
     let path = file_path(data_dir)?;
