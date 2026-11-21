@@ -176,6 +176,18 @@ export interface BillingView {
   portal: boolean;
   /** False for read-only people: they see their plan but can't buy or manage it. */
   canChange: boolean;
+  /** Billing emails (ADR 0091). Missing from older servers. */
+  emails?: BillingEmails;
+}
+
+/** `/api/me/emails`: whether this server sends billing emails, and whether you get the usage ones. */
+export interface BillingEmails {
+  /** The server sends billing emails at all. */
+  on: boolean;
+  /** You get the token and storage limit emails. Plan and payment emails always go. */
+  usage: boolean;
+  /** False for read-only people. Only from `/api/me/emails`. */
+  canChange?: boolean;
 }
 
 /** One of your own secrets, as `/api/me/secrets` lists it (ADR 0029, 0044). Never the value. */

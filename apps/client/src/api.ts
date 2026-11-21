@@ -5,6 +5,7 @@ import type {
   Approval,
   ApprovalScope,
   AuditPage,
+  BillingEmails,
   BillingView,
   BotAccessView,
   BotNotificationsPatch,
@@ -422,6 +423,24 @@ export class SuperBotApi {
   /** Your Stripe billing portal: change or cancel the plan, cards, invoices. */
   async billingPortal(): Promise<{ url: string }> {
     return this.request<{ url: string }>("POST", "/api/billing/portal");
+  }
+
+  /**
+   * Your billing email settings (ADR 0091), apart from `/api/billing`, which a server can
+   * answer 404 while it still sends them (no checkout). null from servers before them.
+   */
+  async billingEmails(): Promise<BillingEmails | null> {
+    try {
+      return await this.request<BillingEmails>("GET", "/api/me/emails");
+    } catch (e) {
+      if (e instanceof ApiError && [403, 404, 405].includes(e.status)) return null;
+      throw e;
+    }
+  }
+
+  /** Turns your token and storage limit emails on or off (ADR 0091). */
+  async setUsageEmails(usage: boolean): Promise<BillingEmails> {
+    return this.request<BillingEmails>("PUT", "/api/me/emails", { usage });
   }
 
   // Your own secrets, for your Bots only (ADR 0029, 0044). Values go in, never come back.

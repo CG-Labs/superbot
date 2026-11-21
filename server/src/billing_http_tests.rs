@@ -17,7 +17,7 @@ use crate::*;
 
 pub(crate) const SECRET: &str = "whsec_test_not_a_real_secret";
 pub(crate) const UPDATED: &str = include_str!("../tests/fixtures/stripe/customer.subscription.updated.json");
-const DELETED: &str = include_str!("../tests/fixtures/stripe/customer.subscription.deleted.json");
+pub(crate) const DELETED: &str = include_str!("../tests/fixtures/stripe/customer.subscription.deleted.json");
 
 pub(crate) struct World {
     pub port: u16,

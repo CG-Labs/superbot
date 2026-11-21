@@ -946,8 +946,11 @@ mod tests {
         // An old sudoers rule that allows only `ensure`: says how to fix it.
         let iso = for_tests(&dir, "/bin/false");
         assert!(iso.remove_teammate("a1", "b2", "c0ffee0123456789", &Work::Hold).unwrap_err().contains("remove failed"));
-        std::fs::write(&sudo, "#!/bin/sh\necho 'sudo: a password is required' >&2\nexit 1\n").unwrap();
-        let iso = for_tests(&dir, sudo.to_str().unwrap());
+        // A new file, not a rewrite: another test's fork may still hold `sudo` open (ETXTBSY).
+        let denied = dir.join("sudo-denied");
+        std::fs::write(&denied, "#!/bin/sh\necho 'sudo: a password is required' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let iso = for_tests(&dir, denied.to_str().unwrap());
         assert!(iso.purge("c0ffee0123456789").unwrap_err().contains("install.sh --isolation"));
     }
 

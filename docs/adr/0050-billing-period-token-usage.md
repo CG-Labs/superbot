@@ -61,4 +61,4 @@ Stripe's meters carry one number per event, so botd sends the total tokens. Pric
 - `monthlyTokens` is a real limit. A harness that reports nothing (or a provider that doesn't give Hermes counts) isn't limited by it. Those runs are shown as unknown, and `monthlyRuns` still applies.
 - Migration 20 adds `token_usage` and `subscriptions.period_start`. Existing subscriptions get their start from their next Stripe event; until then, months count back from their end.
 - Usage is per owner, as runs are. Someone using a teammate's shared Bot spends the teammate's tokens. Under `SHARED_BOTS=isolated`, it's still the owner's plan that applies (ADR 0046).
-- Not built: storage limits, resizing machines on a tier change, billing emails, and per-token-type Stripe prices.
+- Not built: storage limits, resizing machines on a tier change, billing emails, and per-token-type Stripe prices. (Storage limits, resizing and billing emails are since built: [ADR 0082](0082-storage-limits-per-tier.md), [ADR 0085](0085-resizing-machines-on-a-tier-change.md), [ADR 0091](0091-billing-emails.md), which emails at 80% and 100% of `monthlyTokens`.)
