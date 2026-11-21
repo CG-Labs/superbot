@@ -75,6 +75,8 @@ describe("billing helpers", () => {
 
   it("thanks people back from checkout, and says nothing was charged when they cancel", () => {
     expect(checkoutNotice("success")?.good).toBe(true);
+    expect(checkoutNotice("success", true)?.text).toMatch(/team's plan changes for everyone/);
+    expect(checkoutNotice("cancelled", true)?.good).toBe(false);
     expect(checkoutNotice(["cancelled"])).toEqual({ text: "Checkout cancelled. Nothing was charged.", good: false });
     expect(checkoutNotice(undefined)).toBeNull();
     expect(checkoutNotice("<script>")).toBeNull();

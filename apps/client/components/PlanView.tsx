@@ -173,7 +173,8 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
   const over = plan ? overLimits(plan).filter((o) => o !== "storage") : [];
   const storageNote = storageWarning(plan?.usage.storage);
   const status = view ? subscriptionLine(view.subscription) : null;
-  const subscribed = !!view?.subscription;
+  const team = view?.teamPlan;
+  const subscribed = !!view?.subscription || !!team;
   const canChange = !!view?.canChange;
 
   return (
@@ -193,7 +194,7 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
         {plan ? (
           <View style={styles.card}>
             <Text style={styles.cardTitle}>{plan.label} plan</Text>
-            {status ? <Text style={styles.dim}>{status}</Text> : null}
+            {team ? <Text style={styles.dim}>{`${team.name ?? "Your team"} pays for this plan for everyone on it.`}</Text> : status ? <Text style={styles.dim}>{status}</Text> : null}
             {planUsageLines(plan).map((l) => (
               <Text key={l} style={styles.line}>
                 {l}
@@ -246,7 +247,13 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
           </View>
         ))}
         {subscribed || !canChange ? (
-          <Text style={styles.dim}>{view?.portal && canChange ? "To change or cancel your plan, use Manage billing." : "To change your plan, ask an admin."}</Text>
+          <Text style={styles.dim}>
+            {team
+              ? "Your team's owners and admins change its plan on the Team screen."
+              : view?.portal && canChange
+                ? "To change or cancel your plan, use Manage billing."
+                : "To change your plan, ask an admin."}
+          </Text>
         ) : null}
       </ScrollView>
     </View>

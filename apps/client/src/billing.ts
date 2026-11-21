@@ -56,9 +56,10 @@ export function subscriptionLine(sub: BillingView["subscription"]): string | nul
   return `${status} · current period ends ${date}`;
 }
 
-/** What to say when Stripe sends someone back (`?checkout=` on the return link). */
-export function checkoutNotice(param: string | string[] | undefined): { text: string; good: boolean } | null {
+/** What to say when Stripe sends someone back (`?checkout=` on the return link); `team` for a team's plan. */
+export function checkoutNotice(param: string | string[] | undefined, team = false): { text: string; good: boolean } | null {
   const v = Array.isArray(param) ? param[0] : param;
+  if (v === "success" && team) return { text: "Thanks! The team's plan changes for everyone as soon as Stripe confirms the payment, usually within a minute.", good: true };
   if (v === "success") return { text: "Thanks! Your plan changes as soon as Stripe confirms the payment, usually within a minute.", good: true };
   if (v === "cancelled") return { text: "Checkout cancelled. Nothing was charged.", good: false };
   return null;

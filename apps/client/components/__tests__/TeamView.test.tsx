@@ -1,8 +1,8 @@
 import React from "react";
-import { render, screen, userEvent, within } from "@testing-library/react-native";
-import { TeamView } from "../TeamView";
+import { act, render, screen, userEvent, within } from "@testing-library/react-native";
+import { TEAM_CONFIRM_EVERY_MS, TeamView } from "../TeamView";
 import { ApiError, type SuperBotApi } from "../../src/api";
-import type { MyTeamInvite, OffboardingPreview, Team, TeamMember } from "../../src/types";
+import type { MyTeamInvite, OffboardingPreview, Team, TeamBilling, TeamMember } from "../../src/types";
 
 const mockConfirm = jest.fn(async (..._a: unknown[]) => true);
 jest.mock("../../src/dialogs", () => ({ confirmAsync: (...a: unknown[]) => mockConfirm(...a) }));
@@ -58,20 +58,110 @@ function fakeApi(team: Team | null, invites: MyTeamInvite[] = []) {
     leaveTeam: jest.fn(async () => {}),
     acceptTeamInvite: jest.fn(async () => {}),
     declineTeamInvite: jest.fn(async () => {}),
+    teamCheckout: jest.fn(async (tier: string) => ({ url: `https://checkout.stripe.com/c/pay/${tier}` })),
+    teamBillingPortal: jest.fn(async () => ({ url: "https://billing.stripe.com/p/session/1" })),
   };
 }
 
-async function open(team: Team | null, { meId = "ada", canWrite = true, invites = [] as MyTeamInvite[] } = {}) {
+async function open(team: Team | null, { meId = "ada", canWrite = true, invites = [] as MyTeamInvite[], checkout = undefined as string | undefined } = {}) {
   const api = fakeApi(team, invites);
   const user = userEvent.setup();
-  await render(<TeamView api={api as unknown as SuperBotApi} meId={meId} canWrite={canWrite} onBack={jest.fn()} />);
+  const openPage = jest.fn(async (_url: string) => {});
+  await render(<TeamView api={api as unknown as SuperBotApi} meId={meId} canWrite={canWrite} onBack={jest.fn()} checkout={checkout} open={openPage} />);
   await screen.findByText(team ? "People" : "You aren't on a team.");
-  return { api, user };
+  return { api, user, openPage };
 }
+
+const plans = [
+  { name: "starter", label: "Starter", managed: true, limits: { maxBots: 2 } },
+  { name: "pro", label: "Pro", managed: true, limits: { maxBots: 10 } },
+];
+const paying: TeamBilling = {
+  plan: { name: "pro", label: "Pro" },
+  subscription: { status: "active", tier: "pro", periodEnd: 1_797_582_000, cancelAt: null },
+  seats: { members: 2, billed: 2, syncing: false, error: null },
+  portal: true,
+  plans,
+  canChange: true,
+};
 
 beforeEach(() => mockConfirm.mockClear());
 
 describe("TeamView", () => {
+  it("lets an owner buy one plan for the whole team through Stripe Checkout (ADR 0093)", async () => {
+    const { api, user, openPage } = await open({ ...teamAs("owner"), billing: { plan: null, subscription: null, seats: null, portal: false, plans, canChange: true } });
+    const plan = within(screen.getByTestId("team-plan"));
+    expect(plan.getByText("No team plan")).toBeOnTheScreen();
+    expect(plan.getByText(/A seat for each person on the team/)).toBeOnTheScreen();
+    expect(plan.queryByText("Manage billing")).toBeNull();
+    await user.press(plan.getByRole("link", { name: "Buy Pro for the team" }));
+    expect(api.teamCheckout).toHaveBeenCalledWith("pro");
+    expect(openPage).toHaveBeenCalledWith("https://checkout.stripe.com/c/pay/pro");
+  });
+
+  it("shows managers the team's plan and seats, and sends them to Stripe's portal", async () => {
+    const { api, user, openPage } = await open({ ...teamAs("admin"), billing: paying }, { meId: "al" });
+    const plan = within(screen.getByTestId("team-plan"));
+    expect(plan.getByText("Pro plan")).toBeOnTheScreen();
+    expect(plan.getByText("Paid through Stripe · current period ends 18 Dec 2026")).toBeOnTheScreen();
+    expect(plan.getByText(/^2 seats, one for each person on the team/)).toBeOnTheScreen();
+    expect(plan.queryByRole("link", { name: /^Buy / })).toBeNull();
+    await user.press(plan.getByText("Manage billing"));
+    expect(api.teamBillingPortal).toHaveBeenCalledTimes(1);
+    expect(openPage).toHaveBeenCalledWith("https://billing.stripe.com/p/session/1");
+  });
+
+  it("says when Stripe hasn't caught up with the team's seats", async () => {
+    await open({ ...teamAs("owner"), billing: { ...paying, seats: { members: 3, billed: 2, syncing: true, error: "Stripe couldn't change the seats just now. SuperBot keeps trying." } } });
+    expect(screen.getByText(/^3 people on the team, 2 billed\. Stripe couldn't change the seats/)).toBeOnTheScreen();
+  });
+
+  it("tells members the team pays, with nothing to change", async () => {
+    await open({ ...teamAs("member"), billing: { plan: { name: "pro", label: "Pro" } } }, { meId: "al" });
+    const plan = within(screen.getByTestId("team-plan"));
+    expect(plan.getByText("The team pays for the Pro plan for everyone on it.")).toBeOnTheScreen();
+    expect(plan.getByText("Only the team's owners and admins can change the team's plan.")).toBeOnTheScreen();
+    expect(plan.queryByText("Manage billing")).toBeNull();
+  });
+
+  it("offers read-only managers no buttons to change the plan", async () => {
+    await open({ ...teamAs("owner"), billing: { ...paying, plan: null, canChange: false } });
+    expect(screen.queryByRole("link", { name: /^Buy / })).toBeNull();
+    expect(screen.queryByText("Manage billing")).toBeNull();
+  });
+
+  it("has no plan section on a server that doesn't sell plans", async () => {
+    await open(teamAs("owner"));
+    expect(screen.queryByTestId("team-plan")).toBeNull();
+  });
+
+  it("keeps the last person on a paying team from leaving", async () => {
+    await open({ ...teamAs("owner"), members: [ada], billing: paying });
+    expect(screen.queryByText("Leave team")).toBeNull();
+    expect(screen.getByText(/Cancel it under Manage billing before you leave/)).toBeOnTheScreen();
+  });
+
+  it("thanks managers back from Stripe, and shows the team's plan once Stripe confirms it", async () => {
+    jest.useFakeTimers();
+    try {
+      const unpaid = { ...teamAs("owner"), billing: { plan: null, subscription: null, seats: null, portal: false, plans, canChange: true } };
+      const { api } = await open(unpaid, { checkout: "success" });
+      expect(screen.getByText(/team's plan changes for everyone/)).toBeOnTheScreen();
+      api.team.mockResolvedValue({ ...teamAs("owner"), billing: paying });
+      await act(async () => {
+        jest.advanceTimersByTime(TEAM_CONFIRM_EVERY_MS);
+      });
+      expect(await screen.findByText("Pro plan")).toBeOnTheScreen();
+      const calls = api.team.mock.calls.length;
+      await act(async () => {
+        jest.advanceTimersByTime(TEAM_CONFIRM_EVERY_MS * 3);
+      });
+      expect(api.team.mock.calls.length).toBe(calls);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it("shows an owner the team, roles and each teammate's machine", async () => {
     await open(teamAs("owner"));
     expect(screen.getByText("Alpha")).toBeOnTheScreen();

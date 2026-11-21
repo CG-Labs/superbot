@@ -151,6 +151,7 @@ fn every_email_is_plain_text_with_a_link_and_no_provider_details() {
         limit: Some(5_000_000),
         why: None,
         message: Some("Storage is 1.2 MB used of the Small plan's 1 MB.".into()),
+        team: None,
     };
     for k in KINDS {
         let r = render(k, &f, Some(LINK), None);
@@ -187,6 +188,73 @@ fn the_computer_line_goes_in_the_body_and_labels_cant_break_the_subject() {
     let r = render(Kind::PlanChanged, &f, Some(LINK), Some("Your computer is now the Pro plan's size."));
     assert_eq!(r.subject, "[SuperBot] Your plan changed to Pro Bcc: someone@example.com");
     assert!(r.body.contains("\nYour computer is now the Pro plan's size.\n"), "{}", r.body);
+}
+
+fn team_sub(status: &str, tier: Option<&str>) -> crate::db::TeamSubscription {
+    crate::db::TeamSubscription {
+        team_id: "t_alpha".into(),
+        provider: "stripe".into(),
+        customer_id: Some("cus_test_alpha".into()),
+        subscription_id: "sub_test_alpha".into(),
+        status: status.into(),
+        price_id: Some("price_pro_monthly".into()),
+        tier: tier.map(String::from),
+        item_id: Some("si_test_alpha".into()),
+        quantity: Some(2),
+        period_start: Some(1_794_990_000),
+        period_end: Some(1_797_582_000),
+        cancel_at: None,
+        started: 1_794_990_000,
+        event_created: 1_795_000_000,
+        updated_at: 0,
+        paid_by: Some("u_ada".into()),
+        seat_tries: 0,
+        seat_failures: 0,
+        seat_next_at: 0,
+        seat_error: None,
+    }
+}
+
+#[test]
+fn a_team_plans_emails_go_to_each_owner_and_admin_once() {
+    let row = team_sub("active", Some("pro"));
+    let to = ["u_ada".to_string(), "u_cy".to_string()];
+    let ev = TeamSubEvent { event_id: "evt_1", row: &row, ending: false, team: "Alpha", to: &to };
+    let applied = changed(None, Some("pro"));
+    let c = crate::db::TeamChange { applied: &applied, before: None, paying_before: None, paying_after: Some(&row), other_paying: None };
+    let e = for_team_subscription(&ev, &c, &tiers());
+    assert_eq!(e.iter().map(|e| (e.user_id.as_str(), e.kind, e.key.as_str())).collect::<Vec<_>>(), [
+        ("u_ada", Kind::PlanStarted, "stripe:evt_1:plan_started:u_ada"),
+        ("u_cy", Kind::PlanStarted, "stripe:evt_1:plan_started:u_cy")
+    ]);
+    assert_eq!(e[0].facts.team.as_deref(), Some("Alpha"));
+    // Nobody to tell, or nothing applied: no emails.
+    assert!(for_team_subscription(&TeamSubEvent { to: &[], ..ev }, &c, &tiers()).is_empty());
+    let dup = Applied::Duplicate;
+    assert!(for_team_subscription(&ev, &crate::db::TeamChange { applied: &dup, ..c }, &tiers()).is_empty());
+    // Set to end: once per person and date.
+    let ending = crate::db::TeamSubscription { cancel_at: Some(1_797_582_000), ..row.clone() };
+    let ev = TeamSubEvent { row: &ending, ..ev };
+    let same = Applied::Unchanged;
+    let e = for_team_subscription(&ev, &crate::db::TeamChange { applied: &same, before: Some(&row), paying_before: Some(&row), paying_after: Some(&ending), other_paying: None }, &tiers());
+    assert_eq!(e.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(), ["stripe:sub_test_alpha:plan_ending:1797582000:u_ada", "stripe:sub_test_alpha:plan_ending:1797582000:u_cy"]);
+}
+
+#[test]
+fn a_team_plans_emails_say_whose_plan_it_is_and_link_to_the_team() {
+    const TEAM: &str = "https://bots.example.com/app/team";
+    let f = Facts { plan: Some("Pro".into()), from_plan: Some("Starter".into()), until: Some(1_797_582_000_000), team: Some("Alpha".into()), ..Default::default() };
+    for k in [Kind::PlanStarted, Kind::PlanChanged, Kind::PaymentFailed, Kind::PlanEnding, Kind::PlanEnded] {
+        let r = render(k, &f, Some(TEAM), Some("Your computer is now the Pro plan's size."));
+        assert_plain(&r);
+        assert!(r.subject.contains("Alpha") && r.body.contains("Alpha") && r.body.contains(TEAM), "{k:?}: {r:?}");
+        assert!(r.body.contains("owners and admins") && !r.body.contains("Your computer"), "{k:?}: {}", r.body);
+        let bare = render(k, &f, None, None);
+        assert!(!bare.body.contains("https://") && bare.body.contains("open Team in SuperBot"), "{k:?}: {}", bare.body);
+    }
+    let r = render(Kind::PlanStarted, &f, Some(TEAM), None);
+    assert_eq!(r.subject, "[SuperBot] Alpha's Pro plan has started");
+    assert!(r.body.contains("every teammate gets its limits") && r.body.contains("a seat for each"), "{}", r.body);
 }
 
 #[test]

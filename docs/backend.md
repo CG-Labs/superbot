@@ -293,6 +293,19 @@ While billing is on and botd has an SMTP server ([ADR 0061](adr/0061-approval-no
 - **Content**: the plan's label, dates, counts, and a link to `{PUBLIC_URL}/app/plan`. Never Stripe ids, prices, portal links, provider details or secrets.
 - **Sending**: one message each, the try counted before it's sent, retried after 1, 4, 16 and 64 minutes, then given up. If an outcome can't be saved, sending stops until the next pass. Audited as `billing.email_sent`, `billing.email_skipped` (`no_user`, `no_address`, `opted_out`, `inactive`) and `billing.email_failed`.
 
+### Team billing
+
+With checkout on ([ADR 0042](adr/0042-billing-checkout-portal-customers.md)), a team's owners and admins buy one plan for everyone on it ([ADR 0093](adr/0093-team-billing.md)). Without billing nothing changes.
+
+- **Buy and manage**: `POST /api/team/billing/checkout {tier}` and `POST /api/team/billing/portal` (write access, the team's owners and admins) return a Stripe page's `{url}`; Stripe sends them back to `/app/team`. A second checkout while the team pays is a 409. The team has its own Stripe customer, never a person's.
+- **Everyone's plan**: while the team pays, each member's tier, limits, machine size and billing period are the team plan's, over any tier of their own. Joining moves the newcomer onto it and leaving moves them back, each audited as `user.tier_changed` (source `team`) with a resize request. A member can't buy a personal plan meanwhile (409, `teamPays`).
+- **Seats**: one per member (at least one), set on the subscription item with prorations when people join or leave and checked every minute; failures retry after 1, 4, 16 and 64 minutes, then hourly. Audited as `team.seats_synced` and `team.seats_sync_failed`. A restricted Stripe key needs write access to Subscriptions.
+- **Webhook**: a subscription is the team's when its metadata has `superbot_team_id`, its id is the team's, or it names no user and its customer is the team's; one naming both a user and a team is ignored (`ambiguous_payer`). Plan changes are audited as `team.tier_changed`.
+- **Safety**: the last member can't leave, be removed, or the team be deleted while it pays or its checkout was paid (409, `team.delete_refused`); an unpaid open checkout is expired first. A paid checkout blocks a second until its subscription is recorded.
+- **Meter**: with `STRIPE_METER_EVENT`, a member's tokens go to the team's customer while it pays, fixed when the run is recorded.
+- **See it**: `GET /api/team` adds `billing` (the plan for everyone; status, seats, plans and `portal` for managers); `GET /api/billing` adds `teamPlan`; `GET /api/teams` shows each team's for server admins. The Team screen, the Plan screen and the console's Teams tab use these.
+- **Emails**: ADR 0091's plan and payment emails for a team plan go to its owners and admins, linking to `/app/team`.
+
 ### One Unix account per user
 
 With `ISOLATION=users`, each user's Bots run as that user's own Unix account, `sb-u-<user id>`, so one user's Bots can't read or write another's folder or harness logins, or botd's `DATA_DIR`, database, `.env`, and master key. **On for new installs** (`deploy/install.sh` and Docker Compose); an install from before keeps it off (unset or `off`), and botd's startup log says how to opt in: `deploy/install.sh --isolation`, or `ISOLATION=users` in Docker Compose's `.env`. Design: [ADR 0037](adr/0037-per-user-unix-accounts.md), [ADR 0058](adr/0058-harness-os-user-by-default.md).
@@ -444,6 +457,6 @@ Approvals, policy, and audit. Writes, decisions, the approvals list, and the aud
 
 ## Not built yet
 
-Sign-up emails, self-serve SSO linking, and sign-up retention ([ADR 0022](adr/0022-landing-and-signups.md)). SCIM groups, group-to-role mapping, and bulk ([ADR 0023](adr/0023-scim.md)). Enrollment and mTLS with per-user machines, moving a user's Bots onto theirs, and `botctl machine` commands ([ADR 0025](adr/0025-control-plane-linode.md)). Yearly prices at checkout ([#31](https://github.com/CG-Labs/superbot/issues/31)). Vault/Key Vault/Secret Manager stores and master-key rotation (the `SecretStore` trait is ready for them), per-Bot resource limits, Slack. Approvals follow-ups are in [approvals-followups.md](approvals-followups.md).
+Sign-up emails, self-serve SSO linking, and sign-up retention ([ADR 0022](adr/0022-landing-and-signups.md)). SCIM groups, group-to-role mapping, and bulk ([ADR 0023](adr/0023-scim.md)). Enrollment and mTLS with per-user machines, moving a user's Bots onto theirs, and `botctl machine` commands ([ADR 0025](adr/0025-control-plane-linode.md)). Yearly prices at checkout, and team-only prices ([#31](https://github.com/CG-Labs/superbot/issues/31), [ADR 0093](adr/0093-team-billing.md)). Vault/Key Vault/Secret Manager stores and master-key rotation (the `SecretStore` trait is ready for them), per-Bot resource limits, Slack. Approvals follow-ups are in [approvals-followups.md](approvals-followups.md).
 
 Computer use (each Bot's screen, browser, and live view) is in [computer.md](computer.md).
