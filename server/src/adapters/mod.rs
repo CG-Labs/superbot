@@ -632,7 +632,7 @@ mod tests {
         super::withhold(["E2E_WITHHELD_KEY".to_string()]);
         super::withhold(["E2E_WITHHELD_KEY".to_string()]);
         let remove = super::local_host().remove;
-        assert_eq!(remove.iter().filter(|k| k.starts_with("E2E_WITHHELD_KEY")).count(), 2, "{remove:?}");
+        assert_eq!(remove.iter().filter(|k| k.starts_with("E2E_WITHHELD_KEY")).count(), 2);
         assert!(remove.contains(&"E2E_WITHHELD_KEY_FILE".to_string()));
         let mut cmd = std::process::Command::new("true");
         super::strip_secret_env(&mut cmd);

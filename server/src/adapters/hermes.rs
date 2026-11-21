@@ -456,7 +456,7 @@ mod tests {
         // as the adapter hands it over; one not saved isn't handed over at all.
         let job = super::super::job_for(&mut Hermes::default(), &i, &mut Vec::new());
         assert_eq!(job.env.get("HERMES_PROVIDER_SUPERBOT_GPT_API_KEY").map(String::as_str), Some("sk-o"));
-        assert!(!job.env.contains_key("TIER_OPENAI_KEY") && !job.env.contains_key("HERMES_PROVIDER_SUPERBOT_CLAUDE_API_KEY"), "{:?}", job.env.keys());
+        assert!(!job.env.contains_key("TIER_OPENAI_KEY") && !job.env.contains_key("HERMES_PROVIDER_SUPERBOT_CLAUDE_API_KEY"));
 
         // Another tier endpoint's key, set in botd's environment: withheld, so never listed.
         super::super::withhold(["TIER_OTHER_KEY".to_string()]);
