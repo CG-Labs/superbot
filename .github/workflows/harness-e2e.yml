@@ -1,0 +1,110 @@
+name: harness-e2e
+
+# Approvals end to end through the real harness CLIs, at the versions SuperBot pins
+# (server/src/adapters/install.rs), with a fake model (ADR 0057). Runs when the code
+# between a harness and a decision changes, weekly, and by hand.
+
+on:
+  pull_request:
+    paths:
+      - 'server/src/adapters/**'
+      - 'server/src/approvals.rs'
+      - 'server/src/main.rs'
+      - 'server/src/policy.rs'
+      - 'server/src/policy/**'
+      - 'server/src/shell.rs'
+      - 'server/src/scripts.rs'
+      - 'server/src/runner.rs'
+      - 'server/src/sandbox.rs'
+      - 'server/src/bin/botctl.rs'
+      - 'server/tests/harness_e2e.rs'
+      - 'deploy/install-harness-clis.sh'
+      - 'deploy/harness-e2e.sh'
+      - 'Cargo.lock'
+      - '.github/workflows/harness-e2e.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'server/src/adapters/**'
+      - 'server/src/approvals.rs'
+      - 'server/src/main.rs'
+      - 'server/src/policy.rs'
+      - 'server/src/policy/**'
+      - 'server/src/shell.rs'
+      - 'server/src/scripts.rs'
+      - 'server/src/runner.rs'
+      - 'server/src/sandbox.rs'
+      - 'server/src/bin/botctl.rs'
+      - 'server/tests/harness_e2e.rs'
+      - 'deploy/install-harness-clis.sh'
+      - 'deploy/harness-e2e.sh'
+      - 'Cargo.lock'
+      - '.github/workflows/harness-e2e.yml'
+  schedule:
+    - cron: '23 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: harness-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  SUPERBOT_E2E_REQUIRE: '1'
+  # The oldest Codex that runs hooks in `codex exec` the way the adapter starts it.
+  # 0.132-0.140 take the flags but skip the hook; older ones refuse the flags.
+  CODEX_MIN_HOOKS: '0.141.0'
+
+jobs:
+  npm-harnesses:
+    name: Claude Code, Codex, Pi
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Build botd and the test
+        run: cargo test --test harness_e2e --no-run
+      - name: Install the pinned CLIs
+        run: |
+          set -euo pipefail
+          deploy/install-harness-clis.sh "$RUNNER_TEMP/clis" claude codex pi | tee /tmp/install.log
+          grep '^/' /tmp/install.log >>"$GITHUB_PATH"
+      - name: Approvals through Claude Code, Codex and Pi
+        run: SUPERBOT_E2E_HARNESSES=claude,codex,pi cargo test --test harness_e2e -- --ignored --nocapture
+      - name: Install the oldest Codex that runs hooks
+        run: |
+          set -euo pipefail
+          HARNESS_VERSION_CODEX="$CODEX_MIN_HOOKS" deploy/install-harness-clis.sh "$RUNNER_TEMP/codex-min" codex | tee /tmp/codex-min.log
+          grep '^/' /tmp/codex-min.log >/tmp/codex-min.path
+      - name: Approvals through the oldest Codex
+        run: |
+          PATH="$(cat /tmp/codex-min.path):$PATH" SUPERBOT_E2E_HARNESSES=codex \
+            cargo test --test harness_e2e -- --ignored --nocapture codex_hooks_hold
+
+  hermes:
+    name: Hermes Agent
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build botd and the test
+        run: cargo test --test harness_e2e --no-run
+      - name: Install the pinned Hermes Agent
+        run: |
+          set -euo pipefail
+          deploy/install-harness-clis.sh "$RUNNER_TEMP/clis" hermes | tee /tmp/install.log
+          grep '^/' /tmp/install.log >>"$GITHUB_PATH"
+          # Each Bot's Hermes builds its runtime from uv's cache: the installer's.
+          echo "UV_CACHE_DIR=$RUNNER_TEMP/clis/hermes/.cache/uv" >>"$GITHUB_ENV"
+      - name: Approvals through Hermes Agent
+        run: SUPERBOT_E2E_HARNESSES=hermes cargo test --test harness_e2e -- --ignored --nocapture
