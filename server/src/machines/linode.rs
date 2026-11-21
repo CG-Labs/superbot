@@ -3,8 +3,8 @@
 //! Authorization header and nowhere else: not in errors, logs, or `Debug`.
 
 use super::provider::{
-    CreateSpec, FirewallDevices, FirewallRule, Fut, MachineProvider, ProviderError, ProviderFirewall,
-    ProviderMachine, RebuildSpec,
+    CreateSpec, FirewallDevices, FirewallRule, Fut, MachineProvider, ProviderError,
+    ProviderFirewall, ProviderMachine, RebuildSpec,
 };
 use base64::Engine;
 use reqwest::{Method, StatusCode};
@@ -105,7 +105,10 @@ impl Linode {
     /// for anything else.
     async fn devices(&self, id: &str) -> Result<Vec<Option<(u64, String)>>, ProviderError> {
         Ok(self
-            .all(&format!("/networking/firewalls/{}/devices", path_id(id)?), None)
+            .all(
+                &format!("/networking/firewalls/{}/devices", path_id(id)?),
+                None,
+            )
             .await?
             .iter()
             .map(|d| {
@@ -174,9 +177,9 @@ fn our_rules(r: &Value) -> Option<Vec<FirewallRule>> {
 }
 
 fn firewall(v: &Value) -> Result<ProviderFirewall, ProviderError> {
-    let id = v["id"]
-        .as_u64()
-        .ok_or_else(|| ProviderError::Transport("Linode sent a firewall we couldn't read".into()))?;
+    let id = v["id"].as_u64().ok_or_else(|| {
+        ProviderError::Transport("Linode sent a firewall we couldn't read".into())
+    })?;
     Ok(ProviderFirewall {
         id: id.to_string(),
         label: v["label"].as_str().unwrap_or_default().into(),
@@ -918,7 +921,10 @@ mod tests {
         );
         let found = api.find_firewall("superbot-fw").await.unwrap().unwrap();
         assert_eq!(found.id, "77", "the exact label, not a namesake");
-        assert!(made.enabled && !found.enabled, "a disabled one is told apart");
+        assert!(
+            made.enabled && !found.enabled,
+            "a disabled one is told apart"
+        );
         assert_eq!(
             found.rules,
             Some(vec![rules[0].clone()]),
@@ -998,7 +1004,11 @@ mod tests {
         assert_eq!(seen[6].3["inbound"].as_array().unwrap().len(), 1);
         assert_eq!(seen[7].3, json!({ "status": "enabled" }));
         assert_eq!(seen[9].3, json!({ "id": 8, "type": "linode" }));
-        assert_eq!(seen[16].3["firewall_id"], json!(77), "behind it from the first boot");
+        assert_eq!(
+            seen[16].3["firewall_id"],
+            json!(77),
+            "behind it from the first boot"
+        );
     }
 
     #[test]
@@ -1009,7 +1019,10 @@ mod tests {
         for (path, v) in [
             ("/inbound_policy", json!("ACCEPT")),
             ("/outbound_policy", json!("DROP")),
-            ("/outbound", json!([{ "action": "DROP", "protocol": "TCP" }])),
+            (
+                "/outbound",
+                json!([{ "action": "DROP", "protocol": "TCP" }]),
+            ),
             ("/inbound/0/action", json!("DROP")),
             ("/inbound/0/protocol", json!("UDP")),
             ("/inbound/0/addresses/ipv4/0", json!("not an address")),
@@ -1093,12 +1106,24 @@ mod tests {
             authorized_keys: vec!["ssh-ed25519 AAAA operator".into()],
             user_data: "#cloud-config\nsecret-token".into(),
         };
-        assert!(!format!("{spec:?}").contains("secret-token"), "the token never reaches a log");
+        assert!(
+            !format!("{spec:?}").contains("secret-token"),
+            "the token never reaches a log"
+        );
         api.rebuild("7", &spec).await.unwrap();
         api.rebuild("7", &spec).await.unwrap();
-        assert_eq!(api.rebuild("8", &spec).await, Err(ProviderError::RateLimited));
-        assert!(matches!(api.rebuild("9", &spec).await, Err(ProviderError::Api { status: 400, .. })));
-        assert!(api.rebuild("../7", &spec).await.is_err(), "ids are checked before they reach a path");
+        assert_eq!(
+            api.rebuild("8", &spec).await,
+            Err(ProviderError::RateLimited)
+        );
+        assert!(matches!(
+            api.rebuild("9", &spec).await,
+            Err(ProviderError::Api { status: 400, .. })
+        ));
+        assert!(
+            api.rebuild("../7", &spec).await.is_err(),
+            "ids are checked before they reach a path"
+        );
 
         let seen = seen.lock().unwrap();
         assert_eq!(seen[0].1, "/linode/instances/7/rebuild");
@@ -1106,11 +1131,17 @@ mod tests {
         assert_eq!(b["image"], "linode/ubuntu24.04");
         assert_eq!(b["booted"], true);
         assert_eq!(b["authorized_keys"], json!(["ssh-ed25519 AAAA operator"]));
-        let ud = base64::engine::general_purpose::STANDARD.decode(b["metadata"]["user_data"].as_str().unwrap()).unwrap();
+        let ud = base64::engine::general_purpose::STANDARD
+            .decode(b["metadata"]["user_data"].as_str().unwrap())
+            .unwrap();
         assert_eq!(ud, b"#cloud-config\nsecret-token");
         let pass = b["root_pass"].as_str().unwrap();
         assert!(pass.len() >= 32);
-        assert_ne!(seen[1].3["root_pass"].as_str().unwrap(), pass, "a new root password each time");
+        assert_ne!(
+            seen[1].3["root_pass"].as_str().unwrap(),
+            pass,
+            "a new root password each time"
+        );
         assert_eq!(seen.len(), 4);
     }
 }

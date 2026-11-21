@@ -106,17 +106,47 @@ pub struct Listed {
 }
 
 /// Names botd or the harnesses rely on; a stored secret must not replace them in a Bot's environment.
-const RESERVED: [&str; 14] = ["AUTH_PASSWORD", "LICENSE_KEY", "STRIPE_WEBHOOK_SECRET", "STRIPE_SECRET_KEY", "PATH", "HOME", "USER", "LOGNAME", "SHELL", "ENV", "BASH_ENV", "NODE_OPTIONS", "DISPLAY", "DBUS_SESSION_BUS_ADDRESS"];
-const RESERVED_PREFIXES: [&str; 7] = ["SUPERBOT_", "BOT_", "SSO_", "LD_", "DYLD_", "AGENT_BROWSER_", "VOXL_"];
+const RESERVED: [&str; 14] = [
+    "AUTH_PASSWORD",
+    "LICENSE_KEY",
+    "STRIPE_WEBHOOK_SECRET",
+    "STRIPE_SECRET_KEY",
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "ENV",
+    "BASH_ENV",
+    "NODE_OPTIONS",
+    "DISPLAY",
+    "DBUS_SESSION_BUS_ADDRESS",
+];
+const RESERVED_PREFIXES: [&str; 7] = [
+    "SUPERBOT_",
+    "BOT_",
+    "SSO_",
+    "LD_",
+    "DYLD_",
+    "AGENT_BROWSER_",
+    "VOXL_",
+];
 pub const MAX_VALUE: usize = 64 * 1024;
 
 fn env_shaped(name: &str) -> bool {
-    !name.is_empty() && name.len() <= 128 && name.bytes().enumerate().all(|(i, b)| b == b'_' || b.is_ascii_uppercase() || (i > 0 && b.is_ascii_digit()))
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| b == b'_' || b.is_ascii_uppercase() || (i > 0 && b.is_ascii_digit()))
 }
 
 pub fn check_name(name: &str) -> Result<(), Error> {
     if !env_shaped(name) {
-        return Err(Error::Invalid("Use an environment variable name: A-Z, 0-9, and _, not starting with a digit.".into()));
+        return Err(Error::Invalid(
+            "Use an environment variable name: A-Z, 0-9, and _, not starting with a digit.".into(),
+        ));
     }
     if RESERVED.contains(&name) || RESERVED_PREFIXES.iter().any(|p| name.starts_with(p)) {
         return Err(Error::Invalid(format!("{name} is reserved by SuperBot.")));
@@ -128,36 +158,61 @@ pub fn check_name(name: &str) -> Result<(), Error> {
 /// Today these are SSO client secrets (`SSO_<PROVIDER>_CLIENT_SECRET`, ADR 0014),
 /// Apple's signing keys (`SSO_<PROVIDER>_PRIVATE_KEY`, ADR 0018), and `SERVER_SECRETS`.
 pub fn server_secret(name: &str) -> bool {
-    let provider = |suffix: &str| name.strip_prefix("SSO_").and_then(|n| n.strip_suffix(suffix)).is_some_and(|id| !id.is_empty());
-    let bot_webhook = name.strip_prefix(BOT_WEBHOOK_PREFIX).is_some_and(|id| !id.is_empty());
-    env_shaped(name) && (provider("_CLIENT_SECRET") || provider("_PRIVATE_KEY") || SERVER_SECRETS.contains(&name) || bot_webhook)
+    let provider = |suffix: &str| {
+        name.strip_prefix("SSO_")
+            .and_then(|n| n.strip_suffix(suffix))
+            .is_some_and(|id| !id.is_empty())
+    };
+    let bot_webhook = name
+        .strip_prefix(BOT_WEBHOOK_PREFIX)
+        .is_some_and(|id| !id.is_empty());
+    env_shaped(name)
+        && (provider("_CLIENT_SECRET")
+            || provider("_PRIVATE_KEY")
+            || SERVER_SECRETS.contains(&name)
+            || bot_webhook)
 }
 
 /// The Turnstile secret (ADR 0022), the Linode token, which can rent and delete every
 /// user's machine (ADR 0025), botd's Incus client key, which can do the same to every
 /// container and administers the Incus host (ADR 0065), and the notifier's SMTP
 /// password, webhook URL, and webhook signing key (ADR 0061).
-pub const SERVER_SECRETS: [&str; 6] = ["TURNSTILE_SECRET", "LINODE_TOKEN", "INCUS_CLIENT_KEY", "SMTP_PASSWORD", "NOTIFY_WEBHOOK_URL", "NOTIFY_WEBHOOK_SECRET"];
+pub const SERVER_SECRETS: [&str; 6] = [
+    "TURNSTILE_SECRET",
+    "LINODE_TOKEN",
+    "INCUS_CLIENT_KEY",
+    "SMTP_PASSWORD",
+    "NOTIFY_WEBHOOK_URL",
+    "NOTIFY_WEBHOOK_SECRET",
+];
 
 /// Each Bot's own notification webhook URL: `NOTIFY_WEBHOOK_URL_BOT_<ID>` (ADR 0061).
 pub const BOT_WEBHOOK_PREFIX: &str = "NOTIFY_WEBHOOK_URL_BOT_";
 
 fn check_saveable(name: &str) -> Result<(), Error> {
-    if server_secret(name) { Ok(()) } else { check_name(name) }
+    if server_secret(name) {
+        Ok(())
+    } else {
+        check_name(name)
+    }
 }
 
 /// A user's secret goes to their Bots, so botd's own names are refused too.
 fn check_user_name(name: &str) -> Result<(), Error> {
     check_name(name)?;
     if server_secret(name) {
-        return Err(Error::Invalid(format!("{name} is SuperBot's own; no Bot gets it.")));
+        return Err(Error::Invalid(format!(
+            "{name} is SuperBot's own; no Bot gets it."
+        )));
     }
     Ok(())
 }
 
 fn check_value(v: &str) -> Result<(), Error> {
     if v.is_empty() || v.len() > MAX_VALUE || v.contains('\0') {
-        return Err(Error::Invalid(format!("The value must be 1 to {MAX_VALUE} bytes, without NUL.")));
+        return Err(Error::Invalid(format!(
+            "The value must be 1 to {MAX_VALUE} bytes, without NUL."
+        )));
     }
     Ok(())
 }
@@ -183,7 +238,10 @@ pub struct Secrets {
 
 impl Secrets {
     pub fn new(stores: Vec<Box<dyn SecretStore>>) -> Secrets {
-        Secrets { stores, users: None }
+        Secrets {
+            stores,
+            users: None,
+        }
     }
 
     pub fn with_users(mut self, users: sealed::UserSecrets) -> Secrets {
@@ -197,12 +255,23 @@ impl Secrets {
 
     pub fn user_list(&self, user_id: &str) -> Result<Vec<UserListed>, Error> {
         let rows = self.users()?.names(user_id)?;
-        let server: Vec<String> = self.list().unwrap_or_default().into_iter().filter(|l| l.for_bots).map(|l| l.name).collect();
+        let server: Vec<String> = self
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|l| l.for_bots)
+            .map(|l| l.name)
+            .collect();
         Ok(rows
             .into_iter()
             .map(|(name, created_at, updated_at)| {
                 let overrides = server.contains(&name);
-                UserListed { name, created_at, updated_at, overrides }
+                UserListed {
+                    name,
+                    created_at,
+                    updated_at,
+                    overrides,
+                }
             })
             .collect())
     }
@@ -215,12 +284,21 @@ impl Secrets {
     /// Saves a secret that reaches only `user_id`'s Bots, over a server-wide one of the
     /// same name, and says whether it replaced one the user had. botd's own secrets
     /// can't be saved here: no Bot may get them.
-    pub fn user_save(&self, user_id: &str, name: &str, value: &str) -> Result<(UserListed, bool), Error> {
+    pub fn user_save(
+        &self,
+        user_id: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<(UserListed, bool), Error> {
         check_user_name(name)?;
         check_value(value)?;
         redact::register_for(user_id, value);
         let replaced = self.users()?.put(user_id, name, value)?;
-        let listed = self.user_list(user_id)?.into_iter().find(|l| l.name == name).ok_or_else(|| Error::Store(format!("{name} was not saved")))?;
+        let listed = self
+            .user_list(user_id)?
+            .into_iter()
+            .find(|l| l.name == name)
+            .ok_or_else(|| Error::Store(format!("{name} was not saved")))?;
         Ok((listed, replaced))
     }
 
@@ -231,7 +309,9 @@ impl Secrets {
 
     /// Drops every secret a user saved. For when the user is deleted.
     pub fn user_forget(&self, user_id: &str) -> Result<usize, Error> {
-        let Ok(users) = self.users() else { return Ok(0) };
+        let Ok(users) = self.users() else {
+            return Ok(0);
+        };
         let names = users.names(user_id)?;
         for (n, ..) in &names {
             users.delete(user_id, n)?;
@@ -282,7 +362,11 @@ impl Secrets {
     }
 
     fn writable(&self) -> Result<&dyn SecretStore, Error> {
-        self.stores.iter().find(|s| s.writable()).map(|s| s.as_ref()).ok_or(Error::ReadOnly)
+        self.stores
+            .iter()
+            .find(|s| s.writable())
+            .map(|s| s.as_ref())
+            .ok_or(Error::ReadOnly)
     }
 
     pub fn put(&self, name: &str, value: &str) -> Result<Listed, Error> {
@@ -290,7 +374,10 @@ impl Secrets {
         check_value(value)?;
         redact::register(value);
         self.writable()?.put(name, value)?;
-        self.list()?.into_iter().find(|l| l.name == name && l.writable).ok_or_else(|| Error::Store(format!("{name} was not saved")))
+        self.list()?
+            .into_iter()
+            .find(|l| l.name == name && l.writable)
+            .ok_or_else(|| Error::Store(format!("{name} was not saved")))
     }
 
     pub fn delete(&self, name: &str) -> Result<bool, Error> {
@@ -307,7 +394,13 @@ impl Secrets {
             for name in s.names()?.into_iter().filter(|n| check_saveable(n).is_ok()) {
                 let shadowed_by = out.iter().find(|l| l.name == name).map(|l| l.store);
                 let for_bots = !server_secret(&name);
-                out.push(Listed { name, store: s.kind(), writable: s.writable(), shadowed_by, for_bots });
+                out.push(Listed {
+                    name,
+                    store: s.kind(),
+                    writable: s.writable(),
+                    shadowed_by,
+                    for_bots,
+                });
             }
         }
         Ok(out)
@@ -354,7 +447,11 @@ impl Secrets {
     /// Teaches the redactor a value. Environment names are a guess from the name, so
     /// only random-looking values from the first store count.
     fn learn(&self, from: &dyn SecretStore, v: &Secret) {
-        if self.stores.first().is_some_and(|first| std::ptr::addr_eq(first.as_ref(), from)) {
+        if self
+            .stores
+            .first()
+            .is_some_and(|first| std::ptr::addr_eq(first.as_ref(), from))
+        {
             redact::register_if_random(v.expose());
         } else {
             redact::register(v.expose());
@@ -372,7 +469,12 @@ impl Secrets {
                 }
             }
         }
-        for (user, v) in self.users.as_ref().map(|u| u.all_values()).unwrap_or_default() {
+        for (user, v) in self
+            .users
+            .as_ref()
+            .map(|u| u.all_values())
+            .unwrap_or_default()
+        {
             redact::register_for(&user, v.expose());
             n += 1;
         }
@@ -389,7 +491,11 @@ pub fn global() -> &'static Secrets {
         let path = crate::db::temp_path("secrets").join("app.sqlite");
         let c = sealed::connect(&path).unwrap();
         let users = sealed::UserSecrets::new(sealed::connect(&path).unwrap(), sealed::cipher());
-        Secrets::new(vec![Box::new(EnvStore::fixed(&[])), Box::new(sealed::SealedStore::new(c, sealed::cipher()))]).with_users(users)
+        Secrets::new(vec![
+            Box::new(EnvStore::fixed(&[])),
+            Box::new(sealed::SealedStore::new(c, sealed::cipher())),
+        ])
+        .with_users(users)
     });
     #[cfg(not(test))]
     GLOBAL.get().expect("secrets::init runs at startup")
@@ -440,7 +546,9 @@ pub fn init(db_path: &Path) -> Result<Report, String> {
         forget,
     )?;
     if forget && boot.discarded == 0 {
-        eprintln!("SUPERBOT_FORGET_SEALED=1 is set, but the master key works, so nothing was dropped. Remove the setting.");
+        eprintln!(
+            "SUPERBOT_FORGET_SEALED=1 is set, but the master key works, so nothing was dropped. Remove the setting."
+        );
     }
     let cipher = sealed::install(cipher)?;
     let store = sealed::SealedStore::new(sealed::connect(db_path)?, Arc::clone(&cipher));
@@ -452,8 +560,17 @@ pub fn init(db_path: &Path) -> Result<Report, String> {
     if boot.sealed + redacted + boot.discarded > 0 {
         sealed::purge_old_pages(&c).map_err(|e| format!("database: {e}"))?;
     }
-    GLOBAL.set(secrets).map_err(|_| "secrets::init ran twice".to_string())?;
-    Ok(Report { key_source, created: boot.created, sealed: boot.sealed, redacted, discarded: boot.discarded, stored })
+    GLOBAL
+        .set(secrets)
+        .map_err(|_| "secrets::init ran twice".to_string())?;
+    Ok(Report {
+        key_source,
+        created: boot.created,
+        sealed: boot.sealed,
+        redacted,
+        discarded: boot.discarded,
+        stored,
+    })
 }
 
 #[cfg(test)]
@@ -464,7 +581,11 @@ mod tests {
         let path = crate::db::temp_path("facade").join("app.sqlite");
         let c = sealed::connect(&path).unwrap();
         let users = sealed::UserSecrets::new(sealed::connect(&path).unwrap(), sealed::cipher());
-        Secrets::new(vec![Box::new(EnvStore::fixed(env)), Box::new(sealed::SealedStore::new(c, sealed::cipher()))]).with_users(users)
+        Secrets::new(vec![
+            Box::new(EnvStore::fixed(env)),
+            Box::new(sealed::SealedStore::new(c, sealed::cipher())),
+        ])
+        .with_users(users)
     }
 
     #[test]
@@ -472,31 +593,87 @@ mod tests {
         let s = secrets(&[("GITHUB_TOKEN", "team-wide-env-value")]);
         let a = format!("sk-ant-a-{}", crate::random_hex(12));
         s.put("OPENAI_API_KEY", "team-openai-value").unwrap();
-        assert_eq!(s.user_put("ua", "ANTHROPIC_API_KEY", &a).unwrap().name, "ANTHROPIC_API_KEY");
-        s.user_put("ua", "OPENAI_API_KEY", "a-openai-value").unwrap();
+        assert_eq!(
+            s.user_put("ua", "ANTHROPIC_API_KEY", &a).unwrap().name,
+            "ANTHROPIC_API_KEY"
+        );
+        s.user_put("ua", "OPENAI_API_KEY", "a-openai-value")
+            .unwrap();
         s.user_put("ub", "GH_TOKEN", "b-gh-value").unwrap();
         let env = |u: &str| -> Vec<(String, String)> {
-            let mut e: Vec<_> = s.harness_env_for(u).into_iter().map(|(k, v)| (k, v.expose().to_string())).collect();
+            let mut e: Vec<_> = s
+                .harness_env_for(u)
+                .into_iter()
+                .map(|(k, v)| (k, v.expose().to_string()))
+                .collect();
             e.sort();
             e
         };
         let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
-        assert_eq!(env("ua"), [pair("ANTHROPIC_API_KEY", &a), pair("OPENAI_API_KEY", "a-openai-value")], "A's own beat the team's");
-        assert_eq!(env("ub"), [pair("GH_TOKEN", "b-gh-value"), pair("OPENAI_API_KEY", "team-openai-value")], "none of A's");
+        assert_eq!(
+            env("ua"),
+            [
+                pair("ANTHROPIC_API_KEY", &a),
+                pair("OPENAI_API_KEY", "a-openai-value")
+            ],
+            "A's own beat the team's"
+        );
+        assert_eq!(
+            env("ub"),
+            [
+                pair("GH_TOKEN", "b-gh-value"),
+                pair("OPENAI_API_KEY", "team-openai-value")
+            ],
+            "none of A's"
+        );
         assert_eq!(env("uc"), [pair("OPENAI_API_KEY", "team-openai-value")]);
-        assert_eq!(redact::text_for(&["ua"], &a), redact::MARK, "redacted from A's Bots");
-        assert_eq!(redact::text_for(&["ub"], "deploy to b-gh-value"), "deploy to [redacted]");
-        assert_eq!(redact::text(&a), a.as_str(), "not from everyone's: any member can save any value");
+        assert_eq!(
+            redact::text_for(&["ua"], &a),
+            redact::MARK,
+            "redacted from A's Bots"
+        );
+        assert_eq!(
+            redact::text_for(&["ub"], "deploy to b-gh-value"),
+            "deploy to [redacted]"
+        );
+        assert_eq!(
+            redact::text(&a),
+            a.as_str(),
+            "not from everyone's: any member can save any value"
+        );
         assert_eq!(redact::text_for(&["ub"], &a), a.as_str());
-        for bad in ["PATH", "BOT_TOKEN", "SSO_X_CLIENT_SECRET", "LINODE_TOKEN", "INCUS_CLIENT_KEY", "TURNSTILE_SECRET", "SMTP_PASSWORD", "NOTIFY_WEBHOOK_URL", "NOTIFY_WEBHOOK_URL_BOT_A1B2C3D4", "lower"] {
-            assert!(matches!(s.user_put("ua", bad, "v"), Err(Error::Invalid(_))), "{bad}");
+        for bad in [
+            "PATH",
+            "BOT_TOKEN",
+            "SSO_X_CLIENT_SECRET",
+            "LINODE_TOKEN",
+            "INCUS_CLIENT_KEY",
+            "TURNSTILE_SECRET",
+            "SMTP_PASSWORD",
+            "NOTIFY_WEBHOOK_URL",
+            "NOTIFY_WEBHOOK_URL_BOT_A1B2C3D4",
+            "lower",
+        ] {
+            assert!(
+                matches!(s.user_put("ua", bad, "v"), Err(Error::Invalid(_))),
+                "{bad}"
+            );
         }
-        assert!(s.list().unwrap().iter().all(|l| l.name != "ANTHROPIC_API_KEY"), "not in the server-wide list");
+        assert!(
+            s.list()
+                .unwrap()
+                .iter()
+                .all(|l| l.name != "ANTHROPIC_API_KEY"),
+            "not in the server-wide list"
+        );
         assert_eq!(s.user_list("ub").unwrap().len(), 1);
         assert!(!s.user_delete("ub", "ANTHROPIC_API_KEY").unwrap());
         assert_eq!(s.user_forget("ua").unwrap(), 2);
         assert!(s.user_list("ua").unwrap().is_empty());
-        assert!(matches!(Secrets::new(vec![]).user_put("ua", "X_TOKEN", "v"), Err(Error::ReadOnly)));
+        assert!(matches!(
+            Secrets::new(vec![]).user_put("ua", "X_TOKEN", "v"),
+            Err(Error::ReadOnly)
+        ));
         redact::forget_for("ua", &a);
         redact::forget_for("ua", "a-openai-value");
         redact::forget_for("ub", "b-gh-value");
@@ -508,10 +685,26 @@ mod tests {
         for ok in ["OPENAI_API_KEY", "A", "_X", "GH_TOKEN2"] {
             assert!(check_name(ok).is_ok(), "{ok}");
         }
-        for bad in ["", "lower", "2X", "A-B", "A B", "PATH", "AUTH_PASSWORD", "SUPERBOT_MASTER_KEY", "BOT_TOKEN", "LD_PRELOAD", &"A".repeat(129)] {
+        for bad in [
+            "",
+            "lower",
+            "2X",
+            "A-B",
+            "A B",
+            "PATH",
+            "AUTH_PASSWORD",
+            "SUPERBOT_MASTER_KEY",
+            "BOT_TOKEN",
+            "LD_PRELOAD",
+            &"A".repeat(129),
+        ] {
             assert!(check_name(bad).is_err(), "{bad}");
         }
-        assert!(check_value("").is_err() && check_value("a\0b").is_err() && check_value(&"x".repeat(MAX_VALUE + 1)).is_err());
+        assert!(
+            check_value("").is_err()
+                && check_value("a\0b").is_err()
+                && check_value(&"x".repeat(MAX_VALUE + 1)).is_err()
+        );
     }
 
     #[test]
@@ -527,65 +720,158 @@ mod tests {
         let stored = format!("stored-{}", crate::random_hex(8));
         s.put("GITHUB_TOKEN", "from-db-value-1").unwrap();
         let l = s.put("OPENAI_API_KEY", &stored).unwrap();
-        assert_eq!(l, Listed { name: "OPENAI_API_KEY".into(), store: "sealed", writable: true, shadowed_by: None, for_bots: true });
-        assert_eq!(s.get("GITHUB_TOKEN").unwrap().unwrap().expose(), "from-env-value-1");
+        assert_eq!(
+            l,
+            Listed {
+                name: "OPENAI_API_KEY".into(),
+                store: "sealed",
+                writable: true,
+                shadowed_by: None,
+                for_bots: true
+            }
+        );
+        assert_eq!(
+            s.get("GITHUB_TOKEN").unwrap().unwrap().expose(),
+            "from-env-value-1"
+        );
         assert_eq!(s.get("OPENAI_API_KEY").unwrap().unwrap().expose(), stored);
 
         let list = s.list().unwrap();
-        assert!(!list.iter().any(|l| l.name == "AUTH_PASSWORD" || l.name.starts_with("SUPERBOT_")), "{list:?}");
+        assert!(
+            !list
+                .iter()
+                .any(|l| l.name == "AUTH_PASSWORD" || l.name.starts_with("SUPERBOT_")),
+            "{list:?}"
+        );
         let gh: Vec<_> = list.iter().filter(|l| l.name == "GITHUB_TOKEN").collect();
         assert_eq!(gh.len(), 2);
         assert_eq!((gh[0].store, gh[0].shadowed_by), ("env", None));
         assert_eq!((gh[1].store, gh[1].shadowed_by), ("sealed", Some("env")));
-        assert_eq!(s.source("GITHUB_TOKEN").unwrap(), Some(("env", false)), "the saved one can't replace it");
+        assert_eq!(
+            s.source("GITHUB_TOKEN").unwrap(),
+            Some(("env", false)),
+            "the saved one can't replace it"
+        );
         assert_eq!(s.source("NPM_TOKEN").unwrap(), Some(("env", false)));
         assert_eq!(s.source("OPENAI_API_KEY").unwrap(), Some(("sealed", true)));
         assert_eq!(s.source("NOPE").unwrap(), None);
 
-        let env: Vec<(String, String)> = s.harness_env().into_iter().map(|(k, v)| (k, v.expose().to_string())).collect();
+        let env: Vec<(String, String)> = s
+            .harness_env()
+            .into_iter()
+            .map(|(k, v)| (k, v.expose().to_string()))
+            .collect();
         assert_eq!(
             env,
-            [("NPM_TOKEN".to_string(), "npm-from-file".to_string()), ("OPENAI_API_KEY".to_string(), stored.clone())],
+            [
+                ("NPM_TOKEN".to_string(), "npm-from-file".to_string()),
+                ("OPENAI_API_KEY".to_string(), stored.clone())
+            ],
             "files arrive under their base name; inherited and shadowed values aren't repeated"
         );
-        let inherited: Vec<String> = s.inherited_harness_env().into_iter().map(|(k, _)| k).collect();
-        assert!(inherited.contains(&"GITHUB_TOKEN".to_string()) && !inherited.contains(&"OPENAI_API_KEY".to_string()), "{inherited:?}");
-        assert!(!inherited.iter().any(|k| k == "AUTH_PASSWORD" || k.starts_with("SUPERBOT_")), "never server secrets: {inherited:?}");
-        assert_eq!(redact::text(&stored), redact::MARK, "a saved value is redacted from then on");
+        let inherited: Vec<String> = s
+            .inherited_harness_env()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(
+            inherited.contains(&"GITHUB_TOKEN".to_string())
+                && !inherited.contains(&"OPENAI_API_KEY".to_string()),
+            "{inherited:?}"
+        );
+        assert!(
+            !inherited
+                .iter()
+                .any(|k| k == "AUTH_PASSWORD" || k.starts_with("SUPERBOT_")),
+            "never server secrets: {inherited:?}"
+        );
+        assert_eq!(
+            redact::text(&stored),
+            redact::MARK,
+            "a saved value is redacted from then on"
+        );
         let rotated = format!("npm_{}", crate::random_hex(12));
         std::fs::write(&npm, &rotated).unwrap();
-        assert!(s.harness_env().iter().any(|(k, v)| k == "NPM_TOKEN" && v.expose() == rotated));
-        assert_eq!(redact::text(&rotated), redact::MARK, "a file changed after startup is redacted before a Bot gets it");
+        assert!(
+            s.harness_env()
+                .iter()
+                .any(|(k, v)| k == "NPM_TOKEN" && v.expose() == rotated)
+        );
+        assert_eq!(
+            redact::text(&rotated),
+            redact::MARK,
+            "a file changed after startup is redacted before a Bot gets it"
+        );
         redact::forget(&rotated);
 
         assert!(s.delete("OPENAI_API_KEY").unwrap());
         assert!(!s.delete("OPENAI_API_KEY").unwrap());
         assert!(matches!(s.put("PATH", "x"), Err(Error::Invalid(_))));
-        assert_eq!(format!("{:?}", s.get("GITHUB_TOKEN").unwrap().unwrap()), "[redacted]");
+        assert_eq!(
+            format!("{:?}", s.get("GITHUB_TOKEN").unwrap().unwrap()),
+            "[redacted]"
+        );
         redact::forget(&stored);
     }
 
     #[test]
     fn sso_client_secrets_are_saved_but_never_reach_bots() {
-        let s = secrets(&[("SSO_GOOGLE_CLIENT_SECRET", "from-env-value-2"), ("SSO_ENTRA_TENANT", "x")]);
+        let s = secrets(&[
+            ("SSO_GOOGLE_CLIENT_SECRET", "from-env-value-2"),
+            ("SSO_ENTRA_TENANT", "x"),
+        ]);
         let value = format!("entra-{}", crate::random_hex(12));
-        assert!(check_name("SSO_ENTRA_CLIENT_SECRET").is_err(), "Bots can't be given an SSO_ name");
+        assert!(
+            check_name("SSO_ENTRA_CLIENT_SECRET").is_err(),
+            "Bots can't be given an SSO_ name"
+        );
         let l = s.put("SSO_ENTRA_CLIENT_SECRET", &value).unwrap();
         assert_eq!((l.store, l.for_bots), ("sealed", false));
-        assert_eq!(s.get("SSO_ENTRA_CLIENT_SECRET").unwrap().unwrap().expose(), value);
-        assert!(s.harness_env().is_empty(), "neither the sealed nor the env client secret goes to a Bot");
-        let names: Vec<_> = s.list().unwrap().into_iter().map(|l| (l.name, l.for_bots)).collect();
-        assert_eq!(names, [("SSO_GOOGLE_CLIENT_SECRET".to_string(), false), ("SSO_ENTRA_CLIENT_SECRET".to_string(), false)]);
-        for bad in ["SSO_ENTRA_TENANT", "SSO__CLIENT_SECRET", "SSO_ENTRA_client_SECRET", "SSO__PRIVATE_KEY", "SSO_APPLE_TEAM_ID", "SSO_PRIVATE_KEY"] {
+        assert_eq!(
+            s.get("SSO_ENTRA_CLIENT_SECRET").unwrap().unwrap().expose(),
+            value
+        );
+        assert!(
+            s.harness_env().is_empty(),
+            "neither the sealed nor the env client secret goes to a Bot"
+        );
+        let names: Vec<_> = s
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|l| (l.name, l.for_bots))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("SSO_GOOGLE_CLIENT_SECRET".to_string(), false),
+                ("SSO_ENTRA_CLIENT_SECRET".to_string(), false)
+            ]
+        );
+        for bad in [
+            "SSO_ENTRA_TENANT",
+            "SSO__CLIENT_SECRET",
+            "SSO_ENTRA_client_SECRET",
+            "SSO__PRIVATE_KEY",
+            "SSO_APPLE_TEAM_ID",
+            "SSO_PRIVATE_KEY",
+        ] {
             assert!(s.put(bad, "v").is_err(), "{bad}");
         }
         assert!(s.delete("SSO_ENTRA_CLIENT_SECRET").unwrap());
         redact::forget(&value);
 
-        let key = format!("-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----", crate::random_hex(32));
+        let key = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----",
+            crate::random_hex(32)
+        );
         assert!(check_name("SSO_APPLE_PRIVATE_KEY").is_err());
         let l = s.put("SSO_APPLE_PRIVATE_KEY", &key).unwrap();
-        assert_eq!((l.store, l.for_bots), ("sealed", false), "Apple's signing key is botd's own");
+        assert_eq!(
+            (l.store, l.for_bots),
+            ("sealed", false),
+            "Apple's signing key is botd's own"
+        );
         assert!(s.harness_env().is_empty());
         assert!(s.delete("SSO_APPLE_PRIVATE_KEY").unwrap());
         redact::forget(&key);
@@ -595,11 +881,24 @@ mod tests {
     fn hosting_and_turnstile_secrets_never_reach_bots() {
         let linode = crate::db::temp_path("linode").join("token");
         std::fs::write(&linode, "linode-from-file-7c1e\n").unwrap();
-        let s = secrets(&[("LINODE_TOKEN_FILE", linode.to_str().unwrap()), ("TURNSTILE_SECRET", "0x4AAA-env")]);
-        assert_eq!(s.get("LINODE_TOKEN").unwrap().unwrap().expose(), "linode-from-file-7c1e", "botd still reads it");
+        let s = secrets(&[
+            ("LINODE_TOKEN_FILE", linode.to_str().unwrap()),
+            ("TURNSTILE_SECRET", "0x4AAA-env"),
+        ]);
+        assert_eq!(
+            s.get("LINODE_TOKEN").unwrap().unwrap().expose(),
+            "linode-from-file-7c1e",
+            "botd still reads it"
+        );
         s.put("TURNSTILE_SECRET", "0x4AAA-sealed").unwrap();
-        assert!(s.harness_env().is_empty(), "not from a file, the environment, or the store");
-        assert!(s.list().unwrap().iter().all(|l| !l.for_bots), "listed as botd's own");
+        assert!(
+            s.harness_env().is_empty(),
+            "not from a file, the environment, or the store"
+        );
+        assert!(
+            s.list().unwrap().iter().all(|l| !l.for_bots),
+            "listed as botd's own"
+        );
         redact::forget("linode-from-file-7c1e");
         redact::forget("0x4AAA-sealed");
     }
@@ -608,33 +907,65 @@ mod tests {
     fn the_license_key_never_reaches_bots() {
         let f = crate::db::temp_path("license-env").join("license.key");
         std::fs::write(&f, "eyJ.license.file\n").unwrap();
-        for vars in [vec![("LICENSE_KEY", "eyJ.license.inline")], vec![("LICENSE_KEY_FILE", f.to_str().unwrap())]] {
+        for vars in [
+            vec![("LICENSE_KEY", "eyJ.license.inline")],
+            vec![("LICENSE_KEY_FILE", f.to_str().unwrap())],
+        ] {
             let s = secrets(&vars);
-            assert!(s.harness_env().is_empty() && s.inherited_harness_env().is_empty(), "{vars:?}");
+            assert!(
+                s.harness_env().is_empty() && s.inherited_harness_env().is_empty(),
+                "{vars:?}"
+            );
             assert!(s.list().unwrap().is_empty(), "{vars:?}");
         }
-        assert!(secrets(&[]).put("LICENSE_KEY", "x").is_err(), "installed through /api/license, not as a secret");
+        assert!(
+            secrets(&[]).put("LICENSE_KEY", "x").is_err(),
+            "installed through /api/license, not as a secret"
+        );
     }
 
     #[test]
     fn stripes_secrets_never_reach_bots() {
-        for (name, value) in [("STRIPE_WEBHOOK_SECRET", "whsec_test"), ("STRIPE_SECRET_KEY", "sk_test_not_real")] {
+        for (name, value) in [
+            ("STRIPE_WEBHOOK_SECRET", "whsec_test"),
+            ("STRIPE_SECRET_KEY", "sk_test_not_real"),
+        ] {
             let f = crate::db::temp_path("stripe-env").join("secret");
             std::fs::write(&f, format!("{value}_from_file\n")).unwrap();
             let file = format!("{name}_FILE");
-            for vars in [vec![(name, value)], vec![(file.as_str(), f.to_str().unwrap())]] {
+            for vars in [
+                vec![(name, value)],
+                vec![(file.as_str(), f.to_str().unwrap())],
+            ] {
                 let s = secrets(&vars);
-                assert!(s.harness_env().is_empty() && s.inherited_harness_env().is_empty(), "{vars:?}");
-                assert!(s.harness_env_for("ua").is_empty(), "a Bot's run space: {vars:?}");
+                assert!(
+                    s.harness_env().is_empty() && s.inherited_harness_env().is_empty(),
+                    "{vars:?}"
+                );
+                assert!(
+                    s.harness_env_for("ua").is_empty(),
+                    "a Bot's run space: {vars:?}"
+                );
                 assert!(s.list().unwrap().is_empty(), "{vars:?}");
             }
             // Even one already in the sealed store (put there before the name was reserved).
             let s = secrets(&[]);
             s.stores[1].put(name, value).unwrap();
-            assert!(s.harness_env_for("ua").is_empty() && s.inherited_harness_env().is_empty(), "{name}");
+            assert!(
+                s.harness_env_for("ua").is_empty() && s.inherited_harness_env().is_empty(),
+                "{name}"
+            );
             let host = crate::adapters::local_host();
-            assert!([name, file.as_str()].iter().all(|k| host.remove.iter().any(|r| r == k)), "{name} removed from local jobs");
-            assert!(secrets(&[]).put(name, value).is_err(), "{name}: set in the environment, not as a secret");
+            assert!(
+                [name, file.as_str()]
+                    .iter()
+                    .all(|k| host.remove.iter().any(|r| r == k)),
+                "{name} removed from local jobs"
+            );
+            assert!(
+                secrets(&[]).put(name, value).is_err(),
+                "{name}: set in the environment, not as a secret"
+            );
             assert!(secrets(&[]).user_put("ua", name, value).is_err(), "{name}");
         }
     }

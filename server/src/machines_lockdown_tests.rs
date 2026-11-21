@@ -50,7 +50,12 @@ async fn serve(fw: Option<Settings>, timeout_ms: Option<i64>) -> Env {
     }
     let cp = Arc::new(cp);
     let (port, app, owner, _) = crate::tests::serve_app_with(move |a| a.machines = cp).await;
-    tokio::spawn(enroll::serve(machine_listener, app.clone(), e.clone(), None));
+    tokio::spawn(enroll::serve(
+        machine_listener,
+        app.clone(),
+        e.clone(),
+        None,
+    ));
     let (_, admin) = user_with(port, &owner, "ops@example.com", "admin").await;
     Env {
         port,
@@ -117,18 +122,30 @@ async fn machines_come_up_behind_one_firewall_that_lets_in_only_the_control_plan
     let fw = &fws[0];
     assert_eq!(
         (fw.label.as_str(), &fw.tags[..], &fw.rules[..]),
-        ("superbot-fw", &["superbot".to_string()][..], &[agent_rule()][..]),
+        (
+            "superbot-fw",
+            &["superbot".to_string()][..],
+            &[agent_rule()][..]
+        ),
         "inbound dropped but for the agent port from botd's address; no SSH"
     );
     let pa = a.provider_id.clone().unwrap();
     assert!(fw.machines.contains(&pa), "behind it from the first boot");
-    assert_eq!(env.fake.calls("attach_firewall"), 0, "attached by the create");
+    assert_eq!(
+        env.fake.calls("attach_firewall"),
+        0,
+        "attached by the create"
+    );
     assert_eq!(a.firewall_id.as_deref(), Some(fw.id.as_str()));
     let created = events(&env, "machine.created").await;
     assert_eq!(created[0]["details"]["firewallId"], fw.id.as_str());
     let made = events(&env, "machine.firewall_created").await;
     assert_eq!(
-        (made.len(), made[0]["targetType"].as_str(), made[0]["targetId"].as_str()),
+        (
+            made.len(),
+            made[0]["targetType"].as_str(),
+            made[0]["targetId"].as_str()
+        ),
         (1, Some("firewall"), Some(fw.id.as_str())),
         "{made:?}"
     );
@@ -227,7 +244,10 @@ async fn the_reconciler_puts_machines_and_rules_back() {
     assert_eq!(updated[0]["details"]["was"], "disabled", "{updated:?}");
     env.fake.set_firewall(&fw, |f| f.enabled = false);
     request(&env, "bea@example.com").await;
-    assert!(env.fake.firewalls()[0].enabled, "no new machine behind a disabled firewall");
+    assert!(
+        env.fake.firewalls()[0].enabled,
+        "no new machine behind a disabled firewall"
+    );
 
     env.fake.delete_firewall(&fw).await.unwrap();
     reconcile(&env).await;
@@ -246,7 +266,10 @@ async fn the_reconciler_puts_machines_and_rules_back() {
     let failed = events(&env, "machine.firewall_failed").await;
     assert_eq!(failed.len(), 1, "recorded once, not every pass: {failed:?}");
     assert_eq!(
-        (failed[0]["outcome"].as_str(), failed[0]["details"]["step"].as_str()),
+        (
+            failed[0]["outcome"].as_str(),
+            failed[0]["details"]["step"].as_str()
+        ),
         (Some("failure"), Some("attach"))
     );
 }
@@ -259,11 +282,20 @@ async fn an_older_firewall_is_kept_right_until_its_machines_go() {
     let (ua, _, a) = request(&env, "ada@example.com").await;
     let pa = machine(&env, &a).provider_id.unwrap();
     let old = env.fake.firewalls()[0].id.clone();
-    env.fake.set_firewall(&old, |f| f.label = "oldprefix-fw".into());
+    env.fake
+        .set_firewall(&old, |f| f.label = "oldprefix-fw".into());
 
     reconcile(&env).await;
-    let new = env.fake.firewalls().into_iter().find(|f| f.label == "superbot-fw").unwrap();
-    assert!(new.machines.is_empty(), "not moved: moving would open it for a moment");
+    let new = env
+        .fake
+        .firewalls()
+        .into_iter()
+        .find(|f| f.label == "superbot-fw")
+        .unwrap();
+    assert!(
+        new.machines.is_empty(),
+        "not moved: moving would open it for a moment"
+    );
     assert_eq!(machine(&env, &a).firewall_id.as_deref(), Some(old.as_str()));
 
     env.fake.set_firewall(&old, |f| {
@@ -271,16 +303,29 @@ async fn an_older_firewall_is_kept_right_until_its_machines_go() {
         f.enabled = false;
     });
     reconcile(&env).await;
-    let o = env.fake.firewalls().into_iter().find(|f| f.id == old).unwrap();
+    let o = env
+        .fake
+        .firewalls()
+        .into_iter()
+        .find(|f| f.id == old)
+        .unwrap();
     assert!(!o.foreign && o.enabled && o.machines.contains(&pa), "{o:?}");
     assert_eq!(o.rules, [agent_rule()]);
-    assert!(events(&env, "machine.firewall_failed").await.is_empty(), "no attach tried");
+    assert!(
+        events(&env, "machine.firewall_failed").await.is_empty(),
+        "no attach tried"
+    );
     assert!(events(&env, "machine.firewall_attached").await.is_empty());
 
     let (_, _, b) = request(&env, "bea@example.com").await;
-    assert_eq!(machine(&env, &b).firewall_id.as_deref(), Some(new.id.as_str()));
     assert_eq!(
-        json_call(&env, "DELETE", &format!("/api/users/{ua}/machine")).await.0,
+        machine(&env, &b).firewall_id.as_deref(),
+        Some(new.id.as_str())
+    );
+    assert_eq!(
+        json_call(&env, "DELETE", &format!("/api/users/{ua}/machine"))
+            .await
+            .0,
         200
     );
     let left: Vec<String> = env.fake.firewalls().into_iter().map(|f| f.id).collect();
@@ -290,7 +335,8 @@ async fn an_older_firewall_is_kept_right_until_its_machines_go() {
 #[tokio::test]
 async fn no_firewall_no_machine() {
     let env = serve(on(), None).await;
-    env.fake.fail_next("find_firewall", ProviderError::RateLimited);
+    env.fake
+        .fail_next("find_firewall", ProviderError::RateLimited);
     let (_, _, m) = request(&env, "ada@example.com").await;
     let row = machine(&env, &m);
     assert_eq!(row.state, State::Pending);
@@ -299,13 +345,20 @@ async fn no_firewall_no_machine() {
     assert!(events(&env, "machine.enroll_token_issued").await.is_empty());
     let failed = events(&env, "machine.create_failed").await;
     assert_eq!(
-        (failed[0]["details"]["step"].as_str(), failed[0]["details"]["retrying"].as_bool()),
+        (
+            failed[0]["details"]["step"].as_str(),
+            failed[0]["details"]["retrying"].as_bool()
+        ),
         (Some("firewall"), Some(true))
     );
     reconcile(&env).await;
     let row = machine(&env, &m);
     assert!(row.provider_id.is_some(), "made on the next pass");
-    assert!(env.fake.firewalls()[0].machines.contains(row.provider_id.as_deref().unwrap()));
+    assert!(
+        env.fake.firewalls()[0]
+            .machines
+            .contains(row.provider_id.as_deref().unwrap())
+    );
 
     env.fake.fail_next(
         "find_firewall",
@@ -316,7 +369,11 @@ async fn no_firewall_no_machine() {
     );
     let (uid, _) = user_with(env.port, &env.admin, "bea@example.com", "member").await;
     let (code, m) = json_call(&env, "POST", &format!("/api/users/{uid}/machine")).await;
-    assert_eq!((code, m["machine"]["state"].as_str()), (502, Some("error")), "{m}");
+    assert_eq!(
+        (code, m["machine"]["state"].as_str()),
+        (502, Some("error")),
+        "{m}"
+    );
     assert_eq!(env.fake.calls("create"), 1);
 }
 
@@ -344,18 +401,27 @@ async fn the_last_machine_out_deletes_the_firewall() {
     );
     assert_eq!(events(&env, "machine.firewall_detached").await.len(), 1);
 
-    env.fake.fail_next("delete_firewall", ProviderError::Transport("reset".into()));
+    env.fake
+        .fail_next("delete_firewall", ProviderError::Transport("reset".into()));
     assert_eq!(del(ub).await, 200, "the machine goes anyway");
     assert_eq!(env.fake.firewalls().len(), 1, "an empty firewall is left");
     let failed = events(&env, "machine.firewall_failed").await;
     assert_eq!(failed[0]["details"]["step"], "delete");
 
     let (uc, _, c) = request(&env, "cy@example.com").await;
-    assert_eq!(machine(&env, &c).firewall_id.as_deref(), Some(fw.as_str()), "reused");
+    assert_eq!(
+        machine(&env, &c).firewall_id.as_deref(),
+        Some(fw.as_str()),
+        "reused"
+    );
     assert_eq!(env.fake.calls("create_firewall"), 1);
     env.fake.set_firewall(&fw, |f| f.others = 1);
     assert_eq!(del(uc).await, 200);
-    assert_eq!(env.fake.firewalls().len(), 1, "it still covers someone's NodeBalancer");
+    assert_eq!(
+        env.fake.firewalls().len(),
+        1,
+        "it still covers someone's NodeBalancer"
+    );
     assert!(events(&env, "machine.firewall_deleted").await.is_empty());
 
     env.fake.set_firewall(&fw, |f| f.others = 0);
@@ -394,7 +460,10 @@ async fn machines_that_dont_enroll_in_time_are_reported() {
     let late = events(&env, "machine.enroll_timeout").await;
     assert_eq!(late.len(), 1, "once, not every pass");
     assert_eq!(
-        (late[0]["outcome"].as_str(), late[0]["details"]["enrollment"].as_str()),
+        (
+            late[0]["outcome"].as_str(),
+            late[0]["details"]["enrollment"].as_str()
+        ),
         (Some("failure"), Some("none"))
     );
 
@@ -422,20 +491,31 @@ async fn machines_that_dont_enroll_in_time_are_reported() {
     agent::enroll(&cfg).await.unwrap();
     let row = env.app.db.machine(&mid).unwrap();
     assert_eq!(
-        (row.enrollment.as_str(), row.enroll_overdue_at, row.enroll_by),
+        (
+            row.enrollment.as_str(),
+            row.enroll_overdue_at,
+            row.enroll_by
+        ),
         ("enrolled", None, None),
         "a late enrollment still counts"
     );
     reconcile(&env).await;
     assert_eq!(events(&env, "machine.enroll_timeout").await.len(), 1);
-    assert!(events(&env, "machine.user_data_cleared").await.is_empty(), "Linode's metadata keeps it (ADR 0035)");
+    assert!(
+        events(&env, "machine.user_data_cleared").await.is_empty(),
+        "Linode's metadata keeps it (ADR 0035)"
+    );
 
     let (ub, _, b) = request(&env, "bea@example.com").await;
     reconcile(&env).await;
     assert!(machine(&env, &b).enroll_overdue_at.is_some());
     let (code, _) = json_call(&env, "POST", &format!("/api/users/{ub}/machine/enrollment")).await;
     assert_eq!(code, 200);
-    assert_eq!(machine(&env, &b).enroll_overdue_at, None, "a new token, a new clock");
+    assert_eq!(
+        machine(&env, &b).enroll_overdue_at,
+        None,
+        "a new token, a new clock"
+    );
 }
 
 #[tokio::test]
@@ -446,7 +526,12 @@ async fn the_token_is_kept_nowhere_but_the_machine() {
     let token = token_in(&env.fake.user_data(&row.label).unwrap());
     assert!(token.starts_with("sbe_") && token.len() > 20);
     reconcile(&env).await;
-    let (_, t) = json_call(&env, "POST", &format!("/api/users/{uid}/machine/enrollment")).await;
+    let (_, t) = json_call(
+        &env,
+        "POST",
+        &format!("/api/users/{uid}/machine/enrollment"),
+    )
+    .await;
     let second = t["token"].as_str().unwrap().to_string();
 
     for path in ["/api/audit?limit=500", "/api/machines"] {

@@ -49,16 +49,22 @@ impl Local {
 
     /// The login `id`, only if it's `teammate`'s for `owner`'s Bots.
     fn get(&self, id: &str, owner: &str, teammate: &str) -> Option<Session> {
-        self.lock().get(id).filter(|s| s.owner == owner && s.teammate == teammate).cloned()
+        self.lock()
+            .get(id)
+            .filter(|s| s.owner == owner && s.teammate == teammate)
+            .cloned()
     }
 
     fn running(&self, owner: &str, teammate: &str) -> Vec<String> {
-        self.terminal.running_for(Space::Teammate { owner, teammate }.dir().as_deref())
+        self.terminal
+            .running_for(Space::Teammate { owner, teammate }.dir().as_deref())
     }
 
     /// Stops every login `teammate` has running for `owner`'s Bots (ADR 0066). How many.
     pub fn stop_for(&self, owner: &str, teammate: &str) -> u32 {
-        Space::Teammate { owner, teammate }.dir().map_or(0, |d| self.terminal.abort_for(&d))
+        Space::Teammate { owner, teammate }
+            .dir()
+            .map_or(0, |d| self.terminal.abort_for(&d))
     }
 }
 
@@ -77,11 +83,16 @@ fn gateway(msg: impl Into<String>) -> ApiError {
 }
 
 fn need_recipe(harness: &str) -> Res<crate::adapters::MachineLogin> {
-    recipe(harness).ok_or_else(|| crate::bad("Only Claude Code and Codex log in. Pi and Hermes use API keys from secrets."))
+    recipe(harness).ok_or_else(|| {
+        crate::bad("Only Claude Code and Codex log in. Pi and Hermes use API keys from secrets.")
+    })
 }
 
 fn need_isolation(app: &App) -> Res<Arc<crate::accounts::Isolation>> {
-    app.isolation.get().cloned().ok_or_else(|| conflict("Per-user accounts are off."))
+    app.isolation
+        .get()
+        .cloned()
+        .ok_or_else(|| conflict("Per-user accounts are off."))
 }
 
 fn files(r: &crate::adapters::MachineLogin) -> Vec<String> {
@@ -105,23 +116,35 @@ fn line(e: &LoginEvent) -> Bytes {
 /// Whether `harness` is logged in for `space`, checked as its account. None: it isn't,
 /// or the account isn't there yet. Never makes the account.
 async fn since(app: &App, space: Space<'_>, harness: &str) -> Result<Option<i64>, String> {
-    let (Some(iso), Some(r)) = (app.isolation.get().cloned(), recipe(harness)) else { return Ok(None) };
+    let (Some(iso), Some(r)) = (app.isolation.get().cloned(), recipe(harness)) else {
+        return Ok(None);
+    };
     if !iso.ready_in(space) {
         return Ok(None);
     }
-    let (Some(run_as), Some(home)) = (iso.run_as_in(space), iso.home_in(space)) else { return Ok(None) };
+    let (Some(run_as), Some(home)) = (iso.run_as_in(space), iso.home_in(space)) else {
+        return Ok(None);
+    };
     let files = files(&r);
-    tokio::task::spawn_blocking(move || run_as.login_since(&home, &files)).await.unwrap_or_else(|e| Err(e.to_string()))
+    tokio::task::spawn_blocking(move || run_as.login_since(&home, &files))
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()))
 }
 
 /// A teammate's own logins for the owner's Bots here. Asking never makes their account.
 /// `serverKey`: a server-wide key logs their runs in without one.
 async fn view(app: &App, owner: &User, teammate: &str) -> Value {
-    let space = Space::Teammate { owner: &owner.id, teammate };
+    let space = Space::Teammate {
+        owner: &owner.id,
+        teammate,
+    };
     let ready = app.isolation().is_some_and(|i| i.ready_in(space));
     let running = app.teammate_logins.running(&owner.id, teammate);
     let mut harnesses = serde_json::Map::new();
-    for n in crate::adapters::NAMES.iter().filter(|n| recipe(n).is_some()) {
+    for n in crate::adapters::NAMES
+        .iter()
+        .filter(|n| recipe(n).is_some())
+    {
         let at = match since(app, space, n).await {
             Ok(at) => at,
             Err(e) => {
@@ -135,7 +158,10 @@ async fn view(app: &App, owner: &User, teammate: &str) -> Value {
             None => wire::LOGGED_OUT,
         };
         let keyed = crate::machines::logins::teammate_login_needed(n).is_none();
-        harnesses.insert(n.to_string(), json!({ "state": state, "since": at, "serverKey": keyed }));
+        harnesses.insert(
+            n.to_string(),
+            json!({ "state": state, "since": at, "serverKey": keyed }),
+        );
     }
     json!({
         "machineId": null, "on": "server", "owner": { "id": owner.id, "name": owner.name }, "forUser": teammate,
@@ -146,23 +172,49 @@ async fn view(app: &App, owner: &User, teammate: &str) -> Value {
 /// Starts the login as the teammate's account for the owner's Bots, making the account
 /// if it's new, and streams what it shows back as JSON lines (`LoginEvent`s), the first
 /// naming the login for `input`. If the caller goes away, the login is stopped.
-pub async fn start(app: AppState, by: Who, owner: User, teammate: String, harness: String) -> Res<Response> {
+pub async fn start(
+    app: AppState,
+    by: Who,
+    owner: User,
+    teammate: String,
+    harness: String,
+) -> Res<Response> {
     let r = need_recipe(&harness)?;
-    let bin = crate::adapters::get(&harness).map(|a| a.bin()).ok_or_else(|| crate::bad("Unknown harness"))?;
+    let bin = crate::adapters::get(&harness)
+        .map(|a| a.bin())
+        .ok_or_else(|| crate::bad("Unknown harness"))?;
     let iso = need_isolation(&app)?;
-    let space = Space::Teammate { owner: &owner.id, teammate: &teammate };
+    let space = Space::Teammate {
+        owner: &owner.id,
+        teammate: &teammate,
+    };
     // Held until the login has started, so a removal (ADR 0066) stops it, never races it.
     let _in_use = crate::teammate_removals::enter(&app, &owner.id, &teammate).ok_or_else(|| conflict("Your account for these Bots on this server is being removed. Try again in a few minutes."))?;
     if !crate::teammate_removals::wanted(&app, &owner.id, &teammate) {
         return Err(crate::not_found("Machine"));
     }
-    let run_as = app.ensure_space(space, &by).await.map_err(|e| gateway(format!("Couldn't set up your account on this server: {e}")))?;
-    let (Some(home), Some(dir)) = (iso.home_in(space), space.dir()) else { return Err(crate::bad("Those ids can't name an account")) };
+    let run_as = app
+        .ensure_space(space, &by)
+        .await
+        .map_err(|e| gateway(format!("Couldn't set up your account on this server: {e}")))?;
+    let (Some(home), Some(dir)) = (iso.home_in(space), space.dir()) else {
+        return Err(crate::bad("Those ids can't name an account"));
+    };
     let id = format!("l{}", crate::random_hex(8));
     let args: Vec<String> = r.args.iter().map(|a| a.to_string()).collect();
-    let req = LoginRequest { login_id: id.clone(), harness: harness.clone(), args: args.clone(), files: files(&r), timeout_secs: LOGIN_SECS, for_user: Some(dir) };
+    let req = LoginRequest {
+        login_id: id.clone(),
+        harness: harness.clone(),
+        args: args.clone(),
+        files: files(&r),
+        timeout_secs: LOGIN_SECS,
+        for_user: Some(dir),
+    };
     let (sudo, argv) = run_as.argv_strings(bin, args);
-    let run = terminal::Command { bin: sudo, args: argv };
+    let run = terminal::Command {
+        bin: sudo,
+        args: argv,
+    };
     // sudo resets PATH; superbot-run puts this one back, so the CLI is found as runs find it.
     let path = std::env::var("PATH").unwrap_or_else(|_| DEFAULT_PATH.into());
     let env = BTreeMap::from([("SUPERBOT_PATH".to_string(), path)]);
@@ -174,15 +226,34 @@ pub async fn start(app: AppState, by: Who, owner: User, teammate: String, harnes
         d
     };
     let event = |action: &str| by.event(action).target("user", &owner.id);
-    let (mut rx, stop) = match app.teammate_logins.terminal.start(&req, &run, &home, &env, None) {
+    let (mut rx, stop) = match app
+        .teammate_logins
+        .terminal
+        .start(&req, &run, &home, &env, None)
+    {
         Ok(started) => started,
         Err((code, why)) => {
-            app.db.record(&event("harness.login_finished").outcome(Outcome::Failure).details(d(json!({ "loggedIn": false, "error": why }))));
-            return Err(ApiError(StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), why));
+            app.db.record(
+                &event("harness.login_finished")
+                    .outcome(Outcome::Failure)
+                    .details(d(json!({ "loggedIn": false, "error": why }))),
+            );
+            return Err(ApiError(
+                StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                why,
+            ));
         }
     };
-    app.teammate_logins.lock().insert(id.clone(), Session { owner: owner.id.clone(), teammate: teammate.clone(), harness: harness.clone() });
-    app.db.record(&event("harness.login_started").details(d(json!({}))));
+    app.teammate_logins.lock().insert(
+        id.clone(),
+        Session {
+            owner: owner.id.clone(),
+            teammate: teammate.clone(),
+            harness: harness.clone(),
+        },
+    );
+    app.db
+        .record(&event("harness.login_started").details(d(json!({}))));
     let finished = d(json!({}));
     let (tx, out) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     let (app2, by2, owner_id) = (app.clone(), by.clone(), owner.id.clone());
@@ -191,9 +262,17 @@ pub async fn start(app: AppState, by: Who, owner: User, teammate: String, harnes
         let mut gone = false;
         let mut end: Option<(bool, bool, String)> = None;
         while let Some(mut ev) = rx.recv().await {
-            if let LoginEvent::Exit { success, logged_in, status } = &mut ev {
+            if let LoginEvent::Exit {
+                success,
+                logged_in,
+                status,
+            } = &mut ev
+            {
                 // Checked as the account: botd may not see into its HOME.
-                let space = Space::Teammate { owner: &owner_id, teammate: &teammate };
+                let space = Space::Teammate {
+                    owner: &owner_id,
+                    teammate: &teammate,
+                };
                 *logged_in = matches!(since(&app, space, &harness).await, Ok(Some(_)));
                 end = Some((*success, *logged_in, status.clone()));
             }
@@ -210,40 +289,101 @@ pub async fn start(app: AppState, by: Who, owner: User, teammate: String, harnes
         };
         let event = |action: &str| by2.event(action).target("user", &owner_id);
         match end {
-            _ if gone => app.db.record(&event("harness.login_aborted").details(with(finished, json!({ "reason": "caller_left" })))),
+            _ if gone => app.db.record(
+                &event("harness.login_aborted")
+                    .details(with(finished, json!({ "reason": "caller_left" }))),
+            ),
             Some((success, logged_in, status)) => {
-                let e = event("harness.login_finished").details(with(finished, json!({ "loggedIn": logged_in, "success": success, "status": status })));
-                app.db.record(&if logged_in { e } else { e.outcome(Outcome::Failure) });
+                let e = event("harness.login_finished").details(with(
+                    finished,
+                    json!({ "loggedIn": logged_in, "success": success, "status": status }),
+                ));
+                app.db.record(&if logged_in {
+                    e
+                } else {
+                    e.outcome(Outcome::Failure)
+                });
             }
             None => {
-                let e = event("harness.login_finished").details(with(finished, json!({ "loggedIn": false, "error": "the login stopped without exiting" })));
+                let e = event("harness.login_finished").details(with(
+                    finished,
+                    json!({ "loggedIn": false, "error": "the login stopped without exiting" }),
+                ));
                 app.db.record(&e.outcome(Outcome::Failure));
             }
         }
         app.teammate_logins.lock().remove(&id);
     });
-    Ok(([(header::CONTENT_TYPE, "application/x-ndjson")], Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(out))).into_response())
+    Ok((
+        [(header::CONTENT_TYPE, "application/x-ndjson")],
+        Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(out)),
+    )
+        .into_response())
 }
 
 /// Types a line into a running login. What was typed is never kept or audited.
-pub async fn input(app: AppState, by: Who, owner: User, teammate: String, id: String, text: String) -> Res<StatusCode> {
-    let s = app.teammate_logins.get(&id, &owner.id, &teammate).ok_or_else(|| crate::not_found("Login"))?;
+pub async fn input(
+    app: AppState,
+    by: Who,
+    owner: User,
+    teammate: String,
+    id: String,
+    text: String,
+) -> Res<StatusCode> {
+    let s = app
+        .teammate_logins
+        .get(&id, &owner.id, &teammate)
+        .ok_or_else(|| crate::not_found("Login"))?;
     app.teammate_logins
         .terminal
         .input(&id, &text)
-        .map_err(|(code, why)| ApiError(StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST), why))?;
-    let space = Space::Teammate { owner: &owner.id, teammate: &teammate };
-    let d = details(space, json!({ "harness": s.harness, "loginId": id, "chars": text.chars().count() }));
-    app.db.record(&by.event("harness.login_input").target("user", &owner.id).details(d));
+        .map_err(|(code, why)| {
+            ApiError(
+                StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
+                why,
+            )
+        })?;
+    let space = Space::Teammate {
+        owner: &owner.id,
+        teammate: &teammate,
+    };
+    let d = details(
+        space,
+        json!({ "harness": s.harness, "loginId": id, "chars": text.chars().count() }),
+    );
+    app.db.record(
+        &by.event("harness.login_input")
+            .target("user", &owner.id)
+            .details(d),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub async fn abort(app: AppState, by: Who, owner: User, teammate: String, id: String) -> Res<StatusCode> {
-    let s = app.teammate_logins.get(&id, &owner.id, &teammate).ok_or_else(|| crate::not_found("Login"))?;
+pub async fn abort(
+    app: AppState,
+    by: Who,
+    owner: User,
+    teammate: String,
+    id: String,
+) -> Res<StatusCode> {
+    let s = app
+        .teammate_logins
+        .get(&id, &owner.id, &teammate)
+        .ok_or_else(|| crate::not_found("Login"))?;
     app.teammate_logins.terminal.abort(&id);
-    let space = Space::Teammate { owner: &owner.id, teammate: &teammate };
-    let d = details(space, json!({ "harness": s.harness, "loginId": id, "reason": "asked" }));
-    app.db.record(&by.event("harness.login_aborted").target("user", &owner.id).details(d));
+    let space = Space::Teammate {
+        owner: &owner.id,
+        teammate: &teammate,
+    };
+    let d = details(
+        space,
+        json!({ "harness": s.harness, "loginId": id, "reason": "asked" }),
+    );
+    app.db.record(
+        &by.event("harness.login_aborted")
+            .target("user", &owner.id)
+            .details(d),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -257,11 +397,24 @@ pub async fn status(app: AppState, owner: User, teammate: String) -> Res {
 pub async fn logout(app: AppState, by: Who, owner: User, teammate: String, harness: String) -> Res {
     let r = need_recipe(&harness)?;
     let iso = need_isolation(&app)?;
-    let space = Space::Teammate { owner: &owner.id, teammate: &teammate };
-    if app.teammate_logins.running(&owner.id, &teammate).contains(&harness) {
-        return Err(conflict(format!("A {harness} login is running. Stop it first.")));
+    let space = Space::Teammate {
+        owner: &owner.id,
+        teammate: &teammate,
+    };
+    if app
+        .teammate_logins
+        .running(&owner.id, &teammate)
+        .contains(&harness)
+    {
+        return Err(conflict(format!(
+            "A {harness} login is running. Stop it first."
+        )));
     }
-    let removed = match (iso.ready_in(space), iso.run_as_in(space), iso.home_in(space)) {
+    let removed = match (
+        iso.ready_in(space),
+        iso.run_as_in(space),
+        iso.home_in(space),
+    ) {
         (true, Some(run_as), Some(home)) => {
             let files = files(&r);
             tokio::task::spawn_blocking(move || run_as.forget(&home, &files))
@@ -272,7 +425,11 @@ pub async fn logout(app: AppState, by: Who, owner: User, teammate: String, harne
         _ => 0,
     };
     let d = details(space, json!({ "harness": harness, "removed": removed }));
-    app.db.record(&by.event("harness.logged_out").target("user", &owner.id).details(d));
+    app.db.record(
+        &by.event("harness.logged_out")
+            .target("user", &owner.id)
+            .details(d),
+    );
     let mut v = view(&app, &owner, &teammate).await;
     v["removed"] = json!(removed);
     Ok(Json(v))

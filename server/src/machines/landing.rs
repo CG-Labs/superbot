@@ -51,7 +51,9 @@ pub struct Landing {
 }
 
 fn hex64(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 fn plain(s: &str) -> bool {
@@ -157,7 +159,9 @@ fn dest(home: &Path, rel: &str) -> Dest {
         match std::fs::symlink_metadata(&at) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Dest::Missing,
             Err(_) => return Dest::Blocked,
-            Ok(m) if last && m.is_file() => return here(&at).map(Dest::File).unwrap_or(Dest::Blocked),
+            Ok(m) if last && m.is_file() => {
+                return here(&at).map(Dest::File).unwrap_or(Dest::Blocked);
+            }
             Ok(m) if !last && m.is_dir() => {}
             Ok(_) => return Dest::Blocked,
         }
@@ -203,11 +207,24 @@ enum Missed {
 /// Moves `tmp` to `to` only if nothing is at `to`.
 fn rename_noreplace(tmp: &Path, to: &Path) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
-    let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(std::io::Error::other);
+    let c =
+        |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(std::io::Error::other);
     let (a, b) = (c(tmp)?, c(to)?);
     // SAFETY: two valid C strings.
-    let r = unsafe { libc::renameat2(libc::AT_FDCWD, a.as_ptr(), libc::AT_FDCWD, b.as_ptr(), libc::RENAME_NOREPLACE) };
-    if r == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+    let r = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            a.as_ptr(),
+            libc::AT_FDCWD,
+            b.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// Whether the file at `p` is still the one stamped.
@@ -223,7 +240,12 @@ fn make_parents(home: &Path, rel: &str) -> std::io::Result<PathBuf> {
         at.push(part);
         match std::fs::symlink_metadata(&at) {
             Ok(m) if m.is_dir() => {}
-            Ok(_) => return Err(std::io::Error::other(format!("{} isn't a folder", at.display()))),
+            Ok(_) => {
+                return Err(std::io::Error::other(format!(
+                    "{} isn't a folder",
+                    at.display()
+                )));
+            }
             Err(_) => std::fs::DirBuilder::new().mode(0o700).create(&at)?,
         }
     }
@@ -370,9 +392,7 @@ impl Landing {
             .map_err(|e| (500, e))?;
         let mut need: HashMap<String, u64> = HashMap::new();
         for (f, now) in m.files.iter().zip(&dests) {
-            if Self::wanted(f, now, &synced) == Act::Write
-                && !self.blob(&f.sha256, true).exists()
-            {
+            if Self::wanted(f, now, &synced) == Act::Write && !self.blob(&f.sha256, true).exists() {
                 need.insert(f.sha256.clone(), f.size);
             }
         }
@@ -406,7 +426,13 @@ impl Landing {
 
     /// `PUT /v1/sync/{id}/blobs/{sha}?offset=`: adds a chunk. One at the wrong offset is
     /// refused with what is held, so botd sends from there. Whole, it's checked.
-    pub fn put(&self, id: &str, sha: &str, offset: u64, body: &[u8]) -> Result<BlobReply, (Refused, Option<BlobReply>)> {
+    pub fn put(
+        &self,
+        id: &str,
+        sha: &str,
+        offset: u64,
+        body: &[u8],
+    ) -> Result<BlobReply, (Refused, Option<BlobReply>)> {
         let st = self.state();
         let size = match st.active.as_ref() {
             Some(a) if a.sync_id == id => match a.need.get(sha) {
@@ -416,7 +442,10 @@ impl Landing {
             _ => return Err(((404, "No such copy. Start it again.".into()), None)),
         };
         if self.blob(sha, true).exists() {
-            return Ok(BlobReply { have: size, done: true });
+            return Ok(BlobReply {
+                have: size,
+                done: true,
+            });
         }
         let part = self.blob(sha, false);
         let have = std::fs::symlink_metadata(&part).map_or(0, |m| m.len());
@@ -447,7 +476,10 @@ impl Landing {
         let got = hash_file(&part).map_err(io)?;
         if got != sha {
             let _ = std::fs::remove_file(&part);
-            return Err(((422, format!("The content's SHA-256 is {got}, not {sha}.")), None));
+            return Err((
+                (422, format!("The content's SHA-256 is {got}, not {sha}.")),
+                None,
+            ));
         }
         std::fs::rename(&part, self.blob(sha, true)).map_err(io)?;
         Ok(BlobReply { have, done: true })
@@ -457,8 +489,10 @@ impl Landing {
     /// if what was there (`was`) is still there untouched.
     fn place(&self, f: &SyncFile, was: &Dest) -> Result<(), Missed> {
         let blob = self.blob(&f.sha256, true);
-        let from = open_nofollow(&blob).map_err(|_| Missed::Failed(format!("The content of {} hasn't arrived.", f.path)))?;
-        self.in_home(|| self.place_from(f, was, from)).map_err(Missed::Failed)?
+        let from = open_nofollow(&blob)
+            .map_err(|_| Missed::Failed(format!("The content of {} hasn't arrived.", f.path)))?;
+        self.in_home(|| self.place_from(f, was, from))
+            .map_err(Missed::Failed)?
     }
 
     fn place_from(&self, f: &SyncFile, was: &Dest, mut from: std::fs::File) -> Result<(), Missed> {
@@ -478,7 +512,11 @@ impl Landing {
                     .open(&tmp);
                 match opened {
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
-                    other => Some(other.map(|to| (tmp.clone(), to)).map_err(|e| format!("{}: {e}", tmp.display()))),
+                    other => Some(
+                        other
+                            .map(|to| (tmp.clone(), to))
+                            .map_err(|e| format!("{}: {e}", tmp.display())),
+                    ),
                 }
             })
             .unwrap_or_else(|| Err(format!("No free name next to {}.", f.path)))
@@ -505,7 +543,10 @@ impl Landing {
             return drop(fail(format!("{}: {e}", f.path)));
         }
         if got != f.sha256 {
-            return drop(fail(format!("{} didn't match its SHA-256 once written.", f.path)));
+            return drop(fail(format!(
+                "{} didn't match its SHA-256 once written.",
+                f.path
+            )));
         }
         let at = self.home.join(&f.path);
         let moved = match was {
@@ -573,7 +614,9 @@ impl Landing {
                     continue;
                 }
                 (Act::Write, _) => self.place(f, &now).map(|()| r.bytes += f.size),
-                (Act::Exec, Dest::File(h)) => self.in_home(|| self.set_exec(f, h)).unwrap_or_else(|e| Err(Missed::Failed(e))),
+                (Act::Exec, Dest::File(h)) => self
+                    .in_home(|| self.set_exec(f, h))
+                    .unwrap_or_else(|e| Err(Missed::Failed(e))),
                 _ => Err(Missed::Raced),
             };
             match done {
@@ -603,7 +646,12 @@ impl Landing {
             st.active = Some(active);
             return Err((500, e));
         }
-        for sha in active.files.iter().map(|f| &f.sha256).collect::<HashSet<_>>() {
+        for sha in active
+            .files
+            .iter()
+            .map(|f| &f.sha256)
+            .collect::<HashSet<_>>()
+        {
             let _ = std::fs::remove_file(self.blob(sha, true));
         }
         Ok(r)
@@ -619,13 +667,17 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let d = std::env::temp_dir().join(format!("superbot-landing-{tag}-{}-{t}", std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("superbot-landing-{tag}-{}-{t}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
 
     fn sha(b: &[u8]) -> String {
-        Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect()
+        Sha256::digest(b)
+            .iter()
+            .map(|x| format!("{x:02x}"))
+            .collect()
     }
 
     fn file(path: &str, body: &[u8]) -> SyncFile {
@@ -651,7 +703,8 @@ mod tests {
         let plan = l.plan(manifest(id, &fs)).unwrap();
         for n in plan.need {
             let body = files.iter().find(|(_, b)| sha(b) == n.sha256).unwrap().1;
-            l.put(id, &n.sha256, n.have, &body[n.have as usize..]).unwrap();
+            l.put(id, &n.sha256, n.have, &body[n.have as usize..])
+                .unwrap();
         }
         l.finish(id).unwrap()
     }
@@ -661,7 +714,16 @@ mod tests {
         for ok in ["work/a.txt", "work/x/y/z", "USER.md", "bots/b1/MEMORY.md"] {
             assert!(allowed(ok), "{ok}");
         }
-        for no in ["work", "work/../x", "/work/a", ".ssh/authorized_keys", "bots/../MEMORY.md", "bots/b1/x", "work/a\nb", "work//a"] {
+        for no in [
+            "work",
+            "work/../x",
+            "/work/a",
+            ".ssh/authorized_keys",
+            "bots/../MEMORY.md",
+            "bots/b1/x",
+            "work/a\nb",
+            "work//a",
+        ] {
             assert!(!allowed(no), "{no}");
         }
     }
@@ -670,29 +732,70 @@ mod tests {
     fn a_copy_lands_checked_and_a_second_changes_nothing() {
         let (home, state) = (scratch("home"), scratch("state"));
         let l = Landing::new(home.clone(), &state).unwrap();
-        let r = copy(&l, "s1", &[("work/a.txt", b"hello"), ("work/d/b.txt", b"there"), ("work/same.txt", b"hello")]);
-        assert_eq!((r.copied, r.unchanged, r.conflict_count, r.bytes), (3, 0, 0, 15));
+        let r = copy(
+            &l,
+            "s1",
+            &[
+                ("work/a.txt", b"hello"),
+                ("work/d/b.txt", b"there"),
+                ("work/same.txt", b"hello"),
+            ],
+        );
+        assert_eq!(
+            (r.copied, r.unchanged, r.conflict_count, r.bytes),
+            (3, 0, 0, 15)
+        );
         assert_eq!(std::fs::read(home.join("work/d/b.txt")).unwrap(), b"there");
-        let mode = |p: &str| std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(home.join(p)).unwrap().permissions()) & 0o777;
+        let mode = |p: &str| {
+            std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::metadata(home.join(p)).unwrap().permissions(),
+            ) & 0o777
+        };
         assert_eq!((mode("work/a.txt"), mode("work/d")), (0o600, 0o700));
-        let plan = l.plan(manifest("s2", &[file("work/a.txt", b"hello")])).unwrap();
+        let plan = l
+            .plan(manifest("s2", &[file("work/a.txt", b"hello")]))
+            .unwrap();
         assert!(plan.need.is_empty());
         let r = l.finish("s2").unwrap();
         assert_eq!((r.copied, r.unchanged), (0, 1));
-        assert!(std::fs::read_dir(state.join("sync/blobs")).unwrap().next().is_none(), "used chunks are dropped");
+        assert!(
+            std::fs::read_dir(state.join("sync/blobs"))
+                .unwrap()
+                .next()
+                .is_none(),
+            "used chunks are dropped"
+        );
     }
 
     #[test]
     fn a_file_changed_on_the_machine_is_kept_and_an_untouched_one_is_updated() {
         let (home, state) = (scratch("home"), scratch("state"));
         let l = Landing::new(home.clone(), &state).unwrap();
-        copy(&l, "s1", &[("work/edited.txt", b"v1"), ("work/plain.txt", b"v1")]);
+        copy(
+            &l,
+            "s1",
+            &[("work/edited.txt", b"v1"), ("work/plain.txt", b"v1")],
+        );
         std::fs::write(home.join("work/edited.txt"), b"the Bot's edit").unwrap();
         std::fs::write(home.join("work/mine.txt"), b"made on the machine").unwrap();
-        let r = copy(&l, "s2", &[("work/edited.txt", b"v2"), ("work/plain.txt", b"v2"), ("work/mine.txt", b"server's")]);
+        let r = copy(
+            &l,
+            "s2",
+            &[
+                ("work/edited.txt", b"v2"),
+                ("work/plain.txt", b"v2"),
+                ("work/mine.txt", b"server's"),
+            ],
+        );
         assert_eq!((r.copied, r.conflict_count), (1, 2));
-        assert_eq!(r.conflicts, vec!["work/edited.txt".to_string(), "work/mine.txt".to_string()]);
-        assert_eq!(std::fs::read(home.join("work/edited.txt")).unwrap(), b"the Bot's edit");
+        assert_eq!(
+            r.conflicts,
+            vec!["work/edited.txt".to_string(), "work/mine.txt".to_string()]
+        );
+        assert_eq!(
+            std::fs::read(home.join("work/edited.txt")).unwrap(),
+            b"the Bot's edit"
+        );
         assert_eq!(std::fs::read(home.join("work/plain.txt")).unwrap(), b"v2");
     }
 
@@ -703,15 +806,33 @@ mod tests {
         std::fs::create_dir_all(home.join("work")).unwrap();
         std::fs::write(home.join("USER.md"), b"machine's facts").unwrap();
         std::os::unix::fs::symlink(&outside, home.join("work/out")).unwrap();
-        let mut seeds = vec![file("USER.md", b"botd's facts"), file("bots/b1/MEMORY.md", b"memory")];
+        let mut seeds = vec![
+            file("USER.md", b"botd's facts"),
+            file("bots/b1/MEMORY.md", b"memory"),
+        ];
         seeds.iter_mut().for_each(|s| s.seed = true);
-        let plan = l.plan(manifest("s1", &[seeds.clone(), vec![file("work/out/x", b"escape")]].concat())).unwrap();
-        assert_eq!(plan.need.len(), 1, "only the memory: the facts exist and the link is blocked");
+        let plan = l
+            .plan(manifest(
+                "s1",
+                &[seeds.clone(), vec![file("work/out/x", b"escape")]].concat(),
+            ))
+            .unwrap();
+        assert_eq!(
+            plan.need.len(),
+            1,
+            "only the memory: the facts exist and the link is blocked"
+        );
         l.put("s1", &plan.need[0].sha256, 0, b"memory").unwrap();
         let r = l.finish("s1").unwrap();
         assert_eq!((r.seeded, r.kept, r.conflict_count), (1, 1, 1));
-        assert_eq!(std::fs::read(home.join("USER.md")).unwrap(), b"machine's facts");
-        assert_eq!(std::fs::read(home.join("bots/b1/MEMORY.md")).unwrap(), b"memory");
+        assert_eq!(
+            std::fs::read(home.join("USER.md")).unwrap(),
+            b"machine's facts"
+        );
+        assert_eq!(
+            std::fs::read(home.join("bots/b1/MEMORY.md")).unwrap(),
+            b"memory"
+        );
         assert!(!outside.join("x").exists());
     }
 
@@ -723,7 +844,13 @@ mod tests {
         let f = file("work/big.bin", &body);
         let plan = l.plan(manifest("s1", std::slice::from_ref(&f))).unwrap();
         assert_eq!(plan.need[0].have, 0);
-        assert_eq!(l.put("s1", &f.sha256, 0, &body[..40]).unwrap(), BlobReply { have: 40, done: false });
+        assert_eq!(
+            l.put("s1", &f.sha256, 0, &body[..40]).unwrap(),
+            BlobReply {
+                have: 40,
+                done: false
+            }
+        );
         let (refused, held) = l.put("s1", &f.sha256, 10, &body[10..]).unwrap_err();
         assert_eq!((refused.0, held.unwrap().have), (409, 40));
         // botd starts over (say, after a restart): the agent still holds the first 40 bytes.
@@ -734,12 +861,22 @@ mod tests {
         assert_eq!(std::fs::read(home.join("work/big.bin")).unwrap(), body);
 
         let wrong = file("work/w.txt", b"right");
-        l.plan(manifest("s3", std::slice::from_ref(&wrong))).unwrap();
-        assert_eq!(l.put("s3", &wrong.sha256, 0, b"wrong").unwrap_err().0.0, 422);
-        assert_eq!(l.put("s3", &wrong.sha256, 0, b"too long").unwrap_err().0.0, 400);
+        l.plan(manifest("s3", std::slice::from_ref(&wrong)))
+            .unwrap();
+        assert_eq!(
+            l.put("s3", &wrong.sha256, 0, b"wrong").unwrap_err().0.0,
+            422
+        );
+        assert_eq!(
+            l.put("s3", &wrong.sha256, 0, b"too long").unwrap_err().0.0,
+            400
+        );
         assert!(l.finish("s3").is_err(), "nothing to put in place");
         assert!(!home.join("work/w.txt").exists());
-        assert_eq!(l.put("nope", &wrong.sha256, 0, b"right").unwrap_err().0.0, 404);
+        assert_eq!(
+            l.put("nope", &wrong.sha256, 0, b"right").unwrap_err().0.0,
+            404
+        );
     }
 
     #[test]
@@ -763,11 +900,26 @@ mod tests {
         std::fs::write(home.join("work/b.txt"), b"made meanwhile").unwrap();
         assert!(matches!(l.place(&a, &was_a), Err(Missed::Raced)));
         assert!(matches!(l.place(&b, &was_b), Err(Missed::Raced)));
-        assert_eq!(std::fs::read(home.join("work/a.txt")).unwrap(), b"edited meanwhile");
-        assert_eq!(std::fs::read(home.join("work/b.txt")).unwrap(), b"made meanwhile");
+        assert_eq!(
+            std::fs::read(home.join("work/a.txt")).unwrap(),
+            b"edited meanwhile"
+        );
+        assert_eq!(
+            std::fs::read(home.join("work/b.txt")).unwrap(),
+            b"made meanwhile"
+        );
         assert_eq!(std::fs::read(outside.join("t")).unwrap(), b"theirs");
-        assert!(std::fs::symlink_metadata(home.join("work/.superbot-sync")).unwrap().is_symlink(), "never removed");
-        let left: Vec<_> = std::fs::read_dir(home.join("work")).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert!(
+            std::fs::symlink_metadata(home.join("work/.superbot-sync"))
+                .unwrap()
+                .is_symlink(),
+            "never removed"
+        );
+        let left: Vec<_> = std::fs::read_dir(home.join("work"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
         assert_eq!(left.len(), 3, "no temp files left behind: {left:?}");
     }
 
@@ -775,24 +927,43 @@ mod tests {
     fn an_exec_bit_changed_on_the_server_follows_unless_changed_on_the_machine() {
         let (home, state) = (scratch("home"), scratch("state"));
         let l = Landing::new(home.clone(), &state).unwrap();
-        let mode = |p: &str| std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(home.join(p)).unwrap().permissions()) & 0o777;
+        let mode = |p: &str| {
+            std::os::unix::fs::PermissionsExt::mode(
+                &std::fs::metadata(home.join(p)).unwrap().permissions(),
+            ) & 0o777
+        };
         let run = |id: &str, files: &[SyncFile]| {
             assert!(l.plan(manifest(id, files)).unwrap().need.is_empty());
             l.finish(id).unwrap()
         };
-        copy(&l, "s1", &[("work/x.sh", b"echo"), ("work/y.sh", b"echo y")]);
+        copy(
+            &l,
+            "s1",
+            &[("work/x.sh", b"echo"), ("work/y.sh", b"echo y")],
+        );
         let (mut x, mut y) = (file("work/x.sh", b"echo"), file("work/y.sh", b"echo y"));
         x.exec = true;
         let r = run("s2", &[x.clone(), y.clone()]);
         assert_eq!((r.copied, r.unchanged, mode("work/x.sh")), (1, 1, 0o700));
         let r = run("s3", &[x.clone(), y.clone()]);
-        assert_eq!((r.copied, r.unchanged), (0, 2), "a second copy changes nothing");
+        assert_eq!(
+            (r.copied, r.unchanged),
+            (0, 2),
+            "a second copy changes nothing"
+        );
 
-        std::fs::set_permissions(home.join("work/y.sh"), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            home.join("work/y.sh"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         x.exec = false;
         y.exec = false;
         let r = run("s4", &[x, y]);
-        assert_eq!((r.copied, r.conflicts.clone()), (1, vec!["work/y.sh".to_string()]));
+        assert_eq!(
+            (r.copied, r.conflicts.clone()),
+            (1, vec!["work/y.sh".to_string()])
+        );
         assert_eq!((mode("work/x.sh"), mode("work/y.sh")), (0o600, 0o700));
     }
 
@@ -801,10 +972,17 @@ mod tests {
         let (home, state) = (scratch("home"), scratch("state"));
         let l = Landing::new(home.clone(), &state).unwrap();
         let long = format!("work/{}", "n".repeat(255));
-        let r = copy(&l, "s1", &[("work/empty", b""), (&long, b"a name at the limit")]);
+        let r = copy(
+            &l,
+            "s1",
+            &[("work/empty", b""), (&long, b"a name at the limit")],
+        );
         assert_eq!(r.copied, 2);
         assert_eq!(std::fs::read(home.join("work/empty")).unwrap(), b"");
-        assert_eq!(std::fs::read(home.join(&long)).unwrap(), b"a name at the limit");
+        assert_eq!(
+            std::fs::read(home.join(&long)).unwrap(),
+            b"a name at the limit"
+        );
     }
 
     #[test]
@@ -813,7 +991,11 @@ mod tests {
         let ok = file("work/a", b"a");
         let mut bad_sha = ok.clone();
         bad_sha.sha256 = "ABC".into();
-        for files in [vec![file("../etc/passwd", b"x")], vec![bad_sha], vec![ok.clone(), ok.clone()]] {
+        for files in [
+            vec![file("../etc/passwd", b"x")],
+            vec![bad_sha],
+            vec![ok.clone(), ok.clone()],
+        ] {
             assert_eq!(l.plan(manifest("s1", &files)).unwrap_err().0, 400);
         }
         assert_eq!(l.plan(manifest("a/b", &[ok])).unwrap_err().0, 400);

@@ -49,11 +49,20 @@ pub fn parse(expr: &str) -> Result<[Vec<bool>; 5], String> {
 }
 
 pub fn matches(expr: &str, t: &chrono::DateTime<Local>) -> bool {
-    let Ok([min, hour, dom, mon, dow]) = parse(expr) else { return false };
+    let Ok([min, hour, dom, mon, dow]) = parse(expr) else {
+        return false;
+    };
     let f: Vec<&str> = expr.split_whitespace().collect();
-    let (d, w) = (dom[t.day() as usize], dow[t.weekday().num_days_from_sunday() as usize]);
+    let (d, w) = (
+        dom[t.day() as usize],
+        dow[t.weekday().num_days_from_sunday() as usize],
+    );
     // Classic cron: if both day fields are restricted, either one may match.
-    let day_ok = if f[2] == "*" || f[4] == "*" { d && w } else { d || w };
+    let day_ok = if f[2] == "*" || f[4] == "*" {
+        d && w
+    } else {
+        d || w
+    };
     min[t.minute() as usize] && hour[t.hour() as usize] && mon[t.month() as usize] && day_ok
 }
 
@@ -66,7 +75,10 @@ pub fn start(app: Arc<App>) {
             let now = Local::now();
             let minute = now.timestamp() / 60;
             for r in app.db.routines(None) {
-                if !r.enabled || r.last_run_at.is_some_and(|t| t / 60_000 == minute) || !matches(&r.cron, &now) {
+                if !r.enabled
+                    || r.last_run_at.is_some_and(|t| t / 60_000 == minute)
+                    || !matches(&r.cron, &now)
+                {
                     continue;
                 }
                 fire(&app, &r, now.timestamp_millis());
@@ -82,13 +94,22 @@ pub(crate) fn fire(app: &Arc<App>, r: &Routine, at_ms: i64) {
     let mut scheduler = Actor::system("scheduler");
     scheduler.on_behalf_of = app.db.bot(&r.bot_id).map(|b| b.owner_id);
     scheduler.asker = r.author_id.clone();
-    let by = Who { actor: scheduler, source: Default::default() };
+    let by = Who {
+        actor: scheduler,
+        source: Default::default(),
+    };
     // Disabling someone pauses their routines; this catches one that fires anyway (ADR 0047).
     if let Some(owner) = by.actor.on_behalf_of.as_deref()
         && let Some((reason, user)) = handover::blocked(&app.db, owner, r.author_id.as_deref())
     {
         let details = json!({ "reason": reason, "name": r.name, "owner": owner, "author": r.author_id, "forUser": user });
-        app.db.record(&by.event("routine.run_refused").target("routine", &r.id).bot(&r.bot_id).outcome(Outcome::Denied).details(details));
+        app.db.record(
+            &by.event("routine.run_refused")
+                .target("routine", &r.id)
+                .bot(&r.bot_id)
+                .outcome(Outcome::Denied)
+                .details(details),
+        );
         handover::pause(app, &by, r, reason, &user);
         return;
     }
@@ -97,9 +118,16 @@ pub(crate) fn fire(app: &Arc<App>, r: &Routine, at_ms: i64) {
     {
         return;
     }
-    app.db.record(&by.event("routine.fired").target("routine", &r.id).bot(&r.bot_id).details(json!({ "name": r.name, "cron": r.cron })));
+    app.db.record(
+        &by.event("routine.fired")
+            .target("routine", &r.id)
+            .bot(&r.bot_id)
+            .details(json!({ "name": r.name, "cron": r.cron })),
+    );
     let text = format!("{}: {}", r.name, r.instruction);
-    let mut msg = app.db.add_message(&r.bot_id, "routine", &text, None, false, Some("queued"));
+    let mut msg = app
+        .db
+        .add_message(&r.bot_id, "routine", &text, None, false, Some("queued"));
     app.db.set_requested_by(msg.id, &by);
     msg.requested_by = Some(by);
     app.push_message(&msg);
@@ -112,9 +140,20 @@ pub(crate) fn fire(app: &Arc<App>, r: &Routine, at_ms: i64) {
 fn take_routine_run(app: &App, r: &Routine, owner: &str, by: &Who, at_ms: i64) -> bool {
     let day = tiers::day(at_ms);
     let tier = app.tier_of(owner);
-    let Err(limit) = app.db.take_routine_run(owner, &day, tier.limits.daily_routine_runs) else { return true };
+    let Err(limit) = app
+        .db
+        .take_routine_run(owner, &day, tier.limits.daily_routine_runs)
+    else {
+        return true;
+    };
     let details = json!({ "reason": "tier_routine_limit", "name": r.name, "owner": owner, "tier": tier.name, "limit": limit, "day": day });
-    app.db.record(&by.event("routine.run_refused").target("routine", &r.id).bot(&r.bot_id).outcome(Outcome::Denied).details(details));
+    app.db.record(
+        &by.event("routine.run_refused")
+            .target("routine", &r.id)
+            .bot(&r.bot_id)
+            .outcome(Outcome::Denied)
+            .details(details),
+    );
     if app.db.routine_refused(owner, &day) {
         let text = format!(
             "The {} plan allows {limit} routine runs a day, and today's are used up, so I skipped \"{}\". Routines run again after midnight (UTC).",

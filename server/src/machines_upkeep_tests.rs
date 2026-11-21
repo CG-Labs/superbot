@@ -8,7 +8,9 @@ use crate::machines::agent::{self, Agent, Config};
 use crate::machines::upkeep::{Upgrades, VERSION};
 use crate::machines::wire::{Download, HarnessInstall, HarnessPlan, InstallSource, NodeRuntime};
 use crate::machines::{enroll, heartbeats, pki};
-use crate::machines_mtls_tests::{Env, config, events, json_call, machine_for, reply_after, send, serve_with};
+use crate::machines_mtls_tests::{
+    Env, config, events, json_call, machine_for, reply_after, send, serve_with,
+};
 use crate::*;
 use base64::Engine;
 use sha2::{Digest, Sha256, Sha512};
@@ -54,16 +56,30 @@ fn exe(p: &std::path::Path, body: &str) {
 }
 
 fn hex(b: &[u8]) -> String {
-    Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect()
+    Sha256::digest(b)
+        .iter()
+        .map(|x| format!("{x:02x}"))
+        .collect()
 }
 
 fn sri(b: &[u8]) -> String {
-    format!("sha512-{}", base64::engine::general_purpose::STANDARD.encode(Sha512::digest(b)))
+    format!(
+        "sha512-{}",
+        base64::engine::general_purpose::STANDARD.encode(Sha512::digest(b))
+    )
 }
 
 fn sh(dir: &std::path::Path, script: &str) {
-    let out = std::process::Command::new("sh").args(["-c", script]).current_dir(dir).output().unwrap();
-    assert!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));
+    let out = std::process::Command::new("sh")
+        .args(["-c", script])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{script}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// An npm package `name@version` whose program `bin` is `body`.
@@ -71,7 +87,11 @@ fn package(name: &str, version: &str, bin: &str, body: &str) -> Vec<u8> {
     let dir = crate::db::temp_path("pkg");
     let p = dir.join("package");
     std::fs::create_dir_all(&p).unwrap();
-    std::fs::write(p.join("package.json"), format!(r#"{{"name": "{name}", "version": "{version}"}}"#)).unwrap();
+    std::fs::write(
+        p.join("package.json"),
+        format!(r#"{{"name": "{name}", "version": "{version}"}}"#),
+    )
+    .unwrap();
     std::fs::write(p.join("bin.txt"), bin).unwrap();
     exe(&p.join("cli.sh"), body);
     sh(&dir, "tar -czf pkg.tgz package");
@@ -99,7 +119,10 @@ async fn downloads(e: &Arc<enroll::Enrollment>, body: Vec<u8>) -> String {
     let l = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let port = l.local_addr().unwrap().port();
     let body = axum::body::Bytes::from(body);
-    let router = axum::Router::new().route("/node.tar.xz", axum::routing::get(move || async move { body.clone() }));
+    let router = axum::Router::new().route(
+        "/node.tar.xz",
+        axum::routing::get(move || async move { body.clone() }),
+    );
     tokio::spawn(pki::serve(l, e.tls(), router, pki::lifetime));
     format!("https://127.0.0.1:{port}/node.tar.xz")
 }
@@ -122,7 +145,10 @@ async fn agent_on(env: &mut Env, mid: &str, token: &str, own: &str) -> Machine {
     exe(&cfg.exe, own);
     let id = agent::enroll(&cfg).await.unwrap();
     let agent = Agent::new(cfg.clone(), id).unwrap();
-    let server = tokio::spawn(agent::serve(env.agent_listener.take().unwrap(), agent.clone()));
+    let server = tokio::spawn(agent::serve(
+        env.agent_listener.take().unwrap(),
+        agent.clone(),
+    ));
     Machine { cfg, agent, server }
 }
 
@@ -164,7 +190,10 @@ fn npm(name: &str, package: &str, version: &str, integrity: String) -> HarnessIn
     HarnessInstall {
         name: name.into(),
         version: version.into(),
-        source: InstallSource::Npm { package: package.into(), integrity: Some(integrity) },
+        source: InstallSource::Npm {
+            package: package.into(),
+            integrity: Some(integrity),
+        },
     }
 }
 
@@ -179,14 +208,24 @@ async fn a_new_machine_installs_the_planned_harnesses_and_runs_bots_with_them() 
     let codex = package("fake-codex", "1.0.0", "codex", "#!/bin/sh\n");
     let tarball = node_tarball(&[("fake-claude@9.9.9", &claude), ("fake-codex@1.0.0", &codex)]);
     let sha = hex(&tarball);
-    let wrong = format!("sha512-{}", base64::engine::general_purpose::STANDARD.encode([0u8; 64]));
+    let wrong = format!(
+        "sha512-{}",
+        base64::engine::general_purpose::STANDARD.encode([0u8; 64])
+    );
     let url = downloads(&ca_twin(), tarball).await;
     let plan = HarnessPlan {
         node: Some(NodeRuntime {
             version: "0.0.1".into(),
-            downloads: [(std::env::consts::ARCH.to_string(), Download { url, sha256: sha })].into(),
+            downloads: [(
+                std::env::consts::ARCH.to_string(),
+                Download { url, sha256: sha },
+            )]
+            .into(),
         }),
-        harnesses: vec![npm("claude", "fake-claude", "9.9.9", sri(&claude)), npm("codex", "fake-codex", "1.0.0", wrong)],
+        harnesses: vec![
+            npm("claude", "fake-claude", "9.9.9", sri(&claude)),
+            npm("codex", "fake-codex", "1.0.0", wrong),
+        ],
     };
     crate::machines::tools::check(&plan).unwrap();
     let planned = plan.clone();
@@ -198,11 +237,24 @@ async fn a_new_machine_installs_the_planned_harnesses_and_runs_bots_with_them() 
 
     let (uid, mid, token) = machine_for(&env, "ada@example.com").await;
     let mut m = agent_on(&mut env, &mid, &token, "#!/bin/sh\n").await;
-    let bot = env.app.db.create_bot_owned("Ada's", "#fff", "waddle", "claude", None, false, &uid, crate::acl::Visibility::Shared);
+    let bot = env.app.db.create_bot_owned(
+        "Ada's",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &uid,
+        crate::acl::Visibility::Shared,
+    );
 
     // Before the plan: refused, as before ADR 0039.
     let before = send(&env, &bot.id, "hello").await;
-    assert!(reply_after(&env, &bot.id, before).await.contains("isn't installed"));
+    assert!(
+        reply_after(&env, &bot.id, before)
+            .await
+            .contains("isn't installed")
+    );
 
     let v = beat_until(&env, &uid, "claude installed and codex failed", |v| {
         let h = &v["agent"]["harnesses"];
@@ -212,21 +264,42 @@ async fn a_new_machine_installs_the_planned_harnesses_and_runs_bots_with_them() 
     assert_eq!(v["agent"]["harnesses"]["claude"]["version"], "9.9.9", "{v}");
     assert_eq!(v["agent"]["plan"].as_str(), Some(plan.id().as_str()), "{v}");
     let why = v["agent"]["harnesses"]["codex"]["error"].as_str().unwrap();
-    assert!(why.contains("not the pinned"), "a package that isn't what was pinned isn't installed: {why}");
+    assert!(
+        why.contains("not the pinned"),
+        "a package that isn't what was pinned isn't installed: {why}"
+    );
     assert!(!m.cfg.tools.join("bin/codex").exists());
-    assert!(std::fs::symlink_metadata(m.cfg.tools.join("bin/node")).unwrap().is_symlink());
+    assert!(
+        std::fs::symlink_metadata(m.cfg.tools.join("bin/node"))
+            .unwrap()
+            .is_symlink()
+    );
 
     let sent = events(&env, "machine.harnesses_requested").await;
     assert_eq!(sent.len(), 1, "sent once, not every heartbeat: {sent:?}");
-    assert_eq!(sent[0]["details"]["harnesses"], json!(["claude@9.9.9", "codex@1.0.0"]));
+    assert_eq!(
+        sent[0]["details"]["harnesses"],
+        json!(["claude@9.9.9", "codex@1.0.0"])
+    );
     let ok = events(&env, "machine.harness_installed").await;
-    assert_eq!((ok.len(), ok[0]["details"]["harness"].as_str()), (1, Some("claude")), "{ok:?}");
+    assert_eq!(
+        (ok.len(), ok[0]["details"]["harness"].as_str()),
+        (1, Some("claude")),
+        "{ok:?}"
+    );
     let bad = events(&env, "machine.harness_install_failed").await;
-    assert_eq!((bad.len(), bad[0]["outcome"].as_str()), (1, Some("failure")), "{bad:?}");
+    assert_eq!(
+        (bad.len(), bad[0]["outcome"].as_str()),
+        (1, Some("failure")),
+        "{bad:?}"
+    );
 
     // The same Bot runs now, with the claude the agent installed.
     let before = send(&env, &bot.id, "again").await;
-    assert_eq!(reply_after(&env, &bot.id, before).await, "ran with the installed claude");
+    assert_eq!(
+        reply_after(&env, &bot.id, before).await,
+        "ran with the installed claude"
+    );
     let routed = events(&env, "bot.run_routed").await;
     assert_eq!(routed[0]["details"]["machine"].as_str(), Some(mid.as_str()));
 
@@ -237,7 +310,13 @@ async fn a_new_machine_installs_the_planned_harnesses_and_runs_bots_with_them() 
     assert_eq!(events(&env, "machine.harnesses_requested").await.len(), 1);
 
     // An admin can send it again now: the failed one is tried again.
-    let (code, v) = json_call(&env, "POST", &format!("/api/users/{uid}/machine/harnesses"), "").await;
+    let (code, v) = json_call(
+        &env,
+        "POST",
+        &format!("/api/users/{uid}/machine/harnesses"),
+        "",
+    )
+    .await;
     assert_eq!(code, 202, "{v}");
     assert_eq!(events(&env, "machine.harnesses_requested").await.len(), 2);
     for _ in 0..400 {
@@ -252,7 +331,11 @@ async fn a_new_machine_installs_the_planned_harnesses_and_runs_bots_with_them() 
 
 /// A build of the agent: answers `--version` as the real one does.
 fn build(version: &str, tag: &str) -> &'static [u8] {
-    Box::leak(format!("#!/bin/sh\n# {tag}\necho 'superbot-machine {version}'\n").into_bytes().into_boxed_slice())
+    Box::leak(
+        format!("#!/bin/sh\n# {tag}\necho 'superbot-machine {version}'\n")
+            .into_bytes()
+            .into_boxed_slice(),
+    )
 }
 
 /// The unit's guard, run before each of `n` starts, as systemd would.
@@ -287,12 +370,33 @@ async fn an_admin_upgrades_an_agent_that_puts_the_old_one_back_if_the_new_one_fa
     std::fs::write(&ctl, "old botctl").unwrap();
     let path = format!("/api/users/{uid}/machine/agent");
 
-    let v = beat_until(&env, &uid, "heard from", |v| v["agent"]["build"].is_string()).await;
-    assert_eq!(v["agent"]["build"].as_str(), Some(hex(old.as_bytes()).as_str()));
-    assert_eq!((v["upToDate"].as_bool(), v["botd"]["build"].as_str()), (Some(false), Some(hex(new).as_str())), "{v}");
-    assert!(v["agent"]["can"].as_array().unwrap().contains(&json!("upgrade")), "{v}");
+    let v = beat_until(&env, &uid, "heard from", |v| {
+        v["agent"]["build"].is_string()
+    })
+    .await;
+    assert_eq!(
+        v["agent"]["build"].as_str(),
+        Some(hex(old.as_bytes()).as_str())
+    );
+    assert_eq!(
+        (v["upToDate"].as_bool(), v["botd"]["build"].as_str()),
+        (Some(false), Some(hex(new).as_str())),
+        "{v}"
+    );
+    assert!(
+        v["agent"]["can"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("upgrade")),
+        "{v}"
+    );
     heartbeats(&env.app, &env.cp).await;
-    assert!(events(&env, "machine.agent_upgrade_requested").await.is_empty(), "manual by default");
+    assert!(
+        events(&env, "machine.agent_upgrade_requested")
+            .await
+            .is_empty(),
+        "manual by default"
+    );
 
     // Held, nothing upgrades it.
     let (code, v) = json_call(&env, "PUT", &format!("{path}/hold"), "").await;
@@ -303,27 +407,47 @@ async fn an_admin_upgrades_an_agent_that_puts_the_old_one_back_if_the_new_one_fa
     let (code, _) = json_call(&env, "DELETE", &format!("{path}/hold"), "").await;
     assert_eq!(code, 200);
     assert_eq!(events(&env, "machine.agent_upgrade_held").await.len(), 1);
-    assert_eq!(events(&env, "machine.agent_upgrade_released").await.len(), 1);
+    assert_eq!(
+        events(&env, "machine.agent_upgrade_released").await.len(),
+        1
+    );
 
     // The new build won't start: the guard puts the old one back.
     let (code, v) = json_call(&env, "POST", &format!("{path}/upgrade"), "").await;
     assert_eq!(code, 202, "{v}");
-    assert_eq!(v["upgrade"]["build"].as_str(), Some(hex(new).as_str()), "{v}");
+    assert_eq!(
+        v["upgrade"]["build"].as_str(),
+        Some(hex(new).as_str()),
+        "{v}"
+    );
     // On its way, it can't be called back, so it can't be held either.
     let (code, v) = json_call(&env, "PUT", &format!("{path}/hold"), "").await;
     assert_eq!(code, 409, "{v}");
     assert!(v["error"].as_str().unwrap().contains("on its way"), "{v}");
     assert_eq!(events(&env, "machine.agent_upgrade_held").await.len(), 1);
     m.wait_for_restart().await;
-    assert_eq!((read(&m.cfg.exe).as_bytes(), read(&ctl).as_str()), (new, "new botctl"));
-    assert_eq!((read(&prev(&m.cfg.exe)), read(&prev(&ctl))), (old.clone(), "old botctl".to_string()));
+    assert_eq!(
+        (read(&m.cfg.exe).as_bytes(), read(&ctl).as_str()),
+        (new, "new botctl")
+    );
+    assert_eq!(
+        (read(&prev(&m.cfg.exe)), read(&prev(&ctl))),
+        (old.clone(), "old botctl".to_string())
+    );
     guard(&m, 4);
-    assert_eq!((read(&m.cfg.exe), read(&ctl)), (old.clone(), "old botctl".to_string()));
+    assert_eq!(
+        (read(&m.cfg.exe), read(&ctl)),
+        (old.clone(), "old botctl".to_string())
+    );
     m.restart().await;
     let v = beat_until(&env, &uid, "rolled back", |v| v["upgrade"].is_null()).await;
     assert_eq!(v["failedBuild"].as_str(), Some(hex(new).as_str()), "{v}");
     let failed = events(&env, "machine.agent_upgrade_failed").await;
-    assert_eq!((failed.len(), failed[0]["details"]["reason"].as_str()), (1, Some("rolled_back")), "{failed:?}");
+    assert_eq!(
+        (failed.len(), failed[0]["details"]["reason"].as_str()),
+        (1, Some("rolled_back")),
+        "{failed:?}"
+    );
     assert_eq!(failed[0]["outcome"], "failure");
 
     // Asked again, the new build starts and botd reaches it: it is kept.
@@ -331,14 +455,33 @@ async fn an_admin_upgrades_an_agent_that_puts_the_old_one_back_if_the_new_one_fa
     assert_eq!(code, 202, "{v}");
     m.wait_for_restart().await;
     m.restart().await;
-    assert!(m.agent.upgrader.trial_deadline().is_some(), "on trial until botd reaches it");
-    let v = beat_until(&env, &uid, "upgraded", |v| v["upToDate"] == true && v["upgrade"].is_null()).await;
-    assert_eq!((v["failedBuild"].clone(), v["agent"]["upgrade"]["state"].clone()), (Value::Null, json!("done")), "{v}");
-    assert!(!prev(&m.cfg.exe).exists() && !prev(&ctl).exists(), "the old build is let go");
+    assert!(
+        m.agent.upgrader.trial_deadline().is_some(),
+        "on trial until botd reaches it"
+    );
+    let v = beat_until(&env, &uid, "upgraded", |v| {
+        v["upToDate"] == true && v["upgrade"].is_null()
+    })
+    .await;
+    assert_eq!(
+        (
+            v["failedBuild"].clone(),
+            v["agent"]["upgrade"]["state"].clone()
+        ),
+        (Value::Null, json!("done")),
+        "{v}"
+    );
+    assert!(
+        !prev(&m.cfg.exe).exists() && !prev(&ctl).exists(),
+        "the old build is let go"
+    );
     let done = events(&env, "machine.agent_upgraded").await;
     assert_eq!(done.len(), 1, "{done:?}");
     assert_eq!(
-        (done[0]["details"]["fromBuild"].as_str(), done[0]["details"]["toBuild"].as_str()),
+        (
+            done[0]["details"]["fromBuild"].as_str(),
+            done[0]["details"]["toBuild"].as_str()
+        ),
         (Some(hex(old.as_bytes()).as_str()), Some(hex(new).as_str()))
     );
     let asked = events(&env, "machine.agent_upgrade_requested").await;
@@ -358,7 +501,10 @@ async fn an_upgrade_whose_agent_goes_quiet_times_out() {
     let old = String::from_utf8(build("0.0.9", "old").to_vec()).unwrap();
     let mut m = agent_on(&mut env, &mid, &token, &old).await;
     let path = format!("/api/users/{uid}/machine/agent");
-    beat_until(&env, &uid, "heard from", |v| v["agent"]["build"].is_string()).await;
+    beat_until(&env, &uid, "heard from", |v| {
+        v["agent"]["build"].is_string()
+    })
+    .await;
     let (code, v) = json_call(&env, "POST", &format!("{path}/upgrade"), "").await;
     assert_eq!(code, 202, "{v}");
     m.wait_for_restart().await;
@@ -367,15 +513,34 @@ async fn an_upgrade_whose_agent_goes_quiet_times_out() {
     m.server.abort();
     let _ = (&mut m.server).await;
     heartbeats(&env.app, &env.cp).await;
-    assert!(events(&env, "machine.agent_upgrade_failed").await.is_empty(), "not yet");
-    env.app.db.machine_upgrade_backdate(&mid, 86_400_000 + 11 * 60_000);
-    assert_eq!(heartbeats(&env.app, &env.cp).await, Some(0), "it doesn't answer");
+    assert!(
+        events(&env, "machine.agent_upgrade_failed")
+            .await
+            .is_empty(),
+        "not yet"
+    );
+    env.app
+        .db
+        .machine_upgrade_backdate(&mid, 86_400_000 + 11 * 60_000);
+    assert_eq!(
+        heartbeats(&env.app, &env.cp).await,
+        Some(0),
+        "it doesn't answer"
+    );
     let failed = events(&env, "machine.agent_upgrade_failed").await;
-    assert_eq!((failed.len(), failed[0]["details"]["reason"].as_str()), (1, Some("timeout")), "{failed:?}");
+    assert_eq!(
+        (failed.len(), failed[0]["details"]["reason"].as_str()),
+        (1, Some("timeout")),
+        "{failed:?}"
+    );
     assert_eq!(failed[0]["outcome"], "failure");
     let (code, v) = json_call(&env, "GET", &path, "").await;
     assert_eq!(code, 200);
-    assert_eq!((v["upgrade"].clone(), v["failedBuild"].as_str()), (Value::Null, Some(hex(new).as_str())), "{v}");
+    assert_eq!(
+        (v["upgrade"].clone(), v["failedBuild"].as_str()),
+        (Value::Null, Some(hex(new).as_str())),
+        "{v}"
+    );
 }
 
 #[tokio::test]
@@ -389,17 +554,38 @@ async fn auto_upgrades_skip_held_machines_and_builds_that_failed() {
     let (uid, mid, token) = machine_for(&env, "bo@example.com").await;
     let old = String::from_utf8(build("0.0.9", "old").to_vec()).unwrap();
     let mut m = agent_on(&mut env, &mid, &token, &old).await;
-    let (code, _) = json_call(&env, "PUT", &format!("/api/users/{uid}/machine/agent/hold"), "").await;
+    let (code, _) = json_call(
+        &env,
+        "PUT",
+        &format!("/api/users/{uid}/machine/agent/hold"),
+        "",
+    )
+    .await;
     assert_eq!(code, 200);
     heartbeats(&env.app, &env.cp).await;
     heartbeats(&env.app, &env.cp).await;
-    assert!(events(&env, "machine.agent_upgrade_requested").await.is_empty(), "held");
+    assert!(
+        events(&env, "machine.agent_upgrade_requested")
+            .await
+            .is_empty(),
+        "held"
+    );
 
-    let (code, _) = json_call(&env, "DELETE", &format!("/api/users/{uid}/machine/agent/hold"), "").await;
+    let (code, _) = json_call(
+        &env,
+        "DELETE",
+        &format!("/api/users/{uid}/machine/agent/hold"),
+        "",
+    )
+    .await;
     assert_eq!(code, 200);
     heartbeats(&env.app, &env.cp).await;
     let asked = events(&env, "machine.agent_upgrade_requested").await;
-    assert_eq!((asked.len(), asked[0]["details"]["by"].as_str()), (1, Some("auto")), "{asked:?}");
+    assert_eq!(
+        (asked.len(), asked[0]["details"]["by"].as_str()),
+        (1, Some("auto")),
+        "{asked:?}"
+    );
     m.wait_for_restart().await;
     guard(&m, 4);
     m.restart().await;
@@ -407,5 +593,9 @@ async fn auto_upgrades_skip_held_machines_and_builds_that_failed() {
     for _ in 0..3 {
         heartbeats(&env.app, &env.cp).await;
     }
-    assert_eq!(events(&env, "machine.agent_upgrade_requested").await.len(), 1, "a build that failed isn't tried again by itself");
+    assert_eq!(
+        events(&env, "machine.agent_upgrade_requested").await.len(),
+        1,
+        "a build that failed isn't tried again by itself"
+    );
 }

@@ -6,12 +6,12 @@
 
 use crate::acl::Visibility;
 use crate::auth_review_http_tests::routes;
+use crate::machines::ControlPlane;
 use crate::machines::fake::Fake;
 use crate::machines::provider::MachineProvider;
 use crate::machines::route::recording::Recording;
-use crate::machines::ControlPlane;
 use crate::rbac::{self, Principal, Role};
-use crate::tests::{audit_list, call, call_with, serve_app, serve_app_with, BotKey};
+use crate::tests::{BotKey, audit_list, call, call_with, serve_app, serve_app_with};
 use crate::users_http_tests::{parse, user_with};
 use crate::*;
 
@@ -30,7 +30,16 @@ async fn world() -> World {
     let (port, app, admin, key) = serve_app().await;
     let (a_id, a) = user_with(port, &admin, "ada@example.com", "member").await;
     let (b_id, b) = user_with(port, &admin, "bea@example.com", "member").await;
-    World { port, app, admin, key, a_id, a, b_id, b }
+    World {
+        port,
+        app,
+        admin,
+        key,
+        a_id,
+        a,
+        b_id,
+        b,
+    }
 }
 
 async fn events(port: u16, admin: &str, q: &str) -> Vec<Value> {
@@ -53,7 +62,14 @@ printf '%s\n' "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tex
 /// Sends `text` and waits for the Bot's reply.
 async fn run(w: &World, who: &str, bot: &str, text: &str) -> String {
     let before = w.app.db.last_id();
-    let (code, body) = call(w.port, "POST", &format!("/api/bots/{bot}/messages"), who, &json!({ "text": text }).to_string()).await;
+    let (code, body) = call(
+        w.port,
+        "POST",
+        &format!("/api/bots/{bot}/messages"),
+        who,
+        &json!({ "text": text }).to_string(),
+    )
+    .await;
     assert_eq!(code, 202, "{body}");
     for _ in 0..300 {
         if let Some(m) = w.app.db.replies_after(bot, before).into_iter().next() {
@@ -69,13 +85,38 @@ async fn another_user_reaches_none_of_a_private_bot_through_any_route() {
     let w = world().await;
     let (port, app) = (w.port, &w.app);
     let (_, viewer) = user_with(port, &w.admin, "vic@example.com", "readonly").await;
-    let pa = app.db.create_bot_owned("Ledger", "#fff", "waddle", "claude", None, false, &w.a_id, Visibility::Private);
-    let pb = app.db.create_bot_owned("Scout", "#fff", "waddle", "claude", None, false, &w.b_id, Visibility::Private);
+    let pa = app.db.create_bot_owned(
+        "Ledger",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &w.a_id,
+        Visibility::Private,
+    );
+    let pb = app.db.create_bot_owned(
+        "Scout",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &w.b_id,
+        Visibility::Private,
+    );
     let b_bot = w.key.auth(&pb.id);
     let a_bot = w.key.auth(&pa.id);
 
     // Things of A's for B to go after: a routine, a pending approval, and chat.
-    let (code, r) = call(port, "POST", &format!("/api/bots/{}/routines", pa.id), &w.a, r#"{"name":"Close","cron":"0 9 * * *","instruction":"close the books"}"#).await;
+    let (code, r) = call(
+        port,
+        "POST",
+        &format!("/api/bots/{}/routines", pa.id),
+        &w.a,
+        r#"{"name":"Close","cron":"0 9 * * *","instruction":"close the books"}"#,
+    )
+    .await;
     assert_eq!(code, 201, "{r}");
     let routine = parse(&r)["id"].as_str().unwrap().to_string();
     let check = json!({ "from": pa.id, "harness": "claude", "event": { "tool_name": "Bash", "tool_input": { "command": "git push origin main" }, "cwd": "/tmp" } }).to_string();
@@ -89,13 +130,16 @@ async fn another_user_reaches_none_of_a_private_bot_through_any_route() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    app.db.add_message(&pa.id, "user", "the payroll numbers", None, false, None);
+    app.db
+        .add_message(&pa.id, "user", "the payroll numbers", None, false, None);
     let messages = app.db.messages(&pa.id, 100).len();
 
     let body_for = |m: &str, p: &str| -> String {
         match (m, p.rsplit('/').next().unwrap_or("")) {
             ("POST", "messages") => r#"{"text":"what are the payroll numbers?"}"#.into(),
-            ("POST", "routines") => r#"{"name":"Mine","cron":"0 9 * * *","instruction":"x"}"#.into(),
+            ("POST", "routines") => {
+                r#"{"name":"Mine","cron":"0 9 * * *","instruction":"x"}"#.into()
+            }
             ("PATCH", "access") => r#"{"visibility":"shared"}"#.into(),
             ("PUT", "policy") => r#"{"mode":"bypass"}"#.into(),
             ("PUT", _) if p.contains("/grants/") => r#"{"level":"operator"}"#.into(),
@@ -115,31 +159,62 @@ async fn another_user_reaches_none_of_a_private_bot_through_any_route() {
         } else {
             continue;
         };
-        let need = rbac::classify(&axum::http::Method::from_bytes(m.as_bytes()).unwrap(), &path);
+        let need = rbac::classify(
+            &axum::http::Method::from_bytes(m.as_bytes()).unwrap(),
+            &path,
+        );
         let body = body_for(&m, &path);
-        for (who, auth, role) in [("Bea", &w.b, Role::Member), ("a read-only user", &viewer, Role::Readonly)] {
+        for (who, auth, role) in [
+            ("Bea", &w.b, Role::Member),
+            ("a read-only user", &viewer, Role::Readonly),
+        ] {
             let (code, res) = call(port, &m, &path, auth, &body).await;
-            let want = if rbac::allows(Principal::User(role), need) { 404 } else { 403 };
+            let want = if rbac::allows(Principal::User(role), need) {
+                404
+            } else {
+                403
+            };
             assert_eq!(code, want, "{who}: {m} {path}: {res}");
-            assert!(!res.contains("payroll") && !res.contains("Ledger"), "{who}: {m} {path}: {res}");
+            assert!(
+                !res.contains("payroll") && !res.contains("Ledger"),
+                "{who}: {m} {path}: {res}"
+            );
         }
         let (code, res) = call(port, &m, &path, &b_bot, &body).await;
-        assert!([403, 404].contains(&code), "Bea's Bot: {m} {path}: {code} {res}");
+        assert!(
+            [403, 404].contains(&code),
+            "Bea's Bot: {m} {path}: {code} {res}"
+        );
         walked += 1;
     }
     assert!(walked >= 15, "{walked} routes");
 
     // Routes that name the Bot in the body or query.
     let named = [
-        ("POST", "/api/ask".to_string(), json!({ "from": pb.id, "to": pa.id, "text": "the payroll?" })),
-        ("POST", "/api/handoff".to_string(), json!({ "from": pa.id, "text": "log in" })),
-        ("POST", "/api/approvals/check".to_string(), json!({ "from": pa.id, "event": { "tool_name": "Bash", "tool_input": { "command": "ls" } } })),
+        (
+            "POST",
+            "/api/ask".to_string(),
+            json!({ "from": pb.id, "to": pa.id, "text": "the payroll?" }),
+        ),
+        (
+            "POST",
+            "/api/handoff".to_string(),
+            json!({ "from": pa.id, "text": "log in" }),
+        ),
+        (
+            "POST",
+            "/api/approvals/check".to_string(),
+            json!({ "from": pa.id, "event": { "tool_name": "Bash", "tool_input": { "command": "ls" } } }),
+        ),
         ("GET", format!("/api/policy/rules?bot={}", pa.id), json!({})),
         ("GET", format!("/api/approvals?bot={}", pa.id), json!({})),
     ];
     for (m, p, body) in &named {
         let (code, res) = call(port, m, p, &w.b, &body.to_string()).await;
-        assert!([400, 403, 404].contains(&code), "Bea: {m} {p}: {code} {res}");
+        assert!(
+            [400, 403, 404].contains(&code),
+            "Bea: {m} {p}: {code} {res}"
+        );
         assert!(!res.contains("payroll") && !res.contains("Ledger"), "{res}");
     }
     let (code, res) = call(port, "POST", "/api/ask", &b_bot, &named[0].2.to_string()).await;
@@ -149,44 +224,120 @@ async fn another_user_reaches_none_of_a_private_bot_through_any_route() {
     for (who, auth) in [("Bea", &w.b), ("Bea's Bot", &b_bot)] {
         for p in ["/api/bots", "/api/state", "/api/approvals"] {
             let (_, res) = call(port, "GET", p, auth, "").await;
-            assert!(!res.contains(&pa.id) && !res.contains("payroll"), "{who} {p}: {res}");
+            assert!(
+                !res.contains(&pa.id) && !res.contains("payroll"),
+                "{who} {p}: {res}"
+            );
         }
     }
 
     // Nothing changed.
     let after = app.db.bot(&pa.id).unwrap();
-    assert_eq!((after.name.as_str(), after.visibility, after.owner_id.as_str()), ("Ledger", Visibility::Private, w.a_id.as_str()));
+    assert_eq!(
+        (
+            after.name.as_str(),
+            after.visibility,
+            after.owner_id.as_str()
+        ),
+        ("Ledger", Visibility::Private, w.a_id.as_str())
+    );
     assert!(app.db.grant(&pa.id, &w.b_id).is_none());
     assert_eq!(app.db.messages(&pa.id, 100).len(), messages);
-    assert!(app.db.routines(Some(&pa.id)).iter().any(|r| r.id == routine && r.enabled));
-    assert_eq!(app.db.approvals(Some("pending"), None, 10).len(), 1, "still waiting on Ada");
-    assert_eq!(call(port, "POST", &format!("/api/approvals/{approval}/deny"), &w.a, "{}").await.0, 200);
+    assert!(
+        app.db
+            .routines(Some(&pa.id))
+            .iter()
+            .any(|r| r.id == routine && r.enabled)
+    );
+    assert_eq!(
+        app.db.approvals(Some("pending"), None, 10).len(),
+        1,
+        "still waiting on Ada"
+    );
+    assert_eq!(
+        call(
+            port,
+            "POST",
+            &format!("/api/approvals/{approval}/deny"),
+            &w.a,
+            "{}"
+        )
+        .await
+        .0,
+        200
+    );
     assert_eq!(hook.await.unwrap().1.lines().next(), Some("deny"));
     let hidden = events(port, &w.admin, "action=access.denied").await;
-    assert!(hidden.iter().any(|e| e["details"]["reason"] == "bot_acl" && e["targetId"] == pa.id.as_str() && e["actorId"] == w.b_id.as_str()));
+    assert!(hidden.iter().any(|e| e["details"]["reason"] == "bot_acl"
+        && e["targetId"] == pa.id.as_str()
+        && e["actorId"] == w.b_id.as_str()));
 }
 
 #[tokio::test]
 async fn a_bot_can_only_act_as_itself() {
     let w = world().await;
     let (port, app) = (w.port, &w.app);
-    let a1 = app.db.create_bot_owned("Ada's", "#fff", "waddle", "claude", None, false, &w.a_id, Visibility::Private);
-    let b1 = app.db.create_bot_owned("Bea's", "#fff", "waddle", "claude", None, false, &w.b_id, Visibility::Private);
-    let b2 = app.db.create_bot_owned("Bea's other", "#fff", "waddle", "claude", None, false, &w.b_id, Visibility::Private);
-    app.db.add_message(&a1.id, "user", "ada-private-note", None, false, None);
+    let a1 = app.db.create_bot_owned(
+        "Ada's",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &w.a_id,
+        Visibility::Private,
+    );
+    let b1 = app.db.create_bot_owned(
+        "Bea's",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &w.b_id,
+        Visibility::Private,
+    );
+    let b2 = app.db.create_bot_owned(
+        "Bea's other",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &w.b_id,
+        Visibility::Private,
+    );
+    app.db
+        .add_message(&a1.id, "user", "ada-private-note", None, false, None);
     let a_bot = w.key.auth(&a1.id);
     let b_bot = w.key.auth(&b1.id);
 
     // B's Bot claiming to be A's, every way botctl could say it.
     let claim = format!("X-SuperBot-Bot: {}\r\n", a1.id);
-    let (code, _, res) = call_with(port, "GET", &format!("/api/bots/{}/messages", a1.id), &b_bot, &claim, "").await;
+    let (code, _, res) = call_with(
+        port,
+        "GET",
+        &format!("/api/bots/{}/messages", a1.id),
+        &b_bot,
+        &claim,
+        "",
+    )
+    .await;
     assert_eq!(code, 403, "{res}");
     let (code, _, _) = call_with(port, "GET", "/api/bots", &b_bot, &claim, "").await;
     assert_eq!(code, 403);
     let mismatch = events(port, &w.admin, "action=access.denied&actor=bot").await;
-    assert!(mismatch.iter().any(|e| e["details"]["reason"] == "bot_mismatch" && e["actorId"] == b1.id.as_str()), "{mismatch:?}");
+    assert!(
+        mismatch
+            .iter()
+            .any(|e| e["details"]["reason"] == "bot_mismatch" && e["actorId"] == b1.id.as_str()),
+        "{mismatch:?}"
+    );
     for (p, body) in [
-        ("/api/ask", json!({ "from": a1.id, "to": b2.id, "text": "hi" })),
+        (
+            "/api/ask",
+            json!({ "from": a1.id, "to": b2.id, "text": "hi" }),
+        ),
         ("/api/handoff", json!({ "from": a1.id, "text": "log in" })),
     ] {
         let (code, res) = call(port, "POST", p, &b_bot, &body.to_string()).await;
@@ -194,17 +345,64 @@ async fn a_bot_can_only_act_as_itself() {
     }
     let check = json!({ "from": a1.id, "harness": "claude", "event": { "tool_name": "Bash", "tool_input": { "command": "ls" } } }).to_string();
     let (code, res) = call(port, "POST", "/api/approvals/check", &b_bot, &check).await;
-    assert_eq!((code, res.lines().next()), (200, Some("deny")), "the hook can't borrow A's Bot's rules");
+    assert_eq!(
+        (code, res.lines().next()),
+        (200, Some("deny")),
+        "the hook can't borrow A's Bot's rules"
+    );
     assert!(app.db.approvals(None, None, 10).is_empty());
 
     // And it can't reach A's Bot as itself either.
-    assert_eq!(call(port, "GET", &format!("/api/bots/{}/messages", a1.id), &b_bot, "").await.0, 404);
-    assert_eq!(call(port, "POST", &format!("/api/bots/{}/messages", a1.id), &b_bot, r#"{"text":"hi"}"#).await.0, 404);
-    assert_eq!(call(port, "GET", &format!("/api/bots/{}/screen", a1.id), &b_bot, "").await.0, 404);
+    assert_eq!(
+        call(
+            port,
+            "GET",
+            &format!("/api/bots/{}/messages", a1.id),
+            &b_bot,
+            ""
+        )
+        .await
+        .0,
+        404
+    );
+    assert_eq!(
+        call(
+            port,
+            "POST",
+            &format!("/api/bots/{}/messages", a1.id),
+            &b_bot,
+            r#"{"text":"hi"}"#
+        )
+        .await
+        .0,
+        404
+    );
+    assert_eq!(
+        call(
+            port,
+            "GET",
+            &format!("/api/bots/{}/screen", a1.id),
+            &b_bot,
+            ""
+        )
+        .await
+        .0,
+        404
+    );
     let (_, list) = call(port, "GET", "/api/bots", &b_bot, "").await;
     assert!(list.contains(&b2.id) && !list.contains(&a1.id), "{list}");
-    let (_, res) = call(port, "GET", &format!("/api/bots/{}/messages", a1.id), &a_bot, "").await;
-    assert!(res.contains("ada-private-note"), "A's own Bot still reads its chat");
+    let (_, res) = call(
+        port,
+        "GET",
+        &format!("/api/bots/{}/messages", a1.id),
+        &a_bot,
+        "",
+    )
+    .await;
+    assert!(
+        res.contains("ada-private-note"),
+        "A's own Bot still reads its chat"
+    );
 
     // Leaving `from` out means itself; a new Bot it makes is its owner's.
     let (code, made) = call(port, "POST", "/api/bots", &b_bot, r#"{"name":"Child"}"#).await;
@@ -218,12 +416,26 @@ async fn a_bot_can_only_act_as_itself() {
     let other_start = BotKey(crate::random_hex(32), None).auth_as(&b1.id, &w.b_id);
     app.db.delete_bot(&b2.id);
     let gone = w.key.auth(&b2.id);
-    for (who, auth) in [("a deleted Bot", &gone), ("one shared token", &shared_style), ("B's MAC on A's id", &forged), ("another start's key", &other_start)] {
-        assert_eq!(call(port, "GET", "/api/bots", auth, "").await.0, 401, "{who}");
+    for (who, auth) in [
+        ("a deleted Bot", &gone),
+        ("one shared token", &shared_style),
+        ("B's MAC on A's id", &forged),
+        ("another start's key", &other_start),
+    ] {
+        assert_eq!(
+            call(port, "GET", "/api/bots", auth, "").await.0,
+            401,
+            "{who}"
+        );
     }
     // Failures are logged once per client per window; the first was the deleted Bot's.
     let failed = events(port, &w.admin, "action=auth.login_failed").await;
-    assert!(failed.iter().any(|e| e["details"]["reason"] == "bot_gone" && e["authMethod"] == "bot_token"), "{failed:?}");
+    assert!(
+        failed
+            .iter()
+            .any(|e| e["details"]["reason"] == "bot_gone" && e["authMethod"] == "bot_token"),
+        "{failed:?}"
+    );
 }
 
 #[tokio::test]
@@ -231,30 +443,94 @@ async fn a_bot_can_do_no_more_than_its_owner() {
     let w = world().await;
     let (port, app) = (w.port, &w.app);
     let (r_id, _) = user_with(port, &w.admin, "rae@example.com", "readonly").await;
-    let rb = app.db.create_bot_owned("Rae's", "#fff", "waddle", "claude", None, false, &r_id, Visibility::Private);
+    let rb = app.db.create_bot_owned(
+        "Rae's",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &r_id,
+        Visibility::Private,
+    );
     let r_bot = w.key.auth(&rb.id);
     assert_eq!(call(port, "GET", "/api/bots", &r_bot, "").await.0, 200);
     let (code, res) = call(port, "POST", "/api/bots", &r_bot, r#"{"name":"More"}"#).await;
     assert_eq!(code, 403, "a read-only user's Bot can't make Bots: {res}");
-    assert_eq!(call(port, "POST", &format!("/api/bots/{}/routines", rb.id), &r_bot, r#"{"name":"R","cron":"0 9 * * *","instruction":"x"}"#).await.0, 403);
+    assert_eq!(
+        call(
+            port,
+            "POST",
+            &format!("/api/bots/{}/routines", rb.id),
+            &r_bot,
+            r#"{"name":"R","cron":"0 9 * * *","instruction":"x"}"#
+        )
+        .await
+        .0,
+        403
+    );
     let denied = events(port, &w.admin, "action=access.denied").await;
-    assert!(denied.iter().any(|e| e["details"]["reason"] == "owner_role" && e["actorId"] == rb.id.as_str()));
+    assert!(
+        denied
+            .iter()
+            .any(|e| e["details"]["reason"] == "owner_role" && e["actorId"] == rb.id.as_str())
+    );
 
     // A disabled owner's Bot keeps nothing.
-    let ab = app.db.create_bot_owned("Ada's", "#fff", "waddle", "claude", None, false, &w.a_id, Visibility::Private);
+    let ab = app.db.create_bot_owned(
+        "Ada's",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &w.a_id,
+        Visibility::Private,
+    );
     let a_bot = w.key.auth(&ab.id);
-    assert!(call(port, "GET", "/api/bots", &a_bot, "").await.1.contains(&ab.id));
-    assert_eq!(call(port, "PATCH", &format!("/api/users/{}", w.a_id), &w.admin, r#"{"status":"disabled"}"#).await.0, 200);
+    assert!(
+        call(port, "GET", "/api/bots", &a_bot, "")
+            .await
+            .1
+            .contains(&ab.id)
+    );
+    assert_eq!(
+        call(
+            port,
+            "PATCH",
+            &format!("/api/users/{}", w.a_id),
+            &w.admin,
+            r#"{"status":"disabled"}"#
+        )
+        .await
+        .0,
+        200
+    );
     let (code, list) = call(port, "GET", "/api/bots", &a_bot, "").await;
     assert_eq!(code, 403, "{list}");
-    assert_eq!(call(port, "GET", &format!("/api/bots/{}/messages", ab.id), &a_bot, "").await.0, 403);
+    assert_eq!(
+        call(
+            port,
+            "GET",
+            &format!("/api/bots/{}/messages", ab.id),
+            &a_bot,
+            ""
+        )
+        .await
+        .0,
+        403
+    );
 }
 
 /// Opens the live stream as `auth` and waits for its headers.
 async fn open_stream(port: u16, auth: &str) -> tokio::net::TcpStream {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let req = format!("GET /api/events HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nAuthorization: {auth}\r\n\r\n");
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let req = format!(
+        "GET /api/events HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nAuthorization: {auth}\r\n\r\n"
+    );
     s.write_all(req.as_bytes()).await.unwrap();
     let mut first = [0u8; 12];
     s.read_exact(&mut first).await.unwrap();
@@ -265,32 +541,75 @@ async fn open_stream(port: u16, auth: &str) -> tokio::net::TcpStream {
 async fn closes(mut s: tokio::net::TcpStream) -> bool {
     use tokio::io::AsyncReadExt;
     let mut rest = Vec::new();
-    tokio::time::timeout(Duration::from_secs(3), s.read_to_end(&mut rest)).await.is_ok()
+    tokio::time::timeout(Duration::from_secs(3), s.read_to_end(&mut rest))
+        .await
+        .is_ok()
 }
 
 #[tokio::test]
 async fn a_bots_token_and_stream_end_when_its_owner_loses_it() {
     let w = world().await;
     let (port, app) = (w.port, &w.app);
-    let ab = app.db.create_bot_owned("Ada's", "#fff", "waddle", "claude", None, false, &w.a_id, Visibility::Private);
+    let ab = app.db.create_bot_owned(
+        "Ada's",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &w.a_id,
+        Visibility::Private,
+    );
     let old = w.key.auth(&ab.id);
 
     // Handed to Bea: Ada's run's token and stream stop; they'd otherwise act with Bea's access.
     let stream = open_stream(port, &old).await;
     let to_bea = json!({ "owner": w.b_id }).to_string();
-    assert_eq!(call(port, "PATCH", &format!("/api/bots/{}/access", ab.id), &w.admin, &to_bea).await.0, 200);
+    assert_eq!(
+        call(
+            port,
+            "PATCH",
+            &format!("/api/bots/{}/access", ab.id),
+            &w.admin,
+            &to_bea
+        )
+        .await
+        .0,
+        200
+    );
     assert!(closes(stream).await, "the old owner's stream is still open");
     assert_eq!(call(port, "GET", "/api/bots", &old, "").await.0, 401);
     let failed = events(port, &w.admin, "action=auth.login_failed").await;
-    assert!(failed.iter().any(|e| e["details"]["reason"] == "bot_moved"), "{failed:?}");
+    assert!(
+        failed.iter().any(|e| e["details"]["reason"] == "bot_moved"),
+        "{failed:?}"
+    );
     let new = w.key.auth(&ab.id);
     assert_ne!(new, old);
-    assert_eq!(call(port, "GET", "/api/bots", &new, "").await.0, 200, "runs for Bea get a token that works");
+    assert_eq!(
+        call(port, "GET", "/api/bots", &new, "").await.0,
+        200,
+        "runs for Bea get a token that works"
+    );
 
     // Its owner disabled: the stream closes.
     let stream = open_stream(port, &new).await;
-    assert_eq!(call(port, "PATCH", &format!("/api/users/{}", w.b_id), &w.admin, r#"{"status":"disabled"}"#).await.0, 200);
-    assert!(closes(stream).await, "a disabled owner's Bot keeps its stream");
+    assert_eq!(
+        call(
+            port,
+            "PATCH",
+            &format!("/api/users/{}", w.b_id),
+            &w.admin,
+            r#"{"status":"disabled"}"#
+        )
+        .await
+        .0,
+        200
+    );
+    assert!(
+        closes(stream).await,
+        "a disabled owner's Bot keeps its stream"
+    );
 }
 
 #[tokio::test]
@@ -298,8 +617,26 @@ async fn each_users_secrets_reach_only_their_bots() {
     let w = world().await;
     let (port, app) = (w.port, &w.app);
     fake_claude(app, "ISO_TEST_API_KEY");
-    let ab = app.db.create_bot_owned("Ada's", "#fff", "waddle", "claude", None, false, &w.a_id, Visibility::Private);
-    let bb = app.db.create_bot_owned("Bea's", "#fff", "waddle", "claude", None, false, &w.b_id, Visibility::Private);
+    let ab = app.db.create_bot_owned(
+        "Ada's",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &w.a_id,
+        Visibility::Private,
+    );
+    let bb = app.db.create_bot_owned(
+        "Bea's",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &w.b_id,
+        Visibility::Private,
+    );
     let value = format!("sk-ant-ada-{}", crate::random_hex(12));
     let put = json!({ "value": value }).to_string();
     let path = "/api/me/secrets/ISO_TEST_API_KEY";
@@ -312,25 +649,61 @@ async fn each_users_secrets_reach_only_their_bots() {
         assert_eq!(call(port, "GET", "/api/me/secrets", &auth, "").await.0, 403);
         assert_eq!(call(port, "DELETE", path, &auth, "").await.0, 403);
     }
-    for bad in ["PATH", "BOT_TOKEN", "LINODE_TOKEN", "TURNSTILE_SECRET", "SSO_X_CLIENT_SECRET", "lower"] {
-        assert_eq!(call(port, "PUT", &format!("/api/me/secrets/{bad}"), &w.a, &put).await.0, 400, "{bad}");
+    for bad in [
+        "PATH",
+        "BOT_TOKEN",
+        "LINODE_TOKEN",
+        "TURNSTILE_SECRET",
+        "SSO_X_CLIENT_SECRET",
+        "lower",
+    ] {
+        assert_eq!(
+            call(port, "PUT", &format!("/api/me/secrets/{bad}"), &w.a, &put)
+                .await
+                .0,
+            400,
+            "{bad}"
+        );
     }
     let (code, res) = call(port, "PUT", path, &w.a, &put).await;
     assert_eq!(code, 200, "{res}");
     assert!(!res.contains(&value));
     let (_, mine) = call(port, "GET", "/api/me/secrets", &w.a, "").await;
-    assert!(mine.contains("ISO_TEST_API_KEY") && !mine.contains(&value), "{mine}");
+    assert!(
+        mine.contains("ISO_TEST_API_KEY") && !mine.contains(&value),
+        "{mine}"
+    );
     let (_, theirs) = call(port, "GET", "/api/me/secrets", &w.b, "").await;
-    assert_eq!(parse(&theirs)["secrets"], json!([]), "Bea sees none of Ada's");
-    assert_eq!(call(port, "DELETE", path, &w.b, "").await.0, 404, "Bea can't delete Ada's");
-    assert!(crate::secrets::global().user_list(&w.a_id).unwrap().iter().any(|l| l.name == "ISO_TEST_API_KEY"));
+    assert_eq!(
+        parse(&theirs)["secrets"],
+        json!([]),
+        "Bea sees none of Ada's"
+    );
+    assert_eq!(
+        call(port, "DELETE", path, &w.b, "").await.0,
+        404,
+        "Bea can't delete Ada's"
+    );
+    assert!(
+        crate::secrets::global()
+            .user_list(&w.a_id)
+            .unwrap()
+            .iter()
+            .any(|l| l.name == "ISO_TEST_API_KEY")
+    );
     let (_, server_wide) = call(port, "GET", "/api/secrets", &w.admin, "").await;
-    assert!(!server_wide.contains("ISO_TEST_API_KEY"), "not a server-wide secret");
+    assert!(
+        !server_wide.contains("ISO_TEST_API_KEY"),
+        "not a server-wide secret"
+    );
 
     // Admins see the names, not the values; nobody else sees them at all.
     let admin_path = format!("/api/users/{}/secrets", w.a_id);
     let (code, listed) = call(port, "GET", &admin_path, &w.admin, "").await;
-    assert!(code == 200 && listed.contains("ISO_TEST_API_KEY") && !listed.contains(&value), "{code} {listed}");
+    assert!(
+        code == 200 && listed.contains("ISO_TEST_API_KEY") && !listed.contains(&value),
+        "{code} {listed}"
+    );
     for auth in [&w.b, &w.a, &w.key.auth(&ab.id)] {
         assert_eq!(call(port, "GET", &admin_path, auth, "").await.0, 403);
         assert_eq!(call(port, "DELETE", &admin_path, auth, "").await.0, 403);
@@ -338,23 +711,51 @@ async fn each_users_secrets_reach_only_their_bots() {
 
     // Ada's value is hidden where her Bots write, and nowhere else: saving a value
     // can't erase words from other people's chats.
-    let ada_msg = app.db.add_message(&ab.id, "user", &format!("deploy with {value}"), None, false, None);
-    let bea_msg = app.db.add_message(&bb.id, "user", &format!("deploy with {value}"), None, false, None);
+    let ada_msg = app.db.add_message(
+        &ab.id,
+        "user",
+        &format!("deploy with {value}"),
+        None,
+        false,
+        None,
+    );
+    let bea_msg = app.db.add_message(
+        &bb.id,
+        "user",
+        &format!("deploy with {value}"),
+        None,
+        false,
+        None,
+    );
     assert_eq!(ada_msg.text, "deploy with [redacted]");
-    assert_eq!(bea_msg.text, format!("deploy with {value}"), "Bea's own words stay hers");
+    assert_eq!(
+        bea_msg.text,
+        format!("deploy with {value}"),
+        "Bea's own words stay hers"
+    );
 
     // Ada's Bot gets it; Bea's doesn't. The reply that echoes it is redacted.
     let ada = run(&w, &w.a, &ab.id, "go").await;
-    assert!(ada.contains("key=[redacted]") && !ada.contains(&value), "{ada}");
+    assert!(
+        ada.contains("key=[redacted]") && !ada.contains(&value),
+        "{ada}"
+    );
     let bea = run(&w, &w.b, &bb.id, "go").await;
     assert!(bea.contains("key=none"), "{bea}");
 
     let audit = events(port, &w.admin, "action=secret.*").await;
-    assert!(audit.iter().any(|e| e["action"] == "secret.set" && e["details"]["scope"] == "user" && e["details"]["userId"] == w.a_id.as_str()));
+    assert!(audit.iter().any(|e| e["action"] == "secret.set"
+        && e["details"]["scope"] == "user"
+        && e["details"]["userId"] == w.a_id.as_str()));
     assert!(!serde_json::to_string(&audit).unwrap().contains(&value));
     let (code, gone) = call(port, "DELETE", &admin_path, &w.admin, "").await;
     assert_eq!((code, parse(&gone)["deleted"].as_u64()), (200, Some(1)));
-    assert!(crate::secrets::global().user_list(&w.a_id).unwrap().is_empty());
+    assert!(
+        crate::secrets::global()
+            .user_list(&w.a_id)
+            .unwrap()
+            .is_empty()
+    );
     crate::secrets::redact::forget_for(&w.a_id, &value);
 }
 
@@ -369,61 +770,134 @@ async fn personal_secrets_with_the_same_name_stay_apart() {
     let ada_v = format!("sk-ada-{}", crate::random_hex(12));
     let bea_v = format!("sk-bea-{}", crate::random_hex(12));
     let body = |v: &str| json!({ "value": v }).to_string();
-    let env_of = |u: &str| crate::secrets::global().harness_env_for(u).into_iter().find(|(n, _)| n == name).map(|(_, v)| v.expose().to_string());
+    let env_of = |u: &str| {
+        crate::secrets::global()
+            .harness_env_for(u)
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.expose().to_string())
+    };
 
     let (code, res) = call(port, "PUT", &path, &w.a, &body(&ada_v)).await;
     assert_eq!(code, 200, "{res}");
     let saved = parse(&res)["secret"].clone();
-    assert!(saved["name"] == name && saved["createdAt"].is_i64() && saved["updatedAt"].is_i64() && saved["overrides"] == false, "{saved}");
+    assert!(
+        saved["name"] == name
+            && saved["createdAt"].is_i64()
+            && saved["updatedAt"].is_i64()
+            && saved["overrides"] == false,
+        "{saved}"
+    );
     assert_eq!(call(port, "PUT", &path, &w.b, &body(&bea_v)).await.0, 200);
 
     // Each sees and gets only their own.
-    for (who, id, mine, theirs) in [(&w.a, &w.a_id, &ada_v, &bea_v), (&w.b, &w.b_id, &bea_v, &ada_v)] {
+    for (who, id, mine, theirs) in [
+        (&w.a, &w.a_id, &ada_v, &bea_v),
+        (&w.b, &w.b_id, &bea_v, &ada_v),
+    ] {
         let (_, list) = call(port, "GET", "/api/me/secrets", who, "").await;
-        assert_eq!(parse(&list)["secrets"].as_array().map(|a| a.len()), Some(1), "{list}");
-        assert!(!list.contains(mine.as_str()) && !list.contains(theirs.as_str()), "{list}");
+        assert_eq!(
+            parse(&list)["secrets"].as_array().map(|a| a.len()),
+            Some(1),
+            "{list}"
+        );
+        assert!(
+            !list.contains(mine.as_str()) && !list.contains(theirs.as_str()),
+            "{list}"
+        );
         assert_eq!(env_of(id).as_deref(), Some(mine.as_str()));
     }
     let (_, admins) = call(port, "GET", "/api/me/secrets", &w.admin, "").await;
-    assert!(!admins.contains(name), "an admin's own list isn't everyone's: {admins}");
+    assert!(
+        !admins.contains(name),
+        "an admin's own list isn't everyone's: {admins}"
+    );
 
     // Ada replaces hers; Bea's stays.
     let ada_v2 = format!("sk-ada2-{}", crate::random_hex(12));
     let (code, res) = call(port, "PUT", &path, &w.a, &body(&ada_v2)).await;
     assert_eq!(code, 200, "{res}");
-    assert_eq!(parse(&res)["secret"]["createdAt"], saved["createdAt"], "replacing keeps when it was first saved");
+    assert_eq!(
+        parse(&res)["secret"]["createdAt"],
+        saved["createdAt"],
+        "replacing keeps when it was first saved"
+    );
     assert_eq!(env_of(&w.a_id).as_deref(), Some(ada_v2.as_str()));
     assert_eq!(env_of(&w.b_id).as_deref(), Some(bea_v.as_str()));
 
     // A server-wide secret of the same name: each person's own still wins for their Bots.
     let server_v = format!("sk-server-{}", crate::random_hex(12));
-    assert_eq!(call(port, "PUT", &format!("/api/secrets/{name}"), &w.admin, &body(&server_v)).await.0, 200);
+    assert_eq!(
+        call(
+            port,
+            "PUT",
+            &format!("/api/secrets/{name}"),
+            &w.admin,
+            &body(&server_v)
+        )
+        .await
+        .0,
+        200
+    );
     let (_, list) = call(port, "GET", "/api/me/secrets", &w.a, "").await;
     assert_eq!(parse(&list)["secrets"][0]["overrides"], true, "{list}");
     assert_eq!(env_of(&w.a_id).as_deref(), Some(ada_v2.as_str()));
 
     // Bea deletes hers: Ada's is untouched, and Bea's Bots fall back to the server's.
     assert_eq!(call(port, "DELETE", &path, &w.b, "").await.0, 200);
-    assert_eq!(call(port, "DELETE", &path, &w.b, "").await.0, 404, "already gone, and Ada's isn't hers to delete");
+    assert_eq!(
+        call(port, "DELETE", &path, &w.b, "").await.0,
+        404,
+        "already gone, and Ada's isn't hers to delete"
+    );
     assert_eq!(env_of(&w.a_id).as_deref(), Some(ada_v2.as_str()));
     assert_eq!(env_of(&w.b_id).as_deref(), Some(server_v.as_str()));
     let (_, list) = call(port, "GET", "/api/me/secrets", &w.b, "").await;
     assert_eq!(parse(&list)["secrets"], json!([]));
-    assert_eq!(call(port, "DELETE", &format!("/api/secrets/{name}"), &w.admin, "").await.0, 200);
+    assert_eq!(
+        call(
+            port,
+            "DELETE",
+            &format!("/api/secrets/{name}"),
+            &w.admin,
+            ""
+        )
+        .await
+        .0,
+        200
+    );
 
     // Read-only people can see their list but not change it.
     let (_, viewer) = user_with(port, &w.admin, "rory@example.com", "readonly").await;
     let (code, list) = call(port, "GET", "/api/me/secrets", &viewer, "").await;
-    assert!(code == 200 && parse(&list)["secrets"] == json!([]), "{code} {list}");
-    assert_eq!(call(port, "PUT", &path, &viewer, &body("x-value")).await.0, 403);
+    assert!(
+        code == 200 && parse(&list)["secrets"] == json!([]),
+        "{code} {list}"
+    );
+    assert_eq!(
+        call(port, "PUT", &path, &viewer, &body("x-value")).await.0,
+        403
+    );
     assert_eq!(call(port, "DELETE", &path, &viewer, "").await.0, 403);
 
     // Audited with who did it and whether it replaced a value; never the value.
     let audit = events(port, &w.admin, "action=secret.*").await;
-    let mine: Vec<_> = audit.iter().filter(|e| e["targetId"] == name && e["details"]["userId"] == w.a_id.as_str()).collect();
-    assert!(mine.iter().any(|e| e["details"]["replaced"] == false) && mine.iter().any(|e| e["details"]["replaced"] == true), "{mine:?}");
-    assert!(mine.iter().all(|e| e["actorEmail"] == "ada@example.com"), "{mine:?}");
-    assert!(audit.iter().any(|e| e["action"] == "secret.deleted" && e["details"]["userId"] == w.b_id.as_str() && e["actorEmail"] == "bea@example.com"));
+    let mine: Vec<_> = audit
+        .iter()
+        .filter(|e| e["targetId"] == name && e["details"]["userId"] == w.a_id.as_str())
+        .collect();
+    assert!(
+        mine.iter().any(|e| e["details"]["replaced"] == false)
+            && mine.iter().any(|e| e["details"]["replaced"] == true),
+        "{mine:?}"
+    );
+    assert!(
+        mine.iter().all(|e| e["actorEmail"] == "ada@example.com"),
+        "{mine:?}"
+    );
+    assert!(audit.iter().any(|e| e["action"] == "secret.deleted"
+        && e["details"]["userId"] == w.b_id.as_str()
+        && e["actorEmail"] == "bea@example.com"));
     let text = serde_json::to_string(&audit).unwrap();
     for v in [&ada_v, &ada_v2, &bea_v, &server_v] {
         assert!(!text.contains(v.as_str()), "a value reached the audit log");
@@ -440,8 +914,26 @@ async fn each_users_bots_work_in_their_own_folder() {
     let w = world().await;
     let (port, app) = (w.port, &w.app);
     fake_claude(app, "UNSET_VAR");
-    let ab = app.db.create_bot_owned("Ada's", "#fff", "waddle", "claude", None, false, &w.a_id, Visibility::Private);
-    let bb = app.db.create_bot_owned("Bea's", "#fff", "waddle", "claude", None, false, &w.b_id, Visibility::Private);
+    let ab = app.db.create_bot_owned(
+        "Ada's",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &w.a_id,
+        Visibility::Private,
+    );
+    let bb = app.db.create_bot_owned(
+        "Bea's",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &w.b_id,
+        Visibility::Private,
+    );
     let ws = crate::paths::canonical(&app.cfg.workspace).unwrap();
     let ada = run(&w, &w.a, &ab.id, "where are you?").await;
     let bea = run(&w, &w.b, &bb.id, "where are you?").await;
@@ -451,12 +943,31 @@ async fn each_users_bots_work_in_their_own_folder() {
     assert!(bea.contains(&format!("cwd={}", b_dir.display())), "{bea}");
     assert_ne!(app.user_file(&w.a_id), app.user_file(&w.b_id));
     let facts = |u: &str| std::fs::read_to_string(app.user_file(u).unwrap()).unwrap();
-    assert!(facts(&w.a_id).contains("- Name: ada") && facts(&w.b_id).contains("- Name: bea"), "{} {}", facts(&w.a_id), facts(&w.b_id));
-    assert!(!app.cfg.data_dir.join("USER.md").exists(), "no facts file shared by every user");
+    assert!(
+        facts(&w.a_id).contains("- Name: ada") && facts(&w.b_id).contains("- Name: bea"),
+        "{} {}",
+        facts(&w.a_id),
+        facts(&w.b_id)
+    );
+    assert!(
+        !app.cfg.data_dir.join("USER.md").exists(),
+        "no facts file shared by every user"
+    );
     // No route serves files, so B has no way to A's folder through the API, and the
     // approval policy counts A's folder as outside B's Bot's workspace.
     assert_eq!(app.policy_ctx(&bb).workspace, b_dir);
-    assert_eq!(call(port, "GET", &format!("/api/users/{}/bots", w.a_id), &w.b, "").await.0, 403);
+    assert_eq!(
+        call(
+            port,
+            "GET",
+            &format!("/api/users/{}/bots", w.a_id),
+            &w.b,
+            ""
+        )
+        .await
+        .0,
+        403
+    );
 }
 
 #[tokio::test]
@@ -465,29 +976,103 @@ async fn shared_bots_work_for_others_but_stay_their_owners() {
     let (port, app) = (w.port, &w.app);
     fake_claude(app, "ISO_SHARED_KEY");
     let value = format!("sk-shared-ada-{}", crate::random_hex(10));
-    crate::secrets::global().user_put(&w.a_id, "ISO_SHARED_KEY", &value).unwrap();
-    let shared = app.db.create_bot_owned("Team", "#fff", "waddle", "claude", None, false, &w.a_id, Visibility::Shared);
-    let granted = app.db.create_bot_owned("Granted", "#fff", "waddle", "claude", None, false, &w.a_id, Visibility::Private);
-    assert_eq!(call(port, "PUT", &format!("/api/bots/{}/grants/{}", granted.id, w.b_id), &w.a, r#"{"level":"operator"}"#).await.0, 200);
-    let a_dir = crate::paths::canonical(&app.cfg.workspace).unwrap().join("users").join(&w.a_id);
+    crate::secrets::global()
+        .user_put(&w.a_id, "ISO_SHARED_KEY", &value)
+        .unwrap();
+    let shared = app.db.create_bot_owned(
+        "Team",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &w.a_id,
+        Visibility::Shared,
+    );
+    let granted = app.db.create_bot_owned(
+        "Granted",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &w.a_id,
+        Visibility::Private,
+    );
+    assert_eq!(
+        call(
+            port,
+            "PUT",
+            &format!("/api/bots/{}/grants/{}", granted.id, w.b_id),
+            &w.a,
+            r#"{"level":"operator"}"#
+        )
+        .await
+        .0,
+        200
+    );
+    let a_dir = crate::paths::canonical(&app.cfg.workspace)
+        .unwrap()
+        .join("users")
+        .join(&w.a_id);
 
     for bot in [&shared, &granted] {
         // Bea can use it: chat, its screen, its routines.
         let (_, list) = call(port, "GET", "/api/bots", &w.b, "").await;
         assert!(list.contains(&bot.id), "{list}");
-        let (code, res) = call(port, "GET", &format!("/api/bots/{}/screen", bot.id), &w.b, "").await;
-        assert!(code == 404 && res.contains("Screens are off"), "past the ACL: {res}");
-        assert_eq!(call(port, "POST", &format!("/api/bots/{}/routines", bot.id), &w.b, r#"{"name":"R","cron":"0 9 * * *","instruction":"x"}"#).await.0, 201);
+        let (code, res) = call(
+            port,
+            "GET",
+            &format!("/api/bots/{}/screen", bot.id),
+            &w.b,
+            "",
+        )
+        .await;
+        assert!(
+            code == 404 && res.contains("Screens are off"),
+            "past the ACL: {res}"
+        );
+        assert_eq!(
+            call(
+                port,
+                "POST",
+                &format!("/api/bots/{}/routines", bot.id),
+                &w.b,
+                r#"{"name":"R","cron":"0 9 * * *","instruction":"x"}"#
+            )
+            .await
+            .0,
+            201
+        );
         // It still runs as Ada's: in her folder, with her keys.
         let reply = run(&w, &w.b, &bot.id, "status").await;
-        assert!(reply.contains(&format!("cwd={}", a_dir.display())) && reply.contains("key=[redacted]"), "{reply}");
+        assert!(
+            reply.contains(&format!("cwd={}", a_dir.display())) && reply.contains("key=[redacted]"),
+            "{reply}"
+        );
         // Bea can't make it hers or change who sees it.
         for (m, p, b) in [
-            ("PATCH", format!("/api/bots/{}", bot.id), r#"{"name":"Bea's now"}"#.to_string()),
+            (
+                "PATCH",
+                format!("/api/bots/{}", bot.id),
+                r#"{"name":"Bea's now"}"#.to_string(),
+            ),
             ("DELETE", format!("/api/bots/{}", bot.id), String::new()),
-            ("PATCH", format!("/api/bots/{}/access", bot.id), r#"{"visibility":"private"}"#.to_string()),
-            ("PATCH", format!("/api/bots/{}/access", bot.id), json!({ "owner": w.b_id }).to_string()),
-            ("PUT", format!("/api/bots/{}/grants/{}", bot.id, w.b_id), r#"{"level":"operator"}"#.to_string()),
+            (
+                "PATCH",
+                format!("/api/bots/{}/access", bot.id),
+                r#"{"visibility":"private"}"#.to_string(),
+            ),
+            (
+                "PATCH",
+                format!("/api/bots/{}/access", bot.id),
+                json!({ "owner": w.b_id }).to_string(),
+            ),
+            (
+                "PUT",
+                format!("/api/bots/{}/grants/{}", bot.id, w.b_id),
+                r#"{"level":"operator"}"#.to_string(),
+            ),
         ] {
             let (code, res) = call(port, m, &p, &w.b, &b).await;
             assert_eq!(code, 403, "{m} {p}: {res}");
@@ -495,14 +1080,48 @@ async fn shared_bots_work_for_others_but_stay_their_owners() {
         assert_eq!(app.db.bot(&bot.id).unwrap().owner_id, w.a_id);
     }
     // Bea's own Bot can ask the shared one, which still answers from Ada's space.
-    let bb = app.db.create_bot_owned("Bea's", "#fff", "waddle", "claude", None, false, &w.b_id, Visibility::Private);
+    let bb = app.db.create_bot_owned(
+        "Bea's",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &w.b_id,
+        Visibility::Private,
+    );
     let ask = json!({ "to": shared.id, "text": "status?" }).to_string();
     let (code, reply) = call(port, "POST", "/api/ask", &w.key.auth(&bb.id), &ask).await;
     assert_eq!(code, 200, "{reply}");
-    assert!(reply.contains(&format!("cwd={}", a_dir.display())), "{reply}");
+    assert!(
+        reply.contains(&format!("cwd={}", a_dir.display())),
+        "{reply}"
+    );
     // Revoking the grant ends it.
-    assert_eq!(call(port, "DELETE", &format!("/api/bots/{}/grants/{}", granted.id, w.b_id), &w.a, "").await.0, 200);
-    assert_eq!(call(port, "GET", &format!("/api/bots/{}/messages", granted.id), &w.b, "").await.0, 404);
+    assert_eq!(
+        call(
+            port,
+            "DELETE",
+            &format!("/api/bots/{}/grants/{}", granted.id, w.b_id),
+            &w.a,
+            ""
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        call(
+            port,
+            "GET",
+            &format!("/api/bots/{}/messages", granted.id),
+            &w.b,
+            ""
+        )
+        .await
+        .0,
+        404
+    );
     crate::secrets::global().user_forget(&w.a_id).unwrap();
     crate::secrets::redact::forget_for(&w.a_id, &value);
 }
@@ -517,7 +1136,13 @@ async fn people_reach_only_their_own_sessions() {
     };
     for (m, p) in [
         ("GET", "/api/sessions".to_string()),
-        ("DELETE", format!("/api/sessions/{}", a_session.clone().unwrap_or_else(|| "s1".into()))),
+        (
+            "DELETE",
+            format!(
+                "/api/sessions/{}",
+                a_session.clone().unwrap_or_else(|| "s1".into())
+            ),
+        ),
         ("DELETE", format!("/api/users/{}/sessions", w.a_id)),
         ("GET", format!("/api/users/{}", w.a_id)),
         ("GET", format!("/api/users/{}/bots", w.a_id)),
@@ -526,9 +1151,16 @@ async fn people_reach_only_their_own_sessions() {
     ] {
         assert_eq!(call(port, m, &p, &w.b, "").await.0, 403, "{m} {p}");
     }
-    assert_eq!(call(port, "GET", "/api/auth/me", &w.a, "").await.0, 200, "Ada's session lives");
+    assert_eq!(
+        call(port, "GET", "/api/auth/me", &w.a, "").await.0,
+        200,
+        "Ada's session lives"
+    );
     // Bea's sign-out ends her session only.
-    assert_eq!(call(port, "POST", "/api/auth/logout", &w.b, "").await.0, 200);
+    assert_eq!(
+        call(port, "POST", "/api/auth/logout", &w.b, "").await.0,
+        200
+    );
     assert_eq!(call(port, "GET", "/api/auth/me", &w.b, "").await.0, 401);
     assert_eq!(call(port, "GET", "/api/auth/me", &w.a, "").await.0, 200);
 }
@@ -538,7 +1170,10 @@ async fn with_routing_on_a_bot_runs_only_on_its_owners_machine() {
     use crate::machines::route::Routing;
     let fake = Arc::new(Fake::default());
     let link = Arc::new(Recording::default());
-    let (p, l): (Arc<dyn MachineProvider>, Arc<dyn crate::machines::route::MachineLink>) = (fake.clone(), link.clone());
+    let (p, l): (
+        Arc<dyn MachineProvider>,
+        Arc<dyn crate::machines::route::MachineLink>,
+    ) = (fake.clone(), link.clone());
     let (port, app, owner, key) = serve_app_with(|a| {
         let mut cp = ControlPlane::for_tests(p);
         (cp.routing, cp.link) = (Routing::On, l);
@@ -548,34 +1183,123 @@ async fn with_routing_on_a_bot_runs_only_on_its_owners_machine() {
     let (_, admin) = user_with(port, &owner, "ops@example.com", "admin").await;
     let (a_id, a) = user_with(port, &admin, "ada@example.com", "member").await;
     let (b_id, b) = user_with(port, &admin, "bea@example.com", "member").await;
-    let w = World { port, app: app.clone(), admin: admin.clone(), key, a_id: a_id.clone(), a: a.clone(), b_id: b_id.clone(), b: b.clone() };
+    let w = World {
+        port,
+        app: app.clone(),
+        admin: admin.clone(),
+        key,
+        a_id: a_id.clone(),
+        a: a.clone(),
+        b_id: b_id.clone(),
+        b: b.clone(),
+    };
     fake_claude(&app, "UNSET_VAR");
-    let ab = app.db.create_bot_owned("Ada's", "#fff", "waddle", "claude", None, false, &a_id, Visibility::Private);
-    let team = app.db.create_bot_owned("Team", "#fff", "waddle", "claude", None, false, &a_id, Visibility::Shared);
-    let bb = app.db.create_bot_owned("Bea's", "#fff", "waddle", "claude", None, false, &b_id, Visibility::Private);
+    let ab = app.db.create_bot_owned(
+        "Ada's",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &a_id,
+        Visibility::Private,
+    );
+    let team = app.db.create_bot_owned(
+        "Team",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &a_id,
+        Visibility::Shared,
+    );
+    let bb = app.db.create_bot_owned(
+        "Bea's",
+        "#fff",
+        "waddle",
+        "claude",
+        None,
+        false,
+        &b_id,
+        Visibility::Private,
+    );
 
     // Ada's machine isn't up yet: her Bots don't run, here or anywhere.
-    assert_eq!(call(port, "POST", &format!("/api/users/{a_id}/machine"), &admin, "{}").await.0, 202);
+    assert_eq!(
+        call(
+            port,
+            "POST",
+            &format!("/api/users/{a_id}/machine"),
+            &admin,
+            "{}"
+        )
+        .await
+        .0,
+        202
+    );
     let said = run(&w, &a, &ab.id, "hi").await;
     assert!(said.contains("isn't assigned to you"), "{said}");
-    let (code, v) = call(port, "PUT", &format!("/api/users/{a_id}/placement"), &admin, "").await;
-    assert_eq!(code, 409, "only a running, enrolled machine can be assigned: {v}");
+    let (code, v) = call(
+        port,
+        "PUT",
+        &format!("/api/users/{a_id}/placement"),
+        &admin,
+        "",
+    )
+    .await;
+    assert_eq!(
+        code, 409,
+        "only a running, enrolled machine can be assigned: {v}"
+    );
     let (code, v) = call(port, "POST", "/api/machines/reconcile", &admin, "").await;
     assert_eq!(code, 200, "{v}");
     let machine = app.db.user_machine(&a_id).unwrap();
     assert_eq!(machine.state, crate::machines::State::Running);
     crate::machines::route::recording::enroll(&app.db, &machine);
-    assert_eq!(call(port, "PUT", &format!("/api/users/{a_id}/placement"), &b, "").await.0, 403, "admins only");
-    let (code, v) = call(port, "PUT", &format!("/api/users/{a_id}/placement"), &admin, "").await;
+    assert_eq!(
+        call(port, "PUT", &format!("/api/users/{a_id}/placement"), &b, "")
+            .await
+            .0,
+        403,
+        "admins only"
+    );
+    let (code, v) = call(
+        port,
+        "PUT",
+        &format!("/api/users/{a_id}/placement"),
+        &admin,
+        "",
+    )
+    .await;
     assert_eq!(code, 200, "{v}");
-    assert_eq!((parse(&v)["runsOn"].as_str(), parse(&v)["assigned"].as_bool()), (Some("machine"), Some(true)), "{v}");
+    assert_eq!(
+        (
+            parse(&v)["runsOn"].as_str(),
+            parse(&v)["assigned"].as_bool()
+        ),
+        (Some("machine"), Some(true)),
+        "{v}"
+    );
     let assigned = events(port, &admin, "action=placement.assigned").await;
-    assert!(assigned.iter().any(|e| e["details"]["routing"] == "on" && e["targetId"] == machine.id.as_str()), "{assigned:?}");
+    assert!(
+        assigned
+            .iter()
+            .any(|e| e["details"]["routing"] == "on" && e["targetId"] == machine.id.as_str()),
+        "{assigned:?}"
+    );
 
     // Running: Ada's work goes to her machine, and nothing runs here.
     for (who, bot) in [(&a, &ab), (&b, &team)] {
         let before = link.sent.lock().unwrap().len();
-        let (code, m) = call(port, "POST", &format!("/api/bots/{}/messages", bot.id), who, r#"{"text":"go"}"#).await;
+        let (code, m) = call(
+            port,
+            "POST",
+            &format!("/api/bots/{}/messages", bot.id),
+            who,
+            r#"{"text":"go"}"#,
+        )
+        .await;
         assert_eq!(code, 202, "{m}");
         let id = parse(&m)["id"].as_i64().unwrap();
         for _ in 0..200 {
@@ -585,23 +1309,64 @@ async fn with_routing_on_a_bot_runs_only_on_its_owners_machine() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let sent = link.sent.lock().unwrap().last().cloned().unwrap();
-        assert_eq!((sent.0.machine_id.as_str(), sent.0.user_id.as_str()), (machine.id.as_str(), a_id.as_str()), "the owner's machine, whoever asked");
-        assert_eq!((sent.1.bot_id.as_str(), sent.1.owner_id.as_str(), sent.1.message_id), (bot.id.as_str(), a_id.as_str(), id));
-        assert_eq!(sent.1.cwd, "/home/bots/work", "the machine's folders, not this server's");
-        assert!(!sent.1.env.contains_key("PATH") && sent.1.env.get("BOT_API").map(String::as_str) == Some("http://127.0.0.1:7444"));
+        assert_eq!(
+            (sent.0.machine_id.as_str(), sent.0.user_id.as_str()),
+            (machine.id.as_str(), a_id.as_str()),
+            "the owner's machine, whoever asked"
+        );
+        assert_eq!(
+            (
+                sent.1.bot_id.as_str(),
+                sent.1.owner_id.as_str(),
+                sent.1.message_id
+            ),
+            (bot.id.as_str(), a_id.as_str(), id)
+        );
+        assert_eq!(
+            sent.1.cwd, "/home/bots/work",
+            "the machine's folders, not this server's"
+        );
+        assert!(
+            !sent.1.env.contains_key("PATH")
+                && sent.1.env.get("BOT_API").map(String::as_str) == Some("http://127.0.0.1:7444")
+        );
     }
     let routed = events(port, &admin, "action=bot.run_routed").await;
     assert_eq!(routed.len(), 2);
-    assert!(routed.iter().all(|e| e["details"]["machine"] == machine.id.as_str() && e["details"]["link"] == "recording"));
-    let invoked = events(port, &admin, &format!("action=harness.invoked&bot={}", ab.id)).await;
-    assert!(!invoked.is_empty() && invoked.iter().all(|e| e["details"]["host"] == "machine"), "nothing ran on this server: {invoked:?}");
+    assert!(
+        routed
+            .iter()
+            .all(|e| e["details"]["machine"] == machine.id.as_str()
+                && e["details"]["link"] == "recording")
+    );
+    let invoked = events(
+        port,
+        &admin,
+        &format!("action=harness.invoked&bot={}", ab.id),
+    )
+    .await;
+    assert!(
+        !invoked.is_empty() && invoked.iter().all(|e| e["details"]["host"] == "machine"),
+        "nothing ran on this server: {invoked:?}"
+    );
 
     // Bea has no machine: her Bot is refused, not run on Ada's or here.
     let said = run(&w, &b, &bb.id, "hi").await;
     assert!(said.contains("you don't have a computer"), "{said}");
-    assert!(link.sent.lock().unwrap().iter().all(|(to, job)| to.user_id == a_id && job.owner_id == a_id));
+    assert!(
+        link.sent
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(to, job)| to.user_id == a_id && job.owner_id == a_id)
+    );
     let refused = events(port, &admin, "action=bot.run_refused").await;
-    assert!(refused.iter().any(|e| e["botId"] == bb.id.as_str() && e["details"]["reason"] == "no_machine" && e["outcome"] == "denied"), "{refused:?}");
+    assert!(
+        refused.iter().any(|e| e["botId"] == bb.id.as_str()
+            && e["details"]["reason"] == "no_machine"
+            && e["outcome"] == "denied"),
+        "{refused:?}"
+    );
 
     // Her agent doesn't answer: refused, and said why.
     *link.heartbeat.lock().unwrap() = Err("connection refused".into());
@@ -610,22 +1375,53 @@ async fn with_routing_on_a_bot_runs_only_on_its_owners_machine() {
     *link.heartbeat.lock().unwrap() = Recording::default().heartbeat.into_inner().unwrap();
 
     // Suspended: refused again.
-    assert_eq!(call(port, "POST", &format!("/api/users/{a_id}/machine/suspend"), &admin, "").await.0, 200);
+    assert_eq!(
+        call(
+            port,
+            "POST",
+            &format!("/api/users/{a_id}/machine/suspend"),
+            &admin,
+            ""
+        )
+        .await
+        .0,
+        200
+    );
     let said = run(&w, &a, &ab.id, "hi").await;
     assert!(said.contains("suspended"), "{said}");
     assert_eq!(fake.calls("create"), 1);
 
     // Unassigned: refused under `on`, with the reason.
-    let (code, v) = call(port, "DELETE", &format!("/api/users/{a_id}/placement"), &admin, "").await;
-    assert_eq!((code, parse(&v)["runsOn"].as_str()), (200, Some("nowhere")), "{v}");
-    assert!(!events(port, &admin, "action=placement.unassigned").await.is_empty());
+    let (code, v) = call(
+        port,
+        "DELETE",
+        &format!("/api/users/{a_id}/placement"),
+        &admin,
+        "",
+    )
+    .await;
+    assert_eq!(
+        (code, parse(&v)["runsOn"].as_str()),
+        (200, Some("nowhere")),
+        "{v}"
+    );
+    assert!(
+        !events(port, &admin, "action=placement.unassigned")
+            .await
+            .is_empty()
+    );
 }
 
 #[test]
 fn the_unenrolled_link_refuses_every_job() {
     use crate::machines::route::{Assigned, MachineLink, Unenrolled};
     use crate::machines::wire::JobEvent;
-    let to = Assigned { machine_id: "m1".into(), user_id: "u1".into(), address: Some("192.0.2.1".into()), pins: vec![] };
+    let to = Assigned {
+        machine_id: "m1".into(),
+        user_id: "u1".into(),
+        address: Some("192.0.2.1".into()),
+        pins: vec![],
+    };
     let job: crate::machines::wire::JobRequest = serde_json::from_value(json!({
         "protocol": 1, "jobId": "j1", "botId": "b1", "ownerId": "u1", "messageId": 1, "bin": "claude", "args": [], "env": {}, "cwd": "/",
         "stdin": null, "files": [], "cleanup": null, "collect": []
@@ -633,8 +1429,12 @@ fn the_unenrolled_link_refuses_every_job() {
     .unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::channel(4);
     let (_abort_tx, abort) = tokio::sync::watch::channel(None);
-    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
     rt.block_on(Unenrolled.run(&to, job, abort, tx));
-    let Some(JobEvent::Error { message }) = rx.try_recv().ok() else { panic!("an error") };
+    let Some(JobEvent::Error { message }) = rx.try_recv().ok() else {
+        panic!("an error")
+    };
     assert!(message.contains("can't reach machines"), "{message}");
 }

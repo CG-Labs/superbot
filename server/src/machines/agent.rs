@@ -201,15 +201,21 @@ impl Config {
             return Err("SUPERBOT_BOT_USER must be a plain user name, not root".into());
         }
         let max_screens = var("SUPERBOT_MAX_SCREENS")
-            .map(|v| v.parse::<u32>().map_err(|_| "SUPERBOT_MAX_SCREENS must be a number"))
+            .map(|v| {
+                v.parse::<u32>()
+                    .map_err(|_| "SUPERBOT_MAX_SCREENS must be a number")
+            })
             .transpose()?
             .unwrap_or(4)
             .clamp(1, 50);
         let teammates = var("SUPERBOT_TEAMMATES")
             .map(PathBuf::from)
             .unwrap_or_else(|| state_dir.join("teammates"));
-        if !teammates.is_absolute() || teammates.starts_with(&home) || home.starts_with(&teammates) {
-            return Err("SUPERBOT_TEAMMATES must be an absolute path apart from SUPERBOT_HOME".into());
+        if !teammates.is_absolute() || teammates.starts_with(&home) || home.starts_with(&teammates)
+        {
+            return Err(
+                "SUPERBOT_TEAMMATES must be an absolute path apart from SUPERBOT_HOME".into(),
+            );
         }
         Ok(Config {
             control_url,
@@ -225,7 +231,9 @@ impl Config {
             harness_path,
             max_jobs,
             tools,
-            exe: var("SUPERBOT_AGENT_BIN").unwrap_or_else(|| AGENT_BIN.into()).into(),
+            exe: var("SUPERBOT_AGENT_BIN")
+                .unwrap_or_else(|| AGENT_BIN.into())
+                .into(),
             bot_user,
             allow_own_user: false,
             screens: display::Settings {
@@ -249,7 +257,10 @@ impl Config {
             botctl: runnable(&self.botctl, &self.roots()).then(|| p(self.botctl.clone())),
             // Checked as the Bots' user in the heartbeat's `layout`.
             sandbox: None,
-            caches: crate::sandbox::caches(&self.home).into_iter().map(p).collect(),
+            caches: crate::sandbox::caches(&self.home)
+                .into_iter()
+                .map(p)
+                .collect(),
         }
     }
 
@@ -293,17 +304,28 @@ impl Config {
             ("USER".to_string(), t.user.clone()),
             ("LOGNAME".to_string(), t.user.clone()),
         ]);
-        job::Host { clear_env: true, remove: Vec::new(), env, user: Some(t.ids) }
+        job::Host {
+            clear_env: true,
+            remove: Vec::new(),
+            env,
+            user: Some(t.ids),
+        }
     }
 
     /// Why `ids` can't be the Bots' user, if it can't.
     fn check_bot_ids(&self, ids: Ids) -> Result<(), String> {
         if ids.uid == 0 || ids.gid == 0 {
-            return Err(format!("{} is root or in root's group; Bots can't run as it.", self.bot_user));
+            return Err(format!(
+                "{} is root or in root's group; Bots can't run as it.",
+                self.bot_user
+            ));
         }
         // SAFETY: no arguments.
         if ids.uid == unsafe { libc::geteuid() } && !self.allow_own_user {
-            return Err(format!("{} is the agent's own user; Bots need their own.", self.bot_user));
+            return Err(format!(
+                "{} is the agent's own user; Bots need their own.",
+                self.bot_user
+            ));
         }
         Ok(())
     }
@@ -311,7 +333,8 @@ impl Config {
     /// The state folder lets the Bots' user through to its home and the tools; the
     /// tools are readable by it. systemd makes the folder 0700 at every start.
     fn open_paths(&self, tools: &Tools) -> Result<(), String> {
-        runas::chmod_dir(&self.state_dir, 0o711).map_err(|e| format!("{}: {e}", self.state_dir.display()))?;
+        runas::chmod_dir(&self.state_dir, 0o711)
+            .map_err(|e| format!("{}: {e}", self.state_dir.display()))?;
         tools.open_up()
     }
 
@@ -678,16 +701,33 @@ struct SavedBotUser {
 }
 
 fn save_bot_user(cfg: &Config, ids: Ids, handed: bool) -> Result<(), String> {
-    let saved = SavedBotUser { user: cfg.bot_user.clone(), uid: ids.uid, gid: ids.gid, handed };
-    write_private(&cfg.state_dir.join(BOT_USER_FILE), &serde_json::to_string(&saved).unwrap_or_default(), 0o600)
+    let saved = SavedBotUser {
+        user: cfg.bot_user.clone(),
+        uid: ids.uid,
+        gid: ids.gid,
+        handed,
+    };
+    write_private(
+        &cfg.state_dir.join(BOT_USER_FILE),
+        &serde_json::to_string(&saved).unwrap_or_default(),
+        0o600,
+    )
 }
 
 fn bot_failed(user: &str, e: String) -> Bot {
     eprintln!("Bots' user: {e}");
-    Bot { status: Some(bot_status(wire::BOT_USER_FAILED, user, None, Some(e))), ids: None }
+    Bot {
+        status: Some(bot_status(wire::BOT_USER_FAILED, user, None, Some(e))),
+        ids: None,
+    }
 }
 
-fn bot_status(state: &str, user: &str, uid: Option<u32>, error: Option<String>) -> wire::BotUserStatus {
+fn bot_status(
+    state: &str,
+    user: &str,
+    uid: Option<u32>,
+    error: Option<String>,
+) -> wire::BotUserStatus {
     wire::BotUserStatus {
         state: state.into(),
         user: user.into(),
@@ -712,17 +752,26 @@ fn load_bot_user(cfg: &Config, tools: &Tools) -> Bot {
             return match std::fs::symlink_metadata(&cfg.home) {
                 Ok(m) if m.uid() != me => bot_failed(
                     &cfg.bot_user,
-                    format!("{} belongs to another user, but no Bots' user is saved.", cfg.home.display()),
+                    format!(
+                        "{} belongs to another user, but no Bots' user is saved.",
+                        cfg.home.display()
+                    ),
                 ),
                 _ => Bot::default(),
             };
         }
         Err(e) => return bot_failed(&cfg.bot_user, format!("{}: {e}", path.display())),
     };
-    let want = Ids { uid: saved.uid, gid: saved.gid };
+    let want = Ids {
+        uid: saved.uid,
+        gid: saved.gid,
+    };
     let checked = (|| {
         if saved.user != cfg.bot_user {
-            return Err(format!("Bots ran as {}, but the agent is set to {}.", saved.user, cfg.bot_user));
+            return Err(format!(
+                "Bots ran as {}, but the agent is set to {}.",
+                saved.user, cfg.bot_user
+            ));
         }
         match runas::lookup(&saved.user) {
             Some((ids, _)) if ids == want => {}
@@ -730,9 +779,11 @@ fn load_bot_user(cfg: &Config, tools: &Tools) -> Bot {
             None => return Err(format!("{} is gone.", saved.user)),
         }
         cfg.check_bot_ids(want)?;
-        let owned = std::fs::symlink_metadata(&cfg.home).is_ok_and(|m| m.is_dir() && m.uid() == want.uid);
+        let owned =
+            std::fs::symlink_metadata(&cfg.home).is_ok_and(|m| m.is_dir() && m.uid() == want.uid);
         if !saved.handed || !owned {
-            runas::hand_over(&cfg.home, want).map_err(|e| format!("{}: {e}", cfg.home.display()))?;
+            runas::hand_over(&cfg.home, want)
+                .map_err(|e| format!("{}: {e}", cfg.home.display()))?;
         }
         cfg.open_paths(tools)?;
         if !saved.handed {
@@ -742,7 +793,12 @@ fn load_bot_user(cfg: &Config, tools: &Tools) -> Bot {
     })();
     match checked {
         Ok(()) => Bot {
-            status: Some(bot_status(wire::BOT_USER_READY, &saved.user, Some(want.uid), None)),
+            status: Some(bot_status(
+                wire::BOT_USER_READY,
+                &saved.user,
+                Some(want.uid),
+                None,
+            )),
             ids: Some(want),
         },
         Err(e) => bot_failed(&saved.user, e),
@@ -754,7 +810,10 @@ impl Agent {
     /// upgrade, the clock on the new agent's trial.
     pub fn new(cfg: Config, id: Identity) -> Result<Arc<Agent>, String> {
         let server = Arc::new(server_config(&cfg, &id)?);
-        let tools = Tools::new(cfg.tools.clone(), Some(cfg.ca_pem.as_str()).filter(|p| !p.is_empty()))?;
+        let tools = Tools::new(
+            cfg.tools.clone(),
+            Some(cfg.ca_pem.as_str()).filter(|p| !p.is_empty()),
+        )?;
         let bot = load_bot_user(&cfg, &tools);
         if bot.status.is_none() {
             std::fs::DirBuilder::new()
@@ -771,8 +830,16 @@ impl Agent {
         if let Some(ids) = bot.ids {
             landing.set_user(ids);
         }
-        let screens = Arc::new(Screens::new(cfg.screens.clone(), cfg.home.clone(), cfg.bot_user.clone()));
-        let teammates = Arc::new(Teammates::new(cfg.teammates.clone(), cfg.state_dir.clone(), cfg.teammate_stand_in.clone()));
+        let screens = Arc::new(Screens::new(
+            cfg.screens.clone(),
+            cfg.home.clone(),
+            cfg.bot_user.clone(),
+        ));
+        let teammates = Arc::new(Teammates::new(
+            cfg.teammates.clone(),
+            cfg.state_dir.clone(),
+            cfg.teammate_stand_in.clone(),
+        ));
         let a = Arc::new(Agent {
             cfg,
             current: RwLock::new((Arc::new(id), server)),
@@ -862,7 +929,9 @@ impl Agent {
 
     /// Whether the agent is handing the home to the Bots' user now.
     fn setting_up(&self) -> bool {
-        self.bot().status.is_some_and(|s| s.state == wire::BOT_USER_SETTING_UP)
+        self.bot()
+            .status
+            .is_some_and(|s| s.state == wire::BOT_USER_SETTING_UP)
     }
 
     /// Who jobs and logins run as: the agent's user until botd asks for the Bots' own
@@ -893,10 +962,16 @@ impl Agent {
     #[allow(clippy::result_large_err)]
     async fn teammate(self: &Arc<Self>, user_id: &str) -> Result<Teammate, Response> {
         if !plain_name(user_id) {
-            return Err(refuse(StatusCode::BAD_REQUEST, "The teammate's id isn't a plain name."));
+            return Err(refuse(
+                StatusCode::BAD_REQUEST,
+                "The teammate's id isn't a plain name.",
+            ));
         }
         if user_id == self.identity().user_id {
-            return Err(refuse(StatusCode::BAD_REQUEST, "That is this machine's own user, not a teammate."));
+            return Err(refuse(
+                StatusCode::BAD_REQUEST,
+                "That is this machine's own user, not a teammate.",
+            ));
         }
         let bots = match self.job_user()? {
             Some(ids) => ids,
@@ -915,7 +990,10 @@ impl Agent {
         .await;
         match made {
             Ok(Ok(t)) => Ok(t),
-            Ok(Err(e)) => Err(refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't set up the teammate's user: {e}"))),
+            Ok(Err(e)) => Err(refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Couldn't set up the teammate's user: {e}"),
+            )),
             Err(e) => Err(refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
         }
     }
@@ -931,7 +1009,8 @@ impl Agent {
         // after this, or a restart, never has root writing in its home.
         save_bot_user(cfg, ids, false)?;
         self.landing.set_user(ids);
-        let handed = runas::hand_over(&cfg.home, ids).map_err(|e| format!("{}: {e}", cfg.home.display()))?;
+        let handed =
+            runas::hand_over(&cfg.home, ids).map_err(|e| format!("{}: {e}", cfg.home.display()))?;
         cfg.open_paths(&self.tools)?;
         work_dirs(cfg, Some(ids))?;
         save_bot_user(cfg, ids, true)?;
@@ -1049,8 +1128,16 @@ fn unescape(s: &str) -> Option<String> {
 /// relative to HOME (ADR 0041). Grouped by harness; anything else is ignored.
 fn creds(query: Option<&str>) -> BTreeMap<&'static str, Vec<String>> {
     let mut out: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
-    for kv in query.unwrap_or("").split('&').filter_map(|kv| kv.strip_prefix("cred=")).take(16) {
-        let Some((h, p)) = unescape(kv).and_then(|v| v.split_once(':').map(|(h, p)| (h.to_string(), p.to_string()))) else {
+    for kv in query
+        .unwrap_or("")
+        .split('&')
+        .filter_map(|kv| kv.strip_prefix("cred="))
+        .take(16)
+    {
+        let Some((h, p)) = unescape(kv).and_then(|v| {
+            v.split_once(':')
+                .map(|(h, p)| (h.to_string(), p.to_string()))
+        }) else {
             continue;
         };
         if let Some(h) = wire::harness_bin(&h)
@@ -1070,24 +1157,48 @@ fn logins(a: &Agent, query: Option<&str>) -> BTreeMap<String, wire::LoginStatus>
 
 /// The same, for a teammate's own logins in their home (ADR 0062), looked at as their
 /// user, so a link they put there reaches nothing they couldn't read themselves.
-fn teammate_logins(a: &Agent, user_id: &str, t: Option<&Teammate>, query: Option<&str>) -> BTreeMap<String, wire::LoginStatus> {
+fn teammate_logins(
+    a: &Agent,
+    user_id: &str,
+    t: Option<&Teammate>,
+    query: Option<&str>,
+) -> BTreeMap<String, wire::LoginStatus> {
     let running = a.logins.running_for(Some(user_id));
     match t {
         Some(t) => login_states(&t.home, Some(t.ids), running, query),
         None => {
             let mut out: BTreeMap<String, wire::LoginStatus> = creds(query)
                 .into_keys()
-                .map(|h| (h.to_string(), wire::LoginStatus { state: wire::LOGGED_OUT.into(), since: None }))
+                .map(|h| {
+                    (
+                        h.to_string(),
+                        wire::LoginStatus {
+                            state: wire::LOGGED_OUT.into(),
+                            since: None,
+                        },
+                    )
+                })
                 .collect();
             for h in running {
-                out.insert(h, wire::LoginStatus { state: wire::LOGGING_IN.into(), since: None });
+                out.insert(
+                    h,
+                    wire::LoginStatus {
+                        state: wire::LOGGING_IN.into(),
+                        since: None,
+                    },
+                );
             }
             out
         }
     }
 }
 
-fn login_states(home: &Path, user: Option<Ids>, running: Vec<String>, query: Option<&str>) -> BTreeMap<String, wire::LoginStatus> {
+fn login_states(
+    home: &Path,
+    user: Option<Ids>,
+    running: Vec<String>,
+    query: Option<&str>,
+) -> BTreeMap<String, wire::LoginStatus> {
     let mut out: BTreeMap<String, wire::LoginStatus> = creds(query)
         .into_iter()
         .map(|(h, files)| {
@@ -1099,7 +1210,13 @@ fn login_states(home: &Path, user: Option<Ids>, running: Vec<String>, query: Opt
                 None if running.iter().any(|r| r == h) => wire::LOGGING_IN,
                 None => wire::LOGGED_OUT,
             };
-            (h.to_string(), wire::LoginStatus { state: state.into(), since })
+            (
+                h.to_string(),
+                wire::LoginStatus {
+                    state: state.into(),
+                    since,
+                },
+            )
         })
         .collect();
     for h in running {
@@ -1170,11 +1287,12 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
             wire::CAN_TEAMMATES,
             wire::CAN_TEAMMATE_REMOVAL,
             wire::CAN_TEAMMATE_LOGINS,
+            wire::CAN_INSTALL_AFTER,
         ]
-            .into_iter()
-            .chain(a.upgrader.build.is_some().then_some(wire::CAN_UPGRADE))
-            .map(String::from)
-            .collect(),
+        .into_iter()
+        .chain(a.upgrader.build.is_some().then_some(wire::CAN_UPGRADE))
+        .map(String::from)
+        .collect(),
         build: a.upgrader.build.clone(),
         plan,
         harnesses,
@@ -1196,7 +1314,12 @@ fn inside(home: &Path, p: &str) -> bool {
 }
 
 /// Why this machine won't run the job, if it won't.
-fn check(cfg: &Config, user_id: &str, j: &wire::JobRequest, home: &Path) -> Result<(), (StatusCode, String)> {
+fn check(
+    cfg: &Config,
+    user_id: &str,
+    j: &wire::JobRequest,
+    home: &Path,
+) -> Result<(), (StatusCode, String)> {
     let bad = |m: String| Err((StatusCode::BAD_REQUEST, m));
     if j.protocol != wire::PROTOCOL {
         return bad(format!(
@@ -1286,7 +1409,11 @@ fn stream<T: serde::Serialize + Send + 'static>(
 
 /// A job's registration and its hold on the tools, kept until the harness has exited
 /// and its cleanup has run, however the job ends.
-struct Running(Arc<Agent>, String, #[allow(dead_code)] super::tools::JobPermit);
+struct Running(
+    Arc<Agent>,
+    String,
+    #[allow(dead_code)] super::tools::JobPermit,
+);
 
 impl Drop for Running {
     fn drop(&mut self) {
@@ -1307,7 +1434,10 @@ impl Drop for StopOnDrop {
 /// A request it refuses gets an error status before anything runs.
 async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobRequest>) -> Response {
     // A teammate's run (ADR 0048): their own user, and nothing outside their home.
-    let home = j.for_user.as_deref().map_or(a.cfg.home.clone(), |u| a.teammates.home_of(u));
+    let home = j
+        .for_user
+        .as_deref()
+        .map_or(a.cfg.home.clone(), |u| a.teammates.home_of(u));
     if let Err((code, msg)) = check(&a.cfg, &a.identity().user_id, &j, &home) {
         return refuse(code, msg);
     }
@@ -1339,8 +1469,14 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
             return refuse(StatusCode::CONFLICT, "That job is already running.");
         }
         // Checked with the jobs held: a removal marks the teammate, then stops what's here.
-        if j.for_user.as_deref().is_some_and(|u| a.teammates.is_leaving(u)) {
-            return refuse(StatusCode::CONFLICT, "That teammate's user is being removed.");
+        if j.for_user
+            .as_deref()
+            .is_some_and(|u| a.teammates.is_leaving(u))
+        {
+            return refuse(
+                StatusCode::CONFLICT,
+                "That teammate's user is being removed.",
+            );
         }
         if jobs.len() >= a.cfg.max_jobs {
             return refuse(
@@ -1354,7 +1490,13 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
                 "This machine is updating its harnesses. Try again in a minute.",
             );
         };
-        jobs.insert(j.job_id.clone(), RunningJob { stop: stop_tx.clone(), for_user: j.for_user.clone() });
+        jobs.insert(
+            j.job_id.clone(),
+            RunningJob {
+                stop: stop_tx.clone(),
+                for_user: j.for_user.clone(),
+            },
+        );
         (permit, user)
     };
     let running = Running(a.clone(), j.job_id.clone(), permit);
@@ -1367,7 +1509,9 @@ async fn start_job(State(a): State<Arc<Agent>>, Json(mut j): Json<wire::JobReque
         }
     };
     let (ev_tx, ev_rx) = mpsc::channel::<wire::JobEvent>(256);
-    let screen = a.screens.hold(&wire::screen_key(&j.bot_id, j.for_user.as_deref()));
+    let screen = a
+        .screens
+        .hold(&wire::screen_key(&j.bot_id, j.for_user.as_deref()));
     tokio::spawn(async move {
         let _running = running;
         let _screen = screen;
@@ -1406,18 +1550,30 @@ async fn start_login(State(a): State<Arc<Agent>>, Json(r): Json<wire::LoginReque
         Err(r) => return r,
     };
     // Checked with the jobs held, as for jobs: a removal marks the teammate first.
-    if r.for_user.as_deref().is_some_and(|u| a.teammates.is_leaving(u)) {
-        return refuse(StatusCode::CONFLICT, "That teammate's user is being removed.");
+    if r.for_user
+        .as_deref()
+        .is_some_and(|u| a.teammates.is_leaving(u))
+    {
+        return refuse(
+            StatusCode::CONFLICT,
+            "That teammate's user is being removed.",
+        );
     }
     let (home, host) = match &teammate {
         Some(t) => (t.home.clone(), a.cfg.teammate_host(t)),
         None => (a.cfg.home.clone(), a.cfg.host(user)),
     };
     if a.upgrader.staging() {
-        return refuse(StatusCode::SERVICE_UNAVAILABLE, "This machine is updating its agent. Try again in a minute.");
+        return refuse(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "This machine is updating its agent. Try again in a minute.",
+        );
     }
     let Some(permit) = a.tools.job_permit() else {
-        return refuse(StatusCode::SERVICE_UNAVAILABLE, "This machine is updating its harnesses. Try again in a minute.");
+        return refuse(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "This machine is updating its harnesses. Try again in a minute.",
+        );
     };
     match a.logins.start(&r, &run, &home, &host.env, host.user) {
         Ok((rx, stop)) => stream(rx, wire::LoginEvent::Ping, (StopOnDrop(stop), permit)),
@@ -1448,16 +1604,31 @@ async fn login_abort(State(a): State<Arc<Agent>>, UrlPath(id): UrlPath<String>) 
 
 /// `POST /v1/logins/forget`: logs a harness out by removing its credential files.
 async fn login_forget(State(a): State<Arc<Agent>>, Json(f): Json<wire::ForgetRequest>) -> Response {
-    if wire::harness_bin(&f.harness).is_none() || f.files.len() > 4 || !f.files.iter().all(|p| wire::home_path(p)) {
-        return refuse(StatusCode::BAD_REQUEST, "Name a harness and its credential files inside HOME.");
+    if wire::harness_bin(&f.harness).is_none()
+        || f.files.len() > 4
+        || !f.files.iter().all(|p| wire::home_path(p))
+    {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "Name a harness and its credential files inside HOME.",
+        );
     }
     if let Some(u) = &f.for_user
         && (!plain_name(u) || *u == a.identity().user_id)
     {
-        return refuse(StatusCode::BAD_REQUEST, "The teammate's id isn't a plain name, or is this machine's own user.");
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "The teammate's id isn't a plain name, or is this machine's own user.",
+        );
     }
-    if a.logins.running_for(f.for_user.as_deref()).contains(&f.harness) {
-        return refuse(StatusCode::CONFLICT, format!("A {} login is running here.", f.harness));
+    if a.logins
+        .running_for(f.for_user.as_deref())
+        .contains(&f.harness)
+    {
+        return refuse(
+            StatusCode::CONFLICT,
+            format!("A {} login is running here.", f.harness),
+        );
     }
     let user = match a.job_user() {
         Ok(u) => u,
@@ -1475,14 +1646,23 @@ async fn login_forget(State(a): State<Arc<Agent>>, Json(f): Json<wire::ForgetReq
             }
         }
     };
-    let whose = if f.for_user.is_some() { "the teammate's" } else { "the Bots'" };
+    let whose = if f.for_user.is_some() {
+        "the teammate's"
+    } else {
+        "the Bots'"
+    };
     match runas::as_user(user, || super::terminal::forget(&home, &f.files)) {
         Ok(removed) => Json(wire::ForgetReply { removed }).into_response(),
-        Err(e) => refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't act as {whose} user: {e}")),
+        Err(e) => refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Couldn't act as {whose} user: {e}"),
+        ),
     }
 }
 
-fn landed<T: serde::Serialize>(r: Result<Result<T, (u16, String)>, tokio::task::JoinError>) -> Response {
+fn landed<T: serde::Serialize>(
+    r: Result<Result<T, (u16, String)>, tokio::task::JoinError>,
+) -> Response {
     match r {
         Ok(Ok(v)) => Json(v).into_response(),
         Ok(Err((code, msg))) => refuse(code_or(code, StatusCode::BAD_REQUEST), msg),
@@ -1544,7 +1724,10 @@ async fn abort_job(
 
 /// `PUT /v1/harnesses`: the harness CLIs botd wants here (ADR 0039). They install in
 /// the background; heartbeats say how it goes.
-async fn set_harnesses(State(a): State<Arc<Agent>>, Json(plan): Json<wire::HarnessPlan>) -> Response {
+async fn set_harnesses(
+    State(a): State<Arc<Agent>>,
+    Json(plan): Json<wire::HarnessPlan>,
+) -> Response {
     match a.tools.set_plan(plan) {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         Err(e) => refuse(StatusCode::BAD_REQUEST, e),
@@ -1567,10 +1750,17 @@ async fn fetch(a: &Agent, path: &str) -> Result<Vec<u8>, String> {
         .await
         .map_err(|e| format!("couldn't reach the control plane: {}", e.without_url()))?;
     if !r.status().is_success() {
-        return Err(format!("the control plane answered {} for {path}", r.status().as_u16()));
+        return Err(format!(
+            "the control plane answered {} for {path}",
+            r.status().as_u16()
+        ));
     }
     let mut out = Vec::new();
-    while let Some(c) = r.chunk().await.map_err(|e| format!("{path}: {}", e.without_url()))? {
+    while let Some(c) = r
+        .chunk()
+        .await
+        .map_err(|e| format!("{path}: {}", e.without_url()))?
+    {
         if out.len() + c.len() > upgrade::MAX_BINARY {
             return Err(format!("{path} is over {} MiB", upgrade::MAX_BINARY >> 20));
         }
@@ -1581,14 +1771,26 @@ async fn fetch(a: &Agent, path: &str) -> Result<Vec<u8>, String> {
 
 /// `POST /v1/upgrade`: replaces this agent with botd's build, then restarts (ADR
 /// 0039). Refused while jobs or logins run; neither starts until it's done.
-async fn start_upgrade(State(a): State<Arc<Agent>>, Json(req): Json<wire::UpgradeRequest>) -> Response {
+async fn start_upgrade(
+    State(a): State<Arc<Agent>>,
+    Json(req): Json<wire::UpgradeRequest>,
+) -> Response {
     {
         let jobs = a.jobs();
         if a.setting_up() {
-            return refuse(StatusCode::CONFLICT, "This machine is setting up its Bots' user. Try again in a few minutes.");
+            return refuse(
+                StatusCode::CONFLICT,
+                "This machine is setting up its Bots' user. Try again in a few minutes.",
+            );
         }
-        if let Some((code, msg)) = a.upgrader.refuse(&req, jobs.len() + a.logins.running().len()) {
-            return refuse(StatusCode::from_u16(code).unwrap_or(StatusCode::CONFLICT), msg);
+        if let Some((code, msg)) = a
+            .upgrader
+            .refuse(&req, jobs.len() + a.logins.running().len())
+        {
+            return refuse(
+                StatusCode::from_u16(code).unwrap_or(StatusCode::CONFLICT),
+                msg,
+            );
         }
         if !a.upgrader.begin(&req) {
             return refuse(StatusCode::CONFLICT, "This agent is upgrading already.");
@@ -1598,7 +1800,11 @@ async fn start_upgrade(State(a): State<Arc<Agent>>, Json(req): Json<wire::Upgrad
     tokio::spawn(async move {
         match up.upgrader.stage(&req, |path| fetch(&up, path)).await {
             Ok(()) => {
-                println!("Upgrade: installed superbot-machine {} ({}); restarting.", req.version, &req.sha256[..16]);
+                println!(
+                    "Upgrade: installed superbot-machine {} ({}); restarting.",
+                    req.version,
+                    &req.sha256[..16]
+                );
                 up.request_restart();
             }
             Err(e) => eprintln!("Upgrade: {e}"),
@@ -1609,23 +1815,45 @@ async fn start_upgrade(State(a): State<Arc<Agent>>, Json(req): Json<wire::Upgrad
 
 /// `PUT /v1/bot-user`: from now on, run Bots as their own user (ADR 0043). Refused
 /// while jobs or logins run; none start until it's done. Heartbeats say how it went.
-async fn set_bot_user(State(a): State<Arc<Agent>>, Json(_r): Json<wire::BotUserRequest>) -> Response {
+async fn set_bot_user(
+    State(a): State<Arc<Agent>>,
+    Json(_r): Json<wire::BotUserRequest>,
+) -> Response {
     {
         let jobs = a.jobs();
         let b = a.bot();
-        if let Some(s) = b.status.as_ref().filter(|s| s.state != wire::BOT_USER_FAILED) {
-            let code = if s.state == wire::BOT_USER_READY { StatusCode::OK } else { StatusCode::ACCEPTED };
+        if let Some(s) = b
+            .status
+            .as_ref()
+            .filter(|s| s.state != wire::BOT_USER_FAILED)
+        {
+            let code = if s.state == wire::BOT_USER_READY {
+                StatusCode::OK
+            } else {
+                StatusCode::ACCEPTED
+            };
             return (code, Json(s.clone())).into_response();
         }
         if a.upgrader.staging() {
-            return refuse(StatusCode::SERVICE_UNAVAILABLE, "This machine is updating its agent. Try again in a minute.");
+            return refuse(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "This machine is updating its agent. Try again in a minute.",
+            );
         }
         let running = jobs.len() + a.logins.running().len();
         if running > 0 {
-            return refuse(StatusCode::CONFLICT, format!("{running} jobs or logins are running here. Try again when they're done."));
+            return refuse(
+                StatusCode::CONFLICT,
+                format!("{running} jobs or logins are running here. Try again when they're done."),
+            );
         }
         a.set_bot(Bot {
-            status: Some(bot_status(wire::BOT_USER_SETTING_UP, &a.cfg.bot_user, None, None)),
+            status: Some(bot_status(
+                wire::BOT_USER_SETTING_UP,
+                &a.cfg.bot_user,
+                None,
+                None,
+            )),
             ids: None,
         });
     }
@@ -1647,18 +1875,32 @@ async fn set_bot_user(State(a): State<Arc<Agent>>, Json(_r): Json<wire::BotUserR
 /// `PUT /v1/screens/{bot}`: starts the Bot's screen, or gives it a new viewer token
 /// (ADR 0045). Only ever as the Bots' own user: before botd has asked for one, or
 /// while it can't be used, no screen starts.
-async fn put_screen(State(a): State<Arc<Agent>>, UrlPath(bot): UrlPath<String>, Json(r): Json<wire::ScreenRequest>) -> Response {
+async fn put_screen(
+    State(a): State<Arc<Agent>>,
+    UrlPath(bot): UrlPath<String>,
+    Json(r): Json<wire::ScreenRequest>,
+) -> Response {
     if r.protocol != wire::SCREEN_PROTOCOL {
         return refuse(
             StatusCode::BAD_REQUEST,
-            format!("This agent speaks screen protocol {}, not {}. Update it.", wire::SCREEN_PROTOCOL, r.protocol),
+            format!(
+                "This agent speaks screen protocol {}, not {}. Update it.",
+                wire::SCREEN_PROTOCOL,
+                r.protocol
+            ),
         );
     }
     if r.owner_id != a.identity().user_id {
-        return refuse(StatusCode::FORBIDDEN, "This machine shows only its own user's Bots.");
+        return refuse(
+            StatusCode::FORBIDDEN,
+            "This machine shows only its own user's Bots.",
+        );
     }
     if !plain_name(&bot) || !wire::screen_token(&r.token) {
-        return refuse(StatusCode::BAD_REQUEST, "Name a Bot and give a long hex token.");
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "Name a Bot and give a long hex token.",
+        );
     }
     if !(320..=7680).contains(&r.width) || !(240..=4320).contains(&r.height) {
         return refuse(StatusCode::BAD_REQUEST, "That screen size is out of range.");
@@ -1676,21 +1918,41 @@ async fn put_screen(State(a): State<Arc<Agent>>, UrlPath(bot): UrlPath<String>, 
     // A teammate's own screen of the Bot runs as their user, in their home (ADR 0048).
     let who = match &r.for_user {
         Some(u) => match a.teammate(u).await {
-            Ok(t) => display::As { ids: t.ids, home: t.home, user: t.user },
+            Ok(t) => display::As {
+                ids: t.ids,
+                home: t.home,
+                user: t.user,
+            },
             Err(r) => return r,
         },
-        None => display::As { ids, home: a.cfg.home.clone(), user: a.cfg.bot_user.clone() },
+        None => display::As {
+            ids,
+            home: a.cfg.home.clone(),
+            user: a.cfg.bot_user.clone(),
+        },
     };
     let key = wire::screen_key(&bot, r.for_user.as_deref());
-    if r.for_user.as_deref().is_some_and(|u| a.teammates.is_leaving(u)) {
-        return refuse(StatusCode::CONFLICT, "That teammate's user is being removed.");
+    if r.for_user
+        .as_deref()
+        .is_some_and(|u| a.teammates.is_leaving(u))
+    {
+        return refuse(
+            StatusCode::CONFLICT,
+            "That teammate's user is being removed.",
+        );
     }
     if a.upgrader.staging() {
-        return refuse(StatusCode::SERVICE_UNAVAILABLE, "This machine is updating its agent. Try again in a minute.");
+        return refuse(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "This machine is updating its agent. Try again in a minute.",
+        );
     }
     let missing = a.screens.missing();
     if !missing.is_empty() {
-        return refuse(StatusCode::UNPROCESSABLE_ENTITY, format!("This machine is missing {}.", missing.join(", ")));
+        return refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("This machine is missing {}.", missing.join(", ")),
+        );
     }
     match a.screens.ensure_as(&key, &r, &who).await {
         Ok(reply) => {
@@ -1719,9 +1981,16 @@ impl ScreenFor {
     }
 }
 
-async fn delete_screen(State(a): State<Arc<Agent>>, UrlPath(bot): UrlPath<String>, Query(f): Query<ScreenFor>) -> Response {
+async fn delete_screen(
+    State(a): State<Arc<Agent>>,
+    UrlPath(bot): UrlPath<String>,
+    Query(f): Query<ScreenFor>,
+) -> Response {
     let Some(key) = f.key(&bot) else {
-        return refuse(StatusCode::BAD_REQUEST, "The teammate's id isn't a plain name.");
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "The teammate's id isn't a plain name.",
+        );
     };
     if a.screens.stop(&key).await {
         StatusCode::NO_CONTENT.into_response()
@@ -1735,13 +2004,27 @@ const TUNNEL_LIFETIME: Duration = Duration::from_secs(12 * 3600);
 
 /// `GET /v1/screens/{bot}/tunnel`: one viewer connection, piped as raw bytes to the
 /// Bot's voxl on loopback. The viewer port itself is never reachable from outside.
-async fn screen_tunnel(State(a): State<Arc<Agent>>, UrlPath(bot): UrlPath<String>, Query(f): Query<ScreenFor>, mut req: Request) -> Response {
-    let wants = req.headers().get(header::UPGRADE).and_then(|v| v.to_str().ok());
+async fn screen_tunnel(
+    State(a): State<Arc<Agent>>,
+    UrlPath(bot): UrlPath<String>,
+    Query(f): Query<ScreenFor>,
+    mut req: Request,
+) -> Response {
+    let wants = req
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok());
     if wants != Some(wire::SCREEN_UPGRADE) {
-        return refuse(StatusCode::BAD_REQUEST, format!("Ask with Upgrade: {}.", wire::SCREEN_UPGRADE));
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            format!("Ask with Upgrade: {}.", wire::SCREEN_UPGRADE),
+        );
     }
     let Some(key) = f.key(&bot) else {
-        return refuse(StatusCode::BAD_REQUEST, "The teammate's id isn't a plain name.");
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "The teammate's id isn't a plain name.",
+        );
     };
     let (port, hold, permit) = match a.screens.tunnel(&key) {
         Ok(t) => t,
@@ -1749,17 +2032,29 @@ async fn screen_tunnel(State(a): State<Arc<Agent>>, UrlPath(bot): UrlPath<String
     };
     let viewer = match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
         Ok(s) => s,
-        Err(e) => return refuse(StatusCode::BAD_GATEWAY, format!("The screen's viewer didn't answer: {e}")),
+        Err(e) => {
+            return refuse(
+                StatusCode::BAD_GATEWAY,
+                format!("The screen's viewer didn't answer: {e}"),
+            );
+        }
     };
     let Some(on) = req.extensions_mut().remove::<hyper::upgrade::OnUpgrade>() else {
-        return refuse(StatusCode::INTERNAL_SERVER_ERROR, "This connection can't be upgraded.");
+        return refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "This connection can't be upgraded.",
+        );
     };
     tokio::spawn(async move {
         let _hold = (hold, permit);
         let Ok(up) = on.await else { return };
         let mut up = hyper_util::rt::TokioIo::new(up);
         let mut viewer = viewer;
-        let _ = tokio::time::timeout(TUNNEL_LIFETIME, tokio::io::copy_bidirectional(&mut up, &mut viewer)).await;
+        let _ = tokio::time::timeout(
+            TUNNEL_LIFETIME,
+            tokio::io::copy_bidirectional(&mut up, &mut viewer),
+        )
+        .await;
     });
     Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
@@ -1772,12 +2067,23 @@ async fn screen_tunnel(State(a): State<Arc<Agent>>, UrlPath(bot): UrlPath<String
 /// `PUT /v1/teammates/{user}`: the OS user and home a teammate's runs of this machine's
 /// user's shared Bots get here, made on first use (ADR 0048). With `?cred=` (as for
 /// heartbeats), it also says which of their own harness logins exist (ADR 0062).
-async fn put_teammate(State(a): State<Arc<Agent>>, UrlPath(user): UrlPath<String>, RawQuery(q): RawQuery, Json(r): Json<wire::TeammateRequest>) -> Response {
+async fn put_teammate(
+    State(a): State<Arc<Agent>>,
+    UrlPath(user): UrlPath<String>,
+    RawQuery(q): RawQuery,
+    Json(r): Json<wire::TeammateRequest>,
+) -> Response {
     if r.owner_id != a.identity().user_id {
-        return refuse(StatusCode::FORBIDDEN, "This machine runs only its own user's Bots.");
+        return refuse(
+            StatusCode::FORBIDDEN,
+            "This machine runs only its own user's Bots.",
+        );
     }
     if a.upgrader.staging() {
-        return refuse(StatusCode::SERVICE_UNAVAILABLE, "This machine is updating its agent. Try again in a minute.");
+        return refuse(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "This machine is updating its agent. Try again in a minute.",
+        );
     }
     match a.teammate(&user).await {
         Ok(t) => {
@@ -1794,9 +2100,16 @@ async fn put_teammate(State(a): State<Arc<Agent>>, UrlPath(user): UrlPath<String
 
 /// `GET /v1/teammates/{user}/logins?cred=...`: which of a teammate's own harness logins
 /// exist here (ADR 0062). Never makes their user: one who has none is logged out.
-async fn get_teammate_logins(State(a): State<Arc<Agent>>, UrlPath(user): UrlPath<String>, RawQuery(q): RawQuery) -> Response {
+async fn get_teammate_logins(
+    State(a): State<Arc<Agent>>,
+    UrlPath(user): UrlPath<String>,
+    RawQuery(q): RawQuery,
+) -> Response {
     if !plain_name(&user) || user == a.identity().user_id {
-        return refuse(StatusCode::BAD_REQUEST, "The teammate's id isn't a plain name, or is this machine's own user.");
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "The teammate's id isn't a plain name, or is this machine's own user.",
+        );
     }
     let bots = match a.job_user() {
         Ok(ids) => ids,
@@ -1811,49 +2124,97 @@ async fn get_teammate_logins(State(a): State<Arc<Agent>>, UrlPath(user): UrlPath
     .ok()
     .flatten();
     let logins = teammate_logins(&a, &user, found.as_ref(), q.as_deref());
-    Json(wire::TeammateLogins { known: found.is_some(), logins }).into_response()
+    Json(wire::TeammateLogins {
+        known: found.is_some(),
+        logins,
+    })
+    .into_response()
 }
 
 /// `POST /v1/teammates/{user}/remove`: the teammate left (ADR 0052). Their jobs and
 /// screens stop, then `Teammates::remove` does the rest. Never the machine's own user.
-async fn remove_teammate(State(a): State<Arc<Agent>>, UrlPath(user): UrlPath<String>, Json(r): Json<wire::TeammateRemoval>) -> Response {
+async fn remove_teammate(
+    State(a): State<Arc<Agent>>,
+    UrlPath(user): UrlPath<String>,
+    Json(r): Json<wire::TeammateRemoval>,
+) -> Response {
     if r.owner_id != a.identity().user_id {
-        return refuse(StatusCode::FORBIDDEN, "This machine runs only its own user's Bots.");
+        return refuse(
+            StatusCode::FORBIDDEN,
+            "This machine runs only its own user's Bots.",
+        );
     }
     if !plain_name(&user) || !plain_name(&r.cleanup_id) {
-        return refuse(StatusCode::BAD_REQUEST, "The teammate's and the removal's ids must be plain names.");
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "The teammate's and the removal's ids must be plain names.",
+        );
     }
     if user == r.owner_id {
-        return refuse(StatusCode::BAD_REQUEST, "That is this machine's own user, not a teammate.");
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "That is this machine's own user, not a teammate.",
+        );
     }
     let files = match (r.files.as_str(), r.archive_name.as_deref()) {
         (wire::TEAMMATE_FILES_ARCHIVE, Some(name)) if plain_name(name) => match a.job_user() {
-            Ok(Some(ids)) => Files::Archive { home: a.cfg.home.clone(), ids, name: name.to_string() },
-            Ok(None) => return refuse(StatusCode::CONFLICT, "Work is archived only to the Bots' own user, and this machine has none."),
+            Ok(Some(ids)) => Files::Archive {
+                home: a.cfg.home.clone(),
+                ids,
+                name: name.to_string(),
+            },
+            Ok(None) => {
+                return refuse(
+                    StatusCode::CONFLICT,
+                    "Work is archived only to the Bots' own user, and this machine has none.",
+                );
+            }
             Err(r) => return r,
         },
         (wire::TEAMMATE_FILES_DELETE, None) if r.hold => Files::Hold,
         (wire::TEAMMATE_FILES_DELETE, None) => Files::Delete,
-        _ => return refuse(StatusCode::BAD_REQUEST, "Say archive with a plain archive name, or delete."),
+        _ => {
+            return refuse(
+                StatusCode::BAD_REQUEST,
+                "Say archive with a plain archive name, or delete.",
+            );
+        }
     };
     if a.upgrader.staging() {
-        return refuse(StatusCode::SERVICE_UNAVAILABLE, "This machine is updating its agent. Try again in a minute.");
+        return refuse(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "This machine is updating its agent. Try again in a minute.",
+        );
     }
     let Some(leaving) = a.teammates.start_leaving(&user) else {
-        return refuse(StatusCode::CONFLICT, "That teammate's user is being removed already.");
+        return refuse(
+            StatusCode::CONFLICT,
+            "That teammate's user is being removed already.",
+        );
     };
     let jobs = a.stop_jobs_for(&user).await;
     // Their logins run as their user, so stopping its processes below ends them anyway.
     a.logins.abort_for(&user);
     let mut screens = 0;
     let suffix = format!("@{user}");
-    for key in a.screens.report().running.into_iter().filter(|k| k.ends_with(&suffix)) {
+    for key in a
+        .screens
+        .report()
+        .running
+        .into_iter()
+        .filter(|k| k.ends_with(&suffix))
+    {
         screens += a.screens.stop(&key).await as u32;
     }
     let (b, id) = (a.clone(), user.clone());
     let done = tokio::task::spawn_blocking(move || {
         let stand_in = b.cfg.teammate_stand_in.is_some();
-        b.teammates.remove(&id, &r.cleanup_id, &files, not_teammates(stand_in, b.bot().ids))
+        b.teammates.remove(
+            &id,
+            &r.cleanup_id,
+            &files,
+            not_teammates(stand_in, b.bot().ids),
+        )
     })
     .await;
     drop(leaving);
@@ -1867,23 +2228,39 @@ async fn remove_teammate(State(a): State<Arc<Agent>>, UrlPath(user): UrlPath<Str
             }
             Json(done.reply(jobs, screens)).into_response()
         }
-        Ok(Err(e)) => refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't remove the teammate's user: {e}")),
+        Ok(Err(e)) => refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Couldn't remove the teammate's user: {e}"),
+        ),
         Err(e) => refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
 /// `POST /v1/teammates/{user}/purge`: deletes the work a removal held aside.
-async fn purge_teammate(State(a): State<Arc<Agent>>, UrlPath(user): UrlPath<String>, Json(r): Json<wire::TeammatePurge>) -> Response {
+async fn purge_teammate(
+    State(a): State<Arc<Agent>>,
+    UrlPath(user): UrlPath<String>,
+    Json(r): Json<wire::TeammatePurge>,
+) -> Response {
     if r.owner_id != a.identity().user_id {
-        return refuse(StatusCode::FORBIDDEN, "This machine runs only its own user's Bots.");
+        return refuse(
+            StatusCode::FORBIDDEN,
+            "This machine runs only its own user's Bots.",
+        );
     }
     if !plain_name(&user) || !plain_name(&r.cleanup_id) {
-        return refuse(StatusCode::BAD_REQUEST, "The teammate's and the removal's ids must be plain names.");
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "The teammate's and the removal's ids must be plain names.",
+        );
     }
     let t = a.teammates.clone();
     match tokio::task::spawn_blocking(move || t.purge(&r.cleanup_id)).await {
         Ok(Ok(purged)) => Json(wire::TeammatePurged { purged }).into_response(),
-        Ok(Err(e)) => refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't delete the held work: {e}")),
+        Ok(Err(e)) => refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Couldn't delete the held work: {e}"),
+        ),
         Err(e) => refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -1903,7 +2280,10 @@ pub fn router(a: Arc<Agent>) -> Router {
         .route("/v1/sync/{id}/blobs/{sha}", axum::routing::put(sync_blob))
         .route("/v1/sync/{id}/finish", post(sync_finish))
         .route("/v1/bot-user", axum::routing::put(set_bot_user))
-        .route("/v1/screens/{bot}", axum::routing::put(put_screen).delete(delete_screen))
+        .route(
+            "/v1/screens/{bot}",
+            axum::routing::put(put_screen).delete(delete_screen),
+        )
         .route("/v1/screens/{bot}/tunnel", get(screen_tunnel))
         .route("/v1/teammates/{user}", axum::routing::put(put_teammate))
         .route("/v1/teammates/{user}/logins", get(get_teammate_logins))

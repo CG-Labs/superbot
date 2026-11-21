@@ -97,7 +97,12 @@ impl Drop for Closed<'_> {
 pub fn enter<'a>(app: &'a AppState, owner: &str, teammate: &str) -> Option<InUse<'a>> {
     let pair = (owner.to_string(), teammate.to_string());
     let mut s = app.teammate_gate.lock();
-    let pending = || app.db.account_removals(Some(PENDING), Some(teammate)).iter().any(|r| r.owner_id == owner && r.user_id == teammate);
+    let pending = || {
+        app.db
+            .account_removals(Some(PENDING), Some(teammate))
+            .iter()
+            .any(|r| r.owner_id == owner && r.user_id == teammate)
+    };
     if s.removing.contains(&pair) || pending() {
         drop(s);
         kick(app);
@@ -113,7 +118,10 @@ fn isolation(app: &App) -> Option<Arc<Isolation>> {
 
 /// botd itself, acting for the account's owner.
 fn system(owner_id: &str) -> Who {
-    Who { actor: Actor::system("isolation").on_behalf_of(owner_id), source: Source::default() }
+    Who {
+        actor: Actor::system("isolation").on_behalf_of(owner_id),
+        source: Source::default(),
+    }
 }
 
 fn removal_event(by: &Who, action: &str, row: &AccountRemoval, extra: Value) -> Event {
@@ -126,7 +134,14 @@ fn removal_event(by: &Who, action: &str, row: &AccountRemoval, extra: Value) -> 
 
 /// Queues the removal of `teammate`'s account for `owner`'s Bots, unless one is pending;
 /// audited when new.
-fn queue(app: &App, iso: &Isolation, by: &Who, owner: &str, teammate: &str, reason: &str) -> Option<(AccountRemoval, bool)> {
+fn queue(
+    app: &App,
+    iso: &Isolation,
+    by: &Who,
+    owner: &str,
+    teammate: &str,
+    reason: &str,
+) -> Option<(AccountRemoval, bool)> {
     let account = Space::Teammate { owner, teammate }.account()?;
     let s = &iso.offboard;
     let (row, made) = app.db.account_removal_queue(&NewAccountRemoval {
@@ -135,11 +150,20 @@ fn queue(app: &App, iso: &Isolation, by: &Who, owner: &str, teammate: &str, reas
         account: &account,
         reason,
         files: s.files.as_str(),
-        grace_days: if s.files == Files::Delete { s.grace_days as i64 } else { 0 },
+        grace_days: if s.files == Files::Delete {
+            s.grace_days as i64
+        } else {
+            0
+        },
         created_by: by.actor.id.as_deref(),
     })?;
     if made {
-        app.db.record(&removal_event(by, "isolation.teammate_removal_queued", &row, json!({})));
+        app.db.record(&removal_event(
+            by,
+            "isolation.teammate_removal_queued",
+            &row,
+            json!({}),
+        ));
     }
     Some((row, made))
 }
@@ -157,7 +181,12 @@ pub fn wanted(app: &App, owner: &str, teammate: &str) -> bool {
 fn pairs(app: &App, iso: &Isolation) -> Vec<(String, String)> {
     let mut p = iso.teammate_pairs();
     p.extend(app.db.teammate_spaces());
-    p.extend(app.db.account_removals(Some(PENDING), None).into_iter().map(|r| (r.owner_id, r.user_id)));
+    p.extend(
+        app.db
+            .account_removals(Some(PENDING), None)
+            .into_iter()
+            .map(|r| (r.owner_id, r.user_id)),
+    );
     p.sort();
     p.dedup();
     p
@@ -166,11 +195,26 @@ fn pairs(app: &App, iso: &Isolation) -> Vec<(String, String)> {
 /// Queues removals for the pairs `only` picks whose teammate shouldn't keep the account:
 /// as `by` (else botd for the owner), with `reason` (else as botd can tell). How many it
 /// queued.
-fn sweep(app: &App, iso: &Isolation, by: Option<&Who>, only: impl Fn(&str, &str) -> bool, reason: Option<&str>) -> usize {
+fn sweep(
+    app: &App,
+    iso: &Isolation,
+    by: Option<&Who>,
+    only: impl Fn(&str, &str) -> bool,
+    reason: Option<&str>,
+) -> usize {
     pairs(app, iso)
         .iter()
         .filter(|(o, t)| only(o, t) && !wanted(app, o, t))
-        .filter_map(|(o, t)| queue(app, iso, by.unwrap_or(&system(o)), o, t, reason.unwrap_or_else(|| offboard::reason_for(app, t))))
+        .filter_map(|(o, t)| {
+            queue(
+                app,
+                iso,
+                by.unwrap_or(&system(o)),
+                o,
+                t,
+                reason.unwrap_or_else(|| offboard::reason_for(app, t)),
+            )
+        })
         .filter(|(_, made)| *made)
         .count()
 }
@@ -203,7 +247,11 @@ pub fn follow_up(app: &AppState) {
     let Some(iso) = isolation(app) else { return };
     sweep(app, &iso, None, |_, _| true, None);
     let at = now();
-    let due = app.db.account_removals(Some(HELD), None).iter().any(|r| r.purge_at.is_some_and(|p| p <= at));
+    let due = app
+        .db
+        .account_removals(Some(HELD), None)
+        .iter()
+        .any(|r| r.purge_at.is_some_and(|p| p <= at));
     if due || !app.db.account_removals(Some(PENDING), None).is_empty() {
         kick(app);
     }
@@ -270,7 +318,12 @@ async fn run(app: &App) {
         try_removal(app, &iso, &system(&row.owner_id), &row, false).await;
     }
     let at = now();
-    for row in app.db.account_removals(Some(HELD), None).into_iter().filter(|r| r.purge_at.is_some_and(|p| p <= at)) {
+    for row in app
+        .db
+        .account_removals(Some(HELD), None)
+        .into_iter()
+        .filter(|r| r.purge_at.is_some_and(|p| p <= at))
+    {
         purge(app, &iso, &row).await;
     }
 }
@@ -288,25 +341,56 @@ enum Tried {
 fn note(app: &App, by: &Who, row: &AccountRemoval, state: &str, why: &str) {
     let changed = row.last_error.as_deref() != Some(why);
     if app.db.account_removal_failed(&row.id, state, why) && changed {
-        let action = if state == HELD { "isolation.teammate_files_purge_failed" } else { "isolation.teammate_removal_failed" };
-        let attempts = app.db.account_removal(&row.id).map_or(row.attempts, |r| r.attempts);
+        let action = if state == HELD {
+            "isolation.teammate_files_purge_failed"
+        } else {
+            "isolation.teammate_removal_failed"
+        };
+        let attempts = app
+            .db
+            .account_removal(&row.id)
+            .map_or(row.attempts, |r| r.attempts);
         let d = json!({ "error": why, "attempts": attempts });
-        app.db.record(&removal_event(by, action, row, d).outcome(Outcome::Failure));
+        app.db
+            .record(&removal_event(by, action, row, d).outcome(Outcome::Failure));
     }
 }
 
 /// Removes one teammate's account, unless they're wanted again and it isn't `forced` by
 /// an admin.
-async fn try_removal(app: &App, iso: &Arc<Isolation>, by: &Who, row: &AccountRemoval, forced: bool) -> Tried {
-    let Some(_taken) = app.account_removals.take(&row.id) else { return Tried::Busy };
-    let Some(row) = app.db.account_removal(&row.id).filter(|r| r.state == PENDING) else { return Tried::Busy };
+async fn try_removal(
+    app: &App,
+    iso: &Arc<Isolation>,
+    by: &Who,
+    row: &AccountRemoval,
+    forced: bool,
+) -> Tried {
+    let Some(_taken) = app.account_removals.take(&row.id) else {
+        return Tried::Busy;
+    };
+    let Some(row) = app
+        .db
+        .account_removal(&row.id)
+        .filter(|r| r.state == PENDING)
+    else {
+        return Tried::Busy;
+    };
     // Once the helper has started, it may have done some of it (processes killed, work
     // moved): finish rather than leave it half done. A later run makes the teammate a new
     // account. The update checks again, so an admin's ask that lands meanwhile still stands.
-    if !forced && row.reason != ADMIN && row.attempts == 0 && wanted(app, &row.owner_id, &row.user_id) {
+    if !forced
+        && row.reason != ADMIN
+        && row.attempts == 0
+        && wanted(app, &row.owner_id, &row.user_id)
+    {
         let why = "access_back";
         if app.db.account_removal_cancel_unasked(&row.id, why) {
-            app.db.record(&removal_event(by, "isolation.teammate_removal_cancelled", &row, json!({ "why": why })));
+            app.db.record(&removal_event(
+                by,
+                "isolation.teammate_removal_cancelled",
+                &row,
+                json!({ "why": why }),
+            ));
             return Tried::Cancelled;
         }
         return Tried::Busy;
@@ -371,13 +455,17 @@ async fn try_removal(app: &App, iso: &Arc<Isolation>, by: &Who, row: &AccountRem
             }
             let purge_at = (r.work == "held").then(|| now() + days * DAY_MS);
             let archived_to = r.path.as_deref().filter(|_| r.work == "archived");
-            if app.db.account_removal_removed(&row.id, archived_to, purge_at) {
+            if app
+                .db
+                .account_removal_removed(&row.id, archived_to, purge_at)
+            {
                 let d = json!({
                     "accountRemoved": r.account_removed, "processesStopped": r.processes, "tempRemoved": r.temp,
                     "runsStopped": runs, "loginsStopped": logins, "work": r.work, "archivedTo": archived_to, "purgeAt": purge_at,
                     "attempts": row.attempts + 1, "notArchived": unarchived.filter(|_| r.work == "held"),
                 });
-                app.db.record(&removal_event(by, "isolation.teammate_removed", &row, d));
+                app.db
+                    .record(&removal_event(by, "isolation.teammate_removed", &row, d));
             }
             Tried::Removed(r)
         }
@@ -391,12 +479,18 @@ async fn try_removal(app: &App, iso: &Arc<Isolation>, by: &Who, row: &AccountRem
 /// How long work an earlier try held is kept when this try meant to archive or delete
 /// it: never less than if it were held now, so a retry never makes it due at once.
 fn held_days(row: &AccountRemoval) -> i64 {
-    if row.files == Files::Delete.as_str() { row.grace_days.max(1) } else { ORPHAN_DAYS }
+    if row.files == Files::Delete.as_str() {
+        row.grace_days.max(1)
+    } else {
+        ORPHAN_DAYS
+    }
 }
 
 /// Deletes the work a removal held, once its days are up. Whether it's done.
 async fn purge(app: &App, iso: &Arc<Isolation>, row: &AccountRemoval) -> bool {
-    let Some(_taken) = app.account_removals.take(&row.id) else { return false };
+    let Some(_taken) = app.account_removals.take(&row.id) else {
+        return false;
+    };
     let by = system(&row.owner_id);
     if !app.db.account_removal_tried(&row.id, HELD) {
         return false;
@@ -410,7 +504,12 @@ async fn purge(app: &App, iso: &Arc<Isolation>, row: &AccountRemoval) -> bool {
     match done {
         Ok(purged) => {
             if app.db.account_removal_end(&row.id, HELD, DONE, None) {
-                app.db.record(&removal_event(&by, "isolation.teammate_files_purged", row, json!({ "purged": purged })));
+                app.db.record(&removal_event(
+                    &by,
+                    "isolation.teammate_files_purged",
+                    row,
+                    json!({ "purged": purged }),
+                ));
             }
             true
         }
@@ -425,7 +524,10 @@ async fn purge(app: &App, iso: &Arc<Isolation>, row: &AccountRemoval) -> bool {
 // (admin only, rbac::classify).
 
 fn person(app: &App, id: &str) -> Value {
-    app.db.user(id).map(|u| json!({ "id": u.id, "name": u.name, "email": u.email })).unwrap_or(json!({ "id": id }))
+    app.db
+        .user(id)
+        .map(|u| json!({ "id": u.id, "name": u.name, "email": u.email }))
+        .unwrap_or(json!({ "id": id }))
 }
 
 fn view(app: &App, r: &AccountRemoval) -> Value {
@@ -453,9 +555,18 @@ pub async fn list_all(State(app): State<AppState>, Query(q): Query<ListQuery>) -
     let all = app.db.account_removals(None, None);
     let rows: Vec<&AccountRemoval> = match q.state.as_deref() {
         None | Some("") | Some("all") => all.iter().collect(),
-        Some("open") => all.iter().filter(|r| r.state == PENDING || r.state == HELD).collect(),
-        Some(s @ (PENDING | HELD | DONE | CANCELLED)) => all.iter().filter(|r| r.state == s).collect(),
-        Some(s) => return Err(bad(format!("state must be pending, held, done, cancelled, open or all, not \"{s}\""))),
+        Some("open") => all
+            .iter()
+            .filter(|r| r.state == PENDING || r.state == HELD)
+            .collect(),
+        Some(s @ (PENDING | HELD | DONE | CANCELLED)) => {
+            all.iter().filter(|r| r.state == s).collect()
+        }
+        Some(s) => {
+            return Err(bad(format!(
+                "state must be pending, held, done, cancelled, open or all, not \"{s}\""
+            )));
+        }
     };
     Ok(Json(json!({
         "files": iso.offboard.files.as_str(),
@@ -493,27 +604,56 @@ pub async fn of_user(State(app): State<AppState>, Path(key): Path<String>) -> Re
 /// `POST /api/users/{key}/teammate-accounts/{teammate}/remove`: removes the teammate's
 /// account for the user's Bots now, even if they still have access (their next run makes
 /// a new one). 200 when done, 202 with why when it's still pending.
-pub async fn remove_now(State(app): State<AppState>, Extension(by): Extension<Who>, Path((key, teammate)): Path<(String, String)>) -> Res<(StatusCode, Json<Value>)> {
+pub async fn remove_now(
+    State(app): State<AppState>,
+    Extension(by): Extension<Who>,
+    Path((key, teammate)): Path<(String, String)>,
+) -> Res<(StatusCode, Json<Value>)> {
     let iso = need_teammates(&app)?;
     let owner = need_user_key(&app, &key)?;
-    let t = app.db.find_user(&teammate).map_or(teammate.clone(), |t| t.id);
+    let t = app
+        .db
+        .find_user(&teammate)
+        .map_or(teammate.clone(), |t| t.id);
     if t == owner.id {
-        return Err(bad("That is the user's own account, which is never removed here. Name a teammate."));
+        return Err(bad(
+            "That is the user's own account, which is never removed here. Name a teammate.",
+        ));
     }
     if crate::accounts::teammate_account(&owner.id, &t).is_none() {
         return Err(bad("Name a teammate by id or email."));
     }
-    let (row, _) = queue(&app, &iso, &by, &owner.id, &t, ADMIN).ok_or_else(|| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Couldn't queue the removal.".into()))?;
+    let (row, _) = queue(&app, &iso, &by, &owner.id, &t, ADMIN).ok_or_else(|| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Couldn't queue the removal.".into(),
+        )
+    })?;
     // A removal already waiting for another reason is the admin's from now on, so a later
     // pass never cancels it because the teammate is wanted again.
     if row.reason != ADMIN && app.db.account_removal_force(&row.id) {
-        app.db.record(&removal_event(&by, "isolation.teammate_removal_forced", &row, json!({ "was": row.reason })));
+        app.db.record(&removal_event(
+            &by,
+            "isolation.teammate_removal_forced",
+            &row,
+            json!({ "was": row.reason }),
+        ));
     }
     let tried = try_removal(&app, &iso, &by, &row, true).await;
-    let after = app.db.account_removal(&row.id).map(|r| view(&app, &r)).unwrap_or(Value::Null);
+    let after = app
+        .db
+        .account_removal(&row.id)
+        .map(|r| view(&app, &r))
+        .unwrap_or(Value::Null);
     Ok(match tried {
-        Tried::Removed(r) => (StatusCode::OK, Json(json!({ "removal": after, "removed": r }))),
-        Tried::Failed(why) => (StatusCode::ACCEPTED, Json(json!({ "removal": after, "error": why }))),
+        Tried::Removed(r) => (
+            StatusCode::OK,
+            Json(json!({ "removal": after, "removed": r })),
+        ),
+        Tried::Failed(why) => (
+            StatusCode::ACCEPTED,
+            Json(json!({ "removal": after, "error": why })),
+        ),
         Tried::Cancelled | Tried::Busy => (StatusCode::ACCEPTED, Json(json!({ "removal": after }))),
     })
 }

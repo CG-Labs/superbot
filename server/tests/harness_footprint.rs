@@ -34,7 +34,7 @@
 mod common;
 
 use common::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -65,7 +65,10 @@ const MAX_IDLE_CPU_S: f64 = 1.0;
 const QUIESCE: Duration = Duration::from_secs(30);
 
 fn env_num(name: &str, default: u64) -> u64 {
-    std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 // ---------------------------------------------------------------------------------
@@ -81,7 +84,11 @@ fn stat(pid: i32) -> Option<Vec<u64>> {
     let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rest = s.rsplit_once(')')?.1;
     // State is a letter; keep the numeric fields at their positions.
-    Some(rest.split_whitespace().map(|f| f.parse().unwrap_or(0)).collect())
+    Some(
+        rest.split_whitespace()
+            .map(|f| f.parse().unwrap_or(0))
+            .collect(),
+    )
 }
 
 /// utime + stime of `pid`, and cutime + cstime (children it waited for), in ticks.
@@ -98,13 +105,18 @@ fn session_of(pid: i32) -> Option<u64> {
 /// them, so summing it over processes doesn't count shared libraries twice.
 fn memory_kib(pid: i32) -> (u64, u64) {
     let field = |text: &str, name: &str| {
-        text.lines().find_map(|l| l.strip_prefix(name)).and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+        text.lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
     };
     if let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")) {
         let rss = field(&s, "Rss:").unwrap_or(0);
         return (rss, field(&s, "Pss:").unwrap_or(rss));
     }
-    let rss = std::fs::read_to_string(format!("/proc/{pid}/status")).ok().and_then(|s| field(&s, "VmRSS:")).unwrap_or(0);
+    let rss = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|s| field(&s, "VmRSS:"))
+        .unwrap_or(0);
     (rss, rss)
 }
 
@@ -113,7 +125,13 @@ fn memory_kib(pid: i32) -> (u64, u64) {
 static LINGERING: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 
 fn lingering() -> Vec<i32> {
-    LINGERING.lock().unwrap().iter().copied().filter(|p| Path::new(&format!("/proc/{p}")).exists()).collect()
+    LINGERING
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .filter(|p| Path::new(&format!("/proc/{p}")).exists())
+        .collect()
 }
 
 /// Processes working for this botd, other than botd and those lingering: their folder or
@@ -122,17 +140,25 @@ fn lingering() -> Vec<i32> {
 fn run_processes(dir: &str, botd: i32) -> Vec<i32> {
     let me = std::process::id() as i32;
     let linger = LINGERING.lock().unwrap().clone();
-    all_processes(dir).into_iter().filter(|&pid| pid != botd && pid != me && !linger.contains(&pid)).collect()
+    all_processes(dir)
+        .into_iter()
+        .filter(|&pid| pid != botd && pid != me && !linger.contains(&pid))
+        .collect()
 }
 
 /// Every process whose folder or environment names `dir`.
 fn all_processes(dir: &str) -> Vec<i32> {
-    let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
     entries
         .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
         .filter(|pid| {
-            let in_dir = std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|c| c.starts_with(dir));
-            in_dir || std::fs::read(format!("/proc/{pid}/environ")).is_ok_and(|e| e.windows(dir.len()).any(|w| w == dir.as_bytes()))
+            let in_dir =
+                std::fs::read_link(format!("/proc/{pid}/cwd")).is_ok_and(|c| c.starts_with(dir));
+            in_dir
+                || std::fs::read(format!("/proc/{pid}/environ"))
+                    .is_ok_and(|e| e.windows(dir.len()).any(|w| w == dir.as_bytes()))
         })
         .collect()
 }
@@ -152,12 +178,18 @@ struct Usage {
 
 fn cmdline(pid: i32) -> String {
     let raw = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-    let line = String::from_utf8_lossy(&raw).replace('\0', " ").trim().to_string();
+    let line = String::from_utf8_lossy(&raw)
+        .replace('\0', " ")
+        .trim()
+        .to_string();
     line.chars().take(160).collect()
 }
 
 fn comm(pid: i32) -> String {
-    std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default().trim().to_string()
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 /// Samples the run processes every 50 ms until dropped, keeping the peaks.
@@ -169,7 +201,10 @@ struct Sampler {
 
 impl Sampler {
     fn start(dir: &str, botd: i32) -> Sampler {
-        let (stop, usage) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(Usage::default())));
+        let (stop, usage) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(Usage::default())),
+        );
         let (s, u, dir) = (stop.clone(), usage.clone(), dir.to_string());
         let sid = session_of(botd);
         let thread = std::thread::spawn(move || {
@@ -197,7 +232,11 @@ impl Sampler {
                 std::thread::sleep(SAMPLE_EVERY);
             }
         });
-        Sampler { stop, usage, thread: Some(thread) }
+        Sampler {
+            stop,
+            usage,
+            thread: Some(thread),
+        }
     }
 
     fn finish(mut self) -> Usage {
@@ -217,7 +256,9 @@ fn disk_bytes(path: &Path) -> u64 {
 /// `disk_bytes`, skipping files already counted in `seen`.
 fn disk_bytes_once(path: &Path, seen: &mut HashSet<(u64, u64)>) -> u64 {
     fn walk(p: &Path, seen: &mut HashSet<(u64, u64)>) -> u64 {
-        let Ok(m) = std::fs::symlink_metadata(p) else { return 0 };
+        let Ok(m) = std::fs::symlink_metadata(p) else {
+            return 0;
+        };
         if !seen.insert((m.dev(), m.ino())) {
             return 0;
         }
@@ -254,24 +295,48 @@ fn secs(d: Duration) -> f64 {
 /// its checkout and everything it runs on (Python, Node.js, uv, ffmpeg, caches) in one
 /// `.hermes` folder around its `hermes-agent` checkout, so that folder is the install.
 fn install_dirs(bin: &str) -> (Option<PathBuf>, Option<PathBuf>) {
-    let over = std::env::var(format!("SUPERBOT_FOOTPRINT_INSTALL_{}", bin.to_uppercase())).ok().filter(|v| !v.is_empty());
-    let exe = which(bin).and_then(|p| std::fs::canonicalize(p).ok()).map(unwrap_launcher);
-    let ancestor = |p: &Path, name: &str| p.ancestors().find(|a| a.file_name().is_some_and(|n| n == name)).map(Path::to_path_buf);
+    let over = std::env::var(format!("SUPERBOT_FOOTPRINT_INSTALL_{}", bin.to_uppercase()))
+        .ok()
+        .filter(|v| !v.is_empty());
+    let exe = which(bin)
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .map(unwrap_launcher);
+    let ancestor = |p: &Path, name: &str| {
+        p.ancestors()
+            .find(|a| a.file_name().is_some_and(|n| n == name))
+            .map(Path::to_path_buf)
+    };
     let install = over.map(PathBuf::from).or_else(|| {
         let exe = exe.as_deref()?;
-        let root = ancestor(exe, if bin == "hermes" { "hermes-agent" } else { "node_modules" })?;
+        let root = ancestor(
+            exe,
+            if bin == "hermes" {
+                "hermes-agent"
+            } else {
+                "node_modules"
+            },
+        )?;
         root.parent().map(Path::to_path_buf)
     });
     let runtime = match bin {
         "hermes" => None,
         // Node.js: its own folder (bin/node, lib/node_modules/npm) when it has one, as
         // nvm and the official tarballs do, else the binary alone (/usr/bin/node).
-        _ => which("node").and_then(|n| std::fs::canonicalize(n).ok()).map(|n| {
-            let own = n.parent().filter(|bin| bin.file_name().is_some_and(|b| b == "bin")).and_then(Path::parent).filter(|root| {
-                !matches!(root.to_str(), Some("/" | "/usr" | "/usr/local" | "/opt/homebrew")) && root.join("lib/node_modules/npm").is_dir()
-            });
-            own.map_or(n.clone(), Path::to_path_buf)
-        }),
+        _ => which("node")
+            .and_then(|n| std::fs::canonicalize(n).ok())
+            .map(|n| {
+                let own = n
+                    .parent()
+                    .filter(|bin| bin.file_name().is_some_and(|b| b == "bin"))
+                    .and_then(Path::parent)
+                    .filter(|root| {
+                        !matches!(
+                            root.to_str(),
+                            Some("/" | "/usr" | "/usr/local" | "/opt/homebrew")
+                        ) && root.join("lib/node_modules/npm").is_dir()
+                    });
+                own.map_or(n.clone(), Path::to_path_buf)
+            }),
     };
     (install, runtime)
 }
@@ -305,7 +370,16 @@ fn version(bin: &str, install: Option<&Path>) -> String {
     if let (Some(home), "hermes") = (install.and_then(Path::parent), bin) {
         cmd.env("HOME", home).env_remove("HERMES_HOME");
     }
-    cmd.output().map(|o| String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or_default().trim().to_string()).unwrap_or_default()
+    cmd.output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        })
+        .unwrap_or_default()
 }
 
 /// Follows a launcher script (`exec /path/to/real "$@"`) to what it runs, a few deep.
@@ -315,8 +389,22 @@ fn unwrap_launcher(mut exe: PathBuf) -> PathBuf {
             Ok(m) if m.len() < 4096 => std::fs::read_to_string(&exe).unwrap_or_default(),
             _ => break,
         };
-        let next = text.starts_with("#!").then(|| text.lines().find_map(|l| l.trim().strip_prefix("exec ")?.split_whitespace().next().map(PathBuf::from))).flatten();
-        match next.filter(|n| n.is_absolute()).and_then(|n| std::fs::canonicalize(n).ok()) {
+        let next = text
+            .starts_with("#!")
+            .then(|| {
+                text.lines().find_map(|l| {
+                    l.trim()
+                        .strip_prefix("exec ")?
+                        .split_whitespace()
+                        .next()
+                        .map(PathBuf::from)
+                })
+            })
+            .flatten();
+        match next
+            .filter(|n| n.is_absolute())
+            .and_then(|n| std::fs::canonicalize(n).ok())
+        {
             Some(n) => exe = n,
             None => break,
         }
@@ -344,14 +432,20 @@ fn botd_ticks(b: &Botd) -> (u64, u64) {
 }
 
 fn calls(b: &Botd) -> u64 {
-    b.model.as_ref().map_or(0, |m| m.calls.load(Ordering::SeqCst))
+    b.model
+        .as_ref()
+        .map_or(0, |m| m.calls.load(Ordering::SeqCst))
 }
 
 /// Waits until no process of any run is left, up to `limit`: how long a run's
 /// processes outlive its result (Hermes's daemon is stopped after the run ends). Those
 /// still there at the limit are taken as lingering.
 fn quiesce(b: &Botd, limit: Duration) -> Duration {
-    let (dir, pid, start) = (b.dir.display().to_string(), b.child.id() as i32, Instant::now());
+    let (dir, pid, start) = (
+        b.dir.display().to_string(),
+        b.child.id() as i32,
+        Instant::now(),
+    );
     loop {
         let left = run_processes(&dir, pid);
         if left.is_empty() {
@@ -375,13 +469,36 @@ fn measure(b: &Botd, bots: &[String], prompts: &[String]) -> Measured {
     let (dir, pid) = (b.dir.display().to_string(), b.child.id() as i32);
     quiesce(b, QUIESCE);
     let (calls0, (own0, kids0)) = (calls(b), botd_ticks(b));
-    let befores: Vec<usize> = bots.iter().map(|id| call(b, "GET", &format!("/api/bots/{id}/messages"), Value::Null).as_array().map_or(0, Vec::len)).collect();
+    let befores: Vec<usize> = bots
+        .iter()
+        .map(|id| {
+            call(b, "GET", &format!("/api/bots/{id}/messages"), Value::Null)
+                .as_array()
+                .map_or(0, Vec::len)
+        })
+        .collect();
     let sampler = Sampler::start(&dir, pid);
     let start = Instant::now();
-    let ids: Vec<Value> = bots.iter().zip(prompts).map(|(id, p)| call(b, "POST", &format!("/api/bots/{id}/messages"), json!({ "text": p }))["id"].clone()).collect();
+    let ids: Vec<Value> = bots
+        .iter()
+        .zip(prompts)
+        .map(|(id, p)| {
+            call(
+                b,
+                "POST",
+                &format!("/api/bots/{id}/messages"),
+                json!({ "text": p }),
+            )["id"]
+                .clone()
+        })
+        .collect();
     let limit = Duration::from_secs(if real() { 600 } else { 300 });
     let finished: Vec<Value> = wait_for("the runs to finish", limit, || {
-        let done: Vec<Value> = audit(b, "bot.run_finished").into_iter().map(|e| details(&e)).filter(|d| ids.contains(&d["messageId"])).collect();
+        let done: Vec<Value> = audit(b, "bot.run_finished")
+            .into_iter()
+            .map(|e| details(&e))
+            .filter(|d| ids.contains(&d["messageId"]))
+            .collect();
         (done.len() == ids.len()).then_some(done)
     });
     let wall = start.elapsed();
@@ -394,10 +511,21 @@ fn measure(b: &Botd, bots: &[String], prompts: &[String]) -> Measured {
     let mut texts = Vec::new();
     for (id, before) in bots.iter().zip(befores) {
         let msgs = call(b, "GET", &format!("/api/bots/{id}/messages"), Value::Null);
-        let fresh = msgs.as_array().map(|m| m[before.min(m.len())..].to_vec()).unwrap_or_default();
-        texts.extend(fresh.iter().filter(|m| m["role"] == "bot").map(|m| m["text"].as_str().unwrap_or_default().to_string()));
+        let fresh = msgs
+            .as_array()
+            .map(|m| m[before.min(m.len())..].to_vec())
+            .unwrap_or_default();
+        texts.extend(
+            fresh
+                .iter()
+                .filter(|m| m["role"] == "bot")
+                .map(|m| m["text"].as_str().unwrap_or_default().to_string()),
+        );
     }
-    let results: Vec<String> = finished.iter().map(|d| d["result"].as_str().unwrap_or_default().to_string()).collect();
+    let results: Vec<String> = finished
+        .iter()
+        .map(|d| d["result"].as_str().unwrap_or_default().to_string())
+        .collect();
     Measured {
         wall,
         result: results.join(","),
@@ -445,14 +573,28 @@ struct Settings {
 fn footprint(harness: &str, s: &Settings) -> (Value, Vec<String>) {
     let b = start(harness, false);
     let botd_pid = b.child.id() as i32;
-    let id = call(&b, "GET", "/api/bots", Value::Null)[0]["id"].as_str().unwrap().to_string();
+    let id = call(&b, "GET", "/api/bots", Value::Null)[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     // As in harness_e2e: the harness's own sandbox depends on the host, and the typical
     // run writes outside the workspace.
     call(&b, "PUT", "/api/policy", json!({ "sandbox": false }));
     // Hermes refuses a session without a model, and the fake endpoint has no default.
-    let model = if real() { std::env::var("SUPERBOT_E2E_BOT_MODEL").ok().filter(|m| !m.is_empty()) } else { (harness == "hermes").then(|| MODEL.to_string()) };
+    let model = if real() {
+        std::env::var("SUPERBOT_E2E_BOT_MODEL")
+            .ok()
+            .filter(|m| !m.is_empty())
+    } else {
+        (harness == "hermes").then(|| MODEL.to_string())
+    };
     if let Some(m) = &model {
-        call(&b, "PATCH", &format!("/api/bots/{id}"), json!({ "model": m }));
+        call(
+            &b,
+            "PATCH",
+            &format!("/api/bots/{id}"),
+            json!({ "model": m }),
+        );
     }
     let proof = std::fs::canonicalize(b.dir.join("proof")).unwrap();
     let home = b.dir.join("home");
@@ -463,20 +605,40 @@ fn footprint(harness: &str, s: &Settings) -> (Value, Vec<String>) {
             m.set_delay(d);
         }
     };
-    let hello = if real() { "Reply with the single word: ready. Use no tools.".to_string() } else { "hello".to_string() };
-    let typical = |bot: &str, i: u64| prompt(&format!("touch {}", proof.join(format!("{bot}-{i}.marker")).display()));
+    let hello = if real() {
+        "Reply with the single word: ready. Use no tools.".to_string()
+    } else {
+        "hello".to_string()
+    };
+    let typical = |bot: &str, i: u64| {
+        prompt(&format!(
+            "touch {}",
+            proof.join(format!("{bot}-{i}.marker")).display()
+        ))
+    };
     let mut broke = Vec::new();
 
     // Cold and warm start: one model turn, no tools, no model delay.
     delay(Duration::ZERO);
     let cold = measure(&b, std::slice::from_ref(&id), std::slice::from_ref(&hello));
-    let warm: Vec<Measured> = (0..2).map(|_| measure(&b, std::slice::from_ref(&id), std::slice::from_ref(&hello))).collect();
-    for (what, m) in std::iter::once(("cold start", &cold)).chain(warm.iter().map(|m| ("warm start", m))) {
+    let warm: Vec<Measured> = (0..2)
+        .map(|_| measure(&b, std::slice::from_ref(&id), std::slice::from_ref(&hello)))
+        .collect();
+    for (what, m) in
+        std::iter::once(("cold start", &cold)).chain(warm.iter().map(|m| ("warm start", m)))
+    {
         if m.result != "done" {
-            broke.push(format!("{what} run didn't finish (result {}): {}", m.result, m.text));
+            broke.push(format!(
+                "{what} run didn't finish (result {}): {}",
+                m.result, m.text
+            ));
         }
     }
-    println!("{harness}: cold start {:.2}s, warm {:.2}s", cold.wall.as_secs_f64(), warm[0].wall.as_secs_f64());
+    println!(
+        "{harness}: cold start {:.2}s, warm {:.2}s",
+        cold.wall.as_secs_f64(),
+        warm[0].wall.as_secs_f64()
+    );
 
     // Typical runs, each held open by the model's delay.
     delay(s.delay);
@@ -485,17 +647,33 @@ fn footprint(harness: &str, s: &Settings) -> (Value, Vec<String>) {
         let m = measure(&b, std::slice::from_ref(&id), &[typical(&id, i)]);
         let marker = proof.join(format!("{id}-{i}.marker"));
         if !marker.exists() || (!real() && !m.text.contains(DONE)) {
-            broke.push(format!("typical run {i} didn't run its command (result {}): {}", m.result, m.text));
+            broke.push(format!(
+                "typical run {i} didn't run its command (result {}): {}",
+                m.result, m.text
+            ));
         }
-        println!("{harness}: run {i}: {:.2}s, peak PSS {:.0} MiB, CPU {:.2}s", m.wall.as_secs_f64(), kib_mib(m.usage.peak_pss_kib), m.cpu_s);
+        println!(
+            "{harness}: run {i}: {:.2}s, peak PSS {:.0} MiB, CPU {:.2}s",
+            m.wall.as_secs_f64(),
+            kib_mib(m.usage.peak_pss_kib),
+            m.cpu_s
+        );
         runs.push(m);
     }
 
     // Per-Bot state: the Bot's state dir, and what the CLI wrote to its home.
     let bot_state = disk_bytes(&b.dir.join("data/bots").join(&id));
     let bot_state_breakdown = breakdown(&b.dir.join("data/bots").join(&id), 3);
-    let home_growth = if real() { None } else { Some(disk_bytes(&home).saturating_sub(home0)) };
-    let home_breakdown = if real() { Value::Null } else { breakdown(&home, 3) };
+    let home_growth = if real() {
+        None
+    } else {
+        Some(disk_bytes(&home).saturating_sub(home0))
+    };
+    let home_breakdown = if real() {
+        Value::Null
+    } else {
+        breakdown(&home, 3)
+    };
 
     // Several Bots at once, each on its first run.
     let mut extra = Vec::new();
@@ -504,34 +682,73 @@ fn footprint(harness: &str, s: &Settings) -> (Value, Vec<String>) {
         if let Some(m) = &model {
             body["model"] = json!(m);
         }
-        extra.push(call(&b, "POST", "/api/bots", body)["id"].as_str().unwrap().to_string());
+        extra.push(
+            call(&b, "POST", "/api/bots", body)["id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
     }
     let prompts: Vec<String> = extra.iter().map(|bot| typical(bot, 0)).collect();
     let together = measure(&b, &extra, &prompts);
-    let ran = extra.iter().filter(|bot| proof.join(format!("{bot}-0.marker")).exists()).count();
+    let ran = extra
+        .iter()
+        .filter(|bot| proof.join(format!("{bot}-0.marker")).exists())
+        .count();
     if ran != extra.len() {
-        broke.push(format!("{ran} of {} concurrent runs ran their command (results {})", extra.len(), together.result));
+        broke.push(format!(
+            "{ran} of {} concurrent runs ran their command (results {})",
+            extra.len(),
+            together.result
+        ));
     }
-    println!("{harness}: {} at once: {:.2}s, peak PSS {:.0} MiB", s.concurrency, together.wall.as_secs_f64(), kib_mib(together.usage.peak_pss_kib));
-    let new_bot_state = extra.iter().map(|bot| disk_bytes(&b.dir.join("data/bots").join(bot))).max().unwrap_or(0);
+    println!(
+        "{harness}: {} at once: {:.2}s, peak PSS {:.0} MiB",
+        s.concurrency,
+        together.wall.as_secs_f64(),
+        kib_mib(together.usage.peak_pss_kib)
+    );
+    let new_bot_state = extra
+        .iter()
+        .map(|bot| disk_bytes(&b.dir.join("data/bots").join(bot)))
+        .max()
+        .unwrap_or(0);
     // The same Bots again: the steady state, once each has run before.
     let prompts: Vec<String> = extra.iter().map(|bot| typical(bot, 1)).collect();
     let again = measure(&b, &extra, &prompts);
-    let ran = extra.iter().filter(|bot| proof.join(format!("{bot}-1.marker")).exists()).count();
+    let ran = extra
+        .iter()
+        .filter(|bot| proof.join(format!("{bot}-1.marker")).exists())
+        .count();
     if ran != extra.len() {
-        broke.push(format!("{ran} of {} concurrent warm runs ran their command (results {})", extra.len(), again.result));
+        broke.push(format!(
+            "{ran} of {} concurrent warm runs ran their command (results {})",
+            extra.len(),
+            again.result
+        ));
     }
-    println!("{harness}: {} at once again: {:.2}s, peak PSS {:.0} MiB", s.concurrency, again.wall.as_secs_f64(), kib_mib(again.usage.peak_pss_kib));
+    println!(
+        "{harness}: {} at once again: {:.2}s, peak PSS {:.0} MiB",
+        s.concurrency,
+        again.wall.as_secs_f64(),
+        kib_mib(again.usage.peak_pss_kib)
+    );
 
     // Idle: what's left once every run ended, the concurrent ones included (processes
     // that outlived a run by `QUIESCE` were moved to the lingering set), over 3 s.
     let quiesced = quiesce(&b, QUIESCE);
     let linger = lingering();
     let linger_rss: u64 = linger.iter().map(|&p| memory_kib(p).0).sum();
-    let linger_ticks0: u64 = linger.iter().filter_map(|&p| cpu_ticks(p).map(|t| t.0)).sum();
+    let linger_ticks0: u64 = linger
+        .iter()
+        .filter_map(|&p| cpu_ticks(p).map(|t| t.0))
+        .sum();
     let (botd_own0, _) = botd_ticks(&b);
     std::thread::sleep(Duration::from_secs(3));
-    let linger_ticks1: u64 = linger.iter().filter_map(|&p| cpu_ticks(p).map(|t| t.0)).sum();
+    let linger_ticks1: u64 = linger
+        .iter()
+        .filter_map(|&p| cpu_ticks(p).map(|t| t.0))
+        .sum();
     let linger_cpu = (linger_ticks1.saturating_sub(linger_ticks0)) as f64 / clk_tck();
     let linger_list: Vec<Value> = linger.iter().map(|&p| json!({ "command": comm(p), "cmdline": cmdline(p), "rssMiB": kib_mib(memory_kib(p).0) })).collect();
     let (botd_own1, _) = botd_ticks(&b);
@@ -552,7 +769,10 @@ fn footprint(harness: &str, s: &Settings) -> (Value, Vec<String>) {
     // Fit: concurrent runs per tier by memory, from the worst of one run alone and an
     // equal share of the concurrent peak.
     let share = |m: &Measured| kib_mib(m.usage.peak_pss_kib) / s.concurrency.max(1) as f64;
-    let per_run_pss = max(runs.iter().map(|m| kib_mib(m.usage.peak_pss_kib)).chain([share(&together), share(&again)]));
+    let per_run_pss = max(runs
+        .iter()
+        .map(|m| kib_mib(m.usage.peak_pss_kib))
+        .chain([share(&together), share(&again)]));
     let per_run_cpu = median(runs.iter().map(|m| m.cpu_s).collect());
     // The Bot's own state; what the CLI writes to its home is shared by the Bots of one OS user.
     let per_bot_disk = mib(bot_state.max(new_bot_state));
@@ -578,14 +798,31 @@ fn footprint(harness: &str, s: &Settings) -> (Value, Vec<String>) {
         .collect();
 
     if cold.wall > MAX_COLD_START {
-        broke.push(format!("cold start took {:?}, over {MAX_COLD_START:?}", cold.wall));
+        broke.push(format!(
+            "cold start took {:?}, over {MAX_COLD_START:?}",
+            cold.wall
+        ));
     }
     if per_run_pss > MAX_RUN_PSS_MIB {
-        broke.push(format!("a run's peak PSS was {per_run_pss:.0} MiB, over {MAX_RUN_PSS_MIB} MiB"));
+        broke.push(format!(
+            "a run's peak PSS was {per_run_pss:.0} MiB, over {MAX_RUN_PSS_MIB} MiB"
+        ));
     }
-    let mut commands: Vec<String> = runs.iter().chain([&together, &again]).flat_map(|m| m.usage.commands.iter().cloned()).collect::<HashSet<_>>().into_iter().collect();
+    let mut commands: Vec<String> = runs
+        .iter()
+        .chain([&together, &again])
+        .flat_map(|m| m.usage.commands.iter().cloned())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
     commands.sort();
-    let mut cmdlines: Vec<String> = runs.iter().chain([&together, &again]).flat_map(|m| m.usage.cmdlines.iter().cloned()).collect::<HashSet<_>>().into_iter().collect();
+    let mut cmdlines: Vec<String> = runs
+        .iter()
+        .chain([&together, &again])
+        .flat_map(|m| m.usage.cmdlines.iter().cloned())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
     cmdlines.sort();
 
     let report = json!({
@@ -655,12 +892,28 @@ fn footprint(harness: &str, s: &Settings) -> (Value, Vec<String>) {
 
 fn machine() -> Value {
     let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    let mem_kib = meminfo.lines().find_map(|l| l.strip_prefix("MemTotal:")).and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok()).unwrap_or(0);
-    let cpu = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default().lines().find_map(|l| l.strip_prefix("model name")).map(|v| v.trim_start_matches([' ', '\t', ':']).to_string());
-    let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default().trim().to_string();
+    let mem_kib = meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))
+        .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+        .unwrap_or(0);
+    let cpu = std::fs::read_to_string("/proc/cpuinfo")
+        .unwrap_or_default()
+        .lines()
+        .find_map(|l| l.strip_prefix("model name"))
+        .map(|v| v.trim_start_matches([' ', '\t', ':']).to_string());
+    let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     let commit = std::env::var("GITHUB_SHA").ok().or_else(|| {
-        let o = std::process::Command::new("git").args(["rev-parse", "HEAD"]).output().ok()?;
-        o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        let o = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()?;
+        o.status
+            .success()
+            .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
     });
     json!({
         "cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
@@ -691,9 +944,20 @@ fn markdown(report: &Value) -> String {
         let x = &h["summary"];
         md.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} ({}) |\n",
-            h["harness"].as_str().unwrap_or("?"), h["version"].as_str().unwrap_or("?"), x["installMiB"], x["perBotDiskMiB"], x["homeDiskMiB"],
-            x["coldStartS"], x["warmStartS"], x["runWallS"], x["perRunPeakPssMiB"], x["perRunPeakRssMiB"], x["perRunCpuS"],
-            x["perRunPeakProcesses"], x["idleProcesses"], x["idleRssMiB"],
+            h["harness"].as_str().unwrap_or("?"),
+            h["version"].as_str().unwrap_or("?"),
+            x["installMiB"],
+            x["perBotDiskMiB"],
+            x["homeDiskMiB"],
+            x["coldStartS"],
+            x["warmStartS"],
+            x["runWallS"],
+            x["perRunPeakPssMiB"],
+            x["perRunPeakRssMiB"],
+            x["perRunCpuS"],
+            x["perRunPeakProcesses"],
+            x["idleProcesses"],
+            x["idleRssMiB"],
         ));
     }
     md.push_str("\nConcurrent runs that fit each tier's machine by memory (machine memory less the reserve, over the peak PSS of one run):\n\n");
@@ -707,7 +971,15 @@ fn markdown(report: &Value) -> String {
     for h in &harnesses {
         md.push_str(&format!("| {} |", h["harness"].as_str().unwrap_or("?")));
         for t in h["tiers"].as_array().into_iter().flatten() {
-            md.push_str(&format!(" {}{} |", t["concurrentRunsByMemory"], if t["maxBotsRunAtOnce"] == true { "" } else { " (below maxBots)" }));
+            md.push_str(&format!(
+                " {}{} |",
+                t["concurrentRunsByMemory"],
+                if t["maxBotsRunAtOnce"] == true {
+                    ""
+                } else {
+                    " (below maxBots)"
+                }
+            ));
         }
         md.push('\n');
     }
@@ -723,7 +995,10 @@ fn markdown(report: &Value) -> String {
             h["processes"].as_array().map(|p| p.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default(),
         ));
         for b in h["ceilingsBroken"].as_array().into_iter().flatten() {
-            md.push_str(&format!("- Ceiling broken: {}\n", b.as_str().unwrap_or_default()));
+            md.push_str(&format!(
+                "- Ceiling broken: {}\n",
+                b.as_str().unwrap_or_default()
+            ));
         }
     }
     md
@@ -738,11 +1013,18 @@ fn harness_footprint() {
         delay: Duration::from_millis(env_num("SUPERBOT_FOOTPRINT_MODEL_DELAY_MS", 1500)),
         reserve_mib: env_num("SUPERBOT_FOOTPRINT_RESERVE_MIB", 512),
     };
-    let out = std::env::var("SUPERBOT_FOOTPRINT_OUT").map(PathBuf::from).unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/footprint"));
+    let out = std::env::var("SUPERBOT_FOOTPRINT_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/footprint"));
     std::fs::create_dir_all(&out).unwrap();
     let mut harnesses = Vec::new();
     let mut broke = BTreeMap::new();
-    for (harness, bin) in [("hermes", "hermes"), ("claude", "claude"), ("codex", "codex"), ("pi", "pi")] {
+    for (harness, bin) in [
+        ("hermes", "hermes"),
+        ("claude", "claude"),
+        ("codex", "codex"),
+        ("pi", "pi"),
+    ] {
         if !wanted(harness, bin) {
             continue;
         }
@@ -764,7 +1046,11 @@ fn harness_footprint() {
         },
         "harnesses": harnesses,
     });
-    std::fs::write(out.join("footprint.json"), serde_json::to_string_pretty(&report).unwrap()).unwrap();
+    std::fs::write(
+        out.join("footprint.json"),
+        serde_json::to_string_pretty(&report).unwrap(),
+    )
+    .unwrap();
     let md = markdown(&report);
     std::fs::write(out.join("footprint.md"), &md).unwrap();
     println!("\n{md}\nReport: {}", out.display());

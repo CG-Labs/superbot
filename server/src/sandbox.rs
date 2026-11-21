@@ -9,12 +9,26 @@ use std::path::{Path, PathBuf};
 /// `pip install` fail in a sandbox that keeps HOME read-only. Never folders that hold
 /// programs or settings (`~/.local`, `~/.cargo/bin`, `~/.config`): a Bot that could
 /// change those could change what runs outside its sandbox later.
-pub const CACHE_DIRS: [&str; 9] = [".cache", ".npm", ".cargo/registry", ".cargo/git", "go/pkg/mod", ".bun/install/cache", ".yarn/berry/cache", ".gradle/caches", ".m2/repository"];
+pub const CACHE_DIRS: [&str; 9] = [
+    ".cache",
+    ".npm",
+    ".cargo/registry",
+    ".cargo/git",
+    "go/pkg/mod",
+    ".bun/install/cache",
+    ".yarn/berry/cache",
+    ".gradle/caches",
+    ".m2/repository",
+];
 
 /// The cache folders that exist under `home`. A missing one isn't listed: Codex refuses
 /// to start a sandbox with a writable folder that doesn't exist. Links aren't followed.
 pub fn caches(home: &Path) -> Vec<PathBuf> {
-    CACHE_DIRS.iter().map(|d| home.join(d)).filter(|p| plain_down_to(home, p)).collect()
+    CACHE_DIRS
+        .iter()
+        .map(|d| home.join(d))
+        .filter(|p| plain_down_to(home, p))
+        .collect()
 }
 
 /// [`caches`], after making the missing ones (mode 0700, the folders on the way 0755,
@@ -38,7 +52,10 @@ pub fn ensure_caches(home: &Path) -> Vec<PathBuf> {
                 Ok(m) if m.file_type().is_dir() => continue,
                 Ok(_) => break,
                 Err(_) if std::fs::DirBuilder::new().mode(mode).create(&at).is_ok() => {
-                    let _ = std::fs::set_permissions(&at, std::os::unix::fs::PermissionsExt::from_mode(mode));
+                    let _ = std::fs::set_permissions(
+                        &at,
+                        std::os::unix::fs::PermissionsExt::from_mode(mode),
+                    );
                 }
                 Err(_) => break,
             }
@@ -72,7 +89,9 @@ pub fn makeable_caches(home: &Path) -> Vec<PathBuf> {
 
 /// Whether every folder from `home` (exclusive) down to `p` is a real folder, not a link.
 fn plain_down_to(home: &Path, p: &Path) -> bool {
-    let Ok(rel) = p.strip_prefix(home) else { return false };
+    let Ok(rel) = p.strip_prefix(home) else {
+        return false;
+    };
     let mut at = home.to_path_buf();
     rel.components().all(|c| {
         at.push(c);
@@ -99,7 +118,10 @@ pub struct Host {
 impl Host {
     /// Whether a sandbox that needs `programs` can start here.
     pub fn has(&self, programs: &[&str]) -> bool {
-        self.namespaces && programs.iter().all(|n| self.programs.iter().any(|p| p == n))
+        self.namespaces
+            && programs
+                .iter()
+                .all(|n| self.programs.iter().any(|p| p == n))
     }
 }
 
@@ -125,7 +147,10 @@ pub fn host_as(ids: Option<(u32, u32)>) -> Host {
 
 #[cfg(target_os = "macos")]
 fn probe(_ids: Option<(u32, u32)>) -> Host {
-    Host { namespaces: Path::new("/usr/bin/sandbox-exec").exists(), programs: PROGRAMS.map(String::from).into() }
+    Host {
+        namespaces: Path::new("/usr/bin/sandbox-exec").exists(),
+        programs: PROGRAMS.map(String::from).into(),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -143,11 +168,31 @@ fn probe(ids: Option<(u32, u32)>) -> Host {
             .status()
             .is_ok_and(|s| s.success())
     };
-    let bwrap = ok("bwrap", &["--unshare-user", "--unshare-net", "--ro-bind", "/", "/", "true"]);
+    let bwrap = ok(
+        "bwrap",
+        &[
+            "--unshare-user",
+            "--unshare-net",
+            "--ro-bind",
+            "/",
+            "/",
+            "true",
+        ],
+    );
     let namespaces = bwrap || ok("unshare", &["--user", "--map-root-user", "--net", "true"]);
-    let on_path = |name: &str| std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()));
-    let programs = PROGRAMS.iter().filter(|n| if **n == "bwrap" { bwrap } else { on_path(n) }).map(|n| n.to_string()).collect();
-    Host { namespaces, programs }
+    let on_path = |name: &str| {
+        std::env::var_os("PATH")
+            .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()))
+    };
+    let programs = PROGRAMS
+        .iter()
+        .filter(|n| if **n == "bwrap" { bwrap } else { on_path(n) })
+        .map(|n| n.to_string())
+        .collect();
+    Host {
+        namespaces,
+        programs,
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -160,8 +205,12 @@ mod tests {
     use super::*;
 
     fn temp_home(name: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let home = std::env::temp_dir().join(format!("sandbox-{name}-{}-{nanos}", std::process::id()));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home =
+            std::env::temp_dir().join(format!("sandbox-{name}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&home).unwrap();
         home
     }
@@ -170,7 +219,11 @@ mod tests {
     fn a_user_is_checked_as_that_user() {
         // SAFETY: plain getters.
         let me = unsafe { (libc::getuid(), libc::getgid()) };
-        assert_eq!(host_as(Some(me)), host(), "this process's own user sees what it sees");
+        assert_eq!(
+            host_as(Some(me)),
+            host(),
+            "this process's own user sees what it sees"
+        );
         assert_eq!(host_as(Some(me)), host_as(Some(me)), "checked once");
     }
 
@@ -186,7 +239,10 @@ mod tests {
         std::fs::create_dir_all(home.join("linked")).unwrap();
         std::os::unix::fs::symlink(home.join("linked"), home.join(".bun")).unwrap();
         std::fs::create_dir_all(home.join("linked/install/cache")).unwrap();
-        assert_eq!(caches(&home), [home.join(".npm"), home.join(".cargo/registry")]);
+        assert_eq!(
+            caches(&home),
+            [home.join(".npm"), home.join(".cargo/registry")]
+        );
         assert!(caches(Path::new("/no/such/home")).is_empty());
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -199,17 +255,46 @@ mod tests {
         std::os::unix::fs::symlink(&outside, home.join(".gradle")).unwrap();
         std::fs::write(home.join(".m2"), "not a folder").unwrap();
         let made = ensure_caches(&home);
-        let want: Vec<PathBuf> = CACHE_DIRS.iter().filter(|d| !d.starts_with(".gradle") && !d.starts_with(".m2")).map(|d| home.join(d)).collect();
+        let want: Vec<PathBuf> = CACHE_DIRS
+            .iter()
+            .filter(|d| !d.starts_with(".gradle") && !d.starts_with(".m2"))
+            .map(|d| home.join(d))
+            .collect();
         assert_eq!(made, want);
-        assert!(!outside.join("caches").exists(), "nothing made through the link");
-        assert_eq!(std::fs::metadata(home.join(".cargo/registry")).unwrap().permissions().mode() & 0o777, 0o700);
-        assert_eq!(std::fs::metadata(home.join(".cargo")).unwrap().permissions().mode() & 0o777, 0o755, "the way there stays searchable");
+        assert!(
+            !outside.join("caches").exists(),
+            "nothing made through the link"
+        );
+        assert_eq!(
+            std::fs::metadata(home.join(".cargo/registry"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(home.join(".cargo"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "the way there stays searchable"
+        );
         assert_eq!(ensure_caches(&home), want, "the same again");
         let fresh = temp_home("fresh");
         std::os::unix::fs::symlink(&outside, fresh.join(".npm")).unwrap();
         let listed = makeable_caches(&fresh);
-        assert!(!listed.contains(&fresh.join(".npm")) && listed.contains(&fresh.join(".cargo/registry")));
-        assert_eq!(ensure_caches(&fresh), listed, "what was listed is what gets made");
+        assert!(
+            !listed.contains(&fresh.join(".npm"))
+                && listed.contains(&fresh.join(".cargo/registry"))
+        );
+        assert_eq!(
+            ensure_caches(&fresh),
+            listed,
+            "what was listed is what gets made"
+        );
         let _ = std::fs::remove_dir_all(&fresh);
         assert!(ensure_caches(Path::new("/no/such/home")).is_empty());
         let _ = std::fs::remove_dir_all(&home);
@@ -218,11 +303,21 @@ mod tests {
 
     #[test]
     fn a_sandbox_starts_only_with_what_it_needs() {
-        let h = Host { namespaces: true, programs: vec!["socat".into()] };
+        let h = Host {
+            namespaces: true,
+            programs: vec!["socat".into()],
+        };
         assert!(h.has(&[]));
         assert!(h.has(&["socat"]) && !h.has(&["bwrap", "socat"]));
-        assert!(!Host { namespaces: false, programs: PROGRAMS.map(String::from).into() }.has(&[]));
-        let wire: Host = serde_json::from_str(r#"{"namespaces":true,"programs":["bwrap"]}"#).unwrap();
+        assert!(
+            !Host {
+                namespaces: false,
+                programs: PROGRAMS.map(String::from).into()
+            }
+            .has(&[])
+        );
+        let wire: Host =
+            serde_json::from_str(r#"{"namespaces":true,"programs":["bwrap"]}"#).unwrap();
         assert!(wire.has(&["bwrap"]));
     }
 }

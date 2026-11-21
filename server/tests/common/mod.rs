@@ -7,14 +7,14 @@
 use axum::body::Bytes;
 use axum::http::{Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 pub const PASSWORD: &str = "e2e-password";
@@ -67,22 +67,33 @@ pub fn fake_model() -> FakeModel {
     let (calls, delay_ms) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
     let (c, d) = (calls.clone(), delay_ms.clone());
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async move {
             let app = axum::Router::new().fallback(move |m: Method, u: Uri, b: Bytes| {
                 let (ids, calls, delay) = (ids.clone(), c.clone(), d.clone());
                 async move {
                     if m == Method::POST {
                         calls.fetch_add(1, Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(delay.load(Ordering::SeqCst))).await;
+                        tokio::time::sleep(Duration::from_millis(delay.load(Ordering::SeqCst)))
+                            .await;
                     }
                     serve(&m, u.path(), &b, &ids)
                 }
             });
-            axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app).await.unwrap();
+            axum::serve(tokio::net::TcpListener::from_std(listener).unwrap(), app)
+                .await
+                .unwrap();
         });
     });
-    FakeModel { port, calls, delay_ms }
+    FakeModel {
+        port,
+        calls,
+        delay_ms,
+    }
 }
 
 pub fn serve(method: &Method, path: &str, body: &[u8], ids: &AtomicU64) -> Response {
@@ -90,11 +101,25 @@ pub fn serve(method: &Method, path: &str, body: &[u8], ids: &AtomicU64) -> Respo
     let id = ids.fetch_add(1, Ordering::SeqCst);
     let stream = req["stream"].as_bool() == Some(true);
     match (method.as_str(), path) {
-        ("GET", p) if p.ends_with("/models") => json_response(json!({ "object": "list", "data": [{ "id": MODEL, "object": "model", "owned_by": "e2e" }] })),
-        ("POST", p) if p.ends_with("/messages/count_tokens") => json_response(json!({ "input_tokens": 1 })),
-        ("POST", p) if p.ends_with("/messages") => anthropic(decide(anthropic_turns(&req), anthropic_tools(&req)), stream, id),
-        ("POST", p) if p.ends_with("/responses") => responses(decide(responses_turns(&req), responses_tools(&req)), stream, id),
-        ("POST", p) if p.ends_with("/chat/completions") => chat(decide(chat_turns(&req), chat_tools(&req)), stream, id),
+        ("GET", p) if p.ends_with("/models") => json_response(
+            json!({ "object": "list", "data": [{ "id": MODEL, "object": "model", "owned_by": "e2e" }] }),
+        ),
+        ("POST", p) if p.ends_with("/messages/count_tokens") => {
+            json_response(json!({ "input_tokens": 1 }))
+        }
+        ("POST", p) if p.ends_with("/messages") => anthropic(
+            decide(anthropic_turns(&req), anthropic_tools(&req)),
+            stream,
+            id,
+        ),
+        ("POST", p) if p.ends_with("/responses") => responses(
+            decide(responses_turns(&req), responses_tools(&req)),
+            stream,
+            id,
+        ),
+        ("POST", p) if p.ends_with("/chat/completions") => {
+            chat(decide(chat_turns(&req), chat_tools(&req)), stream, id)
+        }
         _ => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
@@ -114,14 +139,30 @@ pub fn sse(events: Vec<(Option<&str>, Value)>, done: bool) -> Response {
     if done {
         out.push_str("data: [DONE]\n\n");
     }
-    ([("content-type", "text/event-stream"), ("cache-control", "no-cache")], out).into_response()
+    (
+        [
+            ("content-type", "text/event-stream"),
+            ("cache-control", "no-cache"),
+        ],
+        out,
+    )
+        .into_response()
 }
 
 /// Text of a string, or of the `text` parts of an array of content blocks.
 pub fn text_of(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
-        Value::Array(parts) => parts.iter().map(|p| p["text"].as_str().map(String::from).unwrap_or_else(|| text_of(&p["content"]))).collect::<Vec<_>>().join("\n"),
+        Value::Array(parts) => parts
+            .iter()
+            .map(|p| {
+                p["text"]
+                    .as_str()
+                    .map(String::from)
+                    .unwrap_or_else(|| text_of(&p["content"]))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
         Value::Null => String::new(),
         v => v.to_string(),
     }
@@ -145,16 +186,24 @@ pub fn decide(turns: Vec<Turn>, tools: Vec<(String, Value)>) -> Reply {
         }
     }
     match (want, result) {
-        (Some(_), Some(r)) => Reply::Text(format!("{DONE} {}", r.chars().take(600).collect::<String>())),
+        (Some(_), Some(r)) => Reply::Text(format!(
+            "{DONE} {}",
+            r.chars().take(600).collect::<String>()
+        )),
         (Some(Want::Tool(name, args)), None) => {
             let offered = name.split('/').next().unwrap_or_default();
             match tools.iter().any(|(n, _)| n == offered) {
                 true => Reply::Call { name, args },
-                false => Reply::Text(format!("E2E-NO-TOOL {name} among {:?}", tools.iter().map(|t| &t.0).collect::<Vec<_>>())),
+                false => Reply::Text(format!(
+                    "E2E-NO-TOOL {name} among {:?}",
+                    tools.iter().map(|t| &t.0).collect::<Vec<_>>()
+                )),
             }
         }
         (Some(Want::Run(c)), None) => {
-            let shell = ["Bash", "exec_command", "bash", "terminal", "shell"].iter().find_map(|n| tools.iter().find(|(name, _)| name == n));
+            let shell = ["Bash", "exec_command", "bash", "terminal", "shell"]
+                .iter()
+                .find_map(|n| tools.iter().find(|(name, _)| name == n));
             match shell {
                 Some((name, params)) => {
                     let command = &params["properties"]["command"];
@@ -164,9 +213,15 @@ pub fn decide(turns: Vec<Turn>, tools: Vec<(String, Value)>) -> Reply {
                         _ if command.is_object() => json!({ "command": c }),
                         _ => json!({ "cmd": c }),
                     };
-                    Reply::Call { name: name.clone(), args }
+                    Reply::Call {
+                        name: name.clone(),
+                        args,
+                    }
                 }
-                None => Reply::Text(format!("E2E-NO-SHELL-TOOL among {:?}", tools.iter().map(|t| &t.0).collect::<Vec<_>>())),
+                None => Reply::Text(format!(
+                    "E2E-NO-SHELL-TOOL among {:?}",
+                    tools.iter().map(|t| &t.0).collect::<Vec<_>>()
+                )),
             }
         }
         (None, _) => Reply::Text("E2E-NO-COMMAND".into()),
@@ -187,12 +242,19 @@ pub fn want_of(s: &str) -> Option<Want> {
         let args = rest.strip_prefix("<<")?.split_once(TOOL.1)?.0;
         return Some(Want::Tool(name.into(), serde_json::from_str(args).ok()?));
     }
-    after(RUN.0)?.split_once(RUN.1).map(|(c, _)| Want::Run(c.into()))
+    after(RUN.0)?
+        .split_once(RUN.1)
+        .map(|(c, _)| Want::Run(c.into()))
 }
 
 pub fn anthropic_turns(req: &Value) -> Vec<Turn> {
     let mut turns = Vec::new();
-    for m in req["messages"].as_array().into_iter().flatten().filter(|m| m["role"] == "user") {
+    for m in req["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| m["role"] == "user")
+    {
         match &m["content"] {
             Value::Array(blocks) => {
                 for b in blocks {
@@ -210,13 +272,21 @@ pub fn anthropic_turns(req: &Value) -> Vec<Turn> {
 }
 
 pub fn anthropic_tools(req: &Value) -> Vec<(String, Value)> {
-    req["tools"].as_array().into_iter().flatten().filter_map(|t| Some((t["name"].as_str()?.to_string(), t["input_schema"].clone()))).collect()
+    req["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| Some((t["name"].as_str()?.to_string(), t["input_schema"].clone())))
+        .collect()
 }
 
 pub fn anthropic(reply: Reply, stream: bool, id: u64) -> Response {
     let (block, stop) = match &reply {
         Reply::Text(t) => (json!({ "type": "text", "text": t }), "end_turn"),
-        Reply::Call { name, args } => (json!({ "type": "tool_use", "id": format!("toolu_e2e{id}"), "name": name, "input": args }), "tool_use"),
+        Reply::Call { name, args } => (
+            json!({ "type": "tool_use", "id": format!("toolu_e2e{id}"), "name": name, "input": args }),
+            "tool_use",
+        ),
     };
     let usage = json!({ "input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 });
     let message = json!({ "id": format!("msg_e2e{id}"), "type": "message", "role": "assistant", "model": MODEL, "stop_reason": stop, "stop_sequence": null, "usage": usage });
@@ -229,7 +299,10 @@ pub fn anthropic(reply: Reply, stream: bool, id: u64) -> Response {
     start["content"] = json!([]);
     start["stop_reason"] = Value::Null;
     let (open, delta) = match reply {
-        Reply::Text(t) => (json!({ "type": "text", "text": "" }), json!({ "type": "text_delta", "text": t })),
+        Reply::Text(t) => (
+            json!({ "type": "text", "text": "" }),
+            json!({ "type": "text_delta", "text": t }),
+        ),
         Reply::Call { name, args } => (
             json!({ "type": "tool_use", "id": format!("toolu_e2e{id}"), "name": name, "input": {} }),
             json!({ "type": "input_json_delta", "partial_json": args.to_string() }),
@@ -237,11 +310,26 @@ pub fn anthropic(reply: Reply, stream: bool, id: u64) -> Response {
     };
     sse(
         vec![
-            (Some("message_start"), json!({ "type": "message_start", "message": start })),
-            (Some("content_block_start"), json!({ "type": "content_block_start", "index": 0, "content_block": open })),
-            (Some("content_block_delta"), json!({ "type": "content_block_delta", "index": 0, "delta": delta })),
-            (Some("content_block_stop"), json!({ "type": "content_block_stop", "index": 0 })),
-            (Some("message_delta"), json!({ "type": "message_delta", "delta": { "stop_reason": stop, "stop_sequence": null }, "usage": { "output_tokens": 5 } })),
+            (
+                Some("message_start"),
+                json!({ "type": "message_start", "message": start }),
+            ),
+            (
+                Some("content_block_start"),
+                json!({ "type": "content_block_start", "index": 0, "content_block": open }),
+            ),
+            (
+                Some("content_block_delta"),
+                json!({ "type": "content_block_delta", "index": 0, "delta": delta }),
+            ),
+            (
+                Some("content_block_stop"),
+                json!({ "type": "content_block_stop", "index": 0 }),
+            ),
+            (
+                Some("message_delta"),
+                json!({ "type": "message_delta", "delta": { "stop_reason": stop, "stop_sequence": null }, "usage": { "output_tokens": 5 } }),
+            ),
             (Some("message_stop"), json!({ "type": "message_stop" })),
         ],
         false,
@@ -252,8 +340,12 @@ pub fn responses_turns(req: &Value) -> Vec<Turn> {
     let mut turns = Vec::new();
     for item in req["input"].as_array().into_iter().flatten() {
         match item["type"].as_str() {
-            Some("function_call_output") | Some("custom_tool_call_output") => turns.push(Turn::Result(text_of(&item["output"]))),
-            Some("message") | None if item["role"] == "user" => turns.push(Turn::User(text_of(&item["content"]))),
+            Some("function_call_output") | Some("custom_tool_call_output") => {
+                turns.push(Turn::Result(text_of(&item["output"])))
+            }
+            Some("message") | None if item["role"] == "user" => {
+                turns.push(Turn::User(text_of(&item["content"])))
+            }
             _ => {}
         }
     }
@@ -261,14 +353,24 @@ pub fn responses_turns(req: &Value) -> Vec<Turn> {
 }
 
 pub fn responses_tools(req: &Value) -> Vec<(String, Value)> {
-    req["tools"].as_array().into_iter().flatten().filter_map(|t| Some((t["name"].as_str()?.to_string(), t["parameters"].clone()))).collect()
+    req["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| Some((t["name"].as_str()?.to_string(), t["parameters"].clone())))
+        .collect()
 }
 
 pub fn responses(reply: Reply, stream: bool, id: u64) -> Response {
     let item = match reply {
-        Reply::Text(t) => json!({ "type": "message", "id": format!("msg_e2e{id}"), "role": "assistant", "status": "completed", "content": [{ "type": "output_text", "text": t, "annotations": [] }] }),
+        Reply::Text(t) => {
+            json!({ "type": "message", "id": format!("msg_e2e{id}"), "role": "assistant", "status": "completed", "content": [{ "type": "output_text", "text": t, "annotations": [] }] })
+        }
         // Freeform tools (Codex's `apply_patch`) take text, not JSON.
-        Reply::Call { name, args: Value::String(input) } => {
+        Reply::Call {
+            name,
+            args: Value::String(input),
+        } => {
             json!({ "type": "custom_tool_call", "id": format!("ctc_e2e{id}"), "call_id": format!("call_e2e{id}"), "name": name, "input": input, "status": "completed" })
         }
         Reply::Call { name, args } => {
@@ -287,10 +389,22 @@ pub fn responses(reply: Reply, stream: bool, id: u64) -> Response {
     }
     sse(
         vec![
-            (Some("response.created"), json!({ "type": "response.created", "response": { "id": format!("resp_e2e{id}"), "status": "in_progress", "output": [] } })),
-            (Some("response.output_item.added"), json!({ "type": "response.output_item.added", "output_index": 0, "item": item })),
-            (Some("response.output_item.done"), json!({ "type": "response.output_item.done", "output_index": 0, "item": item })),
-            (Some("response.completed"), json!({ "type": "response.completed", "response": done })),
+            (
+                Some("response.created"),
+                json!({ "type": "response.created", "response": { "id": format!("resp_e2e{id}"), "status": "in_progress", "output": [] } }),
+            ),
+            (
+                Some("response.output_item.added"),
+                json!({ "type": "response.output_item.added", "output_index": 0, "item": item }),
+            ),
+            (
+                Some("response.output_item.done"),
+                json!({ "type": "response.output_item.done", "output_index": 0, "item": item }),
+            ),
+            (
+                Some("response.completed"),
+                json!({ "type": "response.completed", "response": done }),
+            ),
         ],
         false,
     )
@@ -309,7 +423,17 @@ pub fn chat_turns(req: &Value) -> Vec<Turn> {
 }
 
 pub fn chat_tools(req: &Value) -> Vec<(String, Value)> {
-    req["tools"].as_array().into_iter().flatten().filter_map(|t| Some((t["function"]["name"].as_str()?.to_string(), t["function"]["parameters"].clone()))).collect()
+    req["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| {
+            Some((
+                t["function"]["name"].as_str()?.to_string(),
+                t["function"]["parameters"].clone(),
+            ))
+        })
+        .collect()
 }
 
 pub fn chat(reply: Reply, stream: bool, id: u64) -> Response {
@@ -338,8 +462,14 @@ pub fn chat(reply: Reply, stream: bool, id: u64) -> Response {
     last["usage"] = usage;
     sse(
         vec![
-            (None, chunk(json!([{ "index": 0, "delta": delta, "finish_reason": null }]))),
-            (None, chunk(json!([{ "index": 0, "delta": {}, "finish_reason": finish }]))),
+            (
+                None,
+                chunk(json!([{ "index": 0, "delta": delta, "finish_reason": null }])),
+            ),
+            (
+                None,
+                chunk(json!([{ "index": 0, "delta": {}, "finish_reason": finish }])),
+            ),
             (None, last),
         ],
         true,
@@ -360,7 +490,11 @@ impl Drop for Botd {
     fn drop(&mut self) {
         stop(&mut self.child, &self.dir);
         if std::thread::panicking() {
-            eprintln!("--- botd log ({}) ---\n{}", self.dir.display(), tail(&read(&self.dir.join("botd.log")), 80));
+            eprintln!(
+                "--- botd log ({}) ---\n{}",
+                self.dir.display(),
+                tail(&read(&self.dir.join("botd.log")), 80)
+            );
             eprintln!("(kept {} for a look)", self.dir.display());
         } else {
             let _ = std::fs::remove_dir_all(&self.dir);
@@ -407,23 +541,31 @@ pub fn exit_or_kill(child: &mut Child, limit: Duration) {
 
 /// Processes in session `sid`, from /proc (none where there is no /proc).
 pub fn in_session(sid: i32) -> Vec<i32> {
-    let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
     entries
         .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
         .filter(|pid| {
             // After the command's closing paren: state, ppid, pgrp, session.
             let stat = read(&PathBuf::from(format!("/proc/{pid}/stat")));
-            stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(3)?.parse::<i32>().ok()) == Some(sid)
+            stat.rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().nth(3)?.parse::<i32>().ok())
+                == Some(sid)
         })
         .collect()
 }
 
 /// Files named `name` under `dir`, at most `depth` folders down.
 pub fn find(dir: &Path, name: &str, depth: usize) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
     let mut found = Vec::new();
     for e in entries.flatten() {
-        let (path, Ok(kind)) = (e.path(), e.file_type()) else { continue };
+        let (path, Ok(kind)) = (e.path(), e.file_type()) else {
+            continue;
+        };
         if kind.is_dir() && depth > 0 {
             found.extend(find(&path, name, depth - 1));
         } else if kind.is_file() && e.file_name() == name {
@@ -443,11 +585,19 @@ pub fn real() -> bool {
 }
 
 pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 pub fn which(bin: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join(bin)).find(|f| f.is_file()))
+    std::env::var_os("PATH").and_then(|p| {
+        std::env::split_paths(&p)
+            .map(|d| d.join(bin))
+            .find(|f| f.is_file())
+    })
 }
 
 /// Whether to run `harness`: listed (or no list), and its CLI on PATH. Missing is a
@@ -460,26 +610,63 @@ pub fn wanted(harness: &str, bin: &str) -> bool {
         return false;
     }
     if which(bin).is_none() {
-        assert!(std::env::var("SUPERBOT_E2E_REQUIRE").as_deref() != Ok("1"), "`{bin}` isn't on PATH");
+        assert!(
+            std::env::var("SUPERBOT_E2E_REQUIRE").as_deref() != Ok("1"),
+            "`{bin}` isn't on PATH"
+        );
         println!("SKIP {harness}: `{bin}` isn't on PATH");
         return false;
     }
-    println!("RUN  {harness}: {}, {} model", which(bin).unwrap().display(), if real() { "real" } else { "fake" });
+    println!(
+        "RUN  {harness}: {}, {} model",
+        which(bin).unwrap().display(),
+        if real() { "real" } else { "fake" }
+    );
     true
 }
 
 /// Variables a harness login or provider may need in real mode; botd's own settings
 /// never pass, so a server's `.env` can't reach this throwaway botd.
 pub const REAL_ENV_PREFIXES: [&str; 16] = [
-    "ANTHROPIC_", "CLAUDE_", "OPENAI_", "CODEX_", "PI_", "HERMES_", "SUPERBOT_HERMES_", "OPENROUTER_", "NOUS_", "GEMINI_", "GOOGLE_", "XAI_",
-    "DEEPSEEK_", "MISTRAL_", "GROQ_", "AWS_",
+    "ANTHROPIC_",
+    "CLAUDE_",
+    "OPENAI_",
+    "CODEX_",
+    "PI_",
+    "HERMES_",
+    "SUPERBOT_HERMES_",
+    "OPENROUTER_",
+    "NOUS_",
+    "GEMINI_",
+    "GOOGLE_",
+    "XAI_",
+    "DEEPSEEK_",
+    "MISTRAL_",
+    "GROQ_",
+    "AWS_",
 ];
-pub const REAL_ENV: [&str; 11] = ["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "SHELL"];
+pub const REAL_ENV: [&str; 11] = [
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "TZ",
+    "TMPDIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "SHELL",
+];
 
 /// `unhooked`: botd's own `botctl hook` allows every call without asking botd, as a
 /// hook that doesn't reach the gate would; the rest of `botctl` is the real one.
 pub fn start(harness: &str, unhooked: bool) -> Botd {
-    let dir = std::env::temp_dir().join(format!("botd-harness-e2e-{harness}-{}-{}", std::process::id(), free_port()));
+    let dir = std::env::temp_dir().join(format!(
+        "botd-harness-e2e-{harness}-{}-{}",
+        std::process::id(),
+        free_port()
+    ));
     for d in ["data", "workspace", "home", "proof"] {
         std::fs::create_dir_all(dir.join(d)).unwrap();
     }
@@ -488,25 +675,41 @@ pub fn start(harness: &str, unhooked: bool) -> Botd {
     let botd = if unhooked {
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        for (from, to) in [(env!("CARGO_BIN_EXE_botd"), "botd"), (env!("CARGO_BIN_EXE_botctl"), "botctl.real"), (env!("CARGO_BIN_EXE_superbot-run"), "superbot-run")] {
+        for (from, to) in [
+            (env!("CARGO_BIN_EXE_botd"), "botd"),
+            (env!("CARGO_BIN_EXE_botctl"), "botctl.real"),
+            (env!("CARGO_BIN_EXE_superbot-run"), "superbot-run"),
+        ] {
             std::fs::copy(from, bin.join(to)).unwrap();
         }
         let stub = "#!/bin/sh\nif [ \"$1\" = hook ]; then cat >/dev/null; exit 0; fi\nexec \"$(dirname \"$0\")/botctl.real\" \"$@\"\n";
         std::fs::write(bin.join("botctl"), stub).unwrap();
-        std::fs::set_permissions(bin.join("botctl"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(
+            bin.join("botctl"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
         bin.join("botd")
     } else {
         PathBuf::from(env!("CARGO_BIN_EXE_botd"))
     };
     let mut cmd = Command::new(botd);
-    cmd.env_clear().current_dir(&dir).env("PATH", std::env::var("PATH").unwrap_or_default());
+    cmd.env_clear()
+        .current_dir(&dir)
+        .env("PATH", std::env::var("PATH").unwrap_or_default());
     let model = if real() {
         for (k, v) in std::env::vars() {
-            if REAL_ENV.contains(&k.as_str()) || REAL_ENV_PREFIXES.iter().any(|p| k.starts_with(p)) {
+            if REAL_ENV.contains(&k.as_str()) || REAL_ENV_PREFIXES.iter().any(|p| k.starts_with(p))
+            {
                 cmd.env(k, v);
             }
         }
-        for k in std::env::var("SUPERBOT_E2E_PASS_ENV").unwrap_or_default().split(',').map(str::trim).filter(|k| !k.is_empty()) {
+        for k in std::env::var("SUPERBOT_E2E_PASS_ENV")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+        {
             if let Ok(v) = std::env::var(k) {
                 cmd.env(k, v);
             }
@@ -542,8 +745,15 @@ pub fn start(harness: &str, unhooked: bool) -> Botd {
         .stderr(log)
         .spawn()
         .expect("start botd");
-    let b = Botd { child, port, dir, model };
-    wait_for("botd to start", Duration::from_secs(30), || (http(&b, "GET", "/healthz", "").0 == 200).then_some(()));
+    let b = Botd {
+        child,
+        port,
+        dir,
+        model,
+    };
+    wait_for("botd to start", Duration::from_secs(30), || {
+        (http(&b, "GET", "/healthz", "").0 == 200).then_some(())
+    });
     b
 }
 
@@ -565,7 +775,10 @@ pub fn fake_login(harness: &str, home: &Path, port: u16, cmd: &mut Command) {
             );
             // An MCP server with one tool, so MCP calls go through the hook too.
             std::fs::write(home.join("e2e-mcp.py"), MCP_SERVER).unwrap();
-            let config = format!("{config}\n[mcp_servers.e2e]\ncommand = \"python3\"\nargs = [{:?}]\n", home.join("e2e-mcp.py").display().to_string());
+            let config = format!(
+                "{config}\n[mcp_servers.e2e]\ncommand = \"python3\"\nargs = [{:?}]\n",
+                home.join("e2e-mcp.py").display().to_string()
+            );
             std::fs::write(home.join(".codex/config.toml"), config).unwrap();
             cmd.env("E2E_MODEL_KEY", KEY);
         }
@@ -574,8 +787,14 @@ pub fn fake_login(harness: &str, home: &Path, port: u16, cmd: &mut Command) {
             std::fs::create_dir_all(&agent).unwrap();
             let models = json!({ "providers": { "e2e": { "baseUrl": format!("{base}/v1"), "api": "openai-completions", "apiKey": KEY, "models": [{ "id": MODEL, "name": "E2E" }] } } });
             std::fs::write(agent.join("models.json"), models.to_string()).unwrap();
-            std::fs::write(agent.join("settings.json"), json!({ "defaultProvider": "e2e", "defaultModel": MODEL }).to_string()).unwrap();
-            cmd.env("PI_OFFLINE", "1").env("PI_SKIP_VERSION_CHECK", "1").env("PI_TELEMETRY", "0");
+            std::fs::write(
+                agent.join("settings.json"),
+                json!({ "defaultProvider": "e2e", "defaultModel": MODEL }).to_string(),
+            )
+            .unwrap();
+            cmd.env("PI_OFFLINE", "1")
+                .env("PI_SKIP_VERSION_CHECK", "1")
+                .env("PI_TELEMETRY", "0");
         }
         "hermes" => {
             // Each Bot's Hermes builds its runtime from uv's cache; share the installer's.
@@ -584,7 +803,9 @@ pub fn fake_login(harness: &str, home: &Path, port: u16, cmd: &mut Command) {
             } else if let Some(h) = std::env::var_os("HOME") {
                 cmd.env("UV_CACHE_DIR", PathBuf::from(h).join(".cache/uv"));
             }
-            cmd.env("SUPERBOT_HERMES_PROVIDER", "custom").env("SUPERBOT_HERMES_BASE_URL", format!("{base}/v1")).env("OPENAI_API_KEY", KEY);
+            cmd.env("SUPERBOT_HERMES_PROVIDER", "custom")
+                .env("SUPERBOT_HERMES_BASE_URL", format!("{base}/v1"))
+                .env("OPENAI_API_KEY", KEY);
         }
         h => panic!("no fake login for {h}"),
     }
@@ -614,7 +835,9 @@ for line in sys.stdin:
 "#;
 
 pub fn http(b: &Botd, method: &str, path: &str, body: &str) -> (u16, String) {
-    let Ok(mut s) = TcpStream::connect(("127.0.0.1", b.port)) else { return (0, String::new()) };
+    let Ok(mut s) = TcpStream::connect(("127.0.0.1", b.port)) else {
+        return (0, String::new());
+    };
     use base64::Engine;
     let auth = base64::engine::general_purpose::STANDARD.encode(format!("e2e:{PASSWORD}"));
     let req = format!(
@@ -626,11 +849,26 @@ pub fn http(b: &Botd, method: &str, path: &str, body: &str) -> (u16, String) {
     let mut res = String::new();
     let _ = s.read_to_string(&mut res);
     let (head, body) = res.split_once("\r\n\r\n").unwrap_or((&res, ""));
-    (head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0), body.to_string())
+    (
+        head.split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0),
+        body.to_string(),
+    )
 }
 
 pub fn call(b: &Botd, method: &str, path: &str, body: Value) -> Value {
-    let (code, text) = http(b, method, path, &if body.is_null() { String::new() } else { body.to_string() });
+    let (code, text) = http(
+        b,
+        method,
+        path,
+        &if body.is_null() {
+            String::new()
+        } else {
+            body.to_string()
+        },
+    );
     assert!((200..300).contains(&code), "{method} {path}: {code} {text}");
     serde_json::from_str(&text).unwrap_or(Value::Null)
 }
@@ -641,7 +879,10 @@ pub fn wait_for<T>(what: &str, limit: Duration, mut f: impl FnMut() -> Option<T>
         if let Some(v) = f() {
             return v;
         }
-        assert!(start.elapsed() < limit, "timed out after {limit:?} waiting for {what}");
+        assert!(
+            start.elapsed() < limit,
+            "timed out after {limit:?} waiting for {what}"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -658,7 +899,15 @@ pub fn details(e: &Value) -> Value {
 }
 
 pub fn audit(b: &Botd, action: &str) -> Vec<Value> {
-    call(b, "GET", &format!("/api/audit?action={action}&limit=200"), Value::Null)["events"].as_array().cloned().unwrap_or_default()
+    call(
+        b,
+        "GET",
+        &format!("/api/audit?action={action}&limit=200"),
+        Value::Null,
+    )["events"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// One run: what the Bot replied, how it ended, and the approvals it asked for.
@@ -672,30 +921,64 @@ pub struct Run {
 /// for `bot.run_finished` for this message. Each approval is held open a moment first,
 /// and `held` checks the call hasn't happened while the run waits on it.
 pub fn run(b: &Botd, bot: &str, prompt: &str, decide: Option<&str>, held: &dyn Fn()) -> Run {
-    let before = call(b, "GET", &format!("/api/bots/{bot}/messages"), Value::Null).as_array().unwrap().len();
-    let msg = call(b, "POST", &format!("/api/bots/{bot}/messages"), json!({ "text": prompt }));
+    let before = call(b, "GET", &format!("/api/bots/{bot}/messages"), Value::Null)
+        .as_array()
+        .unwrap()
+        .len();
+    let msg = call(
+        b,
+        "POST",
+        &format!("/api/bots/{bot}/messages"),
+        json!({ "text": prompt }),
+    );
     let id = msg["id"].clone();
     let mut approvals: Vec<Value> = Vec::new();
     let limit = Duration::from_secs(if real() { 300 } else { 120 });
-    let done = || audit(b, "bot.run_finished").into_iter().map(|e| details(&e)).find(|d| d["messageId"] == id);
+    let done = || {
+        audit(b, "bot.run_finished")
+            .into_iter()
+            .map(|e| details(&e))
+            .find(|d| d["messageId"] == id)
+    };
     let finished = wait_for("the run to finish", limit, || {
-        for a in call(b, "GET", "/api/approvals?status=pending", Value::Null).as_array().cloned().unwrap_or_default() {
+        for a in call(b, "GET", "/api/approvals?status=pending", Value::Null)
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
             if a["botId"] != bot || approvals.iter().any(|x| x["id"] == a["id"]) {
                 continue;
             }
             if let Some(d) = decide {
                 std::thread::sleep(Duration::from_secs(2));
-                assert!(done().is_none(), "the run finished while an approval was pending: {a}");
+                assert!(
+                    done().is_none(),
+                    "the run finished while an approval was pending: {a}"
+                );
                 held();
-                call(b, "POST", &format!("/api/approvals/{}/{d}", a["id"].as_str().unwrap()), json!({}));
+                call(
+                    b,
+                    "POST",
+                    &format!("/api/approvals/{}/{d}", a["id"].as_str().unwrap()),
+                    json!({}),
+                );
             }
             approvals.push(a);
         }
         done()
     });
     let msgs = call(b, "GET", &format!("/api/bots/{bot}/messages"), Value::Null);
-    let text = msgs.as_array().unwrap()[before..].iter().filter(|m| m["role"] == "bot").map(|m| m["text"].as_str().unwrap_or_default()).collect::<Vec<_>>().join("\n");
-    Run { text, result: finished["result"].as_str().unwrap_or_default().to_string(), approvals }
+    let text = msgs.as_array().unwrap()[before..]
+        .iter()
+        .filter(|m| m["role"] == "bot")
+        .map(|m| m["text"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Run {
+        text,
+        result: finished["result"].as_str().unwrap_or_default().to_string(),
+        approvals,
+    }
 }
 
 pub fn prompt(cmd: &str) -> String {

@@ -16,7 +16,11 @@ async fn serve() -> (u16, AppState, String, String, Arc<Fake>) {
     let p: Arc<dyn MachineProvider> = fake.clone();
     let (port, app, owner, key) =
         serve_app_with(|a| a.machines = Arc::new(ControlPlane::for_tests(p))).await;
-    let bot = key.auth(&app.db.create_bot("Ops", "#fff", "waddle", "claude", None, false).id);
+    let bot = key.auth(
+        &app.db
+            .create_bot("Ops", "#fff", "waddle", "claude", None, false)
+            .id,
+    );
     let (_, admin) = user_with(port, &owner, "ops@example.com", "admin").await;
     (port, app, admin, bot, fake)
 }
@@ -65,7 +69,11 @@ fn admin_routes(u: &str) -> Vec<(&'static str, String, &'static str)> {
         ("GET", format!("/api/users/{u}/machine/screens"), ""),
         ("DELETE", format!("/api/users/{u}/machine/screens/b1"), ""),
         ("GET", format!("/api/users/{u}/machine/rebuild"), ""),
-        ("POST", format!("/api/users/{u}/machine/rebuild?discardWork=true"), ""),
+        (
+            "POST",
+            format!("/api/users/{u}/machine/rebuild?discardWork=true"),
+            "",
+        ),
         ("DELETE", format!("/api/users/{u}/machine/rebuild"), ""),
         ("GET", "/api/machines/legacy".to_string(), ""),
     ]

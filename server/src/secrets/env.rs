@@ -2,7 +2,7 @@
 //! value (Docker and Kubernetes secrets, systemd credentials). Read-only. An empty
 //! value counts as unset, like the rest of botd's settings.
 
-use super::{redact, Error, Secret, SecretStore};
+use super::{Error, Secret, SecretStore, redact};
 use std::collections::HashMap;
 use zeroize::Zeroizing;
 
@@ -16,7 +16,11 @@ impl EnvStore {
 
     #[cfg(test)]
     pub fn fixed(vars: &[(&str, &str)]) -> EnvStore {
-        EnvStore(Some(vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()))
+        EnvStore(Some(
+            vars.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        ))
     }
 
     fn var(&self, k: &str) -> Option<String> {
@@ -30,7 +34,9 @@ impl EnvStore {
     fn keys(&self) -> Vec<String> {
         match &self.0 {
             Some(vars) => vars.keys().cloned().collect(),
-            None => std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()).collect(),
+            None => std::env::vars_os()
+                .filter_map(|(k, _)| k.into_string().ok())
+                .collect(),
         }
     }
 }
@@ -43,12 +49,20 @@ impl SecretStore for EnvStore {
     fn get(&self, name: &str) -> Result<Option<Secret>, Error> {
         let file_var = format!("{name}_FILE");
         match (self.var(name), self.var(&file_var)) {
-            (Some(_), Some(_)) => Err(Error::Invalid(format!("Set {name} or {file_var}, not both."))),
+            (Some(_), Some(_)) => Err(Error::Invalid(format!(
+                "Set {name} or {file_var}, not both."
+            ))),
             (Some(v), None) => Ok(Some(Secret::new(v))),
             (None, Some(path)) => {
-                let text = Zeroizing::new(std::fs::read_to_string(&path).map_err(|e| Error::Store(format!("{file_var} ({path}): {e}")))?);
+                let text = Zeroizing::new(
+                    std::fs::read_to_string(&path)
+                        .map_err(|e| Error::Store(format!("{file_var} ({path}): {e}")))?,
+                );
                 // Files usually end with a newline that isn't part of the secret.
-                let v = text.strip_suffix('\n').map(|t| t.strip_suffix('\r').unwrap_or(t)).unwrap_or(&text);
+                let v = text
+                    .strip_suffix('\n')
+                    .map(|t| t.strip_suffix('\r').unwrap_or(t))
+                    .unwrap_or(&text);
                 Ok((!v.is_empty()).then(|| Secret::new(v)))
             }
             (None, None) => Ok(None),
@@ -106,7 +120,20 @@ mod tests {
         assert!(env.get("D_TOKEN").unwrap().is_none());
         assert!(matches!(env.get("E_TOKEN"), Err(Error::Store(_))));
         assert!(env.get("NOPE").unwrap().is_none());
-        assert_eq!(env.names().unwrap(), ["AWS_ACCESS_KEY_ID", "A_TOKEN", "B_TOKEN", "C_TOKEN", "E_TOKEN"], "files of any secret-named variable, not LOG_FILE");
-        assert_eq!(env.get("AWS_ACCESS_KEY_ID").unwrap().unwrap().expose(), "from-file");
+        assert_eq!(
+            env.names().unwrap(),
+            [
+                "AWS_ACCESS_KEY_ID",
+                "A_TOKEN",
+                "B_TOKEN",
+                "C_TOKEN",
+                "E_TOKEN"
+            ],
+            "files of any secret-named variable, not LOG_FILE"
+        );
+        assert_eq!(
+            env.get("AWS_ACCESS_KEY_ID").unwrap().unwrap().expose(),
+            "from-file"
+        );
     }
 }

@@ -38,7 +38,10 @@ fn now_ms() -> i64 {
 }
 
 pub fn sha256_hex(b: &[u8]) -> String {
-    Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect()
+    Sha256::digest(b)
+        .iter()
+        .map(|x| format!("{x:02x}"))
+        .collect()
 }
 
 fn suffixed(p: &Path, s: &str) -> PathBuf {
@@ -72,7 +75,9 @@ pub struct Upgrader {
 /// `p`, if it is absolute with no `..` in it. The upgrader touches no other path:
 /// each one is the agent's own binary or state dir with a fixed name or suffix.
 fn plain(p: &Path) -> Result<PathBuf, String> {
-    let s = p.to_str().ok_or_else(|| format!("{} isn't UTF-8", p.display()))?;
+    let s = p
+        .to_str()
+        .ok_or_else(|| format!("{} isn't UTF-8", p.display()))?;
     if s.contains("..") {
         return Err(format!("{s} has \"..\" in it"));
     }
@@ -105,7 +110,11 @@ fn write_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
 
 fn write_json<T: Serialize>(path: &Path, v: &T) -> Result<(), String> {
     let tmp = suffixed(path, ".tmp");
-    write_file(&tmp, &serde_json::to_vec_pretty(v).unwrap_or_default(), 0o600)?;
+    write_file(
+        &tmp,
+        &serde_json::to_vec_pretty(v).unwrap_or_default(),
+        0o600,
+    )?;
     std::fs::rename(plain(&tmp)?, plain(path)?).map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -116,7 +125,10 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
 /// Keeps `path` as `path.prev` and puts `path.new` in its place, in one rename.
 fn swap(path: &Path) -> Result<(), String> {
     let path = &plain(path)?;
-    let (new, prev) = (plain(&suffixed(path, ".new"))?, plain(&suffixed(path, ".prev"))?);
+    let (new, prev) = (
+        plain(&suffixed(path, ".new"))?,
+        plain(&suffixed(path, ".prev"))?,
+    );
     remove(&prev);
     std::fs::hard_link(path, &prev)
         .or_else(|_| std::fs::copy(path, &prev).map(|_| ()))
@@ -140,7 +152,10 @@ impl Upgrader {
     /// for another build means the old agent is back (the guard put it back), so that
     /// upgrade rolled back.
     pub fn new(exe: PathBuf, state_dir: PathBuf, version: &str) -> Upgrader {
-        let build = plain(&exe).and_then(|p| std::fs::read(p).map_err(|e| e.to_string())).ok().map(|b| sha256_hex(&b));
+        let build = plain(&exe)
+            .and_then(|p| std::fs::read(p).map_err(|e| e.to_string()))
+            .ok()
+            .map(|b| sha256_hex(&b));
         let botctl = exe.with_file_name("botctl");
         let u = Upgrader {
             exe,
@@ -154,7 +169,8 @@ impl Upgrader {
         };
         if let Some(t) = read_json::<TrialFile>(&u.state_dir.join(TRIAL_FILE)) {
             if u.build.as_deref() == Some(&t.report.to_build) {
-                let left = Duration::from_secs(t.trial_secs.clamp(*TRIAL_SECS.start(), *TRIAL_SECS.end()));
+                let left =
+                    Duration::from_secs(t.trial_secs.clamp(*TRIAL_SECS.start(), *TRIAL_SECS.end()));
                 let mut r = t.report;
                 r.state = wire::UPGRADE_TRIAL.into();
                 *u.trial.lock().unwrap() = Some((r, tokio::time::Instant::now() + left));
@@ -236,28 +252,60 @@ impl Upgrader {
     pub fn refuse(&self, req: &UpgradeRequest, busy: usize) -> Option<(u16, String)> {
         let ok_version = !req.version.is_empty()
             && req.version.len() <= 64
-            && req.version.bytes().all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b));
-        let hex = |s: &str| s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-        if !ok_version || !hex(&req.sha256) || req.botctl_sha256.as_deref().is_some_and(|s| !hex(s)) {
-            return Some((400, "That isn't an upgrade: a version and SHA-256 hashes.".into()));
+            && req
+                .version
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b));
+        let hex =
+            |s: &str| s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if !ok_version || !hex(&req.sha256) || req.botctl_sha256.as_deref().is_some_and(|s| !hex(s))
+        {
+            return Some((
+                400,
+                "That isn't an upgrade: a version and SHA-256 hashes.".into(),
+            ));
         }
-        if req.id.is_empty() || req.id.len() > 64 || !req.id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        if req.id.is_empty()
+            || req.id.len() > 64
+            || !req.id.bytes().all(|b| b.is_ascii_alphanumeric())
+        {
             return Some((400, "The upgrade id isn't a plain name.".into()));
         }
         if !TRIAL_SECS.contains(&req.trial_secs) {
-            return Some((400, format!("trialSecs must be {} to {}.", TRIAL_SECS.start(), TRIAL_SECS.end())));
+            return Some((
+                400,
+                format!(
+                    "trialSecs must be {} to {}.",
+                    TRIAL_SECS.start(),
+                    TRIAL_SECS.end()
+                ),
+            ));
         }
         let Some(build) = &self.build else {
-            return Some((409, format!("This agent can't replace itself: {} isn't readable.", self.exe.display())));
+            return Some((
+                409,
+                format!(
+                    "This agent can't replace itself: {} isn't readable.",
+                    self.exe.display()
+                ),
+            ));
         };
         if *build == req.sha256 {
             return Some((409, "This agent is that build already.".into()));
         }
         if self.trial.lock().unwrap().is_some() {
-            return Some((409, "This agent is on trial after an upgrade; wait for it to finish.".into()));
+            return Some((
+                409,
+                "This agent is on trial after an upgrade; wait for it to finish.".into(),
+            ));
         }
         if busy > 0 {
-            return Some((409, format!("This machine is running {busy} jobs or logins; upgrade it when they're done.")));
+            return Some((
+                409,
+                format!(
+                    "This machine is running {busy} jobs or logins; upgrade it when they're done."
+                ),
+            ));
         }
         None
     }
@@ -317,20 +365,32 @@ impl Upgrader {
             let bytes = fetch(from).await?;
             let got = sha256_hex(&bytes);
             if got != *sha {
-                return Err(format!("{from} from the control plane has SHA-256 {got}, not {sha}"));
+                return Err(format!(
+                    "{from} from the control plane has SHA-256 {got}, not {sha}"
+                ));
             }
             write_file(&suffixed(path, ".new"), &bytes, 0o755)?;
         }
         let out = version_of(&suffixed(&self.exe, ".new")).await?;
         let said = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !out.status.success() || said != format!("superbot-machine {}", req.version) {
-            return Err(format!("the new agent says \"{}\", not superbot-machine {}", clip(&said), req.version));
+            return Err(format!(
+                "the new agent says \"{}\", not superbot-machine {}",
+                clip(&said),
+                req.version
+            ));
         }
         let mut report = self.current.lock().unwrap().clone().unwrap_or_default();
         report.state = wire::UPGRADE_TRIAL.into();
         report.at = now_ms();
         remove(&self.state_dir.join(STARTS_FILE));
-        write_json(&self.state_dir.join(TRIAL_FILE), &TrialFile { report, trial_secs: req.trial_secs })?;
+        write_json(
+            &self.state_dir.join(TRIAL_FILE),
+            &TrialFile {
+                report,
+                trial_secs: req.trial_secs,
+            },
+        )?;
         // botctl first: if the agent's swap fails, botctl goes back too.
         let mut done: Vec<&PathBuf> = Vec::new();
         for (path, _, _) in files.iter().rev() {
@@ -416,21 +476,42 @@ mod tests {
         assert!(u.begin(&r) && !u.begin(&r), "one at a time");
         u.stage(&r, serve).await.unwrap();
         assert_eq!(std::fs::read(&u.exe).unwrap(), NEW);
-        assert_eq!(std::fs::read(suffixed(&u.exe, ".prev")).unwrap(), b"old agent");
+        assert_eq!(
+            std::fs::read(suffixed(&u.exe, ".prev")).unwrap(),
+            b"old agent"
+        );
         assert_eq!(std::fs::read(&u.botctl).unwrap(), b"new botctl");
         assert!(state.join(TRIAL_FILE).exists());
 
         // The restart: the new build finds its trial.
         let next = Upgrader::new(u.exe.clone(), state.clone(), "0.1.0");
         assert_eq!(next.build.as_deref(), Some(r.sha256.as_str()));
-        assert_eq!(next.report().map(|r| r.state), Some(wire::UPGRADE_TRIAL.to_string()));
+        assert_eq!(
+            next.report().map(|r| r.state),
+            Some(wire::UPGRADE_TRIAL.to_string())
+        );
         assert!(next.trial_deadline().is_some());
-        assert_eq!(next.refuse(&req(b"newer"), 0).map(|(c, _)| c), Some(409), "not while on trial");
+        assert_eq!(
+            next.refuse(&req(b"newer"), 0).map(|(c, _)| c),
+            Some(409),
+            "not while on trial"
+        );
         assert!(next.commit() && !next.commit());
         let last = next.report().unwrap();
-        assert_eq!((last.state.as_str(), last.id.as_str(), last.from_build.as_str()), (wire::UPGRADE_DONE, "u1", sha256_hex(b"old agent").as_str()));
+        assert_eq!(
+            (
+                last.state.as_str(),
+                last.id.as_str(),
+                last.from_build.as_str()
+            ),
+            (wire::UPGRADE_DONE, "u1", sha256_hex(b"old agent").as_str())
+        );
         assert!(!suffixed(&u.exe, ".prev").exists() && !state.join(TRIAL_FILE).exists());
-        assert_eq!(next.refuse(&r, 0).map(|(c, _)| c), Some(409), "that build already");
+        assert_eq!(
+            next.refuse(&r, 0).map(|(c, _)| c),
+            Some(409),
+            "that build already"
+        );
     }
 
     #[tokio::test]
@@ -449,9 +530,16 @@ mod tests {
 
         // Right hash, but it isn't an agent of that version.
         let liar: &'static [u8] = b"#!/bin/sh\necho superbot-machine 9.9.9\n";
-        let r = UpgradeRequest { sha256: sha256_hex(liar), botctl_sha256: None, ..req(liar) };
+        let r = UpgradeRequest {
+            sha256: sha256_hex(liar),
+            botctl_sha256: None,
+            ..req(liar)
+        };
         assert!(u.begin(&r));
-        let err = u.stage(&r, move |_| async move { Ok(liar.to_vec()) }).await.unwrap_err();
+        let err = u
+            .stage(&r, move |_| async move { Ok(liar.to_vec()) })
+            .await
+            .unwrap_err();
         assert!(err.contains("9.9.9"), "{err}");
         assert_eq!(std::fs::read(&u.exe).unwrap(), b"old agent");
     }
@@ -467,7 +555,10 @@ mod tests {
         assert_eq!(std::fs::read(&u.exe).unwrap(), b"old agent");
         assert_eq!(std::fs::read(&u.botctl).unwrap(), b"old botctl");
         let last = next.report().unwrap();
-        assert_eq!((last.state.as_str(), last.reason.as_deref()), (wire::UPGRADE_ROLLED_BACK, Some("no heartbeat")));
+        assert_eq!(
+            (last.state.as_str(), last.reason.as_deref()),
+            (wire::UPGRADE_ROLLED_BACK, Some("no heartbeat"))
+        );
 
         // The guard put it back instead: the old agent says so when it starts.
         let (u, state) = upgrader("guarded", b"old agent");
@@ -475,9 +566,16 @@ mod tests {
         u.stage(&r, serve).await.unwrap();
         restore(&u.exe).unwrap();
         let old = Upgrader::new(u.exe.clone(), state.clone(), "0.1.0");
-        assert_eq!(old.report().map(|r| r.state), Some(wire::UPGRADE_ROLLED_BACK.to_string()));
+        assert_eq!(
+            old.report().map(|r| r.state),
+            Some(wire::UPGRADE_ROLLED_BACK.to_string())
+        );
         assert!(!state.join(TRIAL_FILE).exists());
-        assert_eq!(std::fs::read(&u.botctl).unwrap(), b"old botctl", "botctl goes back with it");
+        assert_eq!(
+            std::fs::read(&u.botctl).unwrap(),
+            b"old botctl",
+            "botctl goes back with it"
+        );
         assert!(!suffixed(&u.botctl, ".prev").exists());
     }
 
@@ -485,14 +583,30 @@ mod tests {
     fn requests_are_checked() {
         let (u, _) = upgrader("checks", b"old agent");
         for bad in [
-            UpgradeRequest { version: "1 0".into(), ..req(NEW) },
-            UpgradeRequest { sha256: "ABC".into(), ..req(NEW) },
-            UpgradeRequest { id: "../x".into(), ..req(NEW) },
-            UpgradeRequest { trial_secs: 1, ..req(NEW) },
+            UpgradeRequest {
+                version: "1 0".into(),
+                ..req(NEW)
+            },
+            UpgradeRequest {
+                sha256: "ABC".into(),
+                ..req(NEW)
+            },
+            UpgradeRequest {
+                id: "../x".into(),
+                ..req(NEW)
+            },
+            UpgradeRequest {
+                trial_secs: 1,
+                ..req(NEW)
+            },
         ] {
             assert_eq!(u.refuse(&bad, 0).map(|(c, _)| c), Some(400), "{bad:?}");
         }
-        let none = Upgrader::new(PathBuf::from("/nonexistent/superbot-machine"), std::env::temp_dir(), "0.1.0");
+        let none = Upgrader::new(
+            PathBuf::from("/nonexistent/superbot-machine"),
+            std::env::temp_dir(),
+            "0.1.0",
+        );
         assert_eq!(none.build, None);
         assert_eq!(none.refuse(&req(NEW), 0).map(|(c, _)| c), Some(409));
     }
@@ -500,12 +614,22 @@ mod tests {
     #[test]
     fn only_plain_absolute_paths_are_touched() {
         let (u, _) = upgrader("plain", b"old agent");
-        let dotted = u.exe.parent().unwrap().join("..").join(u.exe.strip_prefix("/").unwrap());
+        let dotted = u
+            .exe
+            .parent()
+            .unwrap()
+            .join("..")
+            .join(u.exe.strip_prefix("/").unwrap());
         assert!(plain(&dotted).is_err() && plain(Path::new("superbot-machine")).is_err());
         assert_eq!(plain(&u.exe).unwrap(), u.exe);
         let odd = Upgrader::new(dotted.clone(), std::env::temp_dir(), "0.1.0");
-        assert_eq!(odd.build, None, "it won't replace a binary it reached through ..");
-        assert!(write_file(&dotted, b"x", 0o600).is_err() && read_json::<TrialFile>(&dotted).is_none());
+        assert_eq!(
+            odd.build, None,
+            "it won't replace a binary it reached through .."
+        );
+        assert!(
+            write_file(&dotted, b"x", 0o600).is_err() && read_json::<TrialFile>(&dotted).is_none()
+        );
         assert_eq!(std::fs::read(&u.exe).unwrap(), b"old agent");
     }
 }

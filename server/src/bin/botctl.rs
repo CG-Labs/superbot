@@ -6,7 +6,7 @@
 //! approvals, policy, users, and sessions from a shell on the server (`SUPERBOT_TOKEN`
 //! from `botctl login`, or the break-glass `SUPERBOT_PASSWORD`).
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::io::{BufRead, Read, Write};
 use std::net::TcpStream;
 
@@ -174,7 +174,12 @@ fn send(cred: Cred, method: &str, path: &str, body: Option<String>) -> Result<Tc
     let auth = match cred {
         Cred::Bot => match (std::env::var("BOT_API"), std::env::var("BOT_TOKEN")) {
             (Ok(_), Ok(token)) => format!("Bearer {token}"),
-            _ => return Err("botctl only works inside a Bot run (BOT_API and BOT_TOKEN are missing).".into()),
+            _ => {
+                return Err(
+                    "botctl only works inside a Bot run (BOT_API and BOT_TOKEN are missing)."
+                        .into(),
+                );
+            }
         },
         Cred::Operator => operator_auth()?,
         Cred::Anonymous => String::new(),
@@ -183,23 +188,35 @@ fn send(cred: Cred, method: &str, path: &str, body: Option<String>) -> Result<Tc
     let addr = addr(&base)?;
     let operator = !matches!(cred, Cred::Bot);
     if operator && !loopback(addr) {
-        return Err(format!("botctl sends SUPERBOT_TOKEN, SUPERBOT_PASSWORD, and sign-in codes only to a server on this machine, not {addr}. Run it on the server, or set BOT_API to an SSH tunnel on 127.0.0.1."));
+        return Err(format!(
+            "botctl sends SUPERBOT_TOKEN, SUPERBOT_PASSWORD, and sign-in codes only to a server on this machine, not {addr}. Run it on the server, or set BOT_API to an SSH tunnel on 127.0.0.1."
+        ));
     }
     let (mut s, target, via) = match TcpStream::connect(addr) {
         Ok(s) => (s, path.to_string(), String::new()),
         Err(e) => match proxy().filter(|_| !operator) {
             Some(p) => {
-                let s = TcpStream::connect(p.addr.as_str()).map_err(|_| format!("Can't reach the server: {e}"))?;
-                let via = p.auth.map(|a| format!("Proxy-Authorization: Basic {}\r\n", base64(a.as_bytes()))).unwrap_or_default();
+                let s = TcpStream::connect(p.addr.as_str())
+                    .map_err(|_| format!("Can't reach the server: {e}"))?;
+                let via = p
+                    .auth
+                    .map(|a| format!("Proxy-Authorization: Basic {}\r\n", base64(a.as_bytes())))
+                    .unwrap_or_default();
                 (s, format!("http://{addr}{path}"), via)
             }
             None => return Err(format!("Can't reach the server: {e}")),
         },
     };
     if operator && !s.peer_addr().is_ok_and(|a| a.ip().is_loopback()) {
-        return Err(format!("{addr} isn't on this machine, so botctl won't send credentials there."));
+        return Err(format!(
+            "{addr} isn't on this machine, so botctl won't send credentials there."
+        ));
     }
-    let auth = if auth.is_empty() { String::new() } else { format!("Authorization: {auth}\r\n") };
+    let auth = if auth.is_empty() {
+        String::new()
+    } else {
+        format!("Authorization: {auth}\r\n")
+    };
     let body = body.unwrap_or_default();
     // BOT_TOKEN is this Bot's own, so it says which Bot is calling (ADR 0029).
     let req = format!(
@@ -216,7 +233,11 @@ fn api(cred: Cred, method: &str, path: &str, body: Option<String>) -> Result<Str
     let mut res = String::new();
     s.read_to_string(&mut res).map_err(|e| e.to_string())?;
     let (head, body) = res.split_once("\r\n\r\n").unwrap_or((&res, ""));
-    let code: u16 = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    let code: u16 = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
     if (200..300).contains(&code) {
         Ok(body.to_string())
     } else {
@@ -229,14 +250,21 @@ fn failure(code: u16, body: &str) -> String {
     struct Failure {
         error: String,
     }
-    let msg = <Failure as serde::Deserialize>::deserialize(&mut serde_json::Deserializer::from_str(body)).map(|f| f.error).unwrap_or(body.into());
+    let msg =
+        <Failure as serde::Deserialize>::deserialize(&mut serde_json::Deserializer::from_str(body))
+            .map(|f| f.error)
+            .unwrap_or(body.into());
     format!("{msg} (HTTP {code})")
 }
 
 /// Where `botctl machine harness-login|harness-logins|harness-logout` go: the caller's
 /// own machine for `me`, else that user's.
 fn login_base(user: &str) -> String {
-    if user == "me" { "/api/machine".into() } else { format!("/api/users/{}/machine", encode(user)) }
+    if user == "me" {
+        "/api/machine".into()
+    } else {
+        format!("/api/users/{}/machine", encode(user))
+    }
 }
 
 /// `botctl machine harness-login`: runs the harness's login on the user's machine (ADR
@@ -244,11 +272,20 @@ fn login_base(user: &str) -> String {
 /// is saved there only.
 fn machine_login(user: &str, harness: &str) -> Result<String, String> {
     let base = login_base(user);
-    let s = send(Cred::Operator, "POST", &format!("{base}/harness-login"), Some(json!({ "harness": harness }).to_string()))?;
+    let s = send(
+        Cred::Operator,
+        "POST",
+        &format!("{base}/harness-login"),
+        Some(json!({ "harness": harness }).to_string()),
+    )?;
     let mut r = std::io::BufReader::new(s);
     let mut status = String::new();
     r.read_line(&mut status).map_err(|e| e.to_string())?;
-    let code: u16 = status.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    let code: u16 = status
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
     loop {
         let mut h = String::new();
         if r.read_line(&mut h).map_err(|e| e.to_string())? == 0 || h.trim().is_empty() {
@@ -262,14 +299,25 @@ fn machine_login(user: &str, harness: &str) -> Result<String, String> {
     }
     let mut out = std::io::stdout();
     for l in r.lines() {
-        let v: Value = serde_json::from_str(&l.map_err(|e| format!("Lost the server: {e}"))?).map_err(|e| e.to_string())?;
+        let v: Value = serde_json::from_str(&l.map_err(|e| format!("Lost the server: {e}"))?)
+            .map_err(|e| e.to_string())?;
         match v["type"].as_str() {
             Some("started") => {
-                eprintln!("The {harness} login is running on the user's machine. Type what it asks for and press Enter; Ctrl-C stops it.");
-                let input = format!("{base}/harness-login/{}/input", encode(v["loginId"].as_str().unwrap_or_default()));
+                eprintln!(
+                    "The {harness} login is running on the user's machine. Type what it asks for and press Enter; Ctrl-C stops it."
+                );
+                let input = format!(
+                    "{base}/harness-login/{}/input",
+                    encode(v["loginId"].as_str().unwrap_or_default())
+                );
                 std::thread::spawn(move || {
                     for line in std::io::stdin().lines().map_while(Result::ok) {
-                        if let Err(e) = api(Cred::Operator, "POST", &input, Some(json!({ "text": line.trim_end() }).to_string())) {
+                        if let Err(e) = api(
+                            Cred::Operator,
+                            "POST",
+                            &input,
+                            Some(json!({ "text": line.trim_end() }).to_string()),
+                        ) {
                             eprintln!("Couldn't send that: {e}");
                         }
                     }
@@ -280,12 +328,24 @@ fn machine_login(user: &str, harness: &str) -> Result<String, String> {
                 let _ = out.flush();
             }
             Some("error") => eprintln!("\n{}", v["message"].as_str().unwrap_or_default()),
-            Some("exit") if v["loggedIn"] == true => return Ok(format!("\nDone. {harness} is logged in on the user's machine; their Bots there use it.")),
-            Some("exit") => return Err(format!("\nThe login ended ({}) without saving a {harness} login.", v["status"].as_str().unwrap_or("stopped"))),
+            Some("exit") if v["loggedIn"] == true => {
+                return Ok(format!(
+                    "\nDone. {harness} is logged in on the user's machine; their Bots there use it."
+                ));
+            }
+            Some("exit") => {
+                return Err(format!(
+                    "\nThe login ended ({}) without saving a {harness} login.",
+                    v["status"].as_str().unwrap_or("stopped")
+                ));
+            }
             _ => {}
         }
     }
-    Err("The server ended the login without saying how it went. See botctl machine harness-logins.".into())
+    Err(
+        "The server ended the login without saying how it went. See botctl machine harness-logins."
+            .into(),
+    )
 }
 
 /// `botctl user teammates ...` and `botctl user teammate-removals ...` (ADR 0066).
@@ -301,8 +361,12 @@ fn teammate_accounts_request(args: &[&str]) -> Result<(&'static str, String), St
 
 /// The extra arguments of `botctl user harness-login`: the owner whose shared Bots the
 /// login is for (`--owner`, ADR 0064), if any, and everything after `--`, if anything.
-fn login_extra<'a>(rest: &'a [&'a str]) -> Result<(Option<&'a str>, Option<&'a [&'a str]>), String> {
-    let usage = || "Usage: botctl user harness-login <user> <claude|codex> [--owner <owner>] [-- <login arguments>...]".to_string();
+fn login_extra<'a>(
+    rest: &'a [&'a str],
+) -> Result<(Option<&'a str>, Option<&'a [&'a str]>), String> {
+    let usage = || {
+        "Usage: botctl user harness-login <user> <claude|codex> [--owner <owner>] [-- <login arguments>...]".to_string()
+    };
     let (owner, rest) = match rest {
         ["--owner", o, rest @ ..] if !o.is_empty() && *o != "--" => (Some(*o), rest),
         _ => (None, rest),
@@ -320,15 +384,29 @@ fn login_extra<'a>(rest: &'a [&'a str]) -> Result<(Option<&'a str>, Option<&'a [
 fn harness_login(key: &str, harness: &str, rest: &[&str]) -> Result<String, String> {
     let (owner, args) = login_extra(rest)?;
     let body = json!({ "harness": harness, "args": args, "owner": owner });
-    let res = api(Cred::Operator, "POST", &format!("/api/users/{}/harness-login", encode(key)), Some(body.to_string()))?;
+    let res = api(
+        Cred::Operator,
+        "POST",
+        &format!("/api/users/{}/harness-login", encode(key)),
+        Some(body.to_string()),
+    )?;
     let v: Value = serde_json::from_str(&res).map_err(|e| e.to_string())?;
-    let argv: Vec<&str> = v["command"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    let argv: Vec<&str> = v["command"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
     let (Some((bin, args)), Some(home)) = (argv.split_first(), v["home"].as_str()) else {
         return Err(format!("Unexpected reply from the server: {res}"));
     };
     match owner {
-        None => eprintln!("Starting the {harness} login as the user's own account (HOME {home}). Only their Bots will use it."),
-        Some(o) => eprintln!("Starting the {harness} login as the user's account for {o}'s shared Bots (HOME {home}). Only their runs of those Bots will use it."),
+        None => eprintln!(
+            "Starting the {harness} login as the user's own account (HOME {home}). Only their Bots will use it."
+        ),
+        Some(o) => eprintln!(
+            "Starting the {harness} login as the user's account for {o}'s shared Bots (HOME {home}). Only their runs of those Bots will use it."
+        ),
     }
     let mut cmd = std::process::Command::new(bin);
     cmd.args(args).current_dir(home).env_clear();
@@ -342,19 +420,32 @@ fn harness_login(key: &str, harness: &str, rest: &[&str]) -> Result<String, Stri
     if let Some(path) = std::env::var_os("PATH") {
         cmd.env("SUPERBOT_PATH", path);
     }
-    let status = cmd.status().map_err(|e| format!("Couldn't start {bin}: {e}"))?;
+    let status = cmd
+        .status()
+        .map_err(|e| format!("Couldn't start {bin}: {e}"))?;
     if status.success() && owner.is_some() {
-        Ok(format!("Done. The user's runs of those Bots now use this {harness} login."))
+        Ok(format!(
+            "Done. The user's runs of those Bots now use this {harness} login."
+        ))
     } else if status.success() {
-        Ok(format!("Done. The user's Bots now use this {harness} login."))
+        Ok(format!(
+            "Done. The user's Bots now use this {harness} login."
+        ))
     } else {
-        Err(format!("The login exited with {status}. If sudo asked for a password, run botctl as botd's service account (sudo -iu <service user>)."))
+        Err(format!(
+            "The login exited with {status}. If sudo asked for a password, run botctl as botd's service account (sudo -iu <service user>)."
+        ))
     }
 }
 
 /// A session token from `botctl login` wins over the break-glass password.
 fn operator_auth() -> Result<String, String> {
-    let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let var = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
     match (var("SUPERBOT_TOKEN"), var("SUPERBOT_PASSWORD")) {
         (Some(t), _) => Ok(format!("Bearer {t}")),
         (None, Some(p)) => Ok(format!("Basic {}", base64(format!("superbot:{p}").as_bytes()))),
@@ -367,7 +458,9 @@ fn login_body(arg: Option<&str>) -> Result<Value, String> {
     let code = match arg {
         Some("-") => {
             let mut c = String::new();
-            std::io::stdin().read_to_string(&mut c).map_err(|e| e.to_string())?;
+            std::io::stdin()
+                .read_to_string(&mut c)
+                .map_err(|e| e.to_string())?;
             Some(c.trim().to_string())
         }
         Some(c) => Some(c.trim().to_string()),
@@ -378,7 +471,11 @@ fn login_body(arg: Option<&str>) -> Result<Value, String> {
         Some(c) => json!({ "code": c }),
         None => match std::env::var("SUPERBOT_PASSWORD") {
             Ok(p) if !p.is_empty() => json!({ "password": p }),
-            _ => return Err("Give a sign-in code (botctl login <code>), or set SUPERBOT_PASSWORD.".into()),
+            _ => {
+                return Err(
+                    "Give a sign-in code (botctl login <code>), or set SUPERBOT_PASSWORD.".into(),
+                );
+            }
         },
     };
     let mut body = body;
@@ -390,15 +487,22 @@ fn login_body(arg: Option<&str>) -> Result<Value, String> {
 fn role(r: &str) -> Result<&str, String> {
     match r {
         "admin" | "member" | "readonly" | "read-only" => Ok(r),
-        _ => Err(format!("Role must be admin, member, or readonly, not \"{r}\".")),
+        _ => Err(format!(
+            "Role must be admin, member, or readonly, not \"{r}\"."
+        )),
     }
 }
 
 /// The `host:port` in BOT_API. botctl speaks plain http only.
 fn addr(base: &str) -> Result<&str, String> {
-    let a = base.strip_prefix("http://").unwrap_or("").trim_end_matches('/');
+    let a = base
+        .strip_prefix("http://")
+        .unwrap_or("")
+        .trim_end_matches('/');
     if a.is_empty() || a.contains(['/', '@', '?', '#']) {
-        return Err(format!("BOT_API should look like http://127.0.0.1:3000, not {base}"));
+        return Err(format!(
+            "BOT_API should look like http://127.0.0.1:3000, not {base}"
+        ));
     }
     Ok(a)
 }
@@ -415,7 +519,9 @@ struct Proxy {
 /// lets through the hosts it's told about. Only a proxy on this machine gets BOT_TOKEN;
 /// plain http to one elsewhere would show it to the network.
 fn proxy() -> Option<Proxy> {
-    let url = std::env::var("HTTP_PROXY").or_else(|_| std::env::var("http_proxy")).ok()?;
+    let url = std::env::var("HTTP_PROXY")
+        .or_else(|_| std::env::var("http_proxy"))
+        .ok()?;
     parse_proxy(&url)
 }
 
@@ -425,7 +531,10 @@ fn parse_proxy(url: &str) -> Option<Proxy> {
         Some((a, h)) => (Some(a), h),
         None => (None, rest),
     };
-    (!addr.is_empty() && !addr.contains(['/', '?', '#']) && loopback(addr)).then(|| Proxy { addr: addr.to_string(), auth: auth.map(unescape) })
+    (!addr.is_empty() && !addr.contains(['/', '?', '#']) && loopback(addr)).then(|| Proxy {
+        addr: addr.to_string(),
+        auth: auth.map(unescape),
+    })
 }
 
 /// Percent-decodes `s`; a malformed escape stays as written.
@@ -434,7 +543,12 @@ fn unescape(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        match (b[i], b.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok())) {
+        match (
+            b[i],
+            b.get(i + 1..i + 3)
+                .and_then(|h| std::str::from_utf8(h).ok())
+                .and_then(|h| u8::from_str_radix(h, 16).ok()),
+        ) {
             (b'%', Some(x)) => {
                 out.push(x);
                 i += 3;
@@ -455,23 +569,35 @@ fn loopback(addr: &str) -> bool {
         Some(rest) => rest.split(']').next().unwrap_or_default(),
         None => addr.rsplit_once(':').map_or(addr, |(h, _)| h),
     };
-    host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn base64(b: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for c in b.chunks(3) {
-        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
         for i in 0..4 {
-            out.push(if i <= c.len() { T[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+            out.push(if i <= c.len() {
+                T[(n >> (18 - 6 * i) & 63) as usize] as char
+            } else {
+                '='
+            });
         }
     }
     out
 }
 
 fn pretty(body: String) -> String {
-    serde_json::from_str::<Value>(&body).ok().and_then(|v| serde_json::to_string_pretty(&v).ok()).unwrap_or(body)
+    serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+        .unwrap_or(body)
 }
 
 /// The approval gate. The harness pipes its PreToolUse event on stdin; botd decides,
@@ -483,12 +609,24 @@ fn hook(harness: &str, cwd: Option<&str>) -> ! {
     let verdict = std::io::stdin()
         .read_to_string(&mut event)
         .map_err(|e| e.to_string())
-        .and_then(|_| hook_body(harness, &std::env::var("BOT_ID").unwrap_or_default(), std::env::var("SUPERBOT_RUN_ID").ok().as_deref(), &event, cwd))
+        .and_then(|_| {
+            hook_body(
+                harness,
+                &std::env::var("BOT_ID").unwrap_or_default(),
+                std::env::var("SUPERBOT_RUN_ID").ok().as_deref(),
+                &event,
+                cwd,
+            )
+        })
         .and_then(|body| api(Cred::Bot, "POST", "/api/approvals/check", Some(body)));
     match verdict {
         Ok(r) if r.lines().next() == Some("allow") => std::process::exit(0),
         Ok(r) => {
-            let reason = r.split_once('\n').map(|(_, r)| r.trim()).filter(|r| !r.is_empty()).unwrap_or("Blocked by SuperBot policy.");
+            let reason = r
+                .split_once('\n')
+                .map(|(_, r)| r.trim())
+                .filter(|r| !r.is_empty())
+                .unwrap_or("Blocked by SuperBot policy.");
             eprintln!("{reason}");
         }
         Err(e) => eprintln!("SuperBot's approval gate failed, so this action was blocked: {e}"),
@@ -498,13 +636,22 @@ fn hook(harness: &str, cwd: Option<&str>) -> ! {
 
 /// `run`: the run this hook is part of, so what a person approved for that run counts
 /// only there (ADR 0051).
-fn hook_body(harness: &str, bot: &str, run: Option<&str>, event: &str, cwd: Option<&str>) -> Result<String, String> {
-    let mut event = serde_json::from_str::<Value>(event).map_err(|e| format!("bad hook input: {e}"))?;
+fn hook_body(
+    harness: &str,
+    bot: &str,
+    run: Option<&str>,
+    event: &str,
+    cwd: Option<&str>,
+) -> Result<String, String> {
+    let mut event =
+        serde_json::from_str::<Value>(event).map_err(|e| format!("bad hook input: {e}"))?;
     if let Some(cwd) = cwd {
         if !cwd.starts_with('/') {
             return Err(format!("--cwd must be an absolute path, not {cwd}"));
         }
-        let obj = event.as_object_mut().ok_or("bad hook input: not a JSON object")?;
+        let obj = event
+            .as_object_mut()
+            .ok_or("bad hook input: not a JSON object")?;
         obj.insert("cwd".into(), json!(cwd));
     }
     Ok(json!({ "from": bot, "harness": harness, "run": run.filter(|r| !r.is_empty()), "event": event }).to_string())
@@ -514,7 +661,9 @@ fn policy_patch(args: &[&str]) -> Result<Value, String> {
     let mut patch = Map::new();
     let mut classes = Map::new();
     for a in args {
-        let (k, v) = a.split_once('=').ok_or(format!("Expected key=value, got \"{a}\""))?;
+        let (k, v) = a
+            .split_once('=')
+            .ok_or(format!("Expected key=value, got \"{a}\""))?;
         // `inherit` puts a Bot's field back to following the global policy.
         let inherit = v == "inherit";
         match k {
@@ -529,7 +678,12 @@ fn policy_patch(args: &[&str]) -> Result<Value, String> {
                 patch.insert("sandbox".into(), on);
             }
             "timeout" if inherit => _ = patch.insert("timeoutMinutes".into(), Value::Null),
-            "timeout" => _ = patch.insert("timeoutMinutes".into(), json!(v.parse::<u64>().map_err(|_| "timeout must be minutes")?)),
+            "timeout" => {
+                _ = patch.insert(
+                    "timeoutMinutes".into(),
+                    json!(v.parse::<u64>().map_err(|_| "timeout must be minutes")?),
+                )
+            }
             class => _ = classes.insert(class.into(), if inherit { Value::Null } else { json!(v) }),
         }
     }
@@ -537,7 +691,10 @@ fn policy_patch(args: &[&str]) -> Result<Value, String> {
         patch.insert("classes".into(), Value::Object(classes));
     }
     if patch.is_empty() {
-        return Err("Nothing to set. Example: botctl policy set global mode=ask timeout=15 git_push=deny".into());
+        return Err(
+            "Nothing to set. Example: botctl policy set global mode=ask timeout=15 git_push=deny"
+                .into(),
+        );
     }
     Ok(Value::Object(patch))
 }
@@ -546,7 +703,16 @@ fn policy_patch(args: &[&str]) -> Result<Value, String> {
 fn encode(v: &str) -> String {
     v.bytes()
         .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'*' | b',' | b':' => (b as char).to_string(),
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~'
+            | b'*'
+            | b','
+            | b':' => (b as char).to_string(),
             _ => format!("%{b:02X}"),
         })
         .collect()
@@ -558,7 +724,8 @@ fn audit_query(rest: &[&str]) -> Result<String, String> {
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match *a {
-            "--from" | "--to" | "--action" | "--actor" | "--method" | "--idp" | "--idp-provider" | "--subject" | "--session" | "--on-behalf-of" | "--outcome"
+            "--from" | "--to" | "--action" | "--actor" | "--method" | "--idp"
+            | "--idp-provider" | "--subject" | "--session" | "--on-behalf-of" | "--outcome"
             | "--bot" | "--limit" => {
                 let v = it.next().ok_or(format!("{a} needs a value"))?;
                 let key = match *a {
@@ -569,10 +736,18 @@ fn audit_query(rest: &[&str]) -> Result<String, String> {
                 pairs.push(format!("{key}={}", encode(v)));
             }
             n if n.parse::<u32>().is_ok() => pairs.push(format!("limit={n}")),
-            other => return Err(format!("Unknown audit option \"{other}\". See botctl admin.")),
+            other => {
+                return Err(format!(
+                    "Unknown audit option \"{other}\". See botctl admin."
+                ));
+            }
         }
     }
-    Ok(if pairs.is_empty() { String::new() } else { format!("?{}", pairs.join("&")) })
+    Ok(if pairs.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", pairs.join("&"))
+    })
 }
 
 fn flag<'a>(rest: &[&'a str], name: &str) -> Option<&'a str> {
@@ -582,16 +757,31 @@ fn flag<'a>(rest: &[&'a str], name: &str) -> Option<&'a str> {
 /// `botctl bot ...`: who owns and can see a Bot (ADR 0017). The request to send.
 fn bot_access(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
     let access = |bot: &str| format!("/api/bots/{}/access", encode(bot));
-    let grant = |bot: &str, user: &str| format!("/api/bots/{}/grants/{}", encode(bot), encode(user));
+    let grant =
+        |bot: &str, user: &str| format!("/api/bots/{}/grants/{}", encode(bot), encode(user));
     Ok(match args {
         ["access", bot] => ("GET", access(bot), None),
         [v @ ("share" | "private"), bot] => {
             let visibility = if *v == "share" { "shared" } else { "private" };
-            ("PATCH", access(bot), Some(json!({ "visibility": visibility }).to_string()))
+            (
+                "PATCH",
+                access(bot),
+                Some(json!({ "visibility": visibility }).to_string()),
+            )
         }
-        ["owner", bot, user] => ("PATCH", access(bot), Some(json!({ "owner": user }).to_string())),
-        ["grant", bot, user, level @ ("viewer" | "operator")] => ("PUT", grant(bot, user), Some(json!({ "level": level }).to_string())),
-        ["grant", ..] => return Err("Usage: botctl bot grant <bot> <user> <viewer|operator>".into()),
+        ["owner", bot, user] => (
+            "PATCH",
+            access(bot),
+            Some(json!({ "owner": user }).to_string()),
+        ),
+        ["grant", bot, user, level @ ("viewer" | "operator")] => (
+            "PUT",
+            grant(bot, user),
+            Some(json!({ "level": level }).to_string()),
+        ),
+        ["grant", ..] => {
+            return Err("Usage: botctl bot grant <bot> <user> <viewer|operator>".into());
+        }
         ["revoke", bot, user] => ("DELETE", grant(bot, user), None),
         _ => return Err("Unknown bot command. See botctl admin.".into()),
     })
@@ -616,15 +806,37 @@ fn machine_request(args: &[&str]) -> Result<(&'static str, String), String> {
         ["folder", user] => ("GET", machine(user, "folder-sync")),
         ["sync", user] => ("POST", machine(user, "folder-sync")),
         ["screens", user] => ("GET", machine(user, "screens")),
-        ["screens", user, "close", bot] => ("DELETE", machine(user, &format!("screens/{}", encode(bot)))),
-        ["teammates", user] => ("GET", machine(user, "teammates")),
-        ["teammates", user, "remove", teammate] => ("POST", machine(user, &format!("teammates/{}/remove", encode(teammate)))),
-        ["teammates", user, "logins", teammate] => ("GET", machine(user, &format!("teammates/{}/harness-logins", encode(teammate)))),
-        ["teammates", user, "logout", teammate, harness] => {
-            ("DELETE", machine(user, &format!("teammates/{}/harness-logins/{}", encode(teammate), encode(harness))))
+        ["screens", user, "close", bot] => {
+            ("DELETE", machine(user, &format!("screens/{}", encode(bot))))
         }
+        ["teammates", user] => ("GET", machine(user, "teammates")),
+        ["teammates", user, "remove", teammate] => (
+            "POST",
+            machine(user, &format!("teammates/{}/remove", encode(teammate))),
+        ),
+        ["teammates", user, "logins", teammate] => (
+            "GET",
+            machine(
+                user,
+                &format!("teammates/{}/harness-logins", encode(teammate)),
+            ),
+        ),
+        ["teammates", user, "logout", teammate, harness] => (
+            "DELETE",
+            machine(
+                user,
+                &format!(
+                    "teammates/{}/harness-logins/{}",
+                    encode(teammate),
+                    encode(harness)
+                ),
+            ),
+        ),
         ["removals"] => ("GET", "/api/machines/teammate-removals?state=open".into()),
-        ["removals", s @ ("pending" | "held" | "done" | "cancelled" | "open" | "all")] => ("GET", format!("/api/machines/teammate-removals?state={s}")),
+        [
+            "removals",
+            s @ ("pending" | "held" | "done" | "cancelled" | "open" | "all"),
+        ] => ("GET", format!("/api/machines/teammate-removals?state={s}")),
         _ => {
             return Err("Usage: botctl machine placement [<user>] | assign <user> | unassign <user> | agent <user> | upgrade <user> [hold|release] | harnesses <user> | legacy | rebuild <user> [--discard-work|status|cancel] | bot-user <user> | harness-login <user|me> <claude|codex> | harness-logins <user|me> | harness-logout <user|me> <harness> | folder <user> | sync <user> | screens <user> [close <bot>] | teammates <user> [remove <teammate> | logins <teammate> | logout <teammate> <harness>] | removals [pending|held|done|cancelled|open|all]".into());
         }
@@ -639,7 +851,11 @@ fn lifecycle_request(args: &[&str]) -> Option<Result<Request, String>> {
     let at = |user: &str, rest: &str| format!("/api/users/{}/machine{rest}", encode(user));
     Some(Ok(match args {
         ["list"] => ("GET", "/api/machines".into(), None),
-        ["list", state] => ("GET", format!("/api/machines?state={}", encode(state)), None),
+        ["list", state] => (
+            "GET",
+            format!("/api/machines?state={}", encode(state)),
+            None,
+        ),
         ["show", user] => ("GET", at(user, ""), None),
         ["request", user, rest @ ..] if rest.len() <= 2 => {
             let mut b = json!({});
@@ -653,12 +869,20 @@ fn lifecycle_request(args: &[&str]) -> Option<Result<Request, String>> {
         }
         ["suspend", user] => ("POST", at(user, "/suspend"), None),
         ["resume", user] => ("POST", at(user, "/resume"), None),
-        ["resize", user, tier] => ("POST", at(user, "/resize"), Some(json!({ "tier": tier }).to_string())),
+        ["resize", user, tier] => (
+            "POST",
+            at(user, "/resize"),
+            Some(json!({ "tier": tier }).to_string()),
+        ),
         ["destroy", user, "--yes"] => ("DELETE", at(user, ""), None),
         ["substrate"] => ("GET", "/api/machines/substrate".into(), None),
         ["substrate", "check"] => ("GET", "/api/machines/substrate?check=true".into(), None),
         ["reconcile"] => ("POST", "/api/machines/reconcile".into(), None),
-        ["list" | "show" | "request" | "suspend" | "resume" | "resize" | "destroy" | "substrate" | "reconcile", ..] => {
+        [
+            "list" | "show" | "request" | "suspend" | "resume" | "resize" | "destroy" | "substrate"
+            | "reconcile",
+            ..,
+        ] => {
             return Some(Err("Usage: botctl machine list [<state>] | show <user> | request <user> [<tier>] [<region>] | suspend <user> | resume <user> | resize <user> <tier> | destroy <user> --yes | substrate [check] | reconcile".into()));
         }
         _ => return None,
@@ -673,7 +897,10 @@ fn rebuild_request(args: &[&str]) -> Result<(&'static str, String, Option<String
         [user, "--discard-work"] => ("POST", format!("{}?discardWork=true", at(user)), None),
         [user, "status"] => ("GET", at(user), None),
         [user, "cancel"] => ("DELETE", at(user), None),
-        _ => return Err("Usage: botctl machine rebuild <user> [--discard-work] | rebuild <user> status|cancel".into()),
+        _ => return Err(
+            "Usage: botctl machine rebuild <user> [--discard-work] | rebuild <user> status|cancel"
+                .into(),
+        ),
     })
 }
 
@@ -720,7 +947,9 @@ fn scim_created(res: &Value) -> String {
         out.push_str(&format!("\nexternalId must be each person's subject in the SSO provider {p} (Entra: map objectId to externalId)."));
     }
     if res["enabled"] == false {
-        out.push_str("\n\nSCIM is off on this server: set SCIM=on and restart botd before the IdP connects.");
+        out.push_str(
+            "\n\nSCIM is off on this server: set SCIM=on and restart botd before the IdP connects.",
+        );
     }
     out
 }
@@ -728,16 +957,28 @@ fn scim_created(res: &Value) -> String {
 /// What `botctl signup approve` prints: the code once, and how to let SSO sign them in.
 fn approved(res: &Value) -> String {
     let mins = (res["expiresAt"].as_i64().unwrap_or_default() - now_ms()) / 60_000;
-    let (email, user) = (res["user"]["email"].as_str().unwrap_or_default(), res["user"]["id"].as_str().unwrap_or_default());
+    let (email, user) = (
+        res["user"]["email"].as_str().unwrap_or_default(),
+        res["user"]["id"].as_str().unwrap_or_default(),
+    );
     let mut out = format!(
         "Approved. {email} is now a {} user ({user}).\n\n{}\n\nA one-time sign-in code, good for about {} hours. It is shown only once; share it privately.",
         res["user"]["role"].as_str().unwrap_or_default(),
         res["code"].as_str().unwrap_or_default(),
         ((mins + 30) / 60).max(1),
     );
-    let sso: Vec<String> = res["sso"].as_array().into_iter().flatten().filter_map(|p| p["id"].as_str()).map(|id| format!("  botctl user link {email} {id} <subject>")).collect();
+    let sso: Vec<String> = res["sso"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p["id"].as_str())
+        .map(|id| format!("  botctl user link {email} {id} <subject>"))
+        .collect();
     if !sso.is_empty() {
-        out.push_str(&format!("\n\nTo let them sign in with single sign-on instead, link their identity:\n{}", sso.join("\n")));
+        out.push_str(&format!(
+            "\n\nTo let them sign in with single sign-on instead, link their identity:\n{}",
+            sso.join("\n")
+        ));
     }
     out
 }
@@ -749,7 +990,13 @@ fn decide(verb: &str, id: &str, rest: &[&str]) -> Result<String, String> {
         ("approve", _) => "Approved.",
         _ => "Denied.",
     };
-    api(Cred::Operator, "POST", &format!("/api/approvals/{id}/{verb}"), Some(body.to_string())).map(|_| done.into())
+    api(
+        Cred::Operator,
+        "POST",
+        &format!("/api/approvals/{id}/{verb}"),
+        Some(body.to_string()),
+    )
+    .map(|_| done.into())
 }
 
 fn decide_body(rest: &[&str]) -> Result<Value, String> {
@@ -762,14 +1009,22 @@ fn decide_body(rest: &[&str]) -> Result<Value, String> {
     };
     let run = rest.contains(&"--run");
     if run && !remember.is_null() {
-        return Err("Pick one: --run (the rest of this task) or --remember (a lasting rule).".into());
+        return Err(
+            "Pick one: --run (the rest of this task) or --remember (a lasting rule).".into(),
+        );
     }
     Ok(json!({ "remember": remember, "scope": if run { "run" } else { "once" } }))
 }
 
 fn env_name(name: &str) -> Result<&str, String> {
-    if name.is_empty() || !name.bytes().all(|b| b == b'_' || b.is_ascii_uppercase() || b.is_ascii_digit()) {
-        return Err(format!("\"{name}\" isn't a valid name. Use an environment variable name like OPENAI_API_KEY."));
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|b| b == b'_' || b.is_ascii_uppercase() || b.is_ascii_digit())
+    {
+        return Err(format!(
+            "\"{name}\" isn't a valid name. Use an environment variable name like OPENAI_API_KEY."
+        ));
     }
     Ok(name)
 }
@@ -777,10 +1032,18 @@ fn env_name(name: &str) -> Result<&str, String> {
 /// The value comes on stdin, so it stays out of shell history and the process list.
 fn stdin_value(mut input: impl Read) -> Result<String, String> {
     let mut v = String::new();
-    input.read_to_string(&mut v).map_err(|e| format!("Couldn't read the value from stdin: {e}"))?;
-    let v = v.strip_suffix('\n').map(|t| t.strip_suffix('\r').unwrap_or(t)).unwrap_or(&v).to_string();
+    input
+        .read_to_string(&mut v)
+        .map_err(|e| format!("Couldn't read the value from stdin: {e}"))?;
+    let v = v
+        .strip_suffix('\n')
+        .map(|t| t.strip_suffix('\r').unwrap_or(t))
+        .unwrap_or(&v)
+        .to_string();
     if v.is_empty() {
-        return Err("No value on stdin. Example: botctl secret set OPENAI_API_KEY < key.txt".into());
+        return Err(
+            "No value on stdin. Example: botctl secret set OPENAI_API_KEY < key.txt".into(),
+        );
     }
     Ok(v)
 }
@@ -811,10 +1074,23 @@ fn setup_summary(s: &Value) -> String {
     let mut out = format!("Setup: {} of {} done ({state}).\n", s["done"], s["total"]);
     for c in s["checklist"].as_array().into_iter().flatten() {
         let mark = if c["done"] == true { "x" } else { " " };
-        out += &format!("  [{mark}] {}\n      {}\n", c["label"].as_str().unwrap_or_default(), c["detail"].as_str().unwrap_or_default());
+        out += &format!(
+            "  [{mark}] {}\n      {}\n",
+            c["label"].as_str().unwrap_or_default(),
+            c["detail"].as_str().unwrap_or_default()
+        );
     }
-    for p in s["signIn"]["providers"].as_array().into_iter().flatten().filter(|p| p["ready"] != true) {
-        out += &format!("\n{} needs its secret: botctl secret set {} < file\n", p["label"].as_str().unwrap_or_default(), p["secret"].as_str().unwrap_or_default());
+    for p in s["signIn"]["providers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| p["ready"] != true)
+    {
+        out += &format!(
+            "\n{} needs its secret: botctl secret set {} < file\n",
+            p["label"].as_str().unwrap_or_default(),
+            p["secret"].as_str().unwrap_or_default()
+        );
     }
     if !p["completedAt"].is_i64() {
         out += "\nThe console's Setup tab has the commands for each step. When you're done: botctl setup done\n";
@@ -829,11 +1105,24 @@ fn license_summary(l: &Value) -> String {
         Some(n) => format!("{} of {n} seats in use", s["used"]),
         None => format!("{} active, no seat limit", s["used"]),
     };
-    let mut out = format!("License: {} ({seats}).\n  {}\n", l["mode"].as_str().unwrap_or_default(), l["detail"].as_str().unwrap_or_default());
+    let mut out = format!(
+        "License: {} ({seats}).\n  {}\n",
+        l["mode"].as_str().unwrap_or_default(),
+        l["detail"].as_str().unwrap_or_default()
+    );
     if let Some(id) = l["license"]["id"].as_str() {
-        out += &format!("  Id {id}, source {}.\n", l["source"].as_str().unwrap_or_default());
+        out += &format!(
+            "  Id {id}, source {}.\n",
+            l["source"].as_str().unwrap_or_default()
+        );
     }
-    for w in l["warnings"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|w| Some(*w) != l["detail"].as_str()) {
+    for w in l["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|w| Some(*w) != l["detail"].as_str())
+    {
         out += &format!("  Warning: {w}\n");
     }
     out
@@ -848,9 +1137,17 @@ fn period_summary(v: &Value) -> String {
         Some(l) => format!("{}/{}", n(used), l),
         None => format!("{}/unlimited", n(used)),
     };
-    let day = |ms: &Value| chrono::DateTime::from_timestamp_millis(ms.as_i64().unwrap_or(0)).map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default();
+    let day = |ms: &Value| {
+        chrono::DateTime::from_timestamp_millis(ms.as_i64().unwrap_or(0))
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_default()
+    };
     let (p, t) = (&v["period"], &v["tokens"]);
-    let source = if p["source"] == "subscription" { "subscription period" } else { "calendar month, UTC" };
+    let source = if p["source"] == "subscription" {
+        "subscription period"
+    } else {
+        "calendar month, UTC"
+    };
     let mut out = format!(
         "{} plan, {} to {} ({source})\nTokens {} (input {}, output {}, cache read {}, cache write {})\nRuns {}",
         v["tier"]["label"].as_str().unwrap_or_default(),
@@ -869,10 +1166,20 @@ fn period_summary(v: &Value) -> String {
     out.push('\n');
     for b in v["byBot"].as_array().into_iter().flatten() {
         let name = b["name"].as_str().unwrap_or("(deleted or not yours now)");
-        out += &format!("  Bot {name} ({}): {} tokens in {} runs\n", b["bot"].as_str().unwrap_or_default(), n(&b["total"]), n(&b["runs"]));
+        out += &format!(
+            "  Bot {name} ({}): {} tokens in {} runs\n",
+            b["bot"].as_str().unwrap_or_default(),
+            n(&b["total"]),
+            n(&b["runs"])
+        );
     }
     for m in v["byModel"].as_array().into_iter().flatten() {
-        out += &format!("  Model {}: {} tokens in {} runs\n", m["model"].as_str().unwrap_or("(not named)"), n(&m["total"]), n(&m["runs"]));
+        out += &format!(
+            "  Model {}: {} tokens in {} runs\n",
+            m["model"].as_str().unwrap_or("(not named)"),
+            n(&m["total"]),
+            n(&m["runs"])
+        );
     }
     out
 }
@@ -890,7 +1197,10 @@ fn usage_summary(v: &Value) -> String {
     let mut out = format!("Billing: {mode}.\n");
     for u in v["users"].as_array().into_iter().flatten() {
         let (p, use_) = (&u["plan"], &u["plan"]["usage"]);
-        let who = u["user"]["email"].as_str().or(u["user"]["name"].as_str()).unwrap_or_default();
+        let who = u["user"]["email"]
+            .as_str()
+            .or(u["user"]["name"].as_str())
+            .unwrap_or_default();
         let mut line = format!(
             "{who}: {} plan; Bots {}; runs {} and tokens {} in {}; routine runs {} on {}",
             p["label"].as_str().unwrap_or_default(),
@@ -905,7 +1215,14 @@ fn usage_summary(v: &Value) -> String {
         match (&u["machine"], allowed) {
             (Value::Null, Some(t)) => line += &format!("; machine size {t}, none yet"),
             (Value::Null, None) => {}
-            (m, _) => line += &format!("; machine {} ({}){}", m["plan"].as_str().unwrap_or_default(), m["state"].as_str().unwrap_or_default(), allowed.map_or(String::new(), |t| format!(", plan size {t}"))),
+            (m, _) => {
+                line += &format!(
+                    "; machine {} ({}){}",
+                    m["plan"].as_str().unwrap_or_default(),
+                    m["state"].as_str().unwrap_or_default(),
+                    allowed.map_or(String::new(), |t| format!(", plan size {t}"))
+                )
+            }
         }
         if let Some(st) = u["subscription"]["status"].as_str() {
             line += &format!("; Stripe {st}");
@@ -913,7 +1230,12 @@ fn usage_summary(v: &Value) -> String {
         if let Some(c) = u["customer"].as_str() {
             line += &format!("; customer {c}");
         }
-        let over: Vec<&str> = u["over"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        let over: Vec<&str> = u["over"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
         if !over.is_empty() {
             line += &format!("; OVER: {}", over.join(", "));
         }
@@ -928,15 +1250,39 @@ fn run(args: &[String]) -> Result<String, String> {
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
     let op = |m: &str, p: &str, b: Option<String>| api(Cred::Operator, m, p, b).map(pretty);
     match a.as_slice() {
-        ["routines"] | ["routine", "list"] => api(Cred::Bot, "GET", &format!("/api/bots/{bot}/routines"), None),
+        ["routines"] | ["routine", "list"] => {
+            api(Cred::Bot, "GET", &format!("/api/bots/{bot}/routines"), None)
+        }
         ["routine", "add", name, cron, what] => {
             let body = json!({ "name": name, "cron": cron, "instruction": what }).to_string();
-            api(Cred::Bot, "POST", &format!("/api/bots/{bot}/routines"), Some(body)).map(|_| format!("Added routine \"{name}\" ({cron})."))
+            api(
+                Cred::Bot,
+                "POST",
+                &format!("/api/bots/{bot}/routines"),
+                Some(body),
+            )
+            .map(|_| format!("Added routine \"{name}\" ({cron})."))
         }
-        ["routine", "rm" | "delete", id] => api(Cred::Bot, "DELETE", &format!("/api/routines/{id}"), None).map(|_| "Deleted.".into()),
+        ["routine", "rm" | "delete", id] => {
+            api(Cred::Bot, "DELETE", &format!("/api/routines/{id}"), None)
+                .map(|_| "Deleted.".into())
+        }
         ["routine", cmd @ ("pause" | "resume"), id] => {
             let body = json!({ "enabled": *cmd == "resume" }).to_string();
-            api(Cred::Bot, "PATCH", &format!("/api/routines/{id}"), Some(body)).map(|_| if *cmd == "pause" { "Paused." } else { "Resumed." }.into())
+            api(
+                Cred::Bot,
+                "PATCH",
+                &format!("/api/routines/{id}"),
+                Some(body),
+            )
+            .map(|_| {
+                if *cmd == "pause" {
+                    "Paused."
+                } else {
+                    "Resumed."
+                }
+                .into()
+            })
         }
         ["bots"] => api(Cred::Bot, "GET", "/api/bots", None),
         ["ask", to, message] => {
@@ -951,29 +1297,52 @@ fn run(args: &[String]) -> Result<String, String> {
         ["hook", harness, "--cwd", cwd] => hook(harness, Some(cwd)),
         ["hook", ..] => {
             // Exit 0 would allow the tool call, so a malformed gate blocks.
-            eprintln!("SuperBot's approval gate is misconfigured, so this action was blocked. Usage: botctl hook <harness> [--cwd <dir>]");
+            eprintln!(
+                "SuperBot's approval gate is misconfigured, so this action was blocked. Usage: botctl hook <harness> [--cwd <dir>]"
+            );
             std::process::exit(2)
         }
 
         ["policy"] | ["policy", "global"] => op("GET", "/api/policy", None),
-        ["policy", "set", "global", rest @ ..] => op("PUT", "/api/policy", Some(policy_patch(rest)?.to_string())),
-        ["policy", "set", id, rest @ ..] => op("PUT", &format!("/api/bots/{id}/policy"), Some(policy_patch(rest)?.to_string())),
-        ["policy", "reset", id] => op("DELETE", &format!("/api/bots/{id}/policy"), None).map(|_| "Reset. This Bot follows the global policy.".into()),
+        ["policy", "set", "global", rest @ ..] => {
+            op("PUT", "/api/policy", Some(policy_patch(rest)?.to_string()))
+        }
+        ["policy", "set", id, rest @ ..] => op(
+            "PUT",
+            &format!("/api/bots/{id}/policy"),
+            Some(policy_patch(rest)?.to_string()),
+        ),
+        ["policy", "reset", id] => op("DELETE", &format!("/api/bots/{id}/policy"), None)
+            .map(|_| "Reset. This Bot follows the global policy.".into()),
         ["policy", id] => op("GET", &format!("/api/bots/{id}/policy"), None),
         ["rules"] => op("GET", "/api/policy/rules", None),
         ["rules", id] => op("GET", &format!("/api/policy/rules?bot={id}"), None),
-        ["rule", "add", action @ ("allow" | "deny"), pattern, rest @ ..] => {
+        [
+            "rule",
+            "add",
+            action @ ("allow" | "deny"),
+            pattern,
+            rest @ ..,
+        ] => {
             let body = json!({ "action": action, "pattern": pattern, "tool": flag(rest, "--tool"), "botId": flag(rest, "--bot") });
             op("POST", "/api/policy/rules", Some(body.to_string()))
         }
-        ["rule", "rm" | "delete", id] => op("DELETE", &format!("/api/policy/rules/{id}"), None).map(|_| "Deleted.".into()),
+        ["rule", "rm" | "delete", id] => {
+            op("DELETE", &format!("/api/policy/rules/{id}"), None).map(|_| "Deleted.".into())
+        }
         ["bot", rest @ ..] => {
             let (method, path, body) = bot_access(rest)?;
             op(method, &path, body)
         }
         ["machine", "harness-login", user, harness] => machine_login(user, harness),
-        ["machine", "harness-logins", user] => op("GET", &format!("{}/harness-logins", login_base(user)), None),
-        ["machine", "harness-logout", user, harness] => op("DELETE", &format!("{}/harness-logins/{}", login_base(user), encode(harness)), None),
+        ["machine", "harness-logins", user] => {
+            op("GET", &format!("{}/harness-logins", login_base(user)), None)
+        }
+        ["machine", "harness-logout", user, harness] => op(
+            "DELETE",
+            &format!("{}/harness-logins/{}", login_base(user), encode(harness)),
+            None,
+        ),
         ["machine", "legacy"] => op("GET", "/api/machines/legacy", None),
         ["machine", "rebuild", rest @ ..] => {
             let (method, path, body) = rebuild_request(rest)?;
@@ -986,13 +1355,19 @@ fn run(args: &[String]) -> Result<String, String> {
         ["machine", rest @ ..] => {
             let (method, path) = machine_request(rest)?;
             let res = op(method, &path, None)?;
-            Ok(if matches!(rest, ["screens", _, "close", _]) { "Closed.".into() } else { res })
+            Ok(if matches!(rest, ["screens", _, "close", _]) {
+                "Closed.".into()
+            } else {
+                res
+            })
         }
         ["signups"] | ["signup", ..] => {
             let (method, path, body) = signup_request(a.get(1..).unwrap_or_default())?;
             let res = api(Cred::Operator, method, &path, body)?;
             match a.get(1) {
-                Some(&"approve") => Ok(approved(&serde_json::from_str(&res).map_err(|e| e.to_string())?)),
+                Some(&"approve") => Ok(approved(
+                    &serde_json::from_str(&res).map_err(|e| e.to_string())?,
+                )),
                 Some(&"reject") => Ok("Rejected. No email was sent.".into()),
                 _ => Ok(pretty(res)),
             }
@@ -1009,15 +1384,34 @@ fn run(args: &[String]) -> Result<String, String> {
         ["approvals"] => op("GET", "/api/approvals?status=pending", None),
         ["approvals", status] => op("GET", &format!("/api/approvals?status={status}"), None),
         [verb @ ("approve" | "deny"), id, rest @ ..] => decide(verb, id, rest),
-        ["audit", "export", rest @ ..] => api(Cred::Operator, "GET", &format!("/api/audit/export.csv{}", audit_query(rest)?), None),
+        ["audit", "export", rest @ ..] => api(
+            Cred::Operator,
+            "GET",
+            &format!("/api/audit/export.csv{}", audit_query(rest)?),
+            None,
+        ),
         ["audit", rest @ ..] => op("GET", &format!("/api/audit{}", audit_query(rest)?), None),
 
         ["login", rest @ ..] if rest.len() <= 1 => {
-            let res: Value = serde_json::from_str(&api(Cred::Anonymous, "POST", "/api/auth/login", Some(login_body(rest.first().copied())?.to_string()))?).map_err(|e| e.to_string())?;
-            let (token, who) = (res["token"].as_str().unwrap_or_default(), res["user"]["name"].as_str().unwrap_or_default());
-            Ok(format!("Signed in as {who} ({}). Run:\n\n  export SUPERBOT_TOKEN={token}", res["user"]["role"].as_str().unwrap_or_default()))
+            let res: Value = serde_json::from_str(&api(
+                Cred::Anonymous,
+                "POST",
+                "/api/auth/login",
+                Some(login_body(rest.first().copied())?.to_string()),
+            )?)
+            .map_err(|e| e.to_string())?;
+            let (token, who) = (
+                res["token"].as_str().unwrap_or_default(),
+                res["user"]["name"].as_str().unwrap_or_default(),
+            );
+            Ok(format!(
+                "Signed in as {who} ({}). Run:\n\n  export SUPERBOT_TOKEN={token}",
+                res["user"]["role"].as_str().unwrap_or_default()
+            ))
         }
-        ["logout"] => op("POST", "/api/auth/logout", None).map(|_| "Signed out. Unset SUPERBOT_TOKEN.".into()),
+        ["logout"] => {
+            op("POST", "/api/auth/logout", None).map(|_| "Signed out. Unset SUPERBOT_TOKEN.".into())
+        }
         ["whoami"] => op("GET", "/api/auth/me", None),
         ["users"] | ["user", "list"] => op("GET", "/api/users", None),
         ["user", "add", email, rest @ ..] => {
@@ -1025,13 +1419,33 @@ fn run(args: &[String]) -> Result<String, String> {
             let body = json!({ "email": email, "name": name, "role": flag(rest, "--role").map(role).transpose()? });
             op("POST", "/api/users", Some(body.to_string()))
         }
-        ["user", "role", key, r] => op("PATCH", &format!("/api/users/{}", encode(key)), Some(json!({ "role": role(r)? }).to_string())),
+        ["user", "role", key, r] => op(
+            "PATCH",
+            &format!("/api/users/{}", encode(key)),
+            Some(json!({ "role": role(r)? }).to_string()),
+        ),
         ["user", "tier", key, t] => {
-            let tier = if *t == "default" { Value::Null } else { json!(t) };
-            op("PATCH", &format!("/api/users/{}", encode(key)), Some(json!({ "tier": tier }).to_string()))
+            let tier = if *t == "default" {
+                Value::Null
+            } else {
+                json!(t)
+            };
+            op(
+                "PATCH",
+                &format!("/api/users/{}", encode(key)),
+                Some(json!({ "tier": tier }).to_string()),
+            )
         }
-        ["user", "isolation", key] => op("GET", &format!("/api/users/{}/isolation", encode(key)), None),
-        ["user", "isolate", key] => op("POST", &format!("/api/users/{}/isolation", encode(key)), None),
+        ["user", "isolation", key] => op(
+            "GET",
+            &format!("/api/users/{}/isolation", encode(key)),
+            None,
+        ),
+        ["user", "isolate", key] => op(
+            "POST",
+            &format!("/api/users/{}/isolation", encode(key)),
+            None,
+        ),
         ["user", "harness-login", key, harness, rest @ ..] => harness_login(key, harness, rest),
         ["user", sub @ ("teammates" | "teammate-removals"), rest @ ..] => {
             let mut args = vec![*sub];
@@ -1040,71 +1454,151 @@ fn run(args: &[String]) -> Result<String, String> {
             op(method, &path, None)
         }
         ["tiers"] => op("GET", "/api/tiers", None),
-        ["usage"] => Ok(usage_summary(&serde_json::from_str(&api(Cred::Operator, "GET", "/api/usage", None)?).map_err(|e| e.to_string())?)),
+        ["usage"] => Ok(usage_summary(
+            &serde_json::from_str(&api(Cred::Operator, "GET", "/api/usage", None)?)
+                .map_err(|e| e.to_string())?,
+        )),
         ["usage", "json"] => op("GET", "/api/usage", None),
-        ["usage", "me"] => Ok(period_summary(&serde_json::from_str(&op("GET", "/api/me/usage", None)?).map_err(|e| e.to_string())?)),
+        ["usage", "me"] => Ok(period_summary(
+            &serde_json::from_str(&op("GET", "/api/me/usage", None)?).map_err(|e| e.to_string())?,
+        )),
         ["usage", "me", "json"] => op("GET", "/api/me/usage", None),
-        ["usage", "user", key] => Ok(period_summary(&serde_json::from_str(&op("GET", &format!("/api/users/{}/usage", encode(key)), None)?).map_err(|e| e.to_string())?)),
-        ["usage", "user", key, "json"] => op("GET", &format!("/api/users/{}/usage", encode(key)), None),
-        ["license"] | ["license", "status"] => Ok(license_summary(&serde_json::from_str(&api(Cred::Operator, "GET", "/api/license", None)?).map_err(|e| e.to_string())?)),
+        ["usage", "user", key] => Ok(period_summary(
+            &serde_json::from_str(&op(
+                "GET",
+                &format!("/api/users/{}/usage", encode(key)),
+                None,
+            )?)
+            .map_err(|e| e.to_string())?,
+        )),
+        ["usage", "user", key, "json"] => {
+            op("GET", &format!("/api/users/{}/usage", encode(key)), None)
+        }
+        ["license"] | ["license", "status"] => Ok(license_summary(
+            &serde_json::from_str(&api(Cred::Operator, "GET", "/api/license", None)?)
+                .map_err(|e| e.to_string())?,
+        )),
         ["license", "json"] => op("GET", "/api/license", None),
         ["license", "install", rest @ ..] if rest.len() <= 1 => {
             let key = match rest.first() {
                 None | Some(&"-") => stdin_value(std::io::stdin())?,
                 Some(path) => std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?,
             };
-            let res = api(Cred::Operator, "PUT", "/api/license", Some(json!({ "key": key.trim() }).to_string()))?;
-            Ok(format!("Installed.\n{}", license_summary(&serde_json::from_str(&res).map_err(|e| e.to_string())?)))
+            let res = api(
+                Cred::Operator,
+                "PUT",
+                "/api/license",
+                Some(json!({ "key": key.trim() }).to_string()),
+            )?;
+            Ok(format!(
+                "Installed.\n{}",
+                license_summary(&serde_json::from_str(&res).map_err(|e| e.to_string())?)
+            ))
         }
         ["license", "remove"] => {
             let res = api(Cred::Operator, "DELETE", "/api/license", None)?;
-            Ok(format!("Removed.\n{}", license_summary(&serde_json::from_str(&res).map_err(|e| e.to_string())?)))
+            Ok(format!(
+                "Removed.\n{}",
+                license_summary(&serde_json::from_str(&res).map_err(|e| e.to_string())?)
+            ))
         }
         ["setup", "json"] => op("GET", "/api/setup", None),
         ["setup", rest @ ..] => {
             let (method, body) = setup_request(rest)?;
             let res = api(Cred::Operator, method, "/api/setup", body)?;
-            Ok(setup_summary(&serde_json::from_str(&res).map_err(|e| e.to_string())?))
+            Ok(setup_summary(
+                &serde_json::from_str(&res).map_err(|e| e.to_string())?,
+            ))
         }
         ["user", cmd @ ("disable" | "enable"), key] => {
-            let status = if *cmd == "disable" { "disabled" } else { "active" };
-            op("PATCH", &format!("/api/users/{}", encode(key)), Some(json!({ "status": status }).to_string()))
+            let status = if *cmd == "disable" {
+                "disabled"
+            } else {
+                "active"
+            };
+            op(
+                "PATCH",
+                &format!("/api/users/{}", encode(key)),
+                Some(json!({ "status": status }).to_string()),
+            )
         }
-        ["user", "routines", key] => op("GET", &format!("/api/users/{}/routines", encode(key)), None),
-        ["user", "resume-routines", key] => op("POST", &format!("/api/users/{}/routines/resume", encode(key)), None),
+        ["user", "routines", key] => {
+            op("GET", &format!("/api/users/{}/routines", encode(key)), None)
+        }
+        ["user", "resume-routines", key] => op(
+            "POST",
+            &format!("/api/users/{}/routines/resume", encode(key)),
+            None,
+        ),
         ["user", "handover", key, rest @ ..] => {
             let (path, body) = handover_request(key, rest)?;
             op("POST", &path, Some(body.to_string()))
         }
         ["user", "code", key, rest @ ..] => {
-            let ttl = flag(rest, "--ttl").map(|t| t.parse::<u32>().map_err(|_| "--ttl must be minutes")).transpose()?;
+            let ttl = flag(rest, "--ttl")
+                .map(|t| t.parse::<u32>().map_err(|_| "--ttl must be minutes"))
+                .transpose()?;
             let body = json!({ "ttlMinutes": ttl }).to_string();
-            let res: Value = serde_json::from_str(&api(Cred::Operator, "POST", &format!("/api/users/{}/login-codes", encode(key)), Some(body))?).map_err(|e| e.to_string())?;
+            let res: Value = serde_json::from_str(&api(
+                Cred::Operator,
+                "POST",
+                &format!("/api/users/{}/login-codes", encode(key)),
+                Some(body),
+            )?)
+            .map_err(|e| e.to_string())?;
             let mins = (res["expiresAt"].as_i64().unwrap_or_default() - now_ms()) / 60_000;
-            Ok(format!("{}\n\nA one-time sign-in code for {}, good for about {} minutes. Share it privately.", res["code"].as_str().unwrap_or_default(), res["user"]["email"].as_str().unwrap_or(key), mins.max(1)))
+            Ok(format!(
+                "{}\n\nA one-time sign-in code for {}, good for about {} minutes. Share it privately.",
+                res["code"].as_str().unwrap_or_default(),
+                res["user"]["email"].as_str().unwrap_or(key),
+                mins.max(1)
+            ))
         }
-        ["user", "identities", key] => op("GET", &format!("/api/users/{}/identities", encode(key)), None),
+        ["user", "identities", key] => op(
+            "GET",
+            &format!("/api/users/{}/identities", encode(key)),
+            None,
+        ),
         ["user", "link", key, provider, subject, rest @ ..] => {
             let body = json!({ "provider": provider, "subject": subject, "tenant": flag(rest, "--tenant") });
-            op("POST", &format!("/api/users/{}/identities", encode(key)), Some(body.to_string()))
+            op(
+                "POST",
+                &format!("/api/users/{}/identities", encode(key)),
+                Some(body.to_string()),
+            )
         }
-        ["user", "unlink", key, id] => op("DELETE", &format!("/api/users/{}/identities/{}", encode(key), encode(id)), None),
+        ["user", "unlink", key, id] => op(
+            "DELETE",
+            &format!("/api/users/{}/identities/{}", encode(key), encode(id)),
+            None,
+        ),
         ["sessions"] => op("GET", "/api/sessions", None),
         ["sessions", key] => op("GET", &format!("/api/sessions?user={}", encode(key)), None),
-        ["session", "revoke", id] => op("DELETE", &format!("/api/sessions/{}", encode(id)), None).map(|_| "Revoked.".into()),
-        ["session", "revoke-all", key] => op("DELETE", &format!("/api/users/{}/sessions", encode(key)), None),
+        ["session", "revoke", id] => {
+            op("DELETE", &format!("/api/sessions/{}", encode(id)), None).map(|_| "Revoked.".into())
+        }
+        ["session", "revoke-all", key] => op(
+            "DELETE",
+            &format!("/api/users/{}/sessions", encode(key)),
+            None,
+        ),
         ["secrets"] => op("GET", "/api/secrets", None),
         ["secret", "set", name] => {
             let name = env_name(name)?;
             let body = json!({ "value": stdin_value(std::io::stdin())? }).to_string();
-            let res: Value = serde_json::from_str(&op("PUT", &format!("/api/secrets/{name}"), Some(body))?).unwrap_or_default();
+            let res: Value =
+                serde_json::from_str(&op("PUT", &format!("/api/secrets/{name}"), Some(body))?)
+                    .unwrap_or_default();
             Ok(if res["secret"]["forBots"] == false {
                 format!("Saved {name}. It is botd's own (single sign-on); Bots never get it.")
             } else {
                 format!("Saved {name}. Bots get it as ${name} from their next run.")
             })
         }
-        ["secret", "rm" | "delete", name] => op("DELETE", &format!("/api/secrets/{}", env_name(name)?), None).map(|_| "Deleted.".into()),
+        ["secret", "rm" | "delete", name] => {
+            op("DELETE", &format!("/api/secrets/{}", env_name(name)?), None)
+                .map(|_| "Deleted.".into())
+        }
         ["help", "admin"] | ["admin"] => Ok(ADMIN_HELP.into()),
         _ => Ok(HELP.into()),
     }
@@ -1121,11 +1615,16 @@ fn handover_request(key: &str, rest: &[&str]) -> Result<(String, Value), String>
     if to.starts_with("--") {
         return Err(usage.into());
     }
-    Ok((format!("/api/users/{}/handover", encode(key)), json!({ "to": to, "resumeRoutines": resume })))
+    Ok((
+        format!("/api/users/{}/handover", encode(key)),
+        json!({ "to": to, "resumeRoutines": resume }),
+    ))
 }
 
 fn now_ms() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 fn main() {
@@ -1149,7 +1648,10 @@ mod tests {
 
     #[test]
     fn a_failure_shows_the_servers_error() {
-        assert_eq!(failure(403, r#"{"error":"not allowed"}"#), "not allowed (HTTP 403)");
+        assert_eq!(
+            failure(403, r#"{"error":"not allowed"}"#),
+            "not allowed (HTTP 403)"
+        );
         assert_eq!(failure(502, "Bad Gateway"), "Bad Gateway (HTTP 502)");
         assert_eq!(failure(400, r#"{"error":7}"#), r#"{"error":7} (HTTP 400)"#);
     }
@@ -1158,9 +1660,18 @@ mod tests {
     fn handover_names_the_disabled_user_and_who_takes_over() {
         let (path, body) = handover_request("ada@example.com", &["bea@example.com"]).unwrap();
         assert_eq!(path, "/api/users/ada%40example.com/handover");
-        assert_eq!(body, json!({ "to": "bea@example.com", "resumeRoutines": false }));
-        assert_eq!(handover_request("u1", &["u2", "--resume"]).unwrap().1["resumeRoutines"], true);
-        assert_eq!(handover_request("u1", &["--resume", "u2"]).unwrap().1["to"], "u2");
+        assert_eq!(
+            body,
+            json!({ "to": "bea@example.com", "resumeRoutines": false })
+        );
+        assert_eq!(
+            handover_request("u1", &["u2", "--resume"]).unwrap().1["resumeRoutines"],
+            true
+        );
+        assert_eq!(
+            handover_request("u1", &["--resume", "u2"]).unwrap().1["to"],
+            "u2"
+        );
         assert!(handover_request("u1", &[]).is_err());
         assert!(handover_request("u1", &["--resume"]).is_err());
         assert!(handover_request("u1", &["u2", "u3"]).is_err());
@@ -1170,12 +1681,27 @@ mod tests {
     fn harness_login_takes_extra_arguments_only_after_a_double_dash() {
         assert_eq!(login_extra(&[]), Ok((None, None)));
         assert_eq!(login_extra(&["--"]), Ok((None, Some(&[][..]))));
-        assert_eq!(login_extra(&["--", "setup-token"]), Ok((None, Some(&["setup-token"][..]))));
+        assert_eq!(
+            login_extra(&["--", "setup-token"]),
+            Ok((None, Some(&["setup-token"][..])))
+        );
         assert!(login_extra(&["setup-token"]).is_err());
         assert_eq!(login_extra(&["--owner", "ada"]), Ok((Some("ada"), None)));
-        assert_eq!(login_extra(&["--owner", "ada", "--", "setup-token"]), Ok((Some("ada"), Some(&["setup-token"][..]))));
-        assert_eq!(login_extra(&["--", "--owner", "ada"]), Ok((None, Some(&["--owner", "ada"][..]))), "after -- it's the login's");
-        for bad in [&["--owner"][..], &["--owner", "--"], &["--owner", ""], &["ada", "--owner"]] {
+        assert_eq!(
+            login_extra(&["--owner", "ada", "--", "setup-token"]),
+            Ok((Some("ada"), Some(&["setup-token"][..])))
+        );
+        assert_eq!(
+            login_extra(&["--", "--owner", "ada"]),
+            Ok((None, Some(&["--owner", "ada"][..]))),
+            "after -- it's the login's"
+        );
+        for bad in [
+            &["--owner"][..],
+            &["--owner", "--"],
+            &["--owner", ""],
+            &["ada", "--owner"],
+        ] {
             assert!(login_extra(bad).is_err(), "{bad:?}");
         }
     }
@@ -1184,83 +1710,227 @@ mod tests {
     fn machine_lifecycle_commands() {
         let r = |a: &[&str]| lifecycle_request(a).unwrap().unwrap();
         assert_eq!(r(&["list"]), ("GET", "/api/machines".into(), None));
-        assert_eq!(r(&["list", "running"]), ("GET", "/api/machines?state=running".into(), None));
-        assert_eq!(r(&["show", "a@example.com"]), ("GET", "/api/users/a%40example.com/machine".into(), None));
-        assert_eq!(r(&["request", "u1"]), ("POST", "/api/users/u1/machine".into(), Some("{}".into())));
+        assert_eq!(
+            r(&["list", "running"]),
+            ("GET", "/api/machines?state=running".into(), None)
+        );
+        assert_eq!(
+            r(&["show", "a@example.com"]),
+            ("GET", "/api/users/a%40example.com/machine".into(), None)
+        );
+        assert_eq!(
+            r(&["request", "u1"]),
+            ("POST", "/api/users/u1/machine".into(), Some("{}".into()))
+        );
         let (_, _, body) = r(&["request", "u1", "pro", "node2"]);
-        assert_eq!(serde_json::from_str::<Value>(&body.unwrap()).unwrap(), json!({ "tier": "pro", "region": "node2" }));
-        assert_eq!(r(&["suspend", "u1"]), ("POST", "/api/users/u1/machine/suspend".into(), None));
-        assert_eq!(r(&["resume", "u1"]), ("POST", "/api/users/u1/machine/resume".into(), None));
-        assert_eq!(r(&["resize", "u1", "max"]), ("POST", "/api/users/u1/machine/resize".into(), Some(r#"{"tier":"max"}"#.into())));
-        assert_eq!(r(&["destroy", "u1", "--yes"]), ("DELETE", "/api/users/u1/machine".into(), None));
-        assert_eq!(r(&["substrate"]), ("GET", "/api/machines/substrate".into(), None));
-        assert_eq!(r(&["substrate", "check"]), ("GET", "/api/machines/substrate?check=true".into(), None));
-        assert_eq!(r(&["reconcile"]), ("POST", "/api/machines/reconcile".into(), None));
-        for bad in [&["destroy", "u1"][..], &["resize", "u1"], &["request", "u1", "pro", "node2", "x"], &["substrate", "now"], &["show"]] {
+        assert_eq!(
+            serde_json::from_str::<Value>(&body.unwrap()).unwrap(),
+            json!({ "tier": "pro", "region": "node2" })
+        );
+        assert_eq!(
+            r(&["suspend", "u1"]),
+            ("POST", "/api/users/u1/machine/suspend".into(), None)
+        );
+        assert_eq!(
+            r(&["resume", "u1"]),
+            ("POST", "/api/users/u1/machine/resume".into(), None)
+        );
+        assert_eq!(
+            r(&["resize", "u1", "max"]),
+            (
+                "POST",
+                "/api/users/u1/machine/resize".into(),
+                Some(r#"{"tier":"max"}"#.into())
+            )
+        );
+        assert_eq!(
+            r(&["destroy", "u1", "--yes"]),
+            ("DELETE", "/api/users/u1/machine".into(), None)
+        );
+        assert_eq!(
+            r(&["substrate"]),
+            ("GET", "/api/machines/substrate".into(), None)
+        );
+        assert_eq!(
+            r(&["substrate", "check"]),
+            ("GET", "/api/machines/substrate?check=true".into(), None)
+        );
+        assert_eq!(
+            r(&["reconcile"]),
+            ("POST", "/api/machines/reconcile".into(), None)
+        );
+        for bad in [
+            &["destroy", "u1"][..],
+            &["resize", "u1"],
+            &["request", "u1", "pro", "node2", "x"],
+            &["substrate", "now"],
+            &["show"],
+        ] {
             assert!(lifecycle_request(bad).unwrap().is_err(), "{bad:?}");
         }
-        assert!(lifecycle_request(&["placement"]).is_none(), "the rest are machine_request's");
+        assert!(
+            lifecycle_request(&["placement"]).is_none(),
+            "the rest are machine_request's"
+        );
     }
 
     #[test]
     fn machine_commands_name_the_users_placement() {
-        assert_eq!(machine_request(&["placement"]).unwrap(), ("GET", "/api/machines/placements".into()));
-        assert_eq!(machine_request(&["placement", "a@example.com"]).unwrap(), ("GET", "/api/users/a%40example.com/placement".into()));
-        assert_eq!(machine_request(&["assign", "u1"]).unwrap(), ("PUT", "/api/users/u1/placement".into()));
-        assert_eq!(machine_request(&["unassign", "u1"]).unwrap(), ("DELETE", "/api/users/u1/placement".into()));
-        assert!(machine_request(&["assign"]).is_err());
-        assert_eq!(machine_request(&["agent", "a@example.com"]).unwrap(), ("GET", "/api/users/a%40example.com/machine/agent".into()));
-        assert_eq!(machine_request(&["upgrade", "u1"]).unwrap(), ("POST", "/api/users/u1/machine/agent/upgrade".into()));
-        assert_eq!(machine_request(&["upgrade", "u1", "hold"]).unwrap(), ("PUT", "/api/users/u1/machine/agent/hold".into()));
-        assert_eq!(machine_request(&["upgrade", "u1", "release"]).unwrap(), ("DELETE", "/api/users/u1/machine/agent/hold".into()));
-        assert_eq!(machine_request(&["harnesses", "u1"]).unwrap(), ("POST", "/api/users/u1/machine/harnesses".into()));
-        assert_eq!(machine_request(&["bot-user", "u1"]).unwrap(), ("POST", "/api/users/u1/machine/bot-user".into()));
-        assert!(machine_request(&["upgrade", "u1", "now"]).is_err());
-        assert_eq!(machine_request(&["folder", "u1"]).unwrap(), ("GET", "/api/users/u1/machine/folder-sync".into()));
-        assert_eq!(machine_request(&["sync", "u1"]).unwrap(), ("POST", "/api/users/u1/machine/folder-sync".into()));
-        assert_eq!(machine_request(&["screens", "a@example.com"]).unwrap(), ("GET", "/api/users/a%40example.com/machine/screens".into()));
-        assert_eq!(machine_request(&["screens", "u1", "close", "b 1"]).unwrap(), ("DELETE", "/api/users/u1/machine/screens/b%201".into()));
-        assert!(machine_request(&["screens", "u1", "close"]).is_err());
-        assert_eq!(teammate_accounts_request(&["teammates", "u1"]).unwrap(), ("GET", "/api/users/u1/teammate-accounts".into()));
         assert_eq!(
-            teammate_accounts_request(&["teammates", "a@example.com", "remove", "b@example.com"]).unwrap(),
-            ("POST", "/api/users/a%40example.com/teammate-accounts/b%40example.com/remove".into())
+            machine_request(&["placement"]).unwrap(),
+            ("GET", "/api/machines/placements".into())
         );
-        assert_eq!(teammate_accounts_request(&["teammate-removals"]).unwrap(), ("GET", "/api/isolation/teammate-removals?state=open".into()));
-        assert_eq!(teammate_accounts_request(&["teammate-removals", "held"]).unwrap(), ("GET", "/api/isolation/teammate-removals?state=held".into()));
-        for bad in [&["teammates", "u1", "remove"][..], &["teammates"], &["teammate-removals", "soon"], &["teammates", "u1", "purge", "u2"]] {
+        assert_eq!(
+            machine_request(&["placement", "a@example.com"]).unwrap(),
+            ("GET", "/api/users/a%40example.com/placement".into())
+        );
+        assert_eq!(
+            machine_request(&["assign", "u1"]).unwrap(),
+            ("PUT", "/api/users/u1/placement".into())
+        );
+        assert_eq!(
+            machine_request(&["unassign", "u1"]).unwrap(),
+            ("DELETE", "/api/users/u1/placement".into())
+        );
+        assert!(machine_request(&["assign"]).is_err());
+        assert_eq!(
+            machine_request(&["agent", "a@example.com"]).unwrap(),
+            ("GET", "/api/users/a%40example.com/machine/agent".into())
+        );
+        assert_eq!(
+            machine_request(&["upgrade", "u1"]).unwrap(),
+            ("POST", "/api/users/u1/machine/agent/upgrade".into())
+        );
+        assert_eq!(
+            machine_request(&["upgrade", "u1", "hold"]).unwrap(),
+            ("PUT", "/api/users/u1/machine/agent/hold".into())
+        );
+        assert_eq!(
+            machine_request(&["upgrade", "u1", "release"]).unwrap(),
+            ("DELETE", "/api/users/u1/machine/agent/hold".into())
+        );
+        assert_eq!(
+            machine_request(&["harnesses", "u1"]).unwrap(),
+            ("POST", "/api/users/u1/machine/harnesses".into())
+        );
+        assert_eq!(
+            machine_request(&["bot-user", "u1"]).unwrap(),
+            ("POST", "/api/users/u1/machine/bot-user".into())
+        );
+        assert!(machine_request(&["upgrade", "u1", "now"]).is_err());
+        assert_eq!(
+            machine_request(&["folder", "u1"]).unwrap(),
+            ("GET", "/api/users/u1/machine/folder-sync".into())
+        );
+        assert_eq!(
+            machine_request(&["sync", "u1"]).unwrap(),
+            ("POST", "/api/users/u1/machine/folder-sync".into())
+        );
+        assert_eq!(
+            machine_request(&["screens", "a@example.com"]).unwrap(),
+            ("GET", "/api/users/a%40example.com/machine/screens".into())
+        );
+        assert_eq!(
+            machine_request(&["screens", "u1", "close", "b 1"]).unwrap(),
+            ("DELETE", "/api/users/u1/machine/screens/b%201".into())
+        );
+        assert!(machine_request(&["screens", "u1", "close"]).is_err());
+        assert_eq!(
+            teammate_accounts_request(&["teammates", "u1"]).unwrap(),
+            ("GET", "/api/users/u1/teammate-accounts".into())
+        );
+        assert_eq!(
+            teammate_accounts_request(&["teammates", "a@example.com", "remove", "b@example.com"])
+                .unwrap(),
+            (
+                "POST",
+                "/api/users/a%40example.com/teammate-accounts/b%40example.com/remove".into()
+            )
+        );
+        assert_eq!(
+            teammate_accounts_request(&["teammate-removals"]).unwrap(),
+            ("GET", "/api/isolation/teammate-removals?state=open".into())
+        );
+        assert_eq!(
+            teammate_accounts_request(&["teammate-removals", "held"]).unwrap(),
+            ("GET", "/api/isolation/teammate-removals?state=held".into())
+        );
+        for bad in [
+            &["teammates", "u1", "remove"][..],
+            &["teammates"],
+            &["teammate-removals", "soon"],
+            &["teammates", "u1", "purge", "u2"],
+        ] {
             assert!(teammate_accounts_request(bad).is_err(), "{bad:?}");
         }
-        assert_eq!(machine_request(&["teammates", "u1"]).unwrap(), ("GET", "/api/users/u1/machine/teammates".into()));
+        assert_eq!(
+            machine_request(&["teammates", "u1"]).unwrap(),
+            ("GET", "/api/users/u1/machine/teammates".into())
+        );
         assert_eq!(
             machine_request(&["teammates", "u1", "remove", "b@example.com"]).unwrap(),
-            ("POST", "/api/users/u1/machine/teammates/b%40example.com/remove".into())
+            (
+                "POST",
+                "/api/users/u1/machine/teammates/b%40example.com/remove".into()
+            )
         );
-        assert_eq!(machine_request(&["removals"]).unwrap(), ("GET", "/api/machines/teammate-removals?state=open".into()));
-        assert_eq!(machine_request(&["removals", "held"]).unwrap(), ("GET", "/api/machines/teammate-removals?state=held".into()));
+        assert_eq!(
+            machine_request(&["removals"]).unwrap(),
+            ("GET", "/api/machines/teammate-removals?state=open".into())
+        );
+        assert_eq!(
+            machine_request(&["removals", "held"]).unwrap(),
+            ("GET", "/api/machines/teammate-removals?state=held".into())
+        );
         assert!(machine_request(&["removals", "soon"]).is_err());
         assert!(machine_request(&["teammates", "u1", "remove"]).is_err());
         assert_eq!(
             machine_request(&["teammates", "u1", "logins", "b@example.com"]).unwrap(),
-            ("GET", "/api/users/u1/machine/teammates/b%40example.com/harness-logins".into())
+            (
+                "GET",
+                "/api/users/u1/machine/teammates/b%40example.com/harness-logins".into()
+            )
         );
         assert_eq!(
             machine_request(&["teammates", "u1", "logout", "u2", "claude"]).unwrap(),
-            ("DELETE", "/api/users/u1/machine/teammates/u2/harness-logins/claude".into())
+            (
+                "DELETE",
+                "/api/users/u1/machine/teammates/u2/harness-logins/claude".into()
+            )
         );
         assert!(machine_request(&["teammates", "u1", "logout", "u2"]).is_err());
-        assert_eq!(rebuild_request(&["a@example.com"]).unwrap(), ("POST", "/api/users/a%40example.com/machine/rebuild".into(), None));
+        assert_eq!(
+            rebuild_request(&["a@example.com"]).unwrap(),
+            (
+                "POST",
+                "/api/users/a%40example.com/machine/rebuild".into(),
+                None
+            )
+        );
         assert_eq!(
             rebuild_request(&["u1", "--discard-work"]).unwrap(),
-            ("POST", "/api/users/u1/machine/rebuild?discardWork=true".into(), None)
+            (
+                "POST",
+                "/api/users/u1/machine/rebuild?discardWork=true".into(),
+                None
+            )
         );
-        assert_eq!(rebuild_request(&["u1", "status"]).unwrap(), ("GET", "/api/users/u1/machine/rebuild".into(), None));
-        assert_eq!(rebuild_request(&["u1", "cancel"]).unwrap(), ("DELETE", "/api/users/u1/machine/rebuild".into(), None));
+        assert_eq!(
+            rebuild_request(&["u1", "status"]).unwrap(),
+            ("GET", "/api/users/u1/machine/rebuild".into(), None)
+        );
+        assert_eq!(
+            rebuild_request(&["u1", "cancel"]).unwrap(),
+            ("DELETE", "/api/users/u1/machine/rebuild".into(), None)
+        );
         assert!(rebuild_request(&[]).is_err());
         assert!(rebuild_request(&["--discard-work"]).is_err());
         assert!(rebuild_request(&["u1", "--discard"]).is_err());
         assert_eq!(login_base("me"), "/api/machine");
-        assert_eq!(login_base("a@example.com"), "/api/users/a%40example.com/machine");
+        assert_eq!(
+            login_base("a@example.com"),
+            "/api/users/a%40example.com/machine"
+        );
     }
 
     #[test]
@@ -1272,14 +1942,33 @@ mod tests {
 
     #[test]
     fn the_operator_password_only_goes_to_this_machine() {
-        for a in ["127.0.0.1:3000", "127.1.2.3:80", "localhost:3000", "LOCALHOST:3000", "[::1]:3000"] {
+        for a in [
+            "127.0.0.1:3000",
+            "127.1.2.3:80",
+            "localhost:3000",
+            "LOCALHOST:3000",
+            "[::1]:3000",
+        ] {
             assert!(loopback(a), "{a}");
         }
-        for a in ["192.0.2.7:3000", "example.com:3000", "localhost.example.com:3000", "[2001:db8::1]:3000", "0.0.0.0:3000", "127.0.0.1.example.com:3000"] {
+        for a in [
+            "192.0.2.7:3000",
+            "example.com:3000",
+            "localhost.example.com:3000",
+            "[2001:db8::1]:3000",
+            "0.0.0.0:3000",
+            "127.0.0.1.example.com:3000",
+        ] {
             assert!(!loopback(a), "{a}");
         }
         assert_eq!(addr("http://127.0.0.1:3000/"), Ok("127.0.0.1:3000"));
-        for b in ["https://127.0.0.1:3000", "127.0.0.1:3000", "http://user@192.0.2.7:3000", "http://192.0.2.7:3000/x", "http://"] {
+        for b in [
+            "https://127.0.0.1:3000",
+            "127.0.0.1:3000",
+            "http://user@192.0.2.7:3000",
+            "http://192.0.2.7:3000/x",
+            "http://",
+        ] {
             assert!(addr(b).is_err(), "{b}");
         }
         let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
@@ -1297,16 +1986,42 @@ mod tests {
         assert_eq!(audit_query(&[]).unwrap(), "");
         assert_eq!(audit_query(&["50"]).unwrap(), "?limit=50");
         assert_eq!(
-            audit_query(&["--from", "2026-11-19T13:00:00+01:00", "--action", "bot.*,auth.login", "--actor", "bot:ab12"]).unwrap(),
+            audit_query(&[
+                "--from",
+                "2026-11-19T13:00:00+01:00",
+                "--action",
+                "bot.*,auth.login",
+                "--actor",
+                "bot:ab12"
+            ])
+            .unwrap(),
             "?from=2026-11-19T13:00:00%2B01:00&action=bot.*,auth.login&actor=bot:ab12"
         );
         assert_eq!(audit_query(&["--to", "a b&c"]).unwrap(), "?to=a%20b%26c");
         assert_eq!(
-            audit_query(&["--actor", "user:ada@example.com", "--method", "sso,password", "--idp", "entra", "--idp-provider", "work"]).unwrap(),
+            audit_query(&[
+                "--actor",
+                "user:ada@example.com",
+                "--method",
+                "sso,password",
+                "--idp",
+                "entra",
+                "--idp-provider",
+                "work"
+            ])
+            .unwrap(),
             "?actor=user:ada%40example.com&method=sso,password&idp=entra&idpProvider=work"
         );
         assert_eq!(
-            audit_query(&["--subject", "https://idp.example/t1|oid-1", "--session", "s0a1b", "--on-behalf-of", "u42"]).unwrap(),
+            audit_query(&[
+                "--subject",
+                "https://idp.example/t1|oid-1",
+                "--session",
+                "s0a1b",
+                "--on-behalf-of",
+                "u42"
+            ])
+            .unwrap(),
             "?subject=https:%2F%2Fidp.example%2Ft1%7Coid-1&session=s0a1b&onBehalfOf=u42"
         );
         assert!(audit_query(&["--from"]).is_err());
@@ -1315,7 +2030,10 @@ mod tests {
 
     #[test]
     fn login_and_user_commands() {
-        assert_eq!(login_body(Some(" sbc_abc ")).unwrap(), json!({ "code": "sbc_abc", "session": "token", "label": "botctl" }));
+        assert_eq!(
+            login_body(Some(" sbc_abc ")).unwrap(),
+            json!({ "code": "sbc_abc", "session": "token", "label": "botctl" })
+        );
         assert!(login_body(Some("  ")).is_err());
         assert_eq!(role("read-only"), Ok("read-only"));
         assert!(role("root").is_err());
@@ -1324,13 +2042,50 @@ mod tests {
 
     #[test]
     fn bot_access_commands() {
-        let req = |a: &[&str]| bot_access(a).map(|(m, p, b)| (m, p, b.map(|b| serde_json::from_str::<Value>(&b).unwrap())));
-        assert_eq!(req(&["access", "b1"]), Ok(("GET", "/api/bots/b1/access".into(), None)));
-        assert_eq!(req(&["share", "b1"]), Ok(("PATCH", "/api/bots/b1/access".into(), Some(json!({ "visibility": "shared" })))));
-        assert_eq!(req(&["private", "b1"]), Ok(("PATCH", "/api/bots/b1/access".into(), Some(json!({ "visibility": "private" })))));
-        assert_eq!(req(&["owner", "b1", "a@example.com"]), Ok(("PATCH", "/api/bots/b1/access".into(), Some(json!({ "owner": "a@example.com" })))));
-        assert_eq!(req(&["grant", "b1", "a+b@example.com", "operator"]), Ok(("PUT", "/api/bots/b1/grants/a%2Bb%40example.com".into(), Some(json!({ "level": "operator" })))));
-        assert_eq!(req(&["revoke", "b1", "u1"]), Ok(("DELETE", "/api/bots/b1/grants/u1".into(), None)));
+        let req = |a: &[&str]| {
+            bot_access(a)
+                .map(|(m, p, b)| (m, p, b.map(|b| serde_json::from_str::<Value>(&b).unwrap())))
+        };
+        assert_eq!(
+            req(&["access", "b1"]),
+            Ok(("GET", "/api/bots/b1/access".into(), None))
+        );
+        assert_eq!(
+            req(&["share", "b1"]),
+            Ok((
+                "PATCH",
+                "/api/bots/b1/access".into(),
+                Some(json!({ "visibility": "shared" }))
+            ))
+        );
+        assert_eq!(
+            req(&["private", "b1"]),
+            Ok((
+                "PATCH",
+                "/api/bots/b1/access".into(),
+                Some(json!({ "visibility": "private" }))
+            ))
+        );
+        assert_eq!(
+            req(&["owner", "b1", "a@example.com"]),
+            Ok((
+                "PATCH",
+                "/api/bots/b1/access".into(),
+                Some(json!({ "owner": "a@example.com" }))
+            ))
+        );
+        assert_eq!(
+            req(&["grant", "b1", "a+b@example.com", "operator"]),
+            Ok((
+                "PUT",
+                "/api/bots/b1/grants/a%2Bb%40example.com".into(),
+                Some(json!({ "level": "operator" }))
+            ))
+        );
+        assert_eq!(
+            req(&["revoke", "b1", "u1"]),
+            Ok(("DELETE", "/api/bots/b1/grants/u1".into(), None))
+        );
         assert!(req(&["grant", "b1", "u1", "owner"]).is_err());
         assert!(req(&["share"]).is_err());
         assert!(req(&[]).is_err());
@@ -1338,13 +2093,28 @@ mod tests {
 
     #[test]
     fn setup_commands() {
-        let req = |a: &[&str]| setup_request(a).map(|(m, b)| (m, b.map(|b| serde_json::from_str::<Value>(&b).unwrap())));
+        let req = |a: &[&str]| {
+            setup_request(a)
+                .map(|(m, b)| (m, b.map(|b| serde_json::from_str::<Value>(&b).unwrap())))
+        };
         assert_eq!(req(&[]), Ok(("GET", None)));
         assert_eq!(req(&["status"]), Ok(("GET", None)));
-        assert_eq!(req(&["done"]), Ok(("PATCH", Some(json!({ "completed": true })))));
-        assert_eq!(req(&["reopen"]), Ok(("PATCH", Some(json!({ "completed": false })))));
-        assert_eq!(req(&["hide"]), Ok(("PATCH", Some(json!({ "dismissed": true })))));
-        assert_eq!(req(&["show"]), Ok(("PATCH", Some(json!({ "dismissed": false })))));
+        assert_eq!(
+            req(&["done"]),
+            Ok(("PATCH", Some(json!({ "completed": true }))))
+        );
+        assert_eq!(
+            req(&["reopen"]),
+            Ok(("PATCH", Some(json!({ "completed": false }))))
+        );
+        assert_eq!(
+            req(&["hide"]),
+            Ok(("PATCH", Some(json!({ "dismissed": true }))))
+        );
+        assert_eq!(
+            req(&["show"]),
+            Ok(("PATCH", Some(json!({ "dismissed": false }))))
+        );
         assert!(req(&["finish", "now"]).is_err());
 
         let s = json!({
@@ -1357,11 +2127,28 @@ mod tests {
             "signIn": { "providers": [{ "label": "Okta", "ready": false, "secret": "SSO_OKTA_CLIENT_SECRET" }] },
         });
         let out = setup_summary(&s);
-        assert!(out.starts_with("Setup: 1 of 2 done (admins see the wizard"), "{out}");
-        assert!(out.contains("[x] A public address with HTTPS") && out.contains("[ ] Sign-in providers ready"), "{out}");
-        assert!(out.contains("botctl secret set SSO_OKTA_CLIENT_SECRET < file") && out.contains("botctl setup done"), "{out}");
-        let done = setup_summary(&json!({ "progress": { "completedAt": 1 }, "done": 2, "total": 2, "checklist": [] }));
-        assert!(done.starts_with("Setup: 2 of 2 done (finished).") && !done.contains("botctl setup done"), "{done}");
+        assert!(
+            out.starts_with("Setup: 1 of 2 done (admins see the wizard"),
+            "{out}"
+        );
+        assert!(
+            out.contains("[x] A public address with HTTPS")
+                && out.contains("[ ] Sign-in providers ready"),
+            "{out}"
+        );
+        assert!(
+            out.contains("botctl secret set SSO_OKTA_CLIENT_SECRET < file")
+                && out.contains("botctl setup done"),
+            "{out}"
+        );
+        let done = setup_summary(
+            &json!({ "progress": { "completedAt": 1 }, "done": 2, "total": 2, "checklist": [] }),
+        );
+        assert!(
+            done.starts_with("Setup: 2 of 2 done (finished).")
+                && !done.contains("botctl setup done"),
+            "{done}"
+        );
     }
 
     #[test]
@@ -1375,9 +2162,15 @@ mod tests {
               "plan": { "label": "Self-host", "limits": {}, "usage": { "bots": 1, "runs": 0, "period": "2026-11", "routineRuns": 0, "day": "2026-11-20" } } },
         ]});
         let out = usage_summary(&v);
-        assert!(out.starts_with("Billing: Stripe webhook and checkout on.\n"), "{out}");
+        assert!(
+            out.starts_with("Billing: Stripe webhook and checkout on.\n"),
+            "{out}"
+        );
         assert!(out.contains("ada@example.com: Starter plan; Bots 3/2; runs 12/300 and tokens 4500/unlimited in 2026-11; routine runs 4/24 on 2026-11-20; machine g6-standard-2 (running), plan size g6-standard-1; Stripe active; customer cus_123; OVER: bots, machineType\n"), "{out}");
-        assert!(usage_summary(&json!({ "billing": true, "users": [] })).starts_with("Billing: Stripe webhook on, checkout off.\n"));
+        assert!(
+            usage_summary(&json!({ "billing": true, "users": [] }))
+                .starts_with("Billing: Stripe webhook on, checkout off.\n")
+        );
         assert!(out.contains("Owner: Self-host plan; Bots 1/unlimited; runs 0/unlimited and tokens 0/unlimited in 2026-11; routine runs 0/unlimited on 2026-11-20\n"), "{out}");
     }
 
@@ -1401,7 +2194,10 @@ mod tests {
         member.as_object_mut().unwrap().remove("byModel");
         member["period"]["source"] = json!("calendar");
         let out = period_summary(&member);
-        assert!(out.contains("(calendar month, UTC)") && !out.contains("Model"), "{out}");
+        assert!(
+            out.contains("(calendar month, UTC)") && !out.contains("Model"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -1412,24 +2208,69 @@ mod tests {
             "warnings": ["The license for Acme Ltd ended on 2027-01-01.", "31 people are active, over the 30 seats allowed."],
         });
         let out = license_summary(&grace);
-        assert!(out.starts_with("License: grace (31 of 30 seats in use).\n  The license for Acme Ltd ended"), "{out}");
-        assert!(out.contains("Id lic-7, source file.") && out.contains("Warning: 31 people") && out.matches("ended on").count() == 1, "{out}");
-        let open = license_summary(&json!({ "mode": "active", "detail": "Licensed.", "seats": { "limit": null, "used": 4 }, "warnings": [] }));
-        assert!(open.starts_with("License: active (4 active, no seat limit)."), "{open}");
+        assert!(
+            out.starts_with(
+                "License: grace (31 of 30 seats in use).\n  The license for Acme Ltd ended"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("Id lic-7, source file.")
+                && out.contains("Warning: 31 people")
+                && out.matches("ended on").count() == 1,
+            "{out}"
+        );
+        let open = license_summary(
+            &json!({ "mode": "active", "detail": "Licensed.", "seats": { "limit": null, "used": 4 }, "warnings": [] }),
+        );
+        assert!(
+            open.starts_with("License: active (4 active, no seat limit)."),
+            "{open}"
+        );
     }
 
     #[test]
     fn signup_commands() {
-        let req = |a: &[&str]| signup_request(a).map(|(m, p, b)| (m, p, b.map(|b| serde_json::from_str::<Value>(&b).unwrap())));
-        assert_eq!(req(&[]), Ok(("GET", "/api/signups?status=pending".into(), None)));
-        assert_eq!(req(&["list", "all"]), Ok(("GET", "/api/signups".into(), None)));
-        assert_eq!(req(&["list", "rejected"]), Ok(("GET", "/api/signups?status=rejected".into(), None)));
-        assert_eq!(req(&["approve", "su1"]), Ok(("POST", "/api/signups/su1/approve".into(), Some(json!({ "role": null, "ttlMinutes": null })))));
+        let req = |a: &[&str]| {
+            signup_request(a)
+                .map(|(m, p, b)| (m, p, b.map(|b| serde_json::from_str::<Value>(&b).unwrap())))
+        };
+        assert_eq!(
+            req(&[]),
+            Ok(("GET", "/api/signups?status=pending".into(), None))
+        );
+        assert_eq!(
+            req(&["list", "all"]),
+            Ok(("GET", "/api/signups".into(), None))
+        );
+        assert_eq!(
+            req(&["list", "rejected"]),
+            Ok(("GET", "/api/signups?status=rejected".into(), None))
+        );
+        assert_eq!(
+            req(&["approve", "su1"]),
+            Ok((
+                "POST",
+                "/api/signups/su1/approve".into(),
+                Some(json!({ "role": null, "ttlMinutes": null }))
+            ))
+        );
         assert_eq!(
             req(&["approve", "su1", "--role", "readonly", "--ttl", "90"]),
-            Ok(("POST", "/api/signups/su1/approve".into(), Some(json!({ "role": "readonly", "ttlMinutes": 90 }))))
+            Ok((
+                "POST",
+                "/api/signups/su1/approve".into(),
+                Some(json!({ "role": "readonly", "ttlMinutes": 90 }))
+            ))
         );
-        assert_eq!(req(&["reject", "su1", "--reason", "spam"]), Ok(("POST", "/api/signups/su1/reject".into(), Some(json!({ "reason": "spam" })))));
+        assert_eq!(
+            req(&["reject", "su1", "--reason", "spam"]),
+            Ok((
+                "POST",
+                "/api/signups/su1/reject".into(),
+                Some(json!({ "reason": "spam" }))
+            ))
+        );
         assert!(req(&["approve", "su1", "--role", "root"]).is_err());
         assert!(req(&["approve", "su1", "--ttl", "soon"]).is_err());
         assert!(req(&["list", "maybe"]).is_err());
@@ -1440,78 +2281,169 @@ mod tests {
             "sso": [{ "id": "work", "label": "Work", "type": "entra" }],
         });
         let out = approved(&res);
-        assert!(out.contains("sbc_x") && out.contains("about 72 hours") && out.contains("botctl user link ada@example.com work <subject>"), "{out}");
+        assert!(
+            out.contains("sbc_x")
+                && out.contains("about 72 hours")
+                && out.contains("botctl user link ada@example.com work <subject>"),
+            "{out}"
+        );
         assert!(!approved(&json!({ "sso": [] })).contains("user link"));
     }
 
     #[test]
     fn scim_commands() {
-        let req = |a: &[&str]| scim_request(a).map(|(m, p, b)| (m, p, b.map(|b| serde_json::from_str::<Value>(&b).unwrap())));
-        assert_eq!(req(&["tokens"]), Ok(("GET", "/api/scim/tokens".into(), None)));
-        assert_eq!(req(&["token", "create", "okta"]), Ok(("POST", "/api/scim/tokens".into(), Some(json!({ "tenant": "okta", "sso": null, "label": null })))));
+        let req = |a: &[&str]| {
+            scim_request(a)
+                .map(|(m, p, b)| (m, p, b.map(|b| serde_json::from_str::<Value>(&b).unwrap())))
+        };
         assert_eq!(
-            req(&["token", "create", "entra", "--sso", "work", "--label", "Entra prod"]),
-            Ok(("POST", "/api/scim/tokens".into(), Some(json!({ "tenant": "entra", "sso": "work", "label": "Entra prod" }))))
+            req(&["tokens"]),
+            Ok(("GET", "/api/scim/tokens".into(), None))
         );
-        assert_eq!(req(&["token", "revoke", "st1"]), Ok(("DELETE", "/api/scim/tokens/st1".into(), None)));
+        assert_eq!(
+            req(&["token", "create", "okta"]),
+            Ok((
+                "POST",
+                "/api/scim/tokens".into(),
+                Some(json!({ "tenant": "okta", "sso": null, "label": null }))
+            ))
+        );
+        assert_eq!(
+            req(&[
+                "token",
+                "create",
+                "entra",
+                "--sso",
+                "work",
+                "--label",
+                "Entra prod"
+            ]),
+            Ok((
+                "POST",
+                "/api/scim/tokens".into(),
+                Some(json!({ "tenant": "entra", "sso": "work", "label": "Entra prod" }))
+            ))
+        );
+        assert_eq!(
+            req(&["token", "revoke", "st1"]),
+            Ok(("DELETE", "/api/scim/tokens/st1".into(), None))
+        );
         assert!(req(&["token", "create"]).is_err());
         assert!(req(&["token", "create", "--sso", "work"]).is_err());
         assert!(req(&["token", "revoke"]).is_err());
 
         let res = json!({ "token": "sbp_x", "enabled": false, "scimToken": { "id": "st1", "tenant": "entra", "ssoProvider": "work" } });
         let out = scim_created(&res);
-        assert!(out.contains("sbp_x") && out.contains("shown only once") && out.contains("/scim/v2") && out.contains("objectId") && out.contains("SCIM=on"), "{out}");
-        let on = scim_created(&json!({ "token": "sbp_y", "enabled": true, "scimToken": { "id": "st2", "tenant": "okta" } }));
+        assert!(
+            out.contains("sbp_x")
+                && out.contains("shown only once")
+                && out.contains("/scim/v2")
+                && out.contains("objectId")
+                && out.contains("SCIM=on"),
+            "{out}"
+        );
+        let on = scim_created(
+            &json!({ "token": "sbp_y", "enabled": true, "scimToken": { "id": "st2", "tenant": "okta" } }),
+        );
         assert!(!on.contains("SCIM=on") && !on.contains("objectId"), "{on}");
     }
 
     #[test]
     fn hook_cwd_overrides_where_the_harness_says_it_runs() {
         let event = r#"{"tool_name":"terminal","tool_input":{"command":"ls"},"cwd":"/opt/hermes"}"#;
-        let body: Value = serde_json::from_str(&hook_body("hermes", "b1", None, event, Some("/workspace")).unwrap()).unwrap();
+        let body: Value = serde_json::from_str(
+            &hook_body("hermes", "b1", None, event, Some("/workspace")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(body["event"]["cwd"], "/workspace");
         assert_eq!(body["event"]["tool_name"], "terminal");
         assert_eq!(body["from"], "b1");
-        let body: Value = serde_json::from_str(&hook_body("claude", "b1", None, event, None).unwrap()).unwrap();
+        let body: Value =
+            serde_json::from_str(&hook_body("claude", "b1", None, event, None).unwrap()).unwrap();
         assert_eq!(body["event"]["cwd"], "/opt/hermes");
         assert!(hook_body("hermes", "b1", None, event, Some("workspace")).is_err());
         assert!(hook_body("hermes", "b1", None, "[1]", Some("/workspace")).is_err());
         assert!(hook_body("hermes", "b1", None, "not json", None).is_err());
         // The run the hook is part of goes with it, so run approvals count only there.
-        let body: Value = serde_json::from_str(&hook_body("claude", "b1", Some("r1"), event, None).unwrap()).unwrap();
-        assert_eq!((body["run"].as_str(), body["from"].as_str()), (Some("r1"), Some("b1")));
-        assert!(serde_json::from_str::<Value>(&hook_body("claude", "b1", Some(""), event, None).unwrap()).unwrap()["run"].is_null());
+        let body: Value =
+            serde_json::from_str(&hook_body("claude", "b1", Some("r1"), event, None).unwrap())
+                .unwrap();
+        assert_eq!(
+            (body["run"].as_str(), body["from"].as_str()),
+            (Some("r1"), Some("b1"))
+        );
+        assert!(
+            serde_json::from_str::<Value>(
+                &hook_body("claude", "b1", Some(""), event, None).unwrap()
+            )
+            .unwrap()["run"]
+                .is_null()
+        );
     }
 
     #[test]
     fn approve_for_the_run_or_remember() {
-        assert_eq!(decide_body(&[]).unwrap(), json!({ "remember": null, "scope": "once" }));
-        assert_eq!(decide_body(&["--run"]).unwrap(), json!({ "remember": null, "scope": "run" }));
-        assert_eq!(decide_body(&["--remember"]).unwrap(), json!({ "remember": "bot", "scope": "once" }));
+        assert_eq!(
+            decide_body(&[]).unwrap(),
+            json!({ "remember": null, "scope": "once" })
+        );
+        assert_eq!(
+            decide_body(&["--run"]).unwrap(),
+            json!({ "remember": null, "scope": "run" })
+        );
+        assert_eq!(
+            decide_body(&["--remember"]).unwrap(),
+            json!({ "remember": "bot", "scope": "once" })
+        );
         assert!(decide_body(&["--run", "--remember-global"]).is_err());
     }
 
     #[test]
     fn policy_set_builds_a_patch() {
         let p = policy_patch(&["mode=ask", "timeout=15", "git_push=deny"]).unwrap();
-        assert_eq!(p, json!({ "mode": "ask", "timeoutMinutes": 15, "classes": { "git_push": "deny" } }));
+        assert_eq!(
+            p,
+            json!({ "mode": "ask", "timeoutMinutes": 15, "classes": { "git_push": "deny" } })
+        );
         assert!(policy_patch(&[]).is_err());
         assert!(policy_patch(&["timeout=soon"]).is_err());
         let p = policy_patch(&["mode=inherit", "timeout=inherit", "git_push=inherit"]).unwrap();
-        assert_eq!(p, json!({ "mode": null, "timeoutMinutes": null, "classes": { "git_push": null } }));
-        assert_eq!(policy_patch(&["sandbox=on"]).unwrap(), json!({ "sandbox": true }));
-        assert_eq!(policy_patch(&["sandbox=off", "mode=bypass"]).unwrap(), json!({ "sandbox": false, "mode": "bypass" }));
-        assert_eq!(policy_patch(&["sandbox=inherit"]).unwrap(), json!({ "sandbox": null }));
+        assert_eq!(
+            p,
+            json!({ "mode": null, "timeoutMinutes": null, "classes": { "git_push": null } })
+        );
+        assert_eq!(
+            policy_patch(&["sandbox=on"]).unwrap(),
+            json!({ "sandbox": true })
+        );
+        assert_eq!(
+            policy_patch(&["sandbox=off", "mode=bypass"]).unwrap(),
+            json!({ "sandbox": false, "mode": "bypass" })
+        );
+        assert_eq!(
+            policy_patch(&["sandbox=inherit"]).unwrap(),
+            json!({ "sandbox": null })
+        );
         assert!(policy_patch(&["sandbox=yes"]).is_err());
     }
 
     #[test]
     fn only_a_proxy_on_this_machine_gets_the_bot_token() {
         let p = parse_proxy("http://user:p%40ss%3Aw@localhost:3128").unwrap();
-        assert_eq!((p.addr.as_str(), p.auth.as_deref()), ("localhost:3128", Some("user:p@ss:w")));
+        assert_eq!(
+            (p.addr.as_str(), p.auth.as_deref()),
+            ("localhost:3128", Some("user:p@ss:w"))
+        );
         let p = parse_proxy("http://127.0.0.1:41000/").unwrap();
         assert_eq!((p.addr.as_str(), p.auth), ("127.0.0.1:41000", None));
-        for bad in ["http://proxy.example:3128", "https://localhost:3128", "http://localhost:3128/x", "socks5://localhost:1080", "http://", "http://u:p@10.0.0.1:3128"] {
+        for bad in [
+            "http://proxy.example:3128",
+            "https://localhost:3128",
+            "http://localhost:3128/x",
+            "socks5://localhost:1080",
+            "http://",
+            "http://u:p@10.0.0.1:3128",
+        ] {
             assert!(parse_proxy(bad).is_none(), "{bad}");
         }
         assert_eq!(unescape("a%2"), "a%2");
@@ -1526,11 +2458,15 @@ mod tests {
             let (mut c, _) = proxy.accept().unwrap();
             let mut buf = [0u8; 4096];
             let n = c.read(&mut buf).unwrap();
-            c.write_all(b"HTTP/1.0 200 OK\r\n\r\n{\"ok\":true}").unwrap();
+            c.write_all(b"HTTP/1.0 200 OK\r\n\r\n{\"ok\":true}")
+                .unwrap();
             String::from_utf8_lossy(&buf[..n]).into_owned()
         });
         // Nothing listens on BOT_API itself, as in a sandbox's own network.
-        let closed = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let closed = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
         let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: tests that set these variables hold ENV.
         unsafe {
@@ -1541,8 +2477,19 @@ mod tests {
         let body = api(Cred::Bot, "GET", "/api/bot/routines", None).unwrap();
         assert_eq!(body, r#"{"ok":true}"#);
         let req = seen.join().unwrap();
-        assert!(req.starts_with(&format!("GET http://{closed}/api/bot/routines HTTP/1.0\r\n")), "{req}");
-        assert!(req.contains(&format!("Proxy-Authorization: Basic {}\r\n", base64(b"sb:s:cret"))), "{req}");
+        assert!(
+            req.starts_with(&format!(
+                "GET http://{closed}/api/bot/routines HTTP/1.0\r\n"
+            )),
+            "{req}"
+        );
+        assert!(
+            req.contains(&format!(
+                "Proxy-Authorization: Basic {}\r\n",
+                base64(b"sb:s:cret")
+            )),
+            "{req}"
+        );
         assert!(req.contains("Authorization: Bearer tok\r\n"));
         // An operator's credentials never take a proxy.
         unsafe { std::env::set_var("SUPERBOT_TOKEN", "op") };

@@ -7,8 +7,8 @@
 mod claude;
 mod codex;
 mod hermes;
-mod pi;
 pub mod install;
+mod pi;
 pub mod version;
 
 use crate::machines::job;
@@ -28,10 +28,15 @@ pub enum AgentEvent {
     /// A finished text block: one chat bubble.
     Text(String),
     /// The agent started using a tool.
-    Tool { name: String, detail: String },
+    Tool {
+        name: String,
+        detail: String,
+    },
     /// A tool call finished without an error, so the harness really ran it. A call the
     /// harness rejects before its hook (bad arguments, an unknown name) ends in an error.
-    ToolRan { name: String },
+    ToolRan {
+        name: String,
+    },
     Error(String),
     /// Model tokens the harness says it used (ADR 0050). A run may report several, one
     /// per model or turn; the runner adds them up. A harness that says nothing: unknown.
@@ -52,7 +57,10 @@ pub struct Usage {
 
 impl Usage {
     pub fn total(&self) -> u64 {
-        self.input.saturating_add(self.output).saturating_add(self.cache_read).saturating_add(self.cache_write)
+        self.input
+            .saturating_add(self.output)
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write)
     }
 
     /// A count from harness JSON: a whole number of tokens, else 0.
@@ -101,7 +109,11 @@ pub struct Sandbox {
 /// `host:port` of botd's API as the run reaches it, for a sandbox that only lets
 /// commands reach hosts it is told about.
 pub fn api_host(input: &RunInput) -> Option<String> {
-    let rest = input.env.get("BOT_API")?.strip_prefix("http://")?.trim_end_matches('/');
+    let rest = input
+        .env
+        .get("BOT_API")?
+        .strip_prefix("http://")?
+        .trim_end_matches('/');
     (!rest.is_empty() && !rest.contains(['/', '@', '?', '#'])).then(|| rest.to_string())
 }
 
@@ -144,8 +156,13 @@ pub(crate) fn secret_env() -> Vec<String> {
     for k in crate::secrets::SERVER_SECRETS {
         names.extend([k.to_string(), format!("{k}_FILE")]);
     }
-    let ours = |k: &String| k.starts_with("SSO_") || k.starts_with(crate::secrets::BOT_WEBHOOK_PREFIX);
-    names.extend(std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()).filter(ours));
+    let ours =
+        |k: &String| k.starts_with("SSO_") || k.starts_with(crate::secrets::BOT_WEBHOOK_PREFIX);
+    names.extend(
+        std::env::vars_os()
+            .filter_map(|(k, _)| k.into_string().ok())
+            .filter(ours),
+    );
     names
 }
 
@@ -157,7 +174,12 @@ pub(crate) fn strip_secret_env(cmd: &mut std::process::Command) {
 
 /// How jobs start on this server: botd's environment, without its secrets.
 pub fn local_host() -> job::Host {
-    job::Host { clear_env: false, remove: secret_env(), env: BTreeMap::new(), user: None }
+    job::Host {
+        clear_env: false,
+        remove: secret_env(),
+        env: BTreeMap::new(),
+        user: None,
+    }
 }
 
 pub trait Adapter: Send + Sync {
@@ -266,7 +288,11 @@ pub fn models(name: &str) -> Vec<ModelOption> {
         return list.clone();
     }
     let list = get(name).map(|a| a.models()).unwrap_or_default();
-    CACHE.lock().unwrap().get_or_insert_default().insert(name.into(), (Instant::now(), list.clone()));
+    CACHE
+        .lock()
+        .unwrap()
+        .get_or_insert_default()
+        .insert(name.into(), (Instant::now(), list.clone()));
     list
 }
 
@@ -312,9 +338,13 @@ pub fn get(name: &str) -> Option<Box<dyn Adapter>> {
 /// Harnesses whose CLI is on PATH. Remembered for a few seconds: views ask for
 /// every Bot, and each check starts a shell per harness.
 pub fn installed() -> Vec<&'static str> {
-    static CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<&'static str>)>> = std::sync::Mutex::new(None);
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<&'static str>)>> =
+        std::sync::Mutex::new(None);
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, list)) = cache.as_ref().filter(|(at, _)| at.elapsed() < std::time::Duration::from_secs(5)) {
+    if let Some((_, list)) = cache
+        .as_ref()
+        .filter(|(at, _)| at.elapsed() < std::time::Duration::from_secs(5))
+    {
         return list.clone();
     }
     let list = find_installed();
@@ -348,7 +378,11 @@ pub async fn aborted(mut abort: watch::Receiver<AbortReason>) {
 
 /// The command for one run: what the adapter asks for, with no ids yet. Paths are as
 /// `input` names them. Events the adapter emits up front go to `out`.
-pub fn job_for(adapter: &mut dyn Adapter, input: &RunInput, out: &mut Vec<AgentEvent>) -> JobRequest {
+pub fn job_for(
+    adapter: &mut dyn Adapter,
+    input: &RunInput,
+    out: &mut Vec<AgentEvent>,
+) -> JobRequest {
     let args = adapter.args(input, out);
     let mut env: BTreeMap<String, String> = input.env.clone().into_iter().collect();
     env.extend(adapter.env(input));
@@ -365,7 +399,14 @@ pub fn job_for(adapter: &mut dyn Adapter, input: &RunInput, out: &mut Vec<AgentE
         env,
         cwd: path(&input.cwd),
         stdin: adapter.stdin(input),
-        files: adapter.files(input).into_iter().map(|(p, body)| JobFile { path: path(&p), body }).collect(),
+        files: adapter
+            .files(input)
+            .into_iter()
+            .map(|(p, body)| JobFile {
+                path: path(&p),
+                body,
+            })
+            .collect(),
         cleanup: adapter.cleanup(input),
         collect: Vec::new(),
     }
@@ -373,7 +414,12 @@ pub fn job_for(adapter: &mut dyn Adapter, input: &RunInput, out: &mut Vec<AgentE
 
 /// Runs the harness on this server, calling `emit` for every event, until it exits or
 /// `abort` fires. With `input.run_as`, it starts as that account.
-pub async fn run(adapter: Box<dyn Adapter>, input: RunInput, abort: watch::Receiver<AbortReason>, emit: impl FnMut(AgentEvent)) {
+pub async fn run(
+    adapter: Box<dyn Adapter>,
+    input: RunInput,
+    abort: watch::Receiver<AbortReason>,
+    emit: impl FnMut(AgentEvent),
+) {
     let host = local_host();
     let stop = abort.clone();
     let run_as = input.run_as.clone();
@@ -395,8 +441,13 @@ pub async fn run(adapter: Box<dyn Adapter>, input: RunInput, abort: watch::Recei
 
 /// Runs the harness wherever `exec` runs a job, and turns what comes back into events.
 /// `exec` sends the job's events to its sender and returns when the job is over.
-pub async fn run_on<F, Fut>(mut adapter: Box<dyn Adapter>, input: RunInput, abort: watch::Receiver<AbortReason>, mut emit: impl FnMut(AgentEvent), exec: F)
-where
+pub async fn run_on<F, Fut>(
+    mut adapter: Box<dyn Adapter>,
+    input: RunInput,
+    abort: watch::Receiver<AbortReason>,
+    mut emit: impl FnMut(AgentEvent),
+    exec: F,
+) where
     F: FnOnce(JobRequest, mpsc::Sender<JobEvent>) -> Fut,
     Fut: Future<Output = ()>,
 {
@@ -415,21 +466,34 @@ where
         while let Some(ev) = rx.recv().await {
             match ev {
                 JobEvent::Line { line } => {
-                    let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+                    let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
                     adapter.on_event(&v, &mut out);
                     for e in out.drain(..) {
                         saw_error |= matches!(e, AgentEvent::Error(_));
                         emit(e);
                     }
                 }
-                JobEvent::Cleanup { why } => emit(AgentEvent::Error(adapter.cleanup_failed(&input, &why))),
+                JobEvent::Cleanup { why } => {
+                    emit(AgentEvent::Error(adapter.cleanup_failed(&input, &why)))
+                }
                 JobEvent::Error { message } => {
                     saw_error = true;
                     emit(AgentEvent::Error(message));
                 }
-                JobEvent::Exit { success, status, stderr, .. } => {
+                JobEvent::Exit {
+                    success,
+                    status,
+                    stderr,
+                    ..
+                } => {
                     if !success && !saw_error && abort.borrow().is_none() {
-                        emit(AgentEvent::Error(if stderr.is_empty() { format!("{bin} exited with {status}") } else { stderr }));
+                        emit(AgentEvent::Error(if stderr.is_empty() {
+                            format!("{bin} exited with {status}")
+                        } else {
+                            stderr
+                        }));
                     }
                 }
                 JobEvent::Started | JobEvent::Ping => {}
@@ -444,25 +508,45 @@ where
 pub async fn stop_leftovers(adapter: &dyn Adapter, input: &RunInput) -> Result<(), String> {
     match adapter.cleanup(input) {
         None => Ok(()),
-        Some(c) => job::cleanup(&local_host(), &c).await.map_err(|why| adapter.cleanup_failed(input, &why)),
+        Some(c) => job::cleanup(&local_host(), &c)
+            .await
+            .map_err(|why| adapter.cleanup_failed(input, &why)),
     }
 }
 
 /// One short line describing a tool call, for the "working" status.
 pub fn describe(input: &Value) -> String {
-    let v = ["command", "cmd", "file_path", "path", "url", "query", "pattern", "description"]
-        .iter()
-        .find_map(|k| input.get(*k));
+    let v = [
+        "command",
+        "cmd",
+        "file_path",
+        "path",
+        "url",
+        "query",
+        "pattern",
+        "description",
+    ]
+    .iter()
+    .find_map(|k| input.get(*k));
     let s = match v {
         Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(a)) => a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" "),
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
         _ => String::new(),
     };
     short(&s)
 }
 
 pub fn short(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(120).collect()
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(120)
+        .collect()
 }
 
 pub fn str_of<'a>(v: &'a Value, key: &str) -> &'a str {
@@ -474,7 +558,14 @@ pub fn new_uuid() -> String {
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
     let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
-    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
 }
 
 #[cfg(test)]
@@ -493,14 +584,24 @@ mod tests {
             env: HashMap::from([("PATH".into(), "/opt/superbot/bin:/usr/bin:/bin".into())]),
             state_dir: dir.join("state"),
             config_dir: dir.join("state"),
-            guard: Some(Guard { command: "'/opt/bin/botctl' hook x".into(), timeout_secs: 300, wait: std::time::Duration::from_secs(240) }),
+            guard: Some(Guard {
+                command: "'/opt/bin/botctl' hook x".into(),
+                timeout_secs: 300,
+                wait: std::time::Duration::from_secs(240),
+            }),
             run_as,
             sandbox: None,
         }
     }
 
     fn run_as(sudo: &str) -> crate::accounts::RunAs {
-        crate::accounts::RunAs { sudo: sudo.into(), runner: "/opt/superbot/bin/superbot-run".into(), account: "sb-u-u1".into(), settings: "/srv/superbot/users/u1/settings".into(), teammate: None }
+        crate::accounts::RunAs {
+            sudo: sudo.into(),
+            runner: "/opt/superbot/bin/superbot-run".into(),
+            account: "sb-u-u1".into(),
+            settings: "/srv/superbot/users/u1/settings".into(),
+            teammate: None,
+        }
     }
 
     #[test]
@@ -513,25 +614,49 @@ mod tests {
         for name in crate::accounts::HARNESSES {
             let job = job_for(get(name).unwrap().as_mut(), &i, &mut Vec::new());
             for f in &job.files {
-                assert!(std::path::Path::new(&f.path).starts_with(&i.config_dir), "{name}: {}", f.path);
+                assert!(
+                    std::path::Path::new(&f.path).starts_with(&i.config_dir),
+                    "{name}: {}",
+                    f.path
+                );
                 wrote.push(name);
             }
             if let Some(c) = &job.cleanup {
-                assert!(std::path::Path::new(&c.when_exists).starts_with(&i.state_dir), "{name}: the run's own state");
+                assert!(
+                    std::path::Path::new(&c.when_exists).starts_with(&i.state_dir),
+                    "{name}: the run's own state"
+                );
             }
         }
-        assert_eq!(wrote, ["pi", "hermes"], "Pi's approval gate and Hermes's managed config");
+        assert_eq!(
+            wrote,
+            ["pi", "hermes"],
+            "Pi's approval gate and Hermes's managed config"
+        );
         for name in crate::accounts::LOGINS {
-            assert!(get(name).unwrap().login_args().is_some(), "an admin logs {name} in as each user");
+            assert!(
+                get(name).unwrap().login_args().is_some(),
+                "an admin logs {name} in as each user"
+            );
         }
     }
 
     #[test]
     fn jobs_for_a_machine_never_go_through_this_servers_accounts() {
         let dir = std::env::temp_dir();
-        let job = job_for(get("claude").unwrap().as_mut(), &input(&dir, Some(run_as("/usr/bin/sudo"))), &mut Vec::new());
+        let job = job_for(
+            get("claude").unwrap().as_mut(),
+            &input(&dir, Some(run_as("/usr/bin/sudo"))),
+            &mut Vec::new(),
+        );
         assert_eq!(job.bin, "claude");
-        assert!(!job.args.iter().any(|a| a.contains("sudo") || a.contains("sb-u-")), "{:?}", job.args);
+        assert!(
+            !job.args
+                .iter()
+                .any(|a| a.contains("sudo") || a.contains("sb-u-")),
+            "{:?}",
+            job.args
+        );
         assert!(!job.env.contains_key("SUPERBOT_PATH"));
     }
 
@@ -541,7 +666,10 @@ mod tests {
         let dir = crate::db::temp_path("run-as");
         let sudo = dir.join("sudo");
         let seen = dir.join("seen");
-        let script = format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho \"PATH=$SUPERBOT_PATH\" >> '{0}'\n", seen.display());
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\necho \"PATH=$SUPERBOT_PATH\" >> '{0}'\n",
+            seen.display()
+        );
         std::fs::write(&sudo, script).unwrap();
         std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
         let (_tx, abort) = watch::channel(None);
@@ -556,8 +684,23 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         let seen = std::fs::read_to_string(&seen).unwrap();
         let lines: Vec<&str> = seen.lines().collect();
-        assert_eq!(lines[..7], ["-n", "-E", "-u", "sb-u-u1", "--", "/opt/superbot/bin/superbot-run", "claude"], "{seen}");
-        assert!(lines.contains(&"--settings"), "the approval gate goes through: {seen}");
+        assert_eq!(
+            lines[..7],
+            [
+                "-n",
+                "-E",
+                "-u",
+                "sb-u-u1",
+                "--",
+                "/opt/superbot/bin/superbot-run",
+                "claude"
+            ],
+            "{seen}"
+        );
+        assert!(
+            lines.contains(&"--settings"),
+            "the approval gate goes through: {seen}"
+        );
         assert_eq!(lines.last(), Some(&"PATH=/opt/superbot/bin:/usr/bin:/bin"));
     }
 
@@ -573,47 +716,93 @@ mod tests {
     fn server_secrets_are_stripped_from_harnesses() {
         let mut cmd = std::process::Command::new("true");
         super::strip_secret_env(&mut cmd);
-        let removed: Vec<_> = cmd.get_envs().filter(|(_, v)| v.is_none()).map(|(k, _)| k.to_string_lossy().into_owned()).collect();
-        for k in ["AUTH_PASSWORD", "SUPERBOT_MASTER_KEY_FILE", "LINODE_TOKEN", "LINODE_TOKEN_FILE", "INCUS_CLIENT_KEY", "INCUS_CLIENT_KEY_FILE", "TURNSTILE_SECRET", "TURNSTILE_SECRET_FILE", "LICENSE_KEY", "LICENSE_KEY_FILE", "STRIPE_WEBHOOK_SECRET", "STRIPE_WEBHOOK_SECRET_FILE", "STRIPE_SECRET_KEY", "STRIPE_SECRET_KEY_FILE", "SMTP_PASSWORD", "SMTP_PASSWORD_FILE", "NOTIFY_WEBHOOK_URL", "NOTIFY_WEBHOOK_SECRET_FILE"] {
+        let removed: Vec<_> = cmd
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        for k in [
+            "AUTH_PASSWORD",
+            "SUPERBOT_MASTER_KEY_FILE",
+            "LINODE_TOKEN",
+            "LINODE_TOKEN_FILE",
+            "INCUS_CLIENT_KEY",
+            "INCUS_CLIENT_KEY_FILE",
+            "TURNSTILE_SECRET",
+            "TURNSTILE_SECRET_FILE",
+            "LICENSE_KEY",
+            "LICENSE_KEY_FILE",
+            "STRIPE_WEBHOOK_SECRET",
+            "STRIPE_WEBHOOK_SECRET_FILE",
+            "STRIPE_SECRET_KEY",
+            "STRIPE_SECRET_KEY_FILE",
+            "SMTP_PASSWORD",
+            "SMTP_PASSWORD_FILE",
+            "NOTIFY_WEBHOOK_URL",
+            "NOTIFY_WEBHOOK_SECRET_FILE",
+        ] {
             assert!(removed.iter().any(|r| r == k), "{k}");
         }
     }
 
     fn sandboxed(dir: &std::path::Path) -> RunInput {
         let mut i = input(dir, None);
-        i.env.insert("BOT_API".into(), "http://127.0.0.1:3000".into());
-        i.sandbox = Some(Sandbox { writable: vec!["/data/bots/b1".into(), "/home/superbot/.npm".into()] });
+        i.env
+            .insert("BOT_API".into(), "http://127.0.0.1:3000".into());
+        i.sandbox = Some(Sandbox {
+            writable: vec!["/data/bots/b1".into(), "/home/superbot/.npm".into()],
+        });
         i
     }
 
     #[test]
     fn codex_runs_in_workspace_write_only_when_sandboxed() {
         let dir = std::env::temp_dir();
-        let open = get("codex").unwrap().args(&input(&dir, None), &mut Vec::new());
-        assert!(open.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+        let open = get("codex")
+            .unwrap()
+            .args(&input(&dir, None), &mut Vec::new());
+        assert!(
+            open.iter()
+                .any(|a| a == "--dangerously-bypass-approvals-and-sandbox")
+        );
         assert!(!open.iter().any(|a| a.starts_with("sandbox_mode")));
         let mut i = sandboxed(&dir);
         for resumed in [false, true] {
             i.session_id = resumed.then(|| "t1".into());
             let a = get("codex").unwrap().args(&i, &mut Vec::new());
-            assert!(!a.iter().any(|a| a.starts_with("--dangerously-bypass-approvals")), "{a:?}");
+            assert!(
+                !a.iter()
+                    .any(|a| a.starts_with("--dangerously-bypass-approvals")),
+                "{a:?}"
+            );
             for c in [
                 "sandbox_mode=\"workspace-write\"",
                 "approval_policy=\"never\"",
                 "sandbox_workspace_write.network_access=true",
                 r#"sandbox_workspace_write.writable_roots=["/data/bots/b1","/home/superbot/.npm"]"#,
             ] {
-                let at = a.iter().position(|x| x == c).unwrap_or_else(|| panic!("{c} in {a:?}"));
+                let at = a
+                    .iter()
+                    .position(|x| x == c)
+                    .unwrap_or_else(|| panic!("{c} in {a:?}"));
                 assert_eq!(a[at - 1], "-c");
             }
             // The approval hook stays: the sandbox is on top of approvals, not instead.
             assert!(a.iter().any(|x| x.starts_with("hooks.PreToolUse")));
             let end = a.iter().position(|x| x == "--").unwrap();
-            assert!(a.iter().position(|x| x.starts_with("sandbox_mode")).unwrap() < end);
+            assert!(
+                a.iter()
+                    .position(|x| x.starts_with("sandbox_mode"))
+                    .unwrap()
+                    < end
+            );
         }
         i.sandbox = Some(Sandbox::default());
         let a = get("codex").unwrap().args(&i, &mut Vec::new());
-        assert!(!a.iter().any(|x| x.contains("writable_roots")), "no empty list");
+        assert!(
+            !a.iter().any(|x| x.contains("writable_roots")),
+            "no empty list"
+        );
     }
 
     #[test]
@@ -621,9 +810,16 @@ mod tests {
         let dir = std::env::temp_dir();
         let settings = |i: &RunInput| {
             let a = get("claude").unwrap().args(i, &mut Vec::new());
-            a.iter().position(|x| x == "--settings").map(|at| serde_json::from_str::<Value>(&a[at + 1]).unwrap())
+            a.iter()
+                .position(|x| x == "--settings")
+                .map(|at| serde_json::from_str::<Value>(&a[at + 1]).unwrap())
         };
-        assert!(settings(&input(&dir, None)).unwrap().get("sandbox").is_none());
+        assert!(
+            settings(&input(&dir, None))
+                .unwrap()
+                .get("sandbox")
+                .is_none()
+        );
         let mut i = sandboxed(&dir);
         let s = settings(&i).unwrap();
         assert_eq!(s["disableAllHooks"], false);
@@ -647,27 +843,49 @@ mod tests {
 
     #[test]
     fn only_harnesses_with_a_sandbox_say_so() {
-        for (name, has) in [("claude", true), ("codex", true), ("pi", false), ("hermes", false)] {
+        for (name, has) in [
+            ("claude", true),
+            ("codex", true),
+            ("pi", false),
+            ("hermes", false),
+        ] {
             assert_eq!(get(name).unwrap().has_sandbox(), has, "{name}");
         }
     }
 
     #[test]
     fn the_canary_arms_on_shell_calls_and_on_hooked_calls_that_ran() {
-        let start = |n: &str| AgentEvent::Tool { name: n.into(), detail: String::new() };
+        let start = |n: &str| AgentEvent::Tool {
+            name: n.into(),
+            detail: String::new(),
+        };
         let ran = |n: &str| AgentEvent::ToolRan { name: n.into() };
-        for (harness, shell, other) in [("claude", "Bash", "Write"), ("codex", "shell", "file_change"), ("pi", "bash", "write"), ("hermes", "terminal", "write_file")] {
+        for (harness, shell, other) in [
+            ("claude", "Bash", "Write"),
+            ("codex", "shell", "file_change"),
+            ("pi", "bash", "write"),
+            ("hermes", "terminal", "write_file"),
+        ] {
             let a = get(harness).unwrap();
-            assert!(arms_canary(&*a, &start(shell)) && arms_canary(&*a, &ran(shell)), "{harness}");
+            assert!(
+                arms_canary(&*a, &start(shell)) && arms_canary(&*a, &ran(shell)),
+                "{harness}"
+            );
             // A call may be refused before the hook, so only one that ran counts.
             assert!(!arms_canary(&*a, &start(other)), "{harness}");
             assert!(arms_canary(&*a, &ran(other)), "{harness}");
-            assert!(!arms_canary(&*a, &AgentEvent::Text("hi".into())), "{harness}");
+            assert!(
+                !arms_canary(&*a, &AgentEvent::Text("hi".into())),
+                "{harness}"
+            );
         }
         let codex = get("codex").unwrap();
         assert!(arms_canary(&*codex, &ran("mcp_tool_call")));
         for hosted_or_untested in ["web_search", "todo_list", "collab_tool_call"] {
-            assert!(!arms_canary(&*codex, &ran(hosted_or_untested)), "{hosted_or_untested}");
+            assert!(
+                !arms_canary(&*codex, &ran(hosted_or_untested)),
+                "{hosted_or_untested}"
+            );
         }
     }
 

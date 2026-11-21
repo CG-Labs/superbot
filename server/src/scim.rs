@@ -9,15 +9,15 @@ use crate::audit::{Actor, ActorKind, Outcome, Source, Who};
 use crate::db::{self, NewIdentity, ScimConflict, ScimFields, ScimKey, ScimToken, ScimUser, User};
 use crate::rbac::Role;
 use crate::users::{self, Limiter};
-use crate::{bad, not_found, ApiError, AppState, Auth, Res};
+use crate::{ApiError, AppState, Auth, Res, bad, not_found};
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{Extension, Path, Query, Request, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -51,7 +51,12 @@ pub struct Scim {
 
 impl Default for Scim {
     fn default() -> Scim {
-        Scim { enabled: false, default_role: Role::Member, limiter: Limiter::new(RATE_LIMIT, RATE_WINDOW_MS), failures: Limiter::new(FAIL_LIMIT, FAIL_WINDOW_MS) }
+        Scim {
+            enabled: false,
+            default_role: Role::Member,
+            limiter: Limiter::new(RATE_LIMIT, RATE_WINDOW_MS),
+            failures: Limiter::new(FAIL_LIMIT, FAIL_WINDOW_MS),
+        }
     }
 }
 
@@ -71,7 +76,11 @@ impl Scim {
                 None => return Err(format!("SCIM_DEFAULT_ROLE must be member or readonly, not \"{role}\"")),
             },
         };
-        Ok(Scim { enabled, default_role, ..Scim::default() })
+        Ok(Scim {
+            enabled,
+            default_role,
+            ..Scim::default()
+        })
     }
 }
 
@@ -85,8 +94,16 @@ pub struct ScimError {
 }
 
 impl ScimError {
-    fn new(status: StatusCode, scim_type: Option<&'static str>, detail: impl Into<String>) -> ScimError {
-        ScimError { status, scim_type, detail: detail.into() }
+    fn new(
+        status: StatusCode,
+        scim_type: Option<&'static str>,
+        detail: impl Into<String>,
+    ) -> ScimError {
+        ScimError {
+            status,
+            scim_type,
+            detail: detail.into(),
+        }
     }
 }
 
@@ -127,15 +144,31 @@ fn scim_json(status: StatusCode, body: Value) -> Response {
 }
 
 fn too_many(retry: i64) -> Response {
-    let mut r = ScimError::new(StatusCode::TOO_MANY_REQUESTS, None, "Too many requests. Try again later.").into_response();
-    r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(retry.max(1)));
+    let mut r = ScimError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        None,
+        "Too many requests. Try again later.",
+    )
+    .into_response();
+    r.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(retry.max(1)));
     r
 }
 
 /// [`conflict`], but a refused seat is audited and explained (ADR 0038).
-fn save_error(app: &AppState, c: &Caller, e: ScimConflict, user: Option<&str>, email: Option<&str>) -> ScimError {
+fn save_error(
+    app: &AppState,
+    c: &Caller,
+    e: ScimConflict,
+    user: Option<&str>,
+    email: Option<&str>,
+) -> ScimError {
     match e {
-        ScimConflict::NoSeat => ScimError::new(StatusCode::FORBIDDEN, None, crate::license::refuse_seat(app, &c.who, "scim", user, email)),
+        ScimConflict::NoSeat => ScimError::new(
+            StatusCode::FORBIDDEN,
+            None,
+            crate::license::refuse_seat(app, &c.who, "scim", user, email),
+        ),
         e => conflict(e),
     }
 }
@@ -147,7 +180,9 @@ fn conflict(e: ScimConflict) -> ScimError {
         ),
         ScimConflict::UserName => uniqueness("Another user in this tenant has this userName."),
         ScimConflict::ExternalId => uniqueness("Another user in this tenant has this externalId."),
-        ScimConflict::Identity => uniqueness("This person's SSO identity is linked to another SuperBot user."),
+        ScimConflict::Identity => {
+            uniqueness("This person's SSO identity is linked to another SuperBot user.")
+        }
         ScimConflict::OtherTenant => uniqueness("This person is managed by another SCIM tenant."),
         ScimConflict::Gone => missing("User"),
         ScimConflict::NoSeat => ScimError::new(StatusCode::FORBIDDEN, None, "No seats left."),
@@ -179,7 +214,11 @@ fn actor(a: &Auth, t: &ScimToken) -> Actor {
         id: Some(format!("scim:{}", t.id)),
         name: Some(name),
         method: Some("scim_token".into()),
-        idp: t.sso_provider.as_deref().and_then(|p| crate::sso::idp_type(a, p)).map(String::from),
+        idp: t
+            .sso_provider
+            .as_deref()
+            .and_then(|p| crate::sso::idp_type(a, p))
+            .map(String::from),
         idp_provider: t.sso_provider.clone(),
         ..Default::default()
     }
@@ -187,10 +226,29 @@ fn actor(a: &Auth, t: &ScimToken) -> Actor {
 
 /// A missing, unknown, or revoked token, throttled per IP. Never what was sent; for a
 /// revoked one, which token it was, since a revoked token still in use may have leaked.
-fn auth_failed(a: &Auth, app: &AppState, source: &Source, reason: &str, revoked: Option<&ScimToken>) {
-    let Some(missed) = a.logins.failure(&format!("{}|scim", source.ip.as_deref().unwrap_or("")), db::now()) else { return };
-    let actor = Actor { kind: ActorKind::System, id: Some("scim".into()), method: Some("scim_token".into()), ..Default::default() };
-    let who = Who { actor, source: source.clone() };
+fn auth_failed(
+    a: &Auth,
+    app: &AppState,
+    source: &Source,
+    reason: &str,
+    revoked: Option<&ScimToken>,
+) {
+    let Some(missed) = a.logins.failure(
+        &format!("{}|scim", source.ip.as_deref().unwrap_or("")),
+        db::now(),
+    ) else {
+        return;
+    };
+    let actor = Actor {
+        kind: ActorKind::System,
+        id: Some("scim".into()),
+        method: Some("scim_token".into()),
+        ..Default::default()
+    };
+    let who = Who {
+        actor,
+        source: source.clone(),
+    };
     let mut details = json!({ "reason": reason, "unloggedSinceLast": missed });
     let mut e = who.event("scim.auth_failed").outcome(Outcome::Failure);
     if let Some(t) = revoked {
@@ -203,7 +261,8 @@ fn auth_failed(a: &Auth, app: &AppState, source: &Source, reason: &str, revoked:
 /// `sbp_` and 64 hex digits, as `users::new_secret` makes them. Anything else is not
 /// looked up.
 fn token_shaped(t: &str) -> bool {
-    t.strip_prefix(TOKEN_PREFIX).is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+    t.strip_prefix(TOKEN_PREFIX)
+        .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Checks the Host, that SCIM is on, the token, the tenant's rate, and the client IP's
@@ -215,9 +274,17 @@ fn token_shaped(t: &str) -> bool {
 /// a junk token could otherwise hold off deprovisioning. Tokens are 256 random bits, so
 /// the IP limit only spares the database and the audit log, as sessions are spared.
 pub async fn guard(State(a): State<Arc<Auth>>, mut req: Request, next: Next) -> Response {
-    let host = req.headers().get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     if !a.hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
-        return (StatusCode::FORBIDDEN, "Unknown Host. Add it to ALLOWED_HOSTS.").into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            "Unknown Host. Add it to ALLOWED_HOSTS.",
+        )
+            .into_response();
     }
     if !a.scim.enabled {
         return missing("SCIM is off on this server (SCIM=on turns it on);").into_response();
@@ -227,7 +294,13 @@ pub async fn guard(State(a): State<Arc<Auth>>, mut req: Request, next: Next) -> 
     };
     let source = crate::request_source(&req, a.trust_forwarded);
     let (ip, at) = (source.ip.clone().unwrap_or_default(), db::now());
-    let token = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|h| h.strip_prefix("Bearer ")).map(str::trim).unwrap_or("");
+    let token = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(str::trim)
+        .unwrap_or("");
     let hash = token_shaped(token).then(|| users::hash(token));
     let found = hash.as_deref().and_then(|h| app.db.live_scim_token(h, at));
     let Some(t) = found else {
@@ -242,14 +315,25 @@ pub async fn guard(State(a): State<Arc<Auth>>, mut req: Request, next: Next) -> 
             (None, false) => "unknown",
         };
         auth_failed(&a, &app, &source, reason, revoked.as_ref());
-        let mut r = ScimError::new(StatusCode::UNAUTHORIZED, None, "A valid SCIM bearer token is required.").into_response();
-        r.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer realm=\"SuperBot SCIM\""));
+        let mut r = ScimError::new(
+            StatusCode::UNAUTHORIZED,
+            None,
+            "A valid SCIM bearer token is required.",
+        )
+        .into_response();
+        r.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=\"SuperBot SCIM\""),
+        );
         return r;
     };
     if let Some(retry) = a.scim.limiter.hit(&t.tenant, at) {
         return too_many(retry);
     }
-    let who = Who { actor: actor(&a, &t), source };
+    let who = Who {
+        actor: actor(&a, &t),
+        source,
+    };
     req.extensions_mut().insert(Caller { token: t, who });
     next.run(req).await
 }
@@ -259,17 +343,27 @@ pub async fn guard(State(a): State<Arc<Auth>>, mut req: Request, next: Next) -> 
 /// `https://<host>/scim/v2`, from the Host header (checked against ALLOWED_HOSTS).
 /// Plain http only for loopback, where there is no proxy in front.
 fn base_url(headers: &HeaderMap) -> String {
-    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let name = match host.strip_prefix('[') {
         Some(rest) => rest.split(']').next().unwrap_or_default(),
         None => host.rsplit_once(':').map_or(host, |(h, _)| h),
     };
-    let scheme = if crate::is_loopback_host(name) { "http" } else { "https" };
+    let scheme = if crate::is_loopback_host(name) {
+        "http"
+    } else {
+        "https"
+    };
     format!("{scheme}://{host}/scim/v2")
 }
 
 fn list(resources: Vec<Value>, total: i64, start: i64) -> Response {
-    scim_json(StatusCode::OK, json!({ "schemas": [LIST_SCHEMA], "totalResults": total, "startIndex": start, "itemsPerPage": resources.len(), "Resources": resources }))
+    scim_json(
+        StatusCode::OK,
+        json!({ "schemas": [LIST_SCHEMA], "totalResults": total, "startIndex": start, "itemsPerPage": resources.len(), "Resources": resources }),
+    )
 }
 
 pub async fn service_provider_config(headers: HeaderMap) -> Response {
@@ -309,7 +403,10 @@ pub async fn resource_types(headers: HeaderMap) -> Response {
 
 pub async fn resource_type(headers: HeaderMap, Path(id): Path<String>) -> ScimRes {
     match id.as_str() {
-        "User" => Ok(scim_json(StatusCode::OK, user_resource_type(&base_url(&headers)))),
+        "User" => Ok(scim_json(
+            StatusCode::OK,
+            user_resource_type(&base_url(&headers)),
+        )),
         _ => Err(missing("Resource type")),
     }
 }
@@ -324,10 +421,30 @@ fn attribute(name: &str, kind: &str, required: bool, uniqueness: &str, descripti
 fn user_schema(base: &str) -> Value {
     let sub = |name: &str, d: &str| attribute(name, "string", false, "none", d);
     let mut name = attribute("name", "complex", false, "none", "The person's name");
-    name["subAttributes"] = json!([sub("formatted", "The full name"), sub("familyName", "Family name"), sub("givenName", "Given name")]);
-    let mut emails = attribute("emails", "complex", false, "none", "Email addresses. SuperBot keeps one: the primary, else the work one, else the first.");
+    name["subAttributes"] = json!([
+        sub("formatted", "The full name"),
+        sub("familyName", "Family name"),
+        sub("givenName", "Given name")
+    ]);
+    let mut emails = attribute(
+        "emails",
+        "complex",
+        false,
+        "none",
+        "Email addresses. SuperBot keeps one: the primary, else the work one, else the first.",
+    );
     emails["multiValued"] = json!(true);
-    emails["subAttributes"] = json!([sub("value", "The address"), sub("type", "work, home, or other"), attribute("primary", "boolean", false, "none", "The address SuperBot keeps")]);
+    emails["subAttributes"] = json!([
+        sub("value", "The address"),
+        sub("type", "work, home, or other"),
+        attribute(
+            "primary",
+            "boolean",
+            false,
+            "none",
+            "The address SuperBot keeps"
+        )
+    ]);
     json!({
         "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Schema"],
         "id": USER_SCHEMA, "name": "User", "description": "A SuperBot user",
@@ -377,9 +494,17 @@ pub async fn unknown() -> Response {
 
 pub fn parse_filter(s: &str) -> Result<ScimKey, String> {
     let s = s.trim();
-    let unsupported = || format!("Unsupported filter: only userName eq \"...\" and externalId eq \"...\" are supported, not {}", s.chars().take(100).collect::<String>());
+    let unsupported = || {
+        format!(
+            "Unsupported filter: only userName eq \"...\" and externalId eq \"...\" are supported, not {}",
+            s.chars().take(100).collect::<String>()
+        )
+    };
     let (attr, rest) = s.split_once(char::is_whitespace).ok_or_else(unsupported)?;
-    let (op, value) = rest.trim_start().split_once(char::is_whitespace).ok_or_else(unsupported)?;
+    let (op, value) = rest
+        .trim_start()
+        .split_once(char::is_whitespace)
+        .ok_or_else(unsupported)?;
     if !op.eq_ignore_ascii_case("eq") {
         return Err(unsupported());
     }
@@ -392,7 +517,10 @@ pub fn parse_filter(s: &str) -> Result<ScimKey, String> {
     if v.is_empty() || v.chars().count() > 512 {
         return Err("The filter's value must be 1 to 512 characters".into());
     }
-    let attr = attr.get(..USER_SCHEMA.len() + 1).filter(|p| p.eq_ignore_ascii_case(&format!("{USER_SCHEMA}:"))).map_or(attr, |p| &attr[p.len()..]);
+    let attr = attr
+        .get(..USER_SCHEMA.len() + 1)
+        .filter(|p| p.eq_ignore_ascii_case(&format!("{USER_SCHEMA}:")))
+        .map_or(attr, |p| &attr[p.len()..]);
     match attr.to_ascii_lowercase().as_str() {
         "username" => Ok(ScimKey::UserName(v)),
         "externalid" => Ok(ScimKey::ExternalId(v)),
@@ -402,26 +530,40 @@ pub fn parse_filter(s: &str) -> Result<ScimKey, String> {
 
 /// `startIndex` (1-based, default 1) and `count` (default 100, at most 200). Names in any case.
 fn page(q: &HashMap<String, String>) -> ScimRes<(i64, i64)> {
-    let get = |k: &str| q.iter().find(|(name, _)| name.eq_ignore_ascii_case(k)).map(|(_, v)| v.trim());
+    let get = |k: &str| {
+        q.iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(k))
+            .map(|(_, v)| v.trim())
+    };
     let num = |k: &str, default: i64| match get(k) {
         None | Some("") => Ok(default),
-        Some(v) => v.parse::<i64>().map_err(|_| invalid(format!("{k} must be a number"))),
+        Some(v) => v
+            .parse::<i64>()
+            .map_err(|_| invalid(format!("{k} must be a number"))),
     };
-    Ok((num("startIndex", 1)?.max(1), num("count", DEFAULT_COUNT)?.clamp(0, MAX_COUNT)))
+    Ok((
+        num("startIndex", 1)?.max(1),
+        num("count", DEFAULT_COUNT)?.clamp(0, MAX_COUNT),
+    ))
 }
 
 // Users.
 
 /// A Unix ms time as RFC 3339, for `meta`.
 fn rfc3339(ms: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(ms).map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)).unwrap_or_default()
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_default()
 }
 
 /// A user as SCIM shows it. Attributes without a value are left out, not null.
 pub fn resource(base: &str, s: &ScimUser) -> Value {
     let u = &s.user;
     let mut name = Map::new();
-    name.insert("formatted".into(), json!(s.formatted.as_deref().unwrap_or(&u.name)));
+    name.insert(
+        "formatted".into(),
+        json!(s.formatted.as_deref().unwrap_or(&u.name)),
+    );
     if let Some(g) = &s.given_name {
         name.insert("givenName".into(), json!(g));
     }
@@ -476,17 +618,33 @@ impl Attrs {
 
     /// What the shown name is built from.
     fn names(&self) -> [Option<&str>; 5] {
-        [Some(self.user_name.as_str()), self.display_name.as_deref(), self.formatted.as_deref(), self.given_name.as_deref(), self.family_name.as_deref()]
+        [
+            Some(self.user_name.as_str()),
+            self.display_name.as_deref(),
+            self.formatted.as_deref(),
+            self.given_name.as_deref(),
+            self.family_name.as_deref(),
+        ]
     }
 
     /// The name SuperBot shows: what the IdP called them, or their userName up to the `@`.
     fn shown_name(&self) -> String {
-        let parts = [self.given_name.as_deref(), self.family_name.as_deref()].into_iter().flatten().collect::<Vec<_>>().join(" ");
+        let parts = [self.given_name.as_deref(), self.family_name.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ");
         self.display_name
             .clone()
             .or_else(|| self.formatted.clone())
             .or_else(|| Some(parts).filter(|p| !p.is_empty()))
-            .unwrap_or_else(|| self.user_name.split('@').next().unwrap_or(&self.user_name).to_string())
+            .unwrap_or_else(|| {
+                self.user_name
+                    .split('@')
+                    .next()
+                    .unwrap_or(&self.user_name)
+                    .to_string()
+            })
             .chars()
             .take(100)
             .collect()
@@ -497,7 +655,10 @@ static NULL: Value = Value::Null;
 
 /// An attribute of an object, by name in any case: SCIM attribute names are case-insensitive.
 fn key<'a>(v: &'a Value, name: &str) -> Option<&'a Value> {
-    v.as_object()?.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v)
+    v.as_object()?
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v)
 }
 
 /// `key`, with missing as null.
@@ -511,8 +672,12 @@ fn text(v: &Value, field: &str, max: usize) -> ScimRes<Option<String>> {
     match v {
         Value::Null => Ok(None),
         Value::String(s) if s.trim().is_empty() => Ok(None),
-        Value::String(s) if s.chars().any(char::is_control) => Err(invalid(format!("{field} has control characters"))),
-        Value::String(s) if s.trim().chars().count() > max => Err(invalid(format!("{field} must be at most {max} characters"))),
+        Value::String(s) if s.chars().any(char::is_control) => {
+            Err(invalid(format!("{field} has control characters")))
+        }
+        Value::String(s) if s.trim().chars().count() > max => {
+            Err(invalid(format!("{field} must be at most {max} characters")))
+        }
         Value::String(s) => Ok(Some(s.trim().to_string())),
         _ => Err(invalid(format!("{field} must be a string"))),
     }
@@ -531,7 +696,9 @@ fn boolean(v: &Value, field: &str) -> ScimRes<bool> {
 fn email(v: &Value, field: &str) -> ScimRes<Option<String>> {
     let e = text(v, field, 254)?;
     match e {
-        Some(e) if !users::valid_email(&e) => Err(invalid(format!("{field} must be an email address"))),
+        Some(e) if !users::valid_email(&e) => {
+            Err(invalid(format!("{field} must be an email address")))
+        }
         e => Ok(e),
     }
 }
@@ -545,8 +712,19 @@ fn pick_email(v: &Value) -> ScimRes<Option<String>> {
     };
     let chosen = list
         .iter()
-        .find(|e| matches!(attr(e, "primary"), Value::Bool(true)) || attr(e, "primary").as_str().is_some_and(|p| p.eq_ignore_ascii_case("true")))
-        .or_else(|| list.iter().find(|e| attr(e, "type").as_str().is_some_and(|t| t.eq_ignore_ascii_case("work"))))
+        .find(|e| {
+            matches!(attr(e, "primary"), Value::Bool(true))
+                || attr(e, "primary")
+                    .as_str()
+                    .is_some_and(|p| p.eq_ignore_ascii_case("true"))
+        })
+        .or_else(|| {
+            list.iter().find(|e| {
+                attr(e, "type")
+                    .as_str()
+                    .is_some_and(|t| t.eq_ignore_ascii_case("work"))
+            })
+        })
         .or_else(|| list.first());
     chosen.map_or(Ok(None), |e| email(attr(e, "value"), "emails.value"))
 }
@@ -570,13 +748,19 @@ fn required_user_name(v: &Value) -> ScimRes<String> {
 /// email is the userName when that is an address (Okta's default profile).
 pub fn from_resource(v: &Value, current: Option<&Attrs>) -> ScimRes<Attrs> {
     if !v.is_object() {
-        return Err(ScimError::new(StatusCode::BAD_REQUEST, Some("invalidSyntax"), "Send the user as a JSON object"));
+        return Err(ScimError::new(
+            StatusCode::BAD_REQUEST,
+            Some("invalidSyntax"),
+            "Send the user as a JSON object",
+        ));
     }
     let user_name = required_user_name(attr(v, "userName"))?;
     let mut a = Attrs {
-        external_id: text(attr(v, "externalId"), "externalId", 256)?.or_else(|| current.and_then(|c| c.external_id.clone())),
+        external_id: text(attr(v, "externalId"), "externalId", 256)?
+            .or_else(|| current.and_then(|c| c.external_id.clone())),
         display_name: text(attr(v, "displayName"), "displayName", 100)?,
-        email: pick_email(attr(v, "emails"))?.or_else(|| Some(user_name.clone()).filter(|n| users::valid_email(n))),
+        email: pick_email(attr(v, "emails"))?
+            .or_else(|| Some(user_name.clone()).filter(|n| users::valid_email(n))),
         user_name,
         active: match key(v, "active") {
             None | Some(Value::Null) => current.is_none_or(|c| c.active),
@@ -596,8 +780,14 @@ pub fn from_resource(v: &Value, current: Option<&Attrs>) -> ScimRes<Attrs> {
 /// enterprise extension, roles, groups, a password) are ignored and never stored.
 pub fn apply_patch(a: &mut Attrs, v: &Value) -> ScimRes<()> {
     let syntax = |d: &str| ScimError::new(StatusCode::BAD_REQUEST, Some("invalidSyntax"), d);
-    let ops = v.as_object().and_then(|o| o.iter().find(|(k, _)| k.eq_ignore_ascii_case("Operations"))).map(|(_, ops)| ops);
-    let ops = ops.and_then(Value::as_array).filter(|o| !o.is_empty()).ok_or_else(|| syntax("Operations must be a list of operations"))?;
+    let ops = v
+        .as_object()
+        .and_then(|o| o.iter().find(|(k, _)| k.eq_ignore_ascii_case("Operations")))
+        .map(|(_, ops)| ops);
+    let ops = ops
+        .and_then(Value::as_array)
+        .filter(|o| !o.is_empty())
+        .ok_or_else(|| syntax("Operations must be a list of operations"))?;
     for op in ops {
         let kind = attr(op, "op").as_str().map(str::to_ascii_lowercase);
         let kind = match kind.as_deref() {
@@ -605,11 +795,23 @@ pub fn apply_patch(a: &mut Attrs, v: &Value) -> ScimRes<()> {
             _ => return Err(syntax("op must be add, replace, or remove")),
         };
         let value = attr(op, "value");
-        match attr(op, "path").as_str().map(str::trim).filter(|p| !p.is_empty()) {
+        match attr(op, "path")
+            .as_str()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
             Some(path) => apply_path(a, &kind, path, value)?,
-            None if kind == "remove" => return Err(ScimError::new(StatusCode::BAD_REQUEST, Some("noTarget"), "remove needs a path")),
+            None if kind == "remove" => {
+                return Err(ScimError::new(
+                    StatusCode::BAD_REQUEST,
+                    Some("noTarget"),
+                    "remove needs a path",
+                ));
+            }
             None => {
-                let obj = value.as_object().ok_or_else(|| syntax("Without a path, value must be an object of attributes"))?;
+                let obj = value.as_object().ok_or_else(|| {
+                    syntax("Without a path, value must be an object of attributes")
+                })?;
                 let mut seen = std::collections::HashSet::new();
                 for (k, val) in obj {
                     if !seen.insert(normal_path(k)) {
@@ -625,8 +827,14 @@ pub fn apply_patch(a: &mut Attrs, v: &Value) -> ScimRes<()> {
 
 /// A PATCH path without the core schema prefix, spaces collapsed, lowercase.
 fn normal_path(path: &str) -> String {
-    let path = path.get(..USER_SCHEMA.len() + 1).filter(|p| p.eq_ignore_ascii_case(&format!("{USER_SCHEMA}:"))).map_or(path, |p| &path[p.len()..]);
-    path.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
+    let path = path
+        .get(..USER_SCHEMA.len() + 1)
+        .filter(|p| p.eq_ignore_ascii_case(&format!("{USER_SCHEMA}:")))
+        .map_or(path, |p| &path[p.len()..]);
+    path.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 fn apply_path(a: &mut Attrs, op: &str, path: &str, v: &Value) -> ScimRes<()> {
@@ -648,17 +856,45 @@ fn apply_path(a: &mut Attrs, op: &str, path: &str, v: &Value) -> ScimRes<()> {
             if !v.is_object() {
                 return Err(invalid("name must be an object"));
             }
-            for (k, keep) in [("givenName", &mut a.given_name), ("familyName", &mut a.family_name), ("formatted", &mut a.formatted)] {
+            for (k, keep) in [
+                ("givenName", &mut a.given_name),
+                ("familyName", &mut a.family_name),
+                ("formatted", &mut a.formatted),
+            ] {
                 if let Some(x) = key(v, k) {
                     *keep = text(x, &format!("name.{k}"), 100)?;
                 }
             }
         }
-        "name.givenname" => a.given_name = if remove { None } else { text(v, "name.givenName", 100)? },
-        "name.familyname" => a.family_name = if remove { None } else { text(v, "name.familyName", 100)? },
-        "name.formatted" => a.formatted = if remove { None } else { text(v, "name.formatted", 100)? },
+        "name.givenname" => {
+            a.given_name = if remove {
+                None
+            } else {
+                text(v, "name.givenName", 100)?
+            }
+        }
+        "name.familyname" => {
+            a.family_name = if remove {
+                None
+            } else {
+                text(v, "name.familyName", 100)?
+            }
+        }
+        "name.formatted" => {
+            a.formatted = if remove {
+                None
+            } else {
+                text(v, "name.formatted", 100)?
+            }
+        }
         "emails" => a.email = if remove { None } else { pick_email(v)? },
-        "emails[type eq \"work\"].value" | "emails[primary eq true].value" | "emails.value" => a.email = if remove { None } else { email(v, "emails.value")? },
+        "emails[type eq \"work\"].value" | "emails[primary eq true].value" | "emails.value" => {
+            a.email = if remove {
+                None
+            } else {
+                email(v, "emails.value")?
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -674,13 +910,30 @@ struct Link {
 }
 
 fn sso_link(a: &Auth, t: &ScimToken, external_id: Option<&str>) -> ScimRes<Option<Link>> {
-    let Some(pid) = &t.sso_provider else { return Ok(None) };
-    let p = a.sso.provider(pid).ok_or_else(|| server_error(format!("This SCIM tenant links the SSO provider {pid}, which isn't in SSO_PROVIDERS any more.")))?;
-    let hint = if p.type_name() == "entra" { " Map the user's objectId to externalId in the provisioning attribute mappings." } else { "" };
+    let Some(pid) = &t.sso_provider else {
+        return Ok(None);
+    };
+    let p = a.sso.provider(pid).ok_or_else(|| {
+        server_error(format!(
+            "This SCIM tenant links the SSO provider {pid}, which isn't in SSO_PROVIDERS any more."
+        ))
+    })?;
+    let hint = if p.type_name() == "entra" {
+        " Map the user's objectId to externalId in the provisioning attribute mappings."
+    } else {
+        ""
+    };
     let ext = external_id.ok_or_else(|| invalid(format!("externalId is required: this tenant links the SSO provider {pid}, so externalId must be the person's subject there.{hint}")))?;
-    let subject = p.subject(ext).map_err(|e| invalid(format!("externalId: {e}.{hint}")))?;
+    let subject = p
+        .subject(ext)
+        .map_err(|e| invalid(format!("externalId: {e}.{hint}")))?;
     let (issuer, tenant) = p.issuer_for(None).map_err(server_error)?;
-    Ok(Some(Link { provider: pid.clone(), issuer, subject, tenant }))
+    Ok(Some(Link {
+        provider: pid.clone(),
+        issuer,
+        subject,
+        tenant,
+    }))
 }
 
 fn fields<'a>(d: &'a Attrs, shown: &'a str, active: Option<bool>) -> ScimFields<'a> {
@@ -700,7 +953,15 @@ fn fields<'a>(d: &'a Attrs, shown: &'a str, active: Option<bool>) -> ScimFields<
 /// Audits what changed on a user and acts on it: deactivating drops their unredeemed SSO
 /// app codes, ends every session, and closes open screens (their links don't know who
 /// opened them). `active` is what this request set, if it changed it.
-async fn changed(app: &AppState, a: &Auth, c: &Caller, before_user: &User, before: Option<&ScimUser>, after: &ScimUser, active: Option<bool>) {
+async fn changed(
+    app: &AppState,
+    a: &Auth,
+    c: &Caller,
+    before_user: &User,
+    before: Option<&ScimUser>,
+    after: &ScimUser,
+    active: Option<bool>,
+) {
     let by = &c.who;
     let ev = |action: &str| by.event(action).target("user", &after.user.id);
     let mut changes = Map::new();
@@ -716,27 +977,47 @@ async fn changed(app: &AppState, a: &Auth, c: &Caller, before_user: &User, befor
         diff("externalId", json!(b.external_id), json!(after.external_id));
         diff("givenName", json!(b.given_name), json!(after.given_name));
         diff("familyName", json!(b.family_name), json!(after.family_name));
-        diff("displayName", json!(b.display_name), json!(after.display_name));
+        diff(
+            "displayName",
+            json!(b.display_name),
+            json!(after.display_name),
+        );
         diff("formatted", json!(b.formatted), json!(after.formatted));
     }
     if !changes.is_empty() {
-        app.db.record(&ev("user.updated").details(json!({ "changes": changes, "tenant": c.token.tenant })));
+        app.db.record(
+            &ev("user.updated").details(json!({ "changes": changes, "tenant": c.token.tenant })),
+        );
     }
     match active {
         Some(true) => {
             let resumed = crate::handover::user_enabled(app, by, &after.user.id);
-            app.db.record(&ev("user.enabled").details(json!({ "tenant": c.token.tenant, "routinesResumed": resumed })))
+            app.db.record(
+                &ev("user.enabled")
+                    .details(json!({ "tenant": c.token.tenant, "routinesResumed": resumed })),
+            )
         }
         Some(false) => {
             a.sso.forget_user(&after.user.id);
-            let n = app.db.revoke_user_sessions(&after.user.id, by.actor.id.as_deref().unwrap_or("scim"), "deprovisioned by SCIM");
+            let n = app.db.revoke_user_sessions(
+                &after.user.id,
+                by.actor.id.as_deref().unwrap_or("scim"),
+                "deprovisioned by SCIM",
+            );
             let paused = crate::handover::user_disabled(app, by, &after.user.id);
-            app.db.record(&ev("user.disabled").details(json!({ "sessionsRevoked": n, "routinesPaused": paused, "tenant": c.token.tenant })));
+            app.db.record(&ev("user.disabled").details(
+                json!({ "sessionsRevoked": n, "routinesPaused": paused, "tenant": c.token.tenant }),
+            ));
             if let Some(screens) = &app.screens {
                 screens.rotate_all().await;
             }
             crate::machines::screens::rotate_all(app).await;
-            crate::machines::offboard::left(app, by, &after.user.id, crate::machines::offboard::DEPROVISIONED);
+            crate::machines::offboard::left(
+                app,
+                by,
+                &after.user.id,
+                crate::machines::offboard::DEPROVISIONED,
+            );
         }
         None => {}
     }
@@ -747,11 +1028,23 @@ async fn changed(app: &AppState, a: &Auth, c: &Caller, before_user: &User, befor
 /// it, the user must still be the tenant's and live when the write runs. `externalId`
 /// can be set once, never changed. The shown name is rebuilt only when a name attribute
 /// changed, so an admin's rename lasts until the IdP sends a new name.
-async fn update(app: &AppState, a: &Auth, c: &Caller, user: &User, before: Option<&ScimUser>, d: &Attrs, taken: Option<(&str, Value)>) -> ScimRes<ScimUser> {
+async fn update(
+    app: &AppState,
+    a: &Auth,
+    c: &Caller,
+    user: &User,
+    before: Option<&ScimUser>,
+    d: &Attrs,
+    taken: Option<(&str, Value)>,
+) -> ScimRes<ScimUser> {
     if let Some(old) = before.and_then(|b| b.external_id.as_deref())
         && d.external_id.as_deref() != Some(old)
     {
-        return Err(ScimError::new(StatusCode::BAD_REQUEST, Some("mutability"), "externalId can't change once set. Delete the user and provision the person again."));
+        return Err(ScimError::new(
+            StatusCode::BAD_REQUEST,
+            Some("mutability"),
+            "externalId can't change once set. Delete the user and provision the person again.",
+        ));
     }
     let shown = match before {
         Some(b) if Attrs::of(b).names() == d.names() => user.name.clone(),
@@ -759,10 +1052,20 @@ async fn update(app: &AppState, a: &Auth, c: &Caller, user: &User, before: Optio
     };
     let active = (d.active != user.active()).then_some(d.active);
     let f = fields(d, &shown, active);
-    app.db.save_scim_user(&c.token.tenant, &user.id, &f, taken.is_some()).map_err(|e| save_error(app, c, e, Some(&user.id), f.email))?;
-    let after = app.db.scim_user(&c.token.tenant, &user.id).ok_or_else(|| server_error("user not saved"))?;
+    app.db
+        .save_scim_user(&c.token.tenant, &user.id, &f, taken.is_some())
+        .map_err(|e| save_error(app, c, e, Some(&user.id), f.email))?;
+    let after = app
+        .db
+        .scim_user(&c.token.tenant, &user.id)
+        .ok_or_else(|| server_error("user not saved"))?;
     if let Some((action, details)) = taken {
-        app.db.record(&c.who.event(action).target("user", &user.id).details(details));
+        app.db.record(
+            &c.who
+                .event(action)
+                .target("user", &user.id)
+                .details(details),
+        );
     }
     changed(app, a, c, user, before, &after, active).await;
     Ok(after)
@@ -771,7 +1074,13 @@ async fn update(app: &AppState, a: &Auth, c: &Caller, user: &User, before: Optio
 /// The JSON body. A body over MAX_BODY, or one that can't be read, is a SCIM error too.
 fn parse_body(body: Result<Bytes, BytesRejection>) -> ScimRes<Value> {
     let body = body.map_err(|e| ScimError::new(e.status(), None, e.body_text()))?;
-    let v = serde_json::from_slice(&body).map_err(|e| ScimError::new(StatusCode::BAD_REQUEST, Some("invalidSyntax"), format!("Invalid JSON: {e}")))?;
+    let v = serde_json::from_slice(&body).map_err(|e| {
+        ScimError::new(
+            StatusCode::BAD_REQUEST,
+            Some("invalidSyntax"),
+            format!("Invalid JSON: {e}"),
+        )
+    })?;
     no_twice(&v)?;
     Ok(v)
 }
@@ -796,29 +1105,63 @@ fn no_twice(v: &Value) -> ScimRes<()> {
 }
 
 fn need(app: &AppState, c: &Caller, id: &str) -> ScimRes<ScimUser> {
-    app.db.scim_user(&c.token.tenant, id).ok_or_else(|| missing("User"))
+    app.db
+        .scim_user(&c.token.tenant, id)
+        .ok_or_else(|| missing("User"))
 }
 
 /// `GET /scim/v2/Users?filter=&startIndex=&count=`: the tenant's users, deactivated
 /// ones included; deleted ones are gone.
-pub async fn list_users(State(app): State<AppState>, Extension(c): Extension<Caller>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> ScimRes {
+pub async fn list_users(
+    State(app): State<AppState>,
+    Extension(c): Extension<Caller>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> ScimRes {
     let (start, count) = page(&q)?;
-    let filter = q.iter().find(|(k, _)| k.eq_ignore_ascii_case("filter")).map(|(_, v)| v.as_str()).filter(|f| !f.trim().is_empty());
-    let key = filter.map(parse_filter).transpose().map_err(|e| ScimError::new(StatusCode::BAD_REQUEST, Some("invalidFilter"), e))?;
-    let (total, users) = app.db.scim_list(&c.token.tenant, key.as_ref(), start - 1, count);
+    let filter = q
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("filter"))
+        .map(|(_, v)| v.as_str())
+        .filter(|f| !f.trim().is_empty());
+    let key = filter
+        .map(parse_filter)
+        .transpose()
+        .map_err(|e| ScimError::new(StatusCode::BAD_REQUEST, Some("invalidFilter"), e))?;
+    let (total, users) = app
+        .db
+        .scim_list(&c.token.tenant, key.as_ref(), start - 1, count);
     let base = base_url(&headers);
-    Ok(list(users.iter().map(|u| resource(&base, u)).collect(), total, start))
+    Ok(list(
+        users.iter().map(|u| resource(&base, u)).collect(),
+        total,
+        start,
+    ))
 }
 
-pub async fn get_user(State(app): State<AppState>, Extension(c): Extension<Caller>, headers: HeaderMap, Path(id): Path<String>) -> ScimRes {
-    Ok(scim_json(StatusCode::OK, resource(&base_url(&headers), &need(&app, &c, &id)?)))
+pub async fn get_user(
+    State(app): State<AppState>,
+    Extension(c): Extension<Caller>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ScimRes {
+    Ok(scim_json(
+        StatusCode::OK,
+        resource(&base_url(&headers), &need(&app, &c, &id)?),
+    ))
 }
 
 /// `POST /scim/v2/Users`. Idempotent on `externalId`: a user the tenant has gets 409; one
 /// it deleted comes back, the same user. With a linked SSO provider, a person whose
 /// identity an admin (or just-in-time sign-in) already linked to a user is that user.
 /// Otherwise a new user, with the default role.
-pub async fn create_user(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, headers: HeaderMap, body: Result<Bytes, BytesRejection>) -> ScimRes {
+pub async fn create_user(
+    State(app): State<AppState>,
+    Extension(a): Extension<Arc<Auth>>,
+    Extension(c): Extension<Caller>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> ScimRes {
     let d = from_resource(&parse_body(body)?, None)?;
     let tenant = c.token.tenant.as_str();
     let base = base_url(&headers);
@@ -834,13 +1177,29 @@ pub async fn create_user(State(app): State<AppState>, Extension(a): Extension<Ar
         && let Some(found) = app.db.scim_find(tenant, &ScimKey::ExternalId(ext.clone()))
     {
         if found.deleted_at.is_none() {
-            return Err(uniqueness(format!("A user with this externalId exists already: {}", found.user.id)));
+            return Err(uniqueness(format!(
+                "A user with this externalId exists already: {}",
+                found.user.id
+            )));
         }
         let restored = json!({ "tenant": tenant, "externalId": ext, "userName": d.user_name });
-        let after = update(&app, &a, &c, &found.user.clone(), Some(&found), &d, Some(("scim.user_restored", restored))).await?;
+        let after = update(
+            &app,
+            &a,
+            &c,
+            &found.user.clone(),
+            Some(&found),
+            &d,
+            Some(("scim.user_restored", restored)),
+        )
+        .await?;
         return created(&after);
     }
-    if app.db.scim_find(tenant, &ScimKey::UserName(d.user_name.clone())).is_some() {
+    if app
+        .db
+        .scim_find(tenant, &ScimKey::UserName(d.user_name.clone()))
+        .is_some()
+    {
         return Err(uniqueness("A user with this userName exists already"));
     }
     let link = sso_link(&a, &c.token, d.external_id.as_deref())?;
@@ -848,16 +1207,28 @@ pub async fn create_user(State(app): State<AppState>, Extension(a): Extension<Ar
         && let Some((_, user)) = app.db.identity(&l.issuer, &l.subject)
     {
         if user.id == users::OPERATOR {
-            return Err(uniqueness("This identity belongs to the owner (break-glass) account, which SCIM never manages."));
+            return Err(uniqueness(
+                "This identity belongs to the owner (break-glass) account, which SCIM never manages.",
+            ));
         }
         // A user another tenant manages stays its own, even deleted there: only it may restore them.
         let mine = match app.db.scim_user_of(&user.id) {
-            Some(o) if o.tenant != tenant => return Err(uniqueness("This person is managed by another SCIM tenant.")),
-            Some(o) if o.deleted_at.is_none() => return Err(uniqueness("This person is provisioned already, under another externalId.")),
+            Some(o) if o.tenant != tenant => {
+                return Err(uniqueness("This person is managed by another SCIM tenant."));
+            }
+            Some(o) if o.deleted_at.is_none() => {
+                return Err(uniqueness(
+                    "This person is provisioned already, under another externalId.",
+                ));
+            }
             o => o,
         };
         let linked = json!({ "tenant": tenant, "externalId": d.external_id, "userName": d.user_name, "provider": l.provider, "subject": l.subject });
-        let action = if mine.is_some() { "scim.user_restored" } else { "scim.user_linked" };
+        let action = if mine.is_some() {
+            "scim.user_restored"
+        } else {
+            "scim.user_linked"
+        };
         let after = update(&app, &a, &c, &user, None, &d, Some((action, linked))).await?;
         return created(&after);
     }
@@ -872,7 +1243,10 @@ pub async fn create_user(State(app): State<AppState>, Extension(a): Extension<Ar
         created_by: created_by.as_deref(),
     });
     let f = fields(&d, &shown, Some(d.active));
-    let user = app.db.create_scim_user(tenant, &f, a.scim.default_role, identity.as_ref()).map_err(|e| save_error(&app, &c, e, None, f.email))?;
+    let user = app
+        .db
+        .create_scim_user(tenant, &f, a.scim.default_role, identity.as_ref())
+        .map_err(|e| save_error(&app, &c, e, None, f.email))?;
     app.db.record(&c.who.event("user.created").target("user", &user.id).details(json!({
         "email": user.email, "name": user.name, "role": user.role, "reason": "scim",
         "tenant": tenant, "externalId": d.external_id, "userName": d.user_name, "active": d.active,
@@ -886,31 +1260,60 @@ pub async fn create_user(State(app): State<AppState>, Extension(a): Extension<Ar
 }
 
 /// `PUT /scim/v2/Users/{id}`: the whole user. An `externalId` or `active` left out is kept.
-pub async fn replace_user(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, headers: HeaderMap, Path(id): Path<String>, body: Result<Bytes, BytesRejection>) -> ScimRes {
+pub async fn replace_user(
+    State(app): State<AppState>,
+    Extension(a): Extension<Arc<Auth>>,
+    Extension(c): Extension<Caller>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Result<Bytes, BytesRejection>,
+) -> ScimRes {
     let before = need(&app, &c, &id)?;
     let d = from_resource(&parse_body(body)?, Some(&Attrs::of(&before)))?;
     let after = update(&app, &a, &c, &before.user, Some(&before), &d, None).await?;
-    Ok(scim_json(StatusCode::OK, resource(&base_url(&headers), &after)))
+    Ok(scim_json(
+        StatusCode::OK,
+        resource(&base_url(&headers), &after),
+    ))
 }
 
 /// `PATCH /scim/v2/Users/{id}`. `active: false` disables the user and ends their sessions.
-pub async fn patch_user(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, headers: HeaderMap, Path(id): Path<String>, body: Result<Bytes, BytesRejection>) -> ScimRes {
+pub async fn patch_user(
+    State(app): State<AppState>,
+    Extension(a): Extension<Arc<Auth>>,
+    Extension(c): Extension<Caller>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Result<Bytes, BytesRejection>,
+) -> ScimRes {
     let before = need(&app, &c, &id)?;
     let mut d = Attrs::of(&before);
     apply_patch(&mut d, &parse_body(body)?)?;
     let after = update(&app, &a, &c, &before.user, Some(&before), &d, None).await?;
-    Ok(scim_json(StatusCode::OK, resource(&base_url(&headers), &after)))
+    Ok(scim_json(
+        StatusCode::OK,
+        resource(&base_url(&headers), &after),
+    ))
 }
 
 /// `DELETE /scim/v2/Users/{id}`: the user is disabled, their sessions end, and the tenant
 /// can't see them any more. Nothing is destroyed: the user and its audit history stay.
-pub async fn delete_user(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, Path(id): Path<String>) -> ScimRes {
+pub async fn delete_user(
+    State(app): State<AppState>,
+    Extension(a): Extension<Arc<Auth>>,
+    Extension(c): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ScimRes {
     let before = need(&app, &c, &id)?;
     if !app.db.delete_scim_user(&c.token.tenant, &id) {
         return Err(missing("User"));
     }
     a.sso.forget_user(&id);
-    let n = app.db.revoke_user_sessions(&id, c.who.actor.id.as_deref().unwrap_or("scim"), "deleted by SCIM");
+    let n = app.db.revoke_user_sessions(
+        &id,
+        c.who.actor.id.as_deref().unwrap_or("scim"),
+        "deleted by SCIM",
+    );
     let paused = crate::handover::user_disabled(&app, &c.who, &id);
     app.db.record(&c.who.event("scim.user_deleted").target("user", &id).details(json!({
         "tenant": c.token.tenant, "externalId": before.external_id, "userName": before.user_name, "sessionsRevoked": n, "routinesPaused": paused,
@@ -932,19 +1335,34 @@ pub async fn delete_user(State(app): State<AppState>, Extension(a): Extension<Ar
 /// A tenant name: lowercase letters, digits, and dashes, like `entra` or `okta-prod`.
 fn tenant_name(v: &Value) -> Res<String> {
     let t = v.as_str().map(str::trim).unwrap_or("");
-    let ok = (1..=32).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') && !t.starts_with('-');
-    ok.then(|| t.to_string()).ok_or_else(|| bad("tenant must be 1 to 32 lowercase letters, digits, or dashes, like entra or okta"))
+    let ok = (1..=32).contains(&t.len())
+        && t.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !t.starts_with('-');
+    ok.then(|| t.to_string()).ok_or_else(|| {
+        bad("tenant must be 1 to 32 lowercase letters, digits, or dashes, like entra or okta")
+    })
 }
 
 /// `GET /api/scim/tokens`: every token (never a value), and whether SCIM is on.
-pub async fn list_tokens(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>) -> Json<Value> {
-    Json(json!({ "enabled": a.scim.enabled, "defaultRole": a.scim.default_role, "tokens": app.db.scim_tokens() }))
+pub async fn list_tokens(
+    State(app): State<AppState>,
+    Extension(a): Extension<Arc<Auth>>,
+) -> Json<Value> {
+    Json(
+        json!({ "enabled": a.scim.enabled, "defaultRole": a.scim.default_role, "tokens": app.db.scim_tokens() }),
+    )
 }
 
 /// `POST /api/scim/tokens {tenant, label?, sso?}`. `sso` names a configured SSO provider
 /// whose subjects this tenant's `externalId`s are; a tenant's first token sets it for
 /// good. The token is returned once; only its hash is kept.
-pub async fn create_token(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res<Response> {
+pub async fn create_token(
+    State(app): State<AppState>,
+    Extension(a): Extension<Arc<Auth>>,
+    Extension(by): Extension<Who>,
+    Json(v): Json<Value>,
+) -> Res<Response> {
     let tenant = tenant_name(&v["tenant"])?;
     let label = users::clean_label(&v["label"]);
     let sso = match &v["sso"] {
@@ -956,28 +1374,57 @@ pub async fn create_token(State(app): State<AppState>, Extension(a): Extension<A
     if let Some(pid) = &sso {
         let p = a.sso.provider(pid).ok_or_else(|| {
             let known: Vec<&str> = a.sso.providers.iter().map(|p| p.id.as_str()).collect();
-            bad(if known.is_empty() { "SSO is off: set SSO_PROVIDERS, or leave sso out".to_string() } else { format!("sso must be one of: {}", known.join(", ")) })
+            bad(if known.is_empty() {
+                "SSO is off: set SSO_PROVIDERS, or leave sso out".to_string()
+            } else {
+                format!("sso must be one of: {}", known.join(", "))
+            })
         })?;
-        p.issuer_for(None).map_err(|e| bad(format!("SCIM can't link {pid}: {e}")))?;
+        p.issuer_for(None)
+            .map_err(|e| bad(format!("SCIM can't link {pid}: {e}")))?;
     }
     let token = users::new_secret(TOKEN_PREFIX);
     let t = app.db.create_scim_token(&tenant, label.as_deref(), sso.as_deref(), &users::hash(&token), by.actor.id.as_deref()).map_err(|first| {
         let had = first.map_or("no SSO provider".to_string(), |p| format!("the SSO provider {p}"));
         ApiError(StatusCode::CONFLICT, format!("Tenant {tenant} links {had}; its tokens all must. Use a new tenant name for another link."))
     })?;
-    app.db.record(&by.event("scim.token_created").target("scim_token", &t.id).details(json!({ "tenant": t.tenant, "label": t.label, "sso": t.sso_provider })));
-    let mut res = (StatusCode::CREATED, Json(json!({ "token": token, "scimToken": t, "enabled": a.scim.enabled }))).into_response();
-    res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    app.db.record(
+        &by.event("scim.token_created")
+            .target("scim_token", &t.id)
+            .details(json!({ "tenant": t.tenant, "label": t.label, "sso": t.sso_provider })),
+    );
+    let mut res = (
+        StatusCode::CREATED,
+        Json(json!({ "token": token, "scimToken": t, "enabled": a.scim.enabled })),
+    )
+        .into_response();
+    res.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(res)
 }
 
 /// `DELETE /api/scim/tokens/{id}`. The tenant's users stay as they are.
-pub async fn revoke_token(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
-    let t = app.db.scim_token(&id).filter(|t| t.revoked_at.is_none()).ok_or_else(|| not_found("SCIM token"))?;
-    if !app.db.revoke_scim_token(&id, by.actor.id.as_deref().unwrap_or("")) {
+pub async fn revoke_token(
+    State(app): State<AppState>,
+    Extension(by): Extension<Who>,
+    Path(id): Path<String>,
+) -> Res {
+    let t = app
+        .db
+        .scim_token(&id)
+        .filter(|t| t.revoked_at.is_none())
+        .ok_or_else(|| not_found("SCIM token"))?;
+    if !app
+        .db
+        .revoke_scim_token(&id, by.actor.id.as_deref().unwrap_or(""))
+    {
         return Err(not_found("SCIM token"));
     }
-    app.db.record(&by.event("scim.token_revoked").target("scim_token", &id).details(json!({ "tenant": t.tenant, "label": t.label })));
+    app.db.record(
+        &by.event("scim.token_revoked")
+            .target("scim_token", &id)
+            .details(json!({ "tenant": t.tenant, "label": t.label })),
+    );
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -991,7 +1438,10 @@ mod tests {
         assert!(!s.enabled);
         assert_eq!(s.default_role, Role::Member);
         assert!(Scim::from_env("on", "").unwrap().enabled);
-        assert_eq!(Scim::from_env("on", "read-only").unwrap().default_role, Role::Readonly);
+        assert_eq!(
+            Scim::from_env("on", "read-only").unwrap().default_role,
+            Role::Readonly
+        );
         assert!(Scim::from_env("maybe", "").is_err());
         assert!(Scim::from_env("on", "admin").is_err());
         assert!(Scim::from_env("on", "owner").is_err());
@@ -999,20 +1449,50 @@ mod tests {
 
     #[test]
     fn the_example_env_files_leave_scim_off() {
-        for (name, text) in [(".env.example", include_str!("../../.env.example")), ("deploy/docker/.env.example", include_str!("../../deploy/docker/.env.example"))] {
-            let vars: HashMap<&str, &str> = text.lines().filter(|l| !l.trim_start().starts_with('#')).filter_map(|l| l.split_once('=')).map(|(k, v)| (k.trim(), v.trim())).collect();
-            let s = Scim::from_env(vars.get("SCIM").copied().unwrap_or(""), vars.get("SCIM_DEFAULT_ROLE").copied().unwrap_or("")).unwrap_or_else(|e| panic!("{name}: {e}"));
+        for (name, text) in [
+            (".env.example", include_str!("../../.env.example")),
+            (
+                "deploy/docker/.env.example",
+                include_str!("../../deploy/docker/.env.example"),
+            ),
+        ] {
+            let vars: HashMap<&str, &str> = text
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .filter_map(|l| l.split_once('='))
+                .map(|(k, v)| (k.trim(), v.trim()))
+                .collect();
+            let s = Scim::from_env(
+                vars.get("SCIM").copied().unwrap_or(""),
+                vars.get("SCIM_DEFAULT_ROLE").copied().unwrap_or(""),
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
             assert!(!s.enabled && vars.contains_key("SCIM"), "{name}");
         }
     }
 
     #[test]
     fn filters() {
-        assert_eq!(parse_filter(r#"userName eq "ada@example.com""#), Ok(ScimKey::UserName("ada@example.com".into())));
-        assert_eq!(parse_filter(r#"  USERNAME  EQ  "Ada"  "#), Ok(ScimKey::UserName("Ada".into())));
-        assert_eq!(parse_filter(r#"externalId eq "00u1""#), Ok(ScimKey::ExternalId("00u1".into())));
-        assert_eq!(parse_filter(r#"urn:ietf:params:scim:schemas:core:2.0:User:userName eq "a""#), Ok(ScimKey::UserName("a".into())));
-        assert_eq!(parse_filter(r#"userName eq "say \"hi\" \\ ok""#), Ok(ScimKey::UserName(r#"say "hi" \ ok"#.into())));
+        assert_eq!(
+            parse_filter(r#"userName eq "ada@example.com""#),
+            Ok(ScimKey::UserName("ada@example.com".into()))
+        );
+        assert_eq!(
+            parse_filter(r#"  USERNAME  EQ  "Ada"  "#),
+            Ok(ScimKey::UserName("Ada".into()))
+        );
+        assert_eq!(
+            parse_filter(r#"externalId eq "00u1""#),
+            Ok(ScimKey::ExternalId("00u1".into()))
+        );
+        assert_eq!(
+            parse_filter(r#"urn:ietf:params:scim:schemas:core:2.0:User:userName eq "a""#),
+            Ok(ScimKey::UserName("a".into()))
+        );
+        assert_eq!(
+            parse_filter(r#"userName eq "say \"hi\" \\ ok""#),
+            Ok(ScimKey::UserName(r#"say "hi" \ ok"#.into()))
+        );
         for bad in [
             "",
             "userName",
@@ -1047,12 +1527,31 @@ mod tests {
     #[test]
     fn resources_are_read_strictly_and_extras_ignored() {
         let a = ada();
-        assert_eq!((a.user_name.as_str(), a.external_id.as_deref(), a.email.as_deref(), a.active), ("ada@example.com", Some("e1"), Some("ada@work.example"), true));
+        assert_eq!(
+            (
+                a.user_name.as_str(),
+                a.external_id.as_deref(),
+                a.email.as_deref(),
+                a.active
+            ),
+            (
+                "ada@example.com",
+                Some("e1"),
+                Some("ada@work.example"),
+                true
+            )
+        );
         assert_eq!(a.shown_name(), "Ada Lovelace");
         let only = from_resource(&json!({ "userName": "grace@example.com" }), None).unwrap();
-        assert_eq!((only.shown_name().as_str(), only.email.as_deref()), ("grace", Some("grace@example.com")));
+        assert_eq!(
+            (only.shown_name().as_str(), only.email.as_deref()),
+            ("grace", Some("grace@example.com"))
+        );
         let upn = from_resource(&json!({ "userName": "grace" }), None).unwrap();
-        assert_eq!(upn.email, None, "a userName that isn't an address isn't an email");
+        assert_eq!(
+            upn.email, None,
+            "a userName that isn't an address isn't an email"
+        );
         let primary = from_resource(&json!({ "userName": "x", "emails": [{ "value": "a@example.com" }, { "value": "b@example.com", "primary": true }] }), None).unwrap();
         assert_eq!(primary.email.as_deref(), Some("b@example.com"));
         for bad in [
@@ -1073,10 +1572,21 @@ mod tests {
         let mut off = ada();
         off.active = false;
         let put = from_resource(&json!({ "userName": "ada@example.com" }), Some(&off)).unwrap();
-        assert_eq!((put.external_id.as_deref(), put.active, put.email.as_deref()), (Some("e1"), false, Some("ada@example.com")));
+        assert_eq!(
+            (put.external_id.as_deref(), put.active, put.email.as_deref()),
+            (Some("e1"), false, Some("ada@example.com"))
+        );
         // Attribute names are case-insensitive, nested ones too.
         let odd = from_resource(&json!({ "USERNAME": "x@example.com", "Active": false, "Name": { "GivenName": "Ada" }, "Emails": [{ "Value": "a@example.com", "Primary": true }] }), None).unwrap();
-        assert_eq!((odd.user_name.as_str(), odd.active, odd.given_name.as_deref(), odd.email.as_deref()), ("x@example.com", false, Some("Ada"), Some("a@example.com")));
+        assert_eq!(
+            (
+                odd.user_name.as_str(),
+                odd.active,
+                odd.given_name.as_deref(),
+                odd.email.as_deref()
+            ),
+            ("x@example.com", false, Some("Ada"), Some("a@example.com"))
+        );
     }
 
     #[test]
@@ -1093,18 +1603,32 @@ mod tests {
             ]}),
         )
         .unwrap();
-        assert_eq!((a.email.as_deref(), a.family_name.as_deref(), a.active), (Some("new@work.example"), Some("King"), false));
+        assert_eq!(
+            (a.email.as_deref(), a.family_name.as_deref(), a.active),
+            (Some("new@work.example"), Some("King"), false)
+        );
         // Okta: no path, an object of attributes.
         apply_patch(&mut a, &json!({ "Operations": [{ "op": "replace", "value": { "active": true, "name": { "givenName": "Augusta" } } }] })).unwrap();
-        assert_eq!((a.active, a.given_name.as_deref(), a.family_name.as_deref()), (true, Some("Augusta"), Some("King")), "name parts not sent are kept");
+        assert_eq!(
+            (a.active, a.given_name.as_deref(), a.family_name.as_deref()),
+            (true, Some("Augusta"), Some("King")),
+            "name parts not sent are kept"
+        );
         apply_patch(&mut a, &json!({ "Operations": [{ "op": "Add", "value": { "displayName": "A. King", "name.givenName": "Ada" } }] })).unwrap();
-        assert_eq!((a.display_name.as_deref(), a.given_name.as_deref()), (Some("A. King"), Some("Ada")));
+        assert_eq!(
+            (a.display_name.as_deref(), a.given_name.as_deref()),
+            (Some("A. King"), Some("Ada"))
+        );
         apply_patch(&mut a, &json!({ "Operations": [{ "op": "remove", "path": "name.familyName" }, { "op": "remove", "path": "emails" }] })).unwrap();
         assert_eq!((a.family_name.as_deref(), a.email.as_deref()), (None, None));
         apply_patch(&mut a, &json!({ "Operations": [{ "Op": "Replace", "Value": { "Name": { "FamilyName": "Byron" }, "ACTIVE": false } }] })).unwrap();
         assert_eq!((a.family_name.as_deref(), a.active), (Some("Byron"), false));
         // Without a displayName, the shown name follows name.formatted, then the parts.
-        let mut n = Attrs { user_name: "u@example.com".into(), given_name: Some("Ada".into()), ..Attrs::default() };
+        let mut n = Attrs {
+            user_name: "u@example.com".into(),
+            given_name: Some("Ada".into()),
+            ..Attrs::default()
+        };
         assert_eq!(n.shown_name(), "Ada");
         apply_patch(&mut n, &json!({ "Operations": [{ "op": "replace", "path": "name.formatted", "value": "Ada L." }] })).unwrap();
         assert_eq!(n.shown_name(), "Ada L.");
@@ -1148,7 +1672,14 @@ mod tests {
         for ok in ["entra", "okta-prod", "g2"] {
             assert_eq!(tenant_name(&json!(ok)).unwrap(), ok);
         }
-        for bad in [json!(""), json!("Entra"), json!("-x"), json!("a b"), json!("x".repeat(33)), json!(1)] {
+        for bad in [
+            json!(""),
+            json!("Entra"),
+            json!("-x"),
+            json!("a b"),
+            json!("x".repeat(33)),
+            json!(1),
+        ] {
             assert!(tenant_name(&bad).is_err(), "{bad}");
         }
     }

@@ -30,14 +30,24 @@ pub fn subject(s: &str) -> String {
 /// An IdP alias as Keycloak allows it in URLs: letters, digits, `.`, `_`, `-`.
 pub fn alias(s: &str) -> Option<String> {
     let s = s.trim();
-    ((1..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))).then(|| s.to_string())
+    ((1..=64).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)))
+    .then(|| s.to_string())
 }
 
 /// A SAML entity ID: a URI of at most 1024 characters (SAML core 8.3.6), with no spaces.
 pub fn entity_id(s: &str) -> Option<String> {
     let s = s.trim();
-    let uri = s.split_once(':').is_some_and(|(scheme, rest)| !scheme.is_empty() && !rest.is_empty() && scheme.bytes().all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b)));
-    ((1..=1024).contains(&s.len()) && uri && s.bytes().all(|b| b.is_ascii_graphic())).then(|| s.to_string())
+    let uri = s.split_once(':').is_some_and(|(scheme, rest)| {
+        !scheme.is_empty()
+            && !rest.is_empty()
+            && scheme
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b))
+    });
+    ((1..=1024).contains(&s.len()) && uri && s.bytes().all(|b| b.is_ascii_graphic()))
+        .then(|| s.to_string())
 }
 
 #[cfg(test)]
@@ -51,10 +61,22 @@ mod tests {
         for bad in ["", "ad fs", "adfs/../x", "a?b", &"a".repeat(65)] {
             assert!(alias(bad).is_none(), "{bad}");
         }
-        for good in ["http://adfs.example.com/adfs/services/trust", "http://www.okta.com/exk1abc", "urn:example:idp", "https://idp.example/metadata"] {
+        for good in [
+            "http://adfs.example.com/adfs/services/trust",
+            "http://www.okta.com/exk1abc",
+            "urn:example:idp",
+            "https://idp.example/metadata",
+        ] {
             assert_eq!(entity_id(good).as_deref(), Some(good));
         }
-        for bad in ["", "adfs", "http://adfs.example.com/a b", ":nope", "x:", &format!("urn:{}", "a".repeat(1024))] {
+        for bad in [
+            "",
+            "adfs",
+            "http://adfs.example.com/a b",
+            ":nope",
+            "x:",
+            &format!("urn:{}", "a".repeat(1024)),
+        ] {
             assert!(entity_id(bad).is_none(), "{bad}");
         }
     }

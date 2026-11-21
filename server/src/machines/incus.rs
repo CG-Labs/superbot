@@ -17,11 +17,11 @@
 //!   `allow`), checked before every create, so Incus itself refuses privileged
 //!   containers, nesting, and host paths there.
 
-use super::provider::{
-    CreateSpec, FirewallDevices, FirewallRule, Fut, MachineProvider, ProviderError, ProviderFirewall,
-    ProviderMachine, RebuildSpec,
-};
 use super::pki;
+use super::provider::{
+    CreateSpec, FirewallDevices, FirewallRule, Fut, MachineProvider, ProviderError,
+    ProviderFirewall, ProviderMachine, RebuildSpec,
+};
 use crate::secrets::SecretStore;
 use reqwest::{Method, StatusCode};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -95,7 +95,9 @@ impl Size {
         };
         let num = |s: &str, prefix: char, max: u32| {
             s.strip_prefix(prefix)
-                .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && !n.starts_with('0'))
+                .filter(|n| {
+                    !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && !n.starts_with('0')
+                })
                 .and_then(|n| n.parse::<u32>().ok())
                 .filter(|n| *n <= max)
         };
@@ -243,7 +245,9 @@ pub fn egress(deny: &[String], control: Option<(IpAddr, u16)>) -> Vec<Rule> {
     for (v6, family) in [(false, "IPv4"), (true, "IPv6")] {
         let mut dest = Vec::new();
         for c in deny {
-            let Some((is6, lo, hi)) = span(c) else { continue };
+            let Some((is6, lo, hi)) = span(c) else {
+                continue;
+            };
             if is6 != v6 {
                 continue;
             }
@@ -271,7 +275,9 @@ pub fn egress(deny: &[String], control: Option<(IpAddr, u16)>) -> Vec<Rule> {
                 action: "drop".into(),
                 protocol: protocol.into(),
                 destination: dest.join(","),
-                description: format!("superbot: no {protocol} to private or host addresses ({family})"),
+                description: format!(
+                    "superbot: no {protocol} to private or host addresses ({family})"
+                ),
                 enabled: true,
                 ..Rule::default()
             });
@@ -281,7 +287,13 @@ pub fn egress(deny: &[String], control: Option<(IpAddr, u16)>) -> Vec<Rule> {
         let ports: Vec<String> = [(1u32, port as u32 - 1), (port as u32 + 1, 65535)]
             .into_iter()
             .filter(|(lo, hi)| lo <= hi)
-            .map(|(lo, hi)| if lo == hi { lo.to_string() } else { format!("{lo}-{hi}") })
+            .map(|(lo, hi)| {
+                if lo == hi {
+                    lo.to_string()
+                } else {
+                    format!("{lo}-{hi}")
+                }
+            })
             .collect();
         if !ports.is_empty() {
             out.push(Rule {
@@ -311,16 +323,24 @@ fn ingress(rules: &[FirewallRule]) -> Vec<Rule> {
     rules
         .iter()
         .flat_map(|r| {
-            let (v6, v4): (Vec<&String>, Vec<&String>) = r.sources.iter().partition(|s| s.contains(':'));
-            [v4, v6].into_iter().filter(|s| !s.is_empty()).map(|sources| Rule {
-                action: "allow".into(),
-                protocol: "tcp".into(),
-                source: sources.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(","),
-                destination_port: r.ports.clone(),
-                description: r.label.clone(),
-                enabled: true,
-                ..Rule::default()
-            })
+            let (v6, v4): (Vec<&String>, Vec<&String>) =
+                r.sources.iter().partition(|s| s.contains(':'));
+            [v4, v6]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .map(|sources| Rule {
+                    action: "allow".into(),
+                    protocol: "tcp".into(),
+                    source: sources
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    destination_port: r.ports.clone(),
+                    description: r.label.clone(),
+                    enabled: true,
+                    ..Rule::default()
+                })
         })
         .collect()
 }
@@ -330,7 +350,11 @@ fn ingress(rules: &[FirewallRule]) -> Vec<Rule> {
 fn our_ingress(rules: &[Rule]) -> Option<Vec<FirewallRule>> {
     let mut out: Vec<FirewallRule> = Vec::new();
     for r in rules {
-        if r.action != "allow" || r.protocol != "tcp" || !r.destination.is_empty() || r.source.is_empty() {
+        if r.action != "allow"
+            || r.protocol != "tcp"
+            || !r.destination.is_empty()
+            || r.source.is_empty()
+        {
             return None;
         }
         let sources = r
@@ -363,7 +387,8 @@ fn name(n: &str) -> Result<&str, ProviderError> {
         && n.len() <= 63
         && n.starts_with(|c: char| c.is_ascii_lowercase())
         && !n.ends_with('-')
-        && n.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        && n.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
     if ok {
         Ok(n)
     } else {
@@ -380,7 +405,12 @@ fn slug(s: &str) -> bool {
 
 /// `https://host[:port]` with nothing else in it: the base URL and the host.
 fn https_base(var: &str, raw: &str) -> Result<(String, url::Host<String>), String> {
-    let bad = || format!("{var} must be https://host[:port], not \"{}\"", crate::audit::clip(raw, 80));
+    let bad = || {
+        format!(
+            "{var} must be https://host[:port], not \"{}\"",
+            crate::audit::clip(raw, 80)
+        )
+    };
     let u = url::Url::parse(raw.trim()).map_err(|_| bad())?;
     if u.scheme() != "https"
         || !u.username().is_empty()
@@ -393,7 +423,10 @@ fn https_base(var: &str, raw: &str) -> Result<(String, url::Host<String>), Strin
     }
     let host = u.host().ok_or_else(bad)?.to_owned();
     let port = u.port().unwrap_or(DEFAULT_PORT);
-    Ok((format!("https://{}:{port}", u.host_str().unwrap_or_default()), host))
+    Ok((
+        format!("https://{}:{port}", u.host_str().unwrap_or_default()),
+        host,
+    ))
 }
 
 fn ip_of(host: &url::Host<String>) -> Option<IpAddr> {
@@ -423,20 +456,34 @@ impl Settings {
     /// INCUS_URL (needed), INCUS_PROJECT, INCUS_NETWORK, INCUS_STORAGE_POOL,
     /// INCUS_IMAGE_SERVER, INCUS_EGRESS_DENY, and MACHINE_CONTROL_URL.
     pub fn from_env(var: &dyn Fn(&str) -> String) -> Result<Settings, String> {
-        let or = |k: &str, d: &str| Some(var(k).trim().to_string()).filter(|v| !v.is_empty()).unwrap_or_else(|| d.into());
+        let or = |k: &str, d: &str| {
+            Some(var(k).trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| d.into())
+        };
         let raw = var("INCUS_URL");
         if raw.trim().is_empty() {
-            return Err("INCUS_URL is needed with MACHINE_PROVIDER=incus, e.g. https://<incus-host>:8443".into());
+            return Err(
+                "INCUS_URL is needed with MACHINE_PROVIDER=incus, e.g. https://<incus-host>:8443"
+                    .into(),
+            );
         }
         let (url, host) = https_base("INCUS_URL", &raw)?;
         let host_ip = ip_of(&host).ok_or(
             "INCUS_URL must name the Incus host by IP address, so containers can be kept off it, e.g. https://<incus-host-ip>:8443",
         )?;
         let mut names = Vec::new();
-        for (k, d) in [("INCUS_PROJECT", "superbot"), ("INCUS_NETWORK", "incusbr0"), ("INCUS_STORAGE_POOL", "default")] {
+        for (k, d) in [
+            ("INCUS_PROJECT", "superbot"),
+            ("INCUS_NETWORK", "incusbr0"),
+            ("INCUS_STORAGE_POOL", "default"),
+        ] {
             let v = or(k, d);
             if !slug(&v) {
-                return Err(format!("{k}: \"{}\" isn't an Incus name", crate::audit::clip(&v, 40)));
+                return Err(format!(
+                    "{k}: \"{}\" isn't an Incus name",
+                    crate::audit::clip(&v, 40)
+                ));
             }
             names.push(v);
         }
@@ -451,7 +498,11 @@ impl Settings {
             }
         };
         let mut deny: Vec<String> = PRIVATE.iter().map(|s| s.to_string()).collect();
-        for c in var("INCUS_EGRESS_DENY").split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        for c in var("INCUS_EGRESS_DENY")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             deny.push(super::firewall::cidr(c).map_err(|e| format!("INCUS_EGRESS_DENY: {e}"))?);
         }
         deny.push(super::firewall::cidr(&host_ip.to_string())?);
@@ -461,7 +512,15 @@ impl Settings {
             .ok()
             .and_then(|u| Some((ip_of(&u.host()?.to_owned())?, u.port_or_known_default()?)));
         let [project, network, pool] = <[String; 3]>::try_from(names).unwrap();
-        Ok(Settings { url, project, network, pool, image_server, deny, control })
+        Ok(Settings {
+            url,
+            project,
+            network,
+            pool,
+            image_server,
+            deny,
+            control,
+        })
     }
 }
 
@@ -476,18 +535,19 @@ impl Credentials {
     /// INCUS_CLIENT_CERT, INCUS_CLIENT_KEY, INCUS_SERVER_CERT (PEM, or `_FILE`).
     pub fn from_store(store: &dyn SecretStore) -> Result<Credentials, String> {
         let get = |k: &str| -> Result<String, String> {
-            let v = store
-                .get(k)
-                .map_err(|e| e.to_string())?
-                .ok_or(format!("{k} (or {k}_FILE) is needed with MACHINE_PROVIDER=incus"))?;
+            let v = store.get(k).map_err(|e| e.to_string())?.ok_or(format!(
+                "{k} (or {k}_FILE) is needed with MACHINE_PROVIDER=incus"
+            ))?;
             Ok(v.expose().trim().to_string())
         };
         let key = get("INCUS_CLIENT_KEY")?;
         crate::secrets::redact::register(&key);
         Ok(Credentials {
-            cert: pki::cert_der(&get("INCUS_CLIENT_CERT")?).map_err(|e| format!("INCUS_CLIENT_CERT: {e}"))?,
+            cert: pki::cert_der(&get("INCUS_CLIENT_CERT")?)
+                .map_err(|e| format!("INCUS_CLIENT_CERT: {e}"))?,
             key: pki::key_der(&key).map_err(|e| format!("INCUS_CLIENT_KEY: {e}"))?,
-            server: pki::cert_der(&get("INCUS_SERVER_CERT")?).map_err(|e| format!("INCUS_SERVER_CERT: {e}"))?,
+            server: pki::cert_der(&get("INCUS_SERVER_CERT")?)
+                .map_err(|e| format!("INCUS_SERVER_CERT: {e}"))?,
         })
     }
 }
@@ -567,7 +627,9 @@ fn operation_id(op: &str) -> Result<&str, ProviderError> {
     if !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
         Ok(id)
     } else {
-        Err(ProviderError::Transport("Incus sent an operation we couldn't read".into()))
+        Err(ProviderError::Transport(
+            "Incus sent an operation we couldn't read".into(),
+        ))
     }
 }
 
@@ -587,9 +649,9 @@ fn instance_of(url: &str) -> Option<(String, String)> {
 
 /// The container as a provider machine.
 fn machine(v: &Value) -> Result<ProviderMachine, ProviderError> {
-    let n = v["name"]
-        .as_str()
-        .ok_or_else(|| ProviderError::Transport("Incus sent an instance we couldn't read".into()))?;
+    let n = v["name"].as_str().ok_or_else(|| {
+        ProviderError::Transport("Incus sent an instance we couldn't read".into())
+    })?;
     let config = &v["config"];
     let text = |k: &str| config[k].as_str().unwrap_or_default().to_string();
     let ipv4 = v["state"]["network"]["eth0"]["addresses"]
@@ -602,7 +664,10 @@ fn machine(v: &Value) -> Result<ProviderMachine, ProviderError> {
     Ok(ProviderMachine {
         id: n.into(),
         label: n.into(),
-        status: v["status"].as_str().unwrap_or("unknown").to_ascii_lowercase(),
+        status: v["status"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_ascii_lowercase(),
         plan: text("user.superbot.plan"),
         region: match v["location"].as_str() {
             None | Some("" | "none") => LOCAL.into(),
@@ -656,7 +721,12 @@ impl Incus {
             .build()
             .map_err(|e| format!("Incus client: {e}"))?;
         let egress = egress(&s.deny, s.control);
-        Ok(Incus { s, egress, pin, http })
+        Ok(Incus {
+            s,
+            egress,
+            pin,
+            http,
+        })
     }
 
     async fn call(
@@ -675,7 +745,9 @@ impl Incus {
             }
             q.finish()
         };
-        let mut req = self.http.request(method, format!("{}{path}?{q}", self.s.url));
+        let mut req = self
+            .http
+            .request(method, format!("{}{path}?{q}", self.s.url));
         if let Some(b) = body {
             req = req.json(b);
         }
@@ -716,14 +788,23 @@ impl Incus {
         let id = operation_id(op)?;
         let timeout = secs.to_string();
         match self
-            .call(Method::GET, &format!("/1.0/operations/{id}/wait"), &[("timeout", &timeout)], None, None)
+            .call(
+                Method::GET,
+                &format!("/1.0/operations/{id}/wait"),
+                &[("timeout", &timeout)],
+                None,
+                None,
+            )
             .await
         {
             Ok(r) => match r.metadata["status"].as_str() {
                 Some("Success") => Ok(true),
                 Some("Failure" | "Cancelled") => Err(api(
                     400,
-                    r.metadata["err"].as_str().filter(|e| !e.is_empty()).unwrap_or("the operation failed"),
+                    r.metadata["err"]
+                        .as_str()
+                        .filter(|e| !e.is_empty())
+                        .unwrap_or("the operation failed"),
                 )),
                 _ => Ok(false),
             },
@@ -748,14 +829,28 @@ impl Incus {
     /// is the `instance_get_full` API extension, which preflight checks for.
     async fn instance(&self, n: &str) -> Result<Value, ProviderError> {
         Ok(self
-            .call(Method::GET, &format!("/1.0/instances/{}", name(n)?), &[("recursion", "1")], None, None)
+            .call(
+                Method::GET,
+                &format!("/1.0/instances/{}", name(n)?),
+                &[("recursion", "1")],
+                None,
+                None,
+            )
             .await?
             .metadata)
     }
 
     /// Whether an operation on `n` (its create, a rebuild) is still running.
     async fn busy(&self, n: &str) -> Result<bool, ProviderError> {
-        let ops = self.call(Method::GET, "/1.0/operations", &[("recursion", "1")], None, None).await?;
+        let ops = self
+            .call(
+                Method::GET,
+                "/1.0/operations",
+                &[("recursion", "1")],
+                None,
+                None,
+            )
+            .await?;
         let url = format!("/1.0/instances/{n}");
         Ok(ops
             .metadata
@@ -765,8 +860,18 @@ impl Incus {
             .filter_map(Value::as_array)
             .flatten()
             .filter(|op| matches!(op["status"].as_str(), Some("Running" | "Pending")))
-            .flat_map(|op| op["resources"]["instances"].as_array().cloned().unwrap_or_default())
-            .any(|u| u.as_str().and_then(instance_of).is_some_and(|(i, p)| i == n && p == self.s.project) || u == url.as_str()))
+            .flat_map(|op| {
+                op["resources"]["instances"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .any(|u| {
+                u.as_str()
+                    .and_then(instance_of)
+                    .is_some_and(|(i, p)| i == n && p == self.s.project)
+                    || u == url.as_str()
+            }))
     }
 
     /// Changes the instance's config and devices with `f`, retrying if it changed
@@ -786,24 +891,45 @@ impl Incus {
                 "description": v["description"],
             });
             f(&mut put);
-            match self.call(Method::PUT, &path, &[], Some(&put), r.etag.as_deref()).await {
+            match self
+                .call(Method::PUT, &path, &[], Some(&put), r.etag.as_deref())
+                .await
+            {
                 Err(ProviderError::Api { status: 412, .. }) => continue,
                 res => return self.finish(res?, EDIT_WAIT, "changing the container").await,
             }
         }
-        Err(ProviderError::Transport("the container kept changing at Incus".into()))
+        Err(ProviderError::Transport(
+            "the container kept changing at Incus".into(),
+        ))
     }
 
     async fn status(&self, n: &str) -> Result<String, ProviderError> {
-        Ok(self.instance(n).await?["status"].as_str().unwrap_or_default().to_string())
+        Ok(self.instance(n).await?["status"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string())
     }
 
-    async fn set_state(&self, n: &str, action: &str, force: bool, secs: u64) -> Result<(), ProviderError> {
+    async fn set_state(
+        &self,
+        n: &str,
+        action: &str,
+        force: bool,
+        secs: u64,
+    ) -> Result<(), ProviderError> {
         let body = json!({ "action": action, "force": force, "timeout": if force { -1 } else { secs as i64 }, "stateful": false });
         let r = self
-            .call(Method::PUT, &format!("/1.0/instances/{}/state", name(n)?), &[], Some(&body), None)
+            .call(
+                Method::PUT,
+                &format!("/1.0/instances/{}/state", name(n)?),
+                &[],
+                Some(&body),
+                None,
+            )
             .await?;
-        self.finish(r, secs + 5, &format!("{action}ing the container")).await
+        self.finish(r, secs + 5, &format!("{action}ing the container"))
+            .await
     }
 
     /// Stops it: cleanly if `force` is off and that works in time, else at once.
@@ -826,7 +952,9 @@ impl Incus {
             return Ok(());
         }
         if self.busy(n).await? {
-            return Err(ProviderError::Transport("Incus is still working on the container (a rebuild?)".into()));
+            return Err(ProviderError::Transport(
+                "Incus is still working on the container (a rebuild?)".into(),
+            ));
         }
         self.set_state(n, "start", false, FORCE_WAIT).await
     }
@@ -836,18 +964,30 @@ impl Incus {
     /// Checked before every create, so botd never makes a container it can't keep
     /// behind its firewall.
     async fn check_server(&self) -> Result<String, ProviderError> {
-        let v = self.call(Method::GET, "/1.0", &[], None, None).await?.metadata;
+        let v = self
+            .call(Method::GET, "/1.0", &[], None, None)
+            .await?
+            .metadata;
         if v["auth"] != "trusted" {
-            return Err(api(403, "Incus doesn't trust botd's client certificate yet"));
+            return Err(api(
+                403,
+                "Incus doesn't trust botd's client certificate yet",
+            ));
         }
         let version = v["environment"]["server_version"].as_str().unwrap_or("?");
         if too_old(version) {
             return Err(api(
                 400,
-                format!("Incus {version} is too old: botd needs {MIN_VERSION} or later, which can change a network ACL that containers in a restricted project use"),
+                format!(
+                    "Incus {version} is too old: botd needs {MIN_VERSION} or later, which can change a network ACL that containers in a restricted project use"
+                ),
             ));
         }
-        let have = |x: &str| v["api_extensions"].as_array().is_some_and(|a| a.iter().any(|e| e == x));
+        let have = |x: &str| {
+            v["api_extensions"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|e| e == x))
+        };
         let missing: Vec<&str> = [
             "network_acl",
             "network_bridge_acl_devices",
@@ -859,14 +999,23 @@ impl Incus {
         .filter(|x| !have(x))
         .collect();
         if !missing.is_empty() {
-            return Err(api(400, format!("Incus lacks API extensions: {}", missing.join(", "))));
+            return Err(api(
+                400,
+                format!("Incus lacks API extensions: {}", missing.join(", ")),
+            ));
         }
         Ok(format!("Incus {version} trusts botd"))
     }
 
     async fn check_project(&self) -> Result<(), ProviderError> {
         let p = self
-            .call(Method::GET, &format!("/1.0/projects/{}", self.s.project), &[], None, None)
+            .call(
+                Method::GET,
+                &format!("/1.0/projects/{}", self.s.project),
+                &[],
+                None,
+                None,
+            )
             .await?
             .metadata;
         let c = &p["config"];
@@ -885,20 +1034,33 @@ impl Incus {
         if let Some(k) = LOOSENED.iter().find(|k| c[**k] == "allow") {
             return Err(refuse(format!("allows {k}")));
         }
-        if c["restricted.devices.disk.paths"].as_str().is_some_and(|p| !p.is_empty()) {
-            return Err(refuse("lets containers mount host paths (restricted.devices.disk.paths)".into()));
-        }
-        if c["restricted.idmap.uid"].as_str().is_some_and(|p| !p.is_empty())
-            || c["restricted.idmap.gid"].as_str().is_some_and(|p| !p.is_empty())
+        if c["restricted.devices.disk.paths"]
+            .as_str()
+            .is_some_and(|p| !p.is_empty())
         {
-            return Err(refuse("lets containers map host ids (restricted.idmap.*)".into()));
+            return Err(refuse(
+                "lets containers mount host paths (restricted.devices.disk.paths)".into(),
+            ));
+        }
+        if c["restricted.idmap.uid"]
+            .as_str()
+            .is_some_and(|p| !p.is_empty())
+            || c["restricted.idmap.gid"]
+                .as_str()
+                .is_some_and(|p| !p.is_empty())
+        {
+            return Err(refuse(
+                "lets containers map host ids (restricted.idmap.*)".into(),
+            ));
         }
         Ok(())
     }
 
     fn source(&self, image: &str) -> Value {
         match &self.s.image_server {
-            Some(server) => json!({ "type": "image", "alias": image, "server": server, "protocol": "simplestreams" }),
+            Some(server) => {
+                json!({ "type": "image", "alias": image, "server": server, "protocol": "simplestreams" })
+            }
             None => json!({ "type": "image", "alias": image }),
         }
     }
@@ -929,7 +1091,8 @@ impl Incus {
         };
         v["profiles"].as_array().is_none_or(Vec::is_empty)
             && devices.as_object().is_some_and(|d| {
-                d.get("eth0") == Some(&self.nic(acl)) && d.iter().all(|(k, dev)| k == "eth0" || dev["type"] != "nic")
+                d.get("eth0") == Some(&self.nic(acl))
+                    && d.iter().all(|(k, dev)| k == "eth0" || dev["type"] != "nic")
             })
     }
     fn root(&self, size: &Size) -> Value {
@@ -949,7 +1112,8 @@ impl Incus {
         let n = v["name"]
             .as_str()
             .ok_or_else(|| ProviderError::Transport("Incus sent an ACL we couldn't read".into()))?;
-        let read = |k: &str| -> Option<Vec<Rule>> { v[k].as_array()?.iter().map(Rule::read).collect() };
+        let read =
+            |k: &str| -> Option<Vec<Rule>> { v[k].as_array()?.iter().map(Rule::read).collect() };
         let (ingress_rules, egress_rules) = (read("ingress"), read("egress"));
         let enabled = [&ingress_rules, &egress_rules]
             .iter()
@@ -974,27 +1138,53 @@ impl Incus {
     }
 
     async fn acl(&self, id: &str) -> Result<Reply, ProviderError> {
-        self.call(Method::GET, &format!("/1.0/network-acls/{}", name(id)?), &[], None, None)
-            .await
+        self.call(
+            Method::GET,
+            &format!("/1.0/network-acls/{}", name(id)?),
+            &[],
+            None,
+            None,
+        )
+        .await
     }
 
     /// Rewrites the ACL with `ingress_rules` and our outbound rules.
-    async fn put_acl(&self, id: &str, change: impl Fn(&Value) -> Vec<Rule>) -> Result<(), ProviderError> {
+    async fn put_acl(
+        &self,
+        id: &str,
+        change: impl Fn(&Value) -> Vec<Rule>,
+    ) -> Result<(), ProviderError> {
         for _ in 0..3 {
             let r = self.acl(id).await?;
-            let body = self.acl_body(&change(&r.metadata), &r.metadata["description"], &r.metadata["config"]);
+            let body = self.acl_body(
+                &change(&r.metadata),
+                &r.metadata["description"],
+                &r.metadata["config"],
+            );
             match self
-                .call(Method::PUT, &format!("/1.0/network-acls/{}", name(id)?), &[], Some(&body), r.etag.as_deref())
+                .call(
+                    Method::PUT,
+                    &format!("/1.0/network-acls/{}", name(id)?),
+                    &[],
+                    Some(&body),
+                    r.etag.as_deref(),
+                )
                 .await
             {
                 Err(ProviderError::Api { status: 412, .. }) => continue,
                 res => return res.map(drop),
             }
         }
-        Err(ProviderError::Transport("the ACL kept changing at Incus".into()))
+        Err(ProviderError::Transport(
+            "the ACL kept changing at Incus".into(),
+        ))
     }
 
-    async fn check(&self, check: &str, f: impl Future<Output = Result<String, ProviderError>>) -> Value {
+    async fn check(
+        &self,
+        check: &str,
+        f: impl Future<Output = Result<String, ProviderError>>,
+    ) -> Value {
         match f.await {
             Ok(detail) => json!({ "check": check, "ok": true, "detail": detail }),
             Err(e) => json!({ "check": check, "ok": false, "detail": e.to_string() }),
@@ -1051,9 +1241,7 @@ impl MachineProvider for Incus {
 
     fn preflight<'a>(&'a self) -> Fut<'a, Vec<Value>> {
         Box::pin(async move {
-            let mut out = vec![
-                self.check("server", self.check_server()).await,
-            ];
+            let mut out = vec![self.check("server", self.check_server()).await];
             out.push(
                 self.check("project", async {
                     self.check_project().await?;
@@ -1064,11 +1252,20 @@ impl MachineProvider for Incus {
             out.push(
                 self.check("network", async {
                     let n = self
-                        .call(Method::GET, &format!("/1.0/networks/{}", self.s.network), &[], None, None)
+                        .call(
+                            Method::GET,
+                            &format!("/1.0/networks/{}", self.s.network),
+                            &[],
+                            None,
+                            None,
+                        )
                         .await?
                         .metadata;
                     if n["type"] != "bridge" || n["managed"] != true {
-                        return Err(api(400, format!("{} isn't a managed bridge", self.s.network)));
+                        return Err(api(
+                            400,
+                            format!("{} isn't a managed bridge", self.s.network),
+                        ));
                     }
                     Ok(format!("{} is a managed bridge", self.s.network))
                 })
@@ -1096,10 +1293,12 @@ impl MachineProvider for Incus {
         Box::pin(async move {
             let size = Size::parse(&spec.plan).map_err(|m| api(400, m))?;
             let n = name(&spec.label)?;
-            let acl = spec
-                .firewall_id
-                .as_deref()
-                .ok_or_else(|| api(400, "containers are made behind the machines' firewall (MACHINE_FIREWALL=on)"))?;
+            let acl = spec.firewall_id.as_deref().ok_or_else(|| {
+                api(
+                    400,
+                    "containers are made behind the machines' firewall (MACHINE_FIREWALL=on)",
+                )
+            })?;
             name(acl)?;
             self.check_server().await?;
             self.check_project().await?;
@@ -1115,14 +1314,20 @@ impl MachineProvider for Incus {
             for (k, v) in size.limits() {
                 config.insert(k.into(), json!(v));
             }
-            config.insert("user.superbot.tag".into(), json!(spec.tags.first().cloned().unwrap_or_default()));
+            config.insert(
+                "user.superbot.tag".into(),
+                json!(spec.tags.first().cloned().unwrap_or_default()),
+            );
             config.insert("user.superbot.tags".into(), json!(spec.tags.join(",")));
             config.insert("user.superbot.plan".into(), json!(spec.plan));
             if let Some(ud) = &spec.user_data {
                 config.insert(USER_DATA.into(), json!(ud));
             }
             if !spec.authorized_keys.is_empty() {
-                config.insert("cloud-init.vendor-data".into(), json!(vendor_data(&spec.authorized_keys)));
+                config.insert(
+                    "cloud-init.vendor-data".into(),
+                    json!(vendor_data(&spec.authorized_keys)),
+                );
             }
             let body = json!({
                 "name": n,
@@ -1139,7 +1344,9 @@ impl MachineProvider for Incus {
             } else {
                 vec![("target", spec.region.as_str())]
             };
-            let r = self.call(Method::POST, "/1.0/instances", &target, Some(&body), None).await?;
+            let r = self
+                .call(Method::POST, "/1.0/instances", &target, Some(&body), None)
+                .await?;
             if let Some(op) = &r.operation {
                 self.wait(op, CREATE_WAIT).await?;
             }
@@ -1159,7 +1366,15 @@ impl MachineProvider for Incus {
 
     fn list<'a>(&'a self, tag: &'a str) -> Fut<'a, Vec<ProviderMachine>> {
         Box::pin(async move {
-            let r = self.call(Method::GET, "/1.0/instances", &[("recursion", "2")], None, None).await?;
+            let r = self
+                .call(
+                    Method::GET,
+                    "/1.0/instances",
+                    &[("recursion", "2")],
+                    None,
+                    None,
+                )
+                .await?;
             r.metadata
                 .as_array()
                 .into_iter()
@@ -1215,16 +1430,24 @@ impl MachineProvider for Incus {
         Box::pin(async move {
             let res = match self.stop(id, true).await {
                 Ok(()) => {
-                    self.call(Method::DELETE, &format!("/1.0/instances/{}", name(id)?), &[], None, None)
-                        .await
+                    self.call(
+                        Method::DELETE,
+                        &format!("/1.0/instances/{}", name(id)?),
+                        &[],
+                        None,
+                        None,
+                    )
+                    .await
                 }
                 Err(e) => Err(e),
             };
             match res {
                 Ok(r) => self.finish(r, FORCE_WAIT, "deleting the container").await,
-                Err(ProviderError::NotFound) if self.busy(id).await? => Err(ProviderError::Transport(
-                    "Incus is still creating the container; it's deleted once made".into(),
-                )),
+                Err(ProviderError::NotFound) if self.busy(id).await? => {
+                    Err(ProviderError::Transport(
+                        "Incus is still creating the container; it's deleted once made".into(),
+                    ))
+                }
                 Err(ProviderError::NotFound) => Ok(()),
                 Err(e) => Err(e),
             }
@@ -1241,7 +1464,8 @@ impl MachineProvider for Incus {
                         c.remove("cloud-init.vendor-data");
                     }
                 } else {
-                    put["config"]["cloud-init.vendor-data"] = json!(vendor_data(&spec.authorized_keys));
+                    put["config"]["cloud-init.vendor-data"] =
+                        json!(vendor_data(&spec.authorized_keys));
                 }
             })
             .await?;
@@ -1256,7 +1480,8 @@ impl MachineProvider for Incus {
                 .await?;
             // Slower than that, it's left stopped: the rebuild worker starts it once
             // Incus is done, if it's still meant to be running.
-            self.finish(r, REBUILD_WAIT, "rebuilding the container").await?;
+            self.finish(r, REBUILD_WAIT, "rebuilding the container")
+                .await?;
             self.start(id).await
         })
     }
@@ -1308,7 +1533,8 @@ impl MachineProvider for Incus {
                 &json!({ "user.superbot.tag": tags.first().cloned().unwrap_or_default() }),
             );
             body["name"] = json!(name(label)?);
-            self.call(Method::POST, "/1.0/network-acls", &[], Some(&body), None).await?;
+            self.call(Method::POST, "/1.0/network-acls", &[], Some(&body), None)
+                .await?;
             self.get_firewall(label).await
         })
     }
@@ -1352,9 +1578,22 @@ impl MachineProvider for Incus {
             if ours.is_empty() {
                 return Ok(out);
             }
-            let list = self.call(Method::GET, "/1.0/instances", &[("recursion", "1")], None, None).await?.metadata;
+            let list = self
+                .call(
+                    Method::GET,
+                    "/1.0/instances",
+                    &[("recursion", "1")],
+                    None,
+                    None,
+                )
+                .await?
+                .metadata;
             for n in ours {
-                let found = list.as_array().into_iter().flatten().find(|v| v["name"] == n.as_str());
+                let found = list
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|v| v["name"] == n.as_str());
                 if found.is_some_and(|v| self.covered(v, acl)) {
                     out.machines.push(n);
                 } else {
@@ -1402,7 +1641,13 @@ impl MachineProvider for Incus {
     fn delete_firewall<'a>(&'a self, id: &'a str) -> Fut<'a, ()> {
         Box::pin(async move {
             match self
-                .call(Method::DELETE, &format!("/1.0/network-acls/{}", name(id)?), &[], None, None)
+                .call(
+                    Method::DELETE,
+                    &format!("/1.0/network-acls/{}", name(id)?),
+                    &[],
+                    None,
+                    None,
+                )
                 .await
             {
                 Ok(_) | Err(ProviderError::NotFound) => Ok(()),
@@ -1418,14 +1663,31 @@ impl MachineProvider for Incus {
 impl Incus {
     /// A call to the API, waiting up to `secs` for any operation it starts. The
     /// metadata, or the operation's once it is done.
-    pub async fn raw(&self, method: Method, path: &str, body: Option<&Value>, secs: u64) -> Result<Value, ProviderError> {
+    pub async fn raw(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+        secs: u64,
+    ) -> Result<Value, ProviderError> {
         let (path, query) = path.split_once('?').unwrap_or((path, ""));
-        let query: Vec<(&str, &str)> = query.split('&').filter_map(|kv| kv.split_once('=')).collect();
+        let query: Vec<(&str, &str)> = query
+            .split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .collect();
         let r = self.call(method, path, &query, body, None).await?;
-        let Some(op) = r.operation else { return Ok(r.metadata) };
+        let Some(op) = r.operation else {
+            return Ok(r.metadata);
+        };
         let id = operation_id(&op)?.to_string();
         let done = self
-            .call(Method::GET, &format!("/1.0/operations/{id}/wait"), &[("timeout", &secs.to_string())], None, None)
+            .call(
+                Method::GET,
+                &format!("/1.0/operations/{id}/wait"),
+                &[("timeout", &secs.to_string())],
+                None,
+                None,
+            )
             .await?
             .metadata;
         match done["status"].as_str() {
@@ -1435,7 +1697,11 @@ impl Incus {
     }
 
     /// Runs `cmd` in container `n` as root: its exit code, stdout and stderr.
-    pub async fn exec(&self, n: &str, cmd: &[&str]) -> Result<(i64, String, String), ProviderError> {
+    pub async fn exec(
+        &self,
+        n: &str,
+        cmd: &[&str],
+    ) -> Result<(i64, String, String), ProviderError> {
         let body = json!({
             "command": cmd,
             "interactive": false,
@@ -1443,15 +1709,34 @@ impl Incus {
             "record-output": true,
             "environment": { "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" },
         });
-        let op = self.raw(Method::POST, &format!("/1.0/instances/{}/exec", name(n)?), Some(&body), 120).await?;
+        let op = self
+            .raw(
+                Method::POST,
+                &format!("/1.0/instances/{}/exec", name(n)?),
+                Some(&body),
+                120,
+            )
+            .await?;
         let code = op["metadata"]["return"].as_i64().unwrap_or(-1);
         let mut out = [String::new(), String::new()];
         for (i, fd) in ["1", "2"].iter().enumerate() {
             if let Some(log) = op["metadata"]["output"][fd].as_str() {
                 let url = format!("{}{}?project={}", self.s.url, log, self.s.project);
-                let res = self.http.get(url).send().await.map_err(|e| ProviderError::Transport(e.to_string()))?;
-                out[i] = res.text().await.map_err(|e| ProviderError::Transport(e.to_string()))?;
-                let _ = self.http.delete(format!("{}{}?project={}", self.s.url, log, self.s.project)).send().await;
+                let res = self
+                    .http
+                    .get(url)
+                    .send()
+                    .await
+                    .map_err(|e| ProviderError::Transport(e.to_string()))?;
+                out[i] = res
+                    .text()
+                    .await
+                    .map_err(|e| ProviderError::Transport(e.to_string()))?;
+                let _ = self
+                    .http
+                    .delete(format!("{}{}?project={}", self.s.url, log, self.s.project))
+                    .send()
+                    .await;
             }
         }
         let [stdout, stderr] = out;

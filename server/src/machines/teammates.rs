@@ -74,11 +74,16 @@ impl OsUsers for System {
                 // through a pidfd, opened before its owner is checked again: while the
                 // process the pidfd names is alive (as the signal needs), the pid is its.
                 // SAFETY: plain integers; the descriptor is owned on success.
-                let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_long, 0 as libc::c_long) };
+                let fd = unsafe {
+                    libc::syscall(libc::SYS_pidfd_open, pid as libc::c_long, 0 as libc::c_long)
+                };
                 if fd < 0 {
                     let e = std::io::Error::last_os_error();
                     if e.raw_os_error() == Some(libc::ENOSYS) {
-                        return Err("this kernel can't stop processes safely (needs Linux 5.3 or later)".into());
+                        return Err(
+                            "this kernel can't stop processes safely (needs Linux 5.3 or later)"
+                                .into(),
+                        );
                     }
                     continue;
                 }
@@ -89,7 +94,13 @@ impl OsUsers for System {
                 }
                 // SAFETY: an open pidfd, a signal number and no extra info.
                 let sent = unsafe {
-                    libc::syscall(libc::SYS_pidfd_send_signal, fd.as_raw_fd() as libc::c_long, libc::SIGKILL as libc::c_long, std::ptr::null::<libc::siginfo_t>(), 0 as libc::c_long)
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        fd.as_raw_fd() as libc::c_long,
+                        libc::SIGKILL as libc::c_long,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0 as libc::c_long,
+                    )
                 };
                 if sent == 0 {
                     stopped.insert(pid);
@@ -170,7 +181,8 @@ impl OsUsers for StandIn {
     }
 
     fn add(&self, name: &str, _home: &Path) -> Result<Ids, String> {
-        self.lookup(name).ok_or_else(|| format!("no user {name} to stand in"))
+        self.lookup(name)
+            .ok_or_else(|| format!("no user {name} to stand in"))
     }
 
     fn remove(&self, _name: &str) -> Result<bool, String> {
@@ -191,7 +203,11 @@ impl OsUsers for StandIn {
 pub enum Files {
     /// To `<home>/work/from-teammates/<name>`, given to `ids` (the Bots' user), so the
     /// owner's Bots have it.
-    Archive { home: PathBuf, ids: Ids, name: String },
+    Archive {
+        home: PathBuf,
+        ids: Ids,
+        name: String,
+    },
     /// Aside, root's alone, until `purge`.
     Hold,
     Delete,
@@ -427,20 +443,36 @@ impl Teammates {
     /// `user_id`'s user and home if they have them here, never made: still the user
     /// recorded for them, passing `check`, with a home that's a folder of theirs (not a
     /// link). None if any of that isn't so.
-    pub fn existing(&self, user_id: &str, check: impl Fn(Ids) -> Result<(), String>) -> Option<Teammate> {
+    pub fn existing(
+        &self,
+        user_id: &str,
+        check: impl Fn(Ids) -> Result<(), String>,
+    ) -> Option<Teammate> {
         let _one = self.making.lock().unwrap_or_else(|e| e.into_inner());
         if self.leaving().contains(user_id) {
             return None;
         }
         let s = self.record().ok()?.remove(user_id)?;
-        let ids = Ids { uid: s.uid, gid: s.gid };
-        let name = self.stand_in.clone().unwrap_or_else(|| wire::teammate_user(user_id));
+        let ids = Ids {
+            uid: s.uid,
+            gid: s.gid,
+        };
+        let name = self
+            .stand_in
+            .clone()
+            .unwrap_or_else(|| wire::teammate_user(user_id));
         if s.user != name || self.os_users.lookup(&s.user) != Some(ids) || check(ids).is_err() {
             return None;
         }
         let home = self.home_of(user_id);
-        let theirs = std::fs::symlink_metadata(&home).is_ok_and(|m| m.is_dir() && m.uid() == ids.uid);
-        theirs.then_some(Teammate { user: s.user, ids, home, created: false })
+        let theirs =
+            std::fs::symlink_metadata(&home).is_ok_and(|m| m.is_dir() && m.uid() == ids.uid);
+        theirs.then_some(Teammate {
+            user: s.user,
+            ids,
+            home,
+            created: false,
+        })
     }
 
     /// `user_id`'s user and home, made if this is their first run here. `check` refuses
@@ -463,7 +495,9 @@ impl Teammates {
         let mut record = self.record()?;
         // A removal that deleted the user and home but stopped before dropping the
         // record leaves nothing of theirs: start again rather than refuse for good.
-        if record.get(user_id).is_some_and(|s| self.os_users.lookup(&s.user).is_none())
+        if record
+            .get(user_id)
+            .is_some_and(|s| self.os_users.lookup(&s.user).is_none())
             && std::fs::symlink_metadata(&home).is_err()
         {
             record.remove(user_id);
@@ -611,7 +645,9 @@ impl Teammates {
                         check(want)?;
                         Some(want)
                     }
-                    Some(_) => return Err(format!("{} isn't the user it was; left alone.", s.user)),
+                    Some(_) => {
+                        return Err(format!("{} isn't the user it was; left alone.", s.user));
+                    }
                     None => None,
                 }
             }
@@ -682,7 +718,10 @@ impl Teammates {
         }
         done.insert(cleanup_id.to_string(), Removed::of(user_id, &out));
         while done.len() > KEEP_REMOVED {
-            let oldest = done.iter().min_by_key(|(_, d)| d.at).map(|(k, _)| k.clone());
+            let oldest = done
+                .iter()
+                .min_by_key(|(_, d)| d.at)
+                .map(|(k, _)| k.clone());
             oldest.map(|k| done.remove(&k));
         }
         self.save_removed(&done)?;
@@ -878,17 +917,32 @@ mod tests {
         };
 
         let r = t.remove("ubea", "c1", &archive, |_| Ok(())).unwrap();
-        assert_eq!((r.files, r.user_removed, r.processes_stopped, r.temp_removed), ("archived", true, 2, 1));
+        assert_eq!(
+            (r.files, r.user_removed, r.processes_stopped, r.temp_removed),
+            ("archived", true, 2, 1)
+        );
         let to = owner.join("work/from-teammates/bea");
         assert_eq!(r.archived_to.as_deref(), Some(to.as_path()));
-        assert_eq!(std::fs::read_to_string(to.join("notes.md")).unwrap(), "bea's");
+        assert_eq!(
+            std::fs::read_to_string(to.join("notes.md")).unwrap(),
+            "bea's"
+        );
         assert!(!bea.home.exists(), "their home, logins and all, is gone");
         assert!(!t.held("c1").exists());
         // Nobody else is touched: the owner's work, the other teammate, their user.
-        assert_eq!(std::fs::read_to_string(owner.join("work/plan.md")).unwrap(), "ada's");
-        assert_eq!(std::fs::read_to_string(cy.workspace().join("notes.md")).unwrap(), "cy's");
+        assert_eq!(
+            std::fs::read_to_string(owner.join("work/plan.md")).unwrap(),
+            "ada's"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cy.workspace().join("notes.md")).unwrap(),
+            "cy's"
+        );
         assert_eq!(t.known(), ["ucy"]);
-        assert_eq!(*fake.removed.lock().unwrap(), std::slice::from_ref(&bea.user));
+        assert_eq!(
+            *fake.removed.lock().unwrap(),
+            std::slice::from_ref(&bea.user)
+        );
         assert!(fake.lookup(&cy.user).is_some());
 
         // Again, as when its answer was lost: the same answer, nothing done.
@@ -902,16 +956,29 @@ mod tests {
         let back = t.ensure("ubea", |_| Ok(())).unwrap();
         assert!(back.created);
         std::fs::write(back.workspace().join("new.md"), "bea's new").unwrap();
-        assert!(t.remove("ubea", "c1", &archive, |_| Ok(())).unwrap().already_gone);
-        assert_eq!(std::fs::read_to_string(back.workspace().join("new.md")).unwrap(), "bea's new");
+        assert!(
+            t.remove("ubea", "c1", &archive, |_| Ok(()))
+                .unwrap()
+                .already_gone
+        );
+        assert_eq!(
+            std::fs::read_to_string(back.workspace().join("new.md")).unwrap(),
+            "bea's new"
+        );
         assert!(t.known().contains(&"ubea".to_string()) && fake.lookup(&back.user).is_some());
 
         // Held, then purged.
         let r = t.remove("ucy", "c2", &Files::Hold, |_| Ok(())).unwrap();
         assert_eq!(r.files, "held");
-        assert_eq!(std::fs::read_to_string(t.held("c2").join("notes.md")).unwrap(), "cy's");
+        assert_eq!(
+            std::fs::read_to_string(t.held("c2").join("notes.md")).unwrap(),
+            "cy's"
+        );
         let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777;
-        assert_eq!((mode(&t.held("c2")), mode(&d.join("teammates/.left"))), (0o700, 0o700));
+        assert_eq!(
+            (mode(&t.held("c2")), mode(&d.join("teammates/.left"))),
+            (0o700, 0o700)
+        );
         assert!(t.purge("c2").unwrap());
         assert!(!t.purge("c2").unwrap());
 
@@ -919,8 +986,15 @@ mod tests {
         let eve = t.ensure("ueve", |_| Ok(())).unwrap();
         std::fs::write(eve.workspace().join("notes.md"), "eve's").unwrap();
         *fake.refuse_removal.lock().unwrap() = true;
-        assert!(t.remove("ueve", "c3", &Files::Delete, |_| Ok(())).unwrap_err().contains("busy"));
-        assert!(t.known().contains(&"ueve".to_string()), "kept until it's done");
+        assert!(
+            t.remove("ueve", "c3", &Files::Delete, |_| Ok(()))
+                .unwrap_err()
+                .contains("busy")
+        );
+        assert!(
+            t.known().contains(&"ueve".to_string()),
+            "kept until it's done"
+        );
         *fake.refuse_removal.lock().unwrap() = false;
         let r = t.remove("ueve", "c3", &Files::Delete, |_| Ok(())).unwrap();
         assert_eq!((r.files, r.user_removed), ("deleted", true));
@@ -935,16 +1009,31 @@ mod tests {
 
         // Refused ids, or a user that isn't the recorded one: nothing is touched.
         let fay = t.ensure("ufay", |_| Ok(())).unwrap();
-        assert!(t.remove("ufay", "c4", &Files::Delete, |_| Err("root".into())).is_err());
-        fake.users.lock().unwrap().insert(fay.user.clone(), Ids { uid: 4_000_000, gid: 4_000_000 });
-        let e = t.remove("ufay", "c4", &Files::Delete, |_| Ok(())).unwrap_err();
+        assert!(
+            t.remove("ufay", "c4", &Files::Delete, |_| Err("root".into()))
+                .is_err()
+        );
+        fake.users.lock().unwrap().insert(
+            fay.user.clone(),
+            Ids {
+                uid: 4_000_000,
+                gid: 4_000_000,
+            },
+        );
+        let e = t
+            .remove("ufay", "c4", &Files::Delete, |_| Ok(()))
+            .unwrap_err();
         assert!(e.contains("isn't the user it was"));
         assert!(fay.home.is_dir() && t.known().contains(&"ufay".to_string()));
 
         // While a removal runs, no run or screen of theirs gets their user.
         let leaving = t.start_leaving("ubea").unwrap();
         assert!(t.start_leaving("ubea").is_none());
-        assert!(t.ensure("ubea", |_| Ok(())).unwrap_err().contains("being removed"));
+        assert!(
+            t.ensure("ubea", |_| Ok(()))
+                .unwrap_err()
+                .contains("being removed")
+        );
         drop(leaving);
         assert!(t.ensure("ubea", |_| Ok(())).is_ok());
         let _ = std::fs::remove_dir_all(&d);

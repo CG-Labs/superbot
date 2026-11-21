@@ -64,7 +64,9 @@ pub fn from_env(var: &dyn Fn(&str) -> String, bot_user: bool) -> Result<Option<S
         v => return Err(format!("MACHINE_SCREENS must be on or off, not \"{v}\"")),
     }
     if !bot_user {
-        return Err("MACHINE_SCREENS=on needs MACHINE_BOT_USER=on: a screen never runs as root".into());
+        return Err(
+            "MACHINE_SCREENS=on needs MACHINE_BOT_USER=on: a screen never runs as root".into(),
+        );
     }
     let ports = match var("MACHINE_SCREEN_PORTS").trim() {
         "" => DEFAULT_PORTS,
@@ -75,8 +77,17 @@ pub fn from_env(var: &dyn Fn(&str) -> String, bot_user: bool) -> Result<Option<S
             .ok_or(format!("MACHINE_SCREEN_PORTS must be <first>-<last> within 6900-6999 (the proxy's /screen/ route), not \"{p}\""))?,
     };
     let (width, height) = crate::screen::parse_size(&var("SCREEN_SIZE"));
-    let minutes = var("SCREEN_IDLE_MINUTES").trim().parse::<i64>().unwrap_or(10).clamp(1, 24 * 60);
-    Ok(Some(Settings { ports, width, height, idle_ms: minutes * 60_000 }))
+    let minutes = var("SCREEN_IDLE_MINUTES")
+        .trim()
+        .parse::<i64>()
+        .unwrap_or(10)
+        .clamp(1, 24 * 60);
+    Ok(Some(Settings {
+        ports,
+        width,
+        height,
+        idle_ms: minutes * 60_000,
+    }))
 }
 
 /// Stops the task when dropped.
@@ -121,13 +132,23 @@ impl Shown {
     }
 
     async fn one_at_a_time(&self, bot: &str) -> tokio::sync::OwnedMutexGuard<()> {
-        let m = self.busy.lock().unwrap_or_else(|e| e.into_inner()).entry(bot.to_string()).or_default().clone();
+        let m = self
+            .busy
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(bot.to_string())
+            .or_default()
+            .clone();
         m.lock_owned().await
     }
 
     /// The keys of `bot`'s open screens: its owner's and its teammates'.
     fn keys_of(&self, bot: &str) -> Vec<String> {
-        self.open().iter().filter(|(_, o)| o.bot_id == bot).map(|(k, _)| k.clone()).collect()
+        self.open()
+            .iter()
+            .filter(|(_, o)| o.bot_id == bot)
+            .map(|(k, _)| k.clone())
+            .collect()
     }
 }
 
@@ -166,9 +187,14 @@ impl Why {
 
     fn status(&self) -> StatusCode {
         match self {
-            Why::Route(Refusal::NoMachine | Refusal::NotAssigned | Refusal::Outdated(_) | Refusal::BotUserFailed) | Why::Off | Why::Missing(_) => {
-                StatusCode::CONFLICT
-            }
+            Why::Route(
+                Refusal::NoMachine
+                | Refusal::NotAssigned
+                | Refusal::Outdated(_)
+                | Refusal::BotUserFailed,
+            )
+            | Why::Off
+            | Why::Missing(_) => StatusCode::CONFLICT,
             _ => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
@@ -202,11 +228,17 @@ pub fn fit(e: &Enrollment, hb: &Heartbeat) -> Result<(), Why> {
         super::teammate::fit(hb).map_err(Why::Route)?;
     }
     let report = hb.screens.as_ref().filter(|s| {
-        hb.protocol >= wire::PROTOCOL && hb.can.iter().any(|c| c == wire::CAN_SCREENS) && s.protocol == wire::SCREEN_PROTOCOL
+        hb.protocol >= wire::PROTOCOL
+            && hb.can.iter().any(|c| c == wire::CAN_SCREENS)
+            && s.protocol == wire::SCREEN_PROTOCOL
     });
     let report = report.ok_or_else(|| Why::Route(Refusal::Outdated(hb.version.clone())))?;
     super::botuser::check_run(e, hb).map_err(Why::Route)?;
-    if hb.upgrade.as_ref().is_some_and(|u| u.state == wire::UPGRADE_STAGING) {
+    if hb
+        .upgrade
+        .as_ref()
+        .is_some_and(|u| u.state == wire::UPGRADE_STAGING)
+    {
         return Err(Why::Route(Refusal::Upgrading));
     }
     if !report.missing.is_empty() {
@@ -215,7 +247,14 @@ pub fn fit(e: &Enrollment, hb: &Heartbeat) -> Result<(), Why> {
     Ok(())
 }
 
-fn screen_event(by: &Who, action: &str, machine_id: &str, bot: &str, for_user: Option<&str>, extra: Value) -> Event {
+fn screen_event(
+    by: &Who,
+    action: &str,
+    machine_id: &str,
+    bot: &str,
+    for_user: Option<&str>,
+    extra: Value,
+) -> Event {
     let mut d = json!({ "botId": bot });
     if let Some(u) = for_user {
         d["forUser"] = json!(u);
@@ -223,7 +262,10 @@ fn screen_event(by: &Who, action: &str, machine_id: &str, bot: &str, for_user: O
     if let (Some(d), Value::Object(x)) = (d.as_object_mut(), extra) {
         d.extend(x);
     }
-    by.event(action).target("machine", machine_id).bot(bot).details(d)
+    by.event(action)
+        .target("machine", machine_id)
+        .bot(bot)
+        .details(d)
 }
 
 fn enrollment(app: &App) -> Option<&Arc<Enrollment>> {
@@ -232,9 +274,21 @@ fn enrollment(app: &App) -> Option<&Arc<Enrollment>> {
 
 /// Asks `to`'s agent to start `bot`'s screen (`for_user`'s own, if given) with `token`,
 /// or give it that token.
-async fn put(e: &Enrollment, s: &Settings, to: &Assigned, bot: &str, for_user: Option<&str>, token: &str) -> Result<ScreenReply, Why> {
-    let address = to.address.as_deref().ok_or_else(|| Why::Route(Refusal::Offline("it has no address yet".into())))?;
-    let client = e.upload_client(to.pins.clone(), START_SECS).map_err(|m| Why::Route(Refusal::Offline(m)))?;
+async fn put(
+    e: &Enrollment,
+    s: &Settings,
+    to: &Assigned,
+    bot: &str,
+    for_user: Option<&str>,
+    token: &str,
+) -> Result<ScreenReply, Why> {
+    let address = to
+        .address
+        .as_deref()
+        .ok_or_else(|| Why::Route(Refusal::Offline("it has no address yet".into())))?;
+    let client = e
+        .upload_client(to.pins.clone(), START_SECS)
+        .map_err(|m| Why::Route(Refusal::Offline(m)))?;
     let body = ScreenRequest {
         protocol: wire::SCREEN_PROTOCOL,
         owner_id: to.user_id.clone(),
@@ -250,23 +304,44 @@ async fn put(e: &Enrollment, s: &Settings, to: &Assigned, bot: &str, for_user: O
         .json(&body)
         .send()
         .await
-        .map_err(|err| Why::Route(Refusal::Offline(format!("its agent didn't answer: {}", super::enroll::without_url(err)))))?;
+        .map_err(|err| {
+            Why::Route(Refusal::Offline(format!(
+                "its agent didn't answer: {}",
+                super::enroll::without_url(err)
+            )))
+        })?;
     let code = r.status().as_u16();
     let text = r.text().await.unwrap_or_default();
     if code != 200 {
-        let msg = serde_json::from_str::<wire::ErrorReply>(&text).map(|e| e.error).unwrap_or_else(|_| format!("its agent answered {code}"));
+        let msg = serde_json::from_str::<wire::ErrorReply>(&text)
+            .map(|e| e.error)
+            .unwrap_or_else(|_| format!("its agent answered {code}"));
         return Err(Why::Failed(code, msg));
     }
-    serde_json::from_str(&text).map_err(|_| Why::Failed(502, "its agent's answer wasn't a screen".into()))
+    serde_json::from_str(&text)
+        .map_err(|_| Why::Failed(502, "its agent's answer wasn't a screen".into()))
 }
 
 /// Starts `bot`'s screen on `to` (`for_user`'s own, if given), or keeps it, with the
 /// token botd holds for it (a new one if it has none). One left on another machine, or
 /// for another owner, is closed first. Records the open screen.
 #[allow(clippy::too_many_arguments)]
-async fn ensure(app: &App, e: &Enrollment, s: &Settings, by: &Who, bot: &Bot, for_user: Option<&str>, to: &Assigned, why: &str) -> Result<(ScreenReply, Zeroizing<String>), Why> {
+async fn ensure(
+    app: &App,
+    e: &Enrollment,
+    s: &Settings,
+    by: &Who,
+    bot: &Bot,
+    for_user: Option<&str>,
+    to: &Assigned,
+    why: &str,
+) -> Result<(ScreenReply, Zeroizing<String>), Why> {
     let key = wire::screen_key(&bot.id, for_user);
-    let elsewhere = e.shown.open().get(&key).is_some_and(|o| o.machine_id != to.machine_id || o.owner_id != bot.owner_id);
+    let elsewhere = e
+        .shown
+        .open()
+        .get(&key)
+        .is_some_and(|o| o.machine_id != to.machine_id || o.owner_id != bot.owner_id);
     if elsewhere {
         close_locked(app, e, by, &key, "moved").await;
     }
@@ -274,17 +349,29 @@ async fn ensure(app: &App, e: &Enrollment, s: &Settings, by: &Who, bot: &Bot, fo
     let token = token.unwrap_or_else(|| Zeroizing::new(crate::random_hex(16)));
     crate::secrets::redact::register(&token);
     let reply = put(e, s, to, &bot.id, for_user, &token).await?;
-    if app.db.bot(&bot.id).is_none_or(|b| b.owner_id != bot.owner_id) {
+    if app
+        .db
+        .bot(&bot.id)
+        .is_none_or(|b| b.owner_id != bot.owner_id)
+    {
         let path = agent_path(&bot.id, for_user, "");
         if let Some(m) = app.db.machine(&to.machine_id) {
-            let _ = e.call_agent(app, &m, reqwest::Method::DELETE, &path, &()).await;
+            let _ = e
+                .call_agent(app, &m, reqwest::Method::DELETE, &path, &())
+                .await;
         }
-        return Err(Why::Failed(409, "the Bot was deleted or given to someone else meanwhile".into()));
+        return Err(Why::Failed(
+            409,
+            "the Bot was deleted or given to someone else meanwhile".into(),
+        ));
     }
     let at = now();
     {
         let mut open = e.shown.open();
-        match open.get_mut(&key).filter(|o| o.machine_id == to.machine_id && o.token == token) {
+        match open
+            .get_mut(&key)
+            .filter(|o| o.machine_id == to.machine_id && o.token == token)
+        {
             Some(o) => o.used = at,
             None => drop(open.insert(
                 key.clone(),
@@ -305,21 +392,37 @@ async fn ensure(app: &App, e: &Enrollment, s: &Settings, by: &Who, bot: &Bot, fo
         }
     }
     if reply.started {
-        app.db.record(&screen_event(by, "machine.screen_started", &to.machine_id, &bot.id, for_user, json!({ "display": reply.display, "for": why })));
+        app.db.record(&screen_event(
+            by,
+            "machine.screen_started",
+            &to.machine_id,
+            &bot.id,
+            for_user,
+            json!({ "display": reply.display, "for": why }),
+        ));
     }
     Ok((reply, token))
 }
 
 /// Where `bot` is shown, if its owner's Bots run on a machine: `Ok(None)` when they run
 /// on this server. Never this server's display for a Bot routed to a machine.
-pub async fn target(app: &App, bot: &Bot) -> Result<Option<(Arc<Enrollment>, Settings, Assigned)>, Why> {
-    let Some(cp) = app.control_plane.get() else { return Ok(None) };
+pub async fn target(
+    app: &App,
+    bot: &Bot,
+) -> Result<Option<(Arc<Enrollment>, Settings, Assigned)>, Why> {
+    let Some(cp) = app.control_plane.get() else {
+        return Ok(None);
+    };
     let to = match cp.route(&app.db, &bot.owner_id) {
         Ok(Target::Local) => return Ok(None),
         Ok(Target::Machine(to)) => to,
         Err(r) => return Err(Why::Route(r)),
     };
-    let e = cp.enrollment.clone().ok_or_else(|| Why::Route(Refusal::Offline("machine enrollment is off on this server".into())))?;
+    let e = cp.enrollment.clone().ok_or_else(|| {
+        Why::Route(Refusal::Offline(
+            "machine enrollment is off on this server".into(),
+        ))
+    })?;
     let s = e.screens.clone().ok_or(Why::Off)?;
     Ok(Some((e, s, to)))
 }
@@ -330,10 +433,20 @@ pub async fn target(app: &App, bot: &Bot) -> Result<Option<(Arc<Enrollment>, Set
 /// `still` checks it again once no new token for it is under way, before anything starts:
 /// a revocation that finished meanwhile must not hand out the new token. `for_user`: the
 /// teammate whose own screen of it this is (ADR 0048), made their user there if need be.
-pub async fn open(app: &AppState, by: &Who, bot: &Bot, for_user: Option<&str>, still: impl Fn() -> Res<()>) -> Res<Option<String>> {
+pub async fn open(
+    app: &AppState,
+    by: &Who,
+    bot: &Bot,
+    for_user: Option<&str>,
+    still: impl Fn() -> Res<()>,
+) -> Res<Option<String>> {
     let refused = |machine: Option<&str>, w: Why| {
         let d = json!({ "reason": w.reason(), "owner": bot.owner_id, "machine": machine, "forUser": for_user });
-        let e = by.event("machine.screen_refused").bot(&bot.id).outcome(Outcome::Denied).details(d);
+        let e = by
+            .event("machine.screen_refused")
+            .bot(&bot.id)
+            .outcome(Outcome::Denied)
+            .details(d);
         app.db.record(&match machine {
             Some(m) => e.target("machine", m),
             None => e.target("bot", &bot.id),
@@ -347,42 +460,83 @@ pub async fn open(app: &AppState, by: &Who, bot: &Bot, for_user: Option<&str>, s
     };
     let _one = e.shown.one_at_a_time(&bot.id).await;
     still()?;
-    let hb = super::enroll::check(app, &e, &to).await.map_err(|m| refused(Some(&to.machine_id), Why::Route(Refusal::Offline(m))))?;
+    let hb = super::enroll::check(app, &e, &to)
+        .await
+        .map_err(|m| refused(Some(&to.machine_id), Why::Route(Refusal::Offline(m))))?;
     fit(&e, &hb).map_err(|w| refused(Some(&to.machine_id), w))?;
     if let Some(u) = for_user {
-        let t = super::teammate::ask(&e, &to, u).await.map_err(|m| refused(Some(&to.machine_id), Why::Route(Refusal::TeammateUserFailed(m))))?;
+        let t = super::teammate::ask(&e, &to, u).await.map_err(|m| {
+            refused(
+                Some(&to.machine_id),
+                Why::Route(Refusal::TeammateUserFailed(m)),
+            )
+        })?;
         if t.created {
             let d = json!({ "owner": bot.owner_id, "forUser": u, "user": t.user, "uid": t.uid });
-            app.db.record(&by.event("machine.teammate_user_created").target("machine", &to.machine_id).bot(&bot.id).details(d));
+            app.db.record(
+                &by.event("machine.teammate_user_created")
+                    .target("machine", &to.machine_id)
+                    .bot(&bot.id)
+                    .details(d),
+            );
         }
         super::offboard::seen(app, &to.machine_id, u);
     }
-    let (reply, token) = ensure(app, &e, &s, by, bot, for_user, &to, "viewer").await.map_err(|w| refused(Some(&to.machine_id), w))?;
+    let (reply, token) = ensure(app, &e, &s, by, bot, for_user, &to, "viewer")
+        .await
+        .map_err(|w| refused(Some(&to.machine_id), w))?;
     let viewer = by.actor.id.clone().unwrap_or_default();
     let key = wire::screen_key(&bot.id, for_user);
-    let (port, first) = listen(app, &e, &s, &key, &viewer).map_err(|w| refused(Some(&to.machine_id), w))?;
+    let (port, first) =
+        listen(app, &e, &s, &key, &viewer).map_err(|w| refused(Some(&to.machine_id), w))?;
     if first {
         let d = json!({ "port": port, "display": reply.display, "viewer": viewer });
-        app.db.record(&screen_event(by, "machine.screen_opened", &to.machine_id, &bot.id, for_user, d));
+        app.db.record(&screen_event(
+            by,
+            "machine.screen_opened",
+            &to.machine_id,
+            &bot.id,
+            for_user,
+            d,
+        ));
     }
     Ok(Some(format!("/screen/{port}/?token={}", token.as_str())))
 }
 
 /// botd's loopback port for the open screen under `key`, listening from now if it
 /// wasn't; and whether `viewer` is new to it.
-fn listen(app: &AppState, e: &Enrollment, s: &Settings, key: &str, viewer: &str) -> Result<(u16, bool), Why> {
+fn listen(
+    app: &AppState,
+    e: &Enrollment,
+    s: &Settings,
+    key: &str,
+    viewer: &str,
+) -> Result<(u16, bool), Why> {
     let mut open = e.shown.open();
-    let taken: Vec<u16> = open.values().filter_map(|o| o.port.as_ref().map(|p| p.0)).collect();
-    let o = open.get_mut(key).ok_or_else(|| Why::Failed(503, "it closed meanwhile".into()))?;
+    let taken: Vec<u16> = open
+        .values()
+        .filter_map(|o| o.port.as_ref().map(|p| p.0))
+        .collect();
+    let o = open
+        .get_mut(key)
+        .ok_or_else(|| Why::Failed(503, "it closed meanwhile".into()))?;
     o.used = now();
     if o.port.is_none() {
         let l = (s.ports.0..=s.ports.1)
             .filter(|p| !taken.contains(p))
-            .find_map(|p| std::net::TcpListener::bind(("127.0.0.1", p)).ok().map(|l| (p, l)));
+            .find_map(|p| {
+                std::net::TcpListener::bind(("127.0.0.1", p))
+                    .ok()
+                    .map(|l| (p, l))
+            });
         let (port, l) = l.ok_or(Why::NoPort)?;
-        l.set_nonblocking(true).map_err(|err| Why::Failed(500, err.to_string()))?;
+        l.set_nonblocking(true)
+            .map_err(|err| Why::Failed(500, err.to_string()))?;
         let l = TcpListener::from_std(l).map_err(|err| Why::Failed(500, err.to_string()))?;
-        o.port = Some((port, Abort(tokio::spawn(accept(app.clone(), key.to_string(), l)))));
+        o.port = Some((
+            port,
+            Abort(tokio::spawn(accept(app.clone(), key.to_string(), l))),
+        ));
     }
     let port = o.port.as_ref().map_or(0, |p| p.0);
     Ok((port, o.viewers.insert(viewer.to_string())))
@@ -405,7 +559,9 @@ async fn accept(app: AppState, key: String, l: TcpListener) {
 
 /// Whether the teammate a screen is for can still operate its Bot (ADR 0048).
 fn still_theirs(app: &App, bot: &Bot, for_user: Option<&str>) -> bool {
-    for_user.is_none_or(|u| crate::acl::Viewer::person(&app.db, u).access(&app.db, bot) >= crate::acl::Access::Operate)
+    for_user.is_none_or(|u| {
+        crate::acl::Viewer::person(&app.db, u).access(&app.db, bot) >= crate::acl::Access::Operate
+    })
 }
 
 /// One viewer connection, piped to the Bot's voxl through its machine's agent. Checked
@@ -416,11 +572,21 @@ async fn tunnel(app: &AppState, key: &str, mut tcp: TcpStream) -> Result<(), Str
     let (bot, for_user, machine_id, owner, mut cut, tunnels) = {
         let open = e.shown.open();
         let o = open.get(key).ok_or("it isn't open")?;
-        (o.bot_id.clone(), o.for_user.clone(), o.machine_id.clone(), o.owner_id.clone(), o.cut.subscribe(), o.tunnels.clone())
+        (
+            o.bot_id.clone(),
+            o.for_user.clone(),
+            o.machine_id.clone(),
+            o.owner_id.clone(),
+            o.cut.subscribe(),
+            o.tunnels.clone(),
+        )
     };
     let bot = bot.as_str();
     let here = app.db.bot(bot).filter(|b| b.owner_id == owner);
-    if here.as_ref().is_some_and(|b| !still_theirs(app, b, for_user.as_deref())) {
+    if here
+        .as_ref()
+        .is_some_and(|b| !still_theirs(app, b, for_user.as_deref()))
+    {
         close_key(app, &Who::system("control_plane"), bot, key, "access_lost").await;
         return Err("the teammate it's for can no longer use its Bot".into());
     }
@@ -439,11 +605,21 @@ async fn tunnel(app: &AppState, key: &str, mut tcp: TcpStream) -> Result<(), Str
         .header(header::UPGRADE, wire::SCREEN_UPGRADE)
         .send()
         .await
-        .map_err(|err| format!("its agent didn't answer: {}", super::enroll::without_url(err)))?;
+        .map_err(|err| {
+            format!(
+                "its agent didn't answer: {}",
+                super::enroll::without_url(err)
+            )
+        })?;
     if r.status() != StatusCode::SWITCHING_PROTOCOLS {
         return Err(format!("its agent answered {}", r.status().as_u16()));
     }
-    let mut up = r.upgrade().await.map_err(|err| format!("the tunnel didn't open: {}", super::enroll::without_url(err)))?;
+    let mut up = r.upgrade().await.map_err(|err| {
+        format!(
+            "the tunnel didn't open: {}",
+            super::enroll::without_url(err)
+        )
+    })?;
     struct Count(Arc<AtomicUsize>);
     impl Drop for Count {
         fn drop(&mut self) {
@@ -471,14 +647,25 @@ pub async fn hold_for_tests(e: &Enrollment, bot: &str) -> tokio::sync::OwnedMute
 /// The screen's environment for a run of `bot` on `to`, starting it there if need be:
 /// `for_user`'s own, for a teammate's run as their own user (ADR 0048). None when
 /// screens are off or the machine can't show one: the Bot runs without.
-pub async fn for_run(app: &App, bot: &Bot, for_user: Option<&str>, to: &Assigned, state_dir: &std::path::Path) -> Option<HashMap<String, String>> {
+pub async fn for_run(
+    app: &App,
+    bot: &Bot,
+    for_user: Option<&str>,
+    to: &Assigned,
+    state_dir: &std::path::Path,
+) -> Option<HashMap<String, String>> {
     let e = enrollment(app)?.clone();
     let s = e.screens.clone()?;
     let _one = e.shown.one_at_a_time(&bot.id).await;
     let by = Who::system("runner");
     match ensure(app, &e, &s, &by, bot, for_user, to, "run").await {
         Ok((reply, _)) => {
-            let info = crate::screen::Info { display: reply.display, bus: reply.bus, port: 0, token: String::new() };
+            let info = crate::screen::Info {
+                display: reply.display,
+                bus: reply.bus,
+                port: 0,
+                token: String::new(),
+            };
             let mut env = crate::screen::bot_env(&info, &bot.id, state_dir);
             if let Some(x) = reply.xauthority {
                 env.insert("XAUTHORITY".into(), x);
@@ -486,7 +673,12 @@ pub async fn for_run(app: &App, bot: &Bot, for_user: Option<&str>, to: &Assigned
             Some(env)
         }
         Err(w) => {
-            eprintln!("Screen of Bot {} on machine {}: {}", bot.id, to.machine_id, w.message());
+            eprintln!(
+                "Screen of Bot {} on machine {}: {}",
+                bot.id,
+                to.machine_id,
+                w.message()
+            );
             None
         }
     }
@@ -496,7 +688,9 @@ pub async fn for_run(app: &App, bot: &Bot, for_user: Option<&str>, to: &Assigned
 /// open viewer is cut off. botd stops showing the old token at once; the machine is
 /// told now, or at the next open.
 pub async fn rotate(app: &App, bot: &str) {
-    let Some(e) = enrollment(app).cloned() else { return };
+    let Some(e) = enrollment(app).cloned() else {
+        return;
+    };
     let _one = e.shown.one_at_a_time(bot).await;
     for key in e.shown.keys_of(bot) {
         rotate_key(app, &e, bot, &key).await;
@@ -504,8 +698,14 @@ pub async fn rotate(app: &App, bot: &str) {
 }
 
 async fn rotate_key(app: &App, e: &Enrollment, bot: &str, key: &str) {
-    let open = e.shown.open().get(key).map(|o| (o.owner_id.clone(), o.for_user.clone()));
-    let Some((owner, for_user)) = open else { return };
+    let open = e
+        .shown
+        .open()
+        .get(key)
+        .map(|o| (o.owner_id.clone(), o.for_user.clone()));
+    let Some((owner, for_user)) = open else {
+        return;
+    };
     let by = Who::system("control_plane");
     let Some(b) = app.db.bot(bot).filter(|b| b.owner_id == owner) else {
         close_locked(app, e, &by, key, "moved").await;
@@ -529,18 +729,34 @@ async fn rotate_key(app: &App, e: &Enrollment, bot: &str, key: &str) {
     };
     let told = match (e.screens.clone(), app.db.machine(&machine)) {
         (Some(s), Some(m)) => {
-            let to = Assigned { machine_id: m.id.clone(), user_id: m.user_id.clone(), address: m.ipv4.clone(), pins: app.db.machine_pins(&m.id) };
-            put(e, &s, &to, &b.id, for_user.as_deref(), &token).await.is_ok()
+            let to = Assigned {
+                machine_id: m.id.clone(),
+                user_id: m.user_id.clone(),
+                address: m.ipv4.clone(),
+                pins: app.db.machine_pins(&m.id),
+            };
+            put(e, &s, &to, &b.id, for_user.as_deref(), &token)
+                .await
+                .is_ok()
         }
         _ => false,
     };
-    app.db.record(&screen_event(&by, "machine.screen_rotated", &machine, bot, for_user.as_deref(), json!({ "machineTold": told })));
+    app.db.record(&screen_event(
+        &by,
+        "machine.screen_rotated",
+        &machine,
+        bot,
+        for_user.as_deref(),
+        json!({ "machineTold": told }),
+    ));
 }
 
 /// Stops showing `bot`'s machine screens, its owner's and its teammates', and asks its
 /// agent to stop them, after any start or new token for it under way.
 pub async fn close(app: &App, by: &Who, bot: &str, reason: &str) -> bool {
-    let Some(e) = enrollment(app).cloned() else { return false };
+    let Some(e) = enrollment(app).cloned() else {
+        return false;
+    };
     let _one = e.shown.one_at_a_time(bot).await;
     let mut closed = false;
     for key in e.shown.keys_of(bot) {
@@ -551,14 +767,22 @@ pub async fn close(app: &App, by: &Who, bot: &str, reason: &str) -> bool {
 
 /// `close` for one of `bot`'s screens.
 async fn close_key(app: &App, by: &Who, bot: &str, key: &str, reason: &str) -> bool {
-    let Some(e) = enrollment(app).cloned() else { return false };
+    let Some(e) = enrollment(app).cloned() else {
+        return false;
+    };
     let _one = e.shown.one_at_a_time(bot).await;
     close_locked(app, &e, by, key, reason).await
 }
 
 /// Closes `user_id`'s own screens on the machine, when they leave it (ADR 0052). How
 /// many it closed.
-pub async fn close_for(app: &App, by: &Who, machine_id: &str, user_id: &str, reason: &str) -> usize {
+pub async fn close_for(
+    app: &App,
+    by: &Who,
+    machine_id: &str,
+    user_id: &str,
+    reason: &str,
+) -> usize {
     let Some(e) = enrollment(app) else { return 0 };
     let theirs: Vec<(String, String)> = e
         .shown
@@ -580,21 +804,40 @@ pub async fn close_for(app: &App, by: &Who, machine_id: &str, user_id: &str, rea
 pub async fn rotate_all(app: &App) {
     let Some(e) = enrollment(app) else { return };
     let mut bots: BTreeSet<String> = e.shown.open().values().map(|o| o.bot_id.clone()).collect();
-    bots.extend(e.shown.busy.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned());
+    bots.extend(
+        e.shown
+            .busy
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned(),
+    );
     for bot in bots {
         rotate(app, &bot).await;
     }
 }
 
 async fn close_locked(app: &App, e: &Enrollment, by: &Who, key: &str, reason: &str) -> bool {
-    let Some(o) = e.shown.open().remove(key) else { return false };
+    let Some(o) = e.shown.open().remove(key) else {
+        return false;
+    };
     let path = agent_path(&o.bot_id, o.for_user.as_deref(), "");
     let stopped = match app.db.machine(&o.machine_id) {
-        Some(m) => e.call_agent(app, &m, reqwest::Method::DELETE, &path, &()).await.is_ok_and(|(c, _)| c == 204 || c == 404),
+        Some(m) => e
+            .call_agent(app, &m, reqwest::Method::DELETE, &path, &())
+            .await
+            .is_ok_and(|(c, _)| c == 204 || c == 404),
         None => false,
     };
     let d = json!({ "reason": reason, "openMs": now() - o.since, "machineStopped": stopped });
-    app.db.record(&screen_event(by, "machine.screen_closed", &o.machine_id, &o.bot_id, o.for_user.as_deref(), d));
+    app.db.record(&screen_event(
+        by,
+        "machine.screen_closed",
+        &o.machine_id,
+        &o.bot_id,
+        o.for_user.as_deref(),
+        d,
+    ));
     true
 }
 
@@ -602,7 +845,9 @@ async fn close_locked(app: &App, e: &Enrollment, by: &Who, key: &str, reason: &s
 /// owner left that machine, and teammates' whose teammate lost the Bot. After every
 /// round of heartbeats.
 pub async fn reap(app: &App) {
-    let Some(e) = enrollment(app).cloned() else { return };
+    let Some(e) = enrollment(app).cloned() else {
+        return;
+    };
     let Some(s) = e.screens.clone() else { return };
     let at = now();
     let due: Vec<(String, String, &'static str)> = {
@@ -636,10 +881,18 @@ pub async fn reap(app: &App) {
 /// `GET /api/users/{key}/machine/screens`: the user's Bots' screens botd shows from
 /// their machine, and what its agent last said of screens.
 pub async fn list(AppS(app): AppS<AppState>, Path(key): Path<String>) -> Res {
-    let cp = app.control_plane.get().ok_or_else(|| ApiError(StatusCode::SERVICE_UNAVAILABLE, super::NOT_CONFIGURED.into()))?;
+    let cp = app.control_plane.get().ok_or_else(|| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            super::NOT_CONFIGURED.into(),
+        )
+    })?;
     let e = super::enroll::need(cp)?;
     let u = need_user_key(&app, &key)?;
-    let m = app.db.user_machine(&u.id).ok_or_else(|| crate::not_found("Machine"))?;
+    let m = app
+        .db
+        .user_machine(&u.id)
+        .ok_or_else(|| crate::not_found("Machine"))?;
     let screens: Vec<Value> = {
         let open = e.shown.open();
         let mut v: Vec<Value> = open
@@ -652,11 +905,20 @@ pub async fn list(AppS(app): AppS<AppState>, Path(key): Path<String>) -> Res {
                 })
             })
             .collect();
-        v.sort_by(|a, b| (a["botId"].as_str(), a["forUser"].as_str()).cmp(&(b["botId"].as_str(), b["forUser"].as_str())));
+        v.sort_by(|a, b| {
+            (a["botId"].as_str(), a["forUser"].as_str())
+                .cmp(&(b["botId"].as_str(), b["forUser"].as_str()))
+        });
         v
     };
-    let agent = m.agent_upkeep.as_ref().map(|u| u["screens"].clone()).unwrap_or(Value::Null);
-    Ok(Json(json!({ "machineId": m.id, "on": e.screens.is_some(), "screens": screens, "agent": agent })))
+    let agent = m
+        .agent_upkeep
+        .as_ref()
+        .map(|u| u["screens"].clone())
+        .unwrap_or(Value::Null);
+    Ok(Json(
+        json!({ "machineId": m.id, "on": e.screens.is_some(), "screens": screens, "agent": agent }),
+    ))
 }
 
 /// `DELETE /api/users/{key}/machine/screens/{bot}`: stops showing a Bot's screens, its
@@ -666,13 +928,22 @@ pub async fn close_now(
     axum::extract::Extension(by): axum::extract::Extension<Who>,
     Path((key, bot)): Path<(String, String)>,
 ) -> Res<StatusCode> {
-    let cp = app.control_plane.get().ok_or_else(|| ApiError(StatusCode::SERVICE_UNAVAILABLE, super::NOT_CONFIGURED.into()))?;
+    let cp = app.control_plane.get().ok_or_else(|| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            super::NOT_CONFIGURED.into(),
+        )
+    })?;
     let e = super::enroll::need(cp)?;
     if e.screens.is_none() {
         return Err(ApiError(StatusCode::CONFLICT, OFF.into()));
     }
     let u = need_user_key(&app, &key)?;
-    let mine = e.shown.open().values().any(|o| o.bot_id == bot && o.owner_id == u.id);
+    let mine = e
+        .shown
+        .open()
+        .values()
+        .any(|o| o.bot_id == bot && o.owner_id == u.id);
     if !mine {
         return Err(crate::not_found("Screen"));
     }
@@ -695,25 +966,54 @@ mod tests {
     use super::*;
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> String {
-        let m: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let m: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         move |k| m.get(k).cloned().unwrap_or_default()
     }
 
     #[test]
     fn settings_are_off_by_default_and_need_the_bots_own_user() {
         assert_eq!(from_env(&env(&[]), true), Ok(None));
-        assert_eq!(from_env(&env(&[("MACHINE_SCREENS", "off")]), false), Ok(None));
+        assert_eq!(
+            from_env(&env(&[("MACHINE_SCREENS", "off")]), false),
+            Ok(None)
+        );
         let e = from_env(&env(&[("MACHINE_SCREENS", "on")]), false).unwrap_err();
         assert!(e.contains("MACHINE_BOT_USER=on"), "{e}");
         assert!(from_env(&env(&[("MACHINE_SCREENS", "yes")]), true).is_err());
-        let s = from_env(&env(&[("MACHINE_SCREENS", "on")]), true).unwrap().unwrap();
-        assert_eq!((s.ports, s.width, s.height, s.idle_ms), (DEFAULT_PORTS, 1280, 800, 600_000));
-        let s = from_env(&env(&[("MACHINE_SCREENS", "on"), ("MACHINE_SCREEN_PORTS", "6950-6955"), ("SCREEN_SIZE", "1024x768"), ("SCREEN_IDLE_MINUTES", "3")]), true)
+        let s = from_env(&env(&[("MACHINE_SCREENS", "on")]), true)
             .unwrap()
             .unwrap();
-        assert_eq!((s.ports, s.width, s.height, s.idle_ms), ((6950, 6955), 1024, 768, 180_000));
+        assert_eq!(
+            (s.ports, s.width, s.height, s.idle_ms),
+            (DEFAULT_PORTS, 1280, 800, 600_000)
+        );
+        let s = from_env(
+            &env(&[
+                ("MACHINE_SCREENS", "on"),
+                ("MACHINE_SCREEN_PORTS", "6950-6955"),
+                ("SCREEN_SIZE", "1024x768"),
+                ("SCREEN_IDLE_MINUTES", "3"),
+            ]),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (s.ports, s.width, s.height, s.idle_ms),
+            ((6950, 6955), 1024, 768, 180_000)
+        );
         for bad in ["7000-7010", "6990-6980", "6950", "a-b", "6899-6950"] {
-            assert!(from_env(&env(&[("MACHINE_SCREENS", "on"), ("MACHINE_SCREEN_PORTS", bad)]), true).is_err(), "{bad}");
+            assert!(
+                from_env(
+                    &env(&[("MACHINE_SCREENS", "on"), ("MACHINE_SCREEN_PORTS", bad)]),
+                    true
+                )
+                .is_err(),
+                "{bad}"
+            );
         }
     }
 
@@ -722,8 +1022,15 @@ mod tests {
             version: "0.2.0".into(),
             protocol: wire::PROTOCOL,
             can: vec![wire::CAN_BOT_USER.into(), wire::CAN_SCREENS.into()],
-            bot_user: Some(wire::BotUserStatus { state: wire::BOT_USER_READY.into(), ..Default::default() }),
-            screens: Some(wire::ScreenReport { protocol: wire::SCREEN_PROTOCOL, max: 4, ..Default::default() }),
+            bot_user: Some(wire::BotUserStatus {
+                state: wire::BOT_USER_READY.into(),
+                ..Default::default()
+            }),
+            screens: Some(wire::ScreenReport {
+                protocol: wire::SCREEN_PROTOCOL,
+                max: 4,
+                ..Default::default()
+            }),
             ..Default::default()
         }
     }
@@ -733,17 +1040,72 @@ mod tests {
         let e = Enrollment::for_tests(1, 1, 1).with_bot_user();
         assert_eq!(fit(&e, &hb()), Ok(()));
         let outdated = Err(Why::Route(Refusal::Outdated("0.2.0".into())));
-        assert_eq!(fit(&e, &Heartbeat { screens: None, ..hb() }), outdated, "from before screens");
-        assert_eq!(fit(&e, &Heartbeat { can: vec![wire::CAN_BOT_USER.into()], ..hb() }), outdated);
-        let other = wire::ScreenReport { protocol: wire::SCREEN_PROTOCOL + 1, ..Default::default() };
-        assert_eq!(fit(&e, &Heartbeat { screens: Some(other), ..hb() }), outdated, "another screen protocol");
-        let pending = Heartbeat { bot_user: None, ..hb() };
+        assert_eq!(
+            fit(
+                &e,
+                &Heartbeat {
+                    screens: None,
+                    ..hb()
+                }
+            ),
+            outdated,
+            "from before screens"
+        );
+        assert_eq!(
+            fit(
+                &e,
+                &Heartbeat {
+                    can: vec![wire::CAN_BOT_USER.into()],
+                    ..hb()
+                }
+            ),
+            outdated
+        );
+        let other = wire::ScreenReport {
+            protocol: wire::SCREEN_PROTOCOL + 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            fit(
+                &e,
+                &Heartbeat {
+                    screens: Some(other),
+                    ..hb()
+                }
+            ),
+            outdated,
+            "another screen protocol"
+        );
+        let pending = Heartbeat {
+            bot_user: None,
+            ..hb()
+        };
         assert_eq!(fit(&e, &pending), Err(Why::Route(Refusal::BotUserPending)));
-        let missing = wire::ScreenReport { protocol: wire::SCREEN_PROTOCOL, missing: vec!["voxl".into()], ..Default::default() };
-        let w = fit(&e, &Heartbeat { screens: Some(missing), ..hb() }).unwrap_err();
-        assert_eq!((w.reason(), w.status()), ("screen_stack_missing", StatusCode::CONFLICT));
+        let missing = wire::ScreenReport {
+            protocol: wire::SCREEN_PROTOCOL,
+            missing: vec!["voxl".into()],
+            ..Default::default()
+        };
+        let w = fit(
+            &e,
+            &Heartbeat {
+                screens: Some(missing),
+                ..hb()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            (w.reason(), w.status()),
+            ("screen_stack_missing", StatusCode::CONFLICT)
+        );
         assert!(w.message().contains("missing voxl"), "{}", w.message());
-        let staging = Heartbeat { upgrade: Some(wire::UpgradeReport { state: wire::UPGRADE_STAGING.into(), ..Default::default() }), ..hb() };
+        let staging = Heartbeat {
+            upgrade: Some(wire::UpgradeReport {
+                state: wire::UPGRADE_STAGING.into(),
+                ..Default::default()
+            }),
+            ..hb()
+        };
         assert_eq!(fit(&e, &staging), Err(Why::Route(Refusal::Upgrading)));
     }
 }

@@ -72,7 +72,10 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { files: Files::Archive, grace_days: 7 }
+        Settings {
+            files: Files::Archive,
+            grace_days: 7,
+        }
     }
 }
 
@@ -85,18 +88,32 @@ impl Settings {
 
     /// The same, from `files` and `days` (ISOLATION_TEAMMATE_FILES and _DAYS on one
     /// server, ADR 0066).
-    pub fn from_vars(var: &dyn Fn(&str) -> String, files_key: &str, days_key: &str) -> Result<Settings, String> {
+    pub fn from_vars(
+        var: &dyn Fn(&str) -> String,
+        files_key: &str,
+        days_key: &str,
+    ) -> Result<Settings, String> {
         let files = match var(files_key).trim() {
             "" | "archive" => Files::Archive,
             "delete" => Files::Delete,
-            v => return Err(format!("{files_key} must be archive or delete, not \"{v}\"")),
+            v => {
+                return Err(format!(
+                    "{files_key} must be archive or delete, not \"{v}\""
+                ));
+            }
         };
         let grace_days = match var(days_key).trim() {
             "" => 7,
-            d => d.parse::<u32>().ok().filter(|d| *d <= 365).ok_or(format!("{days_key} must be 0 to 365, not \"{d}\""))?,
+            d => d
+                .parse::<u32>()
+                .ok()
+                .filter(|d| *d <= 365)
+                .ok_or(format!("{days_key} must be 0 to 365, not \"{d}\""))?,
         };
         if files == Files::Archive && !var(days_key).trim().is_empty() {
-            return Err(format!("{days_key} needs {files_key}=delete: archived work is kept"));
+            return Err(format!(
+                "{days_key} needs {files_key}=delete: archived work is kept"
+            ));
         }
         Ok(Settings { files, grace_days })
     }
@@ -136,7 +153,9 @@ impl Working {
     }
 
     pub(crate) fn take(&self, id: &str) -> Option<Taken<'_>> {
-        self.lock().insert(id.to_string()).then(|| Taken(self, id.to_string()))
+        self.lock()
+            .insert(id.to_string())
+            .then(|| Taken(self, id.to_string()))
     }
 }
 
@@ -151,7 +170,12 @@ pub fn wanted(app: &App, owner_id: &str, user_id: &str) -> bool {
         return false;
     }
     let v = Viewer::person(&app.db, user_id);
-    v != Viewer::Nobody && app.db.bots().iter().any(|b| b.owner_id == owner_id && v.access(&app.db, b) >= Access::Operate)
+    v != Viewer::Nobody
+        && app
+            .db
+            .bots()
+            .iter()
+            .any(|b| b.owner_id == owner_id && v.access(&app.db, b) >= Access::Operate)
 }
 
 /// Why `user_id` no longer has a user on a machine, as best botd can tell.
@@ -168,14 +192,20 @@ fn known(m: &Machine) -> Vec<String> {
     m.agent_upkeep
         .as_ref()
         .and_then(|v| v["teammates"].as_array())
-        .map(|a| a.iter().filter_map(|u| u.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|u| u.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 /// Changes the teammates `m`'s agent is known to have, until a heartbeat says.
 fn edit_known(app: &App, machine_id: &str, f: impl Fn(&mut Vec<String>)) {
     for _ in 0..3 {
-        let Some(m) = app.db.machine(machine_id) else { return };
+        let Some(m) = app.db.machine(machine_id) else {
+            return;
+        };
         let mut list = known(&m);
         let before = list.clone();
         f(&mut list);
@@ -184,7 +214,10 @@ fn edit_known(app: &App, machine_id: &str, f: impl Fn(&mut Vec<String>)) {
         }
         let mut v = m.agent_upkeep.clone().unwrap_or_else(|| json!({}));
         v["teammates"] = json!(list);
-        if app.db.machine_upkeep_swap(machine_id, m.agent_upkeep.as_ref(), &v) {
+        if app
+            .db
+            .machine_upkeep_swap(machine_id, m.agent_upkeep.as_ref(), &v)
+        {
             return;
         }
     }
@@ -205,7 +238,14 @@ fn live(m: &Machine) -> bool {
 }
 
 /// Queues `user_id`'s removal from `m`, unless one is pending; audited when new.
-fn queue(app: &App, e: &Enrollment, by: &Who, m: &Machine, user_id: &str, reason: &str) -> Option<(TeammateCleanup, bool)> {
+fn queue(
+    app: &App,
+    e: &Enrollment,
+    by: &Who,
+    m: &Machine,
+    user_id: &str,
+    reason: &str,
+) -> Option<(TeammateCleanup, bool)> {
     let s = &e.offboard;
     let (row, made) = app.db.teammate_cleanup_queue(&NewTeammateCleanup {
         machine_id: &m.id,
@@ -214,16 +254,32 @@ fn queue(app: &App, e: &Enrollment, by: &Who, m: &Machine, user_id: &str, reason
         os_user: &wire::teammate_user(user_id),
         reason,
         files: s.files.as_str(),
-        grace_days: if s.files == Files::Delete { s.grace_days as i64 } else { 0 },
+        grace_days: if s.files == Files::Delete {
+            s.grace_days as i64
+        } else {
+            0
+        },
         created_by: by.actor.id.as_deref(),
     })?;
     if made {
-        app.db.record(&cleanup_event(by, "machine.teammate_removal_queued", m, &row, json!({})));
+        app.db.record(&cleanup_event(
+            by,
+            "machine.teammate_removal_queued",
+            m,
+            &row,
+            json!({}),
+        ));
     }
     Some((row, made))
 }
 
-fn cleanup_event(by: &Who, action: &str, m: &Machine, row: &TeammateCleanup, extra: Value) -> crate::audit::Event {
+fn cleanup_event(
+    by: &Who,
+    action: &str,
+    m: &Machine,
+    row: &TeammateCleanup,
+    extra: Value,
+) -> crate::audit::Event {
     let mut d = json!({ "forUser": row.user_id, "user": row.os_user, "reason": row.reason, "files": row.files, "cleanupId": row.id });
     if let (Some(d), Value::Object(x)) = (d.as_object_mut(), extra) {
         d.extend(x);
@@ -241,7 +297,16 @@ fn sweep(app: &App, e: &Enrollment, by: &Who, m: &Machine, only: Option<(&str, &
         .iter()
         .filter(|u| only.is_none_or(|(o, _)| o == u.as_str()))
         .filter(|u| **u != m.user_id && !wanted(app, &m.user_id, u))
-        .filter_map(|u| queue(app, e, by, m, u, only.map_or_else(|| reason_for(app, u), |(_, r)| r)))
+        .filter_map(|u| {
+            queue(
+                app,
+                e,
+                by,
+                m,
+                u,
+                only.map_or_else(|| reason_for(app, u), |(_, r)| r),
+            )
+        })
         .filter(|(_, made)| *made)
         .count()
 }
@@ -249,7 +314,9 @@ fn sweep(app: &App, e: &Enrollment, by: &Who, m: &Machine, only: Option<(&str, &
 /// Tries what's pending now, in the background, so heartbeats never wait on a slow
 /// agent. One pass runs at a time; a kick during it runs another after.
 fn kick(app: &AppState) {
-    let Some(e) = enrollment(app).cloned() else { return };
+    let Some(e) = enrollment(app).cloned() else {
+        return;
+    };
     e.offboarding.again.store(true, Ordering::SeqCst);
     if e.offboarding.running.swap(true, Ordering::SeqCst) {
         return;
@@ -274,7 +341,9 @@ fn kick(app: &AppState) {
 pub async fn settled(app: &App) {
     let Some(e) = enrollment(app) else { return };
     for _ in 0..3000 {
-        if !e.offboarding.running.load(Ordering::SeqCst) && !e.offboarding.again.load(Ordering::SeqCst) {
+        if !e.offboarding.running.load(Ordering::SeqCst)
+            && !e.offboarding.again.load(Ordering::SeqCst)
+        {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -303,7 +372,9 @@ pub fn left(app: &AppState, by: &Who, user_id: &str, reason: &str) {
 pub fn check_owner(app: &AppState, by: &Who, owner_id: &str) {
     crate::teammate_removals::check_owner(app, by, owner_id);
     let Some(e) = enrollment(app) else { return };
-    let Some(m) = app.db.user_machine(owner_id) else { return };
+    let Some(m) = app.db.user_machine(owner_id) else {
+        return;
+    };
     if sweep(app, e, by, &m, None) > 0 {
         kick(app);
     }
@@ -319,7 +390,9 @@ pub fn follow_up(app: &AppState) {
     }
     let at = now();
     let held = app.db.teammate_cleanups(Some(HELD), None);
-    if !app.db.teammate_cleanups(Some(PENDING), None).is_empty() || held.iter().any(|r| r.purge_at.is_some_and(|p| p <= at)) {
+    if !app.db.teammate_cleanups(Some(PENDING), None).is_empty()
+        || held.iter().any(|r| r.purge_at.is_some_and(|p| p <= at))
+    {
         kick(app);
     }
 }
@@ -328,31 +401,39 @@ pub fn follow_up(app: &AppState) {
 /// Counts what happened.
 async fn run(app: &App) -> Value {
     use futures_util::StreamExt;
-    let Some(e) = enrollment(app) else { return Value::Null };
-    let tried: Vec<&str> = futures_util::stream::iter(app.db.teammate_cleanups(Some(PENDING), None))
-        .map(|row| async move {
-            let m = app.db.machine(&row.machine_id)?;
-            Some(match try_removal(app, e, &system(&m), &row, false).await {
-                Tried::Removed(_) => "removed",
-                Tried::Failed(_) => "failed",
-                Tried::Waiting(_) => "waiting",
-                Tried::Cancelled => "cancelled",
-                Tried::Busy => return None,
+    let Some(e) = enrollment(app) else {
+        return Value::Null;
+    };
+    let tried: Vec<&str> =
+        futures_util::stream::iter(app.db.teammate_cleanups(Some(PENDING), None))
+            .map(|row| async move {
+                let m = app.db.machine(&row.machine_id)?;
+                Some(match try_removal(app, e, &system(&m), &row, false).await {
+                    Tried::Removed(_) => "removed",
+                    Tried::Failed(_) => "failed",
+                    Tried::Waiting(_) => "waiting",
+                    Tried::Cancelled => "cancelled",
+                    Tried::Busy => return None,
+                })
             })
-        })
-        .buffer_unordered(AT_ONCE)
-        .filter_map(|k| async move { k })
-        .collect()
-        .await;
+            .buffer_unordered(AT_ONCE)
+            .filter_map(|k| async move { k })
+            .collect()
+            .await;
     let at = now();
-    let due = app.db.teammate_cleanups(Some(HELD), None).into_iter().filter(|r| r.purge_at.is_some_and(|p| p <= at));
+    let due = app
+        .db
+        .teammate_cleanups(Some(HELD), None)
+        .into_iter()
+        .filter(|r| r.purge_at.is_some_and(|p| p <= at));
     let purged = futures_util::stream::iter(due)
         .map(|row| async move { purge(app, e, &row).await })
         .buffer_unordered(AT_ONCE)
         .filter(|done| std::future::ready(*done))
         .count()
         .await;
-    let mut out = json!({ "removed": 0, "failed": 0, "waiting": 0, "cancelled": 0, "purged": purged });
+    let mut out =
+        json!({ "removed": 0, "failed": 0, "waiting": 0, "cancelled": 0, "purged": purged });
     for k in tried {
         out[k] = json!(out[k].as_i64().unwrap_or(0) + 1);
     }
@@ -375,12 +456,23 @@ pub(crate) fn archive_name(app: &App, user_id: &str) -> String {
     let who = app
         .db
         .user(user_id)
-        .and_then(|u| u.email.as_deref().and_then(|e| e.split('@').next()).map(str::to_string))
+        .and_then(|u| {
+            u.email
+                .as_deref()
+                .and_then(|e| e.split('@').next())
+                .map(str::to_string)
+        })
         .unwrap_or_else(|| user_id.to_string());
     let mut name: String = who
         .chars()
         .map(|c| c.to_ascii_lowercase())
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
         .take(40)
         .collect();
     name = name.trim_matches(|c| c == '.' || c == '-').to_string();
@@ -392,18 +484,40 @@ pub(crate) fn archive_name(app: &App, user_id: &str) -> String {
 
 /// Records a failed or waiting attempt, auditing it only when the reason is new, so a
 /// machine offline for a week leaves one failure in the log, not one a minute.
-fn note(app: &App, by: &Who, m: &Machine, row: &TeammateCleanup, state: &str, why: &str, attempt: bool) {
+fn note(
+    app: &App,
+    by: &Who,
+    m: &Machine,
+    row: &TeammateCleanup,
+    state: &str,
+    why: &str,
+    attempt: bool,
+) {
     let changed = row.last_error.as_deref() != Some(why);
     if app.db.teammate_cleanup_failed(&row.id, state, why, attempt) && changed {
-        let action = if state == HELD { "machine.teammate_files_purge_failed" } else { "machine.teammate_removal_failed" };
+        let action = if state == HELD {
+            "machine.teammate_files_purge_failed"
+        } else {
+            "machine.teammate_removal_failed"
+        };
         let d = json!({ "error": why, "attempts": row.attempts + attempt as i64 });
-        app.db.record(&cleanup_event(by, action, m, row, d).outcome(Outcome::Failure));
+        app.db
+            .record(&cleanup_event(by, action, m, row, d).outcome(Outcome::Failure));
     }
 }
 
 fn cancel(app: &App, by: &Who, m: &Machine, row: &TeammateCleanup, why: &str) -> Tried {
-    if app.db.teammate_cleanup_end(&row.id, PENDING, CANCELLED, Some(why)) {
-        app.db.record(&cleanup_event(by, "machine.teammate_removal_cancelled", m, row, json!({ "why": why })));
+    if app
+        .db
+        .teammate_cleanup_end(&row.id, PENDING, CANCELLED, Some(why))
+    {
+        app.db.record(&cleanup_event(
+            by,
+            "machine.teammate_removal_cancelled",
+            m,
+            row,
+            json!({ "why": why }),
+        ));
     }
     Tried::Cancelled
 }
@@ -411,7 +525,10 @@ fn cancel(app: &App, by: &Who, m: &Machine, row: &TeammateCleanup, why: &str) ->
 /// Whether `m` is up and its agent enrolled, and what to say if not.
 fn reachable(m: &Machine) -> Result<(), String> {
     if m.state != State::Running {
-        return Err(format!("waiting for the machine: it is {}", m.state.as_str()));
+        return Err(format!(
+            "waiting for the machine: it is {}",
+            m.state.as_str()
+        ));
     }
     if m.enrollment != "enrolled" {
         return Err("waiting for the machine: its agent isn't enrolled".into());
@@ -428,10 +545,26 @@ fn can_remove(m: &Machine) -> bool {
 
 /// Asks the agent to remove one teammate, unless they're wanted there again and it
 /// isn't `forced` by an admin.
-async fn try_removal(app: &App, e: &Enrollment, by: &Who, row: &TeammateCleanup, forced: bool) -> Tried {
-    let Some(_taken) = e.offboarding.take(&row.id) else { return Tried::Busy };
-    let Some(row) = app.db.teammate_cleanup(&row.id).filter(|r| r.state == PENDING) else { return Tried::Busy };
-    let Some(m) = app.db.machine(&row.machine_id) else { return Tried::Busy };
+async fn try_removal(
+    app: &App,
+    e: &Enrollment,
+    by: &Who,
+    row: &TeammateCleanup,
+    forced: bool,
+) -> Tried {
+    let Some(_taken) = e.offboarding.take(&row.id) else {
+        return Tried::Busy;
+    };
+    let Some(row) = app
+        .db
+        .teammate_cleanup(&row.id)
+        .filter(|r| r.state == PENDING)
+    else {
+        return Tried::Busy;
+    };
+    let Some(m) = app.db.machine(&row.machine_id) else {
+        return Tried::Busy;
+    };
     if !live(&m) || m.user_id != row.owner_id {
         return cancel(app, by, &m, &row, "machine_gone");
     }
@@ -439,10 +572,20 @@ async fn try_removal(app: &App, e: &Enrollment, by: &Who, row: &TeammateCleanup,
     // work not yet moved): finish rather than leave it half done. A later run makes the
     // teammate a new user.
     // The update checks again, so an admin's ask that lands meanwhile still stands.
-    if !forced && row.reason != ADMIN && row.attempts == 0 && wanted(app, &row.owner_id, &row.user_id) {
+    if !forced
+        && row.reason != ADMIN
+        && row.attempts == 0
+        && wanted(app, &row.owner_id, &row.user_id)
+    {
         let why = "access_back";
         if app.db.teammate_cleanup_cancel_unasked(&row.id, why) {
-            app.db.record(&cleanup_event(by, "machine.teammate_removal_cancelled", &m, &row, json!({ "why": why })));
+            app.db.record(&cleanup_event(
+                by,
+                "machine.teammate_removal_cancelled",
+                &m,
+                &row,
+                json!({ "why": why }),
+            ));
             return Tried::Cancelled;
         }
         return Tried::Busy;
@@ -452,7 +595,8 @@ async fn try_removal(app: &App, e: &Enrollment, by: &Who, row: &TeammateCleanup,
         return Tried::Waiting(why);
     }
     if !can_remove(&m) {
-        let why = "its agent can't remove teammates' users (it is older than ADR 0052); upgrade it".to_string();
+        let why = "its agent can't remove teammates' users (it is older than ADR 0052); upgrade it"
+            .to_string();
         note(app, by, &m, &row, PENDING, &why, false);
         return Tried::Waiting(why);
     }
@@ -465,18 +609,30 @@ async fn try_removal(app: &App, e: &Enrollment, by: &Who, row: &TeammateCleanup,
         archive_name: (!delete).then(|| archive_name(app, &row.user_id)),
         hold: delete && row.grace_days > 0,
     };
-    match ask(app, e, &m, &format!("/v1/teammates/{}/remove", row.user_id), &body).await {
+    match ask(
+        app,
+        e,
+        &m,
+        &format!("/v1/teammates/{}/remove", row.user_id),
+        &body,
+    )
+    .await
+    {
         Ok(v) => match serde_json::from_value::<TeammateRemoved>(v) {
             Ok(r) => {
                 let purge_at = (r.files == "held").then(|| now() + row.grace_days * DAY_MS);
-                if app.db.teammate_cleanup_removed(&row.id, r.archived_to.as_deref(), purge_at) {
+                if app
+                    .db
+                    .teammate_cleanup_removed(&row.id, r.archived_to.as_deref(), purge_at)
+                {
                     edit_known(app, &m.id, |l| l.retain(|u| u != &row.user_id));
                     let d = json!({
                         "alreadyGone": r.already_gone, "userRemoved": r.user_removed, "jobsStopped": r.jobs_stopped,
                         "screensStopped": r.screens_stopped, "processesStopped": r.processes_stopped, "tempRemoved": r.temp_removed,
                         "work": r.files, "archivedTo": r.archived_to, "purgeAt": purge_at, "attempts": row.attempts + 1,
                     });
-                    app.db.record(&cleanup_event(by, "machine.teammate_removed", &m, &row, d));
+                    app.db
+                        .record(&cleanup_event(by, "machine.teammate_removed", &m, &row, d));
                 }
                 Tried::Removed(Box::new(r))
             }
@@ -495,12 +651,25 @@ async fn try_removal(app: &App, e: &Enrollment, by: &Who, row: &TeammateCleanup,
 
 /// Deletes the work a removal held, once its days are up. Whether it's done.
 async fn purge(app: &App, e: &Enrollment, row: &TeammateCleanup) -> bool {
-    let Some(_taken) = e.offboarding.take(&row.id) else { return false };
-    let Some(m) = app.db.machine(&row.machine_id) else { return false };
+    let Some(_taken) = e.offboarding.take(&row.id) else {
+        return false;
+    };
+    let Some(m) = app.db.machine(&row.machine_id) else {
+        return false;
+    };
     let by = system(&m);
     if !live(&m) {
-        if app.db.teammate_cleanup_end(&row.id, HELD, DONE, Some("machine_gone")) {
-            app.db.record(&cleanup_event(&by, "machine.teammate_files_purged", &m, row, json!({ "purged": false, "why": "machine_gone" })));
+        if app
+            .db
+            .teammate_cleanup_end(&row.id, HELD, DONE, Some("machine_gone"))
+        {
+            app.db.record(&cleanup_event(
+                &by,
+                "machine.teammate_files_purged",
+                &m,
+                row,
+                json!({ "purged": false, "why": "machine_gone" }),
+            ));
         }
         return true;
     }
@@ -508,12 +677,29 @@ async fn purge(app: &App, e: &Enrollment, row: &TeammateCleanup) -> bool {
         note(app, &by, &m, row, HELD, &why, false);
         return false;
     }
-    let body = TeammatePurge { owner_id: m.user_id.clone(), cleanup_id: row.id.clone() };
-    match ask(app, e, &m, &format!("/v1/teammates/{}/purge", row.user_id), &body).await {
+    let body = TeammatePurge {
+        owner_id: m.user_id.clone(),
+        cleanup_id: row.id.clone(),
+    };
+    match ask(
+        app,
+        e,
+        &m,
+        &format!("/v1/teammates/{}/purge", row.user_id),
+        &body,
+    )
+    .await
+    {
         Ok(v) => {
             let purged = serde_json::from_value::<TeammatePurged>(v).is_ok_and(|p| p.purged);
             if app.db.teammate_cleanup_end(&row.id, HELD, DONE, None) {
-                app.db.record(&cleanup_event(&by, "machine.teammate_files_purged", &m, row, json!({ "purged": purged })));
+                app.db.record(&cleanup_event(
+                    &by,
+                    "machine.teammate_files_purged",
+                    &m,
+                    row,
+                    json!({ "purged": purged }),
+                ));
             }
             true
         }
@@ -526,7 +712,13 @@ async fn purge(app: &App, e: &Enrollment, row: &TeammateCleanup) -> bool {
 
 /// POSTs `body` to the machine's agent, pinned to its certificates. Its JSON answer, or
 /// why it didn't do it.
-async fn ask<T: serde::Serialize>(app: &App, e: &Enrollment, m: &Machine, path: &str, body: &T) -> Result<Value, String> {
+async fn ask<T: serde::Serialize>(
+    app: &App,
+    e: &Enrollment,
+    m: &Machine,
+    path: &str,
+    body: &T,
+) -> Result<Value, String> {
     let pins = app.db.machine_pins(&m.id);
     if pins.is_empty() {
         return Err("it has no usable certificate".into());
@@ -540,7 +732,10 @@ async fn ask<T: serde::Serialize>(app: &App, e: &Enrollment, m: &Machine, path: 
         .await
         .map_err(|err| format!("its agent didn't answer: {}", enroll::without_url(err)))?;
     let code = r.status();
-    let reply: Value = enroll::read_capped(&mut r, 64 << 10).await.and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+    let reply: Value = enroll::read_capped(&mut r, 64 << 10)
+        .await
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(Value::Null);
     if code.is_success() {
         return Ok(reply);
     }
@@ -554,7 +749,12 @@ async fn ask<T: serde::Serialize>(app: &App, e: &Enrollment, m: &Machine, path: 
 // (admin only, rbac::classify).
 
 fn view(app: &App, r: &TeammateCleanup) -> Value {
-    let person = |id: &str| app.db.user(id).map(|u| json!({ "id": u.id, "name": u.name, "email": u.email })).unwrap_or(json!({ "id": id }));
+    let person = |id: &str| {
+        app.db
+            .user(id)
+            .map(|u| json!({ "id": u.id, "name": u.name, "email": u.email }))
+            .unwrap_or(json!({ "id": id }))
+    };
     let mut v = serde_json::to_value(r).unwrap_or_default();
     v["teammate"] = person(&r.user_id);
     v["owner"] = person(&r.owner_id);
@@ -562,7 +762,12 @@ fn view(app: &App, r: &TeammateCleanup) -> Value {
 }
 
 fn need_enrollment(app: &App) -> Res<&std::sync::Arc<Enrollment>> {
-    let cp = app.control_plane.get().ok_or_else(|| ApiError(StatusCode::SERVICE_UNAVAILABLE, super::NOT_CONFIGURED.into()))?;
+    let cp = app.control_plane.get().ok_or_else(|| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            super::NOT_CONFIGURED.into(),
+        )
+    })?;
     enroll::need(cp)
 }
 
@@ -579,13 +784,24 @@ pub async fn list_all(AppS(app): AppS<AppState>, Query(q): Query<ListQuery>) -> 
     let all = app.db.teammate_cleanups(None, None);
     let rows: Vec<&TeammateCleanup> = match q.state.as_deref() {
         None | Some("") | Some("all") => all.iter().collect(),
-        Some("open") => all.iter().filter(|r| r.state == PENDING || r.state == HELD).collect(),
-        Some(s @ (PENDING | HELD | DONE | CANCELLED)) => all.iter().filter(|r| r.state == s).collect(),
-        Some(s) => return Err(bad(format!("state must be pending, held, done, cancelled, open or all, not \"{s}\""))),
+        Some("open") => all
+            .iter()
+            .filter(|r| r.state == PENDING || r.state == HELD)
+            .collect(),
+        Some(s @ (PENDING | HELD | DONE | CANCELLED)) => {
+            all.iter().filter(|r| r.state == s).collect()
+        }
+        Some(s) => {
+            return Err(bad(format!(
+                "state must be pending, held, done, cancelled, open or all, not \"{s}\""
+            )));
+        }
     };
     let mut by_machine: std::collections::BTreeMap<&str, Value> = std::collections::BTreeMap::new();
     for r in all.iter().filter(|r| r.state == PENDING || r.state == HELD) {
-        let c = by_machine.entry(&r.machine_id).or_insert_with(|| json!({ "machineId": r.machine_id, "ownerId": r.owner_id, "pending": 0, "held": 0 }));
+        let c = by_machine.entry(&r.machine_id).or_insert_with(
+            || json!({ "machineId": r.machine_id, "ownerId": r.owner_id, "pending": 0, "held": 0 }),
+        );
         c[r.state.as_str()] = json!(c[r.state.as_str()].as_i64().unwrap_or(0) + 1);
     }
     Ok(Json(json!({
@@ -601,7 +817,10 @@ pub async fn list_all(AppS(app): AppS<AppState>, Query(q): Query<ListQuery>) -> 
 pub async fn on_machine(AppS(app): AppS<AppState>, Path(key): Path<String>) -> Res {
     need_enrollment(&app)?;
     let u = need_user_key(&app, &key)?;
-    let m = app.db.user_machine(&u.id).ok_or_else(|| crate::not_found("Machine"))?;
+    let m = app
+        .db
+        .user_machine(&u.id)
+        .ok_or_else(|| crate::not_found("Machine"))?;
     let removals = app.db.teammate_cleanups(None, Some(&m.id));
     let teammates: Vec<Value> = known(&m)
         .iter()
@@ -625,28 +844,64 @@ pub async fn on_machine(AppS(app): AppS<AppState>, Path(key): Path<String>) -> R
 /// `POST /api/users/{key}/machine/teammates/{teammate}/remove`: removes the teammate's
 /// user from the machine now, even if they still have access (their next run there
 /// makes a new one). 200 when done, 202 with why when it's still pending.
-pub async fn remove_now(AppS(app): AppS<AppState>, Extension(by): Extension<Who>, Path((key, teammate)): Path<(String, String)>) -> Res<(StatusCode, Json<Value>)> {
+pub async fn remove_now(
+    AppS(app): AppS<AppState>,
+    Extension(by): Extension<Who>,
+    Path((key, teammate)): Path<(String, String)>,
+) -> Res<(StatusCode, Json<Value>)> {
     let e = need_enrollment(&app)?;
     let u = need_user_key(&app, &key)?;
-    let m = app.db.user_machine(&u.id).ok_or_else(|| crate::not_found("Machine"))?;
-    let t = app.db.find_user(&teammate).map_or(teammate.clone(), |t| t.id);
+    let m = app
+        .db
+        .user_machine(&u.id)
+        .ok_or_else(|| crate::not_found("Machine"))?;
+    let t = app
+        .db
+        .find_user(&teammate)
+        .map_or(teammate.clone(), |t| t.id);
     if t == m.user_id {
         return Err(bad("That is the machine's own user, not a teammate."));
     }
-    if t.is_empty() || t.len() > 64 || !t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+    if t.is_empty()
+        || t.len() > 64
+        || !t
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
         return Err(bad("Name a teammate by id or email."));
     }
-    let (row, _) = queue(&app, e, &by, &m, &t, ADMIN).ok_or_else(|| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Couldn't queue the removal.".into()))?;
+    let (row, _) = queue(&app, e, &by, &m, &t, ADMIN).ok_or_else(|| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Couldn't queue the removal.".into(),
+        )
+    })?;
     // A removal already waiting for another reason is the admin's from now on, so a
     // later pass never cancels it because the teammate is wanted again.
     if row.reason != ADMIN && app.db.teammate_cleanup_force(&row.id) {
-        app.db.record(&cleanup_event(&by, "machine.teammate_removal_forced", &m, &row, json!({ "was": row.reason })));
+        app.db.record(&cleanup_event(
+            &by,
+            "machine.teammate_removal_forced",
+            &m,
+            &row,
+            json!({ "was": row.reason }),
+        ));
     }
     let tried = try_removal(&app, e, &by, &row, true).await;
-    let after = app.db.teammate_cleanup(&row.id).map(|r| view(&app, &r)).unwrap_or(Value::Null);
+    let after = app
+        .db
+        .teammate_cleanup(&row.id)
+        .map(|r| view(&app, &r))
+        .unwrap_or(Value::Null);
     Ok(match tried {
-        Tried::Removed(r) => (StatusCode::OK, Json(json!({ "removal": after, "agent": *r }))),
-        Tried::Failed(why) | Tried::Waiting(why) => (StatusCode::ACCEPTED, Json(json!({ "removal": after, "error": why }))),
+        Tried::Removed(r) => (
+            StatusCode::OK,
+            Json(json!({ "removal": after, "agent": *r })),
+        ),
+        Tried::Failed(why) | Tried::Waiting(why) => (
+            StatusCode::ACCEPTED,
+            Json(json!({ "removal": after, "error": why })),
+        ),
         Tried::Cancelled | Tried::Busy => (StatusCode::ACCEPTED, Json(json!({ "removal": after }))),
     })
 }
@@ -656,7 +911,12 @@ mod tests {
     use super::*;
 
     fn with(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> String {
-        move |k| pairs.iter().find(|(n, _)| *n == k).map_or(String::new(), |(_, v)| v.to_string())
+        move |k| {
+            pairs
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map_or(String::new(), |(_, v)| v.to_string())
+        }
     }
 
     #[test]
@@ -665,12 +925,25 @@ mod tests {
         assert_eq!(Settings::default().files, Files::Archive);
         let d = Settings::from_env(&with(&[("MACHINE_TEAMMATE_FILES", "delete")])).unwrap();
         assert_eq!((d.files, d.grace_days), (Files::Delete, 7));
-        let now = Settings::from_env(&with(&[("MACHINE_TEAMMATE_FILES", "delete"), ("MACHINE_TEAMMATE_FILES_DAYS", "0")])).unwrap();
+        let now = Settings::from_env(&with(&[
+            ("MACHINE_TEAMMATE_FILES", "delete"),
+            ("MACHINE_TEAMMATE_FILES_DAYS", "0"),
+        ]))
+        .unwrap();
         assert_eq!(now.grace_days, 0);
         assert!(now.describe().ends_with("deleted"), "{}", now.describe());
         assert!(Settings::from_env(&with(&[("MACHINE_TEAMMATE_FILES", "keep")])).is_err());
-        assert!(Settings::from_env(&with(&[("MACHINE_TEAMMATE_FILES", "delete"), ("MACHINE_TEAMMATE_FILES_DAYS", "400")])).is_err());
-        assert!(Settings::from_env(&with(&[("MACHINE_TEAMMATE_FILES_DAYS", "3")])).is_err(), "days mean nothing for archived work");
+        assert!(
+            Settings::from_env(&with(&[
+                ("MACHINE_TEAMMATE_FILES", "delete"),
+                ("MACHINE_TEAMMATE_FILES_DAYS", "400")
+            ]))
+            .is_err()
+        );
+        assert!(
+            Settings::from_env(&with(&[("MACHINE_TEAMMATE_FILES_DAYS", "3")])).is_err(),
+            "days mean nothing for archived work"
+        );
     }
 
     #[test]

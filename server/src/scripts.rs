@@ -60,15 +60,23 @@ pub enum Source {
 /// followed only while they stay inside the workspace; FIFOs, devices, and folders
 /// aren't opened.
 pub fn read(workspace: &Path, path: &Path) -> Source {
-    let Ok(ws) = std::fs::canonicalize(workspace) else { return Source::Unreadable("the workspace isn't on this server") };
+    let Ok(ws) = std::fs::canonicalize(workspace) else {
+        return Source::Unreadable("the workspace isn't on this server");
+    };
     let real = match std::fs::canonicalize(path) {
         Ok(p) => p,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Source::Missing,
         Err(_) => return Source::Unreadable("it can't be opened"),
     };
-    let Ok(rel) = real.strip_prefix(&ws) else { return Source::LinksOutside(real) };
-    let Some(file) = open_under(&ws, rel) else { return Source::Unreadable("it changed while SuperBot read it, or can't be opened") };
-    let Ok(meta) = file.metadata() else { return Source::Unreadable("it can't be opened") };
+    let Ok(rel) = real.strip_prefix(&ws) else {
+        return Source::LinksOutside(real);
+    };
+    let Some(file) = open_under(&ws, rel) else {
+        return Source::Unreadable("it changed while SuperBot read it, or can't be opened");
+    };
+    let Ok(meta) = file.metadata() else {
+        return Source::Unreadable("it can't be opened");
+    };
     if !meta.is_file() {
         return Source::Unreadable("it isn't a regular file");
     }
@@ -76,7 +84,11 @@ pub fn read(workspace: &Path, path: &Path) -> Source {
         return Source::TooBig;
     }
     let mut bytes = Vec::new();
-    if file.take(MAX_SCRIPT_BYTES as u64 + 1).read_to_end(&mut bytes).is_err() {
+    if file
+        .take(MAX_SCRIPT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
         return Source::Unreadable("it can't be read");
     }
     if bytes.len() > MAX_SCRIPT_BYTES {
@@ -91,15 +103,21 @@ pub fn read(workspace: &Path, path: &Path) -> Source {
 /// Opens `rel` under the folder `ws` one name at a time, never through a link, so a
 /// folder swapped for a link after the path was checked can't lead outside.
 fn open_under(ws: &Path, rel: &Path) -> Option<std::fs::File> {
-    use std::os::fd::{FromRawFd, OwnedFd, AsRawFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     let dir_flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
-    let root = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY).open(ws).ok()?;
+    let root = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .open(ws)
+        .ok()?;
     let mut dir: OwnedFd = root.into();
     let names: Vec<_> = rel.components().collect();
     let (last, folders) = names.split_last()?;
     for name in folders {
-        let std::path::Component::Normal(n) = name else { return None };
+        let std::path::Component::Normal(n) = name else {
+            return None;
+        };
         let c = std::ffi::CString::new(n.as_bytes()).ok()?;
         // SAFETY: `dir` is an open folder and `c` a NUL-terminated name.
         let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), dir_flags | libc::O_NOFOLLOW) };
@@ -109,10 +127,18 @@ fn open_under(ws: &Path, rel: &Path) -> Option<std::fs::File> {
         // SAFETY: openat returned a new descriptor that nothing else owns.
         dir = unsafe { OwnedFd::from_raw_fd(fd) };
     }
-    let std::path::Component::Normal(n) = last else { return None };
+    let std::path::Component::Normal(n) = last else {
+        return None;
+    };
     let c = std::ffi::CString::new(n.as_bytes()).ok()?;
     // SAFETY: as above.
-    let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
     // SAFETY: as above.
     (fd >= 0).then(|| unsafe { std::fs::File::from_raw_fd(fd) })
 }
@@ -120,11 +146,22 @@ fn open_under(ws: &Path, rel: &Path) -> Option<std::fs::File> {
 /// A compiled program: an ELF or Mach-O header, or, as bash decides before running a
 /// file as a script, a NUL in its first line within the first 80 bytes.
 fn is_binary(b: &[u8]) -> bool {
-    const MAGIC: [&[u8]; 6] = [b"\x7fELF", b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe"];
+    const MAGIC: [&[u8]; 6] = [
+        b"\x7fELF",
+        b"\xfe\xed\xfa\xce",
+        b"\xfe\xed\xfa\xcf",
+        b"\xce\xfa\xed\xfe",
+        b"\xcf\xfa\xed\xfe",
+        b"\xca\xfe\xba\xbe",
+    ];
     if b.starts_with(b"#!") {
         return false;
     }
-    MAGIC.iter().any(|m| b.starts_with(m)) || b.iter().take(80).take_while(|c| **c != b'\n').any(|c| *c == 0)
+    MAGIC.iter().any(|m| b.starts_with(m))
+        || b.iter()
+            .take(80)
+            .take_while(|c| **c != b'\n')
+            .any(|c| *c == 0)
 }
 
 /// The program a `#!` line runs, with `env` and its options skipped. None when there
@@ -133,7 +170,9 @@ pub fn shebang(text: &str) -> Option<Option<String>> {
     let line = text.strip_prefix("#!")?.lines().next().unwrap_or_default();
     let mut words = line.split_whitespace();
     let base = |w: &str| w.rsplit('/').next().unwrap_or(w).to_string();
-    let Some(first) = words.next() else { return Some(None) };
+    let Some(first) = words.next() else {
+        return Some(None);
+    };
     if base(first) != "env" {
         return Some(Some(base(first)));
     }
@@ -193,7 +232,14 @@ struct Apis {
 }
 
 const CP: &[&str] = &["child_process", "execa", "shelljs", "zx"];
-const FS: &[&str] = &["'fs'", "\"fs\"", "node:fs", "fs/promises", "fs-extra", "Deno.remove"];
+const FS: &[&str] = &[
+    "'fs'",
+    "\"fs\"",
+    "node:fs",
+    "fs/promises",
+    "fs-extra",
+    "Deno.remove",
+];
 
 const PYTHON: Apis = Apis {
     spawn: &[
@@ -233,8 +279,28 @@ const PYTHON: Apis = Apis {
     ],
     eval: &["eval", "exec", "run_path", "run_module"],
     load: &["__import__", "import_module"],
-    decode: &["b64decode", "b32decode", "b16decode", "b85decode", "a85decode", "decodebytes", "unhexlify", "fromhex", "codecs.decode", "decompress", "rot13", "rot_13", "marshal.loads"],
-    delete: &[("rmtree", &[]), ("removedirs", &[]), ("remove", &["os.remove", "from os"]), ("unlink", &["os.unlink", "from os", "Path"]), ("rmdir", &["os.rmdir", "from os", "Path"])],
+    decode: &[
+        "b64decode",
+        "b32decode",
+        "b16decode",
+        "b85decode",
+        "a85decode",
+        "decodebytes",
+        "unhexlify",
+        "fromhex",
+        "codecs.decode",
+        "decompress",
+        "rot13",
+        "rot_13",
+        "marshal.loads",
+    ],
+    delete: &[
+        ("rmtree", &[]),
+        ("removedirs", &[]),
+        ("remove", &["os.remove", "from os"]),
+        ("unlink", &["os.unlink", "from os", "Path"]),
+        ("rmdir", &["os.rmdir", "from os", "Path"]),
+    ],
     mail: &["smtplib", "yagmail"],
     bare_calls: false,
     dotted_eval_is_other: true,
@@ -254,9 +320,27 @@ const JS: Apis = Apis {
         ("execaCommandSync", &[]),
     ],
     spawn_opaque: &[("fork", CP), ("Command", &["Deno"]), ("run", &["Deno.run"])],
-    eval: &["eval", "Function", "runInNewContext", "runInThisContext", "runInContext", "compileFunction"],
+    eval: &[
+        "eval",
+        "Function",
+        "runInNewContext",
+        "runInThisContext",
+        "runInContext",
+        "compileFunction",
+    ],
     load: &["require", "import"],
-    decode: &["atob", "'base64'", "\"base64\"", "'hex'", "\"hex\"", "fromCharCode", "inflateSync", "gunzipSync", "inflateRawSync", "brotliDecompressSync"],
+    decode: &[
+        "atob",
+        "'base64'",
+        "\"base64\"",
+        "'hex'",
+        "\"hex\"",
+        "fromCharCode",
+        "inflateSync",
+        "gunzipSync",
+        "inflateRawSync",
+        "brotliDecompressSync",
+    ],
     delete: &[
         ("rimraf", &[]),
         ("rm", FS),
@@ -276,7 +360,18 @@ const JS: Apis = Apis {
 };
 
 const RUBY: Apis = Apis {
-    spawn: &[("system", &[]), ("exec", &[]), ("spawn", &[]), ("popen", &[]), ("capture2", &[]), ("capture2e", &[]), ("capture3", &[]), ("popen2", &[]), ("popen3", &[]), ("pipeline", &["Open3"])],
+    spawn: &[
+        ("system", &[]),
+        ("exec", &[]),
+        ("spawn", &[]),
+        ("popen", &[]),
+        ("capture2", &[]),
+        ("capture2e", &[]),
+        ("capture3", &[]),
+        ("popen2", &[]),
+        ("popen3", &[]),
+        ("pipeline", &["Open3"]),
+    ],
     spawn_opaque: &[],
     eval: &["eval", "instance_eval", "class_eval", "module_eval"],
     load: &[],
@@ -305,18 +400,44 @@ const PERL: Apis = Apis {
     eval: &["eval"],
     load: &[],
     decode: &["decode_base64", "unpack", "pack(", "uncompress"],
-    delete: &[("unlink", &[]), ("rmdir", &[]), ("remove_tree", &[]), ("rmtree", &[])],
-    mail: &["Net::SMTP", "MIME::Lite", "Email::Sender", "Mail::Sendmail", "/sendmail"],
+    delete: &[
+        ("unlink", &[]),
+        ("rmdir", &[]),
+        ("remove_tree", &[]),
+        ("rmtree", &[]),
+    ],
+    mail: &[
+        "Net::SMTP",
+        "MIME::Lite",
+        "Email::Sender",
+        "Mail::Sendmail",
+        "/sendmail",
+    ],
     bare_calls: true,
     dotted_eval_is_other: false,
 };
 
 const PHP: Apis = Apis {
-    spawn: &[("system", &[]), ("exec", &[]), ("shell_exec", &[]), ("passthru", &[]), ("proc_open", &[]), ("popen", &[])],
+    spawn: &[
+        ("system", &[]),
+        ("exec", &[]),
+        ("shell_exec", &[]),
+        ("passthru", &[]),
+        ("proc_open", &[]),
+        ("popen", &[]),
+    ],
     spawn_opaque: &[("pcntl_exec", &[])],
     eval: &["eval", "assert", "create_function"],
     load: &[],
-    decode: &["base64_decode", "gzinflate", "gzuncompress", "gzdecode", "str_rot13", "hex2bin", "convert_uudecode"],
+    decode: &[
+        "base64_decode",
+        "gzinflate",
+        "gzuncompress",
+        "gzdecode",
+        "str_rot13",
+        "hex2bin",
+        "convert_uudecode",
+    ],
     delete: &[("unlink", &[]), ("rmdir", &[])],
     mail: &["mail(", "PHPMailer", "Swift_Mailer"],
     bare_calls: false,
@@ -339,7 +460,12 @@ pub fn scan(lang: Lang, code: &str, name: &str) -> Found {
     // Relative paths and commands may be from another folder (`os.chdir('/tmp')`).
     f.moves = code.contains("chdir");
     let gated = |spec: &Spec| spec.1.is_empty() || spec.1.iter().any(|g| code.contains(g));
-    let unknown_cmd = |api: &str| ("shell_destructive", format!("Runs commands only known when it runs ({api} in {name})"));
+    let unknown_cmd = |api: &str| {
+        (
+            "shell_destructive",
+            format!("Runs commands only known when it runs ({api} in {name})"),
+        )
+    };
 
     for spec in apis.spawn.iter().filter(|s| gated(s)) {
         let sites = call_sites(&toks, spec.0, apis.bare_calls, &work);
@@ -362,17 +488,40 @@ pub fn scan(lang: Lang, code: &str, name: &str) -> Found {
     }
     // A risky API under another name (`from subprocess import run as r`, `f = os.system`,
     // `getattr(os, 'system')`) can't be followed to its calls.
-    for spec in apis.spawn.iter().chain(apis.spawn_opaque).chain(apis.delete).filter(|s| gated(s)) {
+    for spec in apis
+        .spawn
+        .iter()
+        .chain(apis.spawn_opaque)
+        .chain(apis.delete)
+        .filter(|s| gated(s))
+    {
         if let Some(how) = renamed(&toks, spec.0, apis.bare_calls, &work) {
-            f.asks.push(("shell_destructive", format!("Uses {} {how}, so SuperBot can't follow what it runs ({} in {name})", spec.0, spec.0)));
+            f.asks.push((
+                "shell_destructive",
+                format!(
+                    "Uses {} {how}, so SuperBot can't follow what it runs ({} in {name})",
+                    spec.0, spec.0
+                ),
+            ));
         }
     }
-    if lang == Lang::Php && toks.windows(2).any(|w| matches!(w, [Tok::Ident(v), Tok::Punct('(')] if v.starts_with('$'))) {
+    if lang == Lang::Php
+        && toks
+            .windows(2)
+            .any(|w| matches!(w, [Tok::Ident(v), Tok::Punct('(')] if v.starts_with('$')))
+    {
         f.asks.push(unknown_cmd("a function named by a variable"));
     }
     // Command literals: backticks in Ruby, Perl, and PHP, and zx's $`…` in JavaScript.
     for (k, t) in toks.iter().enumerate() {
-        let Tok::Str { text, dynamic, backtick: true } = t else { continue };
+        let Tok::Str {
+            text,
+            dynamic,
+            backtick: true,
+        } = t
+        else {
+            continue;
+        };
         let zx = lang == Lang::Js && k > 0 && toks[k - 1] == Tok::Ident("$".into());
         if lang == Lang::Js && !zx {
             continue;
@@ -383,11 +532,17 @@ pub fn scan(lang: Lang, code: &str, name: &str) -> Found {
             f.commands.push(text.clone());
         }
     }
-    let quoted_cmd = (lang == Lang::Ruby && has_quote_op(code, "%x")) || (lang == Lang::Perl && has_quote_op(code, "qx"));
+    let quoted_cmd = (lang == Lang::Ruby && has_quote_op(code, "%x"))
+        || (lang == Lang::Perl && has_quote_op(code, "qx"));
     if quoted_cmd {
-        f.asks.push(unknown_cmd(if lang == Lang::Ruby { "%x" } else { "qx" }));
+        f.asks
+            .push(unknown_cmd(if lang == Lang::Ruby { "%x" } else { "qx" }));
     }
-    if lang == Lang::Perl && toks.iter().any(|t| matches!(t, Tok::Str { text, .. } if text.starts_with('|') || text.ends_with('|'))) {
+    if lang == Lang::Perl
+        && toks.iter().any(
+            |t| matches!(t, Tok::Str { text, .. } if text.starts_with('|') || text.ends_with('|')),
+        )
+    {
         f.asks.push(unknown_cmd("open with a pipe"));
     }
 
@@ -395,7 +550,10 @@ pub fn scan(lang: Lang, code: &str, name: &str) -> Found {
     for e in apis.eval {
         if raw_calls(code, e, apis.bare_calls, apis.dotted_eval_is_other) > 0 {
             let why = match decodes {
-                Some(d) => format!("Decodes hidden code and runs it ({} and {e} in {name})", d.trim_matches(['\'', '"', '('])),
+                Some(d) => format!(
+                    "Decodes hidden code and runs it ({} and {e} in {name})",
+                    d.trim_matches(['\'', '"', '('])
+                ),
                 None => format!("Runs code only known when it runs ({e} in {name})"),
             };
             f.asks.push(("shell_destructive", why));
@@ -403,9 +561,15 @@ pub fn scan(lang: Lang, code: &str, name: &str) -> Found {
     }
     for l in apis.load {
         let sites = call_sites(&toks, l, false, &work);
-        let fixed = sites.iter().filter(|a| matches!(a.as_slice(), [Arg::Lit(_)])).count();
+        let fixed = sites
+            .iter()
+            .filter(|a| matches!(a.as_slice(), [Arg::Lit(_)]))
+            .count();
         if raw_calls(code, l, false, true) > fixed {
-            f.asks.push(("shell_destructive", format!("Loads code chosen when it runs ({l} in {name})")));
+            f.asks.push((
+                "shell_destructive",
+                format!("Loads code chosen when it runs ({l} in {name})"),
+            ));
         }
     }
 
@@ -420,30 +584,66 @@ pub fn scan(lang: Lang, code: &str, name: &str) -> Found {
                 match a {
                     Arg::Lit(p) => f.deletes.push(p.clone()),
                     Arg::List(ps) => f.deletes.extend(ps.iter().cloned()),
-                    Arg::Opt(keys) if keys.iter().any(|k| k == "dir_fd" || CHANGES_RUN.contains(&k.as_str())) => unknown = true,
+                    Arg::Opt(keys)
+                        if keys
+                            .iter()
+                            .any(|k| k == "dir_fd" || CHANGES_RUN.contains(&k.as_str())) =>
+                    {
+                        unknown = true
+                    }
                     Arg::Opt(_) => {}
                     Arg::Dynamic => unknown = true,
                 }
             }
         }
         if unknown || raw_calls(code, spec.0, apis.bare_calls, false) > sites.len() {
-            f.asks.push(("file_delete", format!("Deletes files at paths only known when it runs ({} in {name})", spec.0)));
+            f.asks.push((
+                "file_delete",
+                format!(
+                    "Deletes files at paths only known when it runs ({} in {name})",
+                    spec.0
+                ),
+            ));
         }
     }
     if let Some(m) = apis.mail.iter().find(|m| code.contains(*m)) {
-        f.asks.push(("outbound_message", format!("Sends email ({} in {name})", m.trim_end_matches('('))));
+        f.asks.push((
+            "outbound_message",
+            format!("Sends email ({} in {name})", m.trim_end_matches('(')),
+        ));
     }
     if work.get() == 0 {
-        f.asks.push(("shell_destructive", format!("Is too complex for SuperBot to check fully ({name})")));
+        f.asks.push((
+            "shell_destructive",
+            format!("Is too complex for SuperBot to check fully ({name})"),
+        ));
     }
-    f.strings = toks.into_iter().filter_map(|t| if let Tok::Str { text, dynamic: false, .. } = t { Some(text) } else { None }).collect();
+    f.strings = toks
+        .into_iter()
+        .filter_map(|t| {
+            if let Tok::Str {
+                text,
+                dynamic: false,
+                ..
+            } = t
+            {
+                Some(text)
+            } else {
+                None
+            }
+        })
+        .collect();
     f
 }
 
 #[derive(Clone, Debug, PartialEq)]
 enum Tok {
     Ident(String),
-    Str { text: String, dynamic: bool, backtick: bool },
+    Str {
+        text: String,
+        dynamic: bool,
+        backtick: bool,
+    },
     Punct(char),
 }
 
@@ -476,7 +676,13 @@ fn tokens(lang: Lang, code: &str) -> Vec<Tok> {
             i += 2;
         } else if c == '\'' || c == '"' || (c == '`' && lang != Lang::Python) {
             let prefix = match out.last() {
-                Some(Tok::Ident(p)) if lang == Lang::Python && i > 0 && ident_char(s[i - 1]) && p.len() <= 2 && p.chars().all(|c| "rRbBuUfF".contains(c)) => {
+                Some(Tok::Ident(p))
+                    if lang == Lang::Python
+                        && i > 0
+                        && ident_char(s[i - 1])
+                        && p.len() <= 2
+                        && p.chars().all(|c| "rRbBuUfF".contains(c)) =>
+                {
                     let p = p.clone();
                     out.pop();
                     p
@@ -518,10 +724,16 @@ fn tokens(lang: Lang, code: &str) -> Vec<Tok> {
                 (Lang::Python, _) => prefix.contains(['f', 'F']) && text.contains('{'),
                 (Lang::Js, '`') => text.contains("${"),
                 (Lang::Ruby, '"' | '`') => text.contains("#{"),
-                (Lang::Perl | Lang::Php, '"' | '`') => text.contains('$') || (lang == Lang::Perl && text.contains('@')),
+                (Lang::Perl | Lang::Php, '"' | '`') => {
+                    text.contains('$') || (lang == Lang::Perl && text.contains('@'))
+                }
                 _ => false,
             };
-            out.push(Tok::Str { text, dynamic: hidden || interpolates, backtick: c == '`' });
+            out.push(Tok::Str {
+                text,
+                dynamic: hidden || interpolates,
+                backtick: c == '`',
+            });
         } else if ident_char(c) {
             let start = i;
             while i < s.len() && ident_char(s[i]) {
@@ -540,37 +752,55 @@ fn tokens(lang: Lang, code: &str) -> Vec<Tok> {
 
 /// How `name` is used other than by calling it: renamed on import, assigned, passed
 /// along, or named in a string. Importing it under its own name is fine.
-fn renamed(toks: &[Tok], name: &str, bare: bool, work: &std::cell::Cell<usize>) -> Option<&'static str> {
+fn renamed(
+    toks: &[Tok],
+    name: &str,
+    bare: bool,
+    work: &std::cell::Cell<usize>,
+) -> Option<&'static str> {
     // Names too common as plain words to count in strings.
     const COMMON: [&str; 6] = ["run", "call", "remove", "delete", "rm", "spawn"];
     for (k, t) in toks.iter().enumerate() {
         match t {
-            Tok::Str { text, .. } if text == name && !COMMON.contains(&name) => return Some("by a name in a string"),
+            Tok::Str { text, .. } if text == name && !COMMON.contains(&name) => {
+                return Some("by a name in a string");
+            }
             Tok::Ident(n) if n == name => {}
             _ => continue,
         }
         let next = toks.get(k + 1);
         let called = match next {
             Some(Tok::Punct('(')) => true,
-            Some(Tok::Str { .. } | Tok::Ident(_) | Tok::Punct('[')) if bare => !matches!(next, Some(Tok::Ident(a)) if a == "as"),
+            Some(Tok::Str { .. } | Tok::Ident(_) | Tok::Punct('[')) if bare => {
+                !matches!(next, Some(Tok::Ident(a)) if a == "as")
+            }
             _ => false,
         };
         if called {
             continue;
         }
-        if matches!(next, Some(Tok::Ident(a)) if a == "as") || matches!(next, Some(Tok::Punct(':'))) && !matches!(toks.get(k + 2), Some(Tok::Punct(':'))) {
+        if matches!(next, Some(Tok::Ident(a)) if a == "as")
+            || matches!(next, Some(Tok::Punct(':')))
+                && !matches!(toks.get(k + 2), Some(Tok::Punct(':')))
+        {
             return Some("under another name");
         }
         // The statement it is in: an import or require naming it as itself is fine.
         let boundary = |t: &Tok| !step(work) || matches!(t, Tok::Punct('\n' | ';'));
         let start = toks[..k].iter().rposition(boundary).map_or(0, |p| p + 1);
-        let end = toks[k..].iter().position(boundary).map_or(toks.len(), |p| k + p);
-        let import = toks[start..end].iter().any(|t| matches!(t, Tok::Ident(w) if ["import", "require", "use"].contains(&w.as_str())));
+        let end = toks[k..]
+            .iter()
+            .position(boundary)
+            .map_or(toks.len(), |p| k + p);
+        let import = toks[start..end].iter().any(
+            |t| matches!(t, Tok::Ident(w) if ["import", "require", "use"].contains(&w.as_str())),
+        );
         if import {
             continue;
         }
         // `def system(…)` / `function exec(…)` define their own, called like the real one.
-        if matches!(toks.get(k.wrapping_sub(1)), Some(Tok::Ident(d)) if ["def", "function", "sub"].contains(&d.as_str())) {
+        if matches!(toks.get(k.wrapping_sub(1)), Some(Tok::Ident(d)) if ["def", "function", "sub"].contains(&d.as_str()))
+        {
             continue;
         }
         return Some("without calling it directly");
@@ -590,7 +820,12 @@ enum Arg {
 
 /// The arguments of each call of `name` in `toks`: `name(…)`, or with `bare`,
 /// `name "…"` up to the end of the line.
-fn call_sites(toks: &[Tok], name: &str, bare: bool, work: &std::cell::Cell<usize>) -> Vec<Vec<Arg>> {
+fn call_sites(
+    toks: &[Tok],
+    name: &str,
+    bare: bool,
+    work: &std::cell::Cell<usize>,
+) -> Vec<Vec<Arg>> {
     let mut out = Vec::new();
     for (k, t) in toks.iter().enumerate() {
         if *t != Tok::Ident(name.into()) {
@@ -623,14 +858,23 @@ fn call_sites(toks: &[Tok], name: &str, bare: bool, work: &std::cell::Cell<usize
                 a.push(t.clone());
             }
         }
-        out.push(args.into_iter().filter(|a| !a.is_empty()).map(|a| arg(&a)).collect());
+        out.push(
+            args.into_iter()
+                .filter(|a| !a.is_empty())
+                .map(|a| arg(&a))
+                .collect(),
+        );
     }
     out
 }
 
 fn arg(toks: &[Tok]) -> Arg {
     let lit = |t: &Tok| match t {
-        Tok::Str { text, dynamic: false, backtick: false } => Some(text.clone()),
+        Tok::Str {
+            text,
+            dynamic: false,
+            backtick: false,
+        } => Some(text.clone()),
         _ => None,
     };
     match toks {
@@ -640,13 +884,20 @@ fn arg(toks: &[Tok]) -> Arg {
             // Every name or string before a `:`, `=>`, or `=` names an option (or, for a
             // Ruby env hash, a variable); nested values are named too, which only asks more.
             let keys = inner.windows(2).filter_map(|w| match w {
-                [Tok::Ident(k) | Tok::Str { text: k, .. }, Tok::Punct(':' | '=')] => Some(k.clone()),
+                [
+                    Tok::Ident(k) | Tok::Str { text: k, .. },
+                    Tok::Punct(':' | '='),
+                ] => Some(k.clone()),
                 _ => None,
             });
             Arg::Opt(keys.collect())
         }
         [Tok::Punct('['), inner @ .., Tok::Punct(']')] => {
-            let items: Option<Vec<String>> = inner.iter().filter(|t| **t != Tok::Punct(',')).map(lit).collect();
+            let items: Option<Vec<String>> = inner
+                .iter()
+                .filter(|t| **t != Tok::Punct(','))
+                .map(lit)
+                .collect();
             items.map(Arg::List).unwrap_or(Arg::Dynamic)
         }
         _ => Arg::Dynamic,
@@ -665,7 +916,9 @@ fn command_of(args: &[Arg]) -> Option<String> {
             }
             Arg::List(l) => words.extend(l.iter().cloned()),
             // Options that change where or what it runs make the command unknown here.
-            Arg::Opt(keys) if keys.iter().any(|k| CHANGES_RUN.contains(&k.as_str())) => return None,
+            Arg::Opt(keys) if keys.iter().any(|k| CHANGES_RUN.contains(&k.as_str())) => {
+                return None;
+            }
             Arg::Opt(_) => {}
             Arg::Dynamic => return None,
         }
@@ -674,12 +927,26 @@ fn command_of(args: &[Arg]) -> Option<String> {
         (_, 0) => None,
         // One string is a whole command line (`os.system("git push")`, `execSync("…")`).
         (1, 1) => words.pop(),
-        _ => Some(words.iter().map(|w| shell_quote(w)).collect::<Vec<_>>().join(" ")),
+        _ => Some(
+            words
+                .iter()
+                .map(|w| shell_quote(w))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
     }
 }
 
 /// Spawn options that change the folder, the program, or its environment (PATH).
-const CHANGES_RUN: [&str; 7] = ["cwd", "chdir", "executable", "argv0", "env", "PATH", "unsetenv_others"];
+const CHANGES_RUN: [&str; 7] = [
+    "cwd",
+    "chdir",
+    "executable",
+    "argv0",
+    "env",
+    "PATH",
+    "unsetenv_others",
+];
 
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -700,7 +967,10 @@ fn raw_calls(code: &str, name: &str, bare: bool, skip_dotted: bool) -> usize {
             if rest.starts_with(ident_char) {
                 return false;
             }
-            trimmed.starts_with('(') || (bare && trimmed.len() < rest.len() && trimmed.starts_with(|c: char| "\"'`$[:%".contains(c) || c.is_alphabetic()))
+            trimmed.starts_with('(')
+                || (bare
+                    && trimmed.len() < rest.len()
+                    && trimmed.starts_with(|c: char| "\"'`$[:%".contains(c) || c.is_alphabetic()))
         })
         .count()
 }
@@ -710,7 +980,15 @@ fn has_quote_op(code: &str, op: &str) -> bool {
     code.match_indices(op).any(|(at, _)| {
         let before = code[..at].chars().next_back();
         let after = code[at + op.len()..].trim_start_matches(' ').chars().next();
-        !before.is_some_and(ident_char) && after.is_some_and(|c| !c.is_alphanumeric() && !c.is_whitespace() && c != '_' && c != '=' && c != ',' && c != ';')
+        !before.is_some_and(ident_char)
+            && after.is_some_and(|c| {
+                !c.is_alphanumeric()
+                    && !c.is_whitespace()
+                    && c != '_'
+                    && c != '='
+                    && c != ','
+                    && c != ';'
+            })
     })
 }
 
@@ -723,12 +1001,25 @@ mod tests {
     }
 
     fn asks(lang: Lang, code: &str) -> Vec<String> {
-        scan(lang, code, "x").asks.into_iter().map(|(_, why)| why).collect()
+        scan(lang, code, "x")
+            .asks
+            .into_iter()
+            .map(|(_, why)| why)
+            .collect()
     }
 
     #[test]
     fn languages_by_program() {
-        for (p, l) in [("python3.12", Lang::Python), ("python", Lang::Python), ("node", Lang::Js), ("bash", Lang::Shell), ("zsh", Lang::Shell), ("ruby", Lang::Ruby), ("perl5", Lang::Perl), ("php8.2", Lang::Php)] {
+        for (p, l) in [
+            ("python3.12", Lang::Python),
+            ("python", Lang::Python),
+            ("node", Lang::Js),
+            ("bash", Lang::Shell),
+            ("zsh", Lang::Shell),
+            ("ruby", Lang::Ruby),
+            ("perl5", Lang::Perl),
+            ("php8.2", Lang::Php),
+        ] {
             assert_eq!(Lang::of(p), Some(l), "{p}");
         }
         assert_eq!(Lang::of("awk"), None);
@@ -738,8 +1029,14 @@ mod tests {
     #[test]
     fn shebangs() {
         assert_eq!(shebang("#!/bin/bash\necho"), Some(Some("bash".into())));
-        assert_eq!(shebang("#!/usr/bin/env python3\n"), Some(Some("python3".into())));
-        assert_eq!(shebang("#!/usr/bin/env -S -u X A=b node --flag\n"), Some(Some("node".into())));
+        assert_eq!(
+            shebang("#!/usr/bin/env python3\n"),
+            Some(Some("python3".into()))
+        );
+        assert_eq!(
+            shebang("#!/usr/bin/env -S -u X A=b node --flag\n"),
+            Some(Some("node".into()))
+        );
         assert_eq!(shebang("#!\n"), Some(None));
         assert_eq!(shebang("echo hi\n"), None);
     }
@@ -755,16 +1052,52 @@ mod tests {
 
     #[test]
     fn written_out_commands_are_found() {
-        assert_eq!(cmds(Lang::Python, "import os\nos.system('git push origin main')"), ["git push origin main"]);
-        assert_eq!(cmds(Lang::Python, "import subprocess\nsubprocess.run(['git', 'push'], check=True)"), ["'git' 'push'"]);
-        assert_eq!(cmds(Lang::Python, "import subprocess as sp\nsp.check_output(\"rm -rf /tmp/x\", shell=True)"), ["rm -rf /tmp/x"]);
-        assert_eq!(cmds(Lang::Js, "const { execSync } = require('child_process');\nexecSync('git push', { stdio: 'inherit' })"), ["git push"]);
-        assert_eq!(cmds(Lang::Js, "const cp = require('child_process'); cp.spawn('git', ['push', '--force'])"), ["'git' 'push' '--force'"]);
-        assert_eq!(cmds(Lang::Js, "import { $ } from 'zx'; await $`git push`"), ["git push"]);
-        assert_eq!(cmds(Lang::Ruby, "system \"git push\"\nputs 1"), ["git push"]);
+        assert_eq!(
+            cmds(Lang::Python, "import os\nos.system('git push origin main')"),
+            ["git push origin main"]
+        );
+        assert_eq!(
+            cmds(
+                Lang::Python,
+                "import subprocess\nsubprocess.run(['git', 'push'], check=True)"
+            ),
+            ["'git' 'push'"]
+        );
+        assert_eq!(
+            cmds(
+                Lang::Python,
+                "import subprocess as sp\nsp.check_output(\"rm -rf /tmp/x\", shell=True)"
+            ),
+            ["rm -rf /tmp/x"]
+        );
+        assert_eq!(
+            cmds(
+                Lang::Js,
+                "const { execSync } = require('child_process');\nexecSync('git push', { stdio: 'inherit' })"
+            ),
+            ["git push"]
+        );
+        assert_eq!(
+            cmds(
+                Lang::Js,
+                "const cp = require('child_process'); cp.spawn('git', ['push', '--force'])"
+            ),
+            ["'git' 'push' '--force'"]
+        );
+        assert_eq!(
+            cmds(Lang::Js, "import { $ } from 'zx'; await $`git push`"),
+            ["git push"]
+        );
+        assert_eq!(
+            cmds(Lang::Ruby, "system \"git push\"\nputs 1"),
+            ["git push"]
+        );
         assert_eq!(cmds(Lang::Ruby, "out = `git push`"), ["git push"]);
         assert_eq!(cmds(Lang::Perl, "system('git', 'push');"), ["'git' 'push'"]);
-        assert_eq!(cmds(Lang::Php, "<?php shell_exec('git push');"), ["git push"]);
+        assert_eq!(
+            cmds(Lang::Php, "<?php shell_exec('git push');"),
+            ["git push"]
+        );
         assert!(asks(Lang::Python, "import os\nos.system('git push')").is_empty());
     }
 
@@ -772,15 +1105,24 @@ mod tests {
     fn harmless_code_asks_nothing() {
         for (lang, code) in [
             (Lang::Python, "import json\nprint(json.dumps({'a': 1}))"),
-            (Lang::Python, "import re\nre.compile(r'\\d+').match('1')\nmodel.eval()\nitems.remove(3)"),
-            (Lang::Js, "const fs = require('fs');\nconsole.log(fs.readFileSync('a.txt', 'utf8'))\n/x/.exec('y')"),
+            (
+                Lang::Python,
+                "import re\nre.compile(r'\\d+').match('1')\nmodel.eval()\nitems.remove(3)",
+            ),
+            (
+                Lang::Js,
+                "const fs = require('fs');\nconsole.log(fs.readFileSync('a.txt', 'utf8'))\n/x/.exec('y')",
+            ),
             (Lang::Js, "const m = require('./lib'); import('./mod.js')"),
             (Lang::Ruby, "h = {}\nh.delete(:a)\nputs 'hi'"),
             (Lang::Perl, "my $x = eval { 1 };\nprint \"ok\\n\";"),
             (Lang::Php, "<?php echo 'hi';"),
         ] {
             let f = scan(lang, code, "x");
-            assert!(f.asks.is_empty() && f.commands.is_empty() && f.deletes.is_empty(), "{code}: {f:?}");
+            assert!(
+                f.asks.is_empty() && f.commands.is_empty() && f.deletes.is_empty(),
+                "{code}: {f:?}"
+            );
         }
     }
 
@@ -793,7 +1135,10 @@ mod tests {
             (Lang::Python, "import os\nos.system('\\x67it push')"),
             (Lang::Python, "import os\nos.execvp('git', ['git', 'push'])"),
             (Lang::Js, "require('child_process').exec(`git ${verb}`)"),
-            (Lang::Js, "const cp = require('child_process'); cp.fork('./worker.js')"),
+            (
+                Lang::Js,
+                "const cp = require('child_process'); cp.fork('./worker.js')",
+            ),
             (Lang::Js, "new Deno.Command('git', { args: ['push'] })"),
             (Lang::Ruby, "system(\"git #{verb}\")"),
             (Lang::Ruby, "x = %x(git push)"),
@@ -803,7 +1148,11 @@ mod tests {
             (Lang::Php, "<?php system($cmd);"),
         ] {
             let a = asks(lang, code);
-            assert!(a.iter().any(|w| w.starts_with("Runs commands only known when it runs")), "{code}: {a:?}");
+            assert!(
+                a.iter()
+                    .any(|w| w.starts_with("Runs commands only known when it runs")),
+                "{code}: {a:?}"
+            );
         }
     }
 
@@ -812,24 +1161,47 @@ mod tests {
         let code = "import os\n".to_string() + &"os.system(".repeat(60_000);
         let t = std::time::Instant::now();
         let f = scan(Lang::Python, &code, "x");
-        assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            t.elapsed()
+        );
         assert!(!f.asks.is_empty());
         let one_line = "from os import ".to_string() + &"system, ".repeat(30_000);
         let t = std::time::Instant::now();
         scan(Lang::Python, &one_line, "x");
-        assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            t.elapsed()
+        );
     }
 
     #[test]
     fn renamed_apis_ask() {
         for (lang, code) in [
             (Lang::Python, "import os\nf = os.system\nf('git push')"),
-            (Lang::Python, "from subprocess import run as r\nr(['git', 'push'])"),
+            (
+                Lang::Python,
+                "from subprocess import run as r\nr(['git', 'push'])",
+            ),
             (Lang::Python, "import os\ngetattr(os, 'system')('git push')"),
-            (Lang::Python, "import subprocess\nlist(map(subprocess.check_output, cmds))"),
-            (Lang::Js, "const { execSync: x } = require('child_process'); x('git push')"),
-            (Lang::Js, "import { execSync as x } from 'child_process'; x('git push')"),
-            (Lang::Js, "const cp = require('child_process'); cp['execSync']('git push')"),
+            (
+                Lang::Python,
+                "import subprocess\nlist(map(subprocess.check_output, cmds))",
+            ),
+            (
+                Lang::Js,
+                "const { execSync: x } = require('child_process'); x('git push')",
+            ),
+            (
+                Lang::Js,
+                "import { execSync as x } from 'child_process'; x('git push')",
+            ),
+            (
+                Lang::Js,
+                "const cp = require('child_process'); cp['execSync']('git push')",
+            ),
             (Lang::Ruby, "m = method(:system)\nm.call('git push')"),
             (Lang::Php, "<?php $f = 'sys' . 'tem'; $f('git push');"),
         ] {
@@ -837,45 +1209,151 @@ mod tests {
             assert!(!a.is_empty(), "{code}: {a:?}");
         }
         // Importing under its own name is not renaming.
-        assert!(asks(Lang::Python, "from subprocess import run, PIPE\nrun(['ls'], stdout=PIPE)").is_empty());
-        assert!(asks(Lang::Js, "const { execSync } = require('child_process'); execSync('ls')").is_empty());
+        assert!(
+            asks(
+                Lang::Python,
+                "from subprocess import run, PIPE\nrun(['ls'], stdout=PIPE)"
+            )
+            .is_empty()
+        );
+        assert!(
+            asks(
+                Lang::Js,
+                "const { execSync } = require('child_process'); execSync('ls')"
+            )
+            .is_empty()
+        );
     }
 
     #[test]
     fn options_that_change_the_run_and_every_deleted_path() {
-        assert!(!asks(Lang::Python, "import subprocess\nsubprocess.run(['rm', '-rf', 'build'], cwd='/tmp')").is_empty());
-        assert!(!asks(Lang::Js, "require('child_process').execSync('rm -rf build', { cwd: '/tmp' })").is_empty());
+        assert!(
+            !asks(
+                Lang::Python,
+                "import subprocess\nsubprocess.run(['rm', '-rf', 'build'], cwd='/tmp')"
+            )
+            .is_empty()
+        );
+        assert!(
+            !asks(
+                Lang::Js,
+                "require('child_process').execSync('rm -rf build', { cwd: '/tmp' })"
+            )
+            .is_empty()
+        );
         assert!(!asks(Lang::Ruby, "system('rm -rf build', chdir: '/tmp')").is_empty());
-        assert_eq!(cmds(Lang::Python, "import subprocess\nsubprocess.run(['ls'], check=True, text=True)"), ["'ls'"]);
-        assert_eq!(scan(Lang::Ruby, "File.delete('local.tmp', '/tmp/important.txt')", "x").deletes, ["local.tmp", "/tmp/important.txt"]);
-        assert_eq!(scan(Lang::Perl, "unlink 'local.tmp', '/tmp/important.txt';", "x").deletes, ["local.tmp", "/tmp/important.txt"]);
+        assert_eq!(
+            cmds(
+                Lang::Python,
+                "import subprocess\nsubprocess.run(['ls'], check=True, text=True)"
+            ),
+            ["'ls'"]
+        );
+        assert_eq!(
+            scan(
+                Lang::Ruby,
+                "File.delete('local.tmp', '/tmp/important.txt')",
+                "x"
+            )
+            .deletes,
+            ["local.tmp", "/tmp/important.txt"]
+        );
+        assert_eq!(
+            scan(Lang::Perl, "unlink 'local.tmp', '/tmp/important.txt';", "x").deletes,
+            ["local.tmp", "/tmp/important.txt"]
+        );
         assert!(!scan(Lang::Perl, "unlink 'a', $b;", "x").asks.is_empty());
-        assert!(!scan(Lang::Python, "from pathlib import Path\nPath(p).unlink()", "x").asks.is_empty());
+        assert!(
+            !scan(
+                Lang::Python,
+                "from pathlib import Path\nPath(p).unlink()",
+                "x"
+            )
+            .asks
+            .is_empty()
+        );
     }
 
     #[test]
     fn hidden_code_is_flagged() {
-        let a = asks(Lang::Python, "import base64\nexec(base64.b64decode('Z2l0IHB1c2g='))");
-        assert_eq!(a, ["Decodes hidden code and runs it (b64decode and exec in x)"]);
-        assert_eq!(asks(Lang::Python, "eval(input())"), ["Runs code only known when it runs (eval in x)"]);
-        assert!(asks(Lang::Js, "eval(atob('Z2l0'))")[0].starts_with("Decodes hidden code and runs it"));
-        assert!(asks(Lang::Js, "new Function(Buffer.from(s, 'base64').toString())()")[0].starts_with("Decodes hidden code"));
+        let a = asks(
+            Lang::Python,
+            "import base64\nexec(base64.b64decode('Z2l0IHB1c2g='))",
+        );
+        assert_eq!(
+            a,
+            ["Decodes hidden code and runs it (b64decode and exec in x)"]
+        );
+        assert_eq!(
+            asks(Lang::Python, "eval(input())"),
+            ["Runs code only known when it runs (eval in x)"]
+        );
+        assert!(
+            asks(Lang::Js, "eval(atob('Z2l0'))")[0].starts_with("Decodes hidden code and runs it")
+        );
+        assert!(
+            asks(
+                Lang::Js,
+                "new Function(Buffer.from(s, 'base64').toString())()"
+            )[0]
+            .starts_with("Decodes hidden code")
+        );
         assert!(asks(Lang::Ruby, "eval(Base64.decode64(s))")[0].starts_with("Decodes hidden code"));
         assert!(asks(Lang::Perl, "eval decode_base64($s);")[0].starts_with("Decodes hidden code"));
-        assert!(asks(Lang::Php, "<?php eval(base64_decode($s));")[0].starts_with("Decodes hidden code"));
-        assert_eq!(asks(Lang::Python, "m = __import__(name)"), ["Loads code chosen when it runs (__import__ in x)"]);
-        assert_eq!(asks(Lang::Js, "require(name)"), ["Loads code chosen when it runs (require in x)"]);
+        assert!(
+            asks(Lang::Php, "<?php eval(base64_decode($s));")[0].starts_with("Decodes hidden code")
+        );
+        assert_eq!(
+            asks(Lang::Python, "m = __import__(name)"),
+            ["Loads code chosen when it runs (__import__ in x)"]
+        );
+        assert_eq!(
+            asks(Lang::Js, "require(name)"),
+            ["Loads code chosen when it runs (require in x)"]
+        );
     }
 
     #[test]
     fn deletes_and_mail() {
-        let f = scan(Lang::Python, "import shutil, os\nshutil.rmtree('/etc/x')\nos.remove(path)", "x");
+        let f = scan(
+            Lang::Python,
+            "import shutil, os\nshutil.rmtree('/etc/x')\nos.remove(path)",
+            "x",
+        );
         assert_eq!(f.deletes, ["/etc/x"]);
-        assert_eq!(f.asks, [("file_delete", "Deletes files at paths only known when it runs (remove in x)".to_string())]);
-        assert_eq!(scan(Lang::Js, "const fs = require('fs'); fs.rmSync('/tmp/a', { recursive: true })", "x").deletes, ["/tmp/a"]);
-        assert_eq!(scan(Lang::Perl, "unlink '/etc/passwd';", "x").deletes, ["/etc/passwd"]);
-        assert_eq!(asks(Lang::Python, "import smtplib\ns = smtplib.SMTP('h')"), ["Sends email (smtplib in x)"]);
-        assert!(scan(Lang::Python, "requests.post('https://hooks.slack.com/services/x')", "x").strings.contains(&"https://hooks.slack.com/services/x".to_string()));
+        assert_eq!(
+            f.asks,
+            [(
+                "file_delete",
+                "Deletes files at paths only known when it runs (remove in x)".to_string()
+            )]
+        );
+        assert_eq!(
+            scan(
+                Lang::Js,
+                "const fs = require('fs'); fs.rmSync('/tmp/a', { recursive: true })",
+                "x"
+            )
+            .deletes,
+            ["/tmp/a"]
+        );
+        assert_eq!(
+            scan(Lang::Perl, "unlink '/etc/passwd';", "x").deletes,
+            ["/etc/passwd"]
+        );
+        assert_eq!(
+            asks(Lang::Python, "import smtplib\ns = smtplib.SMTP('h')"),
+            ["Sends email (smtplib in x)"]
+        );
+        assert!(
+            scan(
+                Lang::Python,
+                "requests.post('https://hooks.slack.com/services/x')",
+                "x"
+            )
+            .strings
+            .contains(&"https://hooks.slack.com/services/x".to_string())
+        );
     }
 
     #[test]
@@ -890,18 +1368,36 @@ mod tests {
         symlink(ws.join("a.sh"), ws.join("sub/in.sh")).unwrap();
         std::fs::write(ws.join("big.sh"), "#".repeat(MAX_SCRIPT_BYTES + 1)).unwrap();
         std::fs::write(ws.join("app"), b"\x7fELF\x02\x01\x01\0").unwrap();
-        assert_eq!(read(&ws, &ws.join("a.sh")), Source::Text("git push\n".into()));
-        assert_eq!(read(&ws, &ws.join("sub/in.sh")), Source::Text("git push\n".into()));
-        assert_eq!(read(&ws, &ws.join("out.sh")), Source::LinksOutside(std::fs::canonicalize(root.join("outside.sh")).unwrap()));
+        assert_eq!(
+            read(&ws, &ws.join("a.sh")),
+            Source::Text("git push\n".into())
+        );
+        assert_eq!(
+            read(&ws, &ws.join("sub/in.sh")),
+            Source::Text("git push\n".into())
+        );
+        assert_eq!(
+            read(&ws, &ws.join("out.sh")),
+            Source::LinksOutside(std::fs::canonicalize(root.join("outside.sh")).unwrap())
+        );
         assert_eq!(read(&ws, &ws.join("nope.sh")), Source::Missing);
         assert_eq!(read(&ws, &ws.join("big.sh")), Source::TooBig);
-        assert_eq!(read(&ws, &ws.join("sub")), Source::Unreadable("it isn't a regular file"));
+        assert_eq!(
+            read(&ws, &ws.join("sub")),
+            Source::Unreadable("it isn't a regular file")
+        );
         assert_eq!(read(&ws, &ws.join("app")), Source::Binary);
-        assert_eq!(read(&root.join("gone"), &ws.join("a.sh")), Source::Unreadable("the workspace isn't on this server"));
+        assert_eq!(
+            read(&root.join("gone"), &ws.join("a.sh")),
+            Source::Unreadable("the workspace isn't on this server")
+        );
         let fifo = ws.join("fifo");
         let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-        assert_eq!(read(&ws, &fifo), Source::Unreadable("it isn't a regular file"));
+        assert_eq!(
+            read(&ws, &fifo),
+            Source::Unreadable("it isn't a regular file")
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

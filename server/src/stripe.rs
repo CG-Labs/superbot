@@ -27,7 +27,11 @@ pub struct Stripe {
 pub enum Error {
     /// No answer, or one that wasn't JSON.
     Unreachable,
-    Refused { status: u16, kind: Option<String>, code: Option<String> },
+    Refused {
+        status: u16,
+        kind: Option<String>,
+        code: Option<String>,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -49,14 +53,30 @@ impl Stripe {
     /// `base` is Stripe's API; tests point it at a fake on loopback, the only place the
     /// key may go without TLS.
     pub fn new(key: &str, base: &str) -> Stripe {
-        let loopback = url::Url::parse(base).ok().is_some_and(|u| matches!(u.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")));
-        let http = reqwest::Client::builder().https_only(!loopback).connect_timeout(CONNECT_TIMEOUT).timeout(TIMEOUT).build().expect("HTTP client");
-        Stripe { key: key.into(), base: base.trim_end_matches('/').into(), http }
+        let loopback = url::Url::parse(base)
+            .ok()
+            .is_some_and(|u| matches!(u.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")));
+        let http = reqwest::Client::builder()
+            .https_only(!loopback)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(TIMEOUT)
+            .build()
+            .expect("HTTP client");
+        Stripe {
+            key: key.into(),
+            base: base.trim_end_matches('/').into(),
+            http,
+        }
     }
 
     /// POSTs `form` to `path` (`/v1/...`). Retried once, with the same idempotency key, when
     /// Stripe doesn't answer or answers 429 or 5xx, as Stripe's own libraries do.
-    pub async fn post(&self, path: &str, form: &[(String, String)], idempotency_key: &str) -> Result<Value, Error> {
+    pub async fn post(
+        &self,
+        path: &str,
+        form: &[(String, String)],
+        idempotency_key: &str,
+    ) -> Result<Value, Error> {
         self.send(path, Some((form, idempotency_key))).await
     }
 
@@ -65,7 +85,11 @@ impl Stripe {
         self.send(path, None).await
     }
 
-    async fn send(&self, path: &str, post: Option<(&[(String, String)], &str)>) -> Result<Value, Error> {
+    async fn send(
+        &self,
+        path: &str,
+        post: Option<(&[(String, String)], &str)>,
+    ) -> Result<Value, Error> {
         let mut last = Error::Unreachable;
         for attempt in 0..2 {
             if attempt > 0 {
@@ -73,10 +97,18 @@ impl Stripe {
             }
             let url = format!("{}{path}", self.base);
             let req = match post {
-                Some((form, key)) => self.http.post(url).header("Idempotency-Key", key).form(form),
+                Some((form, key)) => self
+                    .http
+                    .post(url)
+                    .header("Idempotency-Key", key)
+                    .form(form),
                 None => self.http.get(url),
             };
-            let sent = req.bearer_auth(&self.key).header("Stripe-Version", VERSION).send().await;
+            let sent = req
+                .bearer_auth(&self.key)
+                .header("Stripe-Version", VERSION)
+                .send()
+                .await;
             let Ok(res) = sent else {
                 last = Error::Unreachable;
                 continue;
@@ -90,7 +122,11 @@ impl Stripe {
                 return Ok(body);
             }
             let e = &body["error"];
-            last = Error::Refused { status, kind: e["type"].as_str().map(String::from), code: e["code"].as_str().map(String::from) };
+            last = Error::Refused {
+                status,
+                kind: e["type"].as_str().map(String::from),
+                code: e["code"].as_str().map(String::from),
+            };
             if status != 429 && status < 500 {
                 break;
             }
@@ -114,7 +150,12 @@ pub fn idempotency_key(action: &str, user: &str, form: &[(String, String)], now_
         h.update(v.as_bytes());
         h.update([0]);
     }
-    let hex: String = h.finalize().iter().take(16).map(|b| format!("{b:02x}")).collect();
+    let hex: String = h
+        .finalize()
+        .iter()
+        .take(16)
+        .map(|b| format!("{b:02x}"))
+        .collect();
     format!("superbot-{action}-{hex}")
 }
 
@@ -123,7 +164,10 @@ mod tests {
     use super::*;
 
     fn form(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -131,14 +175,26 @@ mod tests {
         let f = form(&[("customer", "cus_1")]);
         let t = 1_800_000_000_000;
         let k = idempotency_key("portal", "u1", &f, t);
-        assert!(k.starts_with("superbot-portal-") && k.len() == "superbot-portal-".len() + 32, "{k}");
-        assert_eq!(k, idempotency_key("portal", "u1", &f, t + 59_999 - t % 60_000));
+        assert!(
+            k.starts_with("superbot-portal-") && k.len() == "superbot-portal-".len() + 32,
+            "{k}"
+        );
+        assert_eq!(
+            k,
+            idempotency_key("portal", "u1", &f, t + 59_999 - t % 60_000)
+        );
         assert_ne!(k, idempotency_key("portal", "u1", &f, t + 60_000));
         assert_ne!(k, idempotency_key("portal", "u2", &f, t));
         assert_ne!(k, idempotency_key("checkout", "u1", &f, t));
-        assert_ne!(k, idempotency_key("portal", "u1", &form(&[("customer", "cus_2")]), t));
+        assert_ne!(
+            k,
+            idempotency_key("portal", "u1", &form(&[("customer", "cus_2")]), t)
+        );
         // Field boundaries count: ("ab", "c") isn't ("a", "bc").
-        assert_ne!(idempotency_key("x", "u", &form(&[("ab", "c")]), t), idempotency_key("x", "u", &form(&[("a", "bc")]), t));
+        assert_ne!(
+            idempotency_key("x", "u", &form(&[("ab", "c")]), t),
+            idempotency_key("x", "u", &form(&[("a", "bc")]), t)
+        );
     }
 
     #[tokio::test]
@@ -147,14 +203,36 @@ mod tests {
         // doesn't wait for a connect timeout.
         let s = Stripe::new("sk_test_x", "http://192.0.2.1");
         let started = std::time::Instant::now();
-        assert_eq!(s.get("/v1/checkout/sessions/cs_1").await, Err(Error::Unreachable));
-        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        assert_eq!(
+            s.get("/v1/checkout/sessions/cs_1").await,
+            Err(Error::Unreachable)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
     fn errors_say_only_the_status_type_and_code() {
-        let e = Error::Refused { status: 400, kind: Some("invalid_request_error".into()), code: Some("resource_missing".into()) };
-        assert_eq!(e.to_string(), "HTTP 400 invalid_request_error resource_missing");
-        assert_eq!(Error::Refused { status: 503, kind: None, code: None }.to_string(), "HTTP 503");
+        let e = Error::Refused {
+            status: 400,
+            kind: Some("invalid_request_error".into()),
+            code: Some("resource_missing".into()),
+        };
+        assert_eq!(
+            e.to_string(),
+            "HTTP 400 invalid_request_error resource_missing"
+        );
+        assert_eq!(
+            Error::Refused {
+                status: 503,
+                kind: None,
+                code: None
+            }
+            .to_string(),
+            "HTTP 503"
+        );
     }
 }

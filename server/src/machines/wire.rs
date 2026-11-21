@@ -112,6 +112,8 @@ pub const CAN_SCREENS: &str = "screens";
 pub const CAN_TEAMMATES: &str = "teammates";
 pub const CAN_TEAMMATE_REMOVAL: &str = "teammate_removal";
 pub const CAN_TEAMMATE_LOGINS: &str = "teammate_logins";
+/// Runs an install's `after` script (`InstallSource::Script`, ADR 0072).
+pub const CAN_INSTALL_AFTER: &str = "install_after";
 
 /// The screen protocol this build speaks (ADR 0045). A request names it, an agent
 /// refuses any other, and botd treats an agent that reports another as outdated.
@@ -299,7 +301,10 @@ pub struct TeammatePurged {
 
 /// `token` as a viewer password: plain lowercase hex, long enough to guess at no rate.
 pub fn screen_token(token: &str) -> bool {
-    (32..=128).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    (32..=128).contains(&token.len())
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// The OS user Bots run as on a machine (ADR 0043). An agent may be set to another,
@@ -435,11 +440,17 @@ pub struct LoginRequest {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum LoginEvent {
     #[serde(rename_all = "camelCase")]
-    Started { login_id: String },
+    Started {
+        login_id: String,
+    },
     /// What the login wrote to its terminal, as it wrote it.
-    Output { text: String },
+    Output {
+        text: String,
+    },
     Ping,
-    Error { message: String },
+    Error {
+        message: String,
+    },
     /// It exited. `logged_in`: one of its credential files exists now.
     #[serde(rename_all = "camelCase")]
     Exit {
@@ -603,11 +614,15 @@ pub enum InstallSource {
     },
     /// An installer script, checked against `sha256`, run with `args` and HOME set to
     /// a folder of its own. `bin` is where it leaves the program, under that folder.
+    /// `after`: a script botd sends with it, run the same way once it succeeds; only an
+    /// agent that says `CAN_INSTALL_AFTER` is sent one.
     Script {
         url: String,
         sha256: String,
         args: Vec<String>,
         bin: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
     },
 }
 
@@ -804,29 +819,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!((old.protocol, old.layout, old.jobs), (0, None, 0));
-        assert!(old.logins.is_empty(), "an agent from before logins says nothing of them");
-        assert!(old.screens.is_none(), "an agent from before screens says nothing of them");
+        assert!(
+            old.logins.is_empty(),
+            "an agent from before logins says nothing of them"
+        );
+        assert!(
+            old.screens.is_none(),
+            "an agent from before screens says nothing of them"
+        );
     }
 
     #[test]
     fn screen_tokens_are_long_lowercase_hex() {
         assert!(screen_token(&"a1".repeat(16)));
         assert!(screen_token(&"f".repeat(128)));
-        for bad in ["", "abc", &"A1".repeat(16), &"g".repeat(32), &"a".repeat(129), &format!("{} ", "a".repeat(32))] {
+        for bad in [
+            "",
+            "abc",
+            &"A1".repeat(16),
+            &"g".repeat(32),
+            &"a".repeat(129),
+            &format!("{} ", "a".repeat(32)),
+        ] {
             assert!(!screen_token(bad), "{bad:?}");
         }
     }
 
     #[test]
     fn home_paths_are_plain_and_relative() {
-        for ok in ["USER.md", ".claude/.credentials.json", "work/a b/c.txt", "bots/b1/MEMORY.md"] {
+        for ok in [
+            "USER.md",
+            ".claude/.credentials.json",
+            "work/a b/c.txt",
+            "bots/b1/MEMORY.md",
+        ] {
             assert!(home_path(ok), "{ok}");
         }
         let long = "a".repeat(256);
-        for bad in ["", "/etc/passwd", "../x", "a/../b", "a/./b", "a//b", "a/", "a\\b", "a\nb", long.as_str()] {
+        for bad in [
+            "",
+            "/etc/passwd",
+            "../x",
+            "a/../b",
+            "a/./b",
+            "a//b",
+            "a/",
+            "a\\b",
+            "a\nb",
+            long.as_str(),
+        ] {
             assert!(!home_path(bad), "{bad:?}");
         }
-        let e = LoginEvent::Exit { success: true, status: "exit status: 0".into(), logged_in: true };
-        assert_eq!(serde_json::to_string(&e).unwrap(), r#"{"type":"exit","success":true,"status":"exit status: 0","loggedIn":true}"#);
+        let e = LoginEvent::Exit {
+            success: true,
+            status: "exit status: 0".into(),
+            logged_in: true,
+        };
+        assert_eq!(
+            serde_json::to_string(&e).unwrap(),
+            r#"{"type":"exit","success":true,"status":"exit status: 0","loggedIn":true}"#
+        );
     }
 }

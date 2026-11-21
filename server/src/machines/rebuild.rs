@@ -74,7 +74,9 @@ impl Rebuilds {
             "" | "manual" => Ok(Rebuilds::Manual),
             "auto" => Ok(Rebuilds::Auto),
             "off" => Ok(Rebuilds::Off),
-            v => Err(format!("MACHINE_LEGACY_REBUILDS must be off, manual or auto, not \"{v}\"")),
+            v => Err(format!(
+                "MACHINE_LEGACY_REBUILDS must be off, manual or auto, not \"{v}\""
+            )),
         }
     }
 
@@ -95,17 +97,27 @@ pub fn legacy(hb: &Heartbeat) -> bool {
 /// What botd last heard its agent can do. None: never heard, or forgotten by a rebuild.
 fn can_seen(m: &Machine) -> Option<Vec<String>> {
     let u = m.agent_upkeep.as_ref()?;
-    Some(u["can"].as_array().map_or(Vec::new(), |a| a.iter().filter_map(|c| c.as_str().map(String::from)).collect()))
+    Some(u["can"].as_array().map_or(Vec::new(), |a| {
+        a.iter()
+            .filter_map(|c| c.as_str().map(String::from))
+            .collect()
+    }))
 }
 
 /// What a later botd asks of its agent that it can't do.
 pub fn lacks(can: &[String]) -> Vec<&'static str> {
-    CAPABILITIES.into_iter().filter(|c| !can.iter().any(|x| x == c)).collect()
+    CAPABILITIES
+        .into_iter()
+        .filter(|c| !can.iter().any(|x| x == c))
+        .collect()
 }
 
 /// A rebuild is asked for or on its way: Bots don't run there meanwhile.
 pub fn underway(m: &Machine) -> bool {
-    matches!(m.rebuild_state.as_deref(), Some("queued" | "retrying" | "rebuilding"))
+    matches!(
+        m.rebuild_state.as_deref(),
+        Some("queued" | "retrying" | "rebuilding")
+    )
 }
 
 /// How long to wait after `attempts` tries: 1, 2, 4, 8, 16, then 30 minutes.
@@ -115,7 +127,8 @@ pub fn backoff_ms(attempts: i64) -> i64 {
 
 /// It enrolled again since the last rebuild was sent.
 fn back(m: &Machine) -> bool {
-    m.enrollment == "enrolled" && matches!((m.enrolled_at, m.rebuild_sent_at), (Some(e), Some(s)) if e >= s)
+    m.enrollment == "enrolled"
+        && matches!((m.enrolled_at, m.rebuild_sent_at), (Some(e), Some(s)) if e >= s)
 }
 
 fn who(m: &Machine) -> &str {
@@ -142,7 +155,9 @@ fn unable(cp: &ControlPlane, e: &Enrollment) -> Option<&'static str> {
         return Some(super::NOT_CONFIGURED);
     }
     if e.agent_sha256().is_none() {
-        return Some("superbot-machine isn't next to botd, so a rebuilt machine would have no agent to install.");
+        return Some(
+            "superbot-machine isn't next to botd, so a rebuilt machine would have no agent to install.",
+        );
     }
     None
 }
@@ -150,36 +165,84 @@ fn unable(cp: &ControlPlane, e: &Enrollment) -> Option<&'static str> {
 /// Ends the rebuild as failed from one of `from`, with any unused token revoked.
 fn fail(app: &App, m: &Machine, from: &[&str], reason: &str, error: &str) {
     let Some(id) = &m.rebuild_id else { return };
-    if app.db.machine_rebuild_move(&m.id, id, from, "failed", false, None, Some(error)) {
+    if app
+        .db
+        .machine_rebuild_move(&m.id, id, from, "failed", false, None, Some(error))
+    {
         app.db.revoke_machine_tokens(&m.id);
         let m = app.db.machine(&m.id).unwrap_or_else(|| m.clone());
         app.db.record(
-            &event(&system(&m), "machine.rebuild_failed", &m, details(&m, json!({ "reason": reason, "error": error })))
-                .outcome(Outcome::Failure),
+            &event(
+                &system(&m),
+                "machine.rebuild_failed",
+                &m,
+                details(&m, json!({ "reason": reason, "error": error })),
+            )
+            .outcome(Outcome::Failure),
         );
     }
 }
 
 /// A try from `from` failed (`count`: one more try; a rebuild sent counted already):
 /// try again from `to` after the backoff, or give up.
-fn retry_later(app: &App, m: &Machine, from: &str, to: &str, count: bool, reason: &str, error: &str) {
+fn retry_later(
+    app: &App,
+    m: &Machine,
+    from: &str,
+    to: &str,
+    count: bool,
+    reason: &str,
+    error: &str,
+) {
     let Some(id) = &m.rebuild_id else { return };
     let tries = m.rebuild_attempts + count as i64;
     if tries >= MAX_ATTEMPTS {
-        if app.db.machine_rebuild_move(&m.id, id, &[from], from, count, None, Some(error)) {
-            fail(app, &app.db.machine(&m.id).unwrap_or_else(|| m.clone()), &[from], reason, error);
+        if app
+            .db
+            .machine_rebuild_move(&m.id, id, &[from], from, count, None, Some(error))
+        {
+            fail(
+                app,
+                &app.db.machine(&m.id).unwrap_or_else(|| m.clone()),
+                &[from],
+                reason,
+                error,
+            );
         }
         return;
     }
-    app.db.machine_rebuild_move(&m.id, id, &[from], to, count, Some(now() + backoff_ms(tries)), Some(error));
+    app.db.machine_rebuild_move(
+        &m.id,
+        id,
+        &[from],
+        to,
+        count,
+        Some(now() + backoff_ms(tries)),
+        Some(error),
+    );
 }
 
 fn cancel(app: &App, by: &Who, m: &Machine, reason: &str) -> bool {
-    let Some(id) = &m.rebuild_id else { return false };
-    if !app.db.machine_rebuild_move(&m.id, id, &["queued"], "cancelled", false, None, Some(reason)) {
+    let Some(id) = &m.rebuild_id else {
+        return false;
+    };
+    if !app.db.machine_rebuild_move(
+        &m.id,
+        id,
+        &["queued"],
+        "cancelled",
+        false,
+        None,
+        Some(reason),
+    ) {
         return false;
     }
-    app.db.record(&event(by, "machine.rebuild_cancelled", m, details(m, json!({ "reason": reason }))));
+    app.db.record(&event(
+        by,
+        "machine.rebuild_cancelled",
+        m,
+        details(m, json!({ "reason": reason })),
+    ));
     true
 }
 
@@ -195,8 +258,14 @@ fn forget_old(app: &App, m: &Machine) {
 /// Teammate cleanups asked of the old machine before `before`: its disks are gone.
 fn end_cleanups(app: &App, m: &Machine, before: i64) {
     for state in ["pending", "held"] {
-        for c in app.db.teammate_cleanups(Some(state), Some(&m.id)).into_iter().filter(|c| c.created_at <= before) {
-            app.db.teammate_cleanup_end(&c.id, state, "done", Some("machine rebuilt"));
+        for c in app
+            .db
+            .teammate_cleanups(Some(state), Some(&m.id))
+            .into_iter()
+            .filter(|c| c.created_at <= before)
+        {
+            app.db
+                .teammate_cleanup_end(&c.id, state, "done", Some("machine rebuilt"));
         }
     }
 }
@@ -213,10 +282,25 @@ fn deadline(e: &Enrollment, sent: i64) -> i64 {
 }
 
 /// Sends the rebuild from `from` (`queued` or `retrying`). Caller holds `ops`.
-async fn send(app: &App, cp: &ControlPlane, p: &dyn MachineProvider, e: &Enrollment, m: &Machine, from: &str) {
-    let Some(id) = m.rebuild_id.clone() else { return };
+async fn send(
+    app: &App,
+    cp: &ControlPlane,
+    p: &dyn MachineProvider,
+    e: &Enrollment,
+    m: &Machine,
+    from: &str,
+) {
+    let Some(id) = m.rebuild_id.clone() else {
+        return;
+    };
     if m.rebuild_attempts >= MAX_ATTEMPTS {
-        return fail(app, m, &[from], "attempts", "It was tried as many times as it may be.");
+        return fail(
+            app,
+            m,
+            &[from],
+            "attempts",
+            "It was tried as many times as it may be.",
+        );
     }
     let Some(pid) = m.provider_id.clone() else {
         return fail(app, m, &[from], "no_provider_id", "It has no provider id.");
@@ -228,8 +312,17 @@ async fn send(app: &App, cp: &ControlPlane, p: &dyn MachineProvider, e: &Enrollm
         Ok(t) => t,
         Err(why) => return retry_later(app, m, from, from, true, "token", &why),
     };
-    app.db.record(&event(&by, "machine.enroll_token_issued", m, json!({ "expiresAt": expires, "via": "rebuild", "rebuildId": id })));
-    let spec = RebuildSpec { image: cp.image.clone(), authorized_keys: cp.authorized_keys.clone(), user_data: e.user_data(m, &token) };
+    app.db.record(&event(
+        &by,
+        "machine.enroll_token_issued",
+        m,
+        json!({ "expiresAt": expires, "via": "rebuild", "rebuildId": id }),
+    ));
+    let spec = RebuildSpec {
+        image: cp.image.clone(),
+        authorized_keys: cp.authorized_keys.clone(),
+        user_data: e.user_data(m, &token),
+    };
     // Recorded as sent before it is, so a botd that stops mid-call waits for the
     // machine to come back rather than wiping it twice.
     if !app.db.machine_rebuild_sending(&m.id, &id, &[from]) {
@@ -242,23 +335,50 @@ async fn send(app: &App, cp: &ControlPlane, p: &dyn MachineProvider, e: &Enrollm
     match p.rebuild(&pid, &spec).await {
         Ok(()) => {
             wiped(app, &by, &m);
-            app.db.record(&event(&by, "machine.rebuild_sent", &m, details(&m, extra)));
+            app.db
+                .record(&event(&by, "machine.rebuild_sent", &m, details(&m, extra)));
         }
         Err(ProviderError::RateLimited) => {
             app.db.revoke_machine_tokens(&m.id);
             let why = ProviderError::RateLimited.to_string();
-            app.db.machine_rebuild_move(&m.id, &id, &["rebuilding"], from, false, Some(now() + backoff_ms(m.rebuild_attempts)), Some(&why));
+            app.db.machine_rebuild_move(
+                &m.id,
+                &id,
+                &["rebuilding"],
+                from,
+                false,
+                Some(now() + backoff_ms(m.rebuild_attempts)),
+                Some(&why),
+            );
             app.db.record(
-                &event(&by, "machine.rebuild_failed", &m, details(&m, json!({ "reason": "rate_limited", "error": why, "retrying": true })))
-                    .outcome(Outcome::Failure),
+                &event(
+                    &by,
+                    "machine.rebuild_failed",
+                    &m,
+                    details(
+                        &m,
+                        json!({ "reason": "rate_limited", "error": why, "retrying": true }),
+                    ),
+                )
+                .outcome(Outcome::Failure),
             );
         }
         Err(err) if transient(&err) => {
             // It may have happened: wait for the machine to come back with the new
             // token, and send it again only if it doesn't. Its old agent keeps its
             // certificates and cleanups until then.
-            let why = format!("The provider's answer was lost ({err}); waiting to see whether it was rebuilt.");
-            app.db.machine_rebuild_move(&m.id, &id, &["rebuilding"], "rebuilding", false, None, Some(&why));
+            let why = format!(
+                "The provider's answer was lost ({err}); waiting to see whether it was rebuilt."
+            );
+            app.db.machine_rebuild_move(
+                &m.id,
+                &id,
+                &["rebuilding"],
+                "rebuilding",
+                false,
+                None,
+                Some(&why),
+            );
             let mut d = details(&m, extra);
             d["answered"] = json!(false);
             d["error"] = json!(err.to_string());
@@ -270,14 +390,26 @@ async fn send(app: &App, cp: &ControlPlane, p: &dyn MachineProvider, e: &Enrollm
 
 /// One step of `machine_id`'s rebuild, if one is underway. Caller holds `ops`.
 pub(super) async fn step(app: &App, cp: &ControlPlane, e: &Enrollment, machine_id: &str) {
-    let Some(p) = cp.provider.as_deref() else { return };
-    let Some(m) = app.db.machine(machine_id).filter(|m| cp.owns(m)) else { return };
-    let Some(st) = m.rebuild_state.clone().filter(|_| underway(&m)) else { return };
+    let Some(p) = cp.provider.as_deref() else {
+        return;
+    };
+    let Some(m) = app.db.machine(machine_id).filter(|m| cp.owns(m)) else {
+        return;
+    };
+    let Some(st) = m.rebuild_state.clone().filter(|_| underway(&m)) else {
+        return;
+    };
     let at = now();
     match m.state {
         State::Running => {}
         State::Destroying | State::Destroyed | State::Error => {
-            return fail(app, &m, &[st.as_str()], "machine_gone", &format!("The machine is {}.", m.state.as_str()));
+            return fail(
+                app,
+                &m,
+                &[st.as_str()],
+                "machine_gone",
+                &format!("The machine is {}.", m.state.as_str()),
+            );
         }
         // Suspended or still being made: it waits.
         _ => return,
@@ -295,14 +427,38 @@ pub(super) async fn step(app: &App, cp: &ControlPlane, e: &Enrollment, machine_i
                 return fail(app, &m, &["queued"], "unable", why);
             }
             if !m.rebuild_discard && app.db.machine_may_hold_work(&m.id) {
-                return fail(app, &m, &["queued"], "may_hold_work", "It may hold the user's files now, and the rebuild wasn't asked to discard them.");
+                return fail(
+                    app,
+                    &m,
+                    &["queued"],
+                    "may_hold_work",
+                    "It may hold the user's files now, and the rebuild wasn't asked to discard them.",
+                );
             }
             if m.enrollment != "enrolled" {
-                return retry_later(app, &m, "queued", "queued", true, "not_enrolled", "Its agent isn't enrolled, so botd can't check that it's idle.");
+                return retry_later(
+                    app,
+                    &m,
+                    "queued",
+                    "queued",
+                    true,
+                    "not_enrolled",
+                    "Its agent isn't enrolled, so botd can't check that it's idle.",
+                );
             }
             let hb = match enroll::heartbeat(app, e, &m).await {
                 Ok(hb) => hb,
-                Err(why) => return retry_later(app, &m, "queued", "queued", true, "offline", &format!("Its agent didn't answer: {why}")),
+                Err(why) => {
+                    return retry_later(
+                        app,
+                        &m,
+                        "queued",
+                        "queued",
+                        true,
+                        "offline",
+                        &format!("Its agent didn't answer: {why}"),
+                    );
+                }
             };
             if !legacy(&hb) {
                 cancel(app, &system(&m), &m, "not_needed");
@@ -311,7 +467,15 @@ pub(super) async fn step(app: &App, cp: &ControlPlane, e: &Enrollment, machine_i
             if hb.jobs > 0 {
                 let id = m.rebuild_id.as_deref().unwrap_or_default();
                 let why = format!("Waiting: it's running {} jobs.", hb.jobs);
-                app.db.machine_rebuild_move(&m.id, id, &["queued"], "queued", false, Some(at + BUSY_WAIT_MS), Some(&why));
+                app.db.machine_rebuild_move(
+                    &m.id,
+                    id,
+                    &["queued"],
+                    "queued",
+                    false,
+                    Some(at + BUSY_WAIT_MS),
+                    Some(&why),
+                );
                 return;
             }
             send(app, cp, p, e, &m, "queued").await;
@@ -320,7 +484,13 @@ pub(super) async fn step(app: &App, cp: &ControlPlane, e: &Enrollment, machine_i
             if back(&m) {
                 // It enrolled just as the last deadline passed; one that never answers fails.
                 if at > deadline(e, m.rebuild_sent_at.unwrap_or(at)) + ANSWER_MS {
-                    fail(app, &m, &["retrying"], "no_heartbeat", "It enrolled again but its agent never answered.");
+                    fail(
+                        app,
+                        &m,
+                        &["retrying"],
+                        "no_heartbeat",
+                        "It enrolled again but its agent never answered.",
+                    );
                 }
                 return;
             }
@@ -337,7 +507,15 @@ pub(super) async fn step(app: &App, cp: &ControlPlane, e: &Enrollment, machine_i
             {
                 let id = m.rebuild_id.as_deref().unwrap_or_default();
                 let why = format!("Waiting: it's running {} jobs.", hb.jobs);
-                app.db.machine_rebuild_move(&m.id, id, &["retrying"], "retrying", false, Some(at + BUSY_WAIT_MS), Some(&why));
+                app.db.machine_rebuild_move(
+                    &m.id,
+                    id,
+                    &["retrying"],
+                    "retrying",
+                    false,
+                    Some(at + BUSY_WAIT_MS),
+                    Some(&why),
+                );
                 return;
             }
             send(app, cp, p, e, &m, "retrying").await;
@@ -348,7 +526,13 @@ pub(super) async fn step(app: &App, cp: &ControlPlane, e: &Enrollment, machine_i
             if back(&m) {
                 // The heartbeat loop finishes it; one that never answers fails.
                 if at > deadline + ANSWER_MS {
-                    fail(app, &m, &["rebuilding"], "no_heartbeat", "It enrolled again but its agent never answered.");
+                    fail(
+                        app,
+                        &m,
+                        &["rebuilding"],
+                        "no_heartbeat",
+                        "It enrolled again but its agent never answered.",
+                    );
                 }
                 return;
             }
@@ -360,15 +544,29 @@ pub(super) async fn step(app: &App, cp: &ControlPlane, e: &Enrollment, machine_i
                 && let Err(err) = p.boot(pid).await
                 && !transient(&err)
             {
-                eprintln!("Machine rebuild: starting {} after its rebuild: {err}", m.id);
+                eprintln!(
+                    "Machine rebuild: starting {} after its rebuild: {err}",
+                    m.id
+                );
             }
             if at > deadline {
-                let why = format!("It didn't enroll again within {} minutes of the rebuild.", (deadline - sent) / 60_000);
+                let why = format!(
+                    "It didn't enroll again within {} minutes of the rebuild.",
+                    (deadline - sent) / 60_000
+                );
                 app.db.revoke_machine_tokens(&m.id);
                 if app.db.machine(&m.id).is_some_and(|m| back(&m)) {
                     return;
                 }
-                retry_later(app, &m, "rebuilding", "retrying", false, "never_enrolled", &why);
+                retry_later(
+                    app,
+                    &m,
+                    "rebuilding",
+                    "retrying",
+                    false,
+                    "never_enrolled",
+                    &why,
+                );
             }
         }
         _ => {}
@@ -377,8 +575,16 @@ pub(super) async fn step(app: &App, cp: &ControlPlane, e: &Enrollment, machine_i
 
 /// Every machine with a rebuild underway, one step each, each under the lock.
 pub(super) async fn reconcile(app: &App, cp: &ControlPlane) {
-    let Some(e) = cp.enrollment.as_deref() else { return };
-    let ids: Vec<String> = app.db.machines(None).into_iter().filter(underway).map(|m| m.id).collect();
+    let Some(e) = cp.enrollment.as_deref() else {
+        return;
+    };
+    let ids: Vec<String> = app
+        .db
+        .machines(None)
+        .into_iter()
+        .filter(underway)
+        .map(|m| m.id)
+        .collect();
     for id in ids {
         let _g = cp.ops.lock().await;
         step(app, cp, e, &id).await;
@@ -388,46 +594,96 @@ pub(super) async fn reconcile(app: &App, cp: &ControlPlane) {
 /// Queues a rebuild of `m`. `by`: the admin, or None for MACHINE_LEGACY_REBUILDS=auto.
 /// `hb` None: a failed rebuild sent before, whose agent is gone, is sent again
 /// (`retrying`) without waiting for it to answer.
-fn queue(app: &App, m: &Machine, hb: Option<&Heartbeat>, by: Option<&Who>, discard: bool) -> Option<Machine> {
+fn queue(
+    app: &App,
+    m: &Machine,
+    hb: Option<&Heartbeat>,
+    by: Option<&Who>,
+    discard: bool,
+) -> Option<Machine> {
     let auto = system(m);
     let (by, who) = match by {
         Some(w) => (w, w.actor.id.clone().unwrap_or_default()),
         None => (&auto, "auto".to_string()),
     };
     let id = crate::random_hex(8);
-    let from = hb.map(|h| h.version.clone()).or_else(|| m.rebuild_from.clone());
-    if !app.db.machine_rebuild_queue(&m.id, &id, &who, discard, from.as_deref()) {
+    let from = hb
+        .map(|h| h.version.clone())
+        .or_else(|| m.rebuild_from.clone());
+    if !app
+        .db
+        .machine_rebuild_queue(&m.id, &id, &who, discard, from.as_deref())
+    {
         return None;
     }
-    if hb.is_none() && !app.db.machine_rebuild_move(&m.id, &id, &["queued"], "retrying", false, Some(now()), None) {
+    if hb.is_none()
+        && !app.db.machine_rebuild_move(
+            &m.id,
+            &id,
+            &["queued"],
+            "retrying",
+            false,
+            Some(now()),
+            None,
+        )
+    {
         return None;
     }
     let m = app.db.machine(&m.id)?;
     let lacks = hb.map_or(CAPABILITIES.to_vec(), |h| lacks(&h.can));
-    app.db.record(&event(by, "machine.rebuild_requested", &m, details(&m, json!({ "lacks": lacks, "again": hb.is_none() }))));
+    app.db.record(&event(
+        by,
+        "machine.rebuild_requested",
+        &m,
+        details(&m, json!({ "lacks": lacks, "again": hb.is_none() })),
+    ));
     Some(m)
 }
 
 /// After a periodic heartbeat: finishes a rebuild whose machine is back, or queues one
 /// (MACHINE_LEGACY_REBUILDS=auto) for an idle old machine that never ran Bots.
-pub async fn follow_up(app: &AppState, cp: &ControlPlane, e: &Enrollment, machine_id: &str, hb: &Heartbeat) {
-    let Some(m) = app.db.machine(machine_id) else { return };
+pub async fn follow_up(
+    app: &AppState,
+    cp: &ControlPlane,
+    e: &Enrollment,
+    machine_id: &str,
+    hb: &Heartbeat,
+) {
+    let Some(m) = app.db.machine(machine_id) else {
+        return;
+    };
     match m.rebuild_state.as_deref() {
         Some("rebuilding" | "retrying") if back(&m) => {
             let _g = cp.ops.lock().await;
-            let Some(m) = app.db.machine(machine_id).filter(back) else { return };
+            let Some(m) = app.db.machine(machine_id).filter(back) else {
+                return;
+            };
             let from = m.rebuild_state.clone().unwrap_or_default();
             if legacy(hb) {
-                return fail(app, &m, &[from.as_str()], "still_legacy", "It came back with an agent that still can't upgrade itself.");
+                return fail(
+                    app,
+                    &m,
+                    &[from.as_str()],
+                    "still_legacy",
+                    "It came back with an agent that still can't upgrade itself.",
+                );
             }
             let id = m.rebuild_id.clone().unwrap_or_default();
-            if !app.db.machine_rebuild_move(&m.id, &id, &[from.as_str()], "done", false, None, None) {
+            if !app
+                .db
+                .machine_rebuild_move(&m.id, &id, &[from.as_str()], "done", false, None, None)
+            {
                 return;
             }
             let m = app.db.machine(machine_id).unwrap_or(m);
             end_cleanups(app, &m, m.rebuild_sent_at.unwrap_or_else(now));
             let by = system(&m);
-            app.db.record(&event(&by, "machine.rebuilt", &m, details(&m, json!({ "toVersion": hb.version, "toBuild": hb.build }))));
+            app.db.record(&event(
+                &by,
+                "machine.rebuilt",
+                &m,
+                details(&m, json!({ "toVersion": hb.version, "toBuild": hb.build })),
+            ));
             if m.assigned_at.is_some() {
                 super::folder::assigned(app, cp, &m, &by);
             }
@@ -475,12 +731,19 @@ fn view(app: &App, e: &Enrollment, m: &Machine) -> Value {
 }
 
 fn control_plane(app: &App) -> Res<&ControlPlane> {
-    app.control_plane.get().map(|cp| &**cp).ok_or_else(|| ApiError(StatusCode::SERVICE_UNAVAILABLE, super::NOT_CONFIGURED.into()))
+    app.control_plane.get().map(|cp| &**cp).ok_or_else(|| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            super::NOT_CONFIGURED.into(),
+        )
+    })
 }
 
 fn need_machine(app: &AppState, key: &str) -> Res<Machine> {
     let u = need_user_key(app, key)?;
-    app.db.user_machine(&u.id).ok_or_else(|| crate::not_found("Machine"))
+    app.db
+        .user_machine(&u.id)
+        .ok_or_else(|| crate::not_found("Machine"))
 }
 
 fn conflict(msg: impl Into<String>) -> ApiError {
@@ -518,7 +781,9 @@ pub async fn request(
     let e = enroll::need(cp)?;
     let Query(q) = q.map_err(|e| crate::bad(e.body_text()))?;
     if !body.iter().all(u8::is_ascii_whitespace) {
-        return Err(crate::bad("It takes no body; pass ?discardWork=true to discard the machine's files."));
+        return Err(crate::bad(
+            "It takes no body; pass ?discardWork=true to discard the machine's files.",
+        ));
     }
     let discard = q.discard_work;
     if let Some(why) = unable(cp, e) {
@@ -526,16 +791,27 @@ pub async fn request(
     }
     let m = need_machine(&app, &key)?;
     let _g = cp.ops.lock().await;
-    let m = app.db.machine(&m.id).ok_or_else(|| crate::not_found("Machine"))?;
+    let m = app
+        .db
+        .machine(&m.id)
+        .ok_or_else(|| crate::not_found("Machine"))?;
     cp.need_own(&m)?;
     if underway(&m) {
-        return Err(conflict(format!("A rebuild is {} already.", m.rebuild_state.as_deref().unwrap_or_default())));
+        return Err(conflict(format!(
+            "A rebuild is {} already.",
+            m.rebuild_state.as_deref().unwrap_or_default()
+        )));
     }
     if m.state != State::Running {
-        return Err(conflict(format!("The machine is {}; it must be running.", m.state.as_str())));
+        return Err(conflict(format!(
+            "The machine is {}; it must be running.",
+            m.state.as_str()
+        )));
     }
     if m.upgrade_hold_at.is_some() {
-        return Err(conflict("Its agent is held at its build. Release it first (botctl machine upgrade <user> release)."));
+        return Err(conflict(
+            "Its agent is held at its build. Release it first (botctl machine upgrade <user> release).",
+        ));
     }
     // A rebuild that was sent and failed may have left no agent to answer.
     let again = m.rebuild_state.as_deref() == Some("failed") && m.rebuild_sent_at.is_some();
@@ -545,7 +821,9 @@ pub async fn request(
         Err(err) => return Err(err),
     };
     if hb.as_ref().is_some_and(|h| !legacy(h)) {
-        return Err(conflict("Its agent can upgrade itself, so it needn't be rebuilt. Use botctl machine upgrade <user>."));
+        return Err(conflict(
+            "Its agent can upgrade itself, so it needn't be rebuilt. Use botctl machine upgrade <user>.",
+        ));
     }
     if !discard && app.db.machine_may_hold_work(&m.id) {
         return Err(conflict(
@@ -553,7 +831,8 @@ pub async fn request(
              Copy off what's needed, then ask again with ?discardWork=true (botctl machine rebuild <user> --discard-work).",
         ));
     }
-    let m = queue(&app, &m, hb.as_ref(), Some(&by), discard).ok_or_else(|| conflict("It changed meanwhile; try again."))?;
+    let m = queue(&app, &m, hb.as_ref(), Some(&by), discard)
+        .ok_or_else(|| conflict("It changed meanwhile; try again."))?;
     step(&app, cp, e, &m.id).await;
     let m = app.db.machine(&m.id).unwrap_or(m);
     Ok((StatusCode::ACCEPTED, Json(view(&app, e, &m))))
@@ -561,16 +840,29 @@ pub async fn request(
 
 /// `DELETE /api/users/{key}/machine/rebuild`: cancels a rebuild not yet sent. One sent
 /// can't be called back; it ends by itself.
-pub async fn cancel_now(AppS(app): AppS<AppState>, Extension(by): Extension<Who>, Path(key): Path<String>) -> Res {
+pub async fn cancel_now(
+    AppS(app): AppS<AppState>,
+    Extension(by): Extension<Who>,
+    Path(key): Path<String>,
+) -> Res {
     let cp = control_plane(&app)?;
     let e = enroll::need(cp)?;
     let m = need_machine(&app, &key)?;
     let _g = cp.ops.lock().await;
-    let m = app.db.machine(&m.id).ok_or_else(|| crate::not_found("Machine"))?;
+    let m = app
+        .db
+        .machine(&m.id)
+        .ok_or_else(|| crate::not_found("Machine"))?;
     if !cancel(&app, &by, &m, "admin") {
         return Err(conflict(match m.rebuild_state.as_deref() {
-            Some("retrying" | "rebuilding") => "It was sent to the provider already and can't be called back. It ends by itself.".to_string(),
-            s => format!("No rebuild is queued (it is {}).", s.unwrap_or("never asked")),
+            Some("retrying" | "rebuilding") => {
+                "It was sent to the provider already and can't be called back. It ends by itself."
+                    .to_string()
+            }
+            s => format!(
+                "No rebuild is queued (it is {}).",
+                s.unwrap_or("never asked")
+            ),
         }));
     }
     Ok(Json(view(&app, e, &app.db.machine(&m.id).unwrap_or(m))))
@@ -592,7 +884,9 @@ pub async fn legacy_list(AppS(app): AppS<AppState>) -> Res {
         })
         .map(|m| view(&app, e, &m))
         .collect();
-    Ok(Json(json!({ "rebuilds": e.upkeep.rebuilds.as_str(), "machines": machines })))
+    Ok(Json(
+        json!({ "rebuilds": e.upkeep.rebuilds.as_str(), "machines": machines }),
+    ))
 }
 
 #[cfg(test)]
@@ -601,7 +895,11 @@ mod tests {
 
     #[test]
     fn settings() {
-        assert_eq!(Rebuilds::parse("").unwrap(), Rebuilds::Manual, "manual by default");
+        assert_eq!(
+            Rebuilds::parse("").unwrap(),
+            Rebuilds::Manual,
+            "manual by default"
+        );
         assert_eq!(Rebuilds::parse(" AUTO ").unwrap(), Rebuilds::Auto);
         assert_eq!(Rebuilds::parse("off").unwrap(), Rebuilds::Off);
         assert!(Rebuilds::parse("always").is_err());
@@ -616,11 +914,17 @@ mod tests {
 
     #[test]
     fn an_old_agent_lacks_everything_from_adr_0039_on() {
-        let old = Heartbeat { version: "0.1.0".into(), ..Default::default() };
+        let old = Heartbeat {
+            version: "0.1.0".into(),
+            ..Default::default()
+        };
         assert!(legacy(&old));
         assert_eq!(lacks(&old.can).len(), CAPABILITIES.len());
         let new: Vec<String> = CAPABILITIES.iter().map(|c| c.to_string()).collect();
         assert!(lacks(&new).is_empty());
-        assert!(!legacy(&Heartbeat { can: vec![wire::CAN_UPGRADE.into()], ..old }));
+        assert!(!legacy(&Heartbeat {
+            can: vec![wire::CAN_UPGRADE.into()],
+            ..old
+        }));
     }
 }

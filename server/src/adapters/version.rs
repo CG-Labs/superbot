@@ -58,14 +58,14 @@ impl Ord for Version {
     /// Semver precedence: a pre-release comes before its release (0.141.0-alpha.1 <
     /// 0.141.0), and a shorter pre-release before a longer one it starts.
     fn cmp(&self, other: &Self) -> Ordering {
-        (self.major, self.minor, self.patch).cmp(&(other.major, other.minor, other.patch)).then_with(|| {
-            match (self.pre.is_empty(), other.pre.is_empty()) {
+        (self.major, self.minor, self.patch)
+            .cmp(&(other.major, other.minor, other.patch))
+            .then_with(|| match (self.pre.is_empty(), other.pre.is_empty()) {
                 (true, true) => Ordering::Equal,
                 (true, false) => Ordering::Greater,
                 (false, true) => Ordering::Less,
                 (false, false) => self.pre.cmp(&other.pre),
-            }
-        })
+            })
     }
 }
 
@@ -98,15 +98,24 @@ impl Version {
     /// Not `0.141`, `0.141.0.1`, `latest` or an empty pre-release part.
     pub fn parse(s: &str) -> Option<Version> {
         let s = s.strip_prefix('v').unwrap_or(s);
-        let s = s.split_once('+').map_or(s, |(v, build)| if build_ok(build) { v } else { "" });
+        let s = s
+            .split_once('+')
+            .map_or(s, |(v, build)| if build_ok(build) { v } else { "" });
         let (core, pre) = s.split_once('-').map_or((s, None), |(c, p)| (c, Some(p)));
         let nums: Vec<u64> = core.split('.').map(number).collect::<Option<_>>()?;
-        let [major, minor, patch] = nums[..] else { return None };
+        let [major, minor, patch] = nums[..] else {
+            return None;
+        };
         let pre = match pre {
             None => Vec::new(),
             Some(p) => p.split('.').map(ident).collect::<Option<_>>()?,
         };
-        Some(Version { major, minor, patch, pre })
+        Some(Version {
+            major,
+            minor,
+            patch,
+            pre,
+        })
     }
 
     /// The first version in what a CLI's `--version` printed: `codex-cli 0.141.0`.
@@ -133,7 +142,8 @@ fn ident(s: &str) -> Option<Ident> {
 }
 
 fn build_ok(s: &str) -> bool {
-    s.split('.').all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+    s.split('.')
+        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
 }
 
 /// Why a harness can't run guarded where it is.
@@ -149,12 +159,19 @@ pub enum Short {
 pub fn assess(min: &str, said: Result<String, String>) -> Result<(), Short> {
     let min = Version::parse(min).expect("adapters name exact versions");
     let out = said.map_err(Short::Unknown)?;
-    let line = out.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default();
+    let line = out
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or_default();
     match Version::find(&out) {
         Some(v) if v >= min => Ok(()),
         Some(v) => Err(Short::Old(v.to_string())),
         None if line.is_empty() => Err(Short::Unknown("--version printed nothing".into())),
-        None => Err(Short::Unknown(format!("--version printed \"{}\"", super::short(line)))),
+        None => Err(Short::Unknown(format!(
+            "--version printed \"{}\"",
+            super::short(line)
+        ))),
     }
 }
 
@@ -170,7 +187,11 @@ pub fn passed(key: &str) -> bool {
 }
 
 pub fn pass(key: String) {
-    PASSED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default().insert(key, Instant::now());
+    PASSED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_default()
+        .insert(key, Instant::now());
 }
 
 /// `bin` as a run here starting in `cwd` would find it on `path`: relative entries,
@@ -178,18 +199,28 @@ pub fn pass(key: String) {
 /// that replacing it (an update) changes the cache key.
 pub fn resolve(bin: &str, path: &str, cwd: &Path) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
-    path.split(':').map(|d| cwd.join(d).join(bin)).find_map(|p| {
-        let real = p.canonicalize().ok()?;
-        let m = real.metadata().ok()?;
-        (m.is_file() && m.permissions().mode() & 0o111 != 0).then_some(real)
-    })
+    path.split(':')
+        .map(|d| cwd.join(d).join(bin))
+        .find_map(|p| {
+            let real = p.canonicalize().ok()?;
+            let m = real.metadata().ok()?;
+            (m.is_file() && m.permissions().mode() & 0o111 != 0).then_some(real)
+        })
 }
 
 /// The cache key for `bin` here: where it resolves, and that file's size and last change.
 pub fn key_here(bin: &str, real: &Path) -> String {
     let m = real.metadata().ok();
-    let changed = m.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
-    format!("here:{bin}:{}:{}:{}", real.display(), m.map_or(0, |m| m.len()), changed.map_or(0, |d| d.as_nanos()))
+    let changed = m
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+    format!(
+        "here:{bin}:{}:{}:{}",
+        real.display(),
+        m.map_or(0, |m| m.len()),
+        changed.map_or(0, |d| d.as_nanos())
+    )
 }
 
 /// The cache key for `bin` on a machine. Who the run is there and where it starts
@@ -201,7 +232,12 @@ pub fn key_there(bin: &str, machine: &str, user: &str, cwd: &str) -> String {
 /// `<real> --version` on this server, started as the run is: in `cwd`, as `run_as`'s
 /// account when there is one (a Bot can write to `cwd`, so what it finds there never
 /// runs as botd), without botd's secrets. Its stdout, or why not.
-pub async fn read_here(real: &Path, path: &str, cwd: &Path, run_as: Option<&RunAs>) -> Result<String, String> {
+pub async fn read_here(
+    real: &Path,
+    path: &str,
+    cwd: &Path,
+    run_as: Option<&RunAs>,
+) -> Result<String, String> {
     let job = JobRequest {
         protocol: crate::machines::wire::PROTOCOL,
         job_id: String::new(),
@@ -224,9 +260,14 @@ pub async fn read_here(real: &Path, path: &str, cwd: &Path, run_as: Option<&RunA
     };
     let (tx, rx) = mpsc::channel(64);
     let host = super::local_host();
-    let run = async move { crate::machines::job::run(&host, &job, std::future::pending(), &tx).await };
+    let run =
+        async move { crate::machines::job::run(&host, &job, std::future::pending(), &tx).await };
     match tokio::time::timeout(PROBE_TIMEOUT, async { tokio::join!(run, read_job(rx)).1 }).await {
-        Err(_) => Err(format!("{} --version didn't answer in {} seconds", real.display(), PROBE_TIMEOUT.as_secs())),
+        Err(_) => Err(format!(
+            "{} --version didn't answer in {} seconds",
+            real.display(),
+            PROBE_TIMEOUT.as_secs()
+        )),
         Ok(said) => said,
     }
 }
@@ -242,7 +283,9 @@ pub async fn read_job(mut rx: mpsc::Receiver<JobEvent>) -> Result<String, String
             }
             JobEvent::Exit { success: true, .. } => return Ok(out),
             JobEvent::Exit { status, stderr, .. } => return Err(failed(&status, &stderr)),
-            JobEvent::Error { message } | JobEvent::Cleanup { why: message } => return Err(message),
+            JobEvent::Error { message } | JobEvent::Cleanup { why: message } => {
+                return Err(message);
+            }
             JobEvent::Started | JobEvent::Ping => {}
         }
     }
@@ -266,14 +309,47 @@ mod tests {
 
     #[test]
     fn versions_parse_exactly() {
-        assert_eq!(v("0.141.0"), Version { major: 0, minor: 141, patch: 0, pre: vec![] });
+        assert_eq!(
+            v("0.141.0"),
+            Version {
+                major: 0,
+                minor: 141,
+                patch: 0,
+                pre: vec![]
+            }
+        );
         assert_eq!(v("v1.2.3"), v("1.2.3"));
-        assert_eq!(v("0.141.0+build.7"), v("0.141.0"), "build metadata is ignored");
+        assert_eq!(
+            v("0.141.0+build.7"),
+            v("0.141.0"),
+            "build metadata is ignored"
+        );
         assert_eq!(v("0.141.0-alpha.3").to_string(), "0.141.0-alpha.3");
-        assert_eq!(v("1.0.0-x-y.2").pre, vec![Ident::Alnum("x-y".into()), Ident::Num(2)]);
+        assert_eq!(
+            v("1.0.0-x-y.2").pre,
+            vec![Ident::Alnum("x-y".into()), Ident::Num(2)]
+        );
         for bad in [
-            "", "v", "0.141", "0.141.", ".141.0", "0.141.0.1", "0.141.x", "0..0", "-1.0.0", "1.0.0-", "1.0.0-alpha..1",
-            "1.0.0+", "1.0.0+a..b", "1.0.0-al pha", "latest", "codex-cli", "1.0.0_1", "99999999999999999999.0.0", "+1.0.0", " 1.0.0",
+            "",
+            "v",
+            "0.141",
+            "0.141.",
+            ".141.0",
+            "0.141.0.1",
+            "0.141.x",
+            "0..0",
+            "-1.0.0",
+            "1.0.0-",
+            "1.0.0-alpha..1",
+            "1.0.0+",
+            "1.0.0+a..b",
+            "1.0.0-al pha",
+            "latest",
+            "codex-cli",
+            "1.0.0_1",
+            "99999999999999999999.0.0",
+            "+1.0.0",
+            " 1.0.0",
         ] {
             assert_eq!(Version::parse(bad), None, "{bad:?}");
         }
@@ -282,8 +358,22 @@ mod tests {
     #[test]
     fn versions_compare_by_semver_precedence() {
         let order = [
-            "0.0.0", "0.9.0", "0.99.0", "0.140.9", "0.141.0-alpha", "0.141.0-alpha.1", "0.141.0-alpha.2", "0.141.0-alpha.10", "0.141.0-alpha.beta",
-            "0.141.0-beta", "0.141.0-rc.1", "0.141.0", "0.141.1", "0.142.0-alpha.1", "0.142.0", "1.0.0",
+            "0.0.0",
+            "0.9.0",
+            "0.99.0",
+            "0.140.9",
+            "0.141.0-alpha",
+            "0.141.0-alpha.1",
+            "0.141.0-alpha.2",
+            "0.141.0-alpha.10",
+            "0.141.0-alpha.beta",
+            "0.141.0-beta",
+            "0.141.0-rc.1",
+            "0.141.0",
+            "0.141.1",
+            "0.142.0-alpha.1",
+            "0.142.0",
+            "1.0.0",
         ];
         for w in order.windows(2) {
             assert!(v(w[0]) < v(w[1]), "{} < {}", w[0], w[1]);
@@ -304,7 +394,11 @@ mod tests {
             ("codex-cli 0.141", None),
             ("", None),
         ] {
-            assert_eq!(Version::find(out).map(|v| v.to_string()).as_deref(), want, "{out:?}");
+            assert_eq!(
+                Version::find(out).map(|v| v.to_string()).as_deref(),
+                want,
+                "{out:?}"
+            );
         }
     }
 
@@ -315,12 +409,32 @@ mod tests {
         assert_eq!(assess(min, said("codex-cli 0.141.0\n")), Ok(()));
         assert_eq!(assess(min, said("codex-cli 0.171.0")), Ok(()));
         assert_eq!(assess(min, said("codex-cli 0.142.0-alpha.1")), Ok(()));
-        assert_eq!(assess(min, said("codex-cli 0.140.0")), Err(Short::Old("0.140.0".into())));
-        assert_eq!(assess(min, said("codex-cli 0.141.0-alpha.3")), Err(Short::Old("0.141.0-alpha.3".into())), "before its release");
-        assert_eq!(assess(min, said("codex-cli 0.0.0")), Err(Short::Old("0.0.0".into())), "a build from source says 0.0.0");
-        assert_eq!(assess(min, said("\n\n")), Err(Short::Unknown("--version printed nothing".into())));
-        assert_eq!(assess(min, said("codex-cli dev\nmore")), Err(Short::Unknown("--version printed \"codex-cli dev\"".into())));
-        assert_eq!(assess(min, Err("not found".into())), Err(Short::Unknown("not found".into())));
+        assert_eq!(
+            assess(min, said("codex-cli 0.140.0")),
+            Err(Short::Old("0.140.0".into()))
+        );
+        assert_eq!(
+            assess(min, said("codex-cli 0.141.0-alpha.3")),
+            Err(Short::Old("0.141.0-alpha.3".into())),
+            "before its release"
+        );
+        assert_eq!(
+            assess(min, said("codex-cli 0.0.0")),
+            Err(Short::Old("0.0.0".into())),
+            "a build from source says 0.0.0"
+        );
+        assert_eq!(
+            assess(min, said("\n\n")),
+            Err(Short::Unknown("--version printed nothing".into()))
+        );
+        assert_eq!(
+            assess(min, said("codex-cli dev\nmore")),
+            Err(Short::Unknown("--version printed \"codex-cli dev\"".into()))
+        );
+        assert_eq!(
+            assess(min, Err("not found".into())),
+            Err(Short::Unknown("not found".into()))
+        );
     }
 
     #[tokio::test]
@@ -337,14 +451,30 @@ mod tests {
         assert_eq!(resolve("codex", "/nonexistent:/also-not", &elsewhere), None);
         write("echo 'codex-cli 0.140.0'");
         let real = resolve("codex", &path, &elsewhere).unwrap();
-        assert_eq!(read_here(&real, &path, &elsewhere, None).await.as_deref(), Ok("codex-cli 0.140.0\n"));
+        assert_eq!(
+            read_here(&real, &path, &elsewhere, None).await.as_deref(),
+            Ok("codex-cli 0.140.0\n")
+        );
         // Relative and empty entries are from the run's folder, as its harness finds them.
         let parent = dir.parent().unwrap();
         let name = dir.file_name().unwrap().to_str().unwrap();
-        for (p, from) in [(format!("{name}:/usr/bin"), parent), (":/usr/bin".into(), dir.as_path()), (format!("./{name}"), parent)] {
-            assert_eq!(resolve("codex", &p, from).as_ref(), Some(&real), "{p:?} from {}", from.display());
+        for (p, from) in [
+            (format!("{name}:/usr/bin"), parent),
+            (":/usr/bin".into(), dir.as_path()),
+            (format!("./{name}"), parent),
+        ] {
+            assert_eq!(
+                resolve("codex", &p, from).as_ref(),
+                Some(&real),
+                "{p:?} from {}",
+                from.display()
+            );
         }
-        assert_eq!(resolve("codex", name, &elsewhere), None, "not from botd's folder");
+        assert_eq!(
+            resolve("codex", name, &elsewhere),
+            None,
+            "not from botd's folder"
+        );
         let key = key_here("codex", &real);
         assert!(!passed(&key));
         pass(key.clone());
@@ -353,7 +483,10 @@ mod tests {
         write("echo 'boom' >&2; exit 3");
         assert_ne!(key_here("codex", &real), key, "an update is a new key");
         let err = read_here(&real, &path, &elsewhere, None).await.unwrap_err();
-        assert!(err.contains("exit status: 3") && err.ends_with("boom"), "{err}");
+        assert!(
+            err.contains("exit status: 3") && err.ends_with("boom"),
+            "{err}"
+        );
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(resolve("codex", &path, &elsewhere), None, "not executable");
     }
@@ -364,23 +497,60 @@ mod tests {
         let dir = crate::db::temp_path("version-run-as");
         let (sudo, seen) = (dir.join("sudo"), dir.join("seen"));
         let fake = sudo.clone();
-        let script = format!("#!/bin/sh\nprintf '%s\\n' \"$@\" \"PATH=$SUPERBOT_PATH\" \"PWD=$(pwd)\" > '{}'\necho 'codex-cli 0.150.0'\n", seen.display());
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" \"PATH=$SUPERBOT_PATH\" \"PWD=$(pwd)\" > '{}'\necho 'codex-cli 0.150.0'\n",
+            seen.display()
+        );
         std::fs::write(&fake, script).unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let r = RunAs { sudo, runner: "/opt/superbot/bin/superbot-run".into(), account: "sb-u-u1".into(), settings: dir.join("settings"), teammate: None };
+        let r = RunAs {
+            sudo,
+            runner: "/opt/superbot/bin/superbot-run".into(),
+            account: "sb-u-u1".into(),
+            settings: dir.join("settings"),
+            teammate: None,
+        };
         let real = dir.join("codex");
-        assert_eq!(read_here(&real, ":/usr/bin", &dir, Some(&r)).await.as_deref(), Ok("codex-cli 0.150.0\n"));
+        assert_eq!(
+            read_here(&real, ":/usr/bin", &dir, Some(&r))
+                .await
+                .as_deref(),
+            Ok("codex-cli 0.150.0\n")
+        );
         let seen = std::fs::read_to_string(&seen).unwrap();
-        let want = ["-n", "-E", "-u", "sb-u-u1", "--", "/opt/superbot/bin/superbot-run", &real.display().to_string(), "--version", "PATH=:/usr/bin", &format!("PWD={}", dir.display())];
-        assert_eq!(seen.lines().collect::<Vec<_>>(), want, "as the account, never as botd");
+        let want = [
+            "-n",
+            "-E",
+            "-u",
+            "sb-u-u1",
+            "--",
+            "/opt/superbot/bin/superbot-run",
+            &real.display().to_string(),
+            "--version",
+            "PATH=:/usr/bin",
+            &format!("PWD={}", dir.display()),
+        ];
+        assert_eq!(
+            seen.lines().collect::<Vec<_>>(),
+            want,
+            "as the account, never as botd"
+        );
     }
 
     #[test]
     fn a_pass_on_a_machine_is_for_one_user_and_folder() {
         let k = key_there("codex", "m1", "u-ada", "/home/bots/work");
         assert_eq!(k, key_there("codex", "m1", "u-ada", "/home/bots/work"));
-        assert_ne!(k, key_there("codex", "m1", "u-bea", "/home/bots/work"), "a teammate's own user");
-        assert_ne!(k, key_there("codex", "m1", "u-ada", "/home/superbot-t-bea/work"), "another folder");
+        assert_ne!(
+            k,
+            key_there("codex", "m1", "u-bea", "/home/bots/work"),
+            "a teammate's own user"
+        );
+        assert_ne!(
+            k,
+            key_there("codex", "m1", "u-ada", "/home/superbot-t-bea/work"),
+            "another folder"
+        );
         assert_ne!(k, key_there("codex", "m2", "u-ada", "/home/bots/work"));
     }
 
@@ -393,11 +563,40 @@ mod tests {
             }
             read_job(rx)
         };
-        let exit = |success: bool, stderr: &str| JobEvent::Exit { success, status: "exit status: 1".into(), stderr: stderr.into(), files: Default::default(), too_big: vec![] };
-        let ok = send(vec![JobEvent::Started, JobEvent::Line { line: "codex-cli 0.171.0".into() }, JobEvent::Ping, exit(true, "")]).await;
+        let exit = |success: bool, stderr: &str| JobEvent::Exit {
+            success,
+            status: "exit status: 1".into(),
+            stderr: stderr.into(),
+            files: Default::default(),
+            too_big: vec![],
+        };
+        let ok = send(vec![
+            JobEvent::Started,
+            JobEvent::Line {
+                line: "codex-cli 0.171.0".into(),
+            },
+            JobEvent::Ping,
+            exit(true, ""),
+        ])
+        .await;
         assert_eq!(ok.as_deref(), Ok("codex-cli 0.171.0\n"));
-        assert_eq!(send(vec![exit(false, "warn\nbad flag\n")]).await, Err("--version exit status: 1: bad flag".into()));
-        assert_eq!(send(vec![JobEvent::Error { message: "codex isn't installed on this machine.".into() }]).await, Err("codex isn't installed on this machine.".into()));
-        assert_eq!(send(vec![JobEvent::Line { line: "codex-cli 0.171.0".into() }]).await, Err("the computer stopped answering".into()));
+        assert_eq!(
+            send(vec![exit(false, "warn\nbad flag\n")]).await,
+            Err("--version exit status: 1: bad flag".into())
+        );
+        assert_eq!(
+            send(vec![JobEvent::Error {
+                message: "codex isn't installed on this machine.".into()
+            }])
+            .await,
+            Err("codex isn't installed on this machine.".into())
+        );
+        assert_eq!(
+            send(vec![JobEvent::Line {
+                line: "codex-cli 0.171.0".into()
+            }])
+            .await,
+            Err("the computer stopped answering".into())
+        );
     }
 }

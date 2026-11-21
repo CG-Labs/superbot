@@ -6,8 +6,8 @@
 //! takes it off.
 
 use super::provider::{
-    CreateSpec, FirewallDevices, FirewallRule, Fut, MachineProvider, ProviderError, ProviderFirewall,
-    ProviderMachine, RebuildSpec,
+    CreateSpec, FirewallDevices, FirewallRule, Fut, MachineProvider, ProviderError,
+    ProviderFirewall, ProviderMachine, RebuildSpec,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
@@ -54,7 +54,9 @@ fn refused(message: &str) -> ProviderError {
 
 impl State {
     fn firewall_of(&self, machine: &str) -> Option<&FakeFirewall> {
-        self.firewalls.values().find(|f| f.machines.contains(machine))
+        self.firewalls
+            .values()
+            .find(|f| f.machines.contains(machine))
     }
 }
 
@@ -377,7 +379,10 @@ impl MachineProvider for Fake {
     fn enable_firewall<'a>(&'a self, id: &'a str) -> Fut<'a, ()> {
         Box::pin(async move {
             self.with("enable_firewall", |s| {
-                s.firewalls.get_mut(id).ok_or(ProviderError::NotFound)?.enabled = true;
+                s.firewalls
+                    .get_mut(id)
+                    .ok_or(ProviderError::NotFound)?
+                    .enabled = true;
                 Ok(())
             })
         })

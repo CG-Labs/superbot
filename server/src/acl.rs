@@ -8,7 +8,7 @@ use crate::db::{Bot, Db};
 use crate::rbac::{Principal, Role};
 use crate::users::Caller;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
 /// What a caller may do with one Bot. Each level includes the ones below it.
@@ -85,13 +85,31 @@ impl Grant {
 
 /// The whole model. Admins manage every Bot. Owners manage theirs. A shared Bot can be
 /// used by everyone; a grant adds its level. Read-only users never get past viewing.
-pub fn access(user_id: &str, role: Role, owner_id: &str, visibility: Visibility, grant: Option<Grant>) -> Access {
+pub fn access(
+    user_id: &str,
+    role: Role,
+    owner_id: &str,
+    visibility: Visibility,
+    grant: Option<Grant>,
+) -> Access {
     if role == Role::Admin {
         return Access::Manage;
     }
-    let shared = if visibility == Visibility::Shared { Access::Operate } else { Access::None };
-    let base = if owner_id == user_id { Access::Manage } else { shared.max(grant.map_or(Access::None, Grant::access)) };
-    if role == Role::Readonly { base.min(Access::View) } else { base }
+    let shared = if visibility == Visibility::Shared {
+        Access::Operate
+    } else {
+        Access::None
+    };
+    let base = if owner_id == user_id {
+        Access::Manage
+    } else {
+        shared.max(grant.map_or(Access::None, Grant::access))
+    };
+    if role == Role::Readonly {
+        base.min(Access::View)
+    } else {
+        base
+    }
 }
 
 /// How a shared Bot behaves when someone other than its owner uses it (ADR 0046).
@@ -125,7 +143,10 @@ impl SharedBots {
 pub enum Viewer {
     /// Admins and break-glass.
     All,
-    User { id: String, role: Role },
+    User {
+        id: String,
+        role: Role,
+    },
     /// A person without a user record. Only reachable if the owner account is missing.
     Nobody,
     /// A Bot's run for someone other than its owner (ADR 0046): the lesser of its
@@ -139,7 +160,10 @@ impl Viewer {
             (Principal::User(Role::Admin), _) => Viewer::All,
             // A Bot acts with its owner's access (`owner_of`), never more.
             (Principal::Bot, _) => Viewer::Nobody,
-            (Principal::User(role), Some(u)) => Viewer::User { id: u.id.clone(), role },
+            (Principal::User(role), Some(u)) => Viewer::User {
+                id: u.id.clone(),
+                role,
+            },
             (Principal::User(_), None) => Viewer::Nobody,
         }
     }
@@ -155,7 +179,10 @@ impl Viewer {
         match db.user(user_id) {
             Some(u) if !u.active() => Viewer::Nobody,
             Some(u) if u.role == Role::Admin => Viewer::All,
-            Some(u) => Viewer::User { id: u.id, role: u.role },
+            Some(u) => Viewer::User {
+                id: u.id,
+                role: u.role,
+            },
             None => Viewer::Nobody,
         }
     }
@@ -174,7 +201,13 @@ impl Viewer {
         match self {
             Viewer::All => Access::Manage,
             Viewer::Nobody => Access::None,
-            Viewer::User { id, role } => access(id, *role, &bot.owner_id, bot.visibility, db.grant(&bot.id, id)),
+            Viewer::User { id, role } => access(
+                id,
+                *role,
+                &bot.owner_id,
+                bot.visibility,
+                db.grant(&bot.id, id),
+            ),
             Viewer::Within(a, b) => a.access(db, bot).min(b.access(db, bot)),
         }
     }
@@ -201,7 +234,13 @@ impl Viewer {
                 let a = match self {
                     Viewer::All => Access::Manage,
                     Viewer::Nobody | Viewer::Within(..) => Access::None,
-                    Viewer::User { id, role } => access(id, *role, &b.owner_id, b.visibility, grants.get(&b.id).copied()),
+                    Viewer::User { id, role } => access(
+                        id,
+                        *role,
+                        &b.owner_id,
+                        b.visibility,
+                        grants.get(&b.id).copied(),
+                    ),
                 };
                 (a > Access::None).then_some((b, a))
             })
@@ -211,7 +250,11 @@ impl Viewer {
 
 /// The Bot a live event is about, if any.
 fn event_bot(v: &Value) -> Option<&str> {
-    v["botId"].as_str().or_else(|| v["bot"]["id"].as_str()).or_else(|| v["message"]["botId"].as_str()).or_else(|| v["approval"]["botId"].as_str())
+    v["botId"]
+        .as_str()
+        .or_else(|| v["bot"]["id"].as_str())
+        .or_else(|| v["message"]["botId"].as_str())
+        .or_else(|| v["approval"]["botId"].as_str())
 }
 
 /// One viewer's slice of the live stream. Access is cached per Bot and forgotten on
@@ -223,7 +266,10 @@ pub struct StreamFilter {
 
 impl StreamFilter {
     pub fn new(viewer: Viewer) -> StreamFilter {
-        StreamFilter { viewer, seen: HashMap::new() }
+        StreamFilter {
+            viewer,
+            seen: HashMap::new(),
+        }
     }
 
     pub fn reset(&mut self, viewer: Viewer) {
@@ -234,7 +280,9 @@ impl StreamFilter {
     /// The event as this viewer should get it: None to drop it, else with `access` set on
     /// the Bot view it carries. Events about no Bot (policy, resync) pass unchanged.
     pub fn apply(&mut self, db: &Db, data: &str) -> Option<String> {
-        let Ok(mut v) = serde_json::from_str::<Value>(data) else { return Some(data.to_string()) };
+        let Ok(mut v) = serde_json::from_str::<Value>(data) else {
+            return Some(data.to_string());
+        };
         if v["type"] == "resync" {
             self.seen.clear();
             return Some(data.to_string());
@@ -246,11 +294,15 @@ impl StreamFilter {
             }
             return Some(data.to_string());
         }
-        let Some(id) = event_bot(&v).map(String::from) else { return Some(data.to_string()) };
+        let Some(id) = event_bot(&v).map(String::from) else {
+            return Some(data.to_string());
+        };
         let a = match self.seen.get(&id) {
             Some(a) => *a,
             None => {
-                let a = db.bot(&id).map_or(Access::None, |b| self.viewer.access(db, &b));
+                let a = db
+                    .bot(&id)
+                    .map_or(Access::None, |b| self.viewer.access(db, &b));
                 self.seen.insert(id, a);
                 a
             }
@@ -297,7 +349,11 @@ mod tests {
         ];
         for (role, owner, vis, grant, want) in table {
             let owner_id = if owner { "u1" } else { "someone" };
-            assert_eq!(access("u1", role, owner_id, vis, grant), want, "{role:?} owner={owner} {vis:?} {grant:?}");
+            assert_eq!(
+                access("u1", role, owner_id, vis, grant),
+                want,
+                "{role:?} owner={owner} {vis:?} {grant:?}"
+            );
         }
         assert!(HIDDEN < View && View < Operate && Operate < Manage);
     }
@@ -310,45 +366,139 @@ mod tests {
         assert_eq!(Grant::parse("operator"), Some(Grant::Operator));
         assert_eq!(Grant::parse("VIEWER"), Some(Grant::Viewer));
         assert_eq!(Grant::parse("owner"), Option::None);
-        assert_eq!(serde_json::to_value(Access::Operate).unwrap(), json!("operate"));
+        assert_eq!(
+            serde_json::to_value(Access::Operate).unwrap(),
+            json!("operate")
+        );
     }
 
     #[test]
     fn shared_bots_are_isolated_whenever_bots_run_on_users_machines() {
-        assert_eq!(SharedBots::parse("", false), Ok(SharedBots::Open), "self-host: as before");
+        assert_eq!(
+            SharedBots::parse("", false),
+            Ok(SharedBots::Open),
+            "self-host: as before"
+        );
         assert_eq!(SharedBots::parse("", true), Ok(SharedBots::Isolated));
-        assert_eq!(SharedBots::parse(" Isolated ", false), Ok(SharedBots::Isolated), "self-host may opt in");
+        assert_eq!(
+            SharedBots::parse(" Isolated ", false),
+            Ok(SharedBots::Isolated),
+            "self-host may opt in"
+        );
         assert_eq!(SharedBots::parse("open", false), Ok(SharedBots::Open));
-        assert!(SharedBots::parse("open", true).unwrap_err().contains("MACHINE_ROUTING"));
+        assert!(
+            SharedBots::parse("open", true)
+                .unwrap_err()
+                .contains("MACHINE_ROUTING")
+        );
         assert!(SharedBots::parse("team", false).is_err());
     }
 
     #[test]
     fn a_run_for_someone_else_reaches_no_more_than_both() {
         let db = Db::open(&crate::db::temp_path("acl-within").join("app.sqlite")).unwrap();
-        for (id, role) in [("ada", Role::Member), ("bea", Role::Member), ("root", Role::Admin)] {
+        for (id, role) in [
+            ("ada", Role::Member),
+            ("bea", Role::Member),
+            ("root", Role::Admin),
+        ] {
             db.create_user(Some(id), None, id, role).unwrap();
         }
-        let team = db.create_bot_owned("Team", "#fff", "waddle", "claude", None, false, "ada", Visibility::Shared);
-        let ledger = db.create_bot_owned("Ledger", "#fff", "waddle", "claude", None, false, "ada", Visibility::Private);
-        let scout = db.create_bot_owned("Scout", "#fff", "waddle", "claude", None, false, "bea", Visibility::Private);
-        let notes = db.create_bot_owned("Notes", "#fff", "waddle", "claude", None, false, "bea", Visibility::Shared);
+        let team = db.create_bot_owned(
+            "Team",
+            "#fff",
+            "waddle",
+            "claude",
+            None,
+            false,
+            "ada",
+            Visibility::Shared,
+        );
+        let ledger = db.create_bot_owned(
+            "Ledger",
+            "#fff",
+            "waddle",
+            "claude",
+            None,
+            false,
+            "ada",
+            Visibility::Private,
+        );
+        let scout = db.create_bot_owned(
+            "Scout",
+            "#fff",
+            "waddle",
+            "claude",
+            None,
+            false,
+            "bea",
+            Visibility::Private,
+        );
+        let notes = db.create_bot_owned(
+            "Notes",
+            "#fff",
+            "waddle",
+            "claude",
+            None,
+            false,
+            "bea",
+            Visibility::Shared,
+        );
         let (ada, bea) = (Viewer::person(&db, "ada"), Viewer::person(&db, "bea"));
         let capped = ada.clone().within(bea.clone());
         assert!(matches!(capped, Viewer::Within(..)));
-        let names = |v: &Viewer| v.bots(&db).into_iter().map(|(b, a)| (b.name, a)).collect::<Vec<_>>();
-        assert_eq!(names(&capped), vec![("Team".to_string(), Operate), ("Notes".to_string(), Operate)], "never Ada's private Bot or Bea's");
+        let names = |v: &Viewer| {
+            v.bots(&db)
+                .into_iter()
+                .map(|(b, a)| (b.name, a))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(&capped),
+            vec![
+                ("Team".to_string(), Operate),
+                ("Notes".to_string(), Operate)
+            ],
+            "never Ada's private Bot or Bea's"
+        );
         assert_eq!(capped.access(&db, &ledger), HIDDEN);
-        assert_eq!(capped.access(&db, &scout), HIDDEN, "nor a private Bot of the asker's that the owner can't see");
+        assert_eq!(
+            capped.access(&db, &scout),
+            HIDDEN,
+            "nor a private Bot of the asker's that the owner can't see"
+        );
         assert_eq!(capped.access(&db, &team), Operate);
-        assert_eq!(capped.access(&db, &notes), Operate, "both can use the asker's shared Bot");
-        assert_eq!(ada.access(&db, &ledger), Manage, "Ada's own runs are unchanged");
+        assert_eq!(
+            capped.access(&db, &notes),
+            Operate,
+            "both can use the asker's shared Bot"
+        );
+        assert_eq!(
+            ada.access(&db, &ledger),
+            Manage,
+            "Ada's own runs are unchanged"
+        );
 
-        assert_eq!(ada.clone().within(Viewer::person(&db, "root")), ada, "an admin asking adds no cap");
+        assert_eq!(
+            ada.clone().within(Viewer::person(&db, "root")),
+            ada,
+            "an admin asking adds no cap"
+        );
         assert_eq!(Viewer::All.within(bea.clone()), bea);
         assert_eq!(ada.clone().within(ada.clone()), ada);
-        db.update_user("bea", crate::db::UserPatch { status: Some("disabled"), ..Default::default() }).unwrap();
-        assert_eq!(ada.within(Viewer::person(&db, "bea")), Viewer::Nobody, "a disabled asker reaches nothing");
+        db.update_user(
+            "bea",
+            crate::db::UserPatch {
+                status: Some("disabled"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ada.within(Viewer::person(&db, "bea")),
+            Viewer::Nobody,
+            "a disabled asker reaches nothing"
+        );
     }
 
     #[test]
@@ -357,10 +507,32 @@ mod tests {
         for id in ["u1", "u2"] {
             db.create_user(Some(id), None, id, Role::Member).unwrap();
         }
-        let mine = db.create_bot_owned("Mine", "#fff", "waddle", "claude", None, false, "u1", Visibility::Private);
-        let theirs = db.create_bot_owned("Theirs", "#fff", "waddle", "claude", None, false, "u2", Visibility::Private);
-        let mut f = StreamFilter::new(Viewer::User { id: "u1".into(), role: Role::Member });
-        let status = |id: &str| json!({ "type": "status", "botId": id, "working": true }).to_string();
+        let mine = db.create_bot_owned(
+            "Mine",
+            "#fff",
+            "waddle",
+            "claude",
+            None,
+            false,
+            "u1",
+            Visibility::Private,
+        );
+        let theirs = db.create_bot_owned(
+            "Theirs",
+            "#fff",
+            "waddle",
+            "claude",
+            None,
+            false,
+            "u2",
+            Visibility::Private,
+        );
+        let mut f = StreamFilter::new(Viewer::User {
+            id: "u1".into(),
+            role: Role::Member,
+        });
+        let status =
+            |id: &str| json!({ "type": "status", "botId": id, "working": true }).to_string();
         assert!(f.apply(&db, &status(&mine.id)).is_some());
         assert_eq!(f.apply(&db, &status(&theirs.id)), Option::None);
         let msg = json!({ "type": "message", "message": { "botId": theirs.id }, "bot": { "id": theirs.id } }).to_string();
@@ -375,10 +547,19 @@ mod tests {
         assert_eq!(f.apply(&db, &status(&theirs.id)), Option::None);
         assert!(f.apply(&db, r#"{"type":"resync"}"#).is_some());
         assert!(f.apply(&db, &status(&theirs.id)).is_some());
-        assert!(f.apply(&db, &json!({ "type": "botDeleted", "botId": theirs.id }).to_string()).is_some());
+        assert!(
+            f.apply(
+                &db,
+                &json!({ "type": "botDeleted", "botId": theirs.id }).to_string()
+            )
+            .is_some()
+        );
 
         // A new viewer (a role change) starts over.
-        f.reset(Viewer::User { id: "u3".into(), role: Role::Readonly });
+        f.reset(Viewer::User {
+            id: "u3".into(),
+            role: Role::Readonly,
+        });
         assert_eq!(f.apply(&db, &status(&mine.id)), Option::None);
     }
 }

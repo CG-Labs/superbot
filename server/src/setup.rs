@@ -10,12 +10,12 @@ use crate::rbac::Role;
 use crate::sso::Provider;
 use crate::tiers::Tier;
 use crate::users::{self, Caller};
-use crate::{bad, need_user, ApiError, AppState, Auth, Res};
-use axum::extract::{ConnectInfo, Extension, State};
-use axum::http::{header, HeaderMap};
+use crate::{ApiError, AppState, Auth, Res, bad, need_user};
 use axum::Json;
+use axum::extract::{ConnectInfo, Extension, State};
+use axum::http::{HeaderMap, header};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
@@ -33,7 +33,12 @@ pub struct Progress {
 
 impl Default for Progress {
     fn default() -> Self {
-        Progress { step: STEPS[0].into(), dismissed: false, completed_at: None, completed_by: None }
+        Progress {
+            step: STEPS[0].into(),
+            dismissed: false,
+            completed_at: None,
+            completed_by: None,
+        }
     }
 }
 
@@ -50,14 +55,20 @@ fn host_name(h: &str) -> &str {
         return rest.split(']').next().unwrap_or_default();
     }
     match h.rsplit_once(':') {
-        Some((name, port)) if !name.contains(':') && port.bytes().all(|b| b.is_ascii_digit()) => name,
+        Some((name, port)) if !name.contains(':') && port.bytes().all(|b| b.is_ascii_digit()) => {
+            name
+        }
         _ => h,
     }
 }
 
 fn local(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    name == "localhost" || name.ends_with(".localhost") || name.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
+    name == "localhost"
+        || name.ends_with(".localhost")
+        || name
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
 }
 
 /// The ALLOWED_HOSTS names people reach botd at from elsewhere: not loopback, not a bind-all address.
@@ -110,7 +121,10 @@ fn installer_command(domain: &str) -> String {
 }
 
 fn sh_quote(s: &str) -> String {
-    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "._-/:+@".contains(c)) {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-/:+@".contains(c))
+    {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', r"'\''"))
@@ -120,8 +134,16 @@ fn sh_quote(s: &str) -> String {
 /// Restarting botd, for settings it reads only at startup.
 fn restart() -> Vec<Value> {
     vec![
-        step("Bash installer", "Edit ~superbot/superbot/.env, then restart botd.", &["sudo systemctl restart superbot".into()]),
-        step("Docker Compose", "Edit .env next to docker-compose.yml, then recreate botd.", &["docker compose up -d".into()]),
+        step(
+            "Bash installer",
+            "Edit ~superbot/superbot/.env, then restart botd.",
+            &["sudo systemctl restart superbot".into()],
+        ),
+        step(
+            "Docker Compose",
+            "Edit .env next to docker-compose.yml, then recreate botd.",
+            &["docker compose up -d".into()],
+        ),
     ]
 }
 
@@ -129,21 +151,46 @@ fn restart() -> Vec<Value> {
 /// from loopback, where botctl and SSH tunnels reach botd without the proxy.
 fn domain_view(a: &Auth, host: &str, scheme: &str, on_this_machine: bool) -> Value {
     let hosts = public_hosts(&a.hosts);
-    let public_url = a.sso.public_url().map(String::from).or_else(|| hosts.first().map(|h| format!("https://{}", h.to_ascii_lowercase())));
-    let here = Some(host.to_ascii_lowercase()).filter(|h| !local(host_name(h)) && hosts.contains(h));
-    let name = here.or_else(|| hosts.first().cloned()).or_else(|| public_url.as_deref().and_then(|u| u.strip_prefix("https://")).map(String::from));
+    let public_url = a.sso.public_url().map(String::from).or_else(|| {
+        hosts
+            .first()
+            .map(|h| format!("https://{}", h.to_ascii_lowercase()))
+    });
+    let here =
+        Some(host.to_ascii_lowercase()).filter(|h| !local(host_name(h)) && hosts.contains(h));
+    let name = here.or_else(|| hosts.first().cloned()).or_else(|| {
+        public_url
+            .as_deref()
+            .and_then(|u| u.strip_prefix("https://"))
+            .map(String::from)
+    });
     let shown = name.clone().unwrap_or_else(|| "<your-domain>".into());
     let unchecked = scheme == "direct" && on_this_machine;
     let ok = public_url.is_some() && (scheme == "https" || unchecked);
     let detail = match (&public_url, scheme) {
-        (None, _) => "No public address yet: botd answers only on this machine, and nobody else can sign in.".to_string(),
+        (None, _) => {
+            "No public address yet: botd answers only on this machine, and nobody else can sign in."
+                .to_string()
+        }
         (Some(u), "https") => format!("People reach SuperBot at {u}, over HTTPS."),
-        (Some(u), "http") => format!("This request came over plain HTTP. Open {u}/console/ over HTTPS, and check that Caddy has its certificate."),
-        (Some(u), _) if unchecked => format!("Set up for {u}. HTTPS can't be checked from this machine: open {u}/console/ in a browser to see."),
-        (Some(u), _) => format!("Set up for {u}, but this request reached botd over plain HTTP, not through the HTTPS proxy. Open {u}/console/."),
+        (Some(u), "http") => format!(
+            "This request came over plain HTTP. Open {u}/console/ over HTTPS, and check that Caddy has its certificate."
+        ),
+        (Some(u), _) if unchecked => format!(
+            "Set up for {u}. HTTPS can't be checked from this machine: open {u}/console/ in a browser to see."
+        ),
+        (Some(u), _) => format!(
+            "Set up for {u}, but this request reached botd over plain HTTP, not through the HTTPS proxy. Open {u}/console/."
+        ),
     };
     let instructions = vec![
-        step("DNS", format!("Point an A (and AAAA) record for {shown} at this server, and open ports 80 and 443."), &[]),
+        step(
+            "DNS",
+            format!(
+                "Point an A (and AAAA) record for {shown} at this server, and open ports 80 and 443."
+            ),
+            &[],
+        ),
         step(
             "Bash installer",
             "Re-run the installer with the domain. It pulls the latest main and rebuilds, sets ALLOWED_HOSTS and CORS_ORIGINS in .env, writes Caddy's config, and restarts botd. Caddy gets the certificate. It also resets TZ and USER_NAME, so this passes botd's current ones.",
@@ -152,7 +199,10 @@ fn domain_view(a: &Auth, host: &str, scheme: &str, on_this_machine: bool) -> Val
         step(
             "Docker Compose",
             "Set the domain, then recreate the stack. Caddy gets the certificate.",
-            &[format!("./init.sh --domain {shown}"), "docker compose up -d".into()],
+            &[
+                format!("./init.sh --domain {shown}"),
+                "docker compose up -d".into(),
+            ],
         ),
     ];
     json!({
@@ -170,26 +220,80 @@ fn domain_view(a: &Auth, host: &str, scheme: &str, on_this_machine: bool) -> Val
 
 /// Settings each provider type needs, after `SSO_<ID>_`. `<...>` are placeholders.
 const TEMPLATES: [(&str, &str, &str, &[&str]); 6] = [
-    ("entra", "Microsoft Entra ID", "docs/sso/entra.md", &["CLIENT_ID=<application-client-id>", "TENANT=<directory-tenant-id>", "# JIT_ROLE=off"]),
-    ("google", "Google", "docs/sso/google.md", &["CLIENT_ID=<client-id>.apps.googleusercontent.com", "# HOSTED_DOMAINS=example.com", "# JIT_ROLE=off"]),
-    ("github", "GitHub", "docs/sso/github.md", &["CLIENT_ID=<client-id>", "# ALLOWED_ORGS=<org>", "# JIT_ROLE=off"]),
-    ("apple", "Apple", "docs/sso/apple.md", &["CLIENT_ID=<services-id>", "TEAM_ID=<team-id>", "KEY_ID=<key-id>", "# ALLOWED_DOMAINS=example.com"]),
+    (
+        "entra",
+        "Microsoft Entra ID",
+        "docs/sso/entra.md",
+        &[
+            "CLIENT_ID=<application-client-id>",
+            "TENANT=<directory-tenant-id>",
+            "# JIT_ROLE=off",
+        ],
+    ),
+    (
+        "google",
+        "Google",
+        "docs/sso/google.md",
+        &[
+            "CLIENT_ID=<client-id>.apps.googleusercontent.com",
+            "# HOSTED_DOMAINS=example.com",
+            "# JIT_ROLE=off",
+        ],
+    ),
+    (
+        "github",
+        "GitHub",
+        "docs/sso/github.md",
+        &[
+            "CLIENT_ID=<client-id>",
+            "# ALLOWED_ORGS=<org>",
+            "# JIT_ROLE=off",
+        ],
+    ),
+    (
+        "apple",
+        "Apple",
+        "docs/sso/apple.md",
+        &[
+            "CLIENT_ID=<services-id>",
+            "TEAM_ID=<team-id>",
+            "KEY_ID=<key-id>",
+            "# ALLOWED_DOMAINS=example.com",
+        ],
+    ),
     (
         "oidc",
         "Any OpenID Connect IdP (Okta, Keycloak, Auth0)",
         "docs/sso/oidc.md",
-        &["TYPE=oidc", "ISSUER=https://<idp-host>/<issuer-path>", "CLIENT_ID=<client-id>", "LABEL=Company SSO", "# ALLOWED_DOMAINS=example.com"],
+        &[
+            "TYPE=oidc",
+            "ISSUER=https://<idp-host>/<issuer-path>",
+            "CLIENT_ID=<client-id>",
+            "LABEL=Company SSO",
+            "# ALLOWED_DOMAINS=example.com",
+        ],
     ),
     (
         "saml",
         "A SAML IdP through a broker (ADFS, Shibboleth)",
         "docs/sso/saml.md",
-        &["TYPE=saml", "ISSUER=https://<broker-host>/realms/<realm>", "CLIENT_ID=<broker-client-id>", "IDP_ALIAS=<idp-alias>", "IDP_ENTITY_ID=<idp-entity-id>", "LABEL=Company SSO"],
+        &[
+            "TYPE=saml",
+            "ISSUER=https://<broker-host>/realms/<realm>",
+            "CLIENT_ID=<broker-client-id>",
+            "IDP_ALIAS=<idp-alias>",
+            "IDP_ENTITY_ID=<idp-entity-id>",
+            "LABEL=Company SSO",
+        ],
     ),
 ];
 
 /// Copy-ready `.env` lines that add each kind of provider next to the ones already set.
-fn templates(providers: &[Arc<Provider>], public_url: Option<&str>, sso_public_url: Option<&str>) -> Vec<Value> {
+fn templates(
+    providers: &[Arc<Provider>],
+    public_url: Option<&str>,
+    sso_public_url: Option<&str>,
+) -> Vec<Value> {
     let ids: Vec<&str> = providers.iter().map(|p| p.id.as_str()).collect();
     TEMPLATES
         .iter()
@@ -201,7 +305,10 @@ fn templates(providers: &[Arc<Provider>], public_url: Option<&str>, sso_public_u
             let up = id.to_ascii_uppercase();
             let mut env = vec![format!("SSO_PROVIDERS={}", list.join(","))];
             if sso_public_url.is_none() {
-                env.push(format!("SSO_PUBLIC_URL={}", public_url.unwrap_or("https://<your-domain>")));
+                env.push(format!(
+                    "SSO_PUBLIC_URL={}",
+                    public_url.unwrap_or("https://<your-domain>")
+                ));
             }
             for s in *settings {
                 env.push(match s.strip_prefix("# ") {
@@ -209,8 +316,14 @@ fn templates(providers: &[Arc<Provider>], public_url: Option<&str>, sso_public_u
                     None => format!("SSO_{up}_{s}"),
                 });
             }
-            let secret = if *id == "apple" { format!("SSO_{up}_PRIVATE_KEY") } else { format!("SSO_{up}_CLIENT_SECRET") };
-            let base = sso_public_url.or(public_url).unwrap_or("https://<your-domain>");
+            let secret = if *id == "apple" {
+                format!("SSO_{up}_PRIVATE_KEY")
+            } else {
+                format!("SSO_{up}_CLIENT_SECRET")
+            };
+            let base = sso_public_url
+                .or(public_url)
+                .unwrap_or("https://<your-domain>");
             json!({
                 "id": id,
                 "label": label,
@@ -247,7 +360,13 @@ fn sign_in_view(app: &AppState, a: &Auth, public_url: Option<&str>) -> Value {
             })
         })
         .collect();
-    let waiting: Vec<String> = a.sso.providers.iter().filter(|p| !p.ready()).map(|p| p.label.clone()).collect();
+    let waiting: Vec<String> = a
+        .sso
+        .providers
+        .iter()
+        .filter(|p| !p.ready())
+        .map(|p| p.label.clone())
+        .collect();
     let admins: Vec<Value> = app
         .db
         .users()
@@ -278,19 +397,44 @@ fn tiers_view(app: &AppState) -> Value {
     let t = app.tiers();
     let file = t.source != "built-in";
     let detail = if file {
-        format!("{} tiers from {}; people without one get {}.", t.all().len(), t.source, t.default_tier().label)
+        format!(
+            "{} tiers from {}; people without one get {}.",
+            t.all().len(),
+            t.source,
+            t.default_tier().label
+        )
     } else {
         "One built-in tier, self-host: any harness and model, no limits. Right for running SuperBot for yourself or your team.".to_string()
     };
     let instructions = vec![
-        step("Write the file", "Copy deploy/tiers.example.json next to .env and edit its routes and limits. botd refuses to start on a mistake.", &[]),
-        step("Bash installer", "Point botd at it in .env, then restart.", &["TIERS_FILE=<path-to>/tiers.json".into(), "DEFAULT_TIER=starter".into(), "sudo systemctl restart superbot".into()]),
+        step(
+            "Write the file",
+            "Copy deploy/tiers.example.json next to .env and edit its routes and limits. botd refuses to start on a mistake.",
+            &[],
+        ),
+        step(
+            "Bash installer",
+            "Point botd at it in .env, then restart.",
+            &[
+                "TIERS_FILE=<path-to>/tiers.json".into(),
+                "DEFAULT_TIER=starter".into(),
+                "sudo systemctl restart superbot".into(),
+            ],
+        ),
         step(
             "Docker Compose",
             "Copy it into the data volume, point botd at it in .env, then recreate botd.",
-            &["docker compose cp tiers.json botd:/data/tiers.json".into(), "TIERS_FILE=/data/tiers.json".into(), "docker compose up -d".into()],
+            &[
+                "docker compose cp tiers.json botd:/data/tiers.json".into(),
+                "TIERS_FILE=/data/tiers.json".into(),
+                "docker compose up -d".into(),
+            ],
         ),
-        step("Give people a tier", "Anyone without one gets the default.", &["botctl user tier <email> <tier>".into()]),
+        step(
+            "Give people a tier",
+            "Anyone without one gets the default.",
+            &["botctl user tier <email> <tier>".into()],
+        ),
     ];
     json!({
         "source": t.source,
@@ -308,10 +452,32 @@ fn tiers_view(app: &AppState) -> Value {
 fn license_view(app: &AppState, a: &Auth) -> Value {
     let mut v = crate::license::view(app, a);
     v["instructions"] = json!([
-        step("Console", "Paste the key CG-Labs sent you below, or in Settings. It takes effect at once, no restart.", &[]),
-        step("botctl", "On the server, as the superbot user.", &["botctl license install < license.key".into(), "botctl license".into()]),
-        step("Bash installer", "Or install it with the installer, which saves it in DATA_DIR.", &["sudo deploy/install.sh --upgrade --license-file <path-to>/license.key".into()]),
-        step("Docker Compose", "Or set it in .env (it then wins over the console), and recreate botd.", &["LICENSE_KEY=<license-key>".into(), "docker compose up -d".into()]),
+        step(
+            "Console",
+            "Paste the key CG-Labs sent you below, or in Settings. It takes effect at once, no restart.",
+            &[]
+        ),
+        step(
+            "botctl",
+            "On the server, as the superbot user.",
+            &[
+                "botctl license install < license.key".into(),
+                "botctl license".into()
+            ]
+        ),
+        step(
+            "Bash installer",
+            "Or install it with the installer, which saves it in DATA_DIR.",
+            &["sudo deploy/install.sh --upgrade --license-file <path-to>/license.key".into()]
+        ),
+        step(
+            "Docker Compose",
+            "Or set it in .env (it then wins over the console), and recreate botd.",
+            &[
+                "LICENSE_KEY=<license-key>".into(),
+                "docker compose up -d".into()
+            ]
+        ),
     ]);
     v
 }
@@ -323,9 +489,17 @@ fn item(id: &str, label: &str, done: bool, detail: impl Into<String>) -> Value {
 /// Everything the wizard shows, for the request it answers.
 fn report(app: &AppState, a: &Auth, headers: &HeaderMap, peer: Option<IpAddr>) -> Value {
     let progress = app.db.setup_progress();
-    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or_default();
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
     let on_this_machine = peer.is_some_and(|p| p.to_canonical().is_loopback());
-    let domain = domain_view(a, host, scheme(headers, peer, a.trust_forwarded), on_this_machine);
+    let domain = domain_view(
+        a,
+        host,
+        scheme(headers, peer, a.trust_forwarded),
+        on_this_machine,
+    );
     let sign_in = sign_in_view(app, a, domain["publicUrl"].as_str());
     let tiers = tiers_view(app);
     let license = license_view(app, a);
@@ -338,17 +512,46 @@ fn report(app: &AppState, a: &Auth, headers: &HeaderMap, peer: Option<IpAddr>) -
         (n, false) => format!("{n} other admin{}; break-glass sign-in is off.", if n == 1 { "" } else { "s" }),
     };
     let checklist = vec![
-        item("domain", "A public address with HTTPS", domain["ok"] == true, domain["detail"].as_str().unwrap_or_default()),
-        item("signin", "Sign-in providers ready", sign_in["ok"] == true, sign_in["detail"].as_str().unwrap_or_default()),
-        item("admin", "An admin besides the break-glass owner", others > 0, admin_detail),
-        item("tiers", "Plans chosen", true, tiers["detail"].as_str().unwrap_or_default()),
+        item(
+            "domain",
+            "A public address with HTTPS",
+            domain["ok"] == true,
+            domain["detail"].as_str().unwrap_or_default(),
+        ),
+        item(
+            "signin",
+            "Sign-in providers ready",
+            sign_in["ok"] == true,
+            sign_in["detail"].as_str().unwrap_or_default(),
+        ),
+        item(
+            "admin",
+            "An admin besides the break-glass owner",
+            others > 0,
+            admin_detail,
+        ),
+        item(
+            "tiers",
+            "Plans chosen",
+            true,
+            tiers["detail"].as_str().unwrap_or_default(),
+        ),
         // A license, or testing mode the operator turned on; never no license at all (ADR 0068).
-        item("license", "License in order", license["ok"] == true && license["warnings"].as_array().is_none_or(Vec::is_empty), license["detail"].as_str().unwrap_or_default()),
+        item(
+            "license",
+            "License in order",
+            license["ok"] == true && license["warnings"].as_array().is_none_or(Vec::is_empty),
+            license["detail"].as_str().unwrap_or_default(),
+        ),
         item(
             "approvals",
             "Bots ask before risky actions",
             ask,
-            if ask { "On: Bots ask a person before risky actions." } else { "Off (bypass): Bots run risky actions without asking. Turn approvals on unless this is a dev machine." },
+            if ask {
+                "On: Bots ask a person before risky actions."
+            } else {
+                "Off (bypass): Bots run risky actions without asking. Turn approvals on unless this is a dev machine."
+            },
         ),
     ];
     let done = checklist.iter().filter(|c| c["done"] == true).count();
@@ -375,7 +578,12 @@ fn peer_ip(peer: Peer) -> Option<IpAddr> {
 }
 
 /// `GET /api/setup` (admins): what's set up, what isn't, and how to finish.
-pub async fn status(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, headers: HeaderMap, peer: Peer) -> Json<Value> {
+pub async fn status(
+    State(app): State<AppState>,
+    Extension(a): Extension<Arc<Auth>>,
+    headers: HeaderMap,
+    peer: Peer,
+) -> Json<Value> {
     Json(report(&app, &a, &headers, peer_ip(peer)))
 }
 
@@ -391,16 +599,39 @@ pub async fn update(
     Json(v): Json<Value>,
 ) -> Res {
     need_user(c.principal)?;
-    let obj = v.as_object().ok_or_else(|| bad("Send a JSON object: {step?, dismissed?, completed?}."))?;
-    if let Some(k) = obj.keys().find(|k| !["step", "dismissed", "completed"].contains(&k.as_str())) {
-        return Err(bad(format!("Unknown field \"{k}\". Send step, dismissed, or completed.")));
+    let obj = v
+        .as_object()
+        .ok_or_else(|| bad("Send a JSON object: {step?, dismissed?, completed?}."))?;
+    if let Some(k) = obj
+        .keys()
+        .find(|k| !["step", "dismissed", "completed"].contains(&k.as_str()))
+    {
+        return Err(bad(format!(
+            "Unknown field \"{k}\". Send step, dismissed, or completed."
+        )));
     }
     let step = match obj.get("step") {
         None => None,
-        Some(s) => Some(s.as_str().filter(|s| STEPS.contains(s)).ok_or_else(|| bad(format!("step must be one of {}.", STEPS.join(", "))))?),
+        Some(s) => Some(
+            s.as_str()
+                .filter(|s| STEPS.contains(s))
+                .ok_or_else(|| bad(format!("step must be one of {}.", STEPS.join(", "))))?,
+        ),
     };
-    let dismissed = obj.get("dismissed").map(|d| d.as_bool().ok_or_else(|| bad("dismissed must be true or false."))).transpose()?;
-    let completed = obj.get("completed").map(|d| d.as_bool().ok_or_else(|| bad("completed must be true or false."))).transpose()?;
+    let dismissed = obj
+        .get("dismissed")
+        .map(|d| {
+            d.as_bool()
+                .ok_or_else(|| bad("dismissed must be true or false."))
+        })
+        .transpose()?;
+    let completed = obj
+        .get("completed")
+        .map(|d| {
+            d.as_bool()
+                .ok_or_else(|| bad("completed must be true or false."))
+        })
+        .transpose()?;
     let (before, p) = app.db.update_setup_progress(|p| {
         if let Some(s) = step {
             p.step = s.into();
@@ -426,17 +657,29 @@ pub async fn update(
     let out = report(&app, &a, &headers, peer_ip(peer));
     let event = |action: &str| by.event(action).target("setup", "server");
     if before.completed_at.is_none() && p.completed_at.is_some() {
-        let open: Vec<&Value> = out["checklist"].as_array().into_iter().flatten().filter(|i| i["done"] != true).map(|i| &i["id"]).collect();
-        app.db.record(&event("setup.completed").details(json!({ "done": out["done"], "total": out["total"], "open": open })));
+        let open: Vec<&Value> = out["checklist"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|i| i["done"] != true)
+            .map(|i| &i["id"])
+            .collect();
+        app.db.record(
+            &event("setup.completed")
+                .details(json!({ "done": out["done"], "total": out["total"], "open": open })),
+        );
     }
     if before.completed_at.is_some() && p.completed_at.is_none() {
         app.db.record(&event("setup.reopened"));
     }
     if !before.dismissed && p.dismissed {
-        app.db.record(&event("setup.dismissed").details(json!({ "step": p.step })));
+        app.db
+            .record(&event("setup.dismissed").details(json!({ "step": p.step })));
     }
-    if before.dismissed && !p.dismissed && p.completed_at.is_none() && before.completed_at.is_none() {
-        app.db.record(&event("setup.resumed").details(json!({ "step": p.step })));
+    if before.dismissed && !p.dismissed && p.completed_at.is_none() && before.completed_at.is_none()
+    {
+        app.db
+            .record(&event("setup.resumed").details(json!({ "step": p.step })));
     }
     Ok(Json(out))
 }
@@ -448,7 +691,11 @@ mod tests {
 
     #[test]
     fn public_hosts_leave_out_this_machine() {
-        let hosts = crate::allowed_hosts("0.0.0.0", 3000, "Bots.Example.com, localhost:8080,10.0.0.5:3000,[::1]:8443,app.localhost");
+        let hosts = crate::allowed_hosts(
+            "0.0.0.0",
+            3000,
+            "Bots.Example.com, localhost:8080,10.0.0.5:3000,[::1]:8443,app.localhost",
+        );
         assert_eq!(public_hosts(&hosts), ["bots.example.com", "10.0.0.5:3000"]);
         assert!(public_hosts(&crate::allowed_hosts("127.0.0.1", 80, "")).is_empty());
         assert_eq!(host_name("[2001:db8::1]:443"), "2001:db8::1");
@@ -463,19 +710,38 @@ mod tests {
         assert_eq!(scheme(&h, Some(lo), false), "direct");
         h.insert("x-forwarded-proto", HeaderValue::from_static("https"));
         assert_eq!(scheme(&h, Some(lo), false), "https");
-        assert_eq!(scheme(&h, Some(far), false), "direct", "anyone can send the header straight to botd");
+        assert_eq!(
+            scheme(&h, Some(far), false),
+            "direct",
+            "anyone can send the header straight to botd"
+        );
         assert_eq!(scheme(&h, Some(far), true), "https");
         h.insert("x-forwarded-proto", HeaderValue::from_static("http"));
         assert_eq!(scheme(&h, Some(lo), false), "http");
-        assert_eq!(scheme(&h, Some("::ffff:127.0.0.1".parse().unwrap()), false), "http");
+        assert_eq!(
+            scheme(&h, Some("::ffff:127.0.0.1".parse().unwrap()), false),
+            "http"
+        );
     }
 
     #[test]
     fn progress_defaults_and_shows_until_done_or_hidden() {
         let p = Progress::default();
         assert_eq!((p.step.as_str(), p.show()), ("domain", true));
-        assert!(!Progress { dismissed: true, ..p.clone() }.show());
-        assert!(!Progress { completed_at: Some(1), ..p.clone() }.show());
+        assert!(
+            !Progress {
+                dismissed: true,
+                ..p.clone()
+            }
+            .show()
+        );
+        assert!(
+            !Progress {
+                completed_at: Some(1),
+                ..p.clone()
+            }
+            .show()
+        );
         let old: Progress = serde_json::from_str(r#"{"step":"tiers"}"#).unwrap();
         assert_eq!((old.step.as_str(), old.dismissed), ("tiers", false));
     }
@@ -494,8 +760,14 @@ mod tests {
     #[test]
     fn provider_templates_are_valid_settings() {
         let fill = [
-            ("<application-client-id>", "11111111-2222-3333-4444-555555555555"),
-            ("<directory-tenant-id>", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+            (
+                "<application-client-id>",
+                "11111111-2222-3333-4444-555555555555",
+            ),
+            (
+                "<directory-tenant-id>",
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            ),
             ("<client-id>", "abc123"),
             ("<org>", "acme"),
             ("<services-id>", "com.example.superbot"),
@@ -507,7 +779,10 @@ mod tests {
             ("<realm>", "superbot"),
             ("<broker-client-id>", "superbot"),
             ("<idp-alias>", "adfs"),
-            ("<idp-entity-id>", "http://adfs.example.com/adfs/services/trust"),
+            (
+                "<idp-entity-id>",
+                "http://adfs.example.com/adfs/services/trust",
+            ),
             ("<your-domain>", "bots.example.com"),
         ];
         let all = templates(&[], None, None);
@@ -518,12 +793,29 @@ mod tests {
                 env = env.replace(k, v);
             }
             assert!(!env.contains('<'), "unfilled placeholder: {env}");
-            let vars: std::collections::HashMap<String, String> =
-                env.lines().filter(|l| !l.starts_with('#')).filter_map(|l| l.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect();
-            let sso = crate::sso::Sso::from_vars(&|k| vars.get(k).cloned()).unwrap_or_else(|e| panic!("{}: {e}\n{env}", t["id"]));
+            let vars: std::collections::HashMap<String, String> = env
+                .lines()
+                .filter(|l| !l.starts_with('#'))
+                .filter_map(|l| l.split_once('='))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let sso = crate::sso::Sso::from_vars(&|k| vars.get(k).cloned())
+                .unwrap_or_else(|e| panic!("{}: {e}\n{env}", t["id"]));
             let p = &sso.providers[0];
-            assert_eq!((p.id.as_str(), p.env_var()), (t["id"].as_str().unwrap(), t["secret"].as_str().unwrap().to_string()));
-            assert_eq!(sso.callback_url(&p.id), t["callbackUrl"].as_str().unwrap().replace("<your-domain>", "bots.example.com"));
+            assert_eq!(
+                (p.id.as_str(), p.env_var()),
+                (
+                    t["id"].as_str().unwrap(),
+                    t["secret"].as_str().unwrap().to_string()
+                )
+            );
+            assert_eq!(
+                sso.callback_url(&p.id),
+                t["callbackUrl"]
+                    .as_str()
+                    .unwrap()
+                    .replace("<your-domain>", "bots.example.com")
+            );
         }
     }
 
@@ -536,12 +828,30 @@ mod tests {
             _ => None,
         };
         let sso = crate::sso::Sso::from_vars(&vars).unwrap();
-        let t = templates(&sso.providers, Some("https://bots.example.com"), sso.public_url());
+        let t = templates(
+            &sso.providers,
+            Some("https://bots.example.com"),
+            sso.public_url(),
+        );
         let entra = t.iter().find(|t| t["id"] == "entra").unwrap();
-        assert!(entra["env"].as_str().unwrap().starts_with("SSO_PROVIDERS=google,entra\nSSO_ENTRA_CLIENT_ID="), "{entra}");
-        assert_eq!(entra["callbackUrl"], "https://bots.example.com/api/auth/sso/entra/callback");
+        assert!(
+            entra["env"]
+                .as_str()
+                .unwrap()
+                .starts_with("SSO_PROVIDERS=google,entra\nSSO_ENTRA_CLIENT_ID="),
+            "{entra}"
+        );
+        assert_eq!(
+            entra["callbackUrl"],
+            "https://bots.example.com/api/auth/sso/entra/callback"
+        );
         let google = t.iter().find(|t| t["id"] == "google").unwrap();
         assert_eq!(google["configured"], true);
-        assert!(google["env"].as_str().unwrap().starts_with("SSO_PROVIDERS=google\n"));
+        assert!(
+            google["env"]
+                .as_str()
+                .unwrap()
+                .starts_with("SSO_PROVIDERS=google\n")
+        );
     }
 }

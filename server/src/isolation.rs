@@ -32,7 +32,10 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }
 
 fn plain_id(id: &str) -> bool {
@@ -43,8 +46,14 @@ fn plain_id(id: &str) -> bool {
 /// botd's, made fresh at each start, so every token dies with the process that issued
 /// it. The owner is signed in, so a token stops working when the Bot changes hands.
 pub fn bot_token(key: &str, bot_id: &str, owner_id: &str) -> String {
-    let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key.as_bytes()), signed(bot_id, owner_id).as_bytes());
-    format!("{BOT_TOKEN_PREFIX}{bot_id}.{owner_id}.{}", hex(tag.as_ref()))
+    let tag = hmac::sign(
+        &hmac::Key::new(hmac::HMAC_SHA256, key.as_bytes()),
+        signed(bot_id, owner_id).as_bytes(),
+    );
+    format!(
+        "{BOT_TOKEN_PREFIX}{bot_id}.{owner_id}.{}",
+        hex(tag.as_ref())
+    )
 }
 
 fn signed_for(bot_id: &str, owner_id: &str, for_user: &str) -> String {
@@ -56,8 +65,14 @@ fn signed_for(bot_id: &str, owner_id: &str, for_user: &str) -> String {
 /// works only while the Bot's latest run is that teammate's, so what their run keeps
 /// can't act with the owner's access once the owner runs the Bot again.
 pub fn bot_token_for(key: &str, bot_id: &str, owner_id: &str, for_user: &str) -> String {
-    let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key.as_bytes()), signed_for(bot_id, owner_id, for_user).as_bytes());
-    format!("{BOT_TOKEN_PREFIX}{bot_id}.{owner_id}.{for_user}.{}", hex(tag.as_ref()))
+    let tag = hmac::sign(
+        &hmac::Key::new(hmac::HMAC_SHA256, key.as_bytes()),
+        signed_for(bot_id, owner_id, for_user).as_bytes(),
+    );
+    format!(
+        "{BOT_TOKEN_PREFIX}{bot_id}.{owner_id}.{for_user}.{}",
+        hex(tag.as_ref())
+    )
 }
 
 /// The Bot a token was issued to, its owner then, and the teammate it's bound to if
@@ -78,7 +93,9 @@ fn parse_token<'a>(key: &str, token: &'a str) -> Option<(&'a str, &'a str, Optio
         None => signed(id, owner),
         Some(u) => signed_for(id, owner, u),
     };
-    hmac::verify(&k, msg.as_bytes(), &tag).ok().map(|_| (id, owner, for_user))
+    hmac::verify(&k, msg.as_bytes(), &tag)
+        .ok()
+        .map(|_| (id, owner, for_user))
 }
 
 /// The Bot a token was issued to and its owner then, if botd issued it with this key.
@@ -127,7 +144,10 @@ pub fn migrate_workspace(root: &Path, owner: &str, data: &Path) -> io::Result<us
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
             _ => {}
         }
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
         f.write_all(format!("{state}\n").as_bytes())?;
         f.sync_all()?;
         drop(f);
@@ -137,7 +157,13 @@ pub fn migrate_workspace(root: &Path, owner: &str, data: &Path) -> io::Result<us
     let mut moved = 0;
     if state.is_none() {
         let entries: Vec<_> = std::fs::read_dir(&root)?.collect::<io::Result<_>>()?;
-        let entries: Vec<_> = entries.into_iter().filter(|e| !data.starts_with(e.path()) && ![STAGING, LAYOUT_TMP].iter().any(|n| e.file_name() == *n)).collect();
+        let entries: Vec<_> = entries
+            .into_iter()
+            .filter(|e| {
+                !data.starts_with(e.path())
+                    && ![STAGING, LAYOUT_TMP].iter().any(|n| e.file_name() == *n)
+            })
+            .collect();
         if entries.is_empty() && !staging.exists() {
             mark(DONE)?;
             return Ok(0);
@@ -158,7 +184,8 @@ pub fn migrate_workspace(root: &Path, owner: &str, data: &Path) -> io::Result<us
     // Anything still staged, whatever the marker says, finishes moving.
     let users = root.join(USERS);
     std::fs::create_dir_all(&users)?;
-    let dest = paths::child(&users, owner).ok_or_else(|| io::Error::other(format!("{owner} isn't a folder name")))?;
+    let dest = paths::child(&users, owner)
+        .ok_or_else(|| io::Error::other(format!("{owner} isn't a folder name")))?;
     if staging.exists() {
         if dest.exists() {
             for e in std::fs::read_dir(&staging)? {
@@ -177,7 +204,8 @@ pub fn migrate_workspace(root: &Path, owner: &str, data: &Path) -> io::Result<us
 /// Moves `DATA_DIR/USER.md` (from when all Bots shared one) to the owner's folder. True if it moved.
 pub fn migrate_user_file(data: &Path, owner: &str) -> io::Result<bool> {
     let old = data.join("USER.md");
-    let dir = user_dir(data, owner).ok_or_else(|| io::Error::other(format!("{owner} isn't a folder name")))?;
+    let dir = user_dir(data, owner)
+        .ok_or_else(|| io::Error::other(format!("{owner} isn't a folder name")))?;
     let new = dir.join("USER.md");
     if !old.is_file() || new.exists() {
         return Ok(false);
@@ -194,19 +222,37 @@ mod tests {
     fn bot_tokens_name_their_bot_and_nothing_else() {
         let key = crate::random_hex(24);
         let t = bot_token(&key, "b1", "u1");
-        assert!(t.starts_with("sbb_b1.u1.") && t.len() == "sbb_b1.u1.".len() + 64, "{t}");
+        assert!(
+            t.starts_with("sbb_b1.u1.") && t.len() == "sbb_b1.u1.".len() + 64,
+            "{t}"
+        );
         assert_eq!(token_bot(&key, &t), Some(("b1", "u1")));
         assert_eq!(token_for_user(&key, &t), None);
         let bound = bot_token_for(&key, "b1", "u1", "u2");
-        assert_eq!((token_bot(&key, &bound), token_for_user(&key, &bound)), (Some(("b1", "u1")), Some("u2")));
+        assert_eq!(
+            (token_bot(&key, &bound), token_for_user(&key, &bound)),
+            (Some(("b1", "u1")), Some("u2"))
+        );
         assert_ne!(bound, t);
         let unbound = format!("sbb_b1.u1.{}", bound.rsplit('.').next().unwrap());
-        assert_eq!(token_bot(&key, &unbound), None, "a teammate's binding can't be dropped");
+        assert_eq!(
+            token_bot(&key, &unbound),
+            None,
+            "a teammate's binding can't be dropped"
+        );
         let moved = bound.replacen(".u2.", ".u3.", 1);
         assert_eq!(token_bot(&key, &moved), None, "nor moved to someone else");
-        assert_eq!(bot_token(&key, "b1", "u1"), t, "the same for every run of a Bot until botd restarts");
+        assert_eq!(
+            bot_token(&key, "b1", "u1"),
+            t,
+            "the same for every run of a Bot until botd restarts"
+        );
         assert_ne!(bot_token(&key, "b1", "u2"), t, "or until it changes hands");
-        assert_eq!(token_bot(&crate::random_hex(24), &t), None, "another start's key");
+        assert_eq!(
+            token_bot(&crate::random_hex(24), &t),
+            None,
+            "another start's key"
+        );
         assert_eq!(token_bot("", &t), None);
         let mac = t.rsplit_once('.').unwrap().1;
         for forged in [
@@ -247,13 +293,23 @@ mod tests {
         std::fs::create_dir_all(root.join("users")).unwrap();
         assert_eq!(migrate_workspace(&root, "operator", &elsewhere).unwrap(), 3);
         let owner = root.join("users/operator");
-        assert_eq!(std::fs::read_to_string(owner.join("project/src/main.rs")).unwrap(), "fn main() {}");
+        assert_eq!(
+            std::fs::read_to_string(owner.join("project/src/main.rs")).unwrap(),
+            "fn main() {}"
+        );
         assert!(owner.join("notes.md").is_file() && owner.join("users").is_dir());
         assert!(!root.join("notes.md").exists() && !root.join(STAGING).exists());
-        assert_eq!(migrate_workspace(&root, "operator", &elsewhere).unwrap(), 0, "once");
+        assert_eq!(
+            migrate_workspace(&root, "operator", &elsewhere).unwrap(),
+            0,
+            "once"
+        );
         std::fs::write(root.join("later.md"), "x").unwrap();
         assert_eq!(migrate_workspace(&root, "operator", &elsewhere).unwrap(), 0);
-        assert!(root.join("later.md").is_file(), "files made after the move stay put");
+        assert!(
+            root.join("later.md").is_file(),
+            "files made after the move stay put"
+        );
     }
 
     #[test]
@@ -266,9 +322,15 @@ mod tests {
         std::fs::create_dir_all(root.join("users/operator")).unwrap();
         std::fs::write(root.join("users/operator/b.txt"), "b").unwrap();
         migrate_workspace(&root, "operator", &elsewhere).unwrap();
-        assert!(root.join("users/operator/a.txt").is_file() && root.join("users/operator/b.txt").is_file());
+        assert!(
+            root.join("users/operator/a.txt").is_file()
+                && root.join("users/operator/b.txt").is_file()
+        );
         assert!(!root.join(STAGING).exists());
-        assert_eq!(std::fs::read_to_string(root.join(LAYOUT)).unwrap().trim(), "per-user 1");
+        assert_eq!(
+            std::fs::read_to_string(root.join(LAYOUT)).unwrap().trim(),
+            "per-user 1"
+        );
 
         // A marker cut short (empty) with files still staged: they still move.
         let cut = crate::db::temp_path("ws-cut");
@@ -277,17 +339,32 @@ mod tests {
         std::fs::write(cut.join(LAYOUT), "").unwrap();
         migrate_workspace(&cut, "operator", &elsewhere).unwrap();
         assert!(cut.join("users/operator/c.txt").is_file() && !cut.join(STAGING).exists());
-        assert_eq!(std::fs::read_to_string(cut.join(LAYOUT)).unwrap().trim(), DONE);
+        assert_eq!(
+            std::fs::read_to_string(cut.join(LAYOUT)).unwrap().trim(),
+            DONE
+        );
         let cut = crate::db::temp_path("ws-cut-done");
         std::fs::write(cut.join(LAYOUT), "").unwrap();
         std::fs::write(cut.join("later.md"), "x").unwrap();
         assert_eq!(migrate_workspace(&cut, "operator", &elsewhere).unwrap(), 0);
-        assert!(cut.join("later.md").is_file(), "nothing staged: the move had finished");
-        assert_eq!(std::fs::read_to_string(cut.join(LAYOUT)).unwrap().trim(), DONE);
+        assert!(
+            cut.join("later.md").is_file(),
+            "nothing staged: the move had finished"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cut.join(LAYOUT)).unwrap().trim(),
+            DONE
+        );
 
         let fresh = crate::db::temp_path("ws-fresh");
-        assert_eq!(migrate_workspace(&fresh, "operator", &elsewhere).unwrap(), 0);
-        assert!(fresh.join(LAYOUT).is_file() && !fresh.join("users/operator").exists(), "nothing to move");
+        assert_eq!(
+            migrate_workspace(&fresh, "operator", &elsewhere).unwrap(),
+            0
+        );
+        assert!(
+            fresh.join(LAYOUT).is_file() && !fresh.join("users/operator").exists(),
+            "nothing to move"
+        );
     }
 
     #[test]
@@ -298,13 +375,19 @@ mod tests {
         std::fs::write(data.join("app.sqlite"), "db").unwrap();
         std::fs::write(root.join("notes.md"), "hi").unwrap();
         assert_eq!(migrate_workspace(&root, "operator", &data).unwrap(), 1);
-        assert!(data.join("app.sqlite").is_file(), "the folder holding DATA_DIR stays put");
+        assert!(
+            data.join("app.sqlite").is_file(),
+            "the folder holding DATA_DIR stays put"
+        );
         assert!(root.join("users/operator/notes.md").is_file());
 
         let same = crate::db::temp_path("ws-data-same");
         std::fs::write(same.join("app.sqlite"), "db").unwrap();
         assert_eq!(migrate_workspace(&same, "operator", &same).unwrap(), 0);
-        assert!(same.join("app.sqlite").is_file() && !same.join(LAYOUT).exists(), "DATA_DIR as the workspace: nothing moves");
+        assert!(
+            same.join("app.sqlite").is_file() && !same.join(LAYOUT).exists(),
+            "DATA_DIR as the workspace: nothing moves"
+        );
     }
 
     #[test]
@@ -317,19 +400,42 @@ mod tests {
         symlink(data.join("app.sqlite"), root.join(LAYOUT_TMP)).unwrap();
         symlink(&data, root.join(STAGING)).unwrap();
         assert_eq!(migrate_workspace(&root, "operator", &data).unwrap(), 1);
-        assert_eq!(std::fs::read_to_string(data.join("app.sqlite")).unwrap(), "db", "the database is untouched");
-        assert!(!data.join("notes.md").exists(), "nothing moved into DATA_DIR");
+        assert_eq!(
+            std::fs::read_to_string(data.join("app.sqlite")).unwrap(),
+            "db",
+            "the database is untouched"
+        );
+        assert!(
+            !data.join("notes.md").exists(),
+            "nothing moved into DATA_DIR"
+        );
         let owner = root.join("users/operator");
-        assert!(!std::fs::symlink_metadata(&owner).unwrap().file_type().is_symlink() && owner.join("notes.md").is_file());
-        assert_eq!(std::fs::read_to_string(root.join(LAYOUT)).unwrap().trim(), DONE);
+        assert!(
+            !std::fs::symlink_metadata(&owner)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+                && owner.join("notes.md").is_file()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(LAYOUT)).unwrap().trim(),
+            DONE
+        );
         assert!(!root.join(LAYOUT_TMP).exists());
 
         let root = crate::db::temp_path("ws-link-marker");
         std::fs::write(data.join("fake"), "per-user 1\n").unwrap();
         std::fs::write(root.join("notes.md"), "hi").unwrap();
         symlink(data.join("fake"), root.join(LAYOUT)).unwrap();
-        assert_eq!(migrate_workspace(&root, "operator", &data).unwrap(), 1, "a linked marker doesn't count");
-        assert_eq!(std::fs::read_to_string(data.join("fake")).unwrap(), "per-user 1\n");
+        assert_eq!(
+            migrate_workspace(&root, "operator", &data).unwrap(),
+            1,
+            "a linked marker doesn't count"
+        );
+        assert_eq!(
+            std::fs::read_to_string(data.join("fake")).unwrap(),
+            "per-user 1\n"
+        );
     }
 
     #[test]
@@ -338,7 +444,11 @@ mod tests {
         std::fs::write(data.join("USER.md"), "# About the user\n- Name: Ada\n").unwrap();
         assert!(migrate_user_file(&data, "operator").unwrap());
         assert!(!data.join("USER.md").exists());
-        assert!(std::fs::read_to_string(data.join("users/operator/USER.md")).unwrap().contains("Ada"));
+        assert!(
+            std::fs::read_to_string(data.join("users/operator/USER.md"))
+                .unwrap()
+                .contains("Ada")
+        );
         assert!(!migrate_user_file(&data, "operator").unwrap());
     }
 }

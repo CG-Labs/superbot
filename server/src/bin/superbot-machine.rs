@@ -19,11 +19,11 @@ mod job;
 mod landing;
 #[path = "../machines/pki.rs"]
 mod pki;
+#[path = "../machines/runas.rs"]
+mod runas;
 #[path = "../sandbox.rs"]
 #[allow(dead_code)]
 mod sandbox;
-#[path = "../machines/runas.rs"]
-mod runas;
 #[path = "../machines/teammates.rs"]
 mod teammates;
 #[path = "../machines/terminal.rs"]

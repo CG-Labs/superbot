@@ -55,7 +55,11 @@ impl Settings {
         let on = match var("MACHINE_FOLDER_SYNC").trim() {
             "" | "off" => false,
             "on" => true,
-            v => return Err(format!("MACHINE_FOLDER_SYNC must be on or off, not \"{v}\"")),
+            v => {
+                return Err(format!(
+                    "MACHINE_FOLDER_SYNC must be on or off, not \"{v}\""
+                ));
+            }
         };
         let max = var("MACHINE_FOLDER_SYNC_MAX_MB");
         if !on {
@@ -72,7 +76,9 @@ impl Settings {
                 .filter(|m| (1..=100 * 1024).contains(m))
                 .ok_or("MACHINE_FOLDER_SYNC_MAX_MB must be 1 to 102400")?,
         };
-        Ok(Some(Settings { max_bytes: mb << 20 }))
+        Ok(Some(Settings {
+            max_bytes: mb << 20,
+        }))
     }
 }
 
@@ -95,7 +101,10 @@ struct Claim(Arc<Enrollment>, String);
 
 impl Claim {
     fn take(e: &Arc<Enrollment>, machine_id: &str) -> Option<Claim> {
-        e.copying.lock().insert(machine_id.to_string()).then(|| Claim(e.clone(), machine_id.to_string()))
+        e.copying
+            .lock()
+            .insert(machine_id.to_string())
+            .then(|| Claim(e.clone(), machine_id.to_string()))
     }
 }
 
@@ -131,11 +140,16 @@ pub struct Status {
 }
 
 fn load(app: &App, machine_id: &str) -> Option<Status> {
-    app.db.setting(&format!("{KEY}{machine_id}")).and_then(|s| serde_json::from_str(&s).ok())
+    app.db
+        .setting(&format!("{KEY}{machine_id}"))
+        .and_then(|s| serde_json::from_str(&s).ok())
 }
 
 fn save(app: &App, machine_id: &str, s: &Status) {
-    app.db.set_setting(&format!("{KEY}{machine_id}"), &serde_json::to_string(s).unwrap_or_default());
+    app.db.set_setting(
+        &format!("{KEY}{machine_id}"),
+        &serde_json::to_string(s).unwrap_or_default(),
+    );
 }
 
 /// The machine's disks were wiped (ADR 0056): no copy there counts any more, so the
@@ -210,7 +224,11 @@ fn open_at(dir: Option<&OwnedFd>, name: &OsStr, flags: libc::c_int) -> std::io::
 
 /// `base`, then each of `rel` inside the last, with no link anywhere below `base`.
 fn open_beneath(base: &Path, rel: &[OsString], last: libc::c_int) -> std::io::Result<OwnedFd> {
-    let mut at = open_at(None, base.as_os_str(), if rel.is_empty() { last } else { DIR })?;
+    let mut at = open_at(
+        None,
+        base.as_os_str(),
+        if rel.is_empty() { last } else { DIR },
+    )?;
     for (i, part) in rel.iter().enumerate() {
         at = open_at(Some(&at), part, if i + 1 == rel.len() { last } else { DIR })?;
     }
@@ -253,7 +271,13 @@ fn kind_at(dir: &OwnedFd, name: &OsStr) -> Option<libc::mode_t> {
     // SAFETY: a valid descriptor, C string and stat buffer.
     unsafe {
         let mut st: libc::stat = std::mem::zeroed();
-        (libc::fstatat(dir.as_raw_fd(), c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) == 0).then_some(st.st_mode & libc::S_IFMT)
+        (libc::fstatat(
+            dir.as_raw_fd(),
+            c.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        ) == 0)
+            .then_some(st.st_mode & libc::S_IFMT)
     }
 }
 
@@ -263,9 +287,18 @@ impl Listing {
     }
 
     /// Lists `rel` under `base` if it is a regular file, hashing what was opened.
-    fn add(&mut self, path: String, base: &Path, rel: Vec<OsString>, seed: bool, max_bytes: u64) -> Result<(), Failed> {
+    fn add(
+        &mut self,
+        path: String,
+        base: &Path,
+        rel: Vec<OsString>,
+        seed: bool,
+        max_bytes: u64,
+    ) -> Result<(), Failed> {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let opened = open_beneath(base, &rel, FILE).map(std::fs::File::from).and_then(|f| Ok((f.metadata()?, f)));
+        let opened = open_beneath(base, &rel, FILE)
+            .map(std::fs::File::from)
+            .and_then(|f| Ok((f.metadata()?, f)));
         let Ok((meta, file)) = opened else {
             self.skipped += 1;
             return Ok(());
@@ -275,10 +308,19 @@ impl Listing {
             return Ok(());
         }
         if self.files.len() >= MAX_FILES {
-            return Err(failed("too_big", format!("The folder has over {MAX_FILES} files.")));
+            return Err(failed(
+                "too_big",
+                format!("The folder has over {MAX_FILES} files."),
+            ));
         }
         if self.bytes() + meta.len() > max_bytes {
-            return Err(failed("too_big", format!("The folder is over {} MiB (MACHINE_FOLDER_SYNC_MAX_MB).", max_bytes >> 20)));
+            return Err(failed(
+                "too_big",
+                format!(
+                    "The folder is over {} MiB (MACHINE_FOLDER_SYNC_MAX_MB).",
+                    max_bytes >> 20
+                ),
+            ));
         }
         let Ok(sha256) = sha_reader(file) else {
             self.skipped += 1;
@@ -306,7 +348,12 @@ impl Listing {
 /// Every regular file under `root`, as `work/<path>`. Links are never followed, at
 /// `root` or below it.
 fn walk(root: &Path, out: &mut Listing, max_bytes: u64) -> Result<(), Failed> {
-    open_beneath(root, &[], DIR).map_err(|e| failed("no_folder", format!("The user's folder can't be opened: {e}")))?;
+    open_beneath(root, &[], DIR).map_err(|e| {
+        failed(
+            "no_folder",
+            format!("The user's folder can't be opened: {e}"),
+        )
+    })?;
     let mut dirs: Vec<(Vec<OsString>, String)> = vec![(Vec::new(), String::from("work"))];
     while let Some((rel, shown)) = dirs.pop() {
         let Ok(dir) = open_beneath(root, &rel, DIR) else {
@@ -337,8 +384,18 @@ fn walk(root: &Path, out: &mut Listing, max_bytes: u64) -> Result<(), Failed> {
 }
 
 /// A seed from botd's own data folder: `name` in its folder.
-fn seed(out: &mut Listing, path: String, file: Option<PathBuf>, max_bytes: u64) -> Result<(), Failed> {
-    let Some((dir, name)) = file.as_deref().and_then(|f| Some((f.parent()?, f.file_name()?))) else { return Ok(()) };
+fn seed(
+    out: &mut Listing,
+    path: String,
+    file: Option<PathBuf>,
+    max_bytes: u64,
+) -> Result<(), Failed> {
+    let Some((dir, name)) = file
+        .as_deref()
+        .and_then(|f| Some((f.parent()?, f.file_name()?)))
+    else {
+        return Ok(());
+    };
     if open_beneath(dir, &[name.to_os_string()], FILE).is_err() {
         return Ok(());
     }
@@ -347,10 +404,17 @@ fn seed(out: &mut Listing, path: String, file: Option<PathBuf>, max_bytes: u64) 
 
 /// The user's folder, facts and Bots' memory, as a copy sends them.
 pub fn list(app: &App, user_id: &str, max_bytes: u64) -> Result<Listing, Failed> {
-    let root = app.workspace_for(user_id).ok_or_else(|| failed("no_folder", "The user has no folder on this server."))?;
+    let root = app
+        .workspace_for(user_id)
+        .ok_or_else(|| failed("no_folder", "The user has no folder on this server."))?;
     let mut out = Listing::default();
     walk(&root, &mut out, max_bytes)?;
-    seed(&mut out, "USER.md".into(), app.data_user_file(user_id), max_bytes)?;
+    seed(
+        &mut out,
+        "USER.md".into(),
+        app.data_user_file(user_id),
+        max_bytes,
+    )?;
     for bot in app.db.bots().into_iter().filter(|b| b.owner_id == user_id) {
         let path = format!("bots/{}/MEMORY.md", bot.id);
         if wire::home_path(&path) {
@@ -363,13 +427,23 @@ pub fn list(app: &App, user_id: &str, max_bytes: u64) -> Result<Listing, Failed>
 /// Opens a listed file again, if it is still the file that was listed.
 fn reopen(src: &Source) -> Result<std::fs::File, Failed> {
     use std::os::unix::fs::MetadataExt;
-    let shown = || src.base.join(src.rel.iter().collect::<PathBuf>()).display().to_string();
+    let shown = || {
+        src.base
+            .join(src.rel.iter().collect::<PathBuf>())
+            .display()
+            .to_string()
+    };
     let f = open_beneath(&src.base, &src.rel, FILE)
         .map(std::fs::File::from)
         .map_err(|e| failed("source_changed", format!("{}: {e}", shown())))?;
-    let meta = f.metadata().map_err(|e| failed("source_changed", e.to_string()))?;
+    let meta = f
+        .metadata()
+        .map_err(|e| failed("source_changed", e.to_string()))?;
     if !meta.is_file() || meta.dev() != src.dev || meta.ino() != src.ino {
-        return Err(failed("source_changed", format!("{} was replaced while it was being copied.", shown())));
+        return Err(failed(
+            "source_changed",
+            format!("{} was replaced while it was being copied.", shown()),
+        ));
     }
     Ok(f)
 }
@@ -377,31 +451,53 @@ fn reopen(src: &Source) -> Result<std::fs::File, Failed> {
 /// Sends one content from `have` on, chunk by chunk, until the agent has it whole (an
 /// empty one, or one it holds all of, takes one empty chunk). A chunk the agent refuses
 /// for its offset is sent again from where the agent says it is.
-async fn send(client: &reqwest::Client, url: &str, src: &Source, mut have: u64, size: u64, sent: &mut u64) -> Result<(), Failed> {
+async fn send(
+    client: &reqwest::Client,
+    url: &str,
+    src: &Source,
+    mut have: u64,
+    size: u64,
+    sent: &mut u64,
+) -> Result<(), Failed> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let mut f = tokio::fs::File::from_std(reopen(src)?);
     let mut tries = 0;
     loop {
         if have > size {
-            return Err(failed("agent_error", "Its agent holds more of a file than the file has."));
+            return Err(failed(
+                "agent_error",
+                "Its agent holds more of a file than the file has.",
+            ));
         }
-        f.seek(std::io::SeekFrom::Start(have)).await.map_err(|e| failed("source_changed", e.to_string()))?;
-        let mut chunk = vec![0u8; CHUNK.min((size - have) as usize)];
-        f.read_exact(&mut chunk)
+        f.seek(std::io::SeekFrom::Start(have))
             .await
-            .map_err(|_| failed("source_changed", "A file changed while it was being copied."))?;
+            .map_err(|e| failed("source_changed", e.to_string()))?;
+        let mut chunk = vec![0u8; CHUNK.min((size - have) as usize)];
+        f.read_exact(&mut chunk).await.map_err(|_| {
+            failed(
+                "source_changed",
+                "A file changed while it was being copied.",
+            )
+        })?;
         let n = chunk.len() as u64;
         let r = client
             .put(format!("{url}?offset={have}"))
             .body(chunk)
             .send()
             .await
-            .map_err(|e| failed("offline", format!("Lost the machine: {}", enroll::without_url(e))))?;
+            .map_err(|e| {
+                failed(
+                    "offline",
+                    format!("Lost the machine: {}", enroll::without_url(e)),
+                )
+            })?;
         let code = r.status().as_u16();
         let reply: Value = r.json().await.unwrap_or(Value::Null);
         match code {
             200 => {
-                let b: BlobReply = serde_json::from_value(reply).map_err(|_| failed("agent_error", "Its agent's answer wasn't a chunk receipt."))?;
+                let b: BlobReply = serde_json::from_value(reply).map_err(|_| {
+                    failed("agent_error", "Its agent's answer wasn't a chunk receipt.")
+                })?;
                 *sent += n;
                 if b.done {
                     return Ok(());
@@ -413,22 +509,43 @@ async fn send(client: &reqwest::Client, url: &str, src: &Source, mut have: u64, 
             }
             409 if tries < 3 => {
                 tries += 1;
-                have = reply["have"].as_u64().ok_or_else(|| failed("agent_error", "Its agent refused a chunk."))?;
+                have = reply["have"]
+                    .as_u64()
+                    .ok_or_else(|| failed("agent_error", "Its agent refused a chunk."))?;
             }
-            422 => return Err(failed("source_changed", "A file changed while it was being copied.")),
+            422 => {
+                return Err(failed(
+                    "source_changed",
+                    "A file changed while it was being copied.",
+                ));
+            }
             _ => {
                 let why = reply["error"].as_str().unwrap_or("no reason given");
-                return Err(failed("agent_error", format!("Its agent refused a chunk ({code}): {why}")));
+                return Err(failed(
+                    "agent_error",
+                    format!("Its agent refused a chunk ({code}): {why}"),
+                ));
             }
         }
     }
 }
 
 /// One copy to `m`, start to end.
-async fn copy(app: &AppState, e: &Enrollment, m: &Machine, max_bytes: u64, status: &mut Status) -> Result<SyncReport, Failed> {
-    let hb = enroll::heartbeat(app, e, m).await.map_err(|why| failed("offline", format!("Its agent didn't answer: {why}")))?;
+async fn copy(
+    app: &AppState,
+    e: &Enrollment,
+    m: &Machine,
+    max_bytes: u64,
+    status: &mut Status,
+) -> Result<SyncReport, Failed> {
+    let hb = enroll::heartbeat(app, e, m)
+        .await
+        .map_err(|why| failed("offline", format!("Its agent didn't answer: {why}")))?;
     if !hb.can.iter().any(|c| c == wire::CAN_SYNC) {
-        return Err(failed("agent_outdated", "Its agent can't take a folder: it is older than ADR 0041. Upgrade it."));
+        return Err(failed(
+            "agent_outdated",
+            "Its agent can't take a folder: it is older than ADR 0041. Upgrade it.",
+        ));
     }
     let listing = {
         let (app, user_id) = (app.clone(), m.user_id.clone());
@@ -445,23 +562,46 @@ async fn copy(app: &AppState, e: &Enrollment, m: &Machine, max_bytes: u64, statu
     };
     let body = serde_json::to_vec(&manifest).map_err(|e| failed("agent_error", e.to_string()))?;
     if body.len() > wire::MAX_MANIFEST {
-        return Err(failed("too_big", "The folder's list of files is too long to send."));
+        return Err(failed(
+            "too_big",
+            "The folder's list of files is too long to send.",
+        ));
     }
-    let address = m.ipv4.clone().ok_or_else(|| failed("offline", "The machine has no address."))?;
+    let address = m
+        .ipv4
+        .clone()
+        .ok_or_else(|| failed("offline", "The machine has no address."))?;
     let pins = app.db.machine_pins(&m.id);
-    let client = e.upload_client(pins.clone(), CHUNK_SECS).map_err(|why| failed("offline", why))?;
+    let client = e
+        .upload_client(pins.clone(), CHUNK_SECS)
+        .map_err(|why| failed("offline", why))?;
     let reply = post(&client, e.agent_url(&address, "/v1/sync"), body).await?;
-    let plan: SyncPlan = serde_json::from_value(reply).map_err(|_| failed("agent_error", "Its agent's answer wasn't a plan."))?;
+    let plan: SyncPlan = serde_json::from_value(reply)
+        .map_err(|_| failed("agent_error", "Its agent's answer wasn't a plan."))?;
     for need in &plan.need {
         let Some((_, src)) = listing.files.iter().find(|(f, _)| f.sha256 == need.sha256) else {
-            return Err(failed("agent_error", "Its agent asked for content that isn't in the folder."));
+            return Err(failed(
+                "agent_error",
+                "Its agent asked for content that isn't in the folder.",
+            ));
         };
-        let url = e.agent_url(&address, &format!("/v1/sync/{}/blobs/{}", manifest.sync_id, need.sha256));
+        let url = e.agent_url(
+            &address,
+            &format!("/v1/sync/{}/blobs/{}", manifest.sync_id, need.sha256),
+        );
         send(&client, &url, src, need.have, need.size, &mut status.sent).await?;
     }
-    let finishing = e.upload_client(pins, FINISH_SECS).map_err(|why| failed("offline", why))?;
-    let reply = post(&finishing, e.agent_url(&address, &format!("/v1/sync/{}/finish", manifest.sync_id)), b"{}".to_vec()).await?;
-    serde_json::from_value(reply).map_err(|_| failed("agent_error", "Its agent's answer wasn't a report."))
+    let finishing = e
+        .upload_client(pins, FINISH_SECS)
+        .map_err(|why| failed("offline", why))?;
+    let reply = post(
+        &finishing,
+        e.agent_url(&address, &format!("/v1/sync/{}/finish", manifest.sync_id)),
+        b"{}".to_vec(),
+    )
+    .await?;
+    serde_json::from_value(reply)
+        .map_err(|_| failed("agent_error", "Its agent's answer wasn't a report."))
 }
 
 /// A JSON request to the agent, and its answer if it took it.
@@ -472,11 +612,25 @@ async fn post(client: &reqwest::Client, url: String, body: Vec<u8>) -> Result<Va
         .body(body)
         .send()
         .await
-        .map_err(|e| failed("offline", format!("Its agent didn't answer: {}", enroll::without_url(e))))?;
+        .map_err(|e| {
+            failed(
+                "offline",
+                format!("Its agent didn't answer: {}", enroll::without_url(e)),
+            )
+        })?;
     let code = r.status().as_u16();
-    let reply = enroll::read_capped(&mut r, wire::MAX_MANIFEST).await.and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+    let reply = enroll::read_capped(&mut r, wire::MAX_MANIFEST)
+        .await
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(Value::Null);
     if code != 200 {
-        return Err(failed("agent_error", format!("Its agent refused ({code}): {}", reply["error"].as_str().unwrap_or("no reason given"))));
+        return Err(failed(
+            "agent_error",
+            format!(
+                "Its agent refused ({code}): {}",
+                reply["error"].as_str().unwrap_or("no reason given")
+            ),
+        ));
     }
     Ok(reply)
 }
@@ -484,8 +638,12 @@ async fn post(client: &reqwest::Client, url: String, body: Vec<u8>) -> Result<Va
 /// Copies the user's folder to `m` in the background, unless a copy is running.
 /// Returns whether it started one.
 pub fn start(app: &AppState, e: &Arc<Enrollment>, m: &Machine, by: &Who, trigger: &str) -> bool {
-    let Some(settings) = e.folder.clone() else { return false };
-    let Some(claim) = Claim::take(e, &m.id) else { return false };
+    let Some(settings) = e.folder.clone() else {
+        return false;
+    };
+    let Some(claim) = Claim::take(e, &m.id) else {
+        return false;
+    };
     let before = load(app, &m.id).unwrap_or_default();
     let mut status = Status {
         state: "copying".into(),
@@ -497,7 +655,12 @@ pub fn start(app: &AppState, e: &Arc<Enrollment>, m: &Machine, by: &Who, trigger
         ..Status::default()
     };
     save(app, &m.id, &status);
-    app.db.record(&event(by, "machine.folder_sync_started", m, json!({ "trigger": trigger })));
+    app.db.record(&event(
+        by,
+        "machine.folder_sync_started",
+        m,
+        json!({ "trigger": trigger }),
+    ));
     let (app, e, m, by) = (app.clone(), e.clone(), m.clone(), by.clone());
     tokio::spawn(async move {
         let res = copy(&app, &e, &m, settings.max_bytes, &mut status).await;
@@ -540,7 +703,11 @@ pub fn assigned(app: &AppState, cp: &ControlPlane, m: &Machine, by: &Who) {
 /// After a heartbeat: a first copy that failed or was cut short (botd restarted) is
 /// tried again, a few times, unless its folder was too big.
 pub fn follow_up(app: &AppState, e: &Arc<Enrollment>, m: &Machine, hb: &Heartbeat) {
-    if e.folder.is_none() || m.assigned_at.is_none() || e.copying.has(&m.id) || !hb.can.iter().any(|c| c == wire::CAN_SYNC) {
+    if e.folder.is_none()
+        || m.assigned_at.is_none()
+        || e.copying.has(&m.id)
+        || !hb.can.iter().any(|c| c == wire::CAN_SYNC)
+    {
         return;
     }
     let Some(s) = load(app, &m.id) else { return };
@@ -555,7 +722,9 @@ pub fn follow_up(app: &AppState, e: &Arc<Enrollment>, m: &Machine, hb: &Heartbea
 
 /// The user's first copy is running: their Bots wait for it.
 pub fn first_copy_running(app: &App, e: &Enrollment, machine_id: &str) -> bool {
-    e.folder.is_some() && e.copying.has(machine_id) && load(app, machine_id).is_none_or(|s| s.done_at.is_none())
+    e.folder.is_some()
+        && e.copying.has(machine_id)
+        && load(app, machine_id).is_none_or(|s| s.done_at.is_none())
 }
 
 fn view(app: &App, e: &Enrollment, m: &Machine) -> Value {
@@ -569,10 +738,12 @@ fn view(app: &App, e: &Enrollment, m: &Machine) -> Value {
 }
 
 fn control_plane(app: &App) -> Res<&ControlPlane> {
-    app.control_plane
-        .get()
-        .map(|cp| &**cp)
-        .ok_or_else(|| ApiError(StatusCode::SERVICE_UNAVAILABLE, super::NOT_CONFIGURED.into()))
+    app.control_plane.get().map(|cp| &**cp).ok_or_else(|| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            super::NOT_CONFIGURED.into(),
+        )
+    })
 }
 
 // Admin API, under `/api/users/{key}/machine/folder-sync` (admin only, rbac::classify).
@@ -581,7 +752,10 @@ fn control_plane(app: &App) -> Res<&ControlPlane> {
 pub async fn get(AppS(app): AppS<AppState>, UrlPath(key): UrlPath<String>) -> Res {
     let e = enroll::need(control_plane(&app)?)?;
     let u = need_user_key(&app, &key)?;
-    let m = app.db.user_machine(&u.id).ok_or_else(|| crate::not_found("Machine"))?;
+    let m = app
+        .db
+        .user_machine(&u.id)
+        .ok_or_else(|| crate::not_found("Machine"))?;
     Ok(Json(view(&app, e, &m)))
 }
 
@@ -593,21 +767,37 @@ pub async fn now_copy(
 ) -> Res<(StatusCode, Json<Value>)> {
     let e = enroll::need(control_plane(&app)?)?;
     if e.folder.is_none() {
-        return Err(ApiError(StatusCode::CONFLICT, "Folder copies are off. Set MACHINE_FOLDER_SYNC=on to turn them on.".into()));
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "Folder copies are off. Set MACHINE_FOLDER_SYNC=on to turn them on.".into(),
+        ));
     }
     let u = need_user_key(&app, &key)?;
-    let m = app.db.user_machine(&u.id).ok_or_else(|| crate::not_found("Machine"))?;
+    let m = app
+        .db
+        .user_machine(&u.id)
+        .ok_or_else(|| crate::not_found("Machine"))?;
     if !u.active() {
-        return Err(ApiError(StatusCode::FORBIDDEN, "That user is disabled.".into()));
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "That user is disabled.".into(),
+        ));
     }
     if m.state != State::Running || m.enrollment != "enrolled" {
         return Err(ApiError(
             StatusCode::CONFLICT,
-            format!("Their machine is {} and its agent is {}; it must be running and enrolled.", m.state.as_str(), m.enrollment),
+            format!(
+                "Their machine is {} and its agent is {}; it must be running and enrolled.",
+                m.state.as_str(),
+                m.enrollment
+            ),
         ));
     }
     if !start(&app, e, &m, &by, "admin") {
-        return Err(ApiError(StatusCode::CONFLICT, "Their folder is being copied already.".into()));
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "Their folder is being copied already.".into(),
+        ));
     }
     Ok((StatusCode::ACCEPTED, Json(view(&app, e, &m))))
 }
@@ -617,21 +807,47 @@ mod tests {
     use super::*;
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> String {
-        let pairs: Vec<(String, String)> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        move |k| pairs.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default()
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| {
+            pairs
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        }
     }
 
     #[test]
     fn settings_are_off_by_default_and_checked() {
         assert_eq!(Settings::from_env(&env(&[])), Ok(None));
-        assert_eq!(Settings::from_env(&env(&[("MACHINE_FOLDER_SYNC", "on")])), Ok(Some(Settings { max_bytes: DEFAULT_MAX_MB << 20 })));
         assert_eq!(
-            Settings::from_env(&env(&[("MACHINE_FOLDER_SYNC", "on"), ("MACHINE_FOLDER_SYNC_MAX_MB", "5")])),
+            Settings::from_env(&env(&[("MACHINE_FOLDER_SYNC", "on")])),
+            Ok(Some(Settings {
+                max_bytes: DEFAULT_MAX_MB << 20
+            }))
+        );
+        assert_eq!(
+            Settings::from_env(&env(&[
+                ("MACHINE_FOLDER_SYNC", "on"),
+                ("MACHINE_FOLDER_SYNC_MAX_MB", "5")
+            ])),
             Ok(Some(Settings { max_bytes: 5 << 20 }))
         );
         assert!(Settings::from_env(&env(&[("MACHINE_FOLDER_SYNC", "yes")])).is_err());
-        assert!(Settings::from_env(&env(&[("MACHINE_FOLDER_SYNC_MAX_MB", "5")])).is_err(), "a limit without copies is a mistake");
-        assert!(Settings::from_env(&env(&[("MACHINE_FOLDER_SYNC", "on"), ("MACHINE_FOLDER_SYNC_MAX_MB", "0")])).is_err());
+        assert!(
+            Settings::from_env(&env(&[("MACHINE_FOLDER_SYNC_MAX_MB", "5")])).is_err(),
+            "a limit without copies is a mistake"
+        );
+        assert!(
+            Settings::from_env(&env(&[
+                ("MACHINE_FOLDER_SYNC", "on"),
+                ("MACHINE_FOLDER_SYNC_MAX_MB", "0")
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
@@ -640,15 +856,26 @@ mod tests {
         std::fs::create_dir_all(root.join("sub")).unwrap();
         std::fs::write(root.join("a.txt"), "hello").unwrap();
         std::fs::write(root.join("sub/b.sh"), "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(root.join("sub/b.sh"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(
+            root.join("sub/b.sh"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
         std::os::unix::fs::symlink("/etc/passwd", root.join("link")).unwrap();
         std::fs::write(root.join("bad\nname"), "x").unwrap();
         let mut l = Listing::default();
         walk(&root, &mut l, 1 << 20).unwrap();
-        let got: Vec<(&str, u64, bool)> = l.files.iter().map(|(f, _)| (f.path.as_str(), f.size, f.exec)).collect();
+        let got: Vec<(&str, u64, bool)> = l
+            .files
+            .iter()
+            .map(|(f, _)| (f.path.as_str(), f.size, f.exec))
+            .collect();
         assert_eq!(got, [("work/a.txt", 5, false), ("work/sub/b.sh", 10, true)]);
         assert_eq!(l.skipped, 2, "the link and the name a machine can't hold");
-        assert_eq!(l.files[0].0.sha256, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+        assert_eq!(
+            l.files[0].0.sha256,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
         let mut small = Listing::default();
         assert_eq!(walk(&root, &mut small, 8).unwrap_err().reason, "too_big");
 
@@ -659,12 +886,24 @@ mod tests {
         assert_eq!(reopen(&l.files[0].1).unwrap_err().reason, "source_changed");
         std::fs::write(root.join("a.new"), "hello").unwrap();
         std::fs::rename(root.join("a.new"), root.join("a.txt")).unwrap();
-        assert_eq!(reopen(&l.files[0].1).unwrap_err().reason, "source_changed", "another file by the same name");
+        assert_eq!(
+            reopen(&l.files[0].1).unwrap_err().reason,
+            "source_changed",
+            "another file by the same name"
+        );
         std::fs::rename(root.join("sub"), root.join("moved")).unwrap();
         std::os::unix::fs::symlink(root.join("moved"), root.join("sub")).unwrap();
-        assert!(reopen(&l.files[1].1).is_err(), "a folder swapped for a link");
+        assert!(
+            reopen(&l.files[1].1).is_err(),
+            "a folder swapped for a link"
+        );
         let linked = root.with_extension("link");
         std::os::unix::fs::symlink(&root, &linked).unwrap();
-        assert_eq!(walk(&linked, &mut Listing::default(), 1 << 20).unwrap_err().reason, "no_folder");
+        assert_eq!(
+            walk(&linked, &mut Listing::default(), 1 << 20)
+                .unwrap_err()
+                .reason,
+            "no_folder"
+        );
     }
 }

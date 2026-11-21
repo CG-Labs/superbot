@@ -1,8 +1,8 @@
 //! Claude Code CLI: `claude -p --output-format stream-json`.
 //! Resumes with `--resume <session id>`. The system prompt is applied fresh every run.
 
-use super::{describe, new_uuid, str_of, Adapter, AgentEvent, ModelOption, RunInput, Usage};
-use serde_json::{json, Value};
+use super::{Adapter, AgentEvent, ModelOption, RunInput, Usage, describe, new_uuid, str_of};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
 #[derive(Default)]
@@ -38,22 +38,43 @@ impl Adapter for Claude {
     fn args(&mut self, input: &RunInput, _out: &mut Vec<AgentEvent>) -> Vec<String> {
         self.id = input.session_id.clone().unwrap_or_else(new_uuid);
         let mut a: Vec<String> = [
-            "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
-            "--dangerously-skip-permissions", "--append-system-prompt", &input.system,
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+            "--dangerously-skip-permissions",
+            "--append-system-prompt",
+            &input.system,
         ]
         .map(String::from)
         .into();
-        a.extend([if input.session_id.is_some() { "--resume" } else { "--session-id" }.into(), self.id.clone()]);
+        a.extend([
+            if input.session_id.is_some() {
+                "--resume"
+            } else {
+                "--session-id"
+            }
+            .into(),
+            self.id.clone(),
+        ]);
         // A PreToolUse deny holds even with --dangerously-skip-permissions. Flag settings
         // outrank project files, so a workspace `disableAllHooks` can't switch it off.
         let mut settings = serde_json::Map::new();
         if let Some(g) = &input.guard {
-            let hook = json!({ "type": "command", "command": g.command, "timeout": g.timeout_secs });
+            let hook =
+                json!({ "type": "command", "command": g.command, "timeout": g.timeout_secs });
             settings.insert("disableAllHooks".into(), json!(false));
-            settings.insert("hooks".into(), json!({ "PreToolUse": [{ "matcher": "*", "hooks": [hook] }] }));
+            settings.insert(
+                "hooks".into(),
+                json!({ "PreToolUse": [{ "matcher": "*", "hooks": [hook] }] }),
+            );
         }
         if let Some(s) = &input.sandbox {
-            settings.insert("sandbox".into(), sandbox_settings(s, super::api_host(input)));
+            settings.insert(
+                "sandbox".into(),
+                sandbox_settings(s, super::api_host(input)),
+            );
         }
         if !settings.is_empty() {
             a.extend(["--settings".into(), Value::Object(settings).to_string()]);
@@ -72,7 +93,9 @@ impl Adapter for Claude {
         match str_of(e, "type") {
             "stream_event" => {
                 let ev = &e["event"];
-                if str_of(ev, "type") == "content_block_delta" && str_of(&ev["delta"], "type") == "text_delta" {
+                if str_of(ev, "type") == "content_block_delta"
+                    && str_of(&ev["delta"], "type") == "text_delta"
+                {
                     out.push(AgentEvent::TextDelta(str_of(&ev["delta"], "text").into()));
                 }
             }
@@ -84,10 +107,16 @@ impl Adapter for Claude {
                 }
                 for c in e["message"]["content"].as_array().into_iter().flatten() {
                     match str_of(c, "type") {
-                        "text" if !str_of(c, "text").trim().is_empty() => out.push(AgentEvent::Text(str_of(c, "text").into())),
+                        "text" if !str_of(c, "text").trim().is_empty() => {
+                            out.push(AgentEvent::Text(str_of(c, "text").into()))
+                        }
                         "tool_use" => {
-                            self.calls.insert(str_of(c, "id").into(), str_of(c, "name").into());
-                            out.push(AgentEvent::Tool { name: str_of(c, "name").into(), detail: describe(&c["input"]) })
+                            self.calls
+                                .insert(str_of(c, "id").into(), str_of(c, "name").into());
+                            out.push(AgentEvent::Tool {
+                                name: str_of(c, "name").into(),
+                                detail: describe(&c["input"]),
+                            })
                         }
                         _ => {}
                     }
@@ -96,7 +125,12 @@ impl Adapter for Claude {
             // Results come back as the user's turn; a call refused before the hook, by
             // the hook, or failing has `is_error`.
             "user" => {
-                for c in e["message"]["content"].as_array().into_iter().flatten().filter(|c| str_of(c, "type") == "tool_result") {
+                for c in e["message"]["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|c| str_of(c, "type") == "tool_result")
+                {
                     if let Some(name) = self.calls.remove(str_of(c, "tool_use_id"))
                         && c["is_error"].as_bool() != Some(true)
                     {
@@ -105,7 +139,10 @@ impl Adapter for Claude {
                 }
             }
             "system" if str_of(e, "subtype") == "init" => {
-                self.model = e["model"].as_str().filter(|m| !m.is_empty()).map(String::from);
+                self.model = e["model"]
+                    .as_str()
+                    .filter(|m| !m.is_empty())
+                    .map(String::from);
             }
             "result" => {
                 usage(e, self.model.as_deref(), out);
@@ -148,19 +185,30 @@ impl Adapter for Claude {
         Some(super::MachineLogin {
             args: &["auth", "login"],
             files: &[".claude/.credentials.json"],
-            keys: &["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"],
+            keys: &[
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+            ],
         })
     }
 
     fn models(&self) -> Vec<ModelOption> {
-        let efforts: Vec<String> = ["low", "medium", "high", "xhigh", "max"].map(String::from).into();
+        let efforts: Vec<String> = ["low", "medium", "high", "xhigh", "max"]
+            .map(String::from)
+            .into();
         [
             ("claude-fable-5-2", "Fable 5.2", "fable"),
             ("claude-opus-5-5", "Opus 5.5", "opus"),
             ("claude-sonnet-5-5", "Sonnet 5.5", "sonnet"),
             ("claude-haiku-5-5", "Haiku 5.5", "haiku"),
         ]
-        .map(|(id, label, alias)| ModelOption { id: id.into(), label: label.into(), efforts: efforts.clone(), aliases: vec![alias.into()] })
+        .map(|(id, label, alias)| ModelOption {
+            id: id.into(),
+            label: label.into(),
+            efforts: efforts.clone(),
+            aliases: vec![alias.into()],
+        })
         .into()
     }
 }
@@ -190,7 +238,12 @@ fn usage(e: &Value, model: Option<&str>, out: &mut Vec<AgentEvent>) {
             cache_write: n(&u["cache_creation_input_tokens"]),
         });
     }
-    out.extend(found.into_iter().filter(|u| u.total() > 0).map(AgentEvent::Usage));
+    out.extend(
+        found
+            .into_iter()
+            .filter(|u| u.total() > 0)
+            .map(AgentEvent::Usage),
+    );
 }
 
 #[cfg(test)]
@@ -203,12 +256,21 @@ mod tests {
         for l in lines {
             c.on_event(&serde_json::from_str(l).unwrap(), &mut out);
         }
-        out.into_iter().filter_map(|e| if let AgentEvent::Usage(u) = e { Some(u) } else { None }).collect()
+        out.into_iter()
+            .filter_map(|e| {
+                if let AgentEvent::Usage(u) = e {
+                    Some(u)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     #[test]
     fn tokens_come_from_the_result() {
-        let init = r#"{"type":"system","subtype":"init","model":"claude-sonnet-5-5","session_id":"s"}"#;
+        let init =
+            r#"{"type":"system","subtype":"init","model":"claude-sonnet-5-5","session_id":"s"}"#;
         // Per model when Claude Code breaks it down.
         let both = usage_of(&[
             init,
@@ -216,15 +278,36 @@ mod tests {
                "modelUsage":{"claude-sonnet-5-5":{"inputTokens":120,"outputTokens":45,"cacheReadInputTokens":3000,"cacheCreationInputTokens":200},
                              "claude-haiku-5-5":{"inputTokens":30,"outputTokens":5,"cacheReadInputTokens":0,"cacheCreationInputTokens":0}}}"#,
         ]);
-        let sonnet = both.iter().find(|u| u.model.as_deref() == Some("claude-sonnet-5-5")).unwrap();
-        assert_eq!((sonnet.input, sonnet.output, sonnet.cache_read, sonnet.cache_write, sonnet.total()), (120, 45, 3000, 200, 3365));
+        let sonnet = both
+            .iter()
+            .find(|u| u.model.as_deref() == Some("claude-sonnet-5-5"))
+            .unwrap();
+        assert_eq!(
+            (
+                sonnet.input,
+                sonnet.output,
+                sonnet.cache_read,
+                sonnet.cache_write,
+                sonnet.total()
+            ),
+            (120, 45, 3000, 200, 3365)
+        );
         assert_eq!(both.len(), 2);
         // Else the run's usage, for the model init named; an error result still counts.
         let one = usage_of(&[
             init,
             r#"{"type":"result","is_error":true,"result":"overloaded","usage":{"input_tokens":7,"output_tokens":2,"cache_read_input_tokens":1,"cache_creation_input_tokens":0}}"#,
         ]);
-        assert_eq!(one, [Usage { model: Some("claude-sonnet-5-5".into()), input: 7, output: 2, cache_read: 1, cache_write: 0 }]);
+        assert_eq!(
+            one,
+            [Usage {
+                model: Some("claude-sonnet-5-5".into()),
+                input: 7,
+                output: 2,
+                cache_read: 1,
+                cache_write: 0
+            }]
+        );
         // Nothing reported: no usage, so the run is unknown.
         assert!(usage_of(&[r#"{"type":"result","is_error":false,"result":"ok"}"#]).is_empty());
     }
@@ -244,7 +327,16 @@ mod tests {
         for l in lines {
             c.on_event(&serde_json::from_str(l).unwrap(), &mut out);
         }
-        let ran: Vec<&str> = out.iter().filter_map(|e| if let AgentEvent::ToolRan { name } = e { Some(name.as_str()) } else { None }).collect();
+        let ran: Vec<&str> = out
+            .iter()
+            .filter_map(|e| {
+                if let AgentEvent::ToolRan { name } = e {
+                    Some(name.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert_eq!(ran, ["Read"], "once per call, never for an error");
         assert!(c.calls.is_empty());
     }

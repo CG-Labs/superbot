@@ -2,12 +2,14 @@
 //! Admin-only: `rbac::classify` puts these routes under Admin. Webhook URLs are secrets
 //! (they carry their own token): saved in the sealed store, never sent back, only their host.
 
-use super::{apply_bot_patch, apply_patch, load, save, secret_set, stored, smtp, webhook, Settings};
+use super::{
+    Settings, apply_bot_patch, apply_patch, load, save, secret_set, smtp, stored, webhook,
+};
 use crate::audit::Who;
 use crate::db::Bot;
 use crate::runner::App;
 use crate::secrets;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn webhook_view(name: &str) -> Value {
     let source = secrets::global().source(name).ok().flatten();
@@ -23,8 +25,12 @@ fn webhook_view(name: &str) -> Value {
 fn links_view(app: &App) -> Value {
     let n = app.notifier.get();
     match n.and_then(|n| n.links.base.as_ref()) {
-        Some(_) => json!({ "app": n.and_then(|n| n.links.app()), "console": n.and_then(|n| n.links.base.as_ref().map(|b| format!("{b}/console/"))) }),
-        None => json!({ "problem": "Set PUBLIC_URL (or ALLOWED_HOSTS) so notices can link to the approval." }),
+        Some(_) => {
+            json!({ "app": n.and_then(|n| n.links.app()), "console": n.and_then(|n| n.links.base.as_ref().map(|b| format!("{b}/console/"))) })
+        }
+        None => {
+            json!({ "problem": "Set PUBLIC_URL (or ALLOWED_HOSTS) so notices can link to the approval." })
+        }
     }
 }
 
@@ -49,7 +55,9 @@ pub fn view(app: &App) -> Value {
 fn put_url(name: &str, v: Option<&Value>) -> Result<Option<&'static str>, String> {
     let Some(v) = v else { return Ok(None) };
     if let Some((store, false)) = secrets::global().source(name).map_err(|e| e.to_string())? {
-        return Err(format!("{name} comes from the {store} store; change it there"));
+        return Err(format!(
+            "{name} comes from the {store} store; change it there"
+        ));
     }
     match v {
         Value::Null => {
@@ -59,7 +67,9 @@ fn put_url(name: &str, v: Option<&Value>) -> Result<Option<&'static str>, String
         Value::String(s) if s.trim().is_empty() => put_url(name, Some(&Value::Null)),
         Value::String(s) => {
             let url = webhook::check_url(s.trim())?;
-            secrets::global().put(name, url.as_str()).map_err(|e| e.to_string())?;
+            secrets::global()
+                .put(name, url.as_str())
+                .map_err(|e| e.to_string())?;
             Ok(Some("set"))
         }
         _ => Err("The webhook URL must be a string, or null to remove it".into()),
@@ -78,7 +88,9 @@ fn will_have_url(name: &str, v: Option<&Value>) -> bool {
 fn check(app: &App, s: &Settings, has_url: bool) -> Result<(), String> {
     if s.email.enabled {
         if app.notifier.get().is_none_or(|n| n.smtp.is_none()) {
-            return Err("Email needs an SMTP server: set SMTP_HOST and SMTP_FROM, then restart".into());
+            return Err(
+                "Email needs an SMTP server: set SMTP_HOST and SMTP_FROM, then restart".into(),
+            );
         }
         if s.email.to.is_empty() && !s.email.deciders {
             return Err("Email needs an address, or the Bots' deciders".into());
@@ -107,14 +119,22 @@ pub fn update(app: &App, by: &Who, v: &Value) -> Result<Value, String> {
     if let Some(c) = changed {
         details["webhookUrl"] = json!(c);
     }
-    app.db.record(&by.event("notifications.updated").target("notifications", "global").details(details));
+    app.db.record(
+        &by.event("notifications.updated")
+            .target("notifications", "global")
+            .details(details),
+    );
     Ok(view(app))
 }
 
 pub fn bot_view(app: &App, bot: &Bot) -> Value {
     let s = load(&app.db);
     let o = s.bots.get(&bot.id).cloned().unwrap_or_default();
-    let plan = app.notifier.get().map(|n| n.plan(&app.db, Some(bot), &s)).unwrap_or_default();
+    let plan = app
+        .notifier
+        .get()
+        .map(|n| n.plan(&app.db, Some(bot), &s))
+        .unwrap_or_default();
     json!({
         "botId": bot.id,
         "override": o,
@@ -154,6 +174,11 @@ pub fn update_bot(app: &App, by: &Who, bot: &Bot, v: &Value) -> Result<Value, St
     if let Some(c) = changed {
         details["webhookUrl"] = json!(c);
     }
-    app.db.record(&by.event("notifications.updated").target("notifications", &bot.id).bot(&bot.id).details(details));
+    app.db.record(
+        &by.event("notifications.updated")
+            .target("notifications", &bot.id)
+            .bot(&bot.id)
+            .details(details),
+    );
     Ok(bot_view(app, bot))
 }

@@ -5,7 +5,7 @@
 //! and sign-in codes botd issues (by shape): a secret botd was never told about can't
 //! be recognized here.
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -35,13 +35,20 @@ pub fn register(value: &str) {
 /// `KEYBOARD=standard` doesn't erase the word "standard" from chats.
 pub fn register_if_random(value: &str) {
     let v = value.trim();
-    if v.len() >= 12 && !v.contains(char::is_whitespace) && !v.starts_with('/') && v.bytes().any(|b| b.is_ascii_digit()) {
+    if v.len() >= 12
+        && !v.contains(char::is_whitespace)
+        && !v.starts_with('/')
+        && v.bytes().any(|b| b.is_ascii_digit())
+    {
         register(v);
     }
 }
 
 pub fn forget(value: &str) {
-    KNOWN.write().unwrap_or_else(|e| e.into_inner()).retain(|k| k != value.trim());
+    KNOWN
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|k| k != value.trim());
 }
 
 pub fn known() -> Vec<String> {
@@ -68,13 +75,22 @@ pub fn register_for(owner: &str, value: &str) {
 
 #[cfg(test)]
 pub fn forget_for(owner: &str, value: &str) {
-    if let Some(list) = OWNED.write().unwrap_or_else(|e| e.into_inner()).get_mut(owner) {
+    if let Some(list) = OWNED
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(owner)
+    {
         list.retain(|k| k != value.trim());
     }
 }
 
 pub fn owned() -> Vec<(String, Vec<String>)> {
-    OWNED.read().unwrap_or_else(|e| e.into_inner()).iter().map(|(o, l)| (o.clone(), l.clone())).collect()
+    OWNED
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(o, l)| (o.clone(), l.clone()))
+        .collect()
 }
 
 /// `text`, plus the own secrets of `owners` (the users whose Bots wrote or carry `s`).
@@ -83,12 +99,22 @@ pub fn owned() -> Vec<(String, Vec<String>)> {
 pub fn text_for<'a>(owners: &[&str], s: &'a str) -> Cow<'a, str> {
     let theirs: Vec<String> = {
         let owned = OWNED.read().unwrap_or_else(|e| e.into_inner());
-        owners.iter().filter_map(|o| owned.get(*o)).flatten().filter(|k| s.contains(k.as_str())).cloned().collect()
+        owners
+            .iter()
+            .filter_map(|o| owned.get(*o))
+            .flatten()
+            .filter(|k| s.contains(k.as_str()))
+            .cloned()
+            .collect()
     };
     if theirs.is_empty() {
         return text(s);
     }
-    let mut all: Vec<String> = known().into_iter().filter(|k| s.contains(k.as_str())).chain(theirs).collect();
+    let mut all: Vec<String> = known()
+        .into_iter()
+        .filter(|k| s.contains(k.as_str()))
+        .chain(theirs)
+        .collect();
     all.sort_by_key(|k| std::cmp::Reverse(k.len()));
     let mut out = s.to_string();
     for k in &all {
@@ -107,7 +133,11 @@ pub fn value_for(owners: &[&str], v: Value) -> Value {
             Cow::Owned(r) => Value::String(r),
         },
         Value::Array(a) => Value::Array(a.into_iter().map(|v| value_for(owners, v)).collect()),
-        Value::Object(o) => Value::Object(o.into_iter().map(|(k, v)| (k, value_for(owners, v))).collect()),
+        Value::Object(o) => Value::Object(
+            o.into_iter()
+                .map(|(k, v)| (k, value_for(owners, v)))
+                .collect(),
+        ),
         other => other,
     }
 }
@@ -128,15 +158,27 @@ pub fn text(s: &str) -> Cow<'_, str> {
 
 /// Session tokens, sign-in codes, SSO handoff codes, and SCIM tokens botd issues. Only their hashes are kept, so they
 /// can't be registered; they're recognized by shape: a prefix and 64 hex digits.
-const ISSUED: [&str; 4] = [crate::users::SESSION_PREFIX, crate::users::CODE_PREFIX, crate::sso::HANDOFF_PREFIX, crate::scim::TOKEN_PREFIX];
+const ISSUED: [&str; 4] = [
+    crate::users::SESSION_PREFIX,
+    crate::users::CODE_PREFIX,
+    crate::sso::HANDOFF_PREFIX,
+    crate::scim::TOKEN_PREFIX,
+];
 const ISSUED_HEX: usize = 64;
 
 /// Where the first issued token in `s` starts, and its length.
 fn next_issued(s: &str) -> Option<(usize, usize)> {
     ISSUED
         .iter()
-        .flat_map(|p| s.match_indices(p).map(move |(i, _)| (i, p.len() + ISSUED_HEX)))
-        .filter(|&(i, len)| s.as_bytes().get(i + len - ISSUED_HEX..i + len).is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit)))
+        .flat_map(|p| {
+            s.match_indices(p)
+                .map(move |(i, _)| (i, p.len() + ISSUED_HEX))
+        })
+        .filter(|&(i, len)| {
+            s.as_bytes()
+                .get(i + len - ISSUED_HEX..i + len)
+                .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit))
+        })
         .min()
 }
 
@@ -167,14 +209,27 @@ pub fn value(v: Value) -> Value {
 /// Names that mention a secret (`AWS_ACCESS_KEY_ID`, `OPENAI_API_KEY`, ...).
 pub fn names_secret(name: &str) -> bool {
     let n = name.to_ascii_uppercase();
-    ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "PRIVATE"].iter().any(|w| n.contains(w))
+    [
+        "KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIAL",
+        "PRIVATE",
+    ]
+    .iter()
+    .any(|w| n.contains(w))
 }
 
 /// Environment variable names whose values are treated as secrets: they mention one
 /// and don't look like they hold a path or an id instead.
 pub fn looks_secret(name: &str) -> bool {
     let n = name.to_ascii_uppercase();
-    names_secret(&n) && !["_FILE", "_PATH", "_DIR", "_SOCK", "_ID"].iter().any(|s| n.ends_with(s))
+    names_secret(&n)
+        && !["_FILE", "_PATH", "_DIR", "_SOCK", "_ID"]
+            .iter()
+            .any(|s| n.ends_with(s))
 }
 
 /// Redacts known secrets already saved in chat text, choice cards, and approval
@@ -190,14 +245,21 @@ pub fn scrub_rows(c: &Connection) -> rusqlite::Result<usize> {
         all.sort_by_key(|k| std::cmp::Reverse(k.len()));
         for s in all {
             for (table, col) in [("messages", "text"), ("approvals", "subject")] {
-                let sql = format!("UPDATE {table} SET {col} = replace({col}, ?1, ?2) WHERE instr({col}, ?1) > 0 AND bot_id IN (SELECT id FROM bots WHERE owner_id = ?3)");
+                let sql = format!(
+                    "UPDATE {table} SET {col} = replace({col}, ?1, ?2) WHERE instr({col}, ?1) > 0 AND bot_id IN (SELECT id FROM bots WHERE owner_id = ?3)"
+                );
                 n += tx.execute(&sql, params![s, MARK, owner])?;
             }
         }
     }
     for s in known() {
         for (table, col) in [("messages", "text"), ("approvals", "subject")] {
-            n += tx.execute(&format!("UPDATE {table} SET {col} = replace({col}, ?1, ?2) WHERE instr({col}, ?1) > 0"), params![s, MARK])?;
+            n += tx.execute(
+                &format!(
+                    "UPDATE {table} SET {col} = replace({col}, ?1, ?2) WHERE instr({col}, ?1) > 0"
+                ),
+                params![s, MARK],
+            )?;
         }
     }
     // Choice cards and saved requesters are JSON, where a secret with quotes or
@@ -205,13 +267,19 @@ pub fn scrub_rows(c: &Connection) -> rusqlite::Result<usize> {
     for col in ["question", "requested_by"] {
         let rows: Vec<(i64, String, Option<String>)> = {
             let mut s = tx.prepare(&format!("SELECT m.id, m.{col}, b.owner_id FROM messages m LEFT JOIN bots b ON b.id = m.bot_id WHERE m.{col} IS NOT NULL"))?;
-            s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?
+            s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?
         };
         for (id, raw, owner) in rows {
-            let Ok(json) = serde_json::from_str::<Value>(&raw) else { continue };
+            let Ok(json) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
             let clean = value_for(owner.as_deref().as_slice(), json.clone());
             if clean != json {
-                n += tx.execute(&format!("UPDATE messages SET {col} = ? WHERE id = ?"), params![clean.to_string(), id])?;
+                n += tx.execute(
+                    &format!("UPDATE messages SET {col} = ? WHERE id = ?"),
+                    params![clean.to_string(), id],
+                )?;
             }
         }
     }
@@ -236,10 +304,16 @@ mod tests {
         register(&longer);
         register("short");
         assert_eq!(text(&format!("use {key} now")), "use [redacted] now");
-        assert_eq!(text(&format!("{longer}!")), "[redacted]!", "the longer secret goes whole");
+        assert_eq!(
+            text(&format!("{longer}!")),
+            "[redacted]!",
+            "the longer secret goes whole"
+        );
         assert_eq!(text("short words stay"), "short words stay");
         assert!(matches!(text("nothing here"), Cow::Borrowed(_)));
-        let v = value(json!({ "subject": format!("curl -H 'x: {key}'"), "list": [key.clone(), 3], "n": 1, key.clone(): "keys stay" }));
+        let v = value(
+            json!({ "subject": format!("curl -H 'x: {key}'"), "list": [key.clone(), 3], "n": 1, key.clone(): "keys stay" }),
+        );
         assert_eq!(v["subject"], "curl -H 'x: [redacted]'");
         assert_eq!(v["list"], json!(["[redacted]", 3]));
         assert_eq!(v[key.as_str()], "keys stay");
@@ -255,11 +329,25 @@ mod tests {
         let prefix = key[..key.len() - 6].to_string();
         register(&key);
         register_for(&owner, &prefix);
-        assert_eq!(text_for(&[owner.as_str()], &format!("key {key}!")), "key [redacted]!", "the whole server key, no suffix left");
-        assert_eq!(text_for(&[owner.as_str()], &format!("{prefix}..")), "[redacted]..");
-        assert_eq!(text(&format!("{prefix}..")), format!("{prefix}.."), "only in the owner's Bots");
+        assert_eq!(
+            text_for(&[owner.as_str()], &format!("key {key}!")),
+            "key [redacted]!",
+            "the whole server key, no suffix left"
+        );
+        assert_eq!(
+            text_for(&[owner.as_str()], &format!("{prefix}..")),
+            "[redacted].."
+        );
+        assert_eq!(
+            text(&format!("{prefix}..")),
+            format!("{prefix}.."),
+            "only in the owner's Bots"
+        );
         assert_eq!(text_for(&["someone-else"], &prefix), prefix.as_str());
-        assert_eq!(value_for(&[owner.as_str()], json!({ "a": [format!("x {key}")] })), json!({ "a": ["x [redacted]"] }));
+        assert_eq!(
+            value_for(&[owner.as_str()], json!({ "a": [format!("x {key}")] })),
+            json!({ "a": ["x [redacted]"] })
+        );
         forget(&key);
         forget_for(&owner, &prefix);
     }
@@ -269,9 +357,18 @@ mod tests {
         let session = crate::users::new_secret(crate::users::SESSION_PREFIX);
         let code = crate::users::new_secret(crate::users::CODE_PREFIX);
         let scim = crate::users::new_secret(crate::scim::TOKEN_PREFIX);
-        assert_eq!(text(&format!("my code is {code}, token {session}.")), "my code is [redacted], token [redacted].");
-        assert_eq!(text(&format!("SCIM secret: {scim}")), "SCIM secret: [redacted]");
-        assert_eq!(value(json!({ "t": format!("Bearer {session}") }))["t"], "Bearer [redacted]");
+        assert_eq!(
+            text(&format!("my code is {code}, token {session}.")),
+            "my code is [redacted], token [redacted]."
+        );
+        assert_eq!(
+            text(&format!("SCIM secret: {scim}")),
+            "SCIM secret: [redacted]"
+        );
+        assert_eq!(
+            value(json!({ "t": format!("Bearer {session}") }))["t"],
+            "Bearer [redacted]"
+        );
         for s in ["sbs_", "sbc_abc", "sbs_x", "the sbc_ prefix"] {
             assert!(matches!(text(s), Cow::Borrowed(_)), "{s}");
         }
@@ -282,7 +379,12 @@ mod tests {
     #[test]
     fn guessed_values_must_look_random() {
         let key = unique("sk-ant-api03");
-        for v in ["standard", "/home/u/.ssh/id_ed25519", "two words 12345678", "short1"] {
+        for v in [
+            "standard",
+            "/home/u/.ssh/id_ed25519",
+            "two words 12345678",
+            "short1",
+        ] {
             register_if_random(v);
             assert!(!known().iter().any(|k| k == v), "{v}");
         }
@@ -293,10 +395,25 @@ mod tests {
 
     #[test]
     fn secret_looking_names() {
-        for n in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "AUTH_PASSWORD", "GITHUB_TOKEN", "db_secret"] {
+        for n in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "AUTH_PASSWORD",
+            "GITHUB_TOKEN",
+            "db_secret",
+        ] {
             assert!(looks_secret(n), "{n}");
         }
-        for n in ["PATH", "HOME", "GIT_AUTHOR_NAME", "SSH_AUTH_SOCK", "SUPERBOT_MASTER_KEY_FILE", "AWS_ACCESS_KEY_ID", "TZ"] {
+        for n in [
+            "PATH",
+            "HOME",
+            "GIT_AUTHOR_NAME",
+            "SSH_AUTH_SOCK",
+            "SUPERBOT_MASTER_KEY_FILE",
+            "AWS_ACCESS_KEY_ID",
+            "TZ",
+        ] {
             assert!(!looks_secret(n), "{n}");
         }
     }
@@ -308,9 +425,22 @@ mod tests {
         let bot = db.create_bot("A", "#fff", "waddle", "claude", None, true);
         let secret = unique("hunter2\"hunter2\\");
         // Saved before botd knew the value, e.g. by an older version.
-        let m = db.add_message(&bot.id, "bot", &format!("the key is {secret}"), Some(&json!({ "title": secret, "options": ["a"] })), false, None);
+        let m = db.add_message(
+            &bot.id,
+            "bot",
+            &format!("the key is {secret}"),
+            Some(&json!({ "title": secret, "options": ["a"] })),
+            false,
+            None,
+        );
         let ua = format!("curl/8 {secret}");
-        let who = crate::audit::Who { actor: crate::audit::Actor::operator(), source: crate::audit::Source { ip: None, user_agent: Some(ua) } };
+        let who = crate::audit::Who {
+            actor: crate::audit::Actor::operator(),
+            source: crate::audit::Source {
+                ip: None,
+                user_agent: Some(ua),
+            },
+        };
         db.set_requested_by(m.id, &who);
         register(&secret);
         let c = Connection::open(&path).unwrap();
@@ -318,7 +448,10 @@ mod tests {
         let m = db.message(m.id).unwrap();
         assert_eq!(m.text, "the key is [redacted]");
         assert_eq!(m.question.unwrap()["title"], MARK);
-        assert_eq!(m.requested_by.unwrap().source.user_agent.as_deref(), Some("curl/8 [redacted]"));
+        assert_eq!(
+            m.requested_by.unwrap().source.user_agent.as_deref(),
+            Some("curl/8 [redacted]")
+        );
         assert_eq!(scrub_rows(&c).unwrap(), 0, "idempotent");
         forget(&secret);
     }

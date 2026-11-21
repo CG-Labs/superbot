@@ -276,10 +276,15 @@ impl ControlPlane {
         let Some(token) = store.get("LINODE_TOKEN").map_err(|e| e.to_string())? else {
             let routing = route::Routing::parse(&var("MACHINE_ROUTING"))?;
             if routing != route::Routing::Off {
-                return Err(format!("MACHINE_ROUTING={} needs the control plane: {NEEDS_IT}", routing.as_str()));
+                return Err(format!(
+                    "MACHINE_ROUTING={} needs the control plane: {NEEDS_IT}",
+                    routing.as_str()
+                ));
             }
             if firewall::Settings::from_env(&var)?.is_some() {
-                return Err(format!("MACHINE_FIREWALL=on needs the control plane: {NEEDS_IT}"));
+                return Err(format!(
+                    "MACHINE_FIREWALL=on needs the control plane: {NEEDS_IT}"
+                ));
             }
             return Ok(ControlPlane::default());
         };
@@ -305,8 +310,15 @@ impl ControlPlane {
     /// MACHINE_FIREWALL=on, since the firewall is what keeps a container off its
     /// neighbours and private addresses. MACHINE_REGIONS is optional: `local` for a
     /// lone host, cluster member names otherwise.
-    fn incus_from_env(store: &dyn SecretStore, var: &dyn Fn(&str) -> String) -> Result<ControlPlane, String> {
-        if store.get("LINODE_TOKEN").map_err(|e| e.to_string())?.is_some() {
+    fn incus_from_env(
+        store: &dyn SecretStore,
+        var: &dyn Fn(&str) -> String,
+    ) -> Result<ControlPlane, String> {
+        if store
+            .get("LINODE_TOKEN")
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
             return Err("MACHINE_PROVIDER=incus and LINODE_TOKEN are both set; a control plane uses one provider".into());
         }
         if var("MACHINE_CONTROL_URL").trim().is_empty() {
@@ -315,14 +327,19 @@ impl ControlPlane {
         if firewall::Settings::from_env(var)?.is_none() {
             return Err("MACHINE_PROVIDER=incus needs MACHINE_FIREWALL=on: the firewall is what keeps containers off each other, the host, and private addresses".into());
         }
-        let p = incus::Incus::new(incus::Settings::from_env(var)?, incus::Credentials::from_store(store)?)?;
+        let p = incus::Incus::new(
+            incus::Settings::from_env(var)?,
+            incus::Credentials::from_store(store)?,
+        )?;
         let mut cp = ControlPlane::configured(Arc::new(p), var)?;
         cp.regions = list(&var("MACHINE_REGIONS"));
         if cp.regions.is_empty() {
             cp.regions = vec![incus::LOCAL.into()];
         }
         if let Some(r) = cp.regions.iter().find(|r| !slug(r, 32)) {
-            return Err(format!("MACHINE_REGIONS: \"{r}\" isn't a cluster member name"));
+            return Err(format!(
+                "MACHINE_REGIONS: \"{r}\" isn't a cluster member name"
+            ));
         }
         Ok(cp)
     }
@@ -395,9 +412,14 @@ impl ControlPlane {
 
     /// Turns on enrollment: machines get tokens at create, and routed work goes to
     /// them over mutual TLS. Needs the control plane.
-    pub fn enroll_with(&mut self, e: enroll::Enrollment) -> Result<Arc<enroll::Enrollment>, String> {
+    pub fn enroll_with(
+        &mut self,
+        e: enroll::Enrollment,
+    ) -> Result<Arc<enroll::Enrollment>, String> {
         if !self.enabled() {
-            return Err(format!("MACHINE_CONTROL_URL needs the control plane: {NEEDS_IT}"));
+            return Err(format!(
+                "MACHINE_CONTROL_URL needs the control plane: {NEEDS_IT}"
+            ));
         }
         if let Some(s) = &self.firewall_settings {
             self.firewall = Some(firewall::Firewall::new(
@@ -434,7 +456,11 @@ impl ControlPlane {
     }
 
     /// Where `user_id`'s Bots run (`route::target`).
-    pub fn route(&self, db: &crate::db::Db, user_id: &str) -> Result<route::Target, route::Refusal> {
+    pub fn route(
+        &self,
+        db: &crate::db::Db,
+        user_id: &str,
+    ) -> Result<route::Target, route::Refusal> {
         route::target(db, self, user_id)
     }
 
@@ -444,8 +470,18 @@ impl ControlPlane {
     /// `teammate`: the run is a teammate's, as their own user (ADR 0048), which the
     /// agent must be able to do, and which a server-wide key logs in, or their own
     /// login there (ADR 0062), checked once their user answers (`teammate_logged_in`).
-    pub fn ready(&self, app: &App, hb: &wire::Heartbeat, keys: Option<&str>, machine_id: &str, bin: &str, teammate: bool) -> Result<(), route::Refusal> {
-        let Some(e) = &self.enrollment else { return Ok(()) };
+    pub fn ready(
+        &self,
+        app: &App,
+        hb: &wire::Heartbeat,
+        keys: Option<&str>,
+        machine_id: &str,
+        bin: &str,
+        teammate: bool,
+    ) -> Result<(), route::Refusal> {
+        let Some(e) = &self.enrollment else {
+            return Ok(());
+        };
         botuser::check_run(e, hb)?;
         if teammate {
             teammate::fit(hb)?;
@@ -459,7 +495,11 @@ impl ControlPlane {
 
     /// Whether a teammate's run of `bin` may start, from their own user's answer
     /// (`reply`): a server-wide key, or their own login in their home there (ADR 0062).
-    pub fn teammate_logged_in(&self, bin: &str, reply: &wire::TeammateReply) -> Result<(), route::Refusal> {
+    pub fn teammate_logged_in(
+        &self,
+        bin: &str,
+        reply: &wire::TeammateReply,
+    ) -> Result<(), route::Refusal> {
         match &self.enrollment {
             Some(_) => logins::check_teammate_login(bin, reply),
             None => Ok(()),
@@ -482,7 +522,9 @@ impl ControlPlane {
     /// MACHINE_PROVIDER changed) is left as it is: its provider id means nothing to
     /// this one. Its agent is still reached as before.
     pub fn owns(&self, m: &Machine) -> bool {
-        self.provider.as_ref().is_some_and(|p| p.name() == m.provider)
+        self.provider
+            .as_ref()
+            .is_some_and(|p| p.name() == m.provider)
     }
 
     fn need_own(&self, m: &Machine) -> Res<()> {
@@ -527,8 +569,12 @@ impl ControlPlane {
                     route::Routing::Off => "off (Bots run on this server)".into(),
                     r => format!("{} via {}", r.as_str(), self.link.name()),
                 },
-                self.enrollment.as_ref().map_or("off (set MACHINE_CONTROL_URL)".into(), |e| e.describe()),
-                self.firewall.as_ref().map_or("off (set MACHINE_FIREWALL=on)".into(), |f| f.describe())
+                self.enrollment
+                    .as_ref()
+                    .map_or("off (set MACHINE_CONTROL_URL)".into(), |e| e.describe()),
+                self.firewall
+                    .as_ref()
+                    .map_or("off (set MACHINE_FIREWALL=on)".into(), |f| f.describe())
             ),
         }
     }
@@ -634,7 +680,12 @@ async fn provision(
         None => None,
         Some(e) => match e.mint_token(app, &m.id, by.actor.id.as_deref()) {
             Ok((token, expires_at)) => {
-                app.db.record(&event(by, "machine.enroll_token_issued", &m, json!({ "expiresAt": expires_at, "via": "create" })));
+                app.db.record(&event(
+                    by,
+                    "machine.enroll_token_issued",
+                    &m,
+                    json!({ "expiresAt": expires_at, "via": "create" }),
+                ));
                 Some(e.user_data(&m, &token))
             }
             Err(err) => {
@@ -846,13 +897,17 @@ async fn reconcile_one(app: &App, cp: &ControlPlane, p: &dyn MachineProvider, id
                 match p.clear_user_data(&pid).await {
                     Ok(()) => {
                         user_data = false;
-                        app.db.record(&event(&by, "machine.user_data_cleared", &m, d));
+                        app.db
+                            .record(&event(&by, "machine.user_data_cleared", &m, d));
                     }
                     Err(e) => {
                         m.last_error = Some(e.to_string());
                         let mut d = d;
                         d["error"] = json!(e.to_string());
-                        app.db.record(&event(&by, "machine.user_data_clear_failed", &m, d).outcome(Outcome::Failure));
+                        app.db.record(
+                            &event(&by, "machine.user_data_clear_failed", &m, d)
+                                .outcome(Outcome::Failure),
+                        );
                     }
                 }
             }
@@ -940,7 +995,11 @@ pub async fn reconcile(app: &App, cp: &ControlPlane) -> Value {
 pub async fn heartbeats(app: &AppState, cp: &ControlPlane) -> Option<usize> {
     use futures_util::StreamExt;
     let e = cp.enrollment.as_ref()?;
-    let enrolled = app.db.machines(Some(State::Running)).into_iter().filter(|m| m.enrollment == "enrolled");
+    let enrolled = app
+        .db
+        .machines(Some(State::Running))
+        .into_iter()
+        .filter(|m| m.enrollment == "enrolled");
     let answered = futures_util::stream::iter(enrolled)
         .map(|m| async move {
             let Ok(hb) = enroll::heartbeat(app, e, &m).await else {
@@ -1087,7 +1146,11 @@ pub async fn list_all(
 pub fn size_for(app: &App, cp: &ControlPlane, user_id: &str) -> Option<(String, String)> {
     let tier = app.tier_of(user_id);
     let plan = tier.limits.machine_type.clone()?;
-    let name = cp.tiers.iter().find(|(_, p)| *p == plan).map_or_else(|| tier.name.clone(), |(t, _)| t.clone());
+    let name = cp
+        .tiers
+        .iter()
+        .find(|(_, p)| *p == plan)
+        .map_or_else(|| tier.name.clone(), |(t, _)| t.clone());
     Some((name, plan))
 }
 
@@ -1095,7 +1158,10 @@ pub fn size_for(app: &App, cp: &ControlPlane, user_id: &str) -> Option<(String, 
 /// them, else a `MACHINE_TIERS` entry. The user's own size wins, since it may be named
 /// after their tier and a `MACHINE_TIERS` entry of that name may be another plan.
 fn plan_of(cp: &ControlPlane, size: &Option<(String, String)>, tier: &str) -> Option<String> {
-    size.as_ref().filter(|(n, _)| n == tier).map(|(_, p)| p.clone()).or_else(|| cp.plan(tier).map(String::from))
+    size.as_ref()
+        .filter(|(n, _)| n == tier)
+        .map(|(_, p)| p.clone())
+        .or_else(|| cp.plan(tier).map(String::from))
 }
 
 fn tier_choices(cp: &ControlPlane, size: &Option<(String, String)>) -> String {
@@ -1107,13 +1173,26 @@ fn tier_choices(cp: &ControlPlane, size: &Option<(String, String)>) -> String {
 }
 
 /// A machine size the user's plan doesn't give them: refused, and audited.
-fn refuse_size(app: &App, by: &Who, u: &crate::db::User, allowed: &(String, String), tier: &str, plan: &str, action: &str) -> ApiError {
+fn refuse_size(
+    app: &App,
+    by: &Who,
+    u: &crate::db::User,
+    allowed: &(String, String),
+    tier: &str,
+    plan: &str,
+    action: &str,
+) -> ApiError {
     let user_tier = app.tier_of(&u.id);
     let details = json!({
         "reason": "tier_machine_size", "action": action, "userEmail": u.email, "userTier": user_tier.name,
         "askedTier": tier, "askedPlan": plan, "allowedTier": allowed.0, "allowedPlan": allowed.1,
     });
-    app.db.record(&by.event("machine.refused").target("user", &u.id).outcome(Outcome::Denied).details(details));
+    app.db.record(
+        &by.event("machine.refused")
+            .target("user", &u.id)
+            .outcome(Outcome::Denied)
+            .details(details),
+    );
     ApiError(
         StatusCode::FORBIDDEN,
         format!(
@@ -1177,9 +1256,15 @@ pub async fn request(
     // and asking otherwise was refused above.
     let settings = |tier: &str, plan: &str, region: &str| {
         let (tier, plan) = match (&asked_tier, &size) {
-            (Some(t), _) => (t.clone(), plan_of(cp, &size, t).unwrap_or_else(|| plan.into())),
+            (Some(t), _) => (
+                t.clone(),
+                plan_of(cp, &size, t).unwrap_or_else(|| plan.into()),
+            ),
             (None, Some(s)) => s.clone(),
-            (None, None) => (tier.to_string(), cp.plan(tier).map_or_else(|| plan.into(), String::from)),
+            (None, None) => (
+                tier.to_string(),
+                cp.plan(tier).map_or_else(|| plan.into(), String::from),
+            ),
         };
         let region = asked_region.clone().unwrap_or_else(|| region.into());
         (tier, plan, region)
@@ -1483,7 +1568,10 @@ pub async fn reconcile_now(AppS(app): AppS<AppState>, Extension(a): Extension<Ar
 /// `GET /api/machines/substrate?check=true`: what this server makes machines on, what
 /// each tier gets, and how they are kept apart. `check` asks the provider whether it
 /// is set up as the control plane needs.
-pub async fn substrate(Extension(a): Extension<Arc<Auth>>, Query(q): Query<HashMap<String, String>>) -> Res {
+pub async fn substrate(
+    Extension(a): Extension<Arc<Auth>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Res {
     let cp = &a.machines;
     let p = cp.need()?;
     let tiers: Vec<Value> = cp
@@ -1502,7 +1590,9 @@ pub async fn substrate(Extension(a): Extension<Arc<Auth>>, Query(q): Query<HashM
         "firewall": cp.firewall.as_ref().map(|f| json!({ "label": f.label, "rules": firewall::rules_json(&f.rules) })),
         "settings": p.settings(),
     });
-    if q.get("check").is_some_and(|c| matches!(c.as_str(), "1" | "true" | "yes")) {
+    if q.get("check")
+        .is_some_and(|c| matches!(c.as_str(), "1" | "true" | "yes"))
+    {
         v["checks"] = match p.preflight().await {
             Ok(c) => json!(c),
             Err(e) => json!([{ "check": "provider", "ok": false, "detail": e.to_string() }]),
@@ -1565,16 +1655,29 @@ fn unplace(app: &App, by: &Who, m: &Machine, reason: &str) -> bool {
         return false;
     }
     let forgot = app.db.forget_sessions_of(&m.user_id);
-    app.db.record(&event(by, "placement.unassigned", m, json!({ "reason": reason, "sessionsReset": forgot })));
+    app.db.record(&event(
+        by,
+        "placement.unassigned",
+        m,
+        json!({ "reason": reason, "sessionsReset": forgot }),
+    ));
     true
 }
 
 /// `GET /api/machines/placements`: every live machine and where its user's Bots run.
 pub async fn placements(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>) -> Res {
     a.machines.need()?;
-    let live = app.db.machines(None).into_iter().filter(|m| m.state != State::Destroyed);
-    let list: Vec<Value> = live.map(|m| placement_view(&app, &a.machines, &m.user_id)).collect();
-    Ok(Json(json!({ "routing": a.machines.routing.as_str(), "placements": list })))
+    let live = app
+        .db
+        .machines(None)
+        .into_iter()
+        .filter(|m| m.state != State::Destroyed);
+    let list: Vec<Value> = live
+        .map(|m| placement_view(&app, &a.machines, &m.user_id))
+        .collect();
+    Ok(Json(
+        json!({ "routing": a.machines.routing.as_str(), "placements": list }),
+    ))
 }
 
 /// `GET /api/users/{key}/placement`: where the user's Bots run now, and why.
@@ -1600,13 +1703,20 @@ pub async fn assign(
     cp.need()?;
     let u = need_user_key(&app, &key)?;
     let _g = cp.ops.lock().await;
-    let m = app.db.user_machine(&u.id).ok_or_else(|| conflict("They don't have a machine. Request one first.".into()))?;
+    let m = app
+        .db
+        .user_machine(&u.id)
+        .ok_or_else(|| conflict("They don't have a machine. Request one first.".into()))?;
     if m.assigned_at.is_none() {
         if m.state != State::Running || m.enrollment != "enrolled" {
             return Err(conflict(format!(
                 "Their machine is {} and its agent is {}: assign it once it's running and enrolled.",
                 m.state.as_str(),
-                if m.enrollment == "none" { "not enrolled" } else { m.enrollment.as_str() }
+                if m.enrollment == "none" {
+                    "not enrolled"
+                } else {
+                    m.enrollment.as_str()
+                }
             )));
         }
         if app.db.assign_machine(&m.id, by.actor.id.as_deref()) {
@@ -1722,7 +1832,11 @@ mod tests {
     fn incus_settings() {
         let (cert, key) = incus_standin::self_signed("botd.test");
         let (server, _) = incus_standin::self_signed("incus.test");
-        let certs = EnvStore::fixed(&[("INCUS_CLIENT_CERT", &cert), ("INCUS_CLIENT_KEY", &key), ("INCUS_SERVER_CERT", &server)]);
+        let certs = EnvStore::fixed(&[
+            ("INCUS_CLIENT_CERT", &cert),
+            ("INCUS_CLIENT_KEY", &key),
+            ("INCUS_SERVER_CERT", &server),
+        ]);
         let base: &[(&str, &str)] = &[
             ("MACHINE_PROVIDER", "incus"),
             ("INCUS_URL", "https://192.0.2.40:8443"),
@@ -1737,7 +1851,10 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
             ControlPlane::from_env(store, move |k| {
-                vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default()
+                vars.iter()
+                    .find(|(n, _)| n == k)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default()
             })
         };
         let cp = with(&certs, &[]).unwrap();
@@ -1745,34 +1862,96 @@ mod tests {
         assert_eq!(cp.regions, ["local"], "a lone host needs no region");
         assert_eq!(cp.image, incus::DEFAULT_IMAGE);
         assert_eq!(cp.tiers, parse_tiers(incus::DEFAULT_TIERS).unwrap());
-        assert!(cp.describe().starts_with("incus (containers)"), "{}", cp.describe());
+        assert!(
+            cp.describe().starts_with("incus (containers)"),
+            "{}",
+            cp.describe()
+        );
         assert!(!cp.describe().contains("PRIVATE KEY"));
         assert!(cp.need_plan("c2-m4-d40").is_ok());
         let e = cp.need_plan("g6-standard-1").err().unwrap();
-        assert!(e.0 == StatusCode::BAD_REQUEST && e.1.contains("incus machines"), "{}", e.1);
-        let cp = with(&certs, &[("MACHINE_REGIONS", "node1,node2"), ("MACHINE_TIERS", "solo=c1-m1-d10")]).unwrap();
+        assert!(
+            e.0 == StatusCode::BAD_REQUEST && e.1.contains("incus machines"),
+            "{}",
+            e.1
+        );
+        let cp = with(
+            &certs,
+            &[
+                ("MACHINE_REGIONS", "node1,node2"),
+                ("MACHINE_TIERS", "solo=c1-m1-d10"),
+            ],
+        )
+        .unwrap();
         assert_eq!((cp.regions.len(), cp.tiers.len()), (2, 1));
 
         for (store, extra, want) in [
-            (&certs, &[("MACHINE_FIREWALL", "")][..], "MACHINE_FIREWALL=on"),
-            (&certs, &[("MACHINE_CONTROL_URL", ""), ("MACHINE_FIREWALL", "")][..], "MACHINE_CONTROL_URL"),
-            (&certs, &[("INCUS_URL", "")][..], "INCUS_URL"),
-            (&certs, &[("MACHINE_TIERS", "starter=g6-standard-1")][..], "isn't an Incus plan"),
-            (&certs, &[("MACHINE_REGIONS", "Node 1")][..], "MACHINE_REGIONS"),
-            (&certs, &[("MACHINE_PROVIDER", "docker")][..], "linode or incus"),
-            (&EnvStore::fixed(&[("INCUS_CLIENT_CERT", &cert), ("INCUS_SERVER_CERT", &server)]), &[][..], "INCUS_CLIENT_KEY"),
-            (&EnvStore::fixed(&[("INCUS_CLIENT_CERT", &cert), ("INCUS_CLIENT_KEY", "nope"), ("INCUS_SERVER_CERT", &server)]), &[][..], "INCUS_CLIENT_KEY"),
             (
-                &EnvStore::fixed(&[("INCUS_CLIENT_CERT", &cert), ("INCUS_CLIENT_KEY", &key), ("INCUS_SERVER_CERT", &server), ("LINODE_TOKEN", "tok-1234567890")]),
+                &certs,
+                &[("MACHINE_FIREWALL", "")][..],
+                "MACHINE_FIREWALL=on",
+            ),
+            (
+                &certs,
+                &[("MACHINE_CONTROL_URL", ""), ("MACHINE_FIREWALL", "")][..],
+                "MACHINE_CONTROL_URL",
+            ),
+            (&certs, &[("INCUS_URL", "")][..], "INCUS_URL"),
+            (
+                &certs,
+                &[("MACHINE_TIERS", "starter=g6-standard-1")][..],
+                "isn't an Incus plan",
+            ),
+            (
+                &certs,
+                &[("MACHINE_REGIONS", "Node 1")][..],
+                "MACHINE_REGIONS",
+            ),
+            (
+                &certs,
+                &[("MACHINE_PROVIDER", "docker")][..],
+                "linode or incus",
+            ),
+            (
+                &EnvStore::fixed(&[("INCUS_CLIENT_CERT", &cert), ("INCUS_SERVER_CERT", &server)]),
+                &[][..],
+                "INCUS_CLIENT_KEY",
+            ),
+            (
+                &EnvStore::fixed(&[
+                    ("INCUS_CLIENT_CERT", &cert),
+                    ("INCUS_CLIENT_KEY", "nope"),
+                    ("INCUS_SERVER_CERT", &server),
+                ]),
+                &[][..],
+                "INCUS_CLIENT_KEY",
+            ),
+            (
+                &EnvStore::fixed(&[
+                    ("INCUS_CLIENT_CERT", &cert),
+                    ("INCUS_CLIENT_KEY", &key),
+                    ("INCUS_SERVER_CERT", &server),
+                    ("LINODE_TOKEN", "tok-1234567890"),
+                ]),
                 &[][..],
                 "one provider",
             ),
         ] {
-            let e = with(store, extra).err().unwrap_or_else(|| panic!("{extra:?} should fail"));
+            let e = with(store, extra)
+                .err()
+                .unwrap_or_else(|| panic!("{extra:?} should fail"));
             assert!(e.contains(want), "{extra:?}: {e}");
         }
-        let off = with(&EnvStore::fixed(&[]), &[("MACHINE_PROVIDER", ""), ("MACHINE_FIREWALL", "on")]).err().unwrap();
-        assert!(off.contains("MACHINE_PROVIDER=incus"), "the message names both providers: {off}");
+        let off = with(
+            &EnvStore::fixed(&[]),
+            &[("MACHINE_PROVIDER", ""), ("MACHINE_FIREWALL", "on")],
+        )
+        .err()
+        .unwrap();
+        assert!(
+            off.contains("MACHINE_PROVIDER=incus"),
+            "the message names both providers: {off}"
+        );
     }
 
     #[test]
@@ -1871,17 +2050,40 @@ mod tests {
         };
         use route::Routing;
         let off = ControlPlane::from_env(&token, vars("")).unwrap();
-        assert!(off.routing == Routing::Off && off.describe().contains("routing off"), "{}", off.describe());
+        assert!(
+            off.routing == Routing::Off && off.describe().contains("routing off"),
+            "{}",
+            off.describe()
+        );
         let on = ControlPlane::from_env(&token, vars("on")).unwrap();
-        assert!(on.routing == Routing::On && on.describe().contains("routing on via unenrolled"), "{}", on.describe());
+        assert!(
+            on.routing == Routing::On && on.describe().contains("routing on via unenrolled"),
+            "{}",
+            on.describe()
+        );
         let assigned = ControlPlane::from_env(&token, vars("Assigned")).unwrap();
-        assert!(assigned.routing == Routing::Assigned && assigned.describe().contains("routing assigned via"), "{}", assigned.describe());
+        assert!(
+            assigned.routing == Routing::Assigned
+                && assigned.describe().contains("routing assigned via"),
+            "{}",
+            assigned.describe()
+        );
         assert!(ControlPlane::from_env(&token, vars("sometimes")).is_err());
         for mode in ["on", "assigned"] {
-            let err = ControlPlane::from_env(&EnvStore::fixed(&[]), vars(mode)).err().unwrap();
-            assert!(err.contains("LINODE_TOKEN"), "routing without machines would strand every Bot: {err}");
+            let err = ControlPlane::from_env(&EnvStore::fixed(&[]), vars(mode))
+                .err()
+                .unwrap();
+            assert!(
+                err.contains("LINODE_TOKEN"),
+                "routing without machines would strand every Bot: {err}"
+            );
         }
-        assert!(ControlPlane::from_env(&EnvStore::fixed(&[]), vars("off")).unwrap().routing == Routing::Off);
+        assert!(
+            ControlPlane::from_env(&EnvStore::fixed(&[]), vars("off"))
+                .unwrap()
+                .routing
+                == Routing::Off
+        );
     }
 
     #[test]
@@ -1897,17 +2099,28 @@ mod tests {
         };
         let off = ControlPlane::from_env(&token, vars("", "")).unwrap();
         assert!(off.firewall_settings.is_none() && off.firewall.is_none());
-        let err = ControlPlane::from_env(&EnvStore::fixed(&[]), vars("on", "https://192.0.2.1:8443"))
+        let err =
+            ControlPlane::from_env(&EnvStore::fixed(&[]), vars("on", "https://192.0.2.1:8443"))
+                .err()
+                .unwrap();
+        assert!(err.contains("LINODE_TOKEN"), "{err}");
+        let err = ControlPlane::from_env(&token, vars("on", ""))
             .err()
             .unwrap();
-        assert!(err.contains("LINODE_TOKEN"), "{err}");
-        let err = ControlPlane::from_env(&token, vars("on", "")).err().unwrap();
-        assert!(err.contains("MACHINE_CONTROL_URL"), "it opens the agent's port: {err}");
+        assert!(
+            err.contains("MACHINE_CONTROL_URL"),
+            "it opens the agent's port: {err}"
+        );
         let mut cp = ControlPlane::from_env(&token, vars("on", "https://192.0.2.1:8443")).unwrap();
         assert!(cp.firewall.is_none(), "made with enrollment");
-        cp.enroll_with(enroll::Enrollment::for_tests(3, 8443, 7443)).unwrap();
+        cp.enroll_with(enroll::Enrollment::for_tests(3, 8443, 7443))
+            .unwrap();
         let fw = cp.firewall.as_ref().unwrap();
-        assert_eq!(fw.rules[0].sources, ["127.0.0.1/32"], "the control URL's address");
+        assert_eq!(
+            fw.rules[0].sources,
+            ["127.0.0.1/32"],
+            "the control URL's address"
+        );
         assert!(cp.describe().contains("firewall"), "{}", cp.describe());
     }
 }

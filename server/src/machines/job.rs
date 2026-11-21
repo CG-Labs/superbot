@@ -172,7 +172,10 @@ pub async fn run(
         let _ = tx.send(JobEvent::Cleanup { why }).await;
         return;
     }
-    match host.files(|| write_files(&job.files, &job.collect)).and_then(|r| r) {
+    match host
+        .files(|| write_files(&job.files, &job.collect))
+        .and_then(|r| r)
+    {
         Ok(()) => run_child(host, job, abort, tx).await,
         Err(message) => {
             let _ = tx.send(JobEvent::Error { message }).await;

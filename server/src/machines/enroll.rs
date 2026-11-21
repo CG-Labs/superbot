@@ -230,7 +230,11 @@ impl Enrollment {
         e.logins = match var("MACHINE_HARNESS_LOGINS").trim() {
             "" | "off" => false,
             "on" => true,
-            v => return Err(format!("MACHINE_HARNESS_LOGINS must be on or off, not \"{v}\"")),
+            v => {
+                return Err(format!(
+                    "MACHINE_HARNESS_LOGINS must be on or off, not \"{v}\""
+                ));
+            }
         };
         e.folder = super::folder::Settings::from_env(var)?;
         e.bot_user = super::botuser::from_env(var)?;
@@ -238,8 +242,11 @@ impl Enrollment {
         e.teammate_users = super::teammate::from_env(var, e.bot_user)?;
         e.offboard = super::offboard::Settings::from_env(var)?;
         if e.screens.is_some() {
-            let on_path = std::env::var_os("PATH")
-                .and_then(|p| std::env::split_paths(&p).map(|d| d.join(VOXL_BIN)).find(|p| p.is_file()));
+            let on_path = std::env::var_os("PATH").and_then(|p| {
+                std::env::split_paths(&p)
+                    .map(|d| d.join(VOXL_BIN))
+                    .find(|p| p.is_file())
+            });
             e.voxl = read(VOXL_BIN).or_else(|| {
                 let b = std::fs::read(on_path?).ok()?;
                 let sha = sha256_hex(&b);
@@ -343,7 +350,10 @@ impl Enrollment {
     /// With MACHINE_TEAMMATE_FILES=delete, held for `days`.
     #[cfg(test)]
     pub fn with_teammate_files_deleted(mut self, days: u32) -> Enrollment {
-        self.offboard = super::offboard::Settings { files: super::offboard::Files::Delete, grace_days: days };
+        self.offboard = super::offboard::Settings {
+            files: super::offboard::Files::Delete,
+            grace_days: days,
+        };
         self
     }
 
@@ -352,7 +362,12 @@ impl Enrollment {
     #[cfg(test)]
     pub fn with_screens(mut self, ports: (u16, u16)) -> Enrollment {
         self.bot_user = true;
-        self.screens = Some(super::screens::Settings { ports, width: 1280, height: 800, idle_ms: 600_000 });
+        self.screens = Some(super::screens::Settings {
+            ports,
+            width: 1280,
+            height: 800,
+            idle_ms: 600_000,
+        });
         self
     }
 
@@ -400,7 +415,10 @@ impl Enrollment {
             self.enroll_timeout_ms / 60_000,
             self.upkeep.describe(),
             if self.logins { "on" } else { "off" },
-            self.folder.as_ref().map_or("off".to_string(), |f| format!("on, up to {} MiB", f.max_bytes >> 20)),
+            self.folder.as_ref().map_or("off".to_string(), |f| format!(
+                "on, up to {} MiB",
+                f.max_bytes >> 20
+            )),
             if self.bot_user { "on" } else { "off" },
             if self.teammate_users { "on" } else { "off" },
             self.offboard.describe(),
@@ -410,7 +428,11 @@ impl Enrollment {
                     "on, botd ports {}-{}{}",
                     s.ports.0,
                     s.ports.1,
-                    if v.is_some() { "" } else { ", no voxl to give new machines" }
+                    if v.is_some() {
+                        ""
+                    } else {
+                        ", no voxl to give new machines"
+                    }
                 ),
             },
             match (&self.agent, &self.botctl) {
@@ -508,14 +530,22 @@ impl Enrollment {
         if let Some((_, sha)) = &self.agent {
             // botctl first: the agent reports whether it's there when botd checks.
             let botctl = self.botctl.as_ref().map_or(String::new(), |(_, b)| {
-                FIRSTBOOT_BOTCTL.replace("{url}", &self.url).replace("{sha}", b)
+                FIRSTBOOT_BOTCTL
+                    .replace("{url}", &self.url)
+                    .replace("{sha}", b)
             });
-            let bots = if self.bot_user { FIRSTBOOT_BOT_USER.replace("{user}", wire::BOT_USER) } else { String::new() };
+            let bots = if self.bot_user {
+                FIRSTBOOT_BOT_USER.replace("{user}", wire::BOT_USER)
+            } else {
+                String::new()
+            };
             let screens = match (&self.screens, &self.voxl) {
                 (None, _) => String::new(),
                 (Some(_), voxl) => FIRSTBOOT_SCREENS.replace(
                     "{voxl}",
-                    &voxl.as_ref().map_or(String::new(), |(_, sha)| FIRSTBOOT_VOXL.replace("{sha}", sha)),
+                    &voxl.as_ref().map_or(String::new(), |(_, sha)| {
+                        FIRSTBOOT_VOXL.replace("{sha}", sha)
+                    }),
                 ),
             };
             let script = FIRSTBOOT
@@ -547,7 +577,10 @@ impl Enrollment {
     }
 
     /// An HTTPS client that accepts only `pins` and shows botd's certificate.
-    pub(super) fn pinned(&self, pins: Vec<String>) -> Result<(reqwest::Client, Arc<pki::Pinned>), String> {
+    pub(super) fn pinned(
+        &self,
+        pins: Vec<String>,
+    ) -> Result<(reqwest::Client, Arc<pki::Pinned>), String> {
         let c = self.control();
         let (config, verifier) =
             pki::pinned_client_config(pins, c.chain.clone(), c.key.clone_key())?;
@@ -586,7 +619,11 @@ impl Enrollment {
     }
 
     /// Like `pinned`, for copying a folder: each request gets up to `secs`.
-    pub(super) fn upload_client(&self, pins: Vec<String>, secs: u64) -> Result<reqwest::Client, String> {
+    pub(super) fn upload_client(
+        &self,
+        pins: Vec<String>,
+        secs: u64,
+    ) -> Result<reqwest::Client, String> {
         let c = self.control();
         let (config, _) = pki::pinned_client_config(pins, c.chain.clone(), c.key.clone_key())?;
         reqwest::Client::builder()
@@ -856,7 +893,9 @@ pub fn revoke_all(app: &App, by: &Who, m: &Machine, reason: &str) -> usize {
 /// Rebuilt (ADR 0056): the old disks' certificates are revoked, but not the token the
 /// new disks enroll with.
 pub fn revoke_certs(app: &App, by: &Who, m: &Machine, reason: &str) -> usize {
-    let fps = app.db.set_machine_certs(&m.id, &["active", "held"], "revoked", Some(reason));
+    let fps = app
+        .db
+        .set_machine_certs(&m.id, &["active", "held"], "revoked", Some(reason));
     if !fps.is_empty() {
         record(
             app,
@@ -1322,7 +1361,11 @@ pub async fn heartbeat(app: &App, e: &Enrollment, m: &Machine) -> Result<wire::H
 }
 
 /// `heartbeat`, for the machine routing picked.
-pub(super) async fn check(app: &App, e: &Enrollment, to: &Assigned) -> Result<wire::Heartbeat, String> {
+pub(super) async fn check(
+    app: &App,
+    e: &Enrollment,
+    to: &Assigned,
+) -> Result<wire::Heartbeat, String> {
     probe(app, e, to, &[]).await
 }
 
@@ -1416,7 +1459,10 @@ fn take_events(buf: &mut Vec<u8>, chunk: &[u8]) -> Option<Vec<JobEvent>> {
 /// The whole events in `buf` once `chunk` is added; `buf` keeps the unfinished line.
 /// Lines that aren't events are skipped. None: a line, finished or not, is over
 /// `MAX_EVENT`.
-pub(super) fn take_lines<T: serde::de::DeserializeOwned>(buf: &mut Vec<u8>, chunk: &[u8]) -> Option<Vec<T>> {
+pub(super) fn take_lines<T: serde::de::DeserializeOwned>(
+    buf: &mut Vec<u8>,
+    chunk: &[u8],
+) -> Option<Vec<T>> {
     // What was already in `buf` has no newline: search only what's new.
     let mut from = buf.len();
     buf.extend_from_slice(chunk);
@@ -1693,36 +1739,136 @@ mod tests {
             "agent settings alone are a mistake"
         );
         assert!(with(&[("MACHINE_ENROLL_TIMEOUT_MINUTES", "20")]).is_err());
-        assert!(with(&[("MACHINE_LEGACY_REBUILDS", "auto")]).is_err(), "rebuilds need enrollment");
-        assert!(with(&[("MACHINE_HARNESSES", "claude")]).is_err(), "harnesses need enrollment");
+        assert!(
+            with(&[("MACHINE_LEGACY_REBUILDS", "auto")]).is_err(),
+            "rebuilds need enrollment"
+        );
+        assert!(
+            with(&[("MACHINE_HARNESSES", "claude")]).is_err(),
+            "harnesses need enrollment"
+        );
         assert!(with(&[("MACHINE_AGENT_UPGRADES", "auto")]).is_err());
-        let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_HARNESSES", "pi")]).unwrap().unwrap();
-        assert!(e.upkeep.plan.is_some() && e.describe().contains("harnesses on machines: pi@1.5.2; agent upgrades: manual"), "{}", e.describe());
-        assert!(with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_HARNESSES", "nope")]).is_err());
-        let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443")]).unwrap().unwrap();
-        assert!(!e.logins && e.folder.is_none() && !e.bot_user, "logins, folder copies and the Bots' user are off unless asked");
-        assert!(e.describe().contains("Bots' own user off"), "{}", e.describe());
-        assert!(e.describe().contains("teammates' own users off"), "{}", e.describe());
-        for v in ["MACHINE_HARNESS_LOGINS", "MACHINE_FOLDER_SYNC", "MACHINE_FOLDER_SYNC_MAX_MB", "MACHINE_BOT_USER", "MACHINE_TEAMMATE_USERS"] {
+        let e = with(&[
+            ("MACHINE_CONTROL_URL", "https://cp.example:8443"),
+            ("MACHINE_HARNESSES", "pi"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(
+            e.upkeep.plan.is_some()
+                && e.describe()
+                    .contains("harnesses on machines: pi@1.5.2; agent upgrades: manual"),
+            "{}",
+            e.describe()
+        );
+        assert!(
+            with(&[
+                ("MACHINE_CONTROL_URL", "https://cp.example:8443"),
+                ("MACHINE_HARNESSES", "nope")
+            ])
+            .is_err()
+        );
+        let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443")])
+            .unwrap()
+            .unwrap();
+        assert!(
+            !e.logins && e.folder.is_none() && !e.bot_user,
+            "logins, folder copies and the Bots' user are off unless asked"
+        );
+        assert!(
+            e.describe().contains("Bots' own user off"),
+            "{}",
+            e.describe()
+        );
+        assert!(
+            e.describe().contains("teammates' own users off"),
+            "{}",
+            e.describe()
+        );
+        for v in [
+            "MACHINE_HARNESS_LOGINS",
+            "MACHINE_FOLDER_SYNC",
+            "MACHINE_FOLDER_SYNC_MAX_MB",
+            "MACHINE_BOT_USER",
+            "MACHINE_TEAMMATE_USERS",
+        ] {
             let vars: &'static [(&'static str, &'static str)] = Box::leak(Box::new([(v, "on")]));
             assert!(with(vars).is_err(), "{v} needs enrollment");
         }
-        let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_HARNESS_LOGINS", "on"), ("MACHINE_FOLDER_SYNC", "on")]).unwrap().unwrap();
-        assert!(e.logins && e.folder.as_ref().is_some_and(|f| f.max_bytes == 2048 << 20), "{}", e.describe());
-        assert!(with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_HARNESS_LOGINS", "yes")]).is_err());
-        let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_BOT_USER", "on")]).unwrap().unwrap();
-        assert!(e.bot_user && e.describe().contains("Bots' own user on"), "{}", e.describe());
-        assert!(with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_BOT_USER", "yes")]).is_err());
-        assert!(with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_TEAMMATE_USERS", "on")]).is_err(), "teammates' users need the Bots' user");
-        let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_BOT_USER", "on"), ("MACHINE_TEAMMATE_USERS", "on")]).unwrap().unwrap();
-        assert!(e.teammate_users && e.describe().contains("teammates' own users on"), "{}", e.describe());
-        for (raw, ok) in [("", Some(15)), ("5", Some(5)), ("60", Some(60)), ("4", None), ("61", None), ("soon", None)] {
+        let e = with(&[
+            ("MACHINE_CONTROL_URL", "https://cp.example:8443"),
+            ("MACHINE_HARNESS_LOGINS", "on"),
+            ("MACHINE_FOLDER_SYNC", "on"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(
+            e.logins && e.folder.as_ref().is_some_and(|f| f.max_bytes == 2048 << 20),
+            "{}",
+            e.describe()
+        );
+        assert!(
+            with(&[
+                ("MACHINE_CONTROL_URL", "https://cp.example:8443"),
+                ("MACHINE_HARNESS_LOGINS", "yes")
+            ])
+            .is_err()
+        );
+        let e = with(&[
+            ("MACHINE_CONTROL_URL", "https://cp.example:8443"),
+            ("MACHINE_BOT_USER", "on"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(
+            e.bot_user && e.describe().contains("Bots' own user on"),
+            "{}",
+            e.describe()
+        );
+        assert!(
+            with(&[
+                ("MACHINE_CONTROL_URL", "https://cp.example:8443"),
+                ("MACHINE_BOT_USER", "yes")
+            ])
+            .is_err()
+        );
+        assert!(
+            with(&[
+                ("MACHINE_CONTROL_URL", "https://cp.example:8443"),
+                ("MACHINE_TEAMMATE_USERS", "on")
+            ])
+            .is_err(),
+            "teammates' users need the Bots' user"
+        );
+        let e = with(&[
+            ("MACHINE_CONTROL_URL", "https://cp.example:8443"),
+            ("MACHINE_BOT_USER", "on"),
+            ("MACHINE_TEAMMATE_USERS", "on"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(
+            e.teammate_users && e.describe().contains("teammates' own users on"),
+            "{}",
+            e.describe()
+        );
+        for (raw, ok) in [
+            ("", Some(15)),
+            ("5", Some(5)),
+            ("60", Some(60)),
+            ("4", None),
+            ("61", None),
+            ("soon", None),
+        ] {
             let vars: &'static [(&'static str, &'static str)] = Box::leak(Box::new([
                 ("MACHINE_CONTROL_URL", "https://cp.example:8443"),
                 ("MACHINE_ENROLL_TIMEOUT_MINUTES", raw),
             ]));
             assert_eq!(
-                with(vars).ok().flatten().map(|e| e.enroll_timeout_ms / 60_000),
+                with(vars)
+                    .ok()
+                    .flatten()
+                    .map(|e| e.enroll_timeout_ms / 60_000),
                 ok,
                 "{raw}"
             );
@@ -1858,9 +2004,18 @@ mod tests {
         ] {
             assert!(script.contains(&want), "{want}\n{script}");
         }
-        let order = ["sha256sum -c", "systemctl enable", "\" enroll;", "rm -f /var/lib/cloud", "systemctl start"]
-            .map(|s| script.find(s).unwrap_or_else(|| panic!("{s}")));
-        assert!(order.windows(2).all(|w| w[0] < w[1]), "verify, install, enroll, scrub, start: {order:?}");
+        let order = [
+            "sha256sum -c",
+            "systemctl enable",
+            "\" enroll;",
+            "rm -f /var/lib/cloud",
+            "systemctl start",
+        ]
+        .map(|s| script.find(s).unwrap_or_else(|| panic!("{s}")));
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "verify, install, enroll, scrub, start: {order:?}"
+        );
         assert!(
             ud.ends_with(&format!("runcmd:\n  - [{FIRSTBOOT_PATH}]\n")),
             "{ud}"
@@ -1877,13 +2032,18 @@ mod tests {
             .args(["-n", "-c", &script])
             .output()
             .unwrap();
-        assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stderr));
+        assert!(
+            check.status.success(),
+            "{}",
+            String::from_utf8_lossy(&check.stderr)
+        );
 
         e.botctl = Some((Bytes::from_static(b"botctl"), "cd".repeat(32)));
         let script = firstboot_in(&e.user_data(&m, "sbe_tok"));
         for want in [
             format!("echo \"{}  $ctl.new\" | sha256sum -c -", "cd".repeat(32)),
-            "--cacert /etc/superbot/ca.pem -o \"$ctl.new\" \"https://127.0.0.1:1/v1/botctl\"".into(),
+            "--cacert /etc/superbot/ca.pem -o \"$ctl.new\" \"https://127.0.0.1:1/v1/botctl\""
+                .into(),
             format!("echo \"{}  $bin.new\" | sha256sum -c -", "ab".repeat(32)),
             "ctl=$dir/botctl".into(),
             "ln -sfn \"$ctl\" /usr/local/bin/botctl".into(),
@@ -1892,41 +2052,89 @@ mod tests {
         }
         let order = ["/v1/botctl", "/v1/agent", "systemctl start"]
             .map(|s| script.find(s).unwrap_or_else(|| panic!("{s}")));
-        assert!(order.windows(2).all(|w| w[0] < w[1]), "botctl before the agent starts: {order:?}");
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "botctl before the agent starts: {order:?}"
+        );
         let check = std::process::Command::new("sh")
             .args(["-n", "-c", &script])
             .output()
             .unwrap();
-        assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stderr));
+        assert!(
+            check.status.success(),
+            "{}",
+            String::from_utf8_lossy(&check.stderr)
+        );
         let ud = e.user_data(&m, "sbe_tok");
-        assert!(ud.contains("StateDirectoryMode=0700") && !ud.contains("useradd"), "no Bots' user unless asked");
+        assert!(
+            ud.contains("StateDirectoryMode=0700") && !ud.contains("useradd"),
+            "no Bots' user unless asked"
+        );
 
         // MACHINE_BOT_USER (ADR 0043): the user is made at first boot, and the state
         // folder lets it through to its home.
         e.bot_user = true;
         let ud = e.user_data(&m, "sbe_tok");
-        assert!(ud.contains("StateDirectoryMode=0711") && !ud.contains("StateDirectoryMode=0700"), "{ud}");
+        assert!(
+            ud.contains("StateDirectoryMode=0711") && !ud.contains("StateDirectoryMode=0700"),
+            "{ud}"
+        );
         let script = firstboot_in(&ud);
         assert!(
             script.contains("id -u superbot-bots >/dev/null 2>&1 || useradd --system --user-group --no-create-home --shell /usr/sbin/nologin --comment \"SuperBot Bots\" --home-dir /var/lib/superbot-machine/home superbot-bots"),
             "{script}"
         );
-        let order = ["useradd", "/v1/agent", "systemctl start"].map(|s| script.find(s).unwrap_or_else(|| panic!("{s}")));
+        let order = ["useradd", "/v1/agent", "systemctl start"]
+            .map(|s| script.find(s).unwrap_or_else(|| panic!("{s}")));
         assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
-        let check = std::process::Command::new("sh").args(["-n", "-c", &script]).output().unwrap();
-        assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stderr));
+        let check = std::process::Command::new("sh")
+            .args(["-n", "-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            check.status.success(),
+            "{}",
+            String::from_utf8_lossy(&check.stderr)
+        );
 
         // MACHINE_SCREENS (ADR 0045): the screen programs, after the agent, never fatal.
-        e.screens = Some(super::super::screens::Settings { ports: (6960, 6999), width: 1280, height: 800, idle_ms: 600_000 });
+        e.screens = Some(super::super::screens::Settings {
+            ports: (6960, 6999),
+            width: 1280,
+            height: 800,
+            idle_ms: 600_000,
+        });
         for voxl in [None, Some((Bytes::from_static(b"voxl"), "ef".repeat(32)))] {
             e.voxl = voxl.clone();
             let script = firstboot_in(&e.user_data(&m, "sbe_tok"));
-            let (start, apt) = (script.find("systemctl start").unwrap(), script.find("apt-get install").unwrap());
+            let (start, apt) = (
+                script.find("systemctl start").unwrap(),
+                script.find("apt-get install").unwrap(),
+            );
             assert!(start < apt, "{script}");
-            assert_eq!(script.contains(&format!("echo \"{}  /usr/local/bin/.voxl.new\" | sha256sum -c -", "ef".repeat(32))), voxl.is_some(), "{script}");
-            assert!(script.trim_end().ends_with("echo \"superbot: screen programs didn't install\" >&2; fi"), "{script}");
-            let check = std::process::Command::new("sh").args(["-n", "-c", &script]).output().unwrap();
-            assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stderr));
+            assert_eq!(
+                script.contains(&format!(
+                    "echo \"{}  /usr/local/bin/.voxl.new\" | sha256sum -c -",
+                    "ef".repeat(32)
+                )),
+                voxl.is_some(),
+                "{script}"
+            );
+            assert!(
+                script
+                    .trim_end()
+                    .ends_with("echo \"superbot: screen programs didn't install\" >&2; fi"),
+                "{script}"
+            );
+            let check = std::process::Command::new("sh")
+                .args(["-n", "-c", &script])
+                .output()
+                .unwrap();
+            assert!(
+                check.status.success(),
+                "{}",
+                String::from_utf8_lossy(&check.stderr)
+            );
         }
 
         // A failed or wrong download never installs voxl, and says it didn't install.
@@ -1934,7 +2142,11 @@ mod tests {
         e.voxl = Some((Bytes::from_static(voxl), sha256_hex(voxl)));
         let script = firstboot_in(&e.user_data(&m, "sbe_tok"));
         let block = &script[script.find("if DEBIAN_FRONTEND").unwrap()..];
-        for (curl, installed) in [("printf 'voxl, botd' >\"$out\"; exit 22", false), ("printf 'not voxl' >\"$out\"", false), ("printf \"voxl, botd's build\" >\"$out\"", true)] {
+        for (curl, installed) in [
+            ("printf 'voxl, botd' >\"$out\"; exit 22", false),
+            ("printf 'not voxl' >\"$out\"", false),
+            ("printf \"voxl, botd's build\" >\"$out\"", true),
+        ] {
             let root = crate::db::temp_path("firstboot-screens");
             let (stubs, bin) = (root.join("stubs"), root.join("bin"));
             std::fs::create_dir_all(&stubs).unwrap();
@@ -1942,20 +2154,35 @@ mod tests {
             let stub = |name: &str, body: &str| {
                 let p = stubs.join(name);
                 std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-                std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+                std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                    .unwrap();
             };
             stub("apt-get", "exit 0");
-            stub("curl", &format!("while [ $# -gt 0 ]; do [ \"$1\" = -o ] && out=$2; shift; done\n{curl}"));
+            stub(
+                "curl",
+                &format!("while [ $# -gt 0 ]; do [ \"$1\" = -o ] && out=$2; shift; done\n{curl}"),
+            );
             let run = block.replace("/usr/local/bin", &bin.display().to_string());
             let out = std::process::Command::new("sh")
                 .args(["-c", &run])
                 .env("PATH", format!("{}:/usr/bin:/bin", stubs.display()))
                 .output()
                 .unwrap();
-            let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-            assert_eq!(bin.join("voxl").exists(), installed, "{curl}: {stdout}{stderr}");
+            let (stdout, stderr) = (
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+            assert_eq!(
+                bin.join("voxl").exists(),
+                installed,
+                "{curl}: {stdout}{stderr}"
+            );
             assert!(!bin.join(".voxl.new").exists(), "{curl}");
-            let said = if installed { stdout.contains("screen programs installed") } else { stderr.contains("screen programs didn't install") };
+            let said = if installed {
+                stdout.contains("screen programs installed")
+            } else {
+                stderr.contains("screen programs didn't install")
+            };
             assert!(said, "{curl}: {stdout}{stderr}");
         }
     }
@@ -1974,7 +2201,9 @@ mod tests {
         );
         assert!(buf.is_empty());
 
-        let huge = line(&JobEvent::Line { line: "a".repeat(MAX_EVENT) });
+        let huge = line(&JobEvent::Line {
+            line: "a".repeat(MAX_EVENT),
+        });
         assert_eq!(
             take_events(&mut Vec::new(), huge.as_bytes()),
             None,
@@ -1987,7 +2216,10 @@ mod tests {
         );
         let most = "a".repeat(MAX_EVENT - 64);
         assert_eq!(
-            take_events(&mut Vec::new(), line(&JobEvent::Line { line: most.clone() }).as_bytes()),
+            take_events(
+                &mut Vec::new(),
+                line(&JobEvent::Line { line: most.clone() }).as_bytes()
+            ),
             Some(vec![JobEvent::Line { line: most }])
         );
     }
@@ -1999,7 +2231,10 @@ mod tests {
     /// The unit's guard, run as systemd would before each start, after an upgrade.
     #[test]
     fn the_guard_puts_the_old_agent_back_after_three_failed_starts() {
-        let (state, dir) = (crate::db::temp_path("guard-state"), crate::db::temp_path("guard-bin"));
+        let (state, dir) = (
+            crate::db::temp_path("guard-state"),
+            crate::db::temp_path("guard-bin"),
+        );
         let start = || {
             let out = std::process::Command::new("sh")
                 .args(["-c", GUARD])
@@ -2010,7 +2245,12 @@ mod tests {
             assert!(out.status.success(), "the guard never stops a start");
         };
         let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default();
-        for (f, body) in [("superbot-machine", "new"), ("superbot-machine.prev", "old"), ("botctl", "new ctl"), ("botctl.prev", "old ctl")] {
+        for (f, body) in [
+            ("superbot-machine", "new"),
+            ("superbot-machine.prev", "old"),
+            ("botctl", "new ctl"),
+            ("botctl.prev", "old ctl"),
+        ] {
             std::fs::write(dir.join(f), body).unwrap();
         }
         start();
@@ -2018,10 +2258,18 @@ mod tests {
         std::fs::write(state.join("upgrade-trial.json"), "{}").unwrap();
         for n in 1..=3 {
             start();
-            assert_eq!(read("superbot-machine"), "new", "start {n} of the new agent");
+            assert_eq!(
+                read("superbot-machine"),
+                "new",
+                "start {n} of the new agent"
+            );
         }
         start();
-        assert_eq!((read("superbot-machine"), read("botctl")), ("old".into(), "old ctl".into()), "the fourth start runs the old one");
+        assert_eq!(
+            (read("superbot-machine"), read("botctl")),
+            ("old".into(), "old ctl".into()),
+            "the fourth start runs the old one"
+        );
         assert!(!dir.join("superbot-machine.prev").exists());
         start();
         assert_eq!(read("superbot-machine"), "old", "nothing left to put back");
