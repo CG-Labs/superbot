@@ -50,10 +50,14 @@ fn managed_config(input: &RunInput, secret_names: &[String]) -> Value {
     let mut passthrough: Vec<&String> = input.env.keys().chain(inherited).collect();
     passthrough.sort();
     passthrough.dedup();
+    // Every Bot on a host runs one sealed install (ADR 0072): what it runs on is pinned
+    // there, so a run fetches no packages into it and checks no plugin for updates.
     let mut c = json!({
         "terminal": { "env_passthrough": passthrough },
         "memory": { "memory_enabled": false, "user_profile_enabled": false },
         "agent": { "disabled_toolsets": ["cronjob"] },
+        "security": { "allow_lazy_installs": false },
+        "plugins": { "auto_update_check_hours": 0 },
     });
     if let Some(g) = &input.guard {
         // The hook runs in the daemon's folder, not the Bot's, so name the real one.
@@ -344,6 +348,8 @@ mod tests {
         assert_eq!(c["terminal"]["env_passthrough"], json!(["BOT_TOKEN", "GITHUB_TOKEN"]));
         assert_eq!(c["memory"], json!({ "memory_enabled": false, "user_profile_enabled": false }));
         assert_eq!(c["agent"]["disabled_toolsets"], json!(["cronjob"]));
+        assert_eq!(c["security"]["allow_lazy_installs"], false, "nothing is fetched into the shared install");
+        assert_eq!(c["plugins"]["auto_update_check_hours"], 0);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("t0k3n") && !text.contains("ghp_x"), "names only, never values");
 
