@@ -114,7 +114,7 @@ If any check fails, botd makes nothing, and the machine shows the reason. Incus 
 - **Host-to-container traffic.** Whether the ACL's default inbound drop also filters traffic that starts on the Incus host itself depends on Incus's bridge firewall. This is unverified on a live host. Containers' inbound from other containers and from outside is covered either way.
 - **Disk sizes** are enforced only by pools whose driver supports quotas (zfs, btrfs, lvm). The `dir` driver doesn't, and the preflight check says so.
 - **Snapshots** are on the same pool and host, not off-host backups.
-- **The enrollment token** stays in the instance's config (`cloud-init.user-data`), readable by Incus admins. It is single-use and expires in 60 minutes. The first boot also deletes the NoCloud seed copy inside the container.
+- **The enrollment token** is in the instance's config (`cloud-init.user-data`), readable by Incus admins, until the container enrolls or misses its deadline; then botd removes it ([ADR 0067](0067-clearing-enrollment-data-from-containers.md)). It is single-use and expires in 60 minutes. The first boot also deletes the NoCloud seed copy inside the container.
 
 ### Placement and routing are unchanged
 
@@ -166,7 +166,7 @@ Integration tests run botd end to end on loopback. A user's container is request
 
 - Validate against a real Incus host: host-to-container filtering, IPv6 filtering on bridges without IPv6, cloud-init and rebuild timings, and the extension names the preflight check expects.
 - Off-host backups: export snapshots to customer S3 ([#40](https://github.com/CG-Labs/superbot/issues/40)).
-- Clear `cloud-init.user-data` from the instance's config once it has enrolled.
+- Clear `cloud-init.user-data` from the instance's config once it has enrolled (done, [ADR 0067](0067-clearing-enrollment-data-from-containers.md)).
 - Per-container egress allowlists and DNS policy (M5).
 - Resize machines when a user's tier changes ([#31](https://github.com/CG-Labs/superbot/issues/31)).
 - OVN networks with per-project ACLs, so botd can use a restricted client certificate.
