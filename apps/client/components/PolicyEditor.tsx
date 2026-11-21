@@ -6,6 +6,7 @@ import { ACTION_LABELS, ACTIONS, classChoice, minutesLabel, newRule, parseTimeou
 import { colors } from "../src/theme";
 import type { Policy, PolicyAction, PolicyMode, PolicyPatch, PolicyRule, PolicyView } from "../src/types";
 import { Chips } from "./Chips";
+import { NotificationsCard, type NotificationsApi } from "./NotificationsCard";
 
 interface Props {
   api: Pick<SuperBotApi, "policyView" | "patchGlobalPolicy" | "patchBotPolicy" | "resetBotPolicy" | "addPolicyRule" | "deletePolicyRule">;
@@ -13,6 +14,8 @@ interface Props {
   bot?: { id: string; name: string };
   /** Admins only: the server refuses everyone else's changes (ADR 0012). */
   canEdit: boolean;
+  /** Notification settings (ADR 0061), shown to admins when given. */
+  notifications?: NotificationsApi;
   onBack: () => void;
   /** Asks before risky changes; `confirmAsync` unless a test swaps it. */
   confirm?: (title: string, message: string, confirmLabel?: string) => Promise<boolean>;
@@ -31,7 +34,7 @@ function message(e: unknown): string {
  * The approval policy (ADR 0007, 0049): the mode, an action per risky class, how long an
  * approval waits, and the allow/deny rules. Global, or one Bot's on top of it.
  */
-export function PolicyEditor({ api, bot, canEdit, onBack, confirm = confirmAsync }: Props) {
+export function PolicyEditor({ api, bot, canEdit, notifications, onBack, confirm = confirmAsync }: Props) {
   const botId = bot?.id;
   const [view, setView] = useState<PolicyView | undefined>(undefined);
   /** The global policy under a Bot's, for the "Default (…)" choices. */
@@ -402,6 +405,8 @@ export function PolicyEditor({ api, bot, canEdit, onBack, confirm = confirmAsync
             </View>
           </View>
         ) : null}
+
+        {canEdit && notifications ? <NotificationsCard api={notifications} bot={bot} /> : null}
       </ScrollView>
     </View>
   );

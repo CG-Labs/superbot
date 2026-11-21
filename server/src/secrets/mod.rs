@@ -129,12 +129,17 @@ pub fn check_name(name: &str) -> Result<(), Error> {
 /// Apple's signing keys (`SSO_<PROVIDER>_PRIVATE_KEY`, ADR 0018), and `SERVER_SECRETS`.
 pub fn server_secret(name: &str) -> bool {
     let provider = |suffix: &str| name.strip_prefix("SSO_").and_then(|n| n.strip_suffix(suffix)).is_some_and(|id| !id.is_empty());
-    env_shaped(name) && (provider("_CLIENT_SECRET") || provider("_PRIVATE_KEY") || SERVER_SECRETS.contains(&name))
+    let bot_webhook = name.strip_prefix(BOT_WEBHOOK_PREFIX).is_some_and(|id| !id.is_empty());
+    env_shaped(name) && (provider("_CLIENT_SECRET") || provider("_PRIVATE_KEY") || SERVER_SECRETS.contains(&name) || bot_webhook)
 }
 
-/// The Turnstile secret (ADR 0022), and the Linode token, which can rent and delete
-/// every user's machine (ADR 0025).
-pub const SERVER_SECRETS: [&str; 2] = ["TURNSTILE_SECRET", "LINODE_TOKEN"];
+/// The Turnstile secret (ADR 0022), the Linode token, which can rent and delete every
+/// user's machine (ADR 0025), and the notifier's SMTP password, webhook URL, and webhook
+/// signing key (ADR 0061).
+pub const SERVER_SECRETS: [&str; 5] = ["TURNSTILE_SECRET", "LINODE_TOKEN", "SMTP_PASSWORD", "NOTIFY_WEBHOOK_URL", "NOTIFY_WEBHOOK_SECRET"];
+
+/// Each Bot's own notification webhook URL: `NOTIFY_WEBHOOK_URL_BOT_<ID>` (ADR 0061).
+pub const BOT_WEBHOOK_PREFIX: &str = "NOTIFY_WEBHOOK_URL_BOT_";
 
 fn check_saveable(name: &str) -> Result<(), Error> {
     if server_secret(name) { Ok(()) } else { check_name(name) }
@@ -482,7 +487,7 @@ mod tests {
         assert_eq!(redact::text_for(&["ub"], "deploy to b-gh-value"), "deploy to [redacted]");
         assert_eq!(redact::text(&a), a.as_str(), "not from everyone's: any member can save any value");
         assert_eq!(redact::text_for(&["ub"], &a), a.as_str());
-        for bad in ["PATH", "BOT_TOKEN", "SSO_X_CLIENT_SECRET", "LINODE_TOKEN", "TURNSTILE_SECRET", "lower"] {
+        for bad in ["PATH", "BOT_TOKEN", "SSO_X_CLIENT_SECRET", "LINODE_TOKEN", "TURNSTILE_SECRET", "SMTP_PASSWORD", "NOTIFY_WEBHOOK_URL", "NOTIFY_WEBHOOK_URL_BOT_A1B2C3D4", "lower"] {
             assert!(matches!(s.user_put("ua", bad, "v"), Err(Error::Invalid(_))), "{bad}");
         }
         assert!(s.list().unwrap().iter().all(|l| l.name != "ANTHROPIC_API_KEY"), "not in the server-wide list");

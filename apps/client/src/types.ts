@@ -232,6 +232,75 @@ export interface PolicyView {
   sandbox?: SandboxSupport;
 }
 
+// Approval notifications (ADR 0061): admins only.
+
+export type NotifyFormat = "slack" | "json";
+export type NotifyDetail = "summary" | "minimal";
+
+export interface NotificationSettings {
+  email: { enabled: boolean; to: string[]; deciders: boolean };
+  webhook: { enabled: boolean; format: NotifyFormat };
+  delaySeconds: number;
+  throttleSeconds: number;
+  detail: NotifyDetail;
+}
+
+/** A webhook URL is a secret: only whether it's set, and its host. */
+export interface WebhookUrlView {
+  set: boolean;
+  host: string | null;
+  store: string | null;
+  /** False when the server's environment holds it, so it changes there. */
+  writable: boolean;
+}
+
+export interface NotificationsView {
+  settings: NotificationSettings;
+  email: { configured: boolean; server: string | null; passwordSet: boolean };
+  webhook: WebhookUrlView;
+  signing: boolean;
+  links: { app?: string | null; console?: string | null; problem?: string };
+  /** Bots with settings of their own. */
+  bots: string[];
+}
+
+export interface NotificationsPatch {
+  email?: { enabled?: boolean; to?: string[]; deciders?: boolean };
+  /** url: a string saves it, null removes it. */
+  webhook?: { enabled?: boolean; format?: NotifyFormat; url?: string | null };
+  delaySeconds?: number;
+  throttleSeconds?: number;
+  detail?: NotifyDetail;
+}
+
+/** Unset fields follow the global settings. */
+export interface BotNotifySettings {
+  email?: boolean;
+  webhook?: boolean;
+  format?: NotifyFormat;
+}
+
+export interface BotNotificationsView {
+  botId: string;
+  override: BotNotifySettings;
+  webhook: WebhookUrlView;
+  global: { email: boolean; webhook: boolean; format: NotifyFormat };
+  /** Where its next notice goes, as things are now. */
+  reaches: { email: number; deciders: { id: string; name: string; hasEmail: boolean }[]; webhook: "global" | "own" | null };
+}
+
+export interface BotNotificationsPatch {
+  email?: boolean | null;
+  webhook?: boolean | null;
+  format?: NotifyFormat | null;
+  webhookUrl?: string | null;
+}
+
+export interface NotifyTestResult {
+  ok: boolean;
+  results: { channel: string; ok: boolean; delivered?: number; error?: string | null }[];
+}
+
 export type ApprovalStatus = "pending" | "approved" | "denied" | "expired" | "cancelled";
 
 export interface Approval {

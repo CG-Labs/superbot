@@ -7,12 +7,17 @@ import type {
   AuditPage,
   BillingView,
   BotAccessView,
+  BotNotificationsPatch,
+  BotNotificationsView,
   BotView,
   LoginCode,
   Message,
   ModelOption,
   MyUsage,
   NewPolicyRule,
+  NotificationsPatch,
+  NotificationsView,
+  NotifyTestResult,
   PersonalSecret,
   Policy,
   PolicyMode,
@@ -271,6 +276,29 @@ export class SuperBotApi {
 
   async deletePolicyRule(id: string): Promise<void> {
     await this.request("DELETE", `/api/policy/rules/${encodeURIComponent(id)}`);
+  }
+
+  // Approval notifications (ADR 0061): admins only, enforced by the server.
+
+  async notifications(): Promise<NotificationsView> {
+    return this.request<NotificationsView>("GET", "/api/notifications");
+  }
+
+  async patchNotifications(patch: NotificationsPatch): Promise<NotificationsView> {
+    return this.request<NotificationsView>("PUT", "/api/notifications", patch);
+  }
+
+  /** Sends a test now through every channel that's on: the global settings, or one Bot's. */
+  async testNotifications(botId?: string): Promise<NotifyTestResult> {
+    return this.request<NotifyTestResult>("POST", "/api/notifications/test", botId ? { botId } : {});
+  }
+
+  async botNotifications(botId: string): Promise<BotNotificationsView> {
+    return this.request<BotNotificationsView>("GET", `/api/bots/${botId}/notifications`);
+  }
+
+  async patchBotNotifications(botId: string, patch: BotNotificationsPatch): Promise<BotNotificationsView> {
+    return this.request<BotNotificationsView>("PUT", `/api/bots/${botId}/notifications`, patch);
   }
 
   // Users, codes, sessions, and sign-ins: admins only, enforced by the server (ADR 0012, 0021).

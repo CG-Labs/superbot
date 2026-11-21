@@ -55,6 +55,9 @@ mod machines_teammates_tests;
 #[cfg(test)]
 mod machines_offboard_tests;
 mod passwd;
+mod notify;
+#[cfg(test)]
+mod notify_http_tests;
 mod paths;
 mod policy;
 #[cfg(test)]
@@ -185,6 +188,7 @@ async fn main() {
     let scim = scim::Scim::from_env(&env("SCIM", ""), &env("SCIM_DEFAULT_ROLE", "")).unwrap_or_else(|e| exit(format!("SCIM: {e}")));
     let tiers = tiers::Tiers::from_env(|k| env(k, "")).unwrap_or_else(|e| exit(format!("Tiers: {e}")));
     let payments = billing::Billing::from_env(&secrets::env::EnvStore::process(), &|k| env(k, "")).unwrap_or_else(|e| exit(format!("Billing: {e}")));
+    let notifier = notify::Notifier::from_env(&|k| env(k, "")).unwrap_or_else(|e| exit(format!("Notifications: {e}")));
     let allow_no_auth = auth_startup(&host, &password, break_glass);
     secrets::redact::register(&password);
     if adapters::get(&default_harness).is_none() {
@@ -347,6 +351,10 @@ async fn main() {
     if let Some(m) = auth_state.payments.meter() {
         let _ = app.meter.set(m);
     }
+    let notifications = notify::load(&app.db);
+    println!("Notifications: {}.", notifier.describe(&notifications));
+    let notify_summary = json!({ "email": notifier.smtp.is_some() && notifications.email.enabled, "webhook": notifications.webhook.enabled, "bots": notifications.bots.len() });
+    let _ = app.notifier.set(Arc::new(notifier));
     println!("Billing: {}.", billing::describe(auth_state.payments.enabled(), auth_state.payments.checkout_enabled(), app.meter.get().is_some(), app.tiers()));
     match auth_state.scim.enabled {
         true => println!("SCIM: on at /scim/v2; new users get the {} role.", auth_state.scim.default_role.as_str()),
@@ -394,6 +402,7 @@ async fn main() {
         "scim": auth_state_scim,
         "billing": auth_state_billing,
         "billingCheckout": auth_state_checkout,
+        "notifications": notify_summary,
         "tiers": app.tiers().all().iter().map(|t| &t.name).collect::<Vec<_>>(),
         "defaultTier": app.tiers().default_tier().name,
         "license": license.summary(),
@@ -490,6 +499,9 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/bots/{id}/screen", get(screen_info))
         .route("/bots/{id}/policy", get(get_bot_policy).put(put_bot_policy).delete(delete_bot_policy))
         .route("/policy", get(get_policy).put(put_policy))
+        .route("/notifications", get(get_notifications).put(put_notifications))
+        .route("/notifications/test", post(test_notifications))
+        .route("/bots/{id}/notifications", get(get_bot_notifications).put(put_bot_notifications))
         .route("/policy/rules", get(list_rules).post(add_rule))
         .route("/policy/rules/{id}", delete(delete_rule))
         .route("/approvals", get(list_approvals))
@@ -1759,6 +1771,7 @@ async fn delete_bot(State(app): State<AppState>, Extension(c): Extension<Caller>
     }
     machines::screens::close(&app, &by, &id, "bot_deleted").await;
     app.db.delete_bot(&id);
+    notify::forget_bot(&app, &id);
     app.db.record(&by.event("bot.deleted").target("bot", &id).bot(&id).details(json!({ "name": bot.name, "harness": bot.harness })));
     machines::offboard::check_owner(&app, &by, &bot.owner_id);
     app.send(json!({ "type": "botDeleted", "botId": id }));
@@ -2311,6 +2324,39 @@ async fn delete_bot_policy(State(app): State<AppState>, Extension(who): Extensio
     app.stop_unguarded_runs();
     app.push_bot(&id);
     Ok(Json(bot_policy_view(&app, &id)))
+}
+
+// Approval notifications (ADR 0061). Admin-only (rbac::classify).
+
+async fn get_notifications(State(app): State<AppState>) -> Json<Value> {
+    Json(notify::api::view(&app))
+}
+
+async fn put_notifications(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res {
+    need_user(who)?;
+    Ok(Json(notify::api::update(&app, &by, &v).map_err(bad)?))
+}
+
+async fn test_notifications(State(app): State<AppState>, Extension(who): Extension<Principal>, Json(v): Json<Value>) -> Res {
+    need_user(who)?;
+    let bot = match v.get("botId").and_then(Value::as_str) {
+        Some(id) => Some(need_bot(&app, id)?),
+        None => None,
+    };
+    let Some(n) = app.notifier.get() else { return Err(bad("Notifications are off on this server")) };
+    let sent = n.test(&app, bot.as_ref()).await.map_err(bad)?;
+    Ok(Json(json!({ "ok": sent.iter().all(|s| s["ok"] == true), "results": sent })))
+}
+
+async fn get_bot_notifications(State(app): State<AppState>, Path(id): Path<String>) -> Res {
+    let bot = need_bot(&app, &id)?;
+    Ok(Json(notify::api::bot_view(&app, &bot)))
+}
+
+async fn put_bot_notifications(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
+    need_user(who)?;
+    let bot = need_bot(&app, &id)?;
+    Ok(Json(notify::api::update_bot(&app, &by, &bot, &v).map_err(bad)?))
 }
 
 async fn list_rules(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Query(q): Query<HashMap<String, String>>) -> Res {

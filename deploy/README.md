@@ -390,6 +390,17 @@ Admin actions (logins, Bot and routine changes, approvals, policy, handoffs) are
 - Both installs back it up: the bash timer and the Compose `backup` service take a SQLite `.backup` of `app.sqlite`, audit table included, and keep archives for `SUPERBOT_BACKUP_RETENTION_DAYS` (default 14). So a pruned event still exists in backups for that long; shorten it too if you must erase events.
 - Source IPs: the installer's Caddy is on loopback, so `botd` trusts its `X-Forwarded-For`. Compose sets `TRUST_FORWARDED_FOR=1`, since `botd` is reachable only through Caddy.
 
+## Approval notifications
+
+A pending approval can reach people by email and a webhook when no app is open ([ADR 0061](../docs/adr/0061-approval-notifications.md)). Both are off until an admin turns them on; neither needs a paid service.
+
+1. **Links.** Notices link to the approval at `<PUBLIC_URL>/app/home?approval=<id>` and to its audit trail in the console. `PUBLIC_URL` defaults to `SSO_PUBLIC_URL`, else `https://` and the first `ALLOWED_HOSTS` entry, which the installer and Compose set to your domain. Without any, notices go without links.
+2. **Email (optional).** Set `SMTP_HOST` and `SMTP_FROM` (like `SuperBot <bots@example.com>`) in `.env`, and if your server signs in, `SMTP_USERNAME` and the password: `SMTP_PASSWORD`, `SMTP_PASSWORD_FILE`, or `botctl secret set SMTP_PASSWORD` (or the console's Server secrets). `SMTP_TLS` is `starttls` (default, port 587), `tls` (port 465) or `none` (only to `127.0.0.1`, port 25); `SMTP_PORT` changes the port. botd refuses to send if STARTTLS isn't offered, and never signs in without TLS. Restart `botd`: its startup line says `Notifications: email ready…`.
+3. **Turn it on.** In the app, open the approval policy (Approvals → Edit risky actions…) and use the Notifications card, or the console's Settings. Choose email addresses (and whether each Bot's owner and operators get email too), a webhook URL (a Slack incoming webhook, or any https endpoint; `json` posts are signed with `NOTIFY_WEBHOOK_SECRET` if set), how long to wait first (30 s by default: approvals answered by then send nothing), how often one Bot may notify (120 s: the rest go as one digest), and whether notices show the command or only the Bot and the risk. **Send a test** sends one now.
+4. **Per Bot.** A Bot's own approval policy in the app turns email or the webhook on or off for it, and can give it its own webhook URL, for example its team's channel.
+
+Webhook URLs are secrets: botd keeps them in the sealed store (`NOTIFY_WEBHOOK_URL`, and `NOTIFY_WEBHOOK_URL_BOT_<ID>` per Bot) and shows only their host. Set in `.env` instead, they win and change only there. No Bot gets these, the SMTP password or the signing secret. Every send and failure is in the audit log (`notification.sent`, `notification.failed`), and settings changes are `notifications.updated`.
+
 ## Tiers (plans)
 
 Off unless you set `TIERS_FILE`: without it every user is on one open `self-host` tier and Bots run on whatever model they're set to, as before. To sell plans that pick the model ([ADR 0033](../docs/adr/0033-tiers-model-routing.md)):

@@ -141,6 +141,7 @@ impl App {
                 let run = run.map(|r| (r.to_string(), scope));
                 self.approval_waiters.lock().unwrap().insert(a.id.clone(), Waiter { tx, run });
                 self.push_approval(&a);
+                crate::notify::requested(self, &a);
                 self.set_run_status(&bot.id, &format!("Waiting for approval: {}", short(&a.subject)));
                 let guard = OnDrop { app: self.clone(), id: a.id.clone() };
                 let answer = tokio::time::timeout(wait, rx).await;

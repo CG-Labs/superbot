@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { Modal, StyleSheet, useWindowDimensions, View } from "react-native";
-import { Redirect, router } from "expo-router";
+import { Redirect, router, useLocalSearchParams } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { ApprovalsInbox } from "../components/ApprovalsInbox";
 import { BotDetailsPanel } from "../components/BotDetailsPanel";
@@ -11,6 +11,7 @@ import { Sidebar } from "../components/Sidebar";
 import { isAdmin, openConsole, openSetup, watchSetup } from "../src/admin";
 import { planAvailable } from "../src/billing";
 import { showError } from "../src/dialogs";
+import { approvalParam } from "../src/notifications";
 import { isStarter, starterText } from "../src/prompts";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
@@ -27,11 +28,20 @@ export default function HomeScreen() {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [screen, setScreen] = useState<ScreenState>(null);
   const [approvalsOpen, setApprovalsOpen] = useState(false);
+  // A notification's link, `/home?approval=<id>` (ADR 0061), opens the inbox on it.
+  const linked = approvalParam(useLocalSearchParams<{ approval?: string }>().approval);
+  const [focusId, setFocusId] = useState<string | null>(null);
   const [setupWaiting, setSetupWaiting] = useState(false);
   const [billing, setBilling] = useState(false);
   const [prefill, setPrefill] = useState<string | null>(null);
 
   useEffect(() => (api ? watchSetup(api, me, setSetupWaiting) : undefined), [api, me]);
+  useEffect(() => {
+    if (!api || !linked) return;
+    setFocusId(linked);
+    setApprovalsOpen(true);
+    router.setParams({ approval: undefined });
+  }, [api, linked]);
   useEffect(() => {
     if (!api) return;
     let live = true;
@@ -42,7 +52,7 @@ export default function HomeScreen() {
   }, [api]);
 
   if (!api) {
-    return <Redirect href="/" />;
+    return <Redirect href={linked ? { pathname: "/", params: { approval: linked } } : "/"} />;
   }
 
   const bot = bots.find((b) => b.id === activeId);
@@ -153,7 +163,11 @@ export default function HomeScreen() {
       />
       <ApprovalsInbox
         visible={approvalsOpen}
-        onClose={() => setApprovalsOpen(false)}
+        focusId={focusId}
+        onClose={() => {
+          setApprovalsOpen(false);
+          setFocusId(null);
+        }}
         onOpenPolicy={() => {
           setApprovalsOpen(false);
           router.push("/policy");

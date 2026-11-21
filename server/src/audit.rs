@@ -519,6 +519,9 @@ pub struct Filter {
     pub on_behalf_of: Option<String>,
     pub outcome: Option<String>,
     pub bot_id: Option<String>,
+    /// `target=approval:<id>`: what the event was about. The id is optional.
+    pub target_type: Option<String>,
+    pub target_id: Option<String>,
     /// Paging cursors: event ids.
     pub before: Option<i64>,
     pub after: Option<i64>,
@@ -552,7 +555,8 @@ pub fn parse_time(s: &str, end: bool) -> Result<i64, String> {
 impl Filter {
     /// `?from=&to=&action=a,b.*&actor=user|bot|system[:id]&outcome=&bot=&before=&after=`,
     /// and for people: `actor=user:<email>`, `method=sso,password`, `idp=entra` (the type),
-    /// `idpProvider=<id>`, `subject=<issuer|sub>`, `session=<id>`, `onBehalfOf=<user id or email>`.
+    /// `idpProvider=<id>`, `subject=<issuer|sub>`, `session=<id>`, `onBehalfOf=<user id or email>`,
+    /// and `target=<type>[:<id>]`.
     pub fn from_query(q: &HashMap<String, String>) -> Result<Filter, String> {
         let get = |k: &str| q.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
         let mut f = Filter {
@@ -625,6 +629,14 @@ impl Filter {
             }
             f.bot_id = Some(b.into());
         }
+        if let Some(t) = get("target") {
+            let (kind, id) = t.split_once(':').map_or((t, None), |(k, i)| (k, Some(i)));
+            if !word(kind) || id.is_some_and(|i| !plain_id(i)) {
+                return Err("target must be <type> or <type>:<id>, like approval:a1b2c3d4".into());
+            }
+            f.target_type = Some(kind.into());
+            f.target_id = id.map(String::from);
+        }
         let cursor = |k: &str| get(k).map(|v| v.parse::<i64>().map_err(|_| format!("{k} must be an event id"))).transpose();
         f.before = cursor("before")?;
         f.after = cursor("after")?;
@@ -649,7 +661,7 @@ impl Filter {
             "from": self.from, "to": self.to, "actions": self.actions, "actorKind": self.actor_kind,
             "actorId": self.actor_id, "actorEmail": self.actor_email, "methods": self.methods, "idp": self.idp,
             "idpProvider": self.idp_provider, "subject": self.subject, "sessionId": self.session_id, "onBehalfOf": self.on_behalf_of,
-            "outcome": self.outcome, "botId": self.bot_id,
+            "outcome": self.outcome, "botId": self.bot_id, "targetType": self.target_type, "targetId": self.target_id,
         })
     }
 }
@@ -984,7 +996,10 @@ mod tests {
         assert_eq!(q(&[("from", "2026-11-19T14:00:00+01:00")]).unwrap().from, Some(1_795_093_200_000));
         assert_eq!(q(&[("from", "1700000000000")]).unwrap().from, Some(1_700_000_000_000));
         assert_eq!(q(&[("action", "*")]).unwrap().actions.len(), 0);
-        for bad in [("from", "yesterday"), ("action", "x'; DROP"), ("actor", "admin"), ("actor", "bot:a b"), ("outcome", "ok"), ("before", "x")] {
+        let t = q(&[("target", "approval:a1b2c3d4")]).unwrap();
+        assert_eq!((t.target_type.as_deref(), t.target_id.as_deref()), (Some("approval"), Some("a1b2c3d4")));
+        assert_eq!(q(&[("target", "bot")]).unwrap().target_id, None);
+        for bad in [("from", "yesterday"), ("action", "x'; DROP"), ("actor", "admin"), ("actor", "bot:a b"), ("outcome", "ok"), ("before", "x"), ("target", "Approval:x"), ("target", "approval:a b")] {
             assert!(q(&[bad]).is_err(), "{bad:?}");
         }
     }
