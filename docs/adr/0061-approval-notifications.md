@@ -49,6 +49,7 @@ The domain is `PUBLIC_URL`, else `SSO_PUBLIC_URL`, else the first `ALLOWED_HOSTS
 - **Delay** (`delaySeconds`, 30 by default, up to 600): botd waits before sending. An approval answered by then, in an open app, sends nothing.
 - **Once**: each approval is sent at most once.
 - **Throttle** (`throttleSeconds`, 120 by default, up to 3600): after a notice for a Bot, its next approvals wait for the window's end and go as one digest (up to 10 listed, the rest counted). Approvals answered in the meantime drop out.
+- **Deadlines win.** Neither the delay nor the throttle waits past half the time an approval has left, so a short approval (a one-minute timeout, say) is still noticed with time to answer. The digest goes early if one of its approvals needs it to.
 
 The throttle lives in botd's memory. A restart forgets it, and pending approvals don't survive a restart either: their hooks fail closed.
 
@@ -68,7 +69,7 @@ A deleted Bot's settings and URL go with it.
 
 - A self-hosted server can reach people with an SMTP server it already has, or a Slack (or compatible) webhook, both free.
 - Notices leave the server. Admins choose where they go, and **minimal** keeps commands out of shared channels.
-- A slow or broken SMTP server or webhook delays nothing: sends run apart from the approval, time out (20 s per SMTP step, 10 s per webhook), and are audited.
+- A slow or broken SMTP server or webhook delays nothing: sends run apart from the approval and from each other, time out (20 s per SMTP step, 10 s per webhook), and are audited.
 - Notification state isn't shared between servers. One botd per database is already the rule.
 
 ## Alternatives considered

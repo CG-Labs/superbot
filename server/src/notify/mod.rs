@@ -482,11 +482,12 @@ impl Channel for Webhook {
 }
 
 /// Per-Bot windows: after a notice, a Bot's next approvals are held and go as one digest
-/// when the window ends. Each approval is offered once.
+/// when the window ends, or sooner if one of them must go out before its deadline. Each
+/// approval is offered once.
 #[derive(Default)]
 pub struct Throttle {
     last: HashMap<String, Instant>,
-    held: HashMap<String, Vec<String>>,
+    held: HashMap<String, Held>,
     seen: HashSet<String>,
     order: VecDeque<String>,
 }
@@ -496,12 +497,19 @@ pub enum Offer {
     /// Already offered.
     Duplicate,
     Now,
-    /// Held for the digest. `Some`: the first held, so flush after this long.
+    /// Held for the digest. `Some`: it moved the flush earlier (or is the first held), so
+    /// flush after this long.
     Held(Option<Duration>),
 }
 
+struct Held {
+    ids: Vec<String>,
+    due: Instant,
+}
+
 impl Throttle {
-    pub fn offer(&mut self, bot: &str, id: &str, window: Duration, now: Instant) -> Offer {
+    /// `by`: the latest this approval may go out, ahead of its deadline.
+    pub fn offer(&mut self, bot: &str, id: &str, window: Duration, by: Instant, now: Instant) -> Offer {
         if !self.seen.insert(id.to_string()) {
             return Offer::Duplicate;
         }
@@ -512,10 +520,16 @@ impl Throttle {
             self.seen.remove(&old);
         }
         match self.last.get(bot) {
-            Some(t) if !window.is_zero() && now < *t + window => {
-                let held = self.held.entry(bot.to_string()).or_default();
-                held.push(id.to_string());
-                Offer::Held((held.len() == 1).then(|| *t + window - now))
+            Some(t) if !window.is_zero() && now < *t + window && by > now => {
+                let due = (*t + window).min(by);
+                let held = self.held.entry(bot.to_string()).or_insert_with(|| Held { ids: Vec::new(), due });
+                held.ids.push(id.to_string());
+                if held.ids.len() == 1 || due < held.due {
+                    held.due = due;
+                    Offer::Held(Some(due - now))
+                } else {
+                    Offer::Held(None)
+                }
             }
             _ => {
                 self.last.insert(bot.to_string(), now);
@@ -524,12 +538,13 @@ impl Throttle {
         }
     }
 
-    /// The held approvals; a new window starts if there were any.
+    /// The held approvals once they're due; a new window starts if there were any.
     pub fn take(&mut self, bot: &str, now: Instant) -> Vec<String> {
-        let ids = self.held.remove(bot).unwrap_or_default();
-        if !ids.is_empty() {
-            self.last.insert(bot.to_string(), now);
+        if !self.held.get(bot).is_some_and(|h| h.due <= now) {
+            return Vec::new();
         }
+        let ids = self.held.remove(bot).map(|h| h.ids).unwrap_or_default();
+        self.last.insert(bot.to_string(), now);
         ids
     }
 }
@@ -633,16 +648,18 @@ impl Notifier {
         if self.plan(&app.db, Some(&bot), &s).is_empty() {
             return;
         }
-        let (me, app, id) = (self.clone(), app.clone(), a.id.clone());
+        let (me, app, id, expires_at) = (self.clone(), app.clone(), a.id.clone(), a.expires_at);
         tokio::spawn(async move {
-            if s.delay_seconds > 0 {
-                tokio::time::sleep(Duration::from_secs(s.delay_seconds as u64)).await;
+            let delay = Duration::from_secs(s.delay_seconds as u64).min(half_left(expires_at));
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
             }
             if !pending(&app.db, &id) {
                 return;
             }
             let window = Duration::from_secs(load(&app.db).throttle_seconds as u64);
-            let offer = me.throttle.lock().unwrap_or_else(|e| e.into_inner()).offer(&bot.id, &id, window, Instant::now());
+            let now = Instant::now();
+            let offer = me.throttle.lock().unwrap_or_else(|e| e.into_inner()).offer(&bot.id, &id, window, now + half_left(expires_at), now);
             match offer {
                 Offer::Now => me.send_pending(&app, &bot.id, &[id]).await,
                 Offer::Held(Some(wait)) => {
@@ -727,6 +744,12 @@ impl Notifier {
         }
         out
     }
+}
+
+/// Half the time an approval has left: the delay and the throttle never wait past this,
+/// so a notice still leaves people time to answer.
+fn half_left(expires_at: i64) -> Duration {
+    Duration::from_millis((expires_at - crate::db::now()).max(0) as u64 / 2)
 }
 
 fn pending(db: &Db, id: &str) -> bool {

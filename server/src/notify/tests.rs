@@ -67,21 +67,38 @@ fn a_bots_fields_go_back_to_the_global_settings_with_null() {
 }
 
 #[test]
+fn held_approvals_go_out_before_their_deadline() {
+    let mut t = Throttle::default();
+    let (w, t0) = (Duration::from_secs(120), Instant::now());
+    let far = t0 + Duration::from_secs(86_400);
+    assert_eq!(t.offer("b", "a1", w, far, t0), Offer::Now);
+    let s = |n| t0 + Duration::from_secs(n);
+    assert_eq!(t.offer("b", "a2", w, far, s(10)), Offer::Held(Some(Duration::from_secs(110))));
+    assert_eq!(t.offer("b", "a3", w, s(40), s(20)), Offer::Held(Some(Duration::from_secs(20))), "a sooner deadline moves the flush earlier");
+    assert_eq!(t.offer("b", "a4", w, s(90), s(25)), Offer::Held(None), "a later one doesn't");
+    assert!(t.take("b", s(30)).is_empty(), "not due yet");
+    assert_eq!(t.take("b", s(40)), ["a2", "a3", "a4"]);
+    assert!(t.take("b", s(120)).is_empty(), "the window-end flush finds nothing left");
+    assert_eq!(t.offer("b", "a5", w, s(50), s(50)), Offer::Now, "no time left: send now");
+}
+
+#[test]
 fn the_throttle_sends_each_approval_once_and_folds_the_rest_into_one_digest() {
     let mut t = Throttle::default();
     let (w, t0) = (Duration::from_secs(120), Instant::now());
-    assert_eq!(t.offer("b1", "a1", w, t0), Offer::Now);
-    assert_eq!(t.offer("b1", "a1", w, t0), Offer::Duplicate);
-    assert_eq!(t.offer("b2", "a2", w, t0), Offer::Now, "each Bot has its own window");
-    assert_eq!(t.offer("b1", "a3", w, t0 + Duration::from_secs(20)), Offer::Held(Some(Duration::from_secs(100))));
-    assert_eq!(t.offer("b1", "a4", w, t0 + Duration::from_secs(30)), Offer::Held(None), "one flush per window");
+    let far = t0 + Duration::from_secs(86_400);
+    assert_eq!(t.offer("b1", "a1", w, far, t0), Offer::Now);
+    assert_eq!(t.offer("b1", "a1", w, far, t0), Offer::Duplicate);
+    assert_eq!(t.offer("b2", "a2", w, far, t0), Offer::Now, "each Bot has its own window");
+    assert_eq!(t.offer("b1", "a3", w, far, t0 + Duration::from_secs(20)), Offer::Held(Some(Duration::from_secs(100))));
+    assert_eq!(t.offer("b1", "a4", w, far, t0 + Duration::from_secs(30)), Offer::Held(None), "one flush per window");
     assert_eq!(t.take("b1", t0 + w), ["a3", "a4"]);
-    assert_eq!(t.offer("b1", "a5", w, t0 + w + Duration::from_secs(1)), Offer::Held(Some(Duration::from_secs(119))), "the digest started a new window");
+    assert_eq!(t.offer("b1", "a5", w, far, t0 + w + Duration::from_secs(1)), Offer::Held(Some(Duration::from_secs(119))), "the digest started a new window");
     assert_eq!(t.take("b1", t0 + w * 2), ["a5"]);
     assert!(t.take("b1", t0 + w * 3).is_empty());
-    assert_eq!(t.offer("b1", "a6", w, t0 + w * 4), Offer::Now, "an empty take doesn't start a window");
-    assert_eq!(t.offer("b3", "a7", Duration::ZERO, t0), Offer::Now);
-    assert_eq!(t.offer("b3", "a8", Duration::ZERO, t0), Offer::Now, "no throttle");
+    assert_eq!(t.offer("b1", "a6", w, far, t0 + w * 4), Offer::Now, "an empty take doesn't start a window");
+    assert_eq!(t.offer("b3", "a7", Duration::ZERO, far, t0), Offer::Now);
+    assert_eq!(t.offer("b3", "a8", Duration::ZERO, far, t0), Offer::Now, "no throttle");
 }
 
 #[test]
@@ -233,6 +250,20 @@ async fn a_pending_approval_reaches_email_and_the_webhook_once_with_audit() {
     }
     let hook = sent.iter().find(|e| e.details["channel"] == "webhook").unwrap();
     assert_eq!((hook.details["host"].as_str(), hook.details["own"].as_bool()), (Some("127.0.0.1"), Some(true)));
+    secrets::global().delete(&webhook::bot_secret(&r.bot.id)).unwrap();
+}
+
+#[tokio::test]
+async fn short_approvals_are_noticed_before_they_time_out() {
+    let r = rig(Settings { email: EmailSettings { enabled: false, ..Default::default() }, ..on(30, 120) }, None).await;
+    let soon = |subject: &str| r.app.db.add_approval(&r.bot.id, "claude", "Bash", "shell", subject, &json!({ "command": subject }), "git_push", "Pushes", crate::db::now() + 3_000);
+    let (a, b) = (soon("git push 1"), soon("git push 2"));
+    requested(&r.app, &a);
+    requested(&r.app, &b);
+    let hits = until("both, inside the 30 s delay and the 120 s window", || Some(r.hook.hits.lock().unwrap().clone()).filter(|h| h.len() >= 2)).await;
+    let text: String = hits.iter().map(|h| h.body["text"].as_str().unwrap_or_default().to_string()).collect();
+    assert!(text.contains(&a.id) && text.contains(&b.id), "{text}");
+    assert!(r.app.db.approval(&b.id).unwrap().status == "pending", "with time left to answer");
     secrets::global().delete(&webhook::bot_secret(&r.bot.id)).unwrap();
 }
 
