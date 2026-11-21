@@ -6,9 +6,9 @@ import { SettingsView } from "../components/SettingsView";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
 
-/** This device's settings: App lock (ADR 0078) and push notifications (ADR 0080). */
+/** This device's settings: App lock (ADR 0078) and push notifications (ADR 0080), and your two-factor authentication (ADR 0094). */
 export default function SettingsScreen() {
-  const { ready, api } = useSuperBot();
+  const { ready, api, can } = useSuperBot();
   if (!ready) {
     return (
       <View style={styles.loading}>
@@ -20,7 +20,7 @@ export default function SettingsScreen() {
   const back = () => (router.canGoBack() ? router.back() : router.replace("/home"));
   return (
     <SafeAreaView style={styles.root} edges={["top", "left", "right"]}>
-      <SettingsView onBack={back} api={api} />
+      <SettingsView onBack={back} api={api} admin={can("admin")} />
     </SafeAreaView>
   );
 }

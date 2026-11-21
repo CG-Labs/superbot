@@ -39,10 +39,11 @@ function notice(msg, isError = true) {
 const fail = (err) => notice(err.message || String(err));
 
 // Shown-once values: sign-in codes and SCIM tokens. Closing forgets them; the server keeps only hashes.
-function showOnce({ title, note, value, link }) {
+function showOnce({ title, note, value, link, lines = false }) {
   $("once-title").textContent = title;
   $("once-note").textContent = note;
   $("once-value").textContent = value;
+  $("once-value").classList.toggle("lines", lines);
   $("once-copy-link").hidden = !link;
   $("once-copy-link").dataset.link = link || "";
   $("once").hidden = false;
@@ -104,8 +105,10 @@ function renderUsers() {
       <td>${active ? "Active" : '<span class="bad">Disabled</span>'}</td>
       <td>${lastLogin(u)}</td>
       <td>${u.pendingCodes ? `Waiting<div class="sub">until ${esc(fmt(u.pendingCodes.expiresAt))}</div>` : ""}</td>
+      <td>${u.mfa?.enabled ? `On<div class="sub">since ${esc(fmt(u.mfa.enabledAt))}</div>` : ""}</td>
       <td class="actions">
         <button type="button" class="btn" data-act="code" ${active ? "" : "disabled"}>New code</button>
+        ${u.mfa?.enabled && u.id !== me.user?.id ? '<button type="button" class="btn" data-act="mfa">Reset 2FA</button>' : ""}
         ${u.breakGlass ? "" : `<button type="button" class="btn" data-act="status">${active ? "Disable" : "Enable"}</button>`}
         <button type="button" class="btn" data-act="sessions">Sign out everywhere</button>
       </td>
@@ -139,6 +142,11 @@ $("users-rows").addEventListener("click", async (e) => {
       const disable = u.status === "active";
       if (disable && !confirm(`Disable ${u.name}? They are signed out everywhere and can't sign in until enabled.`)) return;
       await api("PATCH", `/api/users/${key(u.id)}`, { status: disable ? "disabled" : "active" });
+    }
+    if (t.dataset.act === "mfa") {
+      if (!confirm(`Reset two-factor authentication for ${u.name}? Use this if they lost their authenticator app. If it's required, they set it up again at their next sign-in.`)) return;
+      await api("DELETE", `/api/users/${key(u.id)}/mfa`);
+      notice(`Two-factor authentication reset for ${u.name}.`, false);
     }
     if (t.dataset.act === "sessions") {
       if (!confirm(`Sign ${u.name} out of every session?`)) return;
@@ -915,7 +923,116 @@ async function loadSignIn() {
   const sso = providers.length ? `SSO: ${providers.map((p) => `${p.label || p.id} (${p.type || "oidc"})`).join(", ")}.` : "No SSO providers are set up (SSO_PROVIDERS).";
   const glass = me.breakGlass ? "Break-glass password sign-in at /login is on (AUTH_BREAK_GLASS)." : "Break-glass password sign-in is off.";
   $("signin-info").textContent = `${glass} ${sso} Sign-in codes come from Users.`;
+  loadMfa();
 }
+
+// Two-factor authentication (ADR 0094): the policy, and the admin's own.
+const MFA_POLICY_NOTE = {
+  off: "Nobody has to, but anyone can turn it on for themselves.",
+  admins: "Admins, and the owner's break-glass password, need a code from an authenticator app at /login. The password no longer works over HTTP Basic.",
+  all: "Everyone signing in with a sign-in code or the password needs a code from an authenticator app.",
+};
+
+async function loadMfa() {
+  let m;
+  try { m = await api("GET", "/api/auth/mfa"); } catch (err) { $("mfa-policy-note").textContent = err.message; return; }
+  $("mfa-policy").value = m.policy;
+  $("mfa-policy").disabled = m.policyPinned;
+  const sso = " Single sign-on relies on your identity provider's MFA: require it there.";
+  $("mfa-policy-note").textContent = MFA_POLICY_NOTE[m.policy] + sso + (m.policyPinned ? " Set by AUTH_MFA in botd's environment." : "");
+  $("mfa-mine-state").textContent = m.enabled
+    ? `Yours is on, with ${m.recoveryCodesLeft} recovery code${m.recoveryCodesLeft === 1 ? "" : "s"} left.`
+    : m.required ? "Yours is off, so your next sign-in sets it up." : "Yours is off.";
+  $("mfa-on").hidden = m.enabled;
+  $("mfa-codes").hidden = !m.enabled;
+  $("mfa-off").hidden = !m.enabled || m.required;
+}
+
+function showRecoveryCodes(codes) {
+  showOnce({
+    title: "Your recovery codes",
+    note: "Each works once if you lose your authenticator app. Save them somewhere safe. They can't be shown again.",
+    value: codes.join("\n"),
+    lines: true,
+  });
+}
+
+// A code from the app, or a recovery code, to prove a change.
+function secondFactor(what) {
+  const v = (prompt(`To ${what}, enter the code from your authenticator app, or a recovery code.`) || "").trim();
+  if (!v) return null;
+  return /^\d{6}$/.test(v.replace(/\s/g, "")) ? { totp: v.replace(/\s/g, "") } : { recoveryCode: v };
+}
+
+$("mfa-policy").addEventListener("change", async (e) => {
+  try {
+    await api("PUT", "/api/auth/mfa/policy", { require: e.target.value });
+    notice("Two-factor policy saved.", false);
+  } catch (err) {
+    fail(err);
+  }
+  loadMfa();
+});
+
+$("mfa-on").addEventListener("click", async () => {
+  try {
+    const s = await api("POST", "/api/auth/mfa/enroll", {});
+    $("mfa-qr").src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(s.qrSvg);
+    $("mfa-key").textContent = s.secret.replace(/(.{4})/g, "$1 ").trim();
+    $("mfa-setup").hidden = false;
+    $("mfa-code").focus();
+  } catch (err) {
+    fail(err);
+  }
+});
+
+function closeMfaSetup() {
+  $("mfa-setup").hidden = true;
+  $("mfa-qr").removeAttribute("src");
+  $("mfa-key").textContent = "";
+  $("mfa-code").value = "";
+}
+
+$("mfa-cancel").addEventListener("click", async () => {
+  closeMfaSetup();
+  await api("POST", "/api/auth/mfa/disable", {}).catch(() => {});
+  loadMfa();
+});
+
+$("mfa-confirm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try {
+    const r = await api("POST", "/api/auth/mfa/confirm", { totp: $("mfa-code").value.replace(/\s/g, "") });
+    closeMfaSetup();
+    showRecoveryCodes(r.recoveryCodes);
+  } catch (err) {
+    fail(err);
+  }
+  loadMfa();
+});
+
+$("mfa-codes").addEventListener("click", async () => {
+  const proof = secondFactor("make new recovery codes");
+  if (!proof) return;
+  try {
+    showRecoveryCodes((await api("POST", "/api/auth/mfa/recovery-codes", proof)).recoveryCodes);
+  } catch (err) {
+    fail(err);
+  }
+  loadMfa();
+});
+
+$("mfa-off").addEventListener("click", async () => {
+  const proof = secondFactor("turn two-factor authentication off");
+  if (!proof) return;
+  try {
+    await api("POST", "/api/auth/mfa/disable", proof);
+    notice("Two-factor authentication is off for you.", false);
+  } catch (err) {
+    fail(err);
+  }
+  loadMfa();
+});
 
 let secrets = [];
 

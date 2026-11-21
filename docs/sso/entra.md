@@ -118,6 +118,12 @@ Every other tenant is refused, even though Microsoft would sign its people in. L
 - **Web client** (Expo web): sign-in opens in a popup and returns to `{web client}/auth`. The one botd's installer or Compose serves returns to `{SSO_PUBLIC_URL}/app/auth`, which is allowed by default; add any other web client's address to `SSO_APP_REDIRECTS`.
 - **Desktop (Electron)**: not yet; it loads from `file://`, which Microsoft can't return to. Use a sign-in code (`botctl user code <user>`).
 
+## Require MFA at the IdP
+
+SuperBot doesn't ask single sign-on sign-ins for its own second factor: the IdP's MFA is that factor, so require it there. Sign-in codes and the owner's password get SuperBot's own two-factor authentication instead ([ADR 0094](../adr/0094-totp-second-factor.md)). Requiring MFA at your IdP is your control as the customer (CC6.1-2 in the [SOC 2 readiness checklist](../security/soc2-readiness-checklist.md)).
+
+In Entra, add a **Conditional Access** policy (**Protection → Conditional Access → New policy**) for the SuperBot app, or all cloud apps, with **Grant → Require multifactor authentication** (or an authentication strength). Without Entra ID P1, turn on **Security defaults** (**Identity → Overview → Properties**), which require MFA registration for everyone.
+
 ## Troubleshooting
 
 Each failed SSO sign-in is in the audit log with a reason (`botctl audit --action auth.login_failed`):
