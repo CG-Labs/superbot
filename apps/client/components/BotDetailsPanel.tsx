@@ -28,7 +28,7 @@ interface Props {
   onOpenScreen: () => void;
   /** Opens this Bot's policy editor (ADR 0049). */
   onOpenPolicy?: (botId: string) => void;
-  /** Admins only: opens the audit log filtered to this Bot (ADR 0059). */
+  /** Admins only: opens the audit log filtered to this Bot (ADR 0060). */
   onOpenAudit?: (botId: string) => void;
   /** Sends a suggested prompt to this Bot, or puts a starter in its message box (ADR 0054). */
   onUsePrompt?: (prompt: string) => void;

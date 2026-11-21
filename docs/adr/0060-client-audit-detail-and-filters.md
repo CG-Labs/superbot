@@ -1,4 +1,4 @@
-# 0059: Audit log detail and filters in the client
+# 0060: Audit log detail and filters in the client
 
 ## Status
 

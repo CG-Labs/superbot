@@ -153,7 +153,7 @@ async fn approval(port: u16, bot: &str, bot_auth: &str, who: &str, cmd: &str, de
     hook.await.unwrap();
 }
 
-/// The client's "Approval decisions" kind with its Bot filter (ADR 0059): a comma-separated
+/// The client's "Approval decisions" kind with its Bot filter (ADR 0060): a comma-separated
 /// action list ANDed with `bot`, the same in the list and the CSV export, and admins only.
 #[tokio::test]
 async fn approval_decisions_for_one_bot() {

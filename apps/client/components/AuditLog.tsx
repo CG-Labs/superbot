@@ -89,7 +89,7 @@ function EventRow({ e, selected, onPress, botName, nameOf }: { e: AuditEvent; se
   );
 }
 
-/** The audit log for admins: filters, paging, event detail, and CSV export (ADR 0009, 0019, 0028, 0059). The server refuses it to everyone else. */
+/** The audit log for admins: filters, paging, event detail, and CSV export (ADR 0009, 0019, 0028, 0060). The server refuses it to everyone else. */
 export function AuditLog({ api, onBack, botName, bots = [], initial }: Props) {
   const { width } = useWindowDimensions();
   const wide = width >= 900;
