@@ -142,8 +142,13 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine backup <user>                     Back it up to object storage now
   botctl machine recovery                          Each tier's RPO and RTO, machines past their RPO, and how
                                                    long restores took (ADR 0074)
-  botctl machine restore <user> <backup-id> [--identity <age-key-file>] --yes  Make it again from that backup; it enrolls anew
+  botctl machine restore <user> <backup-id> [--identity <age-key-file>] [--host <name>] --yes  Make it again from that backup; it enrolls anew
+                                                   (--host: onto that Incus host, deleting it from its own; ADR 0076)
   botctl machine restore <user> status             How its latest restore went
+  botctl machine hosts [check]                     Incus hosts (ADR 0076): up, down or lost, and their machines; check asks each now
+  botctl machine host recover <name> [--to <host>] [--identity <age-key-file>] --yes
+                                                   Declare a host that doesn't answer lost, and restore its machines from
+                                                   their newest off-host backups onto another host; they enroll anew
   botctl machine bot-user <user>                   Run its Bots as their own OS user now (MACHINE_BOT_USER), retrying a failure
   botctl machine harness-login <user|me> <claude|codex>  Log the harness in on the machine; the login stays there
   botctl machine harness-logins <user|me>          Which harnesses are logged in on it
@@ -698,10 +703,30 @@ fn backup_request(args: &[&str], read: impl Fn(&str) -> Result<String, String>) 
                 Some(i) => Some(read(rest.get(i + 1).filter(|f| !f.starts_with("--")).ok_or("--identity needs a file")?)?),
                 None => None,
             };
-            ("POST", at(user, "restore"), Some(json!({ "backupId": id, "identity": identity }).to_string()))
+            let mut body = json!({ "backupId": id, "identity": identity });
+            if let Some(h) = flag(rest, "--host") {
+                body["host"] = json!(h);
+            }
+            ("POST", at(user, "restore"), Some(body.to_string()))
+        }
+        ["hosts"] => ("GET", "/api/machines/hosts".into(), None),
+        ["hosts", "check"] => ("GET", "/api/machines/hosts?check=true".into(), None),
+        ["host", "recover", name, rest @ ..] if !name.starts_with("--") && rest.contains(&"--yes") => {
+            let identity = match rest.iter().position(|a| *a == "--identity") {
+                Some(i) => Some(read(rest.get(i + 1).filter(|f| !f.starts_with("--")).ok_or("--identity needs a file")?)?),
+                None => None,
+            };
+            let body = json!({ "to": flag(rest, "--to"), "identity": identity });
+            ("POST", format!("/api/machines/hosts/{}/recover", encode(name)), Some(body.to_string()))
+        }
+        ["host", "recover", _, ..] => {
+            return Err("Recovering declares the host lost for good and restores its machines elsewhere from their backups; add --yes".into());
         }
         ["restore", _, _, ..] => return Err("Restoring replaces the machine and everything on it since the backup; add --yes".into()),
-        _ => return Err("Usage: botctl machine backups [<user>] | backup <user> | recovery | restore <user> <backup-id> [--identity <file>] --yes | restore <user> status".into()),
+        _ => return Err(
+            "Usage: botctl machine backups [<user>] | backup <user> | recovery | restore <user> <backup-id> [--identity <file>] [--host <name>] --yes | restore <user> status | hosts [check] | host recover <name> [--to <host>] [--identity <file>] --yes"
+                .into(),
+        ),
     })
 }
 
@@ -1003,7 +1028,7 @@ fn run(args: &[String]) -> Result<String, String> {
         ["machine", "harness-logins", user] => op("GET", &format!("{}/harness-logins", login_base(user)), None),
         ["machine", "harness-logout", user, harness] => op("DELETE", &format!("{}/harness-logins/{}", login_base(user), encode(harness)), None),
         ["machine", "legacy"] => op("GET", "/api/machines/legacy", None),
-        ["machine", rest @ ..] if matches!(rest.first(), Some(&("backups" | "backup" | "restore" | "recovery"))) => {
+        ["machine", rest @ ..] if matches!(rest.first(), Some(&("backups" | "backup" | "restore" | "recovery" | "hosts" | "host"))) => {
             let (method, path, body) = backup_request(rest, |f| std::fs::read_to_string(f).map_err(|e| format!("--identity {f}: {e}")))?;
             op(method, &path, body)
         }
@@ -1306,6 +1331,17 @@ mod tests {
         assert!(backup_request(&["restore", "u1", "b1", "--identity", "--yes"], read).is_err());
         assert!(backup_request(&["restore", "u1", "b1", "--identity", "nope", "--yes"], read).is_err());
         assert!(backup_request(&["backup"], read).is_err());
+        let (_, _, b) = backup_request(&["restore", "u1", "b1", "--host", "spare", "--yes"], read).unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&b.unwrap()).unwrap(), json!({ "backupId": "b1", "identity": null, "host": "spare" }));
+        assert_eq!(backup_request(&["hosts"], read).unwrap(), ("GET", "/api/machines/hosts".into(), None));
+        assert_eq!(backup_request(&["hosts", "check"], read).unwrap(), ("GET", "/api/machines/hosts?check=true".into(), None));
+        let (m, p, b) = backup_request(&["host", "recover", "main", "--to", "spare", "--identity", "key.txt", "--yes"], read).unwrap();
+        assert_eq!((m, p.as_str()), ("POST", "/api/machines/hosts/main/recover"));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&b.unwrap()).unwrap(), json!({ "to": "spare", "identity": "AGE-SECRET-KEY-1X" }));
+        let (_, _, b) = backup_request(&["host", "recover", "main", "--yes"], read).unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&b.unwrap()).unwrap(), json!({ "to": null, "identity": null }));
+        assert!(backup_request(&["host", "recover", "main"], read).unwrap_err().contains("--yes"));
+        assert!(backup_request(&["host", "recover", "--yes"], read).is_err());
         assert_eq!(login_base("me"), "/api/machine");
         assert_eq!(login_base("a@example.com"), "/api/users/a%40example.com/machine");
     }
