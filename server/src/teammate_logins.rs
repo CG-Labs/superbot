@@ -55,6 +55,11 @@ impl Local {
     fn running(&self, owner: &str, teammate: &str) -> Vec<String> {
         self.terminal.running_for(Space::Teammate { owner, teammate }.dir().as_deref())
     }
+
+    /// Stops every login `teammate` has running for `owner`'s Bots (ADR 0066). How many.
+    pub fn stop_for(&self, owner: &str, teammate: &str) -> u32 {
+        Space::Teammate { owner, teammate }.dir().map_or(0, |d| self.terminal.abort_for(&d))
+    }
 }
 
 /// Whether `owner`'s teammates log in on this server: teammate accounts are on, and the

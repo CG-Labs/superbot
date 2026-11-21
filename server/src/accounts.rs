@@ -54,6 +54,7 @@ const FORGET_FILES: &str = "cd \"$HOME\" || exit 1; for f; do if [ -h \"$f\" ] |
 pub const DEFAULT_DIR: &str = "/srv/superbot/users";
 const DEFAULT_SUDO: &str = "/usr/bin/sudo";
 const DEFAULT_USERCTL: &str = "/usr/local/sbin/superbot-userctl";
+const PASSWD: &str = "/etc/passwd";
 /// The most of a memory or facts file botd reads back from a user's folder.
 pub const MAX_FILE: u64 = 1 << 20;
 
@@ -68,8 +69,59 @@ pub struct Isolation {
     /// `ISOLATION_TEAMMATES` (ADR 0064): a teammate's run of a shared Bot uses an account
     /// of its own, not the owner's. Set at startup by `teammates_flag`.
     pub teammates: bool,
-    /// One account setup at a time, so two first runs don't both run `useradd`.
+    /// What becomes of a leaving teammate's work (`ISOLATION_TEAMMATE_FILES`, ADR 0066).
+    pub offboard: crate::machines::offboard::Settings,
+    /// The local password database, where teammate accounts are found (ADR 0066).
+    pub passwd: PathBuf,
+    /// One account setup or removal at a time, so two first runs don't both run `useradd`.
     setup: std::sync::Arc<std::sync::Mutex<()>>,
+}
+
+/// What becomes of a leaving teammate's workspace (ADR 0066).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Work {
+    /// Handed to the owner's account, in `workspace/from-teammates/<name>`.
+    Archive(String),
+    /// Kept aside, root's alone, until `purge`.
+    Hold,
+    Delete,
+}
+
+/// What `superbot-userctl remove` did.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Removed {
+    /// The account was there and is gone now; false: it was gone already.
+    pub account_removed: bool,
+    /// Rounds of killing its processes that found some.
+    pub processes: u32,
+    /// Its entries removed from /tmp, /var/tmp and /dev/shm.
+    pub temp: u32,
+    /// `archived`, `held`, `deleted` or `none`.
+    pub work: String,
+    /// Where archived or held work is.
+    pub path: Option<String>,
+}
+
+impl Removed {
+    fn parse(out: &str) -> Result<Removed, String> {
+        let mut r = Removed::default();
+        let mut seen = false;
+        for (k, v) in out.lines().filter_map(|l| l.split_once('=')) {
+            match k {
+                "account" => (r.account_removed, seen) = (v == "removed", true),
+                "processes" => r.processes = v.parse().unwrap_or(0),
+                "temp" => r.temp = v.parse().unwrap_or(0),
+                "work" if matches!(v, "archived" | "held" | "deleted" | "none") => r.work = v.into(),
+                "path" if v.starts_with('/') => r.path = Some(v.into()),
+                _ => {}
+            }
+        }
+        if !seen || r.work.is_empty() {
+            return Err(format!("superbot-userctl remove said something else: {:?}", out.trim()));
+        }
+        Ok(r)
+    }
 }
 
 /// How one run starts as its owner's account, or as a teammate's for the owner's Bots.
@@ -334,6 +386,8 @@ impl Isolation {
             runner: bin_dir.join("superbot-run"),
             userctl: or("ISOLATION_USERCTL", DEFAULT_USERCTL).into(),
             teammates: false,
+            offboard: crate::machines::offboard::Settings::from_vars(&get, "ISOLATION_TEAMMATE_FILES", "ISOLATION_TEAMMATE_FILES_DAYS")?,
+            passwd: PASSWD.into(),
             setup: Default::default(),
         };
         for (what, p) in [("sudo", &iso.sudo), ("superbot-run", &iso.runner), ("superbot-userctl", &iso.userctl)] {
@@ -492,6 +546,75 @@ impl Isolation {
             return Err("superbot-userctl ran, but the account or its folders still aren't there".into());
         }
         Ok(true)
+    }
+
+    /// Every teammate account on this server, as `(owner, teammate)`: each `sb-t-` entry
+    /// in the password database whose home is the one `superbot-userctl ensure` gives that
+    /// pair, and whose name is the one it derives from them. Nothing else counts.
+    pub fn teammate_pairs(&self) -> Vec<(String, String)> {
+        let Ok(text) = std::fs::read_to_string(&self.passwd) else { return vec![] };
+        let mut out: Vec<(String, String)> = text
+            .lines()
+            .filter_map(|l| {
+                let f: Vec<&str> = l.split(':').collect();
+                let (name, home) = (*f.first()?, *f.get(5)?);
+                if !name.starts_with(TEAMMATE_PREFIX) {
+                    return None;
+                }
+                let dir = Path::new(home).strip_prefix(&self.root).ok()?;
+                let mut parts = dir.components();
+                let (Some(std::path::Component::Normal(pair)), Some(std::path::Component::Normal(h)), None) = (parts.next(), parts.next(), parts.next()) else {
+                    return None;
+                };
+                let (owner, teammate) = pair.to_str()?.split_once('-')?;
+                (h == "home" && teammate_account(owner, teammate).as_deref() == Some(name)).then(|| (owner.to_string(), teammate.to_string()))
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Removes a teammate's account for `owner`'s Bots, their processes and folder, with
+    /// the root helper (`superbot-userctl remove`), dealing with their workspace as `work`
+    /// says. Safe to run again: what's gone stays gone. Never a user's own account: the
+    /// helper takes two different ids and derives the account itself. Blocking.
+    pub fn remove_teammate(&self, owner: &str, teammate: &str, cleanup_id: &str, work: &Work) -> Result<Removed, String> {
+        Space::Teammate { owner, teammate }.account().ok_or("those ids can't name a teammate account")?;
+        let mut args = vec!["remove".to_string(), owner.into(), teammate.into(), cleanup_id.into()];
+        match work {
+            Work::Archive(name) => args.extend(["archive".to_string(), name.clone()]),
+            Work::Hold => args.push("hold".into()),
+            Work::Delete => args.push("delete".into()),
+        }
+        let _one = self.setup.lock().unwrap_or_else(|e| e.into_inner());
+        Removed::parse(&self.userctl(&args)?)
+    }
+
+    /// Deletes work a removal held (`superbot-userctl purge`). Whether there was any.
+    /// Blocking.
+    pub fn purge(&self, cleanup_id: &str) -> Result<bool, String> {
+        let out = self.userctl(&["purge".into(), cleanup_id.into()])?;
+        Ok(out.lines().any(|l| l == "purged=yes"))
+    }
+
+    /// `sudo -n superbot-userctl <args>`: what it printed, or why it failed.
+    fn userctl(&self, args: &[String]) -> Result<String, String> {
+        let out = Command::new(&self.sudo)
+            .arg("-n")
+            .arg(&self.userctl)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("couldn't start {}: {e}", self.sudo.display()))?;
+        let what = args.first().map_or("", String::as_str);
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let last = err.trim().lines().last().unwrap_or_default();
+            let hint = if last.starts_with("sudo:") { ". Re-run deploy/install.sh --isolation: its sudoers rule lets botd remove accounts" } else { "" };
+            return Err(format!("superbot-userctl {what} failed ({}){}{hint}", out.status, if last.is_empty() { String::new() } else { format!(": {last}") }));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 }
 
@@ -709,6 +832,8 @@ pub(crate) fn for_tests(root: &Path, sudo: &str) -> Isolation {
         runner: "/usr/local/bin/superbot-run".into(),
         userctl: DEFAULT_USERCTL.into(),
         teammates: false,
+        offboard: Default::default(),
+        passwd: root.join("passwd"),
         setup: Default::default(),
     }
 }
@@ -778,6 +903,68 @@ mod tests {
         std::fs::create_dir_all(&mine).unwrap();
         let err = parse("users", mine.to_str().unwrap()).unwrap_err();
         assert!(err.contains("owned by root"), "{err}");
+    }
+
+    #[test]
+    fn what_the_helper_says_it_removed_is_read_strictly() {
+        let r = Removed::parse("account=removed\nprocesses=2\ntemp=3\nwork=archived\npath=/srv/u/a1/workspace/from-teammates/bea\n").unwrap();
+        assert_eq!((r.account_removed, r.processes, r.temp, r.work.as_str()), (true, 2, 3, "archived"));
+        assert_eq!(r.path.as_deref(), Some("/srv/u/a1/workspace/from-teammates/bea"));
+        let gone = Removed::parse("account=absent\nprocesses=0\ntemp=0\nwork=none\npath=relative\n").unwrap();
+        assert_eq!((gone.account_removed, gone.work.as_str(), gone.path), (false, "none", None));
+        for bad in ["", "sb-t-x /home", "account=removed\n", "account=removed\nwork=moved\n"] {
+            assert!(Removed::parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn removing_asks_the_helper_for_one_teammate_account_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::db::temp_path("iso-remove");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sudo = dir.join("sudo");
+        let log = dir.join("args");
+        std::fs::write(&sudo, format!("#!/bin/sh\necho \"$*\" >> {}\necho account=removed\necho work=held\necho purged=yes\n", log.display())).unwrap();
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let iso = for_tests(&dir, sudo.to_str().unwrap());
+        assert_eq!(iso.remove_teammate("a1", "b2", "c0ffee0123456789", &Work::Archive("bea-2026-01-01".into())).unwrap().work, "held");
+        iso.remove_teammate("a1", "b2", "c0ffee0123456789", &Work::Hold).unwrap();
+        iso.remove_teammate("a1", "b2", "c0ffee0123456789", &Work::Delete).unwrap();
+        assert!(iso.purge("c0ffee0123456789").unwrap());
+        for (o, t) in [("a1", "a1"), ("a1", ""), ("a1", "../b2"), ("A1", "b2")] {
+            assert!(iso.remove_teammate(o, t, "c0ffee0123456789", &Work::Delete).is_err(), "{o} {t}");
+        }
+        let args = std::fs::read_to_string(&log).unwrap();
+        let u = DEFAULT_USERCTL;
+        assert_eq!(
+            args,
+            format!(
+                "-n {u} remove a1 b2 c0ffee0123456789 archive bea-2026-01-01\n-n {u} remove a1 b2 c0ffee0123456789 hold\n-n {u} remove a1 b2 c0ffee0123456789 delete\n-n {u} purge c0ffee0123456789\n"
+            )
+        );
+
+        // An old sudoers rule that allows only `ensure`: says how to fix it.
+        let iso = for_tests(&dir, "/bin/false");
+        assert!(iso.remove_teammate("a1", "b2", "c0ffee0123456789", &Work::Hold).unwrap_err().contains("remove failed"));
+        std::fs::write(&sudo, "#!/bin/sh\necho 'sudo: a password is required' >&2\nexit 1\n").unwrap();
+        let iso = for_tests(&dir, sudo.to_str().unwrap());
+        assert!(iso.purge("c0ffee0123456789").unwrap_err().contains("install.sh --isolation"));
+    }
+
+    #[test]
+    fn teammate_files_settings_come_from_their_own_variables() {
+        use crate::machines::offboard::Files;
+        let get = |files: &'static str, days: &'static str| {
+            move |k: &str| match k {
+                "ISOLATION_TEAMMATE_FILES" => files.to_string(),
+                "ISOLATION_TEAMMATE_FILES_DAYS" => days.to_string(),
+                _ => String::new(),
+            }
+        };
+        let s = crate::machines::offboard::Settings::from_vars(&get("delete", "3"), "ISOLATION_TEAMMATE_FILES", "ISOLATION_TEAMMATE_FILES_DAYS").unwrap();
+        assert_eq!((s.files, s.grace_days), (Files::Delete, 3));
+        let err = crate::machines::offboard::Settings::from_vars(&get("keep", ""), "ISOLATION_TEAMMATE_FILES", "ISOLATION_TEAMMATE_FILES_DAYS").unwrap_err();
+        assert!(err.starts_with("ISOLATION_TEAMMATE_FILES must"), "{err}");
     }
 
     #[test]

@@ -80,21 +80,23 @@ impl Settings {
     /// MACHINE_TEAMMATE_FILES (`archive`, the default, or `delete`) and
     /// MACHINE_TEAMMATE_FILES_DAYS (0 to 365, default 7; only with `delete`).
     pub fn from_env(var: &dyn Fn(&str) -> String) -> Result<Settings, String> {
-        let files = match var("MACHINE_TEAMMATE_FILES").trim() {
+        Settings::from_vars(var, "MACHINE_TEAMMATE_FILES", "MACHINE_TEAMMATE_FILES_DAYS")
+    }
+
+    /// The same, from `files` and `days` (ISOLATION_TEAMMATE_FILES and _DAYS on one
+    /// server, ADR 0066).
+    pub fn from_vars(var: &dyn Fn(&str) -> String, files_key: &str, days_key: &str) -> Result<Settings, String> {
+        let files = match var(files_key).trim() {
             "" | "archive" => Files::Archive,
             "delete" => Files::Delete,
-            v => return Err(format!("MACHINE_TEAMMATE_FILES must be archive or delete, not \"{v}\"")),
+            v => return Err(format!("{files_key} must be archive or delete, not \"{v}\"")),
         };
-        let grace_days = match var("MACHINE_TEAMMATE_FILES_DAYS").trim() {
+        let grace_days = match var(days_key).trim() {
             "" => 7,
-            d => d
-                .parse::<u32>()
-                .ok()
-                .filter(|d| *d <= 365)
-                .ok_or(format!("MACHINE_TEAMMATE_FILES_DAYS must be 0 to 365, not \"{d}\""))?,
+            d => d.parse::<u32>().ok().filter(|d| *d <= 365).ok_or(format!("{days_key} must be 0 to 365, not \"{d}\""))?,
         };
-        if files == Files::Archive && !var("MACHINE_TEAMMATE_FILES_DAYS").trim().is_empty() {
-            return Err("MACHINE_TEAMMATE_FILES_DAYS needs MACHINE_TEAMMATE_FILES=delete: archived work is kept".into());
+        if files == Files::Archive && !var(days_key).trim().is_empty() {
+            return Err(format!("{days_key} needs {files_key}=delete: archived work is kept"));
         }
         Ok(Settings { files, grace_days })
     }
@@ -116,11 +118,11 @@ const AT_ONCE: usize = 4;
 #[derive(Default)]
 pub struct Working {
     taken: Mutex<HashSet<String>>,
-    running: AtomicBool,
-    again: AtomicBool,
+    pub(crate) running: AtomicBool,
+    pub(crate) again: AtomicBool,
 }
 
-struct Taken<'a>(&'a Working, String);
+pub(crate) struct Taken<'a>(&'a Working, String);
 
 impl Drop for Taken<'_> {
     fn drop(&mut self) {
@@ -133,7 +135,7 @@ impl Working {
         self.taken.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn take(&self, id: &str) -> Option<Taken<'_>> {
+    pub(crate) fn take(&self, id: &str) -> Option<Taken<'_>> {
         self.lock().insert(id.to_string()).then(|| Taken(self, id.to_string()))
     }
 }
@@ -153,7 +155,7 @@ pub fn wanted(app: &App, owner_id: &str, user_id: &str) -> bool {
 }
 
 /// Why `user_id` no longer has a user on a machine, as best botd can tell.
-fn reason_for(app: &App, user_id: &str) -> &'static str {
+pub(crate) fn reason_for(app: &App, user_id: &str) -> &'static str {
     match app.db.user(user_id) {
         None => DELETED,
         Some(u) if !u.active() => DISABLED,
@@ -281,8 +283,10 @@ pub async fn settled(app: &App) {
 }
 
 /// `user_id` was disabled, deprovisioned or lost their role: queue their removal from
-/// every machine they have a user on, and try at once.
+/// every machine they have a user on, and try at once. Their accounts for owners' Bots on
+/// this server go too (ADR 0066).
 pub fn left(app: &AppState, by: &Who, user_id: &str, reason: &str) {
+    crate::teammate_removals::left(app, by, user_id, reason);
     let Some(e) = enrollment(app) else { return };
     let mut queued = 0;
     for m in app.db.machines(None) {
@@ -294,8 +298,10 @@ pub fn left(app: &AppState, by: &Who, user_id: &str, reason: &str) {
 }
 
 /// `owner_id`'s Bots may have been taken from someone (a grant revoked, a Bot made
-/// private, given away or deleted): queue removals on their machine, and try at once.
+/// private, given away or deleted): queue removals on their machine, and try at once,
+/// and of teammates' accounts for their Bots on this server (ADR 0066).
 pub fn check_owner(app: &AppState, by: &Who, owner_id: &str) {
+    crate::teammate_removals::check_owner(app, by, owner_id);
     let Some(e) = enrollment(app) else { return };
     let Some(m) = app.db.user_machine(owner_id) else { return };
     if sweep(app, e, by, &m, None) > 0 {
@@ -365,7 +371,7 @@ enum Tried {
 }
 
 /// The folder name archived work gets: the teammate's email name (or id) and the date.
-fn archive_name(app: &App, user_id: &str) -> String {
+pub(crate) fn archive_name(app: &App, user_id: &str) -> String {
     let who = app
         .db
         .user(user_id)

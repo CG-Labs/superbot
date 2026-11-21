@@ -177,6 +177,8 @@ pub struct App {
     pub notifier: OnceLock<Arc<crate::notify::Notifier>>,
     /// Teammates' own harness logins for owners' shared Bots here (ADR 0064).
     pub teammate_logins: crate::teammate_logins::Local,
+    /// Removals of leaving teammates' accounts here being tried now (ADR 0066).
+    pub account_removals: crate::machines::offboard::Working,
     closing: AtomicBool,
 }
 
@@ -204,6 +206,7 @@ impl App {
             meter: OnceLock::new(),
             notifier: OnceLock::new(),
             teammate_logins: Default::default(),
+            account_removals: Default::default(),
             closing: AtomicBool::new(false),
         })
     }
