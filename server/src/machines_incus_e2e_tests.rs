@@ -693,7 +693,8 @@ async fn real_incus_host_loss_restores_onto_another_host() {
     let identity = env.backup_identity.as_ref().unwrap().to_string().expose_secret().to_string();
     let (code, out) = json_call(&env, "POST", "/api/machines/hosts/a/recover", &json!({ "identity": identity }).to_string()).await;
     assert_eq!(code, 202, "{out}");
-    assert_eq!((out["to"].as_str(), out["restoring"].as_array().map(Vec::len)), (Some("b"), Some(1)), "{out}");
+    assert_eq!((&out["toHosts"], out["restoring"].as_array().map(Vec::len)), (&json!(["b"]), Some(1)), "{out}");
+    assert_eq!(out["restoring"][0]["toHost"], "b", "{out}");
     let rid = out["restoring"][0]["restore"]["id"].as_str().unwrap().to_string();
     let r = wait(&env, "restored onto b", Duration::from_secs(900), || env.app.db.machine_restore(&rid).filter(|r| !matches!(r.state.as_str(), "importing" | "replacing"))).await;
     assert_eq!(r.state, "enrolling", "{:?}", r.error);
