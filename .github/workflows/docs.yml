@@ -1,19 +1,21 @@
 name: docs
 
-# Links in the security pack (docs/security/) point at ADRs and other docs, so any docs
-# change can break one. Changes to server/, deploy/ and apps/client/ run the same test
-# in the server workflow's `cargo test`.
+# Links in the security pack (docs/security/) point at ADRs, other docs, workflows and
+# config, so a change to any of them can break one. Changes to server/, deploy/ and
+# apps/client/ run the same test in the server workflow's `cargo test`.
 on:
   push:
     paths:
       - 'docs/**'
       - 'server/tests/security_docs_links.rs'
-      - '.github/workflows/docs.yml'
+      - '.github/workflows/**'
+      - '.cargo/**'
   pull_request:
     paths:
       - 'docs/**'
       - 'server/tests/security_docs_links.rs'
-      - '.github/workflows/docs.yml'
+      - '.github/workflows/**'
+      - '.cargo/**'
 
 permissions:
   contents: read

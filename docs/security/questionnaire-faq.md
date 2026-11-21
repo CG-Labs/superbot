@@ -54,7 +54,10 @@ Users are disabled, not deleted, today; their sessions end at once. Teammates wh
 An internal authentication and authorization review found no critical or high issues ([auth review](auth-review-2026-11.md), [SCIM review](auth-review-2026-11-scim.md)). An external penetration test is planned before M3 general availability ([roadmap](../ROADMAP.md)).
 
 **Are you SOC 2 certified?**
-No. No SOC 2 audit has started. A [SOC 2 control mapping](soc2-control-mapping.md) shows, for each Security, Availability and Confidentiality criterion, what the product does, what the operator or customer must do, and the gaps. A readiness checklist is planned for M4 and a Type II audit for M5 ([roadmap](../ROADMAP.md#compliance-path-not-promises)).
+No. No SOC 2 audit has started. A [SOC 2 control mapping](soc2-control-mapping.md) shows, for each Security, Availability and Confidentiality criterion, what the product does, what the operator or customer must do, and the gaps. A [readiness checklist](soc2-readiness-checklist.md) tracks each gap with an owner, the evidence to collect and its status; a Type II audit is planned for M5 ([roadmap](../ROADMAP.md#compliance-path-not-promises)).
+
+**Do you scan dependencies for known vulnerabilities?**
+Yes, in CI: `cargo audit` and `npm audit` run on every lockfile change and weekly. Accepted findings are listed with reasons ([ADR 0092](../adr/0092-dependency-vulnerability-scanning.md)). Container images aren't scanned yet.
 
 **Who is responsible for which controls?**
 It depends on who runs the server. When you self-host, you are the operator: hosting, physical security, backups off the host, alert channels and your own policies are yours. On the managed service, those are the provider's. Either way, you decide who gets access and enforce MFA at your IdP. See [how to read the mapping](soc2-control-mapping.md#how-to-read-it).
