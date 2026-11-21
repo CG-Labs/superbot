@@ -470,7 +470,7 @@ With Docker Compose, `botd` must listen beyond the container's loopback for a sc
 
 ## Status page and SLO alerts
 
-`botd` serves a public status page at `/status` (and `/status.json` for tools), through Caddy like every other path: no Caddyfile change. It shows the API, database, machines and control plane (with managed machines), harness runners and notifications (once set up), each from `botd`'s own checks and its last few minutes of requests and runs, plus incident notes admins post in the console's **Status** tab. It shows no customer data, counts, hostnames or errors. Design: [ADR 0090](../docs/adr/0090-status-page-and-uptime-slo.md); the objectives it serves: [docs/slo.md](../docs/slo.md).
+`botd` serves a public status page at `/status` (and `/status.json` for tools), through Caddy like every other path: no Caddyfile change. It shows the API, database, machines and control plane (with managed machines), harness runners and notifications (once a channel is on), each from `botd`'s own checks and its last few minutes of requests and runs, plus incident notes admins post in the console's **Status** tab. It shows no customer data, counts, hostnames or errors. `/status.json` answers 503 during a major outage, so an uptime probe counts it as down. Design: [ADR 0090](../docs/adr/0090-status-page-and-uptime-slo.md); the objectives it serves: [docs/slo.md](../docs/slo.md).
 
 | Setting in `.env` | Meaning |
 |---|---|

@@ -25,7 +25,7 @@ The page has to be public, so it must be safe to expose: no tenant data, no coun
 
 ### The status page: botd serves it
 
-`GET /status` (HTML) and `GET /status.json` are served by botd on its main port, beside `/healthz`, outside sign-in. Caddy already sends every path it doesn't serve itself to botd, so neither the installer's Caddyfile nor Compose's changes.
+`GET /status` (HTML) and `GET /status.json` are served by botd on its main port, beside `/healthz`, outside sign-in. `/status.json` answers 503 (with the same body) when the overall status is a major outage and 200 otherwise, so an uptime probe that wants a 2xx counts a server that answers but is down as down; `/status`, for people, is always 200. Caddy already sends every path it doesn't serve itself to botd, so neither the installer's Caddyfile nor Compose's changes.
 
 **Why in botd, not a hosted status service.** The components' health comes from botd's own checks and counters, which no outside service can see without a scrape endpoint being opened to it. A hosted page (Statuspage, Instatus, Better Stack) can still be put in front by an operator who wants one off-site: `/status.json` uses the component status names those tools use (`operational`, `degraded_performance`, `partial_outage`, `major_outage`, `under_maintenance`). The cost: if the server is down, so is its page. That's acceptable because the outside probe is what measures uptime and pages on-call, and an operator can publish the probe's results elsewhere.
 
@@ -37,15 +37,15 @@ The page has to be public, so it must be safe to expose: no tenant data, no coun
 | Database | always | `SELECT 1` through the same connection lock as every query: an error is a major outage, slower than 500 ms degraded |
 | Machines and control plane | control plane on | hosts not answering (some: partial outage; all: major outage), the reconciler more than 3 intervals and a minute behind, 10% or more of live machines in error, or open RPO breaches (degraded) |
 | Harness runners | always | the failed share (error or timeout) of the last 15 minutes of finished runs (from 4): 25% degraded, 50% partial outage |
-| Notifications | a notifier set up | the last 15 minutes of `notification.failed` against `notification.sent`: 5 failures and no successes is a partial outage; at least 2 failures and half or more failing, degraded |
+| Notifications | a channel on: email with SMTP set up, the global webhook, or push | the last 15 minutes of `notification.failed` against `notification.sent`: 5 failures and no successes is a partial outage; at least 2 failures and half or more failing, degraded |
 
-"The last minutes" come from a small per-minute window (15 minutes) kept beside ADR 0089's counters and fed by the same calls, so the page reacts to now rather than to totals since the last restart. Stopped, interrupted and policy-ended runs aren't failures. The thresholds are constants in `server/src/status.rs`, tested one by one.
+"The last minutes" come from a small per-minute window (15 minutes) kept beside ADR 0089's counters and fed by the same calls (except requests to `/healthz` and the status pages, so probes can't dilute the API's error share), so the page reacts to now rather than to totals since the last restart. Stopped, interrupted and policy-ended runs aren't failures. The thresholds are constants in `server/src/status.rs`, tested one by one.
 
 ### Incident notes
 
-Admins post incidents in the console's Status tab or at `/api/status/incidents` (`GET`, `POST`; `PATCH` and `DELETE /{id}`; `POST /{id}/updates`). Each has a title, an impact (`none`, `minor`, `major`, `critical`, `maintenance`), the components it affects, and a timeline of updates, each with a state (`investigating`, `identified`, `monitoring`, `resolved`) and a body. They live in SQLite (`status_incidents`, `status_incident_updates`), so they're in the server's backups. Every change is audited (`status.incident_created`, `status.incident_updated`, `status.incident_deleted`).
+Admins post incidents in the console's Status tab or at `/api/status/incidents` (`GET`, `POST`; `PATCH` and `DELETE /{id}`; `POST /{id}/updates`). Each has a title, an impact (`none`, `minor`, `major`, `critical`, `maintenance`), the components it affects, and a timeline of updates, each with a state (`investigating`, `identified`, `monitoring`, `resolved`) and a body. They live in SQLite (`status_incidents`, `status_incident_updates`), so they're in the server's backups. Each incident and its first update, and each update and the state it sets, are written in one transaction. A write that fails answers 500 and isn't audited. Every change is audited (`status.incident_created`, `status.incident_updated`, `status.incident_deleted`).
 
-An open incident raises each component it names to at least its impact (minor: degraded, major: partial outage, critical: major outage, maintenance: under maintenance), and an open incident naming none still sets the overall status. Checks can make things worse than the incident says, never better. Resolved incidents stay on the page for 14 days, up to 20 incidents and 10 updates each.
+An open incident raises each component it names to at least its impact (minor: degraded, major: partial outage, critical: major outage, maintenance: under maintenance), and an open incident naming none still sets the overall status. Every open incident counts, not just those listed. Checks can make things worse than the incident says, never better. Resolved incidents stay on the page for 14 days, up to 20 incidents and 10 updates each.
 
 The routes fall to `Admin` in `rbac::classify` like every unclassified route; Bots and members get 403.
 
