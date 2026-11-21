@@ -3,7 +3,7 @@ import { act, render, screen, userEvent, within } from "@testing-library/react-n
 import { UsersAdmin, matchesUser } from "../UsersAdmin";
 import { ApiError, type SuperBotApi } from "../../src/api";
 import { fetchSsoProviders } from "../../src/sso";
-import type { AdminUser, SignupRequest } from "../../src/types";
+import type { AdminUser, SignupRequest, TeammateAccounts, TeammateRemoval } from "../../src/types";
 
 jest.mock("../BotAvatar", () => ({ BotAvatar: () => null }));
 jest.mock("../../src/sso", () => ({
@@ -88,6 +88,8 @@ function fakeApi(list: AdminUser[], requests: SignupRequest[] = []) {
     revokeUserSessions: jest.fn(async () => ({ revoked: 1 })),
     linkIdentity: jest.fn(async () => ({})),
     unlinkIdentity: jest.fn(async () => {}),
+    teammateAccounts: jest.fn(async (): Promise<TeammateAccounts | null> => null),
+    removeTeammateAccount: jest.fn(async (): Promise<{ removal: TeammateRemoval | null; error?: string }> => ({ removal: null })),
     userBots: jest.fn(async () => ({
       active: true,
       bots: [{ bot: { id: "b1", name: "Scout", color: "#fff", shape: "waddle" }, owner: { id: "operator", name: "Owner" }, visibility: "private", access: "view", grant: "viewer" }],
@@ -197,6 +199,37 @@ describe("UsersAdmin", () => {
 
     await user.press(screen.getByText("Unlink"));
     expect(api.unlinkIdentity).toHaveBeenCalledWith("u1", "i1");
+  });
+
+  it("shows teammates' accounts here and removes one when asked", async () => {
+    const { api, user } = await open([owner, alex]);
+    const bea = { id: "u9", name: "Bea", email: "bea@example.com" };
+    const me = { id: "u1", name: "Alex", email: "alex@example.com" };
+    const held: TeammateRemoval = {
+      id: "c1", ownerId: "u1", userId: "u8", account: "sb-t-2", reason: "disabled", files: "delete", state: "held", attempts: 1,
+      lastError: null, archivedTo: null, purgeAt: Date.UTC(2030, 0, 2), createdAt: 1, doneAt: null, owner: me, teammate: { id: "u8", name: "Cy" },
+    };
+    api.teammateAccounts.mockResolvedValue({
+      userId: "u1",
+      accounts: [{ owner: me, teammate: bea, account: "sb-t-1", wanted: false, removal: null }],
+      removals: [held],
+    });
+    api.removeTeammateAccount.mockResolvedValueOnce({ removal: null, error: "superbot-userctl remove failed" });
+    await user.press(screen.getByLabelText("User Alex"));
+    expect(await screen.findByText("Teammate accounts here")).toBeOnTheScreen();
+    expect(screen.getByText(/no longer has access/)).toBeOnTheScreen();
+    expect(screen.getByText(/Cy · Removed; work held until/)).toBeOnTheScreen();
+    await user.press(screen.getByText("Remove"));
+    expect(mockConfirm).toHaveBeenCalled();
+    expect(api.removeTeammateAccount).toHaveBeenCalledWith("u1", "u9");
+    expect(await screen.findByText("Still pending: superbot-userctl remove failed")).toBeOnTheScreen();
+  });
+
+  it("shows no teammate accounts section when teammates have none here", async () => {
+    const { user } = await open([owner, alex]);
+    await user.press(screen.getByLabelText("User Alex"));
+    expect(await screen.findByText(/^Scout/)).toBeOnTheScreen();
+    expect(screen.queryByText("Teammate accounts here")).toBeNull();
   });
 
   it("shows a failed load with a retry, and still offers sign out", async () => {

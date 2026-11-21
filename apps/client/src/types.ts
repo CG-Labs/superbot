@@ -446,6 +446,39 @@ export interface UserBots {
   }[];
 }
 
+/** A removal of a leaving teammate's account on this server (ADR 0066). */
+export interface TeammateRemoval {
+  id: string;
+  ownerId: string;
+  userId: string;
+  account: string;
+  reason: string;
+  files: "archive" | "delete";
+  state: "pending" | "held" | "done" | "cancelled";
+  attempts: number;
+  lastError: string | null;
+  archivedTo: string | null;
+  purgeAt: number | null;
+  createdAt: number;
+  doneAt: number | null;
+  owner: { id: string; name?: string | null; email?: string | null };
+  teammate: { id: string; name?: string | null; email?: string | null };
+}
+
+/** `/api/users/{id}/teammate-accounts`: teammates' own accounts for the user's shared Bots here, and the user's for others' (ADR 0064, 0066). */
+export interface TeammateAccounts {
+  userId: string;
+  accounts: {
+    owner: { id: string; name?: string | null; email?: string | null };
+    teammate: { id: string; name?: string | null; email?: string | null };
+    account: string;
+    /** They still may use the owner's Bots. */
+    wanted: boolean;
+    removal: TeammateRemoval | null;
+  }[];
+  removals: TeammateRemoval[];
+}
+
 /** One row of `/api/audit` (ADR 0009, 0019). Admins only. Actor fields are null on rows from before ADR 0019. */
 export interface AuditEvent {
   id: number;
