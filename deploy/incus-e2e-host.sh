@@ -9,7 +9,8 @@
 # It writes <out-dir>/incus-e2e.env with the settings the test reads, and botd's
 # certificate and key beside it, owned by the user who ran sudo.
 #
-# INCUS_SOURCE: zabbly (default, the current stable release) or ubuntu (the distro's).
+# INCUS_SOURCE: zabbly (default, the current stable release), zabbly-lts-6.0 (or another
+# Zabbly LTS channel), or ubuntu (the distro's; 24.04's 6.0.0 is too old for botd).
 # POOL_DRIVER: btrfs (default, on a loop file; it enforces disk sizes) or dir.
 set -euo pipefail
 
@@ -36,17 +37,19 @@ install_incus() {
   fi
   export DEBIAN_FRONTEND=noninteractive
   case $source_ in
-    zabbly)
-      say "Installing Incus from the Zabbly stable repository"
+    zabbly | zabbly-lts-*)
+      channel=stable
+      [[ $source_ == zabbly-lts-* ]] && channel=${source_#zabbly-}
+      say "Installing Incus from the Zabbly $channel repository"
       mkdir -p /etc/apt/keyrings
       curl -fsSL https://pkgs.zabbly.com/key.asc -o /etc/apt/keyrings/zabbly.asc
       # shellcheck source=/dev/null
       codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
-      echo "deb [signed-by=/etc/apt/keyrings/zabbly.asc] https://pkgs.zabbly.com/incus/stable $codename main" \
-        >/etc/apt/sources.list.d/zabbly-incus-stable.list
+      echo "deb [signed-by=/etc/apt/keyrings/zabbly.asc] https://pkgs.zabbly.com/incus/$channel $codename main" \
+        >"/etc/apt/sources.list.d/zabbly-incus-$channel.list"
       ;;
     ubuntu) say "Installing Incus from Ubuntu's archive" ;;
-    *) echo "INCUS_SOURCE must be zabbly or ubuntu" >&2; exit 1 ;;
+    *) echo "INCUS_SOURCE must be zabbly, zabbly-lts-<version> or ubuntu" >&2; exit 1 ;;
   esac
   apt-get update -qq
   apt-get install -y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \

@@ -538,6 +538,13 @@ async fn only_the_pinned_host_and_a_trusted_certificate() {
     let checks = ok.preflight().await.unwrap();
     assert!(checks.iter().all(|c| c["ok"] == true), "{checks:?}");
 
+    // An Incus too old for ACLs on a bridged NIC, such as Ubuntu 24.04's 6.0.0, is named.
+    s.w().missing_extensions = vec!["network_bridge_acl_devices".into()];
+    let checks = ok.preflight().await.unwrap();
+    assert_eq!(checks[0]["ok"], false);
+    assert!(checks[0]["detail"].as_str().unwrap().contains("lacks API extensions: network_bridge_acl_devices"), "{checks:?}");
+    s.w().missing_extensions.clear();
+
     // Another server certificate: botd won't talk to it.
     let (other, _) = self_signed("incus.test");
     let mut c = s.credentials();

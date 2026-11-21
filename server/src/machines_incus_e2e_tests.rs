@@ -246,6 +246,13 @@ async fn real_incus_containers_enroll_stay_apart_and_follow_the_lifecycle() {
     let (code, s) = json_call(&env, "GET", "/api/machines/substrate?check=true", "").await;
     assert_eq!(code, 200, "{s}");
     let checks = s["checks"].as_array().unwrap().clone();
+    if std::env::var("SUPERBOT_INCUS_E2E_EXPECT").as_deref() == Ok("too-old") {
+        // Such as Ubuntu 24.04's own Incus 6.0.0, which refuses ACLs on a bridged NIC.
+        assert_eq!(checks[0]["ok"], false, "{checks:?}");
+        assert!(checks[0]["detail"].as_str().unwrap().contains("network_bridge_acl_devices"), "{checks:?}");
+        env.say(&format!("preflight refuses this Incus: {}", checks[0]["detail"]));
+        return;
+    }
     let pool = env.incus.raw(Method::GET, "/1.0/storage-pools/default", None, 10).await.unwrap();
     for c in &checks {
         let dir = c["check"] == "storage pool" && pool["driver"] == "dir";

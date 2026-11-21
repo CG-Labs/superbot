@@ -71,6 +71,8 @@ pub struct World {
     /// The next this many instance PUTs and PATCHes find that another client changed
     /// the instance (`user.other-client`) since it was read.
     pub races: usize,
+    /// API extensions this Incus lacks, as an older release would.
+    pub missing_extensions: Vec<String>,
     ops: BTreeMap<String, Op>,
     trusted: Vec<String>,
     next_ip: u8,
@@ -248,6 +250,13 @@ fn reply(status: StatusCode, v: Value, etag: Option<String>) -> Response {
         r.headers_mut().insert("etag", e.parse().unwrap());
     }
     r
+}
+
+fn extensions(missing: &[String]) -> Vec<&'static str> {
+    ["network_acl", "network_bridge_acl_devices", "instances_rebuild", "instance_create_start", "instance_get_full"]
+        .into_iter()
+        .filter(|x| !missing.iter().any(|m| m == x))
+        .collect()
 }
 
 fn sync(meta: Value) -> Response {
@@ -467,7 +476,7 @@ async fn handle(
     match (method.as_str(), &parts[..]) {
         ("GET", ["1.0"]) => sync(json!({
             "auth": "trusted",
-            "api_extensions": ["network_acl", "instances_rebuild", "instance_create_start", "instance_get_full"],
+            "api_extensions": extensions(&w.missing_extensions),
             "environment": { "server_version": "6.0-standin" },
         })),
         ("GET", ["1.0", "projects", p]) => match w.projects.get(*p) {

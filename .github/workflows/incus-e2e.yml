@@ -45,8 +45,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # zabbly: the current stable release. ubuntu: Ubuntu 24.04's own package (6.0 LTS).
-        incus: [zabbly, ubuntu]
+        # zabbly: the current stable release. zabbly-lts-6.0: the oldest LTS botd supports.
+        # ubuntu: Ubuntu 24.04's own 6.0.0, too old for ACLs on a bridged NIC, so the test
+        # checks that botd's preflight says so.
+        include:
+          - incus: zabbly
+          - incus: zabbly-lts-6.0
+          - incus: ubuntu
+            expect: too-old
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -62,6 +68,8 @@ jobs:
       - name: Make the runner an Incus host
         run: sudo SUPERBOT_INCUS_E2E_THROWAWAY=1 INCUS_SOURCE=${{ matrix.incus }} deploy/incus-e2e-host.sh "$RUNNER_TEMP/incus-e2e"
       - name: Containers enroll, stay apart, and follow the lifecycle
+        env:
+          SUPERBOT_INCUS_E2E_EXPECT: ${{ matrix.expect }}
         run: |
           set -euo pipefail
           set -a; . "$RUNNER_TEMP/incus-e2e/incus-e2e.env"; set +a
