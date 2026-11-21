@@ -84,7 +84,8 @@ fn metrics_are_off_by_default_and_need_a_token_off_loopback() {
 fn bots_never_get_the_metrics_token() {
     assert!(secrets::server_secret("METRICS_TOKEN"));
     let withheld = adapters::secret_env();
-    assert!(withheld.iter().any(|k| k == "METRICS_TOKEN") && withheld.iter().any(|k| k == "METRICS_TOKEN_FILE"), "{withheld:?}");
+    assert!(withheld.iter().any(|k| k == "METRICS_TOKEN"));
+    assert!(withheld.iter().any(|k| k == "METRICS_TOKEN_FILE"));
 }
 
 #[tokio::test]
