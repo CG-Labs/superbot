@@ -1,7 +1,7 @@
 //! Runs Bots: one task at a time per Bot, in order. Builds the system prompt
 //! (identity, rules, memory), streams harness events to the web app, and saves replies.
 
-use crate::accounts::{self, Isolation, RunAs};
+use crate::accounts::{self, Isolation, RunAs, Space};
 use crate::acl::{Access, SharedBots, Viewer, Visibility};
 use crate::adapters::{self, AbortReason, AgentEvent, Guard, RunInput, Sandbox, Usage};
 use crate::audit::{Actor, ActorKind, Event, Outcome, Who};
@@ -175,6 +175,8 @@ pub struct App {
     pub meter: OnceLock<Arc<crate::billing::Meter>>,
     /// Email and webhook notices for pending approvals (ADR 0061). Unset: none.
     pub notifier: OnceLock<Arc<crate::notify::Notifier>>,
+    /// Teammates' own harness logins for owners' shared Bots here (ADR 0064).
+    pub teammate_logins: crate::teammate_logins::Local,
     closing: AtomicBool,
 }
 
@@ -201,6 +203,7 @@ impl App {
             resume_routines_on_enable: OnceLock::new(),
             meter: OnceLock::new(),
             notifier: OnceLock::new(),
+            teammate_logins: Default::default(),
             closing: AtomicBool::new(false),
         })
     }
@@ -282,6 +285,11 @@ impl App {
 
     /// Where a Bot's runs go now, as anyone who can see it may know (ADR 0046): `server`,
     /// `machine` (its owner's) or `nowhere`. None while routing is off: always here.
+    /// Whether `owner_id`'s Bots run on this server: no machines, or routing says here.
+    pub fn runs_here(&self, owner_id: &str) -> bool {
+        self.control_plane.get().is_none_or(|cp| matches!(cp.route(&self.db, owner_id), Ok(Target::Local)))
+    }
+
     pub fn runs_on(&self, bot: &Bot) -> Option<&'static str> {
         let cp = self.control_plane.get().filter(|cp| cp.routing != route::Routing::Off)?;
         Some(match cp.route(&self.db, &bot.owner_id) {
@@ -350,13 +358,18 @@ impl App {
             "owner": self.db.user(&b.owner_id).map(|u| json!({ "id": u.id, "name": u.name })),
             "visibility": b.visibility, "prompts": b.prompts,
         });
+        let has_login = crate::machines::logins::recipe(&b.harness).is_some();
         if let Some(on) = self.runs_on(b) {
             v["runsOn"] = json!(on);
             // Teammates log in with their own account on the owner's machine (ADR 0062).
             let teammates_log_in = self.control_plane.get().and_then(|cp| cp.enrollment.as_ref()).is_some_and(|e| e.logins && e.teammate_users);
-            if on == "machine" && teammates_log_in && crate::machines::logins::recipe(&b.harness).is_some() {
+            if on == "machine" && teammates_log_in && has_login {
                 v["teammateLogins"] = json!(true);
             }
+        }
+        // And with their own account on this server (ADR 0064).
+        if has_login && crate::teammate_logins::on(self, &b.owner_id) {
+            v["teammateLogins"] = json!(true);
         }
         if self.shared_bots() == SharedBots::Isolated {
             v["sharedBots"] = json!(SharedBots::Isolated);
@@ -547,28 +560,49 @@ impl App {
     /// Makes sure the user's account and folders exist (ADR 0037). A new account and a
     /// failure are audited, as done by `by`.
     pub async fn ensure_account(&self, user_id: &str, by: &Who) -> Result<RunAs, String> {
+        self.ensure_space(Space::User(user_id), by).await
+    }
+
+    /// `ensure_account` for any space: a user's own, or a teammate's for one owner's
+    /// shared Bots (ADR 0064). Audited against the owner, with `forUser` for a teammate's.
+    pub async fn ensure_space(&self, space: Space<'_>, by: &Who) -> Result<RunAs, String> {
         let iso = self.isolation.get().cloned().ok_or("Per-user accounts are off (ISOLATION=users turns them on).")?;
-        let run_as = iso.run_as(user_id).ok_or_else(|| format!("User id {user_id:?} can't be part of a Unix account name."))?;
-        let id = user_id.to_string();
+        let run_as = iso.run_as_in(space).ok_or_else(|| format!("{space:?} can't be part of a Unix account name."))?;
+        let (owner, teammate) = match space {
+            Space::User(u) => (u.to_string(), None),
+            Space::Teammate { owner, teammate } => (owner.to_string(), Some(teammate.to_string())),
+        };
         let made = tokio::task::spawn_blocking({
-            let iso = iso.clone();
-            move || iso.ensure(&id)
+            let (iso, owner, teammate) = (iso.clone(), owner.clone(), teammate.clone());
+            move || iso.ensure_in(Space::of(&owner, teammate.as_deref()))
         })
         .await
         .unwrap_or_else(|e| Err(e.to_string()));
-        let event = |action: &str| by.event(action).target("user", user_id);
+        let event = |action: &str| by.event(action).target("user", &owner);
+        let mut details = json!({ "account": run_as.account });
+        if let Some(t) = &teammate {
+            details["forUser"] = json!(t);
+        }
         match made {
             Ok(false) => Ok(run_as),
             Ok(true) => {
-                self.db.record(&event("isolation.account_created").details(json!({ "account": run_as.account, "home": iso.home(user_id) })));
+                details["home"] = json!(iso.home_in(space));
+                self.db.record(&event("isolation.account_created").details(details));
                 Ok(run_as)
             }
             Err(e) => {
                 eprintln!("Isolation: couldn't set up a user's account (see isolation.account_failed in the audit log): {e}");
-                self.db.record(&event("isolation.account_failed").outcome(Outcome::Failure).details(json!({ "account": run_as.account, "error": e })));
+                details["error"] = json!(e);
+                self.db.record(&event("isolation.account_failed").outcome(Outcome::Failure).details(details));
                 Err(e)
             }
         }
+    }
+
+    /// Whether a teammate's run of a shared Bot here uses an account of its own
+    /// (`ISOLATION_TEAMMATES`, ADR 0064).
+    pub fn teammate_accounts(&self) -> bool {
+        self.shared_bots() == SharedBots::Isolated && self.isolation().is_some_and(|i| i.teammates)
     }
 
     /// Where a Bot's run happens and what it gets: its owner's working folder, and
@@ -692,9 +726,12 @@ impl App {
         let Some((tier, route)) = self.tier_route(&bot, msg, &by, &period) else { return };
         let placed_at = self.db.placed_at(&bot.owner_id);
         let Some(place) = self.place(&bot, msg, &by, &period.key, bin, for_other.as_deref()).await else { return };
+        // A teammate's run here gets an account of its own (ADR 0064), never the owner's.
+        let teammate = for_other.as_deref().filter(|_| matches!(place, Place::Here) && self.teammate_accounts());
+        let run_space = Space::of(&bot.owner_id, teammate);
         // The owner's own machine runs only their Bots, so only runs here need their account.
         let run_as = match place {
-            Place::Here => match self.isolate(&bot, msg, &by, &period.key).await {
+            Place::Here => match self.isolate(&bot, msg, &by, &period.key, teammate).await {
                 Ok(r) => r,
                 Err(()) => return,
             },
@@ -702,13 +739,16 @@ impl App {
         };
         let mut spot = self.spot(&bot, bot_dir.clone(), space, place, for_other.as_deref());
         spot.for_other = for_other.clone();
-        // With per-user accounts the harness keeps its state in its owner's folder, and
+        // With per-user accounts the harness keeps its state in its account's folder, and
         // reads botd's files from one it can't change (`isolate` made both).
         if run_as.is_some()
             && let Some(iso) = self.isolation()
-            && let (Some(state), Some(settings)) = (iso.bot_state(&bot.owner_id, &bot.id), iso.bot_settings(&bot.owner_id, &bot.id))
+            && let (Some(state), Some(settings)) = (iso.bot_state_in(run_space, &bot.id), iso.bot_settings_in(run_space, &bot.id))
         {
             (spot.state_dir, spot.config_dir) = (state, settings);
+        }
+        if let (Some(u), Some(iso)) = (teammate, self.isolation()) {
+            self.in_teammate_space(&mut spot, iso, &bot, u);
         }
         if self.hooks_refused(&bot, msg, &by, &period.key, &spot, run_as.as_ref()).await {
             return;
@@ -717,7 +757,7 @@ impl App {
         // `superbot-run` for a per-user account, which botd can't make folders for.
         if spot.machine.is_none() {
             spot.home = match &run_as {
-                Some(_) => self.isolation().and_then(|i| i.home(&bot.owner_id)),
+                Some(_) => self.isolation().and_then(|i| i.home_in(run_space)),
                 None => self.cfg.home.clone(),
             };
             if self.db.effective_policy(&bot.id).sandbox && has_sandbox {
@@ -797,6 +837,10 @@ impl App {
                 }
             });
 
+            // Made fresh from botd's for each teammate's run; kept back after it.
+            if teammate.is_some() {
+                self.seed_teammate_memory(&bot, &spot.memory);
+            }
             let mut env = spot.env.clone();
             env.insert("SUPERBOT_RUN_ID".into(), run_id.clone());
             if spot.screens
@@ -882,7 +926,10 @@ impl App {
             match &spot.machine {
                 None => {
                     adapters::run(adapter, input, abort_rx.clone(), emit).await;
-                    self.keep_memory(&bot);
+                    match teammate {
+                        Some(_) => self.keep_teammate_memory(&bot, &spot.memory),
+                        None => self.keep_memory(&bot),
+                    }
                 }
                 Some(to) => self.run_there(&bot, msg, &spot, to, adapter, input, abort_rx.clone(), emit).await,
             }
@@ -1301,35 +1348,97 @@ impl App {
         }
     }
 
-    /// With per-user accounts (ADR 0037): the account this run starts as, always its
-    /// owner's, made now if it's new. Ok(None): isolation is off. Err: refused, and the
-    /// Bot said why; it never falls back to running as botd's account.
-    async fn isolate(&self, bot: &Bot, msg: &Message, by: &Who, period: &str) -> Result<Option<RunAs>, ()> {
-        if self.isolation().is_none() {
-            return Ok(None);
-        }
-        let refused = |reason: &str, text: &str| {
+    /// With per-user accounts (ADR 0037): the account this run starts as, its owner's,
+    /// or for `teammate` under `ISOLATION_TEAMMATES` that teammate's for the owner's Bots
+    /// (ADR 0064), made now if it's new. A teammate's run needs their own harness login
+    /// there, or a server-wide key: it never falls back to the owner's. Ok(None):
+    /// isolation is off. Err: refused, and the Bot said why; it never falls back to
+    /// running as botd's account.
+    async fn isolate(&self, bot: &Bot, msg: &Message, by: &Who, period: &str, teammate: Option<&str>) -> Result<Option<RunAs>, ()> {
+        let Some(iso) = self.isolation.get().cloned() else { return Ok(None) };
+        let space = Space::of(&bot.owner_id, teammate);
+        let refused = |reason: &str, text: &str, more: Value| {
             self.give_back(bot, msg, period);
             let e = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied);
-            let account = accounts::account(&bot.owner_id);
-            self.db.record(&e.details(json!({ "reason": reason, "owner": bot.owner_id, "account": account, "harness": bot.harness, "messageId": msg.id })));
+            let mut details = json!({ "reason": reason, "owner": bot.owner_id, "account": space.account(), "harness": bot.harness, "messageId": msg.id });
+            if let Some(u) = teammate {
+                details["forUser"] = json!(u);
+            }
+            merge(&mut details, &more);
+            self.db.record(&e.details(details));
             self.say(&bot.id, text, true);
             Err(())
         };
         if !accounts::HARNESSES.contains(&bot.harness.as_str()) {
             let text = format!("This server runs each person's Bots under their own account, and {} can't run that way. Switch me to another harness in my settings.", bot.harness);
-            return refused("isolation_harness", &text);
+            return refused("isolation_harness", &text, json!({}));
         }
-        let Ok(run_as) = self.ensure_account(&bot.owner_id, by).await else {
-            return refused("no_account", "I couldn't set up my owner's account on this server, so I didn't run. An admin can check the server log.");
+        let whose = if teammate.is_some() { "an account for you" } else { "my owner's account" };
+        let Ok(run_as) = self.ensure_space(space, by).await else {
+            return refused("no_account", &format!("I couldn't set up {whose} on this server, so I didn't run. An admin can check the server log."), json!({}));
         };
-        if let Some(iso) = self.isolation()
-            && let Err(e) = iso.make_bot_dirs(&bot.owner_id, &bot.id)
+        if let Err(e) = iso.make_bot_dirs_in(space, &bot.id) {
+            eprintln!("Isolation: couldn't make a Bot's folders in its account's folder: {e}");
+            return refused("no_account", &format!("I couldn't set up my folders in {whose} on this server, so I didn't run. An admin can check the server log."), json!({}));
+        }
+        if teammate.is_some()
+            && let Some(login) = crate::machines::logins::teammate_login_needed(&bot.harness)
         {
-            eprintln!("Isolation: couldn't make a Bot's folders in its owner's folder: {e}");
-            return refused("no_account", "I couldn't set up my folders in my owner's account on this server, so I didn't run. An admin can check the server log.");
+            let home = iso.home_in(space).unwrap_or_default();
+            let files: Vec<String> = login.files.iter().map(|f| f.to_string()).collect();
+            let r = run_as.clone();
+            let since = tokio::task::spawn_blocking(move || r.login_since(&home, &files)).await.unwrap_or_else(|e| Err(e.to_string()));
+            if !matches!(since, Ok(Some(_))) {
+                let owner = self.db.user(&bot.owner_id).map(|u| u.name).unwrap_or_else(|| "its owner".into());
+                let h = adapters::get(&bot.harness).map_or(bot.harness.clone(), |a| a.bin().to_string());
+                let text = format!(
+                    "I didn't run: {h} isn't logged in for you on this server for {owner}'s Bots. Runs for teammates use their own login, never {owner}'s. \
+                     Log in from my details in the app, or an admin can save a server-wide key."
+                );
+                return refused("teammate_not_logged_in", &text, json!({ "detail": since.err() }));
+            }
         }
         Ok(Some(run_as))
+    }
+
+    /// A teammate's run here (ADR 0064) works in their account's folders for the owner's
+    /// Bots: its own workspace, HOME and memory copy, with a token bound to them.
+    fn in_teammate_space(&self, spot: &mut Spot, iso: &Isolation, bot: &Bot, teammate: &str) {
+        let space = Space::Teammate { owner: &bot.owner_id, teammate };
+        let (Some(ws), Some(home), Some(mem), Some(dir)) = (iso.workspace_in(space), iso.home_in(space), iso.memory_file_in(space, &bot.id), iso.memory_dir_in(space)) else {
+            return;
+        };
+        spot.ctx = Some(Ctx { workspace: ws.clone(), home: home.clone(), readable: true });
+        (spot.cwd, spot.home, spot.memory, spot.user_file) = (ws, Some(home), mem, dir.join("USER.md"));
+        let token = isolation::bot_token_for(&self.cfg.bot_key, &bot.id, &bot.owner_id, teammate);
+        crate::secrets::redact::register(&token);
+        spot.env.insert("BOT_TOKEN".into(), token);
+    }
+
+    /// The memory copy a teammate's run edits, made fresh from botd's (ADR 0064). The
+    /// owner's account never sees it.
+    fn seed_teammate_memory(&self, bot: &Bot, copy: &Path) {
+        accounts::remove(copy);
+        if let Some(text) = self.data_memory_file(&bot.id).and_then(|p| std::fs::read_to_string(p).ok()) {
+            let _ = accounts::seed(copy, &text);
+        }
+    }
+
+    /// What a teammate's run left in its memory copy goes back to botd's, if the Bot is
+    /// still its owner's. The owner's own copy is then dropped, so their next run starts
+    /// from it, and the teammate's copy goes.
+    fn keep_teammate_memory(&self, bot: &Bot, copy: &Path) {
+        let still = self.db.bot(&bot.id).is_some_and(|now| now.owner_id == bot.owner_id);
+        if still
+            && let (Some(text), Some(to)) = (accounts::read_plain(copy, accounts::MAX_FILE), self.data_memory_file(&bot.id))
+            && std::fs::read_to_string(&to).ok().as_deref() != Some(text.as_str())
+        {
+            let _ = std::fs::write(&to, text);
+            if let Some(own) = self.isolation().and_then(|i| i.memory_file(&bot.owner_id, &bot.id)) {
+                accounts::remove(&own);
+            }
+        }
+        accounts::remove(copy);
     }
 
     /// The tier this run is on and the route it takes: the Bot owner's tier picks the
@@ -1650,7 +1759,7 @@ impl App {
     fn system_prompt_at(&self, bot: &Bot, spot: &Spot) -> String {
         let read = |p: &Option<PathBuf>| p.as_deref().and_then(|p| self.read_memory(p)).unwrap_or_default().trim().to_string();
         let (mem_file, user_file) = match spot.machine {
-            None => (self.memory_file(bot), self.user_file(&bot.owner_id)),
+            None => (Some(spot.memory.clone()), Some(spot.user_file.clone())),
             Some(_) => (self.data_memory_file(&bot.id), self.data_user_file(&bot.owner_id)),
         };
         // Only the Bots its owner can see (ADR 0017), and that whoever it runs for can (ADR 0046).
@@ -1977,7 +2086,7 @@ mod tests {
         let app = test_app();
         let bot = app.db.create_bot("A", "#fff", "waddle", "pi", None, true);
         let msg = app.db.add_message(&bot.id, "user", "hi", None, false, Some("queued"));
-        assert_eq!(app.isolate(&bot, &msg, &Who::system("test"), "2026-11").await, Ok(None));
+        assert_eq!(app.isolate(&bot, &msg, &Who::system("test"), "2026-11", None).await, Ok(None));
         app.init_bot_files(&bot);
         assert_eq!(app.memory_file(&bot), app.data_memory_file(&bot.id));
         assert_eq!(app.user_file(&bot.owner_id), app.data_user_file(&bot.owner_id));
@@ -2101,7 +2210,7 @@ mod tests {
         // A harness botd doesn't know never runs as botd instead.
         let bot = app.db.create_bot("X", "#fff", "waddle", "aider", None, true);
         let msg = app.db.add_message(&bot.id, "user", "hi", None, false, Some("queued"));
-        assert_eq!(app.isolate(&bot, &msg, &who, "2026-11").await, Err(()));
+        assert_eq!(app.isolate(&bot, &msg, &who, "2026-11", None).await, Err(()));
         let last = app.db.messages(&bot.id, 1).pop().unwrap();
         assert!(last.error && last.text.contains("another harness"), "{}", last.text);
         assert_eq!(actions(&app, "bot.run_refused")[0].details["reason"], "isolation_harness");
@@ -2111,7 +2220,7 @@ mod tests {
         for harness in crate::accounts::HARNESSES {
             let bot = app.db.create_bot("C", "#fff", "waddle", harness, None, true);
             let msg = app.db.add_message(&bot.id, "user", "hi", None, false, Some("queued"));
-            assert_eq!(app.isolate(&bot, &msg, &who, "2026-11").await, Err(()), "{harness}");
+            assert_eq!(app.isolate(&bot, &msg, &who, "2026-11", None).await, Err(()), "{harness}");
             let refused = actions(&app, "bot.run_refused");
             assert_eq!(refused.last().unwrap().details["reason"], "no_account", "{harness}");
             assert_eq!(refused.last().unwrap().details["account"], format!("sb-u-{}", bot.owner_id));

@@ -367,7 +367,7 @@ mod tests {
         let script = format!("#!/bin/sh\nprintf '%s\\n' \"$@\" \"PATH=$SUPERBOT_PATH\" \"PWD=$(pwd)\" > '{}'\necho 'codex-cli 0.150.0'\n", seen.display());
         std::fs::write(&fake, script).unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let r = RunAs { sudo, runner: "/opt/superbot/bin/superbot-run".into(), account: "sb-u-u1".into(), settings: dir.join("settings") };
+        let r = RunAs { sudo, runner: "/opt/superbot/bin/superbot-run".into(), account: "sb-u-u1".into(), settings: dir.join("settings"), teammate: None };
         let real = dir.join("codex");
         assert_eq!(read_here(&real, ":/usr/bin", &dir, Some(&r)).await.as_deref(), Ok("codex-cli 0.150.0\n"));
         let seen = std::fs::read_to_string(&seen).unwrap();

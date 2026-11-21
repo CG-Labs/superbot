@@ -335,7 +335,7 @@ async fn as_root_bots_get_their_own_os_user_and_cant_reach_the_agents_files() {
         ("USER".to_string(), USER.to_string()),
     ]);
     let run = terminal::Command {
-        bin: "claude",
+        bin: "claude".into(),
         args: vec![],
     };
     let (mut rx, _stop) = m

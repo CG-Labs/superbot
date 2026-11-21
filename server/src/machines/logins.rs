@@ -96,6 +96,12 @@ pub fn cred_query() -> Vec<String> {
 
 /// Whether runs get one of the login's keys, so they need no login: the server-wide
 /// ones, and `owner`'s own if given (a run for someone else gets none, ADR 0046).
+/// The login a teammate's own run of `bin` needs: its recipe, unless the harness has
+/// none or a server-wide key makes one unneeded (ADR 0062, ADR 0064).
+pub fn teammate_login_needed(bin: &str) -> Option<MachineLogin> {
+    recipe(bin).filter(|r| !keyed(None, r))
+}
+
 fn keyed(owner: Option<&str>, r: &MachineLogin) -> bool {
     let s = crate::secrets::global();
     owner
@@ -614,16 +620,22 @@ pub async fn my_logout(
 
 /// The machine's owner, if the caller is their teammate there: a person (never a Bot),
 /// not the owner, who can still run one of the owner's Bots, while their runs there go
-/// as their own user. Anyone else learns nothing, not even whether the owner exists.
+/// as their own user, or here as their own account (ADR 0064). Anyone else learns
+/// nothing, not even whether the owner exists.
 fn teammate_of(app: &App, c: &Caller, owner_id: &str) -> Res<(User, String)> {
     let me = me(c)?;
     let hidden = || crate::not_found("Machine");
     let owner = app.db.user(owner_id).ok_or_else(hidden)?;
-    let on = app.control_plane.get().is_some_and(|cp| cp.teammate_users());
+    let on = app.control_plane.get().is_some_and(|cp| cp.teammate_users()) || here(app, &owner.id);
     if !on || !super::offboard::wanted(app, &owner.id, &me.id) {
         return Err(hidden());
     }
     Ok((owner, me.id))
+}
+
+/// The owner's Bots run on this server, where teammates have their own accounts.
+fn here(app: &App, owner_id: &str) -> bool {
+    crate::teammate_logins::on(app, owner_id)
 }
 
 /// `POST /api/machine/teammate/{owner}/harness-login` `{harness}`: a stream of `LoginEvent`s.
@@ -635,6 +647,9 @@ pub async fn teammate_start(
     Json(b): Json<StartBody>,
 ) -> Res<Response> {
     let (u, me) = teammate_of(&app, &c, &owner)?;
+    if here(&app, &u.id) {
+        return crate::teammate_logins::start(app, by, u, me, b.harness).await;
+    }
     start(app, by, u, Some(me), b.harness).await
 }
 
@@ -647,6 +662,9 @@ pub async fn teammate_input(
     Json(b): Json<InputBody>,
 ) -> Res<StatusCode> {
     let (u, me) = teammate_of(&app, &c, &owner)?;
+    if here(&app, &u.id) {
+        return crate::teammate_logins::input(app, by, u, me, id, b.text).await;
+    }
     input(app, by, u, Some(me), id, b.text).await
 }
 
@@ -658,6 +676,9 @@ pub async fn teammate_abort(
     Path((owner, id)): Path<(String, String)>,
 ) -> Res<StatusCode> {
     let (u, me) = teammate_of(&app, &c, &owner)?;
+    if here(&app, &u.id) {
+        return crate::teammate_logins::abort(app, by, u, me, id).await;
+    }
     abort(app, by, u, Some(me), id).await
 }
 
@@ -665,6 +686,9 @@ pub async fn teammate_abort(
 /// for the caller there.
 pub async fn teammate_status(AppS(app): AppS<AppState>, Extension(c): Extension<Caller>, Path(owner): Path<String>) -> Res {
     let (u, me) = teammate_of(&app, &c, &owner)?;
+    if here(&app, &u.id) {
+        return crate::teammate_logins::status(app, u, me).await;
+    }
     status(app, u, Some(me)).await
 }
 
@@ -677,11 +701,15 @@ pub async fn teammate_logout(
     Path((owner, harness)): Path<(String, String)>,
 ) -> Res {
     let (u, me) = teammate_of(&app, &c, &owner)?;
+    if here(&app, &u.id) {
+        return crate::teammate_logins::logout(app, by, u, me, harness).await;
+    }
     logout(app, by, u, Some(me), harness).await
 }
 
 // For admins, under `/api/users/{key}/machine/teammates/{teammate}`: see and log out a
-// teammate's logins. Only the teammate logs in as themselves.
+// teammate's logins. Only the teammate logs in as themselves from the app; on this
+// server an admin can also run it at the terminal (`botctl user harness-login --owner`).
 
 fn admin_teammate(app: &AppState, key: &str, teammate: &str) -> Res<(User, String)> {
     let u = need_user_key(app, key)?;
@@ -695,6 +723,9 @@ fn admin_teammate(app: &AppState, key: &str, teammate: &str) -> Res<(User, Strin
 /// `GET /api/users/{key}/machine/teammates/{teammate}/harness-logins`.
 pub async fn admin_teammate_status(AppS(app): AppS<AppState>, Path((key, teammate)): Path<(String, String)>) -> Res {
     let (u, t) = admin_teammate(&app, &key, &teammate)?;
+    if here(&app, &u.id) {
+        return crate::teammate_logins::status(app, u, t).await;
+    }
     status(app, u, Some(t)).await
 }
 
@@ -705,6 +736,9 @@ pub async fn admin_teammate_logout(
     Path((key, teammate, harness)): Path<(String, String, String)>,
 ) -> Res {
     let (u, t) = admin_teammate(&app, &key, &teammate)?;
+    if here(&app, &u.id) {
+        return crate::teammate_logins::logout(app, by, u, t, harness).await;
+    }
     logout(app, by, u, Some(t), harness).await
 }
 
