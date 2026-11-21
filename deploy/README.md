@@ -532,7 +532,7 @@ botd now has users, roles, and sessions ([ADR 0012](../docs/adr/0012-users-sessi
 
 ## Docker Compose (supported)
 
-`botd` + Caddy (automatic HTTPS) + a daily backup job, from [`deploy/docker/`](docker/). Needs Docker Engine with the Compose v2 plugin. Design: [ADR 0006](../docs/adr/0006-docker-compose.md).
+`botd` + Caddy (automatic HTTPS) + a daily backup job, from [`deploy/docker/`](docker/). Needs Docker Engine with the Compose v2 plugin, on amd64 or arm64. Compose pulls the published images, `ghcr.io/cg-labs/superbot` and `ghcr.io/cg-labs/superbot-caddy`, or [builds them from the checkout](#build-from-source). Design: [ADR 0006](../docs/adr/0006-docker-compose.md), [ADR 0084](../docs/adr/0084-published-image-with-computer-use.md).
 
 ### Quick start
 
@@ -540,7 +540,7 @@ botd now has users, roles, and sessions ([ADR 0012](../docs/adr/0012-users-sessi
 git clone https://github.com/CG-Labs/superbot.git
 cd superbot/deploy/docker
 ./init.sh --domain bots.example.com --tz Europe/Jersey --user-name "Alex"
-docker compose up -d --build
+docker compose up -d
 docker compose logs -f botd
 ```
 
@@ -550,8 +550,8 @@ Without a domain, `./init.sh` gives plain HTTP at `http://localhost`, published 
 
 | Service | Role |
 |---------|------|
-| `botd` | Server, web app, harness CLIs. Runs as uid `10001`, port 3000 not published. Only the capabilities `sudo` needs to start [each user's runs as their own account](#per-user-accounts-in-docker). |
-| `caddy` | `caddy:2` plus the [web client](#web-client) and [landing page](#landing-page-and-sign-ups), built from this checkout (`Dockerfile` target `caddy`). Publishes 80/443 on `SUPERBOT_BIND`, serves the landing page at `/` and the client at `/app/`, proxies everything else to `botd` (SSE unbuffered). |
+| `botd` | Server, web app, harness CLIs, and the Bots' [screens and browser](#screens-and-computer-use-in-docker). Runs as uid `10001`, port 3000 not published. Only the capabilities `sudo` needs to start [each user's runs as their own account](#per-user-accounts-in-docker). |
+| `caddy` | `caddy:2` plus the [web client](#web-client) and [landing page](#landing-page-and-sign-ups) (`Dockerfile` target `caddy`, published as `superbot-caddy`). Publishes 80/443 on `SUPERBOT_BIND`, serves the landing page at `/` and the client at `/app/`, Bots' screens at `/screen/<port>/`, and proxies everything else to `botd` (SSE unbuffered). |
 | `backup` | Archives `DATA_DIR` at start and every `SUPERBOT_BACKUP_INTERVAL` seconds. No network. |
 
 | Volume | Mounted at | Holds |
@@ -569,11 +569,34 @@ Secure by default: Compose refuses to start without `AUTH_PASSWORD`; the image s
 
 Every other `botd` setting (`TZ`, `USER_NAME`, `DEFAULT_HARNESS`, `CORS_ORIGINS`, `RUN_TIMEOUT_MINUTES`, …) goes in `.env`; apply changes with `docker compose up -d`. For tiers ([ADR 0033](../docs/adr/0033-tiers-model-routing.md)), copy the file into the data volume (`docker compose cp tiers.json botd:/data/tiers.json`) and set `TIERS_FILE=/data/tiers.json`; without it every user is on the open `self-host` tier, as before. For a [license](#license), paste the key into the console (it lands in the `data` volume) or set `LICENSE_KEY` in `.env`. `HOST`, `PORT`, `DATA_DIR`, and `WORKSPACE_DIR` are fixed by the image.
 
+### Images and versions
+
+Each merge to `main` and each release publishes both images for amd64 and arm64 to GHCR. Choose one with `SUPERBOT_VERSION` in `.env`:
+
+| `SUPERBOT_VERSION` | What |
+|--------------------|------|
+| `main` (default) | The latest merge to `main`, and a weekly rebuild with Debian's security fixes |
+| `1.2.3`, `1.2`, `1`, `latest` | A release, once there are any |
+| `sha-<7-char commit>` | Exactly the build of that commit on `main` |
+
+Set `SUPERBOT_IMAGE` and `SUPERBOT_CADDY_IMAGE` to use images from somewhere else (a mirror, or your own registry).
+
+### Build from source
+
+To build both images from the checkout instead, for another set of harness CLIs, Hermes Agent, pinned CLI versions, or a change of your own:
+
+```sh
+./init.sh --from-source          # writes COMPOSE_FILE=docker-compose.yml:docker-compose.build.yml to .env
+docker compose up -d --build
+```
+
+Or pass both files each time: `docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build`. `./init.sh --published` goes back to the published images. A build takes several minutes and a few GB of build cache.
+
 ### Harness CLIs and logins
 
-The image bakes in Claude Code, Codex, and Pi (`npm i -g` at build time). Pick a subset with `SUPERBOT_HARNESSES` in `.env` (e.g. `claude`, or empty for none), then `docker compose build botd && docker compose up -d`. Pin versions with build args, e.g. `docker compose build --build-arg CLAUDE_CODE_VERSION=2.1.328 botd` (`CODEX_VERSION` and `PI_VERSION` too).
+The image bakes in Claude Code, Codex, and Pi (`npm i -g` at build time). When [building from source](#build-from-source), pick a subset with `SUPERBOT_HARNESSES` in `.env` (e.g. `claude`, or empty for none), then `docker compose build botd && docker compose up -d`. Pin versions with build args, e.g. `docker compose build --build-arg CLAUDE_CODE_VERSION=2.1.328 botd` (`CODEX_VERSION` and `PI_VERSION` too).
 
-Hermes Agent is opt-in: add it with `SUPERBOT_HARNESSES=claude codex pi hermes` (about 2.5 GB more in the image). The image installs it in `/opt/hermes`, pinned with `HERMES_COMMIT`, and its Bots share its one environment ([ADR 0072](../docs/adr/0072-one-hermes-environment-per-computer.md)). It has no login: save a provider key with `botctl secret set` (above) and, if needed, set `SUPERBOT_HERMES_PROVIDER` and `SUPERBOT_HERMES_BASE_URL` in `.env`. See [backend docs](../docs/backend.md#hermes-agent).
+Hermes Agent is opt-in and needs [building from source](#build-from-source): add it with `SUPERBOT_HARNESSES=claude codex pi hermes` (about 2.5 GB more in the image). The image installs it in `/opt/hermes`, pinned with `HERMES_COMMIT`, and its Bots share its one environment ([ADR 0072](../docs/adr/0072-one-hermes-environment-per-computer.md)). It has no login: save a provider key with `botctl secret set` (above) and, if needed, set `SUPERBOT_HERMES_PROVIDER` and `SUPERBOT_HERMES_BASE_URL` in `.env`. See [backend docs](../docs/backend.md#hermes-agent).
 
 Log in once inside the container, as the `superbot` user that runs the Bots. Logins are stored in the `home` volume and survive upgrades and container recreation:
 
@@ -601,13 +624,15 @@ Harness CLIs must be in the image (`SUPERBOT_HARNESSES`): ones installed later w
 ### Upgrade
 
 ```sh
-cd superbot && git pull
+cd superbot && git pull                          # for changes to the compose files and Caddyfile
 cd deploy/docker
 docker compose exec botd superbot-backup        # optional: archive first
-docker compose build --pull && docker compose up -d
+docker compose pull && docker compose up -d
 ```
 
-Volumes are kept. The schema migrates on start, as with the bash install. The build also rebuilds the `caddy` image with the checkout's web client. To pin a release, `git checkout <tag>` before building.
+Volumes are kept. The schema migrates on start, as with the bash install. The `caddy` image carries the matching web client. To pin a version, set `SUPERBOT_VERSION` (see [Images and versions](#images-and-versions)). When [building from source](#build-from-source), run `docker compose build --pull && docker compose up -d` instead, after `git checkout <tag>` to pin a release.
+
+Upgrading from before the published images: Compose built the images locally then, and now pulls them, so the next `docker compose up -d` switches to the published ones. Volumes don't change. If you baked in Hermes Agent or another set of harness CLIs, run `./init.sh --from-source` first to keep building your own.
 
 Upgrading from a release before secrets: run `./init.sh` once first. It adds a random `SUPERBOT_MASTER_KEY` to `.env` (Compose refuses to start without one) and leaves everything else alone. The key encrypts saved secrets and approvals' tool input ([master key](#master-key)); it stays in `.env` on the host, never in a volume.
 
@@ -657,17 +682,28 @@ sudo -u superbot superbot-backup --home /home/superbot - > superbot-migrate.tar.
 cd superbot/deploy/docker && ./init.sh --domain bots.example.com   # reuse AUTH_PASSWORD from ~superbot/superbot/.env if you like
 # Carry the master key over (replacing the one init.sh made), or saved secrets won't open:
 key=$(sudo cat ~superbot/.config/superbot/master.key) && sed -i "s|^SUPERBOT_MASTER_KEY=.*|SUPERBOT_MASTER_KEY='$key'|" .env
-docker compose up -d --build && docker compose stop botd backup
+docker compose up -d && docker compose stop botd backup
 docker compose run --rm --no-deps -T botd superbot-restore - < superbot-migrate.tar.gz
 docker compose up -d
 ```
 
 Then log the harness CLIs in again inside the container.
 
-### Not in the image yet
+### Screens and computer use in Docker
 
-Screens and computer use (Xvfb, browser, voxl): `botd` reports `Screens: off`. Use the bash installer plus [`install-computer.sh`](install-computer.sh) if you need them.
+The image has the Bots' computer ([docs/computer.md](../docs/computer.md)): each Bot's virtual screen (Xvfb, Openbox, D-Bus), a browser (agent-browser driving Debian's Chromium), agent-desktop, and voxl for the live view you watch and take over in the app. It's the stack [`install-computer.sh`](install-computer.sh) installs on a bash install, with Chromium in place of Chrome for Testing so it works on arm64 too.
+
+As on a bash install, botd turns screens off while [per-user accounts](#per-user-accounts-in-docker) are on: an X display belongs to botd's account, and per-user screens don't exist yet. The log says `Screens: off (per-user screens ...)`. To use screens, run every Bot as botd's account:
+
+```sh
+./init.sh --no-isolation && docker compose up -d
+docker compose logs botd | grep Screens        # Screens: on (viewers listen on 0.0.0.0, SCREEN_ADDR).
+```
+
+Each screen's viewer listens in the `botd` container on ports 6901 and up (`SCREEN_BASE`, `MAX_SCREENS`). Compose sets `SCREEN_ADDR=0.0.0.0` so Caddy, on the compose network, can serve them at `/screen/<port>/`; no port is published, and each viewer checks its own token. `botd` gets 1 GB of shared memory for Chromium. Size the host for about 0.5 to 1 GB of RAM per open screen (`MAX_SCREENS`, default 3), and set `SCREEN_SIZE` and `SCREEN_IDLE_MINUTES` in `.env` as on a bash install. The bash install's earlyoom safety net isn't in the container: cap memory with Docker if the host is tight.
+
+Building from source, `SUPERBOT_COMPUTER=off` leaves all of this out (about 1.2 GB smaller).
 
 ### Check the setup
 
-[`deploy/docker/smoke-test.sh`](docker/smoke-test.sh) builds the image and runs the stack in an isolated project (own volumes and ports 18080/18443): health, auth, Host allowlist, the landing page, the web client at `/app/`, harness CLIs, SSE through Caddy, saved secrets (encrypted, names only, absent from logs and backups), per-user accounts (on for a new `.env`, unable to read `/data` or botd's env, the same uid after a recreate), and a backup/restore round trip, then removes everything. CI runs it on every change to the image.
+[`deploy/docker/smoke-test.sh`](docker/smoke-test.sh) builds the images and runs the stack in an isolated project (own volumes and ports 18080/18443): health, auth, Host allowlist, the landing page, the web client at `/app/`, harness CLIs, SSE through Caddy, saved secrets (encrypted, names only, absent from logs and backups), per-user accounts (on for a new `.env`, unable to read `/data` or botd's env, the same uid after a recreate), a backup/restore round trip, and screens (off under per-user accounts; with `ISOLATION=off`, a Bot's screen starts, its live view opens through Caddy only with its token, and Chromium opens on it), then removes everything. `SMOKE_NO_BUILD=1` tests the published images instead (`SUPERBOT_VERSION`). CI runs it on amd64 and arm64 on every change to the image, before publishing.

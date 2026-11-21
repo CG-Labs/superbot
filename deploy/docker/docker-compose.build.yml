@@ -1,0 +1,32 @@
+# Build both images from this checkout instead of pulling the published ones:
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+# ./init.sh --from-source saves that choice in .env (COMPOSE_FILE), so plain `docker compose` uses it.
+# Docs: deploy/README.md ("Build from source").
+
+x-local-image: &local-image
+  image: ${SUPERBOT_IMAGE:-superbot:local}
+  # Built here; never pulled from a registry under this name.
+  pull_policy: never
+
+services:
+  botd:
+    <<: *local-image
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        HARNESSES: ${SUPERBOT_HARNESSES-claude codex pi}
+        COMPUTER: ${SUPERBOT_COMPUTER:-on}
+
+  backup:
+    <<: *local-image
+
+  caddy:
+    image: ${SUPERBOT_CADDY_IMAGE:-superbot-caddy:local}
+    pull_policy: never
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: caddy
+      args:
+        CADDY_IMAGE: ${CADDY_IMAGE:-caddy:2}

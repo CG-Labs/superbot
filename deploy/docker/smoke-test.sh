@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # End-to-end check of the Compose setup in an isolated project (own volumes, env file, and ports).
 # Never touches a real install's volumes. Usage, from anywhere:
-#   deploy/docker/smoke-test.sh              # builds the image
-#   SUPERBOT_IMAGE=superbot:ci SMOKE_NO_BUILD=1 deploy/docker/smoke-test.sh
+#   deploy/docker/smoke-test.sh              # builds the images from this checkout
+#   SUPERBOT_IMAGE=superbot:ci SUPERBOT_CADDY_IMAGE=superbot-caddy:ci SMOKE_NO_BUILD=1 deploy/docker/smoke-test.sh
+#   SMOKE_NO_BUILD=1 deploy/docker/smoke-test.sh   # the published images (SUPERBOT_VERSION, default main)
 set -euo pipefail
 
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+COMPOSE_FILES=(-f "$DIR/docker-compose.yml")
+[[ "${SMOKE_NO_BUILD:-}" == 1 ]] || COMPOSE_FILES+=(-f "$DIR/docker-compose.build.yml")
 PROJECT=${SMOKE_PROJECT:-superbot-smoke}
 HTTP_PORT=${SMOKE_HTTP_PORT:-18080}
 HTTPS_PORT=${SMOKE_HTTPS_PORT:-18443}
@@ -15,7 +18,7 @@ export SUPERBOT_ENV_FILE="$WORK/.env"
 
 log() { printf '==> %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
-dc() { docker compose -f "$DIR/docker-compose.yml" -p "$PROJECT" --env-file "$SUPERBOT_ENV_FILE" "$@"; }
+dc() { docker compose "${COMPOSE_FILES[@]}" -p "$PROJECT" --env-file "$SUPERBOT_ENV_FILE" "$@"; }
 
 cleanup() {
   local status=$?
@@ -129,6 +132,7 @@ dc exec -T botd sh -c 'd=$(dirname "$(command -v botd)"); for h in claude codex 
 log "Per-user accounts (ADR 0058): on for a new .env, and an account can't read botd's data or env"
 grep -qx 'ISOLATION=users' "$SUPERBOT_ENV_FILE" || fail "a new .env doesn't turn per-user accounts on"
 grep -q 'Isolation: each user' <<<"$(dc logs --no-color botd)" || fail "botd didn't start with per-user accounts"
+grep -q 'Screens: off (per-user' <<<"$(dc logs --no-color botd)" || fail "screens aren't off under per-user accounts"
 probe=smokeprobe
 dc exec -T botd sudo -n /usr/local/sbin/superbot-userctl ensure "$probe" >/dev/null || fail "superbot-userctl couldn't make an account"
 as_account() { dc exec -T -w "/srv/superbot/users/$probe/home" botd sudo -n -u "sb-u-$probe" /opt/superbot/bin/superbot-run /bin/sh -c "$1"; }
@@ -254,5 +258,37 @@ grep -q '"name":"SMOKE_API_KEY"' <<<"$(curl -fsS "${AUTH[@]}" "$BASE/api/secrets
 grep -q '"name":"KeepMe"' <<<"$(curl -fsS "${AUTH[@]}" "$BASE/api/audit?action=bot.created")" || fail "the audit log is missing after the restore"
 ((rto <= ${SMOKE_RTO_SECONDS:-300})) || fail "restore took ${rto}s (budget ${SMOKE_RTO_SECONDS:-300}s)"
 log "Restore drill passed: back up in ${rto}s"
+
+log "Screens (docs/computer.md): on with ISOLATION=off, a Bot's screen starts and is viewed through Caddy"
+ENV_FILE="$SUPERBOT_ENV_FILE" "$DIR/init.sh" --no-isolation >/dev/null
+dc up -d --no-build --force-recreate --wait --wait-timeout 120 botd
+grep -q 'Screens: on (viewers listen on 0.0.0.0' <<<"$(dc logs --no-color botd)" || fail "botd didn't turn screens on"
+bot_id=$(curl -fsS "${AUTH[@]}" -H 'Content-Type: application/json' -d '{"name":"Screenie"}' "$BASE/api/bots" \
+  | grep -o '"id":"[0-9a-zA-Z_-]*"' | sed -n '1s/"id":"\(.*\)"/\1/p')
+[[ -n "$bot_id" ]] || fail "no id for the new Bot"
+screen=$(curl -fsS "${AUTH[@]}" "$BASE/api/bots/$bot_id/screen") || fail "the Bot's screen didn't start"
+url=$(sed -n 's/.*"url":"\([^"]*\)".*/\1/p' <<<"$screen")
+[[ "$url" =~ ^/screen/(69[0-9][0-9])/\?token=([0-9a-f]{32})$ ]] || fail "unexpected screen link: $screen"
+port=${BASH_REMATCH[1]} token=${BASH_REMATCH[2]}
+[[ -z "${GITHUB_ACTIONS:-}" ]] || echo "::add-mask::$token"
+display=":$((port - 6800))"
+expect_code 200 "$BASE$url"
+grep -qi '<html' <<<"$(curl -fsS "$BASE$url")" || fail "Caddy didn't serve the screen's viewer at $BASE/screen/$port/"
+ws_code() { # The viewer's live stream, opened through Caddy with the given token.
+  curl -s -o /dev/null -m 3 -w '%{http_code}' -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+    -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' "$BASE/screen/$port/ws?token=$1" || true
+}
+[[ $(ws_code "$token") == 101 ]] || fail "the screen's live stream didn't open through Caddy"
+[[ $(ws_code "$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')") == 401 ]] || fail "the screen's live stream opened with a wrong token"
+dc exec -T botd xdpyinfo -display "$display" >/dev/null || fail "no X display $display in botd"
+
+log "Computer use: Chromium opens on the Bot's screen"
+ab() { dc exec -T -e DISPLAY="$display" -e AGENT_BROWSER_SESSION=smoke -e AGENT_BROWSER_HEADED=1 -e AGENT_BROWSER_NO_XVFB=1 botd agent-browser "$@"; }
+ab open 'data:text/html,<title>superbot-smoke</title><h1>hello</h1>' >/dev/null || fail "agent-browser couldn't open a page"
+[[ $(ab get title) == superbot-smoke ]] || fail "agent-browser read the wrong title"
+windows=$(dc exec -T botd xwininfo -display "$display" -root -tree) || fail "couldn't list the windows on $display"
+grep -q '"superbot-smoke - Chromium"' <<<"$windows" || fail "Chromium isn't on the Bot's screen: $windows"
+ab close >/dev/null || true
+dc exec -T botd agent-desktop --version >/dev/null || fail "agent-desktop is not runnable in the image"
 
 log "Smoke test passed"
