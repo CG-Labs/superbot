@@ -71,6 +71,9 @@ const STOP_WAIT: u64 = 30;
 const FORCE_WAIT: u64 = 20;
 const EDIT_WAIT: u64 = 30;
 const REBUILD_WAIT: u64 = 60;
+/// How long botd keeps watching a rebuild that outlasts REBUILD_WAIT, to start the
+/// container once it's done.
+const REBUILD_FINISH: u64 = 30 * 60;
 
 /// What a plan gives a container.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -424,6 +427,9 @@ impl Settings {
             return Err("INCUS_URL is needed with MACHINE_PROVIDER=incus, e.g. https://<incus-host>:8443".into());
         }
         let (url, host) = https_base("INCUS_URL", &raw)?;
+        let host_ip = ip_of(&host).ok_or(
+            "INCUS_URL must name the Incus host by IP address, so containers can be kept off it, e.g. https://<incus-host-ip>:8443",
+        )?;
         let mut names = Vec::new();
         for (k, d) in [("INCUS_PROJECT", "superbot"), ("INCUS_NETWORK", "incusbr0"), ("INCUS_STORAGE_POOL", "default")] {
             let v = or(k, d);
@@ -446,9 +452,7 @@ impl Settings {
         for c in var("INCUS_EGRESS_DENY").split(',').map(str::trim).filter(|s| !s.is_empty()) {
             deny.push(super::firewall::cidr(c).map_err(|e| format!("INCUS_EGRESS_DENY: {e}"))?);
         }
-        if let Some(ip) = ip_of(&host) {
-            deny.push(super::firewall::cidr(&ip.to_string())?);
-        }
+        deny.push(super::firewall::cidr(&host_ip.to_string())?);
         deny.sort();
         deny.dedup();
         let control = url::Url::parse(var("MACHINE_CONTROL_URL").trim())
@@ -486,6 +490,7 @@ impl Credentials {
     }
 }
 
+#[derive(Clone)]
 pub struct Incus {
     s: Settings,
     egress: Vec<Rule>,
@@ -854,6 +859,45 @@ impl Incus {
         })
     }
 
+    /// Whether the container's network is what `attach_firewall` sets: no profiles,
+    /// eth0 exactly `nic(acl)`, and no other NIC.
+    fn covered(&self, v: &Value, acl: &str) -> bool {
+        let devices = match v.get("expanded_devices") {
+            Some(d) if d.is_object() => d,
+            _ => &v["devices"],
+        };
+        v["profiles"].as_array().is_none_or(Vec::is_empty)
+            && devices.as_object().is_some_and(|d| {
+                d.get("eth0") == Some(&self.nic(acl)) && d.iter().all(|(k, dev)| k == "eth0" || dev["type"] != "nic")
+            })
+    }
+
+    /// Starts `n` once its rebuild `op` succeeds, for a rebuild slower than
+    /// REBUILD_WAIT. Lost if botd restarts meanwhile; the rebuild worker then sends
+    /// the rebuild again when the machine doesn't enroll.
+    fn start_after(&self, op: String, n: String) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            let until = tokio::time::Instant::now() + Duration::from_secs(REBUILD_FINISH);
+            while tokio::time::Instant::now() < until {
+                match me.wait(&op, 60).await {
+                    Ok(true) => {
+                        if let Err(e) = me.start(&n).await {
+                            eprintln!("Incus: starting {n} after its rebuild: {e}");
+                        }
+                        return;
+                    }
+                    Ok(false) | Err(ProviderError::Transport(_)) => tokio::time::sleep(Duration::from_secs(1)).await,
+                    Err(e) => {
+                        eprintln!("Incus: rebuilding {n}: {e}");
+                        return;
+                    }
+                }
+            }
+            eprintln!("Incus: {n} was still rebuilding after {} minutes; not starting it", REBUILD_FINISH / 60);
+        });
+    }
+
     fn root(&self, size: &Size) -> Value {
         json!({ "type": "disk", "path": "/", "pool": self.s.pool, "size": format!("{}GiB", size.disk_gib) })
     }
@@ -1145,17 +1189,22 @@ impl MachineProvider for Incus {
         })
     }
 
+    /// Gone counts as deleted only once no create of it is still running, which
+    /// would make it after all; until then the reconciler keeps trying.
     fn delete<'a>(&'a self, id: &'a str) -> Fut<'a, ()> {
         Box::pin(async move {
-            match self.stop(id, true).await {
-                Ok(()) | Err(ProviderError::NotFound) => {}
-                Err(e) => return Err(e),
-            }
-            match self
-                .call(Method::DELETE, &format!("/1.0/instances/{}", name(id)?), &[], None, None)
-                .await
-            {
+            let res = match self.stop(id, true).await {
+                Ok(()) => {
+                    self.call(Method::DELETE, &format!("/1.0/instances/{}", name(id)?), &[], None, None)
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+            match res {
                 Ok(r) => self.finish(r, FORCE_WAIT, "deleting the container").await,
+                Err(ProviderError::NotFound) if self.creating(id).await? => Err(ProviderError::Transport(
+                    "Incus is still creating the container; it's deleted once made".into(),
+                )),
                 Err(ProviderError::NotFound) => Ok(()),
                 Err(e) => Err(e),
             }
@@ -1185,7 +1234,14 @@ impl MachineProvider for Incus {
                     None,
                 )
                 .await?;
-            self.finish(r, REBUILD_WAIT, "rebuilding the container").await?;
+            if let Some(op) = r.operation
+                && !self.wait(&op, REBUILD_WAIT).await?
+            {
+                self.start_after(op, id.to_string());
+                return Err(ProviderError::Transport(
+                    "Incus is still rebuilding the container; botd starts it once that's done".into(),
+                ));
+            }
             self.start(id).await
         })
     }
@@ -1241,23 +1297,51 @@ impl MachineProvider for Incus {
         })
     }
 
+    /// Machines are this project's containers naming the ACL whose network is still
+    /// exactly as attached; one changed since (another default, a filter off, a second
+    /// NIC) counts as another device, so the reconciler attaches it again.
     fn firewall_devices<'a>(&'a self, id: &'a str) -> Fut<'a, FirewallDevices> {
         Box::pin(async move {
+            let acl = name(id)?;
             let mut out = FirewallDevices::default();
-            for u in self.acl(id).await?.metadata["used_by"].as_array().into_iter().flatten() {
-                match u.as_str().and_then(instance_of) {
-                    Some((n, project)) if project == self.s.project => out.machines.push(n),
-                    _ => out.others += 1,
+            let used_by = self.acl(acl).await?.metadata["used_by"].clone();
+            let ours: Vec<String> = used_by
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|u| u.as_str().and_then(instance_of))
+                .filter(|(_, project)| *project == self.s.project)
+                .map(|(n, _)| n)
+                .collect();
+            out.others = used_by.as_array().map_or(0, Vec::len) - ours.len();
+            if ours.is_empty() {
+                return Ok(out);
+            }
+            let list = self.call(Method::GET, "/1.0/instances", &[("recursion", "1")], None, None).await?.metadata;
+            for n in ours {
+                let found = list.as_array().into_iter().flatten().find(|v| v["name"] == n.as_str());
+                if found.is_some_and(|v| self.covered(v, acl)) {
+                    out.machines.push(n);
+                } else {
+                    out.others += 1;
                 }
             }
             Ok(out)
         })
     }
 
+    /// Puts the whole isolated NIC back as eth0, and drops profiles and other NICs.
     fn attach_firewall<'a>(&'a self, id: &'a str, machine: &'a str) -> Fut<'a, ()> {
         Box::pin(async move {
             let acl = name(id)?;
-            self.edit(machine, |put| put["devices"]["eth0"] = self.nic(acl)).await
+            self.edit(machine, |put| {
+                if let Some(d) = put["devices"].as_object_mut() {
+                    d.retain(|k, dev| k == "eth0" || dev["type"] != "nic");
+                }
+                put["devices"]["eth0"] = self.nic(acl);
+                put["profiles"] = json!([]);
+            })
+            .await
         })
     }
 

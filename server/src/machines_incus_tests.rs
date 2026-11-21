@@ -203,6 +203,12 @@ async fn containers_are_cut_off_from_each_other() {
     let nic = env.incus.instance(&b.label).unwrap().body["devices"]["eth0"].clone();
     assert_eq!((nic["security.acls"].as_str(), nic["security.port_isolation"].as_str()), (Some("superbot-fw"), Some("true")));
 
+    // So is one opened up in place while it still names the ACL.
+    env.incus.w().instances.get_mut(&a.label).unwrap().body["devices"]["eth0"]["security.acls.default.ingress.action"] = json!("allow");
+    let r = reconcile(&env).await;
+    assert_eq!(r["firewallAttached"], 1, "{r}");
+    assert_eq!(env.incus.instance(&a.label).unwrap().body["devices"]["eth0"]["security.acls.default.ingress.action"], "drop");
+
     // Loosened outbound rules are set back too.
     env.incus.w().acls.get_mut("superbot-fw").unwrap()["egress"] = json!([]);
     reconcile(&env).await;
@@ -259,14 +265,14 @@ async fn machines_from_another_provider_are_left_alone() {
     let r = reconcile(&env).await;
     assert_eq!(r["checked"], 0, "{r}");
     assert!(env.incus.w().calls.iter().all(|c| !c.path.contains("4242")), "never asked Incus about it");
-    for (method, path, body) in [
+    for (method, action, body) in [
         ("POST", "suspend", ""),
         ("POST", "resize", r#"{"tier":"pro"}"#),
         ("DELETE", "", ""),
     ] {
-        let path = format!("/api/users/{uid}/machine{}", if path.is_empty() { String::new() } else { format!("/{path}") });
+        let path = format!("/api/users/{uid}/machine{}", if action.is_empty() { String::new() } else { format!("/{action}") });
         let (code, r) = json_call(&env, method, &path, body).await;
-        assert_eq!(code, 409, "{method} {path}: {r}");
+        assert_eq!(code, 409, "{method} {action}: {r}");
         assert!(r["error"].as_str().unwrap().contains("at linode"), "{r}");
     }
     assert_eq!(env.app.db.machine(&m.id).unwrap().state, State::Running, "untouched");

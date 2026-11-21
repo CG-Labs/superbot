@@ -97,12 +97,14 @@ fn settings_come_from_the_environment() {
     }
     assert_eq!(s.control, Some(("10.9.8.7".parse().unwrap(), 8444)));
 
-    let local = Settings::from_env(&env(&[("INCUS_URL", "https://incus.internal:9443/"), ("INCUS_IMAGE_SERVER", "local")])).unwrap();
-    assert_eq!(local.url, "https://incus.internal:9443");
+    let local = Settings::from_env(&env(&[("INCUS_URL", "https://[2001:db8::50]:9443/"), ("INCUS_IMAGE_SERVER", "local")])).unwrap();
+    assert_eq!(local.url, "https://[2001:db8::50]:9443");
+    assert!(local.deny.contains(&"2001:db8::50/128".to_string()), "{:?}", local.deny);
     assert_eq!(local.image_server, None);
     assert_eq!(local.control, None);
 
     for (pairs, want) in [
+        (&[("INCUS_URL", "https://incus.internal:8443")][..], "by IP address"),
         (&[("INCUS_URL", "http://192.0.2.50:8443")][..], "INCUS_URL"),
         (&[("INCUS_URL", "https://192.0.2.50:8443/1.0")][..], "INCUS_URL"),
         (&[("INCUS_URL", "https://user:pw@192.0.2.50")][..], "INCUS_URL"),
@@ -288,6 +290,34 @@ async fn suspend_resume_resize_backups_rebuild_and_delete() {
 }
 
 #[tokio::test]
+async fn a_slow_rebuild_still_ends_with_the_container_started() {
+    let s = StandIn::start().await;
+    let p = incus(&s);
+    p.create_firewall("superbot-fw", &["superbot".into()], &[agent_rule()]).await.unwrap();
+    p.create(&spec("superbot-m1", "c1-m2-d20")).await.unwrap();
+    s.w().hold_rebuilds = true;
+    let rb = RebuildSpec { image: "ubuntu/26.04/cloud".into(), authorized_keys: Vec::new(), user_data: "#cloud-config\n".into() };
+    match p.rebuild("superbot-m1", &rb).await {
+        Err(ProviderError::Transport(m)) => assert!(m.contains("still rebuilding"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(s.instance("superbot-m1").unwrap().status, "Stopped");
+    s.release();
+    let started = async {
+        loop {
+            let i = s.instance("superbot-m1").unwrap();
+            if i.status == "Running" {
+                return i;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    };
+    let i = tokio::time::timeout(std::time::Duration::from_secs(10), started).await.expect("started once rebuilt");
+    assert_eq!(i.rebuilt, 1);
+    assert_eq!(i.source["alias"], "ubuntu/26.04/cloud");
+}
+
+#[tokio::test]
 async fn a_create_still_running_is_provisioning_and_a_failed_one_is_a_refusal() {
     let s = StandIn::start().await;
     let p = incus(&s);
@@ -296,8 +326,15 @@ async fn a_create_still_running_is_provisioning_and_a_failed_one_is_a_refusal() 
     let m = p.create(&spec("superbot-m1", "c1-m2-d20")).await.unwrap();
     assert_eq!((m.id.as_str(), m.status.as_str()), ("superbot-m1", "provisioning"));
     assert_eq!(p.get("superbot-m1").await.unwrap().status, "provisioning", "not gone while it downloads");
+    match p.delete("superbot-m1").await {
+        Err(ProviderError::Transport(m)) => assert!(m.contains("still creating"), "not deleted while it may still appear: {m}"),
+        other => panic!("{other:?}"),
+    }
     s.release();
     assert_eq!(p.get("superbot-m1").await.unwrap().status, "running");
+    p.delete("superbot-m1").await.unwrap();
+    assert!(s.instance("superbot-m1").is_none(), "deleted once made");
+    s.w().hold_creates = false;
 
     s.w().fail_op = Some("Failed getting remote image info: not found".into());
     match p.create(&spec("superbot-m2", "c1-m2-d20")).await {
@@ -360,6 +397,26 @@ async fn the_firewall_is_a_network_acl() {
     let mut on = p.firewall_devices("superbot-fw").await.unwrap().machines;
     on.sort();
     assert_eq!(on, ["superbot-m1", "superbot-m2"]);
+
+    // Still naming the ACL isn't enough: a NIC loosened in place, a second NIC, or a
+    // profile means it's attached again.
+    type Drift = fn(&mut Value);
+    let drifts: [(&str, Drift); 4] = [
+        ("open by default", |b| b["devices"]["eth0"]["security.acls.default.ingress.action"] = json!("allow")),
+        ("no port isolation", |b| b["devices"]["eth0"]["security.port_isolation"] = json!("false")),
+        ("a second NIC", |b| b["devices"]["eth1"] = json!({ "type": "nic", "network": "incusbr0" })),
+        ("a profile", |b| b["profiles"] = json!(["default"])),
+    ];
+    for (what, drift) in drifts {
+        drift(&mut s.w().instances.get_mut("superbot-m2").unwrap().body);
+        let d = p.firewall_devices("superbot-fw").await.unwrap();
+        assert_eq!((d.machines.as_slice(), d.others), (&["superbot-m1".to_string()][..], 1), "{what}");
+        p.attach_firewall("superbot-fw", "superbot-m2").await.unwrap();
+        let b = s.instance("superbot-m2").unwrap().body;
+        assert_eq!(b["devices"]["eth0"], p.nic("superbot-fw"), "{what}");
+        assert!(b["devices"].get("eth1").is_none() && b["profiles"] == json!([]), "{what}");
+        assert_eq!(p.firewall_devices("superbot-fw").await.unwrap().machines.len(), 2, "{what}");
+    }
 
     assert!(p.delete_firewall("superbot-fw").await.is_err(), "Incus keeps an ACL in use");
     p.delete("superbot-m1").await.unwrap();
