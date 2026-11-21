@@ -140,6 +140,20 @@ impl Queued {
             Slot { slots: self.slots.clone(), pool: self.pool.clone(), ticket: self.ticket }
         })
     }
+
+    /// Its slot now, over the cap (`botctl ask`, as `take`'s `lend`), keeping the pool's cap.
+    pub fn borrow(mut self) -> Slot {
+        let mut pools = self.slots.lock();
+        let p = pools.entry(self.pool.clone()).or_default();
+        if let Some(i) = p.waiting.iter().position(|w| w.ticket == self.ticket) {
+            let w = p.waiting.remove(i).expect("in line");
+            p.held.push(Held { ticket: w.ticket, bot: w.bot });
+            p.pump();
+        }
+        drop(pools);
+        self.taken = true;
+        Slot { slots: self.slots.clone(), pool: self.pool.clone(), ticket: self.ticket }
+    }
 }
 
 impl Drop for Queued {
@@ -341,5 +355,19 @@ mod tests {
         assert!(matches!(c.turn(), Turn::Waiting { .. }));
         drop(asker);
         assert_eq!(c.turn(), Turn::Go);
+    }
+
+    #[test]
+    fn a_waiting_run_borrows_without_changing_the_cap() {
+        let s = slots();
+        let _a = s.take("m1", Some(2), "a", false).unwrap();
+        let _b = s.take("m1", Some(2), "b", false).unwrap();
+        let c = queued(s.take("m1", Some(2), "c", false));
+        let d = queued(s.take("m1", Some(1), "d", false));
+        let c = c.borrow();
+        assert_eq!(s.load("m1"), (3, 1));
+        assert_eq!(d.turn(), Turn::Waiting { position: 1, running: 3, limit: 1 });
+        drop(c);
+        assert!(matches!(d.turn(), Turn::Waiting { .. }), "the cap is still 1");
     }
 }

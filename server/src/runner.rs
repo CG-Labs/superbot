@@ -1144,10 +1144,7 @@ impl App {
         self.db.record(&by.event("bot.run_dequeued").target("message", &msg.id.to_string()).bot(&bot.id).outcome(outcome).details(waited));
         match result {
             "started" => queued.slot().map(|s| (s, true)),
-            "lent" => {
-                drop(queued);
-                self.slots.take(&pool, cap, &bot.id, true).ok().map(|s| (s, true))
-            }
+            "lent" => Some((queued.borrow(), true)),
             "stopped" => {
                 drop(queued);
                 self.give_back(bot, msg, period);
