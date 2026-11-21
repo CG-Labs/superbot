@@ -35,6 +35,12 @@
     #sso a[data-type="apple"] { background: #fff; border-color: #fff; color: #000; }
     .or { display: none; align-items: center; gap: 10px; color: #6b6b6b; font-size: 13px; }
     .or::before, .or::after { content: ""; flex: 1; border-top: 1px solid #2a2a2a; }
+    [hidden] { display: none !important; }
+    #mfa, #saved { display: flex; flex-direction: column; gap: 14px; }
+    #qr { width: 200px; height: 200px; align-self: center; border-radius: 12px; background: #fff; padding: 8px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 14px; word-break: break-all; user-select: all; text-align: center; color: #ececec; }
+    #codes { margin: 0; padding: 12px; list-style: none; columns: 2; border: 1px solid #2a2a2a; border-radius: 12px; }
+    a.link, button.link { color: #4b8df8; background: none; padding: 0; font-weight: 400; font-size: 14px; text-align: center; text-decoration: none; }
   </style>
 </head>
 <body>
@@ -42,8 +48,27 @@
     <h1>SuperBot</h1>
     <div id="sso"></div>
     <div class="or" id="or">or</div>
-    <p>Enter your sign-in code, or the server password.</p>
+    <div id="first">
+      <p>Enter your sign-in code, or the server password.</p>
+    </div>
     <input id="secret" type="password" autocomplete="current-password" placeholder="Sign-in code or password" autofocus required />
+    <!-- Two-factor authentication (docs/adr/0094-totp-second-factor.md). -->
+    <div id="mfa" hidden>
+      <p id="mfa-say"></p>
+      <img id="qr" alt="QR code to add SuperBot to an authenticator app" hidden />
+      <div id="setup" hidden>
+        <p>Or enter this key in the app:</p>
+        <div class="mono" id="key"></div>
+        <a class="link" id="otpauth">Open in an authenticator app on this device</a>
+      </div>
+      <input id="totp" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="6-digit code" />
+      <input id="recovery" autocomplete="off" placeholder="Recovery code" hidden />
+      <button class="link" id="use-recovery" type="button">Use a recovery code</button>
+    </div>
+    <div id="saved" hidden>
+      <p>Two-factor authentication is on. Save these recovery codes somewhere safe. Each works once if you lose your authenticator app. They won't be shown again.</p>
+      <ul class="mono" id="codes"></ul>
+    </div>
     <button id="go" type="submit">Sign in</button>
     <div class="error" id="error" role="alert"></div>
   </form>
@@ -91,11 +116,66 @@
       if (box.children.length) document.getElementById("or").style.display = "flex";
     }).catch(() => {});
 
+    const $ = (id) => document.getElementById(id);
+    const totp = $("totp"), recovery = $("recovery");
+    // The second step of a sign-in: the server's challenge, and whether it is setting up an app.
+    let challenge = null, enrolling = false, done = null;
+
+    $("use-recovery").addEventListener("click", () => {
+      const on = recovery.hidden;
+      recovery.hidden = !on;
+      totp.hidden = on;
+      $("use-recovery").textContent = on ? "Use the code from your app" : "Use a recovery code";
+      (on ? recovery : totp).focus();
+    });
+
+    function askSecondFactor(data) {
+      challenge = data.challenge;
+      enrolling = data.mfa === "enroll";
+      $("first").hidden = secret.hidden = true;
+      secret.required = false;
+      $("mfa").hidden = false;
+      $("mfa-say").textContent = data.error;
+      $("use-recovery").hidden = enrolling;
+      if (enrolling && data.secret) {
+        $("qr").src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(data.qrSvg || "");
+        $("qr").hidden = !data.qrSvg;
+        $("setup").hidden = false;
+        $("key").textContent = data.secret.replace(/(.{4})/g, "$1 ").trim();
+        $("otpauth").href = data.otpauthUrl;
+      }
+      go.textContent = enrolling ? "Turn on and sign in" : "Verify";
+      totp.value = recovery.value = "";
+      (recovery.hidden ? totp : recovery).focus();
+    }
+
+    async function signedIn() {
+      try { localStorage.removeItem(SIGNED_OUT); } catch {}
+      // Browsers drop Secure cookies on plain http, except on localhost.
+      const me = await fetch("/api/auth/me");
+      if (me.ok) return location.replace(landing(await me.json().catch(() => null)));
+      error.textContent = "Signed in, but this browser didn't keep the session. Open SuperBot over HTTPS.";
+    }
+
+    function showRecoveryCodes(codes) {
+      $("mfa").hidden = true;
+      $("saved").hidden = false;
+      $("codes").replaceChildren(...codes.map((c) => Object.assign(document.createElement("li"), { textContent: c })));
+      go.textContent = "I saved them. Continue";
+    }
+
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
-      const value = secret.value.trim();
+      if (done) return done();
       const body = { session: "cookie", label: "Web" };
-      if (value.startsWith("sbc_")) body.code = value; else body.password = value;
+      if (challenge) {
+        body.challenge = challenge;
+        if (recovery.hidden) body.totp = totp.value.replace(/\s/g, ""); else body.recoveryCode = recovery.value.trim();
+        if (!body.totp && !body.recoveryCode) return;
+      } else {
+        const value = secret.value.trim();
+        if (value.startsWith("sbc_")) body.code = value; else body.password = value;
+      }
       go.disabled = true;
       error.textContent = "";
       try {
@@ -104,15 +184,22 @@
           headers: { "content-type": "application/json" },
           body: JSON.stringify(body),
         });
+        const data = await r.json().catch(() => ({}));
         if (r.ok) {
-          try { localStorage.removeItem(SIGNED_OUT); } catch {}
-          // Browsers drop Secure cookies on plain http, except on localhost.
-          const me = await fetch("/api/auth/me");
-          if (me.ok) return location.replace(landing(await me.json().catch(() => null)));
-          error.textContent = "Signed in, but this browser didn't keep the session. Open SuperBot over HTTPS.";
+          if (Array.isArray(data.recoveryCodes) && data.recoveryCodes.length) {
+            done = signedIn;
+            return showRecoveryCodes(data.recoveryCodes);
+          }
+          return signedIn();
+        }
+        if (r.status === 401 && data.challenge && data.mfa) {
+          if (data.challenge !== challenge) askSecondFactor(data);
+          else error.textContent = data.error;
+          totp.value = recovery.value = "";
           return;
         }
-        const data = await r.json().catch(() => ({}));
+        // A spent or expired challenge: start again.
+        if (challenge) setTimeout(() => location.reload(), 2500);
         error.textContent = data.error || "Sign in failed.";
       } catch {
         error.textContent = "Can't reach the server.";

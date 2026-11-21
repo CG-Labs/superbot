@@ -4,7 +4,7 @@
 
 Accepted (21 Nov 2026). The last item on per-user isolation ([#30](https://github.com/CG-Labs/superbot/issues/30), M3): SCIM groups map to teams. It extends the SCIM stub ([ADR 0023](0023-scim.md)) and its hardening ([ADR 0026](0026-scim-review-hardening.md)) with the Group resource, onto team accounts and machines ([ADR 0087](0087-team-accounts-and-machines.md)), team screens ([ADR 0088](0088-team-screens-in-the-apps.md)) and team billing ([ADR 0093](0093-team-billing.md)). Offboarding ([ADR 0052](0052-teammate-offboarding-on-machines.md), [ADR 0066](0066-removing-teammate-accounts-on-one-server.md)) doesn't change.
 
-Numbering: `main` has up to 0093, and open PR [#154](https://github.com/CG-Labs/superbot/pull/154) claims 0094, so this is 0095.
+Numbering: `main` has up to 0094 (two-factor sign-in, [PR #154](https://github.com/CG-Labs/superbot/pull/154)), so this is 0095.
 
 ## Context
 
@@ -85,7 +85,7 @@ Everyone leaves, as above (reason `scim_group_deleted`), then the team goes. A t
 - With `SCIM_GROUPS=on`, a person added to a team group in Entra or Okta gets the team and a machine on the next sync; removed, they lose the team's Bots, their OS users on teammates' machines, and the team's machine, with no admin step.
 - SCIM teams start without an owner until a server admin names one.
 - Admins can't fix a SCIM team's members in SuperBot; they fix the group.
-- One new table (`scim_groups`), in migration 39.
+- One new table (`scim_groups`), in migration 40.
 
 ## Limits and follow-ups
 

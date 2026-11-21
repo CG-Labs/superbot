@@ -103,6 +103,12 @@ The iOS and Android apps open Apple's page in the system browser and come back o
 
 [App Store Review Guideline 4.8](https://developer.apple.com/app-store/review/guidelines/#login-services): an iOS app that lets people set up or sign in to their primary account with a third-party or social login (Google, GitHub, …) must also offer an equivalent login that limits data to name and email, lets people keep their email private, and doesn't track them for ads without consent. Sign in with Apple meets it. So if a SuperBot build you publish on the App Store shows Google or GitHub buttons, turn on Apple too, unless an exception fits (for example, an enterprise or business app where people must sign in with an existing company account, such as a server with only Entra).
 
+## Require MFA at the IdP
+
+SuperBot doesn't ask single sign-on sign-ins for its own second factor: the IdP's MFA is that factor, so require it there. Sign-in codes and the owner's password get SuperBot's own two-factor authentication instead ([ADR 0094](../adr/0094-totp-second-factor.md)). Requiring MFA at your IdP is your control as the customer (CC6.1-2 in the [SOC 2 readiness checklist](../security/soc2-readiness-checklist.md)).
+
+Apple protects every account that uses Sign in with Apple with two-factor authentication, so there is nothing to turn on. You can't require a particular factor, though: if you need that, offer an IdP you manage instead.
+
 ## Troubleshooting
 
 Each failed sign-in is in the audit log with a reason (`botctl audit --action auth.login_failed`):

@@ -296,7 +296,7 @@ pub fn user_view(u: &User) -> Value {
 /// A user as the admin portal lists them: how they last signed in, in the audit log's
 /// terms (`authMethod`, `idp`, `idpProvider`, ADR 0019), their linked sign-ins, and any
 /// code still waiting to be used (never the code itself, only its count and expiry).
-fn admin_view(a: &Auth, u: &User, identities: &[db::Identity], pending: Option<&(i64, i64)>) -> Value {
+fn admin_view(a: &Auth, u: &User, identities: &[db::Identity], pending: Option<&(i64, i64)>, mfa_since: Option<i64>) -> Value {
     let idp = |provider: &str| crate::sso::idp_type(a, provider);
     let mut v = user_view(u);
     v["lastLogin"] = match u.last_login_at {
@@ -314,6 +314,7 @@ fn admin_view(a: &Auth, u: &User, identities: &[db::Identity], pending: Option<&
         }))
         .collect::<Vec<_>>());
     v["pendingCodes"] = pending.map_or(Value::Null, |(n, exp)| json!({ "count": n, "expiresAt": exp }));
+    v["mfa"] = json!({ "enabled": mfa_since.is_some(), "enabledAt": mfa_since });
     if let Some(app) = &a.app {
         v["plan"] = crate::tier_usage(app, &u.id);
     }
@@ -325,15 +326,16 @@ fn session_view(s: &Session, cfg: &SessionConfig) -> Value {
     json!({
         "id": s.id, "userId": s.user_id, "kind": s.kind, "method": s.method, "idpSubject": s.idp_subject, "idpProvider": s.idp_provider, "label": s.label,
         "ip": s.ip, "userAgent": s.user_agent, "createdAt": s.created_at, "lastSeenAt": s.last_seen_at,
-        "expiresAt": s.expires_at, "endsAt": ends,
+        "expiresAt": s.expires_at, "endsAt": ends, "mfa": s.mfa,
     })
 }
 
 // Sign in and out.
 
 /// The new session's token and how it's handed over. `idp` is the SSO provider id and
-/// `issuer|subject` for SSO sign-ins.
-pub fn start_session(a: &Auth, user: &User, method: &str, idp: Option<(&str, &str)>, cookie: bool, label: Option<&str>, source: &Source) -> (Session, String) {
+/// `issuer|subject` for SSO sign-ins; `mfa` the second factor a local sign-in passed.
+#[allow(clippy::too_many_arguments)]
+pub fn start_session(a: &Auth, user: &User, method: &str, idp: Option<(&str, &str)>, mfa: Option<&str>, cookie: bool, label: Option<&str>, source: &Source) -> (Session, String) {
     let token = new_secret(SESSION_PREFIX);
     let app = a.app.as_ref().expect("sessions need the database");
     let s = app.db.create_session(&NewSession {
@@ -347,6 +349,7 @@ pub fn start_session(a: &Auth, user: &User, method: &str, idp: Option<(&str, &st
         ip: source.ip.as_deref(),
         user_agent: source.user_agent.as_deref(),
         expires_at: db::now() + a.sessions.max_ms,
+        mfa,
     });
     (s, token)
 }
@@ -354,8 +357,16 @@ pub fn start_session(a: &Auth, user: &User, method: &str, idp: Option<(&str, &st
 /// The sign-in reply: `{user, session, token}`, with the cookie set instead of the
 /// token returned for the web app. Never cached.
 pub fn session_response(a: &Auth, user: &User, s: &Session, token: &str) -> Response {
+    session_reply(a, user, s, token, json!({}))
+}
+
+/// `session_response` with `extra`'s fields added, such as new recovery codes.
+pub fn session_reply(a: &Auth, user: &User, s: &Session, token: &str, extra: Value) -> Response {
     let cookie = s.kind == "cookie";
-    let body = json!({ "user": user_view(user), "session": session_view(s, &a.sessions), "token": if cookie { Value::Null } else { json!(token) } });
+    let mut body = json!({ "user": user_view(user), "session": session_view(s, &a.sessions), "token": if cookie { Value::Null } else { json!(token) } });
+    if let (Some(b), Value::Object(e)) = (body.as_object_mut(), extra) {
+        b.extend(e);
+    }
     let mut res = Json(body).into_response();
     if cookie {
         res.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&session_cookie(token, a.sessions.max_ms)).unwrap());
@@ -377,11 +388,13 @@ pub fn too_many(retry: i64) -> Response {
     r
 }
 
-/// `POST /api/auth/login` `{password | code, session?: "cookie" | "token", label?}`.
+/// `POST /api/auth/login` `{password | code, totp? | recoveryCode?, session?: "cookie" | "token", label?}`.
 /// No credentials needed (the middleware only checks Host). A password is the
 /// break-glass login for the owner; a code is a one-time code an admin made.
 /// "cookie" sets an HttpOnly cookie for the web app; "token" (default) returns a
-/// bearer token for the client and botctl.
+/// bearer token for the client and botctl. When the person needs a second factor
+/// (ADR 0094) and didn't send a good one, the reply is a 401 with `mfa` and a
+/// `challenge`, which `{challenge, totp | recoveryCode}` finishes.
 pub async fn login(Extension(a): Extension<Arc<Auth>>, Extension(source): Extension<Source>, headers: HeaderMap, Json(v): Json<Value>) -> Response {
     let Some(app) = a.app.as_ref() else {
         return ApiError(StatusCode::SERVICE_UNAVAILABLE, "No database".into()).into_response();
@@ -402,6 +415,9 @@ pub async fn login(Extension(a): Extension<Arc<Auth>>, Extension(source): Extens
     let label = clean_label(&v["label"]);
     if let Some(handoff) = v["sso"].as_str() {
         return crate::sso::redeem(&a, source, handoff, v["verifier"].as_str().unwrap_or(""), cookie, label.as_deref());
+    }
+    if let Some(challenge) = v["challenge"].as_str() {
+        return crate::mfa::finish(&a, source, challenge, &v, cookie, label.as_deref());
     }
     let code = v["code"].as_str().map(str::trim).filter(|c| !c.is_empty());
     let password = v["password"].as_str().filter(|p| !p.is_empty());
@@ -430,7 +446,14 @@ pub async fn login(Extension(a): Extension<Arc<Auth>>, Extension(source): Extens
         let msg = if method == "code" { "That sign-in code is wrong, used, or expired." } else { "Wrong password." };
         return ApiError(StatusCode::UNAUTHORIZED, msg.into()).into_response();
     };
-    let (s, token) = start_session(&a, &user, method, None, cookie, label.as_deref(), &source);
+    if method != "none" {
+        match crate::mfa::gate(&a, &user, method, &v, &source) {
+            Ok(Some(kind)) => return crate::mfa::signed_in(&a, &user, method, kind, cookie, label.as_deref(), source, None),
+            Ok(None) => {}
+            Err(res) => return res,
+        }
+    }
+    let (s, token) = start_session(&a, &user, method, None, None, cookie, label.as_deref(), &source);
     let who = Who { actor: actor(&a, &user, Some(&s), method), source };
     app.db.record(&who.event("auth.login").target("session", &s.id).details(json!({ "method": method, "kind": s.kind, "label": s.label })));
     session_response(&a, &user, &s, &token)
@@ -455,6 +478,7 @@ pub async fn me(Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Call
         "session": c.session.as_ref().map(|s| session_view(s, &a.sessions)),
         "breakGlass": a.break_glass,
         "landing": crate::landing(c.principal),
+        "mfa": c.user.as_ref().map_or(Value::Null, |u| crate::mfa::summary(&a, u)),
     }))
 }
 
@@ -467,16 +491,18 @@ pub fn need_user_key(app: &AppState, key: &str) -> Res<User> {
 pub async fn list_users(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>) -> Json<Value> {
     let ids = app.db.all_identities();
     let codes = app.db.pending_codes(db::now());
+    let mfa = app.db.mfa_enabled();
     let users = app.db.users();
     crate::storage::warm(&app, &users.iter().map(|u| u.id.clone()).collect::<Vec<_>>()).await;
-    let list: Vec<Value> = users.iter().map(|u| admin_view(&a, u, ids.get(&u.id).map_or(&[], Vec::as_slice), codes.get(&u.id))).collect();
+    let list: Vec<Value> = users.iter().map(|u| admin_view(&a, u, ids.get(&u.id).map_or(&[], Vec::as_slice), codes.get(&u.id), mfa.get(&u.id).copied())).collect();
     Json(json!(list))
 }
 
 pub async fn get_user(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Path(key): Path<String>) -> Res {
     let u = need_user_key(&app, &key)?;
     crate::storage::warm(&app, std::slice::from_ref(&u.id)).await;
-    Ok(Json(admin_view(&a, &u, &app.db.identities(&u.id), app.db.pending_codes(db::now()).get(&u.id))))
+    let mfa = app.db.mfa(&u.id).and_then(|m| m.confirmed_at);
+    Ok(Json(admin_view(&a, &u, &app.db.identities(&u.id), app.db.pending_codes(db::now()).get(&u.id), mfa)))
 }
 
 /// `GET /api/users/{key}/bots`: the Bots this user can see, with their access and any
@@ -597,6 +623,7 @@ pub async fn update_user(State(app): State<AppState>, Extension(a): Extension<Ar
             app.db.record(&ev("user.enabled").details(json!({ "routinesResumed": resumed })));
         } else {
             a.sso.forget_user(&after.id);
+            a.mfa.forget_user(&after.id);
             let n = app.db.revoke_user_sessions(&after.id, by.actor.id.as_deref().unwrap_or(""), "user disabled");
             let paused = crate::handover::user_disabled(&app, &by, &after.id);
             app.db.record(&ev("user.disabled").details(json!({ "sessionsRevoked": n, "routinesPaused": paused })));
@@ -685,6 +712,7 @@ pub async fn revoke_user_sessions(State(app): State<AppState>, Extension(a): Ext
     // Codes go first: a redemption holds them until its session exists, so either that
     // session is made in time to be revoked below or the code is already gone.
     a.sso.forget_user(&u.id);
+    a.mfa.forget_user(&u.id);
     let n = app.db.revoke_user_sessions(&u.id, by.actor.id.as_deref().unwrap_or(""), "revoked by admin");
     // A screen link doesn't know who opened it, so they all change.
     if let Some(screens) = &app.screens {
@@ -826,7 +854,7 @@ mod tests {
         let cfg = SessionConfig { idle_ms: 10 * MINUTE, max_ms: 60 * MINUTE };
         let token = new_secret(SESSION_PREFIX);
         fn new(token_hash: &str, max_ms: i64) -> NewSession<'_> {
-            NewSession { user_id: OPERATOR, token_hash, kind: "token", method: "password", idp_subject: None, idp_provider: None, label: None, ip: None, user_agent: None, expires_at: db::now() + max_ms }
+            NewSession { user_id: OPERATOR, token_hash, kind: "token", method: "password", idp_subject: None, idp_provider: None, label: None, ip: None, user_agent: None, expires_at: db::now() + max_ms, mfa: None }
         }
         let s = db.create_session(&new(&hash(&token), cfg.max_ms));
         let t0 = s.created_at;

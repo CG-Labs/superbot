@@ -35,6 +35,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
 
   botctl login [<code> | -]                        Sign in with a sign-in code (- reads it from stdin), or
                                                    with SUPERBOT_PASSWORD; prints a SUPERBOT_TOKEN
+    [--totp <code> | --recovery-code <code>]       With two-factor authentication on, the code from
+                                                   your authenticator app, or a recovery code
   botctl logout                                    End the SUPERBOT_TOKEN session
   botctl whoami                                    Who the token or password signs in as, and its role
   botctl users                                     List users
@@ -231,16 +233,18 @@ fn send(cred: Cred, method: &str, path: &str, body: Option<String>) -> Result<Tc
 }
 
 fn api(cred: Cred, method: &str, path: &str, body: Option<String>) -> Result<String, String> {
+    let (code, body) = exchange(cred, method, path, body)?;
+    if (200..300).contains(&code) { Ok(body) } else { Err(failure(code, &body)) }
+}
+
+/// The status and body of one request, whatever the status.
+fn exchange(cred: Cred, method: &str, path: &str, body: Option<String>) -> Result<(u16, String), String> {
     let mut s = send(cred, method, path, body)?;
     let mut res = String::new();
     s.read_to_string(&mut res).map_err(|e| e.to_string())?;
     let (head, body) = res.split_once("\r\n\r\n").unwrap_or((&res, ""));
     let code: u16 = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
-    if (200..300).contains(&code) {
-        Ok(body.to_string())
-    } else {
-        Err(failure(code, body))
-    }
+    Ok((code, body.to_string()))
 }
 
 fn failure(code: u16, body: &str) -> String {
@@ -381,8 +385,24 @@ fn operator_auth() -> Result<String, String> {
     }
 }
 
-/// `botctl login`: the body for POST /api/auth/login.
-fn login_body(arg: Option<&str>) -> Result<Value, String> {
+/// `botctl login [<code> | -] [--totp <code> | --recovery-code <code>]`: the body for
+/// POST /api/auth/login. A second factor goes in the same request (ADR 0094).
+fn login_body(args: &[&str]) -> Result<Value, String> {
+    const USE: &str = "usage: botctl login [<code> | -] [--totp <code> | --recovery-code <code>]";
+    let (arg, rest) = match args.split_first() {
+        Some((a, rest)) if !a.starts_with("--") => (Some(*a), rest),
+        _ => (None, args),
+    };
+    let second = match (flag(rest, "--totp"), flag(rest, "--recovery-code")) {
+        (Some(_), Some(_)) => return Err(USE.into()),
+        (Some(c), None) => Some(("totp", c)),
+        (None, Some(c)) => Some(("recoveryCode", c)),
+        (None, None) if rest.is_empty() => None,
+        _ => return Err(USE.into()),
+    };
+    if second.is_some() && rest.len() != 2 {
+        return Err(USE.into());
+    }
     let code = match arg {
         Some("-") => {
             let mut c = String::new();
@@ -401,9 +421,66 @@ fn login_body(arg: Option<&str>) -> Result<Value, String> {
         },
     };
     let mut body = body;
+    if let Some((k, c)) = second {
+        body[k] = json!(c.trim());
+    }
     body["session"] = json!("token");
     body["label"] = json!("botctl");
     Ok(body)
+}
+
+/// `botctl login`. When the server asks for a second factor, asks for it here and
+/// finishes the same sign-in: a sign-in code is spent by the first step.
+fn login(args: &[&str]) -> Result<String, String> {
+    let (mut code, mut res) = exchange(Cred::Anonymous, "POST", "/api/auth/login", Some(login_body(args)?.to_string()))?;
+    let mut lines = std::io::stdin().lines();
+    loop {
+        let v: Value = serde_json::from_str(&res).unwrap_or(Value::Null);
+        if (200..300).contains(&code) {
+            return Ok(signed_in(&v));
+        }
+        let Some(challenge) = v["challenge"].as_str().filter(|_| code == 401) else { return Err(failure(code, &res)) };
+        let enroll = v["mfa"] == "enroll";
+        eprintln!("{}", v["error"].as_str().unwrap_or_default());
+        if enroll {
+            eprintln!("\nAdd this to your authenticator app:\n{}\n", setup_text(&v));
+        }
+        eprint!("{}", if enroll { "Code: " } else { "Code (or a recovery code): " });
+        let _ = std::io::stderr().flush();
+        let typed = match lines.next() {
+            Some(l) => l.map_err(|e| e.to_string())?,
+            None => return Err("No code given. Sign in again.".into()),
+        };
+        (code, res) = exchange(Cred::Anonymous, "POST", "/api/auth/login", Some(factor_body(challenge, &typed, enroll)?.to_string()))?;
+    }
+}
+
+/// What someone types or opens to add the account to an authenticator app.
+fn setup_text(v: &Value) -> String {
+    let field = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+    format!("  Setup key: {}\n  {}", field("secret"), field("otpauthUrl"))
+}
+
+/// The second step: six digits are an authenticator code, anything else a recovery code.
+/// Enrolment takes only an authenticator code.
+fn factor_body(challenge: &str, typed: &str, enroll: bool) -> Result<Value, String> {
+    let typed = typed.trim();
+    if typed.is_empty() {
+        return Err("No code given. Sign in again.".into());
+    }
+    let totp = enroll || (typed.len() == 6 && typed.bytes().all(|b| b.is_ascii_digit()));
+    let kind = if totp { "totp" } else { "recoveryCode" };
+    Ok(json!({ "challenge": challenge, (kind): typed, "session": "token", "label": "botctl" }))
+}
+
+fn signed_in(v: &Value) -> String {
+    let (token, who, role) = (v["token"].as_str().unwrap_or_default(), v["user"]["name"].as_str().unwrap_or_default(), v["user"]["role"].as_str().unwrap_or_default());
+    let mut out = format!("Signed in as {who} ({role}). Run:\n\n  export SUPERBOT_TOKEN={token}");
+    if let Some(codes) = v["recoveryCodes"].as_array() {
+        let codes: Vec<&str> = codes.iter().filter_map(Value::as_str).collect();
+        out.push_str(&format!("\n\nTwo-factor sign-in is on. Save these recovery codes somewhere safe; each works once and they won't be shown again:\n\n  {}", codes.join("\n  ")));
+    }
+    out
 }
 
 fn role(r: &str) -> Result<&str, String> {
@@ -1127,11 +1204,7 @@ fn run(args: &[String]) -> Result<String, String> {
         ["audit", "export", rest @ ..] => api(Cred::Operator, "GET", &format!("/api/audit/export.csv{}", audit_query(rest)?), None),
         ["audit", rest @ ..] => op("GET", &format!("/api/audit{}", audit_query(rest)?), None),
 
-        ["login", rest @ ..] if rest.len() <= 1 => {
-            let res: Value = serde_json::from_str(&api(Cred::Anonymous, "POST", "/api/auth/login", Some(login_body(rest.first().copied())?.to_string()))?).map_err(|e| e.to_string())?;
-            let (token, who) = (res["token"].as_str().unwrap_or_default(), res["user"]["name"].as_str().unwrap_or_default());
-            Ok(format!("Signed in as {who} ({}). Run:\n\n  export SUPERBOT_TOKEN={token}", res["user"]["role"].as_str().unwrap_or_default()))
-        }
+        ["login", rest @ ..] => login(rest),
         ["logout"] => op("POST", "/api/auth/logout", None).map(|_| "Signed out. Unset SUPERBOT_TOKEN.".into()),
         ["whoami"] => op("GET", "/api/auth/me", None),
         ["users"] | ["user", "list"] => op("GET", "/api/users", None),
@@ -1481,8 +1554,20 @@ mod tests {
 
     #[test]
     fn login_and_user_commands() {
-        assert_eq!(login_body(Some(" sbc_abc ")).unwrap(), json!({ "code": "sbc_abc", "session": "token", "label": "botctl" }));
-        assert!(login_body(Some("  ")).is_err());
+        assert_eq!(login_body(&[" sbc_abc "]).unwrap(), json!({ "code": "sbc_abc", "session": "token", "label": "botctl" }));
+        assert!(login_body(&["  "]).is_err());
+        assert_eq!(login_body(&["sbc_abc", "--totp", " 123456"]).unwrap(), json!({ "code": "sbc_abc", "totp": "123456", "session": "token", "label": "botctl" }));
+        assert_eq!(login_body(&["sbc_abc", "--recovery-code", "abcde-fghij"]).unwrap()["recoveryCode"], "abcde-fghij");
+        for bad in [&["sbc_abc", "--totp"][..], &["sbc_abc", "--totp", "1", "--recovery-code", "2"], &["sbc_abc", "extra"], &["sbc_abc", "--nope", "1"]] {
+            assert!(login_body(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(factor_body("sbm_x", " 123456\n", false).unwrap(), json!({ "challenge": "sbm_x", "totp": "123456", "session": "token", "label": "botctl" }));
+        assert_eq!(factor_body("sbm_x", "abcde-fghij", false).unwrap()["recoveryCode"], "abcde-fghij");
+        assert_eq!(factor_body("sbm_x", "12345", true).unwrap()["totp"], "12345");
+        assert!(factor_body("sbm_x", "  ", false).is_err());
+        assert_eq!(setup_text(&json!({ "secret": "ABCD", "otpauthUrl": "otpauth://totp/x" })), "  Setup key: ABCD\n  otpauth://totp/x");
+        let done = signed_in(&json!({ "token": "sbt_t", "user": { "name": "Ana", "role": "admin" }, "recoveryCodes": ["aaaaa-bbbbb", "ccccc-ddddd"] }));
+        assert!(done.contains("export SUPERBOT_TOKEN=sbt_t") && done.contains("  aaaaa-bbbbb\n  ccccc-ddddd"), "{done}");
         assert_eq!(role("read-only"), Ok("read-only"));
         assert!(role("root").is_err());
         assert_eq!(encode("a.b+c@example.com"), "a.b%2Bc%40example.com");

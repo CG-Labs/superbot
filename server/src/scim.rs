@@ -758,6 +758,7 @@ async fn changed(app: &AppState, a: &Auth, c: &Caller, before_user: &User, befor
         }
         Some(false) => {
             a.sso.forget_user(&after.user.id);
+            a.mfa.forget_user(&after.user.id);
             let n = app.db.revoke_user_sessions(&after.user.id, by.actor.id.as_deref().unwrap_or("scim"), "deprovisioned by SCIM");
             let paused = crate::handover::user_disabled(app, by, &after.user.id);
             app.db.record(&ev("user.disabled").details(json!({ "sessionsRevoked": n, "routinesPaused": paused, "tenant": c.token.tenant })));
@@ -939,6 +940,7 @@ pub async fn delete_user(State(app): State<AppState>, Extension(a): Extension<Ar
         return Err(missing("User"));
     }
     a.sso.forget_user(&id);
+    a.mfa.forget_user(&id);
     let n = app.db.revoke_user_sessions(&id, c.who.actor.id.as_deref().unwrap_or("scim"), "deleted by SCIM");
     let paused = crate::handover::user_disabled(&app, &c.who, &id);
     app.db.record(&c.who.event("scim.user_deleted").target("user", &id).details(json!({
