@@ -18,7 +18,7 @@ Secrets, approval inputs and push tokens are encrypted field by field (XChaCha20
 Yes: Microsoft Entra ID, Google, Apple, GitHub, any OIDC provider, and SAML through a Keycloak broker. SCIM 2.0 user provisioning and deprovisioning. Native SAML is planned (M5). See [authentication](access-control.md#authentication).
 
 **Do you support MFA?**
-Not in SuperBot itself. Use SSO and enforce MFA at your IdP.
+Not in SuperBot itself. Use SSO and enforce MFA at your IdP. This is a listed gap in the [SOC 2 control mapping](soc2-control-mapping.md#cc6-logical-and-physical-access).
 
 **How are users kept apart?**
 Each user's Bots run as that user's own Unix account on one server, or on that user's own machine when managed. A Bot can do no more than its owner. On machines, running Bots as an unprivileged user (`MACHINE_BOT_USER`) and teammates as their own OS users (`MACHINE_TEAMMATE_USERS`) are off by default and must be turned on, as must the Linode firewall (`MACHINE_FIREWALL`). See [isolation](access-control.md#isolation-between-users).
@@ -51,7 +51,13 @@ Sessions end after 7 days idle or 30 days. Backups are kept 14 days by default. 
 Users are disabled, not deleted, today; their sessions end at once. Teammates who leave have their OS users and homes removed from the owner's machine. Erasure for managed users is planned (M4).
 
 **Has SuperBot been security tested?**
-An internal authentication and authorization review found no critical or high issues ([auth review](auth-review-2026-11.md), [SCIM review](auth-review-2026-11-scim.md)). An external penetration test is planned before M3 general availability, and SOC 2 work is M3 (control mapping) to M5 (Type II) ([roadmap](../ROADMAP.md)).
+An internal authentication and authorization review found no critical or high issues ([auth review](auth-review-2026-11.md), [SCIM review](auth-review-2026-11-scim.md)). An external penetration test is planned before M3 general availability ([roadmap](../ROADMAP.md)).
+
+**Are you SOC 2 certified?**
+No. No SOC 2 audit has started. A [SOC 2 control mapping](soc2-control-mapping.md) shows, for each Security, Availability and Confidentiality criterion, what the product does, what the operator or customer must do, and the gaps. A readiness checklist is planned for M4 and a Type II audit for M5 ([roadmap](../ROADMAP.md#compliance-path-not-promises)).
+
+**Who is responsible for which controls?**
+It depends on who runs the server. When you self-host, you are the operator: hosting, physical security, backups off the host, alert channels and your own policies are yours. On the managed service, those are the provider's. Either way, you decide who gets access and enforce MFA at your IdP. See [how to read the mapping](soc2-control-mapping.md#how-to-read-it).
 
 **Is the code open?**
 Yes. The code and every design decision ([ADRs](../adr/)) are public, so each answer here can be checked.
