@@ -21,6 +21,7 @@ import { Chips } from "./Chips";
 import { PromptsEditor } from "./PromptsEditor";
 import { RoutineEditor } from "./RoutineEditor";
 import { SuggestedPrompts } from "./SuggestedPrompts";
+import { TeammateLoginPanel } from "./TeammateLoginPanel";
 
 interface Props {
   visible: boolean;
@@ -55,6 +56,7 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, 
     canOnBot,
     me,
     harnesses,
+    api,
   } = useSuperBot();
   const bot = bots.find((b) => b.id === activeId);
   // The Bot's own harness stays listed even if it is no longer installed. Admins get
@@ -280,6 +282,16 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, 
                   <Text style={styles.dim}>{line}</Text>
                 </View>
               ))}
+              {api && bot.teammateLogins && bot.owner && bot.owner.id !== me.id && canOperate ? (
+                <TeammateLoginPanel
+                  key={`${bot.owner.id}:${bot.harness}`}
+                  api={api}
+                  ownerId={bot.owner.id}
+                  ownerName={bot.owner.name || "its owner"}
+                  harness={bot.harness}
+                  canWrite={can("write")}
+                />
+              ) : null}
               <View style={styles.row}>
                 <Text style={styles.dim}>Shared with everyone</Text>
                 <Switch

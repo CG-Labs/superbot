@@ -48,8 +48,10 @@ pub async fn ask(e: &Enrollment, to: &Assigned, user_id: &str) -> Result<Teammat
     let address = to.address.as_deref().ok_or("it has no address yet")?;
     // useradd can take a while on a busy machine.
     let client = e.upload_client(to.pins.clone(), 60)?;
+    // Agents before ADR 0062 ignore the query, and answer with no logins.
+    let query = if e.logins { super::logins::cred_query().join("&") } else { String::new() };
     let mut r = client
-        .put(e.agent_url(address, &format!("/v1/teammates/{user_id}")))
+        .put(e.agent_url(address, &format!("/v1/teammates/{user_id}?{query}")))
         .json(&TeammateRequest {
             owner_id: to.user_id.clone(),
         })

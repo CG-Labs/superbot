@@ -45,5 +45,11 @@ describe("Bot access", () => {
       "Others' runs use the server's keys and their access, never your own",
     );
     expect(whoseKeys({ sharedBots: "isolated", visibility: "private", owner: ada }, "u1")).toBeNull();
+    expect(whoseKeys({ sharedBots: "isolated", visibility: "shared", owner: ada, teammateLogins: true }, "u2")).toBe(
+      "For you it uses your own login or the server's keys and your access, never Ada's own",
+    );
+    expect(whoseKeys({ sharedBots: "isolated", visibility: "shared", owner: ada, teammateLogins: true }, "u1")).toBe(
+      "Others' runs use their own login or the server's keys and their access, never your own",
+    );
   });
 });

@@ -111,6 +111,7 @@ pub const CAN_BOT_USER: &str = "bot_user";
 pub const CAN_SCREENS: &str = "screens";
 pub const CAN_TEAMMATES: &str = "teammates";
 pub const CAN_TEAMMATE_REMOVAL: &str = "teammate_removal";
+pub const CAN_TEAMMATE_LOGINS: &str = "teammate_logins";
 
 /// The screen protocol this build speaks (ADR 0045). A request names it, an agent
 /// refuses any other, and botd treats an agent that reports another as outdated.
@@ -216,6 +217,20 @@ pub struct TeammateReply {
     pub bots: String,
     /// The user was made by this request.
     pub created: bool,
+    /// Each harness the request asked about with `cred=`, logged in or not in this
+    /// teammate's own home (`CAN_TEAMMATE_LOGINS`, ADR 0062).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub logins: BTreeMap<String, LoginStatus>,
+}
+
+/// `GET /v1/teammates/{user}/logins`: a teammate's own harness logins on the machine
+/// (ADR 0062). Asking never makes their user.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeammateLogins {
+    /// They have a user here.
+    pub known: bool,
+    pub logins: BTreeMap<String, LoginStatus>,
 }
 
 /// What becomes of a leaving teammate's `work` folder (ADR 0052).
@@ -408,6 +423,11 @@ pub struct LoginRequest {
     /// Where the login saves its credentials, relative to HOME (`home_path`).
     pub files: Vec<String>,
     pub timeout_secs: u64,
+    /// The teammate whose own login this is, run as their OS user in their home on the
+    /// machine (ADR 0062). None: the owner's, in the Bots' home. Sent only to an agent
+    /// that says `CAN_TEAMMATE_LOGINS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_user: Option<String>,
 }
 
 /// What a login stream carries, one per line.
@@ -442,6 +462,9 @@ pub struct LoginInput {
 pub struct ForgetRequest {
     pub harness: String,
     pub files: Vec<String>,
+    /// The teammate whose own login to remove (ADR 0062). None: the owner's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_user: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

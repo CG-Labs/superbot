@@ -132,6 +132,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine screens <user> close <bot>        Close that Bot's screen there now
   botctl machine teammates <user>                  Teammates with their own user on it, and removals of ones who left
   botctl machine teammates <user> remove <teammate>  Remove that teammate's user and home from it now
+  botctl machine teammates <user> logins <teammate>  Whether that teammate's own harness logins on it are logged in
+  botctl machine teammates <user> logout <teammate> <harness>  Log that teammate's own harness out on it
   botctl machine removals [<state>]                Teammate removals: open (default), pending, held, done, cancelled, all
   botctl secrets                                   List secret names (never values)
   botctl secret set <NAME> < value-file            Save a secret, encrypted; Bots get it as $NAME
@@ -578,10 +580,14 @@ fn machine_request(args: &[&str]) -> Result<(&'static str, String), String> {
         ["screens", user, "close", bot] => ("DELETE", machine(user, &format!("screens/{}", encode(bot)))),
         ["teammates", user] => ("GET", machine(user, "teammates")),
         ["teammates", user, "remove", teammate] => ("POST", machine(user, &format!("teammates/{}/remove", encode(teammate)))),
+        ["teammates", user, "logins", teammate] => ("GET", machine(user, &format!("teammates/{}/harness-logins", encode(teammate)))),
+        ["teammates", user, "logout", teammate, harness] => {
+            ("DELETE", machine(user, &format!("teammates/{}/harness-logins/{}", encode(teammate), encode(harness))))
+        }
         ["removals"] => ("GET", "/api/machines/teammate-removals?state=open".into()),
         ["removals", s @ ("pending" | "held" | "done" | "cancelled" | "open" | "all")] => ("GET", format!("/api/machines/teammate-removals?state={s}")),
         _ => {
-            return Err("Usage: botctl machine placement [<user>] | assign <user> | unassign <user> | agent <user> | upgrade <user> [hold|release] | harnesses <user> | legacy | rebuild <user> [--discard-work|status|cancel] | bot-user <user> | harness-login <user|me> <claude|codex> | harness-logins <user|me> | harness-logout <user|me> <harness> | folder <user> | sync <user> | screens <user> [close <bot>] | teammates <user> [remove <teammate>] | removals [pending|held|done|cancelled|open|all]".into());
+            return Err("Usage: botctl machine placement [<user>] | assign <user> | unassign <user> | agent <user> | upgrade <user> [hold|release] | harnesses <user> | legacy | rebuild <user> [--discard-work|status|cancel] | bot-user <user> | harness-login <user|me> <claude|codex> | harness-logins <user|me> | harness-logout <user|me> <harness> | folder <user> | sync <user> | screens <user> [close <bot>] | teammates <user> [remove <teammate> | logins <teammate> | logout <teammate> <harness>] | removals [pending|held|done|cancelled|open|all]".into());
         }
     })
 }
@@ -1113,6 +1119,15 @@ mod tests {
         assert_eq!(machine_request(&["removals", "held"]).unwrap(), ("GET", "/api/machines/teammate-removals?state=held".into()));
         assert!(machine_request(&["removals", "soon"]).is_err());
         assert!(machine_request(&["teammates", "u1", "remove"]).is_err());
+        assert_eq!(
+            machine_request(&["teammates", "u1", "logins", "b@example.com"]).unwrap(),
+            ("GET", "/api/users/u1/machine/teammates/b%40example.com/harness-logins".into())
+        );
+        assert_eq!(
+            machine_request(&["teammates", "u1", "logout", "u2", "claude"]).unwrap(),
+            ("DELETE", "/api/users/u1/machine/teammates/u2/harness-logins/claude".into())
+        );
+        assert!(machine_request(&["teammates", "u1", "logout", "u2"]).is_err());
         assert_eq!(rebuild_request(&["a@example.com"]).unwrap(), ("POST", "/api/users/a%40example.com/machine/rebuild".into(), None));
         assert_eq!(
             rebuild_request(&["u1", "--discard-work"]).unwrap(),

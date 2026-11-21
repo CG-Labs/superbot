@@ -352,6 +352,11 @@ impl App {
         });
         if let Some(on) = self.runs_on(b) {
             v["runsOn"] = json!(on);
+            // Teammates log in with their own account on the owner's machine (ADR 0062).
+            let teammates_log_in = self.control_plane.get().and_then(|cp| cp.enrollment.as_ref()).is_some_and(|e| e.logins && e.teammate_users);
+            if on == "machine" && teammates_log_in && crate::machines::logins::recipe(&b.harness).is_some() {
+                v["teammateLogins"] = json!(true);
+            }
         }
         if self.shared_bots() == SharedBots::Isolated {
             v["sharedBots"] = json!(SharedBots::Isolated);
@@ -1024,6 +1029,10 @@ impl App {
                         self.db.record(&e.details(json!({ "owner": bot.owner_id, "forUser": u, "user": t.user, "uid": t.uid, "messageId": msg.id })));
                     }
                     crate::machines::offboard::seen(self, &to.machine_id, u);
+                    // Their own login there, never the owner's (ADR 0062).
+                    if let Err(r) = cp.teammate_logged_in(bin, &t) {
+                        return refused(r, Some(&to.machine_id));
+                    }
                     Some(t)
                 }
             },

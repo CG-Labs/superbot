@@ -105,6 +105,9 @@ pub enum Refusal {
     NoTeammateKey(String),
     /// Its agent couldn't set up the teammate's own user (ADR 0048): its words.
     TeammateUserFailed(String),
+    /// A teammate's run there needs their own login for this harness, in their own home
+    /// there, or a server-wide key; the owner's login is never used for it (ADR 0062).
+    TeammateNotLoggedIn(String),
     /// It is being rebuilt with today's agent, or is about to be (ADR 0056).
     Rebuilding,
 }
@@ -128,6 +131,7 @@ impl Refusal {
             Refusal::BotUserFailed => "bot_user_failed",
             Refusal::NoTeammateKey(_) => "teammate_no_key",
             Refusal::TeammateUserFailed(_) => "teammate_user_failed",
+            Refusal::TeammateNotLoggedIn(_) => "teammate_not_logged_in",
             Refusal::Rebuilding => "machine_rebuilding",
         }
     }
@@ -137,7 +141,9 @@ impl Refusal {
         match self {
             Refusal::Offline(e) | Refusal::Outdated(e) | Refusal::TeammateUserFailed(e) => Some(e.clone()),
             Refusal::NotReady(s) => Some(s.as_str().into()),
-            Refusal::HarnessMissing(h) | Refusal::HarnessInstalling(h) | Refusal::NotLoggedIn(h) | Refusal::NoTeammateKey(h) => Some(h.clone()),
+            Refusal::HarnessMissing(h) | Refusal::HarnessInstalling(h) | Refusal::NotLoggedIn(h) | Refusal::NoTeammateKey(h) | Refusal::TeammateNotLoggedIn(h) => {
+                Some(h.clone())
+            }
             _ => None,
         }
     }
@@ -171,6 +177,7 @@ impl Refusal {
             Refusal::BotUserFailed => "I didn't run: your computer couldn't set up a separate account for your Bots. Ask an admin to look at it (`botctl machine agent <your email>`).".into(),
             Refusal::NoTeammateKey(h) => format!("I didn't run: runs for your teammates use their own account on your computer, and {h} has no server-wide key for that. Ask an admin to save one."),
             Refusal::TeammateUserFailed(_) => "I didn't run: your computer couldn't set up a separate account for a teammate. Ask an admin to look at it (`botctl machine agent <your email>`).".into(),
+            Refusal::TeammateNotLoggedIn(h) => format!("I didn't run: runs for your teammates use their own {h} login on your computer, never yours, and this one has none. They can log in from my details in the app, or an admin can save a server-wide key."),
             Refusal::Rebuilding => "I didn't run: your computer is being rebuilt with the latest setup. Try again in a few minutes.".into(),
         }
     }
@@ -190,6 +197,9 @@ impl Refusal {
             }
             Refusal::NoTeammateKey(h) => {
                 return format!("I didn't run: on {o}'s computer, runs for teammates use a separate account, and {h} has no server-wide key for that. An admin can save one.");
+            }
+            Refusal::TeammateNotLoggedIn(h) => {
+                return format!("I didn't run: {h} isn't logged in for you on {o}'s computer. Runs for teammates there use their own login, never {o}'s. Log in from my details in the app, or an admin can save a server-wide key.");
             }
             Refusal::TeammateUserFailed(_) => "it couldn't set up an account for you there",
             Refusal::Outdated(_)
@@ -327,6 +337,8 @@ pub mod recording {
         /// Teammates it was asked to make users for, and what it answers.
         pub teammates: Mutex<Vec<String>>,
         pub teammate_error: Mutex<Option<String>>,
+        /// Each teammate's own logins there (ADR 0062), as its answer says.
+        pub teammate_logins: Mutex<std::collections::HashMap<String, std::collections::BTreeMap<String, wire::LoginStatus>>>,
     }
 
     /// Records `m` as enrolled, with a certificate from a throwaway CA.
@@ -373,6 +385,7 @@ pub mod recording {
                 ]),
                 teammates: Mutex::default(),
                 teammate_error: Mutex::default(),
+                teammate_logins: Mutex::default(),
             }
         }
     }
@@ -406,7 +419,11 @@ pub mod recording {
             };
             let res = match self.teammate_error.lock().unwrap().clone() {
                 Some(e) => Err(e),
-                None => Ok(teammate_reply(user_id, created)),
+                None => {
+                    let mut r = teammate_reply(user_id, created);
+                    r.logins = self.teammate_logins.lock().unwrap().get(user_id).cloned().unwrap_or_default();
+                    Ok(r)
+                }
             };
             Box::pin(async move { res })
         }
@@ -416,7 +433,7 @@ pub mod recording {
     pub fn teammate_reply(user_id: &str, created: bool) -> wire::TeammateReply {
         let user = wire::teammate_user(user_id);
         let home = format!("/home/teammates/{user}");
-        wire::TeammateReply { workspace: format!("{home}/work"), bots: format!("{home}/bots"), home, uid: 2001, user, created }
+        wire::TeammateReply { workspace: format!("{home}/work"), bots: format!("{home}/bots"), home, uid: 2001, user, created, logins: Default::default() }
     }
 }
 
@@ -437,6 +454,7 @@ mod tests {
             Refusal::BotUserFailed,
             Refusal::NoTeammateKey("claude".into()),
             Refusal::TeammateUserFailed("useradd failed at 192.0.2.7".into()),
+            Refusal::TeammateNotLoggedIn("claude".into()),
             Refusal::Rebuilding,
         ];
         for r in &all {

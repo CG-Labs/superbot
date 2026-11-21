@@ -1062,13 +1062,36 @@ fn creds(query: Option<&str>) -> BTreeMap<&'static str, Vec<String>> {
     out
 }
 
-/// Whether each harness asked about is logged in, and those logging in now.
+/// Whether each harness asked about is logged in for the owner, in the Bots' home, and
+/// those logging in now. Teammates' own logins never count here (ADR 0062).
 fn logins(a: &Agent, query: Option<&str>) -> BTreeMap<String, wire::LoginStatus> {
-    let running = a.logins.running();
+    login_states(&a.cfg.home, a.bot().ids, a.logins.running_for(None), query)
+}
+
+/// The same, for a teammate's own logins in their home (ADR 0062), looked at as their
+/// user, so a link they put there reaches nothing they couldn't read themselves.
+fn teammate_logins(a: &Agent, user_id: &str, t: Option<&Teammate>, query: Option<&str>) -> BTreeMap<String, wire::LoginStatus> {
+    let running = a.logins.running_for(Some(user_id));
+    match t {
+        Some(t) => login_states(&t.home, Some(t.ids), running, query),
+        None => {
+            let mut out: BTreeMap<String, wire::LoginStatus> = creds(query)
+                .into_keys()
+                .map(|h| (h.to_string(), wire::LoginStatus { state: wire::LOGGED_OUT.into(), since: None }))
+                .collect();
+            for h in running {
+                out.insert(h, wire::LoginStatus { state: wire::LOGGING_IN.into(), since: None });
+            }
+            out
+        }
+    }
+}
+
+fn login_states(home: &Path, user: Option<Ids>, running: Vec<String>, query: Option<&str>) -> BTreeMap<String, wire::LoginStatus> {
     let mut out: BTreeMap<String, wire::LoginStatus> = creds(query)
         .into_iter()
         .map(|(h, files)| {
-            let since = runas::as_user(a.bot().ids, || super::terminal::logged_in(&a.cfg.home, &files))
+            let since = runas::as_user(user, || super::terminal::logged_in(home, &files))
                 .ok()
                 .flatten();
             let state = match since {
@@ -1146,6 +1169,7 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
             wire::CAN_SCREENS,
             wire::CAN_TEAMMATES,
             wire::CAN_TEAMMATE_REMOVAL,
+            wire::CAN_TEAMMATE_LOGINS,
         ]
             .into_iter()
             .chain(a.upgrader.build.is_some().then_some(wire::CAN_UPGRADE))
@@ -1361,26 +1385,41 @@ fn code_or(code: u16, fallback: StatusCode) -> StatusCode {
 }
 
 /// `POST /v1/logins`: runs a harness's login in a terminal here and streams what it
-/// shows (ADR 0041). Its credentials stay in this machine's HOME. A dropped stream
-/// stops it. Like a job, it holds off agent upgrades and harness updates.
+/// shows (ADR 0041). Its credentials stay in this machine's HOME: the Bots' for the
+/// owner, or a teammate's own (`for_user`, ADR 0062), as their user, made if need be.
+/// A dropped stream stops it. Like a job, it holds off agent upgrades and harness updates.
 async fn start_login(State(a): State<Arc<Agent>>, Json(r): Json<wire::LoginRequest>) -> Response {
     let run = match super::terminal::check(&r, |b| a.cfg.has(b)) {
         Ok(run) => run,
         Err((code, msg)) => return refuse(code_or(code, StatusCode::BAD_REQUEST), msg),
+    };
+    let teammate = match r.for_user.as_deref() {
+        Some(u) => match a.teammate(u).await {
+            Ok(t) => Some(t),
+            Err(r) => return r,
+        },
+        None => None,
     };
     let _jobs = a.jobs();
     let user = match a.job_user() {
         Ok(u) => u,
         Err(r) => return r,
     };
-    let env = a.cfg.host(user).env;
+    // Checked with the jobs held, as for jobs: a removal marks the teammate first.
+    if r.for_user.as_deref().is_some_and(|u| a.teammates.is_leaving(u)) {
+        return refuse(StatusCode::CONFLICT, "That teammate's user is being removed.");
+    }
+    let (home, host) = match &teammate {
+        Some(t) => (t.home.clone(), a.cfg.teammate_host(t)),
+        None => (a.cfg.home.clone(), a.cfg.host(user)),
+    };
     if a.upgrader.staging() {
         return refuse(StatusCode::SERVICE_UNAVAILABLE, "This machine is updating its agent. Try again in a minute.");
     }
     let Some(permit) = a.tools.job_permit() else {
         return refuse(StatusCode::SERVICE_UNAVAILABLE, "This machine is updating its harnesses. Try again in a minute.");
     };
-    match a.logins.start(&r, &run, &a.cfg.home, &env, user) {
+    match a.logins.start(&r, &run, &home, &host.env, host.user) {
         Ok((rx, stop)) => stream(rx, wire::LoginEvent::Ping, (StopOnDrop(stop), permit)),
         Err((code, msg)) => refuse(code_or(code, StatusCode::CONFLICT), msg),
     }
@@ -1412,16 +1451,34 @@ async fn login_forget(State(a): State<Arc<Agent>>, Json(f): Json<wire::ForgetReq
     if wire::harness_bin(&f.harness).is_none() || f.files.len() > 4 || !f.files.iter().all(|p| wire::home_path(p)) {
         return refuse(StatusCode::BAD_REQUEST, "Name a harness and its credential files inside HOME.");
     }
-    if a.logins.running().contains(&f.harness) {
+    if let Some(u) = &f.for_user
+        && (!plain_name(u) || *u == a.identity().user_id)
+    {
+        return refuse(StatusCode::BAD_REQUEST, "The teammate's id isn't a plain name, or is this machine's own user.");
+    }
+    if a.logins.running_for(f.for_user.as_deref()).contains(&f.harness) {
         return refuse(StatusCode::CONFLICT, format!("A {} login is running here.", f.harness));
     }
     let user = match a.job_user() {
         Ok(u) => u,
         Err(r) => return r,
     };
-    match runas::as_user(user, || super::terminal::forget(&a.cfg.home, &f.files)) {
+    // A teammate's own login is removed as their user, from their home. One who has no
+    // user here has nothing to remove.
+    let (home, user) = match &f.for_user {
+        None => (a.cfg.home.clone(), user),
+        Some(u) => {
+            let stand_in = a.cfg.teammate_stand_in.is_some();
+            match a.teammates.existing(u, not_teammates(stand_in, user)) {
+                Some(t) => (t.home, Some(t.ids)),
+                None => return Json(wire::ForgetReply { removed: 0 }).into_response(),
+            }
+        }
+    };
+    let whose = if f.for_user.is_some() { "the teammate's" } else { "the Bots'" };
+    match runas::as_user(user, || super::terminal::forget(&home, &f.files)) {
         Ok(removed) => Json(wire::ForgetReply { removed }).into_response(),
-        Err(e) => refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't act as the Bots' user: {e}")),
+        Err(e) => refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("Couldn't act as {whose} user: {e}")),
     }
 }
 
@@ -1713,8 +1770,9 @@ async fn screen_tunnel(State(a): State<Arc<Agent>>, UrlPath(bot): UrlPath<String
 }
 
 /// `PUT /v1/teammates/{user}`: the OS user and home a teammate's runs of this machine's
-/// user's shared Bots get here, made on first use (ADR 0048).
-async fn put_teammate(State(a): State<Arc<Agent>>, UrlPath(user): UrlPath<String>, Json(r): Json<wire::TeammateRequest>) -> Response {
+/// user's shared Bots get here, made on first use (ADR 0048). With `?cred=` (as for
+/// heartbeats), it also says which of their own harness logins exist (ADR 0062).
+async fn put_teammate(State(a): State<Arc<Agent>>, UrlPath(user): UrlPath<String>, RawQuery(q): RawQuery, Json(r): Json<wire::TeammateRequest>) -> Response {
     if r.owner_id != a.identity().user_id {
         return refuse(StatusCode::FORBIDDEN, "This machine runs only its own user's Bots.");
     }
@@ -1726,10 +1784,34 @@ async fn put_teammate(State(a): State<Arc<Agent>>, UrlPath(user): UrlPath<String
             if t.created {
                 println!("Teammate user {} made for runs of shared Bots.", t.user);
             }
-            Json(t.reply()).into_response()
+            let mut reply = t.reply();
+            reply.logins = teammate_logins(&a, &user, Some(&t), q.as_deref());
+            Json(reply).into_response()
         }
         Err(r) => r,
     }
+}
+
+/// `GET /v1/teammates/{user}/logins?cred=...`: which of a teammate's own harness logins
+/// exist here (ADR 0062). Never makes their user: one who has none is logged out.
+async fn get_teammate_logins(State(a): State<Arc<Agent>>, UrlPath(user): UrlPath<String>, RawQuery(q): RawQuery) -> Response {
+    if !plain_name(&user) || user == a.identity().user_id {
+        return refuse(StatusCode::BAD_REQUEST, "The teammate's id isn't a plain name, or is this machine's own user.");
+    }
+    let bots = match a.job_user() {
+        Ok(ids) => ids,
+        Err(r) => return r,
+    };
+    let (b, id) = (a.clone(), user.clone());
+    let found = tokio::task::spawn_blocking(move || {
+        let stand_in = b.cfg.teammate_stand_in.is_some();
+        b.teammates.existing(&id, not_teammates(stand_in, bots))
+    })
+    .await
+    .ok()
+    .flatten();
+    let logins = teammate_logins(&a, &user, found.as_ref(), q.as_deref());
+    Json(wire::TeammateLogins { known: found.is_some(), logins }).into_response()
 }
 
 /// `POST /v1/teammates/{user}/remove`: the teammate left (ADR 0052). Their jobs and
@@ -1761,6 +1843,8 @@ async fn remove_teammate(State(a): State<Arc<Agent>>, UrlPath(user): UrlPath<Str
         return refuse(StatusCode::CONFLICT, "That teammate's user is being removed already.");
     };
     let jobs = a.stop_jobs_for(&user).await;
+    // Their logins run as their user, so stopping its processes below ends them anyway.
+    a.logins.abort_for(&user);
     let mut screens = 0;
     let suffix = format!("@{user}");
     for key in a.screens.report().running.into_iter().filter(|k| k.ends_with(&suffix)) {
@@ -1822,6 +1906,7 @@ pub fn router(a: Arc<Agent>) -> Router {
         .route("/v1/screens/{bot}", axum::routing::put(put_screen).delete(delete_screen))
         .route("/v1/screens/{bot}/tunnel", get(screen_tunnel))
         .route("/v1/teammates/{user}", axum::routing::put(put_teammate))
+        .route("/v1/teammates/{user}/logins", get(get_teammate_logins))
         .route("/v1/teammates/{user}/remove", post(remove_teammate))
         .route("/v1/teammates/{user}/purge", post(purge_teammate))
         .layer(DefaultBodyLimit::max(MAX_RELAY_BODY))
