@@ -19,7 +19,7 @@ botd keeps the organisation's data in one SQLite database, `DATA_DIR/app.sqlite`
 | Audit log | Append-only rows ([ADR 0009](../adr/0009-audit-events.md)). |
 | Billing: Stripe customer IDs, subscriptions, usage and token counts | Rows. No card data ([ADR 0040](../adr/0040-billing-v0-tier-limits.md), [ADR 0042](../adr/0042-billing-checkout-portal-customers.md), [ADR 0050](../adr/0050-billing-period-token-usage.md)). |
 | Machine records, certificates, backup and restore records | Rows ([ADR 0031](../adr/0031-machine-enrollment-mtls.md), [ADR 0071](../adr/0071-off-host-machine-backups.md)). |
-| Each user's facts and Bots' memory, when runs are on this server | Files: `DATA_DIR/users/<id>/USER.md`, `DATA_DIR/bots/<id>/`. |
+| Each user's facts and Bots' memory | Files: `DATA_DIR/users/<id>/USER.md`, `DATA_DIR/bots/<id>/`, kept for every run, here or on a machine. A run on a machine sends the changed files back and botd writes them here (up to 1 MiB each). With per-user accounts, runs here work on a copy in the user's folder, which botd copies back. |
 | Each user's working folder, when runs are on this server | Files: `WORKSPACE_DIR/users/<id>/`, owned by that user's Unix account ([ADR 0058](../adr/0058-harness-os-user-by-default.md)). |
 | The master key | A file or environment variable **outside** `DATA_DIR` (`SUPERBOT_MASTER_KEY`, `SUPERBOT_MASTER_KEY_FILE`, or `~/.config/superbot/master.key`). Never in backups. |
 
@@ -28,7 +28,7 @@ botd keeps the organisation's data in one SQLite database, `DATA_DIR/app.sqlite`
 | Data | Notes |
 |------|-------|
 | The user's working folder (`work/`) | Copied once from the server when `MACHINE_FOLDER_SYNC=on`, then lives on the machine ([ADR 0041](../adr/0041-machine-harness-logins-and-folder-copy.md)). |
-| Bots' memory and the user's `USER.md` | Seeded from the server where the machine has none. |
+| Bots' memory and the user's `USER.md` | Copies of botd's, so both sides hold them. A run takes botd's copy with it (the facts only when none of the owner's other Bots is running there) and sends changes back. A teammate's run gets no `USER.md` and sends none back ([ADR 0046](../adr/0046-shared-bots-under-isolation.md)). |
 | Harness logins (`~/.claude/.credentials.json`, `~/.codex/auth.json`) | Written by the harness's own login on the machine. botd relays the login terminal without saving it or the login files; the audit log records only how many characters were typed. The files are part of the machine's disk, so **machine backups contain them**: Incus backups copy the whole container, homes included, to S3-compatible storage, unencrypted unless `MACHINE_BACKUP_AGE_RECIPIENTS` is set, and Linode Backups hold them too ([ADR 0041](../adr/0041-machine-harness-logins-and-folder-copy.md), [ADR 0062](../adr/0062-teammate-harness-logins.md), [ADR 0071](../adr/0071-off-host-machine-backups.md)). |
 | Harness sessions and the Hermes Agent environment | One shared Hermes install per machine, a home per Bot ([ADR 0072](../adr/0072-one-hermes-environment-per-computer.md)). |
 | Screens | Live X displays. Nothing is recorded ([ADR 0045](../adr/0045-screens-on-machines.md)). |
