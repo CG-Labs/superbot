@@ -49,7 +49,7 @@ Each removal is a row in `account_removals` (owner, teammate, account, reason, f
 ### Running things and shared Bots
 
 - A gate keeps runs and removals of a pair apart (`teammate_removals::Gate`). A teammate's run, and a login while it starts, holds the pair's account open. A removal closes it: no new run or login starts there while it's being removed or a removal is pending (the run is refused, `account_being_removed`, and the login gets a 409), and once let in, a run checks the teammate's access again, so one that passed its check just before access was revoked doesn't make a new account.
-- The removal stops the teammate's runs of the owner's Bots (`bot.run_finished` with `account_removed`) and waits up to 60 s for them to end, so each saves its memory copy back to botd first. A run that doesn't end in time fails the try, which is retried. Then it stops their harness logins (`teammate_logins::stop_for`), and the helper kills whatever is left.
+- The removal stops the teammate's runs of the owner's Bots in that account (`bot.run_finished` with `account_removed`); their runs on the owner's machine go on. It waits up to 60 s for them to end, so each saves its memory copy back to botd first. A run that doesn't end in time fails the try, which is retried. Then it stops their harness logins (`teammate_logins::stop_for`), and the helper kills whatever is left.
 - Shared Bots keep working for everyone else: their state, memory and settings live in `DATA_DIR` and in other accounts' folders, never in the leaver's pair folder.
 
 ## Alternatives considered

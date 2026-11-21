@@ -59,6 +59,8 @@ struct Run {
     hook_wait: Option<Duration>,
     /// The folders its tool calls are judged by, when it isn't on this server.
     ctx: Option<Ctx>,
+    /// The teammate whose account here it runs in (ADR 0064), if any.
+    teammate: Option<String>,
 }
 
 /// Where a run happens: here, or on its owner's machine (ADR 0036).
@@ -854,6 +856,7 @@ impl App {
                     hooks: hooks.clone(),
                     hook_wait: guard.as_ref().map(|g| g.wait),
                     ctx: spot.ctx.clone(),
+                    teammate: teammate.map(String::from),
                 });
             }
             self.send(json!({ "type": "status", "botId": bot.id, "working": true, "status": "Thinking" }));
@@ -1759,13 +1762,14 @@ impl App {
         true
     }
 
-    /// Stops the runs going now for `teammate` of `owner`'s Bots, whose account here is
-    /// being removed (ADR 0066). Each saves its memory copy as it ends. How many.
+    /// Stops the runs going now in `teammate`'s account here for `owner`'s Bots, which is
+    /// being removed (ADR 0066). Their runs elsewhere go on. Each saves its memory copy as
+    /// it ends. How many.
     pub fn stop_teammate_runs(&self, owner: &str, teammate: &str) -> u32 {
-        let theirs: Vec<String> = self.askers.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|(_, a)| *a == teammate).map(|(b, _)| b.clone()).collect();
+        let theirs: Vec<String> = self.state().iter().filter(|(_, s)| s.run.as_ref().is_some_and(|r| r.teammate.as_deref() == Some(teammate))).map(|(id, _)| id.clone()).collect();
         let mut n = 0;
         for id in theirs.iter().filter(|id| self.db.bot(id).is_some_and(|b| b.owner_id == owner)) {
-            if let Some(r) = self.state().get(id).and_then(|s| s.run.as_ref()) {
+            if let Some(r) = self.state().get(id).and_then(|s| s.run.as_ref()).filter(|r| r.teammate.as_deref() == Some(teammate)) {
                 r.abort.send_if_modified(|v| v.get_or_insert("removed") == &"removed");
                 n += 1;
             }
@@ -1958,6 +1962,7 @@ impl App {
             hooks: Arc::default(),
             hook_wait: None,
             ctx: None,
+            teammate: None,
         };
         self.state().entry(bot_id.into()).or_default().run = Some(run);
         id
@@ -2425,7 +2430,7 @@ mod tests {
         let (tx, rx) = watch::channel(None);
         let hook_wait = guarded.then_some(Duration::from_secs(60));
         app.state().entry(bot_id.into()).or_default().run =
-            Some(Run { id: "r1".into(), grants: Vec::new(), abort: tx, status: String::new(), draft: String::new(), hooks: Default::default(), hook_wait, ctx: None });
+            Some(Run { id: "r1".into(), grants: Vec::new(), abort: tx, status: String::new(), draft: String::new(), hooks: Default::default(), hook_wait, ctx: None, teammate: None });
         rx
     }
 
@@ -2447,5 +2452,21 @@ mod tests {
         app.stop_unguarded_runs();
         assert_eq!(*unguarded.borrow(), Some("policy"));
         assert_eq!(*guarded.borrow(), None);
+    }
+
+    #[test]
+    fn removing_a_teammates_account_stops_only_runs_in_it() {
+        let app = test_app();
+        let here = app.db.create_bot("Here", "#fff", "waddle", "claude", None, false);
+        let there = app.db.create_bot("There", "#fff", "waddle", "claude", None, false);
+        let (in_account, on_machine) = (fake_run(&app, &here.id, false), fake_run(&app, &there.id, false));
+        app.state().get_mut(&here.id).and_then(|s| s.run.as_mut()).unwrap().teammate = Some("cy".into());
+        for b in [&here, &there] {
+            app.askers.lock().unwrap().insert(b.id.clone(), "cy".into());
+        }
+
+        assert_eq!(app.stop_teammate_runs(&here.owner_id, "cy"), 1);
+        assert_eq!(*in_account.borrow(), Some("removed"));
+        assert_eq!(*on_machine.borrow(), None, "a run on the owner's machine doesn't use the account");
     }
 }
