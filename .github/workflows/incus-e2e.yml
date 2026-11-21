@@ -4,7 +4,7 @@ name: incus-e2e
 # runner becomes the Incus host and botd's tests make, enroll, isolate, suspend,
 # resume, resize, rebuild and destroy real containers (ADR 0069), and back one up to
 # an S3-compatible store on loopback and restore it (ADR 0071), timing the restore
-# against its tier's RTO (ADR 0073). Runs when the machines code changes, weekly, and
+# against its tier's RTO (ADR 0074). Runs when the machines code changes, weekly, and
 # by hand.
 
 on:
@@ -111,7 +111,7 @@ jobs:
           set -a; . "$RUNNER_TEMP/incus-e2e/incus-e2e.env"; set +a
           SUPERBOT_INCUS_E2E_BIN_DIR="$GITHUB_WORKSPACE/target/debug" "$(cat /tmp/test-bin)" --ignored --exact --nocapture \
             machines_incus_e2e_tests::real_incus_containers_enroll_stay_apart_and_follow_the_lifecycle
-      - name: The restore drill's timing (ADR 0073)
+      - name: The restore drill's timing (ADR 0074)
         if: always() && matrix.expect != 'too-old'
         run: |
           f="$RUNNER_TEMP/restore-drill.json"

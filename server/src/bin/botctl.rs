@@ -141,7 +141,7 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine backups [<user>]                  Off-host backups (ADR 0071): every one and the settings, or the user's and its last restore
   botctl machine backup <user>                     Back it up to object storage now
   botctl machine recovery                          Each tier's RPO and RTO, machines past their RPO, and how
-                                                   long restores took (ADR 0073)
+                                                   long restores took (ADR 0074)
   botctl machine restore <user> <backup-id> [--identity <age-key-file>] --yes  Make it again from that backup; it enrolls anew
   botctl machine restore <user> status             How its latest restore went
   botctl machine bot-user <user>                   Run its Bots as their own OS user now (MACHINE_BOT_USER), retrying a failure
@@ -683,7 +683,7 @@ fn rebuild_request(args: &[&str]) -> Result<(&'static str, String, Option<String
     })
 }
 
-/// `botctl machine backups|backup|recovery|restore ...` (ADR 0071, 0073): the request to send. The
+/// `botctl machine backups|backup|recovery|restore ...` (ADR 0071, 0074): the request to send. The
 /// identity file is read here and sent for this restore only.
 fn backup_request(args: &[&str], read: impl Fn(&str) -> Result<String, String>) -> Result<(&'static str, String, Option<String>), String> {
     let at = |user: &str, verb: &str| format!("/api/users/{}/machine/{verb}", encode(user));

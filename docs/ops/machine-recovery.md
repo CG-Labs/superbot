@@ -1,6 +1,6 @@
 # Machine recovery: RPO, RTO and drills
 
-How botd holds users' Incus containers to a recovery point objective (RPO) and a recovery time objective (RTO) per tier, how it tells you when one is missed, and how to drill a restore. Design: [ADR 0073](../adr/0073-machine-rpo-and-rto.md). Backups and restores themselves: [ADR 0071](../adr/0071-off-host-machine-backups.md) and [setup](incus-containers.md#7-off-host-backups-optional). The text for customers is in [machine recovery objectives](../security/machine-recovery-objectives.md).
+How botd holds users' Incus containers to a recovery point objective (RPO) and a recovery time objective (RTO) per tier, how it tells you when one is missed, and how to drill a restore. Design: [ADR 0074](../adr/0074-machine-rpo-and-rto.md). Backups and restores themselves: [ADR 0071](../adr/0071-off-host-machine-backups.md) and [setup](incus-containers.md#7-off-host-backups-optional). The text for customers is in [machine recovery objectives](../security/machine-recovery-objectives.md).
 
 This needs off-host backups on (`MACHINE_BACKUP_S3_BUCKET` set). Linode machines use Linode's own backups and aren't tracked.
 

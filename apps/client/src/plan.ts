@@ -20,6 +20,7 @@ export function planUsageLines(plan: PlanUsage): string[] {
   if (u.tokens != null) lines.push(`Model tokens ${period}: ${of(u.tokens, l.monthlyTokens)}`);
   if (u.day != null) lines.push(`Routine runs today (UTC): ${of(u.routineRuns, l.dailyRoutineRuns)}`);
   if (l.machineType) lines.push(`Machine size on this plan: ${l.machineType}`);
+  if (l.concurrentRuns != null) lines.push(`Tasks at once on their machine: ${l.concurrentRuns}`);
   return lines;
 }
 

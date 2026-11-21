@@ -43,7 +43,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const DEFAULT_INTERVAL_HOURS: i64 = 24;
-/// The schedule when MACHINE_BACKUP_INTERVAL_HOURS is unset (ADR 0073): the default
+/// The schedule when MACHINE_BACKUP_INTERVAL_HOURS is unset (ADR 0074): the default
 /// tiers' targets. Any other tier gets the bare value.
 pub const DEFAULT_INTERVALS: &str = "24,pro=12,max=6";
 pub const DEFAULT_RETENTION_DAYS: i64 = 14;
@@ -165,7 +165,7 @@ pub struct Settings {
     /// Starts every key, ending in `/` unless empty.
     pub prefix: String,
     pub recipients: Vec<age::x25519::Recipient>,
-    /// Hours between a machine's backups (ADR 0073).
+    /// Hours between a machine's backups (ADR 0074).
     pub interval: PerTier,
     /// Hours a machine may go without a newer backup before it breaches its RPO. Tiers
     /// not named: their interval plus RPO_HEADROOM_HOURS.

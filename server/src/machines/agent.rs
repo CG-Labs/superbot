@@ -22,7 +22,8 @@
 //! - `SUPERBOT_HARNESS_PATH`: PATH for harnesses (default `<tools>/bin`, then
 //!   `<home>/.local/bin`, then the system's). A harness counts as installed only if it
 //!   resolves to a file under the tools, the home or `PROGRAM_ROOTS`.
-//! - `SUPERBOT_MAX_JOBS`: jobs at once (default 8).
+//! - `SUPERBOT_MAX_JOBS`: jobs at once (default 32), a backstop: botd keeps the cap by
+//!   the owner's tier and queues the rest (ADR 0073).
 //! - `SUPERBOT_AGENT_BIN`: this binary, replaced by upgrades (ADR 0039; default
 //!   `/usr/local/lib/superbot/superbot-machine`).
 //! - `SUPERBOT_BOT_USER`: the OS user Bots run as once botd asks (ADR 0043; default
@@ -194,7 +195,7 @@ impl Config {
         let max_jobs = var("SUPERBOT_MAX_JOBS")
             .map(|v| v.parse().map_err(|_| "SUPERBOT_MAX_JOBS must be a number"))
             .transpose()?
-            .unwrap_or(8)
+            .unwrap_or(32)
             .max(1);
         let bot_user = var("SUPERBOT_BOT_USER").unwrap_or_else(|| wire::BOT_USER.into());
         if !runas::plain_user(&bot_user) || bot_user == "root" {

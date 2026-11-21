@@ -297,7 +297,7 @@ pub enum NoticeKind {
     Approval,
     Digest,
     Test,
-    /// About the server, not an approval (ADR 0073): `Notice::alert`.
+    /// About the server, not an approval (ADR 0074): `Notice::alert`.
     Alert,
 }
 
@@ -312,7 +312,7 @@ impl NoticeKind {
     }
 }
 
-/// Something admins need to act on, such as a machine past its RPO (ADR 0073). It goes
+/// Something admins need to act on, such as a machine past its RPO (ADR 0074). It goes
 /// to the global email list and webhook, never to a Bot's deciders or own webhook.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

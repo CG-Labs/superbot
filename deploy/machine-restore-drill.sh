@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Restore drill for a managed machine (ADR 0073): restores a drill user's machine from an off-host
+# Restore drill for a managed machine (ADR 0074): restores a drill user's machine from an off-host
 # backup through botd's admin API, waits for it to enroll again, and checks how long it took against
 # the tier's RTO, as botd recorded it. Everything on that machine since the backup is lost, so run it
 # only against a machine kept for drills, never a customer's. docs/ops/machine-recovery.md.

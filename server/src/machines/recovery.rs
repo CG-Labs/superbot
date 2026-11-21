@@ -1,4 +1,4 @@
-//! Recovery objectives for machines with off-host backups (ADR 0073). Each tier has an
+//! Recovery objectives for machines with off-host backups (ADR 0074). Each tier has an
 //! RPO (how old the newest off-host copy of a machine may get) and an RTO (how long a
 //! restore may take, from the request to the machine enrolling again), set beside its
 //! backup schedule (`backup::Settings`).
@@ -100,7 +100,7 @@ pub fn view(app: &App, cp: &ControlPlane, off: &Offsite, m: &Machine) -> Value {
     })
 }
 
-/// Whether a finished restore met its RTO. None: not finished, or from before ADR 0073.
+/// Whether a finished restore met its RTO. None: not finished, or from before ADR 0074.
 fn within(r: &MachineRestore) -> Option<bool> {
     Some(r.duration_ms? <= r.rto_ms?)
 }

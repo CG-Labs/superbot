@@ -1210,7 +1210,7 @@ fn migrate_machine_backups(c: &Connection, _fresh: bool) -> rusqlite::Result<()>
     )
 }
 
-/// Recovery objectives (ADR 0073): each restore's tier, RTO and how long it took, and
+/// Recovery objectives (ADR 0074): each restore's tier, RTO and how long it took, and
 /// each time a machine went past its RPO.
 fn migrate_machine_recovery(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
     let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machine_restores') WHERE name = 'rto_ms'", [], |r| r.get(0))?;
@@ -1240,7 +1240,7 @@ fn migrate_machine_recovery(c: &Connection, _fresh: bool) -> rusqlite::Result<()
     )
 }
 
-/// A time a machine had no off-host backup newer than its RPO (ADR 0073). `breached_at`
+/// A time a machine had no off-host backup newer than its RPO (ADR 0074). `breached_at`
 /// is when that began (`covered_since` + `rpo_ms`), `detected_at` when botd saw it.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1334,7 +1334,7 @@ pub struct MachineRestore {
     /// When the restored disk took the old one's place.
     pub replaced_at: Option<i64>,
     pub finished_at: Option<i64>,
-    /// The machine's tier and its RTO when the restore was asked for (ADR 0073).
+    /// The machine's tier and its RTO when the restore was asked for (ADR 0074).
     pub tier: Option<String>,
     pub rto_ms: Option<i64>,
     /// From the request to the machine enrolling again, once done.
@@ -4833,7 +4833,7 @@ impl Db {
         s.query_map([limit], machine_restore_row).unwrap().filter_map(Result::ok).collect()
     }
 
-    /// How long a finished restore took (ADR 0073).
+    /// How long a finished restore took (ADR 0074).
     /// Moves an enrolling restore to done with how long it took, in one write so a restart
     /// can't leave it done without its timing. Returns whether it moved.
     pub fn machine_restore_done(&self, id: &str, duration_ms: i64) -> bool {
@@ -4854,7 +4854,7 @@ impl Db {
             == 1
     }
 
-    // RPO breaches (ADR 0073)
+    // RPO breaches (ADR 0074)
 
     /// Opens a breach for the machine, unless one is open. Returns it if this call did.
     pub fn machine_rpo_breach_start(&self, id: &str, m: &Machine, rpo_ms: i64, covered_since: i64) -> Option<MachineRpoBreach> {

@@ -243,7 +243,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
       } else if (evt.type === "status") {
         setBots((bs) =>
           bs.map((b) =>
-            b.id === evt.botId ? { ...b, working: evt.working, status: evt.status } : b,
+            b.id === evt.botId ? { ...b, working: evt.working, status: evt.status, queued: evt.queued } : b,
           ),
         );
         if (!evt.working) {

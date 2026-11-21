@@ -87,6 +87,9 @@ mod setup_http_tests;
 mod shared_bots_http_tests;
 mod scripts;
 mod shell;
+mod slots;
+#[cfg(test)]
+mod slots_http_tests;
 mod signups;
 #[cfg(test)]
 mod signups_http_tests;
@@ -279,6 +282,12 @@ async fn main() {
     }, screens);
     let _ = app.tiers.set(Arc::new(tiers));
     println!("Tiers: {}.", app.tiers().describe());
+    let run_cap = slots::parse_cap(&env("MAX_CONCURRENT_RUNS", "")).unwrap_or_else(|e| exit(e));
+    let _ = app.run_cap.set(run_cap);
+    match run_cap {
+        Some(n) => println!("Runs at once: {n} on this server, and on a machine whose owner's tier sets no concurrentRuns; more wait their turn (MAX_CONCURRENT_RUNS, ADR 0073)."),
+        None => println!("Runs at once: no cap on this server (MAX_CONCURRENT_RUNS=off); machines follow their owner's tier's concurrentRuns."),
+    }
     let _ = app.shared_bots.set(shared_bots);
     let _ = app.resume_routines_on_enable.set(resume_routines);
     println!(

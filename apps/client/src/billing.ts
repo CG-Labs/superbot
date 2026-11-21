@@ -35,6 +35,7 @@ export function limitSummary(limits: TierView["limits"]): string[] {
   ];
   if (limits.monthlyTokens != null) lines.splice(2, 0, n(limits.monthlyTokens, "model token a month", "model tokens a month", ""));
   if (limits.machineType) lines.push(`Machine: ${limits.machineType}`);
+  if (limits.concurrentRuns != null) lines.push(n(limits.concurrentRuns, "task at once", "tasks at once", ""));
   return lines;
 }
 

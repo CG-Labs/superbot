@@ -535,7 +535,7 @@ async fn backup_and_restore(env: &Env, uid: &str, m: &crate::db::Machine, other:
     }
     env.say(&format!("restored container enrolled anew ({}s)", t.elapsed().as_secs()));
 
-    // The restore drill (ADR 0073): timed from the request to enrollment, within the tier's RTO.
+    // The restore drill (ADR 0074): timed from the request to enrollment, within the tier's RTO.
     let r = env.app.db.machine_restore(&rid).unwrap();
     let (took, rto) = (r.duration_ms.expect("a finished restore is timed"), r.rto_ms.unwrap());
     let drill = json!({

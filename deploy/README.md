@@ -444,6 +444,7 @@ Each tier's `limits` ([ADR 0040](../docs/adr/0040-billing-v0-tier-limits.md)) ar
 | `monthlyRuns` | Bot runs per calendar month (UTC) | Runs are refused, and the Bot says why. |
 | `dailyRoutineRuns` | Routine runs per day (UTC) | Routine firings are skipped until midnight. The Bot says so once a day. |
 | `machineType` | The Linode plan (`g6-standard-2`, …) for the user's machine | Admins can't request or resize their machine to another size. Without one, `MACHINE_TIERS` decides as before. |
+| `concurrentRuns` | Bot runs at once on the user's machine ([ADR 0073](../docs/adr/0073-concurrent-runs-per-machine.md)) | More runs wait their turn, oldest first; the Bot shows it's queued and can be stopped. Without one, `MAX_CONCURRENT_RUNS` (default 8). Runs on this server share `MAX_CONCURRENT_RUNS` instead. |
 
 Every refusal is in the audit log (`bot.create_refused`, `routine.run_refused`, `machine.refused`, `bot.run_refused`). `botctl usage` (or `GET /api/usage`, admins) lists each person's use against their limits and flags anyone over, for example after moving to a smaller plan; the client shows the same on each user.
 

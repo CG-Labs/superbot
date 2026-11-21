@@ -291,7 +291,7 @@ function machineActions(m) {
   }
 }
 
-// Against its tier's RPO and RTO (ADR 0073), when off-host backups are on.
+// Against its tier's RPO and RTO (ADR 0074), when off-host backups are on.
 function recoveryCell(m) {
   const r = m.recovery;
   if (!r) return "";
