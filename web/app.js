@@ -373,6 +373,8 @@ function auditQuery() {
   if (person) p.set("actor", `user:${person}`);
   else if ($("au-actor").value) p.set("actor", $("au-actor").value);
   if ($("au-method").value) p.set("method", $("au-method").value);
+  const target = $("au-target").value.trim();
+  if (target) p.set("target", target);
   // Whole days in the browser's time zone, sent as unix ms.
   const day = (id, add) => {
     const v = $(id).value;
@@ -461,11 +463,90 @@ let policySandbox = true;
 
 async function loadSettings() {
   await queuePolicy(loadPolicy);
+  loadNotifications();
   loadLicense();
   loadSignIn();
   loadSecrets();
   loadScim();
 }
+
+// Approval notifications (ADR 0059): email through botd's SMTP settings and a webhook.
+// The webhook URL is a secret: botd keeps it sealed and shows only its host.
+
+function showNotifications(v) {
+  const s = v.settings;
+  $("notify-email").checked = s.email.enabled;
+  $("notify-email").disabled = !v.email.configured && !s.email.enabled;
+  $("notify-to").value = s.email.to.join(", ");
+  $("notify-deciders").checked = s.email.deciders;
+  $("notify-webhook").checked = s.webhook.enabled;
+  $("notify-format").value = s.webhook.format;
+  const url = $("notify-url");
+  url.value = "";
+  url.disabled = !v.webhook.writable;
+  url.placeholder = v.webhook.set ? `Replace the URL (now ${v.webhook.host || "set"})` : "Webhook URL, like https://hooks.slack.com/services/...";
+  $("notify-url-remove").hidden = !v.webhook.set || !v.webhook.writable;
+  $("notify-delay").value = s.delaySeconds;
+  $("notify-throttle").value = s.throttleSeconds;
+  $("notify-detail").value = s.detail;
+  const lines = [
+    v.email.configured ? `Email goes through ${v.email.server}.` : "Email isn't set up: set SMTP_HOST and SMTP_FROM in .env and restart botd.",
+    v.webhook.set
+      ? `Webhook URL set (${v.webhook.host || "unknown host"})${v.webhook.writable ? "" : ", by botd's environment: change it in .env"}.`
+      : "No webhook URL yet.",
+  ];
+  $("notify-status").innerHTML = lines.map((l) => `<p class="hint">${esc(l)}</p>`).join("")
+    + (v.links.problem ? `<p class="warn">${esc(v.links.problem)}</p>` : "");
+}
+
+async function loadNotifications() {
+  try {
+    showNotifications(await api("GET", "/api/notifications"));
+  } catch (err) {
+    $("notify-status").innerHTML = `<p class="warn">${esc(err.message)}</p>`;
+  }
+}
+
+$("notify-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const seconds = (id) => ($(id).value === "" ? undefined : Number($(id).value));
+  const body = {
+    email: { enabled: $("notify-email").checked, to: $("notify-to").value.split(/[\s,;]+/).filter(Boolean), deciders: $("notify-deciders").checked },
+    webhook: { enabled: $("notify-webhook").checked, format: $("notify-format").value },
+    delaySeconds: seconds("notify-delay"),
+    throttleSeconds: seconds("notify-throttle"),
+    detail: $("notify-detail").value,
+  };
+  const url = $("notify-url").value.trim();
+  if (url) body.webhook.url = url;
+  try {
+    showNotifications(await api("PUT", "/api/notifications", body));
+    notice("Notifications saved.", false);
+  } catch (err) {
+    fail(err);
+  }
+});
+
+$("notify-url-remove").addEventListener("click", async () => {
+  if (!confirm("Remove the webhook URL? The webhook turns off.")) return;
+  try {
+    showNotifications(await api("PUT", "/api/notifications", { webhook: { url: null } }));
+    notice("Webhook URL removed.", false);
+  } catch (err) {
+    fail(err);
+  }
+});
+
+$("notify-test").addEventListener("click", async () => {
+  try {
+    const r = await api("POST", "/api/notifications/test", {});
+    const name = (c) => (c === "email" ? "Email" : c === "webhook" ? "Webhook" : c);
+    if (r.ok) notice(`Test sent: ${r.results.map((x) => name(x.channel).toLowerCase()).join(" and ")}.`, false);
+    else notice(r.results.filter((x) => !x.ok).map((x) => `${name(x.channel)} failed: ${x.error || "see the audit log"}`).join(" "));
+  } catch (err) {
+    fail(err);
+  }
+});
 
 // The license (ADR 0038). botd checks the key; once saved it's never sent back.
 
@@ -1024,9 +1105,14 @@ $("setup-body").addEventListener("submit", async (e) => {
 
 const TABS = { users: loadUsers, requests: loadRequests, machines: loadMachines, audit: () => loadAudit(), settings: loadSettings, setup: loadSetup };
 
+// `#audit?target=approval:<id>`: a notification's link to one approval's trail (ADR 0059).
 function showTab() {
-  const name = location.hash.slice(1);
+  const [name, query] = location.hash.slice(1).split("?");
   const tab = name in TABS ? name : "users";
+  if (tab === "audit" && query) {
+    const q = new URLSearchParams(query);
+    $("au-target").value = q.get("target") || "";
+  }
   for (const t of Object.keys(TABS)) $(`tab-${t}`).hidden = t !== tab;
   for (const a of document.querySelectorAll("#tabs a")) a.classList.toggle("on", a.dataset.tab === tab);
   TABS[tab]();
