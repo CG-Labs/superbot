@@ -225,10 +225,17 @@ pub fn checks(app: &App, now_ms: i64) -> Vec<(&'static str, Health)> {
         out.push(("machines", machines_health(&machine_facts(app, cp, now_ms))));
     }
     out.push(("runners", runners_health(&m.recent(now_ms, RECENT_MINUTES))));
-    if app.notifier.get().is_some() {
+    if notifications_on(app) {
         out.push(("notifications", notifications_health(&m.recent(now_ms, RECENT_MINUTES))));
     }
     out
+}
+
+/// A channel that sends: email with SMTP set up and turned on, the global webhook, or push.
+fn notifications_on(app: &App) -> bool {
+    let Some(n) = app.notifier.get() else { return false };
+    let s = crate::notify::load(&app.db);
+    (n.smtp.is_some() && s.email.enabled) || s.webhook.enabled || n.push.is_some()
 }
 
 fn name_of(id: &str) -> &'static str {
@@ -250,16 +257,17 @@ fn public_incident(i: &StatusIncident) -> Value {
     })
 }
 
-/// The whole page's data: checks, raised by open incidents, and recent incidents.
+/// The whole page's data: checks, raised by every open incident, and recent incidents.
+/// If the database can't be read, the checks already say so and the lists are empty.
 pub fn snapshot(app: &App, now_ms: i64) -> Value {
-    let incidents = app.db.status_incidents(now_ms - HISTORY_DAYS * 86_400_000, PUBLIC_INCIDENTS, PUBLIC_UPDATES);
-    let open: Vec<&StatusIncident> = incidents.iter().filter(|i| i.resolved_at.is_none()).collect();
+    let incidents = app.db.status_incidents(now_ms - HISTORY_DAYS * 86_400_000, PUBLIC_INCIDENTS, PUBLIC_UPDATES).unwrap_or_default();
+    let open = app.db.status_incidents_open().unwrap_or_default();
     let mut overall = Level::Operational;
     let components: Vec<Value> = checks(app, now_ms)
         .into_iter()
         .map(|(id, (mut level, mut note))| {
-            for i in open.iter().filter(|i| i.components.iter().any(|c| c == id)) {
-                let raised = Level::of_impact(&i.impact);
+            for (impact, _) in open.iter().filter(|(_, comps)| comps.iter().any(|c| c == id)) {
+                let raised = Level::of_impact(impact);
                 if raised > level {
                     level = raised;
                     note = None;
@@ -270,8 +278,8 @@ pub fn snapshot(app: &App, now_ms: i64) -> Value {
         })
         .collect();
     // An open incident that names no component still says how bad things are.
-    for i in &open {
-        overall = overall.max(Level::of_impact(&i.impact));
+    for (impact, _) in &open {
+        overall = overall.max(Level::of_impact(impact));
     }
     json!({
         "status": overall,
@@ -340,12 +348,15 @@ fn off() -> Response {
     (StatusCode::NOT_FOUND, Json(json!({ "error": "The status page is off (STATUS_PAGE=off)." }))).into_response()
 }
 
-/// `GET /status.json`: open to anyone.
+/// `GET /status.json`: open to anyone. A major outage answers 503 (with the same body), so
+/// an uptime probe that wants a 2xx counts it as down, as docs/slo.md does.
 pub async fn json_page(State(app): State<AppState>) -> Response {
     if !app.status.enabled() {
         return off();
     }
-    let mut res = Json(app.status.get(&app)).into_response();
+    let s = app.status.get(&app);
+    let code = if level_of(&s["status"]) == Level::MajorOutage { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK };
+    let mut res = (code, Json(s)).into_response();
     public_headers(&mut res, "default-src 'none'; frame-ancestors 'none'");
     res
 }
@@ -485,8 +496,18 @@ fn components(v: &Value) -> Result<Option<Vec<String>>, crate::ApiError> {
     Ok(Some(out))
 }
 
+fn db_err(e: rusqlite::Error) -> crate::ApiError {
+    crate::obs::log::line(crate::obs::log::Level::Warn, &format!("WARNING: status incidents: {e}"));
+    crate::ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Couldn't save that. Try again.".into())
+}
+
 fn need_incident(app: &App, id: &str) -> Res<StatusIncident> {
-    app.db.status_incident(id).ok_or_else(|| not_found("Incident"))
+    app.db.status_incident(id).map_err(db_err)?.ok_or_else(|| not_found("Incident"))
+}
+
+/// A write that changed nothing: the incident went between reading it and writing.
+fn changed(done: rusqlite::Result<bool>) -> Res<()> {
+    if done.map_err(db_err)? { Ok(()) } else { Err(not_found("Incident")) }
 }
 
 fn incident_event(by: &Who, action: &str, i: &StatusIncident) -> crate::audit::Event {
@@ -497,7 +518,7 @@ fn incident_event(by: &Who, action: &str, i: &StatusIncident) -> crate::audit::E
 
 /// `GET /api/status/incidents`: the newest 100, open or not, with their authors.
 pub async fn list(State(app): State<AppState>) -> Res {
-    Ok(Json(json!({ "incidents": app.db.status_incidents(0, 100, i64::MAX), "components": COMPONENTS.map(|(id, name)| json!({ "id": id, "name": name })), "enabled": app.status.enabled() })))
+    Ok(Json(json!({ "incidents": app.db.status_incidents(0, 100, i64::MAX).map_err(db_err)?, "components": COMPONENTS.map(|(id, name)| json!({ "id": id, "name": name })), "enabled": app.status.enabled() })))
 }
 
 /// `POST /api/status/incidents` `{title, body, impact?, components?, state?}`.
@@ -508,7 +529,7 @@ pub async fn create(State(app): State<AppState>, Extension(by): Extension<Who>, 
     let state = one_of(&v, "state", &STATES)?.unwrap_or_else(|| "investigating".into());
     let comps = components(&v)?.unwrap_or_default();
     let id = format!("inc_{}", crate::random_hex(6));
-    let i = app.db.status_incident_create(&NewStatusIncident { id: &id, title: &title, impact: &impact, components: &comps, state: &state, body: &body, by: by.actor.id.as_deref() });
+    let i = app.db.status_incident_create(&NewStatusIncident { id: &id, title: &title, impact: &impact, components: &comps, state: &state, body: &body, by: by.actor.id.as_deref() }).map_err(db_err)?;
     app.db.record(&incident_event(&by, "status.incident_created", &i));
     app.status.invalidate();
     Ok((StatusCode::CREATED, Json(json!(i))))
@@ -520,7 +541,7 @@ pub async fn edit(State(app): State<AppState>, Extension(by): Extension<Who>, Pa
     let title = text(&v, "title", MAX_TITLE, false)?;
     let impact = one_of(&v, "impact", &IMPACTS)?;
     let comps = components(&v)?;
-    app.db.status_incident_edit(&id, title.as_deref(), impact.as_deref(), comps.as_deref());
+    changed(app.db.status_incident_edit(&id, title.as_deref(), impact.as_deref(), comps.as_deref()))?;
     let i = need_incident(&app, &id)?;
     app.db.record(&incident_event(&by, "status.incident_updated", &i));
     app.status.invalidate();
@@ -532,7 +553,7 @@ pub async fn add_update(State(app): State<AppState>, Extension(by): Extension<Wh
     need_incident(&app, &id)?;
     let state = one_of(&v, "state", &STATES)?.ok_or_else(|| bad(format!("Send a state: one of {}", STATES.join(", "))))?;
     let body = text(&v, "body", MAX_BODY, true)?.ok_or_else(|| bad("Send a body."))?;
-    app.db.status_incident_add_update(&id, &state, &body, by.actor.id.as_deref());
+    changed(app.db.status_incident_add_update(&id, &state, &body, by.actor.id.as_deref()))?;
     let i = need_incident(&app, &id)?;
     app.db.record(&incident_event(&by, "status.incident_updated", &i));
     app.status.invalidate();
@@ -542,7 +563,7 @@ pub async fn add_update(State(app): State<AppState>, Extension(by): Extension<Wh
 /// `DELETE /api/status/incidents/{id}`: for one posted by mistake. Resolve real ones.
 pub async fn delete(State(app): State<AppState>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     let i = need_incident(&app, &id)?;
-    app.db.status_incident_delete(&id);
+    changed(app.db.status_incident_delete(&id))?;
     app.db.record(&incident_event(&by, "status.incident_deleted", &i));
     app.status.invalidate();
     Ok(Json(json!({ "deleted": id })))

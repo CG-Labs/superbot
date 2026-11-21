@@ -9,10 +9,12 @@ use crate::tests::{audit_list, call, call_with, serve_app, serve_app_with};
 use crate::users_http_tests::{parse, user_with};
 use crate::*;
 
+/// `/status.json`, checking it answers 503 exactly when it reports a major outage.
 async fn public(port: u16) -> Value {
     let (code, body) = call(port, "GET", "/status.json", "", "").await;
-    assert_eq!(code, 200, "{body}");
-    parse(&body)
+    let s = parse(&body);
+    assert_eq!(code, if s["status"] == "major_outage" { 503 } else { 200 }, "{body}");
+    s
 }
 
 fn component<'a>(s: &'a Value, id: &str) -> Option<&'a Value> {
@@ -63,6 +65,36 @@ async fn the_snapshot_is_shared_for_a_few_seconds() {
     assert_eq!(public(port).await["status"], "operational", "still the cached snapshot");
     app.status.invalidate();
     assert_eq!(public(port).await["status"], "major_outage");
+    assert_eq!(call(port, "GET", "/status.json", "", "").await.0, 503, "an uptime probe sees a major outage as down");
+    assert_eq!(call(port, "GET", "/status", "", "").await.0, 200, "people still get the page");
+}
+
+#[tokio::test]
+async fn probes_dont_dilute_the_api_error_share() {
+    let (port, app, _, _) = serve_app().await;
+    app.db.metrics().bump_recent(db::now(), |r| (r.requests, r.errors) = (20, 20));
+    for _ in 0..30 {
+        call(port, "GET", "/healthz", "", "").await;
+        app.status.invalidate();
+        call(port, "GET", "/status.json", "", "").await;
+    }
+    app.status.invalidate();
+    assert_eq!(component(&public(port).await, "api").unwrap()["status"], "major_outage");
+}
+
+#[tokio::test]
+async fn every_open_incident_counts_not_just_those_listed() {
+    let (port, _, owner, _) = serve_app().await;
+    let (code, _) = call(port, "POST", "/api/status/incidents", &owner, r#"{"title":"Down","body":"Everything.","impact":"critical","components":["api"]}"#).await;
+    assert_eq!(code, 201);
+    for n in 0..25 {
+        let body = json!({ "title": format!("Note {n}"), "body": "FYI.", "impact": "none" }).to_string();
+        assert_eq!(call(port, "POST", "/api/status/incidents", &owner, &body).await.0, 201);
+    }
+    let s = public(port).await;
+    assert_eq!(s["incidents"].as_array().unwrap().len(), 20, "the list is capped");
+    assert!(!s.to_string().contains("\"Down\""), "the critical one is off the list: {s}");
+    assert_eq!((s["status"].as_str(), component(&s, "api").unwrap()["status"].as_str()), (Some("major_outage"), Some("major_outage")), "{s}");
 }
 
 #[tokio::test]
@@ -72,6 +104,13 @@ async fn machines_and_notifications_show_when_this_server_uses_them() {
     let _ = app.notifier.set(Arc::new(notify::Notifier::new(None, None)));
     let s = public(port).await;
     assert!(component(&s, "machines").is_some_and(|c| c["status"] == "operational" && c["name"] == "Machines and control plane"), "{s}");
+    assert!(component(&s, "notifications").is_none(), "a notifier with no channel on isn't shown: {s}");
+
+    let mut on = notify::load(&app.db);
+    on.webhook.enabled = true;
+    notify::save(&app.db, &on);
+    app.status.invalidate();
+    let s = public(port).await;
     assert!(component(&s, "notifications").is_some_and(|c| c["status"] == "operational"), "{s}");
 
     for _ in 0..5 {
@@ -142,7 +181,8 @@ async fn admins_post_incidents_that_raise_components_until_resolved() {
     for a in ["status.incident_created", "status.incident_updated", "status.incident_deleted"] {
         assert!(actions.iter().any(|x| x == a), "{a} in {actions:?}");
     }
-    assert!(app.db.status_incident(&id).is_none());
+    assert!(app.db.status_incident(&id).unwrap().is_none());
+    assert_eq!(call(port, "PATCH", &format!("/api/status/incidents/{id}"), &admin, r#"{"title":"x"}"#).await.0, 404);
 }
 
 #[tokio::test]

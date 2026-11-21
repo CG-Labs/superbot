@@ -206,10 +206,13 @@ impl Metrics {
         let mut m = self.lock();
         *m.http.entry((class, method, status_class(code))).or_default() += 1;
         m.http_seconds.entry(class).or_default().observe(&HTTP_BUCKETS, seconds);
-        m.recent.bump(crate::db::now(), |r| {
-            r.requests += 1;
-            r.errors += (code >= 500) as u64;
-        });
+        // Probes would dilute the error share the status page judges the API by.
+        if !matches!(class, "healthz" | "status") {
+            m.recent.bump(crate::db::now(), |r| {
+                r.requests += 1;
+                r.errors += (code >= 500) as u64;
+            });
+        }
     }
 
     /// What happened in the last `minutes` (1 to `RECENT_MINUTES`) up to `now_ms`.
@@ -421,6 +424,8 @@ mod tests {
         let m = Metrics::default();
         m.request("bots", "GET", 200, 0.01);
         m.request("bots", "GET", 503, 0.01);
+        m.request("healthz", "GET", 200, 0.01);
+        m.request("status", "GET", 200, 0.01);
         m.run_finished("claude", "done", 1.0);
         m.run_finished("claude", "timeout", 1.0);
         m.run_finished("claude", "stopped", 1.0);

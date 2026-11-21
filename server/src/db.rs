@@ -5452,97 +5452,100 @@ impl Db {
         s.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().filter_map(Result::ok).collect()
     }
 
-    pub fn status_incident_create(&self, n: &NewStatusIncident) -> StatusIncident {
+    pub fn status_incident_create(&self, n: &NewStatusIncident) -> rusqlite::Result<StatusIncident> {
         let at = now();
         let resolved = (n.state == "resolved").then_some(at);
         let comps = serde_json::to_string(n.components).unwrap_or_else(|_| "[]".into());
-        let c = self.c();
-        c.execute(
-            "INSERT INTO status_incidents (id, title, impact, components, state, created_by, created_at, updated_at, resolved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)",
-            params![n.id, n.title, n.impact, comps, n.state, n.by, at, resolved],
-        )
-        .unwrap();
-        c.execute(
-            "INSERT INTO status_incident_updates (incident_id, state, body, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
-            params![n.id, n.state, n.body, n.by, at],
-        )
-        .unwrap();
-        drop(c);
-        self.status_incident(n.id).expect("just made")
+        {
+            let c = self.c();
+            let tx = c.unchecked_transaction()?;
+            tx.execute(
+                "INSERT INTO status_incidents (id, title, impact, components, state, created_by, created_at, updated_at, resolved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)",
+                params![n.id, n.title, n.impact, comps, n.state, n.by, at, resolved],
+            )?;
+            tx.execute(
+                "INSERT INTO status_incident_updates (incident_id, state, body, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+                params![n.id, n.state, n.body, n.by, at],
+            )?;
+            tx.commit()?;
+        }
+        self.status_incident(n.id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
     }
 
-    pub fn status_incident(&self, id: &str) -> Option<StatusIncident> {
-        let mut i = self.c().query_row("SELECT * FROM status_incidents WHERE id = ?", [id], status_incident_row).optional().ok().flatten()?;
-        i.updates = self.status_updates(&i.id, i64::MAX);
-        Some(i)
+    pub fn status_incident(&self, id: &str) -> rusqlite::Result<Option<StatusIncident>> {
+        let Some(mut i) = self.c().query_row("SELECT * FROM status_incidents WHERE id = ?", [id], status_incident_row).optional()? else {
+            return Ok(None);
+        };
+        i.updates = self.status_updates(&i.id, i64::MAX)?;
+        Ok(Some(i))
     }
 
-    fn status_updates(&self, id: &str, limit: i64) -> Vec<StatusUpdate> {
+    fn status_updates(&self, id: &str, limit: i64) -> rusqlite::Result<Vec<StatusUpdate>> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM status_incident_updates WHERE incident_id = ? ORDER BY id DESC LIMIT ?").unwrap();
-        s.query_map(params![id, limit], |r| {
+        let mut s = c.prepare("SELECT * FROM status_incident_updates WHERE incident_id = ? ORDER BY id DESC LIMIT ?")?;
+        let rows = s.query_map(params![id, limit], |r| {
             Ok(StatusUpdate { id: r.get("id")?, state: r.get("state")?, body: r.get("body")?, created_by: r.get("created_by")?, created_at: r.get("created_at")? })
-        })
-        .unwrap()
-        .filter_map(Result::ok)
-        .collect()
+        })?;
+        rows.collect()
     }
 
     /// Open incidents, and those resolved at or after `resolved_since`, newest first, with
     /// up to `updates` of each one's newest updates.
-    pub fn status_incidents(&self, resolved_since: i64, limit: i64, updates: i64) -> Vec<StatusIncident> {
+    pub fn status_incidents(&self, resolved_since: i64, limit: i64, updates: i64) -> rusqlite::Result<Vec<StatusIncident>> {
         let list: Vec<StatusIncident> = {
             let c = self.c();
-            let mut s = c
-                .prepare("SELECT * FROM status_incidents WHERE resolved_at IS NULL OR resolved_at >= ? ORDER BY resolved_at IS NOT NULL, created_at DESC LIMIT ?")
-                .unwrap();
-            s.query_map(params![resolved_since, limit], status_incident_row).unwrap().filter_map(Result::ok).collect()
+            let mut s = c.prepare("SELECT * FROM status_incidents WHERE resolved_at IS NULL OR resolved_at >= ? ORDER BY resolved_at IS NOT NULL, created_at DESC LIMIT ?")?;
+            let rows = s.query_map(params![resolved_since, limit], status_incident_row)?;
+            rows.collect::<rusqlite::Result<_>>()?
         };
         list.into_iter()
             .map(|mut i| {
-                i.updates = self.status_updates(&i.id, updates);
-                i
+                i.updates = self.status_updates(&i.id, updates)?;
+                Ok(i)
             })
             .collect()
     }
 
-    pub fn status_incident_edit(&self, id: &str, title: Option<&str>, impact: Option<&str>, components: Option<&[String]>) -> bool {
+    /// Every open incident's impact and components, however many there are.
+    pub fn status_incidents_open(&self) -> rusqlite::Result<Vec<(String, Vec<String>)>> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT impact, components FROM status_incidents WHERE resolved_at IS NULL")?;
+        let rows = s.query_map([], |r| Ok((r.get::<_, String>(0)?, serde_json::from_str(&r.get::<_, String>(1)?).unwrap_or_default())))?;
+        rows.collect()
+    }
+
+    pub fn status_incident_edit(&self, id: &str, title: Option<&str>, impact: Option<&str>, components: Option<&[String]>) -> rusqlite::Result<bool> {
         let comps = components.map(|c| serde_json::to_string(c).unwrap_or_else(|_| "[]".into()));
-        self.c()
-            .execute(
-                "UPDATE status_incidents SET title = COALESCE(?1, title), impact = COALESCE(?2, impact), components = COALESCE(?3, components), updated_at = ?4 WHERE id = ?5",
-                params![title, impact, comps, now(), id],
-            )
-            .unwrap_or(0)
-            == 1
+        Ok(self.c().execute(
+            "UPDATE status_incidents SET title = COALESCE(?1, title), impact = COALESCE(?2, impact), components = COALESCE(?3, components), updated_at = ?4 WHERE id = ?5",
+            params![title, impact, comps, now(), id],
+        )? == 1)
     }
 
     /// Adds an update; its state becomes the incident's. Resolving stamps `resolved_at`,
     /// and any other state reopens it.
-    pub fn status_incident_add_update(&self, id: &str, state: &str, body: &str, by: Option<&str>) -> bool {
+    pub fn status_incident_add_update(&self, id: &str, state: &str, body: &str, by: Option<&str>) -> rusqlite::Result<bool> {
         let at = now();
         let c = self.c();
-        let changed = c
-            .execute(
-                "UPDATE status_incidents SET state = ?1, updated_at = ?2,
-                   resolved_at = CASE WHEN ?1 = 'resolved' THEN COALESCE(resolved_at, ?2) ELSE NULL END
-                 WHERE id = ?3",
-                params![state, at, id],
-            )
-            .unwrap_or(0)
-            == 1;
+        let tx = c.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE status_incidents SET state = ?1, updated_at = ?2,
+               resolved_at = CASE WHEN ?1 = 'resolved' THEN COALESCE(resolved_at, ?2) ELSE NULL END
+             WHERE id = ?3",
+            params![state, at, id],
+        )? == 1;
         if changed {
-            c.execute(
+            tx.execute(
                 "INSERT INTO status_incident_updates (incident_id, state, body, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
                 params![id, state, body, by, at],
-            )
-            .unwrap();
+            )?;
         }
-        changed
+        tx.commit()?;
+        Ok(changed)
     }
 
-    pub fn status_incident_delete(&self, id: &str) -> bool {
-        self.c().execute("DELETE FROM status_incidents WHERE id = ?", [id]).unwrap_or(0) == 1
+    pub fn status_incident_delete(&self, id: &str) -> rusqlite::Result<bool> {
+        Ok(self.c().execute("DELETE FROM status_incidents WHERE id = ?", [id])? == 1)
     }
 
     // Hosts (ADR 0076)
