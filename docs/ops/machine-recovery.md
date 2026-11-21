@@ -51,7 +51,7 @@ The console's Machines page shows an off-host backup column (age, the tier's RPO
 
 ### In CI, on a real Incus host
 
-The `incus-e2e` workflow ([ADR 0069](../adr/0069-validating-incus-containers-on-a-real-host.md)) backs a real container up, changes it, restores it, and fails if the restore took longer than the tier's RTO. The timing is in the job summary and in the `restore-drill-<incus>` artifact (`durationMs`, `rtoMs`, `backupBytes`). It runs on changes to the machine code, weekly, and by hand. The CI container's disk is small, so this proves the path and the clock, not how long a full 80 GB disk takes.
+The `incus-e2e` workflow ([ADR 0069](../adr/0069-validating-incus-containers-on-a-real-host.md)) backs a real container up, changes it, restores it, and fails if the restore took longer than the tier's RTO. The timing is in the job summary and in the `restore-drill-<incus>` artifact (`durationMs`, `rtoMs`, `backupBytes`). It runs on changes to the machine code, weekly, and by hand. The CI container's disk is small, so this proves the path and the clock, not how long a full 80 GB disk takes. On the runner a 253 MB backup restores in about a minute, roughly 5 MB/s of import; drill a large machine on your own hardware before you promise 60 minutes for one.
 
 ### By hand, on your server
 

@@ -38,6 +38,8 @@ The default schedule tightens with the tier because the tiers sell more resource
 
 **RTO.** A restore downloads, checks and decrypts the backup while importing it, swaps it in, starts it, and waits for its agent to enroll. The import is proportional to the backup's size. The rest is seconds: [ADR 0069](0069-validating-incus-containers-on-a-real-host.md) measured enrollment at about 6 seconds with a cached image, and the real-host test measures the whole restore on every run (below). Sixty minutes is the same as the self-host server's RTO (ADR 0030). It covers an 80 GB backup at about 25 MB/s with room for the boot. A restore that hasn't enrolled within the enrollment timeout plus ten minutes fails anyway (ADR 0071).
 
+Measured on this PR's real-host runs (GitHub-hosted runner, MinIO beside Incus): a 253 MB backup restored in 55 s on Incus 6 (zabbly) and 68 s on Incus 7 LTS, 40 to 52 s of it the download and import. That is about 5 to 6 MB/s, much slower than the 25 MB/s the RTO assumes for an 80 GB disk. At the CI rate, 60 minutes covers about 20 GB. The runner's nested storage and shared CPU are no guide to a real host, but until the manual drill on production hardware shows a large machine restoring within its RTO, don't put 60 minutes for pro or max in a contract.
+
 ### What botd tracks
 
 **RPO.** A machine is held to its RPO while it is running, or in error after it once enrolled, on this server's provider, with no restore underway. A suspended machine's disk doesn't change, so it isn't. A restore is held to the RTO instead.
