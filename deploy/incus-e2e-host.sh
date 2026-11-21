@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Makes a throwaway Ubuntu host into an Incus host for the real-Incus end-to-end test
-# (server/src/machines_incus_e2e_tests.rs, ADR 0068), the way docs/ops/incus-containers.md
+# (server/src/machines_incus_e2e_tests.rs, ADR 0069), the way docs/ops/incus-containers.md
 # sets one up: a storage pool, a SuperBot-only bridge, a restricted project, the API on
 # the bridge's address, and a trusted client certificate for botd.
 #
@@ -10,7 +10,7 @@
 # certificate and key beside it, owned by the user who ran sudo.
 #
 # INCUS_SOURCE: zabbly (default, the current stable release), zabbly-lts-7.0 (or another
-# Zabbly LTS channel), or ubuntu (the distro's). 6.0 is too old for botd (ADR 0068).
+# Zabbly LTS channel), or ubuntu (the distro's). 6.0 is too old for botd (ADR 0069).
 # POOL_DRIVER: btrfs (default, on a loop file; it enforces disk sizes) or dir.
 set -euo pipefail
 

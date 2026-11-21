@@ -2,11 +2,13 @@
 //! checked offline against the public keys below. It names the licensee, an edition, the
 //! seats (active users) it covers, features, and when it ends.
 //!
-//! Nothing here stops a server. Without a license, or with one that is invalid or long
-//! expired, botd runs as the community edition: every feature works, for up to
-//! [`COMMUNITY_SEATS`] active users. A license that has just ended keeps its seats for
-//! [`GRACE_DAYS`] more. Over the limit, nobody is signed out or disabled; adding or
-//! re-enabling people is refused until a seat is free. The owner (break-glass) account
+//! SuperBot has no free tier (ADR 0068). Without a license, or with one that is invalid
+//! or long expired, botd still starts and admins can still sign in and install a key, but
+//! Bots don't run and nobody takes a seat. The one exception is testing mode
+//! (`TESTING_MODE=on`), which an operator turns on for a test server: no license, billing
+//! off, no seat limit, and every screen says so. A license that has just ended keeps its
+//! seats for [`GRACE_DAYS`] more. Over the limit, nobody is signed out or disabled; adding
+//! or re-enabling people is refused until a seat is free. The owner (break-glass) account
 //! never takes a seat.
 //!
 //! The key comes from `LICENSE_KEY` or `LICENSE_KEY_FILE` (which win, as other settings
@@ -27,11 +29,10 @@ use axum::Json;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, RwLock};
 pub use token::{Claims, Invalid, Key};
 
-/// Active users a server without a valid license may have, the owner account aside.
-pub const COMMUNITY_SEATS: u32 = 10;
 /// Days an ended license keeps its seats and features, so a late renewal breaks nothing.
 pub const GRACE_DAYS: i64 = 14;
 /// Admins are warned this many days before a license ends.
@@ -76,14 +77,14 @@ impl Source {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
-    /// No license: the community edition.
-    Community,
+    /// No license.
+    Unlicensed,
     Active,
     /// Ended less than [`GRACE_DAYS`] ago: still honoured.
     Grace,
-    /// Ended longer ago: the community edition again.
+    /// Ended longer ago: no longer a license.
     Expired,
-    /// Set, but not a license this server accepts: the community edition.
+    /// Set, but not a license this server accepts.
     Invalid,
 }
 
@@ -122,6 +123,17 @@ pub struct Status {
     pub claims: Option<Claims>,
     pub problem: Option<Problem>,
     pub at: i64,
+    /// `TESTING_MODE=on`: the operator runs this server unlicensed, with billing off.
+    pub testing_mode: bool,
+}
+
+/// `TESTING_MODE`: off unless set to on/1/true/yes.
+pub fn testing_flag(raw: &str) -> Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Ok(true),
+        "" | "0" | "false" | "off" | "no" => Ok(false),
+        _ => Err(format!("TESTING_MODE must be on or off, not \"{raw}\"")),
+    }
 }
 
 fn date(ms: i64) -> String {
@@ -134,21 +146,37 @@ impl Status {
         matches!(self.mode, Mode::Active | Mode::Grace)
     }
 
+    /// Running on testing mode: no license is honoured and `TESTING_MODE` is on. A license
+    /// always wins over it.
+    pub fn testing(&self) -> bool {
+        self.testing_mode && !self.licensed()
+    }
+
+    /// Whether Bots may run: a license, or testing mode. Never a free tier.
+    pub fn usable(&self) -> bool {
+        self.licensed() || self.testing_mode
+    }
+
     fn honoured(&self) -> Option<&Claims> {
         self.claims.as_ref().filter(|_| self.licensed())
     }
 
-    /// Active users allowed now, the owner aside. None: unlimited. A license never
-    /// allows fewer than the community edition.
+    /// Active users allowed now, the owner aside. None: unlimited. Without a license
+    /// none, unless testing mode is on.
     pub fn seat_cap(&self) -> Option<u32> {
         match self.honoured() {
-            Some(c) => c.seats.map(|s| s.max(COMMUNITY_SEATS)),
-            None => Some(COMMUNITY_SEATS),
+            Some(c) => c.seats,
+            None if self.testing_mode => None,
+            None => Some(0),
         }
     }
 
     pub fn edition(&self) -> &str {
-        self.honoured().map_or("community", |c| c.edition.as_str())
+        match self.honoured() {
+            Some(c) => c.edition.as_str(),
+            None if self.testing_mode => "testing",
+            None => "none",
+        }
     }
 
     /// For paid modules: whether the license grants `feature` now.
@@ -167,7 +195,7 @@ impl Status {
 
     /// What the audit log keeps of it: never the token.
     pub fn summary(&self) -> Value {
-        let mut v = json!({ "mode": self.mode, "source": self.source, "edition": self.edition(), "seats": self.seat_cap() });
+        let mut v = json!({ "mode": self.mode, "source": self.source, "edition": self.edition(), "seats": self.seat_cap(), "testing": self.testing() });
         if let Some(c) = &self.claims {
             v["id"] = json!(c.jti);
             v["licensee"] = json!(c.sub);
@@ -181,28 +209,47 @@ impl Status {
 
     /// Changes when the license or its mode does; kept to audit changes once.
     fn marker(&self) -> String {
-        match (&self.claims, &self.problem) {
+        let m = match (&self.claims, &self.problem) {
             (Some(c), _) => format!("{:?}:{}", self.mode, c.jti).to_lowercase(),
             (None, Some(p)) => format!("invalid:{}", p.code),
-            (None, None) => "community".into(),
-        }
+            (None, None) => "unlicensed".into(),
+        };
+        if self.testing() { format!("{m}:testing") } else { m }
     }
 
-    /// One sentence for admins.
+    /// One sentence or two for admins.
     pub fn detail(&self) -> String {
-        let community = format!("the community edition, free for up to {COMMUNITY_SEATS} active users");
         let seats = |c: &Claims| c.seats.map_or("unlimited seats".to_string(), |s| format!("{s} seat{}", if s == 1 { "" } else { "s" }));
+        let then = if self.testing_mode {
+            "Testing mode is on (TESTING_MODE), so the server keeps running with billing off.".to_string()
+        } else {
+            "Bots don't run and nobody new can be added until a license is installed; SuperBot has no free tier.".to_string()
+        };
         match (self.mode, &self.claims) {
-            (Mode::Community, _) => format!("No license: {community}. Every feature works."),
+            (Mode::Unlicensed, _) if self.testing_mode => {
+                "Testing mode (TESTING_MODE=on): no license, billing is off, and nothing is charged. For testing only, not production.".into()
+            }
+            (Mode::Unlicensed, _) => {
+                "No license. SuperBot has no free tier: install the license key from CG-Labs, or set TESTING_MODE=on for a test server. Until then, Bots don't run and nobody new can be added.".into()
+            }
             (Mode::Active, Some(c)) => format!("Licensed to {} ({}, {}) until {}.", c.sub, c.edition, seats(c), date(c.exp * 1000)),
             (Mode::Grace, Some(c)) => format!(
-                "The license for {} ended on {}. It keeps working until {}; install the renewed key before then, or the server becomes {community}.",
+                "The license for {} ended on {}. It keeps working until {}; install the renewed key before then, or Bots stop running.",
                 c.sub,
                 date(c.exp * 1000),
                 date(self.grace_ends_at().unwrap_or_default())
             ),
-            (Mode::Expired, Some(c)) => format!("The license for {} ended on {}. Running as {community}.", c.sub, date(c.exp * 1000)),
-            _ => format!("The license key isn't valid ({}). Running as {community}.", self.problem.as_ref().map_or("unknown", |p| p.code)),
+            (Mode::Expired, Some(c)) => format!("The license for {} ended on {}. {then}", c.sub, date(c.exp * 1000)),
+            _ => format!("The license key isn't valid ({}). {then}", self.problem.as_ref().map_or("unknown", |p| p.code)),
+        }
+    }
+
+    /// Why a run is refused while [`usable`](Self::usable) is false, for the Bot to say.
+    pub fn run_refusal(&self) -> String {
+        match self.mode {
+            Mode::Expired => "I can't run: this server's SuperBot license has ended. Ask an admin to install the renewed key.".into(),
+            Mode::Invalid => "I can't run: this server's SuperBot license key isn't valid. Ask an admin to install a valid key.".into(),
+            _ => "I can't run: this server has no SuperBot license, and SuperBot has no free tier. Ask an admin to install the license key.".into(),
         }
     }
 
@@ -214,7 +261,7 @@ impl Status {
         {
             w.push(format!("The license ends on {}. Ask CG-Labs for the renewed key.", date(exp)));
         }
-        if matches!(self.mode, Mode::Grace | Mode::Expired | Mode::Invalid) {
+        if matches!(self.mode, Mode::Grace | Mode::Expired | Mode::Invalid) || !self.usable() {
             w.push(self.detail());
         }
         if let Some(cap) = self.seat_cap()
@@ -231,7 +278,7 @@ impl Status {
         match self.honoured() {
             Some(c) => format!("No seats left: the license for {} covers {cap} active users, and {used} are active. Disable someone, or ask CG-Labs for more seats.", c.sub),
             None => format!(
-                "No seats left: without a license, SuperBot is free for up to {cap} active users, and {used} are active. Disable someone, or install a license key (console Settings, or botctl license install)."
+                "No seats: this server has no license, and SuperBot has no free tier ({used} active). Install a license key (console Settings, or botctl license install), or set TESTING_MODE=on on a test server."
             ),
         }
     }
@@ -254,8 +301,10 @@ impl Status {
             "license": license,
             "error": self.problem.as_ref().map(|p| p.code),
             "problem": self.problem.as_ref().map(|p| p.text.clone()),
-            "seats": { "limit": cap, "used": used, "available": cap.map(|c| c.saturating_sub(used)), "community": COMMUNITY_SEATS },
-            "ok": matches!(self.mode, Mode::Community | Mode::Active),
+            "seats": { "limit": cap, "used": used, "available": cap.map(|c| c.saturating_sub(used)) },
+            "testing": self.testing(),
+            "usable": self.usable(),
+            "ok": self.mode == Mode::Active || (self.mode == Mode::Unlicensed && self.testing_mode),
             "detail": self.detail(),
             "warnings": self.warnings(used),
             "graceDays": GRACE_DAYS,
@@ -280,6 +329,8 @@ pub struct Licensing {
     /// `DATA_DIR/license.key`.
     path: PathBuf,
     loaded: RwLock<Loaded>,
+    /// `TESTING_MODE`, set once at start.
+    testing: AtomicBool,
     /// Installs, removals, and the status-change check, one at a time: each reads, writes,
     /// and audits together.
     changing: Mutex<()>,
@@ -293,9 +344,14 @@ fn read_capped(path: &Path) -> std::io::Result<String> {
 }
 
 impl Licensing {
-    /// Nothing loaded yet: the community edition.
+    /// Nothing loaded yet, and testing mode off: unlicensed.
     pub fn new(keys: Vec<Key>, data_dir: &Path) -> Licensing {
-        Licensing { keys, path: data_dir.join(FILE), loaded: RwLock::new(Loaded::none()), changing: Mutex::new(()) }
+        Licensing { keys, path: data_dir.join(FILE), loaded: RwLock::new(Loaded::none()), testing: AtomicBool::new(false), changing: Mutex::new(()) }
+    }
+
+    /// Turns testing mode (`TESTING_MODE`) on or off.
+    pub fn set_testing(&self, on: bool) {
+        self.testing.store(on, Ordering::Relaxed);
     }
 
     fn check(&self, t: &str, now_ms: i64) -> Result<Claims, Invalid> {
@@ -316,7 +372,7 @@ impl Licensing {
     }
 
     /// Reads `LICENSE_KEY`, else `LICENSE_KEY_FILE`, else `DATA_DIR/license.key`. Never
-    /// fails: a bad key is reported, and the server runs as the community edition.
+    /// fails: a bad key is reported, and the server runs unlicensed.
     pub fn load(&self, get: impl Fn(&str) -> String) {
         let (inline, file) = (get("LICENSE_KEY"), get("LICENSE_KEY_FILE"));
         let (inline, file) = (inline.trim(), file.trim());
@@ -358,7 +414,7 @@ impl Licensing {
         self.start_if_due(now_ms);
         let l = self.loaded.read().unwrap_or_else(|e| e.into_inner());
         let (mode, claims, problem) = match &l.license {
-            None => (Mode::Community, None, None),
+            None => (Mode::Unlicensed, None, None),
             Some(Err(p)) => (Mode::Invalid, None, Some(p.clone())),
             Some(Ok(c)) => {
                 let exp = c.exp * 1000;
@@ -372,7 +428,7 @@ impl Licensing {
                 (mode, Some(c.clone()), None)
             }
         };
-        Status { mode, source: l.source, claims, problem, at: now_ms }
+        Status { mode, source: l.source, claims, problem, at: now_ms, testing_mode: self.testing.load(Ordering::Relaxed) }
     }
 
     pub fn seat_cap(&self) -> Option<u32> {
@@ -416,7 +472,7 @@ impl Licensing {
         Ok(self.status())
     }
 
-    /// Deletes `DATA_DIR/license.key`: the community edition again. Audited.
+    /// Deletes `DATA_DIR/license.key`: unlicensed again. Audited.
     pub fn remove(&self, db: &Db, by: &Who) -> Result<Status, ChangeError> {
         let _one = self.changing.lock().unwrap_or_else(|e| e.into_inner());
         let before = self.status();
@@ -449,17 +505,17 @@ impl Licensing {
             return;
         }
         db.set_setting(SEEN, &mark);
-        if seen.is_none() && now.mode == Mode::Community {
+        if seen.is_none() && now.mode == Mode::Unlicensed && !now.testing() {
             return;
         }
         let target = now.claims.as_ref().map_or("server", |c| c.jti.as_str());
-        let outcome = if now.licensed() || now.mode == Mode::Community { Outcome::Success } else { Outcome::Failure };
+        let outcome = if now.usable() { Outcome::Success } else { Outcome::Failure };
         db.record(&Event::new(Actor::system("license"), "license.status_changed").target("license", target).outcome(outcome).details(json!({ "from": seen, "to": now.summary() })));
     }
 }
 
 fn changed_from(before: &Status) -> Value {
-    if before.mode == Mode::Community { Value::Null } else { before.summary() }
+    if before.mode == Mode::Unlicensed { Value::Null } else { before.summary() }
 }
 
 /// Written whole or not at all, readable by botd's user only.
@@ -510,9 +566,16 @@ pub fn refuse_seat(app: &AppState, who: &Who, via: &str, target: Option<&str>, e
 
 // HTTP (admins only: these fall into RBAC's default arm).
 
-/// `GET /api/license`: the license, its mode, and the seats in use. Never the key.
-pub async fn get(State(app): State<AppState>) -> Json<Value> {
-    Json(app.license.status().view(app.db.active_seats()))
+/// The license as admins see it, with whether billing is on (ADR 0068).
+pub fn view(app: &AppState, a: &crate::Auth) -> Value {
+    let mut v = app.license.status().view(app.db.active_seats());
+    v["billing"] = a.payments.status();
+    v
+}
+
+/// `GET /api/license`: the license, its mode, the seats in use, and billing. Never the key.
+pub async fn get(State(app): State<AppState>, Extension(a): Extension<std::sync::Arc<crate::Auth>>) -> Json<Value> {
+    Json(view(&app, &a))
 }
 
 fn change_error(e: ChangeError) -> ApiError {
@@ -529,16 +592,16 @@ fn change_error(e: ChangeError) -> ApiError {
 }
 
 /// `PUT /api/license {key}`: checks the key and saves it to `DATA_DIR/license.key`.
-pub async fn put(State(app): State<AppState>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res {
+pub async fn put(State(app): State<AppState>, Extension(a): Extension<std::sync::Arc<crate::Auth>>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res {
     let key = v.get("key").and_then(Value::as_str).map(str::trim).filter(|k| !k.is_empty()).ok_or_else(|| crate::bad("Send {\"key\": \"<license key>\"}."))?;
-    let s = app.license.install(&app.db, &by, key).map_err(change_error)?;
-    Ok(Json(s.view(app.db.active_seats())))
+    app.license.install(&app.db, &by, key).map_err(change_error)?;
+    Ok(Json(view(&app, &a)))
 }
 
-/// `DELETE /api/license`: back to the community edition.
-pub async fn delete(State(app): State<AppState>, Extension(by): Extension<Who>) -> Res {
-    let s = app.license.remove(&app.db, &by).map_err(change_error)?;
-    Ok(Json(s.view(app.db.active_seats())))
+/// `DELETE /api/license`: unlicensed again.
+pub async fn delete(State(app): State<AppState>, Extension(a): Extension<std::sync::Arc<crate::Auth>>, Extension(by): Extension<Who>) -> Res {
+    app.license.remove(&app.db, &by).map_err(change_error)?;
+    Ok(Json(view(&app, &a)))
 }
 
 #[cfg(test)]
@@ -704,30 +767,58 @@ mod tests {
     #[test]
     fn modes_follow_the_clock_and_seats_follow_the_mode() {
         let l = lic("lic-modes");
-        assert_eq!(l.status().mode, Mode::Community);
-        assert_eq!(l.seat_cap(), Some(COMMUNITY_SEATS));
-        assert_eq!(l.status().edition(), "community");
+        let none = l.status();
+        assert_eq!((none.mode, none.seat_cap(), none.edition(), none.usable(), none.testing()), (Mode::Unlicensed, Some(0), "none", false, false));
+        assert!(none.detail().contains("no free tier"), "{}", none.detail());
+        assert_eq!(none.warnings(0), vec![none.detail()], "an admin is told");
 
         let c = claims(Some(50), 20);
         l.load(env(&[("LICENSE_KEY", &mint(&c))]));
         let exp = c.exp * 1000;
         let at = |ms: i64| l.status_at(ms);
-        assert_eq!((at(exp - 1).mode, at(exp - 1).seat_cap()), (Mode::Active, Some(50)));
+        assert_eq!((at(exp - 1).mode, at(exp - 1).seat_cap(), at(exp - 1).usable()), (Mode::Active, Some(50), true));
         assert!(at(exp - 1).warnings(3)[0].contains("ends on"), "warned before it ends");
         assert!(at(exp - 40 * DAY_MS).warnings(3).is_empty());
         assert!(at(exp - 1).allows("scim") && !at(exp - 1).allows("white-label"));
         // Ended: still honoured during the grace period.
         assert_eq!((at(exp).mode, at(exp).seat_cap()), (Mode::Grace, Some(50)));
         assert!(at(exp + GRACE_DAYS * DAY_MS - 1).licensed());
-        // Then the community edition, and the license's features are gone.
+        // Then no seats, no runs, and the license's features are gone. No free fallback.
         let gone = at(exp + GRACE_DAYS * DAY_MS);
-        assert_eq!((gone.mode, gone.seat_cap(), gone.edition(), gone.allows("scim")), (Mode::Expired, Some(COMMUNITY_SEATS), "community", false));
-        assert!(gone.seat_error(10).contains("without a license"));
-        // Unlimited seats, and never fewer than the community edition.
+        assert_eq!((gone.mode, gone.seat_cap(), gone.edition(), gone.allows("scim"), gone.usable()), (Mode::Expired, Some(0), "none", false, false));
+        assert!(gone.seat_error(10).contains("no free tier"));
+        assert!(gone.run_refusal().contains("ended"));
+        // Unlimited seats, and exactly what the license says otherwise.
         l.load(env(&[("LICENSE_KEY", &mint(&claims(None, 20)))]));
         assert_eq!(l.seat_cap(), None);
         l.load(env(&[("LICENSE_KEY", &mint(&claims(Some(3), 20)))]));
-        assert_eq!(l.seat_cap(), Some(COMMUNITY_SEATS));
+        assert_eq!(l.seat_cap(), Some(3));
+    }
+
+    #[test]
+    fn testing_mode_is_explicit_loud_and_loses_to_a_license() {
+        assert_eq!(testing_flag(""), Ok(false), "off by default");
+        assert_eq!((testing_flag("on"), testing_flag("TRUE"), testing_flag("0")), (Ok(true), Ok(true), Ok(false)));
+        assert!(testing_flag("maybe").unwrap_err().contains("TESTING_MODE"));
+
+        let l = lic("lic-testing");
+        l.set_testing(true);
+        let s = l.status();
+        assert_eq!((s.mode, s.seat_cap(), s.edition(), s.usable(), s.testing()), (Mode::Unlicensed, None, "testing", true, true));
+        assert!(s.detail().contains("billing is off"), "{}", s.detail());
+        let v = s.view(3);
+        assert_eq!((v["testing"].as_bool(), v["usable"].as_bool(), v["ok"].as_bool()), (Some(true), Some(true), Some(true)));
+        assert_eq!(s.summary()["testing"], json!(true));
+        // An ended license on a test server: still runs, and says why.
+        let c = claims(Some(5), -(GRACE_DAYS + 1));
+        l.load(env(&[("LICENSE_KEY", &mint(&c))]));
+        let s = l.status();
+        assert_eq!((s.mode, s.usable(), s.testing(), s.seat_cap()), (Mode::Expired, true, true, None));
+        assert!(s.detail().contains("Testing mode is on"), "{}", s.detail());
+        // A license wins: its seats, its edition, and not testing.
+        l.load(env(&[("LICENSE_KEY", &mint(&claims(Some(5), 20)))]));
+        let s = l.status();
+        assert_eq!((s.mode, s.seat_cap(), s.edition(), s.testing()), (Mode::Active, Some(5), "business", false));
     }
 
     #[test]
@@ -738,7 +829,7 @@ mod tests {
         c.nbf = Some(starts);
         l.load(env(&[("LICENSE_KEY", &mint(&c))]));
         let s = l.status();
-        assert_eq!((s.mode, s.problem.as_ref().map(|p| p.code), s.seat_cap()), (Mode::Invalid, Some("not_yet_valid"), Some(COMMUNITY_SEATS)));
+        assert_eq!((s.mode, s.problem.as_ref().map(|p| p.code), s.seat_cap()), (Mode::Invalid, Some("not_yet_valid"), Some(0)));
         let s = l.status_at(starts * 1000);
         assert_eq!((s.mode, s.seat_cap(), s.source), (Mode::Active, Some(50), Source::Env));
         assert_eq!(l.status().mode, Mode::Active, "kept, not checked again");
@@ -755,8 +846,8 @@ mod tests {
         ] {
             l.load(env(&vars));
             let s = l.status();
-            assert_eq!((s.mode, s.problem.as_ref().map(|p| p.code), s.seat_cap()), (Mode::Invalid, Some(code), Some(COMMUNITY_SEATS)), "{vars:?}");
-            assert!(s.detail().contains("community edition"));
+            assert_eq!((s.mode, s.problem.as_ref().map(|p| p.code), s.seat_cap()), (Mode::Invalid, Some(code), Some(0)), "{vars:?}");
+            assert!(s.detail().contains("no free tier"));
         }
         // LICENSE_KEY_FILE, and the file in DATA_DIR.
         let f = crate::db::temp_path("lic-file");
@@ -769,6 +860,6 @@ mod tests {
         assert_eq!((l.status().mode, l.status().source), (Mode::Active, Source::File));
         std::fs::write(&l.path, "  \n").unwrap();
         l.load(env(&[]));
-        assert_eq!(l.status().mode, Mode::Community, "an empty file is no license");
+        assert_eq!(l.status().mode, Mode::Unlicensed, "an empty file is no license");
     }
 }

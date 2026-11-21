@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { ActivityIndicator, AppState, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
-import { checkoutNotice, limitSummary, openBillingPage, subscriptionLine } from "../src/billing";
+import { BILLING_OFF, checkoutNotice, limitSummary, openBillingPage, subscriptionLine } from "../src/billing";
 import { overLimits, planUsageLines, usageLines } from "../src/plan";
 import { colors } from "../src/theme";
 import type { BillingView, MyUsage } from "../src/types";
@@ -107,7 +107,9 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
     return (
       <View style={styles.root}>
         {header}
-        <Text style={[styles.dim, styles.pad]}>Billing isn't set up on this server.</Text>
+        <Text style={[styles.dim, styles.pad]} accessibilityRole="summary">
+          {BILLING_OFF}
+        </Text>
         {usage ? (
           <ScrollView contentContainerStyle={styles.body}>
             <UsageCard usage={usage} />

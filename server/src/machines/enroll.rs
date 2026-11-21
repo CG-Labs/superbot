@@ -680,7 +680,7 @@ else
   echo "superbot: enrolling failed; the agent will keep trying" >&2
 fi
 # cloud-init's copies of the user data hold the token: the raw and merged user data and
-# its cache (ADR 0068), and the NoCloud seed an Incus container is given (ADR 0065).
+# its cache (ADR 0069), and the NoCloud seed an Incus container is given (ADR 0065).
 # Only the agent's file is needed.
 rm -f /var/lib/cloud/instance/user-data.txt /var/lib/cloud/instance/user-data.txt.i /var/lib/cloud/instance/cloud-config.txt /var/lib/cloud/instance/obj.pkl /var/lib/cloud/seed/nocloud-net/user-data
 systemctl start superbot-machine

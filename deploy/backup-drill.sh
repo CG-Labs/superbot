@@ -25,6 +25,9 @@ export SUPERBOT_INSTALL_NO_MAIN=1
 source "$REPO/deploy/install.sh"
 # shellcheck disable=SC2034 # read by stage_trusted_deploy
 INSTALL_DIR=$REPO
+# shellcheck disable=SC2034 # read by configure_env
+# A throwaway server, unlicensed: testing mode, as the installer's --testing-mode sets (ADR 0068).
+TESTING_MODE_ON=true
 
 OFFSITE=$(mktemp -d) # stands in for storage off the host: the archive, .env, master key, age identity
 WORK=$(mktemp -d)

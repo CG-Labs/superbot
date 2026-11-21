@@ -157,7 +157,7 @@ fn part(s: &str) -> Result<Map<String, Value>, Invalid> {
 
 /// The claims of a token signed by one of `keys`, for audience [`AUDIENCE`], that has
 /// started by `now` (unix seconds). Expiry is not checked here: an expired license is
-/// still a license, and botd decides what that means (a grace period, then community).
+/// still a license, and botd decides what that means (a grace period, then no license).
 pub fn verify(token: &str, keys: &[Key], now: i64) -> Result<Claims, Invalid> {
     let token = token.trim();
     if token.len() > MAX_TOKEN {

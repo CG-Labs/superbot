@@ -437,13 +437,15 @@ Every refusal is in the audit log (`bot.create_refused`, `routine.run_refused`, 
 
 ### Stripe (optional)
 
-Off unless `STRIPE_WEBHOOK_SECRET` is set; `/billing/stripe/webhook` answers 404 until then. With only the webhook, botd never calls Stripe: it only receives signed events. Add `STRIPE_SECRET_KEY` to sell plans in the app ([ADR 0042](../docs/adr/0042-billing-checkout-portal-customers.md)). Use test-mode keys until you're ready to charge.
+**Billing is off while SuperBot is in testing** ([ADR 0068](../docs/adr/0068-no-free-tier.md)): botd reads no `STRIPE_*` setting and makes no Stripe call unless `BILLING=on`, which testing mode refuses. The Plan screen and the console say billing is off. Use no real Stripe keys until billing is turned on.
+
+With `BILLING=on`, off unless `STRIPE_WEBHOOK_SECRET` is set; `/billing/stripe/webhook` answers 404 until then. With only the webhook, botd never calls Stripe: it only receives signed events. Add `STRIPE_SECRET_KEY` to sell plans in the app ([ADR 0042](../docs/adr/0042-billing-checkout-portal-customers.md)). Use test-mode keys until you're ready to charge.
 
 1. In each tier, list its Stripe price ids in `stripePrices` (see [`tiers.example.json`](tiers.example.json)). A price may belong to one tier only. Checkout sells a tier's first price; tiers without one can't be bought.
 2. In Stripe, add a webhook endpoint at `https://<your-host>/billing/stripe/webhook` for `customer.subscription.created`, `.updated`, `.deleted`, `checkout.session.completed`, and `customer.deleted`, and put its signing secret (`whsec_…`) in `STRIPE_WEBHOOK_SECRET` (or `STRIPE_WEBHOOK_SECRET_FILE`).
 3. For checkout and the customer portal, put a secret key in `STRIPE_SECRET_KEY` (or `STRIPE_SECRET_KEY_FILE`). A restricted key (`rk_…`) with write access to Checkout Sessions and Customer portal is enough. Stripe sends people back to `PUBLIC_URL` (default: `SSO_PUBLIC_URL`, else `https://` and the first `ALLOWED_HOSTS` entry) at `/app/plan`.
 4. In Stripe's dashboard, turn on the customer portal (Settings → Billing → Customer portal) and choose what people may do there: update their card, see invoices, switch between your plans' prices, cancel.
-5. Restart `botd`. Its startup line says whether the webhook and checkout are on.
+5. Set `BILLING=on` and restart `botd`. Its startup line says whether the webhook and checkout are on.
 
 Everyone then sees **Plan** in the client's sidebar: their plan and use against its limits, **Upgrade** buttons for each plan with a price, and **Manage billing** once they have a Stripe customer. Read-only people see their plan but can't buy one. Someone who already pays is sent to the portal instead of a second checkout. Without `STRIPE_SECRET_KEY`, subscriptions you create in Stripe still set tiers if they carry `metadata.superbot_user_id` (the user's id from `botctl users`) or belong to a customer botd has linked.
 
@@ -455,7 +457,13 @@ An active, trialing, or past-due subscription puts the user on its price's tier;
 
 ## License
 
-Without a license, SuperBot is the **community edition**: every feature, for up to 10 active people. The owner (break-glass) account doesn't count. A license from CG-Labs names your organisation and sets your seats ([ADR 0038](../docs/adr/0038-self-host-license-key.md)). botd checks it offline, so nothing phones home.
+SuperBot has **no free tier** ([ADR 0068](../docs/adr/0068-no-free-tier.md)). A license from CG-Labs names your organisation and sets your plan and seats ([ADR 0038](../docs/adr/0038-self-host-license-key.md)). botd checks it offline, so nothing phones home. Without a license, botd starts and admins can sign in to install one, but Bots don't run and nobody new can be added.
+
+**Testing mode.** A test server (like the dogfood server) runs without a license only when the operator sets `TESTING_MODE=on` in `.env` (or installs with `--testing-mode`) and restarts botd. It lifts the seat limit and keeps billing off. botd's start-up log, the console's License card, and the setup wizard all say "Testing mode". It is never on by default, and a valid license always wins over it.
+
+```sh
+sudo deploy/install.sh --upgrade --testing-mode   # test servers only
+```
 
 ```sh
 sudo deploy/install.sh --upgrade --license-file /path/to/license.key   # or, on a running server:
@@ -465,8 +473,8 @@ sudo -u superbot env SUPERBOT_PASSWORD="$(sudo grep -oP '^AUTH_PASSWORD=\K.*' ~s
 Or paste it into the console under Settings (or the setup wizard's Plans step). These all save `DATA_DIR/license.key` (mode `0600`; backups include it) and take effect at once. `LICENSE_KEY` or `LICENSE_KEY_FILE` in `.env` wins over that file and needs a restart.
 
 - **Seats**: active people other than the owner account. Over the limit, nobody is signed out or disabled, but nobody new can be added or re-enabled (by an admin, SSO sign-up, an approved request, or SCIM) until one is free. The error says so, and `license.seat_refused` is audited.
-- **Renewals**: admins are warned 30 days before the license ends. After it ends, it keeps its seats for 14 more days, then the server is the community edition again. Nothing stops working; install the renewed key any time.
-- **A bad key** (changed, signed by someone else, or for something else) never stops botd: it logs why at start, and runs as the community edition. `botctl license` and the console show the reason. Installs, removals, refusals, and status changes are audited (`license.*`).
+- **Renewals**: admins are warned 30 days before the license ends. After it ends, it keeps its seats for 14 more days, then Bots stop running and nobody new can be added (unless testing mode is on). Nobody is signed out; install the renewed key any time.
+- **A bad key** (changed, signed by someone else, or for something else) never stops botd from starting: it logs why, and the server is unlicensed until a valid key is installed. `botctl license` and the console show the reason. Installs, removals, refusals, and status changes are audited (`license.*`).
 
 ## Landing page and sign-ups
 

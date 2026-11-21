@@ -608,7 +608,7 @@ async fn checkout_is_off_without_the_secret_key() {
         for who in [w.a.clone(), w.admin.clone(), w.bots.auth(&owned.id)] {
             for (m, p, body) in [("GET", "/api/billing", ""), ("POST", "/api/billing/checkout", r#"{"tier":"pro"}"#), ("POST", "/api/billing/portal", ""), ("POST", "/api/billing/checkout", "not json")] {
                 let (code, res) = call(w.port, m, p, &who, body).await;
-                assert_eq!((code, parse(&res)["error"].as_str()), (404, Some("Billing isn't set up on this server.")), "{m} {p} (webhook {stripe})");
+                assert_eq!((code, parse(&res)["error"].as_str()), (404, Some("Billing is off while SuperBot is in testing: nothing is charged.")), "{m} {p} (webhook {stripe})");
             }
         }
         let (_, usage) = call(w.port, "GET", "/api/usage", &w.admin, "").await;

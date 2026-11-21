@@ -1,4 +1,4 @@
-//! Machines as Incus system containers against a real Incus host (ADR 0068), not the
+//! Machines as Incus system containers against a real Incus host (ADR 0069), not the
 //! stand-in: botd's router and machine port in this process, the Incus provider built
 //! from the same settings botd reads, and real containers that run cloud-init, fetch
 //! the real `superbot-machine` from botd, enroll over mutual TLS, and answer heartbeats.
@@ -247,7 +247,7 @@ async fn real_incus_containers_enroll_stay_apart_and_follow_the_lifecycle() {
     assert_eq!(code, 200, "{s}");
     let checks = s["checks"].as_array().unwrap().clone();
     if std::env::var("SUPERBOT_INCUS_E2E_EXPECT").as_deref() == Ok("too-old") {
-        // The 6.0 LTS, including Ubuntu 24.04's own 6.0.0: see ADR 0068.
+        // The 6.0 LTS, including Ubuntu 24.04's own 6.0.0: see ADR 0069.
         assert_eq!(checks[0]["ok"], false, "{checks:?}");
         assert!(checks[0]["detail"].as_str().unwrap().contains("too old: botd needs 7.0.1"), "{checks:?}");
         env.say(&format!("preflight refuses this Incus: {}", checks[0]["detail"]));

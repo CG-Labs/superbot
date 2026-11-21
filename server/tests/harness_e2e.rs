@@ -533,6 +533,7 @@ fn start(harness: &str, unhooked: bool) -> Botd {
         .env("WORKSPACE_DIR", dir.join("workspace"))
         .env("DEFAULT_HARNESS", harness)
         .env("SCREENS", "off")
+        .env("TESTING_MODE", "on")
         .stdout(log.try_clone().unwrap())
         .stderr(log)
         .spawn()

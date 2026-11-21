@@ -104,7 +104,7 @@ Once it has enrolled, the next reconcile removes its enrollment user data from t
 
 ## Testing against a real host
 
-An end-to-end test runs botd's Incus provider against a real Incus host ([ADR 0068](../adr/0068-validating-incus-containers-on-a-real-host.md)). The `incus-e2e` CI job runs it on GitHub's runners. To run it yourself, use a throwaway Ubuntu 24.04 VM, because the script reconfigures Incus on the host it runs on:
+An end-to-end test runs botd's Incus provider against a real Incus host ([ADR 0069](../adr/0069-validating-incus-containers-on-a-real-host.md)). The `incus-e2e` CI job runs it on GitHub's runners. To run it yourself, use a throwaway Ubuntu 24.04 VM, because the script reconfigures Incus on the host it runs on:
 
 ```bash
 sudo SUPERBOT_INCUS_E2E_THROWAWAY=1 deploy/incus-e2e-host.sh /tmp/incus-e2e   # INCUS_SOURCE=zabbly-lts-7.0 for the LTS

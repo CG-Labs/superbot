@@ -2,7 +2,7 @@ name: incus-e2e
 
 # Per-user containers (ADR 0065, 0067) on a real Incus host, not the stand-in: the
 # runner becomes the Incus host and botd's tests make, enroll, isolate, suspend,
-# resume, resize, rebuild and destroy real containers (ADR 0068). Runs when the
+# resume, resize, rebuild and destroy real containers (ADR 0069). Runs when the
 # machines code changes, weekly, and by hand.
 
 on:
@@ -46,7 +46,7 @@ jobs:
       fail-fast: false
       matrix:
         # zabbly: the current stable release. zabbly-lts-7.0: the LTS botd supports.
-        # zabbly-lts-6.0 and ubuntu (24.04's own 6.0.0) are too old (ADR 0068), so the
+        # zabbly-lts-6.0 and ubuntu (24.04's own 6.0.0) are too old (ADR 0069), so the
         # test checks that botd's preflight check says so.
         include:
           - incus: zabbly

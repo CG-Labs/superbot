@@ -543,7 +543,7 @@ fn error(status: StatusCode, v: &Value) -> ProviderError {
 
 /// Before 7.0.1 (so every 6.0 LTS release), changing a network ACL used by a NIC of a
 /// container outside the default project fails while applying it, after the new rules
-/// are saved, so the firewall Incus enforces no longer matches the ACL (ADR 0068).
+/// are saved, so the firewall Incus enforces no longer matches the ACL (ADR 0069).
 const MIN_VERSION: &str = "7.0.1";
 
 /// Whether an Incus `server_version` is older than [`MIN_VERSION`]. One botd can't read
@@ -1407,7 +1407,7 @@ impl MachineProvider for Incus {
     }
 }
 
-/// For the end-to-end test against a real Incus host (ADR 0068): what botd never does
+/// For the end-to-end test against a real Incus host (ADR 0069): what botd never does
 /// itself, such as looking inside a container.
 #[cfg(test)]
 impl Incus {
