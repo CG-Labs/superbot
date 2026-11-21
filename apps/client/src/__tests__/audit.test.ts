@@ -166,7 +166,10 @@ describe("audit labels", () => {
         ["Saved as rule", "r1"],
       ],
     });
-    expect(decisionSummary(ev({ action: "approval.approved", details: { runId: "run1", covers: "git push to origin" } }))?.verdict).toBe("Approved for the rest of the run");
+    // As the server sends it (`RunScope::covers_text`): one reason per kind of call the run may repeat.
+    const forRun = decisionSummary(ev({ action: "approval.approved", details: { runId: "run1", covers: ["pushes to origin", "", "installs packages"] } }));
+    expect(forRun).toEqual({ verdict: "Approved for the rest of the run", lines: [["Covers", "pushes to origin; installs packages"]] });
+    expect(decisionSummary(ev({ action: "approval.approved", details: { runId: "run1", covers: [] } }))?.verdict).toBe("Approved");
     expect(decisionSummary(ev({ action: "approval.approved", details: {} }))?.verdict).toBe("Approved");
     expect(decisionSummary(ev({ action: "approval.expired", details: null }))).toEqual({ verdict: "Expired: nobody answered, so it was denied", lines: [] });
     expect(decisionSummary(ev({ action: "approval.requested" }))).toBeNull();

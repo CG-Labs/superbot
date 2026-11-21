@@ -192,12 +192,14 @@ export function eventFields(e: AuditEvent, { nameOf = (id) => id, botName }: Nam
 }
 
 const str = (v: unknown) => (typeof v === "string" && v ? v : null);
+/** A string, or a list of strings (the server sends `covers` as one per kind of call), as one line. */
+const text = (v: unknown) => (Array.isArray(v) ? str(v.filter((x) => typeof x === "string" && x).join("; ")) : str(v));
 
 /** What an approval decision was about and how it ended (ADR 0007, 0051). Null for other events. */
 export function decisionSummary(e: AuditEvent): { verdict: string; lines: [string, string][] } | null {
   const d = e.details ?? {};
   let verdict: string;
-  if (e.action === "approval.approved") verdict = str(d.runId) && str(d.covers) ? "Approved for the rest of the run" : "Approved";
+  if (e.action === "approval.approved") verdict = str(d.runId) && text(d.covers) ? "Approved for the rest of the run" : "Approved";
   else if (e.action === "approval.denied") verdict = "Denied";
   else if (e.action === "approval.expired") verdict = "Expired: nobody answered, so it was denied";
   else return null;
@@ -206,7 +208,7 @@ export function decisionSummary(e: AuditEvent): { verdict: string; lines: [strin
     ["Tool", str(d.tool)],
     ["Kind", str(d.class)],
     ["Note", str(d.note)],
-    ["Covers", str(d.covers)],
+    ["Covers", text(d.covers)],
     ["Saved as rule", str(d.rule)],
   ];
   return { verdict, lines: rows.filter((r): r is [string, string] => !!r[1]) };

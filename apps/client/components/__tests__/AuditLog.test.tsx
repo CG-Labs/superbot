@@ -247,6 +247,23 @@ describe("AuditLog", () => {
     expect(api.audit).toHaveBeenLastCalledWith("", undefined);
   });
 
+  it("refreshes the filter being loaded, not the one it's replacing", async () => {
+    const { api, user } = await open([{ events: [ev(1)], nextBefore: null }]);
+    await screen.findByLabelText("Audit event 1: bot.created");
+    api.audit.mockImplementationOnce(() => new Promise<AuditPage>(() => {}));
+    await user.press(screen.getByText("Filters"));
+    await user.press(screen.getByRole("radio", { name: "Failure" }));
+    await act(() => new Promise((r) => setTimeout(r, 350)));
+    expect(lastQuery(api)).toBe("outcome=failure");
+    api.audit.mockImplementationOnce(async () => ({ events: [ev(2, { outcome: "failure" })], nextBefore: null }));
+    await fireEvent(screen.getByTestId("audit-list"), "refresh");
+    expect(lastQuery(api)).toBe("outcome=failure");
+    expect(await screen.findByLabelText("Audit event 2: bot.created")).toBeOnTheScreen();
+    expect(screen.queryByLabelText("Audit event 1: bot.created")).toBeNull();
+    await user.press(screen.getByText("Export CSV"));
+    expect(api.auditCsv).toHaveBeenLastCalledWith("outcome=failure");
+  });
+
   it("shows the event beside the list on a wide screen, and keeps it there after following it", async () => {
     mockWidth = 1200;
     const { api, user } = await open([{ events: [ev(1, { sessionId: "s1" })], nextBefore: null }]);

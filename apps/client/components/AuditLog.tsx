@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, FlatList, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 import type { SuperBotApi } from "../src/api";
 import {
   ACTORS,
@@ -155,10 +156,11 @@ export function AuditLog({ api, onBack, botName, bots = [], initial }: Props) {
     return () => clearTimeout(t);
   }, [query, filterError, load]);
 
+  // Reloads what the controls show, so it never brings back a filter that a newer load is replacing.
   const refresh = async () => {
     setRefreshing(true);
     try {
-      await load(shown.current);
+      await load(filterError ? shown.current : query);
     } finally {
       setRefreshing(false);
     }
@@ -316,12 +318,12 @@ export function AuditLog({ api, onBack, botName, bots = [], initial }: Props) {
         <>
           {list}
           <Modal visible={!!selected} animationType="slide" onRequestClose={() => setSelected(null)}>
-            <View style={styles.modalRoot}>
+            <SafeAreaView style={styles.modalRoot}>
               <Pressable style={styles.modalHeader} onPress={() => setSelected(null)} accessibilityRole="button" accessibilityLabel="Back to the audit log">
                 <Text style={styles.back}>‹ Audit log</Text>
               </Pressable>
               <ScrollView contentContainerStyle={{ padding: 16, paddingRight: 20 }}>{detail}</ScrollView>
-            </View>
+            </SafeAreaView>
           </Modal>
         </>
       )}
