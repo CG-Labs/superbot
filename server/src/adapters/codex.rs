@@ -78,6 +78,15 @@ impl Adapter for Codex {
     fn on_event(&mut self, e: &Value, out: &mut Vec<AgentEvent>) {
         let item = &e["item"];
         let kind = str_of(item, "type");
+        // Codex reports no item for a call its hook blocked; a failed one says so.
+        if str_of(e, "type") == "item.completed"
+            && !matches!(kind, "" | "agent_message" | "reasoning" | "error")
+            && !matches!(str_of(item, "status"), "failed" | "declined")
+            && item["error"].is_null()
+        {
+            let name = if kind == "command_execution" { "shell" } else { kind };
+            out.push(AgentEvent::ToolRan { name: name.into() });
+        }
         match str_of(e, "type") {
             "thread.started" => out.push(AgentEvent::Session(str_of(e, "thread_id").into())),
             "item.completed" if kind == "agent_message" && !str_of(item, "text").trim().is_empty() => {
@@ -125,6 +134,13 @@ impl Adapter for Codex {
     /// From `codex debug models`: the models this login can use, and their efforts.
     fn shell_tool(&self) -> &'static str {
         "shell"
+    }
+
+    /// From 0.141.0, `PreToolUse` sees commands, `apply_patch` (`file_change`) and MCP
+    /// calls. Hosted tools (`web_search`) skip it; `update_plan` (`todo_list`) and
+    /// subagents are left out, as CI can't make the pinned release call them.
+    fn hooks_tool(&self, tool: &str) -> bool {
+        matches!(tool, "shell" | "file_change" | "mcp_tool_call")
     }
 
     fn has_sandbox(&self) -> bool {
@@ -207,6 +223,32 @@ mod tests {
     }
 
     #[test]
+    fn finished_calls_are_reported_by_kind() {
+        // As `codex exec --json` 0.141 to 0.171 prints them.
+        let lines = [
+            r#"{"type":"item.started","item":{"id":"item_2","type":"file_change","changes":[{"path":"/w/b.txt","kind":"add"}],"status":"in_progress"}}"#,
+            r#"{"type":"item.completed","item":{"id":"item_2","type":"file_change","changes":[{"path":"/w/b.txt","kind":"add"}],"status":"completed"}}"#,
+            r#"{"type":"item.completed","item":{"id":"item_3","type":"mcp_tool_call","server":"e2e","tool":"touch","arguments":{},"result":{"content":[]},"error":null,"status":"completed"}}"#,
+            r#"{"type":"item.completed","item":{"id":"item_4","type":"mcp_tool_call","server":"e2e","tool":"touch","arguments":{},"result":null,"error":{"message":"boom"},"status":"failed"}}"#,
+            r#"{"type":"item.completed","item":{"id":"item_5","type":"command_execution","command":"/bin/bash -lc 'false'","exit_code":1,"status":"failed"}}"#,
+            r#"{"type":"item.completed","item":{"id":"item_6","type":"command_execution","command":"/bin/bash -lc 'echo hi'","exit_code":0,"status":"completed"}}"#,
+            r#"{"type":"item.completed","item":{"id":"item_7","type":"todo_list","items":[{"text":"ok","completed":false}]}}"#,
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"error","message":"`--dangerously-bypass-hook-trust` is enabled."}}"#,
+            r#"{"type":"item.completed","item":{"id":"item_8","type":"agent_message","text":"done"}}"#,
+        ];
+        let mut c = Codex::default();
+        let mut out = Vec::new();
+        for l in lines {
+            c.on_event(&serde_json::from_str(l).unwrap(), &mut out);
+        }
+        let ran: Vec<&str> = out.iter().filter_map(|e| if let AgentEvent::ToolRan { name } = e { Some(name.as_str()) } else { None }).collect();
+        assert_eq!(ran, ["file_change", "mcp_tool_call", "shell", "todo_list"]);
+        let hooked: Vec<&str> = ran.into_iter().filter(|t| c.hooks_tool(t)).collect();
+        assert_eq!(hooked, ["file_change", "mcp_tool_call", "shell"], "not plans, nor hosted web search");
+        assert!(!c.hooks_tool("web_search"));
+    }
+
+    #[test]
     fn ci_tests_the_oldest_codex_runs_accept() {
         let wf = include_str!("../../../.github/workflows/harness-e2e.yml");
         let min = Codex::default().hooks_since().unwrap();
@@ -216,7 +258,7 @@ mod tests {
     #[test]
     fn a_sandbox_that_cant_start_is_said_once() {
         let mut out = Vec::new();
-        let done = |o: &str| json!({ "type": "item.completed", "item": { "type": "command_execution", "aggregated_output": o } });
+        let done = |o: &str| json!({ "type": "item.completed", "item": { "type": "command_execution", "aggregated_output": o, "status": "failed" } });
         let failed = done("bwrap: No permissions to create new namespace, likely because the kernel does not allow non-privileged user namespaces.\n");
         Codex::default().on_event(&failed, &mut out);
         assert!(out.is_empty(), "without the sandbox it's only a command's output");

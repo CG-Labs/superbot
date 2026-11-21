@@ -174,6 +174,7 @@ impl Adapter for Hermes {
                 self.flush(out);
                 out.push(AgentEvent::Tool { name: str_of(e, "name").into(), detail: describe(&e["input"]) });
             }
+            "tool_result" if e["is_error"].as_bool() == Some(false) => out.push(AgentEvent::ToolRan { name: str_of(e, "name").into() }),
             "result" => {
                 session(out);
                 self.usage(&e["tokens"], out);
@@ -201,6 +202,12 @@ impl Adapter for Hermes {
     /// Hermes has no command that lists models without a prompt, so the model is free text.
     fn shell_tool(&self) -> &'static str {
         "terminal"
+    }
+
+    /// `pre_tool_call` runs before every tool Hermes offers: files, search, code,
+    /// clarify, delegation, skills, web and browser alike.
+    fn hooks_tool(&self, _tool: &str) -> bool {
+        true
     }
 
     fn models(&self) -> Vec<ModelOption> {
@@ -266,6 +273,7 @@ mod tests {
                 AgentEvent::TextDelta(t) => format!("delta {t}"),
                 AgentEvent::Text(t) => format!("text {t}"),
                 AgentEvent::Tool { name, detail } => format!("tool {name}: {detail}"),
+                AgentEvent::ToolRan { name } => format!("ran {name}"),
                 AgentEvent::Error(m) => format!("error {m}"),
                 AgentEvent::Usage(u) => format!("usage {} in={} out={} read={} write={}", u.model.unwrap_or_default(), u.input, u.output, u.cache_read, u.cache_write),
             })
@@ -387,6 +395,12 @@ mod tests {
                 "text It failed: not a git repository.",
             ]
         );
+        // A call that ran ends without an error (as the pinned Hermes writes it).
+        let read = events(&[
+            r#"{"type": "tool_use", "name": "read_file", "tool_call_id": "call_2", "input": {"path": "/etc/hostname"}}"#,
+            r#"{"type": "tool_result", "name": "read_file", "tool_call_id": "call_2", "output": "{\"content\": \"1|host\"}", "duration_ms": 205, "is_error": false}"#,
+        ]);
+        assert_eq!(read, ["tool read_file: /etc/hostname", "ran read_file"]);
         // A hook block emits no tool_use; the reply still arrives once.
         let blocked = events(&[
             r#"{"type": "text", "text": "Pushing now."}"#,
