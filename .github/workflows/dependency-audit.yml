@@ -50,9 +50,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - name: Report every advisory in the app's runtime dependencies
-        run: npm audit --package-lock-only --omit=dev || true
+      # Dev dependencies too: Electron is one, and the desktop app ships inside it.
+      - name: Report every advisory
+        run: npm audit --package-lock-only || true
       # Critical only: markdown-it (via react-native-markdown-display, no fixed release) is
       # High and tracked in the SOC 2 readiness checklist (CC7.1-2) until it's replaced.
       - name: Fail on critical advisories
-        run: npm audit --package-lock-only --omit=dev --audit-level=critical
+        run: npm audit --package-lock-only --audit-level=critical
