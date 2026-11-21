@@ -393,6 +393,23 @@ impl World {
         if c["security.nesting"] == "true" {
             return Some("Container nesting is forbidden".into());
         }
+        // Incus's low-level container options, refused unless
+        // restricted.containers.lowlevel=allow.
+        let lowlevel = [
+            "boot.host_shutdown_timeout",
+            "limits.memory.swap",
+            "linux.kernel_modules",
+            "raw.apparmor",
+            "raw.idmap",
+            "raw.lxc",
+            "raw.seccomp",
+            "security.guestapi.images",
+            "security.idmap.base",
+            "security.idmap.size",
+        ];
+        if let Some(k) = c.as_object().and_then(|c| c.keys().find(|k| lowlevel.contains(&k.as_str()))) {
+            return Some(format!("Use of low-level config \"{k}\" on container is forbidden"));
+        }
         let devices = body["devices"].as_object().cloned().unwrap_or_default();
         for d in devices.values() {
             if d["type"] == "disk" && d["path"] != "/" {

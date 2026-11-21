@@ -163,12 +163,12 @@ async fn a_container_is_unprivileged_isolated_and_sized_by_its_plan() {
         ("limits.cpu", "2"),
         ("limits.memory", "4GiB"),
         ("limits.memory.enforce", "hard"),
-        ("limits.memory.swap", "false"),
         ("limits.processes", "4096"),
         ("user.superbot.tag", "superbot"),
     ] {
         assert_eq!(c[k], v, "{k}");
     }
+    assert!(c.get("limits.memory.swap").is_none(), "a restricted project refuses it");
     assert!(c["cloud-init.user-data"].as_str().unwrap().starts_with("#cloud-config"));
     let vendor = c["cloud-init.vendor-data"].as_str().unwrap();
     assert!(vendor.contains("\"ssh-ed25519 AAAAC3Nza admin@example\"") && vendor.contains("disable_root: false"));
