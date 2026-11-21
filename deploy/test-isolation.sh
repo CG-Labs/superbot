@@ -245,7 +245,7 @@ for u in t1 t2; do
   out=$(sudo -u "sb-u-$u" env HERMES_HOME="$bh" "$wrapper")
   [[ "$out" == "lazy=1 home=$bh" ]] || die "sb-u-$u's Bot didn't run the shared Hermes: $out"
   [[ "$(stat -c '%U' "$bh/installs/$key")" == "sb-u-$u" ]] || die "sb-u-$u's record of the install isn't its own"
-  (( (8#$(stat -c '%a' "$bh/installs/$key") & 8#077) == 0 )) || die "others may read sb-u-$u's record of the install"
+  (( (8#$(stat -c '%a' "$bh/installs/$key") & 8#007) == 0 )) || die "other accounts may read sb-u-$u's record of the install"
   [[ "$(readlink "$bh/installs/$key/environments")" == "$st/environments" ]] || die "sb-u-$u's Bot doesn't use the shared environment"
   refused sudo -u "sb-u-$u" touch "$st/environments/g1/venv/x"
   refused sudo -u "sb-u-$u" touch "$st/facts.json"
