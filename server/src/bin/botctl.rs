@@ -35,6 +35,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
 
   botctl login [<code> | -]                        Sign in with a sign-in code (- reads it from stdin), or
                                                    with SUPERBOT_PASSWORD; prints a SUPERBOT_TOKEN
+    [--totp <code> | --recovery-code <code>]       With two-factor authentication on, the code from
+                                                   your authenticator app, or a recovery code
   botctl logout                                    End the SUPERBOT_TOKEN session
   botctl whoami                                    Who the token or password signs in as, and its role
   botctl users                                     List users
@@ -381,8 +383,24 @@ fn operator_auth() -> Result<String, String> {
     }
 }
 
-/// `botctl login`: the body for POST /api/auth/login.
-fn login_body(arg: Option<&str>) -> Result<Value, String> {
+/// `botctl login [<code> | -] [--totp <code> | --recovery-code <code>]`: the body for
+/// POST /api/auth/login. A second factor goes in the same request (ADR 0094).
+fn login_body(args: &[&str]) -> Result<Value, String> {
+    const USE: &str = "usage: botctl login [<code> | -] [--totp <code> | --recovery-code <code>]";
+    let (arg, rest) = match args.split_first() {
+        Some((a, rest)) if !a.starts_with("--") => (Some(*a), rest),
+        _ => (None, args),
+    };
+    let second = match (flag(rest, "--totp"), flag(rest, "--recovery-code")) {
+        (Some(_), Some(_)) => return Err(USE.into()),
+        (Some(c), None) => Some(("totp", c)),
+        (None, Some(c)) => Some(("recoveryCode", c)),
+        (None, None) if rest.is_empty() => None,
+        _ => return Err(USE.into()),
+    };
+    if second.is_some() && rest.len() != 2 {
+        return Err(USE.into());
+    }
     let code = match arg {
         Some("-") => {
             let mut c = String::new();
@@ -401,6 +419,9 @@ fn login_body(arg: Option<&str>) -> Result<Value, String> {
         },
     };
     let mut body = body;
+    if let Some((k, c)) = second {
+        body[k] = json!(c.trim());
+    }
     body["session"] = json!("token");
     body["label"] = json!("botctl");
     Ok(body)
@@ -1127,8 +1148,16 @@ fn run(args: &[String]) -> Result<String, String> {
         ["audit", "export", rest @ ..] => api(Cred::Operator, "GET", &format!("/api/audit/export.csv{}", audit_query(rest)?), None),
         ["audit", rest @ ..] => op("GET", &format!("/api/audit{}", audit_query(rest)?), None),
 
-        ["login", rest @ ..] if rest.len() <= 1 => {
-            let res: Value = serde_json::from_str(&api(Cred::Anonymous, "POST", "/api/auth/login", Some(login_body(rest.first().copied())?.to_string()))?).map_err(|e| e.to_string())?;
+        ["login", rest @ ..] => {
+            let body = login_body(rest)?;
+            let res = api(Cred::Anonymous, "POST", "/api/auth/login", Some(body.to_string())).map_err(|e| {
+                if body["totp"].is_null() && body["recoveryCode"].is_null() && e.contains("authenticator app") {
+                    format!("{e}\nRun botctl login again with --totp <code> (or --recovery-code <code>).")
+                } else {
+                    e
+                }
+            })?;
+            let res: Value = serde_json::from_str(&res).map_err(|e| e.to_string())?;
             let (token, who) = (res["token"].as_str().unwrap_or_default(), res["user"]["name"].as_str().unwrap_or_default());
             Ok(format!("Signed in as {who} ({}). Run:\n\n  export SUPERBOT_TOKEN={token}", res["user"]["role"].as_str().unwrap_or_default()))
         }
@@ -1481,8 +1510,13 @@ mod tests {
 
     #[test]
     fn login_and_user_commands() {
-        assert_eq!(login_body(Some(" sbc_abc ")).unwrap(), json!({ "code": "sbc_abc", "session": "token", "label": "botctl" }));
-        assert!(login_body(Some("  ")).is_err());
+        assert_eq!(login_body(&[" sbc_abc "]).unwrap(), json!({ "code": "sbc_abc", "session": "token", "label": "botctl" }));
+        assert!(login_body(&["  "]).is_err());
+        assert_eq!(login_body(&["sbc_abc", "--totp", " 123456"]).unwrap(), json!({ "code": "sbc_abc", "totp": "123456", "session": "token", "label": "botctl" }));
+        assert_eq!(login_body(&["sbc_abc", "--recovery-code", "abcde-fghij"]).unwrap()["recoveryCode"], "abcde-fghij");
+        for bad in [&["sbc_abc", "--totp"][..], &["sbc_abc", "--totp", "1", "--recovery-code", "2"], &["sbc_abc", "extra"], &["sbc_abc", "--nope", "1"]] {
+            assert!(login_body(bad).is_err(), "{bad:?}");
+        }
         assert_eq!(role("read-only"), Ok("read-only"));
         assert!(role("root").is_err());
         assert_eq!(encode("a.b+c@example.com"), "a.b%2Bc%40example.com");
