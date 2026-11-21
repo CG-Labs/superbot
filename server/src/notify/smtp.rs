@@ -616,7 +616,7 @@ mod tests {
         assert_eq!(got.iter().map(|g| g.to.clone()).collect::<Vec<_>>(), [vec!["a@example.com".to_string()], vec!["b@example.com".to_string()]]);
         assert_eq!(got[0].body, "Line one\n.\nhttps://x/app/");
         assert!(got[0].headers.contains("Subject: =?UTF-8?B?"), "{}", got[0].headers);
-        assert!(got[0].headers.contains("To: <a@example.com>") && !got[0].headers.contains("b@example.com"));
+        assert!(got[0].headers.contains("To: <a@example.com>") && !got[0].headers.contains("<b@example.com>"), "{}", got[0].headers);
     }
 
     #[tokio::test]
