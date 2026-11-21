@@ -111,6 +111,7 @@ export default function HomeScreen() {
             onOpenApprovals={() => setApprovalsOpen(true)}
             onOpenPlan={billing ? () => router.push("/plan") : undefined}
             onOpenSecrets={() => router.push("/secrets")}
+            onOpenSettings={() => router.push("/settings")}
             onOpenUsers={() => router.push("/users")}
             onOpenAudit={() => router.push("/audit")}
             onOpenConsole={() => void openConsole(api.baseUrl).catch((err) => showError(err, "Couldn't open the admin console"))}
