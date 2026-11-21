@@ -200,6 +200,14 @@ async fn a_lost_hosts_machines_are_restored_onto_another_host_and_enroll_anew() 
 
     let (ada, m) = machine(&env, "ada@example.com", true).await;
     let (bea, n) = machine(&env, "bea@example.com", false).await;
+    // One with a restore underway when its host is lost, and one whose create (on a)
+    // went unanswered as far as botd knows.
+    let (dee, d) = machine(&env, "dee@example.com", true).await;
+    let db = back_up(&env, &dee).await;
+    let busy = crate::db::NewMachineRestore { id: "rbusy", machine: &d, backup_id: &db.id, by: None, rto_ms: None, from_host: None, to_host: None, reason: None };
+    env.app.db.machine_restore_start(&busy).unwrap();
+    assert!(!env.app.db.machine_pins(&d.id).is_empty());
+    let (_, ed) = machine(&env, "ed@example.com", false).await;
     let b = back_up(&env, &ada).await;
     let (_, view) = json_call(&env, "GET", &format!("/api/users/{ada}/machine"), "").await;
     assert_eq!(view["host"].as_str(), Some("a"), "{view}");
@@ -223,9 +231,18 @@ async fn a_lost_hosts_machines_are_restored_onto_another_host_and_enroll_anew() 
     reconcile(&env).await;
     let down = events(&env, "machine.host_down").await;
     assert_eq!(down.len(), 1, "{down:?}");
-    assert_eq!((down[0]["targetType"].as_str(), down[0]["targetId"].as_str(), down[0]["details"]["machines"].as_u64()), (Some("host"), Some("a"), Some(2)));
+    assert_eq!((down[0]["targetType"].as_str(), down[0]["targetId"].as_str(), down[0]["details"]["machines"].as_u64()), (Some("host"), Some("a"), Some(4)));
     let alert = mail_with(&mail, "Incus host a isn't answering").await;
     assert!(alert.body.contains("botctl machine host recover a"), "{}", alert.body);
+    // A create a may have made isn't sent again elsewhere while a is down.
+    let mut e = env.app.db.machine(&ed.id).unwrap();
+    (e.state, e.provider_id, e.create_sent_at) = (State::Pending, None, Some(crate::db::now()));
+    assert!(env.app.db.save_machine(&e, State::Running));
+    reconcile(&env).await;
+    let e = env.app.db.machine(&ed.id).unwrap();
+    assert_eq!((e.state, e.provider_id.as_deref()), (State::Pending, None));
+    assert!(e.last_error.as_deref().unwrap().contains("may have reached Incus host a"), "{:?}", e.last_error);
+    assert!(env.b.instance(&ed.label).is_none(), "no second copy on b");
     let (cid, _) = user_with(env.port, &env.admin, "cy@example.com", "member").await;
     let (code, c) = json_call(&env, "POST", &format!("/api/users/{cid}/machine"), "").await;
     assert_eq!(code, 202, "{c}");
@@ -253,6 +270,8 @@ async fn a_lost_hosts_machines_are_restored_onto_another_host_and_enroll_anew() 
     assert_eq!(code, 202, "{out}");
     assert_eq!((out["to"].as_str(), out["declaredLost"].as_bool()), (Some("b"), Some(true)), "{out}");
     assert_eq!((out["restoring"].as_array().unwrap().len(), out["unrestorable"][0]["userId"].as_str()), (1, Some(bea.as_str())), "{out}");
+    assert_eq!(out["skipped"][0]["userId"].as_str(), Some(dee.as_str()), "{out}");
+    assert!(env.app.db.machine_pins(&d.id).is_empty(), "revoked though its restore was underway");
     let rid = out["restoring"][0]["restore"]["id"].as_str().unwrap().to_string();
     let r = settled(&env, &rid).await;
     assert_eq!(r.state, "enrolling", "{:?}", r.error);
@@ -306,7 +325,9 @@ async fn a_lost_hosts_machines_are_restored_onto_another_host_and_enroll_anew() 
     reconcile(&env).await;
     let (code, h) = json_call(&env, "GET", "/api/machines/hosts?check=true", "").await;
     assert_eq!(code, 200);
-    assert_eq!((h["hosts"][0]["state"].as_str(), h["hosts"][0]["machines"].as_u64()), (Some("lost"), Some(1)), "{h}");
+    assert_eq!((h["hosts"][0]["state"].as_str(), h["hosts"][0]["machines"].as_u64()), (Some("lost"), Some(2)), "{h}");
+    let e = env.app.db.machine(&ed.id).unwrap();
+    assert!(e.provider_id.as_deref().is_some_and(|p| p.starts_with("b/")), "made on b once a is lost: {e:?}");
     let (code, _) = json_call(&env, "DELETE", &format!("/api/users/{bea}/machine"), "").await;
     assert_eq!(code, 200, "a machine on a lost host is destroyed without it");
     assert_eq!(env.app.db.machine(&n.id).unwrap().state, State::Destroyed);
@@ -343,6 +364,10 @@ async fn a_host_that_comes_back_is_up_and_machines_move_between_hosts_that_are_u
     let path = format!("/api/users/{ada}/machine/restore");
     let (code, e) = json_call(&env, "POST", &path, &json!({ "backupId": b.id, "host": "nope" }).to_string()).await;
     assert_eq!(code, 400, "{e}");
+    // It kept an older firewall (from before a label prefix change) that b doesn't have.
+    let old = env.a.w().acls["superbot-fw"].clone();
+    env.a.w().acls.insert("old-fw".into(), old);
+    env.app.db.set_machine_firewall_id(&m.id, Some("old-fw"));
     let (code, r) = json_call(&env, "POST", &path, &json!({ "backupId": b.id, "host": "b" }).to_string()).await;
     assert_eq!(code, 202, "{r}");
     let r = settled(&env, r["restore"]["id"].as_str().unwrap()).await;
@@ -351,6 +376,7 @@ async fn a_host_that_comes_back_is_up_and_machines_move_between_hosts_that_are_u
     assert_eq!(read(&env.b, &m.label, "/home/user/notes.txt").as_deref(), Some("version 1"));
     let mm = env.app.db.machine(&m.id).unwrap();
     assert_eq!(mm.provider_id.as_deref(), Some(format!("b/{}", m.label).as_str()));
+    assert_eq!((mm.firewall_id.as_deref(), env.b.instance(&m.label).unwrap().body["devices"]["eth0"]["security.acls"].as_str()), (Some("superbot-fw"), Some("superbot-fw")), "today's firewall on b");
     enroll_again(&env, &env.b, &mm).await;
     assert_eq!(env.app.db.machine_last_restore(&m.id).unwrap().state, "done");
 }

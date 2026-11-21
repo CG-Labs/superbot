@@ -4942,6 +4942,11 @@ impl Db {
         self.c().execute("UPDATE machines SET provider_id = ?, updated_at = ? WHERE id = ?", params![provider_id, now(), machine_id]).unwrap();
     }
 
+    /// The firewall a machine is behind now, as after a move to a host that has only today's.
+    pub fn set_machine_firewall_id(&self, machine_id: &str, firewall_id: Option<&str>) {
+        self.c().execute("UPDATE machines SET firewall_id = ?, updated_at = ? WHERE id = ?", params![firewall_id, now(), machine_id]).unwrap();
+    }
+
     #[cfg(test)]
     pub fn machine_host_failing_backdate(&self, name: &str, ms: i64) {
         self.c().execute("UPDATE machine_hosts SET failing_since = failing_since - ?1 WHERE name = ?2", params![ms, name]).unwrap();

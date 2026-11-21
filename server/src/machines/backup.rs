@@ -861,22 +861,27 @@ async fn replace(app: &App, cp: &ControlPlane, e: &Enrollment, r: &MachineRestor
     let prior = (m.enroll_by, m.enroll_overdue_at);
     let (token, expires) = e.mint_token(app, &m.id, who)?;
     app.db.record(&event(by, "machine.enroll_token_issued", &m, json!({ "expiresAt": expires, "via": "restore", "restoreId": r.id })));
+    // Onto another host, today's firewall must be there before the copy is put behind it.
+    // An older one the machine kept (after a label prefix change) may not be.
+    let moving = r.to_host.is_some() && r.from_host != r.to_host;
+    let mut firewall_id = m.firewall_id.clone();
+    if moving && let Some(fw) = &cp.firewall {
+        match super::firewall::ensure(app, fw, p, by).await {
+            Ok(id) => firewall_id = Some(id),
+            Err(err) => {
+                app.db.restore_enroll_by(&m.id, prior.0, prior.1);
+                return Err(format!("setting up the firewall on host {}: {err}", r.to_host.as_deref().unwrap_or_default()));
+            }
+        }
+    }
     let spec = RestoreSpec {
         plan: m.plan.clone(),
         tags: cp.spec(&m, None).tags,
         authorized_keys: cp.authorized_keys.clone(),
-        firewall_id: m.firewall_id.clone(),
+        firewall_id: firewall_id.clone(),
         files: e.restore_files(&m, &token),
         remove: vec![IDENTITY_PATH.into()],
     };
-    // Onto another host, the firewall must be there before the copy is put behind it.
-    let moving = r.to_host.is_some() && r.from_host != r.to_host;
-    if moving && let Some(fw) = &cp.firewall {
-        if let Err(err) = super::firewall::ensure(app, fw, p, by).await {
-            app.db.restore_enroll_by(&m.id, prior.0, prior.1);
-            return Err(format!("setting up the firewall on host {}: {err}", r.to_host.as_deref().unwrap_or_default()));
-        }
-    }
     let pm = match p.replace_with(&provider_id(&m), &staging(p, &m, r), &spec).await {
         Ok(pm) => pm,
         Err(err) => {
@@ -889,6 +894,10 @@ async fn replace(app: &App, cp: &ControlPlane, e: &Enrollment, r: &MachineRestor
     if m.provider_id.as_deref() != Some(pid.as_str()) {
         app.db.set_machine_provider_id(&m.id, &pid);
         m.provider_id = Some(pid.clone());
+    }
+    if m.firewall_id != firewall_id {
+        app.db.set_machine_firewall_id(&m.id, firewall_id.as_deref());
+        m.firewall_id = firewall_id;
     }
     // What the old disk's agent said and held is gone with it, as after a rebuild. All
     // of it, and the time enrollment counts from, before it boots: enrollment doesn't

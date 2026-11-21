@@ -657,6 +657,11 @@ async fn provision(
     mut m: Machine,
     by: &Who,
 ) -> Machine {
+    if let Some(why) = hosts::create_unsure(p, &m) {
+        m.last_error = Some(why);
+        app.db.save_machine(&m, m.state);
+        return m;
+    }
     // The firewall first: a machine is never made without one, nor a token minted for
     // a create that won't be sent.
     m.firewall_id = match &cp.firewall {
@@ -763,19 +768,21 @@ async fn finish_destroy(app: &App, p: &dyn MachineProvider, mut m: Machine, by: 
         Some(id) => Ok(Some(id.clone())),
         None => by_label(p, &m).await.map(|f| f.map(|pm| pm.id)),
     };
+    let unsure = hosts::create_unsure(p, &m);
     let res = match id {
         Ok(Some(id)) => p.delete(&id).await.map(|()| true),
-        Ok(None) => Ok(!m
-            .create_sent_at
-            .is_some_and(|t| now() - t < CREATE_SETTLE_MS)),
+        Ok(None) => Ok(unsure.is_none()
+            && !m
+                .create_sent_at
+                .is_some_and(|t| now() - t < CREATE_SETTLE_MS)),
         Err(e) => Err(e),
     };
     let from = m.state;
     match res {
         Ok(false) => {
-            m.last_error = Some(
-                "Waiting to be sure a create the provider didn't answer made no machine.".into(),
-            );
+            m.last_error = Some(unsure.unwrap_or_else(|| {
+                "Waiting to be sure a create the provider didn't answer made no machine.".into()
+            }));
             app.db.save_machine(&m, from);
         }
         Ok(true) => {

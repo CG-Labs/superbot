@@ -59,6 +59,21 @@ pub(super) fn unreachable(cp: &ControlPlane, m: &Machine) -> Option<String> {
     }
 }
 
+/// Why a machine whose earlier create went unanswered can't be made, or found gone,
+/// now: that create may have reached a host that is down, and would be a second copy.
+/// botd doesn't know which host it went to, so it waits until every host answers or
+/// is declared lost.
+pub(super) fn create_unsure(p: &dyn super::provider::MachineProvider, m: &Machine) -> Option<String> {
+    if m.provider_id.is_some() || m.create_sent_at.is_none() {
+        return None;
+    }
+    let down = p.hosts()?.configured().into_iter().find(|c| c.status == HostStatus::Down)?;
+    Some(format!(
+        "An earlier create may have reached Incus host {}, which isn't answering. Waiting until it answers or is declared lost.",
+        down.name
+    ))
+}
+
 /// Machines on `host` that are still to be dealt with.
 fn on(app: &App, cp: &ControlPlane, h: &dyn Hosts, host: &str) -> Vec<Machine> {
     app.db
@@ -319,12 +334,12 @@ pub async fn recover(
     let (mut restoring, mut unrestorable, mut skipped) = (Vec::new(), Vec::new(), Vec::new());
     let mut runs = Vec::new();
     for m in machines {
+        // Nothing from that host's disks is trusted again, even while a restore is underway.
+        enroll::revoke_all(&app, &by, &m, HOST_LOST);
         if let Some(r) = app.db.machine_restoring(&m.id) {
             skipped.push(json!({ "machineId": m.id, "userId": m.user_id, "reason": format!("A restore is {} already.", r.state) }));
             continue;
         }
-        // Nothing from that host's disks is trusted again.
-        enroll::revoke_all(&app, &by, &m, HOST_LOST);
         if m.state == State::Destroying {
             continue;
         }

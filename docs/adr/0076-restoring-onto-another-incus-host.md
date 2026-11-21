@@ -46,14 +46,18 @@ Each reconcile interval, botd asks every host that isn't lost for its server inf
 3. If any machine's newest backup is encrypted and there is no `identity`, it is refused (400) before anything changes.
 4. The host is declared lost: recorded with who did it, audited once as `machine.host_lost`, and alerted.
 5. For each machine on it:
-   - Its enrollment tokens and certificates are revoked (`reason: host_lost`). Nothing from that host's disks is trusted again.
+   - Its enrollment tokens and certificates are revoked (`reason: host_lost`), even when a restore of it is already underway. Nothing from that host's disks is trusted again.
    - If it has a finished off-host backup, a restore from the newest one onto `to` is recorded and audited as `machine.restore_requested` with `fromHost`, `toHost` and `reason: host_lost`.
    - If it has none, it goes to error with a message saying so, audited as `machine.lost` (`reason: host_lost`, `restorable: false`). It is to be destroyed and requested again.
    - One already restoring, or that can't be restored now, is skipped and listed.
-6. The restores run two at a time, each as ADR 0071's restore: import onto `to` beside nothing, today's settings, firewall and a fresh enrollment token pushed onto its disk (never into the provider's config, ADR 0067), then the swap, a boot, and enrolling anew. The firewall is set up on `to` first if it isn't there.
+6. The restores run two at a time, each as ADR 0071's restore: import onto `to` beside nothing, today's settings, firewall and a fresh enrollment token pushed onto its disk (never into the provider's config, ADR 0067), then the swap, a boot, and enrolling anew. The firewall is set up on `to` first if it isn't there. A machine moved to another host is behind today's firewall there, even if it was behind an older one (from before a label prefix change), and its record says so.
 7. The machine's record names its new host as soon as the swap is done (`provider_id` is `<to>/<label>`), so whatever happens next happens there.
 
 It answers 202 with what it restores, what it can't, and what it skipped. Running it again picks up machines it skipped and announces nothing twice.
+
+### Creates that may have landed
+
+A create sent to a host that then stopped answering may have made the container there. While any host is down, a machine whose create got no answer is neither created again (placement would pick another host and make a second copy) nor finished destroying: it waits, with a message naming the host, until that host answers (the container is adopted or cleaned up) or is declared lost (its containers are gone with it).
 
 ### Moving one machine
 
@@ -73,7 +77,7 @@ The data lost is everything since each machine's newest off-host backup: at most
 
 ### Tests and drills
 
-- **Against stand-ins** (`machines_hosts_tests`): two Incus stand-ins as hosts `a` and `b`, the S3 stand-in, and the real agent. Host `a` stops answering: nothing is lost or revoked while it is only failing; after the threshold it is down, audited and alerted once, and new machines go to `b`. Restores are refused while `a` is down and not lost. Declared lost: certificates revoked, the backed-up machine restored onto `b` from its backup with a fresh token and behind the firewall there, its record moved, enrolled anew and timed; the machine with no backup in error. `a` coming back is never called again, and destroying a machine on it doesn't need it. A host that comes back is up again and can't be recovered; a machine moved between two up hosts leaves no copy behind. Pinning and old provider ids are checked at startup.
+- **Against stand-ins** (`machines_hosts_tests`): two Incus stand-ins as hosts `a` and `b`, the S3 stand-in, and the real agent. Host `a` stops answering: nothing is lost or revoked while it is only failing; after the threshold it is down, audited and alerted once, and new machines go to `b`. Restores are refused while `a` is down and not lost, and a machine whose create went unanswered isn't made again on `b`. Declared lost: certificates revoked (also for a machine already restoring, which is skipped), the backed-up machine restored onto `b` from its backup with a fresh token and behind the firewall there, its record moved, enrolled anew and timed; the machine with no backup in error. `a` coming back is never called again, and destroying a machine on it doesn't need it. A host that comes back is up again and can't be recovered; a machine moved between two up hosts leaves no copy behind and is behind today's firewall on its new host. Pinning and old provider ids are checked at startup.
 - **On a real Incus host in CI** (the `incus-e2e` job, ADR 0069): one Incus stands in for two hosts. Host `a` is the `superbot` project reached through a TCP forwarder on loopback, and host `b` a second restricted project, `superbot-b`, made by `deploy/incus-e2e-host.sh`. A real container on `a` enrolls and is backed up, encrypted, to versitygw. Then `a` is lost: the forwarder closes and the container is deleted. botd finds `a` down, the test declares it lost, and the container is made again in `b` from the backup, with the backup's files, a new identity, the firewall, and only its new certificate, within its tier's RTO. The timing is in the job summary and uploaded as `host-drill-<incus>`. The two projects share one kernel and storage, so this checks botd's side of a host loss (routing, ids, detection, recovery and re-enrollment), not the network between real hosts.
 
 ## Consequences
