@@ -1485,7 +1485,10 @@ async fn act(
         let res = match (step, &target) {
             (Step::Suspend, _) => p.shutdown(&pid).await,
             (Step::Resume, _) => p.boot(&pid).await,
-            (_, Some((_, plan))) => p.resize(&pid, plan).await,
+            (_, Some((t, plan))) => {
+                app.db.machine_resize_sent(&m.id, t, plan);
+                p.resize(&pid, plan).await
+            }
             _ => Ok(()),
         };
         if let Err(e) = res {
@@ -1503,6 +1506,9 @@ async fn act(
     m.last_error = None;
     if !app.db.save_machine(&m, from) {
         return Err(conflict("The machine changed meanwhile; try again.".into()));
+    }
+    if step == Step::Resize {
+        app.db.machine_resize_unsent(&m.id, None);
     }
     app.db.record(&event(by, action, &m, extra));
     match m.state {

@@ -14,6 +14,10 @@
 //!   or squeeze.
 //! - `done`, `failed`, `cancelled`: settled. A newer tier change asks again.
 //!
+//! The size sent to the provider is kept until its outcome is seen (`settle`), whatever
+//! becomes of the request: its host keeps room for it, and a tier change back to the
+//! size botd has on record asks for that size again rather than cancelling.
+//!
 //! Nothing is lost on a downgrade: a machine is only made smaller once what's on it
 //! fits. An admin can still resize by hand (`POST /api/users/{key}/machine/resize`).
 
@@ -46,6 +50,12 @@ const OPEN: [&str; 2] = ["pending", "waiting"];
 
 fn open(m: &Machine) -> bool {
     m.resize_state.as_deref().is_some_and(|s| OPEN.contains(&s))
+}
+
+/// Whether a resize sent to the provider, with its outcome unknown, may have left the
+/// machine at another size than botd's record.
+fn unsettled(m: &Machine) -> bool {
+    m.resize_sent_plan.as_deref().is_some_and(|s| s != m.plan)
 }
 
 fn details(m: &Machine, extra: Value) -> Value {
@@ -82,14 +92,17 @@ pub fn follow(app: &App, by: &Who, user_id: &str, cause: &str, event_id: Option<
         }
         return None;
     };
-    if (&tier, &plan) == (&m.tier, &m.plan) {
+    // A resize sent whose outcome is unknown may have left the machine at another size
+    // than botd's record: it's asked for again, not taken as done.
+    let unsettled = unsettled(&m);
+    if (&tier, &plan) == (&m.tier, &m.plan) && !unsettled {
         if open(&m) {
             cancel(app, by, &m, "already_that_size", "The machine is that size already.");
         }
         return None;
     }
     let same = m.resize_tier.as_deref() == Some(tier.as_str()) && m.resize_plan.as_deref() == Some(plan.as_str());
-    if same && (open(&m) || !fresh) {
+    if same && (open(&m) || (!fresh && !unsettled)) {
         return None;
     }
     if !app.db.machine_resize_queue(&m.id, &tier, &plan, (&m.tier, &m.plan), cause, event_id) {
@@ -313,8 +326,54 @@ async fn facts(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, m: &M
     })
 }
 
+/// A resize sent whose outcome botd hasn't seen, settled from what the provider says
+/// now: the size it took is recorded, one it didn't take is forgotten. Left as it is
+/// while the provider is still resizing. Callers hold `ops`.
+async fn settle(app: &AppState, p: &dyn MachineProvider, m: &Machine) -> Result<(), ProviderError> {
+    let (Some(tier), Some(sent)) = (m.resize_sent_tier.clone(), m.resize_sent_plan.clone()) else { return Ok(()) };
+    let pid = match &m.provider_id {
+        Some(pid) if !matches!(m.state, State::Destroying | State::Destroyed) => pid.clone(),
+        _ => {
+            app.db.machine_resize_unsent(&m.id, Some(&sent));
+            return Ok(());
+        }
+    };
+    let pm = match p.get(&pid).await {
+        Ok(pm) => pm,
+        Err(ProviderError::NotFound) => {
+            app.db.machine_resize_unsent(&m.id, Some(&sent));
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    if pm.status == "resizing" {
+        return Ok(());
+    }
+    if pm.plan == sent && sent != m.plan {
+        let mut after = m.clone();
+        (after.tier, after.plan, after.last_error) = (tier.clone(), sent.clone(), None);
+        if !app.db.save_machine(&after, m.state) {
+            return Ok(()); // changed meanwhile: the next pass looks again
+        }
+        let extra = json!({
+            "fromTier": m.tier, "toTier": tier, "fromPlan": m.plan, "toPlan": sent, "providerCall": false,
+            "auto": true, "settled": true, "providerId": pid,
+        });
+        app.db.record(&event(&system(&after), "machine.resized", &after, extra));
+    }
+    app.db.machine_resize_unsent(&m.id, Some(&sent));
+    Ok(())
+}
+
 /// One step for one machine's resize. Callers hold `ops`.
 async fn step(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, id: &str) {
+    let Some(m) = app.db.machine(id) else { return };
+    if let Err(e) = settle(app, p, &m).await {
+        if let Some(plan) = m.resize_plan.as_deref().filter(|_| open(&m)) {
+            retry(app, &m, plan, e);
+        }
+        return;
+    }
     let Some(m) = app.db.machine(id) else { return };
     // The tier may have moved on since it was asked for (or TIERS_FILE did).
     follow(app, &system(&m), &m.user_id, m.resize_cause.as_deref().unwrap_or("admin"), m.resize_event.as_deref(), false);
@@ -351,8 +410,12 @@ async fn step(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, id: &s
         return wait(app, &m, &plan, "provider_busy", "The provider is still busy resizing the machine.");
     }
     let call = pm.plan != plan;
-    if call && let Err(e) = p.resize(&pid, &plan).await {
-        return retry(app, &m, &plan, e);
+    if call {
+        // Kept until the outcome is seen, whatever becomes of the request meanwhile.
+        app.db.machine_resize_sent(&m.id, &tier, &plan);
+        if let Err(e) = p.resize(&pid, &plan).await {
+            return retry(app, &m, &plan, e);
+        }
     }
     let mut after = m.clone();
     let (from_tier, from_plan) = (m.tier.clone(), m.plan.clone());
@@ -360,6 +423,7 @@ async fn step(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, id: &s
     if !app.db.save_machine(&after, m.state) {
         return; // changed meanwhile: the next pass looks again
     }
+    app.db.machine_resize_unsent(&m.id, None);
     app.db.machine_resize_move(&m.id, &plan, &OPEN, "done", None, None, false, None);
     let extra = json!({
         "fromTier": from_tier, "toTier": tier, "fromPlan": from_plan, "toPlan": plan, "providerCall": call,

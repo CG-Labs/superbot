@@ -321,20 +321,78 @@ async fn a_tier_change_while_the_provider_resizes_is_followed_after() {
     assert_eq!((w.status().await["resize"]["state"].as_str(), w.plan()), (Some("done"), "g6-standard-1".to_string()));
 }
 
+/// Where the fake provider has the machine now.
+async fn provider_plan(w: &World, m: &crate::db::Machine) -> String {
+    w.fake.get(m.provider_id.as_deref().unwrap()).await.unwrap().plan
+}
+
+#[tokio::test]
+async fn a_tier_change_back_after_a_lost_answer_resizes_the_machine_back() {
+    let w = world().await;
+    let m = w.machine().await;
+    w.set_tier("big").await;
+    // The provider grows it to big, but the answer is lost: botd still records small.
+    w.fake.lose_next("resize");
+    w.reconcile().await;
+    assert_eq!((provider_plan(&w, &m).await, w.plan()), ("g6-standard-2".to_string(), "g6-standard-1".to_string()));
+    // Ada is moved back to small before the retry. The machine may be big, so this is
+    // asked for, not cancelled as the size it is already.
+    w.set_tier("small").await;
+    let s = w.status().await;
+    assert_eq!((s["resize"]["state"].as_str(), s["resize"]["toPlan"].as_str()), (Some("pending"), Some("g6-standard-1")), "{s}");
+    // The next pass finds big at the provider, records it, and makes it small again.
+    w.app.db.machine_disk_seen(&m.id, GB, 80 * GB);
+    w.reconcile().await;
+    assert_eq!((provider_plan(&w, &m).await, w.plan()), ("g6-standard-1".to_string(), "g6-standard-1".to_string()));
+    assert_eq!(w.status().await["resize"]["state"], "done");
+    let resized = w.audit("machine.resized").await;
+    assert!(resized.iter().any(|e| e["details"]["settled"] == true && e["details"]["toPlan"] == "g6-standard-2"), "{resized:?}");
+    assert_eq!(w.fake.calls("resize"), 2);
+}
+
+#[tokio::test]
+async fn a_tier_change_back_while_a_resize_answer_is_lost_still_ends_at_the_tier_size() {
+    let w = world().await;
+    let m = w.machine().await;
+    w.set_tier("big").await;
+    // While the provider grows it to big, Ada is moved back to small; then the answer
+    // to the resize is lost.
+    let (app, a_id) = (w.app.clone(), w.a_id.clone());
+    w.fake.during_next("resize", move || {
+        app.db.update_user(&a_id, crate::db::UserPatch { tier: Some(Some("small".into())), ..Default::default() }).unwrap();
+        crate::machines::resize::follow(&app, &crate::audit::Who::system("test"), &a_id, "admin", None, true);
+    });
+    w.fake.lose_next("resize");
+    w.reconcile().await;
+    assert_eq!(provider_plan(&w, &m).await, "g6-standard-2");
+    let s = w.status().await;
+    assert_eq!((s["resize"]["state"].as_str(), s["resize"]["toPlan"].as_str()), (Some("pending"), Some("g6-standard-1")), "{s}");
+    w.app.db.machine_disk_seen(&m.id, GB, 80 * GB);
+    w.reconcile().await;
+    assert_eq!((provider_plan(&w, &m).await, w.plan()), ("g6-standard-1".to_string(), "g6-standard-1".to_string()));
+    assert_eq!(w.status().await["resize"]["state"], "done");
+}
+
+fn two_sizes() -> &'static str {
+    r#"{"default":"small","tiers":[
+      {"name":"small","label":"Small","routes":"any","limits":{"machineType":"c1-m2-d20"}},
+      {"name":"big","label":"Big","routes":"any","limits":{"machineType":"c2-m4-d40"}}]}"#
+}
+
 #[tokio::test]
 async fn a_resize_whose_answer_is_unknown_keeps_its_room_on_the_host() {
     // Room for three CPUs on host a.
     let env = serve_with(|a, _, _| Fleet::new(vec![sized(a, "c3-m6-d60")], DOWN_MS)).await;
-    let tiers = r#"{"default":"small","tiers":[
-      {"name":"small","label":"Small","routes":"any","limits":{"machineType":"c1-m2-d20"}},
-      {"name":"big","label":"Big","routes":"any","limits":{"machineType":"c2-m4-d40"}}]}"#;
-    env.app.tiers.set(Arc::new(Tiers::parse(tiers, None).unwrap())).unwrap();
+    env.app.tiers.set(Arc::new(Tiers::parse(two_sizes(), None).unwrap())).unwrap();
     let (ada, m) = machine_on(&env, &env.a, "a", "ada@example.com", false).await;
     let (code, r) = json_call(&env, "PATCH", &format!("/api/users/{ada}"), r#"{"tier":"big"}"#).await;
     assert_eq!(code, 200, "{r}");
-    // As after a grow whose answer was lost: it may have taken big's room already.
-    let later = db::now() + 3_600_000;
-    assert!(env.app.db.machine_resize_move(&m.id, "c2-m4-d40", &["pending"], "pending", Some("provider"), Some("lost"), true, Some(later)));
+    // The grow's outcome is unknown (Incus kept changing under it): it may have taken
+    // big's room already.
+    env.a.w().races = 3;
+    reconcile(&env).await;
+    let (_, s) = json_call(&env, "GET", &format!("/api/users/{ada}/machine/resize"), "").await;
+    assert_eq!((s["resize"]["state"].as_str(), s["resize"]["reason"].as_str()), (Some("pending"), Some("provider")), "{s}");
     let (_, h) = json_call(&env, "GET", "/api/machines/hosts", "").await;
     let a = h["hosts"].as_array().unwrap().iter().find(|x| x["name"] == "a").unwrap();
     assert_eq!(a["load"]["allocated"]["cpus"], 2, "{h}");
@@ -350,6 +408,39 @@ async fn a_resize_whose_answer_is_unknown_keeps_its_room_on_the_host() {
     assert_eq!((s["resize"]["state"].as_str(), s["plan"].as_str()), (Some("done"), Some("c2-m4-d40")), "{s}");
 }
 
+#[tokio::test]
+async fn the_room_an_unknown_resize_holds_lasts_until_the_provider_is_checked() {
+    // Room for three CPUs on host a.
+    let env = serve_with(|a, _, _| Fleet::new(vec![sized(a, "c3-m6-d60")], DOWN_MS)).await;
+    env.app.tiers.set(Arc::new(Tiers::parse(two_sizes(), None).unwrap())).unwrap();
+    let (ada, _) = machine_on(&env, &env.a, "a", "ada@example.com", false).await;
+    let (code, r) = json_call(&env, "PATCH", &format!("/api/users/{ada}"), r#"{"tier":"big"}"#).await;
+    assert_eq!(code, 200, "{r}");
+    env.a.w().races = 3;
+    reconcile(&env).await;
+    // Ada moves back to small before the provider is checked: the grow may still have
+    // landed, so her machine keeps big's room, and a big machine for Cy doesn't fit.
+    let (code, r) = json_call(&env, "PATCH", &format!("/api/users/{ada}"), r#"{"tier":"small"}"#).await;
+    assert_eq!(code, 200, "{r}");
+    let (_, h) = json_call(&env, "GET", "/api/machines/hosts", "").await;
+    let a = h["hosts"].as_array().unwrap().iter().find(|x| x["name"] == "a").unwrap();
+    assert_eq!(a["load"]["allocated"]["cpus"], 2, "{h}");
+    let (cy, _) = user_with(env.port, &env.admin, "cy@example.com", "member").await;
+    let (code, r) = json_call(&env, "PATCH", &format!("/api/users/{cy}"), r#"{"tier":"big"}"#).await;
+    assert_eq!(code, 200, "{r}");
+    let (code, e) = json_call(&env, "POST", &format!("/api/users/{cy}/machine"), "").await;
+    assert_eq!(code, 409, "{e}");
+    // The next pass finds the grow never landed: the room is freed, and Cy's fits.
+    reconcile(&env).await;
+    let (_, s) = json_call(&env, "GET", &format!("/api/users/{ada}/machine/resize"), "").await;
+    assert_eq!((s["resize"]["state"].as_str(), s["plan"].as_str()), (Some("cancelled"), Some("c1-m2-d20")), "{s}");
+    let (_, h) = json_call(&env, "GET", "/api/machines/hosts", "").await;
+    let a = h["hosts"].as_array().unwrap().iter().find(|x| x["name"] == "a").unwrap();
+    assert_eq!(a["load"]["allocated"]["cpus"], 1, "{h}");
+    let (code, e) = json_call(&env, "POST", &format!("/api/users/{cy}/machine"), "").await;
+    assert_eq!(code, 202, "{e}");
+}
+
 fn sized(m: Member, cap: &str) -> Member {
     Member { capacity: Some(capacity(cap).unwrap()), ..m }
 }
@@ -358,10 +449,7 @@ fn sized(m: Member, cap: &str) -> Member {
 async fn an_incus_machine_grows_in_place_once_its_host_has_room() {
     // Room on host a for two small machines, and no more.
     let env = serve_with(|a, _, _| Fleet::new(vec![sized(a, "c2-m4-d40")], DOWN_MS)).await;
-    let tiers = r#"{"default":"small","tiers":[
-      {"name":"small","label":"Small","routes":"any","limits":{"machineType":"c1-m2-d20"}},
-      {"name":"big","label":"Big","routes":"any","limits":{"machineType":"c2-m4-d40"}}]}"#;
-    env.app.tiers.set(Arc::new(Tiers::parse(tiers, None).unwrap())).unwrap();
+    env.app.tiers.set(Arc::new(Tiers::parse(two_sizes(), None).unwrap())).unwrap();
     let mail = crate::notify::smtp::fake::start(Default::default()).await;
     alerts_to(&env, &mail);
     let (ada, m) = machine_on(&env, &env.a, "a", "ada@example.com", false).await;

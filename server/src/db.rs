@@ -647,6 +647,12 @@ pub struct Machine {
     /// When it entered its state.
     #[serde(skip)]
     pub resize_at: Option<i64>,
+    /// The size last sent to the provider whose outcome botd hasn't seen: it may hold
+    /// that size already, whatever `plan` says. Cleared once the provider is checked.
+    #[serde(skip)]
+    pub resize_sent_tier: Option<String>,
+    #[serde(skip)]
+    pub resize_sent_plan: Option<String>,
     /// What its agent last said of its disk, in bytes (ADR 0085), and when.
     pub disk_used: Option<i64>,
     pub disk_total: Option<i64>,
@@ -821,6 +827,8 @@ fn machine_row(r: &Row) -> rusqlite::Result<Machine> {
         resize_next_at: r.get("resize_next_at")?,
         resize_requested_at: r.get("resize_requested_at")?,
         resize_at: r.get("resize_at")?,
+        resize_sent_tier: r.get("resize_sent_tier")?,
+        resize_sent_plan: r.get("resize_sent_plan")?,
         disk_used: r.get("disk_used")?,
         disk_total: r.get("disk_total")?,
         disk_seen_at: r.get("disk_seen_at")?,
@@ -1257,7 +1265,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 32] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 33] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1290,7 +1298,20 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 32] = [
     migrate_push_devices,
     migrate_machine_host_drain,
     migrate_machine_tier_resize,
+    migrate_machine_resize_sent,
 ];
+
+/// The size last sent to the provider for a resize whose outcome is unknown (ADR 0085).
+fn migrate_machine_resize_sent(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'resize_sent_plan'", [], |r| r.get(0))?;
+    if has {
+        return Ok(());
+    }
+    c.execute_batch(
+        "ALTER TABLE machines ADD COLUMN resize_sent_tier TEXT;
+        ALTER TABLE machines ADD COLUMN resize_sent_plan TEXT;",
+    )
+}
 
 /// Resizing a machine when its user's tier changes (ADR 0085): the latest resize, kept
 /// on the machine as rebuilds are, and what its agent says of its disk.
@@ -5121,10 +5142,30 @@ impl Db {
             == 1
     }
 
-    /// Machines with a resize not yet done.
+    /// Records that the machine is about to be sent to `plan` (for `tier`), before the
+    /// provider is asked, so a lost answer is checked rather than forgotten.
+    pub fn machine_resize_sent(&self, machine_id: &str, tier: &str, plan: &str) {
+        let _ = self.c().execute(
+            "UPDATE machines SET resize_sent_tier = ?, resize_sent_plan = ? WHERE id = ?",
+            params![tier, plan, machine_id],
+        );
+    }
+
+    /// The provider's answer for a resize sent to `plan` (None: any) is known: forgets
+    /// it, unless another was sent since.
+    pub fn machine_resize_unsent(&self, machine_id: &str, plan: Option<&str>) {
+        let _ = self.c().execute(
+            "UPDATE machines SET resize_sent_tier = NULL, resize_sent_plan = NULL WHERE id = ?1 AND (?2 IS NULL OR resize_sent_plan IS ?2)",
+            params![machine_id, plan],
+        );
+    }
+
+    /// Machines with a resize not yet done, or one sent whose outcome is unknown.
     pub fn machines_resizing(&self) -> Vec<Machine> {
         let c = self.c();
-        let mut s = c.prepare("SELECT * FROM machines WHERE resize_state IN ('pending', 'waiting') ORDER BY resize_requested_at, id").unwrap();
+        let mut s = c
+            .prepare("SELECT * FROM machines WHERE resize_state IN ('pending', 'waiting') OR resize_sent_plan IS NOT NULL ORDER BY resize_requested_at, id")
+            .unwrap();
         s.query_map([], machine_row).unwrap().filter_map(Result::ok).collect()
     }
 

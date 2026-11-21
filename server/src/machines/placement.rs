@@ -91,12 +91,12 @@ fn need(cp: &ControlPlane, plan: &str) -> Resources {
     cp.provider.as_deref().and_then(|p| p.plan_resources(plan)).unwrap_or_default()
 }
 
-/// What `m` takes on its host: its plan, or while a resize's answer is unknown (it
-/// may have reached the provider), the larger of both plans in each resource.
+/// What `m` takes on its host: its plan, or while a resize sent to the provider has an
+/// unknown outcome (whatever has become of the request since), the larger of both
+/// plans in each resource.
 fn counted(cp: &ControlPlane, m: &Machine) -> Resources {
     let now = need(cp, &m.plan);
-    let in_flight = m.resize_reason.as_deref() == Some("provider") && matches!(m.resize_state.as_deref(), Some("pending" | "waiting"));
-    match m.resize_plan.as_deref().filter(|_| in_flight) {
+    match m.resize_sent_plan.as_deref().filter(|s| *s != m.plan) {
         Some(to) => {
             let to = need(cp, to);
             Resources { cpus: now.cpus.max(to.cpus), memory_gib: now.memory_gib.max(to.memory_gib), disk_gib: now.disk_gib.max(to.disk_gib) }
