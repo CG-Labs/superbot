@@ -142,7 +142,7 @@ The test found three problems before it passed, all fixed here:
   - one upgrade through the suite;
   - two providers through tier routing, with fallback.
 
-  Hermes is cleared to be the managed default. New Bots on a managed tier already take its first route's harness, and the shipped tiers put Hermes first on every managed plan.
-- **Not done here.** Installing Hermes by default in the installer, the Compose image, and `MACHINE_HARNESSES` for managed machines is the next step of that rollout.
+  Hermes is cleared to be the managed default.
+- **Not done here.** Making it the default is [ADR 0079](0079-hermes-default-for-managed-tiers.md). (This said new Bots already took a managed tier's first route's harness; they took `DEFAULT_HARNESS` whenever the tier had it, so Claude on Pro and Max. ADR 0079 fixes that.)
 - **Fallback is opt-in per route.** A route with no `fallback` fails as before, and an open tier keeps Hermes's own settings.
 - **Keys go only where routed.** A tier endpoint's key is a secret like any other, saved with `botctl secret set` or set in `.env`. It goes only to runs routed to its endpoint.

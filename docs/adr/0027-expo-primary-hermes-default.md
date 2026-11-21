@@ -74,6 +74,7 @@ Larger gaps are follow-ups, not blockers. They are admin features that stay in t
 ## How decision 2 applies
 
 - **Managed tiers (M3)**: new Bots run on Hermes Agent by default. The control plane sets `DEFAULT_HARNESS=hermes` and installs the pinned Hermes in each user's computer or container. Tier-to-model routing goes through Hermes's providers.
+  *Done (21 Nov 2026), differently: the default is per tier, not `DEFAULT_HARNESS`. Each managed tier in the tiers file names its `defaultHarness` (Hermes on every shipped plan), managed machines install it when `MACHINE_HARNESSES` is unset, and older Bots move only when an admin asks ([ADR 0079](0079-hermes-default-for-managed-tiers.md)).*
 - **Self-host**: unchanged. Hermes stays opt-in in the installer and image (`--with-hermes`, [ADR 0015](0015-hermes-adapter.md)); `DEFAULT_HARNESS` keeps its current default.
 - **Readiness**: the owner has decided *whether*. ADR 0011's gate items become the release checklist for managed tiers: the end-to-end approval test on the pinned stable version (including fail-closed on hook timeout and the unguarded-run canary), per-Bot memory and CPU measured on the smallest managed size, one upstream upgrade through the test suite, and tier routing with at least two providers.
 - **Support matrix**: Hermes Agent, pinned stable release only, carries the Enterprise SLA. Claude Code, Codex, Pi and others are best-effort: bugs fixed as capacity allows, no response-time commitment.

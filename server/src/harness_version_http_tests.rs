@@ -107,7 +107,9 @@ async fn guarded_codex_runs_on_this_server_need_a_codex_that_runs_the_hook() {
     std::fs::remove_file(app.cfg.bin_dir.join("codex")).unwrap();
     if adapters::version::resolve("codex", &std::env::var("PATH").unwrap_or_default(), &app.cfg.workspace).is_none() {
         let said = run(port, &app, &admin, &bot.id).await;
-        assert!(said.contains("codex isn't on this server's PATH"), "{said}");
+        assert!(said.contains("codex isn't installed on this server"), "{said}");
+        let refused = events(port, &admin, &format!("action=bot.run_refused&bot={}", bot.id)).await;
+        assert_eq!(refused[0]["details"]["reason"], "harness_missing");
     }
 }
 

@@ -296,7 +296,11 @@ fn tiers_view(app: &AppState) -> Value {
         "source": t.source,
         "fileLoaded": file,
         "default": t.default_tier().name,
-        "tiers": t.all().iter().map(Tier::view).collect::<Vec<_>>(),
+        "tiers": t.all().iter().map(|x| {
+            let mut v = x.view();
+            v["newBots"] = json!(x.new_bot_harness(&app.cfg.default_harness));
+            v
+        }).collect::<Vec<_>>(),
         "managed": t.all().iter().any(Tier::managed),
         "ok": true,
         "detail": detail,
