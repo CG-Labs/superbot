@@ -139,6 +139,8 @@ export function AppLockProvider({ children, auth = deviceAuth, store = deviceSto
         else await store.clear();
         settingsRef.current = s;
         setSettings(s);
+        // Turned off while unlocked; a lock from leaving mid-save no longer applies.
+        if (!s.enabled) dispatch({ type: "unlocked" });
       } finally {
         pending.current = null;
       }
