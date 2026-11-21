@@ -184,6 +184,10 @@ async fn provide(app: &AppState, by: &Who, team: &Team, user: &User) -> Value {
         // Under the lock the sweep destroys under, so a due machine is either taken back
         // or destroyed, never both.
         let guard = cp.lock_ops().await;
+        // Leaving releases under this lock too: someone gone by now keeps it released.
+        if app.db.team_id_of(&user.id).as_deref() != Some(team.id.as_str()) {
+            return json!("left");
+        }
         let Some(tm) = app.db.team_machine(&m.id) else { return json!("own") };
         if tm.released_at.is_none() && tm.team_id == team.id {
             return json!("kept");
@@ -355,13 +359,16 @@ pub(crate) async fn leave_as(app: &AppState, by: &Who, team_id: &str, user_id: &
 async fn release(app: &AppState, by: &Who, team_id: &str, user_id: &str) {
     let Some(cp) = control_plane(app) else { return };
     let Some(m) = app.db.user_machine(user_id) else { return };
-    if app.db.team_machine(&m.id).is_none_or(|t| t.team_id != team_id || t.released_at.is_some()) {
-        return;
-    }
     let days = settings(app).machine_days;
     let due = now() + days as i64 * DAY_MS;
-    if !app.db.team_machine_release(&m.id, team_id, due) {
-        return;
+    {
+        let _g = cp.lock_ops().await;
+        if app.db.team_machine(&m.id).is_none_or(|t| t.team_id != team_id || t.released_at.is_some()) {
+            return;
+        }
+        if !app.db.team_machine_release(&m.id, team_id, due) {
+            return;
+        }
     }
     let suspended = match m.state {
         MachineState::Running if days > 0 => crate::machines::act_if(app, cp, by, user_id, Step::Suspend, None, &|x| released(app, &m.id, x)).await.is_ok(),
