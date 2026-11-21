@@ -63,6 +63,7 @@ describe("billing helpers", () => {
     expect(limitSummary({ maxBots: 10 })).toEqual(["10 Bots", "Unlimited runs", "Unlimited routine runs"]);
     expect(limitSummary({ maxBots: 3, concurrentRuns: 3 })).toEqual(["3 Bots", "Unlimited runs", "Unlimited routine runs", "3 tasks at once"]);
     expect(limitSummary({ maxBots: 10, monthlyTokens: 5_000_000 })).toEqual(["10 Bots", "Unlimited runs", "5,000,000 model tokens a month", "Unlimited routine runs"]);
+    expect(limitSummary({ maxBots: 3, maxStorageMb: 5000 }).at(-1)).toBe("5 GB of storage");
   });
 
   it("says how the subscription stands", () => {

@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import { ActivityIndicator, AppState, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
 import { BILLING_OFF, checkoutNotice, limitSummary, openBillingPage, subscriptionLine } from "../src/billing";
-import { overLimits, planUsageLines, usageLines } from "../src/plan";
+import { overLimits, planUsageLines, storageWarning, usageLines } from "../src/plan";
 import { colors } from "../src/theme";
 import type { BillingView, MyUsage } from "../src/types";
 
@@ -20,7 +20,8 @@ interface Props {
 }
 
 /** Your model tokens and runs this billing period (ADR 0050). */
-function UsageCard({ usage }: { usage: MyUsage }) {
+function UsageCard({ usage, warn }: { usage: MyUsage; warn?: boolean }) {
+  const warning = warn ? storageWarning(usage.storage) : null;
   return (
     <View style={styles.card} accessibilityLabel="Usage this period">
       <Text style={styles.cardTitle}>Usage this period</Text>
@@ -29,6 +30,11 @@ function UsageCard({ usage }: { usage: MyUsage }) {
           {l}
         </Text>
       ))}
+      {warning ? (
+        <Text style={styles.warn} accessibilityRole="alert">
+          {warning}
+        </Text>
+      ) : null}
     </View>
   );
 }
@@ -112,7 +118,7 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
         </Text>
         {usage ? (
           <ScrollView contentContainerStyle={styles.body}>
-            <UsageCard usage={usage} />
+            <UsageCard usage={usage} warn />
           </ScrollView>
         ) : null}
       </View>
@@ -120,7 +126,9 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
   }
 
   const plan = view?.plan;
-  const over = plan ? overLimits(plan) : [];
+  // Full storage gets its own note, which says how to free it.
+  const over = plan ? overLimits(plan).filter((o) => o !== "storage") : [];
+  const storageNote = storageWarning(plan?.usage.storage);
   const status = view ? subscriptionLine(view.subscription) : null;
   const subscribed = !!view?.subscription;
   const canChange = !!view?.canChange;
@@ -149,6 +157,11 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
               </Text>
             ))}
             {over.length ? <Text style={styles.warn}>Over this plan's limit for {over.join(", ")}: new ones are refused until you upgrade.</Text> : null}
+            {storageNote ? (
+              <Text style={styles.warn} accessibilityRole="alert">
+                {storageNote}
+              </Text>
+            ) : null}
             {view?.portal && canChange ? (
               <Pressable
                 style={[styles.btn, busy && styles.busy]}
@@ -162,7 +175,7 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
             ) : null}
           </View>
         ) : null}
-        {usage ? <UsageCard usage={usage} /> : null}
+        {usage ? <UsageCard usage={usage} warn={!plan} /> : null}
         {view?.plans.length ? <Text style={styles.section}>Plans</Text> : null}
         {view?.plans.map((p) => (
           <View key={p.name} style={[styles.card, p.current && styles.currentCard]}>

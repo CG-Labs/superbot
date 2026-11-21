@@ -70,6 +70,18 @@ describe("PlanView (ADR 0042)", () => {
     expect(open).toHaveBeenCalledWith("https://checkout.stripe.com/c/pay/pro");
   });
 
+  it("warns when storage is nearly full, and says how to free it when full (ADR 0082)", async () => {
+    const storage = { used: 950_000, limit: 1_000_000, percent: 95, state: "warning" as const, warnAt: 90, partial: false, measuredAt: 1 };
+    const plan = { ...starter, limits: { maxStorageMb: 1 }, usage: { period: "2026-11", runs: 0, bots: 0, storage } };
+    const { rerender } = await render(<PlanView api={fakeApi(billing({ plan }))} onBack={jest.fn()} />);
+    expect(await screen.findByText("Storage: 950 KB of 1 MB (95%)")).toBeOnTheScreen();
+    expect(screen.getByText(/^Storage is 95% full/)).toBeOnTheScreen();
+    const full = { ...plan, usage: { ...plan.usage, storage: { ...storage, used: 1_200_000, percent: 120, state: "over" as const } } };
+    await rerender(<PlanView api={fakeApi(billing({ plan: full }))} onBack={jest.fn()} />);
+    expect(await screen.findByText(/^Storage is full: new messages and tasks are refused/)).toBeOnTheScreen();
+    expect(screen.queryByText(/Over this plan's limit for storage/)).toBeNull();
+  });
+
   it("sends subscribers to the billing portal instead of a second checkout", async () => {
     const api = fakeApi(billing({ subscription: { status: "active", tier: "starter", periodEnd: 1_797_582_000 }, portal: true }));
     const open = jest.fn(async () => {});
