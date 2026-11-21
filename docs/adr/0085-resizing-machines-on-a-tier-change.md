@@ -28,13 +28,13 @@ A tier's `machineType` sets the size of the user's machine. Until now, a tier ch
 
 A resize waits, saying why in plain words, while any of these is true. The order is most actionable first.
 
-1. **`storage_over`:** the user's storage ([ADR 0082](0082-storage-limits-per-tier.md)) is at or past the new tier's `maxStorageMb`. "Storage is X used of the Small plan's Y. The machine moves to the Small size once that's deleted…"
+1. **`storage_over`:** the resize makes the machine smaller, and the user's storage ([ADR 0082](0082-storage-limits-per-tier.md)) is at or past the new tier's `maxStorageMb`. Growing removes nothing, so it never holds up a bigger size. "Storage is X used of the Small plan's Y. The machine moves to the Small size once that's deleted…"
 2. **When the new disk is smaller, or botd can't tell it isn't:**
    - **`plan_disk_unknown`:** the provider can't say how big the new size's disk is.
    - **`disk_unknown`:** the machine hasn't reported its disk use in the last 15 minutes.
    - **`disk_too_full`:** what's on the disk is more than 90% of the new disk.
 
-   Machines now report disk use (used and total bytes of the agent's home filesystem) with every heartbeat. A suspended machine's last report is trusted, since its disk can't change. Linode's plan disk comes from `GET /linode/types/{plan}`; Incus reads it from the plan name (`c<cpus>-m<GiB>-d<GiB>`).
+   Machines now report disk use (used and total bytes of the agent's home filesystem) with every heartbeat. A suspended machine's last report is trusted only if it was recent (15 minutes) when the machine was suspended, since its disk can't change while it's off. Machines record when they were suspended (`suspended_at`); one suspended before that was recorded waits for a fresh report. Linode's plan disk comes from `GET /linode/types/{plan}`; Incus reads it from the plan name (`c<cpus>-m<GiB>-d<GiB>`).
 3. **`no_room`:** an Incus host hasn't room to grow the container where it is (below).
 4. **`busy`:** Bots are running on the machine, and the resize would restart it (a VM) or shrink a container's CPUs, memory or disk. It waits at most 6 hours, then goes ahead, so a busy machine still ends up the size its plan says.
 

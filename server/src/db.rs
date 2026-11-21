@@ -658,6 +658,10 @@ pub struct Machine {
     pub disk_used: Option<i64>,
     pub disk_total: Option<i64>,
     pub disk_seen_at: Option<i64>,
+    /// When it was last suspended, while it is. None for one suspended before this was
+    /// kept.
+    #[serde(skip)]
+    pub suspended_at: Option<i64>,
 }
 
 /// A certificate the control plane issued a machine (ADR 0031). Looked up by
@@ -833,6 +837,7 @@ fn machine_row(r: &Row) -> rusqlite::Result<Machine> {
         disk_used: r.get("disk_used")?,
         disk_total: r.get("disk_total")?,
         disk_seen_at: r.get("disk_seen_at")?,
+        suspended_at: r.get("suspended_at")?,
     })
 }
 
@@ -1266,7 +1271,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 34] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 35] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1301,7 +1306,18 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 34] = [
     migrate_teams,
     migrate_machine_tier_resize,
     migrate_machine_resize_sent,
+    migrate_machine_suspended_at,
 ];
+
+/// When a machine was suspended (ADR 0085): what its agent said of its disk before then
+/// still holds while it's off, and what it said long before doesn't.
+fn migrate_machine_suspended_at(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'suspended_at'", [], |r| r.get(0))?;
+    if has {
+        return Ok(());
+    }
+    c.execute_batch("ALTER TABLE machines ADD COLUMN suspended_at INTEGER;")
+}
 
 /// Team accounts (ADR 0087): a team is a group of this server's users, each in one team
 /// at most, with a role in it. Invites wait for the person with that email to accept.
@@ -4428,7 +4444,9 @@ impl Db {
         self.c()
             .execute(
                 "UPDATE machines SET provider_id = ?, tier = ?, plan = ?, region = ?, state = ?, provider_status = ?, ipv4 = ?, backups = ?,
-                 last_error = ?, create_sent_at = ?, placed_on = ?, updated_at = ?, destroyed_at = ?, firewall_id = ? WHERE id = ? AND state = ?",
+                 last_error = ?, create_sent_at = ?, placed_on = ?, updated_at = ?, destroyed_at = ?, firewall_id = ?,
+                 suspended_at = CASE WHEN ?5 != 'suspended' THEN NULL WHEN state = 'suspended' THEN suspended_at ELSE ?12 END
+                 WHERE id = ? AND state = ?",
                 params![
                     m.provider_id,
                     m.tier,
@@ -5221,6 +5239,13 @@ impl Db {
             "UPDATE machines SET disk_used = ?, disk_total = ?, disk_seen_at = ? WHERE id = ?",
             params![b(used), b(total), now(), machine_id],
         );
+    }
+
+    /// What the machine's agent said of its disk at `at`, as if long ago.
+    #[cfg(test)]
+    pub fn machine_disk_seen_at(&self, machine_id: &str, used: u64, total: u64, at: i64) {
+        self.machine_disk_seen(machine_id, used, total);
+        let _ = self.c().execute("UPDATE machines SET disk_seen_at = ? WHERE id = ?", params![at, machine_id]);
     }
 
     /// Forgets a machine's resize, as if none was ever asked for.

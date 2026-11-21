@@ -242,6 +242,28 @@ async fn a_downgrade_waits_until_what_the_user_has_fits_the_smaller_tier() {
 }
 
 #[tokio::test]
+async fn a_suspended_machine_is_made_smaller_only_on_a_disk_report_from_just_before_it_was_suspended() {
+    let w = world().await;
+    w.set_tier("big").await;
+    let m = w.machine().await;
+    let (off, on) = (format!("/api/users/{}/machine/suspend", w.a_id), format!("/api/users/{}/machine/resume", w.a_id));
+    // Its agent last said 10 GB an hour before it was suspended: files may have come since.
+    w.app.db.machine_disk_seen_at(&m.id, 10 * GB, 80 * GB, db::now() - 3_600_000);
+    assert_eq!(call(w.port, "POST", &off, &w.admin, "").await.0, 200);
+    w.set_tier("small").await;
+    w.reconcile().await;
+    let s = w.status().await;
+    assert_eq!((s["state"].as_str(), s["resize"]["reason"].as_str()), (Some("suspended"), Some("disk_unknown")), "{s}");
+    assert_eq!(w.fake.calls("resize"), 0, "nothing lost");
+    // Running again, it reports, and is suspended at once: that report still holds.
+    assert_eq!(call(w.port, "POST", &on, &w.admin, "").await.0, 200);
+    w.app.db.machine_disk_seen(&m.id, 10 * GB, 80 * GB);
+    assert_eq!(call(w.port, "POST", &off, &w.admin, "").await.0, 200);
+    w.reconcile().await;
+    assert_eq!((w.status().await["resize"]["state"].as_str(), w.plan()), (Some("done"), "g6-standard-1".to_string()));
+}
+
+#[tokio::test]
 async fn a_failing_provider_is_tried_again_and_a_lost_answer_isnt_resized_twice() {
     let w = world().await;
     let m = w.machine().await;

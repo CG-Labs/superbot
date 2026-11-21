@@ -8,7 +8,7 @@
 //!
 //! - `pending`: to be tried on the next pass (after a backoff, once a try failed).
 //! - `waiting`: not safe yet, with the reason in plain words, looked at again on every
-//!   pass: the user's storage is over the new tier's cap, the machine's disk holds more
+//!   pass: the user's storage is over a smaller tier's cap, the machine's disk holds more
 //!   than the new size's disk would with room to spare (or botd can't tell), its host
 //!   hasn't room to grow it, or Bots are running on a machine the resize would restart
 //!   or squeeze.
@@ -163,7 +163,8 @@ pub enum Decision {
 /// Whether the resize may go ahead now, or why not, most actionable reason first.
 pub fn decide(f: &Facts) -> Decision {
     let label = &f.label;
-    if let Some((used, cap)) = f.storage
+    // Growing removes nothing, so what the user has only holds up a smaller size.
+    if let Some((used, cap)) = f.storage.filter(|_| f.shrinks())
         && used >= cap
     {
         return Decision::Wait(
@@ -303,8 +304,12 @@ fn retry(app: &AppState, m: &Machine, plan: &str, e: ProviderError) {
 async fn facts(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, m: &Machine, plan: &str) -> Result<Facts, ProviderError> {
     let (from, to) = (p.plan_resources(&m.plan), p.plan_resources(plan));
     let (from_disk, to_disk) = (p.plan_disk(&m.plan).await?, p.plan_disk(plan).await?);
-    // A suspended machine's disk can't change, so what it said before still holds.
-    let fresh = m.state == State::Suspended || m.disk_seen_at.is_some_and(|t| now() - t < DISK_FRESH_MS);
+    // A suspended machine's disk can't change, so what it said just before still holds.
+    let at = match m.state {
+        State::Suspended => m.suspended_at,
+        _ => Some(now()),
+    };
+    let fresh = matches!((m.disk_seen_at, at), (Some(seen), Some(at)) if at - seen < DISK_FRESH_MS);
     let tier = app.tier_of(&m.user_id);
     let storage = match storage::limit(&tier.limits) {
         Some(cap) => Some((storage::current(app, &m.user_id, storage::CHECK_AGE).await.used(), cap)),
@@ -519,6 +524,8 @@ mod tests {
         assert_eq!(r, "no_room");
         assert!(text.contains("a has 0 of 2 CPUs free"), "{text}");
         assert_eq!(reason(&Facts { room: Some(Ok(())), ..up.clone() }), "go");
+        // Storage over the new tier's cap doesn't hold up a bigger machine: nothing is lost.
+        assert_eq!(reason(&Facts { storage: Some((6 * GB, 5 * GB)), ..up.clone() }), "go");
         // A provider that can't size either plan is treated as shrinking the disk.
         assert_eq!(reason(&Facts { from_disk: None, ..up }), "disk_unknown");
     }
