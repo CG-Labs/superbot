@@ -291,4 +291,70 @@ pub trait MachineProvider: Send + Sync {
     fn detach_firewall<'a>(&'a self, id: &'a str, machine: &'a str) -> Fut<'a, ()>;
     /// Succeeds if it is already gone.
     fn delete_firewall<'a>(&'a self, id: &'a str) -> Fut<'a, ()>;
+
+    /// The hosts machines are spread over, where the provider has several to choose
+    /// from (ADR 0076). None: one place, nothing to choose.
+    fn hosts(&self) -> Option<&dyn Hosts> {
+        None
+    }
+}
+
+/// How the control plane last found a host (ADR 0076). `Down`: it hasn't answered for
+/// INCUS_HOST_DOWN_MINUTES, and nothing new goes there. `Lost`: an admin said it is
+/// gone for good, so its machines are made again elsewhere and it is never called.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HostStatus {
+    Up,
+    Down,
+    Lost,
+}
+
+impl HostStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HostStatus::Up => "up",
+            HostStatus::Down => "down",
+            HostStatus::Lost => "lost",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<HostStatus> {
+        match s {
+            "up" => Some(HostStatus::Up),
+            "down" => Some(HostStatus::Down),
+            "lost" => Some(HostStatus::Lost),
+            _ => None,
+        }
+    }
+}
+
+/// A configured host. Never a credential.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HostInfo {
+    pub name: String,
+    pub url: String,
+    /// The SHA-256 of the certificate botd pins for it.
+    pub fingerprint: String,
+    pub status: HostStatus,
+}
+
+/// Several hosts behind one provider: machine ids say which one each is on.
+pub trait Hosts: Send + Sync {
+    /// Every configured host, in placement order.
+    fn configured(&self) -> Vec<HostInfo>;
+    /// The host a machine id is on.
+    fn host_of(&self, id: &str) -> String;
+    /// The id of the machine called `name` on `host`.
+    fn id_on(&self, host: &str, name: &str) -> String;
+    /// What the control plane decided about `host`, which needn't be configured: a lost
+    /// host taken out of the settings is still lost.
+    fn set_status(&self, host: &str, status: HostStatus);
+    fn status(&self, host: &str) -> Option<HostStatus>;
+    /// Where a new machine goes: the first configured host that is up.
+    fn placement(&self) -> Option<String>;
+    /// How long a host may fail to answer before it is down.
+    fn down_after_ms(&self) -> i64;
+    /// Asks `host` whether it answers and trusts botd: what it said.
+    fn probe<'a>(&'a self, host: &'a str) -> Fut<'a, String>;
 }

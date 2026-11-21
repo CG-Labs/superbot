@@ -253,6 +253,12 @@ fn failed(app: &App, by: &Who, m: &Machine, firewall_id: &str, step: &str, e: &P
     );
 }
 
+/// Whether `m` is on a host that is down or lost, so nothing there can be checked.
+fn on_unreachable_host(p: &dyn MachineProvider, m: &Machine) -> bool {
+    let (Some(h), Some(pid)) = (p.hosts(), m.provider_id.as_deref()) else { return false };
+    h.status(&h.host_of(pid)).is_some_and(|s| s != super::provider::HostStatus::Up)
+}
+
 /// Keeps the firewall as configured and every machine the provider has behind it:
 /// those adopted from a lost create, made before the firewall was on, or taken off it
 /// at the provider. A machine still behind an older firewall of ours (e.g. from
@@ -268,6 +274,7 @@ pub async fn sync(app: &App, fw: &Firewall, p: &dyn MachineProvider) -> usize {
             matches!(m.state, State::Provisioning | State::Running | State::Suspended)
                 && m.provider_id.is_some()
                 && m.provider == p.name()
+                && !on_unreachable_host(p, m)
         })
         .collect();
     if live.is_empty() {

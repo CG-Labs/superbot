@@ -18,6 +18,7 @@ pub mod enroll;
 pub mod fake;
 pub mod firewall;
 pub mod folder;
+pub mod hosts;
 pub mod incus;
 #[cfg(test)]
 pub mod incus_standin;
@@ -348,7 +349,7 @@ impl ControlPlane {
         if firewall::Settings::from_env(var)?.is_none() {
             return Err("MACHINE_PROVIDER=incus needs MACHINE_FIREWALL=on: the firewall is what keeps containers off each other, the host, and private addresses".into());
         }
-        let p = incus::Incus::new(incus::Settings::from_env(var)?, incus::Credentials::from_store(store)?)?;
+        let p = incus::fleet::Fleet::from_env(store, var)?;
         let mut cp = ControlPlane::configured(Arc::new(p), var)?;
         cp.regions = list(&var("MACHINE_REGIONS"));
         if cp.regions.is_empty() {
@@ -509,6 +510,11 @@ impl ControlPlane {
 
     pub fn enabled(&self) -> bool {
         self.provider.is_some()
+    }
+
+    /// The provider's hosts, where it has several (ADR 0076).
+    pub fn hosts(&self) -> Option<&dyn provider::Hosts> {
+        self.provider.as_deref()?.hosts()
     }
 
     /// Whether `m` was made by this server's provider. One made by another (after
@@ -1011,6 +1017,7 @@ pub fn start(app: AppState, cp: Arc<ControlPlane>) {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
+            hosts::watch(&a, &c).await;
             reconcile(&a, &c).await;
         }
     });
@@ -1035,10 +1042,13 @@ fn admin_view(app: &App, m: &Machine) -> Value {
     let mut v = serde_json::to_value(m).unwrap_or_default();
     v["userEmail"] = json!(app.db.user(&m.user_id).and_then(|u| u.email));
     v["lastBackup"] = backup::last(app, &m.id);
-    if let Some(cp) = app.control_plane.get()
-        && let Some(off) = cp.offsite.as_deref()
-    {
-        v["recovery"] = recovery::view(app, cp, off, m);
+    if let Some(cp) = app.control_plane.get() {
+        if let Some(host) = hosts::of(cp, m) {
+            v["host"] = json!(host);
+        }
+        if let Some(off) = cp.offsite.as_deref() {
+            v["recovery"] = recovery::view(app, cp, off, m);
+        }
     }
     v
 }
@@ -1516,7 +1526,11 @@ pub async fn destroy(
 /// `POST /api/machines/reconcile`: one pass now, instead of waiting for the timer.
 pub async fn reconcile_now(AppS(app): AppS<AppState>, Extension(a): Extension<Arc<Auth>>) -> Res {
     a.machines.need()?;
+    let down = hosts::watch(&app, &a.machines).await;
     let mut out = reconcile(&app, &a.machines).await;
+    if a.machines.hosts().is_some() {
+        out["hostsDown"] = down.into();
+    }
     if let Some(n) = heartbeats(&app, &a.machines).await {
         out["heartbeats"] = n.into();
     }

@@ -400,6 +400,13 @@ fn https_base(var: &str, raw: &str) -> Result<(String, url::Host<String>), Strin
     Ok((format!("https://{}:{port}", u.host_str().unwrap_or_default()), host))
 }
 
+/// The Incus host's own address in an `INCUS_URL`, as a CIDR, so containers are kept
+/// off every host's API, not just their own's.
+pub(crate) fn host_cidr(url: &str) -> Option<String> {
+    let (_, host) = https_base("INCUS_URL", url).ok()?;
+    super::firewall::cidr(&ip_of(&host)?.to_string()).ok()
+}
+
 fn ip_of(host: &url::Host<String>) -> Option<IpAddr> {
     match host {
         url::Host::Ipv4(a) => Some(IpAddr::V4(*a)),
@@ -478,7 +485,14 @@ pub struct Credentials {
 
 impl Credentials {
     /// INCUS_CLIENT_CERT, INCUS_CLIENT_KEY, INCUS_SERVER_CERT (PEM, or `_FILE`).
+    #[cfg(test)]
     pub fn from_store(store: &dyn SecretStore) -> Result<Credentials, String> {
+        Credentials::for_host(store, None)
+    }
+
+    /// The same client certificate and key, and the certificate of the host whose
+    /// INCUS_SERVER_CERT_<suffix> it is (ADR 0076). None: INCUS_SERVER_CERT.
+    pub fn for_host(store: &dyn SecretStore, suffix: Option<&str>) -> Result<Credentials, String> {
         let get = |k: &str| -> Result<String, String> {
             let v = store
                 .get(k)
@@ -491,7 +505,10 @@ impl Credentials {
         Ok(Credentials {
             cert: pki::cert_der(&get("INCUS_CLIENT_CERT")?).map_err(|e| format!("INCUS_CLIENT_CERT: {e}"))?,
             key: pki::key_der(&key).map_err(|e| format!("INCUS_CLIENT_KEY: {e}"))?,
-            server: pki::cert_der(&get("INCUS_SERVER_CERT")?).map_err(|e| format!("INCUS_SERVER_CERT: {e}"))?,
+            server: {
+                let k = suffix.map_or("INCUS_SERVER_CERT".to_string(), |s| format!("INCUS_SERVER_CERT_{s}"));
+                pki::cert_der(&get(&k)?).map_err(|e| format!("{k}: {e}"))?
+            },
         })
     }
 }
@@ -671,6 +688,15 @@ impl Incus {
             .map_err(|e| format!("Incus client: {e}"))?;
         let egress = egress(&s.deny, s.control);
         Ok(Incus { s, egress, pin, http, stream })
+    }
+
+    pub(crate) fn base(&self) -> &Settings {
+        &self.s
+    }
+
+    /// The SHA-256 of the host certificate botd pins.
+    pub(crate) fn fingerprint(&self) -> &str {
+        &self.pin
     }
 
     fn url(&self, path: &str, query: &[(&str, &str)]) -> String {
@@ -891,7 +917,7 @@ impl Incus {
     /// That Incus trusts botd and is new enough, with every API extension botd uses.
     /// Checked before every create, so botd never makes a container it can't keep
     /// behind its firewall.
-    async fn check_server(&self) -> Result<String, ProviderError> {
+    pub(crate) async fn check_server(&self) -> Result<String, ProviderError> {
         let v = self.call(Method::GET, "/1.0", &[], None, None).await?.metadata;
         if v["auth"] != "trusted" {
             return Err(api(403, "Incus doesn't trust botd's client certificate yet"));
@@ -1048,6 +1074,69 @@ impl Incus {
             }
         }
         Err(ProviderError::Transport("the ACL kept changing at Incus".into()))
+    }
+
+    /// Sets up the imported copy as the machine: today's isolation, size, tags, and NIC
+    /// behind the firewall, whatever its backup said, none of its cloud-init user data,
+    /// and `spec`'s files. It is left stopped, under its own name.
+    pub(crate) async fn prepare(&self, staging: &str, spec: &RestoreSpec) -> Result<(), ProviderError> {
+        let size = Size::parse(&spec.plan).map_err(|m| api(400, m))?;
+        let staging = name(staging)?;
+        let acl = name(
+            spec.firewall_id
+                .as_deref()
+                .ok_or_else(|| api(400, "containers are restored behind the machines' firewall (MACHINE_FIREWALL=on)"))?,
+        )?;
+        self.check_server().await?;
+        self.check_project().await?;
+        self.stop(staging, true).await?;
+        self.edit(staging, |put| {
+            if !put["config"].is_object() {
+                put["config"] = json!({});
+            }
+            let c = put["config"].as_object_mut().unwrap();
+            // Snapshots start again once it has enrolled and its token file is gone.
+            for k in [USER_DATA, "cloud-init.vendor-data", "snapshots.schedule", "snapshots.expiry", "snapshots.pattern"] {
+                c.remove(k);
+            }
+            for (k, v) in [
+                ("security.privileged", "false"),
+                ("security.nesting", "false"),
+                ("security.idmap.isolated", "true"),
+                ("security.guestapi", "false"),
+            ] {
+                c.insert(k.into(), json!(v));
+            }
+            for (k, v) in size.limits() {
+                c.insert(k.into(), json!(v));
+            }
+            c.insert("user.superbot.tag".into(), json!(spec.tags.first().cloned().unwrap_or_default()));
+            c.insert("user.superbot.tags".into(), json!(spec.tags.join(",")));
+            c.insert("user.superbot.plan".into(), json!(spec.plan));
+            if !spec.authorized_keys.is_empty() {
+                c.insert("cloud-init.vendor-data".into(), json!(vendor_data(&spec.authorized_keys)));
+            }
+            put["devices"] = json!({ "root": self.root(&size), "eth0": self.nic(acl) });
+            put["profiles"] = json!([]);
+            put["description"] = json!("SuperBot machine");
+        })
+        .await?;
+        for f in &spec.files {
+            self.push(staging, f).await?;
+        }
+        for path in &spec.remove {
+            self.remove_file(staging, path).await?;
+        }
+        Ok(())
+    }
+
+    /// Gives the restored container the machine's name, once the old one is gone.
+    pub(crate) async fn rename(&self, staging: &str, id: &str) -> Result<(), ProviderError> {
+        let (staging, id) = (name(staging)?, name(id)?);
+        let r = self
+            .call(Method::POST, &format!("/1.0/instances/{staging}"), &[], Some(&json!({ "name": id })), None)
+            .await?;
+        self.finish(r, EDIT_WAIT, "renaming the restored container").await
     }
 
     async fn check(&self, check: &str, f: impl Future<Output = Result<String, ProviderError>>) -> Value {
@@ -1418,63 +1507,11 @@ impl MachineProvider for Incus {
         })
     }
 
-    /// The restored container gets today's isolation, size, tags, and NIC behind the
-    /// firewall, whatever its backup said, and none of its cloud-init user data. It is
-    /// left stopped for the caller to boot.
     fn replace_with<'a>(&'a self, id: &'a str, staging: &'a str, spec: &'a RestoreSpec) -> Fut<'a, ProviderMachine> {
         Box::pin(async move {
-            let size = Size::parse(&spec.plan).map_err(|m| api(400, m))?;
-            let (id, staging) = (name(id)?, name(staging)?);
-            let acl = name(
-                spec.firewall_id
-                    .as_deref()
-                    .ok_or_else(|| api(400, "containers are restored behind the machines' firewall (MACHINE_FIREWALL=on)"))?,
-            )?;
-            self.check_server().await?;
-            self.check_project().await?;
-            self.stop(staging, true).await?;
-            self.edit(staging, |put| {
-                if !put["config"].is_object() {
-                    put["config"] = json!({});
-                }
-                let c = put["config"].as_object_mut().unwrap();
-                // Snapshots start again once it has enrolled and its token file is gone.
-                for k in [USER_DATA, "cloud-init.vendor-data", "snapshots.schedule", "snapshots.expiry", "snapshots.pattern"] {
-                    c.remove(k);
-                }
-                for (k, v) in [
-                    ("security.privileged", "false"),
-                    ("security.nesting", "false"),
-                    ("security.idmap.isolated", "true"),
-                    ("security.guestapi", "false"),
-                ] {
-                    c.insert(k.into(), json!(v));
-                }
-                for (k, v) in size.limits() {
-                    c.insert(k.into(), json!(v));
-                }
-                c.insert("user.superbot.tag".into(), json!(spec.tags.first().cloned().unwrap_or_default()));
-                c.insert("user.superbot.tags".into(), json!(spec.tags.join(",")));
-                c.insert("user.superbot.plan".into(), json!(spec.plan));
-                if !spec.authorized_keys.is_empty() {
-                    c.insert("cloud-init.vendor-data".into(), json!(vendor_data(&spec.authorized_keys)));
-                }
-                put["devices"] = json!({ "root": self.root(&size), "eth0": self.nic(acl) });
-                put["profiles"] = json!([]);
-                put["description"] = json!("SuperBot machine");
-            })
-            .await?;
-            for f in &spec.files {
-                self.push(staging, f).await?;
-            }
-            for path in &spec.remove {
-                self.remove_file(staging, path).await?;
-            }
+            self.prepare(staging, spec).await?;
             self.delete(id).await?;
-            let r = self
-                .call(Method::POST, &format!("/1.0/instances/{staging}"), &[], Some(&json!({ "name": id })), None)
-                .await?;
-            self.finish(r, EDIT_WAIT, "renaming the restored container").await?;
+            self.rename(staging, id).await?;
             self.get(id).await
         })
     }
@@ -1656,6 +1693,8 @@ impl Incus {
         Ok((code, stdout, stderr))
     }
 }
+
+pub mod fleet;
 
 #[cfg(test)]
 mod tests;

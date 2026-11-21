@@ -285,6 +285,8 @@ mod tests {
             ("POST", "/api/machines/reconcile", Perm::Admin),
             ("GET", "/api/machines/placements", Perm::Admin),
             ("GET", "/api/machines/substrate", Perm::Admin),
+            ("GET", "/api/machines/hosts", Perm::Admin),
+            ("POST", "/api/machines/hosts/main/recover", Perm::Admin),
             ("GET", "/api/users/u1/placement", Perm::Admin),
             ("PUT", "/api/users/u1/placement", Perm::Admin),
             ("DELETE", "/api/users/u1/placement", Perm::Admin),
