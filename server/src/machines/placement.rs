@@ -91,6 +91,20 @@ fn need(cp: &ControlPlane, plan: &str) -> Resources {
     cp.provider.as_deref().and_then(|p| p.plan_resources(plan)).unwrap_or_default()
 }
 
+/// What `m` takes on its host: its plan, or while a resize sent to the provider has an
+/// unknown outcome (whatever has become of the request since), the larger of both
+/// plans in each resource.
+fn counted(cp: &ControlPlane, m: &Machine) -> Resources {
+    let now = need(cp, &m.plan);
+    match m.resize_sent_plan.as_deref().filter(|s| *s != m.plan) {
+        Some(to) => {
+            let to = need(cp, to);
+            Resources { cpus: now.cpus.max(to.cpus), memory_gib: now.memory_gib.max(to.memory_gib), disk_gib: now.disk_gib.max(to.disk_gib) }
+        }
+        None => now,
+    }
+}
+
 /// Every configured host's load, in the order configured.
 pub fn loads(app: &App, cp: &ControlPlane, h: &dyn Hosts) -> Vec<HostLoad> {
     let rows: HashMap<String, crate::db::MachineHost> = app.db.machine_hosts().into_iter().map(|r| (r.name.clone(), r)).collect();
@@ -111,18 +125,18 @@ pub fn loads(app: &App, cp: &ControlPlane, h: &dyn Hosts) -> Vec<HostLoad> {
             }
         })
         .collect();
-    let mut add = |host: &str, plan: &str| {
+    let mut add = |host: &str, takes: Resources| {
         if let Some(l) = out.iter_mut().find(|l| l.name == host) {
             l.machines += 1;
-            l.used = l.used.plus(need(cp, plan));
+            l.used = l.used.plus(takes);
         }
     };
     let live: Vec<Machine> = app.db.machines(None).into_iter().filter(|m| cp.owns(m) && m.state != State::Destroyed).collect();
     for m in &live {
         match (&m.provider_id, &m.placed_on) {
-            (Some(pid), _) => add(&h.host_of(pid), &m.plan),
+            (Some(pid), _) => add(&h.host_of(pid), counted(cp, m)),
             // A create sent but not answered may have made it there.
-            (None, Some(host)) => add(host, &m.plan),
+            (None, Some(host)) => add(host, counted(cp, m)),
             (None, None) => {}
         }
     }
@@ -131,7 +145,7 @@ pub fn loads(app: &App, cp: &ControlPlane, h: &dyn Hosts) -> Vec<HostLoad> {
     for r in ["importing", "replacing"].into_iter().flat_map(|s| app.db.machine_restores_in(s)) {
         let (Some(to), Some(m)) = (r.to_host.as_deref(), live.iter().find(|m| m.id == r.machine_id)) else { continue };
         if m.provider_id.as_deref().map(|p| h.host_of(p)).as_deref() != Some(to) {
-            add(to, &m.plan);
+            add(to, need(cp, &m.plan));
         }
     }
     out
@@ -178,6 +192,37 @@ pub fn fits(app: &App, cp: &ControlPlane, plan: &str, host: &str) -> Result<(), 
         Some(why) => Err(format!("Host {why}; nothing new goes there.")),
         None => l.room(need(cp, plan)).map(drop).map_err(|e| format!("Host {e}.")),
     }
+}
+
+/// Whether machine `m` on `host` may grow to plan `to` where it is (ADR 0085): the
+/// extra CPUs, memory and disk within the host's capacity. Its machine count doesn't
+/// change, and a drained host still lets its own machines grow.
+pub fn grow(app: &App, cp: &ControlPlane, host: &str, m: &Machine, to: &str) -> Result<(), String> {
+    let Some(h) = cp.hosts() else { return Ok(()) };
+    let (a, b) = (counted(cp, m), need(cp, to));
+    let more = Resources {
+        cpus: b.cpus.saturating_sub(a.cpus),
+        memory_gib: b.memory_gib.saturating_sub(a.memory_gib),
+        disk_gib: b.disk_gib.saturating_sub(a.disk_gib),
+    };
+    if more == Resources::default() {
+        return Ok(());
+    }
+    let l = loads(app, cp, h).into_iter().find(|l| l.name == host).ok_or_else(|| format!("There's no Incus host \"{}\".", crate::audit::clip(host, 40)))?;
+    if matches!(l.status, HostStatus::Down | HostStatus::Lost) {
+        return Err(l.closed().unwrap_or_default());
+    }
+    let Some(cap) = l.capacity else { return Ok(()) };
+    for (what, used, want, of) in [
+        ("CPUs", l.used.cpus, more.cpus, cap.cpus),
+        ("GiB of memory", l.used.memory_gib, more.memory_gib, cap.memory_gib),
+        ("GiB of disk", l.used.disk_gib, more.disk_gib, cap.disk_gib),
+    ] {
+        if want > 0 && used.saturating_add(want) > of {
+            return Err(format!("{} has {} of {of} {what} free, {want} more needed", l.name, of.saturating_sub(used)));
+        }
+    }
+    Ok(())
 }
 
 /// A machine (or a request for one, `m` None) that couldn't be placed: audited and

@@ -615,6 +615,53 @@ pub struct Machine {
     pub rebuild_error: Option<String>,
     /// Its agent's version when the rebuild was asked for.
     pub rebuild_from: Option<String>,
+    /// Its latest resize to follow its user's tier (ADR 0085): `pending`, `waiting`,
+    /// `done`, `failed` or `cancelled`. None: never asked.
+    #[serde(skip)]
+    pub resize_state: Option<String>,
+    /// The size it is to have, and the one it had when asked.
+    #[serde(skip)]
+    pub resize_tier: Option<String>,
+    #[serde(skip)]
+    pub resize_plan: Option<String>,
+    #[serde(skip)]
+    pub resize_from_tier: Option<String>,
+    #[serde(skip)]
+    pub resize_from_plan: Option<String>,
+    /// What changed the tier (`stripe` or `admin`), and the Stripe event, if one.
+    #[serde(skip)]
+    pub resize_cause: Option<String>,
+    #[serde(skip)]
+    pub resize_event: Option<String>,
+    /// Why it waits, failed or was cancelled: a short code and the words people see.
+    #[serde(skip)]
+    pub resize_reason: Option<String>,
+    #[serde(skip)]
+    pub resize_error: Option<String>,
+    #[serde(skip)]
+    pub resize_attempts: i64,
+    /// Not tried again before this.
+    #[serde(skip)]
+    pub resize_next_at: Option<i64>,
+    #[serde(skip)]
+    pub resize_requested_at: Option<i64>,
+    /// When it entered its state.
+    #[serde(skip)]
+    pub resize_at: Option<i64>,
+    /// The size last sent to the provider whose outcome botd hasn't seen: it may hold
+    /// that size already, whatever `plan` says. Cleared once the provider is checked.
+    #[serde(skip)]
+    pub resize_sent_tier: Option<String>,
+    #[serde(skip)]
+    pub resize_sent_plan: Option<String>,
+    /// What its agent last said of its disk, in bytes (ADR 0085), and when.
+    pub disk_used: Option<i64>,
+    pub disk_total: Option<i64>,
+    pub disk_seen_at: Option<i64>,
+    /// When it was last suspended, while it is. None for one suspended before this was
+    /// kept.
+    #[serde(skip)]
+    pub suspended_at: Option<i64>,
 }
 
 /// A certificate the control plane issued a machine (ADR 0031). Looked up by
@@ -772,6 +819,25 @@ fn machine_row(r: &Row) -> rusqlite::Result<Machine> {
         rebuild_sent_at: r.get("rebuild_sent_at")?,
         rebuild_error: r.get("rebuild_error")?,
         rebuild_from: r.get("rebuild_from")?,
+        resize_state: r.get("resize_state")?,
+        resize_tier: r.get("resize_tier")?,
+        resize_plan: r.get("resize_plan")?,
+        resize_from_tier: r.get("resize_from_tier")?,
+        resize_from_plan: r.get("resize_from_plan")?,
+        resize_cause: r.get("resize_cause")?,
+        resize_event: r.get("resize_event")?,
+        resize_reason: r.get("resize_reason")?,
+        resize_error: r.get("resize_error")?,
+        resize_attempts: r.get("resize_attempts")?,
+        resize_next_at: r.get("resize_next_at")?,
+        resize_requested_at: r.get("resize_requested_at")?,
+        resize_at: r.get("resize_at")?,
+        resize_sent_tier: r.get("resize_sent_tier")?,
+        resize_sent_plan: r.get("resize_sent_plan")?,
+        disk_used: r.get("disk_used")?,
+        disk_total: r.get("disk_total")?,
+        disk_seen_at: r.get("disk_seen_at")?,
+        suspended_at: r.get("suspended_at")?,
     })
 }
 
@@ -1205,7 +1271,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 32] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 35] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1238,7 +1304,20 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 32] = [
     migrate_push_devices,
     migrate_machine_host_drain,
     migrate_teams,
+    migrate_machine_tier_resize,
+    migrate_machine_resize_sent,
+    migrate_machine_suspended_at,
 ];
+
+/// When a machine was suspended (ADR 0085): what its agent said of its disk before then
+/// still holds while it's off, and what it said long before doesn't.
+fn migrate_machine_suspended_at(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'suspended_at'", [], |r| r.get(0))?;
+    if has {
+        return Ok(());
+    }
+    c.execute_batch("ALTER TABLE machines ADD COLUMN suspended_at INTEGER;")
+}
 
 /// Team accounts (ADR 0087): a team is a group of this server's users, each in one team
 /// at most, with a role in it. Invites wait for the person with that email to accept.
@@ -1280,6 +1359,45 @@ fn migrate_teams(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
           release_at INTEGER
         );
         CREATE INDEX IF NOT EXISTS team_machines_user ON team_machines(user_id);",
+    )
+}
+
+/// The size last sent to the provider for a resize whose outcome is unknown (ADR 0085).
+fn migrate_machine_resize_sent(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'resize_sent_plan'", [], |r| r.get(0))?;
+    if has {
+        return Ok(());
+    }
+    c.execute_batch(
+        "ALTER TABLE machines ADD COLUMN resize_sent_tier TEXT;
+        ALTER TABLE machines ADD COLUMN resize_sent_plan TEXT;",
+    )
+}
+
+/// Resizing a machine when its user's tier changes (ADR 0085): the latest resize, kept
+/// on the machine as rebuilds are, and what its agent says of its disk.
+fn migrate_machine_tier_resize(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'resize_state'", [], |r| r.get(0))?;
+    if has {
+        return Ok(());
+    }
+    c.execute_batch(
+        "ALTER TABLE machines ADD COLUMN resize_state TEXT;
+        ALTER TABLE machines ADD COLUMN resize_tier TEXT;
+        ALTER TABLE machines ADD COLUMN resize_plan TEXT;
+        ALTER TABLE machines ADD COLUMN resize_from_tier TEXT;
+        ALTER TABLE machines ADD COLUMN resize_from_plan TEXT;
+        ALTER TABLE machines ADD COLUMN resize_cause TEXT;
+        ALTER TABLE machines ADD COLUMN resize_event TEXT;
+        ALTER TABLE machines ADD COLUMN resize_reason TEXT;
+        ALTER TABLE machines ADD COLUMN resize_error TEXT;
+        ALTER TABLE machines ADD COLUMN resize_attempts INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE machines ADD COLUMN resize_next_at INTEGER;
+        ALTER TABLE machines ADD COLUMN resize_requested_at INTEGER;
+        ALTER TABLE machines ADD COLUMN resize_at INTEGER;
+        ALTER TABLE machines ADD COLUMN disk_used INTEGER;
+        ALTER TABLE machines ADD COLUMN disk_total INTEGER;
+        ALTER TABLE machines ADD COLUMN disk_seen_at INTEGER;",
     )
 }
 
@@ -4326,7 +4444,9 @@ impl Db {
         self.c()
             .execute(
                 "UPDATE machines SET provider_id = ?, tier = ?, plan = ?, region = ?, state = ?, provider_status = ?, ipv4 = ?, backups = ?,
-                 last_error = ?, create_sent_at = ?, placed_on = ?, updated_at = ?, destroyed_at = ?, firewall_id = ? WHERE id = ? AND state = ?",
+                 last_error = ?, create_sent_at = ?, placed_on = ?, updated_at = ?, destroyed_at = ?, firewall_id = ?,
+                 suspended_at = CASE WHEN ?5 != 'suspended' THEN NULL WHEN state = 'suspended' THEN suspended_at ELSE ?12 END
+                 WHERE id = ? AND state = ?",
                 params![
                     m.provider_id,
                     m.tier,
@@ -5034,6 +5154,106 @@ impl Db {
             "UPDATE machines SET agent_upkeep = NULL, harnesses_sent_at = NULL, harnesses_sent_plan = NULL, upgrade_id = NULL,
              upgrade_build = NULL, upgrade_sent_at = NULL, upgrade_by = NULL, upgrade_failed_build = NULL WHERE id = ?",
             [machine_id],
+        );
+    }
+
+    // Resizes that follow a user's tier (ADR 0085). Each step names the target and the
+    // states it may come from, so a stale step, or one racing a newer tier, changes nothing.
+
+    /// Asks for `machine_id` to become `(tier, plan)`, replacing any resize not yet done.
+    /// Returns whether it was saved: not when the same one is open already.
+    pub fn machine_resize_queue(&self, machine_id: &str, tier: &str, plan: &str, from: (&str, &str), cause: &str, event: Option<&str>) -> bool {
+        let at = now();
+        self.c()
+            .execute(
+                "UPDATE machines SET resize_state = 'pending', resize_tier = ?1, resize_plan = ?2, resize_from_tier = ?3, resize_from_plan = ?4,
+                 resize_cause = ?5, resize_event = ?6, resize_reason = NULL, resize_error = NULL, resize_attempts = 0, resize_next_at = ?7,
+                 resize_requested_at = ?7, resize_at = ?7
+                 WHERE id = ?8 AND state NOT IN ('destroying', 'destroyed')
+                 AND NOT (resize_state IN ('pending', 'waiting') AND resize_tier IS ?1 AND resize_plan IS ?2)",
+                params![tier, plan, from.0, from.1, cause, event, at, machine_id],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Moves the resize to `plan` from one of `from` to `to`, with why. `attempt` counts
+    /// one more try; `next_at` is when to look again. Returns whether it was in `from`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn machine_resize_move(
+        &self,
+        machine_id: &str,
+        plan: &str,
+        from: &[&str],
+        to: &str,
+        reason: Option<&str>,
+        error: Option<&str>,
+        attempt: bool,
+        next_at: Option<i64>,
+    ) -> bool {
+        let states = from.iter().map(|s| format!("'{}'", s.replace('\'', ""))).collect::<Vec<_>>().join(", ");
+        self.c()
+            .execute(
+                &format!(
+                    "UPDATE machines SET resize_state = ?1, resize_reason = ?2, resize_error = ?3, resize_attempts = resize_attempts + ?4, resize_next_at = ?5,
+                     resize_at = CASE WHEN resize_state = ?1 THEN resize_at ELSE ?6 END
+                     WHERE id = ?7 AND resize_plan IS ?8 AND resize_state IN ({states})"
+                ),
+                params![to, reason, error, attempt as i64, next_at, now(), machine_id, plan],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Records that the machine is about to be sent to `plan` (for `tier`), before the
+    /// provider is asked, so a lost answer is checked rather than forgotten.
+    pub fn machine_resize_sent(&self, machine_id: &str, tier: &str, plan: &str) {
+        let _ = self.c().execute(
+            "UPDATE machines SET resize_sent_tier = ?, resize_sent_plan = ? WHERE id = ?",
+            params![tier, plan, machine_id],
+        );
+    }
+
+    /// The provider's answer for a resize sent to `plan` (None: any) is known: forgets
+    /// it, unless another was sent since.
+    pub fn machine_resize_unsent(&self, machine_id: &str, plan: Option<&str>) {
+        let _ = self.c().execute(
+            "UPDATE machines SET resize_sent_tier = NULL, resize_sent_plan = NULL WHERE id = ?1 AND (?2 IS NULL OR resize_sent_plan IS ?2)",
+            params![machine_id, plan],
+        );
+    }
+
+    /// Machines with a resize not yet done, or one sent whose outcome is unknown.
+    pub fn machines_resizing(&self) -> Vec<Machine> {
+        let c = self.c();
+        let mut s = c
+            .prepare("SELECT * FROM machines WHERE resize_state IN ('pending', 'waiting') OR resize_sent_plan IS NOT NULL ORDER BY resize_requested_at, id")
+            .unwrap();
+        s.query_map([], machine_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// What the machine's agent said of its disk, in bytes.
+    pub fn machine_disk_seen(&self, machine_id: &str, used: u64, total: u64) {
+        let b = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+        let _ = self.c().execute(
+            "UPDATE machines SET disk_used = ?, disk_total = ?, disk_seen_at = ? WHERE id = ?",
+            params![b(used), b(total), now(), machine_id],
+        );
+    }
+
+    /// What the machine's agent said of its disk at `at`, as if long ago.
+    #[cfg(test)]
+    pub fn machine_disk_seen_at(&self, machine_id: &str, used: u64, total: u64, at: i64) {
+        self.machine_disk_seen(machine_id, used, total);
+        let _ = self.c().execute("UPDATE machines SET disk_seen_at = ? WHERE id = ?", params![at, machine_id]);
+    }
+
+    /// Forgets a machine's resize, as if none was ever asked for.
+    #[cfg(test)]
+    pub fn machine_resize_forget(&self, machine_id: &str) {
+        let _ = self.c().execute(
+            "UPDATE machines SET resize_state = NULL, resize_tier = NULL, resize_plan = NULL WHERE id = ?",
+            params![machine_id],
         );
     }
 

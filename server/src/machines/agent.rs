@@ -1185,7 +1185,24 @@ async fn heartbeat(State(a): State<Arc<Agent>>, RawQuery(q): RawQuery) -> Json<w
         bot_user: a.bot().status,
         screens: Some(a.screens.report()),
         teammates: Some(a.teammates.known()),
+        disk: disk(&a.cfg.home),
     })
+}
+
+/// How full the disk holding `path` is.
+fn disk(path: &Path) -> Option<wire::Disk> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid C string and `s` a writable statvfs.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
+        return None;
+    }
+    #[allow(clippy::unnecessary_cast)]
+    let block = (s.f_frsize as u64).max(1);
+    let total = (s.f_blocks as u64).saturating_mul(block);
+    let free = (s.f_bfree as u64).saturating_mul(block);
+    Some(wire::Disk { used: total.saturating_sub(free), total })
 }
 
 /// Whether `p` is an absolute path inside `home`, with no `..` to climb out.

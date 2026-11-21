@@ -213,6 +213,12 @@ pub trait MachineProvider: Send + Sync {
     fn plan_resources(&self, _plan: &str) -> Option<Resources> {
         None
     }
+    /// How big `plan`'s disk is, in bytes, if the provider can say (ADR 0085): what a
+    /// machine resized to it must fit in.
+    fn plan_disk<'a>(&'a self, plan: &'a str) -> Fut<'a, Option<u64>> {
+        let bytes = self.plan_resources(plan).map(|r| r.disk_gib.saturating_mul(1 << 30));
+        Box::pin(async move { Ok(bytes) })
+    }
     /// The provider's own settings for admins. Never a credential.
     fn settings(&self) -> serde_json::Value {
         serde_json::json!({})

@@ -33,6 +33,7 @@ pub mod pki;
 pub mod provider;
 pub mod rebuild;
 pub mod recovery;
+pub mod resize;
 pub mod route;
 pub mod runas;
 pub mod s3;
@@ -1027,6 +1028,7 @@ pub async fn reconcile(app: &AppState, cp: &ControlPlane) -> Value {
         changed += reconcile_one(app, cp, p, id).await as usize;
     }
     rebuild::reconcile(app, cp).await;
+    resize::reconcile(app, cp).await;
     let teams = crate::teams::sweep(app, cp).await;
     let mut out = json!({ "checked": ids.len(), "changed": changed });
     if teams != json!({}) {
@@ -1106,6 +1108,7 @@ fn admin_view(app: &App, m: &Machine) -> Value {
     let mut v = serde_json::to_value(m).unwrap_or_default();
     v["userEmail"] = json!(app.db.user(&m.user_id).and_then(|u| u.email));
     v["lastBackup"] = backup::last(app, &m.id);
+    v["resize"] = resize::view(m);
     if let Some(cp) = app.control_plane.get() {
         if let Some(host) = hosts::of(cp, m) {
             v["host"] = json!(host);
@@ -1125,6 +1128,7 @@ fn own_view(app: &App, m: &Machine) -> Value {
         "enrollment": m.enrollment, "agentSeenAt": m.agent_seen_at, "enrollOverdueAt": m.enroll_overdue_at,
         "assigned": m.assigned_at.is_some(),
         "lastBackupAt": app.db.machine_last_backup(&m.id).map(|b| b.created_at),
+        "resize": resize::own_view(m),
     })
 }
 
@@ -1466,6 +1470,15 @@ pub(crate) async fn act_if(
         )));
     }
     let pid = provider_id(&m)?.to_string();
+    // Growing in place needs room on its host (ADR 0085).
+    if let Some((_, plan)) = target.as_ref().filter(|_| step == Step::Resize)
+        && let Some(host) = hosts::of(cp, &m)
+        && let Err(why) = placement::grow(app, cp, &host, &m, plan)
+    {
+        let d = json!({ "toPlan": plan, "reason": "no_room", "error": why });
+        app.db.record(&event(by, "machine.resize_refused", &m, d).outcome(Outcome::Denied));
+        return Err(conflict(format!("Its host hasn't room for that size: {why}. Free room on it, or move the machine to another host first.")));
+    }
     let action = match step {
         Step::Suspend => "machine.suspended",
         Step::Resume => "machine.resumed",
@@ -1505,7 +1518,10 @@ pub(crate) async fn act_if(
         let res = match (step, &target) {
             (Step::Suspend, _) => p.shutdown(&pid).await,
             (Step::Resume, _) => p.boot(&pid).await,
-            (_, Some((_, plan))) => p.resize(&pid, plan).await,
+            (_, Some((t, plan))) => {
+                app.db.machine_resize_sent(&m.id, t, plan);
+                p.resize(&pid, plan).await
+            }
             _ => Ok(()),
         };
         if let Err(e) = res {
@@ -1524,12 +1540,20 @@ pub(crate) async fn act_if(
     if !app.db.save_machine(&m, from) {
         return Err(conflict("The machine changed meanwhile; try again.".into()));
     }
+    if step == Step::Resize {
+        app.db.machine_resize_unsent(&m.id, None);
+    }
     app.db.record(&event(by, action, &m, extra));
     match m.state {
         State::Suspended if from != State::Suspended => enroll::hold(app, by, &m),
         State::Running if from == State::Suspended => enroll::release(app, by, &m),
         _ => {}
     }
+    if step == Step::Resize {
+        // A resize the tier asked for that this one did, or made moot, is settled.
+        resize::follow(app, by, &m.user_id, "admin", None, false);
+    }
+    let m = app.db.machine(&m.id).unwrap_or(m);
     Ok(reply(app, StatusCode::OK, &m))
 }
 

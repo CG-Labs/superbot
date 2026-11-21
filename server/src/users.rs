@@ -588,6 +588,7 @@ pub async fn update_user(State(app): State<AppState>, Extension(a): Extension<Ar
         let effective = |t: &Option<String>| app.tiers().of(t.as_deref()).name.clone();
         let details = json!({ "from": before.tier, "to": after.tier, "effectiveFrom": effective(&before.tier), "effectiveTo": effective(&after.tier) });
         app.db.record(&ev("user.tier_changed").details(details));
+        crate::machines::resize::follow(&app, &by, &after.id, "admin", None, true);
         app.send(json!({ "type": "resync" }));
     }
     if before.status != after.status {

@@ -381,6 +381,17 @@ pub struct Heartbeat {
     /// remove them (`CAN_TEAMMATE_REMOVAL`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub teammates: Option<Vec<String>>,
+    /// How full the disk holding the Bots' home is (ADR 0085). None before it said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk: Option<Disk>,
+}
+
+/// A disk's use, in bytes, as `statvfs` reports it: `used` is what is taken, root's
+/// reserve included, so it is what a smaller disk would have to hold.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Disk {
+    pub used: u64,
+    pub total: u64,
 }
 
 /// Whether a harness is logged in on the machine: whether one of the credential files

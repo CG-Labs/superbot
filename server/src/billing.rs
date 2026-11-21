@@ -458,7 +458,12 @@ fn subscription_event(app: &App, event_id: &str, kind: &str, event: &Value) -> R
     let details = json!({ "eventId": event_id, "type": kind, "subscription": sub.id, "status": row.status, "price": row.price_id, "tier": tier });
     let by = system(Some(&user));
     let outcome = match applied {
-        Applied::Duplicate => return Ok("duplicate"),
+        Applied::Duplicate => {
+            // Stripe redelivers what it got no answer for, so a resize the first delivery
+            // didn't get to ask for is asked for now (ADR 0085); one asked for already isn't again.
+            crate::machines::resize::follow(app, &by, &user, "stripe", Some(event_id), false);
+            return Ok("duplicate");
+        }
         Applied::Stale => "stale",
         Applied::Superseded => "superseded",
         Applied::OtherUser => return ignore("subscription_of_another_user", Some(&user), json!({ "subscription": sub.id })),
@@ -471,6 +476,7 @@ fn subscription_event(app: &App, event_id: &str, kind: &str, event: &Value) -> R
                 d.extend(x);
             }
             app.db.record(&by.event("user.tier_changed").target("user", &user).details(d));
+            crate::machines::resize::follow(app, &by, &user, "stripe", Some(event_id), true);
             "tier_changed"
         }
     };
