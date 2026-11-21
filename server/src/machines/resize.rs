@@ -361,7 +361,10 @@ async fn settle(app: &AppState, p: &dyn MachineProvider, m: &Machine) -> Result<
         });
         app.db.record(&event(&system(&after), "machine.resized", &after, extra));
         // The request for that size is done; a newer one, for another size, stays open.
-        app.db.machine_resize_move(&m.id, &sent, &OPEN, "done", None, None, false, None);
+        // Tiers may share a plan, so the tier must match too.
+        if app.db.machine(&m.id).is_some_and(|x| x.resize_tier.as_deref() == Some(tier.as_str())) {
+            app.db.machine_resize_move(&m.id, &sent, &OPEN, "done", None, None, false, None);
+        }
     }
     app.db.machine_resize_unsent(&m.id, Some(&sent));
     Ok(())

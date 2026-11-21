@@ -354,6 +354,22 @@ async fn a_tier_change_back_after_a_lost_answer_resizes_the_machine_back() {
 }
 
 #[tokio::test]
+async fn a_settled_resize_doesnt_mark_a_request_for_another_tier_on_the_same_plan_done() {
+    let w = world().await;
+    let m = w.machine().await;
+    w.set_tier("big").await;
+    w.fake.lose_next("resize");
+    w.reconcile().await;
+    // Before the provider is checked, another tier sharing big's plan is asked for.
+    assert!(w.app.db.machine_resize_queue(&m.id, "other", "g6-standard-2", ("starter", "g6-standard-1"), "admin", None));
+    w.reconcile().await;
+    // The lost resize is settled as pro; the request for `other` isn't taken as done by it.
+    let s = w.status().await;
+    assert_eq!((s["tier"].as_str(), s["plan"].as_str()), (Some("pro"), Some("g6-standard-2")), "{s}");
+    assert_ne!(s["resize"]["state"], "done", "{s}");
+}
+
+#[tokio::test]
 async fn a_tier_change_back_while_a_resize_answer_is_lost_still_ends_at_the_tier_size() {
     let w = world().await;
     let m = w.machine().await;
