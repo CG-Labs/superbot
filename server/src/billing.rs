@@ -862,8 +862,8 @@ mod tests {
         fn kind(&self) -> &'static str {
             "never-read"
         }
-        fn get(&self, name: &str) -> Result<Option<crate::secrets::Secret>, crate::secrets::Error> {
-            panic!("billing is off, yet {name} was read");
+        fn get(&self, _: &str) -> Result<Option<crate::secrets::Secret>, crate::secrets::Error> {
+            panic!("billing is off, yet a secret was read");
         }
         fn names(&self) -> Result<Vec<String>, crate::secrets::Error> {
             panic!("billing is off, yet the store was listed");
