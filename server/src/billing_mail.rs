@@ -39,6 +39,9 @@ pub const MAX_ATTEMPTS: i64 = 5;
 const EVERY: Duration = Duration::from_secs(30);
 /// The share of a plan's model tokens that sends "running low".
 pub const TOKENS_WARN_PERCENT: u64 = 80;
+/// How long a Stripe event's emails wait for the webhook to follow the event (ask for
+/// a resize) before they're due anyway, if it never says it has.
+pub const HOLD_MS: i64 = 60_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -444,14 +447,15 @@ fn usage_key(user: &str, tier: &Tier, period: &str, kind: Kind) -> String {
     format!("usage:{user}:{}:{period}:{}", tier.name, kind.as_str())
 }
 
-/// A run took the owner's tokens in the period from `before` to `after`: says so as they
-/// pass `TOKENS_WARN_PERCENT` of the tier's `monthlyTokens`, and when they reach it.
-pub fn tokens(app: &App, user: &str, tier: &Tier, period: &crate::usage::Period, before: u64, after: u64) {
+/// A run left the owner with `after` of the tier's `monthlyTokens` used this period:
+/// says so once they're past `TOKENS_WARN_PERCENT`, and once they reach it. From the
+/// saved total, not this run's share, so runs that finish together can't skip one.
+pub fn tokens(app: &App, user: &str, tier: &Tier, period: &crate::usage::Period, after: u64) {
     let Some(limit) = tier.limits.monthly_tokens.filter(|l| *l > 0) else { return };
     let warn = u64::try_from(u128::from(limit) * u128::from(TOKENS_WARN_PERCENT) / 100).unwrap_or(limit);
-    let kind = if before < limit && after >= limit {
+    let kind = if after >= limit {
         Kind::TokensUsedUp
-    } else if before < warn && after >= warn {
+    } else if after >= warn {
         Kind::TokensLow
     } else {
         return;
@@ -516,62 +520,62 @@ pub async fn send_due(app: &App) -> usize {
     let _one = m.busy.lock().await;
     let mut sent = 0;
     for q in app.db.due_billing_emails(crate::db::now(), BATCH) {
-        sent += usize::from(send_one(app, m, &q).await);
+        match send_one(app, m, &q).await {
+            Ok(went) => sent += usize::from(went),
+            // Without saving outcomes, sending more could send them again.
+            Err(e) => {
+                eprintln!("billing: stopped sending billing emails: couldn't save one's outcome: {e}");
+                break;
+            }
+        }
     }
     sent
 }
 
-async fn send_one(app: &App, m: &BillingMail, q: &Queued) -> bool {
+/// Sends one email, or skips it. Ok(true) when it went; Err when its outcome couldn't
+/// be saved. Its try is counted, with the next try's time, before it's sent, so an
+/// outcome lost after that waits its backoff rather than sending again at once.
+async fn send_one(app: &App, m: &BillingMail, q: &Queued) -> Result<bool, String> {
     let by = system(&q.user_id);
     let mut d = json!({ "kind": q.kind, "key": q.key, "eventId": q.event_id });
-    let skip = |reason: &str, d: &mut Value| {
-        app.db.billing_email_result(q.id, "skipped", Some(reason), false, None);
+    let skip = |reason: &str, mut d: Value| -> Result<bool, String> {
+        app.db.billing_email_result(q.id, "skipped", Some(reason))?;
         d["reason"] = json!(reason);
-        app.db.record(&by.event("billing.email_skipped").target("user", &q.user_id).details(d.take()));
+        app.db.record(&by.event("billing.email_skipped").target("user", &q.user_id).details(d));
+        Ok(false)
     };
-    let Some(kind) = Kind::parse(&q.kind) else {
-        skip("unknown_kind", &mut d);
-        return false;
-    };
-    let Some(u) = app.db.user(&q.user_id) else {
-        skip("no_user", &mut d);
-        return false;
-    };
-    let Some(to) = u.email.clone().filter(|e| smtp::address_ok(e)) else {
-        skip("no_address", &mut d);
-        return false;
-    };
+    let Some(kind) = Kind::parse(&q.kind) else { return skip("unknown_kind", d) };
+    let Some(u) = app.db.user(&q.user_id) else { return skip("no_user", d) };
+    let Some(to) = u.email.clone().filter(|e| smtp::address_ok(e)) else { return skip("no_address", d) };
     if !kind.essential() && !app.db.usage_emails(&u.id) {
-        skip("opted_out", &mut d);
-        return false;
+        return skip("opted_out", d);
     }
     if !kind.essential() && !u.active() {
-        skip("inactive", &mut d);
-        return false;
+        return skip("inactive", d);
+    }
+    let attempts = q.attempts + 1;
+    if !app.db.claim_billing_email(q.id, crate::db::now() + backoff_ms(attempts))? {
+        return Ok(false);
     }
     let r = render(kind, &q.facts, m.plan_link.as_deref(), computer(app, q, kind).as_deref());
     let mail = smtp::Mail { to: to.clone(), subject: r.subject, body: r.body };
     d["to"] = json!(to);
-    let attempts = q.attempts + 1;
     d["attempts"] = json!(attempts);
     match m.mailer.deliver(&mail).await {
         Ok(()) => {
-            app.db.billing_email_result(q.id, "sent", None, true, None);
+            let saved = app.db.billing_email_result(q.id, "sent", None);
             app.db.record(&by.event("billing.email_sent").target("user", &q.user_id).details(d));
-            true
+            saved.map(|()| true)
         }
         Err(e) => {
             let e = crate::secrets::redact::text(&e).into_owned();
             let retry = attempts < MAX_ATTEMPTS;
-            match retry {
-                true => app.db.billing_email_result(q.id, "pending", Some(&e), true, Some(crate::db::now() + backoff_ms(attempts))),
-                false => app.db.billing_email_result(q.id, "failed", Some(&e), true, None),
-            }
+            let saved = app.db.billing_email_result(q.id, if retry { "pending" } else { "failed" }, Some(&e));
             eprintln!("billing: a {} email to {} failed (try {attempts}): {e}", q.kind, q.user_id);
             d["error"] = json!(e);
             d["retrying"] = json!(retry);
             app.db.record(&by.event("billing.email_failed").target("user", &q.user_id).outcome(Outcome::Failure).details(d));
-            false
+            saved.map(|()| false)
         }
     }
 }
@@ -606,7 +610,14 @@ pub fn view(app: &App, user_id: &str) -> Value {
 /// usage emails. Emails about your plan and payments always go while they're on.
 pub async fn get_mine(State(app): State<AppState>, Extension(c): Extension<Caller>) -> Res {
     let u = person(&c)?;
-    Ok(Json(view(&app, &u.id)))
+    Ok(Json(mine(&app, &c, &u.id)))
+}
+
+/// `view`, and whether the caller may change it (read-only people can't).
+fn mine(app: &App, c: &Caller, user_id: &str) -> Value {
+    let mut v = view(app, user_id);
+    v["canChange"] = json!(crate::rbac::allows(c.principal, crate::rbac::Perm::Write));
+    v
 }
 
 /// `PUT /api/me/emails {usage: bool}`: turns your usage emails on or off.
@@ -617,10 +628,13 @@ pub async fn put_mine(State(app): State<AppState>, Extension(c): Extension<Calle
     };
     let before = app.db.usage_emails(&u.id);
     if before != on {
-        app.db.set_usage_emails(&u.id, on);
+        app.db.set_usage_emails(&u.id, on).map_err(|e| {
+            eprintln!("botd: couldn't save {}'s email settings: {e}", u.id);
+            ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Couldn't save your email settings; see the server log.".into())
+        })?;
         app.db.record(&by.event("billing.email_settings_updated").target("user", &u.id).details(json!({ "usage": { "from": before, "to": on } })));
     }
-    Ok(Json(view(&app, &u.id)))
+    Ok(Json(mine(&app, &c, &u.id)))
 }
 
 #[cfg(test)]

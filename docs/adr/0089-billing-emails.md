@@ -27,9 +27,9 @@ To the person the plan is for (the user the subscription is linked to, never a S
 | Plan ended | A Stripe event takes the user off the paid tier (deleted, canceled, unpaid). Says whether it ended because payments failed. | Essential |
 | Computer waiting | A Stripe plan change's resize waits on the user: storage over the new plan (`storage_over`) or files that won't fit the smaller disk (`disk_too_full`). Uses the wait message the app shows. | Essential |
 | Computer couldn't resize | A Stripe plan change's resize failed. Says the plan applies anyway and an admin was told. | Essential |
-| Tokens running low | A run takes the owner past 80% of their tier's `monthlyTokens` this period. | Usage |
-| Tokens used up | A run takes them to the limit. Says when more start. | Usage |
-| Storage nearly full | Storage reaches ADR 0082's 90% warning. | Usage |
+| Tokens running low | A run ends with the owner past 80% of their tier's `monthlyTokens` this period. | Usage |
+| Tokens used up | A run ends with them at the limit. Says when more start. | Usage |
+| Storage nearly full | A run starts with storage past ADR 0082's 90% warning. | Usage |
 | Storage full | A message or task is refused because storage is full. | Usage |
 
 Plan started, changed and ended also say what the user's computer is doing about the change, read when the email is sent: moving (it may restart once, nothing is lost), waiting and why, done, or failed. That's only for the resize the same Stripe event asked for, and only with the control plane on.
@@ -47,21 +47,23 @@ Plan started, changed and ended also say what the user's computer is doing about
 - Each email has a key naming what asked for it, stored with it under a unique index. A second email with the same key isn't queued.
   - A Stripe event's emails: `stripe:<event id>:<kind>`.
   - A plan set to end: `stripe:<subscription id>:plan_ending:<end time>`, so `customer.subscription.updated` and a later redelivery or a second event saying the same thing send one email. A new end date sends again.
-  - Usage: `usage:<user>:<tier>:<billing period>:<kind>`, so once a period per tier. A new plan or a new period can send again.
+  - Usage: `usage:<user>:<tier>:<billing period>:<kind>`, so once a period per tier. A new plan or a new period can send again. Token emails follow the saved total after each run, not that run's share, so runs that finish together can't skip one. Storage emails don't wait for the chat's once-a-day warning.
   - Resizes: `resize:<machine>:<asked at>:<kind>`, so once per resize request and outcome.
 - A subscription event's emails are queued in the same database transaction that records the event id and applies it ([ADR 0040](0040-billing-v0-tier-limits.md)). The event is recorded with its emails or not at all, and a redelivered event is a duplicate before any email is looked at.
+- They're held until the webhook has followed the event (asked for any resize), then released, so the plan email can say what the computer is doing. If botd stops in between, they're due anyway after a minute.
 - Which emails an event asks for follows what applying it changed (`Applied`), not the event alone. A stale, duplicate, superseded or other-user event changes nothing, so it sends nothing. A payment-failed email needs the move into `past_due`, so the retries Stripe sends while it stays there don't repeat it.
 
 ### Sending
 
 - A sender task sends what's queued, oldest first, 20 at a time, woken when something is queued and every 30 seconds. It sends one email per SMTP message, through ADR 0061's transport and its settings (`SMTP_HOST`, `SMTP_PORT`, `SMTP_TLS`, `SMTP_FROM`, `SMTP_USERNAME`, `SMTP_PASSWORD`). There is no new provider.
-- A failed send is tried again after 1, 4, 16 and 64 minutes, then given up on after 5 tries.
+- Each try is counted, with the time of the next, before the email is sent. A failed send is tried again after 1, 4, 16 and 64 minutes, then given up on after 5 tries.
+- If botd can't save an email's outcome (a full disk, say), it logs it and stops sending until the next pass, so it doesn't send emails it can't mark sent. That email waits its backoff before another try.
 - Just before sending, the sender skips an email whose user is gone (`no_user`) or has no email address (`no_address`), and a usage email for someone disabled (`inactive`) or opted out (`opted_out`). Essential emails go to disabled users: their plan and payment still matter.
 - Queued emails are kept with their state (`pending`, `sent`, `skipped`, `failed`), tries and reason. They're small, and they're what stops a resend.
 
 ### Turning usage emails off
 
-- Usage emails are on for everyone by default. Anyone can turn theirs off from the Plan screen's **Emails** card, or with `PUT /api/me/emails` `{usage: false}`. `GET /api/me/emails` and `GET /api/billing` (`emails`) give `{on, usage}`, where `on` says the server sends billing emails at all.
+- Usage emails are on for everyone by default. Anyone can turn theirs off from the Plan screen's **Emails** card, or with `PUT /api/me/emails` `{usage: false}`. `GET /api/me/emails` gives `{on, usage, canChange}`, where `on` says the server sends billing emails at all; `GET /api/billing` has `emails: {on, usage}` too. The Plan screen reads `/api/me/emails` itself, so the card shows on a server that sends billing emails without checkout (no `STRIPE_SECRET_KEY`).
 - Plan and payment emails can't be turned off: they're about money and the user's computer.
 - Changing it needs write access (read-only people can't), and Bots can't. Each change is audited as `billing.email_settings_updated` with `usage: {from, to}`.
 - Usage emails say how to turn them off, with the link.

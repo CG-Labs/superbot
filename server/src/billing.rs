@@ -490,8 +490,9 @@ fn subscription_event(app: &App, event_id: &str, kind: &str, event: &Value) -> R
     let mut d = details;
     d["outcome"] = json!(outcome);
     app.db.record(&by.event("billing.subscription_synced").target("user", &user).details(d));
-    // After the resize is asked for, so the plan email can say what the computer is doing.
+    // Now that the resize is asked for, so the plan email can say what the computer is doing.
     if emails > 0 {
+        app.db.release_billing_emails(event_id);
         crate::billing_mail::wake(app);
     }
     Ok(outcome)

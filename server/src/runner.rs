@@ -1874,13 +1874,14 @@ impl App {
             let text = format!("The {} plan allows {limit} runs a {this}, and this {this}'s are used up. More start on {more}.", tier.label);
             return refused("tier_limit", text, Some(u64::from(limit)), None, Value::Null);
         }
-        if let Some((m, limit, storage::State::Warning)) = storage
-            && self.storage.first_warning(&self.db, &bot.owner_id, crate::db::now())
-        {
-            let who = Who { actor: Actor::system("billing").on_behalf_of(&bot.owner_id), source: Default::default() };
-            let details = json!({ "owner": bot.owner_id, "tier": tier.name, "limit": limit, "used": m.used(), "warnAt": storage::WARN_PERCENT, "partial": m.partial });
-            self.db.record(&who.event(storage::WARNING_ACTION).target("user", &bot.owner_id).bot(&bot.id).details(details));
-            self.say(&bot.id, &storage::warning_text(&tier.label, m.used(), *limit), false);
+        if let Some((m, limit, storage::State::Warning)) = storage {
+            if self.storage.first_warning(&self.db, &bot.owner_id, crate::db::now()) {
+                let who = Who { actor: Actor::system("billing").on_behalf_of(&bot.owner_id), source: Default::default() };
+                let details = json!({ "owner": bot.owner_id, "tier": tier.name, "limit": limit, "used": m.used(), "warnAt": storage::WARN_PERCENT, "partial": m.partial });
+                self.db.record(&who.event(storage::WARNING_ACTION).target("user", &bot.owner_id).bot(&bot.id).details(details));
+                self.say(&bot.id, &storage::warning_text(&tier.label, m.used(), *limit), false);
+            }
+            // Once a billing period and tier by its key, apart from the chat's once a day.
             crate::billing_mail::storage(self, &bot.owner_id, tier, m.used(), *limit, false);
         }
         Some((tier.name.clone(), route, wiring))
@@ -1942,8 +1943,10 @@ impl App {
             let details = json!({ "owner": bot.owner_id, "tier": tier.name, "limit": limit, "used": before.saturating_add(total), "period": period.key, "periodEnd": period.end, "runId": run_id });
             self.db.record(&by.event("usage.token_limit_reached").target("user", &bot.owner_id).bot(&bot.id).details(details));
         }
-        if let Some(before) = before {
-            crate::billing_mail::tokens(self, &bot.owner_id, tier, &period, before, before.saturating_add(total));
+        if before.is_some() {
+            // The saved total, which counts runs recorded at the same time as this one.
+            let after = self.db.tokens_used(&bot.owner_id, period.start, period.end);
+            crate::billing_mail::tokens(self, &bot.owner_id, tier, &period, after);
         }
         reported.then_some(total)
     }

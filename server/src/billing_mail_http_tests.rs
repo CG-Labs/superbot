@@ -140,7 +140,7 @@ async fn with_billing_emails_off_nothing_is_queued_or_sent() {
     assert!(w.app.db.billing_emails_of(&w.a_id, 10).is_empty());
     assert_eq!(billing_mail::send_due(&w.app).await, 0);
     let (_, me) = call(w.port, "GET", "/api/me/emails", &w.a, "").await;
-    assert_eq!(parse(&me), json!({ "on": false, "usage": true }));
+    assert_eq!(parse(&me), json!({ "on": false, "usage": true, "canChange": true }));
 }
 
 #[tokio::test]
@@ -211,7 +211,7 @@ async fn token_emails_go_once_a_period_unless_turned_off() {
 
     // Bea turns usage emails off: hers are skipped and audited; her plan's still go.
     let (code, body) = call(w.port, "PUT", "/api/me/emails", &w.b, r#"{"usage":false}"#).await;
-    assert_eq!((code, parse(&body)), (200, json!({ "on": true, "usage": false })), "{body}");
+    assert_eq!((code, parse(&body)), (200, json!({ "on": true, "usage": false, "canChange": true })), "{body}");
     let changed = audit(w.port, &w.admin, "action=billing.email_settings_updated").await;
     assert_eq!((changed.len(), changed[0]["details"]["usage"].clone()), (1, json!({ "from": true, "to": false })));
     call(w.port, "PUT", "/api/me/emails", &w.b, r#"{"usage":false}"#).await;
@@ -235,6 +235,38 @@ async fn token_emails_go_once_a_period_unless_turned_off() {
     // The Plan screen's view says so too.
     let (_, me) = call(w.port, "GET", "/api/me/emails", &w.b, "").await;
     assert_eq!(parse(&me)["usage"], false);
+}
+
+#[tokio::test]
+async fn token_emails_follow_the_saved_total_not_just_this_runs_share() {
+    let w = world(true).await;
+    let app = &w.app;
+    let mailer = fake::install(app, Some(PUBLIC));
+    set_tier(&w, &w.a_id, json!("pro")).await;
+    let bot = app.db.create_bot_owned("Busy", "#fff", "waddle", "claude", None, false, &w.a_id, Visibility::Private);
+    // A run that finished alongside took Ada past 80% without its own check seeing it.
+    let row = crate::db::TokenRow {
+        user_id: w.a_id.clone(),
+        bot_id: bot.id.clone(),
+        run_id: "run_alongside".into(),
+        message_id: None,
+        harness: "claude".into(),
+        model: None,
+        reported: true,
+        input: 4_200_000,
+        output: 0,
+        cache_read: 0,
+        cache_write: 0,
+        at: crate::db::now(),
+        meter: false,
+    };
+    app.db.record_tokens(&[row]).unwrap();
+    fake_claude_tokens(app, 1000);
+    go(&w, &w.a, &bot.id).await;
+    let got = sent(app, &mailer).await;
+    assert_eq!(got.iter().map(|m| m.subject.as_str()).collect::<Vec<_>>(), ["[SuperBot] You've used 84% of this period's model tokens"]);
+    go(&w, &w.a, &bot.id).await;
+    assert_eq!(sent(app, &mailer).await.len(), 1, "once a period");
 }
 
 /// Small: 1 MB of storage and the g6-standard-1 machine; big: g6-standard-2, sold as
@@ -359,6 +391,9 @@ async fn storage_emails_go_once_a_period() {
     let path = format!("/api/bots/{}/messages", bot.id);
     let ask = || call(w.port, "POST", &path, &w.a, r#"{"text":"go"}"#);
     w.fill(950_000);
+    // The chat's once-a-day warning was already said today (another tier, or the last
+    // period): the email still goes, once for this period and tier.
+    assert!(w.app.storage.first_warning(&w.app.db, &w.a_id, crate::db::now()));
     for n in 1..=2 {
         assert_eq!(ask().await.0, 202);
         crate::billing_http_tests::replies(&w.app, &bot.id, 0, n).await;
@@ -385,7 +420,12 @@ async fn bots_have_no_email_settings_and_the_plan_view_shows_them() {
     assert_eq!(code, 403);
     assert!(w.app.db.usage_emails(&w.a_id));
     let (code, body) = call(w.port, "GET", "/api/me/emails", &w.a, "").await;
-    assert_eq!((code, parse(&body)), (200, json!({ "on": true, "usage": true })));
+    assert_eq!((code, parse(&body)), (200, json!({ "on": true, "usage": true, "canChange": true })));
+    // Read-only people see theirs but can't change it.
+    let (_, ro) = user_with(w.port, &w.admin, "ro@example.com", "readonly").await;
+    let (code, body) = call(w.port, "GET", "/api/me/emails", &ro, "").await;
+    assert_eq!((code, parse(&body)["canChange"].as_bool()), (200, Some(false)), "{body}");
+    assert_eq!(call(w.port, "PUT", "/api/me/emails", &ro, r#"{"usage":false}"#).await.0, 403);
 }
 
 #[tokio::test]

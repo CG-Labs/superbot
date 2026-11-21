@@ -331,12 +331,12 @@ fn link_in(c: &Connection, user_id: &str, provider: &str, customer_id: &str, via
     Ok(Linked::New)
 }
 
-fn queue_email(c: &Connection, e: &crate::billing_mail::NewEmail) -> rusqlite::Result<bool> {
+/// Queues a billing email, due at `due`, unless one with its key was queued before.
+fn queue_email(c: &Connection, e: &crate::billing_mail::NewEmail, due: i64) -> rusqlite::Result<bool> {
     let facts = serde_json::to_string(&e.facts).unwrap_or_else(|_| "{}".into());
-    let at = now();
     Ok(c.execute(
         "INSERT OR IGNORE INTO billing_emails (key, user_id, kind, facts, event_id, next_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        params![e.key, e.user_id, e.kind.as_str(), facts, e.event_id, at, at],
+        params![e.key, e.user_id, e.kind.as_str(), facts, e.event_id, due, now()],
     )? == 1)
 }
 
@@ -3688,9 +3688,12 @@ impl Db {
             (_, Some(cus)) => Some(link_in(&tx, &sub.user_id, &sub.provider, cus, "subscription").map_err(|e| e.to_string())?),
         };
         let emails = mail(&Change { applied: &outcome, before: by_id.as_ref(), paying_before: paying_before.as_ref() });
+        // Held until the caller has followed the event (`release_billing_emails`), so a
+        // plan email can say what the computer is doing; due anyway after the hold.
+        let due = now() + crate::billing_mail::HOLD_MS;
         let mut queued = 0;
         for e in &emails {
-            queued += usize::from(queue_email(&tx, e).map_err(|e| e.to_string())?);
+            queued += usize::from(queue_email(&tx, e, due).map_err(|e| e.to_string())?);
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok((outcome, linked, queued))
@@ -3699,7 +3702,7 @@ impl Db {
     /// Queues a billing email (ADR 0089) unless one with its key was queued before.
     /// True when this queued it.
     pub fn queue_billing_email(&self, e: &crate::billing_mail::NewEmail) -> bool {
-        queue_email(&self.c(), e).unwrap_or_else(|err| {
+        queue_email(&self.c(), e, now()).unwrap_or_else(|err| {
             eprintln!("botd: couldn't queue a billing email: {err}");
             false
         })
@@ -3720,14 +3723,34 @@ impl Db {
         q.query_map(params![user_id, limit], queued_email_row).map(|rows| rows.flatten().collect()).unwrap_or_default()
     }
 
-    /// Settles a pending billing email: `sent`, `skipped` or `failed`, or `pending` again
-    /// at `next_at` after a failed try. A try that failed counts as an attempt.
-    pub fn billing_email_result(&self, id: i64, state: &str, reason: Option<&str>, attempted: bool, next_at: Option<i64>) {
+    /// Makes a Stripe event's held emails due now.
+    pub fn release_billing_emails(&self, event_id: &str) {
+        let at = now();
+        if let Err(e) = self.c().execute(
+            "UPDATE billing_emails SET next_at = ? WHERE event_id = ? AND state = 'pending' AND attempts = 0 AND next_at > ?",
+            params![at, event_id, at],
+        ) {
+            eprintln!("botd: couldn't release billing emails for {event_id}: {e}");
+        }
+    }
+
+    /// Counts a try of a pending billing email before it's sent, and puts its next try
+    /// at `next_at`. False when it's no longer pending.
+    pub fn claim_billing_email(&self, id: i64, next_at: i64) -> Result<bool, String> {
+        self.c()
+            .execute("UPDATE billing_emails SET attempts = attempts + 1, next_at = ? WHERE id = ? AND state = 'pending'", params![next_at, id])
+            .map(|n| n == 1)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Settles a pending billing email: `sent`, `skipped` or `failed`, or `pending` with
+    /// why its last try failed.
+    pub fn billing_email_result(&self, id: i64, state: &str, reason: Option<&str>) -> Result<(), String> {
         let done = (state != "pending").then(now);
-        let _ = self.c().execute(
-            "UPDATE billing_emails SET state = ?, reason = ?, attempts = attempts + ?, next_at = COALESCE(?, next_at), done_at = ? WHERE id = ? AND state = 'pending'",
-            params![state, reason, i64::from(attempted), next_at, done, id],
-        );
+        self.c()
+            .execute("UPDATE billing_emails SET state = ?, reason = ?, done_at = ? WHERE id = ? AND state = 'pending'", params![state, reason, done, id])
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     /// Makes every pending billing email due now, as if its backoff had passed.
@@ -3741,12 +3764,15 @@ impl Db {
         self.c().query_row("SELECT usage_emails FROM email_prefs WHERE user_id = ?", [user_id], |r| r.get(0)).optional().ok().flatten().unwrap_or(true)
     }
 
-    pub fn set_usage_emails(&self, user_id: &str, on: bool) {
-        let _ = self.c().execute(
-            "INSERT INTO email_prefs (user_id, usage_emails, updated_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT (user_id) DO UPDATE SET usage_emails = ?2, updated_at = ?3",
-            params![user_id, on, now()],
-        );
+    pub fn set_usage_emails(&self, user_id: &str, on: bool) -> Result<(), String> {
+        self.c()
+            .execute(
+                "INSERT INTO email_prefs (user_id, usage_emails, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (user_id) DO UPDATE SET usage_emails = ?2, updated_at = ?3",
+                params![user_id, on, now()],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     /// The user's payment-provider customer (ADR 0042).
@@ -6241,6 +6267,49 @@ mod tests {
                 assert_eq!(db.user(&u.id).unwrap().tier.as_deref(), want, "events {picked:?} in order {order:?}");
             }
         }
+    }
+
+    #[test]
+    fn a_stripe_events_emails_are_queued_with_it_once_and_held_until_released() {
+        use crate::billing_mail::{Facts, HOLD_MS, Kind, NewEmail};
+        let db = Db::open(&temp_path("billing-emails-held").join("app.sqlite")).unwrap();
+        let u = db.create_user(None, None, "Payer", Role::Member).unwrap();
+        let s = Subscription {
+            user_id: u.id.clone(),
+            provider: "stripe".into(),
+            customer_id: None,
+            subscription_id: "sub_1".into(),
+            status: "active".into(),
+            price_id: None,
+            tier: Some("pro".into()),
+            period_start: None,
+            period_end: None,
+            started: 10,
+            event_created: 10,
+            updated_at: 0,
+        };
+        let mail = |_: &Change| vec![NewEmail { key: "stripe:evt_1:plan_started".into(), user_id: u.id.clone(), kind: Kind::PlanStarted, facts: Facts::default(), event_id: Some("evt_1".into()) }];
+        let (applied, _, queued) = db.apply_subscription("evt_1", "customer.subscription.updated", &s, true, &mail).unwrap();
+        assert_eq!((applied, queued), (Applied::Changed { from: None, to: Some("pro".into()) }, 1));
+        let (applied, _, queued) = db.apply_subscription("evt_1", "customer.subscription.updated", &s, true, &mail).unwrap();
+        assert_eq!((applied, queued), (Applied::Duplicate, 0));
+        // Held, but due after the hold even if never released.
+        let at = now();
+        assert!(db.due_billing_emails(at, 10).is_empty());
+        assert_eq!(db.due_billing_emails(at + HOLD_MS + 1_000, 10).len(), 1);
+        db.release_billing_emails("evt_1");
+        let due = db.due_billing_emails(now(), 10);
+        assert_eq!(due.len(), 1);
+        // A claimed try counts and waits for its next time; a settled email can't be claimed.
+        assert!(db.claim_billing_email(due[0].id, now() + 60_000).unwrap());
+        assert!(db.due_billing_emails(now(), 10).is_empty());
+        db.billing_email_result(due[0].id, "sent", None).unwrap();
+        assert!(!db.claim_billing_email(due[0].id, 0).unwrap());
+        let row = &db.billing_emails_of(&u.id, 1)[0];
+        assert_eq!((row.state.as_str(), row.attempts), ("sent", 1));
+        // Releasing again doesn't bring a sent email back.
+        db.release_billing_emails("evt_1");
+        assert!(db.due_billing_emails(now() + HOLD_MS * 2, 10).is_empty());
     }
 
     #[test]
