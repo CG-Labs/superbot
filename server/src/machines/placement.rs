@@ -180,6 +180,37 @@ pub fn fits(app: &App, cp: &ControlPlane, plan: &str, host: &str) -> Result<(), 
     }
 }
 
+/// Whether a machine on `host` may grow from `from` to `to` where it is (ADR 0085): the
+/// extra CPUs, memory and disk within the host's capacity. Its machine count doesn't
+/// change, and a drained host still lets its own machines grow.
+pub fn grow(app: &App, cp: &ControlPlane, host: &str, from: &str, to: &str) -> Result<(), String> {
+    let Some(h) = cp.hosts() else { return Ok(()) };
+    let (a, b) = (need(cp, from), need(cp, to));
+    let more = Resources {
+        cpus: b.cpus.saturating_sub(a.cpus),
+        memory_gib: b.memory_gib.saturating_sub(a.memory_gib),
+        disk_gib: b.disk_gib.saturating_sub(a.disk_gib),
+    };
+    if more == Resources::default() {
+        return Ok(());
+    }
+    let l = loads(app, cp, h).into_iter().find(|l| l.name == host).ok_or_else(|| format!("There's no Incus host \"{}\".", crate::audit::clip(host, 40)))?;
+    if matches!(l.status, HostStatus::Down | HostStatus::Lost) {
+        return Err(l.closed().unwrap_or_default());
+    }
+    let Some(cap) = l.capacity else { return Ok(()) };
+    for (what, used, want, of) in [
+        ("CPUs", l.used.cpus, more.cpus, cap.cpus),
+        ("GiB of memory", l.used.memory_gib, more.memory_gib, cap.memory_gib),
+        ("GiB of disk", l.used.disk_gib, more.disk_gib, cap.disk_gib),
+    ] {
+        if want > 0 && used.saturating_add(want) > of {
+            return Err(format!("{} has {} of {of} {what} free, {want} more needed", l.name, of.saturating_sub(used)));
+        }
+    }
+    Ok(())
+}
+
 /// A machine (or a request for one, `m` None) that couldn't be placed: audited and
 /// alerted.
 pub fn failed(app: &crate::AppState, by: &Who, user_id: &str, m: Option<&Machine>, plan: &str, why: &str) {

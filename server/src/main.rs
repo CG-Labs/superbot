@@ -659,7 +659,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/machine", get(machines::get).post(machines::request).delete(machines::destroy))
         .route("/users/{key}/machine/suspend", post(machines::suspend))
         .route("/users/{key}/machine/resume", post(machines::resume))
-        .route("/users/{key}/machine/resize", post(machines::resize))
+        .route("/users/{key}/machine/resize", get(machines::resize::status).post(machines::resize))
         .route("/users/{key}/machine/enrollment", post(machines::enroll::issue_token))
         .route("/users/{key}/machine/certificates", delete(machines::enroll::revoke))
         .route("/users/{key}/machine/agent", get(machines::upkeep::get))
@@ -688,6 +688,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/placement", get(machines::placement).put(machines::assign).delete(machines::unassign))
         .route("/machines", get(machines::list_all))
         .route("/machines/placements", get(machines::placements))
+        .route("/machines/resizes", get(machines::resize::list))
         .route("/machines/backups", get(machines::backup::list_all))
         .route("/machines/recovery", get(machines::recovery::get))
         .route("/machines/substrate", get(machines::substrate))
@@ -1563,6 +1564,7 @@ pub(crate) fn tier_usage(app: &App, user_id: &str) -> Value {
         "periodStart": period.start, "periodEnd": period.end, "periodSource": period.source.as_str(),
         "storage": storage::view(app, user_id),
     });
+    v["machine"] = machines::resize::plan_view(app, user_id);
     v
 }
 
@@ -1601,7 +1603,7 @@ async fn admin_usage(State(app): State<AppState>, Extension(a): Extension<Arc<Au
                 "user": { "id": u.id, "email": u.email, "name": u.name, "role": u.role, "status": u.status },
                 "tier": u.tier,
                 "plan": plan,
-                "machine": machine.as_ref().map(|m| json!({ "tier": m.tier, "plan": m.plan, "state": m.state, "fits": fits(m) })),
+                "machine": machine.as_ref().map(|m| json!({ "tier": m.tier, "plan": m.plan, "state": m.state, "fits": fits(m), "resize": machines::resize::view(m) })),
                 "subscription": app.db.subscription(&u.id),
                 "customer": app.db.customer_of(&u.id),
                 "over": over,

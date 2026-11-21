@@ -383,6 +383,11 @@ impl App {
         }
     }
 
+    /// Runs of `owner_id`'s Bots on their machine now, theirs and teammates'.
+    pub fn runs_on_machine(&self, owner_id: &str) -> u32 {
+        self.on_machines.lock().unwrap_or_else(|e| e.into_inner()).get(owner_id).copied().unwrap_or(0)
+    }
+
     pub fn is_running(&self, bot_id: &str) -> bool {
         self.state().get(bot_id).is_some_and(|s| s.run.is_some())
     }

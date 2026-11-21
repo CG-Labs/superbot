@@ -43,7 +43,12 @@ struct State {
     calls: Vec<String>,
     /// The user data each create or rebuild was sent, by label: what the machine boots with.
     user_data: HashMap<String, String>,
+    /// Plans' disks in bytes, where they differ from Linode's (`plan_disk`).
+    disks: HashMap<String, Option<u64>>,
 }
+
+/// Linode's disks for the default tiers' plans, in GiB.
+const DISKS_GIB: [(&str, u64); 3] = [("g6-standard-1", 50), ("g6-standard-2", 80), ("g6-standard-4", 160)];
 
 fn refused(message: &str) -> ProviderError {
     ProviderError::Api {
@@ -177,6 +182,11 @@ impl Fake {
         id
     }
 
+    /// `plan`'s disk is `bytes` (None: the provider can't say).
+    pub fn set_plan_disk(&self, plan: &str, bytes: Option<u64>) {
+        self.state.lock().unwrap().disks.insert(plan.into(), bytes);
+    }
+
     /// What the last create or rebuild for `label` carried as cloud-init user data.
     pub fn user_data(&self, label: &str) -> Option<String> {
         self.state.lock().unwrap().user_data.get(label).cloned()
@@ -280,6 +290,14 @@ impl MachineProvider for Fake {
 
     fn resize<'a>(&'a self, id: &'a str, plan: &'a str) -> Fut<'a, ()> {
         Box::pin(async move { self.update("resize", id, |m| m.plan = plan.into()) })
+    }
+
+    fn plan_disk<'a>(&'a self, plan: &'a str) -> Fut<'a, Option<u64>> {
+        Box::pin(async move {
+            self.with("plan_disk", |s| {
+                Ok(s.disks.get(plan).copied().unwrap_or_else(|| DISKS_GIB.iter().find(|(p, _)| *p == plan).map(|(_, g)| g << 30)))
+            })
+        })
     }
 
     fn shutdown<'a>(&'a self, id: &'a str) -> Fut<'a, ()> {
