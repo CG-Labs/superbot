@@ -3172,7 +3172,7 @@ mod tests {
         let lines: Vec<&str> = body.split("\r\n").collect();
         assert_eq!(format!("{}\r\n", lines[0]), audit::CSV_HEADER);
         assert_eq!(lines.len(), 3, "header, one row, and the final CRLF: {body:?}");
-        assert!(lines[1].contains(r#""{""harness"":""claude"",""model"":null,""name"":""=HYPERLINK"#), "{}", lines[1]);
+        assert!(lines[1].contains(r#""{""harness"":""claude"",""harnessFrom"":""server"",""model"":null,""name"":""=HYPERLINK"#), "{}", lines[1]);
         assert!(lines[1].split(',').nth(6) == Some("bot.created"));
         // The export itself is audited, and a cell that starts a formula is defused.
         let exported = &app.db.audit_events(&audit::Filter { actions: vec!["audit.exported".into()], ..Default::default() }, 10, false)[0];
