@@ -436,7 +436,8 @@ async fn a_teammate_logs_in_with_their_own_account_and_only_their_runs_use_it() 
     let again = run(&w, &w.bea, &team, "again").await;
     assert!(again.contains("isn't logged in for you"), "{again}");
     // A Bot can't log in as anyone.
-    let token = format!("Bearer {}", crate::isolation::bot_token(&w.env.app.cfg.bot_key, &team, &w.ada));
+    let token = w.env.app.run_tokens.issue(&team, &w.ada, "r1", None, crate::db::now(), 60_000).0;
+    let token = format!("Bearer {token}");
     assert_eq!(get(&w, &format!("{base}/harness-logins"), &token).await.0, 403);
 }
 

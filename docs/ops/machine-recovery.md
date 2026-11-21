@@ -32,6 +32,7 @@ botd checks every machine each reconcile interval (`MACHINE_RECONCILE_SECONDS`, 
 | Restore failed | `machine.restore_failed` (failure) | As before (ADR 0071); now alerted too. |
 | Incus host down | `machine.host_down` (failure, target type `host`) | A host hasn't answered for `INCUS_HOST_DOWN_MINUTES` (10). Once each time ([ADR 0076](../adr/0076-restoring-onto-another-incus-host.md)). |
 | Incus host up again | `machine.host_up` | A down host answers again. |
+| No room for a machine | `machine.placement_failed` (failure, target type `user` or `machine`) | No open Incus host has room for a new or waiting machine's plan ([ADR 0081](../adr/0081-placing-machines-by-host-load.md)). Each refused request, and once per waiting machine. |
 | Incus host declared lost | `machine.host_lost` (failure) | An admin recovered it (below). Once. |
 
 `machine.restored` carries `durationMs`, `rtoMs` and `withinRto`.
@@ -91,7 +92,7 @@ botctl machine host recover <name> --yes                       # onto the first 
 botctl machine host recover <name> --to <host> --identity backup-identity.txt --yes
 ```
 
-It declares the host lost (for good; a replacement gets a new name), revokes its machines' certificates and tokens, and restores each from its newest off-host backup onto the other host, two at a time. Each enrolls anew. A machine with no backup goes to error: destroy it and request a new one for that user. The answer lists what is restoring, what can't be, and what was skipped; run it again to retry the skipped ones. `botctl machine recovery` shows each restore's time against the RTO.
+It declares the host lost (for good; a replacement gets a new name), revokes its machines' certificates and tokens, and restores each from its newest off-host backup onto another host, two at a time. Without `--to`, each goes where placement puts it ([ADR 0081](../adr/0081-placing-machines-by-host-load.md)): an open host with room for it, counting the ones placed before it; one with nowhere to go is skipped, to retry once there is room. Each enrolls anew. A machine with no backup goes to error: destroy it and request a new one for that user. The answer lists what is restoring, what can't be, and what was skipped; run it again to retry the skipped ones. `botctl machine recovery` shows each restore's time against the RTO.
 
 The data lost is everything on each machine since its newest backup. A whole host's restores take about machines ÷ 2 × one restore's time.
 

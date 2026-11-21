@@ -35,7 +35,7 @@ impl Role {
 }
 
 /// Who is calling: a signed-in person with a role, or a Bot (`botctl`, with the
-/// per-start BOT_TOKEN that every Bot run can read).
+/// BOT_TOKEN its run gets, live only while that run is, ADR 0083).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Principal {
     User(Role),
@@ -294,6 +294,8 @@ mod tests {
             ("GET", "/api/machines/substrate", Perm::Admin),
             ("GET", "/api/machines/hosts", Perm::Admin),
             ("POST", "/api/machines/hosts/main/recover", Perm::Admin),
+            ("PUT", "/api/machines/hosts/main/drain", Perm::Admin),
+            ("DELETE", "/api/machines/hosts/main/drain", Perm::Admin),
             ("GET", "/api/users/u1/placement", Perm::Admin),
             ("PUT", "/api/users/u1/placement", Perm::Admin),
             ("DELETE", "/api/users/u1/placement", Perm::Admin),
