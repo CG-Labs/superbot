@@ -11,7 +11,7 @@ on:
       - 'site/**'
       - 'web/**'
       - 'apps/client/**'
-      - 'docs/security/**'
+      - 'docs/**'
       - '.github/workflows/server.yml'
   pull_request:
     paths:
@@ -23,7 +23,7 @@ on:
       - 'site/**'
       - 'web/**'
       - 'apps/client/**'
-      - 'docs/security/**'
+      - 'docs/**'
       - '.github/workflows/server.yml'
 
 permissions:
