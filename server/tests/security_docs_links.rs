@@ -253,14 +253,30 @@ fn checklist_rows(md: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// Criteria and areas named in the mapping's list of gaps for the checklist.
+/// Criteria and areas named in the mapping's list of gaps for the checklist, with ranges
+/// (`CC7.3 to CC7.5`) expanded to every criterion in them.
 fn gap_list_criteria(mapping: &str) -> Vec<String> {
     let list = mapping.split("## Gaps for the SOC 2 readiness checklist").nth(1).unwrap_or("");
-    list.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.'))
-        .map(|t| t.trim_end_matches('.'))
-        .filter(|t| criterion(t).is_some())
-        .map(str::to_string)
-        .collect()
+    let tokens: Vec<&str> = list.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.')).map(|t| t.trim_end_matches('.')).filter(|t| !t.is_empty()).collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let Some((group, from)) = criterion(tokens[i]) else {
+            i += 1;
+            continue;
+        };
+        if let (Some(from), Some(&"to"), Some(Some((g, Some(to))))) = (from, tokens.get(i + 1), tokens.get(i + 2).map(|t| criterion(t)))
+            && g == group
+            && to >= from
+        {
+            out.extend((from..=to).map(|n| format!("{group}.{n}")));
+            i += 3;
+        } else {
+            out.push(tokens[i].to_string());
+            i += 1;
+        }
+    }
+    out
 }
 
 #[test]
@@ -319,7 +335,10 @@ fn the_checker_catches_what_it_should() {
     let rows = checklist_rows("| ID | Item |\n| CC6.1-1 | MFA | Product | Engineering lead | e | Gap | none |\n| CC6.9-1 | x |\n| A1.3 | x |\n");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][5], "Gap");
-    assert_eq!(gap_list_criteria("x CC9.9\n## Gaps for the SOC 2 readiness checklist (M4)\n1. MFA (CC6.1).\n2. Policies (CC1, CC7.3 to CC7.5, M4)."), vec!["CC6.1", "CC1", "CC7.3", "CC7.5"]);
+    assert_eq!(
+        gap_list_criteria("x CC9.9\n## Gaps for the SOC 2 readiness checklist (M4)\n1. MFA (CC6.1).\n2. Policies (CC1, CC7.3 to CC7.5, M4).\n3. Odd (CC2.3 to CC6.1, A1.3 to A1.2)."),
+        vec!["CC6.1", "CC1", "CC7.3", "CC7.4", "CC7.5", "CC2.3", "CC6.1", "A1.3", "A1.2"]
+    );
     let rows = criterion_rows("| Criterion | Status |\n| CC6.1 Access | Product; Gap | x |\n| CC10.1 No | Gap |\n| Not CC1.1 | Gap |\n");
     assert_eq!(rows, vec![("CC6.1".to_string(), "Product; Gap".to_string())]);
     let md = "# Data flows\n## At rest\n## At rest\n`[x](nope.md)`\n```\n[y](nope.md)\n```\n[z](#at-rest-1) [w](https://x.example)\n";
