@@ -32,6 +32,10 @@ deploy/install-computer.sh <user that runs botd>
 
 Then add `AGENT_BROWSER_SKILLS_DIR=/opt/computer/share/agent-browser-skills` to botd's environment and restart it. It prints `Screens: on.`
 
+With Docker Compose there's nothing to install: the published image has all of it, with Debian's Chromium (it has arm64 builds, unlike Chrome for Testing), and Compose's Caddy serves the `/screen/` route below from the `botd` container (`SCREEN_ADDR=0.0.0.0`). See [Screens and computer use in Docker](../deploy/README.md#screens-and-computer-use-in-docker) and [ADR 0084](adr/0084-published-image-with-computer-use.md).
+
+As on a bash install, screens are off while per-user accounts (`ISOLATION=users`) are on: per-user screens don't exist yet.
+
 The script also adds 4 GB of swap and earlyoom, which kills the biggest Chrome before the server runs out of memory.
 
 ## Proxy
@@ -46,7 +50,7 @@ handle @screen {
 }
 ```
 
-Ports are `6800 + SCREEN_BASE + slot`: 6901, 6902, ... by default. voxl checks its own token, so the route needs no extra login.
+Ports are `6800 + SCREEN_BASE + slot`: 6901, 6902, ... by default. botd refuses to start if `SCREEN_BASE` and `MAX_SCREENS` put them outside this route's 6900-6999. voxl checks its own token, so the route needs no extra login.
 
 ## Sizing
 

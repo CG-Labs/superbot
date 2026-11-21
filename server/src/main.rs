@@ -274,8 +274,12 @@ async fn main() {
     if let Some(iso) = isolation.as_mut() {
         iso.teammates = teammate_accounts;
     }
+    let screen_addr = screen::init_listen_addr(&env("SCREEN_ADDR", "")).unwrap_or_else(|e| exit(e));
     // Screens are X displays botd's account runs; any local account could open them.
     let screens = if isolation.is_some() { None } else { paths::child(&data_dir, "screens").and_then(screen::Screens::from_env) };
+    if let Some(s) = &screens {
+        s.check_ports().unwrap_or_else(|e| exit(format!("Screens: {e}")));
+    }
     if let (Some(local), Some(machine)) = (&screens, enrollment.as_ref().and_then(|e| e.screens.as_ref())) {
         let (a, b) = local.ports();
         if a <= machine.ports.1 && machine.ports.0 <= b {
@@ -567,9 +571,10 @@ async fn main() {
     println!(
         "Screens: {}.",
         match (app.screens.is_some(), app.isolation().is_some()) {
-            (true, _) => "on",
-            (false, true) => "off (per-user screens don't exist yet, so ISOLATION=users turns them off)",
-            (false, false) => "off (install Xvfb and openbox to turn them on)",
+            (true, _) if screen_addr.is_loopback() => "on".to_string(),
+            (true, _) => format!("on (viewers listen on {screen_addr}, SCREEN_ADDR)"),
+            (false, true) => "off (per-user screens don't exist yet, so ISOLATION=users turns them off)".into(),
+            (false, false) => "off (install Xvfb and openbox to turn them on)".into(),
         }
     );
 

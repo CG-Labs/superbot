@@ -144,7 +144,7 @@ Encrypted: mount the identity and pass it, e.g. `docker compose run --rm --no-de
 ```sh
 git clone https://github.com/CG-Labs/superbot.git && cd superbot/deploy/docker
 cp /path/to/old/.env .env          # same AUTH_PASSWORD and SUPERBOT_MASTER_KEY; or run ./init.sh and copy the key line in
-docker compose up -d --build --wait
+docker compose up -d --wait          # add --build if .env has COMPOSE_FILE (built from source)
 docker compose stop botd backup
 docker compose run --rm --no-deps -T botd superbot-restore - < superbot-<stamp>.tar.gz
 docker compose up -d
