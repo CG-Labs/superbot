@@ -1,4 +1,4 @@
-//! Billing emails (ADR 0089) on the real router: Stripe's signed subscription events
+//! Billing emails (ADR 0090) on the real router: Stripe's signed subscription events
 //! email the person the plan is for, once per event however often Stripe redelivers
 //! it; payments that fail, plans set to end and plans that end say so with a link to
 //! the Plan screen; a downgrade that waits on the user's files says so; nearing or

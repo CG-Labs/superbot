@@ -141,7 +141,7 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         // anyone may remove theirs, as anyone may sign out.
         ("PUT", ["me", "push"]) => Write,
         ("GET" | "DELETE", ["me", "push"]) => Account,
-        // Your own billing emails (ADR 0089). Handlers refuse Bots.
+        // Your own billing emails (ADR 0090). Handlers refuse Bots.
         ("PUT", ["me", "emails"]) => Write,
         ("GET", ["me", "emails"]) => Account,
 

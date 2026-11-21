@@ -275,7 +275,7 @@ fn wait(app: &AppState, m: &Machine, plan: &str, reason: &str, text: &str) {
     }
     // Said once per reason, not every pass.
     app.db.record(&event(&system(m), "machine.resize_waiting", m, details(m, json!({ "reason": reason, "error": text }))));
-    // Only these waits are the user's to end: they delete files (ADR 0089).
+    // Only these waits are the user's to end: they delete files (ADR 0090).
     if matches!(reason, "storage_over" | "disk_too_full") {
         crate::billing_mail::resize(app, m, crate::billing_mail::Kind::ResizeWaiting, Some(text));
     }

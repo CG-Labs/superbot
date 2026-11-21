@@ -176,7 +176,7 @@ export interface BillingView {
   portal: boolean;
   /** False for read-only people: they see their plan but can't buy or manage it. */
   canChange: boolean;
-  /** Billing emails (ADR 0089). Missing from older servers. */
+  /** Billing emails (ADR 0090). Missing from older servers. */
   emails?: BillingEmails;
 }
 

@@ -144,7 +144,7 @@ sequenceDiagram
 
 - Card details are entered on Stripe's pages and never reach botd.
 - The signed webhook is the only way a plan changes. Unsigned, mis-signed or stale events are refused.
-- Billing emails go through the operator's SMTP server to the person the plan is for, as plain text: their plan name and dates, what their computer is doing about a plan change, and how close they are to their tier's tokens and storage. Never a Stripe id, price, amount, card detail, portal link or secret. Off unless billing and SMTP are on ([ADR 0089](../adr/0089-billing-emails.md)).
+- Billing emails go through the operator's SMTP server to the person the plan is for, as plain text: their plan name and dates, what their computer is doing about a plan change, and how close they are to their tier's tokens and storage. Never a Stripe id, price, amount, card detail, portal link or secret. Off unless billing and SMTP are on ([ADR 0090](../adr/0090-billing-emails.md)).
 
 ### Machines and backups
 

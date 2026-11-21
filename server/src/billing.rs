@@ -362,7 +362,7 @@ struct Sub<'a> {
     period_start: Option<i64>,
     period_end: Option<i64>,
     created: Option<i64>,
-    /// When Stripe will end it, Unix seconds (ADR 0089): `cancel_at`, or the period's
+    /// When Stripe will end it, Unix seconds (ADR 0090): `cancel_at`, or the period's
     /// end while `cancel_at_period_end`.
     cancel_at: Option<i64>,
 }

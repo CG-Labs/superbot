@@ -39,7 +39,7 @@ function UsageCard({ usage, warn }: { usage: MyUsage; warn?: boolean }) {
   );
 }
 
-/** Whether you get usage emails, while the server sends billing emails (ADR 0089). */
+/** Whether you get usage emails, while the server sends billing emails (ADR 0090). */
 function EmailsCard({ emails, busy, onChange }: { emails: BillingEmails; busy: boolean; onChange: (usage: boolean) => void }) {
   return (
     <View style={styles.card}>

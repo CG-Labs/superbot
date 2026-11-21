@@ -1,10 +1,10 @@
-# 0089: Billing emails
+# 0090: Billing emails
 
 ## Status
 
 Accepted (21 Nov 2026). Sixth slice of billing v0 ([#31](https://github.com/CG-Labs/superbot/issues/31), [roadmap](../ROADMAP.md)). Builds on tier limits and the Stripe webhook ([ADR 0040](0040-billing-v0-tier-limits.md)), checkout, the portal and customers ([ADR 0042](0042-billing-checkout-portal-customers.md)), billing-period token usage ([ADR 0050](0050-billing-period-token-usage.md)), storage limits ([ADR 0082](0082-storage-limits-per-tier.md)), resizing machines on a tier change ([ADR 0085](0085-resizing-machines-on-a-tier-change.md)), and the SMTP transport from approval notifications ([ADR 0061](0061-approval-notifications.md)).
 
-Numbering: `main` has up to 0088, with 0086 left for other open work. No open PR adds an ADR, so this is 0089. Renumber it if a collision appears at merge.
+Numbering: `main` has up to 0089 (metrics and structured logs), with 0086 left for other open work, so this is 0090. It was drafted as 0089 and renumbered when ADR 0089 merged first.
 
 ## Context
 

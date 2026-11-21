@@ -426,7 +426,7 @@ export class SuperBotApi {
   }
 
   /**
-   * Your billing email settings (ADR 0089), apart from `/api/billing`, which a server can
+   * Your billing email settings (ADR 0090), apart from `/api/billing`, which a server can
    * answer 404 while it still sends them (no checkout). null from servers before them.
    */
   async billingEmails(): Promise<BillingEmails | null> {
@@ -438,7 +438,7 @@ export class SuperBotApi {
     }
   }
 
-  /** Turns your token and storage limit emails on or off (ADR 0089). */
+  /** Turns your token and storage limit emails on or off (ADR 0090). */
   async setUsageEmails(usage: boolean): Promise<BillingEmails> {
     return this.request<BillingEmails>("PUT", "/api/me/emails", { usage });
   }

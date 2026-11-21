@@ -54,7 +54,7 @@ Disabled unless `STRIPE_WEBHOOK_SECRET` (or `_FILE`) is set; until then `/billin
 - Usage periods aligned with each subscription's billing period instead of calendar months and UTC days.
 - Token metering and enforcing `monthlyTokens`; storage limits.
 - Resizing machines automatically when a user's tier changes.
-- Billing emails (receipts, failed payments, limit warnings). (Built by [ADR 0089](0089-billing-emails.md): plan, payment, resize and limit emails; receipts stay Stripe's.)
+- Billing emails (receipts, failed payments, limit warnings). (Built by [ADR 0090](0090-billing-emails.md): plan, payment, resize and limit emails; receipts stay Stripe's.)
 
 ## Consequences
 
