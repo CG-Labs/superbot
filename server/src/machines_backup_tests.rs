@@ -446,6 +446,15 @@ async fn machines_past_their_rpo_are_flagged_alerted_and_cleared_by_a_backup() {
     assert!(r["breaches"][0]["endedAt"].is_null() && r["machines"][0]["breach"] == true, "{r}");
     let (_, view) = json_call(&env, "GET", &format!("/api/users/{uid}/machine"), "").await;
     assert_eq!((view["recovery"]["breach"].as_bool(), view["recovery"]["lastBackupAt"].is_null()), (Some(true), true), "{view}");
+    // And /metrics shows it (ADR 0089), with the tier but not the machine or its user.
+    let metrics = crate::obs::render(&env.app);
+    assert_eq!(crate::obs_http_tests::total(&metrics, "superbot_machine_rpo_breaches_open"), 1.0, "{metrics}");
+    assert_eq!(crate::obs_http_tests::total(&metrics, "superbot_machines_past_rpo{"), 1.0, "{metrics}");
+    assert_eq!(crate::obs_http_tests::total(&metrics, "superbot_machines_rpo_tracked{"), 1.0, "{metrics}");
+    assert!(crate::obs_http_tests::total(&metrics, "superbot_machine_backup_age_max_seconds{") >= 27.0 * 3600.0, "{metrics}");
+    assert_eq!(crate::obs_http_tests::total(&metrics, r#"superbot_events_total{event="machine.rpo_breached",outcome="failure"}"#), 1.0, "{metrics}");
+    assert_eq!(crate::obs_http_tests::total(&metrics, r#"superbot_machines{state="running"}"#), 1.0, "{metrics}");
+    assert!(!metrics.contains(&m.id) && !metrics.contains(&uid) && !metrics.contains("ada@"), "{metrics}");
 
     // A backup ends it.
     let b = back_up(&env, &uid).await;
@@ -457,6 +466,9 @@ async fn machines_past_their_rpo_are_flagged_alerted_and_cleared_by_a_backup() {
     let (_, r) = json_call(&env, "GET", "/api/machines/recovery", "").await;
     assert_eq!((r["breaching"].as_u64(), r["breaches"][0]["endReason"].as_str()), (Some(0), Some("backed_up")), "{r}");
     assert_eq!(r["machines"][0]["lastBackupAt"].as_i64(), Some(b.created_at), "{r}");
+    let metrics = crate::obs::render(&env.app);
+    assert_eq!(crate::obs_http_tests::total(&metrics, "superbot_machines_past_rpo{"), 0.0, "{metrics}");
+    assert_eq!(crate::obs_http_tests::total(&metrics, "superbot_machine_rpo_breaches_open"), 0.0, "{metrics}");
 
     // Each tier on its own schedule and RPO: 13 hours is fine on starter (every 24 hours,
     // RPO 26), but due and past its RPO on pro (every 12, RPO 14).

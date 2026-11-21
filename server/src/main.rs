@@ -70,6 +70,9 @@ mod passwd;
 mod notify;
 #[cfg(test)]
 mod notify_http_tests;
+mod obs;
+#[cfg(test)]
+mod obs_http_tests;
 #[cfg(test)]
 mod push_http_tests;
 mod paths;
@@ -150,6 +153,7 @@ use axum::routing::{any, delete, get, patch, post, put};
 use axum::{Json, Router};
 use std::collections::HashMap;
 use db::{BotPatch, Db};
+use obs::log::{log_info, log_warn};
 use rbac::{Perm, Principal, Role};
 use runner::{App, Config};
 use users::{Caller, SessionConfig};
@@ -205,9 +209,11 @@ async fn main() {
     let password = auth_password();
     let default_harness = env("DEFAULT_HARNESS", "claude");
     let exit = |e: String| -> ! {
-        eprintln!("{e}");
+        log_warn!("{e}");
         std::process::exit(1);
     };
+    let observe = obs::Settings::from_env(&|k| env(k, ""), &secrets::env::EnvStore::process()).unwrap_or_else(|e| exit(format!("Observability: {e}")));
+    obs::log::set_format(observe.log);
     let break_glass = users::break_glass_flag(&env("AUTH_BREAK_GLASS", "")).unwrap_or_else(|e| exit(e));
     let sessions = SessionConfig::from_env(&env("SESSION_IDLE_TIMEOUT", ""), &env("SESSION_MAX_AGE", "")).unwrap_or_else(|e| exit(e));
     let sso = sso::Sso::from_env().unwrap_or_else(|e| exit(format!("SSO: {e}")));
@@ -228,11 +234,11 @@ async fn main() {
     let allow_no_auth = auth_startup(&host, &password, break_glass);
     secrets::redact::register(&password);
     if adapters::get(&default_harness).is_none() {
-        eprintln!("DEFAULT_HARNESS must be one of: {}", adapters::NAMES.join(", "));
+        log_warn!("DEFAULT_HARNESS must be one of: {}", adapters::NAMES.join(", "));
         std::process::exit(1);
     }
     let retention = audit::retention_days(&env("AUDIT_RETENTION_DAYS", "")).unwrap_or_else(|e| {
-        eprintln!("{e}");
+        log_warn!("{e}");
         std::process::exit(1);
     });
     let bot_key = random_hex(32);
@@ -242,7 +248,7 @@ async fn main() {
 
     let root = |key: &str, default: &str| {
         paths::root(&env(key, default)).unwrap_or_else(|e| {
-            eprintln!("{key}: {e}");
+            log_warn!("{key}: {e}");
             std::process::exit(1);
         })
     };
@@ -252,14 +258,14 @@ async fn main() {
     let db = Db::open(&db_path).expect("open database");
     match secrets::init(&db_path) {
         Ok(r) => {
-            println!("Master key: {}{}.", r.key_source, if r.created { " (new)" } else { "" });
+            log_info!("Master key: {}{}.", r.key_source, if r.created { " (new)" } else { "" });
             if r.sealed + r.redacted + r.discarded > 0 {
-                println!("Secrets: sealed {} saved tool inputs, redacted {} saved rows, discarded {} sealed values.", r.sealed, r.redacted, r.discarded);
+                log_info!("Secrets: sealed {} saved tool inputs, redacted {} saved rows, discarded {} sealed values.", r.sealed, r.redacted, r.discarded);
             }
-            println!("Stored secrets: {}.", r.stored);
+            log_info!("Stored secrets: {}.", r.stored);
         }
         Err(e) => {
-            eprintln!("Secrets: {e}");
+            log_warn!("Secrets: {e}");
             std::process::exit(1);
         }
     }
@@ -309,19 +315,19 @@ async fn main() {
         home: std::env::var_os("HOME").map(PathBuf::from),
     }, screens);
     let _ = app.tiers.set(Arc::new(tiers));
-    println!("Tiers: {}.", app.tiers().describe());
+    log_info!("Tiers: {}.", app.tiers().describe());
     let run_cap = slots::parse_cap(&env("MAX_CONCURRENT_RUNS", "")).unwrap_or_else(|e| exit(e));
     let _ = app.run_cap.set(run_cap);
     match run_cap {
-        Some(n) => println!("Runs at once: {n} on this server, and on a machine whose owner's tier sets no concurrentRuns; more wait their turn (MAX_CONCURRENT_RUNS, ADR 0073)."),
-        None => println!("Runs at once: no cap on this server (MAX_CONCURRENT_RUNS=off); machines follow their owner's tier's concurrentRuns."),
+        Some(n) => log_info!("Runs at once: {n} on this server, and on a machine whose owner's tier sets no concurrentRuns; more wait their turn (MAX_CONCURRENT_RUNS, ADR 0073)."),
+        None => log_info!("Runs at once: no cap on this server (MAX_CONCURRENT_RUNS=off); machines follow their owner's tier's concurrentRuns."),
     }
     let _ = app.shared_bots.set(shared_bots);
     app.db.set_teams_strict(teams.strict);
     let _ = app.teams.set(teams);
-    println!("Teams: {} (ADR 0087).", teams.describe());
+    log_info!("Teams: {} (ADR 0087).", teams.describe());
     let _ = app.resume_routines_on_enable.set(resume_routines);
-    println!(
+    log_info!(
         "Shared Bots: {}.",
         match shared_bots {
             acl::SharedBots::Open => "open (a Bot acts with its owner's access and keys for everyone who uses it; SHARED_BOTS=isolated limits that)",
@@ -330,19 +336,19 @@ async fn main() {
     );
     match isolation {
         Some(iso) => {
-            println!(
+            log_info!(
                 "Isolation: each user's Bots run as their own account ({}<user id>), in {}/<user id>; harnesses: {}.",
                 accounts::PREFIX,
                 iso.root.display(),
                 accounts::HARNESSES.join(", ")
             );
             if iso.teammates {
-                println!(
+                log_info!(
                     "Isolation: a teammate's run of a shared Bot uses its own account ({}<hash>), in {}/<owner>-<teammate>, with the teammate's own harness logins (ADR 0064).",
                     accounts::TEAMMATE_PREFIX,
                     iso.root.display()
                 );
-                println!(
+                log_info!(
                     "Isolation: a teammate's account goes when they leave or lose the owner's Bots; their work is {} (ADR 0066).",
                     match (iso.offboard.files, iso.offboard.grace_days) {
                         (machines::offboard::Files::Archive, _) => "handed to the owner, in workspace/from-teammates (ISOLATION_TEAMMATE_FILES=delete deletes it)".to_string(),
@@ -351,19 +357,19 @@ async fn main() {
                     }
                 );
             } else if shared_bots == acl::SharedBots::Isolated {
-                println!("Isolation: ISOLATION_TEAMMATES=off, so a teammate's run of a shared Bot uses its owner's account (ADR 0046).");
+                log_info!("Isolation: ISOLATION_TEAMMATES=off, so a teammate's run of a shared Bot uses its owner's account (ADR 0046).");
             }
             let mut own = vec![app.cfg.data_dir.clone(), PathBuf::from(".env")];
             own.extend(std::env::var_os("SUPERBOT_MASTER_KEY_FILE").map(PathBuf::from));
             for p in accounts::close_to_others(&own) {
-                eprintln!("WARNING: other accounts can read {p}, which botd couldn't change. Per-user accounts must not read botd's files: chmod o-rwx it.");
+                log_warn!("WARNING: other accounts can read {p}, which botd couldn't change. Per-user accounts must not read botd's files: chmod o-rwx it.");
             }
             if accounts::others_visible() {
-                eprintln!("WARNING: other accounts' processes are visible in /proc, so Bots can read each other's command lines. Run botd with ProtectProc=invisible (deploy/install.sh --isolation sets it).");
+                log_warn!("WARNING: other accounts' processes are visible in /proc, so Bots can read each other's command lines. Run botd with ProtectProc=invisible (deploy/install.sh --isolation sets it).");
             }
             let _ = app.isolation.set(Arc::new(iso));
         }
-        None => println!(
+        None => log_info!(
             "Isolation: off (every Bot runs as this account and could read .env, the database and the master key). \
              New installs have it on; to opt in, re-run deploy/install.sh --isolation, or set ISOLATION=users with Docker Compose (deploy/README.md)."
         ),
@@ -372,15 +378,15 @@ async fn main() {
     teammate_removals::start(&app);
     let paused = handover::pause_already_disabled(&app, &Who { actor: Actor::system("bootstrap"), source: Source::default() });
     if paused > 0 {
-        println!("Routines: paused {paused} that ran for disabled users (ADR 0047).");
+        log_info!("Routines: paused {paused} that ran for disabled users (ADR 0047).");
     }
     for t in app.db.assigned_tiers().into_iter().filter(|t| app.tiers().get(t).is_none()) {
-        eprintln!("WARNING: some users have tier \"{t}\", which TIERS_FILE no longer lists. They get the default tier ({}) until an admin picks another.", app.tiers().default_tier().name);
+        log_warn!("WARNING: some users have tier \"{t}\", which TIERS_FILE no longer lists. They get the default tier ({}) until an admin picks another.", app.tiers().default_tier().name);
     }
     adapters::withhold(app.tiers().providers().iter().map(|p| p.key_secret.clone()));
     let saved = |k: &str| secrets::global().get(k).ok().flatten().is_some_and(|v| !v.expose().trim().is_empty());
     for p in app.tiers().providers().iter().filter(|p| !saved(&p.key_secret)) {
-        eprintln!("WARNING: TIERS_FILE provider \"{}\" has no key: the secret its keySecret names isn't saved or set in botd's environment. Runs routed to it are refused until it is (botctl secret set).", p.name);
+        log_warn!("WARNING: TIERS_FILE provider \"{}\" has no key: the secret its keySecret names isn't saved or set in botd's environment. Runs routed to it are refused until it is (botctl secret set).", p.name);
     }
     {
         let installed = adapters::installed();
@@ -393,30 +399,30 @@ async fn main() {
         });
         let (line, warnings) = app.tiers().default_harness_notes(&app.cfg.default_harness, here, on_machines.as_deref());
         if let Some(line) = line {
-            println!("{line}");
+            log_info!("{line}");
         }
         for w in warnings {
-            eprintln!("WARNING: {w}");
+            log_warn!("WARNING: {w}");
         }
     }
     secrets::redact::register(env("LICENSE_KEY", "").trim());
     app.license.set_testing(testing);
     app.license.load(|k| env(k, ""));
     let license = app.license.status();
-    println!("License: {}", license.detail());
+    log_info!("License: {}", license.detail());
     for w in license.warnings(app.db.active_seats()).into_iter().filter(|w| *w != license.detail()) {
-        eprintln!("WARNING: {w}");
+        log_warn!("WARNING: {w}");
     }
     if !license.usable() {
-        eprintln!("WARNING: {}", license.detail());
+        log_warn!("WARNING: {}", license.detail());
     }
     if license.testing() {
-        eprintln!("WARNING: testing mode is on (TESTING_MODE). No license, billing off; not for production.");
+        log_warn!("WARNING: testing mode is on (TESTING_MODE). No license, billing off; not for production.");
     }
     match runner::test_hook_secs(&env(runner::TEST_HOOK_TIMEOUT, "")) {
         Err(e) => exit(e),
-        Ok(Some(s)) if license.testing() => eprintln!("WARNING: {} is set: every approval hook times out after {s} seconds.", runner::TEST_HOOK_TIMEOUT),
-        Ok(Some(_)) => eprintln!("WARNING: {} is ignored: it only applies in testing mode.", runner::TEST_HOOK_TIMEOUT),
+        Ok(Some(s)) if license.testing() => log_warn!("WARNING: {} is set: every approval hook times out after {s} seconds.", runner::TEST_HOOK_TIMEOUT),
+        Ok(Some(_)) => log_warn!("WARNING: {} is ignored: it only applies in testing mode.", runner::TEST_HOOK_TIMEOUT),
         Ok(None) => {}
     }
 
@@ -424,11 +430,11 @@ async fn main() {
     // the owner account's.
     match isolation::migrate_workspace(&app.cfg.workspace, users::OPERATOR, &app.cfg.data_dir) {
         Ok(0) => {}
-        Ok(n) => println!("Workspace: moved {n} shared files and folders into users/{}.", users::OPERATOR),
+        Ok(n) => log_info!("Workspace: moved {n} shared files and folders into users/{}.", users::OPERATOR),
         Err(e) => exit(format!("WORKSPACE_DIR: couldn't move the shared files into users/{}: {e}", users::OPERATOR)),
     }
     match isolation::migrate_user_file(&app.cfg.data_dir, users::OPERATOR) {
-        Ok(true) => println!("USER.md: moved to users/{}/USER.md.", users::OPERATOR),
+        Ok(true) => log_info!("USER.md: moved to users/{}/USER.md.", users::OPERATOR),
         Ok(false) => {}
         Err(e) => exit(format!("DATA_DIR: couldn't move USER.md: {e}")),
     }
@@ -458,12 +464,12 @@ async fn main() {
         payments,
         ..Auth::new(Some(app.clone()))
     });
-    println!("Control plane: {}.", auth_state.machines.describe());
+    log_info!("Control plane: {}.", auth_state.machines.describe());
     if let Some(m) = auth_state.payments.meter() {
         let _ = app.meter.set(m);
     }
     let notifications = notify::load(&app.db);
-    println!("Notifications: {}.", notifier.describe(&notifications));
+    log_info!("Notifications: {}.", notifier.describe(&notifications));
     let notify_summary = json!({
         "email": notifier.smtp.is_some() && notifications.email.enabled,
         "webhook": notifications.webhook.enabled,
@@ -472,14 +478,14 @@ async fn main() {
     });
     let _ = app.notifier.set(Arc::new(notifier));
     if let Some(w) = &ignored_stripe {
-        eprintln!("WARNING: {w}");
+        log_warn!("WARNING: {w}");
     }
-    println!("Billing: {}.", billing::describe(auth_state.payments.enabled(), auth_state.payments.checkout_enabled(), app.meter.get().is_some(), app.tiers()));
+    log_info!("Billing: {}.", billing::describe(auth_state.payments.enabled(), auth_state.payments.checkout_enabled(), app.meter.get().is_some(), app.tiers()));
     match auth_state.scim.enabled {
-        true => println!("SCIM: on at /scim/v2; new users get the {} role.", auth_state.scim.default_role.as_str()),
-        false => println!("SCIM: off (SCIM=off)."),
+        true => log_info!("SCIM: on at /scim/v2; new users get the {} role.", auth_state.scim.default_role.as_str()),
+        false => log_info!("SCIM: off (SCIM=off)."),
     }
-    println!(
+    log_info!(
         "Sign-ups: {}.",
         match (auth_state.signups.enabled, auth_state.signups.turnstile.is_some()) {
             (false, _) => "off (SIGNUPS=off)",
@@ -489,7 +495,7 @@ async fn main() {
     );
     for p in &auth_state.sso.providers {
         let ready = p.not_ready().unwrap_or_else(|| "ready".into());
-        println!("SSO: {} ({}, {}), {ready}; {}; just-in-time sign-up {}.", p.id, p.label, p.type_name(), p.audience(), p.jit_role.map_or("off", |r| r.as_str()));
+        log_info!("SSO: {} ({}, {}), {ready}; {}; just-in-time sign-up {}.", p.id, p.label, p.type_name(), p.audience(), p.jit_role.map_or("off", |r| r.as_str()));
     }
     let sso_ids: Vec<String> = auth_state.sso.providers.iter().map(|p| p.id.clone()).collect();
     let control_plane = auth_state.machines.clone();
@@ -528,6 +534,8 @@ async fn main() {
         "defaultTier": app.tiers().default_tier().name,
         "tierHarnesses": app.tiers().all().iter().filter_map(|t| Some((t.name.clone(), json!(t.default_harness.as_ref()?)))).collect::<serde_json::Map<_, _>>(),
         "license": license.summary(),
+        "logFormat": observe.log.as_str(),
+        "metrics": observe.metrics.as_ref().map(|m| json!({ "loopback": m.addr.ip().is_loopback(), "token": m.token.is_some() })),
     })));
     license::start(app.clone());
     audit::start_retention(app.clone(), retention);
@@ -535,18 +543,18 @@ async fn main() {
     machines::hosts::load(&app, &control_plane).unwrap_or_else(|e| exit(format!("Incus hosts: {e}")));
     machines::start(app.clone(), control_plane);
     if policy.mode == policy::Mode::Bypass {
-        eprintln!(
+        log_warn!(
             "WARNING: harness policy is bypass: Bots run every tool without asking. \
              Opt in to approvals with `botctl policy set global mode=ask` (see docs/backend.md)."
         );
     }
     if !policy.sandbox {
-        eprintln!("Harness sandboxes: off. Turn them on with `botctl policy set global sandbox=on` (ADR 0055).");
+        log_warn!("Harness sandboxes: off. Turn them on with `botctl policy set global sandbox=on` (ADR 0055).");
     } else {
         let (with, can) = sandbox_harnesses(&app.cfg.sandbox_host);
         let cant: Vec<_> = with.into_iter().filter(|h| !can.contains(h)).collect();
         if !cant.is_empty() {
-            eprintln!(
+            log_warn!(
                 "WARNING: harness sandboxes are on, but {}'s can't start here (no unprivileged user namespaces, or no working bubblewrap or socat), \
                  so those runs on this server go without. Install bubblewrap and socat, or allow user namespaces (ADR 0055).",
                 cant.join(" and ")
@@ -568,16 +576,21 @@ async fn main() {
     }
 
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await.expect("bind");
-    println!("Listening on http://{host}:{port}");
+    log_info!("Listening on http://{host}:{port}");
+    log_info!("Observability: {} (ADR 0089).", observe.describe());
+    if let Some(m) = observe.metrics {
+        let l = tokio::net::TcpListener::bind(m.addr).await.unwrap_or_else(|err| exit(format!("METRICS_LISTEN {}: {err}", m.addr)));
+        tokio::spawn(obs::serve(l, app.clone(), m.token));
+    }
     if let Some(e) = enrollment {
         let machine_listener = tokio::net::TcpListener::bind(e.listen).await.unwrap_or_else(|err| exit(format!("MACHINE_LISTEN {}: {err}", e.listen)));
-        println!("Machines enroll at {} (listening on {}).", e.url, e.listen);
+        log_info!("Machines enroll at {} (listening on {}).", e.url, e.listen);
         // Bots on machines reach this API through the machine port, as if from loopback.
         let api = machines::enroll::Api { router: router.clone(), host: format!("127.0.0.1:{port}") };
         tokio::spawn(machines::enroll::serve(machine_listener, app.clone(), e, Some(api)));
     }
-    println!("Harnesses on PATH: {}. Default: {}.", adapters::installed().join(", "), app.cfg.default_harness);
-    println!(
+    log_info!("Harnesses on PATH: {}. Default: {}.", adapters::installed().join(", "), app.cfg.default_harness);
+    log_info!(
         "Screens: {}.",
         match (app.screens.is_some(), app.isolation().is_some()) {
             (true, _) if screen_addr.is_loopback() => "on".to_string(),
@@ -751,7 +764,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/signups/{id}/approve", post(signups::approve))
         .route("/signups/{id}/reject", post(signups::reject))
         .route("/scim/tokens", get(scim::list_tokens).post(scim::create_token))
-        .route("/scim/tokens/{id}", delete(scim::revoke_token));
+        .route("/scim/tokens/{id}", delete(scim::revoke_token))
+        .route_layer(middleware::from_fn(obs::note_route));
     // SCIM has its own bearer tokens and error format, so its own guard, not `auth` (ADR 0023).
     let scim_routes = Router::new()
         .route("/scim/v2/ServiceProviderConfig", get(scim::service_provider_config))
@@ -786,6 +800,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
                 .layer(Extension(auth_state)),
         )
         .layer(cors_layer())
+        .layer(middleware::from_fn_with_state(app.clone(), obs::track))
         .with_state(app)
 }
 
@@ -987,7 +1002,7 @@ fn auth_password() -> String {
     match secrets::env::EnvStore::process().get("AUTH_PASSWORD") {
         Ok(p) => p.map(|p| p.expose().to_string()).unwrap_or_default(),
         Err(e) => {
-            eprintln!("{e}");
+            log_warn!("{e}");
             std::process::exit(1);
         }
     }
@@ -997,7 +1012,7 @@ fn auth_password() -> String {
 /// ALLOW_NO_AUTH=1 on loopback only. With it off, people sign in with sessions only.
 fn auth_startup(host: &str, password: &str, break_glass: bool) -> bool {
     if !break_glass {
-        println!(
+        log_info!(
             "Break-glass password sign-in is off (AUTH_BREAK_GLASS=0){}. People sign in with sessions; \
              set AUTH_BREAK_GLASS=1 and restart to get back in with AUTH_PASSWORD.",
             if password.is_empty() { "" } else { "; AUTH_PASSWORD is ignored" }
@@ -1008,18 +1023,18 @@ fn auth_startup(host: &str, password: &str, break_glass: bool) -> bool {
         return false;
     }
     if !is_loopback_host(host) {
-        eprintln!("Refusing to listen on a public address without AUTH_PASSWORD.");
+        log_warn!("Refusing to listen on a public address without AUTH_PASSWORD.");
         std::process::exit(1);
     }
     if env("ALLOW_NO_AUTH", "") == "1" {
-        eprintln!(
+        log_warn!(
             "WARNING: ALLOW_NO_AUTH=1 with empty AUTH_PASSWORD on {host}. \
              Any local process that passes the Host allowlist can use the API without login. \
              Set AUTH_PASSWORD for real use."
         );
         return true;
     }
-    eprintln!(
+    log_warn!(
         "Refusing to start: set AUTH_PASSWORD (recommended), or set ALLOW_NO_AUTH=1 only for \
          loopback development (HOST=127.0.0.1, localhost, or ::1)."
     );
@@ -2815,7 +2830,7 @@ fn secret_error(e: secrets::Error) -> ApiError {
         secrets::Error::Invalid(m) => bad(m),
         secrets::Error::ReadOnly => ApiError(StatusCode::CONFLICT, e.to_string()),
         secrets::Error::Store(m) => {
-            eprintln!("secrets: {m}");
+            log_warn!("secrets: {m}");
             ApiError(StatusCode::INTERNAL_SERVER_ERROR, "The secret store failed; see the server log.".into())
         }
     }

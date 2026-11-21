@@ -125,7 +125,7 @@ async fn view(app: &App, owner: &User, teammate: &str) -> Value {
         let at = match since(app, space, n).await {
             Ok(at) => at,
             Err(e) => {
-                eprintln!("Teammate logins: couldn't check a {n} login as its account: {e}");
+                crate::obs::log::log_warn!("Teammate logins: couldn't check a {n} login as its account: {e}");
                 None
             }
         };

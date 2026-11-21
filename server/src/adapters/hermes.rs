@@ -130,7 +130,7 @@ impl Adapter for Hermes {
         let secret_names: Vec<String> = match crate::secrets::global().list() {
             Ok(list) => list.into_iter().map(|l| l.name).collect(),
             Err(e) => {
-                eprintln!("hermes: listing secret names: {e}");
+                crate::obs::log::log_warn!("hermes: listing secret names: {e}");
                 Vec::new()
             }
         };

@@ -256,7 +256,7 @@ impl Secrets {
                 }
                 Ok(None) => {}
                 // The error text can name the user, so only its kind is logged.
-                Err(e) => eprintln!("A user's secret {name} couldn't be read ({}).", e.kind()),
+                Err(e) => crate::obs::log::log_warn!("A user's secret {name} couldn't be read ({}).", e.kind()),
             }
         }
         out
@@ -345,7 +345,7 @@ impl Secrets {
                         }
                     }
                     Ok(None) => {}
-                    Err(e) => eprintln!("secret {name}: {e}"),
+                    Err(e) => crate::obs::log::log_warn!("secret {name}: {e}"),
                 }
             }
         }
@@ -441,7 +441,7 @@ pub fn init(db_path: &Path) -> Result<Report, String> {
         forget,
     )?;
     if forget && boot.discarded == 0 {
-        eprintln!("SUPERBOT_FORGET_SEALED=1 is set, but the master key works, so nothing was dropped. Remove the setting.");
+        crate::obs::log::log_warn!("SUPERBOT_FORGET_SEALED=1 is set, but the master key works, so nothing was dropped. Remove the setting.");
     }
     let cipher = sealed::install(cipher)?;
     let store = sealed::SealedStore::new(sealed::connect(db_path)?, Arc::clone(&cipher));

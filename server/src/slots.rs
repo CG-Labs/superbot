@@ -212,6 +212,11 @@ impl Slots {
         self.lock().get(pool).map_or((0, 0), |p| (p.held.len(), p.waiting.len()))
     }
 
+    /// Runs holding slots and runs waiting, across every pool.
+    pub fn totals(&self) -> (usize, usize) {
+        self.lock().values().fold((0, 0), |(h, w), p| (h + p.held.len(), w + p.waiting.len()))
+    }
+
     /// Where `bot` waits, if it does: its pool and place.
     pub fn waiting(&self, bot: &str) -> Option<(String, Turn)> {
         let pools = self.lock();
