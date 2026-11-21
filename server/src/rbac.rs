@@ -268,6 +268,10 @@ mod tests {
             ("GET", "/api/scim/tokens", Perm::Admin),
             ("POST", "/api/scim/tokens", Perm::Admin),
             ("DELETE", "/api/scim/tokens/st1", Perm::Admin),
+            // So are the links between SCIM groups and teams (ADR 0095).
+            ("GET", "/api/scim/groups", Perm::Admin),
+            ("POST", "/api/scim/groups", Perm::Admin),
+            ("DELETE", "/api/scim/groups/t1", Perm::Admin),
             ("GET", "/api/auth/me", Perm::Account),
             ("GET", "/api/machine", Perm::Account),
             ("GET", "/api/me/secrets", Perm::Read),
