@@ -153,7 +153,7 @@ pub async fn start(app: AppState, by: Who, owner: User, teammate: String, harnes
     let space = Space::Teammate { owner: &owner.id, teammate: &teammate };
     // Held until the login has started, so a removal (ADR 0066) stops it, never races it.
     let _in_use = crate::teammate_removals::enter(&app, &owner.id, &teammate).ok_or_else(|| conflict("Your account for these Bots on this server is being removed. Try again in a few minutes."))?;
-    if !crate::machines::offboard::wanted(&app, &owner.id, &teammate) {
+    if !crate::teammate_removals::wanted(&app, &owner.id, &teammate) {
         return Err(crate::not_found("Machine"));
     }
     let run_as = app.ensure_space(space, &by).await.map_err(|e| gateway(format!("Couldn't set up your account on this server: {e}")))?;

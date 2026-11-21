@@ -211,6 +211,34 @@ async fn a_disabled_teammate_loses_their_account_once_and_their_held_work_is_pur
 }
 
 #[tokio::test]
+async fn a_disabled_owners_teammates_lose_their_accounts_for_her_bots_and_she_keeps_hers() {
+    let w = world(delete_after(0)).await;
+    let (code, _) = call(w.port, "PATCH", &format!("/api/users/{}", w.a_id), &w.admin, r#"{"status":"disabled"}"#).await;
+    assert_eq!(code, 200);
+    settled(&w).await;
+
+    let removed = events(&w, "isolation.teammate_removed").await;
+    let mut gone: Vec<&str> = removed.iter().filter_map(|e| e["details"]["forUser"].as_str()).collect();
+    gone.sort();
+    let mut want = [w.b_id.as_str(), w.c_id.as_str()];
+    want.sort();
+    assert_eq!(gone, want, "{removed:?}");
+    assert!(removed.iter().all(|e| e["targetId"] == w.a_id.as_str() && e["details"]["reason"] == "access_lost"), "{removed:?}");
+    let p = passwd(&w);
+    assert!(p.contains(&format!("sb-u-{}:", w.a_id)), "Ada's own account is gone");
+    assert!(!p.contains(&accounts::teammate_account(&w.a_id, &w.b_id).unwrap()) && !p.contains(&accounts::teammate_account(&w.a_id, &w.c_id).unwrap()));
+    assert_eq!(std::fs::read_to_string(w.root.join(format!("{}/workspace/mine.txt", w.a_id))).unwrap(), "ada's");
+    assert!(calls(&w).iter().all(|c| c.starts_with(&format!("remove {} ", w.a_id))), "{:?}", calls(&w));
+
+    // Once she's back, her teammates get new accounts as they run; nothing more goes.
+    let (code, _) = call(w.port, "PATCH", &format!("/api/users/{}", w.a_id), &w.admin, r#"{"status":"active"}"#).await;
+    assert_eq!(code, 200);
+    crate::teammate_removals::follow_up(&w.app);
+    settled(&w).await;
+    assert_eq!(calls(&w).len(), 2, "{:?}", calls(&w));
+}
+
+#[tokio::test]
 async fn a_revoked_grant_removes_the_account_and_a_returning_teammate_is_never_removed_unasked() {
     let w = world(delete_after(0)).await;
     // A removal queued while Bea still may use the Bot, never tried: cancelled.

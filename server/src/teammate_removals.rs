@@ -144,6 +144,13 @@ fn queue(app: &App, iso: &Isolation, by: &Who, owner: &str, teammate: &str, reas
     Some((row, made))
 }
 
+/// Whether `teammate` keeps their account for `owner`'s Bots here: as on machines
+/// (`offboard::wanted`), and only while the owner is active, since none of a disabled
+/// owner's Bots run.
+pub fn wanted(app: &App, owner: &str, teammate: &str) -> bool {
+    app.db.user(owner).is_some_and(|u| u.active()) && offboard::wanted(app, owner, teammate)
+}
+
 /// Every teammate account here, as `(owner, teammate)`: in the password database, or
 /// made by botd and not removed since (a recreated container keeps the folders, not the
 /// accounts), and every pair a removal is still pending for.
@@ -162,7 +169,7 @@ fn pairs(app: &App, iso: &Isolation) -> Vec<(String, String)> {
 fn sweep(app: &App, iso: &Isolation, by: Option<&Who>, only: impl Fn(&str, &str) -> bool, reason: Option<&str>) -> usize {
     pairs(app, iso)
         .iter()
-        .filter(|(o, t)| only(o, t) && !offboard::wanted(app, o, t))
+        .filter(|(o, t)| only(o, t) && !wanted(app, o, t))
         .filter_map(|(o, t)| queue(app, iso, by.unwrap_or(&system(o)), o, t, reason.unwrap_or_else(|| offboard::reason_for(app, t))))
         .filter(|(_, made)| *made)
         .count()
@@ -296,7 +303,7 @@ async fn try_removal(app: &App, iso: &Arc<Isolation>, by: &Who, row: &AccountRem
     // Once the helper has started, it may have done some of it (processes killed, work
     // moved): finish rather than leave it half done. A later run makes the teammate a new
     // account. The update checks again, so an admin's ask that lands meanwhile still stands.
-    if !forced && row.reason != ADMIN && row.attempts == 0 && offboard::wanted(app, &row.owner_id, &row.user_id) {
+    if !forced && row.reason != ADMIN && row.attempts == 0 && wanted(app, &row.owner_id, &row.user_id) {
         let why = "access_back";
         if app.db.account_removal_cancel_unasked(&row.id, why) {
             app.db.record(&removal_event(by, "isolation.teammate_removal_cancelled", &row, json!({ "why": why })));
@@ -307,12 +314,16 @@ async fn try_removal(app: &App, iso: &Arc<Isolation>, by: &Who, row: &AccountRem
     let pair = (row.owner_id.clone(), row.user_id.clone());
     app.teammate_gate.lock().removing.insert(pair.clone());
     let _closed = Closed(&app.teammate_gate, pair.clone());
-    let runs = app.stop_teammate_runs(&row.owner_id, &row.user_id);
-    // A run saves its memory copy back as it ends: the folder goes only after.
+    let mut runs = app.stop_teammate_runs(&row.owner_id, &row.user_id);
+    // A run saves its memory copy back as it ends: the folder goes only after. One let in
+    // just before the gate closed may still be setting up, so it's stopped once it starts.
     let mut waited = 0;
     while app.teammate_gate.in_use(&pair) && waited < RUN_END_SECS * 20 {
         tokio::time::sleep(Duration::from_millis(50)).await;
         waited += 1;
+        if waited % 10 == 0 {
+            runs = runs.max(app.stop_teammate_runs(&row.owner_id, &row.user_id));
+        }
     }
     if app.teammate_gate.in_use(&pair) {
         let why = "a run in the account is still ending";
@@ -466,7 +477,7 @@ pub async fn of_user(State(app): State<AppState>, Path(key): Path<String>) -> Re
             let open = removals.iter().find(|r| r.owner_id == o && r.user_id == t && r.state == PENDING);
             json!({
                 "owner": person(&app, &o), "teammate": person(&app, &t), "account": Space::Teammate { owner: &o, teammate: &t }.account(),
-                "wanted": offboard::wanted(&app, &o, &t), "removal": open.map(|r| view(&app, r)),
+                "wanted": wanted(&app, &o, &t), "removal": open.map(|r| view(&app, r)),
             })
         })
         .collect();
