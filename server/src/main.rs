@@ -107,6 +107,9 @@ mod signups;
 #[cfg(test)]
 mod signups_http_tests;
 mod sso;
+mod status;
+#[cfg(test)]
+mod status_http_tests;
 mod stripe;
 mod tiers;
 mod billing;
@@ -214,6 +217,7 @@ async fn main() {
     };
     let observe = obs::Settings::from_env(&|k| env(k, ""), &secrets::env::EnvStore::process()).unwrap_or_else(|e| exit(format!("Observability: {e}")));
     obs::log::set_format(observe.log);
+    let status_page = status::Page::parse(&env("STATUS_PAGE", "")).unwrap_or_else(|e| exit(e));
     let break_glass = users::break_glass_flag(&env("AUTH_BREAK_GLASS", "")).unwrap_or_else(|e| exit(e));
     let sessions = SessionConfig::from_env(&env("SESSION_IDLE_TIMEOUT", ""), &env("SESSION_MAX_AGE", "")).unwrap_or_else(|e| exit(e));
     let sso = sso::Sso::from_env().unwrap_or_else(|e| exit(format!("SSO: {e}")));
@@ -326,6 +330,8 @@ async fn main() {
     app.db.set_teams_strict(teams.strict);
     let _ = app.teams.set(teams);
     log_info!("Teams: {} (ADR 0087).", teams.describe());
+    app.status.set_enabled(status_page);
+    log_info!("Status page: {} (STATUS_PAGE, ADR 0090).", if status_page { "on, at /status and /status.json" } else { "off" });
     let _ = app.resume_routines_on_enable.set(resume_routines);
     log_info!(
         "Shared Bots: {}.",
@@ -536,6 +542,7 @@ async fn main() {
         "license": license.summary(),
         "logFormat": observe.log.as_str(),
         "metrics": observe.metrics.as_ref().map(|m| json!({ "loopback": m.addr.ip().is_loopback(), "token": m.token.is_some() })),
+        "statusPage": status_page,
     })));
     license::start(app.clone());
     audit::start_retention(app.clone(), retention);
@@ -765,6 +772,9 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/signups/{id}/reject", post(signups::reject))
         .route("/scim/tokens", get(scim::list_tokens).post(scim::create_token))
         .route("/scim/tokens/{id}", delete(scim::revoke_token))
+        .route("/status/incidents", get(status::list).post(status::create))
+        .route("/status/incidents/{id}", patch(status::edit).delete(status::delete))
+        .route("/status/incidents/{id}/updates", post(status::add_update))
         .route_layer(middleware::from_fn(obs::note_route));
     // SCIM has its own bearer tokens and error format, so its own guard, not `auth` (ADR 0023).
     let scim_routes = Router::new()
@@ -791,6 +801,9 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .layer(Extension(auth_state.clone()));
     Router::new()
         .route("/healthz", get(|| async { Json(json!({ "ok": true })) }))
+        // Open to anyone, like /healthz: no tenant data (ADR 0090).
+        .route("/status", get(status::html_page))
+        .route("/status.json", get(status::json_page))
         .merge(scim_routes)
         .merge(billing_routes)
         .merge(

@@ -12,6 +12,9 @@ use crate::*;
 /// Routes anyone may call: signing in, the page to do it on, and asking for access.
 const PUBLIC: &[(&str, &str)] = &[
     ("GET", "/healthz"),
+    // The status page: fixed component names and admins' public notes (ADR 0090).
+    ("GET", "/status"),
+    ("GET", "/status.json"),
     ("GET", "/login"),
     ("POST", "/api/auth/login"),
     ("GET", "/api/auth/sso"),
@@ -131,8 +134,8 @@ async fn every_route_but_the_public_ones_needs_credentials_and_the_right_role() 
         if m != "GET" && p != "/api/auth/logout" && !(m == "DELETE" && p == "/api/me/push") {
             assert!(!rbac::allows(Principal::User(Role::Readonly), need), "readonly could {m} {p}");
         }
-        // The admin portal, the audit log, secrets, signups, the setup wizard, and the license are admin-only.
-        if ["/api/users", "/api/sessions", "/api/audit", "/api/secrets", "/api/signups", "/api/policy", "/api/setup", "/api/license", "/api/usage"].iter().any(|s| p.starts_with(s)) && !(m == "GET" && p.starts_with("/api/policy")) {
+        // The admin portal, the audit log, secrets, signups, the setup wizard, the license, and status incidents are admin-only.
+        if ["/api/users", "/api/sessions", "/api/audit", "/api/secrets", "/api/signups", "/api/policy", "/api/setup", "/api/license", "/api/usage", "/api/status"].iter().any(|s| p.starts_with(s)) && !(m == "GET" && p.starts_with("/api/policy")) {
             assert_eq!(need, rbac::Perm::Admin, "{m} {p}");
         }
         checked += 1;

@@ -79,6 +79,65 @@ impl Histogram {
     }
 }
 
+/// Minutes of per-minute counts kept for the status page (ADR 0090).
+pub const RECENT_MINUTES: i64 = 15;
+
+/// Run results the status page counts as failed: the run broke, not a person or policy.
+pub const RUN_FAILURES: [&str; 2] = ["error", "timeout"];
+
+/// What happened in a stretch of recent minutes, for the status page.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Recent {
+    pub requests: u64,
+    /// Requests answered with a 5xx.
+    pub errors: u64,
+    pub runs_done: u64,
+    /// Runs that ended in `RUN_FAILURES`.
+    pub runs_failed: u64,
+    pub notices_sent: u64,
+    pub notices_failed: u64,
+}
+
+impl Recent {
+    fn add(&mut self, o: &Recent) {
+        self.requests += o.requests;
+        self.errors += o.errors;
+        self.runs_done += o.runs_done;
+        self.runs_failed += o.runs_failed;
+        self.notices_sent += o.notices_sent;
+        self.notices_failed += o.notices_failed;
+    }
+}
+
+/// Per-minute counts for the last `RECENT_MINUTES`, oldest first.
+#[derive(Default)]
+struct Window(std::collections::VecDeque<(i64, Recent)>);
+
+impl Window {
+    fn bump(&mut self, now_ms: i64, f: impl FnOnce(&mut Recent)) {
+        let minute = now_ms.div_euclid(60_000);
+        if self.0.back().is_none_or(|(m, _)| *m < minute) {
+            self.0.push_back((minute, Recent::default()));
+        }
+        while self.0.front().is_some_and(|(m, _)| *m <= minute - RECENT_MINUTES) {
+            self.0.pop_front();
+        }
+        // A clock that stepped back counts in the newest minute rather than reordering.
+        if let Some((_, r)) = self.0.back_mut() {
+            f(r);
+        }
+    }
+
+    fn sum(&self, now_ms: i64, minutes: i64) -> Recent {
+        let from = now_ms.div_euclid(60_000) - minutes.clamp(1, RECENT_MINUTES) + 1;
+        let mut total = Recent::default();
+        for (_, r) in self.0.iter().filter(|(m, _)| *m >= from) {
+            total.add(r);
+        }
+        total
+    }
+}
+
 #[derive(Default)]
 struct Inner {
     http: BTreeMap<(&'static str, &'static str, &'static str), u64>,
@@ -90,6 +149,7 @@ struct Inner {
     events: BTreeMap<(&'static str, &'static str), u64>,
     reconciles: u64,
     reconcile_last: Option<(i64, f64)>,
+    recent: Window,
 }
 
 /// One per database, so each test's app counts on its own.
@@ -146,6 +206,28 @@ impl Metrics {
         let mut m = self.lock();
         *m.http.entry((class, method, status_class(code))).or_default() += 1;
         m.http_seconds.entry(class).or_default().observe(&HTTP_BUCKETS, seconds);
+        // Probes would dilute the error share the status page judges the API by.
+        if !matches!(class, "healthz" | "status") {
+            m.recent.bump(crate::db::now(), |r| {
+                r.requests += 1;
+                r.errors += (code >= 500) as u64;
+            });
+        }
+    }
+
+    /// What happened in the last `minutes` (1 to `RECENT_MINUTES`) up to `now_ms`.
+    pub fn recent(&self, now_ms: i64, minutes: i64) -> Recent {
+        self.lock().recent.sum(now_ms, minutes)
+    }
+
+    /// When the machine reconciler last finished a pass, in ms, if it has.
+    pub fn last_reconcile(&self) -> Option<i64> {
+        self.lock().reconcile_last.map(|(at, _)| at)
+    }
+
+    #[cfg(test)]
+    pub fn bump_recent(&self, now_ms: i64, f: impl FnOnce(&mut Recent)) {
+        self.lock().recent.bump(now_ms, f);
     }
 
     pub fn run_started(&self, harness_name: &str) -> Active<'_> {
@@ -159,6 +241,13 @@ impl Metrics {
         let mut m = self.lock();
         *m.runs.entry((h, r)).or_default() += 1;
         m.run_seconds.entry(h).or_default().observe(&RUN_BUCKETS, seconds);
+        let failed = RUN_FAILURES.contains(&r);
+        if failed || r == "done" {
+            m.recent.bump(crate::db::now(), |w| {
+                w.runs_done += (!failed) as u64;
+                w.runs_failed += failed as u64;
+            });
+        }
     }
 
     /// An audit event as `Db::record` writes it: counted if its action is in `EVENTS`.
@@ -169,6 +258,12 @@ impl Metrics {
         }
         let mut m = self.lock();
         *m.events.entry((a, known(&OUTCOMES, outcome))).or_default() += 1;
+        if matches!(a, "notification.sent" | "notification.failed") {
+            m.recent.bump(crate::db::now(), |w| {
+                w.notices_sent += (a == "notification.sent") as u64;
+                w.notices_failed += (a == "notification.failed") as u64;
+            });
+        }
         if action == "bot.run_refused" {
             let mut r = reason(refusal.unwrap_or(""));
             if !m.refused.contains_key(&r) && m.refused.len() >= MAX_REASONS {
@@ -305,6 +400,38 @@ mod tests {
         }
         assert!(m.lock().refused.len() <= MAX_REASONS + 1);
         assert!(m.lock().refused.get("other").is_some_and(|n| *n >= 10));
+    }
+
+    #[test]
+    fn the_recent_window_counts_by_minute_and_forgets_old_ones() {
+        let m = Metrics::default();
+        let t0 = 1_000 * 60_000;
+        m.bump_recent(t0, |r| r.requests += 3);
+        m.bump_recent(t0 + 30_000, |r| r.errors += 1);
+        m.bump_recent(t0 + 5 * 60_000, |r| r.runs_failed += 2);
+        let now = t0 + 5 * 60_000;
+        assert_eq!(m.recent(now, 1), Recent { runs_failed: 2, ..Default::default() });
+        assert_eq!(m.recent(now, 15), Recent { requests: 3, errors: 1, runs_failed: 2, ..Default::default() });
+        // Fifteen minutes on, the first minute has gone.
+        m.bump_recent(t0 + RECENT_MINUTES * 60_000, |r| r.notices_sent += 1);
+        let later = m.recent(t0 + RECENT_MINUTES * 60_000, RECENT_MINUTES);
+        assert_eq!(later, Recent { runs_failed: 2, notices_sent: 1, ..Default::default() });
+        assert!(m.lock().recent.0.len() <= RECENT_MINUTES as usize);
+    }
+
+    #[test]
+    fn requests_runs_and_notices_feed_the_recent_window() {
+        let m = Metrics::default();
+        m.request("bots", "GET", 200, 0.01);
+        m.request("bots", "GET", 503, 0.01);
+        m.request("healthz", "GET", 200, 0.01);
+        m.request("status", "GET", 200, 0.01);
+        m.run_finished("claude", "done", 1.0);
+        m.run_finished("claude", "timeout", 1.0);
+        m.run_finished("claude", "stopped", 1.0);
+        m.audited("notification.failed", "failure", None);
+        let r = m.recent(crate::db::now(), RECENT_MINUTES);
+        assert_eq!(r, Recent { requests: 2, errors: 1, runs_done: 1, runs_failed: 1, notices_sent: 0, notices_failed: 1 });
     }
 
     #[test]

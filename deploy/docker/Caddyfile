@@ -40,7 +40,7 @@
 		uri strip_prefix /screen/{re.screen.1}
 		reverse_proxy botd:{re.screen.1}
 	}
-	# Everything else: botd's console at /console/, /login, /api, /healthz.
+	# Everything else: botd's console at /console/, /login, /api, /healthz, /status.
 	handle {
 		reverse_proxy botd:3000 {
 			# /api/events is an SSE stream: never buffer.

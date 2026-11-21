@@ -16,6 +16,7 @@
       <a href="#machines" data-tab="machines">Machines</a>
       <a href="#teams" data-tab="teams">Teams</a>
       <a href="#audit" data-tab="audit">Audit log</a>
+      <a href="#status" data-tab="status">Status</a>
       <a href="#settings" data-tab="settings">Settings</a>
       <a href="#setup" data-tab="setup">Setup <span class="count" id="setup-count"></span></a>
     </nav>
@@ -134,6 +135,35 @@
       <div class="empty" id="au-empty" hidden></div>
       <button type="button" class="btn more" id="au-more" hidden>Load more</button>
       <p class="hint">Append-only. Export uses these filters.</p>
+    </section>
+
+    <section id="tab-status" hidden>
+      <p class="hint" id="status-note"></p>
+      <form class="card" id="inc-new" autocomplete="off">
+        <div class="bar">
+          <input id="inc-title" placeholder="Incident title, e.g. Slow Bot runs" required maxlength="120" />
+          <select id="inc-impact" title="Impact">
+            <option value="minor">Minor: degraded</option>
+            <option value="major">Major: partial outage</option>
+            <option value="critical">Critical: major outage</option>
+            <option value="maintenance">Maintenance</option>
+            <option value="none">None: a note only</option>
+          </select>
+          <select id="inc-state" title="State">
+            <option value="investigating">Investigating</option>
+            <option value="identified">Identified</option>
+            <option value="monitoring">Monitoring</option>
+            <option value="resolved">Resolved</option>
+          </select>
+        </div>
+        <div class="bar" id="inc-components"></div>
+        <div class="bar">
+          <textarea id="inc-body" rows="3" required maxlength="2000" placeholder="What's happening and what people should expect. Anyone can read this."></textarea>
+          <button type="submit" class="btn primary">Post incident</button>
+        </div>
+      </form>
+      <div id="incidents-list"></div>
+      <div class="empty" id="incidents-empty" hidden></div>
     </section>
 
     <section id="tab-settings" hidden>

@@ -468,6 +468,47 @@ With Docker Compose, `botd` must listen beyond the container's loopback for a sc
 
 **Structured logs.** `LOG_FORMAT=json` (default `text`) makes `botd` print one JSON object per line, on stdout and stderr as before, for journald, Docker's logging drivers, or a shipper such as Vector or Promtail. Each has `ts` (UTC), `level` and `msg`. On top of `botd`'s own lines, it logs every request (`http.request`: request id, method, route template, route class, status, duration) and every run (`message.queued`, `run.started`, `run.finished`: run, message and Bot ids, harness, result, duration). No emails, names, IP addresses, message text, paths as sent or tokens; those stay in the [audit log](#audit-log-retention). Every response has an `X-Request-Id` header, the same id as its log line. An id sent in by a proxy is kept if it's plain (letters, digits, `-`, `_`, `.`, up to 64). `journalctl -u superbot -o cat | jq 'select(.msg == "run.finished")'` lists finished runs.
 
+## Status page and SLO alerts
+
+`botd` serves a public status page at `/status` (and `/status.json` for tools), through Caddy like every other path: no Caddyfile change. It shows the API, database, machines and control plane (with managed machines), harness runners and notifications (once a channel is on), each from `botd`'s own checks and its last few minutes of requests and runs, plus incident notes admins post in the console's **Status** tab. It shows no customer data, counts, hostnames or errors. `/status.json` answers 503 during a major outage, so an uptime probe counts it as down. Design: [ADR 0090](../docs/adr/0090-status-page-and-uptime-slo.md); the objectives it serves: [docs/slo.md](../docs/slo.md).
+
+| Setting in `.env` | Meaning |
+|---|---|
+| `STATUS_PAGE` | `on` (default) or `off` (both pages answer 404; admins can still prepare incidents) |
+
+Anyone can read what you post, so write for customers: what's affected, what to expect, when you'll update. Known secret values are redacted, but nothing else is.
+
+**Uptime probe.** `botd` can't report its own downtime, so the SLO's uptime is measured from outside: probe `https://<your-domain>/status.json` every 30 seconds from somewhere that isn't the server's host. With Prometheus' blackbox exporter:
+
+```yaml
+scrape_configs:
+  - job_name: superbot-status
+    metrics_path: /probe
+    params: { module: [http_2xx] }
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["https://<your-domain>/status.json"]
+    relabel_configs:
+      - { source_labels: [__address__], target_label: __param_target }
+      - { target_label: __address__, replacement: "<blackbox-exporter>:9115" }
+```
+
+Uptime Kuma or a hosted uptime checker works too: alert when two checks in a row fail.
+
+**Alert rules.** [`deploy/prometheus/superbot-slo.rules.yml`](prometheus/superbot-slo.rules.yml) has error-budget burn-rate alerts on the [metrics](#metrics-and-logs), and alerts for `botd` not being scraped, the probe failing, and Bot runs failing. They assume the scrape jobs are named `superbot` and `superbot-status`, and a 99.9% target (change `superbot:slo_availability:target` for another):
+
+```sh
+sudo cp deploy/prometheus/superbot-slo.rules.yml /etc/prometheus/
+promtool check rules /etc/prometheus/superbot-slo.rules.yml
+```
+
+```yaml
+# prometheus.yml
+rule_files: ["/etc/prometheus/superbot-slo.rules.yml"]
+```
+
+Route `severity: page` to on-call and `severity: ticket` to a queue in Alertmanager.
+
 ## Approval notifications
 
 A pending approval can reach people by email and a webhook when no app is open ([ADR 0061](../docs/adr/0061-approval-notifications.md)). Both are off until an admin turns them on; neither needs a paid service.

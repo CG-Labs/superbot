@@ -46,3 +46,5 @@ This covers machines that run as Incus containers with off-host backups turned o
 7. **Failures outside the Provider's control**, including the object storage provider being unavailable. A breach caused by one is still recorded.
 
 The objectives are targets the system measures and alerts on. Any credits or remedies for missing them are set in the customer's agreement, not here.
+
+The service's own availability, as opposed to one machine's recovery, is in the [uptime SLO](../slo.md).

@@ -97,6 +97,7 @@ pub fn route_class(path: &str) -> &'static str {
     let api = |p: &str| path == p || path.strip_prefix(p).is_some_and(|r| r.starts_with('/'));
     match path {
         "/healthz" => "healthz",
+        "/status" | "/status.json" => "status",
         "/login" => "auth",
         "/api/events" => "events",
         "/api/approvals/check" => "approval_hook",
@@ -111,6 +112,7 @@ pub fn route_class(path: &str) -> &'static str {
         _ if api("/api/audit") => "audit",
         _ if api("/api/billing") || api("/api/usage") || api("/api/tiers") || api("/api/license") => "billing",
         _ if api("/api/signups") => "signups",
+        _ if api("/api/status") => "status",
         _ if api("/scim") => "scim",
         _ if api("/api") => "api_other",
         _ => "web",
