@@ -344,6 +344,28 @@ pub struct RecoverBody {
     identity: Option<String>,
 }
 
+/// Refuses a recovery of `host` with nowhere open to restore onto: `to`, or any other host.
+fn open_targets(app: &App, cp: &ControlPlane, h: &dyn Hosts, host: &str, to: Option<&str>) -> Res<()> {
+    let loads = placement::loads(app, cp, h);
+    match to {
+        Some(t) => {
+            if let Some(s) = h.status(t).filter(|s| *s != HostStatus::Up) {
+                return Err(conflict(format!("Host {t} is {}; restore onto a host that is up.", s.as_str())));
+            }
+            if let Some(why) = loads.iter().find(|l| l.name == t).and_then(|l| l.closed()) {
+                return Err(conflict(format!("Host {why}; restore onto a host that is open.")));
+            }
+        }
+        None if !loads.iter().any(|l| l.name != host && l.closed().is_none()) => {
+            return Err(conflict(
+                "No other Incus host is up and open to restore onto. Add one to INCUS_HOSTS and restart botd, or undrain one (botctl machine host undrain <name>).".into(),
+            ));
+        }
+        None => {}
+    }
+    Ok(())
+}
+
 /// `POST /api/machines/hosts/{name}/recover`: declares the host lost and restores each
 /// of its machines from its newest off-host backup onto another host. Refused while the
 /// host answers. Again later, it picks up machines it couldn't do before. 202.
@@ -369,22 +391,7 @@ pub async fn recover(
         Some(t) if !h.configured().iter().any(|c| c.name == *t) => {
             return Err(bad(format!("There's no Incus host \"{}\".", crate::audit::clip(t, 40))));
         }
-        Some(t) => {
-            if let Some(s) = h.status(t).filter(|s| *s != HostStatus::Up) {
-                return Err(conflict(format!("Host {t} is {}; restore onto a host that is up.", s.as_str())));
-            }
-            if let Some(why) = placement::loads(&app, cp, h).iter().find(|l| l.name == *t).and_then(|l| l.closed()) {
-                return Err(conflict(format!("Host {why}; restore onto a host that is open.")));
-            }
-        }
-        None => {
-            let open: Vec<String> = placement::loads(&app, cp, h).into_iter().filter(|l| l.name != name && l.closed().is_none()).map(|l| l.name).collect();
-            if open.is_empty() {
-                return Err(conflict(
-                    "No other Incus host is up and open to restore onto. Add one to INCUS_HOSTS and restart botd, or undrain one (botctl machine host undrain <name>).".into(),
-                ));
-            }
-        }
+        _ => open_targets(&app, cp, h, &name, to.as_deref())?,
     }
     if row.state != "lost" && h.configured().iter().any(|c| c.name == name) && h.probe(&name).await.is_ok() {
         if app.db.machine_host_answered(&name) {
@@ -401,6 +408,8 @@ pub async fn recover(
     };
 
     let _g = cp.ops.lock().await;
+    // Again under the lock: a target may have been drained or gone down meanwhile.
+    open_targets(&app, cp, h, &name, to.as_deref())?;
     let machines = on(&app, cp, h, &name);
     if ids.is_empty()
         && let Some(m) = machines

@@ -134,12 +134,19 @@ pub fn loads(app: &App, cp: &ControlPlane, h: &dyn Hosts) -> Vec<HostLoad> {
     out
 }
 
+const NO_ROOM: &str = "No Incus host ";
+
 /// Why no host can take a machine of `plan`.
 fn none(plan: &str, why: Vec<String>) -> String {
     match why.is_empty() {
-        true => format!("No Incus host can take a {plan} machine: none is configured."),
-        false => format!("No Incus host has room for a {plan} machine: {}.", why.join("; ")),
+        true => format!("{NO_ROOM}can take a {plan} machine: none is configured."),
+        false => format!("{NO_ROOM}has room for a {plan} machine: {}.", why.join("; ")),
     }
+}
+
+/// Whether a machine's error says it is waiting for room, so it was announced already.
+pub fn waiting(last_error: &str) -> bool {
+    last_error.starts_with(NO_ROOM)
 }
 
 /// The host a new machine of `plan` goes on, other than `except`, by INCUS_PLACEMENT;

@@ -25,7 +25,7 @@ What a host has to give is configured, as plans are:
 | Setting | Meaning | Default |
 |---|---|---|
 | `INCUS_CAPACITY` | `c<cpus>-m<memory GiB>-d<disk GiB>`, what every host's machines may be given in all. | none: no limit |
-| `INCUS_CAPACITY_<NAME>` | One host's own. | `INCUS_CAPACITY` |
+| `INCUS_CAPACITY_<NAME>` | One host's own, the first host's included (`INCUS_CAPACITY_MAIN`). | `INCUS_CAPACITY` |
 | `INCUS_MAX_MACHINES[_<NAME>]` | How many machines a host may have (1 to 100000). | none |
 | `INCUS_PLACEMENT` | `spread` (the least loaded host) or `fill` (the first in the order configured). | `spread` |
 
@@ -37,10 +37,10 @@ A host is **open** if it is up, answered its last check (not merely not yet down
 
 The same choice (`placement::choose`) is used everywhere a machine lands on a host:
 
-- **New machines.** The control plane picks the host and creates the container there (`Hosts::create_on`); the provider no longer picks. A request when no host has room is refused (409) before anything is recorded, naming each host and why: `a has 0 of 16 CPUs free, 2 needed; b is drained`. A machine the reconciler sends (a create retried after a transient failure) that finds no room stays pending with that reason, audited and alerted once, and is made as soon as there is room.
+- **New machines.** The control plane picks the host and creates the container there (`Hosts::create_on`); the provider no longer picks. A request when no host has room is refused (409) before anything is recorded, naming each host and why: `a has 0 of 16 CPUs free, 2 needed; b is drained`. A machine the reconciler sends (a create retried after a transient failure) that finds no room stays pending with that reason, audited and alerted once (the reason is kept up to date as hosts change, without announcing it again), and is made as soon as there is room. A retried create first looks for a container an earlier, unanswered create may have made on any host and adopts it, before placing it afresh: load may have moved since, and placement could otherwise pick another host and make a second copy.
 - **A restore whose own host was lost** goes where placement puts it, away from the lost host.
 - **A restore onto another host** (`--host`) is refused (409) if that host is drained, failing, or hasn't room. A restore in place needs no room: it replaces the machine where it is.
-- **A lost host's machines** (`POST /api/machines/hosts/{name}/recover`): without `to`, each is placed in turn, counting the ones placed before it, so they spread over the hosts with room rather than all going to one. With `to`, each must fit there. One with nowhere to go is skipped with the reason (its certificates are revoked all the same), and recovering again picks it up once there is room. The answer and the alert list the hosts they went to (`toHosts`); `to` is only what was asked. Refused (409) before anything changes if no other host is open.
+- **A lost host's machines** (`POST /api/machines/hosts/{name}/recover`): without `to`, each is placed in turn, counting the ones placed before it, so they spread over the hosts with room rather than all going to one. With `to`, each must fit there. One with nowhere to go is skipped with the reason (its certificates are revoked all the same), and recovering again picks it up once there is room. The answer and the alert list the hosts they went to (`toHosts`); `to` is only what was asked. Refused (409) before anything changes if no other host is open, checked again under the lock just before the host is declared lost.
 
 Placement runs under the control plane's lock (`ops`), as every create and restore does, so two machines can't take the same room.
 
@@ -59,7 +59,7 @@ Placement runs under the control plane's lock (`ops`), as every create and resto
 ### Tests
 
 - **Unit**: room and load per measure, why a host is closed, and the settings (`INCUS_CAPACITY`, `_<NAME>`, all or none, `INCUS_MAX_MACHINES`, `INCUS_PLACEMENT`).
-- **Against stand-ins** (`machines_placement_tests`, in the style of ADR 0076's): two hosts with room for two machines each. Machines spread, ties in order; a host that didn't answer its last check is skipped before it is down; a full fleet refuses the request (nothing recorded), audited and alerted; the view shows each host's load and that nothing fits. A drained host gets nothing though it has room; drain is admin-only, checked, audited once; a machine the reconciler sends waits with the reason, announced once, and is made when the host is undrained. Then three hosts of different sizes: a move onto a drained host is refused; a lost host's three machines are placed one by one onto the two hosts with room, the third skipped for want of room, and placed once room is freed. ADR 0076's tests run unchanged with `fill`, which is ADR 0076's old placement.
+- **Against stand-ins** (`machines_placement_tests`, in the style of ADR 0076's): two hosts with room for two machines each. Machines spread, ties in order; a host that didn't answer its last check is skipped before it is down; a full fleet refuses the request (nothing recorded), audited and alerted; the view shows each host's load and that nothing fits. A drained host gets nothing though it has room; drain is admin-only, checked, audited once; a machine the reconciler sends waits with the reason, announced once, and is made when the host is undrained. Then three hosts of different sizes: a move onto a drained host is refused; a lost host's three machines are placed one by one onto the two hosts with room, the third skipped for want of room, and placed once room is freed. A create whose answer was lost is adopted on the host it reached, not made again where spread would put it. ADR 0076's tests run unchanged with `fill`, which is ADR 0076's old placement.
 
 ## Consequences
 

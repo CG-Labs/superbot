@@ -121,8 +121,8 @@ impl Fleet {
 
     /// INCUS_URL and the INCUS_* settings for the first host, INCUS_HOSTS for the rest,
     /// INCUS_HOST_DOWN_MINUTES, and placement (ADR 0081): INCUS_PLACEMENT, and each
-    /// host's INCUS_CAPACITY and INCUS_MAX_MACHINES (the first host's unless
-    /// `_<NAME>` sets its own). Capacity is set for every host or for none, so the
+    /// host's INCUS_CAPACITY and INCUS_MAX_MACHINES (shared, unless `_<NAME>` sets
+    /// that host's own, the first host's included). Capacity is set for every host or for none, so the
     /// least loaded host is one measure across them all.
     pub fn from_env(store: &dyn SecretStore, var: &dyn Fn(&str) -> String) -> Result<Fleet, String> {
         let main = Some(var("INCUS_HOST_NAME").trim().to_string()).filter(|v| !v.is_empty()).unwrap_or(DEFAULT_HOST.into());
@@ -163,23 +163,23 @@ impl Fleet {
             built.push((n.clone(), s, Credentials::for_host(store, sfx.as_deref())?));
         }
         let policy = Policy::parse(&var("INCUS_PLACEMENT")).ok_or("INCUS_PLACEMENT must be spread or fill")?;
-        let own = |k: &str, n: &str, first: bool| -> (String, String) {
-            let key = if first { k.to_string() } else { format!("{k}_{}", suffix(n)) };
+        let own = |k: &str, n: &str| -> (String, String) {
+            let key = format!("{k}_{}", suffix(n));
             let v = var(&key);
             match v.trim() {
-                "" if !first => (k.to_string(), var(k)),
+                "" => (k.to_string(), var(k)),
                 _ => (key, v),
             }
         };
         let every: Vec<String> = built.iter().filter_map(|(_, s, _)| host_cidr(&s.url)).collect();
         let mut members = Vec::new();
-        for (i, (name, mut s, c)) in built.into_iter().enumerate() {
+        for (name, mut s, c) in built {
             s.deny.extend(every.iter().cloned());
             s.deny.sort();
             s.deny.dedup();
-            let (key, raw) = own("INCUS_CAPACITY", &name, i == 0);
+            let (key, raw) = own("INCUS_CAPACITY", &name);
             let cap = Some(raw.trim()).filter(|r| !r.is_empty()).map(capacity).transpose().map_err(|e| format!("{key}: {e}"))?;
-            let (key, raw) = own("INCUS_MAX_MACHINES", &name, i == 0);
+            let (key, raw) = own("INCUS_MAX_MACHINES", &name);
             let max = match raw.trim() {
                 "" => None,
                 v => Some(v.parse::<u64>().ok().filter(|n| (1..=100_000).contains(n)).ok_or(format!("{key} must be 1 to 100000"))?),
@@ -722,6 +722,10 @@ mod tests {
         assert_eq!((hosts[0].max_machines, hosts[1].max_machines, f.policy()), (Some(40), Some(40), Policy::Fill));
         assert_eq!(f.settings()["hosts"][1]["capacity"]["memoryGiB"], 32);
         assert_eq!(f.plan_resources("c2-m4-d40"), Some(Resources { cpus: 2, memory_gib: 4, disk_gib: 40 }));
+        let f = two(vec![("INCUS_CAPACITY", "c32-m128-d2000".into()), ("INCUS_CAPACITY_MAIN", "c8-m32-d500".into()), ("INCUS_MAX_MACHINES_MAIN", "5".into())]).unwrap();
+        let hosts = f.configured();
+        assert_eq!((hosts[0].capacity.map(|c| c.cpus), hosts[1].capacity.map(|c| c.cpus)), (Some(8), Some(32)), "the first host's own, too");
+        assert_eq!((hosts[0].max_machines, hosts[1].max_machines), (Some(5), None));
 
         for (extra, want) in [
             (vec![("INCUS_CAPACITY_B", "c8-m32-d500".to_string())], "set for every Incus host or none; host main"),

@@ -7,6 +7,7 @@
 
 use crate::db::NewMachine;
 use crate::machines::State;
+use crate::machines::provider::CreateSpec;
 use crate::machines::incus::fleet::{Fleet, Member, capacity};
 use crate::machines_hosts_tests::{
     DOWN_MS, Env, alerts_to, back_up, events, json_call, machine_on, mail_with, reconcile, serve_with, settled, until,
@@ -113,6 +114,15 @@ async fn new_machines_go_to_the_least_loaded_open_host_and_never_past_its_room()
     assert!(gm.last_error.as_deref().unwrap().contains("No Incus host has room"), "{:?}", gm.last_error);
     let failed: Vec<Value> = events(&env, "machine.placement_failed").await.into_iter().filter(|e| e["targetId"] == g.id.as_str()).collect();
     assert_eq!(failed.len(), 1, "{failed:?}");
+    // Its reason changes as hosts do (a stops answering), and it isn't announced again.
+    env.a.w().down = true;
+    reconcile(&env).await;
+    let gm = env.app.db.machine(&g.id).unwrap();
+    assert!(gm.last_error.as_deref().unwrap().contains("a didn't answer its last check"), "{:?}", gm.last_error);
+    let failed: Vec<Value> = events(&env, "machine.placement_failed").await.into_iter().filter(|e| e["targetId"] == g.id.as_str()).collect();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    env.a.w().down = false;
+    reconcile(&env).await;
 
     // Undrained: open again, and the waiting machine is made there.
     let (code, v) = json_call(&env, "DELETE", "/api/machines/hosts/b/drain", "").await;
@@ -196,4 +206,35 @@ async fn restores_and_a_lost_hosts_machines_are_placed_by_load() {
     assert_eq!((out["declaredLost"].as_bool(), &out["toHosts"], out["skipped"].as_array().map(Vec::len)), (Some(false), &json!(["b"]), Some(0)), "{out}");
     let r = settled(&env, out["restoring"][0]["restore"]["id"].as_str().unwrap()).await;
     assert_eq!((r.state.as_str(), r.machine_id.as_str()), ("enrolling", left.as_str()), "{:?}", r.error);
+}
+
+#[tokio::test]
+async fn a_create_whose_answer_was_lost_is_adopted_where_it_landed_not_made_again() {
+    let env = serve_with(|a, b, _| Fleet::new(vec![a, b], DOWN_MS)).await;
+    machine_on(&env, &env.a, "a", "bea@example.com", false).await;
+    let (uid, _) = user_with(env.port, &env.admin, "ada@example.com", "member").await;
+    let new = NewMachine { user_id: &uid, provider: "incus", label_prefix: "superbot", tier: "starter", plan: "c1-m2-d20", region: "local", created_by: None };
+    let mut m = env.app.db.add_machine(&new).ok().unwrap();
+    // It reached a, but botd never heard; spread alone would now pick b.
+    let spec = CreateSpec {
+        label: m.label.clone(),
+        plan: m.plan.clone(),
+        region: m.region.clone(),
+        image: crate::machines::incus::DEFAULT_IMAGE.into(),
+        tags: vec![m.tag.clone(), format!("{}-user-{}", m.tag, m.user_id)],
+        authorized_keys: vec![],
+        user_data: None,
+        firewall_id: Some("superbot-fw".into()),
+    };
+    env.cp.hosts().unwrap().create_on("a", &spec).await.unwrap();
+    m.create_sent_at = Some(crate::db::now());
+    assert!(env.app.db.save_machine(&m, State::Pending));
+    assert_eq!(hosts(&env).await["placement"].as_str(), Some("b"));
+    reconcile(&env).await;
+    let mm = env.app.db.machine(&m.id).unwrap();
+    assert_eq!(mm.provider_id.as_deref(), Some(format!("a/{}", m.label).as_str()), "{mm:?}");
+    assert!(env.b.instance(&m.label).is_none(), "no second copy on b");
+    let created = events(&env, "machine.created").await;
+    let mine = created.iter().find(|e| e["targetId"] == m.id.as_str()).unwrap();
+    assert_eq!(mine["details"]["adopted"].as_bool(), Some(true), "{created:?}");
 }
