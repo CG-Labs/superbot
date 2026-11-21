@@ -221,4 +221,18 @@ mod tests {
         let e = bad.put("x", Vec::new()).await.unwrap_err();
         assert!(e.contains("SignatureDoesNotMatch") && !e.contains("wrong-secret"), "{e}");
     }
+
+    #[tokio::test]
+    async fn a_failed_completion_drops_the_parts() {
+        let s = StandIn::start().await;
+        let mut c = S3::new(s.settings()).unwrap();
+        c.part_size = 4;
+        let mut up = c.upload("p/x").await.unwrap();
+        up.write(b"hello world").await.unwrap();
+        s.w().fail = Some(("POST".into(), 500));
+        assert!(up.finish().await.is_err());
+        let w = s.w();
+        assert!(w.uploads.is_empty() && w.objects.is_empty());
+        assert!(w.calls.last().unwrap().starts_with("DELETE /backups/p/x?uploadId="), "{:?}", w.calls);
+    }
 }

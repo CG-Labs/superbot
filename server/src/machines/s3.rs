@@ -366,8 +366,18 @@ impl Upload<'_> {
         Ok(())
     }
 
-    /// Ends the upload: the object's size and SHA-256.
+    /// Ends the upload: the object's size and SHA-256. If that fails, the parts go.
     pub async fn finish(mut self) -> Result<(u64, String), String> {
+        match self.complete().await {
+            Ok(()) => Ok((self.size, hex(self.hash.finish().as_ref()))),
+            Err(e) => {
+                self.abort().await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn complete(&mut self) -> Result<(), String> {
         if !self.buf.is_empty() || self.parts.is_empty() {
             self.part().await?;
         }
@@ -383,7 +393,7 @@ impl Upload<'_> {
         if body.contains("<Error>") {
             return Err(refusal(reqwest::StatusCode::OK, &body));
         }
-        Ok((self.size, hex(self.hash.finish().as_ref())))
+        Ok(())
     }
 
     /// Drops the parts written so far.
