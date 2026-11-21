@@ -3,6 +3,7 @@
 
 use super::{describe, new_uuid, str_of, Adapter, AgentEvent, ModelOption, RunInput, Usage};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 #[derive(Default)]
 pub struct Claude {
@@ -10,6 +11,8 @@ pub struct Claude {
     saw_turn: bool,
     /// The model `system/init` named.
     model: Option<String>,
+    /// Tool calls not finished yet: id to tool name, as results name only the id.
+    calls: HashMap<String, String>,
 }
 
 /// Claude Code's sandbox for Bash (ADR 0055): writes to the working folder, the temp
@@ -82,8 +85,22 @@ impl Adapter for Claude {
                 for c in e["message"]["content"].as_array().into_iter().flatten() {
                     match str_of(c, "type") {
                         "text" if !str_of(c, "text").trim().is_empty() => out.push(AgentEvent::Text(str_of(c, "text").into())),
-                        "tool_use" => out.push(AgentEvent::Tool { name: str_of(c, "name").into(), detail: describe(&c["input"]) }),
+                        "tool_use" => {
+                            self.calls.insert(str_of(c, "id").into(), str_of(c, "name").into());
+                            out.push(AgentEvent::Tool { name: str_of(c, "name").into(), detail: describe(&c["input"]) })
+                        }
                         _ => {}
+                    }
+                }
+            }
+            // Results come back as the user's turn; a call refused before the hook, by
+            // the hook, or failing has `is_error`.
+            "user" => {
+                for c in e["message"]["content"].as_array().into_iter().flatten().filter(|c| str_of(c, "type") == "tool_result") {
+                    if let Some(name) = self.calls.remove(str_of(c, "tool_use_id"))
+                        && c["is_error"].as_bool() != Some(true)
+                    {
+                        out.push(AgentEvent::ToolRan { name });
                     }
                 }
             }
@@ -105,6 +122,12 @@ impl Adapter for Claude {
     /// Update it when Anthropic ships new models.
     fn shell_tool(&self) -> &'static str {
         "Bash"
+    }
+
+    /// The `*` matcher runs the hook for every tool once Claude Code has checked the
+    /// call's arguments.
+    fn hooks_tool(&self, _tool: &str) -> bool {
+        true
     }
 
     fn has_sandbox(&self) -> bool {
@@ -204,5 +227,25 @@ mod tests {
         assert_eq!(one, [Usage { model: Some("claude-sonnet-5-5".into()), input: 7, output: 2, cache_read: 1, cache_write: 0 }]);
         // Nothing reported: no usage, so the run is unknown.
         assert!(usage_of(&[r#"{"type":"result","is_error":false,"result":"ok"}"#]).is_empty());
+    }
+
+    #[test]
+    fn finished_calls_are_reported_by_name() {
+        // As Claude Code 2.1 streams them: a read that ran, an edit refused before the hook.
+        let lines = [
+            r#"{"type":"assistant","message":{"content":[{"id":"toolu_1","input":{"file_path":"/w/x.txt"},"name":"Read","type":"tool_use"}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":[{"type":"text","text":"hi"}]}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"id":"toolu_2","input":{"file_path":"/w/y.txt"},"name":"Edit","type":"tool_use"}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"<tool_use_error>File does not exist.</tool_use_error>","is_error":true,"tool_use_id":"toolu_2"}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"again","tool_use_id":"toolu_1"}]}}"#,
+        ];
+        let mut c = Claude::default();
+        let mut out = Vec::new();
+        for l in lines {
+            c.on_event(&serde_json::from_str(l).unwrap(), &mut out);
+        }
+        let ran: Vec<&str> = out.iter().filter_map(|e| if let AgentEvent::ToolRan { name } = e { Some(name.as_str()) } else { None }).collect();
+        assert_eq!(ran, ["Read"], "once per call, never for an error");
+        assert!(c.calls.is_empty());
     }
 }

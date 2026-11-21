@@ -29,6 +29,9 @@ pub enum AgentEvent {
     Text(String),
     /// The agent started using a tool.
     Tool { name: String, detail: String },
+    /// A tool call finished without an error, so the harness really ran it. A call the
+    /// harness rejects before its hook (bad arguments, an unknown name) ends in an error.
+    ToolRan { name: String },
     Error(String),
     /// Model tokens the harness says it used (ADR 0050). A run may report several, one
     /// per model or turn; the runner adds them up. A harness that says nothing: unknown.
@@ -157,7 +160,7 @@ pub fn local_host() -> job::Host {
     job::Host { clear_env: false, remove: secret_env(), env: BTreeMap::new(), user: None }
 }
 
-pub trait Adapter: Send {
+pub trait Adapter: Send + Sync {
     fn bin(&self) -> &'static str;
     /// Command-line arguments. May emit events up front (e.g. a session id it chose).
     fn args(&mut self, input: &RunInput, out: &mut Vec<AgentEvent>) -> Vec<String>;
@@ -191,9 +194,14 @@ pub trait Adapter: Send {
     fn cleanup_failed(&self, _input: &RunInput, why: &str) -> String {
         why.to_string()
     }
-    /// The tool name its events use for shell commands. Ask mode stops a run that uses it
-    /// without calling the hook, since that harness isn't enforcing approvals.
+    /// The tool name its events use for shell commands.
     fn shell_tool(&self) -> &'static str;
+    /// Whether every call of `tool` (as its events name it) that runs went through the
+    /// hook first, as tested against the real CLI (ADR 0063). Ask mode stops a run that
+    /// runs one without calling the hook (`arms_canary`).
+    fn hooks_tool(&self, tool: &str) -> bool {
+        tool.eq_ignore_ascii_case(self.shell_tool())
+    }
     /// Whether the harness has a sandbox of its own that `RunInput::sandbox` turns on.
     fn has_sandbox(&self) -> bool {
         false
@@ -277,6 +285,19 @@ pub fn output(bin: &str, args: &[&str]) -> String {
 
 /// To add a harness: write one adapter file and list it here.
 pub const NAMES: [&str; 4] = ["claude", "codex", "pi", "hermes"];
+
+/// Whether `e` shows the harness running a call its hook must have seen first: a shell
+/// call starting, or a call of a hooked tool finishing without an error. A guarded run
+/// that shows one and never calls the hook isn't enforcing approvals (ADR 0007, 0063).
+/// Only calls that ran count: a harness checks a call's arguments before its hook, so
+/// a call it rejects (an edit of a file not read yet) never reaches the hook.
+pub fn arms_canary(a: &dyn Adapter, e: &AgentEvent) -> bool {
+    match e {
+        AgentEvent::Tool { name, .. } => name.eq_ignore_ascii_case(a.shell_tool()),
+        AgentEvent::ToolRan { name } => a.hooks_tool(name),
+        _ => false,
+    }
+}
 
 pub fn get(name: &str) -> Option<Box<dyn Adapter>> {
     match name {
@@ -628,6 +649,25 @@ mod tests {
     fn only_harnesses_with_a_sandbox_say_so() {
         for (name, has) in [("claude", true), ("codex", true), ("pi", false), ("hermes", false)] {
             assert_eq!(get(name).unwrap().has_sandbox(), has, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_canary_arms_on_shell_calls_and_on_hooked_calls_that_ran() {
+        let start = |n: &str| AgentEvent::Tool { name: n.into(), detail: String::new() };
+        let ran = |n: &str| AgentEvent::ToolRan { name: n.into() };
+        for (harness, shell, other) in [("claude", "Bash", "Write"), ("codex", "shell", "file_change"), ("pi", "bash", "write"), ("hermes", "terminal", "write_file")] {
+            let a = get(harness).unwrap();
+            assert!(arms_canary(&*a, &start(shell)) && arms_canary(&*a, &ran(shell)), "{harness}");
+            // A call may be refused before the hook, so only one that ran counts.
+            assert!(!arms_canary(&*a, &start(other)), "{harness}");
+            assert!(arms_canary(&*a, &ran(other)), "{harness}");
+            assert!(!arms_canary(&*a, &AgentEvent::Text("hi".into())), "{harness}");
+        }
+        let codex = get("codex").unwrap();
+        assert!(arms_canary(&*codex, &ran("mcp_tool_call")));
+        for hosted_or_untested in ["web_search", "todo_list", "collab_tool_call"] {
+            assert!(!arms_canary(&*codex, &ran(hosted_or_untested)), "{hosted_or_untested}");
         }
     }
 

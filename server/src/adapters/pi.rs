@@ -81,6 +81,8 @@ impl Adapter for Pi {
             "tool_execution_start" => {
                 out.push(AgentEvent::Tool { name: str_of(e, "toolName").into(), detail: describe(&e["args"]) })
             }
+            // Bad arguments and blocked calls end with `isError` too.
+            "tool_execution_end" if e["isError"].as_bool() == Some(false) => out.push(AgentEvent::ToolRan { name: str_of(e, "toolName").into() }),
             _ => {}
         }
     }
@@ -89,6 +91,11 @@ impl Adapter for Pi {
     /// provider, model, context, max-out, thinking (yes/no), images.
     fn shell_tool(&self) -> &'static str {
         "bash"
+    }
+
+    /// The extension's `tool_call` handler runs before every tool.
+    fn hooks_tool(&self, _tool: &str) -> bool {
+        true
     }
 
     fn models(&self) -> Vec<ModelOption> {
@@ -121,5 +128,22 @@ mod tests {
         out.clear();
         Pi.on_event(&serde_json::from_str(r#"{"type":"message_end","message":{"role":"user","usage":{"input":5}}}"#).unwrap(), &mut out);
         assert!(out.is_empty(), "only the model's own messages");
+    }
+
+    #[test]
+    fn finished_calls_are_reported_by_name() {
+        // As pi 1.5 prints them: a read that ran, one that failed, one with bad arguments.
+        let lines = [
+            r#"{"type":"tool_execution_start","toolCallId":"c1","toolName":"read","args":{"path":"/w/x.txt"}}"#,
+            r#"{"type":"tool_execution_end","toolCallId":"c1","toolName":"read","result":{"content":[{"type":"text","text":"yo"}]},"isError":false,"durationMs":3}"#,
+            r#"{"type":"tool_execution_end","toolCallId":"c2","toolName":"read","result":{"content":[{"type":"text","text":"ENOENT"}]},"isError":true,"durationMs":1}"#,
+            r#"{"type":"tool_execution_end","toolCallId":"c3","toolName":"write","result":{"content":[{"type":"text","text":"Validation failed"}]},"isError":true}"#,
+        ];
+        let mut out = Vec::new();
+        for l in lines {
+            Pi.on_event(&serde_json::from_str(l).unwrap(), &mut out);
+        }
+        let ran: Vec<&str> = out.iter().filter_map(|e| if let AgentEvent::ToolRan { name } = e { Some(name.as_str()) } else { None }).collect();
+        assert_eq!(ran, ["read"]);
     }
 }
