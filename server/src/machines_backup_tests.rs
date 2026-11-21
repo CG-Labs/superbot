@@ -387,8 +387,10 @@ fn backups_are_off_unless_configured_and_need_a_provider_that_exports() {
 fn alerts_to(env: &Env, mail: &crate::notify::smtp::fake::Server) {
     let smtp = crate::notify::smtp::Smtp::for_test("127.0.0.1", mail.port, crate::notify::smtp::Tls::None, None, None);
     let _ = env.app.notifier.set(Arc::new(crate::notify::Notifier::new(Some(smtp), Some("https://bots.example.com".into()))));
-    let mut s = crate::notify::Settings::default();
-    s.email = crate::notify::EmailSettings { enabled: true, to: vec!["ops@example.com".into()], deciders: true };
+    let s = crate::notify::Settings {
+        email: crate::notify::EmailSettings { enabled: true, to: vec!["ops@example.com".into()], deciders: true },
+        ..Default::default()
+    };
     crate::notify::save(&env.app.db, &s);
 }
 
