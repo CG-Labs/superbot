@@ -360,6 +360,8 @@ async fn settle(app: &AppState, p: &dyn MachineProvider, m: &Machine) -> Result<
             "auto": true, "settled": true, "providerId": pid,
         });
         app.db.record(&event(&system(&after), "machine.resized", &after, extra));
+        // The request for that size is done; a newer one, for another size, stays open.
+        app.db.machine_resize_move(&m.id, &sent, &OPEN, "done", None, None, false, None);
     }
     app.db.machine_resize_unsent(&m.id, Some(&sent));
     Ok(())

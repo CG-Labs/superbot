@@ -268,6 +268,9 @@ async fn a_failing_provider_is_tried_again_and_a_lost_answer_isnt_resized_twice(
     assert_eq!((w.fake.calls("resize"), w.plan()), (2, "g6-standard-2".to_string()));
     let d = &w.audit("machine.resized").await[0]["details"];
     assert_eq!(d["providerCall"], false, "{d}");
+    let s = w.status().await;
+    assert_eq!((s["resize"]["state"].as_str(), s["resize"]["reason"].as_str()), (Some("done"), None), "done, not cancelled: {s}");
+    assert!(w.audit("machine.resize_cancelled").await.is_empty());
 
     // A failure that won't pass fails it at once, audited; a new tier change asks again.
     w.set_tier("small").await;
