@@ -4,6 +4,8 @@
 
 Accepted (21 Nov 2026). Meets the first condition [ADR 0070](0070-hermes-per-bot-footprint.md) set on Hermes Agent becoming the managed default: share one dependency environment across a machine's Bots. Part of [#33](https://github.com/CG-Labs/superbot/issues/33) (M3), item 2 of the [ADR 0011 checklist](0011-hermes-agent-backend.md#recommendation).
 
+Since [ADR 0076](0076-two-providers-through-tier-routing.md), `deploy/hermes-share.sh` also adds Hermes's `anthropic` extra to the shared environment, since Bots can't install it. Its wrapper also gives a Bot with no `config.yaml` an empty one, since Hermes reads the fallback chain only from a data root that has one.
+
 ## Context
 
 Each Bot runs Hermes with its own `HERMES_HOME` (the Bot's state folder, [ADR 0015](0015-hermes-adapter.md)), and that is how one Bot's config, memory, sessions and logins stay apart from another's. Hermes keeps its Python dependency environment per data root, in `<HERMES_HOME>/installs/<key>/environments/` (`<key>` is the start of the SHA-256 of the checkout's real path). So every new Bot's first run built a 470 MiB environment of its own: [ADR 0070](0070-hermes-per-bot-footprint.md) measured 487 MiB of disk and about 20 CPU-seconds per new Bot, and 90 CPU-seconds when four new Bots start at once.
