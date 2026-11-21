@@ -121,6 +121,10 @@ pub fn folders(app: &App, user_id: &str) -> Folders {
 /// Adds up file sizes, never following a link (a link counts as itself), and counts each
 /// file once across every walk, even when roots overlap or files are hard links. Folders
 /// that can't be read, and anything past `max` entries, are left out: the total is partial.
+///
+/// Bots can change these folders while they're walked, so each folder is opened from its
+/// already-open parent, one name at a time, refusing links: one swapped for a link after
+/// it was listed can't lead the walk (with botd's wider access) outside.
 struct Walker {
     inodes: std::collections::HashSet<(u64, u64)>,
     seen: u64,
@@ -128,47 +132,130 @@ struct Walker {
     partial: bool,
 }
 
+/// An open folder, and the names in it with what `lstat` says about each.
+struct Dir(std::os::fd::OwnedFd);
+
+impl Dir {
+    const FLAGS: libc::c_int = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+    fn open(path: &std::path::Path) -> std::io::Result<Dir> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(path)?;
+        Ok(Dir(f.into()))
+    }
+
+    /// The folder `name` in this one; an error if it's anything else now, a link included.
+    fn child(&self, name: &std::ffi::CStr) -> std::io::Result<Dir> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        // SAFETY: `self.0` is an open folder and `name` a NUL-terminated name.
+        let fd = unsafe { libc::openat(self.0.as_raw_fd(), name.as_ptr(), Self::FLAGS) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a new descriptor that nothing else owns.
+        Ok(Dir(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    /// Each name here (not `.` or `..`) with its `lstat`, or None where that failed.
+    fn entries(&self) -> std::io::Result<Vec<(std::ffi::CString, Option<libc::stat>)>> {
+        use std::os::fd::{AsRawFd, IntoRawFd};
+        let dup = self.0.try_clone()?.into_raw_fd();
+        // SAFETY: `dup` is an open folder that the stream now owns and closes.
+        let stream = unsafe { libc::fdopendir(dup) };
+        if stream.is_null() {
+            let e = std::io::Error::last_os_error();
+            // SAFETY: fdopendir failed, so `dup` is still ours to close.
+            unsafe { libc::close(dup) };
+            return Err(e);
+        }
+        let mut out = Vec::new();
+        loop {
+            // SAFETY: `stream` is open; the entry is read before the next call.
+            let e = unsafe { libc::readdir(stream) };
+            if e.is_null() {
+                break;
+            }
+            // SAFETY: `d_name` is NUL-terminated within the entry.
+            let name = unsafe { std::ffi::CStr::from_ptr((*e).d_name.as_ptr()) };
+            if name == c"." || name == c".." {
+                continue;
+            }
+            // SAFETY: an all-zero stat is valid; fstatat fills it in.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: as above; AT_SYMLINK_NOFOLLOW describes a link, not its target.
+            let ok = unsafe { libc::fstatat(self.0.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } == 0;
+            out.push((name.to_owned(), ok.then_some(st)));
+        }
+        // SAFETY: `stream` is open and closed once.
+        unsafe { libc::closedir(stream) };
+        Ok(out)
+    }
+}
+
 impl Walker {
     fn new(max: u64) -> Walker {
         Walker { inodes: Default::default(), seen: 0, max, partial: false }
     }
 
-    fn size(&mut self, m: &std::fs::Metadata) -> u64 {
-        use std::os::unix::fs::MetadataExt;
-        if self.inodes.insert((m.dev(), m.ino())) { m.len() } else { 0 }
+    fn size(&mut self, dev: u64, ino: u64, len: u64) -> u64 {
+        if self.inodes.insert((dev, ino)) { len } else { 0 }
     }
 
     fn add(&mut self, roots: &[PathBuf]) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        use std::rc::Rc;
         let mut total = 0u64;
-        let mut stack: Vec<PathBuf> = Vec::new();
+        // Folders still to list. Each queued name is opened from its parent, which stays
+        // open until its last child is: as many open folders as the walk is deep.
+        let mut stack: Vec<Rc<Dir>> = Vec::new();
+        let mut queued: Vec<(Rc<Dir>, std::ffi::CString)> = Vec::new();
         for r in roots {
             match std::fs::symlink_metadata(r) {
-                Ok(m) if m.is_dir() => stack.push(r.clone()),
-                Ok(m) => total = total.saturating_add(self.size(&m)),
+                Ok(m) if m.is_dir() => match Dir::open(r) {
+                    Ok(d) => stack.push(Rc::new(d)),
+                    Err(_) => self.partial = true,
+                },
+                Ok(m) => total = total.saturating_add(self.size(m.dev(), m.ino(), m.len())),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => self.partial = true,
             }
         }
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
+        loop {
+            let dir = match stack.pop() {
+                Some(d) => d,
+                None => match queued.pop() {
+                    Some((parent, name)) => match parent.child(&name) {
+                        Ok(d) => Rc::new(d),
+                        // Gone, or now a file or a link: not a folder to walk any more.
+                        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP)) => continue,
+                        Err(_) => {
+                            self.partial = true;
+                            continue;
+                        }
+                    },
+                    None => break,
+                },
+            };
+            let Ok(entries) = dir.entries() else {
                 self.partial = true;
                 continue;
             };
-            for entry in entries {
+            for (name, st) in entries {
                 self.seen += 1;
                 if self.seen > self.max {
                     self.partial = true;
                     return total;
                 }
-                // DirEntry::metadata doesn't follow links.
-                let Ok(m) = entry.and_then(|e| e.metadata().map(|m| (e.path(), m))) else {
+                let Some(st) = st else {
                     self.partial = true;
                     continue;
                 };
-                if m.1.is_dir() {
-                    stack.push(m.0);
+                if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                    queued.push((dir.clone(), name));
                 } else {
-                    total = total.saturating_add(self.size(&m.1));
+                    #[allow(clippy::unnecessary_cast)]
+                    let (dev, ino, len) = (st.st_dev as u64, st.st_ino as u64, st.st_size.max(0) as u64);
+                    total = total.saturating_add(self.size(dev, ino, len));
                 }
             }
         }
@@ -196,6 +283,10 @@ pub fn measure(f: &Folders) -> Measured {
 #[derive(Default)]
 pub struct Cache {
     measured: Mutex<HashMap<String, (Instant, Measured)>>,
+    /// Bumped by `forget`: a walk that started before it doesn't put its result back.
+    generation: Mutex<HashMap<String, u64>>,
+    /// One walk per user at a time; callers who wait get its result.
+    walking: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     warned: Mutex<HashMap<String, String>>,
 }
 
@@ -205,8 +296,20 @@ impl Cache {
         m.get(user_id).filter(|(at, _)| at.elapsed() <= max_age).map(|(_, v)| v.clone())
     }
 
-    fn put(&self, user_id: &str, v: Measured) {
-        self.measured.lock().unwrap_or_else(|e| e.into_inner()).insert(user_id.to_string(), (Instant::now(), v));
+    fn generation(&self, user_id: &str) -> u64 {
+        self.generation.lock().unwrap_or_else(|e| e.into_inner()).get(user_id).copied().unwrap_or(0)
+    }
+
+    /// Keeps `v` unless the user was forgotten since generation `g`, when its walk began.
+    fn put(&self, user_id: &str, g: u64, v: Measured) {
+        let gens = self.generation.lock().unwrap_or_else(|e| e.into_inner());
+        if gens.get(user_id).copied().unwrap_or(0) == g {
+            self.measured.lock().unwrap_or_else(|e| e.into_inner()).insert(user_id.to_string(), (Instant::now(), v));
+        }
+    }
+
+    fn walk_lock(&self, user_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        self.walking.lock().unwrap_or_else(|e| e.into_inner()).entry(user_id.to_string()).or_default().clone()
     }
 
     /// The last measurement, however old.
@@ -216,28 +319,42 @@ impl Cache {
 
     /// Drops a user's measurement, so the next check measures again (after a run).
     pub fn forget(&self, user_id: &str) {
+        let mut gens = self.generation.lock().unwrap_or_else(|e| e.into_inner());
+        *gens.entry(user_id.to_string()).or_default() += 1;
         self.measured.lock().unwrap_or_else(|e| e.into_inner()).remove(user_id);
     }
 
-    /// True the first time it's asked for this user on `day`.
-    pub fn first_warning(&self, user_id: &str, day: &str) -> bool {
+    /// True the first time it's asked for this user on the UTC day of `now` (ms). The
+    /// audit log remembers across restarts: a warning recorded today counts.
+    pub fn first_warning(&self, db: &crate::db::Db, user_id: &str, now: i64) -> bool {
+        let day = crate::tiers::day(now);
         let mut w = self.warned.lock().unwrap_or_else(|e| e.into_inner());
-        if w.get(user_id).is_some_and(|d| d == day) {
+        if w.get(user_id).is_some_and(|d| *d == day) {
             return false;
         }
-        w.insert(user_id.to_string(), day.to_string());
-        true
+        w.insert(user_id.to_string(), day);
+        !db.audited_since(WARNING_ACTION, "user", user_id, now - now.rem_euclid(86_400_000))
     }
 }
+
+/// What a warning is audited as.
+pub const WARNING_ACTION: &str = "usage.storage_warning";
 
 /// A user's storage, measured within `max_age`. The walk runs off the async threads.
 pub async fn current(app: &std::sync::Arc<App>, user_id: &str, max_age: Duration) -> Measured {
     if let Some(m) = app.storage.get(user_id, max_age) {
         return m;
     }
+    let lock = app.storage.walk_lock(user_id);
+    let _walking = lock.lock().await;
+    // Whoever held it may just have measured.
+    if let Some(m) = app.storage.get(user_id, max_age) {
+        return m;
+    }
+    let g = app.storage.generation(user_id);
     let f = folders(app, user_id);
     let m = tokio::task::spawn_blocking(move || measure(&f)).await.unwrap_or_else(|_| Measured { partial: true, at: crate::db::now(), ..Default::default() });
-    app.storage.put(user_id, m.clone());
+    app.storage.put(user_id, g, m.clone());
     m
 }
 
@@ -388,10 +505,31 @@ mod tests {
         assert_eq!(full, "Storage is full: 5.2 GB used of the Starter plan's 5 GB, so I didn't run. Delete files from the workspace, or move to a bigger plan, then ask again.");
         let warn = warning_text("Starter", 4_600_000_000, 5_000_000_000);
         assert!(warn.starts_with("Storage is 92% full: 4.6 GB used of the Starter plan's 5 GB."), "{warn}");
+    }
+
+    #[test]
+    fn a_walk_from_before_a_forget_isnt_kept() {
         let cache = Cache::default();
-        assert!(cache.first_warning("u1", "2026-11-21"));
-        assert!(!cache.first_warning("u1", "2026-11-21"));
-        assert!(cache.first_warning("u2", "2026-11-21"));
-        assert!(cache.first_warning("u1", "2026-11-22"));
+        let g = cache.generation("u1");
+        cache.forget("u1");
+        cache.put("u1", g, Measured { files: 5, ..Default::default() });
+        assert!(cache.last("u1").is_none());
+        cache.put("u1", cache.generation("u1"), Measured { files: 7, ..Default::default() });
+        assert_eq!(cache.last("u1").map(|m| m.files), Some(7));
+    }
+
+    #[test]
+    fn a_folder_swapped_for_a_link_isnt_opened() {
+        let root = crate::db::temp_path("storage-swap");
+        std::fs::create_dir_all(root.join("mine/sub")).unwrap();
+        std::fs::create_dir_all(root.join("theirs")).unwrap();
+        let dir = Dir::open(&root.join("mine")).unwrap();
+        assert!(dir.child(c"sub").is_ok());
+        // Listed as a folder, then swapped for a link before it's opened.
+        std::fs::remove_dir(root.join("mine/sub")).unwrap();
+        std::os::unix::fs::symlink(root.join("theirs"), root.join("mine/sub")).unwrap();
+        assert!(matches!(dir.child(c"sub").err().and_then(|e| e.raw_os_error()), Some(libc::ENOTDIR | libc::ELOOP)));
+        // A root that's a link isn't walked either.
+        assert!(Dir::open(&root.join("mine/sub")).is_err());
     }
 }
