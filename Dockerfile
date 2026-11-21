@@ -45,8 +45,9 @@ ARG HARNESSES="claude codex pi"
 ARG CLAUDE_CODE_VERSION=latest
 ARG CODEX_VERSION=latest
 ARG PI_VERSION=latest
-# Hermes Agent release the image installs: the commit of tag v0.23.2 (NousResearch/hermes-agent).
-ARG HERMES_COMMIT=ae2a81ccc00e9b7c06301523e5bb09608397149c
+# Hermes Agent release the image installs: the commit of tag v0.23.3 (NousResearch/hermes-agent),
+# as server/src/adapters/install.rs pins it. Change it with deploy/hermes-pin.sh bump.
+ARG HERMES_COMMIT=caafe5389ae585ef77387a962aee05b1bcf17029
 ARG SUPERBOT_UID=10001
 
 RUN apt-get update \

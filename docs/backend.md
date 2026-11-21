@@ -49,7 +49,7 @@ The server is still the computer, so treat it that way. Details and trade-offs: 
 
 ### Hermes Agent
 
-[Hermes Agent](https://github.com/NousResearch/hermes-agent) (Nous Research, MIT), tested on v0.23.2. Design: [ADR 0011](adr/0011-hermes-agent-backend.md) option (a), details in [ADR 0015](adr/0015-hermes-adapter.md).
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) (Nous Research, MIT), tested on v0.23.3. Upgrades: stable releases only, through the test suite with `deploy/hermes-pin.sh` ([ADR 0075](adr/0075-hermes-upgrades.md)). Design: [ADR 0011](adr/0011-hermes-agent-backend.md) option (a), details in [ADR 0015](adr/0015-hermes-adapter.md).
 
 - **Install**: `deploy/install.sh --with-hermes`, or `hermes` in `SUPERBOT_HARNESSES` for Docker ([deploy/README.md](../deploy/README.md)). Both pin a commit. Then pick Hermes Agent for a Bot in its settings, or set `DEFAULT_HARNESS=hermes`.
 - **Provider and key**: save the key encrypted, e.g. `botctl secret set OPENROUTER_API_KEY < key.txt`. Saved secrets reach Hermes as env vars; Hermes hides its provider keys from the agent's shell. `SUPERBOT_HERMES_PROVIDER` and `SUPERBOT_HERMES_BASE_URL` in `.env` become `--provider` and `--base-url`; empty means Hermes's own config. The model is free text (Hermes can't list models without a prompt): the apps show a text field, and the web UI an "Other model…" choice. Effort maps to `--reasoning` (`none` to `ultra`).

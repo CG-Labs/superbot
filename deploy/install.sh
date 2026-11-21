@@ -21,8 +21,9 @@ WITH_HERMES=false
 LICENSE_FILE=""
 # --testing-mode: run unlicensed with billing off (TESTING_MODE=on; docs/adr/0068-no-free-tier.md).
 TESTING_MODE_ON=false
-# Hermes Agent release --with-hermes installs: the commit of tag v0.23.2 (NousResearch/hermes-agent).
-HERMES_COMMIT=${HERMES_COMMIT:-ae2a81ccc00e9b7c06301523e5bb09608397149c}
+# Hermes Agent release --with-hermes installs: the commit of tag v0.23.3 (NousResearch/hermes-agent),
+# as server/src/adapters/install.rs pins it. Change it with deploy/hermes-pin.sh bump.
+HERMES_COMMIT=${HERMES_COMMIT:-caafe5389ae585ef77387a962aee05b1bcf17029}
 SHARE_DIR=${SHARE_DIR:-/usr/local/share/superbot}
 SYSTEMD_DIR=${SYSTEMD_DIR:-/etc/systemd/system}
 CLIENT_DIR=${CLIENT_DIR:-/var/www/superbot-app}
