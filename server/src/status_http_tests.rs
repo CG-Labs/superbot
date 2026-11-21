@@ -198,6 +198,37 @@ async fn secrets_and_control_characters_never_reach_the_page() {
     assert!(s.contains("Oopstitle"), "{s}");
 }
 
+/// The burn-rate rules in deploy/ name only metrics botd exports, so a renamed metric
+/// can't silently leave an alert that never fires.
+#[tokio::test]
+async fn the_slo_rules_use_only_metrics_botd_exports() {
+    let (_, app, _, _) = serve_app().await;
+    let rendered = obs::render(&app);
+    let rules = include_str!("../../deploy/prometheus/superbot-slo.rules.yml");
+    let mut names: Vec<&str> = Vec::new();
+    for (i, _) in rules.match_indices("superbot_") {
+        let rest = &rules[i..];
+        let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(rest.len());
+        let name = &rest[..end];
+        let before = rules[..i].chars().next_back();
+        if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':' || c == '/') {
+            continue;
+        }
+        names.push(name);
+    }
+    assert!(names.contains(&"superbot_http_requests_total") && names.contains(&"superbot_runs_total"), "{names:?}");
+    for n in names {
+        let family = n.trim_end_matches("_bucket").trim_end_matches("_sum").trim_end_matches("_count");
+        assert!(rendered.contains(&format!("# TYPE {family} ")), "{n} isn't a metric botd exports");
+    }
+    for label in ["status_class=\"5xx\"", "route_class!~\"healthz|status\"", "result=~\"error|timeout\""] {
+        assert!(rules.contains(label), "{label}");
+    }
+    for class in ["healthz", "status"] {
+        assert_eq!(obs::route_class(if class == "status" { "/status.json" } else { "/healthz" }), class);
+    }
+}
+
 #[tokio::test]
 async fn status_page_off_answers_404() {
     let (port, app, owner, _) = serve_app().await;

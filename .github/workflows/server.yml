@@ -110,6 +110,23 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
       - run: shellcheck -S warning deploy/*.sh deploy/docker/*.sh
 
+  # ADR 0090: the SLO burn-rate rules parse, and fire (and stay quiet) when they should.
+  prometheus-rules:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      PROMETHEUS_VERSION: 3.5.0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install promtool
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/prom.tgz "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz"
+          tar -xzf /tmp/prom.tgz -C /tmp
+          sudo install "/tmp/prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
+      - run: promtool check rules deploy/prometheus/superbot-slo.rules.yml
+      - run: promtool test rules deploy/prometheus/superbot-slo.rules.test.yml
+
   backup-scripts:
     runs-on: ubuntu-latest
     steps:

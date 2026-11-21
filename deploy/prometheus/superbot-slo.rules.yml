@@ -1,0 +1,136 @@
+# SLO burn-rate alerts for botd (docs/slo.md, docs/adr/0090-status-page-and-uptime-slo.md),
+# from the metrics in docs/adr/0089-metrics-and-structured-logs.md.
+#
+# Load it from prometheus.yml:
+#   rule_files: ["/etc/prometheus/superbot-slo.rules.yml"]
+# Check it with: promtool check rules superbot-slo.rules.yml
+#                promtool test rules superbot-slo.rules.test.yml
+#
+# It assumes the scrape job is named "superbot" (as in deploy/README.md) and, for the
+# outside-in probe, a blackbox exporter job named "superbot-status" fetching
+# https://<your-domain>/status.json. Rename them here if yours differ.
+#
+# The target is the strictest tier this server sells: 99.9% (Pro and Max). A server
+# selling only Starter may set 0.995; one selling Enterprise at 99.95%, 0.9995.
+
+groups:
+  - name: superbot-slo-recording
+    interval: 30s
+    rules:
+      - record: superbot:slo_availability:target
+        expr: vector(0.999)
+
+      # The share of requests botd answered with a 5xx. Health checks and the status
+      # page are probes, not users, so they don't dilute it.
+      - record: superbot:http_request_errors:ratio_rate5m
+        expr: |
+          sum by (job) (rate(superbot_http_requests_total{status_class="5xx",route_class!~"healthz|status"}[5m]))
+          / sum by (job) (rate(superbot_http_requests_total{route_class!~"healthz|status"}[5m]))
+      - record: superbot:http_request_errors:ratio_rate30m
+        expr: |
+          sum by (job) (rate(superbot_http_requests_total{status_class="5xx",route_class!~"healthz|status"}[30m]))
+          / sum by (job) (rate(superbot_http_requests_total{route_class!~"healthz|status"}[30m]))
+      - record: superbot:http_request_errors:ratio_rate1h
+        expr: |
+          sum by (job) (rate(superbot_http_requests_total{status_class="5xx",route_class!~"healthz|status"}[1h]))
+          / sum by (job) (rate(superbot_http_requests_total{route_class!~"healthz|status"}[1h]))
+      - record: superbot:http_request_errors:ratio_rate2h
+        expr: |
+          sum by (job) (rate(superbot_http_requests_total{status_class="5xx",route_class!~"healthz|status"}[2h]))
+          / sum by (job) (rate(superbot_http_requests_total{route_class!~"healthz|status"}[2h]))
+      - record: superbot:http_request_errors:ratio_rate6h
+        expr: |
+          sum by (job) (rate(superbot_http_requests_total{status_class="5xx",route_class!~"healthz|status"}[6h]))
+          / sum by (job) (rate(superbot_http_requests_total{route_class!~"healthz|status"}[6h]))
+      - record: superbot:http_request_errors:ratio_rate1d
+        expr: |
+          sum by (job) (rate(superbot_http_requests_total{status_class="5xx",route_class!~"healthz|status"}[1d]))
+          / sum by (job) (rate(superbot_http_requests_total{route_class!~"healthz|status"}[1d]))
+      - record: superbot:http_request_errors:ratio_rate3d
+        expr: |
+          sum by (job) (rate(superbot_http_requests_total{status_class="5xx",route_class!~"healthz|status"}[3d]))
+          / sum by (job) (rate(superbot_http_requests_total{route_class!~"healthz|status"}[3d]))
+
+      # The share of finished Bot runs that broke (error or timeout), as the status page
+      # counts them. Stopped, interrupted and policy-ended runs aren't failures.
+      - record: superbot:runs_failed:ratio_rate1h
+        expr: |
+          sum by (job) (rate(superbot_runs_total{result=~"error|timeout"}[1h]))
+          / sum by (job) (rate(superbot_runs_total{result=~"done|error|timeout"}[1h]))
+
+  - name: superbot-slo-alerts
+    rules:
+      # Multiwindow, multi-burn-rate alerts (the Google SRE workbook's): a burn of 14.4x
+      # spends 2% of a 30-day budget in an hour, 6x spends 5% in six hours. The short
+      # window stops an alert once the burn has ended.
+      - alert: SuperBotErrorBudgetBurnFast
+        expr: |
+          (
+            superbot:http_request_errors:ratio_rate1h > on() group_left() (14.4 * (1 - superbot:slo_availability:target))
+            and
+            superbot:http_request_errors:ratio_rate5m > on() group_left() (14.4 * (1 - superbot:slo_availability:target))
+          )
+          or
+          (
+            superbot:http_request_errors:ratio_rate6h > on() group_left() (6 * (1 - superbot:slo_availability:target))
+            and
+            superbot:http_request_errors:ratio_rate30m > on() group_left() (6 * (1 - superbot:slo_availability:target))
+          )
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: botd is spending its availability error budget fast
+          description: "{{ $value | humanizePercentage }} of requests are failing with a 5xx. At this rate the 30-day error budget (docs/slo.md) runs out within days. Check /status, botd's logs (LOG_FORMAT=json, level warn) and superbot_http_requests_total by route_class."
+
+      # A burn of 3x spends 10% of the budget in a day; 1x spends it all in 30 days.
+      - alert: SuperBotErrorBudgetBurnSlow
+        expr: |
+          (
+            superbot:http_request_errors:ratio_rate1d > on() group_left() (3 * (1 - superbot:slo_availability:target))
+            and
+            superbot:http_request_errors:ratio_rate2h > on() group_left() (3 * (1 - superbot:slo_availability:target))
+          )
+          or
+          (
+            superbot:http_request_errors:ratio_rate3d > on() group_left() (1 * (1 - superbot:slo_availability:target))
+            and
+            superbot:http_request_errors:ratio_rate6h > on() group_left() (1 * (1 - superbot:slo_availability:target))
+          )
+        for: 1h
+        labels:
+          severity: ticket
+        annotations:
+          summary: botd is spending its availability error budget faster than it earns it
+          description: "{{ $value | humanizePercentage }} of requests are failing with a 5xx, enough to use up the 30-day error budget (docs/slo.md) before the window ends."
+
+      # botd's own metrics can't count the time it's down, so the scrape and the probe do.
+      - alert: SuperBotDown
+        expr: up{job="superbot"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: Prometheus can't scrape botd
+          description: "botd at {{ $labels.instance }} hasn't answered a scrape for 2 minutes. Every minute down counts against the availability SLO (docs/slo.md)."
+
+      - alert: SuperBotStatusProbeFailing
+        expr: probe_success{job="superbot-status"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: The public status page isn't answering
+          description: "The outside-in probe of /status.json has failed for 2 minutes: users likely can't reach SuperBot. These minutes are the availability SLO's bad minutes (docs/slo.md)."
+
+      - alert: SuperBotRunFailuresHigh
+        expr: |
+          superbot:runs_failed:ratio_rate1h > 0.1
+          and on(job)
+          sum by (job) (increase(superbot_runs_total{result=~"done|error|timeout"}[1h])) >= 10
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Many Bot runs are failing
+          description: "{{ $value | humanizePercentage }} of Bot runs in the last hour ended in error or timeout, above the 10% run objective (docs/slo.md). Check superbot_runs_total by harness and the model providers' status."

@@ -1,0 +1,90 @@
+# promtool test rules superbot-slo.rules.test.yml
+rule_files:
+  - superbot-slo.rules.yml
+
+evaluation_interval: 30s
+
+tests:
+  # Half of all requests fail for an hour: the fast burn pages, the probes' own
+  # requests aren't counted, and nothing else fires.
+  - interval: 30s
+    input_series:
+      - series: 'superbot_http_requests_total{job="superbot",route_class="bots",method="GET",status_class="2xx"}'
+        values: '0+10x240'
+      - series: 'superbot_http_requests_total{job="superbot",route_class="bots",method="GET",status_class="5xx"}'
+        values: '0+10x240'
+      - series: 'superbot_http_requests_total{job="superbot",route_class="healthz",method="GET",status_class="2xx"}'
+        values: '0+1000x240'
+      - series: 'up{job="superbot",instance="botd:9464"}'
+        values: '1x240'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: SuperBotErrorBudgetBurnFast
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              job: superbot
+            exp_annotations:
+              summary: botd is spending its availability error budget fast
+              description: "50% of requests are failing with a 5xx. At this rate the 30-day error budget (docs/slo.md) runs out within days. Check /status, botd's logs (LOG_FORMAT=json, level warn) and superbot_http_requests_total by route_class."
+      - eval_time: 70m
+        alertname: SuperBotDown
+        exp_alerts: []
+    promql_expr_test:
+      - expr: superbot:http_request_errors:ratio_rate5m
+        eval_time: 30m
+        exp_samples:
+          - labels: 'superbot:http_request_errors:ratio_rate5m{job="superbot"}'
+            value: 0.5
+
+  # One failure in two thousand is within a 99.9% budget: no alert.
+  - interval: 30s
+    input_series:
+      - series: 'superbot_http_requests_total{job="superbot",route_class="bots",method="GET",status_class="2xx"}'
+        values: '0+1999x240'
+      - series: 'superbot_http_requests_total{job="superbot",route_class="bots",method="GET",status_class="5xx"}'
+        values: '0+1x240'
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: SuperBotErrorBudgetBurnFast
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: SuperBotErrorBudgetBurnSlow
+        exp_alerts: []
+
+  # botd stops answering scrapes.
+  - interval: 30s
+    input_series:
+      - series: 'up{job="superbot",instance="botd:9464"}'
+        values: '1x10 0x10'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: SuperBotDown
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              job: superbot
+              instance: botd:9464
+            exp_annotations:
+              summary: Prometheus can't scrape botd
+              description: "botd at botd:9464 hasn't answered a scrape for 2 minutes. Every minute down counts against the availability SLO (docs/slo.md)."
+
+  # A quarter of runs time out over an hour.
+  - interval: 1m
+    input_series:
+      - series: 'superbot_runs_total{job="superbot",harness="claude",result="done"}'
+        values: '0+3x90'
+      - series: 'superbot_runs_total{job="superbot",harness="claude",result="timeout"}'
+        values: '0+1x90'
+      - series: 'superbot_runs_total{job="superbot",harness="claude",result="stopped"}'
+        values: '0+50x90'
+    alert_rule_test:
+      - eval_time: 80m
+        alertname: SuperBotRunFailuresHigh
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              job: superbot
+            exp_annotations:
+              summary: Many Bot runs are failing
+              description: "25% of Bot runs in the last hour ended in error or timeout, above the 10% run objective (docs/slo.md). Check superbot_runs_total by harness and the model providers' status."
