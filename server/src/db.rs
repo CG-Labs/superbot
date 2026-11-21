@@ -4712,7 +4712,8 @@ mod tests {
                  ALTER TABLE machines DROP COLUMN rebuild_from;",
             )
             .unwrap();
-        db.c().execute_batch(&format!("PRAGMA user_version = {};", MIGRATIONS.len() - 1)).unwrap();
+        let rebuild = MIGRATIONS.iter().position(|m| std::ptr::fn_addr_eq(*m, migrate_machine_rebuild as fn(&Connection, bool) -> rusqlite::Result<()>)).unwrap();
+        db.c().execute_batch(&format!("PRAGMA user_version = {rebuild};")).unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();
         let r = db.machine(&m.id).unwrap();
