@@ -59,14 +59,7 @@ pub enum Perm {
     Admin,
 }
 
-pub const PERMS: [Perm; 6] = [
-    Perm::Account,
-    Perm::Read,
-    Perm::Review,
-    Perm::Write,
-    Perm::Approve,
-    Perm::Admin,
-];
+pub const PERMS: [Perm; 6] = [Perm::Account, Perm::Read, Perm::Review, Perm::Write, Perm::Approve, Perm::Admin];
 
 impl Perm {
     pub fn as_str(self) -> &'static str {
@@ -93,11 +86,7 @@ pub fn allows(p: Principal, perm: Perm) -> bool {
 }
 
 pub fn granted(p: Principal) -> Vec<&'static str> {
-    PERMS
-        .iter()
-        .filter(|&&perm| allows(p, perm))
-        .map(|p| p.as_str())
-        .collect()
+    PERMS.iter().filter(|&&perm| allows(p, perm)).map(|p| p.as_str()).collect()
 }
 
 /// The permission a request needs. `path` is the raw request path. Segments are
@@ -106,21 +95,13 @@ pub fn classify(method: &Method, path: &str) -> Perm {
     use Perm::*;
     let Some(api) = path.strip_prefix("/api/") else {
         // The embedded web app's files. Anything else is a 404 or 405 anyway.
-        return if method == Method::GET || method == Method::HEAD {
-            Read
-        } else {
-            Admin
-        };
+        return if method == Method::GET || method == Method::HEAD { Read } else { Admin };
     };
     let s: Vec<&str> = api.split('/').collect();
     if s.iter().any(|seg| seg.is_empty()) {
         return Admin;
     }
-    let m = if method == Method::HEAD {
-        "GET"
-    } else {
-        method.as_str()
-    };
+    let m = if method == Method::HEAD { "GET" } else { method.as_str() };
     match (m, s.as_slice()) {
         // The admin portal (ADR 0021): users, sign-in codes, identities, sessions, and a
         // user's Bot access. First, so no broader arm added below can ever open them.
@@ -137,21 +118,8 @@ pub fn classify(method: &Method, path: &str) -> Perm {
         // Your own logins on a teammate's machine (ADR 0062). Handlers refuse Bots and
         // anyone who isn't the owner's teammate.
         ("GET", ["machine", "teammate", _, "harness-logins"]) => Account,
-        (
-            "POST",
-            ["machine", "teammate", _, "harness-login"]
-            | ["machine", "teammate", _, "harness-login", _, "input"],
-        ) => Write,
-        (
-            "DELETE",
-            [
-                "machine",
-                "teammate",
-                _,
-                "harness-login" | "harness-logins",
-                _,
-            ],
-        ) => Write,
+        ("POST", ["machine", "teammate", _, "harness-login"] | ["machine", "teammate", _, "harness-login", _, "input"]) => Write,
+        ("DELETE", ["machine", "teammate", _, "harness-login" | "harness-logins", _]) => Write,
         // Your own secrets (ADR 0029). Handlers refuse Bots; anyone else's are under `users`.
         ("GET", ["me", "secrets"]) => Read,
         // Your own plan (ADR 0033). Every tier with its models is `tiers`, for admins.
@@ -206,16 +174,7 @@ mod tests {
             (Perm::Admin, true, false, false, false),
         ];
         for (perm, a, m, r, b) in table {
-            assert_eq!(
-                [
-                    allows(ADMIN, perm),
-                    allows(MEMBER, perm),
-                    allows(READONLY, perm),
-                    allows(BOT, perm)
-                ],
-                [a, m, r, b],
-                "{perm:?}"
-            );
+            assert_eq!([allows(ADMIN, perm), allows(MEMBER, perm), allows(READONLY, perm), allows(BOT, perm)], [a, m, r, b], "{perm:?}");
         }
         assert_eq!(granted(READONLY), ["account", "read", "review"]);
     }
@@ -348,47 +307,19 @@ mod tests {
             ("GET", "/api/machines/legacy", Perm::Admin),
             ("POST", "/api/users/u1/machine/bot-user", Perm::Admin),
             ("POST", "/api/users/u1/machine/harness-login", Perm::Admin),
-            (
-                "POST",
-                "/api/users/u1/machine/harness-login/l1/input",
-                Perm::Admin,
-            ),
-            (
-                "DELETE",
-                "/api/users/u1/machine/harness-login/l1",
-                Perm::Admin,
-            ),
+            ("POST", "/api/users/u1/machine/harness-login/l1/input", Perm::Admin),
+            ("DELETE", "/api/users/u1/machine/harness-login/l1", Perm::Admin),
             ("GET", "/api/users/u1/machine/harness-logins", Perm::Admin),
-            (
-                "DELETE",
-                "/api/users/u1/machine/harness-logins/claude",
-                Perm::Admin,
-            ),
-            (
-                "GET",
-                "/api/users/u1/machine/teammates/u2/harness-logins",
-                Perm::Admin,
-            ),
-            (
-                "DELETE",
-                "/api/users/u1/machine/teammates/u2/harness-logins/claude",
-                Perm::Admin,
-            ),
+            ("DELETE", "/api/users/u1/machine/harness-logins/claude", Perm::Admin),
+            ("GET", "/api/users/u1/machine/teammates/u2/harness-logins", Perm::Admin),
+            ("DELETE", "/api/users/u1/machine/teammates/u2/harness-logins/claude", Perm::Admin),
             ("GET", "/api/users/u1/machine/folder-sync", Perm::Admin),
             ("POST", "/api/users/u1/machine/folder-sync", Perm::Admin),
             ("GET", "/api/users/u1/machine/teammates", Perm::Admin),
-            (
-                "POST",
-                "/api/users/u1/machine/teammates/u2/remove",
-                Perm::Admin,
-            ),
+            ("POST", "/api/users/u1/machine/teammates/u2/remove", Perm::Admin),
             ("GET", "/api/machines/teammate-removals", Perm::Admin),
             ("GET", "/api/users/u1/teammate-accounts", Perm::Admin),
-            (
-                "POST",
-                "/api/users/u1/teammate-accounts/u2/remove",
-                Perm::Admin,
-            ),
+            ("POST", "/api/users/u1/teammate-accounts/u2/remove", Perm::Admin),
             ("GET", "/api/isolation/teammate-removals", Perm::Admin),
             ("GET", "/api/machine/harness-logins", Perm::Account),
             ("POST", "/api/machine/harness-login", Perm::Write),
@@ -396,31 +327,11 @@ mod tests {
             ("DELETE", "/api/machine/harness-login/l1", Perm::Write),
             ("DELETE", "/api/machine/harness-logins/claude", Perm::Write),
             ("PUT", "/api/machine/harness-login", Perm::Admin),
-            (
-                "GET",
-                "/api/machine/teammate/u1/harness-logins",
-                Perm::Account,
-            ),
-            (
-                "POST",
-                "/api/machine/teammate/u1/harness-login",
-                Perm::Write,
-            ),
-            (
-                "POST",
-                "/api/machine/teammate/u1/harness-login/l1/input",
-                Perm::Write,
-            ),
-            (
-                "DELETE",
-                "/api/machine/teammate/u1/harness-login/l1",
-                Perm::Write,
-            ),
-            (
-                "DELETE",
-                "/api/machine/teammate/u1/harness-logins/claude",
-                Perm::Write,
-            ),
+            ("GET", "/api/machine/teammate/u1/harness-logins", Perm::Account),
+            ("POST", "/api/machine/teammate/u1/harness-login", Perm::Write),
+            ("POST", "/api/machine/teammate/u1/harness-login/l1/input", Perm::Write),
+            ("DELETE", "/api/machine/teammate/u1/harness-login/l1", Perm::Write),
+            ("DELETE", "/api/machine/teammate/u1/harness-logins/claude", Perm::Write),
             ("PUT", "/api/machine/teammate/u1/harness-login", Perm::Admin),
             ("GET", "/api/machine/teammate/u1", Perm::Admin),
             ("GET", "/api/machine/teammate//harness-logins", Perm::Admin),
@@ -454,10 +365,7 @@ mod tests {
         assert_eq!(classify(&Method::POST, "/api/approvals"), Perm::Admin);
         assert_eq!(classify(&Method::PUT, "/api/bots/b1"), Perm::Admin);
         assert_eq!(classify(&Method::PUT, "/api/bots/b1/access"), Perm::Admin);
-        assert_eq!(
-            classify(&Method::GET, "/api/bots/b1/grants/u1"),
-            Perm::Admin
-        );
+        assert_eq!(classify(&Method::GET, "/api/bots/b1/grants/u1"), Perm::Admin);
         assert_eq!(classify(&Method::PUT, "/api/bots/b1/grants"), Perm::Admin);
         assert_eq!(classify(&Method::POST, "/"), Perm::Admin);
         assert_eq!(classify(&Method::POST, "/api/machine"), Perm::Admin);
@@ -470,9 +378,6 @@ mod tests {
         assert_eq!(Role::parse(" Read-Only "), Some(Role::Readonly));
         assert_eq!(Role::parse("admin"), Some(Role::Admin));
         assert_eq!(Role::parse("owner"), None);
-        assert_eq!(
-            serde_json::to_string(&Role::Readonly).unwrap(),
-            "\"readonly\""
-        );
+        assert_eq!(serde_json::to_string(&Role::Readonly).unwrap(), "\"readonly\"");
     }
 }

@@ -17,20 +17,13 @@ const EMAIL_PAGES: usize = 10;
 
 /// The API next to a GitHub address: github.com's own, or GitHub Enterprise Server's `/api/v3`.
 pub fn api_for(web: &str) -> String {
-    if web == URL {
-        API.into()
-    } else {
-        format!("{web}/api/v3")
-    }
+    if web == URL { API.into() } else { format!("{web}/api/v3") }
 }
 
 /// An organization's login as GitHub allows it, lowercase (GitHub compares them that way).
 pub fn org(s: &str) -> Option<String> {
     let s = s.trim().to_ascii_lowercase();
-    let ok = (1..=39).contains(&s.len())
-        && !s.starts_with('-')
-        && !s.ends_with('-')
-        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    let ok = (1..=39).contains(&s.len()) && !s.starts_with('-') && !s.ends_with('-') && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
     ok.then_some(s)
 }
 
@@ -38,8 +31,7 @@ pub fn org(s: &str) -> Option<String> {
 /// and someone else can then take the old login.
 pub fn user_id(s: &str) -> Option<String> {
     let s = s.trim();
-    ((1..=20).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit()) && !s.starts_with('0'))
-        .then(|| s.to_string())
+    ((1..=20).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit()) && !s.starts_with('0')).then(|| s.to_string())
 }
 
 pub struct GitHub<'a> {
@@ -50,40 +42,12 @@ pub struct GitHub<'a> {
 }
 
 impl GitHub<'_> {
-    pub async fn sign_in(
-        &self,
-        http: &reqwest::Client,
-        code: &str,
-        redirect_uri: &str,
-        verifier: &str,
-        secret: &str,
-    ) -> Result<Claims, Invalid> {
-        let form = [
-            ("client_id", self.client_id),
-            ("client_secret", secret),
-            ("code", code),
-            ("redirect_uri", redirect_uri),
-            ("code_verifier", verifier),
-        ];
-        let res = http
-            .post(format!("{}/login/oauth/access_token", self.web))
-            .header("accept", "application/json")
-            .form(&form)
-            .send()
-            .await
-            .map_err(|_| Invalid("idp_unreachable"))?;
+    pub async fn sign_in(&self, http: &reqwest::Client, code: &str, redirect_uri: &str, verifier: &str, secret: &str) -> Result<Claims, Invalid> {
+        let form = [("client_id", self.client_id), ("client_secret", secret), ("code", code), ("redirect_uri", redirect_uri), ("code_verifier", verifier)];
+        let res = http.post(format!("{}/login/oauth/access_token", self.web)).header("accept", "application/json").form(&form).send().await.map_err(|_| Invalid("idp_unreachable"))?;
         // Errors come back as 200 with an `error` field.
         let token = match read_json(res).await? {
-            (200, v)
-                if v["token_type"]
-                    .as_str()
-                    .is_some_and(|t| t.eq_ignore_ascii_case("bearer")) =>
-            {
-                v["access_token"]
-                    .as_str()
-                    .filter(|t| !t.is_empty() && t.len() <= 4096)
-                    .map(String::from)
-            }
+            (200, v) if v["token_type"].as_str().is_some_and(|t| t.eq_ignore_ascii_case("bearer")) => v["access_token"].as_str().filter(|t| !t.is_empty() && t.len() <= 4096).map(String::from),
             _ => None,
         };
         let token = token.ok_or(Invalid("code_exchange_failed"))?;
@@ -92,12 +56,7 @@ impl GitHub<'_> {
         claims
     }
 
-    async fn get(
-        &self,
-        http: &reqwest::Client,
-        token: &str,
-        path: &str,
-    ) -> Result<(u16, Value), Invalid> {
+    async fn get(&self, http: &reqwest::Client, token: &str, path: &str) -> Result<(u16, Value), Invalid> {
         let res = http
             .get(format!("{}{path}", self.api))
             .bearer_auth(token)
@@ -114,50 +73,21 @@ impl GitHub<'_> {
             (200, v) => v,
             _ => return Err(Invalid("idp_bad_response")),
         };
-        let subject = user["id"]
-            .as_u64()
-            .filter(|id| *id > 0)
-            .ok_or(Invalid("missing_subject"))?
-            .to_string();
+        let subject = user["id"].as_u64().filter(|id| *id > 0).ok_or(Invalid("missing_subject"))?.to_string();
         let login = user["login"].as_str().map(|l| crate::audit::clip(l, 39));
-        let email = self
-            .primary_email(http, token)
-            .await?
-            .ok_or(Invalid("email_unverified"))?;
+        let email = self.primary_email(http, token).await?.ok_or(Invalid("email_unverified"))?;
         if !self.allowed_orgs.is_empty() && !self.in_allowed_org(http, token).await? {
             return Err(Invalid("wrong_org"));
         }
-        let name = user["name"]
-            .as_str()
-            .map(|n| crate::audit::clip(n.trim(), 100))
-            .filter(|n| !n.is_empty())
-            .or_else(|| login.clone());
-        Ok(Claims {
-            issuer: self.web.to_string(),
-            subject,
-            tenant: None,
-            email: Some(email),
-            name,
-            username: login,
-        })
+        let name = user["name"].as_str().map(|n| crate::audit::clip(n.trim(), 100)).filter(|n| !n.is_empty()).or_else(|| login.clone());
+        Ok(Claims { issuer: self.web.to_string(), subject, tenant: None, email: Some(email), name, username: login })
     }
 
     /// The primary address, only if verified: GitHub lets people add any address
     /// unverified. The list is paged, and the primary needn't be on the first page.
-    async fn primary_email(
-        &self,
-        http: &reqwest::Client,
-        token: &str,
-    ) -> Result<Option<String>, Invalid> {
+    async fn primary_email(&self, http: &reqwest::Client, token: &str) -> Result<Option<String>, Invalid> {
         for page in 1..=EMAIL_PAGES {
-            let list = match self
-                .get(
-                    http,
-                    token,
-                    &format!("/user/emails?per_page={EMAILS_PER_PAGE}&page={page}"),
-                )
-                .await?
-            {
+            let list = match self.get(http, token, &format!("/user/emails?per_page={EMAILS_PER_PAGE}&page={page}")).await? {
                 (200, Value::Array(list)) => list,
                 // No user:email scope (or a GitHub App without the email permission).
                 (403 | 404, _) => return Ok(None),
@@ -165,10 +95,7 @@ impl GitHub<'_> {
             };
             if let Some(e) = list.iter().find(|e| e["primary"] == json!(true)) {
                 let verified = e["verified"] == json!(true);
-                return Ok(e["email"]
-                    .as_str()
-                    .map(|e| e.trim().to_string())
-                    .filter(|e| verified && crate::users::valid_email(e)));
+                return Ok(e["email"].as_str().map(|e| e.trim().to_string()).filter(|e| verified && crate::users::valid_email(e)));
             }
             if list.len() < EMAILS_PER_PAGE {
                 break;
@@ -182,18 +109,8 @@ impl GitHub<'_> {
     /// hasn't approved) for anyone it won't vouch for.
     async fn in_allowed_org(&self, http: &reqwest::Client, token: &str) -> Result<bool, Invalid> {
         for org in self.allowed_orgs {
-            match self
-                .get(http, token, &format!("/user/memberships/orgs/{org}"))
-                .await?
-            {
-                (200, v)
-                    if v["state"] == "active"
-                        && v["organization"]["login"]
-                            .as_str()
-                            .is_some_and(|l| l.eq_ignore_ascii_case(org)) =>
-                {
-                    return Ok(true);
-                }
+            match self.get(http, token, &format!("/user/memberships/orgs/{org}")).await? {
+                (200, v) if v["state"] == "active" && v["organization"]["login"].as_str().is_some_and(|l| l.eq_ignore_ascii_case(org)) => return Ok(true),
                 (200 | 403 | 404, _) => {}
                 _ => return Err(Invalid("idp_bad_response")),
             }
@@ -204,18 +121,9 @@ impl GitHub<'_> {
     /// botd needs the token for one sign-in only, so it doesn't leave it valid. Best
     /// effort, in the background: sign-in doesn't wait for it.
     fn revoke(&self, http: &reqwest::Client, token: String, secret: &str) {
-        let (http, url, id, secret) = (
-            http.clone(),
-            format!("{}/applications/{}/token", self.api, self.client_id),
-            self.client_id.to_string(),
-            crate::secrets::Secret::new(secret),
-        );
+        let (http, url, id, secret) = (http.clone(), format!("{}/applications/{}/token", self.api, self.client_id), self.client_id.to_string(), crate::secrets::Secret::new(secret));
         tokio::spawn(async move {
-            let req = http
-                .delete(url)
-                .basic_auth(id, Some(secret.expose()))
-                .header("accept", "application/vnd.github+json")
-                .json(&json!({ "access_token": token }));
+            let req = http.delete(url).basic_auth(id, Some(secret.expose())).header("accept", "application/vnd.github+json").json(&json!({ "access_token": token }));
             let _ = req.send().await;
         });
     }
@@ -236,9 +144,6 @@ mod tests {
             assert!(org(bad).is_none(), "{bad}");
         }
         assert_eq!(api_for(URL), API);
-        assert_eq!(
-            api_for("https://github.example.com"),
-            "https://github.example.com/api/v3"
-        );
+        assert_eq!(api_for("https://github.example.com"), "https://github.example.com/api/v3");
     }
 }

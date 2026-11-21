@@ -5,9 +5,9 @@
 //! This file has no `crate::` paths: `superbot-license`, the offline tool CG-Labs mints
 //! keys with, includes it too, so both sides read and write exactly the same format.
 
-use aws_lc_rs::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
-use base64::Engine;
+use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD as B64};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -71,23 +71,13 @@ impl Invalid {
 
     pub fn text(self) -> &'static str {
         match self {
-            Invalid::Malformed => {
-                "This isn't a SuperBot license key. Paste the whole key, three parts separated by dots."
-            }
+            Invalid::Malformed => "This isn't a SuperBot license key. Paste the whole key, three parts separated by dots.",
             Invalid::BadAlgorithm => "This key isn't signed the way SuperBot licenses are (EdDSA).",
-            Invalid::UnknownKey => {
-                "This license was signed by a key this version of SuperBot doesn't know. Upgrade SuperBot, or ask CG-Labs for a new key."
-            }
-            Invalid::BadSignature => {
-                "This license's signature doesn't match: it was changed after it was issued, or wasn't issued by CG-Labs."
-            }
+            Invalid::UnknownKey => "This license was signed by a key this version of SuperBot doesn't know. Upgrade SuperBot, or ask CG-Labs for a new key.",
+            Invalid::BadSignature => "This license's signature doesn't match: it was changed after it was issued, or wasn't issued by CG-Labs.",
             Invalid::WrongAudience => "This key isn't a SuperBot self-host license.",
-            Invalid::NotYetValid => {
-                "This license starts later. Check this server's clock, or install it once it starts."
-            }
-            Invalid::BadClaims => {
-                "This license is missing something it needs (licensee, id, edition, seats, or dates)."
-            }
+            Invalid::NotYetValid => "This license starts later. Check this server's clock, or install it once it starts.",
+            Invalid::BadClaims => "This license is missing something it needs (licensee, id, edition, seats, or dates).",
         }
     }
 }
@@ -108,19 +98,11 @@ pub struct Key {
 impl Key {
     /// `public` is the 32-byte Ed25519 key in unpadded base64url, as `superbot-license keygen` prints it.
     pub fn parse(kid: &str, public: &str) -> Result<Key, String> {
-        let public = B64
-            .decode(public.trim())
-            .map_err(|e| format!("key {kid}: {e}"))?;
+        let public = B64.decode(public.trim()).map_err(|e| format!("key {kid}: {e}"))?;
         if public.len() != 32 {
-            return Err(format!(
-                "key {kid}: an Ed25519 public key is 32 bytes, not {}",
-                public.len()
-            ));
+            return Err(format!("key {kid}: an Ed25519 public key is 32 bytes, not {}", public.len()));
         }
-        Ok(Key {
-            kid: kid.into(),
-            public,
-        })
+        Ok(Key { kid: kid.into(), public })
     }
 }
 
@@ -129,10 +111,7 @@ pub fn valid_kid(kid: &str) -> bool {
 }
 
 fn slug(s: &str, max: usize) -> bool {
-    (1..=max).contains(&s.len())
-        && s.bytes().all(|b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_' || b == b'.'
-        })
+    (1..=max).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_' || b == b'.')
 }
 
 fn text(s: &str, max: usize) -> bool {
@@ -185,30 +164,21 @@ pub fn verify(token: &str, keys: &[Key], now: i64) -> Result<Claims, Invalid> {
         return Err(Invalid::Malformed);
     }
     let mut parts = token.split('.');
-    let (Some(h), Some(p), Some(s), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
+    let (Some(h), Some(p), Some(s), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
         return Err(Invalid::Malformed);
     };
     let header = part(h)?;
     if header.get("alg").and_then(Value::as_str) != Some("EdDSA") || header.contains_key("crit") {
         return Err(Invalid::BadAlgorithm);
     }
-    let kid = header
-        .get("kid")
-        .and_then(Value::as_str)
-        .ok_or(Invalid::UnknownKey)?;
-    let key = keys
-        .iter()
-        .find(|k| k.kid == kid)
-        .ok_or(Invalid::UnknownKey)?;
+    let kid = header.get("kid").and_then(Value::as_str).ok_or(Invalid::UnknownKey)?;
+    let key = keys.iter().find(|k| k.kid == kid).ok_or(Invalid::UnknownKey)?;
     let sig = B64.decode(s).map_err(|_| Invalid::Malformed)?;
     UnparsedPublicKey::new(&ED25519, &key.public)
         .verify(format!("{h}.{p}").as_bytes(), &sig)
         .map_err(|_| Invalid::BadSignature)?;
     // Only now is the payload ours to read.
-    let claims: Claims =
-        serde_json::from_value(Value::Object(part(p)?)).map_err(|_| Invalid::BadClaims)?;
+    let claims: Claims = serde_json::from_value(Value::Object(part(p)?)).map_err(|_| Invalid::BadClaims)?;
     if claims.aud != AUDIENCE {
         return Err(Invalid::WrongAudience);
     }
@@ -232,11 +202,7 @@ pub fn sign(key: &Ed25519KeyPair, kid: &str, claims: &Claims) -> Result<String, 
         return Err("the key id must be 1 to 32 lowercase letters, digits, or - _ .".into());
     }
     let header = serde_json::json!({ "alg": "EdDSA", "typ": "JWT", "kid": kid });
-    let signed = format!(
-        "{}.{}",
-        B64.encode(header.to_string()),
-        B64.encode(serde_json::to_string(claims).map_err(|e| e.to_string())?)
-    );
+    let signed = format!("{}.{}", B64.encode(header.to_string()), B64.encode(serde_json::to_string(claims).map_err(|e| e.to_string())?));
     let sig = key.sign(signed.as_bytes());
     Ok(format!("{signed}.{}", B64.encode(sig.as_ref())))
 }
@@ -246,23 +212,13 @@ pub fn generate_pem() -> Result<String, String> {
     let key = Ed25519KeyPair::generate().map_err(|_| "couldn't make a key")?;
     let der = key.to_pkcs8v1().map_err(|_| "couldn't encode the key")?;
     let b64 = STANDARD.encode(der.as_ref());
-    let lines: Vec<&str> = b64
-        .as_bytes()
-        .chunks(64)
-        .map(|c| std::str::from_utf8(c).unwrap())
-        .collect();
+    let lines: Vec<&str> = b64.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap()).collect();
     Ok(format!("{PEM_BEGIN}\n{}\n{PEM_END}\n", lines.join("\n")))
 }
 
 pub fn key_from_pem(pem: &str) -> Result<Ed25519KeyPair, String> {
-    let body = pem
-        .trim()
-        .strip_prefix(PEM_BEGIN)
-        .and_then(|r| r.strip_suffix(PEM_END))
-        .ok_or("expected a PKCS#8 PEM private key (BEGIN PRIVATE KEY)")?;
-    let der = STANDARD
-        .decode(body.split_whitespace().collect::<String>())
-        .map_err(|e| format!("bad PEM: {e}"))?;
+    let body = pem.trim().strip_prefix(PEM_BEGIN).and_then(|r| r.strip_suffix(PEM_END)).ok_or("expected a PKCS#8 PEM private key (BEGIN PRIVATE KEY)")?;
+    let der = STANDARD.decode(body.split_whitespace().collect::<String>()).map_err(|e| format!("bad PEM: {e}"))?;
     Ed25519KeyPair::from_pkcs8(&der).map_err(|e| format!("not an Ed25519 private key: {e}"))
 }
 

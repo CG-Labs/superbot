@@ -39,8 +39,7 @@ use tokio::sync::mpsc;
 
 /// How long a login may wait for its user.
 const LOGIN_SECS: u64 = 900;
-pub const OFF: &str =
-    "Harness logins on machines are off. Set MACHINE_HARNESS_LOGINS=on to turn them on.";
+pub const OFF: &str = "Harness logins on machines are off. Set MACHINE_HARNESS_LOGINS=on to turn them on.";
 
 /// A login running on a machine, by its id.
 #[derive(Clone, Debug)]
@@ -91,11 +90,7 @@ pub fn cred_query() -> Vec<String> {
     crate::adapters::NAMES
         .iter()
         .filter_map(|name| Some((name, recipe(name)?)))
-        .flat_map(|(name, r)| {
-            r.files
-                .iter()
-                .map(move |f| format!("cred={}", escape(&format!("{name}:{f}"))))
-        })
+        .flat_map(|(name, r)| r.files.iter().map(move |f| format!("cred={}", escape(&format!("{name}:{f}")))))
         .collect()
 }
 
@@ -118,12 +113,7 @@ fn keyed(owner: Option<&str>, r: &MachineLogin) -> bool {
 
 /// Whether a run of `bin` may start on its owner's machine, as far as logins go.
 /// `owner`: whose own keys the run gets, if anyone's.
-pub fn check_run(
-    e: &Enrollment,
-    hb: &Heartbeat,
-    owner: Option<&str>,
-    bin: &str,
-) -> Result<(), Refusal> {
+pub fn check_run(e: &Enrollment, hb: &Heartbeat, owner: Option<&str>, bin: &str) -> Result<(), Refusal> {
     match recipe(bin) {
         Some(r) if e.logins => route::logged_in(hb, bin, keyed(owner, &r)),
         _ => Ok(()),
@@ -141,9 +131,7 @@ fn keeps_teammate_logins(hb: &Heartbeat) -> bool {
 /// agent can keep one: `check_teammate_login` checks it once their user answers.
 pub fn check_teammate_run(e: &Enrollment, hb: &Heartbeat, bin: &str) -> Result<(), Refusal> {
     match recipe(bin) {
-        Some(r) if !keyed(None, &r) && !(e.logins && keeps_teammate_logins(hb)) => {
-            Err(Refusal::NoTeammateKey(bin.into()))
-        }
+        Some(r) if !keyed(None, &r) && !(e.logins && keeps_teammate_logins(hb)) => Err(Refusal::NoTeammateKey(bin.into())),
         _ => Ok(()),
     }
 }
@@ -151,10 +139,7 @@ pub fn check_teammate_run(e: &Enrollment, hb: &Heartbeat, bin: &str) -> Result<(
 /// Whether a teammate's run of `bin` may start, from their user's answer: a server-wide
 /// key, or their own login there. The owner's login never counts.
 pub fn check_teammate_login(bin: &str, reply: &TeammateReply) -> Result<(), Refusal> {
-    let theirs = reply
-        .logins
-        .get(bin)
-        .is_some_and(|l| l.state == wire::LOGGED_IN);
+    let theirs = reply.logins.get(bin).is_some_and(|l| l.state == wire::LOGGED_IN);
     match recipe(bin) {
         Some(r) if !keyed(None, &r) && !theirs => Err(Refusal::TeammateNotLoggedIn(bin.into())),
         _ => Ok(()),
@@ -162,12 +147,10 @@ pub fn check_teammate_login(bin: &str, reply: &TeammateReply) -> Result<(), Refu
 }
 
 fn control_plane(app: &App) -> Res<&ControlPlane> {
-    app.control_plane.get().map(|cp| &**cp).ok_or_else(|| {
-        ApiError(
-            StatusCode::SERVICE_UNAVAILABLE,
-            super::NOT_CONFIGURED.into(),
-        )
-    })
+    app.control_plane
+        .get()
+        .map(|cp| &**cp)
+        .ok_or_else(|| ApiError(StatusCode::SERVICE_UNAVAILABLE, super::NOT_CONFIGURED.into()))
 }
 
 fn need_on(app: &App) -> Res<Arc<Enrollment>> {
@@ -194,15 +177,9 @@ fn need_recipe(harness: &str) -> Res<MachineLogin> {
 /// The user's machine, running with an enrolled agent.
 fn ready_machine(app: &App, u: &User) -> Res<Machine> {
     if !u.active() {
-        return Err(ApiError(
-            StatusCode::FORBIDDEN,
-            "That user is disabled.".into(),
-        ));
+        return Err(ApiError(StatusCode::FORBIDDEN, "That user is disabled.".into()));
     }
-    let m = app
-        .db
-        .user_machine(&u.id)
-        .ok_or_else(|| crate::not_found("Machine"))?;
+    let m = app.db.user_machine(&u.id).ok_or_else(|| crate::not_found("Machine"))?;
     if m.state != State::Running || m.enrollment != "enrolled" {
         return Err(conflict(format!(
             "The machine is {} and its agent is {}; it must be running and enrolled.",
@@ -214,16 +191,11 @@ fn ready_machine(app: &App, u: &User) -> Res<Machine> {
 }
 
 async fn heartbeat(app: &App, e: &Enrollment, m: &Machine) -> Res<Heartbeat> {
-    let hb = enroll::heartbeat(app, e, m).await.map_err(|why| {
-        ApiError(
-            StatusCode::BAD_GATEWAY,
-            format!("Its agent didn't answer: {why}"),
-        )
-    })?;
+    let hb = enroll::heartbeat(app, e, m)
+        .await
+        .map_err(|why| ApiError(StatusCode::BAD_GATEWAY, format!("Its agent didn't answer: {why}")))?;
     if !hb.can.iter().any(|c| c == wire::CAN_LOGINS) {
-        return Err(conflict(
-            "Its agent can't run logins: it is older than ADR 0041. Upgrade it.",
-        ));
+        return Err(conflict("Its agent can't run logins: it is older than ADR 0041. Upgrade it."));
     }
     Ok(hb)
 }
@@ -246,19 +218,13 @@ fn view(e: &Enrollment, m: &Machine, hb: &Heartbeat) -> Value {
 
 fn agent_error(code: u16, reply: &Value) -> ApiError {
     let why = reply["error"].as_str().unwrap_or("no reason given");
-    ApiError(
-        StatusCode::BAD_GATEWAY,
-        format!("Its agent refused ({code}): {why}"),
-    )
+    ApiError(StatusCode::BAD_GATEWAY, format!("Its agent refused ({code}): {why}"))
 }
 
 /// The signed-in person, never a Bot.
 fn me(c: &Caller) -> Res<User> {
     if c.principal == Principal::Bot {
-        return Err(ApiError(
-            StatusCode::FORBIDDEN,
-            "A Bot can't log in harnesses on a machine.".into(),
-        ));
+        return Err(ApiError(StatusCode::FORBIDDEN, "A Bot can't log in harnesses on a machine.".into()));
     }
     c.user.clone().ok_or_else(|| crate::not_found("Machine"))
 }
@@ -278,13 +244,7 @@ pub struct StartBody {
 /// Starts the login on the user's machine and streams what it shows back as JSON
 /// lines (`LoginEvent`s), the first naming the login for `input`. If the caller goes
 /// away, the login there is stopped.
-async fn start(
-    app: AppState,
-    by: Who,
-    u: User,
-    teammate: Option<String>,
-    harness: String,
-) -> Res<Response> {
+async fn start(app: AppState, by: Who, u: User, teammate: Option<String>, harness: String) -> Res<Response> {
     let e = need_on(&app)?;
     let r = need_recipe(&harness)?;
     let m = ready_machine(&app, &u)?;
@@ -292,21 +252,12 @@ async fn start(
     match &teammate {
         // The agent refuses a second login of theirs for the same harness.
         Some(_) => need_teammate_logins(&e, &hb)?,
-        None if hb
-            .logins
-            .get(&harness)
-            .is_some_and(|l| l.state == wire::LOGGING_IN) =>
-        {
-            return Err(conflict(format!(
-                "A {harness} login is already running there."
-            )));
+        None if hb.logins.get(&harness).is_some_and(|l| l.state == wire::LOGGING_IN) => {
+            return Err(conflict(format!("A {harness} login is already running there.")));
         }
         None => {}
     }
-    let address = m
-        .ipv4
-        .clone()
-        .ok_or_else(|| conflict("The machine has no address yet."))?;
+    let address = m.ipv4.clone().ok_or_else(|| conflict("The machine has no address yet."))?;
     let id = format!("l{}", crate::random_hex(8));
     let req = LoginRequest {
         login_id: id.clone(),
@@ -320,9 +271,7 @@ async fn start(
         let (harness, id, whose) = (harness.clone(), id.clone(), whose(teammate.as_deref()));
         move |extra: Value| {
             let mut d = json!({ "harness": harness, "loginId": id });
-            if let (Some(d), Value::Object(w), Value::Object(x)) =
-                (d.as_object_mut(), whose.clone(), extra)
-            {
+            if let (Some(d), Value::Object(w), Value::Object(x)) = (d.as_object_mut(), whose.clone(), extra) {
                 d.extend(w);
                 d.extend(x);
             }
@@ -338,42 +287,24 @@ async fn start(
             for_user: teammate.clone(),
         },
     );
-    app.db.record(&event(
-        &by,
-        "machine.harness_login_started",
-        &m,
-        details(json!({})),
-    ));
+    app.db.record(&event(&by, "machine.harness_login_started", &m, details(json!({}))));
     let failed = |why: String| {
         e.sessions.lock().remove(&id);
         app.db.record(
-            &event(
-                &by,
-                "machine.harness_login_finished",
-                &m,
-                details(json!({ "loggedIn": false, "error": why })),
-            )
-            .outcome(Outcome::Failure),
+            &event(&by, "machine.harness_login_finished", &m, details(json!({ "loggedIn": false, "error": why })))
+                .outcome(Outcome::Failure),
         );
     };
     let pins = app.db.machine_pins(&m.id);
     let sent = match e.job_client(pins.clone()) {
-        Ok(c) => c
-            .post(e.agent_url(&address, "/v1/logins"))
-            .json(&req)
-            .send()
-            .await
-            .map_err(enroll::without_url),
+        Ok(c) => c.post(e.agent_url(&address, "/v1/logins")).json(&req).send().await.map_err(enroll::without_url),
         Err(why) => Err(why),
     };
     let mut res = match sent {
         Ok(res) => res,
         Err(why) => {
             failed(why.clone());
-            return Err(ApiError(
-                StatusCode::BAD_GATEWAY,
-                format!("Its agent didn't answer: {why}"),
-            ));
+            return Err(ApiError(StatusCode::BAD_GATEWAY, format!("Its agent didn't answer: {why}")));
         }
     };
     if !res.status().is_success() {
@@ -401,11 +332,7 @@ async fn start(
                     };
                     for ev in events {
                         match &ev {
-                            LoginEvent::Exit {
-                                success,
-                                logged_in,
-                                status,
-                            } => end = Some((*success, *logged_in, status.clone())),
+                            LoginEvent::Exit { success, logged_in, status } => end = Some((*success, *logged_in, status.clone())),
                             LoginEvent::Error { message } => error = Some(message.clone()),
                             _ => {}
                         }
@@ -424,47 +351,21 @@ async fn start(
         }
         match end {
             Some((success, logged_in, status)) => {
-                let ev = event(
-                    &by,
-                    "machine.harness_login_finished",
-                    &m,
-                    details(json!({ "loggedIn": logged_in, "success": success, "status": status })),
-                );
-                app.db.record(&if logged_in {
-                    ev
-                } else {
-                    ev.outcome(Outcome::Failure)
-                });
+                let ev = event(&by, "machine.harness_login_finished", &m, details(json!({ "loggedIn": logged_in, "success": success, "status": status })));
+                app.db.record(&if logged_in { ev } else { ev.outcome(Outcome::Failure) });
             }
             None if gone => {
                 if let Ok((c, _)) = e.pinned(pins) {
-                    let _ = c
-                        .post(e.agent_url(&address, &format!("/v1/logins/{id}/abort")))
-                        .send()
-                        .await;
+                    let _ = c.post(e.agent_url(&address, &format!("/v1/logins/{id}/abort"))).send().await;
                 }
-                app.db.record(&event(
-                    &by,
-                    "machine.harness_login_aborted",
-                    &m,
-                    details(json!({ "reason": "caller_left" })),
-                ));
+                app.db.record(&event(&by, "machine.harness_login_aborted", &m, details(json!({ "reason": "caller_left" }))));
             }
             None => {
                 let message = error.unwrap_or_else(|| "its agent stopped answering".into());
-                let _ = tx
-                    .send(Ok(line(&LoginEvent::Error {
-                        message: message.clone(),
-                    })))
-                    .await;
+                let _ = tx.send(Ok(line(&LoginEvent::Error { message: message.clone() }))).await;
                 app.db.record(
-                    &event(
-                        &by,
-                        "machine.harness_login_finished",
-                        &m,
-                        details(json!({ "loggedIn": false, "error": message })),
-                    )
-                    .outcome(Outcome::Failure),
+                    &event(&by, "machine.harness_login_finished", &m, details(json!({ "loggedIn": false, "error": message })))
+                        .outcome(Outcome::Failure),
                 );
             }
         }
@@ -484,91 +385,36 @@ pub struct InputBody {
 }
 
 /// Types a line into a running login. What was typed is never kept or audited.
-async fn input(
-    app: AppState,
-    by: Who,
-    u: User,
-    teammate: Option<String>,
-    id: String,
-    text: String,
-) -> Res<StatusCode> {
+async fn input(app: AppState, by: Who, u: User, teammate: Option<String>, id: String, text: String) -> Res<StatusCode> {
     let e = need_on(&app)?;
-    let s = e
-        .sessions
-        .get(&id, &u.id, teammate.as_deref())
-        .ok_or_else(|| crate::not_found("Login"))?;
-    let m = app
-        .db
-        .machine(&s.machine_id)
-        .ok_or_else(|| crate::not_found("Machine"))?;
+    let s = e.sessions.get(&id, &u.id, teammate.as_deref()).ok_or_else(|| crate::not_found("Login"))?;
+    let m = app.db.machine(&s.machine_id).ok_or_else(|| crate::not_found("Machine"))?;
     let path = format!("/v1/logins/{id}/input");
     let (code, reply) = e
-        .call_agent(
-            &app,
-            &m,
-            reqwest::Method::POST,
-            &path,
-            &wire::LoginInput { text: text.clone() },
-        )
+        .call_agent(&app, &m, reqwest::Method::POST, &path, &wire::LoginInput { text: text.clone() })
         .await
-        .map_err(|why| {
-            ApiError(
-                StatusCode::BAD_GATEWAY,
-                format!("Its agent didn't answer: {why}"),
-            )
-        })?;
+        .map_err(|why| ApiError(StatusCode::BAD_GATEWAY, format!("Its agent didn't answer: {why}")))?;
     if !(200..300).contains(&code) {
         return Err(agent_error(code, &reply));
     }
-    let d = with_whose(
-        json!({ "harness": s.harness, "loginId": id, "chars": text.chars().count() }),
-        teammate.as_deref(),
-    );
-    app.db
-        .record(&event(&by, "machine.harness_login_input", &m, d));
+    let d = with_whose(json!({ "harness": s.harness, "loginId": id, "chars": text.chars().count() }), teammate.as_deref());
+    app.db.record(&event(&by, "machine.harness_login_input", &m, d));
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn abort(
-    app: AppState,
-    by: Who,
-    u: User,
-    teammate: Option<String>,
-    id: String,
-) -> Res<StatusCode> {
+async fn abort(app: AppState, by: Who, u: User, teammate: Option<String>, id: String) -> Res<StatusCode> {
     let e = need_on(&app)?;
-    let s = e
-        .sessions
-        .get(&id, &u.id, teammate.as_deref())
-        .ok_or_else(|| crate::not_found("Login"))?;
-    let m = app
-        .db
-        .machine(&s.machine_id)
-        .ok_or_else(|| crate::not_found("Machine"))?;
+    let s = e.sessions.get(&id, &u.id, teammate.as_deref()).ok_or_else(|| crate::not_found("Login"))?;
+    let m = app.db.machine(&s.machine_id).ok_or_else(|| crate::not_found("Machine"))?;
     let (code, reply) = e
-        .call_agent(
-            &app,
-            &m,
-            reqwest::Method::POST,
-            &format!("/v1/logins/{id}/abort"),
-            &json!({}),
-        )
+        .call_agent(&app, &m, reqwest::Method::POST, &format!("/v1/logins/{id}/abort"), &json!({}))
         .await
-        .map_err(|why| {
-            ApiError(
-                StatusCode::BAD_GATEWAY,
-                format!("Its agent didn't answer: {why}"),
-            )
-        })?;
+        .map_err(|why| ApiError(StatusCode::BAD_GATEWAY, format!("Its agent didn't answer: {why}")))?;
     if !(200..300).contains(&code) {
         return Err(agent_error(code, &reply));
     }
-    let d = with_whose(
-        json!({ "harness": s.harness, "loginId": id, "reason": "asked" }),
-        teammate.as_deref(),
-    );
-    app.db
-        .record(&event(&by, "machine.harness_login_aborted", &m, d));
+    let d = with_whose(json!({ "harness": s.harness, "loginId": id, "reason": "asked" }), teammate.as_deref());
+    app.db.record(&event(&by, "machine.harness_login_aborted", &m, d));
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -603,21 +449,12 @@ async fn logout(app: AppState, by: Who, u: User, teammate: Option<String>, harne
     let (code, reply) = e
         .call_agent(&app, &m, reqwest::Method::POST, "/v1/logins/forget", &body)
         .await
-        .map_err(|why| {
-            ApiError(
-                StatusCode::BAD_GATEWAY,
-                format!("Its agent didn't answer: {why}"),
-            )
-        })?;
+        .map_err(|why| ApiError(StatusCode::BAD_GATEWAY, format!("Its agent didn't answer: {why}")))?;
     if !(200..300).contains(&code) {
         return Err(agent_error(code, &reply));
     }
-    let d = with_whose(
-        json!({ "harness": harness, "removed": reply["removed"] }),
-        teammate.as_deref(),
-    );
-    app.db
-        .record(&event(&by, "machine.harness_logged_out", &m, d));
+    let d = with_whose(json!({ "harness": harness, "removed": reply["removed"] }), teammate.as_deref());
+    app.db.record(&event(&by, "machine.harness_logged_out", &m, d));
     let mut v = match &teammate {
         None => view(&e, &m, &heartbeat(&app, &e, &m).await?),
         Some(t) => teammate_view(&app, &e, &m, t).await?,
@@ -645,14 +482,10 @@ fn with_whose(mut d: Value, teammate: Option<&str>) -> Value {
 /// (ADR 0048), and on an agent that keeps their logins apart (ADR 0062).
 fn need_teammate_logins(e: &Enrollment, hb: &Heartbeat) -> Res<()> {
     if !e.teammate_users {
-        return Err(conflict(
-            "Teammates have their own logins on a machine only with MACHINE_TEAMMATE_USERS=on.",
-        ));
+        return Err(conflict("Teammates have their own logins on a machine only with MACHINE_TEAMMATE_USERS=on."));
     }
     if !keeps_teammate_logins(hb) {
-        return Err(conflict(
-            "Its agent can't keep teammates' own logins: it is older than ADR 0062. Upgrade it.",
-        ));
+        return Err(conflict("Its agent can't keep teammates' own logins: it is older than ADR 0062. Upgrade it."));
     }
     Ok(())
 }
@@ -664,41 +497,21 @@ async fn teammate_view(app: &App, e: &Enrollment, m: &Machine, teammate: &str) -
     let (code, reply) = e
         .call_agent(app, m, reqwest::Method::GET, &path, &json!({}))
         .await
-        .map_err(|why| {
-            ApiError(
-                StatusCode::BAD_GATEWAY,
-                format!("Its agent didn't answer: {why}"),
-            )
-        })?;
+        .map_err(|why| ApiError(StatusCode::BAD_GATEWAY, format!("Its agent didn't answer: {why}")))?;
     if !(200..300).contains(&code) {
         return Err(agent_error(code, &reply));
     }
-    let said: wire::TeammateLogins = serde_json::from_value(reply).map_err(|_| {
-        ApiError(
-            StatusCode::BAD_GATEWAY,
-            "Its agent's answer didn't parse.".into(),
-        )
-    })?;
+    let said: wire::TeammateLogins = serde_json::from_value(reply).map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "Its agent's answer didn't parse.".into()))?;
     let harnesses: serde_json::Map<String, Value> = crate::adapters::NAMES
         .iter()
         .filter_map(|n| Some((n, recipe(n)?)))
         .map(|(n, r)| {
             let st = said.logins.get(*n).cloned().unwrap_or_default();
-            let state = if st.state.is_empty() {
-                wire::LOGGED_OUT
-            } else {
-                st.state.as_str()
-            };
-            (
-                n.to_string(),
-                json!({ "state": state, "since": st.since, "serverKey": keyed(None, &r) }),
-            )
+            let state = if st.state.is_empty() { wire::LOGGED_OUT } else { st.state.as_str() };
+            (n.to_string(), json!({ "state": state, "since": st.since, "serverKey": keyed(None, &r) }))
         })
         .collect();
-    let owner = app
-        .db
-        .user(&m.user_id)
-        .map(|o| json!({ "id": o.id, "name": o.name }));
+    let owner = app.db.user(&m.user_id).map(|o| json!({ "id": o.id, "name": o.name }));
     Ok(json!({
         "machineId": m.id, "owner": owner, "forUser": teammate, "logins": "on", "hasUser": said.known, "harnesses": harnesses,
     }))
@@ -813,11 +626,7 @@ fn teammate_of(app: &App, c: &Caller, owner_id: &str) -> Res<(User, String)> {
     let me = me(c)?;
     let hidden = || crate::not_found("Machine");
     let owner = app.db.user(owner_id).ok_or_else(hidden)?;
-    let on = app
-        .control_plane
-        .get()
-        .is_some_and(|cp| cp.teammate_users())
-        || here(app, &owner.id);
+    let on = app.control_plane.get().is_some_and(|cp| cp.teammate_users()) || here(app, &owner.id);
     if !on || !super::offboard::wanted(app, &owner.id, &me.id) {
         return Err(hidden());
     }
@@ -875,11 +684,7 @@ pub async fn teammate_abort(
 
 /// `GET /api/machine/teammate/{owner}/harness-logins`: whether each harness is logged in
 /// for the caller there.
-pub async fn teammate_status(
-    AppS(app): AppS<AppState>,
-    Extension(c): Extension<Caller>,
-    Path(owner): Path<String>,
-) -> Res {
+pub async fn teammate_status(AppS(app): AppS<AppState>, Extension(c): Extension<Caller>, Path(owner): Path<String>) -> Res {
     let (u, me) = teammate_of(&app, &c, &owner)?;
     if here(&app, &u.id) {
         return crate::teammate_logins::status(app, u, me).await;
@@ -910,19 +715,13 @@ fn admin_teammate(app: &AppState, key: &str, teammate: &str) -> Res<(User, Strin
     let u = need_user_key(app, key)?;
     let t = need_user_key(app, teammate)?;
     if t.id == u.id {
-        return Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            "That's the machine's owner: use /machine/harness-logins.".into(),
-        ));
+        return Err(ApiError(StatusCode::BAD_REQUEST, "That's the machine's owner: use /machine/harness-logins.".into()));
     }
     Ok((u, t.id))
 }
 
 /// `GET /api/users/{key}/machine/teammates/{teammate}/harness-logins`.
-pub async fn admin_teammate_status(
-    AppS(app): AppS<AppState>,
-    Path((key, teammate)): Path<(String, String)>,
-) -> Res {
+pub async fn admin_teammate_status(AppS(app): AppS<AppState>, Path((key, teammate)): Path<(String, String)>) -> Res {
     let (u, t) = admin_teammate(&app, &key, &teammate)?;
     if here(&app, &u.id) {
         return crate::teammate_logins::status(app, u, t).await;
@@ -949,25 +748,15 @@ mod tests {
 
     #[test]
     fn only_claude_and_codex_log_in_on_a_machine_and_heartbeats_ask_for_their_files() {
-        let with: Vec<&str> = crate::adapters::NAMES
-            .iter()
-            .copied()
-            .filter(|n| recipe(n).is_some())
-            .collect();
+        let with: Vec<&str> = crate::adapters::NAMES.iter().copied().filter(|n| recipe(n).is_some()).collect();
         assert_eq!(with, ["claude", "codex"]);
         assert_eq!(
             cred_query(),
-            [
-                "cred=claude%3A.claude%2F.credentials.json",
-                "cred=codex%3A.codex%2Fauth.json"
-            ]
+            ["cred=claude%3A.claude%2F.credentials.json", "cred=codex%3A.codex%2Fauth.json"]
         );
         for n in with {
             let r = recipe(n).unwrap();
-            assert!(
-                r.files.iter().all(|f| wire::home_path(f)) && !r.keys.is_empty(),
-                "{n}"
-            );
+            assert!(r.files.iter().all(|f| wire::home_path(f)) && !r.keys.is_empty(), "{n}");
         }
     }
 }

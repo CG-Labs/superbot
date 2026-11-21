@@ -44,19 +44,11 @@ impl Jwks {
         let keys = v["keys"].as_array().ok_or(Invalid("bad_jwks"))?;
         let keys = keys
             .iter()
-            .filter(|k| {
-                k["kty"] == "RSA"
-                    && k["use"].as_str().is_none_or(|u| u == "sig")
-                    && k["alg"].as_str().is_none_or(|a| a == "RS256")
-            })
+            .filter(|k| k["kty"] == "RSA" && k["use"].as_str().is_none_or(|u| u == "sig") && k["alg"].as_str().is_none_or(|a| a == "RS256"))
             .filter_map(|k| {
                 let n = unsigned(&B64.decode(k["n"].as_str()?).ok()?);
                 let e = unsigned(&B64.decode(k["e"].as_str()?).ok()?);
-                (!n.is_empty() && !e.is_empty()).then(|| Jwk {
-                    kid: k["kid"].as_str().map(String::from),
-                    n,
-                    e,
-                })
+                (!n.is_empty() && !e.is_empty()).then(|| Jwk { kid: k["kid"].as_str().map(String::from), n, e })
             })
             .collect();
         Ok(Jwks { keys })
@@ -88,9 +80,7 @@ pub fn decode(token: &str) -> Result<Token, Invalid> {
         return Err(Invalid("malformed"));
     }
     let mut parts = token.split('.');
-    let (Some(h), Some(p), Some(s), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
+    let (Some(h), Some(p), Some(s), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
         return Err(Invalid("malformed"));
     };
     let header = part(h)?;
@@ -112,35 +102,16 @@ pub fn decode(token: &str) -> Result<Token, Invalid> {
 impl Token {
     /// Signed by the key the header names, or by any key when it names none.
     pub fn verify(&self, jwks: &Jwks) -> Result<(), Invalid> {
-        let mut keys = jwks
-            .keys
-            .iter()
-            .filter(|k| self.kid.is_none() || k.kid == self.kid)
-            .peekable();
+        let mut keys = jwks.keys.iter().filter(|k| self.kid.is_none() || k.kid == self.kid).peekable();
         if keys.peek().is_none() {
             return Err(Invalid("unknown_key"));
         }
-        let ok = keys.any(|k| {
-            RsaPublicKeyComponents { n: &k.n, e: &k.e }
-                .verify(
-                    &RSA_PKCS1_2048_8192_SHA256,
-                    self.signed.as_bytes(),
-                    &self.sig,
-                )
-                .is_ok()
-        });
-        if ok {
-            Ok(())
-        } else {
-            Err(Invalid("bad_signature"))
-        }
+        let ok = keys.any(|k| RsaPublicKeyComponents { n: &k.n, e: &k.e }.verify(&RSA_PKCS1_2048_8192_SHA256, self.signed.as_bytes(), &self.sig).is_ok());
+        if ok { Ok(()) } else { Err(Invalid("bad_signature")) }
     }
 
     pub fn str(&self, name: &str) -> Option<&str> {
-        self.claims
-            .get(name)
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
+        self.claims.get(name).and_then(Value::as_str).filter(|s| !s.is_empty())
     }
 
     /// The OIDC checks every provider shares: audience, authorized party, times, nonce.
@@ -169,10 +140,7 @@ impl Token {
         if iat > now + SKEW || time("nbf").is_some_and(|nbf| nbf > now + SKEW) {
             return Err(Invalid("not_yet_valid"));
         }
-        if !self
-            .str("nonce")
-            .is_some_and(|n| crate::same(n.as_bytes(), nonce.as_bytes()))
-        {
+        if !self.str("nonce").is_some_and(|n| crate::same(n.as_bytes(), nonce.as_bytes())) {
             return Err(Invalid("nonce_mismatch"));
         }
         Ok(())
@@ -198,10 +166,7 @@ pub mod test_keys {
 
     impl Key {
         fn new(kid: &str) -> Key {
-            Key {
-                kid: kid.into(),
-                pair: KeyPair::generate(KeySize::Rsa2048).unwrap(),
-            }
+            Key { kid: kid.into(), pair: KeyPair::generate(KeySize::Rsa2048).unwrap() }
         }
 
         pub fn jwk(&self) -> Value {
@@ -210,28 +175,14 @@ pub mod test_keys {
         }
 
         pub fn sign_with(&self, header: &Value, claims: &Value) -> String {
-            let signed = format!(
-                "{}.{}",
-                B64.encode(header.to_string()),
-                B64.encode(claims.to_string())
-            );
+            let signed = format!("{}.{}", B64.encode(header.to_string()), B64.encode(claims.to_string()));
             let mut sig = vec![0; self.pair.public_modulus_len()];
-            self.pair
-                .sign(
-                    &signature::RSA_PKCS1_SHA256,
-                    &SystemRandom::new(),
-                    signed.as_bytes(),
-                    &mut sig,
-                )
-                .unwrap();
+            self.pair.sign(&signature::RSA_PKCS1_SHA256, &SystemRandom::new(), signed.as_bytes(), &mut sig).unwrap();
             format!("{signed}.{}", B64.encode(sig))
         }
 
         pub fn sign(&self, claims: &Value) -> String {
-            self.sign_with(
-                &json!({ "alg": "RS256", "typ": "JWT", "kid": self.kid }),
-                claims,
-            )
+            self.sign_with(&json!({ "alg": "RS256", "typ": "JWT", "kid": self.kid }), claims)
         }
     }
 
@@ -256,12 +207,7 @@ mod tests {
 
     fn nonce() -> &'static str {
         static N: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-        N.get_or_init(|| {
-            crate::random_bytes(16)
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect()
-        })
+        N.get_or_init(|| crate::random_bytes(16).iter().map(|b| format!("{b:02x}")).collect())
     }
 
     fn claims() -> Value {
@@ -279,10 +225,7 @@ mod tests {
     fn accepts_a_good_token_signed_by_any_published_key() {
         let [k1, k2] = keys();
         let set = Jwks::parse(&jwks(&[k1, k2])).unwrap();
-        assert_eq!(
-            check(&k1.sign(&claims()), &set).unwrap().str("sub"),
-            Some("s")
-        );
+        assert_eq!(check(&k1.sign(&claims()), &set).unwrap().str("sub"), Some("s"));
         assert!(check(&k2.sign(&claims()), &set).is_ok());
         let no_kid = k2.sign_with(&json!({ "alg": "RS256" }), &claims());
         assert!(check(&no_kid, &set).is_ok(), "no kid: try each key");
@@ -293,14 +236,8 @@ mod tests {
         let [k1, k2] = keys();
         let only_k1 = Jwks::parse(&jwks(&[k1])).unwrap();
         let forged = k2.sign_with(&json!({ "alg": "RS256", "kid": "k1" }), &claims());
-        assert_eq!(
-            check(&forged, &only_k1).err(),
-            Some(Invalid("bad_signature"))
-        );
-        assert_eq!(
-            check(&k2.sign(&claims()), &only_k1).err(),
-            Some(Invalid("unknown_key"))
-        );
+        assert_eq!(check(&forged, &only_k1).err(), Some(Invalid("bad_signature")));
+        assert_eq!(check(&k2.sign(&claims()), &only_k1).err(), Some(Invalid("unknown_key")));
 
         let good = k1.sign(&claims());
         let (head, rest) = good.split_once('.').unwrap();
@@ -308,30 +245,13 @@ mod tests {
         let mut c = claims();
         c["sub"] = json!("admin");
         let tampered = format!("{head}.{}.{sig}", B64.encode(c.to_string()));
-        assert_eq!(
-            check(&tampered, &only_k1).err(),
-            Some(Invalid("bad_signature"))
-        );
+        assert_eq!(check(&tampered, &only_k1).err(), Some(Invalid("bad_signature")));
 
-        let unsigned = format!(
-            "{}.{}.",
-            B64.encode(r#"{"alg":"none"}"#),
-            B64.encode(claims().to_string())
-        );
-        assert_eq!(
-            check(&unsigned, &only_k1).err(),
-            Some(Invalid("bad_algorithm"))
-        );
-        let hs = format!(
-            "{}.{}.{sig}",
-            B64.encode(r#"{"alg":"HS256","kid":"k1"}"#),
-            B64.encode(claims().to_string())
-        );
+        let unsigned = format!("{}.{}.", B64.encode(r#"{"alg":"none"}"#), B64.encode(claims().to_string()));
+        assert_eq!(check(&unsigned, &only_k1).err(), Some(Invalid("bad_algorithm")));
+        let hs = format!("{}.{}.{sig}", B64.encode(r#"{"alg":"HS256","kid":"k1"}"#), B64.encode(claims().to_string()));
         assert_eq!(check(&hs, &only_k1).err(), Some(Invalid("bad_algorithm")));
-        let crit = k1.sign_with(
-            &json!({ "alg": "RS256", "kid": "k1", "crit": ["x"] }),
-            &claims(),
-        );
+        let crit = k1.sign_with(&json!({ "alg": "RS256", "kid": "k1", "crit": ["x"] }), &claims());
         assert_eq!(check(&crit, &only_k1).err(), Some(Invalid("bad_algorithm")));
         for junk in ["", "a.b", "a.b.c.d", "!!.!!.!!", &format!("{good}x")] {
             assert!(check(junk, &only_k1).is_err(), "{junk}");
@@ -339,13 +259,7 @@ mod tests {
         assert!(Jwks::parse(&json!({ "nope": [] })).is_err());
         let mut enc = k1.jwk();
         enc["use"] = json!("enc");
-        assert!(
-            Jwks::parse(&json!({ "keys": [enc] }))
-                .unwrap()
-                .keys
-                .is_empty(),
-            "encryption keys are not signing keys"
-        );
+        assert!(Jwks::parse(&json!({ "keys": [enc] })).unwrap().keys.is_empty(), "encryption keys are not signing keys");
     }
 
     #[test]
@@ -357,58 +271,23 @@ mod tests {
             f(&mut c);
             check(&k1.sign(&c), &set).err()
         };
-        assert_eq!(
-            with(&|c| c["aud"] = json!("client-2")),
-            Some(Invalid("wrong_audience"))
-        );
-        assert_eq!(
-            with(&|c| c["aud"] = json!(["client-2", "client-1"])),
-            Some(Invalid("wrong_audience")),
-            "several audiences need azp"
-        );
-        assert_eq!(
-            with(&|c| {
-                c["aud"] = json!(["client-2", "client-1"]);
-                c["azp"] = json!("client-1");
-            }),
-            None
-        );
-        assert_eq!(
-            with(&|c| c["azp"] = json!("client-2")),
-            Some(Invalid("wrong_audience"))
-        );
-        assert_eq!(
-            with(&|c| c["exp"] = json!(NOW - SKEW - 1)),
-            Some(Invalid("expired"))
-        );
-        assert_eq!(
-            with(&|c| c["exp"] = json!(NOW - 60)),
-            None,
-            "within the clock skew"
-        );
-        assert_eq!(
-            with(&|c| c["nbf"] = json!(NOW + SKEW + 60)),
-            Some(Invalid("not_yet_valid"))
-        );
-        assert_eq!(
-            with(&|c| c["iat"] = json!(NOW + SKEW + 60)),
-            Some(Invalid("not_yet_valid"))
-        );
-        assert_eq!(
-            with(&|c| {
-                c.as_object_mut().unwrap().remove("exp");
-            }),
-            Some(Invalid("malformed"))
-        );
-        assert_eq!(
-            with(&|c| c["nonce"] = json!("n-2")),
-            Some(Invalid("nonce_mismatch"))
-        );
-        assert_eq!(
-            with(&|c| {
-                c.as_object_mut().unwrap().remove("nonce");
-            }),
-            Some(Invalid("nonce_mismatch"))
-        );
+        assert_eq!(with(&|c| c["aud"] = json!("client-2")), Some(Invalid("wrong_audience")));
+        assert_eq!(with(&|c| c["aud"] = json!(["client-2", "client-1"])), Some(Invalid("wrong_audience")), "several audiences need azp");
+        assert_eq!(with(&|c| {
+            c["aud"] = json!(["client-2", "client-1"]);
+            c["azp"] = json!("client-1");
+        }), None);
+        assert_eq!(with(&|c| c["azp"] = json!("client-2")), Some(Invalid("wrong_audience")));
+        assert_eq!(with(&|c| c["exp"] = json!(NOW - SKEW - 1)), Some(Invalid("expired")));
+        assert_eq!(with(&|c| c["exp"] = json!(NOW - 60)), None, "within the clock skew");
+        assert_eq!(with(&|c| c["nbf"] = json!(NOW + SKEW + 60)), Some(Invalid("not_yet_valid")));
+        assert_eq!(with(&|c| c["iat"] = json!(NOW + SKEW + 60)), Some(Invalid("not_yet_valid")));
+        assert_eq!(with(&|c| {
+            c.as_object_mut().unwrap().remove("exp");
+        }), Some(Invalid("malformed")));
+        assert_eq!(with(&|c| c["nonce"] = json!("n-2")), Some(Invalid("nonce_mismatch")));
+        assert_eq!(with(&|c| {
+            c.as_object_mut().unwrap().remove("nonce");
+        }), Some(Invalid("nonce_mismatch")));
     }
 }

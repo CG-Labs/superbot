@@ -7,7 +7,7 @@
 //! stops any that get through.
 //! Sandbox (ADR 0055): `workspace-write` with the network on, else none at all.
 
-use super::{Adapter, AgentEvent, ModelOption, RunInput, Usage, output, short, str_of};
+use super::{output, short, str_of, Adapter, AgentEvent, ModelOption, RunInput, Usage};
 use serde_json::Value;
 
 #[derive(Default)]
@@ -22,21 +22,14 @@ pub struct Codex {
 /// `--sandbox`, so both take it as config. Never asking (`approval_policy`): what the
 /// sandbox blocks fails, and SuperBot's hook is the approval gate.
 fn sandbox_config(s: &super::Sandbox) -> Vec<String> {
-    let roots: Vec<Value> = s
-        .writable
-        .iter()
-        .map(|p| Value::String(p.display().to_string()))
-        .collect();
+    let roots: Vec<Value> = s.writable.iter().map(|p| Value::String(p.display().to_string())).collect();
     let mut c = vec![
         "sandbox_mode=\"workspace-write\"".to_string(),
         "approval_policy=\"never\"".into(),
         "sandbox_workspace_write.network_access=true".into(),
     ];
     if !roots.is_empty() {
-        c.push(format!(
-            "sandbox_workspace_write.writable_roots={}",
-            Value::Array(roots)
-        ));
+        c.push(format!("sandbox_workspace_write.writable_roots={}", Value::Array(roots)));
     }
     c.into_iter().flat_map(|v| ["-c".to_string(), v]).collect()
 }
@@ -57,21 +50,12 @@ impl Adapter for Codex {
             Some(s) => a.extend(sandbox_config(s)),
             None => a.push("--dangerously-bypass-approvals-and-sandbox".into()),
         }
-        a.extend([
-            "-c".into(),
-            format!(
-                "developer_instructions={}",
-                Value::String(input.system.clone())
-            ),
-        ]);
+        a.extend(["-c".into(), format!("developer_instructions={}", Value::String(input.system.clone()))]);
         if let Some(m) = &input.model {
             a.extend(["-m".into(), m.clone()]);
         }
         if let Some(e) = &input.effort {
-            a.extend([
-                "-c".into(),
-                format!("model_reasoning_effort={}", Value::String(e.clone())),
-            ]);
+            a.extend(["-c".into(), format!("model_reasoning_effort={}", Value::String(e.clone()))]);
         }
         // Codex reads Claude-style PreToolUse hooks. Inline hooks need trust, which
         // `exec` can't prompt for; we generate this one, so we vouch for it.
@@ -81,13 +65,7 @@ impl Adapter for Codex {
                 Value::String(g.command.clone()),
                 g.timeout_secs
             );
-            a.extend([
-                "-c".into(),
-                "features.hooks=true".into(),
-                "-c".into(),
-                hooks,
-                "--dangerously-bypass-hook-trust".into(),
-            ]);
+            a.extend(["-c".into(), "features.hooks=true".into(), "-c".into(), hooks, "--dangerously-bypass-hook-trust".into()]);
         }
         a.push("--".into());
         if let Some(id) = &input.session_id {
@@ -106,25 +84,17 @@ impl Adapter for Codex {
             && !matches!(str_of(item, "status"), "failed" | "declined")
             && item["error"].is_null()
         {
-            let name = if kind == "command_execution" {
-                "shell"
-            } else {
-                kind
-            };
+            let name = if kind == "command_execution" { "shell" } else { kind };
             out.push(AgentEvent::ToolRan { name: name.into() });
         }
         match str_of(e, "type") {
             "thread.started" => out.push(AgentEvent::Session(str_of(e, "thread_id").into())),
-            "item.completed"
-                if kind == "agent_message" && !str_of(item, "text").trim().is_empty() =>
-            {
+            "item.completed" if kind == "agent_message" && !str_of(item, "text").trim().is_empty() => {
                 out.push(AgentEvent::Text(str_of(item, "text").into()))
             }
             // A note, not an error: a command's output may only quote bubblewrap, and the
             // Bot may still finish the task.
-            "item.completed"
-                if kind == "command_execution" && self.sandboxed && !self.sandbox_failed =>
-            {
+            "item.completed" if kind == "command_execution" && self.sandboxed && !self.sandbox_failed => {
                 if let Some(why) = sandbox_failure(str_of(item, "aggregated_output")) {
                     self.sandbox_failed = true;
                     out.push(AgentEvent::Text(format!(
@@ -133,45 +103,28 @@ impl Adapter for Codex {
                     )));
                 }
             }
-            "item.started" if kind == "command_execution" => out.push(AgentEvent::Tool {
-                name: "shell".into(),
-                detail: unwrap(str_of(item, "command")),
-            }),
+            "item.started" if kind == "command_execution" => {
+                out.push(AgentEvent::Tool { name: "shell".into(), detail: unwrap(str_of(item, "command")) })
+            }
             "item.started" if !kind.is_empty() && kind != "reasoning" => {
                 let detail = match (item["server"].as_str(), item["tool"].as_str()) {
                     (Some(s), Some(t)) => format!("{s}.{t}"),
                     _ => str_of(item, "query").into(),
                 };
-                out.push(AgentEvent::Tool {
-                    name: kind.into(),
-                    detail,
-                })
+                out.push(AgentEvent::Tool { name: kind.into(), detail })
             }
             // OpenAI counts cached prompt tokens inside `input_tokens`, and reasoning inside
             // `output_tokens`; `codex exec` doesn't name the model.
             "turn.completed" => {
                 let u = &e["usage"];
-                let (input, read, write) = (
-                    Usage::count(&u["input_tokens"]),
-                    Usage::count(&u["cached_input_tokens"]),
-                    Usage::count(&u["cache_write_input_tokens"]),
-                );
-                let usage = Usage {
-                    model: None,
-                    input: input.saturating_sub(read).saturating_sub(write),
-                    output: Usage::count(&u["output_tokens"]),
-                    cache_read: read,
-                    cache_write: write,
-                };
+                let (input, read, write) = (Usage::count(&u["input_tokens"]), Usage::count(&u["cached_input_tokens"]), Usage::count(&u["cache_write_input_tokens"]));
+                let usage = Usage { model: None, input: input.saturating_sub(read).saturating_sub(write), output: Usage::count(&u["output_tokens"]), cache_read: read, cache_write: write };
                 if usage.total() > 0 {
                     out.push(AgentEvent::Usage(usage));
                 }
             }
             "turn.failed" | "error" => {
-                let msg = e["error"]["message"]
-                    .as_str()
-                    .or(e["message"].as_str())
-                    .unwrap_or("Codex failed");
+                let msg = e["error"]["message"].as_str().or(e["message"].as_str()).unwrap_or("Codex failed");
                 out.push(AgentEvent::Error(msg.into()))
             }
             _ => {}
@@ -213,8 +166,7 @@ impl Adapter for Codex {
     }
 
     fn models(&self) -> Vec<ModelOption> {
-        let v: Value =
-            serde_json::from_str(&output("codex", &["debug", "models"])).unwrap_or_default();
+        let v: Value = serde_json::from_str(&output("codex", &["debug", "models"])).unwrap_or_default();
         v["models"]
             .as_array()
             .into_iter()
@@ -222,10 +174,7 @@ impl Adapter for Codex {
             .filter(|m| str_of(m, "visibility") == "list")
             .map(|m| ModelOption {
                 id: str_of(m, "slug").into(),
-                label: m["display_name"]
-                    .as_str()
-                    .unwrap_or(str_of(m, "slug"))
-                    .into(),
+                label: m["display_name"].as_str().unwrap_or(str_of(m, "slug")).into(),
                 efforts: m["supported_reasoning_levels"]
                     .as_array()
                     .into_iter()
@@ -241,17 +190,8 @@ impl Adapter for Codex {
 /// bubblewrap's own error when it can't make the sandbox: no user namespaces (a
 /// container, Ubuntu's AppArmor restriction), or no network namespace.
 fn sandbox_failure(output: &str) -> Option<&str> {
-    const SIGNS: [&str; 5] = [
-        "namespace",
-        "uid map",
-        "setting up uid",
-        "loopback",
-        "No permissions to create",
-    ];
-    output
-        .lines()
-        .map(str::trim)
-        .find(|l| l.starts_with("bwrap:") && SIGNS.iter().any(|s| l.contains(s)))
+    const SIGNS: [&str; 5] = ["namespace", "uid map", "setting up uid", "loopback", "No permissions to create"];
+    output.lines().map(str::trim).find(|l| l.starts_with("bwrap:") && SIGNS.iter().any(|s| l.contains(s)))
 }
 
 /// "/bin/bash -lc 'echo hi'" -> "echo hi"
@@ -274,28 +214,11 @@ mod tests {
         let mut out = Vec::new();
         let line = r#"{"type":"turn.completed","usage":{"input_tokens":24763,"cached_input_tokens":24448,"cache_write_input_tokens":0,"output_tokens":122,"reasoning_output_tokens":64}}"#;
         Codex::default().on_event(&serde_json::from_str(line).unwrap(), &mut out);
-        let [AgentEvent::Usage(u)] = out.as_slice() else {
-            panic!("one usage event")
-        };
-        assert_eq!(
-            (
-                u.model.as_deref(),
-                u.input,
-                u.cache_read,
-                u.output,
-                u.total()
-            ),
-            (None, 315, 24448, 122, 24885)
-        );
+        let [AgentEvent::Usage(u)] = out.as_slice() else { panic!("one usage event") };
+        assert_eq!((u.model.as_deref(), u.input, u.cache_read, u.output, u.total()), (None, 315, 24448, 122, 24885));
         out.clear();
-        Codex::default().on_event(
-            &serde_json::from_str(r#"{"type":"turn.completed","usage":{}}"#).unwrap(),
-            &mut out,
-        );
-        Codex::default().on_event(
-            &serde_json::from_str(r#"{"type":"turn.completed"}"#).unwrap(),
-            &mut out,
-        );
+        Codex::default().on_event(&serde_json::from_str(r#"{"type":"turn.completed","usage":{}}"#).unwrap(), &mut out);
+        Codex::default().on_event(&serde_json::from_str(r#"{"type":"turn.completed"}"#).unwrap(), &mut out);
         assert!(out.is_empty(), "no counts: unknown");
     }
 
@@ -318,23 +241,10 @@ mod tests {
         for l in lines {
             c.on_event(&serde_json::from_str(l).unwrap(), &mut out);
         }
-        let ran: Vec<&str> = out
-            .iter()
-            .filter_map(|e| {
-                if let AgentEvent::ToolRan { name } = e {
-                    Some(name.as_str())
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let ran: Vec<&str> = out.iter().filter_map(|e| if let AgentEvent::ToolRan { name } = e { Some(name.as_str()) } else { None }).collect();
         assert_eq!(ran, ["file_change", "mcp_tool_call", "shell", "todo_list"]);
         let hooked: Vec<&str> = ran.into_iter().filter(|t| c.hooks_tool(t)).collect();
-        assert_eq!(
-            hooked,
-            ["file_change", "mcp_tool_call", "shell"],
-            "not plans, nor hosted web search"
-        );
+        assert_eq!(hooked, ["file_change", "mcp_tool_call", "shell"], "not plans, nor hosted web search");
         assert!(!c.hooks_tool("web_search"));
     }
 
@@ -342,44 +252,22 @@ mod tests {
     fn ci_tests_the_oldest_codex_runs_accept() {
         let wf = include_str!("../../../.github/workflows/harness-e2e.yml");
         let min = Codex::default().hooks_since().unwrap();
-        assert!(
-            wf.contains(&format!("CODEX_MIN_HOOKS: '{min}'")),
-            "CODEX_MIN_HOOKS in harness-e2e.yml is {min}"
-        );
+        assert!(wf.contains(&format!("CODEX_MIN_HOOKS: '{min}'")), "CODEX_MIN_HOOKS in harness-e2e.yml is {min}");
     }
 
     #[test]
     fn a_sandbox_that_cant_start_is_said_once() {
         let mut out = Vec::new();
         let done = |o: &str| json!({ "type": "item.completed", "item": { "type": "command_execution", "aggregated_output": o, "status": "failed" } });
-        let failed = done(
-            "bwrap: No permissions to create new namespace, likely because the kernel does not allow non-privileged user namespaces.\n",
-        );
+        let failed = done("bwrap: No permissions to create new namespace, likely because the kernel does not allow non-privileged user namespaces.\n");
         Codex::default().on_event(&failed, &mut out);
-        assert!(
-            out.is_empty(),
-            "without the sandbox it's only a command's output"
-        );
-        let mut c = Codex {
-            sandboxed: true,
-            ..Default::default()
-        };
+        assert!(out.is_empty(), "without the sandbox it's only a command's output");
+        let mut c = Codex { sandboxed: true, ..Default::default() };
         c.on_event(&done("total 0\nbwrap is a fine word\n"), &mut out);
         assert!(out.is_empty());
         c.on_event(&failed, &mut out);
-        c.on_event(
-            &done("bwrap: setting up uid map: Permission denied\n"),
-            &mut out,
-        );
-        let [AgentEvent::Text(e)] = out.as_slice() else {
-            panic!(
-                "one note, not an error that fails the task, got {}",
-                out.len()
-            )
-        };
-        assert!(
-            e.contains("bubblewrap") && e.contains("No permissions to create new namespace"),
-            "{e}"
-        );
+        c.on_event(&done("bwrap: setting up uid map: Permission denied\n"), &mut out);
+        let [AgentEvent::Text(e)] = out.as_slice() else { panic!("one note, not an error that fails the task, got {}", out.len()) };
+        assert!(e.contains("bubblewrap") && e.contains("No permissions to create new namespace"), "{e}");
     }
 }

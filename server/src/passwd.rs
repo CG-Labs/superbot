@@ -23,9 +23,7 @@ pub fn by_uid(uid: u32) -> Option<Account> {
     lookup(|pw, buf, len, res| unsafe { libc::getpwuid_r(uid, pw, buf, len, res) })
 }
 
-fn lookup(
-    call: impl Fn(*mut libc::passwd, *mut libc::c_char, usize, *mut *mut libc::passwd) -> libc::c_int,
-) -> Option<Account> {
+fn lookup(call: impl Fn(*mut libc::passwd, *mut libc::c_char, usize, *mut *mut libc::passwd) -> libc::c_int) -> Option<Account> {
     let mut buf = vec![0 as libc::c_char; 4096];
     loop {
         // SAFETY: passwd is plain data; all-zero is a valid value to be overwritten.

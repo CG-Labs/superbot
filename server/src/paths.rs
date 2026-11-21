@@ -18,13 +18,9 @@ pub fn root(dir: &str) -> io::Result<PathBuf> {
             c => p.push(c),
         }
     }
-    let s = p
-        .to_str()
-        .ok_or_else(|| io::Error::other(format!("{dir}: path is not UTF-8")))?;
+    let s = p.to_str().ok_or_else(|| io::Error::other(format!("{dir}: path is not UTF-8")))?;
     if s.contains("..") {
-        return Err(io::Error::other(format!(
-            "{dir}: folder names can't contain \"..\""
-        )));
+        return Err(io::Error::other(format!("{dir}: folder names can't contain \"..\"")));
     }
     std::fs::create_dir_all(s)?;
     std::fs::canonicalize(s)
@@ -43,11 +39,7 @@ pub fn child(root: &Path, name: &str) -> Option<PathBuf> {
         return None;
     }
     let p = root.join(name);
-    if p.starts_with(root) && p.parent() == Some(root) {
-        Some(p)
-    } else {
-        None
-    }
+    if p.starts_with(root) && p.parent() == Some(root) { Some(p) } else { None }
 }
 
 /// Whether `path`, as another computer reported it, names something strictly under
@@ -56,8 +48,7 @@ pub fn under(root: &str, path: &str) -> bool {
     let root = Path::new(root);
     root.is_absolute()
         && Path::new(path).strip_prefix(root).is_ok_and(|rest| {
-            rest.components().next().is_some()
-                && rest.components().all(|c| matches!(c, Component::Normal(_)))
+            rest.components().next().is_some() && rest.components().all(|c| matches!(c, Component::Normal(_)))
         })
         && !path.contains("/./")
 }
@@ -70,15 +61,7 @@ mod tests {
     fn under_stays_strictly_inside() {
         assert!(under("/home/bots", "/home/bots/.npm"));
         assert!(under("/home/bots", "/home/bots/.cargo/registry"));
-        for bad in [
-            "/home/bots",
-            "/home/bots/",
-            "/home/bots/../etc",
-            "/home/bots/./x",
-            "/home/botsx/.npm",
-            "relative/.npm",
-            "/etc",
-        ] {
+        for bad in ["/home/bots", "/home/bots/", "/home/bots/../etc", "/home/bots/./x", "/home/botsx/.npm", "relative/.npm", "/etc"] {
             assert!(!under("/home/bots", bad), "{bad}");
         }
         assert!(!under("relative", "relative/x"));
@@ -88,21 +71,8 @@ mod tests {
     fn child_keeps_plain_names_inside_the_root() {
         let r = Path::new("/srv/data");
         assert_eq!(child(r, "bots"), Some(PathBuf::from("/srv/data/bots")));
-        assert_eq!(
-            child(r, "MEMORY.md"),
-            Some(PathBuf::from("/srv/data/MEMORY.md"))
-        );
-        for bad in [
-            "",
-            ".",
-            "..",
-            "../etc",
-            "a/b",
-            "/etc/passwd",
-            "a\\b",
-            "x..y",
-            "a\0b",
-        ] {
+        assert_eq!(child(r, "MEMORY.md"), Some(PathBuf::from("/srv/data/MEMORY.md")));
+        for bad in ["", ".", "..", "../etc", "a/b", "/etc/passwd", "a\\b", "x..y", "a\0b"] {
             assert_eq!(child(r, bad), None, "{bad:?}");
         }
     }

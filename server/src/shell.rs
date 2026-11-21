@@ -93,10 +93,7 @@ pub fn parse(src: &str, depth: usize) -> Result<Vec<Command>, Error> {
 }
 
 /// Words that open or close a compound command. They don't name a program.
-const RESERVED: [&str; 14] = [
-    "if", "then", "else", "elif", "fi", "do", "done", "while", "until", "!", "{", "}", "time",
-    "esac",
-];
+const RESERVED: [&str; 14] = ["if", "then", "else", "elif", "fi", "do", "done", "while", "until", "!", "{", "}", "time", "esac"];
 
 struct Heredoc {
     id: usize,
@@ -129,23 +126,12 @@ struct Parser {
 }
 
 fn is_name(s: &str) -> bool {
-    s.chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    s.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 impl Parser {
     fn new(s: Vec<char>, depth: usize, out: Vec<Command>) -> Parser {
-        Parser {
-            s,
-            i: 0,
-            depth,
-            out,
-            heredocs: Vec::new(),
-            next_heredoc: 0,
-            pending: Pending::default(),
-        }
+        Parser { s, i: 0, depth, out, heredocs: Vec::new(), next_heredoc: 0, pending: Pending::default() }
     }
 
     fn peek(&self) -> Option<char> {
@@ -173,9 +159,7 @@ impl Parser {
     }
 
     fn skip_blanks(&mut self) {
-        while matches!(self.peek(), Some(' ' | '\t'))
-            || (self.peek() == Some('\\') && self.peek_at(1) == Some('\n'))
-        {
+        while matches!(self.peek(), Some(' ' | '\t')) || (self.peek() == Some('\\') && self.peek_at(1) == Some('\n')) {
             self.i += if self.peek() == Some('\\') { 2 } else { 1 };
         }
     }
@@ -199,34 +183,21 @@ impl Parser {
     fn sub(&mut self, text: String, heredoc_body: bool) -> Result<(), Error> {
         self.nested(|p| {
             let mut q = Parser::new(text.chars().collect(), p.depth, std::mem::take(&mut p.out));
-            let r = if heredoc_body {
-                q.text(None, &mut Word::default())
-            } else {
-                q.list(false)
-            };
+            let r = if heredoc_body { q.text(None, &mut Word::default()) } else { q.list(false) };
             p.out = q.out;
             r
         })
     }
 
     /// Ends the current simple command. Returns its index if it names a program.
-    fn end_command(
-        &mut self,
-        argv: &mut Vec<Word>,
-        pipe_from: &mut Option<usize>,
-    ) -> Result<Option<usize>, Error> {
+    fn end_command(&mut self, argv: &mut Vec<Word>, pipe_from: &mut Option<usize>) -> Result<Option<usize>, Error> {
         let from = pipe_from.take();
         let pending = std::mem::take(&mut self.pending);
         let mut words = std::mem::take(argv);
-        let skip = words
-            .iter()
-            .take_while(|w| !w.dynamic && RESERVED.contains(&w.text.as_str()))
-            .count();
+        let skip = words.iter().take_while(|w| !w.dynamic && RESERVED.contains(&w.text.as_str())).count();
         words.drain(..skip);
         // Loop headers and `function f` name no program; their substitutions are already recorded.
-        let header = words.first().is_some_and(|w| {
-            !w.dynamic && ["for", "select", "function"].contains(&w.text.as_str())
-        });
+        let header = words.first().is_some_and(|w| !w.dynamic && ["for", "select", "function"].contains(&w.text.as_str()));
         if words.is_empty() || header {
             return Ok(None);
         }
@@ -234,18 +205,10 @@ impl Parser {
             return Err(Error::TooMany);
         }
         let idx = self.out.len();
-        if let Some(h) = pending
-            .heredoc
-            .and_then(|id| self.heredocs.iter_mut().find(|h| h.id == id))
-        {
+        if let Some(h) = pending.heredoc.and_then(|id| self.heredocs.iter_mut().find(|h| h.id == id)) {
             h.feeds = Some(idx);
         }
-        self.out.push(Command {
-            argv: words,
-            pipe_from: from,
-            stdin: pending.stdin,
-            writes: pending.writes,
-        });
+        self.out.push(Command { argv: words, pipe_from: from, stdin: pending.stdin, writes: pending.writes });
         Ok(Some(idx))
     }
 
@@ -339,36 +302,20 @@ impl Parser {
                 _ => {
                     let w = self.word()?;
                     // `2>file`: digits right before a redirection are its fd, not a word.
-                    if matches!(self.peek(), Some('<' | '>'))
-                        && !w.dynamic
-                        && !w.text.is_empty()
-                        && w.text.chars().all(|c| c.is_ascii_digit())
-                    {
+                    if matches!(self.peek(), Some('<' | '>')) && !w.dynamic && !w.text.is_empty() && w.text.chars().all(|c| c.is_ascii_digit()) {
                         self.pending.fd = Some(w.text);
                         continue;
                     }
-                    let test = !w.dynamic
-                        && w.text == "[["
-                        && argv
-                            .iter()
-                            .all(|w| !w.dynamic && RESERVED.contains(&w.text.as_str()));
+                    let test = !w.dynamic && w.text == "[[" && argv.iter().all(|w| !w.dynamic && RESERVED.contains(&w.text.as_str()));
                     argv.push(w);
                     if test {
                         self.condition()?;
-                        argv.push(Word {
-                            text: "]]".into(),
-                            dynamic: false,
-                        });
+                        argv.push(Word { text: "]]".into(), dynamic: false });
                     }
                     // Headers are short; checking only short commands keeps this linear.
                     if argv.len() <= 8 {
-                        let head: Vec<&Word> = argv
-                            .iter()
-                            .skip_while(|w| !w.dynamic && RESERVED.contains(&w.text.as_str()))
-                            .collect();
-                        let plain = |k: usize, s: &str| {
-                            head.get(k).is_some_and(|w| !w.dynamic && w.text == s)
-                        };
+                        let head: Vec<&Word> = argv.iter().skip_while(|w| !w.dynamic && RESERVED.contains(&w.text.as_str())).collect();
+                        let plain = |k: usize, s: &str| head.get(k).is_some_and(|w| !w.dynamic && w.text == s);
                         if head.len() == 3 && plain(0, "case") && plain(2, "in") {
                             argv.clear();
                             cases += 1;
@@ -408,12 +355,8 @@ impl Parser {
     /// The plain word `w` starts here and ends at a separator.
     fn at_word(&self, w: &str) -> bool {
         let n = w.chars().count();
-        w.chars()
-            .enumerate()
-            .all(|(k, c)| self.peek_at(k) == Some(c))
-            && self
-                .peek_at(n)
-                .is_none_or(|c| c.is_whitespace() || ";&|()<>".contains(c))
+        w.chars().enumerate().all(|(k, c)| self.peek_at(k) == Some(c))
+            && self.peek_at(n).is_none_or(|c| c.is_whitespace() || ";&|()<>".contains(c))
     }
 
     /// The rest of `[[ … ]]`, where `( ) | & < >` are operands, not operators.
@@ -466,9 +409,7 @@ impl Parser {
                     return Ok(());
                 }
                 Some('|') => self.i += 1,
-                Some(c) if c.is_whitespace() || ";&(<>".contains(c) => {
-                    return Err(Error::Unexpected(c));
-                }
+                Some(c) if c.is_whitespace() || ";&(<>".contains(c) => return Err(Error::Unexpected(c)),
                 Some(_) => {
                     self.word()?;
                 }
@@ -484,10 +425,7 @@ impl Parser {
         if self.peek() == Some('(') {
             self.i += 1;
             self.nested(|p| p.list(true))?;
-            argv.push(Word {
-                text: format!("{c}(…)"),
-                dynamic: true,
-            });
+            argv.push(Word { text: format!("{c}(…)"), dynamic: true });
             return Ok(());
         }
         let (mut here_string, mut read_write) = (false, false);
@@ -503,18 +441,9 @@ impl Parser {
                 }
                 let (id, expand) = (self.next_heredoc, !raw.contains(['\'', '"', '\\']));
                 self.next_heredoc += 1;
-                self.heredocs.push(Heredoc {
-                    id,
-                    delim: w.text,
-                    expand,
-                    strip_tabs,
-                    feeds: None,
-                });
+                self.heredocs.push(Heredoc { id, delim: w.text, expand, strip_tabs, feeds: None });
                 if stdin {
-                    self.pending.stdin = Some(Input::Heredoc {
-                        body: String::new(),
-                        expand,
-                    });
+                    self.pending.stdin = Some(Input::Heredoc { body: String::new(), expand });
                     self.pending.heredoc = Some(id);
                 }
                 return Ok(());
@@ -529,14 +458,10 @@ impl Parser {
         self.skip_blanks();
         let target = match self.peek() {
             None => return Err(Error::Unterminated("redirection")),
-            Some(c) if c.is_whitespace() || ";&|()<>".contains(c) => {
-                return Err(Error::Unexpected(c));
-            }
+            Some(c) if c.is_whitespace() || ";&|()<>".contains(c) => return Err(Error::Unexpected(c)),
             Some(_) => self.word()?,
         };
-        let fd_dup = dup
-            && !target.dynamic
-            && (target.text == "-" || target.text.chars().all(|c| c.is_ascii_digit()));
+        let fd_dup = dup && !target.dynamic && (target.text == "-" || target.text.chars().all(|c| c.is_ascii_digit()));
         if c == '>' && !fd_dup || read_write {
             self.pending.writes.push(target.clone());
         }
@@ -562,22 +487,14 @@ impl Parser {
                 }
                 let line: String = self.s[start..self.i].iter().collect();
                 self.eat('\n');
-                let l = if h.strip_tabs {
-                    line.trim_start_matches('\t')
-                } else {
-                    &line
-                };
+                let l = if h.strip_tabs { line.trim_start_matches('\t') } else { &line };
                 if l == h.delim {
                     break;
                 }
                 body.push_str(l);
                 body.push('\n');
             }
-            if let Some(Command {
-                stdin: Some(Input::Heredoc { body: b, .. }),
-                ..
-            }) = h.feeds.and_then(|i| self.out.get_mut(i))
-            {
+            if let Some(Command { stdin: Some(Input::Heredoc { body: b, .. }), .. }) = h.feeds.and_then(|i| self.out.get_mut(i)) {
                 b.clone_from(&body);
             }
             if h.expand && body.contains(['$', '`']) {
@@ -595,10 +512,7 @@ impl Parser {
         while let Some(c) = self.peek() {
             match c {
                 ' ' | '\t' | '\n' | ';' | '&' | '|' | '<' | '>' | ')' => break,
-                '(' if w.text.ends_with('=')
-                    && is_name(w.text.trim_end_matches(['=', '+']))
-                    && !w.dynamic =>
-                {
+                '(' if w.text.ends_with('=') && is_name(w.text.trim_end_matches(['=', '+'])) && !w.dynamic => {
                     self.i += 1;
                     self.array()?;
                     w.text.push_str("(…)");
@@ -651,19 +565,17 @@ impl Parser {
 
     /// `name=( … )`: an array's words, which may expand.
     fn array(&mut self) -> Result<(), Error> {
-        self.nested(|p| {
-            loop {
-                p.skip_space_and_comments();
-                match p.peek() {
-                    None => return Err(Error::Unterminated("(")),
-                    Some(')') => {
-                        p.i += 1;
-                        return Ok(());
-                    }
-                    Some(c) if ";&|(<>".contains(c) => return Err(Error::Unexpected(c)),
-                    Some(_) => {
-                        p.word()?;
-                    }
+        self.nested(|p| loop {
+            p.skip_space_and_comments();
+            match p.peek() {
+                None => return Err(Error::Unterminated("(")),
+                Some(')') => {
+                    p.i += 1;
+                    return Ok(());
+                }
+                Some(c) if ";&|(<>".contains(c) => return Err(Error::Unexpected(c)),
+                Some(_) => {
+                    p.word()?;
                 }
             }
         })
@@ -684,9 +596,7 @@ impl Parser {
     /// a NUL ends the string, as in bash.
     fn ansi(&mut self, w: &mut Word) -> Result<(), Error> {
         let mut bytes = Vec::new();
-        let push = |bytes: &mut Vec<u8>, c: char| {
-            bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes())
-        };
+        let push = |bytes: &mut Vec<u8>, c: char| bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
         loop {
             match self.bump() {
                 None => return Err(Error::Unterminated("$'")),
@@ -752,9 +662,7 @@ impl Parser {
     /// Up to `max` more digits in `radix`, after `n`.
     fn digits(&mut self, radix: u32, max: usize, mut n: u32) -> u32 {
         for _ in 0..max {
-            let Some(d) = self.peek().and_then(|c| c.to_digit(radix)) else {
-                break;
-            };
+            let Some(d) = self.peek().and_then(|c| c.to_digit(radix)) else { break };
             n = n * radix + d;
             self.i += 1;
         }
@@ -821,10 +729,7 @@ impl Parser {
             Some(c) if c.is_ascii_alphabetic() || c == '_' => {
                 w.dynamic = true;
                 w.text.push('$');
-                while let Some(c) = self
-                    .peek()
-                    .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-                {
+                while let Some(c) = self.peek().filter(|c| c.is_ascii_alphanumeric() || *c == '_') {
                     w.text.push(c);
                     self.i += 1;
                 }
@@ -920,11 +825,7 @@ mod tests {
     use super::*;
 
     fn cmds(src: &str) -> Vec<Vec<String>> {
-        parse(src, 0)
-            .unwrap()
-            .into_iter()
-            .map(|c| c.argv.into_iter().map(|w| w.text).collect())
-            .collect()
+        parse(src, 0).unwrap().into_iter().map(|c| c.argv.into_iter().map(|w| w.text).collect()).collect()
     }
 
     fn progs(src: &str) -> Vec<String> {
@@ -933,20 +834,13 @@ mod tests {
 
     #[test]
     fn words_and_quotes() {
-        assert_eq!(
-            cmds(r#"echo 'a b' "c $HOME" d\ e $'f\'g'"#),
-            [["echo", "a b", "c $HOME", "d e", "f'g"]]
-        );
+        assert_eq!(cmds(r#"echo 'a b' "c $HOME" d\ e $'f\'g'"#), [["echo", "a b", "c $HOME", "d e", "f'g"]]);
         assert_eq!(cmds("echo a\\\nb"), [["echo", "ab"]]);
         assert_eq!(cmds("echo {a,b} x#y # comment"), [["echo", "{a,b}", "x#y"]]);
     }
 
     fn word(src: &str) -> Word {
-        parse(&format!("echo {src}"), 0)
-            .unwrap()
-            .remove(0)
-            .argv
-            .remove(1)
+        parse(&format!("echo {src}"), 0).unwrap().remove(0).argv.remove(1)
     }
 
     #[test]
@@ -970,38 +864,24 @@ mod tests {
         for src in [r"$'\xff'", r"$'\U110000'", r"$'\uD800'"] {
             assert!(word(src).dynamic, "{src}");
         }
-        assert_eq!(
-            parse(r"echo $'\'", 0).unwrap_err(),
-            Error::Unterminated("$'")
-        );
+        assert_eq!(parse(r"echo $'\'", 0).unwrap_err(), Error::Unterminated("$'"));
     }
 
     #[test]
     fn globs_and_brace_lists_are_dynamic() {
-        for src in [
-            "gi?", "g*", "[g]it", "{git,x}", "{1..3}", "a{b,c}d", "$\"x\"",
-        ] {
+        for src in ["gi?", "g*", "[g]it", "{git,x}", "{1..3}", "a{b,c}d", "$\"x\""] {
             assert!(word(src).dynamic, "{src}");
         }
-        for src in [
-            "[", "a[[", "]", "{", "}", "{}", "{x}", "a,b", "'g*'", "\"gi?\"", r"g\*", "a.b",
-            "{a.b}",
-        ] {
+        for src in ["[", "a[[", "]", "{", "}", "{}", "{x}", "a,b", "'g*'", "\"gi?\"", r"g\*", "a.b", "{a.b}"] {
             assert!(!word(src).dynamic, "{src}");
         }
     }
 
     #[test]
     fn separators_and_pipes() {
-        assert_eq!(
-            progs("a; b && c || d & e\nf"),
-            ["a", "b", "c", "d", "e", "f"]
-        );
+        assert_eq!(progs("a; b && c || d & e\nf"), ["a", "b", "c", "d", "e", "f"]);
         let p = parse("curl -fsSL x | sh", 0).unwrap();
-        assert_eq!(
-            (p[1].argv[0].text.as_str(), p[1].pipe_from),
-            ("sh", Some(0))
-        );
+        assert_eq!((p[1].argv[0].text.as_str(), p[1].pipe_from), ("sh", Some(0)));
         assert_eq!(parse("a || b", 0).unwrap()[1].pipe_from, None);
     }
 
@@ -1010,45 +890,24 @@ mod tests {
         assert_eq!(progs("echo $(git push)"), ["git", "echo"]);
         assert_eq!(progs(r#"echo "$(git push origin main)""#), ["git", "echo"]);
         assert_eq!(progs("echo \"today: `git push`\""), ["git", "echo"]);
-        assert_eq!(
-            progs("echo \"$(echo \"$(rm -rf /)\")\""),
-            ["rm", "echo", "echo"]
-        );
+        assert_eq!(progs("echo \"$(echo \"$(rm -rf /)\")\""), ["rm", "echo", "echo"]);
         assert_eq!(progs("diff <(git push) >(rm x)"), ["git", "rm", "diff"]);
-        assert_eq!(
-            progs("echo ${x:-$(git push)} $((1 + $(rm y)))"),
-            ["git", "rm", "echo"]
-        );
+        assert_eq!(progs("echo ${x:-$(git push)} $((1 + $(rm y)))"), ["git", "rm", "echo"]);
         assert_eq!(progs("echo `echo \\`git push\\``"), ["git", "echo", "echo"]);
         assert_eq!(progs("echo '$(git push)' \"\\$(git push)\""), ["echo"]);
-        assert_eq!(
-            progs("x=$(git push) y=(a $(rm z))"),
-            ["git", "rm", "x=$(…)"]
-        );
+        assert_eq!(progs("x=$(git push) y=(a $(rm z))"), ["git", "rm", "x=$(…)"]);
     }
 
     #[test]
     fn compound_commands() {
-        assert_eq!(
-            progs("if git pull; then rm -rf /; else echo; fi"),
-            ["git", "rm", "echo"]
-        );
+        assert_eq!(progs("if git pull; then rm -rf /; else echo; fi"), ["git", "rm", "echo"]);
         assert_eq!(progs("for f in $(ls); do rm \"$f\"; done"), ["ls", "rm"]);
         assert_eq!(progs("while true; do git push; done"), ["true", "git"]);
-        assert_eq!(
-            progs("(cd /; rm -rf x) && { git push; }"),
-            ["cd", "rm", "git"]
-        );
+        assert_eq!(progs("(cd /; rm -rf x) && { git push; }"), ["cd", "rm", "git"]);
         assert_eq!(progs("f() { rm -rf /; }; f"), ["rm", "f"]);
         assert_eq!(progs("function g { git push; }"), ["git"]);
-        assert_eq!(
-            progs("case $1 in a|b) rm x;; (c) git push;; *) echo;; esac; ls"),
-            ["rm", "git", "echo", "ls"]
-        );
-        assert_eq!(
-            progs("echo $(case x in y) git push;; esac)"),
-            ["git", "echo"]
-        );
+        assert_eq!(progs("case $1 in a|b) rm x;; (c) git push;; *) echo;; esac; ls"), ["rm", "git", "echo", "ls"]);
+        assert_eq!(progs("echo $(case x in y) git push;; esac)"), ["git", "echo"]);
         assert_eq!(progs("for ((i=0; i<3; i++)); do echo; done"), ["echo"]);
         assert_eq!(progs("! git push"), ["git"]);
     }
@@ -1056,31 +915,16 @@ mod tests {
     #[test]
     fn redirections_are_not_arguments() {
         assert_eq!(cmds("echo hi >out 2>&1 &>>log < in"), [["echo", "hi"]]);
-        assert_eq!(
-            cmds("cat > $(git push)"),
-            [vec!["git", "push"], vec!["cat"]]
-        );
+        assert_eq!(cmds("cat > $(git push)"), [vec!["git", "push"], vec!["cat"]]);
         assert_eq!(cmds("cat <<< \"$(rm x)\""), [vec!["rm", "x"], vec!["cat"]]);
     }
 
     #[test]
     fn heredocs() {
-        assert_eq!(
-            progs("cat <<EOF > f\nhello $(git push)\nEOF\nls"),
-            ["cat", "git", "ls"]
-        );
-        assert_eq!(
-            progs("cat <<'EOF'\n$(git push) `rm x`\nEOF\nls"),
-            ["cat", "ls"]
-        );
-        assert_eq!(
-            progs("cat <<-\"EOF\"\n\t$(git push)\n\tEOF\nls"),
-            ["cat", "ls"]
-        );
-        assert_eq!(
-            progs("cat <<A <<B; rm x\na\nA\n`git push`\nB\nls"),
-            ["cat", "rm", "git", "ls"]
-        );
+        assert_eq!(progs("cat <<EOF > f\nhello $(git push)\nEOF\nls"), ["cat", "git", "ls"]);
+        assert_eq!(progs("cat <<'EOF'\n$(git push) `rm x`\nEOF\nls"), ["cat", "ls"]);
+        assert_eq!(progs("cat <<-\"EOF\"\n\t$(git push)\n\tEOF\nls"), ["cat", "ls"]);
+        assert_eq!(progs("cat <<A <<B; rm x\na\nA\n`git push`\nB\nls"), ["cat", "rm", "git", "ls"]);
     }
 
     #[test]
@@ -1118,19 +962,7 @@ mod tests {
 
     #[test]
     fn unreadable_input_is_an_error() {
-        for bad in [
-            "echo 'x",
-            "echo \"x",
-            "echo $(x",
-            "echo `x",
-            "echo ${x",
-            "echo $((1",
-            "a )",
-            "echo >",
-            "a (b)",
-            ";;",
-            "cat <<",
-        ] {
+        for bad in ["echo 'x", "echo \"x", "echo $(x", "echo `x", "echo ${x", "echo $((1", "a )", "echo >", "a (b)", ";;", "cat <<"] {
             assert!(parse(bad, 0).is_err(), "{bad:?}");
         }
     }
@@ -1142,18 +974,12 @@ mod tests {
         assert_eq!(parse(&"( ".repeat(100_000), 0), Err(Error::TooDeep));
         assert_eq!(parse(&"`".repeat(3), MAX_DEPTH), Err(Error::TooDeep));
         assert_eq!(parse(&"a".repeat(MAX_LEN + 1), 0), Err(Error::TooLong));
-        assert_eq!(
-            parse(&"a;".repeat(MAX_COMMANDS + 1), 0),
-            Err(Error::TooMany)
-        );
+        assert_eq!(parse(&"a;".repeat(MAX_COMMANDS + 1), 0), Err(Error::TooMany));
         assert_eq!(parse("x", MAX_DEPTH + 1), Err(Error::TooDeep));
         let wide = "a ".repeat(MAX_LEN / 2 - 1);
         let t = std::time::Instant::now();
         assert_eq!(parse(&wide, 0).unwrap()[0].argv.len(), MAX_LEN / 2 - 1);
-        assert!(
-            t.elapsed() < std::time::Duration::from_secs(5),
-            "linear time"
-        );
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "linear time");
     }
 
     fn one(src: &str) -> Command {
@@ -1162,22 +988,10 @@ mod tests {
 
     #[test]
     fn standard_input_and_writes() {
-        let lit = |s: &str| Word {
-            text: s.into(),
-            dynamic: false,
-        };
-        assert_eq!(
-            one("sh < cmds.txt").stdin,
-            Some(Input::File(lit("cmds.txt")))
-        );
-        assert_eq!(
-            one("sh 0< cmds.txt").stdin,
-            Some(Input::File(lit("cmds.txt")))
-        );
-        assert_eq!(
-            one("bash <<< 'git push'").stdin,
-            Some(Input::HereString(lit("git push")))
-        );
+        let lit = |s: &str| Word { text: s.into(), dynamic: false };
+        assert_eq!(one("sh < cmds.txt").stdin, Some(Input::File(lit("cmds.txt"))));
+        assert_eq!(one("sh 0< cmds.txt").stdin, Some(Input::File(lit("cmds.txt"))));
+        assert_eq!(one("bash <<< 'git push'").stdin, Some(Input::HereString(lit("git push"))));
         assert_eq!(one("sh <&3").stdin, Some(Input::Other));
         assert_eq!(one("sh <> f").stdin, Some(Input::File(lit("f"))));
         assert_eq!(one("sh <> f").writes, [lit("f")]);
@@ -1195,29 +1009,11 @@ mod tests {
     #[test]
     fn here_documents_feed_their_command() {
         let p = parse("cat <<A; sh <<-'B'\nhello $X\nA\n\tgit push\n\tB\n", 0).unwrap();
-        assert_eq!(
-            p[0].stdin,
-            Some(Input::Heredoc {
-                body: "hello $X\n".into(),
-                expand: true
-            })
-        );
-        assert_eq!(
-            p[1].stdin,
-            Some(Input::Heredoc {
-                body: "git push\n".into(),
-                expand: false
-            })
-        );
+        assert_eq!(p[0].stdin, Some(Input::Heredoc { body: "hello $X\n".into(), expand: true }));
+        assert_eq!(p[1].stdin, Some(Input::Heredoc { body: "git push\n".into(), expand: false }));
         // On another descriptor it is not the command's input.
         assert_eq!(one("sh 3<<EOF\ngit push\nEOF").stdin, None);
         // Two here-documents for one command: the last one is its input.
-        assert_eq!(
-            one("sh <<A <<B\nls\nA\ngit push\nB").stdin,
-            Some(Input::Heredoc {
-                body: "git push\n".into(),
-                expand: true
-            })
-        );
+        assert_eq!(one("sh <<A <<B\nls\nA\ngit push\nB").stdin, Some(Input::Heredoc { body: "git push\n".into(), expand: true }));
     }
 }

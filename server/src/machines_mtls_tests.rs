@@ -39,10 +39,7 @@ pub(crate) async fn serve_with(f: impl FnOnce(Enrollment) -> Enrollment) -> Env 
 }
 
 /// `serve_with`, with botd's auth settings changed by `tweak` too.
-pub(crate) async fn serve_with_auth(
-    f: impl FnOnce(Enrollment) -> Enrollment,
-    tweak: impl FnOnce(&mut crate::Auth) + Send + 'static,
-) -> Env {
+pub(crate) async fn serve_with_auth(f: impl FnOnce(Enrollment) -> Enrollment, tweak: impl FnOnce(&mut crate::Auth) + Send + 'static) -> Env {
     let machine_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let agent_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let (mport, aport) = (
@@ -54,17 +51,16 @@ pub(crate) async fn serve_with_auth(
     let mut cp = ControlPlane::for_tests(p);
     cp.routing = Routing::On;
     let e = cp
-        .enroll_with(f(
-            Enrollment::for_tests(9, mport, aport).with_agent(AGENT.as_bytes())
-        ))
+        .enroll_with(f(Enrollment::for_tests(9, mport, aport).with_agent(AGENT.as_bytes())))
         .unwrap();
     let cp = Arc::new(cp);
     let shared = cp.clone();
-    let (port, app, owner, _, router) = crate::tests::serve_app_and_router(move |a| {
-        a.machines = shared;
-        tweak(a);
-    })
-    .await;
+    let (port, app, owner, _, router) =
+        crate::tests::serve_app_and_router(move |a| {
+            a.machines = shared;
+            tweak(a);
+        })
+        .await;
     let api = enroll::Api {
         router,
         host: format!("127.0.0.1:{port}"),
@@ -418,10 +414,7 @@ async fn new_machines_download_the_agent_botd_hashed() {
         .user_data(&env.app.db.machine(&mid).unwrap().label)
         .unwrap();
     assert!(
-        ud.contains(&format!(
-            "echo \"{}  $bin.new\" | sha256sum -c -",
-            sha(AGENT)
-        )),
+        ud.contains(&format!("echo \"{}  $bin.new\" | sha256sum -c -", sha(AGENT))),
         "{ud}"
     );
     let config = pki::client_config(&pki::cert_der(env.e.ca_pem()).unwrap(), None).unwrap();
@@ -477,13 +470,7 @@ async fn tokens_are_single_use_bound_to_one_machine_and_short_lived() {
 
     env.app
         .db
-        .add_machine_token(
-            &mb,
-            &sha("sbe_stale"),
-            crate::db::now() - 1,
-            None,
-            crate::db::now(),
-        )
+        .add_machine_token(&mb, &sha("sbe_stale"), crate::db::now() - 1, None, crate::db::now())
         .unwrap();
     let stale = agent::enroll(&config(&env, &mb, Some("sbe_stale")))
         .await
@@ -1160,19 +1147,10 @@ pub(crate) async fn reply_after(env: &Env, bot: &str, before: i64) -> String {
 /// Sends as the Bot's owner, so the run is theirs (ADR 0046); as the admin if they can't sign in.
 pub(crate) async fn send(env: &Env, bot: &str, text: &str) -> i64 {
     let owner = env.app.db.bot(bot).map(|b| b.owner_id).unwrap_or_default();
-    let auth = crate::users_http_tests::signed_in(env.port, &env.admin, &owner)
-        .await
-        .unwrap_or_else(|| env.admin.clone());
+    let auth = crate::users_http_tests::signed_in(env.port, &env.admin, &owner).await.unwrap_or_else(|| env.admin.clone());
     let before = env.app.db.last_id();
     let body = json!({ "text": text }).to_string();
-    let (code, m) = call(
-        env.port,
-        "POST",
-        &format!("/api/bots/{bot}/messages"),
-        &auth,
-        &body,
-    )
-    .await;
+    let (code, m) = call(env.port, "POST", &format!("/api/bots/{bot}/messages"), &auth, &body).await;
     assert_eq!(code, 202, "{m}");
     before
 }
@@ -1511,11 +1489,8 @@ while :; do echo '{}'; sleep 0.05; done
 "#;
 
 fn alive(pid: &str) -> bool {
-    std::fs::read_to_string(format!("/proc/{}/stat", pid.trim())).is_ok_and(|s| {
-        s.rsplit(')')
-            .next()
-            .is_some_and(|r| !r.trim_start().starts_with('Z'))
-    })
+    std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
+        .is_ok_and(|s| s.rsplit(')').next().is_some_and(|r| !r.trim_start().starts_with('Z')))
 }
 
 #[tokio::test]
@@ -1561,10 +1536,7 @@ async fn an_install_waits_until_a_stopped_job_has_exited_and_cleaned_up() {
             .await
             .expect("the install got its turn")
             .unwrap();
-        assert!(
-            waited,
-            "dropped {dropped}: the install waited for the harness to exit and its cleanup"
-        );
+        assert!(waited, "dropped {dropped}: the install waited for the harness to exit and its cleanup");
         assert_eq!(m.agent.running(), 0);
     }
 }
@@ -1639,31 +1611,16 @@ fn agent_counts_programs_only_under_its_home_or_the_system() {
         teammates: crate::db::temp_path("roots-teammates"),
         teammate_stand_in: None,
     };
-    assert_eq!(
-        cfg.layout().botctl,
-        None,
-        "outside the home and the system's directories"
-    );
+    assert_eq!(cfg.layout().botctl, None, "outside the home and the system's directories");
 
     cfg.botctl = bin.join("botctl");
     std::os::unix::fs::symlink(elsewhere.join("botctl"), &cfg.botctl).unwrap();
-    assert_eq!(
-        cfg.layout().botctl,
-        None,
-        "a link is judged by where it leads"
-    );
+    assert_eq!(cfg.layout().botctl, None, "a link is judged by where it leads");
 
     std::fs::remove_file(&cfg.botctl).unwrap();
     exe(&cfg.botctl);
-    assert_eq!(
-        cfg.layout().botctl.as_deref(),
-        Some(cfg.botctl.to_str().unwrap())
-    );
+    assert_eq!(cfg.layout().botctl.as_deref(), Some(cfg.botctl.to_str().unwrap()));
 
     cfg.botctl = "/bin/sh".into();
-    assert_eq!(
-        cfg.layout().botctl.as_deref(),
-        Some("/bin/sh"),
-        "a system program"
-    );
+    assert_eq!(cfg.layout().botctl.as_deref(), Some("/bin/sh"), "a system program");
 }

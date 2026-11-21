@@ -32,18 +32,12 @@ struct Screen {
 
 impl Screen {
     fn alive(&mut self) -> bool {
-        self.procs
-            .iter_mut()
-            .chain(self.viewer.as_mut())
-            .all(|c| matches!(c.try_wait(), Ok(None)))
+        self.procs.iter_mut().chain(self.viewer.as_mut()).all(|c| matches!(c.try_wait(), Ok(None)))
     }
 }
 
 fn new_token() -> String {
-    let token: String = crate::random_bytes(16)
-        .iter()
-        .map(|x| format!("{x:02x}"))
-        .collect();
+    let token: String = crate::random_bytes(16).iter().map(|x| format!("{x:02x}")).collect();
     crate::secrets::redact::register(&token);
     token
 }
@@ -55,22 +49,8 @@ fn spawn_viewer(display: &str, port: u16, token: &str) -> std::io::Result<Option
     }
     spawn(
         Command::new("voxl")
-            .args([
-                "--addr",
-                "127.0.0.1",
-                "--port",
-                &port.to_string(),
-                "--allowed-hosts",
-                "*",
-            ])
-            .args([
-                "--audio-enabled",
-                "false",
-                "--file-transfers",
-                "none",
-                "--enable-clipboard",
-                "true",
-            ])
+            .args(["--addr", "127.0.0.1", "--port", &port.to_string(), "--allowed-hosts", "*"])
+            .args(["--audio-enabled", "false", "--file-transfers", "none", "--enable-clipboard", "true"])
             .env("DISPLAY", display)
             .env("VOXL_PASSWORD", token),
     )
@@ -86,17 +66,12 @@ pub struct Info {
 }
 
 pub fn on_path(bin: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
 }
 
 fn spawn(cmd: &mut Command) -> std::io::Result<Child> {
     crate::adapters::strip_secret_env(cmd.as_std_mut());
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn()
 }
 
 /// `WIDTHxHEIGHT` within sane bounds, else the default 1280x800. Only these
@@ -144,20 +119,14 @@ impl Screens {
     }
 
     fn bus_path(&self, n: u16) -> Option<PathBuf> {
-        crate::paths::child(
-            &crate::paths::canonical(&self.run_dir)?,
-            &format!("bus-{n}"),
-        )
+        crate::paths::child(&crate::paths::canonical(&self.run_dir)?, &format!("bus-{n}"))
     }
 
     fn info(&self, s: &Screen) -> Info {
         let n = self.base + s.slot;
         Info {
             display: format!(":{n}"),
-            bus: format!(
-                "unix:path={}",
-                self.bus_path(n).unwrap_or_default().display()
-            ),
+            bus: format!("unix:path={}", self.bus_path(n).unwrap_or_default().display()),
             port: 6800 + n,
             token: s.token.clone(),
         }
@@ -176,11 +145,7 @@ impl Screens {
             stop(bot_id, s).await;
         }
         if live.len() >= self.max as usize {
-            let victim = live
-                .iter()
-                .filter(|(id, _)| !busy(id))
-                .min_by_key(|(_, s)| s.used)
-                .map(|(id, _)| id.clone())?;
+            let victim = live.iter().filter(|(id, _)| !busy(id)).min_by_key(|(_, s)| s.used).map(|(id, _)| id.clone())?;
             let s = live.remove(&victim).unwrap();
             stop(&victim, s).await;
         }
@@ -199,31 +164,15 @@ impl Screens {
     }
 
     async fn start(&self, slot: u16) -> std::io::Result<Screen> {
-        let mut s = Screen {
-            slot,
-            token: new_token(),
-            used: Instant::now(),
-            procs: Vec::new(),
-            viewer: None,
-        };
-        let Info {
-            display, bus, port, ..
-        } = self.info(&s);
+        let mut s = Screen { slot, token: new_token(), used: Instant::now(), procs: Vec::new(), viewer: None };
+        let Info { display, bus, port, .. } = self.info(&s);
         let n = self.base + slot;
 
-        let (sock, lock) =
-            x11_paths(n).ok_or_else(|| std::io::Error::other("bad display number"))?;
+        let (sock, lock) = x11_paths(n).ok_or_else(|| std::io::Error::other("bad display number"))?;
         let _ = std::fs::remove_file(&lock);
         let _ = std::fs::remove_file(&sock);
         let (w, h) = self.size;
-        s.procs.push(spawn(Command::new("Xvfb").args([
-            &display,
-            "-screen",
-            "0",
-            &format!("{w}x{h}x24"),
-            "-nolisten",
-            "tcp",
-        ]))?);
+        s.procs.push(spawn(Command::new("Xvfb").args([&display, "-screen", "0", &format!("{w}x{h}x24"), "-nolisten", "tcp"]))?);
         for _ in 0..50 {
             if sock.exists() {
                 break;
@@ -234,20 +183,10 @@ impl Screens {
             return Err(std::io::Error::other("Xvfb didn't open its display"));
         }
 
-        let bus_path = self
-            .bus_path(n)
-            .ok_or_else(|| std::io::Error::other("no screens folder"))?;
+        let bus_path = self.bus_path(n).ok_or_else(|| std::io::Error::other("no screens folder"))?;
         let _ = std::fs::remove_file(&bus_path);
-        s.procs.push(spawn(Command::new("dbus-daemon").args([
-            "--session",
-            "--nofork",
-            &format!("--address={bus}"),
-        ]))?);
-        s.procs.push(spawn(
-            Command::new("openbox")
-                .env("DISPLAY", &display)
-                .env("DBUS_SESSION_BUS_ADDRESS", &bus),
-        )?);
+        s.procs.push(spawn(Command::new("dbus-daemon").args(["--session", "--nofork", &format!("--address={bus}")]))?);
+        s.procs.push(spawn(Command::new("openbox").env("DISPLAY", &display).env("DBUS_SESSION_BUS_ADDRESS", &bus))?);
         s.viewer = spawn_viewer(&display, port, &s.token)?;
         Ok(s)
     }
@@ -257,9 +196,7 @@ impl Screens {
     /// For when someone loses access to the Bot: the proxy doesn't ask `botd`.
     pub async fn rotate_token(&self, bot_id: &str) {
         let mut live = self.live.lock().await;
-        let Some(s) = live.get_mut(bot_id) else {
-            return;
-        };
+        let Some(s) = live.get_mut(bot_id) else { return };
         if let Some(mut v) = s.viewer.take() {
             let _ = v.kill().await;
         }
@@ -287,11 +224,8 @@ impl Screens {
     /// Stops screens that nobody used for a while.
     pub async fn reap(&self, busy: impl Fn(&str) -> bool) {
         let mut live = self.live.lock().await;
-        let idle: Vec<String> = live
-            .iter()
-            .filter(|(id, s)| !busy(id) && s.used.elapsed() > self.idle)
-            .map(|(id, _)| id.clone())
-            .collect();
+        let idle: Vec<String> =
+            live.iter().filter(|(id, s)| !busy(id) && s.used.elapsed() > self.idle).map(|(id, _)| id.clone()).collect();
         for id in idle {
             let s = live.remove(&id).unwrap();
             stop(&id, s).await;
@@ -309,10 +243,7 @@ impl Screens {
 /// Polls a local port every 100 ms until it accepts a connection. False after `tries`.
 pub async fn wait_for_port(port: u16, tries: u32) -> bool {
     for _ in 0..tries {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_ok()
-        {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -323,10 +254,7 @@ pub async fn wait_for_port(port: u16, tries: u32) -> bool {
 /// Closes the Bot's browser cleanly (so its profile saves), then kills the screen.
 async fn stop(bot_id: &str, s: Screen) {
     if on_path("agent-browser") {
-        let close = Command::new("agent-browser")
-            .args(["--session", &browser_session(bot_id), "close"])
-            .stdin(Stdio::null())
-            .output();
+        let close = Command::new("agent-browser").args(["--session", &browser_session(bot_id), "close"]).stdin(Stdio::null()).output();
         let _ = tokio::time::timeout(Duration::from_secs(10), close).await;
     }
     crate::secrets::redact::forget(&s.token);
@@ -341,10 +269,7 @@ pub fn bot_env(info: &Info, bot_id: &str, bot_dir: &Path) -> HashMap<String, Str
         ("DISPLAY".into(), info.display.clone()),
         ("DBUS_SESSION_BUS_ADDRESS".into(), info.bus.clone()),
         ("AGENT_BROWSER_SESSION".into(), browser_session(bot_id)),
-        (
-            "AGENT_BROWSER_PROFILE".into(),
-            profile.display().to_string(),
-        ),
+        ("AGENT_BROWSER_PROFILE".into(), profile.display().to_string()),
         ("AGENT_BROWSER_HEADED".into(), "1".into()),
         ("AGENT_BROWSER_NO_XVFB".into(), "1".into()),
         ("AGENT_BROWSER_ARGS".into(), "--start-maximized".into()),
@@ -360,9 +285,7 @@ mod tests {
 
     #[tokio::test]
     async fn waits_for_a_listener() {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(wait_for_port(port, 1).await);
         drop(listener);
@@ -371,16 +294,12 @@ mod tests {
 
     #[tokio::test]
     async fn sees_a_late_listener() {
-        let probe = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
+        let probe = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = probe.local_addr().unwrap().port();
         drop(probe);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(250)).await;
-            let l = tokio::net::TcpListener::bind(("127.0.0.1", port))
-                .await
-                .unwrap();
+            let l = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
             tokio::time::sleep(Duration::from_secs(2)).await;
             drop(l);
         });
@@ -391,17 +310,7 @@ mod tests {
     fn screen_size_is_two_numbers_or_the_default() {
         assert_eq!(parse_size("1920x1080"), (1920, 1080));
         assert_eq!(parse_size(" 800x600 "), (800, 600));
-        for bad in [
-            "",
-            "1280",
-            "x800",
-            "1280x800 -ac",
-            "1280x800x24",
-            "-nolisten",
-            "99999x99999",
-            "1x1",
-            "1280x800;rm -rf /",
-        ] {
+        for bad in ["", "1280", "x800", "1280x800 -ac", "1280x800x24", "-nolisten", "99999x99999", "1x1", "1280x800;rm -rf /"] {
             assert_eq!(parse_size(bad), (1280, 800), "{bad:?}");
         }
     }
@@ -409,22 +318,9 @@ mod tests {
     #[tokio::test]
     async fn a_new_token_keeps_the_display_running() {
         let dir = std::env::temp_dir().join(format!("superbot-screens-{}", crate::short_id()));
-        let screens = Screens {
-            max: 1,
-            idle: Duration::from_secs(60),
-            base: 100,
-            size: (1280, 800),
-            run_dir: dir,
-            live: Mutex::default(),
-        };
+        let screens = Screens { max: 1, idle: Duration::from_secs(60), base: 100, size: (1280, 800), run_dir: dir, live: Mutex::default() };
         let display = spawn(Command::new("sleep").arg("30")).unwrap();
-        let s = Screen {
-            slot: 1,
-            token: new_token(),
-            used: Instant::now(),
-            procs: vec![display],
-            viewer: None,
-        };
+        let s = Screen { slot: 1, token: new_token(), used: Instant::now(), procs: vec![display], viewer: None };
         screens.live.lock().await.insert("b1".into(), s);
         let before = screens.ensure("b1", |_| true).await.unwrap().token;
 
@@ -432,10 +328,7 @@ mod tests {
         let after = screens.ensure("b1", |_| true).await.unwrap().token;
         assert_ne!(before, after);
         assert_eq!(after.len(), 32);
-        assert!(
-            screens.live.lock().await.get_mut("b1").unwrap().alive(),
-            "same display, not restarted"
-        );
+        assert!(screens.live.lock().await.get_mut("b1").unwrap().alive(), "same display, not restarted");
         screens.rotate_token("nobody").await;
         screens.remove("b1").await;
     }

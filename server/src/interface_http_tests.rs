@@ -1,7 +1,7 @@
 //! The Expo client is the interface for everyone (ADR 0027); the console is a minimal
 //! admin page with no chat, Bots, or screens (ADR 0032).
 
-use crate::sso_http_tests::{OID, header, mock_idp, serve_with, set_cookies, to_callback};
+use crate::sso_http_tests::{header, mock_idp, serve_with, set_cookies, to_callback, OID};
 use crate::tests::{call, call_with, serve_app};
 use crate::users_http_tests::{parse, user_with};
 use crate::*;
@@ -19,17 +19,8 @@ async fn location(port: u16, path: &str, auth: &str, extra: &str) -> (u16, Optio
 /// The values a `${...}` hole can take: its quoted strings (`${ok ? "approve" : "deny"}`),
 /// else a placeholder id.
 fn hole(expr: &str) -> Vec<String> {
-    let quoted: Vec<String> = expr
-        .split('"')
-        .skip(1)
-        .step_by(2)
-        .map(String::from)
-        .collect();
-    if quoted.is_empty() {
-        vec!["x".into()]
-    } else {
-        quoted
-    }
+    let quoted: Vec<String> = expr.split('"').skip(1).step_by(2).map(String::from).collect();
+    if quoted.is_empty() { vec!["x".into()] } else { quoted }
 }
 
 /// Every string a JS/TS literal starting at `s[0]` (a `"` or a backtick) can be, and the
@@ -46,21 +37,14 @@ fn literal(s: &str) -> (Vec<String>, &str) {
         if quote == b'`' && s[i..].starts_with("${") {
             let (mut depth, mut j) = (0, i + 1);
             for (k, ch) in s[i + 1..].char_indices() {
-                depth += match ch {
-                    '{' => 1,
-                    '}' => -1,
-                    _ => 0,
-                };
+                depth += match ch { '{' => 1, '}' => -1, _ => 0 };
                 if depth == 0 {
                     j = i + 1 + k;
                     break;
                 }
             }
             let options = hole(&s[i + 2..j]);
-            out = out
-                .iter()
-                .flat_map(|o| options.iter().map(move |v| format!("{o}{v}")))
-                .collect();
+            out = out.iter().flat_map(|o| options.iter().map(move |v| format!("{o}{v}"))).collect();
             i = j + 1;
             continue;
         }
@@ -82,10 +66,7 @@ fn api_calls(src: &str) -> Vec<(String, String)> {
         while let Some(at) = rest.find(['"', '`']) {
             let before = line[..line.len() - rest.len() + at].trim_end();
             let (values, after) = literal(&rest[at..]);
-            let ahead = format!(
-                "{after}\n{}",
-                lines[(n + 1).min(lines.len())..lines.len().min(n + 3)].join("\n")
-            );
+            let ahead = format!("{after}\n{}", lines[(n + 1).min(lines.len())..lines.len().min(n + 3)].join("\n"));
             let ahead = ahead.split(';').next().unwrap_or_default();
             for v in values {
                 let Some(p) = v.find("/api/") else { continue };
@@ -93,11 +74,7 @@ fn api_calls(src: &str) -> Vec<(String, String)> {
                 let method = METHODS
                     .iter()
                     .find(|m| before.ends_with(&format!("\"{m}\",")))
-                    .or_else(|| {
-                        METHODS
-                            .iter()
-                            .find(|m| ahead.contains(&format!("method: \"{m}\"")))
-                    })
+                    .or_else(|| METHODS.iter().find(|m| ahead.contains(&format!("method: \"{m}\""))))
                     .unwrap_or(&"GET");
                 out.push((method.to_string(), path));
             }
@@ -111,17 +88,11 @@ fn api_calls(src: &str) -> Vec<(String, String)> {
 
 /// Just the status line, for responses that stream and never end (`/api/events`).
 async fn status_only(port: u16, path: &str, auth: &str) -> u16 {
-    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
-        .await
-        .unwrap();
-    let req =
-        format!("GET {path} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nAuthorization: {auth}\r\n\r\n");
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let req = format!("GET {path} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nAuthorization: {auth}\r\n\r\n");
     s.write_all(req.as_bytes()).await.unwrap();
     let mut line = String::new();
-    tokio::io::BufReader::new(s)
-        .read_line(&mut line)
-        .await
-        .unwrap();
+    tokio::io::BufReader::new(s).read_line(&mut line).await.unwrap();
     line.split_whitespace().nth(1).unwrap().parse().unwrap()
 }
 
@@ -131,15 +102,8 @@ async fn assert_routed(port: u16, auth: &str, calls: &[(String, String)]) {
     let nothing = call(port, "GET", "/api/no/such/route", auth, "").await;
     assert_eq!(nothing.0, 404);
     for (m, p) in calls {
-        let got = if p == "/api/events" {
-            (status_only(port, p, auth).await, String::new())
-        } else {
-            call(port, m, p, auth, "{}").await
-        };
-        assert!(
-            got.0 != 405 && got != nothing,
-            "{m} {p} isn't served: {got:?}"
-        );
+        let got = if p == "/api/events" { (status_only(port, p, auth).await, String::new()) } else { call(port, m, p, auth, "{}").await };
+        assert!(got.0 != 405 && got != nothing, "{m} {p} isn't served: {got:?}");
     }
 }
 
@@ -152,17 +116,8 @@ fn the_call_finder_reads_templates_and_methods() {
           method: "POST",
         return `${this.baseUrl}/api/events`;
     "#;
-    let want = [
-        ("GET", "/api/audit/export.csv"),
-        ("GET", "/api/events"),
-        ("POST", "/api/approvals/x/approve"),
-        ("POST", "/api/approvals/x/deny"),
-        ("POST", "/api/auth/login"),
-    ];
-    assert_eq!(
-        api_calls(src),
-        want.map(|(m, p)| (m.to_string(), p.to_string()))
-    );
+    let want = [("GET", "/api/audit/export.csv"), ("GET", "/api/events"), ("POST", "/api/approvals/x/approve"), ("POST", "/api/approvals/x/deny"), ("POST", "/api/auth/login")];
+    assert_eq!(api_calls(src), want.map(|(m, p)| (m.to_string(), p.to_string())));
 }
 
 #[tokio::test]
@@ -172,24 +127,10 @@ async fn the_console_is_an_admin_page_without_chat_bots_or_screens() {
     assert_eq!(code, 200);
     assert_eq!(html, CONSOLE_HTML);
     let csp = header(&head, "content-security-policy").unwrap();
-    for part in [
-        "script-src 'self'",
-        "style-src 'self'",
-        "frame-ancestors 'none'",
-        "connect-src 'self'",
-    ] {
+    for part in ["script-src 'self'", "style-src 'self'", "frame-ancestors 'none'", "connect-src 'self'"] {
         assert!(csp.contains(part), "{csp}");
     }
-    for tab in [
-        "Users",
-        "Requests",
-        "Machines",
-        "Audit log",
-        "Settings",
-        "Setup",
-        "Sign out",
-        r#"href="/app/""#,
-    ] {
+    for tab in ["Users", "Requests", "Machines", "Audit log", "Settings", "Setup", "Sign out", r#"href="/app/""#] {
         assert!(html.contains(tab), "{tab}");
     }
     // Nothing the CSP would block: one script, from a file, and no inline styles.
@@ -198,48 +139,16 @@ async fn the_console_is_an_admin_page_without_chat_bots_or_screens() {
     assert!(!html.contains("style=") && !html.contains("<style"));
     for (file, csp_too) in [("/console/app.js", true), ("/console/styles.css", true)] {
         let (code, head, _) = call_with(port, "GET", file, &admin, "", "").await;
-        assert_eq!(
-            (code, header(&head, "content-security-policy").is_some()),
-            (200, csp_too),
-            "{file}"
-        );
+        assert_eq!((code, header(&head, "content-security-policy").is_some()), (200, csp_too), "{file}");
     }
 
     // Chat, Bots, Bot approvals, live events, and screens are the app's.
-    for gone in [
-        "/api/state",
-        "/api/events",
-        "EventSource",
-        "/api/bots",
-        "/messages",
-        "/screen",
-        "/api/approvals",
-        "/routines",
-        "/api/harnesses",
-    ] {
-        assert!(
-            !CONSOLE_JS.contains(gone) && !html.contains(gone),
-            "{gone} is still in the console"
-        );
+    for gone in ["/api/state", "/api/events", "EventSource", "/api/bots", "/messages", "/screen", "/api/approvals", "/routines", "/api/harnesses"] {
+        assert!(!CONSOLE_JS.contains(gone) && !html.contains(gone), "{gone} is still in the console");
     }
     let calls = api_calls(CONSOLE_JS);
-    for want in [
-        "/api/users",
-        "/api/signups/x/approve",
-        "/api/machines",
-        "/api/users/x/machine/suspend",
-        "/api/audit",
-        "/api/audit/export.csv",
-        "/api/policy",
-        "/api/secrets/x",
-        "/api/scim/tokens",
-        "/api/setup",
-        "/api/license",
-    ] {
-        assert!(
-            calls.iter().any(|(_, p)| p == want) || html.contains(want),
-            "the console lost {want}: {calls:?}"
-        );
+    for want in ["/api/users", "/api/signups/x/approve", "/api/machines", "/api/users/x/machine/suspend", "/api/audit", "/api/audit/export.csv", "/api/policy", "/api/secrets/x", "/api/scim/tokens", "/api/setup", "/api/license"] {
+        assert!(calls.iter().any(|(_, p)| p == want) || html.contains(want), "the console lost {want}: {calls:?}");
     }
 }
 
@@ -265,19 +174,8 @@ async fn every_call_the_console_makes_is_served_and_admin_only() {
 async fn every_route_the_client_uses_is_still_served() {
     let (port, _, admin, _) = serve_app().await;
     let calls = api_calls(CLIENT_API);
-    for want in [
-        ("GET", "/api/state"),
-        ("GET", "/api/events"),
-        ("POST", "/api/bots/x/messages"),
-        ("GET", "/api/bots/x/screen"),
-        ("POST", "/api/approvals/x/deny"),
-        ("POST", "/api/auth/login"),
-        ("GET", "/api/audit/export.csv"),
-    ] {
-        assert!(
-            calls.contains(&(want.0.to_string(), want.1.to_string())),
-            "{want:?} not found in api.ts: {calls:?}"
-        );
+    for want in [("GET", "/api/state"), ("GET", "/api/events"), ("POST", "/api/bots/x/messages"), ("GET", "/api/bots/x/screen"), ("POST", "/api/approvals/x/deny"), ("POST", "/api/auth/login"), ("GET", "/api/audit/export.csv")] {
+        assert!(calls.contains(&(want.0.to_string(), want.1.to_string())), "{want:?} not found in api.ts: {calls:?}");
     }
     assert_routed(port, &admin, &calls).await;
 }
@@ -289,27 +187,14 @@ async fn people_land_on_the_app_and_admins_keep_the_console() {
     let (_, viewer) = user_with(port, &admin, "rex@example.com", "readonly").await;
 
     // Break-glass (the owner, an admin) still gets the console and its files.
-    for path in [
-        "/console/",
-        "/console/index.html",
-        "/console/app.js",
-        "/console/styles.css",
-    ] {
+    for path in ["/console/", "/console/index.html", "/console/app.js", "/console/styles.css"] {
         assert_eq!(location(port, path, &admin, "").await.0, 200, "{path}");
     }
     // Without Caddy's web client, /app/ sends admins to the console.
-    assert_eq!(
-        location(port, "/app/", &admin, "").await.1.as_deref(),
-        Some("/console/")
-    );
+    assert_eq!(location(port, "/app/", &admin, "").await.1.as_deref(), Some("/console/"));
 
     for who in [&member, &viewer] {
-        for path in [
-            "/console/",
-            "/console/index.html",
-            "/console/app.js",
-            "/console/styles.css",
-        ] {
+        for path in ["/console/", "/console/index.html", "/console/app.js", "/console/styles.css"] {
             let (code, to, _) = location(port, path, who, "").await;
             assert_eq!((code, to.as_deref()), (303, Some("/app/")), "{path}");
         }
@@ -320,12 +205,8 @@ async fn people_land_on_the_app_and_admins_keep_the_console() {
         assert_eq!(location(port, "/app/some/deep/link", who, "").await.0, 404);
     }
 
-    let me =
-        |auth: String| async move { parse(&call(port, "GET", "/api/auth/me", &auth, "").await.1) };
-    assert_eq!(
-        me(admin.clone()).await["landing"].as_str(),
-        Some("/console/")
-    );
+    let me = |auth: String| async move { parse(&call(port, "GET", "/api/auth/me", &auth, "").await.1) };
+    assert_eq!(me(admin.clone()).await["landing"].as_str(), Some("/console/"));
     assert_eq!(me(member.clone()).await["landing"].as_str(), Some("/app/"));
     assert_eq!(me(viewer.clone()).await["landing"].as_str(), Some("/app/"));
 }
@@ -334,21 +215,11 @@ async fn people_land_on_the_app_and_admins_keep_the_console() {
 async fn sign_in_health_and_the_public_site_stay_open() {
     let (port, _, _, _) = serve_app().await;
     for path in ["/console/", "/app/"] {
-        assert_eq!(
-            location(port, path, "", "").await.1.as_deref(),
-            Some("/login"),
-            "{path}"
-        );
+        assert_eq!(location(port, path, "", "").await.1.as_deref(), Some("/login"), "{path}");
     }
     let (code, _, body) = location(port, "/login", "", "").await;
-    assert!(
-        code == 200 && body.contains("Sign-in code or password"),
-        "{code}"
-    );
-    assert!(
-        body.contains("me?.landing"),
-        "the sign-in page follows the server's landing"
-    );
+    assert!(code == 200 && body.contains("Sign-in code or password"), "{code}");
+    assert!(body.contains("me?.landing"), "the sign-in page follows the server's landing");
     for path in ["/healthz", "/", "/get-started"] {
         assert_eq!(location(port, path, "", "").await.0, 200, "{path}");
     }
@@ -358,146 +229,63 @@ async fn sign_in_health_and_the_public_site_stay_open() {
 async fn a_members_cookie_session_from_the_sign_in_page_opens_the_app() {
     let (port, _, admin, _) = serve_app().await;
     let (id, _) = user_with(port, &admin, "mia@example.com", "member").await;
-    let (_, c) = call(
-        port,
-        "POST",
-        &format!("/api/users/{id}/login-codes"),
-        &admin,
-        "",
-    )
-    .await;
+    let (_, c) = call(port, "POST", &format!("/api/users/{id}/login-codes"), &admin, "").await;
     let body = json!({ "code": parse(&c)["code"], "session": "cookie" }).to_string();
-    let (code, head, _) = call_with(
-        port,
-        "POST",
-        "/api/auth/login",
-        "",
-        &format!("Origin: http://127.0.0.1:{port}\r\n"),
-        &body,
-    )
-    .await;
+    let (code, head, _) = call_with(port, "POST", "/api/auth/login", "", &format!("Origin: http://127.0.0.1:{port}\r\n"), &body).await;
     assert_eq!(code, 200);
-    let token = header(&head, "set-cookie")
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
+    let token = header(&head, "set-cookie").unwrap().split(';').next().unwrap().to_string();
     let cookie = format!("Cookie: {token}\r\n");
-    assert_eq!(
-        location(port, "/console/", "", &cookie).await.1.as_deref(),
-        Some("/app/")
-    );
+    assert_eq!(location(port, "/console/", "", &cookie).await.1.as_deref(), Some("/app/"));
     // The app adopts this cookie: /api/auth/me shows a session it can use.
     let (code, _, me) = call_with(port, "GET", "/api/auth/me", "", &cookie, "").await;
     let me = parse(&me);
-    assert_eq!(
-        (code, me["landing"].as_str(), me["session"].is_object()),
-        (200, Some("/app/"), true)
-    );
+    assert_eq!((code, me["landing"].as_str(), me["session"].is_object()), (200, Some("/app/"), true));
 }
 
 #[tokio::test]
 async fn a_new_harness_drops_the_old_model_and_effort() {
     let (port, _, admin, _) = serve_app().await;
-    let (code, b) = call(
-        port,
-        "POST",
-        "/api/bots",
-        &admin,
-        &json!({ "name": "Ada", "harness": "claude" }).to_string(),
-    )
-    .await;
+    let (code, b) = call(port, "POST", "/api/bots", &admin, &json!({ "name": "Ada", "harness": "claude" }).to_string()).await;
     assert_eq!(code, 201, "{b}");
     let id = parse(&b)["id"].as_str().unwrap().to_string();
     let patch = |body: Value| {
         let (admin, id) = (admin.clone(), id.clone());
         async move {
-            let (code, b) = call(
-                port,
-                "PATCH",
-                &format!("/api/bots/{id}"),
-                &admin,
-                &body.to_string(),
-            )
-            .await;
+            let (code, b) = call(port, "PATCH", &format!("/api/bots/{id}"), &admin, &body.to_string()).await;
             assert_eq!(code, 200, "{b}");
             parse(&b)
         }
     };
     let b = patch(json!({ "model": "opus", "effort": "high" })).await;
-    assert_eq!(
-        (b["model"].as_str(), b["effort"].as_str()),
-        (Some("opus"), Some("high"))
-    );
+    assert_eq!((b["model"].as_str(), b["effort"].as_str()), (Some("opus"), Some("high")));
     let b = patch(json!({ "harness": "codex" })).await;
-    assert_eq!(
-        (
-            b["harness"].as_str(),
-            b["model"].as_str(),
-            b["effort"].as_str()
-        ),
-        (Some("codex"), None, None)
-    );
+    assert_eq!((b["harness"].as_str(), b["model"].as_str(), b["effort"].as_str()), (Some("codex"), None, None));
     // A model sent with the new harness is kept.
     let b = patch(json!({ "harness": "claude", "model": "sonnet" })).await;
-    assert_eq!(
-        (b["harness"].as_str(), b["model"].as_str()),
-        (Some("claude"), Some("sonnet"))
-    );
+    assert_eq!((b["harness"].as_str(), b["model"].as_str()), (Some("claude"), Some("sonnet")));
     // The same harness again changes nothing.
-    assert_eq!(
-        patch(json!({ "harness": "claude" })).await["model"].as_str(),
-        Some("sonnet")
-    );
+    assert_eq!(patch(json!({ "harness": "claude" })).await["model"].as_str(), Some("sonnet"));
 }
 
 #[tokio::test]
 async fn sso_web_sign_ins_land_by_role() {
     let idp = mock_idp().await;
     let (port, app, admin, id) = serve_with(&idp, &[], |_| {}).await;
-    let u = app
-        .db
-        .create_user(None, Some("ada@example.com"), "Ada", Role::Member)
-        .unwrap();
-    let (code, _) = call(
-        port,
-        "POST",
-        &format!("/api/users/{}/identities", u.id),
-        &admin,
-        &json!({ "provider": id, "subject": OID }).to_string(),
-    )
-    .await;
+    let u = app.db.create_user(None, Some("ada@example.com"), "Ada", Role::Member).unwrap();
+    let (code, _) = call(port, "POST", &format!("/api/users/{}/identities", u.id), &admin, &json!({ "provider": id, "subject": OID }).to_string()).await;
     assert_eq!(code, 201);
 
     let sign_in = || async {
         let (path, binder) = to_callback(port, &format!("/api/auth/sso/{id}/start")).await;
         let (code, head, body) = call_with(port, "GET", &path, "", &binder, "").await;
         assert_eq!(code, 200, "{head}");
-        assert!(
-            set_cookies(&head)
-                .iter()
-                .any(|c| c.starts_with("__Host-superbot_session=sbs_"))
-        );
+        assert!(set_cookies(&head).iter().any(|c| c.starts_with("__Host-superbot_session=sbs_")));
         body
     };
     let body = sign_in().await;
-    assert!(
-        body.contains("url=/app/") && body.contains(r#"href="/app/""#),
-        "{body}"
-    );
+    assert!(body.contains("url=/app/") && body.contains(r#"href="/app/""#), "{body}");
 
-    call(
-        port,
-        "PATCH",
-        &format!("/api/users/{}", u.id),
-        &admin,
-        &json!({ "role": "admin" }).to_string(),
-    )
-    .await;
+    call(port, "PATCH", &format!("/api/users/{}", u.id), &admin, &json!({ "role": "admin" }).to_string()).await;
     let body = sign_in().await;
-    assert!(
-        body.contains("url=/console/") && body.contains(r#"href="/console/""#),
-        "{body}"
-    );
+    assert!(body.contains("url=/console/") && body.contains(r#"href="/console/""#), "{body}");
 }

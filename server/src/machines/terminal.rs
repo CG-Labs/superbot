@@ -72,12 +72,7 @@ pub fn check(r: &LoginRequest, has: impl Fn(&str) -> bool) -> Result<Command, Re
     let Some(bin) = wire::harness_bin(&r.harness) else {
         return bad("That isn't a harness this machine runs.");
     };
-    let Some(args) = r
-        .args
-        .iter()
-        .map(|a| wire::login_word(a))
-        .collect::<Option<Vec<_>>>()
-    else {
+    let Some(args) = r.args.iter().map(|a| wire::login_word(a)).collect::<Option<Vec<_>>>() else {
         return bad("The login's arguments aren't ones a machine login takes.");
     };
     if r.files.is_empty() || r.files.len() > 4 || !r.files.iter().all(|f| wire::home_path(f)) {
@@ -122,9 +117,7 @@ pub fn forget(home: &Path, files: &[String]) -> u32 {
     let mut n = 0;
     for p in files.iter().filter_map(|f| under(home, f)) {
         // Removing a link removes the link, never what it points to.
-        if std::fs::symlink_metadata(&p).is_ok_and(|m| !m.is_dir())
-            && std::fs::remove_file(&p).is_ok()
-        {
+        if std::fs::symlink_metadata(&p).is_ok_and(|m| !m.is_dir()) && std::fs::remove_file(&p).is_ok() {
             n += 1;
         }
     }
@@ -148,10 +141,7 @@ fn open_pty() -> std::io::Result<(OwnedFd, OwnedFd)> {
         if libc::ptsname_r(m, name.as_mut_ptr(), name.len()) != 0 {
             return Err(err());
         }
-        let s = libc::open(
-            name.as_ptr(),
-            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
-        );
+        let s = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
         if s < 0 {
             return Err(err());
         }
@@ -219,10 +209,7 @@ impl Logins {
 
     /// The harnesses logging in now, for anyone.
     pub fn running(&self) -> Vec<String> {
-        self.sessions()
-            .values()
-            .map(|s| s.harness.clone())
-            .collect()
+        self.sessions().values().map(|s| s.harness.clone()).collect()
     }
 
     /// The harnesses logging in now for `for_user` (None: the owner) only.
@@ -237,10 +224,7 @@ impl Logins {
     /// Stops every login of teammate `user_id`. How many there were.
     pub fn abort_for(&self, user_id: &str) -> u32 {
         let s = self.sessions();
-        let theirs: Vec<&Session> = s
-            .values()
-            .filter(|s| s.for_user.as_deref() == Some(user_id))
-            .collect();
+        let theirs: Vec<&Session> = s.values().filter(|s| s.for_user.as_deref() == Some(user_id)).collect();
         for t in &theirs {
             let _ = t.stop.send(true);
         }
@@ -258,19 +242,12 @@ impl Logins {
         env: &BTreeMap<String, String>,
         user: Option<Ids>,
     ) -> Result<(mpsc::Receiver<LoginEvent>, watch::Sender<bool>), Refused> {
-        let (master, slave) =
-            open_pty().map_err(|e| (500, format!("Couldn't open a terminal: {e}")))?;
+        let (master, slave) = open_pty().map_err(|e| (500, format!("Couldn't open a terminal: {e}")))?;
         if let Some(ids) = user {
             use std::os::fd::AsRawFd;
             // SAFETY: an open descriptor; the login's user owns its terminal.
             if unsafe { libc::fchown(slave.as_raw_fd(), ids.uid, ids.gid) } != 0 {
-                return Err((
-                    500,
-                    format!(
-                        "Couldn't give the terminal to the Bots' user: {}",
-                        std::io::Error::last_os_error()
-                    ),
-                ));
+                return Err((500, format!("Couldn't give the terminal to the Bots' user: {}", std::io::Error::last_os_error())));
             }
         }
         let input = std::fs::File::from(master);
@@ -278,19 +255,11 @@ impl Logins {
         let (stop_tx, mut stop_rx) = watch::channel(false);
         {
             let mut s = self.sessions();
-            if s.values()
-                .any(|s| s.harness == r.harness && s.for_user == r.for_user)
-            {
-                return Err((
-                    409,
-                    format!("A {} login is already running here.", r.harness),
-                ));
+            if s.values().any(|s| s.harness == r.harness && s.for_user == r.for_user) {
+                return Err((409, format!("A {} login is already running here.", r.harness)));
             }
             if s.len() >= MAX_LOGINS || s.contains_key(&r.login_id) {
-                return Err((
-                    409,
-                    "Another login is running here. Try again when it's done.".into(),
-                ));
+                return Err((409, "Another login is running here. Try again when it's done.".into()));
             }
             s.insert(
                 r.login_id.clone(),
@@ -329,16 +298,12 @@ impl Logins {
                 Ok(())
             });
         }
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| (500, format!("Couldn't start {}: {e}", run.bin)))?;
+        let mut child = cmd.spawn().map_err(|e| (500, format!("Couldn't start {}: {e}", run.bin)))?;
         drop(slave);
         let pid = child.id();
         let (tx, rx) = mpsc::channel::<LoginEvent>(256);
         // First, before anything it shows.
-        let _ = tx.try_send(LoginEvent::Started {
-            login_id: r.login_id.clone(),
-        });
+        let _ = tx.try_send(LoginEvent::Started { login_id: r.login_id.clone() });
         let reading = {
             let tx = tx.clone();
             tokio::task::spawn_blocking(move || read_terminal(reader, tx))
@@ -370,14 +335,11 @@ impl Logins {
             // holds the terminal open.
             let _ = tokio::time::timeout(GRACE, reading).await;
             let status = status.expect("set above");
-            let logged_in =
-                runas::as_user(user, || logged_in(&home, &files).is_some()).unwrap_or(false);
+            let logged_in = runas::as_user(user, || logged_in(&home, &files).is_some()).unwrap_or(false);
             let _ = tx
                 .send(LoginEvent::Exit {
                     success: status.as_ref().is_ok_and(|s| s.success()),
-                    status: status
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|e| e.to_string()),
+                    status: status.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string()),
                     logged_in,
                 })
                 .await;
@@ -439,12 +401,8 @@ mod tests {
     }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
-        let t = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let d =
-            std::env::temp_dir().join(format!("superbot-login-{tag}-{}-{t}", std::process::id()));
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let d = std::env::temp_dir().join(format!("superbot-login-{tag}-{}-{t}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -462,20 +420,10 @@ mod tests {
 
     #[test]
     fn only_plain_logins_of_installed_harnesses_run() {
-        assert_eq!(
-            check(&req(&[".claude/.credentials.json"]), |_| true),
-            Ok(Command {
-                bin: "claude".into(),
-                args: vec!["auth".into(), "login".into()]
-            })
-        );
+        assert_eq!(check(&req(&[".claude/.credentials.json"]), |_| true), Ok(Command { bin: "claude".into(), args: vec!["auth".into(), "login".into()] }));
         assert_eq!(check(&req(&[".claude/x"]), |_| false).unwrap_err().0, 422);
         for files in [&[][..], &["/etc/shadow"], &["../x"], &[".claude/../../x"]] {
-            assert_eq!(
-                check(&req(files), |_| true).unwrap_err().0,
-                400,
-                "{files:?}"
-            );
+            assert_eq!(check(&req(files), |_| true).unwrap_err().0, 400, "{files:?}");
         }
         let mut r = req(&["a"]);
         r.harness = "sh".into();
@@ -488,11 +436,7 @@ mod tests {
         assert!(check(&r, |_| true).is_err());
         let mut r = req(&["a"]);
         r.args.push("--dangerously-skip-permissions".into());
-        assert_eq!(
-            check(&r, |_| true).unwrap_err().0,
-            400,
-            "only a login's own words"
-        );
+        assert_eq!(check(&r, |_| true).unwrap_err().0, 400, "only a login's own words");
     }
 
     #[test]
@@ -530,27 +474,17 @@ mod tests {
              [ \"$code\" = ok ] || { echo bad; exit 1; }\nmkdir -p .claude && echo '{}' > .claude/.credentials.json\necho done\n",
         )
         .unwrap();
-        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         let logins = Arc::new(Logins::default());
         let r = req(&[".claude/.credentials.json"]);
         let env = BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
         let (mut rx, _stop) = logins.start(&r, &fake(&bin), &home, &env, None).unwrap();
         assert_eq!(logins.running(), vec!["claude".to_string()]);
-        assert_eq!(
-            logins
-                .start(&r, &fake(&bin), &home, &env, None)
-                .unwrap_err()
-                .0,
-            409
-        );
+        assert_eq!(logins.start(&r, &fake(&bin), &home, &env, None).unwrap_err().0, 409);
         let mut shown = String::new();
         let mut typed = false;
         let exit = loop {
-            let e = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+            let e = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap();
             match e {
                 LoginEvent::Output { text } => {
                     shown.push_str(&text);
@@ -572,10 +506,7 @@ mod tests {
             },
             "{shown}"
         );
-        assert!(
-            shown.contains("done") && !shown.contains("ok\r"),
-            "{shown:?}"
-        );
+        assert!(shown.contains("done") && !shown.contains("ok\r"), "{shown:?}");
         assert!(logins.running().is_empty());
         assert_eq!(logins.input("l1", "x").unwrap_err().0, 404);
         assert_eq!(logins.input("l1", "a\u{1b}b").unwrap_err().0, 400);
@@ -586,8 +517,7 @@ mod tests {
         let home = scratch("run");
         let bin = home.join("slow-login");
         std::fs::write(&bin, "#!/bin/sh\necho waiting\nsleep 60\n").unwrap();
-        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         let logins = Arc::new(Logins::default());
         let r = req(&[".claude/.credentials.json"]);
         let env = BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
@@ -595,23 +525,11 @@ mod tests {
         let _ = rx.recv().await;
         assert!(logins.abort("l1"));
         let exit = loop {
-            if let e @ LoginEvent::Exit { .. } =
-                tokio::time::timeout(Duration::from_secs(10), rx.recv())
-                    .await
-                    .unwrap()
-                    .unwrap()
-            {
+            if let e @ LoginEvent::Exit { .. } = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap() {
                 break e;
             }
         };
-        assert!(matches!(
-            exit,
-            LoginEvent::Exit {
-                success: false,
-                logged_in: false,
-                ..
-            }
-        ));
+        assert!(matches!(exit, LoginEvent::Exit { success: false, logged_in: false, .. }));
     }
 
     #[tokio::test]
@@ -619,60 +537,21 @@ mod tests {
         let home = scratch("people");
         let bin = home.join("slow-login");
         std::fs::write(&bin, "#!/bin/sh\necho waiting\nsleep 60\n").unwrap();
-        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         let logins = Arc::new(Logins::default());
         let env = BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
-        let for_user = |id: &str, who: Option<&str>| LoginRequest {
-            login_id: id.into(),
-            for_user: who.map(String::from),
-            ..req(&[".claude/.credentials.json"])
-        };
-        let (mut owner, _s1) = logins
-            .start(&for_user("l1", None), &fake(&bin), &home, &env, None)
-            .unwrap();
-        let (mut bea, _s2) = logins
-            .start(
-                &for_user("l2", Some("u-bea")),
-                &fake(&bin),
-                &home,
-                &env,
-                None,
-            )
-            .unwrap();
-        let (_cy, _s3) = logins
-            .start(
-                &for_user("l3", Some("u-cy")),
-                &fake(&bin),
-                &home,
-                &env,
-                None,
-            )
-            .unwrap();
-        assert_eq!(
-            logins
-                .start(
-                    &for_user("l4", Some("u-bea")),
-                    &fake(&bin),
-                    &home,
-                    &env,
-                    None
-                )
-                .unwrap_err()
-                .0,
-            409,
-            "one each"
-        );
+        let for_user = |id: &str, who: Option<&str>| LoginRequest { login_id: id.into(), for_user: who.map(String::from), ..req(&[".claude/.credentials.json"]) };
+        let (mut owner, _s1) = logins.start(&for_user("l1", None), &fake(&bin), &home, &env, None).unwrap();
+        let (mut bea, _s2) = logins.start(&for_user("l2", Some("u-bea")), &fake(&bin), &home, &env, None).unwrap();
+        let (_cy, _s3) = logins.start(&for_user("l3", Some("u-cy")), &fake(&bin), &home, &env, None).unwrap();
+        assert_eq!(logins.start(&for_user("l4", Some("u-bea")), &fake(&bin), &home, &env, None).unwrap_err().0, 409, "one each");
         assert_eq!(logins.running_for(None), ["claude"], "the owner's own only");
         assert_eq!(logins.running_for(Some("u-bea")), ["claude"]);
         assert!(logins.running_for(Some("u-dan")).is_empty());
 
         assert_eq!(logins.abort_for("u-bea"), 1);
         let ended = async |rx: &mut mpsc::Receiver<LoginEvent>| loop {
-            match tokio::time::timeout(Duration::from_secs(10), rx.recv())
-                .await
-                .unwrap()
-            {
+            match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap() {
                 Some(LoginEvent::Exit { .. }) | None => break true,
                 _ => {}
             }

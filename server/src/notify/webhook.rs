@@ -6,7 +6,7 @@
 
 use super::{Notice, NoticeKind};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::time::Duration;
 
 /// The secret holding the global webhook's URL.
@@ -39,16 +39,7 @@ impl Format {
 /// The secret for one Bot's own webhook. Bot ids are short hex; anything else is folded
 /// into the characters a secret name may hold.
 pub fn bot_secret(bot_id: &str) -> String {
-    let id: String = bot_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    let id: String = bot_id.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' }).collect();
     format!("{URL}_BOT_{id}")
 }
 
@@ -59,9 +50,7 @@ pub fn check_url(raw: &str) -> Result<url::Url, String> {
     if raw.is_empty() || raw.len() > MAX_URL {
         return Err(format!("The webhook URL must be 1 to {MAX_URL} characters"));
     }
-    let u = url::Url::parse(raw).map_err(|_| {
-        "The webhook URL isn't a web address, like https://hooks.slack.com/services/…".to_string()
-    })?;
+    let u = url::Url::parse(raw).map_err(|_| "The webhook URL isn't a web address, like https://hooks.slack.com/services/…".to_string())?;
     let loopback = matches!(u.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
     if !(u.scheme() == "https" || (u.scheme() == "http" && loopback)) || u.host_str().is_none() {
         return Err("The webhook URL must be https (http only to this machine)".into());
@@ -74,16 +63,12 @@ pub fn check_url(raw: &str) -> Result<url::Url, String> {
 
 /// What the settings show of a URL: its host, never the path, which may be a token.
 pub fn host_of(raw: &str) -> Option<String> {
-    url::Url::parse(raw.trim())
-        .ok()
-        .and_then(|u| u.host_str().map(String::from))
+    url::Url::parse(raw.trim()).ok().and_then(|u| u.host_str().map(String::from))
 }
 
 /// Slack mrkdwn: `&`, `<` and `>` are control characters there.
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 pub fn body(format: Format, n: &Notice) -> Value {
@@ -116,21 +101,9 @@ fn slack_text(n: &Notice) -> String {
             out.push_str(&format!("\n```{}```", esc(&s.replace("```", "'''"))));
         }
         if n.kind != NoticeKind::Test {
-            out.push_str(&format!(
-                "\nDenied <!date^{}^{{time}}|at {}> unless someone answers.",
-                i.expires_at / 1000,
-                super::clock(i.expires_at)
-            ));
+            out.push_str(&format!("\nDenied <!date^{}^{{time}}|at {}> unless someone answers.", i.expires_at / 1000, super::clock(i.expires_at)));
         }
-        let links: Vec<String> = [
-            i.link.as_deref().map(|l| format!("<{l}|Open in SuperBot>")),
-            i.console_link
-                .as_deref()
-                .map(|l| format!("<{l}|Audit log>")),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        let links: Vec<String> = [i.link.as_deref().map(|l| format!("<{l}|Open in SuperBot>")), i.console_link.as_deref().map(|l| format!("<{l}|Audit log>"))].into_iter().flatten().collect();
         if !links.is_empty() {
             out.push_str(&format!("\n{}", links.join(" · ")));
         }
@@ -142,11 +115,7 @@ fn slack_text(n: &Notice) -> String {
 }
 
 pub fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("reqwest client")
+    reqwest::Client::builder().timeout(TIMEOUT).redirect(reqwest::redirect::Policy::none()).build().expect("reqwest client")
 }
 
 fn hex(b: &[u8]) -> String {
@@ -159,42 +128,21 @@ pub fn signature(secret: &str, timestamp: i64, body: &[u8]) -> String {
     use aws_lc_rs::hmac;
     let mut msg = format!("{timestamp}.").into_bytes();
     msg.extend_from_slice(body);
-    format!(
-        "sha256={}",
-        hex(hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes()), &msg).as_ref())
-    )
+    format!("sha256={}", hex(hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes()), &msg).as_ref()))
 }
 
 /// Posts the notice. Errors never hold the URL.
-pub async fn post(
-    http: &reqwest::Client,
-    url: &str,
-    format: Format,
-    n: &Notice,
-    signing: Option<&str>,
-) -> Result<u16, String> {
+pub async fn post(http: &reqwest::Client, url: &str, format: Format, n: &Notice, signing: Option<&str>) -> Result<u16, String> {
     check_url(url)?;
     let body = serde_json::to_vec(&body(format, n)).map_err(|e| e.to_string())?;
-    let mut req = http
-        .post(url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header(
-            reqwest::header::USER_AGENT,
-            concat!("SuperBot/", env!("CARGO_PKG_VERSION")),
-        );
+    let mut req = http.post(url).header(reqwest::header::CONTENT_TYPE, "application/json").header(reqwest::header::USER_AGENT, concat!("SuperBot/", env!("CARGO_PKG_VERSION")));
     if let (Format::Json, Some(secret)) = (format, signing) {
         let ts = chrono::Utc::now().timestamp();
-        req = req
-            .header("X-SuperBot-Timestamp", ts.to_string())
-            .header("X-SuperBot-Signature", signature(secret, ts, &body));
+        req = req.header("X-SuperBot-Timestamp", ts.to_string()).header("X-SuperBot-Signature", signature(secret, ts, &body));
     }
     let res = req.body(body).send().await.map_err(|e| {
         let e = e.without_url();
-        if e.is_timeout() {
-            "the webhook didn't answer in time".to_string()
-        } else {
-            format!("couldn't reach the webhook: {e}")
-        }
+        if e.is_timeout() { "the webhook didn't answer in time".to_string() } else { format!("couldn't reach the webhook: {e}") }
     })?;
     let status = res.status();
     if !status.is_success() {
@@ -231,26 +179,13 @@ pub mod fake {
         let status = Arc::new(Mutex::new(200u16));
         let app = axum::Router::new().route(
             "/{*path}",
-            post(
-                |State((hits, status)): State<S>,
-                 uri: axum::http::Uri,
-                 headers: HeaderMap,
-                 body: axum::body::Bytes| async move {
-                    let body_json =
-                        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
-                    hits.lock().unwrap().push(Hit {
-                        path: uri.path().to_string(),
-                        headers,
-                        body: body_json,
-                        raw: body.to_vec(),
-                    });
-                    StatusCode::from_u16(*status.lock().unwrap()).unwrap()
-                },
-            ),
+            post(|State((hits, status)): State<S>, uri: axum::http::Uri, headers: HeaderMap, body: axum::body::Bytes| async move {
+                let body_json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                hits.lock().unwrap().push(Hit { path: uri.path().to_string(), headers, body: body_json, raw: body.to_vec() });
+                StatusCode::from_u16(*status.lock().unwrap()).unwrap()
+            }),
         );
-        let l = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
+        let l = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let url = format!("http://127.0.0.1:{}{path}", l.local_addr().unwrap().port());
         tokio::spawn(axum::serve(l, app.with_state((hits.clone(), status.clone()))).into_future());
         Receiver { url, hits, status }
@@ -276,9 +211,7 @@ mod tests {
                 subject: Some("git push origin main".into()),
                 expires_at: 1_800_000_000_000,
                 link: Some("https://bots.example.com/app/home?approval=a1".into()),
-                console_link: Some(
-                    "https://bots.example.com/console/#audit?target=approval:a1".into(),
-                ),
+                console_link: Some("https://bots.example.com/console/#audit?target=approval:a1".into()),
             }],
             more: 0,
         }
@@ -288,79 +221,44 @@ mod tests {
     fn urls_are_checked_and_never_shown_whole() {
         assert!(check_url("https://hooks.slack.com/services/T0/B0/xyz").is_ok());
         assert!(check_url("http://127.0.0.1:9/hook").is_ok());
-        for bad in [
-            "http://hooks.example.com/x",
-            "ftp://example.com",
-            "https://user:pw@example.com/x",
-            "not a url",
-            "",
-        ] {
+        for bad in ["http://hooks.example.com/x", "ftp://example.com", "https://user:pw@example.com/x", "not a url", ""] {
             assert!(check_url(bad).is_err(), "{bad}");
         }
-        assert_eq!(
-            host_of("https://hooks.slack.com/services/T0/B0/xyz").as_deref(),
-            Some("hooks.slack.com")
-        );
+        assert_eq!(host_of("https://hooks.slack.com/services/T0/B0/xyz").as_deref(), Some("hooks.slack.com"));
         assert_eq!(bot_secret("a1b2c3d4"), "NOTIFY_WEBHOOK_URL_BOT_A1B2C3D4");
         assert_eq!(bot_secret("x-y"), "NOTIFY_WEBHOOK_URL_BOT_X_Y");
     }
 
     #[test]
     fn slack_text_escapes_and_links() {
-        let t = body(Format::Slack, &notice())["text"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let t = body(Format::Slack, &notice())["text"].as_str().unwrap().to_string();
         assert!(t.contains("Ops &lt;bot&gt; &amp; co"), "{t}");
-        assert!(
-            t.contains("<https://bots.example.com/app/home?approval=a1|Open in SuperBot>"),
-            "{t}"
-        );
+        assert!(t.contains("<https://bots.example.com/app/home?approval=a1|Open in SuperBot>"), "{t}");
         assert!(t.contains("```git push origin main```"), "{t}");
         let j = body(Format::Json, &notice());
-        assert_eq!(
-            (j["type"].as_str(), j["approvals"][0]["approvalId"].as_str()),
-            (Some("approval.requested"), Some("a1"))
-        );
+        assert_eq!((j["type"].as_str(), j["approvals"][0]["approvalId"].as_str()), (Some("approval.requested"), Some("a1")));
     }
 
     #[test]
     fn signatures_are_hmac_sha256() {
         // Checked against `printf '%s' '1700000000.{}' | openssl dgst -sha256 -hmac k`.
-        assert_eq!(
-            signature("k", 1_700_000_000, b"{}"),
-            "sha256=c6ef4734033cee2367414a0939385eca0397754aa7a59716da7463a9298b5146"
-        );
+        assert_eq!(signature("k", 1_700_000_000, b"{}"), "sha256=c6ef4734033cee2367414a0939385eca0397754aa7a59716da7463a9298b5146");
         assert_ne!(signature("k", 1, b"{}"), signature("k", 2, b"{}"));
     }
 
     #[tokio::test]
     async fn posts_and_keeps_the_url_out_of_errors() {
         let r = fake::start("/services/T0/B0/token-9c1f").await;
-        assert_eq!(
-            post(&client(), &r.url, Format::Slack, &notice(), None).await,
-            Ok(200)
-        );
+        assert_eq!(post(&client(), &r.url, Format::Slack, &notice(), None).await, Ok(200));
         assert_eq!(r.hits.lock().unwrap()[0].path, "/services/T0/B0/token-9c1f");
         *r.status.lock().unwrap() = 500;
-        let e = post(&client(), &r.url, Format::Json, &notice(), Some("s3cret"))
-            .await
-            .unwrap_err();
+        let e = post(&client(), &r.url, Format::Json, &notice(), Some("s3cret")).await.unwrap_err();
         assert_eq!(e, "the webhook answered HTTP 500");
         let hit = r.hits.lock().unwrap()[1].clone();
-        let ts: i64 = hit.headers["x-superbot-timestamp"]
-            .to_str()
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert_eq!(
-            hit.headers["x-superbot-signature"].to_str().unwrap(),
-            signature("s3cret", ts, &hit.raw)
-        );
+        let ts: i64 = hit.headers["x-superbot-timestamp"].to_str().unwrap().parse().unwrap();
+        assert_eq!(hit.headers["x-superbot-signature"].to_str().unwrap(), signature("s3cret", ts, &hit.raw));
         let gone = "http://127.0.0.1:1/services/T0/B0/token-9c1f".to_string();
-        let e = post(&client(), &gone, Format::Slack, &notice(), None)
-            .await
-            .unwrap_err();
+        let e = post(&client(), &gone, Format::Slack, &notice(), None).await.unwrap_err();
         assert!(!e.contains("token-9c1f"), "{e}");
     }
 }

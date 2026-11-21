@@ -78,10 +78,7 @@ struct Screen {
 impl Screen {
     fn alive(&mut self) -> bool {
         let up = |c: &mut Child| matches!(c.try_wait(), Ok(None));
-        up(&mut self.x)
-            && up(&mut self.bus)
-            && up(&mut self.wm)
-            && self.viewer.as_mut().is_none_or(up)
+        up(&mut self.x) && up(&mut self.bus) && up(&mut self.wm) && self.viewer.as_mut().is_none_or(up)
     }
 }
 
@@ -146,24 +143,14 @@ impl Screens {
 
     /// `name`, if it's an executable file on the screen PATH.
     fn find(&self, name: &str) -> Option<PathBuf> {
-        self.s
-            .path
-            .split(':')
-            .filter(|d| d.starts_with('/'))
-            .map(|d| Path::new(d).join(name))
-            .find(|p| {
-                std::fs::metadata(p)
-                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            })
+        self.s.path.split(':').filter(|d| d.starts_with('/')).map(|d| Path::new(d).join(name)).find(|p| {
+            std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
     }
 
     /// Of `SCREEN_PROGRAMS`, those this machine doesn't have.
     pub fn missing(&self) -> Vec<String> {
-        wire::SCREEN_PROGRAMS
-            .iter()
-            .filter(|p| self.find(p).is_none())
-            .map(|p| p.to_string())
-            .collect()
+        wire::SCREEN_PROGRAMS.iter().filter(|p| self.find(p).is_none()).map(|p| p.to_string()).collect()
     }
 
     pub fn report(&self) -> wire::ScreenReport {
@@ -186,13 +173,11 @@ impl Screens {
     }
 
     fn bus_path(&self, home: &Path, slot: u32) -> PathBuf {
-        home.join(".screens")
-            .join(format!("bus-{}", self.display(slot)))
+        home.join(".screens").join(format!("bus-{}", self.display(slot)))
     }
 
     fn xauth_path(&self, home: &Path, slot: u32) -> PathBuf {
-        home.join(".screens")
-            .join(format!("xauth-{}", self.display(slot)))
+        home.join(".screens").join(format!("xauth-{}", self.display(slot)))
     }
 
     fn reply(&self, s: &Screen, started: bool) -> wire::ScreenReply {
@@ -206,11 +191,7 @@ impl Screens {
 
     /// The Bots' user, in the Bots' home: whom the machine's own user's screens run as.
     fn bots(&self, ids: Ids) -> As {
-        As {
-            ids,
-            home: self.home.clone(),
-            user: self.user.clone(),
-        }
+        As { ids, home: self.home.clone(), user: self.user.clone() }
     }
 
     /// Keeps `bot`'s screen up while the hold lives.
@@ -221,35 +202,21 @@ impl Screens {
 
     /// The loopback port of `bot`'s viewer, if its screen is up, for one more tunnel.
     /// The permit is the tunnel's share of `MAX_TUNNELS`.
-    pub fn tunnel(
-        self: &Arc<Self>,
-        bot: &str,
-    ) -> Result<(u16, Hold, tokio::sync::OwnedSemaphorePermit), Failure> {
+    pub fn tunnel(self: &Arc<Self>, bot: &str) -> Result<(u16, Hold, tokio::sync::OwnedSemaphorePermit), Failure> {
         let port = {
             let mut live = self.live();
             let s = live.get_mut(bot).filter(|s| s.viewer.is_some());
-            let s = s
-                .and_then(|s| s.alive().then_some(s))
-                .ok_or_else(|| fail(404, "No screen is up for that Bot here."))?;
+            let s = s.and_then(|s| s.alive().then_some(s)).ok_or_else(|| fail(404, "No screen is up for that Bot here."))?;
             s.used = Instant::now();
             self.port(s.slot)
         };
-        let permit = self
-            .tunnels
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| fail(503, "This machine has too many screen viewers open."))?;
+        let permit = self.tunnels.clone().try_acquire_owned().map_err(|_| fail(503, "This machine has too many screen viewers open."))?;
         Ok((port, self.hold(bot), permit))
     }
 
     /// Starts `bot`'s screen as the Bots' user (`ids`), or, if it's up, keeps it and lets
     /// only `token` view it from now on.
-    pub async fn ensure(
-        &self,
-        bot: &str,
-        r: &wire::ScreenRequest,
-        ids: Ids,
-    ) -> Result<wire::ScreenReply, Failure> {
+    pub async fn ensure(&self, bot: &str, r: &wire::ScreenRequest, ids: Ids) -> Result<wire::ScreenReply, Failure> {
         self.ensure_as(bot, r, &self.bots(ids)).await
     }
 
@@ -257,20 +224,13 @@ impl Screens {
     /// `token` view it from now on: only the viewer restarts, so what's on the screen
     /// stays. One running as someone else, or without the cookie the request asks for,
     /// is replaced.
-    pub async fn ensure_as(
-        &self,
-        key: &str,
-        r: &wire::ScreenRequest,
-        who: &As,
-    ) -> Result<wire::ScreenReply, Failure> {
+    pub async fn ensure_as(&self, key: &str, r: &wire::ScreenRequest, who: &As) -> Result<wire::ScreenReply, Failure> {
         let _one = self.changing.lock().await;
         let idle = Duration::from_secs(r.idle_secs.clamp(60, 86_400));
         let xauth = r.xauth || r.for_user.is_some();
         let (old_viewer, unfit) = {
             let mut live = self.live();
-            let fits = live.get_mut(key).map(|s| {
-                s.alive() && s.xauth.is_some() == xauth && s.user == who.user && s.home == who.home
-            });
+            let fits = live.get_mut(key).map(|s| s.alive() && s.xauth.is_some() == xauth && s.user == who.user && s.home == who.home);
             match live.get_mut(key).filter(|_| fits == Some(true)) {
                 Some(s) => {
                     s.used = Instant::now();
@@ -285,10 +245,7 @@ impl Screens {
         };
         // One for another user or cookie ends before its slot is used again.
         if let Some(mut s) = unfit {
-            for c in [&mut s.x, &mut s.bus, &mut s.wm]
-                .into_iter()
-                .chain(s.viewer.as_mut())
-            {
+            for c in [&mut s.x, &mut s.bus, &mut s.wm].into_iter().chain(s.viewer.as_mut()) {
                 let _ = c.kill().await;
             }
         }
@@ -296,13 +253,8 @@ impl Screens {
             if let Some(mut v) = viewer {
                 let _ = v.kill().await;
             }
-            let voxl = self
-                .find("voxl")
-                .ok_or_else(|| fail(422, "This machine has no voxl."))?;
-            return match self
-                .start_viewer(&voxl, slot, &r.token, who, cookie.as_deref())
-                .await
-            {
+            let voxl = self.find("voxl").ok_or_else(|| fail(422, "This machine has no voxl."))?;
+            return match self.start_viewer(&voxl, slot, &r.token, who, cookie.as_deref()).await {
                 Ok(v) => {
                     let mut live = self.live();
                     match live.get_mut(key) {
@@ -331,13 +283,7 @@ impl Screens {
     fn free_slot(&self) -> Result<u32, Failure> {
         let live = self.live();
         if live.len() >= self.s.max as usize {
-            return Err(fail(
-                503,
-                format!(
-                    "This machine shows {} screens already. Try again when one closes.",
-                    self.s.max
-                ),
-            ));
+            return Err(fail(503, format!("This machine shows {} screens already. Try again when one closes.", self.s.max)));
         }
         (1..=self.s.max)
             .filter(|n| !live.values().any(|s| s.slot == *n))
@@ -372,10 +318,7 @@ impl Screens {
             Ok(m) if m.is_dir() => Ok(d),
             Ok(_) => Err(fail(500, format!("{} isn't a folder.", d.display()))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::DirBuilder::new()
-                    .mode(0o1777)
-                    .create(&d)
-                    .map_err(bad)?;
+                std::fs::DirBuilder::new().mode(0o1777).create(&d).map_err(bad)?;
                 runas::chmod_dir(&d, 0o1777).map_err(bad)?;
                 Ok(d)
             }
@@ -383,24 +326,9 @@ impl Screens {
         }
     }
 
-    async fn start(
-        &self,
-        slot: u32,
-        r: &wire::ScreenRequest,
-        who: &As,
-        idle: Duration,
-        xauth: bool,
-    ) -> Result<Screen, Failure> {
-        let find = |p: &str| {
-            self.find(p)
-                .ok_or_else(|| fail(422, format!("This machine has no {p}.")))
-        };
-        let (xvfb, openbox, dbus, voxl) = (
-            find("Xvfb")?,
-            find("openbox")?,
-            find("dbus-daemon")?,
-            find("voxl")?,
-        );
+    async fn start(&self, slot: u32, r: &wire::ScreenRequest, who: &As, idle: Duration, xauth: bool) -> Result<Screen, Failure> {
+        let find = |p: &str| self.find(p).ok_or_else(|| fail(422, format!("This machine has no {p}.")));
+        let (xvfb, openbox, dbus, voxl) = (find("Xvfb")?, find("openbox")?, find("dbus-daemon")?, find("voxl")?);
         let n = self.display(slot);
         let x11 = self.x11_dir()?;
         let socket = x11.join(format!("X{n}"));
@@ -408,9 +336,7 @@ impl Screens {
         let run = who.home.join(".screens");
         let cookie = xauth.then(|| self.xauth_path(&who.home, slot));
         let secret = match cookie {
-            Some(_) => Some(Zeroizing::new(random16().map_err(|e| {
-                fail(500, format!("No randomness for the screen's cookie: {e}"))
-            })?)),
+            Some(_) => Some(Zeroizing::new(random16().map_err(|e| fail(500, format!("No randomness for the screen's cookie: {e}")))?)),
             None => None,
         };
         // A display that was killed leaves its socket and lock in the sticky shared folders,
@@ -425,10 +351,7 @@ impl Screens {
             }
         }
         runas::as_user(Some(who.ids), || -> std::io::Result<()> {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&run)?;
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&run)?;
             let _ = std::fs::remove_file(&bus);
             if let (Some(path), Some(secret)) = (&cookie, &secret) {
                 write_private(path, &xauth_entry(n, secret))?;
@@ -445,18 +368,8 @@ impl Screens {
         };
 
         let size = format!("{}x{}x24", r.width, r.height);
-        let spawn = |c: &mut Command, what: &str| {
-            c.spawn()
-                .map_err(|e| fail(500, format!("{what} didn't start: {e}")))
-        };
-        let mut xargs = vec![
-            format!(":{n}"),
-            "-screen".into(),
-            "0".into(),
-            size,
-            "-nolisten".into(),
-            "tcp".into(),
-        ];
+        let spawn = |c: &mut Command, what: &str| c.spawn().map_err(|e| fail(500, format!("{what} didn't start: {e}")));
+        let mut xargs = vec![format!(":{n}"), "-screen".into(), "0".into(), size, "-nolisten".into(), "tcp".into()];
         if let Some(p) = &cookie {
             xargs.extend(["-auth".into(), p.display().to_string()]);
         }
@@ -476,29 +389,13 @@ impl Screens {
             return Err(fail(503, "The virtual display didn't start."));
         }
         let display = ("DISPLAY", format!(":{n}"));
-        let address = (
-            "DBUS_SESSION_BUS_ADDRESS",
-            format!("unix:path={}", bus.display()),
-        );
+        let address = ("DBUS_SESSION_BUS_ADDRESS", format!("unix:path={}", bus.display()));
         let bus_child = spawn(
-            self.command(&dbus, who, &[]).args([
-                "--session".to_string(),
-                "--nofork".into(),
-                format!("--address={}", address.1),
-            ]),
+            self.command(&dbus, who, &[]).args(["--session".to_string(), "--nofork".into(), format!("--address={}", address.1)]),
             "dbus-daemon",
         )?;
-        let wm = spawn(
-            &mut self.command(
-                &openbox,
-                who,
-                &with_cookie(vec![display.clone(), address.clone()]),
-            ),
-            "openbox",
-        )?;
-        let viewer = self
-            .start_viewer(&voxl, slot, &r.token, who, cookie.as_deref())
-            .await?;
+        let wm = spawn(&mut self.command(&openbox, who, &with_cookie(vec![display.clone(), address.clone()])), "openbox")?;
+        let viewer = self.start_viewer(&voxl, slot, &r.token, who, cookie.as_deref()).await?;
         Ok(Screen {
             slot,
             home: who.home.clone(),
@@ -516,50 +413,21 @@ impl Screens {
 
     /// voxl on loopback, for display `slot`, with `token` as its password; returns once
     /// it answers.
-    async fn start_viewer(
-        &self,
-        voxl: &Path,
-        slot: u32,
-        token: &str,
-        who: &As,
-        cookie: Option<&Path>,
-    ) -> Result<Child, Failure> {
+    async fn start_viewer(&self, voxl: &Path, slot: u32, token: &str, who: &As, cookie: Option<&Path>) -> Result<Child, Failure> {
         let port = self.port(slot);
-        let mut env = vec![
-            ("DISPLAY", format!(":{}", self.display(slot))),
-            ("VOXL_PASSWORD", token.to_string()),
-        ];
+        let mut env = vec![("DISPLAY", format!(":{}", self.display(slot))), ("VOXL_PASSWORD", token.to_string())];
         if let Some(p) = cookie {
             env.push(("XAUTHORITY", p.display().to_string()));
         }
         let mut cmd = self.command(voxl, who, &env);
-        cmd.args([
-            "--addr",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-            "--allowed-hosts",
-            "*",
-        ])
-        .args([
-            "--audio-enabled",
-            "false",
-            "--file-transfers",
-            "none",
-            "--enable-clipboard",
-            "true",
-        ]);
-        let mut v = cmd
-            .spawn()
-            .map_err(|e| fail(500, format!("voxl didn't start: {e}")))?;
+        cmd.args(["--addr", "127.0.0.1", "--port", &port.to_string(), "--allowed-hosts", "*"])
+            .args(["--audio-enabled", "false", "--file-transfers", "none", "--enable-clipboard", "true"]);
+        let mut v = cmd.spawn().map_err(|e| fail(500, format!("voxl didn't start: {e}")))?;
         for _ in 0..200 {
             if !matches!(v.try_wait(), Ok(None)) {
                 break;
             }
-            if tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .is_ok()
-            {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
                 return Ok(v);
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -636,12 +504,7 @@ fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let _ = std::fs::remove_file(path);
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(path)?;
     f.write_all(body)
 }
 
@@ -657,33 +520,19 @@ mod tests {
 
     fn me() -> Ids {
         // SAFETY: no arguments.
-        unsafe {
-            Ids {
-                uid: libc::geteuid(),
-                gid: libc::getegid(),
-            }
-        }
+        unsafe { Ids { uid: libc::geteuid(), gid: libc::getegid() } }
     }
 
     /// Stand-ins: an Xvfb that makes its socket, and a voxl that listens on its port.
     fn fakes() -> (Arc<Screens>, PathBuf) {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let root =
-            std::env::temp_dir().join(format!("superbot-screens-{}-{n}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("superbot-screens-{}-{n}", std::process::id()));
         let (bin, tmp, home) = (root.join("bin"), root.join("tmp"), root.join("home"));
         for d in [&bin, &tmp, &home] {
             std::fs::create_dir_all(d).unwrap();
         }
-        script(
-            &bin,
-            "Xvfb",
-            &format!(
-                "#!/bin/sh\nn=${{1#:}}\necho \"$@\" > {t}/xvfb-$n.args\nmkdir -p {x}\n: > {x}/X$n\nexec sleep 60\n",
-                t = tmp.display(),
-                x = tmp.join(".X11-unix").display()
-            ),
-        );
+        script(&bin, "Xvfb", &format!("#!/bin/sh\nn=${{1#:}}\necho \"$@\" > {t}/xvfb-$n.args\nmkdir -p {x}\n: > {x}/X$n\nexec sleep 60\n", t = tmp.display(), x = tmp.join(".X11-unix").display()));
         script(&bin, "dbus-daemon", "#!/bin/sh\nexec sleep 60\n");
         script(&bin, "openbox", "#!/bin/sh\nexec sleep 60\n");
         script(
@@ -699,30 +548,12 @@ mod tests {
                 break port;
             }
         };
-        let s = Settings {
-            path: format!("{}:/usr/bin:/bin", bin.display()),
-            tmp,
-            display_base: 100,
-            port_base: free - 1,
-            max: 2,
-        };
-        (
-            Arc::new(Screens::new(s, home, runas::current_user().unwrap())),
-            root,
-        )
+        let s = Settings { path: format!("{}:/usr/bin:/bin", bin.display()), tmp, display_base: 100, port_base: free - 1, max: 2 };
+        (Arc::new(Screens::new(s, home, runas::current_user().unwrap())), root)
     }
 
     fn req(token: &str) -> wire::ScreenRequest {
-        wire::ScreenRequest {
-            protocol: wire::SCREEN_PROTOCOL,
-            owner_id: "u1".into(),
-            token: token.into(),
-            width: 800,
-            height: 600,
-            idle_secs: 60,
-            for_user: None,
-            xauth: false,
-        }
+        wire::ScreenRequest { protocol: wire::SCREEN_PROTOCOL, owner_id: "u1".into(), token: token.into(), width: 800, height: 600, idle_secs: 60, for_user: None, xauth: false }
     }
 
     #[tokio::test]
@@ -733,10 +564,7 @@ mod tests {
         while screens.changing.try_lock().is_ok() && !start.is_finished() {
             tokio::task::yield_now().await;
         }
-        assert!(
-            screens.stop("b1").await,
-            "the start finished first, then stopped"
-        );
+        assert!(screens.stop("b1").await, "the start finished first, then stopped");
         assert!(start.await.unwrap().unwrap().started);
         assert!(screens.report().running.is_empty());
     }
@@ -754,10 +582,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(
-            screens.ensure("b1", &req(&a), me()).await.unwrap().started,
-            "rebuilt, not reused"
-        );
+        assert!(screens.ensure("b1", &req(&a), me()).await.unwrap().started, "rebuilt, not reused");
         assert!(screens.stop("b1").await);
     }
 
@@ -769,35 +594,16 @@ mod tests {
         let first = screens.ensure("b1", &req(&a), me()).await.unwrap();
         assert!(first.started);
         assert_eq!(first.display, ":101");
-        assert!(
-            first.bus.ends_with("/home/.screens/bus-101"),
-            "{}",
-            first.bus
-        );
-        let mode = std::fs::metadata(root.join("tmp/.X11-unix"))
-            .unwrap()
-            .permissions()
-            .mode();
+        assert!(first.bus.ends_with("/home/.screens/bus-101"), "{}", first.bus);
+        let mode = std::fs::metadata(root.join("tmp/.X11-unix")).unwrap().permissions().mode();
         assert_eq!(mode & 0o7777, 0o1777);
 
         let again = screens.ensure("b1", &req(&a), me()).await.unwrap();
         assert_eq!((again.display.as_str(), again.started), (":101", false));
-        let rotated = screens
-            .ensure("b1", &req(&"b".repeat(32)), me())
-            .await
-            .unwrap();
-        assert_eq!(
-            (rotated.display.as_str(), rotated.started),
-            (":101", false),
-            "a new token keeps the screen"
-        );
+        let rotated = screens.ensure("b1", &req(&"b".repeat(32)), me()).await.unwrap();
+        assert_eq!((rotated.display.as_str(), rotated.started), (":101", false), "a new token keeps the screen");
         let (port, _hold, _permit) = screens.tunnel("b1").unwrap();
-        assert!(
-            tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .is_ok(),
-            "the new viewer listens"
-        );
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok(), "the new viewer listens");
 
         assert_eq!(screens.report().running, vec!["b1".to_string()]);
         assert!(screens.tunnel("b2").is_err(), "no screen, no tunnel");
@@ -819,18 +625,10 @@ mod tests {
             s.used = Instant::now() - Duration::from_secs(120);
         }
         screens.reap();
-        assert_eq!(
-            screens.report().running,
-            vec!["b1".to_string()],
-            "a job or viewer keeps it"
-        );
+        assert_eq!(screens.report().running, vec!["b1".to_string()], "a job or viewer keeps it");
         drop(hold);
         screens.reap();
-        assert_eq!(
-            screens.report().running,
-            vec!["b1".to_string()],
-            "idle counts from when the last hold ended"
-        );
+        assert_eq!(screens.report().running, vec!["b1".to_string()], "idle counts from when the last hold ended");
         screens.live().get_mut("b1").unwrap().used = Instant::now() - Duration::from_secs(120);
         screens.reap();
         assert!(screens.report().running.is_empty());
@@ -864,41 +662,25 @@ mod tests {
         let a = "a".repeat(32);
         let owner = screens.ensure("b1", &req(&a), me()).await.unwrap();
         assert_eq!(owner.xauthority, None, "as before unless asked");
-        let args =
-            |n: u32| std::fs::read_to_string(root.join(format!("tmp/xvfb-{n}.args"))).unwrap();
+        let args = |n: u32| std::fs::read_to_string(root.join(format!("tmp/xvfb-{n}.args"))).unwrap();
         assert!(!args(101).contains("-auth"), "{}", args(101));
 
         let theirs = root.join("teammate");
         std::fs::create_dir_all(&theirs).unwrap();
-        let bea = As {
-            ids: me(),
-            home: theirs.clone(),
-            user: "superbot-t-bea".into(),
-        };
+        let bea = As { ids: me(), home: theirs.clone(), user: "superbot-t-bea".into() };
         let mut r = req(&a);
         r.for_user = Some("u-bea".into());
         let t = screens.ensure_as("b1@u-bea", &r, &bea).await.unwrap();
         assert!(t.started);
         assert_eq!(t.display, ":102", "a screen of its own, not the owner's");
         assert!(t.bus.contains(&theirs.display().to_string()), "{}", t.bus);
-        let cookie = PathBuf::from(
-            t.xauthority
-                .clone()
-                .expect("a teammate's screen always has a cookie"),
-        );
+        let cookie = PathBuf::from(t.xauthority.clone().expect("a teammate's screen always has a cookie"));
         assert!(cookie.starts_with(&theirs));
-        assert_eq!(
-            std::fs::metadata(&cookie).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        assert_eq!(std::fs::metadata(&cookie).unwrap().permissions().mode() & 0o777, 0o600);
         let entry = std::fs::read(&cookie).unwrap();
         assert_eq!(&entry[..2], &[0xff, 0xff]);
         assert_eq!(entry.len(), 2 + 2 + 2 + 3 + 2 + 18 + 2 + 16);
-        assert!(
-            args(102).contains(&format!("-auth {}", cookie.display())),
-            "{}",
-            args(102)
-        );
+        assert!(args(102).contains(&format!("-auth {}", cookie.display())), "{}", args(102));
         let mut running = screens.report().running;
         running.sort();
         assert_eq!(running, ["b1", "b1@u-bea"]);
@@ -923,17 +705,7 @@ mod tests {
 
     #[test]
     fn programs_are_found_only_on_the_screen_path() {
-        let s = Screens::new(
-            Settings {
-                path: "/nonexistent:relative".into(),
-                ..Settings::default()
-            },
-            "/nonexistent".into(),
-            "x".into(),
-        );
-        assert_eq!(
-            s.missing(),
-            wire::SCREEN_PROGRAMS.map(String::from).to_vec()
-        );
+        let s = Screens::new(Settings { path: "/nonexistent:relative".into(), ..Settings::default() }, "/nonexistent".into(), "x".into());
+        assert_eq!(s.missing(), wire::SCREEN_PROGRAMS.map(String::from).to_vec());
     }
 }

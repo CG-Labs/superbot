@@ -1,9 +1,7 @@
 //! SCIM provisioning end to end (ADR 0023): the real router, with the request shapes
 //! Okta and Entra ID send.
 
-use crate::sso_http_tests::{
-    OID, header, mock_idp, s256, serve_with, set_cookies, to_callback, web_sign_in,
-};
+use crate::sso_http_tests::{header, mock_idp, s256, serve_with, set_cookies, to_callback, web_sign_in, OID};
 use crate::tests::{audit_list, call, call_with, serve_app_with};
 use crate::users_http_tests::{parse, user_with};
 use crate::*;
@@ -22,39 +20,17 @@ async fn serve(tweak: impl FnOnce(&mut Auth)) -> (u16, AppState, String) {
 
 /// A new SCIM token. Returns its value and id.
 async fn token(port: u16, admin: &str, body: Value) -> (String, String) {
-    let (code, head, res) = call_with(
-        port,
-        "POST",
-        "/api/scim/tokens",
-        admin,
-        "",
-        &body.to_string(),
-    )
-    .await;
+    let (code, head, res) = call_with(port, "POST", "/api/scim/tokens", admin, "", &body.to_string()).await;
     assert_eq!(code, 201, "{res}");
     assert_eq!(header(&head, "cache-control").as_deref(), Some("no-store"));
     let res = parse(&res);
-    (
-        res["token"].as_str().unwrap().to_string(),
-        res["scimToken"]["id"].as_str().unwrap().to_string(),
-    )
+    (res["token"].as_str().unwrap().to_string(), res["scimToken"]["id"].as_str().unwrap().to_string())
 }
 
 /// A SCIM request with `token`. Returns the status, response head, and body.
-async fn scim(
-    port: u16,
-    token: &str,
-    method: &str,
-    path: &str,
-    body: Value,
-) -> (u16, String, Value) {
-    let body = if body.is_null() {
-        String::new()
-    } else {
-        body.to_string()
-    };
-    let (code, head, res) =
-        call_with(port, method, path, &format!("Bearer {token}"), "", &body).await;
+async fn scim(port: u16, token: &str, method: &str, path: &str, body: Value) -> (u16, String, Value) {
+    let body = if body.is_null() { String::new() } else { body.to_string() };
+    let (code, head, res) = call_with(port, method, path, &format!("Bearer {token}"), "", &body).await;
     (code, head, parse(&res))
 }
 
@@ -66,23 +42,9 @@ async fn events(port: u16, admin: &str, query: &str) -> Vec<Value> {
 
 /// A session for an existing user, from a one-time code.
 async fn session_for(port: u16, admin: &str, user: &str) -> String {
-    let (code, c) = call(
-        port,
-        "POST",
-        &format!("/api/users/{user}/login-codes"),
-        admin,
-        "",
-    )
-    .await;
+    let (code, c) = call(port, "POST", &format!("/api/users/{user}/login-codes"), admin, "").await;
     assert_eq!(code, 200, "{c}");
-    let (code, res) = call(
-        port,
-        "POST",
-        "/api/auth/login",
-        "",
-        &json!({ "code": parse(&c)["code"] }).to_string(),
-    )
-    .await;
+    let (code, res) = call(port, "POST", "/api/auth/login", "", &json!({ "code": parse(&c)["code"] }).to_string()).await;
     assert_eq!(code, 200, "{res}");
     format!("Bearer {}", parse(&res)["token"].as_str().unwrap())
 }
@@ -103,16 +65,8 @@ fn okta_user(user_name: &str, external_id: &str) -> Value {
 }
 
 fn is_scim_error(head: &str, body: &Value, status: u16) {
-    assert_eq!(
-        header(head, "content-type").as_deref(),
-        Some("application/scim+json"),
-        "{head}"
-    );
-    assert_eq!(
-        body["schemas"],
-        json!(["urn:ietf:params:scim:api:messages:2.0:Error"]),
-        "{body}"
-    );
+    assert_eq!(header(head, "content-type").as_deref(), Some("application/scim+json"), "{head}");
+    assert_eq!(body["schemas"], json!(["urn:ietf:params:scim:api:messages:2.0:Error"]), "{body}");
     assert_eq!(body["status"], status.to_string(), "{body}");
 }
 
@@ -134,110 +88,29 @@ async fn scim_is_off_by_default() {
 async fn tokens_are_admin_only_shown_once_and_revocable() {
     let (port, _, admin) = serve(|_| {}).await;
     let (_, member) = user_with(port, &admin, "member@example.com", "member").await;
-    assert_eq!(
-        call(
-            port,
-            "POST",
-            "/api/scim/tokens",
-            &member,
-            r#"{"tenant":"okta"}"#
-        )
-        .await
-        .0,
-        403
-    );
-    assert_eq!(
-        call(port, "GET", "/api/scim/tokens", &member, "").await.0,
-        403
-    );
-    for bad in [
-        json!({}),
-        json!({ "tenant": "Okta" }),
-        json!({ "tenant": "a b" }),
-        json!({ "tenant": "okta", "sso": "nope" }),
-        json!({ "tenant": "okta", "sso": 1 }),
-    ] {
-        assert_eq!(
-            call(port, "POST", "/api/scim/tokens", &admin, &bad.to_string())
-                .await
-                .0,
-            400,
-            "{bad}"
-        );
+    assert_eq!(call(port, "POST", "/api/scim/tokens", &member, r#"{"tenant":"okta"}"#).await.0, 403);
+    assert_eq!(call(port, "GET", "/api/scim/tokens", &member, "").await.0, 403);
+    for bad in [json!({}), json!({ "tenant": "Okta" }), json!({ "tenant": "a b" }), json!({ "tenant": "okta", "sso": "nope" }), json!({ "tenant": "okta", "sso": 1 })] {
+        assert_eq!(call(port, "POST", "/api/scim/tokens", &admin, &bad.to_string()).await.0, 400, "{bad}");
     }
 
-    let (t, id) = token(
-        port,
-        &admin,
-        json!({ "tenant": "okta", "label": "Okta prod" }),
-    )
-    .await;
+    let (t, id) = token(port, &admin, json!({ "tenant": "okta", "label": "Okta prod" })).await;
     assert!(t.starts_with("sbp_") && t.len() == 68, "{t}");
     let (_, list) = call(port, "GET", "/api/scim/tokens", &admin, "").await;
-    assert!(
-        !list.contains(&t) && !list.contains(&users::hash(&t)),
-        "never the token or its hash: {list}"
-    );
+    assert!(!list.contains(&t) && !list.contains(&users::hash(&t)), "never the token or its hash: {list}");
     let list = parse(&list);
-    assert_eq!(
-        (list["enabled"].clone(), list["defaultRole"].clone()),
-        (json!(true), json!("member"))
-    );
-    assert_eq!(
-        (
-            list["tokens"][0]["id"].as_str(),
-            list["tokens"][0]["tenant"].as_str(),
-            list["tokens"][0]["label"].as_str()
-        ),
-        (Some(id.as_str()), Some("okta"), Some("Okta prod"))
-    );
+    assert_eq!((list["enabled"].clone(), list["defaultRole"].clone()), (json!(true), json!("member")));
+    assert_eq!((list["tokens"][0]["id"].as_str(), list["tokens"][0]["tenant"].as_str(), list["tokens"][0]["label"].as_str()), (Some(id.as_str()), Some("okta"), Some("Okta prod")));
     assert_eq!(scim(port, &t, "GET", USERS, Value::Null).await.0, 200);
     assert!(list["tokens"][0]["lastUsedAt"].is_null());
     assert!(!parse(&call(port, "GET", "/api/scim/tokens", &admin, "").await.1)["tokens"][0]["lastUsedAt"].is_null(), "use is recorded");
 
     let made = &events(port, &admin, "action=scim.token_created").await[0];
-    assert_eq!(
-        (
-            made["targetId"].as_str(),
-            made["details"]["tenant"].as_str(),
-            made["actorId"].as_str()
-        ),
-        (Some(id.as_str()), Some("okta"), Some("operator"))
-    );
-    assert_eq!(
-        call(
-            port,
-            "DELETE",
-            &format!("/api/scim/tokens/{id}"),
-            &admin,
-            ""
-        )
-        .await
-        .0,
-        200
-    );
-    assert_eq!(
-        call(
-            port,
-            "DELETE",
-            &format!("/api/scim/tokens/{id}"),
-            &admin,
-            ""
-        )
-        .await
-        .0,
-        404,
-        "revoked once"
-    );
-    assert_eq!(
-        scim(port, &t, "GET", USERS, Value::Null).await.0,
-        401,
-        "a revoked token stops working"
-    );
-    assert_eq!(
-        events(port, &admin, "action=scim.token_revoked").await[0]["targetId"].as_str(),
-        Some(id.as_str())
-    );
+    assert_eq!((made["targetId"].as_str(), made["details"]["tenant"].as_str(), made["actorId"].as_str()), (Some(id.as_str()), Some("okta"), Some("operator")));
+    assert_eq!(call(port, "DELETE", &format!("/api/scim/tokens/{id}"), &admin, "").await.0, 200);
+    assert_eq!(call(port, "DELETE", &format!("/api/scim/tokens/{id}"), &admin, "").await.0, 404, "revoked once");
+    assert_eq!(scim(port, &t, "GET", USERS, Value::Null).await.0, 401, "a revoked token stops working");
+    assert_eq!(events(port, &admin, "action=scim.token_revoked").await[0]["targetId"].as_str(), Some(id.as_str()));
     let (_, all) = call(port, "GET", "/api/audit", &admin, "").await;
     assert!(!all.contains(&t), "the token is never logged");
 }
@@ -248,68 +121,29 @@ async fn only_a_scim_token_works_and_bad_ones_are_throttled() {
     let (_, member) = user_with(port, &admin, "member@example.com", "member").await;
     let (t, _) = token(port, &admin, json!({ "tenant": "okta" })).await;
     let fake = users::new_secret(scim::TOKEN_PREFIX);
-    for (n, auth) in [
-        "".to_string(),
-        format!("Bearer {fake}"),
-        "Bearer sbp_short".into(),
-        admin.clone(),
-        member.clone(),
-        format!("Basic {t}"),
-    ]
-    .iter()
-    .enumerate()
-    {
+    for (n, auth) in ["".to_string(), format!("Bearer {fake}"), "Bearer sbp_short".into(), admin.clone(), member.clone(), format!("Basic {t}")].iter().enumerate() {
         let (code, head, body) = call_with(port, "GET", USERS, auth, "", "").await;
         assert_eq!(code, 401, "credential {n}");
         is_scim_error(&head, &parse(&body), 401);
-        assert_eq!(
-            header(&head, "www-authenticate").as_deref(),
-            Some("Bearer realm=\"SuperBot SCIM\"")
-        );
+        assert_eq!(header(&head, "www-authenticate").as_deref(), Some("Bearer realm=\"SuperBot SCIM\""));
     }
-    assert_eq!(
-        call(port, "GET", "/api/state", &format!("Bearer {t}"), "")
-            .await
-            .0,
-        401,
-        "a SCIM token is not a session"
-    );
-    assert_eq!(
-        call(port, "GET", "/api/scim/tokens", &format!("Bearer {t}"), "")
-            .await
-            .0,
-        401
-    );
-    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
-        .await
-        .unwrap();
-    s.write_all(
-        format!("GET {USERS} HTTP/1.0\r\nHost: evil.example\r\nAuthorization: Bearer {t}\r\n\r\n")
-            .as_bytes(),
-    )
-    .await
-    .unwrap();
+    assert_eq!(call(port, "GET", "/api/state", &format!("Bearer {t}"), "").await.0, 401, "a SCIM token is not a session");
+    assert_eq!(call(port, "GET", "/api/scim/tokens", &format!("Bearer {t}"), "").await.0, 401);
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    s.write_all(format!("GET {USERS} HTTP/1.0\r\nHost: evil.example\r\nAuthorization: Bearer {t}\r\n\r\n").as_bytes()).await.unwrap();
     let mut res = String::new();
     s.read_to_string(&mut res).await.unwrap();
     assert!(res.starts_with("HTTP/1.0 403"), "an unknown Host: {res}");
 
     let failed = events(port, &admin, "action=scim.auth_failed").await;
     assert_eq!(failed.len(), 1, "throttled: {failed:?}");
-    assert_eq!(
-        (
-            failed[0]["outcome"].as_str(),
-            failed[0]["details"]["reason"].as_str(),
-            failed[0]["authMethod"].as_str()
-        ),
-        (Some("failure"), Some("missing"), Some("scim_token"))
-    );
+    assert_eq!((failed[0]["outcome"].as_str(), failed[0]["details"]["reason"].as_str(), failed[0]["authMethod"].as_str()), (Some("failure"), Some("missing"), Some("scim_token")));
     let (_, all) = call(port, "GET", "/api/audit", &admin, "").await;
     assert!(!all.contains(&fake), "a guessed token is never logged");
 
     let mut limited = None;
     for n in 0..30 {
-        let (code, head, _) =
-            call_with(port, "GET", USERS, &format!("Bearer {fake}"), "", "").await;
+        let (code, head, _) = call_with(port, "GET", USERS, &format!("Bearer {fake}"), "", "").await;
         if code == 429 {
             limited = Some((n, header(&head, "retry-after")));
             break;
@@ -335,23 +169,10 @@ async fn bad_tokens_from_an_address_never_block_a_valid_token_from_it() {
         codes.push(call_with(port, "GET", USERS, &junk, shared, "").await.0);
     }
     assert_eq!(codes, [401, 401, 401, 429]);
-    assert_eq!(
-        call_with(port, "GET", USERS, &junk, shared, "").await.0,
-        429,
-        "bad tokens stay blocked"
-    );
+    assert_eq!(call_with(port, "GET", USERS, &junk, shared, "").await.0, 429, "bad tokens stay blocked");
     // The real tenant, from the same address, still deprovisions.
-    let off = json!({ "Operations": [{ "op": "replace", "path": "active", "value": false }] })
-        .to_string();
-    let (code, _, body) = call_with(
-        port,
-        "PATCH",
-        &format!("{USERS}/{id}"),
-        &format!("Bearer {t}"),
-        shared,
-        &off,
-    )
-    .await;
+    let off = json!({ "Operations": [{ "op": "replace", "path": "active", "value": false }] }).to_string();
+    let (code, _, body) = call_with(port, "PATCH", &format!("{USERS}/{id}"), &format!("Bearer {t}"), shared, &off).await;
     assert_eq!(code, 200, "{body}");
     assert!(!app.db.user(&id).unwrap().active());
 }
@@ -360,41 +181,14 @@ async fn bad_tokens_from_an_address_never_block_a_valid_token_from_it() {
 async fn a_revoked_token_in_use_is_named_in_the_audit_log() {
     let (port, _, admin) = serve(|_| {}).await;
     let (t, id) = token(port, &admin, json!({ "tenant": "okta" })).await;
-    assert_eq!(
-        call(
-            port,
-            "DELETE",
-            &format!("/api/scim/tokens/{id}"),
-            &admin,
-            ""
-        )
-        .await
-        .0,
-        200
-    );
+    assert_eq!(call(port, "DELETE", &format!("/api/scim/tokens/{id}"), &admin, "").await.0, 200);
     assert_eq!(scim(port, &t, "GET", USERS, Value::Null).await.0, 401);
     let failed = events(port, &admin, "action=scim.auth_failed").await;
     assert_eq!(failed.len(), 1, "{failed:?}");
     let e = &failed[0];
-    assert_eq!(
-        (
-            e["details"]["reason"].as_str(),
-            e["details"]["tenant"].as_str(),
-            e["targetType"].as_str(),
-            e["targetId"].as_str()
-        ),
-        (
-            Some("revoked"),
-            Some("okta"),
-            Some("scim_token"),
-            Some(id.as_str())
-        )
-    );
+    assert_eq!((e["details"]["reason"].as_str(), e["details"]["tenant"].as_str(), e["targetType"].as_str(), e["targetId"].as_str()), (Some("revoked"), Some("okta"), Some("scim_token"), Some(id.as_str())));
     let (_, all) = call(port, "GET", "/api/audit", &admin, "").await;
-    assert!(
-        !all.contains(&t) && !all.contains(&users::hash(&t)),
-        "never the token or its hash"
-    );
+    assert!(!all.contains(&t) && !all.contains(&users::hash(&t)), "never the token or its hash");
 }
 
 /// SCIM-03: a SCIM token sent to the API is refused and logged as one, not as a bad Bot token.
@@ -402,25 +196,10 @@ async fn a_revoked_token_in_use_is_named_in_the_audit_log() {
 async fn a_scim_token_on_the_api_is_logged_as_a_scim_token() {
     let (port, _, admin) = serve(|_| {}).await;
     let (t, _) = token(port, &admin, json!({ "tenant": "okta" })).await;
-    assert_eq!(
-        call(port, "GET", "/api/users", &format!("Bearer {t}"), "")
-            .await
-            .0,
-        401
-    );
+    assert_eq!(call(port, "GET", "/api/users", &format!("Bearer {t}"), "").await.0, 401);
     let failed = events(port, &admin, "action=auth.login_failed").await;
-    let e = failed
-        .iter()
-        .find(|e| e["details"]["method"] == "scim_token")
-        .unwrap_or_else(|| panic!("{failed:?}"));
-    assert_eq!(
-        (
-            e["details"]["reason"].as_str(),
-            e["actorKind"].as_str(),
-            e["actorId"].as_str()
-        ),
-        (Some("not_for_api"), Some("system"), Some("scim"))
-    );
+    let e = failed.iter().find(|e| e["details"]["method"] == "scim_token").unwrap_or_else(|| panic!("{failed:?}"));
+    assert_eq!((e["details"]["reason"].as_str(), e["actorKind"].as_str(), e["actorId"].as_str()), (Some("not_for_api"), Some("system"), Some("scim")));
 }
 
 /// SCIM-02: an update that doesn't change `active` leaves the status as it is when it
@@ -429,65 +208,23 @@ async fn a_scim_token_on_the_api_is_logged_as_a_scim_token() {
 async fn an_update_that_leaves_active_alone_cannot_undo_an_admins_disable() {
     let (port, app, admin) = serve(|_| {}).await;
     let (t, _) = token(port, &admin, json!({ "tenant": "okta" })).await;
-    let (_, _, u) = scim(
-        port,
-        &t,
-        "POST",
-        USERS,
-        okta_user("ada@example.com", "00u1"),
-    )
-    .await;
+    let (_, _, u) = scim(port, &t, "POST", USERS, okta_user("ada@example.com", "00u1")).await;
     let id = u["id"].as_str().unwrap().to_string();
     // What a PATCH of the family name read before the admin acted.
     let stale = app.db.scim_user("okta", &id).unwrap();
     assert!(stale.user.active());
-    assert_eq!(
-        call(
-            port,
-            "PATCH",
-            &format!("/api/users/{id}"),
-            &admin,
-            r#"{"status":"disabled"}"#
-        )
-        .await
-        .0,
-        200
-    );
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{id}"), &admin, r#"{"status":"disabled"}"#).await.0, 200);
     assert!(!app.db.user(&id).unwrap().active());
-    let rename = db::ScimFields {
-        user_name: &stale.user_name,
-        external_id: stale.external_id.as_deref(),
-        given_name: Some("Ada"),
-        family_name: Some("King"),
-        scim_display_name: None,
-        formatted: None,
-        display_name: "Ada King",
-        email: stale.user.email.as_deref(),
-        active: None,
-    };
+    let rename = db::ScimFields { user_name: &stale.user_name, external_id: stale.external_id.as_deref(), given_name: Some("Ada"), family_name: Some("King"), scim_display_name: None, formatted: None, display_name: "Ada King", email: stale.user.email.as_deref(), active: None };
     app.db.save_scim_user("okta", &id, &rename, false).unwrap();
     assert!(!app.db.user(&id).unwrap().active(), "the disable stands");
     assert_eq!(app.db.user(&id).unwrap().name, "Ada King");
     // Through the API: an unrelated update records no enable and leaves them disabled.
-    let (code, _, u) = scim(
-        port,
-        &t,
-        "PATCH",
-        &format!("{USERS}/{id}"),
-        json!({ "Operations": [{ "op": "replace", "path": "displayName", "value": "A. King" }] }),
-    )
-    .await;
+    let (code, _, u) = scim(port, &t, "PATCH", &format!("{USERS}/{id}"), json!({ "Operations": [{ "op": "replace", "path": "displayName", "value": "A. King" }] })).await;
     assert_eq!((code, u["active"].clone()), (200, json!(false)));
     assert!(events(port, &admin, "action=user.enabled").await.is_empty());
     // The IdP still owns `active`: saying so enables them again.
-    let (_, _, u) = scim(
-        port,
-        &t,
-        "PATCH",
-        &format!("{USERS}/{id}"),
-        json!({ "Operations": [{ "op": "replace", "path": "active", "value": true }] }),
-    )
-    .await;
+    let (_, _, u) = scim(port, &t, "PATCH", &format!("{USERS}/{id}"), json!({ "Operations": [{ "op": "replace", "path": "active", "value": true }] })).await;
     assert_eq!(u["active"], true);
     assert_eq!(events(port, &admin, "action=user.enabled").await.len(), 1);
 }
@@ -504,107 +241,33 @@ async fn each_tenant_is_rate_limited() {
     assert_eq!(code, 429);
     is_scim_error(&head, &body, 429);
     assert!(header(&head, "retry-after").is_some());
-    assert_eq!(
-        scim(port, &b, "GET", USERS, Value::Null).await.0,
-        200,
-        "other tenants aren't slowed"
-    );
+    assert_eq!(scim(port, &b, "GET", USERS, Value::Null).await.0, 200, "other tenants aren't slowed");
 }
 
 #[tokio::test]
 async fn discovery_describes_users_only() {
     let (port, _, admin) = serve(|_| {}).await;
     let (t, _) = token(port, &admin, json!({ "tenant": "okta" })).await;
-    let (code, head, spc) = scim(
-        port,
-        &t,
-        "GET",
-        "/scim/v2/ServiceProviderConfig",
-        Value::Null,
-    )
-    .await;
-    assert_eq!(
-        (code, header(&head, "content-type").as_deref()),
-        (200, Some("application/scim+json"))
-    );
-    assert_eq!(
-        (
-            spc["patch"]["supported"].clone(),
-            spc["bulk"]["supported"].clone(),
-            spc["filter"]["supported"].clone()
-        ),
-        (json!(true), json!(false), json!(true))
-    );
+    let (code, head, spc) = scim(port, &t, "GET", "/scim/v2/ServiceProviderConfig", Value::Null).await;
+    assert_eq!((code, header(&head, "content-type").as_deref()), (200, Some("application/scim+json")));
+    assert_eq!((spc["patch"]["supported"].clone(), spc["bulk"]["supported"].clone(), spc["filter"]["supported"].clone()), (json!(true), json!(false), json!(true)));
     assert_eq!(spc["authenticationSchemes"][0]["type"], "oauthbearertoken");
 
     let (_, _, types) = scim(port, &t, "GET", "/scim/v2/ResourceTypes", Value::Null).await;
-    assert_eq!(
-        (
-            types["totalResults"].clone(),
-            types["Resources"][0]["endpoint"].clone()
-        ),
-        (json!(1), json!("/Users"))
-    );
-    assert_eq!(
-        scim(port, &t, "GET", "/scim/v2/ResourceTypes/User", Value::Null)
-            .await
-            .0,
-        200
-    );
-    assert_eq!(
-        scim(port, &t, "GET", "/scim/v2/ResourceTypes/Group", Value::Null)
-            .await
-            .0,
-        404
-    );
+    assert_eq!((types["totalResults"].clone(), types["Resources"][0]["endpoint"].clone()), (json!(1), json!("/Users")));
+    assert_eq!(scim(port, &t, "GET", "/scim/v2/ResourceTypes/User", Value::Null).await.0, 200);
+    assert_eq!(scim(port, &t, "GET", "/scim/v2/ResourceTypes/Group", Value::Null).await.0, 404);
     let (_, _, schemas) = scim(port, &t, "GET", "/scim/v2/Schemas", Value::Null).await;
     assert_eq!(schemas["Resources"][0]["id"], scim::USER_SCHEMA);
-    assert_eq!(
-        scim(
-            port,
-            &t,
-            "GET",
-            &format!("/scim/v2/Schemas/{}", scim::USER_SCHEMA),
-            Value::Null
-        )
-        .await
-        .0,
-        200
-    );
+    assert_eq!(scim(port, &t, "GET", &format!("/scim/v2/Schemas/{}", scim::USER_SCHEMA), Value::Null).await.0, 200);
 
     // Groups: an empty list for connection tests, and a clear refusal for the rest.
-    let (code, _, groups) = scim(
-        port,
-        &t,
-        "GET",
-        "/scim/v2/Groups?startIndex=1&count=100",
-        Value::Null,
-    )
-    .await;
-    assert_eq!(
-        (
-            code,
-            groups["totalResults"].clone(),
-            groups["Resources"].clone()
-        ),
-        (200, json!(0), json!([]))
-    );
-    let (code, head, body) = scim(
-        port,
-        &t,
-        "POST",
-        "/scim/v2/Groups",
-        json!({ "displayName": "Eng" }),
-    )
-    .await;
+    let (code, _, groups) = scim(port, &t, "GET", "/scim/v2/Groups?startIndex=1&count=100", Value::Null).await;
+    assert_eq!((code, groups["totalResults"].clone(), groups["Resources"].clone()), (200, json!(0), json!([])));
+    let (code, head, body) = scim(port, &t, "POST", "/scim/v2/Groups", json!({ "displayName": "Eng" })).await;
     assert_eq!(code, 501);
     is_scim_error(&head, &body, 501);
-    assert_eq!(
-        scim(port, &t, "GET", "/scim/v2/Groups/g1", Value::Null)
-            .await
-            .0,
-        404
-    );
+    assert_eq!(scim(port, &t, "GET", "/scim/v2/Groups/g1", Value::Null).await.0, 404);
     let (code, head, body) = scim(port, &t, "GET", "/scim/v2/Bulk", Value::Null).await;
     assert_eq!(code, 404);
     is_scim_error(&head, &body, 404);
@@ -615,181 +278,52 @@ async fn okta_provisions_finds_updates_and_deactivates() {
     let (port, app, admin) = serve(|_| {}).await;
     let (t, tid) = token(port, &admin, json!({ "tenant": "okta" })).await;
 
-    let (code, head, u) = scim(
-        port,
-        &t,
-        "POST",
-        USERS,
-        okta_user("ada@example.com", "00u1"),
-    )
-    .await;
+    let (code, head, u) = scim(port, &t, "POST", USERS, okta_user("ada@example.com", "00u1")).await;
     assert_eq!(code, 201, "{u}");
-    assert_eq!(
-        header(&head, "content-type").as_deref(),
-        Some("application/scim+json")
-    );
+    assert_eq!(header(&head, "content-type").as_deref(), Some("application/scim+json"));
     let id = u["id"].as_str().unwrap().to_string();
-    assert_eq!(
-        (
-            u["userName"].as_str(),
-            u["externalId"].as_str(),
-            u["active"].clone(),
-            u["displayName"].as_str()
-        ),
-        (
-            Some("ada@example.com"),
-            Some("00u1"),
-            json!(true),
-            Some("Ada Lovelace")
-        )
-    );
-    assert_eq!(
-        u["emails"],
-        json!([{ "value": "ada@example.com", "type": "work", "primary": true }])
-    );
-    assert_eq!(
-        u["meta"]["location"],
-        format!("http://127.0.0.1:{port}/scim/v2/Users/{id}")
-    );
-    assert_eq!(
-        header(&head, "location"),
-        Some(format!("http://127.0.0.1:{port}/scim/v2/Users/{id}"))
-    );
+    assert_eq!((u["userName"].as_str(), u["externalId"].as_str(), u["active"].clone(), u["displayName"].as_str()), (Some("ada@example.com"), Some("00u1"), json!(true), Some("Ada Lovelace")));
+    assert_eq!(u["emails"], json!([{ "value": "ada@example.com", "type": "work", "primary": true }]));
+    assert_eq!(u["meta"]["location"], format!("http://127.0.0.1:{port}/scim/v2/Users/{id}"));
+    assert_eq!(header(&head, "location"), Some(format!("http://127.0.0.1:{port}/scim/v2/Users/{id}")));
     assert!(u.get("password").is_none() && u.get("groups").is_none());
     let user = app.db.user(&id).unwrap();
-    assert_eq!(
-        (user.email.as_deref(), user.role, user.active()),
-        (Some("ada@example.com"), rbac::Role::Member, true)
-    );
+    assert_eq!((user.email.as_deref(), user.role, user.active()), (Some("ada@example.com"), rbac::Role::Member, true));
 
     // Okta checks before creating: by userName, any case.
-    let (_, _, found) = scim(
-        port,
-        &t,
-        "GET",
-        "/scim/v2/Users?filter=userName%20eq%20%22ADA%40example.com%22&startIndex=1&count=100",
-        Value::Null,
-    )
-    .await;
-    assert_eq!(
-        (
-            found["totalResults"].clone(),
-            found["Resources"][0]["id"].as_str()
-        ),
-        (json!(1), Some(id.as_str()))
-    );
-    let (_, _, found) = scim(
-        port,
-        &t,
-        "GET",
-        "/scim/v2/Users?filter=externalId+eq+%2200u1%22",
-        Value::Null,
-    )
-    .await;
+    let (_, _, found) = scim(port, &t, "GET", "/scim/v2/Users?filter=userName%20eq%20%22ADA%40example.com%22&startIndex=1&count=100", Value::Null).await;
+    assert_eq!((found["totalResults"].clone(), found["Resources"][0]["id"].as_str()), (json!(1), Some(id.as_str())));
+    let (_, _, found) = scim(port, &t, "GET", "/scim/v2/Users?filter=externalId+eq+%2200u1%22", Value::Null).await;
     assert_eq!(found["totalResults"], 1);
-    let (_, _, none) = scim(
-        port,
-        &t,
-        "GET",
-        "/scim/v2/Users?filter=externalId+eq+%2200U1%22",
-        Value::Null,
-    )
-    .await;
+    let (_, _, none) = scim(port, &t, "GET", "/scim/v2/Users?filter=externalId+eq+%2200U1%22", Value::Null).await;
     assert_eq!(none["totalResults"], 0, "externalId is case-exact");
-    let (code, head, body) = scim(
-        port,
-        &t,
-        "GET",
-        "/scim/v2/Users?filter=name.givenName+sw+%22A%22",
-        Value::Null,
-    )
-    .await;
-    assert_eq!(
-        (code, body["scimType"].as_str()),
-        (400, Some("invalidFilter"))
-    );
+    let (code, head, body) = scim(port, &t, "GET", "/scim/v2/Users?filter=name.givenName+sw+%22A%22", Value::Null).await;
+    assert_eq!((code, body["scimType"].as_str()), (400, Some("invalidFilter")));
     is_scim_error(&head, &body, 400);
-    assert_eq!(
-        scim(port, &t, "GET", "/scim/v2/Users?startIndex=x", Value::Null)
-            .await
-            .0,
-        400
-    );
+    assert_eq!(scim(port, &t, "GET", "/scim/v2/Users?startIndex=x", Value::Null).await.0, 400);
 
     // Creating twice: the same externalId, or the same userName, is a conflict.
-    for again in [
-        okta_user("ada@example.com", "00u1"),
-        okta_user("ADA@example.com", "00u9"),
-    ] {
+    for again in [okta_user("ada@example.com", "00u1"), okta_user("ADA@example.com", "00u9")] {
         let (code, head, body) = scim(port, &t, "POST", USERS, again).await;
-        assert_eq!(
-            (code, body["scimType"].as_str()),
-            (409, Some("uniqueness")),
-            "{body}"
-        );
+        assert_eq!((code, body["scimType"].as_str()), (409, Some("uniqueness")), "{body}");
         is_scim_error(&head, &body, 409);
     }
     // Pages, 1-based.
-    assert_eq!(
-        scim(
-            port,
-            &t,
-            "POST",
-            USERS,
-            okta_user("grace@example.com", "00u2")
-        )
-        .await
-        .0,
-        201
-    );
-    let (_, _, page) = scim(
-        port,
-        &t,
-        "GET",
-        "/scim/v2/Users?startIndex=2&count=1",
-        Value::Null,
-    )
-    .await;
-    assert_eq!(
-        (
-            page["totalResults"].clone(),
-            page["startIndex"].clone(),
-            page["itemsPerPage"].clone(),
-            page["Resources"][0]["userName"].as_str()
-        ),
-        (json!(2), json!(2), json!(1), Some("grace@example.com"))
-    );
+    assert_eq!(scim(port, &t, "POST", USERS, okta_user("grace@example.com", "00u2")).await.0, 201);
+    let (_, _, page) = scim(port, &t, "GET", "/scim/v2/Users?startIndex=2&count=1", Value::Null).await;
+    assert_eq!((page["totalResults"].clone(), page["startIndex"].clone(), page["itemsPerPage"].clone(), page["Resources"][0]["userName"].as_str()), (json!(2), json!(2), json!(1), Some("grace@example.com")));
     let (_, _, counted) = scim(port, &t, "GET", "/scim/v2/Users?count=0", Value::Null).await;
-    assert_eq!(
-        (
-            counted["totalResults"].clone(),
-            counted["Resources"].clone()
-        ),
-        (json!(2), json!([]))
-    );
+    assert_eq!((counted["totalResults"].clone(), counted["Resources"].clone()), (json!(2), json!([])));
 
     // PUT (Okta's AIW apps) replaces the profile.
     let mut put = okta_user("ada@example.com", "00u1");
     put["name"] = json!({ "givenName": "Ada", "familyName": "King" });
     put["displayName"] = json!("Ada King");
     let (code, _, u) = scim(port, &t, "PUT", &format!("{USERS}/{id}"), put).await;
-    assert_eq!(
-        (
-            code,
-            u["name"]["familyName"].as_str(),
-            u["displayName"].as_str()
-        ),
-        (200, Some("King"), Some("Ada King"))
-    );
+    assert_eq!((code, u["name"]["familyName"].as_str(), u["displayName"].as_str()), (200, Some("King"), Some("Ada King")));
     let upd = &events(port, &admin, "action=user.updated").await[0];
-    assert_eq!(
-        upd["details"]["changes"]["name"],
-        json!({ "from": "Ada Lovelace", "to": "Ada King" })
-    );
-    assert_eq!(
-        upd["details"]["changes"]["familyName"],
-        json!({ "from": "Lovelace", "to": "King" })
-    );
+    assert_eq!(upd["details"]["changes"]["name"], json!({ "from": "Ada Lovelace", "to": "Ada King" }));
+    assert_eq!(upd["details"]["changes"]["familyName"], json!({ "from": "Lovelace", "to": "King" }));
 
     // Deactivation (Okta's OIN apps): PATCH without a path. Their sessions end.
     let session = session_for(port, &admin, &id).await;
@@ -797,86 +331,26 @@ async fn okta_provisions_finds_updates_and_deactivates() {
     let off = json!({ "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"], "Operations": [{ "op": "replace", "value": { "active": false } }] });
     let (code, _, u) = scim(port, &t, "PATCH", &format!("{USERS}/{id}"), off).await;
     assert_eq!((code, u["active"].clone()), (200, json!(false)));
-    assert_eq!(
-        me(port, &session).await,
-        401,
-        "deprovisioning ends every session"
-    );
+    assert_eq!(me(port, &session).await, 401, "deprovisioning ends every session");
     assert!(!app.db.user(&id).unwrap().active());
     let disabled = &events(port, &admin, "action=user.disabled").await[0];
     assert_eq!(
-        (
-            disabled["actorKind"].as_str(),
-            disabled["actorId"].as_str(),
-            disabled["actorName"].as_str(),
-            disabled["authMethod"].as_str()
-        ),
-        (
-            Some("system"),
-            Some(format!("scim:{tid}").as_str()),
-            Some("SCIM okta"),
-            Some("scim_token")
-        )
+        (disabled["actorKind"].as_str(), disabled["actorId"].as_str(), disabled["actorName"].as_str(), disabled["authMethod"].as_str()),
+        (Some("system"), Some(format!("scim:{tid}").as_str()), Some("SCIM okta"), Some("scim_token"))
     );
-    assert_eq!(
-        (
-            disabled["targetId"].as_str(),
-            disabled["details"]["sessionsRevoked"].clone()
-        ),
-        (Some(id.as_str()), json!(1))
-    );
+    assert_eq!((disabled["targetId"].as_str(), disabled["details"]["sessionsRevoked"].clone()), (Some(id.as_str()), json!(1)));
     let mine = events(port, &admin, &format!("actor=system:scim:{tid}")).await;
-    assert!(
-        mine.iter().any(|e| e["action"] == "user.created")
-            && mine.iter().any(|e| e["action"] == "user.disabled"),
-        "{mine:?}"
-    );
-    assert_eq!(
-        call(
-            port,
-            "POST",
-            &format!("/api/users/{id}/login-codes"),
-            &admin,
-            ""
-        )
-        .await
-        .0,
-        409,
-        "a disabled user can't sign in"
-    );
+    assert!(mine.iter().any(|e| e["action"] == "user.created") && mine.iter().any(|e| e["action"] == "user.disabled"), "{mine:?}");
+    assert_eq!(call(port, "POST", &format!("/api/users/{id}/login-codes"), &admin, "").await.0, 409, "a disabled user can't sign in");
 
     // Deactivated users are still found, so Okta can reactivate them.
-    let (_, _, found) = scim(
-        port,
-        &t,
-        "GET",
-        "/scim/v2/Users?filter=userName+eq+%22ada%40example.com%22",
-        Value::Null,
-    )
-    .await;
-    assert_eq!(
-        (
-            found["totalResults"].clone(),
-            found["Resources"][0]["active"].clone()
-        ),
-        (json!(1), json!(false))
-    );
+    let (_, _, found) = scim(port, &t, "GET", "/scim/v2/Users?filter=userName+eq+%22ada%40example.com%22", Value::Null).await;
+    assert_eq!((found["totalResults"].clone(), found["Resources"][0]["active"].clone()), (json!(1), json!(false)));
     let on = json!({ "Operations": [{ "op": "replace", "value": { "active": true } }] });
-    assert_eq!(
-        scim(port, &t, "PATCH", &format!("{USERS}/{id}"), on)
-            .await
-            .2["active"],
-        true
-    );
-    assert_eq!(
-        events(port, &admin, "action=user.enabled").await[0]["targetId"].as_str(),
-        Some(id.as_str())
-    );
+    assert_eq!(scim(port, &t, "PATCH", &format!("{USERS}/{id}"), on).await.2["active"], true);
+    assert_eq!(events(port, &admin, "action=user.enabled").await[0]["targetId"].as_str(), Some(id.as_str()));
     let (_, all) = call(port, "GET", "/api/audit", &admin, "").await;
-    assert!(
-        !all.contains("OktaPlaceholder1!"),
-        "the placeholder password is never kept or logged"
-    );
+    assert!(!all.contains("OktaPlaceholder1!"), "the placeholder password is never kept or logged");
 }
 
 #[tokio::test]
@@ -895,15 +369,8 @@ async fn entra_patches_deletes_softly_and_provisions_again() {
     let (code, _, u) = scim(port, &t, "POST", USERS, grace.clone()).await;
     assert_eq!(code, 201, "{u}");
     let id = u["id"].as_str().unwrap().to_string();
-    assert_eq!(
-        app.db.user(&id).unwrap().role,
-        rbac::Role::Member,
-        "SCIM never sets roles"
-    );
-    assert_eq!(
-        app.db.user(&id).unwrap().email.as_deref(),
-        Some("grace.hopper@contoso.example")
-    );
+    assert_eq!(app.db.user(&id).unwrap().role, rbac::Role::Member, "SCIM never sets roles");
+    assert_eq!(app.db.user(&id).unwrap().email.as_deref(), Some("grace.hopper@contoso.example"));
 
     let patch = json!({ "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"], "Operations": [
         { "op": "Replace", "path": "emails[type eq \"work\"].value", "value": "grace@navy.example" },
@@ -912,189 +379,58 @@ async fn entra_patches_deletes_softly_and_provisions_again() {
         { "op": "Replace", "path": "active", "value": "False" },
     ]});
     let (code, _, u) = scim(port, &t, "PATCH", &format!("{USERS}/{id}"), patch).await;
-    assert_eq!(
-        (
-            code,
-            u["emails"][0]["value"].as_str(),
-            u["displayName"].as_str(),
-            u["active"].clone()
-        ),
-        (
-            200,
-            Some("grace@navy.example"),
-            Some("Amazing Grace"),
-            json!(false)
-        )
-    );
+    assert_eq!((code, u["emails"][0]["value"].as_str(), u["displayName"].as_str(), u["active"].clone()), (200, Some("grace@navy.example"), Some("Amazing Grace"), json!(false)));
     for bad in [
         json!({ "Operations": [{ "op": "Replace", "path": "externalId", "value": "other" }] }),
         json!({ "Operations": [{ "op": "Remove", "path": "userName" }] }),
         json!({ "Operations": [{ "op": "Copy", "path": "active", "value": true }] }),
     ] {
-        let (code, head, body) =
-            scim(port, &t, "PATCH", &format!("{USERS}/{id}"), bad.clone()).await;
+        let (code, head, body) = scim(port, &t, "PATCH", &format!("{USERS}/{id}"), bad.clone()).await;
         assert_eq!(code, 400, "{bad}");
         is_scim_error(&head, &body, 400);
     }
-    assert_eq!(
-        scim(
-            port,
-            &t,
-            "PATCH",
-            &format!("{USERS}/{id}"),
-            json!({ "Operations": [{ "op": "Replace", "path": "externalId", "value": "other" }] })
-        )
-        .await
-        .2["scimType"],
-        "mutability"
-    );
-    let (code, _, body) =
-        call_with(port, "POST", USERS, &format!("Bearer {t}"), "", "{not json").await;
-    assert_eq!(
-        (code, parse(&body)["scimType"].as_str()),
-        (400, Some("invalidSyntax"))
-    );
-    let (code, head, body) = call_with(
-        port,
-        "POST",
-        USERS,
-        &format!("Bearer {t}"),
-        "",
-        &format!("{{\"userName\":\"{}\"}}", "x".repeat(scim::MAX_BODY)),
-    )
-    .await;
+    assert_eq!(scim(port, &t, "PATCH", &format!("{USERS}/{id}"), json!({ "Operations": [{ "op": "Replace", "path": "externalId", "value": "other" }] })).await.2["scimType"], "mutability");
+    let (code, _, body) = call_with(port, "POST", USERS, &format!("Bearer {t}"), "", "{not json").await;
+    assert_eq!((code, parse(&body)["scimType"].as_str()), (400, Some("invalidSyntax")));
+    let (code, head, body) = call_with(port, "POST", USERS, &format!("Bearer {t}"), "", &format!("{{\"userName\":\"{}\"}}", "x".repeat(scim::MAX_BODY))).await;
     assert_eq!(code, 413);
     is_scim_error(&head, &parse(&body), 413);
 
     // Removing the email removes it, even when the userName is an address.
-    let (code, _, u) = scim(
-        port,
-        &t,
-        "PATCH",
-        &format!("{USERS}/{id}"),
-        json!({ "Operations": [{ "op": "Remove", "path": "emails" }] }),
-    )
-    .await;
+    let (code, _, u) = scim(port, &t, "PATCH", &format!("{USERS}/{id}"), json!({ "Operations": [{ "op": "Remove", "path": "emails" }] })).await;
     assert_eq!((code, u.get("emails")), (200, None), "{u}");
     assert_eq!(app.db.user(&id).unwrap().email, None);
     // name.formatted is kept as sent; the shown name stays the displayName.
     let (_, _, u) = scim(port, &t, "PATCH", &format!("{USERS}/{id}"), json!({ "Operations": [{ "op": "Replace", "path": "name.formatted", "value": "G. Hopper" }] })).await;
-    assert_eq!(
-        (u["name"]["formatted"].as_str(), u["displayName"].as_str()),
-        (Some("G. Hopper"), Some("Amazing Grace"))
-    );
+    assert_eq!((u["name"]["formatted"].as_str(), u["displayName"].as_str()), (Some("G. Hopper"), Some("Amazing Grace")));
     let audited = events(port, &admin, "action=user.updated").await;
-    let last = audited
-        .iter()
-        .find(|e| e["targetId"] == id.as_str())
-        .unwrap();
-    assert_eq!(
-        last["details"]["changes"]["formatted"]["to"], "G. Hopper",
-        "{last}"
-    );
+    let last = audited.iter().find(|e| e["targetId"] == id.as_str()).unwrap();
+    assert_eq!(last["details"]["changes"]["formatted"]["to"], "G. Hopper", "{last}");
 
     // Turn it back on, sign in, then DELETE: disabled, sessions gone, history kept.
-    assert_eq!(
-        scim(
-            port,
-            &t,
-            "PATCH",
-            &format!("{USERS}/{id}"),
-            json!({ "Operations": [{ "op": "Replace", "path": "active", "value": true }] })
-        )
-        .await
-        .0,
-        200
-    );
+    assert_eq!(scim(port, &t, "PATCH", &format!("{USERS}/{id}"), json!({ "Operations": [{ "op": "Replace", "path": "active", "value": true }] })).await.0, 200);
     let session = session_for(port, &admin, &id).await;
-    let (code, head, body) = call_with(
-        port,
-        "DELETE",
-        &format!("{USERS}/{id}"),
-        &format!("Bearer {t}"),
-        "",
-        "",
-    )
-    .await;
+    let (code, head, body) = call_with(port, "DELETE", &format!("{USERS}/{id}"), &format!("Bearer {t}"), "", "").await;
     assert_eq!((code, body.as_str()), (204, ""), "{head}");
     assert_eq!(me(port, &session).await, 401);
-    assert_eq!(
-        scim(port, &t, "GET", &format!("{USERS}/{id}"), Value::Null)
-            .await
-            .0,
-        404
-    );
-    assert_eq!(
-        scim(
-            port,
-            &t,
-            "PATCH",
-            &format!("{USERS}/{id}"),
-            json!({ "Operations": [{ "op": "replace", "path": "active", "value": true }] })
-        )
-        .await
-        .0,
-        404
-    );
-    assert_eq!(
-        scim(port, &t, "DELETE", &format!("{USERS}/{id}"), Value::Null)
-            .await
-            .0,
-        404
-    );
-    assert_eq!(
-        scim(
-            port,
-            &t,
-            "GET",
-            "/scim/v2/Users?filter=externalId+eq+%22grace%22",
-            Value::Null
-        )
-        .await
-        .2["totalResults"],
-        0
-    );
+    assert_eq!(scim(port, &t, "GET", &format!("{USERS}/{id}"), Value::Null).await.0, 404);
+    assert_eq!(scim(port, &t, "PATCH", &format!("{USERS}/{id}"), json!({ "Operations": [{ "op": "replace", "path": "active", "value": true }] })).await.0, 404);
+    assert_eq!(scim(port, &t, "DELETE", &format!("{USERS}/{id}"), Value::Null).await.0, 404);
+    assert_eq!(scim(port, &t, "GET", "/scim/v2/Users?filter=externalId+eq+%22grace%22", Value::Null).await.2["totalResults"], 0);
     let kept = app.db.user(&id).expect("never destroyed");
     assert!(!kept.active());
     // An update that read the user before the DELETE can't bring them back.
-    let stale = db::ScimFields {
-        user_name: "grace@contoso.example",
-        external_id: Some("grace"),
-        given_name: None,
-        family_name: None,
-        scim_display_name: None,
-        formatted: None,
-        display_name: "Grace",
-        email: None,
-        active: Some(true),
-    };
-    assert_eq!(
-        app.db.save_scim_user("entra", &id, &stale, false),
-        Err(db::ScimConflict::Gone)
-    );
+    let stale = db::ScimFields { user_name: "grace@contoso.example", external_id: Some("grace"), given_name: None, family_name: None, scim_display_name: None, formatted: None, display_name: "Grace", email: None, active: Some(true) };
+    assert_eq!(app.db.save_scim_user("entra", &id, &stale, false), Err(db::ScimConflict::Gone));
     assert!(!app.db.user(&id).unwrap().active());
     let deleted = &events(port, &admin, "action=scim.user_deleted").await[0];
-    assert_eq!(
-        (
-            deleted["targetId"].as_str(),
-            deleted["details"]["sessionsRevoked"].clone(),
-            deleted["details"]["externalId"].as_str()
-        ),
-        (Some(id.as_str()), json!(1), Some("grace"))
-    );
+    assert_eq!((deleted["targetId"].as_str(), deleted["details"]["sessionsRevoked"].clone(), deleted["details"]["externalId"].as_str()), (Some(id.as_str()), json!(1), Some("grace")));
 
     // The same person provisioned again: the same user, active again.
     let (code, _, again) = scim(port, &t, "POST", USERS, grace).await;
-    assert_eq!(
-        (code, again["id"].as_str(), again["active"].clone()),
-        (201, Some(id.as_str()), json!(true)),
-        "{again}"
-    );
+    assert_eq!((code, again["id"].as_str(), again["active"].clone()), (201, Some(id.as_str()), json!(true)), "{again}");
     assert!(app.db.user(&id).unwrap().active());
-    assert_eq!(
-        events(port, &admin, "action=scim.user_restored").await[0]["targetId"].as_str(),
-        Some(id.as_str())
-    );
+    assert_eq!(events(port, &admin, "action=scim.user_restored").await[0]["targetId"].as_str(), Some(id.as_str()));
 }
 
 #[tokio::test]
@@ -1104,33 +440,12 @@ async fn tenants_are_isolated_and_never_take_over_users() {
     let (b, _) = token(port, &admin, json!({ "tenant": "b" })).await;
     let (_, _, u) = scim(port, &a, "POST", USERS, okta_user("ada@example.com", "x1")).await;
     let id = u["id"].as_str().unwrap().to_string();
-    assert_eq!(
-        app.db.user(&id).unwrap().role,
-        rbac::Role::Readonly,
-        "SCIM_DEFAULT_ROLE"
-    );
+    assert_eq!(app.db.user(&id).unwrap().role, rbac::Role::Readonly, "SCIM_DEFAULT_ROLE");
 
-    for (method, body) in [
-        ("GET", Value::Null),
-        ("PUT", okta_user("ada@example.com", "x1")),
-        (
-            "PATCH",
-            json!({ "Operations": [{ "op": "replace", "path": "active", "value": false }] }),
-        ),
-        ("DELETE", Value::Null),
-    ] {
-        assert_eq!(
-            scim(port, &b, method, &format!("{USERS}/{id}"), body)
-                .await
-                .0,
-            404,
-            "{method}"
-        );
+    for (method, body) in [("GET", Value::Null), ("PUT", okta_user("ada@example.com", "x1")), ("PATCH", json!({ "Operations": [{ "op": "replace", "path": "active", "value": false }] })), ("DELETE", Value::Null)] {
+        assert_eq!(scim(port, &b, method, &format!("{USERS}/{id}"), body).await.0, 404, "{method}");
     }
-    assert_eq!(
-        scim(port, &b, "GET", USERS, Value::Null).await.2["totalResults"],
-        0
-    );
+    assert_eq!(scim(port, &b, "GET", USERS, Value::Null).await.2["totalResults"], 0);
     assert!(app.db.user(&id).unwrap().active());
 
     // Email is never the key: another tenant, or an existing user, keeps its address.
@@ -1139,81 +454,21 @@ async fn tenants_are_isolated_and_never_take_over_users() {
     let (boss, _) = user_with(port, &admin, "boss@example.com", "admin").await;
     let (code, _, body) = scim(port, &a, "POST", USERS, okta_user("boss@example.com", "x2")).await;
     assert_eq!(code, 409);
-    assert!(
-        body["detail"]
-            .as_str()
-            .unwrap()
-            .contains("botctl user link"),
-        "{body}"
-    );
+    assert!(body["detail"].as_str().unwrap().contains("botctl user link"), "{body}");
     assert_eq!(app.db.user(&boss).unwrap().role, rbac::Role::Admin);
 
     // A restore that fails (the email is someone else's now) leaves no restore event.
     let (_, _, u) = scim(port, &a, "POST", USERS, okta_user("dee@example.com", "x3")).await;
     let dee = u["id"].as_str().unwrap().to_string();
-    assert_eq!(
-        scim(port, &a, "DELETE", &format!("{USERS}/{dee}"), Value::Null)
-            .await
-            .0,
-        204
-    );
-    assert_eq!(
-        call(
-            port,
-            "PATCH",
-            &format!("/api/users/{dee}"),
-            &admin,
-            r#"{"email":"dee.old@example.com"}"#
-        )
-        .await
-        .0,
-        200
-    );
-    assert_eq!(
-        call(
-            port,
-            "POST",
-            "/api/users",
-            &admin,
-            r#"{"email":"dee@example.com"}"#
-        )
-        .await
-        .0,
-        201
-    );
-    assert_eq!(
-        scim(port, &a, "POST", USERS, okta_user("dee@example.com", "x3"))
-            .await
-            .0,
-        409
-    );
-    assert!(
-        events(port, &admin, "action=scim.user_restored")
-            .await
-            .is_empty()
-    );
+    assert_eq!(scim(port, &a, "DELETE", &format!("{USERS}/{dee}"), Value::Null).await.0, 204);
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{dee}"), &admin, r#"{"email":"dee.old@example.com"}"#).await.0, 200);
+    assert_eq!(call(port, "POST", "/api/users", &admin, r#"{"email":"dee@example.com"}"#).await.0, 201);
+    assert_eq!(scim(port, &a, "POST", USERS, okta_user("dee@example.com", "x3")).await.0, 409);
+    assert!(events(port, &admin, "action=scim.user_restored").await.is_empty());
 
     // Admins still own roles: a promotion survives SCIM updates.
-    assert_eq!(
-        call(
-            port,
-            "PATCH",
-            &format!("/api/users/{id}"),
-            &admin,
-            r#"{"role":"admin"}"#
-        )
-        .await
-        .0,
-        200
-    );
-    let (code, _, _) = scim(
-        port,
-        &a,
-        "PUT",
-        &format!("{USERS}/{id}"),
-        okta_user("ada@example.com", "x1"),
-    )
-    .await;
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{id}"), &admin, r#"{"role":"admin"}"#).await.0, 200);
+    let (code, _, _) = scim(port, &a, "PUT", &format!("{USERS}/{id}"), okta_user("ada@example.com", "x1")).await;
     assert_eq!(code, 200);
     assert_eq!(app.db.user(&id).unwrap().role, rbac::Role::Admin);
 }
@@ -1223,210 +478,71 @@ async fn an_sso_linked_tenant_provisions_people_who_then_sign_in() {
     let idp = mock_idp().await;
     let (port, app, admin, sso) = serve_with(&idp, &[], |a| a.scim.enabled = true).await;
     let (t, _) = token(port, &admin, json!({ "tenant": "entra", "sso": sso })).await;
-    let (code, body) = call(
-        port,
-        "POST",
-        "/api/scim/tokens",
-        &admin,
-        r#"{"tenant":"entra"}"#,
-    )
-    .await;
-    assert_eq!(
-        code, 409,
-        "a tenant's tokens all link the same provider: {body}"
-    );
+    let (code, body) = call(port, "POST", "/api/scim/tokens", &admin, r#"{"tenant":"entra"}"#).await;
+    assert_eq!(code, 409, "a tenant's tokens all link the same provider: {body}");
 
     let mut ada = okta_user("ada@corp.example", "");
     ada.as_object_mut().unwrap().remove("externalId");
     let (code, _, body) = scim(port, &t, "POST", USERS, ada.clone()).await;
     assert_eq!(code, 400, "the externalId is the person's subject: {body}");
-    assert!(
-        body["detail"].as_str().unwrap().contains("objectId"),
-        "{body}"
-    );
+    assert!(body["detail"].as_str().unwrap().contains("objectId"), "{body}");
     ada["externalId"] = json!("not-a-guid");
     assert_eq!(scim(port, &t, "POST", USERS, ada.clone()).await.0, 400);
 
     // Before provisioning, nobody is linked; after, the person signs in as the new user.
-    assert_eq!(
-        header(&web_sign_in(port, &sso).await.1, "location").as_deref(),
-        Some("/login?error=sso_not_linked")
-    );
+    assert_eq!(header(&web_sign_in(port, &sso).await.1, "location").as_deref(), Some("/login?error=sso_not_linked"));
     ada["externalId"] = json!(OID.to_uppercase());
     let (code, _, u) = scim(port, &t, "POST", USERS, ada).await;
     assert_eq!(code, 201, "{u}");
     let id = u["id"].as_str().unwrap().to_string();
-    let (_, ids) = call(
-        port,
-        "GET",
-        &format!("/api/users/{id}/identities"),
-        &admin,
-        "",
-    )
-    .await;
+    let (_, ids) = call(port, "GET", &format!("/api/users/{id}/identities"), &admin, "").await;
     assert_eq!(parse(&ids)[0]["subject"], OID, "{ids}");
     let linked = &events(port, &admin, "action=user.identity_linked").await[0];
-    assert_eq!(
-        (
-            linked["authMethod"].as_str(),
-            linked["idpProvider"].as_str(),
-            linked["idp"].as_str()
-        ),
-        (Some("scim_token"), Some(sso.as_str()), Some("entra"))
-    );
+    assert_eq!((linked["authMethod"].as_str(), linked["idpProvider"].as_str(), linked["idp"].as_str()), (Some("scim_token"), Some(sso.as_str()), Some("entra")));
 
     let (path, binder) = to_callback(port, &format!("/api/auth/sso/{sso}/start")).await;
     let (code, head, _) = call_with(port, "GET", &path, "", &binder, "").await;
     assert_eq!(code, 200, "{head}");
-    let cookie = set_cookies(&head)
-        .into_iter()
-        .find(|c| c.starts_with("__Host-superbot_session=sbs_"))
-        .unwrap();
+    let cookie = set_cookies(&head).into_iter().find(|c| c.starts_with("__Host-superbot_session=sbs_")).unwrap();
     let cookie = format!("Cookie: {}\r\n", cookie.split(';').next().unwrap());
     let (_, _, who) = call_with(port, "GET", "/api/auth/me", "", &cookie, "").await;
     assert_eq!(parse(&who)["user"]["id"].as_str(), Some(id.as_str()));
 
     // Deprovisioned: the session ends and SSO sign-in is refused.
     let off = json!({ "Operations": [{ "op": "Replace", "path": "active", "value": "False" }] });
-    assert_eq!(
-        scim(port, &t, "PATCH", &format!("{USERS}/{id}"), off)
-            .await
-            .0,
-        200
-    );
-    assert_eq!(
-        call_with(port, "GET", "/api/auth/me", "", &cookie, "")
-            .await
-            .0,
-        401
-    );
+    assert_eq!(scim(port, &t, "PATCH", &format!("{USERS}/{id}"), off).await.0, 200);
+    assert_eq!(call_with(port, "GET", "/api/auth/me", "", &cookie, "").await.0, 401);
     let (code, head) = web_sign_in(port, &sso).await;
-    assert!(
-        code == 303 && header(&head, "location").is_some_and(|l| l.contains("error=")),
-        "{head}"
-    );
+    assert!(code == 303 && header(&head, "location").is_some_and(|l| l.contains("error=")), "{head}");
 
     // Someone an admin already linked becomes the tenant's: the same user, not a new one.
     let other = "aaaaaaaa-0000-0000-0000-0000000000b2";
-    let (_, made) = call(
-        port,
-        "POST",
-        "/api/users",
-        &admin,
-        r#"{"email":"bob@corp.example","name":"Bob"}"#,
-    )
-    .await;
+    let (_, made) = call(port, "POST", "/api/users", &admin, r#"{"email":"bob@corp.example","name":"Bob"}"#).await;
     let bob = parse(&made)["id"].as_str().unwrap().to_string();
-    assert_eq!(
-        call(
-            port,
-            "POST",
-            &format!("/api/users/{bob}/identities"),
-            &admin,
-            &json!({ "provider": sso, "subject": other }).to_string()
-        )
-        .await
-        .0,
-        201
-    );
-    let (code, _, u) = scim(
-        port,
-        &t,
-        "POST",
-        USERS,
-        okta_user("bob@corp.example", other),
-    )
-    .await;
+    assert_eq!(call(port, "POST", &format!("/api/users/{bob}/identities"), &admin, &json!({ "provider": sso, "subject": other }).to_string()).await.0, 201);
+    let (code, _, u) = scim(port, &t, "POST", USERS, okta_user("bob@corp.example", other)).await;
     assert_eq!((code, u["id"].as_str()), (201, Some(bob.as_str())), "{u}");
-    assert_eq!(
-        events(port, &admin, "action=scim.user_linked").await[0]["targetId"].as_str(),
-        Some(bob.as_str())
-    );
-    let (code, _, _) = scim(
-        port,
-        &t,
-        "POST",
-        USERS,
-        okta_user("bob2@corp.example", other),
-    )
-    .await;
+    assert_eq!(events(port, &admin, "action=scim.user_linked").await[0]["targetId"].as_str(), Some(bob.as_str()));
+    let (code, _, _) = scim(port, &t, "POST", USERS, okta_user("bob2@corp.example", other)).await;
     assert_eq!(code, 409, "provisioned once");
 
     // Two tenants on the same IdP: a user one of them deleted stays its own.
     let (t2, _) = token(port, &admin, json!({ "tenant": "entra-2", "sso": sso })).await;
     let carol = "aaaaaaaa-0000-0000-0000-0000000000c4";
-    let (_, _, u) = scim(
-        port,
-        &t,
-        "POST",
-        USERS,
-        okta_user("carol@corp.example", carol),
-    )
-    .await;
+    let (_, _, u) = scim(port, &t, "POST", USERS, okta_user("carol@corp.example", carol)).await;
     let carol_id = u["id"].as_str().unwrap().to_string();
-    assert_eq!(
-        scim(
-            port,
-            &t,
-            "DELETE",
-            &format!("{USERS}/{carol_id}"),
-            Value::Null
-        )
-        .await
-        .0,
-        204
-    );
-    let (code, _, body) = scim(
-        port,
-        &t2,
-        "POST",
-        USERS,
-        okta_user("carol@corp.example", carol),
-    )
-    .await;
-    assert_eq!(
-        (code, body["scimType"].as_str()),
-        (409, Some("uniqueness")),
-        "{body}"
-    );
+    assert_eq!(scim(port, &t, "DELETE", &format!("{USERS}/{carol_id}"), Value::Null).await.0, 204);
+    let (code, _, body) = scim(port, &t2, "POST", USERS, okta_user("carol@corp.example", carol)).await;
+    assert_eq!((code, body["scimType"].as_str()), (409, Some("uniqueness")), "{body}");
     assert!(!app.db.user(&carol_id).unwrap().active());
     assert_eq!(app.db.scim_user_of(&carol_id).unwrap().tenant, "entra");
-    let (code, _, u) = scim(
-        port,
-        &t,
-        "POST",
-        USERS,
-        okta_user("carol@corp.example", carol),
-    )
-    .await;
-    assert_eq!(
-        (code, u["id"].as_str()),
-        (201, Some(carol_id.as_str())),
-        "only its own tenant restores"
-    );
+    let (code, _, u) = scim(port, &t, "POST", USERS, okta_user("carol@corp.example", carol)).await;
+    assert_eq!((code, u["id"].as_str()), (201, Some(carol_id.as_str())), "only its own tenant restores");
 
     // Never the owner: the break-glass account stays out of SCIM's reach.
     let boss = "aaaaaaaa-0000-0000-0000-0000000000b3";
-    assert_eq!(
-        call(
-            port,
-            "POST",
-            "/api/users/operator/identities",
-            &admin,
-            &json!({ "provider": sso, "subject": boss }).to_string()
-        )
-        .await
-        .0,
-        201
-    );
-    let (code, _, body) = scim(
-        port,
-        &t,
-        "POST",
-        USERS,
-        okta_user("owner@corp.example", boss),
-    )
-    .await;
+    assert_eq!(call(port, "POST", "/api/users/operator/identities", &admin, &json!({ "provider": sso, "subject": boss }).to_string()).await.0, 201);
+    let (code, _, body) = scim(port, &t, "POST", USERS, okta_user("owner@corp.example", boss)).await;
     assert_eq!(code, 409, "{body}");
     assert!(app.db.scim_user_of(users::OPERATOR).is_none());
 }
@@ -1441,15 +557,7 @@ async fn mixed_case_attributes_still_disable() {
     let (code, _, u) = scim(port, &t, "POST", USERS, ada.clone()).await;
     assert_eq!((code, u["active"].clone()), (201, json!(false)), "{u}");
     assert!(!app.db.user(u["id"].as_str().unwrap()).unwrap().active());
-    let (code, head, body) = call_with(
-        port,
-        "POST",
-        USERS,
-        &format!("Bearer {t}"),
-        "",
-        r#"{"userName":"bo@example.com","active":false,"Active":true}"#,
-    )
-    .await;
+    let (code, head, body) = call_with(port, "POST", USERS, &format!("Bearer {t}"), "", r#"{"userName":"bo@example.com","active":false,"Active":true}"#).await;
     assert_eq!(code, 400, "{body}");
     is_scim_error(&head, &parse(&body), 400);
 }
@@ -1463,54 +571,19 @@ async fn admin_renames_last_until_the_idp_sends_a_name() {
     let (_, _, u) = scim(port, &t, "POST", USERS, ada).await;
     let id = u["id"].as_str().unwrap().to_string();
     let path = format!("{USERS}/{id}");
-    let set =
-        |p: &str, v: Value| json!({ "Operations": [{ "op": "replace", "path": p, "value": v }] });
-    let (_, _, u) = scim(
-        port,
-        &t,
-        "PATCH",
-        &path,
-        set("name.familyName", json!("King")),
-    )
-    .await;
-    assert_eq!(
-        u["displayName"], "Ada King",
-        "a name built from its parts follows them"
-    );
+    let set = |p: &str, v: Value| json!({ "Operations": [{ "op": "replace", "path": p, "value": v }] });
+    let (_, _, u) = scim(port, &t, "PATCH", &path, set("name.familyName", json!("King"))).await;
+    assert_eq!(u["displayName"], "Ada King", "a name built from its parts follows them");
 
-    assert_eq!(
-        call(
-            port,
-            "PATCH",
-            &format!("/api/users/{id}"),
-            &admin,
-            r#"{"name":"Ada (Eng)"}"#
-        )
-        .await
-        .0,
-        200
-    );
+    assert_eq!(call(port, "PATCH", &format!("/api/users/{id}"), &admin, r#"{"name":"Ada (Eng)"}"#).await.0, 200);
     let (_, _, u) = scim(port, &t, "PATCH", &path, set("active", json!(false))).await;
-    assert_eq!(
-        u["displayName"], "Ada (Eng)",
-        "an unrelated update keeps an admin's rename"
-    );
+    assert_eq!(u["displayName"], "Ada (Eng)", "an unrelated update keeps an admin's rename");
     let mut same = okta_user("ada@example.com", "00u1");
     same.as_object_mut().unwrap().remove("displayName");
     same["name"]["familyName"] = json!("King");
     let (_, _, u) = scim(port, &t, "PUT", &path, same).await;
-    assert_eq!(
-        u["displayName"], "Ada (Eng)",
-        "a PUT with the same names too"
-    );
-    let (_, _, u) = scim(
-        port,
-        &t,
-        "PATCH",
-        &path,
-        set("displayName", json!("A. King")),
-    )
-    .await;
+    assert_eq!(u["displayName"], "Ada (Eng)", "a PUT with the same names too");
+    let (_, _, u) = scim(port, &t, "PATCH", &path, set("displayName", json!("A. King"))).await;
     assert_eq!(u["displayName"], "A. King");
     assert_eq!(app.db.user(&id).unwrap().name, "A. King");
 }
@@ -1518,86 +591,38 @@ async fn admin_renames_last_until_the_idp_sends_a_name() {
 #[tokio::test]
 async fn deprovisioning_spends_app_codes_not_yet_redeemed() {
     let idp = mock_idp().await;
-    let (port, _, admin, sso) =
-        serve_with(&idp, &[("SSO_APP_REDIRECTS", "superbot://auth")], |a| {
-            a.scim.enabled = true
-        })
-        .await;
+    let (port, _, admin, sso) = serve_with(&idp, &[("SSO_APP_REDIRECTS", "superbot://auth")], |a| a.scim.enabled = true).await;
     let (t, _) = token(port, &admin, json!({ "tenant": "entra", "sso": sso })).await;
     let (code, _, u) = scim(port, &t, "POST", USERS, okta_user("ada@corp.example", OID)).await;
     assert_eq!(code, 201, "{u}");
     let id = u["id"].as_str().unwrap().to_string();
     let verifier = "v".repeat(64);
-    let start = format!(
-        "/api/auth/sso/{sso}/start?session=token&redirect=superbot%3A%2F%2Fauth&challenge={}&state=st-1",
-        s256(&verifier)
-    );
+    let start = format!("/api/auth/sso/{sso}/start?session=token&redirect=superbot%3A%2F%2Fauth&challenge={}&state=st-1", s256(&verifier));
     let code_for = || async {
         let (path, _) = to_callback(port, &start).await;
         let (_, head, _) = call_with(port, "GET", &path, "", "", "").await;
         let to = url::Url::parse(&header(&head, "location").unwrap()).unwrap();
-        to.query_pairs()
-            .find(|(k, _)| k == "code")
-            .unwrap()
-            .1
-            .to_string()
+        to.query_pairs().find(|(k, _)| k == "code").unwrap().1.to_string()
     };
     let redeem = |code: String| {
         let body = json!({ "sso": code, "verifier": verifier }).to_string();
         async move { call(port, "POST", "/api/auth/login", "", &body).await.0 }
     };
     assert_eq!(redeem(code_for().await).await, 200);
-    let set_active =
-        |on: bool| json!({ "Operations": [{ "op": "replace", "path": "active", "value": on }] });
+    let set_active = |on: bool| json!({ "Operations": [{ "op": "replace", "path": "active", "value": on }] });
 
     // Disabled, then enabled again before the code expires: the code still doesn't work.
     let caught = code_for().await;
-    assert_eq!(
-        scim(
-            port,
-            &t,
-            "PATCH",
-            &format!("{USERS}/{id}"),
-            set_active(false)
-        )
-        .await
-        .0,
-        200
-    );
-    assert_eq!(
-        scim(
-            port,
-            &t,
-            "PATCH",
-            &format!("{USERS}/{id}"),
-            set_active(true)
-        )
-        .await
-        .0,
-        200
-    );
+    assert_eq!(scim(port, &t, "PATCH", &format!("{USERS}/{id}"), set_active(false)).await.0, 200);
+    assert_eq!(scim(port, &t, "PATCH", &format!("{USERS}/{id}"), set_active(true)).await.0, 200);
     assert_eq!(redeem(caught).await, 401);
 
     // Deleted, then provisioned again: the same.
     let caught = code_for().await;
-    assert_eq!(
-        scim(port, &t, "DELETE", &format!("{USERS}/{id}"), Value::Null)
-            .await
-            .0,
-        204
-    );
-    assert_eq!(
-        scim(port, &t, "POST", USERS, okta_user("ada@corp.example", OID))
-            .await
-            .0,
-        201
-    );
+    assert_eq!(scim(port, &t, "DELETE", &format!("{USERS}/{id}"), Value::Null).await.0, 204);
+    assert_eq!(scim(port, &t, "POST", USERS, okta_user("ada@corp.example", OID)).await.0, 201);
     assert_eq!(redeem(caught).await, 401);
-    assert_eq!(
-        redeem(code_for().await).await,
-        200,
-        "new sign-ins still work"
-    );
+    assert_eq!(redeem(code_for().await).await, 200, "new sign-ins still work");
 }
 
 /// SCIM-05: deprovisioning pauses the user's routines, whether by `active: false` or
@@ -1615,73 +640,24 @@ async fn deprovisioning_pauses_the_users_routines() {
     let routines: Vec<String> = ids
         .iter()
         .map(|id| {
-            let b = app.db.create_bot_owned(
-                "Daily",
-                "#fff",
-                "waddle",
-                "claude",
-                None,
-                false,
-                id,
-                crate::acl::Visibility::Shared,
-            );
+            let b = app.db.create_bot_owned("Daily", "#fff", "waddle", "claude", None, false, id, crate::acl::Visibility::Shared);
             app.db.add_routine(&b.id, "Daily", "0 9 * * *", "report").id
         })
         .collect();
 
     let off = json!({ "Operations": [{ "op": "replace", "path": "active", "value": false }] });
-    assert_eq!(
-        scim(port, &t, "PATCH", &format!("{USERS}/{}", ids[0]), off)
-            .await
-            .0,
-        200
-    );
-    assert_eq!(
-        scim(
-            port,
-            &t,
-            "DELETE",
-            &format!("{USERS}/{}", ids[1]),
-            Value::Null
-        )
-        .await
-        .0,
-        204
-    );
+    assert_eq!(scim(port, &t, "PATCH", &format!("{USERS}/{}", ids[0]), off).await.0, 200);
+    assert_eq!(scim(port, &t, "DELETE", &format!("{USERS}/{}", ids[1]), Value::Null).await.0, 204);
     for (id, r) in ids.iter().zip(&routines) {
         let r = app.db.routine(r).unwrap();
-        assert_eq!(
-            (
-                r.enabled,
-                r.paused_reason.as_deref(),
-                r.paused_for.as_deref()
-            ),
-            (false, Some("owner_disabled"), Some(id.as_str()))
-        );
+        assert_eq!((r.enabled, r.paused_reason.as_deref(), r.paused_for.as_deref()), (false, Some("owner_disabled"), Some(id.as_str())));
     }
     let paused = events(port, &admin, "action=routine.paused").await;
-    assert!(
-        paused.len() == 2 && paused.iter().all(|e| e["authMethod"] == "scim_token"),
-        "{paused:?}"
-    );
-    assert_eq!(
-        events(port, &admin, "action=user.disabled").await[0]["details"]["routinesPaused"],
-        1
-    );
-    assert_eq!(
-        events(port, &admin, "action=scim.user_deleted").await[0]["details"]["routinesPaused"],
-        1
-    );
+    assert!(paused.len() == 2 && paused.iter().all(|e| e["authMethod"] == "scim_token"), "{paused:?}");
+    assert_eq!(events(port, &admin, "action=user.disabled").await[0]["details"]["routinesPaused"], 1);
+    assert_eq!(events(port, &admin, "action=scim.user_deleted").await[0]["details"]["routinesPaused"], 1);
 
     let on = json!({ "Operations": [{ "op": "replace", "value": { "active": true } }] });
-    assert_eq!(
-        scim(port, &t, "PATCH", &format!("{USERS}/{}", ids[0]), on)
-            .await
-            .0,
-        200
-    );
-    assert!(
-        !app.db.routine(&routines[0]).unwrap().enabled,
-        "an admin resumes them, not the IdP"
-    );
+    assert_eq!(scim(port, &t, "PATCH", &format!("{USERS}/{}", ids[0]), on).await.0, 200);
+    assert!(!app.db.routine(&routines[0]).unwrap().enabled, "an admin resumes them, not the IdP");
 }

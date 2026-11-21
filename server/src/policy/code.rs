@@ -4,8 +4,8 @@
 //! code SuperBot can't see before it runs asks, one call at a time.
 
 use super::{
-    Ctx, Cwds, DOWNLOADED_SCRIPT, MESSAGING_HOSTS, Script, UNREADABLE, Walk, classify_program,
-    classify_shell, deletion, program, quote, strip_wrappers, unreadable,
+    classify_program, classify_shell, deletion, program, quote, strip_wrappers, unreadable, Ctx, Cwds, Script, Walk, DOWNLOADED_SCRIPT,
+    MESSAGING_HOSTS, UNREADABLE,
 };
 use crate::scripts::{self, Lang, Source};
 use crate::shell::{Command, Input, Word};
@@ -40,63 +40,14 @@ enum Code {
 
 /// Programs whose risk depends on their arguments, so arguments `xargs` adds can't be checked.
 const ARGUMENT_SENSITIVE: &[&str] = &[
-    "rm",
-    "rmdir",
-    "unlink",
-    "shred",
-    "srm",
-    "trash",
-    "trash-put",
-    "find",
-    "git",
-    "gh",
-    "curl",
-    "wget",
-    "http",
-    "xh",
-    "sudo",
-    "doas",
-    "su",
-    "env",
-    "eval",
-    "source",
-    ".",
-    "chmod",
-    "chown",
-    "dd",
-    "docker",
-    "systemctl",
-    "sendmail",
-    "mail",
-    "npm",
-    "pip",
-    "pip3",
-    "cargo",
-    "apt-get",
+    "rm", "rmdir", "unlink", "shred", "srm", "trash", "trash-put", "find", "git", "gh", "curl", "wget", "http", "xh", "sudo", "doas", "su",
+    "env", "eval", "source", ".", "chmod", "chown", "dd", "docker", "systemctl", "sendmail", "mail", "npm", "pip", "pip3", "cargo", "apt-get",
 ];
 
 /// Programs that only read a file they name, so naming the script doesn't change it.
 const READS_ONLY: &[&str] = &[
-    "chmod",
-    "ls",
-    "cat",
-    "test",
-    "[",
-    "stat",
-    "file",
-    "head",
-    "tail",
-    "wc",
-    "less",
-    "echo",
-    "printf",
-    "grep",
-    "diff",
-    "sha256sum",
-    "md5sum",
-    "realpath",
-    "readlink",
-    "shellcheck",
+    "chmod", "ls", "cat", "test", "[", "stat", "file", "head", "tail", "wc", "less", "echo", "printf", "grep", "diff", "sha256sum", "md5sum",
+    "realpath", "readlink", "shellcheck",
 ];
 
 const DOWNLOADERS: [&str; 2] = ["curl", "wget"];
@@ -117,58 +68,30 @@ impl Level<'_> {
             }
             let mut prog = program(&first.text);
             if xargs && (Lang::of(&prog).is_some() || ARGUMENT_SENSITIVE.contains(&prog.as_str())) {
-                out.push((
-                    "shell_destructive",
-                    format!("Runs {prog} with arguments from xargs, which SuperBot can't check"),
-                ));
+                out.push(("shell_destructive", format!("Runs {prog} with arguments from xargs, which SuperBot can't check")));
             }
             if let Some((how, code)) = runs_string(&prog, &words[1..]) {
                 match code {
-                    Some(code) if !code.dynamic => {
-                        classify_shell(&code.text, self.cwds, self.ctx, self.depth + 1, w, fed, out)
-                    }
+                    Some(code) if !code.dynamic => classify_shell(&code.text, self.cwds, self.ctx, self.depth + 1, w, fed, out),
                     _ => self.unknown_code("a script", &how, out),
                 }
                 continue;
             }
             if prog == "eval" {
                 match eval {
-                    Some(Ok(inner)) => Level {
-                        s: inner,
-                        depth: self.depth + 1,
-                        input: fed,
-                        ..*self
-                    }
-                    .classify(w, out),
+                    Some(Ok(inner)) => Level { s: inner, depth: self.depth + 1, input: fed, ..*self }.classify(w, out),
                     Some(Err(e)) => unreadable(e, out),
                     None => {
-                        let substituted = words[1..]
-                            .iter()
-                            .any(|a| a.text.contains("$(") || a.text.contains('`'));
-                        self.unknown_code(
-                            "code",
-                            if substituted { "eval $(…)" } else { "eval" },
-                            out,
-                        )
+                        let substituted = words[1..].iter().any(|a| a.text.contains("$(") || a.text.contains('`'));
+                        self.unknown_code("code", if substituted { "eval $(…)" } else { "eval" }, out)
                     }
                 }
                 continue;
             }
             if prog == "alias" {
-                for value in words[1..]
-                    .iter()
-                    .filter_map(|a| a.text.split_once('=').map(|(_, v)| v))
-                {
+                for value in words[1..].iter().filter_map(|a| a.text.split_once('=').map(|(_, v)| v)) {
                     let mut found = Vec::new();
-                    classify_shell(
-                        value,
-                        self.cwds,
-                        self.ctx,
-                        self.depth + 1,
-                        w,
-                        fed,
-                        &mut found,
-                    );
+                    classify_shell(value, self.cwds, self.ctx, self.depth + 1, w, fed, &mut found);
                     out.extend(found.into_iter().filter(|(c, _)| *c != UNREADABLE));
                 }
                 continue;
@@ -189,37 +112,17 @@ impl Level<'_> {
             if let Some(lang) = Lang::of(&prog) {
                 let mut preloads = Vec::new();
                 let code = code_arg(lang, &prog, &words[1..], &mut preloads);
-                for p in preloads.iter().filter(|p| {
-                    p.dynamic
-                        || p.text.starts_with(['.', '/', '~'])
-                        || script_ext(Path::new(&p.text))
-                }) {
+                for p in preloads.iter().filter(|p| p.dynamic || p.text.starts_with(['.', '/', '~']) || script_ext(Path::new(&p.text))) {
                     self.run_file(p, Some(lang), k, w, out);
                 }
                 match code {
                     Code::Inline(code, flag) if lang == Lang::Shell => match code.dynamic {
-                        true => self.unknown_code(
-                            "a script",
-                            &format!("{prog} {flag} {}", code.text),
-                            out,
-                        ),
-                        false => classify_shell(
-                            &code.text,
-                            self.cwds,
-                            self.ctx,
-                            self.depth + 1,
-                            w,
-                            fed,
-                            out,
-                        ),
+                        true => self.unknown_code("a script", &format!("{prog} {flag} {}", code.text), out),
+                        false => classify_shell(&code.text, self.cwds, self.ctx, self.depth + 1, w, fed, out),
                     },
                     Code::Inline(code, flag) => match code.dynamic {
-                        true => {
-                            self.unknown_code("code", &format!("{prog} {flag} {}", code.text), out)
-                        }
-                        false => {
-                            self.code(lang, &code.text, &format!("{prog} {flag}"), w, fed, out)
-                        }
+                        true => self.unknown_code("code", &format!("{prog} {flag} {}", code.text), out),
+                        false => self.code(lang, &code.text, &format!("{prog} {flag}"), w, fed, out),
                     },
                     Code::File(file) => {
                         self.run_file(&file, Some(lang), k, w, out);
@@ -248,20 +151,8 @@ impl Level<'_> {
         let base = m.text.replace('.', "/");
         for file in [format!("{base}.py"), format!("{base}/__main__.py")] {
             let here = self.unsourced.resolve(self.ctx, &file).unwrap_or_default();
-            if here
-                .iter()
-                .any(|p| p.starts_with(&self.ctx.workspace) && p.exists())
-            {
-                self.run_file(
-                    &Word {
-                        text: file,
-                        dynamic: false,
-                    },
-                    Some(Lang::Python),
-                    k,
-                    w,
-                    out,
-                );
+            if here.iter().any(|p| p.starts_with(&self.ctx.workspace) && p.exists()) {
+                self.run_file(&Word { text: file, dynamic: false }, Some(Lang::Python), k, w, out);
                 return;
             }
         }
@@ -282,26 +173,12 @@ impl Level<'_> {
                 }
             }
             let words = strip_wrappers(&c.argv, &mut Vec::new()).0;
-            let Some(first) = words
-                .first()
-                .filter(|f| !f.dynamic && !f.text.contains('/'))
-            else {
-                continue;
-            };
+            let Some(first) = words.first().filter(|f| !f.dynamic && !f.text.contains('/')) else { continue };
             let prog = program(&first.text);
-            if READS_ONLY.contains(&prog.as_str())
-                || RUNS_OTHERS.contains(&prog.as_str())
-                || Lang::of(&prog).is_some()
-                || ["source", ".", "cd"].contains(&prog.as_str())
-            {
+            if READS_ONLY.contains(&prog.as_str()) || RUNS_OTHERS.contains(&prog.as_str()) || Lang::of(&prog).is_some() || ["source", ".", "cd"].contains(&prog.as_str()) {
                 continue;
             }
-            named.extend(
-                words[1..]
-                    .iter()
-                    .filter(|a| !a.dynamic && !a.text.starts_with('-'))
-                    .map(|a| base(&a.text)),
-            );
+            named.extend(words[1..].iter().filter(|a| !a.dynamic && !a.text.starts_with('-')).map(|a| base(&a.text)));
         }
         note_named(named, w, out);
     }
@@ -316,19 +193,12 @@ impl Level<'_> {
         self.s.cmds.iter().find_map(|c| {
             let words = strip_wrappers(&c.argv, &mut Vec::new()).0;
             let args: Vec<&str> = words.iter().skip(1).map(|w| w.text.as_str()).collect();
-            words
-                .first()
-                .filter(|w| !w.dynamic)
-                .and_then(|w| decoder(&program(&w.text), &args))
+            words.first().filter(|w| !w.dynamic).and_then(|w| decoder(&program(&w.text), &args))
         })
     }
 
     fn downloads(&self) -> bool {
-        self.s.cmds.iter().any(|c| {
-            c.argv
-                .iter()
-                .any(|w| !w.dynamic && DOWNLOADERS.contains(&program(&w.text).as_str()))
-        })
+        self.s.cmds.iter().any(|c| c.argv.iter().any(|w| !w.dynamic && DOWNLOADERS.contains(&program(&w.text).as_str())))
     }
 
     /// Runs `kind` ("a command", "code", "a script") only known when it runs, as `detail`
@@ -341,9 +211,7 @@ impl Level<'_> {
         };
         let why = match self.decodes() {
             Some(d) => format!("Decodes hidden code and runs it ({d}, then {detail})"),
-            None if detail.contains("$(") || detail.contains('`') => {
-                format!("Runs the output of a command as code ({detail})")
-            }
+            None if detail.contains("$(") || detail.contains('`') => format!("Runs the output of a command as code ({detail})"),
             None => format!("Runs {kind} only known when it runs ({detail})"),
         };
         out.push(("shell_destructive", why));
@@ -358,26 +226,14 @@ impl Level<'_> {
     fn code(&self, lang: Lang, code: &str, label: &str, w: &mut Walk, fed: bool, out: &mut Out) {
         let mut found = Vec::new();
         if lang == Lang::Shell {
-            classify_shell(
-                code,
-                self.cwds,
-                self.ctx,
-                self.depth + 1,
-                w,
-                fed,
-                &mut found,
-            );
+            classify_shell(code, self.cwds, self.ctx, self.depth + 1, w, fed, &mut found);
         } else {
             let f = scripts::scan(lang, code, label);
-            let moved = Cwds {
-                dirs: self.cwds.dirs.clone(),
-                unknown: true,
-            };
+            let moved = Cwds { dirs: self.cwds.dirs.clone(), unknown: true };
             let cwds = if f.moves { &moved } else { self.cwds };
             // Any string naming a file may be a file it writes (`open('deploy.sh', 'w')`),
             // except as a word of a command it runs.
-            let mut named: std::collections::BTreeMap<String, usize> =
-                std::collections::BTreeMap::new();
+            let mut named: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
             for s in &f.strings {
                 *named.entry(file_name(s)).or_default() += 1;
             }
@@ -386,43 +242,22 @@ impl Level<'_> {
                     *n = n.saturating_sub(1);
                 }
             }
-            note_named(
-                named
-                    .into_iter()
-                    .filter(|(_, n)| *n > 0)
-                    .map(|(s, _)| s)
-                    .collect(),
-                w,
-                &mut found,
-            );
+            note_named(named.into_iter().filter(|(_, n)| *n > 0).map(|(s, _)| s).collect(), w, &mut found);
             for cmd in &f.commands {
                 classify_shell(cmd, cwds, self.ctx, self.depth + 1, w, false, &mut found);
             }
             for p in &f.deletes {
                 deletion(self.ctx, cwds, p, &mut |c, why| found.push((c, why)));
             }
-            for host in MESSAGING_HOSTS.iter().filter(|h| {
-                f.strings
-                    .iter()
-                    .any(|s| s.to_ascii_lowercase().contains(*h))
-            }) {
-                found.push((
-                    "outbound_message",
-                    format!("Sends a message through {}", host.trim_end_matches("://")),
-                ));
+            for host in MESSAGING_HOSTS.iter().filter(|h| f.strings.iter().any(|s| s.to_ascii_lowercase().contains(*h))) {
+                found.push(("outbound_message", format!("Sends a message through {}", host.trim_end_matches("://"))));
             }
             found.extend(f.asks);
         }
         let tag = format!("in {label})");
         for (c, why) in found {
             out.push(match c {
-                UNREADABLE => (
-                    "shell_destructive",
-                    format!(
-                        "Can't fully check {label}: {}",
-                        why.trim_start_matches("Can't check this command safely: ")
-                    ),
-                ),
+                UNREADABLE => ("shell_destructive", format!("Can't fully check {label}: {}", why.trim_start_matches("Can't check this command safely: "))),
                 // Kept as is: a downloaded script is approved one call at a time (ADR 0051).
                 _ if why.ends_with(&tag) || why == DOWNLOADED_SCRIPT => (c, why),
                 _ => (c, format!("{why} ({tag}")),
@@ -433,14 +268,7 @@ impl Level<'_> {
     /// Runs the script `file` names, with `lang` when an interpreter was named. Reads it
     /// from the workspace and classifies it. Some(program) when it is a program, not a
     /// script SuperBot reads: the caller classifies it by that name, as before.
-    fn run_file(
-        &self,
-        file: &Word,
-        lang: Option<Lang>,
-        k: usize,
-        w: &mut Walk,
-        out: &mut Out,
-    ) -> Option<String> {
+    fn run_file(&self, file: &Word, lang: Option<Lang>, k: usize, w: &mut Walk, out: &mut Out) -> Option<String> {
         let ask = |out: &mut Out, why: String| out.push(("shell_destructive", why));
         let name = file.text.as_str();
         if file.dynamic {
@@ -449,16 +277,11 @@ impl Level<'_> {
         }
         let sourced = self.s.cmds[..k].iter().any(|c| {
             let words = strip_wrappers(&c.argv, &mut Vec::new()).0;
-            words
-                .first()
-                .is_some_and(|w| w.dynamic || ["source", "."].contains(&program(&w.text).as_str()))
+            words.first().is_some_and(|w| w.dynamic || ["source", "."].contains(&program(&w.text).as_str()))
         });
         let cwds = if sourced { self.cwds } else { self.unsourced };
         let Some(places) = cwds.resolve(self.ctx, name) else {
-            ask(
-                out,
-                format!("Runs {name} from a folder SuperBot can't tell, so it can't check it"),
-            );
+            ask(out, format!("Runs {name} from a folder SuperBot can't tell, so it can't check it"));
             return None;
         };
         let outside = |p: &Path| lang.is_some() || scratch(p) || script_ext(p);
@@ -476,36 +299,22 @@ impl Level<'_> {
                 continue;
             }
             if !self.ctx.readable {
-                ask(
-                    out,
-                    format!("Runs {name} on the Bot's machine, where SuperBot can't read it"),
-                );
+                ask(out, format!("Runs {name} on the Bot's machine, where SuperBot can't read it"));
                 continue;
             }
             let base = name.rsplit('/').next().unwrap_or(name).to_string();
             if self.changes(k, name) || w.wild_writes || w.changed.contains(&base) {
-                ask(
-                    out,
-                    format!(
-                        "Runs {name} after this same command may change it, so SuperBot can't check what will run"
-                    ),
-                );
+                ask(out, format!("Runs {name} after this same command may change it, so SuperBot can't check what will run"));
                 continue;
             }
             // The same script run again may get other input, so it is checked again. One
             // that runs itself, directly or through others, isn't followed round.
             if w.files.contains(&place) {
-                ask(
-                    out,
-                    format!("Runs {name} from inside itself, which SuperBot doesn't follow"),
-                );
+                ask(out, format!("Runs {name} from inside itself, which SuperBot doesn't follow"));
                 continue;
             }
             if w.reads >= scripts::MAX_FILES {
-                ask(
-                    out,
-                    "Runs more scripts than SuperBot checks in one call".into(),
-                );
+                ask(out, "Runs more scripts than SuperBot checks in one call".into());
                 continue;
             }
             w.reads += 1;
@@ -515,10 +324,9 @@ impl Level<'_> {
             found |= !matches!(source, Source::Missing);
             match source {
                 // Bytecode (`.pyc`) passes bash's binary test but isn't text an interpreter reads as source.
-                Source::Text(text) if lang.is_some() && text.contains(['\0', '\u{FFFD}']) => ask(
-                    out,
-                    format!("Runs {name}, compiled code SuperBot can't read"),
-                ),
+                Source::Text(text) if lang.is_some() && text.contains(['\0', '\u{FFFD}']) => {
+                    ask(out, format!("Runs {name}, compiled code SuperBot can't read"))
+                }
                 Source::Text(text) => {
                     let lang = match (lang, scripts::shebang(&text)) {
                         (Some(l), _) => Some(l),
@@ -526,10 +334,7 @@ impl Level<'_> {
                         (None, Some(Some(i))) => match Lang::of(&i) {
                             Some(l) => Some(l),
                             None => {
-                                ask(
-                                    out,
-                                    format!("Runs {name} with {i}, which SuperBot can't read"),
-                                );
+                                ask(out, format!("Runs {name} with {i}, which SuperBot can't read"));
                                 None
                             }
                         },
@@ -541,51 +346,28 @@ impl Level<'_> {
                     if let Some(l) = lang {
                         let fed = self.fed(&self.s.cmds[k]);
                         // Named the same however it was typed, so a run grant covers `./x.sh` and `bash x.sh` alike.
-                        let label = place
-                            .strip_prefix(&self.ctx.workspace)
-                            .map_or(name.into(), |p| p.to_string_lossy().into_owned());
+                        let label = place.strip_prefix(&self.ctx.workspace).map_or(name.into(), |p| p.to_string_lossy().into_owned());
                         w.files.push(place.clone());
                         self.code(l, &text, &label, w, fed, out);
                         w.files.pop();
                     }
                 }
                 Source::Binary if lang.is_none() => program_name = Some(program(name)),
-                Source::Binary => ask(
-                    out,
-                    format!("Runs {name}, compiled code SuperBot can't read"),
-                ),
+                Source::Binary => ask(out, format!("Runs {name}, compiled code SuperBot can't read")),
                 Source::Missing => {}
-                Source::TooBig => ask(
-                    out,
-                    format!(
-                        "Runs {name}, which is too big for SuperBot to check (over {} KB)",
-                        scripts::MAX_SCRIPT_BYTES / 1024
-                    ),
-                ),
-                Source::Unreadable(why) => ask(
-                    out,
-                    format!("Runs {name}, which SuperBot can't read ({why})"),
-                ),
-                Source::LinksOutside(real) if outside(&real) => ask(
-                    out,
-                    format!(
-                        "Runs {name}, which links outside the workspace, so SuperBot doesn't read it"
-                    ),
-                ),
+                Source::TooBig => ask(out, format!("Runs {name}, which is too big for SuperBot to check (over {} KB)", scripts::MAX_SCRIPT_BYTES / 1024)),
+                Source::Unreadable(why) => ask(out, format!("Runs {name}, which SuperBot can't read ({why})")),
+                Source::LinksOutside(real) if outside(&real) => {
+                    ask(out, format!("Runs {name}, which links outside the workspace, so SuperBot doesn't read it"))
+                }
                 Source::LinksOutside(real) => program_name = Some(program(&real.to_string_lossy())),
             }
         }
         if missing && !found && !asked_outside && program_name.is_none() {
-            ask(
-                out,
-                format!("Runs {name}, which doesn't exist yet, so SuperBot can't check it"),
-            );
+            ask(out, format!("Runs {name}, which doesn't exist yet, so SuperBot can't check it"));
         }
         if asked_outside {
-            ask(
-                out,
-                format!("Runs {name}, a script outside the workspace that SuperBot doesn't read"),
-            );
+            ask(out, format!("Runs {name}, a script outside the workspace that SuperBot doesn't read"));
         }
         program_name
     }
@@ -605,14 +387,9 @@ impl Level<'_> {
                 return true;
             }
             let words = strip_wrappers(&c.argv, &mut Vec::new()).0;
-            let prog = words
-                .first()
-                .filter(|w| !w.dynamic)
-                .map(|w| program(&w.text))
-                .unwrap_or_default();
+            let prog = words.first().filter(|w| !w.dynamic).map(|w| program(&w.text)).unwrap_or_default();
             let interpreter = Lang::of(&prog).is_some() || prog == "source" || prog == ".";
-            let runs_it = words.first().is_some_and(|w| w.text == name)
-                || (interpreter && words.iter().any(|w| w.text == name));
+            let runs_it = words.first().is_some_and(|w| w.text == name) || (interpreter && words.iter().any(|w| w.text == name));
             if j == k || runs_it || READS_ONLY.contains(&prog.as_str()) {
                 excused += c.argv.iter().map(|w| count(&w.text)).sum::<usize>();
             }
@@ -633,30 +410,16 @@ impl Level<'_> {
         }
         let Some(j) = c.pipe_from else {
             if self.input || self.s.src.contains(['|', '<']) {
-                out.push((
-                    "shell_destructive",
-                    format!("Runs {prog} reading code from its input, which SuperBot can't follow"),
-                ));
+                out.push(("shell_destructive", format!("Runs {prog} reading code from its input, which SuperBot can't follow")));
             }
             return;
         };
-        let chain: Vec<&Command> = std::iter::successors(Some(j), |&j| self.s.cmds[j].pipe_from)
-            .map(|j| &self.s.cmds[j])
-            .collect();
+        let chain: Vec<&Command> = std::iter::successors(Some(j), |&j| self.s.cmds[j].pipe_from).map(|j| &self.s.cmds[j]).collect();
         let progs: Vec<(String, Vec<String>)> = chain
             .iter()
             .map(|c| {
                 let words = strip_wrappers(&c.argv, &mut Vec::new()).0;
-                let p = words
-                    .first()
-                    .map(|w| {
-                        if w.dynamic {
-                            w.text.clone()
-                        } else {
-                            program(&w.text)
-                        }
-                    })
-                    .unwrap_or_default();
+                let p = words.first().map(|w| if w.dynamic { w.text.clone() } else { program(&w.text) }).unwrap_or_default();
                 (p, words.iter().skip(1).map(|w| w.text.clone()).collect())
             })
             .collect();
@@ -665,14 +428,8 @@ impl Level<'_> {
             out.push(("network_install", DOWNLOADED_SCRIPT.into()));
             opaque = true;
         }
-        if let Some(d) = progs
-            .iter()
-            .find_map(|(p, a)| decoder(p, &a.iter().map(String::as_str).collect::<Vec<_>>()))
-        {
-            out.push((
-                "shell_destructive",
-                format!("Decodes hidden code and runs it ({d} | {prog})"),
-            ));
+        if let Some(d) = progs.iter().find_map(|(p, a)| decoder(p, &a.iter().map(String::as_str).collect::<Vec<_>>())) {
+            out.push(("shell_destructive", format!("Decodes hidden code and runs it ({d} | {prog})")));
             opaque = true;
         }
         if !opaque {
@@ -684,29 +441,12 @@ impl Level<'_> {
     fn feed(&self, j: usize, lang: Lang, prog: &str, w: &mut Walk, out: &mut Out) {
         let src = &self.s.cmds[j];
         let words = strip_wrappers(&src.argv, &mut Vec::new()).0;
-        let name = words
-            .first()
-            .map(|w| {
-                if w.dynamic {
-                    w.text.clone()
-                } else {
-                    program(&w.text)
-                }
-            })
-            .unwrap_or_default();
+        let name = words.first().map(|w| if w.dynamic { w.text.clone() } else { program(&w.text) }).unwrap_or_default();
         let args = &words[1.min(words.len())..];
-        let piped = |out: &mut Out| {
-            out.push((
-                "shell_destructive",
-                format!("Runs the output of {name} as code ({name} | {prog})"),
-            ))
-        };
+        let piped = |out: &mut Out| out.push(("shell_destructive", format!("Runs the output of {name} as code ({name} | {prog})")));
         match name.as_str() {
             "cat" | "tee" if words.iter().all(|w| !w.dynamic) => {
-                let files: Vec<&Word> = args
-                    .iter()
-                    .filter(|a| !a.text.starts_with('-') || a.text == "-")
-                    .collect();
+                let files: Vec<&Word> = args.iter().filter(|a| !a.text.starts_with('-') || a.text == "-").collect();
                 if name == "cat" && !files.is_empty() {
                     for f in files {
                         self.run_file(f, Some(lang), j, w, out);
@@ -720,18 +460,8 @@ impl Level<'_> {
                 }
             }
             "echo" | "printf" => match echoed(&name, args) {
-                Echo::Text(t) => self.code(
-                    lang,
-                    &t,
-                    &format!("the text piped into {prog}"),
-                    w,
-                    false,
-                    out,
-                ),
-                Echo::Decoded => out.push((
-                    "shell_destructive",
-                    format!("Decodes hidden code and runs it ({name} | {prog})"),
-                )),
+                Echo::Text(t) => self.code(lang, &t, &format!("the text piped into {prog}"), w, false, out),
+                Echo::Decoded => out.push(("shell_destructive", format!("Decodes hidden code and runs it ({name} | {prog})"))),
                 Echo::Dynamic => self.unknown_code("code", &format!("{name} … | {prog}"), out),
                 Echo::Opaque => piped(out),
             },
@@ -739,73 +469,36 @@ impl Level<'_> {
         }
     }
 
-    fn input_code(
-        &self,
-        input: &Input,
-        lang: Lang,
-        prog: &str,
-        k: usize,
-        w: &mut Walk,
-        out: &mut Out,
-    ) {
+    fn input_code(&self, input: &Input, lang: Lang, prog: &str, k: usize, w: &mut Walk, out: &mut Out) {
         match input {
-            Input::Heredoc { body, expand }
-                if *expand && lang != Lang::Shell && body.contains(['$', '`']) =>
-            {
+            Input::Heredoc { body, expand } if *expand && lang != Lang::Shell && body.contains(['$', '`']) => {
                 self.unknown_code("code", &format!("a here-document with $… into {prog}"), out)
             }
-            Input::Heredoc { body, .. } => {
-                self.code(lang, body, "the here-document", w, false, out)
-            }
-            Input::HereString(word) if word.dynamic => {
-                self.unknown_code("code", &format!("{prog} <<< {}", word.text), out)
-            }
-            Input::HereString(word) => {
-                self.code(lang, &word.text, "the here-string", w, false, out)
-            }
+            Input::Heredoc { body, .. } => self.code(lang, body, "the here-document", w, false, out),
+            Input::HereString(word) if word.dynamic => self.unknown_code("code", &format!("{prog} <<< {}", word.text), out),
+            Input::HereString(word) => self.code(lang, &word.text, "the here-string", w, false, out),
             Input::File(file) => {
                 self.run_file(file, Some(lang), k, w, out);
             }
-            Input::Other => out.push((
-                "shell_destructive",
-                format!("Runs {prog} reading code from an input SuperBot can't read"),
-            )),
+            Input::Other => out.push(("shell_destructive", format!("Runs {prog} reading code from an input SuperBot can't read"))),
         }
     }
 
     /// `find … -exec cmd {} ;`: each command it runs, with `{}` a path under each place it searches.
     fn find_exec(&self, args: &[&str], w: &mut Walk, fed: bool, out: &mut Out) {
-        let mut roots: Vec<&str> = args
-            .iter()
-            .copied()
-            .take_while(|a| !a.starts_with('-') && !a.starts_with('(') && !a.starts_with('!'))
-            .collect();
+        let mut roots: Vec<&str> = args.iter().copied().take_while(|a| !a.starts_with('-') && !a.starts_with('(') && !a.starts_with('!')).collect();
         if roots.is_empty() {
             roots.push(".");
         }
         let mut i = 0;
         while i < args.len() {
             if ["-exec", "-execdir", "-ok", "-okdir"].contains(&args[i]) {
-                let end = args[i + 1..]
-                    .iter()
-                    .position(|a| *a == ";" || *a == "+")
-                    .map_or(args.len(), |p| i + 1 + p);
+                let end = args[i + 1..].iter().position(|a| *a == ";" || *a == "+").map_or(args.len(), |p| i + 1 + p);
                 for root in &roots {
                     let found = format!("{}/found", root.trim_end_matches('/'));
-                    let text: Vec<String> = args[i + 1..end]
-                        .iter()
-                        .map(|a| quote(&a.replace("{}", &found)))
-                        .collect();
+                    let text: Vec<String> = args[i + 1..end].iter().map(|a| quote(&a.replace("{}", &found))).collect();
                     if !text.is_empty() {
-                        classify_shell(
-                            &text.join(" "),
-                            self.cwds,
-                            self.ctx,
-                            self.depth + 1,
-                            w,
-                            fed,
-                            out,
-                        );
+                        classify_shell(&text.join(" "), self.cwds, self.ctx, self.depth + 1, w, fed, out);
                     }
                 }
                 i = end;
@@ -832,19 +525,12 @@ fn note_named(named: Vec<String>, w: &mut Walk, out: &mut Out) {
 
 /// Temporary folders anyone can write to: a file there may be anything.
 fn scratch(p: &Path) -> bool {
-    ["/tmp", "/var/tmp", "/dev/shm"]
-        .iter()
-        .any(|d| p.starts_with(d))
+    ["/tmp", "/var/tmp", "/dev/shm"].iter().any(|d| p.starts_with(d))
 }
 
 fn script_ext(p: &Path) -> bool {
-    const EXT: [&str; 16] = [
-        "sh", "bash", "zsh", "ksh", "py", "js", "mjs", "cjs", "ts", "mts", "rb", "pl", "pm", "php",
-        "fish", "command",
-    ];
-    p.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| EXT.contains(&e.to_ascii_lowercase().as_str()))
+    const EXT: [&str; 16] = ["sh", "bash", "zsh", "ksh", "py", "js", "mjs", "cjs", "ts", "mts", "rb", "pl", "pm", "php", "fish", "command"];
+    p.extension().and_then(|e| e.to_str()).is_some_and(|e| EXT.contains(&e.to_ascii_lowercase().as_str()))
 }
 
 /// Wrappers that run a string as a command line: `env -S '…'`, `watch '…'`,
@@ -853,32 +539,14 @@ fn script_ext(p: &Path) -> bool {
 fn runs_string(prog: &str, args: &[Word]) -> Option<(String, Option<Word>)> {
     let joined = |ws: &[Word], quoted: bool| {
         let dynamic = ws.iter().any(|w| w.dynamic);
-        let text = ws
-            .iter()
-            .map(|w| {
-                if quoted {
-                    quote(&w.text)
-                } else {
-                    w.text.clone()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        (!dynamic).then_some(Word {
-            text,
-            dynamic: false,
-        })
+        let text = ws.iter().map(|w| if quoted { quote(&w.text) } else { w.text.clone() }).collect::<Vec<_>>().join(" ");
+        (!dynamic).then_some(Word { text, dynamic: false })
     };
     // The value of `-x v`, `-qxv`, `--long v`, or `--long=v`, and the index of the word it is in.
     let value_of = |short: char, long: &str| -> Option<(usize, Option<Word>)> {
         args.iter().enumerate().find_map(|(i, a)| {
             let t = a.text.as_str();
-            let known = |v: &str| {
-                (!a.dynamic).then(|| Word {
-                    text: v.into(),
-                    dynamic: false,
-                })
-            };
+            let known = |v: &str| (!a.dynamic).then(|| Word { text: v.into(), dynamic: false });
             let next = || Some((i + 1, args.get(i + 1).filter(|w| !w.dynamic).cloned()));
             if t == long {
                 next()
@@ -899,10 +567,7 @@ fn runs_string(prog: &str, args: &[Word]) -> Option<(String, Option<Word>)> {
         "env" => {
             let (at, value) = value_of('S', "--split-string")?;
             let rest = joined(args.get(at + 1..).unwrap_or_default(), true);
-            let code = value.zip(rest).map(|(v, r)| Word {
-                text: format!("{} {}", v.text, r.text),
-                dynamic: false,
-            });
+            let code = value.zip(rest).map(|(v, r)| Word { text: format!("{} {}", v.text, r.text), dynamic: false });
             Some(("env -S".into(), code))
         }
         "script" => value_of('c', "--command").map(|(_, v)| ("script -c".into(), v)),
@@ -911,16 +576,9 @@ fn runs_string(prog: &str, args: &[Word]) -> Option<(String, Option<Word>)> {
             let mut exec = false;
             while let Some(a) = args.get(i).filter(|a| a.text.starts_with('-')) {
                 exec |= a.text == "-x" || a.text == "--exec";
-                i += if a.text == "-n" || a.text == "--interval" {
-                    2
-                } else {
-                    1
-                };
+                i += if a.text == "-n" || a.text == "--interval" { 2 } else { 1 };
             }
-            Some((
-                "watch".into(),
-                joined(args.get(i..).unwrap_or_default(), exec),
-            ))
+            Some(("watch".into(), joined(args.get(i..).unwrap_or_default(), exec)))
         }
         "flock" => {
             if let Some((_, v)) = value_of('c', "--command") {
@@ -928,12 +586,7 @@ fn runs_string(prog: &str, args: &[Word]) -> Option<(String, Option<Word>)> {
             }
             let mut i = 0;
             while let Some(a) = args.get(i).filter(|a| a.text.starts_with('-')) {
-                i += if ["-w", "--timeout", "-E", "--conflict-exit-code"].contains(&a.text.as_str())
-                {
-                    2
-                } else {
-                    1
-                };
+                i += if ["-w", "--timeout", "-E", "--conflict-exit-code"].contains(&a.text.as_str()) { 2 } else { 1 };
             }
             let rest = args.get(i + 1..).unwrap_or_default();
             (!rest.is_empty()).then(|| ("flock".into(), joined(rest, true)))
@@ -951,24 +604,15 @@ fn code_arg(lang: Lang, prog: &str, args: &[Word], preloads: &mut Vec<Word>) -> 
     match base {
         "deno" => match args.first().map(|a| a.text.as_str()) {
             Some("run") => args = &args[1..],
-            Some("eval") => {
-                return args
-                    .get(1)
-                    .map_or(Code::Nothing, |c| Code::Inline(c.clone(), "eval"));
-            }
+            Some("eval") => return args.get(1).map_or(Code::Nothing, |c| Code::Inline(c.clone(), "eval")),
             _ => return Code::Nothing,
         },
         "bun" => {
             if args.first().is_some_and(|a| a.text == "run") {
                 args = &args[1..];
             }
-            if let Some(i) = args
-                .iter()
-                .position(|a| a.text == "-e" || a.text == "--eval")
-            {
-                return args
-                    .get(i + 1)
-                    .map_or(Code::Nothing, |c| Code::Inline(c.clone(), "-e"));
+            if let Some(i) = args.iter().position(|a| a.text == "-e" || a.text == "--eval") {
+                return args.get(i + 1).map_or(Code::Nothing, |c| Code::Inline(c.clone(), "-e"));
             }
             return match args.iter().find(|a| !a.text.starts_with('-')) {
                 Some(f) if f.dynamic || script_ext(Path::new(&f.text)) => Code::File(f.clone()),
@@ -1005,13 +649,7 @@ fn code_arg(lang: Lang, prog: &str, args: &[Word], preloads: &mut Vec<Word>) -> 
         if let Some(long) = t.strip_prefix("--") {
             let name = format!("--{}", long.split('=').next().unwrap_or(""));
             match (o.code_long.iter().find(|f| **f == name), t.split_once('=')) {
-                (Some(f), Some((_, v))) => add(
-                    Some(Word {
-                        text: v.into(),
-                        dynamic: false,
-                    }),
-                    f,
-                ),
+                (Some(f), Some((_, v))) => add(Some(Word { text: v.into(), dynamic: false }), f),
                 (Some(f), None) => {
                     add(args.get(i + 1).cloned(), f);
                     i += 1;
@@ -1022,12 +660,7 @@ fn code_arg(lang: Lang, prog: &str, args: &[Word], preloads: &mut Vec<Word>) -> 
                     }
                     i += 1
                 }
-                (None, Some((_, v))) if o.preload_long.contains(&name.as_str()) => {
-                    preloads.push(Word {
-                        text: v.into(),
-                        dynamic: a.dynamic,
-                    })
-                }
+                (None, Some((_, v))) if o.preload_long.contains(&name.as_str()) => preloads.push(Word { text: v.into(), dynamic: a.dynamic }),
                 _ => {}
             }
             i += 1;
@@ -1039,38 +672,16 @@ fn code_arg(lang: Lang, prog: &str, args: &[Word], preloads: &mut Vec<Word>) -> 
             for (n, ch) in flags.iter().enumerate() {
                 let rest: String = flags[n + 1..].iter().collect();
                 if t.starts_with('-') && o.code_short.contains(ch) {
-                    let flag = ["-c", "-e", "-E", "-p", "-r"]
-                        .into_iter()
-                        .find(|f| f.ends_with(*ch))
-                        .unwrap_or("-c");
+                    let flag = ["-c", "-e", "-E", "-p", "-r"].into_iter().find(|f| f.ends_with(*ch)).unwrap_or("-c");
                     if lang == Lang::Shell {
                         shell_code = Some(flag);
                         continue;
                     }
                     taken = rest.is_empty();
-                    add(
-                        if taken {
-                            args.get(i + 1).cloned()
-                        } else {
-                            Some(Word {
-                                text: rest,
-                                dynamic: false,
-                            })
-                        },
-                        flag,
-                    );
+                    add(if taken { args.get(i + 1).cloned() } else { Some(Word { text: rest, dynamic: false }) }, flag);
                     break;
                 }
-                let value = || {
-                    if rest.is_empty() {
-                        args.get(i + 1).cloned()
-                    } else {
-                        Some(Word {
-                            text: rest.clone(),
-                            dynamic: false,
-                        })
-                    }
-                };
+                let value = || if rest.is_empty() { args.get(i + 1).cloned() } else { Some(Word { text: rest.clone(), dynamic: false }) };
                 if *ch == 'm' && lang == Lang::Python {
                     return value().map_or(Code::Nothing, Code::Module);
                 }
@@ -1081,19 +692,10 @@ fn code_arg(lang: Lang, prog: &str, args: &[Word], preloads: &mut Vec<Word>) -> 
                     let v = value();
                     if o.preload_short.contains(ch) {
                         preloads.extend(v);
-                    } else if let Some(file) = v
-                        .as_ref()
-                        .filter(|_| lang == Lang::Php && *ch == 'd')
-                        .and_then(|v| {
-                            let (key, file) = v.text.split_once('=')?;
-                            ["auto_prepend_file", "auto_append_file"]
-                                .contains(&key.trim())
-                                .then(|| Word {
-                                    text: file.into(),
-                                    dynamic: v.dynamic,
-                                })
-                        })
-                    {
+                    } else if let Some(file) = v.as_ref().filter(|_| lang == Lang::Php && *ch == 'd').and_then(|v| {
+                        let (key, file) = v.text.split_once('=')?;
+                        ["auto_prepend_file", "auto_append_file"].contains(&key.trim()).then(|| Word { text: file.into(), dynamic: v.dynamic })
+                    }) {
                         preloads.push(file);
                     }
                     taken = rest.is_empty();
@@ -1110,11 +712,7 @@ fn code_arg(lang: Lang, prog: &str, args: &[Word], preloads: &mut Vec<Word>) -> 
     }
     if !code.is_empty() {
         let dynamic = code.iter().any(|w| w.dynamic);
-        let text = code
-            .into_iter()
-            .map(|w| w.text)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let text = code.into_iter().map(|w| w.text).collect::<Vec<_>>().join("\n");
         return Code::Inline(Word { text, dynamic }, code_flag);
     }
     if stdin_mode {
@@ -1144,90 +742,41 @@ struct Options {
 }
 
 fn options(lang: Lang) -> Options {
-    let none: Options = Options {
-        code_short: &[],
-        value_short: &[],
-        attached: &[],
-        code_long: &[],
-        value_long: &[],
-        preload_short: &[],
-        preload_long: &[],
-    };
+    let none: Options = Options { code_short: &[], value_short: &[], attached: &[], code_long: &[], value_long: &[], preload_short: &[], preload_long: &[] };
     match lang {
-        Lang::Shell => Options {
-            code_short: &['c'],
-            value_short: &['o', 'O'],
-            code_long: &["--command"],
-            value_long: &["--rcfile", "--init-file"],
-            ..none
-        },
-        Lang::Python => Options {
-            code_short: &['c'],
-            value_short: &['W', 'X', 'Q'],
-            value_long: &["--check-hash-based-pycs"],
-            ..none
-        },
+        Lang::Shell => Options { code_short: &['c'], value_short: &['o', 'O'], code_long: &["--command"], value_long: &["--rcfile", "--init-file"], ..none },
+        Lang::Python => Options { code_short: &['c'], value_short: &['W', 'X', 'Q'], value_long: &["--check-hash-based-pycs"], ..none },
         Lang::Js => Options {
             code_short: &['e', 'p'],
             value_short: &['r', 'C'],
             code_long: &["--eval", "--print"],
-            value_long: &[
-                "--require",
-                "--import",
-                "--loader",
-                "--experimental-loader",
-                "--input-type",
-                "--conditions",
-            ],
+            value_long: &["--require", "--import", "--loader", "--experimental-loader", "--input-type", "--conditions"],
             preload_short: &['r'],
             preload_long: &["--require", "--import", "--loader", "--experimental-loader"],
             ..none
         },
-        Lang::Ruby => Options {
-            code_short: &['e'],
-            value_short: &['r', 'I', 'C', 'E', 'F'],
-            preload_short: &['r'],
-            ..none
-        },
-        Lang::Perl => Options {
-            code_short: &['e', 'E'],
-            attached: &['M', 'm', 'I', 'x', 'd', 'D', 'i', 'C', '0', 'l'],
-            ..none
-        },
-        Lang::Php => Options {
-            code_short: &['r'],
-            value_short: &['d', 'c', 'z'],
-            ..none
-        },
+        Lang::Ruby => Options { code_short: &['e'], value_short: &['r', 'I', 'C', 'E', 'F'], preload_short: &['r'], ..none },
+        Lang::Perl => Options { code_short: &['e', 'E'], attached: &['M', 'm', 'I', 'x', 'd', 'D', 'i', 'C', '0', 'l'], ..none },
+        Lang::Php => Options { code_short: &['r'], value_short: &['d', 'c', 'z'], ..none },
     }
 }
 
 /// A command that turns encoded data back into text or code. Its name as shown.
 fn decoder(prog: &str, args: &[&str]) -> Option<String> {
-    let short = |c: char| {
-        args.iter()
-            .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains(c))
-    };
+    let short = |c: char| args.iter().any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains(c));
     let has = |f: &str| args.contains(&f);
     let yes = match prog {
         "base64" | "base32" | "basenc" => short('d') || short('D') || has("--decode"),
         "xxd" => short('r') || has("--revert"),
         "openssl" => has("-d"),
-        "uudecode" | "gunzip" | "zcat" | "bzcat" | "xzcat" | "unxz" | "unzstd" | "zstdcat"
-        | "lz4cat" | "uncompress" | "rev" | "tr" => true,
-        "gzip" | "bzip2" | "xz" | "zstd" | "lz4" => {
-            short('d') || has("--decompress") || has("--uncompress")
-        }
-        "printf" => args
-            .first()
-            .is_some_and(|f| hidden_escapes(f) || f.contains("%b")),
+        "uudecode" | "gunzip" | "zcat" | "bzcat" | "xzcat" | "unxz" | "unzstd" | "zstdcat" | "lz4cat" | "uncompress" | "rev" | "tr" => true,
+        "gzip" | "bzip2" | "xz" | "zstd" | "lz4" => short('d') || has("--decompress") || has("--uncompress"),
+        "printf" => args.first().is_some_and(|f| hidden_escapes(f) || f.contains("%b")),
         "echo" => short('e') && args.iter().any(|a| hidden_escapes(a)),
         _ => false,
     };
     let shown = match prog {
-        "base64" | "base32" | "basenc" | "gzip" | "bzip2" | "xz" | "zstd" | "lz4" | "openssl" => {
-            format!("{prog} -d")
-        }
+        "base64" | "base32" | "basenc" | "gzip" | "bzip2" | "xz" | "zstd" | "lz4" | "openssl" => format!("{prog} -d"),
         "xxd" => "xxd -r".into(),
         "echo" => "echo -e".into(),
         _ => prog.into(),
@@ -1238,8 +787,7 @@ fn decoder(prog: &str, args: &[&str]) -> Option<String> {
 /// Escapes that spell characters by number (`\x67`, `\147`, `\u0067`).
 fn hidden_escapes(s: &str) -> bool {
     let b = s.as_bytes();
-    b.windows(2)
-        .any(|w| w[0] == b'\\' && (matches!(w[1], b'x' | b'u' | b'U') || w[1].is_ascii_digit()))
+    b.windows(2).any(|w| w[0] == b'\\' && (matches!(w[1], b'x' | b'u' | b'U') || w[1].is_ascii_digit()))
 }
 
 enum Echo {
@@ -1266,13 +814,7 @@ fn echoed(prog: &str, args: &[Word]) -> Echo {
             _ => Echo::Opaque,
         };
     }
-    let words: Vec<&str> = texts
-        .iter()
-        .copied()
-        .skip_while(|a| {
-            a.len() > 1 && a.starts_with('-') && a[1..].chars().all(|c| "neE".contains(c))
-        })
-        .collect();
+    let words: Vec<&str> = texts.iter().copied().skip_while(|a| a.len() > 1 && a.starts_with('-') && a[1..].chars().all(|c| "neE".contains(c))).collect();
     Echo::Text(words.join(" "))
 }
 

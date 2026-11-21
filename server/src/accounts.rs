@@ -112,18 +112,13 @@ impl Removed {
                 "account" => (r.account_removed, seen) = (v == "removed", true),
                 "processes" => r.processes = v.parse().unwrap_or(0),
                 "temp" => r.temp = v.parse().unwrap_or(0),
-                "work" if matches!(v, "archived" | "held" | "deleted" | "none") => {
-                    r.work = v.into()
-                }
+                "work" if matches!(v, "archived" | "held" | "deleted" | "none") => r.work = v.into(),
                 "path" if v.starts_with('/') => r.path = Some(v.into()),
                 _ => {}
             }
         }
         if !seen || r.work.is_empty() {
-            return Err(format!(
-                "superbot-userctl remove said something else: {:?}",
-                out.trim()
-            ));
+            return Err(format!("superbot-userctl remove said something else: {:?}", out.trim()));
         }
         Ok(r)
     }
@@ -199,14 +194,7 @@ impl RunAs {
     /// prompt; `-E`: the run's env (its token and its owner's keys) goes through, which
     /// the sudoers rule allows only for `superbot-run`.
     pub fn argv(&self, bin: &str, args: impl IntoIterator<Item = String>) -> Vec<OsString> {
-        let mut v: Vec<OsString> = vec![
-            self.sudo.clone().into(),
-            "-n".into(),
-            "-E".into(),
-            "-u".into(),
-            self.account.clone().into(),
-            "--".into(),
-        ];
+        let mut v: Vec<OsString> = vec![self.sudo.clone().into(), "-n".into(), "-E".into(), "-u".into(), self.account.clone().into(), "--".into()];
         v.push(self.runner.clone().into());
         v.push(bin.into());
         v.extend(args.into_iter().map(OsString::from));
@@ -214,10 +202,7 @@ impl RunAs {
     }
 
     pub fn argv_strings(&self, bin: &str, args: Vec<String>) -> (String, Vec<String>) {
-        let mut argv = self
-            .argv(bin, args)
-            .into_iter()
-            .map(|s| s.to_string_lossy().into_owned());
+        let mut argv = self.argv(bin, args).into_iter().map(|s| s.to_string_lossy().into_owned());
         (argv.next().unwrap_or_default(), argv.collect())
     }
 
@@ -236,13 +221,7 @@ impl RunAs {
             .map_err(|e| format!("couldn't start {}: {e}", self.sudo.display()))?;
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
-            return Err(format!(
-                "{} as {} failed ({}): {}",
-                script.split(';').next().unwrap_or_default(),
-                self.account,
-                out.status,
-                err.trim()
-            ));
+            return Err(format!("{} as {} failed ({}): {}", script.split(';').next().unwrap_or_default(), self.account, out.status, err.trim()));
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
@@ -253,11 +232,7 @@ impl RunAs {
     pub fn login_since(&self, home: &Path, files: &[String]) -> Result<Option<i64>, String> {
         let files = home_files(files)?;
         let out = self.shell(home, LOGIN_FILES, &files)?;
-        Ok(out
-            .lines()
-            .filter_map(|l| l.trim().parse::<i64>().ok())
-            .max()
-            .map(|s| s * 1000))
+        Ok(out.lines().filter_map(|l| l.trim().parse::<i64>().ok()).max().map(|s| s * 1000))
     }
 
     /// Logs a harness out: removes its credential `files` as the account. How many were
@@ -270,11 +245,7 @@ impl RunAs {
 
 /// Credential files are plain paths inside HOME, as machines take them.
 fn home_files(files: &[String]) -> Result<Vec<String>, String> {
-    if files.is_empty()
-        || files
-            .iter()
-            .any(|f| f.contains("..") || !crate::machines::wire::home_path(f))
-    {
+    if files.is_empty() || files.iter().any(|f| f.contains("..") || !crate::machines::wire::home_path(f)) {
         return Err("credential files must be paths inside HOME".into());
     }
     Ok(files.to_vec())
@@ -287,8 +258,7 @@ impl RunAs {
     /// runs as the account too: botd can't stop the account's processes.
     pub fn prepare(&self, mut job: JobRequest) -> Result<JobRequest, String> {
         for f in std::mem::take(&mut job.files) {
-            write_shared(&self.settings, Path::new(&f.path), &f.body)
-                .map_err(|e| format!("Couldn't write {}: {e}", f.path))?;
+            write_shared(&self.settings, Path::new(&f.path), &f.body).map_err(|e| format!("Couldn't write {}: {e}", f.path))?;
         }
         (job.bin, job.args) = self.argv_strings(&job.bin, std::mem::take(&mut job.args));
         // sudo resets PATH; superbot-run puts this one back.
@@ -297,13 +267,7 @@ impl RunAs {
         }
         if let Some(c) = job.cleanup.as_mut() {
             let check = std::mem::replace(&mut c.when_exists, c.cwd.clone());
-            let mut args = vec![
-                "-c".to_string(),
-                CLEANUP_IF_EXISTS.into(),
-                "sh".into(),
-                check,
-                std::mem::take(&mut c.bin),
-            ];
+            let mut args = vec!["-c".to_string(), CLEANUP_IF_EXISTS.into(), "sh".into(), check, std::mem::take(&mut c.bin)];
             args.append(&mut c.args);
             (c.bin, c.args) = self.argv_strings("/bin/sh", args);
             if let Some(path) = c.env.get("PATH").cloned() {
@@ -319,41 +283,23 @@ impl RunAs {
 /// botd, and must be botd's own; the file is 0640. Nobody else can write there, so the
 /// account can't swap anything in. Through the folder's ACL the account may read.
 pub fn write_shared(base: &Path, path: &Path, body: &str) -> io::Result<()> {
-    let rel = path.strip_prefix(base).map_err(|_| {
-        io::Error::other(format!("{} is outside {}", path.display(), base.display()))
-    })?;
+    let rel = path.strip_prefix(base).map_err(|_| io::Error::other(format!("{} is outside {}", path.display(), base.display())))?;
     if !trusted_dir(base) {
-        return Err(io::Error::other(format!(
-            "{} isn't a folder root made",
-            base.display()
-        )));
+        return Err(io::Error::other(format!("{} isn't a folder root made", base.display())));
     }
     let parts: Vec<_> = rel.components().collect();
-    let (Some((std::path::Component::Normal(name), dirs)), false) =
-        (parts.split_last(), parts.len() < 2)
-    else {
-        return Err(io::Error::other(format!(
-            "{} isn't a file in a Bot's folder under {}",
-            path.display(),
-            base.display()
-        )));
+    let (Some((std::path::Component::Normal(name), dirs)), false) = (parts.split_last(), parts.len() < 2) else {
+        return Err(io::Error::other(format!("{} isn't a file in a Bot's folder under {}", path.display(), base.display())));
     };
     let mut dir = base.to_path_buf();
     for d in dirs {
-        let std::path::Component::Normal(d) = d else {
-            return Err(io::Error::other("not a plain path"));
-        };
+        let std::path::Component::Normal(d) = d else { return Err(io::Error::other("not a plain path")) };
         dir.push(d);
         own_dir(&dir)?;
     }
     let tmp = dir.join(format!(".{}.tmp", name.to_string_lossy()));
     remove(&tmp);
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o640)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&tmp)?;
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o640).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
     f.write_all(body.as_bytes())?;
     // The group bits set the ACL's mask, so the account can read it whatever the umask.
     f.set_permissions(std::fs::Permissions::from_mode(0o640))?;
@@ -369,10 +315,7 @@ fn own_dir(dir: &Path) -> io::Result<()> {
     let m = std::fs::symlink_metadata(dir)?;
     // SAFETY: geteuid can't fail.
     if !m.is_dir() || m.uid() != unsafe { libc::geteuid() } {
-        return Err(io::Error::other(format!(
-            "{} isn't botd's folder",
-            dir.display()
-        )));
+        return Err(io::Error::other(format!("{} isn't botd's folder", dir.display())));
     }
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750))
 }
@@ -384,11 +327,7 @@ pub fn account(user_id: &str) -> Option<String> {
 }
 
 fn plain_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= MAX_ID
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    !id.is_empty() && id.len() <= MAX_ID && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
 /// `sb-t-<24 hex of sha256("<owner>:<teammate>")>`: the account a teammate's runs of the
@@ -400,11 +339,7 @@ pub fn teammate_account(owner: &str, teammate: &str) -> Option<String> {
         return None;
     }
     let d = sha2::Sha256::digest(format!("{owner}:{teammate}").as_bytes());
-    let hex: String = d
-        .iter()
-        .take(TEAMMATE_HEX / 2)
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let hex: String = d.iter().take(TEAMMATE_HEX / 2).map(|b| format!("{b:02x}")).collect();
     Some(format!("{TEAMMATE_PREFIX}{hex}"))
 }
 
@@ -426,45 +361,20 @@ impl Isolation {
     /// `ISOLATION=users` turns it on; unset or `off` leaves it off. On, it checks what
     /// the installer sets up, so a half-made setup stops botd instead of running Bots
     /// unisolated.
-    pub fn from_env(
-        get: impl Fn(&str) -> String,
-        bin_dir: &Path,
-        data_dir: &Path,
-    ) -> Result<Option<Isolation>, String> {
+    pub fn from_env(get: impl Fn(&str) -> String, bin_dir: &Path, data_dir: &Path) -> Result<Option<Isolation>, String> {
         match get("ISOLATION").trim() {
             "" | "off" => return Ok(None),
             "users" => {}
             other => return Err(format!("ISOLATION must be off or users, not {other:?}")),
         }
-        let or = |k: &str, d: &str| {
-            Some(get(k))
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| d.into())
-        };
+        let or = |k: &str, d: &str| Some(get(k)).map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).unwrap_or_else(|| d.into());
         let root = PathBuf::from(or("ISOLATION_DIR", DEFAULT_DIR));
-        if !root.is_absolute()
-            || root
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-            || root.parent().is_none()
-        {
-            return Err(format!(
-                "ISOLATION_DIR must be an absolute folder below /, not {}",
-                root.display()
-            ));
+        if !root.is_absolute() || root.components().any(|c| matches!(c, std::path::Component::ParentDir)) || root.parent().is_none() {
+            return Err(format!("ISOLATION_DIR must be an absolute folder below /, not {}", root.display()));
         }
-        let meta = std::fs::symlink_metadata(&root).map_err(|e| {
-            format!(
-                "ISOLATION_DIR {}: {e}. Run deploy/install.sh --isolation.",
-                root.display()
-            )
-        })?;
+        let meta = std::fs::symlink_metadata(&root).map_err(|e| format!("ISOLATION_DIR {}: {e}. Run deploy/install.sh --isolation.", root.display()))?;
         if !meta.is_dir() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
-            return Err(format!(
-                "ISOLATION_DIR {} must be a folder owned by root that only root can write",
-                root.display()
-            ));
+            return Err(format!("ISOLATION_DIR {} must be a folder owned by root that only root can write", root.display()));
         }
         let data = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
         if data.starts_with(&root) || root.starts_with(&data) {
@@ -476,24 +386,13 @@ impl Isolation {
             runner: bin_dir.join("superbot-run"),
             userctl: or("ISOLATION_USERCTL", DEFAULT_USERCTL).into(),
             teammates: false,
-            offboard: crate::machines::offboard::Settings::from_vars(
-                &get,
-                "ISOLATION_TEAMMATE_FILES",
-                "ISOLATION_TEAMMATE_FILES_DAYS",
-            )?,
+            offboard: crate::machines::offboard::Settings::from_vars(&get, "ISOLATION_TEAMMATE_FILES", "ISOLATION_TEAMMATE_FILES_DAYS")?,
             passwd: PASSWD.into(),
             setup: Default::default(),
         };
-        for (what, p) in [
-            ("sudo", &iso.sudo),
-            ("superbot-run", &iso.runner),
-            ("superbot-userctl", &iso.userctl),
-        ] {
+        for (what, p) in [("sudo", &iso.sudo), ("superbot-run", &iso.runner), ("superbot-userctl", &iso.userctl)] {
             if !p.is_file() {
-                return Err(format!(
-                    "{what} isn't at {}. Run deploy/install.sh --isolation.",
-                    p.display()
-                ));
+                return Err(format!("{what} isn't at {}. Run deploy/install.sh --isolation.", p.display()));
             }
         }
         Ok(Some(iso))
@@ -567,20 +466,12 @@ impl Isolation {
     /// ACL; anything else the account left in its place (a link, a file) is removed first,
     /// so the run starts in a real folder. botd never writes in it.
     pub fn make_bot_dirs_in(&self, space: Space, bot_id: &str) -> io::Result<()> {
-        let (Some(state), Some(settings)) = (
-            self.bot_state_in(space, bot_id),
-            self.bot_settings_in(space, bot_id),
-        ) else {
-            return Err(io::Error::other(format!(
-                "{space:?} or {bot_id:?} can't name a folder"
-            )));
+        let (Some(state), Some(settings)) = (self.bot_state_in(space, bot_id), self.bot_settings_in(space, bot_id)) else {
+            return Err(io::Error::other(format!("{space:?} or {bot_id:?} can't name a folder")));
         };
         for p in [&state, &settings] {
             if !p.parent().is_some_and(trusted_dir) {
-                return Err(io::Error::other(format!(
-                    "{} isn't a folder root made",
-                    p.parent().unwrap_or(p).display()
-                )));
+                return Err(io::Error::other(format!("{} isn't a folder root made", p.parent().unwrap_or(p).display())));
             }
         }
         if std::fs::symlink_metadata(&state).is_ok_and(|m| !m.is_dir()) {
@@ -617,18 +508,11 @@ impl Isolation {
     /// there, made by root. An account made before a folder was added isn't ready, so
     /// the helper runs again and adds it.
     pub fn ready_in(&self, space: Space) -> bool {
-        let (Some(name), Some(home), Some(root)) =
-            (space.account(), self.home_in(space), self.space_root(space))
-        else {
-            return false;
-        };
-        let made_by_root =
-            |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir() && m.uid() == 0);
+        let (Some(name), Some(home), Some(root)) = (space.account(), self.home_in(space), self.space_root(space)) else { return false };
+        let made_by_root = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir() && m.uid() == 0);
         passwd::by_name(&name).is_some_and(|a| a.uid != 0 && a.home == home)
             && made_by_root(&root)
-            && ["memory", "bots", "settings"]
-                .iter()
-                .all(|d| trusted_dir(&root.join(d)))
+            && ["memory", "bots", "settings"].iter().all(|d| trusted_dir(&root.join(d)))
     }
 
     #[cfg(test)]
@@ -640,9 +524,7 @@ impl Isolation {
     /// (`superbot-userctl ensure <id>`, or `ensure <owner> <teammate>`). Ok(true): made
     /// now. Blocking.
     pub fn ensure_in(&self, space: Space) -> Result<bool, String> {
-        space
-            .account()
-            .ok_or_else(|| format!("{space:?} can't be part of a Unix account name"))?;
+        space.account().ok_or_else(|| format!("{space:?} can't be part of a Unix account name"))?;
         let _one = self.setup.lock().unwrap_or_else(|e| e.into_inner());
         if self.ready_in(space) {
             return Ok(false);
@@ -658,20 +540,10 @@ impl Isolation {
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
             let last = err.trim().lines().last().unwrap_or_default();
-            return Err(format!(
-                "superbot-userctl ensure failed ({}){}",
-                out.status,
-                if last.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {last}")
-                }
-            ));
+            return Err(format!("superbot-userctl ensure failed ({}){}", out.status, if last.is_empty() { String::new() } else { format!(": {last}") }));
         }
         if !self.ready_in(space) {
-            return Err(
-                "superbot-userctl ran, but the account or its folders still aren't there".into(),
-            );
+            return Err("superbot-userctl ran, but the account or its folders still aren't there".into());
         }
         Ok(true)
     }
@@ -680,9 +552,7 @@ impl Isolation {
     /// in the password database whose home is the one `superbot-userctl ensure` gives that
     /// pair, and whose name is the one it derives from them. Nothing else counts.
     pub fn teammate_pairs(&self) -> Vec<(String, String)> {
-        let Ok(text) = std::fs::read_to_string(&self.passwd) else {
-            return vec![];
-        };
+        let Ok(text) = std::fs::read_to_string(&self.passwd) else { return vec![] };
         let mut out: Vec<(String, String)> = text
             .lines()
             .filter_map(|l| {
@@ -693,17 +563,11 @@ impl Isolation {
                 }
                 let dir = Path::new(home).strip_prefix(&self.root).ok()?;
                 let mut parts = dir.components();
-                let (
-                    Some(std::path::Component::Normal(pair)),
-                    Some(std::path::Component::Normal(h)),
-                    None,
-                ) = (parts.next(), parts.next(), parts.next())
-                else {
+                let (Some(std::path::Component::Normal(pair)), Some(std::path::Component::Normal(h)), None) = (parts.next(), parts.next(), parts.next()) else {
                     return None;
                 };
                 let (owner, teammate) = pair.to_str()?.split_once('-')?;
-                (h == "home" && teammate_account(owner, teammate).as_deref() == Some(name))
-                    .then(|| (owner.to_string(), teammate.to_string()))
+                (h == "home" && teammate_account(owner, teammate).as_deref() == Some(name)).then(|| (owner.to_string(), teammate.to_string()))
             })
             .collect();
         out.sort();
@@ -715,22 +579,9 @@ impl Isolation {
     /// the root helper (`superbot-userctl remove`), dealing with their workspace as `work`
     /// says. Safe to run again: what's gone stays gone. Never a user's own account: the
     /// helper takes two different ids and derives the account itself. Blocking.
-    pub fn remove_teammate(
-        &self,
-        owner: &str,
-        teammate: &str,
-        cleanup_id: &str,
-        work: &Work,
-    ) -> Result<Removed, String> {
-        Space::Teammate { owner, teammate }
-            .account()
-            .ok_or("those ids can't name a teammate account")?;
-        let mut args = vec![
-            "remove".to_string(),
-            owner.into(),
-            teammate.into(),
-            cleanup_id.into(),
-        ];
+    pub fn remove_teammate(&self, owner: &str, teammate: &str, cleanup_id: &str, work: &Work) -> Result<Removed, String> {
+        Space::Teammate { owner, teammate }.account().ok_or("those ids can't name a teammate account")?;
+        let mut args = vec!["remove".to_string(), owner.into(), teammate.into(), cleanup_id.into()];
         match work {
             Work::Archive(name) => args.extend(["archive".to_string(), name.clone()]),
             Work::Hold => args.push("hold".into()),
@@ -760,20 +611,8 @@ impl Isolation {
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
             let last = err.trim().lines().last().unwrap_or_default();
-            let hint = if last.starts_with("sudo:") {
-                ". Re-run deploy/install.sh --isolation: its sudoers rule lets botd remove accounts"
-            } else {
-                ""
-            };
-            return Err(format!(
-                "superbot-userctl {what} failed ({}){}{hint}",
-                out.status,
-                if last.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {last}")
-                }
-            ));
+            let hint = if last.starts_with("sudo:") { ". Re-run deploy/install.sh --isolation: its sudoers rule lets botd remove accounts" } else { "" };
+            return Err(format!("superbot-userctl {what} failed ({}){}{hint}", out.status, if last.is_empty() { String::new() } else { format!(": {last}") }));
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
@@ -795,16 +634,12 @@ pub fn close_to_others(paths: &[PathBuf]) -> Vec<String> {
     let me = unsafe { libc::geteuid() };
     let mut open = Vec::new();
     for p in paths {
-        let Ok(m) = std::fs::metadata(p) else {
-            continue;
-        };
+        let Ok(m) = std::fs::metadata(p) else { continue };
         let mode = m.permissions().mode();
         if mode & 0o007 == 0 {
             continue;
         }
-        if m.uid() != me
-            || std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode & 0o7770)).is_err()
-        {
+        if m.uid() != me || std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode & 0o7770)).is_err() {
             open.push(p.display().to_string());
         }
     }
@@ -825,11 +660,7 @@ pub fn read_plain(path: &Path, max: u64) -> Option<String> {
     if !path.parent().is_some_and(trusted_dir) {
         return None;
     }
-    let mut f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .ok()?;
+    let mut f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path).ok()?;
     let m = f.metadata().ok()?;
     if !m.is_file() || m.len() > max {
         return None;
@@ -843,18 +674,10 @@ pub fn read_plain(path: &Path, max: u64) -> Option<String> {
 /// already. Never follows a link. Ok(true) if it wrote.
 pub fn seed(path: &Path, text: &str) -> io::Result<bool> {
     if !path.parent().is_some_and(trusted_dir) {
-        return Err(io::Error::other(format!(
-            "{} isn't a folder botd made",
-            path.parent().unwrap_or(path).display()
-        )));
+        return Err(io::Error::other(format!("{} isn't a folder botd made", path.parent().unwrap_or(path).display())));
     }
     // The run's account edits it in place, through the folder's inherited ACL.
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o660)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path);
+    let f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o660).custom_flags(libc::O_NOFOLLOW).open(path);
     match f {
         Ok(mut f) => {
             f.write_all(text.as_bytes())?;
@@ -876,7 +699,7 @@ pub fn remove(path: &Path) {
 /// Admin API: a user's account, making it now, and logging a harness in as them
 /// (`botctl user isolation | isolate | harness-login`). Under `/api/users`, so admins only.
 pub mod http {
-    use super::{HARNESSES, Isolation, LOGINS, Space, account};
+    use super::{Isolation, Space, HARNESSES, LOGINS, account};
     use crate::audit::Who;
     use crate::users::need_user_key;
     use crate::{ApiError, AppState, Res, bad};
@@ -892,10 +715,7 @@ pub mod http {
     }
 
     fn failed(user: &str, e: String) -> ApiError {
-        ApiError(
-            StatusCode::BAD_GATEWAY,
-            format!("Couldn't set up {user}'s account: {e}"),
-        )
+        ApiError(StatusCode::BAD_GATEWAY, format!("Couldn't set up {user}'s account: {e}"))
     }
 
     fn view(iso: &Isolation, user_id: &str) -> Value {
@@ -918,19 +738,13 @@ pub mod http {
     /// `POST /api/users/{key}/isolation`: makes the user's account and folders now
     /// rather than at their first run. Only for active users: a disabled one holds no
     /// seat (ADR 0038) and their Bots can't run.
-    pub async fn ensure(
-        State(app): State<AppState>,
-        Extension(by): Extension<Who>,
-        UrlPath(key): UrlPath<String>,
-    ) -> Res {
+    pub async fn ensure(State(app): State<AppState>, Extension(by): Extension<Who>, UrlPath(key): UrlPath<String>) -> Res {
         let iso = need_on(&app)?;
         let u = need_user_key(&app, &key)?;
         if !u.active() {
             return Err(bad("That user is disabled"));
         }
-        app.ensure_account(&u.id, &by)
-            .await
-            .map_err(|e| failed(&u.id, e))?;
+        app.ensure_account(&u.id, &by).await.map_err(|e| failed(&u.id, e))?;
         Ok(Json(view(&iso, &u.id)))
     }
 
@@ -962,9 +776,7 @@ pub mod http {
                 }
                 let o = need_user_key(&app, o)?;
                 if o.id == u.id {
-                    return Err(bad(
-                        "owner is the user themself: leave it out for their own login",
-                    ));
+                    return Err(bad("owner is the user themself: leave it out for their own login"));
                 }
                 if !o.active() {
                     return Err(bad("That owner is disabled"));
@@ -977,10 +789,7 @@ pub mod http {
             Some(_) => return Err(bad("owner must be a user id, email or name")),
         };
         let harness = v["harness"].as_str().unwrap_or_default();
-        let adapter = LOGINS
-            .contains(&harness)
-            .then(|| crate::adapters::get(harness))
-            .flatten();
+        let adapter = LOGINS.contains(&harness).then(|| crate::adapters::get(harness)).flatten();
         let (bin, default) = adapter
             .and_then(|a| Some((a.bin(), a.login_args()?)))
             .ok_or_else(|| bad(format!("harness must be one of: {}", LOGINS.join(", "))))?;
@@ -989,29 +798,18 @@ pub mod http {
             None | Some(Value::Null) => default.iter().map(|s| s.to_string()).collect(),
             Some(Value::Array(a)) if a.len() <= 16 => a
                 .iter()
-                .map(|x| {
-                    x.as_str()
-                        .filter(|s| s.len() <= 200 && !s.contains('\0'))
-                        .map(String::from)
-                })
+                .map(|x| x.as_str().filter(|s| s.len() <= 200 && !s.contains('\0')).map(String::from))
                 .collect::<Option<_>>()
                 .ok_or_else(|| bad("args must be up to 16 strings"))?,
             _ => return Err(bad("args must be up to 16 strings")),
         };
         let space = match &owner {
-            Some(o) => Space::Teammate {
-                owner: o,
-                teammate: &u.id,
-            },
+            Some(o) => Space::Teammate { owner: o, teammate: &u.id },
             None => Space::User(&u.id),
         };
-        let run_as = app
-            .ensure_space(space, &by)
-            .await
-            .map_err(|e| failed(&u.id, e))?;
+        let run_as = app.ensure_space(space, &by).await.map_err(|e| failed(&u.id, e))?;
         // Not the arguments: they could hold a key.
-        let mut details =
-            json!({ "harness": harness, "account": run_as.account, "customArgs": custom });
+        let mut details = json!({ "harness": harness, "account": run_as.account, "customArgs": custom });
         let target = match &owner {
             Some(o) => {
                 details["forUser"] = json!(u.id);
@@ -1019,20 +817,10 @@ pub mod http {
             }
             None => &u.id,
         };
-        app.db.record(
-            &by.event("harness.login_started")
-                .target("user", target)
-                .details(details),
-        );
-        let command: Vec<String> = run_as
-            .argv(bin, args)
-            .into_iter()
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect();
+        app.db.record(&by.event("harness.login_started").target("user", target).details(details));
+        let command: Vec<String> = run_as.argv(bin, args).into_iter().map(|s| s.to_string_lossy().into_owned()).collect();
         let home = iso.home_in(space);
-        Ok(Json(
-            json!({ "user": u.id, "owner": owner, "account": run_as.account, "harness": harness, "home": home, "command": command }),
-        ))
+        Ok(Json(json!({ "user": u.id, "owner": owner, "account": run_as.account, "harness": harness, "home": home, "command": command })))
     }
 }
 
@@ -1059,18 +847,7 @@ mod tests {
         assert_eq!(account("u1a2b3c4d").as_deref(), Some("sb-u-u1a2b3c4d"));
         assert_eq!(account("operator").as_deref(), Some("sb-u-operator"));
         assert_eq!(account(&"a".repeat(27)).map(|a| a.len()), Some(32));
-        for bad in [
-            "",
-            "..",
-            "../u2",
-            "a/b",
-            "U1",
-            "a-b",
-            "a b",
-            "root;id",
-            "a\0b",
-            &"a".repeat(28),
-        ] {
+        for bad in ["", "..", "../u2", "a/b", "U1", "a-b", "a b", "root;id", "a\0b", &"a".repeat(28)] {
             assert_eq!(account(bad), None, "{bad:?}");
         }
     }
@@ -1078,22 +855,10 @@ mod tests {
     #[test]
     fn each_users_folders_stay_under_their_own_root() {
         let iso = for_tests(Path::new("/srv/superbot/users"), DEFAULT_SUDO);
-        assert_eq!(
-            iso.home("u1").unwrap(),
-            Path::new("/srv/superbot/users/u1/home")
-        );
-        assert_eq!(
-            iso.workspace("u1").unwrap(),
-            Path::new("/srv/superbot/users/u1/workspace")
-        );
-        assert_eq!(
-            iso.user_file("u1").unwrap(),
-            Path::new("/srv/superbot/users/u1/memory/USER.md")
-        );
-        assert_eq!(
-            iso.memory_file("u1", "b1").unwrap(),
-            Path::new("/srv/superbot/users/u1/memory/b1.md")
-        );
+        assert_eq!(iso.home("u1").unwrap(), Path::new("/srv/superbot/users/u1/home"));
+        assert_eq!(iso.workspace("u1").unwrap(), Path::new("/srv/superbot/users/u1/workspace"));
+        assert_eq!(iso.user_file("u1").unwrap(), Path::new("/srv/superbot/users/u1/memory/USER.md"));
+        assert_eq!(iso.memory_file("u1", "b1").unwrap(), Path::new("/srv/superbot/users/u1/memory/b1.md"));
         for bad in ["", "..", "../u2", "a/b", "/etc", "U1"] {
             assert_eq!(iso.user_root(bad), None, "{bad:?}");
             assert_eq!(iso.home(bad), None, "{bad:?}");
@@ -1107,29 +872,10 @@ mod tests {
     #[test]
     fn a_run_starts_only_as_its_owners_account() {
         let iso = for_tests(Path::new("/srv/superbot/users"), DEFAULT_SUDO);
-        let argv = iso
-            .run_as("ub")
-            .unwrap()
-            .argv("claude", ["-p".to_string(), "--".into(), "-u root".into()]);
-        let want: Vec<OsString> = [
-            "/usr/bin/sudo",
-            "-n",
-            "-E",
-            "-u",
-            "sb-u-ub",
-            "--",
-            "/usr/local/bin/superbot-run",
-            "claude",
-            "-p",
-            "--",
-            "-u root",
-        ]
-        .map(OsString::from)
-        .into();
-        assert_eq!(
-            argv, want,
-            "the account is fixed before `--`; nothing the run passes can change it"
-        );
+        let argv = iso.run_as("ub").unwrap().argv("claude", ["-p".to_string(), "--".into(), "-u root".into()]);
+        let want: Vec<OsString> =
+            ["/usr/bin/sudo", "-n", "-E", "-u", "sb-u-ub", "--", "/usr/local/bin/superbot-run", "claude", "-p", "--", "-u root"].map(OsString::from).into();
+        assert_eq!(argv, want, "the account is fixed before `--`; nothing the run passes can change it");
     }
 
     #[test]
@@ -1149,16 +895,9 @@ mod tests {
         assert!(parse("off", "").unwrap().is_none());
         assert!(parse("on", "").unwrap_err().contains("off or users"));
         for dir in ["relative/dir", "/srv/../etc", "/"] {
-            assert!(
-                parse("users", dir).unwrap_err().contains("absolute"),
-                "{dir}"
-            );
+            assert!(parse("users", dir).unwrap_err().contains("absolute"), "{dir}");
         }
-        assert!(
-            parse("users", "/no/such/superbot/dir")
-                .unwrap_err()
-                .contains("install.sh --isolation")
-        );
+        assert!(parse("users", "/no/such/superbot/dir").unwrap_err().contains("install.sh --isolation"));
         // A folder botd's own account can write: refused, or its Bots could plant files there.
         let mine = tmp.join("users");
         std::fs::create_dir_all(&mine).unwrap();
@@ -1169,27 +908,11 @@ mod tests {
     #[test]
     fn what_the_helper_says_it_removed_is_read_strictly() {
         let r = Removed::parse("account=removed\nprocesses=2\ntemp=3\nwork=archived\npath=/srv/u/a1/workspace/from-teammates/bea\n").unwrap();
-        assert_eq!(
-            (r.account_removed, r.processes, r.temp, r.work.as_str()),
-            (true, 2, 3, "archived")
-        );
-        assert_eq!(
-            r.path.as_deref(),
-            Some("/srv/u/a1/workspace/from-teammates/bea")
-        );
-        let gone =
-            Removed::parse("account=absent\nprocesses=0\ntemp=0\nwork=none\npath=relative\n")
-                .unwrap();
-        assert_eq!(
-            (gone.account_removed, gone.work.as_str(), gone.path),
-            (false, "none", None)
-        );
-        for bad in [
-            "",
-            "sb-t-x /home",
-            "account=removed\n",
-            "account=removed\nwork=moved\n",
-        ] {
+        assert_eq!((r.account_removed, r.processes, r.temp, r.work.as_str()), (true, 2, 3, "archived"));
+        assert_eq!(r.path.as_deref(), Some("/srv/u/a1/workspace/from-teammates/bea"));
+        let gone = Removed::parse("account=absent\nprocesses=0\ntemp=0\nwork=none\npath=relative\n").unwrap();
+        assert_eq!((gone.account_removed, gone.work.as_str(), gone.path), (false, "none", None));
+        for bad in ["", "sb-t-x /home", "account=removed\n", "account=removed\nwork=moved\n"] {
             assert!(Removed::parse(bad).is_err(), "{bad:?}");
         }
     }
@@ -1204,28 +927,12 @@ mod tests {
         std::fs::write(&sudo, format!("#!/bin/sh\necho \"$*\" >> {}\necho account=removed\necho work=held\necho purged=yes\n", log.display())).unwrap();
         std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
         let iso = for_tests(&dir, sudo.to_str().unwrap());
-        assert_eq!(
-            iso.remove_teammate(
-                "a1",
-                "b2",
-                "c0ffee0123456789",
-                &Work::Archive("bea-2026-01-01".into())
-            )
-            .unwrap()
-            .work,
-            "held"
-        );
-        iso.remove_teammate("a1", "b2", "c0ffee0123456789", &Work::Hold)
-            .unwrap();
-        iso.remove_teammate("a1", "b2", "c0ffee0123456789", &Work::Delete)
-            .unwrap();
+        assert_eq!(iso.remove_teammate("a1", "b2", "c0ffee0123456789", &Work::Archive("bea-2026-01-01".into())).unwrap().work, "held");
+        iso.remove_teammate("a1", "b2", "c0ffee0123456789", &Work::Hold).unwrap();
+        iso.remove_teammate("a1", "b2", "c0ffee0123456789", &Work::Delete).unwrap();
         assert!(iso.purge("c0ffee0123456789").unwrap());
         for (o, t) in [("a1", "a1"), ("a1", ""), ("a1", "../b2"), ("A1", "b2")] {
-            assert!(
-                iso.remove_teammate(o, t, "c0ffee0123456789", &Work::Delete)
-                    .is_err(),
-                "{o} {t}"
-            );
+            assert!(iso.remove_teammate(o, t, "c0ffee0123456789", &Work::Delete).is_err(), "{o} {t}");
         }
         let args = std::fs::read_to_string(&log).unwrap();
         let u = DEFAULT_USERCTL;
@@ -1238,22 +945,10 @@ mod tests {
 
         // An old sudoers rule that allows only `ensure`: says how to fix it.
         let iso = for_tests(&dir, "/bin/false");
-        assert!(
-            iso.remove_teammate("a1", "b2", "c0ffee0123456789", &Work::Hold)
-                .unwrap_err()
-                .contains("remove failed")
-        );
-        std::fs::write(
-            &sudo,
-            "#!/bin/sh\necho 'sudo: a password is required' >&2\nexit 1\n",
-        )
-        .unwrap();
+        assert!(iso.remove_teammate("a1", "b2", "c0ffee0123456789", &Work::Hold).unwrap_err().contains("remove failed"));
+        std::fs::write(&sudo, "#!/bin/sh\necho 'sudo: a password is required' >&2\nexit 1\n").unwrap();
         let iso = for_tests(&dir, sudo.to_str().unwrap());
-        assert!(
-            iso.purge("c0ffee0123456789")
-                .unwrap_err()
-                .contains("install.sh --isolation")
-        );
+        assert!(iso.purge("c0ffee0123456789").unwrap_err().contains("install.sh --isolation"));
     }
 
     #[test]
@@ -1266,19 +961,9 @@ mod tests {
                 _ => String::new(),
             }
         };
-        let s = crate::machines::offboard::Settings::from_vars(
-            &get("delete", "3"),
-            "ISOLATION_TEAMMATE_FILES",
-            "ISOLATION_TEAMMATE_FILES_DAYS",
-        )
-        .unwrap();
+        let s = crate::machines::offboard::Settings::from_vars(&get("delete", "3"), "ISOLATION_TEAMMATE_FILES", "ISOLATION_TEAMMATE_FILES_DAYS").unwrap();
         assert_eq!((s.files, s.grace_days), (Files::Delete, 3));
-        let err = crate::machines::offboard::Settings::from_vars(
-            &get("keep", ""),
-            "ISOLATION_TEAMMATE_FILES",
-            "ISOLATION_TEAMMATE_FILES_DAYS",
-        )
-        .unwrap_err();
+        let err = crate::machines::offboard::Settings::from_vars(&get("keep", ""), "ISOLATION_TEAMMATE_FILES", "ISOLATION_TEAMMATE_FILES_DAYS").unwrap_err();
         assert!(err.starts_with("ISOLATION_TEAMMATE_FILES must"), "{err}");
     }
 
@@ -1292,48 +977,25 @@ mod tests {
         std::fs::create_dir_all(&mem).unwrap();
 
         std::fs::write(mem.join("b1.md"), "# B1").unwrap();
-        assert_eq!(
-            read_plain(&mem.join("b1.md"), MAX_FILE).as_deref(),
-            Some("# B1")
-        );
+        assert_eq!(read_plain(&mem.join("b1.md"), MAX_FILE).as_deref(), Some("# B1"));
         symlink(&secret, mem.join("b2.md")).unwrap();
-        assert_eq!(
-            read_plain(&mem.join("b2.md"), MAX_FILE),
-            None,
-            "a link is never followed"
-        );
-        assert!(
-            !seed(&mem.join("b2.md"), "x").unwrap(),
-            "nor written through"
-        );
+        assert_eq!(read_plain(&mem.join("b2.md"), MAX_FILE), None, "a link is never followed");
+        assert!(!seed(&mem.join("b2.md"), "x").unwrap(), "nor written through");
         assert_eq!(std::fs::read_to_string(&secret).unwrap(), "botd only");
         remove(&mem.join("b2.md"));
-        assert!(
-            std::fs::symlink_metadata(mem.join("b2.md")).is_err() && secret.exists(),
-            "removing drops the link, not its target"
-        );
+        assert!(std::fs::symlink_metadata(mem.join("b2.md")).is_err() && secret.exists(), "removing drops the link, not its target");
 
         let fifo = std::ffi::CString::new(mem.join("b3.md").to_str().unwrap()).unwrap();
         // SAFETY: a valid path.
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        assert_eq!(
-            read_plain(&mem.join("b3.md"), MAX_FILE),
-            None,
-            "a pipe isn't waited on"
-        );
+        assert_eq!(read_plain(&mem.join("b3.md"), MAX_FILE), None, "a pipe isn't waited on");
         std::fs::write(mem.join("big.md"), "x".repeat(11)).unwrap();
         assert_eq!(read_plain(&mem.join("big.md"), 10), None);
 
         assert!(seed(&mem.join("b4.md"), "# B4").unwrap());
-        assert!(
-            !seed(&mem.join("b4.md"), "other").unwrap(),
-            "never overwrites"
-        );
+        assert!(!seed(&mem.join("b4.md"), "other").unwrap(), "never overwrites");
         assert_eq!(std::fs::read_to_string(mem.join("b4.md")).unwrap(), "# B4");
-        assert_eq!(
-            std::fs::metadata(mem.join("b4.md")).unwrap().mode() & 0o777,
-            0o660
-        );
+        assert_eq!(std::fs::metadata(mem.join("b4.md")).unwrap().mode() & 0o777, 0o660);
 
         // A folder swapped for a link: nothing in it is read or written.
         let swapped = dir.join("swapped");
@@ -1350,8 +1012,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("data")).unwrap();
         std::fs::write(dir.join(".env"), "AUTH_PASSWORD=x\n").unwrap();
-        std::fs::set_permissions(dir.join("data"), std::fs::Permissions::from_mode(0o2755))
-            .unwrap();
+        std::fs::set_permissions(dir.join("data"), std::fs::Permissions::from_mode(0o2755)).unwrap();
         std::fs::set_permissions(dir.join(".env"), std::fs::Permissions::from_mode(0o644)).unwrap();
         let paths = [dir.join("data"), dir.join(".env"), dir.join("missing")];
         assert!(close_to_others(&paths).is_empty());
@@ -1367,18 +1028,9 @@ mod tests {
     #[test]
     fn pi_and_hermes_get_their_own_folders_in_the_owners() {
         let iso = for_tests(Path::new("/srv/superbot/users"), DEFAULT_SUDO);
-        assert_eq!(
-            iso.bot_state("u1", "b1").unwrap(),
-            Path::new("/srv/superbot/users/u1/bots/b1")
-        );
-        assert_eq!(
-            iso.bot_settings("u1", "b1").unwrap(),
-            Path::new("/srv/superbot/users/u1/settings/b1")
-        );
-        assert_eq!(
-            iso.run_as("u1").unwrap().settings,
-            Path::new("/srv/superbot/users/u1/settings")
-        );
+        assert_eq!(iso.bot_state("u1", "b1").unwrap(), Path::new("/srv/superbot/users/u1/bots/b1"));
+        assert_eq!(iso.bot_settings("u1", "b1").unwrap(), Path::new("/srv/superbot/users/u1/settings/b1"));
+        assert_eq!(iso.run_as("u1").unwrap().settings, Path::new("/srv/superbot/users/u1/settings"));
         for bad in ["", "..", "a/b"] {
             assert_eq!(iso.bot_state("u1", bad), None, "{bad:?}");
             assert_eq!(iso.bot_settings("u1", bad), None, "{bad:?}");
@@ -1395,10 +1047,7 @@ mod tests {
         let root = crate::db::temp_path("bot-dirs");
         let iso = for_tests(&root, DEFAULT_SUDO);
         let elsewhere = crate::db::temp_path("bot-dirs-elsewhere");
-        assert!(
-            iso.make_bot_dirs("u1", "b1").is_err(),
-            "no folders from root yet"
-        );
+        assert!(iso.make_bot_dirs("u1", "b1").is_err(), "no folders from root yet");
         for d in ["bots", "settings"] {
             std::fs::create_dir_all(root.join("u1").join(d)).unwrap();
         }
@@ -1422,17 +1071,8 @@ mod tests {
         let root = crate::db::temp_path("prepare");
         let settings = root.join("u1/settings");
         std::fs::create_dir_all(&settings).unwrap();
-        let run_as = RunAs {
-            sudo: "/usr/bin/sudo".into(),
-            runner: "/opt/superbot/bin/superbot-run".into(),
-            account: "sb-u-u1".into(),
-            settings: settings.clone(),
-            teammate: None,
-        };
-        let file = |p: &Path| JobFile {
-            path: p.display().to_string(),
-            body: "{}".into(),
-        };
+        let run_as = RunAs { sudo: "/usr/bin/sudo".into(), runner: "/opt/superbot/bin/superbot-run".into(), account: "sb-u-u1".into(), settings: settings.clone(), teammate: None };
+        let file = |p: &Path| JobFile { path: p.display().to_string(), body: "{}".into() };
         let state = root.join("u1/bots/b1");
         let job = JobRequest {
             protocol: PROTOCOL,
@@ -1445,10 +1085,7 @@ mod tests {
             env: BTreeMap::from([("PATH".into(), "/usr/local/bin:/usr/bin".into())]),
             cwd: root.join("u1/workspace").display().to_string(),
             stdin: None,
-            files: vec![
-                file(&settings.join("b1/superbot-guard.ts")),
-                file(&settings.join("b1/hermes-managed/config.yaml")),
-            ],
+            files: vec![file(&settings.join("b1/superbot-guard.ts")), file(&settings.join("b1/hermes-managed/config.yaml"))],
             cleanup: Some(JobCleanup {
                 when_exists: state.join("hermes/gateway.pid").display().to_string(),
                 bin: "hermes".into(),
@@ -1462,87 +1099,26 @@ mod tests {
         };
         let ready = run_as.prepare(job.clone()).unwrap();
         assert!(ready.files.is_empty(), "botd wrote them already");
-        for (p, mode) in [
-            ("b1", 0o750),
-            ("b1/hermes-managed", 0o750),
-            ("b1/superbot-guard.ts", 0o640),
-            ("b1/hermes-managed/config.yaml", 0o640),
-        ] {
-            assert_eq!(
-                std::fs::symlink_metadata(settings.join(p)).unwrap().mode() & 0o777,
-                mode,
-                "{p}"
-            );
+        for (p, mode) in [("b1", 0o750), ("b1/hermes-managed", 0o750), ("b1/superbot-guard.ts", 0o640), ("b1/hermes-managed/config.yaml", 0o640)] {
+            assert_eq!(std::fs::symlink_metadata(settings.join(p)).unwrap().mode() & 0o777, mode, "{p}");
         }
         assert_eq!(ready.bin, "/usr/bin/sudo");
-        assert_eq!(
-            ready.args[..7],
-            [
-                "-n",
-                "-E",
-                "-u",
-                "sb-u-u1",
-                "--",
-                "/opt/superbot/bin/superbot-run",
-                "hermes"
-            ]
-        );
+        assert_eq!(ready.args[..7], ["-n", "-E", "-u", "sb-u-u1", "--", "/opt/superbot/bin/superbot-run", "hermes"]);
         assert_eq!(ready.env["SUPERBOT_PATH"], "/usr/local/bin:/usr/bin");
         let c = ready.cleanup.unwrap();
-        assert_eq!(
-            c.when_exists,
-            state.display().to_string(),
-            "botd checks only the folder it made"
-        );
+        assert_eq!(c.when_exists, state.display().to_string(), "botd checks only the folder it made");
         assert_eq!(c.bin, "/usr/bin/sudo");
-        assert_eq!(
-            c.args[..10],
-            [
-                "-n",
-                "-E",
-                "-u",
-                "sb-u-u1",
-                "--",
-                "/opt/superbot/bin/superbot-run",
-                "/bin/sh",
-                "-c",
-                CLEANUP_IF_EXISTS,
-                "sh"
-            ]
-        );
-        assert_eq!(
-            c.args[10..],
-            [
-                state.join("hermes/gateway.pid").display().to_string(),
-                "hermes".into(),
-                "gateway".into(),
-                "stop".into()
-            ]
-        );
+        assert_eq!(c.args[..10], ["-n", "-E", "-u", "sb-u-u1", "--", "/opt/superbot/bin/superbot-run", "/bin/sh", "-c", CLEANUP_IF_EXISTS, "sh"]);
+        assert_eq!(c.args[10..], [state.join("hermes/gateway.pid").display().to_string(), "hermes".into(), "gateway".into(), "stop".into()]);
         assert_eq!(c.env["SUPERBOT_PATH"], "/usr/bin");
 
         // The check really runs the cleanup only when the file is there.
-        let sh = |path: &Path| {
-            Command::new("/bin/sh")
-                .args(["-c", CLEANUP_IF_EXISTS, "sh"])
-                .arg(path)
-                .args(["echo", "ran"])
-                .output()
-                .unwrap()
-        };
-        assert_eq!(
-            String::from_utf8_lossy(&sh(&root.join("missing")).stdout),
-            ""
-        );
+        let sh = |path: &Path| Command::new("/bin/sh").args(["-c", CLEANUP_IF_EXISTS, "sh"]).arg(path).args(["echo", "ran"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&sh(&root.join("missing")).stdout), "");
         assert_eq!(String::from_utf8_lossy(&sh(&settings).stdout), "ran\n");
 
         // Nowhere else: not the run's state, not outside the user's folder, not through a link.
-        for p in [
-            state.join("x.ts"),
-            root.join("u2/settings/b1/x.ts"),
-            settings.join("../../x.ts"),
-            settings.join("x.ts"),
-        ] {
+        for p in [state.join("x.ts"), root.join("u2/settings/b1/x.ts"), settings.join("../../x.ts"), settings.join("x.ts")] {
             let mut bad = job.clone();
             bad.files = vec![file(&p)];
             assert!(run_as.prepare(bad).is_err(), "{}", p.display());
@@ -1560,64 +1136,28 @@ mod tests {
         let dir = crate::db::temp_path("setup");
         let log = dir.join("log");
         let sudo = dir.join("sudo");
-        std::fs::write(
-            &sudo,
-            format!(
-                "#!/bin/sh\necho start >>'{0}'\nsleep 0.3\necho end >>'{0}'\nexit 1\n",
-                log.display()
-            ),
-        )
-        .unwrap();
+        std::fs::write(&sudo, format!("#!/bin/sh\necho start >>'{0}'\nsleep 0.3\necho end >>'{0}'\nexit 1\n", log.display())).unwrap();
         std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
         let iso = for_tests(&dir, sudo.to_str().unwrap());
-        let runs: Vec<_> = (0..2)
-            .map(|_| {
-                std::thread::spawn({
-                    let iso = iso.clone();
-                    move || iso.ensure("u1")
-                })
-            })
-            .collect();
+        let runs: Vec<_> = (0..2).map(|_| std::thread::spawn({ let iso = iso.clone(); move || iso.ensure("u1") })).collect();
         for r in runs {
             assert!(r.join().unwrap().is_err());
         }
-        assert_eq!(
-            std::fs::read_to_string(&log).unwrap(),
-            "start\nend\nstart\nend\n"
-        );
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "start\nend\nstart\nend\n");
     }
 
     #[test]
     fn a_teammate_account_is_one_per_owner_and_teammate_and_holds_neither_id() {
         let a = teammate_account("u1", "u2").unwrap();
         assert!(a.starts_with(TEAMMATE_PREFIX) && a.len() == 29);
-        assert!(
-            a[5..]
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        );
+        assert!(a[5..].bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
         assert_eq!(teammate_account("u1", "u2").unwrap(), a, "stable");
-        assert_ne!(
-            teammate_account("u2", "u1").unwrap(),
-            a,
-            "each way round is its own"
-        );
+        assert_ne!(teammate_account("u2", "u1").unwrap(), a, "each way round is its own");
         assert_ne!(teammate_account("u1", "u3").unwrap(), a);
         // superbot-userctl makes the same name.
-        let out = Command::new("/bin/sh")
-            .args(["-c", "printf '%s' 'u1:u2' | sha256sum | cut -c1-24"])
-            .output()
-            .unwrap();
+        let out = Command::new("/bin/sh").args(["-c", "printf '%s' 'u1:u2' | sha256sum | cut -c1-24"]).output().unwrap();
         assert_eq!(&a[5..], String::from_utf8_lossy(&out.stdout).trim());
-        for (o, t) in [
-            ("u1", "u1"),
-            ("", "u2"),
-            ("u1", ""),
-            ("U1", "u2"),
-            ("u1", "a-b"),
-            ("../u1", "u2"),
-            (&"a".repeat(28), "u2"),
-        ] {
+        for (o, t) in [("u1", "u1"), ("", "u2"), ("u1", ""), ("U1", "u2"), ("u1", "a-b"), ("../u1", "u2"), (&"a".repeat(28), "u2")] {
             assert_eq!(teammate_account(o, t), None, "{o:?} {t:?}");
         }
     }
@@ -1626,64 +1166,20 @@ mod tests {
     fn a_teammates_folders_are_their_own_never_the_owners() {
         let iso = for_tests(Path::new("/srv/superbot/users"), DEFAULT_SUDO);
         let pair = Space::of("u1", Some("u2"));
-        assert_eq!(
-            pair,
-            Space::Teammate {
-                owner: "u1",
-                teammate: "u2"
-            }
-        );
-        assert_eq!(
-            Space::of("u1", Some("u1")),
-            Space::User("u1"),
-            "the owner's own run is theirs"
-        );
+        assert_eq!(pair, Space::Teammate { owner: "u1", teammate: "u2" });
+        assert_eq!(Space::of("u1", Some("u1")), Space::User("u1"), "the owner's own run is theirs");
         assert_eq!(Space::of("u1", None), Space::User("u1"));
-        assert_eq!(
-            iso.space_root(pair).unwrap(),
-            Path::new("/srv/superbot/users/u1-u2")
-        );
-        assert_eq!(
-            iso.home_in(pair).unwrap(),
-            Path::new("/srv/superbot/users/u1-u2/home")
-        );
-        assert_eq!(
-            iso.workspace_in(pair).unwrap(),
-            Path::new("/srv/superbot/users/u1-u2/workspace")
-        );
-        assert_eq!(
-            iso.memory_file_in(pair, "b1").unwrap(),
-            Path::new("/srv/superbot/users/u1-u2/memory/b1.md")
-        );
-        assert_eq!(
-            iso.bot_state_in(pair, "b1").unwrap(),
-            Path::new("/srv/superbot/users/u1-u2/bots/b1")
-        );
-        assert_eq!(
-            iso.bot_settings_in(pair, "b1").unwrap(),
-            Path::new("/srv/superbot/users/u1-u2/settings/b1")
-        );
+        assert_eq!(iso.space_root(pair).unwrap(), Path::new("/srv/superbot/users/u1-u2"));
+        assert_eq!(iso.home_in(pair).unwrap(), Path::new("/srv/superbot/users/u1-u2/home"));
+        assert_eq!(iso.workspace_in(pair).unwrap(), Path::new("/srv/superbot/users/u1-u2/workspace"));
+        assert_eq!(iso.memory_file_in(pair, "b1").unwrap(), Path::new("/srv/superbot/users/u1-u2/memory/b1.md"));
+        assert_eq!(iso.bot_state_in(pair, "b1").unwrap(), Path::new("/srv/superbot/users/u1-u2/bots/b1"));
+        assert_eq!(iso.bot_settings_in(pair, "b1").unwrap(), Path::new("/srv/superbot/users/u1-u2/settings/b1"));
         let r = iso.run_as_in(pair).unwrap();
-        assert_eq!(
-            (r.account.as_str(), r.teammate.as_deref()),
-            (teammate_account("u1", "u2").unwrap().as_str(), Some("u2"))
-        );
+        assert_eq!((r.account.as_str(), r.teammate.as_deref()), (teammate_account("u1", "u2").unwrap().as_str(), Some("u2")));
         assert_eq!(r.settings, Path::new("/srv/superbot/users/u1-u2/settings"));
         assert_eq!(iso.run_as("u1").unwrap().teammate, None);
-        for bad in [
-            Space::Teammate {
-                owner: "u1",
-                teammate: "u1",
-            },
-            Space::Teammate {
-                owner: "u1",
-                teammate: "../u2",
-            },
-            Space::Teammate {
-                owner: "",
-                teammate: "u2",
-            },
-        ] {
+        for bad in [Space::Teammate { owner: "u1", teammate: "u1" }, Space::Teammate { owner: "u1", teammate: "../u2" }, Space::Teammate { owner: "", teammate: "u2" }] {
             assert_eq!(iso.space_root(bad), None, "{bad:?}");
             assert_eq!(iso.run_as_in(bad), None, "{bad:?}");
         }
@@ -1691,34 +1187,14 @@ mod tests {
 
     #[test]
     fn teammate_accounts_follow_isolation_and_isolated_shared_bots() {
-        assert_eq!(
-            teammates_flag("", true, true),
-            Ok(true),
-            "on by default with both"
-        );
-        assert_eq!(
-            teammates_flag("", true, false),
-            Ok(false),
-            "open shared Bots: the owner's account, as before"
-        );
+        assert_eq!(teammates_flag("", true, true), Ok(true), "on by default with both");
+        assert_eq!(teammates_flag("", true, false), Ok(false), "open shared Bots: the owner's account, as before");
         assert_eq!(teammates_flag("", false, true), Ok(false));
         assert_eq!(teammates_flag(" off ", true, true), Ok(false));
         assert_eq!(teammates_flag("on", true, true), Ok(true));
-        assert!(
-            teammates_flag("on", false, true)
-                .unwrap_err()
-                .contains("ISOLATION=users")
-        );
-        assert!(
-            teammates_flag("on", true, false)
-                .unwrap_err()
-                .contains("SHARED_BOTS=isolated")
-        );
-        assert!(
-            teammates_flag("yes", true, true)
-                .unwrap_err()
-                .contains("on or off")
-        );
+        assert!(teammates_flag("on", false, true).unwrap_err().contains("ISOLATION=users"));
+        assert!(teammates_flag("on", true, false).unwrap_err().contains("SHARED_BOTS=isolated"));
+        assert!(teammates_flag("yes", true, true).unwrap_err().contains("on or off"));
     }
 
     /// A stand-in sudo that runs what follows `-- <superbot-run>` as this account, with
@@ -1738,51 +1214,28 @@ mod tests {
         let home = dir.join("home");
         std::fs::create_dir_all(home.join(".claude")).unwrap();
         let r = iso.run_as_in(Space::of("u1", Some("u2"))).unwrap();
-        let files = vec![
-            ".claude/.credentials.json".to_string(),
-            ".claude.json".to_string(),
-        ];
+        let files = vec![".claude/.credentials.json".to_string(), ".claude.json".to_string()];
         assert_eq!(r.login_since(&home, &files), Ok(None));
         std::fs::write(home.join(".claude/.credentials.json"), "").unwrap();
-        assert_eq!(
-            r.login_since(&home, &files),
-            Ok(None),
-            "an empty file isn't a login"
-        );
+        assert_eq!(r.login_since(&home, &files), Ok(None), "an empty file isn't a login");
         let secret = dir.join("owner-creds");
         std::fs::write(&secret, "{\"owner\":1}").unwrap();
         std::fs::remove_file(home.join(".claude/.credentials.json")).unwrap();
         symlink(&secret, home.join(".claude/.credentials.json")).unwrap();
-        assert_eq!(
-            r.login_since(&home, &files),
-            Ok(None),
-            "a link to someone's login isn't one"
-        );
+        assert_eq!(r.login_since(&home, &files), Ok(None), "a link to someone's login isn't one");
         assert_eq!(r.forget(&home, &files), Ok(1));
-        assert_eq!(
-            std::fs::read_to_string(&secret).unwrap(),
-            "{\"owner\":1}",
-            "removing drops the link, not its target"
-        );
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), "{\"owner\":1}", "removing drops the link, not its target");
         std::fs::write(home.join(".claude/.credentials.json"), "{}").unwrap();
         let since = r.login_since(&home, &files).unwrap().expect("logged in");
         assert!(since > 1_600_000_000_000, "{since}");
         assert_eq!(r.forget(&home, &files), Ok(1));
         assert_eq!(r.login_since(&home, &files), Ok(None));
-        for bad in [
-            vec![],
-            vec!["../x".to_string()],
-            vec!["/etc/shadow".to_string()],
-            vec![".claude/../../x".to_string()],
-        ] {
+        for bad in [vec![], vec!["../x".to_string()], vec!["/etc/shadow".to_string()], vec![".claude/../../x".to_string()]] {
             assert!(r.login_since(&home, &bad).is_err(), "{bad:?}");
             assert!(r.forget(&home, &bad).is_err(), "{bad:?}");
         }
         let failing = for_tests(&dir, "/bin/false").run_as("u1").unwrap();
-        assert!(
-            failing.login_since(&home, &files).is_err(),
-            "a check that can't run isn't a login"
-        );
+        assert!(failing.login_since(&home, &files).is_err(), "a check that can't run isn't a login");
     }
 
     #[test]
@@ -1790,32 +1243,11 @@ mod tests {
         let dir = crate::db::temp_path("ensure-pair");
         let log = dir.join("log");
         let sudo = dir.join("sudo");
-        std::fs::write(
-            &sudo,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\nexit 3\n",
-                log.display()
-            ),
-        )
-        .unwrap();
+        std::fs::write(&sudo, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\nexit 3\n", log.display())).unwrap();
         std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
         let iso = for_tests(&dir, sudo.to_str().unwrap());
-        assert!(
-            iso.ensure_in(Space::of("u1", Some("u2")))
-                .unwrap_err()
-                .contains("superbot-userctl ensure failed")
-        );
-        assert!(
-            iso.ensure_in(Space::Teammate {
-                owner: "u1",
-                teammate: "u1"
-            })
-            .is_err()
-        );
-        assert_eq!(
-            std::fs::read_to_string(&log).unwrap(),
-            format!("-n {DEFAULT_USERCTL} ensure u1 u2\n"),
-            "never for one person twice"
-        );
+        assert!(iso.ensure_in(Space::of("u1", Some("u2"))).unwrap_err().contains("superbot-userctl ensure failed"));
+        assert!(iso.ensure_in(Space::Teammate { owner: "u1", teammate: "u1" }).is_err());
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), format!("-n {DEFAULT_USERCTL} ensure u1 u2\n"), "never for one person twice");
     }
 }

@@ -31,9 +31,7 @@ struct Args(Vec<String>);
 impl Args {
     /// Takes `--name <value>`. Err when it's given without a value.
     fn take(&mut self, name: &str) -> Res<Option<String>> {
-        let Some(i) = self.0.iter().position(|a| a == name) else {
-            return Ok(None);
-        };
+        let Some(i) = self.0.iter().position(|a| a == name) else { return Ok(None) };
         if i + 1 >= self.0.len() || self.0[i + 1].starts_with("--") {
             return Err(format!("{name} needs a value"));
         }
@@ -43,8 +41,7 @@ impl Args {
     }
 
     fn need(&mut self, name: &str) -> Res<String> {
-        self.take(name)?
-            .ok_or_else(|| format!("{name} is required"))
+        self.take(name)?.ok_or_else(|| format!("{name} is required"))
     }
 
     fn all(&mut self, name: &str) -> Res<Vec<String>> {
@@ -73,8 +70,7 @@ fn now() -> i64 {
 
 /// Midnight UTC at the start of `d`, as unix seconds.
 fn day(d: &str) -> Res<i64> {
-    let date = chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
-        .map_err(|_| format!("{d}: expected a date like 2027-12-31"))?;
+    let date = chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").map_err(|_| format!("{d}: expected a date like 2027-12-31"))?;
     Ok(date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp())
 }
 
@@ -91,14 +87,9 @@ fn default_kid() -> String {
 fn default_id() -> Res<String> {
     use aws_lc_rs::rand::SecureRandom;
     let mut tail = [0u8; 4];
-    aws_lc_rs::rand::SystemRandom::new()
-        .fill(&mut tail)
-        .map_err(|_| "no randomness for the license id")?;
+    aws_lc_rs::rand::SystemRandom::new().fill(&mut tail).map_err(|_| "no randomness for the license id")?;
     let tail: String = tail.iter().map(|b| format!("{b:02x}")).collect();
-    Ok(format!(
-        "lic-{}-{tail}",
-        chrono::Utc::now().format("%Y%m%d")
-    ))
+    Ok(format!("lic-{}-{tail}", chrono::Utc::now().format("%Y%m%d")))
 }
 
 fn key_entry(kid: &str, key: &aws_lc_rs::signature::Ed25519KeyPair) -> String {
@@ -116,16 +107,9 @@ fn keygen(mut a: Args) -> Res<String> {
     let key = token::key_from_pem(&pem)?;
     let mut f = {
         use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&out)
-            .map_err(|e| format!("{out}: {e}"))?
+        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&out).map_err(|e| format!("{out}: {e}"))?
     };
-    f.write_all(pem.as_bytes())
-        .and_then(|_| f.sync_all())
-        .map_err(|e| format!("{out}: {e}"))?;
+    f.write_all(pem.as_bytes()).and_then(|_| f.sync_all()).map_err(|e| format!("{out}: {e}"))?;
     eprintln!("Private key saved to {out}. Keep it offline and backed up; never commit it.");
     eprintln!("Add this to TRUSTED in server/src/license/mod.rs:");
     Ok(key_entry(&kid, &key))
@@ -145,25 +129,10 @@ fn sign(mut a: Args) -> Res<String> {
     let at = now();
     let exp = match (a.take("--expires")?, a.take("--days")?) {
         (Some(d), None) => day(&d)? + 86_400,
-        (None, Some(n)) => {
-            at + n
-                .parse::<i64>()
-                .ok()
-                .filter(|n| (1..=3660).contains(n))
-                .ok_or("--days must be 1 to 3660")?
-                * 86_400
-        }
+        (None, Some(n)) => at + n.parse::<i64>().ok().filter(|n| (1..=3660).contains(n)).ok_or("--days must be 1 to 3660")? * 86_400,
         _ => return Err("give one of --expires or --days".into()),
     };
-    let seats = a
-        .take("--seats")?
-        .map(|s| {
-            s.parse::<u32>()
-                .ok()
-                .filter(|n| *n > 0)
-                .ok_or("--seats must be a whole number above 0")
-        })
-        .transpose()?;
+    let seats = a.take("--seats")?.map(|s| s.parse::<u32>().ok().filter(|n| *n > 0).ok_or("--seats must be a whole number above 0")).transpose()?;
     let claims = Claims {
         iss: token::ISSUER.into(),
         aud: token::AUDIENCE.into(),
@@ -185,30 +154,19 @@ fn sign(mut a: Args) -> Res<String> {
     }
     let t = token::sign(&key, &kid, &claims)?;
     // Our own check, as botd will make it.
-    token::verify(
-        &t,
-        &[Key::parse(&kid, &token::public_b64(&key))?],
-        at.max(claims.nbf.unwrap_or(at)),
-    )
-    .map_err(|e| e.text().to_string())?;
+    token::verify(&t, &[Key::parse(&kid, &token::public_b64(&key))?], at.max(claims.nbf.unwrap_or(at))).map_err(|e| e.text().to_string())?;
     eprintln!("{}", describe(&claims));
     Ok(t)
 }
 
 fn describe(c: &Claims) -> String {
-    let date = |s: i64| {
-        chrono::DateTime::from_timestamp(s, 0)
-            .unwrap_or_default()
-            .format("%Y-%m-%d %H:%M UTC")
-            .to_string()
-    };
+    let date = |s: i64| chrono::DateTime::from_timestamp(s, 0).unwrap_or_default().format("%Y-%m-%d %H:%M UTC").to_string();
     format!(
         "License {} for {}: {} edition, {}, features [{}], from {} until {}.",
         c.jti,
         c.sub,
         c.edition,
-        c.seats
-            .map_or("unlimited seats".into(), |s| format!("{s} seats")),
+        c.seats.map_or("unlimited seats".into(), |s| format!("{s} seats")),
         c.features.join(", "),
         date(c.nbf.unwrap_or(c.iat)),
         date(c.exp)
@@ -227,39 +185,22 @@ fn verify(mut a: Args) -> Res<String> {
         }
         _ => return Err("give one of --key or --public".into()),
     };
-    let at = a
-        .take("--at")?
-        .map(|d| day(&d))
-        .transpose()?
-        .unwrap_or_else(now);
+    let at = a.take("--at")?.map(|d| day(&d)).transpose()?.unwrap_or_else(now);
     let rest = a.rest(1)?;
     let t = match rest.first().map(String::as_str) {
         None | Some("-") => {
             let mut s = String::new();
-            std::io::stdin()
-                .take(token::MAX_TOKEN as u64 + 1)
-                .read_to_string(&mut s)
-                .map_err(|e| e.to_string())?;
+            std::io::stdin().take(token::MAX_TOKEN as u64 + 1).read_to_string(&mut s).map_err(|e| e.to_string())?;
             s
         }
         Some(t) => t.to_string(),
     };
     // With a private key file, the token's own kid is the one to check.
-    let kid = key
-        .0
-        .or_else(|| token::kid_of(&t))
-        .ok_or("the license names no key")?;
-    let c =
-        token::verify(&t, &[Key::parse(&kid, &key.1)?], at).map_err(|e| e.text().to_string())?;
+    let kid = key.0.or_else(|| token::kid_of(&t)).ok_or("the license names no key")?;
+    let c = token::verify(&t, &[Key::parse(&kid, &key.1)?], at).map_err(|e| e.text().to_string())?;
     let shown = serde_json::to_string_pretty(&c).map_err(|e| e.to_string())?;
     let state = if at < c.exp { "valid" } else { "ended" };
-    eprintln!(
-        "{} Signature good; {state} on {}.",
-        describe(&c),
-        chrono::DateTime::from_timestamp(at, 0)
-            .unwrap_or_default()
-            .format("%Y-%m-%d")
-    );
+    eprintln!("{} Signature good; {state} on {}.", describe(&c), chrono::DateTime::from_timestamp(at, 0).unwrap_or_default().format("%Y-%m-%d"));
     if at >= c.exp {
         return Err("the license has ended".into());
     }
@@ -268,11 +209,7 @@ fn verify(mut a: Args) -> Res<String> {
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = if args.is_empty() {
-        String::new()
-    } else {
-        args.remove(0)
-    };
+    let cmd = if args.is_empty() { String::new() } else { args.remove(0) };
     let a = Args(args);
     let res = match cmd.as_str() {
         "keygen" => keygen(a),
@@ -280,9 +217,7 @@ fn main() {
         "sign" => sign(a),
         "verify" => verify(a),
         "" | "help" | "-h" | "--help" => Ok(HELP.to_string()),
-        other => Err(format!(
-            "unknown command {other}. Run superbot-license help."
-        )),
+        other => Err(format!("unknown command {other}. Run superbot-license help.")),
     };
     match res {
         Ok(out) => println!("{out}"),
@@ -308,161 +243,37 @@ mod tests {
         let key = dir.join("cg.pem");
         let k = key.to_str().unwrap();
         let line = keygen(args(&["--out", k, "--kid", "cg-test"])).unwrap();
-        assert!(
-            line.starts_with("(\"cg-test\", \"") && line.ends_with("\"),"),
-            "{line}"
-        );
+        assert!(line.starts_with("(\"cg-test\", \"") && line.ends_with("\"),"), "{line}");
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert!(
-            keygen(args(&["--out", k])).unwrap_err().contains("exists"),
-            "never overwrites a key"
-        );
-        assert_eq!(
-            public(args(&["--key", k, "--kid", "cg-test"])).unwrap(),
-            line
-        );
+        assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(keygen(args(&["--out", k])).unwrap_err().contains("exists"), "never overwrites a key");
+        assert_eq!(public(args(&["--key", k, "--kid", "cg-test"])).unwrap(), line);
 
-        let t = sign(args(&[
-            "--key",
-            k,
-            "--kid",
-            "cg-test",
-            "--licensee",
-            "Acme Ltd",
-            "--days",
-            "365",
-            "--seats",
-            "50",
-            "--feature",
-            "sso",
-            "--feature",
-            "scim",
-            "--id",
-            "lic-acme-1",
-        ]))
-        .unwrap();
+        let t = sign(args(&["--key", k, "--kid", "cg-test", "--licensee", "Acme Ltd", "--days", "365", "--seats", "50", "--feature", "sso", "--feature", "scim", "--id", "lic-acme-1"])).unwrap();
         let public_key = line.split('"').nth(3).unwrap();
         let shown = verify(args(&["--public", &format!("cg-test={public_key}"), &t])).unwrap();
         let c: Claims = serde_json::from_str(&shown).unwrap();
-        assert_eq!(
-            (
-                c.sub.as_str(),
-                c.seats,
-                c.jti.as_str(),
-                c.edition.as_str(),
-                c.aud.as_str()
-            ),
-            (
-                "Acme Ltd",
-                Some(50),
-                "lic-acme-1",
-                "business",
-                token::AUDIENCE
-            )
-        );
+        assert_eq!((c.sub.as_str(), c.seats, c.jti.as_str(), c.edition.as_str(), c.aud.as_str()), ("Acme Ltd", Some(50), "lic-acme-1", "business", token::AUDIENCE));
         assert_eq!(c.features, ["sso", "scim"]);
         assert!(verify(args(&["--key", k, &t])).is_ok());
         // Checked as it will be on a date after it ends.
-        assert!(
-            verify(args(&["--key", k, "--at", "2999-01-01", &t]))
-                .unwrap_err()
-                .contains("ended")
-        );
+        assert!(verify(args(&["--key", k, "--at", "2999-01-01", &t])).unwrap_err().contains("ended"));
         // Through a date: valid all of that day, UTC.
-        let dated = sign(args(&[
-            "--key",
-            k,
-            "--kid",
-            "cg-test",
-            "--licensee",
-            "Acme",
-            "--expires",
-            "2999-12-31",
-        ]))
-        .unwrap();
-        let c: Claims =
-            serde_json::from_str(&verify(args(&["--key", k, &dated])).unwrap()).unwrap();
+        let dated = sign(args(&["--key", k, "--kid", "cg-test", "--licensee", "Acme", "--expires", "2999-12-31"])).unwrap();
+        let c: Claims = serde_json::from_str(&verify(args(&["--key", k, &dated])).unwrap()).unwrap();
         assert_eq!((c.exp, c.seats), (day("3000-01-01").unwrap(), None));
         // Signed in the same second, still two licenses.
-        let again = sign(args(&[
-            "--key",
-            k,
-            "--kid",
-            "cg-test",
-            "--licensee",
-            "Acme",
-            "--expires",
-            "2999-12-31",
-        ]))
-        .unwrap();
-        let c2: Claims =
-            serde_json::from_str(&verify(args(&["--key", k, &again])).unwrap()).unwrap();
-        assert!(
-            c.jti.starts_with("lic-") && c.jti != c2.jti,
-            "{} {}",
-            c.jti,
-            c2.jti
-        );
+        let again = sign(args(&["--key", k, "--kid", "cg-test", "--licensee", "Acme", "--expires", "2999-12-31"])).unwrap();
+        let c2: Claims = serde_json::from_str(&verify(args(&["--key", k, &again])).unwrap()).unwrap();
+        assert!(c.jti.starts_with("lic-") && c.jti != c2.jti, "{} {}", c.jti, c2.jti);
 
         for bad in [
             vec!["--key", k, "--kid", "cg-test", "--licensee", "Acme"],
-            vec![
-                "--key",
-                k,
-                "--kid",
-                "cg-test",
-                "--licensee",
-                "Acme",
-                "--days",
-                "0",
-            ],
-            vec![
-                "--key",
-                k,
-                "--kid",
-                "cg-test",
-                "--licensee",
-                "Acme",
-                "--days",
-                "9",
-                "--seats",
-                "0",
-            ],
-            vec![
-                "--key",
-                k,
-                "--kid",
-                "Not OK",
-                "--licensee",
-                "Acme",
-                "--days",
-                "9",
-            ],
-            vec![
-                "--key",
-                k,
-                "--kid",
-                "cg-test",
-                "--licensee",
-                "Acme",
-                "--expires",
-                "2001-01-01",
-            ],
-            vec![
-                "--key",
-                k,
-                "--kid",
-                "cg-test",
-                "--licensee",
-                "Acme",
-                "--days",
-                "9",
-                "--bogus",
-            ],
+            vec!["--key", k, "--kid", "cg-test", "--licensee", "Acme", "--days", "0"],
+            vec!["--key", k, "--kid", "cg-test", "--licensee", "Acme", "--days", "9", "--seats", "0"],
+            vec!["--key", k, "--kid", "Not OK", "--licensee", "Acme", "--days", "9"],
+            vec!["--key", k, "--kid", "cg-test", "--licensee", "Acme", "--expires", "2001-01-01"],
+            vec!["--key", k, "--kid", "cg-test", "--licensee", "Acme", "--days", "9", "--bogus"],
         ] {
             assert!(sign(args(&bad)).is_err(), "{bad:?}");
         }

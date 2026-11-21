@@ -67,17 +67,9 @@ pub struct Upkeep {
 /// `claude,codex@0.172.0,hermes@<commit>=<sha256>`: commas or spaces between.
 pub fn parse_harnesses(raw: &str) -> Result<Option<HarnessPlan>, String> {
     let mut list = Vec::new();
-    for item in raw
-        .split([',', ' ', '\t', '\n'])
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        let (spec, checksum) = item
-            .split_once('=')
-            .map_or((item, None), |(s, c)| (s, Some(c)));
-        let (name, version) = spec
-            .split_once('@')
-            .map_or((spec, None), |(n, v)| (n, Some(v)));
+    for item in raw.split([',', ' ', '\t', '\n']).map(str::trim).filter(|s| !s.is_empty()) {
+        let (spec, checksum) = item.split_once('=').map_or((item, None), |(s, c)| (s, Some(c)));
+        let (name, version) = spec.split_once('@').map_or((spec, None), |(n, v)| (n, Some(v)));
         let h = crate::adapters::install::install(&name.to_ascii_lowercase(), version, checksum)
             .map_err(|e| format!("MACHINE_HARNESSES: {e}"))?;
         if list.iter().any(|o: &wire::HarnessInstall| o.name == h.name) {
@@ -95,32 +87,17 @@ pub fn parse_harnesses(raw: &str) -> Result<Option<HarnessPlan>, String> {
 
 impl Upkeep {
     pub fn from_env(var: &dyn Fn(&str) -> String) -> Result<Upkeep, String> {
-        let upgrades = match var("MACHINE_AGENT_UPGRADES")
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
+        let upgrades = match var("MACHINE_AGENT_UPGRADES").trim().to_ascii_lowercase().as_str() {
             "" | "manual" => Upgrades::Manual,
             "auto" => Upgrades::Auto,
-            v => {
-                return Err(format!(
-                    "MACHINE_AGENT_UPGRADES must be manual or auto, not \"{v}\""
-                ));
-            }
+            v => return Err(format!("MACHINE_AGENT_UPGRADES must be manual or auto, not \"{v}\"")),
         };
         let rebuilds = super::rebuild::Rebuilds::parse(&var("MACHINE_LEGACY_REBUILDS"))?;
-        Ok(Upkeep {
-            plan: parse_harnesses(&var("MACHINE_HARNESSES"))?,
-            upgrades,
-            rebuilds,
-        })
+        Ok(Upkeep { plan: parse_harnesses(&var("MACHINE_HARNESSES"))?, upgrades, rebuilds })
     }
 
     pub fn describe(&self) -> String {
-        let harnesses = self
-            .plan
-            .as_ref()
-            .map_or("none".into(), |p| names(p).join(", "));
+        let harnesses = self.plan.as_ref().map_or("none".into(), |p| names(p).join(", "));
         format!(
             "harnesses on machines: {harnesses}; agent upgrades: {}; rebuilds of old machines: {}",
             self.upgrades.as_str(),
@@ -130,10 +107,7 @@ impl Upkeep {
 }
 
 fn names(p: &HarnessPlan) -> Vec<String> {
-    p.harnesses
-        .iter()
-        .map(|h| format!("{}@{}", h.name, short(&h.version)))
-        .collect()
+    p.harnesses.iter().map(|h| format!("{}@{}", h.name, short(&h.version))).collect()
 }
 
 fn short(s: &str) -> &str {
@@ -161,16 +135,7 @@ fn upkeep_json(hb: &Heartbeat) -> Value {
     let logins: BTreeMap<&String, &str> = hb
         .logins
         .iter()
-        .map(|(h, l)| {
-            (
-                h,
-                if l.state == wire::LOGGED_IN {
-                    wire::LOGGED_IN
-                } else {
-                    wire::LOGGED_OUT
-                },
-            )
-        })
+        .map(|(h, l)| (h, if l.state == wire::LOGGED_IN { wire::LOGGED_IN } else { wire::LOGGED_OUT }))
         .collect();
     json!({
         "can": hb.can, "build": hb.build, "plan": hb.plan, "harnesses": hb.harnesses, "upgrade": hb.upgrade, "logins": logins,
@@ -183,9 +148,7 @@ fn upkeep_json(hb: &Heartbeat) -> Value {
 /// Records what a heartbeat says of harnesses and upgrades, and what changed, in the
 /// audit log. Every answered heartbeat comes here, so a change is recorded once.
 pub fn observe(app: &App, machine_id: &str, hb: &Heartbeat) {
-    let Some(m) = app.db.machine(machine_id) else {
-        return;
-    };
+    let Some(m) = app.db.machine(machine_id) else { return };
     let new = upkeep_json(hb);
     if m.agent_upkeep.as_ref() != Some(&new) {
         let old: BTreeMap<String, HarnessStatus> = m
@@ -198,64 +161,33 @@ pub fn observe(app: &App, machine_id: &str, hb: &Heartbeat) {
             .as_ref()
             .and_then(|v| serde_json::from_value(v["logins"].clone()).ok())
             .unwrap_or_default();
-        if !app
-            .db
-            .machine_upkeep_swap(&m.id, m.agent_upkeep.as_ref(), &new)
-        {
+        if !app.db.machine_upkeep_swap(&m.id, m.agent_upkeep.as_ref(), &new) {
             return;
         }
         let by = system(&m);
         for (name, st) in &hb.harnesses {
             let was = old.get(name);
-            if st.state == wire::HARNESS_INSTALLED
-                && was.is_none_or(|w| w.state != st.state || w.version != st.version)
-            {
-                app.db.record(&event(
-                    &by,
-                    "machine.harness_installed",
-                    &m,
-                    json!({ "harness": name, "version": st.version }),
-                ));
+            if st.state == wire::HARNESS_INSTALLED && was.is_none_or(|w| w.state != st.state || w.version != st.version) {
+                app.db.record(&event(&by, "machine.harness_installed", &m, json!({ "harness": name, "version": st.version })));
             }
-            if st.state == wire::HARNESS_FAILED
-                && was.is_none_or(|w| w.state != st.state || w.at != st.at)
-            {
+            if st.state == wire::HARNESS_FAILED && was.is_none_or(|w| w.state != st.state || w.at != st.at) {
                 app.db.record(
-                    &event(
-                        &by,
-                        "machine.harness_install_failed",
-                        &m,
-                        json!({ "harness": name, "version": st.wanted, "error": st.error }),
-                    )
-                    .outcome(Outcome::Failure),
+                    &event(&by, "machine.harness_install_failed", &m, json!({ "harness": name, "version": st.wanted, "error": st.error }))
+                        .outcome(Outcome::Failure),
                 );
             }
         }
         // A login made or lost there, however it happened (ADR 0041).
-        let logins: BTreeMap<String, String> =
-            serde_json::from_value(new["logins"].clone()).unwrap_or_default();
+        let logins: BTreeMap<String, String> = serde_json::from_value(new["logins"].clone()).unwrap_or_default();
         for (name, now) in &logins {
             let was = old_logins.get(name);
             if was.map_or(now == wire::LOGGED_IN, |w| w != now) {
-                app.db.record(&event(
-                    &by,
-                    "machine.harness_login_changed",
-                    &m,
-                    json!({ "harness": name, "from": was, "to": now }),
-                ));
+                app.db.record(&event(&by, "machine.harness_login_changed", &m, json!({ "harness": name, "from": was, "to": now })));
             }
         }
-        super::botuser::observed(
-            app,
-            &m,
-            &by,
-            m.agent_upkeep.as_ref().map(|v| &v["botUser"]),
-            &new["botUser"],
-        );
+        super::botuser::observed(app, &m, &by, m.agent_upkeep.as_ref().map(|v| &v["botUser"]), &new["botUser"]);
     }
-    let (Some(id), Some(report)) = (&m.upgrade_id, hb.upgrade.as_ref()) else {
-        return;
-    };
+    let (Some(id), Some(report)) = (&m.upgrade_id, hb.upgrade.as_ref()) else { return };
     if report.id != *id {
         return;
     }
@@ -265,21 +197,13 @@ pub fn observe(app: &App, machine_id: &str, hb: &Heartbeat) {
     });
     match report.state.as_str() {
         wire::UPGRADE_DONE if app.db.machine_upgrade_end(&m.id, id, None) => {
-            app.db
-                .record(&event(&system(&m), "machine.agent_upgraded", &m, details));
+            app.db.record(&event(&system(&m), "machine.agent_upgraded", &m, details));
         }
-        wire::UPGRADE_ROLLED_BACK | wire::UPGRADE_FAILED
-            if app
-                .db
-                .machine_upgrade_end(&m.id, id, m.upgrade_build.as_deref()) =>
-        {
+        wire::UPGRADE_ROLLED_BACK | wire::UPGRADE_FAILED if app.db.machine_upgrade_end(&m.id, id, m.upgrade_build.as_deref()) => {
             let mut d = details;
             d["reason"] = json!(report.state);
             d["error"] = json!(report.reason);
-            app.db.record(
-                &event(&system(&m), "machine.agent_upgrade_failed", &m, d)
-                    .outcome(Outcome::Failure),
-            );
+            app.db.record(&event(&system(&m), "machine.agent_upgrade_failed", &m, d).outcome(Outcome::Failure));
         }
         _ => {}
     }
@@ -298,9 +222,7 @@ fn stale_before(cp: &ControlPlane) -> i64 {
 /// Why `m`'s agent can't be upgraded to botd's build now, if it can't.
 fn blocker(e: &Enrollment, m: &Machine, hb: &Heartbeat) -> Option<String> {
     let Some(served) = e.agent_sha256() else {
-        return Some(
-            "superbot-machine isn't next to botd, so there's no build to upgrade to.".into(),
-        );
+        return Some("superbot-machine isn't next to botd, so there's no build to upgrade to.".into());
     };
     if hb.build.as_deref() == Some(served) {
         return Some("Its agent is botd's build already.".into());
@@ -309,33 +231,20 @@ fn blocker(e: &Enrollment, m: &Machine, hb: &Heartbeat) -> Option<String> {
         return Some("Its agent can't replace itself: it was installed before agent upgrades (ADR 0039). Rebuild it with today's agent: botctl machine rebuild <user> (ADR 0056).".into());
     }
     if newer(&hb.version) {
-        return Some(format!(
-            "Its agent ({}) is newer than botd ({VERSION}), and botd doesn't downgrade agents.",
-            hb.version
-        ));
+        return Some(format!("Its agent ({}) is newer than botd ({VERSION}), and botd doesn't downgrade agents.", hb.version));
     }
     if m.upgrade_hold_at.is_some() {
         return Some("Its agent is held at its build. Release it first.".into());
     }
     if hb.jobs > 0 {
-        return Some(format!(
-            "It's running {} jobs or logins. Upgrade it when they're done.",
-            hb.jobs
-        ));
+        return Some(format!("It's running {} jobs or logins. Upgrade it when they're done.", hb.jobs));
     }
     None
 }
 
 /// Asks `m`'s agent to upgrade itself to botd's build. `by`: who asked, or None when
 /// no one did (MACHINE_AGENT_UPGRADES=auto).
-async fn upgrade(
-    app: &App,
-    cp: &ControlPlane,
-    e: &Enrollment,
-    m: &Machine,
-    hb: &Heartbeat,
-    by: Option<&Who>,
-) -> Result<Value, ApiError> {
+async fn upgrade(app: &App, cp: &ControlPlane, e: &Enrollment, m: &Machine, hb: &Heartbeat, by: Option<&Who>) -> Result<Value, ApiError> {
     let conflict = |msg: String| ApiError(StatusCode::CONFLICT, msg);
     if let Some(why) = blocker(e, m, hb) {
         return Err(conflict(why));
@@ -349,14 +258,8 @@ async fn upgrade(
         Some(w) => (w, w.actor.id.clone().unwrap_or_default()),
         None => (&auto, "auto".to_string()),
     };
-    if !app
-        .db
-        .machine_upgrade_claim(&m.id, &id, &served, &who, stale)
-    {
-        let held = app
-            .db
-            .machine(&m.id)
-            .is_some_and(|m| m.upgrade_hold_at.is_some());
+    if !app.db.machine_upgrade_claim(&m.id, &id, &served, &who, stale) {
+        let held = app.db.machine(&m.id).is_some_and(|m| m.upgrade_hold_at.is_some());
         return Err(conflict(if held {
             "Its agent is held at its build. Release it first.".into()
         } else {
@@ -373,28 +276,14 @@ async fn upgrade(
     let details = json!({
         "upgradeId": id, "by": who, "fromVersion": hb.version, "fromBuild": hb.build, "toVersion": VERSION, "toBuild": served,
     });
-    match e
-        .call_agent(app, m, reqwest::Method::POST, "/v1/upgrade", &req)
-        .await
-    {
+    match e.call_agent(app, m, reqwest::Method::POST, "/v1/upgrade", &req).await {
         Ok((202, _)) => {
-            app.db.record(&event(
-                by,
-                "machine.agent_upgrade_requested",
-                m,
-                details.clone(),
-            ));
+            app.db.record(&event(by, "machine.agent_upgrade_requested", m, details.clone()));
             Ok(details)
         }
         res => {
             let (code, why) = match res {
-                Ok((code, body)) => (
-                    code,
-                    body["error"]
-                        .as_str()
-                        .unwrap_or("no reason given")
-                        .to_string(),
-                ),
+                Ok((code, body)) => (code, body["error"].as_str().unwrap_or("no reason given").to_string()),
                 Err(e) => (0, e),
             };
             // A bad request won't get better; anything else may next time.
@@ -403,55 +292,31 @@ async fn upgrade(
             let mut d = details;
             d["reason"] = json!("refused");
             d["error"] = json!(why);
-            app.db
-                .record(&event(by, "machine.agent_upgrade_failed", m, d).outcome(Outcome::Failure));
-            Err(ApiError(
-                StatusCode::BAD_GATEWAY,
-                format!("Its agent didn't take the upgrade: {why}"),
-            ))
+            app.db.record(&event(by, "machine.agent_upgrade_failed", m, d).outcome(Outcome::Failure));
+            Err(ApiError(StatusCode::BAD_GATEWAY, format!("Its agent didn't take the upgrade: {why}")))
         }
     }
 }
 
 /// Sends `m`'s agent the harness plan.
-async fn send_plan(
-    app: &App,
-    e: &Enrollment,
-    m: &Machine,
-    plan: &HarnessPlan,
-    by: &Who,
-) -> Result<Value, ApiError> {
+async fn send_plan(app: &App, e: &Enrollment, m: &Machine, plan: &HarnessPlan, by: &Who) -> Result<Value, ApiError> {
     let details = json!({ "planId": plan.id(), "harnesses": names(plan) });
-    match e
-        .call_agent(app, m, reqwest::Method::PUT, "/v1/harnesses", plan)
-        .await
-    {
+    match e.call_agent(app, m, reqwest::Method::PUT, "/v1/harnesses", plan).await {
         Ok((202, _)) => {
             app.db.machine_harnesses_sent(&m.id, &plan.id());
-            app.db.record(&event(
-                by,
-                "machine.harnesses_requested",
-                m,
-                details.clone(),
-            ));
+            app.db.record(&event(by, "machine.harnesses_requested", m, details.clone()));
             Ok(details)
         }
         res => {
             let why = match res {
-                Ok((code, body)) => body["error"]
-                    .as_str()
-                    .map_or(format!("it answered {code}"), String::from),
+                Ok((code, body)) => body["error"].as_str().map_or(format!("it answered {code}"), String::from),
                 Err(e) => e,
             };
             app.db.machine_harnesses_sent(&m.id, &plan.id());
             let mut d = details;
             d["error"] = json!(why);
-            app.db
-                .record(&event(by, "machine.harnesses_requested", m, d).outcome(Outcome::Failure));
-            Err(ApiError(
-                StatusCode::BAD_GATEWAY,
-                format!("Its agent didn't take the harness plan: {why}"),
-            ))
+            app.db.record(&event(by, "machine.harnesses_requested", m, d).outcome(Outcome::Failure));
+            Err(ApiError(StatusCode::BAD_GATEWAY, format!("Its agent didn't take the harness plan: {why}")))
         }
     }
 }
@@ -462,49 +327,32 @@ fn plan_due(plan: &HarnessPlan, m: &Machine, hb: &Heartbeat, at: i64) -> bool {
         return false;
     }
     let id = plan.id();
-    let sent = m.harnesses_sent_plan.as_deref() == Some(id.as_str())
-        && m.harnesses_sent_at.is_some_and(|s| at - s < RESEND_MS);
+    let sent = m.harnesses_sent_plan.as_deref() == Some(id.as_str()) && m.harnesses_sent_at.is_some_and(|s| at - s < RESEND_MS);
     if sent {
         return false;
     }
     hb.plan.as_deref() != Some(id.as_str())
         || plan.harnesses.iter().any(|h| {
-            hb.harnesses
-                .get(&h.name)
-                .is_some_and(|s| s.state == wire::HARNESS_FAILED && at - s.at > RETRY_FAILED_MS)
+            hb.harnesses.get(&h.name).is_some_and(|s| s.state == wire::HARNESS_FAILED && at - s.at > RETRY_FAILED_MS)
         })
 }
 
 /// Ends `m`'s upgrade as failed if its agent hasn't said how it went in time, answering
 /// or not. Its build isn't tried again by itself.
 pub fn expire_upgrade(app: &App, cp: &ControlPlane, m: &Machine) {
-    let (Some(id), Some(at)) = (&m.upgrade_id, m.upgrade_sent_at) else {
-        return;
-    };
+    let (Some(id), Some(at)) = (&m.upgrade_id, m.upgrade_sent_at) else { return };
     if at < stale_before(cp)
-        && app
-            .db
-            .machine_upgrade_end(&m.id, id, m.upgrade_build.as_deref())
+        && app.db.machine_upgrade_end(&m.id, id, m.upgrade_build.as_deref())
     {
         let d = json!({ "upgradeId": id, "by": m.upgrade_by, "toBuild": m.upgrade_build, "reason": "timeout", "error": "it never said how the upgrade went" });
-        app.db.record(
-            &event(&system(m), "machine.agent_upgrade_failed", m, d).outcome(Outcome::Failure),
-        );
+        app.db.record(&event(&system(m), "machine.agent_upgrade_failed", m, d).outcome(Outcome::Failure));
     }
 }
 
 /// After a periodic heartbeat: ends an upgrade that never finished, then sends an
 /// upgrade (MACHINE_AGENT_UPGRADES=auto) or the harness plan, if either is due.
-pub async fn follow_up(
-    app: &App,
-    cp: &ControlPlane,
-    e: &Enrollment,
-    machine_id: &str,
-    hb: &Heartbeat,
-) {
-    let Some(m) = app.db.machine(machine_id) else {
-        return;
-    };
+pub async fn follow_up(app: &App, cp: &ControlPlane, e: &Enrollment, machine_id: &str, hb: &Heartbeat) {
+    let Some(m) = app.db.machine(machine_id) else { return };
     if m.upgrade_id.is_some() {
         expire_upgrade(app, cp, &m);
         return;
@@ -516,11 +364,7 @@ pub async fn follow_up(
         let _ = upgrade(app, cp, e, &m, hb, None).await;
         return;
     }
-    if let Some(plan) = e
-        .upkeep
-        .plan
-        .as_ref()
-        .map(|p| install::plan_for(p, &hb.can))
+    if let Some(plan) = e.upkeep.plan.as_ref().map(|p| install::plan_for(p, &hb.can))
         && plan_due(&plan, &m, hb, now())
     {
         let _ = send_plan(app, e, &m, &plan, &system(&m)).await;
@@ -553,35 +397,22 @@ fn view(e: &Enrollment, m: &Machine) -> Value {
 
 /// The control plane from botd's own state, never from the request.
 fn control_plane(app: &App) -> Res<&ControlPlane> {
-    app.control_plane.get().map(|cp| &**cp).ok_or_else(|| {
-        ApiError(
-            StatusCode::SERVICE_UNAVAILABLE,
-            super::NOT_CONFIGURED.into(),
-        )
-    })
+    app.control_plane.get().map(|cp| &**cp).ok_or_else(|| ApiError(StatusCode::SERVICE_UNAVAILABLE, super::NOT_CONFIGURED.into()))
 }
 
 fn need_machine(app: &AppState, key: &str) -> Res<Machine> {
     let u = need_user_key(app, key)?;
-    app.db
-        .user_machine(&u.id)
-        .ok_or_else(|| crate::not_found("Machine"))
+    app.db.user_machine(&u.id).ok_or_else(|| crate::not_found("Machine"))
 }
 
 /// A heartbeat now, so what follows acts on how the agent is.
 pub(super) async fn fresh(app: &App, e: &Enrollment, m: &Machine) -> Res<Heartbeat> {
     if m.enrollment != "enrolled" {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            "Its agent isn't enrolled.".into(),
-        ));
+        return Err(ApiError(StatusCode::CONFLICT, "Its agent isn't enrolled.".into()));
     }
-    enroll::heartbeat(app, e, m).await.map_err(|why| {
-        ApiError(
-            StatusCode::BAD_GATEWAY,
-            format!("Its agent didn't answer: {why}"),
-        )
-    })
+    enroll::heartbeat(app, e, m)
+        .await
+        .map_err(|why| ApiError(StatusCode::BAD_GATEWAY, format!("Its agent didn't answer: {why}")))
 }
 
 /// `GET /api/users/{key}/machine/agent`: its agent's build, harnesses and upgrades,
@@ -618,23 +449,14 @@ pub async fn hold(
     let cp = control_plane(&app)?;
     let e = enroll::need(cp)?;
     let m = need_machine(&app, &key)?;
-    if app
-        .db
-        .machine_upgrade_hold(&m.id, by.actor.id.as_deref(), stale_before(cp))
-    {
-        app.db.record(&event(
-            &by,
-            "machine.agent_upgrade_held",
-            &m,
-            json!({ "build": m.agent_upkeep.as_ref().map(|u| u["build"].clone()) }),
-        ));
+    if app.db.machine_upgrade_hold(&m.id, by.actor.id.as_deref(), stale_before(cp)) {
+        app.db.record(&event(&by, "machine.agent_upgrade_held", &m, json!({ "build": m.agent_upkeep.as_ref().map(|u| u["build"].clone()) })));
     }
     let m = app.db.machine(&m.id).unwrap_or(m);
     if m.upgrade_hold_at.is_none() {
         return Err(ApiError(
             StatusCode::CONFLICT,
-            "An upgrade is on its way to it. Hold it once that upgrade is done or has failed."
-                .into(),
+            "An upgrade is on its way to it. Hold it once that upgrade is done or has failed.".into(),
         ));
     }
     Ok(Json(view(e, &m)))
@@ -651,8 +473,7 @@ pub async fn release(
     let m = need_machine(&app, &key)?;
     if app.db.machine_upgrade_release(&m.id) {
         app.db.machine_upgrade_forget_failure(&m.id);
-        app.db
-            .record(&event(&by, "machine.agent_upgrade_released", &m, json!({})));
+        app.db.record(&event(&by, "machine.agent_upgrade_released", &m, json!({})));
     }
     Ok(Json(view(e, &app.db.machine(&m.id).unwrap_or(m))))
 }
@@ -665,12 +486,11 @@ pub async fn harnesses_now(
     Path(key): Path<String>,
 ) -> Res<(StatusCode, Json<Value>)> {
     let e = enroll::need(control_plane(&app)?)?;
-    let plan = e.upkeep.plan.as_ref().ok_or_else(|| {
-        ApiError(
-            StatusCode::CONFLICT,
-            "MACHINE_HARNESSES is empty, so there's nothing to install.".into(),
-        )
-    })?;
+    let plan = e
+        .upkeep
+        .plan
+        .as_ref()
+        .ok_or_else(|| ApiError(StatusCode::CONFLICT, "MACHINE_HARNESSES is empty, so there's nothing to install.".into()))?;
     let m = need_machine(&app, &key)?;
     let hb = fresh(&app, e, &m).await?;
     if !hb.can.iter().any(|c| c == wire::CAN_HARNESSES) {
@@ -692,10 +512,7 @@ mod tests {
     fn settings() {
         let none = |_: &str| String::new();
         let u = Upkeep::from_env(&none).unwrap();
-        assert!(
-            u.plan.is_none() && u.upgrades == Upgrades::Manual,
-            "off by default"
-        );
+        assert!(u.plan.is_none() && u.upgrades == Upgrades::Manual, "off by default");
         assert_eq!(u.rebuilds, super::super::rebuild::Rebuilds::Manual);
         let env = |k: &str| match k {
             "MACHINE_HARNESSES" => "claude, Codex@0.172.0 pi".into(),
@@ -715,13 +532,7 @@ mod tests {
             ("MACHINE_AGENT_UPGRADES", "always"),
             ("MACHINE_LEGACY_REBUILDS", "yes"),
         ] {
-            let bad = |key: &str| {
-                if key == k {
-                    v.to_string()
-                } else {
-                    String::new()
-                }
-            };
+            let bad = |key: &str| if key == k { v.to_string() } else { String::new() };
             assert!(Upkeep::from_env(&bad).is_err(), "{k}={v}");
         }
     }
@@ -733,9 +544,6 @@ mod tests {
         assert!(!newer(VERSION));
         assert!(newer("99.0.0"));
         assert!(!newer("0.0.1"));
-        assert!(
-            newer("not-a-version"),
-            "an agent botd can't place is left alone"
-        );
+        assert!(newer("not-a-version"), "an agent botd can't place is left alone");
     }
 }

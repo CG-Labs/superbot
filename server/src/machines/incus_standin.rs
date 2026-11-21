@@ -128,12 +128,7 @@ impl ClientCertVerifier for AnyClient {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
     }
     fn verify_tls13_signature(
         &self,
@@ -141,12 +136,7 @@ impl ClientCertVerifier for AnyClient {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
     }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
@@ -164,8 +154,7 @@ impl StandIn {
             next_ip: 10,
             ..World::default()
         };
-        w.projects
-            .insert("superbot".into(), json!({ "restricted": "true" }));
+        w.projects.insert("superbot".into(), json!({ "restricted": "true" }));
         w.projects.insert("default".into(), json!({}));
         let world = Arc::new(Mutex::new(w));
         let provider = pki::provider();
@@ -182,15 +171,8 @@ impl StandIn {
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let router = axum::Router::new()
-            .fallback(handle)
-            .with_state(world.clone());
-        tokio::spawn(pki::serve(
-            listener,
-            Arc::new(move || config.clone()),
-            router,
-            pki::lifetime,
-        ));
+        let router = axum::Router::new().fallback(handle).with_state(world.clone());
+        tokio::spawn(pki::serve(listener, Arc::new(move || config.clone()), router, pki::lifetime));
         StandIn {
             url: format!("https://127.0.0.1:{port}"),
             server_pem,
@@ -273,24 +255,14 @@ fn reply(status: StatusCode, v: Value, etag: Option<String>) -> Response {
 }
 
 fn extensions(missing: &[String]) -> Vec<&'static str> {
-    [
-        "network_acl",
-        "network_bridge_acl_devices",
-        "instances_rebuild",
-        "instance_create_start",
-        "instance_get_full",
-    ]
-    .into_iter()
-    .filter(|x| !missing.iter().any(|m| m == x))
-    .collect()
+    ["network_acl", "network_bridge_acl_devices", "instances_rebuild", "instance_create_start", "instance_get_full"]
+        .into_iter()
+        .filter(|x| !missing.iter().any(|m| m == x))
+        .collect()
 }
 
 fn sync(meta: Value) -> Response {
-    reply(
-        StatusCode::OK,
-        json!({ "type": "sync", "status": "Success", "status_code": 200, "metadata": meta }),
-        None,
-    )
+    reply(StatusCode::OK, json!({ "type": "sync", "status": "Success", "status_code": 200, "metadata": meta }), None)
 }
 
 fn err(code: u16, msg: &str) -> Response {
@@ -306,15 +278,7 @@ fn etag(v: &Value) -> String {
 }
 
 /// What an instance PUT may change (Incus's `InstancePut`).
-const WRITABLE: [&str; 7] = [
-    "architecture",
-    "config",
-    "devices",
-    "ephemeral",
-    "profiles",
-    "stateful",
-    "description",
-];
+const WRITABLE: [&str; 7] = ["architecture", "config", "devices", "ephemeral", "profiles", "stateful", "description"];
 
 fn writable(v: &Value) -> Value {
     let mut out = json!({});
@@ -362,11 +326,7 @@ fn op_json(id: &str, o: &Op) -> Value {
 
 impl World {
     /// Starts an async operation on `instances`, done unless `pending` is held.
-    fn op(
-        &mut self,
-        instances: Vec<String>,
-        pending: Option<(String, Instance)>,
-    ) -> (Response, bool) {
+    fn op(&mut self, instances: Vec<String>, pending: Option<(String, Instance)>) -> (Response, bool) {
         self.op_with(instances, pending, None)
     }
 
@@ -380,8 +340,7 @@ impl World {
         let id = format!("00000000-0000-4000-8000-{:012x}", self.next_op);
         let failed = self.fail_op.take();
         let held = failed.is_none()
-            && ((pending.is_some() && self.hold_creates)
-                || (rebuild.is_some() && self.hold_rebuilds));
+            && ((pending.is_some() && self.hold_creates) || (rebuild.is_some() && self.hold_rebuilds));
         let o = Op {
             status: match (&failed, held) {
                 (Some(_), _) => "Failure".into(),
@@ -395,10 +354,7 @@ impl World {
         };
         let body = json!({ "type": "async", "status": "Operation created", "status_code": 100, "operation": format!("/1.0/operations/{id}"), "metadata": op_json(&id, &o) });
         self.ops.insert(id, o);
-        (
-            reply(StatusCode::ACCEPTED, body, None),
-            failed.is_none() && !held,
-        )
+        (reply(StatusCode::ACCEPTED, body, None), failed.is_none() && !held)
     }
 
     fn used_by(&self, acl: &str) -> Vec<String> {
@@ -406,11 +362,8 @@ impl World {
             .iter()
             .filter(|(_, i)| {
                 i.body["devices"].as_object().is_some_and(|d| {
-                    d.values().any(|dev| {
-                        dev["security.acls"]
-                            .as_str()
-                            .is_some_and(|a| a.split(',').any(|x| x == acl))
-                    })
+                    d.values()
+                        .any(|dev| dev["security.acls"].as_str().is_some_and(|a| a.split(',').any(|x| x == acl)))
                 })
             })
             .map(|(n, i)| instance_url(n, &i.project))
@@ -433,8 +386,7 @@ impl World {
             } else {
                 json!([])
             };
-            v["state"] =
-                json!({ "status": i.status, "network": { "eth0": { "addresses": addresses } } });
+            v["state"] = json!({ "status": i.status, "network": { "eth0": { "addresses": addresses } } });
         }
         v
     }
@@ -466,13 +418,8 @@ impl World {
             "security.idmap.base",
             "security.idmap.size",
         ];
-        if let Some(k) = c
-            .as_object()
-            .and_then(|c| c.keys().find(|k| lowlevel.contains(&k.as_str())))
-        {
-            return Some(format!(
-                "Use of low-level config \"{k}\" on container is forbidden"
-            ));
+        if let Some(k) = c.as_object().and_then(|c| c.keys().find(|k| lowlevel.contains(&k.as_str()))) {
+            return Some(format!("Use of low-level config \"{k}\" on container is forbidden"));
         }
         let devices = body["devices"].as_object().cloned().unwrap_or_default();
         for d in devices.values() {
@@ -491,12 +438,7 @@ impl World {
         devices
             .values()
             .filter_map(|d| d["security.acls"].as_str())
-            .flat_map(|a| {
-                a.split(',')
-                    .filter(|x| !x.is_empty())
-                    .map(String::from)
-                    .collect::<Vec<_>>()
-            })
+            .flat_map(|a| a.split(',').filter(|x| !x.is_empty()).map(String::from).collect::<Vec<_>>())
             .find(|a| !self.acls.contains_key(a))
             .map(|a| format!("Network ACL {a:?} not found"))
     }
@@ -518,10 +460,9 @@ async fn handle(
     if !trusted {
         return err(403, "not authorized");
     }
-    let query: BTreeMap<String, String> =
-        url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
-            .into_owned()
-            .collect();
+    let query: BTreeMap<String, String> = url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
+        .into_owned()
+        .collect();
     let project = query.get("project").cloned().unwrap_or("default".into());
     let recursion = query.get("recursion").cloned().unwrap_or_default();
     let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
@@ -530,15 +471,9 @@ async fn handle(
         path: uri.path().to_string(),
         query: uri.query().unwrap_or_default().to_string(),
         body: body.clone(),
-        if_match: headers
-            .get("if-match")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from),
+        if_match: headers.get("if-match").and_then(|v| v.to_str().ok()).map(String::from),
     });
-    let if_match = headers
-        .get("if-match")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
+    let if_match = headers.get("if-match").and_then(|v| v.to_str().ok()).map(String::from);
     let parts: Vec<&str> = uri.path().trim_start_matches('/').split('/').collect();
     match (method.as_str(), &parts[..]) {
         ("GET", ["1.0"]) => sync(json!({
@@ -553,12 +488,8 @@ async fn handle(
         ("GET", ["1.0", "networks", n]) if *n == "incusbr0" => {
             sync(json!({ "name": n, "type": "bridge", "managed": true }))
         }
-        ("GET", ["1.0", "storage-pools", p]) if *p == "default" => {
-            sync(json!({ "name": p, "driver": "zfs" }))
-        }
-        ("GET", ["1.0", "storage-pools", p]) if *p == "plain" => {
-            sync(json!({ "name": p, "driver": "dir" }))
-        }
+        ("GET", ["1.0", "storage-pools", p]) if *p == "default" => sync(json!({ "name": p, "driver": "zfs" })),
+        ("GET", ["1.0", "storage-pools", p]) if *p == "plain" => sync(json!({ "name": p, "driver": "dir" })),
         ("GET", ["1.0", "networks" | "storage-pools", _]) => err(404, "Not found"),
         ("GET", ["1.0", "instances"]) => {
             let list: Vec<Value> = w
@@ -579,22 +510,14 @@ async fn handle(
             let Some(n) = body["name"].as_str().map(String::from) else {
                 return err(400, "No name provided");
             };
-            if w.instances.contains_key(&n)
-                || w.ops
-                    .values()
-                    .any(|o| o.pending.as_ref().is_some_and(|(p, _)| *p == n))
-            {
+            if w.instances.contains_key(&n) || w.ops.values().any(|o| o.pending.as_ref().is_some_and(|(p, _)| *p == n)) {
                 return err(500, &format!("Instance {n:?} already exists"));
             }
             if let Some(why) = w.refused(&project, &body).or_else(|| w.acls_exist(&body)) {
                 return err(400, &why);
             }
             w.next_ip += 1;
-            let ip = w
-                .addresses
-                .get(&n)
-                .cloned()
-                .unwrap_or(format!("10.20.0.{}", w.next_ip));
+            let ip = w.addresses.get(&n).cloned().unwrap_or(format!("10.20.0.{}", w.next_ip));
             let mut kept = body.clone();
             for k in ["name", "source", "start", "type"] {
                 kept.as_object_mut().unwrap().remove(k);
@@ -605,21 +528,14 @@ async fn handle(
             let i = Instance {
                 project: project.clone(),
                 body: kept,
-                status: if body["start"] == true {
-                    "Running".into()
-                } else {
-                    "Stopped".into()
-                },
+                status: if body["start"] == true { "Running".into() } else { "Stopped".into() },
                 ip,
                 location: query.get("target").cloned().unwrap_or("none".into()),
                 source: body["source"].clone(),
                 rebuilt: 0,
                 boots: (body["start"] == true) as usize,
             };
-            let (r, done) = w.op(
-                vec![instance_url(&n, &project)],
-                Some((n.clone(), i.clone())),
-            );
+            let (r, done) = w.op(vec![instance_url(&n, &project)], Some((n.clone(), i.clone())));
             if done {
                 w.instances.insert(n, i);
             }
@@ -627,12 +543,7 @@ async fn handle(
         }
         (m, ["1.0", "instances", n, rest @ ..]) => {
             let n = n.to_string();
-            let Some(mut i) = w
-                .instances
-                .get(&n)
-                .filter(|i| i.project == project)
-                .cloned()
-            else {
+            let Some(mut i) = w.instances.get(&n).filter(|i| i.project == project).cloned() else {
                 return err(404, "Instance not found");
             };
             if matches!(m, "PUT" | "PATCH") && rest.is_empty() && w.races > 0 {
@@ -685,12 +596,8 @@ async fn handle(
                 }
                 ("PUT", ["state"]) => {
                     let status = match (body["action"].as_str(), i.status.as_str()) {
-                        (Some("start"), "Running") => {
-                            return err(400, "The instance is already running");
-                        }
-                        (Some("stop"), "Stopped") => {
-                            return err(400, "The instance is already stopped");
-                        }
+                        (Some("start"), "Running") => return err(400, "The instance is already running"),
+                        (Some("stop"), "Stopped") => return err(400, "The instance is already stopped"),
                         (Some("start"), _) => "Running",
                         (Some("stop"), _) => "Stopped",
                         _ => return err(400, "Unknown action"),
@@ -707,11 +614,8 @@ async fn handle(
                     if i.status != "Stopped" {
                         return err(400, "Instance must be stopped to be rebuilt");
                     }
-                    let (r, done) = w.op_with(
-                        vec![instance_url(&n, &project)],
-                        None,
-                        Some((n.clone(), body["source"].clone())),
-                    );
+                    let (r, done) =
+                        w.op_with(vec![instance_url(&n, &project)], None, Some((n.clone(), body["source"].clone())));
                     if done {
                         let i = w.instances.get_mut(&n).unwrap();
                         i.rebuilt += 1;
@@ -725,9 +629,7 @@ async fn handle(
         ("GET", ["1.0", "operations"]) => {
             let mut by: BTreeMap<String, Vec<Value>> = BTreeMap::new();
             for (id, o) in &w.ops {
-                by.entry(o.status.to_ascii_lowercase())
-                    .or_default()
-                    .push(op_json(id, o));
+                by.entry(o.status.to_ascii_lowercase()).or_default().push(op_json(id, o));
             }
             sync(json!(by))
         }
@@ -745,11 +647,7 @@ async fn handle(
             let mut acl = body.clone();
             acl.as_object_mut().unwrap().remove("name");
             w.acls.insert(n, acl);
-            reply(
-                StatusCode::CREATED,
-                json!({ "type": "sync", "status": "Success", "status_code": 200, "metadata": {} }),
-                None,
-            )
+            reply(StatusCode::CREATED, json!({ "type": "sync", "status": "Success", "status_code": 200, "metadata": {} }), None)
         }
         (m, ["1.0", "network-acls", n]) => {
             let n = n.to_string();

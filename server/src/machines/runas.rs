@@ -74,20 +74,11 @@ pub fn useradd_args(name: &str, home: &Path) -> Vec<String> {
 }
 
 fn useradd_args_as(name: &str, home: &Path, comment: &str) -> Vec<String> {
-    [
-        "--system",
-        "--user-group",
-        "--no-create-home",
-        "--shell",
-        "/usr/sbin/nologin",
-        "--comment",
-        comment,
-        "--home-dir",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .chain([home.display().to_string(), name.to_string()])
-    .collect()
+    ["--system", "--user-group", "--no-create-home", "--shell", "/usr/sbin/nologin", "--comment", comment, "--home-dir"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain([home.display().to_string(), name.to_string()])
+        .collect()
 }
 
 fn run(program: &str, args: &[String]) -> Result<(), String> {
@@ -491,20 +482,14 @@ pub fn move_into(
         return Err(io::Error::other("nothing to move"));
     };
     let leaf = c(leaf.as_bytes())?;
-    let src = open_at(
-        libc::AT_FDCWD,
-        &c(parent.as_os_str().as_bytes())?,
-        dir_flags,
-    )?;
+    let src = open_at(libc::AT_FDCWD, &c(parent.as_os_str().as_bytes())?, dir_flags)?;
     let mut dir = open_at(libc::AT_FDCWD, &c(base.as_os_str().as_bytes())?, dir_flags)?;
     let mut to = base.to_path_buf();
     for part in under {
         let p = c(part.as_bytes())?;
         to.push(part);
         // SAFETY: an open descriptor and a C string.
-        let r = as_user(Some(ids), || unsafe {
-            libc::mkdirat(dir.as_raw_fd(), p.as_ptr(), 0o700)
-        })?;
+        let r = as_user(Some(ids), || unsafe { libc::mkdirat(dir.as_raw_fd(), p.as_ptr(), 0o700) })?;
         if r < 0 {
             let e = io::Error::last_os_error();
             if e.raw_os_error() != Some(libc::EEXIST) {
@@ -522,11 +507,7 @@ pub fn move_into(
     }
     let mut across = false;
     for n in 1..=100 {
-        let tried = if n == 1 {
-            name.to_string()
-        } else {
-            format!("{name}-{n}")
-        };
+        let tried = if n == 1 { name.to_string() } else { format!("{name}-{n}") };
         let t = c(tried.as_bytes())?;
         if !across {
             // SAFETY: open descriptors and C strings; never replaces what's there.
@@ -552,9 +533,7 @@ pub fn move_into(
         // On another filesystem: copied as `ids` into a folder made for it, then the
         // original deleted.
         // SAFETY: an open descriptor and a C string.
-        let r = as_user(Some(ids), || unsafe {
-            libc::mkdirat(dir.as_raw_fd(), t.as_ptr(), 0o700)
-        })?;
+        let r = as_user(Some(ids), || unsafe { libc::mkdirat(dir.as_raw_fd(), t.as_ptr(), 0o700) })?;
         if r < 0 {
             let e = io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EEXIST) {
@@ -575,9 +554,7 @@ pub fn move_into(
         std::fs::remove_dir_all(from)?;
         return Ok(made);
     }
-    Err(io::Error::other(format!(
-        "{name} and the next 99 names are taken"
-    )))
+    Err(io::Error::other(format!("{name} and the next 99 names are taken")))
 }
 
 /// Copies what's in `src` into `dst`, never following a link: folders, regular files
@@ -595,23 +572,16 @@ fn copy_tree(src: &OwnedFd, dst: &OwnedFd, depth: usize) -> io::Result<()> {
         match st.st_mode & libc::S_IFMT {
             libc::S_IFDIR => {
                 // SAFETY: an open descriptor and a C string.
-                last(
-                    unsafe { libc::mkdirat(dst.as_raw_fd(), name.as_ptr(), 0o700) },
-                    (),
-                )?;
+                last(unsafe { libc::mkdirat(dst.as_raw_fd(), name.as_ptr(), 0o700) }, ())?;
                 let from = open_at(src.as_raw_fd(), &name, libc::O_RDONLY | libc::O_DIRECTORY)?;
                 let into = open_at(dst.as_raw_fd(), &name, libc::O_RDONLY | libc::O_DIRECTORY)?;
                 copy_tree(&from, &into, depth + 1)?;
                 // SAFETY: an open descriptor.
-                last(
-                    unsafe { libc::fchmod(into.as_raw_fd(), mode as libc::mode_t) },
-                    (),
-                )?;
+                last(unsafe { libc::fchmod(into.as_raw_fd(), mode as libc::mode_t) }, ())?;
             }
             libc::S_IFREG => {
                 // What `hand_over` left someone else's stays out.
-                let Ok(from) = open_at(src.as_raw_fd(), &name, libc::O_RDONLY | libc::O_NONBLOCK)
-                else {
+                let Ok(from) = open_at(src.as_raw_fd(), &name, libc::O_RDONLY | libc::O_NONBLOCK) else {
                     continue;
                 };
                 copy_file(&from, dst, &name, mode)?;
@@ -619,24 +589,14 @@ fn copy_tree(src: &OwnedFd, dst: &OwnedFd, depth: usize) -> io::Result<()> {
             libc::S_IFLNK => {
                 let mut buf = vec![0u8; libc::PATH_MAX as usize];
                 // SAFETY: an open descriptor, a C string and a buffer of that length.
-                let n = unsafe {
-                    libc::readlinkat(
-                        src.as_raw_fd(),
-                        name.as_ptr(),
-                        buf.as_mut_ptr().cast(),
-                        buf.len(),
-                    )
-                };
+                let n = unsafe { libc::readlinkat(src.as_raw_fd(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
                 if n < 0 {
                     return Err(io::Error::last_os_error());
                 }
                 buf.truncate(n as usize);
                 let target = CString::new(buf).map_err(io::Error::other)?;
                 // SAFETY: two C strings and an open descriptor; the link is made, not followed.
-                last(
-                    unsafe { libc::symlinkat(target.as_ptr(), dst.as_raw_fd(), name.as_ptr()) },
-                    (),
-                )?;
+                last(unsafe { libc::symlinkat(target.as_ptr(), dst.as_raw_fd(), name.as_ptr()) }, ())?;
             }
             _ => {}
         }
@@ -662,10 +622,7 @@ fn copy_file(s: &OwnedFd, dst: &OwnedFd, to: &CStr, mode: u32) -> io::Result<()>
     let d = last(fd, ()).map(|()| unsafe { OwnedFd::from_raw_fd(fd) })?;
     let filled = (|| {
         // SAFETY: an open descriptor.
-        last(
-            unsafe { libc::fchmod(d.as_raw_fd(), (mode & !SETID) as libc::mode_t) },
-            (),
-        )?;
+        last(unsafe { libc::fchmod(d.as_raw_fd(), (mode & !SETID) as libc::mode_t) }, ())?;
         let (mut r, mut w) = (std::fs::File::from(s.try_clone()?), std::fs::File::from(d));
         io::copy(&mut r, &mut w)?;
         w.sync_all()
@@ -704,8 +661,7 @@ pub fn unshare_links(root: &Path, uid: u32) -> io::Result<u64> {
                     // Their own files may have any name, so the first free one is used.
                     let mut tmp = None;
                     for k in 0..1000 {
-                        let t = CString::new(format!(".superbot-unlinked-{k}"))
-                            .map_err(io::Error::other)?;
+                        let t = CString::new(format!(".superbot-unlinked-{k}")).map_err(io::Error::other)?;
                         match copy_file(&from, dir, &t, st.st_mode & 0o777) {
                             Ok(()) => {
                                 tmp = Some(t);
@@ -717,17 +673,7 @@ pub fn unshare_links(root: &Path, uid: u32) -> io::Result<u64> {
                     }
                     let tmp = tmp.ok_or_else(|| io::Error::other("no free name for a copy"))?;
                     // SAFETY: an open descriptor and two C strings; replaces the link only.
-                    last(
-                        unsafe {
-                            libc::renameat(
-                                dir.as_raw_fd(),
-                                tmp.as_ptr(),
-                                dir.as_raw_fd(),
-                                name.as_ptr(),
-                            )
-                        },
-                        (),
-                    )?;
+                    last(unsafe { libc::renameat(dir.as_raw_fd(), tmp.as_ptr(), dir.as_raw_fd(), name.as_ptr()) }, ())?;
                     *n += 1;
                 }
                 _ => {}
@@ -874,36 +820,12 @@ mod tests {
             p
         };
 
-        let to = move_into(
-            &staged("a"),
-            &base,
-            &["work", "from-teammates"],
-            "bea",
-            me(),
-        )
-        .unwrap();
+        let to = move_into(&staged("a"), &base, &["work", "from-teammates"], "bea", me()).unwrap();
         assert_eq!(to, base.join("work/from-teammates/bea"));
         assert_eq!(std::fs::read_to_string(to.join("notes.md")).unwrap(), "a");
-        assert_eq!(
-            std::fs::symlink_metadata(base.join("work/from-teammates"))
-                .unwrap()
-                .mode()
-                & 0o777,
-            0o700
-        );
-        let again = move_into(
-            &staged("b"),
-            &base,
-            &["work", "from-teammates"],
-            "bea",
-            me(),
-        )
-        .unwrap();
-        assert_eq!(
-            again,
-            base.join("work/from-teammates/bea-2"),
-            "never over what's there"
-        );
+        assert_eq!(std::fs::symlink_metadata(base.join("work/from-teammates")).unwrap().mode() & 0o777, 0o700);
+        let again = move_into(&staged("b"), &base, &["work", "from-teammates"], "bea", me()).unwrap();
+        assert_eq!(again, base.join("work/from-teammates/bea-2"), "never over what's there");
         assert_eq!(std::fs::read_to_string(to.join("notes.md")).unwrap(), "a");
 
         // A folder on the way that's a link is refused, and nothing lands where it points.
@@ -927,37 +849,18 @@ mod tests {
         std::fs::write(home.join("plain"), "mine").unwrap();
         std::fs::write(home.join("a/.superbot-unlinked-0"), "a file of theirs").unwrap();
 
-        assert_eq!(
-            unshare_links(&home, me().uid + 1).unwrap(),
-            0,
-            "someone else's: never read"
-        );
+        assert_eq!(unshare_links(&home, me().uid + 1).unwrap(), 0, "someone else's: never read");
         assert_eq!(std::fs::metadata(&outside).unwrap().nlink(), 2);
         assert_eq!(unshare_links(&home, me().uid).unwrap(), 1);
         let copy = std::fs::metadata(home.join("a/hard")).unwrap();
         assert_eq!((copy.nlink(), copy.mode() & 0o777), (1, 0o640));
-        assert_eq!(
-            std::fs::read_to_string(home.join("a/hard")).unwrap(),
-            "theirs"
-        );
+        assert_eq!(std::fs::read_to_string(home.join("a/hard")).unwrap(), "theirs");
         assert_eq!(std::fs::metadata(&outside).unwrap().nlink(), 1);
         assert_eq!(hand_over(&home, me()).unwrap().skipped, 0);
-        let mut names: Vec<_> = std::fs::read_dir(home.join("a"))
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name())
-            .collect();
+        let mut names: Vec<_> = std::fs::read_dir(home.join("a")).unwrap().flatten().map(|e| e.file_name()).collect();
         names.sort();
-        assert_eq!(
-            names,
-            [".superbot-unlinked-0", "hard"],
-            "no copy left behind"
-        );
-        assert_eq!(
-            std::fs::read_to_string(home.join("a/.superbot-unlinked-0")).unwrap(),
-            "a file of theirs",
-            "a name that's taken is left alone"
-        );
+        assert_eq!(names, [".superbot-unlinked-0", "hard"], "no copy left behind");
+        assert_eq!(std::fs::read_to_string(home.join("a/.superbot-unlinked-0")).unwrap(), "a file of theirs", "a name that's taken is left alone");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -973,41 +876,20 @@ mod tests {
         let from = shm.join(d.file_name().unwrap());
         std::fs::create_dir_all(from.join("sub")).unwrap();
         std::fs::write(from.join("sub/notes.md"), "a").unwrap();
-        std::fs::set_permissions(
-            from.join("sub/notes.md"),
-            std::fs::Permissions::from_mode(0o4750),
-        )
-        .unwrap();
+        std::fs::set_permissions(from.join("sub/notes.md"), std::fs::Permissions::from_mode(0o4750)).unwrap();
         std::os::unix::fs::symlink("/etc/passwd", from.join("link")).unwrap();
         std::fs::hard_link(from.join("sub/notes.md"), from.join("hard")).unwrap();
         let base = d.join("home");
         std::fs::create_dir_all(base.join("work/from-teammates/bea")).unwrap();
 
         let to = move_into(&from, &base, &["work", "from-teammates"], "bea", me()).unwrap();
-        assert_eq!(
-            to,
-            base.join("work/from-teammates/bea-2"),
-            "never over what's there"
-        );
-        assert_eq!(
-            std::fs::read_to_string(to.join("sub/notes.md")).unwrap(),
-            "a"
-        );
+        assert_eq!(to, base.join("work/from-teammates/bea-2"), "never over what's there");
+        assert_eq!(std::fs::read_to_string(to.join("sub/notes.md")).unwrap(), "a");
         let m = std::fs::metadata(to.join("sub/notes.md")).unwrap();
-        assert_eq!(
-            (m.mode() & 0o7777, m.nlink()),
-            (0o750, 1),
-            "no setuid, no shared links"
-        );
-        assert_eq!(
-            std::fs::read_link(to.join("link")).unwrap(),
-            Path::new("/etc/passwd")
-        );
+        assert_eq!((m.mode() & 0o7777, m.nlink()), (0o750, 1), "no setuid, no shared links");
+        assert_eq!(std::fs::read_link(to.join("link")).unwrap(), Path::new("/etc/passwd"));
         assert_eq!(std::fs::read_to_string(to.join("hard")).unwrap(), "a");
-        assert!(
-            std::fs::symlink_metadata(&from).is_err(),
-            "the original is gone"
-        );
+        assert!(std::fs::symlink_metadata(&from).is_err(), "the original is gone");
         let _ = std::fs::remove_dir_all(&d);
     }
 }

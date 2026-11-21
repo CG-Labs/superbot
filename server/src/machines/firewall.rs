@@ -41,12 +41,7 @@ fn flag(name: &str, raw: &str) -> Result<bool, String> {
 /// written is what is let in.
 pub fn cidr(raw: &str) -> Result<String, String> {
     let raw = raw.trim();
-    let bad = || {
-        format!(
-            "\"{}\" isn't an IP address or CIDR range",
-            crate::audit::clip(raw, 50)
-        )
-    };
+    let bad = || format!("\"{}\" isn't an IP address or CIDR range", crate::audit::clip(raw, 50));
     let (ip, len) = match raw.split_once('/') {
         Some((ip, len)) => (ip, Some(len)),
         None => (raw, None),
@@ -55,11 +50,7 @@ pub fn cidr(raw: &str) -> Result<String, String> {
     let max = if ip.is_ipv4() { 32 } else { 128 };
     let len = match len {
         None => max,
-        Some(l) => l
-            .parse::<u32>()
-            .ok()
-            .filter(|l| *l <= max)
-            .ok_or_else(bad)?,
+        Some(l) => l.parse::<u32>().ok().filter(|l| *l <= max).ok_or_else(bad)?,
     };
     let host_bits = match ip {
         IpAddr::V4(a) => u128::from(u32::from(a) & !u32::MAX.checked_shl(32 - len).unwrap_or(0)),
@@ -92,10 +83,7 @@ impl Settings {
         let sources = cidrs("MACHINE_FIREWALL_SOURCES", &var("MACHINE_FIREWALL_SOURCES"))?;
         let ssh = cidrs("MACHINE_SSH_SOURCES", &var("MACHINE_SSH_SOURCES"))?;
         if !on {
-            for (k, v) in [
-                ("MACHINE_FIREWALL_SOURCES", &sources),
-                ("MACHINE_SSH_SOURCES", &ssh),
-            ] {
+            for (k, v) in [("MACHINE_FIREWALL_SOURCES", &sources), ("MACHINE_SSH_SOURCES", &ssh)] {
                 if !v.is_empty() {
                     return Err(format!("{k} needs MACHINE_FIREWALL=on"));
                 }
@@ -159,9 +147,7 @@ impl Firewall {
             .rules
             .iter()
             .find(|r| r.label == SSH_RULE)
-            .map_or("closed".to_string(), |r| {
-                format!("from {}", r.sources.join(", "))
-            });
+            .map_or("closed".to_string(), |r| format!("from {}", r.sources.join(", ")));
         format!(
             "on ({}: agent port {} from {}; SSH {ssh})",
             self.label,
@@ -172,12 +158,10 @@ impl Firewall {
 }
 
 pub fn rules_json(rules: &[FirewallRule]) -> Value {
-    json!(
-        rules
-            .iter()
-            .map(|r| json!({ "label": r.label, "ports": r.ports, "from": r.sources }))
-            .collect::<Vec<_>>()
-    )
+    json!(rules
+        .iter()
+        .map(|r| json!({ "label": r.label, "ports": r.ports, "from": r.sources }))
+        .collect::<Vec<_>>())
 }
 
 /// A change to the firewall itself, not to one machine.
@@ -200,10 +184,7 @@ pub async fn ensure(
 ) -> Result<String, ProviderError> {
     let found = match p.find_firewall(&fw.label).await? {
         Some(f) => f,
-        None => match p
-            .create_firewall(&fw.label, std::slice::from_ref(&fw.tag), &fw.rules)
-            .await
-        {
+        None => match p.create_firewall(&fw.label, std::slice::from_ref(&fw.tag), &fw.rules).await {
             Ok(f) => {
                 record(
                     app,
@@ -284,10 +265,8 @@ pub async fn sync(app: &App, fw: &Firewall, p: &dyn MachineProvider) -> usize {
         .machines(None)
         .into_iter()
         .filter(|m| {
-            matches!(
-                m.state,
-                State::Provisioning | State::Running | State::Suspended
-            ) && m.provider_id.is_some()
+            matches!(m.state, State::Provisioning | State::Running | State::Suspended)
+                && m.provider_id.is_some()
                 && m.provider == p.name()
         })
         .collect();
@@ -355,9 +334,7 @@ pub async fn sync(app: &App, fw: &Firewall, p: &dyn MachineProvider) -> usize {
             // Couldn't read it this pass; attaching would fail if it's still there.
             continue;
         } else {
-            p.attach_firewall(&id, pid)
-                .await
-                .map(|()| (id.clone(), true))
+            p.attach_firewall(&id, pid).await.map(|()| (id.clone(), true))
         };
         match res {
             Ok((home, put_back)) => {
@@ -472,10 +449,7 @@ mod tests {
     #[test]
     fn settings_are_off_unless_asked_and_need_enrollment() {
         assert_eq!(Settings::from_env(&vars(&[])), Ok(None));
-        assert_eq!(
-            Settings::from_env(&vars(&[("MACHINE_FIREWALL", "off")])),
-            Ok(None)
-        );
+        assert_eq!(Settings::from_env(&vars(&[("MACHINE_FIREWALL", "off")])), Ok(None));
         for bad in [
             &[("MACHINE_FIREWALL", "maybe")][..],
             &[("MACHINE_SSH_SOURCES", "192.0.2.0/24")],
@@ -492,19 +466,13 @@ mod tests {
         let s = Settings::from_env(&vars(&[
             ("MACHINE_FIREWALL", "on"),
             ("MACHINE_CONTROL_URL", "https://cp.example:8443"),
-            (
-                "MACHINE_FIREWALL_SOURCES",
-                "198.51.100.9, 2001:db8::9, 198.51.100.9",
-            ),
+            ("MACHINE_FIREWALL_SOURCES", "198.51.100.9, 2001:db8::9, 198.51.100.9"),
         ]))
         .unwrap()
         .unwrap();
         assert_eq!(
             (s.sources.as_slice(), s.ssh.len()),
-            (
-                &["198.51.100.9/32".to_string(), "2001:db8::9/128".into()][..],
-                0
-            )
+            (&["198.51.100.9/32".to_string(), "2001:db8::9/128".into()][..], 0)
         );
     }
 

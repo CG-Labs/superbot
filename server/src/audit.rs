@@ -4,10 +4,10 @@
 //! event; `details` is scrubbed on write as a second line of defense.
 //! Design: docs/adr/0009-audit-events.md; per-user actors and IdP: 0019-audit-actors.md.
 
-use crate::db::{AuditEvent, Bot, now};
+use crate::db::{now, AuditEvent, Bot};
 use crate::runner::App;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -72,37 +72,21 @@ pub struct Actor {
 
 impl Actor {
     pub fn operator() -> Actor {
-        Actor {
-            kind: ActorKind::User,
-            id: Some("operator".into()),
-            ..Default::default()
-        }
+        Actor { kind: ActorKind::User, id: Some("operator".into()), ..Default::default() }
     }
 
     pub fn bot(id: Option<&str>, name: Option<&str>) -> Actor {
-        Actor {
-            kind: ActorKind::Bot,
-            id: id.map(String::from),
-            name: name.map(String::from),
-            ..Default::default()
-        }
+        Actor { kind: ActorKind::Bot, id: id.map(String::from), name: name.map(String::from), ..Default::default() }
     }
 
     /// A Bot, acting for its owner (ADR 0017: Bots act with their owner's access).
     pub fn for_bot(b: &Bot) -> Actor {
-        Actor {
-            on_behalf_of: Some(b.owner_id.clone()),
-            ..Actor::bot(Some(&b.id), Some(&b.name))
-        }
+        Actor { on_behalf_of: Some(b.owner_id.clone()), ..Actor::bot(Some(&b.id), Some(&b.name)) }
     }
 
     /// `part` names the component: `server`, `scheduler`, `approvals`, `retention`, ...
     pub fn system(part: &str) -> Actor {
-        Actor {
-            kind: ActorKind::System,
-            id: Some(part.into()),
-            ..Default::default()
-        }
+        Actor { kind: ActorKind::System, id: Some(part.into()), ..Default::default() }
     }
 
     pub fn method(mut self, m: &str) -> Actor {
@@ -153,17 +137,11 @@ pub struct Who {
 
 impl Who {
     pub fn system(part: &str) -> Who {
-        Who {
-            actor: Actor::system(part),
-            source: Source::default(),
-        }
+        Who { actor: Actor::system(part), source: Source::default() }
     }
 
     pub fn event(&self, action: &str) -> Event {
-        Event {
-            source: self.source.clone(),
-            ..Event::new(self.actor.clone(), action)
-        }
+        Event { source: self.source.clone(), ..Event::new(self.actor.clone(), action) }
     }
 }
 
@@ -223,41 +201,11 @@ impl Event {
 pub const REDACTED: &str = "[redacted]";
 const MAX_STRING: usize = 500;
 const MAX_ARRAY: usize = 100;
-const SECRET_WORDS: [&str; 11] = [
-    "password",
-    "passwd",
-    "secret",
-    "token",
-    "authorization",
-    "cookie",
-    "apikey",
-    "api_key",
-    "api-key",
-    "private_key",
-    "credential",
-];
+const SECRET_WORDS: [&str; 11] =
+    ["password", "passwd", "secret", "token", "authorization", "cookie", "apikey", "api_key", "api-key", "private_key", "credential"];
 /// Prefixes of well-known API keys and tokens (OpenAI/Anthropic, GitHub, GitLab, Slack, AWS, Google, JWTs).
-const TOKEN_PREFIXES: [&str; 19] = [
-    "sk-",
-    "sk_live_",
-    "sk_test_",
-    "ghp_",
-    "gho_",
-    "ghu_",
-    "ghs_",
-    "ghr_",
-    "github_pat_",
-    "glpat-",
-    "xoxb-",
-    "xoxp-",
-    "AKIA",
-    "AIza",
-    "eyJ",
-    "sbs_",
-    "sbc_",
-    "sbh_",
-    "sbp_",
-];
+const TOKEN_PREFIXES: [&str; 19] =
+    ["sk-", "sk_live_", "sk_test_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "glpat-", "xoxb-", "xoxp-", "AKIA", "AIza", "eyJ", "sbs_", "sbc_", "sbh_", "sbp_"];
 
 fn secret_name(k: &str) -> bool {
     let k = k.to_ascii_lowercase();
@@ -269,11 +217,7 @@ pub fn scrub(v: Value) -> Value {
         Value::Object(m) => Value::Object(
             m.into_iter()
                 .map(|(k, v)| {
-                    let v = if secret_name(&k) && !v.is_null() {
-                        json!(REDACTED)
-                    } else {
-                        scrub(v)
-                    };
+                    let v = if secret_name(&k) && !v.is_null() { json!(REDACTED) } else { scrub(v) };
                     (k, v)
                 })
                 .collect(),
@@ -288,11 +232,7 @@ pub fn scrub(v: Value) -> Value {
 
 /// Cuts to `max` characters and drops control characters other than newline and tab.
 pub fn clip(s: &str, max: usize) -> String {
-    let mut out: String = s
-        .chars()
-        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
-        .take(max)
-        .collect();
+    let mut out: String = s.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').take(max).collect();
     if s.chars().count() > max {
         out.push('…');
     }
@@ -357,11 +297,7 @@ fn redact_pairs(s: &str) -> String {
         }
         let key_end = i + b[i..].iter().take_while(|&&c| key_char(c)).count();
         // Closing quotes and brackets may sit between key and separator: `"token":`, `user[password]=`.
-        let mut j = key_end
-            + b[key_end..]
-                .iter()
-                .take_while(|&&c| matches!(c, b'"' | b'\'' | b'\\' | b'[' | b']'))
-                .count();
+        let mut j = key_end + b[key_end..].iter().take_while(|&&c| matches!(c, b'"' | b'\'' | b'\\' | b'[' | b']')).count();
         j += b[j..].iter().take_while(|&&c| c == b' ').count();
         let is_pair = j < b.len() && matches!(b[j], b':' | b'=') && !b[j..].starts_with(b"://");
         if !is_pair || !secret_name(&s[i..key_end]) {
@@ -384,34 +320,17 @@ fn redact_pairs(s: &str) -> String {
         };
         j += 1;
         j += b[j..].iter().take_while(|&&c| c == b' ').count();
-        let open = b[j..]
-            .iter()
-            .take_while(|&&c| matches!(c, b'"' | b'\'' | b'\\'))
-            .count();
+        let open = b[j..].iter().take_while(|&&c| matches!(c, b'"' | b'\'' | b'\\')).count();
         let mut start = j + open;
-        let word = |at: usize| {
-            if json {
-                json_word(b, at)
-            } else {
-                shell_word(s, at, outer)
-            }
-        };
-        let scheme = b[start..]
-            .iter()
-            .take_while(|&&c| c.is_ascii_alphabetic())
-            .count();
-        if open == 0
-            && is_auth_scheme(&s[start..start + scheme])
-            && b.get(start + scheme) == Some(&b' ')
-        {
+        let word = |at: usize| if json { json_word(b, at) } else { shell_word(s, at, outer) };
+        let scheme = b[start..].iter().take_while(|&&c| c.is_ascii_alphabetic()).count();
+        if open == 0 && is_auth_scheme(&s[start..start + scheme]) && b.get(start + scheme) == Some(&b' ') {
             // Authorization: Bearer <x>: keep the scheme, mask the credential.
             start += scheme;
             start += b[start..].iter().take_while(|&&c| c == b' ').count();
         }
         let end = match &s[j..j + open] {
-            "" if start < b.len() && matches!(b[start], b'{' | b'[') => {
-                closing_bracket(&b[start..]).map_or(b.len(), |n| start + n)
-            }
+            "" if start < b.len() && matches!(b[start], b'{' | b'[') => closing_bracket(&b[start..]).map_or(b.len(), |n| start + n),
             "" => word(start),
             "\"" => start + string_end(&b[start..]).unwrap_or(b.len() - start),
             q => s[start..].find(q).map_or(b.len(), |n| start + n),
@@ -429,10 +348,7 @@ fn redact_pairs(s: &str) -> String {
 
 /// End of a bare JSON value (number, `true`, ...).
 fn json_word(b: &[u8], at: usize) -> usize {
-    at + b[at..]
-        .iter()
-        .take_while(|&&c| !c.is_ascii_whitespace() && !b",}]\"".contains(&c))
-        .count()
+    at + b[at..].iter().take_while(|&&c| !c.is_ascii_whitespace() && !b",}]\"".contains(&c)).count()
 }
 
 /// End of an unquoted shell or form value. Inside a quoted argument (`outer`) it runs
@@ -447,9 +363,7 @@ fn shell_word(s: &str, at: usize, outer: Option<char>) -> usize {
             Some(q) if c == q as u8 || c == b'&' => break,
             Some(_) => e += 1,
             None if c.is_ascii_whitespace() || c == b'&' || c == b';' => break,
-            None if c == b'"' || c == b'\'' => {
-                e = s[e + 1..].find(c as char).map_or(b.len(), |n| e + n + 2)
-            }
+            None if c == b'"' || c == b'\'' => e = s[e + 1..].find(c as char).map_or(b.len(), |n| e + n + 2),
             None => e += 1,
         }
     }
@@ -501,11 +415,7 @@ fn quoted(word: &str) -> Mask {
     let open = |q: char| word.matches(q).count() % 2 == 1;
     let first = word.chars().find(|c| matches!(c, '\'' | '"'));
     let other = if first == Some('"') { '\'' } else { '"' };
-    first
-        .into_iter()
-        .chain([other])
-        .find(|&q| open(q))
-        .map_or(Mask::None, Mask::Quoted)
+    first.into_iter().chain([other]).find(|&q| open(q)).map_or(Mask::None, Mask::Quoted)
 }
 
 /// What to mask in the next word.
@@ -547,9 +457,7 @@ fn redact_word(word: &str) -> (String, Mask) {
                 return (word.into(), Mask::Word); // password: <x>
             }
             // Already masked by redact_pairs, up to a quote or the next field.
-            if let Some(rest) = value
-                .trim_start_matches(['"', '\'', '\\'])
-                .strip_prefix(REDACTED)
+            if let Some(rest) = value.trim_start_matches(['"', '\'', '\\']).strip_prefix(REDACTED)
                 && (rest.is_empty() || rest.starts_with(['"', '\'', '\\', '&', ';']))
             {
                 return (word.into(), quoted(word));
@@ -582,11 +490,7 @@ fn redact_word(word: &str) -> (String, Mask) {
     if s.split(['=', ':', '/', '?', '&']).any(known_token) {
         return (REDACTED.into(), Mask::None);
     }
-    if s == bare {
-        (word.into(), Mask::None)
-    } else {
-        (s, Mask::None)
-    }
+    if s == bare { (word.into(), Mask::None) } else { (s, Mask::None) }
 }
 
 // Queries: `GET /api/audit` and the CSV export share these filters.
@@ -624,17 +528,11 @@ pub struct Filter {
 }
 
 fn plain_id(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 128
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_.:@|".contains(c))
+    !s.is_empty() && s.len() <= 128 && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:@|".contains(c))
 }
 
 fn word(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 32
-        && s.chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    !s.is_empty() && s.len() <= 32 && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
 /// Unix ms, RFC 3339 (`2026-11-19T13:00:00Z`), or a UTC date (`2026-11-19`).
@@ -648,16 +546,10 @@ pub fn parse_time(s: &str, end: bool) -> Result<i64, String> {
         return Ok(t.timestamp_millis());
     }
     if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        let d = if end {
-            d.succ_opt().ok_or("Date out of range")?
-        } else {
-            d
-        };
+        let d = if end { d.succ_opt().ok_or("Date out of range")? } else { d };
         return Ok(d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis());
     }
-    Err(format!(
-        "Invalid time \"{s}\": use unix milliseconds, RFC 3339, or YYYY-MM-DD"
-    ))
+    Err(format!("Invalid time \"{s}\": use unix milliseconds, RFC 3339, or YYYY-MM-DD"))
 }
 
 impl Filter {
@@ -672,20 +564,9 @@ impl Filter {
             to: get("to").map(|v| parse_time(v, true)).transpose()?,
             ..Default::default()
         };
-        for a in get("action")
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|a| !a.is_empty())
-        {
+        for a in get("action").unwrap_or_default().split(',').map(str::trim).filter(|a| !a.is_empty()) {
             let name = a.strip_suffix(".*").unwrap_or(a);
-            if a != "*"
-                && (name.is_empty()
-                    || name.len() > 64
-                    || !name.chars().all(|c| {
-                        c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.'
-                    }))
-            {
+            if a != "*" && (name.is_empty() || name.len() > 64 || !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.')) {
                 return Err(format!("Invalid action filter \"{a}\""));
             }
             if a != "*" {
@@ -712,12 +593,7 @@ impl Filter {
                 _ => f.actor_id = id.map(String::from),
             }
         }
-        for m in get("method")
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-        {
+        for m in get("method").unwrap_or_default().split(',').map(str::trim).filter(|m| !m.is_empty()) {
             if !word(m) {
                 return Err(format!("Invalid method filter \"{m}\""));
             }
@@ -726,35 +602,15 @@ impl Filter {
         if f.methods.len() > 10 {
             return Err("At most 10 methods".into());
         }
-        let id = |k: &str| {
-            get(k)
-                .map(|v| {
-                    if plain_id(v) {
-                        Ok(v.to_string())
-                    } else {
-                        Err(format!("Invalid {k}"))
-                    }
-                })
-                .transpose()
-        };
+        let id = |k: &str| get(k).map(|v| if plain_id(v) { Ok(v.to_string()) } else { Err(format!("Invalid {k}")) }).transpose();
         f.idp_provider = id("idpProvider")?;
         f.session_id = id("session")?;
         f.on_behalf_of = match get("onBehalfOf") {
-            Some(e) if e.contains('@') && !crate::users::valid_email(e) => {
-                return Err("Invalid onBehalfOf".into());
-            }
+            Some(e) if e.contains('@') && !crate::users::valid_email(e) => return Err("Invalid onBehalfOf".into()),
             Some(e) if e.contains('@') => Some(e.into()),
             _ => id("onBehalfOf")?,
         };
-        f.idp = get("idp")
-            .map(|v| {
-                if word(v) {
-                    Ok(v.to_string())
-                } else {
-                    Err("Invalid idp".to_string())
-                }
-            })
-            .transpose()?;
+        f.idp = get("idp").map(|v| if word(v) { Ok(v.to_string()) } else { Err("Invalid idp".to_string()) }).transpose()?;
         if let Some(s) = get("subject") {
             if s.len() > 256 || s.chars().any(char::is_control) {
                 return Err("Invalid subject".into());
@@ -781,14 +637,7 @@ impl Filter {
             f.target_type = Some(kind.into());
             f.target_id = id.map(String::from);
         }
-        let cursor = |k: &str| {
-            get(k)
-                .map(|v| {
-                    v.parse::<i64>()
-                        .map_err(|_| format!("{k} must be an event id"))
-                })
-                .transpose()
-        };
+        let cursor = |k: &str| get(k).map(|v| v.parse::<i64>().map_err(|_| format!("{k} must be an event id"))).transpose();
         f.before = cursor("before")?;
         f.after = cursor("after")?;
         Ok(f)
@@ -801,12 +650,7 @@ impl Filter {
             self.actor_id = Some(id);
             self.actor_email = None;
         }
-        if let Some(id) = self
-            .on_behalf_of
-            .as_deref()
-            .filter(|k| k.contains('@'))
-            .and_then(&find)
-        {
+        if let Some(id) = self.on_behalf_of.as_deref().filter(|k| k.contains('@')).and_then(&find) {
             self.on_behalf_of = Some(id);
         }
     }
@@ -831,11 +675,7 @@ pub const CSV_HEADER: &str = "id,time,actor_kind,actor_id,actor_name,actor_subje
 actor_email,actor_role,auth_method,idp,idp_provider,session_id,on_behalf_of\r\n";
 
 pub fn csv_cell(s: &str) -> String {
-    let s = if s.starts_with(['=', '+', '-', '@', '\t', '\r']) {
-        format!("'{s}")
-    } else {
-        s.to_string()
-    };
+    let s = if s.starts_with(['=', '+', '-', '@', '\t', '\r']) { format!("'{s}") } else { s.to_string() };
     if s.contains([',', '"', '\r', '\n']) {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
@@ -920,10 +760,7 @@ impl Logins {
                 s.failures.clear();
             }
         }
-        let entry = s
-            .failures
-            .entry(client.into())
-            .or_insert((at - FAIL_WINDOW_MS, 0));
+        let entry = s.failures.entry(client.into()).or_insert((at - FAIL_WINDOW_MS, 0));
         if at - entry.0 < FAIL_WINDOW_MS || !budget {
             entry.1 += 1;
             return None;
@@ -945,9 +782,7 @@ pub fn retention_days(raw: &str) -> Result<Option<u32>, String> {
         "" | "0" => Ok(None),
         v => match v.parse::<u32>() {
             Ok(d) if (1..=MAX_RETENTION_DAYS).contains(&d) => Ok(Some(d)),
-            _ => Err(format!(
-                "AUDIT_RETENTION_DAYS must be a number of days from 1 to {MAX_RETENTION_DAYS}, or 0 to keep forever"
-            )),
+            _ => Err(format!("AUDIT_RETENTION_DAYS must be a number of days from 1 to {MAX_RETENTION_DAYS}, or 0 to keep forever")),
         },
     }
 }
@@ -957,10 +792,7 @@ pub fn start_retention(app: Arc<App>, days: Option<u32>) {
     let before = app.db.audit_retention();
     if before != days {
         app.db.set_audit_retention(days);
-        app.db.record(
-            &Event::new(Actor::system("retention"), "audit.retention_changed")
-                .details(json!({ "before": before, "after": days })),
-        );
+        app.db.record(&Event::new(Actor::system("retention"), "audit.retention_changed").details(json!({ "before": before, "after": days })));
     }
     let Some(days) = days else { return };
     tokio::spawn(async move {
@@ -975,10 +807,7 @@ pub fn prune(app: &App, days: u32) {
     let cutoff = now() - days as i64 * 86_400_000;
     match app.db.prune_audit() {
         Ok(0) => {}
-        Ok(n) => app.db.record(
-            &Event::new(Actor::system("retention"), "audit.pruned")
-                .details(json!({ "deleted": n, "olderThan": cutoff, "retentionDays": days })),
-        ),
+        Ok(n) => app.db.record(&Event::new(Actor::system("retention"), "audit.pruned").details(json!({ "deleted": n, "olderThan": cutoff, "retentionDays": days }))),
         Err(e) => eprintln!("audit retention: {e}"),
     }
 }
@@ -993,17 +822,8 @@ mod tests {
         assert_eq!(csv_cell("a,b"), "\"a,b\"");
         assert_eq!(csv_cell("say \"hi\""), "\"say \"\"hi\"\"\"");
         assert_eq!(csv_cell("two\nlines"), "\"two\nlines\"");
-        assert_eq!(
-            csv_cell("=HYPERLINK(\"http://x\")"),
-            "\"'=HYPERLINK(\"\"http://x\"\")\""
-        );
-        for (raw, safe) in [
-            ("=1+1", "'=1+1"),
-            ("+1", "'+1"),
-            ("-1", "'-1"),
-            ("@SUM(A1)", "'@SUM(A1)"),
-            ("\tx", "'\tx"),
-        ] {
+        assert_eq!(csv_cell("=HYPERLINK(\"http://x\")"), "\"'=HYPERLINK(\"\"http://x\"\")\"");
+        for (raw, safe) in [("=1+1", "'=1+1"), ("+1", "'+1"), ("-1", "'-1"), ("@SUM(A1)", "'@SUM(A1)"), ("\tx", "'\tx")] {
             assert_eq!(csv_cell(raw), safe, "{raw:?}");
         }
         assert_eq!(csv_cell("\rx"), "\"'\rx\"");
@@ -1044,11 +864,7 @@ mod tests {
         );
         let header: Vec<&str> = CSV_HEADER.trim_end().split(',').collect();
         assert_eq!(header.len(), 21);
-        assert_eq!(
-            header[..14].join(","),
-            "id,time,actor_kind,actor_id,actor_name,actor_subject,action,target_type,target_id,bot_id,outcome,ip,user_agent,details",
-            "old columns stay put"
-        );
+        assert_eq!(header[..14].join(","), "id,time,actor_kind,actor_id,actor_name,actor_subject,action,target_type,target_id,bot_id,outcome,ip,user_agent,details", "old columns stay put");
         let sso = AuditEvent {
             actor_kind: "user".into(),
             actor_id: Some("u1".into()),
@@ -1065,10 +881,7 @@ mod tests {
         };
         let row = csv_row(&sso);
         let cells: Vec<&str> = row.trim_end().rsplitn(8, ',').collect();
-        assert_eq!(
-            cells[..7],
-            ["", "s1", "work", "entra", "sso", "admin", "ada@example.com"]
-        );
+        assert_eq!(cells[..7], ["", "s1", "work", "entra", "sso", "admin", "ada@example.com"]);
     }
 
     #[test]
@@ -1091,33 +904,14 @@ mod tests {
             prompts: None,
         };
         let a = Actor::for_bot(&owner).method("bot_token");
-        assert_eq!(
-            (a.kind, a.id.as_deref(), a.name.as_deref()),
-            (ActorKind::Bot, Some("b1"), Some("Scout"))
-        );
-        assert_eq!(
-            (a.on_behalf_of.as_deref(), a.method.as_deref()),
-            (Some("u1"), Some("bot_token"))
-        );
-        let who = Who {
-            actor: a.clone(),
-            source: Source {
-                ip: Some("192.0.2.1".into()),
-                user_agent: None,
-            },
-        };
+        assert_eq!((a.kind, a.id.as_deref(), a.name.as_deref()), (ActorKind::Bot, Some("b1"), Some("Scout")));
+        assert_eq!((a.on_behalf_of.as_deref(), a.method.as_deref()), (Some("u1"), Some("bot_token")));
+        let who = Who { actor: a.clone(), source: Source { ip: Some("192.0.2.1".into()), user_agent: None } };
         let back: Who = serde_json::from_str(&serde_json::to_string(&who).unwrap()).unwrap();
         assert_eq!((back.actor, back.source), (a, who.source));
         let old: Who = serde_json::from_str(r#"{"actor":{"kind":"user","id":"operator","name":null,"subject":null},"source":{"ip":null,"userAgent":null}}"#).unwrap();
-        assert_eq!(
-            old.actor,
-            Actor::operator(),
-            "fields added later default to empty"
-        );
-        assert_eq!(
-            Actor::system("scheduler").on_behalf_of("u1").kind,
-            ActorKind::System
-        );
+        assert_eq!(old.actor, Actor::operator(), "fields added later default to empty");
+        assert_eq!(Actor::system("scheduler").on_behalf_of("u1").kind, ActorKind::System);
     }
 
     #[test]
@@ -1135,160 +929,56 @@ mod tests {
         for leak in ["abc123", "me:pw", "t0p", "p4ss"] {
             assert!(!s.contains(leak), "{leak} in {s}");
         }
-        assert!(
-            s.starts_with("curl -H 'Authorization: Bearer [redacted]"),
-            "{s}"
-        );
-        assert_eq!(
-            redact_text("export OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwx"),
-            "export OPENAI_API_KEY=[redacted]"
-        );
-        assert_eq!(
-            redact_text("git push origin ghp_abcdefghijklmnopqrstuvwxyz0123"),
-            "git push origin [redacted]"
-        );
-        assert_eq!(
-            redact_text("botctl login sbc_0123456789abcdef0123456789"),
-            "botctl login [redacted]"
-        );
-        assert_eq!(
-            redact_text("SUPERBOT_TOKEN=sbs_0123456789abcdef0123456789 botctl"),
-            "SUPERBOT_TOKEN=[redacted] botctl"
-        );
+        assert!(s.starts_with("curl -H 'Authorization: Bearer [redacted]"), "{s}");
+        assert_eq!(redact_text("export OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwx"), "export OPENAI_API_KEY=[redacted]");
+        assert_eq!(redact_text("git push origin ghp_abcdefghijklmnopqrstuvwxyz0123"), "git push origin [redacted]");
+        assert_eq!(redact_text("botctl login sbc_0123456789abcdef0123456789"), "botctl login [redacted]");
+        assert_eq!(redact_text("SUPERBOT_TOKEN=sbs_0123456789abcdef0123456789 botctl"), "SUPERBOT_TOKEN=[redacted] botctl");
         assert_eq!(redact_text("ls -la  /tmp\nrm x"), "ls -la  /tmp\nrm x");
         assert_eq!(redact_text("password: hunter2"), "password: [redacted]");
-        assert_eq!(
-            redact_text("curl -u admin:hunter2 https://x"),
-            "curl -u admin:[redacted] https://x"
-        );
-        assert_eq!(
-            redact_text("curl --user=admin:hunter2 x"),
-            "curl --user=admin:[redacted] x"
-        );
-        assert_eq!(
-            redact_text("git push -u origin main"),
-            "git push -u origin main"
-        );
+        assert_eq!(redact_text("curl -u admin:hunter2 https://x"), "curl -u admin:[redacted] https://x");
+        assert_eq!(redact_text("curl --user=admin:hunter2 x"), "curl --user=admin:[redacted] x");
+        assert_eq!(redact_text("git push -u origin main"), "git push -u origin main");
         // Quoted secrets with spaces are masked to the closing quote.
-        assert_eq!(
-            redact_text("tool --password 'my secret pass' --verbose"),
-            "tool --password [redacted] --verbose"
-        );
-        assert_eq!(
-            redact_text("tool --password=\"my secret pass\" x"),
-            "tool --password=\"[redacted]\" x"
-        );
-        assert_eq!(
-            redact_text("export DB_PASSWORD='a b c'; run"),
-            "export DB_PASSWORD='[redacted]'; run"
-        );
-        assert_eq!(
-            redact_text("curl -u 'admin:my pass word' https://x"),
-            "curl -u 'admin:[redacted] https://x"
-        );
-        assert_eq!(
-            redact_text("curl --user=\"admin:my pass\" https://x"),
-            "curl --user=\"admin:[redacted] https://x"
-        );
-        assert_eq!(
-            redact_text("run \"password=my secret\" next"),
-            "run \"password=[redacted]\" next"
-        );
-        assert_eq!(
-            redact_text("login --token \"it's a secret\" ok"),
-            "login --token [redacted] ok"
-        );
-        assert_eq!(
-            redact_text("tool --password 'never closed and more"),
-            "tool --password [redacted] "
-        );
-        assert_eq!(
-            redact_text("echo 'hello world' --password 'x y'"),
-            "echo 'hello world' --password [redacted] "
-        );
+        assert_eq!(redact_text("tool --password 'my secret pass' --verbose"), "tool --password [redacted] --verbose");
+        assert_eq!(redact_text("tool --password=\"my secret pass\" x"), "tool --password=\"[redacted]\" x");
+        assert_eq!(redact_text("export DB_PASSWORD='a b c'; run"), "export DB_PASSWORD='[redacted]'; run");
+        assert_eq!(redact_text("curl -u 'admin:my pass word' https://x"), "curl -u 'admin:[redacted] https://x");
+        assert_eq!(redact_text("curl --user=\"admin:my pass\" https://x"), "curl --user=\"admin:[redacted] https://x");
+        assert_eq!(redact_text("run \"password=my secret\" next"), "run \"password=[redacted]\" next");
+        assert_eq!(redact_text("login --token \"it's a secret\" ok"), "login --token [redacted] ok");
+        assert_eq!(redact_text("tool --password 'never closed and more"), "tool --password [redacted] ");
+        assert_eq!(redact_text("echo 'hello world' --password 'x y'"), "echo 'hello world' --password [redacted] ");
         // Secrets after a harmless key, as in MCP tool arguments, plain, escaped, nested, or cut short.
-        assert_eq!(
-            redact_text(r#"mcp__send {"message":"hello","token":"hunter2"}"#),
-            r#"mcp__send {"message":"hello","token":"[redacted]"}"#
-        );
-        assert_eq!(
-            redact_text(r#"mcp__send {"text":"a b","api_key":"x \"y\" z","n":1}"#),
-            r#"mcp__send {"text":"a b","api_key":"[redacted]","n":1}"#
-        );
-        assert_eq!(
-            redact_text(r#"x {"body":"{\"password\":\"hunter2\"}"}"#),
-            r#"x {"body":"{\"password\":\"[redacted]\"}"}"#
-        );
-        assert_eq!(
-            redact_text(r#"x {"credentials":{"user":"a","pass":"hunter2"},"ok":true}"#),
-            r#"x {"credentials":[redacted],"ok":true}"#
-        );
-        assert_eq!(
-            redact_text(r#"x {"a":1,"secret":"hunter2 and more"#),
-            r#"x {"a":1,"secret":"[redacted]"#
-        );
-        assert_eq!(
-            redact_text("a=1&password=hunter2&b=2"),
-            "a=1&password=[redacted]&b=2"
-        );
+        assert_eq!(redact_text(r#"mcp__send {"message":"hello","token":"hunter2"}"#), r#"mcp__send {"message":"hello","token":"[redacted]"}"#);
+        assert_eq!(redact_text(r#"mcp__send {"text":"a b","api_key":"x \"y\" z","n":1}"#), r#"mcp__send {"text":"a b","api_key":"[redacted]","n":1}"#);
+        assert_eq!(redact_text(r#"x {"body":"{\"password\":\"hunter2\"}"}"#), r#"x {"body":"{\"password\":\"[redacted]\"}"}"#);
+        assert_eq!(redact_text(r#"x {"credentials":{"user":"a","pass":"hunter2"},"ok":true}"#), r#"x {"credentials":[redacted],"ok":true}"#);
+        assert_eq!(redact_text(r#"x {"a":1,"secret":"hunter2 and more"#), r#"x {"a":1,"secret":"[redacted]"#);
+        assert_eq!(redact_text("a=1&password=hunter2&b=2"), "a=1&password=[redacted]&b=2");
         assert_eq!(
             redact_text("curl --data 'user[password]=hunter2&user[name]=a' https://x"),
             "curl --data 'user[password]=[redacted]&user[name]=a' https://x"
         );
-        assert_eq!(
-            redact_text("user[password][]=hunter2"),
-            "user[password][]=[redacted]"
-        );
-        assert_eq!(
-            redact_text("user%5Bpassword%5D=hunter2&x=1"),
-            "user%5Bpassword%5D=[redacted]&x=1"
-        );
-        assert_eq!(
-            redact_text("curl --password=abc,def}x] https://x"),
-            "curl --password=[redacted] https://x"
-        );
-        assert_eq!(
-            redact_text("tool --token=ab\"c d\"e next"),
-            "tool --token=[redacted] next"
-        );
-        assert_eq!(
-            redact_text("curl -d 'password=a b,c&x=1' u"),
-            "curl -d 'password=[redacted]&x=1' u"
-        );
-        assert_eq!(
-            redact_text("PASSWORD=abc;echo ok"),
-            "PASSWORD=[redacted];echo ok"
-        );
-        assert_eq!(
-            redact_text(r#"{"message":"my token is mine","n":2}"#),
-            r#"{"message":"my token is mine","n":2}"#
-        );
+        assert_eq!(redact_text("user[password][]=hunter2"), "user[password][]=[redacted]");
+        assert_eq!(redact_text("user%5Bpassword%5D=hunter2&x=1"), "user%5Bpassword%5D=[redacted]&x=1");
+        assert_eq!(redact_text("curl --password=abc,def}x] https://x"), "curl --password=[redacted] https://x");
+        assert_eq!(redact_text("tool --token=ab\"c d\"e next"), "tool --token=[redacted] next");
+        assert_eq!(redact_text("curl -d 'password=a b,c&x=1' u"), "curl -d 'password=[redacted]&x=1' u");
+        assert_eq!(redact_text("PASSWORD=abc;echo ok"), "PASSWORD=[redacted];echo ok");
+        assert_eq!(redact_text(r#"{"message":"my token is mine","n":2}"#), r#"{"message":"my token is mine","n":2}"#);
         assert_eq!(redact_text("token=é€x y"), "token=[redacted] y");
-        assert_eq!(
-            redact_text("pässword=ü token:'é"),
-            "pässword=ü token:'[redacted]"
-        );
+        assert_eq!(redact_text("pässword=ü token:'é"), "pässword=ü token:'[redacted]");
         // Linear in the input: many secret pairs after many quotes.
         let big = "'a' ".repeat(50_000) + &"token=x ".repeat(50_000);
         let t = std::time::Instant::now();
         assert!(!redact_text(&big).contains("=x"));
-        assert!(
-            t.elapsed() < std::time::Duration::from_secs(2),
-            "{:?}",
-            t.elapsed()
-        );
+        assert!(t.elapsed() < std::time::Duration::from_secs(2), "{:?}", t.elapsed());
         let url = format!("https://user:{}@example.com/x", "p".repeat(1_100));
         let v = scrub(json!({ "subject": format!("git clone {url}") }));
         assert!(!v["subject"].as_str().unwrap().contains("ppp"), "{v}");
         // Cut-short or odd input never panics.
-        for odd in [
-            "token=",
-            "password:\"",
-            "token={",
-            "secret=\"\\",
-            "key: [1, {",
-            "token\\\":\\\"x",
-        ] {
+        for odd in ["token=", "password:\"", "token={", "secret=\"\\", "key: [1, {", "token\\\":\\\"x"] {
             redact_text(odd);
         }
         let long = scrub(json!("x".repeat(2000)));
@@ -1297,71 +987,26 @@ mod tests {
 
     #[test]
     fn filters_parse_and_reject() {
-        let q = |pairs: &[(&str, &str)]| {
-            Filter::from_query(
-                &pairs
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect(),
-            )
-        };
-        let f = q(&[
-            ("from", "2026-11-01"),
-            ("to", "2026-11-01"),
-            ("action", "bot.created, approval.*"),
-            ("actor", "bot:abc"),
-            ("outcome", "denied"),
-        ])
-        .unwrap();
+        let q = |pairs: &[(&str, &str)]| Filter::from_query(&pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect());
+        let f = q(&[("from", "2026-11-01"), ("to", "2026-11-01"), ("action", "bot.created, approval.*"), ("actor", "bot:abc"), ("outcome", "denied")]).unwrap();
         assert_eq!(f.to.unwrap() - f.from.unwrap(), 86_400_000);
         assert_eq!(f.actions, ["bot.created", "approval.*"]);
-        assert_eq!(
-            (f.actor_kind.as_deref(), f.actor_id.as_deref()),
-            (Some("bot"), Some("abc"))
-        );
-        assert_eq!(
-            q(&[("from", "2026-11-19T13:00:00Z")]).unwrap().from,
-            Some(1_795_093_200_000)
-        );
-        assert_eq!(
-            q(&[("from", "2026-11-19T14:00:00+01:00")]).unwrap().from,
-            Some(1_795_093_200_000)
-        );
-        assert_eq!(
-            q(&[("from", "1700000000000")]).unwrap().from,
-            Some(1_700_000_000_000)
-        );
+        assert_eq!((f.actor_kind.as_deref(), f.actor_id.as_deref()), (Some("bot"), Some("abc")));
+        assert_eq!(q(&[("from", "2026-11-19T13:00:00Z")]).unwrap().from, Some(1_795_093_200_000));
+        assert_eq!(q(&[("from", "2026-11-19T14:00:00+01:00")]).unwrap().from, Some(1_795_093_200_000));
+        assert_eq!(q(&[("from", "1700000000000")]).unwrap().from, Some(1_700_000_000_000));
         assert_eq!(q(&[("action", "*")]).unwrap().actions.len(), 0);
         let t = q(&[("target", "approval:a1b2c3d4")]).unwrap();
-        assert_eq!(
-            (t.target_type.as_deref(), t.target_id.as_deref()),
-            (Some("approval"), Some("a1b2c3d4"))
-        );
+        assert_eq!((t.target_type.as_deref(), t.target_id.as_deref()), (Some("approval"), Some("a1b2c3d4")));
         assert_eq!(q(&[("target", "bot")]).unwrap().target_id, None);
-        for bad in [
-            ("from", "yesterday"),
-            ("action", "x'; DROP"),
-            ("actor", "admin"),
-            ("actor", "bot:a b"),
-            ("outcome", "ok"),
-            ("before", "x"),
-            ("target", "Approval:x"),
-            ("target", "approval:a b"),
-        ] {
+        for bad in [("from", "yesterday"), ("action", "x'; DROP"), ("actor", "admin"), ("actor", "bot:a b"), ("outcome", "ok"), ("before", "x"), ("target", "Approval:x"), ("target", "approval:a b")] {
             assert!(q(&[bad]).is_err(), "{bad:?}");
         }
     }
 
     #[test]
     fn person_filters_parse_and_reject() {
-        let q = |pairs: &[(&str, &str)]| {
-            Filter::from_query(
-                &pairs
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect(),
-            )
-        };
+        let q = |pairs: &[(&str, &str)]| Filter::from_query(&pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect());
         let f = q(&[
             ("actor", "user:ada@example.com"),
             ("method", "sso, password"),
@@ -1372,74 +1017,27 @@ mod tests {
             ("onBehalfOf", "u42"),
         ])
         .unwrap();
-        assert_eq!(
-            (
-                f.actor_kind.as_deref(),
-                f.actor_id.as_deref(),
-                f.actor_email.as_deref()
-            ),
-            (Some("user"), None, Some("ada@example.com"))
-        );
+        assert_eq!((f.actor_kind.as_deref(), f.actor_id.as_deref(), f.actor_email.as_deref()), (Some("user"), None, Some("ada@example.com")));
         assert_eq!(f.methods, ["sso", "password"]);
-        assert_eq!(
-            (
-                f.idp_provider.as_deref(),
-                f.idp.as_deref(),
-                f.session_id.as_deref()
-            ),
-            (Some("work-entra"), Some("entra"), Some("s0123abcd"))
-        );
-        assert_eq!(
-            (f.subject.as_deref(), f.on_behalf_of.as_deref()),
-            (
-                Some("https://login.microsoftonline.com/t1/v2.0|oid 1"),
-                Some("u42")
-            )
-        );
+        assert_eq!((f.idp_provider.as_deref(), f.idp.as_deref(), f.session_id.as_deref()), (Some("work-entra"), Some("entra"), Some("s0123abcd")));
+        assert_eq!((f.subject.as_deref(), f.on_behalf_of.as_deref()), (Some("https://login.microsoftonline.com/t1/v2.0|oid 1"), Some("u42")));
         let d = f.describe();
-        assert_eq!(
-            (
-                d["actorEmail"].as_str(),
-                d["methods"][1].as_str(),
-                d["onBehalfOf"].as_str()
-            ),
-            (Some("ada@example.com"), Some("password"), Some("u42"))
-        );
+        assert_eq!((d["actorEmail"].as_str(), d["methods"][1].as_str(), d["onBehalfOf"].as_str()), (Some("ada@example.com"), Some("password"), Some("u42")));
         // A Bot's id never becomes an email lookup.
         let bot = q(&[("actor", "bot:a@b")]).unwrap();
-        assert_eq!(
-            (bot.actor_id.as_deref(), bot.actor_email),
-            (Some("a@b"), None)
-        );
+        assert_eq!((bot.actor_id.as_deref(), bot.actor_email), (Some("a@b"), None));
         // An email resolves to whoever has it now; an unknown one stays an email.
-        let mut f = q(&[
-            ("actor", "user:ada@example.com"),
-            ("onBehalfOf", "ada@example.com"),
-        ])
-        .unwrap();
+        let mut f = q(&[("actor", "user:ada@example.com"), ("onBehalfOf", "ada@example.com")]).unwrap();
         f.resolve_users(|k| (k == "ada@example.com").then(|| "u1".to_string()));
-        assert_eq!(
-            (
-                f.actor_id.as_deref(),
-                f.actor_email,
-                f.on_behalf_of.as_deref()
-            ),
-            (Some("u1"), None, Some("u1"))
-        );
+        assert_eq!((f.actor_id.as_deref(), f.actor_email, f.on_behalf_of.as_deref()), (Some("u1"), None, Some("u1")));
         let mut f = q(&[("actor", "user:old@example.com")]).unwrap();
         f.resolve_users(|_| None);
-        assert_eq!(
-            (f.actor_id, f.actor_email.as_deref()),
-            (None, Some("old@example.com"))
-        );
+        assert_eq!((f.actor_id, f.actor_email.as_deref()), (None, Some("old@example.com")));
         // Any address a user can have can be searched, not only id-shaped ones.
         let long = format!("{}@example.com", "a".repeat(140));
         for email in ["ada+work@example.com", "zoë@example.com", long.as_str()] {
             let f = q(&[("actor", &format!("user:{email}")), ("onBehalfOf", email)]).unwrap();
-            assert_eq!(
-                (f.actor_email.as_deref(), f.on_behalf_of.as_deref()),
-                (Some(email), Some(email))
-            );
+            assert_eq!((f.actor_email.as_deref(), f.on_behalf_of.as_deref()), (Some(email), Some(email)));
         }
         let many = ["sso"; 11].join(",");
         for bad in [
@@ -1476,9 +1074,7 @@ mod tests {
         assert_eq!(l.failure("1.2.3.4", FAIL_WINDOW_MS), Some(2));
         // Many IPs: at most MAX_FAIL_EVENTS_PER_WINDOW events per window in total.
         let l = Logins::default();
-        let logged = (0..500)
-            .filter(|i| l.failure(&format!("10.0.0.{i}"), 5).is_some())
-            .count();
+        let logged = (0..500).filter(|i| l.failure(&format!("10.0.0.{i}"), 5).is_some()).count();
         assert_eq!(logged, MAX_FAIL_EVENTS_PER_WINDOW as usize);
     }
 

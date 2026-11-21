@@ -16,23 +16,20 @@ mod audit;
 mod audit_http_tests;
 #[cfg(test)]
 mod auth_review_http_tests;
-mod billing;
 #[cfg(test)]
-mod billing_http_tests;
+mod interface_http_tests;
 #[cfg(test)]
 mod command_analysis_http_tests;
 mod cron;
-mod db;
 mod handover;
 #[cfg(test)]
 mod handover_http_tests;
 #[cfg(test)]
 mod harness_version_http_tests;
-#[cfg(test)]
-mod interface_http_tests;
 mod isolation;
 #[cfg(test)]
 mod isolation_http_tests;
+mod db;
 mod license;
 #[cfg(test)]
 mod license_http_tests;
@@ -48,11 +45,11 @@ mod machines_incus_tests;
 #[cfg(test)]
 mod machines_lockdown_tests;
 #[cfg(test)]
-mod machines_logins_tests;
-#[cfg(test)]
 mod machines_mtls_tests;
 #[cfg(test)]
-mod machines_offboard_tests;
+mod machines_logins_tests;
+#[cfg(test)]
+mod machines_upkeep_tests;
 #[cfg(test)]
 mod machines_rebuild_tests;
 #[cfg(test)]
@@ -60,11 +57,11 @@ mod machines_screens_tests;
 #[cfg(test)]
 mod machines_teammates_tests;
 #[cfg(test)]
-mod machines_upkeep_tests;
+mod machines_offboard_tests;
+mod passwd;
 mod notify;
 #[cfg(test)]
 mod notify_http_tests;
-mod passwd;
 mod paths;
 mod policy;
 #[cfg(test)]
@@ -80,56 +77,60 @@ mod scim;
 #[cfg(test)]
 mod scim_http_tests;
 mod screen;
-mod scripts;
 mod secrets;
 mod setup;
 #[cfg(test)]
 mod setup_http_tests;
 #[cfg(test)]
 mod shared_bots_http_tests;
+mod scripts;
 mod shell;
 mod signups;
 #[cfg(test)]
 mod signups_http_tests;
 mod sso;
-#[cfg(test)]
-mod sso_http_tests;
-#[cfg(test)]
-mod sso_saml_http_tests;
-#[cfg(test)]
-mod sso_social_http_tests;
 mod stripe;
-#[cfg(test)]
-mod teammate_accounts_http_tests;
-mod teammate_logins;
-mod teammate_removals;
-#[cfg(test)]
-mod teammate_removals_http_tests;
 mod tiers;
+mod billing;
 #[cfg(test)]
 mod tiers_http_tests;
+#[cfg(test)]
+mod billing_http_tests;
 mod usage;
 #[cfg(test)]
 mod usage_http_tests;
 mod users;
 #[cfg(test)]
 mod users_http_tests;
+#[cfg(test)]
+mod sso_http_tests;
+#[cfg(test)]
+mod sso_saml_http_tests;
+#[cfg(test)]
+mod sso_social_http_tests;
+#[cfg(test)]
+mod teammate_accounts_http_tests;
+mod teammate_logins;
+mod teammate_removals;
+#[cfg(test)]
+mod teammate_removals_http_tests;
 
 use acl::{Access, Viewer, Visibility};
 use approvals::{DecideError, Remember};
 use audit::{Actor, Event, Outcome, Source, Who};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, Request, State};
-use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, delete, get, patch, post, put};
 use axum::{Json, Router};
+use std::collections::HashMap;
 use db::{BotPatch, Db};
 use rbac::{Perm, Principal, Role};
 use runner::{App, Config};
-use serde_json::{Value, json};
-use std::collections::HashMap;
+use users::{Caller, SessionConfig};
+use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -137,37 +138,24 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use users::{Caller, SessionConfig};
 
 type AppState = Arc<App>;
-type EventStream =
-    std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<SseEvent, Infallible>> + Send>>;
+type EventStream = std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<SseEvent, Infallible>> + Send>>;
 
 static WEB_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
 static SITE_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
 
-const COLORS: [&str; 11] = [
-    "#f5f5f5", "#9a6b3f", "#e5484d", "#e8702e", "#e9a23b", "#4cc06a", "#4fb5a5", "#3b82f6",
-    "#8b5cf6", "#e64a9c", "#7a7a7a",
-];
-const SHAPES: [&str; 12] = [
-    "waddle", "drop", "cloud", "bean", "onigiri", "peanut", "pebble", "square", "jelly", "gem",
-    "gear", "heart",
-];
+const COLORS: [&str; 11] = ["#f5f5f5", "#9a6b3f", "#e5484d", "#e8702e", "#e9a23b", "#4cc06a", "#4fb5a5", "#3b82f6", "#8b5cf6", "#e64a9c", "#7a7a7a"];
+const SHAPES: [&str; 12] = ["waddle", "drop", "cloud", "bean", "onigiri", "peanut", "pebble", "square", "jelly", "gem", "gear", "heart"];
 
 fn env(key: &str, default: &str) -> String {
-    std::env::var(key)
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| default.into())
+    std::env::var(key).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| default.into())
 }
 
 pub fn random_bytes(n: usize) -> Vec<u8> {
     use std::io::Read;
     let mut b = vec![0u8; n];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut b))
-        .expect("read /dev/urandom");
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).expect("read /dev/urandom");
     b
 }
 
@@ -197,47 +185,26 @@ async fn main() {
         eprintln!("{e}");
         std::process::exit(1);
     };
-    let break_glass =
-        users::break_glass_flag(&env("AUTH_BREAK_GLASS", "")).unwrap_or_else(|e| exit(e));
-    let sessions = SessionConfig::from_env(
-        &env("SESSION_IDLE_TIMEOUT", ""),
-        &env("SESSION_MAX_AGE", ""),
-    )
-    .unwrap_or_else(|e| exit(e));
+    let break_glass = users::break_glass_flag(&env("AUTH_BREAK_GLASS", "")).unwrap_or_else(|e| exit(e));
+    let sessions = SessionConfig::from_env(&env("SESSION_IDLE_TIMEOUT", ""), &env("SESSION_MAX_AGE", "")).unwrap_or_else(|e| exit(e));
     let sso = sso::Sso::from_env().unwrap_or_else(|e| exit(format!("SSO: {e}")));
-    let signups = signups::Signups::from_env(
-        &secrets::env::EnvStore::process(),
-        &env("SIGNUPS", ""),
-        &env("TURNSTILE_SITE_KEY", ""),
-    )
-    .unwrap_or_else(|e| exit(format!("Sign-ups: {e}")));
-    let mut control_plane =
-        machines::ControlPlane::from_env(&secrets::env::EnvStore::process(), |k| env(k, ""))
-            .unwrap_or_else(|e| exit(format!("Control plane: {e}")));
-    let shared_bots = acl::SharedBots::parse(
-        &env("SHARED_BOTS", ""),
-        control_plane.routing != machines::route::Routing::Off,
-    )
-    .unwrap_or_else(|e| exit(format!("Shared Bots: {e}")));
-    let resume_routines =
-        handover::resume_on_enable(&env("ROUTINES_ON_ENABLE", "")).unwrap_or_else(|e| exit(e));
-    let scim = scim::Scim::from_env(&env("SCIM", ""), &env("SCIM_DEFAULT_ROLE", ""))
-        .unwrap_or_else(|e| exit(format!("SCIM: {e}")));
-    let tiers =
-        tiers::Tiers::from_env(|k| env(k, "")).unwrap_or_else(|e| exit(format!("Tiers: {e}")));
+    let signups = signups::Signups::from_env(&secrets::env::EnvStore::process(), &env("SIGNUPS", ""), &env("TURNSTILE_SITE_KEY", ""))
+        .unwrap_or_else(|e| exit(format!("Sign-ups: {e}")));
+    let mut control_plane = machines::ControlPlane::from_env(&secrets::env::EnvStore::process(), |k| env(k, ""))
+        .unwrap_or_else(|e| exit(format!("Control plane: {e}")));
+    let shared_bots = acl::SharedBots::parse(&env("SHARED_BOTS", ""), control_plane.routing != machines::route::Routing::Off)
+        .unwrap_or_else(|e| exit(format!("Shared Bots: {e}")));
+    let resume_routines = handover::resume_on_enable(&env("ROUTINES_ON_ENABLE", "")).unwrap_or_else(|e| exit(e));
+    let scim = scim::Scim::from_env(&env("SCIM", ""), &env("SCIM_DEFAULT_ROLE", "")).unwrap_or_else(|e| exit(format!("SCIM: {e}")));
+    let tiers = tiers::Tiers::from_env(|k| env(k, "")).unwrap_or_else(|e| exit(format!("Tiers: {e}")));
     let testing = license::testing_flag(&env("TESTING_MODE", "")).unwrap_or_else(|e| exit(e));
     let (payments, ignored_stripe) =
-        billing::Billing::configured(&secrets::env::EnvStore::process(), &|k| env(k, ""), testing)
-            .unwrap_or_else(|e| exit(format!("Billing: {e}")));
-    let notifier = notify::Notifier::from_env(&|k| env(k, ""))
-        .unwrap_or_else(|e| exit(format!("Notifications: {e}")));
+        billing::Billing::configured(&secrets::env::EnvStore::process(), &|k| env(k, ""), testing).unwrap_or_else(|e| exit(format!("Billing: {e}")));
+    let notifier = notify::Notifier::from_env(&|k| env(k, "")).unwrap_or_else(|e| exit(format!("Notifications: {e}")));
     let allow_no_auth = auth_startup(&host, &password, break_glass);
     secrets::redact::register(&password);
     if adapters::get(&default_harness).is_none() {
-        eprintln!(
-            "DEFAULT_HARNESS must be one of: {}",
-            adapters::NAMES.join(", ")
-        );
+        eprintln!("DEFAULT_HARNESS must be one of: {}", adapters::NAMES.join(", "));
         std::process::exit(1);
     }
     let retention = audit::retention_days(&env("AUDIT_RETENTION_DAYS", "")).unwrap_or_else(|e| {
@@ -246,12 +213,8 @@ async fn main() {
     });
     let bot_key = random_hex(32);
     secrets::redact::register(&bot_key);
-    WEB_DIR
-        .set(std::env::var("WEB_DIR").ok().map(PathBuf::from))
-        .unwrap();
-    SITE_DIR
-        .set(std::env::var("SITE_DIR").ok().map(PathBuf::from))
-        .unwrap();
+    WEB_DIR.set(std::env::var("WEB_DIR").ok().map(PathBuf::from)).unwrap();
+    SITE_DIR.set(std::env::var("SITE_DIR").ok().map(PathBuf::from)).unwrap();
 
     let root = |key: &str, default: &str| {
         paths::root(&env(key, default)).unwrap_or_else(|e| {
@@ -265,16 +228,9 @@ async fn main() {
     let db = Db::open(&db_path).expect("open database");
     match secrets::init(&db_path) {
         Ok(r) => {
-            println!(
-                "Master key: {}{}.",
-                r.key_source,
-                if r.created { " (new)" } else { "" }
-            );
+            println!("Master key: {}{}.", r.key_source, if r.created { " (new)" } else { "" });
             if r.sealed + r.redacted + r.discarded > 0 {
-                println!(
-                    "Secrets: sealed {} saved tool inputs, redacted {} saved rows, discarded {} sealed values.",
-                    r.sealed, r.redacted, r.discarded
-                );
+                println!("Secrets: sealed {} saved tool inputs, redacted {} saved rows, discarded {} sealed values.", r.sealed, r.redacted, r.discarded);
             }
             println!("Stored secrets: {}.", r.stored);
         }
@@ -284,44 +240,20 @@ async fn main() {
         }
     }
     // Machine enrollment's CA key is derived from the master key (ADR 0031).
-    let bin_dir = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    let enrollment = machines::enroll::Enrollment::from_env(
-        &|k| env(k, ""),
-        &secrets::sealed::cipher(),
-        &bin_dir,
-    )
-    .unwrap_or_else(|e| exit(format!("Machine enrollment: {e}")))
-    .map(|e| {
-        control_plane
-            .enroll_with(e)
-            .unwrap_or_else(|e| exit(format!("Machine enrollment: {e}")))
-    });
+    let bin_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+    let enrollment = machines::enroll::Enrollment::from_env(&|k| env(k, ""), &secrets::sealed::cipher(), &bin_dir)
+        .unwrap_or_else(|e| exit(format!("Machine enrollment: {e}")))
+        .map(|e| control_plane.enroll_with(e).unwrap_or_else(|e| exit(format!("Machine enrollment: {e}"))));
 
-    let mut isolation = accounts::Isolation::from_env(|k| env(k, ""), &bin_dir, &data_dir)
+    let mut isolation = accounts::Isolation::from_env(|k| env(k, ""), &bin_dir, &data_dir).unwrap_or_else(|e| exit(format!("Isolation: {e}")));
+    let teammate_accounts = accounts::teammates_flag(&env("ISOLATION_TEAMMATES", ""), isolation.is_some(), shared_bots == acl::SharedBots::Isolated)
         .unwrap_or_else(|e| exit(format!("Isolation: {e}")));
-    let teammate_accounts = accounts::teammates_flag(
-        &env("ISOLATION_TEAMMATES", ""),
-        isolation.is_some(),
-        shared_bots == acl::SharedBots::Isolated,
-    )
-    .unwrap_or_else(|e| exit(format!("Isolation: {e}")));
     if let Some(iso) = isolation.as_mut() {
         iso.teammates = teammate_accounts;
     }
     // Screens are X displays botd's account runs; any local account could open them.
-    let screens = if isolation.is_some() {
-        None
-    } else {
-        paths::child(&data_dir, "screens").and_then(screen::Screens::from_env)
-    };
-    if let (Some(local), Some(machine)) = (
-        &screens,
-        enrollment.as_ref().and_then(|e| e.screens.as_ref()),
-    ) {
+    let screens = if isolation.is_some() { None } else { paths::child(&data_dir, "screens").and_then(screen::Screens::from_env) };
+    if let (Some(local), Some(machine)) = (&screens, enrollment.as_ref().and_then(|e| e.screens.as_ref())) {
         let (a, b) = local.ports();
         if a <= machine.ports.1 && machine.ports.0 <= b {
             exit(format!(
@@ -330,27 +262,19 @@ async fn main() {
             ));
         }
     }
-    let app = App::new(
-        db,
-        Config {
-            data_dir,
-            workspace,
-            user_name: env("USER_NAME", "the user"),
-            // `botctl` ships next to `botd`.
-            bin_dir,
-            api_url: format!("http://127.0.0.1:{port}"),
-            bot_key: bot_key.clone(),
-            run_timeout: Duration::from_secs(
-                60 * env("RUN_TIMEOUT_MINUTES", "60")
-                    .parse::<u64>()
-                    .unwrap_or(60),
-            ),
-            default_harness,
-            sandbox_host: sandbox::host(),
-            home: std::env::var_os("HOME").map(PathBuf::from),
-        },
-        screens,
-    );
+    let app = App::new(db, Config {
+        data_dir,
+        workspace,
+        user_name: env("USER_NAME", "the user"),
+        // `botctl` ships next to `botd`.
+        bin_dir,
+        api_url: format!("http://127.0.0.1:{port}"),
+        bot_key: bot_key.clone(),
+        run_timeout: Duration::from_secs(60 * env("RUN_TIMEOUT_MINUTES", "60").parse::<u64>().unwrap_or(60)),
+        default_harness,
+        sandbox_host: sandbox::host(),
+        home: std::env::var_os("HOME").map(PathBuf::from),
+    }, screens);
     let _ = app.tiers.set(Arc::new(tiers));
     println!("Tiers: {}.", app.tiers().describe());
     let _ = app.shared_bots.set(shared_bots);
@@ -358,10 +282,8 @@ async fn main() {
     println!(
         "Shared Bots: {}.",
         match shared_bots {
-            acl::SharedBots::Open =>
-                "open (a Bot acts with its owner's access and keys for everyone who uses it; SHARED_BOTS=isolated limits that)",
-            acl::SharedBots::Isolated =>
-                "isolated (a run for someone other than its owner gets their access at most and only server-wide keys; new Bots are private)",
+            acl::SharedBots::Open => "open (a Bot acts with its owner's access and keys for everyone who uses it; SHARED_BOTS=isolated limits that)",
+            acl::SharedBots::Isolated => "isolated (a run for someone other than its owner gets their access at most and only server-wide keys; new Bots are private)",
         }
     );
     match isolation {
@@ -387,21 +309,15 @@ async fn main() {
                     }
                 );
             } else if shared_bots == acl::SharedBots::Isolated {
-                println!(
-                    "Isolation: ISOLATION_TEAMMATES=off, so a teammate's run of a shared Bot uses its owner's account (ADR 0046)."
-                );
+                println!("Isolation: ISOLATION_TEAMMATES=off, so a teammate's run of a shared Bot uses its owner's account (ADR 0046).");
             }
             let mut own = vec![app.cfg.data_dir.clone(), PathBuf::from(".env")];
             own.extend(std::env::var_os("SUPERBOT_MASTER_KEY_FILE").map(PathBuf::from));
             for p in accounts::close_to_others(&own) {
-                eprintln!(
-                    "WARNING: other accounts can read {p}, which botd couldn't change. Per-user accounts must not read botd's files: chmod o-rwx it."
-                );
+                eprintln!("WARNING: other accounts can read {p}, which botd couldn't change. Per-user accounts must not read botd's files: chmod o-rwx it.");
             }
             if accounts::others_visible() {
-                eprintln!(
-                    "WARNING: other accounts' processes are visible in /proc, so Bots can read each other's command lines. Run botd with ProtectProc=invisible (deploy/install.sh --isolation sets it)."
-                );
+                eprintln!("WARNING: other accounts' processes are visible in /proc, so Bots can read each other's command lines. Run botd with ProtectProc=invisible (deploy/install.sh --isolation sets it).");
             }
             let _ = app.isolation.set(Arc::new(iso));
         }
@@ -412,60 +328,34 @@ async fn main() {
     }
     app.start_isolation();
     teammate_removals::start(&app);
-    let paused = handover::pause_already_disabled(
-        &app,
-        &Who {
-            actor: Actor::system("bootstrap"),
-            source: Source::default(),
-        },
-    );
+    let paused = handover::pause_already_disabled(&app, &Who { actor: Actor::system("bootstrap"), source: Source::default() });
     if paused > 0 {
         println!("Routines: paused {paused} that ran for disabled users (ADR 0047).");
     }
-    for t in app
-        .db
-        .assigned_tiers()
-        .into_iter()
-        .filter(|t| app.tiers().get(t).is_none())
-    {
-        eprintln!(
-            "WARNING: some users have tier \"{t}\", which TIERS_FILE no longer lists. They get the default tier ({}) until an admin picks another.",
-            app.tiers().default_tier().name
-        );
+    for t in app.db.assigned_tiers().into_iter().filter(|t| app.tiers().get(t).is_none()) {
+        eprintln!("WARNING: some users have tier \"{t}\", which TIERS_FILE no longer lists. They get the default tier ({}) until an admin picks another.", app.tiers().default_tier().name);
     }
     secrets::redact::register(env("LICENSE_KEY", "").trim());
     app.license.set_testing(testing);
     app.license.load(|k| env(k, ""));
     let license = app.license.status();
     println!("License: {}", license.detail());
-    for w in license
-        .warnings(app.db.active_seats())
-        .into_iter()
-        .filter(|w| *w != license.detail())
-    {
+    for w in license.warnings(app.db.active_seats()).into_iter().filter(|w| *w != license.detail()) {
         eprintln!("WARNING: {w}");
     }
     if !license.usable() {
         eprintln!("WARNING: {}", license.detail());
     }
     if license.testing() {
-        eprintln!(
-            "WARNING: testing mode is on (TESTING_MODE). No license, billing off; not for production."
-        );
+        eprintln!("WARNING: testing mode is on (TESTING_MODE). No license, billing off; not for production.");
     }
 
     // Each user's Bots work in that user's folders (ADR 0029). Files from before were
     // the owner account's.
     match isolation::migrate_workspace(&app.cfg.workspace, users::OPERATOR, &app.cfg.data_dir) {
         Ok(0) => {}
-        Ok(n) => println!(
-            "Workspace: moved {n} shared files and folders into users/{}.",
-            users::OPERATOR
-        ),
-        Err(e) => exit(format!(
-            "WORKSPACE_DIR: couldn't move the shared files into users/{}: {e}",
-            users::OPERATOR
-        )),
+        Ok(n) => println!("Workspace: moved {n} shared files and folders into users/{}.", users::OPERATOR),
+        Err(e) => exit(format!("WORKSPACE_DIR: couldn't move the shared files into users/{}: {e}", users::OPERATOR)),
     }
     match isolation::migrate_user_file(&app.cfg.data_dir, users::OPERATOR) {
         Ok(true) => println!("USER.md: moved to users/{}/USER.md.", users::OPERATOR),
@@ -477,18 +367,12 @@ async fn main() {
     if app.db.bots().is_empty() {
         let name = env("PRIMARY_BOT_NAME", "Assistant");
         let harness = default_harness_for(&app, users::OPERATOR);
-        let bot = app
-            .db
-            .create_bot(&name, "#f5f5f5", "waddle", &harness, None, true);
+        let bot = app.db.create_bot(&name, "#f5f5f5", "waddle", &harness, None, true);
         app.init_bot_files(&bot);
     }
     // First start, or the first after upgrading to users: the owner becomes the admin
     // that break-glass signs in as.
-    users::ensure_operator(
-        &app.db,
-        &env("USER_NAME", "Owner"),
-        std::env::var("OWNER_EMAIL").ok().as_deref(),
-    );
+    users::ensure_operator(&app.db, &env("USER_NAME", "Owner"), std::env::var("OWNER_EMAIL").ok().as_deref());
 
     let auth_state = Arc::new(Auth {
         password: password.clone(),
@@ -516,28 +400,14 @@ async fn main() {
     if let Some(w) = &ignored_stripe {
         eprintln!("WARNING: {w}");
     }
-    println!(
-        "Billing: {}.",
-        billing::describe(
-            auth_state.payments.enabled(),
-            auth_state.payments.checkout_enabled(),
-            app.meter.get().is_some(),
-            app.tiers()
-        )
-    );
+    println!("Billing: {}.", billing::describe(auth_state.payments.enabled(), auth_state.payments.checkout_enabled(), app.meter.get().is_some(), app.tiers()));
     match auth_state.scim.enabled {
-        true => println!(
-            "SCIM: on at /scim/v2; new users get the {} role.",
-            auth_state.scim.default_role.as_str()
-        ),
+        true => println!("SCIM: on at /scim/v2; new users get the {} role.", auth_state.scim.default_role.as_str()),
         false => println!("SCIM: off (SCIM=off)."),
     }
     println!(
         "Sign-ups: {}.",
-        match (
-            auth_state.signups.enabled,
-            auth_state.signups.turnstile.is_some()
-        ) {
+        match (auth_state.signups.enabled, auth_state.signups.turnstile.is_some()) {
             (false, _) => "off (SIGNUPS=off)",
             (true, true) => "on, with Turnstile",
             (true, false) => "on (set TURNSTILE_SECRET and TURNSTILE_SITE_KEY to add a bot check)",
@@ -545,21 +415,9 @@ async fn main() {
     );
     for p in &auth_state.sso.providers {
         let ready = p.not_ready().unwrap_or_else(|| "ready".into());
-        println!(
-            "SSO: {} ({}, {}), {ready}; {}; just-in-time sign-up {}.",
-            p.id,
-            p.label,
-            p.type_name(),
-            p.audience(),
-            p.jit_role.map_or("off", |r| r.as_str())
-        );
+        println!("SSO: {} ({}, {}), {ready}; {}; just-in-time sign-up {}.", p.id, p.label, p.type_name(), p.audience(), p.jit_role.map_or("off", |r| r.as_str()));
     }
-    let sso_ids: Vec<String> = auth_state
-        .sso
-        .providers
-        .iter()
-        .map(|p| p.id.clone())
-        .collect();
+    let sso_ids: Vec<String> = auth_state.sso.providers.iter().map(|p| p.id.clone()).collect();
     let control_plane = auth_state.machines.clone();
     let _ = app.control_plane.set(control_plane.clone());
     let auth_state_scim = auth_state.scim.enabled;
@@ -567,37 +425,35 @@ async fn main() {
     let auth_state_checkout = auth_state.payments.checkout_enabled();
     let router = router(app.clone(), auth_state);
     let policy = app.db.global_policy();
-    app.db.record(
-        &Event::new(Actor::system("server"), "server.started").details(json!({
-            "version": env!("CARGO_PKG_VERSION"),
-            "defaultHarness": app.cfg.default_harness,
-            "policyMode": policy.mode,
-            "sandbox": policy.sandbox,
-            "sandboxHost": app.cfg.sandbox_host,
-            "auth": match (break_glass, password.is_empty()) {
-                (true, false) => "sessions+password",
-                (true, true) => "none",
-                (false, _) => "sessions",
-            },
-            "sessionIdleMinutes": sessions.idle_ms / 60_000,
-            "sessionMaxMinutes": sessions.max_ms / 60_000,
-            "auditRetentionDays": retention,
-            "screens": app.screens.is_some(),
-            "isolation": if app.isolation().is_some() { "users" } else { "off" },
-            "isolationTeammates": app.teammate_accounts(),
-            "isolationTeammateFiles": app.isolation().map(|i| i.offboard.files.as_str()),
-            "sharedBots": app.shared_bots(),
-            "sso": sso_ids,
-            "controlPlane": control_plane.enabled(),
-            "scim": auth_state_scim,
-            "billing": auth_state_billing,
-            "billingCheckout": auth_state_checkout,
-            "notifications": notify_summary,
-            "tiers": app.tiers().all().iter().map(|t| &t.name).collect::<Vec<_>>(),
-            "defaultTier": app.tiers().default_tier().name,
-            "license": license.summary(),
-        })),
-    );
+    app.db.record(&Event::new(Actor::system("server"), "server.started").details(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "defaultHarness": app.cfg.default_harness,
+        "policyMode": policy.mode,
+        "sandbox": policy.sandbox,
+        "sandboxHost": app.cfg.sandbox_host,
+        "auth": match (break_glass, password.is_empty()) {
+            (true, false) => "sessions+password",
+            (true, true) => "none",
+            (false, _) => "sessions",
+        },
+        "sessionIdleMinutes": sessions.idle_ms / 60_000,
+        "sessionMaxMinutes": sessions.max_ms / 60_000,
+        "auditRetentionDays": retention,
+        "screens": app.screens.is_some(),
+        "isolation": if app.isolation().is_some() { "users" } else { "off" },
+        "isolationTeammates": app.teammate_accounts(),
+        "isolationTeammateFiles": app.isolation().map(|i| i.offboard.files.as_str()),
+        "sharedBots": app.shared_bots(),
+        "sso": sso_ids,
+        "controlPlane": control_plane.enabled(),
+        "scim": auth_state_scim,
+        "billing": auth_state_billing,
+        "billingCheckout": auth_state_checkout,
+        "notifications": notify_summary,
+        "tiers": app.tiers().all().iter().map(|t| &t.name).collect::<Vec<_>>(),
+        "defaultTier": app.tiers().default_tier().name,
+        "license": license.summary(),
+    })));
     license::start(app.clone());
     audit::start_retention(app.clone(), retention);
     users::start_pruning(app.clone(), sessions);
@@ -609,9 +465,7 @@ async fn main() {
         );
     }
     if !policy.sandbox {
-        eprintln!(
-            "Harness sandboxes: off. Turn them on with `botctl policy set global sandbox=on` (ADR 0055)."
-        );
+        eprintln!("Harness sandboxes: off. Turn them on with `botctl policy set global sandbox=on` (ADR 0055).");
     } else {
         let (with, can) = sandbox_harnesses(&app.cfg.sandbox_host);
         let cant: Vec<_> = with.into_iter().filter(|h| !can.contains(h)).collect();
@@ -632,47 +486,26 @@ async fn main() {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
-                app.screens
-                    .as_ref()
-                    .unwrap()
-                    .reap(|id| app.is_running(id))
-                    .await;
+                app.screens.as_ref().unwrap().reap(|id| app.is_running(id)).await;
             }
         });
     }
 
-    let listener = tokio::net::TcpListener::bind((host.as_str(), port))
-        .await
-        .expect("bind");
+    let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await.expect("bind");
     println!("Listening on http://{host}:{port}");
     if let Some(e) = enrollment {
-        let machine_listener = tokio::net::TcpListener::bind(e.listen)
-            .await
-            .unwrap_or_else(|err| exit(format!("MACHINE_LISTEN {}: {err}", e.listen)));
+        let machine_listener = tokio::net::TcpListener::bind(e.listen).await.unwrap_or_else(|err| exit(format!("MACHINE_LISTEN {}: {err}", e.listen)));
         println!("Machines enroll at {} (listening on {}).", e.url, e.listen);
         // Bots on machines reach this API through the machine port, as if from loopback.
-        let api = machines::enroll::Api {
-            router: router.clone(),
-            host: format!("127.0.0.1:{port}"),
-        };
-        tokio::spawn(machines::enroll::serve(
-            machine_listener,
-            app.clone(),
-            e,
-            Some(api),
-        ));
+        let api = machines::enroll::Api { router: router.clone(), host: format!("127.0.0.1:{port}") };
+        tokio::spawn(machines::enroll::serve(machine_listener, app.clone(), e, Some(api)));
     }
-    println!(
-        "Harnesses on PATH: {}. Default: {}.",
-        adapters::installed().join(", "),
-        app.cfg.default_harness
-    );
+    println!("Harnesses on PATH: {}. Default: {}.", adapters::installed().join(", "), app.cfg.default_harness);
     println!(
         "Screens: {}.",
         match (app.screens.is_some(), app.isolation().is_some()) {
             (true, _) => "on",
-            (false, true) =>
-                "off (per-user screens don't exist yet, so ISOLATION=users turns them off)",
+            (false, true) => "off (per-user screens don't exist yet, so ISOLATION=users turns them off)",
             (false, false) => "off (install Xvfb and openbox to turn them on)",
         }
     );
@@ -680,11 +513,8 @@ async fn main() {
     // On SIGTERM/SIGINT: stop agents (queued work runs after restart), then exit.
     let shutdown_app = app.clone();
     tokio::spawn(async move {
-        use tokio::signal::unix::{SignalKind, signal};
-        let (mut term, mut int) = (
-            signal(SignalKind::terminate()).unwrap(),
-            signal(SignalKind::interrupt()).unwrap(),
-        );
+        use tokio::signal::unix::{signal, SignalKind};
+        let (mut term, mut int) = (signal(SignalKind::terminate()).unwrap(), signal(SignalKind::interrupt()).unwrap());
         tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
         shutdown_app.shutdown();
         for _ in 0..60 {
@@ -696,12 +526,7 @@ async fn main() {
         std::process::exit(0);
     });
 
-    axum::serve(
-        listener,
-        router.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .unwrap();
+    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
 }
 
 fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
@@ -712,46 +537,23 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/bots", get(list_bots).post(create_bot))
         .route("/bots/{id}", patch(update_bot).delete(delete_bot))
         .route("/bots/{id}/access", get(get_access).patch(update_access))
-        .route(
-            "/bots/{id}/grants/{user}",
-            put(put_grant).delete(delete_grant),
-        )
+        .route("/bots/{id}/grants/{user}", put(put_grant).delete(delete_grant))
         .route("/bots/{id}/messages", get(list_messages).post(send_message))
         .route("/bots/{id}/read", post(mark_read))
         .route("/bots/{id}/stop", post(stop_bot))
-        .route(
-            "/bots/{id}/routines",
-            get(list_routines).post(create_routine),
-        )
-        .route(
-            "/routines/{id}",
-            patch(update_routine).delete(delete_routine),
-        )
+        .route("/bots/{id}/routines", get(list_routines).post(create_routine))
+        .route("/routines/{id}", patch(update_routine).delete(delete_routine))
         .route("/bots/{id}/screen", get(screen_info))
-        .route(
-            "/bots/{id}/policy",
-            get(get_bot_policy)
-                .put(put_bot_policy)
-                .delete(delete_bot_policy),
-        )
+        .route("/bots/{id}/policy", get(get_bot_policy).put(put_bot_policy).delete(delete_bot_policy))
         .route("/policy", get(get_policy).put(put_policy))
-        .route(
-            "/notifications",
-            get(get_notifications).put(put_notifications),
-        )
+        .route("/notifications", get(get_notifications).put(put_notifications))
         .route("/notifications/test", post(test_notifications))
-        .route(
-            "/bots/{id}/notifications",
-            get(get_bot_notifications).put(put_bot_notifications),
-        )
+        .route("/bots/{id}/notifications", get(get_bot_notifications).put(put_bot_notifications))
         .route("/policy/rules", get(list_rules).post(add_rule))
         .route("/policy/rules/{id}", delete(delete_rule))
         .route("/approvals", get(list_approvals))
         // A file write's full content passes through here, so allow big bodies.
-        .route(
-            "/approvals/check",
-            post(check_approval).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
-        )
+        .route("/approvals/check", post(check_approval).layer(DefaultBodyLimit::max(32 * 1024 * 1024)))
         .route("/approvals/{id}/approve", post(approve))
         .route("/approvals/{id}/deny", post(deny))
         .route("/audit", get(list_audit))
@@ -766,15 +568,9 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/billing/checkout", post(billing::checkout))
         .route("/billing/portal", post(billing::portal))
         .route("/setup", get(setup::status).patch(setup::update))
-        .route(
-            "/license",
-            get(license::get).put(license::put).delete(license::delete),
-        )
+        .route("/license", get(license::get).put(license::put).delete(license::delete))
         .route("/me/secrets", get(list_my_secrets))
-        .route(
-            "/me/secrets/{name}",
-            put(put_my_secret).delete(delete_my_secret),
-        )
+        .route("/me/secrets/{name}", put(put_my_secret).delete(delete_my_secret))
         .route("/ask", post(ask))
         .route("/handoff", post(handoff))
         .route("/auth/login", post(users::login))
@@ -782,15 +578,9 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/auth/me", get(users::me))
         .route("/auth/sso", get(sso::list))
         .route("/auth/sso/{id}/start", get(sso::start))
-        .route(
-            "/auth/sso/{id}/callback",
-            get(sso::callback).post(sso::callback_post),
-        )
+        .route("/auth/sso/{id}/callback", get(sso::callback).post(sso::callback_post))
         .route("/users", get(users::list_users).post(users::create_user))
-        .route(
-            "/users/{key}",
-            get(users::get_user).patch(users::update_user),
-        )
+        .route("/users/{key}", get(users::get_user).patch(users::update_user))
         .route("/users/{key}/login-codes", post(users::create_login_code))
         .route("/users/{key}/sessions", delete(users::revoke_user_sessions))
         .route("/users/{key}/bots", get(users::user_bots))
@@ -798,226 +588,83 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/users/{key}/routines", get(handover::list))
         .route("/users/{key}/routines/resume", post(handover::resume_for))
         .route("/users/{key}/handover", post(handover::handover))
-        .route(
-            "/users/{key}/secrets",
-            get(list_user_secrets).delete(delete_user_secrets),
-        )
-        .route(
-            "/users/{key}/isolation",
-            get(accounts::http::get).post(accounts::http::ensure),
-        )
-        .route(
-            "/users/{key}/harness-login",
-            post(accounts::http::harness_login),
-        )
-        .route(
-            "/users/{key}/identities",
-            get(sso::list_identities).post(sso::link_identity),
-        )
+        .route("/users/{key}/secrets", get(list_user_secrets).delete(delete_user_secrets))
+        .route("/users/{key}/isolation", get(accounts::http::get).post(accounts::http::ensure))
+        .route("/users/{key}/harness-login", post(accounts::http::harness_login))
+        .route("/users/{key}/identities", get(sso::list_identities).post(sso::link_identity))
         .route("/users/{key}/identities/{id}", delete(sso::unlink_identity))
-        .route(
-            "/users/{key}/machine",
-            get(machines::get)
-                .post(machines::request)
-                .delete(machines::destroy),
-        )
+        .route("/users/{key}/machine", get(machines::get).post(machines::request).delete(machines::destroy))
         .route("/users/{key}/machine/suspend", post(machines::suspend))
         .route("/users/{key}/machine/resume", post(machines::resume))
         .route("/users/{key}/machine/resize", post(machines::resize))
-        .route(
-            "/users/{key}/machine/enrollment",
-            post(machines::enroll::issue_token),
-        )
-        .route(
-            "/users/{key}/machine/certificates",
-            delete(machines::enroll::revoke),
-        )
+        .route("/users/{key}/machine/enrollment", post(machines::enroll::issue_token))
+        .route("/users/{key}/machine/certificates", delete(machines::enroll::revoke))
         .route("/users/{key}/machine/agent", get(machines::upkeep::get))
-        .route(
-            "/users/{key}/machine/agent/upgrade",
-            post(machines::upkeep::upgrade_now),
-        )
-        .route(
-            "/users/{key}/machine/agent/hold",
-            put(machines::upkeep::hold).delete(machines::upkeep::release),
-        )
+        .route("/users/{key}/machine/agent/upgrade", post(machines::upkeep::upgrade_now))
+        .route("/users/{key}/machine/agent/hold", put(machines::upkeep::hold).delete(machines::upkeep::release))
         .route(
             "/users/{key}/machine/rebuild",
-            get(machines::rebuild::get)
-                .post(machines::rebuild::request)
-                .delete(machines::rebuild::cancel_now),
+            get(machines::rebuild::get).post(machines::rebuild::request).delete(machines::rebuild::cancel_now),
         )
-        .route(
-            "/users/{key}/machine/harnesses",
-            post(machines::upkeep::harnesses_now),
-        )
-        .route(
-            "/users/{key}/machine/bot-user",
-            post(machines::botuser::now_for),
-        )
+        .route("/users/{key}/machine/harnesses", post(machines::upkeep::harnesses_now))
+        .route("/users/{key}/machine/bot-user", post(machines::botuser::now_for))
         .route("/users/{key}/machine/screens", get(machines::screens::list))
-        .route(
-            "/users/{key}/machine/screens/{bot}",
-            axum::routing::delete(machines::screens::close_now),
-        )
-        .route(
-            "/users/{key}/machine/harness-login",
-            post(machines::logins::admin_start),
-        )
-        .route(
-            "/users/{key}/machine/harness-login/{id}",
-            delete(machines::logins::admin_abort),
-        )
-        .route(
-            "/users/{key}/machine/harness-login/{id}/input",
-            post(machines::logins::admin_input),
-        )
-        .route(
-            "/users/{key}/machine/harness-logins",
-            get(machines::logins::admin_status),
-        )
-        .route(
-            "/users/{key}/machine/harness-logins/{harness}",
-            delete(machines::logins::admin_logout),
-        )
-        .route(
-            "/users/{key}/machine/teammates/{teammate}/harness-logins",
-            get(machines::logins::admin_teammate_status),
-        )
-        .route(
-            "/users/{key}/machine/teammates/{teammate}/harness-logins/{harness}",
-            delete(machines::logins::admin_teammate_logout),
-        )
-        .route(
-            "/users/{key}/machine/folder-sync",
-            get(machines::folder::get).post(machines::folder::now_copy),
-        )
-        .route(
-            "/users/{key}/machine/teammates",
-            get(machines::offboard::on_machine),
-        )
-        .route(
-            "/users/{key}/machine/teammates/{teammate}/remove",
-            post(machines::offboard::remove_now),
-        )
-        .route(
-            "/users/{key}/placement",
-            get(machines::placement)
-                .put(machines::assign)
-                .delete(machines::unassign),
-        )
+        .route("/users/{key}/machine/screens/{bot}", axum::routing::delete(machines::screens::close_now))
+        .route("/users/{key}/machine/harness-login", post(machines::logins::admin_start))
+        .route("/users/{key}/machine/harness-login/{id}", delete(machines::logins::admin_abort))
+        .route("/users/{key}/machine/harness-login/{id}/input", post(machines::logins::admin_input))
+        .route("/users/{key}/machine/harness-logins", get(machines::logins::admin_status))
+        .route("/users/{key}/machine/harness-logins/{harness}", delete(machines::logins::admin_logout))
+        .route("/users/{key}/machine/teammates/{teammate}/harness-logins", get(machines::logins::admin_teammate_status))
+        .route("/users/{key}/machine/teammates/{teammate}/harness-logins/{harness}", delete(machines::logins::admin_teammate_logout))
+        .route("/users/{key}/machine/folder-sync", get(machines::folder::get).post(machines::folder::now_copy))
+        .route("/users/{key}/machine/teammates", get(machines::offboard::on_machine))
+        .route("/users/{key}/machine/teammates/{teammate}/remove", post(machines::offboard::remove_now))
+        .route("/users/{key}/placement", get(machines::placement).put(machines::assign).delete(machines::unassign))
         .route("/machines", get(machines::list_all))
         .route("/machines/placements", get(machines::placements))
         .route("/machines/substrate", get(machines::substrate))
         .route("/machines/legacy", get(machines::rebuild::legacy_list))
         .route("/machines/reconcile", post(machines::reconcile_now))
-        .route(
-            "/machines/teammate-removals",
-            get(machines::offboard::list_all),
-        )
-        .route(
-            "/users/{key}/teammate-accounts",
-            get(teammate_removals::of_user),
-        )
-        .route(
-            "/users/{key}/teammate-accounts/{teammate}/remove",
-            post(teammate_removals::remove_now),
-        )
-        .route(
-            "/isolation/teammate-removals",
-            get(teammate_removals::list_all),
-        )
+        .route("/machines/teammate-removals", get(machines::offboard::list_all))
+        .route("/users/{key}/teammate-accounts", get(teammate_removals::of_user))
+        .route("/users/{key}/teammate-accounts/{teammate}/remove", post(teammate_removals::remove_now))
+        .route("/isolation/teammate-removals", get(teammate_removals::list_all))
         .route("/machine", get(machines::mine))
         .route("/machine/harness-login", post(machines::logins::my_start))
-        .route(
-            "/machine/harness-login/{id}",
-            delete(machines::logins::my_abort),
-        )
-        .route(
-            "/machine/harness-login/{id}/input",
-            post(machines::logins::my_input),
-        )
+        .route("/machine/harness-login/{id}", delete(machines::logins::my_abort))
+        .route("/machine/harness-login/{id}/input", post(machines::logins::my_input))
         .route("/machine/harness-logins", get(machines::logins::my_status))
-        .route(
-            "/machine/harness-logins/{harness}",
-            delete(machines::logins::my_logout),
-        )
-        .route(
-            "/machine/teammate/{owner}/harness-login",
-            post(machines::logins::teammate_start),
-        )
-        .route(
-            "/machine/teammate/{owner}/harness-login/{id}",
-            delete(machines::logins::teammate_abort),
-        )
-        .route(
-            "/machine/teammate/{owner}/harness-login/{id}/input",
-            post(machines::logins::teammate_input),
-        )
-        .route(
-            "/machine/teammate/{owner}/harness-logins",
-            get(machines::logins::teammate_status),
-        )
-        .route(
-            "/machine/teammate/{owner}/harness-logins/{harness}",
-            delete(machines::logins::teammate_logout),
-        )
+        .route("/machine/harness-logins/{harness}", delete(machines::logins::my_logout))
+        .route("/machine/teammate/{owner}/harness-login", post(machines::logins::teammate_start))
+        .route("/machine/teammate/{owner}/harness-login/{id}", delete(machines::logins::teammate_abort))
+        .route("/machine/teammate/{owner}/harness-login/{id}/input", post(machines::logins::teammate_input))
+        .route("/machine/teammate/{owner}/harness-logins", get(machines::logins::teammate_status))
+        .route("/machine/teammate/{owner}/harness-logins/{harness}", delete(machines::logins::teammate_logout))
         .route("/sessions", get(users::list_sessions))
         .route("/sessions/{id}", delete(users::revoke_session))
-        .route(
-            "/signups",
-            get(signups::list)
-                .post(signups::submit)
-                .layer(DefaultBodyLimit::max(signups::MAX_BODY)),
-        )
+        .route("/signups", get(signups::list).post(signups::submit).layer(DefaultBodyLimit::max(signups::MAX_BODY)))
         .route("/signups/config", get(signups::config))
         .route("/signups/{id}", get(signups::get))
         .route("/signups/{id}/approve", post(signups::approve))
         .route("/signups/{id}/reject", post(signups::reject))
-        .route(
-            "/scim/tokens",
-            get(scim::list_tokens).post(scim::create_token),
-        )
+        .route("/scim/tokens", get(scim::list_tokens).post(scim::create_token))
         .route("/scim/tokens/{id}", delete(scim::revoke_token));
     // SCIM has its own bearer tokens and error format, so its own guard, not `auth` (ADR 0023).
     let scim_routes = Router::new()
-        .route(
-            "/scim/v2/ServiceProviderConfig",
-            get(scim::service_provider_config),
-        )
+        .route("/scim/v2/ServiceProviderConfig", get(scim::service_provider_config))
         .route("/scim/v2/ResourceTypes", get(scim::resource_types))
         .route("/scim/v2/ResourceTypes/{id}", get(scim::resource_type))
         .route("/scim/v2/Schemas", get(scim::schemas))
         .route("/scim/v2/Schemas/{id}", get(scim::schema))
-        .route(
-            "/scim/v2/Users",
-            get(scim::list_users).post(scim::create_user),
-        )
-        .route(
-            "/scim/v2/Users/{id}",
-            get(scim::get_user)
-                .put(scim::replace_user)
-                .patch(scim::patch_user)
-                .delete(scim::delete_user),
-        )
-        .route(
-            "/scim/v2/Groups",
-            get(scim::list_groups).post(scim::groups_unsupported),
-        )
-        .route(
-            "/scim/v2/Groups/{id}",
-            get(scim::get_group)
-                .put(scim::groups_unsupported)
-                .patch(scim::groups_unsupported)
-                .delete(scim::groups_unsupported),
-        )
+        .route("/scim/v2/Users", get(scim::list_users).post(scim::create_user))
+        .route("/scim/v2/Users/{id}", get(scim::get_user).put(scim::replace_user).patch(scim::patch_user).delete(scim::delete_user))
+        .route("/scim/v2/Groups", get(scim::list_groups).post(scim::groups_unsupported))
+        .route("/scim/v2/Groups/{id}", get(scim::get_group).put(scim::groups_unsupported).patch(scim::groups_unsupported).delete(scim::groups_unsupported))
         .route("/scim/v2", any(scim::unknown))
         .route("/scim/v2/{*rest}", any(scim::unknown))
         .layer(DefaultBodyLimit::max(scim::MAX_BODY))
-        .layer(middleware::from_fn_with_state(
-            auth_state.clone(),
-            scim::guard,
-        ))
+        .layer(middleware::from_fn_with_state(auth_state.clone(), scim::guard))
         .layer(Extension(auth_state.clone()));
     // Stripe signs its webhook; there are no credentials to check (ADR 0040).
     let billing_routes = Router::new()
@@ -1073,7 +720,11 @@ fn cors_layer() -> CorsLayer {
             Method::DELETE,
             Method::OPTIONS,
         ])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT]);
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+        ]);
     layer = match raw.as_str() {
         "*" => layer.allow_origin(AllowOrigin::any()),
         "" => layer.allow_origin(AllowOrigin::list([
@@ -1083,10 +734,7 @@ fn cors_layer() -> CorsLayer {
             HeaderValue::from_static("http://127.0.0.1:19006"),
         ])),
         _ => {
-            let origins: Vec<HeaderValue> = raw
-                .split(',')
-                .filter_map(|o| o.trim().parse().ok())
-                .collect();
+            let origins: Vec<HeaderValue> = raw.split(',').filter_map(|o| o.trim().parse().ok()).collect();
             layer.allow_origin(AllowOrigin::list(origins))
         }
     };
@@ -1164,16 +812,9 @@ impl Auth {
     /// Logs the first good Basic-auth request of a client (see `audit::Logins`).
     /// Session sign-ins are logged once, by `users::login`.
     fn login_ok(&self, source: &Source, actor: &Actor, method: &str) {
-        let client = format!(
-            "{}|{}",
-            source.ip.as_deref().unwrap_or(""),
-            source.user_agent.as_deref().unwrap_or("")
-        );
+        let client = format!("{}|{}", source.ip.as_deref().unwrap_or(""), source.user_agent.as_deref().unwrap_or(""));
         if self.logins.success(&client, db::now()) {
-            let who = Who {
-                actor: actor.clone(),
-                source: source.clone(),
-            };
+            let who = Who { actor: actor.clone(), source: source.clone() };
             self.record(who.event("auth.login").details(json!({ "method": method })));
         }
     }
@@ -1181,31 +822,19 @@ impl Auth {
     /// Logs a bad password, code, or token, throttled per IP. Never logs what was sent.
     fn login_failed(&self, source: &Source, method: &str, reason: Option<&str>) {
         let client = format!("{}|{method}", source.ip.as_deref().unwrap_or(""));
-        let Some(missed) = self.logins.failure(&client, db::now()) else {
-            return;
-        };
+        let Some(missed) = self.logins.failure(&client, db::now()) else { return };
         let actor = match method {
             "bot_token" => Actor::bot(None, None),
             "scim_token" => Actor::system("scim"),
-            _ => Actor {
-                id: None,
-                ..Actor::operator()
-            },
+            _ => Actor { id: None, ..Actor::operator() },
         };
         let actor = actor.method(method);
-        let who = Who {
-            actor,
-            source: source.clone(),
-        };
+        let who = Who { actor, source: source.clone() };
         let mut details = json!({ "method": method, "unloggedSinceLast": missed });
         if let Some(r) = reason {
             details["reason"] = json!(r);
         }
-        self.record(
-            who.event("auth.login_failed")
-                .outcome(Outcome::Failure)
-                .details(details),
-        );
+        self.record(who.event("auth.login_failed").outcome(Outcome::Failure).details(details));
     }
 
     /// The live session for a token, or why there isn't one.
@@ -1215,12 +844,7 @@ impl Auth {
             return None;
         }
         let at = db::now();
-        let found = app.db.live_session(
-            &users::hash(token),
-            at,
-            self.sessions.idle_ms,
-            self.sessions.max_ms,
-        )?;
+        let found = app.db.live_session(&users::hash(token), at, self.sessions.idle_ms, self.sessions.max_ms)?;
         app.db.touch_session(&found.0.id, at);
         Some(found)
     }
@@ -1230,10 +854,7 @@ impl Auth {
     fn bot_actor(&self, bot_id: Option<&str>) -> Actor {
         let app = self.app.as_ref();
         match bot_id.and_then(|id| app?.db.bot(id)) {
-            Some(b) => Actor {
-                asker: app.map(|a| a.acting_for(&b)).filter(|a| *a != b.owner_id),
-                ..Actor::for_bot(&b)
-            },
+            Some(b) => Actor { asker: app.map(|a| a.acting_for(&b)).filter(|a| *a != b.owner_id), ..Actor::for_bot(&b) },
             None => Actor::bot(bot_id, None),
         }
         .method("bot_token")
@@ -1243,10 +864,7 @@ impl Auth {
 /// The client's IP and user agent. Behind a proxy on loopback (Caddy on the same
 /// host), the IP is the last X-Forwarded-For entry: the one the proxy added.
 fn request_source(req: &Request, trust_forwarded: bool) -> Source {
-    let peer = req
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|c| c.0.ip().to_canonical());
+    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip().to_canonical());
     let forwarded = req
         .headers()
         .get_all("x-forwarded-for")
@@ -1257,21 +875,11 @@ fn request_source(req: &Request, trust_forwarded: bool) -> Source {
         .rfind(|v| !v.is_empty())
         .and_then(|v| v.parse::<IpAddr>().ok());
     let ip = match forwarded {
-        Some(f) if trust_forwarded || peer.is_some_and(|p| p.is_loopback()) => {
-            Some(f.to_canonical())
-        }
+        Some(f) if trust_forwarded || peer.is_some_and(|p| p.is_loopback()) => Some(f.to_canonical()),
         _ => peer,
     };
-    let user_agent = req
-        .headers()
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .map(|u| audit::clip(u.trim(), 256))
-        .filter(|u| !u.is_empty());
-    Source {
-        ip: ip.map(|i| i.to_string()),
-        user_agent,
-    }
+    let user_agent = req.headers().get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(|u| audit::clip(u.trim(), 256)).filter(|u| !u.is_empty());
+    Source { ip: ip.map(|i| i.to_string()), user_agent }
 }
 
 /// AUTH_PASSWORD, or the file named by AUTH_PASSWORD_FILE. Empty when neither is set.
@@ -1293,11 +901,7 @@ fn auth_startup(host: &str, password: &str, break_glass: bool) -> bool {
         println!(
             "Break-glass password sign-in is off (AUTH_BREAK_GLASS=0){}. People sign in with sessions; \
              set AUTH_BREAK_GLASS=1 and restart to get back in with AUTH_PASSWORD.",
-            if password.is_empty() {
-                ""
-            } else {
-                "; AUTH_PASSWORD is ignored"
-            }
+            if password.is_empty() { "" } else { "; AUTH_PASSWORD is ignored" }
         );
         return false;
     }
@@ -1363,11 +967,7 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if !a.hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
-        return (
-            StatusCode::FORBIDDEN,
-            "Unknown Host. Add it to ALLOWED_HOSTS.",
-        )
-            .into_response();
+        return (StatusCode::FORBIDDEN, "Unknown Host. Add it to ALLOWED_HOSTS.").into_response();
     }
     let source = request_source(&req, a.trust_forwarded);
     let (method, path) = (req.method().clone(), req.uri().path().to_string());
@@ -1375,18 +975,9 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
     req.extensions_mut().insert(source.clone());
     // Signing in, the page to do it on, the public site, and asking for access need no credentials.
     let open = match method {
-        Method::GET | Method::HEAD => {
-            path == "/login"
-                || sso_path(&path).is_some()
-                || site_file(&path).is_some()
-                || path == "/api/signups/config"
-        }
+        Method::GET | Method::HEAD => path == "/login" || sso_path(&path).is_some() || site_file(&path).is_some() || path == "/api/signups/config",
         // Apple posts its answer to the callback (response_mode=form_post).
-        Method::POST => {
-            path == "/api/auth/login"
-                || sso_path(&path) == Some("callback")
-                || path == "/api/signups"
-        }
+        Method::POST => path == "/api/auth/login" || sso_path(&path) == Some("callback") || path == "/api/signups",
         _ => false,
     };
     if open {
@@ -1411,15 +1002,8 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
         ApiError(StatusCode::FORBIDDEN, msg).into_response()
     };
     // Older botctl names its Bot in a header. It must be the Bot the token names.
-    let claimed = req
-        .headers()
-        .get("x-superbot-bot")
-        .map(|v| v.to_str().unwrap_or("").to_string());
-    if caller.principal == Principal::Bot
-        && claimed
-            .as_deref()
-            .is_some_and(|id| Some(id) != caller.bot.as_deref())
-    {
+    let claimed = req.headers().get("x-superbot-bot").map(|v| v.to_str().unwrap_or("").to_string());
+    if caller.principal == Principal::Bot && claimed.as_deref().is_some_and(|id| Some(id) != caller.bot.as_deref()) {
         return denied("bot_mismatch", "This token belongs to another Bot.".into());
     }
     if !rbac::allows(caller.principal, need) {
@@ -1433,12 +1017,7 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
     if caller.principal == Principal::Bot
         && let Some(app) = &a.app
     {
-        let owner = caller
-            .bot
-            .as_deref()
-            .and_then(|id| app.db.bot(id))
-            .and_then(|b| app.db.user(&b.owner_id))
-            .filter(|u| u.active());
+        let owner = caller.bot.as_deref().and_then(|id| app.db.bot(id)).and_then(|b| app.db.user(&b.owner_id)).filter(|u| u.active());
         if !owner.is_some_and(|u| rbac::allows(Principal::User(u.role), need)) {
             return denied("owner_role", "This Bot's owner can't do this.".into());
         }
@@ -1446,16 +1025,8 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
     // A cookie, a password the browser cached, or ALLOW_NO_AUTH rides along on any request the
     // browser makes, so writes on them must come from our own pages. Only a Bearer token is sent on
     // purpose. Some GETs act too (opening a screen starts it), so only plain reads are exempt.
-    let safe = matches!(method, Method::GET | Method::HEAD | Method::OPTIONS)
-        && matches!(
-            need,
-            rbac::Perm::Account | rbac::Perm::Read | rbac::Perm::Review
-        );
-    let ambient = !req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|h| h.starts_with("Bearer "));
+    let safe = matches!(method, Method::GET | Method::HEAD | Method::OPTIONS) && matches!(need, rbac::Perm::Account | rbac::Perm::Read | rbac::Perm::Review);
+    let ambient = !req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).is_some_and(|h| h.starts_with("Bearer "));
     if ambient && !safe && !users::same_origin(req.headers()) {
         return denied("cross_site", "Cross-site request refused.".into());
     }
@@ -1465,11 +1036,7 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
     req.extensions_mut().insert(by.clone());
     let res = next.run(req).await;
     if principal == Principal::Bot && res.status() == StatusCode::FORBIDDEN {
-        a.record(
-            by.event("access.denied")
-                .outcome(Outcome::Denied)
-                .details(json!({ "method": method.as_str(), "path": path })),
-        );
+        a.record(by.event("access.denied").outcome(Outcome::Denied).details(json!({ "method": method.as_str(), "path": path })));
     }
     res
 }
@@ -1478,13 +1045,7 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
 fn sso_path(path: &str) -> Option<&str> {
     match path.strip_prefix("/api/auth/sso")? {
         "" => Some("list"),
-        rest => rest
-            .strip_prefix('/')
-            .and_then(|r| r.split_once('/'))
-            .filter(|(id, step)| {
-                !id.is_empty() && !id.contains('/') && matches!(*step, "start" | "callback")
-            })
-            .map(|(_, step)| step),
+        rest => rest.strip_prefix('/').and_then(|r| r.split_once('/')).filter(|(id, step)| !id.is_empty() && !id.contains('/') && matches!(*step, "start" | "callback")).map(|(_, step)| step),
     }
 }
 
@@ -1492,27 +1053,9 @@ fn sso_path(path: &str) -> Option<&str> {
 /// cookie, or ALLOW_NO_AUTH. A request that sends bad credentials is refused even if
 /// it also has good ones elsewhere.
 fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<Response>> {
-    let h = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let operator = |method: &'static str| Caller {
-        principal: Principal::User(Role::Admin),
-        user: a.operator(),
-        session: None,
-        method,
-        bot: None,
-        bot_for: None,
-    };
-    let from_session = |(s, u): (db::Session, db::User)| Caller {
-        principal: Principal::User(u.role),
-        user: Some(u),
-        session: Some(s),
-        method: "session",
-        bot: None,
-        bot_for: None,
-    };
+    let h = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let operator = |method: &'static str| Caller { principal: Principal::User(Role::Admin), user: a.operator(), session: None, method, bot: None, bot_for: None };
+    let from_session = |(s, u): (db::Session, db::User)| Caller { principal: Principal::User(u.role), user: Some(u), session: Some(s), method: "session", bot: None, bot_for: None };
     let fail = |method: &str, reason: Option<&str>, clear: bool| {
         a.login_failed(source, method, reason);
         Err(Box::new(unauthorized(a, req, clear)))
@@ -1525,41 +1068,22 @@ fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<
         // Bot's latest run is still theirs.
         if t.starts_with(isolation::BOT_TOKEN_PREFIX) {
             let now = |id: &str| a.app.as_ref().map(|app| app.db.bot(id));
-            let run_over =
-                |b: &db::Bot, u: &str| a.app.as_ref().is_some_and(|app| app.acting_for(b) != u);
+            let run_over = |b: &db::Bot, u: &str| a.app.as_ref().is_some_and(|app| app.acting_for(b) != u);
             return match isolation::token_bot(&a.bot_key, t) {
                 Some((id, owner)) => match now(id) {
                     Some(None) => fail("bot_token", Some("bot_gone"), false),
-                    Some(Some(b)) if b.owner_id != owner => {
-                        fail("bot_token", Some("bot_moved"), false)
-                    }
-                    Some(Some(b))
-                        if isolation::token_for_user(&a.bot_key, t)
-                            .is_some_and(|u| run_over(&b, u)) =>
-                    {
-                        fail("bot_token", Some("run_over"), false)
-                    }
-                    _ => Ok(Caller {
-                        principal: Principal::Bot,
-                        user: None,
-                        session: None,
-                        method: "bot_token",
-                        bot: Some(id.to_string()),
-                        bot_for: isolation::token_for_user(&a.bot_key, t).map(str::to_string),
-                    }),
+                    Some(Some(b)) if b.owner_id != owner => fail("bot_token", Some("bot_moved"), false),
+                    Some(Some(b)) if isolation::token_for_user(&a.bot_key, t).is_some_and(|u| run_over(&b, u)) => fail("bot_token", Some("run_over"), false),
+                    _ => Ok(Caller { principal: Principal::Bot, user: None, session: None, method: "bot_token", bot: Some(id.to_string()), bot_for: isolation::token_for_user(&a.bot_key, t).map(str::to_string) }),
                 },
                 None => fail("bot_token", Some("bad_token"), false),
             };
         }
         return match a.session(t) {
             Some(found) => Ok(from_session(found)),
-            None if t.starts_with(users::SESSION_PREFIX) => {
-                fail("session", Some("unknown_or_expired"), false)
-            }
+            None if t.starts_with(users::SESSION_PREFIX) => fail("session", Some("unknown_or_expired"), false),
             // A provisioning token works only under /scim/v2 (ADR 0023); one sent here may have leaked.
-            None if t.starts_with(scim::TOKEN_PREFIX) => {
-                fail("scim_token", Some("not_for_api"), false)
-            }
+            None if t.starts_with(scim::TOKEN_PREFIX) => fail("scim_token", Some("not_for_api"), false),
             None => fail("bot_token", None, false),
         };
     }
@@ -1612,33 +1136,19 @@ fn authenticate(a: &Auth, req: &Request, source: &Source) -> Result<Caller, Box<
 /// fetches, or a cookie session that ended would pop up a password box.
 fn unauthorized(a: &Auth, req: &Request, clear_cookie: bool) -> Response {
     let h = req.headers();
-    let page = !req.uri().path().starts_with("/api/")
-        && matches!(*req.method(), Method::GET | Method::HEAD);
+    let page = !req.uri().path().starts_with("/api/") && matches!(*req.method(), Method::GET | Method::HEAD);
     // With break-glass on, a page sent with a wrong password gets the browser's password box again.
     let mut res = if page && (!a.break_glass || !h.contains_key(header::AUTHORIZATION)) {
         (StatusCode::SEE_OTHER, [(header::LOCATION, "/login")]).into_response()
     } else {
         ApiError(StatusCode::UNAUTHORIZED, "Login required".into()).into_response()
     };
-    let fetch = h
-        .get("sec-fetch-mode")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|m| m != "navigate");
-    if res.status() == StatusCode::UNAUTHORIZED
-        && a.break_glass
-        && !fetch
-        && users::cookie_token(h).is_none()
-    {
-        res.headers_mut().insert(
-            header::WWW_AUTHENTICATE,
-            HeaderValue::from_static("Basic realm=\"Bots\""),
-        );
+    let fetch = h.get("sec-fetch-mode").and_then(|v| v.to_str().ok()).is_some_and(|m| m != "navigate");
+    if res.status() == StatusCode::UNAUTHORIZED && a.break_glass && !fetch && users::cookie_token(h).is_none() {
+        res.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Basic realm=\"Bots\""));
     }
     if clear_cookie {
-        res.headers_mut().insert(
-            header::SET_COOKIE,
-            HeaderValue::from_static(users::clear_cookie()),
-        );
+        res.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_static(users::clear_cookie()));
     }
     res
 }
@@ -1649,10 +1159,7 @@ fn unauthorized(a: &Auth, req: &Request, clear_cookie: bool) -> Response {
 fn need_user(p: Principal) -> Res<()> {
     match p {
         Principal::User(_) => Ok(()),
-        Principal::Bot => Err(ApiError(
-            StatusCode::FORBIDDEN,
-            "Only a signed-in person can do this, not a Bot.".into(),
-        )),
+        Principal::Bot => Err(ApiError(StatusCode::FORBIDDEN, "Only a signed-in person can do this, not a Bot.".into())),
     }
 }
 
@@ -1662,12 +1169,7 @@ fn same(presented: &[u8], secret: &[u8]) -> bool {
     if secret.is_empty() {
         return presented.is_empty();
     }
-    let diff = presented
-        .iter()
-        .enumerate()
-        .fold((presented.len() != secret.len()) as u8, |acc, (i, x)| {
-            acc | (x ^ secret[i % secret.len()])
-        });
+    let diff = presented.iter().enumerate().fold((presented.len() != secret.len()) as u8, |acc, (i, x)| acc | (x ^ secret[i % secret.len()]));
     std::hint::black_box(diff) == 0
 }
 
@@ -1759,25 +1261,11 @@ async fn web(uri: axum::http::Uri, principal: Option<Extension<Principal>>) -> R
     let see = |to: &'static str| (StatusCode::SEE_OTHER, [(header::LOCATION, to)]).into_response();
     let admin = principal.is_some_and(|Extension(p)| p == Principal::User(Role::Admin));
     let file = match path {
-        "/console" => {
-            return (
-                StatusCode::PERMANENT_REDIRECT,
-                [(header::LOCATION, "/console/")],
-            )
-                .into_response();
-        }
+        "/console" => return (StatusCode::PERMANENT_REDIRECT, [(header::LOCATION, "/console/")]).into_response(),
         p if p == "/app" || p.starts_with("/app/") => {
             return match admin {
                 true => see("/console/"),
-                false => (
-                    StatusCode::NOT_FOUND,
-                    [
-                        (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-                        (header::CACHE_CONTROL, "no-cache"),
-                    ],
-                    NO_CLIENT,
-                )
-                    .into_response(),
+                false => (StatusCode::NOT_FOUND, [(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], NO_CLIENT).into_response(),
             };
         }
         p if p.starts_with("/console/") && !admin => return see("/app/"),
@@ -1815,12 +1303,7 @@ pub const CONSOLE_CSP: &str = "default-src 'self'; script-src 'self'; style-src 
 
 // Live updates: one Server-Sent Events stream with everything.
 
-async fn events(
-    State(app): State<AppState>,
-    Extension(a): Extension<Arc<Auth>>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-) -> impl IntoResponse {
+async fn events(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>) -> impl IntoResponse {
     // Each stream carries only the Bots its caller can see (ADR 0017).
     let mut filter = acl::StreamFilter::new(viewer(&app, &c, &by));
     let session = c.session.map(|s| s.id);
@@ -1892,10 +1375,7 @@ async fn events(
             }
         }
     });
-    (
-        [("x-accel-buffering", "no")],
-        Sse::new(Box::pin(ReceiverStream::new(rx)) as EventStream).keep_alive(KeepAlive::default()),
-    )
+    ([("x-accel-buffering", "no")], Sse::new(Box::pin(ReceiverStream::new(rx)) as EventStream).keep_alive(KeepAlive::default()))
 }
 
 #[cfg(not(test))]
@@ -1908,14 +1388,7 @@ async fn login_page() -> Response {
         Some(dir) => std::fs::read_to_string(dir.join("login.html")).unwrap_or_default(),
         None => include_str!("../../web/login.html").to_string(),
     };
-    (
-        [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        body,
-    )
-        .into_response()
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], body).into_response()
 }
 
 // Bots
@@ -1924,35 +1397,19 @@ async fn login_page() -> Response {
 fn plan_user(app: &App, c: &Caller) -> String {
     match (&c.user, c.principal) {
         (Some(u), _) => u.id.clone(),
-        (None, Principal::Bot) => c
-            .bot
-            .as_deref()
-            .and_then(|id| app.db.bot(id))
-            .map_or_else(String::new, |b| b.owner_id),
+        (None, Principal::Bot) => c.bot.as_deref().and_then(|id| app.db.bot(id)).map_or_else(String::new, |b| b.owner_id),
         (None, _) => users::OPERATOR.into(),
     }
 }
 
 /// Every Bot the caller can see, each with their `access` to it.
 fn visible_bots(app: &App, c: &Caller, by: &Who) -> Vec<Value> {
-    viewer(app, c, by)
-        .bots(&app.db)
-        .iter()
-        .map(|(b, a)| bot_view_for(app, c, b, *a))
-        .collect()
+    viewer(app, c, by).bots(&app.db).iter().map(|(b, a)| bot_view_for(app, c, b, *a)).collect()
 }
 
-async fn state(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-) -> Json<Value> {
+async fn state(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>) -> Json<Value> {
     let bots = visible_bots(&app, &c, &by);
-    let approvals = if rbac::allows(c.principal, Perm::Review) {
-        visible_approvals(&app, &c, &by, Some("pending"), None, 200)
-    } else {
-        vec![]
-    };
+    let approvals = if rbac::allows(c.principal, Perm::Review) { visible_approvals(&app, &c, &by, Some("pending"), None, 200) } else { vec![] };
     // The owner keeps USER_NAME, as before users existed.
     let name = match &c.user {
         Some(u) if u.id != users::OPERATOR => u.name.clone(),
@@ -1966,10 +1423,7 @@ async fn state(
     let plan_id = plan_user(&app, &c);
     let me_id = plan_id.as_str();
     let tier = app.tier_of(me_id);
-    let harnesses: Vec<&str> = adapters::installed()
-        .into_iter()
-        .filter(|h| tier.allows_harness(h))
-        .collect();
+    let harnesses: Vec<&str> = adapters::installed().into_iter().filter(|h| tier.allows_harness(h)).collect();
     Json(json!({
         "me": { "name": name, "id": c.user.as_ref().map(|u| &u.id), "email": c.user.as_ref().and_then(|u| u.email.as_ref()), "role": role, "permissions": rbac::granted(c.principal), "session": c.session.is_some(), "tier": tier.view() },
         "harnesses": harnesses,
@@ -1983,38 +1437,21 @@ async fn state(
 /// Models and reasoning efforts the harness offers on this server. On a managed tier
 /// the plan picks the model, so only admins may list them (ADR 0033). `?tier=` (admins):
 /// only that tier's models for the harness, for picking one for a Bot on that tier.
-async fn list_models(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Path(name): Path<String>,
-    Query(q): Query<HashMap<String, String>>,
-) -> Res {
+async fn list_models(State(app): State<AppState>, Extension(c): Extension<Caller>, Path(name): Path<String>, Query(q): Query<HashMap<String, String>>) -> Res {
     if adapters::get(&name).is_none() {
         return Err(not_found("Harness"));
     }
     let admin = c.principal == Principal::User(Role::Admin);
     if !admin && (q.contains_key("tier") || app.tier_of(&plan_user(&app, &c)).managed()) {
-        return Err(ApiError(
-            StatusCode::FORBIDDEN,
-            "Your plan picks the model.".into(),
-        ));
+        return Err(ApiError(StatusCode::FORBIDDEN, "Your plan picks the model.".into()));
     }
     let tier = match q.get("tier") {
         None => None,
-        Some(t) => Some(
-            app.tiers()
-                .get(t)
-                .cloned()
-                .ok_or_else(|| not_found("Tier"))?,
-        ),
+        Some(t) => Some(app.tiers().get(t).cloned().ok_or_else(|| not_found("Tier"))?),
     };
     let harness = name.clone();
-    let list = tokio::task::spawn_blocking(move || adapters::models(&name))
-        .await
-        .unwrap_or_default();
-    let Some(routes) = tier.and_then(|t| t.routes) else {
-        return Ok(Json(json!(list)));
-    };
+    let list = tokio::task::spawn_blocking(move || adapters::models(&name)).await.unwrap_or_default();
+    let Some(routes) = tier.and_then(|t| t.routes) else { return Ok(Json(json!(list))) };
     // The tier's own models, named as the harness names them. "Default model" (no id)
     // is always offered by clients, so routes without a model add nothing here.
     let picked: Vec<adapters::ModelOption> = routes
@@ -2023,12 +1460,7 @@ async fn list_models(
         .filter_map(|r| {
             let id = r.model.clone()?;
             let known = list.iter().find(|m| m.id == id || m.aliases.contains(&id));
-            Some(adapters::ModelOption {
-                label: known.map_or_else(|| id.clone(), |m| m.label.clone()),
-                id,
-                efforts: vec![],
-                aliases: vec![],
-            })
+            Some(adapters::ModelOption { label: known.map_or_else(|| id.clone(), |m| m.label.clone()), id, efforts: vec![], aliases: vec![] })
         })
         .collect();
     Ok(Json(json!(picked)))
@@ -2069,10 +1501,7 @@ pub(crate) fn tier_usage(app: &App, user_id: &str) -> Value {
 /// `GET /api/usage` (admins): every user's plan, limits, and use, their machine against
 /// the plan's size, and their subscription (ADR 0040). `over` names limits a user is
 /// past, which happens after a downgrade: nothing is deleted, new use is refused.
-async fn admin_usage(
-    State(app): State<AppState>,
-    Extension(a): Extension<Arc<Auth>>,
-) -> Json<Value> {
+async fn admin_usage(State(app): State<AppState>, Extension(a): Extension<Arc<Auth>>) -> Json<Value> {
     let users: Vec<Value> = app
         .db
         .users()
@@ -2108,9 +1537,7 @@ async fn admin_usage(
             })
         })
         .collect();
-    Json(
-        json!({ "users": users, "billing": a.payments.enabled(), "checkout": a.payments.checkout_enabled() }),
-    )
+    Json(json!({ "users": users, "billing": a.payments.enabled(), "checkout": a.payments.checkout_enabled() }))
 }
 
 /// `GET /api/tiers` (admins): every tier with its routes, and the default.
@@ -2121,24 +1548,12 @@ async fn list_tiers(State(app): State<AppState>) -> Json<Value> {
 /// The Bot settings must fit the owner's tier: harness, model, and effort, and on
 /// create a free Bot slot (ADR 0033). Admins too: the tier is the routing table.
 /// `current` is the Bot's model when only its effort changes.
-fn check_tier(
-    app: &App,
-    owner_id: &str,
-    harness: &str,
-    model: Option<&str>,
-    effort: Option<&str>,
-    current: Option<&str>,
-) -> Res<()> {
-    app.tier_of(owner_id)
-        .check(harness, model, effort, current)
-        .map_err(|e| ApiError(StatusCode::FORBIDDEN, e))
+fn check_tier(app: &App, owner_id: &str, harness: &str, model: Option<&str>, effort: Option<&str>, current: Option<&str>) -> Res<()> {
+    app.tier_of(owner_id).check(harness, model, effort, current).map_err(|e| ApiError(StatusCode::FORBIDDEN, e))
 }
 
-async fn list_bots(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-) -> Json<Value> {
+
+async fn list_bots(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>) -> Json<Value> {
     Json(json!(visible_bots(&app, &c, &by)))
 }
 
@@ -2151,13 +1566,7 @@ fn need_bot(app: &App, id: &str) -> Res<db::Bot> {
 /// than that of the person its run is for (ADR 0046).
 fn viewer(app: &App, c: &Caller, _by: &Who) -> Viewer {
     match (c.principal, c.bot.as_deref().and_then(|id| app.db.bot(id))) {
-        (Principal::Bot, Some(b))
-            if c.bot_for
-                .as_deref()
-                .is_some_and(|u| app.acting_for(&b) != u) =>
-        {
-            Viewer::Nobody
-        }
+        (Principal::Bot, Some(b)) if c.bot_for.as_deref().is_some_and(|u| app.acting_for(&b) != u) => Viewer::Nobody,
         (Principal::Bot, Some(b)) => app.bot_viewer(&b),
         (Principal::Bot, None) => Viewer::Nobody,
         _ => Viewer::of(c),
@@ -2172,10 +1581,7 @@ fn acting_bot(app: &App, c: &Caller, by: &Who, named: Option<&str>) -> Res<db::B
         Principal::Bot => {
             let own = c.bot.as_deref().unwrap_or("");
             if named.is_some_and(|n| n != own) {
-                return Err(ApiError(
-                    StatusCode::FORBIDDEN,
-                    "A Bot can only act as itself.".into(),
-                ));
+                return Err(ApiError(StatusCode::FORBIDDEN, "A Bot can only act as itself.".into()));
             }
             app.db.bot(own).ok_or_else(|| bad("Unknown Bot (BOT_ID)"))
         }
@@ -2188,13 +1594,7 @@ fn acting_bot(app: &App, c: &Caller, by: &Who, named: Option<&str>) -> Res<db::B
 
 /// The Bot, when the caller has at least `need` on it (ADR 0017). A Bot they can't see
 /// is a 404, the same as one that doesn't exist; one they can see but not use is a 403.
-fn need_bot_access(
-    app: &App,
-    c: &Caller,
-    by: &Who,
-    id: &str,
-    need: Access,
-) -> Res<(db::Bot, Access)> {
+fn need_bot_access(app: &App, c: &Caller, by: &Who, id: &str, need: Access) -> Res<(db::Bot, Access)> {
     let bot = need_bot(app, id)?;
     let has = viewer(app, c, by).access(&app.db, &bot);
     if has >= need {
@@ -2202,77 +1602,36 @@ fn need_bot_access(
     }
     // Its owner could, but the person it runs for can't: always worth a record.
     if let Some(for_user) = capped_by_asker(app, c, |owner| owner.access(&app.db, &bot) >= need) {
-        let details =
-            json!({ "reason": "asker_acl", "need": need, "has": has, "forUser": for_user });
-        app.db.record(
-            &by.event("access.denied")
-                .target("bot", id)
-                .bot(id)
-                .outcome(Outcome::Denied)
-                .details(details),
-        );
+        let details = json!({ "reason": "asker_acl", "need": need, "has": has, "forUser": for_user });
+        app.db.record(&by.event("access.denied").target("bot", id).bot(id).outcome(Outcome::Denied).details(details));
     } else if c.principal != Principal::Bot || has == Access::None {
         // The auth middleware already records every 403 a Bot gets.
         let details = json!({ "reason": "bot_acl", "need": need, "has": has });
-        app.db.record(
-            &by.event("access.denied")
-                .target("bot", id)
-                .bot(id)
-                .outcome(Outcome::Denied)
-                .details(details),
-        );
+        app.db.record(&by.event("access.denied").target("bot", id).bot(id).outcome(Outcome::Denied).details(details));
     }
     Err(match (has, c.principal) {
         (Access::None, _) => not_found("Bot"),
-        (_, Principal::User(Role::Readonly)) => ApiError(
-            StatusCode::FORBIDDEN,
-            "Your role (readonly) can only view Bots.".into(),
-        ),
-        (_, _) if need == Access::Manage => ApiError(
-            StatusCode::FORBIDDEN,
-            "Only this Bot's owner or an admin can do this.".into(),
-        ),
-        _ => ApiError(
-            StatusCode::FORBIDDEN,
-            "You can view this Bot but not use it. Ask its owner for operator access.".into(),
-        ),
+        (_, Principal::User(Role::Readonly)) => ApiError(StatusCode::FORBIDDEN, "Your role (readonly) can only view Bots.".into()),
+        (_, _) if need == Access::Manage => ApiError(StatusCode::FORBIDDEN, "Only this Bot's owner or an admin can do this.".into()),
+        _ => ApiError(StatusCode::FORBIDDEN, "You can view this Bot but not use it. Ask its owner for operator access.".into()),
     })
 }
 
 /// When the caller is a Bot running for someone other than its owner (ADR 0046) and
 /// `owner_could` holds for its owner's own access: whom it runs for.
-fn capped_by_asker(
-    app: &App,
-    c: &Caller,
-    owner_could: impl FnOnce(&Viewer) -> bool,
-) -> Option<String> {
-    let b = c
-        .bot
-        .as_deref()
-        .filter(|_| c.principal == Principal::Bot)
-        .and_then(|id| app.db.bot(id))?;
+fn capped_by_asker(app: &App, c: &Caller, owner_could: impl FnOnce(&Viewer) -> bool) -> Option<String> {
+    let b = c.bot.as_deref().filter(|_| c.principal == Principal::Bot).and_then(|id| app.db.bot(id))?;
     let for_user = app.acting_for(&b);
     (for_user != b.owner_id && owner_could(&Viewer::owner_of(&app.db, &b))).then_some(for_user)
 }
 
 /// Newest approvals for Bots the caller can see; `bot` narrows to one they can see.
-fn visible_approvals(
-    app: &App,
-    c: &Caller,
-    by: &Who,
-    status: Option<&str>,
-    bot: Option<&str>,
-    limit: i64,
-) -> Vec<db::Approval> {
+fn visible_approvals(app: &App, c: &Caller, by: &Who, status: Option<&str>, bot: Option<&str>, limit: i64) -> Vec<db::Approval> {
     let viewer = viewer(app, c, by);
     if viewer == Viewer::All || bot.is_some() {
         return app.db.approvals(status, bot, limit);
     }
-    let ids: Vec<String> = viewer
-        .bots(&app.db)
-        .into_iter()
-        .map(|(b, _)| b.id)
-        .collect();
+    let ids: Vec<String> = viewer.bots(&app.db).into_iter().map(|(b, _)| b.id).collect();
     app.db.approvals_among(status, &ids, limit)
 }
 
@@ -2291,9 +1650,7 @@ fn bot_patch(v: &Value) -> Res<BotPatch> {
     if let Some(n) = v["name"].as_str().map(str::trim).filter(|n| !n.is_empty()) {
         p.name = Some(n.chars().take(60).collect());
     }
-    if let Some(c) = v["color"].as_str().filter(|c| {
-        c.len() == 7 && c.starts_with('#') && c[1..].chars().all(|x| x.is_ascii_hexdigit())
-    }) {
+    if let Some(c) = v["color"].as_str().filter(|c| c.len() == 7 && c.starts_with('#') && c[1..].chars().all(|x| x.is_ascii_hexdigit())) {
         p.color = Some(c.into());
     }
     if let Some(s) = v["shape"].as_str().filter(|s| SHAPES.contains(s)) {
@@ -2311,9 +1668,7 @@ fn bot_patch(v: &Value) -> Res<BotPatch> {
     match &v["effort"] {
         Value::Null if v.get("effort").is_some() => p.effort = Some(None),
         Value::String(e) if e.is_empty() => p.effort = Some(None),
-        Value::String(e)
-            if e.len() <= 20 && e.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') =>
-        {
+        Value::String(e) if e.len() <= 20 && e.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') => {
             p.effort = Some(Some(e.clone()))
         }
         Value::String(_) => return Err(bad("Invalid effort")),
@@ -2321,12 +1676,7 @@ fn bot_patch(v: &Value) -> Res<BotPatch> {
     }
     if let Some(h) = v.get("harness") {
         let h = h.as_str().filter(|h| adapters::get(h).is_some());
-        let h = h.ok_or_else(|| {
-            bad(format!(
-                "Harness must be one of: {}",
-                adapters::NAMES.join(", ")
-            ))
-        })?;
+        let h = h.ok_or_else(|| bad(format!("Harness must be one of: {}", adapters::NAMES.join(", "))))?;
         p.harness = Some(h.into());
     }
     if let Some(list) = v.get("prompts") {
@@ -2343,33 +1693,20 @@ const MAX_PROMPT_CHARS: usize = 200;
 /// and without repeats. An empty list shows none.
 fn prompts_field(v: &Value) -> Res<Option<Vec<String>>> {
     let Some(items) = v.as_array() else {
-        return if v.is_null() {
-            Ok(None)
-        } else {
-            Err(bad(
-                "Prompts must be a list of text, or null for the defaults",
-            ))
-        };
+        return if v.is_null() { Ok(None) } else { Err(bad("Prompts must be a list of text, or null for the defaults")) };
     };
     let mut out: Vec<String> = Vec::new();
     for item in items {
-        let t = item
-            .as_str()
-            .ok_or_else(|| bad("Prompts must be a list of text, or null for the defaults"))?
-            .trim();
+        let t = item.as_str().ok_or_else(|| bad("Prompts must be a list of text, or null for the defaults"))?.trim();
         if t.chars().count() > MAX_PROMPT_CHARS {
-            return Err(bad(format!(
-                "A prompt can be at most {MAX_PROMPT_CHARS} characters"
-            )));
+            return Err(bad(format!("A prompt can be at most {MAX_PROMPT_CHARS} characters")));
         }
         if !t.is_empty() && !out.iter().any(|o| o == t) {
             out.push(t.to_string());
         }
     }
     if out.len() > MAX_PROMPTS {
-        return Err(bad(format!(
-            "A Bot can have at most {MAX_PROMPTS} suggested prompts"
-        )));
+        return Err(bad(format!("A Bot can have at most {MAX_PROMPTS} suggested prompts")));
     }
     Ok(Some(out))
 }
@@ -2377,20 +1714,11 @@ fn prompts_field(v: &Value) -> Res<Option<Vec<String>>> {
 fn visibility_field(v: &Value) -> Res<Option<Visibility>> {
     match v.get("visibility") {
         None | Some(Value::Null) => Ok(None),
-        Some(x) => x
-            .as_str()
-            .and_then(Visibility::parse)
-            .map(Some)
-            .ok_or_else(|| bad("Visibility must be private or shared")),
+        Some(x) => x.as_str().and_then(Visibility::parse).map(Some).ok_or_else(|| bad("Visibility must be private or shared")),
     }
 }
 
-async fn create_bot(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-    Json(v): Json<Value>,
-) -> Res<(StatusCode, Json<Value>)> {
+async fn create_bot(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
     let p = bot_patch(&v)?;
     let name = p.name.ok_or_else(|| bad("Name is required"))?;
     // Shared unless asked otherwise, as every Bot was before ACLs; private with
@@ -2403,17 +1731,8 @@ async fn create_bot(
     if let Some(for_user) = capped_by_asker(&app, &c, |_| true) {
         let details = json!({ "reason": "asker_acl", "action": "bot.create", "forUser": for_user });
         let id = c.bot.as_deref().unwrap_or_default();
-        app.db.record(
-            &by.event("access.denied")
-                .target("bot", id)
-                .bot(id)
-                .outcome(Outcome::Denied)
-                .details(details),
-        );
-        return Err(ApiError(
-            StatusCode::FORBIDDEN,
-            "A Bot working for a teammate can't make new Bots. Ask its owner.".into(),
-        ));
+        app.db.record(&by.event("access.denied").target("bot", id).bot(id).outcome(Outcome::Denied).details(details));
+        return Err(ApiError(StatusCode::FORBIDDEN, "A Bot working for a teammate can't make new Bots. Ask its owner.".into()));
     }
     // A person owns what they make. A Bot's new Bot belongs to that Bot's owner.
     let owner = match (&c.user, c.principal) {
@@ -2421,17 +1740,8 @@ async fn create_bot(
         (None, Principal::Bot) => acting_bot(&app, &c, &by, None)?.owner_id,
         (None, _) => users::OPERATOR.into(),
     };
-    let harness = p
-        .harness
-        .unwrap_or_else(|| default_harness_for(&app, &owner));
-    check_tier(
-        &app,
-        &owner,
-        &harness,
-        p.model.clone().flatten().as_deref(),
-        p.effort.clone().flatten().as_deref(),
-        None,
-    )?;
+    let harness = p.harness.unwrap_or_else(|| default_harness_for(&app, &owner));
+    check_tier(&app, &owner, &harness, p.model.clone().flatten().as_deref(), p.effort.clone().flatten().as_deref(), None)?;
     let tier = app.tier_of(&owner);
     let max = tier.limits.max_bots;
     let bot = app
@@ -2455,17 +1765,9 @@ async fn create_bot(
     app.init_bot_files(&bot);
     app.push_bot(&bot.id);
     let details = json!({ "name": bot.name, "harness": bot.harness, "model": bot.model, "owner": bot.owner_id, "visibility": bot.visibility });
-    app.db.record(
-        &by.event("bot.created")
-            .target("bot", &bot.id)
-            .bot(&bot.id)
-            .details(details),
-    );
+    app.db.record(&by.event("bot.created").target("bot", &bot.id).bot(&bot.id).details(details));
     let access = viewer(&app, &c, &by).access(&app.db, &bot);
-    Ok((
-        StatusCode::CREATED,
-        Json(bot_view_for(&app, &c, &bot, access)),
-    ))
+    Ok((StatusCode::CREATED, Json(bot_view_for(&app, &c, &bot, access))))
 }
 
 /// Settings that changed, as `{field: {from, to}}`.
@@ -2487,13 +1789,7 @@ fn bot_changes(before: &db::Bot, after: &db::Bot) -> serde_json::Map<String, Val
     m
 }
 
-async fn update_bot(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-    Path(id): Path<String>,
-    Json(v): Json<Value>,
-) -> Res {
+async fn update_bot(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
     let (bot, access) = need_bot_access(&app, &c, &by, &id, Access::Manage)?;
     let mut p = bot_patch(&v)?;
     if p.harness.as_ref().is_some_and(|h| *h != bot.harness) {
@@ -2509,40 +1805,20 @@ async fn update_bot(
         // Only what's changing is checked against the tier: a Bot set up before its
         // owner's tier changed can still be renamed, and runs on the tier's route anyway.
         let current = model.clone();
-        let (model, effort) = (
-            p.model.is_some().then_some(model).flatten(),
-            p.effort.is_some().then_some(effort).flatten(),
-        );
-        check_tier(
-            &app,
-            &bot.owner_id,
-            &harness,
-            model.as_deref(),
-            effort.as_deref(),
-            current.as_deref(),
-        )?;
+        let (model, effort) = (p.model.is_some().then_some(model).flatten(), p.effort.is_some().then_some(effort).flatten());
+        check_tier(&app, &bot.owner_id, &harness, model.as_deref(), effort.as_deref(), current.as_deref())?;
     }
     app.db.update_bot(&id, p);
     app.push_bot(&id);
     let after = need_bot(&app, &id)?;
     let changes = bot_changes(&bot, &after);
     if !changes.is_empty() {
-        app.db.record(
-            &by.event("bot.updated")
-                .target("bot", &id)
-                .bot(&id)
-                .details(json!({ "changes": changes })),
-        );
+        app.db.record(&by.event("bot.updated").target("bot", &id).bot(&id).details(json!({ "changes": changes })));
     }
     Ok(Json(bot_view_for(&app, &c, &after, access)))
 }
 
-async fn delete_bot(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-    Path(id): Path<String>,
-) -> Res {
+async fn delete_bot(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     let (bot, _) = need_bot_access(&app, &c, &by, &id, Access::Manage)?;
     if bot.primary {
         return Err(bad("The primary Bot can't be deleted"));
@@ -2554,12 +1830,7 @@ async fn delete_bot(
     machines::screens::close(&app, &by, &id, "bot_deleted").await;
     app.db.delete_bot(&id);
     notify::forget_bot(&app, &id);
-    app.db.record(
-        &by.event("bot.deleted")
-            .target("bot", &id)
-            .bot(&id)
-            .details(json!({ "name": bot.name, "harness": bot.harness })),
-    );
+    app.db.record(&by.event("bot.deleted").target("bot", &id).bot(&id).details(json!({ "name": bot.name, "harness": bot.harness })));
     machines::offboard::check_owner(&app, &by, &bot.owner_id);
     app.send(json!({ "type": "botDeleted", "botId": id }));
     Ok(Json(json!({ "ok": true })))
@@ -2631,57 +1902,27 @@ pub(crate) async fn give_bot(app: &AppState, by: &Who, bot: &db::Bot, to: &db::U
     // transfer (another request took the last slot) leaves that work running.
     if !app.stop_if(id, || app.db.set_bot_owner_capped(id, &to.id, max)) {
         let details = json!({ "reason": "tier_bot_limit", "from": bot.owner_id, "to": to.id, "tier": tier.name, "limit": max });
-        app.db.record(
-            &by.event("bot.transfer_refused")
-                .target("bot", id)
-                .bot(id)
-                .outcome(Outcome::Denied)
-                .details(details),
-        );
-        return Err(ApiError(
-            StatusCode::FORBIDDEN,
-            format!(
-                "{}'s plan ({}) allows {} Bots, and they're all in use.",
-                to.name,
-                tier.label,
-                max.unwrap_or(0)
-            ),
-        ));
+        app.db.record(&by.event("bot.transfer_refused").target("bot", id).bot(id).outcome(Outcome::Denied).details(details));
+        return Err(ApiError(StatusCode::FORBIDDEN, format!("{}'s plan ({}) allows {} Bots, and they're all in use.", to.name, tier.label, max.unwrap_or(0))));
     }
     // The new owner manages it anyway; a leftover grant would only confuse.
     app.db.remove_grant(id, &to.id);
     app.hand_over_memory(id, &bot.owner_id, &to.id);
-    app.db.record(
-        &by.event("bot.owner_changed")
-            .target("bot", id)
-            .bot(id)
-            .details(json!({ "from": bot.owner_id, "to": to.id })),
-    );
+    app.db.record(&by.event("bot.owner_changed").target("bot", id).bot(id).details(json!({ "from": bot.owner_id, "to": to.id })));
     acl_changed(app, by, id, true).await;
     // It runs on the new owner's machine now: teammates may have no use for the old one.
     machines::offboard::check_owner(app, by, &bot.owner_id);
     Ok(())
 }
 
-async fn get_access(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-    Path(id): Path<String>,
-) -> Res {
+async fn get_access(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     let (bot, access) = need_bot_access(&app, &c, &by, &id, Access::View)?;
     Ok(Json(access_view(&app, &bot, access)))
 }
 
 /// Body: `{visibility?: "private" | "shared", owner?: <user id or email>}`. The owner
 /// or an admin can change visibility; only an admin can give a Bot to someone else.
-async fn update_access(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-    Path(id): Path<String>,
-    Json(v): Json<Value>,
-) -> Res {
+async fn update_access(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
     need_user(c.principal)?;
     let (bot, _) = need_bot_access(&app, &c, &by, &id, Access::Manage)?;
     let visibility = visibility_field(&v)?;
@@ -2689,16 +1930,9 @@ async fn update_access(
         None | Some(Value::Null) => None,
         Some(o) => {
             if c.principal != Principal::User(Role::Admin) {
-                return Err(ApiError(
-                    StatusCode::FORBIDDEN,
-                    "Only an admin can change who owns a Bot.".into(),
-                ));
+                return Err(ApiError(StatusCode::FORBIDDEN, "Only an admin can change who owns a Bot.".into()));
             }
-            let key = o
-                .as_str()
-                .map(str::trim)
-                .filter(|k| !k.is_empty())
-                .ok_or_else(|| bad("owner must be a user id or email"))?;
+            let key = o.as_str().map(str::trim).filter(|k| !k.is_empty()).ok_or_else(|| bad("owner must be a user id or email"))?;
             let u = app.db.find_user(key).ok_or_else(|| not_found("User"))?;
             if !u.active() {
                 return Err(bad("That user is disabled"));
@@ -2717,12 +1951,7 @@ async fn update_access(
     }
     if let Some(to) = visibility.filter(|to| *to != bot.visibility) {
         app.db.set_bot_visibility(&id, to);
-        app.db.record(
-            &by.event("bot.visibility_changed")
-                .target("bot", &id)
-                .bot(&id)
-                .details(json!({ "from": bot.visibility, "to": to })),
-        );
+        app.db.record(&by.event("bot.visibility_changed").target("bot", &id).bot(&id).details(json!({ "from": bot.visibility, "to": to })));
         narrowed |= to == Visibility::Private;
     }
     acl_changed(&app, &by, &id, narrowed).await;
@@ -2732,132 +1961,61 @@ async fn update_access(
 }
 
 /// Body: `{level: "viewer" | "operator"}`. Adds or changes one user's grant.
-async fn put_grant(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-    Path((id, key)): Path<(String, String)>,
-    Json(v): Json<Value>,
-) -> Res {
+async fn put_grant(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path((id, key)): Path<(String, String)>, Json(v): Json<Value>) -> Res {
     need_user(c.principal)?;
     let (bot, access) = need_bot_access(&app, &c, &by, &id, Access::Manage)?;
-    let level = v["level"]
-        .as_str()
-        .and_then(acl::Grant::parse)
-        .ok_or_else(|| bad("level must be viewer or operator"))?;
+    let level = v["level"].as_str().and_then(acl::Grant::parse).ok_or_else(|| bad("level must be viewer or operator"))?;
     let u = app.db.find_user(&key).ok_or_else(|| not_found("User"))?;
     if u.id == bot.owner_id {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            "That user owns this Bot already.".into(),
-        ));
+        return Err(ApiError(StatusCode::CONFLICT, "That user owns this Bot already.".into()));
     }
     let by_id = c.user.as_ref().map_or(users::OPERATOR, |u| u.id.as_str());
     let before = app.db.set_grant(&id, &u.id, level, by_id);
     if before != Some(level) {
-        app.db.record(
-            &by.event("bot.access_granted")
-                .target("bot", &id)
-                .bot(&id)
-                .details(json!({ "user": u.id, "level": level, "from": before })),
-        );
-        acl_changed(
-            &app,
-            &by,
-            &id,
-            before == Some(acl::Grant::Operator) && level == acl::Grant::Viewer,
-        )
-        .await;
+        app.db.record(&by.event("bot.access_granted").target("bot", &id).bot(&id).details(json!({ "user": u.id, "level": level, "from": before })));
+        acl_changed(&app, &by, &id, before == Some(acl::Grant::Operator) && level == acl::Grant::Viewer).await;
     }
     Ok(Json(access_view(&app, &bot, access)))
 }
 
-async fn delete_grant(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-    Path((id, key)): Path<(String, String)>,
-) -> Res {
+async fn delete_grant(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path((id, key)): Path<(String, String)>) -> Res {
     need_user(c.principal)?;
     let (bot, access) = need_bot_access(&app, &c, &by, &id, Access::Manage)?;
     let u = app.db.find_user(&key).ok_or_else(|| not_found("User"))?;
-    let level = app
-        .db
-        .remove_grant(&id, &u.id)
-        .ok_or_else(|| not_found("Grant"))?;
-    app.db.record(
-        &by.event("bot.access_revoked")
-            .target("bot", &id)
-            .bot(&id)
-            .details(json!({ "user": u.id, "level": level })),
-    );
+    let level = app.db.remove_grant(&id, &u.id).ok_or_else(|| not_found("Grant"))?;
+    app.db.record(&by.event("bot.access_revoked").target("bot", &id).bot(&id).details(json!({ "user": u.id, "level": level })));
     acl_changed(&app, &by, &id, true).await;
     Ok(Json(access_view(&app, &bot, access)))
 }
 
-async fn mark_read(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-    Path(id): Path<String>,
-) -> Res {
+async fn mark_read(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     need_bot_access(&app, &c, &by, &id, Access::Operate)?;
-    app.db.update_bot(
-        &id,
-        BotPatch {
-            unread: Some(false),
-            ..Default::default()
-        },
-    );
+    app.db.update_bot(&id, BotPatch { unread: Some(false), ..Default::default() });
     app.push_bot(&id);
     Ok(Json(json!({ "ok": true })))
 }
 
-async fn stop_bot(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-    Path(id): Path<String>,
-) -> Res {
+async fn stop_bot(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     need_bot_access(&app, &c, &by, &id, Access::Operate)?;
     app.stop(&id);
-    app.db
-        .record(&by.event("bot.stopped").target("bot", &id).bot(&id));
+    app.db.record(&by.event("bot.stopped").target("bot", &id).bot(&id));
     Ok(Json(json!({ "ok": true })))
 }
 
 // Messages
 
-async fn list_messages(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-    Path(id): Path<String>,
-) -> Res {
+async fn list_messages(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     need_bot_access(&app, &c, &by, &id, Access::View)?;
     Ok(Json(json!(app.db.messages(&id, 200))))
 }
 
-async fn send_message(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-    Path(id): Path<String>,
-    Json(v): Json<Value>,
-) -> Res<(StatusCode, Json<Value>)> {
+async fn send_message(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
     need_bot_access(&app, &c, &by, &id, Access::Operate)?;
-    let text = v["text"]
-        .as_str()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .ok_or_else(|| bad("Text is required"))?;
+    let text = v["text"].as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| bad("Text is required"))?;
     let text: String = text.chars().take(100_000).collect();
     // Answering a choice card: remember which option was picked.
     let mut handoff = None;
-    let answered = v["answer"]["messageId"]
-        .as_i64()
-        .and_then(|mid| app.db.message(mid))
-        .filter(|m| m.bot_id == id);
+    let answered = v["answer"]["messageId"].as_i64().and_then(|mid| app.db.message(mid)).filter(|m| m.bot_id == id);
     let answered_id = answered.as_ref().map(|m| m.id);
     if let (Some(mid), Some(opt)) = (answered_id, v["answer"]["option"].as_u64())
         && let Some(mut q) = answered.and_then(|m| m.question)
@@ -2871,25 +2029,16 @@ async fn send_message(
     let waiter = answered_id.and_then(|mid| app.take_handoff(mid));
     if let Some((mid, option)) = handoff {
         let details = json!({ "option": option, "botWasWaiting": waiter.is_some() });
-        app.db.record(
-            &by.event("handoff.answered")
-                .target("handoff", &mid.to_string())
-                .bot(&id)
-                .details(details),
-        );
+        app.db.record(&by.event("handoff.answered").target("handoff", &mid.to_string()).bot(&id).details(details));
     }
     // Answering a handoff card the Bot is still waiting on: hand the answer to it directly.
     if let Some(tx) = waiter {
-        let msg = app
-            .db
-            .add_message(&id, "user", &text, None, false, Some("done"));
+        let msg = app.db.add_message(&id, "user", &text, None, false, Some("done"));
         app.push_message(&msg);
         let _ = tx.send(text);
         return Ok((StatusCode::ACCEPTED, Json(json!(msg))));
     }
-    let mut msg = app
-        .db
-        .add_message(&id, "user", &text, None, false, Some("queued"));
+    let mut msg = app.db.add_message(&id, "user", &text, None, false, Some("queued"));
     app.db.set_requested_by(msg.id, &by);
     msg.requested_by = Some(by.clone());
     app.push_message(&msg);
@@ -2899,91 +2048,42 @@ async fn send_message(
 
 // Bot to Bot: `botctl ask`. Waits for the reply and returns it as plain text.
 
-async fn ask(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-    Json(v): Json<Value>,
-) -> Result<String, ApiError> {
+async fn ask(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Result<String, ApiError> {
     let from = acting_bot(&app, &c, &by, v["from"].as_str())?;
     // A Bot asks with its owner's access. A person needs to be able to run both Bots.
     let viewer = viewer(&app, &c, &by);
     let to_key = v["to"].as_str().map(str::trim).unwrap_or("");
-    let bots: Vec<db::Bot> = viewer
-        .bots(&app.db)
-        .into_iter()
-        .filter(|(_, a)| *a >= Access::Operate)
-        .map(|(b, _)| b)
-        .collect();
-    let find = |bots: &[db::Bot]| {
-        bots.iter()
-            .find(|b| b.id == to_key)
-            .or_else(|| bots.iter().find(|b| b.name.eq_ignore_ascii_case(to_key)))
-            .cloned()
-    };
+    let bots: Vec<db::Bot> = viewer.bots(&app.db).into_iter().filter(|(_, a)| *a >= Access::Operate).map(|(b, _)| b).collect();
+    let find = |bots: &[db::Bot]| bots.iter().find(|b| b.id == to_key).or_else(|| bots.iter().find(|b| b.name.eq_ignore_ascii_case(to_key))).cloned();
     let Some(to) = find(&bots) else {
         // Hidden only because of whom it runs for (ADR 0046): the same answer, and a record.
-        let owners = |o: &Viewer| {
-            find(
-                &o.bots(&app.db)
-                    .into_iter()
-                    .filter(|(_, a)| *a >= Access::Operate)
-                    .map(|(b, _)| b)
-                    .collect::<Vec<_>>(),
-            )
-        };
+        let owners = |o: &Viewer| find(&o.bots(&app.db).into_iter().filter(|(_, a)| *a >= Access::Operate).map(|(b, _)| b).collect::<Vec<_>>());
         if let Some(for_user) = capped_by_asker(&app, &c, |o| owners(o).is_some()) {
-            let hidden = owners(&Viewer::owner_of(&app.db, &from))
-                .map(|b| b.id)
-                .unwrap_or_default();
-            let details =
-                json!({ "reason": "asker_acl", "need": Access::Operate, "forUser": for_user });
-            app.db.record(
-                &by.event("access.denied")
-                    .target("bot", &hidden)
-                    .bot(&from.id)
-                    .outcome(Outcome::Denied)
-                    .details(details),
-            );
+            let hidden = owners(&Viewer::owner_of(&app.db, &from)).map(|b| b.id).unwrap_or_default();
+            let details = json!({ "reason": "asker_acl", "need": Access::Operate, "forUser": for_user });
+            app.db.record(&by.event("access.denied").target("bot", &hidden).bot(&from.id).outcome(Outcome::Denied).details(details));
         }
-        return Err(bad(format!(
-            "No Bot named \"{to_key}\". Run `botctl bots` to list them."
-        )));
+        return Err(bad(format!("No Bot named \"{to_key}\". Run `botctl bots` to list them.")));
     };
     let to = &to;
     if to.id == from.id {
         return Err(bad("You can't ask yourself"));
     }
-    let text = v["text"]
-        .as_str()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .ok_or_else(|| bad("Message is required"))?;
+    let text = v["text"].as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| bad("Message is required"))?;
     // A Bot asks as itself, for its owner, and on for whomever its run is for; a person as themselves.
     let by = match c.principal {
         Principal::Bot => {
             let mut actor = Actor::for_bot(&from).method("bot_token");
             actor.asker = Some(app.acting_for(&from)).filter(|a| *a != from.owner_id);
-            Who {
-                actor,
-                source: by.source.clone(),
-            }
+            Who { actor, source: by.source.clone() }
         }
         Principal::User(_) => by,
     };
-    app.db.record(
-        &by.event("bot.asked")
-            .target("bot", &to.id)
-            .bot(&from.id)
-            .details(json!({ "to": to.name })),
-    );
+    app.db.record(&by.event("bot.asked").target("bot", &to.id).bot(&from.id).details(json!({ "to": to.name })));
     let wait = Duration::from_secs(9 * 60); // under the 10 minute max most harnesses allow a command
     Ok(match app.ask(&from, to, text, wait, &by).await {
         Some(reply) => reply,
-        None => format!(
-            "{} is still working on it. Their reply will arrive later as a new message.",
-            to.name
-        ),
+        None => format!("{} is still working on it. Their reply will arrive later as a new message.", to.name),
     })
 }
 
@@ -2992,21 +2092,12 @@ async fn ask(
 /// The caller as they are now, role read again: None once their session is revoked or
 /// expired, or they're disabled.
 fn caller_now(app: &App, a: &Auth, c: &Caller) -> Option<Caller> {
-    let Some(s) = &c.session else {
-        return Some(c.clone());
-    };
-    if !app
-        .db
-        .session_is_live(&s.id, db::now(), a.sessions.idle_ms, a.sessions.max_ms)
-    {
+    let Some(s) = &c.session else { return Some(c.clone()) };
+    if !app.db.session_is_live(&s.id, db::now(), a.sessions.idle_ms, a.sessions.max_ms) {
         return None;
     }
     let u = app.db.user(&s.user_id)?;
-    Some(Caller {
-        principal: Principal::User(u.role),
-        user: Some(u),
-        ..c.clone()
-    })
+    Some(Caller { principal: Principal::User(u.role), user: Some(u), ..c.clone() })
 }
 
 /// With teammates' own users on machines (ADR 0048), whose screen of `bot` a caller
@@ -3014,11 +2105,7 @@ fn caller_now(app: &App, a: &Auth, c: &Caller) -> Option<Caller> {
 /// with `?for=<user>`. A Bot's token gets the screen of the person its run is for.
 /// None: the owner's.
 fn screen_for(app: &App, c: &Caller, bot: &db::Bot, asked: Option<&str>) -> Res<Option<String>> {
-    let on = app
-        .control_plane
-        .get()
-        .is_some_and(|cp| cp.teammate_users())
-        && app.shared_bots() == acl::SharedBots::Isolated;
+    let on = app.control_plane.get().is_some_and(|cp| cp.teammate_users()) && app.shared_bots() == acl::SharedBots::Isolated;
     let me = match (&c.user, &c.bot) {
         (Some(u), _) => Some(u.id.clone()),
         (None, Some(b)) => app.db.bot(b).map(|b| app.acting_for(&b)),
@@ -3026,18 +2113,9 @@ fn screen_for(app: &App, c: &Caller, bot: &db::Bot, asked: Option<&str>) -> Res<
     };
     let admin = c.principal == Principal::User(Role::Admin);
     let who = match asked.map(str::trim).filter(|u| !u.is_empty()) {
-        Some(u) if !on => {
-            return Err(bad(format!(
-                "Screens are per teammate only with MACHINE_TEAMMATE_USERS=on, so there's no screen for {u}."
-            )));
-        }
+        Some(u) if !on => return Err(bad(format!("Screens are per teammate only with MACHINE_TEAMMATE_USERS=on, so there's no screen for {u}."))),
         Some(u) if admin || me.as_deref() == Some(u) => Some(u.to_string()),
-        Some(_) => {
-            return Err(ApiError(
-                StatusCode::FORBIDDEN,
-                "Only an admin can open someone else's screen of this Bot.".into(),
-            ));
-        }
+        Some(_) => return Err(ApiError(StatusCode::FORBIDDEN, "Only an admin can open someone else's screen of this Bot.".into())),
         None if on && !admin => me,
         None => None,
     };
@@ -3045,10 +2123,7 @@ fn screen_for(app: &App, c: &Caller, bot: &db::Bot, asked: Option<&str>) -> Res<
     if let Some(u) = &who
         && Viewer::person(&app.db, u).access(&app.db, bot) < Access::Operate
     {
-        return Err(ApiError(
-            StatusCode::NOT_FOUND,
-            "That person can't use this Bot, so it has no screen for them.".into(),
-        ));
+        return Err(ApiError(StatusCode::NOT_FOUND, "That person can't use this Bot, so it has no screen for them.".into()));
     }
     Ok(who)
 }
@@ -3068,60 +2143,29 @@ async fn screen_info(
     // screen may change hands while this waits on it, so access is checked again then.
     let still = || match caller_now(&app, &a, &c) {
         Some(now) => need_bot_access(&app, &now, &by, &id, Access::Operate).map(drop),
-        None => Err(ApiError(
-            StatusCode::UNAUTHORIZED,
-            "Your session has ended. Sign in again.".into(),
-        )),
+        None => Err(ApiError(StatusCode::UNAUTHORIZED, "Your session has ended. Sign in again.".into())),
     };
     if let Some(url) = machines::screens::open(&app, &by, &bot, for_user.as_deref(), still).await? {
         return Ok(Json(json!({ "url": url })));
     }
-    let off = || {
-        ApiError(
-            StatusCode::NOT_FOUND,
-            "Screens are off on this server. Install Xvfb, openbox, and voxl.".into(),
-        )
-    };
-    let screens = app
-        .screens
-        .as_ref()
-        .filter(|_| screen::on_path("voxl"))
-        .ok_or_else(off)?;
+    let off = || ApiError(StatusCode::NOT_FOUND, "Screens are off on this server. Install Xvfb, openbox, and voxl.".into());
+    let screens = app.screens.as_ref().filter(|_| screen::on_path("voxl")).ok_or_else(off)?;
     let info = screens.ensure(&id, |b| app.is_running(b)).await;
-    let info = info.ok_or_else(|| {
-        ApiError(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "All screens are in use. Try again when a Bot finishes.".into(),
-        )
-    })?;
+    let info = info.ok_or_else(|| ApiError(StatusCode::SERVICE_UNAVAILABLE, "All screens are in use. Try again when a Bot finishes.".into()))?;
     still()?;
     // A frame loaded before voxl listens gets the proxy's 502 and stays blank, so only hand out a link that works.
     if !screen::wait_for_port(info.port, 50).await {
-        return Err(ApiError(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "The screen is still starting. Try again in a moment.".into(),
-        ));
+        return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "The screen is still starting. Try again in a moment.".into()));
     }
     // The proxy in front serves /screen/<port>/ from that local voxl port.
-    Ok(Json(
-        json!({ "url": format!("/screen/{}/?token={}", info.port, info.token) }),
-    ))
+    Ok(Json(json!({ "url": format!("/screen/{}/?token={}", info.port, info.token) })))
 }
 
 // A Bot hands its screen to the user: `botctl handoff`. Waits for "Done".
 
-async fn handoff(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-    Json(v): Json<Value>,
-) -> Result<String, ApiError> {
+async fn handoff(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Result<String, ApiError> {
     let bot = acting_bot(&app, &c, &by, v["from"].as_str())?;
-    let text = v["text"]
-        .as_str()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .ok_or_else(|| bad("Say what you need"))?;
+    let text = v["text"].as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| bad("Say what you need"))?;
     let text: String = text.chars().take(300).collect();
     let wait = Duration::from_secs(9 * 60); // under the 10 minute max most harnesses allow a command
     Ok(match app.handoff(&bot, &text, wait).await {
@@ -3132,12 +2176,7 @@ async fn handoff(
 
 // Routines
 
-async fn list_routines(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-    Path(id): Path<String>,
-) -> Res {
+async fn list_routines(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     need_bot_access(&app, &c, &by, &id, Access::View)?;
     Ok(Json(json!(app.db.routines(Some(&id)))))
 }
@@ -3156,9 +2195,7 @@ fn routine_fields(v: &Value) -> Res<RoutineFields> {
     let text = |key: &str, max: usize| -> Res<Option<String>> {
         match v.get(key) {
             None | Some(Value::Null) => Ok(None),
-            Some(Value::String(s)) if !s.trim().is_empty() => {
-                Ok(Some(s.trim().chars().take(max).collect()))
-            }
+            Some(Value::String(s)) if !s.trim().is_empty() => Ok(Some(s.trim().chars().take(max).collect())),
             Some(_) => Err(bad(format!("{key} can't be empty"))),
         }
     };
@@ -3178,13 +2215,7 @@ fn routine_fields(v: &Value) -> Res<RoutineFields> {
     Ok(f)
 }
 
-async fn create_routine(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-    Path(id): Path<String>,
-    Json(v): Json<Value>,
-) -> Res<(StatusCode, Json<Value>)> {
+async fn create_routine(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
     need_bot_access(&app, &c, &by, &id, Access::Operate)?;
     let f = routine_fields(&v)?;
     let (Some(name), Some(cron_expr), Some(instruction)) = (f.name, f.cron, f.instruction) else {
@@ -3194,22 +2225,9 @@ async fn create_routine(
     if f.enabled != Some(false) {
         need_unblocked(&app, &id, author.as_deref())?;
     }
-    let r = app.db.add_routine_by(
-        &id,
-        &name,
-        &cron_expr,
-        &instruction,
-        f.enabled != Some(false),
-        author.as_deref(),
-    );
-    let details =
-        json!({ "name": r.name, "cron": r.cron, "enabled": r.enabled, "author": r.author_id });
-    app.db.record(
-        &by.event("routine.created")
-            .target("routine", &r.id)
-            .bot(&id)
-            .details(details),
-    );
+    let r = app.db.add_routine_by(&id, &name, &cron_expr, &instruction, f.enabled != Some(false), author.as_deref());
+    let details = json!({ "name": r.name, "cron": r.cron, "enabled": r.enabled, "author": r.author_id });
+    app.db.record(&by.event("routine.created").target("routine", &r.id).bot(&id).details(details));
     Ok((StatusCode::CREATED, Json(json!(r))))
 }
 
@@ -3218,34 +2236,19 @@ async fn create_routine(
 fn routine_author(app: &App, c: &Caller) -> Option<String> {
     match (&c.user, c.principal) {
         (Some(u), _) => Some(u.id.clone()),
-        (None, Principal::Bot) => c
-            .bot
-            .as_deref()
-            .and_then(|id| app.db.bot(id))
-            .map(|b| app.acting_for(&b)),
+        (None, Principal::Bot) => c.bot.as_deref().and_then(|id| app.db.bot(id)).map(|b| app.acting_for(&b)),
         _ => None,
     }
 }
 
 /// A routine can't be turned on while its Bot's owner or its author is disabled (ADR 0047).
 fn need_unblocked(app: &App, bot_id: &str, author: Option<&str>) -> Res<()> {
-    let Some(owner) = app.db.bot_owner(bot_id) else {
-        return Err(not_found("Bot"));
-    };
+    let Some(owner) = app.db.bot_owner(bot_id) else { return Err(not_found("Bot")) };
     match handover::blocked(&app.db, &owner, author) {
         None => Ok(()),
         Some((reason, _)) => {
-            let whose = if reason == handover::OWNER_DISABLED {
-                "this Bot's owner"
-            } else {
-                "whoever wrote it"
-            };
-            Err(ApiError(
-                StatusCode::CONFLICT,
-                format!(
-                    "This routine runs for {whose}, whose account is turned off. An admin can hand their Bots and routines to someone else."
-                ),
-            ))
+            let whose = if reason == handover::OWNER_DISABLED { "this Bot's owner" } else { "whoever wrote it" };
+            Err(ApiError(StatusCode::CONFLICT, format!("This routine runs for {whose}, whose account is turned off. An admin can hand their Bots and routines to someone else.")))
         }
     }
 }
@@ -3254,40 +2257,23 @@ fn need_unblocked(app: &App, bot_id: &str, author: Option<&str>) -> Res<()> {
 /// The instruction is a message to the Bot, so only the fact that it changed is kept.
 fn routine_events(by: &Who, before: &db::Routine, after: &db::Routine) -> Vec<Event> {
     let mut out = Vec::new();
-    let ev = |action: &str| {
-        by.event(action)
-            .target("routine", &after.id)
-            .bot(&after.bot_id)
-    };
+    let ev = |action: &str| by.event(action).target("routine", &after.id).bot(&after.bot_id);
     if before.enabled != after.enabled {
-        let action = if after.enabled {
-            "routine.enabled"
-        } else {
-            "routine.disabled"
-        };
+        let action = if after.enabled { "routine.enabled" } else { "routine.disabled" };
         out.push(ev(action).details(json!({ "name": after.name })));
     }
     let mut changes = serde_json::Map::new();
     if before.name != after.name {
-        changes.insert(
-            "name".into(),
-            json!({ "from": before.name, "to": after.name }),
-        );
+        changes.insert("name".into(), json!({ "from": before.name, "to": after.name }));
     }
     if before.cron != after.cron {
-        changes.insert(
-            "cron".into(),
-            json!({ "from": before.cron, "to": after.cron }),
-        );
+        changes.insert("cron".into(), json!({ "from": before.cron, "to": after.cron }));
     }
     if before.instruction != after.instruction {
         changes.insert("instruction".into(), json!("changed"));
     }
     if before.author_id != after.author_id {
-        changes.insert(
-            "author".into(),
-            json!({ "from": before.author_id, "to": after.author_id }),
-        );
+        changes.insert("author".into(), json!({ "from": before.author_id, "to": after.author_id }));
     }
     if !changes.is_empty() {
         out.push(ev("routine.updated").details(json!({ "name": after.name, "changes": changes })));
@@ -3298,47 +2284,21 @@ fn routine_events(by: &Who, before: &db::Routine, after: &db::Routine) -> Vec<Ev
 /// The routine, when the caller can run its Bot. A routine on a hidden Bot is a 404.
 fn need_routine(app: &App, c: &Caller, by: &Who, id: &str) -> Res<db::Routine> {
     let r = app.db.routine(id).ok_or_else(|| not_found("Routine"))?;
-    need_bot_access(app, c, by, &r.bot_id, Access::Operate).map_err(|e| {
-        if e.0 == StatusCode::NOT_FOUND {
-            not_found("Routine")
-        } else {
-            e
-        }
-    })?;
+    need_bot_access(app, c, by, &r.bot_id, Access::Operate).map_err(|e| if e.0 == StatusCode::NOT_FOUND { not_found("Routine") } else { e })?;
     Ok(r)
 }
 
-async fn update_routine(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-    Path(id): Path<String>,
-    Json(v): Json<Value>,
-) -> Res {
+async fn update_routine(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
     let before = need_routine(&app, &c, &by, &id)?;
     let f = routine_fields(&v)?;
     // Whoever writes the instruction is whom it runs for.
     let author = routine_author(&app, &c);
     if f.enabled == Some(true) {
-        let rewrites = f
-            .instruction
-            .as_deref()
-            .is_some_and(|i| i != before.instruction);
-        let author_after = if rewrites && author.is_some() {
-            author.clone()
-        } else {
-            before.author_id.clone()
-        };
+        let rewrites = f.instruction.as_deref().is_some_and(|i| i != before.instruction);
+        let author_after = if rewrites && author.is_some() { author.clone() } else { before.author_id.clone() };
         need_unblocked(&app, &before.bot_id, author_after.as_deref())?;
     }
-    app.db.update_routine(
-        &id,
-        f.name.as_deref(),
-        f.cron.as_deref(),
-        f.instruction.as_deref(),
-        f.enabled,
-        author.as_deref(),
-    );
+    app.db.update_routine(&id, f.name.as_deref(), f.cron.as_deref(), f.instruction.as_deref(), f.enabled, author.as_deref());
     let after = app.db.routine(&id).ok_or_else(|| not_found("Routine"))?;
     for e in routine_events(&by, &before, &after) {
         app.db.record(&e);
@@ -3346,20 +2306,10 @@ async fn update_routine(
     Ok(Json(json!(after)))
 }
 
-async fn delete_routine(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-    Path(id): Path<String>,
-) -> Res {
+async fn delete_routine(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     let r = need_routine(&app, &c, &by, &id)?;
     app.db.delete_routine(&id);
-    app.db.record(
-        &by.event("routine.deleted")
-            .target("routine", &id)
-            .bot(&r.bot_id)
-            .details(json!({ "name": r.name, "cron": r.cron })),
-    );
+    app.db.record(&by.event("routine.deleted").target("routine", &id).bot(&r.bot_id).details(json!({ "name": r.name, "cron": r.cron })));
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -3367,26 +2317,13 @@ async fn delete_routine(
 // Anyone signed in can read it; only a person can change it.
 
 fn classes_view() -> Value {
-    json!(
-        policy::CLASSES
-            .iter()
-            .map(|(id, label)| json!({ "id": id, "label": label }))
-            .collect::<Vec<_>>()
-    )
+    json!(policy::CLASSES.iter().map(|(id, label)| json!({ "id": id, "label": label })).collect::<Vec<_>>())
 }
 
 /// Harnesses with a sandbox of their own, and those whose sandbox can start on `host`.
 fn sandbox_harnesses(host: &sandbox::Host) -> (Vec<&'static str>, Vec<&'static str>) {
-    let with: Vec<_> = adapters::NAMES
-        .iter()
-        .copied()
-        .filter_map(|n| adapters::get(n).filter(|a| a.has_sandbox()).map(|a| (n, a)))
-        .collect();
-    let can = with
-        .iter()
-        .filter(|(_, a)| host.has(a.sandbox_needs()))
-        .map(|(n, _)| *n)
-        .collect();
+    let with: Vec<_> = adapters::NAMES.iter().copied().filter_map(|n| adapters::get(n).filter(|a| a.has_sandbox()).map(|a| (n, a))).collect();
+    let can = with.iter().filter(|(_, a)| host.has(a.sandbox_needs())).map(|(n, _)| *n).collect();
     (with.into_iter().map(|(n, _)| n).collect(), can)
 }
 
@@ -3398,26 +2335,15 @@ fn sandbox_view(app: &App) -> Value {
 }
 
 async fn get_policy(State(app): State<AppState>) -> Json<Value> {
-    Json(
-        json!({ "policy": app.db.global_policy(), "classes": classes_view(), "rules": app.db.rules(None), "sandbox": sandbox_view(&app) }),
-    )
+    Json(json!({ "policy": app.db.global_policy(), "classes": classes_view(), "rules": app.db.rules(None), "sandbox": sandbox_view(&app) }))
 }
 
-async fn put_policy(
-    State(app): State<AppState>,
-    Extension(who): Extension<Principal>,
-    Extension(by): Extension<Who>,
-    Json(v): Json<Value>,
-) -> Res {
+async fn put_policy(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res {
     need_user(who)?;
     let before = app.db.global_policy();
     let after = policy::parse_patch(&v).map_err(bad)?.apply(&before);
     app.db.set_global_policy(&after);
-    app.db.record(
-        &by.event("policy.updated")
-            .target("policy", "global")
-            .details(json!({ "before": before, "after": after })),
-    );
+    app.db.record(&by.event("policy.updated").target("policy", "global").details(json!({ "before": before, "after": after })));
     app.send(json!({ "type": "policy", "policy": after }));
     app.stop_unguarded_runs();
     for b in app.db.bots() {
@@ -3430,56 +2356,29 @@ fn bot_policy_view(app: &App, id: &str) -> Value {
     json!({ "policy": app.db.effective_policy(id), "override": app.db.bot_override(id), "classes": classes_view(), "rules": app.db.rules(Some(id)), "sandbox": sandbox_view(app) })
 }
 
-async fn get_bot_policy(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-    Path(id): Path<String>,
-) -> Res {
+async fn get_bot_policy(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     need_bot_access(&app, &c, &by, &id, Access::View)?;
     Ok(Json(bot_policy_view(&app, &id)))
 }
 
-async fn put_bot_policy(
-    State(app): State<AppState>,
-    Extension(who): Extension<Principal>,
-    Extension(by): Extension<Who>,
-    Path(id): Path<String>,
-    Json(v): Json<Value>,
-) -> Res {
+async fn put_bot_policy(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
     need_user(who)?;
     need_bot(&app, &id)?;
     let before = app.db.bot_override(&id);
     let o = policy::patch_override(&before.clone().unwrap_or_default(), &v).map_err(bad)?;
-    app.db
-        .set_bot_override(&id, Some(&o).filter(|o| !o.is_empty()));
-    app.db.record(
-        &by.event("policy.updated")
-            .target("policy", &id)
-            .bot(&id)
-            .details(json!({ "before": before, "after": o })),
-    );
+    app.db.set_bot_override(&id, Some(&o).filter(|o| !o.is_empty()));
+    app.db.record(&by.event("policy.updated").target("policy", &id).bot(&id).details(json!({ "before": before, "after": o })));
     app.stop_unguarded_runs();
     app.push_bot(&id);
     Ok(Json(bot_policy_view(&app, &id)))
 }
 
-async fn delete_bot_policy(
-    State(app): State<AppState>,
-    Extension(who): Extension<Principal>,
-    Extension(by): Extension<Who>,
-    Path(id): Path<String>,
-) -> Res {
+async fn delete_bot_policy(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     need_user(who)?;
     need_bot(&app, &id)?;
     let before = app.db.bot_override(&id);
     app.db.set_bot_override(&id, None);
-    app.db.record(
-        &by.event("policy.reset")
-            .target("policy", &id)
-            .bot(&id)
-            .details(json!({ "before": before })),
-    );
+    app.db.record(&by.event("policy.reset").target("policy", &id).bot(&id).details(json!({ "before": before })));
     app.stop_unguarded_runs();
     app.push_bot(&id);
     Ok(Json(bot_policy_view(&app, &id)))
@@ -3491,33 +2390,20 @@ async fn get_notifications(State(app): State<AppState>) -> Json<Value> {
     Json(notify::api::view(&app))
 }
 
-async fn put_notifications(
-    State(app): State<AppState>,
-    Extension(who): Extension<Principal>,
-    Extension(by): Extension<Who>,
-    Json(v): Json<Value>,
-) -> Res {
+async fn put_notifications(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res {
     need_user(who)?;
     Ok(Json(notify::api::update(&app, &by, &v).map_err(bad)?))
 }
 
-async fn test_notifications(
-    State(app): State<AppState>,
-    Extension(who): Extension<Principal>,
-    Json(v): Json<Value>,
-) -> Res {
+async fn test_notifications(State(app): State<AppState>, Extension(who): Extension<Principal>, Json(v): Json<Value>) -> Res {
     need_user(who)?;
     let bot = match v.get("botId").and_then(Value::as_str) {
         Some(id) => Some(need_bot(&app, id)?),
         None => None,
     };
-    let Some(n) = app.notifier.get() else {
-        return Err(bad("Notifications are off on this server"));
-    };
+    let Some(n) = app.notifier.get() else { return Err(bad("Notifications are off on this server")) };
     let sent = n.test(&app, bot.as_ref()).await.map_err(bad)?;
-    Ok(Json(
-        json!({ "ok": sent.iter().all(|s| s["ok"] == true), "results": sent }),
-    ))
+    Ok(Json(json!({ "ok": sent.iter().all(|s| s["ok"] == true), "results": sent })))
 }
 
 async fn get_bot_notifications(State(app): State<AppState>, Path(id): Path<String>) -> Res {
@@ -3525,26 +2411,13 @@ async fn get_bot_notifications(State(app): State<AppState>, Path(id): Path<Strin
     Ok(Json(notify::api::bot_view(&app, &bot)))
 }
 
-async fn put_bot_notifications(
-    State(app): State<AppState>,
-    Extension(who): Extension<Principal>,
-    Extension(by): Extension<Who>,
-    Path(id): Path<String>,
-    Json(v): Json<Value>,
-) -> Res {
+async fn put_bot_notifications(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Path(id): Path<String>, Json(v): Json<Value>) -> Res {
     need_user(who)?;
     let bot = need_bot(&app, &id)?;
-    Ok(Json(
-        notify::api::update_bot(&app, &by, &bot, &v).map_err(bad)?,
-    ))
+    Ok(Json(notify::api::update_bot(&app, &by, &bot, &v).map_err(bad)?))
 }
 
-async fn list_rules(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-    Query(q): Query<HashMap<String, String>>,
-) -> Res {
+async fn list_rules(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Query(q): Query<HashMap<String, String>>) -> Res {
     let bot = q.get("bot").map(String::as_str).filter(|b| !b.is_empty());
     if let Some(b) = bot {
         need_bot_access(&app, &c, &by, b, Access::View)?;
@@ -3552,12 +2425,7 @@ async fn list_rules(
     Ok(Json(json!(app.db.rules(bot))))
 }
 
-async fn add_rule(
-    State(app): State<AppState>,
-    Extension(who): Extension<Principal>,
-    Extension(by): Extension<Who>,
-    Json(v): Json<Value>,
-) -> Res<(StatusCode, Json<Value>)> {
+async fn add_rule(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Res<(StatusCode, Json<Value>)> {
     need_user(who)?;
     let bot = v["botId"].as_str().filter(|b| !b.is_empty());
     if let Some(b) = bot {
@@ -3568,40 +2436,20 @@ async fn add_rule(
         Some("deny") => policy::Action::Deny,
         _ => return Err(bad("action must be \"allow\" or \"deny\"")),
     };
-    let pattern = v["pattern"]
-        .as_str()
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .ok_or_else(|| bad("pattern is required"))?;
-    let tool = v["tool"]
-        .as_str()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .unwrap_or("*");
+    let pattern = v["pattern"].as_str().map(str::trim).filter(|p| !p.is_empty()).ok_or_else(|| bad("pattern is required"))?;
+    let tool = v["tool"].as_str().map(str::trim).filter(|t| !t.is_empty()).unwrap_or("*");
     let note = v["note"].as_str().map(str::trim).filter(|n| !n.is_empty());
     if pattern.chars().count() > policy::RULE_PATTERN_MAX {
-        return Err(bad(format!(
-            "pattern must be {} characters or fewer",
-            policy::RULE_PATTERN_MAX
-        )));
+        return Err(bad(format!("pattern must be {} characters or fewer", policy::RULE_PATTERN_MAX)));
     }
     if tool.chars().count() > policy::RULE_TOOL_MAX || tool.chars().any(char::is_whitespace) {
-        return Err(bad(format!(
-            "tool must be \"*\", a kind, or a tool name: no spaces, {} characters or fewer",
-            policy::RULE_TOOL_MAX
-        )));
+        return Err(bad(format!("tool must be \"*\", a kind, or a tool name: no spaces, {} characters or fewer", policy::RULE_TOOL_MAX)));
     }
     if note.is_some_and(|n| n.chars().count() > policy::RULE_NOTE_MAX) {
-        return Err(bad(format!(
-            "note must be {} characters or fewer",
-            policy::RULE_NOTE_MAX
-        )));
+        return Err(bad(format!("note must be {} characters or fewer", policy::RULE_NOTE_MAX)));
     }
     let r = app.db.add_rule(bot, action, tool, pattern, note);
-    let added = by
-        .event("rule.added")
-        .target("rule", &r.id)
-        .details(json!({ "rule": r }));
+    let added = by.event("rule.added").target("rule", &r.id).details(json!({ "rule": r }));
     app.db.record(&match bot {
         Some(b) => added.bot(b),
         None => added,
@@ -3609,19 +2457,11 @@ async fn add_rule(
     Ok((StatusCode::CREATED, Json(json!(r))))
 }
 
-async fn delete_rule(
-    State(app): State<AppState>,
-    Extension(who): Extension<Principal>,
-    Extension(by): Extension<Who>,
-    Path(id): Path<String>,
-) -> Res {
+async fn delete_rule(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Path(id): Path<String>) -> Res {
     need_user(who)?;
     let r = app.db.rule(&id).ok_or_else(|| not_found("Rule"))?;
     app.db.delete_rule(&id);
-    let removed = by
-        .event("rule.removed")
-        .target("rule", &id)
-        .details(json!({ "rule": r }));
+    let removed = by.event("rule.removed").target("rule", &id).details(json!({ "rule": r }));
     app.db.record(&match r.bot_id.as_deref() {
         Some(b) => removed.bot(b),
         None => removed,
@@ -3631,45 +2471,22 @@ async fn delete_rule(
 
 // Approvals
 
-async fn list_approvals(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-    Query(q): Query<HashMap<String, String>>,
-) -> Res {
+async fn list_approvals(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Query(q): Query<HashMap<String, String>>) -> Res {
     need_user(c.principal)?;
-    let limit = q
-        .get("limit")
-        .and_then(|l| l.parse().ok())
-        .unwrap_or(100)
-        .clamp(1, 1000);
+    let limit = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(100).clamp(1, 1000);
     let status = q.get("status").map(String::as_str).filter(|s| *s != "all");
     let bot = q.get("bot").map(String::as_str).filter(|b| !b.is_empty());
     if let Some(b) = bot {
         need_bot_access(&app, &c, &by, b, Access::View)?;
     }
-    Ok(Json(json!(visible_approvals(
-        &app, &c, &by, status, bot, limit
-    ))))
+    Ok(Json(json!(visible_approvals(&app, &c, &by, status, bot, limit))))
 }
 
-async fn approve(
-    state: State<AppState>,
-    c: Extension<Caller>,
-    by: Extension<Who>,
-    id: Path<String>,
-    body: axum::body::Bytes,
-) -> Res {
+async fn approve(state: State<AppState>, c: Extension<Caller>, by: Extension<Who>, id: Path<String>, body: axum::body::Bytes) -> Res {
     decide(state, c, by, id, body, true).await
 }
 
-async fn deny(
-    state: State<AppState>,
-    c: Extension<Caller>,
-    by: Extension<Who>,
-    id: Path<String>,
-    body: axum::body::Bytes,
-) -> Res {
+async fn deny(state: State<AppState>, c: Extension<Caller>, by: Extension<Who>, id: Path<String>, body: axum::body::Bytes) -> Res {
     decide(state, c, by, id, body, false).await
 }
 
@@ -3677,25 +2494,12 @@ async fn deny(
 /// saves a rule for this exact call, which is a policy change, so it needs an admin.
 /// `scope: "run"` approves calls of the same kind for the rest of the Bot's run without
 /// saving anything (ADR 0051), so it takes only what approving once takes.
-async fn decide(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-    Path(id): Path<String>,
-    body: axum::body::Bytes,
-    approve: bool,
-) -> Res {
+async fn decide(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(id): Path<String>, body: axum::body::Bytes, approve: bool) -> Res {
     let who = c.principal;
     need_user(who)?;
     // Answering lets the Bot act, so it takes operator access to that Bot.
     if let Some(a) = app.db.approval(&id) {
-        need_bot_access(&app, &c, &by, &a.bot_id, Access::Operate).map_err(|e| {
-            if e.0 == StatusCode::NOT_FOUND {
-                not_found("Approval")
-            } else {
-                e
-            }
-        })?;
+        need_bot_access(&app, &c, &by, &a.bot_id, Access::Operate).map_err(|e| if e.0 == StatusCode::NOT_FOUND { not_found("Approval") } else { e })?;
     }
     let v: Value = if body.iter().all(u8::is_ascii_whitespace) {
         Value::Null
@@ -3716,60 +2520,31 @@ async fn decide(
         _ => return Err(bad("scope must be \"once\" or \"run\"")),
     };
     if for_run && !approve {
-        return Err(bad(
-            "Only an approval can cover the rest of a task. A denial is for this call; to keep denying it, remember it.",
-        ));
+        return Err(bad("Only an approval can cover the rest of a task. A denial is for this call; to keep denying it, remember it."));
     }
     if for_run && remember.is_some() {
-        return Err(bad(
-            "Pick one: approve for the rest of this task, or remember a lasting rule.",
-        ));
+        return Err(bad("Pick one: approve for the rest of this task, or remember a lasting rule."));
     }
     if remember.is_some() && !rbac::allows(who, rbac::Perm::Admin) {
         app.db.record(&by.event("access.denied").outcome(Outcome::Denied).details(json!({ "path": format!("/api/approvals/{id}"), "need": "admin", "reason": "remember" })));
-        return Err(ApiError(
-            StatusCode::FORBIDDEN,
-            "Only an admin can save a lasting rule. Approve or deny just this call.".into(),
-        ));
+        return Err(ApiError(StatusCode::FORBIDDEN, "Only an admin can save a lasting rule. Approve or deny just this call.".into()));
     }
-    let note: Option<String> = v["note"]
-        .as_str()
-        .map(|n| n.trim().chars().take(500).collect())
-        .filter(|n: &String| !n.is_empty());
-    let decided = if for_run {
-        app.approve_for_run(&id, note.as_deref(), &by)
-    } else {
-        app.decide(&id, approve, remember, note.as_deref(), &by)
-    };
+    let note: Option<String> = v["note"].as_str().map(|n| n.trim().chars().take(500).collect()).filter(|n: &String| !n.is_empty());
+    let decided = if for_run { app.approve_for_run(&id, note.as_deref(), &by) } else { app.decide(&id, approve, remember, note.as_deref(), &by) };
     match decided {
         Ok(a) => Ok(Json(json!(a))),
         Err(DecideError::NotFound) => Err(not_found("Approval")),
-        Err(DecideError::Closed(s)) => Err(ApiError(
-            StatusCode::CONFLICT,
-            format!("This approval is already {s}"),
-        )),
-        Err(DecideError::TooLong) => Err(bad(
-            "This call is too long to remember. Approve or deny it without remembering.",
-        )),
-        Err(DecideError::OnceOnly) => Err(bad(
-            "This call can only be approved once. Approve or deny just this call.",
-        )),
-        Err(DecideError::RunEnded) => Err(ApiError(
-            StatusCode::CONFLICT,
-            "The task this call came from has ended.".into(),
-        )),
+        Err(DecideError::Closed(s)) => Err(ApiError(StatusCode::CONFLICT, format!("This approval is already {s}"))),
+        Err(DecideError::TooLong) => Err(bad("This call is too long to remember. Approve or deny it without remembering.")),
+        Err(DecideError::OnceOnly) => Err(bad("This call can only be approved once. Approve or deny just this call.")),
+        Err(DecideError::RunEnded) => Err(ApiError(StatusCode::CONFLICT, "The task this call came from has ended.".into())),
     }
 }
 
 /// The harness hook (`botctl hook <harness>`) asks here before each tool call.
 /// Body: `{from, harness, event}` with the harness's PreToolUse payload. Waits while
 /// the user decides. Replies in plain text: "allow" or "deny", then the reason.
-async fn check_approval(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-    Json(v): Json<Value>,
-) -> Response {
+async fn check_approval(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Json(v): Json<Value>) -> Response {
     let reply = |allow: bool, reason: &str| {
         let body = format!("{}\n{reason}", if allow { "allow" } else { "deny" });
         ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response()
@@ -3785,41 +2560,19 @@ async fn check_approval(
         return reply(false, "The hook sent no tool name");
     };
     let harness = v["harness"].as_str().unwrap_or(&bot.harness).to_string();
-    let cwd = e["cwd"]
-        .as_str()
-        .filter(|c| c.starts_with('/'))
-        .map(PathBuf::from);
-    let verdict = app
-        .check(
-            &bot,
-            &harness,
-            tool,
-            e["tool_input"].clone(),
-            cwd,
-            v["run"].as_str(),
-        )
-        .await;
+    let cwd = e["cwd"].as_str().filter(|c| c.starts_with('/')).map(PathBuf::from);
+    let verdict = app.check(&bot, &harness, tool, e["tool_input"].clone(), cwd, v["run"].as_str()).await;
     reply(verdict.action == policy::Action::Allow, &verdict.reason)
 }
 
 /// The append-only audit log, newest first, filtered (see `audit::Filter`).
 /// `nextBefore` pages back: pass it as `?before=`.
-async fn list_audit(
-    State(app): State<AppState>,
-    Extension(who): Extension<Principal>,
-    Query(q): Query<HashMap<String, String>>,
-) -> Res {
+async fn list_audit(State(app): State<AppState>, Extension(who): Extension<Principal>, Query(q): Query<HashMap<String, String>>) -> Res {
     need_user(who)?;
-    let limit = q
-        .get("limit")
-        .and_then(|l| l.parse().ok())
-        .unwrap_or(100)
-        .clamp(1, 1000);
+    let limit = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(100).clamp(1, 1000);
     let f = audit_filter(&app, &q)?;
     let events = app.db.audit_events(&f, limit, false);
-    let next = (events.len() as i64 == limit)
-        .then(|| events.last().map(|e| e.id))
-        .flatten();
+    let next = (events.len() as i64 == limit).then(|| events.last().map(|e| e.id)).flatten();
     Ok(Json(json!({ "events": events, "nextBefore": next })))
 }
 
@@ -3831,25 +2584,12 @@ fn audit_filter(app: &App, q: &HashMap<String, String>) -> Result<audit::Filter,
 }
 
 /// The filtered log as RFC 4180 CSV, oldest first, streamed in batches.
-async fn export_audit(
-    State(app): State<AppState>,
-    Extension(who): Extension<Principal>,
-    Extension(by): Extension<Who>,
-    Query(q): Query<HashMap<String, String>>,
-) -> Result<Response, ApiError> {
+async fn export_audit(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Query(q): Query<HashMap<String, String>>) -> Result<Response, ApiError> {
     need_user(who)?;
     let mut f = audit_filter(&app, &q)?;
-    app.db.record(
-        &by.event("audit.exported")
-            .target("audit", "csv")
-            .details(f.describe()),
-    );
+    app.db.record(&by.event("audit.exported").target("audit", "csv").details(f.describe()));
     // A snapshot: events written while the export streams are left out.
-    let newest = app
-        .db
-        .audit_events(&audit::Filter::default(), 1, false)
-        .first()
-        .map_or(0, |e| e.id);
+    let newest = app.db.audit_events(&audit::Filter::default(), 1, false).first().map_or(0, |e| e.id);
     f.before = Some(f.before.map_or(newest + 1, |b| b.min(newest + 1)));
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, Infallible>>(4);
     tokio::task::spawn_blocking(move || {
@@ -3861,29 +2601,14 @@ async fn export_audit(
             let rows = app.db.audit_events(&f, BATCH, true);
             let Some(last) = rows.last() else { break };
             f.after = Some(last.id);
-            if tx
-                .blocking_send(Ok(rows.iter().map(audit::csv_row).collect()))
-                .is_err()
-                || (rows.len() as i64) < BATCH
-            {
+            if tx.blocking_send(Ok(rows.iter().map(audit::csv_row).collect())).is_err() || (rows.len() as i64) < BATCH {
                 break;
             }
         }
     });
-    let name = format!(
-        "attachment; filename=\"superbot-audit-{}.csv\"",
-        chrono::Utc::now().format("%Y%m%d-%H%M%S")
-    );
-    let headers = [
-        (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
-        (header::CONTENT_DISPOSITION, name),
-        (header::CACHE_CONTROL, "no-store".into()),
-    ];
-    Ok((
-        headers,
-        axum::body::Body::from_stream(ReceiverStream::new(rx)),
-    )
-        .into_response())
+    let name = format!("attachment; filename=\"superbot-audit-{}.csv\"", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+    let headers = [(header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()), (header::CONTENT_DISPOSITION, name), (header::CACHE_CONTROL, "no-store".into())];
+    Ok((headers, axum::body::Body::from_stream(ReceiverStream::new(rx))).into_response())
 }
 
 // Secrets: names only. Values go in and reach harnesses; they never come back out.
@@ -3894,53 +2619,30 @@ fn secret_error(e: secrets::Error) -> ApiError {
         secrets::Error::ReadOnly => ApiError(StatusCode::CONFLICT, e.to_string()),
         secrets::Error::Store(m) => {
             eprintln!("secrets: {m}");
-            ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "The secret store failed; see the server log.".into(),
-            )
+            ApiError(StatusCode::INTERNAL_SERVER_ERROR, "The secret store failed; see the server log.".into())
         }
     }
 }
 
 async fn list_secrets(Extension(who): Extension<Principal>) -> Res {
     need_user(who)?;
-    Ok(Json(
-        json!({ "secrets": secrets::global().list().map_err(secret_error)? }),
-    ))
+    Ok(Json(json!({ "secrets": secrets::global().list().map_err(secret_error)? })))
 }
 
-async fn put_secret(
-    State(app): State<AppState>,
-    Extension(who): Extension<Principal>,
-    Extension(by): Extension<Who>,
-    Path(name): Path<String>,
-    Json(v): Json<Value>,
-) -> Res {
+async fn put_secret(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Path(name): Path<String>, Json(v): Json<Value>) -> Res {
     need_user(who)?;
-    let value = v["value"]
-        .as_str()
-        .ok_or_else(|| bad("Send {\"value\": \"...\"}."))?;
+    let value = v["value"].as_str().ok_or_else(|| bad("Send {\"value\": \"...\"}."))?;
     let listed = secrets::global().put(&name, value).map_err(secret_error)?;
-    app.db.record(
-        &by.event("secret.set")
-            .target("secret", &name)
-            .details(json!({ "store": listed.store })),
-    );
+    app.db.record(&by.event("secret.set").target("secret", &name).details(json!({ "store": listed.store })));
     Ok(Json(json!({ "secret": listed })))
 }
 
-async fn delete_secret(
-    State(app): State<AppState>,
-    Extension(who): Extension<Principal>,
-    Extension(by): Extension<Who>,
-    Path(name): Path<String>,
-) -> Res {
+async fn delete_secret(State(app): State<AppState>, Extension(who): Extension<Principal>, Extension(by): Extension<Who>, Path(name): Path<String>) -> Res {
     need_user(who)?;
     if !secrets::global().delete(&name).map_err(secret_error)? {
         return Err(not_found("Secret"));
     }
-    app.db
-        .record(&by.event("secret.deleted").target("secret", &name));
+    app.db.record(&by.event("secret.deleted").target("secret", &name));
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -3951,85 +2653,42 @@ async fn delete_secret(
 /// The signed-in person whose secrets these are.
 fn secrets_owner(c: &Caller) -> Res<String> {
     need_user(c.principal)?;
-    c.user.as_ref().map(|u| u.id.clone()).ok_or_else(|| {
-        ApiError(
-            StatusCode::FORBIDDEN,
-            "Sign in as a user to keep your own secrets.".into(),
-        )
-    })
+    c.user.as_ref().map(|u| u.id.clone()).ok_or_else(|| ApiError(StatusCode::FORBIDDEN, "Sign in as a user to keep your own secrets.".into()))
 }
 
 async fn list_my_secrets(Extension(c): Extension<Caller>) -> Res {
     let me = secrets_owner(&c)?;
-    Ok(Json(
-        json!({ "secrets": secrets::global().user_list(&me).map_err(secret_error)? }),
-    ))
+    Ok(Json(json!({ "secrets": secrets::global().user_list(&me).map_err(secret_error)? })))
 }
 
-async fn put_my_secret(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-    Path(name): Path<String>,
-    Json(v): Json<Value>,
-) -> Res {
+async fn put_my_secret(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(name): Path<String>, Json(v): Json<Value>) -> Res {
     let me = secrets_owner(&c)?;
-    let value = v["value"]
-        .as_str()
-        .ok_or_else(|| bad("Send {\"value\": \"...\"}."))?;
-    let (listed, replaced) = secrets::global()
-        .user_save(&me, &name, value)
-        .map_err(secret_error)?;
-    app.db.record(
-        &by.event("secret.set")
-            .target("secret", &name)
-            .details(json!({ "scope": "user", "userId": me, "replaced": replaced })),
-    );
+    let value = v["value"].as_str().ok_or_else(|| bad("Send {\"value\": \"...\"}."))?;
+    let (listed, replaced) = secrets::global().user_save(&me, &name, value).map_err(secret_error)?;
+    app.db.record(&by.event("secret.set").target("secret", &name).details(json!({ "scope": "user", "userId": me, "replaced": replaced })));
     Ok(Json(json!({ "secret": listed })))
 }
 
-async fn delete_my_secret(
-    State(app): State<AppState>,
-    Extension(c): Extension<Caller>,
-    Extension(by): Extension<Who>,
-    Path(name): Path<String>,
-) -> Res {
+async fn delete_my_secret(State(app): State<AppState>, Extension(c): Extension<Caller>, Extension(by): Extension<Who>, Path(name): Path<String>) -> Res {
     let me = secrets_owner(&c)?;
-    if !secrets::global()
-        .user_delete(&me, &name)
-        .map_err(secret_error)?
-    {
+    if !secrets::global().user_delete(&me, &name).map_err(secret_error)? {
         return Err(not_found("Secret"));
     }
-    app.db.record(
-        &by.event("secret.deleted")
-            .target("secret", &name)
-            .details(json!({ "scope": "user", "userId": me })),
-    );
+    app.db.record(&by.event("secret.deleted").target("secret", &name).details(json!({ "scope": "user", "userId": me })));
     Ok(Json(json!({ "ok": true })))
 }
 
 /// Admin: a user's secret names, never values.
 async fn list_user_secrets(State(app): State<AppState>, Path(key): Path<String>) -> Res {
     let u = users::need_user_key(&app, &key)?;
-    Ok(Json(
-        json!({ "user": u.id, "secrets": secrets::global().user_list(&u.id).map_err(secret_error)? }),
-    ))
+    Ok(Json(json!({ "user": u.id, "secrets": secrets::global().user_list(&u.id).map_err(secret_error)? })))
 }
 
 /// Admin: drops every secret a user saved, e.g. when they leave.
-async fn delete_user_secrets(
-    State(app): State<AppState>,
-    Extension(by): Extension<Who>,
-    Path(key): Path<String>,
-) -> Res {
+async fn delete_user_secrets(State(app): State<AppState>, Extension(by): Extension<Who>, Path(key): Path<String>) -> Res {
     let u = users::need_user_key(&app, &key)?;
     let n = secrets::global().user_forget(&u.id).map_err(secret_error)?;
-    app.db.record(
-        &by.event("secret.deleted")
-            .target("user", &u.id)
-            .details(json!({ "scope": "user", "userId": u.id, "count": n })),
-    );
+    app.db.record(&by.event("secret.deleted").target("user", &u.id).details(json!({ "scope": "user", "userId": u.id, "count": n })));
     Ok(Json(json!({ "deleted": n })))
 }
 
@@ -4040,9 +2699,7 @@ mod tests {
 
     /// Auth in front of a stub route. Returns the port and a Bot's bearer token.
     async fn serve(password: &str, allow_no_auth: bool, extra_hosts: &str) -> (u16, String) {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let bot_key = random_hex(16);
         let bot_token = isolation::bot_token(&bot_key, "b1", users::OPERATOR);
@@ -4063,16 +2720,13 @@ mod tests {
     }
 
     async fn status(port: u16, host: &str, authorization: &str) -> u16 {
-        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .unwrap();
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let auth = if authorization.is_empty() {
             String::new()
         } else {
             format!("Authorization: {authorization}\r\n")
         };
-        let req =
-            format!("GET /api/state HTTP/1.1\r\nHost: {host}\r\n{auth}Connection: close\r\n\r\n");
+        let req = format!("GET /api/state HTTP/1.1\r\nHost: {host}\r\n{auth}Connection: close\r\n\r\n");
         s.write_all(req.as_bytes()).await.unwrap();
         let mut res = String::new();
         s.read_to_string(&mut res).await.unwrap();
@@ -4083,10 +2737,7 @@ mod tests {
         const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = String::new();
         for c in format!("anyone:{password}").as_bytes().chunks(3) {
-            let n = c
-                .iter()
-                .enumerate()
-                .fold(0u32, |n, (i, b)| n | ((*b as u32) << (16 - 8 * i)));
+            let n = c.iter().enumerate().fold(0u32, |n, (i, b)| n | ((*b as u32) << (16 - 8 * i)));
             for i in 0..4 {
                 out.push(if i <= c.len() {
                     T[((n >> (18 - 6 * i)) & 63) as usize] as char
@@ -4109,10 +2760,7 @@ mod tests {
         let pw = random_hex(16);
         let (port, _) = serve(&pw, false, "bots.example.com").await;
         assert_eq!(status(port, "attacker.example", &basic(&pw)).await, 403);
-        assert_eq!(
-            status(port, &format!("attacker.example:{port}"), &basic(&pw)).await,
-            403
-        );
+        assert_eq!(status(port, &format!("attacker.example:{port}"), &basic(&pw)).await, 403);
         assert_eq!(status(port, "127.0.0.1:1", &basic(&pw)).await, 403);
     }
 
@@ -4123,10 +2771,7 @@ mod tests {
         let host = format!("127.0.0.1:{port}");
         assert_eq!(status(port, &host, &basic(&pw)).await, 200);
         assert_eq!(status(port, &host, &basic(&random_hex(16))).await, 401);
-        assert_eq!(
-            status(port, &host, &format!("Bearer {bot_token}")).await,
-            200
-        );
+        assert_eq!(status(port, &host, &format!("Bearer {bot_token}")).await, 200);
         assert_eq!(status(port, "bots.example.com", &basic(&pw)).await, 200);
     }
 
@@ -4155,11 +2800,7 @@ mod tests {
 
     impl BotKey {
         pub(super) fn auth(&self, bot_id: &str) -> String {
-            let owner = self
-                .1
-                .as_ref()
-                .and_then(|app| app.db.bot_owner(bot_id))
-                .unwrap_or_else(|| users::OPERATOR.into());
+            let owner = self.1.as_ref().and_then(|app| app.db.bot_owner(bot_id)).unwrap_or_else(|| users::OPERATOR.into());
             self.auth_as(bot_id, &owner)
         }
 
@@ -4175,20 +2816,14 @@ mod tests {
     }
 
     /// `serve_app`, with Auth changed first (break-glass, session lifetimes).
-    pub(super) async fn serve_app_with(
-        tweak: impl FnOnce(&mut Auth),
-    ) -> (u16, AppState, String, BotKey) {
+    pub(super) async fn serve_app_with(tweak: impl FnOnce(&mut Auth)) -> (u16, AppState, String, BotKey) {
         let (port, app, password, bot, _) = serve_app_and_router(tweak).await;
         (port, app, password, bot)
     }
 
     /// `serve_app_with`, and the router it serves, for botd's machine port.
-    pub(super) async fn serve_app_and_router(
-        tweak: impl FnOnce(&mut Auth),
-    ) -> (u16, AppState, String, BotKey, Router) {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
+    pub(super) async fn serve_app_and_router(tweak: impl FnOnce(&mut Auth)) -> (u16, AppState, String, BotKey, Router) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let password = random_hex(16);
         let app = runner::test_app();
@@ -4207,44 +2842,20 @@ mod tests {
         let r = router(app.clone(), auth);
         let served = r.clone();
         tokio::spawn(async move {
-            axum::serve(
-                listener,
-                served.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            .unwrap();
+            axum::serve(listener, served.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
         });
         (port, app, basic(&password), bot, r)
     }
 
-    pub(super) async fn call(
-        port: u16,
-        method: &str,
-        path: &str,
-        authorization: &str,
-        body: &str,
-    ) -> (u16, String) {
+    pub(super) async fn call(port: u16, method: &str, path: &str, authorization: &str, body: &str) -> (u16, String) {
         let (code, _, body) = call_with(port, method, path, authorization, "", body).await;
         (code, body)
     }
 
     /// `extra` is more header lines, each ending in \r\n. HTTP/1.0, so bodies are never chunked.
-    pub(super) async fn call_with(
-        port: u16,
-        method: &str,
-        path: &str,
-        authorization: &str,
-        extra: &str,
-        body: &str,
-    ) -> (u16, String, String) {
-        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .unwrap();
-        let auth = if authorization.is_empty() {
-            String::new()
-        } else {
-            format!("Authorization: {authorization}\r\n")
-        };
+    pub(super) async fn call_with(port: u16, method: &str, path: &str, authorization: &str, extra: &str, body: &str) -> (u16, String, String) {
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let auth = if authorization.is_empty() { String::new() } else { format!("Authorization: {authorization}\r\n") };
         let req = format!(
             "{method} {path} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n{auth}{extra}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
@@ -4258,10 +2869,7 @@ mod tests {
     }
 
     pub(super) fn audit_list(body: &str) -> Vec<Value> {
-        serde_json::from_str::<Value>(body).unwrap()["events"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
+        serde_json::from_str::<Value>(body).unwrap()["events"].as_array().cloned().unwrap_or_default()
     }
 
     #[tokio::test]
@@ -4286,23 +2894,13 @@ mod tests {
     #[tokio::test]
     async fn bots_cannot_approve_or_change_policy() {
         let (port, app, user, key) = serve_app().await;
-        let bot = app
-            .db
-            .create_bot("A", "#fff", "waddle", "claude", None, true);
+        let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
         let bot_auth = key.auth(&bot.id);
         for (m, p, b) in [
             ("PUT", "/api/policy".to_string(), r#"{"mode":"bypass"}"#),
-            (
-                "PUT",
-                format!("/api/bots/{}/policy", bot.id),
-                r#"{"mode":"bypass"}"#,
-            ),
+            ("PUT", format!("/api/bots/{}/policy", bot.id), r#"{"mode":"bypass"}"#),
             ("DELETE", format!("/api/bots/{}/policy", bot.id), ""),
-            (
-                "POST",
-                "/api/policy/rules".to_string(),
-                r#"{"action":"allow","pattern":"*"}"#,
-            ),
+            ("POST", "/api/policy/rules".to_string(), r#"{"action":"allow","pattern":"*"}"#),
             ("GET", "/api/approvals".to_string(), ""),
             ("POST", "/api/approvals/x/approve".to_string(), "{}"),
             ("POST", "/api/approvals/x/deny".to_string(), "{}"),
@@ -4315,178 +2913,54 @@ mod tests {
         assert_eq!(call(port, "GET", "/api/policy", &bot_auth, "").await.0, 200);
 
         let (code, body) = call(port, "PUT", "/api/policy", &user, r#"{"timeoutMinutes":3}"#).await;
-        assert_eq!(
-            (
-                code,
-                serde_json::from_str::<Value>(&body).unwrap()["policy"]["timeoutMinutes"].as_u64()
-            ),
-            (200, Some(3))
-        );
-        assert_eq!(
-            call(port, "PUT", "/api/policy", &user, r#"{"mode":"yolo"}"#)
-                .await
-                .0,
-            400
-        );
+        assert_eq!((code, serde_json::from_str::<Value>(&body).unwrap()["policy"]["timeoutMinutes"].as_u64()), (200, Some(3)));
+        assert_eq!(call(port, "PUT", "/api/policy", &user, r#"{"mode":"yolo"}"#).await.0, 400);
         let (_, audit) = call(port, "GET", "/api/audit?action=policy.*", &user, "").await;
         assert_eq!(audit_list(&audit)[0]["action"], "policy.updated");
         // Each refused Bot call is on the record.
-        let (_, denied) = call(
-            port,
-            "GET",
-            "/api/audit?action=access.denied&actor=bot",
-            &user,
-            "",
-        )
-        .await;
+        let (_, denied) = call(port, "GET", "/api/audit?action=access.denied&actor=bot", &user, "").await;
         let denied = audit_list(&denied);
         assert_eq!(denied.len(), 9);
-        assert_eq!(
-            (
-                denied[0]["outcome"].as_str(),
-                denied[0]["details"]["path"].as_str()
-            ),
-            (Some("denied"), Some("/api/audit/export.csv"))
-        );
+        assert_eq!((denied[0]["outcome"].as_str(), denied[0]["details"]["path"].as_str()), (Some("denied"), Some("/api/audit/export.csv")));
     }
 
     #[tokio::test]
     async fn admin_actions_are_audited() {
         let (port, app, user, key) = serve_app().await;
         let browser = "User-Agent: TestBrowser/1.0\r\n";
-        let (code, _, body) = call_with(
-            port,
-            "POST",
-            "/api/bots",
-            &user,
-            browser,
-            r#"{"name":"Helper","harness":"claude"}"#,
-        )
-        .await;
+        let (code, _, body) = call_with(port, "POST", "/api/bots", &user, browser, r#"{"name":"Helper","harness":"claude"}"#).await;
         assert_eq!(code, 201);
-        let id = serde_json::from_str::<Value>(&body).unwrap()["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        call_with(
-            port,
-            "PATCH",
-            &format!("/api/bots/{id}"),
-            &user,
-            browser,
-            r#"{"name":"Helper 2","hidden":true}"#,
-        )
-        .await;
-        call_with(
-            port,
-            "PATCH",
-            &format!("/api/bots/{id}"),
-            &user,
-            browser,
-            r#"{"name":"Helper 2"}"#,
-        )
-        .await; // no change, no event
+        let id = serde_json::from_str::<Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
+        call_with(port, "PATCH", &format!("/api/bots/{id}"), &user, browser, r#"{"name":"Helper 2","hidden":true}"#).await;
+        call_with(port, "PATCH", &format!("/api/bots/{id}"), &user, browser, r#"{"name":"Helper 2"}"#).await; // no change, no event
 
         // A Bot's token names it; routine calls are logged with that Bot as the actor.
         let bot_auth = key.auth(&id);
         let botctl = "User-Agent: botctl\r\n";
         let body = r#"{"name":"Standup","cron":"0 9 * * 1-5","instruction":"secret plan: email the team"}"#;
-        let (code, _, r) = call_with(
-            port,
-            "POST",
-            &format!("/api/bots/{id}/routines"),
-            &bot_auth,
-            botctl,
-            body,
-        )
-        .await;
+        let (code, _, r) = call_with(port, "POST", &format!("/api/bots/{id}/routines"), &bot_auth, botctl, body).await;
         assert_eq!(code, 201);
-        let rid = serde_json::from_str::<Value>(&r).unwrap()["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        call_with(
-            port,
-            "PATCH",
-            &format!("/api/routines/{rid}"),
-            &bot_auth,
-            botctl,
-            r#"{"enabled":false,"cron":"0 10 * * *"}"#,
-        )
-        .await;
-        call_with(
-            port,
-            "PATCH",
-            &format!("/api/routines/{rid}"),
-            &user,
-            browser,
-            r#"{"enabled":true}"#,
-        )
-        .await;
-        call_with(
-            port,
-            "DELETE",
-            &format!("/api/routines/{rid}"),
-            &bot_auth,
-            botctl,
-            "",
-        )
-        .await;
-        call_with(
-            port,
-            "POST",
-            &format!("/api/bots/{id}/stop"),
-            &user,
-            browser,
-            "",
-        )
-        .await;
-        call_with(
-            port,
-            "DELETE",
-            &format!("/api/bots/{id}"),
-            &user,
-            browser,
-            "",
-        )
-        .await;
+        let rid = serde_json::from_str::<Value>(&r).unwrap()["id"].as_str().unwrap().to_string();
+        call_with(port, "PATCH", &format!("/api/routines/{rid}"), &bot_auth, botctl, r#"{"enabled":false,"cron":"0 10 * * *"}"#).await;
+        call_with(port, "PATCH", &format!("/api/routines/{rid}"), &user, browser, r#"{"enabled":true}"#).await;
+        call_with(port, "DELETE", &format!("/api/routines/{rid}"), &bot_auth, botctl, "").await;
+        call_with(port, "POST", &format!("/api/bots/{id}/stop"), &user, browser, "").await;
+        call_with(port, "DELETE", &format!("/api/bots/{id}"), &user, browser, "").await;
         let wrong_password = random_hex(16);
         let wrong = basic(&wrong_password);
-        assert_eq!(
-            call_with(port, "GET", "/api/state", &wrong, browser, "")
-                .await
-                .0,
-            401
-        );
-        assert_eq!(
-            call_with(port, "GET", "/api/state", &wrong, browser, "")
-                .await
-                .0,
-            401
-        );
-        assert_eq!(
-            call_with(port, "GET", "/api/state", "Bearer nope", "", "")
-                .await
-                .0,
-            401
-        );
+        assert_eq!(call_with(port, "GET", "/api/state", &wrong, browser, "").await.0, 401);
+        assert_eq!(call_with(port, "GET", "/api/state", &wrong, browser, "").await.0, 401);
+        assert_eq!(call_with(port, "GET", "/api/state", "Bearer nope", "", "").await.0, 401);
 
         let (code, body) = call(port, "GET", "/api/audit?limit=1000", &user, "").await;
         assert_eq!(code, 200);
         let events = audit_list(&body);
         let mut seen: Vec<(String, String, Option<String>, String)> = events
             .iter()
-            .filter(|e| {
-                !["policy.initialized", "audit.exported"].contains(&e["action"].as_str().unwrap())
-            })
+            .filter(|e| !["policy.initialized", "audit.exported"].contains(&e["action"].as_str().unwrap()))
             .map(|e| {
                 let s = |k: &str| e[k].as_str().map(String::from);
-                (
-                    s("action").unwrap(),
-                    s("actorKind").unwrap(),
-                    s("actorId"),
-                    s("outcome").unwrap(),
-                )
+                (s("action").unwrap(), s("actorKind").unwrap(), s("actorId"), s("outcome").unwrap())
             })
             .collect();
         seen.reverse();
@@ -4495,124 +2969,33 @@ mod tests {
         assert_eq!(
             seen,
             [
-                (
-                    "user.created".into(),
-                    "system".into(),
-                    Some("bootstrap".into()),
-                    "success".into()
-                ),
-                (
-                    "auth.login".into(),
-                    "user".into(),
-                    op.clone(),
-                    "success".into()
-                ),
-                (
-                    "bot.created".into(),
-                    "user".into(),
-                    op.clone(),
-                    "success".into()
-                ),
-                (
-                    "bot.updated".into(),
-                    "user".into(),
-                    op.clone(),
-                    "success".into()
-                ),
-                (
-                    "routine.created".into(),
-                    "bot".into(),
-                    me.clone(),
-                    "success".into()
-                ),
-                (
-                    "routine.disabled".into(),
-                    "bot".into(),
-                    me.clone(),
-                    "success".into()
-                ),
-                (
-                    "routine.updated".into(),
-                    "bot".into(),
-                    me.clone(),
-                    "success".into()
-                ),
-                (
-                    "routine.enabled".into(),
-                    "user".into(),
-                    op.clone(),
-                    "success".into()
-                ),
-                (
-                    "routine.deleted".into(),
-                    "bot".into(),
-                    me.clone(),
-                    "success".into()
-                ),
-                (
-                    "bot.stopped".into(),
-                    "user".into(),
-                    op.clone(),
-                    "success".into()
-                ),
-                (
-                    "bot.deleted".into(),
-                    "user".into(),
-                    op.clone(),
-                    "success".into()
-                ),
-                (
-                    "auth.login_failed".into(),
-                    "user".into(),
-                    None,
-                    "failure".into()
-                ),
-                (
-                    "auth.login_failed".into(),
-                    "bot".into(),
-                    None,
-                    "failure".into()
-                ),
-                (
-                    "auth.login".into(),
-                    "user".into(),
-                    op.clone(),
-                    "success".into()
-                ),
+                ("user.created".into(), "system".into(), Some("bootstrap".into()), "success".into()),
+                ("auth.login".into(), "user".into(), op.clone(), "success".into()),
+                ("bot.created".into(), "user".into(), op.clone(), "success".into()),
+                ("bot.updated".into(), "user".into(), op.clone(), "success".into()),
+                ("routine.created".into(), "bot".into(), me.clone(), "success".into()),
+                ("routine.disabled".into(), "bot".into(), me.clone(), "success".into()),
+                ("routine.updated".into(), "bot".into(), me.clone(), "success".into()),
+                ("routine.enabled".into(), "user".into(), op.clone(), "success".into()),
+                ("routine.deleted".into(), "bot".into(), me.clone(), "success".into()),
+                ("bot.stopped".into(), "user".into(), op.clone(), "success".into()),
+                ("bot.deleted".into(), "user".into(), op.clone(), "success".into()),
+                ("auth.login_failed".into(), "user".into(), None, "failure".into()),
+                ("auth.login_failed".into(), "bot".into(), None, "failure".into()),
+                ("auth.login".into(), "user".into(), op.clone(), "success".into()),
             ],
             "the second wrong password from the same IP is throttled; the audit read is a new client (no user agent)"
         );
         let find = |a: &str| events.iter().find(|e| e["action"] == a).unwrap().clone();
         let created = find("bot.created");
-        assert_eq!(
-            (created["ip"].as_str(), created["userAgent"].as_str()),
-            (Some("127.0.0.1"), Some("TestBrowser/1.0"))
-        );
-        assert_eq!(
-            (created["targetType"].as_str(), created["targetId"].as_str()),
-            (Some("bot"), Some(id.as_str()))
-        );
-        assert_eq!(
-            find("bot.updated")["details"]["changes"]["name"],
-            json!({ "from": "Helper", "to": "Helper 2" })
-        );
+        assert_eq!((created["ip"].as_str(), created["userAgent"].as_str()), (Some("127.0.0.1"), Some("TestBrowser/1.0")));
+        assert_eq!((created["targetType"].as_str(), created["targetId"].as_str()), (Some("bot"), Some(id.as_str())));
+        assert_eq!(find("bot.updated")["details"]["changes"]["name"], json!({ "from": "Helper", "to": "Helper 2" }));
         let routine = find("routine.created");
-        assert_eq!(
-            (routine["actorName"].as_str(), routine["userAgent"].as_str()),
-            (Some("Helper 2"), Some("botctl"))
-        );
-        assert_eq!(
-            find("routine.updated")["details"]["changes"]["cron"]["to"],
-            "0 10 * * *"
-        );
-        assert!(
-            !body.contains("secret plan"),
-            "routine instructions are messages, not audit data"
-        );
-        assert!(
-            !body.contains(&wrong_password),
-            "passwords are never logged"
-        );
+        assert_eq!((routine["actorName"].as_str(), routine["userAgent"].as_str()), (Some("Helper 2"), Some("botctl")));
+        assert_eq!(find("routine.updated")["details"]["changes"]["cron"]["to"], "0 10 * * *");
+        assert!(!body.contains("secret plan"), "routine instructions are messages, not audit data");
+        assert!(!body.contains(&wrong_password), "passwords are never logged");
         assert_eq!(find("bot.deleted")["details"]["name"], "Helper 2");
         // The log outlives the Bot.
         assert!(app.db.bot(&id).is_none());
@@ -4620,48 +3003,18 @@ mod tests {
         let (_, page) = call(port, "GET", "/api/audit?limit=2", &user, "").await;
         let page: Value = serde_json::from_str(&page).unwrap();
         let next = page["nextBefore"].as_i64().unwrap();
-        let (_, older) = call(
-            port,
-            "GET",
-            &format!("/api/audit?limit=2&before={next}"),
-            &user,
-            "",
-        )
-        .await;
-        assert!(
-            audit_list(&older)
-                .iter()
-                .all(|e| e["id"].as_i64().unwrap() < next)
-        );
-        let (_, mine) = call(
-            port,
-            "GET",
-            &format!("/api/audit?actor=bot:{id}&action=routine.*"),
-            &user,
-            "",
-        )
-        .await;
+        let (_, older) = call(port, "GET", &format!("/api/audit?limit=2&before={next}"), &user, "").await;
+        assert!(audit_list(&older).iter().all(|e| e["id"].as_i64().unwrap() < next));
+        let (_, mine) = call(port, "GET", &format!("/api/audit?actor=bot:{id}&action=routine.*"), &user, "").await;
         assert_eq!(audit_list(&mine).len(), 4);
-        assert_eq!(
-            call(port, "GET", "/api/audit?from=last-week", &user, "")
-                .await
-                .0,
-            400
-        );
-        assert_eq!(
-            call(port, "GET", "/api/audit/export.csv?actor=root", &user, "")
-                .await
-                .0,
-            400
-        );
+        assert_eq!(call(port, "GET", "/api/audit?from=last-week", &user, "").await.0, 400);
+        assert_eq!(call(port, "GET", "/api/audit/export.csv?actor=root", &user, "").await.0, 400);
     }
 
     #[tokio::test]
     async fn approvals_and_handoffs_are_audited() {
         let (port, app, user, key) = serve_app().await;
-        let bot = app
-            .db
-            .create_bot("A", "#fff", "waddle", "claude", None, true);
+        let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
         let bot_auth = key.auth(&bot.id);
         let check = json!({ "from": bot.id, "harness": "claude", "event": { "tool_name": "Bash", "tool_input": { "command": "git push https://x:tok3n@example.com" }, "cwd": "/tmp" } }).to_string();
         let hook = tokio::spawn({
@@ -4674,80 +3027,31 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
-        let (code, _, _) = call_with(
-            port,
-            "POST",
-            &format!("/api/approvals/{}/deny", pending.id),
-            &user,
-            "X-Forwarded-For: 198.51.100.7\r\n",
-            "{}",
-        )
-        .await;
+        let (code, _, _) = call_with(port, "POST", &format!("/api/approvals/{}/deny", pending.id), &user, "X-Forwarded-For: 198.51.100.7\r\n", "{}").await;
         assert_eq!(code, 200);
         hook.await.unwrap();
 
         let handoff = tokio::spawn({
             let (app, bot) = (app.clone(), bot.clone());
-            async move {
-                app.handoff(&bot, "Log in to the bank", Duration::from_secs(30))
-                    .await
-            }
+            async move { app.handoff(&bot, "Log in to the bank", Duration::from_secs(30)).await }
         });
         let card = loop {
-            if let Some(m) = app
-                .db
-                .messages(&bot.id, 10)
-                .into_iter()
-                .find(|m| m.question.is_some())
-            {
+            if let Some(m) = app.db.messages(&bot.id, 10).into_iter().find(|m| m.question.is_some()) {
                 break m;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
-        let answer =
-            json!({ "text": "Done", "answer": { "messageId": card.id, "option": 0 } }).to_string();
-        assert_eq!(
-            call(
-                port,
-                "POST",
-                &format!("/api/bots/{}/messages", bot.id),
-                &user,
-                &answer
-            )
-            .await
-            .0,
-            202
-        );
+        let answer = json!({ "text": "Done", "answer": { "messageId": card.id, "option": 0 } }).to_string();
+        assert_eq!(call(port, "POST", &format!("/api/bots/{}/messages", bot.id), &user, &answer).await.0, 202);
         assert_eq!(handoff.await.unwrap().as_deref(), Some("Done"));
 
-        let (_, body) = call(
-            port,
-            "GET",
-            "/api/audit?action=approval.*,handoff.*",
-            &user,
-            "",
-        )
-        .await;
+        let (_, body) = call(port, "GET", "/api/audit?action=approval.*,handoff.*", &user, "").await;
         let ev = audit_list(&body);
         let actions: Vec<&str> = ev.iter().map(|e| e["action"].as_str().unwrap()).collect();
-        assert_eq!(
-            actions,
-            [
-                "handoff.answered",
-                "handoff.requested",
-                "approval.denied",
-                "approval.requested"
-            ]
-        );
+        assert_eq!(actions, ["handoff.answered", "handoff.requested", "approval.denied", "approval.requested"]);
         // Behind a proxy on loopback, the client IP is the forwarded one.
-        assert_eq!(
-            (ev[2]["actorId"].as_str(), ev[2]["ip"].as_str()),
-            (Some("operator"), Some("198.51.100.7"))
-        );
-        assert_eq!(
-            ev[0]["details"],
-            json!({ "option": "Done", "botWasWaiting": true })
-        );
+        assert_eq!((ev[2]["actorId"].as_str(), ev[2]["ip"].as_str()), (Some("operator"), Some("198.51.100.7")));
+        assert_eq!(ev[0]["details"], json!({ "option": "Done", "botWasWaiting": true }));
         assert!(!body.contains("tok3n") && !body.contains("bank"), "{body}");
     }
 
@@ -4757,96 +3061,42 @@ mod tests {
         let evil = r#"{"name":"=HYPERLINK(\"http://evil.example\",\"x\"), ok"}"#;
         let (code, created) = call(port, "POST", "/api/bots", &user, evil).await;
         assert_eq!(code, 201, "{created}");
-        let (code, head, body) = call_with(
-            port,
-            "GET",
-            "/api/audit/export.csv?action=bot.created",
-            &user,
-            "",
-            "",
-        )
-        .await;
+        let (code, head, body) = call_with(port, "GET", "/api/audit/export.csv?action=bot.created", &user, "", "").await;
         assert_eq!(code, 200);
         let head = head.to_ascii_lowercase();
-        assert!(
-            head.contains("content-type: text/csv; charset=utf-8"),
-            "{head}"
-        );
-        assert!(
-            head.contains("content-disposition: attachment; filename=\"superbot-audit-"),
-            "{head}"
-        );
+        assert!(head.contains("content-type: text/csv; charset=utf-8"), "{head}");
+        assert!(head.contains("content-disposition: attachment; filename=\"superbot-audit-"), "{head}");
         let lines: Vec<&str> = body.split("\r\n").collect();
         assert_eq!(format!("{}\r\n", lines[0]), audit::CSV_HEADER);
-        assert_eq!(
-            lines.len(),
-            3,
-            "header, one row, and the final CRLF: {body:?}"
-        );
-        assert!(
-            lines[1].contains(r#""{""harness"":""claude"",""model"":null,""name"":""=HYPERLINK"#),
-            "{}",
-            lines[1]
-        );
+        assert_eq!(lines.len(), 3, "header, one row, and the final CRLF: {body:?}");
+        assert!(lines[1].contains(r#""{""harness"":""claude"",""model"":null,""name"":""=HYPERLINK"#), "{}", lines[1]);
         assert!(lines[1].split(',').nth(6) == Some("bot.created"));
         // The export itself is audited, and a cell that starts a formula is defused.
-        let exported = &app.db.audit_events(
-            &audit::Filter {
-                actions: vec!["audit.exported".into()],
-                ..Default::default()
-            },
-            10,
-            false,
-        )[0];
+        let exported = &app.db.audit_events(&audit::Filter { actions: vec!["audit.exported".into()], ..Default::default() }, 10, false)[0];
         assert_eq!(exported.details["actions"], json!(["bot.created"]));
-        let row = audit::csv_row(&db::AuditEvent {
-            actor_name: Some("=1+2".into()),
-            ..exported.clone()
-        });
+        let row = audit::csv_row(&db::AuditEvent { actor_name: Some("=1+2".into()), ..exported.clone() });
         assert!(row.contains(",'=1+2,"), "{row}");
         // Many rows stream in batches, oldest first.
         for i in 0..1200 {
-            app.db
-                .record(&Event::new(Actor::system("test"), "test.bulk").details(json!({ "i": i })));
+            app.db.record(&Event::new(Actor::system("test"), "test.bulk").details(json!({ "i": i })));
         }
-        let (_, _, body) = call_with(
-            port,
-            "GET",
-            "/api/audit/export.csv?action=test.bulk",
-            &user,
-            "",
-            "",
-        )
-        .await;
+        let (_, _, body) = call_with(port, "GET", "/api/audit/export.csv?action=test.bulk", &user, "", "").await;
         let rows: Vec<&str> = body.trim_end().split("\r\n").skip(1).collect();
         assert_eq!(rows.len(), 1200);
         assert!(rows[0].ends_with(r#""{""i"":0}",,,,,,,"#), "{}", rows[0]);
-        assert!(
-            rows[1199].ends_with(r#""{""i"":1199}",,,,,,,"#),
-            "{}",
-            rows[1199]
-        );
+        assert!(rows[1199].ends_with(r#""{""i"":1199}",,,,,,,"#), "{}", rows[1199]);
     }
 
     #[tokio::test]
     async fn hook_waits_for_a_person_then_runs() {
         let (port, app, user, key) = serve_app().await;
-        let bot = app
-            .db
-            .create_bot("A", "#fff", "waddle", "claude", None, true);
+        let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
         let bot_auth = key.auth(&bot.id);
         let check = |cmd: &str| {
             json!({ "from": bot.id, "harness": "claude", "event": { "tool_name": "Bash", "tool_input": { "command": cmd }, "cwd": "/tmp" } }).to_string()
         };
 
-        let (code, body) = call(
-            port,
-            "POST",
-            "/api/approvals/check",
-            &bot_auth,
-            &check("ls -la"),
-        )
-        .await;
+        let (code, body) = call(port, "POST", "/api/approvals/check", &bot_auth, &check("ls -la")).await;
         assert_eq!((code, body.lines().next()), (200, Some("allow")));
 
         let hook = tokio::spawn({
@@ -4864,71 +3114,21 @@ mod tests {
         };
         assert_eq!(pending["class"], "git_push");
         let id = pending["id"].as_str().unwrap();
-        assert_eq!(
-            call(
-                port,
-                "POST",
-                &format!("/api/approvals/{id}/approve"),
-                &bot_auth,
-                "{}"
-            )
-            .await
-            .0,
-            403
-        );
-        let (code, done) = call(
-            port,
-            "POST",
-            &format!("/api/approvals/{id}/approve"),
-            &user,
-            r#"{"remember":"bot"}"#,
-        )
-        .await;
-        assert_eq!(
-            (
-                code,
-                serde_json::from_str::<Value>(&done).unwrap()["status"].as_str()
-            ),
-            (200, Some("approved"))
-        );
+        assert_eq!(call(port, "POST", &format!("/api/approvals/{id}/approve"), &bot_auth, "{}").await.0, 403);
+        let (code, done) = call(port, "POST", &format!("/api/approvals/{id}/approve"), &user, r#"{"remember":"bot"}"#).await;
+        assert_eq!((code, serde_json::from_str::<Value>(&done).unwrap()["status"].as_str()), (200, Some("approved")));
         assert_eq!(hook.await.unwrap().1.lines().next(), Some("allow"));
-        assert_eq!(
-            call(
-                port,
-                "POST",
-                &format!("/api/approvals/{id}/deny"),
-                &user,
-                ""
-            )
-            .await
-            .0,
-            409
-        );
+        assert_eq!(call(port, "POST", &format!("/api/approvals/{id}/deny"), &user, "").await.0, 409);
 
-        let (_, again) = call(
-            port,
-            "POST",
-            "/api/approvals/check",
-            &bot_auth,
-            &check("git push origin main"),
-        )
-        .await;
+        let (_, again) = call(port, "POST", "/api/approvals/check", &bot_auth, &check("git push origin main")).await;
         assert_eq!(again.lines().next(), Some("allow"), "remembered");
 
-        let (_, unknown) = call(
-            port,
-            "POST",
-            "/api/approvals/check",
-            &bot_auth,
-            r#"{"from":"nobody","event":{"tool_name":"Bash"}}"#,
-        )
-        .await;
+        let (_, unknown) = call(port, "POST", "/api/approvals/check", &bot_auth, r#"{"from":"nobody","event":{"tool_name":"Bash"}}"#).await;
         assert_eq!(unknown.lines().next(), Some("deny"));
 
         let deep = format!("echo \"{}{}\"", "$(".repeat(100_000), ")".repeat(100_000));
         for cmd in ["echo \"$(git push", deep.as_str()] {
-            let (code, bad) =
-                call(port, "POST", "/api/approvals/check", &bot_auth, &check(cmd)).await;
+            let (code, bad) = call(port, "POST", "/api/approvals/check", &bot_auth, &check(cmd)).await;
             assert_eq!((code, bad.lines().next()), (200, Some("deny")), "{cmd:.40}");
         }
         for input in [json!({}), json!({ "command": "ls", "cmd": "git push" })] {
@@ -4943,25 +3143,15 @@ mod tests {
     #[tokio::test]
     async fn secrets_api_takes_values_and_never_returns_them() {
         let (port, app, user, key) = serve_app().await;
-        let bot_auth = key.auth(
-            &app.db
-                .create_bot("Z", "#fff", "waddle", "claude", None, false)
-                .id,
-        );
+        let bot_auth = key.auth(&app.db.create_bot("Z", "#fff", "waddle", "claude", None, false).id);
         let name = format!("TEST_{}_API_KEY", random_hex(4).to_uppercase());
         let value = format!("sk-test-{}", random_hex(16));
         let path = format!("/api/secrets/{name}");
         let body = json!({ "value": value }).to_string();
         assert_eq!(call(port, "GET", "/api/secrets", "", "").await.0, 401);
-        assert_eq!(
-            call(port, "GET", "/api/secrets", &bot_auth, "").await.0,
-            403
-        );
+        assert_eq!(call(port, "GET", "/api/secrets", &bot_auth, "").await.0, 403);
         assert_eq!(call(port, "PUT", &path, &bot_auth, &body).await.0, 403);
-        assert_eq!(
-            call(port, "PUT", "/api/secrets/PATH", &user, &body).await.0,
-            400
-        );
+        assert_eq!(call(port, "PUT", "/api/secrets/PATH", &user, &body).await.0, 400);
         assert_eq!(call(port, "PUT", &path, &user, "{}").await.0, 400);
 
         let (code, res) = call(port, "PUT", &path, &user, &body).await;
@@ -4970,35 +3160,16 @@ mod tests {
         let (code, list) = call(port, "GET", "/api/secrets", &user, "").await;
         assert_eq!(code, 200);
         assert!(list.contains(&name) && !list.contains(&value), "{list}");
-        assert_eq!(
-            secrets::global().get(&name).unwrap().unwrap().expose(),
-            value
-        );
-        assert!(
-            secrets::global()
-                .harness_env()
-                .iter()
-                .any(|(k, v)| *k == name && v.expose() == value)
-        );
+        assert_eq!(secrets::global().get(&name).unwrap().unwrap().expose(), value);
+        assert!(secrets::global().harness_env().iter().any(|(k, v)| *k == name && v.expose() == value));
 
         // A Bot echoing the value: the saved chat and the audit log hold the mark instead.
-        let bot = app
-            .db
-            .create_bot("A", "#fff", "waddle", "claude", None, true);
-        let m = app
-            .db
-            .add_message(&bot.id, "bot", &format!("key={value}"), None, false, None);
+        let bot = app.db.create_bot("A", "#fff", "waddle", "claude", None, true);
+        let m = app.db.add_message(&bot.id, "bot", &format!("key={value}"), None, false, None);
         assert_eq!(m.text, "key=[redacted]");
-        app.db.record(
-            &Event::new(Actor::bot(Some(&bot.id), None), "test.echo")
-                .bot(&bot.id)
-                .details(json!({ "said": value })),
-        );
+        app.db.record(&Event::new(Actor::bot(Some(&bot.id), None), "test.echo").bot(&bot.id).details(json!({ "said": value })));
         let (_, audit) = call(port, "GET", "/api/audit", &user, "").await;
-        assert!(
-            !audit.contains(&value) && audit.contains("secret.set") && audit.contains(&name),
-            "{audit}"
-        );
+        assert!(!audit.contains(&value) && audit.contains("secret.set") && audit.contains(&name), "{audit}");
 
         assert_eq!(call(port, "DELETE", &path, &bot_auth, "").await.0, 403);
         assert_eq!(call(port, "DELETE", &path, &user, "").await.0, 200);
@@ -5011,21 +3182,10 @@ mod tests {
         let f = routine_fields(&json!({ "name": "  Digest ", "cron": "0 9 * * 1-5", "instruction": " Sum up email ", "enabled": false })).unwrap();
         assert_eq!(
             f,
-            RoutineFields {
-                name: Some("Digest".into()),
-                cron: Some("0 9 * * 1-5".into()),
-                instruction: Some("Sum up email".into()),
-                enabled: Some(false)
-            }
+            RoutineFields { name: Some("Digest".into()), cron: Some("0 9 * * 1-5".into()), instruction: Some("Sum up email".into()), enabled: Some(false) }
         );
-        assert_eq!(
-            routine_fields(&json!({})).unwrap(),
-            RoutineFields::default()
-        );
-        assert_eq!(
-            routine_fields(&json!({ "name": null })).unwrap(),
-            RoutineFields::default()
-        );
+        assert_eq!(routine_fields(&json!({})).unwrap(), RoutineFields::default());
+        assert_eq!(routine_fields(&json!({ "name": null })).unwrap(), RoutineFields::default());
         assert!(routine_fields(&json!({ "name": "   " })).is_err());
         assert!(routine_fields(&json!({ "instruction": "" })).is_err());
         assert!(routine_fields(&json!({ "name": 5 })).is_err());
@@ -5040,55 +3200,28 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("botd-test-{}", random_hex(6)));
         std::fs::create_dir_all(&dir).unwrap();
         let db = Db::open(&dir.join("app.sqlite")).unwrap();
-        let app = App::new(
-            db,
-            Config {
-                data_dir: dir.clone(),
-                workspace: dir.clone(),
-                user_name: "the user".into(),
-                bin_dir: dir.clone(),
-                api_url: "http://127.0.0.1:0".into(),
-                bot_key: "bot-key".into(),
-                run_timeout: Duration::from_secs(60),
-                default_harness: "claude".into(),
-                sandbox_host: sandbox::Host {
-                    namespaces: true,
-                    programs: sandbox::PROGRAMS.map(String::from).into(),
-                },
-                home: None,
-            },
-            None,
-        );
+        let app = App::new(db, Config {
+            data_dir: dir.clone(),
+            workspace: dir.clone(),
+            user_name: "the user".into(),
+            bin_dir: dir.clone(),
+            api_url: "http://127.0.0.1:0".into(),
+            bot_key: "bot-key".into(),
+            run_timeout: Duration::from_secs(60),
+            default_harness: "claude".into(),
+            sandbox_host: sandbox::Host { namespaces: true, programs: sandbox::PROGRAMS.map(String::from).into() },
+            home: None,
+        }, None);
         app.license.set_testing(true);
         users::ensure_operator(&app.db, "Owner", None);
-        let bot = app
-            .db
-            .create_bot("Tester", "#f5f5f5", "waddle", "claude", None, true);
+        let bot = app.db.create_bot("Tester", "#f5f5f5", "waddle", "claude", None, true);
         let router = Router::new()
-            .route(
-                "/api/bots/{id}/routines",
-                get(list_routines).post(create_routine),
-            )
-            .route(
-                "/api/routines/{id}",
-                patch(update_routine).delete(delete_routine),
-            )
-            .layer(Extension(Who {
-                actor: Actor::operator(),
-                source: Source::default(),
-            }))
-            .layer(Extension(Caller {
-                principal: Principal::User(Role::Admin),
-                user: None,
-                session: None,
-                method: "none",
-                bot: None,
-                bot_for: None,
-            }))
+            .route("/api/bots/{id}/routines", get(list_routines).post(create_routine))
+            .route("/api/routines/{id}", patch(update_routine).delete(delete_routine))
+            .layer(Extension(Who { actor: Actor::operator(), source: Source::default() }))
+            .layer(Extension(Caller { principal: Principal::User(Role::Admin), user: None, session: None, method: "none", bot: None, bot_for: None }))
             .with_state(app.clone());
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
@@ -5097,14 +3230,7 @@ mod tests {
     }
 
     async fn call_json(port: u16, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
-        let (code, res) = call(
-            port,
-            method,
-            path,
-            "",
-            &body.map(|b| b.to_string()).unwrap_or_default(),
-        )
-        .await;
+        let (code, res) = call(port, method, path, "", &body.map(|b| b.to_string()).unwrap_or_default()).await;
         (code, serde_json::from_str(&res).unwrap_or(Value::Null))
     }
 
@@ -5113,58 +3239,27 @@ mod tests {
         let (port, app, bot, dir) = serve_routines().await;
         let base = format!("/api/bots/{bot}/routines");
 
-        let (code, _) = call_json(
-            port,
-            "POST",
-            &base,
-            Some(json!({ "name": "", "cron": "0 9 * * *", "instruction": "x" })),
-        )
-        .await;
+        let (code, _) = call_json(port, "POST", &base, Some(json!({ "name": "", "cron": "0 9 * * *", "instruction": "x" }))).await;
         assert_eq!(code, 400);
-        let (code, _) = call_json(
-            port,
-            "POST",
-            &base,
-            Some(json!({ "name": "A", "cron": "nope", "instruction": "x" })),
-        )
-        .await;
+        let (code, _) = call_json(port, "POST", &base, Some(json!({ "name": "A", "cron": "nope", "instruction": "x" }))).await;
         assert_eq!(code, 400);
-        let (code, _) = call_json(
-            port,
-            "POST",
-            "/api/bots/missing/routines",
-            Some(json!({ "name": "A", "cron": "0 9 * * *", "instruction": "x" })),
-        )
-        .await;
+        let (code, _) = call_json(port, "POST", "/api/bots/missing/routines", Some(json!({ "name": "A", "cron": "0 9 * * *", "instruction": "x" }))).await;
         assert_eq!(code, 404);
 
-        let (code, r) = call_json(
-            port,
-            "POST",
-            &base,
-            Some(json!({ "name": " Digest ", "cron": "0 9 * * *", "instruction": "Sum up" })),
-        )
-        .await;
+        let (code, r) = call_json(port, "POST", &base, Some(json!({ "name": " Digest ", "cron": "0 9 * * *", "instruction": "Sum up" }))).await;
         assert_eq!(code, 201);
         assert_eq!(r["name"], "Digest");
         assert_eq!(r["enabled"], true);
         let id = r["id"].as_str().unwrap().to_string();
         let path = format!("/api/routines/{id}");
 
-        let (code, paused) = call_json(
-            port,
-            "POST",
-            &base,
-            Some(json!({ "name": "B", "cron": "0 9 * * *", "instruction": "y", "enabled": false })),
-        )
-        .await;
+        let (code, paused) = call_json(port, "POST", &base, Some(json!({ "name": "B", "cron": "0 9 * * *", "instruction": "y", "enabled": false }))).await;
         assert_eq!(code, 201);
         assert_eq!(paused["enabled"], false);
 
         let (code, _) = call_json(port, "PATCH", &path, Some(json!({ "name": "   " }))).await;
         assert_eq!(code, 400);
-        let (code, _) =
-            call_json(port, "PATCH", &path, Some(json!({ "cron": "99 * * * *" }))).await;
+        let (code, _) = call_json(port, "PATCH", &path, Some(json!({ "cron": "99 * * * *" }))).await;
         assert_eq!(code, 400);
         assert_eq!(app.db.routine(&id).unwrap().name, "Digest");
         assert_eq!(app.db.routine(&id).unwrap().cron, "0 9 * * *");
@@ -5189,18 +3284,8 @@ mod tests {
         let (code, _) = call_json(port, "DELETE", &path, None).await;
         assert_eq!(code, 404);
 
-        let events = app.db.audit_events(
-            &audit::Filter {
-                actions: vec!["routine.*".into()],
-                ..Default::default()
-            },
-            100,
-            true,
-        );
-        let seen: Vec<(&str, Option<&str>)> = events
-            .iter()
-            .map(|e| (e.action.as_str(), e.target_id.as_deref()))
-            .collect();
+        let events = app.db.audit_events(&audit::Filter { actions: vec!["routine.*".into()], ..Default::default() }, 100, true);
+        let seen: Vec<(&str, Option<&str>)> = events.iter().map(|e| (e.action.as_str(), e.target_id.as_deref())).collect();
         let paused_id = paused["id"].as_str();
         assert_eq!(
             seen,
@@ -5213,17 +3298,9 @@ mod tests {
             ],
             "rejected and missing-routine requests are not logged"
         );
-        assert!(
-            events
-                .iter()
-                .all(|e| e.actor_id.as_deref() == Some("operator")
-                    && e.bot_id.as_deref() == Some(bot.as_str()))
-        );
+        assert!(events.iter().all(|e| e.actor_id.as_deref() == Some("operator") && e.bot_id.as_deref() == Some(bot.as_str())));
         assert_eq!(events[1].details["enabled"], false);
-        assert_eq!(
-            events[3].details["changes"]["instruction"], "changed",
-            "the instruction text is not logged"
-        );
+        assert_eq!(events[3].details["changes"]["instruction"], "changed", "the instruction text is not logged");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -5234,26 +3311,15 @@ mod tests {
         let view = |app: &App| app.bot_view(&app.db.bot(&bot).unwrap())["handoff"].clone();
         assert_eq!(view(&app), Value::Null);
 
-        app.db.add_message(
-            &bot,
-            "bot",
-            "",
-            Some(&json!({ "title": "Pick", "options": ["A", "B"] })),
-            false,
-            None,
-        );
+        app.db.add_message(&bot, "bot", "", Some(&json!({ "title": "Pick", "options": ["A", "B"] })), false, None);
         assert_eq!(view(&app), Value::Null);
 
-        let first = app
-            .db
-            .add_message(&bot, "bot", "", Some(&card("Log in")), false, None);
+        let first = app.db.add_message(&bot, "bot", "", Some(&card("Log in")), false, None);
         assert_eq!(view(&app), json!(first.id));
         app.db.add_message(&bot, "user", "later", None, false, None);
         assert_eq!(view(&app), Value::Null);
 
-        let second = app
-            .db
-            .add_message(&bot, "bot", "", Some(&card("2FA")), false, None);
+        let second = app.db.add_message(&bot, "bot", "", Some(&card("2FA")), false, None);
         assert_eq!(view(&app), json!(second.id));
         let mut q = card("2FA");
         q["picked"] = json!(0);
@@ -5266,12 +3332,7 @@ mod tests {
     fn allowed_host_names() {
         assert_eq!(
             allowed_hosts("::1", 3000, "")[0..4],
-            [
-                "[::1]:3000",
-                "localhost:3000",
-                "127.0.0.1:3000",
-                "[::1]:3000"
-            ]
+            ["[::1]:3000", "localhost:3000", "127.0.0.1:3000", "[::1]:3000"]
         );
         let list = allowed_hosts("127.0.0.1", 3000, " Bots.Example.com ,");
         assert!(list.iter().any(|h| h == "bots.example.com"));

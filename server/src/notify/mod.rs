@@ -25,7 +25,7 @@ use crate::runner::App;
 use crate::secrets;
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -67,11 +67,7 @@ pub struct EmailSettings {
 
 impl Default for EmailSettings {
     fn default() -> Self {
-        EmailSettings {
-            enabled: false,
-            to: Vec::new(),
-            deciders: true,
-        }
+        EmailSettings { enabled: false, to: Vec::new(), deciders: true }
     }
 }
 
@@ -132,18 +128,13 @@ impl Default for Settings {
 impl Settings {
     /// Everything but the Bots' own settings, for the audit log and the global view.
     pub fn global(&self) -> Settings {
-        Settings {
-            bots: BTreeMap::new(),
-            ..self.clone()
-        }
+        Settings { bots: BTreeMap::new(), ..self.clone() }
     }
 }
 
 /// The saved settings. Unreadable ones count as the default: everything off.
 pub fn load(db: &Db) -> Settings {
-    db.setting(SETTINGS_KEY)
-        .and_then(|v| serde_json::from_str(&v).ok())
-        .unwrap_or_default()
+    db.setting(SETTINGS_KEY).and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default()
 }
 
 pub fn save(db: &Db, s: &Settings) {
@@ -182,20 +173,13 @@ pub fn apply_patch(s: &Settings, v: &Value) -> Result<Settings, String> {
             out.webhook.enabled = flag(b, "webhook.enabled")?;
         }
         if let Some(f) = w.get("format").filter(|f| !f.is_null()) {
-            out.webhook.format = f
-                .as_str()
-                .and_then(Format::parse)
-                .ok_or("webhook.format must be \"slack\" or \"json\"")?;
+            out.webhook.format = f.as_str().and_then(Format::parse).ok_or("webhook.format must be \"slack\" or \"json\"")?;
         }
     }
     let seconds = |name: &str, max: u32| -> Result<Option<u32>, String> {
         match v.get(name).filter(|n| !n.is_null()) {
             None => Ok(None),
-            Some(n) => n
-                .as_u64()
-                .filter(|n| *n <= max as u64)
-                .map(|n| Some(n as u32))
-                .ok_or(format!("{name} must be 0 to {max}")),
+            Some(n) => n.as_u64().filter(|n| *n <= max as u64).map(|n| Some(n as u32)).ok_or(format!("{name} must be 0 to {max}")),
         }
     };
     if let Some(d) = seconds("delaySeconds", MAX_DELAY_SECONDS)? {
@@ -217,18 +201,8 @@ pub fn apply_patch(s: &Settings, v: &Value) -> Result<Settings, String> {
 /// A list of addresses, or one string of them split by commas, spaces, or new lines.
 pub fn recipients(v: &Value) -> Result<Vec<String>, String> {
     let raw: Vec<String> = match v {
-        Value::String(s) => s
-            .split([',', ';', ' ', '\n', '\t'])
-            .map(String::from)
-            .collect(),
-        Value::Array(a) => a
-            .iter()
-            .map(|x| {
-                x.as_str()
-                    .map(String::from)
-                    .ok_or("email.to must be a list of addresses")
-            })
-            .collect::<Result<_, _>>()?,
+        Value::String(s) => s.split([',', ';', ' ', '\n', '\t']).map(String::from).collect(),
+        Value::Array(a) => a.iter().map(|x| x.as_str().map(String::from).ok_or("email.to must be a list of addresses")).collect::<Result<_, _>>()?,
         _ => return Err("email.to must be a list of addresses".into()),
     };
     let mut out: Vec<String> = Vec::new();
@@ -264,13 +238,7 @@ pub fn apply_bot_patch(o: &BotSettings, v: &Value) -> Result<BotSettings, String
     match v.get("format") {
         None => {}
         Some(Value::Null) => out.format = None,
-        Some(f) => {
-            out.format = Some(
-                f.as_str()
-                    .and_then(Format::parse)
-                    .ok_or("format must be \"slack\", \"json\", or null")?,
-            )
-        }
+        Some(f) => out.format = Some(f.as_str().and_then(Format::parse).ok_or("format must be \"slack\", \"json\", or null")?),
     }
     Ok(out)
 }
@@ -280,22 +248,14 @@ pub fn apply_bot_patch(o: &BotSettings, v: &Value) -> Result<BotSettings, String
 /// for every Bot; list them in `email.to`.
 pub fn deciders(db: &Db, bot: &Bot) -> Vec<User> {
     let mut ids = vec![bot.owner_id.clone()];
-    for g in db
-        .grants(&bot.id)
-        .into_iter()
-        .filter(|g| g.level == Grant::Operator)
-    {
+    for g in db.grants(&bot.id).into_iter().filter(|g| g.level == Grant::Operator) {
         if !ids.contains(&g.user_id) {
             ids.push(g.user_id);
         }
     }
     ids.into_iter()
         .filter_map(|id| db.user(&id))
-        .filter(|u| {
-            u.active()
-                && rbac::allows(Principal::User(u.role), Perm::Approve)
-                && Viewer::person(db, &u.id).access(db, bot) >= Access::Operate
-        })
+        .filter(|u| u.active() && rbac::allows(Principal::User(u.role), Perm::Approve) && Viewer::person(db, &u.id).access(db, bot) >= Access::Operate)
         .collect()
 }
 
@@ -361,9 +321,7 @@ pub struct Notice {
 
 /// `14:32 UTC`.
 pub fn clock(ms: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(ms)
-        .map(|t| t.format("%H:%M UTC").to_string())
-        .unwrap_or_default()
+    chrono::DateTime::from_timestamp_millis(ms).map(|t| t.format("%H:%M UTC").to_string()).unwrap_or_default()
 }
 
 fn clip(s: &str) -> String {
@@ -378,16 +336,8 @@ fn clip(s: &str) -> String {
 impl Notice {
     pub fn summary(&self) -> String {
         match self.kind {
-            NoticeKind::Approval => format!(
-                "{} is waiting for approval to run {}",
-                self.bot_name,
-                self.items.first().map_or("a tool", |i| i.tool.as_str())
-            ),
-            NoticeKind::Digest => format!(
-                "{} approvals are waiting for {}",
-                self.items.len() + self.more,
-                self.bot_name
-            ),
+            NoticeKind::Approval => format!("{} is waiting for approval to run {}", self.bot_name, self.items.first().map_or("a tool", |i| i.tool.as_str())),
+            NoticeKind::Digest => format!("{} approvals are waiting for {}", self.items.len() + self.more, self.bot_name),
             NoticeKind::Test if self.bot_id.is_empty() => "Test notification from SuperBot".into(),
             NoticeKind::Test => format!("Test notification from SuperBot for {}", self.bot_name),
         }
@@ -402,22 +352,13 @@ impl Notice {
         let mut out = String::new();
         match self.kind {
             NoticeKind::Test => {
-                out.push_str(
-                    "This is a test. Notifications about approvals will reach you here.\n",
-                );
+                out.push_str("This is a test. Notifications about approvals will reach you here.\n");
                 if let Some(l) = app_link {
                     out.push_str(&format!("\nOpen SuperBot: {l}\n"));
                 }
             }
-            NoticeKind::Approval => out.push_str(&format!(
-                "{} is waiting for your approval.\n",
-                self.bot_name
-            )),
-            NoticeKind::Digest => out.push_str(&format!(
-                "{} approvals are waiting for {}.\n",
-                self.items.len() + self.more,
-                self.bot_name
-            )),
+            NoticeKind::Approval => out.push_str(&format!("{} is waiting for your approval.\n", self.bot_name)),
+            NoticeKind::Digest => out.push_str(&format!("{} approvals are waiting for {}.\n", self.items.len() + self.more, self.bot_name)),
         }
         for i in &self.items {
             out.push_str(&format!("\n  {}\n  Tool: {}\n", i.class_label, i.tool));
@@ -428,12 +369,7 @@ impl Notice {
                 out.push_str(&format!("  {s}\n"));
             }
             let mins = ((i.expires_at - now).max(0) as f64 / 60_000.0).ceil() as i64;
-            out.push_str(&format!(
-                "\n  Denied at {} (in {} minute{}) unless someone answers.\n",
-                clock(i.expires_at),
-                mins,
-                if mins == 1 { "" } else { "s" }
-            ));
+            out.push_str(&format!("\n  Denied at {} (in {} minute{}) unless someone answers.\n", clock(i.expires_at), mins, if mins == 1 { "" } else { "s" }));
             if let Some(l) = &i.link {
                 out.push_str(&format!("  Open it in SuperBot: {l}\n"));
             }
@@ -461,15 +397,11 @@ impl Links {
     }
 
     pub fn approval(&self, id: &str) -> Option<String> {
-        self.base
-            .as_ref()
-            .map(|b| format!("{b}/app/home?approval={id}"))
+        self.base.as_ref().map(|b| format!("{b}/app/home?approval={id}"))
     }
 
     pub fn audit(&self, id: &str) -> Option<String> {
-        self.base
-            .as_ref()
-            .map(|b| format!("{b}/console/#audit?target=approval:{id}"))
+        self.base.as_ref().map(|b| format!("{b}/console/#audit?target=approval:{id}"))
     }
 }
 
@@ -489,12 +421,7 @@ pub struct Sent {
 /// `plan.deciders`.
 pub trait Channel: Send + Sync {
     fn name(&self) -> &'static str;
-    fn send<'a>(
-        &'a self,
-        notice: &'a Notice,
-        plan: &'a Plan,
-        links: &'a Links,
-    ) -> BoxFuture<'a, Option<Result<Sent, String>>>;
+    fn send<'a>(&'a self, notice: &'a Notice, plan: &'a Plan, links: &'a Links) -> BoxFuture<'a, Option<Result<Sent, String>>>;
 }
 
 pub struct Email {
@@ -506,27 +433,14 @@ impl Channel for Email {
         "email"
     }
 
-    fn send<'a>(
-        &'a self,
-        n: &'a Notice,
-        plan: &'a Plan,
-        links: &'a Links,
-    ) -> BoxFuture<'a, Option<Result<Sent, String>>> {
+    fn send<'a>(&'a self, n: &'a Notice, plan: &'a Plan, links: &'a Links) -> BoxFuture<'a, Option<Result<Sent, String>>> {
         Box::pin(async move {
             if plan.email.is_empty() {
                 return None;
             }
             let password = stored(smtp::PASSWORD);
             let (subject, body) = (n.email_subject(), n.email_body(links.app().as_deref()));
-            let mails: Vec<smtp::Mail> = plan
-                .email
-                .iter()
-                .map(|to| smtp::Mail {
-                    to: to.clone(),
-                    subject: subject.clone(),
-                    body: body.clone(),
-                })
-                .collect();
+            let mails: Vec<smtp::Mail> = plan.email.iter().map(|to| smtp::Mail { to: to.clone(), subject: subject.clone(), body: body.clone() }).collect();
             Some(self.smtp.send(password.as_ref().map(|p| p.expose()), &mails).await.map(|results| {
                 let failed: Vec<(&String, &String)> = plan.email.iter().zip(&results).filter_map(|(to, r)| r.as_ref().err().map(|e| (to, e))).collect();
                 Sent {
@@ -549,46 +463,20 @@ impl Channel for Webhook {
         "webhook"
     }
 
-    fn send<'a>(
-        &'a self,
-        n: &'a Notice,
-        plan: &'a Plan,
-        _links: &'a Links,
-    ) -> BoxFuture<'a, Option<Result<Sent, String>>> {
+    fn send<'a>(&'a self, n: &'a Notice, plan: &'a Plan, _links: &'a Links) -> BoxFuture<'a, Option<Result<Sent, String>>> {
         Box::pin(async move {
             let (name, format) = plan.webhook.as_ref()?;
-            let Some(url) = stored(name) else {
-                return Some(Err(format!("{name} isn't set")));
-            };
+            let Some(url) = stored(name) else { return Some(Err(format!("{name} isn't set"))) };
             secrets::redact::register(url.expose());
             let signing = stored(webhook::SIGNING);
             let mut detail = json!({ "host": webhook::host_of(url.expose()), "format": format, "own": name != webhook::URL });
-            Some(Ok(
-                match webhook::post(
-                    &self.http,
-                    url.expose(),
-                    *format,
-                    n,
-                    signing.as_ref().map(|s| s.expose()),
-                )
-                .await
-                {
-                    Ok(status) => {
-                        detail["status"] = json!(status);
-                        Sent {
-                            delivered: 1,
-                            detail,
-                            ..Default::default()
-                        }
-                    }
-                    Err(e) => Sent {
-                        failed: 1,
-                        error: Some(e),
-                        detail,
-                        ..Default::default()
-                    },
-                },
-            ))
+            Some(Ok(match webhook::post(&self.http, url.expose(), *format, n, signing.as_ref().map(|s| s.expose())).await {
+                Ok(status) => {
+                    detail["status"] = json!(status);
+                    Sent { delivered: 1, detail, ..Default::default() }
+                }
+                Err(e) => Sent { failed: 1, error: Some(e), detail, ..Default::default() },
+            }))
         })
     }
 }
@@ -621,14 +509,7 @@ struct Held {
 
 impl Throttle {
     /// `by`: the latest this approval may go out, ahead of its deadline.
-    pub fn offer(
-        &mut self,
-        bot: &str,
-        id: &str,
-        window: Duration,
-        by: Instant,
-        now: Instant,
-    ) -> Offer {
+    pub fn offer(&mut self, bot: &str, id: &str, window: Duration, by: Instant, now: Instant) -> Offer {
         if !self.seen.insert(id.to_string()) {
             return Offer::Duplicate;
         }
@@ -641,10 +522,7 @@ impl Throttle {
         match self.last.get(bot) {
             Some(t) if !window.is_zero() && now < *t + window && by > now => {
                 let due = (*t + window).min(by);
-                let held = self.held.entry(bot.to_string()).or_insert_with(|| Held {
-                    ids: Vec::new(),
-                    due,
-                });
+                let held = self.held.entry(bot.to_string()).or_insert_with(|| Held { ids: Vec::new(), due });
                 held.ids.push(id.to_string());
                 if held.ids.len() == 1 || due < held.due {
                     held.due = due;
@@ -684,15 +562,8 @@ impl Notifier {
         if let Some(s) = &smtp {
             channels.push(Box::new(Email { smtp: s.clone() }));
         }
-        channels.push(Box::new(Webhook {
-            http: webhook::client(),
-        }));
-        Notifier {
-            smtp,
-            links: Links { base: public_url },
-            channels,
-            throttle: Mutex::default(),
-        }
+        channels.push(Box::new(Webhook { http: webhook::client() }));
+        Notifier { smtp, links: Links { base: public_url }, channels, throttle: Mutex::default() }
     }
 
     /// SMTP from the environment (`smtp::Smtp::from_env`); links from PUBLIC_URL,
@@ -706,71 +577,44 @@ impl Notifier {
     pub fn describe(&self, s: &Settings) -> String {
         let email = match (&self.smtp, s.email.enabled) {
             (None, _) => "email off (set SMTP_HOST and SMTP_FROM)".to_string(),
-            (Some(m), on) => format!(
-                "email {} through {}",
-                if on { "on" } else { "ready, off" },
-                m.describe()
-            ),
+            (Some(m), on) => format!("email {} through {}", if on { "on" } else { "ready, off" }, m.describe()),
         };
         let hook = match (secret_set(webhook::URL), s.webhook.enabled) {
             (true, true) => "webhook on",
             (true, false) => "webhook set, off",
             (false, _) => "no global webhook",
         };
-        let links = if self.links.base.is_some() {
-            ""
-        } else {
-            "; links off (set PUBLIC_URL)"
-        };
+        let links = if self.links.base.is_some() { "" } else { "; links off (set PUBLIC_URL)" };
         format!("{email}; {hook}{links}")
     }
 
     /// Where a notice for `bot` goes now. No Bot: the global settings alone.
     pub fn plan(&self, db: &Db, bot: Option<&Bot>, s: &Settings) -> Plan {
-        let o = bot
-            .and_then(|b| s.bots.get(&b.id))
-            .cloned()
-            .unwrap_or_default();
+        let o = bot.and_then(|b| s.bots.get(&b.id)).cloned().unwrap_or_default();
         let deciders = bot.map(|b| deciders(db, b)).unwrap_or_default();
         let mut email: Vec<String> = Vec::new();
         if self.smtp.is_some() && o.email.unwrap_or(s.email.enabled) {
-            let theirs = deciders
-                .iter()
-                .filter(|_| s.email.deciders)
-                .filter_map(|u| u.email.clone())
-                .filter(|e| smtp::address_ok(e));
+            let theirs = deciders.iter().filter(|_| s.email.deciders).filter_map(|u| u.email.clone()).filter(|e| smtp::address_ok(e));
             for a in s.email.to.iter().cloned().chain(theirs) {
                 if !email.iter().any(|e| e.eq_ignore_ascii_case(&a)) {
                     email.push(a);
                 }
             }
         }
-        let own = bot
-            .map(|b| webhook::bot_secret(&b.id))
-            .filter(|n| secret_set(n));
+        let own = bot.map(|b| webhook::bot_secret(&b.id)).filter(|n| secret_set(n));
         let webhook = if o.webhook.unwrap_or(own.is_some() || s.webhook.enabled) {
             match own {
                 Some(n) => Some((n, o.format.unwrap_or(s.webhook.format))),
-                None => {
-                    secret_set(webhook::URL).then(|| (webhook::URL.to_string(), s.webhook.format))
-                }
+                None => secret_set(webhook::URL).then(|| (webhook::URL.to_string(), s.webhook.format)),
             }
         } else {
             None
         };
-        Plan {
-            deciders,
-            email,
-            webhook,
-        }
+        Plan { deciders, email, webhook }
     }
 
     fn item(&self, a: &Approval, owner: &str, detail: Detail) -> Item {
-        let class_label = crate::policy::CLASSES
-            .iter()
-            .find(|(c, _)| *c == a.class)
-            .map_or("Needs approval", |(_, l)| *l)
-            .to_string();
+        let class_label = crate::policy::CLASSES.iter().find(|(c, _)| *c == a.class).map_or("Needs approval", |(_, l)| *l).to_string();
         let shown = |s: &str| clip(&secrets::redact::text_for(&[owner], s));
         Item {
             approval_id: a.id.clone(),
@@ -786,17 +630,9 @@ impl Notifier {
     }
 
     pub fn notice(&self, bot: &Bot, approvals: &[Approval], detail: Detail) -> Notice {
-        let items: Vec<Item> = approvals
-            .iter()
-            .take(MAX_ITEMS)
-            .map(|a| self.item(a, &bot.owner_id, detail))
-            .collect();
+        let items: Vec<Item> = approvals.iter().take(MAX_ITEMS).map(|a| self.item(a, &bot.owner_id, detail)).collect();
         Notice {
-            kind: if approvals.len() == 1 {
-                NoticeKind::Approval
-            } else {
-                NoticeKind::Digest
-            },
+            kind: if approvals.len() == 1 { NoticeKind::Approval } else { NoticeKind::Digest },
             bot_id: bot.id.clone(),
             bot_name: clip(&bot.name),
             items,
@@ -808,9 +644,7 @@ impl Notifier {
     /// the throttle holds it for a digest. Returns at once.
     pub fn requested(self: &Arc<Self>, app: &Arc<App>, a: &Approval) {
         let s = load(&app.db);
-        let Some(bot) = app.db.bot(&a.bot_id) else {
-            return;
-        };
+        let Some(bot) = app.db.bot(&a.bot_id) else { return };
         if self.plan(&app.db, Some(&bot), &s).is_empty() {
             return;
         }
@@ -825,22 +659,12 @@ impl Notifier {
             }
             let window = Duration::from_secs(load(&app.db).throttle_seconds as u64);
             let now = Instant::now();
-            let offer = me.throttle.lock().unwrap_or_else(|e| e.into_inner()).offer(
-                &bot.id,
-                &id,
-                window,
-                now + half_left(expires_at),
-                now,
-            );
+            let offer = me.throttle.lock().unwrap_or_else(|e| e.into_inner()).offer(&bot.id, &id, window, now + half_left(expires_at), now);
             match offer {
                 Offer::Now => me.send_pending(&app, &bot.id, &[id]).await,
                 Offer::Held(Some(wait)) => {
                     tokio::time::sleep(wait).await;
-                    let ids = me
-                        .throttle
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .take(&bot.id, Instant::now());
+                    let ids = me.throttle.lock().unwrap_or_else(|e| e.into_inner()).take(&bot.id, Instant::now());
                     me.send_pending(&app, &bot.id, &ids).await;
                 }
                 Offer::Held(None) | Offer::Duplicate => {}
@@ -850,14 +674,8 @@ impl Notifier {
 
     /// Sends the approvals among `ids` still pending, as one notice.
     async fn send_pending(&self, app: &App, bot_id: &str, ids: &[String]) {
-        let waiting: Vec<Approval> = ids
-            .iter()
-            .filter_map(|id| app.db.approval(id))
-            .filter(|a| a.status == "pending")
-            .collect();
-        let Some(bot) = app.db.bot(bot_id) else {
-            return;
-        };
+        let waiting: Vec<Approval> = ids.iter().filter_map(|id| app.db.approval(id)).filter(|a| a.status == "pending").collect();
+        let Some(bot) = app.db.bot(bot_id) else { return };
         if waiting.is_empty() {
             return;
         }
@@ -880,13 +698,7 @@ impl Notifier {
                 None => "Nothing would reach anyone: turn on email with an address, or set a webhook, first".into(),
             });
         }
-        let n = Notice {
-            kind: NoticeKind::Test,
-            bot_id: bot.map(|b| b.id.clone()).unwrap_or_default(),
-            bot_name: bot.map(|b| clip(&b.name)).unwrap_or_default(),
-            items: Vec::new(),
-            more: 0,
-        };
+        let n = Notice { kind: NoticeKind::Test, bot_id: bot.map(|b| b.id.clone()).unwrap_or_default(), bot_name: bot.map(|b| clip(&b.name)).unwrap_or_default(), items: Vec::new(), more: 0 };
         Ok(self.deliver(app, &n, &plan, true).await)
     }
 
@@ -894,10 +706,7 @@ impl Notifier {
         let mut out = Vec::new();
         let ids: Vec<&str> = n.items.iter().map(|i| i.approval_id.as_str()).collect();
         // Channels go out together, so a slow mail server can't hold a webhook past the deadline.
-        let results = futures_util::future::join_all(
-            self.channels.iter().map(|ch| ch.send(n, plan, &self.links)),
-        )
-        .await;
+        let results = futures_util::future::join_all(self.channels.iter().map(|ch| ch.send(n, plan, &self.links))).await;
         for (ch, r) in self.channels.iter().zip(results) {
             let Some(r) = r else { continue };
             let (ok, mut d) = match r {
@@ -918,19 +727,7 @@ impl Notifier {
             if test {
                 d["test"] = json!(true);
             }
-            let mut e = Event::new(
-                Actor::system("notifications"),
-                if ok {
-                    "notification.sent"
-                } else {
-                    "notification.failed"
-                },
-            )
-            .outcome(if ok {
-                Outcome::Success
-            } else {
-                Outcome::Failure
-            });
+            let mut e = Event::new(Actor::system("notifications"), if ok { "notification.sent" } else { "notification.failed" }).outcome(if ok { Outcome::Success } else { Outcome::Failure });
             e = match (ids.as_slice(), n.bot_id.as_str()) {
                 ([one], _) => e.target("approval", one),
                 (_, "") => e.target("notifications", "global"),
@@ -940,11 +737,7 @@ impl Notifier {
                 e = e.bot(&n.bot_id);
             }
             if !ok {
-                eprintln!(
-                    "Notification by {} failed: {}",
-                    ch.name(),
-                    d["error"].as_str().unwrap_or("see the audit log")
-                );
+                eprintln!("Notification by {} failed: {}", ch.name(), d["error"].as_str().unwrap_or("see the audit log"));
             }
             out.push(json!({ "channel": ch.name(), "ok": ok, "delivered": d["delivered"], "error": d["error"] }));
             app.db.record(&e.details(d));
