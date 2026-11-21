@@ -1,0 +1,138 @@
+# SOC 2 control mapping
+
+How SuperBot, as the code works on `main` today, lines up with the AICPA 2017 Trust Services Criteria (revised points of focus, 2022): the Security common criteria (CC1 to CC9), Availability (A1) and Confidentiality (C1). Part of the [security pack](README.md) and [#41](https://github.com/CG-Labs/superbot/issues/41).
+
+**SuperBot is not SOC 2 certified, and no SOC 2 audit has started.** This page is a self-assessment, not an auditor's opinion. It is the starting point for the SOC 2 readiness checklist (M4) and Type II (M5) on the [roadmap](../ROADMAP.md#compliance-path-not-promises). Every **Gap** below is open work.
+
+## How to read it
+
+Each criterion gets one or more of these statuses:
+
+| Status | Meaning |
+|--------|---------|
+| **Product** | SuperBot's code does it, and the linked code, ADR or CI job shows how. Some product controls are off until the operator turns them on; the row says so. |
+| **Operator** | Whoever runs the SuperBot server must do it. When a customer self-hosts, that is the customer. On the managed service, it is the managed provider. |
+| **Customer** | The customer organisation must do it, however SuperBot is run (for example, deciding who gets access, or enforcing MFA at its IdP). |
+| **Gap** | Nothing in the product or in this repository does it today. It must be built or written before an audit. |
+
+Where self-host and managed differ, the row names each. For self-host, every **Operator** duty is the customer's. For managed, organisation-level controls (policies, people, vendors, incident response) belong to the managed provider; this public repository holds no evidence of them, so they are listed as **Gap** until they are documented.
+
+Links go to the ADR (design record), code or CI workflow that is the evidence. The other pages of the pack give more detail: [architecture](architecture.md), [data flows](data-flows.md), [access control and isolation](access-control.md), [subprocessors](subprocessors.md), [machine recovery objectives](machine-recovery-objectives.md).
+
+## CC1: Control environment
+
+| Criterion | Status | What is in place | Gaps |
+|-----------|--------|------------------|------|
+| CC1.1 Commitment to integrity and ethical values | Gap | The code and every design decision are public ([ADRs](../adr/)), under the MIT licence. Contributor rules in [`AGENTS.md`](../../AGENTS.md) forbid committing secrets or private details. | No code of conduct, ethics policy, or personnel acknowledgement. |
+| CC1.2 Board independence and oversight | Gap | None. | No documented governance body overseeing security. |
+| CC1.3 Structure, reporting lines, authorities | Product; Gap | For the customer's own organisation, the product has roles (`admin`, `member`, `readonly`) ([ADR 0012](../adr/0012-users-sessions-rbac.md)) and team roles (`owner`, `admin`, `member`) ([ADR 0087](../adr/0087-team-accounts-and-machines.md)). | For the service organisation: no documented security owner, org chart or responsibilities. |
+| CC1.4 Commitment to competence | Gap | None. | No hiring, background-check or security-training records. |
+| CC1.5 Accountability | Product; Gap | Every audited action names its actor: user, Bot or system, with email, role, sign-in method, session, and who a Bot acted for ([ADR 0019](../adr/0019-audit-actors.md), [`server/src/audit.rs`](../../server/src/audit.rs)). | No performance or disciplinary measures tied to security responsibilities. |
+
+## CC2: Communication and information
+
+| Criterion | Status | What is in place | Gaps |
+|-----------|--------|------------------|------|
+| CC2.1 Relevant, quality information | Product; Gap | An append-only audit log ([access control](access-control.md#audit-log)); machine state, enrollment and heartbeats; RPO and restore records ([ADR 0074](../adr/0074-machine-rpo-and-rto.md)); per-user usage against plan limits ([ADR 0050](../adr/0050-billing-period-token-usage.md)). | No metrics, error reporting or uptime checks (M4). No export of events to a SIEM (M5). |
+| CC2.2 Internal communication | Product; Gap | ADRs record each significant decision and its trade-offs ([`docs/adr/`](../adr/)); this pack must change in the same PR as the code it describes ([pack rules](README.md#keeping-it-accurate)). | No security policies communicated to personnel, and no security-awareness training. |
+| CC2.3 External communication | Product; Gap | This pack, the public code and ADRs, the [subprocessor list](subprocessors.md), and contract text for [machine recovery objectives](machine-recovery-objectives.md). | No vulnerability-disclosure policy or security contact (`SECURITY.md`). No published privacy policy, DPA or terms (M4). No status page (M4). No commitment on telling customers about incidents. |
+
+## CC3: Risk assessment
+
+| Criterion | Status | What is in place | Gaps |
+|-----------|--------|------------------|------|
+| CC3.1 Objectives specified | Product; Gap | The [roadmap](../ROADMAP.md) states goals, scope and exit criteria per milestone; this pack states the security properties the product keeps. | No documented security objectives that a risk assessment is measured against. |
+| CC3.2 Risks identified and analysed | Product; Gap | A risks table in the [roadmap](../ROADMAP.md#risks--open-questions); an internal authentication and authorization review with rated findings and fixes ([auth review](auth-review-2026-11.md), [SCIM review](auth-review-2026-11-scim.md), [ADR 0024](../adr/0024-auth-review-hardening.md), [ADR 0026](../adr/0026-scim-review-hardening.md)); threat trade-offs in each ADR. | No periodic, documented risk assessment or risk register with owners. No external penetration test yet (planned before M3 general availability). |
+| CC3.3 Fraud risk | Product; Gap | Stripe webhooks are signature-checked within a 5-minute window, and a Stripe customer is linked to a user by a completed checkout, never by email ([ADR 0042](../adr/0042-billing-checkout-portal-customers.md), [`server/src/stripe.rs`](../../server/src/stripe.rs)). Bots can't approve their own actions ([ADR 0007](../adr/0007-approvals.md)). Public signups wait for an admin and can sit behind Cloudflare Turnstile ([ADR 0022](../adr/0022-landing-and-signups.md), [`server/src/signups.rs`](../../server/src/signups.rs)). Plan changes are audited. | No fraud risk assessment. |
+| CC3.4 Changes that affect controls | Product; Gap | Significant changes get an ADR before or with the code; the pack is updated in the same PR ([pack rules](README.md#keeping-it-accurate)). | Informal: no scheduled review of how business or technology changes affect controls. |
+
+## CC4: Monitoring activities
+
+| Criterion | Status | What is in place | Gaps |
+|-----------|--------|------------------|------|
+| CC4.1 Ongoing and separate evaluations | Product; Gap | CI runs on each change to the code it covers, and the end-to-end suites also run weekly: unit and HTTP-route tests, including a walk of every route for the right role ([`server.yml`](../../.github/workflows/server.yml)); isolation tests as root ([`deploy/test-isolation.sh`](../../deploy/test-isolation.sh)); approvals through each real harness CLI ([`harness-e2e.yml`](../../.github/workflows/harness-e2e.yml)); containers, backups and host loss on a real Incus host ([`incus-e2e.yml`](../../.github/workflows/incus-e2e.yml)); backup and restore drills. Machines are checked against their RPO every minute ([`server/src/machines/recovery.rs`](../../server/src/machines/recovery.rs)). | No independent evaluation: no internal audit function and no external assessment yet. |
+| CC4.2 Deficiencies communicated and fixed | Product; Operator; Gap | Defects and review findings are tracked as GitHub issues and fixed in PRs (for example AUTH findings, [ADR 0024](../adr/0024-auth-review-hardening.md)). RPO breaches, restores past their RTO, failed restores and Incus hosts not answering alert the operator by email or webhook ([`server/src/machines/hosts.rs`](../../server/src/machines/hosts.rs), [`server/src/notify/mod.rs`](../../server/src/notify/mod.rs)). The operator must turn an alert channel on; without one, alerts are only in the audit log. | No formal process for reporting deficiencies to management with deadlines. |
+
+## CC5: Control activities
+
+| Criterion | Status | What is in place | Gaps |
+|-----------|--------|------------------|------|
+| CC5.1 Control activities chosen to reduce risk | Product; Operator | Safe defaults: risky tool calls wait for approval and are refused if the check can't be made ([ADR 0007](../adr/0007-approvals.md)); per-user Unix accounts are on for new installs ([ADR 0058](../adr/0058-harness-os-user-by-default.md)); harness sandboxes on for Claude Code and Codex ([ADR 0055](../adr/0055-harness-sandbox-defaults.md)); an API route not listed needs admin ([`server/src/rbac.rs`](../../server/src/rbac.rs)). The operator must turn on several protections that are off by default: `MACHINE_FIREWALL` (Linode), `MACHINE_BOT_USER`, `MACHINE_TEAMMATE_USERS`, `TEAMS`, backup encryption. | No documented hardened configuration baseline for the managed service. |
+| CC5.2 General controls over technology | Product; Gap | Pinned dependencies (`Cargo.lock`, `package-lock.json`); harness CLIs and the machine agent checked by SHA-256 before install or upgrade ([ADR 0039](../adr/0039-machine-harnesses-and-agent-upgrades.md), [`server/src/machines/tools.rs`](../../server/src/machines/tools.rs), [`server/src/machines/upgrade.rs`](../../server/src/machines/upgrade.rs)); Hermes Agent pinned to a stable release's commit and checked against upstream in CI ([ADR 0075](../adr/0075-hermes-upgrades.md), [`deploy/hermes-pin.sh`](../../deploy/hermes-pin.sh)); ShellCheck, client type checks and lint in CI. | GitHub Actions are pinned by tag, not commit. No dependency vulnerability scanning. Container images are not signed and carry no provenance ([ADR 0084](../adr/0084-published-image-with-computer-use.md)). |
+| CC5.3 Policies and procedures | Product; Gap | Operator guides: [install](../../deploy/README.md), [backup and restore](../ops/backup-restore.md), [Incus containers](../ops/incus-containers.md), [machine recovery](../ops/machine-recovery.md), and an [IdP guide](../sso/) per provider. | No written information security policy set: access control, change management, incident response, vendor management, data classification and retention, acceptable use. |
+
+## CC6: Logical and physical access
+
+| Criterion | Status | What is in place | Gaps |
+|-----------|--------|------------------|------|
+| CC6.1 Logical access security | Product; Operator; Gap | Sessions are random 256-bit tokens stored only as SHA-256 hashes, in `__Host-` HttpOnly, Secure, SameSite=Strict cookies ([ADR 0012](../adr/0012-users-sessions-rbac.md), [`server/src/users.rs`](../../server/src/users.rs)). Every route is classified by role ([`server/src/rbac.rs`](../../server/src/rbac.rs)); Bots are private or shared by grant ([ADR 0017](../adr/0017-bot-acls.md)); sharing stops at a team ([ADR 0087](../adr/0087-team-accounts-and-machines.md)). Each Bot run gets its own token, revoked when the run ends ([ADR 0083](../adr/0083-per-run-tokens.md)). Secrets are sealed with XChaCha20-Poly1305 under a master key kept outside the data folder ([ADR 0010](../adr/0010-secrets.md), [`server/src/secrets/sealed.rs`](../../server/src/secrets/sealed.rs), [`server/src/secrets/key.rs`](../../server/src/secrets/key.rs)). Machines use mutual TLS with botd's own CA ([ADR 0031](../adr/0031-machine-enrollment-mtls.md), [`server/src/machines/pki.rs`](../../server/src/machines/pki.rs)). The operator protects the master key and the host. | No multi-factor authentication in SuperBot: customers must enforce it at their IdP. No way to rotate the master key. No external secret vault (M5). |
+| CC6.2 Registration and authorization before access | Product; Customer | Accounts come only from an admin (direct, or approving a signup request, which issues a one-time sign-in code), SCIM provisioning, a team invite that expires after 7 days, or SSO just-in-time accounts. Just-in-time accounts are off unless `SSO_<name>_JIT_ROLE` is set; Google, Apple and GitHub refuse them without a list of allowed domains or organizations, while for other OIDC providers and SAML that list is optional ([ADR 0022](../adr/0022-landing-and-signups.md), [ADR 0023](../adr/0023-scim.md), [ADR 0087](../adr/0087-team-accounts-and-machines.md), [`server/src/sso/mod.rs`](../../server/src/sso/mod.rs)). The customer decides who is given access, and runs its IdP. | An operator can turn on just-in-time accounts for a generic OIDC or SAML provider with no domain list, admitting anyone the IdP signs in. |
+| CC6.3 Role-based access, least privilege, removal | Product; Customer; Gap | Roles and Bot grants (`viewer`, `operator`); a Bot can do no more than its owner ([ADR 0029](../adr/0029-per-user-isolation.md)); team admins manage members' machines but not their data ([ADR 0087](../adr/0087-team-accounts-and-machines.md)). Disabling a user or SCIM deprovisioning ends their sessions at once ([ADR 0023](../adr/0023-scim.md)); admins can end any user's sessions. A teammate who loses access loses their OS user and files on the owner's machine or server ([ADR 0052](../adr/0052-teammate-offboarding-on-machines.md), [ADR 0066](../adr/0066-removing-teammate-accounts-on-one-server.md)). The customer assigns roles and reviews access. | No access-review report or workflow. No custom roles or service accounts (M5). |
+| CC6.4 Physical access | Operator; Gap | Not a product control. Self-host: the customer's data centre or host. Managed: inherited from the hosting provider (Linode/Akamai, or wherever the operator runs Incus hosts) ([subprocessors](subprocessors.md)). | Managed: no documented review of the hosting provider's own assurance reports. |
+| CC6.5 Disposal of assets | Product; Operator; Gap | Destroying a machine revokes its certificates ([ADR 0031](../adr/0031-machine-enrollment-mtls.md)); a machine a team gave a leaver is destroyed after `TEAM_MACHINE_DAYS` ([ADR 0087](../adr/0087-team-accounts-and-machines.md)); machine backups are deleted after their retention ([ADR 0071](../adr/0071-off-host-machine-backups.md)); teammates' work is archived or deleted after a grace period ([ADR 0052](../adr/0052-teammate-offboarding-on-machines.md)). Wiping disks is the hosting provider's. | Users are disabled, never deleted: no erasure for managed users (M4). A destroyed machine's backups stay until their retention ends. |
+| CC6.6 Protection against threats from outside the boundary | Product; Operator | Only Caddy is public; botd is on loopback or an unpublished container network ([architecture](architecture.md#components)). Caddy sends a Content-Security-Policy ([`deploy/docker/Caddyfile`](../../deploy/docker/Caddyfile)). Sign-in failures are limited to 10 per 10 minutes per IP; writes without a bearer token must come from botd's own origin ([auth review](auth-review-2026-11.md)). Incus containers can't reach each other, the host or private ranges ([ADR 0065](../adr/0065-incus-container-machines.md)). The Linode firewall needs `MACHINE_FIREWALL=on`, off by default; without it a new Linode is open to the internet and only mutual TLS guards the agent port ([ADR 0035](../adr/0035-machine-firewall-auto-enroll.md)). The operator runs the host firewall and OS patching. | No intrusion detection or WAF in the product. |
+| CC6.7 Data in transit | Product; Operator; Gap | HTTPS to the server; mutual TLS 1.3 to machines; Incus host certificate pinned; webhook and S3 URLs must be HTTPS; SMTP uses STARTTLS or TLS ([encryption in transit](data-flows.md#in-transit)). Backups are encrypted with age when the operator sets recipients ([ADR 0030](../adr/0030-backup-restore-drill.md), [ADR 0071](../adr/0071-off-host-machine-backups.md)). | A model provider in the tiers file may be plain `http://`, which sends prompts and keys unencrypted. Backups are plain unless the operator sets age recipients. |
+| CC6.8 Unauthorized or malicious software | Product; Gap | Risky tool calls wait for a person, scripts are read like the command line that runs them, and a canary checks every hooked tool ([ADR 0007](../adr/0007-approvals.md), [ADR 0053](../adr/0053-smarter-command-analysis.md), [ADR 0063](../adr/0063-canary-covers-every-hooked-tool.md)). Runs are confined to their user's Unix account or machine ([access control](access-control.md#isolation-between-users)). Harness CLIs and the agent are SHA-256-checked (CC5.2). | No malware scanning or endpoint detection on the server or machines. No egress allowlists for runs (M5). Chromium's sandbox is off inside the container ([ADR 0084](../adr/0084-published-image-with-computer-use.md)). |
+
+## CC7: System operations
+
+| Criterion | Status | What is in place | Gaps |
+|-----------|--------|------------------|------|
+| CC7.1 Detecting configuration changes and vulnerabilities | Product; Gap | The reconciler puts machines' firewalls and Incus network ACLs back as they should be ([ADR 0035](../adr/0035-machine-firewall-auto-enroll.md), [ADR 0065](../adr/0065-incus-container-machines.md)); botd checks the Incus project is restricted before every create. Images are rebuilt weekly without cache for Debian's security fixes ([`docker.yml`](../../.github/workflows/docker.yml)), and CI warns weekly when a newer Hermes Agent release is out ([ADR 0075](../adr/0075-hermes-upgrades.md)). | No dependency vulnerability scanning (no Dependabot, `cargo audit` or `npm audit` in CI). No container image scanning. No vulnerability-disclosure channel. |
+| CC7.2 Monitoring for anomalies | Product; Operator; Gap | The audit log records sign-ins and failures, denied access and refused runs ([ADR 0009](../adr/0009-audit-events.md)). Alerts by email or webhook for RPO breaches, restores past RTO, failed restores, hosts not answering and machines that can't be placed ([ADR 0074](../adr/0074-machine-rpo-and-rto.md), [ADR 0076](../adr/0076-restoring-onto-another-incus-host.md), [ADR 0081](../adr/0081-placing-machines-by-host-load.md)). The operator turns the channels on and watches them. | No SIEM export (M5) or metrics (M4). No alerting on suspicious sign-in patterns. The audit log isn't shipped off the server or tamper-evident (M5). |
+| CC7.3 Evaluating security events | Operator; Gap | Not a product control. | No documented triage process or incident classification. |
+| CC7.4 Responding to incidents | Product; Operator; Gap | Tools to contain an incident: disable a user or end their sessions; revoke a machine's certificates; suspend a machine; delete secrets; SCIM deprovisioning ([`server/src/rbac.rs`](../../server/src/rbac.rs) lists the admin routes). Run tokens die with their run ([ADR 0083](../adr/0083-per-run-tokens.md)). | No incident response plan, roles or runbooks. No breach-notification commitment (GDPR work is M4). |
+| CC7.5 Recovering from incidents | Product; Operator; Gap | Server backup and restore tools, drilled in CI ([ADR 0030](../adr/0030-backup-restore-drill.md), [`deploy/superbot-backup.sh`](../../deploy/superbot-backup.sh), [`deploy/backup-drill.sh`](../../deploy/backup-drill.sh)); machine restore and lost-host recovery ([ADR 0071](../adr/0071-off-host-machine-backups.md), [ADR 0076](../adr/0076-restoring-onto-another-incus-host.md)). The operator copies server backups off the host and starts restores. | No post-incident review process. |
+
+## CC8: Change management
+
+| Criterion | Status | What is in place | Gaps |
+|-----------|--------|------------------|------|
+| CC8.1 Changes authorized, tested, approved, and put in place | Product; Operator; Gap | Changes reach `main` through pull requests that run CI ([`.github/workflows/`](../../.github/workflows/)); design changes get an ADR. Releases are built by CI and tagged by commit (`sha-<commit>`) and semver ([ADR 0084](../adr/0084-published-image-with-computer-use.md)). Machine agents upgrade only to botd's build, SHA-256-checked, and are put back if botd can't reach the new one ([ADR 0039](../adr/0039-machine-harnesses-and-agent-upgrades.md)). Moving Bots to a new default harness starts with a dry run ([ADR 0079](../adr/0079-hermes-default-for-managed-tiers.md)). Self-hosters choose when to upgrade (`SUPERBOT_VERSION`). | Branch protection and required reviews are GitHub settings, not shown by this repository. No written change-management policy, segregation of duties or emergency-change process. No changelog or release notes. |
+
+## CC9: Risk mitigation
+
+| Criterion | Status | What is in place | Gaps |
+|-----------|--------|------------------|------|
+| CC9.1 Business disruption | Product; Operator; Gap | Backups, restores and recovery objectives (A1.2, A1.3). Managed machines can spread across several Incus hosts ([ADR 0076](../adr/0076-restoring-onto-another-incus-host.md), [ADR 0081](../adr/0081-placing-machines-by-host-load.md)). | botd is one process with one SQLite database: no high-availability control plane (RTO target 1 hour). No business continuity plan. |
+| CC9.2 Vendors and business partners | Product; Operator; Gap | Every outside service the code can call, what it receives, and the setting that turns it on, each off by default ([subprocessors](subprocessors.md)). SuperBot sends nothing to CG-Labs. | No vendor risk-assessment process, and no review of vendors' assurance reports. No published subprocessor list or DPA for the managed service (M4). |
+
+## A1: Availability
+
+| Criterion | Status | What is in place | Gaps |
+|-----------|--------|------------------|------|
+| A1.1 Capacity | Product; Operator; Gap | Per-plan limits on Bots, runs, routine runs, tokens and storage ([ADR 0040](../adr/0040-billing-v0-tier-limits.md), [ADR 0050](../adr/0050-billing-period-token-usage.md), [ADR 0082](../adr/0082-storage-limits-per-tier.md)); a cap on concurrent runs per machine and per server, with a fair queue ([ADR 0073](../adr/0073-concurrent-runs-per-machine.md), [`server/src/slots.rs`](../../server/src/slots.rs)); machines placed by Incus host capacity, refused and alerted when there's no room ([ADR 0081](../adr/0081-placing-machines-by-host-load.md), [`server/src/machines/placement.rs`](../../server/src/machines/placement.rs)). The operator sizes hosts and sets capacity. | No capacity metrics or dashboards (M4). Machines' own disks aren't measured. No uptime SLO yet (M4). |
+| A1.2 Environmental protections, backups and recovery infrastructure | Product; Operator | Daily server backups (systemd timer or Compose sidecar), optional age encryption, 14-day retention ([ADR 0030](../adr/0030-backup-restore-drill.md)). Off-host Incus machine backups per plan, with RPO checked every minute ([ADR 0071](../adr/0071-off-host-machine-backups.md), [ADR 0074](../adr/0074-machine-rpo-and-rto.md), [machine recovery objectives](machine-recovery-objectives.md)). Data-centre environmental protections are the hosting provider's. Self-host: the customer copies server backups off the host. Managed: the operator sets `MACHINE_BACKUP_S3_BUCKET` and age recipients. | Server backups stay on the host unless the operator copies them off. Linode machines rely on Linode Backups, which the recovery objectives don't cover. |
+| A1.3 Recovery testing | Product; Operator; Gap | CI restores server backups onto a fresh host (installer and Compose) within a 5-minute budget ([`server.yml`](../../.github/workflows/server.yml)); CI restores Incus containers and a lost host's containers on a real Incus host, on changes to the machine code and weekly ([`incus-e2e.yml`](../../.github/workflows/incus-e2e.yml), [ADR 0069](../adr/0069-validating-incus-containers-on-a-real-host.md)). A manual drill script for the operator's own hosts ([`deploy/machine-restore-drill.sh`](../../deploy/machine-restore-drill.sh)). | The manual host-loss drill on production hardware hasn't been run ([#29](https://github.com/CG-Labs/superbot/issues/29)). CI uses small machines, so full-size restore times are unproven. |
+
+## C1: Confidentiality
+
+| Criterion | Status | What is in place | Gaps |
+|-----------|--------|------------------|------|
+| C1.1 Identifying and protecting confidential information | Product; Operator; Customer; Gap | Secrets, approval inputs and push tokens are sealed; secret values are never returned by the API ([ADR 0010](../adr/0010-secrets.md), [ADR 0044](../adr/0044-client-personal-secrets.md)). Known secret values are redacted before text is saved, sent to clients or audited ([`server/src/secrets/redact.rs`](../../server/src/secrets/redact.rs)). Each user's files are behind their own Unix account or machine, and sharing stops at a team ([access control](access-control.md#isolation-between-users), [ADR 0087](../adr/0087-team-accounts-and-machines.md)). botd's own secrets never reach a run; a provider key reaches only runs routed to it ([data flows](data-flows.md#model-providers-through-tier-routing)). The operator encrypts the host's disk. The customer decides what its people put in chats and files, which the harness sends to the model provider. | Chat history and the rest of the database aren't encrypted by SuperBot ([encryption at rest](data-flows.md#at-rest)). No data-classification scheme. |
+| C1.2 Disposing of confidential information | Product; Operator; Gap | Retention settings for the audit log (`AUDIT_RETENTION_DAYS`) and backups; sessions expire; teammates' files and released team machines are deleted after set periods ([retention](data-flows.md#retention)). | No erasure of a user's data (M4). Chat history has no retention setting. |
+
+## Gaps for the SOC 2 readiness checklist (M4)
+
+Collected from the tables above. Product gaps:
+
+1. Multi-factor authentication in SuperBot, or a documented requirement to use IdP MFA (CC6.1).
+2. Master key rotation (CC6.1).
+3. An access-review report for admins (CC6.3).
+4. Erasure of a user's data, and a retention setting for chat history (CC6.5, C1.2).
+5. Dependency and container image vulnerability scanning in CI; GitHub Actions pinned by commit; signed images with provenance (CC5.2, CC7.1).
+6. Metrics, uptime checks and an SLO (CC2.1, A1.1, M4); SIEM export and a tamper-evident audit log (CC7.2, M5).
+7. Egress allowlists for runs (CC6.8, M5).
+8. Machines' disk use measured (A1.1).
+9. The manual host-loss drill on production hardware (A1.3, [#29](https://github.com/CG-Labs/superbot/issues/29)); an external penetration test (CC3.2).
+
+Organisation gaps, for the managed provider (and for self-hosters' own audits):
+
+1. Governance: a security owner, management oversight, code of conduct, hiring and training records (CC1).
+2. A written policy set: information security, access control, change management, incident response, vendor management, data classification and retention, business continuity (CC5.3).
+3. A periodic risk assessment and register (CC3).
+4. A vulnerability-disclosure policy and security contact (CC2.3, CC7.1).
+5. Incident response: triage, runbooks, post-incident reviews, customer and breach notification (CC7.3 to CC7.5).
+6. Change management evidence: branch protection, required reviews and release notes (CC8.1).
+7. Vendor management: reviewing the hosting, storage and model providers' assurance reports (CC6.4, CC9.2).
+8. A privacy policy, DPA and published subprocessor list (CC2.3, CC9.2, M4).
