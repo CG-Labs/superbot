@@ -172,11 +172,12 @@ pub fn pass(key: String) {
     PASSED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default().insert(key, Instant::now());
 }
 
-/// `bin` as a run here would find it on `path`: the file it resolves to, so that
-/// replacing it (an update) changes the cache key.
-pub fn resolve(bin: &str, path: &str) -> Option<PathBuf> {
+/// `bin` as a run here starting in `cwd` would find it on `path`: relative entries,
+/// and empty ones (the current folder), are from `cwd`. The file it resolves to, so
+/// that replacing it (an update) changes the cache key.
+pub fn resolve(bin: &str, path: &str, cwd: &Path) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
-    path.split(':').filter(|d| !d.is_empty()).map(|d| Path::new(d).join(bin)).find_map(|p| {
+    path.split(':').map(|d| cwd.join(d).join(bin)).find_map(|p| {
         let real = p.canonicalize().ok()?;
         let m = real.metadata().ok()?;
         (m.is_file() && m.permissions().mode() & 0o111 != 0).then_some(real)
@@ -190,10 +191,10 @@ pub fn key_here(bin: &str, real: &Path) -> String {
     format!("here:{bin}:{}:{}:{}", real.display(), m.map_or(0, |m| m.len()), changed.map_or(0, |d| d.as_nanos()))
 }
 
-/// `<real> --version` on this server, without botd's secrets: its stdout, or why not.
-pub async fn read_here(real: &Path, path: &str) -> Result<String, String> {
+/// `<real> --version` on this server, in `cwd`, without botd's secrets: its stdout, or why not.
+pub async fn read_here(real: &Path, path: &str, cwd: &Path) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new(real);
-    cmd.arg("--version").env("PATH", path).stdin(std::process::Stdio::null()).kill_on_drop(true);
+    cmd.arg("--version").env("PATH", path).current_dir(cwd).stdin(std::process::Stdio::null()).kill_on_drop(true);
     for k in super::secret_env() {
         cmd.env_remove(k);
     }
@@ -307,10 +308,18 @@ mod tests {
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         };
         let path = format!("/nonexistent:{}:/usr/bin:/bin", dir.display());
-        assert_eq!(resolve("codex", "/nonexistent:/also-not"), None);
+        let elsewhere = Path::new("/").to_path_buf();
+        assert_eq!(resolve("codex", "/nonexistent:/also-not", &elsewhere), None);
         write("echo 'codex-cli 0.140.0'");
-        let real = resolve("codex", &path).unwrap();
-        assert_eq!(read_here(&real, &path).await.as_deref(), Ok("codex-cli 0.140.0\n"));
+        let real = resolve("codex", &path, &elsewhere).unwrap();
+        assert_eq!(read_here(&real, &path, &elsewhere).await.as_deref(), Ok("codex-cli 0.140.0\n"));
+        // Relative and empty entries are from the run's folder, as its harness finds them.
+        let parent = dir.parent().unwrap();
+        let name = dir.file_name().unwrap().to_str().unwrap();
+        for (p, from) in [(format!("{name}:/usr/bin"), parent), (":/usr/bin".into(), dir.as_path()), (format!("./{name}"), parent)] {
+            assert_eq!(resolve("codex", &p, from).as_ref(), Some(&real), "{p:?} from {}", from.display());
+        }
+        assert_eq!(resolve("codex", name, &elsewhere), None, "not from botd's folder");
         let key = key_here("codex", &real);
         assert!(!passed(&key));
         pass(key.clone());
@@ -318,10 +327,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         write("echo 'boom' >&2; exit 3");
         assert_ne!(key_here("codex", &real), key, "an update is a new key");
-        let err = read_here(&real, &path).await.unwrap_err();
+        let err = read_here(&real, &path, &elsewhere).await.unwrap_err();
         assert!(err.contains("exit status: 3") && err.ends_with("boom"), "{err}");
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(resolve("codex", &path), None, "not executable");
+        assert_eq!(resolve("codex", &path, &elsewhere), None, "not executable");
     }
 
     #[tokio::test]

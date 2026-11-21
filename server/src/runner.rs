@@ -133,6 +133,9 @@ struct BotState {
     queue: VecDeque<Message>,
     draining: bool,
     run: Option<Run>,
+    /// Stopped while the message it took was still starting (being placed, or its
+    /// harness checked), before it had a `run` to abort.
+    stopped: bool,
 }
 
 pub struct App {
@@ -605,7 +608,10 @@ impl App {
             // Pop and "queue is empty, stop draining" happen under one lock, so nothing is dropped.
             let next = {
                 let mut st = self.state();
-                let m = st.get_mut(&bot_id).and_then(|s| s.queue.pop_front());
+                let m = st.get_mut(&bot_id).and_then(|s| {
+                    s.stopped = false;
+                    s.queue.pop_front()
+                });
                 if m.is_none() {
                     st.remove(&bot_id);
                 }
@@ -740,16 +746,29 @@ impl App {
             let guard = (policy.mode == Mode::Ask).then(|| guard(&spot.botctl, &bot.harness, policy.timeout_minutes));
             let (sandbox, sandboxed) = spot.sandbox(policy.sandbox, has_sandbox, sandbox_needs);
             let hooks = Arc::new(AtomicU32::new(0));
-            self.state().entry(bot.id.clone()).or_default().run = Some(Run {
-                id: run_id.clone(),
-                grants: std::mem::take(&mut grants),
-                abort: abort_tx.clone(),
-                status: "Thinking".into(),
-                draft: String::new(),
-                hooks: hooks.clone(),
-                hook_wait: guard.as_ref().map(|g| g.wait),
-                ctx: spot.ctx.clone(),
-            });
+            {
+                // Under the lock `stop_if` takes, so a stop lands here or on the run.
+                let mut st = self.state();
+                let s = st.entry(bot.id.clone()).or_default();
+                if std::mem::take(&mut s.stopped) {
+                    drop(st);
+                    if attempt == 0 {
+                        self.give_back(&bot, msg, &period.key);
+                    }
+                    self.say(&bot.id, "Stopped.", true);
+                    return;
+                }
+                s.run = Some(Run {
+                    id: run_id.clone(),
+                    grants: std::mem::take(&mut grants),
+                    abort: abort_tx.clone(),
+                    status: "Thinking".into(),
+                    draft: String::new(),
+                    hooks: hooks.clone(),
+                    hook_wait: guard.as_ref().map(|g| g.wait),
+                    ctx: spot.ctx.clone(),
+                });
+            }
             self.send(json!({ "type": "status", "botId": bot.id, "working": true, "status": "Thinking" }));
             let timeout = self.cfg.run_timeout;
             let timer = tokio::spawn({
@@ -1015,14 +1034,14 @@ impl App {
         let (key, said) = match &spot.machine {
             None => {
                 let path = spot.env.get("PATH").cloned().unwrap_or_default();
-                match version::resolve(bin, &path) {
+                match version::resolve(bin, &path, &spot.cwd) {
                     None => (None, Err(format!("{bin} isn't on this server's PATH"))),
                     Some(real) => {
                         let key = version::key_here(bin, &real);
                         if version::passed(&key) {
                             return false;
                         }
-                        (Some(key), version::read_here(&real, &path).await)
+                        (Some(key), version::read_here(&real, &path, &spot.cwd).await)
                     }
                 }
             }
@@ -1532,8 +1551,11 @@ impl App {
                         self.give_back_routine_to(o, &m);
                     }
                 }
-                if let Some(r) = &s.run {
-                    r.abort.send_if_modified(|v| v.get_or_insert("stopped") == &"stopped");
+                match &s.run {
+                    Some(r) => {
+                        r.abort.send_if_modified(|v| v.get_or_insert("stopped") == &"stopped");
+                    }
+                    None => s.stopped = true,
                 }
             }
         }

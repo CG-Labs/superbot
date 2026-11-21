@@ -105,10 +105,46 @@ async fn guarded_codex_runs_on_this_server_need_a_codex_that_runs_the_hook() {
 
     // No Codex at all: refused, not run.
     std::fs::remove_file(app.cfg.bin_dir.join("codex")).unwrap();
-    if adapters::version::resolve("codex", &std::env::var("PATH").unwrap_or_default()).is_none() {
+    if adapters::version::resolve("codex", &std::env::var("PATH").unwrap_or_default(), &app.cfg.workspace).is_none() {
         let said = run(port, &app, &admin, &bot.id).await;
         assert!(said.contains("codex isn't on this server's PATH"), "{said}");
     }
+}
+
+#[tokio::test]
+async fn a_task_stopped_while_its_harness_is_checked_never_starts() {
+    let (port, app, admin, _) = serve_app().await;
+    let bot = app.db.create_bot("Cody", "#fff", "waddle", "codex", None, true);
+    let args = fake_codex(&app, "codex-cli 0.171.0");
+    let asked = app.cfg.bin_dir.join("asked");
+    let script = std::fs::read_to_string(app.cfg.bin_dir.join("codex")).unwrap();
+    let slow = script.replacen("then echo", &format!("then touch '{}'; sleep 1; echo", asked.display()), 1);
+    std::fs::write(app.cfg.bin_dir.join("codex"), slow).unwrap();
+
+    let before = app.db.last_id();
+    assert_eq!(call(port, "POST", &format!("/api/bots/{}/messages", bot.id), &admin, r#"{"text":"tidy"}"#).await.0, 202);
+    for _ in 0..250 {
+        if asked.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(asked.exists(), "the check started");
+    assert_eq!(call(port, "POST", &format!("/api/bots/{}/stop", bot.id), &admin, "").await.0, 200);
+    let mut said = None;
+    for _ in 0..250 {
+        said = app.db.replies_after(&bot.id, before).into_iter().next().map(|m| m.text);
+        if said.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(said.as_deref(), Some("Stopped."));
+    assert!(!args.exists(), "Codex never got the task");
+    assert!(events(port, &admin, &format!("action=harness.invoked&bot={}", bot.id)).await.is_empty());
+
+    // The stop was for that task only: the next one runs.
+    assert_eq!(run(port, &app, &admin, &bot.id).await, "On it.");
 }
 
 #[tokio::test]
