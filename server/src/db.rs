@@ -1517,6 +1517,16 @@ pub struct StatusIncident {
     pub updates: Vec<StatusUpdate>,
 }
 
+pub struct NewStatusIncident<'a> {
+    pub id: &'a str,
+    pub title: &'a str,
+    pub impact: &'a str,
+    pub components: &'a [String],
+    pub state: &'a str,
+    pub body: &'a str,
+    pub by: Option<&'a str>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusUpdate {
@@ -5442,23 +5452,23 @@ impl Db {
         s.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().filter_map(Result::ok).collect()
     }
 
-    pub fn status_incident_create(&self, id: &str, title: &str, impact: &str, components: &[String], state: &str, body: &str, by: Option<&str>) -> StatusIncident {
+    pub fn status_incident_create(&self, n: &NewStatusIncident) -> StatusIncident {
         let at = now();
-        let resolved = (state == "resolved").then_some(at);
-        let comps = serde_json::to_string(components).unwrap_or_else(|_| "[]".into());
+        let resolved = (n.state == "resolved").then_some(at);
+        let comps = serde_json::to_string(n.components).unwrap_or_else(|_| "[]".into());
         let c = self.c();
         c.execute(
             "INSERT INTO status_incidents (id, title, impact, components, state, created_by, created_at, updated_at, resolved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)",
-            params![id, title, impact, comps, state, by, at, resolved],
+            params![n.id, n.title, n.impact, comps, n.state, n.by, at, resolved],
         )
         .unwrap();
         c.execute(
             "INSERT INTO status_incident_updates (incident_id, state, body, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
-            params![id, state, body, by, at],
+            params![n.id, n.state, n.body, n.by, at],
         )
         .unwrap();
         drop(c);
-        self.status_incident(id).expect("just made")
+        self.status_incident(n.id).expect("just made")
     }
 
     pub fn status_incident(&self, id: &str) -> Option<StatusIncident> {

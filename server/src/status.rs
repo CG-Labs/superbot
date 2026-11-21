@@ -8,7 +8,7 @@
 //! hostnames, errors, tenant data or tokens. `STATUS_PAGE=off` turns them off.
 
 use crate::audit::Who;
-use crate::db::{StatusIncident, now};
+use crate::db::{NewStatusIncident, StatusIncident, now};
 use crate::obs::metrics::{RECENT_MINUTES, Recent};
 use crate::runner::App;
 use crate::secrets::redact;
@@ -508,7 +508,7 @@ pub async fn create(State(app): State<AppState>, Extension(by): Extension<Who>, 
     let state = one_of(&v, "state", &STATES)?.unwrap_or_else(|| "investigating".into());
     let comps = components(&v)?.unwrap_or_default();
     let id = format!("inc_{}", crate::random_hex(6));
-    let i = app.db.status_incident_create(&id, &title, &impact, &comps, &state, &body, by.actor.id.as_deref());
+    let i = app.db.status_incident_create(&NewStatusIncident { id: &id, title: &title, impact: &impact, components: &comps, state: &state, body: &body, by: by.actor.id.as_deref() });
     app.db.record(&incident_event(&by, "status.incident_created", &i));
     app.status.invalidate();
     Ok((StatusCode::CREATED, Json(json!(i))))

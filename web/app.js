@@ -1254,9 +1254,97 @@ $("setup-body").addEventListener("submit", async (e) => {
   loadSetup();
 });
 
+// Status page (ADR 0090): incident notes shown at /status. Anyone can read them, so the
+// form says so; the server drops control characters and known secrets.
+
+const IMPACTS = { none: "None", minor: "Minor", major: "Major", critical: "Critical", maintenance: "Maintenance" };
+const INC_STATES = ["investigating", "identified", "monitoring", "resolved"];
+const stateOptions = (current) => INC_STATES.map((s) => `<option value="${s}" ${s === current ? "selected" : ""}>${s[0].toUpperCase()}${s.slice(1)}</option>`).join("");
+let incidents = { incidents: [], components: [], enabled: true };
+
+async function loadStatus() {
+  try {
+    incidents = await api("GET", "/api/status/incidents");
+    $("incidents-empty").textContent = "No incidents yet.";
+  } catch (err) {
+    incidents = { incidents: [], components: [], enabled: true };
+    $("incidents-empty").textContent = err.message;
+  }
+  renderStatus();
+}
+
+function componentName(id) {
+  return incidents.components.find((c) => c.id === id)?.name || id;
+}
+
+function renderStatus() {
+  $("status-note").innerHTML = incidents.enabled
+    ? 'The public status page is <a href="/status" target="_blank" rel="noopener">/status</a> (and <a href="/status.json" target="_blank" rel="noopener">/status.json</a>). It shows component health from botd\'s own checks, raised by open incidents on the components they name. Anyone can read what you post: no customer names, hostnames or internal details.'
+    : "The public status page is off (STATUS_PAGE=off). You can still prepare incidents; they show once it's on.";
+  const picked = new Set([...document.querySelectorAll("#inc-components input:checked")].map((i) => i.value));
+  $("inc-components").innerHTML = '<span class="sub">Affects:</span> ' + incidents.components
+    .map((c) => `<label><input type="checkbox" value="${esc(c.id)}" ${picked.has(c.id) ? "checked" : ""} /> ${esc(c.name)}</label>`).join("");
+  $("incidents-empty").hidden = incidents.incidents.length > 0;
+  $("incidents-list").innerHTML = incidents.incidents.map((i) => `<div class="card" data-incident="${esc(i.id)}">
+      <div class="bar"><b>${esc(i.title)}</b>
+        <span class="sub">${esc(IMPACTS[i.impact] || i.impact)} · ${esc(i.state)}${i.components.length ? ` · ${esc(i.components.map(componentName).join(", "))}` : ""}${i.resolvedAt ? ` · resolved ${esc(fmt(i.resolvedAt))}` : ""}</span>
+        <button type="button" class="btn push" data-act="delete-incident" title="For one posted by mistake. Resolve real ones.">Delete</button></div>
+      ${i.updates.map((u) => `<p class="use"><b>${esc(u.state)}</b> ${esc(u.body)} <span class="sub">${esc(fmt(u.createdAt))}</span></p>`).join("")}
+      <form class="bar" data-act="incident-update" autocomplete="off">
+        <select name="state" title="State">${stateOptions(i.state === "resolved" ? "resolved" : i.state)}</select>
+        <textarea name="body" rows="2" required maxlength="2000" placeholder="An update, for the public"></textarea>
+        <select name="impact" title="Impact">${Object.entries(IMPACTS).map(([v, l]) => `<option value="${v}" ${v === i.impact ? "selected" : ""}>${l}</option>`).join("")}</select>
+        <button type="submit" class="btn">Post update</button>
+      </form>
+    </div>`).join("");
+}
+
+$("inc-new").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const components = [...document.querySelectorAll("#inc-components input:checked")].map((i) => i.value);
+  try {
+    await api("POST", "/api/status/incidents", { title: $("inc-title").value, body: $("inc-body").value, impact: $("inc-impact").value, state: $("inc-state").value, components });
+    $("inc-new").reset();
+    for (const i of document.querySelectorAll("#inc-components input")) i.checked = false;
+    notice("Posted. It's on the status page now.", false);
+  } catch (err) {
+    fail(err);
+  }
+  loadStatus();
+});
+
+$("incidents-list").addEventListener("submit", async (e) => {
+  const f = e.target.closest('form[data-act="incident-update"]');
+  if (!f) return;
+  e.preventDefault();
+  const id = f.closest("[data-incident]").dataset.incident;
+  const current = incidents.incidents.find((i) => i.id === id);
+  try {
+    if (current && f.impact.value !== current.impact) await api("PATCH", `/api/status/incidents/${key(id)}`, { impact: f.impact.value });
+    await api("POST", `/api/status/incidents/${key(id)}/updates`, { state: f.state.value, body: f.body.value });
+    notice("Update posted.", false);
+  } catch (err) {
+    fail(err);
+  }
+  loadStatus();
+});
+
+$("incidents-list").addEventListener("click", async (e) => {
+  const b = e.target.closest('button[data-act="delete-incident"]');
+  if (!b) return;
+  const id = b.closest("[data-incident]").dataset.incident;
+  if (!confirm("Delete this incident and its updates from the status page? Resolve it instead if it really happened.")) return;
+  try {
+    await api("DELETE", `/api/status/incidents/${key(id)}`);
+  } catch (err) {
+    fail(err);
+  }
+  loadStatus();
+});
+
 // Tabs, from the address bar's #fragment so a reload keeps your place.
 
-const TABS = { users: loadUsers, requests: loadRequests, machines: loadMachines, teams: loadTeams, audit: () => loadAudit(), settings: loadSettings, setup: loadSetup };
+const TABS = { users: loadUsers, requests: loadRequests, machines: loadMachines, teams: loadTeams, audit: () => loadAudit(), status: loadStatus, settings: loadSettings, setup: loadSetup };
 
 // `#audit?target=approval:<id>`: a notification's link to one approval's trail (ADR 0061).
 function showTab() {
