@@ -110,7 +110,8 @@ pub type SeatCap = Box<dyn Fn() -> Option<u32> + Send + Sync>;
 
 /// The connection, and the seat limit every way of adding or re-enabling a user checks
 /// under the same lock. Unset (as in most tests): no limit.
-pub struct Db(Mutex<Connection>, std::sync::OnceLock<SeatCap>);
+/// `.2`: TEAMS=on (ADR 0087), so people in no team share Bots with nobody.
+pub struct Db(Mutex<Connection>, std::sync::OnceLock<SeatCap>, std::sync::atomic::AtomicBool);
 
 pub fn now() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -1204,7 +1205,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 31] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 32] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1236,7 +1237,51 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 31] = [
     migrate_machine_hosts,
     migrate_push_devices,
     migrate_machine_host_drain,
+    migrate_teams,
 ];
+
+/// Team accounts (ADR 0087): a team is a group of this server's users, each in one team
+/// at most, with a role in it. Invites wait for the person with that email to accept.
+/// `team_machines` are the machines a team gave its members, so leaving can give them back.
+fn migrate_teams(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS teams (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          machines INTEGER NOT NULL DEFAULT 1,
+          created_at INTEGER NOT NULL,
+          created_by TEXT,
+          updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS team_members (
+          user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+          team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+          role TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
+          joined_at INTEGER NOT NULL,
+          added_by TEXT
+        );
+        CREATE INDEX IF NOT EXISTS team_members_team ON team_members(team_id, joined_at);
+        CREATE TABLE IF NOT EXISTS team_invites (
+          id TEXT PRIMARY KEY,
+          team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+          email TEXT NOT NULL COLLATE NOCASE,
+          role TEXT NOT NULL CHECK (role IN ('admin', 'member')),
+          created_at INTEGER NOT NULL,
+          created_by TEXT,
+          expires_at INTEGER NOT NULL,
+          UNIQUE (team_id, email)
+        );
+        CREATE TABLE IF NOT EXISTS team_machines (
+          machine_id TEXT PRIMARY KEY,
+          team_id TEXT NOT NULL,
+          user_id TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          released_at INTEGER,
+          release_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS team_machines_user ON team_machines(user_id);",
+    )
+}
 
 /// Phones that get push notifications (ADR 0080): one per session at most, and a token
 /// belongs to one session only, so a phone that changes hands stops reaching the last
@@ -2493,7 +2538,7 @@ impl Db {
             tx.pragma_update(None, "user_version", i as i64 + 1)?;
             tx.commit()?;
         }
-        Ok(Db(Mutex::new(c), std::sync::OnceLock::new()))
+        Ok(Db(Mutex::new(c), std::sync::OnceLock::new(), std::sync::atomic::AtomicBool::new(false)))
     }
 
     fn c(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -5389,6 +5434,297 @@ impl Db {
         self.c()
             .execute("UPDATE machines SET upgrade_sent_at = upgrade_sent_at - ? WHERE id = ?", params![ms, machine_id])
             .unwrap();
+    }
+}
+
+/// A team account (ADR 0087).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Team {
+    pub id: String,
+    pub name: String,
+    /// Each member gets a machine of their own when they join, if the control plane is on.
+    pub machines: bool,
+    pub created_at: i64,
+    pub created_by: Option<String>,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamMember {
+    pub user_id: String,
+    pub team_id: String,
+    /// "owner", "admin" or "member".
+    pub role: String,
+    pub joined_at: i64,
+    pub added_by: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamInvite {
+    pub id: String,
+    pub team_id: String,
+    pub email: String,
+    pub role: String,
+    pub created_at: i64,
+    pub created_by: Option<String>,
+    pub expires_at: i64,
+}
+
+/// A machine a team gave one of its members. `released_at`: they left, so it was
+/// suspended; it's destroyed at `release_at` unless they join a team again first.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamMachine {
+    pub machine_id: String,
+    pub team_id: String,
+    pub user_id: String,
+    pub created_at: i64,
+    pub released_at: Option<i64>,
+    pub release_at: Option<i64>,
+}
+
+fn team_row(r: &Row) -> rusqlite::Result<Team> {
+    Ok(Team {
+        id: r.get("id")?,
+        name: r.get("name")?,
+        machines: r.get("machines")?,
+        created_at: r.get("created_at")?,
+        created_by: r.get("created_by")?,
+        updated_at: r.get("updated_at")?,
+    })
+}
+
+fn team_member_row(r: &Row) -> rusqlite::Result<TeamMember> {
+    Ok(TeamMember {
+        user_id: r.get("user_id")?,
+        team_id: r.get("team_id")?,
+        role: r.get("role")?,
+        joined_at: r.get("joined_at")?,
+        added_by: r.get("added_by")?,
+    })
+}
+
+fn team_invite_row(r: &Row) -> rusqlite::Result<TeamInvite> {
+    Ok(TeamInvite {
+        id: r.get("id")?,
+        team_id: r.get("team_id")?,
+        email: r.get("email")?,
+        role: r.get("role")?,
+        created_at: r.get("created_at")?,
+        created_by: r.get("created_by")?,
+        expires_at: r.get("expires_at")?,
+    })
+}
+
+fn team_machine_row(r: &Row) -> rusqlite::Result<TeamMachine> {
+    Ok(TeamMachine {
+        machine_id: r.get("machine_id")?,
+        team_id: r.get("team_id")?,
+        user_id: r.get("user_id")?,
+        created_at: r.get("created_at")?,
+        released_at: r.get("released_at")?,
+        release_at: r.get("release_at")?,
+    })
+}
+
+impl Db {
+    /// TEAMS=on (ADR 0087): people in no team are a team of one for sharing.
+    pub fn set_teams_strict(&self, on: bool) {
+        self.2.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn teams_strict(&self) -> bool {
+        self.2.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether a Bot `owner` shares, or grants, can reach `user` (ADR 0087): people in
+    /// the same team, or two people in no team unless TEAMS=on. The owner always.
+    pub fn same_team(&self, owner: &str, user: &str) -> bool {
+        owner == user || crate::acl::reaches(self.teams_strict(), self.team_id_of(owner).as_deref(), self.team_id_of(user).as_deref())
+    }
+
+    pub fn create_team(&self, name: &str, by: Option<&str>) -> Team {
+        let id = format!("t{}", crate::random_hex(5));
+        let at = now();
+        self.c()
+            .execute(
+                "INSERT INTO teams (id, name, machines, created_at, created_by, updated_at) VALUES (?1, ?2, 1, ?3, ?4, ?3)",
+                params![id, name, at, by],
+            )
+            .unwrap();
+        self.team(&id).unwrap()
+    }
+
+    pub fn team(&self, id: &str) -> Option<Team> {
+        self.c().query_row("SELECT * FROM teams WHERE id = ?", [id], team_row).optional().ok().flatten()
+    }
+
+    pub fn teams(&self) -> Vec<Team> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM teams ORDER BY created_at, id").unwrap();
+        s.query_map([], team_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    pub fn update_team(&self, id: &str, name: Option<&str>, machines: Option<bool>) {
+        let c = self.c();
+        if let Some(n) = name {
+            c.execute("UPDATE teams SET name = ?1, updated_at = ?2 WHERE id = ?3", params![n, now(), id]).unwrap();
+        }
+        if let Some(m) = machines {
+            c.execute("UPDATE teams SET machines = ?1, updated_at = ?2 WHERE id = ?3", params![m, now(), id]).unwrap();
+        }
+    }
+
+    /// Deletes the team and its invites. Its members must have left first.
+    pub fn delete_team(&self, id: &str) -> bool {
+        self.c().execute("DELETE FROM teams WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM team_members WHERE team_id = ?1)", [id]).unwrap() > 0
+    }
+
+    pub fn team_member(&self, user_id: &str) -> Option<TeamMember> {
+        self.c().query_row("SELECT * FROM team_members WHERE user_id = ?", [user_id], team_member_row).optional().ok().flatten()
+    }
+
+    pub fn team_id_of(&self, user_id: &str) -> Option<String> {
+        self.c().query_row("SELECT team_id FROM team_members WHERE user_id = ?", [user_id], |r| r.get(0)).optional().ok().flatten()
+    }
+
+    /// Every member's team, by user id.
+    pub fn team_ids(&self) -> HashMap<String, String> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT user_id, team_id FROM team_members").unwrap();
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().filter_map(Result::ok).collect()
+    }
+
+    pub fn team_members(&self, team_id: &str) -> Vec<TeamMember> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM team_members WHERE team_id = ? ORDER BY joined_at, user_id").unwrap();
+        s.query_map([team_id], team_member_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Adds `user_id` to the team. False if they're in a team already, this one included.
+    pub fn add_team_member(&self, team_id: &str, user_id: &str, role: &str, by: Option<&str>) -> bool {
+        self.c()
+            .execute(
+                "INSERT OR IGNORE INTO team_members (user_id, team_id, role, joined_at, added_by) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![user_id, team_id, role, now(), by],
+            )
+            .unwrap()
+            > 0
+    }
+
+    /// Changes a member's role, unless it would leave the team without an owner. One
+    /// statement, so two owners demoting themselves at once can't both succeed.
+    pub fn set_team_role(&self, team_id: &str, user_id: &str, role: &str) -> bool {
+        self.c()
+            .execute(
+                "UPDATE team_members SET role = ?1 WHERE team_id = ?2 AND user_id = ?3
+                 AND (?1 = 'owner' OR role != 'owner' OR (SELECT COUNT(*) FROM team_members WHERE team_id = ?2 AND role = 'owner') > 1)",
+                params![role, team_id, user_id],
+            )
+            .unwrap()
+            > 0
+    }
+
+    /// Takes a member off a team. With `keep_owner`, not its last owner while others
+    /// remain, in the same statement.
+    pub fn remove_team_member(&self, team_id: &str, user_id: &str, keep_owner: bool) -> bool {
+        self.c()
+            .execute(
+                "DELETE FROM team_members WHERE team_id = ?1 AND user_id = ?2
+                 AND (NOT ?3 OR role != 'owner'
+                      OR (SELECT COUNT(*) FROM team_members WHERE team_id = ?1 AND role = 'owner') > 1
+                      OR (SELECT COUNT(*) FROM team_members WHERE team_id = ?1) = 1)",
+                params![team_id, user_id, keep_owner],
+            )
+            .unwrap()
+            > 0
+    }
+
+    /// Invites `email`, or renews a pending invite with the new role and expiry.
+    pub fn put_team_invite(&self, team_id: &str, email: &str, role: &str, by: Option<&str>, expires_at: i64) -> TeamInvite {
+        let id = format!("ti{}", crate::random_hex(8));
+        let c = self.c();
+        c.execute(
+            "INSERT INTO team_invites (id, team_id, email, role, created_at, created_by, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(team_id, email) DO UPDATE SET role = ?4, created_at = ?5, created_by = ?6, expires_at = ?7",
+            params![id, team_id, email, role, now(), by, expires_at],
+        )
+        .unwrap();
+        c.query_row("SELECT * FROM team_invites WHERE team_id = ? AND email = ?", [team_id, email], team_invite_row).unwrap()
+    }
+
+    pub fn team_invite(&self, id: &str) -> Option<TeamInvite> {
+        self.c().query_row("SELECT * FROM team_invites WHERE id = ?", [id], team_invite_row).optional().ok().flatten()
+    }
+
+    pub fn team_invites(&self, team_id: &str) -> Vec<TeamInvite> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM team_invites WHERE team_id = ? ORDER BY created_at, id").unwrap();
+        s.query_map([team_id], team_invite_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    pub fn invites_for_email(&self, email: &str) -> Vec<TeamInvite> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM team_invites WHERE email = ? ORDER BY created_at, id").unwrap();
+        s.query_map([email], team_invite_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    pub fn delete_team_invite(&self, id: &str) -> bool {
+        self.c().execute("DELETE FROM team_invites WHERE id = ?", [id]).unwrap() > 0
+    }
+
+    pub fn delete_team_invites_for(&self, team_id: &str, email: &str) {
+        self.c().execute("DELETE FROM team_invites WHERE team_id = ? AND email = ?", [team_id, email]).unwrap();
+    }
+
+    /// Notes that `team_id` gave `user_id` the machine, or gives it back to a team after
+    /// they left one: it's no longer released.
+    pub fn team_machine_mark(&self, machine_id: &str, team_id: &str, user_id: &str) {
+        self.c()
+            .execute(
+                "INSERT INTO team_machines (machine_id, team_id, user_id, created_at) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(machine_id) DO UPDATE SET team_id = ?2, user_id = ?3, released_at = NULL, release_at = NULL",
+                params![machine_id, team_id, user_id, now()],
+            )
+            .unwrap();
+    }
+
+    pub fn team_machine(&self, machine_id: &str) -> Option<TeamMachine> {
+        self.c().query_row("SELECT * FROM team_machines WHERE machine_id = ?", [machine_id], team_machine_row).optional().ok().flatten()
+    }
+
+    pub fn team_machines(&self) -> Vec<TeamMachine> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM team_machines ORDER BY created_at, machine_id").unwrap();
+        s.query_map([], team_machine_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// Releases `machine_id` if `team_id` still holds it: another team may have taken it.
+    pub fn team_machine_release(&self, machine_id: &str, team_id: &str, release_at: i64) -> bool {
+        self.c()
+            .execute(
+                "UPDATE team_machines SET released_at = ?1, release_at = ?2 WHERE machine_id = ?3 AND team_id = ?4 AND released_at IS NULL",
+                params![now(), release_at, machine_id, team_id],
+            )
+            .unwrap()
+            > 0
+    }
+
+    pub fn team_machine_forget(&self, machine_id: &str) {
+        self.c().execute("DELETE FROM team_machines WHERE machine_id = ?", [machine_id]).unwrap();
+    }
+
+    #[cfg(test)]
+    pub fn team_machine_backdate(&self, machine_id: &str, ms: i64) {
+        self.c().execute("UPDATE team_machines SET release_at = release_at - ?1 WHERE machine_id = ?2", params![ms, machine_id]).unwrap();
+    }
+
+    #[cfg(test)]
+    pub fn machine_set_enrolled(&self, machine_id: &str) {
+        self.c().execute("UPDATE machines SET enrollment = 'enrolled' WHERE id = ?", [machine_id]).unwrap();
     }
 }
 

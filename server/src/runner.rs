@@ -206,6 +206,9 @@ pub struct App {
     /// With isolated shared Bots: whom each Bot's latest run is for, by Bot. Kept after
     /// the run ends, so whatever it left running stays capped until the next run.
     askers: Mutex<HashMap<String, String>>,
+    /// Whom each Bot's latest run was asked by, whatever SHARED_BOTS is: what leaving a
+    /// team (ADR 0087) stops.
+    requesters: Mutex<HashMap<String, String>>,
     /// ROUTINES_ON_ENABLE=resume (ADR 0047): re-enabling a user resumes the routines
     /// paused when they were disabled. Unset: they stay paused until an admin resumes them.
     pub resume_routines_on_enable: OnceLock<bool>,
@@ -223,6 +226,8 @@ pub struct App {
     pub storage: crate::storage::Cache,
     /// Each live run's own `BOT_TOKEN` (ADR 0083): issued when it starts, revoked when it ends.
     pub run_tokens: isolation::RunTokens,
+    /// TEAMS and TEAM_MACHINE_DAYS (ADR 0087). Unset: the defaults.
+    pub teams: OnceLock<crate::teams::Settings>,
     closing: AtomicBool,
 }
 
@@ -251,6 +256,7 @@ impl App {
             run_cap: OnceLock::new(),
             shared_bots: OnceLock::new(),
             askers: Mutex::default(),
+            requesters: Mutex::default(),
             resume_routines_on_enable: OnceLock::new(),
             meter: OnceLock::new(),
             notifier: OnceLock::new(),
@@ -258,6 +264,7 @@ impl App {
             account_removals: Default::default(),
             teammate_gate: Default::default(),
             storage: Default::default(),
+            teams: OnceLock::new(),
             closing: AtomicBool::new(false),
         })
     }
@@ -318,6 +325,12 @@ impl App {
             Some(a) if *a != bot.owner_id => owner.within(Viewer::person(&self.db, a)),
             _ => owner,
         }
+    }
+
+    /// Who asked for a Bot's latest run, with open shared Bots too: the person, a
+    /// routine's author, else its owner.
+    pub fn requested_by(&self, bot: &Bot) -> String {
+        self.requesters.lock().unwrap_or_else(|e| e.into_inner()).get(&bot.id).cloned().unwrap_or_else(|| bot.owner_id.clone())
     }
 
     /// Whom a Bot acts for now: the person its latest run is for, else its owner.
@@ -780,11 +793,17 @@ impl App {
             return;
         }
         let isolated = self.shared_bots() == SharedBots::Isolated;
-        let for_other = Some(Self::asker_of(&bot, &by)).filter(|a| isolated && *a != bot.owner_id);
-        if isolated && let Some((reason, text)) = self.wont_run(&bot, for_other.as_deref()) {
+        let asker = Self::asker_of(&bot, &by);
+        // Sharing stops at the team (ADR 0087) whatever SHARED_BOTS is: work queued
+        // before someone left doesn't run for them.
+        let off_team =
+            (asker != bot.owner_id && self.db.user(&asker).is_some() && !self.db.same_team(&bot.owner_id, &asker)).then(|| asker.clone());
+        let for_other = Some(asker.clone()).filter(|a| isolated && *a != bot.owner_id);
+        let refusal = if isolated { self.wont_run(&bot, for_other.as_deref()) } else { off_team.as_deref().and_then(|a| self.wont_run(&bot, Some(a))) };
+        if let Some((reason, text)) = refusal {
             self.give_back_routine(&bot, msg);
             let e = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied);
-            self.db.record(&e.details(json!({ "reason": reason, "owner": bot.owner_id, "forUser": for_other, "messageId": msg.id })));
+            self.db.record(&e.details(json!({ "reason": reason, "owner": bot.owner_id, "forUser": for_other.or(off_team), "messageId": msg.id })));
             // A routine of a disabled owner keeps firing; one bubble says it.
             if self.db.last_message(&bot.id).is_none_or(|m| m.text != text) {
                 self.say(&bot.id, &text, true);
@@ -794,6 +813,7 @@ impl App {
         let Some(space) = self.run_space_with(&bot, for_other.is_none()) else {
             return cant_run("This Bot's owner id isn't a safe folder name, so it can't run.");
         };
+        self.requesters.lock().unwrap_or_else(|e| e.into_inner()).insert(bot.id.clone(), asker);
         if isolated {
             let asker = for_other.clone().unwrap_or_else(|| bot.owner_id.clone());
             self.askers.lock().unwrap_or_else(|e| e.into_inner()).insert(bot.id.clone(), asker);

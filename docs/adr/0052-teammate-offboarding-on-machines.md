@@ -114,5 +114,5 @@ All admin only.
 ## Limits and follow-ups
 
 - **Disk space.** Archived work counts against the owner's disk, as the teammate's home did.
-- **Someone still on the server, but gone from the team.** Team accounts aren't modelled yet. When they are, leaving a team should be one more event here.
+- **Someone still on the server, but gone from the team.** Done in [ADR 0087](0087-team-accounts-and-machines.md): leaving a team is one more event here, with reason `left_team` (and joining one, `joined_team`, for people outside it).
 - **A machine that never comes back** keeps its removals pending until it's destroyed. They're visible in `botctl machine removals`.
