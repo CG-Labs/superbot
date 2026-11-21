@@ -354,7 +354,6 @@ pub fn for_subscription(ev: &SubEvent, c: &Change, tiers: &Tiers) -> Vec<NewEmai
 /// One way to send an email. SMTP (ADR 0061) on a real server; a fake in tests.
 pub trait Mailer: Send + Sync {
     fn deliver<'a>(&'a self, mail: &'a smtp::Mail) -> BoxFuture<'a, Result<(), String>>;
-    fn describe(&self) -> String;
 }
 
 impl Mailer for smtp::Smtp {
@@ -364,11 +363,6 @@ impl Mailer for smtp::Smtp {
             let mut results = self.send(password.as_ref().map(|p| p.expose()), std::slice::from_ref(mail)).await?;
             results.pop().unwrap_or_else(|| Err("the mail server didn't answer".into()))
         })
-    }
-
-    /// The server only: the sign-in name stays out of logs.
-    fn describe(&self) -> String {
-        format!("{}:{} ({})", self.host, self.port, self.tls.as_str())
     }
 }
 
@@ -389,7 +383,7 @@ impl BillingMail {
 
     pub fn describe(&self) -> String {
         let links = if self.plan_link.is_some() { "" } else { "; without links (set PUBLIC_URL)" };
-        format!("on, through {}{links}", self.mailer.describe())
+        format!("on, through the SMTP server{links}")
     }
 }
 
@@ -672,10 +666,6 @@ pub mod fake {
                 self.sent.lock().unwrap().push(mail.clone());
                 Ok(())
             })
-        }
-
-        fn describe(&self) -> String {
-            "a fake mailer".into()
         }
     }
 

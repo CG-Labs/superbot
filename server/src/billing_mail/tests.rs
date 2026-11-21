@@ -203,7 +203,7 @@ fn billing_emails_are_off_unless_billing_and_smtp_are_on() {
     assert!(m.is_none() && said.contains("off"), "{said}");
     let (m, said) = configured(&vars(""), true, Some(&smtp), Some("https://bots.example.com/")).unwrap();
     assert_eq!(m.unwrap().plan_link.as_deref(), Some(LINK));
-    assert!(said.starts_with("on, through 127.0.0.1:25") && !said.contains("without links"), "{said}");
+    assert!(said.starts_with("on, through the SMTP server") && !said.contains("without links"), "{said}");
     let (_, said) = configured(&vars("on"), true, Some(&smtp), None).unwrap();
     assert!(said.contains("without links"), "{said}");
     assert!(configured(&vars("sometimes"), true, Some(&smtp), None).err().unwrap().contains(ENV));
