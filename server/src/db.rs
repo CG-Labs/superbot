@@ -4472,6 +4472,56 @@ mod tests {
     }
 
     #[test]
+    fn a_rebuild_steps_only_from_the_state_it_expects() {
+        let path = temp_path("rebuild-steps").join("app.sqlite");
+        let db = Db::open(&path).unwrap();
+        let u = db.create_user(None, Some("ada@example.com"), "Ada", Role::Member).unwrap();
+        let new = NewMachine { user_id: &u.id, provider: "fake", label_prefix: "superbot", tier: "starter", plan: "g6-standard-1", region: "gb-lon", created_by: None };
+        let m = db.add_machine(&new).unwrap();
+        assert!(!db.machine_rebuild_queue(&m.id, "r1", "auto", false, None), "only a running machine");
+        db.c().execute("UPDATE machines SET state = 'running' WHERE id = ?", [&m.id]).unwrap();
+        assert!(!db.machine_may_hold_work(&m.id));
+        assert!(db.machine_rebuild_queue(&m.id, "r1", "auto", false, Some("0.3.0")));
+        assert!(!db.machine_rebuild_queue(&m.id, "r2", "auto", false, None), "one at a time");
+        assert!(!db.machine_rebuild_move(&m.id, "r0", &["queued"], "cancelled", false, None, None), "a stale rebuild changes nothing");
+        assert!(!db.machine_rebuild_sending(&m.id, "r1", &["retrying"]), "not from another state");
+        assert!(db.machine_rebuild_sending(&m.id, "r1", &["queued"]));
+        let r = db.machine(&m.id).unwrap();
+        assert_eq!((r.rebuild_state.as_deref(), r.rebuild_attempts, r.rebuild_from.as_deref()), (Some("rebuilding"), 1, Some("0.3.0")));
+        assert!(r.rebuild_sent_at.is_some());
+        assert!(db.machine_rebuild_move(&m.id, "r1", &["rebuilding"], "failed", false, None, Some("no")));
+        assert!(db.machine_upgrade_hold(&m.id, None, 0));
+        assert!(!db.machine_rebuild_queue(&m.id, "r3", "admin", true, None), "held");
+        db.machine_upgrade_release(&m.id);
+        assert!(db.machine_rebuild_queue(&m.id, "r3", "admin", true, None), "again after a failure");
+        let r = db.machine(&m.id).unwrap();
+        assert_eq!((r.rebuild_attempts, r.rebuild_error.as_deref(), r.rebuild_discard), (0, None, true));
+        assert!(db.assign_machine(&m.id, None));
+        assert!(db.machine_may_hold_work(&m.id), "assigned");
+        assert!(db.unassign_machine(&m.id));
+        let routed = audit::Event::new(audit::Actor::system("t"), "bot.run_routed").details(json!({ "machine": m.id }));
+        db.record(&routed);
+        assert!(db.machine_may_hold_work(&m.id), "a Bot ran there");
+
+        // An install from before ADR 0056 gets the columns, empty.
+        db.c()
+            .execute_batch(
+                "ALTER TABLE machines DROP COLUMN rebuild_state; ALTER TABLE machines DROP COLUMN rebuild_id;
+                 ALTER TABLE machines DROP COLUMN rebuild_by; ALTER TABLE machines DROP COLUMN rebuild_discard;
+                 ALTER TABLE machines DROP COLUMN rebuild_attempts; ALTER TABLE machines DROP COLUMN rebuild_next_at;
+                 ALTER TABLE machines DROP COLUMN rebuild_requested_at; ALTER TABLE machines DROP COLUMN rebuild_at;
+                 ALTER TABLE machines DROP COLUMN rebuild_sent_at; ALTER TABLE machines DROP COLUMN rebuild_error;
+                 ALTER TABLE machines DROP COLUMN rebuild_from;",
+            )
+            .unwrap();
+        db.c().execute_batch(&format!("PRAGMA user_version = {};", MIGRATIONS.len() - 1)).unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        let r = db.machine(&m.id).unwrap();
+        assert_eq!((r.rebuild_state, r.rebuild_attempts, r.rebuild_discard), (None, 0, false));
+    }
+
+    #[test]
     fn an_upgrade_on_its_way_takes_no_hold() {
         let db = Db::open(&temp_path("upgrade-claimed").join("app.sqlite")).unwrap();
         let u = db.create_user(None, Some("ada@example.com"), "Ada", Role::Member).unwrap();
@@ -4586,7 +4636,8 @@ mod tests {
         let mut p = serde_json::to_value(db.global_policy()).unwrap();
         p.as_object_mut().unwrap().remove("sandbox");
         db.c().execute("UPDATE settings SET value = ? WHERE key = 'policy'", [p.to_string()]).unwrap();
-        db.c().execute_batch(&format!("PRAGMA user_version = {};", MIGRATIONS.len() - 1)).unwrap();
+        let sandbox = MIGRATIONS.iter().position(|m| std::ptr::fn_addr_eq(*m, migrate_sandbox as fn(&Connection, bool) -> rusqlite::Result<()>)).unwrap();
+        db.c().execute_batch(&format!("PRAGMA user_version = {sandbox};")).unwrap();
         drop(db);
         let db = Db::open(&path).unwrap();
         assert!(!db.global_policy().sandbox);
