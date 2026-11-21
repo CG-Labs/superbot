@@ -163,6 +163,8 @@ groupdel "$forged" 2>/dev/null || true
 pair_uid=$(id -u "$pair")
 ws=$TEST_DIR/users/t1-t2/workspace
 sudo -u "$pair" sh -c "cd '$ws' && echo notes >notes.txt && : >tool && chmod 4755 tool && : >/tmp/sb-left-\$(id -u)"
+# And a run's memory copy it never got to save, beside the teammate's USER.md.
+sudo -u "$pair" sh -c "echo remembered >'$TEST_DIR/users/t1-t2/memory/b1.md' && echo me >'$TEST_DIR/users/t1-t2/memory/USER.md'"
 [[ -e "/tmp/sb-left-$pair_uid" ]] || die "no temp file of $pair"
 sudo -u "$pair" setsid sh -c 'trap "" TERM; while :; do sleep 0.2; done' </dev/null >/dev/null 2>&1 &
 sleep 0.5
@@ -183,12 +185,14 @@ kill -0 "$owner_pid" 2>/dev/null || die "remove stopped someone else's process"
 [[ ! -e "/tmp/sb-left-$pair_uid" ]] || die "$pair's temp file is still there"
 [[ "$(stat -c '%U' "$to/notes.txt")" == sb-u-t1 && "$(cat "$to/notes.txt")" == notes ]] || die "the work isn't sb-u-t1's"
 [[ "$(stat -c '%a' "$to/tool")" == 755 ]] || die "a set-id bit was handed over"
+[[ "$(cat "$to/unsaved-memory/b1.md")" == remembered ]] || die "the unsaved memory copy was lost"
+[[ ! -e "$to/unsaved-memory/USER.md" ]] || die "the teammate's USER.md was handed to the owner"
 for u in sb-u-t1 sb-u-t2; do getent passwd "$u" >/dev/null || die "remove took $u"; done
 [[ -d "$TEST_DIR/users/t1/home" && -d "$TEST_DIR/users/t2/home" ]] || die "remove took a user's own folder"
 pkill -KILL -u sb-u-t1 || true
-# Again: nothing left to do, and the archived work stays.
+# Again: nothing left to do, the archived work stays, and it still says where it went.
 out=$(userctl remove t1 t2 "$id1" archive t2-notes)
-grep -qx account=absent <<<"$out" && grep -qx work=none <<<"$out" || die "remove again said: $out"
+grep -qx account=absent <<<"$out" && grep -qx work=archived <<<"$out" && grep -qx "path=$to" <<<"$out" || die "remove again said: $out"
 [[ -f "$to/notes.txt" ]] || die "remove again touched the archive"
 
 # Held aside, root's alone, until purged.
@@ -202,6 +206,22 @@ grep -qx work=held <<<"$out" || die "remove hold said: $out"
 [[ "$(userctl purge "$id2")" == purged=yes ]] || die "purge didn't"
 [[ ! -e "$TEST_DIR/users/.left/$id2" ]] || die "the held work is still there"
 [[ "$(userctl purge "$id2")" == purged=no ]] || die "purge again did something"
+
+# A try that stopped once the work was staged in the owner's workspace: the next one tidies
+# it away and says where it went.
+id3=00112233aabbccdd
+staged=$TEST_DIR/users/t1/workspace/.superbot-from-teammate-$id3
+sudo -u sb-u-t1 sh -c "mkdir '$staged' && echo staged >'$staged/s.txt'"
+out=$(userctl remove t1 t2 "$id3" archive t2-later)
+grep -qx work=archived <<<"$out" && grep -qx "path=$TEST_DIR/users/t1/workspace/from-teammates/t2-later" <<<"$out" || die "remove after a staged try said: $out"
+[[ ! -e "$staged" && -f "$TEST_DIR/users/t1/workspace/from-teammates/t2-later/s.txt" ]] || die "the staged work wasn't tidied away"
+
+# As a recreated container leaves it: a pair's folder, but not its account. botd's OS test
+# finds and removes it.
+userctl ensure t1 t3 >/dev/null
+lost=sb-t-$(printf '%s' 't1:t3' | sha256sum | cut -c1-24)
+userdel "$lost"
+groupdel "$lost" 2>/dev/null || true
 
 log "botd's OS tests, as $SVC"
 envs=(SUPERBOT_ISOLATION_OS_TEST=1 ISOLATION_DIR="$TEST_DIR/users" SUPERBOT_RUN_DIR="$LIB/bin"

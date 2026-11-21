@@ -33,8 +33,9 @@
 # derives from the two ids itself, with the home it gave it: never a user's own sb-u- account,
 # nor any other. It kills every process of the account (as the account itself, so nothing
 # else can be hit), deals with its workspace (archive: handed to the owner's account under
-# workspace/from-teammates/<name>; hold: kept aside, root's alone, in <dir>/.left/<cleanup id>
-# until `purge`; delete: gone), deletes its folder, its files in /tmp, /var/tmp and /dev/shm,
+# workspace/from-teammates/<name>, recorded in <dir>/.left/<cleanup id>.to; hold: kept aside,
+# root's alone, in <dir>/.left/<cleanup id> until `purge`; delete: gone), with any memory
+# copy a run left unsaved, deletes its folder, its files in /tmp, /var/tmp and /dev/shm,
 # its crontab, at jobs and lingering, then the account and its group. Each step can run again:
 # a removal that stopped halfway finishes on the next try. It prints what it did as key=value.
 set -euo pipefail
@@ -199,18 +200,30 @@ as_uid() {
   setpriv --reuid="$uid" --regid="$gid" --clear-groups --inh-caps=-all -- "$@"
 }
 
+# Moves work staged in the owner's workspace into from-teammates/<name>, as the owner's
+# account (uid $1, gid $2), and keeps where it went in .left/<cleanup id>.to, root's, so a
+# retry still reports it once it's moved. Uses remove's locals.
+tidy_archive() {
+  local p
+  folder "$left" root root 0700
+  printf '%s\n' "$to" >"$left/$id.to"
+  p=$(as_uid "$1" "$2" /bin/sh -c "$ARCHIVE_AS_OWNER" sh "$owner_ws" "$staged" "$name" 2>/dev/null | tail -n 1) || p=""
+  [[ -z "$p" || "$p" == "$staged" ]] || to="$owner_ws/$p"
+  printf '%s\n' "$to" >"$left/$id.to"
+}
+
 valid_cleanup_id() {
   [[ "$1" =~ ^[a-f0-9]{8,32}$ ]] || die "cleanup id must be 8 to 32 lowercase hex digits"
 }
 
 # Makes a teammate's work, still in their folder (no process of theirs left), fit to hand
-# over: the unsaved memory copies botd set aside go in with it, a hard link to anyone else's
-# file goes (the file stays theirs), a file of theirs with other links gets a copy of its
-# own, and no set-id bit is left.
+# over: the memory copies botd set aside, and any a run left unsaved, go in with it (not
+# their USER.md), a hard link to anyone else's file goes (the file stays theirs), a file of
+# theirs with other links gets a copy of its own, and no set-id bit is left.
 prepare_work() {
   local root=$1 ws=$2 uid=$3 f tmp
-  for f in "$root"/memory/*.md.unsaved; do
-    [[ -f "$f" && ! -L "$f" ]] || continue
+  for f in "$root"/memory/*.md.unsaved "$root"/memory/*.md; do
+    [[ -f "$f" && ! -L "$f" && "${f##*/}" != USER.md ]] || continue
     [[ -d "$ws/unsaved-memory" && ! -L "$ws/unsaved-memory" ]] || { rm -f -- "$ws/unsaved-memory"; mkdir -- "$ws/unsaved-memory"; }
     mv -n -- "$f" "$ws/unsaved-memory/"
   done
@@ -266,9 +279,29 @@ remove() {
     ((i < 100)) || die "$account's processes keep coming back"
   fi
 
-  # Their work, unless an earlier try already moved it.
+  # The owner's account and workspace, to hand work to: sets ou and og.
+  local owner_acct=$PREFIX$owner ou="" og=""
+  owner_ids() {
+    getent passwd "$owner_acct" >/dev/null || die "can't archive: $owner_acct isn't there"
+    ou=$(id -u "$owner_acct")
+    og=$(id -g "$owner_acct")
+    [[ "$ou" != 0 ]] || die "$owner_acct has uid 0"
+    [[ -d "$ISOLATION_DIR/$owner" && ! -L "$ISOLATION_DIR/$owner" && "$(stat -c '%u' "$ISOLATION_DIR/$owner")" == 0 ]] || die "can't archive: $ISOLATION_DIR/$owner isn't a folder this helper made"
+    [[ -d "$owner_ws" && ! -L "$owner_ws" && "$(stat -c '%u' "$owner_ws")" == "$ou" ]] || die "can't archive: $owner_ws isn't $owner_acct's workspace"
+  }
+
+  # Their work, unless an earlier try already moved it: still staged (tidied away now, when
+  # archiving), moved on (where the record says), or held.
   if [[ -d "$owner_ws/$staged" && ! -L "$owner_ws/$staged" ]]; then
     work=archived to="$owner_ws/$staged"
+    if [[ "$mode" == archive ]]; then
+      owner_ids
+      tidy_archive "$ou" "$og"
+    fi
+  elif [[ -f "$left/$id.to" && ! -L "$left/$id.to" ]] && p=$(head -n 1 -- "$left/$id.to") && [[ "$p" == "$owner_ws/"* ]]; then
+    work=archived to=$p
+    # Moved by the owner's account after the record was last written: it's in there.
+    [[ "$to" != "$owner_ws/$staged" ]] || to="$owner_ws/from-teammates"
   elif [[ -d "$left/$id" && ! -L "$left/$id" ]]; then
     work=held to="$left/$id"
   fi
@@ -279,21 +312,14 @@ remove() {
     if [[ -z "$(find "$ws" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
       work=none
     elif [[ "$mode" == archive ]]; then
-      local owner_acct=$PREFIX$owner ou og
-      getent passwd "$owner_acct" >/dev/null || die "can't archive: $owner_acct isn't there"
-      ou=$(id -u "$owner_acct")
-      og=$(id -g "$owner_acct")
-      [[ "$ou" != 0 ]] || die "$owner_acct has uid 0"
-      [[ -d "$ISOLATION_DIR/$owner" && ! -L "$ISOLATION_DIR/$owner" && "$(stat -c '%u' "$ISOLATION_DIR/$owner")" == 0 ]] || die "can't archive: $ISOLATION_DIR/$owner isn't a folder this helper made"
-      [[ -d "$owner_ws" && ! -L "$owner_ws" && "$(stat -c '%u' "$owner_ws")" == "$ou" ]] || die "can't archive: $owner_ws isn't $owner_acct's workspace"
+      owner_ids
       # Still in the teammate's folder, where the owner's account can't reach: no one can
       # swap anything in while it changes hands.
       chown -R -P -h "$ou:$SERVICE_GROUP" -- "$ws"
       # rename(2) never follows a link at the target, and won't replace one.
       mv -T -- "$ws" "$owner_ws/$staged"
       to="$owner_ws/$staged"
-      p=$(as_uid "$ou" "$og" /bin/sh -c "$ARCHIVE_AS_OWNER" sh "$owner_ws" "$staged" "$name" 2>/dev/null | tail -n 1) || p=""
-      [[ -z "$p" || "$p" == "$staged" ]] || to="$owner_ws/$p"
+      tidy_archive "$ou" "$og"
       work=archived
     elif [[ "$mode" == hold ]]; then
       folder "$left" root root 0700
