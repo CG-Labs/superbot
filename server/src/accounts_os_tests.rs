@@ -3,7 +3,8 @@
 //! Needs root's setup first, so it's ignored unless deploy/test-isolation.sh runs it (as
 //! botd's service account, under the unit's sandboxing) with SUPERBOT_ISOLATION_OS_TEST=1.
 
-use crate::accounts::{self, Isolation};
+use crate::accounts::{self, Isolation, Space};
+use crate::audit::{Actor, ActorKind, Who};
 use crate::acl::Visibility;
 use crate::db::Bot;
 use crate::rbac::Role;
@@ -27,7 +28,10 @@ fn setup() -> Option<(Arc<App>, Arc<Isolation>)> {
         "ISOLATION" => "users".into(),
         _ => std::env::var(k).unwrap_or_default(),
     };
-    let iso = Arc::new(Isolation::from_env(get, &run_dir, &app.cfg.data_dir).unwrap().unwrap());
+    let mut iso = Isolation::from_env(get, &run_dir, &app.cfg.data_dir).unwrap().unwrap();
+    // Only isolated shared Bots use it, and only a test of those turns them on.
+    iso.teammates = true;
+    let iso = Arc::new(iso);
     let _ = app.isolation.set(iso.clone());
     Some((app, iso))
 }
@@ -39,7 +43,17 @@ fn user_and_bot(app: &App, email: &str) -> Bot {
 
 /// Sends `text` to the Bot and waits for its run to finish; the fake harness's reply.
 async fn run(app: &Arc<App>, bot: &Bot, text: &str) -> String {
-    let msg = app.db.add_message(&bot.id, "user", text, None, false, Some("queued"));
+    run_for(app, bot, None, text).await
+}
+
+/// `run`, asked by `who` (None: the Bot's owner, as the runner).
+async fn run_for(app: &Arc<App>, bot: &Bot, who: Option<&str>, text: &str) -> String {
+    let mut msg = app.db.add_message(&bot.id, "user", text, None, false, Some("queued"));
+    if let Some(u) = who {
+        let by = person(u);
+        app.db.set_requested_by(msg.id, &by);
+        msg.requested_by = Some(by);
+    }
     app.enqueue(msg.clone());
     let start = Instant::now();
     while app.db.message(msg.id).unwrap().status.as_deref() != Some("done") {
@@ -48,6 +62,10 @@ async fn run(app: &Arc<App>, bot: &Bot, text: &str) -> String {
     }
     let replies: Vec<String> = app.db.messages(&bot.id, 20).into_iter().filter(|m| m.id > msg.id && m.role == "bot").map(|m| m.text).collect();
     replies.join("\n")
+}
+
+fn person(id: &str) -> Who {
+    Who { actor: Actor { kind: ActorKind::User, id: Some(id.into()), ..Default::default() }, source: Default::default() }
 }
 
 fn probes(reply: &str) -> HashMap<String, String> {
@@ -224,4 +242,126 @@ async fn pi_and_hermes_runs_cannot_read_botds_files_or_change_their_settings() {
             assert_eq!(std::fs::read_to_string(&by).unwrap().trim(), accounts::account(&u.id).unwrap());
         }
     }
+}
+
+fn audited(app: &App, action: &str) -> Vec<serde_json::Value> {
+    let f = crate::audit::Filter { actions: vec![action.into()], ..Default::default() };
+    app.db.audit_events(&f, 200, true).into_iter().map(|e| e.details).collect()
+}
+
+/// A teammate's login for an owner's Bots, run from the app as their account there; what
+/// it showed, and whether it ended logged in.
+async fn log_in(app: &Arc<App>, owner: &str, teammate: &str) -> (String, bool) {
+    use crate::machines::wire::LoginEvent;
+    let owner = app.db.user(owner).unwrap();
+    let res = crate::teammate_logins::start(app.clone(), person(teammate), owner, teammate.into(), "claude".into()).await.unwrap_or_else(|e| panic!("{}", e.1));
+    let body = tokio::time::timeout(Duration::from_secs(60), axum::body::to_bytes(res.into_body(), 1 << 20)).await.expect("the login never ended").unwrap();
+    let mut shown = String::new();
+    let mut logged_in = false;
+    for line in String::from_utf8_lossy(&body).lines() {
+        match serde_json::from_str::<LoginEvent>(line).unwrap() {
+            LoginEvent::Output { text } => shown.push_str(&text),
+            LoginEvent::Exit { logged_in: l, .. } => logged_in = l,
+            _ => {}
+        }
+    }
+    (shown, logged_in)
+}
+
+/// ADR 0064: a teammate's run of a shared Bot on one server is an account of its own,
+/// with their own harness login, and reaches neither the owner's logins and folders nor
+/// another teammate's. Without a login of their own it's refused, never the owner's.
+#[tokio::test]
+#[ignore = "needs root's setup: deploy/test-isolation.sh"]
+async fn a_teammates_run_of_a_shared_bot_is_their_own_account_and_login() {
+    let Some((app, iso)) = setup() else { return };
+    app.shared_bots.set(crate::acl::SharedBots::Isolated).unwrap();
+    assert!(app.teammate_accounts());
+    let mk = |email: &str| app.db.create_user(None, Some(email), email, Role::Member).unwrap().id;
+    let (ada, bea, cy) = (mk("ada@example.com"), mk("bea@example.com"), mk("cy@example.com"));
+    let team = app.db.create_bot_owned("Team", "#fff", "waddle", "claude", None, false, &ada, Visibility::Shared);
+    let (bea_space, cy_space) = (Space::of(&ada, Some(&bea)), Space::of(&ada, Some(&cy)));
+    let (ada_acct, bea_acct) = (accounts::account(&ada).unwrap(), bea_space.account().unwrap());
+
+    // Ada logs in for her own Bots (the fake harness writes a credential into her HOME).
+    assert_eq!(run(&app, &team, "WRITE-CREDS").await, "wrote");
+    let ada_creds = iso.home(&ada).unwrap().join(".claude/.credentials.json");
+    assert!(std::fs::read_to_string(&ada_creds).unwrap().contains("A-SECRET"));
+
+    // Bea logs in for her own Bots too: that login is hers, not one for Ada's.
+    let bea_bot = app.db.create_bot_owned("Bea's", "#fff", "waddle", "claude", None, false, &bea, Visibility::Private);
+    assert_eq!(run(&app, &bea_bot, "WRITE-CREDS").await, "wrote");
+    let bea_own_creds = iso.home(&bea).unwrap().join(".claude/.credentials.json");
+
+    // Bea has no login for Ada's Bots: refused, never Ada's. Her account is made anyway.
+    let refused = run_for(&app, &team, Some(&bea), "WRITE-CREDS").await;
+    assert!(refused.contains("isn't logged in for you on this server"), "{refused}");
+    let why = audited(&app, "bot.run_refused");
+    assert!(why.iter().any(|d| d["reason"] == "teammate_not_logged_in" && d["forUser"] == bea.as_str() && d["account"] == bea_acct.as_str()), "{why:?}");
+    assert!(iso.ready_in(bea_space));
+    assert!(!audited(&app, "harness.invoked").iter().any(|d| d["forUser"] == bea.as_str()), "nothing ran for Bea");
+
+    // Bea logs in from the app: the login runs as her account for Ada's Bots, and lands there.
+    let (shown, logged_in) = log_in(&app, &ada, &bea).await;
+    assert!(logged_in, "{shown}");
+    assert!(shown.contains(&format!("logged in as {bea_acct}")), "{shown}");
+    let bea_creds = iso.home_in(bea_space).unwrap().join(".claude/.credentials.json");
+    let status = crate::teammate_logins::status(app.clone(), app.db.user(&ada).unwrap(), bea.clone()).await.unwrap().0;
+    assert_eq!((status["hasUser"].as_bool(), status["harnesses"]["claude"]["state"].as_str()), (Some(true), Some("logged_in")), "{status}");
+    // Cy, another teammate, logs in for Ada's Bots too: his own account, apart from Bea's.
+    assert!(log_in(&app, &ada, &cy).await.1);
+    let cy_creds = iso.home_in(cy_space).unwrap().join(".claude/.credentials.json");
+    let started = audited(&app, "harness.login_started");
+    assert!(started.iter().any(|d| d["forUser"] == bea.as_str() && d["account"] == bea_acct.as_str() && d["on"] == "server"), "{started:?}");
+
+    let targets = [
+        ("own_creds", bea_creds.clone()),
+        ("creds", ada_creds.clone()),
+        ("a_root", iso.user_root(&ada).unwrap()),
+        ("a_home", iso.home(&ada).unwrap()),
+        ("a_workspace", iso.workspace(&ada).unwrap()),
+        ("a_memory", app.memory_file(&team).unwrap()),
+        ("a_user", iso.user_file(&ada).unwrap()),
+        ("cy_creds", cy_creds.clone()),
+        ("cy_root", iso.space_root(cy_space).unwrap()),
+        ("bea_own_creds", bea_own_creds),
+        ("bea_own_root", iso.user_root(&bea).unwrap()),
+        ("db", app.cfg.data_dir.join("app.sqlite")),
+        ("data", app.cfg.data_dir.clone()),
+    ];
+    let list: Vec<String> = targets.iter().map(|(k, p)| format!("{k}:{}", p.display())).collect();
+    let probe = format!("PROBE {ada_acct} {}", list.join(" "));
+
+    // Bea's run: her account, her folders, her login; nothing of Ada's or Cy's.
+    let got = probes(&run_for(&app, &team, Some(&bea), &probe).await);
+    eprintln!("Bea's run of Ada's Bot saw: {got:?}");
+    assert_eq!(got["user"], bea_acct, "{got:?}");
+    assert_eq!(got["home"], iso.home_in(bea_space).unwrap().display().to_string(), "{got:?}");
+    assert_eq!(got["pwd"], iso.workspace_in(bea_space).unwrap().display().to_string(), "{got:?}");
+    assert_eq!(got["own_creds"], "read", "her own login is hers: {got:?}");
+    for k in ["creds", "a_root", "a_home", "a_workspace", "a_memory", "a_user", "cy_creds", "cy_root", "bea_own_creds", "bea_own_root", "db", "data"] {
+        assert_eq!(got[k], "denied", "{k}: {got:?}");
+    }
+    for k in ["write_a_workspace", "write_a_memory"] {
+        assert_eq!(got[k], "denied", "{k}: {got:?}");
+    }
+    for k in ["sudo_root", "sudo_other", "sudo_userctl"] {
+        assert_eq!(got[k], "denied", "{k}: {got:?}");
+    }
+    assert_eq!((got["server_secrets"].as_str(), got["bot_token"].as_str()), ("absent", "present"), "{got:?}");
+    let invoked = audited(&app, "harness.invoked");
+    assert!(invoked.iter().any(|d| d["forUser"] == bea.as_str() && d["runAs"] == bea_acct.as_str()), "{invoked:?}");
+
+    // Ada's own run can't read Bea's login or folder either.
+    let list = [format!("b_creds:{}", bea_creds.display()), format!("b_root:{}", iso.space_root(bea_space).unwrap().display())];
+    let got = probes(&run(&app, &team, &format!("PROBE {bea_acct} {}", list.join(" "))).await);
+    assert_eq!(got["user"], ada_acct, "{got:?}");
+    assert_eq!((got["b_creds"].as_str(), got["b_root"].as_str()), ("denied", "denied"), "{got:?}");
+
+    // Bea logs out: her login goes, as her account; her next run is refused again.
+    let out = crate::teammate_logins::logout(app.clone(), person(&bea), app.db.user(&ada).unwrap(), bea.clone(), "claude".into()).await.unwrap().0;
+    assert_eq!(out["removed"], 1, "{out}");
+    let again = run_for(&app, &team, Some(&bea), "WRITE-CREDS").await;
+    assert!(again.contains("isn't logged in for you"), "{again}");
+    assert!(std::fs::read_to_string(&ada_creds).unwrap().contains("A-SECRET"), "Ada's login is untouched");
 }

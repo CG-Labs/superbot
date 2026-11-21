@@ -104,6 +104,8 @@ mod sso_http_tests;
 mod sso_saml_http_tests;
 #[cfg(test)]
 mod sso_social_http_tests;
+#[cfg(test)]
+mod teammate_accounts_http_tests;
 mod teammate_logins;
 
 use acl::{Access, Viewer, Visibility};
