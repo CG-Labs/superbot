@@ -73,6 +73,8 @@ pub struct World {
     pub races: usize,
     /// API extensions this Incus lacks, as an older release would.
     pub missing_extensions: Vec<String>,
+    /// The `server_version` it reports, if not the stand-in's own.
+    pub version: Option<String>,
     ops: BTreeMap<String, Op>,
     trusted: Vec<String>,
     next_ip: u8,
@@ -477,7 +479,7 @@ async fn handle(
         ("GET", ["1.0"]) => sync(json!({
             "auth": "trusted",
             "api_extensions": extensions(&w.missing_extensions),
-            "environment": { "server_version": "6.0-standin" },
+            "environment": { "server_version": w.version.clone().unwrap_or("standin".into()) },
         })),
         ("GET", ["1.0", "projects", p]) => match w.projects.get(*p) {
             Some(c) => sync(json!({ "name": p, "config": c })),

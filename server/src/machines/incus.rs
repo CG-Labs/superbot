@@ -541,6 +541,27 @@ fn error(status: StatusCode, v: &Value) -> ProviderError {
     }
 }
 
+/// Before 7.0.1 (so every 6.0 LTS release), changing a network ACL used by a NIC of a
+/// container outside the default project fails while applying it, after the new rules
+/// are saved, so the firewall Incus enforces no longer matches the ACL (ADR 0068).
+const MIN_VERSION: &str = "7.0.1";
+
+/// Whether an Incus `server_version` is older than [`MIN_VERSION`]. One botd can't read
+/// isn't refused for it; the API extensions are still checked.
+fn too_old(version: &str) -> bool {
+    let parse = |v: &str| -> Option<Vec<u32>> {
+        let parts: Option<Vec<u32>> = v.split('.').map(|p| p.parse().ok()).collect();
+        parts.map(|mut p| {
+            p.resize(3, 0);
+            p
+        })
+    };
+    match (parse(version), parse(MIN_VERSION)) {
+        (Some(v), Some(min)) => v < min,
+        _ => false,
+    }
+}
+
 fn operation_id(op: &str) -> Result<&str, ProviderError> {
     let id = op.strip_prefix("/1.0/operations/").unwrap_or(op);
     if !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
@@ -1004,22 +1025,28 @@ impl MachineProvider for Incus {
                     if v["auth"] != "trusted" {
                         return Err(api(403, "Incus doesn't trust botd's client certificate yet"));
                     }
+                    let version = v["environment"]["server_version"].as_str().unwrap_or("?");
+                    if too_old(version) {
+                        return Err(api(
+                            400,
+                            format!("Incus {version} is too old: botd needs {MIN_VERSION} or later, which can change a network ACL that containers in a restricted project use"),
+                        ));
+                    }
                     let have = |x: &str| v["api_extensions"].as_array().is_some_and(|a| a.iter().any(|e| e == x));
                     let missing: Vec<&str> = [
                         "network_acl",
-                        // ACLs and their default actions on a bridged NIC: Incus 6.9, or 6.0.4 on the 6.0 LTS.
                         "network_bridge_acl_devices",
                         "instances_rebuild",
                         "instance_create_start",
                         "instance_get_full",
                     ]
                     .into_iter()
-                        .filter(|x| !have(x))
-                        .collect();
+                    .filter(|x| !have(x))
+                    .collect();
                     if !missing.is_empty() {
                         return Err(api(400, format!("Incus lacks API extensions: {}", missing.join(", "))));
                     }
-                    Ok(format!("Incus {} trusts botd", v["environment"]["server_version"].as_str().unwrap_or("?")))
+                    Ok(format!("Incus {version} trusts botd"))
                 })
                 .await,
             ];

@@ -247,9 +247,9 @@ async fn real_incus_containers_enroll_stay_apart_and_follow_the_lifecycle() {
     assert_eq!(code, 200, "{s}");
     let checks = s["checks"].as_array().unwrap().clone();
     if std::env::var("SUPERBOT_INCUS_E2E_EXPECT").as_deref() == Ok("too-old") {
-        // Such as Ubuntu 24.04's own Incus 6.0.0, which refuses ACLs on a bridged NIC.
+        // The 6.0 LTS, including Ubuntu 24.04's own 6.0.0: see ADR 0068.
         assert_eq!(checks[0]["ok"], false, "{checks:?}");
-        assert!(checks[0]["detail"].as_str().unwrap().contains("network_bridge_acl_devices"), "{checks:?}");
+        assert!(checks[0]["detail"].as_str().unwrap().contains("too old: botd needs 7.0.1"), "{checks:?}");
         env.say(&format!("preflight refuses this Incus: {}", checks[0]["detail"]));
         return;
     }

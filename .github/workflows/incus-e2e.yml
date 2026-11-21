@@ -45,12 +45,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # zabbly: the current stable release. zabbly-lts-6.0: the oldest LTS botd supports.
-        # ubuntu: Ubuntu 24.04's own 6.0.0, too old for ACLs on a bridged NIC, so the test
-        # checks that botd's preflight says so.
+        # zabbly: the current stable release. zabbly-lts-7.0: the LTS botd supports.
+        # zabbly-lts-6.0 and ubuntu (24.04's own 6.0.0) are too old (ADR 0068), so the
+        # test checks that botd's preflight check says so.
         include:
           - incus: zabbly
+          - incus: zabbly-lts-7.0
           - incus: zabbly-lts-6.0
+            expect: too-old
           - incus: ubuntu
             expect: too-old
     steps:

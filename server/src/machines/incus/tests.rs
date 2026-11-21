@@ -545,6 +545,15 @@ async fn only_the_pinned_host_and_a_trusted_certificate() {
     assert!(checks[0]["detail"].as_str().unwrap().contains("lacks API extensions: network_bridge_acl_devices"), "{checks:?}");
     s.w().missing_extensions.clear();
 
+    // Every 6.0 LTS release breaks ACL updates for containers in a restricted project.
+    s.w().version = Some("6.0.7".into());
+    let checks = ok.preflight().await.unwrap();
+    assert_eq!(checks[0]["ok"], false);
+    assert!(checks[0]["detail"].as_str().unwrap().contains("Incus 6.0.7 is too old: botd needs 7.0.1"), "{checks:?}");
+    s.w().version = Some("7.0.1".into());
+    assert_eq!(ok.preflight().await.unwrap()[0]["ok"], true);
+    s.w().version = None;
+
     // Another server certificate: botd won't talk to it.
     let (other, _) = self_signed("incus.test");
     let mut c = s.credentials();
@@ -596,4 +605,14 @@ fn incus_answers_are_read_as_ours() {
         assert!(name(bad).is_err(), "{bad}");
     }
     assert!(name("superbot-m1a2b3c4d").is_ok());
+}
+
+#[test]
+fn incus_before_7_0_1_is_too_old() {
+    for v in ["6.0.0", "6.0.7", "6.9", "7.0", "7.0.0"] {
+        assert!(too_old(v), "{v}");
+    }
+    for v in ["7.0.1", "7.0.2", "7.1", "7.6", "10.0", "standin", "7.1-rc1", "?"] {
+        assert!(!too_old(v), "{v}");
+    }
 }
