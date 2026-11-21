@@ -18,7 +18,7 @@ import {
   setCookieSignedOut,
 } from "./auth";
 import { hasAccess } from "./access";
-import { ApiError, cookieSession, signIn, SuperBotApi } from "./api";
+import { ApiError, cookieSession, finishSignIn, signIn, SuperBotApi } from "./api";
 import {
   applyHandoffHistory,
   applyHandoffMessage,
@@ -39,10 +39,12 @@ import type {
   BotView,
   Me,
   Message,
+  MfaProof,
   ModelOption,
   Policy,
   PolicyMode,
   Routine,
+  ServerConfig,
   SseEvent,
   Visibility,
 } from "./types";
@@ -77,8 +79,16 @@ interface SuperBotContextValue {
   inviteCode: string | null;
   /** Keeps a code taken from the address bar, so it outlives the page that found it. */
   offerInviteCode: (code: string) => void;
-  /** `secret` is a one-time sign-in code, or the server password (break-glass). */
+  /**
+   * `secret` is a one-time sign-in code, or the server password (break-glass). Throws
+   * `MfaRequired` when the server wants a second factor: send it with `loginSecondFactor`.
+   */
   login: (baseUrl: string, secret: string) => Promise<void>;
+  /**
+   * The second step of a sign-in (ADR 0094). `finish` starts using the session; call it
+   * once any `recoveryCodes` (from setting up two-factor authentication) have been shown.
+   */
+  loginSecondFactor: (baseUrl: string, challenge: string, proof: MfaProof) => Promise<{ recoveryCodes: string[] | null; finish: () => Promise<void> }>;
   /** Signs in through one of the server's SSO providers, in the system browser. */
   loginWithSso: (baseUrl: string, providerId: string) => Promise<void>;
   logout: () => Promise<void>;
@@ -410,13 +420,20 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
     return () => sub.remove();
   }, [activeId, api]);
 
-  const login = async (baseUrl: string, secret: string) => {
-    if (!secret.trim()) throw new Error("A sign-in code or password is required");
-    const cfg = await signIn(baseUrl, secret.trim());
-    const client = new SuperBotApi(cfg);
-    await bootstrap(client);
+  const startSession = async (cfg: ServerConfig) => {
+    await bootstrap(new SuperBotApi(cfg));
     await saveCredentials(cfg);
     await setCookieSignedOut(false);
+  };
+
+  const login = async (baseUrl: string, secret: string) => {
+    if (!secret.trim()) throw new Error("A sign-in code or password is required");
+    await startSession(await signIn(baseUrl, secret.trim()));
+  };
+
+  const loginSecondFactor = async (baseUrl: string, challenge: string, proof: MfaProof) => {
+    const { config, recoveryCodes } = await finishSignIn(baseUrl, challenge, proof);
+    return { recoveryCodes, finish: () => startSession(config) };
   };
 
   const loginWithSso = async (baseUrl: string, providerId: string) => {
@@ -593,6 +610,7 @@ export function SuperBotProvider({ children }: { children: React.ReactNode }) {
       inviteCode,
       offerInviteCode,
       login,
+      loginSecondFactor,
       loginWithSso,
       logout,
       refresh,

@@ -2,6 +2,7 @@ import React from "react";
 import { render, screen, userEvent } from "@testing-library/react-native";
 import { LoginScreen } from "../LoginScreen";
 import { LOCAL_SERVER_URL } from "../../src/auth";
+import { MfaRequired } from "../../src/api";
 
 type NodeCrypto = {
   createHash(alg: string): { update(data: string): { digest(enc: string): string } };
@@ -27,7 +28,7 @@ function serverWith(providers: unknown) {
 }
 
 beforeEach(() => {
-  Object.assign(mockCtx, { login: jest.fn(), loginWithSso: jest.fn(async () => {}), error: null });
+  Object.assign(mockCtx, { login: jest.fn(), loginSecondFactor: jest.fn(), loginWithSso: jest.fn(async () => {}), error: null });
 });
 afterEach(() => {
   globalThis.fetch = realFetch;
@@ -88,5 +89,55 @@ describe("LoginScreen", () => {
     await new Promise((r) => setTimeout(r, 600));
     expect(screen.queryByText(/^Sign in with /)).not.toBeOnTheScreen();
     expect(screen.getByText("Connect")).toBeOnTheScreen();
+  });
+
+  it("asks for the second factor, and accepts a recovery code", async () => {
+    serverWith([]);
+    const finish = jest.fn(async () => {});
+    mockCtx.login = jest.fn(async () => {
+      throw new MfaRequired("Enter the code from your authenticator app, or a recovery code.", "sbm_1", "totp", null);
+    });
+    mockCtx.loginSecondFactor = jest
+      .fn()
+      .mockRejectedValueOnce(new MfaRequired("That code is wrong. Try again.", "sbm_1", "totp", null))
+      .mockResolvedValueOnce({ recoveryCodes: null, finish });
+    const user = userEvent.setup();
+    await render(<LoginScreen inviteCode={"sbc_" + "a".repeat(64)} />);
+    await user.press(screen.getByText("Connect"));
+    expect(await screen.findByText("Verify")).toBeOnTheScreen();
+    expect(screen.queryByTestId("mfa-setup")).not.toBeOnTheScreen();
+
+    await user.type(screen.getByLabelText("Second factor"), "000 000");
+    await user.press(screen.getByText("Verify"));
+    expect(mockCtx.loginSecondFactor).toHaveBeenLastCalledWith(LOCAL_SERVER_URL, "sbm_1", { totp: "000000" });
+    expect(await screen.findByText("That code is wrong. Try again.")).toBeOnTheScreen();
+
+    await user.type(screen.getByLabelText("Second factor"), "abcde-fghij");
+    await user.press(screen.getByText("Verify"));
+    expect(mockCtx.loginSecondFactor).toHaveBeenLastCalledWith(LOCAL_SERVER_URL, "sbm_1", { recoveryCode: "abcde-fghij" });
+    expect(finish).toHaveBeenCalled();
+  });
+
+  it("sets up an authenticator app at sign-in, then shows the recovery codes before going on", async () => {
+    serverWith([]);
+    const finish = jest.fn(async () => {});
+    const setup = { secret: "JBSWY3DPEHPK3PXP", otpauthUrl: "otpauth://totp/SuperBot:a?secret=JBSWY3DPEHPK3PXP", qrSvg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"></svg>' };
+    mockCtx.login = jest.fn(async () => {
+      throw new MfaRequired("This server requires two-factor authentication for your account.", "sbm_2", "enroll", setup);
+    });
+    mockCtx.loginSecondFactor = jest.fn(async () => ({ recoveryCodes: ["aaaaa-bbbbb", "ccccc-ddddd"], finish }));
+    const user = userEvent.setup();
+    await render(<LoginScreen inviteCode={"sbc_" + "b".repeat(64)} />);
+    await user.press(screen.getByText("Connect"));
+    expect(await screen.findByTestId("mfa-setup")).toBeOnTheScreen();
+    expect(screen.getByTestId("mfa-key")).toHaveTextContent("JBSW Y3DP EHPK 3PXP");
+
+    await user.type(screen.getByLabelText("Second factor"), "123456");
+    await user.press(screen.getByText("Turn on and connect"));
+    expect(mockCtx.loginSecondFactor).toHaveBeenCalledWith(LOCAL_SERVER_URL, "sbm_2", { totp: "123456" });
+    expect(await screen.findByText("ccccc-ddddd")).toBeOnTheScreen();
+    expect(finish).not.toHaveBeenCalled();
+    await user.press(screen.getByText("I saved them. Continue"));
+    expect(finish).toHaveBeenCalled();
   });
 });

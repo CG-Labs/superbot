@@ -5,15 +5,18 @@ import { colors } from "../src/theme";
 import { useAppLock } from "./AppLock";
 import { Chips } from "./Chips";
 import { PushCard, type PushApi } from "./PushCard";
+import { TwoFactorCard, type MfaApi } from "./TwoFactor";
 
 interface Props {
   onBack: () => void;
-  /** The signed-in server, for this phone's push notifications (ADR 0080). */
-  api?: PushApi;
+  /** The signed-in server, for this phone's push notifications (ADR 0080) and your second factor (ADR 0094). */
+  api?: PushApi & MfaApi;
+  /** Admins also set who must use two-factor authentication. */
+  admin?: boolean;
 }
 
 /** This device's own settings: App lock is kept on the device, push on the server for this session. */
-export function SettingsView({ onBack, api }: Props) {
+export function SettingsView({ onBack, api, admin = false }: Props) {
   return (
     <View style={styles.root}>
       <View style={styles.header}>
@@ -25,6 +28,7 @@ export function SettingsView({ onBack, api }: Props) {
       <ScrollView contentContainerStyle={styles.body}>
         <AppLockCard />
         {api ? <PushCard api={api} /> : null}
+        {api ? <TwoFactorCard api={api} admin={admin} /> : null}
       </ScrollView>
     </View>
   );

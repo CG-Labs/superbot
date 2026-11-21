@@ -441,7 +441,38 @@ export interface AdminUser {
   pendingCodes?: { count: number; expiresAt: number } | null;
   /** Their plan and their use of it (ADR 0033, 0040). */
   plan?: PlanUsage;
+  /** Their second factor (ADR 0094). */
+  mfa?: { enabled: boolean; enabledAt: number | null };
 }
+
+/** Who must have a second factor to sign in with a code or password (ADR 0094). */
+export type MfaPolicy = "off" | "admins" | "all";
+
+/** `GET /api/auth/mfa`: your own second factor, and the policy. */
+export interface MfaStatus {
+  enabled: boolean;
+  enabledAt: number | null;
+  /** Set up but not confirmed with a code yet. */
+  pending: boolean;
+  recoveryCodesLeft: number;
+  /** The policy requires one for you. */
+  required: boolean;
+  policy: MfaPolicy;
+  /** Set by AUTH_MFA on the server, so it can't be changed here. */
+  policyPinned: boolean;
+}
+
+/** A key to add to an authenticator app. */
+export interface MfaSetup {
+  /** Base32, to type in. */
+  secret: string;
+  otpauthUrl: string;
+  /** The otpauth URL as a QR code, an SVG document. */
+  qrSvg: string;
+}
+
+/** A code from the app, or a recovery code. */
+export type MfaProof = { totp: string } | { recoveryCode: string };
 
 export interface LastLogin {
   at: number;
@@ -502,6 +533,8 @@ export interface SessionView {
   id: string;
   kind: "cookie" | "token";
   method: string;
+  /** The second factor it was signed in with: "totp" or "recovery_code". */
+  mfa?: string | null;
   idpProvider?: string | null;
   label?: string | null;
   createdAt: number;

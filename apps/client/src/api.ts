@@ -13,6 +13,10 @@ import type {
   BotView,
   LoginCode,
   Message,
+  MfaPolicy,
+  MfaProof,
+  MfaSetup,
+  MfaStatus,
   ModelOption,
   MyTeamInvite,
   MyUsage,
@@ -60,6 +64,37 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * The server wants a second factor (ADR 0094): a code from an authenticator app, or a
+ * recovery code. With `mode` "enroll", the account must set one up first: `setup` has
+ * the key to add to the app, and the code it shows turns it on.
+ */
+export class MfaRequired extends ApiError {
+  constructor(
+    message: string,
+    readonly challenge: string,
+    readonly mode: "totp" | "enroll",
+    readonly setup: MfaSetup | null,
+  ) {
+    super(message, 401);
+    this.name = "MfaRequired";
+  }
+}
+
+type LoginReply = {
+  token?: string;
+  error?: string;
+  mfa?: "totp" | "enroll";
+  challenge?: string;
+  recoveryCodes?: string[];
+} & Partial<MfaSetup>;
+
+function mfaRequired(data: LoginReply | null): MfaRequired | null {
+  if (!data?.challenge || (data.mfa !== "totp" && data.mfa !== "enroll")) return null;
+  const setup = data.secret && data.otpauthUrl ? { secret: data.secret, otpauthUrl: data.otpauthUrl, qrSvg: data.qrSvg ?? "" } : null;
+  return new MfaRequired(data.error ?? "Enter the code from your authenticator app.", data.challenge, data.mfa, setup);
+}
+
 /** One-time sign-in codes an admin makes start with this (see ADR 0012). */
 export const CODE_PREFIX = "sbc_";
 
@@ -78,8 +113,10 @@ export async function signIn(baseUrl: string, secret: string, label = "SuperBot 
     headers,
     body: JSON.stringify({ ...(isCode ? { code: secret } : { password: secret }), session: "token", label }),
   });
-  const data = (await res.json().catch(() => null)) as { token?: string; error?: string } | null;
+  const data = (await res.json().catch(() => null)) as LoginReply | null;
   if (res.ok && data?.token) return { baseUrl, token: data.token };
+  const second = res.status === 401 ? mfaRequired(data) : null;
+  if (second) throw second;
   if (res.status === 404 || res.status === 405) {
     if (isCode) throw new ApiError("This server doesn't support sign-in codes. Use the password.", res.status);
     return { baseUrl, password: secret };
@@ -87,6 +124,29 @@ export async function signIn(baseUrl: string, secret: string, label = "SuperBot 
   if (res.status === 401 && !data?.error) {
     throw new ApiError(isCode ? "This server doesn't support sign-in codes. Use the password." : "Wrong password.", 401);
   }
+  throw new ApiError(data?.error ?? `HTTP ${res.status}`, res.status);
+}
+
+/**
+ * The second step of a sign-in that `signIn` answered with `MfaRequired`. A sign-in that
+ * had to set up two-factor authentication gets its recovery codes back, once. A wrong
+ * code throws `MfaRequired` again, for the same challenge.
+ */
+export async function finishSignIn(
+  baseUrl: string,
+  challenge: string,
+  proof: MfaProof,
+  label = "SuperBot app",
+): Promise<{ config: ServerConfig; recoveryCodes: string[] | null }> {
+  const res = await fetch(`${normalizeBaseUrl(baseUrl)}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ challenge, ...proof, session: "token", label }),
+  });
+  const data = (await res.json().catch(() => null)) as LoginReply | null;
+  if (res.ok && data?.token) return { config: { baseUrl, token: data.token }, recoveryCodes: data.recoveryCodes?.length ? data.recoveryCodes : null };
+  const again = res.status === 401 ? mfaRequired(data) : null;
+  if (again) throw again;
   throw new ApiError(data?.error ?? `HTTP ${res.status}`, res.status);
 }
 
@@ -356,6 +416,40 @@ export class SuperBotApi {
   /** Ends all of a user's sessions and drops their unused codes. */
   async revokeUserSessions(id: string): Promise<{ revoked: number }> {
     return this.request<{ revoked: number }>("DELETE", `/api/users/${encodeURIComponent(id)}/sessions`);
+  }
+
+  /** Resets a user's second factor, e.g. after a lost phone (ADR 0094). Not your own. */
+  async resetUserMfa(id: string): Promise<{ reset: boolean }> {
+    return this.request<{ reset: boolean }>("DELETE", `/api/users/${encodeURIComponent(id)}/mfa`);
+  }
+
+  /** Your own two-factor authentication (ADR 0094). */
+  async mfaStatus(): Promise<MfaStatus> {
+    return this.request<MfaStatus>("GET", "/api/auth/mfa");
+  }
+
+  /** A new key to add to an authenticator app. Nothing changes until `mfaConfirm`. */
+  async mfaEnroll(): Promise<MfaSetup> {
+    return this.request<MfaSetup>("POST", "/api/auth/mfa/enroll", {});
+  }
+
+  /** Turns it on with a code from the app, and returns the recovery codes, once. */
+  async mfaConfirm(totp: string): Promise<MfaStatus & { recoveryCodes: string[] }> {
+    return this.request<MfaStatus & { recoveryCodes: string[] }>("POST", "/api/auth/mfa/confirm", { totp });
+  }
+
+  async mfaNewRecoveryCodes(proof: MfaProof): Promise<MfaStatus & { recoveryCodes: string[] }> {
+    return this.request<MfaStatus & { recoveryCodes: string[] }>("POST", "/api/auth/mfa/recovery-codes", proof);
+  }
+
+  /** Turns it off; a setup not confirmed yet needs no proof. */
+  async mfaDisable(proof: MfaProof | Record<string, never> = {}): Promise<MfaStatus> {
+    return this.request<MfaStatus>("POST", "/api/auth/mfa/disable", proof);
+  }
+
+  /** Who must have a second factor (admin). */
+  async setMfaPolicy(require: MfaPolicy): Promise<MfaStatus> {
+    return this.request<MfaStatus>("PUT", "/api/auth/mfa/policy", { require });
   }
 
   async linkIdentity(id: string, body: { provider: string; subject: string; tenant?: string }): Promise<UserIdentity> {
