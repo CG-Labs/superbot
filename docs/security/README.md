@@ -20,7 +20,7 @@ Earlier reviews: [auth review, November 2026](auth-review-2026-11.md) and its [S
 ## Keeping it accurate
 
 - Every statement here must match the code on `main`. When a change makes one wrong, the same PR fixes the page.
-- Links in this folder are checked by `cargo test` (`server/tests/security_docs_links.rs`): each relative link must point at a file that exists, and each `#anchor` into a Markdown file at a heading that exists.
+- Links in this folder are checked by `cargo test` (`server/tests/security_docs_links.rs`), on every change to `docs/` or the code: each relative link must point at a file that exists, and each `#anchor` into a Markdown file at a heading that exists.
 - Numbers (session lifetimes, backup schedules, limits) are SuperBot's defaults. An operator who changes them must restate them in their own copy.
 
 ## Not in this pack yet (Planned)

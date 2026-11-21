@@ -3,7 +3,7 @@
 Short answers to common questions, as of the code on `main`. Each links to the detail. Part of the [security pack](README.md).
 
 **Where is our data stored?**
-Organisation data (users, chats, approvals, audit log, secrets, billing records) is in botd's SQLite database on the operator's server. On managed plans, each user's working files, Bot memory and harness logins are on that user's own machine. See [data flows](data-flows.md#what-is-stored-where).
+Organisation data (users, chats, approvals, audit log, secrets, billing records) is in botd's SQLite database on the operator's server. On managed plans, each user's working files, Bot memory and harness logins are on that user's own machine, and in that machine's backups. See [data flows](data-flows.md#what-is-stored-where).
 
 **Can we choose the region?**
 The operator chooses Linode regions (`MACHINE_REGIONS`) or where Incus hosts run, and self-hosting runs wherever you put it. A UK/EU region choice for the managed service is planned for M4 ([roadmap](../ROADMAP.md)).
