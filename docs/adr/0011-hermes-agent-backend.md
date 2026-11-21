@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (19 Nov 2026). The product owner, David Kennedy, accepted it on 19 Nov 2026: Hermes Agent is the default harness for managed tiers and the harness that carries the Enterprise SLA; Claude Code and other harnesses stay available as best-effort. The gate below becomes the release checklist for managed tiers. Details: [ADR 0027](0027-expo-primary-hermes-default.md). Option (a), the adapter, is built ([ADR 0015](0015-hermes-adapter.md)).
+Accepted (19 Nov 2026). The product owner, David Kennedy, accepted it on 19 Nov 2026: Hermes Agent is the default harness for managed tiers and the harness that carries the Enterprise SLA; Claude Code and other harnesses stay available as best-effort. The gate below becomes the release checklist for managed tiers. Details: [ADR 0027](0027-expo-primary-hermes-default.md). Option (a), the adapter, is built ([ADR 0015](0015-hermes-adapter.md)). The gate's status is under [Recommendation](#recommendation); per-Bot footprint measured in [ADR 0070](0070-hermes-per-bot-footprint.md).
 
 Was: Proposed (19 Nov 2026), as an assessment for the owner.
 
@@ -88,13 +88,19 @@ Hermes's gateway, cron, memory, Bot Mode, and approvals become the back end. bot
    - per-Bot memory and CPU on the smallest managed machine are measured and acceptable;
    - one upstream upgrade has been taken through the test suite without adapter changes, or with small ones;
    - tier-to-model routing works with at least two providers.
+
+   **Gate status (21 Nov 2026): not passed**, so Hermes is not the managed default yet ([ADR 0070](0070-hermes-per-bot-footprint.md), [#33](https://github.com/CG-Labs/superbot/issues/33)).
+   - Approvals end to end: **mostly passes.** The canary stops a run whose hook was skipped, against the real Hermes ([ADR 0057](0057-harness-hook-e2e-tests.md), [ADR 0063](0063-canary-covers-every-hooked-tool.md)). Fail-closed on hook timeout is configured and checked in the managed config, but no test makes the real Hermes time a hook out.
+   - Footprint: **measured; passes with conditions** ([ADR 0070](0070-hermes-per-bot-footprint.md)). About 330–370 MiB PSS and 5 CPU-seconds per run, nothing while idle, 487 MiB of disk per Bot, a 2.6 GiB install. A Starter (1 vCPU, 2 GiB) fits 4 runs at once for its 3 Bots. Conditions: share one dependency environment across Bots, and cap concurrent runs per machine by tier.
+   - Upstream upgrade: **not done.** The pin hasn't moved since it was set.
+   - Two providers: **built, not shown.** Tier routes pass a provider to Hermes ([ADR 0033](0033-tiers-model-routing.md)); no run has gone through two real providers yet.
 3. Reject (c). It throws away the approval, audit, and multi-user work, and the harness-agnostic, Rust-first design, for features botd already has.
 
 ## Consequences
 
 - If accepted: a new adapter, `policy.rs` and the unguarded-run canary learn Hermes tool names, the installer and Docker image gain Python 3.14 and a pinned Hermes, and the roadmap tracks (a) in M2 and the (b) gate in M3.
 - Hermes's own approval gate, cron, messaging gateway, and Bot Mode stay unused in SuperBot. botd remains the single place for policy, audit, routines, and Bot-to-Bot.
-- Open: whether Hermes's memory and skill learning run for SuperBot Bots; the shorter approval wait for Hermes Bots; Hermes's footprint per Bot on small machines.
+- Open: whether Hermes's memory and skill learning run for SuperBot Bots; the shorter approval wait for Hermes Bots. Hermes's footprint per Bot on small machines is measured in [ADR 0070](0070-hermes-per-bot-footprint.md).
 
 ## Sources
 
