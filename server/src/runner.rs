@@ -27,6 +27,32 @@ use tokio::sync::{broadcast, oneshot, watch, Notify};
 /// called in. If it hasn't, the harness ignored the hook and the run is stopped.
 const HOOK_GRACE: Duration = Duration::from_secs(5);
 
+/// How long past the run timeout a run's token lives, for the harness to be stopped.
+/// The run ending revokes it well before then.
+const TOKEN_GRACE: Duration = Duration::from_secs(60);
+
+/// One attempt's live `BOT_TOKEN` (ADR 0083). Dropping it revokes the token.
+struct LiveToken<'a> {
+    app: &'a App,
+    secret: String,
+    id: String,
+    by: Who,
+    bot: String,
+    message: i64,
+}
+
+impl Drop for LiveToken<'_> {
+    fn drop(&mut self) {
+        crate::secrets::redact::forget(&self.secret);
+        let Some(e) = self.app.run_tokens.revoke(&self.id) else { return };
+        let details = json!({
+            "jti": e.id, "runId": e.run, "owner": e.owner, "forUser": e.for_user,
+            "reason": "run_ended", "livedMs": crate::db::now().saturating_sub(e.issued_at),
+        });
+        self.app.db.record(&self.by.event("bot.token_revoked").target("message", &self.message.to_string()).bot(&self.bot).details(details));
+    }
+}
+
 pub struct Config {
     pub data_dir: PathBuf,
     /// Holds one working folder per user (`users/<id>`, ADR 0029).
@@ -36,7 +62,7 @@ pub struct Config {
     /// Added to PATH so Bots can run `botctl`.
     pub bin_dir: PathBuf,
     pub api_url: String,
-    /// Signs each Bot's own `BOT_TOKEN` (`isolation::bot_token`). Made fresh at each start.
+    /// Signs each run's own `BOT_TOKEN` (`isolation::RunTokens`). Made fresh at each start.
     pub bot_key: String,
     pub run_timeout: Duration,
     pub default_harness: String,
@@ -193,6 +219,8 @@ pub struct App {
     pub account_removals: crate::machines::offboard::Working,
     /// Teammate accounts here in use and being removed, kept apart (ADR 0066).
     pub teammate_gate: crate::teammate_removals::Gate,
+    /// Each live run's own `BOT_TOKEN` (ADR 0083): issued when it starts, revoked when it ends.
+    pub run_tokens: isolation::RunTokens,
     closing: AtomicBool,
 }
 
@@ -201,7 +229,9 @@ impl App {
         let license = Arc::new(crate::license::Licensing::new(crate::license::trusted(), &cfg.data_dir));
         let seats = license.clone();
         db.set_seat_cap(Box::new(move || seats.seat_cap()));
+        let run_tokens = isolation::RunTokens::new(&cfg.bot_key);
         Arc::new(App {
+            run_tokens,
             license,
             db,
             cfg,
@@ -651,8 +681,9 @@ impl App {
     }
 
     /// Where a Bot's run happens and what it gets: its owner's working folder, and
-    /// the server-wide secrets plus its owner's, never another user's. `BOT_TOKEN`
-    /// proves to botd which Bot is calling, so it can only act as itself.
+    /// the server-wide secrets plus its owner's, never another user's. Its `BOT_TOKEN`
+    /// comes as each attempt starts (`run_token`), so it can only act as itself, and
+    /// only while it runs.
     #[cfg(test)]
     pub(crate) fn run_space(&self, bot: &Bot) -> Option<(PathBuf, HashMap<String, String>)> {
         self.run_space_with(bot, true)
@@ -665,12 +696,9 @@ impl App {
         let s = crate::secrets::global();
         let keys = if owner_keys { s.harness_env_for(&bot.owner_id) } else { s.harness_env() };
         let mut env: HashMap<String, String> = keys.into_iter().map(|(k, v)| (k, v.expose().to_string())).collect();
-        let token = isolation::bot_token(&self.cfg.bot_key, &bot.id, &bot.owner_id);
-        crate::secrets::redact::register(&token);
         env.extend([
             ("BOT_ID".to_string(), bot.id.clone()),
             ("BOT_API".to_string(), self.cfg.api_url.clone()),
-            ("BOT_TOKEN".to_string(), token),
             ("SUPERBOT_BOTCTL".to_string(), self.cfg.bin_dir.join("botctl").display().to_string()),
         ]);
         let path = std::env::var("PATH").unwrap_or_default();
@@ -943,6 +971,10 @@ impl App {
                 }
             }
             env.insert("SUPERBOT_RUN_ID".into(), run_id.clone());
+            // A teammate's run in their own account or OS user acts with no more than theirs.
+            let bound = teammate.map(String::from).or_else(|| spot.teammate_user.as_ref().and(for_other.clone()));
+            let token = self.run_token(&bot, msg, &by, &run_id, bound.as_deref(), attempt, &host);
+            env.insert("BOT_TOKEN".into(), token.secret.clone());
             if spot.screens
                 && spot.machine.is_none()
                 && let Some(screens) = &self.screens
@@ -1045,6 +1077,7 @@ impl App {
                 }
                 Some(to) => self.run_there(&bot, msg, &spot, to, adapter, input, abort_rx.clone(), emit).await,
             }
+            drop(token);
             timer.abort();
             if let Some(c) = canary {
                 c.abort();
@@ -1128,6 +1161,26 @@ impl App {
             }
             return;
         }
+    }
+
+    /// A new `BOT_TOKEN` for one attempt of a run (ADR 0083), audited as
+    /// `bot.token_issued`. It lives no longer than an attempt may, and is revoked
+    /// (`bot.token_revoked`) when the returned guard drops, however the attempt ends.
+    #[allow(clippy::too_many_arguments)]
+    fn run_token(&self, bot: &Bot, msg: &Message, by: &Who, run_id: &str, for_user: Option<&str>, attempt: usize, host: &Value) -> LiveToken<'_> {
+        let ttl = self.cfg.run_timeout.saturating_add(TOKEN_GRACE).as_millis().min(i64::MAX as u128) as i64;
+        let (secret, entry) = self.run_tokens.issue(&bot.id, &bot.owner_id, run_id, for_user, crate::db::now(), ttl);
+        crate::secrets::redact::register(&secret);
+        let mut details = json!({
+            "jti": entry.id, "runId": run_id, "attempt": attempt + 1, "owner": bot.owner_id,
+            "expiresAt": entry.expires_at, "trigger": msg.role, "messageId": msg.id,
+        });
+        if let Some(u) = for_user {
+            details["forUser"] = json!(u);
+        }
+        merge(&mut details, host);
+        self.db.record(&by.event("bot.token_issued").target("message", &msg.id.to_string()).bot(&bot.id).details(details));
+        LiveToken { app: self, secret, id: entry.id, by: by.clone(), bot: bot.id.clone(), message: msg.id }
     }
 
     /// This server's cap on runs at once (ADR 0073). None: no cap.
@@ -1439,7 +1492,7 @@ impl App {
     /// folders, botctl there, and botd's API through the agent's relay; its screen
     /// there, if any, comes after (ADR 0045).
     /// A teammate's run as their own user (ADR 0048) works in that user's home, and its
-    /// token is bound to them (`isolation::bot_token_for`).
+    /// token is bound to them (`run_token`).
     fn spot(&self, bot: &Bot, bot_dir: PathBuf, (cwd, mut env): (PathBuf, HashMap<String, String>), place: Place, for_other: Option<&str>) -> Spot {
         let local = |p: Option<PathBuf>| p.unwrap_or_default();
         match place {
@@ -1471,10 +1524,7 @@ impl App {
                 env.insert("BOT_API".into(), layout.api.clone());
                 env.insert("SUPERBOT_BOTCTL".into(), botctl.display().to_string());
                 let teammate_user = match (teammate, for_other) {
-                    (Some(t), Some(u)) => {
-                        let token = isolation::bot_token_for(&self.cfg.bot_key, &bot.id, &bot.owner_id, u);
-                        crate::secrets::redact::register(&token);
-                        env.insert("BOT_TOKEN".into(), token);
+                    (Some(t), Some(_)) => {
                         layout.user_file = format!("{}/USER.md", t.home);
                         (layout.home, layout.workspace, layout.bots) = (t.home, t.workspace, t.bots);
                         Some(t.user)
@@ -1640,7 +1690,7 @@ impl App {
     }
 
     /// A teammate's run here (ADR 0064) works in their account's folders for the owner's
-    /// Bots: its own workspace, HOME and memory copy, with a token bound to them.
+    /// Bots: its own workspace, HOME and memory copy. Its token is bound to them (`run_token`).
     fn in_teammate_space(&self, spot: &mut Spot, iso: &Isolation, bot: &Bot, teammate: &str) {
         let space = Space::Teammate { owner: &bot.owner_id, teammate };
         let (Some(ws), Some(home), Some(mem), Some(dir)) = (iso.workspace_in(space), iso.home_in(space), iso.memory_file_in(space, &bot.id), iso.memory_dir_in(space)) else {
@@ -1648,9 +1698,6 @@ impl App {
         };
         spot.ctx = Some(Ctx { workspace: ws.clone(), home: home.clone(), readable: true });
         (spot.cwd, spot.home, spot.memory, spot.user_file) = (ws, Some(home), mem, dir.join("USER.md"));
-        let token = isolation::bot_token_for(&self.cfg.bot_key, &bot.id, &bot.owner_id, teammate);
-        crate::secrets::redact::register(&token);
-        spot.env.insert("BOT_TOKEN".into(), token);
     }
 
     /// The memory copy a teammate's run edits, made fresh from botd's (ADR 0064). The
@@ -2731,11 +2778,9 @@ mod tests {
         assert_eq!(env_a.get(&key), Some(&ada_key));
         assert_eq!(env_a2.get(&key), Some(&ada_key));
         assert_eq!(env_b.get(&key), None, "Ada's key never reaches Bea's Bot");
-        let token = |e: &HashMap<String, String>| e["BOT_TOKEN"].clone();
-        assert_eq!(isolation::token_bot(&app.cfg.bot_key, &token(&env_a)), Some((a.id.as_str(), ada.id.as_str())));
-        assert_eq!(isolation::token_bot(&app.cfg.bot_key, &token(&env_b)), Some((b.id.as_str(), bea.id.as_str())));
-        assert_ne!(token(&env_a), token(&env_a2), "each Bot has its own token, even with one owner");
-        assert_eq!(crate::secrets::redact::text(&token(&env_a)), crate::secrets::redact::MARK);
+        for e in [&env_a, &env_a2, &env_b] {
+            assert!(!e.contains_key("BOT_TOKEN"), "a Bot's token comes only with a run (ADR 0083)");
+        }
 
         let facts = |u: &str| std::fs::read_to_string(app.user_file(u).unwrap()).unwrap();
         assert!(facts(&ada.id).contains("Ada") && facts(&bea.id).contains("Bea"));

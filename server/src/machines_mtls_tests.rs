@@ -1283,6 +1283,9 @@ async fn a_users_bot_runs_on_their_machine_with_approvals_and_memory() {
     wait_for_event(&env, "bot.run_finished").await;
     let memory = std::fs::read_to_string(env.app.data_memory_file(&bot.id).unwrap()).unwrap();
     assert!(memory.contains("- learned on the machine"), "{memory}");
+    // Its token ended with it (ADR 0083): what the run left on the machine can't call botd.
+    let (code, _) = via_relay(&api, Some(&bot_token), "/api/bots", Value::Null).await;
+    assert_eq!(code, 403, "the relay refuses a token whose run is over");
 
     let routed = events(&env, "bot.run_routed").await;
     assert_eq!(
@@ -1424,7 +1427,7 @@ async fn a_machine_runs_and_relays_only_for_its_own_user() {
 
     // Bea's Bot token can't use Ada's machine to reach botd, and no token can't either.
     let api = m.agent_api();
-    let bea = crate::isolation::bot_token(&env.app.cfg.bot_key, &bea_bot.id, &ub);
+    let bea = env.app.run_tokens.issue(&bea_bot.id, &ub, "r1", None, crate::db::now(), 60_000).0;
     let (code, _) = via_relay(&api, Some(&bea), "/api/bots", Value::Null).await;
     assert_eq!(code, 403);
     let (code, _) = via_relay(&api, None, "/api/bots", Value::Null).await;
@@ -1433,7 +1436,7 @@ async fn a_machine_runs_and_relays_only_for_its_own_user() {
     assert_eq!(reason_count(&denied, "another_users_bot"), 1, "{denied:?}");
     assert_eq!(reason_count(&denied, "no_bot_token"), 1, "{denied:?}");
     // Ada's own Bot gets through.
-    let ada = crate::isolation::bot_token(&env.app.cfg.bot_key, &ada_bot.id, &ua);
+    let ada = env.app.run_tokens.issue(&ada_bot.id, &ua, "r2", None, crate::db::now(), 60_000).0;
     let body = json!({ "from": ada_bot.id, "event": { "tool_name": "Bash", "tool_input": { "command": "ls" } } });
     let (code, verdict) = via_relay(&api, Some(&ada), "/api/approvals/check", body).await;
     assert_eq!(
