@@ -45,13 +45,7 @@ async fn serve(recipients: Vec<age::x25519::Recipient>) -> Env {
     cp.routing = crate::machines::route::Routing::On;
     let e = cp.enroll_with(Enrollment::for_tests(9, mport, aport).with_agent(AGENT.as_bytes())).unwrap();
     cp.firewall_with(firewall::Settings { sources: Vec::new(), ssh: Vec::new() }).unwrap();
-    let s = Settings {
-        s3: s3.settings(),
-        prefix: "t/".into(),
-        recipients,
-        interval_ms: DAY_MS,
-        retention: Retention::parse("7,pro=30").unwrap(),
-    };
+    let s = Settings { retention: Retention::retention("7,pro=30").unwrap(), ..Settings::with(s3.settings(), "t/", recipients) };
     cp.offsite = Some(Arc::new(Offsite::new(s).unwrap()));
     let cp = Arc::new(cp);
     let c = cp.clone();
@@ -387,4 +381,170 @@ fn backups_are_off_unless_configured_and_need_a_provider_that_exports() {
     let off = ControlPlane::from_env(&linode, |k| if k == "MACHINE_REGIONS" { "gb-lon".into() } else { String::new() }).unwrap();
     assert!(off.offsite.is_none());
     assert!(off.describe().contains("off-host backups off"), "{}", off.describe());
+}
+
+/// Alerts by email to ops@example.com through a stand-in SMTP server (ADR 0061).
+fn alerts_to(env: &Env, mail: &crate::notify::smtp::fake::Server) {
+    let smtp = crate::notify::smtp::Smtp::for_test("127.0.0.1", mail.port, crate::notify::smtp::Tls::None, None, None);
+    let _ = env.app.notifier.set(Arc::new(crate::notify::Notifier::new(Some(smtp), Some("https://bots.example.com".into()))));
+    let s = crate::notify::Settings {
+        email: crate::notify::EmailSettings { enabled: true, to: vec!["ops@example.com".into()], deciders: true },
+        ..Default::default()
+    };
+    crate::notify::save(&env.app.db, &s);
+}
+
+async fn mail_with(mail: &crate::notify::smtp::fake::Server, subject: &str) -> crate::notify::smtp::fake::Received {
+    let mut found = None;
+    until(subject, || {
+        found = mail.got.lock().unwrap().iter().find(|m| m.headers.contains(subject)).cloned();
+        found.is_some()
+    })
+    .await;
+    found.unwrap()
+}
+
+#[tokio::test]
+async fn machines_past_their_rpo_are_flagged_alerted_and_cleared_by_a_backup() {
+    let mut env = serve(Vec::new()).await;
+    let mail = crate::notify::smtp::fake::start(Default::default()).await;
+    alerts_to(&env, &mail);
+    let (uid, m) = enrolled(&mut env, "ada@example.com").await;
+    assert_eq!(m.tier, "starter");
+    use crate::machines::recovery;
+
+    // New, with nothing on it yet: within its RPO (26 hours on starter).
+    assert_eq!(recovery::watch(&env.app, &env.cp), 0);
+    let (code, r) = json_call(&env, "GET", "/api/machines/recovery", "").await;
+    assert_eq!(code, 200, "{r}");
+    assert_eq!((r["tracked"].as_u64(), r["breaching"].as_u64()), (Some(1), Some(0)), "{r}");
+    let starter = r["objectives"].as_array().unwrap().iter().find(|o| o["tier"] == "starter").unwrap().clone();
+    assert_eq!((starter["intervalHours"].as_i64(), starter["rpoHours"].as_i64(), starter["rtoMinutes"].as_i64()), (Some(24), Some(26), Some(60)), "{r}");
+    assert_eq!(r["machines"][0]["rpoHours"].as_i64(), Some(26), "{r}");
+
+    // 27 hours on with no backup: a breach, audited once and alerted.
+    env.app.db.machine_backdate(&m.id, 27 * 3_600_000);
+    assert_eq!(recovery::watch(&env.app, &env.cp), 1);
+    assert_eq!(recovery::watch(&env.app, &env.cp), 1, "still open");
+    let breached = events(&env, "machine.rpo_breached").await;
+    assert_eq!(breached.len(), 1, "once, not every check: {breached:?}");
+    assert_eq!((breached[0]["targetId"].as_str(), breached[0]["outcome"].as_str(), breached[0]["details"]["rpoHours"].as_i64()), (Some(m.id.as_str()), Some("failure"), Some(26)));
+    let got = mail_with(&mail, "ada@example.com's machine has no off-host backup within its RPO").await;
+    assert_eq!(got.to, ["ops@example.com"]);
+    assert!(got.body.contains("No off-host backup of it yet.") && got.body.contains("https://bots.example.com/console/#machines"), "{}", got.body);
+    let mut sent = Vec::new();
+    for _ in 0..100 {
+        sent = events(&env, "notification.sent").await;
+        if !sent.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!((sent[0]["targetId"].as_str(), sent[0]["details"]["event"].as_str()), (Some(m.id.as_str()), Some("machine.rpo_breached")), "{sent:?}");
+    let (_, r) = json_call(&env, "GET", "/api/machines/recovery", "").await;
+    assert_eq!(r["breaching"].as_u64(), Some(1), "{r}");
+    assert!(r["breaches"][0]["endedAt"].is_null() && r["machines"][0]["breach"] == true, "{r}");
+    let (_, view) = json_call(&env, "GET", &format!("/api/users/{uid}/machine"), "").await;
+    assert_eq!((view["recovery"]["breach"].as_bool(), view["recovery"]["lastBackupAt"].is_null()), (Some(true), true), "{view}");
+
+    // A backup ends it.
+    let b = back_up(&env, &uid).await;
+    assert_eq!(b.state, "done", "{:?}", b.error);
+    assert_eq!(recovery::watch(&env.app, &env.cp), 0);
+    let recovered = events(&env, "machine.rpo_recovered").await;
+    assert_eq!((recovered.len(), recovered[0]["details"]["reason"].as_str()), (1, Some("backed_up")), "{recovered:?}");
+    mail_with(&mail, "ada@example.com's machine is back within its RPO").await;
+    let (_, r) = json_call(&env, "GET", "/api/machines/recovery", "").await;
+    assert_eq!((r["breaching"].as_u64(), r["breaches"][0]["endReason"].as_str()), (Some(0), Some("backed_up")), "{r}");
+    assert_eq!(r["machines"][0]["lastBackupAt"].as_i64(), Some(b.created_at), "{r}");
+
+    // Each tier on its own schedule and RPO: 13 hours is fine on starter (every 24 hours,
+    // RPO 26), but due and past its RPO on pro (every 12, RPO 14).
+    env.app.db.machine_backup_backdate(&b.id, 15 * 3_600_000);
+    assert_eq!(backup::pass(&env.app, &env.cp).await, 0, "starter isn't due");
+    assert_eq!(recovery::watch(&env.app, &env.cp), 0);
+    let mut mm = env.app.db.machine(&m.id).unwrap();
+    mm.tier = "pro".into();
+    assert!(env.app.db.save_machine(&mm, mm.state));
+    assert_eq!(recovery::watch(&env.app, &env.cp), 1, "past pro's 14 hours");
+    assert_eq!(events(&env, "machine.rpo_breached").await[0]["details"]["rpoHours"].as_i64(), Some(14));
+    assert_eq!(backup::pass(&env.app, &env.cp).await, 1, "due on pro's 12 hours");
+    assert_eq!(recovery::watch(&env.app, &env.cp), 0);
+
+    // A destroyed machine isn't held to it, and its open breach ends.
+    env.app.db.machine_backup_backdate(&env.app.db.machine_last_backup(&m.id).unwrap().id, 15 * 3_600_000);
+    assert_eq!(recovery::watch(&env.app, &env.cp), 1);
+    let (code, _) = json_call(&env, "DELETE", &format!("/api/users/{uid}/machine"), "").await;
+    assert_eq!(code, 200);
+    assert_eq!(recovery::watch(&env.app, &env.cp), 0);
+    let (_, r) = json_call(&env, "GET", "/api/machines/recovery", "").await;
+    assert_eq!((r["tracked"].as_u64(), r["breaches"][0]["endReason"].as_str()), (Some(0), Some("destroyed")), "{r}");
+}
+
+#[tokio::test]
+async fn restores_are_timed_against_their_tiers_rto() {
+    let mut env = serve(Vec::new()).await;
+    let mail = crate::notify::smtp::fake::start(Default::default()).await;
+    alerts_to(&env, &mail);
+    let (uid, m) = enrolled(&mut env, "ada@example.com").await;
+    let b = back_up(&env, &uid).await;
+
+    // Timed from the request to the agent enrolling again, within starter's 60 minutes.
+    let r = restore_until(&env, &uid, json!({ "backupId": b.id }), "enrolling").await;
+    assert_eq!((r.tier.as_deref(), r.rto_ms), (Some("starter"), Some(60 * 60_000)));
+    let token = read(&env, &m.label, "/etc/superbot/enroll-token").unwrap();
+    agent::enroll(&config(&env, &m.id, &token)).await.unwrap();
+    backup::follow_up(&env.app, &env.cp).await;
+    let r = env.app.db.machine_restore(&r.id).unwrap();
+    assert_eq!(r.state, "done");
+    let took = r.duration_ms.expect("timed");
+    let enrolled_at = env.app.db.machine(&m.id).unwrap().enrolled_at.unwrap();
+    assert_eq!(took, enrolled_at - r.created_at, "until it enrolled, not until botd looked");
+    assert!(r.rto_exceeded_at.is_none());
+    let restored = events(&env, "machine.restored").await;
+    assert_eq!((restored[0]["details"]["durationMs"].as_i64(), restored[0]["details"]["withinRto"].as_bool()), (Some(took), Some(true)), "{restored:?}");
+    let (_, rec) = json_call(&env, "GET", "/api/machines/recovery", "").await;
+    assert_eq!((rec["restores"][0]["durationMs"].as_i64(), rec["restores"][0]["withinRto"].as_bool()), (Some(took), Some(true)), "{rec}");
+    assert_eq!(rec["machines"][0]["lastRestore"]["withinRto"].as_bool(), Some(true), "{rec}");
+    // What's on it now came from the backup, so it's covered from when the restore ended.
+    assert!(rec["machines"][0]["coveredSince"].as_i64() >= r.finished_at, "{rec}");
+
+    // Enrolled within its RTO, but botd only looks after it: on time, not late.
+    let r = restore_until(&env, &uid, json!({ "backupId": b.id }), "enrolling").await;
+    let token = read(&env, &m.label, "/etc/superbot/enroll-token").unwrap();
+    agent::enroll(&config(&env, &m.id, &token)).await.unwrap();
+    env.app.db.machine_restore_backdate(&r.id, 61 * 60_000);
+    env.app.db.machine_restore_replaced_backdate(&r.id, 61 * 60_000);
+    env.app.db.machine_enrolled_backdate(&m.id, 61 * 60_000);
+    backup::follow_up(&env.app, &env.cp).await;
+    let r = env.app.db.machine_restore(&r.id).unwrap();
+    assert!(r.state == "done" && r.duration_ms.unwrap() <= 60 * 60_000 && r.rto_exceeded_at.is_none(), "{r:?}");
+    assert!(events(&env, "machine.restore_rto_exceeded").await.is_empty());
+
+    // Still underway past its RTO: audited and alerted once, then recorded as late.
+    let r = restore_until(&env, &uid, json!({ "backupId": b.id }), "enrolling").await;
+    env.app.db.machine_restore_backdate(&r.id, 61 * 60_000);
+    backup::follow_up(&env.app, &env.cp).await;
+    backup::follow_up(&env.app, &env.cp).await;
+    let late = events(&env, "machine.restore_rto_exceeded").await;
+    assert_eq!(late.len(), 1, "{late:?}");
+    assert_eq!((late[0]["details"]["underway"].as_bool(), late[0]["details"]["rtoMs"].as_i64()), (Some(true), Some(3_600_000)), "{late:?}");
+    let got = mail_with(&mail, "Restoring ada@example.com's machine took longer than its RTO").await;
+    assert!(got.body.contains("RTO 60 minutes; it has taken 61 minutes."), "{}", got.body);
+    let token = read(&env, &m.label, "/etc/superbot/enroll-token").unwrap();
+    agent::enroll(&config(&env, &m.id, &token)).await.unwrap();
+    backup::follow_up(&env.app, &env.cp).await;
+    let r = env.app.db.machine_restore(&r.id).unwrap();
+    assert!(r.state == "done" && r.duration_ms.unwrap() > 60 * 60_000 && r.rto_exceeded_at.is_some(), "{r:?}");
+    assert_eq!(events(&env, "machine.restore_rto_exceeded").await.len(), 1, "not again when it finishes");
+    let restored = events(&env, "machine.restored").await;
+    assert_eq!(restored[0]["details"]["withinRto"].as_bool(), Some(false), "{restored:?}");
+
+    // A failed restore is alerted too.
+    let mut mm = env.app.db.machine(&m.id).unwrap();
+    mm.firewall_id = None;
+    env.app.db.save_machine(&mm, mm.state);
+    restore_until(&env, &uid, json!({ "backupId": b.id }), "failed").await;
+    let got = mail_with(&mail, "Restoring ada@example.com's machine failed").await;
+    assert!(got.body.contains("firewall"), "{}", got.body);
 }

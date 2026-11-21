@@ -72,6 +72,12 @@ fn esc(s: &str) -> String {
 }
 
 pub fn body(format: Format, n: &Notice) -> Value {
+    if let (NoticeKind::Alert, Some(a)) = (n.kind, &n.alert) {
+        return match format {
+            Format::Slack => json!({ "text": alert_text(n, a) }),
+            Format::Json => json!({ "type": a.event, "alert": a, "text": n.summary(), "sentAt": crate::db::now() }),
+        };
+    }
     match format {
         Format::Slack => json!({ "text": slack_text(n) }),
         Format::Json => json!({
@@ -79,6 +85,7 @@ pub fn body(format: Format, n: &Notice) -> Value {
                 NoticeKind::Approval => "approval.requested",
                 NoticeKind::Digest => "approval.digest",
                 NoticeKind::Test => "notification.test",
+                NoticeKind::Alert => "alert",
             },
             "bot": { "id": n.bot_id, "name": n.bot_name },
             "approvals": n.items,
@@ -87,6 +94,17 @@ pub fn body(format: Format, n: &Notice) -> Value {
             "sentAt": crate::db::now(),
         }),
     }
+}
+
+fn alert_text(n: &Notice, a: &super::Alert) -> String {
+    let mut out = format!("*{}*", esc(&n.summary()));
+    for l in &a.lines {
+        out.push_str(&format!("\n• {}", esc(l)));
+    }
+    if let Some(l) = &a.link {
+        out.push_str(&format!("\n<{l}|Open the console>"));
+    }
+    out
 }
 
 fn slack_text(n: &Notice) -> String {
@@ -214,7 +232,28 @@ mod tests {
                 console_link: Some("https://bots.example.com/console/#audit?target=approval:a1".into()),
             }],
             more: 0,
+            alert: None,
         }
+    }
+
+    #[test]
+    fn alerts_carry_their_event_and_lines() {
+        let a = crate::notify::Alert {
+            event: "machine.rpo_breached".into(),
+            title: "ada@example.com's machine is past its RPO".into(),
+            lines: vec!["Tier: pro <fast>".into()],
+            target_type: "machine".into(),
+            target_id: "m1".into(),
+            link: Some("https://bots.example.com/console/#machines".into()),
+        };
+        let n = Notice { kind: NoticeKind::Alert, bot_id: String::new(), bot_name: String::new(), items: vec![], more: 0, alert: Some(a) };
+        let t = body(Format::Slack, &n)["text"].as_str().unwrap().to_string();
+        assert!(t.starts_with("*ada@example.com's machine is past its RPO*") && t.contains("• Tier: pro &lt;fast&gt;"), "{t}");
+        assert!(t.contains("<https://bots.example.com/console/#machines|Open the console>"), "{t}");
+        let j = body(Format::Json, &n);
+        assert_eq!((j["type"].as_str(), j["alert"]["targetId"].as_str()), (Some("machine.rpo_breached"), Some("m1")));
+        assert!(n.email_body(None).contains("Console (admins): https://bots.example.com/console/#machines"));
+        assert_eq!(n.email_subject(), "[SuperBot] ada@example.com's machine is past its RPO");
     }
 
     #[test]

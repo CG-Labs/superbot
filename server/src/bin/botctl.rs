@@ -140,6 +140,8 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine rebuild <user> status|cancel      How its rebuild is going, or cancel one not yet sent
   botctl machine backups [<user>]                  Off-host backups (ADR 0071): every one and the settings, or the user's and its last restore
   botctl machine backup <user>                     Back it up to object storage now
+  botctl machine recovery                          Each tier's RPO and RTO, machines past their RPO, and how
+                                                   long restores took (ADR 0074)
   botctl machine restore <user> <backup-id> [--identity <age-key-file>] --yes  Make it again from that backup; it enrolls anew
   botctl machine restore <user> status             How its latest restore went
   botctl machine bot-user <user>                   Run its Bots as their own OS user now (MACHINE_BOT_USER), retrying a failure
@@ -681,12 +683,13 @@ fn rebuild_request(args: &[&str]) -> Result<(&'static str, String, Option<String
     })
 }
 
-/// `botctl machine backups|backup|restore ...` (ADR 0071): the request to send. The
+/// `botctl machine backups|backup|recovery|restore ...` (ADR 0071, 0074): the request to send. The
 /// identity file is read here and sent for this restore only.
 fn backup_request(args: &[&str], read: impl Fn(&str) -> Result<String, String>) -> Result<(&'static str, String, Option<String>), String> {
     let at = |user: &str, verb: &str| format!("/api/users/{}/machine/{verb}", encode(user));
     Ok(match args {
         ["backups"] => ("GET", "/api/machines/backups".into(), None),
+        ["recovery"] => ("GET", "/api/machines/recovery".into(), None),
         ["backups", user] => ("GET", at(user, "backups"), None),
         ["backup", user] => ("POST", at(user, "backups"), None),
         ["restore", user, "status"] => ("GET", at(user, "restore"), None),
@@ -698,7 +701,7 @@ fn backup_request(args: &[&str], read: impl Fn(&str) -> Result<String, String>) 
             ("POST", at(user, "restore"), Some(json!({ "backupId": id, "identity": identity }).to_string()))
         }
         ["restore", _, _, ..] => return Err("Restoring replaces the machine and everything on it since the backup; add --yes".into()),
-        _ => return Err("Usage: botctl machine backups [<user>] | backup <user> | restore <user> <backup-id> [--identity <file>] --yes | restore <user> status".into()),
+        _ => return Err("Usage: botctl machine backups [<user>] | backup <user> | recovery | restore <user> <backup-id> [--identity <file>] --yes | restore <user> status".into()),
     })
 }
 
@@ -1000,7 +1003,7 @@ fn run(args: &[String]) -> Result<String, String> {
         ["machine", "harness-logins", user] => op("GET", &format!("{}/harness-logins", login_base(user)), None),
         ["machine", "harness-logout", user, harness] => op("DELETE", &format!("{}/harness-logins/{}", login_base(user), encode(harness)), None),
         ["machine", "legacy"] => op("GET", "/api/machines/legacy", None),
-        ["machine", rest @ ..] if matches!(rest.first(), Some(&("backups" | "backup" | "restore"))) => {
+        ["machine", rest @ ..] if matches!(rest.first(), Some(&("backups" | "backup" | "restore" | "recovery"))) => {
             let (method, path, body) = backup_request(rest, |f| std::fs::read_to_string(f).map_err(|e| format!("--identity {f}: {e}")))?;
             op(method, &path, body)
         }
@@ -1290,6 +1293,7 @@ mod tests {
         assert!(rebuild_request(&["u1", "--discard"]).is_err());
         let read = |f: &str| if f == "key.txt" { Ok("AGE-SECRET-KEY-1X".to_string()) } else { Err(format!("{f}: missing")) };
         assert_eq!(backup_request(&["backups"], read).unwrap(), ("GET", "/api/machines/backups".into(), None));
+        assert_eq!(backup_request(&["recovery"], read).unwrap(), ("GET", "/api/machines/recovery".into(), None));
         assert_eq!(backup_request(&["backups", "a@example.com"], read).unwrap(), ("GET", "/api/users/a%40example.com/machine/backups".into(), None));
         assert_eq!(backup_request(&["backup", "u1"], read).unwrap(), ("POST", "/api/users/u1/machine/backups".into(), None));
         assert_eq!(backup_request(&["restore", "u1", "status"], read).unwrap(), ("GET", "/api/users/u1/machine/restore".into(), None));

@@ -297,6 +297,8 @@ pub enum NoticeKind {
     Approval,
     Digest,
     Test,
+    /// About the server, not an approval (ADR 0074): `Notice::alert`.
+    Alert,
 }
 
 impl NoticeKind {
@@ -305,8 +307,24 @@ impl NoticeKind {
             NoticeKind::Approval => "approval",
             NoticeKind::Digest => "digest",
             NoticeKind::Test => "test",
+            NoticeKind::Alert => "alert",
         }
     }
+}
+
+/// Something admins need to act on, such as a machine past its RPO (ADR 0074). It goes
+/// to the global email list and webhook, never to a Bot's deciders or own webhook.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Alert {
+    /// The audit action it reports, e.g. `machine.rpo_breached`.
+    pub event: String,
+    pub title: String,
+    pub lines: Vec<String>,
+    pub target_type: String,
+    pub target_id: String,
+    /// The console page it's about; the notifier fills it in from PUBLIC_URL.
+    pub link: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -317,6 +335,7 @@ pub struct Notice {
     pub items: Vec<Item>,
     /// Approvals left out of a long digest.
     pub more: usize,
+    pub alert: Option<Alert>,
 }
 
 /// `14:32 UTC`.
@@ -340,6 +359,7 @@ impl Notice {
             NoticeKind::Digest => format!("{} approvals are waiting for {}", self.items.len() + self.more, self.bot_name),
             NoticeKind::Test if self.bot_id.is_empty() => "Test notification from SuperBot".into(),
             NoticeKind::Test => format!("Test notification from SuperBot for {}", self.bot_name),
+            NoticeKind::Alert => self.alert.as_ref().map_or_else(|| "SuperBot alert".into(), |a| clip(&a.title)),
         }
     }
 
@@ -350,7 +370,19 @@ impl Notice {
     pub fn email_body(&self, app_link: Option<&str>) -> String {
         let now = crate::db::now();
         let mut out = String::new();
+        if let (NoticeKind::Alert, Some(a)) = (self.kind, &self.alert) {
+            out.push_str(&format!("{}\n\n", clip(&a.title)));
+            for l in &a.lines {
+                out.push_str(&format!("  {}\n", clip(l)));
+            }
+            if let Some(l) = &a.link {
+                out.push_str(&format!("\n  Console (admins): {l}\n"));
+            }
+            out.push_str("\n--\nSuperBot sends alerts like this to the notification email list and webhook set in the console's Settings.\n");
+            return out;
+        }
         match self.kind {
+            NoticeKind::Alert => {}
             NoticeKind::Test => {
                 out.push_str("This is a test. Notifications about approvals will reach you here.\n");
                 if let Some(l) = app_link {
@@ -402,6 +434,11 @@ impl Links {
 
     pub fn audit(&self, id: &str) -> Option<String> {
         self.base.as_ref().map(|b| format!("{b}/console/#audit?target=approval:{id}"))
+    }
+
+    /// A console page: `machines`, `audit?target=machine:<id>`.
+    pub fn console(&self, page: &str) -> Option<String> {
+        self.base.as_ref().map(|b| format!("{b}/console/#{page}"))
     }
 }
 
@@ -637,6 +674,7 @@ impl Notifier {
             bot_name: clip(&bot.name),
             items,
             more: approvals.len().saturating_sub(MAX_ITEMS),
+            alert: None,
         }
     }
 
@@ -698,8 +736,22 @@ impl Notifier {
                 None => "Nothing would reach anyone: turn on email with an address, or set a webhook, first".into(),
             });
         }
-        let n = Notice { kind: NoticeKind::Test, bot_id: bot.map(|b| b.id.clone()).unwrap_or_default(), bot_name: bot.map(|b| clip(&b.name)).unwrap_or_default(), items: Vec::new(), more: 0 };
+        let n = Notice { kind: NoticeKind::Test, bot_id: bot.map(|b| b.id.clone()).unwrap_or_default(), bot_name: bot.map(|b| clip(&b.name)).unwrap_or_default(), items: Vec::new(), more: 0, alert: None };
         Ok(self.deliver(app, &n, &plan, true).await)
+    }
+
+    /// An alert to the global email list and webhook, now. `page`: the console page it
+    /// links to. Nothing when neither is on.
+    pub async fn alert(&self, app: &App, mut a: Alert, page: &str) -> Vec<Value> {
+        let plan = self.plan(&app.db, None, &load(&app.db));
+        if plan.is_empty() {
+            return Vec::new();
+        }
+        a.title = secrets::redact::text(&a.title).into_owned();
+        a.lines = a.lines.iter().map(|l| secrets::redact::text(l).into_owned()).collect();
+        a.link = self.links.console(page);
+        let n = Notice { kind: NoticeKind::Alert, bot_id: String::new(), bot_name: String::new(), items: Vec::new(), more: 0, alert: Some(a) };
+        self.deliver(app, &n, &plan, false).await
     }
 
     async fn deliver(&self, app: &App, n: &Notice, plan: &Plan, test: bool) -> Vec<Value> {
@@ -723,15 +775,19 @@ impl Notifier {
             };
             d["channel"] = json!(ch.name());
             d["kind"] = json!(n.kind.as_str());
-            d["approvals"] = json!(ids);
+            match &n.alert {
+                Some(a) => d["event"] = json!(a.event),
+                None => d["approvals"] = json!(ids),
+            }
             if test {
                 d["test"] = json!(true);
             }
             let mut e = Event::new(Actor::system("notifications"), if ok { "notification.sent" } else { "notification.failed" }).outcome(if ok { Outcome::Success } else { Outcome::Failure });
-            e = match (ids.as_slice(), n.bot_id.as_str()) {
-                ([one], _) => e.target("approval", one),
-                (_, "") => e.target("notifications", "global"),
-                (_, b) => e.target("bot", b),
+            e = match (&n.alert, ids.as_slice(), n.bot_id.as_str()) {
+                (Some(a), _, _) => e.target(&a.target_type, &a.target_id),
+                (None, [one], _) => e.target("approval", one),
+                (None, _, "") => e.target("notifications", "global"),
+                (None, _, b) => e.target("bot", b),
             };
             if !n.bot_id.is_empty() {
                 e = e.bot(&n.bot_id);
@@ -760,6 +816,16 @@ fn pending(db: &Db, id: &str) -> bool {
 pub fn requested(app: &Arc<App>, a: &Approval) {
     if let Some(n) = app.notifier.get() {
         n.requested(app, a);
+    }
+}
+
+/// Sends an alert to the global channels apart from the caller, if botd has a notifier.
+pub fn alert(app: &Arc<App>, a: Alert, page: &'static str) {
+    if let Some(n) = app.notifier.get() {
+        let (n, app) = (n.clone(), app.clone());
+        tokio::spawn(async move {
+            n.alert(&app, a, page).await;
+        });
     }
 }
 

@@ -1139,7 +1139,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 27] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 28] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1167,6 +1167,7 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 27] = [
     migrate_machine_rebuild,
     migrate_account_removals,
     migrate_machine_backups,
+    migrate_machine_recovery,
 ];
 
 /// Off-host backups of machines and restores from them (ADR 0071). At most one backup
@@ -1207,6 +1208,70 @@ fn migrate_machine_backups(c: &Connection, _fresh: bool) -> rusqlite::Result<()>
         CREATE UNIQUE INDEX IF NOT EXISTS machine_restores_underway ON machine_restores(machine_id)
           WHERE state IN ('importing', 'replacing', 'enrolling');",
     )
+}
+
+/// Recovery objectives (ADR 0074): each restore's tier, RTO and how long it took, and
+/// each time a machine went past its RPO.
+fn migrate_machine_recovery(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machine_restores') WHERE name = 'rto_ms'", [], |r| r.get(0))?;
+    if !has {
+        c.execute_batch(
+            "ALTER TABLE machine_restores ADD COLUMN tier TEXT;
+            ALTER TABLE machine_restores ADD COLUMN rto_ms INTEGER;
+            ALTER TABLE machine_restores ADD COLUMN duration_ms INTEGER;
+            ALTER TABLE machine_restores ADD COLUMN rto_exceeded_at INTEGER;",
+        )?;
+    }
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS machine_rpo_breaches (
+          id TEXT PRIMARY KEY,
+          machine_id TEXT NOT NULL,
+          user_id TEXT NOT NULL,
+          tier TEXT NOT NULL,
+          rpo_ms INTEGER NOT NULL,
+          covered_since INTEGER NOT NULL,
+          breached_at INTEGER NOT NULL,
+          detected_at INTEGER NOT NULL,
+          ended_at INTEGER,
+          end_reason TEXT
+        );
+        CREATE INDEX IF NOT EXISTS machine_rpo_breaches_at ON machine_rpo_breaches(breached_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS machine_rpo_breaches_open ON machine_rpo_breaches(machine_id) WHERE ended_at IS NULL;",
+    )
+}
+
+/// A time a machine had no off-host backup newer than its RPO (ADR 0074). `breached_at`
+/// is when that began (`covered_since` + `rpo_ms`), `detected_at` when botd saw it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineRpoBreach {
+    pub id: String,
+    pub machine_id: String,
+    pub user_id: String,
+    pub tier: String,
+    pub rpo_ms: i64,
+    pub covered_since: i64,
+    pub breached_at: i64,
+    pub detected_at: i64,
+    pub ended_at: Option<i64>,
+    /// `backed_up`, `objective_changed`, or why the machine stopped counting
+    /// (`suspended`, `destroyed`, `restoring`, ...).
+    pub end_reason: Option<String>,
+}
+
+fn machine_rpo_breach_row(r: &Row) -> rusqlite::Result<MachineRpoBreach> {
+    Ok(MachineRpoBreach {
+        id: r.get("id")?,
+        machine_id: r.get("machine_id")?,
+        user_id: r.get("user_id")?,
+        tier: r.get("tier")?,
+        rpo_ms: r.get("rpo_ms")?,
+        covered_since: r.get("covered_since")?,
+        breached_at: r.get("breached_at")?,
+        detected_at: r.get("detected_at")?,
+        ended_at: r.get("ended_at")?,
+        end_reason: r.get("end_reason")?,
+    })
 }
 
 /// One off-host backup of a machine (ADR 0071).
@@ -1269,6 +1334,13 @@ pub struct MachineRestore {
     /// When the restored disk took the old one's place.
     pub replaced_at: Option<i64>,
     pub finished_at: Option<i64>,
+    /// The machine's tier and its RTO when the restore was asked for (ADR 0074).
+    pub tier: Option<String>,
+    pub rto_ms: Option<i64>,
+    /// From the request to the machine enrolling again, once done.
+    pub duration_ms: Option<i64>,
+    /// When it was seen to take longer than `rto_ms`.
+    pub rto_exceeded_at: Option<i64>,
 }
 
 fn machine_restore_row(r: &Row) -> rusqlite::Result<MachineRestore> {
@@ -1282,6 +1354,10 @@ fn machine_restore_row(r: &Row) -> rusqlite::Result<MachineRestore> {
         created_at: r.get("created_at")?,
         replaced_at: r.get("replaced_at")?,
         finished_at: r.get("finished_at")?,
+        tier: r.get("tier")?,
+        rto_ms: r.get("rto_ms")?,
+        duration_ms: r.get("duration_ms")?,
+        rto_exceeded_at: r.get("rto_exceeded_at")?,
     })
 }
 
@@ -4694,12 +4770,13 @@ impl Db {
     }
 
     /// Starts a restore of the machine from `backup_id`, unless one is underway.
-    pub fn machine_restore_start(&self, id: &str, machine_id: &str, backup_id: &str, by: Option<&str>) -> Option<MachineRestore> {
+    pub fn machine_restore_start(&self, id: &str, m: &Machine, backup_id: &str, by: Option<&str>, rto_ms: Option<i64>) -> Option<MachineRestore> {
         let made = self
             .c()
             .execute(
-                "INSERT OR IGNORE INTO machine_restores (id, machine_id, backup_id, state, created_by, created_at) VALUES (?, ?, ?, 'importing', ?, ?)",
-                params![id, machine_id, backup_id, by, now()],
+                "INSERT OR IGNORE INTO machine_restores (id, machine_id, backup_id, state, created_by, created_at, tier, rto_ms)
+                 VALUES (?, ?, ?, 'importing', ?, ?, ?, ?)",
+                params![id, m.id, backup_id, by, now(), m.tier, rto_ms],
             )
             .unwrap_or(0)
             == 1;
@@ -4734,6 +4811,92 @@ impl Db {
             .optional()
             .ok()
             .flatten()
+    }
+
+    /// The machine's newest restore that finished.
+    pub fn machine_last_restore_done(&self, machine_id: &str) -> Option<MachineRestore> {
+        self.c()
+            .query_row(
+                "SELECT * FROM machine_restores WHERE machine_id = ? AND state = 'done' ORDER BY finished_at DESC, id DESC LIMIT 1",
+                [machine_id],
+                machine_restore_row,
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// The newest restores of every machine, newest first.
+    pub fn machine_restores_recent(&self, limit: u32) -> Vec<MachineRestore> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM machine_restores ORDER BY created_at DESC, id DESC LIMIT ?").unwrap();
+        s.query_map([limit], machine_restore_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// How long a finished restore took (ADR 0074).
+    /// Moves an enrolling restore to done with how long it took, in one write so a restart
+    /// can't leave it done without its timing. Returns whether it moved.
+    pub fn machine_restore_done(&self, id: &str, duration_ms: i64) -> bool {
+        self.c()
+            .execute(
+                "UPDATE machine_restores SET state = 'done', finished_at = ?1, duration_ms = ?2 WHERE id = ?3 AND state = 'enrolling'",
+                params![now(), duration_ms, id],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Marks a restore as past its RTO, once. Returns whether this call did.
+    pub fn machine_restore_rto_exceeded(&self, id: &str) -> bool {
+        self.c()
+            .execute("UPDATE machine_restores SET rto_exceeded_at = ? WHERE id = ? AND rto_exceeded_at IS NULL", params![now(), id])
+            .unwrap_or(0)
+            == 1
+    }
+
+    // RPO breaches (ADR 0074)
+
+    /// Opens a breach for the machine, unless one is open. Returns it if this call did.
+    pub fn machine_rpo_breach_start(&self, id: &str, m: &Machine, rpo_ms: i64, covered_since: i64) -> Option<MachineRpoBreach> {
+        let made = self
+            .c()
+            .execute(
+                "INSERT OR IGNORE INTO machine_rpo_breaches (id, machine_id, user_id, tier, rpo_ms, covered_since, breached_at, detected_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                params![id, m.id, m.user_id, m.tier, rpo_ms, covered_since, covered_since + rpo_ms, now()],
+            )
+            .unwrap_or(0)
+            == 1;
+        if made { self.c().query_row("SELECT * FROM machine_rpo_breaches WHERE id = ?", [id], machine_rpo_breach_row).ok() } else { None }
+    }
+
+    /// Ends an open breach. Returns whether this call did.
+    pub fn machine_rpo_breach_end(&self, id: &str, reason: &str) -> bool {
+        self.c()
+            .execute("UPDATE machine_rpo_breaches SET ended_at = ?, end_reason = ? WHERE id = ? AND ended_at IS NULL", params![now(), reason, id])
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Every open breach.
+    pub fn machine_rpo_breaches_open(&self) -> Vec<MachineRpoBreach> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM machine_rpo_breaches WHERE ended_at IS NULL ORDER BY breached_at, id").unwrap();
+        s.query_map([], machine_rpo_breach_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// The machine's open breach, if any.
+    pub fn machine_rpo_breach_open(&self, machine_id: &str) -> Option<MachineRpoBreach> {
+        self.c()
+            .query_row("SELECT * FROM machine_rpo_breaches WHERE machine_id = ? AND ended_at IS NULL", [machine_id], machine_rpo_breach_row)
+            .ok()
+    }
+
+    /// The newest breaches, open or not, newest first.
+    pub fn machine_rpo_breaches(&self, limit: u32) -> Vec<MachineRpoBreach> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM machine_rpo_breaches ORDER BY breached_at DESC, id DESC LIMIT ?").unwrap();
+        s.query_map([limit], machine_rpo_breach_row).unwrap().filter_map(Result::ok).collect()
     }
 
     /// Every restore in `state`.
@@ -4803,6 +4966,26 @@ impl Db {
         self.c()
             .execute("UPDATE machine_backups SET created_at = created_at - ?1, expires_at = expires_at - ?1 WHERE id = ?2", params![ms, id])
             .unwrap();
+    }
+
+    #[cfg(test)]
+    pub fn machine_restore_backdate(&self, id: &str, ms: i64) {
+        self.c().execute("UPDATE machine_restores SET created_at = created_at - ?1 WHERE id = ?2", params![ms, id]).unwrap();
+    }
+
+    #[cfg(test)]
+    pub fn machine_restore_replaced_backdate(&self, id: &str, ms: i64) {
+        self.c().execute("UPDATE machine_restores SET replaced_at = replaced_at - ?1 WHERE id = ?2", params![ms, id]).unwrap();
+    }
+
+    #[cfg(test)]
+    pub fn machine_enrolled_backdate(&self, id: &str, ms: i64) {
+        self.c().execute("UPDATE machines SET enrolled_at = enrolled_at - ?1 WHERE id = ?2", params![ms, id]).unwrap();
+    }
+
+    #[cfg(test)]
+    pub fn machine_backdate(&self, id: &str, ms: i64) {
+        self.c().execute("UPDATE machines SET created_at = created_at - ?1 WHERE id = ?2", params![ms, id]).unwrap();
     }
 
     #[cfg(test)]

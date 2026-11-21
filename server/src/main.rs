@@ -637,6 +637,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/machines", get(machines::list_all))
         .route("/machines/placements", get(machines::placements))
         .route("/machines/backups", get(machines::backup::list_all))
+        .route("/machines/recovery", get(machines::recovery::get))
         .route("/machines/substrate", get(machines::substrate))
         .route("/machines/legacy", get(machines::rebuild::legacy_list))
         .route("/machines/reconcile", post(machines::reconcile_now))
