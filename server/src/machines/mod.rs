@@ -1440,7 +1440,7 @@ async fn act(
     // Growing in place needs room on its host (ADR 0085).
     if let Some((_, plan)) = target.as_ref().filter(|_| step == Step::Resize)
         && let Some(host) = hosts::of(cp, &m)
-        && let Err(why) = placement::grow(app, cp, &host, &m.plan, plan)
+        && let Err(why) = placement::grow(app, cp, &host, &m, plan)
     {
         let d = json!({ "toPlan": plan, "reason": "no_room", "error": why });
         app.db.record(&event(by, "machine.resize_refused", &m, d).outcome(Outcome::Denied));

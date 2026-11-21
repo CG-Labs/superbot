@@ -253,6 +253,8 @@ async fn a_failing_provider_is_tried_again_and_a_lost_answer_isnt_resized_twice(
     let r = &s["resize"];
     assert_eq!((r["state"].as_str(), r["attempts"].as_i64(), r["reason"].as_str()), (Some("pending"), Some(1), Some("provider")), "{s}");
     assert!(r["nextAt"].as_i64().unwrap() > db::now(), "{s}");
+    let (_, mine) = call(w.port, "GET", "/api/machine", &w.a, "").await;
+    assert_eq!(parse(&mine)["resize"]["message"], "The machine's provider didn't answer; it's tried again shortly.", "no provider details: {mine}");
     w.reconcile().await;
     assert_eq!(w.fake.calls("resize"), 1, "not before its time");
     // Its time comes; the resize is done but the answer lost: tried again, the provider
@@ -276,6 +278,9 @@ async fn a_failing_provider_is_tried_again_and_a_lost_answer_isnt_resized_twice(
     assert_eq!((s["resize"]["state"].as_str(), s["resize"]["reason"].as_str()), (Some("failed"), Some("provider")), "{s}");
     let failed = w.audit("machine.resize_failed").await;
     assert_eq!((failed.len(), failed[0]["outcome"].as_str()), (1, Some("failure")), "{failed:?}");
+    assert!(s["resize"]["message"].as_str().unwrap().contains("no such plan"), "admins see the error: {s}");
+    let (_, mine) = call(w.port, "GET", "/api/machine", &w.a, "").await;
+    assert_eq!(parse(&mine)["resize"]["message"], "The machine couldn't be resized. An admin has been told.", "{mine}");
     // The reconciler doesn't ask again on its own...
     w.reconcile().await;
     assert_eq!(w.status().await["resize"]["state"], "failed");
@@ -284,6 +289,65 @@ async fn a_failing_provider_is_tried_again_and_a_lost_answer_isnt_resized_twice(
     w.set_tier("small").await;
     w.reconcile().await;
     assert_eq!((w.status().await["resize"]["state"].as_str(), w.plan()), (Some("done"), "g6-standard-1".to_string()));
+
+    // Asking the provider for a plan's disk fails like a resize does: a missing plan
+    // fails it, not a wait for ever.
+    w.set_tier("big").await;
+    w.fake.fail_next("plan_disk", ProviderError::NotFound);
+    w.reconcile().await;
+    let s = w.status().await;
+    assert_eq!((s["resize"]["state"].as_str(), s["resize"]["reason"].as_str()), (Some("failed"), Some("provider")), "{s}");
+    assert_eq!((w.audit("machine.resize_failed").await.len(), w.fake.calls("resize")), (2, 4), "no resize sent");
+}
+
+#[tokio::test]
+async fn a_tier_change_while_the_provider_resizes_is_followed_after() {
+    let w = world().await;
+    let m = w.machine().await;
+    w.set_tier("big").await;
+    // While the provider grows it to big, Ada is moved back to small: that cancels the
+    // request against the size botd still has on record.
+    let (app, a_id) = (w.app.clone(), w.a_id.clone());
+    w.fake.during_next("resize", move || {
+        app.db.update_user(&a_id, crate::db::UserPatch { tier: Some(Some("small".into())), ..Default::default() }).unwrap();
+        crate::machines::resize::follow(&app, &crate::audit::Who::system("test"), &a_id, "admin", None, true);
+    });
+    w.reconcile().await;
+    // The resize to big still landed, and small is asked for again against it.
+    let s = w.status().await;
+    assert_eq!((s["plan"].as_str(), s["resize"]["state"].as_str(), s["resize"]["toPlan"].as_str()), (Some("g6-standard-2"), Some("pending"), Some("g6-standard-1")), "{s}");
+    w.app.db.machine_disk_seen(&m.id, GB, 80 * GB);
+    w.reconcile().await;
+    assert_eq!((w.status().await["resize"]["state"].as_str(), w.plan()), (Some("done"), "g6-standard-1".to_string()));
+}
+
+#[tokio::test]
+async fn a_resize_whose_answer_is_unknown_keeps_its_room_on_the_host() {
+    // Room for three CPUs on host a.
+    let env = serve_with(|a, _, _| Fleet::new(vec![sized(a, "c3-m6-d60")], DOWN_MS)).await;
+    let tiers = r#"{"default":"small","tiers":[
+      {"name":"small","label":"Small","routes":"any","limits":{"machineType":"c1-m2-d20"}},
+      {"name":"big","label":"Big","routes":"any","limits":{"machineType":"c2-m4-d40"}}]}"#;
+    env.app.tiers.set(Arc::new(Tiers::parse(tiers, None).unwrap())).unwrap();
+    let (ada, m) = machine_on(&env, &env.a, "a", "ada@example.com", false).await;
+    let (code, r) = json_call(&env, "PATCH", &format!("/api/users/{ada}"), r#"{"tier":"big"}"#).await;
+    assert_eq!(code, 200, "{r}");
+    // As after a grow whose answer was lost: it may have taken big's room already.
+    let later = db::now() + 3_600_000;
+    assert!(env.app.db.machine_resize_move(&m.id, "c2-m4-d40", &["pending"], "pending", Some("provider"), Some("lost"), true, Some(later)));
+    let (_, h) = json_call(&env, "GET", "/api/machines/hosts", "").await;
+    let a = h["hosts"].as_array().unwrap().iter().find(|x| x["name"] == "a").unwrap();
+    assert_eq!(a["load"]["allocated"]["cpus"], 2, "{h}");
+    // So one more small machine fits, and not two.
+    machine_on(&env, &env.a, "a", "bea@example.com", false).await;
+    let (cy, _) = user_with(env.port, &env.admin, "cy@example.com", "member").await;
+    let (code, e) = json_call(&env, "POST", &format!("/api/users/{cy}/machine"), "").await;
+    assert_eq!(code, 409, "{e}");
+    // Its own retry isn't held up by the room it holds.
+    env.app.db.machine_resize_move(&m.id, "c2-m4-d40", &["pending"], "pending", Some("provider"), Some("lost"), false, Some(0));
+    reconcile(&env).await;
+    let (_, s) = json_call(&env, "GET", &format!("/api/users/{ada}/machine/resize"), "").await;
+    assert_eq!((s["resize"]["state"].as_str(), s["plan"].as_str()), (Some("done"), Some("c2-m4-d40")), "{s}");
 }
 
 fn sized(m: Member, cap: &str) -> Member {

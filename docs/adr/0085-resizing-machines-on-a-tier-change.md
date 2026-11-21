@@ -20,7 +20,8 @@ A tier's `machineType` sets the size of the user's machine. Until now, a tier ch
 
 - The reconciler (every minute, or `POST /api/machines/reconcile`) takes each open request under the control plane's lock. It first checks the request against the user's tier again, since the tier or `TIERS_FILE` may have moved on. States: `pending` (try on this pass), `waiting` (not safe yet, looked at on every pass), then `done`, `failed` or `cancelled`.
 - It asks the provider for the machine first, as the manual resize does, so a resize whose answer was lost isn't sent twice. Linode resizes by its resize call (a cold migration that restarts the VM and grows the disk). Incus edits the container's limits live.
-- Done is audited as `machine.resized` with `auto: true`, the cause, the event id and whether the provider was called. Provider failures that may pass (rate limits, the network, 5xx) are tried again with the rebuild backoff, up to 5 tries. Other failures fail at once: `machine.resize_failed` (outcome failure) and an alert. A failed request isn't tried again by itself; the next tier change asks afresh, and an admin can resize by hand.
+- Tier changes don't take the control plane's lock, so one can cancel a request while the provider is resizing to it. After each resize, the reconciler checks the tier again and asks for a resize back if needed.
+- Done is audited as `machine.resized` with `auto: true`, the cause, the event id and whether the provider was called. Provider failures that may pass (rate limits, the network, 5xx) are tried again with the rebuild backoff, up to 5 tries. Failing to read a plan's disk size from the provider counts as a provider failure too, rather than a wait. Other failures fail at once: `machine.resize_failed` (outcome failure) and an alert. A failed request isn't tried again by itself; the next tier change asks afresh, and an admin can resize by hand.
 
 ### Nothing is lost on a downgrade
 
@@ -43,6 +44,7 @@ Each wait is audited once per reason as `machine.resize_waiting`, not on every p
 ### Resizing within a host's room (#29)
 
 - Growing an Incus container checks only the extra CPUs, memory and disk against its host's capacity (`INCUS_CAPACITY`, [ADR 0081](0081-placing-machines-by-host-load.md)). The machine already counts on its host, so a drained host may still grow what's on it. A host that is down or lost can't.
+- While a resize's answer is unknown (it may have reached the provider), its host counts the larger of the two sizes, so nothing else takes that room. The machine's own retry doesn't count that room against itself.
 - An automatic resize without room waits with `no_room` and alerts admins once: "A machine can't grow on its host". It goes ahead on the first pass after room frees up.
 - A manual resize without room is refused with 409 and `machine.resize_refused` (reason `no_room`). Before this, it could push a host past its capacity. Moving the machine to another host is out of scope: it needs live migration, or a restore that loses work since the last backup.
 - Linode places its own machines, so there's no room check there.
@@ -55,7 +57,7 @@ Each wait is audited once per reason as `machine.resize_waiting`, not on every p
   - The admin machine view and `GET /api/usage` carry `resize`.
   - `botctl machine resize <user> status` and `botctl machine resizes` read these. `botctl usage` prints "resizing to <plan> (<state>: <why>)".
 - **Users:**
-  - `GET /api/machine` and `GET /api/me/tier` (`machine.resize`) carry state, tiers, reason and message, without plans or host names. A `no_room` wait reads "The server it's on hasn't room for the Pro size yet."
+  - `GET /api/machine` and `GET /api/me/tier` (`machine.resize`) carry state, tiers, reason and message, without plans or host names. A `no_room` wait reads "The server it's on hasn't room for the Pro size yet." Provider errors show users a plain message; admins see the error itself.
 
 ## Consequences
 

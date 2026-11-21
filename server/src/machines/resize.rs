@@ -199,6 +199,10 @@ fn user_text(m: &Machine) -> Option<String> {
             "The server it's on hasn't room for the {} size yet. It moves once there is.",
             m.resize_tier.as_deref().unwrap_or("new")
         )),
+        Some("provider") if m.resize_state.as_deref() == Some("failed") => {
+            Some("The machine couldn't be resized. An admin has been told.".into())
+        }
+        Some("provider") => Some("The machine's provider didn't answer; it's tried again shortly.".into()),
         _ => m.resize_error.clone(),
     }
 }
@@ -282,9 +286,10 @@ fn retry(app: &AppState, m: &Machine, plan: &str, e: ProviderError) {
 }
 
 /// What botd knows of the machine and the plans, for `decide`.
-async fn facts(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, m: &Machine, plan: &str) -> Facts {
+/// Err: the provider failed to say what a plan's disk is (None: it can't say).
+async fn facts(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, m: &Machine, plan: &str) -> Result<Facts, ProviderError> {
     let (from, to) = (p.plan_resources(&m.plan), p.plan_resources(plan));
-    let (from_disk, to_disk) = (p.plan_disk(&m.plan).await.ok().flatten(), p.plan_disk(plan).await.ok().flatten());
+    let (from_disk, to_disk) = (p.plan_disk(&m.plan).await?, p.plan_disk(plan).await?);
     // A suspended machine's disk can't change, so what it said before still holds.
     let fresh = m.state == State::Suspended || m.disk_seen_at.is_some_and(|t| now() - t < DISK_FRESH_MS);
     let tier = app.tier_of(&m.user_id);
@@ -292,8 +297,8 @@ async fn facts(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, m: &M
         Some(cap) => Some((storage::current(app, &m.user_id, storage::CHECK_AGE).await.used(), cap)),
         None => None,
     };
-    let room = hosts::of(cp, m).map(|h| placement::grow(app, cp, &h, &m.plan, plan));
-    Facts {
+    let room = hosts::of(cp, m).map(|h| placement::grow(app, cp, &h, m, plan));
+    Ok(Facts {
         restarts: p.substrate() == "vm",
         from,
         to,
@@ -305,7 +310,7 @@ async fn facts(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, m: &M
         runs: if m.state == State::Running { app.runs_on_machine(&m.user_id) } else { 0 },
         waited_ms: now() - m.resize_requested_at.unwrap_or_else(now),
         room,
-    }
+    })
 }
 
 /// One step for one machine's resize. Callers hold `ops`.
@@ -330,7 +335,11 @@ async fn step(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, id: &s
     let Some(pid) = m.provider_id.clone() else {
         return wait(app, &m, &plan, "machine_not_ready", "The machine isn't running yet; it's resized once it is.");
     };
-    if let Decision::Wait(reason, text) = decide(&facts(app, cp, p, &m, &plan).await) {
+    let facts = match facts(app, cp, p, &m, &plan).await {
+        Ok(f) => f,
+        Err(e) => return retry(app, &m, &plan, e),
+    };
+    if let Decision::Wait(reason, text) = decide(&facts) {
         return wait(app, &m, &plan, reason, &text);
     }
     // As `act`: ask the provider first, so a resize whose answer was lost isn't sent twice.
@@ -357,6 +366,9 @@ async fn step(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, id: &s
         "auto": true, "cause": m.resize_cause, "eventId": m.resize_event, "providerId": pid,
     });
     app.db.record(&event(&system(&after), "machine.resized", &after, extra));
+    // The tier may have changed while the provider worked: a request it cancelled
+    // against the old size is asked for again against this one.
+    follow(app, &system(&after), &after.user_id, m.resize_cause.as_deref().unwrap_or("admin"), None, false);
 }
 
 /// Every machine with a resize due, each under the lock on its own.

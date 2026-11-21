@@ -45,6 +45,8 @@ struct State {
     user_data: HashMap<String, String>,
     /// Plans' disks in bytes, where they differ from Linode's (`plan_disk`).
     disks: HashMap<String, Option<u64>>,
+    /// One-shot hooks run as an operation starts, before it's done.
+    during: HashMap<&'static str, Box<dyn FnOnce() + Send>>,
 }
 
 /// Linode's disks for the default tiers' plans, in GiB.
@@ -69,6 +71,10 @@ impl Fake {
         op: &'static str,
         f: impl FnOnce(&mut State) -> Result<T, ProviderError>,
     ) -> Result<T, ProviderError> {
+        let hook = self.state.lock().unwrap().during.remove(op);
+        if let Some(h) = hook {
+            h();
+        }
         let mut s = self.state.lock().unwrap();
         s.calls.push(op.into());
         if let Some(e) = s.fail.remove(op) {
@@ -95,6 +101,11 @@ impl Fake {
     /// The next `op` fails with `e`.
     pub fn fail_next(&self, op: &'static str, e: ProviderError) {
         self.state.lock().unwrap().fail.insert(op, e);
+    }
+
+    /// `f` runs while the next `op` is under way, as if something else happened meanwhile.
+    pub fn during_next(&self, op: &'static str, f: impl FnOnce() + Send + 'static) {
+        self.state.lock().unwrap().during.insert(op, Box::new(f));
     }
 
     /// The next `op` is done, but its answer is lost.
