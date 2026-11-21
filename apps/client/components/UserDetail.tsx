@@ -6,7 +6,7 @@ import { CODE_TTLS, formatExpiry, relativeTime, ROLES, signInMethod } from "../s
 import { overLimits, planUsageLines } from "../src/plan";
 import type { SsoProvider } from "../src/sso";
 import { colors } from "../src/theme";
-import type { AdminUser, LoginCode, Role, SessionView, UserBots, UserIdentity } from "../src/types";
+import type { AdminUser, LoginCode, Role, SessionView, TeammateAccounts, TeammateRemoval, UserBots, UserIdentity } from "../src/types";
 import { BotAvatar } from "./BotAvatar";
 import { Chips } from "./Chips";
 import { CodeReveal } from "./CodeReveal";
@@ -53,6 +53,25 @@ function identityName(i: UserIdentity, providers: SsoProvider[]): string {
   return i.email ?? i.subject ?? i.id;
 }
 
+const personName = (p: { id: string; name?: string | null; email?: string | null }) => p.name || p.email || p.id;
+
+/** Where a removal of a teammate's account on this server stands (ADR 0066). */
+function removalStatus(r: TeammateRemoval): string {
+  if (r.state === "pending") return r.lastError ? `Removal pending: ${r.lastError}` : "Removal pending";
+  if (r.state === "held") return `Removed; work held until ${r.purgeAt ? new Date(r.purgeAt).toLocaleDateString() : "an admin purges it"}`;
+  if (r.state === "cancelled") return "Removal cancelled: access is back";
+  return r.archivedTo ? "Removed; work handed to the owner" : "Removed";
+}
+
+/** What happens to a teammate's work when their account here goes, as the server is set. */
+function workOutcome(t: TeammateAccounts | null): string {
+  if (t?.files === "delete") {
+    if (!t.graceDays) return "their work is deleted for good";
+    return `their work is held for ${t.graceDays} day${t.graceDays === 1 ? "" : "s"}, then deleted`;
+  }
+  return "their work goes to the Bots' owner";
+}
+
 function LoadFailed({ message, onRetry }: { message: string; onRetry: () => void }) {
   return (
     <View style={styles.row}>
@@ -71,6 +90,8 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
   const [bots, setBots] = useState<UserBots | null>(null);
   const [sessionsError, setSessionsError] = useState<string | null>(null);
   const [botsError, setBotsError] = useState<string | null>(null);
+  const [teammates, setTeammates] = useState<TeammateAccounts | null>(null);
+  const [teammatesError, setTeammatesError] = useState<string | null>(null);
   const [pickedProvider, setLinkProvider] = useState("");
   // Providers can arrive after this opens; until someone picks, link with the first.
   const linkProvider = providers.some((p) => p.id === pickedProvider) ? pickedProvider : (providers[0]?.id ?? "");
@@ -84,9 +105,11 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
     const failed = (err: unknown) => (err instanceof Error ? err.message : "Couldn't load");
     setSessionsError(null);
     setBotsError(null);
+    setTeammatesError(null);
     await Promise.all([
       api.userSessions(user.id).then(setSessions, (err) => setSessionsError(failed(err))),
       api.userBots(user.id).then(setBots, (err) => setBotsError(failed(err))),
+      api.teammateAccounts(user.id).then(setTeammates, (err) => setTeammatesError(failed(err))),
     ]);
   }, [api, user.id]);
 
@@ -144,6 +167,15 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
       setSubject("");
       setTenant("");
     });
+
+  const removeTeammate = async (owner: string, teammate: string, who: string) => {
+    const body = `Their processes stop, ${workOutcome(teammates)}, and their login is deleted. A later run makes a new one if they still have access.`;
+    if (!(await confirmAsync(`Remove ${who}'s account here?`, body, "Remove"))) return;
+    void run(async () => {
+      const res = await api.removeTeammateAccount(owner, teammate);
+      if (res.error) throw new Error(`Still pending: ${res.error}`);
+    });
+  };
 
   const providerLabel = (id: string) => providers.find((p) => p.id === id)?.label ?? id;
   const linkType = providers.find((p) => p.id === linkProvider)?.type;
@@ -308,6 +340,36 @@ export function UserDetail({ api, user, meId, providers, onChanged }: Props) {
         )}
         {!active && bots?.bots.length ? <Text style={styles.faint}>Applies once they're enabled again.</Text> : null}
       </Section>
+
+      {teammatesError ? (
+        <Section title="Teammate accounts here">
+          <LoadFailed message={teammatesError} onRetry={() => void loadExtras()} />
+        </Section>
+      ) : teammates && (teammates.accounts.length || teammates.removals.length) ? (
+        <Section title="Teammate accounts here">
+          {teammates.accounts.map((a) => {
+            const mine = a.owner.id === user.id;
+            const who = personName(mine ? a.teammate : user);
+            return (
+              <View key={a.account} style={styles.row}>
+                <Text style={[styles.text, { flex: 1 }]} numberOfLines={2}>
+                  {mine ? `${personName(a.teammate)}, for these Bots` : `For ${personName(a.owner)}'s Bots`}
+                  <Text style={styles.faint}> · {a.removal ? removalStatus(a.removal) : a.wanted ? "in use" : "no longer has access"}</Text>
+                </Text>
+                <Button label="Remove" danger disabled={busy} onPress={() => void removeTeammate(a.owner.id, a.teammate.id, who)} />
+              </View>
+            );
+          })}
+          {teammates.removals
+            .filter((r) => r.state !== "pending")
+            .slice(0, 5)
+            .map((r) => (
+              <Text key={r.id} style={styles.dim}>
+                {r.ownerId === user.id ? personName(r.teammate) : `For ${personName(r.owner)}'s Bots`} · {removalStatus(r)}
+              </Text>
+            ))}
+        </Section>
+      ) : null}
     </View>
   );
 }
