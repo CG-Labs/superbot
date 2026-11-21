@@ -54,11 +54,13 @@ async fn with_isolation_on_admins_see_the_account_and_failures_are_audited() {
     assert_eq!(v["home"], root.join(&id).join("home").display().to_string());
     assert_eq!(v["workspace"], root.join(&id).join("workspace").display().to_string());
     assert_eq!(v["ready"], false);
-    assert_eq!(v["harnesses"], json!(["claude", "codex"]));
+    assert_eq!(v["harnesses"], json!(["claude", "codex", "pi", "hermes"]));
+    assert_eq!(v["logins"], json!(["claude", "codex"]), "Pi and Hermes take API keys");
 
     // Harnesses it can't log in, and arguments that aren't a short list of strings.
     for body in [
         json!({ "harness": "pi" }),
+        json!({ "harness": "hermes" }),
         json!({}),
         json!({ "harness": "claude", "args": "login" }),
         json!({ "harness": "claude", "args": [1] }),

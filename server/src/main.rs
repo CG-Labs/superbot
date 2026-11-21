@@ -273,12 +273,20 @@ async fn main() {
                 iso.root.display(),
                 accounts::HARNESSES.join(", ")
             );
+            let mut own = vec![app.cfg.data_dir.clone(), PathBuf::from(".env")];
+            own.extend(std::env::var_os("SUPERBOT_MASTER_KEY_FILE").map(PathBuf::from));
+            for p in accounts::close_to_others(&own) {
+                eprintln!("WARNING: other accounts can read {p}, which botd couldn't change. Per-user accounts must not read botd's files: chmod o-rwx it.");
+            }
             if accounts::others_visible() {
                 eprintln!("WARNING: other accounts' processes are visible in /proc, so Bots can read each other's command lines. Run botd with ProtectProc=invisible (deploy/install.sh --isolation sets it).");
             }
             let _ = app.isolation.set(Arc::new(iso));
         }
-        None => println!("Isolation: off (all Bots run as this account; ISOLATION=users gives each user their own)."),
+        None => println!(
+            "Isolation: off (every Bot runs as this account and could read .env, the database and the master key). \
+             New installs have it on; to opt in, re-run deploy/install.sh --isolation, or set ISOLATION=users with Docker Compose (deploy/README.md)."
+        ),
     }
     app.start_isolation();
     let paused = handover::pause_already_disabled(&app, &Who { actor: Actor::system("bootstrap"), source: Source::default() });

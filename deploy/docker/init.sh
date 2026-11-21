@@ -7,7 +7,7 @@ set -euo pipefail
 
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ENV_FILE=${ENV_FILE:-"$DIR/.env"}
-DOMAIN="" TZ_VALUE="" USER_NAME_VALUE="" HARNESSES=""
+DOMAIN="" TZ_VALUE="" USER_NAME_VALUE="" HARNESSES="" ISOLATION_VALUE=""
 DOMAIN_SET=false HARNESSES_SET=false
 
 die() { printf 'init.sh: %s\n' "$*" >&2; exit 1; }
@@ -21,6 +21,8 @@ Usage: init.sh [options]
   --tz ZONE          TZ for routines (e.g. Europe/Jersey)
   --user-name NAME   USER_NAME shown in the app
   --harnesses LIST   Harness CLIs baked into the image, e.g. "claude codex pi" (add hermes for Hermes Agent)
+  --isolation        Run each user's Bots as their own Unix account (ISOLATION=users; new .env files have it)
+  --no-isolation     Run every Bot as botd's account (ISOLATION=off)
   -h, --help         Show this help
 EOF
 }
@@ -32,6 +34,8 @@ while [[ $# -gt 0 ]]; do
     --tz) TZ_VALUE=${2:?--tz needs a value}; shift 2 ;;
     --user-name) USER_NAME_VALUE=${2:?--user-name needs a value}; shift 2 ;;
     --harnesses) HARNESSES=${2?--harnesses needs a value}; HARNESSES_SET=true; shift 2 ;;
+    --isolation) ISOLATION_VALUE=users; shift ;;
+    --no-isolation) ISOLATION_VALUE=off; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
@@ -92,6 +96,7 @@ fi
 [[ -z "$TZ_VALUE" ]] || set_env TZ "$TZ_VALUE"
 [[ -z "$USER_NAME_VALUE" ]] || set_env USER_NAME "$USER_NAME_VALUE"
 [[ "$HARNESSES_SET" != true ]] || set_env SUPERBOT_HARNESSES "$HARNESSES"
+[[ -z "$ISOLATION_VALUE" ]] || set_env ISOLATION "$ISOLATION_VALUE"
 
 if [[ -n "$new_password" ]]; then
   printf 'New login password (also AUTH_PASSWORD in %s): %s\n' "$ENV_FILE" "$new_password"

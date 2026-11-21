@@ -16,7 +16,7 @@ An adapter may name the oldest release that runs its hook: `Adapter::hooks_since
 
 When the Bot's effective policy is `ask`, the runner checks after it knows where the run goes, before anything runs:
 
-- **On this server**: it finds `codex` on the run's own `PATH` (botd's bin folder first, as the run gets it), with relative and empty entries taken from the run's working folder as the harness would take them, and runs `codex --version` there, without botd's secrets, for at most 15 seconds.
+- **On this server**: it finds `codex` on the run's own `PATH` (botd's bin folder first, as the run gets it), with relative and empty entries taken from the run's working folder as the harness would take them, and runs `codex --version` there, without botd's secrets, for at most 15 seconds. With per-user accounts ([ADR 0058](0058-harness-os-user-by-default.md)) it still runs as botd: the account gets the same `PATH` and folder, and harness CLIs are installed system-wide for every account to run.
 - **On the owner's machine**: it sends `codex --version` as a job, with the same `cwd` and user as the run. The agent finds the binary on its harness `PATH`, as it would for the run. The heartbeat's harness report isn't used: it only knows what the plan installed, not a Codex installed by hand or one earlier on a custom `SUPERBOT_HARNESS_PATH`. No agent change is needed, so every enrolled agent supports it.
 
 The version is the first `major.minor.patch` (with optional `v`, pre-release and build metadata) in what it prints (`codex-cli 0.141.0`). It is compared by semver precedence, so a pre-release comes before its release: `0.141.0-alpha.3` is refused, `0.142.0-alpha.1` passes. Build metadata is ignored.

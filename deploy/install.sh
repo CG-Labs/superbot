@@ -36,6 +36,7 @@ ISOLATION_MODE=""
 # Unset: the one in root's isolation.conf, else /srv/superbot/users (isolation_dir).
 ISOLATION_DIR=${ISOLATION_DIR:-}
 ISOLATION_GROUP=superbot-users
+HERMES_SHARED_DIR=/opt/hermes
 ISOLATION_CONF=/etc/superbot/isolation.conf
 USERCTL_BIN=/usr/local/sbin/superbot-userctl
 SUDOERS_FILE=/etc/sudoers.d/superbot-isolation
@@ -60,9 +61,11 @@ Usage: install.sh [options]
   --no-backup         Skip daily DATA_DIR backup timer
   --with-hermes       Also install the Hermes Agent CLI (about 2.5 GB; HERMES_COMMIT pins it)
   --license-file PATH Install the license key CG-Labs sent (without one: community edition)
-  --isolation         Run each user's Bots as their own Unix account (ISOLATION=users; ADR 0037).
-                      ISOLATION_DIR sets where their folders go (default /srv/superbot/users)
-  --no-isolation      Turn that off again (accounts and their folders are kept)
+  --isolation         Run each user's Bots as their own Unix account (ISOLATION=users; ADR 0037),
+                      which can't read .env, the database or the master key. On by default for
+                      new installs (ADR 0058); an upgrade keeps what it had. ISOLATION_DIR sets
+                      where their folders go (default /srv/superbot/users)
+  --no-isolation      Turn that off (accounts and their folders are kept)
   --no-client         Skip building the web client (served at /app/)
   --dry-run           Print actions without changing the system
   --non-interactive   Fail instead of prompting for missing flags
@@ -647,7 +650,8 @@ install_license() {
 }
 
 # Hermes's own installer, as the service user (Hermes refuses a checkout another user
-# owns). Its launcher lands in ~/.local/bin, which botd gets on PATH through .env.
+# owns). Its launcher lands in ~/.local/bin, which botd gets on PATH through .env. With
+# per-user accounts, which can't read botd's home, it goes system-wide instead.
 # shellcheck disable=SC2016
 install_hermes() {
   [[ "$WITH_HERMES" == true ]] || return 0
@@ -657,6 +661,10 @@ install_hermes() {
   env_file="$home/superbot/.env"
   bin_path="$home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   url="https://raw.githubusercontent.com/NousResearch/hermes-agent/$HERMES_COMMIT/scripts/install.sh"
+  if [[ "$(isolation_mode)" == users ]]; then
+    install_hermes_shared "$url"
+    return
+  fi
   if [[ "$DRY_RUN" == true ]]; then
     log "[dry-run] would install Hermes Agent $HERMES_COMMIT for $SUPERBOT_USER from $url"
     log "[dry-run] would set PATH=$bin_path in $env_file"
@@ -675,6 +683,32 @@ install_hermes() {
   elif ! grep -q "^PATH=.*$home/.local/bin" "$env_file"; then
     warn "PATH in $env_file lacks $home/.local/bin, so botd won't find hermes"
   fi
+}
+
+# Root's checkout in $HERMES_SHARED_DIR, which every account may run but none may change.
+# Each run has its own HERMES_HOME (the Bot's folder), so this holds only the program.
+# shellcheck disable=SC2016
+install_hermes_shared() {
+  local url=$1 probe
+  if [[ "$DRY_RUN" == true ]]; then
+    log "[dry-run] would install Hermes Agent $HERMES_COMMIT system-wide in $HERMES_SHARED_DIR from $url, linked from /usr/local/bin/hermes"
+    return
+  fi
+  log "Installing Hermes Agent ${HERMES_COMMIT:0:12} system-wide in $HERMES_SHARED_DIR (per-user accounts run it)"
+  apt-get install -y -qq libatomic1 xz-utils
+  install -d -m 0755 -o root -g root "$HERMES_SHARED_DIR"
+  env HOME="$HERMES_SHARED_DIR" SHELL=/bin/bash bash -c 'set -euo pipefail
+    tmp=$(mktemp)
+    trap '\''rm -f "$tmp"'\'' EXIT
+    curl -fsSL "$1" -o "$tmp"
+    bash "$tmp" --non-interactive --skip-browser --skip-computer-use --commit "$2"' _ "$url" "$HERMES_COMMIT"
+  chmod -R go-w "$HERMES_SHARED_DIR"
+  ln -sfn "$HERMES_SHARED_DIR/.local/bin/hermes" /usr/local/bin/hermes
+  probe=$(mktemp -d)
+  chmod 0777 "$probe"
+  sudo -u nobody env HOME="$probe" HERMES_HOME="$probe/hermes" /usr/local/bin/hermes --version >/dev/null \
+    || { rm -rf "$probe"; die "Hermes Agent did not install for other accounts"; }
+  rm -rf "$probe"
 }
 
 service_unit_fixed() {
@@ -802,9 +836,17 @@ configure_isolation() {
   chmod 0750 "$home"
   set_env_var "$env_file" ISOLATION users
   set_env_var "$env_file" ISOLATION_DIR "$ISOLATION_DIR"
-  if [[ "$WITH_HERMES" == true ]]; then
-    warn "Hermes and Pi Bots don't run with per-user accounts yet: switch them to Claude Code or Codex"
-  fi
+}
+
+# New installs get per-user accounts (ADR 0058). An existing one (it has .env) keeps what
+# it had, so an upgrade doesn't change how its Bots run; botd's startup log says how to opt in.
+default_isolation() {
+  [[ -z "$ISOLATION_MODE" && "$UPGRADE" != true ]] || return 0
+  local home
+  home=$(getent passwd "$SUPERBOT_USER" | cut -d: -f6 || true)
+  [[ -n "$home" && -e "$home/superbot/.env" ]] && return 0
+  ISOLATION_MODE=users
+  log "New install: each user's Bots run as their own Unix account (--no-isolation turns this off)"
 }
 
 install_systemd() {
@@ -993,12 +1035,13 @@ Next steps (as the service user):
 EOF
   if [[ "$(isolation_mode)" == users ]]; then
     cat <<EOF
-Per-user accounts are on (ISOLATION=users, docs/adr/0037-per-user-unix-accounts.md):
-  each user's Bots run as sb-u-<user id>, in $ISOLATION_DIR/<user id>. Install harness
-  CLIs system-wide (sudo npm install -g ...), not in ~/.local, so every account finds them.
-  Then log a harness in for each user, as $SUPERBOT_USER, at a terminal:
+Per-user accounts are on (ISOLATION=users, docs/adr/0058-harness-os-user-by-default.md):
+  each user's Bots run as sb-u-<user id>, in $ISOLATION_DIR/<user id>, and can't read
+  botd's .env, database or master key. Install harness CLIs system-wide
+  (sudo npm install -g ...), not in ~/.local, so every account finds them. Then log
+  Claude Code or Codex in for each user, as $SUPERBOT_USER, at a terminal:
     botctl user harness-login <user> claude    # or codex
-  Only Claude Code and Codex Bots run this way so far.
+  Pi and Hermes Agent use provider keys saved with botctl secret set.
 
 EOF
   fi
@@ -1026,6 +1069,7 @@ main() {
   TZ_VALUE=${TZ_VALUE:-UTC}
   USER_NAME_VALUE=${USER_NAME_VALUE:-Owner}
 
+  default_isolation
   ensure_user
   install_packages
   install_node

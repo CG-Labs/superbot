@@ -44,7 +44,7 @@ If flags are omitted, the script prompts on a TTY. The checkout must not be owne
 9. Optional **UFW** (`--ufw`): allow 22, 80, 443
 10. Daily **backup** timer (on by default; `--no-backup` to skip), plus `superbot-restore`: see [Backups and restore](#backups-and-restore)
 11. With `--with-hermes`: [Hermes Agent](#hermes-agent) for the service user
-12. With `--isolation`: [one Unix account per user](#one-unix-account-per-user)
+12. On new installs (or with `--isolation`): [one Unix account per user](#one-unix-account-per-user)
 
 Admin password file: `~superbot/.superbot-admin-password` (mode `0600`).
 
@@ -55,7 +55,7 @@ journalctl -u superbot -f
 sudo -iu superbot claude login   # or codex login, etc.
 ```
 
-With `--isolation`, log harnesses in per user instead: [one Unix account per user](#one-unix-account-per-user).
+With per-user accounts (new installs, or `--isolation`), log harnesses in per user instead: [one Unix account per user](#one-unix-account-per-user).
 
 Open `https://your-domain/app/` for the app (it fills in the server URL), or `https://your-domain/console/` for the built-in admin page. Sign in with the saved password. `https://your-domain/` is the public landing page. The app is the interface for everyone, admins included (chat, Bots, approvals, screens). The console is a minimal admin and break-glass page: users and roles, sign-up requests, per-user machines, the audit log, and settings (approval mode, server secrets, SCIM tokens). Only admins get it; other people who open it or sign in at `/login` land on `/app/` ([ADR 0027](../docs/adr/0027-expo-primary-hermes-default.md), [ADR 0032](../docs/adr/0032-console-admin-only.md)).
 
@@ -95,14 +95,14 @@ The installer builds the Expo client (`apps/client`) from the same commit as `bo
 | `--no-backup` | Skip backup timer |
 | `--with-hermes` | Also install Hermes Agent ([below](#hermes-agent)) |
 | `--license-file` | Install the license key CG-Labs sent ([below](#license)) |
-| `--isolation` / `--no-isolation` | Each user's Bots run as their own Unix account, or not ([below](#one-unix-account-per-user)). Kept on upgrades |
+| `--isolation` / `--no-isolation` | Each user's Bots run as their own Unix account, or not ([below](#one-unix-account-per-user)). On for new installs; upgrades keep what they had |
 | `--no-client` | Skip building the web client |
 | `--dry-run` | Print steps only |
 | `--source-dir` | Copy a local tree instead of cloning |
 
 ## Hermes Agent
 
-Opt-in, because it is large (about 2.5 GB for the install, plus about 0.5 GB per Bot that uses it). `--with-hermes` runs Hermes's own installer as the service user, pinned to the commit of release v0.23.2 (override with `HERMES_COMMIT=<sha>`), and puts `~/.local/bin` on botd's `PATH` in `.env`. Hermes has no login: save a provider key, encrypted ([master key](#master-key)):
+Opt-in, because it is large (about 2.5 GB for the install, plus about 0.5 GB per Bot that uses it). `--with-hermes` runs Hermes's own installer as the service user, pinned to the commit of release v0.23.2 (override with `HERMES_COMMIT=<sha>`), and puts `~/.local/bin` on botd's `PATH` in `.env`. With [per-user accounts](#one-unix-account-per-user), which can't open the service user's home, it installs Hermes system-wide instead, as root in `/opt/hermes`, linked from `/usr/local/bin/hermes`. Hermes has no login: save a provider key, encrypted ([master key](#master-key)):
 
 ```sh
 sudo -u superbot env SUPERBOT_PASSWORD="$(sudo grep -oP '^AUTH_PASSWORD=\K.*' ~superbot/superbot/.env)" botctl secret set OPENROUTER_API_KEY < /path/to/key.txt
@@ -112,10 +112,10 @@ To pick a provider or endpoint, set `SUPERBOT_HERMES_PROVIDER` (Hermes's `--prov
 
 ## One Unix account per user
 
-Off by default. With `--isolation`, each user's Bots run as their own account, `sb-u-<user id>`, so one user's Bots can't read or write another's folder or harness logins, nor botd's database, `.env`, or master key. Design: [ADR 0037](../docs/adr/0037-per-user-unix-accounts.md).
+Each user's Bots, on every harness, run as their own account, `sb-u-<user id>`, so one user's Bots can't read or write another's folder or harness logins, nor botd's data, database, `.env`, or master key. **On for new installs.** An install from before keeps what it had (botd's log says `Isolation: off` and how to opt in); `--no-isolation` opts out. Design: [ADR 0037](../docs/adr/0037-per-user-unix-accounts.md), [ADR 0058](../docs/adr/0058-harness-os-user-by-default.md).
 
 ```sh
-sudo bash deploy/install.sh --upgrade --isolation     # or with curl, as above
+sudo bash deploy/install.sh --upgrade --isolation     # opt an existing install in; or with curl, as above
 ```
 
 What root sets up (and `--no-isolation` takes away again, keeping accounts and their folders):
@@ -135,7 +135,7 @@ botctl user harness-login alex@example.com claude   # claude auth login, as alex
 botctl user harness-login alex@example.com codex
 ```
 
-Accounts are made at a user's first run, or with `botctl user isolate <user>`. Install harness CLIs system-wide (`sudo npm install -g @anthropic-ai/claude-code @openai/codex`): per-user accounts can't open the service user's `~/.local`. Only Claude Code and Codex Bots run this way; Pi and Hermes Bots, and screens, are off until they can. To check it on a throwaway host: `deploy/test-isolation.sh` (CI runs it).
+Accounts are made at a user's first run, or with `botctl user isolate <user>`. Install harness CLIs system-wide (`sudo npm install -g @anthropic-ai/claude-code @openai/codex`): per-user accounts can't open the service user's `~/.local`. Pi and Hermes Agent use provider keys (`botctl secret set`); their approval guard and settings are files botd writes, which the account can read but not change. Screens are off until they can run this way. To check it on a throwaway host: `deploy/test-isolation.sh` (CI runs it).
 
 Turning it on doesn't move files. Each user's work starts in a new, empty `ISOLATION_DIR/<id>/workspace`; their old folder, `WORKSPACE_DIR/users/<id>`, stays where it was. Bot memory and `USER.md` carry over by themselves (botd keeps the real copies). Harness sessions don't: each Bot's next run starts a fresh one, with its memory. To bring a user's files along, as root, after `botctl user isolate <user>`:
 
@@ -484,7 +484,7 @@ Without a domain, `./init.sh` gives plain HTTP at `http://localhost`, published 
 
 | Service | Role |
 |---------|------|
-| `botd` | Server, web app, harness CLIs. Runs as uid `10001`, no capabilities, port 3000 not published. |
+| `botd` | Server, web app, harness CLIs. Runs as uid `10001`, port 3000 not published. Only the capabilities `sudo` needs to start [each user's runs as their own account](#per-user-accounts-in-docker). |
 | `caddy` | `caddy:2` plus the [web client](#web-client) and [landing page](#landing-page-and-sign-ups), built from this checkout (`Dockerfile` target `caddy`). Publishes 80/443 on `SUPERBOT_BIND`, serves the landing page at `/` and the client at `/app/`, proxies everything else to `botd` (SSE unbuffered). |
 | `backup` | Archives `DATA_DIR` at start and every `SUPERBOT_BACKUP_INTERVAL` seconds. No network. |
 
@@ -494,6 +494,7 @@ Without a domain, `./init.sh` gives plain HTTP at `http://localhost`, published 
 | `workspace` | `/workspace` (`WORKSPACE_DIR`) | Each user's working folder, `users/<id>/`, shared by that user's Bots. |
 | `home` | `/home/superbot` | Harness logins and sessions (`~/.claude`, `~/.claude.json`, `~/.codex`, `~/.pi`), runtime `npm i -g` installs. Hermes Agent keeps its per-Bot data in `data` instead. |
 | `backups` | `/backups` | Backup archives. |
+| `users` | `/srv/superbot/users` | With [per-user accounts](#per-user-accounts-in-docker): each user's home (harness logins), workspace, memory copies, and Bots' harness state. |
 | `caddy-data`, `caddy-config` | Caddy | Certificates and ACME account. |
 
 `init.sh` also writes a random `SUPERBOT_MASTER_KEY` once, which encrypts saved secrets ([master key](#master-key)); Compose refuses to start without it. Save API keys for the Bots encrypted instead of in `.env` with `SUPERBOT_PASSWORD=<AUTH_PASSWORD> docker compose exec -T -e SUPERBOT_PASSWORD botd botctl secret set OPENAI_API_KEY < key.txt`.
@@ -519,7 +520,17 @@ Log in once inside the container, as the `superbot` user that runs the Bots. Log
 
 Check with `claude auth status`, `codex login status`, or `pi auth check` (same `docker compose exec` prefix).
 
+With [per-user accounts](#per-user-accounts-in-docker), log Claude Code and Codex in per user instead: `docker compose exec -it -e SUPERBOT_PASSWORD botd botctl user harness-login <user> claude` (or `codex`), with `SUPERBOT_PASSWORD` set to `AUTH_PASSWORD`. Those logins live in the `users` volume.
+
 Keys in `.env` pass through to the Bots, like the bash install. Claude Code's self-updater is off (`DISABLE_AUTOUPDATER=1`); CLIs update when you rebuild. For a newer CLI without a rebuild, `docker compose exec botd npm i -g @openai/codex@latest` installs it into the `home` volume, where it wins on `PATH` until you `npm rm -g` it.
+
+### Per-user accounts in Docker
+
+New `.env` files have `ISOLATION=users`: each user's Bots run as their own Unix account inside the container, which can't read the `data` volume, the database, the `home` volume or botd's env (where `.env`'s secrets are). An `.env` from before has no `ISOLATION` line and stays off; botd's log says so. Turn it on or off with `./init.sh --isolation` or `--no-isolation`, then `docker compose up -d`. Design: [ADR 0058](../docs/adr/0058-harness-os-user-by-default.md).
+
+How it works: the image has `sudo` (its only setuid program), `superbot-run`, and the root helper `superbot-userctl`, with the same two sudo rules as the [bash install](#one-unix-account-per-user). The `botd` service adds back `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `SETUID`, `SETGID` and `AUDIT_WRITE`, and turns `no-new-privileges` off, so `sudo` works; runs drop all of them. Accounts and their folders live in the `users` volume. A recreated container makes each account again, with the uid that owns its files.
+
+Harness CLIs must be in the image (`SUPERBOT_HARNESSES`): ones installed later with `npm i -g` land in the `home` volume, which accounts can't open. Runs see the container's other processes (but not their env); the bash install's systemd unit hides them. Turning it on doesn't move a user's files from the `workspace` volume: copy them into `/srv/superbot/users/<id>/workspace/` as with the [bash install](#one-unix-account-per-user).
 
 ### Upgrade
 
@@ -593,4 +604,4 @@ Screens and computer use (Xvfb, browser, voxl): `botd` reports `Screens: off`. U
 
 ### Check the setup
 
-[`deploy/docker/smoke-test.sh`](docker/smoke-test.sh) builds the image and runs the stack in an isolated project (own volumes and ports 18080/18443): health, auth, Host allowlist, the landing page, the web client at `/app/`, harness CLIs, SSE through Caddy, saved secrets (encrypted, names only, absent from logs and backups), and a backup/restore round trip, then removes everything. CI runs it on every change to the image.
+[`deploy/docker/smoke-test.sh`](docker/smoke-test.sh) builds the image and runs the stack in an isolated project (own volumes and ports 18080/18443): health, auth, Host allowlist, the landing page, the web client at `/app/`, harness CLIs, SSE through Caddy, saved secrets (encrypted, names only, absent from logs and backups), per-user accounts (on for a new `.env`, unable to read `/data` or botd's env, the same uid after a recreate), and a backup/restore round trip, then removes everything. CI runs it on every change to the image.

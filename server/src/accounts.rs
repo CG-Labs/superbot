@@ -5,18 +5,22 @@
 //! - `home`: the account's HOME, so harness logins (`~/.claude`, `~/.codex`) are per user;
 //! - `workspace`: the working folder all of the user's Bots share;
 //! - `memory`: `USER.md` and each Bot's `<bot id>.md`, which botd reads for the prompt
-//!   and copies back to `DATA_DIR` after each run (backups, handovers, turning it off).
+//!   and copies back to `DATA_DIR` after each run (backups, handovers, turning it off);
+//! - `bots/<bot id>`: a Bot's harness state (Pi's sessions, Hermes's data root), the run's;
+//! - `settings/<bot id>`: files botd writes for a Bot's runs (Pi's approval gate, Hermes's
+//!   managed config), which the run reads and can't change (ADR 0058).
 //!
 //! The account and every path come from the Bot owner's id, never from a Bot. botd's
 //! service user may run `superbot-run` as members of `superbot-users` and
-//! `superbot-userctl ensure <id>` as root, nothing else (deploy/install.sh). Off by
-//! default: then runs work as in ADR 0029.
+//! `superbot-userctl ensure <id>` as root, nothing else (deploy/install.sh). The
+//! installer and Compose turn it on for new installs (ADR 0058); unset, runs work as
+//! in ADR 0029.
 
 use crate::machines::wire::JobRequest;
 use crate::passwd;
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -24,9 +28,14 @@ use std::process::{Command, Stdio};
 pub const PREFIX: &str = "sb-u-";
 /// Unix account names are at most 32 bytes.
 const MAX_ID: usize = 32 - PREFIX.len();
-/// Harnesses that run under an account so far. Pi and Hermes keep files botd writes
-/// (Pi's approval gate, Hermes's managed config and daemon) in a folder the run could change.
-pub const HARNESSES: [&str; 2] = ["claude", "codex"];
+/// Harnesses that run under an account: all of them.
+pub const HARNESSES: [&str; 4] = ["claude", "codex", "pi", "hermes"];
+/// Harnesses an admin logs in for a user (`botctl user harness-login`). Pi and Hermes
+/// take API keys from secrets.
+pub const LOGINS: [&str; 2] = ["claude", "codex"];
+/// Checks a missing file as the run's account, then runs the cleanup: botd can't see into
+/// the run's state, and must not follow links the run left there.
+const CLEANUP_IF_EXISTS: &str = "[ -e \"$1\" ] || exit 0; shift; exec \"$@\"";
 pub const DEFAULT_DIR: &str = "/srv/superbot/users";
 const DEFAULT_SUDO: &str = "/usr/bin/sudo";
 const DEFAULT_USERCTL: &str = "/usr/local/sbin/superbot-userctl";
@@ -51,6 +60,8 @@ pub struct RunAs {
     pub sudo: PathBuf,
     pub runner: PathBuf,
     pub account: String,
+    /// `ISOLATION_DIR/<user id>/settings`: the only place a job's files are written.
+    pub settings: PathBuf,
 }
 
 impl RunAs {
@@ -65,18 +76,77 @@ impl RunAs {
         v
     }
 
-    /// The same job, started as this account. Only for jobs on this server.
-    pub fn wrap(&self, mut job: JobRequest) -> JobRequest {
-        let argv = self.argv(&job.bin, std::mem::take(&mut job.args));
-        let mut argv = argv.into_iter().map(|s| s.to_string_lossy().into_owned());
-        job.bin = argv.next().unwrap_or_default();
-        job.args = argv.collect();
+    fn argv_strings(&self, bin: &str, args: Vec<String>) -> (String, Vec<String>) {
+        let mut argv = self.argv(bin, args).into_iter().map(|s| s.to_string_lossy().into_owned());
+        (argv.next().unwrap_or_default(), argv.collect())
+    }
+
+    /// The same job, started as this account. Only for jobs on this server. Its files
+    /// are written now, by botd, into the user's `settings` folder, where the account
+    /// can read them and not change them; a file anywhere else is refused. Its cleanup
+    /// runs as the account too: botd can't stop the account's processes.
+    pub fn prepare(&self, mut job: JobRequest) -> Result<JobRequest, String> {
+        for f in std::mem::take(&mut job.files) {
+            write_shared(&self.settings, Path::new(&f.path), &f.body).map_err(|e| format!("Couldn't write {}: {e}", f.path))?;
+        }
+        (job.bin, job.args) = self.argv_strings(&job.bin, std::mem::take(&mut job.args));
         // sudo resets PATH; superbot-run puts this one back.
         if let Some(path) = job.env.get("PATH").cloned() {
             job.env.insert("SUPERBOT_PATH".into(), path);
         }
-        job
+        if let Some(c) = job.cleanup.as_mut() {
+            let check = std::mem::replace(&mut c.when_exists, c.cwd.clone());
+            let mut args = vec!["-c".to_string(), CLEANUP_IF_EXISTS.into(), "sh".into(), check, std::mem::take(&mut c.bin)];
+            args.append(&mut c.args);
+            (c.bin, c.args) = self.argv_strings("/bin/sh", args);
+            if let Some(path) = c.env.get("PATH").cloned() {
+                c.env.insert("SUPERBOT_PATH".into(), path);
+            }
+        }
+        Ok(job)
     }
+}
+
+/// Writes `body` to `path` under `base` (a user's `settings` folder, made by root), for
+/// the user's account to read and never change. Folders on the way are made 0750 by
+/// botd, and must be botd's own; the file is 0640. Nobody else can write there, so the
+/// account can't swap anything in. Through the folder's ACL the account may read.
+pub fn write_shared(base: &Path, path: &Path, body: &str) -> io::Result<()> {
+    let rel = path.strip_prefix(base).map_err(|_| io::Error::other(format!("{} is outside {}", path.display(), base.display())))?;
+    if !trusted_dir(base) {
+        return Err(io::Error::other(format!("{} isn't a folder root made", base.display())));
+    }
+    let parts: Vec<_> = rel.components().collect();
+    let (Some((std::path::Component::Normal(name), dirs)), false) = (parts.split_last(), parts.len() < 2) else {
+        return Err(io::Error::other(format!("{} isn't a file in a Bot's folder under {}", path.display(), base.display())));
+    };
+    let mut dir = base.to_path_buf();
+    for d in dirs {
+        let std::path::Component::Normal(d) = d else { return Err(io::Error::other("not a plain path")) };
+        dir.push(d);
+        own_dir(&dir)?;
+    }
+    let tmp = dir.join(format!(".{}.tmp", name.to_string_lossy()));
+    remove(&tmp);
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o640).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
+    f.write_all(body.as_bytes())?;
+    // The group bits set the ACL's mask, so the account can read it whatever the umask.
+    f.set_permissions(std::fs::Permissions::from_mode(0o640))?;
+    std::fs::rename(&tmp, dir.join(name))
+}
+
+/// Makes `dir` (0750, or keeps it) and checks it's a real folder botd owns.
+fn own_dir(dir: &Path) -> io::Result<()> {
+    match std::fs::DirBuilder::new().mode(0o750).create(dir) {
+        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
+        _ => {}
+    }
+    let m = std::fs::symlink_metadata(dir)?;
+    // SAFETY: geteuid can't fail.
+    if !m.is_dir() || m.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::other(format!("{} isn't botd's folder", dir.display())));
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750))
 }
 
 /// `sb-u-<id>`, or None when the id can't be part of an account name: 1 to 27 lowercase
@@ -148,16 +218,52 @@ impl Isolation {
         Some(self.memory_dir(owner_id)?.join(format!("{bot_id}.md")))
     }
 
+    /// `bots/<bot id>`: the Bot's harness state, which its runs write.
+    pub fn bot_state(&self, owner_id: &str, bot_id: &str) -> Option<PathBuf> {
+        crate::paths::child(&self.user_root(owner_id)?.join("bots"), bot_id)
+    }
+    /// `settings/<bot id>`: what botd writes for the Bot's runs, read-only to them.
+    pub fn bot_settings(&self, owner_id: &str, bot_id: &str) -> Option<PathBuf> {
+        crate::paths::child(&self.user_root(owner_id)?.join("settings"), bot_id)
+    }
+
+    /// Makes the Bot's state and settings folders in its owner's folder, once the account
+    /// is there. The state folder is botd's, with the account's full access by the
+    /// parent's default ACL; anything else the account left in its place (a link, a file)
+    /// is removed first, so the run starts in a real folder. botd never writes in it.
+    pub fn make_bot_dirs(&self, owner_id: &str, bot_id: &str) -> io::Result<()> {
+        let (Some(state), Some(settings)) = (self.bot_state(owner_id, bot_id), self.bot_settings(owner_id, bot_id)) else {
+            return Err(io::Error::other(format!("{owner_id:?} or {bot_id:?} can't name a folder")));
+        };
+        for p in [&state, &settings] {
+            if !p.parent().is_some_and(trusted_dir) {
+                return Err(io::Error::other(format!("{} isn't a folder root made", p.parent().unwrap_or(p).display())));
+            }
+        }
+        if std::fs::symlink_metadata(&state).is_ok_and(|m| !m.is_dir()) {
+            std::fs::remove_file(&state)?;
+        }
+        match std::fs::DirBuilder::new().mode(0o770).create(&state) {
+            Ok(()) => std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o770))?,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        own_dir(&settings)
+    }
+
     pub fn run_as(&self, user_id: &str) -> Option<RunAs> {
-        Some(RunAs { sudo: self.sudo.clone(), runner: self.runner.clone(), account: account(user_id)? })
+        Some(RunAs { sudo: self.sudo.clone(), runner: self.runner.clone(), account: account(user_id)?, settings: self.user_root(user_id)?.join("settings") })
     }
 
     /// The account exists with the home `superbot-userctl` gives it, and its folders are
-    /// there, made by root.
+    /// there, made by root. An account made before a folder was added isn't ready, so
+    /// the helper runs again and adds it.
     pub fn ready(&self, user_id: &str) -> bool {
         let (Some(name), Some(home), Some(root)) = (account(user_id), self.home(user_id), self.user_root(user_id)) else { return false };
         let made_by_root = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir() && m.uid() == 0);
-        passwd::by_name(&name).is_some_and(|a| a.uid != 0 && a.home == home) && made_by_root(&root) && trusted_dir(&root.join("memory"))
+        passwd::by_name(&name).is_some_and(|a| a.uid != 0 && a.home == home)
+            && made_by_root(&root)
+            && ["memory", "bots", "settings"].iter().all(|d| trusted_dir(&root.join(d)))
     }
 
     /// Makes the user's account and folders if they aren't there, with the root helper.
@@ -193,6 +299,26 @@ pub fn others_visible() -> bool {
     // SAFETY: geteuid can't fail.
     let me = unsafe { libc::geteuid() };
     std::fs::metadata("/proc/1").is_ok_and(|m| m.uid() != me)
+}
+
+/// Takes other accounts' access off botd's own files (DATA_DIR, `.env`, the master key
+/// file), so no per-user account can read them. Returns the ones it couldn't close.
+pub fn close_to_others(paths: &[PathBuf]) -> Vec<String> {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid can't fail.
+    let me = unsafe { libc::geteuid() };
+    let mut open = Vec::new();
+    for p in paths {
+        let Ok(m) = std::fs::metadata(p) else { continue };
+        let mode = m.permissions().mode();
+        if mode & 0o007 == 0 {
+            continue;
+        }
+        if m.uid() != me || std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode & 0o7770)).is_err() {
+            open.push(p.display().to_string());
+        }
+    }
+    open
 }
 
 /// A folder botd may read and write in: a real folder (not a link) made by root or botd,
@@ -248,7 +374,7 @@ pub fn remove(path: &Path) {
 /// Admin API: a user's account, making it now, and logging a harness in as them
 /// (`botctl user isolation | isolate | harness-login`). Under `/api/users`, so admins only.
 pub mod http {
-    use super::{Isolation, HARNESSES, account};
+    use super::{Isolation, HARNESSES, LOGINS, account};
     use crate::audit::Who;
     use crate::users::need_user_key;
     use crate::{ApiError, AppState, Res, bad};
@@ -271,7 +397,7 @@ pub mod http {
         json!({
             "isolation": "users", "user": user_id, "account": account(user_id), "root": iso.user_root(user_id),
             "home": iso.home(user_id), "workspace": iso.workspace(user_id), "memory": iso.memory_dir(user_id),
-            "ready": iso.ready(user_id), "harnesses": HARNESSES,
+            "ready": iso.ready(user_id), "harnesses": HARNESSES, "logins": LOGINS,
         })
     }
 
@@ -313,10 +439,10 @@ pub mod http {
             return Err(bad("That user is disabled"));
         }
         let harness = v["harness"].as_str().unwrap_or_default();
-        let adapter = HARNESSES.contains(&harness).then(|| crate::adapters::get(harness)).flatten();
+        let adapter = LOGINS.contains(&harness).then(|| crate::adapters::get(harness)).flatten();
         let (bin, default) = adapter
             .and_then(|a| Some((a.bin(), a.login_args()?)))
-            .ok_or_else(|| bad(format!("harness must be one of: {}", HARNESSES.join(", "))))?;
+            .ok_or_else(|| bad(format!("harness must be one of: {}", LOGINS.join(", "))))?;
         let custom = !matches!(v.get("args"), None | Some(Value::Null));
         let args: Vec<String> = match v.get("args") {
             None | Some(Value::Null) => default.iter().map(|s| s.to_string()).collect(),
@@ -445,6 +571,132 @@ mod tests {
         assert_eq!(read_plain(&swapped.join("secret"), MAX_FILE), None);
         assert!(seed(&swapped.join("new.md"), "x").is_err());
         assert!(!dir.join("new.md").exists());
+    }
+
+    #[test]
+    fn botds_own_files_are_closed_to_other_accounts() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("sb-close-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        std::fs::write(dir.join(".env"), "AUTH_PASSWORD=x\n").unwrap();
+        std::fs::set_permissions(dir.join("data"), std::fs::Permissions::from_mode(0o2755)).unwrap();
+        std::fs::set_permissions(dir.join(".env"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let paths = [dir.join("data"), dir.join(".env"), dir.join("missing")];
+        assert!(close_to_others(&paths).is_empty());
+        let mode = |p: &str| std::fs::metadata(dir.join(p)).unwrap().permissions().mode() & 0o7777;
+        assert_eq!((mode("data"), mode(".env")), (0o2750, 0o640));
+        // Root's files can't be changed; they're named instead.
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(close_to_others(&["/etc/passwd".into()]), ["/etc/passwd"]);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pi_and_hermes_get_their_own_folders_in_the_owners() {
+        let iso = for_tests(Path::new("/srv/superbot/users"), DEFAULT_SUDO);
+        assert_eq!(iso.bot_state("u1", "b1").unwrap(), Path::new("/srv/superbot/users/u1/bots/b1"));
+        assert_eq!(iso.bot_settings("u1", "b1").unwrap(), Path::new("/srv/superbot/users/u1/settings/b1"));
+        assert_eq!(iso.run_as("u1").unwrap().settings, Path::new("/srv/superbot/users/u1/settings"));
+        for bad in ["", "..", "a/b"] {
+            assert_eq!(iso.bot_state("u1", bad), None, "{bad:?}");
+            assert_eq!(iso.bot_settings("u1", bad), None, "{bad:?}");
+        }
+        assert_eq!(iso.bot_state("U1", "b1"), None);
+        for h in ["claude", "codex", "pi", "hermes"] {
+            assert!(HARNESSES.contains(&h), "{h} runs as its owner's account");
+        }
+    }
+
+    #[test]
+    fn a_bots_folders_are_made_real_and_the_settings_stay_botds() {
+        use std::os::unix::fs::symlink;
+        let root = crate::db::temp_path("bot-dirs");
+        let iso = for_tests(&root, DEFAULT_SUDO);
+        let elsewhere = crate::db::temp_path("bot-dirs-elsewhere");
+        assert!(iso.make_bot_dirs("u1", "b1").is_err(), "no folders from root yet");
+        for d in ["bots", "settings"] {
+            std::fs::create_dir_all(root.join("u1").join(d)).unwrap();
+        }
+        // The account left a link where the Bot's state goes: it's dropped, not followed.
+        symlink(&elsewhere, root.join("u1/bots/b1")).unwrap();
+        iso.make_bot_dirs("u1", "b1").unwrap();
+        let state = std::fs::symlink_metadata(iso.bot_state("u1", "b1").unwrap()).unwrap();
+        assert!(state.is_dir() && state.mode() & 0o777 == 0o770);
+        let settings = std::fs::symlink_metadata(iso.bot_settings("u1", "b1").unwrap()).unwrap();
+        assert!(settings.is_dir() && settings.mode() & 0o777 == 0o750);
+        iso.make_bot_dirs("u1", "b1").unwrap();
+        // A settings folder botd didn't make is refused.
+        symlink(&elsewhere, root.join("u1/settings/b2")).unwrap();
+        assert!(iso.make_bot_dirs("u1", "b2").is_err());
+    }
+
+    #[test]
+    fn isolated_jobs_write_only_into_settings_and_clean_up_as_the_account() {
+        use crate::machines::wire::{JobCleanup, JobFile, PROTOCOL};
+        use std::collections::BTreeMap;
+        let root = crate::db::temp_path("prepare");
+        let settings = root.join("u1/settings");
+        std::fs::create_dir_all(&settings).unwrap();
+        let run_as = RunAs { sudo: "/usr/bin/sudo".into(), runner: "/opt/superbot/bin/superbot-run".into(), account: "sb-u-u1".into(), settings: settings.clone() };
+        let file = |p: &Path| JobFile { path: p.display().to_string(), body: "{}".into() };
+        let state = root.join("u1/bots/b1");
+        let job = JobRequest {
+            protocol: PROTOCOL,
+            job_id: String::new(),
+            bot_id: String::new(),
+            owner_id: String::new(),
+            message_id: 0,
+            bin: "hermes".into(),
+            args: vec!["chat".into()],
+            env: BTreeMap::from([("PATH".into(), "/usr/local/bin:/usr/bin".into())]),
+            cwd: root.join("u1/workspace").display().to_string(),
+            stdin: None,
+            files: vec![file(&settings.join("b1/superbot-guard.ts")), file(&settings.join("b1/hermes-managed/config.yaml"))],
+            cleanup: Some(JobCleanup {
+                when_exists: state.join("hermes/gateway.pid").display().to_string(),
+                bin: "hermes".into(),
+                args: vec!["gateway".into(), "stop".into()],
+                env: BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
+                cwd: state.display().to_string(),
+                timeout_secs: 60,
+            }),
+            collect: vec![],
+            for_user: None,
+        };
+        let ready = run_as.prepare(job.clone()).unwrap();
+        assert!(ready.files.is_empty(), "botd wrote them already");
+        for (p, mode) in [("b1", 0o750), ("b1/hermes-managed", 0o750), ("b1/superbot-guard.ts", 0o640), ("b1/hermes-managed/config.yaml", 0o640)] {
+            assert_eq!(std::fs::symlink_metadata(settings.join(p)).unwrap().mode() & 0o777, mode, "{p}");
+        }
+        assert_eq!(ready.bin, "/usr/bin/sudo");
+        assert_eq!(ready.args[..7], ["-n", "-E", "-u", "sb-u-u1", "--", "/opt/superbot/bin/superbot-run", "hermes"]);
+        assert_eq!(ready.env["SUPERBOT_PATH"], "/usr/local/bin:/usr/bin");
+        let c = ready.cleanup.unwrap();
+        assert_eq!(c.when_exists, state.display().to_string(), "botd checks only the folder it made");
+        assert_eq!(c.bin, "/usr/bin/sudo");
+        assert_eq!(c.args[..10], ["-n", "-E", "-u", "sb-u-u1", "--", "/opt/superbot/bin/superbot-run", "/bin/sh", "-c", CLEANUP_IF_EXISTS, "sh"]);
+        assert_eq!(c.args[10..], [state.join("hermes/gateway.pid").display().to_string(), "hermes".into(), "gateway".into(), "stop".into()]);
+        assert_eq!(c.env["SUPERBOT_PATH"], "/usr/bin");
+
+        // The check really runs the cleanup only when the file is there.
+        let sh = |path: &Path| Command::new("/bin/sh").args(["-c", CLEANUP_IF_EXISTS, "sh"]).arg(path).args(["echo", "ran"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&sh(&root.join("missing")).stdout), "");
+        assert_eq!(String::from_utf8_lossy(&sh(&settings).stdout), "ran\n");
+
+        // Nowhere else: not the run's state, not outside the user's folder, not through a link.
+        for p in [state.join("x.ts"), root.join("u2/settings/b1/x.ts"), settings.join("../../x.ts"), settings.join("x.ts")] {
+            let mut bad = job.clone();
+            bad.files = vec![file(&p)];
+            assert!(run_as.prepare(bad).is_err(), "{}", p.display());
+        }
+        let elsewhere = crate::db::temp_path("prepare-elsewhere");
+        std::os::unix::fs::symlink(&elsewhere, settings.join("b9")).unwrap();
+        let mut bad = job.clone();
+        bad.files = vec![file(&settings.join("b9/x.ts"))];
+        assert!(run_as.prepare(bad).is_err());
+        assert!(!elsewhere.join("x.ts").exists());
     }
 
     #[test]

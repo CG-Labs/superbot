@@ -32,7 +32,7 @@ fn home(input: &RunInput) -> PathBuf {
 }
 
 fn managed_dir(input: &RunInput) -> PathBuf {
-    input.state_dir.join("hermes-managed")
+    input.config_dir.join("hermes-managed")
 }
 
 fn quote(s: &str) -> String {
@@ -246,6 +246,7 @@ mod tests {
             model: None,
             effort: None,
             env: HashMap::from([("BOT_TOKEN".into(), "t0k3n".into()), ("GITHUB_TOKEN".into(), "ghp_x".into())]),
+            config_dir: dir.clone(),
             state_dir: dir,
             guard: guard.then(|| Guard { command: "'/opt/bin/botctl' hook hermes".into(), timeout_secs: 300, wait: Duration::from_secs(240) }),
             run_as: None,
@@ -325,7 +326,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let i = input(true);
         write_files(&i);
-        let path = i.state_dir.join("hermes-managed/config.yaml");
+        let path = i.config_dir.join("hermes-managed/config.yaml");
         let c: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
             c["hooks"]["pre_tool_call"],
@@ -346,7 +347,7 @@ mod tests {
 
         // Bypass: no hook, and a later run drops the old one.
         let mut bypass = input(false);
-        bypass.state_dir = i.state_dir.clone();
+        (bypass.state_dir, bypass.config_dir) = (i.state_dir.clone(), i.config_dir.clone());
         write_files(&bypass);
         let c: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(c.get("hooks").is_none(), "{c}");
@@ -356,7 +357,7 @@ mod tests {
     #[tokio::test]
     async fn a_gate_that_cant_be_written_is_an_error() {
         let mut i = input(true);
-        i.state_dir = "/proc/superbot-no-such-dir".into();
+        i.config_dir = "/proc/superbot-no-such-dir".into();
         i.cwd = std::env::temp_dir();
         let mut out = Vec::new();
         let (_abort, rx) = tokio::sync::watch::channel(None);
