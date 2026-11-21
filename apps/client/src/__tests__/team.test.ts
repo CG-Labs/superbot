@@ -138,6 +138,7 @@ describe("team rules (mirroring the server's, ADR 0087)", () => {
   it("explains a refused removal", () => {
     expect(blockedReason({ blocked: "self" })).toMatch(/Leave team/);
     expect(blockedReason({ blocked: "owner" })).toMatch(/Only the team's owners/);
+    expect(blockedReason({ blocked: "scim" })).toMatch(/identity provider/);
     expect(blockedReason({ blocked: null })).toBeNull();
   });
 
