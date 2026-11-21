@@ -78,6 +78,8 @@ export function AppLockProvider({ children, auth = deviceAuth, store = deviceSto
   const [busy, setBusy] = useState(false);
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
+  /** A setting being written: leaving the app meanwhile is timed by it, not by the old one. */
+  const pending = useRef<LockSettings | null>(null);
   /** A system prompt (Face ID, or Android's passcode screen) moves the app out of the foreground; that is not leaving. */
   const prompting = useRef(false);
   const autoPrompted = useRef(false);
@@ -121,7 +123,7 @@ export function AppLockProvider({ children, auth = deviceAuth, store = deviceSto
     if (!supported) return;
     const sub = AppState.addEventListener("change", (s) => {
       if (prompting.current) return;
-      dispatch({ type: "appState", state: s, now: now(), settings: settingsRef.current });
+      dispatch({ type: "appState", state: s, now: now(), settings: pending.current ?? settingsRef.current });
       if (s === "active") void refreshAvailability();
     });
     return () => sub.remove();
@@ -130,9 +132,15 @@ export function AppLockProvider({ children, auth = deviceAuth, store = deviceSto
   // Storage first, so the screen never shows a setting the next launch won't have.
   const save = useCallback(
     async (s: LockSettings) => {
-      if (s.enabled) await store.set(serializeLockSettings(s));
-      else await store.clear();
-      setSettings(s);
+      pending.current = s;
+      try {
+        if (s.enabled) await store.set(serializeLockSettings(s));
+        else await store.clear();
+        settingsRef.current = s;
+        setSettings(s);
+      } finally {
+        pending.current = null;
+      }
     },
     [store],
   );

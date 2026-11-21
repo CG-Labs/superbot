@@ -122,6 +122,24 @@ describe("App lock (ADR 0078)", () => {
     expect(screen.queryByLabelText("Lock after")).toBeNull();
   });
 
+  it("locks after leaving the app while turning it on was still saving", async () => {
+    let clock = 0;
+    let saved: () => void = () => {};
+    const auth = fakeAuth();
+    const store = fakeStore();
+    store.set.mockImplementationOnce(() => new Promise<void>((r) => (saved = r)));
+    auth.authenticate.mockResolvedValueOnce({ success: true }).mockImplementationOnce(() => new Promise(() => {}));
+    const user = userEvent.setup();
+    await show({ auth, store, now: () => clock });
+    await user.press(within(await screen.findByLabelText("App lock on or off")).getByRole("radio", { name: "On" }));
+    await waitFor(() => expect(store.set).toHaveBeenCalled());
+    await changeAppState("background");
+    await act(async () => saved());
+    clock = 1000;
+    await changeAppState("active");
+    expect(await screen.findByText("SuperBot is locked")).toBeOnTheScreen();
+  });
+
   it("draws the lock in a native modal, above the screens' own modals", async () => {
     const auth = fakeAuth();
     auth.authenticate.mockImplementationOnce(() => new Promise(() => {}));
