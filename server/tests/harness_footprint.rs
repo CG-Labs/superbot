@@ -211,6 +211,11 @@ impl Sampler {
 
 /// Disk used under `path` (allocated blocks, each hard-linked file once, links not followed).
 fn disk_bytes(path: &Path) -> u64 {
+    disk_bytes_once(path, &mut HashSet::new())
+}
+
+/// `disk_bytes`, skipping files already counted in `seen`.
+fn disk_bytes_once(path: &Path, seen: &mut HashSet<(u64, u64)>) -> u64 {
     fn walk(p: &Path, seen: &mut HashSet<(u64, u64)>) -> u64 {
         let Ok(m) = std::fs::symlink_metadata(p) else { return 0 };
         if !seen.insert((m.dev(), m.ino())) {
@@ -226,7 +231,7 @@ fn disk_bytes(path: &Path) -> u64 {
         }
         total
     }
-    walk(path, &mut HashSet::new())
+    walk(path, seen)
 }
 
 fn mib(bytes: u64) -> f64 {
@@ -259,10 +264,13 @@ fn install_dirs(bin: &str) -> (Option<PathBuf>, Option<PathBuf>) {
     });
     let runtime = match bin {
         "hermes" => None,
-        // Node.js: the folder holding its bin/ and lib/, or the binary alone.
-        _ => which("node").and_then(|n| std::fs::canonicalize(n).ok()).map(|n| match n.parent() {
-            Some(bin) if bin.file_name().is_some_and(|b| b == "bin") => bin.parent().map_or(n.clone(), Path::to_path_buf),
-            _ => n,
+        // Node.js: its own folder (bin/node, lib/node_modules/npm) when it has one, as
+        // nvm and the official tarballs do, else the binary alone (/usr/bin/node).
+        _ => which("node").and_then(|n| std::fs::canonicalize(n).ok()).map(|n| {
+            let own = n.parent().filter(|bin| bin.file_name().is_some_and(|b| b == "bin")).and_then(Path::parent).filter(|root| {
+                !matches!(root.to_str(), Some("/" | "/usr" | "/usr/local" | "/opt/homebrew")) && root.join("lib/node_modules/npm").is_dir()
+            });
+            own.map_or(n.clone(), Path::to_path_buf)
         }),
     };
     (install, runtime)
@@ -463,6 +471,11 @@ fn footprint(harness: &str, s: &Settings) -> (Value, Vec<String>) {
     delay(Duration::ZERO);
     let cold = measure(&b, std::slice::from_ref(&id), std::slice::from_ref(&hello));
     let warm: Vec<Measured> = (0..2).map(|_| measure(&b, std::slice::from_ref(&id), std::slice::from_ref(&hello))).collect();
+    for (what, m) in std::iter::once(("cold start", &cold)).chain(warm.iter().map(|m| ("warm start", m))) {
+        if m.result != "done" {
+            broke.push(format!("{what} run didn't finish (result {}): {}", m.result, m.text));
+        }
+    }
     println!("{harness}: cold start {:.2}s, warm {:.2}s", cold.wall.as_secs_f64(), warm[0].wall.as_secs_f64());
 
     // Typical runs, each held open by the model's delay.
@@ -476,23 +489,6 @@ fn footprint(harness: &str, s: &Settings) -> (Value, Vec<String>) {
         }
         println!("{harness}: run {i}: {:.2}s, peak PSS {:.0} MiB, CPU {:.2}s", m.wall.as_secs_f64(), kib_mib(m.usage.peak_pss_kib), m.cpu_s);
         runs.push(m);
-    }
-
-    // Idle: what's left once the last run ended (processes that outlived a run by
-    // `QUIESCE` were moved to the lingering set), over a few seconds.
-    let quiesced = quiesce(&b, QUIESCE);
-    let linger = lingering();
-    let linger_rss: u64 = linger.iter().map(|&p| memory_kib(p).0).sum();
-    let linger_ticks0: u64 = linger.iter().filter_map(|&p| cpu_ticks(p).map(|t| t.0)).sum();
-    let (botd_own0, _) = botd_ticks(&b);
-    std::thread::sleep(Duration::from_secs(3));
-    let linger_ticks1: u64 = linger.iter().filter_map(|&p| cpu_ticks(p).map(|t| t.0)).sum();
-    let linger_cpu = (linger_ticks1.saturating_sub(linger_ticks0)) as f64 / clk_tck();
-    let linger_list: Vec<Value> = linger.iter().map(|&p| json!({ "command": comm(p), "cmdline": cmdline(p), "rssMiB": kib_mib(memory_kib(p).0) })).collect();
-    let (botd_own1, _) = botd_ticks(&b);
-    let botd_idle = memory_kib(botd_pid);
-    if kib_mib(linger_rss) > MAX_IDLE_MIB || linger_cpu > MAX_IDLE_CPU_S {
-        broke.push(format!("processes left running after runs use {:.0} MiB and {linger_cpu:.2} CPU s in 3 s: {linger_list:?}", kib_mib(linger_rss)));
     }
 
     // Per-Bot state: the Bot's state dir, and what the CLI wrote to its home.
@@ -527,12 +523,31 @@ fn footprint(harness: &str, s: &Settings) -> (Value, Vec<String>) {
     }
     println!("{harness}: {} at once again: {:.2}s, peak PSS {:.0} MiB", s.concurrency, again.wall.as_secs_f64(), kib_mib(again.usage.peak_pss_kib));
 
+    // Idle: what's left once every run ended, the concurrent ones included (processes
+    // that outlived a run by `QUIESCE` were moved to the lingering set), over 3 s.
+    let quiesced = quiesce(&b, QUIESCE);
+    let linger = lingering();
+    let linger_rss: u64 = linger.iter().map(|&p| memory_kib(p).0).sum();
+    let linger_ticks0: u64 = linger.iter().filter_map(|&p| cpu_ticks(p).map(|t| t.0)).sum();
+    let (botd_own0, _) = botd_ticks(&b);
+    std::thread::sleep(Duration::from_secs(3));
+    let linger_ticks1: u64 = linger.iter().filter_map(|&p| cpu_ticks(p).map(|t| t.0)).sum();
+    let linger_cpu = (linger_ticks1.saturating_sub(linger_ticks0)) as f64 / clk_tck();
+    let linger_list: Vec<Value> = linger.iter().map(|&p| json!({ "command": comm(p), "cmdline": cmdline(p), "rssMiB": kib_mib(memory_kib(p).0) })).collect();
+    let (botd_own1, _) = botd_ticks(&b);
+    let botd_idle = memory_kib(botd_pid);
+    if kib_mib(linger_rss) > MAX_IDLE_MIB || linger_cpu > MAX_IDLE_CPU_S {
+        broke.push(format!("processes left running after runs use {:.0} MiB and {linger_cpu:.2} CPU s in 3 s: {linger_list:?}", kib_mib(linger_rss)));
+    }
+
     // Install.
     let (install, runtime) = install_dirs(harness);
     let install_path = install.clone();
-    let install_bytes = install.as_deref().map(disk_bytes);
+    // One seen set: a CLI installed inside its Node.js folder is counted once, as install.
+    let mut seen = HashSet::new();
+    let install_bytes = install.as_deref().map(|i| disk_bytes_once(i, &mut seen));
     let install_breakdown = install.as_deref().map(|i| breakdown(i, 1));
-    let runtime_bytes = runtime.as_deref().map(disk_bytes);
+    let runtime_bytes = runtime.as_deref().map(|r| disk_bytes_once(r, &mut seen));
 
     // Fit: concurrent runs per tier by memory, from the worst of one run alone and an
     // equal share of the concurrent peak.
