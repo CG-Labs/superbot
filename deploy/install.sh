@@ -690,8 +690,9 @@ install_hermes() {
   # Installs before ADR 0072 put a launcher first on botd's PATH, from .env.
   if [[ -e "$home/.local/bin/hermes" || -L "$home/.local/bin/hermes" ]]; then
     sudo -u "$SUPERBOT_USER" ln -sfn /usr/local/bin/hermes "$home/.local/bin/hermes"
-    [[ -d "$home/.hermes/hermes-agent" ]] \
-      && log "Bots now share $HERMES_SHARED_DIR; once none runs, $home/.hermes/hermes-agent may be removed"
+    if [[ -d "$home/.hermes/hermes-agent" ]]; then
+      log "Bots now share $HERMES_SHARED_DIR; once none runs, $home/.hermes/hermes-agent may be removed"
+    fi
   fi
 }
 
