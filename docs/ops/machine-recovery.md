@@ -62,7 +62,7 @@ botctl login                      # as an admin
 deploy/machine-restore-drill.sh drill@<your-domain> --fresh --yes
 ```
 
-It shows the objectives, takes a backup with `--fresh` (otherwise uses the newest), restores from it, waits, and prints how long botd recorded against the RTO. It exits non-zero if the restore failed or ran past the RTO. Add `--identity <age key file>` when the server doesn't hold the backups' age identity. Needs `botctl` and `jq`.
+It shows the objectives, takes a backup with `--fresh` (otherwise uses the newest), restores from it, waits, and prints how long botd recorded against the RTO. It exits non-zero if the restore failed or ran past the RTO. It stops waiting once the RTO has passed; botd carries on with the restore. Add `--identity <age key file>` when the server doesn't hold the backups' age identity. Needs `botctl` and `jq`.
 
 Never point it at a customer's machine: everything on it since the backup is lost.
 

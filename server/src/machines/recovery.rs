@@ -77,7 +77,7 @@ pub fn view(app: &App, cp: &ControlPlane, off: &Offsite, m: &Machine) -> Value {
     let st = status(app, cp, off, m);
     let last = app.db.machine_last_backup(&m.id);
     let restore = app.db.machine_last_restore(&m.id);
-    let open = app.db.machine_rpo_breaches_open().into_iter().find(|b| b.machine_id == m.id);
+    let open = app.db.machine_rpo_breach_open(&m.id);
     json!({
         "machineId": m.id,
         "userId": m.user_id,
@@ -186,12 +186,15 @@ pub fn watch(app: &AppState, cp: &ControlPlane) -> usize {
     breaching
 }
 
-/// A restore that finished: records how long it took against its RTO, and returns that
-/// for its `machine.restored` event. It took from the request until the machine
-/// enrolled, not until botd next looked.
-pub fn restored(app: &AppState, m: &Machine, r: &MachineRestore) -> Value {
-    let took = (m.enrolled_at.unwrap_or_else(now) - r.created_at).max(0);
-    app.db.machine_restore_timed(&r.id, took);
+/// How long a restore took: from the request until the machine enrolled, not until botd
+/// next looked.
+pub fn took(m: &Machine, r: &MachineRestore) -> i64 {
+    (m.enrolled_at.unwrap_or_else(now) - r.created_at).max(0)
+}
+
+/// A restore that finished, recorded as done with `took`: checks it against its RTO and
+/// returns that for its `machine.restored` event.
+pub fn restored(app: &AppState, m: &Machine, r: &MachineRestore, took: i64) -> Value {
     let ok = r.rto_ms.is_none_or(|rto| took <= rto);
     if !ok {
         exceeded(app, m, r, took, false);
@@ -213,6 +216,12 @@ fn exceeded(app: &AppState, m: &Machine, r: &MachineRestore, took: i64, underway
     alert(app, m, "machine.restore_rto_exceeded", format!("Restoring {}'s machine took longer than its RTO", who(app, m)), lines);
 }
 
+/// Whether the restore's machine has enrolled since it was swapped in, so it is done
+/// whenever botd next looks, and timed then.
+pub fn enrolled(m: &Machine, r: &MachineRestore) -> bool {
+    r.state == "enrolling" && m.enrollment == "enrolled" && m.enrolled_at.is_some_and(|t| t >= r.replaced_at.unwrap_or(r.created_at))
+}
+
 /// Restores still underway past their RTO: audited and alerted once each.
 pub fn overdue(app: &AppState) {
     let at = now();
@@ -221,6 +230,7 @@ pub fn overdue(app: &AppState) {
             if r.rto_exceeded_at.is_none()
                 && r.rto_ms.is_some_and(|rto| at - r.created_at > rto)
                 && let Some(m) = app.db.machine(&r.machine_id)
+                && !enrolled(&m, &r)
             {
                 exceeded(app, &m, &r, at - r.created_at, true);
             }

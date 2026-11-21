@@ -789,10 +789,11 @@ pub async fn follow_up(app: &AppState, cp: &ControlPlane) {
         let Some(r) = app.db.machine_restore(&r.id).filter(|r| r.state == "enrolling") else { continue };
         let Some(m) = app.db.machine(&r.machine_id) else { continue };
         let since = r.replaced_at.unwrap_or(r.created_at);
-        if m.enrollment == "enrolled" && m.enrolled_at.is_some_and(|t| t >= since) {
-            if app.db.machine_restore_move(&r.id, &["enrolling"], "done", None) {
+        if super::recovery::enrolled(&m, &r) {
+            let took = super::recovery::took(&m, &r);
+            if app.db.machine_restore_done(&r.id, took) {
                 let by = system(&m);
-                let mut d = super::recovery::restored(app, &m, &r);
+                let mut d = super::recovery::restored(app, &m, &r, took);
                 d["restoreId"] = json!(r.id);
                 d["backupId"] = json!(r.backup_id);
                 d["by"] = json!(r.created_by);

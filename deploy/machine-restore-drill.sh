@@ -65,6 +65,7 @@ fi
 step "restoring $USER_KEY's machine from $BACKUP"
 RESTORE=$(api machine restore "$USER_KEY" "$BACKUP" "${IDENTITY[@]}" --yes | jq -r '.restore.id')
 [[ -n "$RESTORE" && "$RESTORE" != null ]] || fail "botd didn't start a restore"
+DEADLINE=
 while :; do
   R=$(api machine restore "$USER_KEY" status)
   [[ $(jq -r '.restore.id' <<<"$R") == "$RESTORE" ]] || fail "another restore replaced $RESTORE"
@@ -72,6 +73,11 @@ while :; do
   case "$STATE" in
     done | failed) break ;;
   esac
+  if [[ -z "$DEADLINE" ]]; then
+    DEADLINE=$(jq -r 'if (.restore.createdAt | type) == "number" and (.restore.rtoMs | type) == "number" then .restore.createdAt + .restore.rtoMs else empty end' <<<"$R")
+    [[ "$DEADLINE" =~ ^[0-9]+$ ]] || fail "botd recorded no RTO for $RESTORE"
+  fi
+  (($(date +%s%3N) <= DEADLINE)) || fail "restore $RESTORE is still $STATE past its RTO (botd carries on with it)"
   printf '    %s\n' "$STATE"
   sleep "$POLL"
 done

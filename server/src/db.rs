@@ -4834,8 +4834,16 @@ impl Db {
     }
 
     /// How long a finished restore took (ADR 0073).
-    pub fn machine_restore_timed(&self, id: &str, duration_ms: i64) {
-        let _ = self.c().execute("UPDATE machine_restores SET duration_ms = ? WHERE id = ?", params![duration_ms, id]);
+    /// Moves an enrolling restore to done with how long it took, in one write so a restart
+    /// can't leave it done without its timing. Returns whether it moved.
+    pub fn machine_restore_done(&self, id: &str, duration_ms: i64) -> bool {
+        self.c()
+            .execute(
+                "UPDATE machine_restores SET state = 'done', finished_at = ?1, duration_ms = ?2 WHERE id = ?3 AND state = 'enrolling'",
+                params![now(), duration_ms, id],
+            )
+            .unwrap_or(0)
+            == 1
     }
 
     /// Marks a restore as past its RTO, once. Returns whether this call did.
@@ -4875,6 +4883,13 @@ impl Db {
         let c = self.c();
         let mut s = c.prepare("SELECT * FROM machine_rpo_breaches WHERE ended_at IS NULL ORDER BY breached_at, id").unwrap();
         s.query_map([], machine_rpo_breach_row).unwrap().filter_map(Result::ok).collect()
+    }
+
+    /// The machine's open breach, if any.
+    pub fn machine_rpo_breach_open(&self, machine_id: &str) -> Option<MachineRpoBreach> {
+        self.c()
+            .query_row("SELECT * FROM machine_rpo_breaches WHERE machine_id = ? AND ended_at IS NULL", [machine_id], machine_rpo_breach_row)
+            .ok()
     }
 
     /// The newest breaches, open or not, newest first.
@@ -4956,6 +4971,16 @@ impl Db {
     #[cfg(test)]
     pub fn machine_restore_backdate(&self, id: &str, ms: i64) {
         self.c().execute("UPDATE machine_restores SET created_at = created_at - ?1 WHERE id = ?2", params![ms, id]).unwrap();
+    }
+
+    #[cfg(test)]
+    pub fn machine_restore_replaced_backdate(&self, id: &str, ms: i64) {
+        self.c().execute("UPDATE machine_restores SET replaced_at = replaced_at - ?1 WHERE id = ?2", params![ms, id]).unwrap();
+    }
+
+    #[cfg(test)]
+    pub fn machine_enrolled_backdate(&self, id: &str, ms: i64) {
+        self.c().execute("UPDATE machines SET enrolled_at = enrolled_at - ?1 WHERE id = ?2", params![ms, id]).unwrap();
     }
 
     #[cfg(test)]

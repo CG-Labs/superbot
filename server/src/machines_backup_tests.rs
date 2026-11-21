@@ -509,6 +509,18 @@ async fn restores_are_timed_against_their_tiers_rto() {
     // What's on it now came from the backup, so it's covered from when the restore ended.
     assert!(rec["machines"][0]["coveredSince"].as_i64() >= r.finished_at, "{rec}");
 
+    // Enrolled within its RTO, but botd only looks after it: on time, not late.
+    let r = restore_until(&env, &uid, json!({ "backupId": b.id }), "enrolling").await;
+    let token = read(&env, &m.label, "/etc/superbot/enroll-token").unwrap();
+    agent::enroll(&config(&env, &m.id, &token)).await.unwrap();
+    env.app.db.machine_restore_backdate(&r.id, 61 * 60_000);
+    env.app.db.machine_restore_replaced_backdate(&r.id, 61 * 60_000);
+    env.app.db.machine_enrolled_backdate(&m.id, 61 * 60_000);
+    backup::follow_up(&env.app, &env.cp).await;
+    let r = env.app.db.machine_restore(&r.id).unwrap();
+    assert!(r.state == "done" && r.duration_ms.unwrap() <= 60 * 60_000 && r.rto_exceeded_at.is_none(), "{r:?}");
+    assert!(events(&env, "machine.restore_rto_exceeded").await.is_empty());
+
     // Still underway past its RTO: audited and alerted once, then recorded as late.
     let r = restore_until(&env, &uid, json!({ "backupId": b.id }), "enrolling").await;
     env.app.db.machine_restore_backdate(&r.id, 61 * 60_000);
