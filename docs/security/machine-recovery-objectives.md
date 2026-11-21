@@ -1,6 +1,6 @@
 # Machine recovery objectives
 
-Text for an SLA, a DPA's availability and resilience clause, or a security questionnaire, describing how a SuperBot operator protects customers' managed machines. It states only what SuperBot enforces and measures ([ADR 0073](../adr/0073-machine-rpo-and-rto.md)). The numbers are SuperBot's defaults; an operator who changes them (see [machine recovery](../ops/machine-recovery.md)) must change them here too, and should not promise tighter numbers than the server is set to. The encryption statement holds only with `MACHINE_BACKUP_AGE_RECIPIENTS` set.
+Text for an SLA, a DPA's availability and resilience clause, or a security questionnaire, describing how a SuperBot operator protects customers' managed machines. It states only what SuperBot enforces and measures ([ADR 0073](../adr/0073-machine-rpo-and-rto.md)). The numbers are SuperBot's defaults; an operator who changes them (see [machine recovery](../ops/machine-recovery.md)) must change them here too, and should not promise tighter numbers than the server is set to, nor an RTO their own drill hasn't shown for the plan's largest disk. The encryption statement holds only with `MACHINE_BACKUP_AGE_RECIPIENTS` set.
 
 "Provider" below is whoever runs the SuperBot server. "Machine" is a customer's managed computer running as an Incus container on the Provider's infrastructure.
 
