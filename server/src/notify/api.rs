@@ -2,7 +2,7 @@
 //! Admin-only: `rbac::classify` puts these routes under Admin. Webhook URLs are secrets
 //! (they carry their own token): saved in the sealed store, never sent back, only their host.
 
-use super::{apply_bot_patch, apply_patch, load, save, secret, secret_set, smtp, webhook, Settings};
+use super::{apply_bot_patch, apply_patch, load, save, secret_set, stored, smtp, webhook, Settings};
 use crate::audit::Who;
 use crate::db::Bot;
 use crate::runner::App;
@@ -13,7 +13,7 @@ fn webhook_view(name: &str) -> Value {
     let source = secrets::global().source(name).ok().flatten();
     json!({
         "set": source.is_some(),
-        "host": secret(name).and_then(|u| webhook::host_of(u.expose())),
+        "host": stored(name).and_then(|u| webhook::host_of(u.expose())),
         "store": source.map(|(kind, _)| kind),
         // The env store owns a name it holds; the URL changes there.
         "writable": source.is_none_or(|(_, w)| w),

@@ -2337,9 +2337,8 @@ async fn put_notifications(State(app): State<AppState>, Extension(who): Extensio
     Ok(Json(notify::api::update(&app, &by, &v).map_err(bad)?))
 }
 
-async fn test_notifications(State(app): State<AppState>, Extension(who): Extension<Principal>, body: axum::body::Bytes) -> Res {
+async fn test_notifications(State(app): State<AppState>, Extension(who): Extension<Principal>, Json(v): Json<Value>) -> Res {
     need_user(who)?;
-    let v: Value = if body.is_empty() { json!({}) } else { serde_json::from_slice(&body).map_err(|_| bad("Send JSON"))? };
     let bot = match v.get("botId").and_then(Value::as_str) {
         Some(id) => Some(need_bot(&app, id)?),
         None => None,

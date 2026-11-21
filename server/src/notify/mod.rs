@@ -141,12 +141,12 @@ pub fn save(db: &Db, s: &Settings) {
     db.set_setting(SETTINGS_KEY, &serde_json::to_string(s).unwrap());
 }
 
-fn secret(name: &str) -> Option<secrets::Secret> {
+fn stored(name: &str) -> Option<secrets::Secret> {
     secrets::global().get(name).ok().flatten()
 }
 
 pub fn secret_set(name: &str) -> bool {
-    secret(name).is_some()
+    stored(name).is_some()
 }
 
 /// `{email?: {enabled?, to?, deciders?}, webhook?: {enabled?, format?}, delaySeconds?,
@@ -438,7 +438,7 @@ impl Channel for Email {
             if plan.email.is_empty() {
                 return None;
             }
-            let password = secret(smtp::PASSWORD);
+            let password = stored(smtp::PASSWORD);
             let (subject, body) = (n.email_subject(), n.email_body(links.app().as_deref()));
             let mails: Vec<smtp::Mail> = plan.email.iter().map(|to| smtp::Mail { to: to.clone(), subject: subject.clone(), body: body.clone() }).collect();
             Some(self.smtp.send(password.as_ref().map(|p| p.expose()), &mails).await.map(|results| {
@@ -466,9 +466,9 @@ impl Channel for Webhook {
     fn send<'a>(&'a self, n: &'a Notice, plan: &'a Plan, _links: &'a Links) -> BoxFuture<'a, Option<Result<Sent, String>>> {
         Box::pin(async move {
             let (name, format) = plan.webhook.as_ref()?;
-            let Some(url) = secret(name) else { return Some(Err(format!("{name} isn't set"))) };
+            let Some(url) = stored(name) else { return Some(Err(format!("{name} isn't set"))) };
             secrets::redact::register(url.expose());
-            let signing = secret(webhook::SIGNING);
+            let signing = stored(webhook::SIGNING);
             let mut detail = json!({ "host": webhook::host_of(url.expose()), "format": format, "own": name != webhook::URL });
             Some(Ok(match webhook::post(&self.http, url.expose(), *format, n, signing.as_ref().map(|s| s.expose())).await {
                 Ok(status) => {
