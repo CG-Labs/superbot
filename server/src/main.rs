@@ -62,6 +62,8 @@ mod machines_screens_tests;
 mod machines_teammates_tests;
 #[cfg(test)]
 mod machines_offboard_tests;
+#[cfg(test)]
+mod machines_placement_tests;
 mod passwd;
 mod notify;
 #[cfg(test)]
@@ -688,6 +690,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/machines/substrate", get(machines::substrate))
         .route("/machines/hosts", get(machines::hosts::list))
         .route("/machines/hosts/{name}/recover", post(machines::hosts::recover))
+        .route("/machines/hosts/{name}/drain", put(machines::hosts::drain).delete(machines::hosts::undrain))
         .route("/machines/legacy", get(machines::rebuild::legacy_list))
         .route("/machines/reconcile", post(machines::reconcile_now))
         .route("/machines/teammate-removals", get(machines::offboard::list_all))

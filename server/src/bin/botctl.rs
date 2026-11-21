@@ -148,7 +148,10 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
   botctl machine restore <user> <backup-id> [--identity <age-key-file>] [--host <name>] --yes  Make it again from that backup; it enrolls anew
                                                    (--host: onto that Incus host, deleting it from its own; ADR 0076)
   botctl machine restore <user> status             How its latest restore went
-  botctl machine hosts [check]                     Incus hosts (ADR 0076): up, down or lost, and their machines; check asks each now
+  botctl machine hosts [check]                     Incus hosts (ADR 0076): up, down or lost, their machines, load and
+                                                   capacity, and where a new machine goes (ADR 0081); check asks each now
+  botctl machine host drain <name> [--reason <text>]  Place nothing new on the host; its machines stay until moved (ADR 0081)
+  botctl machine host undrain <name>               New machines may go on it again
   botctl machine host recover <name> [--to <host>] [--identity <age-key-file>] --yes
                                                    Declare a host that doesn't answer lost, and restore its machines from
                                                    their newest off-host backups onto another host; they enroll anew
@@ -735,12 +738,16 @@ fn backup_request(args: &[&str], read: impl Fn(&str) -> Result<String, String>) 
             let body = json!({ "to": flag(rest, "--to"), "identity": identity });
             ("POST", format!("/api/machines/hosts/{}/recover", encode(name)), Some(body.to_string()))
         }
+        ["host", "drain", name, rest @ ..] if !name.starts_with("--") => {
+            ("PUT", format!("/api/machines/hosts/{}/drain", encode(name)), Some(json!({ "reason": flag(rest, "--reason") }).to_string()))
+        }
+        ["host", "undrain", name] if !name.starts_with("--") => ("DELETE", format!("/api/machines/hosts/{}/drain", encode(name)), None),
         ["host", "recover", _, ..] => {
             return Err("Recovering declares the host lost for good and restores its machines elsewhere from their backups; add --yes".into());
         }
         ["restore", _, _, ..] => return Err("Restoring replaces the machine and everything on it since the backup; add --yes".into()),
         _ => return Err(
-            "Usage: botctl machine backups [<user>] | backup <user> | recovery | restore <user> <backup-id> [--identity <file>] [--host <name>] --yes | restore <user> status | hosts [check] | host recover <name> [--to <host>] [--identity <file>] --yes"
+            "Usage: botctl machine backups [<user>] | backup <user> | recovery | restore <user> <backup-id> [--identity <file>] [--host <name>] --yes | restore <user> status | hosts [check] | host drain <name> [--reason <text>] | host undrain <name> | host recover <name> [--to <host>] [--identity <file>] --yes"
                 .into(),
         ),
     })
@@ -1374,6 +1381,13 @@ mod tests {
         assert_eq!(serde_json::from_str::<serde_json::Value>(&b.unwrap()).unwrap(), json!({ "to": null, "identity": null }));
         assert!(backup_request(&["host", "recover", "main"], read).unwrap_err().contains("--yes"));
         assert!(backup_request(&["host", "recover", "--yes"], read).is_err());
+        let (m, p, b) = backup_request(&["host", "drain", "b", "--reason", "disk swap"], read).unwrap();
+        assert_eq!((m, p.as_str()), ("PUT", "/api/machines/hosts/b/drain"));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&b.unwrap()).unwrap(), json!({ "reason": "disk swap" }));
+        let (_, _, b) = backup_request(&["host", "drain", "b"], read).unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&b.unwrap()).unwrap(), json!({ "reason": null }));
+        assert_eq!(backup_request(&["host", "undrain", "b"], read).unwrap(), ("DELETE", "/api/machines/hosts/b/drain".into(), None));
+        assert!(backup_request(&["host", "undrain"], read).is_err());
         assert_eq!(login_base("me"), "/api/machine");
         assert_eq!(login_base("a@example.com"), "/api/users/a%40example.com/machine");
     }

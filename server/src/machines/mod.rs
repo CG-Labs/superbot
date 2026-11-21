@@ -28,6 +28,7 @@ pub mod landing;
 pub mod linode;
 pub mod logins;
 pub mod offboard;
+pub mod placement;
 pub mod pki;
 pub mod provider;
 pub mod rebuild;
@@ -620,6 +621,7 @@ fn system(m: &Machine) -> Who {
 
 fn observe(m: &mut Machine, pm: &ProviderMachine) {
     m.provider_id = Some(pm.id.clone());
+    m.placed_on = None;
     m.provider_status = Some(pm.status.clone());
     m.ipv4 = pm.ipv4.clone();
     m.backups = pm.backups;
@@ -651,7 +653,7 @@ async fn by_label(
 /// provider has one by that name already, that one is adopted, not a second made.
 /// A transient failure leaves it pending for the reconciler; a refusal is an error.
 async fn provision(
-    app: &App,
+    app: &AppState,
     cp: &ControlPlane,
     p: &dyn MachineProvider,
     mut m: Machine,
@@ -662,41 +664,83 @@ async fn provision(
         app.db.save_machine(&m, m.state);
         return m;
     }
-    // The firewall first: a machine is never made without one, nor a token minted for
-    // a create that won't be sent.
-    m.firewall_id = match &cp.firewall {
-        None => None,
-        Some(fw) => match firewall::ensure(app, fw, p, by).await {
-            Ok(id) => Some(id),
-            Err(e) => return refused(app, m, by, e, "firewall"),
+    // A create whose answer was lost may have made it on any host: adopt that before
+    // placing it again, so a retry never makes a second copy elsewhere.
+    let earlier = match (p.hosts(), m.create_sent_at) {
+        (Some(_), Some(_)) => match by_label(p, &m).await {
+            Ok(found) => found,
+            Err(e) => return refused(app, m, by, e, "create"),
         },
+        _ => None,
     };
-    m.create_sent_at = Some(now());
-    app.db.save_machine(&m, m.state);
-    // A fresh token each attempt. An earlier one stays good until it expires, in case
-    // that attempt made the machine and it is adopted below.
-    let user_data = match &cp.enrollment {
-        None => None,
-        Some(e) => match e.mint_token(app, &m.id, by.actor.id.as_deref()) {
-            Ok((token, expires_at)) => {
-                app.db.record(&event(by, "machine.enroll_token_issued", &m, json!({ "expiresAt": expires_at, "via": "create" })));
-                Some(e.user_data(&m, &token))
-            }
-            Err(err) => {
-                m.last_error = Some(format!("couldn't make an enrollment token: {err}"));
-                app.db.save_machine(&m, m.state);
+    if earlier.is_none() && m.placed_on.take().is_some() {
+        // Not there after all: free its room before placing it again.
+        app.db.save_machine(&m, m.state);
+    }
+    let found = if let Some(pm) = earlier {
+        Ok((pm, true))
+    } else {
+        // Where it goes (ADR 0081). With no room anywhere it waits, said once.
+        let host = match p.hosts().map(|_| placement::choose(app, cp, &m.plan, None)) {
+            None => None,
+            Some(Ok(h)) => Some(h),
+            Some(Err(why)) => {
+                if !m.last_error.as_deref().is_some_and(placement::waiting) {
+                    placement::failed(app, by, &m.user_id, Some(&m), &m.plan, &why);
+                }
+                if m.last_error.as_deref() != Some(why.as_str()) {
+                    m.last_error = Some(why);
+                    app.db.save_machine(&m, m.state);
+                }
                 return m;
             }
-        },
-    };
-    let found = match p.create(&cp.spec(&m, user_data)).await {
-        Ok(pm) => Ok((pm, false)),
-        Err(ProviderError::LabelTaken) => match by_label(p, &m).await {
-            Ok(Some(pm)) => Ok((pm, true)),
-            Ok(None) => Err(ProviderError::LabelTaken),
+        };
+        // The firewall first: a machine is never made without one, nor a token minted for
+        // a create that won't be sent. Only on its host, so a failing one can't hold it up.
+        let on = match (&host, p.hosts()) {
+            (Some(h), Some(hosts)) => hosts.on(h).unwrap_or(p),
+            _ => p,
+        };
+        m.firewall_id = match &cp.firewall {
+            None => None,
+            Some(fw) => match firewall::ensure(app, fw, on, by).await {
+                Ok(id) => Some(id),
+                Err(e) => return refused(app, m, by, e, "firewall"),
+            },
+        };
+        m.create_sent_at = Some(now());
+        m.placed_on = host.clone();
+        app.db.save_machine(&m, m.state);
+        // A fresh token each attempt. An earlier one stays good until it expires, in case
+        // that attempt made the machine and it is adopted below.
+        let user_data = match &cp.enrollment {
+            None => None,
+            Some(e) => match e.mint_token(app, &m.id, by.actor.id.as_deref()) {
+                Ok((token, expires_at)) => {
+                    app.db.record(&event(by, "machine.enroll_token_issued", &m, json!({ "expiresAt": expires_at, "via": "create" })));
+                    Some(e.user_data(&m, &token))
+                }
+                Err(err) => {
+                    m.last_error = Some(format!("couldn't make an enrollment token: {err}"));
+                    app.db.save_machine(&m, m.state);
+                    return m;
+                }
+            },
+        };
+        let spec = cp.spec(&m, user_data);
+        let made = match (&host, p.hosts()) {
+            (Some(h), Some(hosts)) => hosts.create_on(h, &spec).await,
+            _ => p.create(&spec).await,
+        };
+        match made {
+            Ok(pm) => Ok((pm, false)),
+            Err(ProviderError::LabelTaken) => match by_label(p, &m).await {
+                Ok(Some(pm)) => Ok((pm, true)),
+                Ok(None) => Err(ProviderError::LabelTaken),
+                Err(e) => Err(e),
+            },
             Err(e) => Err(e),
-        },
-        Err(e) => Err(e),
+        }
     };
     let from = m.state;
     match found {
@@ -741,6 +785,8 @@ fn refused(app: &App, mut m: Machine, by: &Who, e: ProviderError, step: &str) ->
             // A refusal made nothing, so a delete needn't wait for it.
             m.create_sent_at = None;
         }
+        // Nor does it hold room: a retry once the cause is fixed mustn't count itself.
+        m.placed_on = None;
     }
     m.last_error = Some(match step {
         "firewall" => format!("The machine's firewall couldn't be set up: {e}"),
@@ -837,7 +883,7 @@ fn user_data_spent(m: &Machine, pm: &ProviderMachine) -> Option<&'static str> {
 /// deletes. It never boots or
 /// stops a machine to undo a change made at the provider; it records what it sees.
 /// Returns whether the machine's state changed.
-async fn reconcile_one(app: &App, cp: &ControlPlane, p: &dyn MachineProvider, id: &str) -> bool {
+async fn reconcile_one(app: &AppState, cp: &ControlPlane, p: &dyn MachineProvider, id: &str) -> bool {
     let Some(mut m) = app.db.machine(id) else {
         return false;
     };
@@ -957,7 +1003,7 @@ async fn reconcile_one(app: &App, cp: &ControlPlane, p: &dyn MachineProvider, id
 
 /// One pass over every machine that isn't settled. Each takes the lock on its own, so
 /// an admin's request waits for at most one machine, not the whole pass.
-pub async fn reconcile(app: &App, cp: &ControlPlane) -> Value {
+pub async fn reconcile(app: &AppState, cp: &ControlPlane) -> Value {
     let Some(p) = cp.provider.as_deref() else {
         return json!({ "checked": 0, "changed": 0 });
     };
@@ -1244,12 +1290,25 @@ pub async fn request(
         let region = asked_region.clone().unwrap_or_else(|| region.into());
         (tier, plan, region)
     };
+    // Refused up front when no host has room (ADR 0081), rather than left waiting.
+    let place = |plan: &str| -> Res<()> {
+        match p.hosts().map(|_| placement::choose(&app, cp, plan, None)) {
+            Some(Err(why)) => {
+                placement::failed(&app, &by, &u.id, None, plan, &why);
+                Err(conflict(why))
+            }
+            _ => Ok(()),
+        }
+    };
     let _g = cp.ops.lock().await;
     let m = match app.db.user_machine(&u.id) {
         Some(mut m) if m.state == State::Error => {
             cp.need_own(&m)?;
             let (tier, plan, region) = settings(&m.tier, &m.plan, &m.region);
             cp.need_plan(&plan)?;
+            if m.provider_id.is_none() {
+                place(&plan)?;
+            }
             // The label stays, so a machine made by an earlier create would be adopted
             // as it is. Only change what's asked for when there's none.
             if (&tier, &region) != (&m.tier, &m.region) {
@@ -1303,6 +1362,7 @@ pub async fn request(
             let (default_tier, default_plan) = &cp.tiers[0];
             let (tier, plan, region) = settings(default_tier, default_plan, &cp.regions[0]);
             cp.need_plan(&plan)?;
+            place(&plan)?;
             let new = NewMachine {
                 user_id: &u.id,
                 provider: p.name(),

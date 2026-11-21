@@ -12,6 +12,7 @@ use crate::machines::hosts;
 use crate::machines::incus::Incus;
 use crate::machines::incus::fleet::{Fleet, Member};
 use crate::machines::incus_standin::StandIn;
+use crate::machines::provider::Policy;
 use crate::machines::s3_standin;
 use crate::machines::{ControlPlane, State};
 use crate::tests::{audit_list, call};
@@ -20,34 +21,41 @@ use crate::*;
 use tokio::net::TcpListener;
 use zeroize::Zeroizing;
 
-struct Env {
-    port: u16,
-    app: AppState,
-    admin: String,
-    a: StandIn,
-    b: StandIn,
-    cp: Arc<ControlPlane>,
-    e: Arc<Enrollment>,
+pub(crate) struct Env {
+    pub(crate) port: u16,
+    pub(crate) app: AppState,
+    pub(crate) admin: String,
+    pub(crate) a: StandIn,
+    pub(crate) b: StandIn,
+    pub(crate) c: StandIn,
+    pub(crate) cp: Arc<ControlPlane>,
+    pub(crate) e: Arc<Enrollment>,
     mport: u16,
     _s3: s3_standin::StandIn,
 }
 
 const AGENT: &str = "stand-in for the superbot-machine binary";
-const DOWN_MS: i64 = 60_000;
+pub(crate) const DOWN_MS: i64 = 60_000;
 
-fn host(name: &str, s: &StandIn, mport: u16) -> Member {
+pub(crate) fn host(name: &str, s: &StandIn, mport: u16) -> Member {
     s.w().projects.insert("superbot".into(), json!({ "restricted": "true", "restricted.backups": "allow" }));
-    Member { name: name.into(), incus: Incus::new(s.settings(Some(("127.0.0.1".parse().unwrap(), mport))), s.credentials()).unwrap() }
+    Member::new(name, Incus::new(s.settings(Some(("127.0.0.1".parse().unwrap(), mport))), s.credentials()).unwrap())
 }
 
-/// botd with Incus hosts `a` and `b`, enrollment, the firewall and backups on.
+/// botd with Incus hosts `a` and `b`, enrollment, the firewall and backups on. New
+/// machines go on the first host with room.
 async fn serve() -> Env {
+    serve_with(|a, b, _| Fleet::new(vec![a, b], DOWN_MS).with_policy(Policy::Fill)).await
+}
+
+/// As `serve`, with the fleet `build` makes of hosts `a`, `b` and `c`.
+pub(crate) async fn serve_with(build: impl FnOnce(Member, Member, Member) -> Fleet) -> Env {
     let machine_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let agent_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let (mport, aport) = (machine_listener.local_addr().unwrap().port(), agent_listener.local_addr().unwrap().port());
     drop(agent_listener);
-    let (a, b) = (StandIn::start().await, StandIn::start().await);
-    let fleet = Fleet::new(vec![host("a", &a, mport), host("b", &b, mport)], DOWN_MS);
+    let (a, b, c) = (StandIn::start().await, StandIn::start().await, StandIn::start().await);
+    let fleet = build(host("a", &a, mport), host("b", &b, mport), host("c", &c, mport));
     let s3 = s3_standin::StandIn::start().await;
     let mut cp = ControlPlane::for_tests(Arc::new(fleet));
     cp.regions = vec!["local".into()];
@@ -57,32 +65,32 @@ async fn serve() -> Env {
     let s = Settings { retention: Retention::retention("7").unwrap(), ..Settings::with(s3.settings(), "t/", Vec::new()) };
     cp.offsite = Some(Arc::new(Offsite::new(s).unwrap()));
     let cp = Arc::new(cp);
-    let c = cp.clone();
-    let (port, app, owner, _) = crate::tests::serve_app_with(move |a| a.machines = c).await;
+    let shared = cp.clone();
+    let (port, app, owner, _) = crate::tests::serve_app_with(move |a| a.machines = shared).await;
     hosts::load(&app, &cp).unwrap();
     tokio::spawn(enroll::serve(machine_listener, app.clone(), e.clone(), None));
     let (_, admin) = user_with(port, &owner, "ops@example.com", "admin").await;
-    Env { port, app, admin, a, b, cp, e, mport, _s3: s3 }
+    Env { port, app, admin, a, b, c, cp, e, mport, _s3: s3 }
 }
 
-async fn json_call(env: &Env, method: &str, path: &str, body: &str) -> (u16, Value) {
+pub(crate) async fn json_call(env: &Env, method: &str, path: &str, body: &str) -> (u16, Value) {
     let (code, body) = call(env.port, method, path, &env.admin, body).await;
     (code, parse(&body))
 }
 
-async fn events(env: &Env, action: &str) -> Vec<Value> {
+pub(crate) async fn events(env: &Env, action: &str) -> Vec<Value> {
     let (code, body) = call(env.port, "GET", &format!("/api/audit?action={action}&limit=200"), &env.admin, "").await;
     assert_eq!(code, 200, "{body}");
     audit_list(&body)
 }
 
-async fn reconcile(env: &Env) -> Value {
+pub(crate) async fn reconcile(env: &Env) -> Value {
     let (code, r) = json_call(env, "POST", "/api/machines/reconcile", "").await;
     assert_eq!(code, 200, "{r}");
     r
 }
 
-fn config(env: &Env, machine_id: &str, token: &str) -> Config {
+pub(crate) fn config(env: &Env, machine_id: &str, token: &str) -> Config {
     Config {
         control_url: env.e.url.clone(),
         machine_id: machine_id.into(),
@@ -109,34 +117,39 @@ fn config(env: &Env, machine_id: &str, token: &str) -> Config {
 /// A member's machine, running on host `a`: enrolled, with a file of theirs on its
 /// disk, if `enroll`.
 async fn machine(env: &Env, email: &str, enroll: bool) -> (String, crate::db::Machine) {
+    machine_on(env, &env.a, "a", email, enroll).await
+}
+
+/// A member's machine, which placement must put on `host` (stand-in `s`).
+pub(crate) async fn machine_on(env: &Env, s: &StandIn, host: &str, email: &str, enroll: bool) -> (String, crate::db::Machine) {
     let (uid, _) = user_with(env.port, &env.admin, email, "member").await;
     let (code, m) = json_call(env, "POST", &format!("/api/users/{uid}/machine"), "").await;
     assert_eq!(code, 202, "{m}");
     let m = env.app.db.machine(m["id"].as_str().unwrap()).unwrap();
-    assert_eq!(m.provider_id.as_deref(), Some(format!("a/{}", m.label).as_str()), "new machines go on the first host");
-    env.a.w().instances.get_mut(&m.label).unwrap().ip = "127.0.0.1".into();
+    assert_eq!(m.provider_id.as_deref(), Some(format!("{host}/{}", m.label).as_str()), "placed on {host}");
+    s.w().instances.get_mut(&m.label).unwrap().ip = "127.0.0.1".into();
     reconcile(env).await;
     if enroll {
-        let user_data = env.a.instance(&m.label).unwrap().body["config"]["cloud-init.user-data"].as_str().unwrap().to_string();
+        let user_data = s.instance(&m.label).unwrap().body["config"]["cloud-init.user-data"].as_str().unwrap().to_string();
         let at = user_data.find("content: \"sbe_").unwrap() + "content: \"".len();
         let token = user_data[at..].split('"').next().unwrap().to_string();
         agent::enroll(&config(env, &m.id, &token)).await.unwrap();
         reconcile(env).await;
-        write(&env.a, &m.label, "/home/user/notes.txt", "version 1");
-        write(&env.a, &m.label, IDENTITY_PATH, "the old agent's key");
+        write(s, &m.label, "/home/user/notes.txt", "version 1");
+        write(s, &m.label, IDENTITY_PATH, "the old agent's key");
     }
     (uid, env.app.db.machine(&m.id).unwrap())
 }
 
-fn write(s: &StandIn, label: &str, path: &str, content: &str) {
+pub(crate) fn write(s: &StandIn, label: &str, path: &str, content: &str) {
     s.w().instances.get_mut(label).unwrap().files.insert(path.into(), (content.as_bytes().to_vec(), "0644".into()));
 }
 
-fn read(s: &StandIn, label: &str, path: &str) -> Option<String> {
+pub(crate) fn read(s: &StandIn, label: &str, path: &str) -> Option<String> {
     s.instance(label)?.files.get(path).map(|(c, _)| String::from_utf8_lossy(c).into_owned())
 }
 
-async fn until(what: &str, mut f: impl FnMut() -> bool) {
+pub(crate) async fn until(what: &str, mut f: impl FnMut() -> bool) {
     for _ in 0..200 {
         if f() {
             return;
@@ -146,7 +159,7 @@ async fn until(what: &str, mut f: impl FnMut() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
-async fn back_up(env: &Env, uid: &str) -> crate::db::MachineBackup {
+pub(crate) async fn back_up(env: &Env, uid: &str) -> crate::db::MachineBackup {
     let (code, b) = json_call(env, "POST", &format!("/api/users/{uid}/machine/backups"), "").await;
     assert_eq!(code, 202, "{b}");
     let id = b["id"].as_str().unwrap().to_string();
@@ -156,19 +169,19 @@ async fn back_up(env: &Env, uid: &str) -> crate::db::MachineBackup {
     b
 }
 
-async fn settled(env: &Env, id: &str) -> crate::db::MachineRestore {
+pub(crate) async fn settled(env: &Env, id: &str) -> crate::db::MachineRestore {
     until("the restore", || env.app.db.machine_restore(id).is_some_and(|r| !matches!(r.state.as_str(), "importing" | "replacing"))).await;
     env.app.db.machine_restore(id).unwrap()
 }
 
 /// The token a restore left on the machine's disk, and its agent enrolling with it.
-async fn enroll_again(env: &Env, s: &StandIn, m: &crate::db::Machine) {
+pub(crate) async fn enroll_again(env: &Env, s: &StandIn, m: &crate::db::Machine) {
     let token = read(s, &m.label, "/etc/superbot/enroll-token").expect("a fresh token on its disk");
     agent::enroll(&config(env, &m.id, &token)).await.unwrap();
     backup::follow_up(&env.app, &env.cp).await;
 }
 
-fn alerts_to(env: &Env, mail: &crate::notify::smtp::fake::Server) {
+pub(crate) fn alerts_to(env: &Env, mail: &crate::notify::smtp::fake::Server) {
     let smtp = crate::notify::smtp::Smtp::for_test("127.0.0.1", mail.port, crate::notify::smtp::Tls::None, None, None);
     let _ = env.app.notifier.set(Arc::new(crate::notify::Notifier::new(Some(smtp), Some("https://bots.example.com".into()))));
     let s = crate::notify::Settings {
@@ -178,7 +191,7 @@ fn alerts_to(env: &Env, mail: &crate::notify::smtp::fake::Server) {
     crate::notify::save(&env.app.db, &s);
 }
 
-async fn mail_with(mail: &crate::notify::smtp::fake::Server, subject: &str) -> crate::notify::smtp::fake::Received {
+pub(crate) async fn mail_with(mail: &crate::notify::smtp::fake::Server, subject: &str) -> crate::notify::smtp::fake::Received {
     let mut found = None;
     until(subject, || {
         found = mail.got.lock().unwrap().iter().find(|m| m.headers.contains(subject)).cloned();
@@ -270,7 +283,7 @@ async fn a_lost_hosts_machines_are_restored_onto_another_host_and_enroll_anew() 
     env.b.w().addresses.insert(format!("{}-restore", m.label), "127.0.0.1".into());
     let (code, out) = json_call(&env, "POST", "/api/machines/hosts/a/recover", "{}").await;
     assert_eq!(code, 202, "{out}");
-    assert_eq!((out["to"].as_str(), out["declaredLost"].as_bool()), (Some("b"), Some(true)), "{out}");
+    assert_eq!((out["to"].as_str(), &out["toHosts"], out["declaredLost"].as_bool()), (None, &json!(["b"]), Some(true)), "{out}");
     assert_eq!((out["restoring"].as_array().unwrap().len(), out["unrestorable"][0]["userId"].as_str()), (1, Some(bea.as_str())), "{out}");
     assert_eq!(out["skipped"][0]["userId"].as_str(), Some(dee.as_str()), "{out}");
     assert!(env.app.db.machine_pins(&d.id).is_empty(), "revoked though its restore was underway");
@@ -292,7 +305,7 @@ async fn a_lost_hosts_machines_are_restored_onto_another_host_and_enroll_anew() 
     let revoked = events(&env, "machine.cert_revoked").await;
     assert!(revoked.iter().any(|e| e["targetId"] == m.id.as_str() && e["details"]["reason"] == "host_lost"), "{revoked:?}");
     let lost = events(&env, "machine.host_lost").await;
-    assert_eq!((lost.len(), lost[0]["details"]["to"].as_str()), (1, Some("b")), "{lost:?}");
+    assert_eq!((lost.len(), lost[0]["details"]["placement"].as_str()), (1, Some("fill")), "{lost:?}");
     let requested = events(&env, "machine.restore_requested").await;
     assert_eq!((requested[0]["details"]["fromHost"].as_str(), requested[0]["details"]["reason"].as_str()), (Some("a"), Some("host_lost")), "{requested:?}");
     let alert = mail_with(&mail, "Incus host a was declared lost").await;
