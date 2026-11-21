@@ -3,12 +3,14 @@
 # AUTH_PASSWORD or SUPERBOT_MASTER_KEY.
 #   ./init.sh                                   # http://localhost, random password
 #   ./init.sh --domain bots.example.com --tz Europe/Jersey --user-name Alex
+#   ./init.sh --from-source                     # build the images here instead of pulling them
 set -euo pipefail
 
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ENV_FILE=${ENV_FILE:-"$DIR/.env"}
-DOMAIN="" TZ_VALUE="" USER_NAME_VALUE="" HARNESSES="" ISOLATION_VALUE=""
+DOMAIN="" TZ_VALUE="" USER_NAME_VALUE="" HARNESSES="" ISOLATION_VALUE="" SOURCE=""
 DOMAIN_SET=false HARNESSES_SET=false
+BUILD_FILES=docker-compose.yml:docker-compose.build.yml
 
 die() { printf 'init.sh: %s\n' "$*" >&2; exit 1; }
 
@@ -20,9 +22,12 @@ Usage: init.sh [options]
   --localhost        Plain HTTP on 127.0.0.1 only (clears a previous --domain)
   --tz ZONE          TZ for routines (e.g. Europe/Jersey)
   --user-name NAME   USER_NAME shown in the app
-  --harnesses LIST   Harness CLIs baked into the image, e.g. "claude codex pi" (add hermes for Hermes Agent)
+  --harnesses LIST   Harness CLIs baked into the image, e.g. "claude codex pi" (add hermes for Hermes Agent);
+                     needs --from-source
   --isolation        Run each user's Bots as their own Unix account (ISOLATION=users; new .env files have it)
-  --no-isolation     Run every Bot as botd's account (ISOLATION=off)
+  --no-isolation     Run every Bot as botd's account (ISOLATION=off); Bots' screens need this
+  --from-source      Build the images from this checkout (docker-compose.build.yml) instead of pulling them
+  --published        Pull the published images from ghcr.io (the default; clears --from-source)
   -h, --help         Show this help
 EOF
 }
@@ -36,6 +41,8 @@ while [[ $# -gt 0 ]]; do
     --harnesses) HARNESSES=${2?--harnesses needs a value}; HARNESSES_SET=true; shift 2 ;;
     --isolation) ISOLATION_VALUE=users; shift ;;
     --no-isolation) ISOLATION_VALUE=off; shift ;;
+    --from-source) SOURCE=build; shift ;;
+    --published) SOURCE=published; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
@@ -97,6 +104,10 @@ fi
 [[ -z "$USER_NAME_VALUE" ]] || set_env USER_NAME "$USER_NAME_VALUE"
 [[ "$HARNESSES_SET" != true ]] || set_env SUPERBOT_HARNESSES "$HARNESSES"
 [[ -z "$ISOLATION_VALUE" ]] || set_env ISOLATION "$ISOLATION_VALUE"
+case "$SOURCE" in
+  build) set_env COMPOSE_FILE "$BUILD_FILES" ;;
+  published) set_env COMPOSE_FILE docker-compose.yml ;;
+esac
 
 if [[ -n "$new_password" ]]; then
   printf 'New login password (also AUTH_PASSWORD in %s): %s\n' "$ENV_FILE" "$new_password"
@@ -104,4 +115,9 @@ fi
 if [[ "$new_key" == true ]]; then
   printf 'New master key: SUPERBOT_MASTER_KEY in %s. Back it up apart from the data volume.\n' "$ENV_FILE"
 fi
-printf 'Next: cd %s && docker compose up -d --build\n' "$DIR"
+if grep -qx "COMPOSE_FILE='$BUILD_FILES'" "$ENV_FILE"; then
+  printf 'Next: cd %s && docker compose up -d --build\n' "$DIR"
+else
+  [[ "$HARNESSES_SET" != true ]] || printf 'Note: --harnesses applies only to images built here (--from-source).\n'
+  printf 'Next: cd %s && docker compose up -d\n' "$DIR"
+fi
