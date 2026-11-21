@@ -127,8 +127,8 @@ async fn every_route_but_the_public_ones_needs_credentials_and_the_right_role() 
                 assert_eq!(call(port, &m, &path, auth, "{}").await.0, 403, "{who}: {m} {path} needs {need:?}");
             }
         }
-        // Read-only people change nothing (signing out is their own session).
-        if m != "GET" && p != "/api/auth/logout" {
+        // Read-only people change nothing (signing out, and removing this session's phone, are their own session).
+        if m != "GET" && p != "/api/auth/logout" && !(m == "DELETE" && p == "/api/me/push") {
             assert!(!rbac::allows(Principal::User(Role::Readonly), need), "readonly could {m} {p}");
         }
         // The admin portal, the audit log, secrets, signups, the setup wizard, and the license are admin-only.

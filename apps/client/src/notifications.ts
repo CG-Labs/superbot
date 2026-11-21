@@ -51,7 +51,7 @@ export function webhookUrlProblem(raw: string): string | null {
 
 /** What a test did, in a sentence. */
 export function testSummary(r: NotifyTestResult): string {
-  const name = (c: string) => (c === "email" ? "Email" : c === "webhook" ? "Webhook" : c);
+  const name = (c: string) => (c === "email" ? "Email" : c === "webhook" ? "Webhook" : c === "push" ? "Push" : c);
   if (r.ok) return `Test sent: ${r.results.map((x) => name(x.channel).toLowerCase()).join(" and ")}.`;
   return r.results
     .filter((x) => !x.ok)

@@ -714,7 +714,12 @@ impl App {
             if self.closing.load(Ordering::SeqCst) {
                 return; // left "running": the next start reports it
             }
+            // Only a routine that started tells anyone it finished: refusals say so in chat.
+            let ran = msg.role == "routine" && self.db.message(msg.id).is_some_and(|m| m.status.as_deref() == Some("running"));
             self.db.set_status(msg.id, "done");
+            if ran && let Some(bot) = self.db.bot(&bot_id) {
+                crate::notify::routine_done(&self, &bot, &msg);
+            }
             if msg.role == "peer" {
                 self.answer_peer(&msg, before);
             }

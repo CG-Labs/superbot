@@ -24,6 +24,8 @@ import type {
   PolicyPatch,
   PolicyRule,
   PolicyView,
+  PushRegistration,
+  PushView,
   Role,
   Routine,
   ServerConfig,
@@ -297,6 +299,20 @@ export class SuperBotApi {
   /** Sends a test now through every channel that's on: the global settings, or one Bot's. */
   async testNotifications(botId?: string): Promise<NotifyTestResult> {
     return this.request<NotifyTestResult>("POST", "/api/notifications/test", botId ? { botId } : {});
+  }
+
+  /** Whether this server sends push, and this session's phone (ADR 0080). */
+  async pushDevice(): Promise<PushView> {
+    return this.request<PushView>("GET", "/api/me/push");
+  }
+
+  /** Registers this phone for this session, in place of any it had. */
+  async registerPush(body: PushRegistration): Promise<PushView> {
+    return this.request<PushView>("PUT", "/api/me/push", body);
+  }
+
+  async unregisterPush(): Promise<PushView> {
+    return this.request<PushView>("DELETE", "/api/me/push");
   }
 
   async botNotifications(botId: string): Promise<BotNotificationsView> {

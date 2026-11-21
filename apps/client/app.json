@@ -34,6 +34,7 @@
           "faceIDPermission": "SuperBot uses Face ID to unlock the app when you turn on App lock."
         }
       ],
+      "expo-notifications",
       [
         "expo-splash-screen",
         {

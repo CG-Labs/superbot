@@ -275,9 +275,35 @@ export interface NotificationsView {
   email: { configured: boolean; server: string | null; passwordSet: boolean };
   webhook: WebhookUrlView;
   signing: boolean;
+  /** Push (ADR 0080): the provider when an operator turned it on; each person opts in per phone. */
+  push?: { provider: string | null; accessTokenSet: boolean };
   links: { app?: string | null; console?: string | null; problem?: string };
   /** Bots with settings of their own. */
   bots: string[];
+}
+
+/** This session's phone for push notifications (ADR 0080). The token never comes back. */
+export interface PushDeviceView {
+  id: string;
+  platform: "ios" | "android";
+  approvals: boolean;
+  routines: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface PushView {
+  /** Whether this server sends push at all. */
+  available: boolean;
+  provider: string | null;
+  device: PushDeviceView | null;
+}
+
+export interface PushRegistration {
+  token: string;
+  platform: "ios" | "android";
+  approvals?: boolean;
+  routines?: boolean;
 }
 
 export interface NotificationsPatch {
