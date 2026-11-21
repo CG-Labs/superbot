@@ -13,6 +13,7 @@ import { sharingLabel, whereItRuns, whoseKeys } from "../src/access";
 import { confirmAsync, showError } from "../src/dialogs";
 import { promptsFor } from "../src/prompts";
 import { cronLabel } from "../src/routines";
+import { workingLabel } from "../src/runQueue";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors, HARNESS_NAMES } from "../src/theme";
 import type { Routine } from "../src/types";
@@ -215,7 +216,7 @@ export function BotDetailsPanel({ visible, onClose, onOpenScreen, onOpenPolicy, 
           )}
           <Text style={styles.section}>Computer</Text>
           <View style={styles.row}>
-            <Text style={styles.dim}>{bot.working ? bot.status || "Working" : "Asleep"}</Text>
+            <Text style={styles.dim}>{bot.working ? workingLabel(bot) : "Asleep"}</Text>
             {canOperate ? (
               <Pressable
                 role="button"

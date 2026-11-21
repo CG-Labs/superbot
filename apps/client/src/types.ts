@@ -34,6 +34,8 @@ export interface BotView {
   preview?: string;
   working: boolean;
   status?: string;
+  /** Set while its run waits for a free slot on the computer it runs on (ADR 0073). */
+  queued?: RunQueue;
   draft?: string;
   /** Effective harness policy: "ask" pauses risky tool calls for approval. */
   policy?: PolicyMode;
@@ -64,6 +66,15 @@ export interface BotView {
   prompts?: string[] | null;
 }
 
+/** A run waiting its turn: the computer runs `limit` at once and `running` are going. */
+export interface RunQueue {
+  reason: "at_capacity" | "starting";
+  host: "server" | "machine";
+  position?: number;
+  running?: number;
+  limit?: number;
+}
+
 export interface TierBadge {
   name: string;
   label: string;
@@ -80,6 +91,8 @@ export interface TierView extends TierBadge {
     dailyRoutineRuns?: number | null;
     /** The machine size (provider plan) the control plane gives this plan's users. */
     machineType?: string | null;
+    /** Bot runs at once on this plan's machines; more wait their turn (ADR 0073). */
+    concurrentRuns?: number | null;
   };
 }
 
@@ -564,7 +577,7 @@ export type SseEvent =
   | { type: "bot"; bot: BotView }
   | { type: "botDeleted"; botId: string }
   | { type: "draft"; botId: string; text: string }
-  | { type: "status"; botId: string; working: boolean; status?: string }
+  | { type: "status"; botId: string; working: boolean; status?: string; queued?: RunQueue }
   | { type: "approval"; approval: Approval }
   | { type: "policy"; policy: Policy }
   | { type: "resync" };

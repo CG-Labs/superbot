@@ -18,6 +18,8 @@ describe("plan usage", () => {
       "Machine size on this plan: g6-standard-1",
     ]);
     expect(overLimits(starter)).toEqual(["Bots"]);
+    const capped = { ...starter, limits: { ...starter.limits, concurrentRuns: 3 } };
+    expect(planUsageLines(capped).at(-1)).toBe("Tasks at once on their machine: 3");
   });
 
   it("says when there's no limit, and reads servers from before routine limits", () => {

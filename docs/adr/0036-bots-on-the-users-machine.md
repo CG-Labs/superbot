@@ -67,7 +67,7 @@ The agent checks each job before running it:
 - every path must be inside its home;
 - the program must be on its harness PATH.
 
-It starts each harness from a clean environment: HOME, PATH (`SUPERBOT_HARNESS_PATH`) and LANG are its own, and botd's job env goes on top of that, minus HOME and PATH. Because nothing is inherited there, the job env carries every secret a local run would get, including the ones local runs inherit from botd's own environment (never botd's own secrets, such as `AUTH_PASSWORD`). Each machine runs at most 8 jobs at once (`SUPERBOT_MAX_JOBS`), and a job id that is already running is refused.
+It starts each harness from a clean environment: HOME, PATH (`SUPERBOT_HARNESS_PATH`) and LANG are its own, and botd's job env goes on top of that, minus HOME and PATH. Because nothing is inherited there, the job env carries every secret a local run would get, including the ones local runs inherit from botd's own environment (never botd's own secrets, such as `AUTH_PASSWORD`). Each machine runs at most 8 jobs at once (`SUPERBOT_MAX_JOBS`), and a job id that is already running is refused. (Since [ADR 0073](0073-concurrent-runs-per-machine.md), botd caps runs per machine by the owner's tier and queues the rest; the agent's own limit is a backstop, 32 by default.)
 
 A new `protocol` number means an incompatible change. botd refuses runs on agents that report an older one (`agent_outdated`) rather than guessing.
 
