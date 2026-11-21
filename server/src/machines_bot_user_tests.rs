@@ -327,6 +327,7 @@ async fn as_root_bots_get_their_own_os_user_and_cant_reach_the_agents_files() {
         args: vec![],
         files: vec![".claude/.credentials.json".into()],
         timeout_secs: 60,
+        for_user: None,
     };
     let env_vars = std::collections::BTreeMap::from([
         ("HOME".to_string(), home.display().to_string()),

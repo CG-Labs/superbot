@@ -263,6 +263,7 @@ impl Teammate {
             workspace: p(self.workspace()),
             bots: p(self.bots()),
             created: self.created,
+            logins: Default::default(),
         }
     }
 }
@@ -421,6 +422,25 @@ impl Teammates {
     /// Where `user_id`'s home is, whether or not it's made yet.
     pub fn home_of(&self, user_id: &str) -> PathBuf {
         self.root.join(wire::teammate_user(user_id))
+    }
+
+    /// `user_id`'s user and home if they have them here, never made: still the user
+    /// recorded for them, passing `check`, with a home that's a folder of theirs (not a
+    /// link). None if any of that isn't so.
+    pub fn existing(&self, user_id: &str, check: impl Fn(Ids) -> Result<(), String>) -> Option<Teammate> {
+        let _one = self.making.lock().unwrap_or_else(|e| e.into_inner());
+        if self.leaving().contains(user_id) {
+            return None;
+        }
+        let s = self.record().ok()?.remove(user_id)?;
+        let ids = Ids { uid: s.uid, gid: s.gid };
+        let name = self.stand_in.clone().unwrap_or_else(|| wire::teammate_user(user_id));
+        if s.user != name || self.os_users.lookup(&s.user) != Some(ids) || check(ids).is_err() {
+            return None;
+        }
+        let home = self.home_of(user_id);
+        let theirs = std::fs::symlink_metadata(&home).is_ok_and(|m| m.is_dir() && m.uid() == ids.uid);
+        theirs.then_some(Teammate { user: s.user, ids, home, created: false })
     }
 
     /// `user_id`'s user and home, made if this is their first run here. `check` refuses
