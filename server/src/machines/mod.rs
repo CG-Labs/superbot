@@ -1568,17 +1568,22 @@ pub async fn destroy(
     Extension(by): Extension<Who>,
     Path(key): Path<String>,
 ) -> Res<Response> {
-    destroy_as(&app, &a.machines, &by, &key).await
+    destroy_as(&app, &a.machines, &by, &key, &|_| true).await
 }
 
 /// `destroy`, for the control plane's own callers too (a team's machine given back, ADR 0087).
-pub(crate) async fn destroy_as(app: &AppState, cp: &ControlPlane, by: &Who, key: &str) -> Res<Response> {
+/// `still` is checked under the lock before a machine starts going, so a caller that
+/// decided earlier can't destroy one that changed hands meanwhile.
+pub(crate) async fn destroy_as(app: &AppState, cp: &ControlPlane, by: &Who, key: &str, still: &(dyn Fn(&Machine) -> bool + Sync)) -> Res<Response> {
     let (app, by) = (app.clone(), by.clone());
     let p = cp.need()?;
     let u = need_user_key(&app, key)?;
     let _g = cp.ops.lock().await;
     let mut m = need_machine(&app, &u.id)?;
     cp.need_own(&m)?;
+    if m.state != State::Destroying && !still(&m) {
+        return Err(conflict("The machine changed meanwhile; it's kept.".into()));
+    }
     if m.state != State::Destroying {
         let from = m.state;
         m.state = next(from, Step::Destroy).ok_or_else(|| {

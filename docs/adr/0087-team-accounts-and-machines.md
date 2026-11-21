@@ -53,6 +53,8 @@ People in no team are handled by `TEAMS`:
 - **`TEAMS=off`** (default): they share with each other as before. A self-hosted server with no teams behaves exactly as it did.
 - **`TEAMS=on`**: no team is a team of one, so their shared Bots reach nobody. Managed servers should set this.
 
+This holds whatever `SHARED_BOTS` is. botd records who asked for each run, even when an open shared Bot acts as its owner. Work queued by someone who has since left the owner's team is refused when it comes up (`bot.run_refused`, reason `asker_lost_access`).
+
 Because every check goes through the ACL, everything ADR 0046, 0048, 0062, 0064 and 0083 built on it follows: Bot lists, chats, routines, screens, asks between Bots, teammates' OS users, teammates' harness logins and accounts, and run tokens.
 
 ### Team admins manage machines, not data
@@ -67,7 +69,7 @@ They never see a machine's address, provider ids, errors, files, logins or scree
 
 A machine a member already has of their own stays theirs: team admins get 403 on it. Anyone off the team is not found (404), so one team's admins learn nothing about another team's people.
 
-Machine actions run through the same code as the server admins' routes (`machines::request_as`, `act`), audited with the team admin as actor and the member as `onBehalfOf`. Every team route refuses Bot tokens and needs `write` (or `account` to read). Read-only users can see their team but change nothing.
+Machine actions run through the same code as the server admins' routes (`machines::request_as`, `act`), audited with the team admin as actor and the member as `onBehalfOf`. A failed step gives team admins a plain error. The provider's and placement's details, such as host names and capacity, go to the audit log (`team.machine_failed`) for server admins. A machine the provider failed to build can be asked for again; that retries it. Every team route refuses Bot tokens and needs `write` (or `account` to read). Read-only users can see their team but change nothing.
 
 Server admins manage every team under `/api/teams`, as `rbac::classify` already leaves anything unlisted to admins.
 
@@ -86,9 +88,9 @@ Once that machine is running and enrolled, the reconciler places it (`placement.
 
 1. Grants between the leaver and their former teammates are revoked (`bot.access_revoked`, reason `left_team`), and runs between them stop.
 2. ADR 0052 and 0066 offboarding runs with reason `left_team`. The leaver's user goes from teammates' machines and accounts, and teammates' users go from theirs. Their work is archived to the owner as before.
-3. The machine the team gave them is suspended at once and destroyed after `TEAM_MACHINE_DAYS` (default 7, 0 to 365; 0 destroys it at once). The reconciler does the destroying. Joining a team again before then keeps it.
+3. The machine the team gave them is suspended at once and destroyed after `TEAM_MACHINE_DAYS` (default 7, 0 to 365; 0 destroys it at once). If it was still being built, or didn't power off, every reconcile tries again until it's off. The reconciler does the destroying. It checks again, under the lock that taking a machine back also holds, that the machine is still released and due. Joining a team again before then keeps it.
 
-A team always keeps an owner. Its last owner can't leave or be demoted while others are on it. Only owners make or remove owners. A team whose last member leaves is deleted.
+A team always keeps an owner. Its last owner can't leave, be demoted or be removed (even by a server admin) while others are on it. Only owners make or remove owners. A team whose last member leaves is deleted.
 
 ### Audit
 

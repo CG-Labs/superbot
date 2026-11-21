@@ -402,3 +402,137 @@ async fn bots_and_viewers_cannot_use_team_routes() {
         assert_eq!(call(port, m, p, &ro, r#"{"email":"x@example.com"}"#).await.0, 403, "readonly: {m} {p}");
     }
 }
+
+/// A stand-in `claude` that takes `secs` to answer.
+fn slow_claude(app: &App, secs: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = app.cfg.bin_dir.join("claude");
+    let script = format!("#!/bin/sh\nsleep {secs}\nprintf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"done\"}}]}}}}'\n");
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[tokio::test]
+async fn with_open_shared_bots_leaving_stops_the_run_and_what_was_queued() {
+    let w = world().await;
+    assert_ne!(w.app.shared_bots(), crate::acl::SharedBots::Isolated, "open, as self-hosted without routing");
+    slow_claude(&w.app, 30);
+    let ops = bot(&w, "Ops", &w.ada_id, Visibility::Shared);
+    for text in ["first", "second"] {
+        let (code, res) = call(w.port, "POST", &format!("/api/bots/{ops}/messages"), &w.al, &json!({ "text": text }).to_string()).await;
+        assert_eq!(code, 202, "{res}");
+    }
+    for _ in 0..300 {
+        if w.app.live_run(&ops).is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let b = w.app.db.bot(&ops).unwrap();
+    assert!(w.app.live_run(&ops).is_some() && w.app.requested_by(&b) == w.al_id, "Al's run, though it acts as Ada");
+
+    assert_eq!(call(w.port, "POST", "/api/team/leave", &w.al, "").await.0, 200);
+    for _ in 0..300 {
+        if w.app.live_run(&ops).is_none() && !events(&w, "bot.run_refused").await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(w.app.live_run(&ops).is_none(), "Al's run went on after he left");
+    assert!(events(&w, "harness.invoked").await.len() <= 1, "the second message never ran");
+}
+
+#[tokio::test]
+async fn with_open_shared_bots_work_queued_before_leaving_does_not_run() {
+    let w = world().await;
+    slow_claude(&w.app, 1);
+    let ops = bot(&w, "Ops", &w.ada_id, Visibility::Shared);
+    // Ada's own run, with Al's message waiting behind it.
+    for (who, text) in [(&w.ada, "mine"), (&w.al, "his")] {
+        let (code, res) = call(w.port, "POST", &format!("/api/bots/{ops}/messages"), who, &json!({ "text": text }).to_string()).await;
+        assert_eq!(code, 202, "{res}");
+    }
+    assert_eq!(call(w.port, "POST", "/api/team/leave", &w.al, "").await.0, 200);
+    let mut refused = Vec::new();
+    for _ in 0..300 {
+        refused = events(&w, "bot.run_refused").await;
+        if !refused.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(refused.iter().any(|e| e["details"]["reason"] == "asker_lost_access" && e["details"]["forUser"] == w.al_id.as_str()), "{refused:?}");
+    assert_eq!(events(&w, "harness.invoked").await.len(), 1, "only Ada's ran");
+}
+
+#[tokio::test]
+async fn a_machine_still_being_built_is_suspended_once_ready_after_its_owner_leaves() {
+    let w = world().await;
+    let m = w.app.db.user_machine(&w.al_id).unwrap();
+    assert_eq!(m.state, crate::machines::State::Provisioning);
+    assert_eq!(call(w.port, "POST", "/api/team/leave", &w.al, "").await.0, 200);
+    let released = events(&w, "team.machine_released").await;
+    assert_eq!(released[0]["details"]["suspended"], false, "{released:?}");
+    reconcile(&w).await;
+    reconcile(&w).await;
+    assert_eq!(w.app.db.machine(&m.id).unwrap().state, crate::machines::State::Suspended);
+    assert!(w.app.db.team_machine(&m.id).unwrap().release_at.is_some(), "still due to go later");
+}
+
+#[tokio::test]
+async fn a_machine_taken_back_is_never_destroyed_by_an_earlier_decision() {
+    let w = world().await;
+    reconcile(&w).await;
+    let m = w.app.db.user_machine(&w.al_id).unwrap();
+    assert_eq!(call(w.port, "POST", "/api/team/leave", &w.al, "").await.0, 200);
+    w.app.db.team_machine_backdate(&m.id, 8 * 86_400_000);
+    // Al is back before the sweep gets to it.
+    let (code, v) = json_call(w.port, "PUT", &format!("/api/teams/{}/members/{}", w.alpha, w.al_id), &w.admin, "{}").await;
+    assert_eq!((code, v["provisioned"].as_str()), (200, Some("kept")), "{v}");
+    // A destroy decided on the old record refuses, under the machines' lock.
+    let cp = w.app.control_plane.get().unwrap().clone();
+    let by = crate::audit::Who::system("test");
+    let still = |x: &crate::db::Machine| w.app.db.team_machine(&x.id).is_some_and(|t| t.released_at.is_some());
+    let res = crate::machines::destroy_as(&w.app, &cp, &by, &w.al_id, &still).await;
+    assert_eq!(res.err().map(|e| e.0), Some(StatusCode::CONFLICT));
+    reconcile(&w).await;
+    assert_ne!(w.app.db.machine(&m.id).unwrap().state, crate::machines::State::Destroying);
+    assert_eq!(w.fake.machines().len(), 3);
+}
+
+#[tokio::test]
+async fn a_team_admin_retries_a_machine_the_provider_failed_to_build() {
+    let w = world().await;
+    let (dee_id, _) = user_with(w.port, &w.admin, "dee@example.com", "member").await;
+    w.fake.fail_next("create", crate::machines::provider::ProviderError::Api { status: 400, message: "region full on host-7".into() });
+    let (code, v) = json_call(w.port, "PUT", &format!("/api/teams/{}/members/{dee_id}", w.alpha), &w.admin, "{}").await;
+    assert_eq!((code, v["provisioned"].as_str()), (200, Some("failed")), "{v}");
+    let m = w.app.db.user_machine(&dee_id).unwrap();
+    assert_eq!(m.state, crate::machines::State::Error);
+    let (code, v) = json_call(w.port, "POST", &format!("/api/team/members/{dee_id}/machine"), &w.ada, "").await;
+    assert!(code == 200 || code == 202, "{code} {v}");
+    assert_ne!(w.app.db.user_machine(&dee_id).unwrap().state, crate::machines::State::Error);
+    assert!(!v.to_string().contains("host-7"), "{v}");
+}
+
+#[tokio::test]
+async fn errors_to_team_admins_keep_the_details_for_server_admins() {
+    let w = world().await;
+    let path = format!("/api/team/members/{}/machine/suspend", w.al_id);
+    let (code, body) = call(w.port, "POST", &path, &w.ada, "").await;
+    assert_eq!(code, 409, "suspending a machine still being built: {body}");
+    assert!(body.contains("can't do that now") && !body.to_lowercase().contains("provisioning"), "{body}");
+    let failed = events(&w, "team.machine_failed").await;
+    assert!(failed.iter().any(|e| e["details"]["status"] == 409 && e["details"]["error"].as_str().is_some_and(|s| !s.is_empty())), "{failed:?}");
+}
+
+#[tokio::test]
+async fn a_server_admin_cannot_remove_a_teams_only_owner() {
+    let w = world().await;
+    let (code, res) = call(w.port, "DELETE", &format!("/api/teams/{}/members/{}", w.alpha, w.ada_id), &w.admin, "").await;
+    assert_eq!(code, 409, "{res}");
+    assert_eq!(call(w.port, "DELETE", &format!("/api/teams/{}/members/{}", w.alpha, w.al_id), &w.admin, "").await.0, 200);
+    // Now alone, she can be removed, and the empty team goes.
+    assert_eq!(call(w.port, "DELETE", &format!("/api/teams/{}/members/{}", w.alpha, w.ada_id), &w.admin, "").await.0, 200);
+    assert!(w.app.db.team(&w.alpha).is_none());
+}
