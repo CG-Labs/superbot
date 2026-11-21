@@ -3571,6 +3571,8 @@ impl Db {
             ("on_behalf_of", &f.on_behalf_of),
             ("outcome", &f.outcome),
             ("bot_id", &f.bot_id),
+            ("target_type", &f.target_type),
+            ("target_id", &f.target_id),
         ];
         for (col, v) in exact {
             if let Some(v) = v {
