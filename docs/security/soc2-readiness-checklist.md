@@ -37,7 +37,7 @@ Scope: the managed service. A self-hosting customer is its own service organisat
 | CC3 Risk assessment | 0 | 1 | 4 |
 | CC4 Monitoring activities | 0 | 1 | 1 |
 | CC5 Control activities | 0 | 0 | 4 |
-| CC6 Logical and physical access | 0 | 4 | 13 |
+| CC6 Logical and physical access | 1 | 4 | 12 |
 | CC7 System operations | 1 | 2 | 6 |
 | CC8 Change management | 0 | 0 | 3 |
 | CC9 Risk mitigation | 0 | 1 | 3 |
@@ -97,7 +97,7 @@ Scope: the managed service. A self-hosting customer is its own service organisat
 |----|------|------|-------|---------------------|--------|-----------------|
 | CC6.1-1 | Multi-factor authentication in SuperBot | Product | Engineering lead | MFA enforced for admins and break-glass sign-in; tests | Gap | No second factor in botd; customers must enforce it at their IdP. |
 | CC6.1-2 | A written requirement to enforce MFA at the IdP | Process | Security owner | The requirement in the access control policy; each IdP's MFA setting | Partial | The [questionnaire FAQ](questionnaire-faq.md) tells customers to enforce MFA at their IdP; the [IdP guides](../sso/) don't, and the managed provider's own staff sign-in has no stated rule. |
-| CC6.1-3 | Rotating the secrets master key | Product | Engineering lead | A rotation command, tested, and its audit event | Gap | Secrets are sealed under one master key ([ADR 0010](../adr/0010-secrets.md), [`server/src/secrets/key.rs`](../../server/src/secrets/key.rs)); there is no way to rotate it. |
+| CC6.1-3 | Rotating the secrets master key | Product | Engineering lead | A rotation command, tested, and its audit event | Done | With the old key set as the previous key, botd re-seals every sealed value under the new key at start, in one transaction with a `secret.master_key_rotated` audit event; a crash part-way changes nothing, and the machine CA is kept unless asked otherwise ([ADR 0096](../adr/0096-master-key-rotation.md), [`server/src/secrets/sealed.rs`](../../server/src/secrets/sealed.rs)). Tested for rotation, a crash part-way, wrong keys and running twice, end to end in [`server/tests/master_key_rotation.rs`](../../server/tests/master_key_rotation.rs) and the Compose smoke test. Operator steps for Compose (`init.sh --rotate-master-key`) and the installer: [master key rotation](../ops/master-key-rotation.md). |
 | CC6.1-4 | An external secret vault | Product | Engineering lead | Vault configuration; botd reading from it | Gap | A trait seam only (ADR 0010). Planned for M5. |
 | CC6.2-1 | Just-in-time accounts limited to allowed domains for every provider | Product | Engineering lead | Startup refusing JIT without a domain list; tests | Partial | Google, Apple and GitHub refuse just-in-time accounts without allowed domains or organizations ([`server/src/sso/mod.rs`](../../server/src/sso/mod.rs)); generic OIDC and SAML accept them without one. |
 | CC6.3-1 | An access-review report for admins | Product | Engineering lead | A report of each person's role, last sign-in and Bot access, exportable and dated | Partial | The admin portal shows each person's role, last sign-in and Bot access ([ADR 0021](../adr/0021-admin-portal.md)), and the audit log exports to CSV ([ADR 0009](../adr/0009-audit-events.md)). No single report to sign off. |
