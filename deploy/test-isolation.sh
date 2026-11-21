@@ -226,6 +226,33 @@ lost=sb-t-$(printf '%s' 't1:t3' | sha256sum | cut -c1-24)
 userdel "$lost"
 groupdel "$lost" 2>/dev/null || true
 
+log "One read-only Hermes environment serves every account's Bots, each with its own record (ADR 0072)"
+hs=$LIB/hermes
+launcher=$hs/.hermes/hermes-agent/.hermes/bin/hermes
+mkdir -p "$(dirname "$launcher")"
+# shellcheck disable=SC2016 # expanded by the fake launcher
+printf '#!/bin/sh\necho "lazy=${HERMES_DISABLE_LAZY_INSTALLS:-} home=$HERMES_HOME"\n' >"$launcher"
+chmod 0755 "$launcher"
+key=$(printf '%s' "$(cd "$hs/.hermes/hermes-agent" && pwd -P)" | sha256sum | cut -c1-16)
+st=$hs/.hermes/installs/$key
+mkdir -p "$st/environments/g1/venv" "$st/inputs"
+: >"$st/inputs/uv.lock"
+printf '{"environment": "%s/environments/g1/venv"}\n' "$st" >"$st/facts.json"
+wrapper=$(HOME="$hs" sh "$repo/deploy/hermes-share.sh")
+chmod -R go-w "$hs"
+for u in t1 t2; do
+  bh=$TEST_DIR/users/$u/home/hermes
+  out=$(sudo -u "sb-u-$u" env HERMES_HOME="$bh" "$wrapper")
+  [[ "$out" == "lazy=1 home=$bh" ]] || die "sb-u-$u's Bot didn't run the shared Hermes: $out"
+  [[ "$(stat -c '%U' "$bh/installs/$key")" == "sb-u-$u" ]] || die "sb-u-$u's record of the install isn't its own"
+  (( (8#$(stat -c '%a' "$bh/installs/$key") & 8#077) == 0 )) || die "others may read sb-u-$u's record of the install"
+  [[ "$(readlink "$bh/installs/$key/environments")" == "$st/environments" ]] || die "sb-u-$u's Bot doesn't use the shared environment"
+  refused sudo -u "sb-u-$u" touch "$st/environments/g1/venv/x"
+  refused sudo -u "sb-u-$u" touch "$st/facts.json"
+done
+refused sudo -u sb-u-t2 ls "$TEST_DIR/users/t1/home/hermes"
+refused sudo -u sb-u-t2 env HERMES_HOME="$TEST_DIR/users/t1/home/hermes" "$wrapper"
+
 log "botd's OS tests, as $SVC"
 envs=(SUPERBOT_ISOLATION_OS_TEST=1 ISOLATION_DIR="$TEST_DIR/users" SUPERBOT_RUN_DIR="$LIB/bin"
   PATH="$LIB/fake:/usr/local/bin:/usr/bin:/bin" HOME="$home" AUTH_PASSWORD=must-not-leak

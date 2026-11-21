@@ -214,7 +214,7 @@ pub fn install(
 
 /// Makes one Hermes install's environment every Bot's (ADR 0072). The Dockerfile,
 /// deploy/install.sh and deploy/install-harness-clis.sh run the same file.
-pub const HERMES_SHARE: &str = include_str!("hermes-share.sh");
+pub const HERMES_SHARE: &str = include_str!("../../../deploy/hermes-share.sh");
 /// Where `HERMES_SHARE` leaves the `hermes` Bots run, under the installer's HOME.
 const HERMES_SHARED_BIN: &str = ".hermes/superbot/hermes";
 /// Hermes's own launcher there, which runs a Bot's own environment.

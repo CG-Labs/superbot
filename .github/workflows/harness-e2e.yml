@@ -9,6 +9,7 @@ on:
   pull_request:
     paths:
       - 'server/src/adapters/**'
+      - 'deploy/hermes-share.sh'
       - 'server/src/approvals.rs'
       - 'server/src/main.rs'
       - 'server/src/policy.rs'
@@ -30,6 +31,7 @@ on:
     branches: [main]
     paths:
       - 'server/src/adapters/**'
+      - 'deploy/hermes-share.sh'
       - 'server/src/approvals.rs'
       - 'server/src/main.rs'
       - 'server/src/policy.rs'
@@ -111,8 +113,6 @@ jobs:
           set -euo pipefail
           deploy/install-harness-clis.sh "$RUNNER_TEMP/clis" hermes | tee /tmp/install.log
           grep '^/' /tmp/install.log >>"$GITHUB_PATH"
-          # Each Bot's Hermes builds its runtime from uv's cache: the installer's.
-          echo "UV_CACHE_DIR=$RUNNER_TEMP/clis/hermes/.cache/uv" >>"$GITHUB_ENV"
       - name: Approvals through Hermes Agent
         run: SUPERBOT_E2E_HARNESSES=hermes cargo test --test harness_e2e -- --ignored --nocapture
 
