@@ -87,6 +87,7 @@ async fn an_owners_run_gets_its_own_token_and_it_ends_with_the_run() {
     let (code, list) = call(port, "GET", "/api/bots", &bearer(&first), "").await;
     assert_eq!(code, 200, "{list}");
     assert!(list.contains(&bot));
+    assert!(crate::secrets::redact::known().contains(&token), "chats redact the live token");
     let stream = open_stream(port, &bearer(&first)).await;
     let issued = audit(port, &admin, &format!("action=bot.token_issued&bot={bot}")).await;
     assert_eq!(issued.len(), 1, "{issued:?}");
@@ -107,6 +108,7 @@ async fn an_owners_run_gets_its_own_token_and_it_ends_with_the_run() {
     assert_eq!(revoked.len(), 1, "{revoked:?}");
     let d = &revoked[0]["details"];
     assert_eq!((d["jti"].as_str(), d["runId"].as_str(), d["reason"].as_str()), (Some(token_id.as_str()), Some(run.as_str()), Some("run_ended")));
+    assert!(!crate::secrets::redact::known().contains(&token), "the redactor doesn't keep every finished run's token");
 
     // The next run gets a new token; the old one stays dead while it's live.
     assert_eq!(call(port, "POST", &format!("/api/bots/{bot}/messages"), &ada, r#"{"text":"two"}"#).await.0, 202);

@@ -43,6 +43,7 @@ struct LiveToken<'a> {
 
 impl Drop for LiveToken<'_> {
     fn drop(&mut self) {
+        crate::secrets::redact::forget(&self.secret);
         let Some(e) = self.app.run_tokens.revoke(&self.id) else { return };
         let details = json!({
             "jti": e.id, "runId": e.run, "owner": e.owner, "forUser": e.for_user,
