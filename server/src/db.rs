@@ -1271,7 +1271,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 35] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 36] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1307,7 +1307,36 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 35] = [
     migrate_machine_tier_resize,
     migrate_machine_resize_sent,
     migrate_machine_suspended_at,
+    migrate_status_incidents,
 ];
+
+/// Incident notes for the public status page (ADR 0090), written by admins. Each has a
+/// timeline of updates; the newest one's state is the incident's.
+fn migrate_status_incidents(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS status_incidents (
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          impact TEXT NOT NULL,
+          components TEXT NOT NULL DEFAULT '[]',
+          state TEXT NOT NULL,
+          created_by TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          resolved_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS status_incidents_recent ON status_incidents(resolved_at, created_at);
+        CREATE TABLE IF NOT EXISTS status_incident_updates (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          incident_id TEXT NOT NULL REFERENCES status_incidents(id) ON DELETE CASCADE,
+          state TEXT NOT NULL,
+          body TEXT NOT NULL,
+          created_by TEXT,
+          created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS status_incident_updates_of ON status_incident_updates(incident_id, id);",
+    )
+}
 
 /// When a machine was suspended (ADR 0085): what its agent said of its disk before then
 /// still holds while it's off, and what it said long before doesn't.
@@ -1469,6 +1498,48 @@ fn migrate_machine_hosts(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// An incident note on the status page (ADR 0090).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusIncident {
+    pub id: String,
+    pub title: String,
+    pub impact: String,
+    pub components: Vec<String>,
+    pub state: String,
+    pub created_by: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub resolved_at: Option<i64>,
+    /// Newest first.
+    pub updates: Vec<StatusUpdate>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusUpdate {
+    pub id: i64,
+    pub state: String,
+    pub body: String,
+    pub created_by: Option<String>,
+    pub created_at: i64,
+}
+
+fn status_incident_row(r: &Row) -> rusqlite::Result<StatusIncident> {
+    Ok(StatusIncident {
+        id: r.get("id")?,
+        title: r.get("title")?,
+        impact: r.get("impact")?,
+        components: serde_json::from_str(&r.get::<_, String>("components")?).unwrap_or_default(),
+        state: r.get("state")?,
+        created_by: r.get("created_by")?,
+        created_at: r.get("created_at")?,
+        updated_at: r.get("updated_at")?,
+        resolved_at: r.get("resolved_at")?,
+        updates: Vec::new(),
+    })
 }
 
 /// An Incus host machines are on (ADR 0076). `state`: `up`, `down` (it hasn't answered
@@ -5353,6 +5424,115 @@ impl Db {
             .unwrap_or(0)
             == 1;
         if made { self.machine_restore(n.id) } else { None }
+    }
+
+    // The status page (ADR 0090)
+
+    /// How long a trivial query takes, holding the connection as every other query must.
+    pub fn ping(&self) -> rusqlite::Result<std::time::Duration> {
+        let started = std::time::Instant::now();
+        self.c().query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?;
+        Ok(started.elapsed())
+    }
+
+    /// Live machines by state: destroyed ones aren't counted.
+    pub fn machine_state_counts(&self) -> HashMap<String, i64> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT state, COUNT(*) FROM machines WHERE state != 'destroyed' GROUP BY state").unwrap();
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().filter_map(Result::ok).collect()
+    }
+
+    pub fn status_incident_create(&self, id: &str, title: &str, impact: &str, components: &[String], state: &str, body: &str, by: Option<&str>) -> StatusIncident {
+        let at = now();
+        let resolved = (state == "resolved").then_some(at);
+        let comps = serde_json::to_string(components).unwrap_or_else(|_| "[]".into());
+        let c = self.c();
+        c.execute(
+            "INSERT INTO status_incidents (id, title, impact, components, state, created_by, created_at, updated_at, resolved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)",
+            params![id, title, impact, comps, state, by, at, resolved],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO status_incident_updates (incident_id, state, body, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+            params![id, state, body, by, at],
+        )
+        .unwrap();
+        drop(c);
+        self.status_incident(id).expect("just made")
+    }
+
+    pub fn status_incident(&self, id: &str) -> Option<StatusIncident> {
+        let mut i = self.c().query_row("SELECT * FROM status_incidents WHERE id = ?", [id], status_incident_row).optional().ok().flatten()?;
+        i.updates = self.status_updates(&i.id, i64::MAX);
+        Some(i)
+    }
+
+    fn status_updates(&self, id: &str, limit: i64) -> Vec<StatusUpdate> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT * FROM status_incident_updates WHERE incident_id = ? ORDER BY id DESC LIMIT ?").unwrap();
+        s.query_map(params![id, limit], |r| {
+            Ok(StatusUpdate { id: r.get("id")?, state: r.get("state")?, body: r.get("body")?, created_by: r.get("created_by")?, created_at: r.get("created_at")? })
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect()
+    }
+
+    /// Open incidents, and those resolved at or after `resolved_since`, newest first, with
+    /// up to `updates` of each one's newest updates.
+    pub fn status_incidents(&self, resolved_since: i64, limit: i64, updates: i64) -> Vec<StatusIncident> {
+        let list: Vec<StatusIncident> = {
+            let c = self.c();
+            let mut s = c
+                .prepare("SELECT * FROM status_incidents WHERE resolved_at IS NULL OR resolved_at >= ? ORDER BY resolved_at IS NOT NULL, created_at DESC LIMIT ?")
+                .unwrap();
+            s.query_map(params![resolved_since, limit], status_incident_row).unwrap().filter_map(Result::ok).collect()
+        };
+        list.into_iter()
+            .map(|mut i| {
+                i.updates = self.status_updates(&i.id, updates);
+                i
+            })
+            .collect()
+    }
+
+    pub fn status_incident_edit(&self, id: &str, title: Option<&str>, impact: Option<&str>, components: Option<&[String]>) -> bool {
+        let comps = components.map(|c| serde_json::to_string(c).unwrap_or_else(|_| "[]".into()));
+        self.c()
+            .execute(
+                "UPDATE status_incidents SET title = COALESCE(?1, title), impact = COALESCE(?2, impact), components = COALESCE(?3, components), updated_at = ?4 WHERE id = ?5",
+                params![title, impact, comps, now(), id],
+            )
+            .unwrap_or(0)
+            == 1
+    }
+
+    /// Adds an update; its state becomes the incident's. Resolving stamps `resolved_at`,
+    /// and any other state reopens it.
+    pub fn status_incident_add_update(&self, id: &str, state: &str, body: &str, by: Option<&str>) -> bool {
+        let at = now();
+        let c = self.c();
+        let changed = c
+            .execute(
+                "UPDATE status_incidents SET state = ?1, updated_at = ?2,
+                   resolved_at = CASE WHEN ?1 = 'resolved' THEN COALESCE(resolved_at, ?2) ELSE NULL END
+                 WHERE id = ?3",
+                params![state, at, id],
+            )
+            .unwrap_or(0)
+            == 1;
+        if changed {
+            c.execute(
+                "INSERT INTO status_incident_updates (incident_id, state, body, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+                params![id, state, body, by, at],
+            )
+            .unwrap();
+        }
+        changed
+    }
+
+    pub fn status_incident_delete(&self, id: &str) -> bool {
+        self.c().execute("DELETE FROM status_incidents WHERE id = ?", [id]).unwrap_or(0) == 1
     }
 
     // Hosts (ADR 0076)
