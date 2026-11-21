@@ -567,11 +567,11 @@ pub async fn pass(app: &AppState, cp: &ControlPlane) -> usize {
 /// copy expires by itself), and restores not yet started end as failed too.
 fn interrupted(app: &App) {
     for b in app.db.machine_backups_in("running") {
-        if app.db.machine_backup_end(&b.id, None, Some("botd stopped while it was running")) {
-            if let Some(m) = app.db.machine(&b.machine_id) {
-                let d = json!({ "backupId": b.id, "error": "interrupted", "by": b.created_by });
-                app.db.record(&event(&system(&m), "machine.backup_failed", &m, d).outcome(Outcome::Failure));
-            }
+        if app.db.machine_backup_end(&b.id, None, Some("botd stopped while it was running"))
+            && let Some(m) = app.db.machine(&b.machine_id)
+        {
+            let d = json!({ "backupId": b.id, "error": "interrupted", "by": b.created_by });
+            app.db.record(&event(&system(&m), "machine.backup_failed", &m, d).outcome(Outcome::Failure));
         }
     }
     for st in ["importing", "replacing"] {
@@ -728,7 +728,7 @@ async fn restore(app: AppState, cp: Arc<ControlPlane>, r: MachineRestore, b: Mac
 // HTTP, under `/api/users/{key}/machine/backups|restore` and `/api/machines/backups`
 // (admin only, rbac::classify).
 
-fn need<'a>(a: &'a Auth) -> Res<(&'a ControlPlane, &'a Offsite)> {
+fn need(a: &Auth) -> Res<(&ControlPlane, &Offsite)> {
     let cp = &*a.machines;
     cp.need()?;
     let off = cp.offsite.as_deref().ok_or_else(|| {
