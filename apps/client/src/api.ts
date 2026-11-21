@@ -31,10 +31,13 @@ import type {
   SetupStatus,
   SignupApproval,
   SignupRequest,
+  TeammateLoginsView,
   UserBots,
   UserIdentity,
   Visibility,
 } from "./types";
+import type { LoginEvent } from "./types";
+import { streamLogin, teammateLoginPath, type LoginStream, type StreamXhr } from "./teammateLogins";
 
 export class ApiError extends Error {
   constructor(
@@ -394,6 +397,36 @@ export class SuperBotApi {
 
   async deleteMySecret(name: string): Promise<void> {
     await this.request("DELETE", `/api/me/secrets/${encodeURIComponent(name)}`);
+  }
+
+  // Your own harness logins on a teammate's machine (ADR 0062). Theirs is never used for you.
+
+  async teammateLogins(ownerId: string): Promise<TeammateLoginsView> {
+    return this.request<TeammateLoginsView>("GET", teammateLoginPath(ownerId, "harness-logins"));
+  }
+
+  /** Starts a login of yours there; its terminal's events come to `onEvent`. */
+  startTeammateLogin(
+    ownerId: string,
+    harness: string,
+    onEvent: (e: LoginEvent) => void,
+    make: () => StreamXhr = () => new XMLHttpRequest() as unknown as StreamXhr,
+  ): LoginStream {
+    return streamLogin(make, `${this.baseUrl}${teammateLoginPath(ownerId, "harness-login")}`, this.headers(true), harness, onEvent);
+  }
+
+  /** Types a line into your running login there. */
+  async teammateLoginInput(ownerId: string, loginId: string, text: string): Promise<void> {
+    await this.request("POST", teammateLoginPath(ownerId, `harness-login/${encodeURIComponent(loginId)}/input`), { text });
+  }
+
+  async stopTeammateLogin(ownerId: string, loginId: string): Promise<void> {
+    await this.request("DELETE", teammateLoginPath(ownerId, `harness-login/${encodeURIComponent(loginId)}`));
+  }
+
+  /** Removes your login there. */
+  async teammateLogout(ownerId: string, harness: string): Promise<TeammateLoginsView> {
+    return this.request<TeammateLoginsView>("DELETE", teammateLoginPath(ownerId, `harness-logins/${encodeURIComponent(harness)}`));
   }
 
   // Requests for access from the landing page: admins only (ADR 0022).

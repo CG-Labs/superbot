@@ -32,9 +32,14 @@ export function whereItRuns(bot: Pick<BotView, "runsOn" | "owner">, meId?: strin
   return `Can't run yet: ${whose} computer isn't set up`;
 }
 
-/** What a run for someone other than its owner gets, when the server isolates them. */
-export function whoseKeys(bot: Pick<BotView, "sharedBots" | "owner" | "visibility">, meId?: string | null): string | null {
+/** What a run for someone other than its owner gets, when the server isolates them.
+ *  With `teammateLogins` (ADR 0062) that includes their own harness login. */
+export function whoseKeys(bot: Pick<BotView, "sharedBots" | "owner" | "visibility" | "teammateLogins">, meId?: string | null): string | null {
   if (bot.sharedBots !== "isolated" || !bot.owner) return null;
-  if (bot.owner.id !== meId) return `For you it uses the server's keys and your access, never ${bot.owner.name}'s own`;
-  return bot.visibility === "shared" ? "Others' runs use the server's keys and their access, never your own" : null;
+  const login = bot.teammateLogins;
+  if (bot.owner.id !== meId) {
+    return `For you it uses ${login ? "your own login or " : ""}the server's keys and your access, never ${bot.owner.name}'s own`;
+  }
+  if (bot.visibility !== "shared") return null;
+  return `Others' runs use ${login ? "their own login or " : ""}the server's keys and their access, never your own`;
 }
