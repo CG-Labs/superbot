@@ -1,17 +1,17 @@
-import React, { useCallback, useEffect, useState } from "react";
-import { ActivityIndicator, AppState, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import { ActivityIndicator, AppState, Pressable, ScrollView, StyleSheet, Switch, Text, View } from "react-native";
 import type { SuperBotApi } from "../src/api";
 import { BILLING_OFF, checkoutNotice, limitSummary, openBillingPage, subscriptionLine } from "../src/billing";
 import { overLimits, planUsageLines, storageWarning, usageLines } from "../src/plan";
 import { colors } from "../src/theme";
-import type { BillingView, MyUsage } from "../src/types";
+import type { BillingEmails, BillingView, MyUsage } from "../src/types";
 
 /** After a successful checkout, how often and how many times to look for Stripe's confirmation. */
 export const CONFIRM_EVERY_MS = 3000;
 const CONFIRM_TRIES = 20;
 
 interface Props {
-  api: Pick<SuperBotApi, "billing" | "checkout" | "billingPortal" | "myUsage">;
+  api: Pick<SuperBotApi, "billing" | "checkout" | "billingPortal" | "myUsage" | "billingEmails" | "setUsageEmails">;
   onBack: () => void;
   /** `?checkout=` from Stripe's return link. */
   checkout?: string | string[];
@@ -39,20 +39,39 @@ function UsageCard({ usage, warn }: { usage: MyUsage; warn?: boolean }) {
   );
 }
 
+/** Whether you get usage emails, while the server sends billing emails (ADR 0091). */
+function EmailsCard({ emails, busy, onChange }: { emails: BillingEmails; busy: boolean; onChange: (usage: boolean) => void }) {
+  return (
+    <View style={styles.card}>
+      <Text style={styles.cardTitle}>Emails</Text>
+      <Text style={styles.dim}>We email you when your plan, its payments or your computer change.</Text>
+      <View style={styles.row}>
+        <Text style={[styles.line, styles.grow]}>Also email me near my token and storage limits</Text>
+        <Switch value={emails.usage} disabled={emails.canChange === false || busy} onValueChange={onChange} accessibilityLabel="Usage emails" />
+      </View>
+    </View>
+  );
+}
+
 /** Your plan, your use of it, and Stripe's pages to buy or manage one (ADR 0042). */
 export function PlanView({ api, onBack, checkout, open = openBillingPage }: Props) {
   const [view, setView] = useState<BillingView | null | undefined>(undefined);
   const [usage, setUsage] = useState<MyUsage | null>(null);
+  const [emails, setEmails] = useState<BillingEmails | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const notice = checkoutNotice(checkout);
+  // Bumped by each email setting save: a refresh started before one doesn't undo it.
+  const saves = useRef(0);
 
   const load = useCallback(async () => {
+    const at = saves.current;
     try {
-      // Usage is extra: the plan still shows if it can't load.
-      const [b, u] = await Promise.all([api.billing(), api.myUsage().catch(() => null)]);
+      // Usage and emails are extra: the plan still shows if they can't load.
+      const [b, u, m] = await Promise.all([api.billing(), api.myUsage().catch(() => null), api.billingEmails().catch(() => null)]);
       setView(b);
       setUsage(u);
+      if (saves.current === at) setEmails(m);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -79,6 +98,19 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
     }, CONFIRM_EVERY_MS);
     return () => clearInterval(timer);
   }, [waiting, load]);
+
+  const setUsageEmails = async (usage: boolean) => {
+    setBusy("emails");
+    setError(null);
+    saves.current += 1;
+    try {
+      setEmails(await api.setUsageEmails(usage));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
 
   const go = async (key: string, start: () => Promise<{ url: string }>) => {
     setBusy(key);
@@ -109,6 +141,11 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
       </View>
     );
   }
+  const shownEmails = emails ?? view?.emails;
+  const emailsCard = shownEmails?.on ? (
+    <EmailsCard emails={{ ...shownEmails, canChange: shownEmails.canChange ?? view?.canChange }} busy={!!busy} onChange={(v) => void setUsageEmails(v)} />
+  ) : null;
+
   if (view === null) {
     return (
       <View style={styles.root}>
@@ -116,9 +153,15 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
         <Text style={[styles.dim, styles.pad]} accessibilityRole="summary">
           {BILLING_OFF}
         </Text>
-        {usage ? (
+        {usage || emailsCard ? (
           <ScrollView contentContainerStyle={styles.body}>
-            <UsageCard usage={usage} warn />
+            {error ? (
+              <Text style={styles.error} accessibilityRole="alert">
+                {error}
+              </Text>
+            ) : null}
+            {usage ? <UsageCard usage={usage} warn /> : null}
+            {emailsCard}
           </ScrollView>
         ) : null}
       </View>
@@ -176,6 +219,7 @@ export function PlanView({ api, onBack, checkout, open = openBillingPage }: Prop
           </View>
         ) : null}
         {usage ? <UsageCard usage={usage} warn={!plan} /> : null}
+        {emailsCard}
         {view?.plans.length ? <Text style={styles.section}>Plans</Text> : null}
         {view?.plans.map((p) => (
           <View key={p.name} style={[styles.card, p.current && styles.currentCard]}>
@@ -233,4 +277,6 @@ const styles = StyleSheet.create({
   primaryBtn: { alignSelf: "flex-start", backgroundColor: "#f2f2f2", borderRadius: 999, paddingVertical: 8, paddingHorizontal: 16, marginTop: 8 },
   primaryText: { color: "#111", fontSize: 15 },
   busy: { opacity: 0.6 },
+  row: { flexDirection: "row", alignItems: "center", gap: 12, marginTop: 4 },
+  grow: { flex: 1 },
 });

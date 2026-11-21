@@ -216,6 +216,8 @@ pub struct App {
     pub meter: OnceLock<Arc<crate::billing::Meter>>,
     /// Email and webhook notices for pending approvals (ADR 0061). Unset: none.
     pub notifier: OnceLock<Arc<crate::notify::Notifier>>,
+    /// Billing emails (ADR 0091). Unset: off, and nothing is queued.
+    pub billing_mail: OnceLock<Arc<crate::billing_mail::BillingMail>>,
     /// Teammates' own harness logins for owners' shared Bots here (ADR 0064).
     pub teammate_logins: crate::teammate_logins::Local,
     /// Removals of leaving teammates' accounts here being tried now (ADR 0066).
@@ -262,6 +264,7 @@ impl App {
             resume_routines_on_enable: OnceLock::new(),
             meter: OnceLock::new(),
             notifier: OnceLock::new(),
+            billing_mail: OnceLock::new(),
             teammate_logins: Default::default(),
             account_removals: Default::default(),
             teammate_gate: Default::default(),
@@ -1881,6 +1884,7 @@ impl App {
             }
         };
         if let Some((m, limit, storage::State::Over)) = storage {
+            crate::billing_mail::storage(self, &bot.owner_id, tier, m.used(), *limit, true);
             let text = storage::full_text(&tier.label, m.used(), *limit);
             return refused("storage_limit", text, Some(*limit), Some(m.used()), json!({ "partial": m.partial }));
         }
@@ -1903,13 +1907,15 @@ impl App {
             let text = format!("The {} plan allows {limit} runs a {this}, and this {this}'s are used up. More start on {more}.", tier.label);
             return refused("tier_limit", text, Some(u64::from(limit)), None, Value::Null);
         }
-        if let Some((m, limit, storage::State::Warning)) = storage
-            && self.storage.first_warning(&self.db, &bot.owner_id, crate::db::now())
-        {
-            let who = Who { actor: Actor::system("billing").on_behalf_of(&bot.owner_id), source: Default::default() };
-            let details = json!({ "owner": bot.owner_id, "tier": tier.name, "limit": limit, "used": m.used(), "warnAt": storage::WARN_PERCENT, "partial": m.partial });
-            self.db.record(&who.event(storage::WARNING_ACTION).target("user", &bot.owner_id).bot(&bot.id).details(details));
-            self.say(&bot.id, &storage::warning_text(&tier.label, m.used(), *limit), false);
+        if let Some((m, limit, storage::State::Warning)) = storage {
+            if self.storage.first_warning(&self.db, &bot.owner_id, crate::db::now()) {
+                let who = Who { actor: Actor::system("billing").on_behalf_of(&bot.owner_id), source: Default::default() };
+                let details = json!({ "owner": bot.owner_id, "tier": tier.name, "limit": limit, "used": m.used(), "warnAt": storage::WARN_PERCENT, "partial": m.partial });
+                self.db.record(&who.event(storage::WARNING_ACTION).target("user", &bot.owner_id).bot(&bot.id).details(details));
+                self.say(&bot.id, &storage::warning_text(&tier.label, m.used(), *limit), false);
+            }
+            // Once a billing period and tier by its key, apart from the chat's once a day.
+            crate::billing_mail::storage(self, &bot.owner_id, tier, m.used(), *limit, false);
         }
         Some((tier.name.clone(), route, wiring))
     }
@@ -1969,6 +1975,11 @@ impl App {
             let by = Who { actor: Actor::system("billing").on_behalf_of(&bot.owner_id), source: Default::default() };
             let details = json!({ "owner": bot.owner_id, "tier": tier.name, "limit": limit, "used": before.saturating_add(total), "period": period.key, "periodEnd": period.end, "runId": run_id });
             self.db.record(&by.event("usage.token_limit_reached").target("user", &bot.owner_id).bot(&bot.id).details(details));
+        }
+        if before.is_some() {
+            // The saved total, which counts runs recorded at the same time as this one.
+            let after = self.db.tokens_used(&bot.owner_id, period.start, period.end);
+            crate::billing_mail::tokens(self, &bot.owner_id, tier, &period, after);
         }
         reported.then_some(total)
     }

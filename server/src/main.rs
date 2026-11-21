@@ -113,10 +113,13 @@ mod status_http_tests;
 mod stripe;
 mod tiers;
 mod billing;
+mod billing_mail;
 #[cfg(test)]
 mod tiers_http_tests;
 #[cfg(test)]
 mod billing_http_tests;
+#[cfg(test)]
+mod billing_mail_http_tests;
 mod usage;
 #[cfg(test)]
 mod usage_http_tests;
@@ -235,6 +238,8 @@ async fn main() {
     let (payments, ignored_stripe) =
         billing::Billing::configured(&secrets::env::EnvStore::process(), &|k| env(k, ""), testing).unwrap_or_else(|e| exit(format!("Billing: {e}")));
     let notifier = notify::Notifier::from_env(&|k| env(k, ""), sessions).unwrap_or_else(|e| exit(format!("Notifications: {e}")));
+    let (billing_mail, plan_mail_said) = billing_mail::configured(&|k| env(k, ""), payments.enabled(), notifier.smtp.as_ref(), notifier.links.base.as_deref())
+        .unwrap_or_else(|e| exit(format!("Billing emails: {e}")));
     let allow_no_auth = auth_startup(&host, &password, break_glass);
     secrets::redact::register(&password);
     if adapters::get(&default_harness).is_none() {
@@ -487,6 +492,10 @@ async fn main() {
         log_warn!("WARNING: {w}");
     }
     log_info!("Billing: {}.", billing::describe(auth_state.payments.enabled(), auth_state.payments.checkout_enabled(), app.meter.get().is_some(), app.tiers()));
+    log_info!("Billing emails: {plan_mail_said}.");
+    if let Some(m) = billing_mail {
+        let _ = app.billing_mail.set(Arc::new(m));
+    }
     match auth_state.scim.enabled {
         true => log_info!("SCIM: on at /scim/v2; new users get the {} role.", auth_state.scim.default_role.as_str()),
         false => log_info!("SCIM: off (SCIM=off)."),
@@ -535,6 +544,7 @@ async fn main() {
         "scim": auth_state_scim,
         "billing": auth_state_billing,
         "billingCheckout": auth_state_checkout,
+        "billingEmails": app.billing_mail.get().is_some(),
         "notifications": notify_summary,
         "tiers": app.tiers().all().iter().map(|t| &t.name).collect::<Vec<_>>(),
         "defaultTier": app.tiers().default_tier().name,
@@ -572,6 +582,7 @@ async fn main() {
     app.recover();
     cron::start(app.clone());
     billing::start_metering(app.clone());
+    billing_mail::start(app.clone());
     if app.screens.is_some() {
         let app = app.clone();
         tokio::spawn(async move {
@@ -667,6 +678,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/billing/portal", post(billing::portal))
         .route("/setup", get(setup::status).patch(setup::update))
         .route("/license", get(license::get).put(license::put).delete(license::delete))
+        .route("/me/emails", get(billing_mail::get_mine).put(billing_mail::put_mine))
         .route("/me/push", get(notify::push::get_mine).put(notify::push::put_mine).delete(notify::push::delete_mine))
         .route("/me/secrets", get(list_my_secrets))
         .route("/me/secrets/{name}", put(put_my_secret).delete(delete_my_secret))
@@ -2242,6 +2254,7 @@ async fn send_message(State(app): State<AppState>, Extension(c): Extension<Calle
         let tier = app.tier_of(&bot.owner_id);
         let details = json!({ "reason": "storage_limit", "owner": bot.owner_id, "tier": tier.name, "limit": limit, "used": m.used(), "partial": m.partial });
         app.db.record(&by.event("bot.message_refused").bot(&id).outcome(Outcome::Denied).details(details));
+        billing_mail::storage(&app, &bot.owner_id, tier, m.used(), limit, true);
         return Err(ApiError(StatusCode::FORBIDDEN, storage::refusal_text(&tier.label, m.used(), limit)));
     }
     // Answering a choice card: remember which option was picked.
