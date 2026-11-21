@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Root helper for per-user accounts (docs/adr/0037-per-user-unix-accounts.md). Installed as
 # /usr/local/sbin/superbot-userctl by deploy/install.sh --isolation. botd's service account may
-# run exactly `superbot-userctl ensure ...` as root (sudoers), and nothing else.
+# run exactly `superbot-userctl ensure|remove|purge ...` as root (sudoers), and nothing else.
 #
 #   superbot-userctl ensure <user id>
 #   superbot-userctl ensure <owner id> <teammate id>
+#   superbot-userctl remove <owner id> <teammate id> <cleanup id> archive <name> | hold | delete
+#   superbot-userctl purge <cleanup id>
 #
 # The second is a teammate's account for one owner's shared Bots
 # (docs/adr/0064-teammate-accounts-on-one-server.md): sb-t-<first 24 hex of
@@ -25,6 +27,16 @@
 #
 # The uid is the one the account's home already has, when it has one and no one else holds it:
 # in a container /etc/passwd starts afresh, and the account must come back owning its files.
+#
+# `remove` takes a leaving teammate's account for one owner's Bots away
+# (docs/adr/0066-removing-teammate-accounts-on-one-server.md). Only ever an sb-t- account it
+# derives from the two ids itself, with the home it gave it: never a user's own sb-u- account,
+# nor any other. It kills every process of the account (as the account itself, so nothing
+# else can be hit), deals with its workspace (archive: handed to the owner's account under
+# workspace/from-teammates/<name>; hold: kept aside, root's alone, in <dir>/.left/<cleanup id>
+# until `purge`; delete: gone), deletes its folder, its files in /tmp, /var/tmp and /dev/shm,
+# its crontab, at jobs and lingering, then the account and its group. Each step can run again:
+# a removal that stopped halfway finishes on the next try. It prints what it did as key=value.
 set -euo pipefail
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -167,7 +179,172 @@ ensure() {
   printf '%s %s\n' "$account" "$home"
 }
 
-usage="usage: superbot-userctl ensure <user id> | ensure <owner id> <teammate id>"
+# Run as the owner's account, in its workspace: moves the handed-over work from $2 into
+# from-teammates/$3 (or $3-2, $3-3, ...), never over anything. Prints where it landed: $2
+# if it couldn't, so the work is still the owner's, just not tidied away.
+ARCHIVE_AS_OWNER='cd "$1" || exit 1
+mkdir -p from-teammates 2>/dev/null
+if [ ! -d from-teammates ] || [ -h from-teammates ]; then echo "$2"; exit 0; fi
+n="" i=1
+while [ -e "from-teammates/$3$n" ] || [ -h "from-teammates/$3$n" ]; do
+  i=$((i + 1)); n="-$i"
+  [ "$i" -lt 100 ] || { echo "$2"; exit 0; }
+done
+if mv -T -- "$2" "from-teammates/$3$n" 2>/dev/null; then echo "from-teammates/$3$n"; else echo "$2"; fi'
+
+# Runs the rest as uid:gid, with no groups and no capabilities.
+as_uid() {
+  local uid=$1 gid=$2
+  shift 2
+  setpriv --reuid="$uid" --regid="$gid" --clear-groups --inh-caps=-all -- "$@"
+}
+
+valid_cleanup_id() {
+  [[ "$1" =~ ^[a-f0-9]{8,32}$ ]] || die "cleanup id must be 8 to 32 lowercase hex digits"
+}
+
+# Makes a teammate's work, still in their folder (no process of theirs left), fit to hand
+# over: the unsaved memory copies botd set aside go in with it, a hard link to anyone else's
+# file goes (the file stays theirs), a file of theirs with other links gets a copy of its
+# own, and no set-id bit is left.
+prepare_work() {
+  local root=$1 ws=$2 uid=$3 f tmp
+  for f in "$root"/memory/*.md.unsaved; do
+    [[ -f "$f" && ! -L "$f" ]] || continue
+    [[ -d "$ws/unsaved-memory" && ! -L "$ws/unsaved-memory" ]] || { rm -f -- "$ws/unsaved-memory"; mkdir -- "$ws/unsaved-memory"; }
+    mv -n -- "$f" "$ws/unsaved-memory/"
+  done
+  find "$ws" -xdev ! -type d ! -uid "$uid" -links +1 -delete
+  while IFS= read -r -d '' f; do
+    tmp=$(mktemp -- "$(dirname -- "$f")/.superbot-copy.XXXXXX")
+    cp --preserve=mode,timestamps -- "$f" "$tmp"
+    mv -f -- "$tmp" "$f"
+  done < <(find "$ws" -xdev -type f -uid "$uid" -links +1 -print0)
+  find "$ws" -xdev -type f -perm /6000 -exec chmod ug-s -- {} +
+}
+
+# remove <owner> <teammate> <cleanup id> archive <name> | hold | delete
+remove() {
+  local owner=$1 teammate=$2 id=$3 mode=$4 name=${5:-}
+  local hash account root home ws uid="" gid="" present=false rounds=0 temp=0 work=none to="" i p d
+  hash=$(printf '%s:%s' "$owner" "$teammate" | sha256sum | cut -c1-24)
+  account=$TEAMMATE_PREFIX$hash
+  trusted_path "$ISOLATION_DIR"
+  root="$ISOLATION_DIR/$owner-$teammate"
+  home="$root/home"
+  ws="$root/workspace"
+  local left="$ISOLATION_DIR/.left"
+  local owner_ws="$ISOLATION_DIR/$owner/workspace"
+  local staged=".superbot-from-teammate-$id"
+
+  if getent passwd "$account" >/dev/null; then
+    [[ "$(getent passwd "$account" | cut -d: -f6)" == "$home" ]] || die "$account exists with another home; fix or remove it by hand"
+    uid=$(id -u "$account")
+    gid=$(id -g "$account")
+    [[ "$uid" != 0 && "$gid" != 0 ]] || die "$account has uid or gid 0"
+    present=true
+    passwd --lock "$account" >/dev/null
+  fi
+  if [[ -e "$root" || -L "$root" ]]; then
+    [[ -d "$root" && ! -L "$root" && "$(stat -c '%u' "$root")" == 0 ]] || die "$root isn't a folder this helper made; fix or remove it by hand"
+    if [[ -z "$uid" && -d "$home" && ! -L "$home" ]]; then
+      uid=$(stat -c '%u' "$home")
+      [[ "$uid" != 0 ]] || uid=""
+    fi
+  fi
+
+  # Every process of the account, signalled by the account itself: kill(-1) reaches only
+  # its own processes, so a reused pid of anyone else's is never hit. Until none is left,
+  # reaped too, or userdel refuses.
+  if $present; then
+    for ((i = 0; i < 100; i++)); do
+      pgrep -u "$uid" >/dev/null || break
+      as_uid "$uid" "$gid" kill -9 -1 2>/dev/null || true
+      rounds=$((rounds + 1))
+      sleep 0.1
+    done
+    ((i < 100)) || die "$account's processes keep coming back"
+  fi
+
+  # Their work, unless an earlier try already moved it.
+  if [[ -d "$owner_ws/$staged" && ! -L "$owner_ws/$staged" ]]; then
+    work=archived to="$owner_ws/$staged"
+  elif [[ -d "$left/$id" && ! -L "$left/$id" ]]; then
+    work=held to="$left/$id"
+  fi
+  if [[ "$work" == none && -d "$ws" && ! -L "$ws" ]]; then
+    [[ -n "$uid" ]] || uid=$(stat -c '%u' "$ws")
+    [[ "$uid" != 0 ]] || die "$ws is owned by root; fix or remove it by hand"
+    prepare_work "$root" "$ws" "$uid"
+    if [[ -z "$(find "$ws" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+      work=none
+    elif [[ "$mode" == archive ]]; then
+      local owner_acct=$PREFIX$owner ou og
+      getent passwd "$owner_acct" >/dev/null || die "can't archive: $owner_acct isn't there"
+      ou=$(id -u "$owner_acct")
+      og=$(id -g "$owner_acct")
+      [[ "$ou" != 0 ]] || die "$owner_acct has uid 0"
+      [[ -d "$ISOLATION_DIR/$owner" && ! -L "$ISOLATION_DIR/$owner" && "$(stat -c '%u' "$ISOLATION_DIR/$owner")" == 0 ]] || die "can't archive: $ISOLATION_DIR/$owner isn't a folder this helper made"
+      [[ -d "$owner_ws" && ! -L "$owner_ws" && "$(stat -c '%u' "$owner_ws")" == "$ou" ]] || die "can't archive: $owner_ws isn't $owner_acct's workspace"
+      # Still in the teammate's folder, where the owner's account can't reach: no one can
+      # swap anything in while it changes hands.
+      chown -R -P -h "$ou:$SERVICE_GROUP" -- "$ws"
+      # rename(2) never follows a link at the target, and won't replace one.
+      mv -T -- "$ws" "$owner_ws/$staged"
+      to="$owner_ws/$staged"
+      p=$(as_uid "$ou" "$og" /bin/sh -c "$ARCHIVE_AS_OWNER" sh "$owner_ws" "$staged" "$name" 2>/dev/null | tail -n 1) || p=""
+      [[ -z "$p" || "$p" == "$staged" ]] || to="$owner_ws/$p"
+      work=archived
+    elif [[ "$mode" == hold ]]; then
+      folder "$left" root root 0700
+      mv -T -- "$ws" "$left/$id"
+      work=held to="$left/$id"
+    else
+      work=deleted
+    fi
+  fi
+
+  if [[ -d "$root" && ! -L "$root" ]]; then
+    rm -rf --one-file-system -- "$root"
+  fi
+  # Their files in the shared temp folders, unless that uid is someone else's by now.
+  if [[ -n "$uid" ]] && { $present || ! getent passwd "$uid" >/dev/null; }; then
+    for d in /tmp /var/tmp /dev/shm; do
+      [[ -d "$d" && ! -L "$d" ]] || continue
+      while IFS= read -r -d '' p; do
+        rm -rf --one-file-system -- "$p"
+        temp=$((temp + 1))
+      done < <(find "$d" -xdev -mindepth 1 -maxdepth 1 -uid "$uid" -print0)
+    done
+  fi
+  if $present; then
+    rm -f -- "/var/spool/cron/crontabs/$account" "/var/lib/systemd/linger/$account"
+    if [[ -d /var/spool/cron/atjobs && ! -L /var/spool/cron/atjobs ]]; then
+      find /var/spool/cron/atjobs -xdev -mindepth 1 -maxdepth 1 -type f -uid "$uid" -delete
+    fi
+    userdel "$account"
+  fi
+  if getent group "$account" >/dev/null; then
+    groupdel "$account"
+  fi
+  printf 'account=%s\nprocesses=%s\ntemp=%s\nwork=%s\n' "$($present && echo removed || echo absent)" "$rounds" "$temp" "$work"
+  [[ -z "$to" ]] || printf 'path=%s\n' "$to"
+}
+
+# purge <cleanup id>: deletes work `remove ... hold` kept aside.
+purge() {
+  local id=$1 left="$ISOLATION_DIR/.left"
+  trusted_path "$ISOLATION_DIR"
+  if [[ -e "$left/$id" || -L "$left/$id" ]]; then
+    [[ -d "$left" && ! -L "$left" && "$(stat -c '%u' "$left")" == 0 ]] || die "$left isn't a folder this helper made"
+    rm -rf --one-file-system -- "${left:?}/$id"
+    echo purged=yes
+  else
+    echo purged=no
+  fi
+}
+
+usage="usage: superbot-userctl ensure <user id> | ensure <owner id> <teammate id> | remove <owner id> <teammate id> <cleanup id> archive <name>|hold|delete | purge <cleanup id>"
 case "${1:-}" in
   ensure)
     if [[ $# == 2 ]]; then
@@ -182,6 +359,26 @@ case "${1:-}" in
     else
       die "$usage"
     fi
+    ;;
+  remove)
+    (($# >= 5)) || die "$usage"
+    valid_id "$2"
+    valid_id "$3"
+    [[ "$2" != "$3" ]] || die "owner and teammate must differ: a user's own account is never removed"
+    valid_cleanup_id "$4"
+    case "$5" in
+      archive)
+        [[ $# == 6 && "$6" =~ ^[a-z0-9_][a-z0-9._-]{0,63}$ ]] || die "archive needs a name: 1 to 64 lowercase letters, digits, . _ -, not starting with . or -"
+        ;;
+      hold | delete) [[ $# == 5 ]] || die "$usage" ;;
+      *) die "$usage" ;;
+    esac
+    remove "$2" "$3" "$4" "$5" "${6:-}"
+    ;;
+  purge)
+    [[ $# == 2 ]] || die "$usage"
+    valid_cleanup_id "$2"
+    purge "$2"
     ;;
   *)
     die "$usage"
