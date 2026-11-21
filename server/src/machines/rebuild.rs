@@ -181,16 +181,33 @@ fn cancel(app: &App, by: &Who, m: &Machine, reason: &str) -> bool {
     true
 }
 
-/// The machine's disks may be gone: forget what was on them or said by the old agent.
-fn forget_machine(app: &App, m: &Machine) {
+/// Forgets what the old agent said and what was on its disks. Done before the provider
+/// is asked, so a botd that stops mid-call can't skip it; if the provider refuses, the
+/// old agent says it all again and its Bots start new sessions.
+fn forget_old(app: &App, m: &Machine) {
     app.db.machine_rebuilt_reset(&m.id);
     app.db.forget_sessions_of(&m.user_id);
     super::folder::forget(app, &m.id);
+}
+
+/// Teammate cleanups asked of the old machine before `before`: its disks are gone.
+fn end_cleanups(app: &App, m: &Machine, before: i64) {
     for state in ["pending", "held"] {
-        for c in app.db.teammate_cleanups(Some(state), Some(&m.id)) {
+        for c in app.db.teammate_cleanups(Some(state), Some(&m.id)).into_iter().filter(|c| c.created_at <= before) {
             app.db.teammate_cleanup_end(&c.id, state, "done", Some("machine rebuilt"));
         }
     }
+}
+
+/// The provider took it (or may have): the old agent's certificates and cleanups go.
+fn wiped(app: &App, by: &Who, m: &Machine) {
+    end_cleanups(app, m, m.rebuild_sent_at.unwrap_or_else(now));
+    enroll::revoke_certs(app, by, m, "rebuilt");
+}
+
+/// When a rebuild sent at `sent` should have enrolled again by.
+fn deadline(e: &Enrollment, sent: i64) -> i64 {
+    sent + e.enroll_timeout_ms + BOOT_SLACK_MS
 }
 
 /// Sends the rebuild from `from` (`queued` or `retrying`). Caller holds `ops`.
@@ -218,11 +235,11 @@ async fn send(app: &App, cp: &ControlPlane, p: &dyn MachineProvider, e: &Enrollm
         return;
     }
     let m = app.db.machine(&m.id).unwrap_or_else(|| m.clone());
+    forget_old(app, &m);
     let extra = json!({ "providerId": pid, "image": spec.image, "toVersion": super::upkeep::VERSION, "toBuild": e.agent_sha256() });
     match p.rebuild(&pid, &spec).await {
         Ok(()) => {
-            forget_machine(app, &m);
-            enroll::revoke_certs(app, &by, &m, "rebuilt");
+            wiped(app, &by, &m);
             app.db.record(&event(&by, "machine.rebuild_sent", &m, details(&m, extra)));
         }
         Err(ProviderError::RateLimited) => {
@@ -236,8 +253,8 @@ async fn send(app: &App, cp: &ControlPlane, p: &dyn MachineProvider, e: &Enrollm
         }
         Err(err) if transient(&err) => {
             // It may have happened: wait for the machine to come back with the new
-            // token, and send it again only if it doesn't.
-            forget_machine(app, &m);
+            // token, and send it again only if it doesn't. Its old agent keeps its
+            // certificates and cleanups until then.
             let why = format!("The provider's answer was lost ({err}); waiting to see whether it was rebuilt.");
             app.db.machine_rebuild_move(&m.id, &id, &["rebuilding"], "rebuilding", false, None, Some(&why));
             let mut d = details(&m, extra);
@@ -298,7 +315,14 @@ pub(super) async fn step(app: &App, cp: &ControlPlane, e: &Enrollment, machine_i
             send(app, cp, p, e, &m, "queued").await;
         }
         "retrying" => {
-            if back(&m) || m.rebuild_next_at.is_some_and(|n| n > at) {
+            if back(&m) {
+                // It enrolled just as the last deadline passed; one that never answers fails.
+                if at > deadline(e, m.rebuild_sent_at.unwrap_or(at)) + ANSWER_MS {
+                    fail(app, &m, &["retrying"], "no_heartbeat", "It enrolled again but its agent never answered.");
+                }
+                return;
+            }
+            if m.rebuild_next_at.is_some_and(|n| n > at) {
                 return;
             }
             if let Some(why) = unable(cp, e) {
@@ -318,7 +342,7 @@ pub(super) async fn step(app: &App, cp: &ControlPlane, e: &Enrollment, machine_i
         }
         "rebuilding" => {
             let sent = m.rebuild_sent_at.unwrap_or(at);
-            let deadline = sent + e.enroll_timeout_ms + BOOT_SLACK_MS;
+            let deadline = deadline(e, sent);
             if back(&m) {
                 // The heartbeat loop finishes it; one that never answers fails.
                 if at > deadline + ANSWER_MS {
@@ -329,6 +353,9 @@ pub(super) async fn step(app: &App, cp: &ControlPlane, e: &Enrollment, machine_i
             if at > deadline {
                 let why = format!("It didn't enroll again within {} minutes of the rebuild.", (deadline - sent) / 60_000);
                 app.db.revoke_machine_tokens(&m.id);
+                if app.db.machine(&m.id).is_some_and(|m| back(&m)) {
+                    return;
+                }
                 retry_later(app, &m, "rebuilding", "retrying", false, "never_enrolled", &why);
             }
         }
@@ -347,18 +374,25 @@ pub(super) async fn reconcile(app: &App, cp: &ControlPlane) {
 }
 
 /// Queues a rebuild of `m`. `by`: the admin, or None for MACHINE_LEGACY_REBUILDS=auto.
-fn queue(app: &App, m: &Machine, hb: &Heartbeat, by: Option<&Who>, discard: bool) -> Option<Machine> {
+/// `hb` None: a failed rebuild sent before, whose agent is gone, is sent again
+/// (`retrying`) without waiting for it to answer.
+fn queue(app: &App, m: &Machine, hb: Option<&Heartbeat>, by: Option<&Who>, discard: bool) -> Option<Machine> {
     let auto = system(m);
     let (by, who) = match by {
         Some(w) => (w, w.actor.id.clone().unwrap_or_default()),
         None => (&auto, "auto".to_string()),
     };
     let id = crate::random_hex(8);
-    if !app.db.machine_rebuild_queue(&m.id, &id, &who, discard, Some(&hb.version)) {
+    let from = hb.map(|h| h.version.clone()).or_else(|| m.rebuild_from.clone());
+    if !app.db.machine_rebuild_queue(&m.id, &id, &who, discard, from.as_deref()) {
+        return None;
+    }
+    if hb.is_none() && !app.db.machine_rebuild_move(&m.id, &id, &["queued"], "retrying", false, Some(now()), None) {
         return None;
     }
     let m = app.db.machine(&m.id)?;
-    app.db.record(&event(by, "machine.rebuild_requested", &m, details(&m, json!({ "lacks": lacks(&hb.can) }))));
+    let lacks = hb.map_or(CAPABILITIES.to_vec(), |h| lacks(&h.can));
+    app.db.record(&event(by, "machine.rebuild_requested", &m, details(&m, json!({ "lacks": lacks, "again": hb.is_none() }))));
     Some(m)
 }
 
@@ -379,6 +413,7 @@ pub async fn follow_up(app: &AppState, cp: &ControlPlane, e: &Enrollment, machin
                 return;
             }
             let m = app.db.machine(machine_id).unwrap_or(m);
+            end_cleanups(app, &m, m.rebuild_sent_at.unwrap_or_else(now));
             let by = system(&m);
             app.db.record(&event(&by, "machine.rebuilt", &m, details(&m, json!({ "toVersion": hb.version, "toBuild": hb.build }))));
             if m.assigned_at.is_some() {
@@ -392,7 +427,7 @@ pub async fn follow_up(app: &AppState, cp: &ControlPlane, e: &Enrollment, machin
             && unable(cp, e).is_none()
             && !app.db.machine_may_hold_work(&m.id) =>
         {
-            queue(app, &m, hb, None, false);
+            queue(app, &m, Some(hb), None, false);
         }
         _ => {}
     }
@@ -465,7 +500,8 @@ pub async fn get(AppS(app): AppS<AppState>, Path(key): Path<String>) -> Res {
 }
 
 /// `POST /api/users/{key}/machine/rebuild` `{discardWork?}`: rebuilds it with today's
-/// agent. Its agent must answer and be from before ADR 0039. 202; it is tried at once,
+/// agent. Its agent must answer and be from before ADR 0039, unless a rebuild sent
+/// before failed (it may have none left). 202; it is tried at once,
 /// then by the reconciler, and the audit log and `GET` say how it went.
 pub async fn request(
     AppS(app): AppS<AppState>,
@@ -491,8 +527,14 @@ pub async fn request(
     if m.upgrade_hold_at.is_some() {
         return Err(conflict("Its agent is held at its build. Release it first (botctl machine upgrade <user> release)."));
     }
-    let hb = super::upkeep::fresh(&app, e, &m).await?;
-    if !legacy(&hb) {
+    // A rebuild that was sent and failed may have left no agent to answer.
+    let again = m.rebuild_state.as_deref() == Some("failed") && m.rebuild_sent_at.is_some();
+    let hb = match super::upkeep::fresh(&app, e, &m).await {
+        Ok(hb) => Some(hb),
+        Err(_) if again => None,
+        Err(err) => return Err(err),
+    };
+    if hb.as_ref().is_some_and(|h| !legacy(h)) {
         return Err(conflict("Its agent can upgrade itself, so it needn't be rebuilt. Use botctl machine upgrade <user>."));
     }
     if !discard && app.db.machine_may_hold_work(&m.id) {
@@ -501,7 +543,7 @@ pub async fn request(
              Copy off what's needed, then ask again with discardWork: true (botctl machine rebuild <user> --discard-work).",
         ));
     }
-    let m = queue(&app, &m, &hb, Some(&by), discard).ok_or_else(|| conflict("It changed meanwhile; try again."))?;
+    let m = queue(&app, &m, hb.as_ref(), Some(&by), discard).ok_or_else(|| conflict("It changed meanwhile; try again."))?;
     step(&app, cp, e, &m.id).await;
     let m = app.db.machine(&m.id).unwrap_or(m);
     Ok((StatusCode::ACCEPTED, Json(view(&app, e, &m))))

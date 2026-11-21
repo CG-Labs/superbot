@@ -256,6 +256,42 @@ async fn auto_rebuilds_only_idle_machines_that_never_ran_bots_and_gives_up_after
     reconcile(&env.app, &env.cp).await;
     assert_eq!(env.fake.calls("rebuild") as i64, MAX_ATTEMPTS, "settled");
     assert_eq!(env.app.db.machine_tokens_unused(&mid), 0, "its last token is revoked");
+
+    // No agent is left to answer, yet an admin can ask again: it is sent at once.
+    let (code, v) = json_call(&env, "POST", &format!("/api/users/{uid}/machine/rebuild"), "").await;
+    assert_eq!(code, 202, "{v}");
+    assert_eq!((v["rebuild"]["state"].as_str(), v["rebuild"]["attempts"].as_i64()), (Some("rebuilding"), Some(1)), "{v}");
+    assert_eq!(env.fake.calls("rebuild") as i64, MAX_ATTEMPTS + 1);
+    let asked = events(&env, "machine.rebuild_requested").await;
+    assert_eq!((asked[0]["details"]["again"].as_bool(), asked[0]["details"]["fromVersion"].as_str()), (Some(true), Some("0.3.0")), "{asked:?}");
+}
+
+#[tokio::test]
+async fn a_machine_that_enrolled_as_its_deadline_passed_but_never_answers_fails() {
+    let mut env = serve_with(|e| e).await;
+    let (uid, mid, token) = machine_for(&env, "fy@example.com").await;
+    assert!(env.app.db.unassign_machine(&mid));
+    let old = old_agent(&mut env, &mid, &token).await;
+    heartbeats(&env.app, &env.cp).await;
+    let (code, v) = json_call(&env, "POST", &format!("/api/users/{uid}/machine/rebuild"), "").await;
+    assert_eq!(code, 202, "{v}");
+    let fresh = token_in(&env.fake.user_data(&label(&env, &mid)).unwrap());
+    let listen = old.wipe().await;
+    let new = new_agent(&env, listen, &mid, &fresh).await;
+    new.abort();
+    let _ = new.await;
+
+    // Moved on to retrying from a reading taken before it enrolled.
+    let id = env.app.db.machine(&mid).unwrap().rebuild_id.unwrap();
+    assert!(env.app.db.machine_rebuild_move(&mid, &id, &["rebuilding"], "retrying", false, Some(crate::db::now()), None));
+    reconcile(&env.app, &env.cp).await;
+    assert_eq!(rebuild_view(&env, &uid).await["rebuild"]["state"], "retrying", "it waits for an answer");
+    env.app.db.machine_rebuild_backdate(&mid, 10 * 3_600_000);
+    reconcile(&env.app, &env.cp).await;
+    let v = rebuild_view(&env, &uid).await;
+    assert_eq!(v["rebuild"]["state"], "failed", "{v}");
+    assert_eq!(events(&env, "machine.rebuild_failed").await[0]["details"]["reason"], "no_heartbeat");
+    assert_eq!(env.fake.calls("rebuild"), 1, "never wiped again");
 }
 
 #[tokio::test]
@@ -273,6 +309,10 @@ async fn a_refused_rebuild_fails_and_auto_never_wipes_a_machine_that_may_hold_wo
     }
     assert!(events(&env, "machine.rebuild_requested").await.is_empty(), "assigned: it may hold the user's files");
 
+    // Its sessions are forgotten before the provider is asked, even if it then refuses:
+    // a botd that stops mid-call mustn't leave sessions whose files may be erased.
+    let bot = env.app.db.create_bot_owned("Cy's", "#fff", "waddle", "claude", None, false, &uid, crate::acl::Visibility::Shared);
+    assert!(env.app.db.keep_session(&bot.id, "s1", env.app.db.placed_at(&uid)));
     env.fake.fail_next("rebuild", ProviderError::Api { status: 400, message: "image: Not found".into() });
     let (code, v) = json_call(&env, "POST", &path, r#"{"discardWork":true}"#).await;
     assert_eq!(code, 202, "{v}");
@@ -280,6 +320,7 @@ async fn a_refused_rebuild_fails_and_auto_never_wipes_a_machine_that_may_hold_wo
     assert!(v["rebuild"]["error"].as_str().unwrap().contains("image"), "{v}");
     let failed = events(&env, "machine.rebuild_failed").await;
     assert_eq!(failed[0]["details"]["reason"], "refused");
+    assert!(env.app.db.bot(&bot.id).unwrap().session_id.is_none());
     let m = env.app.db.machine(&mid).unwrap();
     assert_eq!(m.enrollment, "enrolled", "a refused rebuild leaves the old agent as it was");
     assert_eq!(env.app.db.machine_tokens_unused(&mid), 0);
