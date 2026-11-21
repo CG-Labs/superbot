@@ -249,6 +249,20 @@ pub struct Rotation {
     pub unreadable: usize,
 }
 
+/// The key a rotation starts from, and whether derived keys change with it.
+pub struct Previous {
+    pub key: MasterKey,
+    /// New derived keys from the new master key (a new machine CA, so every machine enrolls
+    /// again), instead of keeping the ones in use. For a key that may have leaked.
+    pub new_derived_keys: bool,
+}
+
+impl From<MasterKey> for Previous {
+    fn from(key: MasterKey) -> Previous {
+        Previous { key, new_derived_keys: false }
+    }
+}
+
 /// Every sealed value in the database: the statement that replaces it, its rowid, context, and value.
 fn sealed_rows(c: &Connection) -> rusqlite::Result<Vec<(&'static str, i64, String, String)>> {
     let mut out = Vec::new();
@@ -277,10 +291,10 @@ fn sealed_rows(c: &Connection) -> rusqlite::Result<Vec<(&'static str, i64, Strin
 
 /// Seals everything `old` sealed under `new` instead, in one write transaction with its
 /// audit event: a crash or error leaves the database as it was, still opened by `old`.
-/// The key check is sealed again, and the derived-key root `old` used is kept, sealed
-/// under `new`, so the machine CA and other derived keys don't change. Values `new`
-/// already opens are left alone, so running it again changes nothing.
-fn rotate(c: &Connection, old: &Cipher, new: &Cipher) -> rusqlite::Result<Rotation> {
+/// The key check is sealed again. The derived-key root `old` used is kept, sealed under
+/// `new`, so the machine CA and other derived keys don't change, unless `new_derived_keys`.
+/// Values `new` already opens are left alone, so running it again changes nothing.
+fn rotate(c: &Connection, old: &Cipher, new: &Cipher, new_derived_keys: bool) -> rusqlite::Result<Rotation> {
     let tx = rusqlite::Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
     let mut done = Rotation::default();
     for (update, rowid, context, v) in sealed_rows(&tx)? {
@@ -297,8 +311,12 @@ fn rotate(c: &Connection, old: &Cipher, new: &Cipher) -> rusqlite::Result<Rotati
     }
     let set = "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2";
     tx.execute(set, params![KEY_CHECK, new.seal("key-check", KEY_CHECK_PLAIN)])?;
-    tx.execute(set, params![DERIVE_ROOT, new.seal(DERIVE_ROOT_CONTEXT, &old.1[..])])?;
-    let details = serde_json::json!({ "resealed": done.resealed, "current": done.current, "unreadable": done.unreadable, "derivedKeysKept": true });
+    if new_derived_keys {
+        tx.execute("DELETE FROM settings WHERE key = ?", [DERIVE_ROOT])?;
+    } else {
+        tx.execute(set, params![DERIVE_ROOT, new.seal(DERIVE_ROOT_CONTEXT, &old.1[..])])?;
+    }
+    let details = serde_json::json!({ "resealed": done.resealed, "current": done.current, "unreadable": done.unreadable, "derivedKeysKept": !new_derived_keys });
     tx.execute(
         "INSERT INTO audit_events (at, actor_kind, actor_id, action, target_type, target_id, outcome, details)
          VALUES (?, 'system', 'secrets', 'secret.master_key_rotated', 'secret', 'master-key', 'success', ?)",
@@ -355,7 +373,7 @@ fn opens(c: &Connection, cipher: &Cipher) -> rusqlite::Result<bool> {
 pub fn bootstrap(
     c: &Connection,
     found: Option<MasterKey>,
-    previous: Option<MasterKey>,
+    previous: Option<Previous>,
     create: impl FnOnce() -> Result<MasterKey, String>,
     forget: bool,
 ) -> Result<(Cipher, Bootstrap), String> {
@@ -364,7 +382,7 @@ pub fn bootstrap(
     let cipher = match found {
         Some(k) => {
             let cipher = Cipher::new(&k);
-            let old = previous.as_ref().map(Cipher::new);
+            let old = previous.as_ref().map(|p| Cipher::new(&p.key));
             if opens(c, &cipher).map_err(db)? {
                 b.previous_unused = old.is_some();
             } else if let Some(old) = match old {
@@ -372,7 +390,8 @@ pub fn bootstrap(
                 _ => None,
             } {
                 let old = with_root(c, old)?;
-                b.rotated = Some(rotate(c, &old, &cipher).map_err(db)?);
+                let new_derived_keys = previous.as_ref().is_some_and(|p| p.new_derived_keys);
+                b.rotated = Some(rotate(c, &old, &cipher, new_derived_keys).map_err(db)?);
             } else {
                 if !forget {
                     return Err(if previous.is_some() { WRONG_KEYS } else { WRONG_KEY }.into());
@@ -857,7 +876,7 @@ mod tests {
         let n = seal_one_of_each(&db, &c, &cipher_a);
 
         let b = MasterKey::generate();
-        let (cipher_b, boot) = bootstrap(&c, Some(copy(&b)), Some(copy(&a)), no_key, false).unwrap();
+        let (cipher_b, boot) = bootstrap(&c, Some(copy(&b)), Some(copy(&a).into()), no_key, false).unwrap();
         assert_eq!(boot.rotated, Some(Rotation { resealed: n, current: 0, unreadable: 0 }));
         assert!(!boot.previous_unused);
         assert!(all_open_with(&c, &cipher_b), "every value opens with the new key");
@@ -876,11 +895,32 @@ mod tests {
 
         // A second rotation keeps the same derived keys.
         let k3 = MasterKey::generate();
-        let (cipher_3, boot) = bootstrap(&c, Some(copy(&k3)), Some(copy(&b)), no_key, false).unwrap();
+        let (cipher_3, boot) = bootstrap(&c, Some(copy(&k3)), Some(copy(&b).into()), no_key, false).unwrap();
         assert_eq!(boot.rotated.unwrap().resealed, n);
         assert!(all_open_with(&c, &cipher_3));
         assert_eq!(cipher_3.derive("machine-ca"), ca);
         assert_eq!(rotations(&c).len(), 2);
+    }
+
+    #[test]
+    fn a_rotation_can_change_derived_keys_too() {
+        let (_, db, c) = fresh();
+        let a = MasterKey::generate();
+        let (cipher_a, _) = bootstrap(&c, Some(copy(&a)), None, no_key, false).unwrap();
+        let n = seal_one_of_each(&db, &c, &Arc::new(cipher_a));
+        let b = MasterKey::generate();
+        bootstrap(&c, Some(copy(&b)), Some(copy(&a).into()), no_key, false).unwrap();
+        // A second rotation, from a key that may have leaked: the CA goes with it.
+        let k3 = MasterKey::generate();
+        let previous = Previous { key: copy(&b), new_derived_keys: true };
+        let (cipher_3, boot) = bootstrap(&c, Some(copy(&k3)), Some(previous), no_key, false).unwrap();
+        assert_eq!(boot.rotated.unwrap().resealed, n);
+        assert!(all_open_with(&c, &cipher_3));
+        assert_eq!(cipher_3.derive("machine-ca"), Cipher::new(&k3).derive("machine-ca"), "derived from the new key alone");
+        assert_ne!(cipher_3.derive("machine-ca"), Cipher::new(&a).derive("machine-ca"));
+        assert_eq!(rotations(&c)[1]["derivedKeysKept"], false);
+        let (again, _) = bootstrap(&c, Some(k3), None, no_key, false).unwrap();
+        assert_eq!(again.derive("machine-ca"), cipher_3.derive("machine-ca"));
     }
 
     #[test]
@@ -890,12 +930,12 @@ mod tests {
         let (cipher_a, _) = bootstrap(&c, Some(copy(&a)), None, no_key, false).unwrap();
         seal_one_of_each(&db, &c, &Arc::new(cipher_a));
         let b = MasterKey::generate();
-        bootstrap(&c, Some(copy(&b)), Some(copy(&a)), no_key, false).unwrap();
+        bootstrap(&c, Some(copy(&b)), Some(copy(&a).into()), no_key, false).unwrap();
         let before: Vec<String> = c.prepare("SELECT value FROM secrets UNION ALL SELECT value FROM settings").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
 
         // The previous key left set across restarts: nothing to do, and botd says so.
         for _ in 0..2 {
-            let (cipher_b, boot) = bootstrap(&c, Some(copy(&b)), Some(copy(&a)), no_key, false).unwrap();
+            let (cipher_b, boot) = bootstrap(&c, Some(copy(&b)), Some(copy(&a).into()), no_key, false).unwrap();
             assert!(boot.rotated.is_none() && boot.previous_unused);
             assert!(all_open_with(&c, &cipher_b));
         }
@@ -904,7 +944,7 @@ mod tests {
         assert_eq!(rotations(&c).len(), 1, "one rotation, one audit event");
 
         // The same key as both: nothing to rotate.
-        let (_, boot) = bootstrap(&c, Some(copy(&b)), Some(copy(&b)), no_key, false).unwrap();
+        let (_, boot) = bootstrap(&c, Some(copy(&b)), Some(copy(&b).into()), no_key, false).unwrap();
         assert!(boot.rotated.is_none() && boot.previous_unused);
     }
 
@@ -918,7 +958,7 @@ mod tests {
         // Fail after `secrets` was sealed again, part-way through the other tables.
         c.execute_batch("CREATE TEMP TRIGGER crash BEFORE UPDATE ON user_secrets BEGIN SELECT RAISE(ABORT, 'crash'); END;").unwrap();
         let b = MasterKey::generate();
-        let err = bootstrap(&c, Some(copy(&b)), Some(copy(&a)), no_key, false).err().unwrap();
+        let err = bootstrap(&c, Some(copy(&b)), Some(copy(&a).into()), no_key, false).err().unwrap();
         assert!(err.contains("crash"), "{err}");
         assert!(all_open_with(&c, &cipher_a), "everything is still sealed under the old key");
         assert!(rotations(&c).is_empty(), "no audit event for a rotation that didn't happen");
@@ -927,7 +967,7 @@ mod tests {
         assert_eq!(bootstrap(&c, Some(copy(&b)), None, no_key, false).err().unwrap(), WRONG_KEY);
 
         c.execute_batch("DROP TRIGGER crash").unwrap();
-        let (cipher_b, boot) = bootstrap(&c, Some(copy(&b)), Some(copy(&a)), no_key, false).unwrap();
+        let (cipher_b, boot) = bootstrap(&c, Some(copy(&b)), Some(copy(&a).into()), no_key, false).unwrap();
         assert_eq!(boot.rotated.unwrap().resealed, n);
         assert!(all_open_with(&c, &cipher_b));
         assert_eq!(cipher_b.derive("machine-ca"), cipher_a.derive("machine-ca"));
@@ -940,13 +980,13 @@ mod tests {
         let (cipher_a, _) = bootstrap(&c, Some(copy(&a)), None, no_key, false).unwrap();
         let cipher_a = Arc::new(cipher_a);
         seal_one_of_each(&db, &c, &cipher_a);
-        let err = bootstrap(&c, Some(MasterKey::generate()), Some(MasterKey::generate()), no_key, false).err().unwrap();
+        let err = bootstrap(&c, Some(MasterKey::generate()), Some(MasterKey::generate().into()), no_key, false).err().unwrap();
         assert_eq!(err, WRONG_KEYS);
-        assert_eq!(bootstrap(&c, None, Some(copy(&a)), no_key, false).err().unwrap(), NO_NEW_KEY, "a key is never made during a rotation");
+        assert_eq!(bootstrap(&c, None, Some(copy(&a).into()), no_key, false).err().unwrap(), NO_NEW_KEY, "a key is never made during a rotation");
         assert!(all_open_with(&c, &cipher_a));
         assert!(rotations(&c).is_empty());
         // A wrong previous key with the right current one: nothing to rotate.
-        let (_, boot) = bootstrap(&c, Some(copy(&a)), Some(MasterKey::generate()), no_key, false).unwrap();
+        let (_, boot) = bootstrap(&c, Some(copy(&a)), Some(MasterKey::generate().into()), no_key, false).unwrap();
         assert!(boot.rotated.is_none() && boot.previous_unused);
     }
 
@@ -959,7 +999,7 @@ mod tests {
         let lost = Cipher::new(&MasterKey::generate()).seal(&context("LOST_TOKEN"), b"lost");
         c.execute("INSERT INTO secrets (name, value, created_at, updated_at) VALUES ('LOST_TOKEN', ?, 0, 0)", [&lost]).unwrap();
         let b = MasterKey::generate();
-        let (_, boot) = bootstrap(&c, Some(copy(&b)), Some(copy(&a)), no_key, false).unwrap();
+        let (_, boot) = bootstrap(&c, Some(copy(&b)), Some(copy(&a).into()), no_key, false).unwrap();
         assert_eq!(boot.rotated, Some(Rotation { resealed: n, current: 0, unreadable: 1 }));
         let kept: String = c.query_row("SELECT value FROM secrets WHERE name = 'LOST_TOKEN'", [], |r| r.get(0)).unwrap();
         assert_eq!(kept, lost);
@@ -972,7 +1012,7 @@ mod tests {
         let a = MasterKey::generate();
         let (cipher_a, _) = bootstrap(&c, Some(copy(&a)), None, no_key, false).unwrap();
         seal_one_of_each(&db, &c, &Arc::new(cipher_a));
-        bootstrap(&c, Some(MasterKey::generate()), Some(copy(&a)), no_key, false).unwrap();
+        bootstrap(&c, Some(MasterKey::generate()), Some(copy(&a).into()), no_key, false).unwrap();
         // The rotated key is lost: a new one starts over, with new derived keys.
         let fresh_key = MasterKey::generate();
         let (cipher, boot) = bootstrap(&c, Some(copy(&fresh_key)), None, no_key, true).unwrap();

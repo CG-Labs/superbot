@@ -438,7 +438,8 @@ pub fn init(db_path: &Path) -> Result<Report, String> {
     let (previous, previous_source) = match key::locate_previous(data_dir)? {
         Some((k, source)) => {
             k.register_redactions();
-            (Some(k), Some(source))
+            let new_derived_keys = std::env::var("SUPERBOT_ROTATE_DERIVED_KEYS").is_ok_and(|v| v == "1");
+            (Some(sealed::Previous { key: k, new_derived_keys }), Some(source))
         }
         None => (None, None),
     };
