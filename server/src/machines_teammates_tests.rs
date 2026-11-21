@@ -598,12 +598,16 @@ async fn as_root_a_teammates_login_is_theirs_alone() {
     };
     userdel(USER);
     let state = crate::db::temp_path("agent-root-tl");
-    let w = world_with(|e| e.with_logins(), |_| {}, |c| agent::Config {
-        state_dir: state.clone(),
-        bot_user: USER.into(),
-        allow_own_user: false,
-        teammates: state.join("teammates"),
-        ..c
+    // The stand-in Claude in the tools folder too: teammates can't open the Bots' home.
+    let w = world_claude(|e| e.with_logins(), |_| {}, LOGIN_CLAUDE, |c| {
+        install(&c.tools.join("bin"), "claude", LOGIN_CLAUDE);
+        agent::Config {
+            state_dir: state.clone(),
+            bot_user: USER.into(),
+            allow_own_user: false,
+            teammates: state.join("teammates"),
+            ..c
+        }
     })
     .await;
     let (cy_id, cy) = user_with(w.env.port, &w.env.admin, "cy@example.com", "member").await;
@@ -617,16 +621,25 @@ async fn as_root_a_teammates_login_is_theirs_alone() {
     let (cy_ids, _) = runas::lookup(&cy_user).expect("the agent made Cy's user");
     let (bea_home, cy_home) = (w.m.agent.teammates.home_of(&w.bea_id), w.m.agent.teammates.home_of(&cy_id));
 
-    // Bea's login as a login there saves it: hers, in her own home.
+    // Bea logs in through botd: the login runs as her user, in a terminal she owns, and
+    // what it saves is hers, in her own home.
+    let base = format!("/api/machine/teammate/{}", w.ada);
+    let mut login = crate::machines_logins_tests::Login::open(&w.env, &format!("{base}/harness-login"), &w.bea, "claude").await;
+    let (started, _) = login.until("started").await;
+    let id = started["loginId"].as_str().unwrap().to_string();
+    login.until_shown("Paste the code here").await;
+    let (code, body) = call(w.env.port, "POST", &format!("{base}/harness-login/{id}/input"), &w.bea, r#"{"text":"bea"}"#).await;
+    assert_eq!(code, 204, "{body}");
+    let (exit, out) = login.until("exit").await;
+    assert_eq!(exit["loggedIn"], true, "{exit} {out}");
     let creds = ".claude/.credentials.json";
     let file = bea_home.join(creds);
-    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-    std::fs::write(&file, "bea's login").unwrap();
     for p in [file.parent().unwrap(), file.as_path()] {
-        std::os::unix::fs::chown(p, Some(bea_ids.uid), Some(bea_ids.gid)).unwrap();
+        let m = std::fs::symlink_metadata(p).unwrap();
+        assert_eq!((m.uid(), m.gid()), (bea_ids.uid, bea_ids.gid), "{} is Bea's", p.display());
     }
-    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let base = format!("/api/machine/teammate/{}", w.ada);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), r#"{"token":"bea-saved"}"#);
+    assert_eq!(std::fs::read_to_string(&w.secret).unwrap(), "ada's login", "not in the Bots' home");
     let state_of = async |auth: &str| {
         let (code, body) = call(w.env.port, "GET", &format!("{base}/harness-logins"), auth, "").await;
         assert_eq!(code, 200, "{body}");
@@ -638,7 +651,7 @@ async fn as_root_a_teammates_login_is_theirs_alone() {
     // Neither Cy's user nor the Bots' can read it.
     for u in [cy_user.as_str(), USER] {
         let peek = std::process::Command::new("runuser").args(["-u", u, "--", "cat", &file.display().to_string()]).output().unwrap();
-        assert!(!peek.status.success() && !String::from_utf8_lossy(&peek.stdout).contains("bea's"), "{u} read Bea's login");
+        assert!(!peek.status.success() && !String::from_utf8_lossy(&peek.stdout).contains("bea-saved"), "{u} read Bea's login");
     }
 
     // A link Cy plants to it isn't a login of his, and logging out removes only the link.
@@ -651,7 +664,7 @@ async fn as_root_a_teammates_login_is_theirs_alone() {
     let (code, _) = call(w.env.port, "DELETE", &format!("{base}/harness-logins/claude"), &cy, "").await;
     assert_eq!(code, 200);
     assert!(std::fs::symlink_metadata(&link).is_err(), "his link is gone");
-    assert_eq!(std::fs::read_to_string(&file).unwrap(), "bea's login", "Bea's login stays");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), r#"{"token":"bea-saved"}"#, "Bea's login stays");
     assert_eq!(state_of(&w.bea).await, "logged_in");
 
     userdel(&bea_user);
