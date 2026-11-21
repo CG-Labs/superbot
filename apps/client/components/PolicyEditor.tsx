@@ -20,6 +20,8 @@ interface Props {
 
 type Inherit = "inherit";
 const MODE_LABELS: Record<PolicyMode, string> = { ask: "Ask", bypass: "Bypass" };
+const onOff = (on: boolean) => (on ? "On" : "Off");
+const HARNESS_NAMES: Record<string, string> = { claude: "Claude Code", codex: "Codex", pi: "Pi", hermes: "Hermes Agent" };
 
 function message(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -132,6 +134,16 @@ export function PolicyEditor({ api, bot, canEdit, onBack, confirm = confirmAsync
   const setClass = (cls: string, label: string, a: PolicyAction | Inherit) =>
     patch(`class:${cls}`, a === "inherit" ? `${label}: following the default.` : `${label}: ${ACTION_LABELS[a]}.`, { classes: { [cls]: a === "inherit" ? null : a } });
 
+  const setSandbox = async (v: "on" | "off" | Inherit) => {
+    const next = v === "inherit" ? g.sandbox : v === "on";
+    if (!next && view.policy.sandbox) {
+      const who = bot ? bot.name : "every Bot";
+      const ok = await confirm("Turn the sandbox off?", `Let ${who}'s commands write anywhere its harness can, outside its workspace?`, "Turn off");
+      if (!ok) return;
+    }
+    await patch("sandbox", v === "inherit" ? "Following the default sandbox." : `Sandbox ${v}.`, { sandbox: v === "inherit" ? null : v === "on" });
+  };
+
   const parsedTimeout = parseTimeout(timeout);
   // A Bot following the default may still save the same number, to keep it when the default changes.
   const timeoutChanged = "minutes" in parsedTimeout && (parsedTimeout.minutes !== view.policy.timeoutMinutes || (!!bot && o?.timeoutMinutes === undefined));
@@ -175,6 +187,14 @@ export function PolicyEditor({ api, bot, canEdit, onBack, confirm = confirmAsync
     { value: "ask" as const, label: "Ask" },
     { value: "bypass" as const, label: "Bypass" },
   ];
+  const sandboxOptions = [
+    ...(bot ? [{ value: "inherit" as const, label: `Default (${onOff(g.sandbox)})` }] : []),
+    { value: "on" as const, label: "On" },
+    { value: "off" as const, label: "Off" },
+  ];
+  const sandboxValue = bot && o?.sandbox === undefined ? "inherit" : view.policy.sandbox ? "on" : "off";
+  const support = view.sandbox;
+  const cantStart = support ? support.harnesses.filter((h) => !support.available.includes(h)).map((h) => HARNESS_NAMES[h] ?? h) : [];
   const rules = sortRules(view.rules);
 
   return (
@@ -202,6 +222,21 @@ export function PolicyEditor({ api, bot, canEdit, onBack, confirm = confirmAsync
           <Text style={styles.cardTitle}>Mode</Text>
           <Chips options={modeOptions} value={bot && o?.mode === undefined ? "inherit" : view.policy.mode} onChange={(m) => void setMode(m)} disabled={locked} />
           {view.policy.mode === "bypass" ? <Text style={styles.warn}>Bypass: Bots run everything without asking, and the actions below don't apply. Dev only.</Text> : null}
+        </View>
+
+        <View style={styles.card} accessibilityLabel="Sandbox">
+          <Text style={styles.cardTitle}>Sandbox</Text>
+          <Text style={styles.dim}>
+            The harness's own sandbox, on top of approvals: commands write only in the workspace, temp folders, the Bot's memory, and package caches. It
+            holds in Bypass too.
+            {support ? ` ${support.harnesses.map((h) => HARNESS_NAMES[h] ?? h).join(" and ")} have one; other harnesses run without.` : ""}
+          </Text>
+          <Chips options={sandboxOptions} value={sandboxValue} onChange={(v) => void setSandbox(v)} disabled={locked} />
+          {view.policy.sandbox && cantStart.length ? (
+            <Text style={styles.warn}>
+              {cantStart.join(" and ")}'s sandbox can't start on this server, so those runs here go without. Install bubblewrap and socat (see docs/backend.md).
+            </Text>
+          ) : null}
         </View>
 
         <View style={styles.card}>

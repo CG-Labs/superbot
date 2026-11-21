@@ -249,6 +249,7 @@ mod tests {
             state_dir: dir,
             guard: guard.then(|| Guard { command: "'/opt/bin/botctl' hook hermes".into(), timeout_secs: 300, wait: Duration::from_secs(240) }),
             run_as: None,
+            sandbox: None,
         }
     }
 

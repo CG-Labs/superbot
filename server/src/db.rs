@@ -1109,7 +1109,7 @@ fn audit_row(r: &Row) -> rusqlite::Result<AuditEvent> {
 
 /// Schema changes after the first release, in order. `PRAGMA user_version` is how many ran.
 /// Each gets `fresh`: true when this database was just created.
-const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 23] = [
+const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 24] = [
     migrate_approvals,
     migrate_audit_events,
     migrate_users,
@@ -1133,7 +1133,29 @@ const MIGRATIONS: [fn(&Connection, bool) -> rusqlite::Result<()>; 23] = [
     migrate_approval_runs,
     migrate_teammate_cleanups,
     migrate_bot_prompts,
+    migrate_sandbox,
 ];
+
+/// Harness sandboxes (ADR 0055). New installs have them on (`Policy::new`); an install
+/// upgrading keeps running without, as before, until an admin turns them on. Bots'
+/// own overrides have no `sandbox`, so they follow the global setting.
+fn migrate_sandbox(c: &Connection, fresh: bool) -> rusqlite::Result<()> {
+    if fresh {
+        return Ok(());
+    }
+    let saved: Option<String> = c.query_row("SELECT value FROM settings WHERE key = 'policy'", [], |r| r.get(0)).optional()?;
+    let Some(mut policy) = saved.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).filter(serde_json::Value::is_object) else {
+        return Ok(());
+    };
+    policy["sandbox"] = false.into();
+    c.execute("UPDATE settings SET value = ? WHERE key = 'policy'", [policy.to_string()])?;
+    let details = serde_json::json!({ "sandbox": false, "reason": "existing install keeps harness sandboxes off" });
+    c.execute(
+        "INSERT INTO audit_events (at, actor_kind, actor_id, action, target_type, target_id, outcome, details) VALUES (?, 'system', 'migration', 'policy.sandbox_initialized', 'policy', 'global', 'success', ?)",
+        params![now(), details.to_string()],
+    )?;
+    Ok(())
+}
 
 /// Suggested prompts per Bot (ADR 0054), as a JSON array. NULL: the client's defaults.
 fn migrate_bot_prompts(c: &Connection, _fresh: bool) -> rusqlite::Result<()> {
@@ -4389,12 +4411,36 @@ mod tests {
         drop(c);
         let db = Db::open(&path).unwrap();
         assert_eq!(db.global_policy().mode, Mode::Bypass);
+        assert!(!db.global_policy().sandbox, "an upgrade keeps harness sandboxes off");
         assert_eq!(db.bots().len(), 1);
         // Reopening doesn't re-run the migrations.
         drop(db);
         let db = Db::open(&path).unwrap();
         let actions: Vec<String> = all_events(&db).into_iter().map(|e| e.action).collect();
-        assert_eq!(actions, ["audit.schema_upgraded", "bot.acl_initialized", "policy.initialized"]);
+        assert_eq!(actions, ["policy.sandbox_initialized", "audit.schema_upgraded", "bot.acl_initialized", "policy.initialized"]);
+    }
+
+    #[test]
+    fn an_install_from_before_sandboxes_keeps_them_off() {
+        let path = temp_path("sandbox-upgrade").join("app.sqlite");
+        let db = Db::open(&path).unwrap();
+        assert!(db.global_policy().sandbox, "a fresh install has them on");
+        let bot = db.create_bot("Ada", "#fff", "waddle", "codex", None, false);
+        db.set_bot_override(&bot.id, Some(&Override { timeout_minutes: Some(3), ..Default::default() }));
+        // As saved before ADR 0055: no `sandbox` in the policy.
+        let mut p = serde_json::to_value(db.global_policy()).unwrap();
+        p.as_object_mut().unwrap().remove("sandbox");
+        db.c().execute("UPDATE settings SET value = ? WHERE key = 'policy'", [p.to_string()]).unwrap();
+        db.c().execute_batch(&format!("PRAGMA user_version = {};", MIGRATIONS.len() - 1)).unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert!(!db.global_policy().sandbox);
+        assert_eq!((db.effective_policy(&bot.id).sandbox, db.effective_policy(&bot.id).timeout_minutes), (false, 3), "its Bots follow it");
+        let e = all_events(&db).into_iter().find(|e| e.action == "policy.sandbox_initialized").unwrap();
+        assert_eq!((e.actor_kind.as_str(), e.target_id.as_deref(), e.details["sandbox"].as_bool()), ("system", Some("global"), Some(false)));
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(all_events(&db).iter().filter(|e| e.action == "policy.sandbox_initialized").count(), 1, "once");
     }
 
     macro_rules! undo_audit_actors {
@@ -4444,7 +4490,8 @@ mod tests {
         let v: i64 = db.c().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, MIGRATIONS.len() as i64);
         let rows = all_events(&db);
-        let (upgraded, old) = (&rows[0], rows.iter().find(|e| e.action == "bot.created").unwrap());
+        let upgraded = rows.iter().find(|e| e.action == "audit.schema_upgraded").unwrap();
+        let old = rows.iter().find(|e| e.action == "bot.created").unwrap();
         assert_eq!((upgraded.action.as_str(), upgraded.actor_id.as_deref()), ("audit.schema_upgraded", Some("migration")));
         assert_eq!(upgraded.details["added"].as_array().map(Vec::len), Some(AUDIT_ACTOR_COLUMNS.len()));
         assert_eq!((old.actor_id.as_deref(), old.actor_name.as_deref()), (Some("operator"), Some("Owner")), "old rows stay as written");
@@ -4513,7 +4560,7 @@ mod tests {
         let db = Db::open(&path).unwrap();
         let b = db.bot(&old.id).unwrap();
         assert_eq!((b.owner_id.as_str(), b.visibility), ("operator", Visibility::Shared));
-        let e = &all_events(&db)[1];
+        let e = all_events(&db).into_iter().find(|e| e.action == "bot.acl_initialized").unwrap();
         assert_eq!((e.action.as_str(), e.actor_id.as_deref(), e.details["bots"].as_i64()), ("bot.acl_initialized", Some("migration"), Some(1)));
 
         // Grants: one per user and Bot, gone with the Bot, and the schema refuses unknown words.
@@ -4638,6 +4685,7 @@ mod tests {
                 ("policy.denied", "system", None, None, None, "denied"),
                 ("rule.added", "user", Some("operator"), Some("rule"), Some("r1"), "success"),
                 ("audit.schema_upgraded", "system", Some("migration"), Some("audit"), Some("actors"), "success"),
+                ("policy.sandbox_initialized", "system", Some("migration"), Some("policy"), Some("global"), "success"),
             ]
         );
         assert_eq!(rows[1].details, json!({ "after": 1 }));

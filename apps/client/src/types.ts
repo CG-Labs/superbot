@@ -168,6 +168,8 @@ export interface Policy {
   mode: PolicyMode;
   classes: Record<string, PolicyAction>;
   timeoutMinutes: number;
+  /** The harness's own sandbox (ADR 0055), on top of approvals. */
+  sandbox: boolean;
 }
 
 /** A Bot's own settings on top of the global policy; missing fields follow it. */
@@ -175,6 +177,7 @@ export interface PolicyOverride {
   mode?: PolicyMode;
   classes?: Record<string, PolicyAction>;
   timeoutMinutes?: number;
+  sandbox?: boolean;
 }
 
 /** A change to a policy. On a Bot, `null` puts that field back to following the global policy. */
@@ -182,6 +185,13 @@ export interface PolicyPatch {
   mode?: PolicyMode | null;
   classes?: Record<string, PolicyAction | null>;
   timeoutMinutes?: number | null;
+  sandbox?: boolean | null;
+}
+
+/** Which harnesses have a sandbox of their own, and which of those can start it on the server. */
+export interface SandboxSupport {
+  harnesses: string[];
+  available: string[];
 }
 
 export interface PolicyClass {
@@ -218,6 +228,8 @@ export interface PolicyView {
   classes: PolicyClass[];
   rules: PolicyRule[];
   override?: PolicyOverride | null;
+  /** Missing from an older server. */
+  sandbox?: SandboxSupport;
 }
 
 export type ApprovalStatus = "pending" | "approved" | "denied" | "expired" | "cancelled";

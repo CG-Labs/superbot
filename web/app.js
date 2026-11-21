@@ -457,6 +457,7 @@ for (const id of ["au-action", "au-person"]) {
 // Settings
 
 let policyMode = "ask";
+let policySandbox = true;
 
 async function loadSettings() {
   await queuePolicy(loadPolicy);
@@ -534,6 +535,7 @@ $("license-box").addEventListener("click", async (e) => {
 // and rules for all Bots. Each Bot's own settings and rules are edited in the app.
 
 const ACTIONS = { allow: "Allow", ask: "Ask", deny: "Deny" };
+const HARNESS_NAMES = { claude: "Claude Code", codex: "Codex", pi: "Pi", hermes: "Hermes Agent" };
 const TOOLS = { "*": "Any tool", shell: "Shell", file: "Files", web: "Web", mcp: "MCP", other: "Other tools" };
 
 // Saves run one at a time, so an older answer never replaces a newer one on screen.
@@ -546,6 +548,8 @@ let shownTimeout = null;
 function showPolicy(policy, { timeout = false } = {}) {
   policyMode = policy.mode;
   $("policy-mode").value = policyMode;
+  policySandbox = policy.sandbox !== false;
+  $("policy-sandbox").value = policySandbox ? "on" : "off";
   const box = $("policy-timeout");
   if (timeout || box.value === "" || box.value === String(shownTimeout)) box.value = policy.timeoutMinutes;
   shownTimeout = policy.timeoutMinutes;
@@ -565,6 +569,11 @@ async function loadPolicy() {
       <td><select data-class="${esc(c.id)}" aria-label="${esc(c.label)}">${Object.entries(ACTIONS).map(([a, l]) => `<option value="${a}">${l}</option>`).join("")}</select></td>
     </tr>`).join("");
   showPolicy(v.policy);
+  const sb = v.sandbox;
+  $("policy-sandbox-hint").textContent = "Codex and Claude Code run commands in their own sandbox: they write only in the workspace, temp folders, the Bot's memory, and package caches. It holds in Bypass too."
+    + (sb && sb.harnesses.some((h) => !sb.available.includes(h))
+      ? ` ${sb.harnesses.filter((h) => !sb.available.includes(h)).map((h) => HARNESS_NAMES[h] || h).join(" and ")}'s sandbox can't start on this server, so those runs go without: install bubblewrap and socat.`
+      : "");
   const rules = v.rules || [];
   $("rules-empty").textContent = "No rules for all Bots.";
   $("rules-empty").hidden = rules.length > 0;
@@ -647,6 +656,15 @@ $("policy-mode").addEventListener("change", async (e) => {
       e.target.value = policyMode;
     }
   });
+});
+
+$("policy-sandbox").addEventListener("change", (e) => {
+  const on = e.target.value === "on";
+  if (!on && !confirm("Turn the harness sandbox off for every Bot? Their commands could write anywhere the harness can.")) {
+    e.target.value = policySandbox ? "on" : "off";
+    return;
+  }
+  patchPolicy({ sandbox: on }, `Sandbox ${on ? "on" : "off"} for all Bots.`);
 });
 
 async function loadSignIn() {

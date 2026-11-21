@@ -22,7 +22,8 @@ const CLASSES = [
 
 /** A fake botd: a global policy, per-Bot overrides where null inherits, and rules. */
 function fakeApi() {
-  let global: Policy = { mode: "ask", classes: { shell_destructive: "ask", git_push: "ask" }, timeoutMinutes: 10 };
+  let global: Policy = { mode: "ask", classes: { shell_destructive: "ask", git_push: "ask" }, timeoutMinutes: 10, sandbox: true };
+  const sandbox = { harnesses: ["claude", "codex"], available: ["claude", "codex"] };
   const overrides = new Map<string, PolicyOverride>();
   let rules: PolicyRule[] = [{ id: "g1", botId: null, action: "deny", tool: "shell", pattern: "rm -rf /*", note: "never", at: 1 }];
   let n = 0;
@@ -30,23 +31,31 @@ function fakeApi() {
     mode: o?.mode ?? global.mode,
     classes: { ...global.classes, ...o?.classes },
     timeoutMinutes: o?.timeoutMinutes ?? global.timeoutMinutes,
+    sandbox: o?.sandbox ?? global.sandbox,
   });
   const botView = (id: string): PolicyView => ({
     policy: effective(overrides.get(id)),
     override: overrides.get(id) ?? null,
     classes: CLASSES,
     rules: rules.filter((r) => r.botId === null || r.botId === id),
+    sandbox,
   });
   return {
-    policyView: jest.fn(async (botId?: string) => (botId ? botView(botId) : { policy: global, classes: CLASSES, rules: rules.filter((r) => r.botId === null) })),
+    policyView: jest.fn(async (botId?: string) => (botId ? botView(botId) : { policy: global, classes: CLASSES, rules: rules.filter((r) => r.botId === null), sandbox })),
     patchGlobalPolicy: jest.fn(async (p: PolicyPatch) => {
-      global = { mode: p.mode ?? global.mode, classes: { ...global.classes, ...(p.classes as Record<string, PolicyAction>) }, timeoutMinutes: p.timeoutMinutes ?? global.timeoutMinutes };
+      global = {
+        mode: p.mode ?? global.mode,
+        classes: { ...global.classes, ...(p.classes as Record<string, PolicyAction>) },
+        timeoutMinutes: p.timeoutMinutes ?? global.timeoutMinutes,
+        sandbox: p.sandbox ?? global.sandbox,
+      };
       return global;
     }),
     patchBotPolicy: jest.fn(async (id: string, p: PolicyPatch) => {
       const o: PolicyOverride = { ...overrides.get(id), classes: { ...overrides.get(id)?.classes } };
       if (p.mode !== undefined) o.mode = p.mode ?? undefined;
       if (p.timeoutMinutes !== undefined) o.timeoutMinutes = p.timeoutMinutes ?? undefined;
+      if (p.sandbox !== undefined) o.sandbox = p.sandbox ?? undefined;
       for (const [k, a] of Object.entries(p.classes ?? {})) {
         if (a === null) delete o.classes![k];
         else o.classes![k] = a;
@@ -54,6 +63,7 @@ function fakeApi() {
       if (!Object.keys(o.classes!).length) delete o.classes;
       if (o.mode === undefined) delete o.mode;
       if (o.timeoutMinutes === undefined) delete o.timeoutMinutes;
+      if (o.sandbox === undefined) delete o.sandbox;
       if (Object.keys(o).length) overrides.set(id, o);
       else overrides.delete(id);
       return botView(id);
@@ -120,6 +130,54 @@ describe("PolicyEditor (ADR 0049)", () => {
     await user.press(await screen.findByRole("radio", { name: "Bypass" }));
     expect(no).toHaveBeenCalledWith("Turn approvals off?", expect.stringContaining("every Bot"), "Bypass");
     expect(api.patchGlobalPolicy).not.toHaveBeenCalled();
+  });
+
+  it("asks before turning the sandbox off for all Bots, and turns it back on", async () => {
+    const api = fakeApi();
+    const no = jest.fn(async () => false);
+    const user = userEvent.setup();
+    const { rerender } = await render(<PolicyEditor api={api} canEdit onBack={jest.fn()} confirm={no} />);
+    const card = await screen.findByLabelText("Sandbox");
+    expect(within(card).getByText(/Claude Code and Codex have one/)).toBeOnTheScreen();
+    expect(within(card).queryByText(/can't start/)).toBeNull();
+    expect(within(card).getByRole("radio", { name: "On" })).toBeChecked();
+    await user.press(within(card).getByRole("radio", { name: "Off" }));
+    expect(no).toHaveBeenCalledWith("Turn the sandbox off?", expect.stringContaining("every Bot"), "Turn off");
+    expect(api.patchGlobalPolicy).not.toHaveBeenCalled();
+
+    await rerender(<PolicyEditor api={api} canEdit onBack={jest.fn()} confirm={yes} />);
+    await user.press(within(screen.getByLabelText("Sandbox")).getByRole("radio", { name: "Off" }));
+    expect(api.patchGlobalPolicy).toHaveBeenLastCalledWith({ sandbox: false });
+    expect(await screen.findByText("Sandbox off.")).toBeOnTheScreen();
+    yes.mockClear();
+    await user.press(within(screen.getByLabelText("Sandbox")).getByRole("radio", { name: "On" }));
+    expect(yes).not.toHaveBeenCalled();
+    expect(api.patchGlobalPolicy).toHaveBeenLastCalledWith({ sandbox: true });
+    expect(await screen.findByText("Sandbox on.")).toBeOnTheScreen();
+  });
+
+  it("sets a Bot's sandbox and puts it back to the default", async () => {
+    const api = fakeApi();
+    const user = userEvent.setup();
+    await render(<PolicyEditor api={api} bot={{ id: "b1", name: "Scout" }} canEdit onBack={jest.fn()} confirm={yes} />);
+    const card = await screen.findByLabelText("Sandbox");
+    expect(within(card).getByRole("radio", { name: "Default (On)" })).toBeChecked();
+    await user.press(within(card).getByRole("radio", { name: "Off" }));
+    expect(yes).toHaveBeenCalledWith("Turn the sandbox off?", expect.stringContaining("Scout"), "Turn off");
+    expect(api.patchBotPolicy).toHaveBeenLastCalledWith("b1", { sandbox: false });
+    expect(await screen.findByText("Sandbox off.")).toBeOnTheScreen();
+    expect(within(screen.getByLabelText("Sandbox")).getByRole("radio", { name: "Off" })).toBeChecked();
+    await user.press(within(screen.getByLabelText("Sandbox")).getByRole("radio", { name: "Default (On)" }));
+    expect(api.patchBotPolicy).toHaveBeenLastCalledWith("b1", { sandbox: null });
+    expect(await screen.findByText("Following the default sandbox.")).toBeOnTheScreen();
+  });
+
+  it("warns when sandboxes can't start on the server", async () => {
+    const api = fakeApi();
+    const view = await api.policyView();
+    api.policyView.mockResolvedValue({ ...view, sandbox: { harnesses: ["claude", "codex"], available: ["codex"] } });
+    await render(<PolicyEditor api={api} canEdit onBack={jest.fn()} confirm={yes} />);
+    expect(await screen.findByText(/^Claude Code's sandbox can't start on this server/)).toBeOnTheScreen();
   });
 
   it("puts a Bot's class and timeout back to the default one at a time", async () => {

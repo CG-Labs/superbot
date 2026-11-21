@@ -131,6 +131,26 @@ botctl approvals | botctl approve <id> [--run | --remember] | botctl deny <id>
 
 Limits: the parser sees commands and the scripts they run, not what compiled programs do inside, and its scan of languages other than shell is a heuristic, so this catches mistakes and prompt injection, not a determined attacker. Bots run as the same OS user as `botd`. See [ADR 0007](adr/0007-approvals.md).
 
+### Harness sandboxes
+
+On top of approvals, the policy's `sandbox` turns on the harness's own sandbox ([ADR 0055](adr/0055-harness-sandbox-defaults.md)). It is separate from the mode, so it holds in `bypass` too.
+
+- **Codex** runs `codex exec` in `workspace-write` with the network on: commands write only in the workspace, `/tmp`, and the folders below.
+- **Claude Code** gets its Bash sandbox: the same writes, its proxy for the network (any host, plus botd's API for `botctl`), and no way out of the sandbox for a command. Its file tools and hooks run outside it, as in Claude Code itself.
+- **Pi** and **Hermes Agent** have no sandbox of their own to turn on, so their runs are unchanged.
+- **Also writable**: the Bot's memory and facts folders, and package caches under HOME (`~/.cache`, `~/.npm`, `~/.cargo/registry` and `git`, `~/go/pkg/mod`, Bun, Yarn, Gradle, Maven), made as the run's user when missing so a first build works. With per-user accounts, also the account's own `TMPDIR` (`~/.tmp`). HOME itself, harness logins, and `~/.local` stay read-only. With Codex, a `.git` at the workspace's top is read-only too, so commit in a repo folder inside it.
+- **Needs** unprivileged user namespaces, `bubblewrap`, and (Claude Code) `socat` on Linux; macOS has what it needs. The installer adds both packages. botd checks at start, per harness (Codex needs user namespaces; Claude Code also a working `bwrap` and `socat`): a harness whose sandbox can't start runs without it on the server, botd says so at start, the policy editors warn, and `harness.invoked` records `sandbox: "unavailable"`. Ubuntu 24.04 limits user namespaces with AppArmor; allow them for `bwrap` to use sandboxes there. The Docker image blocks them, so Compose runs go without.
+- **Machines** check for themselves and say so with each run; runs there go without when their harness's sandbox can't start. An agent from before this check gets the sandbox settings anyway, recorded as `unverified`. If Codex's sandbox fails anyway (an agent from before this check), the run says to install bubblewrap or turn the sandbox off for that Bot.
+- **Audit**: changes are `policy.updated`, like the rest of the policy. Each `harness.invoked` says `sandbox`: `on`, `off`, `unsupported` (Pi, Hermes), `unavailable`, or `unverified`.
+
+Fresh installs start with it on. Installs from before keep it off (recorded as `policy.sandbox_initialized`) until you opt in:
+
+```sh
+botctl policy set global sandbox=on      # every Bot
+botctl policy set <bot-id> sandbox=off   # one Bot that needs to write elsewhere
+botctl policy set <bot-id> sandbox=inherit
+```
+
 ## Secrets
 
 API keys and tokens for Bots come from two places, first match wins:

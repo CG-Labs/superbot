@@ -2,11 +2,34 @@
 //! Limitation: Codex fixes its instructions when a session starts, so later memory
 //! changes reach it only through its memory file, not the system prompt.
 //! Approvals: an inline PreToolUse hook. Hosted tools such as web search skip hooks.
+//! Sandbox (ADR 0055): `workspace-write` with the network on, else none at all.
 
 use super::{output, short, str_of, Adapter, AgentEvent, ModelOption, RunInput, Usage};
 use serde_json::Value;
 
-pub struct Codex;
+#[derive(Default)]
+pub struct Codex {
+    /// This run asked for the sandbox, so a bubblewrap error is likely Codex's own.
+    sandboxed: bool,
+    /// Said once per run that the sandbox can't start.
+    sandbox_failed: bool,
+}
+
+/// `-c` overrides for the `workspace-write` sandbox. `codex exec resume` has no
+/// `--sandbox`, so both take it as config. Never asking (`approval_policy`): what the
+/// sandbox blocks fails, and SuperBot's hook is the approval gate.
+fn sandbox_config(s: &super::Sandbox) -> Vec<String> {
+    let roots: Vec<Value> = s.writable.iter().map(|p| Value::String(p.display().to_string())).collect();
+    let mut c = vec![
+        "sandbox_mode=\"workspace-write\"".to_string(),
+        "approval_policy=\"never\"".into(),
+        "sandbox_workspace_write.network_access=true".into(),
+    ];
+    if !roots.is_empty() {
+        c.push(format!("sandbox_workspace_write.writable_roots={}", Value::Array(roots)));
+    }
+    c.into_iter().flat_map(|v| ["-c".to_string(), v]).collect()
+}
 
 impl Adapter for Codex {
     fn bin(&self) -> &'static str {
@@ -18,8 +41,13 @@ impl Adapter for Codex {
         if input.session_id.is_some() {
             a.push("resume".into());
         }
-        a.extend(["--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-c"].map(String::from));
-        a.push(format!("developer_instructions={}", Value::String(input.system.clone())));
+        a.extend(["--json", "--skip-git-repo-check"].map(String::from));
+        self.sandboxed = input.sandbox.is_some();
+        match &input.sandbox {
+            Some(s) => a.extend(sandbox_config(s)),
+            None => a.push("--dangerously-bypass-approvals-and-sandbox".into()),
+        }
+        a.extend(["-c".into(), format!("developer_instructions={}", Value::String(input.system.clone()))]);
         if let Some(m) = &input.model {
             a.extend(["-m".into(), m.clone()]);
         }
@@ -52,6 +80,17 @@ impl Adapter for Codex {
             "item.completed" if kind == "agent_message" && !str_of(item, "text").trim().is_empty() => {
                 out.push(AgentEvent::Text(str_of(item, "text").into()))
             }
+            // A note, not an error: a command's output may only quote bubblewrap, and the
+            // Bot may still finish the task.
+            "item.completed" if kind == "command_execution" && self.sandboxed && !self.sandbox_failed => {
+                if let Some(why) = sandbox_failure(str_of(item, "aggregated_output")) {
+                    self.sandbox_failed = true;
+                    out.push(AgentEvent::Text(format!(
+                        "Codex's sandbox can't start on this computer ({why}), so my commands fail. Install bubblewrap (on Ubuntu 24.04, also its AppArmor profile), \
+                         or turn the sandbox off for me in my approval settings."
+                    )));
+                }
+            }
             "item.started" if kind == "command_execution" => {
                 out.push(AgentEvent::Tool { name: "shell".into(), detail: unwrap(str_of(item, "command")) })
             }
@@ -83,6 +122,10 @@ impl Adapter for Codex {
     /// From `codex debug models`: the models this login can use, and their efforts.
     fn shell_tool(&self) -> &'static str {
         "shell"
+    }
+
+    fn has_sandbox(&self) -> bool {
+        true
     }
 
     fn login_args(&self) -> Option<&'static [&'static str]> {
@@ -120,6 +163,13 @@ impl Adapter for Codex {
     }
 }
 
+/// bubblewrap's own error when it can't make the sandbox: no user namespaces (a
+/// container, Ubuntu's AppArmor restriction), or no network namespace.
+fn sandbox_failure(output: &str) -> Option<&str> {
+    const SIGNS: [&str; 5] = ["namespace", "uid map", "setting up uid", "loopback", "No permissions to create"];
+    output.lines().map(str::trim).find(|l| l.starts_with("bwrap:") && SIGNS.iter().any(|s| l.contains(s)))
+}
+
 /// "/bin/bash -lc 'echo hi'" -> "echo hi"
 fn unwrap(cmd: &str) -> String {
     let inner = cmd
@@ -133,17 +183,34 @@ fn unwrap(cmd: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn tokens_come_from_the_finished_turn() {
         let mut out = Vec::new();
         let line = r#"{"type":"turn.completed","usage":{"input_tokens":24763,"cached_input_tokens":24448,"cache_write_input_tokens":0,"output_tokens":122,"reasoning_output_tokens":64}}"#;
-        Codex.on_event(&serde_json::from_str(line).unwrap(), &mut out);
+        Codex::default().on_event(&serde_json::from_str(line).unwrap(), &mut out);
         let [AgentEvent::Usage(u)] = out.as_slice() else { panic!("one usage event") };
         assert_eq!((u.model.as_deref(), u.input, u.cache_read, u.output, u.total()), (None, 315, 24448, 122, 24885));
         out.clear();
-        Codex.on_event(&serde_json::from_str(r#"{"type":"turn.completed","usage":{}}"#).unwrap(), &mut out);
-        Codex.on_event(&serde_json::from_str(r#"{"type":"turn.completed"}"#).unwrap(), &mut out);
+        Codex::default().on_event(&serde_json::from_str(r#"{"type":"turn.completed","usage":{}}"#).unwrap(), &mut out);
+        Codex::default().on_event(&serde_json::from_str(r#"{"type":"turn.completed"}"#).unwrap(), &mut out);
         assert!(out.is_empty(), "no counts: unknown");
+    }
+
+    #[test]
+    fn a_sandbox_that_cant_start_is_said_once() {
+        let mut out = Vec::new();
+        let done = |o: &str| json!({ "type": "item.completed", "item": { "type": "command_execution", "aggregated_output": o } });
+        let failed = done("bwrap: No permissions to create new namespace, likely because the kernel does not allow non-privileged user namespaces.\n");
+        Codex::default().on_event(&failed, &mut out);
+        assert!(out.is_empty(), "without the sandbox it's only a command's output");
+        let mut c = Codex { sandboxed: true, ..Default::default() };
+        c.on_event(&done("total 0\nbwrap is a fine word\n"), &mut out);
+        assert!(out.is_empty());
+        c.on_event(&failed, &mut out);
+        c.on_event(&done("bwrap: setting up uid map: Permission denied\n"), &mut out);
+        let [AgentEvent::Text(e)] = out.as_slice() else { panic!("one note, not an error that fails the task, got {}", out.len()) };
+        assert!(e.contains("bubblewrap") && e.contains("No permissions to create new namespace"), "{e}");
     }
 }

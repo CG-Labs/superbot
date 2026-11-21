@@ -52,14 +52,20 @@ pub struct Policy {
     pub classes: BTreeMap<String, Action>,
     /// Unanswered approvals are denied after this long.
     pub timeout_minutes: u32,
+    /// Turn on the harness's own sandbox where it has one (ADR 0055). Separate from
+    /// `mode`: it holds in bypass too. A policy saved before it existed has it off.
+    #[serde(default)]
+    pub sandbox: bool,
 }
 
 impl Policy {
+    /// A new install's policy: the sandbox on.
     pub fn new(mode: Mode) -> Policy {
         Policy {
             mode,
             classes: CLASSES.iter().map(|(c, _)| (c.to_string(), Action::Ask)).collect(),
             timeout_minutes: DEFAULT_TIMEOUT_MINUTES,
+            sandbox: true,
         }
     }
 
@@ -78,6 +84,8 @@ pub struct Override {
     pub classes: BTreeMap<String, Action>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_minutes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<bool>,
 }
 
 impl Override {
@@ -89,6 +97,9 @@ impl Override {
         p.classes.extend(self.classes.iter().map(|(k, v)| (k.clone(), *v)));
         if let Some(t) = self.timeout_minutes {
             p.timeout_minutes = t;
+        }
+        if let Some(s) = self.sandbox {
+            p.sandbox = s;
         }
         p
     }
@@ -102,6 +113,9 @@ impl Override {
         if newer.timeout_minutes.is_some() {
             self.timeout_minutes = newer.timeout_minutes;
         }
+        if newer.sandbox.is_some() {
+            self.sandbox = newer.sandbox;
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -110,7 +124,7 @@ impl Override {
 }
 
 /// A Bot's patch on top of its override: `parse_patch`, except `null` for `mode`,
-/// `timeoutMinutes`, or a class puts that field back to following the global policy.
+/// `timeoutMinutes`, `sandbox`, or a class puts that field back to following the global policy.
 pub fn patch_override(current: &Override, v: &Value) -> Result<Override, String> {
     let mut out = current.clone();
     let mut set = v.clone();
@@ -120,6 +134,9 @@ pub fn patch_override(current: &Override, v: &Value) -> Result<Override, String>
         }
         if obj.get("timeoutMinutes").is_some_and(Value::is_null) {
             out.timeout_minutes = None;
+        }
+        if obj.get("sandbox").is_some_and(Value::is_null) {
+            out.sandbox = None;
         }
         if let Some(cs) = obj.get_mut("classes").and_then(Value::as_object_mut) {
             let cleared: Vec<String> = cs.iter().filter(|(_, a)| a.is_null()).map(|(k, _)| k.clone()).collect();
@@ -136,9 +153,12 @@ pub fn patch_override(current: &Override, v: &Value) -> Result<Override, String>
     Ok(out)
 }
 
-/// Parses `{mode?, classes?: {class: action}, timeoutMinutes?}` from the API.
+/// Parses `{mode?, classes?: {class: action}, timeoutMinutes?, sandbox?}` from the API.
 pub fn parse_patch(v: &Value) -> Result<Override, String> {
     let mut o = Override::default();
+    if let Some(s) = v.get("sandbox").filter(|s| !s.is_null()) {
+        o.sandbox = Some(s.as_bool().ok_or("sandbox must be true or false")?);
+    }
     if let Some(m) = v.get("mode").filter(|m| !m.is_null()) {
         o.mode = Some(match m.as_str() {
             Some("ask") => Mode::Ask,
@@ -1614,5 +1634,28 @@ mod tests {
         a.merge(parse_patch(&json!({ "classes": { "file_delete": "allow" } })).unwrap());
         assert_eq!(a.mode, Some(Mode::Ask));
         assert_eq!(a.classes.len(), 2);
+    }
+
+    #[test]
+    fn the_sandbox_is_its_own_setting() {
+        assert!(Policy::new(Mode::Ask).sandbox && Policy::new(Mode::Bypass).sandbox, "new installs have it on");
+        let saved_before: Policy = serde_json::from_value(json!({ "mode": "ask", "classes": {}, "timeoutMinutes": 10 })).unwrap();
+        assert!(!saved_before.sandbox, "a policy saved before it existed keeps it off");
+
+        let mut base = Policy::new(Mode::Ask);
+        base.sandbox = false;
+        let on = parse_patch(&json!({ "sandbox": true })).unwrap();
+        assert_eq!((on.sandbox, on.apply(&base).sandbox, on.apply(&base).mode), (Some(true), true, Mode::Ask));
+        assert!(parse_patch(&json!({ "sandbox": "on" })).is_err());
+        assert_eq!(parse_patch(&json!({ "sandbox": null })).unwrap(), Override::default());
+
+        // A Bot's own setting wins over the default; null follows the default again.
+        let off = patch_override(&Override::default(), &json!({ "sandbox": false, "mode": "bypass" })).unwrap();
+        assert_eq!(off.sandbox, Some(false));
+        assert!(!off.apply(&Policy::new(Mode::Ask)).sandbox);
+        let back = patch_override(&off, &json!({ "sandbox": null })).unwrap();
+        assert_eq!((back.sandbox, back.mode), (None, Some(Mode::Bypass)));
+        assert!(back.apply(&Policy::new(Mode::Ask)).sandbox);
+        assert_eq!(serde_json::to_value(&back).unwrap(), json!({ "mode": "bypass" }), "an unset field isn't saved");
     }
 }

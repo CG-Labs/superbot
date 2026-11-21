@@ -77,6 +77,25 @@ pub struct RunInput {
     /// With per-user accounts (ADR 0037): the account the harness runs as on this
     /// server. None: botd's. Runs on the owner's machine never use it.
     pub run_as: Option<crate::accounts::RunAs>,
+    /// Set when the policy turns on the harness's own sandbox (ADR 0055) and it can
+    /// start where the run happens. Only adapters with `has_sandbox` use it.
+    pub sandbox: Option<Sandbox>,
+}
+
+/// The harness's own sandbox: its shell commands write only to `cwd`, the temp
+/// folders, and `writable`, and keep the network, including botd's API (`BOT_API`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Sandbox {
+    /// Folders outside `cwd` the run writes to: its memory and facts files' folders and
+    /// package caches. Each exists where the run happens.
+    pub writable: Vec<PathBuf>,
+}
+
+/// `host:port` of botd's API as the run reaches it, for a sandbox that only lets
+/// commands reach hosts it is told about.
+pub fn api_host(input: &RunInput) -> Option<String> {
+    let rest = input.env.get("BOT_API")?.strip_prefix("http://")?.trim_end_matches('/');
+    (!rest.is_empty() && !rest.contains(['/', '@', '?', '#'])).then(|| rest.to_string())
 }
 
 /// The approval gate, as each adapter installs it in its harness's own hook format.
@@ -169,6 +188,14 @@ pub trait Adapter: Send {
     /// The tool name its events use for shell commands. Ask mode stops a run that uses it
     /// without calling the hook, since that harness isn't enforcing approvals.
     fn shell_tool(&self) -> &'static str;
+    /// Whether the harness has a sandbox of its own that `RunInput::sandbox` turns on.
+    fn has_sandbox(&self) -> bool {
+        false
+    }
+    /// What its sandbox needs from the host beyond user namespaces, of `sandbox::PROGRAMS`.
+    fn sandbox_needs(&self) -> &'static [&'static str] {
+        &[]
+    }
     /// The longest hook timeout the harness accepts, if it caps it.
     fn max_hook_secs(&self) -> Option<u64> {
         None
@@ -242,7 +269,7 @@ pub const NAMES: [&str; 4] = ["claude", "codex", "pi", "hermes"];
 pub fn get(name: &str) -> Option<Box<dyn Adapter>> {
     match name {
         "claude" => Some(Box::new(claude::Claude::default())),
-        "codex" => Some(Box::new(codex::Codex)),
+        "codex" => Some(Box::new(codex::Codex::default())),
         "pi" => Some(Box::new(pi::Pi)),
         "hermes" => Some(Box::new(hermes::Hermes::default())),
         _ => None,
@@ -428,6 +455,7 @@ mod tests {
             state_dir: dir.join("state"),
             guard: Some(Guard { command: "'/opt/bin/botctl' hook x".into(), timeout_secs: 300, wait: std::time::Duration::from_secs(240) }),
             run_as,
+            sandbox: None,
         }
     }
 
@@ -496,6 +524,95 @@ mod tests {
         let removed: Vec<_> = cmd.get_envs().filter(|(_, v)| v.is_none()).map(|(k, _)| k.to_string_lossy().into_owned()).collect();
         for k in ["AUTH_PASSWORD", "SUPERBOT_MASTER_KEY_FILE", "LINODE_TOKEN", "LINODE_TOKEN_FILE", "TURNSTILE_SECRET", "TURNSTILE_SECRET_FILE", "LICENSE_KEY", "LICENSE_KEY_FILE", "STRIPE_WEBHOOK_SECRET", "STRIPE_WEBHOOK_SECRET_FILE", "STRIPE_SECRET_KEY", "STRIPE_SECRET_KEY_FILE"] {
             assert!(removed.iter().any(|r| r == k), "{k}");
+        }
+    }
+
+    fn sandboxed(dir: &std::path::Path) -> RunInput {
+        let mut i = input(dir, None);
+        i.env.insert("BOT_API".into(), "http://127.0.0.1:3000".into());
+        i.sandbox = Some(Sandbox { writable: vec!["/data/bots/b1".into(), "/home/superbot/.npm".into()] });
+        i
+    }
+
+    #[test]
+    fn codex_runs_in_workspace_write_only_when_sandboxed() {
+        let dir = std::env::temp_dir();
+        let open = get("codex").unwrap().args(&input(&dir, None), &mut Vec::new());
+        assert!(open.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+        assert!(!open.iter().any(|a| a.starts_with("sandbox_mode")));
+        let mut i = sandboxed(&dir);
+        for resumed in [false, true] {
+            i.session_id = resumed.then(|| "t1".into());
+            let a = get("codex").unwrap().args(&i, &mut Vec::new());
+            assert!(!a.iter().any(|a| a.starts_with("--dangerously-bypass-approvals")), "{a:?}");
+            for c in [
+                "sandbox_mode=\"workspace-write\"",
+                "approval_policy=\"never\"",
+                "sandbox_workspace_write.network_access=true",
+                r#"sandbox_workspace_write.writable_roots=["/data/bots/b1","/home/superbot/.npm"]"#,
+            ] {
+                let at = a.iter().position(|x| x == c).unwrap_or_else(|| panic!("{c} in {a:?}"));
+                assert_eq!(a[at - 1], "-c");
+            }
+            // The approval hook stays: the sandbox is on top of approvals, not instead.
+            assert!(a.iter().any(|x| x.starts_with("hooks.PreToolUse")));
+            let end = a.iter().position(|x| x == "--").unwrap();
+            assert!(a.iter().position(|x| x.starts_with("sandbox_mode")).unwrap() < end);
+        }
+        i.sandbox = Some(Sandbox::default());
+        let a = get("codex").unwrap().args(&i, &mut Vec::new());
+        assert!(!a.iter().any(|x| x.contains("writable_roots")), "no empty list");
+    }
+
+    #[test]
+    fn claude_turns_on_its_sandbox_with_the_hook() {
+        let dir = std::env::temp_dir();
+        let settings = |i: &RunInput| {
+            let a = get("claude").unwrap().args(i, &mut Vec::new());
+            a.iter().position(|x| x == "--settings").map(|at| serde_json::from_str::<Value>(&a[at + 1]).unwrap())
+        };
+        assert!(settings(&input(&dir, None)).unwrap().get("sandbox").is_none());
+        let mut i = sandboxed(&dir);
+        let s = settings(&i).unwrap();
+        assert_eq!(s["disableAllHooks"], false);
+        assert!(s["hooks"]["PreToolUse"].is_array());
+        assert_eq!(
+            s["sandbox"],
+            serde_json::json!({
+                "enabled": true,
+                "allowUnsandboxedCommands": false,
+                "filesystem": { "allowWrite": ["/data/bots/b1", "/home/superbot/.npm"] },
+                "network": { "allowedDomains": ["127.0.0.1:3000"] },
+            })
+        );
+        // Bypass mode: no hook, the sandbox still holds.
+        i.guard = None;
+        let s = settings(&i).unwrap();
+        assert!(s.get("hooks").is_none() && s["sandbox"]["enabled"] == true);
+        i.sandbox = None;
+        assert!(settings(&i).is_none());
+    }
+
+    #[test]
+    fn only_harnesses_with_a_sandbox_say_so() {
+        for (name, has) in [("claude", true), ("codex", true), ("pi", false), ("hermes", false)] {
+            assert_eq!(get(name).unwrap().has_sandbox(), has, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_api_host_is_only_a_plain_local_address() {
+        let mut i = input(&std::env::temp_dir(), None);
+        for (api, host) in [
+            ("http://127.0.0.1:3000", Some("127.0.0.1:3000")),
+            ("http://127.0.0.1:41234/", Some("127.0.0.1:41234")),
+            ("https://bots.example", None),
+            ("http://u:p@127.0.0.1:1", None),
+            ("http://127.0.0.1:1/x", None),
+            ("http://", None),
+        ] {
+            i.env.insert("BOT_API".into(), api.into());
+            assert_eq!(api_host(&i).as_deref(), host, "{api}");
         }
     }
 }

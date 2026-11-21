@@ -135,7 +135,14 @@
           <input id="policy-timeout" type="number" min="1" max="1440" step="1" class="minutes" /> minutes
         </label>
         <button type="button" class="btn" id="policy-timeout-save">Save</button>
+        <label>Harness sandbox
+          <select id="policy-sandbox">
+            <option value="on">On</option>
+            <option value="off">Off</option>
+          </select>
+        </label>
       </div>
+      <p class="hint" id="policy-sandbox-hint">Codex and Claude Code run commands in their own sandbox: they write only in the workspace, temp folders, the Bot's memory, and package caches. It holds in Bypass too.</p>
       <table class="grid">
         <thead><tr><th>Risky action</th><th>All Bots</th></tr></thead>
         <tbody id="policy-classes"></tbody>
