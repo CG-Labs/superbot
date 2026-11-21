@@ -43,9 +43,9 @@ while (( $# )); do
       while IFS= read -r line || [[ -n "$line" ]]; do
         line=${line%$'\r'}
         if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
-          value=${BASH_REMATCH[3]}
+          key=${BASH_REMATCH[2]} value=${BASH_REMATCH[3]}
           if [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^\'(.*)\'$ ]]; then value=${BASH_REMATCH[1]}; fi
-          export "${BASH_REMATCH[2]}=$value"
+          export "$key=$value"
         fi
       done <"$2"
       shift 2 ;;

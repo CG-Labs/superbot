@@ -508,24 +508,29 @@ struct Run {
 }
 
 /// Sends `prompt`, answers each approval with `decide` ("approve" or "deny"), and waits
-/// for `bot.run_finished` for this message.
-fn run(b: &Botd, bot: &str, prompt: &str, decide: Option<&str>) -> Run {
+/// for `bot.run_finished` for this message. Each approval is held open a moment first,
+/// and `held` checks the call hasn't happened while the run waits on it.
+fn run(b: &Botd, bot: &str, prompt: &str, decide: Option<&str>, held: &dyn Fn()) -> Run {
     let before = call(b, "GET", &format!("/api/bots/{bot}/messages"), Value::Null).as_array().unwrap().len();
     let msg = call(b, "POST", &format!("/api/bots/{bot}/messages"), json!({ "text": prompt }));
     let id = msg["id"].clone();
     let mut approvals: Vec<Value> = Vec::new();
     let limit = Duration::from_secs(if real() { 300 } else { 120 });
+    let done = || audit(b, "bot.run_finished").into_iter().map(|e| details(&e)).find(|d| d["messageId"] == id);
     let finished = wait_for("the run to finish", limit, || {
         for a in call(b, "GET", "/api/approvals?status=pending", Value::Null).as_array().cloned().unwrap_or_default() {
             if a["botId"] != bot || approvals.iter().any(|x| x["id"] == a["id"]) {
                 continue;
             }
             if let Some(d) = decide {
+                std::thread::sleep(Duration::from_secs(2));
+                assert!(done().is_none(), "the run finished while an approval was pending: {a}");
+                held();
                 call(b, "POST", &format!("/api/approvals/{}/{d}", a["id"].as_str().unwrap()), json!({}));
             }
             approvals.push(a);
         }
-        audit(b, "bot.run_finished").into_iter().map(|e| details(&e)).find(|d| d["messageId"] == id)
+        done()
     });
     let msgs = call(b, "GET", &format!("/api/bots/{bot}/messages"), Value::Null);
     let text = msgs.as_array().unwrap()[before..].iter().filter(|m| m["role"] == "bot").map(|m| m["text"].as_str().unwrap_or_default()).collect::<Vec<_>>().join("\n");
@@ -586,7 +591,7 @@ fn approvals_hold(harness: &str, bin: &str) {
     // Allowed: no class, no rule. It runs, through the hook (the canary would stop a
     // shell call that skipped it).
     let marker = proof.join("allowed.marker");
-    let r = run(&b, &id, &prompt(&format!("touch {}", marker.display())), None);
+    let r = run(&b, &id, &prompt(&format!("touch {}", marker.display())), None, &|| {});
     assert!(r.approvals.is_empty(), "{harness}: an allowed call asked: {:?}", r.approvals);
     assert_ne!(r.result, "unguarded", "{harness} ran a shell command without the hook: {}", r.text);
     assert!(marker.exists(), "{harness}: the allowed command didn't run (result {}): {}", r.result, r.text);
@@ -598,7 +603,7 @@ fn approvals_hold(harness: &str, bin: &str) {
     // Blocked by policy: a deny rule, decided at once. The command never runs and the
     // agent is told why.
     let forbidden = proof.join("e2e-forbidden.marker");
-    let r = run(&b, &id, &prompt(&format!("touch {}", forbidden.display())), None);
+    let r = run(&b, &id, &prompt(&format!("touch {}", forbidden.display())), None, &|| {});
     assert!(r.approvals.is_empty(), "{harness}: a denied call asked: {:?}", r.approvals);
     assert!(!forbidden.exists(), "{harness}: a call the policy denies ran: {}", r.text);
     let denied = audit(&b, "policy.denied").into_iter().map(|e| details(&e)).find(|d| d["subject"].as_str().unwrap_or_default().contains("e2e-forbidden"));
@@ -611,7 +616,11 @@ fn approvals_hold(harness: &str, bin: &str) {
 
     // Needs approval: waits, then runs once approved.
     let push = |branch: &str| format!("git -C {} push origin HEAD:refs/heads/{branch}", repo.display());
-    let r = run(&b, &id, &prompt(&push("e2e-approved")), Some("approve"));
+    let not_pushed = |branch: &'static str| {
+        let remote = remote.clone();
+        move || assert!(!has_ref(&remote, branch), "{harness}: {branch} was pushed before anyone decided")
+    };
+    let r = run(&b, &id, &prompt(&push("e2e-approved")), Some("approve"), &not_pushed("e2e-approved"));
     let [a] = r.approvals.as_slice() else { panic!("{harness}: wanted one approval, got {:?} (result {}): {}", r.approvals, r.result, r.text) };
     assert_eq!((a["harness"].as_str(), a["class"].as_str()), (Some(harness), Some("git_push")), "{a}");
     assert!(has_ref(&remote, "e2e-approved"), "{harness}: approved, but the push didn't happen (result {}): {}", r.result, r.text);
@@ -621,7 +630,7 @@ fn approvals_hold(harness: &str, bin: &str) {
     pass("a call that needs approval waits, and runs once approved");
 
     // Needs approval: waits, then fails once denied.
-    let r = run(&b, &id, &prompt(&push("e2e-denied")), Some("deny"));
+    let r = run(&b, &id, &prompt(&push("e2e-denied")), Some("deny"), &not_pushed("e2e-denied"));
     let [a] = r.approvals.as_slice() else { panic!("{harness}: wanted one approval, got {:?} (result {}): {}", r.approvals, r.result, r.text) };
     assert_eq!(a["class"], "git_push", "{a}");
     assert!(!has_ref(&remote, "e2e-denied"), "{harness}: denied, but the push happened: {}", r.text);
