@@ -12,6 +12,7 @@ import { isAdmin, openConsole, openSetup, watchSetup } from "../src/admin";
 import { planAvailable } from "../src/billing";
 import { showError } from "../src/dialogs";
 import { approvalParam } from "../src/notifications";
+import { botParam } from "../src/push";
 import { isStarter, starterText } from "../src/prompts";
 import { useSuperBot } from "../src/SuperBotContext";
 import { colors } from "../src/theme";
@@ -28,8 +29,11 @@ export default function HomeScreen() {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [screen, setScreen] = useState<ScreenState>(null);
   const [approvalsOpen, setApprovalsOpen] = useState(false);
-  // A notification's link, `/home?approval=<id>` (ADR 0061), opens the inbox on it.
-  const linked = approvalParam(useLocalSearchParams<{ approval?: string }>().approval);
+  // A notification's link: `/home?approval=<id>` (ADR 0061) opens the inbox on it,
+  // `/home?bot=<id>` (a finished routine, ADR 0080) opens that Bot's chat.
+  const params = useLocalSearchParams<{ approval?: string; bot?: string }>();
+  const linked = approvalParam(params.approval);
+  const linkedBot = botParam(params.bot);
   const [focusId, setFocusId] = useState<string | null>(null);
   const [setupWaiting, setSetupWaiting] = useState(false);
   const [billing, setBilling] = useState(false);
@@ -43,6 +47,14 @@ export default function HomeScreen() {
     router.setParams({ approval: undefined });
   }, [api, linked]);
   useEffect(() => {
+    if (!api || !linkedBot || bots.length === 0) return;
+    if (bots.some((b) => b.id === linkedBot)) {
+      setActiveId(linkedBot);
+      if (!wide) setMobilePane("chat");
+    }
+    router.setParams({ bot: undefined });
+  }, [api, linkedBot, bots, wide, setActiveId]);
+  useEffect(() => {
     if (!api) return;
     let live = true;
     void planAvailable(api).then((on) => live && setBilling(on));
@@ -52,7 +64,7 @@ export default function HomeScreen() {
   }, [api]);
 
   if (!api) {
-    return <Redirect href={linked ? { pathname: "/", params: { approval: linked } } : "/"} />;
+    return <Redirect href={linked ? { pathname: "/", params: { approval: linked } } : linkedBot ? { pathname: "/", params: { bot: linkedBot } } : "/"} />;
   }
 
   const bot = bots.find((b) => b.id === activeId);
