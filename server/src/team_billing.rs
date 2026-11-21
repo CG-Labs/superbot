@@ -389,7 +389,7 @@ pub fn view(app: &App, team_id: &str, manager: bool) -> Option<Value> {
         "members": members,
         "billed": s.quantity,
         "syncing": s.quantity != Some(members.max(1)),
-        "error": s.seat_error.as_ref().map(|_| "Stripe didn't take the new seat count yet. botd keeps trying."),
+        "error": s.seat_error.as_ref().map(|_| "Stripe didn't take the new seat count yet. SuperBot keeps trying."),
     })));
     v["portal"] = json!(app.db.team_customer(team_id).is_some());
     v["plans"] = json!(tiers.all().iter().filter(|t| !t.stripe_prices.is_empty()).map(|t| t.view()).collect::<Vec<_>>());

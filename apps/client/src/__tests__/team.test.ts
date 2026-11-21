@@ -4,16 +4,20 @@ import {
   blockedReason,
   canLeave,
   canRemove,
+  leaveBlocked,
   looksLikeEmail,
   machineStatus,
   managesTeam,
   offboardingMessage,
+  seatsLine,
   TEAM_LINK_EVERY_MS,
   teamLinkWanted,
+  teamPlanLine,
+  teamSubscriptionLine,
   watchTeamLink,
 } from "../team";
 import { AppState } from "react-native";
-import type { OffboardingPreview, TeamMachine, TeamMember } from "../types";
+import type { OffboardingPreview, TeamBilling, TeamMachine, TeamMember } from "../types";
 
 const member = (id: string, role: TeamMember["role"]): TeamMember => ({ id, role, name: id, email: `${id}@example.com`, joinedAt: 1, active: true });
 
@@ -67,6 +71,32 @@ describe("team rules (mirroring the server's, ADR 0087)", () => {
     expect(canLeave({ role: "owner", members: [member("me", "owner"), member("a", "owner")] })).toBe(true);
     expect(canLeave({ role: "owner", members: [member("me", "owner")] })).toBe(true);
     expect(canLeave({ role: "member", members: [member("me", "member"), member("a", "owner")] })).toBe(true);
+  });
+
+  it("keeps the last person from leaving, and so deleting the team, while it pays for a plan (ADR 0093)", () => {
+    const paying = { plan: { name: "pro", label: "Pro" } };
+    expect(leaveBlocked({ role: "owner", members: [member("me", "owner")], billing: paying })).toMatch(/Cancel it under Manage billing/);
+    expect(canLeave({ role: "owner", members: [member("me", "owner")], billing: { plan: null } })).toBe(true);
+    expect(canLeave({ role: "member", members: [member("me", "member"), member("a", "owner")], billing: paying })).toBe(true);
+    expect(leaveBlocked({ role: "owner", members: [member("me", "owner"), member("a", "member")] })).toMatch(/only owner/);
+  });
+
+  it("says who pays for the team's plan and how its seats stand", () => {
+    const b: TeamBilling = {
+      plan: { name: "pro", label: "Pro" },
+      subscription: { status: "active", tier: "pro", periodEnd: 1_797_582_000, cancelAt: null },
+      seats: { members: 3, billed: 3, syncing: false, error: null },
+    };
+    expect(teamPlanLine(undefined)).toBeNull();
+    expect(teamPlanLine({ plan: null })).toMatch(/doesn't pay/);
+    expect(teamPlanLine(b)).toBe("The team pays for the Pro plan for everyone on it.");
+    expect(teamSubscriptionLine(b)).toBe("Paid through Stripe · current period ends 18 Dec 2026");
+    expect(teamSubscriptionLine({ ...b, subscription: { ...b.subscription!, cancelAt: 1_797_582_000 } })).toBe("Set to end 18 Dec 2026");
+    expect(teamSubscriptionLine({ plan: b.plan })).toBeNull();
+    expect(seatsLine(b)).toEqual({ text: expect.stringMatching(/^3 seats, one for each person/), tone: "ok" });
+    expect(seatsLine({ ...b, seats: { members: 4, billed: 3, syncing: true, error: null } })).toEqual({ text: "4 people on the team, 3 billed: updating with Stripe…", tone: "dim" });
+    expect(seatsLine({ ...b, seats: { members: 1, billed: 3, syncing: true, error: "Stripe refused the change." } })).toEqual({ text: "1 person on the team, 3 billed. Stripe refused the change.", tone: "warn" });
+    expect(seatsLine({ plan: null, seats: null })).toBeNull();
   });
 
   it("puts a teammate's machine in a few words", () => {
@@ -151,6 +181,12 @@ describe("team API", () => {
     answer(201, {});
     await api.inviteToTeam("cy@example.com", "member");
     expect(fetchMock).toHaveBeenLastCalledWith(expect.stringContaining("/api/team/invites"), expect.objectContaining({ method: "POST", body: '{"email":"cy@example.com","role":"member"}' }));
+    answer(200, { url: "https://checkout.stripe.com/c/pay/1" });
+    expect(await api.teamCheckout("pro")).toEqual({ url: "https://checkout.stripe.com/c/pay/1" });
+    expect(fetchMock).toHaveBeenLastCalledWith("https://bots.example.com/api/team/billing/checkout", expect.objectContaining({ method: "POST", body: '{"tier":"pro"}' }));
+    answer(200, { url: "https://billing.stripe.com/p/session/1" });
+    await api.teamBillingPortal();
+    expect(fetchMock).toHaveBeenLastCalledWith("https://bots.example.com/api/team/billing/portal", expect.objectContaining({ method: "POST" }));
   });
 
   it("shows the Team link only to people on a team or invited to one", async () => {
