@@ -403,7 +403,7 @@ async fn a_removal_the_helper_started_on_is_finished_even_if_access_comes_back()
     crate::teammate_removals::follow_up(&w.app);
     settled(&w).await;
     let r = w.app.db.account_removal(&row.id).unwrap();
-    assert_eq!((r.state.as_str(), r.attempts), ("done", 2), "{r:?}");
+    assert_eq!((r.state.as_str(), r.attempts), ("done", 2), "{:?}", r.last_error);
     assert!(events(&w, "isolation.teammate_removal_cancelled").await.is_empty());
     others_untouched(&w);
 }
