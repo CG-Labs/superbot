@@ -117,7 +117,7 @@ Every change is audited with `targetType` `team`:
 
 ## Limits and follow-ups
 
-- No console or client screens yet: the API is ready, with `GET /api/team` and `GET /api/me/team-invites` for the apps.
+- Console and client screens: done in [ADR 0088](0088-team-screens-in-the-apps.md), with an offboarding preview route for the confirmation.
 - Billing is still per user (ADR 0040). A team-level plan that pays for members' machines is future work.
 - Invites match a user's email. Someone with no account yet signs up first (or is provisioned by SCIM), then accepts.
 - SCIM groups don't map to teams yet.
