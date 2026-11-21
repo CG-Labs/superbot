@@ -8,6 +8,43 @@ use std::future::Future;
 use std::pin::Pin;
 
 pub type Fut<'a, T> = Pin<Box<dyn Future<Output = Result<T, ProviderError>> + Send + 'a>>;
+/// A backup's bytes on their way to or from the provider (ADR 0070).
+pub type ByteStream = Pin<Box<dyn futures_util::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send>>;
+
+/// A file put on a restored machine's disk before it first starts.
+#[derive(Clone, PartialEq)]
+pub struct RestoreFile {
+    pub path: String,
+    pub mode: u32,
+    pub content: String,
+}
+
+/// What a machine restored from a backup becomes (ADR 0070): today's size, tags,
+/// keys and firewall rather than the backup's, the files that make it enroll again,
+/// and the files that must go (its old identity).
+#[derive(Clone, PartialEq)]
+pub struct RestoreSpec {
+    pub plan: String,
+    pub tags: Vec<String>,
+    pub authorized_keys: Vec<String>,
+    pub firewall_id: Option<String>,
+    pub files: Vec<RestoreFile>,
+    pub remove: Vec<String>,
+}
+
+/// The files hold a live enrollment token, so they never reach a log.
+impl fmt::Debug for RestoreSpec {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("RestoreSpec")
+            .field("plan", &self.plan)
+            .field("tags", &self.tags)
+            .field("authorized_keys", &self.authorized_keys.len())
+            .field("firewall_id", &self.firewall_id)
+            .field("files", &self.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>())
+            .field("remove", &self.remove)
+            .finish()
+    }
+}
 
 /// What to create. `label` is unique per provider account and is the idempotency key:
 /// a second create with the same label fails with `LabelTaken`, never makes a twin.
@@ -145,6 +182,10 @@ impl fmt::Display for ProviderError {
     }
 }
 
+fn unsupported() -> ProviderError {
+    ProviderError::Api { status: 501, message: "this provider can't export or import machines".into() }
+}
+
 pub trait MachineProvider: Send + Sync {
     /// Stored with each machine, e.g. `linode`.
     fn name(&self) -> &'static str;
@@ -198,6 +239,37 @@ pub trait MachineProvider: Send + Sync {
     /// gone. Nothing to do where `ProviderMachine::user_data` is never set.
     fn clear_user_data<'a>(&'a self, _id: &'a str) -> Fut<'a, ()> {
         Box::pin(async { Ok(()) })
+    }
+
+    // Off-host backups (ADR 0070): a machine's whole disk exported as one file, and a
+    // machine made again from one. Providers that can't say so.
+
+    /// Whether this provider can export and import machines.
+    fn exports(&self) -> bool {
+        false
+    }
+    /// Makes a backup of the machine called `name` at the provider, without its
+    /// snapshots, and waits for it.
+    fn create_backup<'a>(&'a self, _id: &'a str, _name: &'a str) -> Fut<'a, ()> {
+        Box::pin(async { Err(unsupported()) })
+    }
+    /// The backup's bytes.
+    fn export_backup<'a>(&'a self, _id: &'a str, _name: &'a str) -> Fut<'a, ByteStream> {
+        Box::pin(async { Err(unsupported()) })
+    }
+    /// Succeeds if it is already gone.
+    fn delete_backup<'a>(&'a self, _id: &'a str, _name: &'a str) -> Fut<'a, ()> {
+        Box::pin(async { Err(unsupported()) })
+    }
+    /// Makes a stopped machine called `name` from a backup's bytes.
+    fn import_backup<'a>(&'a self, _name: &'a str, _data: ByteStream) -> Fut<'a, ()> {
+        Box::pin(async { Err(unsupported()) })
+    }
+    /// Puts the imported machine `staging` in place of machine `id`: set up as `spec`
+    /// says while stopped, then the old one deleted, the new one given its name, and
+    /// started. Everything on the old one's disks is lost.
+    fn replace_with<'a>(&'a self, _id: &'a str, _staging: &'a str, _spec: &'a RestoreSpec) -> Fut<'a, ProviderMachine> {
+        Box::pin(async { Err(unsupported()) })
     }
 
     // Firewalls (ADR 0035). Labels are unique per account, as machines' are.

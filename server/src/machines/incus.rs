@@ -18,8 +18,8 @@
 //!   containers, nesting, and host paths there.
 
 use super::provider::{
-    CreateSpec, FirewallDevices, FirewallRule, Fut, MachineProvider, ProviderError, ProviderFirewall,
-    ProviderMachine, RebuildSpec,
+    ByteStream, CreateSpec, FirewallDevices, FirewallRule, Fut, MachineProvider, ProviderError, ProviderFirewall,
+    ProviderMachine, RebuildSpec, RestoreFile, RestoreSpec,
 };
 use super::pki;
 use crate::secrets::SecretStore;
@@ -71,6 +71,10 @@ const STOP_WAIT: u64 = 30;
 const FORCE_WAIT: u64 = 20;
 const EDIT_WAIT: u64 = 30;
 const REBUILD_WAIT: u64 = 60;
+/// Making a backup of a container, or importing one, copies its whole disk.
+const BACKUP_WAIT: u64 = 4 * 3600;
+/// Incus deletes a backup left behind (botd stopped mid-export) after this long.
+const BACKUP_EXPIRY_HOURS: i64 = 24;
 /// Where the enrollment user data goes. The image renders it into the container's
 /// NoCloud seed when the container is first started after a create or rebuild, so
 /// removing it later changes nothing inside a container that has started.
@@ -497,6 +501,8 @@ pub struct Incus {
     egress: Vec<Rule>,
     pin: String,
     http: reqwest::Client,
+    /// For backups' bytes (ADR 0070): no overall timeout, but not silent for long.
+    stream: reqwest::Client,
 }
 
 impl std::fmt::Debug for Incus {
@@ -647,7 +653,7 @@ fn vendor_data(keys: &[String]) -> String {
 impl Incus {
     pub fn new(s: Settings, c: Credentials) -> Result<Incus, String> {
         let pin = pki::fingerprint(&c.server);
-        let (tls, _) = pki::pinned_client_config(vec![pin.clone()], vec![c.cert], c.key)?;
+        let (tls, _) = pki::pinned_client_config(vec![pin.clone()], vec![c.cert.clone()], c.key.clone_key())?;
         let http = reqwest::Client::builder()
             .tls_backend_preconfigured(tls)
             .connect_timeout(Duration::from_secs(5))
@@ -655,8 +661,25 @@ impl Incus {
             .user_agent(concat!("superbot-botd/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| format!("Incus client: {e}"))?;
+        let (tls, _) = pki::pinned_client_config(vec![pin.clone()], vec![c.cert], c.key)?;
+        let stream = reqwest::Client::builder()
+            .tls_backend_preconfigured(tls)
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(Duration::from_secs(300))
+            .user_agent(concat!("superbot-botd/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|e| format!("Incus client: {e}"))?;
         let egress = egress(&s.deny, s.control);
-        Ok(Incus { s, egress, pin, http })
+        Ok(Incus { s, egress, pin, http, stream })
+    }
+
+    fn url(&self, path: &str, query: &[(&str, &str)]) -> String {
+        let mut q = url::form_urlencoded::Serializer::new(String::new());
+        q.append_pair("project", &self.s.project);
+        for (k, v) in query {
+            q.append_pair(k, v);
+        }
+        format!("{}{path}?{}", self.s.url, q.finish())
     }
 
     async fn call(
@@ -667,21 +690,17 @@ impl Incus {
         body: Option<&Value>,
         if_match: Option<&str>,
     ) -> Result<Reply, ProviderError> {
-        let q = {
-            let mut q = url::form_urlencoded::Serializer::new(String::new());
-            q.append_pair("project", &self.s.project);
-            for (k, v) in query {
-                q.append_pair(k, v);
-            }
-            q.finish()
-        };
-        let mut req = self.http.request(method, format!("{}{path}?{q}", self.s.url));
+        let mut req = self.http.request(method, self.url(path, query));
         if let Some(b) = body {
             req = req.json(b);
         }
         if let Some(e) = if_match {
             req = req.header("If-Match", e);
         }
+        self.reply(req).await
+    }
+
+    async fn reply(&self, req: reqwest::RequestBuilder) -> Result<Reply, ProviderError> {
         // reqwest's errors name the URL, which holds no credentials.
         let res = req
             .send()
@@ -741,6 +760,43 @@ impl Incus {
             Ok(())
         } else {
             Err(ProviderError::Transport(format!("Incus is still {doing}")))
+        }
+    }
+
+    /// Like `finish`, for operations that copy a whole disk: waited on a minute at a
+    /// time, up to `secs`.
+    async fn finish_long(&self, r: Reply, secs: u64, doing: &str) -> Result<(), ProviderError> {
+        let Some(op) = r.operation else { return Ok(()) };
+        let until = std::time::Instant::now() + Duration::from_secs(secs);
+        while !self.wait(&op, 60).await? {
+            if std::time::Instant::now() >= until {
+                return Err(ProviderError::Transport(format!("Incus is still {doing}")));
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes a file into a stopped container, as root.
+    async fn push(&self, n: &str, f: &RestoreFile) -> Result<(), ProviderError> {
+        let req = self
+            .http
+            .post(self.url(&format!("/1.0/instances/{}/files", name(n)?), &[("path", &f.path)]))
+            .header("Content-Type", "application/octet-stream")
+            .header("X-Incus-uid", "0")
+            .header("X-Incus-gid", "0")
+            .header("X-Incus-mode", format!("{:04o}", f.mode))
+            .header("X-Incus-type", "file")
+            .header("X-Incus-write", "overwrite")
+            .body(f.content.clone());
+        self.reply(req).await.map(drop)
+    }
+
+    /// Succeeds if it isn't there.
+    async fn remove_file(&self, n: &str, path: &str) -> Result<(), ProviderError> {
+        match self.call(Method::DELETE, &format!("/1.0/instances/{}/files", name(n)?), &[("path", path)], None, None).await {
+            Ok(_) | Err(ProviderError::NotFound) => Ok(()),
+            Err(ProviderError::Api { message, .. }) if message.to_ascii_lowercase().contains("no such file") => Ok(()),
+            Err(e) => Err(e),
         }
     }
 
@@ -1278,6 +1334,138 @@ impl MachineProvider for Incus {
                 Ok(()) | Err(ProviderError::NotFound) => Ok(()),
                 Err(e) => Err(e),
             }
+        })
+    }
+
+    fn exports(&self) -> bool {
+        true
+    }
+
+    /// Without snapshots, which hold older states of the disk, and expiring by itself
+    /// should botd stop before deleting it.
+    fn create_backup<'a>(&'a self, id: &'a str, backup: &'a str) -> Fut<'a, ()> {
+        Box::pin(async move {
+            let expires = chrono::Utc::now() + chrono::Duration::hours(BACKUP_EXPIRY_HOURS);
+            let body = json!({
+                "name": name(backup)?,
+                "expires_at": expires.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "instance_only": true,
+                "optimized_storage": false,
+            });
+            let r = self
+                .call(Method::POST, &format!("/1.0/instances/{}/backups", name(id)?), &[], Some(&body), None)
+                .await?;
+            self.finish_long(r, BACKUP_WAIT, "making the backup").await
+        })
+    }
+
+    fn export_backup<'a>(&'a self, id: &'a str, backup: &'a str) -> Fut<'a, ByteStream> {
+        Box::pin(async move {
+            use futures_util::TryStreamExt;
+            let path = format!("/1.0/instances/{}/backups/{}/export", name(id)?, name(backup)?);
+            let res = self
+                .stream
+                .get(self.url(&path, &[]))
+                .send()
+                .await
+                .map_err(|e| ProviderError::Transport(format!("Incus: {}", e.without_url())))?;
+            let status = res.status();
+            if !status.is_success() {
+                let v: Value = res.json().await.unwrap_or(Value::Null);
+                return Err(error(status, &v));
+            }
+            let bytes = res.bytes_stream().map_err(|e| std::io::Error::other(format!("Incus: {}", e.without_url())));
+            Ok(Box::pin(bytes) as ByteStream)
+        })
+    }
+
+    fn delete_backup<'a>(&'a self, id: &'a str, backup: &'a str) -> Fut<'a, ()> {
+        Box::pin(async move {
+            let path = format!("/1.0/instances/{}/backups/{}", name(id)?, name(backup)?);
+            match self.call(Method::DELETE, &path, &[], None, None).await {
+                Ok(r) => self.finish(r, EDIT_WAIT, "deleting the backup").await,
+                Err(ProviderError::NotFound) => Ok(()),
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    /// Into the project and pool botd uses, whatever the backup says.
+    fn import_backup<'a>(&'a self, n: &'a str, data: ByteStream) -> Fut<'a, ()> {
+        Box::pin(async move {
+            self.check_server().await?;
+            self.check_project().await?;
+            let req = self
+                .stream
+                .post(self.url("/1.0/instances", &[]))
+                .header("Content-Type", "application/octet-stream")
+                .header("X-Incus-name", name(n)?)
+                .header("X-Incus-pool", &self.s.pool)
+                .body(reqwest::Body::wrap_stream(data));
+            let r = self.reply(req).await?;
+            self.finish_long(r, BACKUP_WAIT, "importing the backup").await
+        })
+    }
+
+    /// The restored container gets today's isolation, size, tags, and NIC behind the
+    /// firewall, whatever its backup said, and none of its cloud-init user data. It is
+    /// started only once that and its files are in place.
+    fn replace_with<'a>(&'a self, id: &'a str, staging: &'a str, spec: &'a RestoreSpec) -> Fut<'a, ProviderMachine> {
+        Box::pin(async move {
+            let size = Size::parse(&spec.plan).map_err(|m| api(400, m))?;
+            let (id, staging) = (name(id)?, name(staging)?);
+            let acl = name(
+                spec.firewall_id
+                    .as_deref()
+                    .ok_or_else(|| api(400, "containers are restored behind the machines' firewall (MACHINE_FIREWALL=on)"))?,
+            )?;
+            self.check_server().await?;
+            self.check_project().await?;
+            self.stop(staging, true).await?;
+            self.edit(staging, |put| {
+                if !put["config"].is_object() {
+                    put["config"] = json!({});
+                }
+                let c = put["config"].as_object_mut().unwrap();
+                // Snapshots start again once it has enrolled and its token file is gone.
+                for k in [USER_DATA, "cloud-init.vendor-data", "snapshots.schedule", "snapshots.expiry", "snapshots.pattern"] {
+                    c.remove(k);
+                }
+                for (k, v) in [
+                    ("security.privileged", "false"),
+                    ("security.nesting", "false"),
+                    ("security.idmap.isolated", "true"),
+                    ("security.guestapi", "false"),
+                ] {
+                    c.insert(k.into(), json!(v));
+                }
+                for (k, v) in size.limits() {
+                    c.insert(k.into(), json!(v));
+                }
+                c.insert("user.superbot.tag".into(), json!(spec.tags.first().cloned().unwrap_or_default()));
+                c.insert("user.superbot.tags".into(), json!(spec.tags.join(",")));
+                c.insert("user.superbot.plan".into(), json!(spec.plan));
+                if !spec.authorized_keys.is_empty() {
+                    c.insert("cloud-init.vendor-data".into(), json!(vendor_data(&spec.authorized_keys)));
+                }
+                put["devices"] = json!({ "root": self.root(&size), "eth0": self.nic(acl) });
+                put["profiles"] = json!([]);
+                put["description"] = json!("SuperBot machine");
+            })
+            .await?;
+            for f in &spec.files {
+                self.push(staging, f).await?;
+            }
+            for path in &spec.remove {
+                self.remove_file(staging, path).await?;
+            }
+            self.delete(id).await?;
+            let r = self
+                .call(Method::POST, &format!("/1.0/instances/{staging}"), &[], Some(&json!({ "name": id })), None)
+                .await?;
+            self.finish(r, EDIT_WAIT, "renaming the restored container").await?;
+            self.start(id).await?;
+            self.get(id).await
         })
     }
 
