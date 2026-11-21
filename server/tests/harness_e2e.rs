@@ -3,7 +3,9 @@
 //! each adapter installs, and four calls go through it: an allowed one runs, one a deny
 //! rule blocks never runs, and two `git push`es wait for a person, then run once approved
 //! or fail once denied. Then each tool other than the shell that the canary counts for
-//! that harness (ADR 0063) runs once allowed and is blocked once denied.
+//! that harness (ADR 0063) runs once allowed and is blocked once denied. Last, with a
+//! `botctl hook` that allows everything without asking botd, each of those calls must
+//! end its run as unguarded.
 //!
 //! By default the model is a fake (`FakeModel`) that each CLI reaches through its own
 //! custom-endpoint setting, so everything but the model is real and no login is needed.
@@ -470,13 +472,29 @@ const REAL_ENV_PREFIXES: [&str; 16] = [
 ];
 const REAL_ENV: [&str; 11] = ["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "SHELL"];
 
-fn start(harness: &str) -> Botd {
+/// `unhooked`: botd's own `botctl hook` allows every call without asking botd, as a
+/// hook that doesn't reach the gate would; the rest of `botctl` is the real one.
+fn start(harness: &str, unhooked: bool) -> Botd {
     let dir = std::env::temp_dir().join(format!("botd-harness-e2e-{harness}-{}-{}", std::process::id(), free_port()));
     for d in ["data", "workspace", "home", "proof"] {
         std::fs::create_dir_all(dir.join(d)).unwrap();
     }
     let port = free_port();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_botd"));
+    // botd runs the `botctl` next to it.
+    let botd = if unhooked {
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for (from, to) in [(env!("CARGO_BIN_EXE_botd"), "botd"), (env!("CARGO_BIN_EXE_botctl"), "botctl.real"), (env!("CARGO_BIN_EXE_superbot-run"), "superbot-run")] {
+            std::fs::copy(from, bin.join(to)).unwrap();
+        }
+        let stub = "#!/bin/sh\nif [ \"$1\" = hook ]; then cat >/dev/null; exit 0; fi\nexec \"$(dirname \"$0\")/botctl.real\" \"$@\"\n";
+        std::fs::write(bin.join("botctl"), stub).unwrap();
+        std::fs::set_permissions(bin.join("botctl"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        bin.join("botd")
+    } else {
+        PathBuf::from(env!("CARGO_BIN_EXE_botd"))
+    };
+    let mut cmd = Command::new(botd);
     cmd.env_clear().current_dir(&dir).env("PATH", std::env::var("PATH").unwrap_or_default());
     let model = if real() {
         for (k, v) in std::env::vars() {
@@ -701,7 +719,7 @@ fn approvals_hold(harness: &str, bin: &str) {
     if !wanted(harness, bin) {
         return;
     }
-    let b = start(harness);
+    let b = start(harness, false);
     let bot = call(&b, "GET", "/api/bots", Value::Null)[0].clone();
     assert_eq!(bot["harness"], harness);
     let id = bot["id"].as_str().unwrap().to_string();
@@ -809,6 +827,39 @@ fn approvals_hold(harness: &str, bin: &str) {
     }
 }
 
+/// The canary, end to end: with a hook that never reaches botd, each call the canary
+/// counts (a shell command, and in fake mode each of `other_tools`) still runs, and the
+/// run must end `unguarded`. This proves each CLI's real output reaches the canary.
+fn unhooked_runs_stop(harness: &str, bin: &str) {
+    if !wanted(harness, bin) {
+        return;
+    }
+    let b = start(harness, true);
+    let id = call(&b, "GET", "/api/bots", Value::Null)[0]["id"].as_str().unwrap().to_string();
+    call(&b, "PUT", "/api/policy", json!({ "sandbox": false }));
+    let model = if real() { std::env::var("SUPERBOT_E2E_BOT_MODEL").ok().filter(|m| !m.is_empty()) } else { (harness == "hermes").then(|| MODEL.to_string()) };
+    if let Some(m) = model {
+        call(&b, "PATCH", &format!("/api/bots/{id}"), json!({ "model": m }));
+    }
+    let proof = std::fs::canonicalize(b.dir.join("proof")).unwrap();
+    let r = run(&b, &id, &prompt(&format!("touch {}", proof.join("unhooked.marker").display())), None, &|| {});
+    assert_eq!(r.result, "unguarded", "{harness}: a shell command ran without the hook and the canary missed it: {}", r.text);
+    println!("PASS {harness}: a shell command that skips the hook stops the run");
+    if real() {
+        return;
+    }
+    for (tool, model) in other_tools(harness) {
+        if let Some(m) = model {
+            call(&b, "PATCH", &format!("/api/bots/{id}"), json!({ "model": m }));
+        }
+        let made = proof.join(format!("unhooked-{}.txt", tool.replace('/', "-")));
+        let r = run(&b, &id, &format!("{}{tool}{}<<{}>>", TOOL.0, TOOL.1, other_tool_args(tool, &made)), None, &|| {});
+        assert!(made.exists(), "{harness}: the unhooked {tool} call didn't run (result {}): {}", r.result, r.text);
+        assert_eq!(r.result, "unguarded", "{harness}: {tool} ran without the hook and the canary missed it: {}", r.text);
+        println!("PASS {harness}: {tool} that skips the hook stops the run");
+    }
+}
+
 /// Tools other than the shell that each harness reports through its hook and that the
 /// canary counts, with the Bot model that makes the CLI offer it (ADR 0063).
 fn other_tools(harness: &str) -> Vec<(&'static str, Option<&'static str>)> {
@@ -838,24 +889,28 @@ fn other_tool_args(tool: &str, path: &Path) -> Value {
 #[ignore = "needs the Claude Code CLI; see the harness-e2e workflow"]
 fn claude_code_hooks_hold() {
     approvals_hold("claude", "claude");
+    unhooked_runs_stop("claude", "claude");
 }
 
 #[test]
 #[ignore = "needs the Codex CLI; see the harness-e2e workflow"]
 fn codex_hooks_hold() {
     approvals_hold("codex", "codex");
+    unhooked_runs_stop("codex", "codex");
 }
 
 #[test]
 #[ignore = "needs the Pi CLI; see the harness-e2e workflow"]
 fn pi_hooks_hold() {
     approvals_hold("pi", "pi");
+    unhooked_runs_stop("pi", "pi");
 }
 
 #[test]
 #[ignore = "needs the Hermes Agent CLI; see the harness-e2e workflow"]
 fn hermes_hooks_hold() {
     approvals_hold("hermes", "hermes");
+    unhooked_runs_stop("hermes", "hermes");
 }
 
 #[test]
