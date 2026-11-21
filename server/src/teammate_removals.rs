@@ -9,7 +9,8 @@
 //! aside and deletes it after `ISOLATION_TEAMMATE_FILES_DAYS` (`delete`), and deletes
 //! its folder, harness logins and temp files, then the account. A removal that fails is
 //! tried again every few minutes until it's done; trying again changes nothing once it
-//! is. Accounts made before this, or missed, are found in the password database. A
+//! is. Accounts made before this, or missed, are found in the password database, or in
+//! botd's record of the pairs it set up (a recreated container keeps the folders). A
 //! user's own account, the owner's and every other account are never touched. Every step
 //! is audited.
 
@@ -24,8 +25,10 @@ use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 const PENDING: &str = "pending";
 const HELD: &str = "held";
@@ -37,6 +40,72 @@ const SWEEP_SECS: u64 = 300;
 /// Work that was to be archived, held this long instead when it can't be: its owner is
 /// gone, or their account can't be made.
 const ORPHAN_DAYS: i64 = 30;
+/// How long a removal waits for the account's runs to end and save their memory.
+const RUN_END_SECS: u64 = 60;
+
+type Pair = (String, String);
+
+/// Teammate accounts in use now (a run, or a login starting) and being removed, so the
+/// two never overlap: a removal stops the account's runs and waits for them to end, and
+/// nothing starts in an account being removed or waiting to be.
+#[derive(Default)]
+pub struct Gate(Mutex<GateState>);
+
+#[derive(Default)]
+struct GateState {
+    removing: HashSet<Pair>,
+    using: HashMap<Pair, u32>,
+}
+
+impl Gate {
+    fn lock(&self) -> MutexGuard<'_, GateState> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn in_use(&self, pair: &Pair) -> bool {
+        self.lock().using.get(pair).is_some_and(|n| *n > 0)
+    }
+}
+
+/// A run or login in a teammate's account; the account can't go until it's dropped.
+pub struct InUse<'a>(&'a Gate, Pair);
+
+impl Drop for InUse<'_> {
+    fn drop(&mut self) {
+        let mut s = self.0.lock();
+        if let Some(n) = s.using.get_mut(&self.1) {
+            *n -= 1;
+            if *n == 0 {
+                s.using.remove(&self.1);
+            }
+        }
+    }
+}
+
+/// A removal of a teammate's account under way; nothing starts in it until it's dropped.
+struct Closed<'a>(&'a Gate, Pair);
+
+impl Drop for Closed<'_> {
+    fn drop(&mut self) {
+        self.0.lock().removing.remove(&self.1);
+    }
+}
+
+/// Lets a run or a login start in `teammate`'s account for `owner`'s Bots. None while
+/// that account is being removed or a removal of it is pending, which this hurries
+/// along: the caller refuses, and checks access again once it's let in.
+pub fn enter<'a>(app: &'a AppState, owner: &str, teammate: &str) -> Option<InUse<'a>> {
+    let pair = (owner.to_string(), teammate.to_string());
+    let mut s = app.teammate_gate.lock();
+    let pending = || app.db.account_removals(Some(PENDING), Some(teammate)).iter().any(|r| r.owner_id == owner && r.user_id == teammate);
+    if s.removing.contains(&pair) || pending() {
+        drop(s);
+        kick(app);
+        return None;
+    }
+    *s.using.entry(pair.clone()).or_default() += 1;
+    Some(InUse(&app.teammate_gate, pair))
+}
 
 fn isolation(app: &App) -> Option<Arc<Isolation>> {
     app.isolation.get().cloned()
@@ -75,10 +144,12 @@ fn queue(app: &App, iso: &Isolation, by: &Who, owner: &str, teammate: &str, reas
     Some((row, made))
 }
 
-/// Every teammate account here, as `(owner, teammate)`, and every pair a removal is
-/// still pending for.
+/// Every teammate account here, as `(owner, teammate)`: in the password database, or
+/// made by botd and not removed since (a recreated container keeps the folders, not the
+/// accounts), and every pair a removal is still pending for.
 fn pairs(app: &App, iso: &Isolation) -> Vec<(String, String)> {
     let mut p = iso.teammate_pairs();
+    p.extend(app.db.teammate_spaces());
     p.extend(app.db.account_removals(Some(PENDING), None).into_iter().map(|r| (r.owner_id, r.user_id)));
     p.sort();
     p.dedup();
@@ -211,7 +282,8 @@ fn note(app: &App, by: &Who, row: &AccountRemoval, state: &str, why: &str) {
     let changed = row.last_error.as_deref() != Some(why);
     if app.db.account_removal_failed(&row.id, state, why) && changed {
         let action = if state == HELD { "isolation.teammate_files_purge_failed" } else { "isolation.teammate_removal_failed" };
-        let d = json!({ "error": why, "attempts": row.attempts + 1 });
+        let attempts = app.db.account_removal(&row.id).map_or(row.attempts, |r| r.attempts);
+        let d = json!({ "error": why, "attempts": attempts });
         app.db.record(&removal_event(by, action, row, d).outcome(Outcome::Failure));
     }
 }
@@ -221,9 +293,9 @@ fn note(app: &App, by: &Who, row: &AccountRemoval, state: &str, why: &str) {
 async fn try_removal(app: &App, iso: &Arc<Isolation>, by: &Who, row: &AccountRemoval, forced: bool) -> Tried {
     let Some(_taken) = app.account_removals.take(&row.id) else { return Tried::Busy };
     let Some(row) = app.db.account_removal(&row.id).filter(|r| r.state == PENDING) else { return Tried::Busy };
-    // Once the helper has run, it may have done some of it (processes killed, work moved):
-    // finish rather than leave it half done. A later run makes the teammate a new account.
-    // The update checks again, so an admin's ask that lands meanwhile still stands.
+    // Once the helper has started, it may have done some of it (processes killed, work
+    // moved): finish rather than leave it half done. A later run makes the teammate a new
+    // account. The update checks again, so an admin's ask that lands meanwhile still stands.
     if !forced && row.reason != ADMIN && row.attempts == 0 && offboard::wanted(app, &row.owner_id, &row.user_id) {
         let why = "access_back";
         if app.db.account_removal_cancel_unasked(&row.id, why) {
@@ -232,12 +304,27 @@ async fn try_removal(app: &App, iso: &Arc<Isolation>, by: &Who, row: &AccountRem
         }
         return Tried::Busy;
     }
+    let pair = (row.owner_id.clone(), row.user_id.clone());
+    app.teammate_gate.lock().removing.insert(pair.clone());
+    let _closed = Closed(&app.teammate_gate, pair.clone());
+    let runs = app.stop_teammate_runs(&row.owner_id, &row.user_id);
+    // A run saves its memory copy back as it ends: the folder goes only after.
+    let mut waited = 0;
+    while app.teammate_gate.in_use(&pair) && waited < RUN_END_SECS * 20 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        waited += 1;
+    }
+    if app.teammate_gate.in_use(&pair) {
+        let why = "a run in the account is still ending";
+        note(app, by, &row, PENDING, why);
+        return Tried::Failed(why.into());
+    }
     let logins = app.teammate_logins.stop_for(&row.owner_id, &row.user_id);
     // The work goes to the owner's own account, made now if they never ran a Bot here.
     // With no one to hand it to, it's kept aside a while for an admin instead: the
     // account still goes now.
     let mut unarchived = None;
-    let (work, days) = match (row.files == Files::Delete.as_str(), row.grace_days) {
+    let (work, mut days) = match (row.files == Files::Delete.as_str(), row.grace_days) {
         (true, 0) => (Work::Delete, 0),
         (true, d) => (Work::Hold, d),
         (false, _) => match app.db.user(&row.owner_id) {
@@ -254,6 +341,10 @@ async fn try_removal(app: &App, iso: &Arc<Isolation>, by: &Who, row: &AccountRem
             },
         },
     };
+    // From here the helper may change files, so the removal is never cancelled after.
+    if !app.db.account_removal_tried(&row.id, PENDING) {
+        return Tried::Busy;
+    }
     let done = tokio::task::spawn_blocking({
         let (iso, row, work) = (iso.clone(), row.clone(), work.clone());
         move || iso.remove_teammate(&row.owner_id, &row.user_id, &row.id, &work)
@@ -262,13 +353,18 @@ async fn try_removal(app: &App, iso: &Arc<Isolation>, by: &Who, row: &AccountRem
     .unwrap_or_else(|e| Err(e.to_string()));
     match done {
         Ok(r) => {
+            app.db.teammate_space_gone(&row.owner_id, &row.user_id);
+            if r.work == "held" && work != Work::Hold {
+                days = held_days(&row);
+                unarchived.get_or_insert_with(|| "held by an earlier try".into());
+            }
             let purge_at = (r.work == "held").then(|| now() + days * DAY_MS);
             let archived_to = r.path.as_deref().filter(|_| r.work == "archived");
             if app.db.account_removal_removed(&row.id, archived_to, purge_at) {
                 let d = json!({
                     "accountRemoved": r.account_removed, "processesStopped": r.processes, "tempRemoved": r.temp,
-                    "loginsStopped": logins, "work": r.work, "archivedTo": archived_to, "purgeAt": purge_at, "attempts": row.attempts + 1,
-                    "notArchived": unarchived.filter(|_| r.work == "held"),
+                    "runsStopped": runs, "loginsStopped": logins, "work": r.work, "archivedTo": archived_to, "purgeAt": purge_at,
+                    "attempts": row.attempts + 1, "notArchived": unarchived.filter(|_| r.work == "held"),
                 });
                 app.db.record(&removal_event(by, "isolation.teammate_removed", &row, d));
             }
@@ -281,10 +377,19 @@ async fn try_removal(app: &App, iso: &Arc<Isolation>, by: &Who, row: &AccountRem
     }
 }
 
+/// How long work an earlier try held is kept when this try meant to archive or delete
+/// it: never less than if it were held now, so a retry never makes it due at once.
+fn held_days(row: &AccountRemoval) -> i64 {
+    if row.files == Files::Delete.as_str() { row.grace_days.max(1) } else { ORPHAN_DAYS }
+}
+
 /// Deletes the work a removal held, once its days are up. Whether it's done.
 async fn purge(app: &App, iso: &Arc<Isolation>, row: &AccountRemoval) -> bool {
     let Some(_taken) = app.account_removals.take(&row.id) else { return false };
     let by = system(&row.owner_id);
+    if !app.db.account_removal_tried(&row.id, HELD) {
+        return false;
+    }
     let done = tokio::task::spawn_blocking({
         let (iso, id) = (iso.clone(), row.id.clone());
         move || iso.purge(&id)
@@ -321,7 +426,7 @@ fn view(app: &App, r: &AccountRemoval) -> Value {
 
 fn need_teammates(app: &App) -> Res<Arc<Isolation>> {
     isolation(app)
-        .filter(|i| i.teammates || !i.teammate_pairs().is_empty())
+        .filter(|i| i.teammates || !i.teammate_pairs().is_empty() || !app.db.teammate_spaces().is_empty())
         .ok_or_else(|| ApiError(StatusCode::CONFLICT, "Teammates have no accounts of their own here: per-user accounts and ISOLATION_TEAMMATES are off.".into()))
 }
 
@@ -354,8 +459,7 @@ pub async fn of_user(State(app): State<AppState>, Path(key): Path<String>) -> Re
     let iso = need_teammates(&app)?;
     let u = need_user_key(&app, &key)?;
     let removals = app.db.account_removals(None, Some(&u.id));
-    let accounts: Vec<Value> = iso
-        .teammate_pairs()
+    let accounts: Vec<Value> = pairs(&app, &iso)
         .into_iter()
         .filter(|(o, t)| *o == u.id || *t == u.id)
         .map(|(o, t)| {
@@ -368,6 +472,8 @@ pub async fn of_user(State(app): State<AppState>, Path(key): Path<String>) -> Re
         .collect();
     Ok(Json(json!({
         "userId": u.id,
+        "files": iso.offboard.files.as_str(),
+        "graceDays": iso.offboard.grace_days,
         "accounts": accounts,
         "removals": removals.iter().map(|r| view(&app, r)).collect::<Vec<_>>(),
     })))
@@ -399,4 +505,35 @@ pub async fn remove_now(State(app): State<AppState>, Extension(by): Extension<Wh
         Tried::Failed(why) => (StatusCode::ACCEPTED, Json(json!({ "removal": after, "error": why }))),
         Tried::Cancelled | Tried::Busy => (StatusCode::ACCEPTED, Json(json!({ "removal": after }))),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn work_an_earlier_try_held_is_never_due_at_once() {
+        let row = |files: &str, grace_days| AccountRemoval {
+            id: "c1".into(),
+            owner_id: "u1".into(),
+            user_id: "u2".into(),
+            account: "sb-t-1".into(),
+            reason: "disabled".into(),
+            files: files.into(),
+            grace_days,
+            state: PENDING.into(),
+            attempts: 2,
+            last_error: None,
+            tried_at: None,
+            created_at: 0,
+            created_by: None,
+            removed_at: None,
+            archived_to: None,
+            purge_at: None,
+            done_at: None,
+        };
+        assert_eq!(held_days(&row("archive", 0)), ORPHAN_DAYS);
+        assert_eq!(held_days(&row("delete", 7)), 7);
+        assert_eq!(held_days(&row("delete", 0)), 1);
+    }
 }

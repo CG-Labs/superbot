@@ -310,6 +310,33 @@ async fn work_with_no_owner_account_to_go_to_is_held_not_lost() {
 }
 
 #[tokio::test]
+async fn a_recreated_containers_folders_are_still_cleaned_up() {
+    let w = world(delete_after(0)).await;
+    // The container came back: Bea's account isn't in its password file, her folder is.
+    // botd made it, and remembers.
+    let bea = accounts::teammate_account(&w.a_id, &w.b_id).unwrap();
+    let p: String = passwd(&w).lines().filter(|l| !l.starts_with(&bea)).map(|l| format!("{l}\n")).collect();
+    std::fs::write(w.root.join("passwd"), p).unwrap();
+    w.app.db.teammate_space_made(&w.a_id, &w.b_id);
+    let (code, v) = call(w.port, "GET", &format!("/api/users/{}/teammate-accounts", w.b_id), &w.admin, "").await;
+    assert_eq!((code, parse(&v)["accounts"].as_array().map(Vec::len)), (200, Some(1)), "{v}");
+
+    let (code, _) = call(w.port, "PATCH", &format!("/api/users/{}", w.b_id), &w.admin, r#"{"status":"disabled"}"#).await;
+    assert_eq!(code, 200);
+    settled(&w).await;
+    let removed = events(&w, "isolation.teammate_removed").await;
+    assert_eq!(removed.len(), 1, "{removed:?}");
+    assert_eq!((removed[0]["details"]["accountRemoved"].as_bool(), removed[0]["details"]["work"].as_str()), (Some(false), Some("deleted")));
+    assert!(!w.root.join(format!("{}-{}", w.a_id, w.b_id)).exists());
+    assert!(w.app.db.teammate_spaces().iter().all(|(_, t)| *t != w.b_id), "forgotten once removed");
+    // Once gone, it's never queued again.
+    crate::teammate_removals::follow_up(&w.app);
+    settled(&w).await;
+    assert_eq!(calls(&w).len(), 1, "{:?}", calls(&w));
+    others_untouched(&w);
+}
+
+#[tokio::test]
 async fn without_per_user_accounts_there_is_nothing_to_remove() {
     let (port, _app, admin, _) = serve_app().await;
     let (a_id, _) = user_with(port, &admin, "ada@example.com", "member").await;
@@ -317,4 +344,66 @@ async fn without_per_user_accounts_there_is_nothing_to_remove() {
     assert_eq!(code, 409);
     let (code, _) = call(port, "POST", &format!("/api/users/{a_id}/teammate-accounts/x1/remove"), &admin, "").await;
     assert_eq!(code, 409);
+}
+
+#[tokio::test]
+async fn nothing_starts_in_an_account_being_removed_and_the_removal_waits_for_its_runs() {
+    let w = world(delete_after(0)).await;
+    // A removal of Bea's account that keeps failing stays pending: no run or login of
+    // hers starts in it meanwhile. Cy's account is another matter.
+    std::fs::write(w.root.join("fail-remove"), "boom").unwrap();
+    let (code, res) = call(w.port, "POST", &format!("/api/users/{}/teammate-accounts/{}/remove", w.a_id, w.b_id), &w.admin, "").await;
+    assert_eq!(code, 202, "{res}");
+    assert!(crate::teammate_removals::enter(&w.app, &w.a_id, &w.b_id).is_none());
+    assert!(crate::teammate_removals::enter(&w.app, &w.a_id, &w.c_id).is_some());
+    let (code, res) = call(w.port, "POST", &format!("/api/machine/teammate/{}/harness-login", w.a_id), &w.b, r#"{"harness":"claude"}"#).await;
+    assert_eq!(code, 409, "{res}");
+    assert!(res.contains("being removed"), "{res}");
+    settled(&w).await;
+    std::fs::remove_file(w.root.join("fail-remove")).unwrap();
+
+    // Cy has a run going in his account: an admin's removal stops it, waits for it to
+    // end (it saves its memory then), and only then runs the helper.
+    let app = w.app.clone();
+    let (a_id, c_id) = (w.a_id.clone(), w.c_id.clone());
+    let run = tokio::spawn(async move {
+        let _in_use = crate::teammate_removals::enter(&app, &a_id, &c_id).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        std::fs::read_to_string(app.isolation().unwrap().root.join("calls.log")).unwrap_or_default()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let (code, res) = call(w.port, "POST", &format!("/api/users/{}/teammate-accounts/{}/remove", w.a_id, w.c_id), &w.admin, "").await;
+    assert_eq!(code, 200, "{res}");
+    let seen_by_run = run.await.unwrap();
+    assert!(!seen_by_run.contains(&format!("remove {} {}", w.a_id, w.c_id)), "the helper ran while the run was going: {seen_by_run}");
+    assert!(calls(&w).iter().any(|c| c.starts_with(&format!("remove {} {}", w.a_id, w.c_id))), "{:?}", calls(&w));
+    assert!(crate::teammate_removals::enter(&w.app, &w.a_id, &w.c_id).is_some(), "open again once it's done");
+}
+
+#[tokio::test]
+async fn a_removal_the_helper_started_on_is_finished_even_if_access_comes_back() {
+    let w = world(delete_after(0)).await;
+    // botd stopped while the helper ran for Bea, before it heard back; she may use the
+    // Bot again by the next pass. The helper may have moved her work: it finishes.
+    let row = w
+        .app
+        .db
+        .account_removal_queue(&db::NewAccountRemoval {
+            owner_id: &w.a_id,
+            user_id: &w.b_id,
+            account: &accounts::teammate_account(&w.a_id, &w.b_id).unwrap(),
+            reason: "access_lost",
+            files: "delete",
+            grace_days: 0,
+            created_by: None,
+        })
+        .unwrap()
+        .0;
+    assert!(w.app.db.account_removal_tried(&row.id, "pending"));
+    crate::teammate_removals::follow_up(&w.app);
+    settled(&w).await;
+    let r = w.app.db.account_removal(&row.id).unwrap();
+    assert_eq!((r.state.as_str(), r.attempts), ("done", 2), "{r:?}");
+    assert!(events(&w, "isolation.teammate_removal_cancelled").await.is_empty());
+    others_untouched(&w);
 }

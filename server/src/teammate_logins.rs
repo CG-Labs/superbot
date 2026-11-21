@@ -151,6 +151,11 @@ pub async fn start(app: AppState, by: Who, owner: User, teammate: String, harnes
     let bin = crate::adapters::get(&harness).map(|a| a.bin()).ok_or_else(|| crate::bad("Unknown harness"))?;
     let iso = need_isolation(&app)?;
     let space = Space::Teammate { owner: &owner.id, teammate: &teammate };
+    // Held until the login has started, so a removal (ADR 0066) stops it, never races it.
+    let _in_use = crate::teammate_removals::enter(&app, &owner.id, &teammate).ok_or_else(|| conflict("Your account for these Bots on this server is being removed. Try again in a few minutes."))?;
+    if !crate::machines::offboard::wanted(&app, &owner.id, &teammate) {
+        return Err(crate::not_found("Machine"));
+    }
     let run_as = app.ensure_space(space, &by).await.map_err(|e| gateway(format!("Couldn't set up your account on this server: {e}")))?;
     let (Some(home), Some(dir)) = (iso.home_in(space), space.dir()) else { return Err(crate::bad("Those ids can't name an account")) };
     let id = format!("l{}", crate::random_hex(8));

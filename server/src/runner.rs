@@ -179,6 +179,8 @@ pub struct App {
     pub teammate_logins: crate::teammate_logins::Local,
     /// Removals of leaving teammates' accounts here being tried now (ADR 0066).
     pub account_removals: crate::machines::offboard::Working,
+    /// Teammate accounts here in use and being removed, kept apart (ADR 0066).
+    pub teammate_gate: crate::teammate_removals::Gate,
     closing: AtomicBool,
 }
 
@@ -207,6 +209,7 @@ impl App {
             notifier: OnceLock::new(),
             teammate_logins: Default::default(),
             account_removals: Default::default(),
+            teammate_gate: Default::default(),
             closing: AtomicBool::new(false),
         })
     }
@@ -585,6 +588,9 @@ impl App {
         let mut details = json!({ "account": run_as.account });
         if let Some(t) = &teammate {
             details["forUser"] = json!(t);
+            if made.is_ok() {
+                self.db.teammate_space_made(&owner, t);
+            }
         }
         match made {
             Ok(false) => Ok(run_as),
@@ -732,6 +738,26 @@ impl App {
         // A teammate's run here gets an account of its own (ADR 0064), never the owner's.
         let teammate = for_other.as_deref().filter(|_| matches!(place, Place::Here) && self.teammate_accounts());
         let run_space = Space::of(&bot.owner_id, teammate);
+        // Nothing starts in a teammate's account while it's being removed (ADR 0066), and
+        // access is checked again once let in, so a removal never races a run past it.
+        let _in_use = match teammate {
+            Some(t) => {
+                let entered = crate::teammate_removals::enter(self, &bot.owner_id, t);
+                let refusal = match &entered {
+                    None => Some(("account_being_removed", "Your account for these Bots on this server is being removed, so I didn't run. Try again in a few minutes.".to_string())),
+                    Some(_) => self.wont_run(&bot, Some(t)),
+                };
+                if let Some((reason, text)) = refusal {
+                    self.give_back(&bot, msg, &period.key);
+                    let e = by.event("bot.run_refused").target("message", &msg.id.to_string()).bot(&bot.id).outcome(Outcome::Denied);
+                    self.db.record(&e.details(json!({ "reason": reason, "owner": bot.owner_id, "forUser": t, "messageId": msg.id })));
+                    self.say(&bot.id, &text, true);
+                    return;
+                }
+                entered
+            }
+            None => None,
+        };
         // The owner's own machine runs only their Bots, so only runs here need their account.
         let run_as = match place {
             Place::Here => match self.isolate(&bot, msg, &by, &period.key, teammate).await {
@@ -975,6 +1001,7 @@ impl App {
             let (result, outcome) = match reason {
                 Some("shutdown") => ("interrupted", Outcome::Failure),
                 Some("stopped") => ("stopped", Outcome::Failure),
+                Some("removed") => ("account_removed", Outcome::Failure),
                 Some(r @ ("unguarded" | "policy")) => (r, Outcome::Denied),
                 Some("timeout") => ("timeout", Outcome::Failure),
                 _ if !errors.is_empty() => ("error", Outcome::Failure),
@@ -993,6 +1020,7 @@ impl App {
             match reason {
                 Some("shutdown") => {}
                 Some("stopped") => self.say(&id, "Stopped.", true),
+                Some("removed") => self.say(&id, "I stopped: the account this task ran in on this server is being removed.", true),
                 Some("unguarded") => self.say(
                     &id,
                     &format!(
@@ -1729,6 +1757,20 @@ impl App {
         }
         self.cancel_approvals(bot_id, "The Bot was stopped");
         true
+    }
+
+    /// Stops the runs going now for `teammate` of `owner`'s Bots, whose account here is
+    /// being removed (ADR 0066). Each saves its memory copy as it ends. How many.
+    pub fn stop_teammate_runs(&self, owner: &str, teammate: &str) -> u32 {
+        let theirs: Vec<String> = self.askers.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|(_, a)| *a == teammate).map(|(b, _)| b.clone()).collect();
+        let mut n = 0;
+        for id in theirs.iter().filter(|id| self.db.bot(id).is_some_and(|b| b.owner_id == owner)) {
+            if let Some(r) = self.state().get(id).and_then(|s| s.run.as_ref()) {
+                r.abort.send_if_modified(|v| v.get_or_insert("removed") == &"removed");
+                n += 1;
+            }
+        }
+        n
     }
 
     /// After a policy change: a run that started in bypass has no approval hook, so

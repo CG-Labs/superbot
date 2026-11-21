@@ -1354,7 +1354,13 @@ fn migrate_account_removals(c: &Connection, _fresh: bool) -> rusqlite::Result<()
           done_at INTEGER
         );
         CREATE UNIQUE INDEX IF NOT EXISTS account_removals_pending ON account_removals(owner_id, user_id) WHERE state = 'pending';
-        CREATE INDEX IF NOT EXISTS account_removals_state ON account_removals(state);",
+        CREATE INDEX IF NOT EXISTS account_removals_state ON account_removals(state);
+        CREATE TABLE IF NOT EXISTS teammate_spaces (
+          owner_id TEXT NOT NULL,
+          user_id TEXT NOT NULL,
+          made_at INTEGER NOT NULL,
+          PRIMARY KEY (owner_id, user_id)
+        );",
     )
 }
 
@@ -4213,6 +4219,24 @@ impl Db {
             == 1
     }
 
+    /// A teammate's account and folders for an owner's Bots are on this server (ADR 0066).
+    /// Kept with botd's data, so a recreated container, whose password database starts
+    /// afresh while the folders stay, still knows whose folders they are.
+    pub fn teammate_space_made(&self, owner_id: &str, user_id: &str) {
+        let _ = self.c().execute("INSERT OR IGNORE INTO teammate_spaces (owner_id, user_id, made_at) VALUES (?, ?, ?)", params![owner_id, user_id, now()]);
+    }
+
+    /// Every `(owner, teammate)` whose account and folders may be on this server.
+    pub fn teammate_spaces(&self) -> Vec<(String, String)> {
+        let c = self.c();
+        let mut s = c.prepare("SELECT owner_id, user_id FROM teammate_spaces ORDER BY owner_id, user_id").unwrap();
+        s.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().filter_map(Result::ok).collect()
+    }
+
+    pub fn teammate_space_gone(&self, owner_id: &str, user_id: &str) {
+        let _ = self.c().execute("DELETE FROM teammate_spaces WHERE owner_id = ? AND user_id = ?", [owner_id, user_id]);
+    }
+
     /// Queues the removal of a teammate's account for an owner's Bots, unless one is
     /// pending: returns that one then, and whether this call made it.
     pub fn account_removal_queue(&self, n: &NewAccountRemoval) -> Option<(AccountRemoval, bool)> {
@@ -4253,14 +4277,21 @@ impl Db {
         s.query_map(params![state, user_id], account_removal_row).unwrap().filter_map(Result::ok).collect()
     }
 
+    /// The helper is about to run for a pending (or held, for a purge) removal: counted
+    /// before it starts, so one that stopped halfway is never taken for untried. Returns
+    /// whether it was still in `state`.
+    pub fn account_removal_tried(&self, id: &str, state: &str) -> bool {
+        self.c()
+            .execute("UPDATE account_removals SET attempts = attempts + 1, tried_at = ? WHERE id = ? AND state = ?", params![now(), id, state])
+            .unwrap_or(0)
+            == 1
+    }
+
     /// A try at a pending (or held, for a purge) removal failed. Returns whether it was
     /// still in `state`.
     pub fn account_removal_failed(&self, id: &str, state: &str, error: &str) -> bool {
         self.c()
-            .execute(
-                "UPDATE account_removals SET last_error = ?, attempts = attempts + 1, tried_at = ? WHERE id = ? AND state = ?",
-                params![error, now(), id, state],
-            )
+            .execute("UPDATE account_removals SET last_error = ?, tried_at = ? WHERE id = ? AND state = ?", params![error, now(), id, state])
             .unwrap_or(0)
             == 1
     }
@@ -4272,7 +4303,7 @@ impl Db {
         self.c()
             .execute(
                 "UPDATE account_removals SET state = CASE WHEN ?1 IS NULL THEN 'done' ELSE 'held' END, purge_at = ?1, archived_to = ?2,
-                 removed_at = ?3, done_at = CASE WHEN ?1 IS NULL THEN ?3 ELSE NULL END, attempts = attempts + 1, tried_at = ?3, last_error = NULL
+                 removed_at = ?3, done_at = CASE WHEN ?1 IS NULL THEN ?3 ELSE NULL END, tried_at = ?3, last_error = NULL
                  WHERE id = ?4 AND state = 'pending'",
                 params![purge_at, archived_to, at, id],
             )
@@ -4304,7 +4335,7 @@ impl Db {
     }
 
     /// Cancels a pending removal with `note`, but only if no admin asked for it and the
-    /// helper was never run for it. Returns whether it did.
+    /// helper was never started for it. Returns whether it did.
     pub fn account_removal_cancel_unasked(&self, id: &str, note: &str) -> bool {
         self.c()
             .execute(

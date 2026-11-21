@@ -386,6 +386,11 @@ async fn a_leaving_teammates_account_goes_and_the_shared_bot_keeps_working() {
     }
     let cy_creds = iso.home_in(cy_space).unwrap().join(".claude/.credentials.json");
     assert!(iso.teammate_pairs().contains(&(ada.clone(), bea.clone())), "{:?}", iso.teammate_pairs());
+    // As in a recreated container: deploy/test-isolation.sh left t1-t3's folder, not its
+    // account. botd made it, so its data says so.
+    let lost = iso.space_root(Space::of("t1", Some("t3"))).unwrap();
+    assert!(crate::passwd::by_name(&Space::of("t1", Some("t3")).account().unwrap()).is_none());
+    app.db.teammate_space_made("t1", "t3");
 
     // Bea's run is going, with a tool that ignores TERM, when she leaves.
     let mut msg = app.db.add_message(&team.id, "user", "SLEEP", None, false, Some("queued"));
@@ -407,7 +412,9 @@ async fn a_leaving_teammates_account_goes_and_the_shared_bot_keeps_working() {
     let d = removed.iter().find(|d| d["forUser"] == bea.as_str()).unwrap_or_else(|| panic!("{removed:?} {:?}", audited(&app, "isolation.teammate_removal_failed")));
     eprintln!("Removed: {d}");
     assert_eq!((d["account"].as_str(), d["work"].as_str(), d["accountRemoved"].as_bool()), (Some(bea_acct.as_str()), Some("archived"), Some(true)), "{d}");
-    assert!(d["processesStopped"].as_i64().unwrap() >= 1, "{d}");
+    // botd stops her run first, and waits for it to save its memory; the helper kills
+    // whatever is left.
+    assert_eq!(d["runsStopped"].as_i64(), Some(1), "{d}");
     assert!(crate::passwd::by_name(&bea_acct).is_none(), "the account is gone");
     assert!(std::fs::symlink_metadata(iso.space_root(bea_space).unwrap()).is_err(), "the folder and login are gone");
     let to = PathBuf::from(d["archivedTo"].as_str().unwrap());
@@ -436,6 +443,7 @@ async fn a_leaving_teammates_account_goes_and_the_shared_bot_keeps_working() {
     crate::teammate_removals::follow_up(&app);
     crate::teammate_removals::settled(&app).await;
     assert_eq!(audited(&app, "isolation.teammate_removed").iter().filter(|d| d["forUser"] == bea.as_str()).count(), 1);
+    assert!(std::fs::symlink_metadata(&lost).is_err(), "the folder of an account the container lost is cleaned up too");
     let again = iso.remove_teammate(&ada, &bea, "0123456789abcdef", &accounts::Work::Delete).unwrap();
     assert_eq!((again.account_removed, again.work.as_str()), (false, "none"));
     assert_eq!(std::fs::read_to_string(to.join("notes.txt")).unwrap(), "bea's notes");
