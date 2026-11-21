@@ -119,8 +119,11 @@ pub fn loads(app: &App, cp: &ControlPlane, h: &dyn Hosts) -> Vec<HostLoad> {
     };
     let live: Vec<Machine> = app.db.machines(None).into_iter().filter(|m| cp.owns(m) && m.state != State::Destroyed).collect();
     for m in &live {
-        if let Some(pid) = &m.provider_id {
-            add(&h.host_of(pid), &m.plan);
+        match (&m.provider_id, &m.placed_on) {
+            (Some(pid), _) => add(&h.host_of(pid), &m.plan),
+            // A create sent but not answered may have made it there.
+            (None, Some(host)) => add(host, &m.plan),
+            (None, None) => {}
         }
     }
     // A restore onto another host takes room there from its import until its swap,

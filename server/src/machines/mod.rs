@@ -621,6 +621,7 @@ fn system(m: &Machine) -> Who {
 
 fn observe(m: &mut Machine, pm: &ProviderMachine) {
     m.provider_id = Some(pm.id.clone());
+    m.placed_on = None;
     m.provider_status = Some(pm.status.clone());
     m.ipv4 = pm.ipv4.clone();
     m.backups = pm.backups;
@@ -672,6 +673,10 @@ async fn provision(
         },
         _ => None,
     };
+    if earlier.is_none() && m.placed_on.take().is_some() {
+        // Not there after all: free its room before placing it again.
+        app.db.save_machine(&m, m.state);
+    }
     let found = if let Some(pm) = earlier {
         Ok((pm, true))
     } else {
@@ -691,15 +696,20 @@ async fn provision(
             }
         };
         // The firewall first: a machine is never made without one, nor a token minted for
-        // a create that won't be sent.
+        // a create that won't be sent. Only on its host, so a failing one can't hold it up.
+        let on = match (&host, p.hosts()) {
+            (Some(h), Some(hosts)) => hosts.on(h).unwrap_or(p),
+            _ => p,
+        };
         m.firewall_id = match &cp.firewall {
             None => None,
-            Some(fw) => match firewall::ensure(app, fw, p, by).await {
+            Some(fw) => match firewall::ensure(app, fw, on, by).await {
                 Ok(id) => Some(id),
                 Err(e) => return refused(app, m, by, e, "firewall"),
             },
         };
         m.create_sent_at = Some(now());
+        m.placed_on = host.clone();
         app.db.save_machine(&m, m.state);
         // A fresh token each attempt. An earlier one stays good until it expires, in case
         // that attempt made the machine and it is adopted below.
@@ -774,6 +784,7 @@ fn refused(app: &App, mut m: Machine, by: &Who, e: ProviderError, step: &str) ->
         if step == "create" && matches!(e, ProviderError::Api { .. }) {
             // A refusal made nothing, so a delete needn't wait for it.
             m.create_sent_at = None;
+            m.placed_on = None;
         }
     }
     m.last_error = Some(match step {

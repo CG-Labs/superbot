@@ -554,6 +554,9 @@ pub struct Machine {
     pub last_error: Option<String>,
     /// When a create was last sent. One that went unanswered may still make a machine.
     pub create_sent_at: Option<i64>,
+    /// The host a create was sent to (ADR 0081), until it is answered: its room stays
+    /// taken meanwhile.
+    pub placed_on: Option<String>,
     pub created_at: i64,
     pub created_by: Option<String>,
     pub updated_at: i64,
@@ -732,6 +735,7 @@ fn machine_row(r: &Row) -> rusqlite::Result<Machine> {
         backups: r.get("backups")?,
         last_error: r.get("last_error")?,
         create_sent_at: r.get("create_sent_at")?,
+        placed_on: r.get("placed_on")?,
         created_at: r.get("created_at")?,
         created_by: r.get("created_by")?,
         updated_at: r.get("updated_at")?,
@@ -1266,6 +1270,10 @@ fn migrate_machine_host_drain(c: &Connection, _fresh: bool) -> rusqlite::Result<
             ALTER TABLE machine_hosts ADD COLUMN drained_by TEXT;
             ALTER TABLE machine_hosts ADD COLUMN drain_reason TEXT;",
         )?;
+    }
+    let has: bool = c.query_row("SELECT COUNT(*) FROM pragma_table_info('machines') WHERE name = 'placed_on'", [], |r| r.get(0))?;
+    if !has {
+        c.execute_batch("ALTER TABLE machines ADD COLUMN placed_on TEXT;")?;
     }
     Ok(())
 }
@@ -4255,7 +4263,7 @@ impl Db {
         self.c()
             .execute(
                 "UPDATE machines SET provider_id = ?, tier = ?, plan = ?, region = ?, state = ?, provider_status = ?, ipv4 = ?, backups = ?,
-                 last_error = ?, create_sent_at = ?, updated_at = ?, destroyed_at = ?, firewall_id = ? WHERE id = ? AND state = ?",
+                 last_error = ?, create_sent_at = ?, placed_on = ?, updated_at = ?, destroyed_at = ?, firewall_id = ? WHERE id = ? AND state = ?",
                 params![
                     m.provider_id,
                     m.tier,
@@ -4267,6 +4275,7 @@ impl Db {
                     m.backups,
                     m.last_error,
                     m.create_sent_at,
+                    m.placed_on,
                     now(),
                     m.destroyed_at,
                     m.firewall_id,

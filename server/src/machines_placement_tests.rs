@@ -238,3 +238,39 @@ async fn a_create_whose_answer_was_lost_is_adopted_where_it_landed_not_made_agai
     let mine = created.iter().find(|e| e["targetId"] == m.id.as_str()).unwrap();
     assert_eq!(mine["details"]["adopted"].as_bool(), Some(true), "{created:?}");
 }
+
+#[tokio::test]
+async fn a_create_sent_but_not_answered_keeps_its_room_until_it_is() {
+    let env = serve_with(|a, _, _| Fleet::new(vec![Member { max_machines: Some(1), ..a }], DOWN_MS)).await;
+    let (uid, _) = user_with(env.port, &env.admin, "ada@example.com", "member").await;
+    let new = NewMachine { user_id: &uid, provider: "incus", label_prefix: "superbot", tier: "starter", plan: "c1-m2-d20", region: "local", created_by: None };
+    let mut m = env.app.db.add_machine(&new).ok().unwrap();
+    // Sent to a; Incus hasn't answered yet.
+    m.create_sent_at = Some(crate::db::now());
+    m.placed_on = Some("a".into());
+    assert!(env.app.db.save_machine(&m, State::Pending));
+    let h = hosts(&env).await;
+    assert_eq!(on(&h, "a")["load"]["machines"].as_u64(), Some(1), "{h}");
+    let (bea, _) = user_with(env.port, &env.admin, "bea@example.com", "member").await;
+    let (code, e) = ask(&env, &bea).await;
+    assert_eq!(code, 409, "its room is taken: {e}");
+
+    // Nothing landed after all: the room is freed, and the retry takes it.
+    reconcile(&env).await;
+    let mm = env.app.db.machine(&m.id).unwrap();
+    assert_eq!((mm.provider_id.as_deref(), mm.placed_on.as_deref()), (Some(format!("a/{}", m.label).as_str()), None), "{mm:?}");
+    let (code, e) = ask(&env, &bea).await;
+    assert_eq!(code, 409, "{e}");
+}
+
+#[tokio::test]
+async fn a_host_that_didnt_answer_doesnt_hold_up_creates_on_the_others() {
+    let env = serve_with(|a, b, _| Fleet::new(vec![a, b], DOWN_MS)).await;
+    machine_on(&env, &env.a, "a", "ada@example.com", false).await;
+    env.b.w().down = true;
+    reconcile(&env).await;
+    let (bea, _) = user_with(env.port, &env.admin, "bea@example.com", "member").await;
+    let (code, d) = ask(&env, &bea).await;
+    assert_eq!(code, 202, "{d}");
+    assert!(d["providerId"].as_str().is_some_and(|p| p.starts_with("a/")), "made on a, not left pending: {d}");
+}

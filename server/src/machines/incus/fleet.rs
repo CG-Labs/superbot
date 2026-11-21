@@ -586,6 +586,10 @@ impl Hosts for Fleet {
         })
     }
 
+    fn on(&self, host: &str) -> Option<&dyn MachineProvider> {
+        self.member(host).map(|m| &m.incus as &dyn MachineProvider)
+    }
+
     fn host_of(&self, id: &str) -> String {
         self.parts(id).0.to_string()
     }

@@ -405,6 +405,8 @@ pub trait Hosts: Send + Sync {
     }
     /// Creates and boots a machine on `host`, which must be up.
     fn create_on<'a>(&'a self, host: &'a str, spec: &'a CreateSpec) -> Fut<'a, ProviderMachine>;
+    /// `host` alone, so work for one machine there (its firewall) needn't wait on others.
+    fn on(&self, host: &str) -> Option<&dyn MachineProvider>;
     /// How long a host may fail to answer before it is down.
     fn down_after_ms(&self) -> i64;
     /// Asks `host` whether it answers and trusts botd: what it said.
