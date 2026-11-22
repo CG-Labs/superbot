@@ -418,6 +418,8 @@ async fn machines_that_dont_enroll_in_time_are_reported() {
         screens: crate::machines_mtls_tests::no_screens(),
         teammates: crate::db::temp_path("agent-teammates"),
         teammate_stand_in: None,
+        run_cgroups: false,
+        nft: "/nonexistent/nft".into(),
     };
     agent::enroll(&cfg).await.unwrap();
     let row = env.app.db.machine(&mid).unwrap();

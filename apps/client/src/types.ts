@@ -455,6 +455,74 @@ export interface AdminUser {
   plan?: PlanUsage;
   /** Their second factor (ADR 0094). */
   mfa?: { enabled: boolean; enabledAt: number | null };
+  /** Their custom role across the server (ADR 0123); its base is `role`. */
+  roleId?: string | null;
+  customRole?: CustomRoleRef | null;
+  /** What they can do across the server: their role's permissions and their custom role's (ADR 0132). */
+  permissions?: string[];
+}
+
+/** A custom role, named (ADR 0123). */
+export interface CustomRoleRef {
+  id: string;
+  name: string;
+}
+
+/** A permission a custom role can hold; `team` ones also apply when given within a team. */
+export interface RolePermission {
+  name: string;
+  description: string;
+  team: boolean;
+}
+
+/** A built-in role, as a preset of permissions. Can't be changed. */
+export interface BuiltInRole {
+  id: Role;
+  name: string;
+  builtIn: true;
+  permissions: string[];
+}
+
+export type RoleBase = Exclude<Role, "admin">;
+
+/** A custom role (ADR 0123): a base plus delegable permissions. */
+export interface CustomRole {
+  id: string;
+  name: string;
+  description: string;
+  base: RoleBase;
+  builtIn: false;
+  permissions: string[];
+  /** Names this server doesn't know, saved by another version: shown, never granted. */
+  unknown: string[];
+  /** Its base's permissions and its own. */
+  effective: string[];
+  /** How many people have it across the server, and within a team. */
+  users: number;
+  teamMembers: number;
+  createdAt: number;
+  createdBy: string | null;
+  updatedAt: number;
+  /** Only from `GET /api/roles/{id}`. */
+  holders?: {
+    users: { id: string; name: string; email: string | null }[];
+    teams: { team: { id: string; name: string }; user: { id: string; name: string; email: string | null } }[];
+  };
+}
+
+/** `GET /api/roles`. */
+export interface RolesView {
+  permissions: RolePermission[];
+  builtIn: BuiltInRole[];
+  roles: CustomRole[];
+}
+
+/** `POST /api/roles`, and `PATCH` with any of it. */
+export interface RoleDraft {
+  name: string;
+  description: string;
+  base: RoleBase;
+  permissions: string[];
 }
 
 /** Who must have a second factor to sign in with a code or password (ADR 0094). */
@@ -833,6 +901,8 @@ export interface TeamMember {
   role: TeamRole;
   joinedAt: number;
   active: boolean;
+  /** A custom role given within this team (ADR 0123): only its team permissions apply here. */
+  customRole?: CustomRoleRef | null;
   /** Only for the team's owners and admins; null when they have none. */
   machine?: TeamMachine | null;
 }

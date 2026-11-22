@@ -6,9 +6,11 @@
 // Shared by two binaries, each of which uses only part of it.
 #![allow(dead_code)]
 
+use super::cgroup::{self, RunCgroup};
 use super::runas::{self, Ids};
-use super::wire::{JobCleanup, JobEvent, JobFile, JobRequest};
+use super::wire::{JobCleanup, JobEvent, JobFile, JobRequest, LimitReport};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::future::Future;
 use std::path::Path;
 use std::process::Stdio;
@@ -31,6 +33,23 @@ pub struct Host {
     pub env: BTreeMap<String, String>,
     /// Run as this user, and touch the job's files as it (ADR 0043).
     pub user: Option<Ids>,
+    /// The run's limits (ADR 0135): its cgroup, or why the agent can't hold it to them.
+    pub limits: Option<Limiting>,
+}
+
+#[derive(Clone, Debug)]
+pub enum Limiting {
+    Cgroup(Arc<RunCgroup>),
+    Unavailable(String),
+}
+
+impl Limiting {
+    fn report(&self) -> LimitReport {
+        match self {
+            Limiting::Cgroup(c) => c.report(),
+            Limiting::Unavailable(why) => LimitReport { enforced: false, error: Some(why.clone()), ..Default::default() },
+        }
+    }
 }
 
 impl Host {
@@ -43,7 +62,14 @@ impl Host {
             cmd.env_remove(k);
         }
         cmd.envs(&self.env).envs(env);
-        if let Some(ids) = self.user {
+        if let Some(Limiting::Cgroup(cg)) = &self.limits {
+            let (fd, user) = (cg.procs_fd(), self.user.map(|i| (i.uid, i.gid)));
+            // SAFETY: `enter` makes only async-signal-safe calls, and `cg` (holding the
+            // fd) outlives the spawn.
+            unsafe {
+                cmd.pre_exec(move || cgroup::enter(fd, user));
+            }
+        } else if let Some(ids) = self.user {
             cmd.uid(ids.uid).gid(ids.gid);
         }
         cmd
@@ -287,6 +313,7 @@ async fn run_child(
             stderr: tail(&stderr),
             files,
             too_big,
+            limited: host.limits.as_ref().map(Limiting::report),
         })
         .await;
 }
@@ -317,6 +344,7 @@ mod tests {
                 dir.join("out.md").display().to_string(),
                 dir.join("absent").display().to_string(),
             ],
+            limits: None,
         }
     }
 
@@ -448,6 +476,7 @@ mod tests {
             remove: Vec::new(),
             env: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
             user: None,
+            limits: None,
         };
         let ev = events(&host, &job("echo \"[$HOME]\"", &dir), false).await;
         assert!(ev.contains(&JobEvent::Line { line: "[]".into() }), "{ev:?}");

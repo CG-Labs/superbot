@@ -118,6 +118,9 @@ pub struct Enrollment {
     voxl: Option<(Bytes, String)>,
     /// What new machines' first boot hardens (MACHINE_HARDENING, ADR 0126). None: off.
     pub hardening: Option<super::hardening::Settings>,
+    /// Each Bot run in a cgroup of its own, held to its tier's run limits
+    /// (MACHINE_RUN_LIMITS, ADR 0135): systemd delegates the controllers to the agent.
+    pub run_limits: bool,
 }
 
 impl std::fmt::Debug for Enrollment {
@@ -165,6 +168,7 @@ impl Enrollment {
                 "MACHINE_TEAMMATE_FILES_DAYS",
                 "MACHINE_HARDENING",
                 "MACHINE_EGRESS_DENY",
+                "MACHINE_RUN_LIMITS",
             ] {
                 if !var(k).trim().is_empty() {
                     return Err(format!("{k} needs MACHINE_CONTROL_URL"));
@@ -243,6 +247,11 @@ impl Enrollment {
         e.teammate_users = super::teammate::from_env(var, e.bot_user)?;
         e.offboard = super::offboard::Settings::from_env(var)?;
         e.hardening = super::hardening::Settings::from_env(var)?;
+        e.run_limits = match var("MACHINE_RUN_LIMITS").trim() {
+            "" | "on" => true,
+            "off" => false,
+            v => return Err(format!("MACHINE_RUN_LIMITS must be on or off, not \"{v}\"")),
+        };
         if e.screens.is_some() {
             let on_path = std::env::var_os("PATH")
                 .and_then(|p| std::env::split_paths(&p).map(|d| d.join(VOXL_BIN)).find(|p| p.is_file()));
@@ -288,6 +297,7 @@ impl Enrollment {
             offboarding: Default::default(),
             voxl: None,
             hardening: None,
+            run_limits: false,
         })
     }
 
@@ -367,6 +377,13 @@ impl Enrollment {
     #[cfg(test)]
     pub fn with_hardening(mut self) -> Enrollment {
         self.hardening = Some(super::hardening::Settings::default_on());
+        self
+    }
+
+    /// With MACHINE_RUN_LIMITS=on.
+    #[cfg(test)]
+    pub fn with_run_limits(mut self) -> Enrollment {
+        self.run_limits = true;
         self
     }
 
@@ -583,11 +600,14 @@ impl Enrollment {
     /// The agent's unit. With MACHINE_BOT_USER, its state folder lets the Bots' user
     /// through to its home (ADR 0043).
     pub fn unit(&self) -> String {
+        let mut unit = UNIT.to_string();
         if self.bot_user {
-            UNIT.replace("StateDirectoryMode=0700", "StateDirectoryMode=0711")
-        } else {
-            UNIT.to_string()
+            unit = unit.replace("StateDirectoryMode=0700", "StateDirectoryMode=0711");
         }
+        if self.run_limits {
+            unit = unit.replace("Restart=always\n", "Restart=always\nDelegate=cpu memory pids io\nEnvironment=SUPERBOT_RUN_CGROUPS=delegated\n");
+        }
+        unit
     }
 
     /// An HTTPS client that accepts only `pins` and shows botd's certificate.

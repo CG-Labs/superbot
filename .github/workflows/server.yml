@@ -108,6 +108,16 @@ jobs:
           sudo apt-get install -y -qq nftables
           sudo SUPERBOT_MACHINE_BOT_USER_TEST=1 /tmp/botd-tests --ignored --exact \
             machines_hardening_tests::as_root_harness_users_cant_reach_private_addresses_but_root_can
+      # ADR 0135: an outbound allow-list lets harness users reach only its entries,
+      # and each Bot run is held to its CPU, memory and process limits in a cgroup of its own.
+      - name: Harness users reach only an allow-list's entries
+        run: |
+          sudo SUPERBOT_MACHINE_BOT_USER_TEST=1 /tmp/botd-tests --ignored --exact \
+            machines_hardening_tests::as_root_an_allow_list_lets_harness_users_reach_only_its_entries
+      - name: Bot runs are held to their cgroup limits
+        run: |
+          sudo SUPERBOT_MACHINE_BOT_USER_TEST=1 /tmp/botd-tests --ignored --exact \
+            machines_hardening_tests::as_root_runs_are_held_to_their_limits_and_say_when_they_hit_them
 
   shellcheck:
     runs-on: ubuntu-latest

@@ -1124,6 +1124,7 @@ mod tests {
                 timeout_secs: 60,
             }),
             collect: vec![],
+            limits: None,
             for_user: None,
         };
         let ready = run_as.prepare(job.clone()).unwrap();
