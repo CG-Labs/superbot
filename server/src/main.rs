@@ -46,6 +46,9 @@ mod deprovision;
 #[cfg(test)]
 mod deprovision_http_tests;
 mod erasure;
+mod evidence;
+#[cfg(test)]
+mod evidence_http_tests;
 mod file_retention;
 #[cfg(test)]
 mod file_retention_http_tests;
@@ -353,6 +356,7 @@ async fn main() {
         })
     };
     let data_dir = root("DATA_DIR", "data");
+    let evidence = evidence::Settings::from_env(&|k| env(k, ""), &data_dir).unwrap_or_else(|e| exit(format!("Evidence bundles: {e}")));
     let workspace = root("WORKSPACE_DIR", "workspace");
     let db_path = paths::child(&data_dir, "app.sqlite").unwrap();
     let data_lock = database_encryption::lock_data_dir(&db_path).unwrap_or_else(|e| exit(format!("Database: {e}")));
@@ -749,6 +753,7 @@ async fn main() {
     secrets::external::start_audit(app.clone());
     retention::start(app.clone(), retention::Settings { chat: chat_retention, sessions: session_retention, teammate_files: teammate_files_retention });
     server_backups::start(app.clone());
+    evidence::start(app.clone(), evidence, sessions, mfa_pinned);
     backup_encryption::start(app.clone());
     database_encryption::start(app.clone());
     users::start_pruning(app.clone(), sessions);
@@ -891,6 +896,8 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/backups", get(server_backups::get).post(server_backups::copy_now))
         .route("/database", get(database_encryption::get))
         .route("/support/bundle", get(support::bundle))
+        .route("/evidence", get(evidence::get))
+        .route("/evidence/bundle", get(evidence::bundle))
         .route("/secrets", get(list_secrets))
         .route("/secrets/{name}", put(put_secret).delete(delete_secret))
         .route("/me/tier", get(my_tier))
@@ -923,6 +930,7 @@ fn router(app: AppState, auth_state: Arc<Auth>) -> Router {
         .route("/auth/sso/{id}/callback", get(sso::callback).post(sso::callback_post))
         .route("/auth/sso/{id}/acs", post(sso::acs))
         .route("/auth/sso/{id}/metadata", get(sso::saml_metadata))
+        .route("/auth/sso/{id}/slo", get(sso::slo_get).post(sso::slo_post))
         .route("/sso/{id}/saml", get(sso::saml_status))
         .route("/sso/{id}/saml/idp-metadata", put(sso::saml_import))
         .route("/users", get(users::list_users).post(users::create_user))
@@ -1400,8 +1408,9 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
     // Signing in, the page to do it on, the public site, and asking for access need no credentials.
     let open = match method {
         Method::GET | Method::HEAD => path == "/login" || sso_path(&path).is_some() || site_file(&path).is_some() || path == "/api/signups/config" || path == plans::JSON_PATH,
-        // Apple posts its answer to the callback (response_mode=form_post), SAML IdPs theirs to the ACS.
-        Method::POST => path == "/api/auth/login" || matches!(sso_path(&path), Some("callback" | "acs")) || path == "/api/signups",
+        // Apple posts its answer to the callback (response_mode=form_post), SAML IdPs theirs to
+        // the ACS and their logout messages to the SLO URL.
+        Method::POST => path == "/api/auth/login" || matches!(sso_path(&path), Some("callback" | "acs" | "slo")) || path == "/api/signups",
         _ => false,
     };
     if open {
@@ -1492,11 +1501,11 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
 }
 
 /// `/api/auth/sso` (the list), `/api/auth/sso/{id}/start`, `/api/auth/sso/{id}/callback`, and native
-/// SAML's `/api/auth/sso/{id}/acs` and `/api/auth/sso/{id}/metadata`: which one.
+/// SAML's `/api/auth/sso/{id}/acs`, `/metadata`, and `/slo`: which one.
 fn sso_path(path: &str) -> Option<&str> {
     match path.strip_prefix("/api/auth/sso")? {
         "" => Some("list"),
-        rest => rest.strip_prefix('/').and_then(|r| r.split_once('/')).filter(|(id, step)| !id.is_empty() && !id.contains('/') && matches!(*step, "start" | "callback" | "acs" | "metadata")).map(|(_, step)| step),
+        rest => rest.strip_prefix('/').and_then(|r| r.split_once('/')).filter(|(id, step)| !id.is_empty() && !id.contains('/') && matches!(*step, "start" | "callback" | "acs" | "metadata" | "slo")).map(|(_, step)| step),
     }
 }
 

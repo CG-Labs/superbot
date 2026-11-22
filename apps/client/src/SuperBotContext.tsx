@@ -128,11 +128,15 @@ export function useSuperBot(): SuperBotContextValue {
   return ctx;
 }
 
-/** Ends the browser's cookie session; the signed-out mark stays until the server confirms. */
+/**
+ * Ends the browser's cookie session; the signed-out mark stays until the server confirms. A
+ * session a SAML IdP vouched for then goes to the IdP, to end its session too (ADR 0137).
+ */
 async function endCookieSession(client: SuperBotApi): Promise<void> {
   try {
-    await client.logout();
+    const idpLogout = await client.logout();
     await setCookieSignedOut(false);
+    if (idpLogout && Platform.OS === "web" && typeof window !== "undefined") window.location.assign(idpLogout);
   } catch {
     // Kept signed out; the next start tries again.
   }
