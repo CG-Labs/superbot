@@ -2,7 +2,7 @@
 //! asked for, never on the main port, and needs its token when it has one; requests and
 //! runs are counted by bounded labels and logged with their ids; approvals waiting and
 //! machines show as gauges; and no email, name, message, path or token reaches a label
-//! or a structured log line. Traces and per-tier metrics (ADR 0117) are off unless
+//! or a structured log line. Traces and per-tier metrics (ADR 0118) are off unless
 //! asked for, tie a request to the run it queues and the Bot's calls during it, and
 //! carry no more than those labels and lines do.
 
@@ -399,6 +399,19 @@ async fn wait_for(app: &AppState, done: &str, n: f64) {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("never saw {done}: {}", obs::render(app));
+}
+
+/// The installer and Compose copy these files; with nothing filled in, traces are off.
+#[test]
+fn the_example_env_files_leave_traces_off() {
+    for (name, text) in [(".env.example", include_str!("../../.env.example")), ("deploy/docker/.env.example", include_str!("../../deploy/docker/.env.example"))] {
+        let vars: Vec<(&str, &str)> = text.lines().filter(|l| !l.trim_start().starts_with('#')).filter_map(|l| l.split_once('=')).map(|(k, v)| (k.trim(), v.trim())).collect();
+        let s = settings(&vars).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(s.traces.endpoint.is_none(), "{name}");
+        for k in ["TRACES_OTLP_ENDPOINT", "TRACES_OTLP_HEADERS", "TRACES_SAMPLE_RATIO"] {
+            assert!(text.contains(k), "{name} documents {k}");
+        }
+    }
 }
 
 #[tokio::test]
