@@ -174,6 +174,9 @@ pub struct ControlPlane {
     provider: Option<Arc<dyn MachineProvider>>,
     /// Tier name to provider plan, in order; the first is the default.
     pub tiers: Vec<(String, String)>,
+    /// Tiers whose machines must have a kernel of their own (MACHINE_OWN_KERNEL_TIERS,
+    /// ADR 0119). Never set with a provider whose machines share their host's.
+    pub own_kernel_tiers: Vec<String>,
     /// Allowed regions; the first is the default.
     pub regions: Vec<String>,
     pub image: String,
@@ -217,6 +220,7 @@ impl Default for ControlPlane {
         ControlPlane {
             provider: None,
             tiers: parse_tiers(DEFAULT_TIERS).unwrap(),
+            own_kernel_tiers: Vec::new(),
             regions: Vec::new(),
             image: DEFAULT_IMAGE.into(),
             backups: true,
@@ -292,6 +296,34 @@ pub fn parse_tiers(raw: &str) -> Result<Vec<(String, String)>, String> {
     }
     if out.is_empty() {
         return Err("MACHINE_TIERS needs at least one tier=plan".into());
+    }
+    Ok(out)
+}
+
+/// MACHINE_OWN_KERNEL_TIERS (ADR 0119): tiers of `tiers` whose machines must have a
+/// kernel of their own, or `all`. A provider whose machines share their host's kernel
+/// can't make them, so that is a startup error rather than a quiet downgrade.
+fn own_kernel_tiers(raw: &str, tiers: &[(String, String)], p: &dyn MachineProvider) -> Result<Vec<String>, String> {
+    let names = list(raw);
+    let out: Vec<String> = match names.as_slice() {
+        [all] if all.eq_ignore_ascii_case("all") => tiers.iter().map(|(t, _)| t.clone()).collect(),
+        _ => names,
+    };
+    for (i, t) in out.iter().enumerate() {
+        if !tiers.iter().any(|(n, _)| n == t) {
+            return Err(format!("MACHINE_OWN_KERNEL_TIERS: \"{}\" isn't a tier in MACHINE_TIERS", crate::audit::clip(t, 32)));
+        }
+        if out[..i].contains(t) {
+            return Err(format!("MACHINE_OWN_KERNEL_TIERS: tier \"{t}\" is listed twice"));
+        }
+    }
+    if !out.is_empty() && p.substrate() != "vm" {
+        return Err(format!(
+            "MACHINE_OWN_KERNEL_TIERS: {} must have a kernel of their own, and {} machines are {}s that share their host's (ADR 0119). Use a provider that makes VMs, or take them out",
+            out.join(", "),
+            p.name(),
+            p.substrate()
+        ));
     }
     Ok(out)
 }
@@ -466,10 +498,12 @@ impl ControlPlane {
                 .check_plan(plan)
                 .map_err(|e| format!("MACHINE_TIERS: {tier}: {e}"))?;
         }
+        let own_kernel_tiers = own_kernel_tiers(&var("MACHINE_OWN_KERNEL_TIERS"), &tiers, provider.as_ref())?;
         Ok(ControlPlane {
             provider: Some(provider),
             routing: route::Routing::parse(&var("MACHINE_ROUTING"))?,
             tiers,
+            own_kernel_tiers,
             image,
             backups,
             provider_backups,
@@ -611,7 +645,7 @@ impl ControlPlane {
         match &self.provider {
             None => format!("off ({NEEDS_IT} for one machine per user)"),
             Some(p) => format!(
-                "{} ({}s), regions {}{}, tiers {}, backups {}, off-host backups {}, routing {}, enrollment {}, firewall {}",
+                "{} ({}s), regions {}{}, tiers {}{}, backups {}, off-host backups {}, routing {}, enrollment {}, firewall {}",
                 p.name(),
                 p.substrate(),
                 self.regions.first().map_or(String::new(), |r| format!("{r} (default)")),
@@ -621,6 +655,10 @@ impl ControlPlane {
                     .map(|(t, p)| format!("{t}={p}"))
                     .collect::<Vec<_>>()
                     .join(", "),
+                match self.own_kernel_tiers.as_slice() {
+                    [] => String::new(),
+                    t => format!(" (own kernel: {})", t.join(", ")),
+                },
                 match (self.backups, self.provider_backups) {
                     (false, _) => "off".to_string(),
                     (true, None) => "on".to_string(),
@@ -1790,11 +1828,12 @@ pub async fn substrate(Extension(a): Extension<Arc<Auth>>, Query(q): Query<HashM
     let tiers: Vec<Value> = cp
         .tiers
         .iter()
-        .map(|(t, plan)| json!({ "tier": t, "plan": plan, "resources": p.plan_view(plan) }))
+        .map(|(t, plan)| json!({ "tier": t, "plan": plan, "resources": p.plan_view(plan), "ownKernel": cp.own_kernel_tiers.contains(t) }))
         .collect();
     let mut v = json!({
         "provider": p.name(),
         "substrate": p.substrate(),
+        "kernel": if p.substrate() == "vm" { "own" } else { "shared" },
         "tiers": tiers,
         "regions": cp.regions,
         "defaultRegion": cp.regions.first(),
@@ -2085,6 +2124,9 @@ mod tests {
             (&certs, &[("MACHINE_REGIONS", "Node 1")][..], "MACHINE_REGIONS"),
             (&certs, &[("MACHINE_BACKUPS_RPO_HOURS", "30")][..], "MACHINE_BACKUP_RPO_HOURS"),
             (&certs, &[("MACHINE_PROVIDER", "docker")][..], "linode or incus"),
+            // Containers share the host's kernel, so a tier promised its own can't be made (ADR 0119).
+            (&certs, &[("MACHINE_OWN_KERNEL_TIERS", "pro")][..], "pro must have a kernel of their own, and incus machines are containers that share their host's"),
+            (&certs, &[("MACHINE_OWN_KERNEL_TIERS", "all")][..], "starter, pro, max must have a kernel of their own"),
             (&EnvStore::fixed(&[("INCUS_CLIENT_CERT", &cert), ("INCUS_SERVER_CERT", &server)]), &[][..], "INCUS_CLIENT_KEY"),
             (&EnvStore::fixed(&[("INCUS_CLIENT_CERT", &cert), ("INCUS_CLIENT_KEY", "nope"), ("INCUS_SERVER_CERT", &server)]), &[][..], "INCUS_CLIENT_KEY"),
             (
@@ -2143,6 +2185,21 @@ mod tests {
         assert!(cp.describe().contains("backups on (RPO 26 hours)"), "{}", cp.describe());
         let cp = with(&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_BACKUPS_RPO_HOURS", "48")]).unwrap();
         assert_eq!(cp.provider_backups.map(|p| p.rpo_ms), Some(48 * 3_600_000));
+        // Linode machines are VMs, so any tier may be promised its own kernel (ADR 0119).
+        assert!(cp.own_kernel_tiers.is_empty() && !cp.describe().contains("own kernel"), "off unless set");
+        let cp = with(&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_OWN_KERNEL_TIERS", " pro, max ")]).unwrap();
+        assert_eq!(cp.own_kernel_tiers, ["pro", "max"]);
+        assert!(cp.describe().contains("max=g6-standard-4 (own kernel: pro, max)"), "{}", cp.describe());
+        let cp = with(&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_OWN_KERNEL_TIERS", "ALL")]).unwrap();
+        assert_eq!(cp.own_kernel_tiers, ["starter", "pro", "max"]);
+        for (vars, want) in [
+            (&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_OWN_KERNEL_TIERS", "gold")][..], "\"gold\" isn't a tier in MACHINE_TIERS"),
+            (&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_OWN_KERNEL_TIERS", "pro,pro")][..], "tier \"pro\" is listed twice"),
+            (&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_OWN_KERNEL_TIERS", "all,pro")][..], "\"all\" isn't a tier"),
+        ] {
+            let e = with(vars).err().unwrap_or_else(|| panic!("{vars:?} should fail"));
+            assert!(e.contains(want), "{vars:?}: {e}");
+        }
         for (vars, want) in [
             (&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_BACKUPS_RPO_HOURS", "24")][..], "25 to 168"),
             (&[("MACHINE_REGIONS", "gb-lon"), ("MACHINE_BACKUPS_RPO_HOURS", "a day")][..], "25 to 168"),

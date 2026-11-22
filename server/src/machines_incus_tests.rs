@@ -302,8 +302,8 @@ async fn admins_see_the_substrate_and_check_the_host() {
     let env = serve().await;
     let (code, s) = json_call(&env, "GET", "/api/machines/substrate", "").await;
     assert_eq!(code, 200, "{s}");
-    assert_eq!((s["provider"].as_str(), s["substrate"].as_str()), (Some("incus"), Some("container")));
-    assert_eq!(s["tiers"][1], json!({ "tier": "pro", "plan": "c2-m4-d40", "resources": { "cpus": 2, "memoryGiB": 4, "diskGiB": 40, "processes": 4096 } }));
+    assert_eq!((s["provider"].as_str(), s["substrate"].as_str(), s["kernel"].as_str()), (Some("incus"), Some("container"), Some("shared")));
+    assert_eq!(s["tiers"][1], json!({ "tier": "pro", "plan": "c2-m4-d40", "resources": { "cpus": 2, "memoryGiB": 4, "diskGiB": 40, "processes": 4096 }, "ownKernel": false }));
     assert_eq!(s["regions"], json!(["local"]));
     assert_eq!(s["settings"]["project"], "superbot");
     assert!(s["checks"].is_null(), "the host is asked only when asked");
