@@ -127,8 +127,8 @@ async fn a_period_must_be_whole_days_in_the_past() {
 #[tokio::test]
 async fn each_file_carries_its_controls_evidence() {
     let (port, app, admin, _) = serve_app().await;
-    let (mfa_id, _) = user_with(port, &admin, "with-mfa@example.com", "member").await;
-    assert!(app.db.mfa_enable(&mfa_id, "sealed", 1, &[]));
+    let (enrolled, _) = user_with(port, &admin, "with-mfa@example.com", "member").await;
+    assert!(app.db.mfa_enable(&enrolled, "sealed", 1, &[]));
     let (plain_id, _) = user_with(port, &admin, "plain@example.com", "readonly").await;
     let sys = |a: &str| Event::new(Actor::system("server"), a);
     app.db.record(&sys("server.started").details(json!({ "version": "0.0.9" })));
@@ -150,8 +150,8 @@ async fn each_file_carries_its_controls_evidence() {
 
     let access = parse(file(&f, "access-review.json"));
     let people = access["people"].as_array().unwrap();
-    let person = |id: &str| people.iter().find(|p| p["id"] == id).cloned().unwrap_or_else(|| panic!("{id} missing: {access}"));
-    assert_eq!((person(&mfa_id)["role"].as_str(), person(&mfa_id)["mfa"]["enabled"].as_bool()), (Some("member"), Some(true)));
+    let person = |id: &str| people.iter().find(|p| p["id"] == id).cloned().expect("everyone who can sign in is listed");
+    assert_eq!((person(&enrolled)["role"].as_str(), person(&enrolled)["mfa"]["enabled"].as_bool()), (Some("member"), Some(true)));
     assert_eq!((person(&plain_id)["role"].as_str(), person(&plain_id)["mfa"]["enabled"].as_bool()), (Some("readonly"), Some(false)));
     assert_eq!((person(users::OPERATOR)["admin"].as_bool(), person(users::OPERATOR)["breakGlass"].as_bool()), (Some(true), Some(true)));
     assert_eq!(access["summary"]["people"].as_u64(), Some(people.len() as u64));
