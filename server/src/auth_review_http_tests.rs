@@ -21,6 +21,8 @@ const PUBLIC: &[(&str, &str)] = &[
     ("GET", "/api/auth/sso/{id}/start"),
     ("GET", "/api/auth/sso/{id}/callback"),
     ("POST", "/api/auth/sso/{id}/callback"),
+    ("POST", "/api/auth/sso/{id}/acs"),
+    ("GET", "/api/auth/sso/{id}/metadata"),
     ("POST", "/api/signups"),
     ("GET", "/api/signups/config"),
     // Stripe signs it; checked in `billing` (ADR 0040).

@@ -218,6 +218,12 @@ pub(super) async fn read_json(res: reqwest::Response) -> Result<(u16, Value), In
 
 async fn get_json(http: &reqwest::Client, url: &str) -> Result<Value, Invalid> {
     let res = http.get(url).header("accept", "application/json").send().await.map_err(|_| Invalid("idp_unreachable"))?;
+    match read_json(res).await? {
+        (200, v) => Ok(v),
+        _ => Err(Invalid("idp_bad_response")),
+    }
+}
+
 /// An IdP's SAML metadata document, at most `MAX_METADATA` bytes.
 async fn get_text(http: &reqwest::Client, url: &str) -> Result<String, Invalid> {
     let mut res = http.get(url).header("accept", "application/samlmetadata+xml, application/xml, text/xml").send().await.map_err(|_| Invalid("idp_unreachable"))?;
@@ -232,12 +238,6 @@ async fn get_text(http: &reqwest::Client, url: &str) -> Result<String, Invalid> 
         }
     }
     String::from_utf8(body).map_err(|_| Invalid("idp_bad_response"))
-}
-
-    match read_json(res).await? {
-        (200, v) => Ok(v),
-        _ => Err(Invalid("idp_bad_response")),
-    }
 }
 
 impl Provider {
@@ -256,8 +256,6 @@ impl Provider {
         }
     }
 
-    /// Whether a person with this email could sign in here, as far as the email shows:
-    /// Some(true) when the provider only takes listed domains and this is one,
     /// botd is the SAML service provider itself, rather than signing in over OIDC.
     pub fn saml_sp(&self) -> bool {
         matches!(self.kind, Kind::SamlSp { .. })
@@ -268,6 +266,8 @@ impl Provider {
         !self.saml_sp()
     }
 
+    /// Whether a person with this email could sign in here, as far as the email shows:
+    /// Some(true) when the provider only takes listed domains and this is one,
     /// Some(false) when it isn't, None when the provider doesn't go by email domain.
     pub fn takes_email(&self, email: &str) -> Option<bool> {
         match &self.kind {
@@ -317,16 +317,16 @@ impl Provider {
             Kind::GitHub { web, allowed_orgs, .. } => format!("members of {} on {web}", allowed_orgs.join(", ")),
             Kind::Saml { entity_id, alias, allowed_domains, .. } if allowed_domains.is_empty() => format!("anyone SAML IdP {entity_id} signs in (broker alias {alias})"),
             Kind::Saml { entity_id, alias, allowed_domains, .. } => format!("verified emails at {} from SAML IdP {entity_id} (broker alias {alias})", allowed_domains.join(", ")),
+            Kind::SamlSp { entity_id, allowed_domains, .. } if allowed_domains.is_empty() => {
+                format!("anyone SAML IdP {entity_id} signs in (native)")
+            }
+            Kind::SamlSp { entity_id, allowed_domains, .. } => format!("emails at {} from SAML IdP {entity_id} (native)", allowed_domains.join(", ")),
         }
     }
 
     /// Extra authorization request parameters: always show the account picker for the
     /// big consumer IdPs, and give Google its Workspace domain hint. The hint only
     /// narrows the picker; `claims` checks `hd` itself.
-            Kind::SamlSp { entity_id, allowed_domains, .. } if allowed_domains.is_empty() => {
-                format!("anyone SAML IdP {entity_id} signs in (native)")
-            }
-            Kind::SamlSp { entity_id, allowed_domains, .. } => format!("emails at {} from SAML IdP {entity_id} (native)", allowed_domains.join(", ")),
     pub fn auth_params(&self) -> Vec<(&'static str, String)> {
         match &self.kind {
             Kind::Entra { .. } => vec![("prompt", "select_account".into())],
@@ -345,13 +345,13 @@ impl Provider {
             // Straight to the SAML IdP, past the broker's own login page. Only a shortcut:
             // `claims` checks the IdP the broker actually used.
             Kind::Saml { alias, .. } => vec![(saml::HINT_PARAM, alias.clone())],
+            Kind::SamlSp { .. } => vec![],
         }
     }
 
     /// Where the provider's secret is set: env, `_FILE`, or the secrets store. Apple's is
     /// the private key that signs each client secret; the others', the client secret.
     pub fn env_var(&self) -> String {
-            Kind::SamlSp { .. } => vec![],
         let what = if matches!(self.kind, Kind::Apple { .. }) { "PRIVATE_KEY" } else { "CLIENT_SECRET" };
         format!("SSO_{}_{what}", self.id.to_ascii_uppercase())
     }
@@ -382,18 +382,18 @@ impl Provider {
 
     /// Why the provider isn't offered, for the startup log.
     pub fn not_ready(&self) -> Option<String> {
-        let var = self.env_var();
-        match (&self.kind, self.stored_secret()) {
-            (_, None) => Some(format!("not offered until {var} is set (env, _FILE, or `botctl secret set`)")),
-            (Kind::Apple { .. }, Some(key)) if apple::signing_key(key.expose()).is_err() => Some(format!("not offered: {var} isn't a Sign in with Apple key (the .p8 file)")),
-            _ => None,
-        }
         if let Kind::SamlSp { source, .. } = &self.kind {
             let loaded = self.idp.lock().unwrap_or_else(|e| e.into_inner()).is_some();
             return match source {
                 IdpSource::Saved if !loaded => Some(format!("not offered until its IdP metadata is imported: botctl sso saml {} import < metadata.xml", self.id)),
                 _ => None,
             };
+        }
+        let var = self.env_var();
+        match (&self.kind, self.stored_secret()) {
+            (_, None) => Some(format!("not offered until {var} is set (env, _FILE, or `botctl secret set`)")),
+            (Kind::Apple { .. }, Some(key)) if apple::signing_key(key.expose()).is_err() => Some(format!("not offered: {var} isn't a Sign in with Apple key (the .p8 file)")),
+            _ => None,
         }
     }
 
@@ -410,13 +410,13 @@ impl Provider {
     pub async fn authorization_endpoint(&self, http: &reqwest::Client, gap: Duration) -> Result<String, Invalid> {
         match &self.kind {
             Kind::GitHub { web, .. } => Ok(format!("{web}/login/oauth/authorize")),
+            Kind::SamlSp { .. } => Ok(self.idp_metadata(http, gap).await?.sso_url.clone()),
             _ => Ok(self.metadata(http, gap).await?.authorization_endpoint.clone()),
         }
     }
 
     /// The issuer of a tenant's tokens (Entra), or the provider's one issuer.
     pub fn issuer_for(&self, tenant: Option<&str>) -> Result<(String, Option<String>), String> {
-            Kind::SamlSp { .. } => Ok(self.idp_metadata(http, gap).await?.sso_url.clone()),
         match &self.kind {
             Kind::Entra { authority, tenant: own, allowed } => {
                 let tid = match tenant {
@@ -447,12 +447,6 @@ impl Provider {
         }
     }
 
-    /// The discovery document, retried at most once per `gap` after a failure.
-    pub async fn metadata(&self, http: &reqwest::Client, gap: Duration) -> Result<Arc<Metadata>, Invalid> {
-        let mut c = self.cache.lock().await;
-        let stale = c.meta.as_ref().map(|(m, _)| m.clone());
-        if let Some((m, at)) = &c.meta
-            && at.elapsed() < META_TTL
     /// Native SAML: the IdP metadata loaded now, from any source.
     pub fn idp_loaded(&self) -> Option<Arc<IdpMetadata>> {
         self.idp.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(m, _)| m.clone())
@@ -508,6 +502,12 @@ impl Provider {
         }
     }
 
+    /// The discovery document, retried at most once per `gap` after a failure.
+    pub async fn metadata(&self, http: &reqwest::Client, gap: Duration) -> Result<Arc<Metadata>, Invalid> {
+        let mut c = self.cache.lock().await;
+        let stale = c.meta.as_ref().map(|(m, _)| m.clone());
+        if let Some((m, at)) = &c.meta
+            && at.elapsed() < META_TTL
         {
             return Ok(m.clone());
         }

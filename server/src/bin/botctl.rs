@@ -1067,20 +1067,6 @@ fn license_summary(l: &Value) -> String {
     out
 }
 
-/// One line per user: their plan, each limit as used/allowed, their machine, their
-/// subscription, and any limit they're past (ADR 0040).
-/// One user's billing period (`GET /api/me/usage` or `/api/users/{key}/usage`), for people.
-fn period_summary(v: &Value) -> String {
-    let n = |v: &Value| v.as_u64().unwrap_or(0);
-    let of = |used: &Value, limit: &Value| match limit.as_u64() {
-        Some(l) => format!("{}/{}", n(used), l),
-        None => format!("{}/unlimited", n(used)),
-    };
-    let day = |ms: &Value| chrono::DateTime::from_timestamp_millis(ms.as_i64().unwrap_or(0)).map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default();
-    let (p, t) = (&v["period"], &v["tokens"]);
-    let source = if p["source"] == "subscription" { "subscription period" } else { "calendar month, UTC" };
-    let mut out = format!(
-        "{} plan, {} to {} ({source})\nTokens {} (input {}, output {}, cache read {}, cache write {})\nRuns {}",
 /// `GET /api/sso/{id}/saml`, for a terminal (ADR 0127): what the IdP admin enters, then what the IdP said.
 fn saml_summary(v: &Value) -> String {
     let s = |k: &str| v[k].as_str().unwrap_or("-").to_string();
@@ -1113,6 +1099,20 @@ fn saml_summary(v: &Value) -> String {
     out
 }
 
+/// One line per user: their plan, each limit as used/allowed, their machine, their
+/// subscription, and any limit they're past (ADR 0040).
+/// One user's billing period (`GET /api/me/usage` or `/api/users/{key}/usage`), for people.
+fn period_summary(v: &Value) -> String {
+    let n = |v: &Value| v.as_u64().unwrap_or(0);
+    let of = |used: &Value, limit: &Value| match limit.as_u64() {
+        Some(l) => format!("{}/{}", n(used), l),
+        None => format!("{}/unlimited", n(used)),
+    };
+    let day = |ms: &Value| chrono::DateTime::from_timestamp_millis(ms.as_i64().unwrap_or(0)).map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default();
+    let (p, t) = (&v["period"], &v["tokens"]);
+    let source = if p["source"] == "subscription" { "subscription period" } else { "calendar month, UTC" };
+    let mut out = format!(
+        "{} plan, {} to {} ({source})\nTokens {} (input {}, output {}, cache read {}, cache write {})\nRuns {}",
         v["tier"]["label"].as_str().unwrap_or_default(),
         day(&p["start"]),
         day(&p["end"]),
@@ -1365,6 +1365,17 @@ fn run(args: &[String]) -> Result<String, String> {
             let res = api(Cred::Operator, "DELETE", "/api/license", None)?;
             Ok(format!("Removed.\n{}", license_summary(&serde_json::from_str(&res).map_err(|e| e.to_string())?)))
         }
+        ["sso", "saml", id] => Ok(saml_summary(&serde_json::from_str(&api(Cred::Operator, "GET", &format!("/api/sso/{}/saml", encode(id)), None)?).map_err(|e| e.to_string())?)),
+        ["sso", "saml", id, "json"] => op("GET", &format!("/api/sso/{}/saml", encode(id)), None),
+        ["sso", "saml", id, "import", rest @ ..] if rest.len() <= 1 => {
+            let xml = match rest.first() {
+                None | Some(&"-") => stdin_value(std::io::stdin())?,
+                Some(path) => std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?,
+            };
+            let res = api(Cred::Operator, "PUT", &format!("/api/sso/{}/saml/idp-metadata", encode(id)), Some(json!({ "xml": xml }).to_string()))?;
+            Ok(format!("Imported.\n{}", saml_summary(&serde_json::from_str(&res).map_err(|e| e.to_string())?)))
+        }
+        ["sso", ..] => Err("Usage: botctl sso saml <provider> [json] | sso saml <provider> import [<file> | -]".into()),
         ["setup", "json"] => op("GET", "/api/setup", None),
         ["setup", rest @ ..] => {
             let (method, body) = setup_request(rest)?;
@@ -1379,17 +1390,6 @@ fn run(args: &[String]) -> Result<String, String> {
         ["user", "resume-routines", key] => op("POST", &format!("/api/users/{}/routines/resume", encode(key)), None),
         ["user", "erase", key, rest @ ..] => {
             let (path, body) = erase_request(key, rest)?;
-        ["sso", "saml", id] => Ok(saml_summary(&serde_json::from_str(&api(Cred::Operator, "GET", &format!("/api/sso/{}/saml", encode(id)), None)?).map_err(|e| e.to_string())?)),
-        ["sso", "saml", id, "json"] => op("GET", &format!("/api/sso/{}/saml", encode(id)), None),
-        ["sso", "saml", id, "import", rest @ ..] if rest.len() <= 1 => {
-            let xml = match rest.first() {
-                None | Some(&"-") => stdin_value(std::io::stdin())?,
-                Some(path) => std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?,
-            };
-            let res = api(Cred::Operator, "PUT", &format!("/api/sso/{}/saml/idp-metadata", encode(id)), Some(json!({ "xml": xml }).to_string()))?;
-            Ok(format!("Imported.\n{}", saml_summary(&serde_json::from_str(&res).map_err(|e| e.to_string())?)))
-        }
-        ["sso", ..] => Err("Usage: botctl sso saml <provider> [json] | sso saml <provider> import [<file> | -]".into()),
             op("POST", &path, Some(body.to_string()))
         }
         ["user", "handover", key, rest @ ..] => {
@@ -1880,6 +1880,21 @@ mod tests {
     }
 
     #[test]
+    fn saml_summary_shows_what_to_enter_at_the_idp() {
+        let mut v = json!({
+            "provider": "corp", "label": "Corp", "problem": null, "spEntityId": "https://bots.example/api/auth/sso/corp/metadata",
+            "acsUrl": "https://bots.example/api/auth/sso/corp/acs", "metadataUrl": "https://bots.example/api/auth/sso/corp/metadata",
+            "idpEntityId": "https://idp.example/saml", "source": "botctl", "from": null, "idp": null,
+        });
+        let out = saml_summary(&v);
+        assert!(out.contains("ACS URL (reply URL):      https://bots.example/api/auth/sso/corp/acs"), "{out}");
+        assert!(out.contains("from botctl: not loaded yet."), "{out}");
+        v["idp"] = json!({ "ssoUrl": "https://idp.example/sso", "certificates": [{ "sha256": "ab:cd", "subject": "CN=idp", "notAfter": 1_900_000_000_000_i64 }] });
+        let out = saml_summary(&v);
+        assert!(out.contains("Certificate SHA-256 ab:cd (CN=idp), expires 2030-03-17"), "{out}");
+    }
+
+    #[test]
     fn scim_commands() {
         let req = |a: &[&str]| scim_request(a).map(|(m, p, b)| (m, p, b.map(|b| serde_json::from_str::<Value>(&b).unwrap())));
         assert_eq!(req(&["tokens"]), Ok(("GET", "/api/scim/tokens".into(), None)));
@@ -1895,21 +1910,6 @@ mod tests {
         assert_eq!(req(&["groups"]), Ok(("GET", "/api/scim/groups".into(), None)));
         assert_eq!(req(&["group", "link", "okta", "t1"]), Ok(("POST", "/api/scim/groups".into(), Some(json!({ "tenant": "okta", "team": "t1", "externalId": null, "displayName": null })))));
         assert_eq!(
-    #[test]
-    fn saml_summary_shows_what_to_enter_at_the_idp() {
-        let mut v = json!({
-            "provider": "corp", "label": "Corp", "problem": null, "spEntityId": "https://bots.example/api/auth/sso/corp/metadata",
-            "acsUrl": "https://bots.example/api/auth/sso/corp/acs", "metadataUrl": "https://bots.example/api/auth/sso/corp/metadata",
-            "idpEntityId": "https://idp.example/saml", "source": "botctl", "from": null, "idp": null,
-        });
-        let out = saml_summary(&v);
-        assert!(out.contains("ACS URL (reply URL):      https://bots.example/api/auth/sso/corp/acs"), "{out}");
-        assert!(out.contains("from botctl: not loaded yet."), "{out}");
-        v["idp"] = json!({ "ssoUrl": "https://idp.example/sso", "certificates": [{ "sha256": "ab:cd", "subject": "CN=idp", "notAfter": 1_900_000_000_000_i64 }] });
-        let out = saml_summary(&v);
-        assert!(out.contains("Certificate SHA-256 ab:cd (CN=idp), expires 2030-03-17"), "{out}");
-    }
-
             req(&["group", "link", "entra", "t1", "--external-id", "8aa1", "--name", "Platform Team"]),
             Ok(("POST", "/api/scim/groups".into(), Some(json!({ "tenant": "entra", "team": "t1", "externalId": "8aa1", "displayName": "Platform Team" }))))
         );

@@ -182,9 +182,9 @@ const TEMPLATES: [(&str, &str, &str, &[&str]); 6] = [
     ),
     (
         "saml",
-        "A SAML IdP through a broker (ADFS, Shibboleth)",
-        "docs/sso/saml.md",
-        &["TYPE=saml", "ISSUER=https://<broker-host>/realms/<realm>", "CLIENT_ID=<broker-client-id>", "IDP_ALIAS=<idp-alias>", "IDP_ENTITY_ID=<idp-entity-id>", "LABEL=Company SSO", "# ALLOWED_DOMAINS=example.com"],
+        "A SAML IdP (Okta, Entra ID, ADFS, OneLogin)",
+        "docs/sso/saml-native.md",
+        &["TYPE=saml", "IDP_ENTITY_ID=<idp-entity-id>", "IDP_METADATA_URL=https://<idp-host>/<metadata-path>", "LABEL=Company SSO", "# ALLOWED_DOMAINS=example.com"],
     ),
 ];
 
@@ -209,8 +209,14 @@ fn templates(providers: &[Arc<Provider>], public_url: Option<&str>, sso_public_u
                     None => format!("SSO_{up}_{s}"),
                 });
             }
-            let secret = if *id == "apple" { format!("SSO_{up}_PRIVATE_KEY") } else { format!("SSO_{up}_CLIENT_SECRET") };
+            // Native SAML has no secret; the IdP posts to its ACS rather than redirecting to a callback.
+            let secret = match *id {
+                "apple" => Some(format!("SSO_{up}_PRIVATE_KEY")),
+                "saml" => None,
+                _ => Some(format!("SSO_{up}_CLIENT_SECRET")),
+            };
             let base = sso_public_url.or(public_url).unwrap_or("https://<your-domain>");
+            let step = if *id == "saml" { "acs" } else { "callback" };
             json!({
                 "id": id,
                 "label": label,
@@ -218,7 +224,7 @@ fn templates(providers: &[Arc<Provider>], public_url: Option<&str>, sso_public_u
                 "configured": ids.contains(id),
                 "env": env.join("\n"),
                 "secret": secret,
-                "callbackUrl": format!("{base}/api/auth/sso/{id}/callback"),
+                "callbackUrl": format!("{base}/api/auth/sso/{id}/{step}"),
             })
         })
         .collect()
@@ -518,6 +524,7 @@ mod tests {
             ("<broker-client-id>", "superbot"),
             ("<idp-alias>", "adfs"),
             ("<idp-entity-id>", "http://adfs.example.com/adfs/services/trust"),
+            ("<metadata-path>", "app/exk1abc/sso/saml/metadata"),
             ("<your-domain>", "bots.example.com"),
         ];
         let all = templates(&[], None, None);
@@ -532,7 +539,7 @@ mod tests {
                 env.lines().filter(|l| !l.starts_with('#')).filter_map(|l| l.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect();
             let sso = crate::sso::Sso::from_vars(&|k| vars.get(k).cloned()).unwrap_or_else(|e| panic!("{}: {e}\n{env}", t["id"]));
             let p = &sso.providers[0];
-            assert_eq!((p.id.as_str(), p.env_var()), (t["id"].as_str().unwrap(), t["secret"].as_str().unwrap().to_string()));
+            assert_eq!((p.id.as_str(), p.needs_secret().then(|| p.env_var())), (t["id"].as_str().unwrap(), t["secret"].as_str().map(String::from)));
             assert_eq!(sso.callback_url(&p.id), t["callbackUrl"].as_str().unwrap().replace("<your-domain>", "bots.example.com"));
         }
     }

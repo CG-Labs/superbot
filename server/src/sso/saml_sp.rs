@@ -285,10 +285,10 @@ pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
 
     let conditions = only(assertion, ASSERTION, "Conditions").ok_or(Refused("wrong_audience", None))?;
     let mut until = i64::MAX;
-    if let Some(nb) = conditions.attribute("NotBefore") {
-        if time(nb)? > latest {
-            return Err(Refused("not_yet_valid", None));
-        }
+    if let Some(nb) = conditions.attribute("NotBefore")
+        && time(nb)? > latest
+    {
+        return Err(Refused("not_yet_valid", None));
     }
     if let Some(na) = conditions.attribute("NotOnOrAfter") {
         let na = time(na)?;
@@ -314,10 +314,10 @@ pub fn check_response(posted: &str, e: &Expect) -> Result<Checked, Refused> {
         if na <= earliest {
             return Err(Refused("expired", None));
         }
-        if let Some(nb) = d.attribute("NotBefore") {
-            if time(nb)? > latest {
-                return Err(Refused("not_yet_valid", None));
-            }
+        if let Some(nb) = d.attribute("NotBefore")
+            && time(nb)? > latest
+        {
+            return Err(Refused("not_yet_valid", None));
         }
         if d.attribute("InResponseTo") != Some(e.request_id) {
             return Err(Refused("in_response_to_mismatch", None));
@@ -688,9 +688,8 @@ mod tests {
         assert_eq!(with(|r| r.name_id_format = TRANSIENT.into()), "transient_subject");
         assert_eq!(with(|r| r.name_id = " padded".into()), "missing_subject");
         assert_eq!(with(|r| r.status = "urn:oasis:names:tc:SAML:2.0:status:Responder".into()), "idp_error");
-        let nested =
-            format!(r#"<samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Responder"><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:RequestDenied"/></samlp:StatusCode>"#);
-        let denied = base().xml().replace(&format!(r#"<samlp:StatusCode Value="{SUCCESS}"/>"#), &nested);
+        let nested = r#"<samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Responder"><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:RequestDenied"/></samlp:StatusCode>"#;
+        let denied = base().xml().replace(&format!(r#"<samlp:StatusCode Value="{SUCCESS}"/>"#), nested);
         assert_eq!(check(&denied).unwrap_err(), Refused("idp_error", Some("Responder/RequestDenied".into())));
         let mut unsolicited = base();
         unsolicited.in_response_to = String::new();

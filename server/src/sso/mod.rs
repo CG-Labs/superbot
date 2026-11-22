@@ -478,10 +478,6 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
             }
             (Kind::Oidc { issuer, map: claim_map("sub")?, allowed_domains }, id)
         }
-        "saml" => {
-            let issuer = var(&key("ISSUER")).ok_or_else(|| format!("{} is required: the OIDC issuer of the broker that speaks SAML to your IdP, like https://sso.example.com/realms/superbot", key("ISSUER")))?;
-            if !secure_url(&issuer) {
-                return Err(format!("{} must be an https URL", key("ISSUER")));
         "saml" if native_saml => {
             if let Some(k) = SAML_BRIDGE_ONLY.iter().find(|k| var(&key(k)).is_some()) {
                 return Err(format!("{} is only for the SAML bridge (with {}). Native SAML reads the IdP's metadata instead", key(k), key("ISSUER")));
@@ -513,9 +509,13 @@ fn parse_provider(id: &str, public_url: &str, var: &Var, list: &List) -> Result<
             }
             (Kind::SamlSp { entity_id, sp_entity_id, source, attributes, allowed_domains }, saml::LABEL)
         }
-            }
+        "saml" => {
             if let Some(k) = SAML_NATIVE_ONLY.iter().find(|k| var(&key(k)).is_some()) {
                 return Err(format!("{} is only for native SAML (without {})", key(k), key("ISSUER")));
+            }
+            let issuer = var(&key("ISSUER")).ok_or_else(|| format!("{} is required: the OIDC issuer of the broker that speaks SAML to your IdP, like https://sso.example.com/realms/superbot", key("ISSUER")))?;
+            if !secure_url(&issuer) {
+                return Err(format!("{} must be an https URL", key("ISSUER")));
             }
             let alias = var(&key("IDP_ALIAS")).ok_or_else(|| format!("{} is required: the SAML IdP's alias in the broker, like adfs", key("IDP_ALIAS")))?;
             let alias = saml::alias(&alias).ok_or_else(|| format!("{}: {alias} is not an alias (letters, digits, . _ -)", key("IDP_ALIAS")))?;
@@ -707,6 +707,8 @@ pub async fn start(
         }
     };
     let (state, nonce, verifier, binder) = (random(), random(), random(), random());
+    // Native SAML: the AuthnRequest's ID, which the response's InResponseTo must name.
+    let nonce = if p.saml_sp() { saml_sp::request_id() } else { nonce };
     let ret = match ret {
         Return::Cookie { .. } => Return::Cookie { binder: hash(&binder) },
         r => r,
@@ -717,8 +719,15 @@ pub async fn start(
         return no_store(ret.fail("sso_too_many"));
     }
     let mut url = Url::parse(&endpoint).expect("checked by secure_url");
-    // Native SAML: the AuthnRequest's ID, which the response's InResponseTo must name.
-    let nonce = if p.saml_sp() { saml_sp::request_id() } else { nonce };
+    if let Kind::SamlSp { sp_entity_id, .. } = &p.kind {
+        let request = saml_sp::authn_request(&Sp { entity_id: sp_entity_id, acs: &sso.acs_url(&id) }, &nonce, &endpoint, at);
+        url.query_pairs_mut().extend_pairs([("SAMLRequest", saml_sp::redirect_encode(&request).as_str()), ("RelayState", &state)]);
+        let mut res = see(url.as_str());
+        if matches!(ret, Return::Cookie { .. }) {
+            res.headers_mut().insert(header::SET_COOKIE, saml_binder_cookie(&binder, PENDING_TTL_MS / 1000));
+        }
+        return no_store(res);
+    }
     url.query_pairs_mut().extend_pairs([
         ("client_id", p.client_id.as_str()),
         ("response_type", "code"),
@@ -729,15 +738,6 @@ pub async fn start(
         ("code_challenge_method", "S256"),
     ]);
     if p.oidc() {
-    if let Kind::SamlSp { sp_entity_id, .. } = &p.kind {
-        let request = saml_sp::authn_request(&Sp { entity_id: sp_entity_id, acs: &sso.acs_url(&id) }, &nonce, &endpoint, at);
-        url.query_pairs_mut().extend_pairs([("SAMLRequest", saml_sp::redirect_encode(&request).as_str()), ("RelayState", &state)]);
-        let mut res = see(url.as_str());
-        if matches!(ret, Return::Cookie { .. }) {
-            res.headers_mut().insert(header::SET_COOKIE, saml_binder_cookie(&binder, PENDING_TTL_MS / 1000));
-        }
-        return no_store(res);
-    }
         url.query_pairs_mut().extend_pairs([("response_mode", p.response_mode()), ("nonce", &nonce)]);
     }
     for (k, v) in p.auth_params() {
@@ -830,6 +830,14 @@ async fn finish(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, q: &Ha
             return ret.fail(if matches!(e.0, "wrong_domain" | "email_unverified" | "wrong_org" | "not_brokered") { "sso_wrong_account" } else { "sso_failed" });
         }
     };
+    complete(a, app, source, id, p, &pending, claims, at)
+}
+
+/// The end of every sign-in, once the IdP vouched for `claims`: the linked (or just-in-time)
+/// user, if active, gets a session cookie, or a one-time code for the app that started.
+#[allow(clippy::too_many_arguments)]
+fn complete(a: &Auth, app: &AppState, source: &Source, id: &str, p: &Provider, pending: &Pending, mut claims: Claims, at: i64) -> Response {
+    let (sso, ret) = (&a.sso, &pending.ret);
     if claims.name.is_none() {
         claims.name = pending.name.clone();
     }
@@ -842,14 +850,6 @@ async fn finish(a: &Auth, source: &Source, headers: &HeaderMap, id: &str, q: &Ha
     };
     match ret {
         Return::Cookie { .. } => {
-    complete(a, app, source, id, p, &pending, claims, at)
-}
-
-/// The end of every sign-in, once the IdP vouched for `claims`: the linked (or just-in-time)
-/// user, if active, gets a session cookie, or a one-time code for the app that started.
-#[allow(clippy::too_many_arguments)]
-fn complete(a: &Auth, app: &AppState, source: &Source, id: &str, p: &Provider, pending: &Pending, mut claims: Claims, at: i64) -> Response {
-    let (sso, ret) = (&a.sso, &pending.ret);
             let label = pending.label.as_deref().or(Some("Web"));
             let (s, token) = users::start_session(a, &user, "sso", Some((id, &claims.key())), None, true, label, source);
             signed_in(a, &user, &s, id, &claims, source);
@@ -871,18 +871,6 @@ fn complete(a: &Auth, app: &AppState, source: &Source, id: &str, p: &Provider, p
     }
 }
 
-/// The user an identity belongs to: linked by an admin, or made now (just in time).
-/// Err is (audit reason, page error code).
-fn resolve(app: &AppState, p: &Provider, c: &Claims) -> Result<User, (&'static str, &'static str)> {
-    let found = match app.db.identity(&c.issuer, &c.subject) {
-        Some(f) => f,
-        None => {
-            let Some(role) = p.jit_role else { return Err(("not_linked", "sso_not_linked")) };
-            let email = c.email.as_deref().map(str::trim).filter(|e| users::valid_email(e));
-            let name = c.name.clone().or_else(|| email.map(String::from)).unwrap_or_else(|| format!("{} user", p.label));
-            let new = NewIdentity { provider: &p.id, issuer: &c.issuer, subject: &c.subject, tenant: c.tenant.as_deref(), email, created_by: Some("sso") };
-            match app.db.create_sso_user(email, &name, role, &new) {
-                Ok(u) => {
 /// `POST /api/auth/sso/{id}/acs`: the IdP posts its SAML response here (HTTP-POST binding).
 pub async fn acs(Extension(a): Extension<Arc<Auth>>, Extension(source): Extension<Source>, headers: HeaderMap, Path(id): Path<String>, Form(f): Form<HashMap<String, String>>) -> Response {
     let mut res = finish_saml(&a, &source, &headers, &id, &f).await;
@@ -1027,6 +1015,18 @@ pub async fn saml_import(State(app): State<AppState>, Extension(a): Extension<Ar
     Ok(Json(saml_view(&a, p)))
 }
 
+/// The user an identity belongs to: linked by an admin, or made now (just in time).
+/// Err is (audit reason, page error code).
+fn resolve(app: &AppState, p: &Provider, c: &Claims) -> Result<User, (&'static str, &'static str)> {
+    let found = match app.db.identity(&c.issuer, &c.subject) {
+        Some(f) => f,
+        None => {
+            let Some(role) = p.jit_role else { return Err(("not_linked", "sso_not_linked")) };
+            let email = c.email.as_deref().map(str::trim).filter(|e| users::valid_email(e));
+            let name = c.name.clone().or_else(|| email.map(String::from)).unwrap_or_else(|| format!("{} user", p.label));
+            let new = NewIdentity { provider: &p.id, issuer: &c.issuer, subject: &c.subject, tenant: c.tenant.as_deref(), email, created_by: Some("sso") };
+            match app.db.create_sso_user(email, &name, role, &new) {
+                Ok(u) => {
                     let mut d = json!({ "email": u.email, "name": u.name, "role": role, "provider": p.id, "reason": "just-in-time sign-up" });
                     claim_details(&mut d, c);
                     app.db.record(&Event::new(Actor::system("sso"), "user.created").target("user", &u.id).details(d));
@@ -1505,22 +1505,6 @@ mod tests {
         assert!(with_base(&okta, &[("SSO_OKTA_IDP_ENTITY_ID", ADFS)]).is_err());
     }
 
-    #[test]
-    fn all_six_types_side_by_side() {
-        let s = parse(&[
-            ("SSO_PROVIDERS", "entra,google,okta,github,apple,adfs"),
-            ("SSO_PUBLIC_URL", "https://bot.example.com"),
-            ("SSO_ENTRA_CLIENT_ID", "c1"),
-            ("SSO_ENTRA_TENANT", T1),
-            ("SSO_GOOGLE_CLIENT_ID", "c2"),
-            ("SSO_OKTA_TYPE", "oidc"),
-            ("SSO_OKTA_ISSUER", "https://acme.okta.example"),
-            ("SSO_OKTA_CLIENT_ID", "c3"),
-            ("SSO_GITHUB_CLIENT_ID", "c4"),
-            ("SSO_APPLE_CLIENT_ID", "c5"),
-            ("SSO_APPLE_TEAM_ID", "TEAM123456"),
-            ("SSO_APPLE_KEY_ID", "KEY1234567"),
-            ("SSO_ADFS_TYPE", "saml"),
     fn native(extra: &[(&'static str, &'static str)]) -> Result<Sso, String> {
         let base = [("SSO_PROVIDERS", "corp"), ("SSO_PUBLIC_URL", "https://bot.example.com"), ("SSO_CORP_TYPE", "saml"), ("SSO_CORP_IDP_ENTITY_ID", ADFS)];
         with_base(&base, extra)
@@ -1574,6 +1558,22 @@ mod tests {
         assert!(saml(&[("SSO_ADFS_SP_ENTITY_ID", "urn:x")]).is_err());
     }
 
+    #[test]
+    fn all_six_types_side_by_side() {
+        let s = parse(&[
+            ("SSO_PROVIDERS", "entra,google,okta,github,apple,adfs"),
+            ("SSO_PUBLIC_URL", "https://bot.example.com"),
+            ("SSO_ENTRA_CLIENT_ID", "c1"),
+            ("SSO_ENTRA_TENANT", T1),
+            ("SSO_GOOGLE_CLIENT_ID", "c2"),
+            ("SSO_OKTA_TYPE", "oidc"),
+            ("SSO_OKTA_ISSUER", "https://acme.okta.example"),
+            ("SSO_OKTA_CLIENT_ID", "c3"),
+            ("SSO_GITHUB_CLIENT_ID", "c4"),
+            ("SSO_APPLE_CLIENT_ID", "c5"),
+            ("SSO_APPLE_TEAM_ID", "TEAM123456"),
+            ("SSO_APPLE_KEY_ID", "KEY1234567"),
+            ("SSO_ADFS_TYPE", "saml"),
             ("SSO_ADFS_ISSUER", "https://sso.example.com/realms/superbot"),
             ("SSO_ADFS_CLIENT_ID", "c6"),
             ("SSO_ADFS_IDP_ALIAS", "adfs"),

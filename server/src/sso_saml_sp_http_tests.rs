@@ -150,7 +150,8 @@ async fn forged_misdirected_and_stale_responses_are_refused() {
     let u = sp.app.db.create_user(None, Some("ada@example.com"), "Ada", Role::Member).unwrap();
     call(sp.port, "POST", &format!("/api/users/{}/identities", u.id), &sp.admin, &json!({ "provider": sp.id, "subject": NAME_ID }).to_string()).await;
     let now = db::now();
-    let cases: Vec<(&str, Box<dyn FnOnce(&mut Response)>)> = vec![
+    type Tweak = Box<dyn FnOnce(&mut Response)>;
+    let cases: Vec<(&str, Tweak)> = vec![
         ("unsigned", Box::new(|r| r.sign_assertion = false)),
         ("bad_signature", Box::new(|r| r.signer = 1)),
         ("wrong_audience", Box::new(|r| r.audience = "https://other.example/sp".into())),

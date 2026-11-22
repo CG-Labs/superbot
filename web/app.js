@@ -1267,9 +1267,9 @@ function setupSignIn(s) {
   setup.template = pick.id;
   const template = `<h2>Add a provider</h2>
     <div class="bar"><label>Provider <select id="setup-template">${s.templates.map((t) => `<option value="${esc(t.id)}" ${t.id === pick.id ? "selected" : ""}>${esc(t.label)}${t.configured ? " (set up)" : ""}</option>`).join("")}</select></label></div>
-    <p class="hint">1. Register SuperBot at the provider (see ${esc(pick.docs)}) with this redirect URI:</p>${copyBlock(pick.callbackUrl)}
+    <p class="hint">1. Register SuperBot at the provider (see ${esc(pick.docs)}) with this ${pick.secret ? "redirect URI" : "ACS URL (reply URL)"}:</p>${copyBlock(pick.callbackUrl)}
     <p class="hint">2. Add these lines to .env, filling in the &lt;placeholders&gt;:</p>${copyBlock(pick.env)}
-    <p class="hint">3. Restart botd (below). 4. The provider then shows up on this page: save its secret, <code>${esc(pick.secret)}</code>, there.</p>
+    <p class="hint">3. Restart botd (below). 4. ${pick.secret ? `The provider then shows up on this page: save its secret, <code>${esc(pick.secret)}</code>, there.` : `It needs no secret: <code>botctl sso saml ${esc(pick.id)}</code> shows its SP entity ID and checks the IdP metadata.`}</p>
     ${howto(s.restart)}`;
   return verdict(s.ok, s.detail) + providers + `<h2>Admins</h2>${admins}<p class="hint">${esc(extra)}</p>` + template;
 }
