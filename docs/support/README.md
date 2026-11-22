@@ -11,6 +11,10 @@ How customers get help with SuperBot, how fast, and how the Provider runs suppor
 | [Escalation](escalation.md) | Who a ticket goes to next, when, and how a customer escalates |
 | [Onboarding and success](onboarding.md) | Getting a new customer live: SSO and SCIM, isolation, backups and residency checklists, then the success cadence |
 | [Support bundle](support-bundle.md) | `botctl support-bundle`: what it collects, what it never collects, and how to send it |
+| [Technical account managers](tam.md) | The named TAM for Enterprise customers: what they do, the cadence from kickoff to renewal, and handover |
+| [Customer health score](health-score.md) | `botctl health-score`: six signals from botd's own records, how they're scored, and what to do about each |
+| [Health check](health-check.md) | The TAM's monthly (Enterprise) or quarterly checklist |
+| [Quarterly business review](qbr-template.md) | The template for the review with the customer's owner and sponsor |
 
 Runbooks for the incidents support sees most:
 
@@ -20,6 +24,11 @@ Runbooks for the incidents support sees most:
 | [Machine down or restore](runbook-machine-down.md) | A user's machine, an Incus host, or the server itself is down |
 | [Harness or model provider outage](runbook-harness-outage.md) | Bot runs fail or time out on one harness or provider |
 | [Approval queue stuck](runbook-approvals-stuck.md) | Bots wait on approvals nobody sees, or that never resolve |
+| [SAML sign-in](runbook-saml.md) | SAML sign-in fails: signatures, certificates, clocks, metadata |
+| [Custom roles](runbook-custom-roles.md) | Someone can't do what their role should allow, or can do too much |
+| [Residency pins](runbook-residency.md) | A pinned customer's machine, backup or Bot run is refused or lands in the wrong region |
+| [Air-gapped installs](runbook-air-gapped.md) | An offline install or upgrade fails, or something tries to reach the internet |
+| [Run limits and allow-lists](runbook-run-limits-egress.md) | Runs are held to limits or refused, or a tool can't reach a host |
 
 ## Opening a ticket
 
@@ -40,5 +49,6 @@ Check `<status-page-url>` (the server's `/status`) first: a known incident there
 ## For the Provider
 
 - Keep [tiers](tiers.md) in step with the published plans (`/pricing`, from the tiers file, [ADR 0121](../adr/0121-published-plans.md)) and the [SLO](../slo.md). A plan's support line can also go in its `features` in the tiers file, so buyers see it on `/pricing`.
+- Name a TAM and a backup for each Enterprise customer before its kickoff ([TAM programme](tam.md)), and keep each TAM's accounts few enough to hold the [cadence](tam.md#cadence).
 - Staff an on-call rota before selling Severity 1 response outside business hours. Response targets are a promise only once the rota exists.
 - Review this folder with the rest of the [security pack](../security/README.md) at least once a year, and after any incident whose review changes a runbook.

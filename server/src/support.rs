@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 /// Bumped when a file's shape changes, so support tools can tell bundles apart.
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 const AUDIT_DAYS: i64 = 7;
 /// Newest events read for the summary; older ones in the window are counted as truncated.
 const AUDIT_SCAN: i64 = 20_000;
@@ -55,6 +55,8 @@ you send it: every file is plain text.
                       and the approval policy
   health.json         the status page's checks and open incidents, the setup checklist,
                       license, approvals waiting, runs, machines, database and backups
+  health-score.json   the customer health score for the last 30 days and the signals
+                      behind it: counts and reason codes only
   logs.jsonl          the newest lines botd logged since it started (at most 2,000)
   audit-summary.json  the last 7 days of the audit log, counted by action and outcome,
                       and the newest failures and denials (no names, emails or addresses)
@@ -445,6 +447,7 @@ pub fn build(app: &App, vars: &[(String, String)], setup: Value, now_ms: i64) ->
         ("version.json", json_file(version(app, started.as_ref(), now_ms), &names)),
         ("config.json", json_file(config, &names)),
         ("health.json", json_file(health(app, setup, now_ms), &names)),
+        ("health-score.json", json_file(crate::health_score::build(app, now_ms, crate::health_score::DEFAULT_DAYS), &names)),
         ("logs.jsonl", redact::text(&logs).into_owned().into_bytes()),
         ("audit-summary.json", json_file(audit, &names)),
     ];
