@@ -128,8 +128,10 @@ if (offline_unpack_bundle "$wrong" "$T/u") 2>"$T/arch.err"; then fail "the insta
 grep -q "This bundle is for $other" "$T/arch.err" || fail "the arch refusal didn't say why"
 ok "verify reads any arch's bundle; the installer takes only this host's"
 
-# Images, with stand-ins for skopeo, docker and cosign over a registry in $REG: an index with
-# this arch's image, another arch's and an attestation; a local image; a mirror to push to.
+# Images, with stand-ins for skopeo, docker, cosign and superbot-oci over a registry in $REG: an
+# index with this arch's image, another arch's and an attestation; a local image; a mirror to
+# push to. superbot-oci is only in the bin folder, so push finds it in the bundle, as on a mirror
+# host; its own tests (cargo test --bin superbot-oci) run it against registries.
 command -v jq >/dev/null 2>&1 || fail "the image checks need jq"
 case $ARCH in x86_64) DARCH=amd64 OTHER_DARCH=arm64 ;; *) DARCH=arm64 OTHER_DARCH=amd64 ;; esac
 REG="$T/reg"
@@ -224,6 +226,10 @@ case "$1 $2" in
     [[ -f $STUB_REG/local/$(key "$ref") ]] || exit 1
     if [[ $3 == --format ]]; then cat "$STUB_REG/local/$(key "$ref")"; else echo '[{}]'; fi ;;
   "save -o") : >"$3" ;;
+  "load -q")
+    # As docker load reads it: an OCI archive with a Docker manifest.json naming the image.
+    ref=$(tar -xOf "$4" manifest.json 2>/dev/null | jq -r '.[0].RepoTags[0]') || { echo "stub docker: $4 isn't an image archive" >&2; exit 1; }
+    echo loaded >"$STUB_REG/local/$(key "$ref")" ;;
   "buildx imagetools") echo '{"spdxVersion":"SPDX-2.3"}' ;;
   *) echo "stub docker: $*" >&2; exit 2 ;;
 esac
@@ -236,7 +242,47 @@ echo "$*" >>"$STUB_REG/cosign.log"
 grep -qx "$2" "$STUB_REG/signed" || { echo "no matching signatures" >&2; exit 1; }
 echo '[{"critical":{"identity":{"docker-reference":"reg.test/cg/superbot"}}}]'
 EOF
-chmod 0755 "$T/stub/"*
+cat >"$T/bin/superbot-oci" <<'EOF'
+#!/usr/bin/env bash
+# superbot-oci over $STUB_REG. fetch writes a layout naming the index and one signature; push
+# tags the signed index (from more than one unit) or the one unit's image, and prints its
+# digest, or another one with STUB_REWRITE=push.
+set -euo pipefail
+reg=$STUB_REG
+key() { printf '%s' "$1" | sha256sum | cut -c1-16; }
+case $1 in
+  --version) echo "superbot-oci stub" ;;
+  fetch)
+    echo "$*" >>"$reg/oci.log"
+    [[ $2 == --from && $4 == --image && $6 == --out ]] || { echo "stub superbot-oci: $*" >&2; exit 2; }
+    out=$7
+    mkdir -p "$out/blobs/sha256"
+    echo '{"imageLayoutVersion":"1.0.0"}' >"$out/oci-layout"
+    sig=$(printf '{"signature-for":"%s"}' "$5")
+    d=$(printf '%s' "$sig" | sha256sum | cut -c1-64)
+    printf '%s' "$sig" >"$out/blobs/sha256/$d"
+    printf '{"schemaVersion":2,"manifests":[{"digest":"%s","annotations":{"dev.superbot.oci.role":"index"}},{"digest":"sha256:%s","annotations":{"dev.superbot.oci.role":"referrer"}}]}' \
+      "${3##*@}" "$d" >"$out/index.json" ;;
+  push)
+    [[ $2 == --to ]] || { echo "stub superbot-oci: $*" >&2; exit 2; }
+    dest=$3
+    for u in "${@:4}"; do
+      [[ -f $u/image/oci-layout && -f $u/image/manifest.json ]] || { echo "stub superbot-oci: $u/image isn't an image layout" >&2; exit 1; }
+      echo "push $dest $(jq -r '.manifests[0].digest' "$u/image/index.json") signatures=$([[ -f $u/signatures/index.json ]] && echo yes || echo no)" >>"$reg/oci.log"
+    done
+    if [[ $# -gt 4 ]]; then
+      top=$(jq -r '.manifests[] | select(.annotations["dev.superbot.oci.role"] == "index") | .digest' "$4/signatures/index.json")
+      cp "$reg/blobs/${top#sha256:}" "$reg/refs/$(key "$dest")"
+    else
+      top=$(jq -r '.manifests[0].digest' "$4/image/index.json")
+      cp "$4/image/blobs/sha256/${top#sha256:}" "$reg/refs/$(key "$dest")"
+    fi
+    [[ ${STUB_REWRITE:-} != push ]] || top=sha256:$(printf '%064d' 0)
+    echo "$top" ;;
+  *) echo "stub superbot-oci: $*" >&2; exit 2 ;;
+esac
+EOF
+chmod 0755 "$T/stub/"* "$T/bin/superbot-oci"
 stubbed() { STUB_REG=$REG PATH="$T/stub:$PATH" "$@"; }
 ibuild() { stubbed "$DIR/offline-bundle.sh" build --out "$1" --version "$VERSION" --bin-dir "$T/bin" --client-dir "$T/client" "${@:2}"; }
 
@@ -251,7 +297,13 @@ grep -qx "images=superbot" "$I/MANIFEST" || fail "MANIFEST doesn't list the imag
 [[ "$(cat "$I/images/superbot.digest")" == "$MINE" ]] || fail "the bundled image isn't this arch's, with the registry's digest"
 grep -Fq "verify reg.test/cg/superbot@$INDEX --certificate-identity https://ci.test/docker.yml@refs/tags/v1.0.0" "$REG/cosign.log" \
   || fail "cosign didn't check the index the tag named, with the identity given"
-for f in superbot.cosign.json superbot.sbom.spdx.json superbot.ref; do [[ -s "$I/images/$f" ]] || fail "no images/$f"; done
+for f in superbot.cosign.json superbot.sbom.spdx.json superbot.ref superbot.signatures.tar bin/superbot-oci; do [[ -s "$I/images/$f" || -s "$I/$f" ]] || fail "no $f"; done
+[[ "$(cat "$I/images/superbot.index")" == "$INDEX" ]] || fail "the bundle doesn't record the signed index the image came from"
+grep -Fq "fetch --from reg.test/cg/superbot@$INDEX --image $MINE --out " "$REG/oci.log" \
+  || fail "the signatures weren't copied from the signed index, for this arch's image"
+mkdir "$T/ix/sig" && tar -xf "$I/images/superbot.signatures.tar" -C "$T/ix/sig"
+[[ -f "$T/ix/sig/oci-layout" && "$(jq -r '.manifests[0].digest' "$T/ix/sig/index.json")" == "$INDEX" ]] || fail "images/superbot.signatures.tar isn't the layout superbot-oci wrote"
+[[ "$(tar -tvf "$I/images/superbot.signatures.tar" | awk '{ print $2 }' | sort -u)" == 0/0 ]] || fail "the signatures layout's entries aren't owned by 0/0"
 mkdir "$T/ix/oci" && tar -xf "$I/images/superbot.tar" -C "$T/ix/oci"
 O="$T/ix/oci"
 [[ -f "$O/oci-layout" && -f "$O/blobs/sha256/${MINE#sha256:}" ]] || fail "the image isn't an OCI layout holding its manifest"
@@ -262,7 +314,18 @@ for p in $(jq -r '.[0].Config, .[0].Layers[]' "$O/manifest.json"); do [[ -f "$O/
 [[ "$(sha256sum <"$O/$(jq -r '.[0].Config' "$O/manifest.json")" | cut -c1-64)" == "$(jq -r '.config.digest' "$T/img/mine.manifest" | cut -c8-)" ]] \
   || fail "manifest.json's config isn't the image's"
 "$DIR/offline-bundle.sh" verify "$IB" >/dev/null || fail "a bundle with an image didn't verify"
-ok "an image is checked by the digest its tag names, and bundled for this arch as an OCI archive with the registry's digest that docker load also reads"
+ok "an image is checked by the digest its tag names, and bundled for this arch as an OCI archive with the registry's digest that docker load also reads, with its signatures and attestations"
+
+printf 'key\n' >"$T/cosign.pub"
+ibuild "$T/ikey" --image superbot=reg.test/cg/superbot:1.0.0 --image-key "$T/cosign.pub" >"$T/ikey.log" 2>&1 || { cat "$T/ikey.log" >&2; fail "a key-signed image didn't bundle"; }
+grep -Fqx "verify reg.test/cg/superbot@$INDEX --key $T/cosign.pub --insecure-ignore-tlog=true --output json" "$REG/cosign.log" || fail "cosign didn't check the image against --image-key"
+grep -Fq "signed by the key in $T/cosign.pub" "$T/ikey.log" || fail "the build didn't say which key signed the image"
+ok "--image-key checks an image's signature against a key instead of the release identity"
+
+stubbed "$DIR/offline-bundle.sh" load "$IB" >"$T/load.log" 2>&1 || { cat "$T/load.log" >&2; fail "load of a bundle with signatures failed"; }
+grep -Fq "Loaded reg.test/cg/superbot:1.0.0 ($MINE, signature checked when bundled)" "$T/load.log" || fail "load didn't load the image alone"
+rm -f "$REG/local/$(regkey reg.test/cg/superbot:1.0.0)"
+ok "load takes the images, not their signatures"
 
 ibuild "$T/iown" --image own=own-image:2 --allow-unsigned >"$T/iown.log" 2>&1 || { cat "$T/iown.log" >&2; fail "a local image didn't bundle"; }
 [[ "$(tar -xOf "$T/iown/$TOP.tar.gz" "$TOP/images/own.digest")" == "$OWN" ]] || fail "the local image wasn't bundled from docker save"
@@ -288,12 +351,20 @@ irefused "is a $OTHER_DARCH image, not $DARCH" "a single image of another arch" 
 irefused "is a $OTHER_DARCH image, not $DARCH" "a local image of another arch" --image x=foreign-image:2 --allow-unsigned
 STUB_REWRITE=copy irefused "changed its digest" "a copy that changed the signed digest" --image superbot=reg.test/cg/superbot:1.0.0
 irefused "given twice" "the same name twice" --image x=own-image:2 --image x=own-image:2 --allow-unsigned
-ok "untagged, digest-only or odd references, unsigned images, other arches and changed digests are not bundled"
+irefused "not both" "a key and an identity" --image superbot=reg.test/cg/superbot:1.0.0 --image-key "$T/cosign.pub" --image-identity x
+irefused "no file at" "a key that isn't there" --image superbot=reg.test/cg/superbot:1.0.0 --image-key "$T/nokey.pub"
+mkdir -p "$T/nooci" && cp "$T/bin/"* "$T/nooci/" && rm "$T/nooci/superbot-oci"
+rm -rf "$T/inope"
+out=$(stubbed "$DIR/offline-bundle.sh" build --out "$T/inope" --version "$VERSION" --bin-dir "$T/nooci" --client-dir "$T/client" --image x=own-image:2 --allow-unsigned 2>&1) \
+  && fail "a bundle with images was built without superbot-oci"
+grep -Fq "cargo build --release --bin superbot-oci" <<<"$out" || { printf '%s\n' "$out" >&2; fail "a build without superbot-oci was refused for another reason"; }
+ok "untagged, digest-only or odd references, unsigned images, other arches, changed digests, and images without superbot-oci are not bundled"
 
 push() { stubbed "$DIR/offline-bundle.sh" push "$@" 2>&1; }
 out=$(push "$IB" --registry mirror.test:5000/superbot) || { printf '%s\n' "$out" >&2; fail "push failed"; }
 [[ "$(cat "$REG/refs/$(regkey mirror.test:5000/superbot/superbot:1.0.0)")" == "$(cat "$REG/blobs/${MINE#sha256:}")" ]] || fail "the mirror didn't get the bundled manifest"
 grep -Fq "SUPERBOT_IMAGE=mirror.test:5000/superbot/superbot@$MINE" <<<"$out" || { printf '%s\n' "$out" >&2; fail "push didn't print the pinned Compose setting"; }
+grep -Fqx "push mirror.test:5000/superbot/superbot:1.0.0 $MINE signatures=yes" "$REG/oci.log" || fail "push didn't hand superbot-oci the image with its signatures"
 out=$(STUB_REWRITE=push push "$IB" --registry mirror.test/changed) && fail "a push that changed the digest passed"
 grep -Fq "after the push, not the bundle's $MINE" <<<"$out" || { printf '%s\n' "$out" >&2; fail "the changed push failed for another reason"; }
 for bad in mirror "mirror.test/Upper" "https://mirror.test" "mirror.test//x" "-mirror.test"; do
@@ -314,7 +385,46 @@ out=$(push "$T/iclash/$TOP.tar.gz" --registry mirror.test/clash) && fail "two im
 grep -Fq "Images a and b would both be pushed to mirror.test/clash/unsigned:1.0.0: nothing pushed" <<<"$out" || { printf '%s\n' "$out" >&2; fail "the clash was refused for another reason"; }
 [[ ! -e "$REG/refs/$(regkey mirror.test/clash/unsigned:1.0.0)" ]] || fail "an image was pushed before the clash was found"
 grep -q "is for push" <<<"$("$DIR/offline-bundle.sh" verify "$IB" --registry mirror.test 2>&1 || true)" || fail "verify took --registry"
-ok "push copies images to a mirror with the bundle's digest, checks it there, prints Compose's pinned settings, and refuses bad registries, two images on one tag, and old bundles"
+grep -Fq "has no signatures in its bundle" <<<"$(push "$T/iunsigned/$TOP.tar.gz" --registry mirror.test/u)" || fail "push of an unsigned image didn't warn that it has no signatures"
+nooci=$(B=$IB remake nooci rm bin/superbot-oci)
+out=$(push "$nooci" --registry mirror.test) && fail "push without superbot-oci passed"
+grep -q "push needs superbot-oci" <<<"$out" || { printf '%s\n' "$out" >&2; fail "push without superbot-oci didn't say why"; }
+ok "push copies images with their signatures to a mirror with the bundle's digest, checks it there, prints Compose's pinned settings, and refuses bad registries, two images on one tag, old bundles, and no superbot-oci"
+
+# Both arches' bundles of one release: the signed index goes up, and the tag names it.
+case $ARCH in x86_64) OTHER_ARCH=aarch64 ;; *) OTHER_ARCH=x86_64 ;; esac
+OTOP="superbot-offline-$VERSION-$OTHER_ARCH"
+ibuild "$T/iother" --arch "$OTHER_ARCH" --image superbot=reg.test/cg/superbot:1.0.0 --image-identity https://ci.test/docker.yml@refs/tags/v1.0.0 >"$T/iother.log" 2>&1 \
+  || { cat "$T/iother.log" >&2; fail "the other arch's bundle didn't build"; }
+OB="$T/iother/$OTOP.tar.gz"
+[[ "$(tar -xOf "$OB" "$OTOP/images/superbot.digest")" == "$THEIRS" ]] || fail "the other arch's bundle doesn't hold its image"
+out=$(push "$IB" "$OB" --registry mirror.test/multi --sha256 "$(cut -c1-64 "$IB.sha256")" --sha256 "$(cut -c1-64 "$OB.sha256")") \
+  || { printf '%s\n' "$out" >&2; fail "push of both arches' bundles failed"; }
+[[ "$(cat "$REG/refs/$(regkey mirror.test/multi/superbot:1.0.0)")" == "$(cat "$T/img/index.json")" ]] || fail "the mirror's tag isn't the signed index"
+grep -Fq "to mirror.test/multi/superbot:1.0.0 ($INDEX, the signed index for linux/$DARCH, linux/$OTHER_DARCH)" <<<"$out" || { printf '%s\n' "$out" >&2; fail "push didn't say it put up the index"; }
+grep -Fq "SUPERBOT_IMAGE=mirror.test/multi/superbot@$INDEX" <<<"$out" || fail "Compose's pin isn't the signed index"
+for d in "$MINE" "$THEIRS"; do
+  grep -Fqx "push mirror.test/multi/superbot:1.0.0 $d signatures=yes" "$REG/oci.log" || fail "superbot-oci didn't get $d with its signatures"
+done
+pushrefused() {
+  local want=$1 why=$2 out
+  shift 2
+  if out=$(push "$@"); then fail "$why: pushed"; fi
+  grep -Fq -- "$want" <<<"$out" || { printf '%s\n' "$out" >&2; fail "$why: refused for another reason"; }
+}
+pushrefused "Two of these bundles are for $ARCH" "the same arch twice" "$IB" "$IB" --registry mirror.test/twice
+pushrefused "one --sha256 per bundle" "one --sha256 for two bundles" "$IB" "$OB" --registry mirror.test/x --sha256 "$(cut -c1-64 "$IB.sha256")"
+pushrefused "not the one published" "a --sha256 for the other bundle" "$IB" "$OB" --registry mirror.test/x --sha256 "$(cut -c1-64 "$OB.sha256")" --sha256 "$(cut -c1-64 "$IB.sha256")"
+ibuild "$T/iotherv" --arch "$OTHER_ARCH" --version 0.1.0-other --image superbot=reg.test/cg/superbot:1.0.0 --image-identity https://ci.test/docker.yml@refs/tags/v1.0.0 >/dev/null 2>&1 \
+  || fail "the other version's bundle didn't build"
+pushrefused "give bundles of one release" "bundles of two versions" "$IB" "$T/iotherv/superbot-offline-0.1.0-other-$OTHER_ARCH.tar.gz" --registry mirror.test/x
+ibuild "$T/iotheru" --arch "$OTHER_ARCH" --image superbot=reg.test/cg/unsigned:1.0.0 --allow-unsigned >/dev/null 2>&1 || fail "the other arch's unsigned bundle didn't build"
+pushrefused "doesn't hold the same superbot image" "bundles of different images" "$IB" "$T/iotheru/$OTOP.tar.gz" --registry mirror.test/x
+ibuild "$T/iotheru2" --arch "$OTHER_ARCH" --image superbot=reg.test/cg/superbot:1.0.0 --allow-unsigned >/dev/null 2>&1 || fail "the other arch's unsigned bundle didn't build"
+pushrefused "has no signed multi-arch index with it" "an unsigned arch" "$IB" "$T/iotheru2/$OTOP.tar.gz" --registry mirror.test/x
+pushrefused "hold different images" "a bundle with other images" "$IB" "$(B=$OB TOP=$OTOP remake noimage sh -c 'sed -i "s/^images=.*/images=other/" MANIFEST')" --registry mirror.test/x
+[[ ! -e "$REG/refs/$(regkey mirror.test/x/superbot:1.0.0)" && ! -e "$REG/refs/$(regkey mirror.test/twice/superbot:1.0.0)" ]] || fail "a refused push pushed something"
+ok "both arches' bundles put up the signed multi-arch index; bundles of one arch twice, of two releases, or that can't make the index are refused before anything is pushed"
 
 # Versions: same or newer installs; older is refused.
 release="$T/offline-release"
