@@ -54,6 +54,19 @@ AUTH_PASSWORD, and BOT_API if botd isn't on http://127.0.0.1:3000; both are only
                                                    Refused under a legal hold, as a team's last owner, with
                                                    a machine (--destroy-machine destroys it first), or with
                                                    their machines' backups kept (--delete-backups deletes them)
+  botctl roles                                     Custom roles (ADR 0123), the permissions they're built from,
+                                                   and the built-in roles as presets of them
+  botctl role show <role>                          A role (id or name), its effective permissions, and who has it
+  botctl role add "<name>" [--base member|readonly] [--perms <a,b>] [--description "<text>"]
+                                                   A role on member (default) or read-only, plus permissions:
+                                                   users.manage, bots.manage, audit.view, billing.manage,
+                                                   signups.approve, machines.manage
+  botctl role edit <role> [--name "<name>"] [--base member|readonly] [--perms <a,b>|none] [--description "<text>"]
+                                                   A new base applies at once to everyone who has it
+  botctl role rm <role>                            Delete it, once nobody has it
+  botctl role assign <role> <user> [--team <team>] Give it across the server (its base becomes their role), or
+                                                   with --team only in that team (its team permissions)
+  botctl role unassign <role> <user> [--team <team>]  Take it away; across the server they keep its base
   botctl user tier <user> <tier|default>           Their plan: the models and limits they get
   botctl user region <user> [<region>|default]     Where their machine and its backups live (ADR 0117): theirs,
                                                    their team's or the default; set it, or follow the team again.
@@ -982,6 +995,76 @@ fn scim_request(args: &[&str]) -> Result<(&'static str, String, Option<String>),
     })
 }
 
+/// `botctl roles` and `botctl role ...`: custom roles (ADR 0123, 0132). The server checks
+/// every name and permission; this only shapes the request.
+fn role_request(args: &[&str]) -> Result<(&'static str, String, Option<String>), String> {
+    const USAGE: &str = "Usage: botctl roles | role show <role> | role add \"<name>\" [--base member|readonly] [--perms a,b] [--description TEXT] | role edit <role> [--name NAME] [--base B] [--perms a,b|none] [--description TEXT] | role rm <role> | role assign|unassign <role> <user> [--team <team>]";
+    let perms = |v: &str| -> Value {
+        if v == "none" {
+            return json!([]);
+        }
+        json!(v.split(',').map(str::trim).filter(|p| !p.is_empty()).collect::<Vec<_>>())
+    };
+    let at = |id: &str| format!("/api/roles/{}", encode(id));
+    let holder = |id: &str, user: &str, rest: &[&str]| match flag(rest, "--team") {
+        Some(team) => format!("{}/teams/{}/users/{}", at(id), encode(team), encode(user)),
+        None => format!("{}/users/{}", at(id), encode(user)),
+    };
+    let known = |rest: &[&str], allowed: &[&str]| -> Result<(), String> {
+        let mut it = rest.iter();
+        while let Some(a) = it.next() {
+            if !allowed.contains(a) || it.next().is_none() {
+                return Err(format!("Unexpected \"{a}\". {USAGE}"));
+            }
+        }
+        Ok(())
+    };
+    Ok(match args {
+        [] | ["list"] => ("GET", "/api/roles".into(), None),
+        ["show", id] => ("GET", at(id), None),
+        ["add", name, rest @ ..] if !name.starts_with("--") => {
+            known(rest, &["--base", "--perms", "--description"])?;
+            let body = json!({ "name": name, "base": flag(rest, "--base"), "description": flag(rest, "--description"), "permissions": perms(flag(rest, "--perms").unwrap_or("none")) });
+            ("POST", "/api/roles".into(), Some(body.to_string()))
+        }
+        ["edit", id, rest @ ..] if !id.starts_with("--") && !rest.is_empty() => {
+            known(rest, &["--name", "--base", "--perms", "--description"])?;
+            let mut body = Map::new();
+            for (opt, field) in [("--name", "name"), ("--base", "base"), ("--description", "description")] {
+                if let Some(v) = flag(rest, opt) {
+                    body.insert(field.into(), json!(v));
+                }
+            }
+            if let Some(v) = flag(rest, "--perms") {
+                body.insert("permissions".into(), perms(v));
+            }
+            ("PATCH", at(id), Some(Value::Object(body).to_string()))
+        }
+        ["rm" | "delete", id] => ("DELETE", at(id), None),
+        [verb @ ("assign" | "unassign"), id, user, rest @ ..] if !user.starts_with("--") => {
+            known(rest, &["--team"])?;
+            (if *verb == "assign" { "PUT" } else { "DELETE" }, holder(id, user, rest), None)
+        }
+        _ => return Err(USAGE.into()),
+    })
+}
+
+/// What `botctl role assign|unassign` prints.
+fn role_assigned(verb: &str, res: &Value) -> String {
+    let who = res["user"]["email"].as_str().or(res["user"]["name"].as_str()).unwrap_or_default();
+    let team = res["team"]["name"].as_str();
+    match (verb, team) {
+        ("assign", Some(t)) => format!(
+            "{who} has {} in {t}. There it gives: {}.",
+            res["role"]["name"].as_str().unwrap_or_default(),
+            res["applies"].as_array().filter(|a| !a.is_empty()).map_or("nothing (it has no team permissions)".into(), |a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")),
+        ),
+        ("assign", None) => format!("{who} has {} now; their role is {}.", res["role"]["name"].as_str().unwrap_or_default(), res["user"]["role"].as_str().unwrap_or_default()),
+        (_, Some(t)) => format!("Taken away from {who} in {t}."),
+        _ => format!("Taken away. {who} keeps {} as their role.", res["user"]["role"].as_str().unwrap_or_default()),
+    }
+}
+
 /// What `botctl scim token create` prints: the token once, and where the IdP sends it.
 fn scim_created(res: &Value) -> String {
     let t = &res["scimToken"];
@@ -1356,6 +1439,16 @@ fn run(args: &[String]) -> Result<String, String> {
             match rest {
                 ["token", "create", ..] => Ok(scim_created(&serde_json::from_str(&res).map_err(|e| e.to_string())?)),
                 ["token", "revoke", ..] => Ok("Revoked. The IdP can't provision with it any more; its users stay as they are.".into()),
+                _ => Ok(pretty(res)),
+            }
+        }
+        ["roles"] | ["role", ..] => {
+            let rest = a.get(1..).unwrap_or_default();
+            let (method, path, body) = role_request(rest)?;
+            let res = api(Cred::Operator, method, &path, body)?;
+            match rest.first() {
+                Some(&("rm" | "delete")) => Ok("Deleted.".into()),
+                Some(&verb @ ("assign" | "unassign")) => Ok(role_assigned(verb, &serde_json::from_str(&res).map_err(|e| e.to_string())?)),
                 _ => Ok(pretty(res)),
             }
         }
@@ -2067,6 +2160,42 @@ mod tests {
         v["idp"] = json!({ "ssoUrl": "https://idp.example/sso", "certificates": [{ "sha256": "ab:cd", "subject": "CN=idp", "notAfter": 1_900_000_000_000_i64 }] });
         let out = saml_summary(&v);
         assert!(out.contains("Certificate SHA-256 ab:cd (CN=idp), expires 2030-03-17"), "{out}");
+    }
+
+    #[test]
+    fn role_commands() {
+        let req = |a: &[&str]| role_request(a).map(|(m, p, b)| (m, p, b.map(|b| serde_json::from_str::<Value>(&b).unwrap())));
+        assert_eq!(req(&[]), Ok(("GET", "/api/roles".into(), None)));
+        assert_eq!(req(&["show", "Help desk"]), Ok(("GET", "/api/roles/Help%20desk".into(), None)));
+        assert_eq!(
+            req(&["add", "Auditor"]),
+            Ok(("POST", "/api/roles".into(), Some(json!({ "name": "Auditor", "base": null, "description": null, "permissions": [] }))))
+        );
+        assert_eq!(
+            req(&["add", "Auditor", "--base", "readonly", "--perms", "audit.view, signups.approve", "--description", "Reviews"]),
+            Ok(("POST", "/api/roles".into(), Some(json!({ "name": "Auditor", "base": "readonly", "description": "Reviews", "permissions": ["audit.view", "signups.approve"] }))))
+        );
+        assert_eq!(req(&["edit", "r1", "--perms", "none"]), Ok(("PATCH", "/api/roles/r1".into(), Some(json!({ "permissions": [] })))));
+        assert_eq!(
+            req(&["edit", "r1", "--name", "Support", "--base", "member", "--description", ""]),
+            Ok(("PATCH", "/api/roles/r1".into(), Some(json!({ "name": "Support", "base": "member", "description": "" }))))
+        );
+        assert_eq!(req(&["rm", "r1"]), Ok(("DELETE", "/api/roles/r1".into(), None)));
+        assert_eq!(req(&["assign", "r1", "ada@example.com"]), Ok(("PUT", "/api/roles/r1/users/ada%40example.com".into(), None)));
+        assert_eq!(req(&["assign", "r1", "u1", "--team", "t1"]), Ok(("PUT", "/api/roles/r1/teams/t1/users/u1".into(), None)));
+        assert_eq!(req(&["unassign", "r1", "u1"]), Ok(("DELETE", "/api/roles/r1/users/u1".into(), None)));
+        assert_eq!(req(&["unassign", "r1", "u1", "--team", "t1"]), Ok(("DELETE", "/api/roles/r1/teams/t1/users/u1".into(), None)));
+        for bad in [&["add"][..], &["add", "--base", "member"], &["add", "X", "--perm", "audit.view"], &["add", "X", "--base"], &["edit", "r1"], &["assign", "r1"], &["assign", "r1", "u1", "--org", "x"], &["show"]] {
+            assert!(req(bad).is_err(), "{bad:?}");
+        }
+
+        let org = json!({ "user": { "email": "ada@example.com", "role": "readonly" }, "role": { "name": "Auditor" } });
+        assert_eq!(role_assigned("assign", &org), "ada@example.com has Auditor now; their role is readonly.");
+        assert_eq!(role_assigned("unassign", &org), "Taken away. ada@example.com keeps readonly as their role.");
+        let team = json!({ "team": { "name": "Ops" }, "user": { "email": "ada@example.com" }, "role": { "name": "Lead" }, "applies": ["users.manage"] });
+        assert_eq!(role_assigned("assign", &team), "ada@example.com has Lead in Ops. There it gives: users.manage.");
+        assert!(role_assigned("assign", &json!({ "team": { "name": "Ops" }, "user": {}, "role": {}, "applies": [] })).contains("no team permissions"));
+        assert_eq!(role_assigned("unassign", &team), "Taken away from ada@example.com in Ops.");
     }
 
     #[test]

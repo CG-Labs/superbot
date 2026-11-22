@@ -140,6 +140,33 @@ async fn a_custom_role_opens_its_routes_and_nothing_else() {
     assert_eq!(events(port, &admin, "role.unassigned").await[0]["details"]["keeps"].as_str(), Some("readonly"));
 }
 
+/// The roles editors in the apps show what each person can do from these lists (ADR 0132).
+#[tokio::test]
+async fn admin_user_views_list_each_persons_effective_permissions() {
+    let (port, _, admin, _) = serve_app().await;
+    let (bo, _) = user_with(port, &admin, "bo@example.com", "member").await;
+    let (_, viewer) = user_with(port, &admin, "rex@example.com", "readonly").await;
+    let perms_of = |users: &Value, email: &str| users.as_array().unwrap().iter().find(|u| u["email"] == email).map(|u| u["permissions"].clone()).unwrap();
+
+    let (_, users) = json_call(port, "GET", "/api/users", &admin, "").await;
+    assert_eq!(perms_of(&users, "bo@example.com"), json!(["account", "read", "review", "write", "approve"]));
+    assert_eq!(perms_of(&users, "rex@example.com"), json!(["account", "read", "review"]));
+    assert_eq!(users.as_array().unwrap().iter().find(|u| u["breakGlass"] == true).unwrap()["permissions"].as_array().unwrap().len(), 12);
+
+    let support = role(port, &admin, "Support", "readonly", &["users.manage", "audit.view"]).await;
+    give(port, &admin, &support, &bo).await;
+    let (_, v) = json_call(port, "GET", &format!("/api/users/{bo}"), &admin, "").await;
+    assert_eq!(v["permissions"], json!(["account", "read", "review", "users.manage", "audit.view"]), "{v}");
+    assert_eq!(v["customRole"], json!({ "id": support, "name": "Support" }));
+
+    // A change to the role shows at once, as it applies at once.
+    assert_eq!(call(port, "PATCH", &format!("/api/roles/{support}"), &admin, r#"{"base":"member","permissions":["users.manage"]}"#).await.0, 200);
+    let (_, users) = json_call(port, "GET", "/api/users", &admin, "").await;
+    assert_eq!(perms_of(&users, "bo@example.com"), json!(["account", "read", "review", "write", "approve", "users.manage"]));
+    // Read-only people don't see anyone's.
+    assert_eq!(call(port, "GET", "/api/users", &viewer, "").await.0, 403);
+}
+
 #[tokio::test]
 async fn each_permission_opens_its_own_routes() {
     let (port, _, admin, _) = serve_app().await;
@@ -305,6 +332,17 @@ async fn the_owner_and_yourself_keep_your_roles() {
 }
 
 #[tokio::test]
+async fn an_email_in_any_case_finds_the_person() {
+    // So the console has to match emails the same way before it warns about an admin.
+    let (port, app, admin, _) = serve_app().await;
+    let r = role(port, &admin, "Ops", "member", &["machines.manage"]).await;
+    let (al, _) = user_with(port, &admin, "al@example.com", "admin").await;
+    let v = give(port, &admin, &r, "Al@Example.COM").await;
+    assert_eq!(v["user"]["id"].as_str(), Some(al.as_str()), "{v}");
+    assert_eq!(app.db.user(&al).unwrap().role, Role::Member);
+}
+
+#[tokio::test]
 async fn names_the_server_doesnt_know_grant_nothing() {
     let (port, app, admin, _) = serve_app().await;
     // As a newer version, or a hand edit, might leave it.
@@ -316,6 +354,13 @@ async fn names_the_server_doesnt_know_grant_nothing() {
     assert_eq!(call(port, "GET", "/api/audit", &cy_auth, "").await.0, 200);
     assert_eq!(call(port, "GET", "/api/secrets", &cy_auth, "").await.0, 403);
     assert_eq!(call(port, "PUT", "/api/policy", &cy_auth, "{}").await.0, 403);
+
+    // A save without permissions keeps them; the editor always sends them for such a role.
+    let path = format!("/api/roles/{}", r.id);
+    let (_, v) = json_call(port, "PATCH", &path, &admin, r#"{"name":"Future 2"}"#).await;
+    assert_eq!(v["unknown"], json!(["secrets.manage", "admin"]), "{v}");
+    let (code, v) = json_call(port, "PATCH", &path, &admin, r#"{"name":"Future 3","permissions":["audit.view"]}"#).await;
+    assert_eq!((code, v["permissions"].clone(), v["unknown"].clone()), (200, json!(["audit.view"]), json!([])), "{v}");
 }
 
 #[tokio::test]

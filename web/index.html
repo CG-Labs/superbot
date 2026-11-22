@@ -15,6 +15,7 @@
       <a href="#requests" data-tab="requests">Requests <span class="count" id="requests-count"></span></a>
       <a href="#machines" data-tab="machines">Machines</a>
       <a href="#teams" data-tab="teams">Teams</a>
+      <a href="#roles" data-tab="roles">Roles</a>
       <a href="#audit" data-tab="audit">Audit log</a>
       <a href="#status" data-tab="status">Status</a>
       <a href="#settings" data-tab="settings">Settings</a>
@@ -28,7 +29,7 @@
   </header>
 
   <main>
-    <p class="note">This page is for admins: people, requests for access, machines, teams, the audit log, and server settings. Chat, Bots, approvals of Bot actions, and screens are in <a href="/app/" target="_blank" rel="noopener">the app</a>.</p>
+    <p class="note">This page is for admins: people, requests for access, machines, teams, custom roles, the audit log, and server settings. Chat, Bots, approvals of Bot actions, and screens are in <a href="/app/" target="_blank" rel="noopener">the app</a>.</p>
     <div class="error" id="error" role="alert" hidden></div>
 
     <section id="tab-users" hidden>
@@ -50,7 +51,7 @@
         </label>
       </form>
       <table class="grid">
-        <thead><tr><th>Person</th><th>Role</th><th>Status</th><th>Last sign-in</th><th>Code</th><th>2FA</th><th>Data region</th><th></th></tr></thead>
+        <thead><tr><th>Person</th><th>Role</th><th>Custom role</th><th>Status</th><th>Last sign-in</th><th>Code</th><th>2FA</th><th>Data region</th><th></th></tr></thead>
         <tbody id="users-rows"></tbody>
       </table>
       <div class="empty" id="users-empty" hidden></div>
@@ -105,6 +106,36 @@
       <p class="hint" id="teams-settings"></p>
       <div id="teams-list"></div>
       <div class="empty" id="teams-empty" hidden></div>
+    </section>
+
+    <section id="tab-roles" hidden>
+      <p class="hint">A custom role is a base role (member or read-only) plus permissions an admin gives away; it never adds up to admin. Given across the server, its base becomes the person's role. Given within a team, only its team permissions apply, there. Changes apply at once and are audited.</p>
+      <div id="roles-list"></div>
+      <div class="empty" id="roles-empty" hidden></div>
+      <form class="card" id="role-form" autocomplete="off">
+        <h2 id="role-form-title">New role</h2>
+        <div class="bar">
+          <input id="role-name" placeholder="Name, e.g. Help desk" required maxlength="60" />
+          <label>Based on
+            <select id="role-base">
+              <option value="member">Member</option>
+              <option value="readonly">Read-only</option>
+            </select>
+          </label>
+        </div>
+        <div class="bar"><input id="role-description" class="wide" placeholder="What it's for (optional)" maxlength="500" /></div>
+        <div class="perms" id="role-perms"></div>
+        <p class="hint" id="role-effective"></p>
+        <div class="bar">
+          <button type="submit" class="btn primary" id="role-save">Create role</button>
+          <button type="button" class="btn" id="role-cancel" hidden>Cancel</button>
+        </div>
+      </form>
+      <h2>Built-in roles</h2>
+      <table class="grid">
+        <thead><tr><th>Role</th><th>Can do</th></tr></thead>
+        <tbody id="roles-builtin"></tbody>
+      </table>
     </section>
 
     <section id="tab-audit" hidden>

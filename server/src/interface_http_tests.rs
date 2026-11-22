@@ -130,7 +130,7 @@ async fn the_console_is_an_admin_page_without_chat_bots_or_screens() {
     for part in ["script-src 'self'", "style-src 'self'", "frame-ancestors 'none'", "connect-src 'self'"] {
         assert!(csp.contains(part), "{csp}");
     }
-    for tab in ["Users", "Requests", "Machines", "Teams", "Audit log", "Settings", "Setup", "Sign out", r#"href="/app/""#] {
+    for tab in ["Users", "Requests", "Machines", "Teams", "Roles", "Audit log", "Settings", "Setup", "Sign out", r#"href="/app/""#] {
         assert!(html.contains(tab), "{tab}");
     }
     // Nothing the CSP would block: one script, from a file, and no inline styles.
@@ -147,9 +147,22 @@ async fn the_console_is_an_admin_page_without_chat_bots_or_screens() {
         assert!(!CONSOLE_JS.contains(gone) && !html.contains(gone), "{gone} is still in the console");
     }
     let calls = api_calls(CONSOLE_JS);
-    for want in ["/api/users", "/api/signups/x/approve", "/api/machines", "/api/users/x/machine/suspend", "/api/audit", "/api/audit/export.csv", "/api/policy", "/api/secrets/x", "/api/scim/tokens", "/api/setup", "/api/license", "/api/teams", "/api/teams/x/members/x"] {
+    for want in ["/api/users", "/api/signups/x/approve", "/api/machines", "/api/users/x/machine/suspend", "/api/audit", "/api/audit/export.csv", "/api/policy", "/api/secrets/x", "/api/scim/tokens", "/api/setup", "/api/license", "/api/teams", "/api/teams/x/members/x", "/api/roles", "/api/roles/x/users/x", "/api/roles/x/teams/x/users/x"] {
         assert!(calls.iter().any(|(_, p)| p == want) || html.contains(want), "the console lost {want}: {calls:?}");
     }
+}
+
+/// ADR 0132: the console asks before it takes a custom role away, across the server or
+/// within a team, and finds people by email the way the server does (in any case).
+#[test]
+fn the_console_asks_before_taking_a_role_away_and_matches_emails_in_any_case() {
+    let lines: Vec<&str> = CONSOLE_JS.lines().collect();
+    let take_aways: Vec<usize> = (0..lines.len()).filter(|&n| lines[n].contains(r#"api("DELETE", `/api/roles/"#) && lines[n].contains("/users/")).collect();
+    assert!(take_aways.len() >= 3, "{take_aways:?}");
+    for n in take_aways {
+        assert!(lines[n.saturating_sub(1)..=n].iter().any(|l| l.contains("confirm(")), "line {} takes a role away without asking: {}", n + 1, lines[n].trim());
+    }
+    assert!(!CONSOLE_JS.contains(".email =="), "the console compares emails case-sensitively");
 }
 
 #[tokio::test]
