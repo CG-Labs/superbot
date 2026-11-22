@@ -238,7 +238,7 @@ fn sign_in_view(app: &AppState, a: &Auth, public_url: Option<&str>) -> Value {
                 "type": p.type_name(),
                 "ready": p.ready(),
                 "problem": p.not_ready(),
-                "secret": p.env_var(),
+                "secret": p.needs_secret().then(|| p.env_var()),
                 "secretStore": source.map(|(store, _)| store),
                 "secretSavable": source.is_none_or(|(_, writable)| writable),
                 "callbackUrl": a.sso.callback_url(&p.id),

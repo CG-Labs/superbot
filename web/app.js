@@ -1243,7 +1243,7 @@ const providerRow = (p) => `<tr>
     <td>${esc(p.label)}<div class="sub">${esc(p.id)} · ${esc(p.type)}${p.jitRole ? ` · new people join as ${esc(ROLES[p.jitRole] || p.jitRole)}` : ""}</div></td>
     <td>${p.ready ? "Ready" : `<span class="warn-text">${esc(p.problem || "Not ready")}</span>`}</td>
     <td>${copyBlock(p.callbackUrl)}</td>
-    <td>${p.secretSavable === false ? envSecret(p.secret) : secretForm(p)}</td>
+    <td>${!p.secret ? `<span class="sub">No secret. IdP metadata: <code>botctl sso saml ${esc(p.id)}</code></span>` : p.secretSavable === false ? envSecret(p.secret) : secretForm(p)}</td>
   </tr>`;
 const secretForm = (p) => `<form class="secret-inline" data-secret="${esc(p.secret)}" autocomplete="off">
     <textarea rows="1" placeholder="${esc(p.secret)}" required spellcheck="false" autocomplete="off"></textarea>

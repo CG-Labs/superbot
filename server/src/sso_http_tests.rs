@@ -127,7 +127,7 @@ pub(super) async fn serve_vars(vars: HashMap<String, String>) -> (u16, AppState,
     serve_vars_with(vars, |_| {}).await
 }
 
-async fn serve_vars_with(mut vars: HashMap<String, String>, tweak: impl FnOnce(&mut Auth)) -> (u16, AppState, String) {
+pub(super) async fn serve_vars_with(mut vars: HashMap<String, String>, tweak: impl FnOnce(&mut Auth)) -> (u16, AppState, String) {
     let (port, app, admin, _) = serve_app_with(|a| {
         tweak(a);
         // The port is only known now, and the public URL must name it.
