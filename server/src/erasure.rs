@@ -158,6 +158,12 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
             return Err(e);
         }
     };
+    // From here no Bot becomes theirs or leaves them until the erasure ends, so the
+    // primary Bot, which may have been given to them meanwhile, is checked once more.
+    let _under_way = begin(&u.id);
+    if let Some(b) = owned(&app).into_iter().find(|b| b.primary) {
+        return refuse(PRIMARY, json!({ "bot": b.id }), "They own the primary Bot, which can't be deleted. Give it to someone else first.".into());
+    }
     let mut machine = Value::Null;
     if let Some(m) = machine_now {
         crate::machines::destroy_as(&app, &a.machines, &by, &u.id, &|_| true).await?;
@@ -167,9 +173,6 @@ pub async fn erase(State(app): State<AppState>, Extension(a): Extension<Arc<Auth
         machine = json!({ "id": m.id, "destroyed": true });
     }
 
-    // Past every refusal: from here, no Bot becomes theirs or leaves them, and nothing
-    // starts for them, until the erasure ends.
-    let _under_way = begin(&u.id);
     let team = crate::teams::erase_member(&app, &by, &u.id, leaving).await?;
     if u.active() {
         app.db.update_user(&u.id, UserPatch { status: Some("disabled"), ..Default::default() }).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

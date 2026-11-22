@@ -833,9 +833,13 @@ impl App {
             return cant_run("This Bot's id isn't a safe folder name, so it can't run.");
         };
         let by = self.requester(&bot, msg);
-        // Nothing runs on the Bots of someone being erased, or for them (ADR 0102). Not
+        // Nothing runs on the Bots of someone being erased, once disabled for it, or for
+        // them (ADR 0102); before that a refused erasure leaves their work alone. Not
         // audited: the event would name them after their erasure rewrote the log.
-        let erased = |u: &str| crate::erasure::under_way(u) || self.db.user(u).is_some_and(|u| u.erased_at.is_some());
+        let erased = |u: &str| match self.db.user(u) {
+            Some(u) => u.erased_at.is_some() || (!u.active() && crate::erasure::under_way(&u.id)),
+            None => false,
+        };
         if erased(&bot.owner_id) || named_in(msg).iter().any(|u| erased(u)) {
             self.give_back_routine(&bot, msg);
             self.say(&bot.id, "I didn't run this: the account it was for is being erased.", true);

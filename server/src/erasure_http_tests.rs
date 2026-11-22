@@ -407,6 +407,27 @@ async fn an_open_checkout_is_closed_first_and_a_paid_one_refuses() {
 }
 
 #[tokio::test]
+async fn a_primary_bot_given_to_them_while_stripe_answers_is_not_deleted() {
+    let (w, stripe) = crate::billing_http_tests::shop().await;
+    let primary = w.app.db.create_bot("Main", "#fff", "waddle", "claude", None, true).id;
+    assert_eq!(crate::billing_http_tests::buy(&w, &w.b, "pro").await.0, 200);
+    stripe.slow(600);
+    let erasing = {
+        let (port, admin, b) = (w.port, w.admin.clone(), w.b_id.clone());
+        tokio::spawn(async move { erase(port, &admin, &b, "").await })
+    };
+    // Past the first primary Bot check, the erasure waits on Stripe to close her checkout.
+    until("the erasure to reach Stripe", || stripe.seen().iter().any(|s| s.path.ends_with("/expire"))).await;
+    let (code, v) = json_call(w.port, "PATCH", &format!("/api/bots/{primary}/access"), &w.admin, &json!({ "owner": w.b_id }).to_string()).await;
+    assert_eq!(code, 200, "{v}");
+    let (code, v) = erasing.await.unwrap();
+    assert_eq!(code, 409, "{v}");
+    assert_eq!(audit(w.port, &w.admin, "action=user.erase_refused").await[0]["details"]["reason"].as_str(), Some("primary_bot"));
+    assert_eq!(w.app.db.bot(&primary).map(|b| b.owner_id), Some(w.b_id.clone()), "kept, and still hers");
+    assert!(w.app.db.user(&w.b_id).unwrap().active() && !crate::erasure::under_way(&w.b_id));
+}
+
+#[tokio::test]
 async fn no_bot_becomes_theirs_or_leaves_them_while_they_are_erased() {
     let (port, app, admin, _) = serve_app().await;
     let (ada, ada_auth) = user_with(port, &admin, "ada@example.com", "member").await;
