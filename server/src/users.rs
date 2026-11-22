@@ -633,6 +633,7 @@ pub async fn update_user(State(app): State<AppState>, Extension(a): Extension<Ar
             let resumed = crate::handover::user_enabled(&app, &by, &after.id);
             app.db.record(&ev("user.enabled").details(json!({ "routinesResumed": resumed })));
             crate::teams::user_enabled(&app, &by, &after.id).await;
+            crate::deprovision::user_enabled(&app, &by, &after.id).await;
         } else {
             disabled(&app, &a, &by, &after.id);
         }
@@ -641,6 +642,9 @@ pub async fn update_user(State(app): State<AppState>, Extension(a): Extension<Ar
     if lost {
         let reason = if after.active() { crate::machines::offboard::ACCESS_LOST } else { crate::machines::offboard::DISABLED };
         lost_access(&app, &by, &after.id, reason).await;
+    }
+    if before.active() && !after.active() {
+        crate::deprovision::user_disabled(&app, &by, &after.id, crate::deprovision::ADMIN).await;
     }
     Ok(Json(user_view(&after)))
 }

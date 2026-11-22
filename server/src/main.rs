@@ -42,6 +42,9 @@ mod database_encryption;
 #[cfg(test)]
 mod database_encryption_http_tests;
 mod db;
+mod deprovision;
+#[cfg(test)]
+mod deprovision_http_tests;
 mod erasure;
 mod file_retention;
 #[cfg(test)]
@@ -1381,6 +1384,10 @@ async fn auth(State(a): State<Arc<Auth>>, req: Request, next: Next) -> Response 
         let owner = caller.bot.as_deref().and_then(|id| app.db.bot(id)).and_then(|b| app.db.user(&b.owner_id)).filter(|u| u.active());
         if !owner.is_some_and(|u| rbac::allows(Principal::User(u.role), need)) {
             return denied("owner_role", "This Bot's owner can't do this.".into());
+        }
+        // Nor anything for a teammate who has been disabled since the run began (ADR 0124).
+        if caller.bot_for.as_deref().is_some_and(|u| !app.db.user(u).is_some_and(|u| u.active())) {
+            return denied("for_user_disabled", "The person this run is for is turned off.".into());
         }
     }
     // A cookie, a password the browser cached, or ALLOW_NO_AUTH rides along on any request the
