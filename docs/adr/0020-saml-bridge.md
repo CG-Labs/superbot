@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. An M2 slice ([roadmap](../ROADMAP.md#m2--multi-user--sso)): the SAML bridge, the rest of [#19](https://github.com/CG-Labs/superbot/issues/19). Full native SAML stays in M5 ([#52](https://github.com/CG-Labs/superbot/issues/52)). Extends [ADR 0014](0014-oidc-sso-entra.md) and [ADR 0016](0016-sso-multi-provider.md): the flow, binder cookie, handoff to the app, account linking, and audit events (with per-user actors, [ADR 0019](0019-audit-actors.md)) are unchanged; SAML sign-ins record `idp` = `saml`. Setup guide: [SAML](../sso/saml.md).
+Accepted. An M2 slice ([roadmap](../ROADMAP.md#m2--multi-user--sso)): the SAML bridge, the rest of [#19](https://github.com/CG-Labs/superbot/issues/19). Full native SAML stays in M5 ([#52](https://github.com/CG-Labs/superbot/issues/52)). Extends [ADR 0014](0014-oidc-sso-entra.md) and [ADR 0016](0016-sso-multi-provider.md): the flow, binder cookie, handoff to the app, account linking, and audit events (with per-user actors, [ADR 0019](0019-audit-actors.md)) are unchanged; SAML sign-ins record `idp` = `saml`. Setup guide: [SAML](../sso/saml.md). Amended by [ADR 0103](0103-sso-jit-needs-an-allow-list.md): just in time now needs `ALLOWED_DOMAINS`.
 
 ## Context
 

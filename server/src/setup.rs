@@ -184,7 +184,7 @@ const TEMPLATES: [(&str, &str, &str, &[&str]); 6] = [
         "saml",
         "A SAML IdP through a broker (ADFS, Shibboleth)",
         "docs/sso/saml.md",
-        &["TYPE=saml", "ISSUER=https://<broker-host>/realms/<realm>", "CLIENT_ID=<broker-client-id>", "IDP_ALIAS=<idp-alias>", "IDP_ENTITY_ID=<idp-entity-id>", "LABEL=Company SSO"],
+        &["TYPE=saml", "ISSUER=https://<broker-host>/realms/<realm>", "CLIENT_ID=<broker-client-id>", "IDP_ALIAS=<idp-alias>", "IDP_ENTITY_ID=<idp-entity-id>", "LABEL=Company SSO", "# ALLOWED_DOMAINS=example.com"],
     ),
 ];
 

@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted. Third slice of M2 ([roadmap](../ROADMAP.md#m2--multi-user--sso)): Google sign-in ([#18](https://github.com/CG-Labs/superbot/issues/18)) and the generic OIDC connector ([#19](https://github.com/CG-Labs/superbot/issues/19); its SAML bridge is still to come). Extends [ADR 0014](0014-oidc-sso-entra.md), whose flow, token checks, secrets, and audit events are unchanged.
+Accepted. Third slice of M2 ([roadmap](../ROADMAP.md#m2--multi-user--sso)): Google sign-in ([#18](https://github.com/CG-Labs/superbot/issues/18)) and the generic OIDC connector ([#19](https://github.com/CG-Labs/superbot/issues/19); its SAML bridge is still to come). Extends [ADR 0014](0014-oidc-sso-entra.md), whose flow, token checks, secrets, and audit events are unchanged. Amended by [ADR 0103](0103-sso-jit-needs-an-allow-list.md): just in time on a generic OIDC provider now needs `ALLOWED_DOMAINS`.
 
 ## Context
 
