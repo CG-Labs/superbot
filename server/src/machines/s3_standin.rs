@@ -22,6 +22,8 @@ pub struct World {
     pub calls: Vec<String>,
     /// The next request with this method fails with this status.
     pub fail: Option<(String, u16)>,
+    /// Keys per listing page; S3's 1,000 when unset.
+    pub page: Option<usize>,
     next: u32,
 }
 
@@ -117,9 +119,17 @@ async fn handle(State(world): State<Arc<Mutex<World>>>, method: Method, uri: Uri
     match (method.as_str(), key.is_empty()) {
         ("GET", true) => {
             let prefix = query.get("prefix").cloned().unwrap_or_default();
+            let after = query.get("continuation-token").cloned().unwrap_or_default();
+            let page = w.page.unwrap_or(1000);
+            let found: Vec<(&String, &Vec<u8>)> = w.objects.iter().filter(|(k, _)| k.starts_with(&prefix) && **k > after).collect();
             let mut out = String::from("<ListBucketResult>");
-            for (k, v) in w.objects.iter().filter(|(k, _)| k.starts_with(&prefix)) {
-                out.push_str(&format!("<Contents><Key>{k}</Key><Size>{}</Size></Contents>", v.len()));
+            for (k, v) in found.iter().take(page) {
+                out.push_str(&format!("<Contents><Key>{}</Key><Size>{}</Size></Contents>", k.replace('&', "&amp;"), v.len()));
+            }
+            if found.len() > page {
+                out.push_str(&format!("<IsTruncated>true</IsTruncated><NextContinuationToken>{}</NextContinuationToken>", found[page - 1].0.replace('&', "&amp;")));
+            } else {
+                out.push_str("<IsTruncated>false</IsTruncated>");
             }
             out.push_str("</ListBucketResult>");
             xml(StatusCode::OK, out)
@@ -213,6 +223,13 @@ mod tests {
         assert_eq!(&got[..], b"hello world");
         c.put("p/m.json", b"{}".to_vec()).await.unwrap();
         assert_eq!(c.list("p/").await.unwrap(), ["p/a b.bin", "p/m.json"]);
+        c.put("p/x&y", Vec::new()).await.unwrap();
+        c.put("q/other", Vec::new()).await.unwrap();
+        s.w().page = Some(1);
+        assert_eq!(c.list("p/").await.unwrap(), ["p/a b.bin", "p/m.json", "p/x&y"], "every page, unescaped");
+        assert_eq!(s.w().calls.iter().filter(|c| c.contains("list-type")).count(), 1 + 3);
+        s.w().page = None;
+        c.delete("p/x&y").await.unwrap();
         c.delete("p/a b.bin").await.unwrap();
         c.delete("p/a b.bin").await.unwrap();
         assert!(c.get("p/a b.bin").await.unwrap_err().contains("NoSuchKey"));

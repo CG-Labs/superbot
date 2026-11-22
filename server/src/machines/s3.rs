@@ -1,7 +1,7 @@
 //! A small S3 client for off-host machine backups (ADR 0071): path-style requests
 //! signed with AWS Signature Version 4, which AWS S3, Cloudflare R2, Backblaze B2,
 //! MinIO and most S3-compatible stores accept. Only what backups need: multipart
-//! uploads, small puts, streaming gets, and deletes. The secret key signs requests and
+//! uploads, small puts, streaming gets, listings and deletes. The secret key signs requests and
 //! goes nowhere else: not in errors, logs, or `Debug`.
 
 use crate::secrets::SecretStore;
@@ -286,16 +286,24 @@ impl S3 {
         }
     }
 
-    /// Keys under `prefix`, up to 1,000.
-    #[cfg(test)]
+    /// Every key under `prefix`, a page of up to 1,000 at a time.
     pub async fn list(&self, prefix: &str) -> Result<Vec<String>, String> {
-        let res = self.send(Method::GET, None, &[("list-type", "2"), ("prefix", prefix)], Vec::new()).await?;
-        let xml = S3::text(res).await?;
-        Ok(xml
-            .split("<Contents>")
-            .skip(1)
-            .filter_map(|c| tag(c, "Key"))
-            .collect())
+        let mut keys = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut q = vec![("list-type", "2"), ("prefix", prefix)];
+            if let Some(t) = token.as_deref() {
+                q.push(("continuation-token", t));
+            }
+            let res = self.send(Method::GET, None, &q, Vec::new()).await?;
+            let xml = S3::text(res).await?;
+            keys.extend(xml.split("<Contents>").skip(1).filter_map(|c| tag(c, "Key")));
+            token = match (tag(&xml, "IsTruncated").as_deref(), tag(&xml, "NextContinuationToken")) {
+                (Some("true"), Some(t)) if !t.is_empty() && token.as_deref() != Some(t.as_str()) => Some(t),
+                (Some("true"), _) => return Err("the backup store's listing was cut off without a way to go on".into()),
+                _ => return Ok(keys),
+            };
+        }
     }
 
     /// Makes the bucket, or finds it made (the end-to-end test's own store).
