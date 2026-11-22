@@ -77,9 +77,9 @@ botctl audit checkpoints 10      # the last 10, with their tokens
 - `head`: the checkpoint doesn't sign the head it is sealed onto. Events before it were changed and the chain rebuilt.
 - `key`: signed by a key botd doesn't trust, or the key id doesn't match.
 - `signature`: the signature doesn't verify.
-- `record`: its record in `audit_checkpoints` is gone, differs from the event, or exists without one; or the stored token isn't the one recorded.
+- `record`: its record in `audit_checkpoints` is gone, differs from the event, or exists without one (a pruned checkpoint's record stays only while its timestamp event is in the log); or the stored token isn't the one recorded.
 - `malformed`: the event's details are incomplete.
-- For a token: `imprint` (it stamps something else), `nonce`, `signature`, `certificate` (not a time-stamping certificate, or not valid at its time), `untrusted` (doesn't chain to `AUDIT_TIMESTAMP_CA_FILE`) or `malformed`.
+- For a token: `imprint` (it stamps something else), `nonce`, `signature`, `certificate` (not a time-stamping certificate, or not valid at its time), `untrusted` (doesn't chain to `AUDIT_TIMESTAMP_CA_FILE`, or a CA on the way is limited to other uses, path lengths or names) or `malformed`.
 
 botd trusts the keys it has used, which it keeps in the database. To doubt the database too, take the key from your SIEM (each new key is recorded as `audit.checkpoint_key`) or an earlier `botctl audit key`, and pin it:
 

@@ -527,17 +527,11 @@ impl<'a> Verifier<'a> {
     }
 
     /// The first and last ids walked.
-    pub fn walked(&self) -> Option<(i64, i64)> {
-        Some((self.report.first?, self.last?))
-    }
-
-    /// Checkpoint records kept beside the walked rows: `(checkpoint, timestamp event)`.
-    pub fn recorded(&mut self, rows: &[(i64, Option<i64>)]) {
-        let Some((first, last)) = self.walked() else {
-            return;
-        };
+    /// Checkpoint records kept beside the rows from `lo` to `hi`; `pruned`: the anchor's id.
+    pub fn recorded(&mut self, rows: &[crate::audit_checkpoint::Recorded], lo: i64, hi: i64, pruned: Option<i64>) {
+        let last = self.last;
         if let Some(c) = self.checks.as_mut() {
-            for (id, reason) in c.recorded(rows, first, last) {
+            for (id, reason) in c.recorded(rows, lo, hi, last, pruned) {
                 self.report.broke(id, reason);
             }
         }
@@ -617,6 +611,7 @@ fn walk(db: &Db, anchor: Option<Link>, o: &Options, keys: &[Vec<u8>]) -> Report 
     let inside = range.from.is_some_and(|f| db.audit_chain_rows(i64::MIN, 1).ok().and_then(|r| r.first().map(|r| r.id)).is_some_and(|first| first < f));
     let lookup = |id: i64| db.with_conn(|c| crate::audit_checkpoint::row(c, id).ok().flatten());
     let checker = crate::audit_checkpoint::Checker::new(keys.to_vec(), &o.trust, Box::new(lookup));
+    let pruned = anchor.as_ref().map(|a| a.id);
     let mut v = Verifier::new(anchor, o.pins.clone()).within(range, inside).checking(checker);
     let mut after = range.from.map_or(i64::MIN, |f| f.saturating_sub(1));
     'rows: loop {
@@ -645,11 +640,10 @@ fn walk(db: &Db, anchor: Option<Link>, o: &Options, keys: &[Vec<u8>]) -> Report 
             Err(e) => v.fail(format!("couldn't read the erasures after event {to}: {e}")),
         }
     }
-    if let Some((first, last)) = v.walked() {
-        match db.with_conn(|c| crate::audit_checkpoint::recorded(c, first, last)) {
-            Ok(rows) => v.recorded(&rows),
-            Err(e) => v.fail(format!("couldn't read the audit checkpoints: {e}")),
-        }
+    let (lo, hi) = (range.from.unwrap_or(i64::MIN), range.to.unwrap_or(i64::MAX));
+    match db.with_conn(|c| crate::audit_checkpoint::recorded(c, lo, hi)) {
+        Ok(rows) => v.recorded(&rows, lo, hi, pruned),
+        Err(e) => v.fail(format!("couldn't read the audit checkpoints: {e}")),
     }
     v.finish()
 }

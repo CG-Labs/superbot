@@ -7145,7 +7145,9 @@ impl Db {
             tx.query_row("SELECT id, chain_hash FROM audit_events WHERE id < ? ORDER BY id DESC LIMIT 1", [end], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
         let Some((last, hash)) = last else { return Ok((0, None)) };
         let n = tx.execute("DELETE FROM audit_events WHERE id <= ?", [last])?;
-        tx.execute("DELETE FROM audit_checkpoints WHERE event_id <= ?", [last])?;
+        // A record outlives its checkpoint while its timestamp event is still in the log, so that
+        // event's export and check still have the token.
+        tx.execute("DELETE FROM audit_checkpoints WHERE event_id <= ?1 AND (tsa_event_id IS NULL OR tsa_event_id <= ?1)", [last])?;
         let anchor = hash.map(|hash| crate::audit_chain::Link { id: last, hash });
         if let Some(a) = &anchor {
             crate::audit_chain::set_anchor(&tx, a)?;

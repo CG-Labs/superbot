@@ -390,21 +390,38 @@ pub fn row(c: &Connection, id: i64) -> rusqlite::Result<Option<Checkpoint>> {
     c.query_row(&format!("SELECT {COLS} FROM audit_checkpoints WHERE event_id = ?"), [id], read).optional()
 }
 
+/// Records whose `audit.checkpoint` event is in the log: one without (a row added by hand)
+/// is never shown, scheduled from or stamped, and `botctl audit verify` reports it.
+const SEALED: &str = "EXISTS (SELECT 1 FROM audit_events e WHERE e.id = audit_checkpoints.event_id AND e.action = 'audit.checkpoint')";
+
 /// Newest first, before event `before`.
 pub fn list(c: &Connection, before: i64, limit: i64) -> rusqlite::Result<Vec<Checkpoint>> {
-    let mut s = c.prepare(&format!("SELECT {COLS} FROM audit_checkpoints WHERE event_id < ? ORDER BY event_id DESC LIMIT ?"))?;
+    let mut s = c.prepare(&format!("SELECT {COLS} FROM audit_checkpoints WHERE event_id < ? AND {SEALED} ORDER BY event_id DESC LIMIT ?"))?;
     s.query_map(params![before, limit], read)?.collect()
 }
 
-/// Checkpoint records whose event, or timestamp event, is from `first` to `last`:
-/// `(checkpoint event, timestamp event)`.
-pub fn recorded(c: &Connection, first: i64, last: i64) -> rusqlite::Result<Vec<(i64, Option<i64>)>> {
-    let mut s = c.prepare("SELECT event_id, tsa_event_id FROM audit_checkpoints WHERE event_id BETWEEN ?1 AND ?2 OR tsa_event_id BETWEEN ?1 AND ?2 ORDER BY event_id")?;
-    s.query_map(params![first, last], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
+/// A record kept beside the chain, for the check: its checkpoint event and timestamp event,
+/// and whether the log holds each as an event of its kind.
+#[derive(Clone, Copy, Debug)]
+pub struct Recorded {
+    pub id: i64,
+    pub stamp: Option<i64>,
+    pub id_logged: bool,
+    pub stamp_logged: bool,
+}
+
+/// Records whose event, or timestamp event, is from `first` to `last`.
+pub fn recorded(c: &Connection, first: i64, last: i64) -> rusqlite::Result<Vec<Recorded>> {
+    let mut s = c.prepare(&format!(
+        "SELECT event_id, tsa_event_id, {SEALED},
+           EXISTS (SELECT 1 FROM audit_events e WHERE e.id = audit_checkpoints.tsa_event_id AND e.action = '{TIMESTAMPED}')
+         FROM audit_checkpoints WHERE event_id BETWEEN ?1 AND ?2 OR tsa_event_id BETWEEN ?1 AND ?2 ORDER BY event_id"
+    ))?;
+    s.query_map(params![first, last], |r| Ok(Recorded { id: r.get(0)?, stamp: r.get(1)?, id_logged: r.get(2)?, stamp_logged: r.get(3)? }))?.collect()
 }
 
 fn pending(c: &Connection) -> rusqlite::Result<Option<Checkpoint>> {
-    c.query_row(&format!("SELECT {COLS} FROM audit_checkpoints WHERE tsa_status = 'pending' ORDER BY event_id LIMIT 1"), [], read).optional()
+    c.query_row(&format!("SELECT {COLS} FROM audit_checkpoints WHERE tsa_status = 'pending' AND {SEALED} ORDER BY event_id LIMIT 1"), [], read).optional()
 }
 
 /// How the checkpoint came about, for its event.
@@ -445,7 +462,7 @@ pub fn create(app: &App, by: &Who, trigger: Trigger) -> rusqlite::Result<Checkpo
 /// Whether a scheduled checkpoint is due: `every` has passed since the last one, and
 /// something besides checkpoints happened since.
 fn due(c: &Connection, every_ms: i64, at: i64) -> rusqlite::Result<bool> {
-    let last: Option<(i64, i64)> = c.query_row("SELECT event_id, at FROM audit_checkpoints ORDER BY event_id DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+    let last: Option<(i64, i64)> = c.query_row(&format!("SELECT event_id, at FROM audit_checkpoints WHERE {SEALED} ORDER BY event_id DESC LIMIT 1"), [], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
     if last.is_some_and(|(_, t)| t + every_ms > at) {
         return Ok(false);
     }
@@ -697,17 +714,32 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Records kept beside the chain from `first` to `last`, `(checkpoint, timestamp
-    /// event)`: each must have the events walked. Returns the breaks, by event.
-    pub fn recorded(&mut self, rows: &[(i64, Option<i64>)], first: i64, last: i64) -> Vec<(i64, &'static str)> {
+    /// Records kept beside the chain with an event from `lo` to `hi`: each must name events
+    /// walked, events logged after the walk (`last`, the last row walked), or, for a
+    /// checkpoint pruned (up to `pruned`), the timestamp event that keeps it. Returns the
+    /// breaks, by event.
+    pub fn recorded(&mut self, rows: &[Recorded], lo: i64, hi: i64, last: Option<i64>, pruned: Option<i64>) -> Vec<(i64, &'static str)> {
+        let within = |id: i64| (lo..=hi).contains(&id);
+        let after = |id: i64| last.is_none_or(|l| id > l);
         let mut out = Vec::new();
-        for &(id, stamp) in rows {
-            if (first..=last).contains(&id) && !self.walked.contains(&id) {
-                self.broke(Fault { id, reason: "record", error: format!("a checkpoint record names event {id}, which isn't a checkpoint") });
-                out.push((id, "checkpoint"));
+        for r in rows {
+            let id = r.id;
+            if within(id) && !self.walked.contains(&id) && !(after(id) && r.id_logged) {
+                let was_pruned = pruned.is_some_and(|p| id <= p);
+                let kept = was_pruned && r.stamp.is_some_and(|t| !within(t) || self.stamps.get(&t) == Some(&id));
+                if !kept {
+                    let error = if was_pruned {
+                        format!("checkpoint {id} was pruned, yet its record stayed without a timestamp event")
+                    } else {
+                        format!("a checkpoint record names event {id}, which isn't a checkpoint")
+                    };
+                    self.broke(Fault { id, reason: "record", error });
+                    out.push((id, "checkpoint"));
+                }
             }
-            if let Some(t) = stamp.filter(|t| (first..=last).contains(t)) {
-                if self.stamps.get(&t) != Some(&id) {
+            if let Some(t) = r.stamp.filter(|&t| within(t)) {
+                let fine = if after(t) { r.stamp_logged } else { self.stamps.get(&t) == Some(&id) };
+                if !fine {
                     self.broke(Fault { id: t, reason: "record", error: format!("checkpoint {id}'s token names event {t}, which doesn't record it") });
                     out.push((t, "timestamp"));
                 }
@@ -812,7 +844,7 @@ pub fn view(app: &App) -> rusqlite::Result<Value> {
         let last = list(c, i64::MAX, 1)?.pop();
         let stamped: i64 = c.query_row("SELECT count(*) FROM audit_checkpoints WHERE tsa_status = 'stamped'", [], |r| r.get(0))?;
         let pending: i64 = c.query_row("SELECT count(*) FROM audit_checkpoints WHERE tsa_status = 'pending'", [], |r| r.get(0))?;
-        let last_stamp = c.query_row(&format!("SELECT {COLS} FROM audit_checkpoints WHERE tsa_status = 'stamped' ORDER BY event_id DESC LIMIT 1"), [], read).optional()?;
+        let last_stamp = c.query_row(&format!("SELECT {COLS} FROM audit_checkpoints WHERE tsa_status = 'stamped' AND {SEALED} ORDER BY event_id DESC LIMIT 1"), [], read).optional()?;
         Ok((chain_head(c)?, count, last, stamped, pending, last_stamp))
     })?;
     let s = cp.stamping();
@@ -904,8 +936,8 @@ pub fn render(app: &App, out: &mut String) {
     let (signed, stamped, pending) = app
         .db
         .with_conn(|c| -> rusqlite::Result<_> {
-            let one = |sql: &str| c.query_row(sql, [], |r| r.get::<_, Option<i64>>(0));
-            Ok((one("SELECT max(at) FROM audit_checkpoints")?, one("SELECT max(tsa_time) FROM audit_checkpoints")?, one("SELECT count(*) FROM audit_checkpoints WHERE tsa_status = 'pending'")?))
+            let one = |sql: String| c.query_row(&sql, [], |r| r.get::<_, Option<i64>>(0));
+            Ok((one(format!("SELECT max(at) FROM audit_checkpoints WHERE {SEALED}"))?, one(format!("SELECT max(tsa_time) FROM audit_checkpoints WHERE {SEALED}"))?, one("SELECT count(*) FROM audit_checkpoints WHERE tsa_status = 'pending'".into())?))
         })
         .unwrap_or_default();
     if let Some(t) = signed {
@@ -1086,6 +1118,23 @@ mod tests {
             .unwrap();
         let r = checks(&app, Options::default());
         assert_eq!(r.first_broken.as_ref().map(|b| (b.id, b.reason)), Some((ids[0], "checkpoint")), "{r:?}");
+
+        // Nor can a record past the head pose as the newest checkpoint, or put off the next.
+        let app = crate::runner::test_app();
+        some_events(&app, 1);
+        let c = create(&app, &Who::system("test"), Trigger::Api).unwrap();
+        some_events(&app, 1);
+        let far = c.id + 1000;
+        app.db
+            .execute_raw(&format!(
+                "INSERT INTO audit_checkpoints (event_id, at, seq, hash, key_id, public_key, signature, tsa_status) VALUES ({far}, {}, 0, '{}', '{}', '{}', '{}', 'off')",
+                i64::MAX / 2, GENESIS, c.key_id, c.public_key, c.signature
+            ))
+            .unwrap();
+        let r = checks(&app, Options::default());
+        assert_eq!((r.ok, r.first_broken.as_ref().map(|b| (b.id, b.reason))), (false, Some((far, "checkpoint"))), "{r:?}");
+        assert_eq!(view(&app).unwrap()["checkpoints"]["last"]["id"], c.id);
+        assert!(app.db.with_conn(|x| due(x, 60_000, c.at + 60_000)).unwrap(), "scheduled from the real checkpoint");
     }
 
     #[test]
@@ -1109,26 +1158,32 @@ mod tests {
         assert_eq!(r.first_broken.map(|b| (b.id, b.reason)), Some((ids[1], "contents")));
     }
 
+    const NONCE: [u8; 4] = [0x41, 2, 3, 4];
+
+    /// Stamps `c` as the stamper does, with the fake TSA's token: the token and its event.
+    fn stamp_by_hand(app: &App, fake: &FakeTsa, c: &Checkpoint) -> (Vec<u8>, i64) {
+        app.db.execute_raw(&format!("UPDATE audit_checkpoints SET tsa_status = 'pending', tsa = 'http://tsa.test' WHERE event_id = {}", c.id)).unwrap();
+        let token = fake.token(&c.imprint(), Some(&NONCE), 1_795_386_498_000);
+        let ev = app
+            .db
+            .record_with(&Event::new(Actor::system("audit_timestamp"), TIMESTAMPED), |db, id, _| {
+                db.execute(
+                    "UPDATE audit_checkpoints SET tsa_status = 'stamped', tsa_token = ?, tsa_time = ?, tsa_nonce = ?, tsa_event_id = ? WHERE event_id = ?",
+                    params![b64().encode(&token), 1_795_386_498_000i64, hex(&NONCE), id, c.id],
+                )?;
+                Ok(json!({ "checkpoint": c.id, "time": 1_795_386_498_000i64, "timestampSha256": hex(&Sha256::digest(&token)) }))
+            })
+            .unwrap();
+        (token, ev)
+    }
+
     #[test]
     fn timestamps_are_checked_from_the_token() {
         let app = crate::runner::test_app();
         let fake = FakeTsa::new();
         some_events(&app, 2);
         let c = create(&app, &Who::system("test"), Trigger::Api).unwrap();
-        // As the stamper does, with the fake TSA's token.
-        app.db.execute_raw(&format!("UPDATE audit_checkpoints SET tsa_status = 'pending', tsa = 'http://tsa.test' WHERE event_id = {}", c.id)).unwrap();
-        let nonce = [0x41, 2, 3, 4];
-        let token = fake.token(&c.imprint(), Some(&nonce), 1_795_386_498_000);
-        let ev = app
-            .db
-            .record_with(&Event::new(Actor::system("audit_timestamp"), TIMESTAMPED), |db, id, _| {
-                db.execute(
-                    "UPDATE audit_checkpoints SET tsa_status = 'stamped', tsa_token = ?, tsa_time = ?, tsa_nonce = ?, tsa_event_id = ? WHERE event_id = ?",
-                    params![b64().encode(&token), 1_795_386_498_000i64, hex(&nonce), id, c.id],
-                )?;
-                Ok(json!({ "checkpoint": c.id, "time": 1_795_386_498_000i64, "timestampSha256": hex(&Sha256::digest(&token)) }))
-            })
-            .unwrap();
+        let (_, ev) = stamp_by_hand(&app, &fake, &c);
         let r = checks(&app, Options::default());
         let k = r.checkpoints.clone().unwrap();
         assert!(r.ok, "{r:?}");
@@ -1141,7 +1196,7 @@ mod tests {
 
         // Swapping in a token for something else is caught.
         app.db.execute_raw("DROP TRIGGER audit_checkpoints_signed").unwrap();
-        let other = fake.token(&[0; 32], Some(&nonce), 1_795_386_498_000);
+        let other = fake.token(&[0; 32], Some(&NONCE), 1_795_386_498_000);
         app.db.execute_raw(&format!("UPDATE audit_checkpoints SET tsa_token = '{}' WHERE event_id = {}", b64().encode(&other), c.id)).unwrap();
         assert_eq!(checks(&app, Options::default()).checkpoints.unwrap().first_broken.unwrap().reason, "record");
         // Even with the event's hash of it rewritten and the chain resealed.
@@ -1149,6 +1204,47 @@ mod tests {
         app.db.execute_raw(&format!("UPDATE audit_events SET details = json_set(details, '$.timestampSha256', '{}') WHERE id = {ev}", hex(&Sha256::digest(&other)))).unwrap();
         reseal(&app, ev);
         assert_eq!(checks(&app, Options::default()).checkpoints.unwrap().first_broken.unwrap().reason, "imprint");
+    }
+
+    #[test]
+    fn retention_keeps_a_record_while_its_timestamp_event_is_in_the_log() {
+        let app = crate::runner::test_app();
+        let fake = FakeTsa::new();
+        some_events(&app, 2);
+        let c = create(&app, &Who::system("test"), Trigger::Api).unwrap();
+        let (token, ev) = stamp_by_hand(&app, &fake, &c);
+        let later = some_events(&app, 1)[0];
+        // Ages events up to `last` past a 30-day window and prunes them.
+        let prune_to = |last: i64| {
+            app.db.execute_raw("DROP TRIGGER IF EXISTS audit_events_no_update").unwrap();
+            app.db.execute_raw(&format!("UPDATE audit_events SET at = {} WHERE id <= {last}", now() - 40 * 86_400_000)).unwrap();
+            reseal(&app, i64::MIN);
+            app.db.set_audit_retention(Some(30));
+            app.db.prune_audit(None).unwrap().1.map(|a| a.id)
+        };
+        // A long outage: the checkpoint goes before the timestamp event that came late.
+        assert_eq!(prune_to(c.id), Some(c.id));
+        assert!(app.db.with_conn(|x| row(x, c.id)).unwrap().is_some(), "kept for its timestamp event");
+        let rows = app.db.audit_events(&crate::audit::Filter::default(), 100, true);
+        assert_eq!(export_extras(&app.db, &rows)[&ev]["timestamp"]["token"].as_str(), Some(b64().encode(&token).as_str()));
+        let r = checks(&app, Options::default());
+        assert_eq!((r.ok, r.checkpoints.as_ref().unwrap().timestamped), (true, 1), "{r:?}");
+        // A pruned checkpoint's record kept with no timestamp event is named.
+        let stray = c.id - 1;
+        app.db
+            .execute_raw(&format!(
+                "INSERT INTO audit_checkpoints (event_id, at, seq, hash, key_id, public_key, signature, tsa_status) VALUES ({stray}, 0, 0, '{}', '{}', '{}', '{}', 'off')",
+                GENESIS, c.key_id, c.public_key, c.signature
+            ))
+            .unwrap();
+        let r = checks(&app, Options::default());
+        assert_eq!((r.ok, r.checkpoints.unwrap().first_broken.map(|f| (f.id, f.reason))), (false, Some((stray, "record"))));
+        app.db.execute_raw(&format!("DELETE FROM audit_checkpoints WHERE event_id = {stray}")).unwrap();
+        // Once its timestamp event goes too, so does the record.
+        assert_eq!(prune_to(ev), Some(ev));
+        assert!(app.db.with_conn(|x| row(x, c.id)).unwrap().is_none());
+        let r = checks(&app, Options::default());
+        assert_eq!((r.ok, r.first), (true, Some(later)), "{r:?}");
     }
 
     #[test]
