@@ -194,7 +194,8 @@ pub fn insert_system(c: &Connection, part: &str, action: &str, target: (&str, &s
 }
 
 /// The event an erasure writes, in its own transaction, naming the rows whose salt it
-/// cleared. An erased row that no such event names fails verification.
+/// cleared. An erased row that no such event names fails verification. These events
+/// hold nobody's data, so no erasure clears their salt.
 pub const ERASED: &str = "audit.erased";
 
 /// Records which rows an erasure cleared the salt of, as `[first, last]` id ranges.
@@ -379,13 +380,12 @@ impl Verifier {
         let reason = reason.or(pinned_wrong.then_some("pin"));
         if let Some(reason) = reason {
             self.report.broke(r.id, reason);
-        } else {
-            if r.salt.is_none() {
-                self.unexplained.insert(r.id);
-            }
-            if r.fixed.get(3) == Some(&Sql::Text(ERASED.into())) {
-                self.explain(r);
-            }
+        } else if r.salt.is_none() {
+            self.unexplained.insert(r.id);
+        } else if r.fixed.get(3) == Some(&Sql::Text(ERASED.into())) {
+            // Only with its salt are the rows it names checked: an erasure event never
+            // loses its salt, so one without could name anything, itself included.
+            self.explain(r);
         }
         if let Some(h) = &r.hash {
             self.report.head = Some(Link { id: r.id, hash: h.clone() });
@@ -703,6 +703,18 @@ mod tests {
         let mut wrong = erased[..6].to_vec();
         wrong.push(other);
         assert_eq!(check(&wrong, None, vec![]).first_broken, Some(Broken { id: 4, reason: "erased" }), "it must name this row");
+        // An erasure event whose own salt is gone can't vouch for anything: its rows are
+        // unchecked, so they could have been widened to cover a row changed by hand.
+        let mut widened = erased.clone();
+        widened[6].salt = None;
+        widened[6].erasable[6] = Sql::Text(r#"{"rows":[[1,7]]}"#.into());
+        widened[2].salt = None;
+        widened[2].erasable[0] = Sql::Text("forged".into());
+        let pins: Vec<Link> = erased.iter().map(|r| Link { id: r.id, hash: r.hash.clone().unwrap() }).collect();
+        let r = check(&widened, None, pins);
+        assert!(r.pins.iter().all(|p| p.result == "match"), "the hashes are untouched: {r:?}");
+        assert_eq!((r.ok, r.first_broken.clone()), (false, Some(Broken { id: 3, reason: "erased" })), "{r:?}");
+        assert!(check(&widened, None, vec![]).broken >= 2, "the erasure event itself is unexplained too");
         // A salt kept with changed fields is a change, not an erasure.
         let mut kept = rows;
         kept[3].erasable[0] = Sql::Text("x-pseudonym".into());

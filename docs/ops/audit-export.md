@@ -17,7 +17,7 @@ It prints the result and exits 1 if the chain is broken. The same is `GET /api/a
   - `contents`: the event was changed.
   - `link`: an event before it was removed, added or reordered, or the start was cut without an anchor.
   - `unsealed`: it has no seal at all.
-  - `erased`: its salt was cleared, but no erasure (`audit.erased`) names it, so its fields can't be checked.
+  - `erased`: its salt was cleared, but no erasure (`audit.erased`) with its own salt names it, so its fields can't be checked. Erasures never clear an `audit.erased` event's salt, so one without a salt is itself reported here.
 - `error`: the log couldn't be read to the end. The check fails.
   - `pin`: it differs from a hash you gave (below).
 

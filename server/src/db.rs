@@ -4830,9 +4830,9 @@ impl Db {
         c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", params![AUDIT_ERASING, s.pseudonym])?;
         let mut sql = String::from(
             "SELECT id, actor_id, actor_name, actor_email, actor_subject, target_id, on_behalf_of, ip, user_agent, session_id, details FROM audit_events
-             WHERE actor_id = ?1 OR target_id = ?1 OR on_behalf_of = ?1 OR instr(details, ?1) > 0",
+             WHERE action != ?2 AND (actor_id = ?1 OR target_id = ?1 OR on_behalf_of = ?1 OR instr(details, ?1) > 0",
         );
-        let mut args: Vec<String> = vec![s.id.clone()];
+        let mut args: Vec<String> = vec![s.id.clone(), crate::audit_chain::ERASED.into()];
         for e in &s.emails {
             args.push(e.clone());
             sql.push_str(&format!(" OR actor_email = ?{n} COLLATE NOCASE OR instr(lower(details), ?{n}) > 0", n = args.len()));
@@ -4841,6 +4841,7 @@ impl Db {
             args.push(x.clone());
             sql.push_str(&format!(" OR actor_subject = ?{n} OR instr(details, ?{n}) > 0", n = args.len()));
         }
+        sql.push(')');
         type Row = (i64, [Option<String>; 9], String);
         let rows: Vec<Row> = {
             let mut st = c.prepare(&sql)?;

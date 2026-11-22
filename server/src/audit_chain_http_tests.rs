@@ -118,6 +118,18 @@ async fn erasure_and_retention_keep_the_chain_whole() {
     app.db.execute_raw(&format!("UPDATE audit_events SET chain_salt = NULL, details = '{{\"name\":\"Other\"}}' WHERE id = {id}")).unwrap();
     let v = verify(port, &admin, "").await;
     assert_eq!((v["ok"].as_bool(), v["firstBroken"]["id"].as_i64(), v["firstBroken"]["reason"].as_str()), (Some(false), Some(id), Some("erased")), "{v}");
+    // Nor is widening the erasure's own rows to cover it, its salt cleared so they go
+    // unchecked: its hash, and so any pin of it, stays the same.
+    let erasure = named["id"].as_i64().unwrap();
+    let before = app.db.audit_chain_rows(erasure - 1, 1).unwrap().remove(0);
+    let pin = before.hash.clone().unwrap();
+    app.db.execute_raw(&format!("UPDATE audit_events SET chain_salt = NULL, details = '{{\"rows\":[[1,{id}]]}}' WHERE id = {erasure}")).unwrap();
+    let v = verify(port, &admin, &format!("?pin={erasure}:{pin}")).await;
+    assert_eq!((v["ok"].as_bool(), v["pins"][0]["result"].as_str(), v["firstBroken"]["reason"].as_str()), (Some(false), Some("match"), Some("erased")), "{v}");
+    assert_eq!(v["broken"], v["erased"], "her rows, the erasure and the changed row: none is vouched for now: {v}");
+    let rows = &before.erasable[crate::audit_chain::ERASABLE.iter().position(|c| *c == "details").unwrap()];
+    let rusqlite::types::Value::Text(rows) = rows else { panic!("{rows:?}") };
+    app.db.execute_raw(&format!("UPDATE audit_events SET chain_salt = '{}', details = '{rows}' WHERE id = {erasure}", before.salt.unwrap())).unwrap();
     // A seal SQLite holds as something other than text is no seal, never skipped.
     app.db.execute_raw(&format!("UPDATE audit_events SET chain_salt = 'x', chain_hash = x'00' WHERE id = {id}")).unwrap();
     let v = verify(port, &admin, "").await;
