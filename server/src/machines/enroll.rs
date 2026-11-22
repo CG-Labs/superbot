@@ -846,6 +846,7 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
+ProtectProc=invisible
 ReadWritePaths=/etc/superbot /usr/local/lib/superbot
 
 [Install]
@@ -1808,8 +1809,12 @@ mod tests {
         assert!(e.upkeep.plan.is_some() && e.describe().contains("harnesses on machines: pi@1.5.2; agent upgrades: manual"), "{}", e.describe());
         assert!(with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_HARNESSES", "nope")]).is_err());
         let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443")]).unwrap().unwrap();
-        assert!(!e.logins && e.folder.is_none() && !e.bot_user, "logins, folder copies and the Bots' user are off unless asked");
-        assert!(e.describe().contains("Bots' own user off"), "{}", e.describe());
+        assert!(!e.logins && e.folder.is_none(), "logins and folder copies are off unless asked");
+        assert!(e.bot_user && e.describe().contains("Bots' own user on"), "the Bots' own user is on unless turned off (ADR 0145): {}", e.describe());
+        let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_BOT_USER", "off")]).unwrap().unwrap();
+        assert!(!e.bot_user && e.describe().contains("Bots' own user off"), "{}", e.describe());
+        assert!(e.unit().contains("StateDirectoryMode=0700"), "{}", e.unit());
+        let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443")]).unwrap().unwrap();
         assert!(e.describe().contains("teammates' own users off"), "{}", e.describe());
         for v in ["MACHINE_HARNESS_LOGINS", "MACHINE_FOLDER_SYNC", "MACHINE_FOLDER_SYNC_MAX_MB", "MACHINE_BOT_USER", "MACHINE_TEAMMATE_USERS"] {
             let vars: &'static [(&'static str, &'static str)] = Box::leak(Box::new([(v, "on")]));
@@ -1821,7 +1826,8 @@ mod tests {
         let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_BOT_USER", "on")]).unwrap().unwrap();
         assert!(e.bot_user && e.describe().contains("Bots' own user on"), "{}", e.describe());
         assert!(with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_BOT_USER", "yes")]).is_err());
-        assert!(with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_TEAMMATE_USERS", "on")]).is_err(), "teammates' users need the Bots' user");
+        assert!(with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_BOT_USER", "off"), ("MACHINE_TEAMMATE_USERS", "on")]).is_err(), "teammates' users need the Bots' user");
+        assert!(with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_TEAMMATE_USERS", "on")]).unwrap().unwrap().teammate_users, "which is on by default");
         let e = with(&[("MACHINE_CONTROL_URL", "https://cp.example:8443"), ("MACHINE_BOT_USER", "on"), ("MACHINE_TEAMMATE_USERS", "on")]).unwrap().unwrap();
         assert!(e.teammate_users && e.describe().contains("teammates' own users on"), "{}", e.describe());
         for (raw, ok) in [("", Some(15)), ("5", Some(5)), ("60", Some(60)), ("4", None), ("61", None), ("soon", None)] {
@@ -2014,6 +2020,11 @@ mod tests {
         e.bot_user = true;
         let ud = e.user_data(&m, "sbe_tok");
         assert!(ud.contains("StateDirectoryMode=0711") && !ud.contains("StateDirectoryMode=0700"), "{ud}");
+        // ADR 0145: nothing in the unit gains privileges, and its users see only their
+        // own processes, not the agent's or another person's.
+        for want in ["NoNewPrivileges=yes", "ProtectProc=invisible", "PrivateTmp=yes"] {
+            assert!(e.unit().lines().any(|l| l == want), "{want} in {}", e.unit());
+        }
         let script = firstboot_in(&ud);
         assert!(
             script.contains("id -u superbot-bots >/dev/null 2>&1 || useradd --system --user-group --no-create-home --shell /usr/sbin/nologin --comment \"SuperBot Bots\" --home-dir /var/lib/superbot-machine/home superbot-bots"),

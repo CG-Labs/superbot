@@ -11,13 +11,13 @@ use super::enroll::Enrollment;
 use super::route::{Assigned, Refusal};
 use super::wire::{self, Heartbeat, TeammateReply, TeammateRequest};
 
-/// MACHINE_TEAMMATE_USERS: on or off (the default). Needs MACHINE_BOT_USER=on, so the
+/// MACHINE_TEAMMATE_USERS: on or off (the default). Not with MACHINE_BOT_USER=off, so the
 /// owner's own runs are never root and teammates' users have something to be kept from.
 pub fn from_env(var: &dyn Fn(&str) -> String, bot_user: bool) -> Result<bool, String> {
     match var("MACHINE_TEAMMATE_USERS").trim() {
         "" | "off" => Ok(false),
         "on" if bot_user => Ok(true),
-        "on" => Err("MACHINE_TEAMMATE_USERS=on needs MACHINE_BOT_USER=on".into()),
+        "on" => Err("MACHINE_TEAMMATE_USERS=on needs the Bots' own user, which MACHINE_BOT_USER=off turns off".into()),
         v => Err(format!(
             "MACHINE_TEAMMATE_USERS must be on or off, not \"{v}\""
         )),
@@ -111,7 +111,7 @@ mod tests {
         assert!(
             from_env(&with("on"), false)
                 .unwrap_err()
-                .contains("MACHINE_BOT_USER=on")
+                .contains("MACHINE_BOT_USER=off")
         );
         assert!(from_env(&with("yes"), true).is_err());
     }
